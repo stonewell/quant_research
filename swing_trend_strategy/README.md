@@ -104,15 +104,22 @@ stocks**, if the goal is competing with buy-and-hold.
 
 ## Project layout
 
+Shared code (the yfinance loader, standard indicators, and standard
+performance metrics) lives one level up in `../common/` and is used by every
+project in this workspace. Each module here re-exports the shared functions
+it needs and keeps only project-specific logic local, so the public API
+(`swingbot.data.load_ohlcv`, `swingbot.metrics.sharpe_ratio`, etc.) is
+unchanged for callers.
+
 ```
 swing_trend_strategy/
   swingbot/
     config.py        SwingConfig dataclass — every tunable parameter, with rationale
-    data.py           yfinance OHLCV loader with local CSV caching
-    indicators.py     RSI (Wilder), SMA
+    data.py           Thin wrapper over ../common/data.py, pinned to this project's data/ dir
+    indicators.py     rsi/sma re-exported from ../common/indicators.py
     strategy.py       Vectorized entry/exit signal computation (no state)
     backtester.py     Event loop: next-bar-open entries, intrabar stop/target/trailing, cash/equity accounting
-    metrics.py        CAGR, Sharpe, Sortino, max drawdown, win rate, profit factor, expectancy, avg holding period
+    metrics.py        expectancy_stats/avg_holding_days/summarize() (local) + base metrics re-exported from ../common/metrics.py
     plotting.py       Price+MAs+trades chart, equity-curve-vs-both-benchmarks chart
   run_backtest.py      CLI entry point (always reports both benchmarks)
   tests/                pytest unit + integration tests

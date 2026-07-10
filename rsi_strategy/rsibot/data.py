@@ -1,33 +1,13 @@
-"""Historical OHLCV data loading with local CSV caching."""
+"""Historical OHLCV data loading with local CSV caching -- thin wrapper
+around the shared quant-level loader (`common/data.py`), pinned to this
+project's own `data/` cache directory."""
 
 import os
 
-import pandas as pd
-import yfinance as yf
+from common.data import load_ohlcv as _load_ohlcv
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 
 
-def load_ohlcv(symbol: str, start: str, end: str, interval: str = "1d", use_cache: bool = True) -> pd.DataFrame:
-    """Download (or load cached) OHLCV data for symbol between start and end.
-
-    Uses auto_adjust=True so Close is dividend/split-adjusted (a reasonable
-    approximation of total return for a long-only backtest).
-    """
-    os.makedirs(DATA_DIR, exist_ok=True)
-    cache_path = os.path.join(DATA_DIR, f"{symbol}_{interval}_{start}_{end}.csv")
-
-    if use_cache and os.path.exists(cache_path):
-        df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
-    else:
-        df = yf.download(symbol, start=start, end=end, interval=interval, auto_adjust=True, progress=False)
-        if df.empty:
-            raise ValueError(f"No data returned for {symbol} between {start} and {end}")
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df = df[["Open", "High", "Low", "Close", "Volume"]]
-        df.to_csv(cache_path)
-
-    df.index = pd.to_datetime(df.index)
-    df = df.dropna(subset=["Open", "High", "Low", "Close"])
-    return df
+def load_ohlcv(symbol: str, start: str, end: str, interval: str = "1d", use_cache: bool = True):
+    return _load_ohlcv(symbol, start, end, interval, use_cache, cache_dir=DATA_DIR)

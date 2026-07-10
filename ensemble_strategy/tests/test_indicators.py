@@ -1,14 +1,12 @@
 import numpy as np
 import pandas as pd
+from common.testing import make_ohlcv_from_closes
 
 from ensemblebot.indicators import adx, rsi, sma
 
 
 def make_df(closes):
-    closes = pd.Series(closes, dtype=float)
-    return pd.DataFrame({
-        "Open": closes.values, "High": closes.values + 0.5, "Low": closes.values - 0.5, "Close": closes.values,
-    })
+    return make_ohlcv_from_closes(closes, use_index=False)
 
 
 def test_rsi_is_100_when_all_gains():

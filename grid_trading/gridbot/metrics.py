@@ -1,70 +1,12 @@
 """Performance metrics for evaluating a backtested equity curve and trade log.
 
-Mirrors the standard toolkit used in the quantitative backtesting literature
-reviewed for this project: CAGR, annualized volatility, Sharpe/Sortino ratio,
-max drawdown, win rate, and profit factor.
+Base metrics are re-exported from the shared `common/metrics.py` module;
+`summarize` (this project's specific report shape) stays local.
 """
 
-import numpy as np
 import pandas as pd
-
-
-def total_return(equity: pd.Series) -> float:
-    return equity.iloc[-1] / equity.iloc[0] - 1.0
-
-
-def cagr(equity: pd.Series, periods_per_year: int = 252) -> float:
-    n_periods = len(equity)
-    if n_periods < 2:
-        return 0.0
-    growth = equity.iloc[-1] / equity.iloc[0]
-    years = n_periods / periods_per_year
-    if growth <= 0 or years <= 0:
-        return -1.0
-    return growth ** (1 / years) - 1.0
-
-
-def annualized_vol(returns: pd.Series, periods_per_year: int = 252) -> float:
-    return returns.std(ddof=1) * np.sqrt(periods_per_year)
-
-
-def sharpe_ratio(returns: pd.Series, risk_free: float = 0.0, periods_per_year: int = 252) -> float:
-    excess = returns - risk_free / periods_per_year
-    std = excess.std(ddof=1)
-    if std == 0 or np.isnan(std):
-        return 0.0
-    return (excess.mean() / std) * np.sqrt(periods_per_year)
-
-
-def sortino_ratio(returns: pd.Series, risk_free: float = 0.0, periods_per_year: int = 252) -> float:
-    excess = returns - risk_free / periods_per_year
-    downside = excess[excess < 0]
-    dd_std = downside.std(ddof=1)
-    if dd_std == 0 or np.isnan(dd_std):
-        return 0.0
-    return (excess.mean() / dd_std) * np.sqrt(periods_per_year)
-
-
-def max_drawdown(equity: pd.Series) -> float:
-    peak = equity.cummax()
-    dd = (peak - equity) / peak
-    return dd.max()
-
-
-def win_rate(trades: pd.DataFrame) -> float:
-    sells = trades[trades["side"] == "sell"]
-    if sells.empty:
-        return 0.0
-    return (sells["pnl"] > 0).mean()
-
-
-def profit_factor(trades: pd.DataFrame) -> float:
-    sells = trades[trades["side"] == "sell"]
-    gains = sells.loc[sells["pnl"] > 0, "pnl"].sum()
-    losses = -sells.loc[sells["pnl"] < 0, "pnl"].sum()
-    if losses == 0:
-        return float("inf") if gains > 0 else 0.0
-    return gains / losses
+from common.metrics import (annualized_vol, cagr, max_drawdown, profit_factor, sharpe_ratio, sortino_ratio,
+                              total_return, win_rate)
 
 
 def summarize(equity_curve: pd.DataFrame, trades: pd.DataFrame, periods_per_year: int = 252) -> dict:

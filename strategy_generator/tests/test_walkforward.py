@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import pytest
+from common.testing import make_ar1_ohlcv
 
 from stratgen.generator import GeneratorConfig
 from stratgen.walkforward import WalkForwardConfig, generate_folds, run_walkforward
@@ -31,49 +32,59 @@ def test_generate_folds_step_size_matches_test_window():
 
 def test_generate_folds_empty_when_data_too_short():
     config = WalkForwardConfig(train_years=4.0, validation_years=2.0, test_years=1.0)
-    folds = generate_folds(n_bars=100, config=config)
-    assert folds == []
+    assert generate_folds(n_bars=100, config=config) == []
 
 
-def _ar1_close(phi, n, seed, scale=0.3):
-    rng = np.random.default_rng(seed)
-    eps = rng.normal(0, 1, n)
-    increments = np.zeros(n)
-    for t in range(1, n):
-        increments[t] = phi * increments[t - 1] + eps[t]
-    close = 100 + np.cumsum(increments * scale)
-    idx = pd.bdate_range("2010-01-01", periods=n)
-    high = close + np.abs(rng.normal(0.3, 0.1, n))
-    low = close - np.abs(rng.normal(0.3, 0.1, n))
-    open_ = close + rng.normal(0, 0.1, n)
-    return pd.DataFrame({"Open": open_, "High": high, "Low": low, "Close": close}, index=idx)
+def _ar1_close(phi, n, seed, scale=0.01):
+    return make_ar1_ohlcv(phi, n, seed, scale, start="2010-01-01")
 
 
-def test_run_walkforward_end_to_end_on_synthetic_trend():
-    df = _ar1_close(phi=0.5, n=2500, seed=5)
-    config = WalkForwardConfig(train_years=1.5, validation_years=0.7, test_years=0.5, embargo_days=10,
-                                warmup_buffer_days=200,
-                                generator_config=GeneratorConfig(n_random_search=10, hurst_seed=2, min_trades_for_trust=3))
-    result = run_walkforward(df, config)
+def _small_wf_config(seed=2):
+    return WalkForwardConfig(train_years=1.5, validation_years=0.7, test_years=0.5, embargo_days=10,
+                              warmup_buffer_days=200,
+                              generator_config=GeneratorConfig(n_random_search=10, hurst_seed=seed, min_trades_for_trust=3))
+
+
+def test_run_walkforward_raises_on_empty_universe():
+    with pytest.raises(ValueError):
+        run_walkforward({}, WalkForwardConfig())
+
+
+def test_run_walkforward_raises_on_misaligned_universe():
+    universe = {"A": _ar1_close(0.5, 2500, seed=1), "B": _ar1_close(0.5, 2400, seed=2)}
+    with pytest.raises(ValueError):
+        run_walkforward(universe, WalkForwardConfig())
+
+
+def test_run_walkforward_end_to_end_on_synthetic_universe():
+    universe = {"A": _ar1_close(0.5, 2500, seed=5), "B": _ar1_close(0.5, 2500, seed=6)}
+    result = run_walkforward(universe, _small_wf_config())
+    assert result["n_symbols"] == 2
     assert result["n_folds"] > 0
     assert len(result["folds"]) == result["n_folds"]
     assert np.isfinite(result["mean_validation_sharpe"])
     assert np.isfinite(result["mean_test_sharpe"])
     for fold in result["folds"]:
         assert fold["regime_label"] in ("trending", "mean_reverting", "random_walk_like")
+        assert "pooled_hurst_z" in fold
+
+
+def test_run_walkforward_matches_single_symbol_universe_as_a_sanity_check():
+    # A one-symbol "universe" should behave like validating that symbol alone.
+    universe = {"A": _ar1_close(0.5, 2500, seed=7)}
+    result = run_walkforward(universe, _small_wf_config())
+    assert result["n_symbols"] == 1
+    assert result["n_folds"] > 0
 
 
 def test_run_walkforward_raises_when_no_folds_fit():
-    df = _ar1_close(phi=0.5, n=100, seed=5)
+    universe = {"A": _ar1_close(0.5, 100, seed=5), "B": _ar1_close(0.5, 100, seed=6)}
     with pytest.raises(ValueError):
-        run_walkforward(df, WalkForwardConfig())
+        run_walkforward(universe, WalkForwardConfig())
 
 
 def test_run_walkforward_dsr_is_a_probability_when_present():
-    df = _ar1_close(phi=0.5, n=2500, seed=6)
-    config = WalkForwardConfig(train_years=1.5, validation_years=0.7, test_years=0.5, embargo_days=10,
-                                warmup_buffer_days=200,
-                                generator_config=GeneratorConfig(n_random_search=10, hurst_seed=2, min_trades_for_trust=3))
-    result = run_walkforward(df, config)
+    universe = {"A": _ar1_close(0.5, 2500, seed=8), "B": _ar1_close(0.5, 2500, seed=9)}
+    result = run_walkforward(universe, _small_wf_config())
     if result["deflated_sharpe_ratio"] is not None:
         assert 0.0 <= result["deflated_sharpe_ratio"] <= 1.0

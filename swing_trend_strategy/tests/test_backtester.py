@@ -1,23 +1,10 @@
 import numpy as np
 import pandas as pd
 import pytest
+from common.testing import make_trending_pullback_df
 
 from swingbot.backtester import run_backtest
 from swingbot.config import SwingConfig
-
-
-def make_trending_pullback_df(n=600, seed=7):
-    """A rising market with periodic dips -- should reliably trigger pullback entries."""
-    rng = np.random.default_rng(seed)
-    t = np.arange(n)
-    trend = 100 + t * 0.15
-    dips = -6 * np.abs(np.sin(t / 25.0))
-    close = trend + dips + rng.normal(0, 0.3, n)
-    high = close + np.abs(rng.normal(0.4, 0.15, n))
-    low = close - np.abs(rng.normal(0.4, 0.15, n))
-    open_ = close + rng.normal(0, 0.1, n)
-    idx = pd.bdate_range("2018-01-01", periods=n)
-    return pd.DataFrame({"Open": open_, "High": high, "Low": low, "Close": close}, index=idx)
 
 
 def test_backtest_runs_and_trades_in_a_trending_pullback_market():

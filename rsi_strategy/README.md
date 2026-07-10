@@ -82,15 +82,22 @@ that sample, from -23.75% to -40.55%).
 
 ## Project layout
 
+Shared code (the yfinance loader, standard indicators, and standard
+performance metrics) lives one level up in `../common/` and is used by every
+project in this workspace. Each module here re-exports the shared functions
+it needs and keeps only project-specific logic local, so the public API
+(`rsibot.data.load_ohlcv`, `rsibot.metrics.sharpe_ratio`, etc.) is unchanged
+for callers.
+
 ```
 rsi_strategy/
   rsibot/
     config.py        RSIConfig dataclass — every tunable parameter
-    data.py           yfinance OHLCV loader with local CSV caching
-    indicators.py     RSI (Wilder + Cutler), cumulative RSI, SMA
+    data.py           Thin wrapper over ../common/data.py, pinned to this project's data/ dir
+    indicators.py     rsi(method=...) dispatcher (local) + rsi_wilder/rsi_cutler/cumulative_rsi/sma re-exported from ../common/indicators.py
     strategy.py       Vectorized entry/exit signal computation (no state)
     backtester.py     Event loop: next-bar-open execution, stops, cash/equity accounting
-    metrics.py        CAGR, Sharpe, Sortino, max drawdown, win rate, profit factor, time-in-market
+    metrics.py        summarize() (local) + base metrics re-exported from ../common/metrics.py
     plotting.py       Price+RSI+trades chart, equity-curve-vs-benchmark chart
   run_backtest.py      CLI entry point
   tests/                pytest unit + integration tests

@@ -1,17 +1,14 @@
 import numpy as np
 import pandas as pd
 import pytest
+from common.testing import make_ohlcv_from_closes
 
 from selectorbot.correlation import (beta_to_benchmark, correlation_matrix, correlation_regime_shift,
                                        hierarchical_clusters, redundancy_flags, returns_matrix)
 
 
 def make_price_df(close):
-    close = pd.Series(close, dtype=float)
-    idx = pd.bdate_range("2020-01-01", periods=len(close))
-    return pd.DataFrame({
-        "Open": close.values, "High": close.values + 0.3, "Low": close.values - 0.3, "Close": close.values,
-    }, index=idx)
+    return make_ohlcv_from_closes(close, spread=0.3)
 
 
 def test_returns_matrix_aligns_on_common_dates():

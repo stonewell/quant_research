@@ -264,14 +264,22 @@ self-validating result:
 
 ## Project layout
 
+Shared code (the yfinance loader and standard indicators) lives one level up
+in `../common/` and is used by every project in this workspace. Each module
+here re-exports the shared functions it needs and keeps only project-specific
+logic local, so the public API (`selectorbot.data.load_ohlcv`,
+`selectorbot.volatility.atr`, `selectorbot.persistence.hurst_exponent`, etc.)
+is unchanged for callers. `liquidity.py`, `correlation.py`, and `scoring.py`
+are unique to this project and unaffected.
+
 ```
 instrument_selection/
   selectorbot/
     config.py        SelectionConfig — universe, benchmark, all thresholds
-    data.py           yfinance loader for a universe of tickers, skips failures gracefully
+    data.py           Thin wrapper over ../common/data.py (load_ohlcv/load_universe/fetch_fund_metadata), pinned to this project's data/ dir
     liquidity.py      Avg dollar volume + Corwin-Schultz spread estimator
-    volatility.py     Realized vol, ATR%, vol-of-vol, ATR regime-change ratio, ADX
-    persistence.py    Hurst exponent (R/S analysis) + shuffle-based significance test, autocorrelation, variance ratio
+    volatility.py     volatility_summary() (local) + atr/atr_pct/adx/realized_vol/vol_of_vol/atr_regime_ratio re-exported from ../common/indicators.py
+    persistence.py    hurst_significance()/persistence_summary() (local, shuffle-based significance test) + hurst_exponent/autocorrelation/variance_ratio re-exported from ../common/hurst.py
     correlation.py    Correlation matrix, beta, hierarchical clustering, redundancy flags, regime-shift check
     scoring.py        Strategy-agnostic composite score: liquidity, volatility adequacy, predictability, diversification, history/fund-quality
     plotting.py       Correlation heatmap, dendrogram, Hurst-vs-volatility scatter (descriptive, not strategy-specific)
