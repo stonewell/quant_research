@@ -1,19 +1,13 @@
 import numpy as np
 import pandas as pd
+from common.testing import make_oscillating_df as _make_oscillating_df
 
 from rsibot.backtester import run_backtest
 from rsibot.config import RSIConfig
 
 
 def make_oscillating_df(n=400, base=100.0, amplitude=8.0, noise=0.3, seed=7):
-    rng = np.random.default_rng(seed)
-    t = np.arange(n)
-    close = base + amplitude * np.sin(t / 10.0) + rng.normal(0, noise, n)
-    high = close + np.abs(rng.normal(0.5, 0.2, n))
-    low = close - np.abs(rng.normal(0.5, 0.2, n))
-    open_ = close + rng.normal(0, 0.1, n)
-    idx = pd.bdate_range("2020-01-01", periods=n)
-    return pd.DataFrame({"Open": open_, "High": high, "Low": low, "Close": close}, index=idx)
+    return _make_oscillating_df(n, base, amplitude, noise, seed, sine_period=10.0)
 
 
 def test_backtest_runs_and_trades_on_oscillating_market():

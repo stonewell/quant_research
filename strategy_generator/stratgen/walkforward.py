@@ -1,5 +1,7 @@
-"""Walk-forward validation: the standard, concretely-specified defense
-against overfitting when auto-tuning strategy parameters to historical data.
+"""Walk-forward validation for a whole UNIVERSE: the standard,
+concretely-specified defense against overfitting when auto-tuning strategy
+parameters to historical data, applied to a single pooled-across-the-universe
+strategy rather than one strategy per symbol.
 
 Research grounding: a three-way chronological split -- (a) a TRAIN window
 used to fit/search candidate parameterizations, (b) a VALIDATION window
@@ -11,17 +13,20 @@ the final unbiased read -- repeated across multiple rolling folds. An
 embargo gap before the test window guards against information leakage from
 indicator lookback windows straddling the validation/test boundary. The
 "generalization ratio" (mean out-of-sample performance / mean in-sample
-performance) measures how much the strategy degrades out of sample; a ratio
-near 1.0 means it generalizes well, a ratio near 0 (or negative) means the
-in-sample edge was mostly noise.
+performance) measures how much the strategy degrades out of sample.
 
 Regime classification (Hurst) and the parameter grid search are both fit
-using ONLY the train window of each fold; the winning parameterization is
-chosen by VALIDATION-window performance, and test-window performance is
+using ONLY the train window of each fold, POOLED (median) across every
+symbol in the universe; the winning parameterization is chosen by POOLED
+VALIDATION-window performance, and POOLED test-window performance is
 computed only once, after selection, per fold.
+
+Because fold boundaries are defined by bar POSITION (not date), every symbol
+in the universe must share the same number of bars / trading calendar --
+`run_walkforward` validates this and raises a clear error otherwise, rather
+than silently misaligning dates across instruments.
 """
 
-import itertools
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -30,7 +35,7 @@ import pandas as pd
 from .backtester import run_backtest
 from .generator import GeneratorConfig, grid_combinations
 from .metrics import deflated_sharpe_ratio, sharpe_ratio
-from .regime import classify_series
+from .regime import aggregate_regime
 from .templates import TEMPLATES_BY_REGIME, NoTradeTemplate
 
 TRADING_DAYS_PER_YEAR = 252
@@ -40,9 +45,9 @@ TRADING_DAYS_PER_YEAR = 252
 class WalkForwardConfig:
     train_years: float = 4.0
     validation_years: float = 2.0
-    test_years: float = 1.0       # also used as the step size between folds, per research's rolling-window convention
+    test_years: float = 1.0       # also used as the step size between folds
     embargo_days: int = 30
-    warmup_buffer_days: int = 250  # extra bars prepended per fold so indicators (e.g. SMA-150) are warmed up by train_start
+    warmup_buffer_days: int = 250  # extra bars prepended per fold so indicators are warmed up by train_start
     generator_config: GeneratorConfig = field(default_factory=GeneratorConfig)
 
 
@@ -87,65 +92,96 @@ def _slice_sharpe(equity_curve: pd.DataFrame, start_date, end_date) -> tuple:
     return sharpe_ratio(returns), len(window)
 
 
-def _evaluate_fold(df: pd.DataFrame, fold: dict, config: GeneratorConfig) -> dict:
-    fold_df = df.iloc[fold["buffer_start"]:fold["test_end"]]
-    train_df = df.iloc[fold["train_start"]:fold["train_end"]]
+def _pool(values: list) -> float:
+    valid = [v for v in values if np.isfinite(v)]
+    return float(np.median(valid)) if valid else float("-inf")
 
-    log_returns = np.log(train_df["Close"] / train_df["Close"].shift(1)).dropna()
-    regime = classify_series(log_returns, n_simulations=config.hurst_n_simulations, k=config.hurst_k, seed=config.hurst_seed)
+
+def _validate_aligned_universe(universe: dict) -> int:
+    lengths = {symbol: len(df) for symbol, df in universe.items()}
+    if len(set(lengths.values())) != 1:
+        raise ValueError(
+            f"Walk-forward fold boundaries are bar-position-based and require every symbol in the "
+            f"universe to share the same number of bars (i.e. the same trading calendar); got {lengths}"
+        )
+    return next(iter(lengths.values()))
+
+
+def _evaluate_fold(universe: dict, fold: dict, config: GeneratorConfig) -> dict:
+    fold_universe = {s: df.iloc[fold["buffer_start"]:fold["test_end"]] for s, df in universe.items()}
+    train_returns = {}
+    for s, df in universe.items():
+        train_df = df.iloc[fold["train_start"]:fold["train_end"]]
+        train_returns[s] = np.log(train_df["Close"] / train_df["Close"].shift(1)).dropna()
+
+    regime = aggregate_regime(train_returns, n_simulations=config.hurst_n_simulations, k=config.hurst_k, seed=config.hurst_seed)
     template_cls = TEMPLATES_BY_REGIME[regime["regime_label"]]
     template = template_cls()
 
-    train_start_date = df.index[fold["train_start"]]
-    validation_start_date = df.index[fold["validation_start"]]
-    validation_end_date = df.index[fold["validation_end"]]
-    test_start_date = df.index[fold["test_start"]]
-    test_end_date = df.index[min(fold["test_end"], len(df) - 1)]
+    any_df = next(iter(universe.values()))
+    validation_start_date = any_df.index[fold["validation_start"]]
+    validation_end_date = any_df.index[fold["validation_end"]]
+    test_start_date = any_df.index[fold["test_start"]]
+    test_end_date = any_df.index[min(fold["test_end"], len(any_df) - 1)]
 
     if isinstance(template, NoTradeTemplate):
-        return {"regime_label": regime["regime_label"], "hurst": regime["hurst"], "template_name": template.name,
+        return {"regime_label": regime["regime_label"], "pooled_hurst_z": regime["pooled_z"], "template_name": template.name,
                 "params": {}, "validation_sharpe": 0.0, "test_sharpe": 0.0, "test_num_trades": 0,
                 "n_trials": 0, "trusted": True}
 
     combos = grid_combinations(template.param_grid)
     scored = []
     for params in combos:
-        try:
-            result = run_backtest(fold_df, template, params, initial_capital=config.initial_capital,
-                                   commission_per_trade=config.commission_per_trade, commission_pct=config.commission_pct,
-                                   slippage_pct=config.slippage_pct, atr_period=config.atr_period)
-        except Exception:
-            scored.append((params, float("-inf"), None))
-            continue
-        eq = result["equity_curve"]
-        if eq.empty:
-            scored.append((params, float("-inf"), None))
-            continue
-        validation_sharpe, _ = _slice_sharpe(eq, validation_start_date, validation_end_date)
-        scored.append((params, validation_sharpe, eq))
+        per_symbol_validation_sharpe, per_symbol_eq = [], {}
+        for symbol, fdf in fold_universe.items():
+            try:
+                result = run_backtest(fdf, template, params, initial_capital=config.initial_capital,
+                                       commission_per_trade=config.commission_per_trade, commission_pct=config.commission_pct,
+                                       slippage_pct=config.slippage_pct, atr_period=config.atr_period)
+            except Exception:
+                per_symbol_validation_sharpe.append(float("-inf"))
+                continue
+            eq = result["equity_curve"]
+            if eq.empty:
+                per_symbol_validation_sharpe.append(float("-inf"))
+                continue
+            v_sharpe, _ = _slice_sharpe(eq, validation_start_date, validation_end_date)
+            per_symbol_validation_sharpe.append(v_sharpe)
+            per_symbol_eq[symbol] = eq
+        scored.append((params, _pool(per_symbol_validation_sharpe), per_symbol_eq))
 
-    best_params, best_validation_sharpe, best_eq = max(scored, key=lambda r: r[1])
+    best_params, best_pooled_validation, best_per_symbol_eq = max(scored, key=lambda r: r[1])
 
-    if best_eq is None:
-        test_sharpe, test_n = float("-inf"), 0
-    else:
-        test_sharpe, test_n = _slice_sharpe(best_eq, test_start_date, test_end_date)
+    per_symbol_test_sharpe, per_symbol_test_n = {}, {}
+    for symbol, eq in best_per_symbol_eq.items():
+        ts, tn = _slice_sharpe(eq, test_start_date, test_end_date)
+        per_symbol_test_sharpe[symbol] = ts
+        per_symbol_test_n[symbol] = tn
+    pooled_test = _pool(list(per_symbol_test_sharpe.values()))
+    total_test_trades = int(sum(per_symbol_test_n.values()))
 
-    trusted = best_validation_sharpe > 0 and test_n >= config.min_trades_for_trust
+    trusted = best_pooled_validation > 0 and total_test_trades >= config.min_trades_for_trust
     return {
-        "regime_label": regime["regime_label"], "hurst": regime["hurst"], "template_name": template.name,
-        "params": best_params, "validation_sharpe": best_validation_sharpe, "test_sharpe": test_sharpe,
-        "test_num_trades": test_n, "n_trials": len(combos), "trusted": trusted,
+        "regime_label": regime["regime_label"], "pooled_hurst_z": regime["pooled_z"], "template_name": template.name,
+        "params": best_params, "validation_sharpe": best_pooled_validation, "test_sharpe": pooled_test,
+        "test_num_trades": total_test_trades, "n_trials": len(combos), "trusted": trusted,
     }
 
 
-def run_walkforward(df: pd.DataFrame, config: WalkForwardConfig = None) -> dict:
+def run_walkforward(universe: dict, config: WalkForwardConfig = None) -> dict:
+    """`universe`: {symbol: OHLCV DataFrame}. Every symbol must share the
+    same number of bars (see `_validate_aligned_universe`); align/trim your
+    data (e.g., an inner join on dates) before calling this."""
     config = config or WalkForwardConfig()
-    folds = generate_folds(len(df), config)
+    if not universe:
+        raise ValueError("universe must contain at least one symbol's OHLCV DataFrame")
+    n_bars = _validate_aligned_universe(universe)
+
+    folds = generate_folds(n_bars, config)
     if not folds:
         raise ValueError("Not enough bars to build even one walk-forward fold with the configured window lengths")
 
-    fold_results = [_evaluate_fold(df, fold, config.generator_config) for fold in folds]
+    fold_results = [_evaluate_fold(universe, fold, config.generator_config) for fold in folds]
 
     validation_sharpes = np.array([r["validation_sharpe"] for r in fold_results if np.isfinite(r["validation_sharpe"])])
     test_sharpes = np.array([r["test_sharpe"] for r in fold_results if np.isfinite(r["test_sharpe"])])
@@ -168,4 +204,5 @@ def run_walkforward(df: pd.DataFrame, config: WalkForwardConfig = None) -> dict:
         "generalization_ratio": generalization_ratio,
         "deflated_sharpe_ratio": dsr,
         "n_folds": len(fold_results),
+        "n_symbols": len(universe),
     }

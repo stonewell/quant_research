@@ -114,15 +114,22 @@ a strict improvement.
 
 ## Project layout
 
+Shared code (the yfinance loader, standard indicators, and standard
+performance metrics) lives one level up in `../common/` and is used by every
+project in this workspace. Each module here re-exports the shared functions
+it needs and keeps only project-specific logic local, so the public API
+(`ensemblebot.data.load_ohlcv`, `ensemblebot.metrics.sharpe_ratio`, etc.) is
+unchanged for callers.
+
 ```
 ensemble_strategy/
   ensemblebot/
     config.py        EnsembleConfig — mode selects ensemble/trend_only/meanrev_only
-    data.py           yfinance OHLCV loader with local CSV caching
-    indicators.py     RSI (Wilder), SMA, ADX (Wilder's trend-strength indicator)
+    data.py           Thin wrapper over ../common/data.py, pinned to this project's data/ dir
+    indicators.py     rsi/sma/adx re-exported from ../common/indicators.py
     regime.py         Regime classification with hysteresis and no-lookahead shifting
     backtester.py     Event loop: binary exposure model, mode-dependent desired-exposure logic
-    metrics.py        CAGR, Sharpe, max drawdown, win rate, profit factor
+    metrics.py        summarize() (local) + base metrics re-exported from ../common/metrics.py
     plotting.py       Price with regime shading, equity-curve comparison across all modes
   run_backtest.py      CLI — always runs all 3 modes + buy-and-hold side by side
   tests/                pytest unit + integration tests

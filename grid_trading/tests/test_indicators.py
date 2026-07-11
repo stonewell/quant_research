@@ -1,18 +1,12 @@
 import numpy as np
 import pandas as pd
+from common.testing import make_ohlcv_from_closes
 
 from gridbot.indicators import atr, sma, trend_regime
 
 
 def make_df(closes):
-    closes = pd.Series(closes, dtype=float)
-    df = pd.DataFrame({
-        "Open": closes,
-        "High": closes + 1,
-        "Low": closes - 1,
-        "Close": closes,
-    })
-    return df
+    return make_ohlcv_from_closes(closes, spread=1.0, use_index=False)
 
 
 def test_atr_constant_range_bar():

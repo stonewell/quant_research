@@ -1,17 +1,9 @@
 import numpy as np
 import pandas as pd
 import pytest
+from common.testing import make_ar1_series as _ar1_series
 
 from selectorbot.persistence import autocorrelation, hurst_exponent, hurst_significance, variance_ratio
-
-
-def _ar1_series(phi, n, seed):
-    rng = np.random.default_rng(seed)
-    eps = rng.normal(0, 1, n)
-    x = np.zeros(n)
-    for t in range(1, n):
-        x[t] = phi * x[t - 1] + eps[t]
-    return pd.Series(x)
 
 
 def test_hurst_orders_trend_randomwalk_meanrev_correctly():

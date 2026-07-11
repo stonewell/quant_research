@@ -17,45 +17,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-
-
-def _rs_stat(x: np.ndarray) -> float:
-    mean = x.mean()
-    cum_dev = np.cumsum(x - mean)
-    r = cum_dev.max() - cum_dev.min()
-    s = x.std(ddof=1)
-    if s == 0:
-        return np.nan
-    return r / s
-
-
-def hurst_exponent(series: pd.Series, min_chunk_size: int = 8, max_lag_fraction: float = 0.5) -> float:
-    """Classical rescaled-range (R/S) Hurst estimator on a stationary
-    increment series (e.g., log returns), not raw price levels."""
-    x = pd.Series(series).dropna().to_numpy()
-    n = len(x)
-    if n < min_chunk_size * 4:
-        return np.nan
-
-    max_chunk = int(n * max_lag_fraction)
-    sizes = np.unique(np.floor(np.logspace(np.log10(min_chunk_size), np.log10(max_chunk), num=20)).astype(int))
-    sizes = sizes[sizes >= min_chunk_size]
-
-    log_sizes, log_rs = [], []
-    for size in sizes:
-        n_chunks = n // size
-        if n_chunks < 1:
-            continue
-        chunk_rs = [_rs_stat(x[i * size:(i + 1) * size]) for i in range(n_chunks)]
-        chunk_rs = [v for v in chunk_rs if not np.isnan(v) and v > 0]
-        if chunk_rs:
-            log_sizes.append(np.log(size))
-            log_rs.append(np.log(np.mean(chunk_rs)))
-
-    if len(log_sizes) < 4:
-        return np.nan
-    slope, _ = np.polyfit(log_sizes, log_rs, 1)
-    return slope
+from common.hurst import hurst_exponent
 
 
 @dataclass
@@ -116,3 +78,61 @@ def classify_series(series: pd.Series, n_simulations: int = 300, k: float = 1.5,
     calibration = calibrate_null_distribution(len(series.dropna()), n_simulations=n_simulations, seed=seed)
     label = classify_regime(h, calibration, k=k)
     return {"hurst": h, "regime_label": label, "null_mean": calibration.mean, "null_std": calibration.std}
+
+
+def hurst_zscore(series: pd.Series, n_simulations: int = 300, seed: int = None) -> dict:
+    """Like `classify_series`, but returns the raw z-score (Hurst deviation
+    from its own calibrated null, in std units) instead of a discretized
+    label -- the building block for pooling regime evidence across multiple
+    instruments without throwing away information by labeling too early."""
+    h = hurst_exponent(series)
+    calibration = calibrate_null_distribution(len(series.dropna()), n_simulations=n_simulations, seed=seed)
+    z = (h - calibration.mean) / calibration.std if (not np.isnan(h) and calibration.std > 0) else np.nan
+    return {"hurst": h, "z": z, "null_mean": calibration.mean, "null_std": calibration.std}
+
+
+def aggregate_regime(series_by_symbol: dict, n_simulations: int = 300, k: float = 1.5, seed: int = None) -> dict:
+    """Classify a WHOLE UNIVERSE at once, for generating a single strategy
+    meant to apply across every instrument in it, rather than one strategy
+    per symbol.
+
+    Each symbol's Hurst is standardized against a null calibrated to that
+    symbol's OWN window length (so instruments with different history
+    lengths remain comparable), then the per-symbol z-scores are pooled via
+    their MEDIAN and classified against the same threshold used for a single
+    series. The median (not the mean) is used deliberately so one outlier
+    instrument -- e.g. a commodity ETF with an unusually strong idiosyncratic
+    trend -- can't single-handedly flip the whole universe's classification.
+
+    This directly addresses a question research flagged as open and
+    unresolved: generating an independent strategy per instrument across a
+    universe is itself a multiple-comparisons problem (whichever instrument's
+    history happened to back-test best gets reported, without correcting for
+    having effectively run N trials). Pooling the regime decision -- and,
+    downstream in `generator.py`, the parameter search itself -- across the
+    whole universe treats "does this generalize across many instruments" as
+    the actual object of search, rather than "which one instrument got the
+    luckiest fit."
+    """
+    per_symbol = {symbol: hurst_zscore(series, n_simulations=n_simulations, seed=seed)
+                  for symbol, series in series_by_symbol.items()}
+
+    z_values = np.array([v["z"] for v in per_symbol.values() if not np.isnan(v["z"])])
+    if len(z_values) == 0:
+        pooled_z, label = float("nan"), "random_walk_like"
+    else:
+        pooled_z = float(np.median(z_values))
+        if pooled_z >= k:
+            label = "trending"
+        elif pooled_z <= -k:
+            label = "mean_reverting"
+        else:
+            label = "random_walk_like"
+
+    return {
+        "regime_label": label,
+        "pooled_z": pooled_z,
+        "n_symbols": len(series_by_symbol),
+        "n_symbols_with_valid_hurst": len(z_values),
+        "per_symbol": per_symbol,
+    }

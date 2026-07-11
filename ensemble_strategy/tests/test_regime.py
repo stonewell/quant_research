@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+from common.testing import make_ohlcv_from_closes
 
 from ensemblebot.config import EnsembleConfig
 from ensemblebot.regime import apply_hysteresis, classify_regime
@@ -18,11 +19,7 @@ def test_hysteresis_defaults_to_range_before_any_threshold_crossed():
 
 
 def make_df(closes, n_pad=250):
-    closes = pd.Series(np.concatenate([np.full(n_pad, closes[0]), closes]), dtype=float)
-    idx = pd.bdate_range("2018-01-01", periods=len(closes))
-    return pd.DataFrame({
-        "Open": closes.values, "High": closes.values + 0.5, "Low": closes.values - 0.5, "Close": closes.values,
-    }, index=idx)
+    return make_ohlcv_from_closes(closes, start="2018-01-01", pad_left=n_pad)
 
 
 def test_downtrend_overrides_adx_even_if_trending():

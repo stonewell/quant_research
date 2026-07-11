@@ -1,9 +1,10 @@
 #!/usr/bin/env python
-"""CLI entry point: generate a strategy per instrument in a universe, from
-that instrument's own historical data -- either a single-window "generate"
-(fast, for exploration) or a full walk-forward validation (slower, gives an
-honest out-of-sample read via the generalization ratio and Deflated Sharpe
-Ratio).
+"""CLI entry point: generate ONE strategy for a whole universe of
+instruments, pooling their historical data -- not a separate strategy per
+symbol (see stratgen/generator.py's module docstring for why). Either a
+single-window "generate" (fast, for exploration) or a full walk-forward
+validation (slower, gives an honest out-of-sample read via the
+generalization ratio and Deflated Sharpe Ratio).
 
 NOTE: not exercised against real market data as part of this project's own
 test suite (by request) -- only synthetic-data unit/integration tests are
@@ -27,12 +28,14 @@ RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Per-instrument strategy generator")
+    p = argparse.ArgumentParser(description="Universe-wide strategy generator")
     p.add_argument("--universe", nargs="+", default=["SPY", "QQQ"])
     p.add_argument("--start", default="2010-01-01")
     p.add_argument("--end", default="2024-12-31")
     p.add_argument("--interval", default="1d")
     p.add_argument("--mode", choices=["generate", "walkforward"], default="generate")
+    p.add_argument("--aggregation", choices=["median", "mean"], default="median",
+                   help="how per-symbol Sharpe ratios are pooled into one universe-level score")
     p.add_argument("--n-random-search", type=int, default=200)
     p.add_argument("--ers-percentile-threshold", type=float, default=0.90)
     p.add_argument("--min-trades-for-trust", type=int, default=10)
@@ -44,47 +47,66 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _align_universe(universe: dict) -> dict:
+    """Walk-forward's fold boundaries are bar-position-based, so every
+    symbol must share the same trading calendar -- trim to the intersection
+    of all symbols' dates (an inner join) rather than assuming yfinance
+    happens to return identical calendars for every ticker requested."""
+    common_index = None
+    for df in universe.values():
+        common_index = df.index if common_index is None else common_index.intersection(df.index)
+    return {symbol: df.loc[common_index] for symbol, df in universe.items()}
+
+
 def main():
     args = build_arg_parser().parse_args()
     gen_config = GeneratorConfig(
         n_random_search=args.n_random_search, ers_percentile_threshold=args.ers_percentile_threshold,
-        min_trades_for_trust=args.min_trades_for_trust,
+        min_trades_for_trust=args.min_trades_for_trust, aggregation=args.aggregation,
     )
 
-    rows = []
+    universe = {}
     for symbol in args.universe:
         print(f"Loading {symbol} ...")
-        df = load_ohlcv(symbol, args.start, args.end, args.interval, use_cache=not args.no_cache)
-
-        if args.mode == "generate":
-            spec = StrategyGenerator(gen_config).generate(df)
-            print(f"  {symbol}: regime={spec.regime_label} hurst={spec.hurst:.3f} "
-                  f"template={spec.template_name} params={spec.params} "
-                  f"train_sharpe={spec.train_sharpe:.2f} ers_percentile={spec.ers_percentile:.2f} "
-                  f"trusted={spec.trusted}")
-            rows.append({"symbol": symbol, "regime_label": spec.regime_label, "hurst": spec.hurst,
-                         "template": spec.template_name, "params": spec.params, "train_sharpe": spec.train_sharpe,
-                         "train_num_trades": spec.train_num_trades, "ers_percentile": spec.ers_percentile,
-                         "trusted": spec.trusted})
-        else:
-            wf_config = WalkForwardConfig(
-                train_years=args.train_years, validation_years=args.validation_years,
-                test_years=args.test_years, embargo_days=args.embargo_days, generator_config=gen_config,
-            )
-            result = run_walkforward(df, wf_config)
-            print(f"  {symbol}: n_folds={result['n_folds']} mean_validation_sharpe={result['mean_validation_sharpe']:.2f} "
-                  f"mean_test_sharpe={result['mean_test_sharpe']:.2f} "
-                  f"generalization_ratio={result['generalization_ratio']:.2f} "
-                  f"DSR={result['deflated_sharpe_ratio']}")
-            rows.append({"symbol": symbol, "n_folds": result["n_folds"],
-                         "mean_validation_sharpe": result["mean_validation_sharpe"],
-                         "mean_test_sharpe": result["mean_test_sharpe"],
-                         "generalization_ratio": result["generalization_ratio"],
-                         "deflated_sharpe_ratio": result["deflated_sharpe_ratio"]})
+        universe[symbol] = load_ohlcv(symbol, args.start, args.end, args.interval, use_cache=not args.no_cache)
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    out_path = os.path.join(RESULTS_DIR, f"strategygen_{args.mode}_report.csv")
-    pd.DataFrame(rows).to_csv(out_path, index=False)
+
+    if args.mode == "generate":
+        spec = StrategyGenerator(gen_config).generate(universe)
+        print(f"\n=== Generated strategy for universe of {spec.n_symbols} symbols ===")
+        print(f"  regime={spec.regime_label} pooled_hurst_z={spec.pooled_hurst_z:.2f}")
+        print(f"  template={spec.template_name} params={spec.params}")
+        print(f"  universe_sharpe ({args.aggregation})={spec.universe_sharpe:.2f} "
+              f"total_trades={spec.total_num_trades} ers_percentile={spec.ers_percentile:.2f} trusted={spec.trusted}")
+        print("\n  Per-symbol breakdown (how consistent is this 'universal' strategy?):")
+        per_symbol_df = pd.DataFrame({
+            "sharpe": spec.per_symbol_sharpe, "num_trades": spec.per_symbol_num_trades,
+        })
+        print(per_symbol_df.round(2))
+
+        out_path = os.path.join(RESULTS_DIR, "strategygen_generate_report.csv")
+        per_symbol_df.to_csv(out_path)
+    else:
+        aligned = _align_universe(universe)
+        wf_config = WalkForwardConfig(
+            train_years=args.train_years, validation_years=args.validation_years,
+            test_years=args.test_years, embargo_days=args.embargo_days, generator_config=gen_config,
+        )
+        result = run_walkforward(aligned, wf_config)
+        print(f"\n=== Walk-forward validation for universe of {result['n_symbols']} symbols ===")
+        print(f"  n_folds={result['n_folds']} mean_validation_sharpe={result['mean_validation_sharpe']:.2f} "
+              f"mean_test_sharpe={result['mean_test_sharpe']:.2f} "
+              f"generalization_ratio={result['generalization_ratio']:.2f} "
+              f"DSR={result['deflated_sharpe_ratio']}")
+        for i, fold in enumerate(result["folds"]):
+            print(f"  fold {i}: regime={fold['regime_label']} template={fold['template_name']} "
+                  f"params={fold['params']} validation_sharpe={fold['validation_sharpe']:.2f} "
+                  f"test_sharpe={fold['test_sharpe']:.2f} trusted={fold['trusted']}")
+
+        out_path = os.path.join(RESULTS_DIR, "strategygen_walkforward_report.csv")
+        pd.DataFrame(result["folds"]).to_csv(out_path, index=False)
+
     print(f"\nSaved report to {out_path}")
 
 

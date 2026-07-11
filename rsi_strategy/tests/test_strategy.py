@@ -1,17 +1,10 @@
 import numpy as np
 import pandas as pd
+from common.testing import make_ohlcv_from_closes as make_df
 
 from rsibot.config import RSIConfig
 from rsibot.indicators import rsi
 from rsibot.strategy import generate_signals
-
-
-def make_df(closes):
-    closes = pd.Series(closes, dtype=float)
-    idx = pd.bdate_range("2020-01-01", periods=len(closes))
-    return pd.DataFrame({
-        "Open": closes.values, "High": closes.values + 0.5, "Low": closes.values - 0.5, "Close": closes.values,
-    }, index=idx)
 
 
 def test_entry_signal_matches_raw_rsi_threshold_when_trend_filter_disabled():

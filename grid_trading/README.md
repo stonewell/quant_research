@@ -74,15 +74,22 @@ docstrings say so explicitly.
 
 ## Project layout
 
+Shared code (the yfinance loader, standard indicators, and standard
+performance metrics) lives one level up in `../common/` and is used by every
+project in this workspace. Each module here re-exports the shared functions
+it needs and keeps only project-specific logic local, so the public API
+(`gridbot.data.load_ohlcv`, `gridbot.metrics.sharpe_ratio`, etc.) is
+unchanged for callers.
+
 ```
 grid_trading/
   gridbot/
     config.py        GridConfig dataclass — every tunable parameter
-    data.py           yfinance OHLCV loader with local CSV caching
-    indicators.py     ATR (Wilder), SMA, trend-regime classifier
+    data.py           Thin wrapper over ../common/data.py, pinned to this project's data/ dir
+    indicators.py     trend_regime (local) + atr/sma re-exported from ../common/indicators.py
     grid_engine.py    Grid geometry + slot fill state machine (no money logic)
     backtester.py     Event loop: cash/equity accounting, costs, risk controls
-    metrics.py        CAGR, Sharpe, Sortino, max drawdown, win rate, profit factor
+    metrics.py        summarize() (local) + base metrics re-exported from ../common/metrics.py
     plotting.py       Price+grid+trades chart, equity-curve-vs-benchmark chart
   run_backtest.py      CLI entry point
   tests/                pytest unit + integration tests

@@ -1,33 +1,13 @@
 """Technical indicators used to drive the adaptive grid: ATR for volatility-based
 spacing, and a long-term SMA band used as a trend filter.
+
+`atr` and `sma` are re-exported from the shared `common/indicators.py`
+module; `trend_regime` is specific to this project's grid strategy.
 """
 
 import numpy as np
 import pandas as pd
-
-
-def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Wilder's Average True Range.
-
-    df must have columns High, Low, Close. Returns a Series aligned to df.index.
-    Uses Wilder's smoothing (equivalent to an EWM with alpha = 1/period), the
-    standard ATR definition used in the ATR-grid-spacing sources reviewed.
-    """
-    high, low, close = df["High"], df["Low"], df["Close"]
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [
-            high - low,
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    return tr.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
-
-
-def sma(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(window=period, min_periods=period).mean()
+from common.indicators import atr, sma
 
 
 def trend_regime(close: pd.Series, ma_period: int = 100, band_pct: float = 0.03) -> pd.Series:
