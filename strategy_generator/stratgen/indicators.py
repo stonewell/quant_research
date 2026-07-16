@@ -10,4 +10,4 @@ constructs rather than an arbitrary function set -- is deliberately followed
 here instead of building a full genetic-programming symbolic search.
 """
 
-from common.indicators import atr, atr_pct, rsi, sma
+from common.indicators import atr, atr_pct, realized_vol, rsi, sma
