@@ -15,11 +15,20 @@ indicator lookback windows straddling the validation/test boundary. The
 "generalization ratio" (mean out-of-sample performance / mean in-sample
 performance) measures how much the strategy degrades out of sample.
 
-Regime classification (Hurst) and the parameter grid search are both fit
-using ONLY the train window of each fold, POOLED (median) across every
-symbol in the universe; the winning parameterization is chosen by POOLED
-VALIDATION-window performance, and POOLED test-window performance is
-computed only once, after selection, per fold.
+Regime classification (Hurst) is fit using ONLY the train window of each
+fold, POOLED (median) across every symbol in the universe -- that part is
+about which single-symbol TEMPLATE FAMILY to route to, and is unaffected by
+the change below. The parameter grid search, however, now matches
+`generator.py`'s single-shot `generate()` methodology: each candidate is
+scored by ONE multi-asset PORTFOLIO backtest across the whole fold universe
+(`portfolio_backtester.py`) rather than N independent per-symbol backtests
+pooled by median after the fact. The winning parameterization is chosen by
+that one combined equity curve's VALIDATION-window Sharpe, and its
+TEST-window Sharpe/trade-count are read from the SAME combined run, once,
+after selection -- not pooled from N separate per-symbol test-window slices.
+This was a deliberate revision (walk-forward previously used the older
+per-symbol-pooled methodology after `generate()` had already moved on from
+it -- see strategy_generator/README.md's "Known limitations" history).
 
 Because fold boundaries are defined by bar POSITION (not date), every symbol
 in the universe must share the same number of bars / trading calendar --
@@ -32,9 +41,9 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from .backtester import run_backtest
 from .generator import GeneratorConfig, grid_combinations
 from .metrics import deflated_sharpe_ratio, sharpe_ratio
+from .portfolio_backtester import run_portfolio_backtest
 from .regime import aggregate_regime
 from .templates import TEMPLATES_BY_REGIME, NoTradeTemplate
 
@@ -92,11 +101,6 @@ def _slice_sharpe(equity_curve: pd.DataFrame, start_date, end_date) -> tuple:
     return sharpe_ratio(returns), len(window)
 
 
-def _pool(values: list) -> float:
-    valid = [v for v in values if np.isfinite(v)]
-    return float(np.median(valid)) if valid else float("-inf")
-
-
 def _validate_aligned_universe(universe: dict) -> int:
     lengths = {symbol: len(df) for symbol, df in universe.items()}
     if len(set(lengths.values())) != 1:
@@ -126,45 +130,53 @@ def _evaluate_fold(universe: dict, fold: dict, config: GeneratorConfig) -> dict:
 
     if isinstance(template, NoTradeTemplate):
         return {"regime_label": regime["regime_label"], "pooled_hurst_z": regime["pooled_z"], "template_name": template.name,
-                "params": {}, "validation_sharpe": 0.0, "test_sharpe": 0.0, "test_num_trades": 0,
+                "params": {}, "validation_sharpe": 0.0, "test_sharpe": 0.0, "test_num_trades": 0, "test_num_bars": 0,
                 "n_trials": 0, "trusted": True}
 
     combos = grid_combinations(template.param_grid)
     scored = []
     for params in combos:
-        per_symbol_validation_sharpe, per_symbol_eq = [], {}
-        for symbol, fdf in fold_universe.items():
-            try:
-                result = run_backtest(fdf, template, params, initial_capital=config.initial_capital,
-                                       commission_per_trade=config.commission_per_trade, commission_pct=config.commission_pct,
-                                       slippage_pct=config.slippage_pct, atr_period=config.atr_period)
-            except Exception:
-                per_symbol_validation_sharpe.append(float("-inf"))
-                continue
-            eq = result["equity_curve"]
-            if eq.empty:
-                per_symbol_validation_sharpe.append(float("-inf"))
-                continue
-            v_sharpe, _ = _slice_sharpe(eq, validation_start_date, validation_end_date)
-            per_symbol_validation_sharpe.append(v_sharpe)
-            per_symbol_eq[symbol] = eq
-        scored.append((params, _pool(per_symbol_validation_sharpe), per_symbol_eq))
+        try:
+            result = run_portfolio_backtest(
+                fold_universe, template, params, max_concurrent_positions=config.max_concurrent_positions,
+                max_holding_days=config.single_symbol_max_holding_days, initial_capital=config.initial_capital,
+                commission_per_trade=config.commission_per_trade, commission_pct=config.commission_pct,
+                slippage_pct=config.slippage_pct, atr_period=config.atr_period,
+            )
+        except Exception:
+            scored.append((params, float("-inf"), None))
+            continue
+        eq = result["equity_curve"]
+        if eq.empty:
+            scored.append((params, float("-inf"), None))
+            continue
+        v_sharpe, _ = _slice_sharpe(eq, validation_start_date, validation_end_date)
+        scored.append((params, v_sharpe, result))
 
-    best_params, best_pooled_validation, best_per_symbol_eq = max(scored, key=lambda r: r[1])
+    best_params, best_validation_sharpe, best_result = max(scored, key=lambda r: r[1])
 
-    per_symbol_test_sharpe, per_symbol_test_n = {}, {}
-    for symbol, eq in best_per_symbol_eq.items():
-        ts, tn = _slice_sharpe(eq, test_start_date, test_end_date)
-        per_symbol_test_sharpe[symbol] = ts
-        per_symbol_test_n[symbol] = tn
-    pooled_test = _pool(list(per_symbol_test_sharpe.values()))
-    total_test_trades = int(sum(per_symbol_test_n.values()))
+    if best_result is None:
+        test_sharpe, test_num_bars, test_num_trades = float("-inf"), 0, 0
+    else:
+        test_sharpe, test_num_bars = _slice_sharpe(best_result["equity_curve"], test_start_date, test_end_date)
+        trades = best_result["trades"]
+        if trades.empty:
+            test_num_trades = 0
+        else:
+            in_test_window = (trades["date"] >= test_start_date) & (trades["date"] < test_end_date)
+            # Actual closed-trade count in the test window, used for the `min_trades_for_trust` gate.
+            # The per-symbol-pooled design this replaced conflated this with `test_num_bars` below (a
+            # pre-existing naming mismatch that silently inflated trust, since bars-in-window is always
+            # >> trades-in-window) -- kept as two separate fields now: `test_num_bars` still feeds DSR's
+            # `n_obs` (the return-series sample size backing the Sharpe estimate, which IS bar count, not
+            # trade count), while `test_num_trades` is the actual trade count the trust gate needs.
+            test_num_trades = int((in_test_window & (trades["side"] == "sell")).sum())
 
-    trusted = best_pooled_validation > 0 and total_test_trades >= config.min_trades_for_trust
+    trusted = best_validation_sharpe > 0 and test_num_trades >= config.min_trades_for_trust
     return {
         "regime_label": regime["regime_label"], "pooled_hurst_z": regime["pooled_z"], "template_name": template.name,
-        "params": best_params, "validation_sharpe": best_pooled_validation, "test_sharpe": pooled_test,
-        "test_num_trades": total_test_trades, "n_trials": len(combos), "trusted": trusted,
+        "params": best_params, "validation_sharpe": best_validation_sharpe, "test_sharpe": test_sharpe,
+        "test_num_trades": test_num_trades, "test_num_bars": test_num_bars, "n_trials": len(combos), "trusted": trusted,
     }
 
 
@@ -191,7 +203,7 @@ def run_walkforward(universe: dict, config: WalkForwardConfig = None) -> dict:
     generalization_ratio = (mean_oos / mean_is) if mean_is > 0 else float("nan")
 
     total_trials = sum(r["n_trials"] for r in fold_results)
-    total_test_obs = sum(r["test_num_trades"] for r in fold_results)
+    total_test_obs = sum(r["test_num_bars"] for r in fold_results)  # DSR's n_obs = return-series sample size, not trade count
     dsr = None
     if len(test_sharpes) and total_trials > 1:
         dsr = deflated_sharpe_ratio(float(np.median(test_sharpes)), n_trials=max(total_trials, len(fold_results)),

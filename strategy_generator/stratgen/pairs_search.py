@@ -65,6 +65,7 @@ class PairsSearchResult:
     trusted: bool
     n_pairs_searched: int
     n_pairs_total: int
+    per_symbol_pnl: dict = None  # {symbol_a: realized P&L on that leg, symbol_b: realized P&L on that leg}
 
 
 def _align(df_a: pd.DataFrame, df_b: pd.DataFrame) -> tuple:
@@ -129,6 +130,28 @@ def search_pairs_candidates(universe: dict, gen_config, pairs_config: PairsSearc
 
     best_pair, best_params, best_sharpe, best_trades = max(grid_results, key=lambda r: r[2])
 
+    # Re-run the winning combo once more to get its trade log for the per-symbol P&L breakdown
+    # -- cheaper than storing every combo's trade log during the grid search above.
+    best_pc = PairsConfig(lookback=best_params["lookback"], entry_zscore=best_params["entry_zscore"],
+                          max_holding_days=pairs_config.max_holding_days)
+    best_df_a, best_df_b = aligned[best_pair]
+    try:
+        best_result = run_pairs_backtest(
+            best_df_a, best_df_b, best_pc, initial_capital=gen_config.initial_capital,
+            commission_per_trade=gen_config.commission_per_trade, commission_pct=gen_config.commission_pct,
+            slippage_pct=gen_config.slippage_pct, warmup=gen_config.warmup,
+        )
+        best_trade_log = best_result["trades"]
+    except Exception:
+        best_trade_log = pd.DataFrame()
+    if best_trade_log.empty:
+        per_symbol_pnl = {best_pair[0]: 0.0, best_pair[1]: 0.0}
+    else:
+        per_symbol_pnl = {
+            best_pair[0]: float(best_trade_log.loc[best_trade_log["instrument"] == "a", "pnl"].sum()),
+            best_pair[1]: float(best_trade_log.loc[best_trade_log["instrument"] == "b", "pnl"].sum()),
+        }
+
     random_scores = []
     for _ in range(gen_config.n_random_search):
         pair = searched_pairs[rng.integers(len(searched_pairs))]
@@ -146,5 +169,5 @@ def search_pairs_candidates(universe: dict, gen_config, pairs_config: PairsSearc
         symbol_a=best_pair[0], symbol_b=best_pair[1], params=best_params, sharpe=best_sharpe,
         num_trades=best_trades, ers_passed=ers_passed, ers_percentile=ers_percentile,
         n_trials=len(searched_pairs) * len(combos) + len(random_scores), trusted=trusted,
-        n_pairs_searched=len(searched_pairs), n_pairs_total=len(all_pairs),
+        n_pairs_searched=len(searched_pairs), n_pairs_total=len(all_pairs), per_symbol_pnl=per_symbol_pnl,
     )

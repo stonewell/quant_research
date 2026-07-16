@@ -26,7 +26,7 @@ def test_generate_produces_one_spec_for_whole_universe_not_per_symbol():
     assert isinstance(spec.template_name, str)
     assert isinstance(spec.params, dict)
     # But per-symbol transparency is still exposed for the chosen params.
-    assert set(spec.per_symbol_sharpe.keys()) == {"A", "B", "C"}
+    assert set(spec.per_symbol_pnl.keys()) == {"A", "B", "C"}
     assert set(spec.per_symbol_num_trades.keys()) == {"A", "B", "C"}
 
 
@@ -38,7 +38,7 @@ def test_universe_of_random_walks_routes_to_no_trade():
     assert spec.strategy_family == "no_trade"
     assert spec.n_trials == 0
     assert spec.trusted
-    assert spec.per_symbol_sharpe == {"A": 0.0, "B": 0.0}
+    assert spec.per_symbol_pnl == {"A": 0.0, "B": 0.0}
 
 
 def test_universe_of_strong_trends_routes_to_momentum():
@@ -99,21 +99,33 @@ def test_n_trials_accounts_for_grid_and_random_search_regardless_of_universe_siz
     assert spec.n_trials == grid_size + 25
 
 
-def test_median_aggregation_differs_from_mean_when_configured():
+def test_single_symbol_search_scores_one_combined_portfolio_not_pooled_per_symbol_sharpes():
+    # The whole point of this design: universe_sharpe is ONE number from ONE
+    # multi-asset portfolio backtest, not a per-symbol dict pooled by
+    # median/mean -- there is no more `aggregation` config knob because
+    # there's nothing left to pool.
     universe = {
         "A": _ar1_close(phi=0.75, n=1200, seed=10),
         "B": _ar1_close(phi=0.75, n=1200, seed=11),
         "C": _ar1_close(phi=0.75, n=1200, seed=12),
     }
-    spec_median = StrategyGenerator(GeneratorConfig(
-        n_random_search=15, hurst_seed=1, aggregation="median", search_pairs=False,
+    spec = StrategyGenerator(GeneratorConfig(n_random_search=15, hurst_seed=1, search_pairs=False)).generate(universe)
+    assert isinstance(spec.universe_sharpe, float)
+    assert np.isfinite(spec.universe_sharpe)
+    assert not hasattr(GeneratorConfig(), "aggregation")
+
+
+def test_max_concurrent_positions_caps_the_portfolio_search():
+    universe = {
+        "A": _ar1_close(phi=0.75, n=1200, seed=10),
+        "B": _ar1_close(phi=0.75, n=1200, seed=11),
+        "C": _ar1_close(phi=0.75, n=1200, seed=12),
+    }
+    spec = StrategyGenerator(GeneratorConfig(
+        n_random_search=10, hurst_seed=1, search_pairs=False, max_concurrent_positions=1,
     )).generate(universe)
-    spec_mean = StrategyGenerator(GeneratorConfig(
-        n_random_search=15, hurst_seed=1, aggregation="mean", search_pairs=False,
-    )).generate(universe)
-    # Both should at least run to completion and produce a real (non -inf) pooled score.
-    assert np.isfinite(spec_median.universe_sharpe)
-    assert np.isfinite(spec_mean.universe_sharpe)
+    assert spec.strategy_family == "single_symbol"
+    assert np.isfinite(spec.universe_sharpe)
 
 
 # --- pairs-candidate integration: the architecture-limit removal itself ---

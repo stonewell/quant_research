@@ -132,28 +132,42 @@ percentage), per the research's emphasis on volatility-relative rather than
 universal risk parameters — and is a template-level constant, not searched,
 to keep the effective number of trials small and auditable.
 
-**Pooled selection**: each of the 9 candidate parameter combinations is
-backtested INDEPENDENTLY on every symbol in the universe, and the combination
-selected is the one with the best POOLED (median, by default; `mean` is also
-available via `GeneratorConfig.aggregation`) Sharpe ratio across all of them
-— not the one that best fits any single instrument. `GeneratedStrategySpec.per_symbol_sharpe`
-and `.per_symbol_num_trades` expose the per-instrument breakdown for the
-*winning* parameters, specifically so you can see how consistent the
-"universal" choice actually is (a strategy that pools well because it's
-mediocre-everywhere looks very different from one that's strong on most
-names and pooled-down by one laggard, and the summary number alone can't
-tell you which).
+**Portfolio selection**: each of the 9 candidate parameter combinations is
+backtested as ONE multi-asset PORTFOLIO run across the whole universe
+(`portfolio_backtester.py`) — every symbol the template signals on is traded
+CONCURRENTLY, sharing one cash pool, capped at `max_concurrent_positions`
+equal-weight slots and a hard `single_symbol_max_holding_days` cap (default
+63 trading days ≈ 3 months) per position. The combination selected is the
+one with the best Sharpe ratio from that single combined equity curve — not
+the one that best fits any single instrument, and (this is the change from
+an earlier design) not a median/mean POOLED from N independent single-asset
+backtests either. `GeneratedStrategySpec.per_symbol_pnl` and
+`.per_symbol_num_trades` still expose a per-instrument breakdown of the
+*winning* run, specifically so you can see how consistent the "universal"
+choice actually is (a strategy that scores well because one or two symbols
+carried the whole portfolio looks very different from one that contributed
+evenly, and the summary Sharpe alone can't tell you which) — but they're now
+each symbol's share of ONE shared run, not N separately-computed Sharpe
+ratios pooled after the fact.
+
+**Why this is a more honest evaluation than the design it replaced**: N
+independent single-asset backtests each implicitly assume 100% of capital
+is available to trade EVERY symbol at once — impossible in a real account.
+A shared-portfolio backtest is forced to size positions down when several
+symbols signal simultaneously (equal-weight across `max_concurrent_
+positions` slots), so a template that looks great pooled-independently but
+would in practice need more capital than you have gets scored accordingly.
 
 ### 3. Equivalent Random Search (ERS) — a mandatory sanity pretest
 
 Concrete, quantifiable pretest (Chen & Navet, ICONIP 2006): before trusting
 any search result, compare it against a size-matched pool of **randomly
-generated** candidate parameterizations evaluated on the *same* (pooled,
-universe-wide) objective. Beating that pool is necessary but explicitly **not
+generated** candidate parameterizations evaluated on the *same* (combined-
+portfolio) objective. Beating that pool is necessary but explicitly **not
 sufficient** for concluding a generated strategy is genuinely good — it only
 clears a minimum bar (default: the grid-search winner must beat the 90th
-percentile of 200 random candidates, each itself scored by its own pooled
-performance across the universe). Failing this check is treated as a hard
+percentile of 200 random candidates, each itself scored by its own portfolio
+backtest across the universe). Failing this check is treated as a hard
 signal that the search machinery found nothing better than chance would have.
 
 ### 4. Walk-forward validation — the standard, concretely-specified defense
@@ -357,16 +371,17 @@ strategy_generator/
     indicators.py     rsi/sma/atr/atr_pct/realized_vol re-exported from ../common/indicators.py (the deliberately small primitive set)
     regime.py          hurst_exponent re-exported from ../common/hurst.py; Monte-Carlo calibration + universe-wide median-pooled classification (local, unique to this project)
     templates.py       MomentumTemplate, MeanReversionTemplate, NoTradeTemplate, TurnOfMonthTemplate, VolGatedMomentumTemplate (2 free params each)
-    backtester.py      Template-agnostic event loop: next-bar-open entries, intrabar ATR-stop, mark-to-market (single-instrument, long-only)
+    backtester.py      Single-instrument, single-position event loop (next-bar-open entries, intrabar ATR-stop) -- used directly by tests/manual exploration; generator.py now scores candidates via portfolio_backtester.py instead
+    portfolio_backtester.py  Multi-asset portfolio backtest: concurrent positions across every signaled symbol in a universe, one shared cash pool, equal-weight slots, hard max-holding-days cap -- what generator.py's single-symbol search actually scores candidates with
     pairs.py            Distance/rolling-z-score pairs-trading signals (two-instrument, long-short -- not a Template subclass, see above)
     pairs_backtester.py  Dollar-neutral long-short execution matching pairs.py's signals
     pairs_search.py       Pairs-candidate search across every pair in a universe + its own Equivalent Random Search check -- the pairs analogue of the single-symbol grid search below
     metrics.py          summarize() (local) + base metrics + Deflated Sharpe Ratio re-exported from ../common/metrics.py
-    generator.py        Universe-pooled regime routing + constrained grid search + ERS for single-symbol templates, PLUS the pairs-candidate search, compared and reconciled into one GeneratedStrategySpec
-    walkforward.py       Three-way split (train/validation/test) across rolling folds, applied to the pooled universe (single-symbol templates only -- see Known limitations)
+    generator.py        Hurst-regime routing + constrained grid search scored via ONE combined-portfolio backtest per candidate (not pooled per-symbol Sharpes) + ERS, PLUS the pairs-candidate search, compared and reconciled into one GeneratedStrategySpec
+    walkforward.py       Three-way split (train/validation/test) across rolling folds, each candidate scored via the SAME combined-portfolio backtest as generate() (single-symbol templates only -- pairs not yet wired in, see Known limitations)
     data.py               Thin wrapper over ../common/data.py (present, usable, not exercised this session)
   run_strategygen.py       CLI: "generate" (fast, single-window) or "walkforward" (full validation) for the WHOLE universe
-  tests/                    pytest, synthetic data only -- includes test_pairs.py and test_pairs_search.py for the new pairs capability
+  tests/                    pytest, synthetic data only -- includes test_portfolio_backtester.py, test_pairs.py, and test_pairs_search.py for the newer capabilities
   data/, results/           gitignored
 ```
 
@@ -393,10 +408,11 @@ Key options (see `python run_strategygen.py --help` for the full list):
 | Flag | Meaning |
 |---|---|
 | `--mode` | `generate` (one-shot, all history) or `walkforward` (proper rolling validation) |
-| `--aggregation` | `median` (default; resists one outlier instrument) or `mean`, for pooling per-symbol Sharpe ratios |
 | `--n-random-search` | Size of the Equivalent Random Search pool, for BOTH the single-symbol and pairs candidate searches (default 200) |
 | `--ers-percentile-threshold` | How far above the random pool a candidate must rank to be trusted (default 0.90) |
 | `--min-trades-for-trust` | Minimum trade count (total across the universe for single-symbol; round-trips for the winning pair) before a result is trusted (default 10) |
+| `--max-concurrent-positions` | Equal-weight slot cap for the single-symbol multi-asset portfolio backtest (default 10) |
+| `--single-symbol-max-holding-days` | Hard cap forcing single-symbol-template positions to close under this many trading days (default 63 ≈ 3 months) |
 | `--no-search-pairs` | Disable the pairs-trading candidate search -- single-symbol templates only, restoring the pre-pairs behavior |
 | `--max-pairs-to-search` | Cap on distinct pairs backtested for large universes; C(N,2) grows quadratically (default 50) |
 | `--pairs-max-holding-days` | Hard cap forcing pairs trades to close under this many trading days (default 63 ≈ 3 months) |
@@ -412,7 +428,7 @@ bar-position-based and require a shared trading calendar across the universe.
 python -m pytest tests/ -v
 ```
 
-74 tests, synthetic data only (per this project's instruction), covering:
+87 tests, synthetic data only (per this project's instruction), covering:
 indicator correctness; the Hurst estimator's known finite-sample bias and
 its Monte-Carlo calibration; universe-wide regime pooling (median resists a
 single outlier instrument, a universe of pure noise routes to no-trade, an
@@ -427,8 +443,16 @@ on strongly-trending/mean-reverting/random-walk synthetic universes,
 including that a universal strategy still exposes a per-symbol performance
 breakdown; the walk-forward harness's fold geometry (chronological
 ordering, no overlap, correct step size), its hard rejection of a
-misaligned (differently-lengthed) universe, and a full end-to-end run
-producing a valid generalization ratio and DSR; the pairs-trading module
+misaligned (differently-lengthed) universe, a full end-to-end run
+producing a valid generalization ratio and DSR, that each fold now scores
+candidates via the same combined-portfolio backtest `generate()` uses
+(rather than the older per-symbol-pooled methodology), that
+`test_num_trades`/`test_num_bars` are tracked as two genuinely different
+numbers (real closed-trade count for the trust gate vs. return-series bar
+count for DSR's `n_obs` — conflating them was a latent bug in the design
+this replaced, since bars-in-window is always far larger than trades-in-
+window and silently inflated trust), and that `max_concurrent_positions`
+forwards correctly into the fold-level portfolio search; the pairs-trading module
 (rolling z-score matching a manual calculation, correct long/short direction
 assignment and P&L sign on a deterministic divergence-then-convergence
 price series, the hard `max_holding_days` cap actually firing when a spread
@@ -448,6 +472,17 @@ which is standard practice for synthetic price simulation and inherently
 guarantees positive prices — the test suite now runs warning-free even
 under `-W error::RuntimeWarning`.
 
+`portfolio_backtester.py` also has its own dedicated coverage
+(`test_portfolio_backtester.py`): `max_concurrent_positions` is never
+exceeded, cash/equity invariants hold across multiple concurrently-held
+instruments, trades are correctly tagged by symbol, `max_holding_days`
+force-closes a position a pure signal-based exit would have held open
+indefinitely (a smooth, never-reversing uptrend where `MomentumTemplate`'s
+own crossover exit never fires), simultaneous entries on identical price
+series get equal-weight sizing, and symbols with non-overlapping calendars
+are correctly inner-joined onto their shared trading window rather than
+silently misaligned.
+
 ## Known limitations
 
 - Not validated against real market data in this session (see above) —
@@ -456,21 +491,28 @@ under `-W error::RuntimeWarning`.
 - The parameter search is a small grid, not genetic programming or Bayesian
   optimization — deliberate, per the research above, but it does mean the
   generator can only find what's inside each template's 9-combination grid.
-- **The flip side of universe-pooling**: a strategy selected for the best
-  pooled performance across many instruments may not be a strong fit for
-  ANY single one of them — pooling reduces the risk of overfitting to one
+- **The flip side of trading the universe as one portfolio**: a strategy
+  selected for the best COMBINED-portfolio performance may not be a strong
+  fit for ANY single instrument in it — sharing capital across
+  `max_concurrent_positions` slots reduces the risk of overfitting to one
   instrument's idiosyncrasies, but it can also produce a "compromise"
-  strategy that's mediocre everywhere. `per_symbol_sharpe`/`per_symbol_num_trades`
-  are exposed specifically so you can check this rather than trust the
-  pooled number blindly; a highly heterogeneous universe (e.g., mixing
-  equities, bonds, and commodities) is more likely to produce this failure
-  mode than a universe of similar instruments (e.g., US sector ETFs).
-- Pooling across the universe does NOT eliminate multiple-testing risk, it
-  relocates it: the DSR correction here accounts for the parameter-grid and
-  random-search trials within one generation run, but not for having tried
-  this on several different candidate universes and reported the best one
-  (an analogous, still-open concern research flagged for the per-instrument
-  design this replaced).
+  strategy whose good bars on some symbols mask bad bars on others.
+  `per_symbol_pnl`/`per_symbol_num_trades` are exposed specifically so you
+  can check this rather than trust the combined Sharpe blindly; a highly
+  heterogeneous universe (e.g., mixing equities, bonds, and commodities) is
+  more likely to produce this failure mode than a universe of similar
+  instruments (e.g., US sector ETFs). A related, more mechanical effect
+  worth knowing about: with more signaling symbols than free slots on a
+  given bar, `max_concurrent_positions` fills them in a fixed, deterministic
+  order (sorted symbol name, see `portfolio_backtester.py`) — no
+  signal-strength ranking is attempted, since every template here only ever
+  emits a boolean signal, not a ranked score.
+- Evaluating the universe as one portfolio does NOT eliminate multiple-
+  testing risk, it relocates it: the DSR correction here accounts for the
+  parameter-grid and random-search trials within one generation run, but not
+  for having tried this on several different candidate universes and
+  reported the best one (an analogous, still-open concern research flagged
+  for the fully-per-instrument design this replaced two revisions ago).
 - Walk-forward window defaults (4yr/2yr/1yr/30-day embargo) were calibrated
   in the source literature for liquid, long-history S&P 500 stocks; shorter-
   history instruments will need smaller windows (all configurable) or won't
