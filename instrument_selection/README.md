@@ -195,6 +195,114 @@ transparent, documented, adjustable default (pass your own `weights` dict to
 resulting rank as a shortlist to investigate further, not a proof of
 anything.
 
+## From scores to a chosen basket: the discrete selection step
+
+Everything above ranks instruments individually. It doesn't answer the
+actual question a basket-builder needs answered: **which K instruments do I
+actually trade?** Sorting by `overall_selection_score` and taking the top K
+is the obvious first idea, but it can happily fill a basket with mutually-
+redundant names that all scored well for the same reason (the README's own
+worked example above shows exactly this: QQQ and XLK, both tech-heavy, are
+97.5% correlated — a naive top-K basket could contain both and call it
+diversified). `correlation.redundancy_flags()` only WARNS about this; it
+never resolves it into a final list. A follow-up deep-research pass looked
+specifically for verified methods to close that gap — deliberately
+excluding portfolio WEIGHT optimization (Markowitz, HRP, risk parity, which
+allocate capital across an already-chosen set) since that's a different,
+later problem. Three methods survived with real evidentiary backing and are
+now implemented in `selectorbot/selection.py`:
+
+### `select_cluster_representatives` — cluster, then pick one per cluster
+Reuses this project's own `correlation.hierarchical_clusters`, then picks
+ONE representative per cluster. **Confidence: high**, but the rule matters:
+the one peer-reviewed, theoretically-grounded method for exactly this — ACC,
+"Asset Clustering through Correlation" (Tang, Xu & Zhou, *Expert Systems
+with Applications*, 2022) — proves a NARROWER rule than "pick the cluster's
+best individual scorer." Their Theorem 2 shows that among portfolios formed
+by picking one asset per correlation-cluster, choosing the **lowest-
+variance** asset in each cluster minimizes portfolio variance — a claim
+generalizing this into "lowest-volatility is the universally best
+representative-selection rule" was separately checked during this research
+and does **not** hold; the guarantee is conditional on that specific
+downstream objective (minimizing portfolio variance) and on the correlation-
+blockmodel clustering assumption. Backed by a real 19-year S&P 500 backtest
+(Feb 2001–Jan 2020): ACC-selected baskets beat both plain SPY and sector-ETF
+baskets on Sharpe/Sortino/Calmar under three separate allocation schemes
+(e.g. Sharpe 0.79–0.86 vs. SPY's 0.36; max drawdown 32.45% vs. SPY's 55.25%
+under a minimum-variance allocation). This module's `representative_rule=
+"lowest_volatility"` (the default whenever a volatility Series is supplied)
+implements the proven rule; `"highest_score"` is offered as a disclosed,
+**unproven fallback** for when volatility data isn't available, or when
+minimizing portfolio variance specifically isn't your actual goal.
+
+### `select_diversified_greedy` — Max-Sum Diversification for a fixed K
+Borodin, Lee & Ye (PODS 2012 / *ACM Transactions on Algorithms*) formalize
+exactly this problem — select a fixed-size subset maximizing a quality score
+plus the sum of pairwise diversity (distance) among selected members,
+subject to a cardinality constraint — and explicitly name "portfolio
+management" as an application domain alongside web search and facility
+location. **Confidence: high** for the algorithm/theory — they prove the
+problem is NP-hard even under a metric distance, and give a greedy
+construction (repeatedly add the candidate with the highest marginal gain:
+its own score plus `diversity_weight` times its total distance to everyone
+already chosen) with a proven constant-factor approximation guarantee for a
+monotone submodular quality function (a plain per-instrument score
+qualifies trivially, as the modular special case). **No finance-specific
+backtest exists** in the surviving research for this exact algorithm — the
+guarantee is "provably not much worse than the best possible greedy-style
+selection," not validated financial performance. Use `diversity_weight=0`
+to recover naive top-K exactly (useful for side-by-side comparison).
+
+### `select_diversified_threshold_greedy` — the simplest, threshold-gated variant
+Walks candidates in descending score order and keeps one only if its
+correlation to every already-selected instrument stays below
+`max_correlation` — literally enforcing this project's existing
+`max_cluster_correlation` config (previously used only to flag pairs, never
+to act on them) during selection itself. Unlike the other two methods, it
+determines the basket size FROM THE DATA rather than requiring K up front —
+echoing a peer-reviewed finding (Yang, Rea & Rea, *Journal of Investment
+Strategies*, 2016) that the number of instruments needed for adequate
+diversification isn't a fixed constant: their PCA-based selection method
+(a related but separately-researched, NOT-implemented-here approach — see
+below) showed the "right" count shrinks when correlations rise and grows
+when they fall, using as few as ~15 of 200 ASX-listed stocks to closely
+replicate the full index depending on the prevailing correlation regime.
+
+### What was researched but deliberately NOT implemented this pass
+- **The Generalized MaxMean Dispersion Problem** (Prokopyev et al., 2009):
+  folds the choice of K itself into a single ratio-maximization objective
+  (maximize total pairwise diversity divided by total selected weight,
+  subject only to a minimum-size constraint) — elegant, but a genuine
+  fractional-programming problem, more involved to solve correctly than
+  either greedy method above. Left undone to keep the implemented surface
+  matched to what's actually tested.
+- **PCA-based backward-elimination variable selection** (Yang, Rea & Rea
+  2016, cited above): iteratively removes the instrument contributing least
+  to diversification, using PCA loadings on the returns matrix. Needs an
+  eigendecomposition this project doesn't otherwise compute — a reasonable
+  future addition, not done here.
+
+### The failure mode none of these methods resolve
+Research explicitly checked whether the selection-step literature addresses
+this project's own prior finding (Cotter & Suurlaht 2015, in
+`correlation.py`'s docstring) that correlation-cluster-based diversification
+can back the WORST outcome during a crash. It corroborated and sharpened the
+concern rather than resolving it: **left-tail (crash) correlations run
+systematically higher than calm-period correlations across asset classes**
+— a persistent, well-documented regularity (Page & Panariello, *Financial
+Analysts Journal*, 2018, corroborating earlier foundational work: Longin &
+Solnik 2001; Ang & Bekaert 2002), not a one-off episode. All three methods
+above consume a single, unconditional correlation matrix computed over the
+whole sample (`correlation.correlation_matrix`) — none of them, nor the
+wider selection-specific literature searched for this revision, resolves
+the fact that a basket selected to look diversified in normal times can
+become far more correlated than the matrix suggests exactly when a crash
+makes diversification matter most. A claim that cluster structure becomes
+MORE rigid (rather than reshuffling) during a crisis was itself checked and
+did not hold up — so it remains a genuinely open question, not a
+merely-under-researched one, how these selected baskets actually behave
+when correlations spike.
+
 ## Other documented pitfalls (described, not coded)
 
 - **Survivorship and look-ahead bias in backtesting:** using today's index
@@ -282,9 +390,10 @@ instrument_selection/
     persistence.py    hurst_significance()/persistence_summary() (local, shuffle-based significance test) + hurst_exponent/autocorrelation/variance_ratio re-exported from ../common/hurst.py
     correlation.py    Correlation matrix, beta, hierarchical clustering, redundancy flags, regime-shift check
     scoring.py        Strategy-agnostic composite score: liquidity, volatility adequacy, predictability, diversification, history/fund-quality
+    selection.py       Turns scores + correlation into an actual chosen basket: cluster-representative, Max-Sum-Diversification greedy, and threshold-gated greedy (see "From scores to a chosen basket" above)
     plotting.py       Correlation heatmap, dendrogram, Hurst-vs-volatility scatter (descriptive, not strategy-specific)
-  run_screener.py      CLI — full report across all metrics for a universe
-  tests/                pytest unit tests (31 tests covering every module)
+  run_screener.py      CLI — full report across all metrics for a universe, plus a chosen basket via --select-method
+  tests/                pytest unit tests (43 tests covering every module)
   data/                 cached price CSVs (gitignored)
   results/              screening report, correlation matrix, charts (gitignored)
 ```
@@ -317,9 +426,16 @@ Key options (see `python run_screener.py --help` for the full list):
 | `--max-cluster-correlation` | Threshold above which a pair is flagged as redundant |
 | `--no-fund-metadata` | Skip the best-effort expense-ratio/AUM lookup (faster, no ETF-quality component) |
 | `--top-n` | How many top-ranked instruments to print by overall selection score |
+| `--select-method` | `top_k` (naive baseline), `cluster` (ACC-style representative-per-cluster), `greedy` (Max-Sum Diversification, needs `--select-k`), or `threshold` (default -- gated by `--max-cluster-correlation`, sizes itself) |
+| `--select-k` | Basket size for `top_k`/`greedy` (required for `greedy`) |
+| `--select-max-k` | Optional cap on basket size for `threshold` (which otherwise sizes itself from the data) |
 
 Outputs land in `results/`: `screening_report.csv` (every metric and score
-per symbol), `correlation_matrix.csv`, and three charts.
+per symbol), `correlation_matrix.csv`, and three charts. The chosen basket
+(per `--select-method`) prints to stdout — run all four methods side by
+side on your own universe to compare, since no head-to-head comparison of
+them survived this project's research (see "From scores to a chosen
+basket" above).
 
 ## Testing
 
@@ -327,7 +443,7 @@ per symbol), `correlation_matrix.csv`, and three charts.
 python -m pytest tests/ -v
 ```
 
-31 tests covering: the Corwin-Schultz spread estimator (non-negative,
+43 tests covering: the Corwin-Schultz spread estimator (non-negative,
 increases with wider high-low noise), realized vol/ATR%/vol-of-vol/ADX
 correctness on synthetic series with known properties, the Hurst estimator
 correctly ordering trending > random-walk > mean-reverting synthetic AR(1)
@@ -340,7 +456,19 @@ Hurst readings score near zero, diversification favors low correlation to
 the rest of the universe, history adequacy caps at the configured threshold,
 and — the most important behavioral test — that a symbol missing ETF-only
 metadata (e.g., a plain stock) still gets a valid, non-NaN overall score
-with its weights correctly renormalized rather than being penalized.
+with its weights correctly renormalized rather than being penalized;
+`selection.py`'s three methods (`test_selection.py`) on a constructed
+"near-identical pair + one independent symbol" universe: cluster
+representatives correctly collapse the redundant pair to one member per the
+`highest_score` and `lowest_volatility` rules (including that
+`lowest_volatility` overrides a higher raw score, and that requesting it
+without a volatility Series raises), the Max-Sum-Diversification greedy
+prefers the independent symbol over a near-duplicate once `diversity_weight`
+is nonzero but degenerates to exact naive top-K at `diversity_weight=0`
+(a direct check that the "improvement over naive" claim is real, not just
+asserted), and the threshold-gated greedy both skips the correlated
+lower-priority candidate and lets basket size emerge from the data rather
+than a fixed K.
 
 ## Known limitations
 
@@ -363,3 +491,20 @@ with its weights correctly renormalized rather than being penalized.
   only equals true fund age when your requested start date predates the
   fund's inception; if you request a shorter window than the fund's real
   history, this will understate its true age.
+- **`selection.py`'s three methods are not validated against real market
+  data this session** (per this pass's own instruction) — only synthetic,
+  constructed-correlation test universes. `select_cluster_representatives`
+  and `select_diversified_greedy` both carry real backtested/theoretical
+  evidence from their respective sources (see above), but this project's
+  own implementation of them hasn't been run against real prices yet.
+- All three selection methods consume ONE static, unconditional correlation
+  matrix — none of them adapts to the well-documented fact that
+  correlations spike specifically during crashes (see "The failure mode
+  none of these methods resolve," above). A basket that looks well-
+  diversified on `correlation.correlation_matrix`'s full-sample numbers can
+  still be far more correlated than that exactly when it matters most.
+- No head-to-head comparison of the three methods against EACH OTHER
+  survived research (each is validated against a naive baseline in its own
+  source, not against the others) — running more than one on your own
+  universe and comparing is this project's own exploration, not a
+  reproduction of a verified ranking.
