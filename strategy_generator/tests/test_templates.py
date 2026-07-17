@@ -2,8 +2,14 @@ import numpy as np
 import pandas as pd
 from common.testing import make_ohlcv_from_closes as make_df
 
-from stratgen.indicators import rsi, sma
-from stratgen.templates import MeanReversionTemplate, MomentumTemplate, NoTradeTemplate
+from stratgen.indicators import realized_vol, rsi, sma
+from stratgen.templates import (
+    MeanReversionTemplate,
+    MomentumTemplate,
+    NoTradeTemplate,
+    TurnOfMonthTemplate,
+    VolGatedMomentumTemplate,
+)
 
 
 def test_momentum_template_matches_manual_ma_state():
@@ -45,3 +51,84 @@ def test_momentum_and_meanrev_param_grids_are_small():
     # research-documented mitigation against unconstrained/GP-style search.
     assert len(MomentumTemplate().param_grid) == 2
     assert len(MeanReversionTemplate().param_grid) == 2
+
+
+def test_turn_of_month_template_matches_manual_calendar_calc():
+    idx = pd.bdate_range("2021-01-01", periods=400)
+    closes = 100 + np.cumsum(np.random.default_rng(11).normal(0, 1, len(idx)))
+    df = pd.DataFrame({"Open": closes, "High": closes + 0.5, "Low": closes - 0.5, "Close": closes}, index=idx)
+    template = TurnOfMonthTemplate()
+    params = {"entry_days_before_month_end": 2, "exit_trading_day_of_month": 3}
+
+    result = template.signals(df, params)
+
+    month_key = pd.Series(idx.to_period("M"), index=idx)
+    day_rank = month_key.groupby(month_key).cumcount() + 1
+    days_in_month = month_key.groupby(month_key).transform("size")
+    days_until_end = days_in_month - day_rank
+    expected_entry = days_until_end < 2
+    expected_exit = day_rank > 3
+
+    pd.testing.assert_series_equal(result["entry_signal"], expected_entry, check_names=False)
+    pd.testing.assert_series_equal(result["exit_signal"], expected_exit, check_names=False)
+    # Entry should only ever fire in the last couple of trading days of a month.
+    assert (days_in_month[result["entry_signal"]] - day_rank[result["entry_signal"]] < 2).all()
+
+
+def test_turn_of_month_template_trades_only_a_few_days_per_month():
+    idx = pd.bdate_range("2021-01-01", periods=500)
+    closes = 100 + np.cumsum(np.random.default_rng(12).normal(0, 1, len(idx)))
+    df = pd.DataFrame({"Open": closes, "High": closes + 0.5, "Low": closes - 0.5, "Close": closes}, index=idx)
+    template = TurnOfMonthTemplate()
+    result = template.signals(df, {"entry_days_before_month_end": 1, "exit_trading_day_of_month": 3})
+    # Roughly 1 entry day and up to 3 exit-eligible days per ~21-trading-day month --
+    # entry should fire far less often than it doesn't.
+    assert 0 < result["entry_signal"].mean() < 0.15
+
+
+def test_vol_gated_momentum_template_matches_manual_calc():
+    rng = np.random.default_rng(13)
+    closes = 100 + np.cumsum(rng.normal(0, 1, 500))
+    df = make_df(closes)
+    template = VolGatedMomentumTemplate()
+    params = {"vol_lookback": 20, "vol_percentile": 90}
+
+    result = template.signals(df, params)
+
+    trend_ma = sma(df["Close"], template.trend_ma_period)
+    trend_ok = (df["Close"] > trend_ma).fillna(False)
+    vol = realized_vol(df["Close"], 20)
+    vol_threshold = vol.rolling(252, min_periods=252).quantile(0.90)
+    vol_extreme_high = (vol > vol_threshold).fillna(False)
+
+    pd.testing.assert_series_equal(result["entry_signal"], (trend_ok & ~vol_extreme_high), check_names=False)
+    pd.testing.assert_series_equal(result["exit_signal"], ((~trend_ok) | vol_extreme_high), check_names=False)
+
+
+def test_vol_gated_momentum_template_blocks_entries_during_a_vol_spike():
+    # A quiet uptrend (trend_ok true throughout) with one deterministic, sharp
+    # volatility spike injected midway -- entries should be blocked and any
+    # open position forced flat only during/around that spike, not the whole
+    # otherwise-calm uptrend.
+    n = 500
+    idx = pd.bdate_range("2019-01-01", periods=n)
+    t = np.arange(n)
+    closes = 100 + t * 0.05
+    closes = closes.astype(float)
+    rng = np.random.default_rng(14)
+    spike = np.zeros(n)
+    spike[300:320] = rng.normal(0, 8, 20)  # a short, violent volatility burst
+    closes = closes + spike
+    df = pd.DataFrame({"Open": closes, "High": closes + 0.5, "Low": closes - 0.5, "Close": closes}, index=idx)
+
+    template = VolGatedMomentumTemplate()
+    result = template.signals(df, {"vol_lookback": 10, "vol_percentile": 90})
+
+    assert result["entry_signal"].iloc[:280].any()  # normal calm uptrend: entries allowed
+    assert result["exit_signal"].iloc[305:320].any()  # spike window: forced flat at some point
+    assert len(template.param_grid) == 2
+
+
+def test_new_calendar_and_vol_gated_param_grids_are_small():
+    assert len(TurnOfMonthTemplate().param_grid) == 2
+    assert len(VolGatedMomentumTemplate().param_grid) == 2

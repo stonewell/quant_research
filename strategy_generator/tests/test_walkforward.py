@@ -88,3 +88,53 @@ def test_run_walkforward_dsr_is_a_probability_when_present():
     result = run_walkforward(universe, _small_wf_config())
     if result["deflated_sharpe_ratio"] is not None:
         assert 0.0 <= result["deflated_sharpe_ratio"] <= 1.0
+
+
+# --- portfolio-scoring rewire: matches generator.py's generate() methodology ---
+
+def test_fold_results_report_test_num_trades_and_test_num_bars_separately():
+    # These used to be conflated into one field (bar count doing double duty
+    # as a trade-count proxy) -- the fix that matched generate()'s actual
+    # trade-count semantics needs test_num_bars to stay separately available
+    # for DSR's n_obs, which wants the return-series sample size, not trades.
+    universe = {"A": _ar1_close(0.5, 2500, seed=5), "B": _ar1_close(0.5, 2500, seed=6)}
+    result = run_walkforward(universe, _small_wf_config())
+    for fold in result["folds"]:
+        assert "test_num_trades" in fold
+        assert "test_num_bars" in fold
+        if fold["template_name"] != "no_trade":
+            # A fold's test window has far more trading days than round-trip trades.
+            assert fold["test_num_trades"] <= fold["test_num_bars"]
+
+
+def test_min_trades_for_trust_uses_actual_trade_count_not_bar_count():
+    # A test window of ~0.5 years has roughly 125 trading days but a
+    # trend-following template holding for weeks/months will realistically
+    # produce far fewer than 125 round-trip trades in that window -- setting
+    # min_trades_for_trust between those two numbers should read as
+    # untrusted. Before the fix, `test_num_trades` was actually a bar count,
+    # so this threshold would have been satisfied by bars alone regardless
+    # of how few real trades occurred.
+    universe = {"A": _ar1_close(0.75, 2500, seed=10), "B": _ar1_close(0.75, 2500, seed=11)}
+    config = WalkForwardConfig(
+        train_years=1.5, validation_years=0.7, test_years=0.5, embargo_days=10, warmup_buffer_days=200,
+        generator_config=GeneratorConfig(n_random_search=5, hurst_seed=1, min_trades_for_trust=80),
+    )
+    result = run_walkforward(universe, config)
+    for fold in result["folds"]:
+        if fold["template_name"] != "no_trade":
+            assert fold["test_num_bars"] > 80  # far more trading days than trades in a ~0.5yr window
+            if fold["test_num_trades"] < 80:
+                assert not fold["trusted"]
+
+
+def test_max_concurrent_positions_is_forwarded_to_the_portfolio_search():
+    universe = {
+        "A": _ar1_close(0.5, 2500, seed=5), "B": _ar1_close(0.5, 2500, seed=6), "C": _ar1_close(0.5, 2500, seed=7),
+    }
+    config = WalkForwardConfig(
+        train_years=1.5, validation_years=0.7, test_years=0.5, embargo_days=10, warmup_buffer_days=200,
+        generator_config=GeneratorConfig(n_random_search=5, hurst_seed=1, max_concurrent_positions=1),
+    )
+    result = run_walkforward(universe, config)
+    assert result["n_folds"] > 0  # runs to completion with a restrictive slot cap, doesn't crash

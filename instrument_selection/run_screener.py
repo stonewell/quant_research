@@ -14,7 +14,7 @@ import os
 
 import pandas as pd
 
-from selectorbot import correlation, liquidity, persistence, plotting, scoring, volatility
+from selectorbot import correlation, liquidity, persistence, plotting, scoring, selection, volatility
 from selectorbot.config import SelectionConfig
 from selectorbot.data import fetch_fund_metadata, load_universe
 
@@ -34,6 +34,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-fund-metadata", action="store_false", dest="fetch_fund_metadata",
                     default=d.fetch_fund_metadata, help="skip best-effort expense-ratio/AUM lookup")
     p.add_argument("--top-n", type=int, default=8, help="how many top-ranked instruments to print")
+    p.add_argument("--select-method", choices=["top_k", "cluster", "greedy", "threshold"], default="threshold",
+                   help="how to turn scores+correlation into a final chosen basket (see README); "
+                        "'top_k' is the naive baseline all three others are designed to improve on")
+    p.add_argument("--select-k", type=int, default=None,
+                   help="basket size for --select-method top_k/greedy (required for greedy; default 8 for top_k)")
+    p.add_argument("--select-max-k", type=int, default=None,
+                   help="optional cap on basket size for --select-method threshold (which otherwise sizes itself)")
     p.add_argument("--no-cache", action="store_true")
     p.add_argument("--no-plots", action="store_true")
     return p
@@ -115,8 +122,30 @@ def main():
         score_cols += ["etf_expense_score", "etf_aum_score"]
     print(scored[score_cols + ["overall_selection_score"]].round(1))
 
-    print(f"\n=== Top {args.top_n} candidates by overall selection score ===")
+    print(f"\n=== Top {args.top_n} candidates by overall selection score (individual ranking, ignores redundancy) ===")
     print(scored["overall_selection_score"].sort_values(ascending=False).head(args.top_n).round(1))
+
+    scores = scored["overall_selection_score"]
+    if args.select_method == "top_k":
+        chosen = list(scores.sort_values(ascending=False).head(args.select_k or args.top_n).index)
+    elif args.select_method == "cluster":
+        realized_vol = pd.to_numeric(scored["realized_vol_annualized_pct"], errors="coerce")
+        # distance_threshold is a correlation-DISTANCE (d=sqrt(2*(1-rho))), not a raw correlation --
+        # converted here so --max-cluster-correlation means the same thing across all select methods.
+        distance_threshold = (2 * (1 - config.max_cluster_correlation)) ** 0.5
+        chosen = selection.select_cluster_representatives(
+            scores, corr, distance_threshold=distance_threshold, volatility=realized_vol)
+    elif args.select_method == "greedy":
+        if not args.select_k:
+            raise SystemExit("--select-method greedy requires --select-k")
+        chosen = selection.select_diversified_greedy(scores, corr, k=args.select_k)
+    else:
+        chosen = selection.select_diversified_threshold_greedy(
+            scores, corr, max_correlation=config.max_cluster_correlation, max_k=args.select_max_k)
+
+    print(f"\n=== Chosen basket ({args.select_method}, {len(chosen)} instruments) -- "
+          f"see README for what each method does and doesn't guarantee ===")
+    print(scored.loc[chosen, "overall_selection_score"].sort_values(ascending=False).round(1))
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
     scored_path = os.path.join(RESULTS_DIR, "screening_report.csv")

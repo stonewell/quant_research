@@ -4,7 +4,13 @@ import pytest
 from common.testing import make_trending_pullback_df
 
 from stratgen.backtester import run_backtest
-from stratgen.templates import MeanReversionTemplate, MomentumTemplate, NoTradeTemplate
+from stratgen.templates import (
+    MeanReversionTemplate,
+    MomentumTemplate,
+    NoTradeTemplate,
+    TurnOfMonthTemplate,
+    VolGatedMomentumTemplate,
+)
 
 
 def test_momentum_backtest_runs_and_never_lets_cash_go_negative():
@@ -54,3 +60,21 @@ def test_raises_when_not_enough_bars_for_warmup():
     df = make_trending_pullback_df(n=20, seed=1)
     with pytest.raises(ValueError):
         run_backtest(df, MomentumTemplate(), {"fast_ma": 10, "slow_ma": 50}, warmup=60)
+
+
+def test_turn_of_month_backtest_trades_repeatedly_and_never_lets_cash_go_negative():
+    df = make_trending_pullback_df(n=500, seed=9)
+    result = run_backtest(df, TurnOfMonthTemplate(),
+                          {"entry_days_before_month_end": 1, "exit_trading_day_of_month": 3}, warmup=30)
+    sells = result["trades"][result["trades"]["side"] == "sell"]
+    assert len(sells) > 5  # ~500 trading days / ~21 per month => should fire most months
+    assert (result["equity_curve"]["cash"] >= -1e-6).all()
+    assert (result["equity_curve"]["equity"] > 0).all()
+
+
+def test_vol_gated_momentum_backtest_runs_and_never_lets_cash_go_negative():
+    df = make_trending_pullback_df(n=600, seed=10)
+    result = run_backtest(df, VolGatedMomentumTemplate(), {"vol_lookback": 20, "vol_percentile": 90}, warmup=260)
+    assert not result["equity_curve"].empty
+    assert (result["equity_curve"]["cash"] >= -1e-6).all()
+    assert (result["equity_curve"]["equity"] > 0).all()
