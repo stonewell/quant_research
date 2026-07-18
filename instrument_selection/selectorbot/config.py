@@ -31,10 +31,20 @@ class SelectionConfig:
 
     # --- liquidity ---
     # No single verified numeric $-volume cutoff survived research (liquidity
-    # requirements are strategy- and size-dependent) -- these are adjustable
-    # screening floors, not scientifically "correct" numbers. Rank-based
-    # scoring (percentile within the universe) is used alongside these as a
-    # more defensible relative measure.
+    # requirements are strategy- and size-dependent) -- this is an adjustable
+    # screening floor, not a scientifically "correct" number. But research
+    # DID verify that it should act as a HARD GATE, not a soft-scored input:
+    # index-provider methodology (MSCI GIMI/Factor Index families) applies
+    # liquidity as a binary pass/fail investability screen BEFORE any
+    # weighting/optimization step, and the composite-indicator literature
+    # (OECD/JRC Handbook) documents "full compensability" as the named risk
+    # of folding a non-negotiable tradability requirement into an additive
+    # score -- a genuinely illiquid instrument can "buy back" a good
+    # composite score with strength on an unrelated dimension. See
+    # `screening.screen_universe()`, applied before scoring/selection.
+    # Rank-based `liquidity_score` (percentile within the SURVIVING universe)
+    # is still used alongside this as a more defensible relative measure for
+    # ranking among instruments that already cleared the hard floor.
     min_avg_dollar_volume: float = 5_000_000.0
     liquidity_window: int = 60
 
@@ -64,11 +74,22 @@ class SelectionConfig:
     adx_range_threshold: float = 20.0
 
     # --- history length / fund-metadata (ETF closure-risk research) ---
-    # A peer-reviewed hazard-model study found ETF closure risk is
+    # Two distinct thresholds, per the same hard-gate-vs-soft-score research
+    # finding as liquidity above: `min_history_years` is a HARD floor --
+    # below it, every statistic this tool computes is too unreliable to
+    # trust at all (an instrument with a few weeks of data shouldn't be
+    # ranked on volatility/correlation/predictability, it should be
+    # excluded), applied in `screening.screen_universe()`. Kept deliberately
+    # low/permissive (unlike Hurst's own much stricter `hurst_min_obs`
+    # floor) since liquidity/volatility are still roughly estimable with far
+    # less history than a Hurst significance test needs.
+    min_history_years: float = 1.0
+    # `min_history_years_for_full_credit` stays a SOFT scoring threshold --
+    # a peer-reviewed hazard-model study found ETF closure risk is
     # concentrated in a fund's first three years and recommends individual
-    # investors favor ETFs at least 3-4 years old; longer history also makes
-    # every statistic above (Hurst especially) more reliable. Full credit is
-    # given at or above this many years of available price history.
+    # investors favor ETFs at least 3-4 years old; full credit in
+    # `history_adequacy_score` is given at or above this many years, but an
+    # instrument between the two thresholds is scored down, not excluded.
     min_history_years_for_full_credit: float = 4.0
     # Best-effort enrichment (expense ratio, AUM) via yfinance metadata --
     # NOT from verified research (that's a data-availability question, not a

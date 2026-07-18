@@ -14,7 +14,7 @@ import os
 
 import pandas as pd
 
-from selectorbot import correlation, liquidity, persistence, plotting, scoring, selection, volatility
+from selectorbot import correlation, liquidity, persistence, plotting, screening, scoring, selection, volatility
 from selectorbot.config import SelectionConfig
 from selectorbot.data import fetch_fund_metadata, load_universe
 
@@ -29,7 +29,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--start", default=d.start)
     p.add_argument("--end", default=d.end)
     p.add_argument("--interval", default=d.interval)
-    p.add_argument("--min-avg-dollar-volume", type=float, default=d.min_avg_dollar_volume)
+    p.add_argument("--min-avg-dollar-volume", type=float, default=d.min_avg_dollar_volume,
+                    help="hard liquidity gate -- instruments below this are excluded before scoring/selection, not just soft-scored")
+    p.add_argument("--min-history-years", type=float, default=d.min_history_years,
+                    help="hard history-length gate -- distinct from --min-history-years-for-full-credit, which is a soft scoring threshold")
     p.add_argument("--max-cluster-correlation", type=float, default=d.max_cluster_correlation)
     p.add_argument("--no-fund-metadata", action="store_false", dest="fetch_fund_metadata",
                     default=d.fetch_fund_metadata, help="skip best-effort expense-ratio/AUM lookup")
@@ -50,8 +53,8 @@ def main():
     args = build_arg_parser().parse_args()
     config = SelectionConfig(
         universe=args.universe, benchmark=args.benchmark, start=args.start, end=args.end, interval=args.interval,
-        min_avg_dollar_volume=args.min_avg_dollar_volume, max_cluster_correlation=args.max_cluster_correlation,
-        fetch_fund_metadata=args.fetch_fund_metadata,
+        min_avg_dollar_volume=args.min_avg_dollar_volume, min_history_years=args.min_history_years,
+        max_cluster_correlation=args.max_cluster_correlation, fetch_fund_metadata=args.fetch_fund_metadata,
     )
     universe = list(dict.fromkeys(config.universe + [config.benchmark]))  # ensure benchmark is included, no dupes
 
@@ -70,6 +73,16 @@ def main():
     for col in metrics.columns:
         if col != "regime_label":
             metrics[col] = pd.to_numeric(metrics[col], errors="coerce")
+
+    metrics, screened_out = screening.screen_universe(metrics, config, benchmark=config.benchmark)
+    print(f"\n=== Hard screen: liquidity >= ${config.min_avg_dollar_volume:,.0f}/day, "
+          f"history >= {config.min_history_years} years ===")
+    if not screened_out.empty:
+        print(f"  excluded {len(screened_out)}/{len(screened_out) + len(metrics)}: "
+              f"{dict(zip(screened_out.index, screened_out['screen_fail_reason']))}")
+    else:
+        print("  none excluded")
+    data = {symbol: df for symbol, df in data.items() if symbol in metrics.index}
 
     returns = correlation.returns_matrix(data)
     corr = correlation.correlation_matrix(returns)
@@ -151,6 +164,8 @@ def main():
     scored_path = os.path.join(RESULTS_DIR, "screening_report.csv")
     scored.to_csv(scored_path)
     corr.to_csv(os.path.join(RESULTS_DIR, "correlation_matrix.csv"))
+    if not screened_out.empty:
+        screened_out.to_csv(os.path.join(RESULTS_DIR, "screened_out.csv"))
     print(f"\nSaved full report to {scored_path}")
 
     if not args.no_plots:

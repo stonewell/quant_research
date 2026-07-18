@@ -13,6 +13,71 @@ structure, real diversification value, and enough trustworthy history. This
 is a screening/research tool, not a backtester: it doesn't simulate trades,
 it characterizes instruments.
 
+## Screen first, score second: hard gates before soft scores
+
+Liquidity and history length used to be soft, rank-based inputs into the
+one composite score everything downstream (including the diversification-
+selection methods below) consumed — `min_avg_dollar_volume` existed as a
+config field but was never actually enforced anywhere; a genuinely illiquid
+instrument could still rank well by scoring strongly on unrelated
+dimensions (predictability, diversification, history) and end up selected
+anyway. A follow-up deep-research pass specifically checked whether that's
+defensible, and found real, citable evidence it isn't:
+
+- **Index-provider methodology** (MSCI's GIMI and Factor Index families,
+  verified against primary-source PDFs, stable across ~2013-2024 document
+  vintages): a set of enumerated, **binary pass/fail** investability screens
+  — minimum size, minimum liquidity, minimum length of trading, financial
+  reporting — defines an eligible universe strictly BEFORE any
+  factor-tilting, weighting, or optimization step runs on it. MSCI's own
+  factor "Alpha score" formula deliberately **excludes liquidity as a
+  component** — it's resolved entirely by universe construction (which
+  Parent Index the optimizer is even allowed to draw from), never blended
+  into the score the optimizer selects on.
+- **The composite-indicator/MCDA literature** (OECD/JRC *Handbook on
+  Constructing Composite Indicators*; Cinelli, Kadziński, Gonzalez &
+  Słowiński, *Omega*, peer-reviewed) formally names this failure mode **"full
+  compensability"**: an additive/weighted score lets a unit offset a
+  deficiency on one dimension with strength on another — the Handbook's own
+  worked example shows (21,1,1,1) and (6,6,6,6) can score identically
+  despite representing very different underlying conditions. Its
+  prescription for a genuinely non-negotiable requirement (a tradability
+  floor is exactly that) is to remove it from the composite via a **prior
+  hard gate**, not to keep tuning weights.
+- **This project's own `hurst_min_obs` floor already did this correctly**
+  for the Hurst significance test specifically (see `persistence.py`) —
+  below that many observations, the result is `NaN`/`"insufficient_data"`,
+  not a low-confidence score. Independent peer-reviewed evidence (Weron 2002,
+  *Physica A*) supports treating short samples this way: DFA/GPH
+  Hurst-estimator error degrades by roughly an order of magnitude between
+  L=256 and L=65536 observations, and the original study excluded its own
+  shortest sample size from part of its analysis rather than including it
+  with a caveat. `screening.py` (new) extends the SAME pattern to liquidity
+  and overall history length, which previously had no equivalent floor.
+
+`run_screener.py` now runs `screening.screen_universe()` immediately after
+computing raw metrics and BEFORE building the correlation matrix or scoring
+anything — an excluded instrument is dropped from the correlation matrix,
+`overall_selection_score`, and every `selection.py` method entirely, not
+just soft-scored down. Two hard gates are implemented: `min_avg_dollar_volume`
+(existing field, now actually enforced) and a new, deliberately low/
+permissive `min_history_years` (distinct from the SOFT
+`min_history_years_for_full_credit` used by `history_adequacy_score` — the
+hard floor just asks "is there enough data to compute anything meaningful
+at all," the soft threshold asks "has this ETF cleared its highest-closure-
+risk window"). The benchmark symbol is exempt from both gates (beta and the
+correlation regime-shift check both require it to be present), and every
+excluded symbol's reason is reported (`screened_out.csv`, printed to stdout)
+rather than having it silently vanish.
+
+**What this pass could NOT resolve, and neither could the wider literature
+searched for it:** whether screening BEFORE vs. AFTER correlation/clustering
+changes which instruments end up as cluster representatives or Max-Sum
+greedy picks. This project screens before (matching the index-provider
+precedent's ordering), but that specific ordering choice is not
+independently verified to matter for these particular selection algorithms
+— it's a reasonable default, not a proven-optimal one.
+
 ## The five key aspects, and how each affects selection
 
 ### 1. Liquidity — can you actually trade it at the backtested price?
@@ -38,9 +103,10 @@ bounce component — letting the two be mathematically disentangled.
 minimum") survived this project's research pass — requirements are strategy-
 and position-size-dependent. `min_avg_dollar_volume` is an adjustable
 screening floor you should tune to your own capital and strategy, not a
-scientifically-derived threshold. `liquidity_score` instead ranks
-instruments by percentile *within your chosen universe*, a more defensible
-relative measure.
+scientifically-derived threshold. `liquidity_score` ranks instruments by
+percentile *within the universe that already cleared that floor* (see
+"Screen first, score second," below, for why this is now a hard gate applied
+in `screening.py`, not just a soft, rank-based input the way it used to be).
 
 ### 2. Volatility — is there a tradable edge, and what kind?
 
@@ -158,10 +224,14 @@ underlying basket.
 
 **What's implemented:** `history_years` (actual calendar span of available
 price data — always computable, and a legitimate proxy for fund age when the
-requested date range predates the fund's inception) drives
-`history_adequacy_score`, capped at full credit once a fund clears
-`min_history_years_for_full_credit` (default 4, matching the "3-4 years"
-research threshold). Expense ratio and AUM are fetched best-effort via
+requested date range predates the fund's inception) is now checked TWICE:
+a hard floor (`min_history_years`, default 1) excludes an instrument
+entirely in `screening.py` before anything else runs, and — only for
+instruments that clear it — drives `history_adequacy_score`, capped at full
+credit once a fund clears `min_history_years_for_full_credit` (default 4,
+matching the "3-4 years" research threshold). See "Screen first, score
+second," above, for why these are two separate thresholds with two separate
+jobs, not one number doing double duty. Expense ratio and AUM are fetched best-effort via
 yfinance metadata (`fetch_fund_metadata()`) and scored (`etf_expense_score`,
 `etf_aum_score`) when available. Critically, these are **not weighted the
 same as the verified research metrics above** — they're a data-availability
@@ -389,13 +459,14 @@ instrument_selection/
     volatility.py     volatility_summary() (local) + atr/atr_pct/adx/realized_vol/vol_of_vol/atr_regime_ratio re-exported from ../common/indicators.py
     persistence.py    hurst_significance()/persistence_summary() (local, shuffle-based significance test) + hurst_exponent/autocorrelation/variance_ratio re-exported from ../common/hurst.py
     correlation.py    Correlation matrix, beta, hierarchical clustering, redundancy flags, regime-shift check
-    scoring.py        Strategy-agnostic composite score: liquidity, volatility adequacy, predictability, diversification, history/fund-quality
+    screening.py       HARD gates (liquidity floor, min history) applied BEFORE scoring/correlation/selection -- see "Screen first, score second" above
+    scoring.py        Strategy-agnostic composite score for instruments that already cleared screening.py's gates: volatility adequacy, predictability, diversification, history/fund-quality
     selection.py       Turns scores + correlation into an actual chosen basket: cluster-representative, Max-Sum-Diversification greedy, and threshold-gated greedy (see "From scores to a chosen basket" above)
     plotting.py       Correlation heatmap, dendrogram, Hurst-vs-volatility scatter (descriptive, not strategy-specific)
   run_screener.py      CLI — full report across all metrics for a universe, plus a chosen basket via --select-method
-  tests/                pytest unit tests (43 tests covering every module)
+  tests/                pytest unit tests (51 tests covering every module)
   data/                 cached price CSVs (gitignored)
-  results/              screening report, correlation matrix, charts (gitignored)
+  results/              screening report, correlation matrix, screened-out report, charts (gitignored)
 ```
 
 ## Setup
@@ -422,7 +493,8 @@ Key options (see `python run_screener.py --help` for the full list):
 |---|---|
 | `--universe` | Space-separated list of tickers to screen (benchmark is auto-added) |
 | `--benchmark` | Symbol used for beta and the correlation regime-shift check |
-| `--min-avg-dollar-volume` | Liquidity floor (adjustable, not a verified universal number) |
+| `--min-avg-dollar-volume` | HARD liquidity gate -- excluded before scoring/selection, not just soft-scored (adjustable, not a verified universal number) |
+| `--min-history-years` | HARD history-length gate, distinct from `--min-history-years-for-full-credit` (a soft scoring threshold, not exposed as its own flag) |
 | `--max-cluster-correlation` | Threshold above which a pair is flagged as redundant |
 | `--no-fund-metadata` | Skip the best-effort expense-ratio/AUM lookup (faster, no ETF-quality component) |
 | `--top-n` | How many top-ranked instruments to print by overall selection score |
@@ -431,11 +503,12 @@ Key options (see `python run_screener.py --help` for the full list):
 | `--select-max-k` | Optional cap on basket size for `threshold` (which otherwise sizes itself from the data) |
 
 Outputs land in `results/`: `screening_report.csv` (every metric and score
-per symbol), `correlation_matrix.csv`, and three charts. The chosen basket
-(per `--select-method`) prints to stdout — run all four methods side by
-side on your own universe to compare, since no head-to-head comparison of
-them survived this project's research (see "From scores to a chosen
-basket" above).
+per symbol that cleared the hard gates), `correlation_matrix.csv`,
+`screened_out.csv` (excluded symbols and why, only written if any were
+excluded), and three charts. The chosen basket (per `--select-method`)
+prints to stdout — run all four methods side by side on your own universe
+to compare, since no head-to-head comparison of them survived this
+project's research (see "From scores to a chosen basket" above).
 
 ## Testing
 
@@ -443,7 +516,7 @@ basket" above).
 python -m pytest tests/ -v
 ```
 
-43 tests covering: the Corwin-Schultz spread estimator (non-negative,
+51 tests covering: the Corwin-Schultz spread estimator (non-negative,
 increases with wider high-low noise), realized vol/ATR%/vol-of-vol/ADX
 correctness on synthetic series with known properties, the Hurst estimator
 correctly ordering trending > random-walk > mean-reverting synthetic AR(1)
@@ -468,7 +541,14 @@ is nonzero but degenerates to exact naive top-K at `diversity_weight=0`
 (a direct check that the "improvement over naive" claim is real, not just
 asserted), and the threshold-gated greedy both skips the correlated
 lower-priority candidate and lets basket size emerge from the data rather
-than a fixed K.
+than a fixed K; `screening.py`'s hard gates (`test_screening.py`): an
+illiquid instrument and a too-short-history instrument are each correctly
+excluded with the right reason recorded, both reasons are reported together
+when an instrument fails on both axes, missing liquidity/history data is
+treated as a failure rather than silently passing, a good instrument is
+never excluded, the benchmark is exempt from both gates when named (and
+correctly NOT exempt when it isn't), and passed/screened-out always
+partition the input exactly (nothing is dropped or double-counted).
 
 ## Known limitations
 
@@ -508,3 +588,17 @@ than a fixed K.
   source, not against the others) — running more than one on your own
   universe and comparing is this project's own exploration, not a
   reproduction of a verified ranking.
+- **`screening.py`'s hard gates are not validated against real market data
+  this session either** — same as `selection.py`, synthetic constructed
+  universes only.
+- Whether screening BEFORE correlation/clustering (this project's choice)
+  vs. AFTER changes which instruments end up as cluster representatives or
+  greedy diversification picks is an explicitly open question — no source
+  found in either research pass addresses it directly for these algorithms.
+  The current ordering matches index-provider precedent, not a
+  finance-specific proof that order doesn't matter here.
+- `min_history_years` (the new hard floor, default 1 year) is a deliberately
+  low, permissive default chosen by analogy to the Hurst precedent, not
+  itself a number with direct literature support the way
+  `min_history_years_for_full_credit` (4 years, ETF-closure-risk research)
+  has — tune it for your own data-quality tolerance.
