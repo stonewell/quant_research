@@ -244,10 +244,10 @@ def candlestick_patterns(df: pd.DataFrame, trend_window: int = 5, doji_body_frac
 
     higher_closes = white & (c > pc) & (c.shift(1) > c.shift(2))
     three_white = white & white.shift(1, fill_value=False) & white.shift(2, fill_value=False)
-    out["three_white_soldiers"] = three_white & higher_closes
+    out["three_white_soldiers"] = down.shift(1).fillna(False) & three_white & higher_closes
     lower_closes = black & (c < pc) & (c.shift(1) < c.shift(2))
     three_black = black & black.shift(1, fill_value=False) & black.shift(2, fill_value=False)
-    out["three_black_crows"] = three_black & lower_closes
+    out["three_black_crows"] = up.shift(1).fillna(False) & three_black & lower_closes
 
     return out.fillna(False)
 

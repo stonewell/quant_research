@@ -22,6 +22,14 @@ def _bars(o, h, l, c, start="2015-01-01"):
     return pd.DataFrame({"Open": o, "High": h, "Low": l, "Close": c}, index=idx)
 
 
+def _hl(o, c, pad=0.2):
+    """High/low that just wraps each bar's body -- shadow length is
+    irrelevant to the patterns exercised below, only the body geometry is."""
+    h = [max(oo, cc) + pad for oo, cc in zip(o, c)]
+    l = [min(oo, cc) - pad for oo, cc in zip(o, c)]
+    return h, l
+
+
 def make_reversal_cycles(n_cycles=45, down=8, up=8):
     """Deterministic sawtooth: each cycle falls (black candles), prints a
     textbook bullish ENGULFING bar at the trough, then rises (white candles).
@@ -91,6 +99,119 @@ def test_same_shape_is_bullish_in_downtrend_but_not_in_uptrend():
     assert bool(down_p["hammer"].iloc[-1])
     assert not bool(up_p["hammer"].iloc[-1])
     assert bool(up_p["hanging_man"].iloc[-1])
+
+
+def test_doji_detected_when_body_is_tiny_relative_to_range():
+    o = [100, 100]
+    c = [100.5, 100.05]  # last bar: 0.05 body on a 2.0 range -> well under the 0.1 fraction
+    h, l = _hl(o, c, pad=1.0)
+    df = _bars(o, h, l, c)
+    patterns = candlestick_patterns(df)
+    assert bool(patterns["doji"].iloc[-1])
+
+
+def test_bullish_harami_detected_in_downtrend():
+    o = [108, 107, 106, 105, 104, 103, 102, 101, 100.3]
+    c = [107, 106, 105, 104, 103, 102, 101, 100, 100.7]  # small white body inside prior black body [100, 101]
+    h, l = _hl(o, c)
+    df = _bars(o, h, l, c)
+    patterns = candlestick_patterns(df, trend_window=3)
+    assert bool(patterns["bullish_harami"].iloc[-1])
+
+
+def test_bearish_harami_detected_in_uptrend():
+    o = [92, 93, 94, 95, 96, 97, 98, 99, 99.7]
+    c = [93, 94, 95, 96, 97, 98, 99, 100, 99.3]  # small black body inside prior white body [99, 100]
+    h, l = _hl(o, c)
+    df = _bars(o, h, l, c)
+    patterns = candlestick_patterns(df, trend_window=3)
+    assert bool(patterns["bearish_harami"].iloc[-1])
+
+
+def test_piercing_line_detected_in_downtrend():
+    o = [108, 107, 106, 105, 104, 103, 102, 101, 99.5]
+    c = [107, 106, 105, 104, 103, 102, 101, 100, 100.7]  # gaps below prior low, closes above prior midpoint
+    h, l = _hl(o, c)
+    df = _bars(o, h, l, c)
+    patterns = candlestick_patterns(df, trend_window=3)
+    assert bool(patterns["piercing_line"].iloc[-1])
+
+
+def test_dark_cloud_cover_detected_in_uptrend():
+    o = [92, 93, 94, 95, 96, 97, 98, 99, 100.5]
+    c = [93, 94, 95, 96, 97, 98, 99, 100, 99.3]  # gaps above prior high, closes below prior midpoint
+    h, l = _hl(o, c)
+    df = _bars(o, h, l, c)
+    patterns = candlestick_patterns(df, trend_window=3)
+    assert bool(patterns["dark_cloud_cover"].iloc[-1])
+
+
+def test_morning_star_detected_in_downtrend():
+    o = [108, 107, 106, 105, 104, 103, 102, 101, 100, 98.2, 98.5]
+    c = [107, 106, 105, 104, 103, 102, 101, 100, 98, 98.4, 100.5]
+    h, l = _hl(o, c)
+    df = _bars(o, h, l, c)
+    patterns = candlestick_patterns(df, trend_window=3)
+    assert bool(patterns["morning_star"].iloc[-1])
+
+
+def test_evening_star_detected_in_uptrend():
+    o = [92, 93, 94, 95, 96, 97, 98, 99, 100, 102.1, 101.8]
+    c = [93, 94, 95, 96, 97, 98, 99, 100, 102, 101.9, 99.5]
+    h, l = _hl(o, c)
+    df = _bars(o, h, l, c)
+    patterns = candlestick_patterns(df, trend_window=3)
+    assert bool(patterns["evening_star"].iloc[-1])
+
+
+def test_three_white_soldiers_requires_a_preceding_downtrend():
+    # Three rising white candles that merely CONTINUE an existing uptrend are
+    # not a reversal and must not fire -- this is the trend-gate regression
+    # test: every other reversal pattern in the module is gated on the prior
+    # trend, and three_white_soldiers/three_black_crows previously were not.
+    incline_c = [93, 94, 95, 96, 97, 98, 99, 100, 101]
+    incline_o = [92, 93, 94, 95, 96, 97, 98, 99, 100]
+    continuing_o = [101, 102, 103]
+    continuing_c = [102, 103, 104]
+    o, c = incline_o + continuing_o, incline_c + continuing_c
+    h, l = _hl(o, c)
+    no_gate = candlestick_patterns(_bars(o, h, l, c), trend_window=3)
+    assert not bool(no_gate["three_white_soldiers"].iloc[-1])
+
+    # Three rising white candles that interrupt a prior DOWNtrend are the
+    # genuine reversal pattern and must fire.
+    decline_c = [107, 106, 105, 104, 103, 102, 101, 100, 99]
+    decline_o = [108, 107, 106, 105, 104, 103, 102, 101, 100]
+    reversal_o = [99.2, 100.1, 101.0]
+    reversal_c = [100.0, 101.0, 102.0]
+    o2, c2 = decline_o + reversal_o, decline_c + reversal_c
+    h2, l2 = _hl(o2, c2)
+    with_gate = candlestick_patterns(_bars(o2, h2, l2, c2), trend_window=3)
+    assert bool(with_gate["three_white_soldiers"].iloc[-1])
+
+
+def test_three_black_crows_requires_a_preceding_uptrend():
+    # Three declining black candles that merely CONTINUE an existing
+    # downtrend are not a reversal and must not fire.
+    decline_c = [107, 106, 105, 104, 103, 102, 101, 100, 99]
+    decline_o = [108, 107, 106, 105, 104, 103, 102, 101, 100]
+    continuing_o = [99, 98.1, 97.2]
+    continuing_c = [98.2, 97.3, 96.4]
+    o, c = decline_o + continuing_o, decline_c + continuing_c
+    h, l = _hl(o, c)
+    no_gate = candlestick_patterns(_bars(o, h, l, c), trend_window=3)
+    assert not bool(no_gate["three_black_crows"].iloc[-1])
+
+    # Three declining black candles that interrupt a prior UPtrend are the
+    # genuine reversal pattern and must fire.
+    incline_c = [93, 94, 95, 96, 97, 98, 99, 100, 101]
+    incline_o = [92, 93, 94, 95, 96, 97, 98, 99, 100]
+    reversal_o = [100.8, 99.9, 99.0]
+    reversal_c = [100.0, 99.0, 98.0]
+    o2, c2 = incline_o + reversal_o, incline_c + reversal_c
+    h2, l2 = _hl(o2, c2)
+    with_gate = candlestick_patterns(_bars(o2, h2, l2, c2), trend_window=3)
+    assert bool(with_gate["three_black_crows"].iloc[-1])
 
 
 # --- directional-edge math ----------------------------------------------
