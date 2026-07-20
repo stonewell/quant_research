@@ -76,13 +76,17 @@ def test_etf_expense_score_favors_lower_expense_ratio():
 
 
 def test_overall_score_weighted_average_matches_manual_calculation_when_all_present():
+    # No candlestick_edge or momentum_edge column here, so both those scores
+    # are NaN and get renormalized out -- the expected value divides by the sum
+    # of the weights actually present (the same graceful-degradation path a
+    # plain stock hits).
     metrics_with_meta = make_metrics(expense_ratio=[0.001, 0.02, 0.005], total_assets=[1e11, 1e8, 5e9])
     scored = score_universe(metrics_with_meta)
     weights = {
-        "liquidity_score": 0.30, "vol_adequacy_score": 0.20, "predictability_score": 0.20,
+        "liquidity_score": 0.30, "vol_adequacy_score": 0.20, "predictability_score": 0.07,
         "diversification_score": 0.15, "history_adequacy_score": 0.10,
         "etf_expense_score": 0.025, "etf_aum_score": 0.025,
     }
     row = scored.loc["TRENDY"]
-    expected = sum(row[col] * w for col, w in weights.items())
+    expected = sum(row[col] * w for col, w in weights.items()) / sum(weights.values())
     assert row["overall_selection_score"] == pytest.approx(expected)

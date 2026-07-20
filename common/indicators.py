@@ -114,3 +114,161 @@ def atr_regime_ratio(df: pd.DataFrame, period: int = 14, short_window: int = 20,
     short_avg = a_pct.rolling(short_window, min_periods=short_window).mean()
     long_avg = a_pct.rolling(long_window, min_periods=long_window).mean()
     return short_avg / long_avg
+
+
+def roc(close: pd.Series, period: int = 252) -> pd.Series:
+    """Rate of change / raw price momentum: the trailing `period`-bar return
+    (`close / close[t-period] - 1`). With period ~= 252 (12 months) this is
+    the exact signal behind the cross-sectional (Jegadeesh & Titman 1993) and
+    time-series (Moskowitz, Ooi & Pedersen 2012) momentum anomalies."""
+    return close / close.shift(period) - 1
+
+
+def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
+    """Moving Average Convergence-Divergence (Appel). Returns a frame with the
+    `macd` line (fast EMA - slow EMA), its `signal` EMA, and the `hist`ogram
+    (macd - signal). A standard practitioner momentum indicator; its
+    stand-alone profitability is weak once data-snooping is corrected for
+    (Park & Irwin 2007), so this project reports it descriptively rather than
+    scoring the raw signal."""
+    ema_fast = close.ewm(span=fast, adjust=False, min_periods=slow).mean()
+    ema_slow = close.ewm(span=slow, adjust=False, min_periods=slow).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False, min_periods=slow + signal).mean()
+    return pd.DataFrame({"macd": macd_line, "signal": signal_line, "hist": macd_line - signal_line})
+
+
+# --------------------------------------------------------------------------
+# Candlestick reversal patterns (OHLC single-/two-/three-bar patterns).
+#
+# These detect the classic Japanese-candlestick reversal patterns from the
+# open/high/low/close relationships within and across bars. They are the raw
+# building block for `instrument_selection`'s candlestick-predictability
+# component; see that project's `candlestick.py` for the significance test and
+# the (largely negative) academic evidence on whether these patterns actually
+# predict anything in liquid markets. Pattern geometry follows the standard
+# definitions (Nison 1991; Morris 2006) as summarized in the studies that
+# tested them (Caginalp & Laurent 1998; Marshall, Young & Rose 2006).
+#
+# Every reversal pattern is only meaningful when it interrupts a prior trend
+# (a "hammer" in a downtrend is a bullish reversal; the identical shape in an
+# uptrend is a bearish "hanging man"), so each detector is gated on a simple
+# preceding-trend context, computed exactly as Caginalp & Laurent did: a short
+# moving average that has been rising (uptrend) or falling (downtrend) over its
+# own window, measured through the bar BEFORE the pattern completes.
+# --------------------------------------------------------------------------
+
+
+def _candle_parts(df: pd.DataFrame) -> dict:
+    o, h, l, c = df["Open"], df["High"], df["Low"], df["Close"]
+    rng = (h - l).replace(0, np.nan)
+    body = c - o
+    abody = body.abs()
+    upper_shadow = h - c.combine(o, max)
+    lower_shadow = o.combine(c, min) - l
+    return {
+        "o": o, "h": h, "l": l, "c": c, "rng": rng, "body": body, "abody": abody,
+        "upper": upper_shadow, "lower": lower_shadow,
+        "white": c > o, "black": c < o,
+    }
+
+
+def _trend_context(close: pd.Series, window: int) -> tuple:
+    """(prior_uptrend, prior_downtrend) booleans: whether an SMA(window) rose
+    or fell over its own window, measured through the bar before the signal
+    (shift(1)). Matches Caginalp & Laurent (1998)'s use of a short MA to
+    require a pattern to actually interrupt a preceding trend."""
+    ma = close.rolling(window, min_periods=window).mean()
+    rose = (ma > ma.shift(window)).shift(1).fillna(False)
+    fell = (ma < ma.shift(window)).shift(1).fillna(False)
+    return rose, fell
+
+
+def candlestick_patterns(df: pd.DataFrame, trend_window: int = 5, doji_body_frac: float = 0.1,
+                         shadow_ratio: float = 2.0, small_body_frac: float = 0.5) -> pd.DataFrame:
+    """Boolean DataFrame (indexed like `df`) with one column per detected
+    candlestick pattern. `df` must have Open/High/Low/Close columns.
+
+    - `trend_window`: SMA window used for the preceding-trend gate.
+    - `doji_body_frac`: body <= this fraction of the high-low range -> doji.
+    - `shadow_ratio`: the long shadow of a hammer/star must be >= this many
+      times the body length.
+    - `small_body_frac`: "small body" threshold (fraction of range, and of a
+      neighbouring bar's body) used by star/harami-type patterns.
+    """
+    p = _candle_parts(df)
+    o, h, l, c = p["o"], p["h"], p["l"], p["c"]
+    rng, body, abody = p["rng"], p["body"], p["abody"]
+    upper, lower, white, black = p["upper"], p["lower"], p["white"], p["black"]
+    up, down = _trend_context(c, trend_window)
+
+    small_body = abody <= (small_body_frac * rng)
+    long_lower = lower >= (shadow_ratio * abody)
+    long_upper = upper >= (shadow_ratio * abody)
+    tiny_upper = upper <= abody
+    tiny_lower = lower <= abody
+
+    po, ph, pl, pc = o.shift(1), h.shift(1), l.shift(1), c.shift(1)
+    p_white, p_black = white.shift(1, fill_value=False), black.shift(1, fill_value=False)
+    p_abody = abody.shift(1)
+    p_mid = (po + pc) / 2
+    body_hi, body_lo = c.combine(o, max), c.combine(o, min)
+    p_body_hi, p_body_lo = pc.combine(po, max), pc.combine(po, min)
+
+    out = pd.DataFrame(index=df.index)
+
+    # --- neutral (indecision), reported but not a directional signal ---
+    out["doji"] = (abody <= (doji_body_frac * rng))
+
+    # --- single-bar reversals ---
+    out["hammer"] = down & small_body & long_lower & tiny_upper
+    out["hanging_man"] = up & small_body & long_lower & tiny_upper
+    out["inverted_hammer"] = down & small_body & long_upper & tiny_lower
+    out["shooting_star"] = up & small_body & long_upper & tiny_lower
+
+    # --- two-bar reversals ---
+    out["bullish_engulfing"] = down & p_black & white & (c >= po) & (o <= pc)
+    out["bearish_engulfing"] = up & p_white & black & (o >= pc) & (c <= po)
+    out["piercing_line"] = down & p_black & white & (o < pl) & (c > p_mid) & (c < po)
+    out["dark_cloud_cover"] = up & p_white & black & (o > ph) & (c < p_mid) & (c > po)
+    out["bullish_harami"] = down & p_black & (body_hi <= po) & (body_lo >= pc)
+    out["bearish_harami"] = up & p_white & (body_hi <= pc) & (body_lo >= po)
+
+    # --- three-bar reversals ---
+    o1, c1 = o.shift(2), c.shift(2)
+    abody1 = abody.shift(2)
+    black1, white1 = black.shift(2, fill_value=False), white.shift(2, fill_value=False)
+    small_star = abody.shift(1) <= (small_body_frac * abody1)
+    out["morning_star"] = down.shift(1).fillna(False) & black1 & small_star & white & (c > (o1 + c1) / 2)
+    out["evening_star"] = up.shift(1).fillna(False) & white1 & small_star & black & (c < (o1 + c1) / 2)
+
+    higher_closes = white & (c > pc) & (c.shift(1) > c.shift(2))
+    three_white = white & white.shift(1, fill_value=False) & white.shift(2, fill_value=False)
+    out["three_white_soldiers"] = three_white & higher_closes
+    lower_closes = black & (c < pc) & (c.shift(1) < c.shift(2))
+    three_black = black & black.shift(1, fill_value=False) & black.shift(2, fill_value=False)
+    out["three_black_crows"] = three_black & lower_closes
+
+    return out.fillna(False)
+
+
+BULLISH_REVERSAL_PATTERNS = [
+    "hammer", "inverted_hammer", "bullish_engulfing", "piercing_line",
+    "bullish_harami", "morning_star", "three_white_soldiers",
+]
+BEARISH_REVERSAL_PATTERNS = [
+    "hanging_man", "shooting_star", "bearish_engulfing", "dark_cloud_cover",
+    "bearish_harami", "evening_star", "three_black_crows",
+]
+
+
+def bullish_reversal_signals(df: pd.DataFrame, **kwargs) -> pd.Series:
+    """True on any bar completing a bullish candlestick reversal pattern."""
+    patterns = candlestick_patterns(df, **kwargs)
+    return patterns[BULLISH_REVERSAL_PATTERNS].any(axis=1)
+
+
+def bearish_reversal_signals(df: pd.DataFrame, **kwargs) -> pd.Series:
+    """True on any bar completing a bearish candlestick reversal pattern."""
+    patterns = candlestick_patterns(df, **kwargs)
+    return patterns[BEARISH_REVERSAL_PATTERNS].any(axis=1)

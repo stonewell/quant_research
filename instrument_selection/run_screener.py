@@ -14,7 +14,18 @@ import os
 
 import pandas as pd
 
-from selectorbot import correlation, liquidity, persistence, plotting, screening, scoring, selection, volatility
+from selectorbot import (
+    candlestick,
+    correlation,
+    liquidity,
+    momentum,
+    persistence,
+    plotting,
+    screening,
+    scoring,
+    selection,
+    volatility,
+)
 from selectorbot.config import SelectionConfig
 from selectorbot.data import fetch_fund_metadata, load_universe
 
@@ -67,11 +78,14 @@ def main():
         liq = liquidity.liquidity_summary(df, config.liquidity_window)
         vol = volatility.volatility_summary(df, config)
         per = persistence.persistence_summary(df["Close"], config)
+        cnd = candlestick.candlestick_summary(df, config)
+        mom = momentum.momentum_summary(df, config)
         history_years = (df.index[-1] - df.index[0]).days / 365.25
-        rows[symbol] = {**liq, **vol, **per, "history_years": history_years}
+        rows[symbol] = {**liq, **vol, **per, **cnd, **mom, "history_years": history_years}
     metrics = pd.DataFrame(rows).T
+    non_numeric = {"regime_label", "candlestick_label", "momentum_label"}
     for col in metrics.columns:
-        if col != "regime_label":
+        if col not in non_numeric:
             metrics[col] = pd.to_numeric(metrics[col], errors="coerce")
 
     metrics, screened_out = screening.screen_universe(metrics, config, benchmark=config.benchmark)
@@ -113,6 +127,16 @@ def main():
                      "atr_pct_mean", "adx_mean", "hurst", "hurst_significant", "regime_label", "history_years"]
     print(scored[display_cols].round(3))
 
+    print("\n=== Candlestick reversal-pattern predictability (mostly no edge is the EXPECTED result -- see README) ===")
+    candle_cols = ["candlestick_edge", "candlestick_significant", "candlestick_p_value",
+                   "candlestick_n_signals", "candlestick_label"]
+    print(scored[[c for c in candle_cols if c in scored.columns]].round(4))
+
+    print("\n=== Time-series-momentum predictability (bootstrap-tested per instrument; crash-caveated -- see README) ===")
+    mom_cols = ["momentum_edge", "momentum_significant", "momentum_p_value",
+                "momentum_lookback_return", "pct_days_above_trend_ma", "momentum_label"]
+    print(scored[[c for c in mom_cols if c in scored.columns]].round(3))
+
     print("\n=== Beta to benchmark ===")
     print(betas.round(2).sort_values(ascending=False))
 
@@ -130,7 +154,7 @@ def main():
 
     print("\n=== Selection score components (0-100 each) ===")
     score_cols = ["liquidity_score", "vol_adequacy_score", "predictability_score",
-                  "diversification_score", "history_adequacy_score"]
+                  "momentum_score", "candlestick_score", "diversification_score", "history_adequacy_score"]
     if "etf_expense_score" in scored.columns:
         score_cols += ["etf_expense_score", "etf_aum_score"]
     print(scored[score_cols + ["overall_selection_score"]].round(1))

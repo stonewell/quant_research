@@ -25,10 +25,26 @@ validated predictive model.
 import numpy as np
 import pandas as pd
 
+# Three components now answer the SAME strategy-agnostic question -- "does this
+# series show genuine, statistically significant exploitable structure at
+# all?" -- via three independent, bootstrap-null-gated tests: long-memory
+# Hurst (`predictability_score`), time-series-momentum serial correlation
+# (`momentum_score`), and OHLC candlestick reversal edge (`candlestick_score`).
+# The "structure family" keeps its original combined weight of 0.20, now split
+# BY STRENGTH OF EVIDENCE: momentum gets the largest share (0.10 -- two of the
+# most-replicated anomalies in finance, Jegadeesh-Titman 1993 / Moskowitz-Ooi-
+# Pedersen 2012), Hurst long-memory 0.07, and candlestick the smallest (0.03 --
+# Marshall-Young-Rose 2006 found no value in liquid US equities). Momentum is
+# still only 0.10, not higher, because its per-asset significance is contested
+# (Huang et al. 2020) and it carries left-tail crash risk (Daniel-Moskowitz
+# 2016). Everything outside the family is unchanged, so the weights still sum
+# to 1.0, and any missing/insignificant component degrades gracefully to ~0.
 DEFAULT_WEIGHTS = {
     "liquidity_score": 0.30,
     "vol_adequacy_score": 0.20,
-    "predictability_score": 0.20,
+    "predictability_score": 0.07,
+    "momentum_score": 0.10,
+    "candlestick_score": 0.03,
     "diversification_score": 0.15,
     "history_adequacy_score": 0.10,
     "etf_expense_score": 0.025,
@@ -78,6 +94,38 @@ def score_universe(metrics: pd.DataFrame, weights: dict = None,
     hurst_deviation = (df["hurst"] - 0.5).abs().clip(upper=0.5)
     significance_weight = np.where(df["hurst_significant"].fillna(False), 1.0, 0.15)
     df["predictability_score"] = (hurst_deviation * 2 * 100) * significance_weight
+
+    # Candlestick predictability: the SAME "is there exploitable structure"
+    # question, tested on OHLC reversal patterns instead of long memory.
+    # Rank the ABSOLUTE conditional edge (direction-agnostic, matching
+    # predictability) across the universe, then gate it hard on the
+    # placebo/bootstrap significance test -- an insignificant edge is
+    # down-weighted to 0.15 exactly like an insignificant Hurst reading, so
+    # noise-level candlestick "edges" (the expected case for most liquid
+    # instruments, per Marshall-Young-Rose) score near zero rather than
+    # ranking on chance. Absent (e.g. insufficient history) -> NaN, excluded.
+    if "candlestick_edge" in df.columns:
+        cs_significance_weight = np.where(df["candlestick_significant"].fillna(False), 1.0, 0.15)
+        df["candlestick_score"] = _pct_rank(df["candlestick_edge"].abs()) * 100 * cs_significance_weight
+        df.loc[df["candlestick_edge"].isna(), "candlestick_score"] = np.nan
+    else:
+        df["candlestick_score"] = np.nan
+
+    # Time-series-momentum predictability: the SAME "is there exploitable
+    # structure" question, tested on the serial correlation between past and
+    # future returns (the statistical core of the momentum anomaly) instead of
+    # long memory or OHLC geometry. Rank the ABSOLUTE edge (direction-agnostic:
+    # a strong reversal tendency is as exploitable as a strong trend) and gate
+    # it on the shuffle-null significance test, exactly like the other two
+    # structure components -- so a series whose past returns don't reliably
+    # predict its future ones (the expected case for many liquid instruments,
+    # per Huang et al. 2020) scores near zero rather than ranking on chance.
+    if "momentum_edge" in df.columns:
+        mom_significance_weight = np.where(df["momentum_significant"].fillna(False), 1.0, 0.15)
+        df["momentum_score"] = _pct_rank(df["momentum_edge"].abs()) * 100 * mom_significance_weight
+        df.loc[df["momentum_edge"].isna(), "momentum_score"] = np.nan
+    else:
+        df["momentum_score"] = np.nan
 
     # Diversification: lower average correlation to the rest of the universe
     # is better for basket construction. Requires the caller to have merged

@@ -2,8 +2,9 @@ import numpy as np
 import pandas as pd
 from common.testing import make_ohlcv_from_closes as make_df
 
-from stratgen.indicators import realized_vol, rsi, sma
+from stratgen.indicators import realized_vol, roc, rsi, sma
 from stratgen.templates import (
+    AbsoluteMomentumTemplate,
     MeanReversionTemplate,
     MomentumTemplate,
     NoTradeTemplate,
@@ -132,3 +133,43 @@ def test_vol_gated_momentum_template_blocks_entries_during_a_vol_spike():
 def test_new_calendar_and_vol_gated_param_grids_are_small():
     assert len(TurnOfMonthTemplate().param_grid) == 2
     assert len(VolGatedMomentumTemplate().param_grid) == 2
+
+
+def test_absolute_momentum_template_matches_manual_roc_signs():
+    rng = np.random.default_rng(21)
+    closes = 100 * np.exp(np.cumsum(rng.normal(0, 0.01, 500)))
+    df = make_df(closes)
+    template = AbsoluteMomentumTemplate()
+    params = {"entry_lookback": 252, "exit_lookback": 21}
+
+    result = template.signals(df, params)
+
+    expected_entry = (roc(df["Close"], 252) > 0).fillna(False)
+    expected_exit = (roc(df["Close"], 21) < 0).fillna(False)
+    pd.testing.assert_series_equal(result["entry_signal"], expected_entry, check_names=False)
+    pd.testing.assert_series_equal(result["exit_signal"], expected_exit, check_names=False)
+
+
+def test_absolute_momentum_holds_a_steady_uptrend_and_exits_a_downtrend():
+    # A clean uptrend for the whole entry-lookback window should keep the
+    # trailing return positive (entry on, exit off); a clean downtrend should
+    # flip both -- the core "hold your own trend, step to cash otherwise" rule.
+    n = 400
+    up = make_df(100 * np.exp(np.cumsum(np.full(n, 0.002))))     # monotonic up
+    down = make_df(100 * np.exp(np.cumsum(np.full(n, -0.002))))  # monotonic down
+    template = AbsoluteMomentumTemplate()
+    params = {"entry_lookback": 126, "exit_lookback": 21}
+
+    up_sig = template.signals(up, params)
+    down_sig = template.signals(down, params)
+
+    # After warmup, an unbroken uptrend is fully invested and never exit-signaled...
+    assert up_sig["entry_signal"].iloc[200:].all()
+    assert not up_sig["exit_signal"].iloc[200:].any()
+    # ...and an unbroken downtrend is the mirror image.
+    assert not down_sig["entry_signal"].iloc[200:].any()
+    assert down_sig["exit_signal"].iloc[200:].all()
+
+
+def test_absolute_momentum_param_grid_is_small():
+    assert len(AbsoluteMomentumTemplate().param_grid) == 2
