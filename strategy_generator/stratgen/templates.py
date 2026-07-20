@@ -17,15 +17,20 @@ DataFrame with `entry_signal`/`exit_signal` boolean columns, computed from
 each bar's CLOSE (the backtester acts on them at the NEXT bar's open, to
 avoid lookahead -- consistent with every other backtester in this workspace).
 
-`TurnOfMonthTemplate` and `VolGatedMomentumTemplate` below were added after a
-deep-research pass specifically looking for additional sub-3-month-holding
-templates with sourced evidence of beating buy-and-hold on drawdown as well
-as return (see ../README.md for the full research grounding, confidence
-levels, and disclosed simplifications for each). Neither is wired into
-`TEMPLATES_BY_REGIME`: that dict routes by a trending/mean-reverting/
-random-walk three-way split, and neither new template's edge is conditioned
-on that axis -- they're available for direct use via `run_backtest(df,
-template, params)` like any other template here, just not part of the
+`TurnOfMonthTemplate`, `VolGatedMomentumTemplate`, and
+`AbsoluteMomentumTemplate` below were added after deep-research passes
+specifically looking for additional sub-3-month-holding templates with
+sourced evidence of beating buy-and-hold on drawdown as well as return (see
+../README.md for the full research grounding, confidence levels, disclosed
+simplifications, and adversarial counter-evidence for each). None is wired
+into `TEMPLATES_BY_REGIME`: that dict routes by a trending/mean-reverting/
+random-walk three-way split. For `TurnOfMonth`/`VolGatedMomentum` that's
+because their edge isn't conditioned on that axis; for `AbsoluteMomentum` the
+edge IS a trending-regime one, but its per-asset significance is contested
+(Zakamulin 2014; Huang et al. 2020) and the trending slot is already held by
+`MomentumTemplate`, so rather than silently change routing it's offered as an
+alternative trending-regime construct for direct use via `run_backtest(df,
+template, params)` (and through the generator's ERS/trust gate), not the
 automatic Hurst-regime router.
 """
 
@@ -33,7 +38,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-from .indicators import realized_vol, rsi, sma
+from .indicators import realized_vol, roc, rsi, sma
 
 
 @dataclass
@@ -175,6 +180,84 @@ class VolGatedMomentumTemplate(Template):
         out = pd.DataFrame(index=df.index)
         out["entry_signal"] = trend_ok & ~vol_extreme_high
         out["exit_signal"] = (~trend_ok) | vol_extreme_high
+        return out
+
+
+@dataclass
+class AbsoluteMomentumTemplate(Template):
+    """Time-series (a.k.a. absolute) momentum: hold the instrument only while
+    its OWN trailing return is positive, and step to cash when it isn't -- the
+    single most-replicated tradable momentum construct, and the one in the
+    momentum family with the strongest DRAWDOWN-reduction evidence (which is
+    exactly the axis this project's follow-up template search cared about).
+
+    This is a genuinely different signal from `MomentumTemplate`, not a
+    reskin: `MomentumTemplate` is a fast/slow SMA CROSSOVER (a rule on two
+    smoothed PRICE levels), whereas this is a rule on the SIGN of the
+    instrument's own trailing RETURN -- the precise construct the academic
+    time-series-momentum literature studies. The overlap (both are
+    trend-following and long the same broad up-moves) is real and disclosed;
+    the estimators differ and can disagree at turning points, which is why
+    it's offered as a distinct option rather than folded into the crossover.
+
+    Research grounding (adversarially verified, both directions):
+    - **FOR (the core anomaly):** Moskowitz, Ooi & Pedersen (2012, *Journal of
+      Financial Economics* 104(2):228-250) documented time-series momentum in
+      every one of 58 liquid futures across equities, currencies, commodities
+      and bonds: a 12-month-lookback / 1-month-hold rule was positive for all
+      58 and significant for 52, with the diversified portfolio delivering an
+      annualized Sharpe near 1.1 (1985-2009); returns persist ~1-12 months
+      then partially reverse. This is the `lookback`/exit design below.
+    - **FOR (the drawdown mechanism specifically):** Faber (2007, *Journal of
+      Wealth Management*) tested a 10-month-SMA / absolute-momentum timing
+      rule (economically the same "own trend is up -> hold, else cash" signal)
+      across 20+ markets and a 5-asset-class allocation: it delivered
+      equity-like returns with bond-like volatility, cut the max drawdown from
+      ~46% (buy-and-hold) to single digits, and improved the risk-adjusted
+      return / drawdown in >90% of the out-of-sample markets while invested
+      only ~70% of the time. The de-risk-to-cash leg is what buys the
+      drawdown reduction, and it's why the exit uses a (typically shorter)
+      lookback than the entry -- cut losers faster than you commit to winners.
+    - **AGAINST (why it's still only a directly-usable option, not trusted
+      outright, and not auto-routed):** Zakamulin (2014, *Journal of Asset
+      Management* 15(4)) showed the headline moving-average / time-series-
+      momentum timing results are substantially overstated -- data-mining
+      bias, ignored transaction costs, and extreme sensitivity to the lookback
+      AND to the in-/out-of-sample split point; his robust out-of-sample tests
+      found the "edge" is mostly RISK reduction confined to a few historical
+      episodes, not persistent return outperformance. Huang, Li, Wang & Zhou
+      (2020, *JFE* 135(3)) similarly found per-asset TSM weak once the pooled
+      t-stat is bootstrap-corrected. Consistent with this, a long-horizon
+      study finds long-only TSM beats buy-and-hold over the very long run but
+      with <60% probability of doing so over any given 5-10-year window. So
+      like `TurnOfMonth`/`VolGatedMomentum`, this template is exposed for
+      direct use and put through the generator's ERS / trust gate rather than
+      wired into `TEMPLATES_BY_REGIME` -- it is NOT trusted just for having a
+      famous name.
+
+    `entry_lookback`: trailing-return window (trading days) whose sign gates
+    entry -- ~126/189/252 days spans the 6-12-month horizon the evidence is
+    about. `exit_lookback`: a (typically shorter) trailing-return window whose
+    turning negative forces the exit-to-cash; a shorter exit than entry is the
+    asymmetry that produces the drawdown reduction (Faber). Both are ROC
+    windows, keeping this to exactly 2 free search parameters like every other
+    template here. Computed on each bar's CLOSE; acted on at the NEXT bar's
+    open by the backtester, so there is no lookahead.
+    """
+
+    name: str = "absolute_momentum"
+    param_grid: dict = field(default_factory=lambda: {
+        "entry_lookback": [126, 189, 252], "exit_lookback": [21, 42, 63],
+    })
+    stop_loss_atr_mult: float = 3.0  # loose: the trailing-return sign flip IS the primary risk control, per the trend-following evidence
+
+    def signals(self, df: pd.DataFrame, params: dict) -> pd.DataFrame:
+        close = df["Close"]
+        entry_momentum = roc(close, params["entry_lookback"])
+        exit_momentum = roc(close, params["exit_lookback"])
+        out = pd.DataFrame(index=df.index)
+        out["entry_signal"] = (entry_momentum > 0).fillna(False)
+        out["exit_signal"] = (exit_momentum < 0).fillna(False)
         return out
 
 

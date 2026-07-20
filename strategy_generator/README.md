@@ -48,7 +48,7 @@ confirm the tradeoff is worth it in practice — it's a sound methodological
 argument, not an empirically demonstrated improvement).
 
 **Testing note, stated up front per this project's original instruction: this
-project was validated with synthetic data only — the 52-test suite exercises
+project was validated with synthetic data only — the 90-test suite exercises
 every module's mechanics and statistical properties, but the pipeline was NOT
 run end-to-end against real market data this session.** `run_strategygen.py`
 and `stratgen/data.py` are complete and usable against real data (via
@@ -259,6 +259,48 @@ this project's own testing): no accepted risk-based explanation exists, only
 unproven cash-flow/rebalancing hypotheses, and calendar effects are
 documented to weaken or drift to different days over time.
 
+### `AbsoluteMomentumTemplate` — time-series (absolute) momentum
+Hold the instrument only while its OWN trailing return is positive; step to
+cash otherwise (`entry_lookback`, `exit_lookback`: 2 free params — a shorter
+exit than entry cuts losers faster than it commits to winners, which is where
+the drawdown reduction comes from). **Confidence: high for the anomaly and its
+drawdown mechanism, deliberately NOT trusted as a standalone edge.** This is a
+genuinely different signal from `MomentumTemplate` — that one is a fast/slow
+SMA *crossover* (a rule on two smoothed price levels); this is a rule on the
+*sign of the instrument's own trailing return*, the exact construct the
+academic time-series-momentum literature studies. The overlap (both are
+trend-following) is real and disclosed. Evidence, verified in both directions:
+
+- **For (the anomaly):** Moskowitz, Ooi & Pedersen (2012, *Journal of
+  Financial Economics* 104(2):228–250) found time-series momentum in every one
+  of 58 liquid futures — a 12-month-lookback / 1-month-hold rule positive for
+  all 58, significant for 52, diversified-portfolio Sharpe ≈ 1.1 (1985–2009).
+- **For (the drawdown mechanism specifically — the axis this pass cared
+  about):** Faber (2007, *Journal of Wealth Management*) tested an economically
+  equivalent 10-month-SMA / absolute-momentum timing rule across 20+ markets
+  and a 5-asset-class allocation: equity-like returns with bond-like
+  volatility, max drawdown cut from ~46% (buy-and-hold) to single digits, and
+  improved risk-adjusted return/drawdown in >90% of out-of-sample markets while
+  invested only ~70% of the time. The de-risk-to-cash leg is what buys the
+  drawdown reduction.
+- **Against (why it is NOT auto-routed and is put through the same ERS/trust
+  gate as everything else):** Zakamulin (2014, *Journal of Asset Management*
+  15(4)) showed these moving-average / time-series-momentum timing results are
+  substantially overstated by data-mining bias and ignored transaction costs,
+  and are extremely sensitive to both the lookback and the in-/out-of-sample
+  split point — his robust out-of-sample tests find the benefit is mostly *risk*
+  reduction confined to a few historical episodes, not persistent return
+  outperformance. Huang, Li, Wang & Zhou (2020, *JFE* 135(3)) likewise found
+  per-asset TSM weak once the pooled t-stat is bootstrap-corrected, and a
+  long-horizon study puts the probability that long-only TSM beats buy-and-hold
+  over any given 5–10-year window below 60% despite a positive very-long-run
+  edge. **Disclosed non-wiring:** unlike `TurnOfMonth`/`VolGatedMomentum`
+  (whose edges aren't conditioned on the trend axis), this one's edge *is* a
+  trending-regime edge — but the `TEMPLATES_BY_REGIME` "trending" slot is
+  already held by `MomentumTemplate`, and rather than silently change routing
+  it's offered as an alternative trending-regime construct for direct use (and
+  through the generator's ERS/trust gate), not the automatic Hurst router.
+
 ### `VolGatedMomentumTemplate` — conditional volatility-targeting, simplified
 Trend-following (fixed 100-day SMA filter), de-risked out of the market when
 realized volatility spikes above its own trailing-252-day percentile
@@ -327,6 +369,17 @@ this project's constraints:
    competed away — today's edge is likely thinner than the 40-year average.
 
 ### What did NOT make the cut from this follow-up pass, and why
+- **MACD / RSI-crossover and other oscillator "momentum indicators"**: the
+  `roc` primitive `AbsoluteMomentumTemplate` needs is now re-exported, but MACD
+  (already implemented in `../common/indicators.py`) is deliberately NOT
+  exposed and no oscillator-crossover template was built — Park & Irwin (2007,
+  *Journal of Economic Surveys*) reviewed 95 studies and, in their futures
+  reality-check, found popular rules including RSI and MACD survived White's
+  Bootstrap Reality Check / Hansen's SPA data-snooping corrections in only 2 of
+  17 contracts and did not persist out-of-sample. Time-series/absolute momentum
+  (`roc`-based) was included instead precisely because it is the one
+  momentum-family construct with strong, independently-replicated drawdown
+  evidence; the raw oscillators are not.
 - **Cointegration-based ETF pairs trading** (Chen & Alexiou 2025): mechanics
   confirmed, but the "better Sharpe AND lower drawdown than buy-and-hold"
   framing was refuted on adversarial check — the paper's own baseline result
@@ -368,9 +421,9 @@ base `hurst_exponent` math is now shared.
 ```
 strategy_generator/
   stratgen/
-    indicators.py     rsi/sma/atr/atr_pct/realized_vol re-exported from ../common/indicators.py (the deliberately small primitive set)
+    indicators.py     rsi/sma/atr/atr_pct/realized_vol/roc re-exported from ../common/indicators.py (the deliberately small primitive set; MACD deliberately NOT re-exported -- weak stand-alone evidence, Park & Irwin 2007)
     regime.py          hurst_exponent re-exported from ../common/hurst.py; Monte-Carlo calibration + universe-wide median-pooled classification (local, unique to this project)
-    templates.py       MomentumTemplate, MeanReversionTemplate, NoTradeTemplate, TurnOfMonthTemplate, VolGatedMomentumTemplate (2 free params each)
+    templates.py       MomentumTemplate, MeanReversionTemplate, NoTradeTemplate, TurnOfMonthTemplate, VolGatedMomentumTemplate, AbsoluteMomentumTemplate (2 free params each)
     backtester.py      Single-instrument, single-position event loop (next-bar-open entries, intrabar ATR-stop) -- used directly by tests/manual exploration; generator.py now scores candidates via portfolio_backtester.py instead
     portfolio_backtester.py  Multi-asset portfolio backtest: concurrent positions across every signaled symbol in a universe, one shared cash pool, equal-weight slots, hard max-holding-days cap -- what generator.py's single-symbol search actually scores candidates with
     pairs.py            Distance/rolling-z-score pairs-trading signals (two-instrument, long-short -- not a Template subclass, see above)
@@ -428,7 +481,7 @@ bar-position-based and require a shared trading calendar across the universe.
 python -m pytest tests/ -v
 ```
 
-87 tests, synthetic data only (per this project's instruction), covering:
+90 tests, synthetic data only (per this project's instruction), covering:
 indicator correctness; the Hurst estimator's known finite-sample bias and
 its Monte-Carlo calibration; universe-wide regime pooling (median resists a
 single outlier instrument, a universe of pure noise routes to no-trade, an

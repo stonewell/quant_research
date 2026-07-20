@@ -13,6 +13,71 @@ structure, real diversification value, and enough trustworthy history. This
 is a screening/research tool, not a backtester: it doesn't simulate trades,
 it characterizes instruments.
 
+## Screen first, score second: hard gates before soft scores
+
+Liquidity and history length used to be soft, rank-based inputs into the
+one composite score everything downstream (including the diversification-
+selection methods below) consumed — `min_avg_dollar_volume` existed as a
+config field but was never actually enforced anywhere; a genuinely illiquid
+instrument could still rank well by scoring strongly on unrelated
+dimensions (predictability, diversification, history) and end up selected
+anyway. A follow-up deep-research pass specifically checked whether that's
+defensible, and found real, citable evidence it isn't:
+
+- **Index-provider methodology** (MSCI's GIMI and Factor Index families,
+  verified against primary-source PDFs, stable across ~2013-2024 document
+  vintages): a set of enumerated, **binary pass/fail** investability screens
+  — minimum size, minimum liquidity, minimum length of trading, financial
+  reporting — defines an eligible universe strictly BEFORE any
+  factor-tilting, weighting, or optimization step runs on it. MSCI's own
+  factor "Alpha score" formula deliberately **excludes liquidity as a
+  component** — it's resolved entirely by universe construction (which
+  Parent Index the optimizer is even allowed to draw from), never blended
+  into the score the optimizer selects on.
+- **The composite-indicator/MCDA literature** (OECD/JRC *Handbook on
+  Constructing Composite Indicators*; Cinelli, Kadziński, Gonzalez &
+  Słowiński, *Omega*, peer-reviewed) formally names this failure mode **"full
+  compensability"**: an additive/weighted score lets a unit offset a
+  deficiency on one dimension with strength on another — the Handbook's own
+  worked example shows (21,1,1,1) and (6,6,6,6) can score identically
+  despite representing very different underlying conditions. Its
+  prescription for a genuinely non-negotiable requirement (a tradability
+  floor is exactly that) is to remove it from the composite via a **prior
+  hard gate**, not to keep tuning weights.
+- **This project's own `hurst_min_obs` floor already did this correctly**
+  for the Hurst significance test specifically (see `persistence.py`) —
+  below that many observations, the result is `NaN`/`"insufficient_data"`,
+  not a low-confidence score. Independent peer-reviewed evidence (Weron 2002,
+  *Physica A*) supports treating short samples this way: DFA/GPH
+  Hurst-estimator error degrades by roughly an order of magnitude between
+  L=256 and L=65536 observations, and the original study excluded its own
+  shortest sample size from part of its analysis rather than including it
+  with a caveat. `screening.py` (new) extends the SAME pattern to liquidity
+  and overall history length, which previously had no equivalent floor.
+
+`run_screener.py` now runs `screening.screen_universe()` immediately after
+computing raw metrics and BEFORE building the correlation matrix or scoring
+anything — an excluded instrument is dropped from the correlation matrix,
+`overall_selection_score`, and every `selection.py` method entirely, not
+just soft-scored down. Two hard gates are implemented: `min_avg_dollar_volume`
+(existing field, now actually enforced) and a new, deliberately low/
+permissive `min_history_years` (distinct from the SOFT
+`min_history_years_for_full_credit` used by `history_adequacy_score` — the
+hard floor just asks "is there enough data to compute anything meaningful
+at all," the soft threshold asks "has this ETF cleared its highest-closure-
+risk window"). The benchmark symbol is exempt from both gates (beta and the
+correlation regime-shift check both require it to be present), and every
+excluded symbol's reason is reported (`screened_out.csv`, printed to stdout)
+rather than having it silently vanish.
+
+**What this pass could NOT resolve, and neither could the wider literature
+searched for it:** whether screening BEFORE vs. AFTER correlation/clustering
+changes which instruments end up as cluster representatives or Max-Sum
+greedy picks. This project screens before (matching the index-provider
+precedent's ordering), but that specific ordering choice is not
+independently verified to matter for these particular selection algorithms
+— it's a reasonable default, not a proven-optimal one.
+
 ## The five key aspects, and how each affects selection
 
 ### 1. Liquidity — can you actually trade it at the backtested price?
@@ -38,9 +103,10 @@ bounce component — letting the two be mathematically disentangled.
 minimum") survived this project's research pass — requirements are strategy-
 and position-size-dependent. `min_avg_dollar_volume` is an adjustable
 screening floor you should tune to your own capital and strategy, not a
-scientifically-derived threshold. `liquidity_score` instead ranks
-instruments by percentile *within your chosen universe*, a more defensible
-relative measure.
+scientifically-derived threshold. `liquidity_score` ranks instruments by
+percentile *within the universe that already cleared that floor* (see
+"Screen first, score second," below, for why this is now a hard gate applied
+in `screening.py`, not just a soft, rank-based input the way it used to be).
 
 ### 2. Volatility — is there a tradable edge, and what kind?
 
@@ -113,6 +179,148 @@ Autocorrelation (lag-1) and a simplified variance-ratio statistic (Lo &
 MacKinlay's point estimate, not the full heteroskedasticity-robust test) are
 included as complementary, easier-to-interpret cross-checks.
 
+### 3b. Candlestick predictability — does the OHLC structure carry information too?
+
+**Why it's here, and why it's a SEPARATE, deliberately small component from
+the Hurst predictability above:** the Hurst test asks whether *close-to-close
+returns* have exploitable long-memory structure. Candlestick analysis makes a
+different, older claim: that the *within-bar and across-bar open/high/low/close
+relationships* — hammers, engulfings, stars — carry short-horizon reversal
+information that close-only statistics miss. This component asks the same
+strategy-agnostic question as §3 ("is there genuine, statistically significant
+structure at all?"), but on that OHLC-geometry channel instead of long memory,
+and reports the direction only as a descriptive label (`candlestick_label`).
+
+**The honest, adversarially-checked research picture (this is a contested
+area, and the component is weighted to reflect that):**
+
+- **The notable study IN FAVOUR — and the source of the test this component
+  implements:** Caginalp & Laurent (1998, *Applied Mathematical Finance*
+  5:181-206, "The Predictive Power of Price Patterns") ran a non-parametric
+  test on daily OHLC of all S&P 500 stocks 1992-1996 and found three-day
+  candlestick reversal patterns predicted a reversal out-of-sample at ~36
+  standard deviations from the null (~1% over a two-day hold). Their core
+  statistic — does the *conditional* probability of a reversal given a pattern
+  exceed the *unconditional* base-rate probability — is exactly the
+  direction-agnostic information-content measure `candlestick.py` computes.
+- **The more rigorous study AGAINST — and the source of the significance test:**
+  Marshall, Young & Rose (2006, *Journal of Banking & Finance* 30(8):2303-2323)
+  built an extension of the Efron (1979) bootstrap that resamples random OHLC
+  series and found candlestick strategies have **no value** on DJIA stocks
+  1992-2002 — "further evidence that this market is informationally efficient."
+  Their bootstrap-null comparison (real edge vs. the edge you'd get by chance)
+  is the discipline `candlestick_significance()` follows, via a coarser
+  random-date placebo (documented as coarser, the same honesty caveat the
+  Hurst test carries about its own shuffle surrogates).
+- **Corroboration across markets:** a Swedish OMXS30 study (2007-2015) found
+  poor predictive power / weak-form efficiency; an intraday DJIA 5-minute
+  study (Etienne et al.) found ~a third of rules beat buy-and-hold at the
+  Bonferroni level but **none** survived transaction costs plus the SSPA
+  data-snooping correction.
+
+**What's implemented:** `common/indicators.py` detects the canonical
+single-/two-/three-bar reversal patterns (hammer, hanging man, inverted
+hammer, shooting star, bullish/bearish engulfing, piercing line, dark-cloud
+cover, bullish/bearish harami, morning/evening star, three white soldiers /
+three black crows, plus a neutral doji), each gated on a preceding-trend
+context exactly as Caginalp & Laurent used a short MA (a hammer in a downtrend
+is bullish; the identical shape in an uptrend is the bearish hanging man).
+`candlestick.py` then measures the pattern-conditional forward return net of
+the base-rate drift, tests it against a placebo null, and — like every
+`regime_label` in this tool — gates the reported edge on that significance
+test. `candlestick_score` ranks the absolute (direction-agnostic) edge across
+the surviving universe and down-weights insignificant readings to near-zero,
+just as `predictability_score` does for an insignificant Hurst value.
+
+**What to expect (and why a near-zero result is the CORRECT outcome, not a
+bug):** given the weight of rigorous evidence, `candlestick_significant`
+should be **False for most liquid instruments** — directly analogous to this
+project's own Hurst finding, where 15 of 16 broad ETFs came back
+random-walk-like. A non-zero, significant candlestick edge is a flag that an
+instrument is unusual and worth investigating further, *not* a validated
+trading edge. That is why the composite gives this component the smallest
+weight of the five always-present scores (0.03, the smallest share of the
+"exploitable structure" family) and treats an insignificant reading as ~zero.
+
+### 3c. Momentum predictability — does the instrument's own past return predict its future?
+
+**Why it's here, and how it differs from §3 and §3b:** momentum is the single
+most-replicated form of the "is there exploitable structure?" question, so it
+gets its own channel. §3 (Hurst) measures long-range memory via variance
+scaling; §3b (candlestick) measures OHLC-geometry reversals; this component
+measures the **serial correlation between an instrument's past `lookback`-day
+return and its subsequent `horizon`-day return** — the literal statistical
+core of the momentum anomaly. As always, direction is reported descriptively
+(`momentum_label`: `momentum`/trending vs. `reversal`/mean-reverting) and the
+*score* is the direction-agnostic magnitude, gated on significance. This is a
+strategy-agnostic property of the instrument ("does momentum work on it over
+the sample?"), NOT a "buy it because it's up right now" timing call — the
+trailing return is reported only as a descriptive snapshot
+(`momentum_lookback_return`), never scored.
+
+**The honest, adversarially-checked research picture:**
+
+- **The evidence FOR (two of the most-cited anomalies in finance):**
+  Jegadeesh & Titman (1993, *Journal of Finance* 48(1):65-91) documented
+  cross-sectional momentum (past 3-12-month winners keep beating losers by
+  ~1%/month over the next 3-12 months, NYSE/AMEX 1965-1989, not explained by
+  systematic risk — though it partially reverses over the following two
+  years). Moskowitz, Ooi & Pedersen (2012, *Journal of Financial Economics*
+  104(2):228-250) documented **time-series** momentum: a security's own past
+  12-month excess return positively predicts its next-month return for **every
+  one of 58 liquid futures** across equities, currencies, commodities and
+  bonds. The time-series form is the one relevant to picking a single
+  instrument, and is exactly what `momentum_edge` estimates.
+- **The critique AGAINST — and the reason it's still bootstrap-tested
+  per-instrument rather than trusted outright:** Huang, Li, Wang & Zhou (2020,
+  *JFE* 135(3):774-794, "Time series momentum: Is it there?") showed the
+  headline TSM result rests on a **pooled** regression whose large t-stat
+  (~4.3) is *not* statistically reliable — it over-rejects no-predictability
+  because of cross-asset mean differences, a persistent predictor, and
+  volatility scaling. Their bootstrap-corrected, **asset-by-asset** tests find
+  little TSM in- or out-of-sample, and the strategy performs about the same as
+  one based on the historical mean that needs no predictability at all. Their
+  prescription — test each instrument on its own against a proper bootstrap
+  null — is *exactly* what this module does, so the critique is baked into the
+  method rather than argued around.
+- **The technical-indicator angle (RSI/MACD/ROC) specifically:** Park & Irwin
+  (2007, *Journal of Economic Surveys*) reviewed 95 modern technical-analysis
+  studies (56 positive / 20 negative / 19 mixed) and found most suffer
+  data-snooping, ex-post rule selection, and transaction-cost problems; their
+  futures reality-check found that after White's Bootstrap Reality Check and
+  Hansen's SPA data-snooping corrections, popular rules including RSI and MACD
+  were significant in only 2 of 17 contracts and didn't persist out-of-sample.
+  So the classic momentum *indicators* (RSI, MACD, ROC) are computed and
+  reported descriptively, but the **scored** quantity is the bootstrap-tested
+  return-predictability edge, not a raw indicator signal.
+- **The cross-cutting caveat even when momentum IS real:** Daniel & Moskowitz
+  (2016, *JFE* 122(2):221-247, "Momentum crashes") show momentum returns are
+  strongly negatively skewed (the winner-minus-loser portfolio's monthly skew
+  is −4.70) with infrequent but severe, persistent crashes concentrated in
+  panic states — after market declines, when volatility is high,
+  contemporaneous with rebounds (Mar-May 2009: past losers +163% vs. past
+  winners +8%). A high momentum edge is **not** a free lunch; it carries
+  left-tail crash risk this single number can't capture — the same spirit as
+  the unresolved correlation-spikes-in-a-crash caveat in §4.
+
+**What's implemented:** `common/indicators.py` adds `roc` (rate of change /
+raw momentum, the J&T/MOP 12-month signal) and `macd`, alongside the existing
+`rsi` and `adx`. `momentum.py`'s `momentum_efficacy()` computes the past-vs-
+future serial correlation (using log prices, so the Pearson correlation
+demeans out the per-asset drift that biased Huang et al.'s pooled test) and
+tests it against a shuffle null that destroys serial dependence while
+preserving the sliding windows' mechanical overlap. `momentum_score` ranks the
+absolute edge across the surviving universe and down-weights insignificant
+readings to near-zero, exactly like the Hurst and candlestick channels.
+
+**What to expect:** as with Hurst and candlesticks — and consistent with both
+this project's own random-walk-like Hurst finding and Huang et al.'s weak
+per-asset result — `momentum_significant` should be **False for many broad,
+liquid instruments** over long, mixed-regime windows. A significant momentum
+edge flags an instrument whose own-return predictability is unusually strong
+on this sample: a lead to investigate, weighted small (0.10) and crash-
+caveated, not a validated trading edge.
+
 ### 4. Correlation and diversification — building a basket, not a bet on one name
 
 **Why it matters:** if you're running a strategy across several instruments
@@ -158,10 +366,14 @@ underlying basket.
 
 **What's implemented:** `history_years` (actual calendar span of available
 price data — always computable, and a legitimate proxy for fund age when the
-requested date range predates the fund's inception) drives
-`history_adequacy_score`, capped at full credit once a fund clears
-`min_history_years_for_full_credit` (default 4, matching the "3-4 years"
-research threshold). Expense ratio and AUM are fetched best-effort via
+requested date range predates the fund's inception) is now checked TWICE:
+a hard floor (`min_history_years`, default 1) excludes an instrument
+entirely in `screening.py` before anything else runs, and — only for
+instruments that clear it — drives `history_adequacy_score`, capped at full
+credit once a fund clears `min_history_years_for_full_credit` (default 4,
+matching the "3-4 years" research threshold). See "Screen first, score
+second," above, for why these are two separate thresholds with two separate
+jobs, not one number doing double duty. Expense ratio and AUM are fetched best-effort via
 yfinance metadata (`fetch_fund_metadata()`) and scored (`etf_expense_score`,
 `etf_aum_score`) when available. Critically, these are **not weighted the
 same as the verified research metrics above** — they're a data-availability
@@ -174,19 +386,35 @@ lacking a fund-only attribute.
 
 ## The composite score
 
-`overall_selection_score` is a weighted average of five always-present
-components (liquidity, volatility adequacy, predictability, diversification,
-history adequacy) plus two optional ETF-metadata components, with weights:
+`overall_selection_score` is a weighted average of seven always-present
+components (liquidity, volatility adequacy, predictability, momentum,
+candlestick predictability, diversification, history adequacy) plus two
+optional ETF-metadata components, with weights:
 
 | Component | Weight | Always available? |
 |---|---|---|
 | `liquidity_score` | 0.30 | yes |
 | `vol_adequacy_score` | 0.20 | yes |
-| `predictability_score` | 0.20 | yes |
+| `momentum_score` | 0.10 | yes |
+| `predictability_score` | 0.07 | yes |
+| `candlestick_score` | 0.03 | yes |
 | `diversification_score` | 0.15 | yes (needs ≥2 symbols) |
 | `history_adequacy_score` | 0.10 | yes |
 | `etf_expense_score` | 0.025 | best-effort |
 | `etf_aum_score` | 0.025 | best-effort |
+
+The "does this series show exploitable structure at all?" family keeps its
+original combined weight of **0.20**, now split across three independent,
+bootstrap-null-gated tests **by strength of evidence**: `momentum_score`
+(time-series-momentum serial correlation) gets the largest share at 0.10 — two
+of the most-replicated anomalies in finance (§3c) — `predictability_score`
+(long-memory Hurst) 0.07, and `candlestick_score` (OHLC reversal edge) the
+smallest at 0.03 (weakest evidence, §3b). Momentum is capped at 0.10 rather
+than higher because its per-asset significance is contested (Huang et al.
+2020) and it carries left-tail crash risk (Daniel & Moskowitz 2016). Nothing
+outside the family changed, so the weights still sum to 1.0, and — like every
+other component — a missing or statistically insignificant reading in any of
+the three degrades gracefully to near-zero rather than penalizing.
 
 As with every other number in this tool: **no verified universal formula for
 combining these into one score survived research** — these weights are a
@@ -347,6 +575,16 @@ self-validating result:
   persistent statistical edge on the whole-period series — any edge they
   show tends to be regime-specific (e.g., real during 2000-2002/2008-style
   stress, absent during a long, mostly-random-walk-like bull grind).
+- **The candlestick component came back with NO significant edge for every
+  liquid ETF tested** — a direct real-data re-confirmation of the dominant
+  academic finding (Marshall, Young & Rose 2006) and a near-exact parallel to
+  the Hurst result above. On a 2015-2024 run, SPY/QQQ/TLT/GLD each detected
+  800-930 reversal patterns yet produced a base-rate-adjusted conditional edge
+  within ~±0.1% and a placebo p-value nowhere near significance (0.12-0.59),
+  so all four scored near-zero on `candlestick_score`. As documented in §3b,
+  this "no edge" outcome is the *expected* result for liquid instruments, not
+  a defect — the component earns its keep by flagging the rare instrument that
+  deviates from it, exactly as the Hurst test flagged only USO.
 - **The correlation-spike-in-stress phenomenon was empirically confirmed on
   this data**: average pairwise correlation was 0.266 in calm periods vs.
   0.389 in high-volatility periods (a 1.46x spike) — matching the documented
@@ -388,14 +626,17 @@ instrument_selection/
     liquidity.py      Avg dollar volume + Corwin-Schultz spread estimator
     volatility.py     volatility_summary() (local) + atr/atr_pct/adx/realized_vol/vol_of_vol/atr_regime_ratio re-exported from ../common/indicators.py
     persistence.py    hurst_significance()/persistence_summary() (local, shuffle-based significance test) + hurst_exponent/autocorrelation/variance_ratio re-exported from ../common/hurst.py
+    candlestick.py    candlestick_significance()/candlestick_summary() (local, placebo-null test on OHLC reversal patterns) + pattern detectors re-exported from ../common/indicators.py
+    momentum.py       momentum_efficacy()/momentum_summary() (local, shuffle-null test on past-vs-future return serial correlation) + roc/macd/rsi re-exported from ../common/indicators.py
     correlation.py    Correlation matrix, beta, hierarchical clustering, redundancy flags, regime-shift check
-    scoring.py        Strategy-agnostic composite score: liquidity, volatility adequacy, predictability, diversification, history/fund-quality
+    screening.py       HARD gates (liquidity floor, min history) applied BEFORE scoring/correlation/selection -- see "Screen first, score second" above
+    scoring.py        Strategy-agnostic composite score for instruments that already cleared screening.py's gates: volatility adequacy, predictability, momentum, candlestick predictability, diversification, history/fund-quality
     selection.py       Turns scores + correlation into an actual chosen basket: cluster-representative, Max-Sum-Diversification greedy, and threshold-gated greedy (see "From scores to a chosen basket" above)
     plotting.py       Correlation heatmap, dendrogram, Hurst-vs-volatility scatter (descriptive, not strategy-specific)
   run_screener.py      CLI — full report across all metrics for a universe, plus a chosen basket via --select-method
-  tests/                pytest unit tests (43 tests covering every module)
+  tests/                pytest unit tests (72 tests covering every module)
   data/                 cached price CSVs (gitignored)
-  results/              screening report, correlation matrix, charts (gitignored)
+  results/              screening report, correlation matrix, screened-out report, charts (gitignored)
 ```
 
 ## Setup
@@ -422,7 +663,8 @@ Key options (see `python run_screener.py --help` for the full list):
 |---|---|
 | `--universe` | Space-separated list of tickers to screen (benchmark is auto-added) |
 | `--benchmark` | Symbol used for beta and the correlation regime-shift check |
-| `--min-avg-dollar-volume` | Liquidity floor (adjustable, not a verified universal number) |
+| `--min-avg-dollar-volume` | HARD liquidity gate -- excluded before scoring/selection, not just soft-scored (adjustable, not a verified universal number) |
+| `--min-history-years` | HARD history-length gate, distinct from `--min-history-years-for-full-credit` (a soft scoring threshold, not exposed as its own flag) |
 | `--max-cluster-correlation` | Threshold above which a pair is flagged as redundant |
 | `--no-fund-metadata` | Skip the best-effort expense-ratio/AUM lookup (faster, no ETF-quality component) |
 | `--top-n` | How many top-ranked instruments to print by overall selection score |
@@ -431,11 +673,12 @@ Key options (see `python run_screener.py --help` for the full list):
 | `--select-max-k` | Optional cap on basket size for `threshold` (which otherwise sizes itself from the data) |
 
 Outputs land in `results/`: `screening_report.csv` (every metric and score
-per symbol), `correlation_matrix.csv`, and three charts. The chosen basket
-(per `--select-method`) prints to stdout — run all four methods side by
-side on your own universe to compare, since no head-to-head comparison of
-them survived this project's research (see "From scores to a chosen
-basket" above).
+per symbol that cleared the hard gates), `correlation_matrix.csv`,
+`screened_out.csv` (excluded symbols and why, only written if any were
+excluded), and three charts. The chosen basket (per `--select-method`)
+prints to stdout — run all four methods side by side on your own universe
+to compare, since no head-to-head comparison of them survived this
+project's research (see "From scores to a chosen basket" above).
 
 ## Testing
 
@@ -443,7 +686,7 @@ basket" above).
 python -m pytest tests/ -v
 ```
 
-43 tests covering: the Corwin-Schultz spread estimator (non-negative,
+72 tests covering: the Corwin-Schultz spread estimator (non-negative,
 increases with wider high-low noise), realized vol/ATR%/vol-of-vol/ADX
 correctness on synthetic series with known properties, the Hurst estimator
 correctly ordering trending > random-walk > mean-reverting synthetic AR(1)
@@ -468,7 +711,33 @@ is nonzero but degenerates to exact naive top-K at `diversity_weight=0`
 (a direct check that the "improvement over naive" claim is real, not just
 asserted), and the threshold-gated greedy both skips the correlated
 lower-priority candidate and lets basket size emerge from the data rather
-than a fixed K.
+than a fixed K; `screening.py`'s hard gates (`test_screening.py`): an
+illiquid instrument and a too-short-history instrument are each correctly
+excluded with the right reason recorded, both reasons are reported together
+when an instrument fails on both axes, missing liquidity/history data is
+treated as a failure rather than silently passing, a good instrument is
+never excluded, the benchmark is exempt from both gates when named (and
+correctly NOT exempt when it isn't), and passed/screened-out always
+partition the input exactly (nothing is dropped or double-counted);
+`candlestick.py` (`test_candlestick.py`): the pattern detectors correctly
+find a bullish/bearish engulfing in the appropriate trend and — the key
+behavioral check — flag the identical hammer shape as bullish in a downtrend
+but bearish (hanging man) in an uptrend, the directional-edge math nets out
+the base-rate drift to zero when patterns carry no information, the
+significance test flags a deterministically-engineered reversal edge but
+does NOT flag a random walk (the exact mirror of the Hurst noise test),
+`candlestick_summary` reports `insufficient_data` for too-short series, and
+`candlestick_score` gates on significance (an insignificant edge scores below
+an identical-magnitude significant one) while a symbol with no candlestick
+data still gets a valid, renormalized overall score rather than a penalty;
+`momentum.py` (`test_momentum.py`): `roc`/`macd` correctness (ROC equals the
+trailing return; MACD is positive in an uptrend and ~0 when flat), the
+efficacy test flags a strongly positively-autocorrelated AR(1) series as
+`momentum` and a negatively-autocorrelated one as `reversal` (correct sign)
+but does NOT flag an iid random walk (the same noise discipline as the Hurst
+and candlestick tests), `momentum_summary` reports `insufficient_data` for a
+too-short series, and `momentum_score` gates on significance while a symbol
+with no momentum data still gets a valid, renormalized overall score.
 
 ## Known limitations
 
@@ -479,6 +748,41 @@ than a fixed K.
   than the academic literature's phase-randomization method) — a
   significant result means "some temporal dependence beyond chance," not
   proof of long-range memory specifically.
+- **The candlestick component is intentionally small and expected to be
+  near-zero for most liquid instruments** — the weight of rigorous evidence
+  (Marshall, Young & Rose 2006; corroborated across markets) is that
+  candlestick patterns carry little-to-no exploitable information after
+  correcting for data snooping and base-rate drift; only Caginalp & Laurent
+  (1998) found strong positive evidence. `candlestick_significance()` uses a
+  random-date *placebo* null, not Marshall-Young-Rose's full OHLC bootstrap or
+  a data-snooping (SSPA/Reality-Check) correction across patterns, and does
+  NOT account for transaction costs — so a significant reading means "this
+  instrument's OHLC geometry shows a reversal edge beyond random signal
+  placement," a flag to investigate, not a tradable, cost-adjusted edge. The
+  pattern detectors also use a single fixed geometry/trend-window convention;
+  candlestick definitions vary across authors and the specific thresholds here
+  (shadow ratio, small-body fraction, MA trend window) are documented,
+  adjustable conventions, not verified-optimal numbers.
+- **The momentum component measures a real, heavily-replicated anomaly but is
+  deliberately conservative about it.** `momentum_edge` is a single
+  past-vs-future serial correlation at one fixed (`lookback`, `horizon`) pair;
+  Huang, Li, Wang & Zhou (2020) showed the pooled evidence for time-series
+  momentum is statistically fragile and asset-by-asset evidence is weak, so a
+  significant reading here means "this instrument's own returns predicted its
+  future returns beyond an iid shuffle on this sample," not a validated,
+  cost-adjusted, out-of-sample edge. It uses a shuffle null (not a
+  data-snooping-robust SSPA/Reality-Check across many lookback/horizon
+  choices), ignores transaction costs, and — critically — does not capture
+  momentum's well-documented left-tail crash risk (Daniel & Moskowitz 2016:
+  momentum returns are severely negatively skewed and crash in post-decline,
+  high-volatility panic states). The momentum and Hurst channels also overlap
+  conceptually (both detect trending persistence via different estimators);
+  this is disclosed and reflected in their shared, capped family weight, not
+  hidden. `momentum_lookback_return` is a point-in-time descriptor only and is
+  never part of the score. Like `selection.py` and `screening.py`, the
+  momentum component was **not run against real market data this session** —
+  it is validated only on synthetic AR(1) series with known serial structure
+  (the same construction the Hurst tests use).
 - `scoring.py`'s composite formula is a transparent, documented way of
   combining the individual verified metrics — not a validated predictive
   model. No such model survived this project's research pass. Use the
@@ -508,3 +812,17 @@ than a fixed K.
   source, not against the others) — running more than one on your own
   universe and comparing is this project's own exploration, not a
   reproduction of a verified ranking.
+- **`screening.py`'s hard gates are not validated against real market data
+  this session either** — same as `selection.py`, synthetic constructed
+  universes only.
+- Whether screening BEFORE correlation/clustering (this project's choice)
+  vs. AFTER changes which instruments end up as cluster representatives or
+  greedy diversification picks is an explicitly open question — no source
+  found in either research pass addresses it directly for these algorithms.
+  The current ordering matches index-provider precedent, not a
+  finance-specific proof that order doesn't matter here.
+- `min_history_years` (the new hard floor, default 1 year) is a deliberately
+  low, permissive default chosen by analogy to the Hurst precedent, not
+  itself a number with direct literature support the way
+  `min_history_years_for_full_credit` (4 years, ETF-closure-risk research)
+  has — tune it for your own data-quality tolerance.
