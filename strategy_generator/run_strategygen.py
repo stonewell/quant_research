@@ -22,7 +22,9 @@ RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results"
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Basket Asset Allocation Strategy Generator")
-    p.add_argument("--universe", nargs="+", default=["SPY", "QQQ"])
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--universe", nargs="+", default=["SPY", "QQQ"], help="List of symbols to trade")
+    group.add_argument("--universe-file", help="Path to a JSON file containing the universe basket, exported by the instrument selection tool")
     p.add_argument("--start", default="2015-01-01")
     p.add_argument("--end", default="2024-12-31")
     p.add_argument("--interval", default="1d")
@@ -42,8 +44,19 @@ def main():
         min_rebalances_for_trust=args.min_rebalances_for_trust,
     )
 
+    if args.universe_file:
+        import json
+        with open(args.universe_file, "r") as f:
+            basket_data = json.load(f)
+        universe_symbols = basket_data.get("basket", [])
+        if not universe_symbols:
+            raise ValueError(f"No 'basket' array found in {args.universe_file}")
+        print(f"Loaded {len(universe_symbols)} symbols from {args.universe_file} (method: {basket_data.get('method', 'unknown')})")
+    else:
+        universe_symbols = args.universe
+
     universe = {}
-    for symbol in args.universe:
+    for symbol in universe_symbols:
         print(f"Loading {symbol} ...")
         universe[symbol] = load_ohlcv(symbol, args.start, args.end, args.interval, use_cache=not args.no_cache)
 
