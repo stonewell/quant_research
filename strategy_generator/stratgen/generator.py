@@ -15,8 +15,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from .allocation_backtester import run_allocation_backtest
-from .allocation_templates import ALLOCATION_TEMPLATES
+from common.allocation_backtester import run_allocation_backtest
+from common.allocation_templates import ALLOCATION_TEMPLATES
 from .metrics import sharpe_ratio
 
 

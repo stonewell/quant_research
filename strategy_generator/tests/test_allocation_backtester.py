@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from common.testing import make_ohlcv_from_closes as make_df
 
-from stratgen.allocation_backtester import run_allocation_backtest
+from common.allocation_backtester import run_allocation_backtest
 
 
 def test_allocation_backtester_drift():

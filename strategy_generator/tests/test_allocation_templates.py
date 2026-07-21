@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from common.testing import make_ohlcv_from_closes as make_df
 
-from stratgen.allocation_templates import (
+from common.allocation_templates import (
     CrossSectionalMomentumAllocation,
     EqualWeightAllocation,
     InverseVolatilityAllocation,
@@ -80,3 +80,15 @@ def test_cross_sectional_momentum_allocation():
     np.testing.assert_allclose(weights.iloc[30]["A"], 1.0)
     np.testing.assert_allclose(weights.iloc[30]["B"], 0.0)
     np.testing.assert_allclose(weights.iloc[30]["C"], 0.0)
+
+
+def test_warmup_bars_reports_each_templates_indicator_lookback():
+    # A caller slicing a sub-window (e.g. backtester/run_backtest.py's
+    # run_walkforward) needs to know how much history to pull in ahead of
+    # that window so the template's own indicator isn't cold at the window's
+    # start -- this is the contract each template must expose.
+    assert EqualWeightAllocation().warmup_bars({"rebalance_freq_days": 21}) == 0
+    assert InverseVolatilityAllocation().warmup_bars({"vol_lookback": 60, "rebalance_freq_days": 21}) == 60
+    assert CrossSectionalMomentumAllocation().warmup_bars(
+        {"mom_lookback": 126, "top_n_fraction": 0.5, "rebalance_freq_days": 21}
+    ) == 126

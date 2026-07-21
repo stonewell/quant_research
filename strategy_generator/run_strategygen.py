@@ -75,6 +75,22 @@ def main():
         out_path = os.path.join(RESULTS_DIR, "strategygen_allocation_weights.csv")
         weights.ffill().fillna(0.0).to_csv(out_path)
         print(f"\nSaved full daily target weights to {out_path}")
+
+        import json
+        strategy_json_path = os.path.join(RESULTS_DIR, "strategy.json")
+        with open(strategy_json_path, "w") as f:
+            json.dump({
+                "template_name": spec.template_name,
+                "params": spec.params,
+                "explanation": spec.explanation,
+                # Persisted so a downstream consumer (e.g. backtester/run_backtest.py)
+                # can tell a candidate that failed the ERS/rebalance-count gate apart
+                # from a genuinely trusted one without re-running the search.
+                "trusted": spec.trusted,
+                "ers_passed": spec.ers_passed,
+                "ers_percentile": spec.ers_percentile,
+            }, f, indent=2)
+        print(f"Saved strategy definition to {strategy_json_path}")
     else:
         print("Walkforward mode is currently disabled for the new allocation architecture.")
 

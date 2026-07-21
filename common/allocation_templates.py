@@ -22,7 +22,7 @@ from typing import Dict
 import numpy as np
 import pandas as pd
 
-from .indicators import realized_vol, roc
+from common.indicators import realized_vol, roc
 
 
 @dataclass
@@ -42,6 +42,16 @@ class AllocationTemplate:
         """Returns a human-readable explanation of how weights are calculated
         and when rebalancing occurs."""
         raise NotImplementedError
+
+    def warmup_bars(self, params: dict) -> int:
+        """How many bars of price history BEFORE a target evaluation window
+        this template's indicators need before they stop returning NaN.
+        Callers that slice a universe into a sub-window (e.g. a walk-forward
+        fold) must include this many extra bars ahead of the window so the
+        indicator isn't cold at the window's own start -- see
+        `backtester/run_backtest.py`'s `run_walkforward`. Default: no
+        indicator, no warmup needed."""
+        return 0
 
 
 def _get_rebalance_dates(index: pd.DatetimeIndex, freq_days: int) -> pd.DatetimeIndex:
@@ -127,6 +137,9 @@ class InverseVolatilityAllocation(AllocationTemplate):
             f"computing its inverse (1/vol), and normalizing across the basket so the total weights sum to 100%."
         )
 
+    def warmup_bars(self, params: dict) -> int:
+        return params["vol_lookback"]
+
 
 @dataclass
 class CrossSectionalMomentumAllocation(AllocationTemplate):
@@ -178,6 +191,9 @@ class CrossSectionalMomentumAllocation(AllocationTemplate):
             f"Calculated by ranking all assets by their {params['mom_lookback']}-day trailing return, "
             f"selecting the top {frac_pct}% of the basket, and equally weighting those winners."
         )
+
+    def warmup_bars(self, params: dict) -> int:
+        return params["mom_lookback"]
 
 ALLOCATION_TEMPLATES = [
     EqualWeightAllocation,
