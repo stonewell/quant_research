@@ -8,6 +8,7 @@ from selectorbot.selection import (
     select_cluster_representatives,
     select_diversified_greedy,
     select_diversified_threshold_greedy,
+    select_max_diversification_ratio,
 )
 
 
@@ -132,3 +133,14 @@ def test_select_diversified_threshold_greedy_high_threshold_behaves_like_naive_t
     scores = pd.Series({"A": 95.0, "B": 90.0, "C": 60.0})
     chosen = select_diversified_threshold_greedy(scores, corr, max_correlation=1.01)  # nothing gets filtered
     assert chosen == ["A", "B", "C"]
+
+
+def test_select_max_diversification_ratio_prefers_uncorrelated_assets():
+    _, returns, corr = _redundant_pair_plus_independent(seed=13)
+    scores = pd.Series({"A": 95.0, "B": 94.0, "C": 70.0})
+    volatility = returns.std()
+    chosen = select_max_diversification_ratio(scores, corr, volatility=volatility, k=2, score_weight=0.1)
+    # A and B are ~0.99 correlated, C is independent -> DR prefers {A, C} or {B, C}
+    assert "C" in chosen
+    assert ("A" in chosen) != ("B" in chosen)
+

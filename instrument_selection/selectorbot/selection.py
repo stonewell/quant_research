@@ -155,3 +155,64 @@ def select_diversified_threshold_greedy(scores: pd.Series, corr: pd.DataFrame, m
         if all(corr.loc[sym, s] < max_correlation for s in selected):
             selected.append(sym)
     return selected
+
+
+def select_max_diversification_ratio(scores: pd.Series, corr: pd.DataFrame, volatility: pd.Series,
+                                     k: int = None, score_weight: float = 0.1) -> list:
+    """Maximum Diversification Ratio selection (Choueifaty & Coignard 2008,
+    Journal of Portfolio Management): greedily selects assets to maximize the
+    portfolio Diversification Ratio DR = (w^T sigma) / sqrt(w^T Sigma w),
+    blended with individual quality scores.
+    
+    DR measures the ratio of weighted average asset volatilities to total
+    portfolio volatility. Highly correlated assets reduce DR, while uncorrelated
+    or negatively correlated assets increase DR."""
+    import numpy as np
+
+    symbols = [s for s in corr.index if s in scores.index and s in volatility.index]
+    if not symbols:
+        return []
+
+    vol = volatility.reindex(symbols).fillna(volatility.median())
+    corr_sub = corr.loc[symbols, symbols]
+    
+    # Precompute covariance elements: cov_ij = vol_i * vol_j * corr_ij
+    vol_arr = vol.to_numpy()
+    cov_matrix = pd.DataFrame(
+        np.outer(vol_arr, vol_arr) * corr_sub.to_numpy(),
+        index=symbols, columns=symbols
+    )
+
+    k = k or len(symbols)
+    remaining = list(symbols)
+    selected = []
+
+    def calc_dr(candidate_set):
+        if not candidate_set:
+            return 0.0
+        n = len(candidate_set)
+        sum_vol = vol.reindex(candidate_set).sum()
+        sub_cov = cov_matrix.loc[candidate_set, candidate_set].to_numpy()
+        port_var = sub_cov.sum() / (n * n)
+        if port_var <= 0:
+            return 0.0
+        return sum_vol / (np.sqrt(port_var) * n)
+
+    while remaining and len(selected) < k:
+        if not selected:
+            # Start with the highest individual score
+            best = max(remaining, key=lambda s: scores[s])
+        else:
+            def marginal_gain(sym):
+                cand = selected + [sym]
+                dr = calc_dr(cand)
+                # Normalize individual score to 0-1 range for blending
+                norm_score = scores[sym] / 100.0 if 100.0 in scores.values or scores.max() > 1 else scores[sym]
+                return dr + score_weight * norm_score
+
+            best = max(remaining, key=marginal_gain)
+
+        selected.append(best)
+        remaining.remove(best)
+
+    return selected

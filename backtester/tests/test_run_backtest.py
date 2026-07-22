@@ -68,10 +68,38 @@ def test_run_standard():
 
     result = run_standard(universe, template, params, args)
 
-    assert "sharpe" in result
+    assert "sharpe_ratio" in result
+    assert "cagr" in result
     assert "max_drawdown" in result
+    assert "calmar_ratio" in result
+    assert "win_rate" in result
+    assert "profit_factor" in result
     assert "equity_curve" in result
     assert not result["equity_curve"].empty
+
+
+def test_run_standard_max_drawdown_is_a_positive_magnitude():
+    # Regression test: run_allocation_backtest used to report max_drawdown as
+    # a NEGATIVE number while common/metrics.py's max_drawdown() (used
+    # elsewhere in this workspace, and previously ALSO recomputed inline
+    # here) reports the same real-world quantity as POSITIVE -- so the same
+    # backtest run could print "-18.00%" from one code path and "18.0%" from
+    # another. A synthetic price path with a known, exact drawdown pins the
+    # convention: it must come back positive and match the known magnitude.
+    idx = pd.bdate_range("2020-01-01", periods=5)
+    # Equal-weight, single asset A: up 25%, then down 20% (back to start),
+    # then flat -- a textbook 20% drawdown from the day-2 peak.
+    closes_a = [100.0, 125.0, 100.0, 100.0, 100.0]
+    universe = {"A": make_df(closes_a, start="2020-01-01")}
+
+    template = _get_template("equal_weight")
+    params = {"rebalance_freq_days": 100}  # single allocation on day 0, never rebalanced again
+    args = MockArgs()
+
+    result = run_standard(universe, template, params, args)
+
+    assert result["max_drawdown"] > 0
+    np.testing.assert_allclose(result["max_drawdown"], 0.20, atol=1e-9)
 
 
 def test_run_walkforward():

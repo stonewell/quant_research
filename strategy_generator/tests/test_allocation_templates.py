@@ -4,8 +4,11 @@ from common.testing import make_ohlcv_from_closes as make_df
 
 from common.allocation_templates import (
     CrossSectionalMomentumAllocation,
+    DualMomentumAllocation,
     EqualWeightAllocation,
+    HierarchicalRiskParityAllocation,
     InverseVolatilityAllocation,
+    MaxDiversificationAllocation,
 )
 
 
@@ -82,6 +85,111 @@ def test_cross_sectional_momentum_allocation():
     np.testing.assert_allclose(weights.iloc[30]["C"], 0.0)
 
 
+def test_hierarchical_risk_parity_allocation():
+    idx = pd.bdate_range("2020-01-01", periods=100)
+    rng = np.random.default_rng(10)
+    closes_a = 100 + np.cumsum(rng.normal(0, 0.1, 100))
+    closes_b = 100 + np.cumsum(rng.normal(0, 2.0, 100))
+
+    universe = {
+        "A": make_df(closes_a, start="2020-01-01"),
+        "B": make_df(closes_b, start="2020-01-01"),
+    }
+
+    template = HierarchicalRiskParityAllocation()
+    weights = template.generate_weights(universe, {"cov_lookback": 20, "rebalance_freq_days": 10})
+
+    rebalance_rows = weights.dropna(how="all")
+    assert not rebalance_rows.empty
+    # Weights should sum to 1.0
+    np.testing.assert_allclose(rebalance_rows.sum(axis=1), 1.0)
+    # A (lower vol) gets higher HRP weight than B (higher vol)
+    assert rebalance_rows.iloc[-1]["A"] > rebalance_rows.iloc[-1]["B"]
+
+
+def test_hierarchical_risk_parity_excludes_a_symbol_with_no_data_in_window():
+    # Regression test: a symbol that hasn't started trading yet (all-NaN
+    # Close for the whole lookback window -- e.g. a newer ETF mixed into an
+    # older basket) used to have its covariance zero-filled, which
+    # inverse-variance weighting misreads as "risk-free" and hands almost
+    # the entire portfolio to. It must instead be excluded from that
+    # rebalance date's weights (left at 0 once the backtester fills it in),
+    # not dominate them. All synthetic data, no network/market data involved.
+    idx = pd.bdate_range("2020-01-01", periods=100)
+    rng = np.random.default_rng(7)
+    closes_a = 100 + np.cumsum(rng.normal(0, 1.0, 100))
+    closes_b = 100 + np.cumsum(rng.normal(0, 1.0, 100))
+
+    # C has no price history at all for the first 90 bars (NaN Close) --
+    # every 20-day lookback window before bar 90 is entirely NaN for C.
+    closes_c = np.full(100, np.nan)
+    closes_c[90:] = 100 + np.cumsum(rng.normal(0, 1.0, 10))
+
+    universe = {
+        "A": make_df(closes_a, start="2020-01-01"),
+        "B": make_df(closes_b, start="2020-01-01"),
+        "C": pd.DataFrame({"Close": closes_c}, index=idx),
+    }
+
+    template = HierarchicalRiskParityAllocation()
+    weights = template.generate_weights(universe, {"cov_lookback": 20, "rebalance_freq_days": 10})
+
+    rebalance_rows = weights.dropna(how="all")
+    assert not rebalance_rows.empty
+
+    # Every rebalance date before C has any data must NOT allocate to C --
+    # it should be excluded (NaN in this sparse frame, later filled to 0.0
+    # by the backtester), not dominate the portfolio.
+    early_rows = rebalance_rows[rebalance_rows.index < idx[90]]
+    assert not early_rows.empty
+    assert early_rows["C"].isna().all()
+    # A and B alone still sum to 1.0 -- properly renormalized among just the
+    # symbols that actually had data, not diluted by a phantom C weight.
+    np.testing.assert_allclose(early_rows["A"] + early_rows["B"], 1.0)
+
+
+def test_dual_momentum_allocation_steps_to_cash_when_trend_negative():
+    idx = pd.bdate_range("2020-01-01", periods=100)
+
+    # A and B both go down
+    closes_a = np.linspace(100, 50, 100)
+    closes_b = np.linspace(100, 30, 100)
+
+    universe = {
+        "A": make_df(closes_a, start="2020-01-01"),
+        "B": make_df(closes_b, start="2020-01-01"),
+    }
+
+    template = DualMomentumAllocation()
+    weights = template.generate_weights(universe, {"mom_lookback": 20, "top_n_fraction": 0.5, "rebalance_freq_days": 10})
+
+    rebalance_rows = weights.dropna(how="all")
+    # After warmup, both assets have negative trailing returns -> absolute momentum filter sets weights to 0 (cash)
+    last_row = rebalance_rows.iloc[-1]
+    np.testing.assert_allclose(last_row["A"], 0.0)
+    np.testing.assert_allclose(last_row["B"], 0.0)
+
+
+def test_max_diversification_allocation():
+    idx = pd.bdate_range("2020-01-01", periods=100)
+    rng = np.random.default_rng(20)
+
+    closes_a = 100 + np.cumsum(rng.normal(0, 1.0, 100))
+    closes_b = 100 + np.cumsum(rng.normal(0, 1.0, 100))
+
+    universe = {
+        "A": make_df(closes_a, start="2020-01-01"),
+        "B": make_df(closes_b, start="2020-01-01"),
+    }
+
+    template = MaxDiversificationAllocation()
+    weights = template.generate_weights(universe, {"vol_lookback": 20, "rebalance_freq_days": 10})
+
+    rebalance_rows = weights.dropna(how="all")
+    assert not rebalance_rows.empty
+    np.testing.assert_allclose(rebalance_rows.sum(axis=1), 1.0)
+
+
 def test_warmup_bars_reports_each_templates_indicator_lookback():
     # A caller slicing a sub-window (e.g. backtester/run_backtest.py's
     # run_walkforward) needs to know how much history to pull in ahead of
@@ -92,3 +200,6 @@ def test_warmup_bars_reports_each_templates_indicator_lookback():
     assert CrossSectionalMomentumAllocation().warmup_bars(
         {"mom_lookback": 126, "top_n_fraction": 0.5, "rebalance_freq_days": 21}
     ) == 126
+    assert HierarchicalRiskParityAllocation().warmup_bars({"cov_lookback": 126, "rebalance_freq_days": 21}) == 126
+    assert DualMomentumAllocation().warmup_bars({"mom_lookback": 126, "top_n_fraction": 0.5, "rebalance_freq_days": 21}) == 126
+    assert MaxDiversificationAllocation().warmup_bars({"vol_lookback": 126, "rebalance_freq_days": 21}) == 126

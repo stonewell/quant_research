@@ -10,18 +10,25 @@ module; `volatility_summary` (this project's config-driven report) stays local.
 """
 
 import pandas as pd
-from common.indicators import adx, atr, atr_pct, atr_regime_ratio, realized_vol, vol_of_vol
+from common.indicators import adx, atr, atr_pct, atr_regime_ratio, downside_realized_vol, realized_vol, vol_of_vol
 
 
 def volatility_summary(df: pd.DataFrame, config) -> dict:
     rv = realized_vol(df["Close"], config.realized_vol_window)
+    drv = downside_realized_vol(df["Close"], config.realized_vol_window)
     ap = atr_pct(df, config.atr_period)
     vov = vol_of_vol(df["Close"], config.realized_vol_window)
     regime_ratio = atr_regime_ratio(df, config.atr_period, config.atr_short_window, config.atr_long_window)
     adx_series = adx(df, config.adx_period)
 
+    rv_mean = rv.mean(skipna=True)
+    drv_mean = drv.mean(skipna=True)
+    downside_ratio = drv_mean / rv_mean if rv_mean not in (0, None) else 0.5
+
     return {
-        "realized_vol_annualized_pct": rv.mean(skipna=True) * 100,
+        "realized_vol_annualized_pct": rv_mean * 100,
+        "downside_vol_annualized_pct": drv_mean * 100,
+        "downside_vol_ratio": downside_ratio,
         "atr_pct_mean": ap.mean(skipna=True) * 100,
         "vol_of_vol": vov.mean(skipna=True),
         "pct_days_vol_regime_change": (regime_ratio.dropna().sub(1).abs() >= config.atr_regime_change_threshold).mean() * 100,
