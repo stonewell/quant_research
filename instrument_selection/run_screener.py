@@ -192,6 +192,17 @@ def main():
         screened_out.to_csv(os.path.join(RESULTS_DIR, "screened_out.csv"))
     print(f"\nSaved full report to {scored_path}")
 
+    import json
+    from datetime import datetime
+    basket_json_path = os.path.join(RESULTS_DIR, "basket.json")
+    with open(basket_json_path, "w") as f:
+        json.dump({
+            "basket": list(chosen),
+            "method": args.select_method,
+            "date_generated": datetime.utcnow().isoformat() + "Z"
+        }, f, indent=2)
+    print(f"Saved chosen basket to {basket_json_path}")
+
     if not args.no_plots:
         p1 = plotting.plot_correlation_heatmap(corr)
         p2 = plotting.plot_dendrogram(corr)
