@@ -70,14 +70,14 @@ class EqualWeightAllocation(AllocationTemplate):
         symbols = list(universe.keys())
         if not symbols:
             return pd.DataFrame()
-        
+
         # Use the first symbol's index as the master calendar (assumes aligned universe)
         master_index = universe[symbols[0]].index
         rebalance_dates = _get_rebalance_dates(master_index, params["rebalance_freq_days"])
-        
+
         n_symbols = len(symbols)
         weight = 1.0 / n_symbols if n_symbols > 0 else 0.0
-        
+
         weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
         weights_df.loc[rebalance_dates, :] = weight
 
@@ -107,23 +107,23 @@ class InverseVolatilityAllocation(AllocationTemplate):
         symbols = list(universe.keys())
         if not symbols:
             return pd.DataFrame()
-            
+
         master_index = universe[symbols[0]].index
         rebalance_dates = _get_rebalance_dates(master_index, params["rebalance_freq_days"])
-        
+
         # Calculate daily inverse volatility for all symbols
         inv_vols = pd.DataFrame(index=master_index, columns=symbols)
         for sym, df in universe.items():
             vol = realized_vol(df["Close"], window=params["vol_lookback"])
             # Avoid division by zero
             inv_vols[sym] = 1.0 / vol.replace(0, np.nan)
-            
+
         # Only keep values on rebalance dates
         inv_vols_rebal = inv_vols.loc[rebalance_dates]
-        
+
         # Normalize so weights sum to 1.0 across the row
         weights_rebal = inv_vols_rebal.div(inv_vols_rebal.sum(axis=1), axis=0)
-        
+
         weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
         weights_df.loc[rebalance_dates] = weights_rebal
 
@@ -154,22 +154,22 @@ class CrossSectionalMomentumAllocation(AllocationTemplate):
         symbols = list(universe.keys())
         if not symbols:
             return pd.DataFrame()
-            
+
         master_index = universe[symbols[0]].index
         rebalance_dates = _get_rebalance_dates(master_index, params["rebalance_freq_days"])
-        
+
         # Calculate momentum (Rate of Change) for all symbols
         moms = pd.DataFrame(index=master_index, columns=symbols)
         for sym, df in universe.items():
             moms[sym] = roc(df["Close"], period=params["mom_lookback"])
-            
+
         moms_rebal = moms.loc[rebalance_dates]
-        
+
         n_symbols = len(symbols)
         top_n = max(1, int(n_symbols * params["top_n_fraction"]))
-        
+
         weights_rebal = pd.DataFrame(index=rebalance_dates, columns=symbols, data=0.0)
-        
+
         for date, row in moms_rebal.iterrows():
             if row.isna().all():
                 continue
@@ -177,7 +177,7 @@ class CrossSectionalMomentumAllocation(AllocationTemplate):
             top_symbols = row.nlargest(top_n).index
             # Equal weight among the top N
             weights_rebal.loc[date, top_symbols] = 1.0 / top_n
-            
+
         weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
         weights_df.loc[rebalance_dates] = weights_rebal
 

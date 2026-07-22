@@ -21,7 +21,7 @@ def run_allocation_backtest(
 ) -> dict:
     """
     Simulates portfolio equity curve given daily target weights.
-    
+
     `target_weights` is a SPARSE DataFrame indexed by date, with columns for
     each symbol: a row is NaN except on an actual rebalance date, where it
     holds the target portfolio fraction (0.0 to 1.0) for that symbol. Do not

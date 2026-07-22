@@ -72,22 +72,22 @@ def run_standard(universe: dict, template, params: dict, args) -> dict:
     target_weights = template.generate_weights(universe, params)
     if target_weights.empty:
         raise ValueError("Template generated empty weights.")
-        
+
     result = run_allocation_backtest(
         universe, target_weights,
         initial_capital=args.initial_capital,
         commission_pct=args.commission_pct,
         slippage_pct=args.slippage_pct
     )
-    
+
     eq = result["equity_curve"]
     if eq.empty:
         raise ValueError("Backtest produced empty equity curve.")
-        
+
     returns = eq["equity"].pct_change().dropna()
     sr = sharpe_ratio(returns)
     mdd = max_drawdown(eq["equity"])
-    
+
     result["sharpe"] = sr
     result["max_drawdown"] = mdd
     return result
@@ -97,16 +97,16 @@ def run_walkforward(universe: dict, template, params: dict, args) -> list:
     aligned = _align_universe(universe)
     if not aligned:
         raise ValueError("Universe alignment resulted in empty data.")
-        
+
     any_df = next(iter(aligned.values()))
     n_bars = len(any_df)
-    
+
     window_bars = int(round(args.window_years * 252))
     step_bars = int(round(args.step_years * 252))
-    
+
     if window_bars >= n_bars:
         raise ValueError("Window size is larger than the available data.")
-        
+
     # Lookback indicators (e.g. InverseVolatility's realized_vol,
     # CrossSectionalMomentum's roc) are cold for their first `warmup_bars`
     # bars. Slicing a fold to bare [start_idx:end_idx) recomputes them from
@@ -170,22 +170,22 @@ def run_walkforward(universe: dict, template, params: dict, args) -> list:
             "total_turnover": turnover,
             "total_rebalances": rebalances
         })
-        
+
         start_idx += step_bars
-        
+
     return folds
 
 
 def main():
     args = build_arg_parser().parse_args()
-    
+
     with open(args.strategy_file, "r") as f:
         strategy_def = json.load(f)
-        
+
     template_name = strategy_def["template_name"]
     params = strategy_def["params"]
     explanation = strategy_def.get("explanation", "")
-    
+
     print(f"Loaded Strategy: {template_name}")
     print(f"Parameters: {params}")
     print(f"Logic: {explanation}")
@@ -195,44 +195,44 @@ def main():
               f"ers_percentile={strategy_def.get('ers_percentile')}) -- "
               f"treat these results as exploratory, not validated.")
     print()
-    
+
     universe = {}
     for symbol in args.universe:
         print(f"Loading {symbol} ...")
         universe[symbol] = load_ohlcv(symbol, args.start, args.end, args.interval, use_cache=not args.no_cache)
-        
+
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    
+
     if args.mode == "standard":
         print("\n=== Running Standard Backtest ===")
         result = run_standard(universe, _get_template(template_name), params, args)
-        
+
         print(f"Sharpe Ratio: {result['sharpe']:.2f}")
         print(f"Max Drawdown: {result['max_drawdown']*100:.1f}%")
         print(f"Total Rebalances: {result['total_rebalances']}")
         print(f"Total Turnover: {result['total_turnover']:.2f}")
-        
+
         out_path = os.path.join(RESULTS_DIR, "backtest_equity.csv")
         result["equity_curve"].to_csv(out_path)
         print(f"\nSaved equity curve to {out_path}")
-        
+
         weights_path = os.path.join(RESULTS_DIR, "backtest_weights.csv")
         result["actual_weights"].to_csv(weights_path)
         print(f"Saved actual daily weights to {weights_path}")
-        
+
     elif args.mode == "walkforward":
         print(f"\n=== Running Walkforward Rolling Evaluation ===")
         print(f"Window: {args.window_years} years, Step: {args.step_years} years")
-        
+
         folds = run_walkforward(universe, _get_template(template_name), params, args)
-        
+
         folds_df = pd.DataFrame(folds)
         print("\nRolling Windows Performance:")
         print(folds_df.to_string(index=False))
-        
+
         print(f"\nMean Sharpe Ratio: {folds_df['sharpe_ratio'].mean():.2f}")
         print(f"Mean Max Drawdown: {folds_df['max_drawdown'].mean()*100:.1f}%")
-        
+
         out_path = os.path.join(RESULTS_DIR, "walkforward_report.csv")
         folds_df.to_csv(out_path, index=False)
         print(f"\nSaved walkforward report to {out_path}")

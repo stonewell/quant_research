@@ -53,7 +53,7 @@ def _portfolio_score(universe: dict, template, params: dict, config: GeneratorCo
         target_weights = template.generate_weights(universe, params)
         if target_weights.empty:
             return float("-inf"), 0, 0.0
-            
+
         result = run_allocation_backtest(
             universe, target_weights,
             initial_capital=config.initial_capital,
@@ -62,14 +62,14 @@ def _portfolio_score(universe: dict, template, params: dict, config: GeneratorCo
         )
     except Exception:
         return float("-inf"), 0, 0.0
-        
+
     eq = result["equity_curve"]
     if eq.empty:
         return float("-inf"), 0, 0.0
-        
+
     returns = eq["equity"].pct_change().dropna()
     sr = sharpe_ratio(returns)
-    
+
     return sr, result["total_rebalances"], result["total_turnover"]
 
 
@@ -110,23 +110,23 @@ class RandomAllocationTemplate:
     """A dummy template used purely for the ERS check."""
     def __init__(self, rng: np.random.Generator):
         self.rng = rng
-        
+
     def generate_weights(self, universe: dict, params: dict) -> pd.DataFrame:
         return _random_weights(universe, params["rebalance_freq_days"], self.rng)
 
 
 def _search_allocation(universe: dict, cfg: GeneratorConfig) -> dict:
     """Grid search across all allocation templates."""
-    
+
     all_results = []
     total_grid_trials = 0
-    
+
     # 1. Grid Search across all templates
     for template_cls in ALLOCATION_TEMPLATES:
         template = template_cls()
         combos = grid_combinations(template.param_grid)
         total_grid_trials += len(combos)
-        
+
         for params in combos:
             score, rebalances, turnover = _portfolio_score(universe, template, params, cfg)
             all_results.append({
@@ -136,19 +136,19 @@ def _search_allocation(universe: dict, cfg: GeneratorConfig) -> dict:
                 "rebalances": rebalances,
                 "turnover": turnover
             })
-            
+
     # Find the best template + params
     best_result = max(all_results, key=lambda r: r["score"])
     best_score = best_result["score"]
-    
+
     # 2. Equivalent Random Search (ERS)
     rng = np.random.default_rng(cfg.seed)
     random_scores = []
     random_template = RandomAllocationTemplate(rng)
-    
+
     # Use the winning rebalance frequency for a fair comparison
     winning_freq = best_result["params"].get("rebalance_freq_days", 21)
-    
+
     for _ in range(cfg.n_random_search):
         score, _, _ = _portfolio_score(universe, random_template, {"rebalance_freq_days": winning_freq}, cfg)
         if np.isfinite(score):
@@ -181,10 +181,10 @@ class StrategyGenerator:
             raise ValueError("universe must contain at least one symbol's OHLCV DataFrame")
 
         result = _search_allocation(universe, cfg)
-        
+
         template = result["template"]
         params = result["params"]
-        
+
         # Generate the final weights for output
         target_weights = template.generate_weights(universe, params)
         explanation = template.explain_weights(params)

@@ -18,14 +18,14 @@ from backtester.run_backtest import _align_universe, _get_template, run_standard
 def test_align_universe():
     idx1 = pd.bdate_range("2020-01-01", periods=10)
     idx2 = pd.bdate_range("2020-01-05", periods=10)
-    
+
     universe = {
         "A": pd.DataFrame({"Close": np.ones(10)}, index=idx1),
         "B": pd.DataFrame({"Close": np.ones(10)}, index=idx2),
     }
-    
+
     aligned = _align_universe(universe)
-    
+
     # Should be the intersection
     expected_idx = idx1.intersection(idx2)
     assert len(aligned["A"]) == len(expected_idx)
@@ -36,7 +36,7 @@ def test_align_universe():
 def test_get_template():
     template = _get_template("equal_weight")
     assert template.name == "equal_weight"
-    
+
     try:
         _get_template("non_existent")
         assert False, "Should have raised ValueError"
@@ -61,13 +61,13 @@ def test_run_standard():
         "A": make_df(np.linspace(100, 200, 100), start="2020-01-01"),
         "B": make_df(np.linspace(100, 50, 100), start="2020-01-01"),
     }
-    
+
     template = _get_template("equal_weight")
     params = {"rebalance_freq_days": 10}
     args = MockArgs()
-    
+
     result = run_standard(universe, template, params, args)
-    
+
     assert "sharpe" in result
     assert "max_drawdown" in result
     assert "equity_curve" in result
@@ -81,21 +81,21 @@ def test_run_walkforward():
         "A": make_df(np.linspace(100, 200, 252), start="2020-01-01"),
         "B": make_df(np.linspace(100, 50, 252), start="2020-01-01"),
     }
-    
+
     template = _get_template("equal_weight")
     params = {"rebalance_freq_days": 10}
     # 0.5 year window, 0.25 year step
     args = MockArgs(window_years=0.5, step_years=0.25)
-    
+
     folds = run_walkforward(universe, template, params, args)
-    
+
     # Total 1 year. Window 0.5. Step 0.25.
     # Folds:
     # 0.0 to 0.5
     # 0.25 to 0.75
     # 0.5 to 1.0
     assert len(folds) == 3
-    
+
     for fold in folds:
         assert "start_date" in fold
         assert "end_date" in fold

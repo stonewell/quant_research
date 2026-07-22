@@ -39,7 +39,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main():
     args = build_arg_parser().parse_args()
     gen_config = GeneratorConfig(
-        n_random_search=args.n_random_search, 
+        n_random_search=args.n_random_search,
         ers_percentile_threshold=args.ers_percentile_threshold,
         min_rebalances_for_trust=args.min_rebalances_for_trust,
     )
@@ -70,10 +70,10 @@ def main():
         print(f"  Portfolio Sharpe Ratio: {spec.universe_sharpe:.2f}")
         print(f"  Total Rebalances: {spec.total_rebalances} | Total Turnover: {spec.total_turnover:.2f}")
         print(f"  ERS Percentile: {spec.ers_percentile:.2f} | Trusted: {spec.trusted}")
-        
+
         print("\n=== Strategy Logic & Execution Schedule ===")
         print(f"  {spec.explanation}")
-        
+
         print("\n=== Recent Target Weights (Last 5 Rebalance Dates) ===")
         # spec.target_weights is sparse -- NaN except on an actual rebalance
         # date, so those dates are just the non-NaN rows (no diffing needed,
