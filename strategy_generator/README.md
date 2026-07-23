@@ -1,15 +1,17 @@
-# Automated Strategy Generator (Universe-Wide, Data-Driven)
+# Automated Portfolio Strategy Generator (Basket Asset Allocation)
 
-A tool that GENERATES a concrete, parameterized trading strategy for a whole
-UNIVERSE of instruments at once, pooling their historical data — not a
-separate strategy per symbol, and not a fixed, manually-designed strategy
-applied everywhere. It classifies the universe's statistical regime
-(trending / mean-reverting / random-walk-like) by pooling every symbol's own
-evidence, routes the whole universe to a matching single-symbol strategy
-template, searches that template's small parameter space by POOLED
-performance across every instrument, sanity-checks the result against a
-random-search baseline, and validates the whole pipeline with proper
-walk-forward testing.
+A tool that GENERATES a concrete, parameterized asset allocation trading strategy for a whole
+BASKET of instruments simultaneously (e.g. exported from `instrument_selection`).
+
+It searches across 6 portfolio allocation templates grounded in peer-reviewed quantitative finance literature:
+1. `EqualWeightAllocation` (1/N naive baseline)
+2. `InverseVolatilityAllocation` (1/vol risk parity)
+3. `CrossSectionalMomentumAllocation` (Jegadeesh & Titman 1993; Moskowitz et al. 2012)
+4. `HierarchicalRiskParityAllocation` (Marcos López de Prado 2016, *Journal of Portfolio Management*)
+5. `DualMomentumAllocation` (Gary Antonacci 2014, *JPM* / Faber 2007)
+6. `MaxDiversificationAllocation` (Choueifaty & Coignard 2008, *JPM*)
+
+The strategy generator evaluates each template and parameter grid using the portfolio allocation backtester (`common/allocation_backtester.py`), which accounts for daily weight drift, partial cash holdings, and rebalancing transaction costs. The Equivalent Random Search (ERS) pretest validates that the winning strategy beats a size-matched pool of random allocation portfolios.
 
 **Not single-instrument-only.** Alongside that single-symbol search, the
 generator also searches a pairs-trading candidate across every pair in the

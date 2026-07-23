@@ -97,6 +97,15 @@ def realized_vol(close: pd.Series, window: int = 20, periods_per_year: int = 252
     return returns.rolling(window, min_periods=window).std() * np.sqrt(periods_per_year)
 
 
+def downside_realized_vol(close: pd.Series, window: int = 20, periods_per_year: int = 252) -> pd.Series:
+    """Annualized downside semi-deviation (std of negative returns relative to 0).
+    Grounding: Estrada (2000), Ang, Chen & Xing (2006, J. Finance "Downside Risk").
+    Isolates loss volatility rather than penalizing upside gains."""
+    returns = close.pct_change()
+    downside_sq = returns.clip(upper=0.0) ** 2
+    return np.sqrt(downside_sq.rolling(window, min_periods=window).mean()) * np.sqrt(periods_per_year)
+
+
 def vol_of_vol(close: pd.Series, vol_window: int = 20, vov_window: int = 60,
                periods_per_year: int = 252) -> pd.Series:
     """Rolling std of the realized-vol series itself -- a volatility-

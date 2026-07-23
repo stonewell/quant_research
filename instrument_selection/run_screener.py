@@ -48,9 +48,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-fund-metadata", action="store_false", dest="fetch_fund_metadata",
                     default=d.fetch_fund_metadata, help="skip best-effort expense-ratio/AUM lookup")
     p.add_argument("--top-n", type=int, default=8, help="how many top-ranked instruments to print")
-    p.add_argument("--select-method", choices=["top_k", "cluster", "greedy", "threshold"], default="threshold",
+    p.add_argument("--select-method", choices=["top_k", "cluster", "greedy", "threshold", "max_diversification"], default="threshold",
                    help="how to turn scores+correlation into a final chosen basket (see README); "
-                        "'top_k' is the naive baseline all three others are designed to improve on")
+                        "'top_k' is the naive baseline all others are designed to improve on")
     p.add_argument("--select-k", type=int, default=None,
                    help="basket size for --select-method top_k/greedy (required for greedy; default 8 for top_k)")
     p.add_argument("--select-max-k", type=int, default=None,
@@ -122,10 +122,11 @@ def main():
     pd.set_option("display.width", 160)
     pd.set_option("display.max_columns", 20)
 
-    print("\n=== Liquidity, volatility, and persistence metrics ===")
+    print("\n=== Liquidity, volatility, downside risk, and persistence metrics ===")
     display_cols = ["avg_dollar_volume", "median_spread_pct", "realized_vol_annualized_pct",
-                     "atr_pct_mean", "adx_mean", "hurst", "hurst_significant", "regime_label", "history_years"]
-    print(scored[display_cols].round(3))
+                    "downside_vol_annualized_pct", "downside_vol_ratio",
+                    "atr_pct_mean", "adx_mean", "hurst", "hurst_significant", "regime_label", "history_years"]
+    print(scored[[c for c in display_cols if c in scored.columns]].round(3))
 
     print("\n=== Candlestick reversal-pattern predictability (mostly no edge is the EXPECTED result -- see README) ===")
     candle_cols = ["candlestick_edge", "candlestick_significant", "candlestick_p_value",
@@ -176,6 +177,10 @@ def main():
         if not args.select_k:
             raise SystemExit("--select-method greedy requires --select-k")
         chosen = selection.select_diversified_greedy(scores, corr, k=args.select_k)
+    elif args.select_method == "max_diversification":
+        realized_vol = pd.to_numeric(scored["realized_vol_annualized_pct"], errors="coerce")
+        chosen = selection.select_max_diversification_ratio(
+            scores, corr, volatility=realized_vol, k=args.select_k or args.top_n)
     else:
         chosen = selection.select_diversified_threshold_greedy(
             scores, corr, max_correlation=config.max_cluster_correlation, max_k=args.select_max_k)

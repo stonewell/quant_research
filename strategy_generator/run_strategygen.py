@@ -12,6 +12,7 @@ Example:
 import argparse
 import os
 
+import numpy as np
 import pandas as pd
 
 from stratgen.data import load_ohlcv
@@ -67,7 +68,8 @@ def main():
         print(f"\n=== Generated Allocation Strategy for basket of {spec.n_symbols} assets ===")
         print(f"  Template: {spec.template_name}")
         print(f"  Optimal Parameters: {spec.params}")
-        print(f"  Portfolio Sharpe Ratio: {spec.universe_sharpe:.2f}")
+        print(f"  Portfolio Sharpe Ratio: {spec.universe_sharpe:.2f} | CAGR: {spec.cagr * 100:.2f}% | Max Drawdown: {spec.max_drawdown * 100:.2f}%")
+        print(f"  Calmar Ratio: {spec.calmar_ratio:.2f} | Win Rate: {spec.win_rate * 100:.1f}% | Profit Factor: {spec.profit_factor:.2f}")
         print(f"  Total Rebalances: {spec.total_rebalances} | Total Turnover: {spec.total_turnover:.2f}")
         print(f"  ERS Percentile: {spec.ers_percentile:.2f} | Trusted: {spec.trusted}")
 
@@ -96,9 +98,12 @@ def main():
                 "template_name": spec.template_name,
                 "params": spec.params,
                 "explanation": spec.explanation,
-                # Persisted so a downstream consumer (e.g. backtester/run_backtest.py)
-                # can tell a candidate that failed the ERS/rebalance-count gate apart
-                # from a genuinely trusted one without re-running the search.
+                "sharpe_ratio": spec.universe_sharpe,
+                "cagr": spec.cagr,
+                "max_drawdown": spec.max_drawdown,
+                "calmar_ratio": spec.calmar_ratio,
+                "win_rate": spec.win_rate,
+                "profit_factor": spec.profit_factor if np.isfinite(spec.profit_factor) else None,
                 "trusted": spec.trusted,
                 "ers_passed": spec.ers_passed,
                 "ers_percentile": spec.ers_percentile,

@@ -3,11 +3,27 @@ import pandas as pd
 import pytest
 from common.testing import make_ohlcv_from_closes
 
-from selectorbot.volatility import adx, atr, atr_pct, atr_regime_ratio, realized_vol, vol_of_vol
+from selectorbot.volatility import adx, atr, atr_pct, atr_regime_ratio, downside_realized_vol, realized_vol, vol_of_vol
 
 
 def make_df(closes):
     return make_ohlcv_from_closes(closes, use_index=False)
+
+
+def test_downside_realized_vol_lower_for_upward_trending_series():
+    # Asset with pure upward gains vs asset with pure downward losses
+    up_returns = np.array([0.01] * 100)
+    down_returns = np.array([-0.01] * 100)
+
+    up_close = pd.Series(100 * np.cumprod(1 + up_returns))
+    down_close = pd.Series(100 * np.cumprod(1 + down_returns))
+
+    up_dvol = downside_realized_vol(up_close, window=50).dropna().iloc[-1]
+    down_dvol = downside_realized_vol(down_close, window=50).dropna().iloc[-1]
+
+    # Pure upward gains have 0 downside volatility
+    assert up_dvol == pytest.approx(0.0, abs=1e-6)
+    assert down_dvol > 0.10
 
 
 def test_realized_vol_matches_known_std():

@@ -82,9 +82,15 @@ def score_universe(metrics: pd.DataFrame, weights: dict = None,
 
     # Volatility adequacy: too little volatility (relative to peers) can't
     # cover costs; too much tends to come with instability. Score peaks in
-    # the middle of the cross-sectional distribution.
+    # the middle of the cross-sectional distribution, and is penalized for
+    # high downside-volatility ratio (disproportionate tail risk, Ang et al. 2006).
     vol_rank = _pct_rank(df["realized_vol_annualized_pct"])
-    df["vol_adequacy_score"] = 100 * (1 - 2 * (vol_rank - 0.5).abs())
+    base_vol_score = 100 * (1 - 2 * (vol_rank - 0.5).abs())
+    if "downside_vol_ratio" in df.columns and df["downside_vol_ratio"].notna().any():
+        downside_penalty = _pct_rank(df["downside_vol_ratio"]) * 20.0
+        df["vol_adequacy_score"] = (base_vol_score - downside_penalty).clip(lower=0.0)
+    else:
+        df["vol_adequacy_score"] = base_vol_score
 
     # Predictability: does the series show genuine, statistically
     # significant structure at all (in EITHER direction), per the

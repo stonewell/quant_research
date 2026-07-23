@@ -37,6 +37,11 @@ class GeneratedStrategySpec:
     template_name: str
     params: dict
     universe_sharpe: float
+    cagr: float
+    max_drawdown: float
+    calmar_ratio: float
+    win_rate: float
+    profit_factor: float
     total_turnover: float
     total_rebalances: int
     ers_passed: bool
@@ -47,12 +52,12 @@ class GeneratedStrategySpec:
     target_weights: pd.DataFrame  # sparse: NaN except on actual rebalance dates (see allocation_templates.py)
 
 
-def _portfolio_score(universe: dict, template, params: dict, config: GeneratorConfig) -> tuple:
+def _portfolio_score(universe: dict, template, params: dict, config: GeneratorConfig) -> dict:
     """Backtest `params` using the allocation backtester."""
     try:
         target_weights = template.generate_weights(universe, params)
         if target_weights.empty:
-            return float("-inf"), 0, 0.0
+            return {"sharpe_ratio": float("-inf"), "total_rebalances": 0, "total_turnover": 0.0}
 
         result = run_allocation_backtest(
             universe, target_weights,
@@ -60,17 +65,9 @@ def _portfolio_score(universe: dict, template, params: dict, config: GeneratorCo
             commission_pct=config.commission_pct,
             slippage_pct=config.slippage_pct
         )
+        return result
     except Exception:
-        return float("-inf"), 0, 0.0
-
-    eq = result["equity_curve"]
-    if eq.empty:
-        return float("-inf"), 0, 0.0
-
-    returns = eq["equity"].pct_change().dropna()
-    sr = sharpe_ratio(returns)
-
-    return sr, result["total_rebalances"], result["total_turnover"]
+        return {"sharpe_ratio": float("-inf"), "total_rebalances": 0, "total_turnover": 0.0}
 
 
 def grid_combinations(param_grid: dict) -> list:
@@ -128,17 +125,17 @@ def _search_allocation(universe: dict, cfg: GeneratorConfig) -> dict:
         total_grid_trials += len(combos)
 
         for params in combos:
-            score, rebalances, turnover = _portfolio_score(universe, template, params, cfg)
+            res = _portfolio_score(universe, template, params, cfg)
             all_results.append({
                 "template": template,
                 "params": params,
-                "score": score,
-                "rebalances": rebalances,
-                "turnover": turnover
+                "res": res,
+                "score": res.get("sharpe_ratio", float("-inf")),
             })
 
     # Find the best template + params
     best_result = max(all_results, key=lambda r: r["score"])
+    best_res = best_result["res"]
     best_score = best_result["score"]
 
     # 2. Equivalent Random Search (ERS)
@@ -150,20 +147,22 @@ def _search_allocation(universe: dict, cfg: GeneratorConfig) -> dict:
     winning_freq = best_result["params"].get("rebalance_freq_days", 21)
 
     for _ in range(cfg.n_random_search):
-        score, _, _ = _portfolio_score(universe, random_template, {"rebalance_freq_days": winning_freq}, cfg)
-        if np.isfinite(score):
-            random_scores.append(score)
+        res = _portfolio_score(universe, random_template, {"rebalance_freq_days": winning_freq}, cfg)
+        s = res.get("sharpe_ratio", float("-inf"))
+        if np.isfinite(s):
+            random_scores.append(s)
 
     ers_percentile = float((np.array(random_scores) < best_score).mean()) if random_scores else 1.0
     ers_passed = ers_percentile >= cfg.ers_percentile_threshold
-    trusted = ers_passed and best_result["rebalances"] >= cfg.min_rebalances_for_trust
+    trusted = ers_passed and best_res.get("total_rebalances", 0) >= cfg.min_rebalances_for_trust
 
     return {
         "template": best_result["template"],
         "params": best_result["params"],
+        "res": best_res,
         "score": best_score,
-        "total_rebalances": best_result["rebalances"],
-        "total_turnover": best_result["turnover"],
+        "total_rebalances": best_res.get("total_rebalances", 0),
+        "total_turnover": best_res.get("total_turnover", 0.0),
         "ers_passed": ers_passed,
         "ers_percentile": ers_percentile,
         "n_trials": total_grid_trials + len(random_scores),
@@ -184,6 +183,7 @@ class StrategyGenerator:
 
         template = result["template"]
         params = result["params"]
+        res = result["res"]
 
         # Generate the final weights for output
         target_weights = template.generate_weights(universe, params)
@@ -194,6 +194,11 @@ class StrategyGenerator:
             template_name=template.name,
             params=params,
             universe_sharpe=result["score"],
+            cagr=res.get("cagr", 0.0),
+            max_drawdown=res.get("max_drawdown", 0.0),
+            calmar_ratio=res.get("calmar_ratio", 0.0),
+            win_rate=res.get("win_rate", 0.0),
+            profit_factor=res.get("profit_factor", 0.0),
             total_turnover=result["total_turnover"],
             total_rebalances=result["total_rebalances"],
             ers_passed=result["ers_passed"],

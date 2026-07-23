@@ -29,7 +29,6 @@ if _PROJECT_ROOT not in sys.path:
 from common.allocation_backtester import run_allocation_backtest
 from common.allocation_templates import ALLOCATION_TEMPLATES
 from common.data import load_ohlcv
-from common.metrics import max_drawdown, sharpe_ratio
 
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 
@@ -80,16 +79,13 @@ def run_standard(universe: dict, template, params: dict, args) -> dict:
         slippage_pct=args.slippage_pct
     )
 
-    eq = result["equity_curve"]
-    if eq.empty:
+    if result["equity_curve"].empty:
         raise ValueError("Backtest produced empty equity curve.")
 
-    returns = eq["equity"].pct_change().dropna()
-    sr = sharpe_ratio(returns)
-    mdd = max_drawdown(eq["equity"])
-
-    result["sharpe"] = sr
-    result["max_drawdown"] = mdd
+    # result already carries sharpe_ratio/cagr/max_drawdown/calmar_ratio/
+    # win_rate/profit_factor from run_allocation_backtest -- report those
+    # directly rather than recomputing (that recomputation used to disagree
+    # in sign with the backtester's own max_drawdown).
     return result
 
 
@@ -117,6 +113,13 @@ def run_walkforward(universe: dict, template, params: dict, args) -> list:
     # unchanged.
     warmup_bars = template.warmup_bars(params)
 
+    def _nan_fold_metrics() -> dict:
+        return {
+            "sharpe_ratio": float("nan"), "cagr": float("nan"), "max_drawdown": float("nan"),
+            "calmar_ratio": float("nan"), "win_rate": float("nan"), "profit_factor": float("nan"),
+            "total_turnover": 0.0, "total_rebalances": 0,
+        }
+
     folds = []
     start_idx = 0
     while start_idx + window_bars <= n_bars:
@@ -132,7 +135,7 @@ def run_walkforward(universe: dict, template, params: dict, args) -> list:
         try:
             full_weights = template.generate_weights(buffered_universe, params)
             if full_weights.empty:
-                sr, mdd, turnover, rebalances = float("nan"), float("nan"), 0.0, 0
+                fold_metrics = _nan_fold_metrics()
             else:
                 # Restrict to the eval window, but seed its first row with the
                 # carried-over (forward-filled) target as of the window's
@@ -149,27 +152,27 @@ def run_walkforward(universe: dict, template, params: dict, args) -> list:
                     commission_pct=args.commission_pct,
                     slippage_pct=args.slippage_pct
                 )
-                eq = result["equity_curve"]
-                if eq.empty:
-                    sr, mdd, turnover, rebalances = float("nan"), float("nan"), 0.0, 0
+                if result["equity_curve"].empty:
+                    fold_metrics = _nan_fold_metrics()
                 else:
-                    returns = eq["equity"].pct_change().dropna()
-                    sr = sharpe_ratio(returns)
-                    mdd = max_drawdown(eq["equity"])
-                    turnover = result["total_turnover"]
-                    rebalances = result["total_rebalances"]
+                    # Same fields (and the same sign convention) run_standard
+                    # reports -- no separate recomputation, so the two modes
+                    # can't drift apart.
+                    fold_metrics = {
+                        "sharpe_ratio": result["sharpe_ratio"],
+                        "cagr": result["cagr"],
+                        "max_drawdown": result["max_drawdown"],
+                        "calmar_ratio": result["calmar_ratio"],
+                        "win_rate": result["win_rate"],
+                        "profit_factor": result["profit_factor"],
+                        "total_turnover": result["total_turnover"],
+                        "total_rebalances": result["total_rebalances"],
+                    }
         except Exception as e:
             print(f"Error in window {start_date} to {end_date}: {e}")
-            sr, mdd, turnover, rebalances = float("nan"), float("nan"), 0.0, 0
+            fold_metrics = _nan_fold_metrics()
 
-        folds.append({
-            "start_date": start_date,
-            "end_date": end_date,
-            "sharpe_ratio": sr,
-            "max_drawdown": mdd,
-            "total_turnover": turnover,
-            "total_rebalances": rebalances
-        })
+        folds.append({"start_date": start_date, "end_date": end_date, **fold_metrics})
 
         start_idx += step_bars
 
@@ -207,8 +210,10 @@ def main():
         print("\n=== Running Standard Backtest ===")
         result = run_standard(universe, _get_template(template_name), params, args)
 
-        print(f"Sharpe Ratio: {result['sharpe']:.2f}")
-        print(f"Max Drawdown: {result['max_drawdown']*100:.1f}%")
+        print(f"Sharpe Ratio: {result['sharpe_ratio']:.2f} | CAGR: {result['cagr']*100:.2f}% | "
+              f"Max Drawdown: {result['max_drawdown']*100:.1f}%")
+        print(f"Calmar Ratio: {result['calmar_ratio']:.2f} | Win Rate: {result['win_rate']*100:.1f}% | "
+              f"Profit Factor: {result['profit_factor']:.2f}")
         print(f"Total Rebalances: {result['total_rebalances']}")
         print(f"Total Turnover: {result['total_turnover']:.2f}")
 
@@ -230,8 +235,10 @@ def main():
         print("\nRolling Windows Performance:")
         print(folds_df.to_string(index=False))
 
-        print(f"\nMean Sharpe Ratio: {folds_df['sharpe_ratio'].mean():.2f}")
-        print(f"Mean Max Drawdown: {folds_df['max_drawdown'].mean()*100:.1f}%")
+        print(f"\nMean Sharpe Ratio: {folds_df['sharpe_ratio'].mean():.2f} | "
+              f"Mean CAGR: {folds_df['cagr'].mean()*100:.2f}%")
+        print(f"Mean Max Drawdown: {folds_df['max_drawdown'].mean()*100:.1f}% | "
+              f"Mean Calmar Ratio: {folds_df['calmar_ratio'].mean():.2f}")
 
         out_path = os.path.join(RESULTS_DIR, "walkforward_report.csv")
         folds_df.to_csv(out_path, index=False)

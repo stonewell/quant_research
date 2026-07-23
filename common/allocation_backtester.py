@@ -109,9 +109,46 @@ def run_allocation_backtest(
     # Reconstruct actual weights DataFrame for transparency
     actual_weights_df = pd.DataFrame(actual_w, index=common_idx, columns=symbols)
 
+    # Compute additional performance metrics
+    eq = equity_df["equity"]
+    daily_returns = eq.pct_change().dropna()
+
+    total_return = (eq.iloc[-1] / eq.iloc[0]) - 1.0 if len(eq) > 0 else 0.0
+    n_years = max((common_idx[-1] - common_idx[0]).days / 365.25, 1.0 / 252.0) if len(common_idx) > 1 else 1.0
+    cagr = ((1.0 + total_return) ** (1.0 / n_years)) - 1.0 if total_return > -1.0 else -1.0
+
+    # Max Drawdown -- positive magnitude (e.g. 0.18 for an 18% drawdown),
+    # matching common/metrics.py's max_drawdown() convention used elsewhere
+    # in this workspace (backtester/run_backtest.py in particular reports
+    # both side by side, so the sign must agree).
+    cummax = eq.cummax()
+    drawdown = (cummax - eq) / cummax
+    max_dd = float(drawdown.max()) if not drawdown.empty else 0.0
+
+    # Calmar Ratio
+    calmar = cagr / max_dd if max_dd > 0 else 0.0
+
+    # Sharpe Ratio
+    mean_ret = float(daily_returns.mean()) if not daily_returns.empty else 0.0
+    std_ret = float(daily_returns.std()) if not daily_returns.empty else 0.0
+    sr = (mean_ret / std_ret) * np.sqrt(252) if std_ret > 0 else 0.0
+
+    # Win Rate & Profit Factor
+    pos_ret = daily_returns[daily_returns > 0]
+    neg_ret = daily_returns[daily_returns < 0]
+    win_rate = len(pos_ret) / len(daily_returns) if len(daily_returns) > 0 else 0.0
+    profit_factor = pos_ret.sum() / abs(neg_ret.sum()) if not neg_ret.empty and neg_ret.sum() != 0 else np.nan
+
     return {
         "equity_curve": equity_df,
         "actual_weights": actual_weights_df,
         "total_turnover": total_turnover,
         "total_rebalances": int(is_rebalance.sum()),
+        "total_return": total_return,
+        "cagr": cagr,
+        "max_drawdown": max_dd,
+        "sharpe_ratio": sr,
+        "calmar_ratio": calmar,
+        "win_rate": win_rate,
+        "profit_factor": profit_factor,
     }

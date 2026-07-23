@@ -45,6 +45,11 @@ def test_main_loads_universe_from_file(mock_gen_cls, mock_load):
         template_name = "test"
         params = {}
         universe_sharpe = 1.0
+        cagr = 0.10
+        max_drawdown = -0.05
+        calmar_ratio = 2.0
+        win_rate = 0.55
+        profit_factor = 1.5
         total_turnover = 1.0
         total_rebalances = 1
         ers_passed = True

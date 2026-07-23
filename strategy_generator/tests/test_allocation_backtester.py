@@ -3,6 +3,7 @@ import pandas as pd
 from common.testing import make_ohlcv_from_closes as make_df
 
 from common.allocation_backtester import run_allocation_backtest
+from common.metrics import max_drawdown as metrics_max_drawdown
 
 
 def test_allocation_backtester_drift():
@@ -109,3 +110,31 @@ def test_backtester_rebalances_even_when_target_value_is_unchanged():
     assert actual_w.loc[idx[4]]["A"] > 0.5
     assert actual_w.loc[idx[9]]["A"] > 0.5
     assert res["total_rebalances"] == 3
+
+
+def test_max_drawdown_matches_common_metrics_sign_convention():
+    # Regression test: run_allocation_backtest's own max_drawdown used to be
+    # NEGATIVE ((eq - cummax) / cummax, .min()) while common/metrics.py's
+    # max_drawdown() -- the shared convention used across this whole
+    # workspace, and what backtester/run_backtest.py displays alongside it --
+    # is POSITIVE. Pin both the sign and the exact value against a synthetic
+    # equity path with a known, hand-computed drawdown.
+    idx = pd.bdate_range("2020-01-01", periods=5)
+    # Single-asset equal weight: +25% then -20% (back to start) then flat --
+    # an exact 20% drawdown from the day-2 peak.
+    closes_a = [100.0, 125.0, 100.0, 100.0, 100.0]
+    universe = {"A": make_df(closes_a, start="2020-01-01")}
+
+    target_weights = pd.DataFrame(np.nan, index=idx, columns=["A"])
+    target_weights.iloc[0] = [1.0]
+
+    res = run_allocation_backtest(universe, target_weights, commission_pct=0.0, slippage_pct=0.0)
+
+    assert res["max_drawdown"] > 0
+    np.testing.assert_allclose(res["max_drawdown"], 0.20, atol=1e-9)
+    np.testing.assert_allclose(res["max_drawdown"], metrics_max_drawdown(res["equity_curve"]["equity"]))
+
+    # Calmar Ratio = CAGR / |Max Drawdown|; with a positive max_drawdown this
+    # is a straight division, no abs() needed -- pin that the two agree in sign.
+    if res["max_drawdown"] > 0:
+        np.testing.assert_allclose(res["calmar_ratio"], res["cagr"] / res["max_drawdown"])

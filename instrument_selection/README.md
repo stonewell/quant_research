@@ -108,19 +108,25 @@ percentile *within the universe that already cleared that floor* (see
 "Screen first, score second," below, for why this is now a hard gate applied
 in `screening.py`, not just a soft, rank-based input the way it used to be).
 
-### 2. Volatility — is there a tradable edge, and what kind?
+### 2. Volatility and Downside Risk — is there a tradable edge, and what kind?
 
 **Why it matters:** grid trading needs volatility, but specifically
 *range-bound* volatility — enough price oscillation to repeatedly hit grid
 levels, without a sustained directional move that leaves the grid
 one-sidedly exposed. Trend-following needs *sustained directional*
 volatility. Very low-volatility instruments may not generate enough edge to
-cover round-trip costs, regardless of strategy. Volatility-of-volatility
-("vol clustering") matters too: an instrument whose own volatility regime is
-itself unstable is harder for any strategy to size risk against consistently.
+cover round-trip costs, regardless of strategy.
+
+Standard volatility measures treat upward rallies as "risk", penalizing assets
+that have strong upward price gains. **Downside realized volatility** (semi-deviation,
+Estrada 2000; Ang, Chen & Xing 2006, *Journal of Finance* "Downside Risk") isolates
+loss volatility relative to 0. Assets with low **downside volatility ratio**
+(downside vol / total realized vol) exhibit favorable right-skewed gain dynamics
+and lower crash propensity.
 
 **What's implemented:** realized volatility (annualized rolling std of
-returns), ATR% (ATR as a fraction of price — the same building block used in
+returns), downside realized volatility (annualized semi-deviation of negative returns),
+downside volatility ratio, ATR% (ATR as a fraction of price — the same building block used in
 this workspace's grid-trading project's dynamic spacing), vol-of-vol
 (rolling std of the realized-vol series), and an ATR *regime-change* ratio
 (short-window ATR% vs. its own longer-window average — research's documented
@@ -495,6 +501,15 @@ diversification isn't a fixed constant: their PCA-based selection method
 below) showed the "right" count shrinks when correlations rise and grows
 when they fall, using as few as ~15 of 200 ASX-listed stocks to closely
 replicate the full index depending on the prevailing correlation regime.
+
+### `select_max_diversification_ratio` — Maximum Diversification Ratio selection
+Greedily selects a subset of K assets that maximizes Choueifaty & Coignard (2008,
+*Journal of Portfolio Management*, "Toward Maximum Diversification")'s landmark
+**Diversification Ratio**:
+$$DR(w) = \frac{w^T \sigma}{\sqrt{w^T \Sigma w}}$$
+DR measures the ratio of weighted average asset volatilities to total portfolio
+volatility. Selecting assets that maximize DR ensures the basket exhibits strong
+correlation-risk reduction properties.
 
 ### What was researched but deliberately NOT implemented this pass
 - **The Generalized MaxMean Dispersion Problem** (Prokopyev et al., 2009):
