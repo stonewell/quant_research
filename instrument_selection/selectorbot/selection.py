@@ -163,7 +163,7 @@ def select_max_diversification_ratio(scores: pd.Series, corr: pd.DataFrame, vola
     Journal of Portfolio Management): greedily selects assets to maximize the
     portfolio Diversification Ratio DR = (w^T sigma) / sqrt(w^T Sigma w),
     blended with individual quality scores.
-    
+
     DR measures the ratio of weighted average asset volatilities to total
     portfolio volatility. Highly correlated assets reduce DR, while uncorrelated
     or negatively correlated assets increase DR."""
@@ -175,7 +175,7 @@ def select_max_diversification_ratio(scores: pd.Series, corr: pd.DataFrame, vola
 
     vol = volatility.reindex(symbols).fillna(volatility.median())
     corr_sub = corr.loc[symbols, symbols]
-    
+
     # Precompute covariance elements: cov_ij = vol_i * vol_j * corr_ij
     vol_arr = vol.to_numpy()
     cov_matrix = pd.DataFrame(

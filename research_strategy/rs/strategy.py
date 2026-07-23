@@ -30,7 +30,7 @@ def _get_rebalance_dates(index: pd.DatetimeIndex, freq_days: int) -> pd.Datetime
 
 class ActiveDualMomentumRiskParity:
     """Active Dual Momentum GTAA + Inverse Volatility Risk Parity Strategy.
-    
+
     1. Trend Gate: Close > 200d SMA and 126d ROC > 0.
     2. Momentum Ranking: 0.5 * ROC(63) + 0.5 * ROC(126).
     3. Inverse Volatility Sizing: Weight_i ~ 1 / Vol_60(i).
@@ -128,7 +128,7 @@ class ActiveDualMomentumRiskParity:
 
 class BoldAssetAllocation:
     """Wouter Keller's Bold Asset Allocation (BAA-G12) Strategy.
-    
+
     1. Canary Universe Turbulence Detector: SPY, EEM, EFA, AGG.
     2. If ANY canary asset has negative momentum (Close < 12m SMA or 126d ROC < 0), state = Turbulent.
     3. Calm State: Select top 3 assets from Offensive Universe by 126d ROC.
@@ -217,7 +217,7 @@ class BoldAssetAllocation:
 
 class VolatilityManagedStrategy:
     """Alan Moreira & Tyler Muir (2017, Journal of Finance) Volatility-Managed Strategy.
-    
+
     Scales baseline portfolio return / weight inversely by its recent 20-day realized variance:
     Weight = Target_Vol / Realized_Vol_20, capped at max_leverage (e.g. 1.0).
     """
