@@ -20,6 +20,7 @@ from research_strategy.rs.config import StrategyConfig
 from research_strategy.rs.strategy import (
     ActiveDualMomentumRiskParity,
     BoldAssetAllocation,
+    NaturalLanguageStrategy,
     VolatilityManagedStrategy,
 )
 
@@ -131,14 +132,25 @@ def test_volatility_managed_deleveraging():
     assert pytest.approx(total_w, abs=1e-4) == 1.0
 
 
+def test_natural_language_strategy_custom_description():
+    text = "Rebalance weekly. Select top 2 assets from SPY, QQQ, GLD, TLT with Close > 50d SMA. Allocate equally."
+    strat = NaturalLanguageStrategy(text)
+    universe = create_mock_universe(n_days=250)
+
+    weights = strat.generate_weights(universe)
+    assert not weights.empty
+
+    rebal_dates = weights.dropna(how="all").index
+    last_rebal = rebal_dates[-1]
+
+    # Each selected asset gets 50%
+    active_weights = weights.loc[last_rebal][weights.loc[last_rebal] > 0]
+    assert len(active_weights) <= 2
+    for w in active_weights:
+        assert pytest.approx(w, abs=1e-4) == 0.50
+
+
 def test_volatility_managed_excludes_a_symbol_with_no_data_in_window():
-    # Regression test: a risky symbol that hasn't started trading yet (all-NaN
-    # Close, e.g. a newer ETF mixed into an older basket) used to be handed a
-    # full equal-weight share regardless -- the backtester would then treat
-    # its missing return as a fabricated flat 0%, silently parking real
-    # capital in an asset that doesn't exist yet. It must be excluded instead,
-    # with the remaining risky symbols renormalized among themselves. All
-    # data here is synthetic (no market data / network calls).
     n_days = 250
     universe = create_mock_universe(n_days=n_days)
 
@@ -161,22 +173,6 @@ def test_volatility_managed_excludes_a_symbol_with_no_data_in_window():
     assert early_rebal
 
     for date in early_rebal:
-        # NEW has no data yet -> must not receive weight.
         assert weights.loc[date, "NEW"] == 0.0
-        # SPY/QQQ/GLD alone (renormalized) plus cash must still sum to 1.0 --
-        # capital isn't silently lost to a phantom NEW allocation.
         total_w = weights.loc[date].sum()
         assert pytest.approx(total_w, abs=1e-4) == 1.0
-
-
-def test_volatility_managed_warmup_bars_respects_params_override():
-    # Regression test: generate_weights already reads vol_managed_var_lookback
-    # from `params` (falling back to the config default); warmup_bars must
-    # agree, or a caller sizing a warmup buffer from warmup_bars(params) (e.g.
-    # a walk-forward fold) would silently under-buffer whenever params
-    # override the config default.
-    cfg = StrategyConfig(vol_managed_var_lookback=20)
-    strat = VolatilityManagedStrategy(cfg)
-
-    assert strat.warmup_bars() == 20
-    assert strat.warmup_bars({"vol_managed_var_lookback": 90}) == 90

@@ -1,16 +1,18 @@
 #!/usr/bin/env python
 """CLI Entry Point: Researched Quantitative Trading Strategies Evaluation.
 
-Runs backtests for:
+Evaluates strategies written in plain English or predefined canonical research strategies:
 1. Active Dual Momentum GTAA + Risk Parity (Antonacci 2014, Faber 2007)
 2. Wouter Keller's Bold Asset Allocation BAA-G12 (Keller 2022)
 3. Moreira & Muir Volatility-Managed Portfolios (Moreira & Muir 2017)
+4. Custom Plain English Strategy descriptions (--description or --description-file)
 
 STRICT TEST POLICY: Runs on synthetic multi-asset price histories (no real market data calls).
 
-Example:
+Examples:
     python run_research_strategy.py --strategy all
-    python run_research_strategy.py --strategy dual_momentum
+    python run_research_strategy.py --description "Rebalance monthly. Select top 3 assets from SPY, QQQ, EEM, GLD, TLT with Close > 200d SMA. Rank by 126d return and allocate using 60d inverse volatility."
+    python run_research_strategy.py --description-file strategy.txt
 """
 
 import argparse
@@ -30,9 +32,11 @@ import pandas as pd
 from common.allocation_backtester import run_allocation_backtest
 from common.testing import make_ohlcv_from_closes
 from rs.config import StrategyConfig
+from rs.nl_parser import parse_plain_english_strategy
 from rs.strategy import (
     ActiveDualMomentumRiskParity,
     BoldAssetAllocation,
+    NaturalLanguageStrategy,
     VolatilityManagedStrategy,
 )
 
@@ -61,16 +65,12 @@ def generate_synthetic_universe(n_days: int = 1200, seed: int = 42, start: str =
     universe = {}
     for i, sym in enumerate(symbols):
         if sym == "BIL":
-            # Cash proxy: steady small positive return, ultra-low vol
             ret = rng.normal(0.0001, 0.0002, n_days)
         elif sym in ("TLT", "IEF", "AGG", "TIP"):
-            # Treasuries/Bonds: slightly negative correlation to equities during stress
             ret = -0.3 * market_returns + rng.normal(0.0001, 0.005, n_days)
         elif sym == "GLD":
-            # Gold: independent commodity driver
             ret = rng.normal(0.0002, 0.008, n_days)
         else:
-            # Equities / Real Estate: beta * market + idiosyncratic noise
             beta = 0.8 + 0.1 * (i % 4)
             ret = beta * market_returns + rng.normal(0, 0.006, n_days)
 
@@ -83,7 +83,9 @@ def generate_synthetic_universe(n_days: int = 1200, seed: int = 42, start: str =
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Researched Quantitative Trading Strategies CLI Runner")
     p.add_argument("--strategy", choices=["dual_momentum", "baa_keller", "volatility_managed", "all"],
-                   default="all", help="Strategy implementation to evaluate")
+                   default="all", help="Preset strategy implementation to evaluate")
+    p.add_argument("--description", type=str, help="Plain English strategy description text")
+    p.add_argument("--description-file", type=str, help="Path to plain English strategy description text file")
     p.add_argument("--n-days", type=int, default=1200, help="Number of synthetic trading days to simulate")
     p.add_argument("--seed", type=int, default=42, help="Random seed for synthetic data generation")
     return p
@@ -98,18 +100,37 @@ def main():
     print(f"Generated synthetic data for {len(universe)} symbols: {', '.join(universe.keys())}\n")
 
     strategies_to_run = {}
-    if args.strategy in ("dual_momentum", "all"):
-        strategies_to_run["dual_momentum"] = ActiveDualMomentumRiskParity(cfg)
-    if args.strategy in ("baa_keller", "all"):
-        strategies_to_run["baa_keller"] = BoldAssetAllocation(cfg)
-    if args.strategy in ("volatility_managed", "all"):
-        strategies_to_run["volatility_managed"] = VolatilityManagedStrategy(cfg)
+
+    if args.description:
+        spec = parse_plain_english_strategy(args.description)
+        strategies_to_run["custom_plain_english"] = NaturalLanguageStrategy(spec, cfg)
+    elif args.description_file:
+        if not os.path.exists(args.description_file):
+            print(f"Error: Description file '{args.description_file}' not found.")
+            sys.exit(1)
+        with open(args.description_file, "r") as f:
+            desc_text = f.read()
+        spec = parse_plain_english_strategy(desc_text)
+        strategies_to_run["custom_plain_english"] = NaturalLanguageStrategy(spec, cfg)
+    else:
+        if args.strategy in ("dual_momentum", "all"):
+            strategies_to_run["dual_momentum"] = ActiveDualMomentumRiskParity(cfg)
+        if args.strategy in ("baa_keller", "all"):
+            strategies_to_run["baa_keller"] = BoldAssetAllocation(cfg)
+        if args.strategy in ("volatility_managed", "all"):
+            strategies_to_run["volatility_managed"] = VolatilityManagedStrategy(cfg)
 
     report_data = {}
     weights_summary = {}
 
     for strat_name, strat_obj in strategies_to_run.items():
-        print(f"=== Running Strategy: {strat_name} ===")
+        spec_summary = strat_obj.explain_weights()
+        print("=" * 80)
+        print("SECTION 1: PARSED STRATEGY SPECIFICATION")
+        print(spec_summary)
+        print("\nSECTION 2: BACKTEST RESULTS & TARGET WEIGHTS")
+        print("=" * 80)
+
         target_weights = strat_obj.generate_weights(universe)
 
         backtest_res = run_allocation_backtest(
@@ -120,8 +141,6 @@ def main():
             slippage_pct=cfg.slippage_pct
         )
 
-        explanation = strat_obj.explain_weights()
-        print(f"  Logic: {explanation}")
         print(f"  Sharpe Ratio:    {backtest_res['sharpe_ratio']:.2f}")
         print(f"  CAGR:            {backtest_res['cagr'] * 100:.2f}%")
         print(f"  Max Drawdown:    {backtest_res['max_drawdown'] * 100:.2f}%")
@@ -136,7 +155,9 @@ def main():
         print((recent_rebal * 100).round(1).astype(str) + "%\n")
 
         report_data[strat_name] = {
-            "explanation": explanation,
+            "strategy_name": strat_obj.spec.strategy_name,
+            "raw_description": strat_obj.spec.raw_description,
+            "parsed_summary": spec_summary,
             "sharpe_ratio": float(backtest_res["sharpe_ratio"]),
             "cagr": float(backtest_res["cagr"]),
             "max_drawdown": float(backtest_res["max_drawdown"]),
