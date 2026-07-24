@@ -5,7 +5,13 @@ Evaluates strategies written in plain English or predefined canonical research s
 1. Active Dual Momentum GTAA + Risk Parity (Antonacci 2014, Faber 2007)
 2. Wouter Keller's Bold Asset Allocation BAA-G12 (Keller 2022)
 3. Moreira & Muir Volatility-Managed Portfolios (Moreira & Muir 2017)
-4. Custom Plain English Strategy descriptions (--description or --description-file)
+4. Accelerating Dual Momentum (Ludlow & Hanly 2018)
+5. Vigilant Asset Allocation VAA-G4 (Keller & Keuning 2017)
+6. RSI(2) Mean-Reversion (ported from the former rsi_strategy project)
+7. Trend-Pullback Swing (ported from the former swing_trend_strategy project)
+8. ATR-Adaptive Grid (ported from the former grid_trading project)
+9. Regime-Switching Ensemble (ported from the former ensemble_strategy project)
+10. Custom Plain English Strategy descriptions (--description or --description-file)
 
 STRICT TEST POLICY: Runs on synthetic multi-asset price histories (no real market data calls).
 
@@ -34,9 +40,15 @@ from common.testing import make_ohlcv_from_closes
 from rs.config import StrategyConfig
 from rs.nl_parser import parse_plain_english_strategy
 from rs.strategy import (
+    AcceleratingDualMomentum,
     ActiveDualMomentumRiskParity,
+    AdaptiveGridStrategy,
     BoldAssetAllocation,
+    EnsembleRegimeSwitchingStrategy,
     NaturalLanguageStrategy,
+    RSIMeanReversionStrategy,
+    SwingTrendPullbackStrategy,
+    VigilantAssetAllocation,
     VolatilityManagedStrategy,
 )
 
@@ -59,7 +71,7 @@ def generate_synthetic_universe(n_days: int = 1200, seed: int = 42, start: str =
 
     symbols = [
         "SPY", "QQQ", "IWM", "EFA", "EEM", "GLD", "TLT", "VNQ",
-        "AGG", "TIP", "IEF", "LQD", "DBC", "BIL"
+        "AGG", "TIP", "IEF", "LQD", "DBC", "BIL", "SCZ"
     ]
 
     universe = {}
@@ -82,7 +94,10 @@ def generate_synthetic_universe(n_days: int = 1200, seed: int = 42, start: str =
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Researched Quantitative Trading Strategies CLI Runner")
-    p.add_argument("--strategy", choices=["dual_momentum", "baa_keller", "volatility_managed", "all"],
+    p.add_argument("--strategy",
+                   choices=["dual_momentum", "baa_keller", "volatility_managed", "accelerating_dual_momentum",
+                            "vigilant_asset_allocation", "rsi_mean_reversion", "swing_trend_pullback",
+                            "adaptive_grid", "ensemble_regime_switching", "all"],
                    default="all", help="Preset strategy implementation to evaluate")
     p.add_argument("--description", type=str, help="Plain English strategy description text")
     p.add_argument("--description-file", type=str, help="Path to plain English strategy description text file")
@@ -119,6 +134,18 @@ def main():
             strategies_to_run["baa_keller"] = BoldAssetAllocation(cfg)
         if args.strategy in ("volatility_managed", "all"):
             strategies_to_run["volatility_managed"] = VolatilityManagedStrategy(cfg)
+        if args.strategy in ("accelerating_dual_momentum", "all"):
+            strategies_to_run["accelerating_dual_momentum"] = AcceleratingDualMomentum(cfg)
+        if args.strategy in ("vigilant_asset_allocation", "all"):
+            strategies_to_run["vigilant_asset_allocation"] = VigilantAssetAllocation(cfg)
+        if args.strategy in ("rsi_mean_reversion", "all"):
+            strategies_to_run["rsi_mean_reversion"] = RSIMeanReversionStrategy(cfg)
+        if args.strategy in ("swing_trend_pullback", "all"):
+            strategies_to_run["swing_trend_pullback"] = SwingTrendPullbackStrategy(cfg)
+        if args.strategy in ("adaptive_grid", "all"):
+            strategies_to_run["adaptive_grid"] = AdaptiveGridStrategy(cfg)
+        if args.strategy in ("ensemble_regime_switching", "all"):
+            strategies_to_run["ensemble_regime_switching"] = EnsembleRegimeSwitchingStrategy(cfg)
 
     report_data = {}
     weights_summary = {}
@@ -154,9 +181,14 @@ def main():
         print("  Recent Target Weights (Last 3 Rebalances):")
         print((recent_rebal * 100).round(1).astype(str) + "%\n")
 
+        # Not every strategy is NaturalLanguageStrategy-based (e.g.
+        # AcceleratingDualMomentum/VigilantAssetAllocation are standalone
+        # classes with no `.spec`) -- fall back to the class name/docstring
+        # rather than assuming `.spec` exists on every strategy object.
+        spec = getattr(strat_obj, "spec", None)
         report_data[strat_name] = {
-            "strategy_name": strat_obj.spec.strategy_name,
-            "raw_description": strat_obj.spec.raw_description,
+            "strategy_name": getattr(spec, "strategy_name", type(strat_obj).__name__),
+            "raw_description": getattr(spec, "raw_description", (type(strat_obj).__doc__ or "").strip()),
             "parsed_summary": spec_summary,
             "sharpe_ratio": float(backtest_res["sharpe_ratio"]),
             "cagr": float(backtest_res["cagr"]),

@@ -4,10 +4,19 @@ Grounding:
 1. Dual Momentum GTAA + Risk Parity: Antonacci (2014, JPM), Faber (2007, JWM).
 2. Bold Asset Allocation (BAA-G12): Wouter J. Keller (2022 SSRN).
 3. Volatility-Managed Portfolios: Moreira & Muir (2017, Journal of Finance).
+4. Accelerating Dual Momentum: Ludlow & Hanly (2018, EngineeredPortfolio.com).
+5. Vigilant Asset Allocation (VAA-G4): Keller & Keuning (2017 SSRN #3002624).
+6. RSI(2) mean-reversion, trend-pullback swing, ATR-adaptive grid, and
+   regime-switching ensemble: ported from this workspace's former
+   `rsi_strategy`, `swing_trend_strategy`, `grid_trading`, and
+   `ensemble_strategy` side projects (see `rs/strategy.py`
+   for the full research grounding each one carried, and the close-based
+   approximation each port discloses relative to its original event-driven,
+   intrabar-aware backtester).
 """
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 DEFAULT_RISKY_UNIVERSE = ["SPY", "QQQ", "IWM", "EFA", "EEM", "GLD", "TLT", "VNQ"]
 DEFAULT_CASH_PROXY = "BIL"
@@ -16,6 +25,15 @@ DEFAULT_CASH_PROXY = "BIL"
 DEFAULT_BAA_CANARY = ["SPY", "EEM", "EFA", "AGG"]
 DEFAULT_BAA_OFFENSIVE = ["SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "DBC"]
 DEFAULT_BAA_DEFENSIVE = ["TIP", "IEF", "TLT", "BIL", "AGG", "DBC"]
+
+# Vigilant Asset Allocation (VAA-G4) universes. NOTE: Keller & Keuning's own
+# published offensive/defensive ticker list could NOT be confirmed with high
+# confidence -- two different candidate universes attributed to the paper by
+# secondary sources were independently checked and refuted. These defaults
+# are illustrative only, not a verified reproduction of the original paper's
+# universe; substitute your own before treating results as a paper replication.
+DEFAULT_VAA_OFFENSIVE = ["SPY", "QQQ", "EFA", "EEM"]
+DEFAULT_VAA_DEFENSIVE = ["IEF", "BIL"]
 
 
 @dataclass
@@ -43,6 +61,105 @@ class StrategyConfig:
     vol_managed_target_vol: float = 0.15   # Target annualized volatility (15%)
     vol_managed_var_lookback: int = 20     # 20-day realized variance estimate
     vol_managed_max_leverage: float = 1.0  # Max exposure (1.0 = no leverage, unlevered long-only)
+
+    # Accelerating Dual Momentum (Ludlow & Hanly 2018) parameters. Fixed
+    # 4-ETF universe per the published rule: SPY vs. SCZ on relative +
+    # absolute momentum, falling back to whichever of TLT/TIP has the
+    # better trailing 1-month return when neither equity sleeve qualifies.
+    adm_equity_a: str = "SPY"
+    adm_equity_b: str = "SCZ"
+    adm_bond_a: str = "TLT"
+    adm_bond_b: str = "TIP"
+
+    # Vigilant Asset Allocation (VAA-G4) parameters -- see
+    # DEFAULT_VAA_OFFENSIVE/DEFAULT_VAA_DEFENSIVE above for the universe
+    # caveat. The 13612W momentum formula and T=1/B=1 binary switch
+    # (Keller & Keuning 2017) are well-verified and NOT affected by that
+    # caveat -- only the specific tickers are illustrative.
+    vaa_offensive_universe: List[str] = field(default_factory=lambda: list(DEFAULT_VAA_OFFENSIVE))
+    vaa_defensive_universe: List[str] = field(default_factory=lambda: list(DEFAULT_VAA_DEFENSIVE))
+
+    # --- RSI(2) mean-reversion (ported from `rsi_strategy`) ---
+    # Entry: price > 200d SMA (trend filter) and RSI(2) < oversold_threshold
+    # (or cumulative RSI(2) over `rsi_cumulative_lookback` bars < threshold).
+    # Exit rule has NO verified consensus per the original project's
+    # research (only the entry + trend filter are well-verified) -- treat
+    # exit_mode/exit_rsi_threshold as an open, empirically-tuned parameter.
+    rsi_symbol: str = "SPY"
+    rsi_period: int = 2
+    rsi_method: str = "wilder"            # "wilder" or "cutler"
+    rsi_entry_mode: str = "single"        # "single" or "cumulative"
+    rsi_oversold_threshold: float = 10.0
+    rsi_cumulative_lookback: int = 2
+    rsi_cumulative_threshold: float = 10.0
+    rsi_require_trend_filter: bool = True
+    rsi_trend_ma_period: int = 200
+    rsi_exit_mode: str = "rsi_cross"      # "rsi_cross", "ma_cross", or "either"
+    rsi_exit_rsi_threshold: float = 70.0
+    rsi_exit_ma_period: int = 5
+    rsi_stop_loss_pct: Optional[float] = None   # None disables
+    rsi_max_holding_days: Optional[int] = 10    # None disables
+    rsi_position_size_pct: float = 1.0
+
+    # --- Trend-pullback swing (ported from `swing_trend_strategy`) ---
+    # Entry: close > rising 200d SMA (uptrend), close < 20d SMA (pullback),
+    # 5-period RSI < 45. Only the flat "equity_pct" position-sizing mode is
+    # ported -- the original's "risk_based" per-trade sizing (stop-distance
+    # -> position size) doesn't fit a flat target-weight schedule.
+    swing_symbol: str = "SPY"
+    swing_trend_ma_period: int = 200
+    swing_require_rising_trend_ma: bool = True
+    swing_trend_slope_lookback: int = 20
+    swing_pullback_ma_period: int = 20
+    swing_rsi_period: int = 5
+    swing_entry_rsi_threshold: float = 45.0
+    swing_exit_rsi_threshold: float = 90.0    # high on purpose -- see original project's research notes:
+    # set above the verified 65 so the trailing stop / profit target / time
+    # cap do most of the exit work instead of an early RSI-cross exit.
+    swing_stop_loss_pct: float = 0.05
+    swing_reward_risk_ratio: float = 3.0      # profit_target_pct = stop_loss_pct * reward_risk_ratio
+    swing_use_trailing_stop: bool = True
+    swing_trailing_activate_pct: float = 0.07
+    swing_trailing_stop_pct: float = 0.04
+    swing_max_holding_days: Optional[int] = 63
+    swing_position_size_pct: float = 1.0
+
+    # --- ATR-adaptive grid trading (ported from `grid_trading`) ---
+    # Long-only buy-low/sell-high grid, spacing scaled by ATR% (clipped to a
+    # floor/ceiling), gated by a trend filter and an equity drawdown circuit
+    # breaker. See `AdaptiveGridStrategy`'s docstring for the CLOSE-based
+    # (vs. the original's intrabar High/Low) approximation this port makes.
+    grid_symbol: str = "SPY"
+    grid_atr_period: int = 14
+    grid_atr_multiplier: float = 1.0
+    grid_min_spacing_pct: float = 0.01
+    grid_max_spacing_pct: float = 0.06
+    grid_levels_per_side: int = 6
+    grid_regrid_breakout_mult: float = 2.0
+    grid_regrid_on_profit_cycle: bool = True
+    grid_position_size_pct: float = 0.015     # equity fraction risked per grid slot
+    grid_max_open_slots: int = 5
+    grid_capital_reserve_pct: float = 0.4     # fraction of capital kept out of active grids
+    grid_trend_ma_period: int = 100
+    grid_trend_band_pct: float = 0.03
+    grid_drawdown_stop_pct: float = 0.10
+    grid_cooldown_bars_after_stop: int = 10
+
+    # --- Regime-switching ensemble (ported from `ensemble_strategy`) ---
+    # Trend-following (buy-and-hold) when ADX signals a trending regime
+    # above a rising 200d SMA, tactical RSI(2) mean-reversion when
+    # range-bound, cash below the 200d SMA. `ensemble_mode` selects which
+    # sleeve(s) are active, matching the original project's
+    # component-decomposition CLI ("ensemble", "trend_only", "meanrev_only").
+    ensemble_symbol: str = "SPY"
+    ensemble_mode: str = "ensemble"
+    ensemble_trend_ma_period: int = 200
+    ensemble_adx_period: int = 14
+    ensemble_adx_trend_threshold: float = 25.0
+    ensemble_adx_range_threshold: float = 20.0
+    ensemble_rsi_period: int = 2
+    ensemble_entry_rsi_threshold: float = 10.0
+    ensemble_exit_rsi_threshold: float = 70.0
 
     # Backtester execution defaults
     initial_capital: float = 100_000.0
