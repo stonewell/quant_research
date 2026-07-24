@@ -1,0 +1,148 @@
+{
+  "dual_momentum": {
+    "name": "Active Dual Momentum GTAA",
+    "type": "natural_language",
+    "plain_english_description": "Rebalance monthly. Risky assets: SPY, QQQ, IWM, EFA, EEM, GLD, TLT, VNQ. Apply absolute trend gate: Close > 200d SMA and 126d ROC > 0. Rank passing assets by 63d and 126d momentum, select top 3 assets, and allocate using 60d inverse volatility risk parity weighting. Assign unallocated capital to cash proxy BIL.",
+    "parameters": {
+      "rebalance_freq_days": 21,
+      "top_k": 3,
+      "cash_proxy": "BIL"
+    }
+  },
+  "baa_keller": {
+    "name": "Bold Asset Allocation (BAA-G12)",
+    "type": "natural_language",
+    "plain_english_description": "Rebalance monthly. Use canary assets: SPY, EEM, EFA, AGG. If any canary asset has Close below 200d SMA or 126d ROC <= 0, market is turbulent. In calm markets, select top 3 offensive assets from SPY, QQQ, IWM, EFA, EEM, TLT, LQD, DBC by 126d ROC with equal weighting. In turbulent markets, select top 3 defensive assets from TIP, IEF, TLT, BIL, AGG, DBC with positive 126d ROC, and assign remainder to cash proxy BIL.",
+    "parameters": {
+      "rebalance_freq_days": 21,
+      "top_k": 3,
+      "cash_proxy": "BIL"
+    }
+  },
+  "volatility_managed": {
+    "name": "Volatility-Managed Portfolio",
+    "type": "natural_language",
+    "plain_english_description": "Rebalance monthly. Risky assets: SPY, QQQ, IWM, EFA, EEM, GLD, TLT, VNQ. Dynamically scale portfolio risk exposure using 20-day volatility-managed inverse variance scaling targeting 15% annual volatility, de-leveraging into cash proxy BIL when volatility spikes.",
+    "parameters": {
+      "rebalance_freq_days": 21,
+      "vol_managed_target_vol": 0.15,
+      "vol_managed_var_lookback": 20,
+      "vol_managed_max_leverage": 1.0,
+      "cash_proxy": "BIL"
+    }
+  },
+  "accelerating_dual_momentum": {
+    "name": "Accelerating Dual Momentum (ADM)",
+    "type": "class",
+    "class_name": "AcceleratingDualMomentum",
+    "description": "Chris Ludlow & Steve Hanly (2018) 4-ETF dual momentum strategy on SPY/SCZ equity sleeves with TLT/TIP bond fallback.",
+    "parameters": {
+      "rebalance_freq_days": 21,
+      "adm_equity_a": "SPY",
+      "adm_equity_b": "SCZ",
+      "adm_bond_a": "TLT",
+      "adm_bond_b": "TIP"
+    }
+  },
+  "vigilant_asset_allocation": {
+    "name": "Vigilant Asset Allocation (VAA-G4)",
+    "type": "class",
+    "class_name": "VigilantAssetAllocation",
+    "description": "Keller & Keuning (2017) 13612W momentum formula binary switching strategy between offensive and defensive universes.",
+    "parameters": {
+      "rebalance_freq_days": 21,
+      "vaa_offensive_universe": ["SPY", "QQQ", "EFA", "EEM"],
+      "vaa_defensive_universe": ["IEF", "BIL"]
+    }
+  },
+  "rsi_mean_reversion": {
+    "name": "RSI(2) Mean-Reversion",
+    "type": "class",
+    "class_name": "RSIMeanReversionStrategy",
+    "description": "Connors-style RSI(2) long-only mean-reversion timing strategy extended for multi-asset evaluation.",
+    "parameters": {
+      "rsi_symbol": "SPY",
+      "rsi_period": 2,
+      "rsi_method": "wilder",
+      "rsi_entry_mode": "single",
+      "rsi_oversold_threshold": 10.0,
+      "rsi_cumulative_lookback": 2,
+      "rsi_cumulative_threshold": 10.0,
+      "rsi_require_trend_filter": true,
+      "rsi_trend_ma_period": 200,
+      "rsi_exit_mode": "rsi_cross",
+      "rsi_exit_rsi_threshold": 70.0,
+      "rsi_exit_ma_period": 5,
+      "rsi_stop_loss_pct": null,
+      "rsi_max_holding_days": 10,
+      "rsi_position_size_pct": 1.0,
+      "cash_proxy": "BIL"
+    }
+  },
+  "swing_trend_pullback": {
+    "name": "Trend-Pullback Swing",
+    "type": "class",
+    "class_name": "SwingTrendPullbackStrategy",
+    "description": "Trend-following pullback swing strategy buying dips in confirmed uptrends across active risky symbols.",
+    "parameters": {
+      "swing_symbol": "SPY",
+      "swing_trend_ma_period": 200,
+      "swing_require_rising_trend_ma": true,
+      "swing_trend_slope_lookback": 20,
+      "swing_pullback_ma_period": 20,
+      "swing_rsi_period": 5,
+      "swing_entry_rsi_threshold": 45.0,
+      "swing_exit_rsi_threshold": 90.0,
+      "swing_stop_loss_pct": 0.05,
+      "swing_reward_risk_ratio": 3.0,
+      "swing_use_trailing_stop": true,
+      "swing_trailing_activate_pct": 0.07,
+      "swing_trailing_stop_pct": 0.04,
+      "swing_max_holding_days": 63,
+      "swing_position_size_pct": 1.0,
+      "cash_proxy": "BIL"
+    }
+  },
+  "adaptive_grid": {
+    "name": "ATR-Adaptive Grid",
+    "type": "class",
+    "class_name": "AdaptiveGridStrategy",
+    "description": "Volatility-scaled grid trading strategy with trend filters and equity drawdown circuit breakers.",
+    "parameters": {
+      "grid_symbol": "SPY",
+      "grid_atr_period": 14,
+      "grid_atr_multiplier": 1.0,
+      "grid_min_spacing_pct": 0.01,
+      "grid_max_spacing_pct": 0.06,
+      "grid_levels_per_side": 6,
+      "grid_regrid_breakout_mult": 2.0,
+      "grid_regrid_on_profit_cycle": true,
+      "grid_position_size_pct": 0.015,
+      "grid_max_open_slots": 5,
+      "grid_capital_reserve_pct": 0.4,
+      "grid_trend_ma_period": 100,
+      "grid_trend_band_pct": 0.03,
+      "grid_drawdown_stop_pct": 0.10,
+      "grid_cooldown_bars_after_stop": 10,
+      "cash_proxy": "BIL"
+    }
+  },
+  "ensemble_regime_switching": {
+    "name": "Regime-Switching Ensemble",
+    "type": "class",
+    "class_name": "EnsembleRegimeSwitchingStrategy",
+    "description": "ADX regime-switching ensemble combining trend-following and RSI mean-reversion sleeves.",
+    "parameters": {
+      "ensemble_symbol": "SPY",
+      "ensemble_mode": "ensemble",
+      "ensemble_trend_ma_period": 200,
+      "ensemble_adx_period": 14,
+      "ensemble_adx_trend_threshold": 25.0,
+      "ensemble_adx_range_threshold": 20.0,
+      "ensemble_rsi_period": 2,
+      "ensemble_entry_rsi_threshold": 10.0,
+      "ensemble_exit_rsi_threshold": 70.0,
+      "cash_proxy": "BIL"
+    }
+  }
+}

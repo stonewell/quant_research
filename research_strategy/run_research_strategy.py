@@ -1,16 +1,25 @@
 #!/usr/bin/env python
 """CLI Entry Point: Researched Quantitative Trading Strategies Evaluation.
 
-Runs backtests for:
+Evaluates strategies written in plain English or predefined canonical research strategies:
 1. Active Dual Momentum GTAA + Risk Parity (Antonacci 2014, Faber 2007)
 2. Wouter Keller's Bold Asset Allocation BAA-G12 (Keller 2022)
 3. Moreira & Muir Volatility-Managed Portfolios (Moreira & Muir 2017)
+4. Accelerating Dual Momentum (Ludlow & Hanly 2018)
+5. Vigilant Asset Allocation VAA-G4 (Keller & Keuning 2017)
+6. RSI(2) Mean-Reversion (ported from the former rsi_strategy project)
+7. Trend-Pullback Swing (ported from the former swing_trend_strategy project)
+8. ATR-Adaptive Grid (ported from the former grid_trading project)
+9. Regime-Switching Ensemble (ported from the former ensemble_strategy project)
+10. Custom Plain English Strategy descriptions (--description or --description-file)
 
 STRICT TEST POLICY: Runs on synthetic multi-asset price histories (no real market data calls).
 
-Example:
+Examples:
     python run_research_strategy.py --strategy all
-    python run_research_strategy.py --strategy dual_momentum
+    python run_research_strategy.py --config custom_config.json --strategy all
+    python run_research_strategy.py --description "Rebalance monthly. Select top 3 assets from SPY, QQQ, EEM, GLD, TLT with Close > 200d SMA. Rank by 126d return and allocate using 60d inverse volatility."
+    python run_research_strategy.py --description-file strategy.txt
 """
 
 import argparse
@@ -19,24 +28,68 @@ import os
 import sys
 from typing import Dict
 
-# Ensure project root is in sys.path for common and rs imports
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Ensure project root and research_strategy directory are in sys.path
+_RS_ROOT = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_RS_ROOT)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
+if _RS_ROOT not in sys.path:
+    sys.path.insert(0, _RS_ROOT)
 
 import numpy as np
 import pandas as pd
 
 from common.allocation_backtester import run_allocation_backtest
 from common.testing import make_ohlcv_from_closes
-from rs.config import StrategyConfig
+from rs.config import StrategyConfig, load_strategies_config
+from rs.nl_parser import parse_plain_english_strategy
 from rs.strategy import (
+    AcceleratingDualMomentum,
     ActiveDualMomentumRiskParity,
+    AdaptiveGridStrategy,
     BoldAssetAllocation,
+    EnsembleRegimeSwitchingStrategy,
+    NaturalLanguageStrategy,
+    RSIMeanReversionStrategy,
+    SwingTrendPullbackStrategy,
+    VigilantAssetAllocation,
     VolatilityManagedStrategy,
 )
 
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+
+STRATEGY_CLASS_MAP = {
+    "AcceleratingDualMomentum": AcceleratingDualMomentum,
+    "ActiveDualMomentumRiskParity": ActiveDualMomentumRiskParity,
+    "AdaptiveGridStrategy": AdaptiveGridStrategy,
+    "BoldAssetAllocation": BoldAssetAllocation,
+    "EnsembleRegimeSwitchingStrategy": EnsembleRegimeSwitchingStrategy,
+    "NaturalLanguageStrategy": NaturalLanguageStrategy,
+    "RSIMeanReversionStrategy": RSIMeanReversionStrategy,
+    "SwingTrendPullbackStrategy": SwingTrendPullbackStrategy,
+    "VigilantAssetAllocation": VigilantAssetAllocation,
+    "VolatilityManagedStrategy": VolatilityManagedStrategy,
+}
+
+
+def instantiate_strategy_from_config_entry(entry_key: str, entry_data: dict):
+    strat_type = entry_data.get("type", "class")
+    params = entry_data.get("parameters", {})
+    cfg = StrategyConfig.from_dict(params)
+
+    if strat_type == "natural_language":
+        plain_english = entry_data.get("plain_english_description", "")
+        name = entry_data.get("name", entry_key)
+        spec = parse_plain_english_strategy(plain_english, name=name)
+        return NaturalLanguageStrategy(spec, config=cfg)
+    elif strat_type == "class":
+        cls_name = entry_data.get("class_name", "")
+        cls_obj = STRATEGY_CLASS_MAP.get(cls_name)
+        if not cls_obj:
+            raise ValueError(f"Unknown strategy class_name '{cls_name}' for strategy key '{entry_key}'")
+        return cls_obj(config=cfg)
+    else:
+        raise ValueError(f"Unknown strategy type '{strat_type}' for strategy key '{entry_key}'")
 
 
 def generate_synthetic_universe(n_days: int = 1200, seed: int = 42, start: str = "2020-01-01") -> Dict[str, pd.DataFrame]:
@@ -50,27 +103,27 @@ def generate_synthetic_universe(n_days: int = 1200, seed: int = 42, start: str =
     market_vol = 0.01      # ~16% annual vol
     market_returns = rng.normal(market_drift, market_vol, n_days)
 
-    # Add a stress/crash regime in the middle (e.g. days 400-500)
-    market_returns[400:500] = rng.normal(-0.002, 0.025, 100)
+    # Add a stress/crash regime in the middle (e.g. days 400-500), sized to
+    # whatever actually fits in a shorter synthetic run instead of always
+    # assuming a fixed 100-day window is available.
+    crash_start, crash_end = min(400, n_days), min(500, n_days)
+    if crash_end > crash_start:
+        market_returns[crash_start:crash_end] = rng.normal(-0.002, 0.025, crash_end - crash_start)
 
     symbols = [
         "SPY", "QQQ", "IWM", "EFA", "EEM", "GLD", "TLT", "VNQ",
-        "AGG", "TIP", "IEF", "LQD", "DBC", "BIL"
+        "AGG", "TIP", "IEF", "LQD", "DBC", "BIL", "SCZ"
     ]
 
     universe = {}
     for i, sym in enumerate(symbols):
         if sym == "BIL":
-            # Cash proxy: steady small positive return, ultra-low vol
             ret = rng.normal(0.0001, 0.0002, n_days)
         elif sym in ("TLT", "IEF", "AGG", "TIP"):
-            # Treasuries/Bonds: slightly negative correlation to equities during stress
             ret = -0.3 * market_returns + rng.normal(0.0001, 0.005, n_days)
         elif sym == "GLD":
-            # Gold: independent commodity driver
             ret = rng.normal(0.0002, 0.008, n_days)
         else:
-            # Equities / Real Estate: beta * market + idiosyncratic noise
             beta = 0.8 + 0.1 * (i % 4)
             ret = beta * market_returns + rng.normal(0, 0.006, n_days)
 
@@ -82,8 +135,12 @@ def generate_synthetic_universe(n_days: int = 1200, seed: int = 42, start: str =
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Researched Quantitative Trading Strategies CLI Runner")
-    p.add_argument("--strategy", choices=["dual_momentum", "baa_keller", "volatility_managed", "all"],
-                   default="all", help="Strategy implementation to evaluate")
+    p.add_argument("--strategy",
+                   default="all",
+                   help="Strategy key from JSON config to evaluate, or 'all' (default: 'all')")
+    p.add_argument("--config", type=str, default=None, help="Path to custom strategies JSON config file")
+    p.add_argument("--description", type=str, help="Plain English strategy description text")
+    p.add_argument("--description-file", type=str, help="Path to plain English strategy description text file")
     p.add_argument("--n-days", type=int, default=1200, help="Number of synthetic trading days to simulate")
     p.add_argument("--seed", type=int, default=42, help="Random seed for synthetic data generation")
     return p
@@ -97,19 +154,42 @@ def main():
     universe = generate_synthetic_universe(n_days=args.n_days, seed=args.seed)
     print(f"Generated synthetic data for {len(universe)} symbols: {', '.join(universe.keys())}\n")
 
+    loaded_config = load_strategies_config(args.config)
     strategies_to_run = {}
-    if args.strategy in ("dual_momentum", "all"):
-        strategies_to_run["dual_momentum"] = ActiveDualMomentumRiskParity(cfg)
-    if args.strategy in ("baa_keller", "all"):
-        strategies_to_run["baa_keller"] = BoldAssetAllocation(cfg)
-    if args.strategy in ("volatility_managed", "all"):
-        strategies_to_run["volatility_managed"] = VolatilityManagedStrategy(cfg)
+
+    if args.description:
+        spec = parse_plain_english_strategy(args.description)
+        strategies_to_run["custom_plain_english"] = NaturalLanguageStrategy(spec, cfg)
+    elif args.description_file:
+        if not os.path.exists(args.description_file):
+            print(f"Error: Description file '{args.description_file}' not found.")
+            sys.exit(1)
+        with open(args.description_file, "r") as f:
+            desc_text = f.read()
+        spec = parse_plain_english_strategy(desc_text)
+        strategies_to_run["custom_plain_english"] = NaturalLanguageStrategy(spec, cfg)
+    else:
+        if args.strategy == "all":
+            for entry_key, entry_data in loaded_config.items():
+                strategies_to_run[entry_key] = instantiate_strategy_from_config_entry(entry_key, entry_data)
+        elif args.strategy in loaded_config:
+            entry_data = loaded_config[args.strategy]
+            strategies_to_run[args.strategy] = instantiate_strategy_from_config_entry(args.strategy, entry_data)
+        else:
+            print(f"Error: Unknown strategy '{args.strategy}'. Available options in config: {', '.join(loaded_config.keys())}, or 'all'.")
+            sys.exit(1)
 
     report_data = {}
     weights_summary = {}
 
     for strat_name, strat_obj in strategies_to_run.items():
-        print(f"=== Running Strategy: {strat_name} ===")
+        spec_summary = strat_obj.explain_weights()
+        print("=" * 80)
+        print("SECTION 1: PARSED STRATEGY SPECIFICATION")
+        print(spec_summary)
+        print("\nSECTION 2: BACKTEST RESULTS & TARGET WEIGHTS")
+        print("=" * 80)
+
         target_weights = strat_obj.generate_weights(universe)
 
         backtest_res = run_allocation_backtest(
@@ -120,8 +200,6 @@ def main():
             slippage_pct=cfg.slippage_pct
         )
 
-        explanation = strat_obj.explain_weights()
-        print(f"  Logic: {explanation}")
         print(f"  Sharpe Ratio:    {backtest_res['sharpe_ratio']:.2f}")
         print(f"  CAGR:            {backtest_res['cagr'] * 100:.2f}%")
         print(f"  Max Drawdown:    {backtest_res['max_drawdown'] * 100:.2f}%")
@@ -135,8 +213,11 @@ def main():
         print("  Recent Target Weights (Last 3 Rebalances):")
         print((recent_rebal * 100).round(1).astype(str) + "%\n")
 
+        spec = getattr(strat_obj, "spec", None)
         report_data[strat_name] = {
-            "explanation": explanation,
+            "strategy_name": getattr(spec, "strategy_name", type(strat_obj).__name__),
+            "raw_description": getattr(spec, "raw_description", (type(strat_obj).__doc__ or "").strip()),
+            "parsed_summary": spec_summary,
             "sharpe_ratio": float(backtest_res["sharpe_ratio"]),
             "cagr": float(backtest_res["cagr"]),
             "max_drawdown": float(backtest_res["max_drawdown"]),

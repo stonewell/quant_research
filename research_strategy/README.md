@@ -1,6 +1,6 @@
 # Researched Quantitative Trading Strategies (`research_strategy`)
 
-A dedicated side project implementing and evaluating three top-tier quantitative tactical asset allocation (TAA) strategies synthesized from academic literature and practitioner research (*Journal of Finance*, *Journal of Portfolio Management*, SSRN, AllocateSmartly).
+A dedicated side project implementing and evaluating nine quantitative trading strategies: five tactical asset allocation (TAA) strategies synthesized from academic literature and practitioner research (*Journal of Finance*, *Journal of Portfolio Management*, SSRN, AllocateSmartly), plus four single-asset timing strategies consolidated into this project from this workspace's former standalone `rsi_strategy`, `swing_trend_strategy`, `grid_trading`, and `ensemble_strategy` side projects.
 
 ---
 
@@ -51,46 +51,112 @@ A dedicated side project implementing and evaluating three top-tier quantitative
   2. Unallocated weight $(1 - f_{\text{managed}}(t))$ is held in cash proxy (`BIL`).
   3. Eliminates momentum crash tail risk (Barroso & Santa-Clara 2015) by rapidly de-leveraging during market volatility spikes.
 
+### Strategy 4: Accelerating Dual Momentum (ADM)
+* **Academic/Practitioner Grounding**: Chris Ludlow & Steve Hanly (2018, EngineeredPortfolio.com), independently tracked by AllocateSmartly.
+* **Universe**: 4 ETFs -- `SPY`, `SCZ`, and defensive pair `TLT` / `TIP`.
+
+### Strategy 5: Vigilant Asset Allocation (VAA-G4)
+* **Academic Grounding**: Wouter J. Keller & Jan Willem Keuning (2017, SSRN #3002624).
+* **Mechanics**: 13612W momentum score with binary switching between offensive and defensive universes.
+
+### Strategy 6–9: Consolidated Timing Strategies
+* **RSI(2) Mean-Reversion**: Connors-style short-term RSI mean-reversion timing across active symbols.
+* **Trend-Pullback Swing**: Trend-following pullback strategy buying dips in confirmed uptrends.
+* **ATR-Adaptive Grid**: Volatility-scaled grid trading strategy with trend filters and drawdown stop.
+* **Regime-Switching Ensemble**: ADX regime-switching ensemble combining trend-following and RSI mean-reversion.
+
 ---
 
-## 2. Strictly Offline Testing Policy
+## 2. JSON Strategy Configuration (`strategies_config.json`)
+
+All strategy parameters, descriptions, and plain English definitions are defined in `research_strategy/strategies_config.json` instead of being hardcoded.
+
+### Schema
+The configuration supports two strategy entry types:
+1. **Plain English Strategies (`"type": "natural_language"`)**:
+   Uses `"plain_english_description"` parsed dynamically by the Natural Language Strategy Engine (`nl_parser.py`).
+2. **Class-based Strategies (`"type": "class"`)**:
+   Specifies `"class_name"` mapped to python strategy implementations (`rs/strategy.py`).
+
+Example structure:
+```json
+{
+  "dual_momentum": {
+    "name": "Active Dual Momentum GTAA",
+    "type": "natural_language",
+    "plain_english_description": "Rebalance monthly. Risky assets: SPY, QQQ, IWM, EFA, EEM, GLD, TLT, VNQ. Apply absolute trend gate: Close > 200d SMA and 126d ROC > 0. Rank passing assets by 63d and 126d momentum, select top 3 assets, and allocate using 60d inverse volatility risk parity weighting. Assign unallocated capital to cash proxy BIL.",
+    "parameters": {
+      "rebalance_freq_days": 21,
+      "top_k": 3
+    }
+  },
+  "rsi_mean_reversion": {
+    "name": "RSI(2) Mean-Reversion",
+    "type": "class",
+    "class_name": "RSIMeanReversionStrategy",
+    "description": "Connors-style RSI(2) long-only mean-reversion timing strategy.",
+    "parameters": {
+      "rsi_symbol": "SPY",
+      "rsi_period": 2,
+      "rsi_oversold_threshold": 10.0,
+      "rsi_exit_rsi_threshold": 70.0
+    }
+  }
+}
+```
+
+---
+
+## 3. Strictly Offline Testing Policy
 
 **NO REAL MARKET DATA IS FETCHED OR REQUIRED.**
-To ensure fast, reproducible execution across any environment without internet access or API dependencies, all CLI runs and unit tests execute strictly against **synthetic multi-asset OHLCV data** generated via correlated geometric Brownian motion and factor drift models (`common/testing.py`).
+All CLI runs and unit tests execute strictly against **synthetic multi-asset OHLCV data** generated via correlated geometric Brownian motion and factor drift models (`common/testing.py`).
 
 ---
 
-## 3. Directory Structure
+## 4. Directory Structure
 
 ```
 apps/quant/research_strategy/
 ├── rs/
 │   ├── __init__.py
-│   ├── config.py              # StrategyConfig (universes, lookback periods, risk parameters)
-│   └── strategy.py            # Dual Momentum, BAA-G12, and Volatility-Managed implementations
-├── run_research_strategy.py   # CLI runner with synthetic data generator & backtester
+│   ├── config.py              # StrategyConfig & load_strategies_config()
+│   ├── nl_parser.py           # Plain-English strategy description -> ParsedStrategySpec
+│   └── strategy.py            # NaturalLanguageStrategy engine + strategy implementations
+├── strategies_config.json     # Central JSON configuration for all strategies & parameters
+├── run_research_strategy.py   # CLI runner loading strategy configs dynamically
 ├── dashboard.py               # Terminal ASCII report viewer
 ├── tests/
-│   └── test_strategy.py       # Offline unit tests for all strategy mechanics
+│   ├── test_nl_parser.py      # Offline unit tests for the plain-English parser
+│   └── test_strategy.py       # Offline unit tests for all strategies & config loading
 └── README.md                  # Strategy formulations, citations, and guide
 ```
 
 ---
 
-## 4. Usage Guide
+## 5. Usage Guide
 
 ### Running Unit Tests
-Execute unit tests using the workspace virtual environment:
+Execute offline unit tests using the workspace virtual environment:
 ```powershell
 strategy_generator\.venv\Scripts\python.exe -m pytest research_strategy/tests -v
 ```
 
 ### Running CLI Backtests
-Simulate portfolio backtests on synthetic multi-asset data across all strategies:
+Simulate portfolio backtests on synthetic multi-asset data across all strategies loaded from JSON config:
 ```powershell
 strategy_generator\.venv\Scripts\python.exe research_strategy/run_research_strategy.py --strategy all
 ```
-Options for `--strategy`: `dual_momentum`, `baa_keller`, `volatility_managed`, `all`.
+
+Pass a custom JSON configuration file:
+```powershell
+strategy_generator\.venv\Scripts\python.exe research_strategy/run_research_strategy.py --config custom_config.json --strategy all
+```
+
+Evaluate custom plain English strategies via CLI text:
+```powershell
+strategy_generator\.venv\Scripts\python.exe research_strategy/run_research_strategy.py --description "Rebalance monthly. Select top 3 assets from SPY, QQQ, EEM, GLD, TLT with Close > 200d SMA. Rank by 126d return and allocate using 60d inverse volatility."
+```
 
 ### Viewing Terminal Dashboard
 Launch the terminal dashboard to view side-by-side performance summaries and recent target allocations:
@@ -100,7 +166,7 @@ strategy_generator\.venv\Scripts\python.exe research_strategy/dashboard.py
 
 ---
 
-## 5. Key Metrics Reported
+## 6. Key Metrics Reported
 
 * **Sharpe Ratio**: Annualized return per unit of total risk ($R_p / \sigma_p$).
 * **CAGR**: Compound Annual Growth Rate over the simulated period.
