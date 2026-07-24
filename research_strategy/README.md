@@ -52,67 +52,111 @@ A dedicated side project implementing and evaluating nine quantitative trading s
   3. Eliminates momentum crash tail risk (Barroso & Santa-Clara 2015) by rapidly de-leveraging during market volatility spikes.
 
 ### Strategy 4: Accelerating Dual Momentum (ADM)
-* **Academic/Practitioner Grounding**: Chris Ludlow & Steve Hanly (2018, EngineeredPortfolio.com), independently tracked by AllocateSmartly (ranked 5th most popular TAA strategy by member allocation as of this research).
-* **Universe**: exactly 4 ETFs -- `SPY` (US large-cap), `SCZ` (international small-cap equities), and a defensive pair `TLT` (20+yr Treasuries) / `TIP` (TIPS).
-* **Mathematical Mechanics**:
-  1. **Momentum Score**: for `SPY` and `SCZ`, $Score_i(t) = \frac{1}{3}\left(ROC_{21,i}(t) + ROC_{63,i}(t) + ROC_{126,i}(t)\right)$ -- the simple average of trailing 1/3/6-month total returns.
-  2. **Binary Switch**: if $Score_{SPY} > Score_{SCZ}$ and $Score_{SPY} > 0$, hold 100% `SPY`. Elif $Score_{SCZ} > Score_{SPY}$ and $Score_{SCZ} > 0$, hold 100% `SCZ`.
-  3. **Defensive Fallback**: if neither equity sleeve has positive relative+absolute momentum, hold 100% of whichever of `TLT`/`TIP` has the higher trailing 1-month ($ROC_{21}$) return.
-  4. Fully concentrated, single-asset holding -- no partial or cash allocation is part of the published rule.
-* **Caveat**: AllocateSmartly explicitly characterizes ADM as an especially aggressive strategy with the highest annualized volatility of any strategy they track -- a known characteristic of this fully-concentrated design, not a defect.
+* **Academic/Practitioner Grounding**: Chris Ludlow & Steve Hanly (2018, EngineeredPortfolio.com), independently tracked by AllocateSmartly.
+* **Universe**: 4 ETFs -- `SPY`, `SCZ`, and defensive pair `TLT` / `TIP`.
 
 ### Strategy 5: Vigilant Asset Allocation (VAA-G4)
-* **Academic Grounding**: Wouter J. Keller & Jan Willem Keuning (2017, SSRN #3002624, "Breadth Momentum and Vigilant Asset Allocation (VAA): Winning More by Losing Less"). This project implements the aggressive, fully-concentrated **G4 (T=1/B=1)** variant the authors recommend, not the diversified Balanced/G12 variant.
-* **Mathematical Mechanics**:
-  1. **13612W Momentum Score**: $Score_i(t) = 12\cdot(p_0/p_1 - 1) + 4\cdot(p_0/p_3 - 1) + 2\cdot(p_0/p_6 - 1) + 1\cdot(p_0/p_{12} - 1)$, a 12/4/2/1-weighted blend of 1/3/6/12-month returns (implemented as $ROC_{21}$/$ROC_{63}$/$ROC_{126}$/$ROC_{252}$ trading days).
-  2. **Binary Switch**: if **every** offensive-universe asset has a positive score, hold 100% of the single highest-scoring offensive asset. Otherwise (any offensive asset's score is non-positive), hold 100% of the single highest-scoring defensive asset.
-  3. Fully concentrated, single-asset holding, no diversification within the chosen sleeve -- this is what distinguishes G4 from the Balanced/G12 variant.
-* **CAVEAT -- disputed universe**: Keller & Keuning's own published offensive/defensive ticker list could **not** be confirmed with high confidence. Two different candidate universes attributed to the paper by secondary sources were each independently checked and refuted during research for this project. `StrategyConfig.vaa_offensive_universe`/`vaa_defensive_universe` (default: offensive `SPY, QQQ, EFA, EEM`; defensive `IEF, BIL`) are **illustrative defaults only**, not a verified reproduction of the original paper's universe -- substitute your own before treating results as a paper replication. The 13612W formula and binary switching logic above are independently well-verified and unaffected by this caveat.
+* **Academic Grounding**: Wouter J. Keller & Jan Willem Keuning (2017, SSRN #3002624).
+* **Mechanics**: 13612W momentum score with binary switching between offensive and defensive universes.
+
+### Strategy 6–9: Consolidated Timing Strategies
+* **RSI(2) Mean-Reversion**: Connors-style short-term RSI mean-reversion timing across active symbols.
+* **Trend-Pullback Swing**: Trend-following pullback strategy buying dips in confirmed uptrends.
+* **ATR-Adaptive Grid**: Volatility-scaled grid trading strategy with trend filters and drawdown stop.
+* **Regime-Switching Ensemble**: ADX regime-switching ensemble combining trend-following and RSI mean-reversion.
 
 ---
 
-## 2. Strictly Offline Testing Policy
+## 2. JSON Strategy Configuration (`strategies_config.json`)
+
+All strategy parameters, descriptions, and plain English definitions are defined in `research_strategy/strategies_config.json` instead of being hardcoded.
+
+### Schema
+The configuration supports two strategy entry types:
+1. **Plain English Strategies (`"type": "natural_language"`)**:
+   Uses `"plain_english_description"` parsed dynamically by the Natural Language Strategy Engine (`nl_parser.py`).
+2. **Class-based Strategies (`"type": "class"`)**:
+   Specifies `"class_name"` mapped to python strategy implementations (`rs/strategy.py`).
+
+Example structure:
+```json
+{
+  "dual_momentum": {
+    "name": "Active Dual Momentum GTAA",
+    "type": "natural_language",
+    "plain_english_description": "Rebalance monthly. Risky assets: SPY, QQQ, IWM, EFA, EEM, GLD, TLT, VNQ. Apply absolute trend gate: Close > 200d SMA and 126d ROC > 0. Rank passing assets by 63d and 126d momentum, select top 3 assets, and allocate using 60d inverse volatility risk parity weighting. Assign unallocated capital to cash proxy BIL.",
+    "parameters": {
+      "rebalance_freq_days": 21,
+      "top_k": 3
+    }
+  },
+  "rsi_mean_reversion": {
+    "name": "RSI(2) Mean-Reversion",
+    "type": "class",
+    "class_name": "RSIMeanReversionStrategy",
+    "description": "Connors-style RSI(2) long-only mean-reversion timing strategy.",
+    "parameters": {
+      "rsi_symbol": "SPY",
+      "rsi_period": 2,
+      "rsi_oversold_threshold": 10.0,
+      "rsi_exit_rsi_threshold": 70.0
+    }
+  }
+}
+```
+
+---
+
+## 3. Strictly Offline Testing Policy
 
 **NO REAL MARKET DATA IS FETCHED OR REQUIRED.**
-To ensure fast, reproducible execution across any environment without internet access or API dependencies, all CLI runs and unit tests execute strictly against **synthetic multi-asset OHLCV data** generated via correlated geometric Brownian motion and factor drift models (`common/testing.py`).
+All CLI runs and unit tests execute strictly against **synthetic multi-asset OHLCV data** generated via correlated geometric Brownian motion and factor drift models (`common/testing.py`).
 
 ---
 
-## 3. Directory Structure
+## 4. Directory Structure
 
 ```
 apps/quant/research_strategy/
 ├── rs/
 │   ├── __init__.py
-│   ├── config.py              # StrategyConfig (universes, lookback periods, risk parameters)
+│   ├── config.py              # StrategyConfig & load_strategies_config()
 │   ├── nl_parser.py           # Plain-English strategy description -> ParsedStrategySpec
-│   └── strategy.py            # NaturalLanguageStrategy engine + all 5 strategy implementations
-├── run_research_strategy.py   # CLI runner with synthetic data generator & backtester
+│   └── strategy.py            # NaturalLanguageStrategy engine + strategy implementations
+├── strategies_config.json     # Central JSON configuration for all strategies & parameters
+├── run_research_strategy.py   # CLI runner loading strategy configs dynamically
 ├── dashboard.py               # Terminal ASCII report viewer
 ├── tests/
 │   ├── test_nl_parser.py      # Offline unit tests for the plain-English parser
-│   └── test_strategy.py       # Offline unit tests for all strategy mechanics
+│   └── test_strategy.py       # Offline unit tests for all strategies & config loading
 └── README.md                  # Strategy formulations, citations, and guide
 ```
 
 ---
 
-## 4. Usage Guide
+## 5. Usage Guide
 
 ### Running Unit Tests
-Execute unit tests using the workspace virtual environment:
+Execute offline unit tests using the workspace virtual environment:
 ```powershell
 strategy_generator\.venv\Scripts\python.exe -m pytest research_strategy/tests -v
 ```
 
 ### Running CLI Backtests
-Simulate portfolio backtests on synthetic multi-asset data across all strategies:
+Simulate portfolio backtests on synthetic multi-asset data across all strategies loaded from JSON config:
 ```powershell
 strategy_generator\.venv\Scripts\python.exe research_strategy/run_research_strategy.py --strategy all
 ```
-Options for `--strategy`: `dual_momentum`, `baa_keller`, `volatility_managed`, `accelerating_dual_momentum`, `vigilant_asset_allocation`, `all`.
 
-You can also evaluate a strategy written in plain English instead of a preset, via the `NaturalLanguageStrategy` engine (`--description`/`--description-file`; see `rs/nl_parser.py`). This path currently covers the equal-weight/inverse-volatility/volatility-managed/canary-switch mechanics behind Strategies 1-3; ADM and VAA (Strategies 4-5) are standalone classes not yet expressible through the parser.
+Pass a custom JSON configuration file:
+```powershell
+strategy_generator\.venv\Scripts\python.exe research_strategy/run_research_strategy.py --config custom_config.json --strategy all
+```
+
+Evaluate custom plain English strategies via CLI text:
+```powershell
+strategy_generator\.venv\Scripts\python.exe research_strategy/run_research_strategy.py --description "Rebalance monthly. Select top 3 assets from SPY, QQQ, EEM, GLD, TLT with Close > 200d SMA. Rank by 126d return and allocate using 60d inverse volatility."
+```
 
 ### Viewing Terminal Dashboard
 Launch the terminal dashboard to view side-by-side performance summaries and recent target allocations:
@@ -122,7 +166,7 @@ strategy_generator\.venv\Scripts\python.exe research_strategy/dashboard.py
 
 ---
 
-## 5. Key Metrics Reported
+## 6. Key Metrics Reported
 
 * **Sharpe Ratio**: Annualized return per unit of total risk ($R_p / \sigma_p$).
 * **CAGR**: Compound Annual Growth Rate over the simulated period.

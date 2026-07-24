@@ -15,7 +15,9 @@ Grounding:
    intrabar-aware backtester).
 """
 
-from dataclasses import dataclass, field
+import json
+import os
+from dataclasses import dataclass, field, fields
 from typing import List, Optional
 
 DEFAULT_RISKY_UNIVERSE = ["SPY", "QQQ", "IWM", "EFA", "EEM", "GLD", "TLT", "VNQ"]
@@ -165,3 +167,23 @@ class StrategyConfig:
     initial_capital: float = 100_000.0
     commission_pct: float = 0.0005          # 5 bps
     slippage_pct: float = 0.0005            # 5 bps
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "StrategyConfig":
+        """Instantiates StrategyConfig from a dictionary, keeping only valid dataclass fields."""
+        valid_fields = {f.name for f in fields(cls)}
+        filtered = {k: v for k, v in data.items() if k in valid_fields}
+        return cls(**filtered)
+
+
+def load_strategies_config(json_path: Optional[str] = None) -> dict:
+    """Loads the strategy configuration JSON file.
+    Defaults to research_strategy/strategies_config.json if json_path is not specified.
+    """
+    if json_path is None:
+        json_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "strategies_config.json")
+    if not os.path.exists(json_path):
+        raise FileNotFoundError(f"Strategy config file not found at '{json_path}'.")
+    with open(json_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+

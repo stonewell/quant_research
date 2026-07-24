@@ -20,7 +20,8 @@ from common.testing import (
     make_oscillating_df,
     make_trending_pullback_df,
 )
-from research_strategy.rs.config import StrategyConfig
+from research_strategy.rs.config import StrategyConfig, load_strategies_config
+from research_strategy.run_research_strategy import instantiate_strategy_from_config_entry
 from research_strategy.rs.strategy import (
     AcceleratingDualMomentum,
     ActiveDualMomentumRiskParity,
@@ -312,6 +313,35 @@ def test_vaa_warmup_bars():
     assert VigilantAssetAllocation().warmup_bars() == 252
 
 
+# --- Regression: default `<x>_symbol` must not silently expand to the full
+# --- multi-asset universe (see _get_risky_symbols) -----------------------
+
+def test_default_config_trades_only_spy_even_with_a_full_multi_symbol_universe_present():
+    # Regression test: `_get_risky_symbols` used to special-case the literal
+    # string "SPY" as meaning "not customized", so ANY config leaving
+    # `<x>_symbol` at its default (or explicitly set to "SPY", the shipped
+    # default in strategies_config.json for every one of these four
+    # strategies) would silently expand to the full `risky_universe` instead
+    # of trading just SPY. `create_mock_universe` intentionally contains all
+    # of DEFAULT_RISKY_UNIVERSE plus extras -- exactly the shape of universe
+    # the real CLI builds, where the bug was only ever visible (every other
+    # test here uses a minimal 2-symbol universe that masked it).
+    universe = create_mock_universe(n_days=300)
+
+    for strat in (
+        RSIMeanReversionStrategy(StrategyConfig(rsi_require_trend_filter=False, rsi_oversold_threshold=90)),
+        SwingTrendPullbackStrategy(StrategyConfig(swing_require_rising_trend_ma=False, swing_entry_rsi_threshold=90)),
+        AdaptiveGridStrategy(),
+        EnsembleRegimeSwitchingStrategy(StrategyConfig(ensemble_mode="trend_only")),
+    ):
+        weights = strat.generate_weights(universe)
+        daily = _daily(weights)
+        other_symbols = [s for s in universe if s not in ("SPY", "BIL")]
+        assert not (daily[other_symbols] > 0).any().any(), (
+            f"{type(strat).__name__} with default config traded a non-SPY symbol"
+        )
+
+
 # --- RSIMeanReversionStrategy -------------------------------------------
 
 def test_rsi_trend_filter_blocks_entries_in_a_sustained_downtrend():
@@ -395,7 +425,9 @@ def test_rsi_multi_asset_allocates_across_qualifying_symbols():
     }
     cfg = StrategyConfig(rsi_require_trend_filter=False, rsi_oversold_threshold=30)
     strat = RSIMeanReversionStrategy(cfg)
-    weights = strat.generate_weights(universe)
+    # rsi_symbol defaults to "SPY", which is now correctly honored as "trade
+    # just SPY" -- multi-asset evaluation is an explicit opt-in via params.
+    weights = strat.generate_weights(universe, params={"symbols": ["SPY", "QQQ"]})
     daily = _daily(weights)
 
     assert "SPY" in daily.columns
@@ -503,7 +535,9 @@ def test_swing_multi_asset_normalizes_weights_when_multiple_symbols_trigger():
     }
     cfg = StrategyConfig(swing_position_size_pct=1.0)
     strat = SwingTrendPullbackStrategy(cfg)
-    weights = strat.generate_weights(universe)
+    # swing_symbol defaults to "SPY", now correctly honored as "trade just
+    # SPY" -- multi-asset evaluation is an explicit opt-in via params.
+    weights = strat.generate_weights(universe, params={"symbols": ["SPY", "QQQ"]})
     daily = _daily(weights)
 
     assert "SPY" in daily.columns
@@ -570,7 +604,9 @@ def test_grid_multi_asset_deploys_grids_across_multiple_symbols():
         "BIL": make_ohlcv_from_closes([100.0] * 500, start=str(df1.index[0].date())),
     }
     strat = AdaptiveGridStrategy()
-    weights = strat.generate_weights(universe)
+    # grid_symbol defaults to "SPY", now correctly honored as "trade just
+    # SPY" -- multi-asset evaluation is an explicit opt-in via params.
+    weights = strat.generate_weights(universe, params={"symbols": ["SPY", "QQQ"]})
     daily = _daily(weights)
 
     assert "SPY" in daily.columns
@@ -633,10 +669,54 @@ def test_ensemble_multi_asset_equal_weights_trending_symbols():
     }
     cfg = StrategyConfig(ensemble_mode="trend_only", ensemble_trend_ma_period=200)
     strat = EnsembleRegimeSwitchingStrategy(cfg)
-    weights = strat.generate_weights(universe)
+    # ensemble_symbol defaults to "SPY", now correctly honored as "trade just
+    # SPY" -- multi-asset evaluation is an explicit opt-in via params.
+    weights = strat.generate_weights(universe, params={"symbols": ["SPY", "QQQ"]})
     daily = _daily(weights)
 
     both_active = (daily["SPY"] > 0) & (daily["QQQ"] > 0)
     if both_active.any():
         np.testing.assert_allclose(daily.loc[both_active, "SPY"], 0.5)
         np.testing.assert_allclose(daily.loc[both_active, "QQQ"], 0.5)
+
+
+def test_load_strategies_config_default():
+    config = load_strategies_config()
+    assert isinstance(config, dict)
+    assert "dual_momentum" in config
+    assert "baa_keller" in config
+    assert "volatility_managed" in config
+    assert "rsi_mean_reversion" in config
+    assert "accelerating_dual_momentum" in config
+
+
+def test_strategy_config_from_dict():
+    params = {
+        "rebalance_freq_days": 10,
+        "top_k": 2,
+        "non_existent_param": 999
+    }
+    cfg = StrategyConfig.from_dict(params)
+    assert cfg.rebalance_freq_days == 10
+    assert cfg.top_k == 2
+    assert not hasattr(cfg, "non_existent_param")
+
+
+def test_instantiate_strategies_from_json_config():
+    config = load_strategies_config()
+    for key, entry in config.items():
+        strat = instantiate_strategy_from_config_entry(key, entry)
+        assert strat is not None
+        assert hasattr(strat, "generate_weights")
+        assert hasattr(strat, "explain_weights")
+
+
+def test_run_strategy_from_json_config():
+    config = load_strategies_config()
+    universe = create_mock_universe(n_days=300)
+    dual_mom_entry = config["dual_momentum"]
+    strat = instantiate_strategy_from_config_entry("dual_momentum", dual_mom_entry)
+    weights = strat.generate_weights(universe)
+    assert not weights.empty
+    assert "SPY" in weights.columns
+

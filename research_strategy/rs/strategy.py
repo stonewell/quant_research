@@ -83,7 +83,21 @@ def _get_risky_symbols(
     cfg_risky_universe: List[str],
     cash_proxy: str,
 ) -> List[str]:
-    """Helper to determine the list of risky symbols to evaluate for timing strategies."""
+    """Helper to determine the list of risky symbols to evaluate for timing strategies.
+
+    Precedence: an explicit per-call override via `params` ("symbol" for a
+    single ticker, "symbols"/"risky_universe" for a list) always wins.
+    Absent any override, the strategy's own configured `<x>_symbol` is
+    authoritative for single-symbol trading -- e.g. `RSIMeanReversionStrategy()`
+    with zero params trades just "SPY" (matching the original single-asset
+    project this was ported from), because `cfg_symbol` is honored whenever
+    it's set, NOT treated as a "still at its default" sentinel just because
+    it happens to equal the field's own default value. (A prior version
+    special-cased the literal string "SPY" as meaning "unset" -- which broke
+    every config that named SPY, including the shipped defaults, since a
+    string can't distinguish "left at default" from "explicitly chosen".)
+    Only when `cfg_symbol` itself is empty/None does this fall back to the
+    shared multi-asset `risky_universe` for genuine multi-symbol evaluation."""
     p = params or {}
     if "symbol" in p and p["symbol"]:
         sym = p["symbol"]
@@ -93,7 +107,7 @@ def _get_risky_symbols(
     if "risky_universe" in p and p["risky_universe"]:
         return [s for s in p["risky_universe"] if s in universe and s != cash_proxy]
 
-    if cfg_symbol and cfg_symbol not in ("SPY", ""):
+    if cfg_symbol:
         return [cfg_symbol] if cfg_symbol in universe else []
 
     candidates = [s for s in cfg_risky_universe if s in universe and s != cash_proxy]
