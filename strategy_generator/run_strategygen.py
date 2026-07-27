@@ -11,10 +11,16 @@ Example:
 
 import argparse
 import os
+import sys
+
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 import numpy as np
 import pandas as pd
 
+from common.universe import add_universe_cli_args, resolve_universe_from_args
 from stratgen.data import load_ohlcv
 from stratgen.generator import GeneratorConfig, StrategyGenerator
 
@@ -23,9 +29,7 @@ RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results"
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Basket Asset Allocation Strategy Generator")
-    group = p.add_mutually_exclusive_group()
-    group.add_argument("--universe", nargs="+", default=["SPY", "QQQ"], help="List of symbols to trade")
-    group.add_argument("--universe-file", help="Path to a JSON file containing the universe basket, exported by the instrument selection tool")
+    add_universe_cli_args(p, default_universe=["SPY", "QQQ"])
     p.add_argument("--start", default="2015-01-01")
     p.add_argument("--end", default="2024-12-31")
     p.add_argument("--interval", default="1d")
@@ -33,6 +37,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-random-search", type=int, default=200)
     p.add_argument("--ers-percentile-threshold", type=float, default=0.90)
     p.add_argument("--min-rebalances-for-trust", type=int, default=4)
+    p.add_argument("--data-provider", default="yfinance",
+                   help="Market data source provider ('yfinance', 'csv', 'synthetic', or custom module specifier string e.g. 'script.py:CustomProvider')")
+    p.add_argument("--data-dir", type=str, default=None,
+                   help="Folder path for CSV data provider")
     p.add_argument("--no-cache", action="store_true")
     return p
 
@@ -45,21 +53,18 @@ def main():
         min_rebalances_for_trust=args.min_rebalances_for_trust,
     )
 
-    if args.universe_file:
-        import json
-        with open(args.universe_file, "r") as f:
-            basket_data = json.load(f)
-        universe_symbols = basket_data.get("basket", [])
-        if not universe_symbols:
-            raise ValueError(f"No 'basket' array found in {args.universe_file}")
-        print(f"Loaded {len(universe_symbols)} symbols from {args.universe_file} (method: {basket_data.get('method', 'unknown')})")
-    else:
-        universe_symbols = args.universe
+    universe_symbols = resolve_universe_from_args(args, default_symbols=["SPY", "QQQ"])
+    if not universe_symbols:
+        raise ValueError("Resolved universe symbol list is empty.")
+
+    data_kwargs = {"provider": args.data_provider}
+    if args.data_dir:
+        data_kwargs["folder_path"] = args.data_dir
 
     universe = {}
     for symbol in universe_symbols:
         print(f"Loading {symbol} ...")
-        universe[symbol] = load_ohlcv(symbol, args.start, args.end, args.interval, use_cache=not args.no_cache)
+        universe[symbol] = load_ohlcv(symbol, args.start, args.end, args.interval, use_cache=not args.no_cache, **data_kwargs)
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
 

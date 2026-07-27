@@ -120,7 +120,9 @@ def parse_plain_english_strategy(description: str, name: Optional[str] = None) -
 
     # Determine strategy name
     if not name:
-        if "baa" in text_lower or "bold asset" in text_lower or "keller" in text_lower or "canary" in text_lower:
+        if "turtle" in text_lower or "donchian" in text_lower or "channel breakout" in text_lower:
+            name = "Turtle Channel Breakout (Parsed)"
+        elif "baa" in text_lower or "bold asset" in text_lower or "keller" in text_lower or "canary" in text_lower:
             name = "Bold Asset Allocation (Parsed)"
         elif "volatility-managed" in text_lower or "volatility managed" in text_lower or "moreira" in text_lower:
             name = "Volatility-Managed Strategy (Parsed)"

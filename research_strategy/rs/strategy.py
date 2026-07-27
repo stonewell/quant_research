@@ -925,3 +925,140 @@ class EnsembleRegimeSwitchingStrategy:
             p.get("ensemble_adx_period", cfg.ensemble_adx_period),
             p.get("ensemble_rsi_period", cfg.ensemble_rsi_period),
         ) + 1
+
+
+class TurtleBreakoutStrategy:
+    """Classic Turtle Channel Breakout Strategy (Dennis & Eckhardt / Donchian).
+
+    Supports System 1 (20-day entry / 10-day exit) and System 2 (55-day entry / 20-day exit)
+    with 2N ATR trailing stop, optional 200d SMA trend filter, and inverse ATR risk weighting.
+    """
+
+    def __init__(self, config: StrategyConfig = None):
+        self.config = config or StrategyConfig()
+
+    def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
+        cfg = self.config
+        p = params or {}
+        cash_proxy = p.get("cash_proxy", cfg.cash_proxy)
+        entry_breakout_days = p.get("turtle_entry_breakout_days", cfg.turtle_entry_breakout_days)
+        exit_breakout_days = p.get("turtle_exit_breakout_days", cfg.turtle_exit_breakout_days)
+        atr_period = p.get("turtle_atr_period", cfg.turtle_atr_period)
+        atr_stop_mult = p.get("turtle_atr_stop_mult", cfg.turtle_atr_stop_mult)
+        require_trend_filter = p.get("turtle_require_trend_filter", cfg.turtle_require_trend_filter)
+        trend_ma_period = p.get("turtle_trend_ma_period", cfg.turtle_trend_ma_period)
+        position_sizing_mode = p.get("turtle_position_sizing_mode", cfg.turtle_position_sizing_mode)
+
+        symbols = list(universe.keys())
+        risky_symbols = _get_risky_symbols(universe, params, cfg.turtle_symbol, cfg.risky_universe, cash_proxy)
+        if not risky_symbols:
+            return pd.DataFrame()
+
+        master_index = universe[risky_symbols[0]].index
+        n_bars = len(master_index)
+
+        active_mask = {sym: np.zeros(n_bars, dtype=bool) for sym in risky_symbols}
+        vol_weights = {sym: np.zeros(n_bars, dtype=float) for sym in risky_symbols}
+
+        for sym in risky_symbols:
+            df = universe[sym]
+            close = df["Close"]
+            high = df["High"]
+            low = df["Low"]
+
+            atr_series = atr(df, atr_period)
+            trend_ma = sma(close, trend_ma_period) if require_trend_filter else None
+
+            donchian_high = high.shift(1).rolling(entry_breakout_days).max()
+            donchian_low = low.shift(1).rolling(exit_breakout_days).min()
+
+            in_position = False
+            peak_price = 0.0
+
+            for i in range(n_bars):
+                c = close.iloc[i]
+                a = atr_series.iloc[i]
+
+                if pd.isna(c) or c <= 0 or pd.isna(a) or a <= 0:
+                    in_position = False
+                    continue
+
+                ma = trend_ma.iloc[i] if require_trend_filter else None
+                if require_trend_filter and pd.isna(ma):
+                    in_position = False
+                    continue
+
+                # donchian_high/donchian_low are already shift(1)'d before the
+                # rolling window (built from bars before i, never bar i
+                # itself), so comparing them against bar i's OWN close here
+                # is the full and correct amount of lag -- matching the
+                # README's documented formula (Close(t) vs. the channel
+                # through t-1) and every sibling strategy in this file
+                # (RSI/Swing/Grid/Ensemble all decide day i's state from day
+                # i's own already-lagged indicators). Using [i-1] values here
+                # on top of that would double the lag, delaying entries,
+                # exits, and stops by a full extra trading day.
+                dh = donchian_high.iloc[i]
+                dl = donchian_low.iloc[i]
+
+                if in_position:
+                    peak_price = max(peak_price, high.iloc[i])
+                    stop_price = peak_price - atr_stop_mult * a
+                    donchian_exit = pd.notna(dl) and c < dl
+                    atr_exit = c < stop_price
+
+                    if donchian_exit or atr_exit:
+                        in_position = False
+                else:
+                    entry_breakout = pd.notna(dh) and c > dh
+                    trend_ok = (not require_trend_filter) or (pd.notna(ma) and c > ma)
+                    if entry_breakout and trend_ok:
+                        in_position = True
+                        peak_price = high.iloc[i]
+
+                active_mask[sym][i] = in_position
+                vol_weights[sym][i] = (c / a) if (in_position and a > 0) else 0.0
+
+        daily_weights = pd.DataFrame(index=master_index)
+
+        if position_sizing_mode == "inverse_atr":
+            vol_df = pd.DataFrame(vol_weights, index=master_index)
+            sum_vol = vol_df.sum(axis=1)
+            scale = np.where(sum_vol > 0, 1.0 / np.maximum(1.0, sum_vol), 0.0)
+            daily_weights = vol_df.mul(scale, axis=0)
+        else:
+            mask_df = pd.DataFrame(active_mask, index=master_index).astype(float)
+            sum_active = mask_df.sum(axis=1)
+            scale = np.where(sum_active > 0, 1.0 / np.maximum(1.0, sum_active), 0.0)
+            daily_weights = mask_df.mul(scale, axis=0)
+
+        if cash_proxy in symbols:
+            daily_weights[cash_proxy] = np.maximum(0.0, 1.0 - daily_weights.sum(axis=1))
+
+        daily_weights = _fill_out_columns(daily_weights, symbols)
+        return _sparse_from_daily(daily_weights)
+
+    def explain_weights(self, params: dict = None) -> str:
+        cfg = self.config
+        p = params or {}
+        entry_days = p.get("turtle_entry_breakout_days", cfg.turtle_entry_breakout_days)
+        exit_days = p.get("turtle_exit_breakout_days", cfg.turtle_exit_breakout_days)
+        stop_mult = p.get("turtle_atr_stop_mult", cfg.turtle_atr_stop_mult)
+        tf = p.get("turtle_require_trend_filter", cfg.turtle_require_trend_filter)
+        ma_period = p.get("turtle_trend_ma_period", cfg.turtle_trend_ma_period)
+        tf_str = f"with {ma_period}d SMA trend filter" if tf else "without trend filter"
+        return (
+            f"Turtle Channel Breakout (multi-asset timing, {entry_days}d entry / {exit_days}d exit): "
+            f"buys Donchian high breakouts {tf_str}. Exits on {exit_days}d Donchian low or "
+            f"{stop_mult}N ATR trailing stop. Positions sized by inverse volatility."
+        )
+
+    def warmup_bars(self, params: dict = None) -> int:
+        cfg = self.config
+        p = params or {}
+        entry_days = p.get("turtle_entry_breakout_days", cfg.turtle_entry_breakout_days)
+        exit_days = p.get("turtle_exit_breakout_days", cfg.turtle_exit_breakout_days)
+        atr_period = p.get("turtle_atr_period", cfg.turtle_atr_period)
+        ma_period = p.get("turtle_trend_ma_period", cfg.turtle_trend_ma_period) if p.get("turtle_require_trend_filter", cfg.turtle_require_trend_filter) else 0
+        return max(entry_days, exit_days, atr_period, ma_period) + 1
+

@@ -1,84 +1,350 @@
-"""Shared historical OHLCV data loading with local CSV caching, used across
-every project in this workspace. Each project's own `data.py` is a thin
-wrapper that pins `cache_dir` to that project's own `data/` folder, so the
-per-project cache layout and call signatures (`load_ohlcv(symbol, start, end,
-interval, use_cache)`, no `cache_dir` argument) are unchanged for callers.
+"""Shared historical OHLCV data loading with extensible data provider interface and
+local CSV caching, used across every project in this workspace.
 """
 
+from abc import ABC, abstractmethod
+import hashlib
+import importlib
+import importlib.util
 import os
+import sys
+from typing import Dict, List, Optional, Type, Union
 import warnings
 
+import numpy as np
 import pandas as pd
 import yfinance as yf
 
 
-def load_ohlcv(symbol: str, start: str, end: str, interval: str = "1d", use_cache: bool = True,
-               cache_dir: str = None) -> pd.DataFrame:
-    """Download (or load cached) OHLCV data for symbol between start and end.
+class BaseDataProvider(ABC):
+    """Abstract base class for all market data providers."""
 
-    Uses auto_adjust=True so Close is dividend/split-adjusted (a reasonable
-    approximation of total return for a long-only backtest). If `cache_dir`
-    is None, caching is skipped entirely (always downloads fresh).
-    """
-    cache_path = None
-    if cache_dir:
-        os.makedirs(cache_dir, exist_ok=True)
-        cache_path = os.path.join(cache_dir, f"{symbol}_{interval}_{start}_{end}.csv")
+    @abstractmethod
+    def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+        """Fetch OHLCV data for a single symbol. Must return DataFrame with DatetimeIndex
+        and columns ['Open', 'High', 'Low', 'Close', 'Volume'].
+        """
+        pass
 
-    if use_cache and cache_path and os.path.exists(cache_path):
-        df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
-    else:
+    def fetch_universe(self, symbols: List[str], start: str, end: str, interval: str = "1d") -> Dict[str, pd.DataFrame]:
+        """Fetch OHLCV for each symbol in symbols list. Skips failing symbols with warnings."""
+        data = {}
+        for symbol in symbols:
+            try:
+                data[symbol] = self.fetch_ohlcv(symbol, start, end, interval)
+            except Exception as exc:
+                warnings.warn(f"Skipping {symbol}: {exc}")
+        return data
+
+    def fetch_metadata(self, symbol: str) -> dict:
+        """Best-effort metadata lookup returning {'expense_ratio': float, 'total_assets': float}."""
+        return {"expense_ratio": float("nan"), "total_assets": float("nan")}
+
+
+class YFinanceDataProvider(BaseDataProvider):
+    """Data provider sourcing OHLCV and fund metadata from Yahoo Finance via yfinance."""
+
+    def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
         df = yf.download(symbol, start=start, end=end, interval=interval, auto_adjust=True, progress=False)
         if df.empty:
             raise ValueError(f"No data returned for {symbol} between {start} and {end}")
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df = df[["Open", "High", "Low", "Close", "Volume"]]
-        if cache_path:
-            df.to_csv(cache_path)
+        df.index = pd.to_datetime(df.index)
+        df = df.dropna(subset=["Open", "High", "Low", "Close"])
+        return df
 
-    df.index = pd.to_datetime(df.index)
-    df = df.dropna(subset=["Open", "High", "Low", "Close"])
-    return df
+    def fetch_metadata(self, symbol: str) -> dict:
+        expense_ratio, total_assets = float("nan"), float("nan")
+        try:
+            info = yf.Ticker(symbol).info
+        except Exception:
+            return {"expense_ratio": expense_ratio, "total_assets": total_assets}
+
+        for key in ("netExpenseRatio", "annualReportExpenseRatio", "expenseRatio"):
+            value = info.get(key)
+            if value is not None:
+                expense_ratio = float(value)
+                break
+
+        for key in ("totalAssets", "netAssets"):
+            value = info.get(key)
+            if value is not None:
+                total_assets = float(value)
+                break
+
+        return {"expense_ratio": expense_ratio, "total_assets": total_assets}
+
+
+class CSVFolderDataProvider(BaseDataProvider):
+    """Data provider reading historical CSV files from a specified folder."""
+
+    def __init__(self, folder_path: str = "data"):
+        self.folder_path = folder_path
+
+    def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+        candidates = [
+            os.path.join(self.folder_path, f"{symbol}.csv"),
+            os.path.join(self.folder_path, f"{symbol}_{interval}.csv"),
+            os.path.join(self.folder_path, f"{symbol}_{interval}_{start}_{end}.csv"),
+        ]
+        found_path = None
+        for path in candidates:
+            if os.path.exists(path):
+                found_path = path
+                break
+
+        if not found_path:
+            raise FileNotFoundError(f"No CSV file found for symbol '{symbol}' in folder '{self.folder_path}'")
+
+        df = pd.read_csv(found_path, index_col=0, parse_dates=True)
+        req_cols = ["Open", "High", "Low", "Close", "Volume"]
+        for col in req_cols:
+            if col not in df.columns:
+                raise ValueError(f"CSV file '{found_path}' missing required column '{col}'")
+
+        df = df[req_cols]
+        df.index = pd.to_datetime(df.index)
+        if start:
+            df = df[df.index >= pd.to_datetime(start)]
+        if end:
+            df = df[df.index <= pd.to_datetime(end)]
+
+        if df.empty:
+            raise ValueError(f"CSV data for {symbol} is empty between {start} and {end}")
+
+        return df.dropna(subset=["Open", "High", "Low", "Close"])
+
+
+class SyntheticDataProvider(BaseDataProvider):
+    """Data provider generating synthetic geometric Brownian motion OHLCV data."""
+
+    def __init__(self, seed: int = 42, drift: float = 0.0003, vol: float = 0.01):
+        self.seed = seed
+        self.drift = drift
+        self.vol = vol
+
+    def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+        start_dt = pd.to_datetime(start) if start else pd.to_datetime("2020-01-01")
+        end_dt = pd.to_datetime(end) if end else start_dt + pd.Timedelta(days=1200)
+
+        dates = pd.bdate_range(start_dt, end_dt)
+        n_days = len(dates)
+        if n_days <= 0:
+            n_days = 252
+            dates = pd.bdate_range("2020-01-01", periods=n_days)
+
+        # Python's builtin hash() is randomized per-process for strings
+        # (PYTHONHASHSEED), so it must NOT be used here -- it would silently
+        # make `seed` non-reproducible across runs (the same seed producing
+        # different data every process invocation). A stable digest gives
+        # the same per-symbol offset regardless of process/interpreter.
+        symbol_seed = self.seed + (int(hashlib.md5(symbol.encode("utf-8")).hexdigest(), 16) % 10000)
+        rng = np.random.default_rng(symbol_seed)
+
+        rets = rng.normal(self.drift, self.vol, n_days)
+        closes = 100.0 * np.exp(np.cumsum(rets))
+
+        df = pd.DataFrame(index=dates)
+        df["Close"] = closes
+        df["Open"] = closes * (1.0 + rng.normal(0, 0.002, n_days))
+        df["High"] = np.maximum(df["Open"], df["Close"]) * (1.0 + np.abs(rng.normal(0, 0.004, n_days)))
+        df["Low"] = np.minimum(df["Open"], df["Close"]) * (1.0 - np.abs(rng.normal(0, 0.004, n_days)))
+        df["Volume"] = (rng.uniform(1e5, 1e7, n_days)).astype(float)
+        return df[["Open", "High", "Low", "Close", "Volume"]]
+
+
+class CachedDataProvider(BaseDataProvider):
+    """Wrapper provider that adds CSV disk caching around any inner BaseDataProvider."""
+
+    def __init__(self, inner_provider: BaseDataProvider, cache_dir: str):
+        self.inner_provider = inner_provider
+        self.cache_dir = cache_dir
+
+    def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+        if not self.cache_dir:
+            return self.inner_provider.fetch_ohlcv(symbol, start, end, interval)
+
+        os.makedirs(self.cache_dir, exist_ok=True)
+        cache_path = os.path.join(self.cache_dir, f"{symbol}_{interval}_{start}_{end}.csv")
+
+        if os.path.exists(cache_path):
+            df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+            df.index = pd.to_datetime(df.index)
+            return df
+
+        df = self.inner_provider.fetch_ohlcv(symbol, start, end, interval)
+        if not df.empty:
+            df.to_csv(cache_path)
+        return df
+
+    # fetch_universe is deliberately NOT overridden here: BaseDataProvider's
+    # default implementation loops over symbols calling `self.fetch_ohlcv`
+    # (the cached version) for each -- delegating straight to
+    # `inner_provider.fetch_universe` instead, as a prior version of this
+    # method did, would call the INNER provider's fetch_ohlcv directly for
+    # every symbol, silently skipping this class's own cache entirely for
+    # any caller using load_universe() rather than per-symbol load_ohlcv().
+
+    def fetch_metadata(self, symbol: str) -> dict:
+        return self.inner_provider.fetch_metadata(symbol)
+
+
+_PROVIDER_REGISTRY: Dict[str, Type[BaseDataProvider]] = {}
+
+
+def register_provider(name: str, provider_cls: Type[BaseDataProvider]):
+    """Registers a data provider class under a name."""
+    _PROVIDER_REGISTRY[name.lower()] = provider_cls
+
+
+register_provider("yfinance", YFinanceDataProvider)
+register_provider("csv", CSVFolderDataProvider)
+register_provider("synthetic", SyntheticDataProvider)
+
+_DEFAULT_PROVIDER: Optional[BaseDataProvider] = None
+
+
+def set_default_data_provider(provider: BaseDataProvider):
+    """Sets global default data provider instance."""
+    global _DEFAULT_PROVIDER
+    _DEFAULT_PROVIDER = provider
+
+
+def _parse_module_specifier(target_str: str, default_attr: Optional[str] = None):
+    target_str = target_str.strip()
+    path_or_module = target_str
+    attr_name = default_attr
+
+    if ":" in target_str:
+        parts = target_str.rsplit(":", 1)
+        if not ("\\" in parts[1] or "/" in parts[1] or parts[1].endswith(".py")):
+            if not (len(parts[0]) == 1 and os.path.exists(target_str)):
+                path_or_module, attr_name = parts[0], parts[1]
+
+    return path_or_module, attr_name
+
+
+def _load_provider_from_specifier(specifier: str, **kwargs) -> BaseDataProvider:
+    """Dynamically loads a data provider from a module specifier string
+    (e.g., 'script.py:CustomProvider', 'module.path:CustomProvider', or 'script.py').
+    """
+    path_or_module, attr_name = _parse_module_specifier(specifier)
+
+    if os.path.exists(path_or_module) or path_or_module.endswith(".py"):
+        file_path = os.path.abspath(path_or_module)
+        module_name = f"dynamic_provider_{abs(hash(file_path))}"
+        spec = importlib.util.spec_from_file_location(module_name, file_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Could not load Python script from '{file_path}'")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = mod
+        spec.loader.exec_module(mod)
+    else:
+        try:
+            mod = importlib.import_module(path_or_module)
+        except Exception as exc:
+            raise ValueError(
+                f"Could not import module '{path_or_module}' for data provider '{specifier}': {exc}"
+            ) from exc
+
+    target_cls = None
+    if attr_name:
+        if not hasattr(mod, attr_name):
+            raise AttributeError(f"Module or script '{path_or_module}' has no attribute '{attr_name}'")
+        target_cls = getattr(mod, attr_name)
+    else:
+        for attr in dir(mod):
+            val = getattr(mod, attr)
+            if isinstance(val, type) and issubclass(val, BaseDataProvider) and val is not BaseDataProvider:
+                target_cls = val
+                break
+        if target_cls is None:
+            raise AttributeError(
+                f"No BaseDataProvider subclass found in module '{path_or_module}'. Specify 'module:ClassName'."
+            )
+
+    if isinstance(target_cls, type):
+        instance = target_cls(**kwargs)
+    elif callable(target_cls):
+        instance = target_cls(**kwargs)
+    else:
+        instance = target_cls
+
+    if not hasattr(instance, "fetch_ohlcv") or not callable(getattr(instance, "fetch_ohlcv")):
+        raise TypeError(f"Loaded provider '{target_str}' does not implement 'fetch_ohlcv'")
+
+    return instance
+
+
+def get_data_provider(provider_name_or_instance: Union[str, BaseDataProvider, None] = None, **kwargs) -> BaseDataProvider:
+    """Factory to instantiate or retrieve a provider instance. Accepts registered provider names,
+    instances, or module specifier strings (e.g. 'script.py:CustomProvider' or 'module.path:CustomProvider').
+    """
+    if isinstance(provider_name_or_instance, BaseDataProvider):
+        return provider_name_or_instance
+
+    if provider_name_or_instance is None:
+        if _DEFAULT_PROVIDER is not None:
+            return _DEFAULT_PROVIDER
+        return YFinanceDataProvider(**kwargs)
+
+    name = str(provider_name_or_instance).strip()
+    if name.lower() in _PROVIDER_REGISTRY:
+        provider_cls = _PROVIDER_REGISTRY[name.lower()]
+        return provider_cls(**kwargs)
+
+    if ":" in name or os.path.exists(name) or name.endswith(".py") or "." in name:
+        return _load_provider_from_specifier(name, **kwargs)
+
+    raise ValueError(
+        f"Unknown data provider '{provider_name_or_instance}'. Available registered providers: {list(_PROVIDER_REGISTRY.keys())}"
+    )
+
+
+def load_ohlcv(symbol: str, start: str, end: str, interval: str = "1d", use_cache: bool = True,
+               cache_dir: str = None, provider: Union[str, BaseDataProvider, None] = None, **kwargs) -> pd.DataFrame:
+    """Download (or load cached) OHLCV data for symbol between start and end.
+    Maintains backward compatibility with original load_ohlcv function signature.
+    """
+    base_prov = get_data_provider(provider, **kwargs)
+    if use_cache and cache_dir:
+        prov = CachedDataProvider(base_prov, cache_dir)
+    else:
+        prov = base_prov
+    return prov.fetch_ohlcv(symbol, start, end, interval)
 
 
 def load_universe(symbols: list, start: str, end: str, interval: str = "1d", use_cache: bool = True,
-                   cache_dir: str = None) -> dict:
-    """Load OHLCV for each symbol; skips (with a warning) any that fail."""
-    data = {}
-    for symbol in symbols:
-        try:
-            data[symbol] = load_ohlcv(symbol, start, end, interval, use_cache, cache_dir)
-        except Exception as exc:
-            warnings.warn(f"Skipping {symbol}: {exc}")
-    return data
-
-
-def fetch_fund_metadata(symbol: str) -> dict:
-    """Best-effort expense ratio / AUM lookup via yfinance metadata.
-
-    This is a data-availability convenience, not a verified research claim --
-    yfinance's `.info` field names are inconsistent across instrument types
-    and frequently missing, especially for plain stocks (which have neither
-    an expense ratio nor a fund AUM). Callers should treat NaN as "not
-    available," not "zero" or "bad."
+                  cache_dir: str = None, provider: Union[str, BaseDataProvider, None] = None, **kwargs) -> dict:
+    """Load OHLCV for each symbol; skips (with a warning) any that fail.
+    Maintains backward compatibility with original load_universe function signature.
     """
-    expense_ratio, total_assets = float("nan"), float("nan")
-    try:
-        info = yf.Ticker(symbol).info
-    except Exception:
-        return {"expense_ratio": expense_ratio, "total_assets": total_assets}
+    base_prov = get_data_provider(provider, **kwargs)
+    if use_cache and cache_dir:
+        prov = CachedDataProvider(base_prov, cache_dir)
+    else:
+        prov = base_prov
+    return prov.fetch_universe(symbols, start, end, interval)
 
-    for key in ("netExpenseRatio", "annualReportExpenseRatio", "expenseRatio"):
-        value = info.get(key)
-        if value is not None:
-            expense_ratio = float(value)
-            break
 
-    for key in ("totalAssets", "netAssets"):
-        value = info.get(key)
-        if value is not None:
-            total_assets = float(value)
-            break
+def fetch_fund_metadata(symbol: str, provider: Union[str, BaseDataProvider, None] = None, **kwargs) -> dict:
+    """Best-effort expense ratio / AUM lookup via metadata provider."""
+    prov = get_data_provider(provider, **kwargs)
+    return prov.fetch_metadata(symbol)
 
-    return {"expense_ratio": expense_ratio, "total_assets": total_assets}
+
+# Re-export Universe Provider components for convenience
+from .universe import (
+    BaseUniverseProvider,
+    CodeUniverseProvider,
+    FileUniverseProvider,
+    StaticUniverseProvider,
+    add_universe_cli_args,
+    get_universe_provider,
+    register_universe_provider,
+    resolve_universe_from_args,
+    resolve_universe_symbols,
+)
+
