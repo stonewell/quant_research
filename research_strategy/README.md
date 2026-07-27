@@ -65,6 +65,18 @@ A dedicated side project implementing and evaluating nine quantitative trading s
 * **ATR-Adaptive Grid**: Volatility-scaled grid trading strategy with trend filters and drawdown stop.
 * **Regime-Switching Ensemble**: ADX regime-switching ensemble combining trend-following and RSI mean-reversion.
 
+### Strategy 10–11: Turtle Channel Breakout Strategies (S1 & S2)
+* **Historical & Academic Grounding**: Richard Dennis & William Eckhardt (1983 "Turtle Traders"), Richard Donchian (1960 "High-Low Channel Breakout"), Robert Carver (2023 "Systematic Trading").
+* **Mathematical Mechanics**:
+  1. **Donchian Breakout Entry**:
+     * **System 1 (S1 - 20-day)**: Long entry when $Close_i(t) > \max(High_i(t-20 \dots t-1))$.
+     * **System 2 (S2 - 55-day)**: Long entry when $Close_i(t) > \max(High_i(t-55 \dots t-1))$.
+  2. **Trend Filter**: Optional $Close_i(t) > SMA_{200, i}(t)$ gate to prevent buying breakouts in secular bear markets.
+  3. **Donchian & $2N$ ATR Exits**:
+     * **Donchian Low Exit**: Exits when $Close_i(t) < \min(Low_i(t-N_{\text{exit}} \dots t-1))$ (10-day for S1, 20-day for S2).
+     * **$2N$ ATR Trailing Stop**: Exits when price drops $2 \times \text{ATR}_{20}$ below the peak price achieved since entry.
+  4. **Inverse-ATR Volatility Sizing**: Normalizes risk exposure across active breakout symbols proportional to $1 / (\text{ATR}_{20} / Close)$. Unallocated capital defaults to cash proxy (`BIL`).
+
 ---
 
 ## 2. JSON Strategy Configuration (`strategies_config.json`)

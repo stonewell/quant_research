@@ -51,6 +51,7 @@ from rs.strategy import (
     NaturalLanguageStrategy,
     RSIMeanReversionStrategy,
     SwingTrendPullbackStrategy,
+    TurtleBreakoutStrategy,
     VigilantAssetAllocation,
     VolatilityManagedStrategy,
 )
@@ -67,6 +68,7 @@ STRATEGY_CLASS_MAP = {
     "NaturalLanguageStrategy": NaturalLanguageStrategy,
     "RSIMeanReversionStrategy": RSIMeanReversionStrategy,
     "SwingTrendPullbackStrategy": SwingTrendPullbackStrategy,
+    "TurtleBreakoutStrategy": TurtleBreakoutStrategy,
     "VigilantAssetAllocation": VigilantAssetAllocation,
     "VolatilityManagedStrategy": VolatilityManagedStrategy,
 }

@@ -144,5 +144,35 @@
       "ensemble_exit_rsi_threshold": 70.0,
       "cash_proxy": "BIL"
     }
+  },
+  "turtle_breakout_s1": {
+    "name": "Turtle Channel Breakout (System 1 - 20d)",
+    "type": "class",
+    "class_name": "TurtleBreakoutStrategy",
+    "description": "Classic Turtle System 1 20-day Donchian channel breakout with 10-day exit, 2N ATR trailing stop, 200d SMA trend filter, and inverse ATR risk weighting.",
+    "parameters": {
+      "turtle_entry_breakout_days": 20,
+      "turtle_exit_breakout_days": 10,
+      "turtle_atr_period": 20,
+      "turtle_atr_stop_mult": 2.0,
+      "turtle_require_trend_filter": true,
+      "turtle_trend_ma_period": 200,
+      "cash_proxy": "BIL"
+    }
+  },
+  "turtle_breakout_s2": {
+    "name": "Turtle Channel Breakout (System 2 - 55d)",
+    "type": "class",
+    "class_name": "TurtleBreakoutStrategy",
+    "description": "Classic Turtle System 2 55-day Donchian channel breakout with 20-day exit, 2N ATR trailing stop, 200d SMA trend filter, and inverse ATR risk weighting.",
+    "parameters": {
+      "turtle_entry_breakout_days": 55,
+      "turtle_exit_breakout_days": 20,
+      "turtle_atr_period": 20,
+      "turtle_atr_stop_mult": 2.0,
+      "turtle_require_trend_filter": true,
+      "turtle_trend_ma_period": 200,
+      "cash_proxy": "BIL"
+    }
   }
 }

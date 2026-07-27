@@ -163,6 +163,16 @@ class StrategyConfig:
     ensemble_entry_rsi_threshold: float = 10.0
     ensemble_exit_rsi_threshold: float = 70.0
 
+    # --- Turtle Channel Breakout Strategy (Dennis & Eckhardt / Donchian) ---
+    turtle_symbol: str = "SPY"
+    turtle_entry_breakout_days: int = 20
+    turtle_exit_breakout_days: int = 10
+    turtle_atr_period: int = 20
+    turtle_atr_stop_mult: float = 2.0
+    turtle_require_trend_filter: bool = True
+    turtle_trend_ma_period: int = 200
+    turtle_position_sizing_mode: str = "inverse_atr"  # "inverse_atr" or "equal_weight"
+
     # Backtester execution defaults
     initial_capital: float = 100_000.0
     commission_pct: float = 0.0005          # 5 bps

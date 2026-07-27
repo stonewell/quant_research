@@ -31,6 +31,7 @@ from research_strategy.rs.strategy import (
     NaturalLanguageStrategy,
     RSIMeanReversionStrategy,
     SwingTrendPullbackStrategy,
+    TurtleBreakoutStrategy,
     VigilantAssetAllocation,
     VolatilityManagedStrategy,
 )
@@ -719,4 +720,123 @@ def test_run_strategy_from_json_config():
     weights = strat.generate_weights(universe)
     assert not weights.empty
     assert "SPY" in weights.columns
+
+
+def test_turtle_breakout_triggers_entry_on_donchian_high():
+    # Construct price series with a clear 20-day high breakout in an uptrend
+    n = 250
+    closes = np.linspace(100.0, 120.0, n)
+    closes[150] = 135.0  # Big upward spike / breakout
+    closes[151:] = 135.0
+
+    df = make_ohlcv_from_closes(closes)
+    universe = _timing_universe(df)
+    cfg = StrategyConfig(
+        turtle_entry_breakout_days=20,
+        turtle_exit_breakout_days=10,
+        turtle_require_trend_filter=False
+    )
+    strat = TurtleBreakoutStrategy(cfg)
+    weights = strat.generate_weights(universe)
+    daily = _daily(weights)
+
+    # donchian_high is already built from bars before i (shift(1) inside the
+    # rolling window), so bar 150's own close is what breaks out -- the
+    # position must be active on bar 150 itself, not a day later.
+    assert daily["SPY"].iloc[150] > 0.0
+
+
+def test_turtle_breakout_exits_on_donchian_low():
+    # Construct price series that breaks out then drops below 10-day low
+    n = 250
+    closes = np.full(n, 100.0)
+    closes[:200] = np.linspace(100, 110, 200)
+    closes[200] = 125.0  # Breakout
+    closes[201:215] = 125.0
+    closes[215] = 90.0   # Drop below 10d low
+    closes[216:] = 90.0
+
+    df = make_ohlcv_from_closes(closes)
+    universe = _timing_universe(df)
+    cfg = StrategyConfig(
+        turtle_entry_breakout_days=20,
+        turtle_exit_breakout_days=10,
+        turtle_require_trend_filter=False
+    )
+    strat = TurtleBreakoutStrategy(cfg)
+    weights = strat.generate_weights(universe)
+    daily = _daily(weights)
+
+    # Active on the breakout bar itself, exited on the drop bar itself --
+    # both already-lagged Donchian series compare against the SAME day's
+    # close, no extra day of delay.
+    assert daily["SPY"].iloc[200] > 0.0
+    assert daily["SPY"].iloc[215] == 0.0
+
+
+def test_turtle_breakout_exits_on_atr_trailing_stop():
+    n = 250
+    closes = np.linspace(100.0, 110.0, n)
+    closes[180] = 140.0  # Sharp spike
+    closes[181] = 100.0  # Sharp reversal exceeding 2N ATR stop
+
+    df = make_ohlcv_from_closes(closes)
+    universe = _timing_universe(df)
+    cfg = StrategyConfig(
+        turtle_entry_breakout_days=20,
+        turtle_exit_breakout_days=10,
+        turtle_atr_stop_mult=2.0,
+        turtle_require_trend_filter=False
+    )
+    strat = TurtleBreakoutStrategy(cfg)
+    weights = strat.generate_weights(universe)
+    daily = _daily(weights)
+
+    # Entered on the spike bar itself (a fresh 20-day high), then the very
+    # next bar's sharp reversal breaches peak - 2*ATR on that SAME bar's
+    # close -- exits on bar 181 itself, not a day later.
+    assert daily["SPY"].iloc[180] > 0.0
+    assert daily["SPY"].iloc[181] == 0.0
+
+
+def test_turtle_breakout_trend_filter_blocks_downtrend():
+    n = 250
+    # Closes well below 200d SMA
+    closes = np.concatenate([np.linspace(150, 80, 210), np.array([90.0] * 40)])
+    # Even if 90.0 is a 20d high, close < 200d SMA should block entry
+    df = make_ohlcv_from_closes(closes)
+    universe = _timing_universe(df)
+    cfg = StrategyConfig(
+        turtle_entry_breakout_days=20,
+        turtle_require_trend_filter=True,
+        turtle_trend_ma_period=200
+    )
+    strat = TurtleBreakoutStrategy(cfg)
+    weights = strat.generate_weights(universe)
+    daily = _daily(weights)
+
+    assert (daily["SPY"].iloc[210:] == 0.0).all()
+
+
+def test_turtle_breakout_multi_asset_inverse_atr_weights():
+    df1 = make_trending_pullback_df(n=300, seed=42)
+    df2 = make_trending_pullback_df(n=300, seed=99)
+    universe = {
+        "SPY": df1,
+        "QQQ": df2,
+        "BIL": make_ohlcv_from_closes([100.0] * 300, start=str(df1.index[0].date())),
+    }
+    cfg = StrategyConfig(
+        turtle_entry_breakout_days=20,
+        turtle_require_trend_filter=False,
+        turtle_position_sizing_mode="inverse_atr"
+    )
+    strat = TurtleBreakoutStrategy(cfg)
+    weights = strat.generate_weights(universe)
+    daily = _daily(weights)
+
+    assert not weights.empty
+    assert "SPY" in daily.columns
+    assert "QQQ" in daily.columns
+
 
