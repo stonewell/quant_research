@@ -29,6 +29,7 @@ if _PROJECT_ROOT not in sys.path:
 from common.allocation_backtester import run_allocation_backtest
 from common.allocation_templates import ALLOCATION_TEMPLATES
 from common.data import load_ohlcv
+from common.universe import add_universe_cli_args, resolve_universe_from_args
 
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
@@ -37,7 +38,7 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Standalone Basket Allocation Backtester")
     p.add_argument("--strategy-file", required=True, help="Path to strategy.json file exported by strategy_generator")
-    p.add_argument("--universe", nargs="+", required=True, help="List of symbols to trade")
+    add_universe_cli_args(p)
     p.add_argument("--start", default="2015-01-01")
     p.add_argument("--end", default="2024-12-31")
     p.add_argument("--interval", default="1d")
@@ -47,8 +48,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--initial-capital", type=float, default=100_000.0)
     p.add_argument("--commission-pct", type=float, default=0.0005)
     p.add_argument("--slippage-pct", type=float, default=0.0005)
-    p.add_argument("--data-provider", choices=["yfinance", "csv", "synthetic"], default="yfinance",
-                   help="Market data source provider (default: yfinance)")
+    p.add_argument("--data-provider", default="yfinance",
+                   help="Market data source provider ('yfinance', 'csv', 'synthetic', or custom module specifier string e.g. 'script.py:CustomProvider')")
     p.add_argument("--data-dir", type=str, default=None,
                    help="Folder path for CSV data provider")
     p.add_argument("--no-cache", action="store_true")
@@ -208,8 +209,12 @@ def main():
     if args.data_dir:
         data_kwargs["folder_path"] = args.data_dir
 
+    universe_symbols = resolve_universe_from_args(args)
+    if not universe_symbols:
+        raise ValueError("No universe symbols provided or resolved. Pass --universe, --universe-file, or --universe-provider.")
+
     universe = {}
-    for symbol in args.universe:
+    for symbol in universe_symbols:
         print(f"Loading {symbol} ...")
         universe[symbol] = load_ohlcv(symbol, args.start, args.end, args.interval,
                                        use_cache=not args.no_cache, cache_dir=DATA_DIR, **data_kwargs)

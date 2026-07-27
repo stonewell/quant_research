@@ -26,6 +26,7 @@ from selectorbot import (
     selection,
     volatility,
 )
+from common.universe import add_universe_cli_args, resolve_universe_from_args
 from selectorbot.config import SelectionConfig
 from selectorbot.data import fetch_fund_metadata, load_universe
 
@@ -35,7 +36,7 @@ RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results"
 def build_arg_parser() -> argparse.ArgumentParser:
     d = SelectionConfig()
     p = argparse.ArgumentParser(description="Quant-strategy instrument screener")
-    p.add_argument("--universe", nargs="+", default=d.universe)
+    add_universe_cli_args(p, default_universe=d.universe)
     p.add_argument("--benchmark", default=d.benchmark)
     p.add_argument("--start", default=d.start)
     p.add_argument("--end", default=d.end)
@@ -55,8 +56,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="basket size for --select-method top_k/greedy (required for greedy; default 8 for top_k)")
     p.add_argument("--select-max-k", type=int, default=None,
                    help="optional cap on basket size for --select-method threshold (which otherwise sizes itself)")
-    p.add_argument("--data-provider", choices=["yfinance", "csv", "synthetic"], default="yfinance",
-                   help="Market data source provider (default: yfinance)")
+    p.add_argument("--data-provider", default="yfinance",
+                   help="Market data source provider ('yfinance', 'csv', 'synthetic', or custom module specifier string e.g. 'script.py:CustomProvider')")
     p.add_argument("--data-dir", type=str, default=None,
                    help="Folder path for CSV data provider")
     p.add_argument("--no-cache", action="store_true")
@@ -66,8 +67,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main():
     args = build_arg_parser().parse_args()
+    d = SelectionConfig()
+    resolved_universe = resolve_universe_from_args(args, default_symbols=d.universe)
     config = SelectionConfig(
-        universe=args.universe, benchmark=args.benchmark, start=args.start, end=args.end, interval=args.interval,
+        universe=resolved_universe, benchmark=args.benchmark, start=args.start, end=args.end, interval=args.interval,
         min_avg_dollar_volume=args.min_avg_dollar_volume, min_history_years=args.min_history_years,
         max_cluster_correlation=args.max_cluster_correlation, fetch_fund_metadata=args.fetch_fund_metadata,
     )

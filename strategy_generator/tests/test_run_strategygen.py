@@ -14,7 +14,7 @@ if _PROJECT_ROOT not in sys.path:
 from run_strategygen import build_arg_parser, main
 
 
-def test_build_arg_parser_universe_mutually_exclusive():
+def test_build_arg_parser_universe_options():
     parser = build_arg_parser()
 
     # Should parse fine with just universe
@@ -25,13 +25,6 @@ def test_build_arg_parser_universe_mutually_exclusive():
     # Should parse fine with just universe-file
     args = parser.parse_args(["--universe-file", "basket.json"])
     assert args.universe_file == "basket.json"
-
-    # Should fail if both are provided
-    try:
-        parser.parse_args(["--universe", "A", "B", "--universe-file", "basket.json"])
-        assert False, "Should have raised SystemExit"
-    except SystemExit:
-        pass
 
 
 @patch("run_strategygen.load_ohlcv")

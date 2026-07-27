@@ -40,6 +40,7 @@ import pandas as pd
 
 from common.allocation_backtester import run_allocation_backtest
 from common.data import load_universe
+from common.universe import add_universe_cli_args, resolve_universe_from_args
 from rs.config import StrategyConfig, load_strategies_config
 from rs.nl_parser import parse_plain_english_strategy
 from rs.strategy import (
@@ -102,6 +103,7 @@ DEFAULT_UNIVERSE_SYMBOLS = [
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Researched Quantitative Trading Strategies CLI Runner")
+    add_universe_cli_args(p, default_universe=DEFAULT_UNIVERSE_SYMBOLS)
     p.add_argument("--strategy",
                    default="all",
                    help="Strategy key from JSON config to evaluate, or 'all' (default: 'all')")
@@ -111,8 +113,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-days", type=int, default=1200,
                    help="Number of business days of history to request (all providers)")
     p.add_argument("--seed", type=int, default=42, help="Random seed (only used with --data-provider synthetic)")
-    p.add_argument("--data-provider", choices=["synthetic", "yfinance", "csv"], default="synthetic",
-                   help="Market data source provider (default: synthetic)")
+    p.add_argument("--data-provider", default="synthetic",
+                   help="Market data source provider ('synthetic', 'yfinance', 'csv', or custom module specifier string e.g. 'script.py:CustomProvider')")
     p.add_argument("--data-dir", type=str, default=None,
                    help="Folder path for CSV data provider")
     p.add_argument("--no-cache", action="store_true", help="Disable local CSV caching of fetched data")
@@ -137,10 +139,12 @@ def main():
     if args.data_dir:
         data_kwargs["folder_path"] = args.data_dir
 
-    print(f"Loading market data for {len(DEFAULT_UNIVERSE_SYMBOLS)} symbols via provider "
+    universe_symbols = resolve_universe_from_args(args, default_symbols=DEFAULT_UNIVERSE_SYMBOLS)
+
+    print(f"Loading market data for {len(universe_symbols)} symbols via provider "
           f"'{args.data_provider}' ({start} to {end}) ...")
     universe = load_universe(
-        DEFAULT_UNIVERSE_SYMBOLS, start=start, end=end,
+        universe_symbols, start=start, end=end,
         use_cache=not args.no_cache, cache_dir=DATA_DIR, **data_kwargs,
     )
     print(f"Loaded {len(universe)} symbols: {', '.join(universe.keys())}\n")

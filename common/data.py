@@ -4,7 +4,10 @@ local CSV caching, used across every project in this workspace.
 
 from abc import ABC, abstractmethod
 import hashlib
+import importlib
+import importlib.util
 import os
+import sys
 from typing import Dict, List, Optional, Type, Union
 import warnings
 
@@ -209,8 +212,76 @@ def set_default_data_provider(provider: BaseDataProvider):
     _DEFAULT_PROVIDER = provider
 
 
+def _parse_module_specifier(target_str: str, default_attr: Optional[str] = None):
+    target_str = target_str.strip()
+    path_or_module = target_str
+    attr_name = default_attr
+
+    if ":" in target_str:
+        parts = target_str.rsplit(":", 1)
+        if not ("\\" in parts[1] or "/" in parts[1] or parts[1].endswith(".py")):
+            if not (len(parts[0]) == 1 and os.path.exists(target_str)):
+                path_or_module, attr_name = parts[0], parts[1]
+
+    return path_or_module, attr_name
+
+
+def _load_provider_from_specifier(specifier: str, **kwargs) -> BaseDataProvider:
+    """Dynamically loads a data provider from a module specifier string
+    (e.g., 'script.py:CustomProvider', 'module.path:CustomProvider', or 'script.py').
+    """
+    path_or_module, attr_name = _parse_module_specifier(specifier)
+
+    if os.path.exists(path_or_module) or path_or_module.endswith(".py"):
+        file_path = os.path.abspath(path_or_module)
+        module_name = f"dynamic_provider_{abs(hash(file_path))}"
+        spec = importlib.util.spec_from_file_location(module_name, file_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Could not load Python script from '{file_path}'")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = mod
+        spec.loader.exec_module(mod)
+    else:
+        try:
+            mod = importlib.import_module(path_or_module)
+        except Exception as exc:
+            raise ValueError(
+                f"Could not import module '{path_or_module}' for data provider '{specifier}': {exc}"
+            ) from exc
+
+    target_cls = None
+    if attr_name:
+        if not hasattr(mod, attr_name):
+            raise AttributeError(f"Module or script '{path_or_module}' has no attribute '{attr_name}'")
+        target_cls = getattr(mod, attr_name)
+    else:
+        for attr in dir(mod):
+            val = getattr(mod, attr)
+            if isinstance(val, type) and issubclass(val, BaseDataProvider) and val is not BaseDataProvider:
+                target_cls = val
+                break
+        if target_cls is None:
+            raise AttributeError(
+                f"No BaseDataProvider subclass found in module '{path_or_module}'. Specify 'module:ClassName'."
+            )
+
+    if isinstance(target_cls, type):
+        instance = target_cls(**kwargs)
+    elif callable(target_cls):
+        instance = target_cls(**kwargs)
+    else:
+        instance = target_cls
+
+    if not hasattr(instance, "fetch_ohlcv") or not callable(getattr(instance, "fetch_ohlcv")):
+        raise TypeError(f"Loaded provider '{target_str}' does not implement 'fetch_ohlcv'")
+
+    return instance
+
+
 def get_data_provider(provider_name_or_instance: Union[str, BaseDataProvider, None] = None, **kwargs) -> BaseDataProvider:
-    """Factory to instantiate or retrieve a provider instance."""
+    """Factory to instantiate or retrieve a provider instance. Accepts registered provider names,
+    instances, or module specifier strings (e.g. 'script.py:CustomProvider' or 'module.path:CustomProvider').
+    """
     if isinstance(provider_name_or_instance, BaseDataProvider):
         return provider_name_or_instance
 
@@ -219,12 +290,17 @@ def get_data_provider(provider_name_or_instance: Union[str, BaseDataProvider, No
             return _DEFAULT_PROVIDER
         return YFinanceDataProvider(**kwargs)
 
-    name = str(provider_name_or_instance).lower()
-    if name not in _PROVIDER_REGISTRY:
-        raise ValueError(f"Unknown data provider '{provider_name_or_instance}'. Available providers: {list(_PROVIDER_REGISTRY.keys())}")
+    name = str(provider_name_or_instance).strip()
+    if name.lower() in _PROVIDER_REGISTRY:
+        provider_cls = _PROVIDER_REGISTRY[name.lower()]
+        return provider_cls(**kwargs)
 
-    provider_cls = _PROVIDER_REGISTRY[name]
-    return provider_cls(**kwargs)
+    if ":" in name or os.path.exists(name) or name.endswith(".py") or "." in name:
+        return _load_provider_from_specifier(name, **kwargs)
+
+    raise ValueError(
+        f"Unknown data provider '{provider_name_or_instance}'. Available registered providers: {list(_PROVIDER_REGISTRY.keys())}"
+    )
 
 
 def load_ohlcv(symbol: str, start: str, end: str, interval: str = "1d", use_cache: bool = True,
@@ -257,3 +333,18 @@ def fetch_fund_metadata(symbol: str, provider: Union[str, BaseDataProvider, None
     """Best-effort expense ratio / AUM lookup via metadata provider."""
     prov = get_data_provider(provider, **kwargs)
     return prov.fetch_metadata(symbol)
+
+
+# Re-export Universe Provider components for convenience
+from .universe import (
+    BaseUniverseProvider,
+    CodeUniverseProvider,
+    FileUniverseProvider,
+    StaticUniverseProvider,
+    add_universe_cli_args,
+    get_universe_provider,
+    register_universe_provider,
+    resolve_universe_from_args,
+    resolve_universe_symbols,
+)
+

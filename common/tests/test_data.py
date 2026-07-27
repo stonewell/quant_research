@@ -225,3 +225,37 @@ def test_set_default_data_provider():
         assert prov is dummy
     finally:
         set_default_data_provider(None)
+
+
+def test_data_provider_module_specifier_from_file():
+    code = (
+        "from common.data import BaseDataProvider\n"
+        "import pandas as pd\n"
+        "class DynamicScriptProvider(BaseDataProvider):\n"
+        "    def fetch_ohlcv(self, symbol, start, end, interval='1d'):\n"
+        "        dates = pd.bdate_range('2020-01-01', periods=3)\n"
+        "        return pd.DataFrame({'Open': 1.0, 'High': 2.0, 'Low': 0.5, 'Close': 1.5, 'Volume': 100}, index=dates)\n"
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+        f.write(code)
+        script_path = f.name
+
+    try:
+        # Test explicit class specifier
+        prov1 = get_data_provider(f"{script_path}:DynamicScriptProvider")
+        df1 = prov1.fetch_ohlcv("TEST", "2020-01-01", "2020-01-05")
+        assert len(df1) == 3
+        assert (df1["Close"] == 1.5).all()
+
+        # Test implicit class auto-discovery
+        prov2 = get_data_provider(script_path)
+        df2 = prov2.fetch_ohlcv("TEST", "2020-01-01", "2020-01-05")
+        assert len(df2) == 3
+    finally:
+        os.remove(script_path)
+
+
+def test_data_provider_invalid_module_specifier():
+    with pytest.raises((ValueError, ImportError, AttributeError, FileNotFoundError)):
+        get_data_provider("non_existent_script.py:MissingClass")
+
