@@ -10,16 +10,20 @@ the one a real historical screen should have seen and rejected.
 
 import os
 
-from common.data import fetch_fund_metadata
+from common.data import fetch_fund_metadata as _fetch_fund_metadata
 from common.data import load_ohlcv as _load_ohlcv
 from common.data import load_universe as _load_universe
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 
 
-def load_ohlcv(symbol: str, start: str, end: str, interval: str = "1d", use_cache: bool = True):
-    return _load_ohlcv(symbol, start, end, interval, use_cache, cache_dir=DATA_DIR)
+def load_ohlcv(symbol: str, start: str, end: str, interval: str = "1d", use_cache: bool = True, provider=None, **kwargs):
+    return _load_ohlcv(symbol, start, end, interval, use_cache, cache_dir=DATA_DIR, provider=provider, **kwargs)
 
 
-def load_universe(symbols: list, start: str, end: str, interval: str = "1d", use_cache: bool = True) -> dict:
-    return _load_universe(symbols, start, end, interval, use_cache, cache_dir=DATA_DIR)
+def load_universe(symbols: list, start: str, end: str, interval: str = "1d", use_cache: bool = True, provider=None, **kwargs) -> dict:
+    return _load_universe(symbols, start, end, interval, use_cache, cache_dir=DATA_DIR, provider=provider, **kwargs)
+
+
+def fetch_fund_metadata(symbol: str, provider=None, **kwargs) -> dict:
+    return _fetch_fund_metadata(symbol, provider=provider, **kwargs)

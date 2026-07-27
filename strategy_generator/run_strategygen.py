@@ -33,6 +33,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-random-search", type=int, default=200)
     p.add_argument("--ers-percentile-threshold", type=float, default=0.90)
     p.add_argument("--min-rebalances-for-trust", type=int, default=4)
+    p.add_argument("--data-provider", choices=["yfinance", "csv", "synthetic"], default="yfinance",
+                   help="Market data source provider (default: yfinance)")
+    p.add_argument("--data-dir", type=str, default=None,
+                   help="Folder path for CSV data provider")
     p.add_argument("--no-cache", action="store_true")
     return p
 
@@ -56,10 +60,14 @@ def main():
     else:
         universe_symbols = args.universe
 
+    data_kwargs = {"provider": args.data_provider}
+    if args.data_dir:
+        data_kwargs["folder_path"] = args.data_dir
+
     universe = {}
     for symbol in universe_symbols:
         print(f"Loading {symbol} ...")
-        universe[symbol] = load_ohlcv(symbol, args.start, args.end, args.interval, use_cache=not args.no_cache)
+        universe[symbol] = load_ohlcv(symbol, args.start, args.end, args.interval, use_cache=not args.no_cache, **data_kwargs)
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
 

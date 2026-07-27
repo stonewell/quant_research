@@ -31,6 +31,7 @@ from common.allocation_templates import ALLOCATION_TEMPLATES
 from common.data import load_ohlcv
 
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -46,6 +47,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--initial-capital", type=float, default=100_000.0)
     p.add_argument("--commission-pct", type=float, default=0.0005)
     p.add_argument("--slippage-pct", type=float, default=0.0005)
+    p.add_argument("--data-provider", choices=["yfinance", "csv", "synthetic"], default="yfinance",
+                   help="Market data source provider (default: yfinance)")
+    p.add_argument("--data-dir", type=str, default=None,
+                   help="Folder path for CSV data provider")
     p.add_argument("--no-cache", action="store_true")
     return p
 
@@ -199,10 +204,15 @@ def main():
               f"treat these results as exploratory, not validated.")
     print()
 
+    data_kwargs = {"provider": args.data_provider}
+    if args.data_dir:
+        data_kwargs["folder_path"] = args.data_dir
+
     universe = {}
     for symbol in args.universe:
         print(f"Loading {symbol} ...")
-        universe[symbol] = load_ohlcv(symbol, args.start, args.end, args.interval, use_cache=not args.no_cache)
+        universe[symbol] = load_ohlcv(symbol, args.start, args.end, args.interval,
+                                       use_cache=not args.no_cache, cache_dir=DATA_DIR, **data_kwargs)
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
 

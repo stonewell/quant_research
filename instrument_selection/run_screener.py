@@ -55,6 +55,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="basket size for --select-method top_k/greedy (required for greedy; default 8 for top_k)")
     p.add_argument("--select-max-k", type=int, default=None,
                    help="optional cap on basket size for --select-method threshold (which otherwise sizes itself)")
+    p.add_argument("--data-provider", choices=["yfinance", "csv", "synthetic"], default="yfinance",
+                   help="Market data source provider (default: yfinance)")
+    p.add_argument("--data-dir", type=str, default=None,
+                   help="Folder path for CSV data provider")
     p.add_argument("--no-cache", action="store_true")
     p.add_argument("--no-plots", action="store_true")
     return p
@@ -69,8 +73,12 @@ def main():
     )
     universe = list(dict.fromkeys(config.universe + [config.benchmark]))  # ensure benchmark is included, no dupes
 
+    data_kwargs = {"provider": args.data_provider}
+    if args.data_dir:
+        data_kwargs["folder_path"] = args.data_dir
+
     print(f"Loading {len(universe)} symbols from {config.start} to {config.end} ...")
-    data = load_universe(universe, config.start, config.end, config.interval, use_cache=not args.no_cache)
+    data = load_universe(universe, config.start, config.end, config.interval, use_cache=not args.no_cache, **data_kwargs)
     print(f"Loaded {len(data)}/{len(universe)} symbols (see warnings above for any skipped).")
 
     rows = {}
@@ -112,7 +120,7 @@ def main():
 
     if config.fetch_fund_metadata:
         print("Fetching best-effort fund metadata (expense ratio, AUM) ...")
-        meta_rows = {symbol: fetch_fund_metadata(symbol) for symbol in metrics.index}
+        meta_rows = {symbol: fetch_fund_metadata(symbol, **data_kwargs) for symbol in metrics.index}
         meta_df = pd.DataFrame(meta_rows).T
         metrics["expense_ratio"] = pd.to_numeric(meta_df["expense_ratio"], errors="coerce")
         metrics["total_assets"] = pd.to_numeric(meta_df["total_assets"], errors="coerce")

@@ -26,7 +26,6 @@ import argparse
 import json
 import os
 import sys
-from typing import Dict
 
 # Ensure project root and research_strategy directory are in sys.path
 _RS_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -40,7 +39,7 @@ import numpy as np
 import pandas as pd
 
 from common.allocation_backtester import run_allocation_backtest
-from common.testing import make_ohlcv_from_closes
+from common.data import load_universe
 from rs.config import StrategyConfig, load_strategies_config
 from rs.nl_parser import parse_plain_english_strategy
 from rs.strategy import (
@@ -57,6 +56,7 @@ from rs.strategy import (
 )
 
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
 STRATEGY_CLASS_MAP = {
     "AcceleratingDualMomentum": AcceleratingDualMomentum,
@@ -92,45 +92,10 @@ def instantiate_strategy_from_config_entry(entry_key: str, entry_data: dict):
         raise ValueError(f"Unknown strategy type '{strat_type}' for strategy key '{entry_key}'")
 
 
-def generate_synthetic_universe(n_days: int = 1200, seed: int = 42, start: str = "2020-01-01") -> Dict[str, pd.DataFrame]:
-    """Generates a realistic synthetic multi-asset universe with correlated factor drift,
-    market regimes, and volatility clustering. Guaranteed offline & network-free.
-    """
-    rng = np.random.default_rng(seed)
-
-    # Market factor returns
-    market_drift = 0.0003  # ~7.5% annual drift
-    market_vol = 0.01      # ~16% annual vol
-    market_returns = rng.normal(market_drift, market_vol, n_days)
-
-    # Add a stress/crash regime in the middle (e.g. days 400-500), sized to
-    # whatever actually fits in a shorter synthetic run instead of always
-    # assuming a fixed 100-day window is available.
-    crash_start, crash_end = min(400, n_days), min(500, n_days)
-    if crash_end > crash_start:
-        market_returns[crash_start:crash_end] = rng.normal(-0.002, 0.025, crash_end - crash_start)
-
-    symbols = [
-        "SPY", "QQQ", "IWM", "EFA", "EEM", "GLD", "TLT", "VNQ",
-        "AGG", "TIP", "IEF", "LQD", "DBC", "BIL", "SCZ"
-    ]
-
-    universe = {}
-    for i, sym in enumerate(symbols):
-        if sym == "BIL":
-            ret = rng.normal(0.0001, 0.0002, n_days)
-        elif sym in ("TLT", "IEF", "AGG", "TIP"):
-            ret = -0.3 * market_returns + rng.normal(0.0001, 0.005, n_days)
-        elif sym == "GLD":
-            ret = rng.normal(0.0002, 0.008, n_days)
-        else:
-            beta = 0.8 + 0.1 * (i % 4)
-            ret = beta * market_returns + rng.normal(0, 0.006, n_days)
-
-        close = 100.0 * np.exp(np.cumsum(ret))
-        universe[sym] = make_ohlcv_from_closes(close, spread=0.2, start=start)
-
-    return universe
+DEFAULT_UNIVERSE_SYMBOLS = [
+    "SPY", "QQQ", "IWM", "EFA", "EEM", "GLD", "TLT", "VNQ",
+    "AGG", "TIP", "IEF", "LQD", "DBC", "BIL", "SCZ"
+]
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -141,8 +106,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", type=str, default=None, help="Path to custom strategies JSON config file")
     p.add_argument("--description", type=str, help="Plain English strategy description text")
     p.add_argument("--description-file", type=str, help="Path to plain English strategy description text file")
-    p.add_argument("--n-days", type=int, default=1200, help="Number of synthetic trading days to simulate")
-    p.add_argument("--seed", type=int, default=42, help="Random seed for synthetic data generation")
+    p.add_argument("--n-days", type=int, default=1200,
+                   help="Number of business days of history to request (all providers)")
+    p.add_argument("--seed", type=int, default=42, help="Random seed (only used with --data-provider synthetic)")
+    p.add_argument("--data-provider", choices=["synthetic", "yfinance", "csv"], default="synthetic",
+                   help="Market data source provider (default: synthetic)")
+    p.add_argument("--data-dir", type=str, default=None,
+                   help="Folder path for CSV data provider")
+    p.add_argument("--no-cache", action="store_true", help="Disable local CSV caching of fetched data")
     return p
 
 
@@ -150,9 +121,27 @@ def main():
     args = build_arg_parser().parse_args()
     cfg = StrategyConfig()
 
-    print(f"Generating synthetic multi-asset universe ({args.n_days} days, seed={args.seed}) ...")
-    universe = generate_synthetic_universe(n_days=args.n_days, seed=args.seed)
-    print(f"Generated synthetic data for {len(universe)} symbols: {', '.join(universe.keys())}\n")
+    # Every provider (including "synthetic") now goes through the same
+    # common.data.load_universe path -- SyntheticDataProvider gives the same
+    # reproducible-per-seed data whether it's this CLI or any other caller
+    # asking for provider="synthetic", instead of a second, one-off
+    # synthetic generator living only here.
+    start = "2020-01-01"
+    end = str(pd.bdate_range(start, periods=args.n_days)[-1].date())
+
+    data_kwargs = {"provider": args.data_provider}
+    if args.data_provider == "synthetic":
+        data_kwargs["seed"] = args.seed
+    if args.data_dir:
+        data_kwargs["folder_path"] = args.data_dir
+
+    print(f"Loading market data for {len(DEFAULT_UNIVERSE_SYMBOLS)} symbols via provider "
+          f"'{args.data_provider}' ({start} to {end}) ...")
+    universe = load_universe(
+        DEFAULT_UNIVERSE_SYMBOLS, start=start, end=end,
+        use_cache=not args.no_cache, cache_dir=DATA_DIR, **data_kwargs,
+    )
+    print(f"Loaded {len(universe)} symbols: {', '.join(universe.keys())}\n")
 
     loaded_config = load_strategies_config(args.config)
     strategies_to_run = {}
