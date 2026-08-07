@@ -442,23 +442,24 @@ strategy_generator/
 
 ## Setup
 
+This project shares a single `uv`-managed environment with the rest of the
+workspace. From the repo root (one level up):
+
 ```bash
-python -m venv .venv
-.venv/Scripts/activate        # Windows; use `source .venv/bin/activate` on macOS/Linux
-pip install -r ../requirements.txt
+uv sync
 ```
 
 ## Usage (against real data, when you're ready)
 
 ```bash
-# Fast: generate ONE strategy for the whole universe from all available history
-python run_strategygen.py --universe SPY QQQ AAPL --mode generate
+# Fast: generate ONE strategy for the whole universe from all available history (run from the repo root)
+uv run python strategy_generator/run_strategygen.py --universe SPY QQQ AAPL --mode generate
 
 # Slower, honest: full walk-forward validation with generalization ratio + DSR
-python run_strategygen.py --universe SPY QQQ AAPL --mode walkforward --start 2010-01-01
+uv run python strategy_generator/run_strategygen.py --universe SPY QQQ AAPL --mode walkforward --start 2010-01-01
 ```
 
-Key options (see `python run_strategygen.py --help` for the full list):
+Key options (see `uv run python strategy_generator/run_strategygen.py --help` for the full list):
 
 | Flag | Meaning |
 |---|---|
@@ -480,7 +481,8 @@ bar-position-based and require a shared trading calendar across the universe.
 ## Testing
 
 ```bash
-python -m pytest tests/ -v
+# from the repo root
+uv run pytest strategy_generator/tests -v
 ```
 
 90 tests, synthetic data only (per this project's instruction), covering:
