@@ -656,23 +656,24 @@ instrument_selection/
 
 ## Setup
 
+This project shares a single `uv`-managed environment with the rest of the
+workspace. From the repo root (one level up):
+
 ```bash
-python -m venv .venv
-.venv/Scripts/activate        # Windows; use `source .venv/bin/activate` on macOS/Linux
-pip install -r ../requirements.txt
+uv sync
 ```
 
 ## Usage
 
 ```bash
-# Default broad-ETF universe
-python run_screener.py --start 2015-01-01 --end 2024-12-31
+# Default broad-ETF universe (run from the repo root)
+uv run python instrument_selection/run_screener.py --start 2015-01-01 --end 2024-12-31
 
 # Your own universe
-python run_screener.py --universe SPY QQQ AAPL MSFT NVDA GLD TLT --benchmark SPY
+uv run python instrument_selection/run_screener.py --universe SPY QQQ AAPL MSFT NVDA GLD TLT --benchmark SPY
 ```
 
-Key options (see `python run_screener.py --help` for the full list):
+Key options (see `uv run python instrument_selection/run_screener.py --help` for the full list):
 
 | Flag | Meaning |
 |---|---|
@@ -698,7 +699,8 @@ project's research (see "From scores to a chosen basket" above).
 ## Testing
 
 ```bash
-python -m pytest tests/ -v
+# from the repo root
+uv run pytest instrument_selection/tests -v
 ```
 
 72 tests covering: the Corwin-Schultz spread estimator (non-negative,

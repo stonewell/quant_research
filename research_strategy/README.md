@@ -148,32 +148,34 @@ apps/quant/research_strategy/
 
 ## 5. Usage Guide
 
+This project shares a single `uv`-managed environment with the rest of the
+workspace. From the repo root (one level up), run `uv sync` once, then:
+
 ### Running Unit Tests
-Execute offline unit tests using the workspace virtual environment:
 ```powershell
-strategy_generator\.venv\Scripts\python.exe -m pytest research_strategy/tests -v
+uv run pytest research_strategy/tests -v
 ```
 
 ### Running CLI Backtests
 Simulate portfolio backtests on synthetic multi-asset data across all strategies loaded from JSON config:
 ```powershell
-strategy_generator\.venv\Scripts\python.exe research_strategy/run_research_strategy.py --strategy all
+uv run python research_strategy/run_research_strategy.py --strategy all
 ```
 
 Pass a custom JSON configuration file:
 ```powershell
-strategy_generator\.venv\Scripts\python.exe research_strategy/run_research_strategy.py --config custom_config.json --strategy all
+uv run python research_strategy/run_research_strategy.py --config custom_config.json --strategy all
 ```
 
 Evaluate custom plain English strategies via CLI text:
 ```powershell
-strategy_generator\.venv\Scripts\python.exe research_strategy/run_research_strategy.py --description "Rebalance monthly. Select top 3 assets from SPY, QQQ, EEM, GLD, TLT with Close > 200d SMA. Rank by 126d return and allocate using 60d inverse volatility."
+uv run python research_strategy/run_research_strategy.py --description "Rebalance monthly. Select top 3 assets from SPY, QQQ, EEM, GLD, TLT with Close > 200d SMA. Rank by 126d return and allocate using 60d inverse volatility."
 ```
 
 ### Viewing Terminal Dashboard
 Launch the terminal dashboard to view side-by-side performance summaries and recent target allocations:
 ```powershell
-strategy_generator\.venv\Scripts\python.exe research_strategy/dashboard.py
+uv run python research_strategy/dashboard.py
 ```
 
 ---
