@@ -11,7 +11,9 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from run_strategygen import build_arg_parser, main
+import pytest
+
+from run_strategygen import _load_factor_report, build_arg_parser, main
 
 
 def test_build_arg_parser_universe_options():
@@ -50,6 +52,8 @@ def test_main_loads_universe_from_file(mock_gen_cls, mock_load):
         trusted = True
         explanation = "test"
         target_weights = pd.DataFrame()
+        factor_context = None
+        factor_tiebreak_used = False
 
     mock_gen_instance.generate.return_value = MockSpec()
 
@@ -76,3 +80,27 @@ def test_main_loads_universe_from_file(mock_gen_cls, mock_load):
 
     finally:
         os.remove(temp_path)
+
+
+def test_load_factor_report_missing_key_raises_clear_error(tmp_path):
+    path = tmp_path / "bad_factor_report.json"
+    path.write_text(json.dumps({"not_factor_performance": {}}))
+
+    with pytest.raises(ValueError, match="factor_performance"):
+        _load_factor_report(str(path))
+
+
+def test_load_factor_report_wrong_type_raises_clear_error(tmp_path):
+    path = tmp_path / "bad_factor_report.json"
+    path.write_text(json.dumps({"factor_performance": "not_an_object"}))
+
+    with pytest.raises(ValueError, match="must be a JSON object"):
+        _load_factor_report(str(path))
+
+
+def test_load_factor_report_valid(tmp_path):
+    path = tmp_path / "factor_report.json"
+    path.write_text(json.dumps({"factor_performance": {"breadth": {"mean_sharpe_ratio": 0.5}}}))
+
+    report = _load_factor_report(str(path))
+    assert report["factor_performance"]["breadth"]["mean_sharpe_ratio"] == 0.5

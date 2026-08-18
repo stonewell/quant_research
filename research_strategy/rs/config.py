@@ -21,6 +21,8 @@ import warnings
 from dataclasses import dataclass, field, fields
 from typing import List, Optional
 
+from common.factor_taxonomy import FACTOR_CATEGORIES
+
 DEFAULT_RISKY_UNIVERSE = ["SPY", "QQQ", "IWM", "EFA", "EEM", "GLD", "TLT", "VNQ"]
 DEFAULT_CASH_PROXY = "BIL"
 
@@ -293,6 +295,12 @@ def load_strategies_config(json_path: Optional[str] = None) -> dict:
         if not isinstance(value, dict):
             raise ValueError(
                 f"strategies_config.json entry '{key}' must be a JSON object, got {type(value).__name__}."
+            )
+        unknown_factors = set(value.get("factors", [])) - set(FACTOR_CATEGORIES)
+        if unknown_factors:
+            warnings.warn(
+                f"strategies_config.json entry '{key}': unrecognized factor tag(s) {sorted(unknown_factors)} "
+                f"not in common.factor_taxonomy.FACTOR_CATEGORIES: {sorted(FACTOR_CATEGORIES)}"
             )
 
     return data

@@ -7,7 +7,8 @@
       "rebalance_freq_days": 21,
       "top_k": 3,
       "cash_proxy": "BIL"
-    }
+    },
+    "factors": ["absolute_momentum_trend", "relative_momentum", "volatility_targeting"]
   },
   "baa_keller": {
     "name": "Bold Asset Allocation (BAA-G12)",
@@ -17,7 +18,8 @@
       "rebalance_freq_days": 21,
       "top_k": 3,
       "cash_proxy": "BIL"
-    }
+    },
+    "factors": ["absolute_momentum_trend", "relative_momentum"]
   },
   "volatility_managed": {
     "name": "Volatility-Managed Portfolio",
@@ -29,7 +31,8 @@
       "vol_managed_var_lookback": 20,
       "vol_managed_max_leverage": 1.0,
       "cash_proxy": "BIL"
-    }
+    },
+    "factors": ["volatility_targeting"]
   },
   "accelerating_dual_momentum": {
     "name": "Accelerating Dual Momentum (ADM)",
@@ -42,7 +45,8 @@
       "adm_equity_b": "SCZ",
       "adm_bond_a": "TLT",
       "adm_bond_b": "TIP"
-    }
+    },
+    "factors": ["absolute_momentum_trend", "relative_momentum"]
   },
   "vigilant_asset_allocation": {
     "name": "Vigilant Asset Allocation (VAA-G4)",
@@ -53,7 +57,8 @@
       "rebalance_freq_days": 21,
       "vaa_offensive_universe": ["SPY", "QQQ", "EFA", "EEM"],
       "vaa_defensive_universe": ["IEF", "BIL"]
-    }
+    },
+    "factors": ["absolute_momentum_trend", "relative_momentum"]
   },
   "rsi_mean_reversion": {
     "name": "RSI(2) Mean-Reversion",
@@ -77,7 +82,8 @@
       "rsi_max_holding_days": 10,
       "rsi_position_size_pct": 1.0,
       "cash_proxy": "BIL"
-    }
+    },
+    "factors": ["mean_reversion", "absolute_momentum_trend"]
   },
   "swing_trend_pullback": {
     "name": "Trend-Pullback Swing",
@@ -101,7 +107,8 @@
       "swing_max_holding_days": 63,
       "swing_position_size_pct": 1.0,
       "cash_proxy": "BIL"
-    }
+    },
+    "factors": ["absolute_momentum_trend", "mean_reversion"]
   },
   "adaptive_grid": {
     "name": "ATR-Adaptive Grid",
@@ -125,7 +132,8 @@
       "grid_drawdown_stop_pct": 0.10,
       "grid_cooldown_bars_after_stop": 10,
       "cash_proxy": "BIL"
-    }
+    },
+    "factors": ["volatility_targeting", "absolute_momentum_trend"]
   },
   "ensemble_regime_switching": {
     "name": "Regime-Switching Ensemble",
@@ -143,7 +151,8 @@
       "ensemble_entry_rsi_threshold": 10.0,
       "ensemble_exit_rsi_threshold": 70.0,
       "cash_proxy": "BIL"
-    }
+    },
+    "factors": ["regime_trend_strength", "absolute_momentum_trend", "mean_reversion"]
   },
   "turtle_breakout_s1": {
     "name": "Turtle Channel Breakout (System 1 - 20d)",
@@ -158,7 +167,8 @@
       "turtle_require_trend_filter": true,
       "turtle_trend_ma_period": 200,
       "cash_proxy": "BIL"
-    }
+    },
+    "factors": ["absolute_momentum_trend", "volatility_targeting"]
   },
   "turtle_breakout_s2": {
     "name": "Turtle Channel Breakout (System 2 - 55d)",
@@ -173,35 +183,40 @@
       "turtle_require_trend_filter": true,
       "turtle_trend_ma_period": 200,
       "cash_proxy": "BIL"
-    }
+    },
+    "factors": ["absolute_momentum_trend", "volatility_targeting"]
   },
   "permanent_portfolio": {
     "name": "Permanent Portfolio (Harry Browne)",
     "type": "class",
     "class_name": "PermanentPortfolioStrategy",
     "description": "Static 25% SPY / 25% TLT / 25% BIL / 25% GLD allocation, annual rebalance. SPY substitutes for the canonical VTI.",
-    "parameters": {}
+    "parameters": {},
+    "factors": ["static_fixed_weight"]
   },
   "golden_butterfly": {
     "name": "Golden Butterfly (Portfolio Charts)",
     "type": "class",
     "class_name": "GoldenButterflyStrategy",
     "description": "Static 20% each SPY / IWM / TLT / BIL / GLD allocation, annual rebalance. IWM and BIL are disclosed substitutes for small-cap-value (VBR) and short-term treasuries (SHY).",
-    "parameters": {}
+    "parameters": {},
+    "factors": ["static_fixed_weight"]
   },
   "all_weather": {
     "name": "All Weather / All Seasons (Dalio-style retail approximation)",
     "type": "class",
     "class_name": "AllWeatherStrategy",
     "description": "Static 30% SPY / 40% TLT / 15% IEF / 7.5% GLD / 7.5% DBC allocation, annual rebalance. A fixed-weight approximation, not genuine risk-budgeted risk parity.",
-    "parameters": {}
+    "parameters": {},
+    "factors": ["static_fixed_weight"]
   },
   "hfea": {
     "name": "HFEA (Hedgefundie's Excellent Adventure)",
     "type": "class",
     "class_name": "HFEAStrategy",
     "description": "Static 55% UPRO / 45% TMF leveraged risk-parity allocation, quarterly rebalance. Synthetic data does NOT model genuine 3x leverage/volatility decay -- see class docstring.",
-    "parameters": {}
+    "parameters": {},
+    "factors": ["static_fixed_weight"]
   },
   "protective_asset_allocation": {
     "name": "Protective Asset Allocation (PAA)",
@@ -213,7 +228,8 @@
       "paa_momentum_lookback": 252,
       "paa_top_k": 6,
       "paa_protection_factor": 1
-    }
+    },
+    "factors": ["breadth", "absolute_momentum_trend", "relative_momentum"]
   },
   "adaptive_asset_allocation": {
     "name": "Adaptive Asset Allocation (AAA)",
@@ -226,6 +242,7 @@
       "aaa_top_k": 4,
       "aaa_vol_lookback": 20,
       "aaa_corr_lookback": 126
-    }
+    },
+    "factors": ["relative_momentum", "correlation_diversification"]
   }
 }

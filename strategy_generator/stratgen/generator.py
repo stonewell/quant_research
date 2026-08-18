@@ -29,6 +29,13 @@ class GeneratorConfig:
     commission_pct: float = 0.0005
     slippage_pct: float = 0.0005
     seed: int = None
+    # How close (as a fraction of the leading score, with `factor_tiebreak_epsilon`
+    # itself also used as an absolute floor so near-zero Sharpe scores don't
+    # collapse the window to nothing) two templates' backtested Sharpe ratios
+    # must be before an optional factor_report (see generate()) is allowed to
+    # break the tie. A factor score NEVER overrides a clearly-better-performing
+    # template -- see _search_allocation's docstring.
+    factor_tiebreak_epsilon: float = 0.05
 
 
 @dataclass
@@ -50,6 +57,12 @@ class GeneratedStrategySpec:
     trusted: bool
     explanation: str
     target_weights: pd.DataFrame  # sparse: NaN except on actual rebalance dates (see allocation_templates.py)
+    # Populated only when a factor_report was supplied to generate(): each
+    # considered template's factor_score (mean historical Sharpe of its own
+    # factor_tags, per the report), for transparency into whether/how it
+    # could have influenced selection -- see _search_allocation.
+    factor_context: dict = None
+    factor_tiebreak_used: bool = False
 
 
 def _portfolio_score(universe: dict, template, params: dict, config: GeneratorConfig) -> dict:
@@ -112,8 +125,68 @@ class RandomAllocationTemplate:
         return _random_weights(universe, params["rebalance_freq_days"], self.rng)
 
 
-def _search_allocation(universe: dict, cfg: GeneratorConfig) -> dict:
-    """Grid search across all allocation templates."""
+def _factor_score(template, factor_report: dict):
+    """Mean historical Sharpe (from factor_report['factor_performance']) over
+    `template`'s own factor_tags. Returns None if no report was supplied or
+    none of the template's tags appear in the report (e.g. a tag that no
+    strategy in that research_strategy run carried)."""
+    if not factor_report:
+        return None
+    factor_performance = factor_report.get("factor_performance", {})
+    sharpes = [
+        factor_performance[tag]["mean_sharpe_ratio"]
+        for tag in getattr(template, "factor_tags", [])
+        if tag in factor_performance and "mean_sharpe_ratio" in factor_performance[tag]
+    ]
+    return sum(sharpes) / len(sharpes) if sharpes else None
+
+
+def _apply_factor_tiebreak(best_per_template: dict, factor_report: dict, epsilon: float):
+    """Given each template's own best (template, params, res, score) result,
+    picks the overall winner: the highest-score template, UNLESS an optional
+    factor_report is supplied and at least one OTHER template is within
+    `epsilon` of the leading score (see GeneratorConfig.factor_tiebreak_epsilon)
+    AND has a computable factor_score that beats the leader's -- in which case
+    that template wins instead. Returns (winning_result, factor_context,
+    factor_tiebreak_used). Pure function of its inputs -- no backtesting --
+    so this is unit-testable without constructing real universes/templates.
+    """
+    best_result = max(best_per_template.values(), key=lambda r: r["score"])
+    best_score = best_result["score"]
+
+    factor_context = {}
+    if factor_report is not None:
+        for r in best_per_template.values():
+            factor_context[r["template"].name] = _factor_score(r["template"], factor_report)
+
+    factor_tiebreak_used = False
+    if factor_report is not None and np.isfinite(best_score):
+        tolerance = max(abs(best_score) * epsilon, epsilon)
+        tied = [r for r in best_per_template.values() if abs(best_score - r["score"]) <= tolerance]
+        tied_with_factor_score = [r for r in tied if factor_context.get(r["template"].name) is not None]
+        if len(tied) > 1 and tied_with_factor_score:
+            factor_winner = max(tied_with_factor_score, key=lambda r: factor_context[r["template"].name])
+            if factor_winner["template"].name != best_result["template"].name:
+                best_result = factor_winner
+                factor_tiebreak_used = True
+
+    return best_result, factor_context, factor_tiebreak_used
+
+
+def _search_allocation(universe: dict, cfg: GeneratorConfig, factor_report: dict = None) -> dict:
+    """Grid search across all allocation templates.
+
+    If `factor_report` is supplied (see run_strategygen.py's --factor-report
+    and research_strategy/run_research_strategy.py's factor_summary.json
+    output), it is used ONLY to break a tie among templates whose backtested
+    Sharpe ratios are already statistically ambiguous (within
+    cfg.factor_tiebreak_epsilon of each other) -- it can never override a
+    template that clearly outperformed on this universe's own backtest. This
+    keeps the primary, ERS-validated Sharpe signal authoritative; the factor
+    report only nudges genuinely close calls, and is documented as such in
+    the returned factor_context/factor_tiebreak_used fields regardless of
+    whether it actually fired.
+    """
 
     all_results = []
     total_grid_trials = 0
@@ -133,10 +206,21 @@ def _search_allocation(universe: dict, cfg: GeneratorConfig) -> dict:
                 "score": res.get("sharpe_ratio", float("-inf")),
             })
 
-    # Find the best template + params
-    best_result = max(all_results, key=lambda r: r["score"])
-    best_res = best_result["res"]
+    # Find the best (template, params) combo per DISTINCT template -- needed
+    # so tie-breaking compares templates against each other, not individual
+    # param combos (a single template's own grid can otherwise fill every
+    # top slot and hide that a different template is a close second).
+    best_per_template = {}
+    for r in all_results:
+        name = r["template"].name
+        if name not in best_per_template or r["score"] > best_per_template[name]["score"]:
+            best_per_template[name] = r
+
+    best_result, factor_context, factor_tiebreak_used = _apply_factor_tiebreak(
+        best_per_template, factor_report, cfg.factor_tiebreak_epsilon
+    )
     best_score = best_result["score"]
+    best_res = best_result["res"]
 
     # 2. Equivalent Random Search (ERS)
     rng = np.random.default_rng(cfg.seed)
@@ -167,6 +251,8 @@ def _search_allocation(universe: dict, cfg: GeneratorConfig) -> dict:
         "ers_percentile": ers_percentile,
         "n_trials": total_grid_trials + len(random_scores),
         "trusted": trusted,
+        "factor_context": factor_context,
+        "factor_tiebreak_used": factor_tiebreak_used,
     }
 
 
@@ -174,12 +260,17 @@ class StrategyGenerator:
     def __init__(self, config: GeneratorConfig = None):
         self.config = config or GeneratorConfig()
 
-    def generate(self, universe: dict) -> GeneratedStrategySpec:
+    def generate(self, universe: dict, factor_report: dict = None) -> GeneratedStrategySpec:
+        """`factor_report` is the optional, parsed contents of a
+        research_strategy factor_summary.json (see run_strategygen.py's
+        --factor-report flag) -- omit it (default) for today's unchanged
+        behavior. See _search_allocation's docstring for exactly how/when it
+        can influence the winning template."""
         cfg = self.config
         if not universe:
             raise ValueError("universe must contain at least one symbol's OHLCV DataFrame")
 
-        result = _search_allocation(universe, cfg)
+        result = _search_allocation(universe, cfg, factor_report=factor_report)
 
         template = result["template"]
         params = result["params"]
@@ -206,5 +297,7 @@ class StrategyGenerator:
             n_trials=result["n_trials"],
             trusted=result["trusted"],
             explanation=explanation,
-            target_weights=target_weights
+            target_weights=target_weights,
+            factor_context=result["factor_context"],
+            factor_tiebreak_used=result["factor_tiebreak_used"],
         )

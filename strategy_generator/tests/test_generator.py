@@ -2,7 +2,17 @@ import numpy as np
 import pandas as pd
 from common.testing import make_ohlcv_from_closes as make_df
 
-from stratgen.generator import GeneratorConfig, StrategyGenerator
+from stratgen.generator import GeneratorConfig, StrategyGenerator, _apply_factor_tiebreak
+
+
+class _FakeTemplate:
+    def __init__(self, name, factor_tags):
+        self.name = name
+        self.factor_tags = factor_tags
+
+
+def _fake_result(name, score, factor_tags=()):
+    return {"template": _FakeTemplate(name, list(factor_tags)), "params": {}, "res": {}, "score": score}
 
 
 def test_generator_finds_momentum_allocation():
@@ -63,10 +73,16 @@ def test_generator_finds_inverse_vol_allocation():
 def test_generator_ers_check_works():
     idx = pd.bdate_range("2020-01-01", periods=300)
 
-    # A completely random universe with zero mean return (pure noise around 100)
+    # A genuine zero-drift random walk (geometric, so it can't go negative --
+    # see common/testing.py's own note on this). Crucially this is NOT "a
+    # constant plus iid noise" (100 + rng.normal(...)) -- that construction
+    # has a fixed, exploitable mean to revert to, which is a real, legitimate
+    # edge for a mean-reversion template, not overfitting; a true random walk
+    # has no such fixed mean, so no template (momentum, mean-reversion, or
+    # allocation-based) should find a persistent edge on it.
     rng = np.random.default_rng(123)
-    closes_a = 100 + rng.normal(0, 0.5, 300)
-    closes_b = 100 + rng.normal(0, 0.5, 300)
+    closes_a = 100.0 * np.exp(np.cumsum(rng.normal(0, 0.01, 300)))
+    closes_b = 100.0 * np.exp(np.cumsum(rng.normal(0, 0.01, 300)))
 
     universe = {
         "A": make_df(closes_a, start="2020-01-01"),
@@ -78,6 +94,93 @@ def test_generator_ers_check_works():
 
     spec = gen.generate(universe)
 
-    # On pure mean-reverting noise around a constant mean, no trend or allocation strategy has a significant edge over random search
+    # On a genuine zero-drift random walk, no trend or allocation strategy has a significant edge over random search
     assert spec.trusted is False
     assert spec.ers_passed is False
+
+
+def test_factor_tiebreak_fires_when_scores_are_close_and_factor_score_is_higher():
+    best_per_template = {
+        "momentum_like": _fake_result("momentum_like", score=1.00, factor_tags=["relative_momentum"]),
+        "breadth_like": _fake_result("breadth_like", score=0.98, factor_tags=["breadth"]),
+    }
+    factor_report = {"factor_performance": {
+        "relative_momentum": {"mean_sharpe_ratio": 0.1},
+        "breadth": {"mean_sharpe_ratio": 0.9},
+    }}
+
+    winner, factor_context, tiebreak_used = _apply_factor_tiebreak(best_per_template, factor_report, epsilon=0.05)
+
+    assert tiebreak_used is True
+    assert winner["template"].name == "breadth_like"
+    assert factor_context == {"momentum_like": 0.1, "breadth_like": 0.9}
+
+
+def test_factor_tiebreak_does_not_fire_when_scores_are_clearly_different():
+    best_per_template = {
+        "clear_winner": _fake_result("clear_winner", score=2.00, factor_tags=["relative_momentum"]),
+        "clear_loser": _fake_result("clear_loser", score=0.10, factor_tags=["breadth"]),
+    }
+    # clear_loser's factor tag scores much higher, but the Sharpe gap is not
+    # within epsilon -- the factor report must NOT override a clear winner.
+    factor_report = {"factor_performance": {
+        "relative_momentum": {"mean_sharpe_ratio": 0.01},
+        "breadth": {"mean_sharpe_ratio": 5.0},
+    }}
+
+    winner, factor_context, tiebreak_used = _apply_factor_tiebreak(best_per_template, factor_report, epsilon=0.05)
+
+    assert tiebreak_used is False
+    assert winner["template"].name == "clear_winner"
+
+
+def test_factor_tiebreak_is_a_no_op_when_no_report_supplied():
+    best_per_template = {
+        "a": _fake_result("a", score=1.00, factor_tags=["relative_momentum"]),
+        "b": _fake_result("b", score=0.99, factor_tags=["breadth"]),
+    }
+    winner, factor_context, tiebreak_used = _apply_factor_tiebreak(best_per_template, factor_report=None, epsilon=0.05)
+
+    assert tiebreak_used is False
+    assert winner["template"].name == "a"
+    assert factor_context == {}
+
+
+def test_factor_tiebreak_ignores_templates_with_no_computable_factor_score():
+    # Both templates are tied, but neither's factor_tags appear in the report
+    # -- there's nothing to break the tie WITH, so the original leader stands.
+    best_per_template = {
+        "a": _fake_result("a", score=1.00, factor_tags=["mean_reversion"]),
+        "b": _fake_result("b", score=0.99, factor_tags=["correlation_diversification"]),
+    }
+    factor_report = {"factor_performance": {"breadth": {"mean_sharpe_ratio": 5.0}}}
+
+    winner, factor_context, tiebreak_used = _apply_factor_tiebreak(best_per_template, factor_report, epsilon=0.05)
+
+    assert tiebreak_used is False
+    assert winner["template"].name == "a"
+    assert factor_context == {"a": None, "b": None}
+
+
+def test_generator_factor_report_none_is_byte_for_byte_unchanged():
+    # Regression guard: omitting factor_report must reproduce the exact same
+    # winner as before this feature existed.
+    idx = pd.bdate_range("2020-01-01", periods=300)
+    closes_a = np.linspace(100, 200, 300)
+    closes_b = np.linspace(100, 50, 300)
+    closes_c = np.linspace(100, 50, 300)
+    universe = {
+        "A": make_df(closes_a, start="2020-01-01"),
+        "B": make_df(closes_b, start="2020-01-01"),
+        "C": make_df(closes_c, start="2020-01-01"),
+    }
+
+    config = GeneratorConfig(n_random_search=10, seed=42)
+    gen = StrategyGenerator(config)
+
+    spec_without_report = gen.generate(universe)
+    spec_with_none_report = gen.generate(universe, factor_report=None)
+
+    assert spec_without_report.template_name == spec_with_none_report.template_name == "cross_sectional_momentum"
+    assert not spec_without_report.factor_context
+    assert spec_without_report.factor_tiebreak_used is False

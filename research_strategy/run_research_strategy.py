@@ -25,6 +25,7 @@ Examples:
 import argparse
 import json
 import os
+import statistics
 import sys
 
 # Ensure project root and research_strategy directory are in sys.path
@@ -40,6 +41,7 @@ import pandas as pd
 
 from common.allocation_backtester import run_allocation_backtest
 from common.data import load_universe
+from common.factor_taxonomy import FACTOR_CATEGORIES
 from common.universe import add_universe_cli_args, resolve_universe_from_args
 from rs.config import StrategyConfig, load_strategies_config
 from rs.nl_parser import parse_plain_english_strategy
@@ -143,6 +145,79 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
+def build_and_write_factor_summary(report_data, strategy_factor_tags, args, start, end, results_dir):
+    """Aggregates per-strategy backtest results by factor tag and writes
+    results/factor_summary.json -- the real hand-off artifact
+    `strategy_generator`'s optional `--factor-report` flag consumes (see
+    `strategy_generator/stratgen/generator.py`) to contextualize/tie-break
+    its own template selection. Deliberately conservative: this never claims
+    more than what a single run on `--data-provider synthetic` (the
+    default) can actually support -- see the `caveat` field below.
+    """
+    metrics = ("sharpe_ratio", "cagr", "max_drawdown", "calmar_ratio")
+
+    per_tag_values = {tag: {m: [] for m in metrics} for tag in FACTOR_CATEGORIES}
+    for strat_name, tags in strategy_factor_tags.items():
+        if strat_name not in report_data:
+            continue
+        for tag in tags:
+            if tag not in per_tag_values:
+                continue  # unrecognized tag already warned about at config-load time
+            for m in metrics:
+                value = report_data[strat_name].get(m)
+                if value is not None:
+                    per_tag_values[tag][m].append(value)
+
+    factor_performance = {}
+    for tag, values_by_metric in per_tag_values.items():
+        n = len(values_by_metric["sharpe_ratio"])
+        if n == 0:
+            continue
+        entry = {"n_strategies": n}
+        for m, values in values_by_metric.items():
+            if values:
+                entry[f"mean_{m}"] = statistics.mean(values)
+                entry[f"median_{m}"] = statistics.median(values)
+        factor_performance[tag] = entry
+
+    is_synthetic = args.data_provider == "synthetic"
+    caveat = (
+        f"Computed on provider='{args.data_provider}'"
+        f"{f', seed={args.seed}' if is_synthetic else ''}, n_days={args.n_days}, {start} to {end}. "
+    )
+    if is_synthetic:
+        caveat += (
+            "Synthetic GBM data has NO real momentum/mean-reversion/volatility-clustering structure "
+            "by construction, so this summary reflects MECHANISM/plumbing on this specific run, not a "
+            "validated factor edge -- re-run with --data-provider yfinance against real prices for a "
+            "meaningful factor comparison."
+        )
+    else:
+        caveat += (
+            "Computed from a single backtest window; treat as one data point, not a statistically "
+            "robust factor study -- re-run across multiple periods/universes before treating any "
+            "factor's ranking here as durable."
+        )
+
+    summary = {
+        "run_context": {
+            "data_provider": args.data_provider,
+            "seed": args.seed if is_synthetic else None,
+            "n_days": args.n_days,
+            "start": start,
+            "end": end,
+        },
+        "factor_performance": factor_performance,
+        "strategy_factor_tags": strategy_factor_tags,
+        "caveat": caveat,
+    }
+
+    path = os.path.join(results_dir, "factor_summary.json")
+    with open(path, "w") as f:
+        json.dump(summary, f, indent=2)
+    return path
+
+
 def main():
     args = build_arg_parser().parse_args()
     cfg = StrategyConfig()
@@ -195,6 +270,15 @@ def main():
         else:
             print(f"Error: Unknown strategy '{args.strategy}'. Available options in config: {', '.join(loaded_config.keys())}, or 'all'.")
             sys.exit(1)
+
+    # entry_key -> "factors" tags, only for strategies actually run FROM the
+    # JSON config (an ad-hoc --description/--description-file run has no
+    # config entry and is deliberately left untagged, not force-tagged).
+    strategy_factor_tags = {
+        strat_name: loaded_config[strat_name].get("factors", [])
+        for strat_name in strategies_to_run
+        if strat_name in loaded_config
+    }
 
     report_data = {}
     weights_summary = {}
@@ -256,6 +340,11 @@ def main():
         csv_path = os.path.join(RESULTS_DIR, f"{strat_name}_weights.csv")
         tw_df.to_csv(csv_path)
         print(f"Saved full daily weights for {strat_name} to {csv_path}")
+
+    factor_summary_path = build_and_write_factor_summary(
+        report_data, strategy_factor_tags, args, start, end, RESULTS_DIR
+    )
+    print(f"Saved factor summary to {factor_summary_path}")
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ from typing import Dict
 import numpy as np
 import pandas as pd
 
-from common.indicators import realized_vol, roc
+from common.indicators import realized_vol, roc, rsi
 from common.scheduling import get_rebalance_dates as _get_rebalance_dates
 
 
@@ -30,6 +30,13 @@ from common.scheduling import get_rebalance_dates as _get_rebalance_dates
 class AllocationTemplate:
     name: str
     param_grid: dict
+    # Tags from common.factor_taxonomy.FACTOR_CATEGORIES describing which
+    # quantitative factor(s) this template conditions on -- consumed by
+    # strategy_generator's optional --factor-report hand-off (see
+    # stratgen/generator.py) to contextualize/tie-break template selection.
+    # Default empty: a template that doesn't declare tags simply never
+    # participates in factor-based tie-breaking.
+    factor_tags: list = field(default_factory=list)
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict) -> pd.DataFrame:
         """Returns a DataFrame indexed by date, with columns for each symbol.
@@ -131,12 +138,46 @@ def _hrp_portfolio(cov: np.ndarray) -> np.ndarray:
     return w_arr / sum_w if sum_w > 0 else np.ones(n) / n
 
 
+def _min_variance_weights(cov: np.ndarray) -> np.ndarray:
+    """Long-only minimum-variance portfolio weights via constrained
+    quadratic minimization (weights sum to 1, each in [0, 1]). Grounding:
+    Harry Markowitz (1952, Journal of Finance, "Portfolio Selection") --
+    unlike `_hrp_portfolio`'s heuristic recursive-bisection substitute, this
+    is a genuine numerical optimization of the classic mean-variance
+    objective (variance only; no expected-return term, since a reliable
+    expected-return estimate is the harder, unsolved half of Markowitz's
+    original formulation). Falls back to equal weighting if the optimizer
+    fails to converge (e.g. a near-singular covariance matrix) -- a
+    portfolio can always be equal-weighted; it can't always be safely handed
+    a degenerate optimizer result."""
+    from scipy.optimize import minimize
+
+    n = cov.shape[0]
+    if n == 1:
+        return np.array([1.0])
+
+    def objective(w):
+        return w @ cov @ w
+
+    constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
+    bounds = [(0.0, 1.0)] * n
+    x0 = np.full(n, 1.0 / n)
+
+    result = minimize(objective, x0, method="SLSQP", bounds=bounds, constraints=constraints)
+    if not result.success:
+        return x0
+    w = np.clip(result.x, 0.0, None)
+    total = w.sum()
+    return w / total if total > 0 else x0
+
+
 @dataclass
 class EqualWeightAllocation(AllocationTemplate):
     name: str = "equal_weight"
     param_grid: dict = field(default_factory=lambda: {
         "rebalance_freq_days": [5, 21, 63]  # Weekly, Monthly, Quarterly
     })
+    factor_tags: list = field(default_factory=lambda: ["static_fixed_weight"])
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict) -> pd.DataFrame:
         symbols = list(universe.keys())
@@ -174,6 +215,7 @@ class InverseVolatilityAllocation(AllocationTemplate):
         "vol_lookback": [20, 60, 120],
         "rebalance_freq_days": [5, 21, 63]
     })
+    factor_tags: list = field(default_factory=lambda: ["volatility_targeting"])
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict) -> pd.DataFrame:
         symbols = list(universe.keys())
@@ -221,6 +263,7 @@ class CrossSectionalMomentumAllocation(AllocationTemplate):
         "top_n_fraction": [0.25, 0.5],   # Top 25% or Top 50% of basket
         "rebalance_freq_days": [21, 63]  # Monthly, Quarterly
     })
+    factor_tags: list = field(default_factory=lambda: ["relative_momentum"])
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict) -> pd.DataFrame:
         symbols = list(universe.keys())
@@ -275,6 +318,7 @@ class HierarchicalRiskParityAllocation(AllocationTemplate):
         "cov_lookback": [60, 126, 252],
         "rebalance_freq_days": [21, 63]
     })
+    factor_tags: list = field(default_factory=lambda: ["correlation_diversification"])
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict) -> pd.DataFrame:
         symbols = list(universe.keys())
@@ -335,6 +379,7 @@ class DualMomentumAllocation(AllocationTemplate):
         "top_n_fraction": [0.25, 0.5],
         "rebalance_freq_days": [21, 63]
     })
+    factor_tags: list = field(default_factory=lambda: ["absolute_momentum_trend", "relative_momentum"])
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict) -> pd.DataFrame:
         symbols = list(universe.keys())
@@ -388,6 +433,7 @@ class MaxDiversificationAllocation(AllocationTemplate):
         "vol_lookback": [60, 126],
         "rebalance_freq_days": [21, 63]
     })
+    factor_tags: list = field(default_factory=lambda: ["volatility_targeting", "correlation_diversification"])
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict) -> pd.DataFrame:
         symbols = list(universe.keys())
@@ -440,6 +486,201 @@ class MaxDiversificationAllocation(AllocationTemplate):
         return params["vol_lookback"]
 
 
+@dataclass
+class MeanReversionAllocation(AllocationTemplate):
+    name: str = "mean_reversion"
+    param_grid: dict = field(default_factory=lambda: {
+        "rsi_period": [2, 5, 14],
+        "top_n_fraction": [0.25, 0.5],
+        "rebalance_freq_days": [5, 21],
+    })
+    factor_tags: list = field(default_factory=lambda: ["mean_reversion"])
+
+    def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict) -> pd.DataFrame:
+        symbols = list(universe.keys())
+        if not symbols:
+            return pd.DataFrame()
+
+        master_index = universe[symbols[0]].index
+        rebalance_dates = _get_rebalance_dates(master_index, params["rebalance_freq_days"])
+
+        rsis = pd.DataFrame(index=master_index, columns=symbols)
+        for sym, df in universe.items():
+            rsis[sym] = rsi(df["Close"], period=params["rsi_period"])
+
+        rsis_rebal = rsis.loc[rebalance_dates]
+        n_symbols = len(symbols)
+        top_n = max(1, int(n_symbols * params["top_n_fraction"]))
+
+        weights_rebal = pd.DataFrame(index=rebalance_dates, columns=symbols, data=0.0)
+
+        for date, row in rsis_rebal.iterrows():
+            if row.isna().all():
+                continue
+            # LOWEST RSI = most oversold -- Connors-style RSI(2) mean-reversion.
+            oversold_symbols = row.nsmallest(top_n).index
+            weights_rebal.loc[date, oversold_symbols] = 1.0 / top_n
+
+        weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
+        weights_df.loc[rebalance_dates] = weights_rebal
+        return weights_df
+
+    def explain_weights(self, params: dict) -> str:
+        return (
+            f"Mean Reversion: Rebalances every {params['rebalance_freq_days']} trading days. "
+            f"Reasoning: Ranks all assets by {params['rsi_period']}-period RSI (Connors-style short-term "
+            f"RSI mean-reversion) and equally weights the most-oversold (lowest RSI) "
+            f"{int(params['top_n_fraction'] * 100)}% of the basket. NOTE: short rebalance frequencies "
+            f"(5 trading days) are included so the grid search can empirically test whether this signal "
+            f"survives realistic transaction costs -- mean-reversion strategies are unusually sensitive to "
+            f"the commission/slippage charged on every rebalance's turnover (allocation_backtester.py), "
+            f"since the edge per trade is typically small relative to a fixed per-turnover cost."
+        )
+
+    def warmup_bars(self, params: dict) -> int:
+        return params["rsi_period"]
+
+
+@dataclass
+class MinimumVarianceAllocation(AllocationTemplate):
+    name: str = "minimum_variance"
+    param_grid: dict = field(default_factory=lambda: {
+        "cov_lookback": [60, 126, 252],
+        "rebalance_freq_days": [21, 63],
+    })
+    factor_tags: list = field(default_factory=lambda: ["correlation_diversification"])
+
+    def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict) -> pd.DataFrame:
+        symbols = list(universe.keys())
+        if not symbols:
+            return pd.DataFrame()
+
+        master_index = universe[symbols[0]].index
+        rebalance_dates = _get_rebalance_dates(master_index, params["rebalance_freq_days"])
+
+        returns_df = pd.DataFrame(index=master_index, columns=symbols)
+        for sym, df in universe.items():
+            returns_df[sym] = df["Close"].pct_change()
+
+        lookback = params["cov_lookback"]
+        weights_rebal = pd.DataFrame(index=rebalance_dates, columns=symbols, data=np.nan)
+
+        for date in rebalance_dates:
+            loc = master_index.get_loc(date)
+            if loc < lookback:
+                continue
+            sub_ret = returns_df.iloc[loc - lookback:loc]
+
+            # Same guard as HierarchicalRiskParityAllocation: a symbol
+            # without a full lookback history is excluded rather than
+            # zero-filled into the covariance matrix (zero variance would
+            # otherwise look "risk-free" to the optimizer).
+            valid_symbols = [s for s in symbols if sub_ret[s].notna().all()]
+            if not valid_symbols:
+                continue
+
+            cov = sub_ret[valid_symbols].cov().to_numpy()
+            w_mv = _min_variance_weights(cov)
+            weights_rebal.loc[date, valid_symbols] = w_mv
+
+        weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
+        weights_df.loc[rebalance_dates] = weights_rebal
+        return weights_df
+
+    def explain_weights(self, params: dict) -> str:
+        return (
+            f"Minimum Variance: Rebalances every {params['rebalance_freq_days']} trading days. "
+            f"Reasoning: Solves a constrained quadratic program for the long-only portfolio of minimum "
+            f"variance over the trailing {params['cov_lookback']} days (Markowitz 1952), subject to "
+            f"weights summing to 100%. Unlike HierarchicalRiskParityAllocation's heuristic "
+            f"recursive-bisection substitute, this is a genuine numerical optimization and can be less "
+            f"stable when the covariance matrix is poorly conditioned (falls back to equal-weight on "
+            f"non-convergence)."
+        )
+
+    def warmup_bars(self, params: dict) -> int:
+        return params["cov_lookback"]
+
+
+@dataclass
+class BreadthGatedMomentumAllocation(AllocationTemplate):
+    name: str = "breadth_gated_momentum"
+    param_grid: dict = field(default_factory=lambda: {
+        "mom_lookback": [63, 126, 252],
+        "top_n_fraction": [0.25, 0.5],
+        "protection_factor": [1, 2],
+        "rebalance_freq_days": [21, 63],
+    })
+    factor_tags: list = field(default_factory=lambda: ["breadth", "relative_momentum"])
+
+    def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict) -> pd.DataFrame:
+        symbols = list(universe.keys())
+        if not symbols:
+            return pd.DataFrame()
+
+        master_index = universe[symbols[0]].index
+        rebalance_dates = _get_rebalance_dates(master_index, params["rebalance_freq_days"])
+
+        moms = pd.DataFrame(index=master_index, columns=symbols)
+        for sym, df in universe.items():
+            moms[sym] = roc(df["Close"], period=params["mom_lookback"])
+
+        moms_rebal = moms.loc[rebalance_dates]
+        n_symbols = len(symbols)
+        top_n = max(1, int(n_symbols * params["top_n_fraction"]))
+        n1 = params["protection_factor"] * n_symbols / 4.0
+
+        weights_rebal = pd.DataFrame(index=rebalance_dates, columns=symbols, data=0.0)
+
+        for date, row in moms_rebal.iterrows():
+            row = row.dropna()
+            if len(row) < n_symbols:
+                # Whole-basket warmup gate: breadth's denominator N must be
+                # the FULL basket for the invested fraction to mean anything
+                # -- stricter than HRP/MinVariance's per-symbol exclusion.
+                # One late-listed symbol can stall this template's
+                # rebalancing until every symbol has warmed up.
+                continue
+
+            n_positive = int((row > 0).sum())
+            denom = n_symbols - n1
+            if n_positive <= n1:
+                derisked_fraction = 1.0
+            elif denom > 0:
+                derisked_fraction = max(0.0, (n_symbols - n_positive) / denom)
+            else:
+                derisked_fraction = 0.0
+            invested_fraction = 1.0 - derisked_fraction
+
+            top_symbols = row.nlargest(top_n).index
+            if len(top_symbols) > 0:
+                weights_rebal.loc[date, top_symbols] = invested_fraction / len(top_symbols)
+
+        weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
+        weights_df.loc[rebalance_dates] = weights_rebal
+        return weights_df
+
+    def explain_weights(self, params: dict) -> str:
+        return (
+            f"Breadth-Gated Momentum: Rebalances every {params['rebalance_freq_days']} trading days. "
+            f"Reasoning: generalizes Keller & Keuning (2016, SSRN #2759734, Protective Asset Allocation)'s "
+            f"breadth-based crash-protection mechanism to an arbitrary basket with no dedicated "
+            f"protection/bond symbol -- the de-risked fraction becomes idle cash (this codebase's "
+            f"weights-sum-under-100% convention) rather than flowing to a named defensive instrument. "
+            f"Scores all assets by {params['mom_lookback']}-day momentum; the TOTAL invested fraction "
+            f"scales continuously with breadth (the count of assets with positive momentum), fully "
+            f"de-risking when breadth falls to or below protection_factor={params['protection_factor']} "
+            f"* N / 4 assets. The remainder splits equally across the top "
+            f"{int(params['top_n_fraction'] * 100)}% by momentum rank, regardless of individual sign. "
+            f"NOTE: as with this workspace's own ProtectiveAssetAllocation, the exact breakpoint/scaling "
+            f"constants are a disclosed, reasonable reconstruction of the documented mechanism, not a "
+            f"verified reproduction of the primary paper's exact formula."
+        )
+
+    def warmup_bars(self, params: dict) -> int:
+        return params["mom_lookback"]
+
+
 ALLOCATION_TEMPLATES = [
     EqualWeightAllocation,
     InverseVolatilityAllocation,
@@ -447,4 +688,7 @@ ALLOCATION_TEMPLATES = [
     HierarchicalRiskParityAllocation,
     DualMomentumAllocation,
     MaxDiversificationAllocation,
+    MeanReversionAllocation,
+    MinimumVarianceAllocation,
+    BreadthGatedMomentumAllocation,
 ]

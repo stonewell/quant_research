@@ -35,7 +35,6 @@ import warnings
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize
 
 from common.indicators import (
     adx,
@@ -48,7 +47,7 @@ from common.indicators import (
     rsi_wilder,
     sma,
 )
-from common.allocation_templates import AllocationTemplate
+from common.allocation_templates import AllocationTemplate, _min_variance_weights
 from common.scheduling import get_rebalance_dates as _get_rebalance_dates
 from .config import StrategyConfig
 from .nl_parser import ParsedStrategySpec, parse_plain_english_strategy
@@ -1416,42 +1415,17 @@ class ProtectiveAssetAllocation(AllocationTemplate):
         return p.get("paa_momentum_lookback", cfg.paa_momentum_lookback)
 
 
-def _min_variance_weights(cov: np.ndarray) -> np.ndarray:
-    """Long-only minimum-variance portfolio weights via constrained
-    quadratic minimization (weights sum to 1, each in [0, 1]). Falls back to
-    equal weighting if the optimizer fails to converge (e.g. a near-singular
-    covariance matrix) -- a portfolio can always be equal-weighted; it can't
-    always be safely handed a degenerate optimizer result."""
-    n = cov.shape[0]
-    if n == 1:
-        return np.array([1.0])
-
-    def objective(w):
-        return w @ cov @ w
-
-    constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
-    bounds = [(0.0, 1.0)] * n
-    x0 = np.full(n, 1.0 / n)
-
-    result = minimize(objective, x0, method="SLSQP", bounds=bounds, constraints=constraints)
-    if not result.success:
-        return x0
-    w = np.clip(result.x, 0.0, None)
-    total = w.sum()
-    return w / total if total > 0 else x0
-
-
 class AdaptiveAssetAllocation(AllocationTemplate):
     """Adaptive Asset Allocation (AAA). Butler, Philbrick, Gordillo & Varadi
     (2012, SSRN #2328254, "Adaptive Asset Allocation: A Primer";
     GestaltU/ReSolve Asset Management, which still actively references this
     framework today).
 
-    Two-stage mechanism -- the part that's genuinely new machinery for this
-    project (nothing else here runs a constrained portfolio optimizer; the
-    existing HierarchicalRiskParityAllocation in
-    common/allocation_templates.py avoids one via recursive bisection
-    instead):
+    Two-stage mechanism, using the shared `_min_variance_weights` SLSQP
+    solver (`common/allocation_templates.py` -- also used there by
+    `MinimumVarianceAllocation`, a genuine constrained optimization distinct
+    from `HierarchicalRiskParityAllocation`'s heuristic recursive-bisection
+    substitute for one):
       1. Momentum filter: rank the universe by aaa_momentum_lookback-day
          (default 126, ~6mo) return; keep the top aaa_top_k (default 4 of 8,
          preserving the paper's "keep half" rule).

@@ -118,7 +118,8 @@ Example structure:
     "parameters": {
       "rebalance_freq_days": 21,
       "top_k": 3
-    }
+    },
+    "factors": ["absolute_momentum_trend", "relative_momentum", "volatility_targeting"]
   },
   "rsi_mean_reversion": {
     "name": "RSI(2) Mean-Reversion",
@@ -130,10 +131,51 @@ Example structure:
       "rsi_period": 2,
       "rsi_oversold_threshold": 10.0,
       "rsi_exit_rsi_threshold": 70.0
-    }
+    },
+    "factors": ["mean_reversion", "absolute_momentum_trend"]
   }
 }
 ```
+
+---
+
+## 2b. Factor Tagging & `factor_summary.json` (the `strategy_generator` hand-off)
+
+Every entry in `strategies_config.json` carries an optional `"factors"` list, tagging which
+quantitative factor category (or categories) that strategy conditions on. The tag vocabulary is
+shared workspace-wide via `common/factor_taxonomy.py`'s `FACTOR_CATEGORIES` — the SAME vocabulary
+`common/allocation_templates.py`'s templates use for their own `factor_tags` field, so a tag means
+the same thing in both projects:
+
+| Tag | Meaning |
+|---|---|
+| `absolute_momentum_trend` | An asset's own trailing trend/return sign (SMA gate, ROC > 0 gate) |
+| `relative_momentum` | Cross-sectional ranking of assets by trailing return |
+| `volatility_targeting` | Realized volatility used to size/scale exposure |
+| `mean_reversion` | Short-term oscillator (RSI) signaling overbought/oversold reversal |
+| `breadth` | Aggregate count/fraction of a basket in positive momentum, as a market-wide risk-on/off signal |
+| `correlation_diversification` | Covariance/correlation structure used for portfolio construction |
+| `regime_trend_strength` | Trend-strength/regime classification (ADX, Hurst) gating trend-following |
+| `static_fixed_weight` | Fixed weights with no adaptive signal |
+
+`load_strategies_config()` warns (doesn't raise) on an unrecognized tag, matching this project's
+existing "warn on unknown key" convention.
+
+After every `run_research_strategy.py` run, `results/factor_summary.json` aggregates each ran
+strategy's backtest performance (Sharpe/CAGR/max drawdown/Calmar) by these tags — e.g. "every
+strategy tagged `breadth` averaged Sharpe X on this run." This is a real, consumable artifact:
+`strategy_generator`'s `--factor-report` flag loads it and uses it to (conservatively) tie-break
+its own template selection when the primary backtested-Sharpe signal is ambiguous — see
+`strategy_generator/README.md` for the full mechanism and why it's deliberately bounded to
+tie-breaking only.
+
+**Read the `caveat` field in `factor_summary.json` before trusting anything in it.** On this
+project's default `--data-provider synthetic`, the underlying GBM data has no real
+momentum/mean-reversion/volatility-clustering structure by construction — a factor "winning" on a
+synthetic run reflects mechanism/plumbing, not a validated edge. Re-run with
+`--data-provider yfinance` against real prices for a factor comparison that actually means
+something. Ad-hoc `--description`/`--description-file` runs have no config entry and are omitted
+from the summary rather than force-tagged.
 
 ---
 
@@ -206,3 +248,7 @@ uv run python research_strategy/dashboard.py
 * **Calmar Ratio**: Annualized return divided by maximum drawdown ($\text{CAGR} / |\text{Max DD}|$).
 * **Win Rate & Profit Factor**: Percentage of positive daily return periods and ratio of gross gains to gross losses.
 * **Turnover & Rebalances**: Accumulated portfolio rebalance turnover and rebalance count.
+
+Outputs land in `results/`: `research_strategy_report.json` (per-strategy metrics), one
+`<strategy>_weights.csv` per strategy, and `factor_summary.json` (per-factor-tag aggregated
+performance across the run — see "Factor Tagging" above).
