@@ -173,7 +173,8 @@ def _apply_factor_tiebreak(best_per_template: dict, factor_report: dict, epsilon
     return best_result, factor_context, factor_tiebreak_used
 
 
-def _search_allocation(universe: dict, cfg: GeneratorConfig, factor_report: dict = None) -> dict:
+def _search_allocation(universe: dict, cfg: GeneratorConfig, factor_report: dict = None,
+                        extra_templates: list = None) -> dict:
     """Grid search across all allocation templates.
 
     If `factor_report` is supplied (see run_strategygen.py's --factor-report
@@ -186,14 +187,33 @@ def _search_allocation(universe: dict, cfg: GeneratorConfig, factor_report: dict
     report only nudges genuinely close calls, and is documented as such in
     the returned factor_context/factor_tiebreak_used fields regardless of
     whether it actually fired.
+
+    `extra_templates`, if supplied, is a list of ALREADY-INSTANTIATED
+    AllocationTemplate objects (e.g. PatternBasedAllocationTemplate
+    instances built by stratgen/pattern_mining.py from a universe-specific
+    mined pattern) folded into the SAME candidate pool as the 9 static,
+    zero-arg-constructible classes in ALLOCATION_TEMPLATES -- they compete
+    through the identical grid-search + ERS + factor-tiebreak pipeline below,
+    with no special-casing. Omitting it (default None/[]) is exactly
+    today's behavior.
     """
 
     all_results = []
     total_grid_trials = 0
 
-    # 1. Grid Search across all templates
-    for template_cls in ALLOCATION_TEMPLATES:
-        template = template_cls()
+    # 1. Grid Search across all templates (static + any pre-instantiated extras)
+    templates = [template_cls() for template_cls in ALLOCATION_TEMPLATES] + list(extra_templates or [])
+
+    names_seen = set()
+    for template in templates:
+        if template.name in names_seen:
+            raise ValueError(
+                f"Duplicate allocation template name '{template.name}' -- template names must be "
+                f"unique within a single generate() call (this can happen if extra_templates collides "
+                f"with a static template name, or two mined templates share the same name)."
+            )
+        names_seen.add(template.name)
+
         combos = grid_combinations(template.param_grid)
         total_grid_trials += len(combos)
 
@@ -260,17 +280,20 @@ class StrategyGenerator:
     def __init__(self, config: GeneratorConfig = None):
         self.config = config or GeneratorConfig()
 
-    def generate(self, universe: dict, factor_report: dict = None) -> GeneratedStrategySpec:
+    def generate(self, universe: dict, factor_report: dict = None, extra_templates: list = None) -> GeneratedStrategySpec:
         """`factor_report` is the optional, parsed contents of a
         research_strategy factor_summary.json (see run_strategygen.py's
         --factor-report flag) -- omit it (default) for today's unchanged
-        behavior. See _search_allocation's docstring for exactly how/when it
-        can influence the winning template."""
+        behavior. `extra_templates` is an optional list of pre-instantiated
+        AllocationTemplate objects (e.g. from stratgen/pattern_mining.py) to
+        fold into the search alongside the 9 static templates -- omit it
+        (default) for today's unchanged behavior. See _search_allocation's
+        docstring for exactly how/when either can influence the winner."""
         cfg = self.config
         if not universe:
             raise ValueError("universe must contain at least one symbol's OHLCV DataFrame")
 
-        result = _search_allocation(universe, cfg, factor_report=factor_report)
+        result = _search_allocation(universe, cfg, factor_report=factor_report, extra_templates=extra_templates)
 
         template = result["template"]
         params = result["params"]

@@ -27,7 +27,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from common.allocation_backtester import run_allocation_backtest
-from common.allocation_templates import ALLOCATION_TEMPLATES
+from common.allocation_templates import ALLOCATION_TEMPLATES, PatternBasedAllocationTemplate
 from common.data import load_universe
 from common.universe import add_universe_cli_args, resolve_universe_from_args
 
@@ -70,7 +70,23 @@ def _align_universe(universe: dict) -> dict:
     return {symbol: df.loc[common_index] for symbol, df in universe.items()}
 
 
-def _get_template(template_name: str):
+def _get_template(template_name: str, pattern_spec: dict = None):
+    """Looks up a static template by name, UNLESS `pattern_spec` is given --
+    a PatternBasedAllocationTemplate (strategy_generator/stratgen/
+    pattern_mining.py) is universe-specific and not zero-arg constructible,
+    so it's never in the static ALLOCATION_TEMPLATES registry; a strategy.json
+    produced from a winning mined pattern carries its own `pattern_spec`
+    (see run_strategygen.py) so it can be reconstructed here instead."""
+    if pattern_spec is not None:
+        return PatternBasedAllocationTemplate(
+            feature_name=pattern_spec["feature_name"],
+            feature_lookback=pattern_spec["feature_lookback"],
+            threshold=pattern_spec["threshold"],
+            comparison=pattern_spec["comparison"],
+            event_type=pattern_spec["event_type"],
+            mined_p_value=pattern_spec.get("mined_p_value"),
+            mined_n_events=pattern_spec.get("mined_n_events"),
+        )
     for cls in ALLOCATION_TEMPLATES:
         if cls.name == template_name:
             return cls()
@@ -227,6 +243,7 @@ def main():
     template_name = strategy_def["template_name"]
     params = strategy_def["params"]
     explanation = strategy_def.get("explanation", "")
+    pattern_spec = strategy_def.get("pattern_spec")
 
     print(f"Loaded Strategy: {template_name}")
     print(f"Parameters: {params}")
@@ -257,7 +274,7 @@ def main():
 
     if args.mode == "standard":
         print("\n=== Running Standard Backtest ===")
-        result = run_standard(universe, _get_template(template_name), params, args)
+        result = run_standard(universe, _get_template(template_name, pattern_spec), params, args)
 
         print(f"Sharpe Ratio: {result['sharpe_ratio']:.2f} | CAGR: {result['cagr']*100:.2f}% | "
               f"Max Drawdown: {result['max_drawdown']*100:.1f}%")
@@ -278,7 +295,7 @@ def main():
         print(f"\n=== Running Walkforward Rolling Evaluation ===")
         print(f"Window: {args.window_years} years, Step: {args.step_years} years")
 
-        folds = run_walkforward(universe, _get_template(template_name), params, args)
+        folds = run_walkforward(universe, _get_template(template_name, pattern_spec), params, args)
 
         folds_df = pd.DataFrame(folds)
         print("\nRolling Windows Performance:")

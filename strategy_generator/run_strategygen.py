@@ -24,6 +24,7 @@ import pandas as pd
 from common.universe import add_universe_cli_args, resolve_universe_from_args
 from stratgen.data import load_ohlcv
 from stratgen.generator import GeneratorConfig, StrategyGenerator
+from stratgen.pattern_mining import build_pattern_templates, mine_indicator_patterns
 
 
 def _load_factor_report(path: str) -> dict:
@@ -71,6 +72,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="How close (as a fraction of the leading Sharpe, also used as an absolute floor) "
                         "two templates' scores must be before --factor-report is allowed to break the tie "
                         "(default: 0.05 = 5%%). Ignored if --factor-report is not given.")
+    p.add_argument("--mine-patterns", action="store_true",
+                   help="Detect this universe's aggregate portfolio turning points (peaks/troughs), mine "
+                        "a menu of popular technical indicators for a statistically significant pattern "
+                        "preceding them (Bonferroni-corrected shuffle-null test, see "
+                        "stratgen/pattern_mining.py), and fold any significant finding into the search as "
+                        "an additional candidate template -- it still must clear the same Equivalent "
+                        "Random Search bar as every static template. Finding 0 significant patterns is a "
+                        "common, valid outcome (especially on synthetic data), not an error.")
+    p.add_argument("--pattern-min-swing-pct", type=float, default=0.05,
+                   help="Minimum zigzag swing size (fraction) to confirm a turning point (default 0.05 = 5%%).")
+    p.add_argument("--pattern-lag-bars", type=int, default=20,
+                   help="How many trading days BEFORE each turning point to read indicators at, to avoid "
+                        "the near-tautological result of reading them AT the turning point itself (default 20; "
+                        "see pattern_mining.py's module docstring for why this matters).")
+    p.add_argument("--pattern-max-templates", type=int, default=5,
+                   help="Cap on how many significant mined patterns become candidate templates (default 5).")
     p.add_argument("--data-provider", default="yfinance",
                    help="Market data source provider ('yfinance', 'csv', 'synthetic', or custom module specifier string e.g. 'script.py:CustomProvider')")
     p.add_argument("--data-dir", type=str, default=None,
@@ -109,8 +126,26 @@ def main():
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
+    extra_templates = None
+    if args.mine_patterns:
+        findings, mining_status = mine_indicator_patterns(
+            universe,
+            min_swing_pct=args.pattern_min_swing_pct,
+            lag_bars=args.pattern_lag_bars,
+        )
+        if mining_status != "ok":
+            print(f"Pattern mining: {mining_status} -- skipping, proceeding with the 9 standard templates only.")
+        else:
+            extra_templates = build_pattern_templates(findings, max_templates=args.pattern_max_templates)
+            n_significant = int(findings["significant"].sum()) if not findings.empty else 0
+            # 0 significant patterns is an expected, valid outcome (especially
+            # on synthetic data) -- not an error. See pattern_mining.py.
+            print(f"Pattern mining found {n_significant} statistically significant indicator pattern(s) "
+                  f"out of {len(findings)} tested (Bonferroni-corrected, lag={args.pattern_lag_bars} bars); "
+                  f"{len(extra_templates)} added as candidate template(s).")
+
     if args.mode == "generate":
-        spec = StrategyGenerator(gen_config).generate(universe, factor_report=factor_report)
+        spec = StrategyGenerator(gen_config).generate(universe, factor_report=factor_report, extra_templates=extra_templates)
         print(f"\n=== Generated Allocation Strategy for basket of {spec.n_symbols} assets ===")
         print(f"  Template: {spec.template_name}")
         print(f"  Optimal Parameters: {spec.params}")
@@ -140,6 +175,25 @@ def main():
         weights.ffill().fillna(0.0).to_csv(out_path)
         print(f"\nSaved full daily target weights to {out_path}")
 
+        # If a mined PatternBasedAllocationTemplate won, it's NOT in the
+        # static ALLOCATION_TEMPLATES registry (it's universe-specific, not
+        # zero-arg constructible) -- embed its reconstruction fields
+        # directly so backtester/run_backtest.py can rebuild the exact same
+        # instance from strategy.json alone (see its own _get_template).
+        pattern_spec = None
+        for t in (extra_templates or []):
+            if t.name == spec.template_name:
+                pattern_spec = {
+                    "feature_name": t.feature_name,
+                    "feature_lookback": t.feature_lookback,
+                    "threshold": t.threshold,
+                    "comparison": t.comparison,
+                    "event_type": t.event_type,
+                    "mined_p_value": t.mined_p_value,
+                    "mined_n_events": t.mined_n_events,
+                }
+                break
+
         strategy_json_path = os.path.join(RESULTS_DIR, "strategy.json")
         with open(strategy_json_path, "w") as f:
             json.dump({
@@ -157,6 +211,7 @@ def main():
                 "ers_percentile": spec.ers_percentile,
                 "factor_context": spec.factor_context,
                 "factor_tiebreak_used": spec.factor_tiebreak_used,
+                "pattern_spec": pattern_spec,
             }, f, indent=2)
         print(f"Saved strategy definition to {strategy_json_path}")
     else:

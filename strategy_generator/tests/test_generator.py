@@ -1,8 +1,17 @@
+from unittest.mock import patch
+
 import numpy as np
 import pandas as pd
+import pytest
 from common.testing import make_ohlcv_from_closes as make_df
 
-from stratgen.generator import GeneratorConfig, StrategyGenerator, _apply_factor_tiebreak
+from stratgen.generator import (
+    GeneratorConfig,
+    StrategyGenerator,
+    _apply_factor_tiebreak,
+    _portfolio_score,
+    _search_allocation,
+)
 
 
 class _FakeTemplate:
@@ -184,3 +193,69 @@ def test_generator_factor_report_none_is_byte_for_byte_unchanged():
     assert spec_without_report.template_name == spec_with_none_report.template_name == "cross_sectional_momentum"
     assert not spec_without_report.factor_context
     assert spec_without_report.factor_tiebreak_used is False
+
+
+# --- extra_templates -------------------------------------------------------
+
+class _FixedNameTemplate:
+    """A minimal AllocationTemplate-shaped test double -- just enough to
+    exercise _search_allocation's pool-building/dedup logic without a real
+    backtest."""
+    def __init__(self, name):
+        self.name = name
+        self.param_grid = {"rebalance_freq_days": [21]}
+        self.factor_tags = []
+
+    def generate_weights(self, universe, params):
+        symbols = list(universe.keys())
+        master_index = universe[symbols[0]].index
+        weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
+        weights_df.loc[master_index[::params["rebalance_freq_days"]]] = 1.0 / len(symbols)
+        return weights_df
+
+    def explain_weights(self, params):
+        return "test"
+
+    def warmup_bars(self, params):
+        return 0
+
+
+def _small_universe():
+    idx = pd.bdate_range("2020-01-01", periods=100)
+    return {"A": make_df(np.linspace(100, 110, 100), start="2020-01-01"),
+            "B": make_df(np.linspace(100, 90, 100), start="2020-01-01")}
+
+
+def test_extra_templates_none_is_byte_for_byte_unchanged():
+    universe = _small_universe()
+    config = GeneratorConfig(n_random_search=5, seed=1)
+    result_default = _search_allocation(universe, config)
+    result_none = _search_allocation(universe, config, extra_templates=None)
+    result_empty = _search_allocation(universe, config, extra_templates=[])
+    assert result_default["template"].name == result_none["template"].name == result_empty["template"].name
+    assert result_default["score"] == result_none["score"] == result_empty["score"]
+
+
+def test_extra_templates_duplicate_name_raises():
+    universe = _small_universe()
+    config = GeneratorConfig(n_random_search=5, seed=1)
+    colliding = _FixedNameTemplate("equal_weight")  # collides with a static template's name
+    with pytest.raises(ValueError, match="Duplicate allocation template name"):
+        _search_allocation(universe, config, extra_templates=[colliding])
+
+
+def test_extra_template_can_win_when_it_clearly_scores_best():
+    universe = _small_universe()
+    config = GeneratorConfig(n_random_search=5, seed=1)
+    extra = _FixedNameTemplate("my_extra_template")
+
+    def fake_portfolio_score(universe, template, params, cfg):
+        if getattr(template, "name", None) == "my_extra_template":
+            return {"sharpe_ratio": 999.0, "total_rebalances": 10, "total_turnover": 1.0}
+        return _portfolio_score(universe, template, params, cfg)
+
+    with patch("stratgen.generator._portfolio_score", side_effect=fake_portfolio_score):
+        result = _search_allocation(universe, config, extra_templates=[extra])
+
+    assert result["template"].name == "my_extra_template"
+    assert result["score"] == 999.0

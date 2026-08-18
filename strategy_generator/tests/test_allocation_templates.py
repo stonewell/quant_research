@@ -13,6 +13,7 @@ from common.allocation_templates import (
     MaxDiversificationAllocation,
     MeanReversionAllocation,
     MinimumVarianceAllocation,
+    PatternBasedAllocationTemplate,
 )
 
 
@@ -338,3 +339,71 @@ def test_all_templates_declare_factor_tags():
         template = cls()
         assert isinstance(template.factor_tags, list)
         assert len(template.factor_tags) > 0, f"{template.name} has no factor_tags"
+
+
+# --- PatternBasedAllocationTemplate ----------------------------------------
+
+def test_pattern_based_template_is_not_in_the_static_list():
+    # Deliberately excluded: it's not zero-arg constructible (its threshold
+    # comes from mining a SPECIFIC basket first) -- see its own docstring.
+    assert "PatternBasedAllocationTemplate" not in [cls.__name__ for cls in ALLOCATION_TEMPLATES]
+
+
+def test_pattern_based_template_rejects_invalid_comparison_and_event_type():
+    import pytest
+    with pytest.raises(ValueError, match="comparison"):
+        PatternBasedAllocationTemplate("rsi", 14, threshold=30.0, comparison="sideways", event_type="trough")
+    with pytest.raises(ValueError, match="event_type"):
+        PatternBasedAllocationTemplate("rsi", 14, threshold=30.0, comparison="below", event_type="plateau")
+
+
+def test_pattern_based_template_trough_direction_invests_when_triggered():
+    # A deliberately crashed-then-flat universe: RSI(14) stays low (oversold)
+    # for a long stretch after the crash -- a trough-direction template
+    # (comparison="below") should invest during that stretch.
+    n = 200
+    crash_then_flat = np.concatenate([np.linspace(100, 60, 40), np.full(n - 40, 60.0)])
+    universe = {
+        "A": make_df(crash_then_flat, start="2020-01-01"),
+        "B": make_df(crash_then_flat, start="2020-01-01"),
+    }
+    template = PatternBasedAllocationTemplate("rsi", 14, threshold=40.0, comparison="below", event_type="trough")
+    params = {"threshold_mult": 1.0, "hold_days": 21, "rebalance_freq_days": 5}
+    weights = template.generate_weights(universe, params)
+    rebalance_rows = weights.dropna(how="all")
+    assert not rebalance_rows.empty
+    # At least one rebalance during/after the crash should be invested.
+    assert (rebalance_rows.sum(axis=1) > 0).any()
+
+
+def test_pattern_based_template_peak_direction_derisks_when_triggered():
+    # A deliberately sharply-rallying universe: ADX(14) rises during a strong
+    # sustained trend -- a peak-direction template (comparison="above")
+    # should de-risk (fall to cash) once ADX crosses the mined threshold.
+    n = 200
+    strong_rally = 100 + np.cumsum(np.full(n, 0.8))  # smooth, strong, sustained uptrend
+    universe = {
+        "A": make_df(strong_rally, start="2020-01-01"),
+        "B": make_df(strong_rally, start="2020-01-01"),
+    }
+    template = PatternBasedAllocationTemplate("adx", 14, threshold=20.0, comparison="above", event_type="peak")
+    params = {"threshold_mult": 1.0, "hold_days": 21, "rebalance_freq_days": 5}
+    weights = template.generate_weights(universe, params)
+    rebalance_rows = weights.dropna(how="all")
+    assert not rebalance_rows.empty
+    # Once ADX confirms the strong trend, later rebalances should be de-risked (0).
+    assert (rebalance_rows.sum(axis=1) == 0).any()
+
+
+def test_pattern_based_template_empty_universe_returns_empty_frame():
+    template = PatternBasedAllocationTemplate("rsi", 14, threshold=30.0, comparison="below", event_type="trough")
+    assert template.generate_weights({}, {"rebalance_freq_days": 21}).empty
+
+
+def test_pattern_based_template_warmup_bars_includes_hold_days():
+    template = PatternBasedAllocationTemplate("sma_rel", 50, threshold=0.0, comparison="below", event_type="trough")
+    assert template.warmup_bars({"hold_days": 21}) == 71
+    tuple_lookback_template = PatternBasedAllocationTemplate(
+        "macd_hist", (12, 26, 9), threshold=0.0, comparison="above", event_type="peak"
+    )
+    assert tuple_lookback_template.warmup_bars({"hold_days": 10}) == 36

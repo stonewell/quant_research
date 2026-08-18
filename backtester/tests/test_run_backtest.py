@@ -53,6 +53,28 @@ def test_get_template():
         pass
 
 
+def test_get_template_reconstructs_pattern_based_template_from_spec():
+    # A PatternBasedAllocationTemplate (strategy_generator/stratgen/
+    # pattern_mining.py) is universe-specific and never in the static
+    # ALLOCATION_TEMPLATES registry -- it must be reconstructed from a
+    # pattern_spec dict instead (see run_strategygen.py's strategy.json output).
+    pattern_spec = {
+        "feature_name": "rsi",
+        "feature_lookback": 14,
+        "threshold": 30.0,
+        "comparison": "below",
+        "event_type": "trough",
+        "mined_p_value": 0.001,
+        "mined_n_events": 12,
+    }
+    template = _get_template("pattern_rsi_14_trough", pattern_spec)
+    assert template.name == "pattern_rsi_14_trough"
+    assert template.feature_name == "rsi"
+    assert template.feature_lookback == 14
+    assert template.comparison == "below"
+    assert template.event_type == "trough"
+
+
 class MockArgs:
     def __init__(self, **kwargs):
         self.initial_capital = 100_000.0
@@ -178,9 +200,12 @@ def test_run_walkforward_warms_up_indicator_lookback_before_each_fold():
         assert fold["total_rebalances"] == 12
 
 
-def _write_strategy_file(path, template_name="equal_weight", params=None):
+def _write_strategy_file(path, template_name="equal_weight", params=None, pattern_spec=None):
+    strategy_def = {"template_name": template_name, "params": params or {"rebalance_freq_days": 10}}
+    if pattern_spec is not None:
+        strategy_def["pattern_spec"] = pattern_spec
     with open(path, "w") as f:
-        json.dump({"template_name": template_name, "params": params or {"rebalance_freq_days": 10}}, f)
+        json.dump(strategy_def, f)
 
 
 def test_load_strategy_file_missing_required_keys(tmp_path):
@@ -269,3 +294,42 @@ def test_main_results_dir_and_cache_dir_overrides(tmp_path, monkeypatch):
     assert os.path.exists(results_dir / "backtest_equity.csv")
     assert os.path.exists(results_dir / "backtest_weights.csv")
     assert len(list(cache_dir.glob("*.csv"))) == 2
+
+
+def test_main_runs_pattern_based_strategy_end_to_end(tmp_path, monkeypatch):
+    # A strategy.json carrying a pattern_spec (produced by strategy_generator's
+    # --mine-patterns) must round-trip through main() exactly like a static
+    # template does -- this is the integration point that lets a mined,
+    # ERS-validated pattern actually be re-run/re-verified independently.
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(
+        strategy_path,
+        template_name="pattern_rsi_14_trough",
+        params={"threshold_mult": 1.0, "hold_days": 21, "rebalance_freq_days": 21},
+        pattern_spec={
+            "feature_name": "rsi",
+            "feature_lookback": 14,
+            "threshold": 30.0,
+            "comparison": "below",
+            "event_type": "trough",
+            "mined_p_value": 0.01,
+            "mined_n_events": 15,
+        },
+    )
+    results_dir = tmp_path / "results"
+    cache_dir = tmp_path / "cache"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "AAA", "BBB", "CCC",
+        "--data-provider", "synthetic",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    main()
+
+    assert os.path.exists(results_dir / "backtest_equity.csv")
+    assert os.path.exists(results_dir / "backtest_weights.csv")

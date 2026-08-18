@@ -22,6 +22,7 @@ from typing import Dict
 import numpy as np
 import pandas as pd
 
+from common.indicator_features import compute_feature
 from common.indicators import realized_vol, roc, rsi
 from common.scheduling import get_rebalance_dates as _get_rebalance_dates
 
@@ -169,6 +170,56 @@ def _min_variance_weights(cov: np.ndarray) -> np.ndarray:
     w = np.clip(result.x, 0.0, None)
     total = w.sum()
     return w / total if total > 0 else x0
+
+
+def build_aggregate_curve(universe: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Equal-weight aggregate OHLCV curve for a whole universe: each symbol's
+    own OHLC is rebased to start at the same level (100), then averaged
+    cross-sectionally per day. This is a standard "normalized index"
+    construction, and it guarantees the aggregate retains a sane
+    High >= Close >= Low relationship, since averaging preserves that
+    per-symbol inequality elementwise (High_i >= Close_i for every symbol
+    and every day implies mean(High) >= mean(Close)).
+
+    Symbols are aligned via inner join on their shared trading calendar
+    (matching backtester/run_backtest.py's `_align_universe`) before
+    averaging -- every symbol is fully present at every date in the
+    returned curve, none are partially included or zero-filled.
+
+    DISCLOSED APPROXIMATION: a real portfolio's own intraday high/low isn't
+    literally the average of its constituents' individual highs/lows (those
+    don't necessarily occur at the same moment); this is the same standard
+    simplification used to approximate a basket's own OHLC from constituent
+    OHLC when true simultaneous-quote data isn't available. Used by
+    `PatternBasedAllocationTemplate` below and by
+    `strategy_generator/stratgen/pattern_mining.py`'s turning-point mining,
+    which both need ONE aggregate curve to detect turning points/compute
+    indicators on, not a per-symbol one.
+    """
+    symbols = [s for s, df in universe.items() if not df.empty]
+    if not symbols:
+        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+
+    master_index = universe[symbols[0]].index
+    for sym in symbols[1:]:
+        master_index = master_index.intersection(universe[sym].index)
+    master_index = master_index.sort_values()
+    if len(master_index) < 2:
+        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+
+    out = {}
+    for field in ("Open", "High", "Low", "Close"):
+        normalized = pd.DataFrame({
+            sym: universe[sym][field].reindex(master_index) / universe[sym]["Close"].reindex(master_index).iloc[0]
+            for sym in symbols
+        })
+        out[field] = 100.0 * normalized.mean(axis=1, skipna=True)
+
+    if all("Volume" in universe[sym].columns for sym in symbols):
+        volumes = pd.DataFrame({sym: universe[sym]["Volume"].reindex(master_index) for sym in symbols})
+        out["Volume"] = volumes.sum(axis=1, skipna=True)
+
+    return pd.DataFrame(out, index=master_index)
 
 
 @dataclass
@@ -692,3 +743,126 @@ ALLOCATION_TEMPLATES = [
     MinimumVarianceAllocation,
     BreadthGatedMomentumAllocation,
 ]
+
+
+class PatternBasedAllocationTemplate(AllocationTemplate):
+    """A trading signal built from ONE indicator pattern discovered by
+    `strategy_generator/stratgen/pattern_mining.py`'s turning-point pattern
+    mining -- deliberately NOT in `ALLOCATION_TEMPLATES` above, unlike the 9
+    static templates. Those are universe-agnostic formulas, zero-arg
+    constructible, searched for every basket; this template's own threshold
+    comes from mining a SPECIFIC basket's aggregate-portfolio turning-point
+    history first, so it can't be a static class -- it's instantiated by the
+    mining orchestration and passed into `StrategyGenerator.generate(...,
+    extra_templates=[...])`, competing through the exact same grid-search +
+    Equivalent Random Search validation as every static template.
+
+    HONEST CAVEAT (read `pattern_mining.py`'s module docstring for the full
+    version): the mining pass that discovered this template's threshold
+    needed a few bars of hindsight to LABEL a historical date a "turning
+    point" at all (zigzag confirmation lag) -- but this live signal has NO
+    such lag itself: it only compares today's already-known indicator
+    reading against the mined threshold, never trying to detect a turning
+    point in real time. A mined pattern passing its own (Bonferroni-
+    corrected) significance test is necessary, not sufficient, for it to be
+    presented as trustworthy -- it must ALSO clear the same ERS bar every
+    other template does; on synthetic data, most mining passes are expected
+    to find nothing significant at all, matching this workspace's own
+    repeated finding elsewhere that most series show no significant
+    structure.
+    """
+
+    def __init__(self, feature_name: str, feature_lookback, threshold: float,
+                 comparison: str, event_type: str, mined_p_value: float = None,
+                 mined_n_events: int = None):
+        if comparison not in ("below", "above"):
+            raise ValueError(f"comparison must be 'below' or 'above', got {comparison!r}")
+        if event_type not in ("trough", "peak"):
+            raise ValueError(f"event_type must be 'trough' or 'peak', got {event_type!r}")
+
+        self.feature_name = feature_name
+        self.feature_lookback = feature_lookback
+        self.threshold = threshold
+        self.comparison = comparison
+        self.event_type = event_type
+        self.mined_p_value = mined_p_value
+        self.mined_n_events = mined_n_events
+
+        lb = feature_lookback
+        lb_str = "_".join(str(x) for x in lb) if isinstance(lb, (tuple, list)) else str(lb)
+        name = f"pattern_{feature_name}_{lb_str}_{event_type}"
+        super().__init__(
+            name=name,
+            param_grid={
+                "threshold_mult": [0.9, 1.0, 1.1],
+                "hold_days": [10, 21, 42],
+                "rebalance_freq_days": [5, 21],
+            },
+            factor_tags=["regime_trend_strength"] if event_type == "peak" else ["mean_reversion"],
+        )
+
+    def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict) -> pd.DataFrame:
+        symbols = list(universe.keys())
+        if not symbols:
+            return pd.DataFrame()
+
+        curve = build_aggregate_curve(universe)
+        if curve.empty or len(curve) < 2:
+            return pd.DataFrame()
+
+        master_index = curve.index
+        rebalance_dates = _get_rebalance_dates(master_index, params.get("rebalance_freq_days", 21))
+        if len(rebalance_dates) == 0:
+            return pd.DataFrame()
+
+        threshold_mult = params.get("threshold_mult", 1.0)
+        hold_days = params.get("hold_days", 21)
+        effective_threshold = self.threshold * threshold_mult
+
+        feature = compute_feature(curve, self.feature_name, self.feature_lookback)
+        trigger = (feature <= effective_threshold) if self.comparison == "below" else (feature >= effective_threshold)
+        # A trigger STAYS active for `hold_days` bars after it fires --
+        # vectorized, backward-only (no explicit stateful loop needed).
+        active = trigger.rolling(hold_days, min_periods=1).max().fillna(0).astype(bool)
+
+        # Trough (bullish finding): cash baseline, invest while active.
+        # Peak (bearish finding): invested baseline, de-risk to cash while active.
+        invested = active if self.event_type == "trough" else ~active
+
+        n_symbols = len(symbols)
+        weights_rebal = pd.DataFrame(index=rebalance_dates, columns=symbols, data=0.0)
+        for date in rebalance_dates:
+            if date in invested.index and bool(invested.loc[date]):
+                weights_rebal.loc[date, :] = 1.0 / n_symbols
+
+        weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
+        weights_df.loc[rebalance_dates] = weights_rebal
+        return weights_df
+
+    def explain_weights(self, params: dict) -> str:
+        threshold_mult = params.get("threshold_mult", 1.0)
+        hold_days = params.get("hold_days", 21)
+        rebal = params.get("rebalance_freq_days", 21)
+        effective_threshold = self.threshold * threshold_mult
+        action = "invests" if self.event_type == "trough" else "de-risks to cash"
+        p_str = f"p={self.mined_p_value:.4f}" if self.mined_p_value is not None else "p=n/a"
+        return (
+            f"Pattern-Based ({self.event_type}-associated {self.feature_name}[{self.feature_lookback}]): "
+            f"rebalances every {rebal} trading days. Mined from this basket's own aggregate-portfolio "
+            f"turning-point history via a Bonferroni-corrected shuffle-null significance test "
+            f"({p_str}, n_events={self.mined_n_events}) -- see "
+            f"strategy_generator/stratgen/pattern_mining.py. {action.capitalize()} (equal-weight across "
+            f"the basket) for {hold_days} trading days whenever the {self.feature_name} reading "
+            f"{self.comparison} {effective_threshold:.4g} (mined threshold x {threshold_mult}). HONEST "
+            f"CAVEAT: the mining pass needed a few bars of hindsight to LABEL a historical date a turning "
+            f"point at all (zigzag confirmation lag) -- but this live signal has no such lag itself, since "
+            f"it only compares today's already-known reading against the mined threshold. Passed this "
+            f"workspace's standard Equivalent Random Search validation like every other template; a "
+            f"significant reading during mining reflects mechanism, not a guaranteed real edge -- see "
+            f"strategy_generator/README.md's pattern-mining section."
+        )
+
+    def warmup_bars(self, params: dict) -> int:
+        lb = self.feature_lookback
+        base_lookback = max(lb) if isinstance(lb, (tuple, list)) else lb
+        return base_lookback + params.get("hold_days", 21)

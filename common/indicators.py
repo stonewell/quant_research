@@ -147,6 +147,77 @@ def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> p
     return pd.DataFrame({"macd": macd_line, "signal": signal_line, "hist": macd_line - signal_line})
 
 
+def ema(close: pd.Series, period: int) -> pd.Series:
+    """Standard exponential moving average (span/adjust=False convention,
+    matching this module's own `macd` internals) -- distinct from Wilder's
+    alpha=1/period smoothing used by `rsi_wilder`/`atr`/`adx`, which is a
+    different (slower-decaying) weighting, not just a naming variant."""
+    return close.ewm(span=period, adjust=False, min_periods=period).mean()
+
+
+def bollinger_bands(close: pd.Series, period: int = 20, num_std: float = 2.0) -> pd.DataFrame:
+    """Bollinger Bands (Bollinger 1980s): a `period`-bar SMA envelope +/-
+    `num_std` rolling standard deviations. Returns `mid`/`upper`/`lower` plus
+    two derived, commonly-used descriptive columns: `pctb` (%B, where price
+    sits within the band: 0.0 = lower band, 1.0 = upper band, can exceed
+    [0,1] on a breakout) and `bandwidth` ((upper-lower)/mid, a squeeze/
+    expansion measure)."""
+    mid = sma(close, period)
+    std = close.rolling(window=period, min_periods=period).std()
+    upper = mid + num_std * std
+    lower = mid - num_std * std
+    pctb = (close - lower) / (upper - lower).replace(0, np.nan)
+    bandwidth = (upper - lower) / mid.replace(0, np.nan)
+    return pd.DataFrame({"mid": mid, "upper": upper, "lower": lower, "pctb": pctb, "bandwidth": bandwidth})
+
+
+def stochastic_oscillator(df: pd.DataFrame, k_period: int = 14, d_period: int = 3) -> pd.DataFrame:
+    """Stochastic Oscillator (Lane): %K measures where the close sits within
+    the trailing `k_period`-bar high-low range (0-100); %D is a `d_period`-bar
+    SMA of %K. df must have columns High, Low, Close."""
+    high, low, close = df["High"], df["Low"], df["Close"]
+    lowest_low = low.rolling(window=k_period, min_periods=k_period).min()
+    highest_high = high.rolling(window=k_period, min_periods=k_period).max()
+    k = 100 * (close - lowest_low) / (highest_high - lowest_low).replace(0, np.nan)
+    d = k.rolling(window=d_period, min_periods=d_period).mean()
+    return pd.DataFrame({"k": k, "d": d})
+
+
+def cci(df: pd.DataFrame, period: int = 20) -> pd.Series:
+    """Commodity Channel Index (Lambert 1980): typical price's deviation from
+    its own SMA, scaled by mean absolute deviation (the constant 0.015 sets
+    the conventional +/-100 band). df must have columns High, Low, Close."""
+    typical_price = (df["High"] + df["Low"] + df["Close"]) / 3.0
+    tp_sma = sma(typical_price, period)
+    mean_abs_dev = typical_price.rolling(window=period, min_periods=period).apply(
+        lambda x: np.abs(x - x.mean()).mean(), raw=True
+    )
+    return (typical_price - tp_sma) / (0.015 * mean_abs_dev.replace(0, np.nan))
+
+
+def williams_r(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Williams %R (Williams): where the close sits within the trailing
+    `period`-bar high-low range, on a 0 to -100 scale (0 = period high,
+    -100 = period low) -- the same underlying construction as the Stochastic
+    %K, rescaled and inverted. df must have columns High, Low, Close."""
+    high, low, close = df["High"], df["Low"], df["Close"]
+    highest_high = high.rolling(window=period, min_periods=period).max()
+    lowest_low = low.rolling(window=period, min_periods=period).min()
+    return -100 * (highest_high - close) / (highest_high - lowest_low).replace(0, np.nan)
+
+
+def obv(df: pd.DataFrame) -> pd.Series:
+    """On-Balance Volume (Granville 1963): cumulative volume, added on an
+    up-close bar and subtracted on a down-close bar -- a running measure of
+    whether volume is flowing into or out of an instrument. df must have
+    columns Close, Volume (the one indicator in this module that needs
+    Volume; most synthetic OHLCV test fixtures in this workspace don't
+    generate one -- see common/data.py's SyntheticDataProvider, which does)."""
+    close, volume = df["Close"], df["Volume"]
+    direction = np.sign(close.diff()).fillna(0.0)
+    return (direction * volume).cumsum()
+
+
 # --------------------------------------------------------------------------
 # Candlestick reversal patterns (OHLC single-/two-/three-bar patterns).
 #
