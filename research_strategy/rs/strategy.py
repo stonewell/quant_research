@@ -17,12 +17,25 @@ Timing Strategies (ported from workspace side projects & extended for multi-asse
 7. SwingTrendPullbackStrategy
 8. AdaptiveGridStrategy
 9. EnsembleRegimeSwitchingStrategy
+10. TurtleBreakoutStrategy (Dennis & Eckhardt / Donchian)
+
+Modern Popular Portfolios (static, fixed-weight, no momentum/trend logic):
+11. PermanentPortfolioStrategy (Harry Browne)
+12. GoldenButterflyStrategy (Portfolio Charts)
+13. AllWeatherStrategy (Dalio-style retail risk-parity approximation)
+14. HFEAStrategy ("Hedgefundie's Excellent Adventure", leveraged UPRO/TMF)
+
+Modern Systematic TAA Extensions:
+15. ProtectiveAssetAllocation (Keller & Keuning 2016, SSRN #2759734, PAA)
+16. AdaptiveAssetAllocation (Butler/Philbrick/Gordillo/Varadi 2012, SSRN #2328254, AAA)
 """
 
 from typing import Dict, List, Union
+import warnings
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize
 
 from common.indicators import (
     adx,
@@ -1066,4 +1079,493 @@ class TurtleBreakoutStrategy(AllocationTemplate):
         atr_period = p.get("turtle_atr_period", cfg.turtle_atr_period)
         ma_period = p.get("turtle_trend_ma_period", cfg.turtle_trend_ma_period) if p.get("turtle_require_trend_filter", cfg.turtle_require_trend_filter) else 0
         return max(entry_days, exit_days, atr_period, ma_period) + 1
+
+
+# --- Modern Popular Static Portfolios -------------------------------------
+# Fixed-weight, periodically-rebalanced allocations -- no momentum, no trend
+# gate, no cross-sectional ranking. Each preset substitutes a ticker already
+# in this project's default universe for a canonical holding where a close,
+# disclosed equivalent exists (see each class's own docstring for specifics),
+# to avoid introducing new symbols purely for cosmetic ticker fidelity.
+
+PERMANENT_PORTFOLIO_WEIGHTS = {"SPY": 0.25, "TLT": 0.25, "BIL": 0.25, "GLD": 0.25}
+
+GOLDEN_BUTTERFLY_WEIGHTS = {
+    "SPY": 0.20,  # total-market stock sleeve (canonical: VTI)
+    "IWM": 0.20,  # small-cap sleeve (canonical: VBR, small-cap VALUE -- this project has no
+                  # small-cap-value data source, so the value tilt is lost; disclosed)
+    "TLT": 0.20,  # long-term treasuries
+    "BIL": 0.20,  # short-term safe asset (canonical: SHY, 1-3yr treasuries; BIL substitutes
+                  # T-bills, a close but not identical duration)
+    "GLD": 0.20,  # gold
+}
+
+ALL_WEATHER_WEIGHTS = {"SPY": 0.30, "TLT": 0.40, "IEF": 0.15, "GLD": 0.075, "DBC": 0.075}
+
+HFEA_WEIGHTS = {"UPRO": 0.55, "TMF": 0.45}
+
+
+class StaticAllocationStrategy(AllocationTemplate):
+    """Generic engine for fixed-weight, periodically-rebalanced portfolios --
+    no momentum, no trend gate, no ranking. Rebalances back to the SAME
+    target weights every `rebalance_freq_days`, which matters for the
+    backtester's sparse-weights contract exactly as it does for
+    EqualWeightAllocation (see common/allocation_templates.py's module
+    docstring): recomputing an identical target on every rebalance date is
+    still a real instruction, not a no-op.
+
+    Any configured symbol absent from the universe passed to
+    generate_weights() is silently dropped -- its weight is simply left
+    unallocated (idle cash, per common/allocation_backtester.py's documented
+    convention for weights that don't sum to 1.0) rather than being
+    redistributed across the remaining symbols or raising. A strategy like
+    HFEA that names a leveraged ETF should degrade gracefully if that symbol
+    isn't in the requested universe, not crash the whole run -- but a
+    warning is emitted so the gap isn't silently invisible either.
+    """
+
+    def __init__(self, weights: Dict[str, float], rebalance_freq_days: int, name: str, config: StrategyConfig = None):
+        self.config = config or StrategyConfig()
+        self.weights = dict(weights)
+        self.default_rebalance_freq_days = rebalance_freq_days
+        super().__init__(name=name, param_grid={})
+
+    def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
+        p = params or {}
+        rebal_freq = p.get("rebalance_freq_days", self.default_rebalance_freq_days)
+        weights = p.get("weights", self.weights)
+
+        symbols = list(universe.keys())
+        if not symbols:
+            return pd.DataFrame()
+
+        master_index = universe[symbols[0]].index
+        rebalance_dates = _get_rebalance_dates(master_index, rebal_freq)
+
+        active_weights = {s: w for s, w in weights.items() if s in symbols}
+        missing = sorted(set(weights) - set(active_weights))
+        if missing:
+            warnings.warn(
+                f"{self.name}: configured symbol(s) {missing} not present in universe; "
+                f"their weight is left unallocated (idle cash), not redistributed."
+            )
+
+        row = {s: active_weights.get(s, 0.0) for s in symbols}
+        weights_rebal = pd.DataFrame([row] * len(rebalance_dates), index=rebalance_dates, columns=symbols)
+
+        weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
+        weights_df.loc[rebalance_dates] = weights_rebal
+        return weights_df
+
+    def explain_weights(self, params: dict = None) -> str:
+        p = params or {}
+        weights = p.get("weights", self.weights)
+        rebal_freq = p.get("rebalance_freq_days", self.default_rebalance_freq_days)
+        weight_str = ", ".join(f"{s} {w * 100:.1f}%" for s, w in weights.items())
+        return (
+            f"{self.name}: fixed-weight allocation ({weight_str}), rebalanced every "
+            f"{rebal_freq} trading days back to these exact targets. No momentum, "
+            f"trend gate, or ranking -- purely a static, periodically-rebalanced mix."
+        )
+
+    def warmup_bars(self, params: dict = None) -> int:
+        return 0
+
+
+class PermanentPortfolioStrategy(StaticAllocationStrategy):
+    """Permanent Portfolio (Harry Browne). Still actively covered today
+    (e.g. dividendes.ch, April 2026; optimizedportfolio.com's "(2026)"-dated
+    guide), decades after its 1980s origin.
+
+    Canonical allocation: 25% broad US stocks / 25% long-term Treasuries /
+    25% cash (T-bills) / 25% gold (VTI/TLT/BIL/GLD). This project substitutes
+    SPY for VTI (both broad-US-market proxies, ~99% correlated) to reuse a
+    symbol already in this project's default universe instead of introducing
+    a new one for an equivalent holding.
+
+    Annual rebalance is the canonical convention (not a volatility-band
+    trigger, which some modern implementations use instead). Sourced
+    performance (lazyportfolioetf.com, 10yr window): Sharpe ~0.59, ~30.6%
+    max drawdown (inflation-adjusted) -- meaningfully milder than broad
+    equities, consistent with the portfolio's stated stability-over-growth
+    design goal, not a return-maximizing one.
+    """
+
+    def __init__(self, config: StrategyConfig = None):
+        super().__init__(
+            weights=PERMANENT_PORTFOLIO_WEIGHTS,
+            rebalance_freq_days=252,
+            name="permanent_portfolio",
+            config=config,
+        )
+
+
+class GoldenButterflyStrategy(StaticAllocationStrategy):
+    """Golden Butterfly (Tyler / Portfolio Charts). Actively covered today
+    (optimizedportfolio.com "(2026)"; bestfolio.app blog).
+
+    Canonical allocation: 20% each of total-market stocks, small-cap value,
+    long-term bonds, short-term bonds, and gold -- adds a small-cap tilt and
+    splits fixed income by duration versus the Permanent Portfolio's single
+    long-bond+cash split, trading some stability for a more equity-like
+    return. See GOLDEN_BUTTERFLY_WEIGHTS above for this project's disclosed
+    ticker substitutions (IWM for VBR loses the value tilt; BIL for SHY is a
+    close but not identical duration).
+
+    Sourced performance (portfoliocharts.com / portfoliodb.com, varies by
+    window): CAGR ~8.1-8.3%, max drawdown ~-18% to -20%, Sharpe ~0.47 --
+    roughly 93% of the S&P 500's CAGR at about a third of its max drawdown
+    over the cited window.
+    """
+
+    def __init__(self, config: StrategyConfig = None):
+        super().__init__(
+            weights=GOLDEN_BUTTERFLY_WEIGHTS,
+            rebalance_freq_days=252,
+            name="golden_butterfly",
+            config=config,
+        )
+
+
+class AllWeatherStrategy(StaticAllocationStrategy):
+    """All Weather / "All Seasons" retail risk-parity approximation. The
+    specific 30/40/15/7.5/7.5 breakdown traces to Tony Robbins' "Money:
+    Master the Game" (interview with Ray Dalio) -- Portfolio Charts uses the
+    same allocation under the name "All Seasons Portfolio".
+
+    IMPORTANT: this is a FIXED-WEIGHT approximation, not genuine risk parity.
+    Real risk parity risk-BUDGETS each sleeve to contribute equal volatility
+    (typically requiring leverage on the bond sleeve to make bonds'
+    contribution match equities'); this retail version skips that entirely
+    and just holds fixed percentages -- a documented simplification, not a
+    reproduction of Bridgewater's actual methodology. Cited performance
+    figures (Robbins' own promotional material: profitable 86% of years
+    1984-2013) are weaker-sourced than Portfolio Charts' own independently
+    computed backtest and should be treated as illustrative, not verified.
+
+    Annual rebalance, standard practice for the retail version.
+    """
+
+    def __init__(self, config: StrategyConfig = None):
+        super().__init__(
+            weights=ALL_WEATHER_WEIGHTS,
+            rebalance_freq_days=252,
+            name="all_weather",
+            config=config,
+        )
+
+
+class HFEAStrategy(StaticAllocationStrategy):
+    """"Hedgefundie's Excellent Adventure" (HFEA): 55% UPRO (3x daily S&P
+    500) / 45% TMF (3x daily 20+yr Treasuries), quarterly rebalance.
+    Originated on the Bogleheads forum in 2019 (revised from an original
+    40/60 split); the "Part II" continuation thread has run 250+ pages
+    through 2024-2026, indicating sustained active community following.
+
+    Sourced performance (optimizedportfolio.com, aggregating
+    PortfolioVisualizer-style backtests): ~24.6% CAGR vs. SPY's ~14.8% since
+    May 2009 -- but that window is dominated by a multi-year falling-rate,
+    positive stock-bond-correlation regime that directly favors this
+    strategy's core bet, so this figure alone overstates what an investor
+    starting today should expect. The same aggregate history includes a
+    ~70-71% max drawdown bottoming in late 2023: 2022's rising-rate shock
+    broke the strategy's central assumption (negative/uncorrelated stock-bond
+    returns) when both UPRO and TMF fell together, and TMF underwent a
+    1-for-10 reverse split in 2022 from AUM/price decline. Proponents
+    themselves explicitly caution against allocating an entire portfolio to
+    this strategy.
+
+    IMPORTANT LIMITATION: this project's SyntheticDataProvider generates an
+    independent random walk per symbol -- it does NOT simulate genuine 3x
+    daily-reset leverage or the resulting volatility decay (the actual
+    mechanism behind leveraged ETFs' well-documented long-run divergence from
+    a naive "3x the index return" assumption). Running this strategy against
+    synthetic data exercises the REBALANCING MECHANICS only; it demonstrates
+    nothing about the real strategy's leverage-decay or correlation-breakdown
+    risk. Use real UPRO/TMF price data (--data-provider yfinance) to observe
+    genuine behavior.
+    """
+
+    def __init__(self, config: StrategyConfig = None):
+        super().__init__(
+            weights=HFEA_WEIGHTS,
+            rebalance_freq_days=63,  # quarterly
+            name="hfea",
+            config=config,
+        )
+
+
+class ProtectiveAssetAllocation(AllocationTemplate):
+    """Protective Asset Allocation (PAA). Wouter J. Keller & Jan Willem
+    Keuning (2016, SSRN #2759734, "Protective Asset Allocation (PAA): A
+    Simple Momentum-Based Alternative for Term Deposits") -- a direct
+    successor to this project's own VigilantAssetAllocation (VAA-G4) by the
+    same authors, still actively tracked as a live strategy on
+    AllocateSmartly today.
+
+    Mechanics: each of N risky assets is scored by a smoothed absolute-
+    momentum signal (close / trailing SMA - 1); this project adapts the
+    paper's 13-point MONTHLY SMA to a `paa_momentum_lookback`-day (default
+    252, ~12 months) DAILY SMA -- a disclosed daily-bar adaptation. Count
+    `n` = the number of the N risky assets with positive momentum. The
+    protection-asset (default IEF) fraction scales continuously with
+    breadth: 100% once n falls to or below n1 = paa_protection_factor * N /
+    4, scaling down toward 0% as n rises to N. The remainder splits EQUALLY
+    across the paa_top_k highest-momentum risky assets, selected by rank
+    regardless of individual sign -- even a fully turbulent reading still
+    sends the non-protection remainder to the best-ranked assets, not cash.
+
+    HONEST CAVEAT: this project could not independently verify the exact
+    published bond-fraction formula/constants (the precise n1 breakpoint and
+    scaling denominator) against the primary SSRN paper this session -- the
+    implementation captures the documented MECHANISM (a continuous,
+    breadth-based crash-protection fraction, parameterized by a disclosed,
+    configurable `paa_protection_factor`) but the precise numeric breakpoints
+    are a reasonable, disclosed reconstruction, not a verified reproduction
+    of the paper's exact formula. See config.py's DEFAULT_PAA_UNIVERSE
+    docstring for the further disclosed universe simplification (VGK+EWJ
+    consolidated into EFA).
+    """
+
+    def __init__(self, config: StrategyConfig = None):
+        self.config = config or StrategyConfig()
+        super().__init__(name="protective_asset_allocation", param_grid={})
+
+    def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
+        cfg = self.config
+        p = params or {}
+        rebal_freq = p.get("rebalance_freq_days", cfg.rebalance_freq_days)
+        risky_universe = p.get("paa_universe", cfg.paa_universe)
+        protection_symbol = p.get("paa_protection_symbol", cfg.paa_protection_symbol)
+        lookback = p.get("paa_momentum_lookback", cfg.paa_momentum_lookback)
+        top_k = p.get("paa_top_k", cfg.paa_top_k)
+        protection_factor = p.get("paa_protection_factor", cfg.paa_protection_factor)
+
+        symbols = list(universe.keys())
+        if not symbols:
+            return pd.DataFrame()
+
+        master_index = universe[symbols[0]].index
+        rebalance_dates = _get_rebalance_dates(master_index, rebal_freq)
+
+        has_protection = protection_symbol in symbols
+        risky_symbols = [s for s in risky_universe if s in symbols and s != protection_symbol]
+        n_assets = len(risky_symbols)
+
+        weights_rebal = pd.DataFrame(index=rebalance_dates, columns=symbols, data=0.0)
+
+        if n_assets == 0:
+            weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
+            weights_df.loc[rebalance_dates] = weights_rebal
+            return weights_df
+
+        mom = pd.DataFrame({
+            sym: universe[sym]["Close"] / sma(universe[sym]["Close"], lookback) - 1.0
+            for sym in risky_symbols
+        })
+
+        n1 = protection_factor * n_assets / 4.0
+        k = min(top_k, n_assets)
+
+        for date in rebalance_dates:
+            row = mom.loc[date].dropna()
+            if len(row) < n_assets:
+                continue  # still warming up -- skip until every asset has a valid momentum reading
+
+            n_positive = int((row > 0).sum())
+            denom = n_assets - n1
+            if n_positive <= n1:
+                protection_fraction = 1.0
+            elif denom > 0:
+                protection_fraction = max(0.0, (n_assets - n_positive) / denom)
+            else:
+                protection_fraction = 0.0
+
+            top_symbols = row.sort_values(ascending=False).index[:k]
+            risky_fraction = 1.0 - protection_fraction
+            if len(top_symbols) > 0:
+                weights_rebal.loc[date, top_symbols] = risky_fraction / len(top_symbols)
+            if has_protection:
+                weights_rebal.loc[date, protection_symbol] += protection_fraction
+
+        weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
+        weights_df.loc[rebalance_dates] = weights_rebal
+        return weights_df
+
+    def explain_weights(self, params: dict = None) -> str:
+        cfg = self.config
+        p = params or {}
+        risky_universe = p.get("paa_universe", cfg.paa_universe)
+        protection_symbol = p.get("paa_protection_symbol", cfg.paa_protection_symbol)
+        top_k = p.get("paa_top_k", cfg.paa_top_k)
+        return (
+            f"Protective Asset Allocation -- PAA (Keller & Keuning 2016): rebalances every "
+            f"{p.get('rebalance_freq_days', cfg.rebalance_freq_days)} days. Reasoning: scores "
+            f"{', '.join(risky_universe)} by smoothed absolute momentum; the fraction allocated to "
+            f"the protection asset ({protection_symbol}) scales continuously with the number of "
+            f"assets in positive momentum (100% protection when breadth is weak, 0% when all "
+            f"assets are positive). The remainder splits equally across the top {top_k} "
+            f"highest-momentum assets by rank. NOTE: bond-fraction formula constants are a "
+            f"disclosed reconstruction of the documented mechanism, not a verified reproduction "
+            f"of the original paper's exact formula (see class docstring)."
+        )
+
+    def warmup_bars(self, params: dict = None) -> int:
+        cfg = self.config
+        p = params or {}
+        return p.get("paa_momentum_lookback", cfg.paa_momentum_lookback)
+
+
+def _min_variance_weights(cov: np.ndarray) -> np.ndarray:
+    """Long-only minimum-variance portfolio weights via constrained
+    quadratic minimization (weights sum to 1, each in [0, 1]). Falls back to
+    equal weighting if the optimizer fails to converge (e.g. a near-singular
+    covariance matrix) -- a portfolio can always be equal-weighted; it can't
+    always be safely handed a degenerate optimizer result."""
+    n = cov.shape[0]
+    if n == 1:
+        return np.array([1.0])
+
+    def objective(w):
+        return w @ cov @ w
+
+    constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
+    bounds = [(0.0, 1.0)] * n
+    x0 = np.full(n, 1.0 / n)
+
+    result = minimize(objective, x0, method="SLSQP", bounds=bounds, constraints=constraints)
+    if not result.success:
+        return x0
+    w = np.clip(result.x, 0.0, None)
+    total = w.sum()
+    return w / total if total > 0 else x0
+
+
+class AdaptiveAssetAllocation(AllocationTemplate):
+    """Adaptive Asset Allocation (AAA). Butler, Philbrick, Gordillo & Varadi
+    (2012, SSRN #2328254, "Adaptive Asset Allocation: A Primer";
+    GestaltU/ReSolve Asset Management, which still actively references this
+    framework today).
+
+    Two-stage mechanism -- the part that's genuinely new machinery for this
+    project (nothing else here runs a constrained portfolio optimizer; the
+    existing HierarchicalRiskParityAllocation in
+    common/allocation_templates.py avoids one via recursive bisection
+    instead):
+      1. Momentum filter: rank the universe by aaa_momentum_lookback-day
+         (default 126, ~6mo) return; keep the top aaa_top_k (default 4 of 8,
+         preserving the paper's "keep half" rule).
+      2. Minimum-variance optimization on the survivors: build a covariance
+         matrix from aaa_corr_lookback-day (default 126) correlation
+         combined with aaa_vol_lookback-day (default 20, more responsive)
+         volatility -- the paper's own "hybrid" construction -- then solve
+         for the long-only, minimum-variance weights. Positions below
+         aaa_min_weight_pct are dropped and the remainder renormalized.
+
+    Sourced performance across cited backtests ranges widely by vintage/
+    window (16.9% CAGR / Sharpe 2.15 since 1989 in the original primer;
+    ~12.1%/yr since 1989 and a separate ~14.8%/yr over a more recent 10-year
+    window from secondary aggregators) -- these figures come from different,
+    not cross-verified backtest windows and should be treated as
+    illustrative of the strategy's real-world following, not a single
+    consistent, independently-verified track record.
+
+    HONEST CAVEAT on the universe: see config.py's DEFAULT_AAA_UNIVERSE
+    docstring for the disclosed simplification (EZU+EWJ consolidated into
+    EFA; RWX international-REIT sleeve dropped entirely for lack of a proxy
+    elsewhere in this project's default universe) -- an 8-asset, not the
+    original 10-asset, reproduction.
+    """
+
+    def __init__(self, config: StrategyConfig = None):
+        self.config = config or StrategyConfig()
+        super().__init__(name="adaptive_asset_allocation", param_grid={})
+
+    def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
+        cfg = self.config
+        p = params or {}
+        rebal_freq = p.get("rebalance_freq_days", cfg.rebalance_freq_days)
+        aaa_universe = p.get("aaa_universe", cfg.aaa_universe)
+        mom_lookback = p.get("aaa_momentum_lookback", cfg.aaa_momentum_lookback)
+        top_k = p.get("aaa_top_k", cfg.aaa_top_k)
+        vol_lookback = p.get("aaa_vol_lookback", cfg.aaa_vol_lookback)
+        corr_lookback = p.get("aaa_corr_lookback", cfg.aaa_corr_lookback)
+        min_weight_pct = p.get("aaa_min_weight_pct", cfg.aaa_min_weight_pct)
+
+        symbols = list(universe.keys())
+        if not symbols:
+            return pd.DataFrame()
+
+        universe_symbols = [s for s in aaa_universe if s in symbols]
+        n_universe = len(universe_symbols)
+        master_index = universe[symbols[0]].index
+        rebalance_dates = _get_rebalance_dates(master_index, rebal_freq)
+
+        weights_rebal = pd.DataFrame(index=rebalance_dates, columns=symbols, data=0.0)
+
+        if n_universe == 0:
+            weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
+            weights_df.loc[rebalance_dates] = weights_rebal
+            return weights_df
+
+        closes = pd.DataFrame({sym: universe[sym]["Close"] for sym in universe_symbols})
+        mom = closes.pct_change(mom_lookback)
+        rets = closes.pct_change()
+        k = min(top_k, n_universe)
+
+        for date in rebalance_dates:
+            mom_row = mom.loc[date].dropna()
+            if len(mom_row) < n_universe:
+                continue  # still warming up
+
+            survivors = mom_row.sort_values(ascending=False).index[:k].tolist()
+
+            hist = rets.loc[:date, survivors]
+            corr_hist = hist.tail(corr_lookback)
+            vol_hist = hist.tail(vol_lookback)
+            if len(corr_hist) < corr_lookback or len(vol_hist) < vol_lookback:
+                continue  # still warming up
+
+            corr = corr_hist.corr().to_numpy()
+            vol = vol_hist.std().to_numpy()
+            if np.any(~np.isfinite(corr)) or np.any(~np.isfinite(vol)):
+                continue  # degenerate window (e.g. zero-variance survivor) -- skip this rebalance
+
+            cov = corr * np.outer(vol, vol)
+
+            w = _min_variance_weights(cov)
+            w = np.where(w < min_weight_pct, 0.0, w)
+            total = w.sum()
+            if total <= 0:
+                continue
+            w = w / total
+
+            weights_rebal.loc[date, survivors] = w
+
+        weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
+        weights_df.loc[rebalance_dates] = weights_rebal
+        return weights_df
+
+    def explain_weights(self, params: dict = None) -> str:
+        cfg = self.config
+        p = params or {}
+        aaa_universe = p.get("aaa_universe", cfg.aaa_universe)
+        top_k = p.get("aaa_top_k", cfg.aaa_top_k)
+        return (
+            f"Adaptive Asset Allocation -- AAA (Butler/Philbrick/Gordillo/Varadi 2012): rebalances "
+            f"every {p.get('rebalance_freq_days', cfg.rebalance_freq_days)} days. Reasoning: ranks "
+            f"{', '.join(aaa_universe)} by {p.get('aaa_momentum_lookback', cfg.aaa_momentum_lookback)}-day "
+            f"momentum, keeps the top {top_k}, then solves a long-only minimum-variance optimization "
+            f"on the survivors using a correlation x volatility hybrid covariance matrix. NOTE: this "
+            f"project's universe is a disclosed, reduced 8-asset simplification of the original "
+            f"10-asset paper (see class docstring)."
+        )
+
+    def warmup_bars(self, params: dict = None) -> int:
+        cfg = self.config
+        p = params or {}
+        return max(
+            p.get("aaa_momentum_lookback", cfg.aaa_momentum_lookback),
+            p.get("aaa_corr_lookback", cfg.aaa_corr_lookback),
+        ) + 1
 

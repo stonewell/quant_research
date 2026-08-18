@@ -46,10 +46,16 @@ from rs.nl_parser import parse_plain_english_strategy
 from rs.strategy import (
     AcceleratingDualMomentum,
     ActiveDualMomentumRiskParity,
+    AdaptiveAssetAllocation,
     AdaptiveGridStrategy,
+    AllWeatherStrategy,
     BoldAssetAllocation,
     EnsembleRegimeSwitchingStrategy,
+    GoldenButterflyStrategy,
+    HFEAStrategy,
     NaturalLanguageStrategy,
+    PermanentPortfolioStrategy,
+    ProtectiveAssetAllocation,
     RSIMeanReversionStrategy,
     SwingTrendPullbackStrategy,
     TurtleBreakoutStrategy,
@@ -63,10 +69,16 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 STRATEGY_CLASS_MAP = {
     "AcceleratingDualMomentum": AcceleratingDualMomentum,
     "ActiveDualMomentumRiskParity": ActiveDualMomentumRiskParity,
+    "AdaptiveAssetAllocation": AdaptiveAssetAllocation,
     "AdaptiveGridStrategy": AdaptiveGridStrategy,
+    "AllWeatherStrategy": AllWeatherStrategy,
     "BoldAssetAllocation": BoldAssetAllocation,
     "EnsembleRegimeSwitchingStrategy": EnsembleRegimeSwitchingStrategy,
+    "GoldenButterflyStrategy": GoldenButterflyStrategy,
+    "HFEAStrategy": HFEAStrategy,
     "NaturalLanguageStrategy": NaturalLanguageStrategy,
+    "PermanentPortfolioStrategy": PermanentPortfolioStrategy,
+    "ProtectiveAssetAllocation": ProtectiveAssetAllocation,
     "RSIMeanReversionStrategy": RSIMeanReversionStrategy,
     "SwingTrendPullbackStrategy": SwingTrendPullbackStrategy,
     "TurtleBreakoutStrategy": TurtleBreakoutStrategy,
@@ -102,7 +114,12 @@ def instantiate_strategy_from_config_entry(entry_key: str, entry_data: dict):
 
 DEFAULT_UNIVERSE_SYMBOLS = [
     "SPY", "QQQ", "IWM", "EFA", "EEM", "GLD", "TLT", "VNQ",
-    "AGG", "TIP", "IEF", "LQD", "DBC", "BIL", "SCZ"
+    "AGG", "TIP", "IEF", "LQD", "DBC", "BIL", "SCZ",
+    # Added for the modern popular-strategy pass: HYG (high-yield credit, no
+    # substitute among the symbols above) for ProtectiveAssetAllocation;
+    # UPRO/TMF (leveraged ETFs, leverage IS the strategy -- no substitute
+    # possible) for HFEAStrategy.
+    "HYG", "UPRO", "TMF",
 ]
 
 

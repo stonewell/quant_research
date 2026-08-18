@@ -174,5 +174,58 @@
       "turtle_trend_ma_period": 200,
       "cash_proxy": "BIL"
     }
+  },
+  "permanent_portfolio": {
+    "name": "Permanent Portfolio (Harry Browne)",
+    "type": "class",
+    "class_name": "PermanentPortfolioStrategy",
+    "description": "Static 25% SPY / 25% TLT / 25% BIL / 25% GLD allocation, annual rebalance. SPY substitutes for the canonical VTI.",
+    "parameters": {}
+  },
+  "golden_butterfly": {
+    "name": "Golden Butterfly (Portfolio Charts)",
+    "type": "class",
+    "class_name": "GoldenButterflyStrategy",
+    "description": "Static 20% each SPY / IWM / TLT / BIL / GLD allocation, annual rebalance. IWM and BIL are disclosed substitutes for small-cap-value (VBR) and short-term treasuries (SHY).",
+    "parameters": {}
+  },
+  "all_weather": {
+    "name": "All Weather / All Seasons (Dalio-style retail approximation)",
+    "type": "class",
+    "class_name": "AllWeatherStrategy",
+    "description": "Static 30% SPY / 40% TLT / 15% IEF / 7.5% GLD / 7.5% DBC allocation, annual rebalance. A fixed-weight approximation, not genuine risk-budgeted risk parity.",
+    "parameters": {}
+  },
+  "hfea": {
+    "name": "HFEA (Hedgefundie's Excellent Adventure)",
+    "type": "class",
+    "class_name": "HFEAStrategy",
+    "description": "Static 55% UPRO / 45% TMF leveraged risk-parity allocation, quarterly rebalance. Synthetic data does NOT model genuine 3x leverage/volatility decay -- see class docstring.",
+    "parameters": {}
+  },
+  "protective_asset_allocation": {
+    "name": "Protective Asset Allocation (PAA)",
+    "type": "class",
+    "class_name": "ProtectiveAssetAllocation",
+    "description": "Keller & Keuning (2016) breadth-based continuous crash-protection allocation across an 11-asset universe plus an IEF protection sleeve.",
+    "parameters": {
+      "rebalance_freq_days": 21,
+      "paa_momentum_lookback": 252,
+      "paa_top_k": 6,
+      "paa_protection_factor": 1
+    }
+  },
+  "adaptive_asset_allocation": {
+    "name": "Adaptive Asset Allocation (AAA)",
+    "type": "class",
+    "class_name": "AdaptiveAssetAllocation",
+    "description": "Butler/Philbrick/Gordillo/Varadi (2012) momentum-filter + minimum-variance optimization across an 8-asset universe.",
+    "parameters": {
+      "rebalance_freq_days": 21,
+      "aaa_momentum_lookback": 126,
+      "aaa_top_k": 4,
+      "aaa_vol_lookback": 20,
+      "aaa_corr_lookback": 126
+    }
   }
 }

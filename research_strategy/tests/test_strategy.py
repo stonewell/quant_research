@@ -25,15 +25,23 @@ from research_strategy.run_research_strategy import instantiate_strategy_from_co
 from research_strategy.rs.strategy import (
     AcceleratingDualMomentum,
     ActiveDualMomentumRiskParity,
+    AdaptiveAssetAllocation,
     AdaptiveGridStrategy,
+    AllWeatherStrategy,
     BoldAssetAllocation,
     EnsembleRegimeSwitchingStrategy,
+    GoldenButterflyStrategy,
+    HFEAStrategy,
     NaturalLanguageStrategy,
+    PermanentPortfolioStrategy,
+    ProtectiveAssetAllocation,
     RSIMeanReversionStrategy,
+    StaticAllocationStrategy,
     SwingTrendPullbackStrategy,
     TurtleBreakoutStrategy,
     VigilantAssetAllocation,
     VolatilityManagedStrategy,
+    _min_variance_weights,
 )
 
 
@@ -66,6 +74,9 @@ def create_mock_universe(n_days: int = 300) -> dict:
         "TIP": agg_close,
         "IEF": agg_close,
         "VNQ": spy_close,
+        "HYG": agg_close,
+        "UPRO": spy_close,
+        "TMF": gld_close,
     }
 
     universe = {}
@@ -893,5 +904,219 @@ def test_turtle_breakout_multi_asset_inverse_atr_weights():
     assert not weights.empty
     assert "SPY" in daily.columns
     assert "QQQ" in daily.columns
+
+
+# --- Modern Popular Static Portfolios -------------------------------------
+
+@pytest.mark.parametrize("strat_cls,expected_symbols", [
+    (PermanentPortfolioStrategy, {"SPY", "TLT", "BIL", "GLD"}),
+    (GoldenButterflyStrategy, {"SPY", "IWM", "TLT", "BIL", "GLD"}),
+    (AllWeatherStrategy, {"SPY", "TLT", "IEF", "GLD", "DBC"}),
+])
+def test_static_portfolios_rebalance_to_fixed_weights(strat_cls, expected_symbols):
+    universe = create_mock_universe(n_days=300)
+    strat = strat_cls()
+    assert isinstance(strat, StaticAllocationStrategy)
+
+    weights = strat.generate_weights(universe)
+    rebal_rows = weights.dropna(how="all")
+    assert not rebal_rows.empty
+
+    last_row = rebal_rows.iloc[-1]
+    assert set(last_row[last_row > 0].index) == expected_symbols
+    np.testing.assert_allclose(last_row.sum(), 1.0, atol=1e-9)
+    # Every rebalance targets the SAME fixed weights -- not just the last one.
+    for _, row in rebal_rows.iterrows():
+        np.testing.assert_allclose(row.sum(), 1.0, atol=1e-9)
+
+
+def test_permanent_portfolio_is_equal_25_pct():
+    universe = create_mock_universe(n_days=300)
+    strat = PermanentPortfolioStrategy()
+    weights = strat.generate_weights(universe)
+    last_row = weights.dropna(how="all").iloc[-1]
+    for sym in ("SPY", "TLT", "BIL", "GLD"):
+        assert last_row[sym] == pytest.approx(0.25)
+
+
+def test_hfea_uses_leveraged_etf_symbols_and_5545_split():
+    universe = create_mock_universe(n_days=300)
+    strat = HFEAStrategy()
+    weights = strat.generate_weights(universe)
+    last_row = weights.dropna(how="all").iloc[-1]
+    assert last_row["UPRO"] == pytest.approx(0.55)
+    assert last_row["TMF"] == pytest.approx(0.45)
+
+
+def test_hfea_quarterly_rebalance_frequency():
+    strat = HFEAStrategy()
+    assert strat.default_rebalance_freq_days == 63
+
+
+def test_static_allocation_warns_and_degrades_gracefully_on_missing_symbol():
+    # Universe missing GLD entirely -- Permanent Portfolio's gold sleeve.
+    universe = create_mock_universe(n_days=300)
+    del universe["GLD"]
+
+    strat = PermanentPortfolioStrategy()
+    with pytest.warns(UserWarning, match="GLD"):
+        weights = strat.generate_weights(universe)
+
+    last_row = weights.dropna(how="all").iloc[-1]
+    # Remaining 75% stays at its original weights, GLD's 25% is simply unallocated.
+    assert last_row["SPY"] == pytest.approx(0.25)
+    assert last_row["TLT"] == pytest.approx(0.25)
+    assert last_row["BIL"] == pytest.approx(0.25)
+    assert last_row.sum() == pytest.approx(0.75)
+
+
+def test_static_allocation_strategy_explain_weights_lists_percentages():
+    strat = GoldenButterflyStrategy()
+    summary = strat.explain_weights()
+    assert "20.0%" in summary
+    assert "golden_butterfly" in summary
+
+
+# --- Protective Asset Allocation (PAA) ------------------------------------
+
+def test_paa_full_protection_when_breadth_collapses():
+    n = 400
+    dates = pd.bdate_range("2020-01-01", periods=n)
+    t = np.arange(n)
+    # Every risky asset trending DOWN -> momentum negative for all -> breadth n=0 -> 100% protection.
+    falling = 100.0 - 0.05 * t
+    rising_protection = 100.0 + 0.02 * t
+
+    cfg = StrategyConfig(paa_momentum_lookback=50, rebalance_freq_days=21)
+    risky = cfg.paa_universe
+    universe = {sym: make_ohlcv_from_closes(falling, start="2020-01-01") for sym in risky}
+    universe["IEF"] = make_ohlcv_from_closes(rising_protection, start="2020-01-01")
+    for df, sym in zip(universe.values(), list(universe.keys())):
+        df.index = dates
+
+    strat = ProtectiveAssetAllocation(cfg)
+    weights = strat.generate_weights(universe)
+    last_row = weights.dropna(how="all").iloc[-1]
+
+    assert last_row["IEF"] == pytest.approx(1.0, abs=1e-6)
+    for sym in risky:
+        assert last_row[sym] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_paa_full_risk_on_when_breadth_is_universal():
+    n = 400
+    dates = pd.bdate_range("2020-01-01", periods=n)
+    t = np.arange(n)
+    rising = 100.0 + 0.1 * t
+
+    cfg = StrategyConfig(paa_momentum_lookback=50, rebalance_freq_days=21, paa_top_k=6)
+    risky = cfg.paa_universe
+    universe = {sym: make_ohlcv_from_closes(rising, start="2020-01-01") for sym in risky}
+    universe["IEF"] = make_ohlcv_from_closes(100.0 + 0.001 * t, start="2020-01-01")
+    for df in universe.values():
+        df.index = dates
+
+    strat = ProtectiveAssetAllocation(cfg)
+    weights = strat.generate_weights(universe)
+    last_row = weights.dropna(how="all").iloc[-1]
+
+    assert last_row["IEF"] == pytest.approx(0.0, abs=1e-6)
+    n_held = (last_row > 0).sum()
+    assert n_held == cfg.paa_top_k
+    np.testing.assert_allclose(last_row.sum(), 1.0, atol=1e-9)
+
+
+def test_paa_warmup_bars_matches_momentum_lookback():
+    cfg = StrategyConfig(paa_momentum_lookback=180)
+    strat = ProtectiveAssetAllocation(cfg)
+    assert strat.warmup_bars() == 180
+
+
+def test_paa_missing_protection_symbol_still_allocates_risky_sleeve():
+    universe = create_mock_universe(n_days=300)
+    del universe["IEF"]
+    cfg = StrategyConfig(paa_momentum_lookback=50, rebalance_freq_days=21)
+    strat = ProtectiveAssetAllocation(cfg)
+    weights = strat.generate_weights(universe)
+    assert not weights.empty
+    last_row = weights.dropna(how="all").iloc[-1]
+    assert "IEF" not in last_row.index or pd.isna(last_row.get("IEF"))
+
+
+# --- Adaptive Asset Allocation (AAA) ---------------------------------------
+
+def test_min_variance_weights_favors_lower_variance_asset():
+    cov = np.array([
+        [0.01, 0.0],
+        [0.0, 0.04],
+    ])
+    w = _min_variance_weights(cov)
+    assert w[0] > w[1]
+    np.testing.assert_allclose(w.sum(), 1.0, atol=1e-6)
+    assert (w >= -1e-9).all()
+
+
+def test_min_variance_weights_single_asset_is_fully_allocated():
+    cov = np.array([[0.02]])
+    w = _min_variance_weights(cov)
+    np.testing.assert_allclose(w, [1.0])
+
+
+def test_aaa_selects_top_momentum_survivors_and_sums_to_one():
+    n = 400
+    dates = pd.bdate_range("2020-01-01", periods=n)
+    t = np.arange(n)
+
+    cfg = StrategyConfig(
+        aaa_momentum_lookback=50, aaa_corr_lookback=60, aaa_vol_lookback=20,
+        aaa_top_k=4, rebalance_freq_days=21,
+    )
+    strong = 100.0 + 0.2 * t
+    weak = 100.0 - 0.05 * t
+    universe = {}
+    for i, sym in enumerate(cfg.aaa_universe):
+        closes = strong if i < 4 else weak
+        df = make_ohlcv_from_closes(closes + i, start="2020-01-01")
+        df.index = dates
+        universe[sym] = df
+
+    strat = AdaptiveAssetAllocation(cfg)
+    weights = strat.generate_weights(universe)
+    rebal_rows = weights.dropna(how="all")
+    assert not rebal_rows.empty
+
+    last_row = rebal_rows.iloc[-1]
+    held = last_row[last_row > 0]
+    assert len(held) <= cfg.aaa_top_k
+    np.testing.assert_allclose(last_row.sum(), 1.0, atol=1e-6)
+    # The 4 strongly-trending assets should be the ones actually selected.
+    assert set(held.index).issubset(set(cfg.aaa_universe[:4]))
+
+
+def test_aaa_warmup_bars_covers_longest_lookback():
+    cfg = StrategyConfig(aaa_momentum_lookback=126, aaa_corr_lookback=200)
+    strat = AdaptiveAssetAllocation(cfg)
+    assert strat.warmup_bars() == 201
+
+
+def test_aaa_empty_universe_returns_empty_frame():
+    strat = AdaptiveAssetAllocation()
+    assert strat.generate_weights({}).empty
+
+
+# --- New strategies wired into JSON config --------------------------------
+
+@pytest.mark.parametrize("key", [
+    "permanent_portfolio", "golden_butterfly", "all_weather", "hfea",
+    "protective_asset_allocation", "adaptive_asset_allocation",
+])
+def test_new_strategies_instantiate_and_run_from_json_config(key):
+    config = load_strategies_config()
+    entry = config[key]
+    strat = instantiate_strategy_from_config_entry(key, entry)
+    universe = create_mock_universe(n_days=300)
+    weights = strat.generate_weights(universe)
+    assert not weights.empty
+    assert strat.explain_weights()
 
 

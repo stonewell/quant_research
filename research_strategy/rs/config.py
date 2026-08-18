@@ -38,6 +38,31 @@ DEFAULT_BAA_DEFENSIVE = ["TIP", "IEF", "TLT", "BIL", "AGG", "DBC"]
 DEFAULT_VAA_OFFENSIVE = ["SPY", "QQQ", "EFA", "EEM"]
 DEFAULT_VAA_DEFENSIVE = ["IEF", "BIL"]
 
+# Protective Asset Allocation (PAA, Keller & Keuning 2016) universe. The
+# original paper's 12-asset universe includes VGK (Europe) and EWJ (Japan)
+# separately; this project consolidates both into the existing EFA
+# (developed ex-US broad) holding already used by every other strategy here,
+# trading one region-level split of granularity for consistency with the
+# rest of this project's default universe -- a disclosed simplification, not
+# a verified reproduction of the original 12-asset list. HYG (high-yield
+# credit) has no substitute among the other strategies' universes and is
+# kept as-is.
+DEFAULT_PAA_UNIVERSE = ["SPY", "QQQ", "IWM", "EFA", "EEM", "VNQ", "DBC", "GLD", "HYG", "LQD", "TLT"]
+DEFAULT_PAA_PROTECTION_SYMBOL = "IEF"
+
+# Adaptive Asset Allocation (AAA, Butler/Philbrick/Gordillo/Varadi 2012)
+# universe. The original 10-asset universe splits developed ex-US equity
+# into EZU (Eurozone) + EWJ (Japan) and includes a dedicated international
+# REIT sleeve (RWX); this project consolidates the former into EFA (same
+# simplification as PAA above) and drops the latter (no international-REIT
+# proxy exists elsewhere in this project's default universe, and reusing
+# VNQ -- US REITs -- for both slots would misrepresent it as two distinct
+# asset classes). The resulting 8-asset universe is a disclosed, reduced
+# version of the original -- pass a custom `aaa_universe` (e.g. via
+# --universe-kwargs or a custom strategies_config.json) for a faithful
+# 10-asset reproduction against real market data.
+DEFAULT_AAA_UNIVERSE = ["SPY", "EFA", "EEM", "VNQ", "IEF", "TLT", "DBC", "GLD"]
+
 
 @dataclass
 class StrategyConfig:
@@ -163,6 +188,38 @@ class StrategyConfig:
     ensemble_rsi_period: int = 2
     ensemble_entry_rsi_threshold: float = 10.0
     ensemble_exit_rsi_threshold: float = 70.0
+
+    # --- Protective Asset Allocation (Keller & Keuning 2016, SSRN #2759734) ---
+    # Breadth-based, continuously-scaled crash protection: the fraction of
+    # capital sent to `paa_protection_symbol` grows smoothly from 0% (all N
+    # risky assets in positive momentum) to 100% (at or below `n1` assets in
+    # positive momentum, where n1 = paa_protection_factor * N / 4). The
+    # remainder splits equally across the paa_top_k highest-momentum risky
+    # assets (ranked, not gated -- selected regardless of individual sign).
+    # NOTE: this project could not independently verify the original paper's
+    # exact bond-fraction formula/constants against the primary SSRN source
+    # this session -- see rs/strategy.py's ProtectiveAssetAllocation
+    # docstring for the honest caveat on what's verified vs. reconstructed.
+    paa_universe: List[str] = field(default_factory=lambda: list(DEFAULT_PAA_UNIVERSE))
+    paa_protection_symbol: str = DEFAULT_PAA_PROTECTION_SYMBOL
+    paa_momentum_lookback: int = 252   # ~12 months of daily bars, adapting the paper's monthly 13-point SMA
+    paa_top_k: int = 6
+    paa_protection_factor: int = 1     # a in {0, 1, 2}; a=1 matches AllocateSmartly's published PAA variant
+
+    # --- Adaptive Asset Allocation (Butler/Philbrick/Gordillo/Varadi 2012, SSRN #2328254) ---
+    # Two-stage: (1) momentum filter keeps the top aaa_top_k of the universe
+    # by aaa_momentum_lookback-day return; (2) minimum-variance optimization
+    # (long-only, weights sum to 1) on the survivors, using a covariance
+    # matrix built from aaa_corr_lookback-day correlation combined with
+    # aaa_vol_lookback-day (shorter, more responsive) volatility -- the
+    # paper's own "hybrid" covariance construction. Positions below
+    # aaa_min_weight_pct are dropped and the remainder renormalized.
+    aaa_universe: List[str] = field(default_factory=lambda: list(DEFAULT_AAA_UNIVERSE))
+    aaa_momentum_lookback: int = 126   # 6 months
+    aaa_top_k: int = 4                 # half of an 8-asset universe, preserving the paper's "keep half" rule
+    aaa_vol_lookback: int = 20
+    aaa_corr_lookback: int = 126
+    aaa_min_weight_pct: float = 0.02
 
     # --- Turtle Channel Breakout Strategy (Dennis & Eckhardt / Donchian) ---
     turtle_symbol: str = "SPY"
