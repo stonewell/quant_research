@@ -9,6 +9,7 @@ import json
 import os
 import sys
 from typing import Callable, Dict, List, Optional, Type, Union
+import warnings
 
 
 class BaseUniverseProvider(ABC):
@@ -70,6 +71,13 @@ class FileUniverseProvider(BaseUniverseProvider):
             else:
                 raw_list = []
 
+            if not isinstance(raw_list, list):
+                raise ValueError(
+                    f"Universe file '{self.file_path}': 'basket'/'symbols'/'universe'/'tickers' "
+                    f"value must be a JSON list, got {type(raw_list).__name__}."
+                )
+
+            skipped = []
             for item in raw_list:
                 if isinstance(item, str):
                     symbols.append(item)
@@ -77,6 +85,16 @@ class FileUniverseProvider(BaseUniverseProvider):
                     symbols.append(str(item["symbol"]))
                 elif isinstance(item, dict) and "ticker" in item:
                     symbols.append(str(item["ticker"]))
+                else:
+                    skipped.append(item)
+
+            if skipped:
+                preview = skipped[:5]
+                suffix = "..." if len(skipped) > 5 else ""
+                warnings.warn(
+                    f"Universe file '{self.file_path}': ignored {len(skipped)} malformed "
+                    f"entr{'y' if len(skipped) == 1 else 'ies'}: {preview}{suffix}"
+                )
         else:
             with open(self.file_path, "r", encoding="utf-8") as f:
                 for line in f:
@@ -94,6 +112,10 @@ class FileUniverseProvider(BaseUniverseProvider):
             if s_clean and s_clean not in seen:
                 seen.add(s_clean)
                 out.append(s_clean)
+
+        if not out:
+            raise ValueError(f"Universe file '{self.file_path}' resolved to zero valid ticker symbols.")
+
         return out
 
 

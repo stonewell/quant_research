@@ -11,6 +11,8 @@ from typing import Dict
 import numpy as np
 import pandas as pd
 
+from common.metrics import profit_factor_from_returns, win_rate_from_returns
+
 
 def run_allocation_backtest(
     universe: Dict[str, pd.DataFrame],
@@ -133,11 +135,12 @@ def run_allocation_backtest(
     std_ret = float(daily_returns.std()) if not daily_returns.empty else 0.0
     sr = (mean_ret / std_ret) * np.sqrt(252) if std_ret > 0 else 0.0
 
-    # Win Rate & Profit Factor
-    pos_ret = daily_returns[daily_returns > 0]
-    neg_ret = daily_returns[daily_returns < 0]
-    win_rate = len(pos_ret) / len(daily_returns) if len(daily_returns) > 0 else 0.0
-    profit_factor = pos_ret.sum() / abs(neg_ret.sum()) if not neg_ret.empty and neg_ret.sum() != 0 else np.nan
+    # Win Rate & Profit Factor (returns-based; see common/metrics.py's
+    # win_rate_from_returns/profit_factor_from_returns docstrings for why
+    # these are distinct from the trades-based win_rate/profit_factor also
+    # defined there).
+    win_rate = win_rate_from_returns(daily_returns)
+    profit_factor = profit_factor_from_returns(daily_returns)
 
     return {
         "equity_curve": equity_df,

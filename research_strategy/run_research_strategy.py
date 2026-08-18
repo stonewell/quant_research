@@ -78,7 +78,10 @@ STRATEGY_CLASS_MAP = {
 def instantiate_strategy_from_config_entry(entry_key: str, entry_data: dict):
     strat_type = entry_data.get("type", "class")
     params = entry_data.get("parameters", {})
-    cfg = StrategyConfig.from_dict(params)
+    try:
+        cfg = StrategyConfig.from_dict(params)
+    except ValueError as exc:
+        raise ValueError(f"Invalid config for strategy '{entry_key}': {exc}") from exc
 
     if strat_type == "natural_language":
         plain_english = entry_data.get("plain_english_description", "")
@@ -87,9 +90,11 @@ def instantiate_strategy_from_config_entry(entry_key: str, entry_data: dict):
         return NaturalLanguageStrategy(spec, config=cfg)
     elif strat_type == "class":
         cls_name = entry_data.get("class_name", "")
+        if not cls_name:
+            raise ValueError(f"Strategy '{entry_key}' has type 'class' but no 'class_name' key")
         cls_obj = STRATEGY_CLASS_MAP.get(cls_name)
         if not cls_obj:
-            raise ValueError(f"Unknown strategy class_name '{cls_name}' for strategy key '{entry_key}'")
+            raise ValueError(f"Unrecognized strategy class_name '{cls_name}' for strategy key '{entry_key}'")
         return cls_obj(config=cfg)
     else:
         raise ValueError(f"Unknown strategy type '{strat_type}' for strategy key '{entry_key}'")

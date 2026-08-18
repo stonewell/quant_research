@@ -17,6 +17,7 @@ Grounding:
 
 import json
 import os
+import warnings
 from dataclasses import dataclass, field, fields
 from typing import List, Optional
 
@@ -178,10 +179,39 @@ class StrategyConfig:
     commission_pct: float = 0.0005          # 5 bps
     slippage_pct: float = 0.0005            # 5 bps
 
+    def __post_init__(self):
+        """Validates only the handful of fields used downstream as divisors,
+        loop bounds, or array indices (`strategy.py`'s generate_weights
+        methods) -- a bad value there currently produces a confusing
+        ZeroDivisionError/IndexError deep in strategy execution rather than a
+        clear error at config-construction time. Deliberately NOT exhaustive
+        over all ~60 fields; enum-like string fields (e.g. `ensemble_mode`,
+        `rsi_method`) are left unvalidated since their strategies already
+        handle an unrecognized value with an explicit fallback/error."""
+        if self.rebalance_freq_days <= 0:
+            raise ValueError(f"StrategyConfig.rebalance_freq_days must be > 0, got {self.rebalance_freq_days}")
+        if self.top_k <= 0:
+            raise ValueError(f"StrategyConfig.top_k must be > 0, got {self.top_k}")
+        if self.commission_pct < 0:
+            raise ValueError(f"StrategyConfig.commission_pct must be >= 0, got {self.commission_pct}")
+        if self.slippage_pct < 0:
+            raise ValueError(f"StrategyConfig.slippage_pct must be >= 0, got {self.slippage_pct}")
+        if self.initial_capital <= 0:
+            raise ValueError(f"StrategyConfig.initial_capital must be > 0, got {self.initial_capital}")
+        if not self.cash_proxy or not isinstance(self.cash_proxy, str):
+            raise ValueError(f"StrategyConfig.cash_proxy must be a non-empty string, got {self.cash_proxy!r}")
+        if not isinstance(self.risky_universe, list):
+            raise ValueError(f"StrategyConfig.risky_universe must be a list, got {type(self.risky_universe).__name__}")
+
     @classmethod
     def from_dict(cls, data: dict) -> "StrategyConfig":
-        """Instantiates StrategyConfig from a dictionary, keeping only valid dataclass fields."""
+        """Instantiates StrategyConfig from a dictionary, keeping only valid dataclass fields.
+        Unknown keys are dropped (for forward-compatibility with newer config
+        files) but a warning names them, rather than the previous total silence."""
         valid_fields = {f.name for f in fields(cls)}
+        unknown_keys = set(data.keys()) - valid_fields
+        if unknown_keys:
+            warnings.warn(f"StrategyConfig.from_dict: ignoring unknown key(s) {sorted(unknown_keys)}")
         filtered = {k: v for k, v in data.items() if k in valid_fields}
         return cls(**filtered)
 
@@ -195,5 +225,18 @@ def load_strategies_config(json_path: Optional[str] = None) -> dict:
     if not os.path.exists(json_path):
         raise FileNotFoundError(f"Strategy config file not found at '{json_path}'.")
     with open(json_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"Strategy config file '{json_path}' must be a JSON object mapping strategy "
+            f"keys to entry objects, got {type(data).__name__}."
+        )
+    for key, value in data.items():
+        if not isinstance(value, dict):
+            raise ValueError(
+                f"strategies_config.json entry '{key}' must be a JSON object, got {type(value).__name__}."
+            )
+
+    return data
 

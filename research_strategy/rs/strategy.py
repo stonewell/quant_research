@@ -35,6 +35,8 @@ from common.indicators import (
     rsi_wilder,
     sma,
 )
+from common.allocation_templates import AllocationTemplate
+from common.scheduling import get_rebalance_dates as _get_rebalance_dates
 from .config import StrategyConfig
 from .nl_parser import ParsedStrategySpec, parse_plain_english_strategy
 
@@ -124,12 +126,7 @@ def _rsi_signal(rsi_value: float, in_position: bool, entry_threshold: float, exi
     return 1 if rsi_value < entry_threshold else 0
 
 
-def _get_rebalance_dates(index: pd.DatetimeIndex, freq_days: int) -> pd.DatetimeIndex:
-    """Returns rebalance dates every freq_days."""
-    return index[::freq_days]
-
-
-class NaturalLanguageStrategy:
+class NaturalLanguageStrategy(AllocationTemplate):
     """Execution engine for Plain English Quantitative Asset Allocation Strategies."""
 
     def __init__(self, spec_or_text: Union[ParsedStrategySpec, str], config: StrategyConfig = None):
@@ -138,6 +135,7 @@ class NaturalLanguageStrategy:
             self.spec = spec_or_text
         else:
             self.spec = parse_plain_english_strategy(spec_or_text)
+        super().__init__(name=self.spec.strategy_name, param_grid={})
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
         spec = self.spec
@@ -320,7 +318,7 @@ class VolatilityManagedStrategy(NaturalLanguageStrategy):
         super().__init__(spec, config=config)
 
 
-class AcceleratingDualMomentum:
+class AcceleratingDualMomentum(AllocationTemplate):
     """Accelerating Dual Momentum (ADM).
 
     Chris Ludlow & Steve Hanly, EngineeredPortfolio.com (2018), popularized
@@ -329,6 +327,7 @@ class AcceleratingDualMomentum:
 
     def __init__(self, config: StrategyConfig = None):
         self.config = config or StrategyConfig()
+        super().__init__(name="accelerating_dual_momentum", param_grid={})
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
         cfg = self.config
@@ -394,7 +393,7 @@ class AcceleratingDualMomentum:
         return 126
 
 
-class VigilantAssetAllocation:
+class VigilantAssetAllocation(AllocationTemplate):
     """Vigilant Asset Allocation (VAA-G4).
 
     Wouter J. Keller & Jan Willem Keuning (2017, SSRN #3002624).
@@ -402,6 +401,7 @@ class VigilantAssetAllocation:
 
     def __init__(self, config: StrategyConfig = None):
         self.config = config or StrategyConfig()
+        super().__init__(name="vigilant_asset_allocation", param_grid={})
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
         cfg = self.config
@@ -465,13 +465,14 @@ class VigilantAssetAllocation:
         return 252
 
 
-class RSIMeanReversionStrategy:
+class RSIMeanReversionStrategy(AllocationTemplate):
     """Connors-style RSI(2) long-only mean-reversion strategy (ported from
     the standalone `rsi_strategy` project, extended for multi-asset evaluation).
     """
 
     def __init__(self, config: StrategyConfig = None):
         self.config = config or StrategyConfig()
+        super().__init__(name="rsi_mean_reversion", param_grid={})
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
         cfg = self.config
@@ -579,13 +580,14 @@ class RSIMeanReversionStrategy:
         )
 
 
-class SwingTrendPullbackStrategy:
+class SwingTrendPullbackStrategy(AllocationTemplate):
     """Long-only trend-pullback swing strategy (ported from `swing_trend_strategy`,
     extended for multi-asset evaluation).
     """
 
     def __init__(self, config: StrategyConfig = None):
         self.config = config or StrategyConfig()
+        super().__init__(name="swing_trend_pullback", param_grid={})
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
         cfg = self.config
@@ -686,13 +688,14 @@ class SwingTrendPullbackStrategy:
         )
 
 
-class AdaptiveGridStrategy:
+class AdaptiveGridStrategy(AllocationTemplate):
     """ATR-adaptive grid trading strategy (ported from `grid_trading`, extended
     for multi-asset evaluation).
     """
 
     def __init__(self, config: StrategyConfig = None):
         self.config = config or StrategyConfig()
+        super().__init__(name="adaptive_grid", param_grid={})
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
         cfg = self.config
@@ -827,13 +830,14 @@ class AdaptiveGridStrategy:
         )
 
 
-class EnsembleRegimeSwitchingStrategy:
+class EnsembleRegimeSwitchingStrategy(AllocationTemplate):
     """Regime-switching ensemble (ported from `ensemble_strategy`, extended for
     multi-asset evaluation).
     """
 
     def __init__(self, config: StrategyConfig = None):
         self.config = config or StrategyConfig()
+        super().__init__(name="ensemble_regime_switching", param_grid={})
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
         cfg = self.config
@@ -927,7 +931,7 @@ class EnsembleRegimeSwitchingStrategy:
         ) + 1
 
 
-class TurtleBreakoutStrategy:
+class TurtleBreakoutStrategy(AllocationTemplate):
     """Classic Turtle Channel Breakout Strategy (Dennis & Eckhardt / Donchian).
 
     Supports System 1 (20-day entry / 10-day exit) and System 2 (55-day entry / 20-day exit)
@@ -936,6 +940,7 @@ class TurtleBreakoutStrategy:
 
     def __init__(self, config: StrategyConfig = None):
         self.config = config or StrategyConfig()
+        super().__init__(name="turtle_breakout", param_grid={})
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
         cfg = self.config

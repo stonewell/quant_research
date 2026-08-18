@@ -697,10 +697,65 @@ def test_strategy_config_from_dict():
         "top_k": 2,
         "non_existent_param": 999
     }
-    cfg = StrategyConfig.from_dict(params)
+    with pytest.warns(UserWarning, match="non_existent_param"):
+        cfg = StrategyConfig.from_dict(params)
     assert cfg.rebalance_freq_days == 10
     assert cfg.top_k == 2
     assert not hasattr(cfg, "non_existent_param")
+
+
+@pytest.mark.parametrize("field_name,bad_value", [
+    ("rebalance_freq_days", 0),
+    ("rebalance_freq_days", -5),
+    ("top_k", 0),
+    ("commission_pct", -0.001),
+    ("slippage_pct", -0.001),
+    ("initial_capital", 0),
+    ("cash_proxy", ""),
+    ("risky_universe", "SPY,QQQ"),
+])
+def test_strategy_config_rejects_invalid_values(field_name, bad_value):
+    with pytest.raises(ValueError, match=field_name):
+        StrategyConfig(**{field_name: bad_value})
+
+
+def test_strategy_config_defaults_are_valid():
+    # Regression guard: the dataclass's own defaults must satisfy __post_init__.
+    StrategyConfig()
+
+
+def test_load_strategies_config_rejects_non_dict_entry(tmp_path):
+    bad_path = tmp_path / "bad_config.json"
+    bad_path.write_text('{"my_strategy": "not_an_object"}')
+    with pytest.raises(ValueError, match="my_strategy"):
+        load_strategies_config(str(bad_path))
+
+
+def test_load_strategies_config_rejects_non_dict_top_level(tmp_path):
+    bad_path = tmp_path / "bad_config.json"
+    bad_path.write_text('["not", "a", "dict"]')
+    with pytest.raises(ValueError):
+        load_strategies_config(str(bad_path))
+
+
+def test_instantiate_strategy_missing_class_name_gives_clear_error():
+    with pytest.raises(ValueError, match="no 'class_name' key"):
+        instantiate_strategy_from_config_entry("bad_entry", {"type": "class", "parameters": {}})
+
+
+def test_instantiate_strategy_unrecognized_class_name_gives_clear_error():
+    with pytest.raises(ValueError, match="Unrecognized strategy class_name"):
+        instantiate_strategy_from_config_entry(
+            "bad_entry", {"type": "class", "class_name": "NotARealClass", "parameters": {}}
+        )
+
+
+def test_instantiate_strategy_invalid_params_names_the_strategy_key():
+    with pytest.raises(ValueError, match="bad_entry"):
+        instantiate_strategy_from_config_entry(
+            "bad_entry",
+            {"type": "class", "class_name": "RSIMeanReversionStrategy", "parameters": {"top_k": 0}},
+        )
 
 
 def test_instantiate_strategies_from_json_config():

@@ -5,14 +5,23 @@ from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+import pytest
 
 # Add backtester to path
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+from common.data import BaseDataProvider, register_provider
 from common.testing import make_ohlcv_from_closes as make_df
-from backtester.run_backtest import _align_universe, _get_template, run_standard, run_walkforward
+from backtester.run_backtest import (
+    _align_universe,
+    _get_template,
+    _load_strategy_file,
+    main,
+    run_standard,
+    run_walkforward,
+)
 
 
 def test_align_universe():
@@ -167,3 +176,96 @@ def test_run_walkforward_warms_up_indicator_lookback_before_each_fold():
     # of only the ones after its own in-window warmup period.
     for fold in folds[1:]:
         assert fold["total_rebalances"] == 12
+
+
+def _write_strategy_file(path, template_name="equal_weight", params=None):
+    with open(path, "w") as f:
+        json.dump({"template_name": template_name, "params": params or {"rebalance_freq_days": 10}}, f)
+
+
+def test_load_strategy_file_missing_required_keys(tmp_path):
+    path = tmp_path / "strategy.json"
+    with open(path, "w") as f:
+        json.dump({"template_name": "equal_weight"}, f)  # missing "params"
+
+    with pytest.raises(ValueError, match="missing required key"):
+        _load_strategy_file(str(path))
+
+
+def test_load_strategy_file_params_not_dict(tmp_path):
+    path = tmp_path / "strategy.json"
+    with open(path, "w") as f:
+        json.dump({"template_name": "equal_weight", "params": ["not", "a", "dict"]}, f)
+
+    with pytest.raises(ValueError, match="must be a JSON object"):
+        _load_strategy_file(str(path))
+
+
+def test_load_strategy_file_valid(tmp_path):
+    path = tmp_path / "strategy.json"
+    _write_strategy_file(path)
+    strategy_def = _load_strategy_file(str(path))
+    assert strategy_def["template_name"] == "equal_weight"
+    assert strategy_def["params"] == {"rebalance_freq_days": 10}
+
+
+class _FlakySymbolProvider(BaseDataProvider):
+    """Test-only provider that fails for one specific symbol, to exercise
+    main()'s resilient (warn-and-skip) universe loading."""
+
+    def fetch_ohlcv(self, symbol, start, end, interval="1d"):
+        if symbol == "BAD":
+            raise ValueError("simulated fetch failure")
+        dates = pd.bdate_range(start or "2020-01-01", periods=60)
+        closes = np.linspace(100, 110, len(dates))
+        return make_df(closes, start=dates[0].strftime("%Y-%m-%d"))
+
+
+register_provider("flaky_symbol_test_provider", _FlakySymbolProvider)
+
+
+def test_main_skips_bad_symbol_and_continues(tmp_path, monkeypatch, capsys):
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(strategy_path)
+    results_dir = tmp_path / "results"
+    cache_dir = tmp_path / "cache"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "GOOD1", "BAD", "GOOD2",
+        "--data-provider", "flaky_symbol_test_provider",
+        "--no-cache",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    main()
+
+    captured = capsys.readouterr()
+    assert "Loaded 2/3 symbols" in captured.out
+    assert os.path.exists(results_dir / "backtest_equity.csv")
+
+
+def test_main_results_dir_and_cache_dir_overrides(tmp_path, monkeypatch):
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(strategy_path)
+    results_dir = tmp_path / "custom_results"
+    cache_dir = tmp_path / "custom_cache"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "AAA", "BBB",
+        "--data-provider", "synthetic",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    main()
+
+    assert os.path.exists(results_dir / "backtest_equity.csv")
+    assert os.path.exists(results_dir / "backtest_weights.csv")
+    assert len(list(cache_dir.glob("*.csv"))) == 2

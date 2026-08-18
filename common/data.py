@@ -8,12 +8,15 @@ import importlib
 import importlib.util
 import os
 import sys
+import time
 from typing import Dict, List, Optional, Type, Union
 import warnings
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
+
+from .universe import _parse_module_specifier
 
 
 class BaseDataProvider(ABC):
@@ -155,12 +158,39 @@ class SyntheticDataProvider(BaseDataProvider):
         return df[["Open", "High", "Low", "Close", "Volume"]]
 
 
+_REQUIRED_OHLCV_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
+
+
+def _is_valid_cached_ohlcv(df: pd.DataFrame) -> bool:
+    """Sanity-checks a CSV read back from CachedDataProvider's disk cache:
+    non-empty, has the expected OHLCV columns, and a real DatetimeIndex."""
+    if df.empty:
+        return False
+    if not all(col in df.columns for col in _REQUIRED_OHLCV_COLUMNS):
+        return False
+    if not isinstance(df.index, pd.DatetimeIndex):
+        return False
+    return True
+
+
 class CachedDataProvider(BaseDataProvider):
     """Wrapper provider that adds CSV disk caching around any inner BaseDataProvider."""
 
-    def __init__(self, inner_provider: BaseDataProvider, cache_dir: str):
+    def __init__(self, inner_provider: BaseDataProvider, cache_dir: str, cache_max_age_days: Optional[float] = None):
         self.inner_provider = inner_provider
         self.cache_dir = cache_dir
+        # None (default) preserves the original unlimited-cache behavior --
+        # a cached file is trusted forever regardless of age. Set this to
+        # force a re-fetch once a cached file is older than N days (useful
+        # for a rolling/live `end` date; irrelevant for a fixed historical
+        # range, which never goes stale).
+        self.cache_max_age_days = cache_max_age_days
+
+    def _is_stale(self, cache_path: str) -> bool:
+        if self.cache_max_age_days is None:
+            return False
+        age_days = (time.time() - os.path.getmtime(cache_path)) / 86400.0
+        return age_days > self.cache_max_age_days
 
     def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
         if not self.cache_dir:
@@ -169,10 +199,15 @@ class CachedDataProvider(BaseDataProvider):
         os.makedirs(self.cache_dir, exist_ok=True)
         cache_path = os.path.join(self.cache_dir, f"{symbol}_{interval}_{start}_{end}.csv")
 
-        if os.path.exists(cache_path):
-            df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
-            df.index = pd.to_datetime(df.index)
-            return df
+        if os.path.exists(cache_path) and not self._is_stale(cache_path):
+            try:
+                df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+                df.index = pd.to_datetime(df.index)
+                if not _is_valid_cached_ohlcv(df):
+                    raise ValueError("cached file is missing expected OHLCV columns or is empty")
+                return df
+            except Exception as exc:
+                warnings.warn(f"Cache file '{cache_path}' is corrupt or invalid ({exc}); re-fetching from source.")
 
         df = self.inner_provider.fetch_ohlcv(symbol, start, end, interval)
         if not df.empty:
@@ -210,20 +245,6 @@ def set_default_data_provider(provider: BaseDataProvider):
     """Sets global default data provider instance."""
     global _DEFAULT_PROVIDER
     _DEFAULT_PROVIDER = provider
-
-
-def _parse_module_specifier(target_str: str, default_attr: Optional[str] = None):
-    target_str = target_str.strip()
-    path_or_module = target_str
-    attr_name = default_attr
-
-    if ":" in target_str:
-        parts = target_str.rsplit(":", 1)
-        if not ("\\" in parts[1] or "/" in parts[1] or parts[1].endswith(".py")):
-            if not (len(parts[0]) == 1 and os.path.exists(target_str)):
-                path_or_module, attr_name = parts[0], parts[1]
-
-    return path_or_module, attr_name
 
 
 def _load_provider_from_specifier(specifier: str, **kwargs) -> BaseDataProvider:

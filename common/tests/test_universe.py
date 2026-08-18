@@ -113,6 +113,46 @@ def test_file_universe_provider_text():
         os.remove(txt_path)
 
 
+def test_file_universe_provider_rejects_non_list_basket_value():
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump({"basket": "SPY"}, f)  # a string, not a list -- would otherwise iterate char-by-char
+        json_path = f.name
+
+    try:
+        p = FileUniverseProvider(json_path)
+        with pytest.raises(ValueError, match="must be a JSON list"):
+            p.get_symbols()
+    finally:
+        os.remove(json_path)
+
+
+def test_file_universe_provider_warns_on_malformed_entries():
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump({"basket": ["SPY", 123, {"not_symbol_or_ticker": "x"}, "QQQ"]}, f)
+        json_path = f.name
+
+    try:
+        p = FileUniverseProvider(json_path)
+        with pytest.warns(UserWarning, match="malformed"):
+            symbols = p.get_symbols()
+        assert symbols == ["SPY", "QQQ"]
+    finally:
+        os.remove(json_path)
+
+
+def test_file_universe_provider_raises_on_all_malformed():
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump({"basket": [123, {"not_symbol_or_ticker": "x"}]}, f)
+        json_path = f.name
+
+    try:
+        p = FileUniverseProvider(json_path)
+        with pytest.raises(ValueError, match="zero valid ticker symbols"):
+            p.get_symbols()
+    finally:
+        os.remove(json_path)
+
+
 def test_code_universe_provider_callable():
     def custom_generator(sector="tech"):
         if sector == "tech":

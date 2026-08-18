@@ -75,6 +75,34 @@ def profit_factor(trades: pd.DataFrame) -> float:
     return gains / losses
 
 
+def win_rate_from_returns(returns: pd.Series) -> float:
+    """Fraction of positive-return days/periods in a returns series.
+
+    Distinct from `win_rate()` above: that one takes a trades DataFrame
+    (`side`/`pnl` columns, one row per closed trade); this one takes a plain
+    daily-returns series and counts positive-return periods directly --
+    the convention `common/allocation_backtester.py` uses, since a portfolio
+    backtest doesn't produce discrete per-trade P&L the way a single-position
+    event-driven backtester does. Same name, different input -- do not use
+    interchangeably.
+    """
+    if returns.empty:
+        return 0.0
+    return float((returns > 0).sum() / len(returns))
+
+
+def profit_factor_from_returns(returns: pd.Series) -> float:
+    """Ratio of summed positive-return magnitude to summed negative-return
+    magnitude across a returns series (see `win_rate_from_returns` docstring
+    for why this is a separate function from the trades-based `profit_factor`
+    above)."""
+    pos = returns[returns > 0]
+    neg = returns[returns < 0]
+    if neg.empty or neg.sum() == 0:
+        return float("nan")
+    return float(pos.sum() / abs(neg.sum()))
+
+
 def pct_time_in_market(equity_curve: pd.DataFrame) -> float:
     return equity_curve["in_position"].mean()
 

@@ -113,6 +113,48 @@ def test_canonical_volatility_managed_text_parses_to_documented_values():
     assert spec.allocation_scheme == "volatility_managed"
 
 
+def test_fully_specified_description_produces_no_parser_warnings():
+    text = (
+        "Rebalance monthly. Risky assets: SPY, QQQ, GLD. "
+        "Apply trend gate: Close > 100d SMA and 63d ROC > 0. "
+        "Select top 3 assets. Weight using 60d inverse volatility."
+    )
+    spec = parse_plain_english_strategy(text, name="Explicit Test Strategy")
+    assert spec.warnings == []
+    assert "Parser Warnings:" not in spec.format_summary()
+
+
+def test_vague_description_produces_parser_warnings():
+    spec = parse_plain_english_strategy("Just trade some stocks somehow.")
+    assert any("classify strategy type" in w for w in spec.warnings)
+    assert any("risky-universe" in w for w in spec.warnings)
+    assert any("allocation-scheme" in w for w in spec.warnings)
+    assert "Parser Warnings:" in spec.format_summary()
+
+
+def test_sma_mentioned_without_period_warns_and_defaults():
+    text = "Rebalance monthly. Risky assets: SPY, QQQ. Use SMA trend filter."
+    spec = parse_plain_english_strategy(text, name="SMA Test")
+    assert spec.trend_sma_period == 200
+    assert any("trend_sma_period" in w for w in spec.warnings)
+
+
+def test_roc_mentioned_without_lookback_warns_and_defaults():
+    text = "Rebalance monthly. Risky assets: SPY, QQQ. Apply positive return trend gate."
+    spec = parse_plain_english_strategy(text, name="ROC Test")
+    assert spec.trend_roc_lookback == 126
+    assert any("trend_roc_lookback" in w for w in spec.warnings)
+
+
+def test_canary_universe_fallback_warns():
+    text = "Rebalance monthly. Canary logic enabled with no assets specified."
+    spec = parse_plain_english_strategy(text, name="Canary Fallback Test")
+    assert spec.use_canary_logic is True
+    assert any("canary-universe" in w for w in spec.warnings)
+    assert any("offensive-universe" in w for w in spec.warnings)
+    assert any("defensive-universe" in w for w in spec.warnings)
+
+
 def test_target_vol_and_var_lookback_are_actually_parsed_not_just_defaults():
     # Same regression, isolated from the canonical text's coincidental
     # defaults: a DIFFERENT target/lookback than the dataclass default must

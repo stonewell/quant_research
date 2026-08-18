@@ -54,6 +54,12 @@ class ParsedStrategySpec:
     var_lookback: int = 20
     max_leverage: float = 1.0
 
+    # Populated by parse_plain_english_strategy() whenever a value below
+    # could not be confidently extracted from the description text and fell
+    # back to a default instead -- a low-confidence signal for the caller,
+    # not itself a parse failure (the returned spec is always usable).
+    warnings: List[str] = field(default_factory=list)
+
     def format_summary(self) -> str:
         """Returns a formatted ASCII summary table of the parsed strategy rules."""
         lines = [
@@ -90,8 +96,15 @@ class ParsedStrategySpec:
 
         lines.extend([
             f"Momentum Lookbacks:      {self.mom_short_lookback}d (short), {self.mom_long_lookback}d (long)",
-            "=" * 70,
         ])
+
+        if self.warnings:
+            lines.append("-" * 70)
+            lines.append("Parser Warnings:")
+            for w in self.warnings:
+                lines.append(f"  - {w}")
+
+        lines.append("=" * 70)
         return "\n".join(lines)
 
 
@@ -119,6 +132,7 @@ def parse_plain_english_strategy(description: str, name: Optional[str] = None) -
     text_lower = text.lower()
 
     # Determine strategy name
+    name_unrecognized = False
     if not name:
         if "turtle" in text_lower or "donchian" in text_lower or "channel breakout" in text_lower:
             name = "Turtle Channel Breakout (Parsed)"
@@ -130,8 +144,13 @@ def parse_plain_english_strategy(description: str, name: Optional[str] = None) -
             name = "Active Dual Momentum GTAA (Parsed)"
         else:
             name = "Custom Plain English Strategy"
+            name_unrecognized = True
 
     spec = ParsedStrategySpec(strategy_name=name, raw_description=text)
+    if name_unrecognized:
+        spec.warnings.append(
+            "Could not classify strategy type from description; using generic name 'Custom Plain English Strategy'"
+        )
 
     # 1. Extract Cash Proxy
     cash_match = re.search(r"cash\s*(?:proxy|asset)?\s*:?\s*([A-Z]{2,5})", text, re.IGNORECASE)
@@ -175,10 +194,22 @@ def parse_plain_english_strategy(description: str, name: Optional[str] = None) -
 
         if not spec.canary_universe:
             spec.canary_universe = list(DEFAULT_BAA_CANARY)
+            spec.warnings.append(
+                f"No canary-universe tickers found in description; defaulting to DEFAULT_BAA_CANARY "
+                f"({', '.join(DEFAULT_BAA_CANARY)})"
+            )
         if not spec.offensive_universe:
             spec.offensive_universe = list(DEFAULT_BAA_OFFENSIVE)
+            spec.warnings.append(
+                f"No offensive-universe tickers found in description; defaulting to DEFAULT_BAA_OFFENSIVE "
+                f"({', '.join(DEFAULT_BAA_OFFENSIVE)})"
+            )
         if not spec.defensive_universe:
             spec.defensive_universe = list(DEFAULT_BAA_DEFENSIVE)
+            spec.warnings.append(
+                f"No defensive-universe tickers found in description; defaulting to DEFAULT_BAA_DEFENSIVE "
+                f"({', '.join(DEFAULT_BAA_DEFENSIVE)})"
+            )
     else:
         # General risky universe extraction
         tickers = _extract_tickers(text, spec.cash_proxy)
@@ -186,6 +217,10 @@ def parse_plain_english_strategy(description: str, name: Optional[str] = None) -
             spec.risky_universe = tickers
         else:
             spec.risky_universe = list(DEFAULT_RISKY_UNIVERSE)
+            spec.warnings.append(
+                f"No risky-universe tickers found in description; defaulting to DEFAULT_RISKY_UNIVERSE "
+                f"({', '.join(DEFAULT_RISKY_UNIVERSE)})"
+            )
 
     # 4. Absolute Trend Gate
     if "sma" in text_lower or "moving average" in text_lower:
@@ -197,6 +232,7 @@ def parse_plain_english_strategy(description: str, name: Optional[str] = None) -
             spec.trend_sma_period = int(sma_after.group(1))
         else:
             spec.trend_sma_period = 200
+            spec.warnings.append("'sma'/'moving average' mentioned but no explicit period found; defaulting trend_sma_period=200")
 
     if "roc" in text_lower or "positive return" in text_lower or "trend gate" in text_lower:
         roc_match = re.search(r"(\d+)\s*(?:d|day|month|m)?\s*(?:roc|return)", text_lower)
@@ -205,6 +241,7 @@ def parse_plain_english_strategy(description: str, name: Optional[str] = None) -
             spec.trend_roc_lookback = val if val > 12 else val * 21
         else:
             spec.trend_roc_lookback = 126
+            spec.warnings.append("'roc'/'positive return'/'trend gate' mentioned but no explicit lookback found; defaulting trend_roc_lookback=126")
 
     # 5. Selection & Top K
     topk_match = re.search(r"top\s*(\d+)", text_lower)
@@ -264,5 +301,9 @@ def parse_plain_english_strategy(description: str, name: Optional[str] = None) -
             spec.allocation_scheme = "equal_weight"
         else:
             spec.allocation_scheme = "inverse_volatility"
+        spec.warnings.append(
+            f"No explicit allocation-scheme keywords found in description; defaulting "
+            f"allocation_scheme='{spec.allocation_scheme}' based on canary-logic presence alone"
+        )
 
     return spec

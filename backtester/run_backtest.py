@@ -28,7 +28,7 @@ if _PROJECT_ROOT not in sys.path:
 
 from common.allocation_backtester import run_allocation_backtest
 from common.allocation_templates import ALLOCATION_TEMPLATES
-from common.data import load_ohlcv
+from common.data import load_universe
 from common.universe import add_universe_cli_args, resolve_universe_from_args
 
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
@@ -53,6 +53,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--data-dir", type=str, default=None,
                    help="Folder path for CSV data provider")
     p.add_argument("--no-cache", action="store_true")
+    p.add_argument("--results-dir", type=str, default=None,
+                   help=f"Override the output directory for equity/weights/report CSVs (default: {RESULTS_DIR})")
+    p.add_argument("--cache-dir", type=str, default=None,
+                   help=f"Override the local OHLCV CSV cache directory (default: {DATA_DIR})")
     return p
 
 
@@ -71,6 +75,34 @@ def _get_template(template_name: str):
         if cls.name == template_name:
             return cls()
     raise ValueError(f"Unknown template name: {template_name}")
+
+
+def _load_strategy_file(path: str) -> dict:
+    """Loads and validates a strategy.json file exported by strategy_generator.
+
+    Only `template_name` and `params` are truly required (everything else is
+    read via `.get()` downstream); validating both up front turns a bare
+    `KeyError` deep in `main()` into one clear error naming every missing/
+    malformed key at once.
+    """
+    with open(path, "r") as f:
+        strategy_def = json.load(f)
+
+    missing = [key for key in ("template_name", "params") if key not in strategy_def]
+    if missing:
+        raise ValueError(
+            f"Malformed strategy file '{path}': missing required key(s) {missing}. "
+            f"Expected keys: template_name (str), params (dict), and optionally "
+            f"explanation/trusted/ers_passed/ers_percentile -- see strategy_generator's "
+            f"run_strategygen.py output for the expected shape."
+        )
+    if not isinstance(strategy_def["params"], dict):
+        raise ValueError(
+            f"Malformed strategy file '{path}': 'params' must be a JSON object, "
+            f"got {type(strategy_def['params']).__name__}."
+        )
+
+    return strategy_def
 
 
 def run_standard(universe: dict, template, params: dict, args) -> dict:
@@ -187,9 +219,10 @@ def run_walkforward(universe: dict, template, params: dict, args) -> list:
 
 def main():
     args = build_arg_parser().parse_args()
+    results_dir = args.results_dir or RESULTS_DIR
+    cache_dir = args.cache_dir or DATA_DIR
 
-    with open(args.strategy_file, "r") as f:
-        strategy_def = json.load(f)
+    strategy_def = _load_strategy_file(args.strategy_file)
 
     template_name = strategy_def["template_name"]
     params = strategy_def["params"]
@@ -213,13 +246,14 @@ def main():
     if not universe_symbols:
         raise ValueError("No universe symbols provided or resolved. Pass --universe, --universe-file, or --universe-provider.")
 
-    universe = {}
-    for symbol in universe_symbols:
-        print(f"Loading {symbol} ...")
-        universe[symbol] = load_ohlcv(symbol, args.start, args.end, args.interval,
-                                       use_cache=not args.no_cache, cache_dir=DATA_DIR, **data_kwargs)
+    print(f"Loading {len(universe_symbols)} symbols ...")
+    universe = load_universe(universe_symbols, args.start, args.end, args.interval,
+                              use_cache=not args.no_cache, cache_dir=cache_dir, **data_kwargs)
+    print(f"Loaded {len(universe)}/{len(universe_symbols)} symbols (see warnings above for any skipped).")
+    if not universe:
+        raise ValueError("No symbols could be loaded successfully; see warnings above.")
 
-    os.makedirs(RESULTS_DIR, exist_ok=True)
+    os.makedirs(results_dir, exist_ok=True)
 
     if args.mode == "standard":
         print("\n=== Running Standard Backtest ===")
@@ -232,11 +266,11 @@ def main():
         print(f"Total Rebalances: {result['total_rebalances']}")
         print(f"Total Turnover: {result['total_turnover']:.2f}")
 
-        out_path = os.path.join(RESULTS_DIR, "backtest_equity.csv")
+        out_path = os.path.join(results_dir, "backtest_equity.csv")
         result["equity_curve"].to_csv(out_path)
         print(f"\nSaved equity curve to {out_path}")
 
-        weights_path = os.path.join(RESULTS_DIR, "backtest_weights.csv")
+        weights_path = os.path.join(results_dir, "backtest_weights.csv")
         result["actual_weights"].to_csv(weights_path)
         print(f"Saved actual daily weights to {weights_path}")
 
@@ -255,7 +289,7 @@ def main():
         print(f"Mean Max Drawdown: {folds_df['max_drawdown'].mean()*100:.1f}% | "
               f"Mean Calmar Ratio: {folds_df['calmar_ratio'].mean():.2f}")
 
-        out_path = os.path.join(RESULTS_DIR, "walkforward_report.csv")
+        out_path = os.path.join(results_dir, "walkforward_report.csv")
         folds_df.to_csv(out_path, index=False)
         print(f"\nSaved walkforward report to {out_path}")
 

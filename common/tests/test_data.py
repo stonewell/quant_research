@@ -3,6 +3,7 @@
 import os
 import shutil
 import tempfile
+import time
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -258,4 +259,96 @@ def test_data_provider_module_specifier_from_file():
 def test_data_provider_invalid_module_specifier():
     with pytest.raises((ValueError, ImportError, AttributeError, FileNotFoundError)):
         get_data_provider("non_existent_script.py:MissingClass")
+
+
+@patch("yfinance.Ticker")
+def test_yfinance_fetch_metadata_extracts_expense_ratio_and_aum(mock_ticker):
+    mock_ticker.return_value.info = {"netExpenseRatio": 0.03, "totalAssets": 5e9}
+    metadata = YFinanceDataProvider().fetch_metadata("SPY")
+    assert metadata["expense_ratio"] == pytest.approx(0.03)
+    assert metadata["total_assets"] == pytest.approx(5e9)
+
+
+@patch("yfinance.Ticker")
+def test_yfinance_fetch_metadata_missing_fields_returns_nan(mock_ticker):
+    mock_ticker.return_value.info = {}
+    metadata = YFinanceDataProvider().fetch_metadata("SPY")
+    assert np.isnan(metadata["expense_ratio"])
+    assert np.isnan(metadata["total_assets"])
+
+
+@patch("yfinance.Ticker")
+def test_yfinance_fetch_metadata_handles_ticker_exception(mock_ticker):
+    mock_ticker.side_effect = RuntimeError("network error")
+    metadata = YFinanceDataProvider().fetch_metadata("SPY")
+    assert np.isnan(metadata["expense_ratio"])
+    assert np.isnan(metadata["total_assets"])
+
+
+def test_cached_data_provider_default_unlimited_age_unchanged(temp_csv_dir):
+    # Regression test pinning today's default behavior: with
+    # cache_max_age_days omitted, a cache hit is served no matter how old.
+    calls = {"n": 0}
+
+    class CountingProvider(SyntheticDataProvider):
+        def fetch_ohlcv(self, symbol, start, end, interval="1d"):
+            calls["n"] += 1
+            return super().fetch_ohlcv(symbol, start, end, interval)
+
+    cached_provider = CachedDataProvider(CountingProvider(seed=42), cache_dir=temp_csv_dir)
+    cache_path = os.path.join(temp_csv_dir, "SPY_1d_2020-01-01_2020-01-10.csv")
+
+    cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
+    assert calls["n"] == 1
+
+    # Backdate the cache file's mtime far into the past -- should still hit.
+    old_time = time.time() - (365 * 86400)
+    os.utime(cache_path, (old_time, old_time))
+
+    cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
+    assert calls["n"] == 1
+
+
+def test_cached_data_provider_respects_max_age(temp_csv_dir):
+    calls = {"n": 0}
+
+    class CountingProvider(SyntheticDataProvider):
+        def fetch_ohlcv(self, symbol, start, end, interval="1d"):
+            calls["n"] += 1
+            return super().fetch_ohlcv(symbol, start, end, interval)
+
+    cached_provider = CachedDataProvider(
+        CountingProvider(seed=42), cache_dir=temp_csv_dir, cache_max_age_days=1
+    )
+    cache_path = os.path.join(temp_csv_dir, "SPY_1d_2020-01-01_2020-01-10.csv")
+
+    cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
+    assert calls["n"] == 1
+
+    # Backdate the cache file's mtime past the 1-day max age -- should re-fetch.
+    old_time = time.time() - (2 * 86400)
+    os.utime(cache_path, (old_time, old_time))
+
+    cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
+    assert calls["n"] == 2
+
+
+def test_cached_data_provider_recovers_from_corrupt_cache_file(temp_csv_dir):
+    inner_provider = SyntheticDataProvider(seed=42)
+    cached_provider = CachedDataProvider(inner_provider, cache_dir=temp_csv_dir)
+    cache_path = os.path.join(temp_csv_dir, "SPY_1d_2020-01-01_2020-01-10.csv")
+
+    os.makedirs(temp_csv_dir, exist_ok=True)
+    with open(cache_path, "w", encoding="utf-8") as f:
+        f.write("not,a,valid,ohlcv,file\n1,2,3,4,5\n")
+
+    with pytest.warns(UserWarning, match="corrupt or invalid"):
+        df = cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
+
+    assert not df.empty
+    assert "Close" in df.columns
+
+    # The corrupt file should have been overwritten with valid data.
+    df2 = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+    assert "Close" in df2.columns
 

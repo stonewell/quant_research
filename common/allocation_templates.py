@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 
 from common.indicators import realized_vol, roc
+from common.scheduling import get_rebalance_dates as _get_rebalance_dates
 
 
 @dataclass
@@ -52,11 +53,6 @@ class AllocationTemplate:
         `backtester/run_backtest.py`'s `run_walkforward`. Default: no
         indicator, no warmup needed."""
         return 0
-
-
-def _get_rebalance_dates(index: pd.DatetimeIndex, freq_days: int) -> pd.DatetimeIndex:
-    """Simple rebalance schedule: every N trading days."""
-    return index[::freq_days]
 
 
 def _hrp_portfolio(cov: np.ndarray) -> np.ndarray:
