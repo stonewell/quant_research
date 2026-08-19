@@ -5,12 +5,16 @@ import pandas as pd
 import pytest
 from common.testing import make_ohlcv_from_closes as make_df
 
+from common.allocation_templates import ALLOCATION_TEMPLATES
+
 from stratgen.generator import (
     GeneratorConfig,
+    RandomAllocationTemplate,
     StrategyGenerator,
     _apply_factor_tiebreak,
     _portfolio_score,
     _search_allocation,
+    grid_combinations,
 )
 
 
@@ -152,7 +156,11 @@ def test_factor_tiebreak_is_a_no_op_when_no_report_supplied():
 
     assert tiebreak_used is False
     assert winner["template"].name == "a"
-    assert factor_context == {}
+    # Documented contract (see README's "Data Shapes & Schemas" and
+    # GeneratedStrategySpec.factor_context's own type hint): factor_context
+    # must be None -- not {} -- when no factor_report was supplied, so
+    # strategy.json serializes it as JSON `null` rather than an empty object.
+    assert factor_context is None
 
 
 def test_factor_tiebreak_ignores_templates_with_no_computable_factor_score():
@@ -259,3 +267,78 @@ def test_extra_template_can_win_when_it_clearly_scores_best():
 
     assert result["template"].name == "my_extra_template"
     assert result["score"] == 999.0
+
+
+# --- ERS fail-safe / logging / n_trials regressions ------------------------
+
+def test_ers_percentile_defaults_to_zero_fail_safe_when_random_pool_is_empty():
+    # If EVERY random trial returns a non-finite Sharpe (filtered out by the
+    # `if np.isfinite(s)` guard), random_scores ends up empty. Regression:
+    # this used to default ers_percentile to 1.0 (a trivial, unearned "pass"
+    # against a nonexistent comparison pool) instead of failing safe.
+    universe = _small_universe()
+    config = GeneratorConfig(n_random_search=5, seed=1)
+
+    def fake_portfolio_score(universe, template, params, cfg):
+        if isinstance(template, RandomAllocationTemplate):
+            return {"sharpe_ratio": float("-inf"), "total_rebalances": 0, "total_turnover": 0.0}
+        return _portfolio_score(universe, template, params, cfg)
+
+    with patch("stratgen.generator._portfolio_score", side_effect=fake_portfolio_score):
+        result = _search_allocation(universe, config)
+
+    assert result["ers_percentile"] == 0.0
+    assert result["ers_passed"] is False
+
+
+class _RaisingTemplate:
+    """A template whose generate_weights deliberately raises, to exercise
+    _portfolio_score's except-and-continue fallback + warning."""
+    name = "raising_template"
+
+    def generate_weights(self, universe, params):
+        raise ValueError("deliberate failure for test")
+
+
+def test_portfolio_score_warns_and_returns_inf_fallback_on_exception():
+    # The bare except must keep swallowing the exception into a -inf score
+    # (a single bad candidate/trial should not crash the whole search), but
+    # it must now surface a RuntimeWarning so the failure is visible instead
+    # of silently indistinguishable from "this candidate just performs poorly".
+    universe = _small_universe()
+    config = GeneratorConfig(seed=1)
+    template = _RaisingTemplate()
+
+    with pytest.warns(RuntimeWarning, match="ValueError"):
+        result = _portfolio_score(universe, template, {}, config)
+
+    assert result == {"sharpe_ratio": float("-inf"), "total_rebalances": 0, "total_turnover": 0.0}
+
+
+def test_n_trials_counts_configured_random_search_attempts_not_survivors():
+    # Regression: n_trials used to be total_grid_trials + len(random_scores),
+    # which undercounts whenever some random trials are filtered out for a
+    # non-finite Sharpe. It must reflect cfg.n_random_search (the number of
+    # random trials actually run/attempted), not the number that survived.
+    universe = _small_universe()
+    config = GeneratorConfig(n_random_search=10, seed=1)
+
+    call_count = {"random": 0}
+
+    def fake_portfolio_score(universe, template, params, cfg):
+        if isinstance(template, RandomAllocationTemplate):
+            call_count["random"] += 1
+            # Half of the random trials "fail" (non-finite) -- these must
+            # still be counted in n_trials even though they're excluded from
+            # random_scores.
+            if call_count["random"] % 2 == 0:
+                return {"sharpe_ratio": float("-inf"), "total_rebalances": 0, "total_turnover": 0.0}
+            return {"sharpe_ratio": 0.01, "total_rebalances": 4, "total_turnover": 1.0}
+        return _portfolio_score(universe, template, params, cfg)
+
+    with patch("stratgen.generator._portfolio_score", side_effect=fake_portfolio_score):
+        result = _search_allocation(universe, config)
+
+    expected_grid_trials = sum(len(grid_combinations(t().param_grid)) for t in ALLOCATION_TEMPLATES)
+    assert call_count["random"] == config.n_random_search  # sanity: all 10 were actually run
+    assert result["n_trials"] == expected_grid_trials + config.n_random_search

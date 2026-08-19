@@ -21,6 +21,7 @@ from common.testing import (
     make_trending_pullback_df,
 )
 from research_strategy.rs.config import StrategyConfig, load_strategies_config
+from research_strategy.rs.nl_parser import ParsedStrategySpec
 from research_strategy.run_research_strategy import instantiate_strategy_from_config_entry
 from research_strategy.rs.strategy import (
     AcceleratingDualMomentum,
@@ -130,6 +131,41 @@ def test_baa_canary_universe_switching():
     assert weights.loc[last_rebal, "QQQ"] == 0.0
     defensive_plus_cash = weights.loc[last_rebal, cfg.baa_defensive + [cfg.cash_proxy]].sum()
     assert pytest.approx(defensive_plus_cash, abs=1e-4) == 1.0
+
+
+def test_baa_canary_calm_market_with_no_offensive_candidates_does_not_mischaracterize_as_turbulent():
+    # Regression test: `if not turbulent and offensive_symbols: ... else:
+    # <defensive logic>` used to route a CALM market (canary passes) into
+    # the defensive-allocation branch whenever `offensive_symbols` happened
+    # to be empty (e.g. a custom config narrows the offensive list
+    # independently of the canary list) -- mischaracterizing "no eligible
+    # offensive candidates" as "market is turbulent". SPY is a steady
+    # uptrend here, so the canary must stay calm; with offensive_universe
+    # explicitly empty, the fixed code must fall back straight to cash
+    # rather than pulling from defensive_universe as if turbulent.
+    spec = ParsedStrategySpec(
+        strategy_name="No Offensive Candidates Test",
+        raw_description="test",
+        use_canary_logic=True,
+        canary_universe=["SPY"],
+        offensive_universe=[],
+        defensive_universe=["TLT", "AGG"],
+        cash_proxy="BIL",
+        rebalance_freq_days=20,
+        trend_sma_period=50,
+        trend_roc_lookback=50,
+        top_k=3,
+    )
+    strat = NaturalLanguageStrategy(spec)
+    universe = create_mock_universe(n_days=250)
+
+    weights = strat.generate_weights(universe)
+    rebal_dates = weights.dropna(how="all").index
+    last_rebal = rebal_dates[-1]
+
+    assert weights.loc[last_rebal, "TLT"] == 0.0
+    assert weights.loc[last_rebal, "AGG"] == 0.0
+    assert weights.loc[last_rebal, "BIL"] == 1.0
 
 
 def test_volatility_managed_deleveraging():

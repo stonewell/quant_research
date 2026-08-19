@@ -45,6 +45,12 @@ def run_allocation_backtest(
 
     # Ensure target_weights and closes are aligned
     common_idx = closes.index.intersection(target_weights.index)
+    if len(common_idx) == 0:
+        # target_weights and the universe's OHLCV cover disjoint date ranges
+        # (e.g. a template's rebalance dates were computed against a
+        # different calendar). Without this check, `equity[0] = initial_capital`
+        # below indexes into a zero-length array and raises IndexError.
+        return {"equity_curve": pd.DataFrame(), "turnover": 0.0}
     closes = closes.loc[common_idx]
     sparse_weights = target_weights.loc[common_idx, symbols]
 
@@ -116,6 +122,16 @@ def run_allocation_backtest(
     daily_returns = eq.pct_change().dropna()
 
     total_return = (eq.iloc[-1] / eq.iloc[0]) - 1.0 if len(eq) > 0 else 0.0
+    # NOTE -- undocumented-until-now "years" convention mismatch:
+    # unlike common/metrics.py's cagr() (trading-day-count basis,
+    # n_periods/periods_per_year), this inline CAGR uses actual CALENDAR
+    # days elapsed (.days/365.25). The two will disagree whenever the
+    # underlying calendar has gaps vs. a fixed periods_per_year assumption.
+    # This is a genuine inconsistency (not a deliberate disclosed dual
+    # convention like win_rate/profit_factor vs. win_rate_from_returns/
+    # profit_factor_from_returns) -- flagged here rather than changed, since
+    # altering either formula risks breaking other correctness-dependent
+    # code/tests.
     n_years = max((common_idx[-1] - common_idx[0]).days / 365.25, 1.0 / 252.0) if len(common_idx) > 1 else 1.0
     cagr = ((1.0 + total_return) ** (1.0 / n_years)) - 1.0 if total_return > -1.0 else -1.0
 

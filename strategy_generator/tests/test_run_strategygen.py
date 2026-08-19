@@ -29,7 +29,7 @@ def test_build_arg_parser_universe_options():
     assert args.universe_file == "basket.json"
 
 
-@patch("run_strategygen.load_ohlcv")
+@patch("run_strategygen.load_universe_with_banner")
 @patch("run_strategygen.StrategyGenerator")
 def test_main_loads_universe_from_file(mock_gen_cls, mock_load):
     # Mock the generator to avoid running real backtests
@@ -72,11 +72,11 @@ def test_main_loads_universe_from_file(mock_gen_cls, mock_load):
         with patch.object(sys, "argv", test_args):
             main()
 
-        # Verify load_ohlcv was called with the tickers from the JSON file
-        assert mock_load.call_count == 2
-        calls = mock_load.call_args_list
-        assert calls[0][0][0] == "TICKER1"
-        assert calls[1][0][0] == "TICKER2"
+        # Verify load_universe_with_banner was called once with the full
+        # symbol list from the JSON file (batch load, not per-symbol).
+        assert mock_load.call_count == 1
+        call_args = mock_load.call_args
+        assert call_args[0][0] == ["TICKER1", "TICKER2"]
 
     finally:
         os.remove(temp_path)

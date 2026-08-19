@@ -19,6 +19,21 @@ def _gains_losses(close: pd.Series) -> tuple:
     return gain, loss
 
 
+def _resolve_zero_loss_rsi(result: pd.Series, avg_gain: pd.Series, avg_loss: pd.Series) -> pd.Series:
+    """`100 - 100/(1+rs)` is undefined (NaN, via a 0/0 `rs`) wherever
+    `avg_loss == 0`, which covers two very different cases that a plain
+    `.where(avg_loss != 0, 100.0)` used to conflate:
+
+    - all gains, zero losses over the window -> genuinely maximal RSI, 100.0.
+    - a completely FLAT window (zero gains AND zero losses, e.g. a constant
+      price series) -> no directional information at all, so RSI should be
+      the neutral midpoint, 50.0, not 100.0.
+    """
+    flat = (avg_loss == 0) & (avg_gain == 0)
+    result = result.where(avg_loss != 0, 100.0)
+    return result.where(~flat, 50.0)
+
+
 def rsi_wilder(close: pd.Series, period: int) -> pd.Series:
     """Wilder's RSI: recursively smooths average gain/loss with weight 1/n
     on the newest bar (equivalent to a (2n-1)-period EMA)."""
@@ -27,7 +42,7 @@ def rsi_wilder(close: pd.Series, period: int) -> pd.Series:
     avg_loss = loss.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
     result = 100 - 100 / (1 + rs)
-    return result.where(avg_loss != 0, 100.0)
+    return _resolve_zero_loss_rsi(result, avg_gain, avg_loss)
 
 
 def rsi_cutler(close: pd.Series, period: int) -> pd.Series:
@@ -39,7 +54,7 @@ def rsi_cutler(close: pd.Series, period: int) -> pd.Series:
     avg_loss = loss.rolling(window=period, min_periods=period).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
     result = 100 - 100 / (1 + rs)
-    return result.where(avg_loss != 0, 100.0)
+    return _resolve_zero_loss_rsi(result, avg_gain, avg_loss)
 
 
 def rsi(close: pd.Series, period: int) -> pd.Series:

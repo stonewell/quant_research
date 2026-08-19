@@ -47,7 +47,7 @@ from common.indicators import (
     rsi_wilder,
     sma,
 )
-from common.allocation_templates import AllocationTemplate, _min_variance_weights
+from common.allocation_templates import AllocationTemplate, _inverse_vol_weights, _min_variance_weights
 from common.scheduling import get_rebalance_dates as _get_rebalance_dates
 from .config import StrategyConfig
 from .nl_parser import ParsedStrategySpec, parse_plain_english_strategy
@@ -202,14 +202,16 @@ class NaturalLanguageStrategy(AllocationTemplate):
                         turbulent = True
                         break
 
-                if not turbulent and offensive_symbols:
-                    scores = rocs_long.loc[date, offensive_symbols].dropna()
-                    if not scores.empty:
-                        top_assets = scores.nlargest(min(len(scores), top_k)).index.tolist()
-                        w_each = 1.0 / len(top_assets) if top_assets else 0.0
-                        for ta in top_assets:
-                            weights_rebal.loc[date, ta] = w_each
-                else:
+                # Three distinct cases, kept separate so that "no eligible
+                # offensive candidates" (a universe/config narrowing issue)
+                # is never mischaracterized as "market is turbulent" (a
+                # canary-signal outcome) -- they used to share the same
+                # `else` branch below, which silently routed a CALM market
+                # with an empty `offensive_symbols` list (e.g. a custom
+                # config that narrows the offensive list independently of
+                # the canary list) into the defensive-allocation logic as if
+                # the canary had actually signalled turbulence.
+                if turbulent:
                     scores = rocs_long.loc[date, defensive_symbols].dropna()
                     positive_defensive = scores[scores > 0].nlargest(min(len(scores), top_k)).index.tolist()
                     if positive_defensive:
@@ -222,6 +224,25 @@ class NaturalLanguageStrategy(AllocationTemplate):
                     else:
                         if cash_proxy in symbols:
                             weights_rebal.loc[date, cash_proxy] = 1.0
+                elif offensive_symbols:
+                    scores = rocs_long.loc[date, offensive_symbols].dropna()
+                    if not scores.empty:
+                        top_assets = scores.nlargest(min(len(scores), top_k)).index.tolist()
+                        w_each = 1.0 / len(top_assets) if top_assets else 0.0
+                        for ta in top_assets:
+                            weights_rebal.loc[date, ta] = w_each
+                    elif cash_proxy in symbols:
+                        # Market is calm, but none of the configured
+                        # offensive assets has a usable score this
+                        # rebalance (e.g. still warming up) -- a
+                        # data-availability fallback, not a turbulent call.
+                        weights_rebal.loc[date, cash_proxy] = 1.0
+                else:
+                    # Market is calm (not turbulent) but there are no
+                    # offensive candidates configured/eligible at all.
+                    # Fall back to cash without claiming turbulence.
+                    if cash_proxy in symbols:
+                        weights_rebal.loc[date, cash_proxy] = 1.0
 
         # MODE 2: Volatility-Managed Inverse Variance Scaling
         elif spec.allocation_scheme == "volatility_managed":
@@ -283,15 +304,10 @@ class NaturalLanguageStrategy(AllocationTemplate):
                         for sym in selected:
                             weights_rebal.loc[date, sym] = w_each
                     else:  # "inverse_volatility"
-                        selected_vols = vols.loc[date, selected].replace(0, np.nan)
-                        inv_v = 1.0 / selected_vols
-                        sum_inv_v = inv_v.sum()
-                        if sum_inv_v > 0 and pd.notna(sum_inv_v):
-                            raw_weights = inv_v / sum_inv_v
-                            scale_factor = len(selected) / float(top_k)
-                            final_weights = raw_weights * scale_factor
-                            for sym in selected:
-                                weights_rebal.loc[date, sym] = final_weights[sym]
+                        scale_factor = len(selected) / float(top_k)
+                        final_weights = _inverse_vol_weights(vols.loc[date, selected], scale=scale_factor, on_invalid="zero")
+                        for sym in selected:
+                            weights_rebal.loc[date, sym] = final_weights[sym]
 
                 total_risky_w = weights_rebal.loc[date, risky_symbols].sum()
                 cash_w = max(0.0, 1.0 - total_risky_w)

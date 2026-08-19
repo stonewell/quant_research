@@ -81,6 +81,7 @@ import pandas as pd
 
 from common.allocation_templates import PatternBasedAllocationTemplate, build_aggregate_curve
 from common.indicator_features import DEFAULT_FEATURE_MENU, compute_feature, feature_label
+from common.significance import shuffle_null_test
 from .turning_points import find_turning_points
 
 
@@ -212,14 +213,18 @@ def mine_indicator_patterns(
             if len(valid_eligible) < n_events:
                 continue
 
-            null_stats = np.array([
-                series.iloc[rng.choice(valid_eligible, size=n_events, replace=False)].mean()
-                for _ in range(n_surrogates)
-            ])
-            null_mean = float(null_stats.mean())
+            def _surrogate_stat(rng, series=series, valid_eligible=valid_eligible, n_events=n_events):
+                return series.iloc[rng.choice(valid_eligible, size=n_events, replace=False)].mean()
 
-            p_value = float(np.mean(np.abs(null_stats - null_mean) >= abs(observed_stat - null_mean)))
-            significant = p_value < adjusted_alpha
+            result = shuffle_null_test(
+                observed_stat, _surrogate_stat, n_surrogates, rng,
+                reference=lambda s: s.mean(),   # null_mean, computed from this test's own surrogates
+                alpha=adjusted_alpha,           # Bonferroni layered on via alpha, no threshold math duplicated
+                skip_nan=False,                 # guaranteed non-NaN: valid_eligible pre-filters NaN feature values
+            )
+            null_mean = float(result["reference"])
+            p_value = float(result["p_value"])
+            significant = result["significant"]
             comparison = "below" if observed_stat < null_mean else "above"
 
             findings.append({

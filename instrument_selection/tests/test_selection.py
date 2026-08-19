@@ -79,6 +79,17 @@ def test_select_cluster_representatives_defaults_to_lowest_volatility_when_volat
     assert "A" in chosen
 
 
+def test_select_cluster_representatives_handles_single_symbol_universe_without_crashing():
+    # Regression: a 1-symbol universe (e.g. only the benchmark survived hard
+    # screening) used to crash inside `correlation.hierarchical_clusters`
+    # (scipy ValueError on an empty condensed distance matrix). It must now
+    # produce a clean, trivial 1-symbol basket instead.
+    corr = pd.DataFrame([[1.0]], index=["ONLY"], columns=["ONLY"])
+    scores = pd.Series({"ONLY": 42.0})
+    chosen = select_cluster_representatives(scores, corr, distance_threshold=0.5, representative_rule="highest_score")
+    assert chosen == ["ONLY"]
+
+
 def test_select_diversified_greedy_prefers_the_independent_symbol_over_a_near_duplicate():
     _, _, corr = _redundant_pair_plus_independent(seed=6)
     # A and B both score very high but are near-duplicates; C scores lower but is independent.

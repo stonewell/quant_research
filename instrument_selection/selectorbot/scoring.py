@@ -53,7 +53,13 @@ DEFAULT_WEIGHTS = {
 
 
 def _pct_rank(series: pd.Series) -> pd.Series:
-    return series.rank(pct=True, na_option="bottom")
+    # na_option="keep" (pandas' default) excludes NaN entries from both the
+    # ranking AND the denominator -- a NaN row gets a NaN rank, and every
+    # OTHER row's percentile is computed only over the non-NaN population, so
+    # one symbol's missing data can't silently compress everyone else's
+    # percentile scores. (na_option="bottom" would count NaNs in the
+    # denominator while still giving them the top rank -- wrong on both counts.)
+    return series.rank(pct=True)
 
 
 def _weighted_average(df: pd.DataFrame, weights: dict) -> pd.Series:

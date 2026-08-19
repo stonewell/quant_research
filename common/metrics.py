@@ -22,6 +22,18 @@ def total_return(equity: pd.Series) -> float:
 
 
 def cagr(equity: pd.Series, periods_per_year: int = 252) -> float:
+    """NOTE -- undocumented-until-now "years" convention mismatch: this
+    function annualizes using a TRADING-DAY-COUNT basis (`n_periods /
+    periods_per_year`), whereas `common/allocation_backtester.py`'s own
+    inline CAGR computation annualizes using actual CALENDAR days elapsed
+    (`(last_date - first_date).days / 365.25`). The two will disagree
+    whenever the equity curve has gaps or a non-standard trading calendar
+    (holidays, weekends already excluded from `n_periods` but present in the
+    calendar-day count). This is a genuine inconsistency, not a deliberate
+    disclosed dual-convention like `win_rate`/`profit_factor` vs.
+    `win_rate_from_returns`/`profit_factor_from_returns` above -- flagged
+    here rather than changed, since altering either formula risks breaking
+    other code/tests that depend on its current numeric behavior."""
     n_periods = len(equity)
     if n_periods < 2:
         return 0.0

@@ -65,6 +65,24 @@ def test_hierarchical_clusters_groups_near_identical_series():
     assert clusters["C"] != clusters["A"]
 
 
+def test_hierarchical_clusters_handles_single_symbol_universe_without_crashing():
+    # Hard liquidity/history screening can leave only the benchmark behind --
+    # `squareform`/`linkage` can't operate on a 1x1 (empty condensed) distance
+    # matrix, so this must short-circuit to a trivial single-cluster result
+    # rather than raising ValueError.
+    corr = pd.DataFrame([[1.0]], index=["ONLY"], columns=["ONLY"])
+    clusters = hierarchical_clusters(corr, distance_threshold=0.5)
+    assert list(clusters.index) == ["ONLY"]
+    assert len(clusters) == 1
+    assert clusters["ONLY"] == 0
+
+
+def test_hierarchical_clusters_handles_empty_universe_without_crashing():
+    corr = pd.DataFrame(dtype=float)
+    clusters = hierarchical_clusters(corr, distance_threshold=0.5)
+    assert len(clusters) == 0
+
+
 def test_redundancy_flags_detects_highly_correlated_pair():
     rng = np.random.default_rng(5)
     n = 500

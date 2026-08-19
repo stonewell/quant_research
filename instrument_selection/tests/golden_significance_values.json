@@ -1,0 +1,57 @@
+{
+  "hurst_trend": {
+    "hurst": 0.6903471372668447,
+    "surrogate_mean": 0.5536765250190336,
+    "surrogate_std": 0.0247894393709995,
+    "p_value": 0.0,
+    "significant": true
+  },
+  "hurst_meanrev": {
+    "hurst": 0.37685280667149024,
+    "surrogate_mean": 0.5533602655102247,
+    "surrogate_std": 0.02671442501021885,
+    "p_value": 0.0,
+    "significant": true
+  },
+  "hurst_rw": {
+    "hurst": 0.5574310654512538,
+    "surrogate_mean": 0.551893511746417,
+    "surrogate_std": 0.02386083855336025,
+    "p_value": 0.405,
+    "significant": false
+  },
+  "candlestick_engineered": {
+    "candlestick_edge": 0.03638713611911941,
+    "candlestick_p_value": 0.0,
+    "candlestick_significant": true,
+    "candlestick_n_signals": 441,
+    "candlestick_n_bullish": 223,
+    "candlestick_n_bearish": 220
+  },
+  "candlestick_rw": {
+    "candlestick_edge": "NaN",
+    "candlestick_p_value": "NaN",
+    "candlestick_significant": false,
+    "candlestick_n_signals": 0,
+    "candlestick_n_bullish": 0,
+    "candlestick_n_bearish": 0
+  },
+  "momentum_trend": {
+    "momentum_edge": 0.33205449010605015,
+    "momentum_p_value": 0.0,
+    "momentum_significant": true,
+    "momentum_n_windows": 2990
+  },
+  "momentum_meanrev": {
+    "momentum_edge": -0.26831581400510346,
+    "momentum_p_value": 0.0,
+    "momentum_significant": true,
+    "momentum_n_windows": 2990
+  },
+  "momentum_rw": {
+    "momentum_edge": 0.02637215047964911,
+    "momentum_p_value": 0.45,
+    "momentum_significant": false,
+    "momentum_n_windows": 2990
+  }
+}

@@ -259,6 +259,25 @@ class EqualWeightAllocation(AllocationTemplate):
         )
 
 
+def _inverse_vol_weights(vols: pd.Series, scale: float = 1.0, on_invalid: str = "nan") -> pd.Series:
+    """1/vol, normalized so the returned weights (indexed like `vols`) sum to
+    `scale` (default 1.0) -- the core inverse-volatility math shared by
+    `InverseVolatilityAllocation` (whole-universe, scale=1.0) and
+    `research_strategy`'s dual-momentum inverse-vol branch (a pre-filtered
+    subset, scale=n_selected/top_k for a partial-fill risky sleeve). Zero vol
+    is treated as missing. `on_invalid` controls what's returned when every
+    symbol's vol is invalid/zero (total <= 0 or NaN) -- the two existing call
+    sites disagree here, so this is NOT unified silently: `"nan"`
+    (`InverseVolatilityAllocation`'s existing behavior, via natural division
+    propagation) or `"zero"` (research_strategy's existing behavior, via its
+    0.0-initialized weights frame)."""
+    inv_v = 1.0 / vols.replace(0, np.nan)
+    total = inv_v.sum()
+    if not (pd.notna(total) and total > 0):
+        return pd.Series(np.nan if on_invalid == "nan" else 0.0, index=vols.index)
+    return (inv_v / total) * scale
+
+
 @dataclass
 class InverseVolatilityAllocation(AllocationTemplate):
     name: str = "inverse_volatility"
@@ -276,18 +295,16 @@ class InverseVolatilityAllocation(AllocationTemplate):
         master_index = universe[symbols[0]].index
         rebalance_dates = _get_rebalance_dates(master_index, params["rebalance_freq_days"])
 
-        # Calculate daily inverse volatility for all symbols
-        inv_vols = pd.DataFrame(index=master_index, columns=symbols)
+        # Calculate daily volatility for all symbols
+        vols = pd.DataFrame(index=master_index, columns=symbols, dtype=float)
         for sym, df in universe.items():
-            vol = realized_vol(df["Close"], window=params["vol_lookback"])
-            # Avoid division by zero
-            inv_vols[sym] = 1.0 / vol.replace(0, np.nan)
+            vols[sym] = realized_vol(df["Close"], window=params["vol_lookback"])
 
         # Only keep values on rebalance dates
-        inv_vols_rebal = inv_vols.loc[rebalance_dates]
+        vols_rebal = vols.loc[rebalance_dates]
 
-        # Normalize so weights sum to 1.0 across the row
-        weights_rebal = inv_vols_rebal.div(inv_vols_rebal.sum(axis=1), axis=0)
+        # Invert + normalize so weights sum to 1.0 across the row
+        weights_rebal = vols_rebal.apply(lambda row: _inverse_vol_weights(row), axis=1)
 
         weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
         weights_df.loc[rebalance_dates] = weights_rebal
@@ -506,20 +523,30 @@ class MaxDiversificationAllocation(AllocationTemplate):
             if loc < lookback:
                 continue
             sub_ret = returns_df.iloc[loc - lookback:loc]
-            if sub_ret.dropna(how="all").empty:
+
+            # Same guard as HierarchicalRiskParityAllocation/
+            # MinimumVarianceAllocation: a symbol without a full lookback
+            # history is excluded rather than left in the correlation/
+            # volatility computation, where an all-NaN return column would
+            # otherwise get its correlation `fillna(0)`'d to look maximally
+            # diversifying (and its own weight would come out NaN, breaking
+            # the row's weight-sum invariant).
+            valid_symbols = [s for s in symbols if sub_ret[s].notna().all()]
+            if not valid_symbols:
                 continue
+            sub_ret = sub_ret[valid_symbols]
 
             vols = sub_ret.std() * np.sqrt(252)
             corr = sub_ret.corr().fillna(0)
 
-            n = len(symbols)
+            n = len(valid_symbols)
             avg_corr = (corr.sum(axis=1) - 1.0) / max(n - 1, 1)
 
             denom = (1.0 + avg_corr.clip(lower=0.0)).replace(0, np.nan)
             raw_w = vols / denom
             sum_w = raw_w.sum()
             if sum_w > 0:
-                weights_rebal.loc[date] = raw_w / sum_w
+                weights_rebal.loc[date, valid_symbols] = (raw_w / sum_w).values
 
         weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
         weights_df.loc[rebalance_dates] = weights_rebal

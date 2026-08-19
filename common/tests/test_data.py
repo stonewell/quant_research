@@ -1,6 +1,7 @@
 """Unit tests for common/data.py Market Data Provider Architecture."""
 
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -331,6 +332,83 @@ def test_cached_data_provider_respects_max_age(temp_csv_dir):
 
     cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
     assert calls["n"] == 2
+
+
+def test_csv_folder_data_provider_sorts_unsorted_csv(temp_csv_dir):
+    # Regression test: fetch_ohlcv() used to read the CSV, date-filter it,
+    # and return WITHOUT sorting -- silently violating the documented
+    # ascending-DatetimeIndex OHLCV contract (common/README.md section 1) if
+    # the CSV on disk isn't already sorted by date.
+    dates = pd.bdate_range("2020-01-01", periods=5)
+    shuffled_dates = [dates[3], dates[0], dates[4], dates[1], dates[2]]
+    mock_df = pd.DataFrame(
+        {
+            "Open": [10.0] * 5,
+            "High": [12.0] * 5,
+            "Low": [9.0] * 5,
+            "Close": [11.0, 21.0, 31.0, 41.0, 51.0],
+            "Volume": [100.0] * 5,
+        },
+        index=pd.DatetimeIndex(shuffled_dates),
+    )
+    csv_path = os.path.join(temp_csv_dir, "UNSORTED_1d.csv")
+    mock_df.to_csv(csv_path)
+
+    provider = CSVFolderDataProvider(folder_path=temp_csv_dir)
+    df = provider.fetch_ohlcv("UNSORTED", start="2020-01-01", end="2020-01-10", interval="1d")
+
+    assert df.index.is_monotonic_increasing
+    assert list(df.index) == list(dates)
+
+
+def test_load_provider_from_specifier_missing_fetch_ohlcv_raises_type_error_not_name_error():
+    # Regression test: the error-raising line referenced an undefined
+    # variable `target_str` instead of the actual `specifier` parameter,
+    # causing an unhandled NameError instead of the intended descriptive
+    # TypeError when a dynamically-loaded provider class lacks fetch_ohlcv.
+    code = (
+        "class BogusProvider:\n"
+        "    def not_fetch_ohlcv(self, symbol, start, end, interval='1d'):\n"
+        "        return None\n"
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+        f.write(code)
+        script_path = f.name
+
+    try:
+        with pytest.raises(TypeError, match=re.escape(f"{script_path}:BogusProvider")):
+            get_data_provider(f"{script_path}:BogusProvider")
+    finally:
+        os.remove(script_path)
+
+
+def test_csv_folder_data_provider_rejects_path_traversal_symbol(temp_csv_dir):
+    # Regression test: `symbol` was interpolated directly into a file path
+    # (f"{symbol}.csv") with no sanitization, letting a symbol containing
+    # "../" escape the intended folder.
+    provider = CSVFolderDataProvider(folder_path=temp_csv_dir)
+    with pytest.raises(ValueError):
+        provider.fetch_ohlcv("../../evil", start="2020-01-01", end="2020-01-10")
+
+
+def test_cached_data_provider_rejects_path_traversal_symbol(temp_csv_dir):
+    inner_provider = SyntheticDataProvider(seed=42)
+    cached_provider = CachedDataProvider(inner_provider, cache_dir=temp_csv_dir)
+    with pytest.raises(ValueError):
+        cached_provider.fetch_ohlcv("../../evil", start="2020-01-01", end="2020-01-10")
+
+
+@patch("yfinance.Ticker")
+def test_yfinance_fetch_metadata_handles_info_returning_none(mock_ticker):
+    # Regression test: yfinance's real failure mode for a delisted/invalid
+    # ticker is `.info` returning None (not raising) -- the subsequent
+    # `info.get(key)` calls would then raise an uncaught AttributeError
+    # instead of falling back to the same NaN-filled dict the exception path
+    # already returns. No network access: `.info` is mocked directly.
+    mock_ticker.return_value.info = None
+    metadata = YFinanceDataProvider().fetch_metadata("DELISTED")
+    assert np.isnan(metadata["expense_ratio"])
+    assert np.isnan(metadata["total_assets"])
 
 
 def test_cached_data_provider_recovers_from_corrupt_cache_file(temp_csv_dir):

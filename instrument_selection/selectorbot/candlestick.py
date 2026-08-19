@@ -53,6 +53,7 @@ import numpy as np
 import pandas as pd
 
 from common.indicators import bearish_reversal_signals, bullish_reversal_signals
+from common.significance import StopSurrogates, shuffle_null_test
 
 
 def _directional_edge(bull: pd.Series, bear: pd.Series, fwd: pd.Series) -> tuple:
@@ -96,25 +97,24 @@ def candlestick_significance(df: pd.DataFrame, horizon: int = 5, n_surrogates: i
 
     rng = np.random.default_rng(seed)
     valid_idx = np.flatnonzero(fwd.notna().to_numpy())
-    surrogate = []
-    for _ in range(n_surrogates):
+
+    def _surrogate_stat(rng):
         if len(valid_idx) < n_bull + n_bear:
-            break
+            raise StopSurrogates
         picks = rng.choice(valid_idx, size=n_bull + n_bear, replace=False)
         fake_bull = pd.Series(False, index=df.index)
         fake_bear = pd.Series(False, index=df.index)
         fake_bull.iloc[picks[:n_bull]] = True
         fake_bear.iloc[picks[n_bull:]] = True
         edge, _ = _directional_edge(fake_bull, fake_bear, fwd)
-        if not np.isnan(edge):
-            surrogate.append(edge)
-    surrogate = np.array(surrogate)
-    p_value = (np.abs(surrogate) >= abs(observed)).mean() if len(surrogate) else np.nan
+        return edge
+
+    result = shuffle_null_test(observed, _surrogate_stat, n_surrogates, rng)
 
     return {
         "candlestick_edge": observed,
-        "candlestick_p_value": p_value,
-        "candlestick_significant": bool(p_value < 0.05) if not np.isnan(p_value) else False,
+        "candlestick_p_value": result["p_value"],
+        "candlestick_significant": result["significant"],
         "candlestick_n_signals": n_signals,
         "candlestick_n_bullish": n_bull,
         "candlestick_n_bearish": n_bear,

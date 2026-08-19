@@ -155,6 +155,38 @@ def test_canary_universe_fallback_warns():
     assert any("defensive-universe" in w for w in spec.warnings)
 
 
+def test_roc_explicit_day_unit_is_not_treated_as_months():
+    # Regression test: "10d ROC > 0" has an EXPLICIT day unit, but the old
+    # heuristic (`val if val > 12 else val * 21`) assumed any number <= 12
+    # meant months and multiplied by 21, turning 10 into 210.
+    spec = parse_plain_english_strategy("Trend gate: 10d ROC > 0. Risky assets: SPY, QQQ.")
+    assert spec.trend_roc_lookback == 10
+
+
+def test_roc_month_phrasing_still_applies_month_heuristic():
+    # Confirms the legitimate month-phrased heuristic case wasn't broken by
+    # the day-unit fix above: "3 month ROC" should still become 63 (3 * 21).
+    spec = parse_plain_english_strategy("Trend gate: 3 month ROC > 0. Risky assets: SPY, QQQ.")
+    assert spec.trend_roc_lookback == 63
+
+
+def test_roc_bare_small_number_without_unit_still_uses_month_heuristic():
+    # No explicit unit at all -- legacy heuristic (<=12 assumed months)
+    # should still apply, matching pre-fix behavior for this phrasing.
+    spec = parse_plain_english_strategy("Trend gate: 6 ROC > 0. Risky assets: SPY, QQQ.")
+    assert spec.trend_roc_lookback == 126
+
+
+def test_rsi_mentioned_in_description_is_not_captured_as_phantom_ticker():
+    # Regression test: STOP_WORDS omitted common TA acronyms like RSI/ATR/
+    # ADX/ETF/CAGR/MACD, so a description mentioning "RSI confirmation"
+    # captured "RSI" itself as a spurious phantom ticker in risky_universe.
+    text = "Rebalance monthly. Risky assets: SPY, QQQ with Close > 200d SMA and RSI confirmation."
+    spec = parse_plain_english_strategy(text)
+    assert "RSI" not in spec.risky_universe
+    assert set(spec.risky_universe) == {"SPY", "QQQ"}
+
+
 def test_target_vol_and_var_lookback_are_actually_parsed_not_just_defaults():
     # Same regression, isolated from the canonical text's coincidental
     # defaults: a DIFFERENT target/lookback than the dataclass default must

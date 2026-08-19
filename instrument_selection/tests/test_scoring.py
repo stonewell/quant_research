@@ -67,6 +67,44 @@ def test_overall_score_ignores_missing_etf_metadata_without_penalty():
     # overall score should still be a valid, non-NaN number.
     assert not np.isnan(scored.loc["NEUTRAL", "overall_selection_score"])
     assert np.isnan(scored.loc["NEUTRAL", "etf_expense_score"])
+    # With the NaN correctly excluded from BOTH the ranking and the
+    # denominator (pandas' default na_option="keep"), the two real values
+    # rank 1-of-2 and 2-of-2 among the non-NaN population -- NOT 1-of-3 and
+    # 2-of-3, which is what na_option="bottom" would wrongly produce by
+    # counting NEUTRAL's NaN as a phantom third entry. etf_expense_score
+    # favors a LOWER expense ratio, so TRENDY (0.001, the smaller of the
+    # two) scores 50.0 and MEANREVY (0.005, the larger) scores 0.0.
+    assert scored.loc["TRENDY", "etf_expense_score"] == pytest.approx(50.0)
+    assert scored.loc["MEANREVY", "etf_expense_score"] == pytest.approx(0.0)
+
+
+def test_pct_rank_based_scores_are_not_skewed_by_a_nan_peer():
+    # 4 non-NaN expense ratios plus one NaN peer (NEUTRAL) in the universe:
+    # the non-NaN symbols' etf_expense_score must be IDENTICAL to what
+    # they'd get if the NaN-metadata symbol weren't in the universe at all
+    # -- a NaN peer must never silently compress everyone else's percentile.
+    extra = pd.DataFrame({
+        "avg_dollar_volume": [2e8, 3e8],
+        "median_spread_pct": [0.05, 0.08],
+        "realized_vol_annualized_pct": [20.0, 30.0],
+        "pct_days_trending_adx": [50.0, 60.0],
+        "hurst": [0.6, 0.4],
+        "hurst_significant": [True, True],
+        "hurst_p_value": [0.01, 0.01],
+        "avg_correlation_to_universe": [0.3, 0.6],
+        "history_years": [5.0, 6.0],
+    }, index=["EXTRA1", "EXTRA2"])
+    metrics = pd.concat([make_metrics(), extra])
+    metrics["expense_ratio"] = [0.001, 0.005, np.nan, 0.002, 0.01]
+    metrics["total_assets"] = [1e11, 1e8, np.nan, 5e9, 2e7]
+
+    scored_with_nan_peer = score_universe(metrics)
+    scored_without_nan_peer = score_universe(metrics.drop(index="NEUTRAL"))
+
+    for sym in ["TRENDY", "MEANREVY", "EXTRA1", "EXTRA2"]:
+        assert scored_with_nan_peer.loc[sym, "etf_expense_score"] == pytest.approx(
+            scored_without_nan_peer.loc[sym, "etf_expense_score"]
+        )
 
 
 def test_etf_expense_score_favors_lower_expense_ratio():

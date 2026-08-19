@@ -26,11 +26,20 @@ from selectorbot import (
     selection,
     volatility,
 )
+from common.cli_utils import (
+    add_data_provider_cli_args,
+    build_data_kwargs,
+    default_data_dir,
+    default_results_dir,
+    load_universe_with_banner,
+)
+from common.reporting import utc_timestamp
 from common.universe import add_universe_cli_args, resolve_universe_from_args
 from selectorbot.config import SelectionConfig
-from selectorbot.data import fetch_fund_metadata, load_universe
+from selectorbot.data import fetch_fund_metadata
 
-RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+RESULTS_DIR = default_results_dir(__file__)
+DATA_DIR = default_data_dir(__file__)  # matches selectorbot.data.DATA_DIR -- preserves this project's cache location
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -55,14 +64,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--select-k", type=int, default=None,
                    help="basket size for --select-method top_k/greedy (required for greedy; default 8 for top_k)")
     p.add_argument("--select-max-k", type=int, default=None,
-                   help="optional cap on basket size for --select-method threshold (which otherwise sizes itself)")
-    p.add_argument("--data-provider", default="yfinance",
-                   help="Market data source provider ('yfinance', 'csv', 'synthetic', or custom module specifier string e.g. 'script.py:CustomProvider')")
-    p.add_argument("--data-dir", type=str, default=None,
-                   help="Folder path for CSV data provider")
-    p.add_argument("--no-cache", action="store_true")
+                   help="optional cap on basket size for --select-method threshold/max_diversification "
+                        "(which otherwise size themselves from the data)")
+    add_data_provider_cli_args(p)   # default_provider="yfinance" matches current default
     p.add_argument("--no-plots", action="store_true")
     return p
+
+
+def select_basket(args, config, scored: pd.DataFrame, corr: pd.DataFrame) -> list:
+    """Dispatch `--select-method` to the right `selection.py` function,
+    honoring each method's documented CLI knobs (see README's `--select-*`
+    table) -- split out from `main()` so this wiring is unit-testable
+    without needing to load market data."""
+    scores = scored["overall_selection_score"]
+    if args.select_method == "top_k":
+        return list(scores.sort_values(ascending=False).head(args.select_k or args.top_n).index)
+    elif args.select_method == "cluster":
+        realized_vol = pd.to_numeric(scored["realized_vol_annualized_pct"], errors="coerce")
+        # distance_threshold is a correlation-DISTANCE (d=sqrt(2*(1-rho))), not a raw correlation --
+        # converted here so --max-cluster-correlation means the same thing across all select methods.
+        distance_threshold = (2 * (1 - config.max_cluster_correlation)) ** 0.5
+        return selection.select_cluster_representatives(
+            scores, corr, distance_threshold=distance_threshold, volatility=realized_vol)
+    elif args.select_method == "greedy":
+        if not args.select_k:
+            raise SystemExit("--select-method greedy requires --select-k")
+        return selection.select_diversified_greedy(scores, corr, k=args.select_k)
+    elif args.select_method == "max_diversification":
+        realized_vol = pd.to_numeric(scored["realized_vol_annualized_pct"], errors="coerce")
+        # k=args.select_max_k (not --select-k/--top-n): per README, this method
+        # self-sizes to the full surviving universe unless --select-max-k caps it,
+        # matching the --select-method threshold branch below.
+        return selection.select_max_diversification_ratio(
+            scores, corr, volatility=realized_vol, k=args.select_max_k)
+    else:
+        return selection.select_diversified_threshold_greedy(
+            scores, corr, max_correlation=config.max_cluster_correlation, max_k=args.select_max_k)
 
 
 def main():
@@ -76,13 +113,12 @@ def main():
     )
     universe = list(dict.fromkeys(config.universe + [config.benchmark]))  # ensure benchmark is included, no dupes
 
-    data_kwargs = {"provider": args.data_provider}
-    if args.data_dir:
-        data_kwargs["folder_path"] = args.data_dir
+    data_kwargs = build_data_kwargs(args)
 
-    print(f"Loading {len(universe)} symbols from {config.start} to {config.end} ...")
-    data = load_universe(universe, config.start, config.end, config.interval, use_cache=not args.no_cache, **data_kwargs)
-    print(f"Loaded {len(data)}/{len(universe)} symbols (see warnings above for any skipped).")
+    data = load_universe_with_banner(universe, config.start, config.end, config.interval,
+                                      use_cache=not args.no_cache, cache_dir=DATA_DIR, data_kwargs=data_kwargs,
+                                      require_nonempty=False,
+                                      loading_msg=f"Loading {len(universe)} symbols from {config.start} to {config.end} ...")
 
     rows = {}
     for symbol, df in data.items():
@@ -174,27 +210,7 @@ def main():
     print(f"\n=== Top {args.top_n} candidates by overall selection score (individual ranking, ignores redundancy) ===")
     print(scored["overall_selection_score"].sort_values(ascending=False).head(args.top_n).round(1))
 
-    scores = scored["overall_selection_score"]
-    if args.select_method == "top_k":
-        chosen = list(scores.sort_values(ascending=False).head(args.select_k or args.top_n).index)
-    elif args.select_method == "cluster":
-        realized_vol = pd.to_numeric(scored["realized_vol_annualized_pct"], errors="coerce")
-        # distance_threshold is a correlation-DISTANCE (d=sqrt(2*(1-rho))), not a raw correlation --
-        # converted here so --max-cluster-correlation means the same thing across all select methods.
-        distance_threshold = (2 * (1 - config.max_cluster_correlation)) ** 0.5
-        chosen = selection.select_cluster_representatives(
-            scores, corr, distance_threshold=distance_threshold, volatility=realized_vol)
-    elif args.select_method == "greedy":
-        if not args.select_k:
-            raise SystemExit("--select-method greedy requires --select-k")
-        chosen = selection.select_diversified_greedy(scores, corr, k=args.select_k)
-    elif args.select_method == "max_diversification":
-        realized_vol = pd.to_numeric(scored["realized_vol_annualized_pct"], errors="coerce")
-        chosen = selection.select_max_diversification_ratio(
-            scores, corr, volatility=realized_vol, k=args.select_k or args.top_n)
-    else:
-        chosen = selection.select_diversified_threshold_greedy(
-            scores, corr, max_correlation=config.max_cluster_correlation, max_k=args.select_max_k)
+    chosen = select_basket(args, config, scored, corr)
 
     print(f"\n=== Chosen basket ({args.select_method}, {len(chosen)} instruments) -- "
           f"see README for what each method does and doesn't guarantee ===")
@@ -209,13 +225,12 @@ def main():
     print(f"\nSaved full report to {scored_path}")
 
     import json
-    from datetime import datetime
     basket_json_path = os.path.join(RESULTS_DIR, "basket.json")
     with open(basket_json_path, "w") as f:
         json.dump({
             "basket": list(chosen),
             "method": args.select_method,
-            "date_generated": datetime.utcnow().isoformat() + "Z"
+            "date_generated": utc_timestamp()
         }, f, indent=2)
     print(f"Saved chosen basket to {basket_json_path}")
 

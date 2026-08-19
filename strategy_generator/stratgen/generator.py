@@ -10,6 +10,7 @@ to ensure the result is genuinely better than chance.
 """
 
 import itertools
+import warnings
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -79,7 +80,12 @@ def _portfolio_score(universe: dict, template, params: dict, config: GeneratorCo
             slippage_pct=config.slippage_pct
         )
         return result
-    except Exception:
+    except Exception as exc:
+        warnings.warn(
+            f"_portfolio_score: {template!r} raised {type(exc).__name__}: {exc} -- "
+            f"treating this candidate/trial as -inf Sharpe and continuing.",
+            category=RuntimeWarning,
+        )
         return {"sharpe_ratio": float("-inf"), "total_rebalances": 0, "total_turnover": 0.0}
 
 
@@ -154,8 +160,9 @@ def _apply_factor_tiebreak(best_per_template: dict, factor_report: dict, epsilon
     best_result = max(best_per_template.values(), key=lambda r: r["score"])
     best_score = best_result["score"]
 
-    factor_context = {}
+    factor_context = None
     if factor_report is not None:
+        factor_context = {}
         for r in best_per_template.values():
             factor_context[r["template"].name] = _factor_score(r["template"], factor_report)
 
@@ -256,7 +263,10 @@ def _search_allocation(universe: dict, cfg: GeneratorConfig, factor_report: dict
         if np.isfinite(s):
             random_scores.append(s)
 
-    ers_percentile = float((np.array(random_scores) < best_score).mean()) if random_scores else 1.0
+    # If every random trial failed/returned non-finite, there is no pool to
+    # compare against -- default to 0.0 (fail-safe: this candidate has NOT
+    # been shown to beat anything), not 1.0 (a trivial, unearned "pass").
+    ers_percentile = float((np.array(random_scores) < best_score).mean()) if random_scores else 0.0
     ers_passed = ers_percentile >= cfg.ers_percentile_threshold
     trusted = ers_passed and best_res.get("total_rebalances", 0) >= cfg.min_rebalances_for_trust
 
@@ -269,7 +279,7 @@ def _search_allocation(universe: dict, cfg: GeneratorConfig, factor_report: dict
         "total_turnover": best_res.get("total_turnover", 0.0),
         "ers_passed": ers_passed,
         "ers_percentile": ers_percentile,
-        "n_trials": total_grid_trials + len(random_scores),
+        "n_trials": total_grid_trials + cfg.n_random_search,
         "trusted": trusted,
         "factor_context": factor_context,
         "factor_tiebreak_used": factor_tiebreak_used,

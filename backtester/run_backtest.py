@@ -28,11 +28,17 @@ if _PROJECT_ROOT not in sys.path:
 
 from common.allocation_backtester import run_allocation_backtest
 from common.allocation_templates import ALLOCATION_TEMPLATES, PatternBasedAllocationTemplate
-from common.data import load_universe
+from common.cli_utils import (
+    add_data_provider_cli_args,
+    build_data_kwargs,
+    default_data_dir,
+    default_results_dir,
+    load_universe_with_banner,
+)
 from common.universe import add_universe_cli_args, resolve_universe_from_args
 
-RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+RESULTS_DIR = default_results_dir(__file__)
+DATA_DIR = default_data_dir(__file__)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -48,11 +54,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--initial-capital", type=float, default=100_000.0)
     p.add_argument("--commission-pct", type=float, default=0.0005)
     p.add_argument("--slippage-pct", type=float, default=0.0005)
-    p.add_argument("--data-provider", default="yfinance",
-                   help="Market data source provider ('yfinance', 'csv', 'synthetic', or custom module specifier string e.g. 'script.py:CustomProvider')")
-    p.add_argument("--data-dir", type=str, default=None,
-                   help="Folder path for CSV data provider")
-    p.add_argument("--no-cache", action="store_true")
+    add_data_provider_cli_args(p)
     p.add_argument("--results-dir", type=str, default=None,
                    help=f"Override the output directory for equity/weights/report CSVs (default: {RESULTS_DIR})")
     p.add_argument("--cache-dir", type=str, default=None,
@@ -78,6 +80,13 @@ def _get_template(template_name: str, pattern_spec: dict = None):
     produced from a winning mined pattern carries its own `pattern_spec`
     (see run_strategygen.py) so it can be reconstructed here instead."""
     if pattern_spec is not None:
+        if not template_name.startswith("pattern_"):
+            raise ValueError(
+                f"pattern_spec provided but template_name '{template_name}' does not "
+                f"start with 'pattern_' -- a pattern_spec block only makes sense for a "
+                f"mined pattern-based template; refusing to silently reinterpret "
+                f"'{template_name}' as one."
+            )
         return PatternBasedAllocationTemplate(
             feature_name=pattern_spec["feature_name"],
             feature_lookback=pattern_spec["feature_lookback"],
@@ -118,6 +127,18 @@ def _load_strategy_file(path: str) -> dict:
             f"got {type(strategy_def['params']).__name__}."
         )
 
+    pattern_spec = strategy_def.get("pattern_spec")
+    if pattern_spec is not None:
+        required_pattern_keys = ("feature_name", "feature_lookback", "threshold", "comparison", "event_type")
+        missing_pattern_keys = [key for key in required_pattern_keys if key not in pattern_spec]
+        if missing_pattern_keys:
+            raise ValueError(
+                f"Malformed strategy file '{path}': 'pattern_spec' is missing required "
+                f"key(s) {missing_pattern_keys}. Expected keys: {list(required_pattern_keys)} "
+                f"(plus optional mined_p_value/mined_n_events) -- see strategy_generator's "
+                f"run_strategygen.py pattern-mining output for the expected shape."
+            )
+
     return strategy_def
 
 
@@ -154,6 +175,18 @@ def run_walkforward(universe: dict, template, params: dict, args) -> list:
     window_bars = int(round(args.window_years * 252))
     step_bars = int(round(args.step_years * 252))
 
+    if window_bars <= 0:
+        raise ValueError(
+            f"--window-years must be positive (resolved to {window_bars} bars from "
+            f"window_years={args.window_years}); a non-positive window would silently "
+            f"corrupt fold end dates via negative indexing instead of ever evaluating anything."
+        )
+    if step_bars <= 0:
+        raise ValueError(
+            f"--step-years must be positive (resolved to {step_bars} bars from "
+            f"step_years={args.step_years}); a non-positive step would never advance "
+            f"past the first fold, hanging the walk-forward loop forever."
+        )
     if window_bars >= n_bars:
         raise ValueError("Window size is larger than the available data.")
 
@@ -255,20 +288,15 @@ def main():
               f"treat these results as exploratory, not validated.")
     print()
 
-    data_kwargs = {"provider": args.data_provider}
-    if args.data_dir:
-        data_kwargs["folder_path"] = args.data_dir
+    data_kwargs = build_data_kwargs(args)
 
     universe_symbols = resolve_universe_from_args(args)
     if not universe_symbols:
         raise ValueError("No universe symbols provided or resolved. Pass --universe, --universe-file, or --universe-provider.")
 
-    print(f"Loading {len(universe_symbols)} symbols ...")
-    universe = load_universe(universe_symbols, args.start, args.end, args.interval,
-                              use_cache=not args.no_cache, cache_dir=cache_dir, **data_kwargs)
-    print(f"Loaded {len(universe)}/{len(universe_symbols)} symbols (see warnings above for any skipped).")
-    if not universe:
-        raise ValueError("No symbols could be loaded successfully; see warnings above.")
+    universe = load_universe_with_banner(universe_symbols, args.start, args.end, args.interval,
+                                          use_cache=not args.no_cache, cache_dir=cache_dir,
+                                          data_kwargs=data_kwargs, require_nonempty=True)
 
     os.makedirs(results_dir, exist_ok=True)
 

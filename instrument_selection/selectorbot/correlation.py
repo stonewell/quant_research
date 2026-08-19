@@ -48,7 +48,19 @@ def correlation_distance(corr: pd.DataFrame) -> pd.DataFrame:
 def hierarchical_clusters(corr: pd.DataFrame, distance_threshold: float = 0.5) -> pd.Series:
     """Cluster symbols by correlation distance; symbols in the same cluster
     are redundant/highly-correlated candidates for the basket. Returns a
-    Series mapping symbol -> cluster id."""
+    Series mapping symbol -> cluster id.
+
+    With fewer than 2 symbols (e.g. hard liquidity/history screening left
+    only the benchmark), there's nothing to cluster -- `squareform` on an
+    empty/1x1 distance matrix and `linkage` on the resulting empty condensed
+    matrix both raise `ValueError`. Skip straight to the trivial result
+    instead: 0 symbols -> empty Series, 1 symbol -> that symbol alone in its
+    own cluster (still a valid, consumable result for
+    `select_cluster_representatives`, which just picks the best/lowest-vol
+    member of each cluster -- trivially itself here)."""
+    if len(corr.index) < 2:
+        labels = [0] if len(corr.index) == 1 else []
+        return pd.Series(labels, index=corr.index, name="cluster")
     dist = correlation_distance(corr)
     condensed = squareform(dist.to_numpy(), checks=False)
     z = linkage(condensed, method="average")

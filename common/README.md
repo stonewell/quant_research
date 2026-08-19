@@ -5,8 +5,10 @@ Shared code used by every project in this workspace (`backtester`, `instrument_s
 (`universe.py`), technical indicators (`indicators.py`, `indicator_features.py`), the Hurst
 exponent (`hurst.py`), performance metrics (`metrics.py`), the portfolio allocation backtester
 (`allocation_backtester.py`) and its templates (`allocation_templates.py`), the shared factor
-taxonomy (`factor_taxonomy.py`), rebalance scheduling (`scheduling.py`), and synthetic-data test
-generators (`testing.py`).
+taxonomy (`factor_taxonomy.py`), rebalance scheduling (`scheduling.py`), synthetic-data test
+generators (`testing.py`), shared CLI scaffolding for every `run_*.py` entrypoint (`cli_utils.py`),
+shared output-writing conventions (`reporting.py`), and shared shuffle/placebo-null significance
+testing primitives (`significance.py`).
 
 **This file is the single source of truth for every DataFrame/dataset shape used by 2+ projects in
 this workspace.** Each project's own README documents only the schemas that are genuinely unique to

@@ -7,6 +7,7 @@ import hashlib
 import importlib
 import importlib.util
 import os
+import re
 import sys
 import time
 from typing import Dict, List, Optional, Type, Union
@@ -17,6 +18,25 @@ import pandas as pd
 import yfinance as yf
 
 from .universe import _parse_module_specifier
+
+
+# Real ticker symbols (equities, ETFs, indices, FX pairs) are drawn from a
+# small, well-known alphabet. Both CSVFolderDataProvider and
+# CachedDataProvider interpolate `symbol` directly into a filesystem path
+# (e.g. f"{symbol}.csv") -- without this allow-list, a `symbol` containing
+# path separators/traversal (e.g. "../../evil") could escape the intended
+# folder entirely.
+_SAFE_SYMBOL_RE = re.compile(r"^[A-Za-z0-9_.\-^=]+$")
+
+
+def _validate_symbol_for_path(symbol: str) -> None:
+    """Raises ValueError if `symbol` isn't safe to interpolate into a
+    filesystem path (see `_SAFE_SYMBOL_RE`)."""
+    if not symbol or not _SAFE_SYMBOL_RE.match(symbol):
+        raise ValueError(
+            f"Invalid symbol '{symbol}': must match {_SAFE_SYMBOL_RE.pattern} "
+            "to be used as a filename component."
+        )
 
 
 class BaseDataProvider(ABC):
@@ -65,6 +85,14 @@ class YFinanceDataProvider(BaseDataProvider):
         except Exception:
             return {"expense_ratio": expense_ratio, "total_assets": total_assets}
 
+        # A real yfinance failure mode for delisted/invalid tickers: `.info`
+        # returns None (or something else non-dict-like) instead of raising.
+        # Without this check, the `.get()` calls below would raise an
+        # uncaught AttributeError instead of falling back to the same
+        # NaN-filled dict the exception path above already returns.
+        if not isinstance(info, dict):
+            return {"expense_ratio": expense_ratio, "total_assets": total_assets}
+
         for key in ("netExpenseRatio", "annualReportExpenseRatio", "expenseRatio"):
             value = info.get(key)
             if value is not None:
@@ -87,6 +115,7 @@ class CSVFolderDataProvider(BaseDataProvider):
         self.folder_path = folder_path
 
     def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+        _validate_symbol_for_path(symbol)
         candidates = [
             os.path.join(self.folder_path, f"{symbol}.csv"),
             os.path.join(self.folder_path, f"{symbol}_{interval}.csv"),
@@ -117,7 +146,10 @@ class CSVFolderDataProvider(BaseDataProvider):
         if df.empty:
             raise ValueError(f"CSV data for {symbol} is empty between {start} and {end}")
 
-        return df.dropna(subset=["Open", "High", "Low", "Close"])
+        # Enforce the documented ascending-DatetimeIndex OHLCV contract
+        # (common/README.md, section 1) -- a CSV on disk isn't guaranteed to
+        # already be sorted by date.
+        return df.dropna(subset=["Open", "High", "Low", "Close"]).sort_index()
 
 
 class SyntheticDataProvider(BaseDataProvider):
@@ -196,6 +228,7 @@ class CachedDataProvider(BaseDataProvider):
         if not self.cache_dir:
             return self.inner_provider.fetch_ohlcv(symbol, start, end, interval)
 
+        _validate_symbol_for_path(symbol)
         os.makedirs(self.cache_dir, exist_ok=True)
         cache_path = os.path.join(self.cache_dir, f"{symbol}_{interval}_{start}_{end}.csv")
 
@@ -294,7 +327,7 @@ def _load_provider_from_specifier(specifier: str, **kwargs) -> BaseDataProvider:
         instance = target_cls
 
     if not hasattr(instance, "fetch_ohlcv") or not callable(getattr(instance, "fetch_ohlcv")):
-        raise TypeError(f"Loaded provider '{target_str}' does not implement 'fetch_ohlcv'")
+        raise TypeError(f"Loaded provider '{specifier}' does not implement 'fetch_ohlcv'")
 
     return instance
 

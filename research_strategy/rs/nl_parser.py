@@ -16,7 +16,14 @@ DEFAULT_BAA_DEFENSIVE = ["TIP", "IEF", "TLT", "BIL", "AGG", "DBC"]
 
 STOP_WORDS = {
     "THE", "AND", "FOR", "TOP", "SMA", "ROC", "BAA", "GTAA", "ALL",
-    "USE", "FROM", "WITH", "INTO", "WHEN", "THAT", "THIS", "EACH"
+    "USE", "FROM", "WITH", "INTO", "WHEN", "THAT", "THIS", "EACH",
+    # Common all-caps technical-analysis / finance acronyms that otherwise
+    # get captured as spurious phantom tickers by _extract_tickers() when a
+    # description merely mentions them (e.g. "...with RSI confirmation...").
+    # A later `if s in symbols` filter in strategy.py stops them from ever
+    # being traded, but they still pollute explain_weights()/parsed_summary
+    # output as if they were part of the universe.
+    "RSI", "ATR", "ADX", "ETF", "CAGR", "MACD",
 }
 
 
@@ -235,10 +242,26 @@ def parse_plain_english_strategy(description: str, name: Optional[str] = None) -
             spec.warnings.append("'sma'/'moving average' mentioned but no explicit period found; defaulting trend_sma_period=200")
 
     if "roc" in text_lower or "positive return" in text_lower or "trend gate" in text_lower:
-        roc_match = re.search(r"(\d+)\s*(?:d|day|month|m)?\s*(?:roc|return)", text_lower)
+        # Capture an adjacent day/month unit token (group 2) alongside the
+        # number itself. Without this, e.g. "10d ROC > 0" -- an EXPLICIT day
+        # unit -- fell through to the "small number means months" heuristic
+        # below and was wrongly multiplied by 21 (10 -> 210) purely because
+        # 10 <= 12, discarding the explicitly-stated day unit entirely.
+        roc_match = re.search(r"(\d+)\s*(d|day|days|m|month|months)?\s*(?:roc|return)", text_lower)
         if roc_match:
             val = int(roc_match.group(1))
-            spec.trend_roc_lookback = val if val > 12 else val * 21
+            unit = roc_match.group(2)
+            if unit and unit.startswith("d"):
+                # Explicit day unit -- use the number literally regardless
+                # of its size.
+                spec.trend_roc_lookback = val
+            elif unit and unit.startswith("m"):
+                # Explicit month unit -- convert to trading days.
+                spec.trend_roc_lookback = val * 21
+            else:
+                # No explicit unit found -- keep the legacy heuristic for
+                # bare numbers (e.g. "3 ROC" is assumed to mean 3 months).
+                spec.trend_roc_lookback = val if val > 12 else val * 21
         else:
             spec.trend_roc_lookback = 126
             spec.warnings.append("'roc'/'positive return'/'trend gate' mentioned but no explicit lookback found; defaulting trend_roc_lookback=126")

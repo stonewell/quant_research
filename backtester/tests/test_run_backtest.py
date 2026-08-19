@@ -75,6 +75,24 @@ def test_get_template_reconstructs_pattern_based_template_from_spec():
     assert template.event_type == "trough"
 
 
+def test_get_template_rejects_pattern_spec_with_non_pattern_prefixed_template_name():
+    # Regression test: SCHEMAS.md documents that pattern-template
+    # reconstruction triggers "when template_name starts with pattern_", but
+    # _get_template used to branch purely on `pattern_spec is not None`,
+    # never checking template_name -- so a strategy.json naming a static
+    # template (e.g. "equal_weight") with a stray leftover pattern_spec block
+    # would be silently misinterpreted as a pattern template.
+    pattern_spec = {
+        "feature_name": "rsi",
+        "feature_lookback": 14,
+        "threshold": 30.0,
+        "comparison": "below",
+        "event_type": "trough",
+    }
+    with pytest.raises(ValueError, match="pattern_"):
+        _get_template("equal_weight", pattern_spec)
+
+
 class MockArgs:
     def __init__(self, **kwargs):
         self.initial_capital = 100_000.0
@@ -164,6 +182,42 @@ def test_run_walkforward():
         assert "total_rebalances" in fold
 
 
+def test_run_walkforward_raises_on_non_positive_step_years():
+    # Regression test: step_bars = int(round(args.step_years * 252)) used to
+    # be unvalidated, so a zero/negative --step-years never advanced
+    # start_idx past the loop's termination condition, hanging the process
+    # forever and growing `folds` unboundedly. Must raise promptly instead of
+    # looping -- if this test doesn't raise, it will hang.
+    idx = pd.bdate_range("2020-01-01", periods=252)
+    universe = {
+        "A": make_df(np.linspace(100, 200, 252), start="2020-01-01"),
+    }
+    template = _get_template("equal_weight")
+    params = {"rebalance_freq_days": 10}
+    args = MockArgs(window_years=0.5, step_years=0.0)
+
+    with pytest.raises(ValueError, match="step-years"):
+        run_walkforward(universe, template, params, args)
+
+
+def test_run_walkforward_raises_on_non_positive_window_years():
+    # Regression test: the old guard `if window_bars >= n_bars: raise ...`
+    # never caught window_bars <= 0 (always false for non-positive vs
+    # positive n_bars), so end_idx <= start_idx and
+    # any_df.index[end_idx - 1] could silently wrap via negative indexing to
+    # an unrelated date instead of raising a clean error.
+    idx = pd.bdate_range("2020-01-01", periods=252)
+    universe = {
+        "A": make_df(np.linspace(100, 200, 252), start="2020-01-01"),
+    }
+    template = _get_template("equal_weight")
+    params = {"rebalance_freq_days": 10}
+    args = MockArgs(window_years=0.0, step_years=0.25)
+
+    with pytest.raises(ValueError, match="window-years"):
+        run_walkforward(universe, template, params, args)
+
+
 def test_run_walkforward_warms_up_indicator_lookback_before_each_fold():
     # Regression test: InverseVolatility's realized_vol needs `vol_lookback`
     # bars of history before it stops returning NaN. A fold sliced to bare
@@ -223,6 +277,25 @@ def test_load_strategy_file_params_not_dict(tmp_path):
         json.dump({"template_name": "equal_weight", "params": ["not", "a", "dict"]}, f)
 
     with pytest.raises(ValueError, match="must be a JSON object"):
+        _load_strategy_file(str(path))
+
+
+def test_load_strategy_file_pattern_spec_missing_required_keys(tmp_path):
+    # Regression test: _get_template indexed pattern_spec["threshold"] etc.
+    # via plain brackets with no upfront validation, so a malformed
+    # pattern_spec block used to raise a raw, unhandled KeyError deep in
+    # main() instead of a clean, informative ValueError.
+    path = tmp_path / "strategy.json"
+    pattern_spec = {
+        "feature_name": "rsi",
+        "feature_lookback": 14,
+        # "threshold" intentionally omitted
+        "comparison": "below",
+        "event_type": "trough",
+    }
+    _write_strategy_file(path, template_name="pattern_rsi_14_trough", pattern_spec=pattern_spec)
+
+    with pytest.raises(ValueError, match="threshold"):
         _load_strategy_file(str(path))
 
 

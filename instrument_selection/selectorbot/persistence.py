@@ -28,6 +28,7 @@ specifically.
 import numpy as np
 import pandas as pd
 from common.hurst import autocorrelation, hurst_exponent, variance_ratio
+from common.significance import shuffle_null_test
 
 
 def hurst_significance(series: pd.Series, n_surrogates: int = 200, min_chunk_size: int = 8,
@@ -38,23 +39,20 @@ def hurst_significance(series: pd.Series, n_surrogates: int = 200, min_chunk_siz
 
     x = series.dropna().to_numpy()
     rng = np.random.default_rng(seed)
-    surrogate_h = []
-    for _ in range(n_surrogates):
-        shuffled = pd.Series(rng.permutation(x))
-        h = hurst_exponent(shuffled, min_chunk_size, max_lag_fraction)
-        if not np.isnan(h):
-            surrogate_h.append(h)
-    surrogate_h = np.array(surrogate_h)
 
-    deviation = abs(observed - 0.5)
-    p_value = (np.abs(surrogate_h - 0.5) >= deviation).mean() if len(surrogate_h) else np.nan
+    def _surrogate_stat(rng):
+        shuffled = pd.Series(rng.permutation(x))
+        return hurst_exponent(shuffled, min_chunk_size, max_lag_fraction)
+
+    result = shuffle_null_test(observed, _surrogate_stat, n_surrogates, rng, reference=0.5)
+    surrogate_h = result["surrogate_stats"]
 
     return {
         "hurst": observed,
         "surrogate_mean": surrogate_h.mean() if len(surrogate_h) else np.nan,
         "surrogate_std": surrogate_h.std() if len(surrogate_h) else np.nan,
-        "p_value": p_value,
-        "significant": bool(p_value < 0.05) if not np.isnan(p_value) else False,
+        "p_value": result["p_value"],
+        "significant": result["significant"],
     }
 
 

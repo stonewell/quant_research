@@ -18,11 +18,17 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-import numpy as np
 import pandas as pd
 
+from common.cli_utils import (
+    add_data_provider_cli_args,
+    build_data_kwargs,
+    default_data_dir,
+    default_results_dir,
+    load_universe_with_banner,
+)
+from common.reporting import format_weights_pct, write_dense_weights_csv, write_json_report
 from common.universe import add_universe_cli_args, resolve_universe_from_args
-from stratgen.data import load_ohlcv
 from stratgen.generator import GeneratorConfig, StrategyGenerator
 from stratgen.pattern_mining import build_pattern_templates, mine_indicator_patterns
 
@@ -48,7 +54,7 @@ def _load_factor_report(path: str) -> dict:
 
     return report
 
-RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+RESULTS_DIR = default_results_dir(__file__)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -88,11 +94,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "see pattern_mining.py's module docstring for why this matters).")
     p.add_argument("--pattern-max-templates", type=int, default=5,
                    help="Cap on how many significant mined patterns become candidate templates (default 5).")
-    p.add_argument("--data-provider", default="yfinance",
-                   help="Market data source provider ('yfinance', 'csv', 'synthetic', or custom module specifier string e.g. 'script.py:CustomProvider')")
-    p.add_argument("--data-dir", type=str, default=None,
-                   help="Folder path for CSV data provider")
-    p.add_argument("--no-cache", action="store_true")
+    add_data_provider_cli_args(p)
     return p
 
 
@@ -115,14 +117,13 @@ def main():
     if not universe_symbols:
         raise ValueError("Resolved universe symbol list is empty.")
 
-    data_kwargs = {"provider": args.data_provider}
-    if args.data_dir:
-        data_kwargs["folder_path"] = args.data_dir
+    data_kwargs = build_data_kwargs(args)
 
-    universe = {}
-    for symbol in universe_symbols:
-        print(f"Loading {symbol} ...")
-        universe[symbol] = load_ohlcv(symbol, args.start, args.end, args.interval, use_cache=not args.no_cache, **data_kwargs)
+    universe = load_universe_with_banner(
+        universe_symbols, args.start, args.end, args.interval,
+        use_cache=not args.no_cache, cache_dir=default_data_dir(__file__),
+        data_kwargs=data_kwargs, require_nonempty=True,
+    )
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
@@ -165,14 +166,13 @@ def main():
         # date, so those dates are just the non-NaN rows (no diffing needed,
         # and no risk of missing a rebalance that recomputed the same weight).
         weights = spec.target_weights
-        recent_rebalances = weights.dropna(how="all").tail(5)
 
         # Convert to percentages for readability
-        recent_pct = (recent_rebalances * 100).round(1).astype(str) + "%"
+        recent_pct = format_weights_pct(weights, 5)
         print(recent_pct)
 
         out_path = os.path.join(RESULTS_DIR, "strategygen_allocation_weights.csv")
-        weights.ffill().fillna(0.0).to_csv(out_path)
+        write_dense_weights_csv(weights, out_path)
         print(f"\nSaved full daily target weights to {out_path}")
 
         # If a mined PatternBasedAllocationTemplate won, it's NOT in the
@@ -195,24 +195,23 @@ def main():
                 break
 
         strategy_json_path = os.path.join(RESULTS_DIR, "strategy.json")
-        with open(strategy_json_path, "w") as f:
-            json.dump({
-                "template_name": spec.template_name,
-                "params": spec.params,
-                "explanation": spec.explanation,
-                "sharpe_ratio": spec.universe_sharpe,
-                "cagr": spec.cagr,
-                "max_drawdown": spec.max_drawdown,
-                "calmar_ratio": spec.calmar_ratio,
-                "win_rate": spec.win_rate,
-                "profit_factor": spec.profit_factor if np.isfinite(spec.profit_factor) else None,
-                "trusted": spec.trusted,
-                "ers_passed": spec.ers_passed,
-                "ers_percentile": spec.ers_percentile,
-                "factor_context": spec.factor_context,
-                "factor_tiebreak_used": spec.factor_tiebreak_used,
-                "pattern_spec": pattern_spec,
-            }, f, indent=2)
+        write_json_report({
+            "template_name": spec.template_name,
+            "params": spec.params,
+            "explanation": spec.explanation,
+            "sharpe_ratio": spec.universe_sharpe,
+            "cagr": spec.cagr,
+            "max_drawdown": spec.max_drawdown,
+            "calmar_ratio": spec.calmar_ratio,
+            "win_rate": spec.win_rate,
+            "profit_factor": spec.profit_factor,
+            "trusted": spec.trusted,
+            "ers_passed": spec.ers_passed,
+            "ers_percentile": spec.ers_percentile,
+            "factor_context": spec.factor_context,
+            "factor_tiebreak_used": spec.factor_tiebreak_used,
+            "pattern_spec": pattern_spec,
+        }, strategy_json_path)
         print(f"Saved strategy definition to {strategy_json_path}")
     else:
         print("Walkforward mode is currently disabled for the new allocation architecture.")

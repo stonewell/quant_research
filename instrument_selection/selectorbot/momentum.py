@@ -88,6 +88,7 @@ import numpy as np
 import pandas as pd
 
 from common.indicators import macd, roc, rsi, sma  # noqa: F401  (re-exported technical momentum indicators)
+from common.significance import shuffle_null_test
 
 
 def _corr(x: np.ndarray, y: np.ndarray) -> float:
@@ -132,21 +133,19 @@ def momentum_efficacy(close: pd.Series, lookback: int = 252, horizon: int = 21,
     daily = lp.diff().dropna().to_numpy()
     start = float(lp.iloc[0])
     rng = np.random.default_rng(seed)
-    surrogate = []
-    for _ in range(n_surrogates):
+
+    def _surrogate_stat(rng):
         shuffled = rng.permutation(daily)
         lp_s = pd.Series(np.concatenate([[start], start + np.cumsum(shuffled)]))
         xs, ys = _past_forward(lp_s, lookback, horizon)
-        c = _corr(xs, ys)
-        if not np.isnan(c):
-            surrogate.append(c)
-    surrogate = np.array(surrogate)
-    p_value = (np.abs(surrogate) >= abs(observed)).mean() if len(surrogate) else np.nan
+        return _corr(xs, ys)
+
+    result = shuffle_null_test(observed, _surrogate_stat, n_surrogates, rng)
 
     return {
         "momentum_edge": observed,
-        "momentum_p_value": p_value,
-        "momentum_significant": bool(p_value < 0.05) if not np.isnan(p_value) else False,
+        "momentum_p_value": result["p_value"],
+        "momentum_significant": result["significant"],
         "momentum_n_windows": n_windows,
     }
 

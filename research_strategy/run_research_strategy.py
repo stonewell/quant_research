@@ -23,7 +23,6 @@ Examples:
 """
 
 import argparse
-import json
 import os
 import statistics
 import sys
@@ -40,8 +39,10 @@ import numpy as np
 import pandas as pd
 
 from common.allocation_backtester import run_allocation_backtest
+from common.cli_utils import add_data_provider_cli_args, build_data_kwargs, default_data_dir, default_results_dir
 from common.data import load_universe
 from common.factor_taxonomy import FACTOR_CATEGORIES
+from common.reporting import format_weights_pct, write_dense_weights_csv, write_json_report
 from common.universe import add_universe_cli_args, resolve_universe_from_args
 from rs.config import StrategyConfig, load_strategies_config
 from rs.nl_parser import parse_plain_english_strategy
@@ -65,8 +66,8 @@ from rs.strategy import (
     VolatilityManagedStrategy,
 )
 
-RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+RESULTS_DIR = default_results_dir(__file__)
+DATA_DIR = default_data_dir(__file__)
 
 STRATEGY_CLASS_MAP = {
     "AcceleratingDualMomentum": AcceleratingDualMomentum,
@@ -137,11 +138,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-days", type=int, default=1200,
                    help="Number of business days of history to request (all providers)")
     p.add_argument("--seed", type=int, default=42, help="Random seed (only used with --data-provider synthetic)")
-    p.add_argument("--data-provider", default="synthetic",
-                   help="Market data source provider ('synthetic', 'yfinance', 'csv', or custom module specifier string e.g. 'script.py:CustomProvider')")
-    p.add_argument("--data-dir", type=str, default=None,
-                   help="Folder path for CSV data provider")
-    p.add_argument("--no-cache", action="store_true", help="Disable local CSV caching of fetched data")
+    add_data_provider_cli_args(p, default_provider="synthetic", no_cache_help="Disable local CSV caching of fetched data")
     return p
 
 
@@ -213,8 +210,7 @@ def build_and_write_factor_summary(report_data, strategy_factor_tags, args, star
     }
 
     path = os.path.join(results_dir, "factor_summary.json")
-    with open(path, "w") as f:
-        json.dump(summary, f, indent=2)
+    write_json_report(summary, path)
     return path
 
 
@@ -230,11 +226,9 @@ def main():
     start = "2020-01-01"
     end = str(pd.bdate_range(start, periods=args.n_days)[-1].date())
 
-    data_kwargs = {"provider": args.data_provider}
+    data_kwargs = build_data_kwargs(args)
     if args.data_provider == "synthetic":
         data_kwargs["seed"] = args.seed
-    if args.data_dir:
-        data_kwargs["folder_path"] = args.data_dir
 
     universe_symbols = resolve_universe_from_args(args, default_symbols=DEFAULT_UNIVERSE_SYMBOLS)
 
@@ -301,6 +295,27 @@ def main():
             slippage_pct=cfg.slippage_pct
         )
 
+        # `run_allocation_backtest` deliberately short-circuits to
+        # {"equity_curve": pd.DataFrame(), "turnover": 0.0} (no metrics keys
+        # at all) whenever `target_weights` came back empty -- which is
+        # itself the CORRECT, documented behavior of several strategies
+        # (e.g. AcceleratingDualMomentum, RSIMeanReversionStrategy,
+        # SwingTrendPullbackStrategy, AdaptiveGridStrategy,
+        # EnsembleRegimeSwitchingStrategy, VigilantAssetAllocation) when a
+        # required ticker is missing from the loaded universe. Without this
+        # guard, a single strategy hitting that legitimate path used to
+        # crash the ENTIRE `--strategy all` run via an unhandled KeyError on
+        # backtest_res['sharpe_ratio'] below, producing zero output (no
+        # report/factor-summary/weights CSVs) for every strategy, not just
+        # the affected one. Skip just this strategy and keep going instead.
+        if "sharpe_ratio" not in backtest_res or backtest_res.get("equity_curve", pd.DataFrame()).empty:
+            print(f"  WARNING: Skipping strategy '{strat_name}' -- backtest produced no result "
+                  f"(generate_weights() returned an empty target-weights DataFrame, most likely "
+                  f"because a ticker required by this strategy is missing from the loaded "
+                  f"universe). This strategy is excluded from the JSON report, weights CSVs, "
+                  f"and factor summary for this run; other strategies continue normally.\n")
+            continue
+
         print(f"  Sharpe Ratio:    {backtest_res['sharpe_ratio']:.2f}")
         print(f"  CAGR:            {backtest_res['cagr'] * 100:.2f}%")
         print(f"  Max Drawdown:    {backtest_res['max_drawdown'] * 100:.2f}%")
@@ -310,9 +325,8 @@ def main():
         print(f"  Total Turnover:  {backtest_res['total_turnover']:.2f}")
         print(f"  Total Rebal:     {backtest_res['total_rebalances']}\n")
 
-        recent_rebal = target_weights.dropna(how="all").tail(3)
         print("  Recent Target Weights (Last 3 Rebalances):")
-        print((recent_rebal * 100).round(1).astype(str) + "%\n")
+        print(format_weights_pct(target_weights, 3, suffix="%\n"))
 
         spec = getattr(strat_obj, "spec", None)
         report_data[strat_name] = {
@@ -328,17 +342,16 @@ def main():
             "total_turnover": float(backtest_res["total_turnover"]),
             "total_rebalances": int(backtest_res["total_rebalances"]),
         }
-        weights_summary[strat_name] = target_weights.ffill().fillna(0.0)
+        weights_summary[strat_name] = target_weights
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
     json_path = os.path.join(RESULTS_DIR, "research_strategy_report.json")
-    with open(json_path, "w") as f:
-        json.dump(report_data, f, indent=2)
+    write_json_report(report_data, json_path)
     print(f"Saved JSON report to {json_path}")
 
     for strat_name, tw_df in weights_summary.items():
         csv_path = os.path.join(RESULTS_DIR, f"{strat_name}_weights.csv")
-        tw_df.to_csv(csv_path)
+        write_dense_weights_csv(tw_df, csv_path)
         print(f"Saved full daily weights for {strat_name} to {csv_path}")
 
     factor_summary_path = build_and_write_factor_summary(
