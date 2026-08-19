@@ -1,7 +1,15 @@
 """Unit tests for common/allocation_backtester.py."""
 
+import os
+import sys
+
 import numpy as np
 import pandas as pd
+
+# Ensure project root is in sys.path
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from common.allocation_backtester import run_allocation_backtest
 from common.testing import make_ohlcv_from_closes as make_df
