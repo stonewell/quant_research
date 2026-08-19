@@ -216,10 +216,44 @@ workspace. From the repo root (one level up), run `uv sync` once, then:
 uv run pytest research_strategy/tests -v
 ```
 
+### Argument reference
+
+Universe-resolution flags (`--universe`/`--universe-file`/`--universe-provider`/
+`--universe-kwargs`) are shared with the other 3 projects — see `common/README.md`'s
+cross-reference index; `resolve_universe_from_args` picks the first one supplied, in that order,
+falling back to this project's own 18-symbol `DEFAULT_UNIVERSE_SYMBOLS` (SPY, QQQ, IWM, EFA, EEM,
+GLD, TLT, VNQ, AGG, TIP, IEF, LQD, DBC, BIL, SCZ, HYG, UPRO, TMF) if none are given.
+
+| Flag | Type / default | Meaning |
+|---|---|---|
+| `--universe` / `-u` | space-separated tickers, default: none | Explicit ticker list (falls back to `DEFAULT_UNIVERSE_SYMBOLS`) |
+| `--universe-file` | path, default: none | Load tickers from a file instead |
+| `--universe-provider` | str, default: none | Resolve the universe from a registered provider instead of a static list |
+| `--universe-kwargs` | JSON str, default: none | Extra kwargs (as a JSON object string) passed to `--universe-provider` |
+| `--strategy` | str, default `"all"` | Which `strategies_config.json` entry to run (its key), or `"all"` to run every configured strategy |
+| `--config` | path, default: none | Alternate JSON config file (same schema as `strategies_config.json`, §2) instead of the built-in one |
+| `--description` | str, default: none | One-off plain-English strategy text, parsed via `rs/nl_parser.py` instead of reading `strategies_config.json`/`--config` |
+| `--description-file` | path, default: none | Same as `--description`, but read the text from a file |
+| `--n-days` | int, default `1200` | Number of synthetic bars to generate (only used with `--data-provider synthetic`) |
+| `--seed` | int, default `42` | Random seed for synthetic data generation (only used with `--data-provider synthetic`) |
+| `--data-provider` | str, default `"synthetic"` | `synthetic` (default — see §3's offline policy), `yfinance`, `csv`, or a custom registered/module-specifier provider |
+| `--data-dir` | path, default: none | Folder path for the `csv` data provider |
+| `--no-cache` | flag, default off (cached) | Disable local CSV caching of fetched data (only relevant to non-synthetic providers) |
+
+Note: unlike the other 3 projects, this CLI's `--data-provider` **default is `synthetic`**, per
+§3's offline-testing policy. Real market data is fully supported (the CLI's own low-Sharpe warning
+literally suggests `--data-provider yfinance` to cross-check a synthetic finding) — it is simply
+not the default, and `--n-days`/`--seed` are silently ignored once you opt into a real provider.
+
 ### Running CLI Backtests
 Simulate portfolio backtests on synthetic multi-asset data across all strategies loaded from JSON config:
 ```powershell
 uv run python research_strategy/run_research_strategy.py --strategy all
+```
+
+Run a single named strategy instead of all of them:
+```powershell
+uv run python research_strategy/run_research_strategy.py --strategy momentum_rotation
 ```
 
 Pass a custom JSON configuration file:
@@ -230,6 +264,40 @@ uv run python research_strategy/run_research_strategy.py --config custom_config.
 Evaluate custom plain English strategies via CLI text:
 ```powershell
 uv run python research_strategy/run_research_strategy.py --description "Rebalance monthly. Select top 3 assets from SPY, QQQ, EEM, GLD, TLT with Close > 200d SMA. Rank by 126d return and allocate using 60d inverse volatility."
+```
+
+Same, but reading the description from a file:
+```powershell
+uv run python research_strategy/run_research_strategy.py --description-file my_strategy.txt
+```
+
+Control the synthetic data itself (more bars, different seed):
+```powershell
+uv run python research_strategy/run_research_strategy.py --strategy all --n-days 2500 --seed 7
+```
+
+#### Real market data
+
+```powershell
+# Cross-check a synthetic finding against real prices for the default universe, all strategies
+uv run python research_strategy/run_research_strategy.py --strategy all --data-provider yfinance --no-cache
+
+# A specific strategy, an explicit real-ticker universe
+uv run python research_strategy/run_research_strategy.py --strategy momentum_rotation \
+  --universe SPY QQQ AAPL MSFT NVDA GLD TLT --data-provider yfinance
+
+# Universe loaded from a file (e.g. a basket produced by instrument_selection), real data
+uv run python research_strategy/run_research_strategy.py --strategy all \
+  --universe-file instrument_selection/results/basket.json --data-provider yfinance
+
+# Plain-English description evaluated against real data instead of synthetic
+uv run python research_strategy/run_research_strategy.py \
+  --description "Rebalance monthly. Select top 3 assets from SPY, QQQ, EEM, GLD, TLT with Close > 200d SMA. Rank by 126d return and allocate using 60d inverse volatility." \
+  --data-provider yfinance
+
+# CSV-folder provider (offline real data you already downloaded)
+uv run python research_strategy/run_research_strategy.py --strategy all \
+  --universe SPY QQQ TLT GLD --data-provider csv --data-dir /path/to/ohlcv_csvs
 ```
 
 ### Viewing Terminal Dashboard
@@ -252,3 +320,30 @@ uv run python research_strategy/dashboard.py
 Outputs land in `results/`: `research_strategy_report.json` (per-strategy metrics), one
 `<strategy>_weights.csv` per strategy, and `factor_summary.json` (per-factor-tag aggregated
 performance across the run — see "Factor Tagging" above).
+
+## 7. Data Shapes & Schemas
+
+This project consumes the shared **OHLCV DataFrame**, **universe dict**, **target weights
+DataFrame**, and **portfolio backtest result dict** shapes documented in `../common/README.md`
+(§1–4) — see that file first. `factor_summary.json`'s schema is documented in full in section 2b
+above, not repeated here. Everything below is unique to this project.
+
+### `results/research_strategy_report.json`
+
+A JSON object keyed by strategy key (e.g. `"dual_momentum"`, or `"custom_plain_english"` for an
+ad-hoc `--description` run). Each entry:
+
+| Field | Type | Notes |
+|---|---|---|
+| `strategy_name` | str | From the parsed spec, or the class name for a class-based strategy with no `spec` attribute |
+| `raw_description` | str | The plain-English text (natural-language strategies) or the class's own docstring |
+| `parsed_summary` | str | `explain_weights()`'s full text |
+| `sharpe_ratio`, `cagr`, `max_drawdown`, `calmar_ratio`, `win_rate` | float | From the shared backtest result dict (`../common/README.md` §4) |
+| `profit_factor` | float or `null` | `null` when not finite (e.g. no losing days) |
+| `total_turnover` | float | |
+| `total_rebalances` | int | |
+
+### `results/<strategy>_weights.csv`
+
+The DENSE (forward-filled) form of the target weights DataFrame (`../common/README.md` §3) —
+`target_weights.ffill().fillna(0.0)` — one column per universe symbol, one row per trading day.

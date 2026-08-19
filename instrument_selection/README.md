@@ -665,28 +665,87 @@ uv sync
 
 ## Usage
 
+### Argument reference
+
+All flags are optional except `--select-k` (required only when `--select-method greedy` is
+chosen). Universe-resolution flags (`--universe`/`--universe-file`/`--universe-provider`/
+`--universe-kwargs`) are shared with the other 3 projects — see
+`common/README.md`'s cross-reference index; `resolve_universe_from_args` picks the first one
+supplied, in that order, falling back to this project's own 16-symbol `DEFAULT_UNIVERSE` (SPY,
+QQQ, IWM, DIA, EFA, EEM, GLD, SLV, USO, TLT, IEF, XLE, XLF, XLK, XLV, XLU) if none are given.
+
+| Flag | Type / default | Meaning |
+|---|---|---|
+| `--universe` / `-u` | space-separated tickers, default: none (falls back to `DEFAULT_UNIVERSE`) | Explicit ticker list to screen (benchmark is auto-added if missing) |
+| `--universe-file` | path, default: none | Load tickers from a file instead (e.g. one symbol per line, or a prior `results/basket.json`) |
+| `--universe-provider` | str, default: none | Resolve the universe from a registered provider (e.g. an index-membership provider) instead of a static list |
+| `--universe-kwargs` | JSON str, default: none | Extra kwargs (as a JSON object string) passed to `--universe-provider` |
+| `--benchmark` | str, default `"SPY"` | Symbol used for beta and the correlation regime-shift check |
+| `--start` | `YYYY-MM-DD`, default `"2015-01-01"` | History start date |
+| `--end` | `YYYY-MM-DD`, default `"2024-12-31"` | History end date |
+| `--interval` | str, default `"1d"` | Bar interval passed to the data provider |
+| `--min-avg-dollar-volume` | float, default `5,000,000.0` | HARD liquidity gate — excluded before scoring/selection, not just soft-scored |
+| `--min-history-years` | float, default `1.0` | HARD history-length gate, distinct from `min_history_years_for_full_credit` (a soft scoring threshold, config-only, not exposed as its own flag) |
+| `--max-cluster-correlation` | float, default `0.85` | Threshold above which a pair is flagged as redundant; also the sizing gate for `--select-method threshold` |
+| `--no-fund-metadata` | flag, default off (metadata fetched) | Skip the best-effort expense-ratio/AUM lookup (faster, no ETF-quality component) |
+| `--top-n` | int, default `8` | How many top-ranked instruments to print by overall selection score |
+| `--select-method` | `top_k` \| `cluster` \| `greedy` \| `threshold` \| `max_diversification`, default `"threshold"` | `top_k` (naive baseline, needs `--select-k`), `cluster` (ACC-style representative-per-cluster), `greedy` (Max-Sum Diversification, **requires** `--select-k`), `threshold` (gated by `--max-cluster-correlation`, sizes itself), `max_diversification` (optimizer-based) |
+| `--select-k` | int, default: none | Basket size for `top_k`/`greedy` (required for `greedy`) |
+| `--select-max-k` | int, default: none | Optional cap on basket size for `threshold`/`max_diversification` (which otherwise size themselves from the data) |
+| `--data-provider` | str, default `"yfinance"` | `yfinance`, `csv`, `synthetic`, or a custom registered/module-specifier provider |
+| `--data-dir` | path, default: none | Folder path for the `csv` data provider |
+| `--no-cache` | flag, default off (cached) | Disable local CSV caching of fetched data |
+| `--no-plots` | flag, default off (plots written) | Skip writing the 3 chart files to `results/` |
+
+### Sample commands (real market data)
+
 ```bash
-# Default broad-ETF universe (run from the repo root)
-uv run python instrument_selection/run_screener.py --start 2015-01-01 --end 2024-12-31
+# Default broad-ETF universe, default date range (run from the repo root)
+uv run python instrument_selection/run_screener.py
 
-# Your own universe
-uv run python instrument_selection/run_screener.py --universe SPY QQQ AAPL MSFT NVDA GLD TLT --benchmark SPY
+# Explicit universe + benchmark + custom date range
+uv run python instrument_selection/run_screener.py \
+  --universe SPY QQQ AAPL MSFT NVDA GLD TLT --benchmark SPY \
+  --start 2018-01-01 --end 2024-12-31
+
+# Universe loaded from a file (e.g. a basket saved by a prior run)
+uv run python instrument_selection/run_screener.py \
+  --universe-file instrument_selection/results/basket.json --benchmark SPY
+
+# Tighter liquidity/history gates, stricter redundancy threshold
+uv run python instrument_selection/run_screener.py \
+  --universe SPY QQQ IWM EFA EEM GLD SLV USO TLT IEF XLE XLF XLK XLV XLU \
+  --min-avg-dollar-volume 20000000 --min-history-years 3 --max-cluster-correlation 0.75
+
+# --select-method top_k (naive baseline, needs --select-k)
+uv run python instrument_selection/run_screener.py \
+  --universe SPY QQQ IWM DIA EFA EEM GLD SLV --select-method top_k --select-k 5
+
+# --select-method cluster (ACC-style representative-per-cluster)
+uv run python instrument_selection/run_screener.py \
+  --universe SPY QQQ IWM DIA EFA EEM GLD SLV USO TLT --select-method cluster
+
+# --select-method greedy (Max-Sum Diversification, --select-k required)
+uv run python instrument_selection/run_screener.py \
+  --universe SPY QQQ IWM DIA EFA EEM GLD SLV USO TLT --select-method greedy --select-k 6
+
+# --select-method threshold (default), with an explicit basket-size cap
+uv run python instrument_selection/run_screener.py \
+  --universe SPY QQQ IWM DIA EFA EEM GLD SLV USO TLT XLE XLF XLK XLV XLU \
+  --select-method threshold --select-max-k 10
+
+# --select-method max_diversification
+uv run python instrument_selection/run_screener.py \
+  --universe SPY QQQ IWM DIA EFA EEM GLD SLV USO TLT --select-method max_diversification --select-max-k 8
+
+# Faster run: skip fund-metadata lookup, skip charts, skip the local cache
+uv run python instrument_selection/run_screener.py \
+  --universe SPY QQQ AAPL MSFT NVDA --no-fund-metadata --no-plots --no-cache
+
+# Weekly bars instead of daily, with a data-dir cache override
+uv run python instrument_selection/run_screener.py \
+  --universe SPY QQQ TLT GLD --interval 1wk --data-provider yfinance
 ```
-
-Key options (see `uv run python instrument_selection/run_screener.py --help` for the full list):
-
-| Flag | Meaning |
-|---|---|
-| `--universe` | Space-separated list of tickers to screen (benchmark is auto-added) |
-| `--benchmark` | Symbol used for beta and the correlation regime-shift check |
-| `--min-avg-dollar-volume` | HARD liquidity gate -- excluded before scoring/selection, not just soft-scored (adjustable, not a verified universal number) |
-| `--min-history-years` | HARD history-length gate, distinct from `--min-history-years-for-full-credit` (a soft scoring threshold, not exposed as its own flag) |
-| `--max-cluster-correlation` | Threshold above which a pair is flagged as redundant |
-| `--no-fund-metadata` | Skip the best-effort expense-ratio/AUM lookup (faster, no ETF-quality component) |
-| `--top-n` | How many top-ranked instruments to print by overall selection score |
-| `--select-method` | `top_k` (naive baseline), `cluster` (ACC-style representative-per-cluster), `greedy` (Max-Sum Diversification, needs `--select-k`), or `threshold` (default -- gated by `--max-cluster-correlation`, sizes itself) |
-| `--select-k` | Basket size for `top_k`/`greedy` (required for `greedy`) |
-| `--select-max-k` | Optional cap on basket size for `threshold` (which otherwise sizes itself from the data) |
 
 Outputs land in `results/`: `screening_report.csv` (every metric and score
 per symbol that cleared the hard gates), `correlation_matrix.csv`,
@@ -695,6 +754,53 @@ excluded), and three charts. The chosen basket (per `--select-method`)
 prints to stdout — run all four methods side by side on your own universe
 to compare, since no head-to-head comparison of them survived this
 project's research (see "From scores to a chosen basket" above).
+
+## Data Shapes & Schemas
+
+This project consumes the shared **OHLCV DataFrame** and **universe dict** shapes documented in
+`../common/README.md` (§1–2) — see that file first if you need those. Everything below is unique
+to this project.
+
+### `results/screening_report.csv` — one row per symbol that cleared the hard screen
+
+Index: ticker symbol. Columns, grouped by which module computes them:
+
+| Source | Columns |
+|---|---|
+| `liquidity.py` | `avg_dollar_volume`, `median_dollar_volume`, `median_spread_pct`, `spread_pct_p90` |
+| `volatility.py` | `realized_vol_annualized_pct`, `downside_vol_annualized_pct`, `downside_vol_ratio`, `atr_pct_mean`, `vol_of_vol`, `pct_days_vol_regime_change`, `adx_mean`, `pct_days_trending_adx`, `pct_days_ranging_adx` |
+| `persistence.py` | `hurst`, `hurst_significant` (bool), `hurst_p_value`, `autocorr_lag1`, `variance_ratio_q5`, `regime_label` (str: `"trending"`/`"mean_reverting"`/`"random_walk_like"`/`"insufficient_data"`) |
+| `candlestick.py` | `candlestick_edge`, `candlestick_significant` (bool), `candlestick_p_value`, `candlestick_n_signals`, `candlestick_signal_rate`, `candlestick_label` (str: `"bullish_edge"`/`"bearish_edge"`/`"no_edge"`/`"insufficient_signals"`/`"insufficient_data"`) |
+| `momentum.py` | `momentum_edge`, `momentum_significant` (bool), `momentum_p_value`, `momentum_n_windows`, `momentum_lookback_return`, `pct_days_above_trend_ma`, `momentum_label` (str: `"momentum"`/`"reversal"`/`"no_momentum"`/`"insufficient_data"`) |
+| `run_screener.py` (computed directly) | `history_years` |
+| `run_screener.py` (merged from `correlation.py`) | `avg_correlation_to_universe` |
+| `data.py`/`fetch_fund_metadata` (optional, best-effort) | `expense_ratio`, `total_assets` — `NaN` for plain stocks or when metadata lookup fails, never force-filled |
+| `scoring.py` (the composite) | `liquidity_score`, `vol_adequacy_score`, `predictability_score`, `momentum_score`, `candlestick_score`, `diversification_score`, `history_adequacy_score`, `etf_expense_score`/`etf_aum_score` (optional, only present when expense/AUM data was fetched), `overall_selection_score` — all `0.0`–`100.0` except the last, which is the documented weighted average (see "The composite score" above) |
+
+### `results/correlation_matrix.csv`
+
+Square matrix: index and columns are both the screened universe's ticker symbols, values are
+pairwise Pearson correlation of daily returns (`correlation.py`'s `correlation_matrix()`).
+
+### `results/screened_out.csv` (only written if non-empty)
+
+**Same columns as `screening_report.csv`'s raw metrics ONLY** (`liquidity.py` through
+`history_years` in the table above) **plus `screen_fail_reason`** (str, semicolon-joined if more
+than one gate failed, e.g. `"liquidity;history"`) — screening runs BEFORE scoring
+(`screening.screen_universe()`), so a screened-out row never has the `avg_correlation_to_universe`,
+`expense_ratio`/`total_assets`, or any `*_score` column; those are computed only for symbols that
+passed.
+
+### `results/basket.json`
+
+```json
+{"basket": ["SPY", "QQQ", "..."], "method": "threshold", "date_generated": "2026-01-01T00:00:00Z"}
+```
+
+`"method"` is whichever `--select-method` produced this basket. This file is also the shared
+"universe hand-off" format `common/universe.py`'s `FileUniverseProvider` reads from any of the
+other three projects via `--universe-file` (it accepts a bare list, or a dict with a `"basket"`,
+`"symbols"`, `"universe"`, or `"tickers"` key — this project's own writer always uses `"basket"`).
 
 ## Testing
 

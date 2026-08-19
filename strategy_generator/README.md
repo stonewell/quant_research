@@ -228,40 +228,133 @@ uv sync
 
 ## Usage
 
+### Argument reference
+
+Universe-resolution flags (`--universe`/`--universe-file`/`--universe-provider`/
+`--universe-kwargs`) are shared with the other 3 projects — see `common/README.md`'s
+cross-reference index; `resolve_universe_from_args` picks the first one supplied, in that order,
+falling back to this project's own default universe (`["SPY", "QQQ"]`) if none are given.
+
+| Flag | Type / default | Meaning |
+|---|---|---|
+| `--universe` / `-u` | space-separated tickers, default: none | Explicit ticker list (falls back to `["SPY", "QQQ"]`) |
+| `--universe-file` | path, default: none | Load tickers from a file instead |
+| `--universe-provider` | str, default: none | Resolve the universe from a registered provider instead of a static list |
+| `--universe-kwargs` | JSON str, default: none | Extra kwargs (as a JSON object string) passed to `--universe-provider` |
+| `--start` | `YYYY-MM-DD`, default `"2015-01-01"` | History start date |
+| `--end` | `YYYY-MM-DD`, default `"2024-12-31"` | History end date |
+| `--interval` | str, default `"1d"` | Bar interval passed to the data provider |
+| `--mode` | `generate`, default `"generate"` | Only `generate` is currently supported (see "Known, disclosed gaps") |
+| `--n-random-search` | int, default `200` | Size of the Equivalent Random Search pool |
+| `--ers-percentile-threshold` | float, default `0.90` | How far above the random pool a candidate must rank to be trusted |
+| `--min-rebalances-for-trust` | int, default `4` | Minimum rebalance count before a result is trusted |
+| `--factor-report` | path, default: none | Optional path to a `research_strategy` `factor_summary.json` (see above) |
+| `--factor-tiebreak-epsilon` | float, default `0.05` | How close two templates' Sharpe ratios must be before `--factor-report` can break the tie |
+| `--mine-patterns` | flag, default off | Detect turning-point indicator patterns and add any significant one as a candidate template (see above) |
+| `--pattern-min-swing-pct` | float, default `0.05` | Minimum zigzag swing size to confirm a turning point (0.05 = 5%) |
+| `--pattern-lag-bars` | int, default `20` | How many trading days before each turning point to read indicators at |
+| `--pattern-max-templates` | int, default `5` | Cap on how many significant mined patterns become candidate templates |
+| `--data-provider` | str, default `"yfinance"` | `yfinance`, `csv`, `synthetic`, or a custom module specifier |
+| `--data-dir` | path, default: none | Folder path for the `csv` data provider |
+| `--no-cache` | flag, default off (cached) | Disable local CSV caching of fetched data |
+
+### Sample commands (real market data)
+
 ```bash
 # Generate ONE strategy for the whole universe from all available history (run from the repo root)
 uv run python strategy_generator/run_strategygen.py --universe SPY QQQ AAPL --mode generate
+
+# Explicit date range and bar interval
+uv run python strategy_generator/run_strategygen.py --universe SPY QQQ AAPL MSFT NVDA \
+  --start 2018-01-01 --end 2024-12-31 --interval 1d
+
+# Universe loaded from a file (e.g. a basket produced by instrument_selection)
+uv run python strategy_generator/run_strategygen.py \
+  --universe-file instrument_selection/results/basket.json --mode generate
+
+# Wider Equivalent Random Search pool and a stricter trust bar
+uv run python strategy_generator/run_strategygen.py --universe SPY QQQ AAPL GLD TLT \
+  --n-random-search 500 --ers-percentile-threshold 0.95 --min-rebalances-for-trust 8
 
 # With a research_strategy factor report as an optional tie-break input
 uv run python strategy_generator/run_strategygen.py --universe SPY QQQ AAPL --mode generate \
   --factor-report research_strategy/results/factor_summary.json
 
+# Factor report with a wider tie-break tolerance
+uv run python strategy_generator/run_strategygen.py --universe SPY QQQ AAPL TLT GLD \
+  --factor-report research_strategy/results/factor_summary.json --factor-tiebreak-epsilon 0.10
+
+# With turning-point pattern mining as an additional candidate source
+uv run python strategy_generator/run_strategygen.py --universe SPY QQQ AAPL --mode generate \
+  --mine-patterns
+
+# Pattern mining with custom swing/lag/cap parameters
+uv run python strategy_generator/run_strategygen.py --universe SPY QQQ AAPL MSFT NVDA GLD TLT \
+  --mine-patterns --pattern-min-swing-pct 0.08 --pattern-lag-bars 10 --pattern-max-templates 3
+
+# Factor report AND pattern mining together (both optional candidate sources at once)
+uv run python strategy_generator/run_strategygen.py --universe SPY QQQ AAPL MSFT NVDA GLD TLT IEF \
+  --factor-report research_strategy/results/factor_summary.json --mine-patterns
+
 # Offline/synthetic data only (no network calls) -- this workspace's standing testing convention
 uv run python strategy_generator/run_strategygen.py --universe SPY QQQ AAPL --mode generate \
   --data-provider synthetic
 
-# With turning-point pattern mining as an additional candidate source
-uv run python strategy_generator/run_strategygen.py --universe SPY QQQ AAPL --mode generate \
-  --data-provider synthetic --mine-patterns
+# CSV-folder provider (offline real data you already downloaded), no local caching
+uv run python strategy_generator/run_strategygen.py --universe SPY QQQ TLT GLD \
+  --data-provider csv --data-dir /path/to/ohlcv_csvs --no-cache
 ```
 
-Key options (see `uv run python strategy_generator/run_strategygen.py --help` for the full list):
+## Data Shapes & Schemas
 
-| Flag | Meaning |
-|---|---|
-| `--mode` | Only `generate` is currently supported (see "Known, disclosed gaps") |
-| `--n-random-search` | Size of the Equivalent Random Search pool (default 200) |
-| `--ers-percentile-threshold` | How far above the random pool a candidate must rank to be trusted (default 0.90) |
-| `--min-rebalances-for-trust` | Minimum rebalance count before a result is trusted (default 4) |
-| `--factor-report` | Optional path to a `research_strategy` `factor_summary.json` (see above) |
-| `--factor-tiebreak-epsilon` | How close two templates' Sharpe ratios must be before `--factor-report` can break the tie (default 0.05) |
-| `--mine-patterns` | Detect turning-point indicator patterns and add any significant one as a candidate template (see above) |
-| `--pattern-min-swing-pct` | Minimum zigzag swing size to confirm a turning point (default 0.05 = 5%) |
-| `--pattern-lag-bars` | How many trading days before each turning point to read indicators at (default 20) |
-| `--pattern-max-templates` | Cap on how many significant mined patterns become candidate templates (default 5) |
-| `--data-provider` | `yfinance` (default), `csv`, `synthetic`, or a custom module specifier |
-| `--data-dir` | Folder path for the CSV data provider |
-| `--no-cache` | Disable local CSV caching of fetched data |
+This project consumes the shared **OHLCV DataFrame**, **universe dict**, **target weights
+DataFrame**, **portfolio backtest result dict**, **factor taxonomy vocabulary**, and **indicator
+feature menu** shapes documented in `../common/README.md` (§1–6) — see that file first.
+`factor_summary.json` (consumed via `--factor-report`) is documented in `research_strategy/README.md`
+(the project that produces it), not repeated here. Everything below is unique to this project.
+
+### `results/strategy.json` — this project's own output (schema OWNED here; `backtester` consumes it)
+
+| Field | Type | Notes |
+|---|---|---|
+| `template_name` | str | One of the 9 static template names, or `pattern_<feature>_<lookback>_<peak\|trough>` for a mined winner |
+| `params` | dict | The winning grid-search combination (keys depend on `template_name` — see each template's `param_grid` in `../common/allocation_templates.py`) |
+| `explanation` | str | `explain_weights()`'s full text |
+| `sharpe_ratio`, `cagr`, `max_drawdown`, `calmar_ratio`, `win_rate` | float | From the shared backtest result dict |
+| `profit_factor` | float or `null` | `null` when not finite |
+| `trusted` | bool | `ers_passed AND total_rebalances >= min_rebalances_for_trust` |
+| `ers_passed` | bool | Whether the winner beat `--ers-percentile-threshold` of the random-portfolio pool |
+| `ers_percentile` | float | The winner's actual percentile against that pool |
+| `factor_context` | dict or `null` | `{template_name: factor_score}` for every candidate, only when `--factor-report` was supplied (`null`/absent-equivalent otherwise) |
+| `factor_tiebreak_used` | bool | Whether `--factor-report` actually changed the winner (see "consuming a factor report" above) |
+| `pattern_spec` | dict or `null` | **Only non-null when `template_name` starts with `pattern_`** — the fields needed to reconstruct the exact `PatternBasedAllocationTemplate` instance: `feature_name` (str), `feature_lookback` (int or 3-int list, e.g. `[12, 26, 9]` for `macd_hist`), `threshold` (float), `comparison` (`"below"`/`"above"`), `event_type` (`"trough"`/`"peak"`), `mined_p_value` (float), `mined_n_events` (int). `backtester/run_backtest.py`'s `_get_template` reads this block to reconstruct the template when present — a hand-edited `strategy.json` naming a `pattern_*` template WITHOUT this block cannot be re-run. |
+
+### `GeneratedStrategySpec` (in-memory dataclass, `stratgen/generator.py`)
+
+The object `StrategyGenerator.generate()` returns — a superset of `strategy.json` above, plus
+`n_symbols` (int), `total_turnover`/`total_rebalances` (duplicated from the backtest result dict for
+convenience), `n_trials` (int, total grid + random-search trials run), and `target_weights` (the
+full sparse target weights DataFrame, §3 above — `strategy.json` does NOT persist this; only
+`results/strategygen_allocation_weights.csv` does, in dense/ffill'd form).
+
+### Pattern-mining DataFrames (`stratgen/turning_points.py`, `stratgen/pattern_mining.py`)
+
+Only relevant when using `--mine-patterns` directly against the Python API (the CLI only surfaces
+the final counts, not these intermediate frames):
+
+- **`find_turning_points(close, ...)`** returns a DataFrame indexed by date with columns `type`
+  (`"peak"`/`"trough"`) and `price` (float) — one row per CONFIRMED turning point (see
+  `turning_points.py`'s module docstring for what "confirmed" excludes).
+- **`mine_indicator_patterns(...)`** returns `(findings, status)`. `status` is `"ok"`,
+  `"insufficient_data"`, or `"insufficient_turning_points"`. `findings` (empty in the two
+  degenerate cases, and commonly empty even when `status="ok"`) has one row per
+  (feature, event_type) tested, columns: `feature` (str), `lookback` (int or 3-int list),
+  `event_type` (`"peak"`/`"trough"`), `observed_stat`/`null_mean`/`p_value`/`adjusted_alpha`
+  (float), `significant` (bool), `comparison` (`"below"`/`"above"`), `threshold` (float,
+  the median observed value — becomes the mined template's threshold), `n_events` (int).
+- **`build_pattern_templates(findings, ...)`** turns the significant rows into a
+  `List[PatternBasedAllocationTemplate]` (`../common/README.md` §6 describes the underlying
+  `(name, lookback)` vocabulary these draw from).
 
 ## Testing
 
