@@ -54,6 +54,9 @@ def test_main_loads_universe_from_file(mock_gen_cls, mock_load):
         target_weights = pd.DataFrame()
         factor_context = None
         factor_tiebreak_used = False
+        equity_curve = pd.DataFrame(
+            {"equity": [100.0, 101.0, 102.0]}, index=pd.bdate_range("2020-01-01", periods=3)
+        )
 
     mock_gen_instance.generate.return_value = MockSpec()
 
@@ -78,6 +81,108 @@ def test_main_loads_universe_from_file(mock_gen_cls, mock_load):
         call_args = mock_load.call_args
         assert call_args[0][0] == ["TICKER1", "TICKER2"]
 
+    finally:
+        os.remove(temp_path)
+
+
+@patch("run_strategygen.plotting.plot_equity_curve")
+@patch("run_strategygen.load_universe_with_banner")
+@patch("run_strategygen.StrategyGenerator")
+def test_main_writes_equity_curve_chart_by_default(mock_gen_cls, mock_load, mock_plot):
+    mock_gen_instance = mock_gen_cls.return_value
+
+    class MockSpec:
+        n_symbols = 2
+        template_name = "test"
+        params = {}
+        universe_sharpe = 1.0
+        cagr = 0.10
+        max_drawdown = -0.05
+        calmar_ratio = 2.0
+        win_rate = 0.55
+        profit_factor = 1.5
+        total_turnover = 1.0
+        total_rebalances = 1
+        ers_passed = True
+        ers_percentile = 0.99
+        trusted = True
+        explanation = "test"
+        target_weights = pd.DataFrame()
+        factor_context = None
+        factor_tiebreak_used = False
+        equity_curve = pd.DataFrame(
+            {"equity": [100.0, 101.0, 102.0]}, index=pd.bdate_range("2020-01-01", periods=3)
+        )
+
+    mock_spec = MockSpec()
+    mock_gen_instance.generate.return_value = mock_spec
+    mock_plot.return_value = "/fake/results/equity_curve.png"
+
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json") as f:
+        json.dump({
+            "basket": ["TICKER1", "TICKER2"],
+            "method": "test",
+            "date_generated": "2026-07-21T10:00:00Z"
+        }, f)
+        temp_path = f.name
+
+    try:
+        test_args = ["run_strategygen.py", "--universe-file", temp_path, "--mode", "generate"]
+        with patch.object(sys, "argv", test_args):
+            main()
+
+        assert mock_plot.call_count == 1
+        call_args = mock_plot.call_args
+        pd.testing.assert_series_equal(call_args[0][0], mock_spec.equity_curve["equity"])
+    finally:
+        os.remove(temp_path)
+
+
+@patch("run_strategygen.plotting.plot_equity_curve")
+@patch("run_strategygen.load_universe_with_banner")
+@patch("run_strategygen.StrategyGenerator")
+def test_main_no_plots_skips_equity_curve_chart(mock_gen_cls, mock_load, mock_plot):
+    mock_gen_instance = mock_gen_cls.return_value
+
+    class MockSpec:
+        n_symbols = 2
+        template_name = "test"
+        params = {}
+        universe_sharpe = 1.0
+        cagr = 0.10
+        max_drawdown = -0.05
+        calmar_ratio = 2.0
+        win_rate = 0.55
+        profit_factor = 1.5
+        total_turnover = 1.0
+        total_rebalances = 1
+        ers_passed = True
+        ers_percentile = 0.99
+        trusted = True
+        explanation = "test"
+        target_weights = pd.DataFrame()
+        factor_context = None
+        factor_tiebreak_used = False
+        equity_curve = pd.DataFrame(
+            {"equity": [100.0, 101.0, 102.0]}, index=pd.bdate_range("2020-01-01", periods=3)
+        )
+
+    mock_gen_instance.generate.return_value = MockSpec()
+
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json") as f:
+        json.dump({
+            "basket": ["TICKER1", "TICKER2"],
+            "method": "test",
+            "date_generated": "2026-07-21T10:00:00Z"
+        }, f)
+        temp_path = f.name
+
+    try:
+        test_args = ["run_strategygen.py", "--universe-file", temp_path, "--mode", "generate", "--no-plots"]
+        with patch.object(sys, "argv", test_args):
+            main()
+
+        assert mock_plot.call_count == 0
     finally:
         os.remove(temp_path)
 

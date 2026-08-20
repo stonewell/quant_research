@@ -27,6 +27,7 @@ from common.cli_utils import (
     default_results_dir,
     load_universe_with_banner,
 )
+from common import plotting
 from common.reporting import format_weights_pct, write_dense_weights_csv, write_json_report
 from common.universe import add_universe_cli_args, resolve_universe_from_args
 from stratgen.generator import GeneratorConfig, StrategyGenerator
@@ -94,6 +95,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "see pattern_mining.py's module docstring for why this matters).")
     p.add_argument("--pattern-max-templates", type=int, default=5,
                    help="Cap on how many significant mined patterns become candidate templates (default 5).")
+    p.add_argument("--no-plots", action="store_true",
+                   help="Skip the equity-curve chart normally produced for the winning strategy (charts are ON by default).")
     add_data_provider_cli_args(p)
     return p
 
@@ -213,6 +216,13 @@ def main():
             "pattern_spec": pattern_spec,
         }, strategy_json_path)
         print(f"Saved strategy definition to {strategy_json_path}")
+
+        if not args.no_plots and spec.equity_curve is not None and not spec.equity_curve.empty:
+            chart_path = plotting.plot_equity_curve(
+                spec.equity_curve["equity"], RESULTS_DIR, strategy_label=spec.template_name,
+                title=f"{spec.template_name} Equity Curve (in-sample search result)",
+            )
+            print(f"Saved equity curve chart to {chart_path}")
     else:
         print("Walkforward mode is currently disabled for the new allocation architecture.")
 

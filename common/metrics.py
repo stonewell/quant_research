@@ -119,6 +119,88 @@ def pct_time_in_market(equity_curve: pd.DataFrame) -> float:
     return equity_curve["in_position"].mean()
 
 
+# --- Relative/comparative metrics (strategy vs. a baseline return series) ---
+#
+# Everything above this point is an ABSOLUTE metric (computed from one return/
+# equity series alone). The three functions below are this file's first
+# metrics that compare TWO series -- e.g. a backtested strategy against a
+# single-symbol buy-and-hold baseline. All three align the two input series on
+# their date-index INTERSECTION (inner join) first, silently dropping any
+# non-overlapping head/tail, matching `common/allocation_backtester.py`'s own
+# `closes.index.intersection(target_weights.index)` pattern elsewhere in this
+# workspace. Degenerate inputs (fewer than 2 overlapping periods, or a
+# zero/NaN-variance denominator) return 0.0 for every value here -- the same
+# "no ratio is computable" convention `sharpe_ratio`/`sortino_ratio` use for a
+# zero-std denominator above, deliberately NOT `profit_factor_from_returns`'s
+# `NaN` convention (that one signals a different kind of degeneracy: "no
+# losses exist to divide by", not "not enough data to compute anything").
+
+def alpha_beta(strategy_returns: pd.Series, baseline_returns: pd.Series,
+               risk_free: float = 0.0, periods_per_year: int = 252) -> dict:
+    """Covariance-based CAPM-style alpha/beta of `strategy_returns` against
+    `baseline_returns` (e.g. a single-symbol buy-and-hold baseline's daily
+    returns).
+
+    beta = Cov(strategy_excess, baseline_excess) / Var(baseline_excess)
+    alpha = (mean(strategy_excess) - beta * mean(baseline_excess)) * periods_per_year
+
+    `alpha` is annualized via LINEAR scaling (per-period value * periods_per_year),
+    matching `annualized_vol`/`sharpe_ratio`'s sqrt-scaling conventions elsewhere
+    in this file -- not a compounding/CAGR-style annualization. Covariance-based
+    beta is algebraically identical to a single-variable OLS slope, so this
+    needs no regression library.
+
+    Returns {"alpha": float, "beta": float}.
+    """
+    s, b = strategy_returns.align(baseline_returns, join="inner")
+    mask = s.notna() & b.notna()
+    s, b = s[mask], b[mask]
+    if len(s) < 2:
+        return {"alpha": 0.0, "beta": 0.0}
+    rf_per_period = risk_free / periods_per_year
+    s_ex = s - rf_per_period
+    b_ex = b - rf_per_period
+    var_b = b_ex.var(ddof=1)
+    if var_b == 0 or np.isnan(var_b):
+        return {"alpha": 0.0, "beta": 0.0}
+    beta = s_ex.cov(b_ex) / var_b
+    alpha = (s_ex.mean() - beta * b_ex.mean()) * periods_per_year
+    return {"alpha": float(alpha), "beta": float(beta)}
+
+
+def tracking_error(strategy_returns: pd.Series, baseline_returns: pd.Series,
+                    periods_per_year: int = 252) -> float:
+    """Annualized standard deviation of (strategy_returns - baseline_returns)
+    on the two series' aligned intersection."""
+    s, b = strategy_returns.align(baseline_returns, join="inner")
+    diff = (s - b).dropna()
+    if len(diff) < 2:
+        return 0.0
+    std = diff.std(ddof=1)
+    if std == 0 or np.isnan(std):
+        return 0.0
+    return float(std * np.sqrt(periods_per_year))
+
+
+def information_ratio(strategy_returns: pd.Series, baseline_returns: pd.Series,
+                       periods_per_year: int = 252) -> float:
+    """Annualized mean(strategy_returns - baseline_returns) / annualized std of
+    the same difference -- structurally identical to `sharpe_ratio`'s own
+    `(excess.mean() / excess.std()) * sqrt(periods_per_year)` shape, with
+    "excess over the baseline" standing in for "excess over the risk-free
+    rate". Computed from ONE aligned diff (not by dividing by a separately
+    recomputed `tracking_error(...)`, which would re-align/re-diff a second
+    time and risk float drift from computing the same quantity twice)."""
+    s, b = strategy_returns.align(baseline_returns, join="inner")
+    diff = (s - b).dropna()
+    if len(diff) < 2:
+        return 0.0
+    std = diff.std(ddof=1)
+    if std == 0 or np.isnan(std):
+        return 0.0
+    return float((diff.mean() / std) * np.sqrt(periods_per_year))
+
+
 def expected_max_sharpe(n_trials: int, sharpe_std: float) -> float:
     """Expected maximum Sharpe ratio achievable by pure luck across
     `n_trials` independent trials with cross-trial Sharpe std `sharpe_std`

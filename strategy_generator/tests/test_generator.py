@@ -57,6 +57,30 @@ def test_generator_finds_momentum_allocation():
     assert not spec.target_weights.empty
 
 
+def test_generator_exposes_winning_candidate_equity_curve():
+    idx = pd.bdate_range("2020-01-01", periods=300)
+
+    closes_a = np.linspace(100, 200, 300)
+    closes_b = np.linspace(100, 50, 300)
+    closes_c = np.linspace(100, 50, 300)
+
+    universe = {
+        "A": make_df(closes_a, start="2020-01-01"),
+        "B": make_df(closes_b, start="2020-01-01"),
+        "C": make_df(closes_c, start="2020-01-01"),
+    }
+
+    config = GeneratorConfig(n_random_search=10, seed=42)
+    gen = StrategyGenerator(config)
+
+    spec = gen.generate(universe)
+
+    assert spec.equity_curve is not None
+    assert isinstance(spec.equity_curve, pd.DataFrame)
+    assert not spec.equity_curve.empty
+    assert "equity" in spec.equity_curve.columns
+
+
 def test_generator_finds_inverse_vol_allocation():
     idx = pd.bdate_range("2020-01-01", periods=300)
 

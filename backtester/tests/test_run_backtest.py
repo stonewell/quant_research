@@ -16,8 +16,11 @@ from common.data import BaseDataProvider, register_provider
 from common.testing import make_ohlcv_from_closes as make_df
 from backtester.run_backtest import (
     _align_universe,
+    _compute_standard_comparison,
     _get_template,
     _load_strategy_file,
+    _merge_baseline_folds,
+    _resolve_baseline_params,
     main,
     run_standard,
     run_walkforward,
@@ -406,3 +409,330 @@ def test_main_runs_pattern_based_strategy_end_to_end(tmp_path, monkeypatch):
 
     assert os.path.exists(results_dir / "backtest_equity.csv")
     assert os.path.exists(results_dir / "backtest_weights.csv")
+
+
+# --- Feature 1/2/3: baseline comparison, walkforward summary, equity charting ---
+
+
+def test_resolve_baseline_params_uses_given_json():
+    template = _get_template("equal_weight")
+    params = _resolve_baseline_params(template, '{"rebalance_freq_days": 42}')
+    assert params == {"rebalance_freq_days": 42}
+
+
+def test_resolve_baseline_params_defaults_to_first_grid_value():
+    template = _get_template("equal_weight")
+    params = _resolve_baseline_params(template, None)
+    assert params == {k: v[0] for k, v in template.param_grid.items()}
+
+
+def test_resolve_baseline_params_malformed_json_raises():
+    template = _get_template("equal_weight")
+    with pytest.raises(ValueError, match="Failed to parse"):
+        _resolve_baseline_params(template, "{not valid json")
+
+
+def test_resolve_baseline_params_non_dict_json_raises():
+    template = _get_template("equal_weight")
+    with pytest.raises(ValueError, match="JSON object"):
+        _resolve_baseline_params(template, "[1,2,3]")
+
+
+def test_compute_standard_comparison_identical_curves():
+    idx = pd.bdate_range("2020-01-01", periods=60)
+    rng = np.random.default_rng(3)
+    equity = pd.Series(100 * np.exp(np.cumsum(rng.normal(0.0005, 0.01, len(idx)))), index=idx)
+    eq_df = pd.DataFrame({"equity": equity})
+
+    result = {"equity_curve": eq_df, "cagr": 0.12}
+    baseline_result = {"equity_curve": eq_df, "cagr": 0.12}
+
+    comparison = _compute_standard_comparison(result, baseline_result)
+
+    assert comparison["overlap_bars"] == len(idx)
+    np.testing.assert_allclose(comparison["alpha"], 0.0, atol=1e-9)
+    np.testing.assert_allclose(comparison["beta"], 1.0, atol=1e-9)
+    np.testing.assert_allclose(comparison["tracking_error"], 0.0, atol=1e-9)
+    np.testing.assert_allclose(comparison["information_ratio"], 0.0, atol=1e-9)
+    np.testing.assert_allclose(comparison["outperformance_cagr"], 0.0, atol=1e-9)
+
+
+def test_compute_standard_comparison_disjoint_indexes_returns_nan_no_exception():
+    idx1 = pd.bdate_range("2020-01-01", periods=10)
+    idx2 = pd.bdate_range("2025-01-01", periods=10)
+
+    result = {"equity_curve": pd.DataFrame({"equity": np.linspace(100, 110, 10)}, index=idx1), "cagr": 0.1}
+    baseline_result = {"equity_curve": pd.DataFrame({"equity": np.linspace(100, 105, 10)}, index=idx2), "cagr": 0.05}
+
+    comparison = _compute_standard_comparison(result, baseline_result)
+
+    assert comparison["overlap_bars"] == 0
+    for key in ("alpha", "beta", "tracking_error", "information_ratio", "outperformance_cagr"):
+        assert np.isnan(comparison[key])
+
+
+def test_merge_baseline_folds_pairs_by_date_not_position():
+    # Deliberately different order between the two fold sets, plus a
+    # strategy fold with no matching baseline (start_date, end_date) pair.
+    folds_df = pd.DataFrame([
+        {"start_date": "2020-01-01", "end_date": "2020-06-01", "sharpe_ratio": 1.0,
+         "cagr": 0.10, "max_drawdown": 0.05, "calmar_ratio": 2.0},
+        {"start_date": "2020-06-01", "end_date": "2020-12-01", "sharpe_ratio": 1.2,
+         "cagr": 0.12, "max_drawdown": 0.06, "calmar_ratio": 2.0},
+        {"start_date": "2021-01-01", "end_date": "2021-06-01", "sharpe_ratio": 0.8,
+         "cagr": 0.08, "max_drawdown": 0.04, "calmar_ratio": 2.0},  # no baseline match
+    ])
+    baseline_folds_df = pd.DataFrame([
+        {"start_date": "2020-06-01", "end_date": "2020-12-01", "sharpe_ratio": 0.5,
+         "cagr": 0.05, "max_drawdown": 0.03, "calmar_ratio": 1.5},
+        {"start_date": "2020-01-01", "end_date": "2020-06-01", "sharpe_ratio": 0.4,
+         "cagr": 0.04, "max_drawdown": 0.02, "calmar_ratio": 1.8},
+    ])
+
+    merged = _merge_baseline_folds(folds_df, baseline_folds_df)
+
+    assert len(merged) == 3
+    row0 = merged[merged["start_date"] == "2020-01-01"].iloc[0]
+    assert row0["baseline_sharpe_ratio"] == 0.4
+    np.testing.assert_allclose(row0["outperformance"], 0.10 - 0.04)
+
+    row1 = merged[merged["start_date"] == "2020-06-01"].iloc[0]
+    assert row1["baseline_sharpe_ratio"] == 0.5
+    np.testing.assert_allclose(row1["outperformance"], 0.12 - 0.05)
+
+    row2 = merged[merged["start_date"] == "2021-01-01"].iloc[0]
+    assert pd.isna(row2["baseline_sharpe_ratio"])
+    assert pd.isna(row2["outperformance"])
+
+
+def test_main_baseline_symbol_standard_mode_writes_comparison_files(tmp_path, monkeypatch):
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(strategy_path)
+    results_dir = tmp_path / "results"
+    cache_dir = tmp_path / "cache"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "A", "B",
+        "--baseline-symbol", "SPY",
+        "--mode", "standard",
+        "--data-provider", "synthetic",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    main()
+
+    assert os.path.exists(results_dir / "baseline_equity.csv")
+    assert os.path.exists(results_dir / "comparison_report.json")
+    assert os.path.exists(results_dir / "backtest_equity.csv")
+    assert os.path.exists(results_dir / "backtest_weights.csv")
+
+    with open(results_dir / "comparison_report.json") as f:
+        report = json.load(f)
+    assert report["baseline_symbol"] == "SPY"
+    for key in ("overlap_bars", "alpha", "beta", "tracking_error", "information_ratio", "outperformance_cagr",
+                "baseline_sharpe_ratio", "baseline_cagr", "baseline_max_drawdown", "baseline_calmar_ratio",
+                "strategy_sharpe_ratio", "strategy_cagr"):
+        assert key in report
+
+
+def test_main_baseline_symbol_walkforward_mode_adds_columns(tmp_path, monkeypatch):
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(strategy_path)
+    results_dir = tmp_path / "results"
+    cache_dir = tmp_path / "cache"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "A", "B",
+        "--baseline-symbol", "SPY",
+        "--mode", "walkforward",
+        "--data-provider", "synthetic",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    main()
+
+    folds_df = pd.read_csv(results_dir / "walkforward_report.csv")
+    for col in ("baseline_sharpe_ratio", "baseline_cagr", "baseline_max_drawdown",
+                "baseline_calmar_ratio", "outperformance"):
+        assert col in folds_df.columns
+
+    assert os.path.exists(results_dir / "comparison_report.json")
+    with open(results_dir / "comparison_report.json") as f:
+        report = json.load(f)
+    assert "mean_baseline_sharpe_ratio" in report
+    assert "mean_baseline_cagr" in report
+    assert "mean_outperformance_cagr" in report
+
+    assert os.path.exists(results_dir / "walkforward_summary.json")
+
+
+def test_main_without_baseline_symbol_is_unchanged(tmp_path, monkeypatch):
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(strategy_path)
+
+    # Standard mode
+    results_dir_std = tmp_path / "results_std"
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "A", "B",
+        "--mode", "standard",
+        "--data-provider", "synthetic",
+        "--results-dir", str(results_dir_std),
+        "--cache-dir", str(tmp_path / "cache_std"),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    main()
+
+    assert not os.path.exists(results_dir_std / "baseline_equity.csv")
+    assert not os.path.exists(results_dir_std / "comparison_report.json")
+
+    # Walkforward mode
+    results_dir_wf = tmp_path / "results_wf"
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "A", "B",
+        "--mode", "walkforward",
+        "--data-provider", "synthetic",
+        "--results-dir", str(results_dir_wf),
+        "--cache-dir", str(tmp_path / "cache_wf"),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    main()
+
+    assert not os.path.exists(results_dir_wf / "baseline_equity.csv")
+    assert not os.path.exists(results_dir_wf / "comparison_report.json")
+
+    folds_df = pd.read_csv(results_dir_wf / "walkforward_report.csv")
+    assert list(folds_df.columns) == [
+        "start_date", "end_date", "sharpe_ratio", "cagr", "max_drawdown", "calmar_ratio",
+        "win_rate", "profit_factor", "total_turnover", "total_rebalances",
+    ]
+
+
+def test_main_walkforward_writes_summary_json(tmp_path, monkeypatch):
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(strategy_path)
+    results_dir = tmp_path / "results"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "A", "B",
+        "--mode", "walkforward",
+        "--data-provider", "synthetic",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(tmp_path / "cache"),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    main()
+
+    summary_path = results_dir / "walkforward_summary.json"
+    assert os.path.exists(summary_path)
+    with open(summary_path) as f:
+        summary = json.load(f)
+    for key in ("mean_sharpe_ratio", "mean_cagr", "mean_max_drawdown", "mean_calmar_ratio",
+                "n_folds", "n_valid_folds", "fold_sharpe_std", "deflated_sharpe_ratio"):
+        assert key in summary
+
+
+def test_main_walkforward_summary_dsr_is_null_with_fewer_than_two_folds(tmp_path, monkeypatch):
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(strategy_path)
+    results_dir = tmp_path / "results"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "A", "B",
+        "--mode", "walkforward",
+        "--data-provider", "synthetic",
+        "--start", "2020-01-01",
+        "--end", "2020-06-01",
+        "--window-years", "0.3",
+        "--step-years", "5.0",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(tmp_path / "cache"),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    main()
+
+    with open(results_dir / "walkforward_summary.json") as f:
+        summary = json.load(f)
+
+    assert summary["n_valid_folds"] < 2
+    assert summary["deflated_sharpe_ratio"] is None
+    assert summary["fold_sharpe_std"] is None
+
+
+def test_main_standard_mode_writes_equity_chart_by_default(tmp_path, monkeypatch):
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(strategy_path)
+    results_dir = tmp_path / "results"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "A", "B",
+        "--mode", "standard",
+        "--data-provider", "synthetic",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(tmp_path / "cache"),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    main()
+
+    chart_path = results_dir / "equity_curve.png"
+    assert os.path.exists(chart_path)
+    assert os.path.getsize(chart_path) > 0
+
+
+def test_main_standard_mode_no_plots_skips_chart(tmp_path, monkeypatch):
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(strategy_path)
+    results_dir = tmp_path / "results"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "A", "B",
+        "--mode", "standard",
+        "--data-provider", "synthetic",
+        "--no-plots",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(tmp_path / "cache"),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    main()
+
+    assert not os.path.exists(results_dir / "equity_curve.png")
+
+
+@patch("backtester.run_backtest.plotting.plot_equity_curve")
+def test_main_walkforward_mode_never_calls_plotting(mock_plot, tmp_path, monkeypatch):
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(strategy_path)
+    results_dir = tmp_path / "results"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "A", "B",
+        "--mode", "walkforward",
+        "--data-provider", "synthetic",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(tmp_path / "cache"),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    main()
+
+    mock_plot.assert_not_called()

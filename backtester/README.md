@@ -46,11 +46,15 @@ all of them raises `ValueError("No universe symbols provided or resolved...")`.
 | `--initial-capital` | float, default `100000.0` | Starting portfolio equity |
 | `--commission-pct` | float, default `0.0005` | Per-trade commission, as a fraction of traded notional |
 | `--slippage-pct` | float, default `0.0005` | Per-trade slippage, as a fraction of traded notional |
+| `--baseline-symbol` | str, default: none | Optional single reference symbol (e.g. `SPY`) to compare the strategy against. Off by default — none of the comparison code runs unless this is set |
+| `--baseline-template` | str, default `"equal_weight"` | Static allocation template (one of the 9 in `ALLOCATION_TEMPLATES` — no `pattern_*` templates) used to turn `--baseline-symbol` into a baseline equity curve |
+| `--baseline-params` | JSON str, default: none | Params for `--baseline-template` as a JSON object string (default: that template's first `param_grid` combination) |
 | `--data-provider` | str, default `"yfinance"` | `yfinance`, `csv`, `synthetic`, or a custom module specifier |
 | `--data-dir` | path, default: none | Folder path for the `csv` data provider |
 | `--no-cache` | flag, default off (cached) | Disable local CSV caching of fetched data |
 | `--results-dir` | path, default: none | Override where `backtest_equity.csv`/`backtest_weights.csv`/`walkforward_report.csv` are written (defaults to `backtester/results/`) |
 | `--cache-dir` | path, default: none | Override the local data cache folder |
+| `--no-plots` | flag, default off (charts on) | Skip the `equity_curve.png` chart normally produced in `--mode standard` |
 
 ### Sample commands (real market data)
 
@@ -105,8 +109,25 @@ uv run python backtester/run_backtest.py \
 uv run python backtester/run_backtest.py \
   --strategy-file strategy_generator/results/strategy.json \
   --universe A B C --data-provider synthetic
+
+# Standard mode with a baseline symbol comparison (synthetic data -- no network calls)
+uv run python backtester/run_backtest.py \
+  --strategy-file strategy_generator/results/strategy.json \
+  --universe A B C --data-provider synthetic \
+  --baseline-symbol SPY --baseline-template equal_weight
+
+# Walkforward mode with a baseline comparison and custom baseline params (synthetic data)
+uv run python backtester/run_backtest.py \
+  --strategy-file strategy_generator/results/strategy.json \
+  --universe A B C --data-provider synthetic --mode walkforward \
+  --baseline-symbol SPY --baseline-params '{"rebalance_freq_days": 21}'
 ```
 
 Outputs land in `results/` (or `--results-dir` if given): `backtest_equity.csv` and
 `backtest_weights.csv` (`--mode standard`), or `walkforward_report.csv` (`--mode walkforward`) —
-see `SCHEMAS.md` for column-level detail.
+see `SCHEMAS.md` for column-level detail. `--mode walkforward` also always writes
+`walkforward_summary.json` (mean fold metrics plus the Deflated Sharpe Ratio). When
+`--baseline-symbol` is set: `baseline_equity.csv` and `comparison_report.json` are written in both
+modes, and `walkforward_report.csv` gains 5 extra `baseline_*`/`outperformance` columns. In
+`--mode standard`, unless `--no-plots` is given, `equity_curve.png` is also written (a two-line
+chart, strategy vs. baseline, if `--baseline-symbol` is set).

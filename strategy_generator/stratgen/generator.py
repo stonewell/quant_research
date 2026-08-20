@@ -64,6 +64,7 @@ class GeneratedStrategySpec:
     # could have influenced selection -- see _search_allocation.
     factor_context: dict = None
     factor_tiebreak_used: bool = False
+    equity_curve: pd.DataFrame = None
 
 
 def _portfolio_score(universe: dict, template, params: dict, config: GeneratorConfig) -> dict:
@@ -333,4 +334,5 @@ class StrategyGenerator:
             target_weights=target_weights,
             factor_context=result["factor_context"],
             factor_tiebreak_used=result["factor_tiebreak_used"],
+            equity_curve=res.get("equity_curve"),
         )

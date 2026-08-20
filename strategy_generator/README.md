@@ -257,6 +257,7 @@ falling back to this project's own default universe (`["SPY", "QQQ"]`) if none a
 | `--data-provider` | str, default `"yfinance"` | `yfinance`, `csv`, `synthetic`, or a custom module specifier |
 | `--data-dir` | path, default: none | Folder path for the `csv` data provider |
 | `--no-cache` | flag, default off (cached) | Disable local CSV caching of fetched data |
+| `--no-plots` | flag, default off (charts on) | Skip writing the winning strategy's equity-curve chart (`results/equity_curve.png`) |
 
 ### Sample commands (real market data)
 
@@ -333,9 +334,20 @@ feature menu** shapes documented in `../common/README.md` (§1–6) — see that
 
 The object `StrategyGenerator.generate()` returns — a superset of `strategy.json` above, plus
 `n_symbols` (int), `total_turnover`/`total_rebalances` (duplicated from the backtest result dict for
-convenience), `n_trials` (int, total grid + random-search trials run), and `target_weights` (the
+convenience), `n_trials` (int, total grid + random-search trials run), `target_weights` (the
 full sparse target weights DataFrame, §3 above — `strategy.json` does NOT persist this; only
-`results/strategygen_allocation_weights.csv` does, in dense/ffill'd form).
+`results/strategygen_allocation_weights.csv` does, in dense/ffill'd form), and `equity_curve` (the
+winning candidate's daily portfolio-value DataFrame from `common/allocation_backtester.py`'s result
+dict — also not persisted in `strategy.json`; it's what `run_strategygen.py` charts, see "Outputs"
+below).
+
+### Outputs
+
+Besides `results/strategy.json` and `results/strategygen_allocation_weights.csv` above,
+`run_strategygen.py` also writes `results/equity_curve.png` by default — the winning strategy's
+own IN-SAMPLE equity curve (the same data it was searched/validated on, unlike `backtester`'s
+out-of-sample chart) via the shared `common/plotting.py::plot_equity_curve` helper. Pass
+`--no-plots` to skip it.
 
 ### Pattern-mining DataFrames (`stratgen/turning_points.py`, `stratgen/pattern_mining.py`)
 

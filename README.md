@@ -154,6 +154,42 @@ uv run python backtester/run_backtest.py \
 See `backtester/README.md` for the full CLI argument reference and `backtester/SCHEMAS.md` for
 exact output column definitions.
 
+### Automated: `run_pipeline.py`
+
+`run_pipeline.py` (repo root) chains all 4 steps above end-to-end in a single command, auto-wiring
+each step's output file (`factor_summary.json` -> `basket.json` -> `strategy.json`) into the next
+step's input flag via subprocess calls, and writes a `pipeline_manifest_*.json` run summary under
+`results/`. It only exposes the flags a typical end-to-end run needs to vary; anything else requires
+running the 4 steps manually as shown above.
+
+```bash
+# Full pipeline on synthetic data (no real market data/network)
+uv run python run_pipeline.py --universe SPY QQQ IWM EFA EEM GLD TLT --data-provider synthetic
+
+# Preview the 4 resolved commands without running anything
+uv run python run_pipeline.py --universe SPY QQQ IWM EFA EEM GLD TLT --dry-run
+
+# With turning-point pattern mining (step 3) and a stricter basket cap (step 2)
+uv run python run_pipeline.py --universe SPY QQQ IWM EFA EEM GLD TLT XLE XLF XLK XLV XLU \
+  --data-provider synthetic --select-method threshold --select-max-k 6 --mine-patterns
+
+# Walk-forward evaluation (step 4) with a baseline-symbol comparison against SPY
+uv run python run_pipeline.py --universe SPY QQQ IWM EFA EEM GLD TLT --data-provider synthetic \
+  --mode walkforward --baseline-symbol SPY --baseline-template equal_weight
+
+# Faster run: skip the equity-curve charts step 3/4 would otherwise write
+uv run python run_pipeline.py --universe SPY QQQ IWM EFA EEM GLD TLT --data-provider synthetic --no-plots
+
+# A real end-to-end run against real market data (only pass --data-provider yfinance
+# deliberately -- every other example above defaults to synthetic per this workspace's
+# no-real-market-data-by-default convention)
+uv run python run_pipeline.py --universe SPY QQQ IWM EFA EEM GLD TLT --data-provider yfinance
+```
+
+See `run_pipeline.py --help` for the full flag list; anything not exposed here (e.g. custom
+`--start`/`--end`, `--n-days`/`--seed`, `--top-n`, walk-forward window/step sizing,
+`--factor-tiebreak-epsilon`) requires running the 4 steps manually per the commands above.
+
 ---
 
 ## Inter-Project Data Handoff Schemas
@@ -257,3 +293,4 @@ uv run pytest common/tests -v
 | `instrument_selection/` | Characterizes instruments, performs hard investability screening, and selects diversified baskets | `instrument_selection/run_screener.py` | `instrument_selection/README.md` |
 | `strategy_generator/` | Grid-searches allocation templates & mined indicator patterns to generate validated strategies | `strategy_generator/run_strategygen.py` | `strategy_generator/README.md` |
 | `backtester/` | Standalone CLI evaluating fixed strategy files over single or rolling walkforward windows | `backtester/run_backtest.py` | `backtester/README.md`, `backtester/SCHEMAS.md` |
+| `run_pipeline.py` | Chains all 4 pipeline steps end-to-end via subprocess, auto-wiring each step's output into the next | `run_pipeline.py` | This README |

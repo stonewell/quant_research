@@ -35,6 +35,9 @@ from common.cli_utils import (
     default_results_dir,
     load_universe_with_banner,
 )
+from common.metrics import alpha_beta, deflated_sharpe_ratio, information_ratio, tracking_error
+from common import plotting
+from common.reporting import write_json_report
 from common.universe import add_universe_cli_args, resolve_universe_from_args
 
 RESULTS_DIR = default_results_dir(__file__)
@@ -54,11 +57,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--initial-capital", type=float, default=100_000.0)
     p.add_argument("--commission-pct", type=float, default=0.0005)
     p.add_argument("--slippage-pct", type=float, default=0.0005)
+    p.add_argument("--baseline-symbol", type=str, default=None,
+                   help="Optional single reference symbol (e.g. SPY) to compare the strategy against. Off by default.")
+    p.add_argument("--baseline-template", type=str, default="equal_weight",
+                   choices=[cls.name for cls in ALLOCATION_TEMPLATES],
+                   help="Static allocation template used to turn --baseline-symbol into a baseline equity curve (default: equal_weight)")
+    p.add_argument("--baseline-params", type=str, default=None,
+                   help="JSON object string of params for --baseline-template (default: the template's first param_grid combination)")
     add_data_provider_cli_args(p)
     p.add_argument("--results-dir", type=str, default=None,
                    help=f"Override the output directory for equity/weights/report CSVs (default: {RESULTS_DIR})")
     p.add_argument("--cache-dir", type=str, default=None,
                    help=f"Override the local OHLCV CSV cache directory (default: {DATA_DIR})")
+    p.add_argument("--no-plots", action="store_true",
+                   help="Skip the equity-curve chart normally produced in --mode standard (charts are ON by default).")
     return p
 
 
@@ -142,6 +154,10 @@ def _load_strategy_file(path: str) -> dict:
     return strategy_def
 
 
+def _resolve_window_bars(window_years: float) -> int:
+    return int(round(window_years * 252))
+
+
 def run_standard(universe: dict, template, params: dict, args) -> dict:
     target_weights = template.generate_weights(universe, params)
     if target_weights.empty:
@@ -172,7 +188,7 @@ def run_walkforward(universe: dict, template, params: dict, args) -> list:
     any_df = next(iter(aligned.values()))
     n_bars = len(any_df)
 
-    window_bars = int(round(args.window_years * 252))
+    window_bars = _resolve_window_bars(args.window_years)
     step_bars = int(round(args.step_years * 252))
 
     if window_bars <= 0:
@@ -266,6 +282,95 @@ def run_walkforward(universe: dict, template, params: dict, args) -> list:
     return folds
 
 
+def _resolve_baseline_params(template, baseline_params_json: str = None) -> dict:
+    """Same JSON-object-string convention `common/universe.py`'s
+    `resolve_universe_from_args` uses for `--universe-kwargs`: parse if given,
+    raise ValueError on malformed JSON or a non-dict result. Falls back to the
+    template's first param_grid combination when no override is given."""
+    if baseline_params_json is not None:
+        try:
+            parsed = json.loads(baseline_params_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Failed to parse --baseline-params JSON string: {exc}")
+        if not isinstance(parsed, dict):
+            raise ValueError(f"--baseline-params must be a JSON object, got {type(parsed).__name__}.")
+        return parsed
+    return {k: v[0] for k, v in template.param_grid.items()}
+
+
+def _run_baseline(args, cache_dir, data_kwargs):
+    """Loads --baseline-symbol and runs it through the same run_standard/
+    run_walkforward path as the main strategy, using --baseline-template (a
+    static template only -- no pattern_spec) and --baseline-params (or that
+    template's first param_grid combination). Returns (baseline_out,
+    baseline_params)."""
+    print(f"\n=== Loading Baseline: {args.baseline_symbol} ({args.baseline_template}) ===")
+    baseline_template = _get_template(args.baseline_template)
+    baseline_params = _resolve_baseline_params(baseline_template, args.baseline_params)
+
+    baseline_universe = load_universe_with_banner(
+        [args.baseline_symbol], args.start, args.end, args.interval,
+        use_cache=not args.no_cache, cache_dir=cache_dir,
+        data_kwargs=data_kwargs, require_nonempty=True,
+    )
+
+    if args.mode == "standard":
+        baseline_out = run_standard(baseline_universe, baseline_template, baseline_params, args)
+    else:
+        baseline_out = run_walkforward(baseline_universe, baseline_template, baseline_params, args)
+
+    return baseline_out, baseline_params
+
+
+def _compute_standard_comparison(result: dict, baseline_result: dict) -> dict:
+    """Strategy-vs-baseline comparison metrics for --mode standard, aligned on
+    the two equity curves' overlapping dates. Degenerate (<2 overlapping
+    bars) input returns NaN for every relative field rather than raising."""
+    strat_eq = result["equity_curve"]["equity"]
+    base_eq = baseline_result["equity_curve"]["equity"]
+    common_idx = strat_eq.index.intersection(base_eq.index)
+
+    if len(common_idx) < 2:
+        return {
+            "overlap_bars": int(len(common_idx)),
+            "alpha": float("nan"),
+            "beta": float("nan"),
+            "tracking_error": float("nan"),
+            "information_ratio": float("nan"),
+            "outperformance_cagr": float("nan"),
+        }
+
+    strat_ret = strat_eq.loc[common_idx].pct_change().dropna()
+    base_ret = base_eq.loc[common_idx].pct_change().dropna()
+    ab = alpha_beta(strat_ret, base_ret)
+    return {
+        "overlap_bars": int(len(common_idx)),
+        "alpha": ab["alpha"],
+        "beta": ab["beta"],
+        "tracking_error": tracking_error(strat_ret, base_ret),
+        "information_ratio": information_ratio(strat_ret, base_ret),
+        "outperformance_cagr": result["cagr"] - baseline_result["cagr"],
+    }
+
+
+def _merge_baseline_folds(folds_df: pd.DataFrame, baseline_folds_df: pd.DataFrame) -> pd.DataFrame:
+    """LEFT-JOIN by (start_date, end_date) columns, NOT row position -- the
+    two fold sets are computed from independent bar-position arithmetic over
+    independently-loaded calendars and are not guaranteed to align row-for-
+    row."""
+    renamed = baseline_folds_df[["start_date", "end_date", "sharpe_ratio", "cagr", "max_drawdown", "calmar_ratio"]].rename(
+        columns={
+            "sharpe_ratio": "baseline_sharpe_ratio",
+            "cagr": "baseline_cagr",
+            "max_drawdown": "baseline_max_drawdown",
+            "calmar_ratio": "baseline_calmar_ratio",
+        }
+    )
+    merged = folds_df.merge(renamed, on=["start_date", "end_date"], how="left")
+    merged["outperformance"] = merged["cagr"] - merged["baseline_cagr"]
+    return merged
+
+
 def main():
     args = build_arg_parser().parse_args()
     results_dir = args.results_dir or RESULTS_DIR
@@ -319,6 +424,53 @@ def main():
         result["actual_weights"].to_csv(weights_path)
         print(f"Saved actual daily weights to {weights_path}")
 
+        baseline_result = None
+        if args.baseline_symbol:
+            baseline_result, baseline_params = _run_baseline(args, cache_dir, data_kwargs)
+            comparison = _compute_standard_comparison(result, baseline_result)
+
+            print(f"\n=== Baseline Comparison: {args.baseline_symbol} ({args.baseline_template}) ===")
+            print(f"Baseline Sharpe Ratio: {baseline_result['sharpe_ratio']:.2f} | "
+                  f"Baseline CAGR: {baseline_result['cagr']*100:.2f}% | "
+                  f"Baseline Max Drawdown: {baseline_result['max_drawdown']*100:.1f}%")
+            print(f"Alpha (annualized): {comparison['alpha']*100:.2f}% | Beta: {comparison['beta']:.2f}")
+            print(f"Tracking Error: {comparison['tracking_error']*100:.2f}% | "
+                  f"Information Ratio: {comparison['information_ratio']:.2f}")
+            print(f"Outperformance CAGR: {comparison['outperformance_cagr']*100:.2f}%")
+
+            baseline_equity_path = os.path.join(results_dir, "baseline_equity.csv")
+            baseline_result["equity_curve"].to_csv(baseline_equity_path)
+            print(f"Saved baseline equity curve to {baseline_equity_path}")
+
+            comparison_report = {
+                "baseline_symbol": args.baseline_symbol,
+                "baseline_template": args.baseline_template,
+                "baseline_params": baseline_params,
+                "baseline_sharpe_ratio": baseline_result["sharpe_ratio"],
+                "baseline_cagr": baseline_result["cagr"],
+                "baseline_max_drawdown": baseline_result["max_drawdown"],
+                "baseline_calmar_ratio": baseline_result["calmar_ratio"],
+                "strategy_sharpe_ratio": result["sharpe_ratio"],
+                "strategy_cagr": result["cagr"],
+                **comparison,
+            }
+            comparison_report_path = os.path.join(results_dir, "comparison_report.json")
+            write_json_report(comparison_report, comparison_report_path)
+            print(f"Saved comparison report to {comparison_report_path}")
+
+        if not args.no_plots:
+            equity_series = result["equity_curve"]["equity"]
+            baseline_series = None
+            baseline_chart_label = "Baseline"
+            if args.baseline_symbol and baseline_result is not None:
+                baseline_series = baseline_result["equity_curve"]["equity"]
+                baseline_chart_label = args.baseline_symbol
+            chart_path = plotting.plot_equity_curve(
+                equity_series, results_dir, baseline=baseline_series, baseline_label=baseline_chart_label,
+                strategy_label=template_name, title=f"{template_name} Equity Curve",
+            )
+            print(f"Saved equity curve chart to {chart_path}")
+
     elif args.mode == "walkforward":
         print(f"\n=== Running Walkforward Rolling Evaluation ===")
         print(f"Window: {args.window_years} years, Step: {args.step_years} years")
@@ -326,6 +478,13 @@ def main():
         folds = run_walkforward(universe, _get_template(template_name, pattern_spec), params, args)
 
         folds_df = pd.DataFrame(folds)
+
+        baseline_params = None
+        if args.baseline_symbol:
+            baseline_folds, baseline_params = _run_baseline(args, cache_dir, data_kwargs)
+            baseline_folds_df = pd.DataFrame(baseline_folds)
+            folds_df = _merge_baseline_folds(folds_df, baseline_folds_df)
+
         print("\nRolling Windows Performance:")
         print(folds_df.to_string(index=False))
 
@@ -333,6 +492,54 @@ def main():
               f"Mean CAGR: {folds_df['cagr'].mean()*100:.2f}%")
         print(f"Mean Max Drawdown: {folds_df['max_drawdown'].mean()*100:.1f}% | "
               f"Mean Calmar Ratio: {folds_df['calmar_ratio'].mean():.2f}")
+
+        if args.baseline_symbol:
+            mean_baseline_sharpe = folds_df["baseline_sharpe_ratio"].mean()
+            mean_baseline_cagr = folds_df["baseline_cagr"].mean()
+            mean_outperformance = folds_df["outperformance"].mean()
+            print(f"Mean Baseline Sharpe Ratio: {mean_baseline_sharpe:.2f} | "
+                  f"Mean Baseline CAGR: {mean_baseline_cagr*100:.2f}%")
+            print(f"Mean Outperformance CAGR: {mean_outperformance*100:.2f}%")
+
+        valid_sharpes = folds_df["sharpe_ratio"].dropna()
+        n_valid_folds = len(valid_sharpes)
+        dsr = float("nan")
+        sharpe_std = float("nan")
+        if n_valid_folds >= 2:
+            sharpe_std = float(valid_sharpes.std(ddof=1))
+            dsr = deflated_sharpe_ratio(
+                observed_sharpe=float(valid_sharpes.mean()),
+                n_trials=n_valid_folds,
+                n_obs=_resolve_window_bars(args.window_years),
+                sharpe_std=sharpe_std,
+            )
+        summary = {
+            "mean_sharpe_ratio": float(folds_df["sharpe_ratio"].mean()),
+            "mean_cagr": float(folds_df["cagr"].mean()),
+            "mean_max_drawdown": float(folds_df["max_drawdown"].mean()),
+            "mean_calmar_ratio": float(folds_df["calmar_ratio"].mean()),
+            "n_folds": int(len(folds_df)),
+            "n_valid_folds": n_valid_folds,
+            "fold_sharpe_std": sharpe_std,
+            "deflated_sharpe_ratio": dsr,
+        }
+        print(f"Deflated Sharpe Ratio: {dsr:.3f} (n_trials={n_valid_folds}, fold Sharpe std={sharpe_std:.3f})")
+        summary_path = os.path.join(results_dir, "walkforward_summary.json")
+        write_json_report(summary, summary_path)
+        print(f"Saved walkforward summary to {summary_path}")
+
+        if args.baseline_symbol:
+            comparison_report = {
+                "baseline_symbol": args.baseline_symbol,
+                "baseline_template": args.baseline_template,
+                "baseline_params": baseline_params,
+                "mean_baseline_sharpe_ratio": float(folds_df["baseline_sharpe_ratio"].mean()),
+                "mean_baseline_cagr": float(folds_df["baseline_cagr"].mean()),
+                "mean_outperformance_cagr": float(folds_df["outperformance"].mean()),
+            }
+            comparison_report_path = os.path.join(results_dir, "comparison_report.json")
+            write_json_report(comparison_report, comparison_report_path)
+            print(f"Saved comparison report to {comparison_report_path}")
 
         out_path = os.path.join(results_dir, "walkforward_report.csv")
         folds_df.to_csv(out_path, index=False)
