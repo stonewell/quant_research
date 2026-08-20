@@ -695,6 +695,7 @@ QQQ, IWM, DIA, EFA, EEM, GLD, SLV, USO, TLT, IEF, XLE, XLF, XLK, XLV, XLU) if no
 | `--data-provider` | str, default `"yfinance"` | `yfinance`, `csv`, `synthetic`, or a custom registered/module-specifier provider |
 | `--data-dir` | path, default: none | Folder path for the `csv` data provider |
 | `--no-cache` | flag, default off (cached) | Disable local CSV caching of fetched data |
+| `--cache-ttl-days` | float, default: none | Max age, in days, of a cached OHLCV CSV file before it's treated as stale and re-fetched (default: never expire). Cache directory is shared workspace-wide (`<repo_root>/data/`) -- see [`common/README.md`'s "Shared OHLCV cache directory"](../common/README.md#7-shared-ohlcv-cache-directory) |
 | `--no-plots` | flag, default off (plots written) | Skip writing the 3 chart files to `results/` |
 
 ### Sample commands (real market data)

@@ -39,7 +39,7 @@ import numpy as np
 import pandas as pd
 
 from common.allocation_backtester import run_allocation_backtest
-from common.cli_utils import add_data_provider_cli_args, build_data_kwargs, default_data_dir, default_results_dir
+from common.cli_utils import add_data_provider_cli_args, build_data_kwargs, default_results_dir, shared_data_dir
 from common.data import load_universe
 from common.factor_taxonomy import FACTOR_CATEGORIES
 from common.reporting import format_weights_pct, write_dense_weights_csv, write_json_report
@@ -67,7 +67,7 @@ from rs.strategy import (
 )
 
 RESULTS_DIR = default_results_dir(__file__)
-DATA_DIR = default_data_dir(__file__)
+DATA_DIR = shared_data_dir()
 
 STRATEGY_CLASS_MAP = {
     "AcceleratingDualMomentum": AcceleratingDualMomentum,
@@ -236,7 +236,8 @@ def main():
           f"'{args.data_provider}' ({start} to {end}) ...")
     universe = load_universe(
         universe_symbols, start=start, end=end,
-        use_cache=not args.no_cache, cache_dir=DATA_DIR, **data_kwargs,
+        use_cache=not args.no_cache, cache_dir=DATA_DIR,
+        cache_max_age_days=args.cache_ttl_days, **data_kwargs,
     )
     print(f"Loaded {len(universe)} symbols: {', '.join(universe.keys())}\n")
 

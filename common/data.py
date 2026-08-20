@@ -230,7 +230,15 @@ class CachedDataProvider(BaseDataProvider):
 
         _validate_symbol_for_path(symbol)
         os.makedirs(self.cache_dir, exist_ok=True)
-        cache_path = os.path.join(self.cache_dir, f"{symbol}_{interval}_{start}_{end}.csv")
+        # Prefixing with the inner provider's class name is load-bearing, not
+        # cosmetic: this cache directory is shared workspace-wide across
+        # projects with DIFFERENT default providers (e.g. research_strategy
+        # defaults to synthetic, the other 3 default to yfinance) -- without
+        # this, two projects fetching the same symbol/interval/date-range
+        # from different providers would silently read back each other's
+        # (wrong-provider) cached data.
+        provider_name = type(self.inner_provider).__name__
+        cache_path = os.path.join(self.cache_dir, f"{provider_name}_{symbol}_{interval}_{start}_{end}.csv")
 
         if os.path.exists(cache_path) and not self._is_stale(cache_path):
             try:
@@ -358,26 +366,32 @@ def get_data_provider(provider_name_or_instance: Union[str, BaseDataProvider, No
 
 
 def load_ohlcv(symbol: str, start: str, end: str, interval: str = "1d", use_cache: bool = True,
-               cache_dir: str = None, provider: Union[str, BaseDataProvider, None] = None, **kwargs) -> pd.DataFrame:
+               cache_dir: str = None, provider: Union[str, BaseDataProvider, None] = None,
+               cache_max_age_days: Optional[float] = None, **kwargs) -> pd.DataFrame:
     """Download (or load cached) OHLCV data for symbol between start and end.
     Maintains backward compatibility with original load_ohlcv function signature.
+    `cache_max_age_days` (None by default -- cached files never expire) is
+    passed straight through to CachedDataProvider; it is NOT part of `**kwargs`
+    since those flow into the underlying provider's own constructor.
     """
     base_prov = get_data_provider(provider, **kwargs)
     if use_cache and cache_dir:
-        prov = CachedDataProvider(base_prov, cache_dir)
+        prov = CachedDataProvider(base_prov, cache_dir, cache_max_age_days=cache_max_age_days)
     else:
         prov = base_prov
     return prov.fetch_ohlcv(symbol, start, end, interval)
 
 
 def load_universe(symbols: list, start: str, end: str, interval: str = "1d", use_cache: bool = True,
-                  cache_dir: str = None, provider: Union[str, BaseDataProvider, None] = None, **kwargs) -> dict:
+                  cache_dir: str = None, provider: Union[str, BaseDataProvider, None] = None,
+                  cache_max_age_days: Optional[float] = None, **kwargs) -> dict:
     """Load OHLCV for each symbol; skips (with a warning) any that fail.
     Maintains backward compatibility with original load_universe function signature.
+    See `load_ohlcv`'s docstring for `cache_max_age_days`.
     """
     base_prov = get_data_provider(provider, **kwargs)
     if use_cache and cache_dir:
-        prov = CachedDataProvider(base_prov, cache_dir)
+        prov = CachedDataProvider(base_prov, cache_dir, cache_max_age_days=cache_max_age_days)
     else:
         prov = base_prov
     return prov.fetch_universe(symbols, start, end, interval)

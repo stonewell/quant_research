@@ -239,11 +239,16 @@ GLD, TLT, VNQ, AGG, TIP, IEF, LQD, DBC, BIL, SCZ, HYG, UPRO, TMF) if none are gi
 | `--data-provider` | str, default `"synthetic"` | `synthetic` (default — see §3's offline policy), `yfinance`, `csv`, or a custom registered/module-specifier provider |
 | `--data-dir` | path, default: none | Folder path for the `csv` data provider |
 | `--no-cache` | flag, default off (cached) | Disable local CSV caching of fetched data (only relevant to non-synthetic providers) |
+| `--cache-ttl-days` | float, default: none | Maximum age (in days) of a cached OHLCV file before it's treated as stale and re-fetched; `None` (default) never expires a cache entry on age alone |
 
 Note: unlike the other 3 projects, this CLI's `--data-provider` **default is `synthetic`**, per
 §3's offline-testing policy. Real market data is fully supported (the CLI's own low-Sharpe warning
 literally suggests `--data-provider yfinance` to cross-check a synthetic finding) — it is simply
 not the default, and `--n-days`/`--seed` are silently ignored once you opt into a real provider.
+
+`DATA_DIR` now resolves to the shared, workspace-wide OHLCV cache directory
+(`<repo_root>/data/`) rather than a project-local folder — see `common/README.md`'s
+"Shared OHLCV cache directory" section (§7) for details.
 
 ### Running CLI Backtests
 Simulate portfolio backtests on synthetic multi-asset data across all strategies loaded from JSON config:

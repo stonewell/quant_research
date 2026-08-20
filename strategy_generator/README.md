@@ -257,7 +257,12 @@ falling back to this project's own default universe (`["SPY", "QQQ"]`) if none a
 | `--data-provider` | str, default `"yfinance"` | `yfinance`, `csv`, `synthetic`, or a custom module specifier |
 | `--data-dir` | path, default: none | Folder path for the `csv` data provider |
 | `--no-cache` | flag, default off (cached) | Disable local CSV caching of fetched data |
+| `--cache-ttl-days` | float, default: none | Maximum age (in days) of a cached OHLCV file before it's treated as stale and re-fetched; `None` (default) never expires a cache entry on age alone |
 | `--no-plots` | flag, default off (charts on) | Skip writing the winning strategy's equity-curve chart (`results/equity_curve.png`) |
+
+The local OHLCV cache directory now resolves to the shared, workspace-wide location
+(`<repo_root>/data/`) rather than a project-local folder — see `common/README.md`'s "Shared OHLCV
+cache directory" section (§7) for details.
 
 ### Sample commands (real market data)
 

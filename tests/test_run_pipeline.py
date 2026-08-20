@@ -29,6 +29,7 @@ def test_build_arg_parser_defaults():
     assert args.mine_patterns is False
     assert args.baseline_symbol is None
     assert args.no_plots is False
+    assert args.cache_ttl_days is None
     assert args.dry_run is False
 
 
@@ -126,6 +127,28 @@ def test_mine_patterns_and_baseline_flags_passthrough_only_when_set(monkeypatch,
     assert "--mine-patterns" in argv_step3
     assert "--baseline-symbol" in argv_step4 and "SPY" in argv_step4
     assert "--baseline-template" in argv_step4 and "equal_weight" in argv_step4
+
+
+def test_cache_ttl_days_passthrough_only_when_set(monkeypatch, tmp_path):
+    monkeypatch.setattr(run_pipeline, "RESULTS_DIR", str(tmp_path))
+
+    # First run: flag not set -- must not appear in any step's argv.
+    monkeypatch.setattr(sys, "argv", ["run_pipeline.py"])
+    mock_run = MagicMock(return_value=_fake_result(returncode=0, stderr=""))
+    monkeypatch.setattr(run_pipeline.subprocess, "run", mock_run)
+    run_pipeline.main()
+    for call in mock_run.call_args_list:
+        assert "--cache-ttl-days" not in call.args[0]
+
+    # Second run: flag set -- must be forwarded identically to all 4 steps.
+    monkeypatch.setattr(sys, "argv", ["run_pipeline.py", "--cache-ttl-days", "2"])
+    mock_run2 = MagicMock(return_value=_fake_result(returncode=0, stderr=""))
+    monkeypatch.setattr(run_pipeline.subprocess, "run", mock_run2)
+    run_pipeline.main()
+    assert mock_run2.call_count == 4
+    for call in mock_run2.call_args_list:
+        argv = call.args[0]
+        assert "--cache-ttl-days" in argv and "2.0" in argv
 
 
 def test_dry_run_never_invokes_subprocess(monkeypatch, tmp_path):

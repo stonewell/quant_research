@@ -12,8 +12,10 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+import common.cli_utils
 from common.data import BaseDataProvider, register_provider
 from common.testing import make_ohlcv_from_closes as make_df
+import backtester.run_backtest
 from backtester.run_backtest import (
     _align_universe,
     _compute_standard_comparison,
@@ -21,6 +23,7 @@ from backtester.run_backtest import (
     _load_strategy_file,
     _merge_baseline_folds,
     _resolve_baseline_params,
+    build_arg_parser,
     main,
     run_standard,
     run_walkforward,
@@ -94,6 +97,22 @@ def test_get_template_rejects_pattern_spec_with_non_pattern_prefixed_template_na
     }
     with pytest.raises(ValueError, match="pattern_"):
         _get_template("equal_weight", pattern_spec)
+
+
+def test_data_dir_uses_shared_data_dir():
+    # Regression test: DATA_DIR used to be a per-project default_data_dir(__file__)
+    # (this project's own default_data_dir was removed in the shared OHLCV cache
+    # consolidation); it must now resolve to the single, workspace-wide cache
+    # directory shared by every project.
+    assert backtester.run_backtest.DATA_DIR == common.cli_utils.shared_data_dir()
+
+
+def test_arg_parser_cache_ttl_days_default_and_override():
+    args = build_arg_parser().parse_args(["--strategy-file", "strategy.json"])
+    assert args.cache_ttl_days is None
+
+    args = build_arg_parser().parse_args(["--strategy-file", "strategy.json", "--cache-ttl-days", "7"])
+    assert args.cache_ttl_days == 7.0
 
 
 class MockArgs:

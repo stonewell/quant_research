@@ -23,9 +23,9 @@ import pandas as pd
 from common.cli_utils import (
     add_data_provider_cli_args,
     build_data_kwargs,
-    default_data_dir,
     default_results_dir,
     load_universe_with_banner,
+    shared_data_dir,
 )
 from common import plotting
 from common.reporting import format_weights_pct, write_dense_weights_csv, write_json_report
@@ -124,8 +124,9 @@ def main():
 
     universe = load_universe_with_banner(
         universe_symbols, args.start, args.end, args.interval,
-        use_cache=not args.no_cache, cache_dir=default_data_dir(__file__),
+        use_cache=not args.no_cache, cache_dir=shared_data_dir(),
         data_kwargs=data_kwargs, require_nonempty=True,
+        cache_max_age_days=args.cache_ttl_days,
     )
 
     os.makedirs(RESULTS_DIR, exist_ok=True)

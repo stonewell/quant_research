@@ -112,7 +112,7 @@ def test_cached_data_provider(temp_csv_dir):
 
     # First call: cache miss, fetches from inner and writes to cache_dir
     df1 = cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
-    cache_file = os.path.join(temp_csv_dir, "SPY_1d_2020-01-01_2020-01-10.csv")
+    cache_file = os.path.join(temp_csv_dir, "SyntheticDataProvider_SPY_1d_2020-01-01_2020-01-10.csv")
     assert os.path.exists(cache_file)
 
     # Second call: cache hit, reads from cache_file
@@ -132,7 +132,57 @@ def test_cached_data_provider_caches_through_fetch_universe(temp_csv_dir):
     universe = cached_provider.fetch_universe(["SPY", "QQQ"], start="2020-01-01", end="2020-01-10")
     assert set(universe.keys()) == {"SPY", "QQQ"}
     for sym in ("SPY", "QQQ"):
-        assert os.path.exists(os.path.join(temp_csv_dir, f"{sym}_1d_2020-01-01_2020-01-10.csv"))
+        assert os.path.exists(os.path.join(temp_csv_dir, f"SyntheticDataProvider_{sym}_1d_2020-01-01_2020-01-10.csv"))
+
+
+def test_cached_data_provider_filename_includes_provider_class_name(temp_csv_dir):
+    # Regression test for a real correctness bug: this cache directory is
+    # shared workspace-wide across projects with DIFFERENT default providers.
+    # Two providers of different classes fetching the SAME symbol/interval/
+    # date-range against the SAME cache_dir must land in two distinct cache
+    # files, and each must only ever read back its own -- never the other's.
+    class OtherProvider(BaseDataProvider):
+        def fetch_ohlcv(self, symbol, start, end, interval="1d"):
+            idx = pd.bdate_range(start, end)
+            return pd.DataFrame(
+                {"Open": 999.0, "High": 999.0, "Low": 999.0, "Close": 999.0, "Volume": 1.0},
+                index=idx,
+            )
+
+    synthetic_cached = CachedDataProvider(SyntheticDataProvider(seed=42), cache_dir=temp_csv_dir)
+    other_cached = CachedDataProvider(OtherProvider(), cache_dir=temp_csv_dir)
+
+    df_synthetic = synthetic_cached.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
+    df_other = other_cached.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
+
+    assert os.path.exists(os.path.join(temp_csv_dir, "SyntheticDataProvider_SPY_1d_2020-01-01_2020-01-10.csv"))
+    assert os.path.exists(os.path.join(temp_csv_dir, "OtherProvider_SPY_1d_2020-01-01_2020-01-10.csv"))
+    assert not df_synthetic["Close"].eq(999.0).any()
+    assert df_other["Close"].eq(999.0).all()
+
+    # Re-fetching each must still read back its OWN cached file, not the other's.
+    df_synthetic_again = synthetic_cached.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
+    df_other_again = other_cached.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
+    pd.testing.assert_frame_equal(df_synthetic, df_synthetic_again, check_freq=False)
+    pd.testing.assert_frame_equal(df_other, df_other_again, check_freq=False)
+
+
+def test_load_ohlcv_threads_cache_max_age_days(temp_csv_dir):
+    with patch("common.data.CachedDataProvider") as mock_cached:
+        mock_cached.return_value.fetch_ohlcv.return_value = pd.DataFrame()
+        load_ohlcv("SPY", "2020-01-01", "2020-01-10", cache_dir=temp_csv_dir,
+                   provider="synthetic", cache_max_age_days=3)
+        _, kwargs = mock_cached.call_args
+        assert kwargs.get("cache_max_age_days") == 3
+
+
+def test_load_universe_threads_cache_max_age_days(temp_csv_dir):
+    with patch("common.data.CachedDataProvider") as mock_cached:
+        mock_cached.return_value.fetch_universe.return_value = {}
+        load_universe(["SPY"], "2020-01-01", "2020-01-10", cache_dir=temp_csv_dir,
+                      provider="synthetic", cache_max_age_days=5)
+        _, kwargs = mock_cached.call_args
+        assert kwargs.get("cache_max_age_days") == 5
 
 
 def test_synthetic_data_provider_is_reproducible_across_processes():
@@ -297,7 +347,7 @@ def test_cached_data_provider_default_unlimited_age_unchanged(temp_csv_dir):
             return super().fetch_ohlcv(symbol, start, end, interval)
 
     cached_provider = CachedDataProvider(CountingProvider(seed=42), cache_dir=temp_csv_dir)
-    cache_path = os.path.join(temp_csv_dir, "SPY_1d_2020-01-01_2020-01-10.csv")
+    cache_path = os.path.join(temp_csv_dir, "CountingProvider_SPY_1d_2020-01-01_2020-01-10.csv")
 
     cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
     assert calls["n"] == 1
@@ -321,7 +371,7 @@ def test_cached_data_provider_respects_max_age(temp_csv_dir):
     cached_provider = CachedDataProvider(
         CountingProvider(seed=42), cache_dir=temp_csv_dir, cache_max_age_days=1
     )
-    cache_path = os.path.join(temp_csv_dir, "SPY_1d_2020-01-01_2020-01-10.csv")
+    cache_path = os.path.join(temp_csv_dir, "CountingProvider_SPY_1d_2020-01-01_2020-01-10.csv")
 
     cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
     assert calls["n"] == 1
@@ -414,7 +464,7 @@ def test_yfinance_fetch_metadata_handles_info_returning_none(mock_ticker):
 def test_cached_data_provider_recovers_from_corrupt_cache_file(temp_csv_dir):
     inner_provider = SyntheticDataProvider(seed=42)
     cached_provider = CachedDataProvider(inner_provider, cache_dir=temp_csv_dir)
-    cache_path = os.path.join(temp_csv_dir, "SPY_1d_2020-01-01_2020-01-10.csv")
+    cache_path = os.path.join(temp_csv_dir, "SyntheticDataProvider_SPY_1d_2020-01-01_2020-01-10.csv")
 
     os.makedirs(temp_csv_dir, exist_ok=True)
     with open(cache_path, "w", encoding="utf-8") as f:

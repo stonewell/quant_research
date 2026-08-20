@@ -13,6 +13,7 @@ if _PROJECT_ROOT not in sys.path:
 
 import pytest
 
+from common import cli_utils
 from run_strategygen import _load_factor_report, build_arg_parser, main
 
 
@@ -183,6 +184,79 @@ def test_main_no_plots_skips_equity_curve_chart(mock_gen_cls, mock_load, mock_pl
             main()
 
         assert mock_plot.call_count == 0
+    finally:
+        os.remove(temp_path)
+
+
+def test_cache_ttl_days_arg_default_and_parsing():
+    """--cache-ttl-days is added automatically by add_data_provider_cli_args()
+    and must default to None, parsing to a float when supplied.
+    """
+    parser = build_arg_parser()
+
+    args = parser.parse_args([])
+    assert args.cache_ttl_days is None
+
+    args = parser.parse_args(["--cache-ttl-days", "7"])
+    assert args.cache_ttl_days == 7.0
+
+
+@patch("run_strategygen.load_universe_with_banner")
+@patch("run_strategygen.StrategyGenerator")
+def test_main_wires_shared_data_dir_and_cache_ttl(mock_gen_cls, mock_load):
+    """cache_dir passed to load_universe_with_banner must resolve via the
+    shared, repo-root-relative cache directory (common.cli_utils.shared_data_dir())
+    rather than a project-local path, and --cache-ttl-days must be threaded
+    through as cache_max_age_days -- now that the OHLCV cache is consolidated
+    workspace-wide.
+    """
+    mock_gen_instance = mock_gen_cls.return_value
+
+    class MockSpec:
+        n_symbols = 2
+        template_name = "test"
+        params = {}
+        universe_sharpe = 1.0
+        cagr = 0.10
+        max_drawdown = -0.05
+        calmar_ratio = 2.0
+        win_rate = 0.55
+        profit_factor = 1.5
+        total_turnover = 1.0
+        total_rebalances = 1
+        ers_passed = True
+        ers_percentile = 0.99
+        trusted = True
+        explanation = "test"
+        target_weights = pd.DataFrame()
+        factor_context = None
+        factor_tiebreak_used = False
+        equity_curve = pd.DataFrame(
+            {"equity": [100.0, 101.0, 102.0]}, index=pd.bdate_range("2020-01-01", periods=3)
+        )
+
+    mock_gen_instance.generate.return_value = MockSpec()
+
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json") as f:
+        json.dump({
+            "basket": ["TICKER1", "TICKER2"],
+            "method": "test",
+            "date_generated": "2026-07-21T10:00:00Z"
+        }, f)
+        temp_path = f.name
+
+    try:
+        test_args = [
+            "run_strategygen.py", "--universe-file", temp_path, "--mode", "generate",
+            "--cache-ttl-days", "3.5",
+        ]
+        with patch.object(sys, "argv", test_args):
+            main()
+
+        assert mock_load.call_count == 1
+        _, call_kwargs = mock_load.call_args
+        assert call_kwargs["cache_dir"] == cli_utils.shared_data_dir()
+        assert call_kwargs["cache_max_age_days"] == 3.5
     finally:
         os.remove(temp_path)
 

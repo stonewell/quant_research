@@ -61,6 +61,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "together with --baseline-symbol.")
     p.add_argument("--no-plots", action="store_true",
         help="backtester/strategy_generator --no-plots passthrough -- skip equity-curve charts.")
+    p.add_argument("--cache-ttl-days", type=float, default=None,
+        help="--cache-ttl-days passthrough to all 4 steps -- max age, in days, of a cached "
+             "OHLCV CSV file (shared across all 4 steps via <repo_root>/data/, see "
+             "common/README.md) before it's re-fetched. Default: None = never expire.")
     p.add_argument("--dry-run", action="store_true",
         help="Print the 4 resolved commands without executing anything.")
     return p
@@ -144,6 +148,10 @@ def main():
             step4_args += ["--baseline-template", args.baseline_template]
     if args.no_plots:
         step4_args.append("--no-plots")
+
+    if args.cache_ttl_days is not None:
+        for step_args in (step1_args, step2_args, step3_args, step4_args):
+            step_args += ["--cache-ttl-days", str(args.cache_ttl_days)]
 
     do_step(1, "research_strategy (factor research)", "research_strategy", step1_args)
     do_step(2, "instrument_selection (universe screening)", "instrument_selection", step2_args)

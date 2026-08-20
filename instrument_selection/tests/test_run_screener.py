@@ -6,8 +6,10 @@ see README/CLAUDE conventions)."""
 import numpy as np
 import pandas as pd
 
+from common.cli_utils import shared_data_dir
+from selectorbot import data as selectorbot_data
 from selectorbot.config import SelectionConfig
-from run_screener import build_arg_parser, select_basket
+from run_screener import DATA_DIR, build_arg_parser, select_basket
 
 
 def _make_scored(n=10):
@@ -25,6 +27,25 @@ def _make_scored(n=10):
     np.fill_diagonal(corr_arr, 1.0)
     corr = pd.DataFrame(corr_arr, index=symbols, columns=symbols)
     return scored, corr
+
+
+def test_data_dir_is_shared_workspace_wide_cache():
+    """After the OHLCV cache consolidation, run_screener.py and
+    selectorbot/data.py must both resolve their cache directory via the same
+    `shared_data_dir()` function, i.e. the literal same path."""
+    assert DATA_DIR == shared_data_dir()
+    assert selectorbot_data.DATA_DIR == shared_data_dir()
+    assert DATA_DIR == selectorbot_data.DATA_DIR
+
+
+def test_cache_ttl_days_defaults_to_none():
+    args = build_arg_parser().parse_args([])
+    assert args.cache_ttl_days is None
+
+
+def test_cache_ttl_days_parses_as_float():
+    args = build_arg_parser().parse_args(["--cache-ttl-days", "7"])
+    assert args.cache_ttl_days == 7.0
 
 
 def test_select_max_k_defaults_to_none():

@@ -29,9 +29,9 @@ from selectorbot import (
 from common.cli_utils import (
     add_data_provider_cli_args,
     build_data_kwargs,
-    default_data_dir,
     default_results_dir,
     load_universe_with_banner,
+    shared_data_dir,
 )
 from common.reporting import utc_timestamp
 from common.universe import add_universe_cli_args, resolve_universe_from_args
@@ -39,7 +39,7 @@ from selectorbot.config import SelectionConfig
 from selectorbot.data import fetch_fund_metadata
 
 RESULTS_DIR = default_results_dir(__file__)
-DATA_DIR = default_data_dir(__file__)  # matches selectorbot.data.DATA_DIR -- preserves this project's cache location
+DATA_DIR = shared_data_dir()  # same workspace-wide <repo_root>/data cache dir that selectorbot.data.DATA_DIR resolves to
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -117,7 +117,7 @@ def main():
 
     data = load_universe_with_banner(universe, config.start, config.end, config.interval,
                                       use_cache=not args.no_cache, cache_dir=DATA_DIR, data_kwargs=data_kwargs,
-                                      require_nonempty=False,
+                                      require_nonempty=False, cache_max_age_days=args.cache_ttl_days,
                                       loading_msg=f"Loading {len(universe)} symbols from {config.start} to {config.end} ...")
 
     rows = {}

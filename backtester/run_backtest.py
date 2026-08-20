@@ -31,9 +31,9 @@ from common.allocation_templates import ALLOCATION_TEMPLATES, PatternBasedAlloca
 from common.cli_utils import (
     add_data_provider_cli_args,
     build_data_kwargs,
-    default_data_dir,
     default_results_dir,
     load_universe_with_banner,
+    shared_data_dir,
 )
 from common.metrics import alpha_beta, deflated_sharpe_ratio, information_ratio, tracking_error
 from common import plotting
@@ -41,7 +41,7 @@ from common.reporting import write_json_report
 from common.universe import add_universe_cli_args, resolve_universe_from_args
 
 RESULTS_DIR = default_results_dir(__file__)
-DATA_DIR = default_data_dir(__file__)
+DATA_DIR = shared_data_dir()
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -68,7 +68,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--results-dir", type=str, default=None,
                    help=f"Override the output directory for equity/weights/report CSVs (default: {RESULTS_DIR})")
     p.add_argument("--cache-dir", type=str, default=None,
-                   help=f"Override the local OHLCV CSV cache directory (default: {DATA_DIR})")
+                   help=f"Override the shared, workspace-wide OHLCV CSV cache directory (default: {DATA_DIR})")
     p.add_argument("--no-plots", action="store_true",
                    help="Skip the equity-curve chart normally produced in --mode standard (charts are ON by default).")
     return p
@@ -312,6 +312,7 @@ def _run_baseline(args, cache_dir, data_kwargs):
         [args.baseline_symbol], args.start, args.end, args.interval,
         use_cache=not args.no_cache, cache_dir=cache_dir,
         data_kwargs=data_kwargs, require_nonempty=True,
+        cache_max_age_days=args.cache_ttl_days,
     )
 
     if args.mode == "standard":
@@ -401,7 +402,8 @@ def main():
 
     universe = load_universe_with_banner(universe_symbols, args.start, args.end, args.interval,
                                           use_cache=not args.no_cache, cache_dir=cache_dir,
-                                          data_kwargs=data_kwargs, require_nonempty=True)
+                                          data_kwargs=data_kwargs, require_nonempty=True,
+                                          cache_max_age_days=args.cache_ttl_days)
 
     os.makedirs(results_dir, exist_ok=True)
 

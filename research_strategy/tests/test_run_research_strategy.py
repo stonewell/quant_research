@@ -14,7 +14,30 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+from common import cli_utils
 from research_strategy import run_research_strategy as rrs
+
+
+def test_data_dir_uses_shared_data_dir():
+    """DATA_DIR must resolve via the shared, repo-root-relative cache
+    directory (common.cli_utils.shared_data_dir()) rather than a
+    project-local path, now that the OHLCV cache is consolidated
+    workspace-wide.
+    """
+    assert rrs.DATA_DIR == cli_utils.shared_data_dir()
+
+
+def test_cache_ttl_days_arg_default_and_parsing():
+    """--cache-ttl-days is added automatically by add_data_provider_cli_args()
+    and must default to None, parsing to a float when supplied.
+    """
+    parser = rrs.build_arg_parser()
+
+    args = parser.parse_args([])
+    assert args.cache_ttl_days is None
+
+    args = parser.parse_args(["--cache-ttl-days", "7"])
+    assert args.cache_ttl_days == 7.0
 
 
 # Every DEFAULT_UNIVERSE_SYMBOLS ticker except "SCZ" -- AcceleratingDualMomentum

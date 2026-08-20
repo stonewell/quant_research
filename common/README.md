@@ -102,6 +102,25 @@ feature table (see that project's README) and by `common.allocation_templates.Pa
 — the SAME dispatch backs both, deliberately, so a mined threshold is tested and later traded
 against an identical computation.
 
+## 7. Shared OHLCV cache directory
+
+Every project's `run_*.py` resolves its `--cache-dir`/`DATA_DIR` default via
+`common.cli_utils.shared_data_dir()`, which always resolves to a single `<repo_root>/data/`
+directory regardless of which project calls it — a symbol/interval/date-range fetched by one
+project is reused by all the others instead of being downloaded/cached separately per project.
+
+`common.data.CachedDataProvider` names each cache file `{ProviderClassName}_{symbol}_{interval}_
+{start}_{end}.csv` (e.g. `YFinanceDataProvider_SPY_1d_2015-01-01_2024-12-31.csv`). The provider-class
+prefix is load-bearing, not cosmetic: `research_strategy` defaults to `--data-provider synthetic`
+while the other 3 projects default to `--data-provider yfinance`, so without it, two projects
+requesting the "same" symbol/interval/date-range from different providers against this shared
+directory would silently read back each other's (wrong-provider) cached data.
+
+A cache entry never expires by default (`cache_max_age_days=None`, `CachedDataProvider`'s
+constructor default) — every `run_*.py`'s `--cache-ttl-days` flag (added via
+`add_data_provider_cli_args`, so its name/behavior is identical across all 4 projects and
+`run_pipeline.py`'s passthrough) opts into re-fetching a cached file older than N days instead.
+
 ---
 
 ## Cross-reference index

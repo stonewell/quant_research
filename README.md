@@ -52,6 +52,11 @@ flowchart TD
     end
 ```
 
+All 4 stages also share a single OHLCV cache directory at `data/` (repo root) — a symbol/interval/
+date-range fetched by one stage is reused by every other stage instead of being re-downloaded and
+cached separately per project. See `common/README.md`'s "Shared OHLCV cache directory" section for
+the cache filename convention and the `--cache-ttl-days` staleness knob.
+
 ---
 
 ## Setup & Environment
@@ -180,6 +185,10 @@ uv run python run_pipeline.py --universe SPY QQQ IWM EFA EEM GLD TLT --data-prov
 # Faster run: skip the equity-curve charts step 3/4 would otherwise write
 uv run python run_pipeline.py --universe SPY QQQ IWM EFA EEM GLD TLT --data-provider synthetic --no-plots
 
+# Treat the shared data/ cache as stale after 1 day (useful for a rolling/live --end date;
+# irrelevant for a fixed historical range, which never goes stale)
+uv run python run_pipeline.py --universe SPY QQQ IWM EFA EEM GLD TLT --data-provider synthetic --cache-ttl-days 1
+
 # A real end-to-end run against real market data (only pass --data-provider yfinance
 # deliberately -- every other example above defaults to synthetic per this workspace's
 # no-real-market-data-by-default convention)
@@ -294,3 +303,4 @@ uv run pytest common/tests -v
 | `strategy_generator/` | Grid-searches allocation templates & mined indicator patterns to generate validated strategies | `strategy_generator/run_strategygen.py` | `strategy_generator/README.md` |
 | `backtester/` | Standalone CLI evaluating fixed strategy files over single or rolling walkforward windows | `backtester/run_backtest.py` | `backtester/README.md`, `backtester/SCHEMAS.md` |
 | `run_pipeline.py` | Chains all 4 pipeline steps end-to-end via subprocess, auto-wiring each step's output into the next | `run_pipeline.py` | This README |
+| `data/` | Shared OHLCV cache directory, written/read by all 4 stages (provider-aware filenames, optional `--cache-ttl-days` staleness) | N/A (cache, not code) | `common/README.md` §7 |
