@@ -108,6 +108,15 @@ The configuration supports two strategy entry types:
 2. **Class-based Strategies (`"type": "class"`)**:
    Specifies `"class_name"` mapped to python strategy implementations (`rs/strategy.py`).
 
+`rs/strategy.py`'s `instantiate_strategy_from_config_entry()` — the single source of truth for
+building a strategy instance from an entry, reused directly by `strategy_generator` and
+`backtester` — validates each entry and raises a clear `ValueError` (naming the entry key) rather
+than silently misbehaving: a `"natural_language"` entry with a missing or blank (including
+whitespace-only) `"plain_english_description"` is rejected instead of silently falling through to
+a generic default strategy, a `"class"` entry with a missing/empty `"class_name"` is rejected, and
+an `entry_data` that isn't a dict (e.g. `None`, a list) is rejected up front instead of raising a
+confusing `AttributeError` deep inside the function.
+
 Example structure:
 ```json
 {

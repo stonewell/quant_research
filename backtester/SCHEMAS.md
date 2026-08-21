@@ -24,7 +24,10 @@ this works uniformly for both `type: "class"` and `type: "natural_language"` ent
 BOTH `--mode standard` and `--mode walkforward` (the reconstructed instance's `warmup_bars()` is
 honored during walk-forward fold buffering exactly like any other template's). `pattern_spec` and
 `research_strategy_spec` are mutually exclusive — a winning strategy.json only ever carries one of
-the two (or neither, for a plain static template).
+the two (or neither, for a plain static template). `_load_strategy_file()` enforces this: a
+`strategy.json` with BOTH blocks non-`null` raises a `ValueError` naming both fields, rather than
+silently letting `_get_template()`'s research_strategy_spec-checked-first precedence quietly ignore
+`pattern_spec`.
 
 ## Outputs
 
@@ -77,7 +80,14 @@ Field set differs by mode:
 **`--mode walkforward`:** `baseline_symbol` (str), `baseline_template` (str), `baseline_params`
 (dict), `mean_baseline_sharpe_ratio`, `mean_baseline_cagr` (means of the merged
 `walkforward_report.csv` baseline columns), `mean_outperformance_cagr` (mean of the merged
-`outperformance` column).
+`outperformance` column), `baseline_calendar_mismatch` (bool). The strategy's and baseline's fold
+lists are joined on `(start_date, end_date)`, not row position (see `walkforward_report.csv` above);
+if BOTH fold lists are non-empty but the join matched zero rows (e.g. because one of the main
+`--universe` symbols has a shorter history than `--baseline-symbol`, shifting every fold's aligned
+start/end date), every `baseline_*`/`outperformance` value is silently `NaN` end-to-end unless you
+know to look — `baseline_calendar_mismatch` is `true` in exactly that degenerate case (and a
+console `WARNING:` is also printed), so the report is self-diagnosing instead of just full of
+unexplained nulls. `false` in the normal case, including when only *some* folds fail to match.
 
 ### `results/walkforward_summary.json` (`--mode walkforward`, always written)
 
@@ -119,15 +129,19 @@ silently trusting the strategy file's original params. Fields:
   actual equity curve/weights use `backtest_equity.csv`/`backtest_weights.csv` instead, which
   always reflect whichever params (`best_params` or the `original_params` fallback) the final run
   actually used).
-- **`--mode walkforward`:** `sharpe_ratio` (mean across finite-Sharpe folds, `-inf` if every fold
-  was non-finite), `total_rebalances`/`total_turnover` (summed across folds), and `folds` (the full
-  per-fold list `run_walkforward()` returns, same shape as `walkforward_report.csv`'s rows). No
-  `cagr` key at this level, so `improvement.cagr` is always `null` in `--mode walkforward`.
+- **`--mode walkforward`:** `sharpe_ratio`, `cagr`, `max_drawdown`, `calmar_ratio` (each the mean
+  across that metric's finite-valued folds, `float`; `sharpe_ratio` is `-inf` if every fold was
+  non-finite, the other three are `NaN` in that case), `total_rebalances`/`total_turnover` (summed
+  across folds), and `folds` (the full per-fold list `run_walkforward()` returns, same shape as
+  `walkforward_report.csv`'s rows). `improvement.cagr` (mean-fold `cagr` of `best_result` minus
+  `original_result`) is therefore a real number in `--mode walkforward` too, not always `null`.
 
-Regardless of `status`, the backtest that runs immediately after (and therefore
-`backtest_equity.csv`/`backtest_weights.csv`/`walkforward_report.csv`/everything else this file
-documents) uses `best_params` on success or `original_params` on failure -- `--optimize` never
-produces no output, even when tuning doesn't pass validation.
+Regardless of `status`, the backtest reflected in `backtest_equity.csv`/`backtest_weights.csv`/
+`walkforward_report.csv`/everything else this file documents corresponds to `best_params` on
+success or `original_params` on failure -- `--optimize` never produces no output, even when tuning
+doesn't pass validation. That result is `best_result`/`original_result` above reused directly
+(`score_fn(template, params)` already computed it during the grid search/original scoring), not a
+second, redundant `run_standard`/`run_walkforward` call.
 
 ### `results/equity_curve.png` (`--mode standard`, unless `--no-plots`)
 

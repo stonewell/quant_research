@@ -1599,6 +1599,10 @@ def instantiate_strategy_from_config_entry(entry_key: str, entry_data: dict):
     for "given a strategies_config.json key, build the exact instance
     research_strategy's own CLI would" -- reused as-is by any external
     consumer instead of reimplementing per-type reconstruction."""
+    if not isinstance(entry_data, dict):
+        raise ValueError(
+            f"Strategy '{entry_key}': entry_data must be a dict, got {type(entry_data).__name__}"
+        )
     strat_type = entry_data.get("type", "class")
     params = entry_data.get("parameters", {})
     try:
@@ -1608,6 +1612,10 @@ def instantiate_strategy_from_config_entry(entry_key: str, entry_data: dict):
 
     if strat_type == "natural_language":
         plain_english = entry_data.get("plain_english_description", "")
+        if not plain_english or not plain_english.strip():
+            raise ValueError(
+                f"Strategy '{entry_key}' has type 'natural_language' but no 'plain_english_description' key"
+            )
         name = entry_data.get("name", entry_key)
         spec = parse_plain_english_strategy(plain_english, name=name)
         return NaturalLanguageStrategy(spec, config=cfg)

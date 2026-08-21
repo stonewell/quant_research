@@ -34,6 +34,8 @@ from typing import Callable, Optional
 import numpy as np
 import pandas as pd
 
+from common.allocation_templates import AllocationTemplate
+
 ScoreFn = Callable[[object, dict], dict]
 
 
@@ -74,14 +76,37 @@ def random_weights(universe: dict, rebalance_freq_days: int, rng: np.random.Gene
     return weights_df
 
 
-class RandomAllocationTemplate:
-    """A dummy template used purely for the ERS check."""
+class RandomAllocationTemplate(AllocationTemplate):
+    """A dummy template used purely for the ERS check. Subclasses
+    `AllocationTemplate` (rather than staying a bare standalone class) so it
+    automatically inherits the full template protocol -- `name`,
+    `param_grid`, `factor_tags`, `generate_weights`, `explain_weights`,
+    `warmup_bars` -- and any future addition to that protocol, instead of
+    silently missing a member a future caller happens to need. This is the
+    exact same latent-bug shape as `warmup_bars` below: `backtester.
+    run_walkforward` calling it unconditionally and finding it absent used
+    to raise `AttributeError`, which `_safe_score` would catch and silently
+    degrade to `-inf` instead of failing loudly.
+
+    `__init__` keeps its original single-`rng`-argument signature (not the
+    base dataclass's `(name, param_grid, factor_tags)`) since every existing
+    call site constructs this with just `RandomAllocationTemplate(rng)` --
+    the base class's fields are supplied internally instead, hardcoded to
+    this template's own fixed identity.
+    """
 
     def __init__(self, rng: np.random.Generator):
+        super().__init__(name="random_allocation", param_grid={}, factor_tags=[])
         self.rng = rng
 
     def generate_weights(self, universe: dict, params: dict) -> pd.DataFrame:
         return random_weights(universe, params["rebalance_freq_days"], self.rng)
+
+    def explain_weights(self, params: dict) -> str:
+        return (
+            f"Random-weight portfolio (ERS null comparison), rebalanced every "
+            f"{params.get('rebalance_freq_days', '?')} trading days."
+        )
 
     def warmup_bars(self, params: dict) -> int:
         """Random weights have no indicator to warm up -- 0, matching
@@ -127,6 +152,16 @@ def grid_search_template(template, score_fn: ScoreFn) -> list:
             "result": result,
             "score": result.get("sharpe_ratio", float("-inf")),
         })
+
+    if len(trials) > 0 and all(t["score"] == float("-inf") for t in trials):
+        warnings.warn(
+            f"grid_search_template: ALL {len(trials)} trials for template "
+            f"'{getattr(template, 'name', template)}' returned -inf -- this usually means "
+            f"score_fn itself is broken (a bug, not just bad candidates), not that every "
+            f"parameter combination is genuinely bad. Check the individual per-trial warnings "
+            f"above for the actual exception(s).",
+            category=RuntimeWarning,
+        )
     return trials
 
 
@@ -157,6 +192,17 @@ def run_ers_validation(params: dict, best_score: float, best_result: dict, score
         s = res.get("sharpe_ratio", float("-inf"))
         if np.isfinite(s):
             random_scores.append(s)
+
+    if n_random_search > 0 and not random_scores:
+        warnings.warn(
+            f"run_ers_validation: ALL {n_random_search} random-portfolio draws returned "
+            f"-inf/non-finite -- the random comparison pool is EMPTY. This usually means "
+            f"score_fn itself is broken (a bug, not that every random draw was genuinely bad), "
+            f"not a normal 'candidate didn't beat the random pool' outcome. Check the "
+            f"individual per-trial warnings above for the actual exception(s). Falling back to "
+            f"the fail-safe ers_percentile=0.0 (untrusted).",
+            category=RuntimeWarning,
+        )
 
     ers_percentile = float((np.array(random_scores) < best_score).mean()) if random_scores else 0.0
     ers_passed = ers_percentile >= ers_percentile_threshold

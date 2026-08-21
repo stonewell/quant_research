@@ -805,6 +805,60 @@ def test_instantiate_strategy_invalid_params_names_the_strategy_key():
         )
 
 
+def test_instantiate_strategy_missing_plain_english_description_gives_clear_error():
+    with pytest.raises(ValueError, match="no 'plain_english_description' key"):
+        instantiate_strategy_from_config_entry(
+            "bad_nl_entry", {"type": "natural_language", "parameters": {}}
+        )
+
+
+def test_instantiate_strategy_empty_plain_english_description_gives_clear_error():
+    with pytest.raises(ValueError, match="no 'plain_english_description' key"):
+        instantiate_strategy_from_config_entry(
+            "bad_nl_entry",
+            {"type": "natural_language", "plain_english_description": "", "parameters": {}},
+        )
+
+
+def test_instantiate_strategy_whitespace_plain_english_description_gives_clear_error():
+    with pytest.raises(ValueError, match="no 'plain_english_description' key"):
+        instantiate_strategy_from_config_entry(
+            "bad_nl_entry",
+            {"type": "natural_language", "plain_english_description": "   ", "parameters": {}},
+        )
+
+
+def test_instantiate_strategy_valid_plain_english_description_still_works():
+    text = "Rebalance weekly. Select top 2 assets from SPY, QQQ, GLD, TLT with Close > 50d SMA. Allocate equally."
+    strat = instantiate_strategy_from_config_entry(
+        "good_nl_entry",
+        {"type": "natural_language", "plain_english_description": text, "parameters": {}},
+    )
+    universe = create_mock_universe(n_days=250)
+    weights = strat.generate_weights(universe)
+    assert not weights.empty
+
+    rebal_dates = weights.dropna(how="all").index
+    last_rebal = rebal_dates[-1]
+    active_weights = weights.loc[last_rebal][weights.loc[last_rebal] > 0]
+    assert len(active_weights) <= 2
+
+
+def test_instantiate_strategy_entry_data_none_gives_clear_error():
+    with pytest.raises(ValueError, match="bad_entry"):
+        instantiate_strategy_from_config_entry("bad_entry", None)
+
+
+def test_instantiate_strategy_entry_data_not_a_dict_gives_clear_error():
+    with pytest.raises(ValueError, match="bad_entry"):
+        instantiate_strategy_from_config_entry("bad_entry", ["not", "a", "dict"])
+
+
+def test_instantiate_strategy_missing_type_defaults_to_class():
+    with pytest.raises(ValueError, match="no 'class_name' key"):
+        instantiate_strategy_from_config_entry("bad_entry", {})
+
+
 def test_instantiate_strategies_from_json_config():
     config = load_strategies_config()
     for key, entry in config.items():

@@ -30,6 +30,11 @@ def test_build_arg_parser_defaults():
     assert args.baseline_symbol is None
     assert args.no_plots is False
     assert args.cache_ttl_days is None
+    assert args.research_strategy is None
+    assert args.optimize is False
+    assert args.n_random_search is None
+    assert args.ers_percentile_threshold is None
+    assert args.min_rebalances_for_trust is None
     assert args.dry_run is False
 
 
@@ -127,6 +132,58 @@ def test_mine_patterns_and_baseline_flags_passthrough_only_when_set(monkeypatch,
     assert "--mine-patterns" in argv_step3
     assert "--baseline-symbol" in argv_step4 and "SPY" in argv_step4
     assert "--baseline-template" in argv_step4 and "equal_weight" in argv_step4
+
+
+def test_research_strategy_and_optimize_flags_passthrough_only_when_set(monkeypatch, tmp_path):
+    monkeypatch.setattr(run_pipeline, "RESULTS_DIR", str(tmp_path))
+
+    # First run: neither flag set.
+    monkeypatch.setattr(sys, "argv", ["run_pipeline.py"])
+    mock_run = MagicMock(return_value=_fake_result(returncode=0, stderr=""))
+    monkeypatch.setattr(run_pipeline.subprocess, "run", mock_run)
+    run_pipeline.main()
+
+    for call in mock_run.call_args_list:
+        argv = call.args[0]
+        assert "--research-strategy" not in argv
+        assert "--optimize" not in argv
+        assert "--n-random-search" not in argv
+        assert "--ers-percentile-threshold" not in argv
+        assert "--min-rebalances-for-trust" not in argv
+
+    # Second run: both flags set, with optimize's own sub-flags.
+    monkeypatch.setattr(sys, "argv", [
+        "run_pipeline.py", "--research-strategy", "baa_keller", "adaptive_grid",
+        "--optimize", "--n-random-search", "50", "--ers-percentile-threshold", "0.8",
+        "--min-rebalances-for-trust", "2",
+    ])
+    mock_run2 = MagicMock(return_value=_fake_result(returncode=0, stderr=""))
+    monkeypatch.setattr(run_pipeline.subprocess, "run", mock_run2)
+    run_pipeline.main()
+
+    calls = mock_run2.call_args_list
+    argv_step3 = calls[2].args[0]
+    argv_step4 = calls[3].args[0]
+
+    assert "--research-strategy" in argv_step3 and "baa_keller" in argv_step3 and "adaptive_grid" in argv_step3
+    assert "--optimize" in argv_step4
+    assert "--n-random-search" in argv_step4 and "50" in argv_step4
+    assert "--ers-percentile-threshold" in argv_step4 and "0.8" in argv_step4
+    assert "--min-rebalances-for-trust" in argv_step4 and "2" in argv_step4
+
+
+def test_optimize_sub_flags_omitted_when_optimize_not_set(monkeypatch, tmp_path):
+    # --n-random-search etc. should never be forwarded without --optimize itself,
+    # even if a user passes them without the parent flag (nonsensical but should
+    # not silently leak into backtester's argv).
+    monkeypatch.setattr(run_pipeline, "RESULTS_DIR", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["run_pipeline.py", "--n-random-search", "50"])
+    mock_run = MagicMock(return_value=_fake_result(returncode=0, stderr=""))
+    monkeypatch.setattr(run_pipeline.subprocess, "run", mock_run)
+    run_pipeline.main()
+
+    argv_step4 = mock_run.call_args_list[3].args[0]
+    assert "--n-random-search" not in argv_step4
 
 
 def test_cache_ttl_days_passthrough_only_when_set(monkeypatch, tmp_path):

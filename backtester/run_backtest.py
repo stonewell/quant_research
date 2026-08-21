@@ -201,6 +201,15 @@ def _load_strategy_file(path: str) -> dict:
                 f"must be a JSON object, got {type(research_strategy_spec['entry_data']).__name__}."
             )
 
+    if pattern_spec is not None and research_strategy_spec is not None:
+        raise ValueError(
+            f"Malformed strategy file '{path}': 'pattern_spec' and 'research_strategy_spec' "
+            f"are mutually exclusive -- a strategy.json can only have come from one source "
+            f"(pattern mining OR a research_strategy search winner), never both. "
+            f"_get_template checks research_strategy_spec first, so pattern_spec would be "
+            f"silently ignored; refusing instead of guessing which one this file actually means."
+        )
+
     return strategy_def
 
 
@@ -343,10 +352,23 @@ def _walkforward_score_fn(universe, args):
         folds = run_walkforward(universe, template, params, args)
         sharpes = [f["sharpe_ratio"] for f in folds if np.isfinite(f["sharpe_ratio"])]
         mean_sharpe = float(np.mean(sharpes)) if sharpes else float("-inf")
+        # Mean-fold reductions for cagr/max_drawdown/calmar_ratio, same
+        # convention as sharpe_ratio above -- cagr in particular is needed so
+        # main()'s optimize_report.json "improvement.cagr" (best_result.cagr
+        # - original_result.cagr) isn't always NaN-minus-NaN under
+        # --mode walkforward (neither dict used to carry a "cagr" key at all).
+        cagrs = [f["cagr"] for f in folds if np.isfinite(f["cagr"])]
+        mean_cagr = float(np.mean(cagrs)) if cagrs else float("nan")
+        max_drawdowns = [f["max_drawdown"] for f in folds if np.isfinite(f["max_drawdown"])]
+        mean_max_drawdown = float(np.mean(max_drawdowns)) if max_drawdowns else float("nan")
+        calmar_ratios = [f["calmar_ratio"] for f in folds if np.isfinite(f["calmar_ratio"])]
+        mean_calmar_ratio = float(np.mean(calmar_ratios)) if calmar_ratios else float("nan")
         total_rebalances = sum(f.get("total_rebalances", 0) for f in folds)
         total_turnover = sum(f.get("total_turnover", 0.0) for f in folds)
         return {
-            "sharpe_ratio": mean_sharpe, "total_rebalances": total_rebalances,
+            "sharpe_ratio": mean_sharpe, "cagr": mean_cagr,
+            "max_drawdown": mean_max_drawdown, "calmar_ratio": mean_calmar_ratio,
+            "total_rebalances": total_rebalances,
             "total_turnover": total_turnover, "folds": folds,
         }
     return score_fn
@@ -424,11 +446,21 @@ def _compute_standard_comparison(result: dict, baseline_result: dict) -> dict:
     }
 
 
-def _merge_baseline_folds(folds_df: pd.DataFrame, baseline_folds_df: pd.DataFrame) -> pd.DataFrame:
+def _merge_baseline_folds(folds_df: pd.DataFrame, baseline_folds_df: pd.DataFrame) -> tuple:
     """LEFT-JOIN by (start_date, end_date) columns, NOT row position -- the
     two fold sets are computed from independent bar-position arithmetic over
     independently-loaded calendars and are not guaranteed to align row-for-
-    row."""
+    row.
+
+    Returns `(merged_df, baseline_calendar_mismatch)`. `baseline_calendar_mismatch`
+    is True iff BOTH fold lists are non-empty but the join matched zero rows
+    (every baseline_* column came back all-NaN) -- almost always because the
+    main universe's aligned calendar and --baseline-symbol's calendar cover
+    different date ranges (e.g. one of the main --universe symbols has a
+    shorter history than --baseline-symbol, shifting every fold's start/end
+    date), silently producing an all-NaN baseline comparison with no other
+    signal that anything went wrong. Does NOT change the join logic itself --
+    date-based joining is still correct in the normal (calendar-aligned) case."""
     renamed = baseline_folds_df[["start_date", "end_date", "sharpe_ratio", "cagr", "max_drawdown", "calmar_ratio"]].rename(
         columns={
             "sharpe_ratio": "baseline_sharpe_ratio",
@@ -439,7 +471,22 @@ def _merge_baseline_folds(folds_df: pd.DataFrame, baseline_folds_df: pd.DataFram
     )
     merged = folds_df.merge(renamed, on=["start_date", "end_date"], how="left")
     merged["outperformance"] = merged["cagr"] - merged["baseline_cagr"]
-    return merged
+
+    baseline_calendar_mismatch = bool(
+        not folds_df.empty and not baseline_folds_df.empty
+        and merged["baseline_sharpe_ratio"].notna().sum() == 0
+    )
+    if baseline_calendar_mismatch:
+        print(
+            "WARNING: baseline comparison matched ZERO overlapping (start_date, end_date) "
+            "fold windows between the main universe and --baseline-symbol, even though both "
+            "produced folds -- every baseline_* column and 'outperformance' below will be NaN. "
+            "This almost always means the main universe and --baseline-symbol have different "
+            "effective trading calendars (e.g. one of the main --universe symbols has a shorter "
+            "history than --baseline-symbol). Check each symbol's actual date range/history."
+        )
+
+    return merged, baseline_calendar_mismatch
 
 
 def main():
@@ -477,6 +524,14 @@ def main():
                                           cache_max_age_days=args.cache_ttl_days)
 
     os.makedirs(results_dir, exist_ok=True)
+
+    # Populated inside the --optimize block below with whichever of
+    # original_result/opt["best_result"] ends up matching the final `params`
+    # -- reused as-is by the mode branches below instead of re-running
+    # run_standard/run_walkforward a second time for a result already in
+    # hand. Stays None (no reuse, zero behavior change) when --optimize
+    # isn't set.
+    reused_result = None
 
     if args.optimize:
         optimize_template_instance = _get_template(template_name, pattern_spec, research_strategy_spec)
@@ -523,13 +578,29 @@ def main():
             print(f"  Tuned params {params} -> {opt['best_params']} "
                   f"(Sharpe {original_sharpe:.2f} -> {best_sharpe:.2f}, ERS percentile {opt['ers_percentile']:.2f})")
             params = opt["best_params"]
+            # opt["best_result"] is score_fn(optimize_template_instance, best_params)'s
+            # result -- for standard mode that IS run_standard's own return
+            # value verbatim (_standard_score_fn's score_fn just returns it),
+            # and for walkforward mode its "folds" key IS run_walkforward's
+            # own return value verbatim (_walkforward_score_fn's score_fn
+            # passes it through unmodified) -- so re-running run_standard/
+            # run_walkforward below for these exact same (template, params)
+            # would just recompute an answer already in hand.
+            reused_result = opt["best_result"]
         else:
             print(f"  Tuning did NOT pass validation ({reason}) -- falling back to original params {params}.")
+            # Same reuse argument as above, but for original_result (already
+            # score_fn(optimize_template_instance, params)'s result for
+            # these exact original params).
+            reused_result = original_result
         print(f"Saved optimize report to {optimize_report_path}")
 
     if args.mode == "standard":
         print("\n=== Running Standard Backtest ===")
-        result = run_standard(universe, _get_template(template_name, pattern_spec, research_strategy_spec), params, args)
+        if reused_result is not None:
+            result = reused_result
+        else:
+            result = run_standard(universe, _get_template(template_name, pattern_spec, research_strategy_spec), params, args)
 
         print(format_backtest_metrics_summary(result))
         print(f"Total Rebalances: {result['total_rebalances']}")
@@ -594,15 +665,19 @@ def main():
         print(f"\n=== Running Walkforward Rolling Evaluation ===")
         print(f"Window: {args.window_years} years, Step: {args.step_years} years")
 
-        folds = run_walkforward(universe, _get_template(template_name, pattern_spec, research_strategy_spec), params, args)
+        if reused_result is not None:
+            folds = reused_result["folds"]
+        else:
+            folds = run_walkforward(universe, _get_template(template_name, pattern_spec, research_strategy_spec), params, args)
 
         folds_df = pd.DataFrame(folds)
 
         baseline_params = None
+        baseline_calendar_mismatch = False
         if args.baseline_symbol:
             baseline_folds, baseline_params = _run_baseline(args, cache_dir, data_kwargs)
             baseline_folds_df = pd.DataFrame(baseline_folds)
-            folds_df = _merge_baseline_folds(folds_df, baseline_folds_df)
+            folds_df, baseline_calendar_mismatch = _merge_baseline_folds(folds_df, baseline_folds_df)
 
         print("\nRolling Windows Performance:")
         print(folds_df.to_string(index=False))
@@ -655,6 +730,7 @@ def main():
                 "mean_baseline_sharpe_ratio": float(folds_df["baseline_sharpe_ratio"].mean()),
                 "mean_baseline_cagr": float(folds_df["baseline_cagr"].mean()),
                 "mean_outperformance_cagr": float(folds_df["outperformance"].mean()),
+                "baseline_calendar_mismatch": baseline_calendar_mismatch,
             }
             comparison_report_path = os.path.join(results_dir, "comparison_report.json")
             write_json_report(comparison_report, comparison_report_path)

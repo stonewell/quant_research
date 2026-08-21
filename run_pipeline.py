@@ -52,6 +52,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="instrument_selection --select-max-k passthrough (step 2).")
     p.add_argument("--mine-patterns", action="store_true",
         help="strategy_generator --mine-patterns passthrough (step 3).")
+    p.add_argument("--research-strategy", nargs="+", default=None, metavar="STRATEGY_KEY",
+        help="strategy_generator --research-strategy passthrough (step 3) -- include one or "
+             "more research_strategy strategies (by strategies_config.json key, e.g. "
+             "'baa_keller') as additional candidate templates.")
     p.add_argument("--mode", choices=["standard", "walkforward"], default="standard",
         help="backtester --mode passthrough (step 4).")
     p.add_argument("--baseline-symbol", default=None,
@@ -59,6 +63,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--baseline-template", default=None,
         help="backtester --baseline-template passthrough (step 4); only meaningful "
              "together with --baseline-symbol.")
+    p.add_argument("--optimize", action="store_true",
+        help="backtester --optimize passthrough (step 4) -- grid-search the winning "
+             "strategy's params on the final universe and Equivalent-Random-Search-validate "
+             "the result before the final backtest.")
+    p.add_argument("--n-random-search", type=int, default=None,
+        help="backtester --n-random-search passthrough (step 4); only meaningful together "
+             "with --optimize. Omit for backtester's own default (200).")
+    p.add_argument("--ers-percentile-threshold", type=float, default=None,
+        help="backtester --ers-percentile-threshold passthrough (step 4); only meaningful "
+             "together with --optimize. Omit for backtester's own default (0.90).")
+    p.add_argument("--min-rebalances-for-trust", type=int, default=None,
+        help="backtester --min-rebalances-for-trust passthrough (step 4); only meaningful "
+             "together with --optimize. Omit for backtester's own default (4).")
     p.add_argument("--no-plots", action="store_true",
         help="backtester/strategy_generator --no-plots passthrough -- skip equity-curve charts.")
     p.add_argument("--cache-ttl-days", type=float, default=None,
@@ -137,6 +154,8 @@ def main():
                   "--mode", "generate", "--data-provider", args.data_provider]
     if args.mine_patterns:
         step3_args.append("--mine-patterns")
+    if args.research_strategy:
+        step3_args += ["--research-strategy", *args.research_strategy]
     if args.no_plots:
         step3_args.append("--no-plots")
 
@@ -148,6 +167,14 @@ def main():
             step4_args += ["--baseline-template", args.baseline_template]
     if args.no_plots:
         step4_args.append("--no-plots")
+    if args.optimize:
+        step4_args.append("--optimize")
+        if args.n_random_search is not None:
+            step4_args += ["--n-random-search", str(args.n_random_search)]
+        if args.ers_percentile_threshold is not None:
+            step4_args += ["--ers-percentile-threshold", str(args.ers_percentile_threshold)]
+        if args.min_rebalances_for_trust is not None:
+            step4_args += ["--min-rebalances-for-trust", str(args.min_rebalances_for_trust)]
 
     if args.cache_ttl_days is not None:
         for step_args in (step1_args, step2_args, step3_args, step4_args):

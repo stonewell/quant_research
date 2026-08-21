@@ -189,6 +189,11 @@ uv run python run_pipeline.py --universe SPY QQQ IWM EFA EEM GLD TLT --data-prov
 # irrelevant for a fixed historical range, which never goes stale)
 uv run python run_pipeline.py --universe SPY QQQ IWM EFA EEM GLD TLT --data-provider synthetic --cache-ttl-days 1
 
+# Blend in research_strategy strategies as additional candidates (step 3), and grid-search +
+# ERS-validate the winner's params on this universe before the final backtest (step 4)
+uv run python run_pipeline.py --universe SPY QQQ IWM EFA EEM GLD TLT --data-provider synthetic \
+  --research-strategy baa_keller adaptive_grid --optimize --n-random-search 100
+
 # A real end-to-end run against real market data (only pass --data-provider yfinance
 # deliberately -- every other example above defaults to synthetic per this workspace's
 # no-real-market-data-by-default convention)
@@ -267,9 +272,14 @@ Exported strategy specification consumed directly by `backtester` via `--strateg
   "ers_percentile": 0.94,
   "factor_context": null,
   "factor_tiebreak_used": false,
-  "pattern_spec": null
+  "pattern_spec": null,
+  "research_strategy_spec": null
 }
 ```
+
+`pattern_spec` and `research_strategy_spec` are mutually exclusive — non-null only when the winner came
+from `--mine-patterns` or `--research-strategy` respectively (see `strategy_generator/README.md`'s
+"Data Shapes & Schemas" section for both fields' full schemas).
 
 ---
 

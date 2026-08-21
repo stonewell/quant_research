@@ -4,11 +4,12 @@ Shared code used by every project in this workspace (`backtester`, `instrument_s
 `research_strategy`, `strategy_generator`): market data loading (`data.py`), universe resolution
 (`universe.py`), technical indicators (`indicators.py`, `indicator_features.py`), the Hurst
 exponent (`hurst.py`), performance metrics (`metrics.py`), the portfolio allocation backtester
-(`allocation_backtester.py`) and its templates (`allocation_templates.py`), the shared factor
-taxonomy (`factor_taxonomy.py`), rebalance scheduling (`scheduling.py`), synthetic-data test
-generators (`testing.py`), shared CLI scaffolding for every `run_*.py` entrypoint (`cli_utils.py`),
-shared output-writing conventions (`reporting.py`), shared shuffle/placebo-null significance
-testing primitives (`significance.py`), and shared chart generation (`plotting.py`).
+(`allocation_backtester.py`) and its templates (`allocation_templates.py`), shared grid-search +
+Equivalent Random Search validation (`allocation_search.py`), the shared factor taxonomy
+(`factor_taxonomy.py`), rebalance scheduling (`scheduling.py`), synthetic-data test generators
+(`testing.py`), shared CLI scaffolding for every `run_*.py` entrypoint (`cli_utils.py`), shared
+output-writing conventions (`reporting.py`), shared shuffle/placebo-null significance testing
+primitives (`significance.py`), and shared chart generation (`plotting.py`).
 
 **This file is the single source of truth for every DataFrame/dataset shape used by 2+ projects in
 this workspace.** Each project's own README documents only the schemas that are genuinely unique to
@@ -102,7 +103,50 @@ feature table (see that project's README) and by `common.allocation_templates.Pa
 — the SAME dispatch backs both, deliberately, so a mined threshold is tested and later traded
 against an identical computation.
 
-## 7. Shared OHLCV cache directory
+## 7. Grid-search + Equivalent Random Search (ERS) validation (`allocation_search.py`)
+
+Shared template-agnostic search/validation primitives, extracted from
+`strategy_generator/stratgen/generator.py` so `backtester`'s `--optimize` flag can tune a SINGLE,
+already-chosen template's parameters using the exact same validated mechanism instead of a second,
+independently-maintained copy. Used by both `strategy_generator`'s multi-template search (one
+`grid_search_template` call per candidate template, `run_ers_validation` once on the overall
+winner) and `backtester --optimize`'s single-template tuning (`optimize_template`, which composes
+both for you).
+
+Every function takes a `ScoreFn = Callable[[object, dict], dict]` callback —
+`score_fn(template, params) -> dict` — instead of hardcoding how to backtest a candidate; the
+returned dict must have at least a `"sharpe_ratio"` key (see §4's result dict). `strategy_generator`
+supplies a single-shot `run_allocation_backtest`-based scorer; `backtester` supplies
+`run_standard`/`run_walkforward`-based ones. Any exception `score_fn` raises is caught internally
+and degraded to a `-inf`-Sharpe fallback trial plus a `RuntimeWarning` naming the exception, so a
+bad candidate can never crash the whole search; if EVERY trial (or every ERS random draw) fails
+this way, a second, more prominent aggregate `RuntimeWarning` fires too, since that pattern usually
+means `score_fn` itself is broken rather than every candidate being genuinely bad.
+
+Public members:
+
+| Member | Purpose |
+|---|---|
+| `grid_combinations(param_grid: dict) -> list` | Cartesian product of a `{param_name: [values]}` dict into a list of param dicts; an empty/falsy `param_grid` returns `[{}]` (one degenerate trial), never `[]` |
+| `random_weights(universe, rebalance_freq_days, rng) -> pd.DataFrame` | Generates a random valid sparse weight matrix (§3's shape) for the ERS null comparison |
+| `RandomAllocationTemplate(rng)` | A dummy `AllocationTemplate` subclass (see §3) used purely for the ERS check — `name="random_allocation"`, empty `param_grid`/`factor_tags`, `generate_weights` backed by `random_weights` |
+| `grid_search_template(template, score_fn) -> list` | Evaluates `score_fn` over every combination in `template.param_grid`; returns `[{"params", "result", "score"}, ...]`, one entry per trial |
+| `run_ers_validation(params, best_score, best_result, score_fn, *, n_random_search=200, ers_percentile_threshold=0.90, min_rebalances_for_trust=4, seed=None) -> dict` | Draws `n_random_search` random-weight portfolios, scores each, and returns `{"ers_percentile", "ers_passed", "trusted"}` — `ers_percentile` fail-safes to `0.0` (never a trivial `1.0`) when every random trial is non-finite |
+| `optimize_template(universe, template, score_fn, **ers_kwargs) -> dict` | Convenience wrapper: `grid_search_template` then `run_ers_validation` on its winner, for the single-template case |
+
+## 8. Shared chart generation (`plotting.py`)
+
+`plot_equity_curve(equity: pd.Series, results_dir: str, *, baseline: Optional[pd.Series] = None,
+strategy_label="Strategy", baseline_label="Baseline", title="Equity Curve",
+filename="equity_curve.png") -> str` — single-line equity chart (or two lines if `baseline` is
+given, e.g. a buy-and-hold benchmark plotted alongside the strategy). `equity`/`baseline` are plain
+`pd.Series` (date index -> portfolio value) — pass `result["equity_curve"]["equity"]` (§4), not the
+raw `run_allocation_backtest()` dict. Saves under `results_dir` (created if missing) and returns the
+saved absolute path. Used by `backtester/run_backtest.py` and `strategy_generator/run_strategygen.py`
+to produce the equity-curve chart that accompanies each run's report, so chart styling/behavior
+stays identical across both instead of being reimplemented per project.
+
+## 9. Shared OHLCV cache directory
 
 Every project's `run_*.py` resolves its `--cache-dir`/`DATA_DIR` default via
 `common.cli_utils.shared_data_dir()`, which always resolves to a single `<repo_root>/data/`
@@ -127,7 +171,7 @@ constructor default) — every `run_*.py`'s `--cache-ttl-days` flag (added via
 
 | Project | Uses from this file | Documents locally (see that project's own README) |
 |---|---|---|
-| `backtester` | §1–4 | `strategy.json` consumption (schema owned by `strategy_generator`), `backtest_equity.csv`/`backtest_weights.csv`/`walkforward_report.csv` (see `backtester/SCHEMAS.md`) |
+| `backtester` | §1–4, 7–8 | `strategy.json` consumption (schema owned by `strategy_generator`), `backtest_equity.csv`/`backtest_weights.csv`/`walkforward_report.csv` (see `backtester/SCHEMAS.md`) |
 | `instrument_selection` | §1–2 (universe/OHLCV in) | `screening_report.csv`, `correlation_matrix.csv`, `screened_out.csv`, `basket.json` |
 | `research_strategy` | §1–5 | `research_strategy_report.json`, `factor_summary.json`, `strategies_config.json` entry schema |
-| `strategy_generator` | §1–6 | `strategy.json` (schema OWNED here), `GeneratedStrategySpec`, pattern-mining's turning-points/feature-table/findings DataFrames |
+| `strategy_generator` | §1–8 | `strategy.json` (schema OWNED here), `GeneratedStrategySpec`, pattern-mining's turning-points/feature-table/findings DataFrames |

@@ -385,6 +385,34 @@ def test_load_strategy_file_research_strategy_spec_wrong_types(tmp_path):
         _load_strategy_file(str(path))
 
 
+def test_load_strategy_file_rejects_both_pattern_spec_and_research_strategy_spec(tmp_path):
+    # Bug 2 regression test: pattern_spec and research_strategy_spec are
+    # mutually exclusive (a strategy.json only ever came from one source),
+    # but the two blocks used to be validated completely independently, with
+    # no check that at most one is set. _get_template checks
+    # research_strategy_spec first and returns immediately if present, so a
+    # file with both would have research_strategy_spec silently win with no
+    # diagnostic that pattern_spec was ignored -- must raise instead.
+    path = tmp_path / "strategy.json"
+    pattern_spec = {
+        "feature_name": "rsi",
+        "feature_lookback": 14,
+        "threshold": 30.0,
+        "comparison": "below",
+        "event_type": "trough",
+    }
+    research_strategy_spec = _permanent_portfolio_research_strategy_spec()
+    _write_strategy_file(
+        path, template_name="pattern_rsi_14_trough",
+        pattern_spec=pattern_spec, research_strategy_spec=research_strategy_spec,
+    )
+
+    with pytest.raises(ValueError, match="pattern_spec") as exc_info:
+        _load_strategy_file(str(path))
+    assert "research_strategy_spec" in str(exc_info.value)
+    assert "mutually exclusive" in str(exc_info.value)
+
+
 def test_load_strategy_file_valid(tmp_path):
     path = tmp_path / "strategy.json"
     _write_strategy_file(path)
@@ -668,7 +696,7 @@ def test_merge_baseline_folds_pairs_by_date_not_position():
          "cagr": 0.04, "max_drawdown": 0.02, "calmar_ratio": 1.8},
     ])
 
-    merged = _merge_baseline_folds(folds_df, baseline_folds_df)
+    merged, baseline_calendar_mismatch = _merge_baseline_folds(folds_df, baseline_folds_df)
 
     assert len(merged) == 3
     row0 = merged[merged["start_date"] == "2020-01-01"].iloc[0]
@@ -682,6 +710,59 @@ def test_merge_baseline_folds_pairs_by_date_not_position():
     row2 = merged[merged["start_date"] == "2021-01-01"].iloc[0]
     assert pd.isna(row2["baseline_sharpe_ratio"])
     assert pd.isna(row2["outperformance"])
+
+    # Only ONE of the three folds failed to match -- this is NOT the
+    # degenerate "matched nothing at all" case, so no mismatch flag.
+    assert baseline_calendar_mismatch is False
+
+
+def test_merge_baseline_folds_detects_calendar_mismatch_and_warns(capsys):
+    # Bug 3 regression test: both fold lists are non-empty, but share NO
+    # (start_date, end_date) pairs at all -- e.g. because the main universe's
+    # aligned calendar and --baseline-symbol's calendar cover different date
+    # ranges (one of the main --universe symbols has a shorter history than
+    # --baseline-symbol). The left-join then matches zero rows, and every
+    # baseline_* column comes back all-NaN. This must be detected and
+    # surfaced (a console warning, and a True `baseline_calendar_mismatch`
+    # return value) instead of silently producing an all-NaN report.
+    folds_df = pd.DataFrame([
+        {"start_date": "2020-01-01", "end_date": "2020-06-01", "sharpe_ratio": 1.0,
+         "cagr": 0.10, "max_drawdown": 0.05, "calmar_ratio": 2.0},
+        {"start_date": "2020-06-01", "end_date": "2020-12-01", "sharpe_ratio": 1.2,
+         "cagr": 0.12, "max_drawdown": 0.06, "calmar_ratio": 2.0},
+    ])
+    baseline_folds_df = pd.DataFrame([
+        {"start_date": "2021-01-01", "end_date": "2021-06-01", "sharpe_ratio": 0.5,
+         "cagr": 0.05, "max_drawdown": 0.03, "calmar_ratio": 1.5},
+        {"start_date": "2021-06-01", "end_date": "2021-12-01", "sharpe_ratio": 0.4,
+         "cagr": 0.04, "max_drawdown": 0.02, "calmar_ratio": 1.8},
+    ])
+
+    merged, baseline_calendar_mismatch = _merge_baseline_folds(folds_df, baseline_folds_df)
+
+    assert baseline_calendar_mismatch is True
+    assert merged["baseline_sharpe_ratio"].notna().sum() == 0
+
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.out
+    assert "calendar" in captured.out.lower()
+
+
+def test_merge_baseline_folds_empty_fold_lists_not_flagged_as_mismatch():
+    # An empty fold list on either side is a totally different (and already
+    # otherwise-handled) situation -- must not be conflated with the
+    # "both non-empty but joined nothing" degenerate case.
+    empty_df = pd.DataFrame(columns=["start_date", "end_date", "sharpe_ratio", "cagr", "max_drawdown", "calmar_ratio"])
+    non_empty_df = pd.DataFrame([
+        {"start_date": "2020-01-01", "end_date": "2020-06-01", "sharpe_ratio": 1.0,
+         "cagr": 0.10, "max_drawdown": 0.05, "calmar_ratio": 2.0},
+    ])
+
+    _, mismatch_1 = _merge_baseline_folds(empty_df, non_empty_df)
+    assert mismatch_1 is False
+
+    _, mismatch_2 = _merge_baseline_folds(non_empty_df, empty_df)
+    assert mismatch_2 is False
 
 
 def test_main_baseline_symbol_standard_mode_writes_comparison_files(tmp_path, monkeypatch):
@@ -983,11 +1064,20 @@ def test_main_optimize_success_scenario_tunes_and_uses_best_params(tmp_path, mon
     assert report["best_params"] != original_params
     assert report["best_params"]["top_n_fraction"] == 0.25
 
-    # The critical regression check: the FINAL run_standard call (the one
-    # that actually produced backtest_equity.csv) must have used the tuned
-    # best_params, not the strategy file's original params.
-    final_call_params = mock_run_standard.call_args_list[-1][0][2]
-    assert final_call_params == report["best_params"]
+    # Bug 4 regression check: total run_standard calls = 1 (original_result)
+    # + 12 grid combinations (cross_sectional_momentum's 3x2x2 param_grid) +
+    # 20 ERS random-search draws -- NOT one more for a redundant "final"
+    # backtest that just re-derives score_fn(template, best_params)'s
+    # already-known answer (opt["best_result"], reused directly as `result`).
+    n_grid_combinations = 3 * 2 * 2
+    n_random_search = 20
+    expected_calls = 1 + n_grid_combinations + n_random_search
+    assert mock_run_standard.call_count == expected_calls
+
+    # And the winning combo's params really were scored at some point (i.e.
+    # the tuned result actually reflects best_params, not just that the call
+    # count dropped).
+    assert any(call[0][2] == report["best_params"] for call in mock_run_standard.call_args_list)
 
     assert os.path.exists(results_dir / "backtest_equity.csv")
 
@@ -1032,10 +1122,20 @@ def test_main_optimize_failure_falls_back_to_original_params(tmp_path, monkeypat
     assert report["reason"] is not None
     assert "ERS percentile" in report["reason"]
 
-    # Critical regression check: the FINAL backtest must have run with the
-    # ORIGINAL strategy-file params, not whatever the grid search picked.
-    final_call_params = mock_run_standard.call_args_list[-1][0][2]
-    assert final_call_params == original_params
+    # Bug 4 regression check: total run_standard calls = 1 (original_result)
+    # + 3 grid combinations (equal_weight's rebalance_freq_days param_grid) +
+    # 10 ERS random-search draws -- NOT one more for a redundant "final"
+    # backtest re-deriving the fallback result that's already in hand as
+    # original_result (reused directly as `result`).
+    n_grid_combinations = 3
+    n_random_search = 10
+    expected_calls = 1 + n_grid_combinations + n_random_search
+    assert mock_run_standard.call_count == expected_calls
+
+    # And the original params really were used for the final output (i.e.
+    # the fallback actually reflects original_params, not just that the call
+    # count dropped).
+    assert any(call[0][2] == original_params for call in mock_run_standard.call_args_list)
 
     assert os.path.exists(results_dir / "backtest_equity.csv")
 
@@ -1044,8 +1144,11 @@ def test_main_optimize_walkforward_mode_exercises_walkforward_score_fn(tmp_path,
     # --optimize under --mode walkforward must score every candidate via
     # run_walkforward (the walkforward-specific score_fn), not run_standard --
     # verified by counting actual run_walkforward calls: 1 for the original
-    # params, one per grid combination, one per random-search draw, and one
-    # more for the FINAL run after tuning.
+    # params, one per grid combination, one per random-search draw. Bug 4
+    # regression: NOT one more on top of that for a redundant "final" run --
+    # opt["best_result"]["folds"]/original_result["folds"] (run_walkforward's
+    # own unmodified return value, per _walkforward_score_fn) is reused
+    # directly as `folds` instead.
     strategy_path = tmp_path / "strategy.json"
     _write_strategy_file(strategy_path, template_name="equal_weight", params={"rebalance_freq_days": 21})
     results_dir = tmp_path / "results"
@@ -1072,7 +1175,7 @@ def test_main_optimize_walkforward_mode_exercises_walkforward_score_fn(tmp_path,
         main()
 
     n_grid_combinations = 3  # equal_weight's param_grid: rebalance_freq_days has 3 values
-    expected_calls = 1 + n_grid_combinations + n_random_search + 1  # original + grid + random + final run
+    expected_calls = 1 + n_grid_combinations + n_random_search  # original + grid + random (no redundant final run)
     assert mock_run_walkforward.call_count == expected_calls
 
     assert os.path.exists(results_dir / "optimize_report.json")
@@ -1082,6 +1185,97 @@ def test_main_optimize_walkforward_mode_exercises_walkforward_score_fn(tmp_path,
         report = json.load(f)
     assert "folds" in report["original_result"]
     assert "folds" in report["best_result"]
+
+
+def test_main_optimize_walkforward_mode_improvement_cagr_is_finite(tmp_path, monkeypatch):
+    # Bug 1 regression test: _walkforward_score_fn's result dict used to
+    # carry no "cagr" key at all, so optimize_report.json's
+    # "improvement.cagr" (best_result.get("cagr", nan) - original_result.get(
+    # "cagr", nan)) was always nan - nan under --optimize --mode walkforward,
+    # every single time, regardless of the actual data. With the fix, both
+    # original_result and best_result carry a mean-fold "cagr" key, so
+    # improvement.cagr must be a real, finite number here.
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(strategy_path, template_name="equal_weight", params={"rebalance_freq_days": 21})
+    results_dir = tmp_path / "results"
+    cache_dir = tmp_path / "cache"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "A", "B",
+        "--data-provider", "synthetic",
+        "--mode", "walkforward",
+        "--window-years", "0.5",
+        "--step-years", "0.25",
+        "--optimize",
+        "--n-random-search", "5",
+        "--ers-percentile-threshold", "0.5",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    main()
+
+    with open(results_dir / "optimize_report.json") as f:
+        report = json.load(f)
+
+    assert "cagr" in report["original_result"]
+    assert "cagr" in report["best_result"]
+    assert report["original_result"]["cagr"] is not None
+    assert report["best_result"]["cagr"] is not None
+    assert np.isfinite(report["original_result"]["cagr"])
+    assert np.isfinite(report["best_result"]["cagr"])
+
+    assert report["improvement"]["cagr"] is not None
+    assert np.isfinite(report["improvement"]["cagr"])
+    np.testing.assert_allclose(
+        report["improvement"]["cagr"],
+        report["best_result"]["cagr"] - report["original_result"]["cagr"],
+    )
+
+
+def test_main_optimize_not_set_calls_run_standard_and_run_walkforward_exactly_once(tmp_path, monkeypatch):
+    # Bug 4 zero-behavior-change check: when --optimize is NOT passed, main()
+    # must still call run_standard/run_walkforward exactly once, same as
+    # always -- the reuse-the-already-computed-result path introduced for
+    # --optimize must never engage otherwise.
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(strategy_path, template_name="equal_weight", params={"rebalance_freq_days": 21})
+
+    # Standard mode.
+    results_dir_std = tmp_path / "results_std"
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "A", "B",
+        "--data-provider", "synthetic",
+        "--mode", "standard",
+        "--results-dir", str(results_dir_std),
+        "--cache-dir", str(tmp_path / "cache_std"),
+        "--no-plots",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    with patch("backtester.run_backtest.run_standard", wraps=backtester.run_backtest.run_standard) as mock_run_standard:
+        main()
+    assert mock_run_standard.call_count == 1
+
+    # Walkforward mode.
+    results_dir_wf = tmp_path / "results_wf"
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "A", "B",
+        "--data-provider", "synthetic",
+        "--mode", "walkforward",
+        "--results-dir", str(results_dir_wf),
+        "--cache-dir", str(tmp_path / "cache_wf"),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    with patch("backtester.run_backtest.run_walkforward", wraps=backtester.run_backtest.run_walkforward) as mock_run_walkforward:
+        main()
+    assert mock_run_walkforward.call_count == 1
 
 
 def test_main_optimize_research_strategy_spec_empty_param_grid(tmp_path, monkeypatch):

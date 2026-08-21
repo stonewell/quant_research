@@ -33,7 +33,7 @@ from common.cli_utils import (
     load_universe_with_banner,
     shared_data_dir,
 )
-from common.reporting import utc_timestamp
+from common.reporting import utc_timestamp, write_json_report
 from common.universe import add_universe_cli_args, resolve_universe_from_args
 from selectorbot.config import SelectionConfig
 from selectorbot.data import fetch_fund_metadata
@@ -224,14 +224,12 @@ def main():
         screened_out.to_csv(os.path.join(RESULTS_DIR, "screened_out.csv"))
     print(f"\nSaved full report to {scored_path}")
 
-    import json
     basket_json_path = os.path.join(RESULTS_DIR, "basket.json")
-    with open(basket_json_path, "w") as f:
-        json.dump({
-            "basket": list(chosen),
-            "method": args.select_method,
-            "date_generated": utc_timestamp()
-        }, f, indent=2)
+    write_json_report({
+        "basket": list(chosen),
+        "method": args.select_method,
+        "date_generated": utc_timestamp()
+    }, basket_json_path)
     print(f"Saved chosen basket to {basket_json_path}")
 
     if not args.no_plots:
