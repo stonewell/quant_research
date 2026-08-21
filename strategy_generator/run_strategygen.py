@@ -95,6 +95,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "see pattern_mining.py's module docstring for why this matters).")
     p.add_argument("--pattern-max-templates", type=int, default=5,
                    help="Cap on how many significant mined patterns become candidate templates (default 5).")
+    p.add_argument("--research-strategy", nargs="+", default=None, metavar="STRATEGY_KEY",
+                   help="Include one or more research_strategy strategies (by their strategies_config.json key, "
+                        "e.g. 'baa_keller', 'adaptive_grid' -- see research_strategy/README.md for the full list) "
+                        "as additional candidate templates, alongside the 9 static allocation templates and any "
+                        "--mine-patterns findings. Each is instantiated exactly as research_strategy's own CLI "
+                        "would build it (including any strategies_config.json parameter overrides).")
     p.add_argument("--no-plots", action="store_true",
                    help="Skip the equity-curve chart normally produced for the winning strategy (charts are ON by default).")
     add_data_provider_cli_args(p)
@@ -132,6 +138,13 @@ def main():
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
     extra_templates = None
+    # Kept separate from extra_templates itself (which grows below to also
+    # include any --research-strategy templates): the pattern_spec
+    # reconstruction block further down assumes every candidate it inspects
+    # is a PatternBasedAllocationTemplate (it reads feature_name/threshold/
+    # etc.), so it must only ever search the mined templates, never the
+    # combined pool.
+    mined_templates = None
     if args.mine_patterns:
         findings, mining_status = mine_indicator_patterns(
             universe,
@@ -141,13 +154,43 @@ def main():
         if mining_status != "ok":
             print(f"Pattern mining: {mining_status} -- skipping, proceeding with the 9 standard templates only.")
         else:
-            extra_templates = build_pattern_templates(findings, max_templates=args.pattern_max_templates)
+            mined_templates = build_pattern_templates(findings, max_templates=args.pattern_max_templates)
+            extra_templates = mined_templates
             n_significant = int(findings["significant"].sum()) if not findings.empty else 0
             # 0 significant patterns is an expected, valid outcome (especially
             # on synthetic data) -- not an error. See pattern_mining.py.
             print(f"Pattern mining found {n_significant} statistically significant indicator pattern(s) "
                   f"out of {len(findings)} tested (Bonferroni-corrected, lag={args.pattern_lag_bars} bars); "
                   f"{len(extra_templates)} added as candidate template(s).")
+
+    # research_strategy_entries/templates are kept as separate dicts (keyed by
+    # strategies_config.json key) rather than folded anonymously into
+    # extra_templates, so the strategy.json reconstruction block below can
+    # look a winning template back up by its ORIGINAL config key + entry_data
+    # -- mirroring, but not reusing, the --mine-patterns/pattern_spec pattern
+    # above (a mined template reconstructs from its own fields; a
+    # research_strategy template reconstructs via research_strategy's own
+    # instantiate_strategy_from_config_entry, given back its key + entry).
+    research_strategy_entries = {}  # key -> entry_data dict (for strategy.json reconstruction)
+    research_strategy_templates = {}  # key -> instantiated template
+    if args.research_strategy:
+        from research_strategy.rs.config import load_strategies_config
+        from research_strategy.rs.strategy import instantiate_strategy_from_config_entry
+
+        loaded_config = load_strategies_config()
+        unknown = set(args.research_strategy) - set(loaded_config.keys())
+        if unknown:
+            raise ValueError(
+                f"Unknown --research-strategy key(s) {sorted(unknown)}; valid keys: {sorted(loaded_config.keys())}"
+            )
+        for key in args.research_strategy:
+            entry_data = loaded_config[key]
+            research_strategy_entries[key] = entry_data
+            research_strategy_templates[key] = instantiate_strategy_from_config_entry(key, entry_data)
+
+        extra_templates = (extra_templates or []) + list(research_strategy_templates.values())
+        print(f"Added {len(research_strategy_templates)} research_strategy candidate template(s): "
+              f"{sorted(research_strategy_templates.keys())}")
 
     if args.mode == "generate":
         spec = StrategyGenerator(gen_config).generate(universe, factor_report=factor_report, extra_templates=extra_templates)
@@ -185,7 +228,7 @@ def main():
         # directly so backtester/run_backtest.py can rebuild the exact same
         # instance from strategy.json alone (see its own _get_template).
         pattern_spec = None
-        for t in (extra_templates or []):
+        for t in (mined_templates or []):
             if t.name == spec.template_name:
                 pattern_spec = {
                     "feature_name": t.feature_name,
@@ -195,6 +238,23 @@ def main():
                     "event_type": t.event_type,
                     "mined_p_value": t.mined_p_value,
                     "mined_n_events": t.mined_n_events,
+                }
+                break
+
+        # Same idea as pattern_spec above, but for a winning research_strategy
+        # template: it's also not in the static ALLOCATION_TEMPLATES registry,
+        # so embed enough to rebuild the exact same instance via
+        # research_strategy.rs.strategy.instantiate_strategy_from_config_entry
+        # (strategy_key + entry_data is everything that function needs).
+        # pattern_spec and research_strategy_spec can never both be non-null:
+        # each loop only matches against its own disjoint template list, and a
+        # winning template can only ever have come from one of them.
+        research_strategy_spec = None
+        for key, t in research_strategy_templates.items():
+            if t.name == spec.template_name:
+                research_strategy_spec = {
+                    "strategy_key": key,
+                    "entry_data": research_strategy_entries[key],
                 }
                 break
 
@@ -215,6 +275,7 @@ def main():
             "factor_context": spec.factor_context,
             "factor_tiebreak_used": spec.factor_tiebreak_used,
             "pattern_spec": pattern_spec,
+            "research_strategy_spec": research_strategy_spec,
         }, strategy_json_path)
         print(f"Saved strategy definition to {strategy_json_path}")
 

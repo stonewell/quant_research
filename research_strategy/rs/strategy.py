@@ -1559,3 +1559,66 @@ class AdaptiveAssetAllocation(AllocationTemplate):
             p.get("aaa_corr_lookback", cfg.aaa_corr_lookback),
         ) + 1
 
+
+# Name -> class registry for every "class"-type entry in strategies_config.json,
+# and the strategies_config.json -> instance builder. Both live here (not in
+# run_research_strategy.py, where they originally lived) so another project can
+# import them directly -- e.g. `strategy_generator`'s `--research-strategy` flag
+# and `backtester`'s research_strategy_spec reconstruction both need to build
+# the exact same instance a `research_strategy` CLI run would, including
+# natural-language-parsed strategies (dual_momentum, baa_keller,
+# volatility_managed), not just the class-based ones. See
+# `common/README.md`'s cross-project import convention note for how a consumer
+# reaches this module.
+STRATEGY_CLASS_MAP = {
+    "AcceleratingDualMomentum": AcceleratingDualMomentum,
+    "ActiveDualMomentumRiskParity": ActiveDualMomentumRiskParity,
+    "AdaptiveAssetAllocation": AdaptiveAssetAllocation,
+    "AdaptiveGridStrategy": AdaptiveGridStrategy,
+    "AllWeatherStrategy": AllWeatherStrategy,
+    "BoldAssetAllocation": BoldAssetAllocation,
+    "EnsembleRegimeSwitchingStrategy": EnsembleRegimeSwitchingStrategy,
+    "GoldenButterflyStrategy": GoldenButterflyStrategy,
+    "HFEAStrategy": HFEAStrategy,
+    "NaturalLanguageStrategy": NaturalLanguageStrategy,
+    "PermanentPortfolioStrategy": PermanentPortfolioStrategy,
+    "ProtectiveAssetAllocation": ProtectiveAssetAllocation,
+    "RSIMeanReversionStrategy": RSIMeanReversionStrategy,
+    "SwingTrendPullbackStrategy": SwingTrendPullbackStrategy,
+    "TurtleBreakoutStrategy": TurtleBreakoutStrategy,
+    "VigilantAssetAllocation": VigilantAssetAllocation,
+    "VolatilityManagedStrategy": VolatilityManagedStrategy,
+}
+
+
+def instantiate_strategy_from_config_entry(entry_key: str, entry_data: dict):
+    """Builds the strategy instance a `strategies_config.json` entry describes
+    -- either a `type: "natural_language"` entry (parsed via
+    `parse_plain_english_strategy`) or a `type: "class"` entry (looked up in
+    `STRATEGY_CLASS_MAP` by `class_name`). This is the single source of truth
+    for "given a strategies_config.json key, build the exact instance
+    research_strategy's own CLI would" -- reused as-is by any external
+    consumer instead of reimplementing per-type reconstruction."""
+    strat_type = entry_data.get("type", "class")
+    params = entry_data.get("parameters", {})
+    try:
+        cfg = StrategyConfig.from_dict(params)
+    except ValueError as exc:
+        raise ValueError(f"Invalid config for strategy '{entry_key}': {exc}") from exc
+
+    if strat_type == "natural_language":
+        plain_english = entry_data.get("plain_english_description", "")
+        name = entry_data.get("name", entry_key)
+        spec = parse_plain_english_strategy(plain_english, name=name)
+        return NaturalLanguageStrategy(spec, config=cfg)
+    elif strat_type == "class":
+        cls_name = entry_data.get("class_name", "")
+        if not cls_name:
+            raise ValueError(f"Strategy '{entry_key}' has type 'class' but no 'class_name' key")
+        cls_obj = STRATEGY_CLASS_MAP.get(cls_name)
+        if not cls_obj:
+            raise ValueError(f"Unrecognized strategy class_name '{cls_name}' for strategy key '{entry_key}'")
+        return cls_obj(config=cfg)
+    else:
+        raise ValueError(f"Unknown strategy type '{strat_type}' for strategy key '{entry_key}'")
+

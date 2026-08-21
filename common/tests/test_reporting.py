@@ -14,7 +14,14 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from common.reporting import format_weights_pct, to_dense_weights, utc_timestamp, write_dense_weights_csv, write_json_report
+from common.reporting import (
+    format_backtest_metrics_summary,
+    format_weights_pct,
+    to_dense_weights,
+    utc_timestamp,
+    write_dense_weights_csv,
+    write_json_report,
+)
 
 
 def _sparse_weights():
@@ -89,3 +96,15 @@ def test_write_json_report_default_str_for_non_native_types(tmp_path):
     with open(path) as f:
         data = json.load(f)
     assert data["date"] == str(pd.Timestamp("2020-01-01"))
+
+
+def test_format_backtest_metrics_summary_exact_text():
+    result = {
+        "sharpe_ratio": 1.234, "cagr": 0.0856, "max_drawdown": 0.1865,
+        "calmar_ratio": 0.459, "win_rate": 0.5303, "profit_factor": 1.154,
+    }
+    summary = format_backtest_metrics_summary(result)
+    assert summary == (
+        "Sharpe Ratio: 1.23 | CAGR: 8.56% | Max Drawdown: 18.6%\n"
+        "Calmar Ratio: 0.46 | Win Rate: 53.0% | Profit Factor: 1.15"
+    )

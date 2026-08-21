@@ -37,7 +37,7 @@ from common.cli_utils import (
 )
 from common.metrics import alpha_beta, deflated_sharpe_ratio, information_ratio, tracking_error
 from common import plotting
-from common.reporting import write_json_report
+from common.reporting import format_backtest_metrics_summary, write_json_report
 from common.universe import add_universe_cli_args, resolve_universe_from_args
 
 RESULTS_DIR = default_results_dir(__file__)
@@ -84,13 +84,30 @@ def _align_universe(universe: dict) -> dict:
     return {symbol: df.loc[common_index] for symbol, df in universe.items()}
 
 
-def _get_template(template_name: str, pattern_spec: dict = None):
-    """Looks up a static template by name, UNLESS `pattern_spec` is given --
-    a PatternBasedAllocationTemplate (strategy_generator/stratgen/
-    pattern_mining.py) is universe-specific and not zero-arg constructible,
-    so it's never in the static ALLOCATION_TEMPLATES registry; a strategy.json
-    produced from a winning mined pattern carries its own `pattern_spec`
-    (see run_strategygen.py) so it can be reconstructed here instead."""
+def _get_template(template_name: str, pattern_spec: dict = None, research_strategy_spec: dict = None):
+    """Looks up a static template by name, UNLESS `pattern_spec` or
+    `research_strategy_spec` is given (the two are mutually exclusive --
+    a winning strategy.json only ever came from one source).
+
+    `pattern_spec`: a PatternBasedAllocationTemplate (strategy_generator/
+    stratgen/pattern_mining.py) is universe-specific and not zero-arg
+    constructible, so it's never in the static ALLOCATION_TEMPLATES registry;
+    a strategy.json produced from a winning mined pattern carries its own
+    `pattern_spec` (see run_strategygen.py) so it can be reconstructed here
+    instead.
+
+    `research_strategy_spec`: a strategy.json produced from a winning
+    research_strategy candidate (strategy_generator search) carries its own
+    `research_strategy_spec` (`strategy_key` + `entry_data`) so the exact
+    research_strategy strategy instance -- class-based or natural-language-
+    parsed alike -- can be reconstructed here via research_strategy's own
+    `instantiate_strategy_from_config_entry`, instead of being in the static
+    ALLOCATION_TEMPLATES registry."""
+    if research_strategy_spec is not None:
+        from research_strategy.rs.strategy import instantiate_strategy_from_config_entry
+        return instantiate_strategy_from_config_entry(
+            research_strategy_spec["strategy_key"], research_strategy_spec["entry_data"]
+        )
     if pattern_spec is not None:
         if not template_name.startswith("pattern_"):
             raise ValueError(
@@ -149,6 +166,29 @@ def _load_strategy_file(path: str) -> dict:
                 f"key(s) {missing_pattern_keys}. Expected keys: {list(required_pattern_keys)} "
                 f"(plus optional mined_p_value/mined_n_events) -- see strategy_generator's "
                 f"run_strategygen.py pattern-mining output for the expected shape."
+            )
+
+    research_strategy_spec = strategy_def.get("research_strategy_spec")
+    if research_strategy_spec is not None:
+        missing_research_strategy_keys = [
+            key for key in ("strategy_key", "entry_data") if key not in research_strategy_spec
+        ]
+        if missing_research_strategy_keys:
+            raise ValueError(
+                f"Malformed strategy file '{path}': 'research_strategy_spec' is missing "
+                f"required key(s) {missing_research_strategy_keys}. Expected keys: "
+                f"strategy_key (str), entry_data (dict) -- see strategy_generator's "
+                f"research_strategy-candidate output for the expected shape."
+            )
+        if not isinstance(research_strategy_spec["strategy_key"], str):
+            raise ValueError(
+                f"Malformed strategy file '{path}': 'research_strategy_spec.strategy_key' "
+                f"must be a string, got {type(research_strategy_spec['strategy_key']).__name__}."
+            )
+        if not isinstance(research_strategy_spec["entry_data"], dict):
+            raise ValueError(
+                f"Malformed strategy file '{path}': 'research_strategy_spec.entry_data' "
+                f"must be a JSON object, got {type(research_strategy_spec['entry_data']).__name__}."
             )
 
     return strategy_def
@@ -383,6 +423,7 @@ def main():
     params = strategy_def["params"]
     explanation = strategy_def.get("explanation", "")
     pattern_spec = strategy_def.get("pattern_spec")
+    research_strategy_spec = strategy_def.get("research_strategy_spec")
 
     print(f"Loaded Strategy: {template_name}")
     print(f"Parameters: {params}")
@@ -409,12 +450,9 @@ def main():
 
     if args.mode == "standard":
         print("\n=== Running Standard Backtest ===")
-        result = run_standard(universe, _get_template(template_name, pattern_spec), params, args)
+        result = run_standard(universe, _get_template(template_name, pattern_spec, research_strategy_spec), params, args)
 
-        print(f"Sharpe Ratio: {result['sharpe_ratio']:.2f} | CAGR: {result['cagr']*100:.2f}% | "
-              f"Max Drawdown: {result['max_drawdown']*100:.1f}%")
-        print(f"Calmar Ratio: {result['calmar_ratio']:.2f} | Win Rate: {result['win_rate']*100:.1f}% | "
-              f"Profit Factor: {result['profit_factor']:.2f}")
+        print(format_backtest_metrics_summary(result))
         print(f"Total Rebalances: {result['total_rebalances']}")
         print(f"Total Turnover: {result['total_turnover']:.2f}")
 
@@ -477,7 +515,7 @@ def main():
         print(f"\n=== Running Walkforward Rolling Evaluation ===")
         print(f"Window: {args.window_years} years, Step: {args.step_years} years")
 
-        folds = run_walkforward(universe, _get_template(template_name, pattern_spec), params, args)
+        folds = run_walkforward(universe, _get_template(template_name, pattern_spec, research_strategy_spec), params, args)
 
         folds_df = pd.DataFrame(folds)
 

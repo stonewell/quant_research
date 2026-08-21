@@ -47,72 +47,13 @@ from common.universe import add_universe_cli_args, resolve_universe_from_args
 from rs.config import StrategyConfig, load_strategies_config
 from rs.nl_parser import parse_plain_english_strategy
 from rs.strategy import (
-    AcceleratingDualMomentum,
-    ActiveDualMomentumRiskParity,
-    AdaptiveAssetAllocation,
-    AdaptiveGridStrategy,
-    AllWeatherStrategy,
-    BoldAssetAllocation,
-    EnsembleRegimeSwitchingStrategy,
-    GoldenButterflyStrategy,
-    HFEAStrategy,
     NaturalLanguageStrategy,
-    PermanentPortfolioStrategy,
-    ProtectiveAssetAllocation,
-    RSIMeanReversionStrategy,
-    SwingTrendPullbackStrategy,
-    TurtleBreakoutStrategy,
-    VigilantAssetAllocation,
-    VolatilityManagedStrategy,
+    STRATEGY_CLASS_MAP,
+    instantiate_strategy_from_config_entry,
 )
 
 RESULTS_DIR = default_results_dir(__file__)
 DATA_DIR = shared_data_dir()
-
-STRATEGY_CLASS_MAP = {
-    "AcceleratingDualMomentum": AcceleratingDualMomentum,
-    "ActiveDualMomentumRiskParity": ActiveDualMomentumRiskParity,
-    "AdaptiveAssetAllocation": AdaptiveAssetAllocation,
-    "AdaptiveGridStrategy": AdaptiveGridStrategy,
-    "AllWeatherStrategy": AllWeatherStrategy,
-    "BoldAssetAllocation": BoldAssetAllocation,
-    "EnsembleRegimeSwitchingStrategy": EnsembleRegimeSwitchingStrategy,
-    "GoldenButterflyStrategy": GoldenButterflyStrategy,
-    "HFEAStrategy": HFEAStrategy,
-    "NaturalLanguageStrategy": NaturalLanguageStrategy,
-    "PermanentPortfolioStrategy": PermanentPortfolioStrategy,
-    "ProtectiveAssetAllocation": ProtectiveAssetAllocation,
-    "RSIMeanReversionStrategy": RSIMeanReversionStrategy,
-    "SwingTrendPullbackStrategy": SwingTrendPullbackStrategy,
-    "TurtleBreakoutStrategy": TurtleBreakoutStrategy,
-    "VigilantAssetAllocation": VigilantAssetAllocation,
-    "VolatilityManagedStrategy": VolatilityManagedStrategy,
-}
-
-
-def instantiate_strategy_from_config_entry(entry_key: str, entry_data: dict):
-    strat_type = entry_data.get("type", "class")
-    params = entry_data.get("parameters", {})
-    try:
-        cfg = StrategyConfig.from_dict(params)
-    except ValueError as exc:
-        raise ValueError(f"Invalid config for strategy '{entry_key}': {exc}") from exc
-
-    if strat_type == "natural_language":
-        plain_english = entry_data.get("plain_english_description", "")
-        name = entry_data.get("name", entry_key)
-        spec = parse_plain_english_strategy(plain_english, name=name)
-        return NaturalLanguageStrategy(spec, config=cfg)
-    elif strat_type == "class":
-        cls_name = entry_data.get("class_name", "")
-        if not cls_name:
-            raise ValueError(f"Strategy '{entry_key}' has type 'class' but no 'class_name' key")
-        cls_obj = STRATEGY_CLASS_MAP.get(cls_name)
-        if not cls_obj:
-            raise ValueError(f"Unrecognized strategy class_name '{cls_name}' for strategy key '{entry_key}'")
-        return cls_obj(config=cfg)
-    else:
-        raise ValueError(f"Unknown strategy type '{strat_type}' for strategy key '{entry_key}'")
 
 
 DEFAULT_UNIVERSE_SYMBOLS = [

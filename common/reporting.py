@@ -60,3 +60,16 @@ def write_json_report(data: dict, path: str, *, indent: int = 2) -> None:
     finite, output is identical to a plain `json.dump(data, f, indent=2)`."""
     with open(path, "w") as f:
         json.dump(_sanitize(data), f, indent=indent, default=str)
+
+
+def format_backtest_metrics_summary(result: dict) -> str:
+    """Two-line 'Sharpe/CAGR/MaxDD' + 'Calmar/WinRate/ProfitFactor' summary of
+    a `common.allocation_backtester.run_allocation_backtest` result dict --
+    the one piece of reporting glue duplicated near-verbatim between
+    `backtester/run_backtest.py` and `research_strategy/run_research_strategy.py`."""
+    return (
+        f"Sharpe Ratio: {result['sharpe_ratio']:.2f} | CAGR: {result['cagr']*100:.2f}% | "
+        f"Max Drawdown: {result['max_drawdown']*100:.1f}%\n"
+        f"Calmar Ratio: {result['calmar_ratio']:.2f} | Win Rate: {result['win_rate']*100:.1f}% | "
+        f"Profit Factor: {result['profit_factor']:.2f}"
+    )

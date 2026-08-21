@@ -101,6 +101,27 @@ uv run python strategy_generator/run_strategygen.py --universe SPY QQQ TLT GLD \
   --mode generate --data-provider synthetic --mine-patterns
 ```
 
+## Optional: including `research_strategy` strategies as candidates (`--research-strategy`)
+
+`--research-strategy KEY [KEY ...]` includes one or more of `research_strategy`'s 17 strategy
+implementations as additional candidate templates, alongside the 9 static allocation templates and
+any `--mine-patterns` findings. Each `KEY` is one of `research_strategy/strategies_config.json`'s
+short keys (e.g. `baa_keller`, `adaptive_grid`, `rsi_mean_reversion` — see `research_strategy/README.md`
+for the full list of 17); run
+`uv run python -c "from research_strategy.rs.config import load_strategies_config; print(sorted(load_strategies_config().keys()))"`
+from the repo root to see them directly. Each named strategy is instantiated exactly as
+`research_strategy`'s own CLI would build it — including any `strategies_config.json` parameter
+overrides — via `research_strategy.rs.strategy.instantiate_strategy_from_config_entry`, then folded
+into the SAME grid-search + Equivalent Random Search pipeline as every static template via the
+generic `extra_templates` mechanism (same plumbing `--mine-patterns` uses). An unrecognized key
+raises a clear error listing every valid key rather than failing deep inside the search.
+
+```bash
+uv run python strategy_generator/run_strategygen.py --universe SPY QQQ TLT GLD --mode generate \
+  --data-provider synthetic --research-strategy baa_keller adaptive_grid \
+  --factor-report research_strategy/results/factor_summary.json
+```
+
 **Why the lag matters — the single most important methodological decision in this feature**:
 reading an indicator EXACTLY AT a zigzag-confirmed turning point is nearly tautological, not a
 discovery. A zigzag peak is, by construction, a local price maximum reached via a recent run-up; a
@@ -254,6 +275,7 @@ falling back to this project's own default universe (`["SPY", "QQQ"]`) if none a
 | `--pattern-min-swing-pct` | float, default `0.05` | Minimum zigzag swing size to confirm a turning point (0.05 = 5%) |
 | `--pattern-lag-bars` | int, default `20` | How many trading days before each turning point to read indicators at |
 | `--pattern-max-templates` | int, default `5` | Cap on how many significant mined patterns become candidate templates |
+| `--research-strategy` | space-separated `strategies_config.json` keys, default: none | Include one or more `research_strategy` strategies (e.g. `baa_keller`, `adaptive_grid`) as additional candidate templates (see above) |
 | `--data-provider` | str, default `"yfinance"` | `yfinance`, `csv`, `synthetic`, or a custom module specifier |
 | `--data-dir` | path, default: none | Folder path for the `csv` data provider |
 | `--no-cache` | flag, default off (cached) | Disable local CSV caching of fetched data |
@@ -334,6 +356,7 @@ feature menu** shapes documented in `../common/README.md` (§1–6) — see that
 | `factor_context` | dict or `null` | `{template_name: factor_score}` for every candidate, only when `--factor-report` was supplied (`null`/absent-equivalent otherwise) |
 | `factor_tiebreak_used` | bool | Whether `--factor-report` actually changed the winner (see "consuming a factor report" above) |
 | `pattern_spec` | dict or `null` | **Only non-null when `template_name` starts with `pattern_`** — the fields needed to reconstruct the exact `PatternBasedAllocationTemplate` instance: `feature_name` (str), `feature_lookback` (int or 3-int list, e.g. `[12, 26, 9]` for `macd_hist`), `threshold` (float), `comparison` (`"below"`/`"above"`), `event_type` (`"trough"`/`"peak"`), `mined_p_value` (float), `mined_n_events` (int). `backtester/run_backtest.py`'s `_get_template` reads this block to reconstruct the template when present — a hand-edited `strategy.json` naming a `pattern_*` template WITHOUT this block cannot be re-run. |
+| `research_strategy_spec` | dict or `null` | **Only non-null when the winning template came from `--research-strategy`** (never both this and `pattern_spec` at once — a winning template only ever came from one source) — the fields needed to reconstruct the exact `research_strategy` instance: `strategy_key` (str, the `strategies_config.json` key, e.g. `"baa_keller"`) and `entry_data` (dict, that key's full `strategies_config.json` entry, unmodified). Reconstruct via `research_strategy.rs.strategy.instantiate_strategy_from_config_entry(strategy_key, entry_data)` — the same function `run_strategygen.py` itself calls to build the candidate in the first place. |
 
 ### `GeneratedStrategySpec` (in-memory dataclass, `stratgen/generator.py`)
 

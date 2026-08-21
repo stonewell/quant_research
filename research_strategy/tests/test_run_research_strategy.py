@@ -27,6 +27,42 @@ def test_data_dir_uses_shared_data_dir():
     assert rrs.DATA_DIR == cli_utils.shared_data_dir()
 
 
+def test_strategy_class_map_and_instantiate_helper_importable_from_rs_strategy():
+    """STRATEGY_CLASS_MAP and instantiate_strategy_from_config_entry now live
+    in rs/strategy.py (not this CLI script) so other projects can import them
+    -- confirm run_research_strategy.py's own re-imported names are literally
+    the same objects (not a stale duplicate)."""
+    from rs.strategy import STRATEGY_CLASS_MAP as canonical_map
+    from rs.strategy import instantiate_strategy_from_config_entry as canonical_fn
+
+    assert rrs.STRATEGY_CLASS_MAP is canonical_map
+    assert rrs.instantiate_strategy_from_config_entry is canonical_fn
+    assert len(canonical_map) == 17
+
+
+def test_strategy_class_map_importable_via_research_strategy_namespace_package():
+    """The intended cross-project import path (research_strategy.rs.strategy,
+    reachable via Python's implicit namespace packages since research_strategy/
+    has no __init__.py) must resolve to a working, fully-populated registry --
+    this is the mechanism strategy_generator/backtester use to consume these
+    strategies.
+
+    NOTE: this is deliberately NOT asserted `is` rrs.STRATEGY_CLASS_MAP -- when
+    a single process imports the SAME file under two different qualified names
+    (bare `rs.strategy`, used internally by run_research_strategy.py itself,
+    vs. namespaced `research_strategy.rs.strategy`), Python's import system
+    caches them as two SEPARATE module objects with two separate class
+    definitions (verified directly; this is standard Python import behavior,
+    not a bug). This is harmless in practice: strategy_generator/backtester
+    only ever use the namespaced path and never also import
+    run_research_strategy.py (the only thing that triggers the bare path) in
+    the same process."""
+    from research_strategy.rs.strategy import STRATEGY_CLASS_MAP as namespaced_map
+
+    assert len(namespaced_map) == 17
+    assert set(namespaced_map.keys()) == set(rrs.STRATEGY_CLASS_MAP.keys())
+
+
 def test_cache_ttl_days_arg_default_and_parsing():
     """--cache-ttl-days is added automatically by add_data_provider_cli_args()
     and must default to None, parsing to a float when supplied.

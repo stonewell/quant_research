@@ -13,6 +13,19 @@ project's `_get_template()` reads to reconstruct a mined `PatternBasedAllocation
 `template_name` starts with `pattern_`. Only `template_name` and `params` are strictly required;
 everything else is read via `.get()`.
 
+Also supported: a `research_strategy_spec` block (dict or `null`, default `null`), present when a
+`research_strategy` strategy (one of the 17 implementations in `../research_strategy/rs/strategy.py`)
+won `strategy_generator`'s search instead of a static/mined template. Exactly 2 fields: `strategy_key`
+(str, a key from `research_strategy/strategies_config.json`, e.g. `"permanent_portfolio"`) and
+`entry_data` (dict, the exact raw `strategies_config.json[strategy_key]` entry). `_get_template()`
+reads this block, when present, to reconstruct the exact strategy instance via
+`research_strategy.rs.strategy.instantiate_strategy_from_config_entry(strategy_key, entry_data)` —
+this works uniformly for both `type: "class"` and `type: "natural_language"` entries, and for
+BOTH `--mode standard` and `--mode walkforward` (the reconstructed instance's `warmup_bars()` is
+honored during walk-forward fold buffering exactly like any other template's). `pattern_spec` and
+`research_strategy_spec` are mutually exclusive — a winning strategy.json only ever carries one of
+the two (or neither, for a plain static template).
+
 ## Outputs
 
 ### `results/backtest_equity.csv` (`--mode standard`)

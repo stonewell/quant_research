@@ -99,6 +99,43 @@ def test_get_template_rejects_pattern_spec_with_non_pattern_prefixed_template_na
         _get_template("equal_weight", pattern_spec)
 
 
+def _permanent_portfolio_research_strategy_spec():
+    # The exact raw research_strategy/strategies_config.json["permanent_portfolio"]
+    # entry -- a simple, deterministic, class-based, fixed-weight strategy
+    # (25% SPY / 25% TLT / 25% BIL / 25% GLD, annual rebalance) that needs no
+    # natural-language parsing and no lookback warmup, making it ideal for a
+    # focused reconstruction test.
+    return {
+        "strategy_key": "permanent_portfolio",
+        "entry_data": {
+            "name": "Permanent Portfolio (Harry Browne)",
+            "type": "class",
+            "class_name": "PermanentPortfolioStrategy",
+            "description": (
+                "Static 25% SPY / 25% TLT / 25% BIL / 25% GLD allocation, annual "
+                "rebalance. SPY substitutes for the canonical VTI."
+            ),
+            "parameters": {},
+        },
+    }
+
+
+def test_get_template_reconstructs_research_strategy_spec_from_spec():
+    # A research_strategy_spec (produced by strategy_generator when a
+    # research_strategy candidate wins) is reconstructed via research_strategy's
+    # own instantiate_strategy_from_config_entry -- this must work uniformly
+    # for class-based strategies without any research_strategy-side changes.
+    research_strategy_spec = _permanent_portfolio_research_strategy_spec()
+
+    template = _get_template("permanent_portfolio", research_strategy_spec=research_strategy_spec)
+
+    from research_strategy.rs.strategy import PermanentPortfolioStrategy
+    assert isinstance(template, PermanentPortfolioStrategy)
+    assert template.name == "permanent_portfolio"
+    assert hasattr(template, "generate_weights")
+    assert hasattr(template, "warmup_bars")
+
+
 def test_data_dir_uses_shared_data_dir():
     # Regression test: DATA_DIR used to be a per-project default_data_dir(__file__)
     # (this project's own default_data_dir was removed in the shared OHLCV cache
@@ -276,10 +313,12 @@ def test_run_walkforward_warms_up_indicator_lookback_before_each_fold():
         assert fold["total_rebalances"] == 12
 
 
-def _write_strategy_file(path, template_name="equal_weight", params=None, pattern_spec=None):
+def _write_strategy_file(path, template_name="equal_weight", params=None, pattern_spec=None, research_strategy_spec=None):
     strategy_def = {"template_name": template_name, "params": params or {"rebalance_freq_days": 10}}
     if pattern_spec is not None:
         strategy_def["pattern_spec"] = pattern_spec
+    if research_strategy_spec is not None:
+        strategy_def["research_strategy_spec"] = research_strategy_spec
     with open(path, "w") as f:
         json.dump(strategy_def, f)
 
@@ -318,6 +357,31 @@ def test_load_strategy_file_pattern_spec_missing_required_keys(tmp_path):
     _write_strategy_file(path, template_name="pattern_rsi_14_trough", pattern_spec=pattern_spec)
 
     with pytest.raises(ValueError, match="threshold"):
+        _load_strategy_file(str(path))
+
+
+def test_load_strategy_file_research_strategy_spec_missing_required_keys(tmp_path):
+    # Regression test mirroring test_load_strategy_file_pattern_spec_missing_required_keys:
+    # a research_strategy_spec block missing strategy_key/entry_data must raise
+    # a clear, named ValueError up front instead of a raw KeyError deep in
+    # _get_template.
+    path = tmp_path / "strategy.json"
+    research_strategy_spec = {
+        "strategy_key": "permanent_portfolio",
+        # "entry_data" intentionally omitted
+    }
+    _write_strategy_file(path, template_name="permanent_portfolio", research_strategy_spec=research_strategy_spec)
+
+    with pytest.raises(ValueError, match="entry_data"):
+        _load_strategy_file(str(path))
+
+
+def test_load_strategy_file_research_strategy_spec_wrong_types(tmp_path):
+    path = tmp_path / "strategy.json"
+    research_strategy_spec = {"strategy_key": 123, "entry_data": {}}
+    _write_strategy_file(path, template_name="permanent_portfolio", research_strategy_spec=research_strategy_spec)
+
+    with pytest.raises(ValueError, match="strategy_key"):
         _load_strategy_file(str(path))
 
 
@@ -428,6 +492,81 @@ def test_main_runs_pattern_based_strategy_end_to_end(tmp_path, monkeypatch):
 
     assert os.path.exists(results_dir / "backtest_equity.csv")
     assert os.path.exists(results_dir / "backtest_weights.csv")
+
+
+def test_main_runs_research_strategy_strategy_end_to_end(tmp_path, monkeypatch):
+    # A strategy.json carrying a research_strategy_spec (produced when
+    # strategy_generator's search picks a research_strategy candidate as the
+    # winner) must round-trip through main() exactly like a static template
+    # or a mined pattern does.
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(
+        strategy_path,
+        template_name="permanent_portfolio",
+        params={},
+        research_strategy_spec=_permanent_portfolio_research_strategy_spec(),
+    )
+    results_dir = tmp_path / "results"
+    cache_dir = tmp_path / "cache"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "SPY", "TLT", "BIL", "GLD",
+        "--data-provider", "synthetic",
+        "--mode", "standard",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    main()
+
+    assert os.path.exists(results_dir / "backtest_equity.csv")
+    assert os.path.exists(results_dir / "backtest_weights.csv")
+
+    weights = pd.read_csv(results_dir / "backtest_weights.csv", index_col=0)
+    for symbol in ("SPY", "TLT", "BIL", "GLD"):
+        assert symbol in weights.columns
+
+
+def test_main_runs_research_strategy_strategy_walkforward_end_to_end(tmp_path, monkeypatch):
+    # The critical proof-of-concept: the SAME research_strategy_spec-bearing
+    # strategy.json must also complete --mode walkforward without error and
+    # produce real (non-all-NaN) per-fold metrics -- concrete evidence that
+    # walk-forward fold warmup buffering (template.warmup_bars(params)) works
+    # correctly for a research_strategy-sourced strategy, something
+    # research_strategy's own CLI can never exercise (it has no walk-forward
+    # mode at all).
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(
+        strategy_path,
+        template_name="permanent_portfolio",
+        params={},
+        research_strategy_spec=_permanent_portfolio_research_strategy_spec(),
+    )
+    results_dir = tmp_path / "results"
+    cache_dir = tmp_path / "cache"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "SPY", "TLT", "BIL", "GLD",
+        "--data-provider", "synthetic",
+        "--mode", "walkforward",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    main()
+
+    report_path = results_dir / "walkforward_report.csv"
+    assert os.path.exists(report_path)
+    folds_df = pd.read_csv(report_path)
+    assert len(folds_df) > 0
+    assert folds_df["sharpe_ratio"].notna().any()
+    assert folds_df["cagr"].notna().any()
 
 
 # --- Feature 1/2/3: baseline comparison, walkforward summary, equity charting ---

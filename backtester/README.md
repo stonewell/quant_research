@@ -95,6 +95,16 @@ uv run python backtester/run_backtest.py \
   --strategy-file strategy_generator/results/strategy.json \
   --universe SPY QQQ AAPL MSFT NVDA GLD TLT IEF --mode standard
 
+# Re-running a research_strategy-sourced strategy (strategy.json with a research_strategy_spec
+# block -- a research_strategy strategy that won strategy_generator's search) on a new basket;
+# works identically in both --mode standard and --mode walkforward
+uv run python backtester/run_backtest.py \
+  --strategy-file strategy_generator/results/strategy.json \
+  --universe SPY TLT BIL GLD --mode standard
+uv run python backtester/run_backtest.py \
+  --strategy-file strategy_generator/results/strategy.json \
+  --universe SPY TLT BIL GLD --mode walkforward
+
 # Custom results/cache directories, no local caching of the fetched data
 uv run python backtester/run_backtest.py \
   --strategy-file strategy_generator/results/strategy.json \
