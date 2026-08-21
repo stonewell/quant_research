@@ -211,7 +211,12 @@ strategy_generator/
     generator.py       Grid search across common/allocation_templates.py's 9 templates PLUS any
                         extra_templates (mined patterns), scored via common/allocation_backtester.py,
                         + Equivalent Random Search + the optional factor-report tie-break
-                        (_apply_factor_tiebreak)
+                        (_apply_factor_tiebreak). The grid-search/ERS mechanics themselves
+                        (grid_combinations, RandomAllocationTemplate, grid_search_template,
+                        run_ers_validation) now live in ../common/allocation_search.py, shared with
+                        backtester's --optimize feature -- generator.py just supplies the
+                        _portfolio_score callback and its own multi-template reduction/tiebreak on top;
+                        no CLI flags, strategy.json schema, or user-visible behavior changed.
     turning_points.py   Percentage-based zigzag peak/trough detector (nothing like this exists
                         elsewhere in this workspace) -- used only by pattern_mining.py
     pattern_mining.py   Aggregate-curve turning-point detection -> indicator feature menu ->

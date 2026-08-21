@@ -89,6 +89,46 @@ fold count), `n_valid_folds` (`int`, folds with a non-`NaN` `sharpe_ratio`), `fo
 `n_valid_folds` independent trials). When `n_valid_folds < 2`, `fold_sharpe_std` and
 `deflated_sharpe_ratio` are both `null` (a std/DSR isn't computable from fewer than 2 folds).
 
+### `results/optimize_report.json` (only when `--optimize` is set, ALWAYS written -- success or failure)
+
+Written by the shared `common/allocation_search.py` grid-search + Equivalent Random Search (ERS)
+mechanism (`optimize_template()`), the same one `strategy_generator` uses internally, applied here
+to re-tune the ALREADY-CHOSEN template's `param_grid` on THIS run's universe/mode, instead of
+silently trusting the strategy file's original params. Fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `status` | `"success"` \| `"failed"` | `"success"` iff the winning grid-search combination passed ERS validation (`trusted`); `"failed"` otherwise |
+| `reason` | str or `null` | `null` on success. On failure: either an ERS-percentile message (`ers_passed` was `False`) or a `total_rebalances`-vs-`--min-rebalances-for-trust` message (`ers_passed` was `True` but the winner didn't rebalance often enough to be trusted) |
+| `original_params` | dict | The strategy file's original `params`, unmodified |
+| `original_result` | dict | The score_fn result of scoring `original_params` once, for comparison. Shape differs by mode -- see below |
+| `best_params` | dict | The winning grid-search combination's params (identical to `original_params` when `template.param_grid` is empty, e.g. a `research_strategy_spec`-sourced template) |
+| `best_result` | dict | The score_fn result of scoring `best_params`. Same per-mode shape as `original_result` |
+| `ers_percentile` | float | `best_params`'s Sharpe percentile rank against the Equivalent Random Search pool (`0.0`-`1.0`) |
+| `ers_passed` | bool | Whether `ers_percentile >= --ers-percentile-threshold` |
+| `trusted` | bool | `ers_passed AND best_result["total_rebalances"] >= --min-rebalances-for-trust` -- this is what actually gates whether the final backtest uses `best_params` or falls back to `original_params` |
+| `n_trials` | int | Total number of (template, params) combinations scored: grid combinations + `--n-random-search` |
+| `improvement` | dict | `{"sharpe_ratio": best - original, "cagr": best - original}` (the `sharpe_ratio`/`cagr` keys of `best_result`/`original_result`) |
+
+`original_result`/`best_result`'s shape differs by mode:
+
+- **`--mode standard`:** the flat `run_standard()` result dict (`common/README.md` §4 shape) --
+  `sharpe_ratio`, `cagr`, `max_drawdown`, `calmar_ratio`, `win_rate`, `profit_factor`,
+  `total_turnover`, `total_rebalances`, plus `equity_curve`/`actual_weights` (DataFrames, rendered
+  as their `str()` form in the JSON since a DataFrame isn't natively JSON-serializable -- for the
+  actual equity curve/weights use `backtest_equity.csv`/`backtest_weights.csv` instead, which
+  always reflect whichever params (`best_params` or the `original_params` fallback) the final run
+  actually used).
+- **`--mode walkforward`:** `sharpe_ratio` (mean across finite-Sharpe folds, `-inf` if every fold
+  was non-finite), `total_rebalances`/`total_turnover` (summed across folds), and `folds` (the full
+  per-fold list `run_walkforward()` returns, same shape as `walkforward_report.csv`'s rows). No
+  `cagr` key at this level, so `improvement.cagr` is always `null` in `--mode walkforward`.
+
+Regardless of `status`, the backtest that runs immediately after (and therefore
+`backtest_equity.csv`/`backtest_weights.csv`/`walkforward_report.csv`/everything else this file
+documents) uses `best_params` on success or `original_params` on failure -- `--optimize` never
+produces no output, even when tuning doesn't pass validation.
+
 ### `results/equity_curve.png` (`--mode standard`, unless `--no-plots`)
 
 A PNG line chart of the strategy's equity curve (see `common/plotting.py`'s `plot_equity_curve`).

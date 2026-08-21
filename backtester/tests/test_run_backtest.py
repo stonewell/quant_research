@@ -408,6 +408,27 @@ class _FlakySymbolProvider(BaseDataProvider):
 register_provider("flaky_symbol_test_provider", _FlakySymbolProvider)
 
 
+class _MomentumDivergenceProvider(BaseDataProvider):
+    """Deterministic, noise-free synthetic provider (no network) used only by
+    the --optimize success-scenario test below: one smoothly, strongly
+    trending-UP symbol ("WIN") and three smoothly trending-DOWN symbols, so
+    cross_sectional_momentum's top_n_fraction=0.25 (concentrate in the sole
+    winner) clearly and reliably dominates every other grid combination
+    (any mom_lookback, any rebalance_freq_days) -- a real, deterministic
+    "one combo obviously wins" fixture instead of relying on GBM noise."""
+
+    _SLOPES = {"WIN": 0.5, "L1": -0.10, "L2": -0.15, "L3": -0.20}
+
+    def fetch_ohlcv(self, symbol, start, end, interval="1d"):
+        n = 400
+        slope = self._SLOPES[symbol]
+        closes = 100.0 + slope * np.arange(n)
+        return make_df(closes, start="2020-01-01")
+
+
+register_provider("momentum_divergence_test_provider", _MomentumDivergenceProvider)
+
+
 def test_main_skips_bad_symbol_and_continues(tmp_path, monkeypatch, capsys):
     strategy_path = tmp_path / "strategy.json"
     _write_strategy_file(strategy_path)
@@ -894,3 +915,211 @@ def test_main_walkforward_mode_never_calls_plotting(mock_plot, tmp_path, monkeyp
     main()
 
     mock_plot.assert_not_called()
+
+
+# --- Feature 4: --optimize (shared grid-search + ERS validation via common/allocation_search.py) ---
+
+
+def test_optimize_arg_parser_defaults_and_overrides():
+    args = build_arg_parser().parse_args(["--strategy-file", "strategy.json"])
+    assert args.optimize is False
+    assert args.n_random_search == 200
+    assert args.ers_percentile_threshold == 0.90
+    assert args.min_rebalances_for_trust == 4
+
+    args = build_arg_parser().parse_args([
+        "--strategy-file", "strategy.json",
+        "--optimize",
+        "--n-random-search", "10",
+        "--ers-percentile-threshold", "0.5",
+        "--min-rebalances-for-trust", "2",
+    ])
+    assert args.optimize is True
+    assert args.n_random_search == 10
+    assert args.ers_percentile_threshold == 0.5
+    assert args.min_rebalances_for_trust == 2
+
+
+def test_main_optimize_success_scenario_tunes_and_uses_best_params(tmp_path, monkeypatch):
+    # cross_sectional_momentum's top_n_fraction=0.25 (concentrate in the sole
+    # trending-up winner) must clearly dominate every other grid combination
+    # on this deterministic fixture, clear ERS at a lenient threshold, and --
+    # critically -- the FINAL backtest (not just the tuning search) must
+    # actually run with those tuned params, not the strategy file's original.
+    strategy_path = tmp_path / "strategy.json"
+    original_params = {"mom_lookback": 252, "top_n_fraction": 0.5, "rebalance_freq_days": 63}
+    _write_strategy_file(strategy_path, template_name="cross_sectional_momentum", params=original_params)
+    results_dir = tmp_path / "results"
+    cache_dir = tmp_path / "cache"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "WIN", "L1", "L2", "L3",
+        "--data-provider", "momentum_divergence_test_provider",
+        "--no-cache",
+        "--mode", "standard",
+        "--optimize",
+        "--n-random-search", "20",
+        "--ers-percentile-threshold", "0.5",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+        "--no-plots",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with patch("backtester.run_backtest.run_standard", wraps=backtester.run_backtest.run_standard) as mock_run_standard:
+        main()
+
+    report_path = results_dir / "optimize_report.json"
+    assert os.path.exists(report_path)
+    with open(report_path) as f:
+        report = json.load(f)
+
+    assert report["status"] == "success"
+    assert report["trusted"] is True
+    assert report["ers_passed"] is True
+    assert report["reason"] is None
+    assert report["best_params"] != original_params
+    assert report["best_params"]["top_n_fraction"] == 0.25
+
+    # The critical regression check: the FINAL run_standard call (the one
+    # that actually produced backtest_equity.csv) must have used the tuned
+    # best_params, not the strategy file's original params.
+    final_call_params = mock_run_standard.call_args_list[-1][0][2]
+    assert final_call_params == report["best_params"]
+
+    assert os.path.exists(results_dir / "backtest_equity.csv")
+
+
+def test_main_optimize_failure_falls_back_to_original_params(tmp_path, monkeypatch):
+    # An unreachable --ers-percentile-threshold (> 1.0, the max possible
+    # percentile) guarantees ERS validation fails deterministically,
+    # regardless of the underlying data -- exercising the fallback path
+    # without relying on data-dependent luck.
+    strategy_path = tmp_path / "strategy.json"
+    original_params = {"rebalance_freq_days": 21}
+    _write_strategy_file(strategy_path, template_name="equal_weight", params=original_params)
+    results_dir = tmp_path / "results"
+    cache_dir = tmp_path / "cache"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "A", "B",
+        "--data-provider", "synthetic",
+        "--mode", "standard",
+        "--optimize",
+        "--n-random-search", "10",
+        "--ers-percentile-threshold", "1.1",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+        "--no-plots",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with patch("backtester.run_backtest.run_standard", wraps=backtester.run_backtest.run_standard) as mock_run_standard:
+        main()
+
+    report_path = results_dir / "optimize_report.json"
+    assert os.path.exists(report_path)
+    with open(report_path) as f:
+        report = json.load(f)
+
+    assert report["status"] == "failed"
+    assert report["trusted"] is False
+    assert report["ers_passed"] is False
+    assert report["reason"] is not None
+    assert "ERS percentile" in report["reason"]
+
+    # Critical regression check: the FINAL backtest must have run with the
+    # ORIGINAL strategy-file params, not whatever the grid search picked.
+    final_call_params = mock_run_standard.call_args_list[-1][0][2]
+    assert final_call_params == original_params
+
+    assert os.path.exists(results_dir / "backtest_equity.csv")
+
+
+def test_main_optimize_walkforward_mode_exercises_walkforward_score_fn(tmp_path, monkeypatch):
+    # --optimize under --mode walkforward must score every candidate via
+    # run_walkforward (the walkforward-specific score_fn), not run_standard --
+    # verified by counting actual run_walkforward calls: 1 for the original
+    # params, one per grid combination, one per random-search draw, and one
+    # more for the FINAL run after tuning.
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(strategy_path, template_name="equal_weight", params={"rebalance_freq_days": 21})
+    results_dir = tmp_path / "results"
+    cache_dir = tmp_path / "cache"
+
+    n_random_search = 5
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "A", "B",
+        "--data-provider", "synthetic",
+        "--mode", "walkforward",
+        "--window-years", "0.5",
+        "--step-years", "0.25",
+        "--optimize",
+        "--n-random-search", str(n_random_search),
+        "--ers-percentile-threshold", "0.5",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with patch("backtester.run_backtest.run_walkforward", wraps=backtester.run_backtest.run_walkforward) as mock_run_walkforward:
+        main()
+
+    n_grid_combinations = 3  # equal_weight's param_grid: rebalance_freq_days has 3 values
+    expected_calls = 1 + n_grid_combinations + n_random_search + 1  # original + grid + random + final run
+    assert mock_run_walkforward.call_count == expected_calls
+
+    assert os.path.exists(results_dir / "optimize_report.json")
+    assert os.path.exists(results_dir / "walkforward_report.csv")
+
+    with open(results_dir / "optimize_report.json") as f:
+        report = json.load(f)
+    assert "folds" in report["original_result"]
+    assert "folds" in report["best_result"]
+
+
+def test_main_optimize_research_strategy_spec_empty_param_grid(tmp_path, monkeypatch):
+    # A research_strategy_spec-sourced template (param_grid={}) needs no
+    # special-casing -- optimize_template's degenerate single-combination
+    # path must flow through cleanly, with best_params staying {}.
+    # _write_strategy_file's `params or {"rebalance_freq_days": 10}` default
+    # treats an explicit {} as falsy, so it's written directly here instead --
+    # this test specifically needs a genuinely empty params dict on disk.
+    strategy_path = tmp_path / "strategy.json"
+    with open(strategy_path, "w") as f:
+        json.dump({
+            "template_name": "permanent_portfolio",
+            "params": {},
+            "research_strategy_spec": _permanent_portfolio_research_strategy_spec(),
+        }, f)
+    results_dir = tmp_path / "results"
+    cache_dir = tmp_path / "cache"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "SPY", "TLT", "BIL", "GLD",
+        "--data-provider", "synthetic",
+        "--mode", "standard",
+        "--optimize",
+        "--n-random-search", "5",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+        "--no-plots",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    main()  # must not crash
+
+    with open(results_dir / "optimize_report.json") as f:
+        report = json.load(f)
+
+    assert report["best_params"] == {}
+    assert report["original_params"] == {}
+    assert os.path.exists(results_dir / "backtest_equity.csv")

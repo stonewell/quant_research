@@ -49,6 +49,10 @@ all of them raises `ValueError("No universe symbols provided or resolved...")`.
 | `--baseline-symbol` | str, default: none | Optional single reference symbol (e.g. `SPY`) to compare the strategy against. Off by default — none of the comparison code runs unless this is set |
 | `--baseline-template` | str, default `"equal_weight"` | Static allocation template (one of the 9 in `ALLOCATION_TEMPLATES` — no `pattern_*` templates) used to turn `--baseline-symbol` into a baseline equity curve |
 | `--baseline-params` | JSON str, default: none | Params for `--baseline-template` as a JSON object string (default: that template's first `param_grid` combination) |
+| `--optimize` | flag, default off | Grid-search the loaded strategy's `template.param_grid` on THIS universe (scored via the same `--mode` you selected) and Equivalent-Random-Search-validate the winner (via the shared `common/allocation_search.py`) before running the final backtest. If the winner fails ERS validation, falls back to the strategy file's ORIGINAL params — never silently produces no output. Always writes `results/optimize_report.json` (see `SCHEMAS.md`) |
+| `--n-random-search` | int, default `200` | Size of the Equivalent Random Search pool used to validate `--optimize`'s winning combination |
+| `--ers-percentile-threshold` | float, default `0.90` | How far above the random-portfolio pool the winning combination must rank to be trusted |
+| `--min-rebalances-for-trust` | int, default `4` | Minimum `total_rebalances` the winning combination must have before it's trusted, even if it clears the ERS percentile |
 | `--data-provider` | str, default `"yfinance"` | `yfinance`, `csv`, `synthetic`, or a custom module specifier |
 | `--data-dir` | path, default: none | Folder path for the `csv` data provider |
 | `--no-cache` | flag, default off (cached) | Disable local CSV caching of fetched data |
@@ -132,6 +136,20 @@ uv run python backtester/run_backtest.py \
   --strategy-file strategy_generator/results/strategy.json \
   --universe A B C --data-provider synthetic --mode walkforward \
   --baseline-symbol SPY --baseline-params '{"rebalance_freq_days": 21}'
+
+# --optimize: re-tune the loaded strategy's params on this universe/mode and
+# ERS-validate the winner before running the final backtest (synthetic data)
+uv run python backtester/run_backtest.py \
+  --strategy-file strategy_generator/results/strategy.json \
+  --universe A B C --data-provider synthetic --mode standard \
+  --optimize --n-random-search 200 --ers-percentile-threshold 0.90
+
+# --optimize under --mode walkforward: each candidate is scored by its MEAN
+# fold Sharpe across the same rolling windows walkforward would report
+uv run python backtester/run_backtest.py \
+  --strategy-file strategy_generator/results/strategy.json \
+  --universe A B C --data-provider synthetic --mode walkforward \
+  --optimize --n-random-search 100 --ers-percentile-threshold 0.90 --min-rebalances-for-trust 4
 ```
 
 Outputs land in `results/` (or `--results-dir` if given): `backtest_equity.csv` and
@@ -141,4 +159,7 @@ see `SCHEMAS.md` for column-level detail. `--mode walkforward` also always write
 `--baseline-symbol` is set: `baseline_equity.csv` and `comparison_report.json` are written in both
 modes, and `walkforward_report.csv` gains 5 extra `baseline_*`/`outperformance` columns. In
 `--mode standard`, unless `--no-plots` is given, `equity_curve.png` is also written (a two-line
-chart, strategy vs. baseline, if `--baseline-symbol` is set).
+chart, strategy vs. baseline, if `--baseline-symbol` is set). When `--optimize` is set,
+`results/optimize_report.json` is always written (success or failure) — see `SCHEMAS.md` — and, on
+a trusted win, the FINAL backtest (and therefore every other output above) reflects the tuned
+`best_params` instead of the strategy file's original params.

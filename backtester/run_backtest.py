@@ -27,6 +27,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from common.allocation_backtester import run_allocation_backtest
+from common.allocation_search import optimize_template
 from common.allocation_templates import ALLOCATION_TEMPLATES, PatternBasedAllocationTemplate
 from common.cli_utils import (
     add_data_provider_cli_args,
@@ -64,6 +65,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Static allocation template used to turn --baseline-symbol into a baseline equity curve (default: equal_weight)")
     p.add_argument("--baseline-params", type=str, default=None,
                    help="JSON object string of params for --baseline-template (default: the template's first param_grid combination)")
+    p.add_argument("--optimize", action="store_true",
+        help="Grid-search the loaded strategy's template.param_grid on THIS universe (scored via "
+             "the same --mode you selected) and Equivalent-Random-Search-validate the winner before "
+             "running the final backtest. If the winner fails ERS validation, falls back to the "
+             "strategy.json's ORIGINAL params (never silently produces no output) -- see "
+             "results/optimize_report.json either way.")
+    p.add_argument("--n-random-search", type=int, default=200)
+    p.add_argument("--ers-percentile-threshold", type=float, default=0.90)
+    p.add_argument("--min-rebalances-for-trust", type=int, default=4)
     add_data_provider_cli_args(p)
     p.add_argument("--results-dir", type=str, default=None,
                    help=f"Override the output directory for equity/weights/report CSVs (default: {RESULTS_DIR})")
@@ -322,6 +332,26 @@ def run_walkforward(universe: dict, template, params: dict, args) -> list:
     return folds
 
 
+def _standard_score_fn(universe, args):
+    def score_fn(template, params):
+        return run_standard(universe, template, params, args)
+    return score_fn
+
+
+def _walkforward_score_fn(universe, args):
+    def score_fn(template, params):
+        folds = run_walkforward(universe, template, params, args)
+        sharpes = [f["sharpe_ratio"] for f in folds if np.isfinite(f["sharpe_ratio"])]
+        mean_sharpe = float(np.mean(sharpes)) if sharpes else float("-inf")
+        total_rebalances = sum(f.get("total_rebalances", 0) for f in folds)
+        total_turnover = sum(f.get("total_turnover", 0.0) for f in folds)
+        return {
+            "sharpe_ratio": mean_sharpe, "total_rebalances": total_rebalances,
+            "total_turnover": total_turnover, "folds": folds,
+        }
+    return score_fn
+
+
 def _resolve_baseline_params(template, baseline_params_json: str = None) -> dict:
     """Same JSON-object-string convention `common/universe.py`'s
     `resolve_universe_from_args` uses for `--universe-kwargs`: parse if given,
@@ -447,6 +477,55 @@ def main():
                                           cache_max_age_days=args.cache_ttl_days)
 
     os.makedirs(results_dir, exist_ok=True)
+
+    if args.optimize:
+        optimize_template_instance = _get_template(template_name, pattern_spec, research_strategy_spec)
+        score_fn = _standard_score_fn(universe, args) if args.mode == "standard" else _walkforward_score_fn(universe, args)
+
+        original_result = score_fn(optimize_template_instance, params)
+
+        opt = optimize_template(
+            universe, optimize_template_instance, score_fn,
+            n_random_search=args.n_random_search,
+            ers_percentile_threshold=args.ers_percentile_threshold,
+            min_rebalances_for_trust=args.min_rebalances_for_trust,
+        )
+
+        original_sharpe = original_result.get("sharpe_ratio", float("-inf"))
+        best_sharpe = opt["best_result"].get("sharpe_ratio", float("-inf"))
+        status = "success" if opt["trusted"] else "failed"
+        reason = None
+        if not opt["trusted"]:
+            if not opt["ers_passed"]:
+                reason = (f"ERS percentile {opt['ers_percentile']:.2f} < required "
+                           f"{args.ers_percentile_threshold:.2f}")
+            else:
+                reason = (f"winning combo's total_rebalances "
+                           f"({opt['best_result'].get('total_rebalances', 0)}) < "
+                           f"--min-rebalances-for-trust ({args.min_rebalances_for_trust})")
+
+        optimize_report = {
+            "status": status, "reason": reason,
+            "original_params": params, "original_result": original_result,
+            "best_params": opt["best_params"], "best_result": opt["best_result"],
+            "ers_percentile": opt["ers_percentile"], "ers_passed": opt["ers_passed"], "trusted": opt["trusted"],
+            "n_trials": opt["n_trials"],
+            "improvement": {
+                "sharpe_ratio": best_sharpe - original_sharpe,
+                "cagr": opt["best_result"].get("cagr", float("nan")) - original_result.get("cagr", float("nan")),
+            },
+        }
+        optimize_report_path = os.path.join(results_dir, "optimize_report.json")
+        write_json_report(optimize_report, optimize_report_path)
+
+        print(f"\n=== Optimize: {status} ===")
+        if opt["trusted"]:
+            print(f"  Tuned params {params} -> {opt['best_params']} "
+                  f"(Sharpe {original_sharpe:.2f} -> {best_sharpe:.2f}, ERS percentile {opt['ers_percentile']:.2f})")
+            params = opt["best_params"]
+        else:
+            print(f"  Tuning did NOT pass validation ({reason}) -- falling back to original params {params}.")
+        print(f"Saved optimize report to {optimize_report_path}")
 
     if args.mode == "standard":
         print("\n=== Running Standard Backtest ===")

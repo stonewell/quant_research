@@ -9,7 +9,6 @@ a pool of random-weight portfolios (where weights sum to 1.0 at each rebalance)
 to ensure the result is genuinely better than chance.
 """
 
-import itertools
 import warnings
 from dataclasses import dataclass, field
 
@@ -17,6 +16,12 @@ import numpy as np
 import pandas as pd
 
 from common.allocation_backtester import run_allocation_backtest
+from common.allocation_search import (
+    RandomAllocationTemplate,
+    grid_combinations,
+    grid_search_template,
+    run_ers_validation,
+)
 from common.allocation_templates import ALLOCATION_TEMPLATES
 from .metrics import sharpe_ratio
 
@@ -88,48 +93,6 @@ def _portfolio_score(universe: dict, template, params: dict, config: GeneratorCo
             category=RuntimeWarning,
         )
         return {"sharpe_ratio": float("-inf"), "total_rebalances": 0, "total_turnover": 0.0}
-
-
-def grid_combinations(param_grid: dict) -> list:
-    if not param_grid:
-        return [{}]
-    keys = list(param_grid.keys())
-    return [dict(zip(keys, combo)) for combo in itertools.product(*param_grid.values())]
-
-
-def _random_weights(universe: dict, rebalance_freq_days: int, rng: np.random.Generator) -> pd.DataFrame:
-    """Generates a random valid weight matrix (sums to 1.0 on rebalance days).
-    Sparse (NaN off rebalance dates), matching the contract every
-    AllocationTemplate.generate_weights must follow -- see allocation_templates.py."""
-    symbols = list(universe.keys())
-    if not symbols:
-        return pd.DataFrame()
-
-    master_index = universe[symbols[0]].index
-    rebalance_dates = master_index[::rebalance_freq_days]
-
-    n_dates = len(rebalance_dates)
-    n_symbols = len(symbols)
-
-    # Generate random weights (Dirichlet distribution equivalent)
-    raw_w = rng.exponential(scale=1.0, size=(n_dates, n_symbols))
-    norm_w = raw_w / raw_w.sum(axis=1, keepdims=True)
-
-    weights_rebal = pd.DataFrame(norm_w, index=rebalance_dates, columns=symbols)
-
-    weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
-    weights_df.loc[rebalance_dates] = weights_rebal
-
-    return weights_df
-
-
-class RandomAllocationTemplate:
-    """A dummy template used purely for the ERS check."""
-    def __init__(self, rng: np.random.Generator):
-        self.rng = rng
-
-    def generate_weights(self, universe: dict, params: dict) -> pd.DataFrame:
-        return _random_weights(universe, params["rebalance_freq_days"], self.rng)
 
 
 def _factor_score(template, factor_report: dict):
@@ -212,6 +175,8 @@ def _search_allocation(universe: dict, cfg: GeneratorConfig, factor_report: dict
     # 1. Grid Search across all templates (static + any pre-instantiated extras)
     templates = [template_cls() for template_cls in ALLOCATION_TEMPLATES] + list(extra_templates or [])
 
+    score_fn = lambda template, params: _portfolio_score(universe, template, params, cfg)
+
     names_seen = set()
     for template in templates:
         if template.name in names_seen:
@@ -222,16 +187,15 @@ def _search_allocation(universe: dict, cfg: GeneratorConfig, factor_report: dict
             )
         names_seen.add(template.name)
 
-        combos = grid_combinations(template.param_grid)
-        total_grid_trials += len(combos)
+        trials = grid_search_template(template, score_fn)
+        total_grid_trials += len(trials)
 
-        for params in combos:
-            res = _portfolio_score(universe, template, params, cfg)
+        for t in trials:
             all_results.append({
                 "template": template,
-                "params": params,
-                "res": res,
-                "score": res.get("sharpe_ratio", float("-inf")),
+                "params": t["params"],
+                "res": t["result"],
+                "score": t["score"],
             })
 
     # Find the best (template, params) combo per DISTINCT template -- needed
@@ -251,25 +215,12 @@ def _search_allocation(universe: dict, cfg: GeneratorConfig, factor_report: dict
     best_res = best_result["res"]
 
     # 2. Equivalent Random Search (ERS)
-    rng = np.random.default_rng(cfg.seed)
-    random_scores = []
-    random_template = RandomAllocationTemplate(rng)
-
-    # Use the winning rebalance frequency for a fair comparison
-    winning_freq = best_result["params"].get("rebalance_freq_days", 21)
-
-    for _ in range(cfg.n_random_search):
-        res = _portfolio_score(universe, random_template, {"rebalance_freq_days": winning_freq}, cfg)
-        s = res.get("sharpe_ratio", float("-inf"))
-        if np.isfinite(s):
-            random_scores.append(s)
-
-    # If every random trial failed/returned non-finite, there is no pool to
-    # compare against -- default to 0.0 (fail-safe: this candidate has NOT
-    # been shown to beat anything), not 1.0 (a trivial, unearned "pass").
-    ers_percentile = float((np.array(random_scores) < best_score).mean()) if random_scores else 0.0
-    ers_passed = ers_percentile >= cfg.ers_percentile_threshold
-    trusted = ers_passed and best_res.get("total_rebalances", 0) >= cfg.min_rebalances_for_trust
+    ers = run_ers_validation(
+        best_result["params"], best_score, best_res, score_fn,
+        n_random_search=cfg.n_random_search, ers_percentile_threshold=cfg.ers_percentile_threshold,
+        min_rebalances_for_trust=cfg.min_rebalances_for_trust, seed=cfg.seed,
+    )
+    ers_percentile, ers_passed, trusted = ers["ers_percentile"], ers["ers_passed"], ers["trusted"]
 
     return {
         "template": best_result["template"],
