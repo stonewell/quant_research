@@ -110,6 +110,22 @@
     },
     "factors": ["absolute_momentum_trend", "mean_reversion"]
   },
+  "chan_pivot_shift": {
+    "name": "Chan Pivot Shift",
+    "type": "class",
+    "class_name": "ChanPivotShiftStrategy",
+    "description": "Original, from-scratch reading of Chan theory (缠中说缠): buys once the price pivot (consolidation range) steps up to a wholly higher band and a confirming pullback low forms; not a port of the third-party czsc library.",
+    "parameters": {
+      "chan_symbol": "SPY",
+      "chan_min_gap_bars": 4,
+      "chan_min_strokes": 3,
+      "chan_stop_loss_pct": 0.08,
+      "chan_max_holding_days": 90,
+      "chan_position_size_pct": 1.0,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["regime_trend_strength", "absolute_momentum_trend"]
+  },
   "adaptive_grid": {
     "name": "ATR-Adaptive Grid",
     "type": "class",

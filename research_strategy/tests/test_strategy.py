@@ -30,6 +30,7 @@ from research_strategy.rs.strategy import (
     AdaptiveGridStrategy,
     AllWeatherStrategy,
     BoldAssetAllocation,
+    ChanPivotShiftStrategy,
     EnsembleRegimeSwitchingStrategy,
     GoldenButterflyStrategy,
     HFEAStrategy,
@@ -585,6 +586,117 @@ def test_swing_multi_asset_normalizes_weights_when_multiple_symbols_trigger():
     strat = SwingTrendPullbackStrategy(cfg)
     # swing_symbol defaults to "SPY", now correctly honored as "trade just
     # SPY" -- multi-asset evaluation is an explicit opt-in via params.
+    weights = strat.generate_weights(universe, params={"symbols": ["SPY", "QQQ"]})
+    daily = _daily(weights)
+
+    assert "SPY" in daily.columns
+    assert "QQQ" in daily.columns
+    assert (daily["SPY"] + daily["QQQ"] <= 1.0 + 1e-9).all()
+    np.testing.assert_allclose(daily["SPY"] + daily["QQQ"] + daily["BIL"], 1.0)
+
+
+# --- ChanPivotShiftStrategy -----------------------------------------------
+# All fixtures below are synthetic-only, per this file's offline testing
+# policy. This strategy is an independent, from-scratch reading of Chan
+# theory (see rs/chan_structure.py) -- it shares no code with, and was not
+# validated against, the third-party `czsc` library.
+
+def _chan_breakout_closes(tail=None):
+    """Deterministic closes array with two Chan pivots: an initial range
+    around [90, 100] (bars 1-30), then a breakout to a wholly higher range
+    around [104, 114] (bars 31-70), followed by 20 bars of runway (bars
+    71-90) so the pivot-shift-up signal's 1-bar confirmation lag always
+    lands inside the array. `tail` (if given) is appended after that."""
+
+    def leg(a, b, n):
+        return np.linspace(a, b, n + 1)[1:]
+
+    zigzag = np.concatenate(
+        [
+            [100.0],
+            leg(100, 90, 10), leg(90, 100, 10), leg(100, 90, 10),          # pivot #1 ~ [90, 100]
+            leg(90, 112, 10), leg(112, 104, 10), leg(104, 114, 10), leg(114, 104, 10),  # pivot #2 ~ [104, 114]
+            leg(104, 108, 20),                                            # runway past the confirmation bar
+        ]
+    )
+    return zigzag if tail is None else np.concatenate([zigzag, tail])
+
+
+def test_chan_enters_only_after_the_pivot_shifts_to_a_higher_range():
+    universe = _timing_universe(make_ohlcv_from_closes(_chan_breakout_closes()))
+    strat = ChanPivotShiftStrategy()
+    weights = strat.generate_weights(universe)
+    daily = _daily(weights)
+
+    # Comfortably before the 2nd pivot's window can even close (bar ~71):
+    # no entry should exist yet -- the entry marks a real pivot shift, not
+    # noise from the first (lower) range.
+    assert not (daily["SPY"].iloc[:65] > 0).any(), "no entry before the pivot actually shifts up"
+    assert (daily["SPY"].iloc[65:] > 0).any(), "should enter once the pivot shifts to the higher range"
+
+
+def test_chan_no_entry_on_a_pure_monotonic_decline():
+    closes = 100.0 - 0.1 * np.arange(300)
+    universe = _timing_universe(make_ohlcv_from_closes(closes))
+    strat = ChanPivotShiftStrategy()
+    weights = strat.generate_weights(universe)
+    daily = _daily(weights)
+    # A strictly monotonic path never forms an interior fractal, so no
+    # stroke/pivot -- and therefore no buy signal -- can ever form.
+    assert (daily["SPY"] == 0).all()
+
+
+def test_chan_stop_loss_forces_an_exit():
+    decline = np.linspace(108.0, 40.0, 41)[1:]
+    universe = _timing_universe(make_ohlcv_from_closes(_chan_breakout_closes(tail=decline)))
+    cfg = StrategyConfig(chan_stop_loss_pct=0.05, chan_max_holding_days=None)
+    strat = ChanPivotShiftStrategy(cfg)
+    weights = strat.generate_weights(universe)
+    daily = _daily(weights)
+
+    assert (daily["SPY"] > 0).any(), "should have entered after the pivot shift"
+    entry_day = daily.index[daily["SPY"] > 0][0]
+    entry_price = universe["SPY"]["Close"].loc[entry_day]
+    close = universe["SPY"]["Close"]
+    breach_day = close.index[(close / entry_price - 1 <= -0.05) & (close.index > entry_day)][0]
+    assert daily.loc[breach_day, "SPY"] == 0.0
+
+
+def test_chan_max_holding_days_forces_an_exit():
+    runway = np.linspace(108.0, 110.0, 31)[1:]
+    universe = _timing_universe(make_ohlcv_from_closes(_chan_breakout_closes(tail=runway)))
+    cfg = StrategyConfig(chan_stop_loss_pct=None, chan_max_holding_days=5)
+    strat = ChanPivotShiftStrategy(cfg)
+    weights = strat.generate_weights(universe)
+    daily = _daily(weights)
+
+    assert (daily["SPY"] > 0).any(), "should have entered after the pivot shift"
+    entry_day_pos = np.flatnonzero(daily["SPY"].to_numpy() > 0)[0]
+    assert daily["SPY"].iloc[entry_day_pos + 5] == 0.0
+
+
+def test_chan_missing_symbol_returns_empty():
+    universe = _timing_universe(make_oscillating_df(n=100))
+    cfg = StrategyConfig(chan_symbol="NOT_IN_UNIVERSE")
+    assert ChanPivotShiftStrategy(cfg).generate_weights(universe).empty
+
+
+def test_chan_warmup_bars():
+    cfg = StrategyConfig(chan_min_gap_bars=4, chan_min_strokes=3)
+    assert ChanPivotShiftStrategy(cfg).warmup_bars() == 3 * 2 * (4 + 2)
+
+
+def test_chan_multi_asset_normalizes_weights_when_multiple_symbols_trigger():
+    closes = _chan_breakout_closes()
+    df1 = make_ohlcv_from_closes(closes)
+    df2 = make_ohlcv_from_closes(closes, start=str(df1.index[0].date()))
+    universe = {
+        "SPY": df1,
+        "QQQ": df2,
+        "BIL": make_ohlcv_from_closes([100.0] * len(closes), start=str(df1.index[0].date())),
+    }
+    cfg = StrategyConfig(chan_position_size_pct=1.0)
+    strat = ChanPivotShiftStrategy(cfg)
     weights = strat.generate_weights(universe, params={"symbols": ["SPY", "QQQ"]})
     daily = _daily(weights)
 
@@ -1198,7 +1310,7 @@ def test_aaa_empty_universe_returns_empty_frame():
 
 @pytest.mark.parametrize("key", [
     "permanent_portfolio", "golden_butterfly", "all_weather", "hfea",
-    "protective_asset_allocation", "adaptive_asset_allocation",
+    "protective_asset_allocation", "adaptive_asset_allocation", "chan_pivot_shift",
 ])
 def test_new_strategies_instantiate_and_run_from_json_config(key):
     config = load_strategies_config()

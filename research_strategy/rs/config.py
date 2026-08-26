@@ -13,6 +13,11 @@ Grounding:
    for the full research grounding each one carried, and the close-based
    approximation each port discloses relative to its original event-driven,
    intrabar-aware backtester).
+7. Chan Pivot Shift: an original, from-scratch reading of 缠中说禅 (Chan
+   theory) written natively for this project -- NOT a port of, or
+   dependency on, the third-party `czsc` Rust/Python library. See
+   `rs/chan_structure.py` for the structure detector and its disclosed
+   simplifications.
 """
 
 import json
@@ -233,6 +238,19 @@ class StrategyConfig:
     turtle_trend_ma_period: int = 200
     turtle_position_sizing_mode: str = "inverse_atr"  # "inverse_atr" or "equal_weight"
 
+    # --- Chan Pivot Shift (original, from-scratch reading of 缠中说禅/Chan
+    # theory -- see rs/chan_structure.py; NOT ported from the `czsc`
+    # library). Entry: the price pivot (consolidation range) steps up to a
+    # wholly higher band and a confirming pullback low forms. Exit: a
+    # symmetric downward pivot shift, a stroke-over-stroke momentum-
+    # divergence proxy, a stop-loss, or a max-holding-days timeout. ---
+    chan_symbol: str = "SPY"
+    chan_min_gap_bars: int = 4       # min merged-bar gap between a stroke's fractals (independence rule)
+    chan_min_strokes: int = 3        # min consecutive overlapping strokes to seed a pivot (theory minimum: 3)
+    chan_stop_loss_pct: Optional[float] = 0.08   # None disables
+    chan_max_holding_days: Optional[int] = 90    # None disables
+    chan_position_size_pct: float = 1.0
+
     # Backtester execution defaults
     initial_capital: float = 100_000.0
     commission_pct: float = 0.0005          # 5 bps
@@ -261,6 +279,10 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.cash_proxy must be a non-empty string, got {self.cash_proxy!r}")
         if not isinstance(self.risky_universe, list):
             raise ValueError(f"StrategyConfig.risky_universe must be a list, got {type(self.risky_universe).__name__}")
+        if self.chan_min_gap_bars <= 0:
+            raise ValueError(f"StrategyConfig.chan_min_gap_bars must be > 0, got {self.chan_min_gap_bars}")
+        if self.chan_min_strokes < 3:
+            raise ValueError(f"StrategyConfig.chan_min_strokes must be >= 3, got {self.chan_min_strokes}")
 
     @classmethod
     def from_dict(cls, data: dict) -> "StrategyConfig":

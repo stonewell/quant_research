@@ -28,6 +28,10 @@ Modern Popular Portfolios (static, fixed-weight, no momentum/trend logic):
 Modern Systematic TAA Extensions:
 15. ProtectiveAssetAllocation (Keller & Keuning 2016, SSRN #2759734, PAA)
 16. AdaptiveAssetAllocation (Butler/Philbrick/Gordillo/Varadi 2012, SSRN #2328254, AAA)
+
+Original Structural Strategies (independent from-scratch implementations,
+not ports of any workspace side project or third-party library):
+17. ChanPivotShiftStrategy (缠中说禅/Chan-theory pivot-shift reading, see `chan_structure.py`)
 """
 
 from typing import Dict, List, Union
@@ -49,6 +53,7 @@ from common.indicators import (
 )
 from common.allocation_templates import AllocationTemplate, _inverse_vol_weights, _min_variance_weights
 from common.scheduling import get_rebalance_dates as _get_rebalance_dates
+from .chan_structure import compute_chan_signals
 from .config import StrategyConfig
 from .nl_parser import ParsedStrategySpec, parse_plain_english_strategy
 
@@ -714,6 +719,102 @@ class SwingTrendPullbackStrategy(AllocationTemplate):
             p.get("swing_trend_ma_period", cfg.swing_trend_ma_period),
             p.get("swing_trend_slope_lookback", cfg.swing_trend_slope_lookback),
         )
+
+
+class ChanPivotShiftStrategy(AllocationTemplate):
+    """Long-only timing strategy reading 缠中说禅 ("Chan theory") price
+    structure -- inclusion-merged bars -> fractals -> strokes -> pivots (see
+    `rs/chan_structure.py`) -- and trading a "pivot shift" view of trend:
+    enter once the price's consolidation range (pivot) steps up to a wholly
+    higher band and a confirming pullback low forms; exit on a symmetric
+    downward pivot shift, a stroke-over-stroke momentum-divergence proxy, a
+    stop-loss, or a max-holding-days safety net.
+
+    This is an original, from-scratch reading of Chan theory written
+    natively for this project -- it does NOT port, or reuse any code,
+    formula, or default from the `czsc` Rust/Python library (third-party
+    prior art on the same theory this workspace is aware of but does not
+    depend on); its "divergence" signal is a simple stroke slope/length
+    ratio, not that library's SNR/rsq metrics. See `chan_structure.py` for
+    the disclosed simplifications in the underlying structure detector.
+    """
+
+    def __init__(self, config: StrategyConfig = None):
+        self.config = config or StrategyConfig()
+        super().__init__(name="chan_pivot_shift", param_grid={})
+
+    def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
+        cfg = self.config
+        p = params or {}
+        cash_proxy = p.get("cash_proxy", cfg.cash_proxy)
+        min_gap_bars = p.get("chan_min_gap_bars", cfg.chan_min_gap_bars)
+        min_strokes = p.get("chan_min_strokes", cfg.chan_min_strokes)
+        stop_loss_pct = p.get("chan_stop_loss_pct", cfg.chan_stop_loss_pct)
+        max_holding_days = p.get("chan_max_holding_days", cfg.chan_max_holding_days)
+        position_size_pct = p.get("chan_position_size_pct", cfg.chan_position_size_pct)
+
+        symbols = list(universe.keys())
+        risky_symbols = _get_risky_symbols(universe, params, cfg.chan_symbol, cfg.risky_universe, cash_proxy)
+        if not risky_symbols:
+            return pd.DataFrame()
+
+        master_index = universe[risky_symbols[0]].index
+        n_bars = len(master_index)
+        raw_weights = {sym: np.zeros(n_bars) for sym in risky_symbols}
+
+        for sym in risky_symbols:
+            bars = universe[sym]
+            sig = compute_chan_signals(bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes)
+            entry_signal = sig["buy_signal"].reindex(master_index).fillna(False)
+            exit_signal = sig["sell_signal"].reindex(master_index).fillna(False)
+            close = bars["Close"].reindex(master_index)
+
+            in_position = False
+            entry_idx = 0
+            for i in range(n_bars):
+                if in_position:
+                    held = i - entry_idx
+                    stopped = stop_loss_pct is not None and (close.iloc[i] / close.iloc[entry_idx] - 1) <= -stop_loss_pct
+                    timed_out = max_holding_days is not None and held >= max_holding_days
+                    if exit_signal.iloc[i] or stopped or timed_out:
+                        in_position = False
+                        raw_weights[sym][i] = 0.0
+                    else:
+                        raw_weights[sym][i] = position_size_pct
+                elif entry_signal.iloc[i]:
+                    in_position = True
+                    entry_idx = i
+                    raw_weights[sym][i] = position_size_pct
+
+        daily = pd.DataFrame(raw_weights, index=master_index)
+        total_risky_raw = daily.sum(axis=1)
+        scale = np.where(total_risky_raw > 1.0, 1.0 / total_risky_raw, 1.0)
+        daily = daily.mul(scale, axis=0)
+
+        if cash_proxy in symbols:
+            daily[cash_proxy] = np.maximum(0.0, 1.0 - daily.sum(axis=1))
+
+        daily = _fill_out_columns(daily, symbols)
+        return _sparse_from_daily(daily)
+
+    def explain_weights(self, params: dict = None) -> str:
+        cfg = self.config
+        p = params or {}
+        return (
+            "Chan-theory pivot shift (original structural reading, not a czsc port): "
+            "long active symbols once their price pivot (consolidation range) steps up to a "
+            f"wholly higher band (min {p.get('chan_min_strokes', cfg.chan_min_strokes)} strokes/pivot, "
+            f"{p.get('chan_min_gap_bars', cfg.chan_min_gap_bars)}-bar fractal independence gap) and a "
+            "confirming pullback low forms. Exits on a symmetric downward pivot shift, a stroke-over-stroke "
+            "momentum-divergence proxy, a stop-loss, or a max-holding-days safety net."
+        )
+
+    def warmup_bars(self, params: dict = None) -> int:
+        cfg = self.config
+        p = params or {}
+        min_gap_bars = p.get("chan_min_gap_bars", cfg.chan_min_gap_bars)
+        min_strokes = p.get("chan_min_strokes", cfg.chan_min_strokes)
+        return min_strokes * 2 * (min_gap_bars + 2)
 
 
 class AdaptiveGridStrategy(AllocationTemplate):
@@ -1577,6 +1678,7 @@ STRATEGY_CLASS_MAP = {
     "AdaptiveGridStrategy": AdaptiveGridStrategy,
     "AllWeatherStrategy": AllWeatherStrategy,
     "BoldAssetAllocation": BoldAssetAllocation,
+    "ChanPivotShiftStrategy": ChanPivotShiftStrategy,
     "EnsembleRegimeSwitchingStrategy": EnsembleRegimeSwitchingStrategy,
     "GoldenButterflyStrategy": GoldenButterflyStrategy,
     "HFEAStrategy": HFEAStrategy,
