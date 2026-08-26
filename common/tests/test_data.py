@@ -5,6 +5,7 @@ import re
 import shutil
 import tempfile
 import time
+import warnings
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -17,6 +18,7 @@ from common.data import (
     CachedDataProvider,
     SyntheticDataProvider,
     YFinanceDataProvider,
+    _drop_invalid_ohlcv_rows,
     fetch_fund_metadata,
     get_data_provider,
     load_ohlcv,
@@ -104,6 +106,90 @@ def test_csv_folder_data_provider_not_found(temp_csv_dir):
     provider = CSVFolderDataProvider(folder_path=temp_csv_dir)
     with pytest.raises(FileNotFoundError):
         provider.fetch_ohlcv("NON_EXISTENT", start="2020-01-01", end="2020-01-10")
+
+
+# --- _drop_invalid_ohlcv_rows -----------------------------------------------
+
+def test_drop_invalid_ohlcv_rows_removes_only_the_impossible_rows():
+    dates = pd.bdate_range("2020-01-01", periods=4)
+    df = pd.DataFrame(
+        {
+            "Open": [10.0, 10.0, 10.0, 10.0],
+            "High": [12.0, 9.0, 12.0, 12.0],     # row 1: High < Low
+            "Low": [9.0, 12.0, 9.0, 9.0],
+            "Close": [11.0, 11.0, -5.0, 11.0],   # row 2: negative price
+            "Volume": [100.0] * 4,
+        },
+        index=dates,
+    )
+    with pytest.warns(UserWarning, match="Dropping 2 row"):
+        cleaned = _drop_invalid_ohlcv_rows(df, symbol="TEST")
+
+    assert list(cleaned.index) == [dates[0], dates[3]]
+
+
+def test_drop_invalid_ohlcv_rows_is_a_noop_on_clean_data():
+    dates = pd.bdate_range("2020-01-01", periods=5)
+    df = pd.DataFrame(
+        {
+            "Open": [10.0] * 5,
+            "High": [12.0] * 5,
+            "Low": [9.0] * 5,
+            "Close": [11.0, 9.5, 11.5, 10.0, 10.5],
+            "Volume": [100.0] * 5,
+        },
+        index=dates,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        cleaned = _drop_invalid_ohlcv_rows(df, symbol="TEST")
+    pd.testing.assert_frame_equal(cleaned, df)
+
+
+def test_csv_folder_data_provider_drops_a_bad_row(temp_csv_dir):
+    dates = pd.bdate_range("2020-01-01", periods=4)
+    mock_df = pd.DataFrame(
+        {
+            "Open": [10.0] * 4,
+            "High": [12.0, 12.0, 5.0, 12.0],   # row 2: High < Open/Close
+            "Low": [9.0] * 4,
+            "Close": [11.0] * 4,
+            "Volume": [100.0] * 4,
+        },
+        index=dates,
+    )
+    csv_path = os.path.join(temp_csv_dir, "BAD_1d.csv")
+    mock_df.to_csv(csv_path)
+
+    provider = CSVFolderDataProvider(folder_path=temp_csv_dir)
+    with pytest.warns(UserWarning, match="Dropping 1 row"):
+        df = provider.fetch_ohlcv("BAD", start="2020-01-01", end="2020-01-10", interval="1d")
+
+    assert len(df) == 3
+    assert dates[2] not in df.index
+
+
+@patch("yfinance.download")
+def test_yfinance_data_provider_drops_a_bad_row(mock_yf_download):
+    dates = pd.bdate_range("2020-01-01", periods=4)
+    mock_df = pd.DataFrame(
+        {
+            "Open": [100.0] * 4,
+            "High": [105.0] * 4,
+            "Low": [95.0, 95.0, 95.0, 200.0],  # row 3: Low > High -- impossible
+            "Close": [102.0] * 4,
+            "Volume": [1000.0] * 4,
+        },
+        index=dates,
+    )
+    mock_yf_download.return_value = mock_df
+
+    provider = YFinanceDataProvider()
+    with pytest.warns(UserWarning, match="Dropping 1 row"):
+        df = provider.fetch_ohlcv("AAPL", start="2020-01-01", end="2020-01-05")
+
+    assert len(df) == 3
+    assert dates[3] not in df.index
 
 
 def test_cached_data_provider(temp_csv_dir):
@@ -396,7 +482,7 @@ def test_csv_folder_data_provider_sorts_unsorted_csv(temp_csv_dir):
             "Open": [10.0] * 5,
             "High": [12.0] * 5,
             "Low": [9.0] * 5,
-            "Close": [11.0, 21.0, 31.0, 41.0, 51.0],
+            "Close": [11.0, 9.5, 11.5, 10.0, 10.5],
             "Volume": [100.0] * 5,
         },
         index=pd.DatetimeIndex(shuffled_dates),
@@ -479,4 +565,45 @@ def test_cached_data_provider_recovers_from_corrupt_cache_file(temp_csv_dir):
     # The corrupt file should have been overwritten with valid data.
     df2 = pd.read_csv(cache_path, index_col=0, parse_dates=True)
     assert "Close" in df2.columns
+
+
+def test_cached_data_provider_cleans_a_bad_row_from_a_cache_hit(temp_csv_dir):
+    dates = pd.bdate_range("2020-01-01", periods=3)
+    cache_df = pd.DataFrame(
+        {
+            "Open": [10.0] * 3,
+            "High": [12.0, 12.0, 12.0],
+            "Low": [9.0, 9.0, -1.0],  # row 2: negative price
+            "Close": [11.0] * 3,
+            "Volume": [100.0] * 3,
+        },
+        index=dates,
+    )
+    cache_path = os.path.join(temp_csv_dir, "SyntheticDataProvider_SPY_1d_2020-01-01_2020-01-10.csv")
+    os.makedirs(temp_csv_dir, exist_ok=True)
+    cache_df.to_csv(cache_path)
+
+    cached_provider = CachedDataProvider(SyntheticDataProvider(seed=42), cache_dir=temp_csv_dir)
+    with pytest.warns(UserWarning, match="Dropping 1 row"):
+        df = cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
+
+    assert len(df) == 2
+    assert dates[2] not in df.index
+
+
+def test_cached_data_provider_all_rows_invalid_triggers_refetch(temp_csv_dir):
+    dates = pd.bdate_range("2020-01-01", periods=2)
+    cache_df = pd.DataFrame(
+        {"Open": [10.0] * 2, "High": [1.0] * 2, "Low": [9.0] * 2, "Close": [11.0] * 2, "Volume": [100.0] * 2},
+        index=dates,
+    )  # every row has High < Low
+    cache_path = os.path.join(temp_csv_dir, "SyntheticDataProvider_SPY_1d_2020-01-01_2020-01-10.csv")
+    os.makedirs(temp_csv_dir, exist_ok=True)
+    cache_df.to_csv(cache_path)
+
+    cached_provider = CachedDataProvider(SyntheticDataProvider(seed=42), cache_dir=temp_csv_dir)
+    with pytest.warns(UserWarning, match="corrupt or invalid"):
+        df = cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
+
+    assert not df.empty  # served fresh from the inner (synthetic) provider instead
 

@@ -76,7 +76,7 @@ class YFinanceDataProvider(BaseDataProvider):
         df = df[["Open", "High", "Low", "Close", "Volume"]]
         df.index = pd.to_datetime(df.index)
         df = df.dropna(subset=["Open", "High", "Low", "Close"])
-        return df
+        return _drop_invalid_ohlcv_rows(df, symbol)
 
     def fetch_metadata(self, symbol: str) -> dict:
         expense_ratio, total_assets = float("nan"), float("nan")
@@ -149,7 +149,8 @@ class CSVFolderDataProvider(BaseDataProvider):
         # Enforce the documented ascending-DatetimeIndex OHLCV contract
         # (common/README.md, section 1) -- a CSV on disk isn't guaranteed to
         # already be sorted by date.
-        return df.dropna(subset=["Open", "High", "Low", "Close"]).sort_index()
+        df = df.dropna(subset=["Open", "High", "Low", "Close"]).sort_index()
+        return _drop_invalid_ohlcv_rows(df, symbol)
 
 
 class SyntheticDataProvider(BaseDataProvider):
@@ -191,6 +192,34 @@ class SyntheticDataProvider(BaseDataProvider):
 
 
 _REQUIRED_OHLCV_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
+
+
+def _drop_invalid_ohlcv_rows(df: pd.DataFrame, symbol: str = None) -> pd.DataFrame:
+    """Drops rows with LOGICALLY IMPOSSIBLE OHLC values -- High < Low,
+    High less than the bar's own Open/Close, Low greater than the bar's own
+    Open/Close, a non-positive price, or a NaN/inf anywhere in O/H/L/C -- no
+    real market can ever produce these; they're a data provider bug, not a
+    legitimate (if extreme) price move.
+
+    Deliberately does NOT flag "is this move too big" -- a leveraged ETF, a
+    gap, or an earnings move can legitimately jump 10-50%+ in a day, and
+    judging that is a modeling choice this project keeps out of the shared
+    data layer (see `common/README.md`'s provider contract).
+    """
+    ohlc = df[["Open", "High", "Low", "Close"]]
+    bad = (
+        (ohlc["High"] < ohlc["Low"])
+        | (ohlc["High"] < ohlc[["Open", "Close"]].max(axis=1))
+        | (ohlc["Low"] > ohlc[["Open", "Close"]].min(axis=1))
+        | (ohlc <= 0).any(axis=1)
+        | (~np.isfinite(ohlc)).any(axis=1)
+    )
+    if bad.any():
+        label = symbol or "series"
+        bad_dates = list(df.index[bad])
+        warnings.warn(f"Dropping {int(bad.sum())} row(s) with impossible OHLC values for {label}: {bad_dates}")
+        df = df[~bad]
+    return df
 
 
 def _is_valid_cached_ohlcv(df: pd.DataFrame) -> bool:
@@ -246,6 +275,9 @@ class CachedDataProvider(BaseDataProvider):
                 df.index = pd.to_datetime(df.index)
                 if not _is_valid_cached_ohlcv(df):
                     raise ValueError("cached file is missing expected OHLCV columns or is empty")
+                df = _drop_invalid_ohlcv_rows(df, symbol)
+                if df.empty:
+                    raise ValueError("cached file contains no rows with valid OHLC values")
                 return df
             except Exception as exc:
                 warnings.warn(f"Cache file '{cache_path}' is corrupt or invalid ({exc}); re-fetching from source.")

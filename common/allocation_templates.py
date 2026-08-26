@@ -22,6 +22,7 @@ from typing import Dict
 import numpy as np
 import pandas as pd
 
+from common.covariance import denoise_correlation, denoise_covariance
 from common.indicator_features import compute_feature
 from common.indicators import realized_vol, roc, rsi
 from common.scheduling import get_rebalance_dates as _get_rebalance_dates
@@ -420,6 +421,7 @@ class HierarchicalRiskParityAllocation(AllocationTemplate):
                 continue
 
             cov = sub_ret[valid_symbols].cov().to_numpy()
+            cov = denoise_covariance(cov, n_obs=len(sub_ret))
             w_hrp = _hrp_portfolio(cov)
             weights_rebal.loc[date, valid_symbols] = w_hrp
 
@@ -537,7 +539,7 @@ class MaxDiversificationAllocation(AllocationTemplate):
             sub_ret = sub_ret[valid_symbols]
 
             vols = sub_ret.std() * np.sqrt(252)
-            corr = sub_ret.corr().fillna(0)
+            corr = denoise_correlation(sub_ret.corr().fillna(0), n_obs=len(sub_ret))
 
             n = len(valid_symbols)
             avg_corr = (corr.sum(axis=1) - 1.0) / max(n - 1, 1)
@@ -658,6 +660,7 @@ class MinimumVarianceAllocation(AllocationTemplate):
                 continue
 
             cov = sub_ret[valid_symbols].cov().to_numpy()
+            cov = denoise_covariance(cov, n_obs=len(sub_ret))
             w_mv = _min_variance_weights(cov)
             weights_rebal.loc[date, valid_symbols] = w_mv
 

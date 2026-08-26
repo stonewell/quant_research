@@ -14,6 +14,8 @@ import pandas as pd
 from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import squareform
 
+from common.covariance import denoise_correlation
+
 
 def returns_matrix(data: dict) -> pd.DataFrame:
     """Aligned daily log returns across all symbols (inner join on common dates)."""
@@ -22,7 +24,12 @@ def returns_matrix(data: dict) -> pd.DataFrame:
 
 
 def correlation_matrix(returns: pd.DataFrame) -> pd.DataFrame:
-    return returns.corr()
+    """RMT-denoised (see `common.covariance.denoise_correlation`) sample
+    correlation -- the single choke point every diversification/clustering
+    function below (and `selectorbot/selection.py`'s basket selectors)
+    consumes, so the whole instrument-selection pipeline benefits from one
+    change here."""
+    return denoise_correlation(returns.corr(), n_obs=len(returns))
 
 
 def beta_to_benchmark(returns: pd.DataFrame, benchmark: str) -> pd.Series:
