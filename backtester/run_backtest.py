@@ -99,8 +99,8 @@ def _get_template(template_name: str, pattern_spec: dict = None, research_strate
     `research_strategy_spec` is given (the two are mutually exclusive --
     a winning strategy.json only ever came from one source).
 
-    `pattern_spec`: a PatternBasedAllocationTemplate (strategy_generator/
-    stratgen/pattern_mining.py) is universe-specific and not zero-arg
+    `pattern_spec`: a PatternBasedAllocationTemplate (pattern_mining/
+    pmine/pattern_mining.py) is universe-specific and not zero-arg
     constructible, so it's never in the static ALLOCATION_TEMPLATES registry;
     a strategy.json produced from a winning mined pattern carries its own
     `pattern_spec` (see run_strategygen.py) so it can be reconstructed here

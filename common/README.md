@@ -98,7 +98,7 @@ section for how this vocabulary is actually used (the mechanism, not the schema,
 `common/indicator_features.py`'s `DEFAULT_FEATURE_MENU: List[Tuple[str, int | Tuple[int,int,int]]]`
 — e.g. `("rsi", 14)`, `("macd_hist", (12, 26, 9))`. `feature_label(name, lookback) -> str` turns a
 pair into a column-safe label (e.g. `"rsi_14"`, `"macd_hist_12_26_9"`); `compute_feature(curve,
-name, lookback) -> pd.Series` computes it. Used by `strategy_generator/stratgen/pattern_mining.py`'s
+name, lookback) -> pd.Series` computes it. Used by `pattern_mining/pmine/pattern_mining.py`'s
 feature table (see that project's README) and by `common.allocation_templates.PatternBasedAllocationTemplate`
 — the SAME dispatch backs both, deliberately, so a mined threshold is tested and later traded
 against an identical computation.
@@ -174,4 +174,5 @@ constructor default) — every `run_*.py`'s `--cache-ttl-days` flag (added via
 | `backtester` | §1–4, 7–8 | `strategy.json` consumption (schema owned by `strategy_generator`), `backtest_equity.csv`/`backtest_weights.csv`/`walkforward_report.csv` (see `backtester/SCHEMAS.md`) |
 | `instrument_selection` | §1–2 (universe/OHLCV in) | `screening_report.csv`, `correlation_matrix.csv`, `screened_out.csv`, `basket.json` |
 | `research_strategy` | §1–5 | `research_strategy_report.json`, `factor_summary.json`, `strategies_config.json` entry schema |
-| `strategy_generator` | §1–8 | `strategy.json` (schema OWNED here), `GeneratedStrategySpec`, pattern-mining's turning-points/feature-table/findings DataFrames |
+| `pattern_mining` | §1–2, 6 | `pattern_report.json` (schema OWNED here), turning-points/feature-table/findings DataFrames |
+| `strategy_generator` | §1–8 | `strategy.json` (schema OWNED here), `GeneratedStrategySpec` |

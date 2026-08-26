@@ -1,5 +1,12 @@
 """Turning-point indicator pattern mining.
 
+This is its own pipeline stage (`pattern_mining/run_pattern_mining.py`),
+run independently of `strategy_generator` -- it writes a standalone,
+durable `pattern_mining/results/pattern_report.json` that
+`strategy_generator/run_strategygen.py`'s `--pattern-report` flag loads
+rather than re-running this (Bonferroni-corrected, shuffle-null) mining
+pass on every generation attempt. See root `README.md`'s pipeline docs.
+
 Given a universe, builds its aggregate portfolio curve
 (`common.allocation_templates.build_aggregate_curve`), detects the curve's
 major peaks/troughs (`turning_points.find_turning_points`), and tests
@@ -7,9 +14,10 @@ whether any indicator in a fixed "popular technical indicators" menu
 (`common.indicator_features.DEFAULT_FEATURE_MENU`), read `lag_bars` trading
 days BEFORE those turning points, differs significantly from the same
 indicator read before a random (non-turning-point) date. Any pattern that
-survives this test can be turned into a `PatternBasedAllocationTemplate`
-(`common.allocation_templates`) and passed into `StrategyGenerator.generate`'s
-`extra_templates` -- where it competes through the SAME grid-search +
+survives this test is reported in `pattern_report.json`; `build_pattern_templates`
+below turns the top-p-value significant ones into `PatternBasedAllocationTemplate`
+(`common.allocation_templates`) instances for `StrategyGenerator.generate`'s
+`extra_templates` -- where they compete through the SAME grid-search +
 Equivalent Random Search validation as every static template.
 
 WHY THE LAG MATTERS -- THE SINGLE MOST IMPORTANT METHODOLOGICAL DECISION
@@ -56,7 +64,7 @@ lag: it only ever compares a live, already-known indicator reading against
 the mined threshold, never trying to detect a turning point in real time.
 
 WHY THIS MENU IS AN EXCEPTION TO THIS PROJECT'S "SMALL PRIMITIVE SET" RULE:
-`stratgen/indicators.py`'s own docstring explains why the 9 static templates
+`strategy_generator/stratgen/indicators.py`'s own docstring explains why the 9 static templates
 deliberately restrict themselves to a handful of primitives (Allen &
 Karjalainen 1999's data-snooping caution). This module needs a genuinely
 broad menu to mine against instead, and guards against the resulting

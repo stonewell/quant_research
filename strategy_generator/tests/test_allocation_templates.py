@@ -357,6 +357,44 @@ def test_pattern_based_template_rejects_invalid_comparison_and_event_type():
         PatternBasedAllocationTemplate("rsi", 14, threshold=30.0, comparison="below", event_type="plateau")
 
 
+def test_pattern_based_template_factor_tags_reflect_the_mined_indicator():
+    # factor_tags must reflect WHICH INDICATOR was mined, not just the
+    # peak/trough direction -- this is what lets a mined template's
+    # generator.py factor tie-break compare it against research_strategy's
+    # trend/factor evidence for the right reference class (see
+    # common.allocation_templates._FEATURE_FACTOR_TAGS and its docstring).
+    expected = {
+        "rsi": "mean_reversion",
+        "stoch_k": "mean_reversion",
+        "cci": "mean_reversion",
+        "williams_r": "mean_reversion",
+        "bb_pctb": "mean_reversion",
+        "adx": "regime_trend_strength",
+        "roc": "absolute_momentum_trend",
+        "sma_rel": "absolute_momentum_trend",
+        "macd_hist": "absolute_momentum_trend",
+        "atr_pct": "volatility_targeting",
+    }
+    for feature_name, tag in expected.items():
+        for event_type in ("peak", "trough"):
+            template = PatternBasedAllocationTemplate(
+                feature_name, 14, threshold=1.0, comparison="below", event_type=event_type
+            )
+            assert template.factor_tags == [tag], (
+                f"{feature_name}/{event_type} expected tag {tag!r}, got {template.factor_tags!r}"
+            )
+
+
+def test_pattern_based_template_unknown_feature_falls_back_to_direction_heuristic():
+    # A feature_name outside DEFAULT_FEATURE_MENU (shouldn't happen via
+    # normal mining) degrades to the old peak/trough-only heuristic rather
+    # than raising.
+    peak = PatternBasedAllocationTemplate("made_up_feature", 14, threshold=1.0, comparison="below", event_type="peak")
+    trough = PatternBasedAllocationTemplate("made_up_feature", 14, threshold=1.0, comparison="below", event_type="trough")
+    assert peak.factor_tags == ["regime_trend_strength"]
+    assert trough.factor_tags == ["mean_reversion"]
+
+
 def test_pattern_based_template_trough_direction_invests_when_triggered():
     # A deliberately crashed-then-flat universe: RSI(14) stays low (oversold)
     # for a long stretch after the crash -- a trough-direction template

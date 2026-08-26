@@ -31,7 +31,6 @@ from common import plotting
 from common.reporting import format_weights_pct, write_dense_weights_csv, write_json_report
 from common.universe import add_universe_cli_args, resolve_universe_from_args
 from stratgen.generator import GeneratorConfig, StrategyGenerator
-from stratgen.pattern_mining import build_pattern_templates, mine_indicator_patterns
 
 
 def _load_factor_report(path: str) -> dict:
@@ -51,6 +50,27 @@ def _load_factor_report(path: str) -> dict:
         raise ValueError(
             f"Malformed factor report '{path}': 'factor_performance' must be a JSON object, "
             f"got {type(report['factor_performance']).__name__}."
+        )
+
+    return report
+
+
+def _load_pattern_report(path: str) -> dict:
+    """Loads and validates a `pattern_mining` stage `pattern_report.json`
+    (see `pattern_mining/run_pattern_mining.py`). Raises a clear error
+    naming what's missing rather than a raw KeyError surfacing later."""
+    with open(path, "r") as f:
+        report = json.load(f)
+
+    if not isinstance(report, dict) or "findings" not in report:
+        raise ValueError(
+            f"Malformed pattern report '{path}': expected a JSON object with a "
+            f"'findings' key (see pattern_mining/run_pattern_mining.py's output)."
+        )
+    if not isinstance(report["findings"], list):
+        raise ValueError(
+            f"Malformed pattern report '{path}': 'findings' must be a JSON array, "
+            f"got {type(report['findings']).__name__}."
         )
 
     return report
@@ -79,27 +99,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="How close (as a fraction of the leading Sharpe, also used as an absolute floor) "
                         "two templates' scores must be before --factor-report is allowed to break the tie "
                         "(default: 0.05 = 5%%). Ignored if --factor-report is not given.")
-    p.add_argument("--mine-patterns", action="store_true",
-                   help="Detect this universe's aggregate portfolio turning points (peaks/troughs), mine "
-                        "a menu of popular technical indicators for a statistically significant pattern "
-                        "preceding them (Bonferroni-corrected shuffle-null test, see "
-                        "stratgen/pattern_mining.py), and fold any significant finding into the search as "
-                        "an additional candidate template -- it still must clear the same Equivalent "
-                        "Random Search bar as every static template. Finding 0 significant patterns is a "
-                        "common, valid outcome (especially on synthetic data), not an error.")
-    p.add_argument("--pattern-min-swing-pct", type=float, default=0.05,
-                   help="Minimum zigzag swing size (fraction) to confirm a turning point (default 0.05 = 5%%).")
-    p.add_argument("--pattern-lag-bars", type=int, default=20,
-                   help="How many trading days BEFORE each turning point to read indicators at, to avoid "
-                        "the near-tautological result of reading them AT the turning point itself (default 20; "
-                        "see pattern_mining.py's module docstring for why this matters).")
+    p.add_argument("--pattern-report", type=str, default=None,
+                   help="Path to a pattern_mining stage pattern_report.json (see "
+                        "pattern_mining/run_pattern_mining.py) -- when given, its significant turning-point "
+                        "indicator findings are turned into candidate PatternBasedAllocationTemplate "
+                        "instances (up to --pattern-max-templates), which compete through the same "
+                        "grid-search + Equivalent Random Search validation as every static template. Omit "
+                        "to search only the 9 static templates (plus any --research-strategy templates).")
     p.add_argument("--pattern-max-templates", type=int, default=5,
-                   help="Cap on how many significant mined patterns become candidate templates (default 5).")
+                   help="Cap on how many significant mined patterns (from --pattern-report) become "
+                        "candidate templates (default 5).")
     p.add_argument("--research-strategy", nargs="+", default=None, metavar="STRATEGY_KEY",
                    help="Include one or more research_strategy strategies (by their strategies_config.json key, "
                         "e.g. 'baa_keller', 'adaptive_grid' -- see research_strategy/README.md for the full list) "
                         "as additional candidate templates, alongside the 9 static allocation templates and any "
-                        "--mine-patterns findings. Each is instantiated exactly as research_strategy's own CLI "
+                        "--pattern-report findings. Each is instantiated exactly as research_strategy's own CLI "
                         "would build it (including any strategies_config.json parameter overrides).")
     p.add_argument("--no-plots", action="store_true",
                    help="Skip the equity-curve chart normally produced for the winning strategy (charts are ON by default).")
@@ -145,29 +159,25 @@ def main():
     # etc.), so it must only ever search the mined templates, never the
     # combined pool.
     mined_templates = None
-    if args.mine_patterns:
-        findings, mining_status = mine_indicator_patterns(
-            universe,
-            min_swing_pct=args.pattern_min_swing_pct,
-            lag_bars=args.pattern_lag_bars,
-        )
-        if mining_status != "ok":
-            print(f"Pattern mining: {mining_status} -- skipping, proceeding with the 9 standard templates only.")
-        else:
-            mined_templates = build_pattern_templates(findings, max_templates=args.pattern_max_templates)
-            extra_templates = mined_templates
-            n_significant = int(findings["significant"].sum()) if not findings.empty else 0
-            # 0 significant patterns is an expected, valid outcome (especially
-            # on synthetic data) -- not an error. See pattern_mining.py.
-            print(f"Pattern mining found {n_significant} statistically significant indicator pattern(s) "
-                  f"out of {len(findings)} tested (Bonferroni-corrected, lag={args.pattern_lag_bars} bars); "
-                  f"{len(extra_templates)} added as candidate template(s).")
+    if args.pattern_report:
+        from pattern_mining.pmine.pattern_mining import build_pattern_templates
+
+        pattern_report = _load_pattern_report(args.pattern_report)
+        findings = pd.DataFrame(pattern_report["findings"])
+        mined_templates = build_pattern_templates(findings, max_templates=args.pattern_max_templates)
+        extra_templates = mined_templates
+        n_significant = int(findings["significant"].sum()) if not findings.empty else 0
+        # 0 significant patterns is an expected, valid outcome (especially
+        # on synthetic data) -- not an error. See pmine/pattern_mining.py.
+        print(f"Loaded pattern report from {args.pattern_report} (status={pattern_report.get('status')}, "
+              f"{n_significant} significant of {len(findings)} finding(s)); "
+              f"{len(extra_templates)} added as candidate template(s).")
 
     # research_strategy_entries/templates are kept as separate dicts (keyed by
     # strategies_config.json key) rather than folded anonymously into
     # extra_templates, so the strategy.json reconstruction block below can
     # look a winning template back up by its ORIGINAL config key + entry_data
-    # -- mirroring, but not reusing, the --mine-patterns/pattern_spec pattern
+    # -- mirroring, but not reusing, the --pattern-report/pattern_spec pattern
     # above (a mined template reconstructs from its own fields; a
     # research_strategy template reconstructs via research_strategy's own
     # instantiate_strategy_from_config_entry, given back its key + entry).

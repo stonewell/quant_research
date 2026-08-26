@@ -16,14 +16,18 @@ time-series/absolute-momentum construct (Moskowitz, Ooi & Pedersen 2012;
 Faber 2007) used by `AbsoluteMomentumTemplate`.
 
 `adx`, `macd`, `ema`, `bollinger_bands`, `stochastic_oscillator`, `cci`,
-`williams_r`, and `obv` are re-exported ONLY for `pattern_mining.py`'s
-turning-point feature menu, NOT for any static template -- that menu is a
-deliberate, disclosed EXCEPTION to the "restrict the primitive set" rule
-above: it needs a genuinely broad "popular indicators" menu to mine against,
-and guards against the resulting data-snooping risk a different way (a
-Bonferroni-corrected shuffle-null significance test across the whole menu,
-plus the same ERS/backtested-Sharpe bar every template must clear) rather
-than by keeping the menu small. See `pattern_mining.py`'s module docstring.
+`williams_r`, and `obv` are re-exported for the same broad "popular
+indicators" set the (now separate) `pattern_mining` stage's turning-point
+feature menu mines against (`pattern_mining/pmine/pattern_mining.py`,
+which imports them directly from `common.indicators`/
+`common.indicator_features`, not from here) -- NOT for any static template.
+That menu is a deliberate, disclosed EXCEPTION to the "restrict the
+primitive set" rule above: it needs a genuinely broad menu to mine
+against, and guards against the resulting data-snooping risk a different
+way (a Bonferroni-corrected shuffle-null significance test across the
+whole menu, plus the same ERS/backtested-Sharpe bar every template must
+clear) rather than by keeping the menu small. See
+`pattern_mining/pmine/pattern_mining.py`'s module docstring.
 """
 
 from common.indicators import (

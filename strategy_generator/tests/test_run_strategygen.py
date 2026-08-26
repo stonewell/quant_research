@@ -16,7 +16,7 @@ import pytest
 from common import cli_utils
 from research_strategy.rs.config import load_strategies_config
 from research_strategy.rs.strategy import AdaptiveGridStrategy, instantiate_strategy_from_config_entry
-from run_strategygen import RESULTS_DIR, _load_factor_report, build_arg_parser, main
+from run_strategygen import RESULTS_DIR, _load_factor_report, _load_pattern_report, build_arg_parser, main
 
 
 def test_build_arg_parser_universe_options():
@@ -287,6 +287,30 @@ def test_load_factor_report_valid(tmp_path):
     assert report["factor_performance"]["breadth"]["mean_sharpe_ratio"] == 0.5
 
 
+def test_load_pattern_report_missing_key_raises_clear_error(tmp_path):
+    path = tmp_path / "bad_pattern_report.json"
+    path.write_text(json.dumps({"not_findings": []}))
+
+    with pytest.raises(ValueError, match="findings"):
+        _load_pattern_report(str(path))
+
+
+def test_load_pattern_report_wrong_type_raises_clear_error(tmp_path):
+    path = tmp_path / "bad_pattern_report.json"
+    path.write_text(json.dumps({"findings": "not_a_list"}))
+
+    with pytest.raises(ValueError, match="must be a JSON array"):
+        _load_pattern_report(str(path))
+
+
+def test_load_pattern_report_valid(tmp_path):
+    path = tmp_path / "pattern_report.json"
+    path.write_text(json.dumps({"status": "ok", "findings": [{"feature": "rsi", "significant": True}]}))
+
+    report = _load_pattern_report(str(path))
+    assert report["findings"] == [{"feature": "rsi", "significant": True}]
+
+
 # --- --research-strategy ----------------------------------------------------
 
 def _mock_spec(**overrides):
@@ -450,19 +474,24 @@ class _FakePatternTemplate:
     mined_n_events = 5
 
 
+def _pattern_report_file(tmp_path):
+    path = tmp_path / "pattern_report.json"
+    path.write_text(json.dumps({"status": "ok", "findings": [{"feature": "rsi", "significant": True}]}))
+    return str(path)
+
+
 @patch("run_strategygen.load_universe_with_banner")
 @patch("run_strategygen.StrategyGenerator")
-@patch("run_strategygen.build_pattern_templates")
-@patch("run_strategygen.mine_indicator_patterns")
+@patch("pattern_mining.pmine.pattern_mining.build_pattern_templates")
 def test_pattern_spec_and_research_strategy_spec_never_both_nonnull(
-    mock_mine, mock_build, mock_gen_cls, mock_load
+    mock_build, mock_gen_cls, mock_load, tmp_path
 ):
-    """When both --mine-patterns and --research-strategy are supplied, only
+    """When both --pattern-report and --research-strategy are supplied, only
     the actual winner's spec block may be non-null -- the two independent
     for-loops in main() search disjoint template lists, so this should hold
     regardless of which of the two candidate sources wins."""
-    mock_mine.return_value = (pd.DataFrame({"significant": [True]}), "ok")
     mock_build.return_value = [_FakePatternTemplate()]
+    pattern_report_path = _pattern_report_file(tmp_path)
 
     temp_path = _universe_file()
 
@@ -471,7 +500,7 @@ def test_pattern_spec_and_research_strategy_spec_never_both_nonnull(
         mock_gen_instance.generate.return_value = _mock_spec(template_name=template_name)
         test_args = [
             "run_strategygen.py", "--universe-file", temp_path, "--mode", "generate",
-            "--mine-patterns", "--research-strategy", "adaptive_grid",
+            "--pattern-report", pattern_report_path, "--research-strategy", "adaptive_grid",
         ]
         with patch.object(sys, "argv", test_args):
             main()

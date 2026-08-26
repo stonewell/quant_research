@@ -44,7 +44,10 @@ def _manifest_path(tmp_path):
     return matches[0]
 
 
-def test_main_happy_path_chains_all_4_steps_in_order(monkeypatch, tmp_path):
+def test_main_happy_path_chains_4_of_5_steps_when_mining_off(monkeypatch, tmp_path, capsys):
+    # pattern_mining (step 3) is skipped by default (--mine-patterns not
+    # set) -- only 4 subprocesses actually run, in the same relative order
+    # as before this stage existed.
     monkeypatch.setattr(sys, "argv", ["run_pipeline.py", "--universe", "A", "B"])
     monkeypatch.setattr(run_pipeline, "RESULTS_DIR", str(tmp_path))
 
@@ -68,13 +71,47 @@ def test_main_happy_path_chains_all_4_steps_in_order(monkeypatch, tmp_path):
 
     assert "--universe" in argv2 and "A" in argv2 and "B" in argv2
     assert "--universe-file" in argv3 and run_pipeline.BASKET_PATH in argv3
+    assert "--pattern-report" not in argv3
     assert "--strategy-file" in argv4
+
+    captured_out = capsys.readouterr().out
+    assert "pattern_mining" in captured_out
+    assert "SKIPPED" in captured_out
 
     manifest_path = _manifest_path(tmp_path)
     with open(manifest_path) as f:
         manifest = json.load(f)
     assert manifest["status"] == "ok"
     assert len(manifest["steps"]) == 4
+
+
+def test_main_with_mine_patterns_runs_all_5_steps_in_order(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "argv", ["run_pipeline.py", "--mine-patterns"])
+    monkeypatch.setattr(run_pipeline, "RESULTS_DIR", str(tmp_path))
+
+    mock_run = MagicMock(return_value=_fake_result(returncode=0, stderr=""))
+    monkeypatch.setattr(run_pipeline.subprocess, "run", mock_run)
+
+    run_pipeline.main()
+
+    assert mock_run.call_count == 5
+    calls = mock_run.call_args_list
+    argv1, argv2, argv3, argv4, argv5 = (c.args[0] for c in calls)
+
+    assert run_pipeline.SCRIPTS["research_strategy"] in argv1
+    assert run_pipeline.SCRIPTS["instrument_selection"] in argv2
+    assert run_pipeline.SCRIPTS["pattern_mining"] in argv3
+    assert run_pipeline.SCRIPTS["strategy_generator"] in argv4
+    assert run_pipeline.SCRIPTS["backtester"] in argv5
+
+    assert "--universe-file" in argv3 and run_pipeline.BASKET_PATH in argv3
+    assert "--pattern-report" in argv4 and run_pipeline.PATTERN_REPORT_PATH in argv4
+
+    manifest_path = _manifest_path(tmp_path)
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    assert manifest["status"] == "ok"
+    assert len(manifest["steps"]) == 5
 
 
 def test_main_stops_after_failing_step(monkeypatch, tmp_path, capsys):
@@ -105,18 +142,22 @@ def test_main_stops_after_failing_step(monkeypatch, tmp_path, capsys):
 def test_mine_patterns_and_baseline_flags_passthrough_only_when_set(monkeypatch, tmp_path):
     monkeypatch.setattr(run_pipeline, "RESULTS_DIR", str(tmp_path))
 
-    # First run: neither flag set.
+    # First run: neither flag set -- pattern_mining step skipped entirely
+    # (only 4 subprocess calls), and no --pattern-report/--baseline-symbol
+    # anywhere.
     monkeypatch.setattr(sys, "argv", ["run_pipeline.py"])
     mock_run = MagicMock(return_value=_fake_result(returncode=0, stderr=""))
     monkeypatch.setattr(run_pipeline.subprocess, "run", mock_run)
     run_pipeline.main()
 
+    assert mock_run.call_count == 4
     for call in mock_run.call_args_list:
         argv = call.args[0]
-        assert "--mine-patterns" not in argv
+        assert "--pattern-report" not in argv
         assert "--baseline-symbol" not in argv
 
-    # Second run: both flags set.
+    # Second run: both flags set -- pattern_mining (step 3) now runs, and
+    # its report path is forwarded to strategy_generator (step 4).
     monkeypatch.setattr(sys, "argv", [
         "run_pipeline.py", "--mine-patterns",
         "--baseline-symbol", "SPY", "--baseline-template", "equal_weight",
@@ -126,12 +167,15 @@ def test_mine_patterns_and_baseline_flags_passthrough_only_when_set(monkeypatch,
     run_pipeline.main()
 
     calls = mock_run2.call_args_list
+    assert len(calls) == 5
     argv_step3 = calls[2].args[0]
     argv_step4 = calls[3].args[0]
+    argv_step5 = calls[4].args[0]
 
-    assert "--mine-patterns" in argv_step3
-    assert "--baseline-symbol" in argv_step4 and "SPY" in argv_step4
-    assert "--baseline-template" in argv_step4 and "equal_weight" in argv_step4
+    assert run_pipeline.SCRIPTS["pattern_mining"] in argv_step3
+    assert "--pattern-report" in argv_step4 and run_pipeline.PATTERN_REPORT_PATH in argv_step4
+    assert "--baseline-symbol" in argv_step5 and "SPY" in argv_step5
+    assert "--baseline-template" in argv_step5 and "equal_weight" in argv_step5
 
 
 def test_research_strategy_and_optimize_flags_passthrough_only_when_set(monkeypatch, tmp_path):
@@ -161,15 +205,17 @@ def test_research_strategy_and_optimize_flags_passthrough_only_when_set(monkeypa
     monkeypatch.setattr(run_pipeline.subprocess, "run", mock_run2)
     run_pipeline.main()
 
+    # mine_patterns is off in this test, so pattern_mining (step 3) is
+    # skipped and these are strategy_generator (step 4) / backtester (step 5).
     calls = mock_run2.call_args_list
-    argv_step3 = calls[2].args[0]
-    argv_step4 = calls[3].args[0]
+    argv_strategygen = calls[2].args[0]
+    argv_backtester = calls[3].args[0]
 
-    assert "--research-strategy" in argv_step3 and "baa_keller" in argv_step3 and "adaptive_grid" in argv_step3
-    assert "--optimize" in argv_step4
-    assert "--n-random-search" in argv_step4 and "50" in argv_step4
-    assert "--ers-percentile-threshold" in argv_step4 and "0.8" in argv_step4
-    assert "--min-rebalances-for-trust" in argv_step4 and "2" in argv_step4
+    assert "--research-strategy" in argv_strategygen and "baa_keller" in argv_strategygen and "adaptive_grid" in argv_strategygen
+    assert "--optimize" in argv_backtester
+    assert "--n-random-search" in argv_backtester and "50" in argv_backtester
+    assert "--ers-percentile-threshold" in argv_backtester and "0.8" in argv_backtester
+    assert "--min-rebalances-for-trust" in argv_backtester and "2" in argv_backtester
 
 
 def test_optimize_sub_flags_omitted_when_optimize_not_set(monkeypatch, tmp_path):
@@ -197,13 +243,25 @@ def test_cache_ttl_days_passthrough_only_when_set(monkeypatch, tmp_path):
     for call in mock_run.call_args_list:
         assert "--cache-ttl-days" not in call.args[0]
 
-    # Second run: flag set -- must be forwarded identically to all 4 steps.
+    # Second run: flag set, pattern_mining off -- forwarded to the 4 steps
+    # that actually run.
     monkeypatch.setattr(sys, "argv", ["run_pipeline.py", "--cache-ttl-days", "2"])
     mock_run2 = MagicMock(return_value=_fake_result(returncode=0, stderr=""))
     monkeypatch.setattr(run_pipeline.subprocess, "run", mock_run2)
     run_pipeline.main()
     assert mock_run2.call_count == 4
     for call in mock_run2.call_args_list:
+        argv = call.args[0]
+        assert "--cache-ttl-days" in argv and "2.0" in argv
+
+    # Third run: flag set together with --mine-patterns -- forwarded to all
+    # 5 steps, including the pattern_mining step.
+    monkeypatch.setattr(sys, "argv", ["run_pipeline.py", "--cache-ttl-days", "2", "--mine-patterns"])
+    mock_run3 = MagicMock(return_value=_fake_result(returncode=0, stderr=""))
+    monkeypatch.setattr(run_pipeline.subprocess, "run", mock_run3)
+    run_pipeline.main()
+    assert mock_run3.call_count == 5
+    for call in mock_run3.call_args_list:
         argv = call.args[0]
         assert "--cache-ttl-days" in argv and "2.0" in argv
 

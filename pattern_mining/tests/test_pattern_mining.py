@@ -1,7 +1,7 @@
 import numpy as np
 from common.testing import make_ohlcv_from_closes
 
-from stratgen.pattern_mining import build_pattern_templates, mine_indicator_patterns
+from pmine.pattern_mining import build_pattern_templates, mine_indicator_patterns
 
 
 def _random_walk_universe(n=1500, vol=0.02, seed=42, n_symbols=3):

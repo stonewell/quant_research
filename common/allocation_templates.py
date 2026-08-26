@@ -193,7 +193,7 @@ def build_aggregate_curve(universe: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     simplification used to approximate a basket's own OHLC from constituent
     OHLC when true simultaneous-quote data isn't available. Used by
     `PatternBasedAllocationTemplate` below and by
-    `strategy_generator/stratgen/pattern_mining.py`'s turning-point mining,
+    `pattern_mining/pmine/pattern_mining.py`'s turning-point mining,
     which both need ONE aggregate curve to detect turning points/compute
     indicators on, not a per-symbol one.
     """
@@ -775,31 +775,55 @@ ALLOCATION_TEMPLATES = [
 ]
 
 
+# Maps a mined feature_name to the FACTOR_CATEGORIES tag (common/factor_taxonomy.py)
+# that actually describes it -- grounded directly in that taxonomy's own category
+# descriptions (e.g. "regime_trend_strength" names ADX explicitly; "mean_reversion"
+# names RSI explicitly), not invented here. Used by PatternBasedAllocationTemplate
+# below so a mined template's factor_tags reflect WHICH INDICATOR was mined, not just
+# which direction (peak/trough) it trades -- see pattern_mining/pmine/pattern_mining.py
+# and root README's pipeline docs for why this is what lets a mined pattern's
+# strategy_generator/stratgen/generator.py factor tie-break genuinely compare it
+# against research_strategy's trend/factor evidence for the RIGHT reference class.
+_FEATURE_FACTOR_TAGS = {
+    "rsi": "mean_reversion",
+    "stoch_k": "mean_reversion",
+    "cci": "mean_reversion",
+    "williams_r": "mean_reversion",
+    "bb_pctb": "mean_reversion",
+    "adx": "regime_trend_strength",
+    "roc": "absolute_momentum_trend",
+    "sma_rel": "absolute_momentum_trend",
+    "macd_hist": "absolute_momentum_trend",
+    "atr_pct": "volatility_targeting",
+}
+
+
 class PatternBasedAllocationTemplate(AllocationTemplate):
-    """A trading signal built from ONE indicator pattern discovered by
-    `strategy_generator/stratgen/pattern_mining.py`'s turning-point pattern
-    mining -- deliberately NOT in `ALLOCATION_TEMPLATES` above, unlike the 9
-    static templates. Those are universe-agnostic formulas, zero-arg
-    constructible, searched for every basket; this template's own threshold
-    comes from mining a SPECIFIC basket's aggregate-portfolio turning-point
-    history first, so it can't be a static class -- it's instantiated by the
-    mining orchestration and passed into `StrategyGenerator.generate(...,
+    """A trading signal built from ONE indicator pattern discovered by the
+    `pattern_mining` stage's (`pattern_mining/pmine/pattern_mining.py`)
+    turning-point pattern mining -- deliberately NOT in `ALLOCATION_TEMPLATES`
+    above, unlike the 9 static templates. Those are universe-agnostic formulas,
+    zero-arg constructible, searched for every basket; this template's own
+    threshold comes from mining a SPECIFIC basket's aggregate-portfolio
+    turning-point history first, so it can't be a static class -- it's
+    instantiated from a `pattern_report.json` (or, in-process, straight from
+    a mining pass) and passed into `StrategyGenerator.generate(...,
     extra_templates=[...])`, competing through the exact same grid-search +
     Equivalent Random Search validation as every static template.
 
-    HONEST CAVEAT (read `pattern_mining.py`'s module docstring for the full
-    version): the mining pass that discovered this template's threshold
-    needed a few bars of hindsight to LABEL a historical date a "turning
-    point" at all (zigzag confirmation lag) -- but this live signal has NO
-    such lag itself: it only compares today's already-known indicator
-    reading against the mined threshold, never trying to detect a turning
-    point in real time. A mined pattern passing its own (Bonferroni-
-    corrected) significance test is necessary, not sufficient, for it to be
-    presented as trustworthy -- it must ALSO clear the same ERS bar every
-    other template does; on synthetic data, most mining passes are expected
-    to find nothing significant at all, matching this workspace's own
-    repeated finding elsewhere that most series show no significant
-    structure.
+    HONEST CAVEAT (read `pattern_mining/pmine/pattern_mining.py`'s module
+    docstring for the full version): the mining pass that discovered this
+    template's threshold needed a few bars of hindsight to LABEL a
+    historical date a "turning point" at all (zigzag confirmation lag) --
+    but this live signal has NO such lag itself: it only compares today's
+    already-known indicator reading against the mined threshold, never
+    trying to detect a turning point in real time. A mined pattern passing
+    its own (Bonferroni-corrected) significance test is necessary, not
+    sufficient, for it to be presented as trustworthy -- it must ALSO clear
+    the same ERS bar every other template does; on synthetic data, most
+    mining passes are expected to find nothing significant at all, matching
+    this workspace's own repeated finding elsewhere that most series show
+    no significant structure.
     """
 
     def __init__(self, feature_name: str, feature_lookback, threshold: float,
@@ -821,6 +845,13 @@ class PatternBasedAllocationTemplate(AllocationTemplate):
         lb = feature_lookback
         lb_str = "_".join(str(x) for x in lb) if isinstance(lb, (tuple, list)) else str(lb)
         name = f"pattern_{feature_name}_{lb_str}_{event_type}"
+        # Falls back to the old peak/trough-only heuristic ONLY for a
+        # feature_name outside common/indicator_features.py's own
+        # DEFAULT_FEATURE_MENU (shouldn't happen via normal mining, but
+        # degrades sensibly rather than raising for a hand-built instance).
+        tag = _FEATURE_FACTOR_TAGS.get(
+            feature_name, "regime_trend_strength" if event_type == "peak" else "mean_reversion"
+        )
         super().__init__(
             name=name,
             param_grid={
@@ -828,7 +859,7 @@ class PatternBasedAllocationTemplate(AllocationTemplate):
                 "hold_days": [10, 21, 42],
                 "rebalance_freq_days": [5, 21],
             },
-            factor_tags=["regime_trend_strength"] if event_type == "peak" else ["mean_reversion"],
+            factor_tags=[tag],
         )
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict) -> pd.DataFrame:
@@ -881,7 +912,7 @@ class PatternBasedAllocationTemplate(AllocationTemplate):
             f"rebalances every {rebal} trading days. Mined from this basket's own aggregate-portfolio "
             f"turning-point history via a Bonferroni-corrected shuffle-null significance test "
             f"({p_str}, n_events={self.mined_n_events}) -- see "
-            f"strategy_generator/stratgen/pattern_mining.py. {action.capitalize()} (equal-weight across "
+            f"pattern_mining/pmine/pattern_mining.py. {action.capitalize()} (equal-weight across "
             f"the basket) for {hold_days} trading days whenever the {self.feature_name} reading "
             f"{self.comparison} {effective_threshold:.4g} (mined threshold x {threshold_mult}). HONEST "
             f"CAVEAT: the mining pass needed a few bars of hindsight to LABEL a historical date a turning "
@@ -889,7 +920,7 @@ class PatternBasedAllocationTemplate(AllocationTemplate):
             f"it only compares today's already-known reading against the mined threshold. Passed this "
             f"workspace's standard Equivalent Random Search validation like every other template; a "
             f"significant reading during mining reflects mechanism, not a guaranteed real edge -- see "
-            f"strategy_generator/README.md's pattern-mining section."
+            f"pattern_mining/README.md."
         )
 
     def warmup_bars(self, params: dict) -> int:

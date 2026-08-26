@@ -1,14 +1,14 @@
 """Named indicator "features" (indicator name + lookback) shared by
-`strategy_generator/stratgen/pattern_mining.py`'s turning-point pattern
-mining and `common.allocation_templates.PatternBasedAllocationTemplate`'s
-live trading signal.
+`pattern_mining/pmine/pattern_mining.py`'s turning-point pattern mining and
+`common.allocation_templates.PatternBasedAllocationTemplate`'s live trading
+signal.
 
 The SAME `compute_feature` dispatch backs both call sites deliberately: a
 mined pattern's threshold is tested during mining, and later evaluated
 during live trading, against the IDENTICAL computation -- there must be no
 drift between "what was found significant" and "what the strategy actually
 trades on". This is a shared module specifically so `common/`
-(project-agnostic) and `strategy_generator/` (the mining orchestrator) both
+(project-agnostic) and `pattern_mining/` (the mining orchestrator) both
 import one definition rather than keeping two that could diverge.
 
 Never used by any of the 9 static `AllocationTemplate` classes -- those use

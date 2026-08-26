@@ -81,31 +81,33 @@ uv run python strategy_generator/run_strategygen.py --universe SPY QQQ TLT GLD \
   --mode generate --factor-report research_strategy/results/factor_summary.json
 ```
 
-## Optional: turning-point indicator pattern mining (`--mine-patterns`)
+## Optional: consuming a `pattern_mining` report (`--pattern-report`)
 
-`--mine-patterns` adds one more, more exploratory candidate-discovery path on top of the 9 static
-templates. It builds an equal-weight aggregate portfolio curve for the resolved universe
-(`common.allocation_templates.build_aggregate_curve`), detects the curve's major peaks/troughs with
-a percentage-based zigzag filter (`stratgen/turning_points.py`), and tests whether any indicator in
-a broad "popular technical indicators" menu (`common/indicator_features.py`: RSI, SMA-relative
-position, ROC, ATR%, ADX, Bollinger %B, Stochastic %K, MACD histogram, CCI, Williams %R) reads
-significantly differently `--pattern-lag-bars` trading days (default 20) BEFORE those turning
-points than before a random date (`stratgen/pattern_mining.py`). Any significant finding becomes a
-`PatternBasedAllocationTemplate` (`common/allocation_templates.py`) and is folded into the SAME
-grid-search + Equivalent Random Search pipeline as every static template via the generic
-`extra_templates` mechanism (`StrategyGenerator.generate(..., extra_templates=[...])`) — it must
-still clear the same ERS bar to be trusted; the mining significance test alone is never sufficient.
+Turning-point indicator pattern mining is its own pipeline stage now — see `pattern_mining/README.md`
+for the full methodology (zigzag turning-point detection, the indicator menu, the Bonferroni-corrected
+shuffle-null significance test, and its disclosed lag/hindsight caveats). Run it once
+(`pattern_mining/run_pattern_mining.py`) to produce a durable `pattern_mining/results/pattern_report.json`,
+then pass that report here with `--pattern-report`: its significant findings are turned into
+`PatternBasedAllocationTemplate` (`common/allocation_templates.py`) candidates (up to
+`--pattern-max-templates`), folded into the SAME grid-search + Equivalent Random Search pipeline as
+every static template via the generic `extra_templates` mechanism — they must still clear the same
+ERS bar to be trusted; the mining significance test alone is never sufficient.
 
 ```bash
+# 1. Mine patterns once (its own stage, durable output)
+uv run python pattern_mining/run_pattern_mining.py --universe SPY QQQ TLT GLD --data-provider synthetic
+
+# 2. Feed the report into strategy_generator (can be reused across multiple runs)
 uv run python strategy_generator/run_strategygen.py --universe SPY QQQ TLT GLD \
-  --mode generate --data-provider synthetic --mine-patterns
+  --mode generate --data-provider synthetic \
+  --pattern-report pattern_mining/results/pattern_report.json
 ```
 
 ## Optional: including `research_strategy` strategies as candidates (`--research-strategy`)
 
 `--research-strategy KEY [KEY ...]` includes one or more of `research_strategy`'s 17 strategy
 implementations as additional candidate templates, alongside the 9 static allocation templates and
-any `--mine-patterns` findings. Each `KEY` is one of `research_strategy/strategies_config.json`'s
+any `--pattern-report` findings. Each `KEY` is one of `research_strategy/strategies_config.json`'s
 short keys (e.g. `baa_keller`, `adaptive_grid`, `rsi_mean_reversion` — see `research_strategy/README.md`
 for the full list of 17); run
 `uv run python -c "from research_strategy.rs.config import load_strategies_config; print(sorted(load_strategies_config().keys()))"`
@@ -113,7 +115,7 @@ from the repo root to see them directly. Each named strategy is instantiated exa
 `research_strategy`'s own CLI would build it — including any `strategies_config.json` parameter
 overrides — via `research_strategy.rs.strategy.instantiate_strategy_from_config_entry`, then folded
 into the SAME grid-search + Equivalent Random Search pipeline as every static template via the
-generic `extra_templates` mechanism (same plumbing `--mine-patterns` uses). An unrecognized key
+generic `extra_templates` mechanism (same plumbing `--pattern-report` uses). An unrecognized key
 raises a clear error listing every valid key rather than failing deep inside the search.
 
 ```bash
@@ -121,41 +123,6 @@ uv run python strategy_generator/run_strategygen.py --universe SPY QQQ TLT GLD -
   --data-provider synthetic --research-strategy baa_keller adaptive_grid \
   --factor-report research_strategy/results/factor_summary.json
 ```
-
-**Why the lag matters — the single most important methodological decision in this feature**:
-reading an indicator EXACTLY AT a zigzag-confirmed turning point is nearly tautological, not a
-discovery. A zigzag peak is, by construction, a local price maximum reached via a recent run-up; a
-momentum-style indicator computed AT that exact bar is measuring THE SAME run-up the label is built
-from. An early version of this feature tested at lag=0 and found ~80% of the whole indicator menu
-"significant" on a **pure random-walk universe with zero real structure** — proof the lag=0
-question is nearly definitionally true regardless of the data, not a real finding. Reading the
-indicator `--pattern-lag-bars` days BEFORE the turning point asks a genuinely different, actionable
-question instead: "did this indicator already look unusual before the reversal happened, in a way
-you could have observed and acted on in real time."
-
-**Honest residual limitation (measured, not assumed)**: even at the default 20-bar lag, repeated
-pure-random-walk negative-control runs still occasionally flag a handful of the menu "significant"
-— far fewer than at lag=0-10 (which flagged roughly half the menu), but not a clean, reliable zero.
-Some mechanical/tautological correlation between momentum-style indicators and momentum-defined
-turning points survives the lag adjustment. This is exactly why the mining significance test
-(Bonferroni-corrected across the whole menu, since it tests dozens of indicator/lookback
-combinations — new territory `instrument_selection`'s single-statistic significance tests never
-needed) is treated as a candidate-generation FILTER, not proof of a real edge: every mined candidate
-must ALSO clear the Equivalent Random Search bar, which tests actual backtested performance against
-random portfolios, not just "does this statistic look unusual."
-
-**Confirmation-lag / hindsight caveat (a separate issue from the tautology above)**: labeling a
-historical date a "turning point" at all requires a few bars of hindsight past the turning point
-itself — legitimate for this research/mining pass (the same hindsight `max_drawdown` already uses
-elsewhere in this workspace), but the resulting **live trading template has no such lag**: it only
-ever compares a live, already-known indicator reading against the mined threshold, never trying to
-detect a turning point in real time.
-
-**Expected outcome on synthetic data**: per this workspace's own repeated finding elsewhere
-(`instrument_selection`'s Hurst/momentum/candlestick significance tests, this project's own ERS
-checks), most series show no significant structure. Finding 0 significant patterns is the common,
-correct result on synthetic GBM-like data, not a bug — the CLI prints this explicitly and proceeds
-with the 9 standard templates.
 
 ## Why this design (still accurate, unchanged by the architecture rewrite)
 
@@ -217,31 +184,30 @@ strategy_generator/
                         backtester's --optimize feature -- generator.py just supplies the
                         _portfolio_score callback and its own multi-template reduction/tiebreak on top;
                         no CLI flags, strategy.json schema, or user-visible behavior changed.
-    turning_points.py   Percentage-based zigzag peak/trough detector (nothing like this exists
-                        elsewhere in this workspace) -- used only by pattern_mining.py
-    pattern_mining.py   Aggregate-curve turning-point detection -> indicator feature menu ->
-                        Bonferroni-corrected shuffle-null significance test ->
-                        PatternBasedAllocationTemplate candidates (see --mine-patterns above)
     regime.py           Hurst-based regime classification -- still present, unit-tested, but
                         DISCONNECTED from generator.py (see "Known, disclosed gaps" above)
     indicators.py       Re-exports from ../common/indicators.py: the small, restricted set for the
-                        9 static templates, PLUS the broader popular-indicators menu used ONLY by
-                        pattern_mining.py (see indicators.py's own docstring for why that's a
-                        disclosed exception, not a contradiction, of the "restricted set" rule)
+                        9 static templates, PLUS the broader popular-indicators menu the (now
+                        separate) pattern_mining stage mines against (see indicators.py's own
+                        docstring for why that's a disclosed exception, not a contradiction, of
+                        the "restricted set" rule)
     metrics.py          Thin re-exports from ../common/metrics.py (including deflated_sharpe_ratio,
                         currently unused by this project's own CLI -- see above)
     data.py             Thin wrapper over ../common/data.py
-  run_strategygen.py     CLI: "generate" mode (--factor-report and --mine-patterns are both optional)
+  run_strategygen.py     CLI: "generate" mode (--factor-report and --pattern-report are both optional)
   tests/                 pytest, synthetic data only
   data/, results/        gitignored
 ```
 
+Turning-point pattern mining (`turning_points.py`, `pattern_mining.py`) moved to its own
+`pattern_mining/` project — see `pattern_mining/README.md`.
+
 The actual template implementations (including `PatternBasedAllocationTemplate` and
 `build_aggregate_curve`), and the shared `factor_tags`/factor-taxonomy and indicator-feature
 machinery, live in `../common/allocation_templates.py`, `../common/factor_taxonomy.py`, and
-`../common/indicator_features.py` — this project imports and searches/mines them, it doesn't define
-them (`common/` stays project-agnostic; `pattern_mining.py`'s mining orchestration is the one thing
-that's genuinely `strategy_generator`-specific).
+`../common/indicator_features.py` — this project imports and searches them, it doesn't define
+them (`common/` stays project-agnostic; the `pattern_mining` project's mining orchestration is a
+separate stage this project consumes a durable report from, not code it owns).
 
 ## Setup
 
@@ -276,10 +242,8 @@ falling back to this project's own default universe (`["SPY", "QQQ"]`) if none a
 | `--min-rebalances-for-trust` | int, default `4` | Minimum rebalance count before a result is trusted |
 | `--factor-report` | path, default: none | Optional path to a `research_strategy` `factor_summary.json` (see above) |
 | `--factor-tiebreak-epsilon` | float, default `0.05` | How close two templates' Sharpe ratios must be before `--factor-report` can break the tie |
-| `--mine-patterns` | flag, default off | Detect turning-point indicator patterns and add any significant one as a candidate template (see above) |
-| `--pattern-min-swing-pct` | float, default `0.05` | Minimum zigzag swing size to confirm a turning point (0.05 = 5%) |
-| `--pattern-lag-bars` | int, default `20` | How many trading days before each turning point to read indicators at |
-| `--pattern-max-templates` | int, default `5` | Cap on how many significant mined patterns become candidate templates |
+| `--pattern-report` | path, default: none | Optional path to a `pattern_mining` stage `pattern_report.json` (see above and `pattern_mining/README.md`) |
+| `--pattern-max-templates` | int, default `5` | Cap on how many significant findings (from `--pattern-report`) become candidate templates |
 | `--research-strategy` | space-separated `strategies_config.json` keys, default: none | Include one or more `research_strategy` strategies (e.g. `baa_keller`, `adaptive_grid`) as additional candidate templates (see above) |
 | `--data-provider` | str, default `"yfinance"` | `yfinance`, `csv`, `synthetic`, or a custom module specifier |
 | `--data-dir` | path, default: none | Folder path for the `csv` data provider |
@@ -317,17 +281,19 @@ uv run python strategy_generator/run_strategygen.py --universe SPY QQQ AAPL --mo
 uv run python strategy_generator/run_strategygen.py --universe SPY QQQ AAPL TLT GLD \
   --factor-report research_strategy/results/factor_summary.json --factor-tiebreak-epsilon 0.10
 
-# With turning-point pattern mining as an additional candidate source
+# With a pattern_mining report as an additional candidate source (run the pattern_mining
+# stage first -- see pattern_mining/README.md -- to produce this file)
 uv run python strategy_generator/run_strategygen.py --universe SPY QQQ AAPL --mode generate \
-  --mine-patterns
+  --pattern-report pattern_mining/results/pattern_report.json
 
-# Pattern mining with custom swing/lag/cap parameters
+# Pattern report with a lower candidate-template cap
 uv run python strategy_generator/run_strategygen.py --universe SPY QQQ AAPL MSFT NVDA GLD TLT \
-  --mine-patterns --pattern-min-swing-pct 0.08 --pattern-lag-bars 10 --pattern-max-templates 3
+  --pattern-report pattern_mining/results/pattern_report.json --pattern-max-templates 3
 
-# Factor report AND pattern mining together (both optional candidate sources at once)
+# Factor report AND a pattern report together (both optional candidate sources at once)
 uv run python strategy_generator/run_strategygen.py --universe SPY QQQ AAPL MSFT NVDA GLD TLT IEF \
-  --factor-report research_strategy/results/factor_summary.json --mine-patterns
+  --factor-report research_strategy/results/factor_summary.json \
+  --pattern-report pattern_mining/results/pattern_report.json
 
 # Offline/synthetic data only (no network calls) -- this workspace's standing testing convention
 uv run python strategy_generator/run_strategygen.py --universe SPY QQQ AAPL --mode generate \
@@ -382,24 +348,12 @@ own IN-SAMPLE equity curve (the same data it was searched/validated on, unlike `
 out-of-sample chart) via the shared `common/plotting.py::plot_equity_curve` helper. Pass
 `--no-plots` to skip it.
 
-### Pattern-mining DataFrames (`stratgen/turning_points.py`, `stratgen/pattern_mining.py`)
+### `pattern_report.json`
 
-Only relevant when using `--mine-patterns` directly against the Python API (the CLI only surfaces
-the final counts, not these intermediate frames):
-
-- **`find_turning_points(close, ...)`** returns a DataFrame indexed by date with columns `type`
-  (`"peak"`/`"trough"`) and `price` (float) — one row per CONFIRMED turning point (see
-  `turning_points.py`'s module docstring for what "confirmed" excludes).
-- **`mine_indicator_patterns(...)`** returns `(findings, status)`. `status` is `"ok"`,
-  `"insufficient_data"`, or `"insufficient_turning_points"`. `findings` (empty in the two
-  degenerate cases, and commonly empty even when `status="ok"`) has one row per
-  (feature, event_type) tested, columns: `feature` (str), `lookback` (int or 3-int list),
-  `event_type` (`"peak"`/`"trough"`), `observed_stat`/`null_mean`/`p_value`/`adjusted_alpha`
-  (float), `significant` (bool), `comparison` (`"below"`/`"above"`), `threshold` (float,
-  the median observed value — becomes the mined template's threshold), `n_events` (int).
-- **`build_pattern_templates(findings, ...)`** turns the significant rows into a
-  `List[PatternBasedAllocationTemplate]` (`../common/README.md` §6 describes the underlying
-  `(name, lookback)` vocabulary these draw from).
+Produced by the separate `pattern_mining` stage and consumed here via `--pattern-report` — its
+schema (`run_context`/`status`/`findings`) and the underlying mining DataFrames
+(`find_turning_points`, `mine_indicator_patterns`, `build_pattern_templates`) are documented in
+`pattern_mining/README.md`, not repeated here.
 
 ## Testing
 
@@ -414,14 +368,11 @@ Synthetic data only, covering: each of the 9 templates' signal logic and edge ca
 winner, no-op when no report is supplied — a dedicated regression test pins that omitting
 `--factor-report` reproduces byte-for-byte the same winner as before this feature existed),
 `--factor-report` file validation (a malformed file raises a clear, named error rather than a raw
-`KeyError` surfacing deep inside `generator.py`), the zigzag turning-point detector (known
-peak/trough locations, small-wiggle filtering, end-of-series repainting exclusion), the 6 new
-popular indicators (Bollinger Bands, Stochastic, CCI, Williams %R, EMA, OBV), and
-`pattern_mining.py`'s significance test with BOTH a positive control (a deliberately planted
-indicator/turning-point relationship must be flagged significant) and a negative control (a pure
-random-walk universe must show meaningfully fewer significant findings after the lag adjustment
-than before it — see the "honest residual limitation" note above for why this is a comparative
-check, not a fragile exact-zero assertion).
+`KeyError` surfacing deep inside `generator.py`), `--pattern-report` file validation (same style),
+and the 6 new popular indicators (Bollinger Bands, Stochastic, CCI, Williams %R, EMA, OBV). The
+zigzag turning-point detector and `pattern_mining.py`'s significance test (positive/negative
+control tests) now live in, and are tested by, the separate `pattern_mining` project
+(`uv run pytest pattern_mining/tests -v`) — see `pattern_mining/README.md`.
 
 ## Known limitations
 
@@ -436,12 +387,10 @@ check, not a fragile exact-zero assertion).
   enough to override a real backtested Sharpe difference.
 - See `research_strategy/README.md` for the full caveat on why a `factor_summary.json` computed
   on synthetic data reflects mechanism, not a validated factor edge.
-- `--mine-patterns`' significance test has a measured residual false-positive rate even after the
-  lag adjustment (see the "honest residual limitation" note above) — treat a mined candidate's
-  significance as a filter that earns it a shot at the ERS/backtest gate, not as evidence on its own.
-- `--mine-patterns` only tests ONE fixed lag (`--pattern-lag-bars`) per run, not a range — a
-  deliberate choice to avoid adding another dimension to the already-corrected multiple-comparisons
-  menu, at the cost of not knowing whether a different lag would have found something this run didn't.
+- The `pattern_mining` stage's significance test has known, disclosed limitations (a measured
+  residual false-positive rate even after its lag adjustment, one fixed lag tested per run, not a
+  range) — see `pattern_mining/README.md`. Treat a `--pattern-report` candidate's significance as a
+  filter that earns it a shot at the ERS/backtest gate here, not as evidence on its own.
 - A `PatternBasedAllocationTemplate` that wins is NOT in the static `ALLOCATION_TEMPLATES` registry
   (it's universe-specific); `run_strategygen.py` embeds a `pattern_spec` block in `strategy.json` so
   `backtester/run_backtest.py` can reconstruct the exact same instance (see its own `_get_template`)

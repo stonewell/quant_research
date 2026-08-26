@@ -15,7 +15,7 @@ import os
 import numpy as np
 from common.testing import make_ohlcv_from_closes
 
-from stratgen.pattern_mining import mine_indicator_patterns
+from pmine.pattern_mining import mine_indicator_patterns
 
 _GOLDEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "golden_pattern_mining_values.json")
 with open(_GOLDEN_PATH) as _f:

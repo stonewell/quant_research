@@ -1,6 +1,6 @@
 import pandas as pd
 
-from stratgen.turning_points import find_turning_points
+from pmine.turning_points import find_turning_points
 
 
 def _series(values):
