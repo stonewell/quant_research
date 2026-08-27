@@ -169,6 +169,26 @@ def test_csv_folder_data_provider_drops_a_bad_row(temp_csv_dir):
     assert dates[2] not in df.index
 
 
+def test_csv_folder_data_provider_raises_when_every_row_in_range_is_invalid(temp_csv_dir):
+    # Regression: the empty-range guard used to run BEFORE
+    # _drop_invalid_ohlcv_rows, so a CSV with rows inside the requested date
+    # range but every one logically-impossible OHLC silently returned an
+    # empty DataFrame instead of raising -- the same "no usable data" outcome
+    # the guard was clearly meant to catch.
+    dates = pd.bdate_range("2020-01-01", periods=2)
+    mock_df = pd.DataFrame(
+        {"Open": [10.0] * 2, "High": [1.0] * 2, "Low": [9.0] * 2, "Close": [11.0] * 2, "Volume": [100.0] * 2},
+        index=dates,
+    )  # every row has High < Low
+    csv_path = os.path.join(temp_csv_dir, "ALLBAD_1d.csv")
+    mock_df.to_csv(csv_path)
+
+    provider = CSVFolderDataProvider(folder_path=temp_csv_dir)
+    with pytest.warns(UserWarning, match="Dropping 2 row"):
+        with pytest.raises(ValueError, match="every one was dropped"):
+            provider.fetch_ohlcv("ALLBAD", start="2020-01-01", end="2020-01-10", interval="1d")
+
+
 @patch("yfinance.download")
 def test_yfinance_data_provider_drops_a_bad_row(mock_yf_download):
     dates = pd.bdate_range("2020-01-01", periods=4)
@@ -190,6 +210,22 @@ def test_yfinance_data_provider_drops_a_bad_row(mock_yf_download):
 
     assert len(df) == 3
     assert dates[3] not in df.index
+
+
+@patch("yfinance.download")
+def test_yfinance_data_provider_raises_when_every_row_is_invalid(mock_yf_download):
+    # Regression mirroring test_csv_folder_data_provider_raises_when_every_row_in_range_is_invalid.
+    dates = pd.bdate_range("2020-01-01", periods=2)
+    mock_df = pd.DataFrame(
+        {"Open": [100.0] * 2, "High": [95.0] * 2, "Low": [105.0] * 2, "Close": [102.0] * 2, "Volume": [1000.0] * 2},
+        index=dates,
+    )  # every row has High < Low
+    mock_yf_download.return_value = mock_df
+
+    provider = YFinanceDataProvider()
+    with pytest.warns(UserWarning, match="Dropping 2 row"):
+        with pytest.raises(ValueError, match="every one was dropped"):
+            provider.fetch_ohlcv("AAPL", start="2020-01-01", end="2020-01-05")
 
 
 def test_cached_data_provider(temp_csv_dir):
@@ -606,4 +642,32 @@ def test_cached_data_provider_all_rows_invalid_triggers_refetch(temp_csv_dir):
         df = cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
 
     assert not df.empty  # served fresh from the inner (synthetic) provider instead
+
+
+class _EmptyReturningProvider(BaseDataProvider):
+    """A well-behaved-by-its-own-rules provider that returns an empty
+    DataFrame instead of raising -- YFinance/CSVFolder no longer do this
+    (see their own _drop_invalid_ohlcv_rows-empties-everything guards), but
+    nothing stops a third-party/custom provider from doing so."""
+
+    def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+
+
+def test_cached_data_provider_raises_instead_of_silently_returning_empty(temp_csv_dir):
+    # Regression: on a cache miss (or a corrupt-cache re-fetch), the
+    # inner_provider's result was written to disk and returned as-is with
+    # no emptiness check. fetch_universe()'s try/except only ever skips a
+    # symbol that RAISES, not one that merely returns an empty DataFrame --
+    # so an empty result used to be silently counted as "loaded" downstream.
+    cached_provider = CachedDataProvider(_EmptyReturningProvider(), cache_dir=temp_csv_dir)
+
+    with pytest.raises(ValueError, match="returned no data"):
+        cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
+
+    # And it must be excluded (not silently included with an empty frame)
+    # when reached via fetch_universe(), matching how every other
+    # "this symbol failed" path already behaves.
+    universe = cached_provider.fetch_universe(["SPY"], start="2020-01-01", end="2020-01-10")
+    assert universe == {}
 

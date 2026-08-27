@@ -136,6 +136,70 @@ def test_get_template_reconstructs_research_strategy_spec_from_spec():
     assert hasattr(template, "warmup_bars")
 
 
+def test_get_template_reconstructs_allocation_composite_from_spec():
+    # A composite_spec with track="allocation" (strategy_generator's aspect
+    # composition, see common/strategy_aspects.py) must rebuild the exact
+    # CompositeAllocationTemplate, with the saved params carried through as
+    # its default_params fallback (needed by --optimize's fresh grid search).
+    composite_spec = {"track": "allocation", "selection_key": "momentum_topn", "weighting_key": "min_variance"}
+    params = {"mom_lookback": 126, "top_n_fraction": 0.5, "cov_lookback": 60, "rebalance_freq_days": 21}
+
+    template = _get_template("momentum_topn__min_variance", composite_spec=composite_spec, params=params)
+
+    from common.strategy_aspects import CompositeAllocationTemplate
+    assert isinstance(template, CompositeAllocationTemplate)
+    assert template.name == "momentum_topn__min_variance"
+    assert template.default_params == params
+
+
+def test_get_template_reconstructs_timing_composite_from_spec():
+    # A composite_spec with track="timing" (research_strategy/rs/timing_aspects.py)
+    # must rebuild the exact CompositeTimingTemplate, with the saved params
+    # carried through as its default_params fallback.
+    composite_spec = {"track": "timing", "entry_key": "turtle_breakout_entry", "exit_key": "rsi_cross_exit"}
+    params = {"turtle_entry_breakout_days": 20, "rsi_stop_loss_pct": 0.05}
+
+    template = _get_template("turtle_breakout_entry__rsi_cross_exit", composite_spec=composite_spec, params=params)
+
+    from research_strategy.rs.timing_aspects import CompositeTimingTemplate
+    assert isinstance(template, CompositeTimingTemplate)
+    assert template.name == "turtle_breakout_entry__rsi_cross_exit"
+    assert template.default_params == params
+
+
+def test_load_strategy_file_composite_spec_missing_required_keys(tmp_path):
+    path = tmp_path / "strategy.json"
+    composite_spec = {"track": "allocation", "selection_key": "momentum_topn"}  # "weighting_key" omitted
+    _write_strategy_file(path, template_name="momentum_topn__min_variance", composite_spec=composite_spec)
+
+    with pytest.raises(ValueError, match="weighting_key"):
+        _load_strategy_file(str(path))
+
+
+def test_load_strategy_file_composite_spec_unknown_track(tmp_path):
+    path = tmp_path / "strategy.json"
+    composite_spec = {"track": "bogus"}
+    _write_strategy_file(path, template_name="x", composite_spec=composite_spec)
+
+    with pytest.raises(ValueError, match="track"):
+        _load_strategy_file(str(path))
+
+
+def test_load_strategy_file_rejects_composite_spec_alongside_pattern_spec(tmp_path):
+    path = tmp_path / "strategy.json"
+    pattern_spec = {
+        "feature_name": "rsi", "feature_lookback": 14, "threshold": 30.0,
+        "comparison": "below", "event_type": "trough",
+    }
+    composite_spec = {"track": "allocation", "selection_key": "momentum_topn", "weighting_key": "min_variance"}
+    _write_strategy_file(
+        path, template_name="pattern_rsi_14_trough", pattern_spec=pattern_spec, composite_spec=composite_spec,
+    )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _load_strategy_file(str(path))
+
+
 def test_data_dir_uses_shared_data_dir():
     # Regression test: DATA_DIR used to be a per-project default_data_dir(__file__)
     # (this project's own default_data_dir was removed in the shared OHLCV cache
@@ -313,12 +377,15 @@ def test_run_walkforward_warms_up_indicator_lookback_before_each_fold():
         assert fold["total_rebalances"] == 12
 
 
-def _write_strategy_file(path, template_name="equal_weight", params=None, pattern_spec=None, research_strategy_spec=None):
+def _write_strategy_file(path, template_name="equal_weight", params=None, pattern_spec=None,
+                          research_strategy_spec=None, composite_spec=None):
     strategy_def = {"template_name": template_name, "params": params or {"rebalance_freq_days": 10}}
     if pattern_spec is not None:
         strategy_def["pattern_spec"] = pattern_spec
     if research_strategy_spec is not None:
         strategy_def["research_strategy_spec"] = research_strategy_spec
+    if composite_spec is not None:
+        strategy_def["composite_spec"] = composite_spec
     with open(path, "w") as f:
         json.dump(strategy_def, f)
 

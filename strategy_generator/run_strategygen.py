@@ -117,6 +117,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "would build it (including any strategies_config.json parameter overrides).")
     p.add_argument("--no-plots", action="store_true",
                    help="Skip the equity-curve chart normally produced for the winning strategy (charts are ON by default).")
+    p.add_argument("--no-compose-aspects", action="store_true",
+                   help="Disable aspect composition (ON by default): pairing one decomposable template's own "
+                        "selection/entry aspect with a DIFFERENT decomposable template's own weighting/exit "
+                        "aspect (e.g. momentum's stock-picking with inverse-volatility's position sizing) to "
+                        "search hybrid strategies that aren't any single static or --research-strategy template. "
+                        "See common/strategy_aspects.py and research_strategy/rs/timing_aspects.py. Pass this "
+                        "flag to restrict the search to only the templates explicitly named/loaded.")
     add_data_provider_cli_args(p)
     return p
 
@@ -128,6 +135,7 @@ def main():
         ers_percentile_threshold=args.ers_percentile_threshold,
         min_rebalances_for_trust=args.min_rebalances_for_trust,
         factor_tiebreak_epsilon=args.factor_tiebreak_epsilon,
+        enable_aspect_composition=not args.no_compose_aspects,
     )
 
     factor_report = None
@@ -214,6 +222,9 @@ def main():
         if factor_report is not None:
             print(f"  Factor Context (mean historical Sharpe by candidate template's factor tags): {spec.factor_context}")
             print(f"  Factor Tie-Break Used: {spec.factor_tiebreak_used}")
+        if spec.is_composite:
+            print(f"  Composite Strategy (track={spec.composite_track}): assembled from aspects "
+                  f"{spec.component_templates} -- not one of this workspace's original templates.")
 
         print("\n=== Strategy Logic & Execution Schedule ===")
         print(f"  {spec.explanation}")
@@ -268,6 +279,25 @@ def main():
                 }
                 break
 
+        # Populated only when a hybrid assembled by aspect composition won
+        # (see GeneratorConfig.enable_aspect_composition) -- mutually
+        # exclusive with pattern_spec/research_strategy_spec above, same
+        # reconstruction convention: enough for backtester/run_backtest.py's
+        # _get_template to rebuild the exact same CompositeAllocationTemplate/
+        # CompositeTimingTemplate instance from common.strategy_aspects/
+        # research_strategy.rs.timing_aspects's registries.
+        composite_spec = None
+        if spec.is_composite:
+            key_names = (
+                ("selection_key", "weighting_key") if spec.composite_track == "allocation"
+                else ("entry_key", "exit_key")
+            )
+            composite_spec = {
+                "track": spec.composite_track,
+                key_names[0]: spec.component_templates[0],
+                key_names[1]: spec.component_templates[1],
+            }
+
         strategy_json_path = os.path.join(RESULTS_DIR, "strategy.json")
         write_json_report({
             "template_name": spec.template_name,
@@ -286,6 +316,7 @@ def main():
             "factor_tiebreak_used": spec.factor_tiebreak_used,
             "pattern_spec": pattern_spec,
             "research_strategy_spec": research_strategy_spec,
+            "composite_spec": composite_spec,
         }, strategy_json_path)
         print(f"Saved strategy definition to {strategy_json_path}")
 

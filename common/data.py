@@ -76,7 +76,13 @@ class YFinanceDataProvider(BaseDataProvider):
         df = df[["Open", "High", "Low", "Close", "Volume"]]
         df.index = pd.to_datetime(df.index)
         df = df.dropna(subset=["Open", "High", "Low", "Close"])
-        return _drop_invalid_ohlcv_rows(df, symbol)
+        df = _drop_invalid_ohlcv_rows(df, symbol)
+        if df.empty:
+            raise ValueError(
+                f"Data for {symbol} between {start} and {end} had rows, but every one was dropped as "
+                f"logically-impossible OHLC (see the warning above) -- no valid data available."
+            )
+        return df
 
     def fetch_metadata(self, symbol: str) -> dict:
         expense_ratio, total_assets = float("nan"), float("nan")
@@ -150,7 +156,13 @@ class CSVFolderDataProvider(BaseDataProvider):
         # (common/README.md, section 1) -- a CSV on disk isn't guaranteed to
         # already be sorted by date.
         df = df.dropna(subset=["Open", "High", "Low", "Close"]).sort_index()
-        return _drop_invalid_ohlcv_rows(df, symbol)
+        df = _drop_invalid_ohlcv_rows(df, symbol)
+        if df.empty:
+            raise ValueError(
+                f"CSV data for {symbol} between {start} and {end} had rows, but every one was dropped "
+                f"as logically-impossible OHLC (see the warning above) -- no valid data available."
+            )
+        return df
 
 
 class SyntheticDataProvider(BaseDataProvider):
@@ -283,8 +295,20 @@ class CachedDataProvider(BaseDataProvider):
                 warnings.warn(f"Cache file '{cache_path}' is corrupt or invalid ({exc}); re-fetching from source.")
 
         df = self.inner_provider.fetch_ohlcv(symbol, start, end, interval)
-        if not df.empty:
-            df.to_csv(cache_path)
+        if df.empty:
+            # Both stock providers (YFinance/CSVFolder) now raise instead of
+            # returning empty (see _drop_invalid_ohlcv_rows call sites
+            # above), so this only fires for a custom/third-party provider
+            # that returns empty without raising -- must still surface as an
+            # error, not a silently "successfully loaded" empty symbol: a
+            # caller iterating fetch_universe() catches exceptions to skip a
+            # symbol with a warning, but has no such check for a merely
+            # EMPTY (non-raising) result, so it would otherwise count this
+            # symbol as loaded and hand an empty DataFrame downstream.
+            raise ValueError(
+                f"{type(self.inner_provider).__name__} returned no data for {symbol} between {start} and {end}."
+            )
+        df.to_csv(cache_path)
         return df
 
     # fetch_universe is deliberately NOT overridden here: BaseDataProvider's

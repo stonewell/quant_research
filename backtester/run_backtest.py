@@ -94,10 +94,12 @@ def _align_universe(universe: dict) -> dict:
     return {symbol: df.loc[common_index] for symbol, df in universe.items()}
 
 
-def _get_template(template_name: str, pattern_spec: dict = None, research_strategy_spec: dict = None):
-    """Looks up a static template by name, UNLESS `pattern_spec` or
-    `research_strategy_spec` is given (the two are mutually exclusive --
-    a winning strategy.json only ever came from one source).
+def _get_template(template_name: str, pattern_spec: dict = None, research_strategy_spec: dict = None,
+                   composite_spec: dict = None, params: dict = None):
+    """Looks up a static template by name, UNLESS `pattern_spec`,
+    `research_strategy_spec`, or `composite_spec` is given (all three are
+    mutually exclusive -- a winning strategy.json only ever came from one
+    source).
 
     `pattern_spec`: a PatternBasedAllocationTemplate (pattern_mining/
     pmine/pattern_mining.py) is universe-specific and not zero-arg
@@ -112,12 +114,44 @@ def _get_template(template_name: str, pattern_spec: dict = None, research_strate
     research_strategy strategy instance -- class-based or natural-language-
     parsed alike -- can be reconstructed here via research_strategy's own
     `instantiate_strategy_from_config_entry`, instead of being in the static
-    ALLOCATION_TEMPLATES registry."""
+    ALLOCATION_TEMPLATES registry.
+
+    `composite_spec`: a strategy.json produced from a winning aspect-composed
+    hybrid (see strategy_generator/stratgen/generator.py's
+    GeneratorConfig.enable_aspect_composition) carries its own
+    `composite_spec` (`track` plus either `selection_key`/`weighting_key` or
+    `entry_key`/`exit_key`) so the exact CompositeAllocationTemplate/
+    CompositeTimingTemplate instance can be rebuilt here from
+    common.strategy_aspects/research_strategy.rs.timing_aspects's registries.
+    `params` (the strategy.json's own top-level saved params) is passed
+    through as the reconstructed composite's `default_params` -- required so
+    `--optimize`'s fresh grid search (which degenerates to a single `{}`
+    trial for a Track B composite, or omits the shared `rebalance_freq_days`
+    for a Track A one) still falls back to the actually-tuned values instead
+    of each aspect's own generic hardcoded defaults."""
     if research_strategy_spec is not None:
         from research_strategy.rs.strategy import instantiate_strategy_from_config_entry
         return instantiate_strategy_from_config_entry(
             research_strategy_spec["strategy_key"], research_strategy_spec["entry_data"]
         )
+    if composite_spec is not None:
+        if composite_spec["track"] == "allocation":
+            from common.strategy_aspects import SELECTION_ASPECTS, WEIGHTING_ASPECTS, CompositeAllocationTemplate
+            return CompositeAllocationTemplate(
+                SELECTION_ASPECTS[composite_spec["selection_key"]],
+                WEIGHTING_ASPECTS[composite_spec["weighting_key"]],
+                default_params=params,
+            )
+        elif composite_spec["track"] == "timing":
+            from research_strategy.rs.timing_aspects import (
+                ENTRY_SIGNAL_ASPECTS, EXIT_RISK_ASPECTS, CompositeTimingTemplate,
+            )
+            return CompositeTimingTemplate(
+                ENTRY_SIGNAL_ASPECTS[composite_spec["entry_key"]],
+                EXIT_RISK_ASPECTS[composite_spec["exit_key"]],
+                default_params=params,
+            )
+        raise ValueError(f"Unknown composite_spec track: {composite_spec['track']!r} (expected 'allocation' or 'timing')")
     if pattern_spec is not None:
         if not template_name.startswith("pattern_"):
             raise ValueError(
@@ -201,13 +235,34 @@ def _load_strategy_file(path: str) -> dict:
                 f"must be a JSON object, got {type(research_strategy_spec['entry_data']).__name__}."
             )
 
-    if pattern_spec is not None and research_strategy_spec is not None:
+    composite_spec = strategy_def.get("composite_spec")
+    if composite_spec is not None:
+        if composite_spec.get("track") == "allocation":
+            required_composite_keys = ("selection_key", "weighting_key")
+        elif composite_spec.get("track") == "timing":
+            required_composite_keys = ("entry_key", "exit_key")
+        else:
+            raise ValueError(
+                f"Malformed strategy file '{path}': 'composite_spec.track' must be 'allocation' or "
+                f"'timing', got {composite_spec.get('track')!r}."
+            )
+        missing_composite_keys = [key for key in required_composite_keys if key not in composite_spec]
+        if missing_composite_keys:
+            raise ValueError(
+                f"Malformed strategy file '{path}': 'composite_spec' (track={composite_spec.get('track')!r}) "
+                f"is missing required key(s) {missing_composite_keys}. Expected keys: track, "
+                f"{list(required_composite_keys)} -- see strategy_generator's aspect-composition output "
+                f"for the expected shape."
+            )
+
+    specs_given = [
+        s for s in (pattern_spec, research_strategy_spec, composite_spec) if s is not None
+    ]
+    if len(specs_given) > 1:
         raise ValueError(
-            f"Malformed strategy file '{path}': 'pattern_spec' and 'research_strategy_spec' "
-            f"are mutually exclusive -- a strategy.json can only have come from one source "
-            f"(pattern mining OR a research_strategy search winner), never both. "
-            f"_get_template checks research_strategy_spec first, so pattern_spec would be "
-            f"silently ignored; refusing instead of guessing which one this file actually means."
+            f"Malformed strategy file '{path}': 'pattern_spec', 'research_strategy_spec', and "
+            f"'composite_spec' are mutually exclusive -- a strategy.json can only have come from "
+            f"one source, never more than one. Refusing to guess which one this file actually means."
         )
 
     return strategy_def
@@ -501,6 +556,7 @@ def main():
     explanation = strategy_def.get("explanation", "")
     pattern_spec = strategy_def.get("pattern_spec")
     research_strategy_spec = strategy_def.get("research_strategy_spec")
+    composite_spec = strategy_def.get("composite_spec")
 
     print(f"Loaded Strategy: {template_name}")
     print(f"Parameters: {params}")
@@ -534,7 +590,9 @@ def main():
     reused_result = None
 
     if args.optimize:
-        optimize_template_instance = _get_template(template_name, pattern_spec, research_strategy_spec)
+        optimize_template_instance = _get_template(
+            template_name, pattern_spec, research_strategy_spec, composite_spec, params,
+        )
         score_fn = _standard_score_fn(universe, args) if args.mode == "standard" else _walkforward_score_fn(universe, args)
 
         original_result = score_fn(optimize_template_instance, params)
@@ -600,7 +658,11 @@ def main():
         if reused_result is not None:
             result = reused_result
         else:
-            result = run_standard(universe, _get_template(template_name, pattern_spec, research_strategy_spec), params, args)
+            result = run_standard(
+                universe,
+                _get_template(template_name, pattern_spec, research_strategy_spec, composite_spec, params),
+                params, args,
+            )
 
         print(format_backtest_metrics_summary(result))
         print(f"Total Rebalances: {result['total_rebalances']}")
@@ -668,7 +730,11 @@ def main():
         if reused_result is not None:
             folds = reused_result["folds"]
         else:
-            folds = run_walkforward(universe, _get_template(template_name, pattern_spec, research_strategy_spec), params, args)
+            folds = run_walkforward(
+                universe,
+                _get_template(template_name, pattern_spec, research_strategy_spec, composite_spec, params),
+                params, args,
+            )
 
         folds_df = pd.DataFrame(folds)
 

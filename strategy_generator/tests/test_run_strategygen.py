@@ -60,6 +60,9 @@ def test_main_loads_universe_from_file(mock_gen_cls, mock_load):
         equity_curve = pd.DataFrame(
             {"equity": [100.0, 101.0, 102.0]}, index=pd.bdate_range("2020-01-01", periods=3)
         )
+        is_composite = False
+        composite_track = None
+        component_templates = None
 
     mock_gen_instance.generate.return_value = MockSpec()
 
@@ -116,6 +119,9 @@ def test_main_writes_equity_curve_chart_by_default(mock_gen_cls, mock_load, mock
         equity_curve = pd.DataFrame(
             {"equity": [100.0, 101.0, 102.0]}, index=pd.bdate_range("2020-01-01", periods=3)
         )
+        is_composite = False
+        composite_track = None
+        component_templates = None
 
     mock_spec = MockSpec()
     mock_gen_instance.generate.return_value = mock_spec
@@ -169,6 +175,9 @@ def test_main_no_plots_skips_equity_curve_chart(mock_gen_cls, mock_load, mock_pl
         equity_curve = pd.DataFrame(
             {"equity": [100.0, 101.0, 102.0]}, index=pd.bdate_range("2020-01-01", periods=3)
         )
+        is_composite = False
+        composite_track = None
+        component_templates = None
 
     mock_gen_instance.generate.return_value = MockSpec()
 
@@ -236,6 +245,9 @@ def test_main_wires_shared_data_dir_and_cache_ttl(mock_gen_cls, mock_load):
         equity_curve = pd.DataFrame(
             {"equity": [100.0, 101.0, 102.0]}, index=pd.bdate_range("2020-01-01", periods=3)
         )
+        is_composite = False
+        composite_track = None
+        component_templates = None
 
     mock_gen_instance.generate.return_value = MockSpec()
 
@@ -340,6 +352,9 @@ def _mock_spec(**overrides):
         equity_curve=pd.DataFrame(
             {"equity": [100.0, 101.0, 102.0]}, index=pd.bdate_range("2020-01-01", periods=3)
         ),
+        is_composite=False,
+        composite_track=None,
+        component_templates=None,
     )
     defaults.update(overrides)
     return type("MockSpec", (), defaults)()
@@ -460,6 +475,67 @@ def test_research_strategy_spec_is_none_when_a_different_template_wins(mock_gen_
         os.remove(temp_path)
 
 
+@patch("run_strategygen.load_universe_with_banner")
+@patch("run_strategygen.StrategyGenerator")
+def test_composite_spec_written_when_a_composite_wins(mock_gen_cls, mock_load):
+    mock_gen_instance = mock_gen_cls.return_value
+    mock_gen_instance.generate.return_value = _mock_spec(
+        template_name="momentum_topn__min_variance",
+        is_composite=True,
+        composite_track="allocation",
+        component_templates=["momentum_topn", "min_variance"],
+    )
+
+    temp_path = _universe_file()
+    try:
+        test_args = ["run_strategygen.py", "--universe-file", temp_path, "--mode", "generate"]
+        with patch.object(sys, "argv", test_args):
+            main()
+
+        with open(os.path.join(RESULTS_DIR, "strategy.json")) as f:
+            written = json.load(f)
+
+        assert written["composite_spec"] == {
+            "track": "allocation", "selection_key": "momentum_topn", "weighting_key": "min_variance",
+        }
+        assert written["pattern_spec"] is None
+        assert written["research_strategy_spec"] is None
+    finally:
+        os.remove(temp_path)
+
+
+@patch("run_strategygen.load_universe_with_banner")
+@patch("run_strategygen.StrategyGenerator")
+def test_composite_spec_written_for_timing_track(mock_gen_cls, mock_load):
+    mock_gen_instance = mock_gen_cls.return_value
+    mock_gen_instance.generate.return_value = _mock_spec(
+        template_name="turtle_breakout_entry__rsi_cross_exit",
+        is_composite=True,
+        composite_track="timing",
+        component_templates=["turtle_breakout_entry", "rsi_cross_exit"],
+    )
+
+    temp_path = _universe_file()
+    try:
+        test_args = ["run_strategygen.py", "--universe-file", temp_path, "--mode", "generate"]
+        with patch.object(sys, "argv", test_args):
+            main()
+
+        with open(os.path.join(RESULTS_DIR, "strategy.json")) as f:
+            written = json.load(f)
+
+        assert written["composite_spec"] == {
+            "track": "timing", "entry_key": "turtle_breakout_entry", "exit_key": "rsi_cross_exit",
+        }
+    finally:
+        os.remove(temp_path)
+
+
+def test_no_compose_aspects_flag_disables_composition():
+    args = build_arg_parser().parse_args(["--no-compose-aspects"])
+    assert args.no_compose_aspects is True
+
+
 class _FakePatternTemplate:
     """Minimal PatternBasedAllocationTemplate-shaped double -- just enough to
     exercise the pattern_spec reconstruction block without real turning-point
@@ -531,9 +607,9 @@ def test_pattern_spec_and_research_strategy_spec_never_both_nonnull(
 def test_omitting_research_strategy_is_byte_for_byte_unchanged(mock_gen_cls, mock_load):
     """Regression: not passing --research-strategy must produce the exact
     same strategy.json as before this feature existed, aside from the new
-    'research_strategy_spec' key always being present and null -- mirroring
-    test_extra_templates_none_is_byte_for_byte_unchanged in test_generator.py
-    for the equivalent --mine-patterns-era guarantee."""
+    'research_strategy_spec'/'composite_spec' keys always being present and
+    null -- mirroring test_extra_templates_none_is_byte_for_byte_unchanged
+    in test_generator.py for the equivalent --mine-patterns-era guarantee."""
     mock_gen_instance = mock_gen_cls.return_value
     mock_gen_instance.generate.return_value = _mock_spec(template_name="equal_weight")
 
@@ -568,6 +644,7 @@ def test_omitting_research_strategy_is_byte_for_byte_unchanged(mock_gen_cls, moc
             "factor_tiebreak_used": False,
             "pattern_spec": None,
             "research_strategy_spec": None,
+            "composite_spec": None,
         }
     finally:
         os.remove(temp_path)

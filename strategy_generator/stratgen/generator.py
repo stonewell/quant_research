@@ -23,6 +23,7 @@ from common.allocation_search import (
     run_ers_validation,
 )
 from common.allocation_templates import ALLOCATION_TEMPLATES
+from common.strategy_aspects import build_composite_candidates
 from .metrics import sharpe_ratio
 
 
@@ -42,6 +43,20 @@ class GeneratorConfig:
     # break the tie. A factor score NEVER overrides a clearly-better-performing
     # template -- see _search_allocation's docstring.
     factor_tiebreak_epsilon: float = 0.05
+    # Whether to also search hybrid templates assembled by pairing one
+    # decomposable template's own selection/entry aspect with a DIFFERENT
+    # decomposable template's own weighting/exit aspect (see
+    # common/strategy_aspects.py and research_strategy/rs/timing_aspects.py)
+    # -- e.g. momentum's stock-picking with inverse-volatility's position
+    # sizing, a combination that isn't any single static template. On by
+    # default, mirroring how mined/research_strategy extra_templates are
+    # already merged into the same candidate pool by default.
+    enable_aspect_composition: bool = True
+    # How many of the top-scoring decomposable templates (per track) to
+    # cross-breed -- bounds the extra cost to roughly composition_top_k^2
+    # additional single-point backtests (no new grid search), not a
+    # combinatorial explosion over every known aspect.
+    composition_top_k: int = 4
 
 
 @dataclass
@@ -70,6 +85,16 @@ class GeneratedStrategySpec:
     factor_context: dict = None
     factor_tiebreak_used: bool = False
     equity_curve: pd.DataFrame = None
+    # Populated when the winning template is a hybrid assembled by
+    # aspect composition (see GeneratorConfig.enable_aspect_composition):
+    # `composite_track` is "allocation" (common/strategy_aspects.py) or
+    # "timing" (research_strategy/rs/timing_aspects.py), and
+    # `component_templates` is `[selection_key, weighting_key]` or
+    # `[entry_key, exit_key]` respectively. Both are None for an atomic
+    # (non-hybrid) winner.
+    is_composite: bool = False
+    composite_track: str = None
+    component_templates: list = None
 
 
 def _portfolio_score(universe: dict, template, params: dict, config: GeneratorConfig) -> dict:
@@ -208,6 +233,34 @@ def _search_allocation(universe: dict, cfg: GeneratorConfig, factor_report: dict
         if name not in best_per_template or r["score"] > best_per_template[name]["score"]:
             best_per_template[name] = r
 
+    # 1b. Aspect composition: pair one decomposable template's own
+    # selection/entry aspect with a DIFFERENT decomposable template's own
+    # weighting/exit aspect, scoring each hybrid ONCE at its two source
+    # templates' own best-found params (no new grid search -- see
+    # common/strategy_aspects.py and research_strategy/rs/timing_aspects.py
+    # for exactly how "top-k decomposable templates" is decided). A hybrid
+    # then competes for the overall winner slot through the exact same
+    # factor-tiebreak + ERS-validation path below as every atomic template.
+    if cfg.enable_aspect_composition:
+        composite_candidates = build_composite_candidates(best_per_template, top_k=cfg.composition_top_k)
+        try:
+            from research_strategy.rs.timing_aspects import build_composite_timing_candidates
+        except ImportError:
+            pass
+        else:
+            composite_candidates += build_composite_timing_candidates(best_per_template, top_k=cfg.composition_top_k)
+
+        for template, merged_params in composite_candidates:
+            if template.name in names_seen:
+                continue
+            names_seen.add(template.name)
+            res = score_fn(template, merged_params)
+            score = res.get("sharpe_ratio", float("-inf"))
+            total_grid_trials += 1
+            r = {"template": template, "params": merged_params, "res": res, "score": score}
+            all_results.append(r)
+            best_per_template[template.name] = r
+
     best_result, factor_context, factor_tiebreak_used = _apply_factor_tiebreak(
         best_per_template, factor_report, cfg.factor_tiebreak_epsilon
     )
@@ -265,6 +318,22 @@ class StrategyGenerator:
         target_weights = template.generate_weights(universe, params)
         explanation = template.explain_weights(params)
 
+        # Duck-typed rather than isinstance-checked against
+        # CompositeAllocationTemplate/CompositeTimingTemplate so this module
+        # never needs to hard-import research_strategy.rs.timing_aspects
+        # (optional, see _search_allocation) just to report which track won.
+        is_composite = False
+        composite_track = None
+        component_templates = None
+        if hasattr(template, "selection") and hasattr(template, "weighting"):
+            is_composite = True
+            composite_track = "allocation"
+            component_templates = [template.selection.key, template.weighting.key]
+        elif hasattr(template, "entry") and hasattr(template, "exit"):
+            is_composite = True
+            composite_track = "timing"
+            component_templates = [template.entry.key, template.exit.key]
+
         return GeneratedStrategySpec(
             n_symbols=len(universe),
             template_name=template.name,
@@ -286,4 +355,7 @@ class StrategyGenerator:
             factor_context=result["factor_context"],
             factor_tiebreak_used=result["factor_tiebreak_used"],
             equity_curve=res.get("equity_curve"),
+            is_composite=is_composite,
+            composite_track=composite_track,
+            component_templates=component_templates,
         )
