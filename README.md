@@ -351,3 +351,5 @@ uv run pytest tests -v
 | `backtester/` | Standalone CLI evaluating fixed strategy files over single or rolling walkforward windows | `backtester/run_backtest.py` | `backtester/README.md`, `backtester/SCHEMAS.md` |
 | `run_pipeline.py` | Chains all 5 pipeline steps end-to-end via subprocess, auto-wiring each step's output into the next | `run_pipeline.py` | This README |
 | `data/` | Shared OHLCV cache directory, written/read by all 5 stages (provider-aware filenames, optional `--cache-ttl-days` staleness) | N/A (cache, not code) | `common/README.md` §7 |
+| `fundamental_screener/` | Standalone (not pipeline-wired) real-fundamentals buy/sell screener; also produces a `backtester`-compatible strategy | `fundamental_screener/run_fundamental_screener.py` | `fundamental_screener/README.md` |
+| `bnn_forecaster/` | Standalone (not pipeline-wired) AutoBNN probabilistic-forecast buy/sell screener; own isolated `uv` environment (see its README) | `bnn_forecaster/run_bnn_forecaster.py` | `bnn_forecaster/README.md` |

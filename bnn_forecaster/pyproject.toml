@@ -1,0 +1,41 @@
+[project]
+name = "bnn-forecaster"
+version = "0.1.0"
+requires-python = ">=3.11"
+# Deliberately its OWN isolated uv project/venv, separate from the repo root's
+# pyproject.toml/uv.lock -- autobnn's JAX + TensorFlow Probability dependency
+# chain needs jax/jaxlib pinned well below their latest releases (TFP's JAX
+# substrate hasn't kept pace with jax's own fast-moving internal APIs), which
+# would otherwise conflict with the rest of this workspace's much lighter,
+# unpinned numpy/pandas/scipy stack. Isolating it here means the root
+# workspace never has to accept that constraint. `common/` is NOT installed
+# as a package -- it's reached via the same repo-root sys.path injection
+# every project's run_*.py already uses, so this project only needs to
+# provide common's own RUNTIME dependencies (pandas/numpy/scipy/yfinance/
+# matplotlib), not common itself.
+dependencies = [
+    "pandas>=2.0",
+    "numpy>=1.24,<2.1",   # tensorflow-probability==0.25.0's bundled bijector code still calls
+                          # np.reshape(..., newshape=...), removed in newer numpy
+    "yfinance>=0.2",
+    "matplotlib>=3.7",
+    "scipy>=1.10",
+    "autobnn",
+    "jax<0.4.30",         # tensorflow-probability's JAX substrate calls
+    "jaxlib<0.4.30",      # jax.interpreters.xla.pytype_aval_mappings, removed in newer jax;
+                          # jaxlib must track jax closely or jax refuses to import
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0",
+]
+
+[tool.uv]
+environments = [
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: exercises a real AutoBNN fit (several seconds, JAX JIT-compilation dominated) instead of a mocked one -- deselect with -m 'not slow' for a fast run.",
+]

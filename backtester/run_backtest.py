@@ -95,11 +95,12 @@ def _align_universe(universe: dict) -> dict:
 
 
 def _get_template(template_name: str, pattern_spec: dict = None, research_strategy_spec: dict = None,
-                   composite_spec: dict = None, params: dict = None, fundamental_spec: dict = None):
+                   composite_spec: dict = None, params: dict = None, fundamental_spec: dict = None,
+                   bnn_spec: dict = None):
     """Looks up a static template by name, UNLESS `pattern_spec`,
-    `research_strategy_spec`, `composite_spec`, or `fundamental_spec` is
-    given (all four are mutually exclusive -- a winning strategy.json only
-    ever came from one source).
+    `research_strategy_spec`, `composite_spec`, `fundamental_spec`, or
+    `bnn_spec` is given (all five are mutually exclusive -- a winning
+    strategy.json only ever came from one source).
 
     `pattern_spec`: a PatternBasedAllocationTemplate (pattern_mining/
     pmine/pattern_mining.py) is universe-specific and not zero-arg
@@ -139,7 +140,18 @@ def _get_template(template_name: str, pattern_spec: dict = None, research_strate
     actual behavior configured via `params` (already loaded from
     strategy.json regardless), so the marker exists only to identify the
     origin/track unambiguously and trigger the right import, not to carry
-    any reconstruction data of its own."""
+    any reconstruction data of its own.
+
+    `bnn_spec`: a strategy.json produced by the separate `bnn_forecaster`
+    project (AutoBNN probabilistic price forecasting, see
+    `bnn_forecaster/README.md`) carries a trivial `bnn_spec` marker
+    (`{"source": "bnn_forecaster"}`) so its `BnnForecastStrategy` can be
+    reconstructed here -- same zero-arg/params-driven shape as
+    `fundamental_spec` above. Reconstructing this template requires
+    `bnn_forecaster`'s own isolated `uv` environment (its `autobnn`/`jax`
+    dependency chain is NOT installed in this workspace's root venv) -- run
+    backtester with `bnn_forecaster`'s venv python for a bnn_spec strategy
+    file, not the root one."""
     if research_strategy_spec is not None:
         from research_strategy.rs.strategy import instantiate_strategy_from_config_entry
         return instantiate_strategy_from_config_entry(
@@ -166,6 +178,9 @@ def _get_template(template_name: str, pattern_spec: dict = None, research_strate
     if fundamental_spec is not None:
         from fundamental_screener.fscreen.strategy import FundamentalMarginOfSafetyStrategy
         return FundamentalMarginOfSafetyStrategy()
+    if bnn_spec is not None:
+        from bnn_forecaster.bnnf.strategy import BnnForecastStrategy
+        return BnnForecastStrategy()
     if pattern_spec is not None:
         if not template_name.startswith("pattern_"):
             raise ValueError(
@@ -276,15 +291,23 @@ def _load_strategy_file(path: str) -> dict:
             f"got {type(fundamental_spec).__name__}."
         )
 
+    bnn_spec = strategy_def.get("bnn_spec")
+    if bnn_spec is not None and not isinstance(bnn_spec, dict):
+        raise ValueError(
+            f"Malformed strategy file '{path}': 'bnn_spec' must be a JSON object, "
+            f"got {type(bnn_spec).__name__}."
+        )
+
     specs_given = [
-        s for s in (pattern_spec, research_strategy_spec, composite_spec, fundamental_spec) if s is not None
+        s for s in (pattern_spec, research_strategy_spec, composite_spec, fundamental_spec, bnn_spec)
+        if s is not None
     ]
     if len(specs_given) > 1:
         raise ValueError(
             f"Malformed strategy file '{path}': 'pattern_spec', 'research_strategy_spec', "
-            f"'composite_spec', and 'fundamental_spec' are mutually exclusive -- a strategy.json can "
-            f"only have come from one source, never more than one. Refusing to guess which one this "
-            f"file actually means."
+            f"'composite_spec', 'fundamental_spec', and 'bnn_spec' are mutually exclusive -- a "
+            f"strategy.json can only have come from one source, never more than one. Refusing to "
+            f"guess which one this file actually means."
         )
 
     return strategy_def
@@ -580,6 +603,7 @@ def main():
     research_strategy_spec = strategy_def.get("research_strategy_spec")
     composite_spec = strategy_def.get("composite_spec")
     fundamental_spec = strategy_def.get("fundamental_spec")
+    bnn_spec = strategy_def.get("bnn_spec")
 
     print(f"Loaded Strategy: {template_name}")
     print(f"Parameters: {params}")
@@ -615,6 +639,7 @@ def main():
     if args.optimize:
         optimize_template_instance = _get_template(
             template_name, pattern_spec, research_strategy_spec, composite_spec, params, fundamental_spec,
+            bnn_spec,
         )
         score_fn = _standard_score_fn(universe, args) if args.mode == "standard" else _walkforward_score_fn(universe, args)
 
@@ -683,7 +708,7 @@ def main():
         else:
             result = run_standard(
                 universe,
-                _get_template(template_name, pattern_spec, research_strategy_spec, composite_spec, params, fundamental_spec),
+                _get_template(template_name, pattern_spec, research_strategy_spec, composite_spec, params, fundamental_spec, bnn_spec),
                 params, args,
             )
 
@@ -755,7 +780,7 @@ def main():
         else:
             folds = run_walkforward(
                 universe,
-                _get_template(template_name, pattern_spec, research_strategy_spec, composite_spec, params, fundamental_spec),
+                _get_template(template_name, pattern_spec, research_strategy_spec, composite_spec, params, fundamental_spec, bnn_spec),
                 params, args,
             )
 

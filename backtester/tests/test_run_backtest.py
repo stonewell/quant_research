@@ -241,6 +241,46 @@ def test_load_strategy_file_rejects_fundamental_spec_alongside_composite_spec(tm
         _load_strategy_file(str(path))
 
 
+def test_get_template_reconstructs_bnn_forecaster_strategy_from_spec():
+    # A bnn_spec (produced by the separate bnn_forecaster project) must
+    # rebuild the exact BnnForecastStrategy -- zero-arg constructible, same
+    # shape as fundamental_spec above. bnn_forecaster's autobnn/jax
+    # dependency chain lives ONLY in its own isolated uv environment, not
+    # this workspace's root venv -- skip (not fail) when it's absent, e.g.
+    # when this suite runs under the root venv rather than
+    # bnn_forecaster's own.
+    pytest.importorskip("autobnn", reason="bnn_forecaster's isolated uv environment is not active")
+    bnn_spec = {"source": "bnn_forecaster"}
+
+    template = _get_template("bnn_forecast", bnn_spec=bnn_spec)
+
+    from bnn_forecaster.bnnf.strategy import BnnForecastStrategy
+    assert isinstance(template, BnnForecastStrategy)
+    assert template.name == "bnn_forecast"
+
+
+def test_load_strategy_file_bnn_spec_must_be_object(tmp_path):
+    path = tmp_path / "strategy.json"
+    strategy_def = {"template_name": "bnn_forecast", "params": {}, "bnn_spec": "not-an-object"}
+    with open(path, "w") as f:
+        json.dump(strategy_def, f)
+
+    with pytest.raises(ValueError, match="bnn_spec"):
+        _load_strategy_file(str(path))
+
+
+def test_load_strategy_file_rejects_bnn_spec_alongside_fundamental_spec(tmp_path):
+    path = tmp_path / "strategy.json"
+    fundamental_spec = {"source": "fundamental_screener"}
+    bnn_spec = {"source": "bnn_forecaster"}
+    _write_strategy_file(
+        path, template_name="x", fundamental_spec=fundamental_spec, bnn_spec=bnn_spec,
+    )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _load_strategy_file(str(path))
+
+
 def test_data_dir_uses_shared_data_dir():
     # Regression test: DATA_DIR used to be a per-project default_data_dir(__file__)
     # (this project's own default_data_dir was removed in the shared OHLCV cache
@@ -419,7 +459,8 @@ def test_run_walkforward_warms_up_indicator_lookback_before_each_fold():
 
 
 def _write_strategy_file(path, template_name="equal_weight", params=None, pattern_spec=None,
-                          research_strategy_spec=None, composite_spec=None, fundamental_spec=None):
+                          research_strategy_spec=None, composite_spec=None, fundamental_spec=None,
+                          bnn_spec=None):
     strategy_def = {"template_name": template_name, "params": params or {"rebalance_freq_days": 10}}
     if pattern_spec is not None:
         strategy_def["pattern_spec"] = pattern_spec
@@ -429,6 +470,8 @@ def _write_strategy_file(path, template_name="equal_weight", params=None, patter
         strategy_def["composite_spec"] = composite_spec
     if fundamental_spec is not None:
         strategy_def["fundamental_spec"] = fundamental_spec
+    if bnn_spec is not None:
+        strategy_def["bnn_spec"] = bnn_spec
     with open(path, "w") as f:
         json.dump(strategy_def, f)
 
