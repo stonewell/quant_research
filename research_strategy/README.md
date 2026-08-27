@@ -251,6 +251,7 @@ GLD, TLT, VNQ, AGG, TIP, IEF, LQD, DBC, BIL, SCZ, HYG, UPRO, TMF) if none are gi
 | `--description-file` | path, default: none | Same as `--description`, but read the text from a file |
 | `--n-days` | int, default `1200` | Number of synthetic bars to generate (only used with `--data-provider synthetic`) |
 | `--seed` | int, default `42` | Random seed for synthetic data generation (only used with `--data-provider synthetic`) |
+| `--top-n` | int, default `5` | Number of top-ranked strategies (by Sharpe ratio, CAGR tie-break) written to `top_strategies_summary.json` (§7) |
 | `--data-provider` | str, default `"synthetic"` | `synthetic` (default — see §3's offline policy), `yfinance`, `csv`, or a custom registered/module-specifier provider |
 | `--data-dir` | path, default: none | Folder path for the `csv` data provider |
 | `--no-cache` | flag, default off (cached) | Disable local CSV caching of fetched data (only relevant to non-synthetic providers) |
@@ -338,8 +339,12 @@ uv run python research_strategy/dashboard.py
 * **Turnover & Rebalances**: Accumulated portfolio rebalance turnover and rebalance count.
 
 Outputs land in `results/`: `research_strategy_report.json` (per-strategy metrics), one
-`<strategy>_weights.csv` per strategy, and `factor_summary.json` (per-factor-tag aggregated
-performance across the run — see "Factor Tagging" above).
+`<strategy>_weights.csv` per strategy, `factor_summary.json` (per-factor-tag aggregated
+performance across the run — see "Factor Tagging" above), and `top_strategies_summary.json` (the
+top `--top-n` strategies from this run, ranked by Sharpe ratio with CAGR as a tie-break — see §7).
+Unlike `factor_summary.json`, this ranks individual strategies against each other rather than
+aggregating by factor tag, and it isn't currently consumed by any other project — it's a
+human-facing leaderboard, also echoed to the console at the end of the run.
 
 ## 7. Data Shapes & Schemas
 
@@ -360,6 +365,34 @@ ad-hoc `--description` run). Each entry:
 | `parsed_summary` | str | `explain_weights()`'s full text |
 | `sharpe_ratio`, `cagr`, `max_drawdown`, `calmar_ratio`, `win_rate` | float | From the shared backtest result dict (`../common/README.md` §4) |
 | `profit_factor` | float or `null` | `null` when not finite (e.g. no losing days) |
+| `total_turnover` | float | |
+| `total_rebalances` | int | |
+
+### `results/top_strategies_summary.json`
+
+Ranks the strategies actually evaluated in this run by backtested Sharpe ratio (CAGR as a
+tie-break) — see §5/§6. Distinct from `factor_summary.json` (§2b), which aggregates by factor
+TAG rather than ranking individual strategies:
+
+| Field | Type | Notes |
+|---|---|---|
+| `run_context` | object | Same shape as `factor_summary.json`'s `run_context` (§2b) |
+| `ranking_metric` | str | Always `"sharpe_ratio (cagr tie-break)"` |
+| `n_strategies_evaluated` | int | Total strategies with a valid backtest result this run (before truncating to `--top-n`) |
+| `top_strategies` | array | Up to `--top-n` entries, `rank` 1 = highest Sharpe (see below) |
+| `caveat` | str | Same synthetic-data-caveat convention as `factor_summary.json` — **read this before trusting the ranking** |
+
+Each `top_strategies[i]` entry:
+
+| Field | Type | Notes |
+|---|---|---|
+| `rank` | int | 1-indexed |
+| `strategy_key` | str | The `strategies_config.json` key (or `"custom_plain_english"`) |
+| `strategy_name` | str | Prefers `strategies_config.json`'s own `"name"`; falls back to `research_strategy_report.json`'s `strategy_name` for an ad-hoc `--description` run with no config entry |
+| `description` | str | Prefers `strategies_config.json`'s `"description"`/`"plain_english_description"`; same fallback as above |
+| `factor_tags` | array of str | This strategy's own tags from `strategies_config.json` (empty for an ad-hoc run) |
+| `sharpe_ratio`, `cagr`, `max_drawdown`, `calmar_ratio`, `win_rate` | float | Same values as `research_strategy_report.json` |
+| `profit_factor` | float or `null` | `null` when not finite |
 | `total_turnover` | float | |
 | `total_rebalances` | int | |
 

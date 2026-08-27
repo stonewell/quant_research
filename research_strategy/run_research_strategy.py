@@ -79,6 +79,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-days", type=int, default=1200,
                    help="Number of business days of history to request (all providers)")
     p.add_argument("--seed", type=int, default=42, help="Random seed (only used with --data-provider synthetic)")
+    p.add_argument("--top-n", type=int, default=5,
+                   help="Number of top-ranked strategies (by Sharpe ratio, CAGR tie-break) to include "
+                        "in top_strategies_summary.json (default: 5)")
     add_data_provider_cli_args(p, default_provider="synthetic", no_cache_help="Disable local CSV caching of fetched data")
     return p
 
@@ -153,6 +156,85 @@ def build_and_write_factor_summary(report_data, strategy_factor_tags, args, star
     path = os.path.join(results_dir, "factor_summary.json")
     write_json_report(summary, path)
     return path
+
+
+def build_and_write_top_strategies_summary(report_data, strategy_factor_tags, loaded_config, args,
+                                            start, end, results_dir, top_n=5):
+    """Ranks this run's strategies by backtested Sharpe ratio (CAGR as a tie-break) and writes
+    results/top_strategies_summary.json -- a human-scannable leaderboard, distinct from
+    `build_and_write_factor_summary`'s per-FACTOR-TAG aggregation (this ranks individual
+    strategies against each other, not tags). Same synthetic-data-caveat convention as that
+    function, tailored to per-strategy ranking noise instead of factor aggregation. Returns
+    `(path, top_strategies)` -- the list is returned alongside the path so callers can print a
+    console leaderboard without re-reading the JSON file just written."""
+    ranked = sorted(
+        report_data.items(),
+        key=lambda kv: (kv[1]["sharpe_ratio"], kv[1]["cagr"]),
+        reverse=True,
+    )[:top_n]
+
+    top_strategies = []
+    for rank, (strat_name, metrics) in enumerate(ranked, start=1):
+        # Prefer strategies_config.json's own human-readable name/description
+        # (what a user would recognize this strategy by) -- report_data's own
+        # strategy_name/raw_description is the fallback for an ad-hoc
+        # --description/--description-file run with no config entry at all.
+        config_entry = loaded_config.get(strat_name, {})
+        display_name = config_entry.get("name", metrics["strategy_name"])
+        description = (
+            config_entry.get("description")
+            or config_entry.get("plain_english_description")
+            or metrics["raw_description"]
+        )
+        top_strategies.append({
+            "rank": rank,
+            "strategy_key": strat_name,
+            "strategy_name": display_name,
+            "description": description,
+            "factor_tags": strategy_factor_tags.get(strat_name, []),
+            "sharpe_ratio": metrics["sharpe_ratio"],
+            "cagr": metrics["cagr"],
+            "max_drawdown": metrics["max_drawdown"],
+            "calmar_ratio": metrics["calmar_ratio"],
+            "win_rate": metrics["win_rate"],
+            "profit_factor": metrics["profit_factor"],
+            "total_turnover": metrics["total_turnover"],
+            "total_rebalances": metrics["total_rebalances"],
+        })
+
+    is_synthetic = args.data_provider == "synthetic"
+    caveat = (
+        f"Computed on provider='{args.data_provider}'"
+        f"{f', seed={args.seed}' if is_synthetic else ''}, n_days={args.n_days}, {start} to {end}. "
+        "Ranking reflects a SINGLE backtest window with no Equivalent Random Search or significance "
+        "testing (unlike strategy_generator) -- treat rank order as descriptive of this one run, not "
+        "a validated quality signal."
+    )
+    if is_synthetic:
+        caveat += (
+            " Synthetic GBM data has NO real momentum/mean-reversion/volatility-clustering structure "
+            "by construction, so this ranking reflects MECHANISM/plumbing on this specific run, not "
+            "genuine strategy skill -- re-run with --data-provider yfinance against real prices for a "
+            "meaningful leaderboard."
+        )
+
+    summary = {
+        "run_context": {
+            "data_provider": args.data_provider,
+            "seed": args.seed if is_synthetic else None,
+            "n_days": args.n_days,
+            "start": start,
+            "end": end,
+        },
+        "ranking_metric": "sharpe_ratio (cagr tie-break)",
+        "n_strategies_evaluated": len(report_data),
+        "top_strategies": top_strategies,
+        "caveat": caveat,
+    }
+
+    path = os.path.join(results_dir, "top_strategies_summary.json")
+    write_json_report(summary, path)
+    return path, top_strategies
 
 
 def main():
@@ -300,6 +382,17 @@ def main():
         report_data, strategy_factor_tags, args, start, end, RESULTS_DIR
     )
     print(f"Saved factor summary to {factor_summary_path}")
+
+    top_strategies_path, top_strategies = build_and_write_top_strategies_summary(
+        report_data, strategy_factor_tags, loaded_config, args, start, end, RESULTS_DIR, top_n=args.top_n
+    )
+    print(f"Saved top strategies summary to {top_strategies_path}")
+
+    print(f"\n=== Top {len(top_strategies)} Strategies (Sharpe ratio, CAGR tie-break) ===")
+    for entry in top_strategies:
+        print(f"  #{entry['rank']} {entry['strategy_name']} ({entry['strategy_key']}): "
+              f"Sharpe {entry['sharpe_ratio']:.2f} | CAGR {entry['cagr'] * 100:.2f}% | "
+              f"MaxDD {entry['max_drawdown'] * 100:.2f}% | Calmar {entry['calmar_ratio']:.2f}")
 
 
 if __name__ == "__main__":

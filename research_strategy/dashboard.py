@@ -27,6 +27,27 @@ def display_dashboard():
     print("      RESEARCHED QUANTITATIVE TRADING STRATEGIES DASHBOARD")
     print("=" * 80 + "\n")
 
+    # Top-N Leaderboard (Sharpe ratio, CAGR tie-break) -- written by
+    # run_research_strategy.py's build_and_write_top_strategies_summary().
+    # Kept as a standalone JSON read (not an import of run_research_strategy.py)
+    # so this dashboard stays a lightweight, independent viewer.
+    top_strategies_path = os.path.join(RESULTS_DIR, "top_strategies_summary.json")
+    if os.path.exists(top_strategies_path):
+        with open(top_strategies_path, "r") as f:
+            top_summary = json.load(f)
+        top_strategies = top_summary.get("top_strategies", [])
+        print(f"=== TOP {len(top_strategies)} STRATEGIES (Sharpe ratio, CAGR tie-break) ===")
+        for entry in top_strategies:
+            profit_factor = f"{entry['profit_factor']:.2f}" if entry.get("profit_factor") is not None else "N/A"
+            print(f"  #{entry['rank']} {entry['strategy_name']} ({entry['strategy_key']}): "
+                  f"Sharpe {entry['sharpe_ratio']:.2f} | CAGR {entry['cagr'] * 100:.2f}% | "
+                  f"MaxDD {entry['max_drawdown'] * 100:.2f}% | Calmar {entry['calmar_ratio']:.2f} | "
+                  f"Profit Factor {profit_factor}")
+        print(f"(of {top_summary.get('n_strategies_evaluated', len(data))} strategies evaluated this run)")
+        print("-" * 80 + "\n")
+    else:
+        print("(No top_strategies_summary.json found -- re-run run_research_strategy.py to generate it.)\n")
+
     # Performance Comparison Table
     metrics_list = []
     for strat, details in data.items():
