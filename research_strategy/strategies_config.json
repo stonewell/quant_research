@@ -126,6 +126,23 @@
     },
     "factors": ["regime_trend_strength", "absolute_momentum_trend"]
   },
+  "compounder_margin_of_safety": {
+    "name": "Compounder Margin of Safety",
+    "type": "class",
+    "class_name": "CompounderMarginOfSafetyStrategy",
+    "description": "Price-only proxy adaptation of a conservative value-investing community's valuation framework (see docs/snowball_strategy.txt): holds a candidate blue-chip only while in a confirmed uptrend with contained volatility (a proxy for the doc's moat/high-ROE quality screen) and its own trailing annualized return clears a required hurdle; exits once that trailing return decays below the benchmark's own trailing return. DISCLOSED SIMPLIFICATION: no real fundamentals (ROE/dividend/earnings growth) are used -- see the separate fundamental_screener project for a real-data version.",
+    "parameters": {
+      "cms_candidate_universe": ["KO", "PG", "JNJ", "MSFT", "COST", "WMT", "MCD", "PEP"],
+      "cms_benchmark_symbol": "SPY",
+      "cms_lookback_days": 1260,
+      "cms_trend_ma_period": 200,
+      "cms_vol_lookback": 60,
+      "cms_max_volatility": 0.30,
+      "cms_required_return": 0.12,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["absolute_momentum_trend", "relative_momentum", "volatility_targeting"]
+  },
   "adaptive_grid": {
     "name": "ATR-Adaptive Grid",
     "type": "class",

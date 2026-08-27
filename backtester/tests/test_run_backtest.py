@@ -200,6 +200,47 @@ def test_load_strategy_file_rejects_composite_spec_alongside_pattern_spec(tmp_pa
         _load_strategy_file(str(path))
 
 
+def test_get_template_reconstructs_fundamental_screener_strategy_from_spec():
+    # A fundamental_spec (produced by the separate fundamental_screener
+    # project) must rebuild the exact FundamentalMarginOfSafetyStrategy --
+    # it's zero-arg constructible, so the marker only needs to identify the
+    # source/trigger the right import, not carry reconstruction data itself.
+    fundamental_spec = {"source": "fundamental_screener"}
+
+    template = _get_template("fundamental_margin_of_safety", fundamental_spec=fundamental_spec)
+
+    from fundamental_screener.fscreen.strategy import FundamentalMarginOfSafetyStrategy
+    assert isinstance(template, FundamentalMarginOfSafetyStrategy)
+    assert template.name == "fundamental_margin_of_safety"
+
+
+def test_load_strategy_file_fundamental_spec_must_be_object(tmp_path):
+    path = tmp_path / "strategy.json"
+    strategy_def = {
+        "template_name": "fundamental_margin_of_safety",
+        "params": {},
+        "fundamental_spec": "not-an-object",
+    }
+    with open(path, "w") as f:
+        json.dump(strategy_def, f)
+
+    with pytest.raises(ValueError, match="fundamental_spec"):
+        _load_strategy_file(str(path))
+
+
+def test_load_strategy_file_rejects_fundamental_spec_alongside_composite_spec(tmp_path):
+    path = tmp_path / "strategy.json"
+    composite_spec = {"track": "allocation", "selection_key": "momentum_topn", "weighting_key": "min_variance"}
+    fundamental_spec = {"source": "fundamental_screener"}
+    _write_strategy_file(
+        path, template_name="momentum_topn__min_variance",
+        composite_spec=composite_spec, fundamental_spec=fundamental_spec,
+    )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _load_strategy_file(str(path))
+
+
 def test_data_dir_uses_shared_data_dir():
     # Regression test: DATA_DIR used to be a per-project default_data_dir(__file__)
     # (this project's own default_data_dir was removed in the shared OHLCV cache
@@ -378,7 +419,7 @@ def test_run_walkforward_warms_up_indicator_lookback_before_each_fold():
 
 
 def _write_strategy_file(path, template_name="equal_weight", params=None, pattern_spec=None,
-                          research_strategy_spec=None, composite_spec=None):
+                          research_strategy_spec=None, composite_spec=None, fundamental_spec=None):
     strategy_def = {"template_name": template_name, "params": params or {"rebalance_freq_days": 10}}
     if pattern_spec is not None:
         strategy_def["pattern_spec"] = pattern_spec
@@ -386,6 +427,8 @@ def _write_strategy_file(path, template_name="equal_weight", params=None, patter
         strategy_def["research_strategy_spec"] = research_strategy_spec
     if composite_spec is not None:
         strategy_def["composite_spec"] = composite_spec
+    if fundamental_spec is not None:
+        strategy_def["fundamental_spec"] = fundamental_spec
     with open(path, "w") as f:
         json.dump(strategy_def, f)
 

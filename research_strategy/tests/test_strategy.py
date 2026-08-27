@@ -31,6 +31,7 @@ from research_strategy.rs.strategy import (
     AllWeatherStrategy,
     BoldAssetAllocation,
     ChanPivotShiftStrategy,
+    CompounderMarginOfSafetyStrategy,
     EnsembleRegimeSwitchingStrategy,
     GoldenButterflyStrategy,
     HFEAStrategy,
@@ -1318,6 +1319,120 @@ def test_new_strategies_instantiate_and_run_from_json_config(key):
     strat = instantiate_strategy_from_config_entry(key, entry)
     universe = create_mock_universe(n_days=300)
     weights = strat.generate_weights(universe)
+    assert not weights.empty
+    assert strat.explain_weights()
+
+
+# --- CompounderMarginOfSafetyStrategy (price-proxy of docs/snowball_strategy.txt) ---
+
+def _cms_universe(n_days=300, seed=5):
+    dates = pd.bdate_range("2020-01-01", periods=n_days)
+    t = np.arange(n_days)
+    rng = np.random.default_rng(seed)
+    universe = {
+        "KO": make_ohlcv_from_closes(100.0 + 0.25 * t + rng.normal(0, 0.5, n_days)),   # strong, steady uptrend
+        "PG": make_ohlcv_from_closes(100.0 + 0.02 * t + rng.normal(0, 0.5, n_days)),   # weak trend -- shouldn't clear the hurdle
+        "SPY": make_ohlcv_from_closes(100.0 + 0.05 * t + rng.normal(0, 0.3, n_days)),  # benchmark, modest drift
+        "BIL": make_ohlcv_from_closes([100.0] * n_days),
+    }
+    for df in universe.values():
+        df.index = dates
+    return universe
+
+
+def test_cms_entry_fires_for_quality_symbol_clearing_the_hurdle():
+    universe = _cms_universe()
+    cfg = StrategyConfig(
+        cms_candidate_universe=["KO", "PG"], cms_benchmark_symbol="SPY",
+        cms_lookback_days=60, cms_trend_ma_period=30, cms_vol_lookback=20,
+        cms_max_volatility=5.0,  # generous -- not exercising the vol gate here
+        cms_required_return=0.10,
+    )
+    strat = CompounderMarginOfSafetyStrategy(cfg)
+    weights = strat.generate_weights(universe)
+    daily = _daily(weights)
+    assert (daily["KO"] > 0).any(), "KO's strong steady uptrend should clear the return hurdle"
+
+
+def test_cms_quality_gate_excludes_high_volatility_symbol():
+    n = 300
+    dates = pd.bdate_range("2020-01-01", periods=n)
+    t = np.arange(n)
+    rng = np.random.default_rng(11)
+    universe = {
+        "MSFT": make_ohlcv_from_closes(100.0 + 0.30 * t + rng.normal(0, 15.0, n)),  # big drift but very noisy
+        "SPY": make_ohlcv_from_closes(100.0 + 0.05 * t + rng.normal(0, 0.3, n)),
+        "BIL": make_ohlcv_from_closes([100.0] * n),
+    }
+    for df in universe.values():
+        df.index = dates
+    cfg = StrategyConfig(
+        cms_candidate_universe=["MSFT"], cms_benchmark_symbol="SPY",
+        cms_lookback_days=60, cms_trend_ma_period=30, cms_vol_lookback=20,
+        cms_max_volatility=0.05,  # tight ceiling -- MSFT's high noise must fail this
+        cms_required_return=0.05,
+    )
+    strat = CompounderMarginOfSafetyStrategy(cfg)
+    weights = strat.generate_weights(universe)
+    daily = _daily(weights)
+    assert (daily["MSFT"] == 0).all(), "high-volatility symbol must never enter despite a large drift"
+
+
+def test_cms_sell_trigger_exits_when_edge_over_benchmark_decays():
+    n = 300
+    dates = pd.bdate_range("2020-01-01", periods=n)
+    t = np.arange(n)
+    rng = np.random.default_rng(13)
+    # Strong uptrend for the first 150 bars, then flat -- once the 60-day
+    # trailing-return window fully rolls past the regime change, the
+    # trailing return should decay below SPY's own steady trailing return.
+    ko_close = np.concatenate([
+        100.0 + 0.4 * t[:150],
+        100.0 + 0.4 * 149 + rng.normal(0, 0.2, n - 150),
+    ]) + rng.normal(0, 0.3, n)
+    universe = {
+        "KO": make_ohlcv_from_closes(ko_close),
+        "SPY": make_ohlcv_from_closes(100.0 + 0.10 * t + rng.normal(0, 0.3, n)),
+        "BIL": make_ohlcv_from_closes([100.0] * n),
+    }
+    for df in universe.values():
+        df.index = dates
+    cfg = StrategyConfig(
+        cms_candidate_universe=["KO"], cms_benchmark_symbol="SPY",
+        cms_lookback_days=60, cms_trend_ma_period=30, cms_vol_lookback=20,
+        cms_max_volatility=5.0, cms_required_return=0.10,
+    )
+    strat = CompounderMarginOfSafetyStrategy(cfg)
+    weights = strat.generate_weights(universe)
+    daily = _daily(weights)
+
+    assert (daily["KO"].iloc[150:200] > 0).any(), "should have been held during/soon after the strong-trend regime"
+    assert (daily["KO"].iloc[-30:] == 0).all(), "should have exited once the trend flattened and the edge decayed"
+
+
+def test_cms_warmup_bars_covers_all_lookbacks():
+    cfg = StrategyConfig(cms_trend_ma_period=50, cms_vol_lookback=20, cms_lookback_days=252)
+    strat = CompounderMarginOfSafetyStrategy(cfg)
+    assert strat.warmup_bars() == 252
+
+
+def test_cms_returns_empty_when_no_candidates_in_universe():
+    universe = {
+        "SPY": make_ohlcv_from_closes([100.0] * 50),
+        "BIL": make_ohlcv_from_closes([100.0] * 50),
+    }
+    strat = CompounderMarginOfSafetyStrategy(StrategyConfig(cms_candidate_universe=["KO", "PG"]))
+    assert strat.generate_weights(universe).empty
+
+
+def test_compounder_margin_of_safety_instantiates_and_runs_from_json_config():
+    config = load_strategies_config()
+    entry = config["compounder_margin_of_safety"]
+    strat = instantiate_strategy_from_config_entry("compounder_margin_of_safety", entry)
+    universe = _cms_universe()
+    weights = strat.generate_weights(
+        universe, {"cms_lookback_days": 60, "cms_trend_ma_period": 30, "cms_vol_lookback": 20},
+    )
     assert not weights.empty
     assert strat.explain_weights()
 

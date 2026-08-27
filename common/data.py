@@ -60,8 +60,20 @@ class BaseDataProvider(ABC):
         return data
 
     def fetch_metadata(self, symbol: str) -> dict:
-        """Best-effort metadata lookup returning {'expense_ratio': float, 'total_assets': float}."""
-        return {"expense_ratio": float("nan"), "total_assets": float("nan")}
+        """Best-effort metadata lookup. Every field defaults to NaN -- a
+        provider that can't/doesn't support a given field (e.g. a synthetic
+        provider has no real company behind a symbol at all) should never
+        raise for it, just report it as unavailable. `roe`/`dividend_yield`/
+        `earnings_growth`/`debt_to_equity` are stock-fundamental fields
+        (currently only populated by `YFinanceDataProvider`, see its own
+        `fetch_metadata` docstring for the exact yfinance source fields and
+        their unit caveats); `expense_ratio`/`total_assets` are fund-level
+        fields for ETFs."""
+        return {
+            "expense_ratio": float("nan"), "total_assets": float("nan"),
+            "roe": float("nan"), "dividend_yield": float("nan"),
+            "earnings_growth": float("nan"), "debt_to_equity": float("nan"),
+        }
 
 
 class YFinanceDataProvider(BaseDataProvider):
@@ -85,11 +97,31 @@ class YFinanceDataProvider(BaseDataProvider):
         return df
 
     def fetch_metadata(self, symbol: str) -> dict:
-        expense_ratio, total_assets = float("nan"), float("nan")
+        """Best-effort fund/company metadata from yfinance's `.info` -- every
+        field defaults to NaN and is only ever overwritten on a successful,
+        present, non-None lookup (see `BaseDataProvider.fetch_metadata`'s own
+        docstring for why: this must never raise for a symbol missing one
+        field, since callers use partial metadata all the time, e.g. an ETF
+        has no `roe`/`earnings_growth` and an individual stock usually has no
+        `expense_ratio`).
+
+        `roe`/`dividend_yield`/`earnings_growth`/`debt_to_equity` are read
+        as-is from yfinance's own `.info` fields with NO unit normalization:
+        yfinance has historically been inconsistent about whether
+        `dividendYield`/`debtToEquity` are already-decimal fractions or
+        percentage-scaled numbers (has varied across yfinance versions) --
+        callers must treat these as "yfinance's own convention, whatever that
+        happens to be for this install," not a guaranteed-decimal fraction.
+        """
+        result = {
+            "expense_ratio": float("nan"), "total_assets": float("nan"),
+            "roe": float("nan"), "dividend_yield": float("nan"),
+            "earnings_growth": float("nan"), "debt_to_equity": float("nan"),
+        }
         try:
             info = yf.Ticker(symbol).info
         except Exception:
-            return {"expense_ratio": expense_ratio, "total_assets": total_assets}
+            return result
 
         # A real yfinance failure mode for delisted/invalid tickers: `.info`
         # returns None (or something else non-dict-like) instead of raising.
@@ -97,21 +129,33 @@ class YFinanceDataProvider(BaseDataProvider):
         # uncaught AttributeError instead of falling back to the same
         # NaN-filled dict the exception path above already returns.
         if not isinstance(info, dict):
-            return {"expense_ratio": expense_ratio, "total_assets": total_assets}
+            return result
 
         for key in ("netExpenseRatio", "annualReportExpenseRatio", "expenseRatio"):
             value = info.get(key)
             if value is not None:
-                expense_ratio = float(value)
+                result["expense_ratio"] = float(value)
                 break
 
         for key in ("totalAssets", "netAssets"):
             value = info.get(key)
             if value is not None:
-                total_assets = float(value)
+                result["total_assets"] = float(value)
                 break
 
-        return {"expense_ratio": expense_ratio, "total_assets": total_assets}
+        for field, keys in (
+            ("roe", ("returnOnEquity",)),
+            ("dividend_yield", ("dividendYield",)),
+            ("earnings_growth", ("earningsGrowth", "earningsQuarterlyGrowth")),
+            ("debt_to_equity", ("debtToEquity",)),
+        ):
+            for key in keys:
+                value = info.get(key)
+                if value is not None:
+                    result[field] = float(value)
+                    break
+
+        return result
 
 
 class CSVFolderDataProvider(BaseDataProvider):

@@ -32,6 +32,11 @@ Modern Systematic TAA Extensions:
 Original Structural Strategies (independent from-scratch implementations,
 not ports of any workspace side project or third-party library):
 17. ChanPivotShiftStrategy (缠中说禅/Chan-theory pivot-shift reading, see `chan_structure.py`)
+
+Value-Investing-Adapted Strategies:
+18. CompounderMarginOfSafetyStrategy (price-only proxy of a conservative valuation
+    framework, see `docs/snowball_strategy.txt`; the real-fundamentals version lives
+    in the separate `fundamental_screener` project)
 """
 
 from typing import Dict, List, Union
@@ -1197,6 +1202,136 @@ class TurtleBreakoutStrategy(AllocationTemplate):
         return max(entry_days, exit_days, atr_period, ma_period) + 1
 
 
+class CompounderMarginOfSafetyStrategy(AllocationTemplate):
+    """Price-only proxy adaptation of a conservative value-investing
+    community's valuation framework (see `docs/snowball_strategy.txt`): the
+    original method only holds durable, moat-protected, high-ROE,
+    dividend-paying compounders whose expected 5-year return clears a risk
+    premium over a broad-index benchmark, and sells the moment that edge
+    decays away.
+
+    DISCLOSED SIMPLIFICATION: the original framework is fundamentals-driven
+    (5-year earnings forecast, ROE, dividend policy, free-cash-flow quality,
+    P/E-based terminal valuation) -- no dividend/ROE/earnings/valuation data
+    exists anywhere in this workspace (OHLCV price history only). This class
+    is a PRICE-ONLY PROXY: a long-term-uptrend + contained-volatility
+    "stability" gate stands in for the moat/high-ROE quality screen, and a
+    trailing annualized-return proxy (momentum persistence, not a real
+    forecast) stands in for the document's earnings-growth-driven expected
+    return. A real-fundamentals version (actual ROE/dividend yield/earnings
+    growth from yfinance) lives in the separate `fundamental_screener`
+    project instead, since it needs real network data and can't be
+    offline/synthetic-tested like every other strategy here.
+    """
+
+    def __init__(self, config: StrategyConfig = None):
+        self.config = config or StrategyConfig()
+        super().__init__(name="compounder_margin_of_safety", param_grid={})
+
+    def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
+        cfg = self.config
+        p = params or {}
+        cash_proxy = p.get("cash_proxy", cfg.cash_proxy)
+        candidate_universe = p.get("cms_candidate_universe", cfg.cms_candidate_universe)
+        benchmark_symbol = p.get("cms_benchmark_symbol", cfg.cms_benchmark_symbol)
+        lookback_days = p.get("cms_lookback_days", cfg.cms_lookback_days)
+        trend_ma_period = p.get("cms_trend_ma_period", cfg.cms_trend_ma_period)
+        vol_lookback = p.get("cms_vol_lookback", cfg.cms_vol_lookback)
+        max_volatility = p.get("cms_max_volatility", cfg.cms_max_volatility)
+        required_return = p.get("cms_required_return", cfg.cms_required_return)
+
+        symbols = list(universe.keys())
+        candidate_symbols = [s for s in candidate_universe if s in universe and s != benchmark_symbol]
+        if not candidate_symbols or benchmark_symbol not in universe:
+            return pd.DataFrame()
+
+        master_index = universe[candidate_symbols[0]].index
+        n_bars = len(master_index)
+
+        benchmark_close = universe[benchmark_symbol]["Close"]
+        # Annualized trailing return over lookback_days -- the benchmark's
+        # own compounded return, used as the sell-trigger comparator. An
+        # index's own "expected return" is inherently a price/total-return
+        # concept, so this comparator is price-based even though the
+        # candidate side's own signal would be real-fundamentals-based in
+        # the fundamental_screener project's sibling strategy.
+        benchmark_trailing_return = (
+            (benchmark_close / benchmark_close.shift(lookback_days)) ** (252.0 / lookback_days) - 1.0
+        )
+
+        raw_weights = {}
+        for sym in candidate_symbols:
+            close = universe[sym]["Close"]
+            trend_ma = sma(close, trend_ma_period)
+            vol = realized_vol(close, vol_lookback)
+            trailing_return = (close / close.shift(lookback_days)) ** (252.0 / lookback_days) - 1.0
+
+            quality_ok = (close > trend_ma) & (vol <= max_volatility)
+            entry_signal = (quality_ok & (trailing_return >= required_return)).fillna(False)
+            exit_signal = (~quality_ok | (trailing_return < benchmark_trailing_return)).fillna(True)
+
+            close_arr = close.to_numpy()
+            entry_arr = entry_signal.to_numpy()
+            exit_arr = exit_signal.to_numpy()
+            raw = np.zeros(n_bars)
+            in_position = False
+            for i in range(n_bars):
+                if in_position:
+                    if exit_arr[i]:
+                        in_position = False
+                        raw[i] = 0.0
+                    else:
+                        raw[i] = 1.0
+                elif entry_arr[i]:
+                    in_position = True
+                    raw[i] = 1.0
+            raw_weights[sym] = raw
+
+        position_size_pct = 1.0 / len(candidate_symbols)
+        daily = pd.DataFrame(raw_weights, index=master_index) * position_size_pct
+        total_risky_raw = daily.sum(axis=1)
+        scale = np.where(total_risky_raw > 1.0, 1.0 / total_risky_raw, 1.0)
+        daily = daily.mul(scale, axis=0)
+
+        if cash_proxy in symbols:
+            daily[cash_proxy] = np.maximum(0.0, 1.0 - daily.sum(axis=1))
+
+        daily = _fill_out_columns(daily, symbols)
+        return _sparse_from_daily(daily)
+
+    def explain_weights(self, params: dict = None) -> str:
+        cfg = self.config
+        p = params or {}
+        trend_ma_period = p.get("cms_trend_ma_period", cfg.cms_trend_ma_period)
+        max_volatility = p.get("cms_max_volatility", cfg.cms_max_volatility)
+        lookback_days = p.get("cms_lookback_days", cfg.cms_lookback_days)
+        required_return = p.get("cms_required_return", cfg.cms_required_return)
+        benchmark_symbol = p.get("cms_benchmark_symbol", cfg.cms_benchmark_symbol)
+        return (
+            f"Compounder Margin-of-Safety (price-proxy adaptation of docs/snowball_strategy.txt's "
+            f"conservative valuation framework): holds a candidate symbol only while it is in a "
+            f"confirmed uptrend (close > {trend_ma_period}-day SMA) with realized volatility <= "
+            f"{max_volatility * 100:.0f}% (a quality/stability proxy for the doc's moat/high-ROE "
+            f"screen) AND its own {lookback_days}-bar annualized trailing return is >= "
+            f"{required_return * 100:.0f}% (a momentum-persistence proxy for the doc's "
+            f"earnings-growth-driven expected return, not a real forecast). Exits the moment that "
+            f"trailing-return proxy decays below {benchmark_symbol}'s own trailing return -- a direct "
+            f"translation of the document's own sell-trigger rule (hold only while priced to beat the "
+            f"benchmark). DISCLOSED SIMPLIFICATION: no real fundamentals (ROE/dividend yield/earnings "
+            f"growth) are used here -- see the separate fundamental_screener project for a "
+            f"real-data version of this same philosophy."
+        )
+
+    def warmup_bars(self, params: dict = None) -> int:
+        cfg = self.config
+        p = params or {}
+        return max(
+            p.get("cms_trend_ma_period", cfg.cms_trend_ma_period),
+            p.get("cms_vol_lookback", cfg.cms_vol_lookback),
+            p.get("cms_lookback_days", cfg.cms_lookback_days),
+        )
+
+
 # --- Modern Popular Static Portfolios -------------------------------------
 # Fixed-weight, periodically-rebalanced allocations -- no momentum, no trend
 # gate, no cross-sectional ranking. Each preset substitutes a ticker already
@@ -1679,6 +1814,7 @@ STRATEGY_CLASS_MAP = {
     "AllWeatherStrategy": AllWeatherStrategy,
     "BoldAssetAllocation": BoldAssetAllocation,
     "ChanPivotShiftStrategy": ChanPivotShiftStrategy,
+    "CompounderMarginOfSafetyStrategy": CompounderMarginOfSafetyStrategy,
     "EnsembleRegimeSwitchingStrategy": EnsembleRegimeSwitchingStrategy,
     "GoldenButterflyStrategy": GoldenButterflyStrategy,
     "HFEAStrategy": HFEAStrategy,

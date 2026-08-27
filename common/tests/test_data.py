@@ -443,11 +443,47 @@ def test_yfinance_fetch_metadata_extracts_expense_ratio_and_aum(mock_ticker):
 
 
 @patch("yfinance.Ticker")
+def test_yfinance_fetch_metadata_extracts_stock_fundamentals(mock_ticker):
+    mock_ticker.return_value.info = {
+        "returnOnEquity": 0.35, "dividendYield": 0.025,
+        "earningsGrowth": 0.08, "debtToEquity": 45.2,
+    }
+    metadata = YFinanceDataProvider().fetch_metadata("KO")
+    assert metadata["roe"] == pytest.approx(0.35)
+    assert metadata["dividend_yield"] == pytest.approx(0.025)
+    assert metadata["earnings_growth"] == pytest.approx(0.08)
+    assert metadata["debt_to_equity"] == pytest.approx(45.2)
+
+
+def test_base_provider_fetch_metadata_default_shape_includes_fundamental_fields():
+    # A provider with no real company behind a symbol (e.g. synthetic) must
+    # still return the full field set as NaN, not omit the new fundamental
+    # keys -- callers (e.g. fundamental_screener) shouldn't need a
+    # provider-specific KeyError guard just because they're using a
+    # provider that can't supply real fundamentals.
+    metadata = SyntheticDataProvider().fetch_metadata("SPY")
+    for field in ("expense_ratio", "total_assets", "roe", "dividend_yield", "earnings_growth", "debt_to_equity"):
+        assert field in metadata
+        assert np.isnan(metadata[field])
+
+
+@patch("yfinance.Ticker")
+def test_yfinance_fetch_metadata_earnings_growth_falls_back_to_quarterly(mock_ticker):
+    mock_ticker.return_value.info = {"earningsQuarterlyGrowth": 0.12}
+    metadata = YFinanceDataProvider().fetch_metadata("KO")
+    assert metadata["earnings_growth"] == pytest.approx(0.12)
+
+
+@patch("yfinance.Ticker")
 def test_yfinance_fetch_metadata_missing_fields_returns_nan(mock_ticker):
     mock_ticker.return_value.info = {}
     metadata = YFinanceDataProvider().fetch_metadata("SPY")
     assert np.isnan(metadata["expense_ratio"])
     assert np.isnan(metadata["total_assets"])
+    assert np.isnan(metadata["roe"])
+    assert np.isnan(metadata["dividend_yield"])
+    assert np.isnan(metadata["earnings_growth"])
+    assert np.isnan(metadata["debt_to_equity"])
 
 
 @patch("yfinance.Ticker")
@@ -456,6 +492,7 @@ def test_yfinance_fetch_metadata_handles_ticker_exception(mock_ticker):
     metadata = YFinanceDataProvider().fetch_metadata("SPY")
     assert np.isnan(metadata["expense_ratio"])
     assert np.isnan(metadata["total_assets"])
+    assert np.isnan(metadata["roe"])
 
 
 def test_cached_data_provider_default_unlimited_age_unchanged(temp_csv_dir):
@@ -581,6 +618,7 @@ def test_yfinance_fetch_metadata_handles_info_returning_none(mock_ticker):
     metadata = YFinanceDataProvider().fetch_metadata("DELISTED")
     assert np.isnan(metadata["expense_ratio"])
     assert np.isnan(metadata["total_assets"])
+    assert np.isnan(metadata["roe"])
 
 
 def test_cached_data_provider_recovers_from_corrupt_cache_file(temp_csv_dir):

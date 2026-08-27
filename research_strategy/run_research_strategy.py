@@ -12,6 +12,8 @@ Evaluates strategies written in plain English or predefined canonical research s
 8. ATR-Adaptive Grid (ported from the former grid_trading project)
 9. Regime-Switching Ensemble (ported from the former ensemble_strategy project)
 10. Custom Plain English Strategy descriptions (--description or --description-file)
+11. Compounder Margin of Safety (price-only proxy of docs/snowball_strategy.txt's conservative
+    valuation framework; see rs/strategy.py's module docstring for the full strategy list)
 
 STRICT TEST POLICY: Runs on synthetic multi-asset price histories (no real market data calls).
 

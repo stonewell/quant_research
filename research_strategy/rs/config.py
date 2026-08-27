@@ -251,6 +251,28 @@ class StrategyConfig:
     chan_max_holding_days: Optional[int] = 90    # None disables
     chan_position_size_pct: float = 1.0
 
+    # --- Compounder Margin-of-Safety (price-proxy adaptation of a
+    # conservative value-investing community's valuation framework, see
+    # docs/snowball_strategy.txt) -- holds a candidate "quality compounder"
+    # only while it's in a confirmed uptrend with contained volatility (a
+    # price-only proxy for the doc's moat/high-ROE screen -- this project has
+    # no real ROE/dividend/earnings data anywhere, see rs/strategy.py's own
+    # docstring for the full disclosed-simplification list) AND its own
+    # trailing annualized return clears a required hurdle; exits once that
+    # trailing return decays below the benchmark's own trailing return (the
+    # doc's own sell-trigger rule, translated directly). Candidate universe
+    # is illustrative -- a hand-picked, unverified blue-chip basket, not a
+    # curated reproduction of the source document's own selection criteria. ---
+    cms_candidate_universe: List[str] = field(
+        default_factory=lambda: ["KO", "PG", "JNJ", "MSFT", "COST", "WMT", "MCD", "PEP"]
+    )
+    cms_benchmark_symbol: str = "SPY"
+    cms_lookback_days: int = 1260           # ~5 years, mirrors the doc's own 5-year framing
+    cms_trend_ma_period: int = 200
+    cms_vol_lookback: int = 60
+    cms_max_volatility: float = 0.30
+    cms_required_return: float = 0.12       # doc's normal-environment buy hurdle
+
     # Backtester execution defaults
     initial_capital: float = 100_000.0
     commission_pct: float = 0.0005          # 5 bps
