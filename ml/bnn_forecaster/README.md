@@ -110,10 +110,61 @@ and set thresholds that match what you actually observe.
 
 ## Usage
 
+### Argument reference
+
+Universe-resolution flags (`--universe`/`--universe-file`/`--universe-provider`/
+`--universe-kwargs`) are shared with the pipeline projects — see `common/README.md`'s
+cross-reference index; `resolve_universe_from_args` picks the first one supplied, in that order,
+falling back to this project's own 8-symbol `DEFAULT_CANDIDATE_UNIVERSE` (KO, PG, JNJ, MSFT, COST,
+WMT, MCD, PEP) if none are given.
+
+| Flag | Type / default | Meaning |
+|---|---|---|
+| `--universe` / `-u` | space-separated tickers, default: none | Explicit ticker list (falls back to `DEFAULT_CANDIDATE_UNIVERSE`) |
+| `--universe-file` | path, default: none | Load tickers from a file instead |
+| `--universe-provider` | str, default: none | Resolve the universe from a registered provider instead of a static list |
+| `--universe-kwargs` | JSON str, default: none | Extra kwargs (as a JSON object string) passed to `--universe-provider` |
+| `--benchmark` | str, default `"SPY"` | Broad-index benchmark symbol for the sell-trigger comparator |
+| `--top-n` | int, default `5` | How many top buy/sell candidates to report |
+| `--horizon-days` | int, default `21` (~1 month) | Forecast horizon in trading days, also the annualization base |
+| `--lookback-days` | int, default `756` (~3 years) | Trading days of trailing history to fit each symbol's BNN on |
+| `--estimator` | `map` \| `mcmc` \| `vi`, default `"map"` | AutoBNN estimator type — `map` (Maximum A Posteriori) is by far the cheapest; `mcmc`/`vi` are much more expensive |
+| `--width` | int, default `10` | AutoBNN ensemble width (reduced from AutoBNN's own default of 50 for practical runtime) |
+| `--num-iters` | int, default `1000` | MAP optimization iterations per symbol (reduced from AutoBNN's own default of 5000 — see the calibration trade-off above) |
+| `--num-particles` | int, default `4` | AutoBNN particle count |
+| `--required-return` | float, default `0.10` | Annualized median-forecast buy hurdle |
+| `--max-ci-width` | float, default `0.30` | 97.5/2.5 quantile spread ceiling (annualized) to count a forecast as "confident" — see the calibration caveat above before trusting this default |
+| `--seed` | int, default `42` | Random seed |
+| `--start` | `YYYY-MM-DD`, default `"2015-01-01"` | History start date |
+| `--end` | `YYYY-MM-DD`, default `"2024-12-31"` | History end date |
+| `--interval` | str, default `"1d"` | Bar interval passed to the data provider |
+| `--data-provider` | str, default `"synthetic"` | `synthetic`, `yfinance`, `csv`, or a custom module specifier |
+| `--data-dir` | path, default: none | Folder path for the `csv` data provider |
+| `--no-cache` | flag, default off (cached) | Disable local CSV caching of OHLCV history |
+| `--cache-ttl-days` | float, default: none | Maximum age (in days) of a cached OHLCV file before it's treated as stale and re-fetched |
+
+### Sample commands
+
 ```bash
 uv run python run_bnn_forecaster.py --data-provider synthetic
 uv run python run_bnn_forecaster.py --universe KO PG JNJ MSFT COST WMT MCD PEP --data-provider yfinance
 uv run python run_bnn_forecaster.py --num-iters 200 --width 6   # faster, lower-quality fit for quick iteration
+
+# Shorter forecast horizon and trailing lookback
+uv run python run_bnn_forecaster.py --horizon-days 5 --lookback-days 252 --data-provider synthetic
+
+# More expensive estimator + more particles (slower, potentially better-calibrated -- unverified)
+uv run python run_bnn_forecaster.py --estimator vi --num-particles 8 --data-provider synthetic
+
+# Universe loaded from a file (e.g. a basket produced by instrument_selection)
+uv run python run_bnn_forecaster.py --universe-file ../../pipeline/instrument_selection/results/basket.json \
+  --data-provider yfinance
+
+# Tune the buy/sell thresholds after inspecting a real run's actual ci_width output (see caveat above)
+uv run python run_bnn_forecaster.py --required-return 0.15 --max-ci-width 1.5 --data-provider yfinance
+
+# Re-fetch a stale cached OHLCV file after 1 day instead of trusting it forever
+uv run python run_bnn_forecaster.py --data-provider yfinance --cache-ttl-days 1
 ```
 
 ### Outputs (`results/`)

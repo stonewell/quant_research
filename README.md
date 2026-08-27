@@ -247,6 +247,10 @@ uv run python run_pipeline.py --universe SPY QQQ IWM EFA EEM GLD TLT --data-prov
 uv run python run_pipeline.py --universe SPY QQQ IWM EFA EEM GLD TLT --data-provider synthetic \
   --research-strategy baa_keller adaptive_grid --optimize --n-random-search 100
 
+# --optimize with a stricter ERS trust bar (higher percentile, more required rebalances)
+uv run python run_pipeline.py --universe SPY QQQ IWM EFA EEM GLD TLT --data-provider synthetic \
+  --optimize --ers-percentile-threshold 0.95 --min-rebalances-for-trust 8
+
 # A real end-to-end run against real market data (only pass --data-provider yfinance
 # deliberately -- every other example above defaults to synthetic per this workspace's
 # no-real-market-data-by-default convention)

@@ -39,18 +39,36 @@ conservatism).
 
 ## Usage
 
-```bash
-# Screen the default illustrative blue-chip basket (KO, PG, JNJ, MSFT, COST, WMT, MCD, PEP)
-python run_fundamental_screener.py --data-provider synthetic
+### Argument reference
 
-# A custom universe, real benchmark price history
-python run_fundamental_screener.py --universe KO PG JNJ MSFT COST WMT MCD PEP \
-  --benchmark SPY --data-provider yfinance
+Universe-resolution flags (`--universe`/`--universe-file`/`--universe-provider`/
+`--universe-kwargs`) are shared with the other pipeline projects — see `common/README.md`'s
+cross-reference index; `resolve_universe_from_args` picks the first one supplied, in that order,
+falling back to this project's own 8-symbol `DEFAULT_CANDIDATE_UNIVERSE` (KO, PG, JNJ, MSFT, COST,
+WMT, MCD, PEP) if none are given.
 
-# Tune the quality/return thresholds
-python run_fundamental_screener.py --required-return 0.10 --min-roe 0.20 \
-  --max-debt-to-equity 100 --top-n 3
-```
+| Flag | Type / default | Meaning |
+|---|---|---|
+| `--universe` / `-u` | space-separated tickers, default: none | Explicit ticker list (falls back to `DEFAULT_CANDIDATE_UNIVERSE`) |
+| `--universe-file` | path, default: none | Load tickers from a file instead |
+| `--universe-provider` | str, default: none | Resolve the universe from a registered provider instead of a static list |
+| `--universe-kwargs` | JSON str, default: none | Extra kwargs (as a JSON object string) passed to `--universe-provider` |
+| `--benchmark` | str, default `"SPY"` | Broad-index benchmark symbol for the sell-trigger comparator |
+| `--top-n` | int, default `5` | How many top buy/sell candidates to report |
+| `--required-return` | float, default `0.12` | Buy hurdle: `expected_return` (`earnings_growth + dividend_yield`) must clear this |
+| `--min-roe` | float, default `0.15` | Quality gate: minimum return on equity |
+| `--min-dividend-yield` | float, default `0.0` | Quality gate: minimum dividend yield (must actually pay a dividend) |
+| `--max-debt-to-equity` | float, default `150.0` | Quality gate: maximum debt-to-equity (yfinance's own scale — see `common/data.py`'s caveat) |
+| `--min-earnings-growth` | float, default `0.05` | Quality gate: minimum earnings growth (the source document's explicit ≥5% 5yr-CAGR requirement) |
+| `--lookback-days` | int, default `1260` (~5 years) | Trading days of benchmark price history used for its own trailing-return comparator |
+| `--start` | `YYYY-MM-DD`, default `"2015-01-01"` | Benchmark history start date |
+| `--end` | `YYYY-MM-DD`, default `"2024-12-31"` | Benchmark history end date |
+| `--interval` | str, default `"1d"` | Bar interval passed to the data provider |
+| `--seed` | int, default `42` | Random seed (only used with `--data-provider synthetic`) |
+| `--data-provider` | str, default `"synthetic"` | Only affects the benchmark's OHLCV history (see below) — `synthetic`, `yfinance`, `csv`, or a custom module specifier |
+| `--data-dir` | path, default: none | Folder path for the `csv` data provider |
+| `--no-cache` | flag, default off (cached) | Disable local CSV caching of the benchmark's OHLCV history |
+| `--cache-ttl-days` | float, default: none | Maximum age (in days) of a cached OHLCV file before it's treated as stale and re-fetched |
 
 `--data-provider` (default `synthetic`, matching this workspace's offline
 convention) only affects the benchmark's OHLCV history used for the
@@ -58,6 +76,38 @@ sell-trigger comparator -- **fundamentals always come from real yfinance**,
 printed as an explicit warning when run with `--data-provider synthetic`
 (a synthetic benchmark comparator is meaningless noise; use
 `--data-provider yfinance` for a comparator that means anything).
+
+### Sample commands
+
+```bash
+# Run from inside pipeline/
+# Screen the default illustrative blue-chip basket (KO, PG, JNJ, MSFT, COST, WMT, MCD, PEP)
+uv run python fundamental_screener/run_fundamental_screener.py --data-provider synthetic
+
+# A custom universe, real benchmark price history
+uv run python fundamental_screener/run_fundamental_screener.py --universe KO PG JNJ MSFT COST WMT MCD PEP \
+  --benchmark SPY --data-provider yfinance
+
+# Tune the quality/return thresholds
+uv run python fundamental_screener/run_fundamental_screener.py --required-return 0.10 --min-roe 0.20 \
+  --max-debt-to-equity 100 --top-n 3
+
+# Tune the dividend-yield/earnings-growth quality gates and the benchmark's own trailing lookback
+uv run python fundamental_screener/run_fundamental_screener.py --min-dividend-yield 0.02 \
+  --min-earnings-growth 0.08 --lookback-days 756
+
+# Universe loaded from a file (e.g. a basket produced by instrument_selection)
+uv run python fundamental_screener/run_fundamental_screener.py \
+  --universe-file instrument_selection/results/basket.json --data-provider yfinance
+
+# Explicit benchmark date range, offline/synthetic benchmark comparator (real fundamentals still
+# fetched over the network regardless -- see above)
+uv run python fundamental_screener/run_fundamental_screener.py --data-provider synthetic \
+  --seed 7 --start 2018-01-01 --end 2024-12-31
+
+# Re-fetch a stale cached benchmark OHLCV file after 1 day instead of trusting it forever
+uv run python fundamental_screener/run_fundamental_screener.py --data-provider yfinance --cache-ttl-days 1
+```
 
 ### Outputs (`results/`)
 
@@ -68,8 +118,8 @@ printed as an explicit warning when run with `--data-provider synthetic`
   shape), and a `caveat` field -- read it before trusting anything here.
 - **`fundamental_strategy.json`** -- a `strategy.json`-compatible artifact
   (same shape `strategy_generator`/`research_strategy` produce) so
-  `backtester/run_backtest.py --strategy-file results/fundamental_strategy.json`
-  can run a real backtest against this project's own
+  `backtester/run_backtest.py --strategy-file pipeline/fundamental_screener/results/fundamental_strategy.json`
+  (from the repo root) can run a real backtest against this project's own
   `FundamentalMarginOfSafetyStrategy`, via a `fundamental_spec` marker
   block (mutually exclusive with `pattern_spec`/`research_strategy_spec`/
   `composite_spec`, matching that same hand-off convention). This hand-off
@@ -104,6 +154,7 @@ in this project's own test suite, matching this workspace's testing
 conventions even though the CLI itself is real-data-only by design:
 
 ```bash
+# from inside pipeline/
 uv run pytest fundamental_screener/tests -v
 ```
 

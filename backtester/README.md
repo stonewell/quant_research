@@ -109,6 +109,25 @@ uv run python backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY TLT BIL GLD --mode walkforward
 
+# Re-running an aspect-composed hybrid strategy (strategy.json with a composite_spec block --
+# a winning pairing of one template's selection/entry aspect with a DIFFERENT template's own
+# weighting/exit aspect; see strategy_generator's --no-compose-aspects) on a new basket
+uv run python backtester/run_backtest.py \
+  --strategy-file pipeline/strategy_generator/results/strategy.json \
+  --universe SPY QQQ IWM EFA EEM GLD TLT --mode standard
+
+# Re-running a fundamental_screener-sourced strategy (strategy.json with a fundamental_spec
+# block) -- see pipeline/fundamental_screener/README.md for how bnn_strategy.json is produced
+uv run python backtester/run_backtest.py \
+  --strategy-file pipeline/fundamental_screener/results/fundamental_strategy.json \
+  --universe KO PG SPY BIL --mode standard
+
+# Re-running a bnn_forecaster-sourced strategy (strategy.json with a bnn_spec block) -- MUST use
+# bnn_forecaster's own isolated venv, not pipeline's (see ml/bnn_forecaster/README.md)
+ml/bnn_forecaster/.venv/Scripts/python.exe backtester/run_backtest.py \
+  --strategy-file ml/bnn_forecaster/results/bnn_strategy.json \
+  --universe KO PG SPY BIL --mode standard
+
 # Custom results/cache directories, no local caching of the fetched data
 uv run python backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \

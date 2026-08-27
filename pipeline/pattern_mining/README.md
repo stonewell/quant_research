@@ -151,7 +151,7 @@ shared `factor_tags`/factor-taxonomy/indicator-feature machinery this stage mine
 ## 6. Testing
 
 ```bash
-# from the repo root
+# from inside pipeline/
 uv run pytest pattern_mining/tests -v
 ```
 

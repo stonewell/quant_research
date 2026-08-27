@@ -35,9 +35,11 @@ from this project's searchable template set. See each class's docstring in
 `stratgen/generator.py` grid-searches every template's small parameter set (`param_grid`),
 scores each combination with the shared portfolio backtester (`common/allocation_backtester.py`,
 which accounts for daily weight drift, partial cash holdings, and rebalancing transaction costs),
-and picks the highest-Sharpe combination across ALL templates. The Equivalent Random Search (ERS)
-check then validates that this winner beats a size-matched pool of random allocation portfolios —
-necessary, not sufficient, evidence the result isn't just noise.
+and picks the highest-Sharpe combination across ALL templates — plus, by default, hybrid
+recombinations of DIFFERENT templates' own aspects (see "Optional: aspect composition" below;
+`--no-compose-aspects` to disable). The Equivalent Random Search (ERS) check then validates that
+this winner beats a size-matched pool of random allocation portfolios — necessary, not sufficient,
+evidence the result isn't just noise.
 
 **Every template operates cross-sectionally on the whole universe already** — this is not a
 per-symbol independent search; `HierarchicalRiskParityAllocation` and `MinimumVarianceAllocation`
@@ -111,7 +113,7 @@ any `--pattern-report` findings. Each `KEY` is one of `research_strategy/strateg
 short keys (e.g. `baa_keller`, `adaptive_grid`, `rsi_mean_reversion` — see `research_strategy/README.md`
 for the full list of 17); run
 `uv run python -c "from research_strategy.rs.config import load_strategies_config; print(sorted(load_strategies_config().keys()))"`
-from the repo root to see them directly. Each named strategy is instantiated exactly as
+from inside `pipeline/` to see them directly. Each named strategy is instantiated exactly as
 `research_strategy`'s own CLI would build it — including any `strategies_config.json` parameter
 overrides — via `research_strategy.rs.strategy.instantiate_strategy_from_config_entry`, then folded
 into the SAME grid-search + Equivalent Random Search pipeline as every static template via the
@@ -122,6 +124,39 @@ raises a clear error listing every valid key rather than failing deep inside the
 uv run python strategy_generator/run_strategygen.py --universe SPY QQQ TLT GLD --mode generate \
   --data-provider synthetic --research-strategy baa_keller adaptive_grid \
   --factor-report research_strategy/results/factor_summary.json
+```
+
+## Optional: aspect composition — hybrid templates across DIFFERENT sources (`--no-compose-aspects`)
+
+**ON by default.** Each of the 9 static templates fuses two orthogonal decisions into one
+`generate_weights` — SELECTION (which symbols are eligible) + WEIGHTING (how the invested fraction
+splits across them) for basket templates; ENTRY SIGNAL + EXIT/RISK/SIZING for the 4 decomposable
+single-asset timing templates (`RSIMeanReversionStrategy`, `SwingTrendPullbackStrategy`,
+`ChanPivotShiftStrategy`, `TurtleBreakoutStrategy`, only reachable via `--research-strategy`).
+Aspect composition decomposes each side into a standalone, independently composable piece
+(`common/strategy_aspects.py` for basket templates' `SelectionAspect`/`WeightingAspect`;
+`research_strategy/rs/timing_aspects.py` for timing templates' `EntrySignalAspect`/`ExitRiskAspect`)
+and searches HYBRID pairings across different source templates too — e.g. momentum's stock-picking
+paired with inverse-volatility's position sizing, a combination that doesn't exist as any single
+static template. A winning hybrid is folded into the SAME grid-search + Equivalent Random Search
+pipeline as every static/mined/`--research-strategy` candidate; it must still clear the same ERS bar
+to be trusted.
+
+A winning hybrid's `results/strategy.json` carries a `composite_spec` block (see "Data Shapes &
+Schemas" below) so `backtester` can reconstruct the exact `CompositeAllocationTemplate`/
+`CompositeTimingTemplate` instance. Pass `--no-compose-aspects` to disable this and restrict the
+search to only the templates explicitly named/loaded (the 9 static templates, plus any
+`--pattern-report`/`--research-strategy` candidates) — useful for a faster run, or to reproduce
+this project's pre-aspect-composition search behavior exactly.
+
+```bash
+# Default: aspect composition ON -- may return a hybrid composite_spec winner
+uv run python strategy_generator/run_strategygen.py --universe SPY QQQ IWM EFA EEM GLD TLT \
+  --mode generate --data-provider synthetic
+
+# Disable aspect composition -- only whole static/mined/--research-strategy templates compete
+uv run python strategy_generator/run_strategygen.py --universe SPY QQQ IWM EFA EEM GLD TLT \
+  --mode generate --data-provider synthetic --no-compose-aspects
 ```
 
 ## Why this design (still accurate, unchanged by the architecture rewrite)
@@ -250,6 +285,7 @@ falling back to this project's own default universe (`["SPY", "QQQ"]`) if none a
 | `--no-cache` | flag, default off (cached) | Disable local CSV caching of fetched data |
 | `--cache-ttl-days` | float, default: none | Maximum age (in days) of a cached OHLCV file before it's treated as stale and re-fetched; `None` (default) never expires a cache entry on age alone |
 | `--no-plots` | flag, default off (charts on) | Skip writing the winning strategy's equity-curve chart (`results/equity_curve.png`) |
+| `--no-compose-aspects` | flag, default off (aspect composition ON) | Disable hybrid search across DIFFERENT templates' selection/weighting or entry/exit aspects (see "Optional: aspect composition" below); restricts the search to only the templates explicitly named/loaded |
 
 The local OHLCV cache directory now resolves to the shared, workspace-wide location
 (`<repo_root>/data/`) rather than a project-local folder — see `common/README.md`'s "Shared OHLCV
@@ -258,7 +294,7 @@ cache directory" section (§7) for details.
 ### Sample commands (real market data)
 
 ```bash
-# Generate ONE strategy for the whole universe from all available history (run from the repo root)
+# Generate ONE strategy for the whole universe from all available history (run from inside pipeline/)
 uv run python strategy_generator/run_strategygen.py --universe SPY QQQ AAPL --mode generate
 
 # Explicit date range and bar interval
@@ -316,7 +352,7 @@ feature menu** shapes documented in `../../common/README.md` (§1–6) — see t
 
 | Field | Type | Notes |
 |---|---|---|
-| `template_name` | str | One of the 9 static template names, or `pattern_<feature>_<lookback>_<peak\|trough>` for a mined winner |
+| `template_name` | str | One of the 9 static template names, `pattern_<feature>_<lookback>_<peak\|trough>` for a mined winner, or `<selection_key>__<weighting_key>` / `<entry_key>__<exit_key>` for an aspect-composed hybrid winner (see `composite_spec` below) |
 | `params` | dict | The winning grid-search combination (keys depend on `template_name` — see each template's `param_grid` in `../../common/allocation_templates.py`) |
 | `explanation` | str | `explain_weights()`'s full text |
 | `sharpe_ratio`, `cagr`, `max_drawdown`, `calmar_ratio`, `win_rate` | float | From the shared backtest result dict |
@@ -328,6 +364,7 @@ feature menu** shapes documented in `../../common/README.md` (§1–6) — see t
 | `factor_tiebreak_used` | bool | Whether `--factor-report` actually changed the winner (see "consuming a factor report" above) |
 | `pattern_spec` | dict or `null` | **Only non-null when `template_name` starts with `pattern_`** — the fields needed to reconstruct the exact `PatternBasedAllocationTemplate` instance: `feature_name` (str), `feature_lookback` (int or 3-int list, e.g. `[12, 26, 9]` for `macd_hist`), `threshold` (float), `comparison` (`"below"`/`"above"`), `event_type` (`"trough"`/`"peak"`), `mined_p_value` (float), `mined_n_events` (int). `backtester/run_backtest.py`'s `_get_template` reads this block to reconstruct the template when present — a hand-edited `strategy.json` naming a `pattern_*` template WITHOUT this block cannot be re-run. |
 | `research_strategy_spec` | dict or `null` | **Only non-null when the winning template came from `--research-strategy`** (never both this and `pattern_spec` at once — a winning template only ever came from one source) — the fields needed to reconstruct the exact `research_strategy` instance: `strategy_key` (str, the `strategies_config.json` key, e.g. `"baa_keller"`) and `entry_data` (dict, that key's full `strategies_config.json` entry, unmodified). Reconstruct via `research_strategy.rs.strategy.instantiate_strategy_from_config_entry(strategy_key, entry_data)` — the same function `run_strategygen.py` itself calls to build the candidate in the first place. |
+| `composite_spec` | dict or `null` | **Only non-null when the winner came from aspect composition** (see "Optional: aspect composition" above; mutually exclusive with every other `*_spec` field) — always has `track` (`"allocation"` or `"timing"`) plus exactly 2 more fields: `selection_key`/`weighting_key` (str, e.g. `"momentum_topn"`/`"inverse_vol"`, looked up in `common/strategy_aspects.py`'s `SELECTION_ASPECTS`/`WEIGHTING_ASPECTS`) for `track: "allocation"`, or `entry_key`/`exit_key` (str, e.g. `"rsi_oversold_entry"`/`"rsi_cross_exit"`, looked up in `research_strategy/rs/timing_aspects.py`'s `ENTRY_SIGNAL_ASPECTS`/`EXIT_RISK_ASPECTS`) for `track: "timing"`. `backtester/run_backtest.py`'s `_get_template` reads this block to reconstruct the exact `CompositeAllocationTemplate`/`CompositeTimingTemplate` instance, using this file's own top-level `params` as the reconstructed composite's `default_params`. |
 
 ### `GeneratedStrategySpec` (in-memory dataclass, `stratgen/generator.py`)
 
@@ -358,7 +395,7 @@ schema (`run_context`/`status`/`findings`) and the underlying mining DataFrames
 ## Testing
 
 ```bash
-# from the repo root
+# from inside pipeline/
 uv run pytest strategy_generator/tests -v
 ```
 

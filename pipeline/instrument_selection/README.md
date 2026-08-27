@@ -701,7 +701,7 @@ QQQ, IWM, DIA, EFA, EEM, GLD, SLV, USO, TLT, IEF, XLE, XLF, XLK, XLV, XLU) if no
 ### Sample commands (real market data)
 
 ```bash
-# Default broad-ETF universe, default date range (run from the repo root)
+# Default broad-ETF universe, default date range (run from inside pipeline/)
 uv run python instrument_selection/run_screener.py
 
 # Explicit universe + benchmark + custom date range
@@ -806,7 +806,7 @@ other three projects via `--universe-file` (it accepts a bare list, or a dict wi
 ## Testing
 
 ```bash
-# from the repo root
+# from inside pipeline/
 uv run pytest instrument_selection/tests -v
 ```
 

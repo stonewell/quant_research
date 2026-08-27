@@ -22,12 +22,47 @@ reads this block, when present, to reconstruct the exact strategy instance via
 `research_strategy.rs.strategy.instantiate_strategy_from_config_entry(strategy_key, entry_data)` —
 this works uniformly for both `type: "class"` and `type: "natural_language"` entries, and for
 BOTH `--mode standard` and `--mode walkforward` (the reconstructed instance's `warmup_bars()` is
-honored during walk-forward fold buffering exactly like any other template's). `pattern_spec` and
-`research_strategy_spec` are mutually exclusive — a winning strategy.json only ever carries one of
-the two (or neither, for a plain static template). `_load_strategy_file()` enforces this: a
-`strategy.json` with BOTH blocks non-`null` raises a `ValueError` naming both fields, rather than
-silently letting `_get_template()`'s research_strategy_spec-checked-first precedence quietly ignore
-`pattern_spec`.
+honored during walk-forward fold buffering exactly like any other template's).
+
+Also supported: a `composite_spec` block (dict or `null`, default `null`), present when
+`strategy_generator`'s aspect composition (`--no-compose-aspects` to disable; ON by default — see
+`../pipeline/strategy_generator/README.md`) won with a HYBRID pairing across two different source
+templates instead of a single whole one. Always has a `track` field, `"allocation"` or `"timing"`,
+plus exactly 2 more fields depending on which:
+- `track: "allocation"` (basket templates, `common/strategy_aspects.py`): `selection_key` (str,
+  e.g. `"momentum_topn"`) + `weighting_key` (str, e.g. `"inverse_vol"`) — looked up in
+  `SELECTION_ASPECTS`/`WEIGHTING_ASPECTS` to build a `CompositeAllocationTemplate`.
+- `track: "timing"` (single-asset templates, `../pipeline/research_strategy/rs/timing_aspects.py`):
+  `entry_key` (str, e.g. `"rsi_oversold_entry"`) + `exit_key` (str, e.g. `"rsi_cross_exit"`) —
+  looked up in `ENTRY_SIGNAL_ASPECTS`/`EXIT_RISK_ASPECTS` to build a `CompositeTimingTemplate`.
+
+`_get_template()` also passes the strategy.json's own top-level `params` through as the
+reconstructed composite's `default_params`, so `--optimize`'s fresh grid search falls back to the
+actually-tuned values instead of each aspect's own generic hardcoded defaults. `_load_strategy_file()`
+validates `track` is one of the two allowed values and that the matching pair of keys is present,
+raising a `ValueError` naming the missing key(s) otherwise.
+
+Also supported: a `fundamental_spec` block (dict or `null`, default `null`) — a trivial marker,
+always exactly `{"source": "fundamental_screener"}`, present when the strategy file was produced by
+the separate `fundamental_screener` project (see `../pipeline/fundamental_screener/README.md`)
+instead of `strategy_generator`. `_get_template()` uses its mere presence to reconstruct a
+zero-arg `FundamentalMarginOfSafetyStrategy`, with all actual behavior coming from the strategy
+file's own top-level `params` (already loaded regardless) — the marker only identifies the origin
+and triggers the right import.
+
+Also supported: a `bnn_spec` block (dict or `null`, default `null`) — same trivial-marker shape as
+`fundamental_spec`, always exactly `{"source": "bnn_forecaster"}`, present when the strategy file
+was produced by the separate `bnn_forecaster` project (see `../ml/bnn_forecaster/README.md`).
+Reconstructing a `bnn_spec` strategy REQUIRES running `backtester` with `bnn_forecaster`'s own
+isolated `uv` environment (its `autobnn`/`jax` dependency chain is not installed in `pipeline`'s
+venv) — e.g. `ml/bnn_forecaster/.venv/Scripts/python.exe backtester/run_backtest.py --strategy-file
+ml/bnn_forecaster/results/bnn_strategy.json ...` from the repo root.
+
+`pattern_spec`, `research_strategy_spec`, `composite_spec`, `fundamental_spec`, and `bnn_spec` are
+ALL mutually exclusive — a winning strategy.json only ever carries one of the five (or none, for a
+plain static template). `_load_strategy_file()` enforces this: a `strategy.json` with more than one
+of these blocks non-`null` raises a `ValueError` naming the conflict, rather than silently letting
+`_get_template()`'s fixed check order quietly ignore all but one.
 
 ## Outputs
 
