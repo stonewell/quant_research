@@ -2,11 +2,11 @@
 this workspace's `research_strategy` and `strategy_generator` projects.
 
 This is the ONE canonical taxonomy both projects reference when tagging
-their own strategies/templates (`research_strategy/strategies_config.json`'s
+their own strategies/templates (`pipeline/research_strategy/strategies_config.json`'s
 `"factors"` key; `common/allocation_templates.py`'s `factor_tags` field) --
 having a single shared vocabulary is what makes `research_strategy`'s
 factor-summary output and `strategy_generator`'s `--factor-report` consumer
-(see `strategy_generator/stratgen/generator.py`) mean the same thing by a
+(see `pipeline/strategy_generator/stratgen/generator.py`) mean the same thing by a
 given tag, rather than drifting into inconsistent spellings independently.
 """
 

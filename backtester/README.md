@@ -66,88 +66,88 @@ all of them raises `ValueError("No universe symbols provided or resolved...")`.
 ```bash
 # Standard mode: full-history evaluation of a generated strategy on a new basket (run from the repo root)
 uv run python backtester/run_backtest.py \
-  --strategy-file strategy_generator/results/strategy.json \
+  --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY QQQ AAPL --mode standard
 
 # Explicit date range and bar interval
 uv run python backtester/run_backtest.py \
-  --strategy-file strategy_generator/results/strategy.json \
+  --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY QQQ AAPL MSFT NVDA --start 2018-01-01 --end 2024-12-31 --interval 1d
 
 # Universe loaded from a file (e.g. a basket produced by instrument_selection)
 uv run python backtester/run_backtest.py \
-  --strategy-file strategy_generator/results/strategy.json \
-  --universe-file instrument_selection/results/basket.json --mode standard
+  --strategy-file pipeline/strategy_generator/results/strategy.json \
+  --universe-file pipeline/instrument_selection/results/basket.json --mode standard
 
 # Walkforward mode: rolling-fold consistency check with the default 1y window / 0.5y step
 uv run python backtester/run_backtest.py \
-  --strategy-file strategy_generator/results/strategy.json \
+  --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY QQQ AAPL GLD TLT --mode walkforward
 
 # Walkforward mode with custom window/step sizes
 uv run python backtester/run_backtest.py \
-  --strategy-file strategy_generator/results/strategy.json \
+  --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY QQQ AAPL GLD TLT --mode walkforward --window-years 2 --step-years 1
 
 # Custom trading-cost assumptions and starting capital
 uv run python backtester/run_backtest.py \
-  --strategy-file strategy_generator/results/strategy.json \
+  --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY QQQ AAPL --initial-capital 250000 --commission-pct 0.001 --slippage-pct 0.001
 
 # Re-running a mined pattern-based strategy (strategy.json with a pattern_spec block) on a new basket
 uv run python backtester/run_backtest.py \
-  --strategy-file strategy_generator/results/strategy.json \
+  --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY QQQ AAPL MSFT NVDA GLD TLT IEF --mode standard
 
 # Re-running a research_strategy-sourced strategy (strategy.json with a research_strategy_spec
 # block -- a research_strategy strategy that won strategy_generator's search) on a new basket;
 # works identically in both --mode standard and --mode walkforward
 uv run python backtester/run_backtest.py \
-  --strategy-file strategy_generator/results/strategy.json \
+  --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY TLT BIL GLD --mode standard
 uv run python backtester/run_backtest.py \
-  --strategy-file strategy_generator/results/strategy.json \
+  --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY TLT BIL GLD --mode walkforward
 
 # Custom results/cache directories, no local caching of the fetched data
 uv run python backtester/run_backtest.py \
-  --strategy-file strategy_generator/results/strategy.json \
+  --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY QQQ TLT GLD --no-cache \
   --results-dir /tmp/backtest_results --cache-dir /tmp/backtest_cache
 
 # CSV-folder provider (offline real data you already downloaded)
 uv run python backtester/run_backtest.py \
-  --strategy-file strategy_generator/results/strategy.json \
+  --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY QQQ TLT GLD --data-provider csv --data-dir /path/to/ohlcv_csvs
 
 # Offline/synthetic data only (no network calls) -- this workspace's standing testing convention
 uv run python backtester/run_backtest.py \
-  --strategy-file strategy_generator/results/strategy.json \
+  --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe A B C --data-provider synthetic
 
 # Standard mode with a baseline symbol comparison (synthetic data -- no network calls)
 uv run python backtester/run_backtest.py \
-  --strategy-file strategy_generator/results/strategy.json \
+  --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe A B C --data-provider synthetic \
   --baseline-symbol SPY --baseline-template equal_weight
 
 # Walkforward mode with a baseline comparison and custom baseline params (synthetic data)
 uv run python backtester/run_backtest.py \
-  --strategy-file strategy_generator/results/strategy.json \
+  --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe A B C --data-provider synthetic --mode walkforward \
   --baseline-symbol SPY --baseline-params '{"rebalance_freq_days": 21}'
 
 # --optimize: re-tune the loaded strategy's params on this universe/mode and
 # ERS-validate the winner before running the final backtest (synthetic data)
 uv run python backtester/run_backtest.py \
-  --strategy-file strategy_generator/results/strategy.json \
+  --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe A B C --data-provider synthetic --mode standard \
   --optimize --n-random-search 200 --ers-percentile-threshold 0.90
 
 # --optimize under --mode walkforward: each candidate is scored by its MEAN
 # fold Sharpe across the same rolling windows walkforward would report
 uv run python backtester/run_backtest.py \
-  --strategy-file strategy_generator/results/strategy.json \
+  --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe A B C --data-provider synthetic --mode walkforward \
   --optimize --n-random-search 100 --ers-percentile-threshold 0.90 --min-rebalances-for-trust 4
 ```

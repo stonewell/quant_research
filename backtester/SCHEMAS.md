@@ -7,16 +7,16 @@ backtest result dict** shapes documented in `../common/README.md` (§1–4) — 
 
 ## Input: `--strategy-file` (a `strategy.json`)
 
-Schema owned and documented by `strategy_generator` — see `../strategy_generator/README.md`'s "Data
+Schema owned and documented by `strategy_generator` — see `../pipeline/strategy_generator/README.md`'s "Data
 Shapes & Schemas" section for the full field list, including the `pattern_spec` block this
 project's `_get_template()` reads to reconstruct a mined `PatternBasedAllocationTemplate` when
 `template_name` starts with `pattern_`. Only `template_name` and `params` are strictly required;
 everything else is read via `.get()`.
 
 Also supported: a `research_strategy_spec` block (dict or `null`, default `null`), present when a
-`research_strategy` strategy (one of the 17 implementations in `../research_strategy/rs/strategy.py`)
+`research_strategy` strategy (one of the 17 implementations in `../pipeline/research_strategy/rs/strategy.py`)
 won `strategy_generator`'s search instead of a static/mined template. Exactly 2 fields: `strategy_key`
-(str, a key from `research_strategy/strategies_config.json`, e.g. `"permanent_portfolio"`) and
+(str, a key from `pipeline/research_strategy/strategies_config.json`, e.g. `"permanent_portfolio"`) and
 `entry_data` (dict, the exact raw `strategies_config.json[strategy_key]` entry). `_get_template()`
 reads this block, when present, to reconstruct the exact strategy instance via
 `research_strategy.rs.strategy.instantiate_strategy_from_config_entry(strategy_key, entry_data)` —

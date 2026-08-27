@@ -1,5 +1,5 @@
 """Named indicator "features" (indicator name + lookback) shared by
-`pattern_mining/pmine/pattern_mining.py`'s turning-point pattern mining and
+`pipeline/pattern_mining/pmine/pattern_mining.py`'s turning-point pattern mining and
 `common.allocation_templates.PatternBasedAllocationTemplate`'s live trading
 signal.
 
@@ -8,12 +8,12 @@ mined pattern's threshold is tested during mining, and later evaluated
 during live trading, against the IDENTICAL computation -- there must be no
 drift between "what was found significant" and "what the strategy actually
 trades on". This is a shared module specifically so `common/`
-(project-agnostic) and `pattern_mining/` (the mining orchestrator) both
+(project-agnostic) and `pipeline/pattern_mining/` (the mining orchestrator) both
 import one definition rather than keeping two that could diverge.
 
 Never used by any of the 9 static `AllocationTemplate` classes -- those use
 a small, fixed primitive set directly (see
-`strategy_generator/stratgen/indicators.py`'s own docstring on why that set
+`pipeline/strategy_generator/stratgen/indicators.py`'s own docstring on why that set
 is deliberately restricted, per Allen & Karjalainen 1999). This module's
 broader "popular indicators" menu is a disclosed exception used only for
 pattern mining, which guards against data-snooping a different way (a

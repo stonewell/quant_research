@@ -10,7 +10,7 @@ Modes:
                to measure consistency (no re-optimization).
 
 Example:
-    python run_backtest.py --strategy-file ../strategy_generator/results/strategy.json --universe SPY QQQ AAPL --mode standard
+    python run_backtest.py --strategy-file ../pipeline/strategy_generator/results/strategy.json --universe SPY QQQ AAPL --mode standard
 """
 
 import argparse
@@ -25,6 +25,13 @@ import pandas as pd
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
+# research_strategy and fundamental_screener live under pipeline/,
+# bnn_forecaster under ml/ -- add both group directories so those projects' bare
+# `import research_strategy...`-style modules keep resolving unchanged.
+for _group in ("pipeline", "ml"):
+    _group_dir = os.path.join(_PROJECT_ROOT, _group)
+    if _group_dir not in sys.path:
+        sys.path.insert(0, _group_dir)
 
 from common.allocation_backtester import run_allocation_backtest
 from common.allocation_search import optimize_template
@@ -102,7 +109,7 @@ def _get_template(template_name: str, pattern_spec: dict = None, research_strate
     `bnn_spec` is given (all five are mutually exclusive -- a winning
     strategy.json only ever came from one source).
 
-    `pattern_spec`: a PatternBasedAllocationTemplate (pattern_mining/
+    `pattern_spec`: a PatternBasedAllocationTemplate (pipeline/pattern_mining/
     pmine/pattern_mining.py) is universe-specific and not zero-arg
     constructible, so it's never in the static ALLOCATION_TEMPLATES registry;
     a strategy.json produced from a winning mined pattern carries its own
@@ -118,7 +125,7 @@ def _get_template(template_name: str, pattern_spec: dict = None, research_strate
     ALLOCATION_TEMPLATES registry.
 
     `composite_spec`: a strategy.json produced from a winning aspect-composed
-    hybrid (see strategy_generator/stratgen/generator.py's
+    hybrid (see pipeline/strategy_generator/stratgen/generator.py's
     GeneratorConfig.enable_aspect_composition) carries its own
     `composite_spec` (`track` plus either `selection_key`/`weighting_key` or
     `entry_key`/`exit_key`) so the exact CompositeAllocationTemplate/
@@ -133,7 +140,7 @@ def _get_template(template_name: str, pattern_spec: dict = None, research_strate
 
     `fundamental_spec`: a strategy.json produced by the separate
     `fundamental_screener` project (real ROE/dividend/earnings-growth/
-    leverage buy-sell screening, see `fundamental_screener/README.md`)
+    leverage buy-sell screening, see `pipeline/fundamental_screener/README.md`)
     carries a trivial `fundamental_spec` marker (`{"source":
     "fundamental_screener"}`) so its `FundamentalMarginOfSafetyStrategy`
     can be reconstructed here -- it's zero-arg constructible, with every
@@ -144,7 +151,7 @@ def _get_template(template_name: str, pattern_spec: dict = None, research_strate
 
     `bnn_spec`: a strategy.json produced by the separate `bnn_forecaster`
     project (AutoBNN probabilistic price forecasting, see
-    `bnn_forecaster/README.md`) carries a trivial `bnn_spec` marker
+    `ml/bnn_forecaster/README.md`) carries a trivial `bnn_spec` marker
     (`{"source": "bnn_forecaster"}`) so its `BnnForecastStrategy` can be
     reconstructed here -- same zero-arg/params-driven shape as
     `fundamental_spec` above. Reconstructing this template requires

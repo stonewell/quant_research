@@ -1,6 +1,6 @@
 """Shared grid-search + Equivalent Random Search (ERS) validation primitives.
 
-Originally lived only inside `strategy_generator/stratgen/generator.py`,
+Originally lived only inside `pipeline/strategy_generator/stratgen/generator.py`,
 entangled with that project's multi-template comparison/factor-tiebreak
 logic. This module extracts the genuinely template-agnostic pieces so
 `backtester` can tune a SINGLE, already-chosen template's parameters (its
@@ -217,7 +217,7 @@ def optimize_template(universe: dict, template, score_fn: ScoreFn, *,
     then `run_ers_validation` on its winner). For a MULTI-template search, do
     NOT call this once per template -- call `grid_search_template` per
     template yourself, reduce to one winner, then call `run_ers_validation`
-    ONCE on that winner (see `strategy_generator/stratgen/generator.py`'s
+    ONCE on that winner (see `pipeline/strategy_generator/stratgen/generator.py`'s
     `_search_allocation`).
 
     Returns `{"best_params", "best_result", "best_score", "ers_percentile",

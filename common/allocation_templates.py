@@ -193,7 +193,7 @@ def build_aggregate_curve(universe: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     simplification used to approximate a basket's own OHLC from constituent
     OHLC when true simultaneous-quote data isn't available. Used by
     `PatternBasedAllocationTemplate` below and by
-    `pattern_mining/pmine/pattern_mining.py`'s turning-point mining,
+    `pipeline/pattern_mining/pmine/pattern_mining.py`'s turning-point mining,
     which both need ONE aggregate curve to detect turning points/compute
     indicators on, not a per-symbol one.
     """
@@ -780,9 +780,9 @@ ALLOCATION_TEMPLATES = [
 # descriptions (e.g. "regime_trend_strength" names ADX explicitly; "mean_reversion"
 # names RSI explicitly), not invented here. Used by PatternBasedAllocationTemplate
 # below so a mined template's factor_tags reflect WHICH INDICATOR was mined, not just
-# which direction (peak/trough) it trades -- see pattern_mining/pmine/pattern_mining.py
+# which direction (peak/trough) it trades -- see pipeline/pattern_mining/pmine/pattern_mining.py
 # and root README's pipeline docs for why this is what lets a mined pattern's
-# strategy_generator/stratgen/generator.py factor tie-break genuinely compare it
+# pipeline/strategy_generator/stratgen/generator.py factor tie-break genuinely compare it
 # against research_strategy's trend/factor evidence for the RIGHT reference class.
 _FEATURE_FACTOR_TAGS = {
     "rsi": "mean_reversion",
@@ -800,7 +800,7 @@ _FEATURE_FACTOR_TAGS = {
 
 class PatternBasedAllocationTemplate(AllocationTemplate):
     """A trading signal built from ONE indicator pattern discovered by the
-    `pattern_mining` stage's (`pattern_mining/pmine/pattern_mining.py`)
+    `pattern_mining` stage's (`pipeline/pattern_mining/pmine/pattern_mining.py`)
     turning-point pattern mining -- deliberately NOT in `ALLOCATION_TEMPLATES`
     above, unlike the 9 static templates. Those are universe-agnostic formulas,
     zero-arg constructible, searched for every basket; this template's own
@@ -811,7 +811,7 @@ class PatternBasedAllocationTemplate(AllocationTemplate):
     extra_templates=[...])`, competing through the exact same grid-search +
     Equivalent Random Search validation as every static template.
 
-    HONEST CAVEAT (read `pattern_mining/pmine/pattern_mining.py`'s module
+    HONEST CAVEAT (read `pipeline/pattern_mining/pmine/pattern_mining.py`'s module
     docstring for the full version): the mining pass that discovered this
     template's threshold needed a few bars of hindsight to LABEL a
     historical date a "turning point" at all (zigzag confirmation lag) --
@@ -912,7 +912,7 @@ class PatternBasedAllocationTemplate(AllocationTemplate):
             f"rebalances every {rebal} trading days. Mined from this basket's own aggregate-portfolio "
             f"turning-point history via a Bonferroni-corrected shuffle-null significance test "
             f"({p_str}, n_events={self.mined_n_events}) -- see "
-            f"pattern_mining/pmine/pattern_mining.py. {action.capitalize()} (equal-weight across "
+            f"pipeline/pattern_mining/pmine/pattern_mining.py. {action.capitalize()} (equal-weight across "
             f"the basket) for {hold_days} trading days whenever the {self.feature_name} reading "
             f"{self.comparison} {effective_threshold:.4g} (mined threshold x {threshold_mult}). HONEST "
             f"CAVEAT: the mining pass needed a few bars of hindsight to LABEL a historical date a turning "
@@ -920,7 +920,7 @@ class PatternBasedAllocationTemplate(AllocationTemplate):
             f"it only compares today's already-known reading against the mined threshold. Passed this "
             f"workspace's standard Equivalent Random Search validation like every other template; a "
             f"significant reading during mining reflects mechanism, not a guaranteed real edge -- see "
-            f"pattern_mining/README.md."
+            f"pipeline/pattern_mining/README.md."
         )
 
     def warmup_bars(self, params: dict) -> int:

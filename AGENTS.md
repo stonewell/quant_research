@@ -7,23 +7,42 @@ reference. Read `README.md` first for the end-to-end pipeline picture and data-f
 
 ## What this repo is
 
-A modular, six-component quantitative trading research/backtesting workspace: `research_strategy`
-(factor research) -> `instrument_selection` (universe screening) -> `pattern_mining` (optional
-turning-point mining) -> `strategy_generator` (allocation strategy search) -> `backtester`
-(standalone evaluation), all built on shared infrastructure in `common/`. `run_pipeline.py` chains
-all 5 stages via subprocess. See `README.md`'s "Workspace Architecture & Data Flow" section for the
-diagram and each stage's I/O schema.
+A modular quantitative trading research/backtesting workspace, organized into two project groups
+plus shared infrastructure at the repo root:
+- **`pipeline/`** -- the core research/backtest pipeline family, all sharing one `uv` environment:
+  `research_strategy` (factor research) -> `instrument_selection` (universe screening) ->
+  `pattern_mining` (optional turning-point mining) -> `strategy_generator` (allocation strategy
+  search), plus `fundamental_screener` (real-fundamentals buy/sell screening, not wired into the
+  pipeline). `pipeline/run_pipeline.py` chains the first 4 stages plus `backtester` via subprocess.
+- **`ml/`** -- ML/DL-based strategy projects, each with its OWN isolated `uv` environment (heavier,
+  version-sensitive dependency stacks that would conflict with `pipeline/`'s): currently
+  `bnn_forecaster` (AutoBNN probabilistic forecasting).
+- `common/` and `backtester/` stay at the repo root, shared by both groups, with **no
+  `pyproject.toml`/venv of their own** -- reached via `sys.path` injection from whichever group's
+  venv is running them (see below).
+
+See `README.md`'s "Workspace Architecture & Data Flow" section for the diagram and each stage's I/O
+schema.
 
 ## Setup & running things
 
 ```bash
-uv sync                                    # one shared env for the whole workspace
-uv run python <project>/run_*.py --help    # every project's CLI
+cd pipeline && uv sync                             # pipeline/'s shared env (research_strategy,
+                                                    # instrument_selection, pattern_mining,
+                                                    # strategy_generator, fundamental_screener)
+cd ml/bnn_forecaster && uv sync                    # bnn_forecaster's own isolated env
+
+# from inside pipeline/ (or via pipeline/.venv/Scripts/python.exe from anywhere):
+uv run python <project>/run_*.py --help            # every pipeline project's CLI
 uv run python run_pipeline.py --data-provider synthetic --universe SPY QQQ ...
 ```
 
-On Windows, the venv's interpreter is at `.venv/Scripts/python.exe` if `uv run` isn't available in
-the current shell.
+`common/` and `backtester/` have no venv of their own -- run them with WHICHEVER group's venv is
+appropriate for the strategy you're touching. Both groups' venvs can run `common`'s and
+`backtester`'s own full test suites (verified directly, not just assumed).
+
+On Windows, a venv's interpreter is at `<group>/.venv/Scripts/python.exe` if `uv run` isn't
+available in the current shell.
 
 ## Testing policy -- read before running or writing tests
 
@@ -31,15 +50,16 @@ the current shell.
   runs 100% offline via `SyntheticDataProvider`/`common/testing.py`'s synthetic OHLCV generators.
   Default any CLI example you write to `--data-provider synthetic`; only use `yfinance` when a human
   explicitly asks for a real-data run.
-- Each project has its own `tests/` directory (`common/tests`, `research_strategy/tests`,
-  `instrument_selection/tests`, `pattern_mining/tests`, `strategy_generator/tests`,
-  `backtester/tests`, root `tests/`). None has an `__init__.py`, and several projects share
-  identically-named test files (`test_allocation_templates.py`, `test_indicators.py`, ...), so a
-  bare `pytest` from the repo root -- or `pytest` given more than one of these directories at
+- Each project has its own `tests/` directory (`common/tests`, `pipeline/research_strategy/tests`,
+  `pipeline/instrument_selection/tests`, `pipeline/pattern_mining/tests`,
+  `pipeline/strategy_generator/tests`, `pipeline/fundamental_screener/tests`, `pipeline/tests`,
+  `backtester/tests`, `ml/bnn_forecaster/tests`). None has an `__init__.py`, and several projects
+  share identically-named test files (`test_allocation_templates.py`, `test_indicators.py`, ...), so
+  a bare `pytest` from the repo root -- or `pytest` given more than one of these directories at
   once -- fails with `import file mismatch`. Two ways around this:
   - Run one directory at a time (what the per-project READMEs show): `pytest common/tests -q`.
   - Or pass `--import-mode=importlib` to run several/all directories together in one invocation:
-    `pytest common/tests strategy_generator/tests backtester ... -q --import-mode=importlib`.
+    `pytest common/tests pipeline/strategy_generator/tests backtester ... -q --import-mode=importlib`.
 
 ## Core domain model -- must-know before touching template/strategy code
 
@@ -47,7 +67,8 @@ the current shell.
   implementing `generate_weights(universe, params) -> DataFrame`, `explain_weights(params) -> str`,
   and `warmup_bars(params) -> int`. Two families implement this interface: the 9 static, zero-arg
   templates in `common/allocation_templates.py`, and the 18 richer, `StrategyConfig`-driven
-  templates (basket presets + single-asset timing strategies) in `research_strategy/rs/strategy.py`.
+  templates (basket presets + single-asset timing strategies) in
+  `pipeline/research_strategy/rs/strategy.py`.
 
 - **Sparse weights contract (critical):** `generate_weights` returns a DataFrame indexed by date
   where a row is `NaN` on every day EXCEPT an actual rebalance date, where it holds the real target
@@ -76,7 +97,7 @@ the current shell.
   override a template that clearly won on backtested Sharpe.
 
 - **Aspect composition** (added recently -- `common/strategy_aspects.py` for basket templates,
-  `research_strategy/rs/timing_aspects.py` for single-asset timing templates): `strategy_generator`
+  `pipeline/research_strategy/rs/timing_aspects.py` for single-asset timing templates): `strategy_generator`
   no longer just picks the single best whole template. It decomposes several templates into
   reusable pieces -- *selection* (which symbols/how much to invest) + *weighting* (how to size
   across them) for the 9 static templates; *entry signal* + *exit/risk/sizing* for 4 of the 18

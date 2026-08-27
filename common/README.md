@@ -59,8 +59,8 @@ Two coexisting, both-correct conventions for how a template represents "insuffic
 - **Rank-based templates** (momentum, mean-reversion, breadth-gated) initialize the row to all-`0.0` (an explicit, deliberate all-cash rebalance instruction).
 - **Covariance-based templates** (HRP, minimum-variance, max-diversification) leave the row as `NaN` (not a rebalance at all — the backtester drifts the previous weights forward).
 
-CSV exports of this shape (e.g. `research_strategy/results/<strategy>_weights.csv`,
-`strategy_generator/results/strategygen_allocation_weights.csv`,
+CSV exports of this shape (e.g. `pipeline/research_strategy/results/<strategy>_weights.csv`,
+`pipeline/strategy_generator/results/strategygen_allocation_weights.csv`,
 `backtester/results/backtest_weights.csv`) apply `.ffill().fillna(0.0)` before writing — i.e. the
 saved CSV is the DENSE, forward-filled daily weight series, not the sparse in-memory contract above.
 
@@ -89,8 +89,8 @@ should check `result["equity_curve"].empty` before relying on the other keys).
 (`AllocationTemplate.factor_tags`, a `List[str]` field) use to tag which quantitative factor(s) a
 strategy/template conditions on. Valid tags: `absolute_momentum_trend`, `relative_momentum`,
 `volatility_targeting`, `mean_reversion`, `breadth`, `correlation_diversification`,
-`regime_trend_strength`, `static_fixed_weight`. See `research_strategy/README.md`'s "Factor
-Tagging" section and `strategy_generator/README.md`'s "consuming a research_strategy factor report"
+`regime_trend_strength`, `static_fixed_weight`. See `pipeline/research_strategy/README.md`'s "Factor
+Tagging" section and `pipeline/strategy_generator/README.md`'s "consuming a research_strategy factor report"
 section for how this vocabulary is actually used (the mechanism, not the schema, lives there).
 
 ## 6. Indicator feature menu (`name`, `lookback`) pairs
@@ -98,7 +98,7 @@ section for how this vocabulary is actually used (the mechanism, not the schema,
 `common/indicator_features.py`'s `DEFAULT_FEATURE_MENU: List[Tuple[str, int | Tuple[int,int,int]]]`
 — e.g. `("rsi", 14)`, `("macd_hist", (12, 26, 9))`. `feature_label(name, lookback) -> str` turns a
 pair into a column-safe label (e.g. `"rsi_14"`, `"macd_hist_12_26_9"`); `compute_feature(curve,
-name, lookback) -> pd.Series` computes it. Used by `pattern_mining/pmine/pattern_mining.py`'s
+name, lookback) -> pd.Series` computes it. Used by `pipeline/pattern_mining/pmine/pattern_mining.py`'s
 feature table (see that project's README) and by `common.allocation_templates.PatternBasedAllocationTemplate`
 — the SAME dispatch backs both, deliberately, so a mined threshold is tested and later traded
 against an identical computation.
@@ -106,7 +106,7 @@ against an identical computation.
 ## 7. Grid-search + Equivalent Random Search (ERS) validation (`allocation_search.py`)
 
 Shared template-agnostic search/validation primitives, extracted from
-`strategy_generator/stratgen/generator.py` so `backtester`'s `--optimize` flag can tune a SINGLE,
+`pipeline/strategy_generator/stratgen/generator.py` so `backtester`'s `--optimize` flag can tune a SINGLE,
 already-chosen template's parameters using the exact same validated mechanism instead of a second,
 independently-maintained copy. Used by both `strategy_generator`'s multi-template search (one
 `grid_search_template` call per candidate template, `run_ers_validation` once on the overall
@@ -142,7 +142,7 @@ filename="equity_curve.png") -> str` — single-line equity chart (or two lines 
 given, e.g. a buy-and-hold benchmark plotted alongside the strategy). `equity`/`baseline` are plain
 `pd.Series` (date index -> portfolio value) — pass `result["equity_curve"]["equity"]` (§4), not the
 raw `run_allocation_backtest()` dict. Saves under `results_dir` (created if missing) and returns the
-saved absolute path. Used by `backtester/run_backtest.py` and `strategy_generator/run_strategygen.py`
+saved absolute path. Used by `backtester/run_backtest.py` and `pipeline/strategy_generator/run_strategygen.py`
 to produce the equity-curve chart that accompanies each run's report, so chart styling/behavior
 stays identical across both instead of being reimplemented per project.
 

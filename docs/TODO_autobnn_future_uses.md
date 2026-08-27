@@ -2,7 +2,7 @@
 
 **Status: parked for later revisit. Nothing here is implemented, and this file is deliberately not
 linked from any README or referenced by any code.** The only AutoBNN integration actually shipped
-is the standalone `bnn_forecaster/` project (see its own README). This file captures a broader
+is the standalone `ml/bnn_forecaster/` project (see its own README). This file captures a broader
 analysis of where else AutoBNN's capability (a compositional Bayesian Neural Network producing a
 calibrated median + confidence-interval forecast per time series, via `predict_quantiles`) could
 plausibly apply elsewhere in this workspace, for whenever that's worth picking up.

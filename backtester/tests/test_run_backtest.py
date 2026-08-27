@@ -11,6 +11,10 @@ import pytest
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
+for _group in ("pipeline", "ml"):
+    _group_dir = os.path.join(_PROJECT_ROOT, _group)
+    if _group_dir not in sys.path:
+        sys.path.insert(0, _group_dir)
 
 import common.cli_utils
 from common.data import BaseDataProvider, register_provider
@@ -60,7 +64,7 @@ def test_get_template():
 
 
 def test_get_template_reconstructs_pattern_based_template_from_spec():
-    # A PatternBasedAllocationTemplate (strategy_generator/stratgen/
+    # A PatternBasedAllocationTemplate (pipeline/strategy_generator/stratgen/
     # pattern_mining.py) is universe-specific and never in the static
     # ALLOCATION_TEMPLATES registry -- it must be reconstructed from a
     # pattern_spec dict instead (see run_strategygen.py's strategy.json output).
@@ -100,7 +104,7 @@ def test_get_template_rejects_pattern_spec_with_non_pattern_prefixed_template_na
 
 
 def _permanent_portfolio_research_strategy_spec():
-    # The exact raw research_strategy/strategies_config.json["permanent_portfolio"]
+    # The exact raw pipeline/research_strategy/strategies_config.json["permanent_portfolio"]
     # entry -- a simple, deterministic, class-based, fixed-weight strategy
     # (25% SPY / 25% TLT / 25% BIL / 25% GLD, annual rebalance) that needs no
     # natural-language parsing and no lookback warmup, making it ideal for a
@@ -153,7 +157,7 @@ def test_get_template_reconstructs_allocation_composite_from_spec():
 
 
 def test_get_template_reconstructs_timing_composite_from_spec():
-    # A composite_spec with track="timing" (research_strategy/rs/timing_aspects.py)
+    # A composite_spec with track="timing" (pipeline/research_strategy/rs/timing_aspects.py)
     # must rebuild the exact CompositeTimingTemplate, with the saved params
     # carried through as its default_params fallback.
     composite_spec = {"track": "timing", "entry_key": "turtle_breakout_entry", "exit_key": "rsi_cross_exit"}

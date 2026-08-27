@@ -1,7 +1,7 @@
 """Shared chart generation: equity-curve line chart, optionally with a
 baseline/comparison series overlaid -- for cross-project reuse by
 `backtester` and `strategy_generator`. Mirrors
-`instrument_selection/selectorbot/plotting.py`'s conventions (Agg backend,
+`pipeline/instrument_selection/selectorbot/plotting.py`'s conventions (Agg backend,
 dpi=130, os.makedirs + savefig + close, returns the saved absolute path),
 but takes an explicit `results_dir` argument since (unlike that module) this
 one is called from multiple projects with different results/ directories

@@ -66,7 +66,7 @@ def format_backtest_metrics_summary(result: dict) -> str:
     """Two-line 'Sharpe/CAGR/MaxDD' + 'Calmar/WinRate/ProfitFactor' summary of
     a `common.allocation_backtester.run_allocation_backtest` result dict --
     the one piece of reporting glue duplicated near-verbatim between
-    `backtester/run_backtest.py` and `research_strategy/run_research_strategy.py`."""
+    `backtester/run_backtest.py` and `pipeline/research_strategy/run_research_strategy.py`."""
     return (
         f"Sharpe Ratio: {result['sharpe_ratio']:.2f} | CAGR: {result['cagr']*100:.2f}% | "
         f"Max Drawdown: {result['max_drawdown']*100:.1f}%\n"
