@@ -1,3 +1,5 @@
+[ English | [简体中文](README_ZH.md) ]
+
 # bnn_forecaster
 
 Probabilistic price forecasting via [AutoBNN](https://research.google/blog/autobnn-probabilistic-time-series-forecasting-with-compositional-bayesian-neural-networks/)

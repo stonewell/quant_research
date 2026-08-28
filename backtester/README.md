@@ -1,3 +1,5 @@
+[ English | [简体中文](README_ZH.md) ]
+
 # `backtester`
 
 Standalone CLI that evaluates a fixed, already-generated allocation strategy (a `strategy.json`

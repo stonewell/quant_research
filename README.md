@@ -1,3 +1,5 @@
+[ English | [简体中文](README_ZH.md) ]
+
 # Quantitative Trading Workspace
 
 A modular, end-to-end quantitative trading research, asset selection, strategy generation, and backtesting framework.

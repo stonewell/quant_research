@@ -1,3 +1,5 @@
+[ English | [简体中文](README_ZH.md) ]
+
 # Researched Quantitative Trading Strategies (`research_strategy`)
 
 A dedicated side project implementing and evaluating seventeen quantitative trading strategies: five tactical asset allocation (TAA) strategies synthesized from academic literature and practitioner research (*Journal of Finance*, *Journal of Portfolio Management*, SSRN, AllocateSmartly), four single-asset timing strategies consolidated into this project from this workspace's former standalone `rsi_strategy`, `swing_trend_strategy`, `grid_trading`, and `ensemble_strategy` side projects, two Donchian channel breakout systems, four modern, actively-followed static/fixed-weight portfolios popular with retail and practitioner communities today (Permanent Portfolio, Golden Butterfly, All Weather, HFEA), and two modern systematic TAA extensions added in a follow-up deep-research pass on "modern, popular, effective" strategies (Protective Asset Allocation, Adaptive Asset Allocation) -- see "Strategy 12-17" below for that pass's findings and disclosed simplifications.

@@ -1,3 +1,5 @@
+[ English | [简体中文](README_ZH.md) ]
+
 # Turning-Point Indicator Pattern Mining (`pattern_mining`)
 
 A dedicated pipeline stage that mines a universe's aggregate portfolio price history for

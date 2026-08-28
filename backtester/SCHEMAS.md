@@ -1,3 +1,5 @@
+[ English | [简体中文](SCHEMAS_ZH.md) ]
+
 # `backtester` — Data Shapes & Schemas
 
 Standalone schema doc, kept separate from `README.md` (which covers setup/usage/CLI arguments) so

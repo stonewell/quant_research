@@ -1,3 +1,5 @@
+[ English | [简体中文](AGENTS_ZH.md) ]
+
 # AGENTS.md
 
 Instructions for any coding agent (Claude Code, Codex, Cursor, etc.) working in this repository.

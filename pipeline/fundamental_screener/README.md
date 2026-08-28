@@ -1,3 +1,5 @@
+[ English | [简体中文](README_ZH.md) ]
+
 # fundamental_screener
 
 Real-fundamentals buy/sell screening adapted from a conservative

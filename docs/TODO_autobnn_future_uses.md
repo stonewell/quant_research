@@ -1,3 +1,5 @@
+[ English | [简体中文](TODO_autobnn_future_uses_ZH.md) ]
+
 # TODO: other potential AutoBNN uses in this workspace
 
 **Status: parked for later revisit. Nothing here is implemented, and this file is deliberately not

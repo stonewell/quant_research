@@ -1,3 +1,5 @@
+[ English | [简体中文](README_ZH.md) ]
+
 # Automated Portfolio Strategy Generator (Basket Asset Allocation)
 
 A tool that GENERATES a concrete, parameterized asset allocation trading strategy for a whole

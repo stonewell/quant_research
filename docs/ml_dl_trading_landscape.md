@@ -1,3 +1,5 @@
+[ English | [简体中文](ml_dl_trading_landscape_ZH.md) ]
+
 # ML/DL trading solutions landscape (beyond AutoBNN) — research summary
 
 **Status: reference/survey doc, not an implementation plan.** Nothing here is wired into any
