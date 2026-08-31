@@ -21,6 +21,7 @@ from common.testing import make_ohlcv_from_closes, make_oscillating_df, make_tre
 from research_strategy.rs.config import StrategyConfig
 from research_strategy.rs.strategy import (
     ChanPivotShiftStrategy,
+    ChanThreeTypeStrategy,
     RSIMeanReversionStrategy,
     SwingTrendPullbackStrategy,
     TurtleBreakoutStrategy,
@@ -32,13 +33,14 @@ from research_strategy.rs.timing_aspects import (
     CompositeTimingTemplate,
     build_composite_timing_candidates,
 )
-from research_strategy.tests.test_strategy import _chan_breakout_closes, _timing_universe, _daily
+from research_strategy.tests.test_strategy import _chan3_breakout_closes, _chan_breakout_closes, _timing_universe, _daily
 
 
 PARITY_CASES = [
     (RSIMeanReversionStrategy, lambda: _timing_universe(make_oscillating_df(n=500, seed=7))),
     (SwingTrendPullbackStrategy, lambda: _timing_universe(make_trending_pullback_df(n=500, seed=7))),
     (ChanPivotShiftStrategy, lambda: _timing_universe(make_ohlcv_from_closes(_chan_breakout_closes()))),
+    (ChanThreeTypeStrategy, lambda: _timing_universe(make_ohlcv_from_closes(_chan3_breakout_closes()))),
     (TurtleBreakoutStrategy, lambda: _timing_universe(make_ohlcv_from_closes(_turtle_breakout_closes()))),
 ]
 

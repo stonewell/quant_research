@@ -126,6 +126,25 @@
     },
     "factors": ["regime_trend_strength", "absolute_momentum_trend"]
   },
+  "chan_three_type": {
+    "name": "Chan Three-Type Buy/Sell Points",
+    "type": "class",
+    "class_name": "ChanThreeTypeStrategy",
+    "description": "Additive extension of chan_pivot_shift: segments (线段), segment-level pivots, real MACD-histogram-area divergence (背驰), and the formal 一/二/三类买卖点 taxonomy; coexists with chan_pivot_shift, does not replace it.",
+    "parameters": {
+      "chan3_symbol": "SPY",
+      "chan3_min_gap_bars": 4,
+      "chan3_min_strokes": 3,
+      "chan3_macd_fast": 12,
+      "chan3_macd_slow": 26,
+      "chan3_macd_signal": 9,
+      "chan3_stop_loss_pct": 0.08,
+      "chan3_max_holding_days": 90,
+      "chan3_position_size_pct": 1.0,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["regime_trend_strength", "absolute_momentum_trend"]
+  },
   "compounder_margin_of_safety": {
     "name": "Compounder Margin of Safety",
     "type": "class",

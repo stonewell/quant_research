@@ -251,6 +251,24 @@ class StrategyConfig:
     chan_max_holding_days: Optional[int] = 90    # None disables
     chan_position_size_pct: float = 1.0
 
+    # --- Chan Three-Type Buy/Sell Points (additive extension of Chan Pivot
+    # Shift above -- see rs/chan_signals.py; NOT a modification of
+    # ChanPivotShiftStrategy or chan_structure.py, which are left untouched).
+    # Builds segments (线段) on top of strokes, segment-level pivots (中枢),
+    # real MACD-histogram-area divergence (背驰, common.indicators.macd), and
+    # the formal 一/二/三类买卖点 taxonomy. Entry/exit is an unconditional OR
+    # of all three buy/sell-point types respectively (no per-type toggle in
+    # this first version). ---
+    chan3_symbol: str = "SPY"
+    chan3_min_gap_bars: int = 4
+    chan3_min_strokes: int = 3
+    chan3_macd_fast: int = 12
+    chan3_macd_slow: int = 26
+    chan3_macd_signal: int = 9
+    chan3_stop_loss_pct: Optional[float] = 0.08   # None disables
+    chan3_max_holding_days: Optional[int] = 90    # None disables
+    chan3_position_size_pct: float = 1.0
+
     # --- Compounder Margin-of-Safety (price-proxy adaptation of a
     # conservative value-investing community's valuation framework, see
     # docs/snowball_strategy.txt) -- holds a candidate "quality compounder"
@@ -305,6 +323,10 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.chan_min_gap_bars must be > 0, got {self.chan_min_gap_bars}")
         if self.chan_min_strokes < 3:
             raise ValueError(f"StrategyConfig.chan_min_strokes must be >= 3, got {self.chan_min_strokes}")
+        if self.chan3_min_gap_bars <= 0:
+            raise ValueError(f"StrategyConfig.chan3_min_gap_bars must be > 0, got {self.chan3_min_gap_bars}")
+        if self.chan3_min_strokes < 3:
+            raise ValueError(f"StrategyConfig.chan3_min_strokes must be >= 3, got {self.chan3_min_strokes}")
 
     @classmethod
     def from_dict(cls, data: dict) -> "StrategyConfig":

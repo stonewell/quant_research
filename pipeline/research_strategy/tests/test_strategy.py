@@ -34,6 +34,7 @@ from research_strategy.rs.strategy import (
     AllWeatherStrategy,
     BoldAssetAllocation,
     ChanPivotShiftStrategy,
+    ChanThreeTypeStrategy,
     CompounderMarginOfSafetyStrategy,
     EnsembleRegimeSwitchingStrategy,
     GoldenButterflyStrategy,
@@ -701,6 +702,120 @@ def test_chan_multi_asset_normalizes_weights_when_multiple_symbols_trigger():
     }
     cfg = StrategyConfig(chan_position_size_pct=1.0)
     strat = ChanPivotShiftStrategy(cfg)
+    weights = strat.generate_weights(universe, params={"symbols": ["SPY", "QQQ"]})
+    daily = _daily(weights)
+
+    assert "SPY" in daily.columns
+    assert "QQQ" in daily.columns
+    assert (daily["SPY"] + daily["QQQ"] <= 1.0 + 1e-9).all()
+    np.testing.assert_allclose(daily["SPY"] + daily["QQQ"] + daily["BIL"], 1.0)
+
+
+# --- ChanThreeTypeStrategy -------------------------------------------------
+# All fixtures below are synthetic-only, per this file's offline testing
+# policy. This is an ADDITIVE extension of ChanPivotShiftStrategy above (see
+# rs/chan_signals.py) -- it shares no test fixtures or code with, and does
+# not modify, that strategy or chan_structure.py.
+
+def _chan3_breakout_closes(tail=None):
+    """Deterministic closes array that produces a single, clean third-type
+    buy point (breakout above a segment-level pivot's band, confirmed by a
+    retest that holds above it) at bar 309 of 329. Found by a randomized
+    search over zigzag turning-point parameters (see the session's scratch
+    verification script) rather than hand-derived -- getting segments/
+    segment-level pivots to cleanly form AND break out from raw OHLC closes
+    is not tractable to hand-derive exactly, so this exact sequence was
+    verified by actually running `compute_chan3_signals` on it. `tail` (if
+    given) is appended after that."""
+
+    def leg(a, b, n):
+        return np.linspace(a, b, n + 1)[1:]
+
+    turns = [
+        100.0, 89.58, 115.1, 79.6, 101.82, 67.57, 90.43, 85.12, 124.16, 119.52,
+        132.84, 105.8, 138.93, 128.0, 163.22, 134.17, 140.47, 121.06, 156.94, 137.38,
+    ]
+    bars_per_leg = 11
+    zigzag = np.concatenate([leg(a, b, bars_per_leg) for a, b in zip(turns[:-1], turns[1:])])
+    warmup = np.full(100, 100.0)  # clears common.indicators.macd's own EMA warm-up
+    runway = np.linspace(zigzag[-1], zigzag[-1] * 1.02, 21)[1:]
+    closes = np.concatenate([warmup, zigzag, runway])
+    return closes if tail is None else np.concatenate([closes, tail])
+
+
+def test_chan3_enters_after_a_buy_point_confirms():
+    universe = _timing_universe(make_ohlcv_from_closes(_chan3_breakout_closes()))
+    strat = ChanThreeTypeStrategy()
+    weights = strat.generate_weights(universe)
+    daily = _daily(weights)
+
+    assert not (daily["SPY"].iloc[:300] > 0).any(), "no entry before the buy point actually confirms"
+    assert (daily["SPY"].iloc[300:] > 0).any(), "should enter once a buy point (first/second/third-type) confirms"
+
+
+def test_chan3_no_entry_on_a_pure_monotonic_decline():
+    closes = 100.0 - 0.1 * np.arange(400)
+    universe = _timing_universe(make_ohlcv_from_closes(closes))
+    strat = ChanThreeTypeStrategy()
+    weights = strat.generate_weights(universe)
+    daily = _daily(weights)
+    # A strictly monotonic path never forms an interior fractal, so no
+    # stroke/segment/pivot -- and therefore no buy point -- can ever form.
+    assert (daily["SPY"] == 0).all()
+
+
+def test_chan3_stop_loss_forces_an_exit():
+    decline = np.linspace(140.0, 60.0, 41)[1:]
+    universe = _timing_universe(make_ohlcv_from_closes(_chan3_breakout_closes(tail=decline)))
+    cfg = StrategyConfig(chan3_stop_loss_pct=0.05, chan3_max_holding_days=None)
+    strat = ChanThreeTypeStrategy(cfg)
+    weights = strat.generate_weights(universe)
+    daily = _daily(weights)
+
+    assert (daily["SPY"] > 0).any(), "should have entered after a buy point confirmed"
+    entry_day = daily.index[daily["SPY"] > 0][0]
+    entry_price = universe["SPY"]["Close"].loc[entry_day]
+    close = universe["SPY"]["Close"]
+    breach_day = close.index[(close / entry_price - 1 <= -0.05) & (close.index > entry_day)][0]
+    assert daily.loc[breach_day, "SPY"] == 0.0
+
+
+def test_chan3_max_holding_days_forces_an_exit():
+    runway = np.linspace(140.0, 142.0, 31)[1:]
+    universe = _timing_universe(make_ohlcv_from_closes(_chan3_breakout_closes(tail=runway)))
+    cfg = StrategyConfig(chan3_stop_loss_pct=None, chan3_max_holding_days=5)
+    strat = ChanThreeTypeStrategy(cfg)
+    weights = strat.generate_weights(universe)
+    daily = _daily(weights)
+
+    assert (daily["SPY"] > 0).any(), "should have entered after a buy point confirmed"
+    entry_day_pos = np.flatnonzero(daily["SPY"].to_numpy() > 0)[0]
+    assert daily["SPY"].iloc[entry_day_pos + 5] == 0.0
+
+
+def test_chan3_missing_symbol_returns_empty():
+    universe = _timing_universe(make_oscillating_df(n=100))
+    cfg = StrategyConfig(chan3_symbol="NOT_IN_UNIVERSE")
+    assert ChanThreeTypeStrategy(cfg).generate_weights(universe).empty
+
+
+def test_chan3_warmup_bars():
+    cfg = StrategyConfig(chan3_min_gap_bars=4, chan3_min_strokes=3, chan3_macd_slow=26, chan3_macd_signal=9)
+    expected = max(3**2 * 2 * (4 + 2) + 2 * (4 + 2), 26 + 9 + 10)
+    assert ChanThreeTypeStrategy(cfg).warmup_bars() == expected
+
+
+def test_chan3_multi_asset_normalizes_weights_when_multiple_symbols_trigger():
+    closes = _chan3_breakout_closes()
+    df1 = make_ohlcv_from_closes(closes)
+    df2 = make_ohlcv_from_closes(closes, start=str(df1.index[0].date()))
+    universe = {
+        "SPY": df1,
+        "QQQ": df2,
+        "BIL": make_ohlcv_from_closes([100.0] * len(closes), start=str(df1.index[0].date())),
+    }
+    cfg = StrategyConfig(chan3_position_size_pct=1.0)
+    strat = ChanThreeTypeStrategy(cfg)
     weights = strat.generate_weights(universe, params={"symbols": ["SPY", "QQQ"]})
     daily = _daily(weights)
 
