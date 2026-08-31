@@ -651,7 +651,7 @@ instrument_selection/
     selection.py       Turns scores + correlation into an actual chosen basket: cluster-representative, Max-Sum-Diversification greedy, and threshold-gated greedy (see "From scores to a chosen basket" above)
     plotting.py       Correlation heatmap, dendrogram, Hurst-vs-volatility scatter (descriptive, not strategy-specific)
   run_screener.py      CLI — full report across all metrics for a universe, plus a chosen basket via --select-method
-  tests/                pytest unit tests (72 tests covering every module)
+  tests/                pytest unit tests (101 tests covering every module)
   data/                 cached price CSVs (gitignored)
   results/              screening report, correlation matrix, screened-out report, charts (gitignored)
 ```
@@ -745,7 +745,7 @@ uv run python instrument_selection/run_screener.py \
 uv run python instrument_selection/run_screener.py \
   --universe SPY QQQ AAPL MSFT NVDA --no-fund-metadata --no-plots --no-cache
 
-# Weekly bars instead of daily, with a data-dir cache override
+# Weekly bars instead of daily
 uv run python instrument_selection/run_screener.py \
   --universe SPY QQQ TLT GLD --interval 1wk --data-provider yfinance
 ```
@@ -812,7 +812,7 @@ other three projects via `--universe-file` (it accepts a bare list, or a dict wi
 uv run pytest instrument_selection/tests -v
 ```
 
-72 tests covering: the Corwin-Schultz spread estimator (non-negative,
+101 tests covering: the Corwin-Schultz spread estimator (non-negative,
 increases with wider high-low noise), realized vol/ATR%/vol-of-vol/ADX
 correctness on synthetic series with known properties, the Hurst estimator
 correctly ordering trending > random-walk > mean-reverting synthetic AR(1)

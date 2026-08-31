@@ -8,11 +8,17 @@
 
 ## 环境安装与配置
 
-本项目与工作区的其余项目共享单个 `uv` 管理的环境。从仓库根目录（上一级）：
+本项目没有自己的 `pyproject.toml`/`uv` 环境——请使用与您所评估策略匹配的那个项目组的 venv
+（参阅根目录 `README_ZH.md` 的“环境搭建”一节）。以 pipeline 项目组为例：
 
 ```bash
-uv sync
+cd pipeline && uv sync
 ```
+
+之后从仓库根目录直接用该 venv 的解释器调用本项目 CLI（如下方每条示例命令所示），例如
+`pipeline/.venv/Scripts/python.exe backtester/run_backtest.py ...`——在仓库根目录直接运行
+`uv run python backtester/run_backtest.py ...` 会失败（`ModuleNotFoundError: No module named
+'numpy'`），因为仓库根目录本身没有 `uv` 管理的环境可供 `uv run` 回退使用。
 
 ## 使用指南
 
@@ -51,59 +57,64 @@ uv sync
 | `--cache-ttl-days` | 浮点数天数，默认值：无 | 重新获取早于 N 天的缓存 OHLCV 文件，而非永久信任 |
 | `--no-plots` | 标志，默认关闭（生成图表） | 跳过 normally 在 `--mode standard` 下生成的 `equity_curve.png` 图表 |
 
-### 示例命令（真实市场数据）
+### 示例命令
+
+从仓库根目录运行，直接使用 pipeline venv 的解释器（参阅上方“环境安装与配置”）——本项目没有
+自己的环境，`uv run` 在此不适用。
+
+#### 真实市场数据
 
 ```bash
-# 标准模式：对新资产组合上的已生成策略进行全历史评估（从仓库根目录运行）
-uv run python backtester/run_backtest.py \
+# 标准模式：对新资产组合上的已生成策略进行全历史评估
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY QQQ AAPL --mode standard
 
 # 显式指定日期范围和 K 线周期
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY QQQ AAPL MSFT NVDA --start 2018-01-01 --end 2024-12-31 --interval 1d
 
 # 从文件加载标的池（如 instrument_selection 生成的组合）
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe-file pipeline/instrument_selection/results/basket.json --mode standard
 
 # Walkforward 模式：使用默认的 1 年窗口 / 0.5 年步长进行滚动窗口一致性检查
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY QQQ AAPL GLD TLT --mode walkforward
 
 # 自定义窗口/步长大小的 Walkforward 模式
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY QQQ AAPL GLD TLT --mode walkforward --window-years 2 --step-years 1
 
 # 自定义交易成本假设和初始资金
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY QQQ AAPL --initial-capital 250000 --commission-pct 0.001 --slippage-pct 0.001
 
 # 在新组合上重新运行基于挖掘模式的策略（带有 pattern_spec 块的 strategy.json）
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY QQQ AAPL MSFT NVDA GLD TLT IEF --mode standard
 
 # 在新组合上重新运行源自 research_strategy 的策略（带有 research_strategy_spec 块的 strategy.json，即在 strategy_generator 搜索中获胜的 research_strategy 策略）；在 --mode standard 与 --mode walkforward 下运行机制完全相同
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY TLT BIL GLD --mode standard
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY TLT BIL GLD --mode walkforward
 
 # 在新组合上重新运行切面组合的混合策略（带有 composite_spec 块的 strategy.json，即某模板的选择/入场切面与另一不同模板的权重/离场切面的获胜组合；参阅 strategy_generator 的 --no-compose-aspects）
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY QQQ IWM EFA EEM GLD TLT --mode standard
 
-# 重新运行源自 fundamental_screener 的策略（带有 fundamental_spec 块的 strategy.json）--参阅 pipeline/fundamental_screener/README_ZH.md 了解 bnn_strategy.json 是如何生成的
-uv run python backtester/run_backtest.py \
+# 重新运行源自 fundamental_screener 的策略（带有 fundamental_spec 块的 strategy.json）--参阅 pipeline/fundamental_screener/README_ZH.md 了解 fundamental_strategy.json 是如何生成的
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/fundamental_screener/results/fundamental_strategy.json \
   --universe KO PG SPY BIL --mode standard
 
@@ -113,41 +124,45 @@ ml/bnn_forecaster/.venv/Scripts/python.exe backtester/run_backtest.py \
   --universe KO PG SPY BIL --mode standard
 
 # 自定义结果/缓存目录，不本地缓存获取的数据
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY QQQ TLT GLD --no-cache \
   --results-dir /tmp/backtest_results --cache-dir /tmp/backtest_cache
 
 # CSV 文件夹提供商（您已下载的离线真实数据）
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY QQQ TLT GLD --data-provider csv --data-dir /path/to/ohlcv_csvs
+```
 
+#### 离线/合成数据
+
+```bash
 # 仅离线/合成数据（无网络调用）--本工作区常设的测试规范
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe A B C --data-provider synthetic
 
 # 带基准标的对比的标准模式（合成数据 --无网络调用）
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe A B C --data-provider synthetic \
   --baseline-symbol SPY --baseline-template equal_weight
 
 # 带基准对比和自定义基准参数的 Walkforward 模式（合成数据）
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe A B C --data-provider synthetic --mode walkforward \
   --baseline-symbol SPY --baseline-params '{"rebalance_freq_days": 21}'
 
 # --optimize：在当前标的池/模式上重新调优已加载策略的参数，并在运行最终回测前对胜者进行 ERS 验证（合成数据）
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe A B C --data-provider synthetic --mode standard \
   --optimize --n-random-search 200 --ers-percentile-threshold 0.90
 
 # --mode walkforward 下的 --optimize：每个候选策略通过其在 walkforward 报告的相同滚动窗口上的平均折叠夏普比率进行打分
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe A B C --data-provider synthetic --mode walkforward \
   --optimize --n-random-search 100 --ers-percentile-threshold 0.90 --min-rebalances-for-trust 4

@@ -15,12 +15,19 @@ repeated here.
 
 ## Setup
 
-This project shares a single `uv`-managed environment with the rest of the workspace. From the
-repo root (one level up):
+This project has no `pyproject.toml`/`uv` environment of its own — run it with whichever group's
+venv fits the strategy you're evaluating (see the root `README.md`'s "Setup & Environment"
+section). For the pipeline group:
 
 ```bash
-uv sync
+cd pipeline && uv sync
 ```
+
+Then invoke this project's CLI from the repo root via that venv's interpreter directly (as every
+sample command below does), e.g. `pipeline/.venv/Scripts/python.exe backtester/run_backtest.py
+...` — a bare `uv run python backtester/run_backtest.py ...` from the repo root fails
+(`ModuleNotFoundError: No module named 'numpy'`) since there's no `uv`-managed environment at the
+repo root for `uv run` to fall back to.
 
 ## Usage
 
@@ -63,64 +70,69 @@ all of them raises `ValueError("No universe symbols provided or resolved...")`.
 | `--cache-ttl-days` | float days, default: none | Re-fetch a cached OHLCV file older than N days instead of trusting it forever |
 | `--no-plots` | flag, default off (charts on) | Skip the `equity_curve.png` chart normally produced in `--mode standard` |
 
-### Sample commands (real market data)
+### Sample commands
+
+Run from the repo root, via the pipeline venv's interpreter directly (see "Setup" above) — `uv
+run` doesn't work here since this project has no environment of its own.
+
+#### Real market data
 
 ```bash
-# Standard mode: full-history evaluation of a generated strategy on a new basket (run from the repo root)
-uv run python backtester/run_backtest.py \
+# Standard mode: full-history evaluation of a generated strategy on a new basket
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY QQQ AAPL --mode standard
 
 # Explicit date range and bar interval
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY QQQ AAPL MSFT NVDA --start 2018-01-01 --end 2024-12-31 --interval 1d
 
 # Universe loaded from a file (e.g. a basket produced by instrument_selection)
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe-file pipeline/instrument_selection/results/basket.json --mode standard
 
 # Walkforward mode: rolling-fold consistency check with the default 1y window / 0.5y step
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY QQQ AAPL GLD TLT --mode walkforward
 
 # Walkforward mode with custom window/step sizes
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY QQQ AAPL GLD TLT --mode walkforward --window-years 2 --step-years 1
 
 # Custom trading-cost assumptions and starting capital
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY QQQ AAPL --initial-capital 250000 --commission-pct 0.001 --slippage-pct 0.001
 
 # Re-running a mined pattern-based strategy (strategy.json with a pattern_spec block) on a new basket
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY QQQ AAPL MSFT NVDA GLD TLT IEF --mode standard
 
 # Re-running a research_strategy-sourced strategy (strategy.json with a research_strategy_spec
 # block -- a research_strategy strategy that won strategy_generator's search) on a new basket;
 # works identically in both --mode standard and --mode walkforward
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY TLT BIL GLD --mode standard
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY TLT BIL GLD --mode walkforward
 
 # Re-running an aspect-composed hybrid strategy (strategy.json with a composite_spec block --
 # a winning pairing of one template's selection/entry aspect with a DIFFERENT template's own
 # weighting/exit aspect; see strategy_generator's --no-compose-aspects) on a new basket
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY QQQ IWM EFA EEM GLD TLT --mode standard
 
 # Re-running a fundamental_screener-sourced strategy (strategy.json with a fundamental_spec
-# block) -- see pipeline/fundamental_screener/README.md for how bnn_strategy.json is produced
-uv run python backtester/run_backtest.py \
+# block) -- see pipeline/fundamental_screener/README.md for how fundamental_strategy.json is produced
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/fundamental_screener/results/fundamental_strategy.json \
   --universe KO PG SPY BIL --mode standard
 
@@ -131,43 +143,47 @@ ml/bnn_forecaster/.venv/Scripts/python.exe backtester/run_backtest.py \
   --universe KO PG SPY BIL --mode standard
 
 # Custom results/cache directories, no local caching of the fetched data
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY QQQ TLT GLD --no-cache \
   --results-dir /tmp/backtest_results --cache-dir /tmp/backtest_cache
 
 # CSV-folder provider (offline real data you already downloaded)
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe SPY QQQ TLT GLD --data-provider csv --data-dir /path/to/ohlcv_csvs
+```
 
+#### Offline / synthetic data
+
+```bash
 # Offline/synthetic data only (no network calls) -- this workspace's standing testing convention
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe A B C --data-provider synthetic
 
 # Standard mode with a baseline symbol comparison (synthetic data -- no network calls)
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe A B C --data-provider synthetic \
   --baseline-symbol SPY --baseline-template equal_weight
 
 # Walkforward mode with a baseline comparison and custom baseline params (synthetic data)
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe A B C --data-provider synthetic --mode walkforward \
   --baseline-symbol SPY --baseline-params '{"rebalance_freq_days": 21}'
 
 # --optimize: re-tune the loaded strategy's params on this universe/mode and
 # ERS-validate the winner before running the final backtest (synthetic data)
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe A B C --data-provider synthetic --mode standard \
   --optimize --n-random-search 200 --ers-percentile-threshold 0.90
 
 # --optimize under --mode walkforward: each candidate is scored by its MEAN
 # fold Sharpe across the same rolling windows walkforward would report
-uv run python backtester/run_backtest.py \
+pipeline/.venv/Scripts/python.exe backtester/run_backtest.py \
   --strategy-file pipeline/strategy_generator/results/strategy.json \
   --universe A B C --data-provider synthetic --mode walkforward \
   --optimize --n-random-search 100 --ers-percentile-threshold 0.90 --min-rebalances-for-trust 4

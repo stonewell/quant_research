@@ -56,9 +56,11 @@ To backtest a winning `bnn_strategy.json` (see below), run `backtester`
 **using this project's own venv**, not `pipeline/`'s:
 
 ```bash
-# from the repo root
+# from the repo root -- --data-provider synthetic here too, matching the run above (backtester's
+# own default is --data-provider yfinance, which would otherwise silently hit the network)
 ml/bnn_forecaster/.venv/Scripts/python.exe backtester/run_backtest.py \
-  --strategy-file ml/bnn_forecaster/results/bnn_strategy.json --universe KO PG SPY BIL
+  --strategy-file ml/bnn_forecaster/results/bnn_strategy.json --universe KO PG SPY BIL \
+  --data-provider synthetic
 ```
 
 ## What it does
@@ -130,7 +132,7 @@ WMT, MCD, PEP) if none are given.
 | `--top-n` | int, default `5` | How many top buy/sell candidates to report |
 | `--horizon-days` | int, default `21` (~1 month) | Forecast horizon in trading days, also the annualization base |
 | `--lookback-days` | int, default `756` (~3 years) | Trading days of trailing history to fit each symbol's BNN on |
-| `--estimator` | `map` \| `mcmc` \| `vi`, default `"map"` | AutoBNN estimator type — `map` (Maximum A Posteriori) is by far the cheapest; `mcmc`/`vi` are much more expensive |
+| `--estimator` | `map` \| `mcmc` \| `vi`, default `"map"` | AutoBNN estimator type — `map` (Maximum A Posteriori) is by far the cheapest and the only one verified working; `mcmc` is much more expensive; `vi` crashes outright on this project's pinned dependency versions (`flax.errors.ScopeParamShapeError` — see the sample command below) |
 | `--width` | int, default `10` | AutoBNN ensemble width (reduced from AutoBNN's own default of 50 for practical runtime) |
 | `--num-iters` | int, default `1000` | MAP optimization iterations per symbol (reduced from AutoBNN's own default of 5000 — see the calibration trade-off above) |
 | `--num-particles` | int, default `4` | AutoBNN particle count |
@@ -155,7 +157,12 @@ uv run python run_bnn_forecaster.py --num-iters 200 --width 6   # faster, lower-
 # Shorter forecast horizon and trailing lookback
 uv run python run_bnn_forecaster.py --horizon-days 5 --lookback-days 252 --data-provider synthetic
 
-# More expensive estimator + more particles (slower, potentially better-calibrated -- unverified)
+# More expensive estimator + more particles (slower, potentially better-calibrated -- unverified).
+# KNOWN BROKEN on this project's pinned autobnn/flax/JAX versions as of this writing: crashes with
+# `flax.errors.ScopeParamShapeError: Initializer expected to generate shape () but got shape (1,)
+# ... for parameter "noise_scale"` -- a real dependency-stack incompatibility, not a flag/usage
+# error; verified directly, not just documented secondhand. `--estimator map` (the default) is
+# unaffected.
 uv run python run_bnn_forecaster.py --estimator vi --num-particles 8 --data-provider synthetic
 
 # Universe loaded from a file (e.g. a basket produced by instrument_selection)
@@ -182,8 +189,8 @@ uv run python run_bnn_forecaster.py --data-provider yfinance --cache-ttl-days 1
 ## Testing
 
 ```bash
-uv run pytest tests -v              # fast (mocked fit_forecast), ~2s
-uv run pytest tests -v -m slow      # includes one real (unmocked) AutoBNN fit, ~15s
+uv run pytest tests -v -m "not slow"  # fast (mocked fit_forecast only), ~2s
+uv run pytest tests -v                # everything, including the real (unmocked) AutoBNN fit, ~20s
 ```
 
 Most tests mock `fit_forecast` with controlled `forecast_return`/`ci_width`

@@ -2,7 +2,7 @@
 
 # 量化交易策略研究 (`research_strategy`)
 
-一个专门的子项目，实现并评估 17 种量化交易策略：5 种从学术文献与从业者研究（*Journal of Finance*、*Journal of Portfolio Management*、SSRN、AllocateSmartly）中综合而成的战术资产配置 (TAA) 策略；4 种单资产择时策略（由本工作区原有的 `rsi_strategy`、`swing_trend_strategy`、`grid_trading` 和 `ensemble_strategy` 整合而来）；2 种 Donchian 通道突破系统；4 种现代热门静态/固定权重组合（永久组合、黄金蝴蝶、全天候、HFEA）；以及在对“现代、热门、有效”策略的后续深度研究中新增的 2 种现代系统化 TAA 扩展（保护性资产配置 PAA、自适应资产配置 AAA）——参阅下文“策略 12-17”了解该研究的发现与已披露的简化。
+一个专门的子项目，实现并评估 20 种量化交易策略：5 种从学术文献与从业者研究（*Journal of Finance*、*Journal of Portfolio Management*、SSRN、AllocateSmartly）中综合而成的战术资产配置 (TAA) 策略；4 种单资产择时策略（由本工作区原有的 `rsi_strategy`、`swing_trend_strategy`、`grid_trading` 和 `ensemble_strategy` 整合而来）；2 种 Donchian 通道突破系统；4 种现代热门静态/固定权重组合（永久组合、黄金蝴蝶、全天候、HFEA）；在对”现代、热门、有效”策略的后续深度研究中新增的 2 种现代系统化 TAA 扩展（保护性资产配置 PAA、自适应资产配置 AAA，参阅下文”策略 12-17”了解该研究的发现与已披露的简化）；以及 2 种对缠中说禅价格结构的原创从零实现，后者是前者的增量扩展（参阅”策略 18-20”）。
 
 ---
 
@@ -97,6 +97,10 @@
 
 * **复利安全边际** (`CompounderMarginOfSafetyStrategy`, `compounder_margin_of_safety`)：价格端代理版本的价值投资框架。真实基本面版本（包含真实 ROE/股息率/盈利增长）请参阅独立的 `fundamental_screener` 项目。
 
+### 策略 20：缠论三类买卖点 (Chan Three-Type Buy/Sell Points，策略 18 的增量扩展)
+
+* **缠论三类买卖点** (`ChanThreeTypeStrategy`, `chan_three_type`)：对策略 18 的**增量扩展**，而非修改——`ChanPivotShiftStrategy`/`chan_structure.py` 保持原样不变，本策略作为对缠中说禅理论更贴近正式分类法的独立实现与其并存。在 `chan_structure.py` 的笔之上新增两层结构：线段（对真实特征序列终止规则的一种披露性价格近似）与线段级别的中枢（直接复用 `chan_structure.build_pivots`，仅将输入从笔换成线段）。将策略 18 的背驰代理替换为基于 `common.indicators.macd`（此前未被本项目任何策略使用）的真实 MACD 柱面积背驰，并实现正式的一/二/三类买卖点分类法：第一类买卖点是经 MACD 背驰确认的中枢突破/跌破；第二类买卖点是第一类点之后未创新极值的回抽失败点；第三类买卖点是突破后回抽不破中枢边缘的确认点（无需背驰）。完整的披露性简化见 `rs/chan_signals.py`。
+
 ---
 
 ## 2. JSON 策略配置 (`strategies_config.json`)
@@ -129,6 +133,8 @@ apps/quant/research_strategy/
 │   ├── config.py              # StrategyConfig & load_strategies_config()
 │   ├── nl_parser.py           # 自然语言描述 -> ParsedStrategySpec
 │   ├── chan_structure.py      # 独立缠论结构检测器（分型/笔/枢轴）
+│   ├── chan_signals.py        # 增量扩展：线段、真实 MACD 背驰、一/二/三类买卖点
+│   ├── timing_aspects.py      # 单资产择时模板的入场 x 出场/风控要素分解
 │   └── strategy.py            # NaturalLanguageStrategy 引擎与策略实现
 ├── strategies_config.json     # 所有策略和参数的中央 JSON 配置
 ├── run_research_strategy.py   # 动态加载策略配置的 CLI 运行器
@@ -136,6 +142,8 @@ apps/quant/research_strategy/
 ├── tests/
 │   ├── test_nl_parser.py      # 自然语言解析器的离线单元测试
 │   ├── test_chan_structure.py # 缠论结构检测器的离线单元测试
+│   ├── test_chan_signals.py   # 线段/MACD 背驰/三类买卖点的离线单元测试
+│   ├── test_timing_aspects.py # 入场 x 出场要素组合的离线单元测试
 │   └── test_strategy.py       # 所有策略和配置加载的离线单元测试
 └── README_ZH.md               # 策略公式、引用与指南
 ```
@@ -157,7 +165,7 @@ uv run pytest research_strategy/tests -v
 uv run python research_strategy/run_research_strategy.py --strategy all
 
 # 运行单个策略
-uv run python research_strategy/run_research_strategy.py --strategy momentum_rotation
+uv run python research_strategy/run_research_strategy.py --strategy dual_momentum
 
 # 使用真实市场数据 (yfinance)
 uv run python research_strategy/run_research_strategy.py --strategy all --data-provider yfinance --no-cache

@@ -2,7 +2,7 @@
 
 # Researched Quantitative Trading Strategies (`research_strategy`)
 
-A dedicated side project implementing and evaluating seventeen quantitative trading strategies: five tactical asset allocation (TAA) strategies synthesized from academic literature and practitioner research (*Journal of Finance*, *Journal of Portfolio Management*, SSRN, AllocateSmartly), four single-asset timing strategies consolidated into this project from this workspace's former standalone `rsi_strategy`, `swing_trend_strategy`, `grid_trading`, and `ensemble_strategy` side projects, two Donchian channel breakout systems, four modern, actively-followed static/fixed-weight portfolios popular with retail and practitioner communities today (Permanent Portfolio, Golden Butterfly, All Weather, HFEA), and two modern systematic TAA extensions added in a follow-up deep-research pass on "modern, popular, effective" strategies (Protective Asset Allocation, Adaptive Asset Allocation) -- see "Strategy 12-17" below for that pass's findings and disclosed simplifications.
+A dedicated side project implementing and evaluating twenty quantitative trading strategies: five tactical asset allocation (TAA) strategies synthesized from academic literature and practitioner research (*Journal of Finance*, *Journal of Portfolio Management*, SSRN, AllocateSmartly), four single-asset timing strategies consolidated into this project from this workspace's former standalone `rsi_strategy`, `swing_trend_strategy`, `grid_trading`, and `ensemble_strategy` side projects, two Donchian channel breakout systems, four modern, actively-followed static/fixed-weight portfolios popular with retail and practitioner communities today (Permanent Portfolio, Golden Butterfly, All Weather, HFEA), two modern systematic TAA extensions added in a follow-up deep-research pass on "modern, popular, effective" strategies (Protective Asset Allocation, Adaptive Asset Allocation) -- see "Strategy 12-17" below for that pass's findings and disclosed simplifications -- and two original, from-scratch structural readings of 缠中说禅 ("Chan theory") price structure, the second an additive extension of the first (see "Strategy 18-20").
 
 ---
 
@@ -100,6 +100,10 @@ A dedicated research pass specifically looked for strategies that are genuinely 
 ### Strategy 19: Compounder Margin of Safety (price-only proxy of a conservative value-investing framework)
 
 * **Compounder Margin of Safety** (`CompounderMarginOfSafetyStrategy`, `compounder_margin_of_safety`): adapts a conservative value-investing community's valuation framework (see `docs/snowball_strategy.txt` at the repo root) — the original method only holds durable, moat-protected, high-ROE, dividend-paying compounders whose expected 5-year return clears a risk premium over a broad-index benchmark (~12% normal hurdle vs. the index's own ~6-8%), and sells the moment that edge decays away. **DISCLOSED SIMPLIFICATION:** this workspace has no dividend/ROE/earnings/valuation data anywhere (OHLCV price history only, verified via grep across every provider in `common/data.py`), so this is a **price-only proxy**: a long-term uptrend + contained-volatility "stability" gate stands in for the moat/high-ROE quality screen, and a trailing annualized-return proxy (momentum persistence, not a real forecast) stands in for the document's earnings-growth-driven expected return; the sell rule is a direct translation (exit once that trailing-return proxy decays below the benchmark's own trailing return). Candidate universe defaults to an illustrative, unverified blue-chip basket (KO, PG, JNJ, MSFT, COST, WMT, MCD, PEP) rather than this project's usual broad-ETF universe, since "moat"/"quality" are single-company traits. A **real-fundamentals version** (actual ROE/dividend yield/earnings growth from yfinance) lives in the separate `fundamental_screener` project instead, since it needs real network data and can't be offline/synthetic-tested like everything here.
+
+### Strategy 20: Chan Three-Type Buy/Sell Points (additive extension of Strategy 18)
+
+* **Chan Three-Type Buy/Sell Points** (`ChanThreeTypeStrategy`, `chan_three_type`): an ADDITIVE extension of Strategy 18 above, not a modification of it — `ChanPivotShiftStrategy`/`chan_structure.py` are left exactly as they are, and this strategy coexists alongside it as its own independent reading of 缠中说禅 ("Chan theory"), one level closer to the formal published taxonomy. Adds two structural layers on top of `chan_structure.py`'s strokes: segments (线段, a disclosed price-only proxy for the real characteristic-sequence termination rule) and segment-level pivots (built by reusing `chan_structure.build_pivots` verbatim on segments instead of strokes). Replaces the Strategy 18 divergence proxy with real MACD-histogram-area divergence (背驰, via `common.indicators.macd`, previously unused by any strategy in this project) and implements the formal first/second/third-type buy/sell point taxonomy (一/二/三类买卖点): a first-type point is a pivot breakdown/breakout confirmed by MACD divergence between the entering and leaving move; a second-type point is a failed follow-through after a first-type point (a retest that doesn't make a new extreme); a third-type point is a breakout retest that holds the pivot's own band edge, with no divergence check. See `rs/chan_signals.py` for the full disclosed simplifications at each new stage.
 
 ### What was researched but NOT implemented in this pass
 
@@ -214,6 +218,8 @@ apps/quant/research_strategy/
 │   ├── config.py              # StrategyConfig & load_strategies_config()
 │   ├── nl_parser.py           # Plain-English strategy description -> ParsedStrategySpec
 │   ├── chan_structure.py      # Independent Chan-theory structure detector (fractals/strokes/pivots)
+│   ├── chan_signals.py        # Additive extension: segments, real MACD divergence, 一/二/三类买卖点
+│   ├── timing_aspects.py      # Entry x exit/risk aspect decomposition for single-asset timing templates
 │   └── strategy.py            # NaturalLanguageStrategy engine + strategy implementations
 ├── strategies_config.json     # Central JSON configuration for all strategies & parameters
 ├── run_research_strategy.py   # CLI runner loading strategy configs dynamically
@@ -221,6 +227,8 @@ apps/quant/research_strategy/
 ├── tests/
 │   ├── test_nl_parser.py      # Offline unit tests for the plain-English parser
 │   ├── test_chan_structure.py # Offline unit tests for the Chan structure detector
+│   ├── test_chan_signals.py   # Offline unit tests for segments/MACD divergence/三类买卖点
+│   ├── test_timing_aspects.py # Offline unit tests for entry x exit aspect composition
 │   └── test_strategy.py       # Offline unit tests for all strategies & config loading
 └── README.md                  # Strategy formulations, citations, and guide
 ```
@@ -280,7 +288,7 @@ uv run python research_strategy/run_research_strategy.py --strategy all
 
 Run a single named strategy instead of all of them:
 ```powershell
-uv run python research_strategy/run_research_strategy.py --strategy momentum_rotation
+uv run python research_strategy/run_research_strategy.py --strategy dual_momentum
 ```
 
 Pass a custom JSON configuration file:
@@ -310,7 +318,7 @@ uv run python research_strategy/run_research_strategy.py --strategy all --n-days
 uv run python research_strategy/run_research_strategy.py --strategy all --data-provider yfinance --no-cache
 
 # A specific strategy, an explicit real-ticker universe
-uv run python research_strategy/run_research_strategy.py --strategy momentum_rotation \
+uv run python research_strategy/run_research_strategy.py --strategy dual_momentum \
   --universe SPY QQQ AAPL MSFT NVDA GLD TLT --data-provider yfinance
 
 # Universe loaded from a file (e.g. a basket produced by instrument_selection), real data

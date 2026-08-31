@@ -109,13 +109,16 @@ uv run python strategy_generator/run_strategygen.py --universe SPY QQQ TLT GLD \
 
 ## Optional: including `research_strategy` strategies as candidates (`--research-strategy`)
 
-`--research-strategy KEY [KEY ...]` includes one or more of `research_strategy`'s 17 strategy
+`--research-strategy KEY [KEY ...]` includes one or more of `research_strategy`'s 20 strategy
 implementations as additional candidate templates, alongside the 9 static allocation templates and
 any `--pattern-report` findings. Each `KEY` is one of `research_strategy/strategies_config.json`'s
 short keys (e.g. `baa_keller`, `adaptive_grid`, `rsi_mean_reversion` — see `research_strategy/README.md`
-for the full list of 17); run
-`uv run python -c "from research_strategy.rs.config import load_strategies_config; print(sorted(load_strategies_config().keys()))"`
-from inside `pipeline/` to see them directly. Each named strategy is instantiated exactly as
+for the full list of 20); run
+`PYTHONPATH=.. uv run python -c "from research_strategy.rs.config import load_strategies_config; print(sorted(load_strategies_config().keys()))"`
+from inside `pipeline/` to see them directly (the bare form without `PYTHONPATH=..` fails with
+`ModuleNotFoundError: No module named 'common'` — unlike every `run_*.py` entry point, this
+one-liner bypasses the repo-root `sys.path` injection those scripts do themselves; on PowerShell use
+`$env:PYTHONPATH=".."; uv run python -c "..."` instead). Each named strategy is instantiated exactly as
 `research_strategy`'s own CLI would build it — including any `strategies_config.json` parameter
 overrides — via `research_strategy.rs.strategy.instantiate_strategy_from_config_entry`, then folded
 into the SAME grid-search + Equivalent Random Search pipeline as every static template via the

@@ -30,7 +30,7 @@
 
 - **消费因子研究报告 (`--factor-report`)**：加载 `research_strategy` 导出的 `factor_summary.json`。在最高夏普比率候选策略出现微小平局（夏普比率差异在 `--factor-tiebreak-epsilon` 内）时作为平局决胜依据。
 - **消费模式挖掘报告 (`--pattern-report`)**：加载 `pattern_mining` 导出的 `pattern_report.json`，将其显著性特征转换为候选策略参与竞争。
-- **引入研究策略 (`--research-strategy`)**：引入 `research_strategy` 的 17 种具体策略实现作为额外候选模板。
+- **引入研究策略 (`--research-strategy`)**：引入 `research_strategy` 的 20 种具体策略实现作为额外候选模板。
 
 ---
 
