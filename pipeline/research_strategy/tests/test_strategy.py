@@ -33,6 +33,7 @@ from research_strategy.rs.strategy import (
     AdaptiveGridStrategy,
     AllWeatherStrategy,
     BoldAssetAllocation,
+    ChanPivotShiftMACDStrategy,
     ChanPivotShiftStrategy,
     ChanThreeTypeStrategy,
     CompounderMarginOfSafetyStrategy,
@@ -816,6 +817,119 @@ def test_chan3_multi_asset_normalizes_weights_when_multiple_symbols_trigger():
     }
     cfg = StrategyConfig(chan3_position_size_pct=1.0)
     strat = ChanThreeTypeStrategy(cfg)
+    weights = strat.generate_weights(universe, params={"symbols": ["SPY", "QQQ"]})
+    daily = _daily(weights)
+
+    assert "SPY" in daily.columns
+    assert "QQQ" in daily.columns
+    assert (daily["SPY"] + daily["QQQ"] <= 1.0 + 1e-9).all()
+    np.testing.assert_allclose(daily["SPY"] + daily["QQQ"] + daily["BIL"], 1.0)
+
+
+# --- ChanPivotShiftMACDStrategy --------------------------------------------
+# All fixtures below are synthetic-only, per this file's offline testing
+# policy. This is an ADDITIVE copy of ChanPivotShiftStrategy above (see
+# rs/chan_signals.py's compute_chan_pivot_macd_signals) -- it shares no test
+# fixtures or code with, and does not modify, that strategy.
+
+def _chanm_top_divergence_closes():
+    """96 flat warm-up bars, a dip (seeds a bottom fractal), a steep up-leg,
+    a partial pullback, a shallower second up-leg reaching a new high, then
+    a tail (seeds the final top fractal). Verified by direct execution
+    (see test_chan_signals.py) to produce exactly one real MACD
+    top-divergence sell at bar 144 of 148, with no pivot-shift signal (too
+    few strokes for a second pivot)."""
+    warmup = np.full(96, 100.0)
+    dip = np.linspace(99, 97, 5)[1:]
+    leg_a = np.linspace(97.6, 120, 20)
+    pullback = np.linspace(119, 116, 5)[1:]
+    leg_b = np.linspace(116.6, 126, 20)
+    tail = np.linspace(125, 122, 5)[1:]
+    return np.concatenate([warmup, dip, leg_a, pullback, leg_b, tail])
+
+
+def _chanm_breakout_closes(tail=None):
+    """Exact mirror of _chanm_top_divergence_closes (negated around 200),
+    flipping up-legs into down-legs so the real MACD divergence fires as a
+    BOTTOM-divergence BUY instead, at bar 144 of 148 -- verified by direct
+    execution. `tail` (if given) is appended after that."""
+    closes = 200.0 - _chanm_top_divergence_closes()
+    return closes if tail is None else np.concatenate([closes, tail])
+
+
+def test_chanm_enters_after_a_bottom_divergence_buy_confirms():
+    universe = _timing_universe(make_ohlcv_from_closes(_chanm_breakout_closes()))
+    strat = ChanPivotShiftMACDStrategy()
+    weights = strat.generate_weights(universe)
+    daily = _daily(weights)
+
+    assert not (daily["SPY"].iloc[:144] > 0).any(), "no entry before the bottom divergence confirms"
+    assert (daily["SPY"].iloc[144:] > 0).any(), "should enter once the bottom-divergence buy confirms"
+
+
+def test_chanm_no_entry_on_a_pure_monotonic_decline():
+    closes = 100.0 - 0.1 * np.arange(300)
+    universe = _timing_universe(make_ohlcv_from_closes(closes))
+    strat = ChanPivotShiftMACDStrategy()
+    weights = strat.generate_weights(universe)
+    daily = _daily(weights)
+    # A strictly monotonic path never forms an interior fractal, so no
+    # stroke/pivot -- and therefore no buy signal -- can ever form.
+    assert (daily["SPY"] == 0).all()
+
+
+def test_chanm_stop_loss_forces_an_exit():
+    decline = np.linspace(78.0, 40.0, 41)[1:]
+    universe = _timing_universe(make_ohlcv_from_closes(_chanm_breakout_closes(tail=decline)))
+    cfg = StrategyConfig(chanm_stop_loss_pct=0.05, chanm_max_holding_days=None)
+    strat = ChanPivotShiftMACDStrategy(cfg)
+    weights = strat.generate_weights(universe)
+    daily = _daily(weights)
+
+    assert (daily["SPY"] > 0).any(), "should have entered after the bottom divergence confirmed"
+    entry_day = daily.index[daily["SPY"] > 0][0]
+    entry_price = universe["SPY"]["Close"].loc[entry_day]
+    close = universe["SPY"]["Close"]
+    breach_day = close.index[(close / entry_price - 1 <= -0.05) & (close.index > entry_day)][0]
+    assert daily.loc[breach_day, "SPY"] == 0.0
+
+
+def test_chanm_max_holding_days_forces_an_exit():
+    runway = np.linspace(78.0, 80.0, 31)[1:]
+    universe = _timing_universe(make_ohlcv_from_closes(_chanm_breakout_closes(tail=runway)))
+    cfg = StrategyConfig(chanm_stop_loss_pct=None, chanm_max_holding_days=5)
+    strat = ChanPivotShiftMACDStrategy(cfg)
+    weights = strat.generate_weights(universe)
+    daily = _daily(weights)
+
+    assert (daily["SPY"] > 0).any(), "should have entered after the bottom divergence confirmed"
+    entry_day_pos = np.flatnonzero(daily["SPY"].to_numpy() > 0)[0]
+    assert daily["SPY"].iloc[entry_day_pos + 5] == 0.0
+
+
+def test_chanm_missing_symbol_returns_empty():
+    universe = _timing_universe(make_oscillating_df(n=100))
+    cfg = StrategyConfig(chanm_symbol="NOT_IN_UNIVERSE")
+    assert ChanPivotShiftMACDStrategy(cfg).generate_weights(universe).empty
+
+
+def test_chanm_warmup_bars():
+    cfg = StrategyConfig(chanm_min_gap_bars=4, chanm_min_strokes=3, chanm_macd_slow=26, chanm_macd_signal=9)
+    expected = max(3 * 2 * (4 + 2), 26 + 9 + 10)
+    assert ChanPivotShiftMACDStrategy(cfg).warmup_bars() == expected
+
+
+def test_chanm_multi_asset_normalizes_weights_when_multiple_symbols_trigger():
+    closes = _chanm_breakout_closes()
+    df1 = make_ohlcv_from_closes(closes)
+    df2 = make_ohlcv_from_closes(closes, start=str(df1.index[0].date()))
+    universe = {
+        "SPY": df1,
+        "QQQ": df2,
+        "BIL": make_ohlcv_from_closes([100.0] * len(closes), start=str(df1.index[0].date())),
+    }
+    cfg = StrategyConfig(chanm_position_size_pct=1.0)
+    strat = ChanPivotShiftMACDStrategy(cfg)
     weights = strat.generate_weights(universe, params={"symbols": ["SPY", "QQQ"]})
     daily = _daily(weights)
 

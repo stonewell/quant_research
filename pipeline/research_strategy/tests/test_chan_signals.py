@@ -32,6 +32,7 @@ from research_strategy.rs.chan_signals import (
     build_segments,
     classify_points,
     compute_chan3_signals,
+    compute_chan_pivot_macd_signals,
     macd_divergence,
 )
 
@@ -344,3 +345,86 @@ def test_compute_chan3_signals_buy_and_sell_are_or_of_the_three_types():
     sig = compute_chan3_signals(df)
     assert (sig["buy_signal"] == (sig["first_buy"] | sig["second_buy"] | sig["third_buy"])).all()
     assert (sig["sell_signal"] == (sig["first_sell"] | sig["second_sell"] | sig["third_sell"])).all()
+
+
+# --- compute_chan_pivot_macd_signals -----------------------------------------
+# A near-literal copy of compute_chan_signals's own pivot-band-shift buy/sell
+# rules, with only the disclosed stroke-slope "momentum divergence proxy"
+# replaced by real MACD-histogram-area divergence (symmetric: a top-
+# divergence sell AND a bottom-divergence buy). Divergence fixtures below
+# were derived by actually running the implemented function end to end
+# (merge_inclusion -> find_fractals -> build_strokes -> macd_divergence),
+# iterating on leg lengths until the intended structure/divergence
+# relationship appeared -- not hand-derived up front.
+
+def test_compute_chan_pivot_macd_signals_reproduces_pivot_shift_buy_rule_exactly():
+    from research_strategy.rs.chan_structure import compute_chan_signals
+
+    def leg(a, b, n):
+        return np.linspace(a, b, n + 1)[1:]
+
+    closes = np.concatenate(
+        [
+            [100.0],
+            leg(100, 90, 10), leg(90, 100, 10), leg(100, 90, 10),
+            leg(90, 112, 10), leg(112, 104, 10), leg(104, 114, 10), leg(114, 104, 10),
+            leg(104, 108, 20),
+        ]
+    )
+    idx = pd.bdate_range("2020-01-01", periods=len(closes))
+    df = pd.DataFrame({"Open": closes, "High": closes + 0.5, "Low": closes - 0.5, "Close": closes}, index=idx)
+
+    old = compute_chan_signals(df, min_gap_bars=4, min_strokes=3)
+    new = compute_chan_pivot_macd_signals(df, min_gap_bars=4, min_strokes=3)
+    # The pivot-shift buy rule (rule 1) is copied verbatim and untouched by
+    # the divergence swap, so it must match compute_chan_signals's own
+    # buy_signal exactly on this fixture (which has no downward pivot shift,
+    # so rule 2/sell is not exercised by this comparison).
+    assert (old["buy_signal"] == new["buy_signal"]).all()
+
+
+def _chanm_top_divergence_closes():
+    """96 flat warm-up bars, then a dip (seeds a bottom fractal), a steep
+    up-leg, a partial pullback, a shallower second up-leg reaching a new
+    high, then a tail (seeds the final top fractal). Produces exactly one
+    pivot (too few strokes for a second one, so rules 1/2 never fire) and
+    two up-strokes whose real MACD divergence -- verified by direct
+    execution -- fires a sell at bar 144 of 148."""
+    warmup = np.full(96, 100.0)
+    dip = np.linspace(99, 97, 5)[1:]
+    leg_a = np.linspace(97.6, 120, 20)
+    pullback = np.linspace(119, 116, 5)[1:]
+    leg_b = np.linspace(116.6, 126, 20)
+    tail = np.linspace(125, 122, 5)[1:]
+    return np.concatenate([warmup, dip, leg_a, pullback, leg_b, tail])
+
+
+def test_compute_chan_pivot_macd_signals_detects_top_divergence_sell():
+    closes = _chanm_top_divergence_closes()
+    idx = pd.bdate_range("2020-01-01", periods=len(closes))
+    df = pd.DataFrame({"Open": closes, "High": closes + 0.2, "Low": closes - 0.2, "Close": closes}, index=idx)
+    sig = compute_chan_pivot_macd_signals(df, min_gap_bars=4, min_strokes=3)
+    assert np.flatnonzero(sig["sell_signal"].to_numpy()).tolist() == [144]
+    assert not sig["buy_signal"].any()
+
+
+def test_compute_chan_pivot_macd_signals_detects_bottom_divergence_buy():
+    # Exact mirror of the top-divergence fixture: negate prices around a
+    # baseline, flipping up-legs into down-legs.
+    closes = 200.0 - _chanm_top_divergence_closes()
+    idx = pd.bdate_range("2020-01-01", periods=len(closes))
+    df = pd.DataFrame({"Open": closes, "High": closes + 0.2, "Low": closes - 0.2, "Close": closes}, index=idx)
+    sig = compute_chan_pivot_macd_signals(df, min_gap_bars=4, min_strokes=3)
+    assert np.flatnonzero(sig["buy_signal"].to_numpy()).tolist() == [144]
+    assert not sig["sell_signal"].any()
+
+
+def test_compute_chan_pivot_macd_signals_returns_expected_schema():
+    closes = np.full(100, 100.0)
+    idx = pd.bdate_range("2020-01-01", periods=len(closes))
+    df = pd.DataFrame({"Open": closes, "High": closes + 0.5, "Low": closes - 0.5, "Close": closes}, index=idx)
+    sig = compute_chan_pivot_macd_signals(df)
+    assert set(sig.columns) == {"buy_signal", "sell_signal"}
+    assert sig.index.equals(df.index)
+    assert not sig["buy_signal"].any()
+    assert not sig["sell_signal"].any()

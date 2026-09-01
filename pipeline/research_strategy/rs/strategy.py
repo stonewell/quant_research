@@ -34,9 +34,12 @@ not ports of any workspace side project or third-party library):
 17. ChanPivotShiftStrategy (缠中说禅/Chan-theory pivot-shift reading, see `chan_structure.py`)
 18. ChanThreeTypeStrategy (additive extension of #17: segments, real MACD
     divergence, formal 一/二/三类买卖点 taxonomy -- see `chan_signals.py`)
+19. ChanPivotShiftMACDStrategy (additive copy of #17: same pivot-shift buy/sell
+    rule, but its disclosed stroke-slope divergence proxy replaced by real
+    MACD divergence, made symmetric -- see `chan_signals.py`)
 
 Value-Investing-Adapted Strategies:
-19. CompounderMarginOfSafetyStrategy (price-only proxy of a conservative valuation
+20. CompounderMarginOfSafetyStrategy (price-only proxy of a conservative valuation
     framework, see `docs/snowball_strategy.txt`; the real-fundamentals version lives
     in the separate `fundamental_screener` project)
 """
@@ -61,7 +64,7 @@ from common.indicators import (
 from common.allocation_templates import AllocationTemplate, _inverse_vol_weights, _min_variance_weights
 from common.scheduling import get_rebalance_dates as _get_rebalance_dates
 from .chan_structure import compute_chan_signals
-from .chan_signals import compute_chan3_signals
+from .chan_signals import compute_chan3_signals, compute_chan_pivot_macd_signals
 from .config import StrategyConfig
 from .nl_parser import ParsedStrategySpec, parse_plain_english_strategy
 
@@ -933,6 +936,112 @@ class ChanThreeTypeStrategy(AllocationTemplate):
         # entering/leaving legs a first/third-type point also needs beyond
         # the pivot's own window; must also clear MACD's own EMA warm-up.
         structural = (min_strokes**2) * 2 * (min_gap_bars + 2) + 2 * (min_gap_bars + 2)
+        macd_floor = macd_slow + macd_signal + 10
+        return max(structural, macd_floor)
+
+
+class ChanPivotShiftMACDStrategy(AllocationTemplate):
+    """Long-only timing strategy that is a near-literal copy of
+    `ChanPivotShiftStrategy`'s pivot-band-shift buy/sell rule (stroke-based
+    pivots -- deliberately NOT segments, unlike `ChanThreeTypeStrategy`), with
+    its disclosed stroke-slope/length "momentum divergence proxy" replaced by
+    real MACD-histogram-area divergence (`common.indicators.macd`, via
+    `rs/chan_signals.py`'s `compute_chan_pivot_macd_signals`).
+
+    ADDITIVE, not a modification: `ChanPivotShiftStrategy`/`chan_structure.py`
+    are left exactly as they are. One deliberate difference beyond the proxy
+    swap: this strategy is SYMMETRIC (a top-divergence sell AND a
+    bottom-divergence buy), where the original proxy only ever produced a
+    sell signal (checked only on up-strokes) -- real divergence makes both
+    directions equally cheap to compute, so both are wired in here.
+    """
+
+    def __init__(self, config: StrategyConfig = None):
+        self.config = config or StrategyConfig()
+        super().__init__(name="chan_pivot_shift_macd", param_grid={})
+
+    def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
+        cfg = self.config
+        p = params or {}
+        cash_proxy = p.get("cash_proxy", cfg.cash_proxy)
+        min_gap_bars = p.get("chanm_min_gap_bars", cfg.chanm_min_gap_bars)
+        min_strokes = p.get("chanm_min_strokes", cfg.chanm_min_strokes)
+        macd_fast = p.get("chanm_macd_fast", cfg.chanm_macd_fast)
+        macd_slow = p.get("chanm_macd_slow", cfg.chanm_macd_slow)
+        macd_signal = p.get("chanm_macd_signal", cfg.chanm_macd_signal)
+        stop_loss_pct = p.get("chanm_stop_loss_pct", cfg.chanm_stop_loss_pct)
+        max_holding_days = p.get("chanm_max_holding_days", cfg.chanm_max_holding_days)
+        position_size_pct = p.get("chanm_position_size_pct", cfg.chanm_position_size_pct)
+
+        symbols = list(universe.keys())
+        risky_symbols = _get_risky_symbols(universe, params, cfg.chanm_symbol, cfg.risky_universe, cash_proxy)
+        if not risky_symbols:
+            return pd.DataFrame()
+
+        master_index = universe[risky_symbols[0]].index
+        n_bars = len(master_index)
+        raw_weights = {sym: np.zeros(n_bars) for sym in risky_symbols}
+
+        for sym in risky_symbols:
+            bars = universe[sym]
+            sig = compute_chan_pivot_macd_signals(
+                bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes,
+                macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal,
+            )
+            entry_signal = sig["buy_signal"].reindex(master_index).fillna(False)
+            exit_signal = sig["sell_signal"].reindex(master_index).fillna(False)
+            close = bars["Close"].reindex(master_index)
+
+            in_position = False
+            entry_idx = 0
+            for i in range(n_bars):
+                if in_position:
+                    held = i - entry_idx
+                    stopped = stop_loss_pct is not None and (close.iloc[i] / close.iloc[entry_idx] - 1) <= -stop_loss_pct
+                    timed_out = max_holding_days is not None and held >= max_holding_days
+                    if exit_signal.iloc[i] or stopped or timed_out:
+                        in_position = False
+                        raw_weights[sym][i] = 0.0
+                    else:
+                        raw_weights[sym][i] = position_size_pct
+                elif entry_signal.iloc[i]:
+                    in_position = True
+                    entry_idx = i
+                    raw_weights[sym][i] = position_size_pct
+
+        daily = pd.DataFrame(raw_weights, index=master_index)
+        total_risky_raw = daily.sum(axis=1)
+        scale = np.where(total_risky_raw > 1.0, 1.0 / total_risky_raw, 1.0)
+        daily = daily.mul(scale, axis=0)
+
+        if cash_proxy in symbols:
+            daily[cash_proxy] = np.maximum(0.0, 1.0 - daily.sum(axis=1))
+
+        daily = _fill_out_columns(daily, symbols)
+        return _sparse_from_daily(daily)
+
+    def explain_weights(self, params: dict = None) -> str:
+        cfg = self.config
+        p = params or {}
+        return (
+            "Chan-theory pivot shift with real MACD divergence (a copy of chan_pivot_shift with its "
+            "disclosed stroke-slope divergence proxy replaced by real MACD-histogram-area divergence): "
+            "long active symbols once their price pivot steps up to a wholly higher band "
+            f"(min {p.get('chanm_min_strokes', cfg.chanm_min_strokes)} strokes/pivot, "
+            f"{p.get('chanm_min_gap_bars', cfg.chanm_min_gap_bars)}-bar fractal independence gap) and a "
+            "confirming pullback low forms, OR a bottom-divergence buy point (a new low on weaker MACD "
+            "momentum). Exits on a symmetric downward pivot shift, a top-divergence sell point, a "
+            "stop-loss, or a max-holding-days safety net."
+        )
+
+    def warmup_bars(self, params: dict = None) -> int:
+        cfg = self.config
+        p = params or {}
+        min_gap_bars = p.get("chanm_min_gap_bars", cfg.chanm_min_gap_bars)
+        min_strokes = p.get("chanm_min_strokes", cfg.chanm_min_strokes)
+        macd_slow = p.get("chanm_macd_slow", cfg.chanm_macd_slow)
+        macd_signal = p.get("chanm_macd_signal", cfg.chanm_macd_signal)
+        structural = min_strokes * 2 * (min_gap_bars + 2)
         macd_floor = macd_slow + macd_signal + 10
         return max(structural, macd_floor)
 
@@ -1928,6 +2037,7 @@ STRATEGY_CLASS_MAP = {
     "AdaptiveGridStrategy": AdaptiveGridStrategy,
     "AllWeatherStrategy": AllWeatherStrategy,
     "BoldAssetAllocation": BoldAssetAllocation,
+    "ChanPivotShiftMACDStrategy": ChanPivotShiftMACDStrategy,
     "ChanPivotShiftStrategy": ChanPivotShiftStrategy,
     "ChanThreeTypeStrategy": ChanThreeTypeStrategy,
     "CompounderMarginOfSafetyStrategy": CompounderMarginOfSafetyStrategy,

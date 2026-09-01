@@ -35,7 +35,7 @@ from common.allocation_templates import AllocationTemplate
 from common.indicators import atr, cumulative_rsi, rsi, rsi_cutler, rsi_wilder, sma
 
 from .chan_structure import compute_chan_signals
-from .chan_signals import compute_chan3_signals
+from .chan_signals import compute_chan3_signals, compute_chan_pivot_macd_signals
 from .strategy import _fill_out_columns, _get_risky_symbols, _sparse_from_daily
 
 
@@ -150,6 +150,19 @@ def _entry_chan3_point(df: pd.DataFrame, params: dict) -> pd.Series:
     return sig["buy_signal"].reindex(df.index).fillna(False)
 
 
+def _entry_chanm_pivot(df: pd.DataFrame, params: dict) -> pd.Series:
+    min_gap_bars = params.get("chanm_min_gap_bars", 4)
+    min_strokes = params.get("chanm_min_strokes", 3)
+    macd_fast = params.get("chanm_macd_fast", 12)
+    macd_slow = params.get("chanm_macd_slow", 26)
+    macd_signal = params.get("chanm_macd_signal", 9)
+    sig = compute_chan_pivot_macd_signals(
+        df, min_gap_bars=min_gap_bars, min_strokes=min_strokes,
+        macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal,
+    )
+    return sig["buy_signal"].reindex(df.index).fillna(False)
+
+
 def _entry_turtle_breakout(df: pd.DataFrame, params: dict) -> pd.Series:
     close, high = df["Close"], df["High"]
     entry_breakout_days = params.get("turtle_entry_breakout_days", 20)
@@ -205,6 +218,15 @@ ENTRY_SIGNAL_ASPECTS: Dict[str, EntrySignalAspect] = {
             p.get("chan3_macd_slow", 26) + p.get("chan3_macd_signal", 9) + 10,
         ),
         describe_fn=lambda p: "a Chan-theory first/second/third-type buy point (segments + real MACD divergence)",
+    ),
+    "chanm_pivot_entry": EntrySignalAspect(
+        key="chanm_pivot_entry", factor_tags=["regime_trend_strength"], symbol_param_key="chanm_symbol",
+        compute_fn=_entry_chanm_pivot,
+        warmup_fn=lambda p: max(
+            p.get("chanm_min_strokes", 3) * 2 * (p.get("chanm_min_gap_bars", 4) + 2),
+            p.get("chanm_macd_slow", 26) + p.get("chanm_macd_signal", 9) + 10,
+        ),
+        describe_fn=lambda p: "a Chan-theory pivot shift up, or a bottom-divergence buy point (real MACD)",
     ),
     "turtle_breakout_entry": EntrySignalAspect(
         key="turtle_breakout_entry", factor_tags=["absolute_momentum_trend"], symbol_param_key="turtle_symbol",
@@ -387,6 +409,45 @@ def _exit_chan3_point(df: pd.DataFrame, entry_signal: pd.Series, params: dict) -
     return raw
 
 
+def _exit_chanm_signal(df: pd.DataFrame, entry_signal: pd.Series, params: dict) -> np.ndarray:
+    close = df["Close"]
+    n_bars = len(close)
+    min_gap_bars = params.get("chanm_min_gap_bars", 4)
+    min_strokes = params.get("chanm_min_strokes", 3)
+    macd_fast = params.get("chanm_macd_fast", 12)
+    macd_slow = params.get("chanm_macd_slow", 26)
+    macd_signal = params.get("chanm_macd_signal", 9)
+    stop_loss_pct = params.get("chanm_stop_loss_pct", 0.08)
+    max_holding_days = params.get("chanm_max_holding_days", 90)
+    position_size_pct = params.get("chanm_position_size_pct", 1.0)
+
+    sig = compute_chan_pivot_macd_signals(
+        df, min_gap_bars=min_gap_bars, min_strokes=min_strokes,
+        macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal,
+    )
+    exit_signal = sig["sell_signal"].reindex(df.index).fillna(False).to_numpy()
+
+    close_arr = close.to_numpy()
+    entry_arr = entry_signal.to_numpy()
+    raw = np.zeros(n_bars)
+    in_position, entry_idx = False, 0
+    for i in range(n_bars):
+        if in_position:
+            held = i - entry_idx
+            stopped = stop_loss_pct is not None and (close_arr[i] / close_arr[entry_idx] - 1) <= -stop_loss_pct
+            timed_out = max_holding_days is not None and held >= max_holding_days
+            if exit_signal[i] or stopped or timed_out:
+                in_position = False
+                raw[i] = 0.0
+            else:
+                raw[i] = position_size_pct
+        elif entry_arr[i]:
+            in_position = True
+            entry_idx = i
+            raw[i] = position_size_pct
+    return raw
+
+
 def _exit_turtle_atr_trailing(df: pd.DataFrame, entry_signal: pd.Series, params: dict) -> np.ndarray:
     close, high = df["Close"], df["High"]
     n_bars = len(close)
@@ -472,6 +533,18 @@ EXIT_RISK_ASPECTS: Dict[str, ExitRiskAspect] = {
             f"max-holding-days={p.get('chan3_max_holding_days')}"
         ),
     ),
+    "chanm_signal_exit": ExitRiskAspect(
+        key="chanm_signal_exit", factor_tags=["regime_trend_strength"],
+        run_fn=_exit_chanm_signal,
+        warmup_fn=lambda p: max(
+            p.get("chanm_min_strokes", 3) * 2 * (p.get("chanm_min_gap_bars", 4) + 2),
+            p.get("chanm_macd_slow", 26) + p.get("chanm_macd_signal", 9) + 10,
+        ),
+        describe_fn=lambda p: (
+            f"a symmetric downward Chan pivot shift or a top-divergence sell point (real MACD), "
+            f"stop-loss={p.get('chanm_stop_loss_pct')}, max-holding-days={p.get('chanm_max_holding_days')}"
+        ),
+    ),
     "turtle_atr_trailing_exit": ExitRiskAspect(
         key="turtle_atr_trailing_exit", factor_tags=["volatility_targeting"],
         run_fn=_exit_turtle_atr_trailing,
@@ -495,6 +568,7 @@ TIMING_TEMPLATE_ASPECTS = {
     "SwingTrendPullbackStrategy": ("swing_pullback_entry", "swing_stop_target_exit"),
     "ChanPivotShiftStrategy": ("chan_pivot_entry", "chan_signal_exit"),
     "ChanThreeTypeStrategy": ("chan3_point_entry", "chan3_point_exit"),
+    "ChanPivotShiftMACDStrategy": ("chanm_pivot_entry", "chanm_signal_exit"),
     "TurtleBreakoutStrategy": ("turtle_breakout_entry", "turtle_atr_trailing_exit"),
 }
 

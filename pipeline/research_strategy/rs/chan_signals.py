@@ -30,6 +30,13 @@ Pipeline added here:
    segment-level pivots above and `macd_divergence`.
 10. `compute_chan3_signals`: orchestrates 6-9 into per-bar boolean signals,
     aligned to `df.index`, mirroring `compute_chan_signals`'s own shape.
+11. `compute_chan_pivot_macd_signals`: a SEPARATE, much narrower orchestrator
+    -- a near-literal copy of `compute_chan_signals`'s own pivot-band-shift
+    buy/sell rules (stroke-based pivots, not segments), with only its
+    disclosed stroke-slope "momentum divergence proxy" replaced by real
+    `macd_divergence`, made symmetric (both a top-divergence sell and a
+    bottom-divergence buy). Powers `ChanPivotShiftMACDStrategy`, independent
+    of and not consumed by `ChanThreeTypeStrategy`/`compute_chan3_signals`.
 """
 
 from __future__ import annotations
@@ -369,3 +376,80 @@ def compute_chan3_signals(
     result["buy_signal"] = result["first_buy"] | result["second_buy"] | result["third_buy"]
     result["sell_signal"] = result["first_sell"] | result["second_sell"] | result["third_sell"]
     return result
+
+
+def compute_chan_pivot_macd_signals(
+    df: pd.DataFrame,
+    min_gap_bars: int = 4,
+    min_strokes: int = 3,
+    macd_fast: int = 12,
+    macd_slow: int = 26,
+    macd_signal: int = 9,
+) -> pd.DataFrame:
+    """A near-literal copy of `chan_structure.compute_chan_signals`'s pivot-band-shift
+    buy/sell rules (stroke-based pivots -- deliberately NOT segments, unlike
+    `compute_chan3_signals`, so this stays a faithful structural copy of
+    `ChanPivotShiftStrategy`), with its disclosed stroke-slope "momentum
+    divergence proxy" replaced by real MACD-histogram-area divergence
+    (`macd_divergence`, reusing `common.indicators.macd`).
+
+    Made symmetric (a deliberate small extension beyond the original, which
+    only ever produced a sell signal from divergence): a top-divergence sell
+    signal on weakening consecutive up-strokes (a new high on weaker
+    momentum), AND a bottom-divergence buy signal on weakening consecutive
+    down-strokes (a new low on weaker momentum).
+
+    Returns `{"buy_signal": ..., "sell_signal": ...}`, aligned to `df.index`
+    -- identical shape to `compute_chan_signals`'s own output.
+    """
+    buy = pd.Series(False, index=df.index)
+    sell = pd.Series(False, index=df.index)
+
+    merged = merge_inclusion(df)
+    fractals = find_fractals(merged)
+    strokes = build_strokes(fractals, min_gap_bars)
+    pivots = build_pivots(strokes, min_strokes)
+    hist = macd(df["Close"], macd_fast, macd_slow, macd_signal)["hist"].reset_index(drop=True)
+
+    def _mark(series: pd.Series, fractal_pos: int) -> None:
+        confirm_pos = fractal_pos + 1
+        if confirm_pos < len(merged):
+            series.loc[merged.index[confirm_pos]] = True
+
+    def _first_stroke_after(start_idx: int, direction: str) -> int | None:
+        for si in range(start_idx, len(strokes)):
+            if strokes.iloc[si]["direction"] == direction:
+                return si
+        return None
+
+    # Rules 1+2, copied verbatim from compute_chan_signals: buy/sell on a
+    # pivot band stepping wholly above/below the prior pivot's band, timed to
+    # the confirming pullback stroke after the pivot's own window closes.
+    for k in range(1, len(pivots)):
+        prev_p, curr_p = pivots.iloc[k - 1], pivots.iloc[k]
+        window_last_idx = int(curr_p["start_stroke_idx"]) + min_strokes - 1
+        if curr_p["zd"] >= prev_p["zg"]:
+            si = _first_stroke_after(window_last_idx, "down")
+            if si is not None:
+                _mark(buy, int(strokes.iloc[si]["end_pos"]))
+        if curr_p["zg"] <= prev_p["zd"]:
+            si = _first_stroke_after(window_last_idx, "up")
+            if si is not None:
+                _mark(sell, int(strokes.iloc[si]["end_pos"]))
+
+    # Rule 3, replaced: real MACD divergence, symmetric top (sell) and bottom (buy).
+    up_strokes = strokes[strokes["direction"] == "up"].reset_index(drop=True)
+    for idx in range(1, len(up_strokes)):
+        a, b = up_strokes.iloc[idx - 1], up_strokes.iloc[idx]
+        has_div, _, _ = macd_divergence(a, b, hist, merged)
+        if has_div:
+            _mark(sell, int(b["end_pos"]))
+
+    down_strokes = strokes[strokes["direction"] == "down"].reset_index(drop=True)
+    for idx in range(1, len(down_strokes)):
+        a, b = down_strokes.iloc[idx - 1], down_strokes.iloc[idx]
+        has_div, _, _ = macd_divergence(a, b, hist, merged)
+        if has_div:
+            _mark(buy, int(b["end_pos"]))
+
+    return pd.DataFrame({"buy_signal": buy, "sell_signal": sell})

@@ -269,6 +269,23 @@ class StrategyConfig:
     chan3_max_holding_days: Optional[int] = 90    # None disables
     chan3_position_size_pct: float = 1.0
 
+    # --- Chan Pivot Shift (MACD) (additive copy of Chan Pivot Shift above --
+    # see rs/chan_signals.py's compute_chan_pivot_macd_signals; NOT a
+    # modification of ChanPivotShiftStrategy). Same stroke-based
+    # pivot-band-shift buy/sell rule, but with the disclosed stroke-slope
+    # "momentum divergence proxy" replaced by real MACD-histogram-area
+    # divergence (common.indicators.macd), made symmetric: a top-divergence
+    # sell AND a bottom-divergence buy (the original proxy was sell-only). ---
+    chanm_symbol: str = "SPY"
+    chanm_min_gap_bars: int = 4
+    chanm_min_strokes: int = 3
+    chanm_macd_fast: int = 12
+    chanm_macd_slow: int = 26
+    chanm_macd_signal: int = 9
+    chanm_stop_loss_pct: Optional[float] = 0.08   # None disables
+    chanm_max_holding_days: Optional[int] = 90    # None disables
+    chanm_position_size_pct: float = 1.0
+
     # --- Compounder Margin-of-Safety (price-proxy adaptation of a
     # conservative value-investing community's valuation framework, see
     # docs/snowball_strategy.txt) -- holds a candidate "quality compounder"
@@ -327,6 +344,10 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.chan3_min_gap_bars must be > 0, got {self.chan3_min_gap_bars}")
         if self.chan3_min_strokes < 3:
             raise ValueError(f"StrategyConfig.chan3_min_strokes must be >= 3, got {self.chan3_min_strokes}")
+        if self.chanm_min_gap_bars <= 0:
+            raise ValueError(f"StrategyConfig.chanm_min_gap_bars must be > 0, got {self.chanm_min_gap_bars}")
+        if self.chanm_min_strokes < 3:
+            raise ValueError(f"StrategyConfig.chanm_min_strokes must be >= 3, got {self.chanm_min_strokes}")
 
     @classmethod
     def from_dict(cls, data: dict) -> "StrategyConfig":

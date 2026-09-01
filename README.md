@@ -8,7 +8,7 @@ This workspace is organized into two project groups, each with its own `uv` envi
 shared infrastructure at the repo root:
 
 - **`pipeline/`** -- the core research/backtest pipeline family (one shared `uv` environment):
-  - `research_strategy/`: Researched quantitative trading strategies (20 TAA, timing, breakout, structural, and static portfolio models) and factor summary exporter.
+  - `research_strategy/`: Researched quantitative trading strategies (21 TAA, timing, breakout, structural, and static portfolio models) and factor summary exporter.
   - `instrument_selection/`: Strategy-agnostic screening, predictability testing (Hurst, candlestick, momentum), correlation clustering, and basket selection tool.
   - `pattern_mining/`: Turning-point indicator pattern mining (Bonferroni-corrected shuffle-null significance test), writing a durable `pattern_report.json` for `strategy_generator` to consume.
   - `strategy_generator/`: Portfolio strategy generator searching allocation templates and mined turning-point patterns, validated via Equivalent Random Search (ERS) and factor research tie-breaking.
@@ -98,7 +98,7 @@ group's venv fits the strategy you're using, e.g. `pipeline/.venv/Scripts/python
 
 ### Step 1: Factor Research (`research_strategy`)
 
-Run quantitative factor research across 20 implemented strategy formulations to characterize performance across factor categories (`absolute_momentum_trend`, `relative_momentum`, `volatility_targeting`, `mean_reversion`, `breadth`, `correlation_diversification`, etc.).
+Run quantitative factor research across 21 implemented strategy formulations to characterize performance across factor categories (`absolute_momentum_trend`, `relative_momentum`, `volatility_targeting`, `mean_reversion`, `breadth`, `correlation_diversification`, etc.).
 
 ```bash
 # Run from inside pipeline/ (or use pipeline/.venv/Scripts/python.exe from the repo root)
@@ -384,7 +384,7 @@ pipeline/.venv/Scripts/python.exe -m pytest backtester/tests -v
 | `backtester/` (repo root) | Standalone CLI evaluating fixed strategy files over single or rolling walkforward windows; no `pyproject.toml` of its own | `backtester/run_backtest.py` | `backtester/README.md`, `backtester/SCHEMAS.md` |
 | `data/` (repo root) | Shared OHLCV cache directory, written/read by every stage (provider-aware filenames, optional `--cache-ttl-days` staleness) | N/A (cache, not code) | `common/README.md` §7 |
 | `pipeline/` | Shared `uv` environment for the projects below, plus the orchestrator | `pipeline/pyproject.toml` | -- |
-| `pipeline/research_strategy/` | Evaluates 20 quantitative trading strategies and exports factor research summaries | `pipeline/research_strategy/run_research_strategy.py` | `pipeline/research_strategy/README.md` |
+| `pipeline/research_strategy/` | Evaluates 21 quantitative trading strategies and exports factor research summaries | `pipeline/research_strategy/run_research_strategy.py` | `pipeline/research_strategy/README.md` |
 | `pipeline/instrument_selection/` | Characterizes instruments, performs hard investability screening, and selects diversified baskets | `pipeline/instrument_selection/run_screener.py` | `pipeline/instrument_selection/README.md` |
 | `pipeline/pattern_mining/` | Mines turning-point indicator patterns via a Bonferroni-corrected shuffle-null significance test | `pipeline/pattern_mining/run_pattern_mining.py` | `pipeline/pattern_mining/README.md` |
 | `pipeline/strategy_generator/` | Grid-searches allocation templates & mined indicator patterns to generate validated strategies | `pipeline/strategy_generator/run_strategygen.py` | `pipeline/strategy_generator/README.md` |
