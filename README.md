@@ -13,6 +13,7 @@ shared infrastructure at the repo root:
   - `pattern_mining/`: Turning-point indicator pattern mining (Bonferroni-corrected shuffle-null significance test), writing a durable `pattern_report.json` for `strategy_generator` to consume.
   - `strategy_generator/`: Portfolio strategy generator searching allocation templates and mined turning-point patterns, validated via Equivalent Random Search (ERS) and factor research tie-breaking.
   - `fundamental_screener/`: Standalone (not pipeline-wired) real-fundamentals buy/sell screener.
+  - `live_signal/`: Standalone (not pipeline-wired) point-in-time buy/sell signal + rebalance instruction for an already-generated `strategy.json`, as of today or any given date.
   - `run_pipeline.py`: Chains research_strategy -> instrument_selection -> pattern_mining -> strategy_generator -> `backtester` end-to-end via subprocess.
 - **`ml/`** -- ML/DL-based strategy projects, each with its OWN isolated `uv` environment:
   - `bnn_forecaster/`: Standalone (not pipeline-wired) AutoBNN probabilistic-forecast buy/sell screener.
@@ -348,7 +349,7 @@ from `--pattern-report` or `--research-strategy` respectively (see `pipeline/str
 
 All unit tests across the repository run offline without requiring external network access or live market data, utilizing synthetic data generation (`SyntheticDataProvider` or Brownian motion generators in `common/testing.py`).
 
-Each project's test suite must be run separately, one path at a time -- none of the 8 `tests/`
+Each project's test suite must be run separately, one path at a time -- none of the 9 `tests/`
 directories (including `pipeline/tests/`, covering `run_pipeline.py`) has an `__init__.py`,
 so collecting more than one in a single `pytest` invocation (e.g. a bare `uv run pytest` from the
 repo root) fails with `import file mismatch` errors on the handful of same-named test files
@@ -364,6 +365,7 @@ uv run pytest instrument_selection/tests -v
 uv run pytest pattern_mining/tests -v
 uv run pytest strategy_generator/tests -v
 uv run pytest fundamental_screener/tests -v
+uv run pytest live_signal/tests -v
 uv run pytest tests -v                        # run_pipeline.py's own tests
 
 # from inside ml/bnn_forecaster/ (its own isolated venv)
@@ -389,5 +391,6 @@ pipeline/.venv/Scripts/python.exe -m pytest backtester/tests -v
 | `pipeline/pattern_mining/` | Mines turning-point indicator patterns via a Bonferroni-corrected shuffle-null significance test | `pipeline/pattern_mining/run_pattern_mining.py` | `pipeline/pattern_mining/README.md` |
 | `pipeline/strategy_generator/` | Grid-searches allocation templates & mined indicator patterns to generate validated strategies | `pipeline/strategy_generator/run_strategygen.py` | `pipeline/strategy_generator/README.md` |
 | `pipeline/fundamental_screener/` | Standalone (not pipeline-wired) real-fundamentals buy/sell screener; also produces a `backtester`-compatible strategy | `pipeline/fundamental_screener/run_fundamental_screener.py` | `pipeline/fundamental_screener/README.md` |
+| `pipeline/live_signal/` | Standalone (not pipeline-wired) point-in-time buy/sell signal + holdings-aware rebalance instruction for an already-generated `strategy.json`, as of today or any given date | `pipeline/live_signal/run_live_signal.py` | `pipeline/live_signal/README.md` |
 | `pipeline/run_pipeline.py` | Chains research_strategy -> instrument_selection -> pattern_mining -> strategy_generator -> `backtester` end-to-end via subprocess, auto-wiring each step's output into the next | `pipeline/run_pipeline.py` | This README |
 | `ml/bnn_forecaster/` | Standalone (not pipeline-wired) AutoBNN probabilistic-forecast buy/sell screener; own isolated `uv` environment (see its README) | `ml/bnn_forecaster/run_bnn_forecaster.py` | `ml/bnn_forecaster/README.md` |

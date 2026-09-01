@@ -12,6 +12,7 @@
   - `pattern_mining/`：拐点指标模式挖掘（基于 Bonferroni 矫正的打乱置换零假设显著性检验），生成供 `strategy_generator` 消费的持久化 `pattern_report.json`。
   - `strategy_generator/`：组合策略生成器，搜索配置模板与挖掘出的拐点模式，通过等效随机搜索（ERS）验证并结合因子研究进行平局决胜。
   - `fundamental_screener/`：独立（未接入流水线）的真实基本面买入/卖出筛选器。
+  - `live_signal/`：独立（未接入流水线）的时点买卖信号与再平衡指令工具，针对已生成的 `strategy.json`，评估今天或任意指定日期。
   - `run_pipeline.py`：通过子进程端到端串联 research_strategy -> instrument_selection -> pattern_mining -> strategy_generator -> `backtester`。
 - **`ml/`** -- 基于 ML/DL 的策略项目组，每个项目拥有**独立隔离**的 `uv` 环境：
   - `bnn_forecaster/`：独立（未接入流水线）的 AutoBNN 概率预测买入/卖出筛选器。
@@ -306,7 +307,7 @@ uv run python run_pipeline.py --universe SPY QQQ IWM EFA EEM GLD TLT --data-prov
 
 仓库中的所有单元测试均完全离线运行，无需外部网络访问或实时市场数据，使用合成数据生成器（`SyntheticDataProvider` 或 `common/testing.py` 中的布朗运动生成器）。
 
-每个项目的测试套件必须单独运行，一次运行一个路径——8 个 `tests/` 目录（包括涵盖 `run_pipeline.py` 的 `pipeline/tests/`）均未包含 `__init__.py`，因此在单个 `pytest` 调用中收集多个目录（例如从根目录直接运行 `uv run pytest`）会导致同名测试文件（`test_allocation_templates.py`、`test_indicators.py` 等）出现 `import file mismatch` 错误。不存在一次性运行工作区所有测试的单个命令（且 `pipeline/` 与 `ml/bnn_forecaster/` 独立的虚拟环境必须分别用于其各自项目的测试——`common` 和 `backtester` 的测试可以从任意一个环境运行）：
+每个项目的测试套件必须单独运行，一次运行一个路径——9 个 `tests/` 目录（包括涵盖 `run_pipeline.py` 的 `pipeline/tests/`）均未包含 `__init__.py`，因此在单个 `pytest` 调用中收集多个目录（例如从根目录直接运行 `uv run pytest`）会导致同名测试文件（`test_allocation_templates.py`、`test_indicators.py` 等）出现 `import file mismatch` 错误。不存在一次性运行工作区所有测试的单个命令（且 `pipeline/` 与 `ml/bnn_forecaster/` 独立的虚拟环境必须分别用于其各自项目的测试——`common` 和 `backtester` 的测试可以从任意一个环境运行）：
 
 ```bash
 # 在 pipeline/ 内部（其独立的 venv）
@@ -315,6 +316,7 @@ uv run pytest instrument_selection/tests -v
 uv run pytest pattern_mining/tests -v
 uv run pytest strategy_generator/tests -v
 uv run pytest fundamental_screener/tests -v
+uv run pytest live_signal/tests -v
 uv run pytest tests -v                        # run_pipeline.py 自身的测试
 
 # 在 ml/bnn_forecaster/ 内部（其独立的隔离 venv）
@@ -340,5 +342,6 @@ pipeline/.venv/Scripts/python.exe -m pytest backtester/tests -v
 | `pipeline/pattern_mining/` | 通过 Bonferroni 矫正的打乱置换显著性检验挖掘拐点指标模式 | `pipeline/pattern_mining/run_pattern_mining.py` | `pipeline/pattern_mining/README_ZH.md` |
 | `pipeline/strategy_generator/` | 网格搜索配置模板和挖掘出的指标模式以生成经过验证的策略 | `pipeline/strategy_generator/run_strategygen.py` | `pipeline/strategy_generator/README_ZH.md` |
 | `pipeline/fundamental_screener/` | 独立（未接入流水线）的真实基本面买入/卖出筛选器；亦生成兼容 `backtester` 的策略 | `pipeline/fundamental_screener/run_fundamental_screener.py` | `pipeline/fundamental_screener/README_ZH.md` |
+| `pipeline/live_signal/` | 独立（未接入流水线）的时点买卖信号与持仓感知再平衡指令工具，针对已生成的 `strategy.json`，评估今天或任意指定日期 | `pipeline/live_signal/run_live_signal.py` | `pipeline/live_signal/README_ZH.md` |
 | `pipeline/run_pipeline.py` | 通过子进程端到端串联 research_strategy -> instrument_selection -> pattern_mining -> strategy_generator -> `backtester`，自动将每步输出接入下一步 | `pipeline/run_pipeline.py` | 本 README |
 | `ml/bnn_forecaster/` | 独立（未接入流水线）的 AutoBNN 概率预测买入/卖出筛选器；拥有独立的隔离 `uv` 环境（参阅其 README） | `ml/bnn_forecaster/run_bnn_forecaster.py` | `ml/bnn_forecaster/README_ZH.md` |
