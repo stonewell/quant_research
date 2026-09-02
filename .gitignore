@@ -6,3 +6,4 @@ __pycache__/
 **/results/*.csv
 **/results/*.json
 .pytest_cache/
+uv.lock
