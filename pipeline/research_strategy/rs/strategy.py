@@ -61,7 +61,15 @@ from common.indicators import (
     rsi_wilder,
     sma,
 )
-from common.allocation_templates import AllocationTemplate, _inverse_vol_weights, _min_variance_weights
+from common.allocation_templates import (
+    AllocationTemplate,
+    _cap_and_deroute_to_cash,
+    _fill_out_columns,
+    _inverse_vol_weights,
+    _min_variance_weights,
+    _sparse_from_daily,
+)
+from common.position_exits import run_stop_timeout_exit
 from common.scheduling import get_rebalance_dates as _get_rebalance_dates
 from .chan_structure import compute_chan_signals
 from .chan_signals import compute_chan3_signals, compute_chan_pivot_macd_signals
@@ -89,21 +97,6 @@ CANONICAL_VOLATILITY_MANAGED_TEXT = (
     "Dynamically scale portfolio risk exposure using 20-day volatility-managed inverse variance scaling "
     "targeting 15% annual volatility, de-leveraging into cash proxy BIL when volatility spikes."
 )
-
-
-def _sparse_from_daily(daily: pd.DataFrame) -> pd.DataFrame:
-    """Compress a dense daily target-weight DataFrame to the sparse contract:
-    NaN except on a day the target actually differs from the previous day's."""
-    changed = (daily != daily.shift(1)).any(axis=1)
-    changed.iloc[0] = True
-    return daily.where(changed)
-
-
-def _fill_out_columns(daily: pd.DataFrame, symbols: list) -> pd.DataFrame:
-    for s in symbols:
-        if s not in daily.columns:
-            daily[s] = 0.0
-    return daily[symbols]
 
 
 def _get_risky_symbols(
@@ -574,30 +567,12 @@ class RSIMeanReversionStrategy(AllocationTemplate):
                 raise ValueError(f"Unknown rsi_exit_mode: {exit_mode!r} (expected 'rsi_cross', 'ma_cross', or 'either')")
             exit_signal = exit_signal.fillna(False)
 
-            in_position = False
-            entry_idx = 0
-            for i in range(n_bars):
-                if in_position:
-                    held = i - entry_idx
-                    stopped = stop_loss_pct is not None and (close.iloc[i] / close.iloc[entry_idx] - 1) <= -stop_loss_pct
-                    timed_out = max_holding_days is not None and held >= max_holding_days
-                    if exit_signal.iloc[i] or stopped or timed_out:
-                        in_position = False
-                        raw_weights[sym][i] = 0.0
-                    else:
-                        raw_weights[sym][i] = position_size_pct
-                elif entry_signal.iloc[i]:
-                    in_position = True
-                    entry_idx = i
-                    raw_weights[sym][i] = position_size_pct
+            raw_weights[sym] = run_stop_timeout_exit(
+                close, entry_signal, exit_signal, stop_loss_pct, max_holding_days, position_size_pct
+            )
 
         daily = pd.DataFrame(raw_weights, index=master_index)
-        total_risky_raw = daily.sum(axis=1)
-        scale = np.where(total_risky_raw > 1.0, 1.0 / total_risky_raw, 1.0)
-        daily = daily.mul(scale, axis=0)
-
-        if cash_proxy in symbols:
-            daily[cash_proxy] = np.maximum(0.0, 1.0 - daily.sum(axis=1))
+        daily = _cap_and_deroute_to_cash(daily, symbols, cash_proxy)
 
         daily = _fill_out_columns(daily, symbols)
         return _sparse_from_daily(daily)
@@ -702,12 +677,7 @@ class SwingTrendPullbackStrategy(AllocationTemplate):
                     raw_weights[sym][i] = position_size_pct
 
         daily = pd.DataFrame(raw_weights, index=master_index)
-        total_risky_raw = daily.sum(axis=1)
-        scale = np.where(total_risky_raw > 1.0, 1.0 / total_risky_raw, 1.0)
-        daily = daily.mul(scale, axis=0)
-
-        if cash_proxy in symbols:
-            daily[cash_proxy] = np.maximum(0.0, 1.0 - daily.sum(axis=1))
+        daily = _cap_and_deroute_to_cash(daily, symbols, cash_proxy)
 
         daily = _fill_out_columns(daily, symbols)
         return _sparse_from_daily(daily)
@@ -780,30 +750,12 @@ class ChanPivotShiftStrategy(AllocationTemplate):
             exit_signal = sig["sell_signal"].reindex(master_index).fillna(False)
             close = bars["Close"].reindex(master_index)
 
-            in_position = False
-            entry_idx = 0
-            for i in range(n_bars):
-                if in_position:
-                    held = i - entry_idx
-                    stopped = stop_loss_pct is not None and (close.iloc[i] / close.iloc[entry_idx] - 1) <= -stop_loss_pct
-                    timed_out = max_holding_days is not None and held >= max_holding_days
-                    if exit_signal.iloc[i] or stopped or timed_out:
-                        in_position = False
-                        raw_weights[sym][i] = 0.0
-                    else:
-                        raw_weights[sym][i] = position_size_pct
-                elif entry_signal.iloc[i]:
-                    in_position = True
-                    entry_idx = i
-                    raw_weights[sym][i] = position_size_pct
+            raw_weights[sym] = run_stop_timeout_exit(
+                close, entry_signal, exit_signal, stop_loss_pct, max_holding_days, position_size_pct
+            )
 
         daily = pd.DataFrame(raw_weights, index=master_index)
-        total_risky_raw = daily.sum(axis=1)
-        scale = np.where(total_risky_raw > 1.0, 1.0 / total_risky_raw, 1.0)
-        daily = daily.mul(scale, axis=0)
-
-        if cash_proxy in symbols:
-            daily[cash_proxy] = np.maximum(0.0, 1.0 - daily.sum(axis=1))
+        daily = _cap_and_deroute_to_cash(daily, symbols, cash_proxy)
 
         daily = _fill_out_columns(daily, symbols)
         return _sparse_from_daily(daily)
@@ -882,30 +834,12 @@ class ChanThreeTypeStrategy(AllocationTemplate):
             exit_signal = sig["sell_signal"].reindex(master_index).fillna(False)
             close = bars["Close"].reindex(master_index)
 
-            in_position = False
-            entry_idx = 0
-            for i in range(n_bars):
-                if in_position:
-                    held = i - entry_idx
-                    stopped = stop_loss_pct is not None and (close.iloc[i] / close.iloc[entry_idx] - 1) <= -stop_loss_pct
-                    timed_out = max_holding_days is not None and held >= max_holding_days
-                    if exit_signal.iloc[i] or stopped or timed_out:
-                        in_position = False
-                        raw_weights[sym][i] = 0.0
-                    else:
-                        raw_weights[sym][i] = position_size_pct
-                elif entry_signal.iloc[i]:
-                    in_position = True
-                    entry_idx = i
-                    raw_weights[sym][i] = position_size_pct
+            raw_weights[sym] = run_stop_timeout_exit(
+                close, entry_signal, exit_signal, stop_loss_pct, max_holding_days, position_size_pct
+            )
 
         daily = pd.DataFrame(raw_weights, index=master_index)
-        total_risky_raw = daily.sum(axis=1)
-        scale = np.where(total_risky_raw > 1.0, 1.0 / total_risky_raw, 1.0)
-        daily = daily.mul(scale, axis=0)
-
-        if cash_proxy in symbols:
-            daily[cash_proxy] = np.maximum(0.0, 1.0 - daily.sum(axis=1))
+        daily = _cap_and_deroute_to_cash(daily, symbols, cash_proxy)
 
         daily = _fill_out_columns(daily, symbols)
         return _sparse_from_daily(daily)
@@ -992,30 +926,12 @@ class ChanPivotShiftMACDStrategy(AllocationTemplate):
             exit_signal = sig["sell_signal"].reindex(master_index).fillna(False)
             close = bars["Close"].reindex(master_index)
 
-            in_position = False
-            entry_idx = 0
-            for i in range(n_bars):
-                if in_position:
-                    held = i - entry_idx
-                    stopped = stop_loss_pct is not None and (close.iloc[i] / close.iloc[entry_idx] - 1) <= -stop_loss_pct
-                    timed_out = max_holding_days is not None and held >= max_holding_days
-                    if exit_signal.iloc[i] or stopped or timed_out:
-                        in_position = False
-                        raw_weights[sym][i] = 0.0
-                    else:
-                        raw_weights[sym][i] = position_size_pct
-                elif entry_signal.iloc[i]:
-                    in_position = True
-                    entry_idx = i
-                    raw_weights[sym][i] = position_size_pct
+            raw_weights[sym] = run_stop_timeout_exit(
+                close, entry_signal, exit_signal, stop_loss_pct, max_holding_days, position_size_pct
+            )
 
         daily = pd.DataFrame(raw_weights, index=master_index)
-        total_risky_raw = daily.sum(axis=1)
-        scale = np.where(total_risky_raw > 1.0, 1.0 / total_risky_raw, 1.0)
-        daily = daily.mul(scale, axis=0)
-
-        if cash_proxy in symbols:
-            daily[cash_proxy] = np.maximum(0.0, 1.0 - daily.sum(axis=1))
+        daily = _cap_and_deroute_to_cash(daily, symbols, cash_proxy)
 
         daily = _fill_out_columns(daily, symbols)
         return _sparse_from_daily(daily)
@@ -1161,12 +1077,7 @@ class AdaptiveGridStrategy(AllocationTemplate):
                     cooldown_until = i + cooldown_bars_after_stop
 
         daily = pd.DataFrame(raw_weights, index=master_index)
-        total_risky_raw = daily.sum(axis=1)
-        scale = np.where(total_risky_raw > max_deployed, max_deployed / total_risky_raw, 1.0)
-        daily = daily.mul(scale, axis=0)
-
-        if cash_proxy in symbols:
-            daily[cash_proxy] = np.maximum(0.0, 1.0 - daily.sum(axis=1))
+        daily = _cap_and_deroute_to_cash(daily, symbols, cash_proxy, cap=max_deployed, cash_target=1.0)
 
         daily = _fill_out_columns(daily, symbols)
         return _sparse_from_daily(daily)
@@ -1513,12 +1424,7 @@ class CompounderMarginOfSafetyStrategy(AllocationTemplate):
 
         position_size_pct = 1.0 / len(candidate_symbols)
         daily = pd.DataFrame(raw_weights, index=master_index) * position_size_pct
-        total_risky_raw = daily.sum(axis=1)
-        scale = np.where(total_risky_raw > 1.0, 1.0 / total_risky_raw, 1.0)
-        daily = daily.mul(scale, axis=0)
-
-        if cash_proxy in symbols:
-            daily[cash_proxy] = np.maximum(0.0, 1.0 - daily.sum(axis=1))
+        daily = _cap_and_deroute_to_cash(daily, symbols, cash_proxy)
 
         daily = _fill_out_columns(daily, symbols)
         return _sparse_from_daily(daily)
@@ -1959,7 +1865,7 @@ class AdaptiveAssetAllocation(AllocationTemplate):
             return weights_df
 
         closes = pd.DataFrame({sym: universe[sym]["Close"] for sym in universe_symbols})
-        mom = closes.pct_change(mom_lookback)
+        mom = roc(closes, mom_lookback)
         rets = closes.pct_change()
         k = min(top_k, n_universe)
 

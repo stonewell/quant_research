@@ -20,23 +20,23 @@ import argparse
 import os
 import sys
 
-_PM_ROOT = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT = os.path.dirname(_PM_ROOT)
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
-if _PM_ROOT not in sys.path:
-    sys.path.insert(0, _PM_ROOT)
-_REPO_ROOT = os.path.dirname(_PROJECT_ROOT)
+# Ensure the repo root is in sys.path to allow importing from common
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from common.cli_utils import (
     add_data_provider_cli_args,
+    bootstrap_project_paths,
     build_data_kwargs,
     default_results_dir,
     load_universe_with_banner,
     shared_data_dir,
 )
+
+# Also add this project's own directory (for bare `from pmine...` imports)
+# and pipeline/ (for pattern_mining as a sibling group member).
+bootstrap_project_paths(_REPO_ROOT, __file__)
 from common.reporting import write_json_report
 from common.universe import add_universe_cli_args, resolve_universe_from_args
 from pmine.pattern_mining import mine_indicator_patterns

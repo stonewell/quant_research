@@ -30,23 +30,24 @@ from datetime import date, timedelta
 
 import pandas as pd
 
-# Ensure this project's own directory (for bare `from lsig...` imports),
-# pipeline/ (for research_strategy/fundamental_screener), and the repo root
-# (for common) are all in sys.path.
-_LIVE_SIGNAL_ROOT = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT = os.path.dirname(_LIVE_SIGNAL_ROOT)
-_REPO_ROOT = os.path.dirname(_PROJECT_ROOT)
-for _extra in (_LIVE_SIGNAL_ROOT, _PROJECT_ROOT, _REPO_ROOT):
-    if _extra not in sys.path:
-        sys.path.insert(0, _extra)
+# Add the repo root to sys.path to allow importing from common
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 from common.cli_utils import (
     add_data_provider_cli_args,
+    add_output_dir_override_args,
+    bootstrap_project_paths,
     build_data_kwargs,
     default_results_dir,
     load_universe_with_banner,
     shared_data_dir,
 )
+
+# This project's own directory (for bare `from lsig...` imports) plus
+# pipeline/ (for research_strategy/fundamental_screener).
+bootstrap_project_paths(_REPO_ROOT, __file__)
 from common.reporting import write_json_report
 from common.universe import add_universe_cli_args, resolve_universe_from_args
 from common.strategy_spec import get_template, load_strategy_file
@@ -78,10 +79,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Minimum |weight delta| to count as a buy/sell rather than a hold (default: 1e-6)")
     p.add_argument("--interval", default="1d")
     add_data_provider_cli_args(p, default_provider="yfinance")
-    p.add_argument("--results-dir", type=str, default=None,
-                   help=f"Override the output directory for the JSON report/CSV instruction (default: {RESULTS_DIR})")
-    p.add_argument("--cache-dir", type=str, default=None,
-                   help=f"Override the shared, workspace-wide OHLCV CSV cache directory (default: {DATA_DIR})")
+    add_output_dir_override_args(p, RESULTS_DIR, DATA_DIR, "the JSON report/CSV instruction")
     return p
 
 

@@ -11,8 +11,27 @@ Example:
 
 import argparse
 import os
+import sys
+
+# Ensure the repo root is in sys.path to allow importing from common
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import pandas as pd
+
+from common.cli_utils import (
+    add_data_provider_cli_args,
+    bootstrap_project_paths,
+    build_data_kwargs,
+    default_results_dir,
+    load_universe_with_banner,
+    shared_data_dir,
+)
+
+# Also add this project's own directory (for bare `from selectorbot...`
+# imports) and pipeline/ (for instrument_selection as a sibling group member).
+bootstrap_project_paths(_REPO_ROOT, __file__)
 
 from selectorbot import (
     candlestick,
@@ -25,13 +44,6 @@ from selectorbot import (
     scoring,
     selection,
     volatility,
-)
-from common.cli_utils import (
-    add_data_provider_cli_args,
-    build_data_kwargs,
-    default_results_dir,
-    load_universe_with_banner,
-    shared_data_dir,
 )
 from common.reporting import utc_timestamp, write_json_report
 from common.universe import add_universe_cli_args, resolve_universe_from_args

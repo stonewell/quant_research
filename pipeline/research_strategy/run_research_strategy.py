@@ -29,14 +29,8 @@ import os
 import statistics
 import sys
 
-# Ensure project root and research_strategy directory are in sys.path
-_RS_ROOT = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT = os.path.dirname(_RS_ROOT)
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
-if _RS_ROOT not in sys.path:
-    sys.path.insert(0, _RS_ROOT)
-_REPO_ROOT = os.path.dirname(_PROJECT_ROOT)
+# Ensure the repo root is in sys.path to allow importing from common
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
@@ -44,11 +38,21 @@ import numpy as np
 import pandas as pd
 
 from common.allocation_backtester import run_allocation_backtest
-from common.cli_utils import add_data_provider_cli_args, build_data_kwargs, default_results_dir, shared_data_dir
-from common.data import load_universe
+from common.cli_utils import (
+    add_data_provider_cli_args,
+    bootstrap_project_paths,
+    build_data_kwargs,
+    default_results_dir,
+    load_universe_with_banner,
+    shared_data_dir,
+)
 from common.factor_taxonomy import FACTOR_CATEGORIES
 from common.reporting import format_weights_pct, write_dense_weights_csv, write_json_report
 from common.universe import add_universe_cli_args, resolve_universe_from_args
+
+# Also add this project's own directory (for bare `from rs...` imports) and
+# pipeline/ (for research_strategy as a sibling group member).
+bootstrap_project_paths(_REPO_ROOT, __file__)
 from rs.config import StrategyConfig, load_strategies_config
 from rs.nl_parser import parse_plain_english_strategy
 from rs.strategy import (
@@ -260,14 +264,15 @@ def main():
 
     universe_symbols = resolve_universe_from_args(args, default_symbols=DEFAULT_UNIVERSE_SYMBOLS)
 
-    print(f"Loading market data for {len(universe_symbols)} symbols via provider "
-          f"'{args.data_provider}' ({start} to {end}) ...")
-    universe = load_universe(
-        universe_symbols, start=start, end=end,
+    universe = load_universe_with_banner(
+        universe_symbols, start, end,
         use_cache=not args.no_cache, cache_dir=DATA_DIR,
-        cache_max_age_days=args.cache_ttl_days, **data_kwargs,
+        data_kwargs=data_kwargs, require_nonempty=False,
+        cache_max_age_days=args.cache_ttl_days,
+        loading_msg=f"Loading market data for {len(universe_symbols)} symbols via provider "
+                    f"'{args.data_provider}' ({start} to {end}) ...",
     )
-    print(f"Loaded {len(universe)} symbols: {', '.join(universe.keys())}\n")
+    print()
 
     loaded_config = load_strategies_config(args.config)
     strategies_to_run = {}

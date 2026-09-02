@@ -27,22 +27,26 @@ import os
 import sys
 from dataclasses import asdict
 
-# Ensure project root and this project's own directory are in sys.path,
-# matching research_strategy/run_research_strategy.py's own convention.
-_FS_ROOT = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT = os.path.dirname(_FS_ROOT)
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
-if _FS_ROOT not in sys.path:
-    sys.path.insert(0, _FS_ROOT)
-_REPO_ROOT = os.path.dirname(_PROJECT_ROOT)
+# Ensure the repo root is in sys.path to allow importing from common
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from common.cli_utils import add_data_provider_cli_args, build_data_kwargs, default_results_dir, shared_data_dir
-from common.data import load_universe
+from common.cli_utils import (
+    add_data_provider_cli_args,
+    bootstrap_project_paths,
+    build_data_kwargs,
+    default_results_dir,
+    load_universe_with_banner,
+    shared_data_dir,
+)
 from common.reporting import utc_timestamp, write_json_report
 from common.universe import add_universe_cli_args, resolve_universe_from_args
+
+# Also add this project's own directory (for bare `from fscreen...` imports)
+# and pipeline/ (for fundamental_screener as a sibling group member).
+bootstrap_project_paths(_REPO_ROOT, __file__)
+
 from fscreen.config import DEFAULT_CANDIDATE_UNIVERSE, ScreenerConfig
 from fscreen.fundamentals import fetch_fundamentals_frame
 from fscreen.rules import evaluate_buy_sell, rank_buy_sell
@@ -104,11 +108,12 @@ def main():
         data_kwargs["seed"] = args.seed
 
     ohlcv_universe = list(dict.fromkeys(cfg.universe + [cfg.benchmark_symbol]))
-    print(f"Loading {len(ohlcv_universe)} symbols' OHLCV (benchmark comparator only) via provider "
-          f"'{args.data_provider}' ({args.start} to {args.end}) ...")
-    price_universe = load_universe(
-        ohlcv_universe, start=args.start, end=args.end, interval=args.interval,
-        use_cache=not args.no_cache, cache_dir=DATA_DIR, cache_max_age_days=args.cache_ttl_days, **data_kwargs,
+    price_universe = load_universe_with_banner(
+        ohlcv_universe, args.start, args.end, args.interval,
+        use_cache=not args.no_cache, cache_dir=DATA_DIR, data_kwargs=data_kwargs,
+        require_nonempty=False, cache_max_age_days=args.cache_ttl_days,
+        loading_msg=f"Loading {len(ohlcv_universe)} symbols' OHLCV (benchmark comparator only) via "
+                    f"provider '{args.data_provider}' ({args.start} to {args.end}) ...",
     )
     if cfg.benchmark_symbol not in price_universe:
         raise ValueError(f"Benchmark symbol '{cfg.benchmark_symbol}' could not be loaded -- cannot compute the sell-trigger comparator.")

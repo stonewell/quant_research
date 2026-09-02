@@ -1,16 +1,52 @@
 """Shared CLI scaffolding used by every project's `run_*.py` entrypoint in this
 workspace: default results/data directory conventions, the standard
-`--data-provider`/`--data-dir`/`--no-cache` argparse trio, and a universe-loading
-wrapper with the "Loading N symbols... Loaded M/N..." console banner. Pairs with
-`common/universe.py`'s `add_universe_cli_args`/`resolve_universe_from_args`.
+`--data-provider`/`--data-dir`/`--no-cache` argparse trio, a universe-loading
+wrapper with the "Loading N symbols... Loaded M/N..." console banner, and a
+`sys.path` bootstrap helper. Pairs with `common/universe.py`'s
+`add_universe_cli_args`/`resolve_universe_from_args`.
 """
 
 import os
+import sys
 from typing import Optional
 
 from .data import load_universe
 
 _PROVIDER_ROTATION = ["yfinance", "csv", "synthetic"]
+
+
+def bootstrap_project_paths(repo_root: str, caller_file: str, groups: tuple = ("pipeline", "ml")) -> None:
+    """Adds the caller's own directory and each sibling group directory
+    (`pipeline/`, `ml/`) to `sys.path`, so bare `import research_strategy...`-
+    style modules resolve regardless of which project's `run_*.py` imports
+    this first. Callers must add `repo_root` to `sys.path` THEMSELVES in one
+    line before importing this module -- `common/` itself isn't reachable
+    until that's already done, a real chicken-and-egg exception every caller
+    keeps inline:
+
+        _REPO_ROOT = os.path.dirname(...)  # however many dirname() calls the caller's own depth needs
+        if _REPO_ROOT not in sys.path:
+            sys.path.insert(0, _REPO_ROOT)
+        from common.cli_utils import bootstrap_project_paths
+        bootstrap_project_paths(_REPO_ROOT, __file__)
+    """
+    own_dir = os.path.dirname(os.path.abspath(caller_file))
+    for d in (own_dir, *(os.path.join(repo_root, g) for g in groups)):
+        if d not in sys.path:
+            sys.path.insert(0, d)
+
+
+def add_output_dir_override_args(parser, results_dir_default: str, cache_dir_default: str,
+                                  results_artifact_desc: str) -> None:
+    """Adds the standard `--results-dir`/`--cache-dir` override pair (shared
+    verbatim by `backtester/run_backtest.py` and `pipeline/live_signal/run_live_signal.py`
+    before this was centralized). Callers still resolve the actual value
+    themselves (`args.results_dir or RESULTS_DIR`) -- too trivial a line to
+    abstract further."""
+    parser.add_argument("--results-dir", type=str, default=None,
+                         help=f"Override the output directory for {results_artifact_desc} (default: {results_dir_default})")
+    parser.add_argument("--cache-dir", type=str, default=None,
+                         help=f"Override the shared, workspace-wide OHLCV CSV cache directory (default: {cache_dir_default})")
 
 
 def default_results_dir(caller_file: str) -> str:

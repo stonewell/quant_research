@@ -21,28 +21,28 @@ import sys
 import numpy as np
 import pandas as pd
 
-# Add the parent directory to sys.path to allow importing from common
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
-# research_strategy and fundamental_screener live under pipeline/,
-# bnn_forecaster under ml/ -- add both group directories so those projects' bare
-# `import research_strategy...`-style modules keep resolving unchanged.
-for _group in ("pipeline", "ml"):
-    _group_dir = os.path.join(_PROJECT_ROOT, _group)
-    if _group_dir not in sys.path:
-        sys.path.insert(0, _group_dir)
+# Add the repo root to sys.path to allow importing from common
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 from common.allocation_backtester import run_allocation_backtest
 from common.allocation_search import optimize_template
 from common.allocation_templates import ALLOCATION_TEMPLATES
 from common.cli_utils import (
     add_data_provider_cli_args,
+    add_output_dir_override_args,
+    bootstrap_project_paths,
     build_data_kwargs,
     default_results_dir,
     load_universe_with_banner,
     shared_data_dir,
 )
+
+# research_strategy and fundamental_screener live under pipeline/,
+# bnn_forecaster under ml/ -- add both group directories so those projects' bare
+# `import research_strategy...`-style modules keep resolving unchanged.
+bootstrap_project_paths(_REPO_ROOT, __file__)
 from common.metrics import alpha_beta, deflated_sharpe_ratio, information_ratio, tracking_error
 from common import plotting
 from common.reporting import format_backtest_metrics_summary, write_json_report
@@ -83,10 +83,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--ers-percentile-threshold", type=float, default=0.90)
     p.add_argument("--min-rebalances-for-trust", type=int, default=4)
     add_data_provider_cli_args(p)
-    p.add_argument("--results-dir", type=str, default=None,
-                   help=f"Override the output directory for equity/weights/report CSVs (default: {RESULTS_DIR})")
-    p.add_argument("--cache-dir", type=str, default=None,
-                   help=f"Override the shared, workspace-wide OHLCV CSV cache directory (default: {DATA_DIR})")
+    add_output_dir_override_args(p, RESULTS_DIR, DATA_DIR, "equity/weights/report CSVs")
     p.add_argument("--no-plots", action="store_true",
                    help="Skip the equity-curve chart normally produced in --mode standard (charts are ON by default).")
     return p

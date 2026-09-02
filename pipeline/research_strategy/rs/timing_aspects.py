@@ -17,12 +17,13 @@ percent-stop-loss/max-holding-days exit instead of Turtle's own ATR
 trailing stop.
 
 Lives in `research_strategy/rs/` (not `common/`) because it depends on
-`rs.strategy`'s single-asset-timing helpers (`_get_risky_symbols`,
-`_fill_out_columns`, `_sparse_from_daily`) and `rs.chan_structure` -- this
-module is itself an addition to `research_strategy`, not a core primitive.
-Deliberately NOT a refactor of the 4 existing classes (zero regression risk
-to already-tested code): this is new, parallel logic reusing
-`common.indicators`.
+`rs.strategy`'s single-asset-timing helper `_get_risky_symbols` and
+`rs.chan_structure` -- this module is itself an addition to
+`research_strategy`, not a core primitive. Deliberately NOT a refactor of the
+4 existing classes (zero regression risk to already-tested code): this is
+new, parallel logic reusing `common.indicators`, plus the same shared
+weight-shaping/exit-loop helpers (`common.allocation_templates`,
+`common.position_exits`) those classes themselves use.
 """
 
 from dataclasses import asdict, dataclass
@@ -31,12 +32,13 @@ from typing import Callable, Dict
 import numpy as np
 import pandas as pd
 
-from common.allocation_templates import AllocationTemplate
+from common.allocation_templates import AllocationTemplate, _cap_and_deroute_to_cash, _fill_out_columns, _sparse_from_daily
 from common.indicators import atr, cumulative_rsi, rsi, rsi_cutler, rsi_wilder, sma
+from common.position_exits import run_stop_timeout_exit
 
 from .chan_structure import compute_chan_signals
 from .chan_signals import compute_chan3_signals, compute_chan_pivot_macd_signals
-from .strategy import _fill_out_columns, _get_risky_symbols, _sparse_from_daily
+from .strategy import _get_risky_symbols
 
 
 @dataclass
@@ -246,7 +248,6 @@ ENTRY_SIGNAL_ASPECTS: Dict[str, EntrySignalAspect] = {
 
 def _exit_rsi_cross(df: pd.DataFrame, entry_signal: pd.Series, params: dict) -> np.ndarray:
     close = df["Close"]
-    n_bars = len(close)
     rsi_period = params.get("rsi_period", 2)
     rsi_method = params.get("rsi_method", "wilder")
     exit_mode = params.get("rsi_exit_mode", "rsi_cross")
@@ -270,25 +271,7 @@ def _exit_rsi_cross(df: pd.DataFrame, entry_signal: pd.Series, params: dict) -> 
         raise ValueError(f"Unknown rsi_exit_mode: {exit_mode!r} (expected 'rsi_cross', 'ma_cross', or 'either')")
     exit_signal = exit_signal.fillna(False).to_numpy()
 
-    close_arr = close.to_numpy()
-    entry_arr = entry_signal.to_numpy()
-    raw = np.zeros(n_bars)
-    in_position, entry_idx = False, 0
-    for i in range(n_bars):
-        if in_position:
-            held = i - entry_idx
-            stopped = stop_loss_pct is not None and (close_arr[i] / close_arr[entry_idx] - 1) <= -stop_loss_pct
-            timed_out = max_holding_days is not None and held >= max_holding_days
-            if exit_signal[i] or stopped or timed_out:
-                in_position = False
-                raw[i] = 0.0
-            else:
-                raw[i] = position_size_pct
-        elif entry_arr[i]:
-            in_position = True
-            entry_idx = i
-            raw[i] = position_size_pct
-    return raw
+    return run_stop_timeout_exit(close, entry_signal, exit_signal, stop_loss_pct, max_holding_days, position_size_pct)
 
 
 def _exit_swing_stop_target(df: pd.DataFrame, entry_signal: pd.Series, params: dict) -> np.ndarray:
@@ -339,7 +322,6 @@ def _exit_swing_stop_target(df: pd.DataFrame, entry_signal: pd.Series, params: d
 
 def _exit_chan_signal(df: pd.DataFrame, entry_signal: pd.Series, params: dict) -> np.ndarray:
     close = df["Close"]
-    n_bars = len(close)
     min_gap_bars = params.get("chan_min_gap_bars", 4)
     min_strokes = params.get("chan_min_strokes", 3)
     stop_loss_pct = params.get("chan_stop_loss_pct", 0.08)
@@ -349,30 +331,11 @@ def _exit_chan_signal(df: pd.DataFrame, entry_signal: pd.Series, params: dict) -
     sig = compute_chan_signals(df, min_gap_bars=min_gap_bars, min_strokes=min_strokes)
     exit_signal = sig["sell_signal"].reindex(df.index).fillna(False).to_numpy()
 
-    close_arr = close.to_numpy()
-    entry_arr = entry_signal.to_numpy()
-    raw = np.zeros(n_bars)
-    in_position, entry_idx = False, 0
-    for i in range(n_bars):
-        if in_position:
-            held = i - entry_idx
-            stopped = stop_loss_pct is not None and (close_arr[i] / close_arr[entry_idx] - 1) <= -stop_loss_pct
-            timed_out = max_holding_days is not None and held >= max_holding_days
-            if exit_signal[i] or stopped or timed_out:
-                in_position = False
-                raw[i] = 0.0
-            else:
-                raw[i] = position_size_pct
-        elif entry_arr[i]:
-            in_position = True
-            entry_idx = i
-            raw[i] = position_size_pct
-    return raw
+    return run_stop_timeout_exit(close, entry_signal, exit_signal, stop_loss_pct, max_holding_days, position_size_pct)
 
 
 def _exit_chan3_point(df: pd.DataFrame, entry_signal: pd.Series, params: dict) -> np.ndarray:
     close = df["Close"]
-    n_bars = len(close)
     min_gap_bars = params.get("chan3_min_gap_bars", 4)
     min_strokes = params.get("chan3_min_strokes", 3)
     macd_fast = params.get("chan3_macd_fast", 12)
@@ -388,30 +351,11 @@ def _exit_chan3_point(df: pd.DataFrame, entry_signal: pd.Series, params: dict) -
     )
     exit_signal = sig["sell_signal"].reindex(df.index).fillna(False).to_numpy()
 
-    close_arr = close.to_numpy()
-    entry_arr = entry_signal.to_numpy()
-    raw = np.zeros(n_bars)
-    in_position, entry_idx = False, 0
-    for i in range(n_bars):
-        if in_position:
-            held = i - entry_idx
-            stopped = stop_loss_pct is not None and (close_arr[i] / close_arr[entry_idx] - 1) <= -stop_loss_pct
-            timed_out = max_holding_days is not None and held >= max_holding_days
-            if exit_signal[i] or stopped or timed_out:
-                in_position = False
-                raw[i] = 0.0
-            else:
-                raw[i] = position_size_pct
-        elif entry_arr[i]:
-            in_position = True
-            entry_idx = i
-            raw[i] = position_size_pct
-    return raw
+    return run_stop_timeout_exit(close, entry_signal, exit_signal, stop_loss_pct, max_holding_days, position_size_pct)
 
 
 def _exit_chanm_signal(df: pd.DataFrame, entry_signal: pd.Series, params: dict) -> np.ndarray:
     close = df["Close"]
-    n_bars = len(close)
     min_gap_bars = params.get("chanm_min_gap_bars", 4)
     min_strokes = params.get("chanm_min_strokes", 3)
     macd_fast = params.get("chanm_macd_fast", 12)
@@ -427,25 +371,7 @@ def _exit_chanm_signal(df: pd.DataFrame, entry_signal: pd.Series, params: dict) 
     )
     exit_signal = sig["sell_signal"].reindex(df.index).fillna(False).to_numpy()
 
-    close_arr = close.to_numpy()
-    entry_arr = entry_signal.to_numpy()
-    raw = np.zeros(n_bars)
-    in_position, entry_idx = False, 0
-    for i in range(n_bars):
-        if in_position:
-            held = i - entry_idx
-            stopped = stop_loss_pct is not None and (close_arr[i] / close_arr[entry_idx] - 1) <= -stop_loss_pct
-            timed_out = max_holding_days is not None and held >= max_holding_days
-            if exit_signal[i] or stopped or timed_out:
-                in_position = False
-                raw[i] = 0.0
-            else:
-                raw[i] = position_size_pct
-        elif entry_arr[i]:
-            in_position = True
-            entry_idx = i
-            raw[i] = position_size_pct
-    return raw
+    return run_stop_timeout_exit(close, entry_signal, exit_signal, stop_loss_pct, max_holding_days, position_size_pct)
 
 
 def _exit_turtle_atr_trailing(df: pd.DataFrame, entry_signal: pd.Series, params: dict) -> np.ndarray:
@@ -624,12 +550,7 @@ class CompositeTimingTemplate(AllocationTemplate):
             raw_weights[sym] = self.exit.run(df, entry_signal, p)
 
         daily = pd.DataFrame(raw_weights, index=master_index)
-        total_risky_raw = daily.sum(axis=1)
-        scale = np.where(total_risky_raw > 1.0, 1.0 / total_risky_raw, 1.0)
-        daily = daily.mul(scale, axis=0)
-
-        if cash_proxy in symbols:
-            daily[cash_proxy] = np.maximum(0.0, 1.0 - daily.sum(axis=1))
+        daily = _cap_and_deroute_to_cash(daily, symbols, cash_proxy)
 
         daily = _fill_out_columns(daily, symbols)
         return _sparse_from_daily(daily)

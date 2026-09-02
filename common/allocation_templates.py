@@ -173,6 +173,48 @@ def _min_variance_weights(cov: np.ndarray) -> np.ndarray:
     return w / total if total > 0 else x0
 
 
+def _fill_out_columns(daily: pd.DataFrame, symbols: list) -> pd.DataFrame:
+    """Ensures `daily` has exactly `symbols` as its columns, in that order --
+    any symbol not already present gets an explicit 0.0 column (never NaN,
+    per the sparse-weights NaN-vs-0.0 contract). Shared by every single-asset
+    timing template/aspect that builds its own weights per-symbol before
+    reassembling the full universe-wide frame."""
+    for s in symbols:
+        if s not in daily.columns:
+            daily[s] = 0.0
+    return daily[symbols]
+
+
+def _sparse_from_daily(daily: pd.DataFrame) -> pd.DataFrame:
+    """Compress a dense daily target-weight DataFrame to the sparse contract:
+    NaN except on a day the target actually differs from the previous day's."""
+    changed = (daily != daily.shift(1)).any(axis=1)
+    changed.iloc[0] = True
+    return daily.where(changed)
+
+
+def _cap_and_deroute_to_cash(
+    daily: pd.DataFrame, symbols: list, cash_proxy: str, cap: float = 1.0, cash_target: float = None,
+) -> pd.DataFrame:
+    """Scales down any date whose total risky-symbol weight exceeds `cap`
+    (proportionally, so relative weights among the day's positions are
+    preserved), then routes whatever's left of `cash_target` (defaults to
+    `cap` itself) after that scaling into `cash_proxy` (an explicit
+    0.0-floor write, per the sparse-weights NaN-vs-0.0 contract). Both are
+    full weight fractions, not percentages. `cash_target` only needs to
+    differ from `cap` for a strategy that deliberately caps deployed capital
+    below 1.0 (a capital reserve) while still routing the FULL remainder up
+    to 1.0 into cash, e.g. `AdaptiveGridStrategy`."""
+    if cash_target is None:
+        cash_target = cap
+    total_risky_raw = daily.sum(axis=1)
+    scale = np.where(total_risky_raw > cap, cap / total_risky_raw, 1.0)
+    daily = daily.mul(scale, axis=0)
+    if cash_proxy in symbols:
+        daily[cash_proxy] = np.maximum(0.0, cash_target - daily.sum(axis=1))
+    return daily
+
+
 def build_aggregate_curve(universe: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     """Equal-weight aggregate OHLCV curve for a whole universe: each symbol's
     own OHLC is rebased to start at the same level (100), then averaged

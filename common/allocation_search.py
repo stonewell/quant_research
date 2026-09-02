@@ -35,6 +35,7 @@ import numpy as np
 import pandas as pd
 
 from common.allocation_templates import AllocationTemplate
+from common.scheduling import get_rebalance_dates
 
 ScoreFn = Callable[[object, dict], dict]
 
@@ -59,7 +60,7 @@ def random_weights(universe: dict, rebalance_freq_days: int, rng: np.random.Gene
         return pd.DataFrame()
 
     master_index = universe[symbols[0]].index
-    rebalance_dates = master_index[::rebalance_freq_days]
+    rebalance_dates = get_rebalance_dates(master_index, rebalance_freq_days)
 
     n_dates = len(rebalance_dates)
     n_symbols = len(symbols)

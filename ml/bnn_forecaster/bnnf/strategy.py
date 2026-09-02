@@ -18,9 +18,9 @@ strategies (`RSIMeanReversionStrategy`, `TurtleBreakoutStrategy`) and this
 workspace's other two "beat the benchmark" siblings
 (`CompounderMarginOfSafetyStrategy`, `FundamentalMarginOfSafetyStrategy`) --
 a genuine buy-high/sell-low hysteresis needs per-symbol position state.
-`_fill_out_columns`/`_sparse_from_daily` are duplicated here (not imported
-cross-project) to keep this project decoupled, matching this workspace's
-per-project-owns-its-helpers convention.
+`_fill_out_columns`/`_sparse_from_daily` were duplicated here in three
+projects independently before being centralized into
+`common.allocation_templates` -- imported from there now, not redefined.
 """
 
 from dataclasses import fields, replace
@@ -29,25 +29,12 @@ from typing import Dict
 import numpy as np
 import pandas as pd
 
-from common.allocation_templates import AllocationTemplate
+from common.allocation_templates import AllocationTemplate, _fill_out_columns, _sparse_from_daily
 
 from .config import ForecasterConfig
 from .forecasting import fit_forecast
 
 _FORECASTER_CONFIG_FIELDS = {f.name for f in fields(ForecasterConfig)}
-
-
-def _fill_out_columns(daily: pd.DataFrame, symbols: list) -> pd.DataFrame:
-    for s in symbols:
-        if s not in daily.columns:
-            daily[s] = 0.0
-    return daily[symbols]
-
-
-def _sparse_from_daily(daily: pd.DataFrame) -> pd.DataFrame:
-    changed = (daily != daily.shift(1)).any(axis=1)
-    changed.iloc[0] = True
-    return daily.where(changed)
 
 
 class BnnForecastStrategy(AllocationTemplate):
