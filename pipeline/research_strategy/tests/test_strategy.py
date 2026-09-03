@@ -368,19 +368,21 @@ def test_vaa_warmup_bars():
     assert VigilantAssetAllocation().warmup_bars() == 252
 
 
-# --- Regression: default `<x>_symbol` must not silently expand to the full
-# --- multi-asset universe (see _get_risky_symbols) -----------------------
+# --- Default config now trades the FULL passed universe, not a hardcoded
+# --- single symbol (see _get_risky_symbols) -------------------------------
 
-def test_default_config_trades_only_spy_even_with_a_full_multi_symbol_universe_present():
-    # Regression test: `_get_risky_symbols` used to special-case the literal
-    # string "SPY" as meaning "not customized", so ANY config leaving
-    # `<x>_symbol` at its default (or explicitly set to "SPY", the shipped
-    # default in strategies_config.json for every one of these four
-    # strategies) would silently expand to the full `risky_universe` instead
-    # of trading just SPY. `create_mock_universe` intentionally contains all
-    # of DEFAULT_RISKY_UNIVERSE plus extras -- exactly the shape of universe
-    # the real CLI builds, where the bug was only ever visible (every other
-    # test here uses a minimal 2-symbol universe that masked it).
+def test_default_config_now_trades_the_full_multi_symbol_universe():
+    # `_get_risky_symbols` deliberately resolves to every symbol actually
+    # present in the passed universe (minus cash_proxy) by default for these
+    # single-instrument timing strategies -- each already recomputes its own
+    # entry/exit signal independently per-symbol, so a whole-universe basket
+    # is the intended default now, not an opt-in via params={"symbols": [...]}.
+    # (A prior version of this test pinned the OPPOSITE contract -- "default
+    # config always trades just SPY, even with other symbols present" -- see
+    # git history for that superseded regression test.) `create_mock_universe`
+    # intentionally contains all of DEFAULT_RISKY_UNIVERSE plus extras --
+    # exactly the shape of universe the real CLI builds via --universe/
+    # --universe-file.
     universe = create_mock_universe(n_days=300)
 
     for strat in (
@@ -392,9 +394,40 @@ def test_default_config_trades_only_spy_even_with_a_full_multi_symbol_universe_p
         weights = strat.generate_weights(universe)
         daily = _daily(weights)
         other_symbols = [s for s in universe if s not in ("SPY", "BIL")]
-        assert not (daily[other_symbols] > 0).any().any(), (
-            f"{type(strat).__name__} with default config traded a non-SPY symbol"
+        assert (daily[other_symbols] > 0).any().any(), (
+            f"{type(strat).__name__} with default config should now trade the full universe, not just SPY"
         )
+
+
+def test_basket_strategies_handle_mismatched_symbol_calendars_without_crashing():
+    """Regression test for a real crash hit via `--data-provider yfinance`:
+    real market data isn't guaranteed to give every symbol in a universe the
+    exact same number of bars (holiday-calendar differences, late listings,
+    provider gaps). Once a strategy's default basket can include more than
+    one symbol (see _get_risky_symbols), building the final weights
+    DataFrame from differently-sized per-symbol arrays used to raise
+    'ValueError: Length of values (N) does not match length of index (N+1)'.
+    Trim one symbol short by a single bar to reproduce that exact shape."""
+    universe = create_mock_universe(n_days=300)
+    universe["GLD"] = universe["GLD"].iloc[:-1]  # one fewer trading day than everyone else
+
+    strategies = [
+        RSIMeanReversionStrategy(StrategyConfig(rsi_require_trend_filter=False, rsi_oversold_threshold=90)),
+        SwingTrendPullbackStrategy(StrategyConfig(swing_require_rising_trend_ma=False, swing_entry_rsi_threshold=90)),
+        AdaptiveGridStrategy(),
+        EnsembleRegimeSwitchingStrategy(StrategyConfig(ensemble_mode="trend_only")),
+        TurtleBreakoutStrategy(StrategyConfig(turtle_require_trend_filter=False)),
+        ChanPivotShiftStrategy(),
+        ChanThreeTypeStrategy(),
+        ChanPivotShiftMACDStrategy(),
+    ]
+    for strat in strategies:
+        weights = strat.generate_weights(universe)  # must not raise
+        assert isinstance(weights, pd.DataFrame), f"{type(strat).__name__} did not return a DataFrame"
+        if not weights.empty:
+            assert len(weights) <= len(universe["GLD"]), (
+                f"{type(strat).__name__}'s aligned index must never exceed the shortest symbol's own length"
+            )
 
 
 # --- RSIMeanReversionStrategy -------------------------------------------
@@ -460,10 +493,15 @@ def test_rsi_max_holding_days_forces_an_exit():
     assert daily["SPY"].iloc[entry_day_pos + 5] == 0.0
 
 
-def test_rsi_missing_symbol_returns_empty():
+def test_rsi_ignores_stale_symbol_param_and_trades_universe_instead():
+    # Regression: rsi_symbol is no longer consulted for symbol resolution --
+    # generate_weights always trades whatever's actually in the passed
+    # universe (see _get_risky_symbols), so a stale/wrong rsi_symbol value
+    # has zero effect instead of silently producing empty weights.
     universe = _timing_universe(make_oscillating_df(n=100))
-    cfg = StrategyConfig(rsi_symbol="NOT_IN_UNIVERSE")
-    assert RSIMeanReversionStrategy(cfg).generate_weights(universe).empty
+    default_weights = RSIMeanReversionStrategy(StrategyConfig()).generate_weights(universe)
+    stale_weights = RSIMeanReversionStrategy(StrategyConfig(rsi_symbol="NOT_IN_UNIVERSE")).generate_weights(universe)
+    pd.testing.assert_frame_equal(default_weights, stale_weights)
 
 
 def test_rsi_warmup_bars():
@@ -480,9 +518,10 @@ def test_rsi_multi_asset_allocates_across_qualifying_symbols():
     }
     cfg = StrategyConfig(rsi_require_trend_filter=False, rsi_oversold_threshold=30)
     strat = RSIMeanReversionStrategy(cfg)
-    # rsi_symbol defaults to "SPY", which is now correctly honored as "trade
-    # just SPY" -- multi-asset evaluation is an explicit opt-in via params.
-    weights = strat.generate_weights(universe, params={"symbols": ["SPY", "QQQ"]})
+    # Multi-asset evaluation is now the default (see _get_risky_symbols) --
+    # no params override needed; every symbol in the passed universe (minus
+    # cash_proxy) is traded.
+    weights = strat.generate_weights(universe)
     daily = _daily(weights)
 
     assert "SPY" in daily.columns
@@ -570,10 +609,11 @@ def test_swing_max_holding_days_forces_an_exit():
     assert daily["SPY"].iloc[entry_day_pos + 10] == 0.0
 
 
-def test_swing_missing_symbol_returns_empty():
+def test_swing_ignores_stale_symbol_param_and_trades_universe_instead():
     universe = _timing_universe(make_trending_pullback_df(n=100))
-    cfg = StrategyConfig(swing_symbol="NOT_IN_UNIVERSE")
-    assert SwingTrendPullbackStrategy(cfg).generate_weights(universe).empty
+    default_weights = SwingTrendPullbackStrategy(StrategyConfig()).generate_weights(universe)
+    stale_weights = SwingTrendPullbackStrategy(StrategyConfig(swing_symbol="NOT_IN_UNIVERSE")).generate_weights(universe)
+    pd.testing.assert_frame_equal(default_weights, stale_weights)
 
 
 def test_swing_warmup_bars():
@@ -590,9 +630,9 @@ def test_swing_multi_asset_normalizes_weights_when_multiple_symbols_trigger():
     }
     cfg = StrategyConfig(swing_position_size_pct=1.0)
     strat = SwingTrendPullbackStrategy(cfg)
-    # swing_symbol defaults to "SPY", now correctly honored as "trade just
-    # SPY" -- multi-asset evaluation is an explicit opt-in via params.
-    weights = strat.generate_weights(universe, params={"symbols": ["SPY", "QQQ"]})
+    # Multi-asset evaluation is now the default (see _get_risky_symbols) --
+    # no params override needed.
+    weights = strat.generate_weights(universe)
     daily = _daily(weights)
 
     assert "SPY" in daily.columns
@@ -681,10 +721,11 @@ def test_chan_max_holding_days_forces_an_exit():
     assert daily["SPY"].iloc[entry_day_pos + 5] == 0.0
 
 
-def test_chan_missing_symbol_returns_empty():
+def test_chan_ignores_stale_symbol_param_and_trades_universe_instead():
     universe = _timing_universe(make_oscillating_df(n=100))
-    cfg = StrategyConfig(chan_symbol="NOT_IN_UNIVERSE")
-    assert ChanPivotShiftStrategy(cfg).generate_weights(universe).empty
+    default_weights = ChanPivotShiftStrategy(StrategyConfig()).generate_weights(universe)
+    stale_weights = ChanPivotShiftStrategy(StrategyConfig(chan_symbol="NOT_IN_UNIVERSE")).generate_weights(universe)
+    pd.testing.assert_frame_equal(default_weights, stale_weights)
 
 
 def test_chan_warmup_bars():
@@ -703,7 +744,8 @@ def test_chan_multi_asset_normalizes_weights_when_multiple_symbols_trigger():
     }
     cfg = StrategyConfig(chan_position_size_pct=1.0)
     strat = ChanPivotShiftStrategy(cfg)
-    weights = strat.generate_weights(universe, params={"symbols": ["SPY", "QQQ"]})
+    # Multi-asset evaluation is now the default (see _get_risky_symbols).
+    weights = strat.generate_weights(universe)
     daily = _daily(weights)
 
     assert "SPY" in daily.columns
@@ -794,10 +836,11 @@ def test_chan3_max_holding_days_forces_an_exit():
     assert daily["SPY"].iloc[entry_day_pos + 5] == 0.0
 
 
-def test_chan3_missing_symbol_returns_empty():
+def test_chan3_ignores_stale_symbol_param_and_trades_universe_instead():
     universe = _timing_universe(make_oscillating_df(n=100))
-    cfg = StrategyConfig(chan3_symbol="NOT_IN_UNIVERSE")
-    assert ChanThreeTypeStrategy(cfg).generate_weights(universe).empty
+    default_weights = ChanThreeTypeStrategy(StrategyConfig()).generate_weights(universe)
+    stale_weights = ChanThreeTypeStrategy(StrategyConfig(chan3_symbol="NOT_IN_UNIVERSE")).generate_weights(universe)
+    pd.testing.assert_frame_equal(default_weights, stale_weights)
 
 
 def test_chan3_warmup_bars():
@@ -817,7 +860,8 @@ def test_chan3_multi_asset_normalizes_weights_when_multiple_symbols_trigger():
     }
     cfg = StrategyConfig(chan3_position_size_pct=1.0)
     strat = ChanThreeTypeStrategy(cfg)
-    weights = strat.generate_weights(universe, params={"symbols": ["SPY", "QQQ"]})
+    # Multi-asset evaluation is now the default (see _get_risky_symbols).
+    weights = strat.generate_weights(universe)
     daily = _daily(weights)
 
     assert "SPY" in daily.columns
@@ -907,10 +951,11 @@ def test_chanm_max_holding_days_forces_an_exit():
     assert daily["SPY"].iloc[entry_day_pos + 5] == 0.0
 
 
-def test_chanm_missing_symbol_returns_empty():
+def test_chanm_ignores_stale_symbol_param_and_trades_universe_instead():
     universe = _timing_universe(make_oscillating_df(n=100))
-    cfg = StrategyConfig(chanm_symbol="NOT_IN_UNIVERSE")
-    assert ChanPivotShiftMACDStrategy(cfg).generate_weights(universe).empty
+    default_weights = ChanPivotShiftMACDStrategy(StrategyConfig()).generate_weights(universe)
+    stale_weights = ChanPivotShiftMACDStrategy(StrategyConfig(chanm_symbol="NOT_IN_UNIVERSE")).generate_weights(universe)
+    pd.testing.assert_frame_equal(default_weights, stale_weights)
 
 
 def test_chanm_warmup_bars():
@@ -930,7 +975,8 @@ def test_chanm_multi_asset_normalizes_weights_when_multiple_symbols_trigger():
     }
     cfg = StrategyConfig(chanm_position_size_pct=1.0)
     strat = ChanPivotShiftMACDStrategy(cfg)
-    weights = strat.generate_weights(universe, params={"symbols": ["SPY", "QQQ"]})
+    # Multi-asset evaluation is now the default (see _get_risky_symbols).
+    weights = strat.generate_weights(universe)
     daily = _daily(weights)
 
     assert "SPY" in daily.columns
@@ -978,10 +1024,11 @@ def test_grid_drawdown_circuit_breaker_flattens_and_cools_down():
     assert daily["SPY"].iloc[-1] == 0.0
 
 
-def test_grid_missing_symbol_returns_empty():
+def test_grid_ignores_stale_symbol_param_and_trades_universe_instead():
     universe = _timing_universe(make_oscillating_df(n=100))
-    cfg = StrategyConfig(grid_symbol="NOT_IN_UNIVERSE")
-    assert AdaptiveGridStrategy(cfg).generate_weights(universe).empty
+    default_weights = AdaptiveGridStrategy(StrategyConfig()).generate_weights(universe)
+    stale_weights = AdaptiveGridStrategy(StrategyConfig(grid_symbol="NOT_IN_UNIVERSE")).generate_weights(universe)
+    pd.testing.assert_frame_equal(default_weights, stale_weights)
 
 
 def test_grid_warmup_bars():
@@ -997,9 +1044,9 @@ def test_grid_multi_asset_deploys_grids_across_multiple_symbols():
         "BIL": make_ohlcv_from_closes([100.0] * 500, start=str(df1.index[0].date())),
     }
     strat = AdaptiveGridStrategy()
-    # grid_symbol defaults to "SPY", now correctly honored as "trade just
-    # SPY" -- multi-asset evaluation is an explicit opt-in via params.
-    weights = strat.generate_weights(universe, params={"symbols": ["SPY", "QQQ"]})
+    # Multi-asset evaluation is now the default (see _get_risky_symbols) --
+    # no params override needed.
+    weights = strat.generate_weights(universe)
     daily = _daily(weights)
 
     assert "SPY" in daily.columns
@@ -1034,10 +1081,11 @@ def test_ensemble_downtrend_always_forces_cash_regardless_of_mode():
         assert not (daily["SPY"].iloc[-10:] > 0).any(), f"mode={mode} should be flat deep in a downtrend"
 
 
-def test_ensemble_missing_symbol_returns_empty():
+def test_ensemble_ignores_stale_symbol_param_and_trades_universe_instead():
     universe = _timing_universe(make_trending_pullback_df(n=100))
-    cfg = StrategyConfig(ensemble_symbol="NOT_IN_UNIVERSE")
-    assert EnsembleRegimeSwitchingStrategy(cfg).generate_weights(universe).empty
+    default_weights = EnsembleRegimeSwitchingStrategy(StrategyConfig()).generate_weights(universe)
+    stale_weights = EnsembleRegimeSwitchingStrategy(StrategyConfig(ensemble_symbol="NOT_IN_UNIVERSE")).generate_weights(universe)
+    pd.testing.assert_frame_equal(default_weights, stale_weights)
 
 
 def test_ensemble_unknown_mode_raises():
@@ -1062,9 +1110,9 @@ def test_ensemble_multi_asset_equal_weights_trending_symbols():
     }
     cfg = StrategyConfig(ensemble_mode="trend_only", ensemble_trend_ma_period=200)
     strat = EnsembleRegimeSwitchingStrategy(cfg)
-    # ensemble_symbol defaults to "SPY", now correctly honored as "trade just
-    # SPY" -- multi-asset evaluation is an explicit opt-in via params.
-    weights = strat.generate_weights(universe, params={"symbols": ["SPY", "QQQ"]})
+    # Multi-asset evaluation is now the default (see _get_risky_symbols) --
+    # no params override needed.
+    weights = strat.generate_weights(universe)
     daily = _daily(weights)
 
     both_active = (daily["SPY"] > 0) & (daily["QQQ"] > 0)
@@ -1339,6 +1387,9 @@ def test_turtle_breakout_multi_asset_inverse_atr_weights():
     assert not weights.empty
     assert "SPY" in daily.columns
     assert "QQQ" in daily.columns
+    # Multi-asset evaluation is now the default -- QQQ must be genuinely
+    # traded, not just present as an always-included zero column.
+    assert (daily["QQQ"] != 0).any()
 
 
 # --- Modern Popular Static Portfolios -------------------------------------

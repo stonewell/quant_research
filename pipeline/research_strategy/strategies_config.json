@@ -66,7 +66,6 @@
     "class_name": "RSIMeanReversionStrategy",
     "description": "Connors-style RSI(2) long-only mean-reversion timing strategy extended for multi-asset evaluation.",
     "parameters": {
-      "rsi_symbol": "SPY",
       "rsi_period": 2,
       "rsi_method": "wilder",
       "rsi_entry_mode": "single",
@@ -91,7 +90,6 @@
     "class_name": "SwingTrendPullbackStrategy",
     "description": "Trend-following pullback swing strategy buying dips in confirmed uptrends across active risky symbols.",
     "parameters": {
-      "swing_symbol": "SPY",
       "swing_trend_ma_period": 200,
       "swing_require_rising_trend_ma": true,
       "swing_trend_slope_lookback": 20,
@@ -116,7 +114,6 @@
     "class_name": "ChanPivotShiftStrategy",
     "description": "Original, from-scratch reading of Chan theory (缠中说缠): buys once the price pivot (consolidation range) steps up to a wholly higher band and a confirming pullback low forms; not a port of the third-party czsc library.",
     "parameters": {
-      "chan_symbol": "SPY",
       "chan_min_gap_bars": 4,
       "chan_min_strokes": 3,
       "chan_stop_loss_pct": 0.08,
@@ -132,7 +129,6 @@
     "class_name": "ChanThreeTypeStrategy",
     "description": "Additive extension of chan_pivot_shift: segments (线段), segment-level pivots, real MACD-histogram-area divergence (背驰), and the formal 一/二/三类买卖点 taxonomy; coexists with chan_pivot_shift, does not replace it.",
     "parameters": {
-      "chan3_symbol": "SPY",
       "chan3_min_gap_bars": 4,
       "chan3_min_strokes": 3,
       "chan3_macd_fast": 12,
@@ -151,7 +147,6 @@
     "class_name": "ChanPivotShiftMACDStrategy",
     "description": "Additive copy of chan_pivot_shift: same stroke-based pivot-band-shift buy/sell rule, but its disclosed stroke-slope divergence proxy replaced by real MACD-histogram-area divergence (背驰), made symmetric (top-divergence sell AND bottom-divergence buy); coexists with chan_pivot_shift, does not replace it.",
     "parameters": {
-      "chanm_symbol": "SPY",
       "chanm_min_gap_bars": 4,
       "chanm_min_strokes": 3,
       "chanm_macd_fast": 12,
@@ -187,7 +182,6 @@
     "class_name": "AdaptiveGridStrategy",
     "description": "Volatility-scaled grid trading strategy with trend filters and equity drawdown circuit breakers.",
     "parameters": {
-      "grid_symbol": "SPY",
       "grid_atr_period": 14,
       "grid_atr_multiplier": 1.0,
       "grid_min_spacing_pct": 0.01,
@@ -212,7 +206,6 @@
     "class_name": "EnsembleRegimeSwitchingStrategy",
     "description": "ADX regime-switching ensemble combining trend-following and RSI mean-reversion sleeves.",
     "parameters": {
-      "ensemble_symbol": "SPY",
       "ensemble_mode": "ensemble",
       "ensemble_trend_ma_period": 200,
       "ensemble_adx_period": 14,

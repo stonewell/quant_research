@@ -110,17 +110,20 @@ def _get_risky_symbols(
 
     Precedence: an explicit per-call override via `params` ("symbol" for a
     single ticker, "symbols"/"risky_universe" for a list) always wins.
-    Absent any override, the strategy's own configured `<x>_symbol` is
-    authoritative for single-symbol trading -- e.g. `RSIMeanReversionStrategy()`
-    with zero params trades just "SPY" (matching the original single-asset
-    project this was ported from), because `cfg_symbol` is honored whenever
-    it's set, NOT treated as a "still at its default" sentinel just because
-    it happens to equal the field's own default value. (A prior version
-    special-cased the literal string "SPY" as meaning "unset" -- which broke
-    every config that named SPY, including the shipped defaults, since a
-    string can't distinguish "left at default" from "explicitly chosen".)
-    Only when `cfg_symbol` itself is empty/None does this fall back to the
-    shared multi-asset `risky_universe` for genuine multi-symbol evaluation."""
+    Absent any override, `cfg_symbol` (when non-empty) is honored for
+    single-symbol trading. Passing `cfg_symbol=None, cfg_risky_universe=None`
+    deliberately skips both hardcoded-symbol branches and lands on the final
+    fallback below -- every symbol actually present in the passed `universe`,
+    minus `cash_proxy` -- which is what the 8 single-instrument atomic timing
+    strategies (RSI/Swing/Grid/Ensemble/Turtle/Chan x3) now pass, since each
+    already independently recomputes its own entry/exit signal per-symbol in
+    its own `generate_weights` loop, making a whole-universe basket coherent.
+    `CompositeTimingTemplate` (rs/timing_aspects.py) must NOT do this -- its
+    entry/exit aspect functions compute ONE signal off a single resolved `df`,
+    so resolving more than one symbol there would nonsensically broadcast
+    that one signal across unrelated tickers (see
+    test_composite_timing_only_trades_entry_aspects_own_symbol_not_full_risky_universe);
+    it always passes its real `cfg_symbol`/`risky_universe` values."""
     p = params or {}
     if "symbol" in p and p["symbol"]:
         sym = p["symbol"]
@@ -133,10 +136,28 @@ def _get_risky_symbols(
     if cfg_symbol:
         return [cfg_symbol] if cfg_symbol in universe else []
 
-    candidates = [s for s in cfg_risky_universe if s in universe and s != cash_proxy]
+    candidates = [s for s in (cfg_risky_universe or []) if s in universe and s != cash_proxy]
     if not candidates:
         candidates = [s for s in universe if s != cash_proxy]
     return candidates
+
+
+def _aligned_master_index(universe: Dict[str, pd.DataFrame], risky_symbols: List[str]) -> pd.DatetimeIndex:
+    """Real (and especially multi-symbol) market data isn't guaranteed to
+    share one exact trading calendar -- different listing dates, holiday
+    calendars (e.g. international ETFs), or provider gaps can leave one
+    symbol's index a few bars shorter/longer than another's even within the
+    same loaded universe. Now that `_get_risky_symbols` can return more than
+    one symbol by default (the basket behavior), every per-symbol raw-weight
+    array must be built and then aligned onto ONE common index before they
+    can be combined into a single DataFrame -- use the intersection of every
+    risky symbol's own index, the same alignment `backtester/run_backtest.py`'s
+    `_align_universe` already applies for walk-forward. For the (still common)
+    single-symbol case this is exactly that symbol's own index, unchanged."""
+    common_index = universe[risky_symbols[0]].index
+    for sym in risky_symbols[1:]:
+        common_index = common_index.intersection(universe[sym].index)
+    return common_index
 
 
 def _rsi_signal(rsi_value: float, in_position: bool, entry_threshold: float, exit_threshold: float) -> int:
@@ -531,13 +552,12 @@ class RSIMeanReversionStrategy(AllocationTemplate):
         position_size_pct = p.get("rsi_position_size_pct", cfg.rsi_position_size_pct)
 
         symbols = list(universe.keys())
-        risky_symbols = _get_risky_symbols(universe, params, cfg.rsi_symbol, cfg.risky_universe, cash_proxy)
+        risky_symbols = _get_risky_symbols(universe, params, cfg_symbol=None, cfg_risky_universe=None, cash_proxy=cash_proxy)
         if not risky_symbols:
             return pd.DataFrame()
 
-        master_index = universe[risky_symbols[0]].index
-        n_bars = len(master_index)
-        raw_weights = {sym: np.zeros(n_bars) for sym in risky_symbols}
+        master_index = _aligned_master_index(universe, risky_symbols)
+        raw_weights = {}
 
         for sym in risky_symbols:
             close = universe[sym]["Close"]
@@ -552,7 +572,7 @@ class RSIMeanReversionStrategy(AllocationTemplate):
             else:
                 raise ValueError(f"Unknown rsi_entry_mode: {entry_mode!r} (expected 'single' or 'cumulative')")
 
-            trend_ok = (close > trend_ma) if require_trend_filter else pd.Series(True, index=master_index)
+            trend_ok = (close > trend_ma) if require_trend_filter else pd.Series(True, index=close.index)
             entry_signal = (entry_trigger & trend_ok).fillna(False)
 
             exit_rsi_ok = rsi_series > exit_rsi_threshold
@@ -567,9 +587,10 @@ class RSIMeanReversionStrategy(AllocationTemplate):
                 raise ValueError(f"Unknown rsi_exit_mode: {exit_mode!r} (expected 'rsi_cross', 'ma_cross', or 'either')")
             exit_signal = exit_signal.fillna(False)
 
-            raw_weights[sym] = run_stop_timeout_exit(
+            raw = run_stop_timeout_exit(
                 close, entry_signal, exit_signal, stop_loss_pct, max_holding_days, position_size_pct
             )
+            raw_weights[sym] = pd.Series(raw, index=close.index).reindex(master_index).fillna(0.0).to_numpy()
 
         daily = pd.DataFrame(raw_weights, index=master_index)
         daily = _cap_and_deroute_to_cash(daily, symbols, cash_proxy)
@@ -628,17 +649,17 @@ class SwingTrendPullbackStrategy(AllocationTemplate):
         position_size_pct = p.get("swing_position_size_pct", cfg.swing_position_size_pct)
 
         symbols = list(universe.keys())
-        risky_symbols = _get_risky_symbols(universe, params, cfg.swing_symbol, cfg.risky_universe, cash_proxy)
+        risky_symbols = _get_risky_symbols(universe, params, cfg_symbol=None, cfg_risky_universe=None, cash_proxy=cash_proxy)
         if not risky_symbols:
             return pd.DataFrame()
 
-        master_index = universe[risky_symbols[0]].index
-        n_bars = len(master_index)
+        master_index = _aligned_master_index(universe, risky_symbols)
         profit_target_pct = stop_loss_pct * reward_risk_ratio
-        raw_weights = {sym: np.zeros(n_bars) for sym in risky_symbols}
+        raw_weights = {}
 
         for sym in risky_symbols:
             close = universe[sym]["Close"]
+            n_bars = len(close)
             trend_ma = sma(close, trend_ma_period)
             pullback_ma = sma(close, pullback_ma_period)
             rsi_series = rsi(close, rsi_period)
@@ -651,6 +672,7 @@ class SwingTrendPullbackStrategy(AllocationTemplate):
             entry_signal = (trend_ok & pullback_ok & rsi_ok).fillna(False)
             exit_signal = (rsi_series > exit_rsi_threshold).fillna(False)
 
+            raw = np.zeros(n_bars)
             in_position = False
             entry_idx = 0
             peak_price = 0.0
@@ -667,14 +689,16 @@ class SwingTrendPullbackStrategy(AllocationTemplate):
                     timed_out = max_holding_days is not None and held >= max_holding_days
                     if stopped or targeted or trailed or exit_signal.iloc[i] or timed_out:
                         in_position = False
-                        raw_weights[sym][i] = 0.0
+                        raw[i] = 0.0
                     else:
-                        raw_weights[sym][i] = position_size_pct
+                        raw[i] = position_size_pct
                 elif entry_signal.iloc[i]:
                     in_position = True
                     entry_idx = i
                     peak_price = c
-                    raw_weights[sym][i] = position_size_pct
+                    raw[i] = position_size_pct
+
+            raw_weights[sym] = pd.Series(raw, index=close.index).reindex(master_index).fillna(0.0).to_numpy()
 
         daily = pd.DataFrame(raw_weights, index=master_index)
         daily = _cap_and_deroute_to_cash(daily, symbols, cash_proxy)
@@ -735,13 +759,12 @@ class ChanPivotShiftStrategy(AllocationTemplate):
         position_size_pct = p.get("chan_position_size_pct", cfg.chan_position_size_pct)
 
         symbols = list(universe.keys())
-        risky_symbols = _get_risky_symbols(universe, params, cfg.chan_symbol, cfg.risky_universe, cash_proxy)
+        risky_symbols = _get_risky_symbols(universe, params, cfg_symbol=None, cfg_risky_universe=None, cash_proxy=cash_proxy)
         if not risky_symbols:
             return pd.DataFrame()
 
-        master_index = universe[risky_symbols[0]].index
-        n_bars = len(master_index)
-        raw_weights = {sym: np.zeros(n_bars) for sym in risky_symbols}
+        master_index = _aligned_master_index(universe, risky_symbols)
+        raw_weights = {}
 
         for sym in risky_symbols:
             bars = universe[sym]
@@ -816,13 +839,12 @@ class ChanThreeTypeStrategy(AllocationTemplate):
         position_size_pct = p.get("chan3_position_size_pct", cfg.chan3_position_size_pct)
 
         symbols = list(universe.keys())
-        risky_symbols = _get_risky_symbols(universe, params, cfg.chan3_symbol, cfg.risky_universe, cash_proxy)
+        risky_symbols = _get_risky_symbols(universe, params, cfg_symbol=None, cfg_risky_universe=None, cash_proxy=cash_proxy)
         if not risky_symbols:
             return pd.DataFrame()
 
-        master_index = universe[risky_symbols[0]].index
-        n_bars = len(master_index)
-        raw_weights = {sym: np.zeros(n_bars) for sym in risky_symbols}
+        master_index = _aligned_master_index(universe, risky_symbols)
+        raw_weights = {}
 
         for sym in risky_symbols:
             bars = universe[sym]
@@ -908,13 +930,12 @@ class ChanPivotShiftMACDStrategy(AllocationTemplate):
         position_size_pct = p.get("chanm_position_size_pct", cfg.chanm_position_size_pct)
 
         symbols = list(universe.keys())
-        risky_symbols = _get_risky_symbols(universe, params, cfg.chanm_symbol, cfg.risky_universe, cash_proxy)
+        risky_symbols = _get_risky_symbols(universe, params, cfg_symbol=None, cfg_risky_universe=None, cash_proxy=cash_proxy)
         if not risky_symbols:
             return pd.DataFrame()
 
-        master_index = universe[risky_symbols[0]].index
-        n_bars = len(master_index)
-        raw_weights = {sym: np.zeros(n_bars) for sym in risky_symbols}
+        master_index = _aligned_master_index(universe, risky_symbols)
+        raw_weights = {}
 
         for sym in risky_symbols:
             bars = universe[sym]
@@ -991,14 +1012,13 @@ class AdaptiveGridStrategy(AllocationTemplate):
         cooldown_bars_after_stop = p.get("grid_cooldown_bars_after_stop", cfg.grid_cooldown_bars_after_stop)
 
         symbols = list(universe.keys())
-        risky_symbols = _get_risky_symbols(universe, params, cfg.grid_symbol, cfg.risky_universe, cash_proxy)
+        risky_symbols = _get_risky_symbols(universe, params, cfg_symbol=None, cfg_risky_universe=None, cash_proxy=cash_proxy)
         if not risky_symbols:
             return pd.DataFrame()
 
-        master_index = universe[risky_symbols[0]].index
-        n_bars = len(master_index)
+        master_index = _aligned_master_index(universe, risky_symbols)
         max_deployed = 1.0 - capital_reserve_pct
-        raw_weights = {sym: np.zeros(n_bars) for sym in risky_symbols}
+        raw_weights = {}
 
         def build_grid(center, spacing_abs):
             lv = [center + i * spacing_abs for i in range(-levels_per_side, levels_per_side + 1)]
@@ -1007,9 +1027,11 @@ class AdaptiveGridStrategy(AllocationTemplate):
         for sym in risky_symbols:
             df = universe[sym]
             close = df["Close"]
+            n_bars = len(close)
             atr_series = atr(df, atr_period)
             trend_ma = sma(close, trend_ma_period)
 
+            raw = np.zeros(n_bars)
             levels = None
             slot_state = None
             notional_equity = 1.0
@@ -1063,18 +1085,20 @@ class AdaptiveGridStrategy(AllocationTemplate):
                         slot_state[j] = True
                         n_open += 1
 
-                raw_weights[sym][i] = min(1.0, sum(slot_state) * position_size_pct)
+                raw[i] = min(1.0, sum(slot_state) * position_size_pct)
 
                 if i > 0 and pd.notna(close.iloc[i - 1]) and close.iloc[i - 1] > 0:
                     day_ret = c / close.iloc[i - 1] - 1.0
-                    notional_equity *= (1.0 + raw_weights[sym][i - 1] * day_ret)
+                    notional_equity *= (1.0 + raw[i - 1] * day_ret)
                 peak_equity = max(peak_equity, notional_equity)
                 drawdown = (peak_equity - notional_equity) / peak_equity if peak_equity > 0 else 0.0
 
                 if drawdown >= drawdown_stop_pct and not in_cooldown:
                     slot_state = [False] * len(slot_state)
-                    raw_weights[sym][i] = 0.0
+                    raw[i] = 0.0
                     cooldown_until = i + cooldown_bars_after_stop
+
+            raw_weights[sym] = pd.Series(raw, index=close.index).reindex(master_index).fillna(0.0).to_numpy()
 
         daily = pd.DataFrame(raw_weights, index=master_index)
         daily = _cap_and_deroute_to_cash(daily, symbols, cash_proxy, cap=max_deployed, cash_target=1.0)
@@ -1122,17 +1146,17 @@ class EnsembleRegimeSwitchingStrategy(AllocationTemplate):
         exit_rsi_threshold = p.get("ensemble_exit_rsi_threshold", cfg.ensemble_exit_rsi_threshold)
 
         symbols = list(universe.keys())
-        risky_symbols = _get_risky_symbols(universe, params, cfg.ensemble_symbol, cfg.risky_universe, cash_proxy)
+        risky_symbols = _get_risky_symbols(universe, params, cfg_symbol=None, cfg_risky_universe=None, cash_proxy=cash_proxy)
         if not risky_symbols:
             return pd.DataFrame()
 
-        master_index = universe[risky_symbols[0]].index
-        n_bars = len(master_index)
-        raw_weights = {sym: np.zeros(n_bars) for sym in risky_symbols}
+        master_index = _aligned_master_index(universe, risky_symbols)
+        raw_weights = {}
 
         for sym in risky_symbols:
             df = universe[sym]
             close = df["Close"]
+            n_bars = len(close)
             trend_ma = sma(close, trend_ma_period)
             adx_series = adx(df, adx_period)
             rsi_series = rsi(close, rsi_period)
@@ -1141,12 +1165,13 @@ class EnsembleRegimeSwitchingStrategy(AllocationTemplate):
             raw_sub = pd.Series(np.where(
                 adx_series >= adx_trend_threshold, "trend",
                 np.where(adx_series <= adx_range_threshold, "range", None)
-            ), index=master_index, dtype=object).ffill().fillna("range")
-            regime = pd.Series(np.where(long_term_uptrend, raw_sub, "downtrend"), index=master_index)
+            ), index=close.index, dtype=object).ffill().fillna("range")
+            regime = pd.Series(np.where(long_term_uptrend, raw_sub, "downtrend"), index=close.index)
 
             regime = regime.shift(1)
             rsi_shifted = rsi_series.shift(1)
 
+            raw = np.zeros(n_bars)
             in_position = False
             for i in range(n_bars):
                 r = regime.iloc[i]
@@ -1167,8 +1192,10 @@ class EnsembleRegimeSwitchingStrategy(AllocationTemplate):
                         desired = _rsi_signal(rv, in_position, entry_rsi_threshold, exit_rsi_threshold)
                 else:
                     raise ValueError(f"Unknown ensemble_mode: {mode!r} (expected 'ensemble', 'trend_only', or 'meanrev_only')")
-                raw_weights[sym][i] = float(desired)
+                raw[i] = float(desired)
                 in_position = desired == 1
+
+            raw_weights[sym] = pd.Series(raw, index=close.index).reindex(master_index).fillna(0.0).to_numpy()
 
         daily = pd.DataFrame(raw_weights, index=master_index)
         n_active = daily.sum(axis=1)
@@ -1224,21 +1251,21 @@ class TurtleBreakoutStrategy(AllocationTemplate):
         position_sizing_mode = p.get("turtle_position_sizing_mode", cfg.turtle_position_sizing_mode)
 
         symbols = list(universe.keys())
-        risky_symbols = _get_risky_symbols(universe, params, cfg.turtle_symbol, cfg.risky_universe, cash_proxy)
+        risky_symbols = _get_risky_symbols(universe, params, cfg_symbol=None, cfg_risky_universe=None, cash_proxy=cash_proxy)
         if not risky_symbols:
             return pd.DataFrame()
 
-        master_index = universe[risky_symbols[0]].index
-        n_bars = len(master_index)
+        master_index = _aligned_master_index(universe, risky_symbols)
 
-        active_mask = {sym: np.zeros(n_bars, dtype=bool) for sym in risky_symbols}
-        vol_weights = {sym: np.zeros(n_bars, dtype=float) for sym in risky_symbols}
+        active_mask = {}
+        vol_weights = {}
 
         for sym in risky_symbols:
             df = universe[sym]
             close = df["Close"]
             high = df["High"]
             low = df["Low"]
+            n_bars = len(close)
 
             atr_series = atr(df, atr_period)
             trend_ma = sma(close, trend_ma_period) if require_trend_filter else None
@@ -1248,6 +1275,8 @@ class TurtleBreakoutStrategy(AllocationTemplate):
 
             in_position = False
             peak_price = 0.0
+            active = np.zeros(n_bars, dtype=bool)
+            vol = np.zeros(n_bars, dtype=float)
 
             for i in range(n_bars):
                 c = close.iloc[i]
@@ -1290,8 +1319,11 @@ class TurtleBreakoutStrategy(AllocationTemplate):
                         in_position = True
                         peak_price = high.iloc[i]
 
-                active_mask[sym][i] = in_position
-                vol_weights[sym][i] = (c / a) if (in_position and a > 0) else 0.0
+                active[i] = in_position
+                vol[i] = (c / a) if (in_position and a > 0) else 0.0
+
+            active_mask[sym] = pd.Series(active, index=close.index).reindex(master_index).fillna(False).to_numpy()
+            vol_weights[sym] = pd.Series(vol, index=close.index).reindex(master_index).fillna(0.0).to_numpy()
 
         daily_weights = pd.DataFrame(index=master_index)
 
