@@ -424,10 +424,92 @@ def test_compute_chan_pivot_macd_signals_returns_expected_schema():
     idx = pd.bdate_range("2020-01-01", periods=len(closes))
     df = pd.DataFrame({"Open": closes, "High": closes + 0.5, "Low": closes - 0.5, "Close": closes}, index=idx)
     sig = compute_chan_pivot_macd_signals(df)
-    assert set(sig.columns) == {"buy_signal", "sell_signal"}
+    assert set(sig.columns) == {
+        "buy_signal", "sell_signal",
+        "divergence_buy", "divergence_sell",
+        "weak_divergence_buy", "weak_divergence_sell",
+    }
     assert sig.index.equals(df.index)
     assert not sig["buy_signal"].any()
     assert not sig["sell_signal"].any()
+
+
+# --- 盘整背驰 vs 背驰 classification + opt-in volume confirmation (ChanPivotShiftMACDAdvStrategy) ---
+
+def _pivot_row(start_pos, end_pos, zg, zd, gg, dd, start_stroke_idx, end_stroke_idx):
+    return {
+        "start_pos": start_pos, "end_pos": end_pos, "zg": zg, "zd": zd,
+        "gg": gg, "dd": dd, "start_stroke_idx": start_stroke_idx, "end_stroke_idx": end_stroke_idx,
+    }
+
+
+def test_strokes_are_pivot_internal_true_when_both_inside_the_same_pivot():
+    from research_strategy.rs.chan_signals import _strokes_are_pivot_internal
+
+    pivots = pd.DataFrame([_pivot_row(0, 40, 108, 92, 110, 90, 0, 4)])
+    assert _strokes_are_pivot_internal(pivots, ia=1, ib=3) is True
+
+
+def test_strokes_are_pivot_internal_false_when_spanning_two_pivots():
+    from research_strategy.rs.chan_signals import _strokes_are_pivot_internal
+
+    pivots = pd.DataFrame(
+        [
+            _pivot_row(0, 30, 108, 92, 110, 90, 0, 2),
+            _pivot_row(40, 70, 130, 118, 132, 116, 3, 5),
+        ]
+    )
+    # ia=1 falls inside the first pivot, ib=4 inside the second -- not both
+    # inside any SINGLE pivot's span, so this is a cross-pivot (strong) pair.
+    assert _strokes_are_pivot_internal(pivots, ia=1, ib=4) is False
+
+
+def test_compute_chan_pivot_macd_signals_classifies_oscillating_divergence_as_weak():
+    """`_chanm_top_divergence_closes` (below) produces its divergence between
+    two up-strokes that both stay inside the SAME (extending) pivot -- a
+    textbook 盘整背驰 (pivot-internal, weaker) case, verified by direct
+    execution. `buy_signal`/`sell_signal` (the pre-existing, backward-
+    compatible columns) are unaffected."""
+    closes = _chanm_top_divergence_closes()
+    idx = pd.bdate_range("2020-01-01", periods=len(closes))
+    df = pd.DataFrame({"Open": closes, "High": closes + 0.2, "Low": closes - 0.2, "Close": closes}, index=idx)
+    sig = compute_chan_pivot_macd_signals(df, min_gap_bars=4, min_strokes=3)
+
+    assert np.flatnonzero(sig["sell_signal"].to_numpy()).tolist() == [144]
+    assert np.flatnonzero(sig["divergence_sell"].to_numpy()).tolist() == [144]
+    assert np.flatnonzero(sig["weak_divergence_sell"].to_numpy()).tolist() == [144]
+    assert not sig["divergence_buy"].any()
+    assert not sig["weak_divergence_buy"].any()
+
+    # Mirror: the bottom-divergence fixture is likewise pivot-internal.
+    closes_buy = 200.0 - _chanm_top_divergence_closes()
+    df_buy = pd.DataFrame({"Open": closes_buy, "High": closes_buy + 0.2, "Low": closes_buy - 0.2, "Close": closes_buy}, index=idx)
+    sig_buy = compute_chan_pivot_macd_signals(df_buy, min_gap_bars=4, min_strokes=3)
+    assert np.flatnonzero(sig_buy["weak_divergence_buy"].to_numpy()).tolist() == [144]
+
+
+def test_compute_chan_pivot_macd_signals_volume_confirmation_gate():
+    """Opt-in `require_volume_confirmation` (Lesson 056): rising volume on
+    the later leg violates 'weakening volume confirms weakening price
+    momentum' and suppresses the divergence once the flag is on; absent
+    Volume or with the flag off, behavior is byte-identical to before."""
+    closes = _chanm_top_divergence_closes()
+    idx = pd.bdate_range("2020-01-01", periods=len(closes))
+    df = pd.DataFrame({"Open": closes, "High": closes + 0.2, "Low": closes - 0.2, "Close": closes}, index=idx)
+
+    # No Volume column -> require_volume_confirmation is a documented no-op.
+    sig_no_volume = compute_chan_pivot_macd_signals(df, min_gap_bars=4, min_strokes=3, require_volume_confirmation=True)
+    assert np.flatnonzero(sig_no_volume["sell_signal"].to_numpy()).tolist() == [144]
+
+    df_rising = df.copy()
+    df_rising["Volume"] = 1_000_000.0
+    df_rising.iloc[118:146, df_rising.columns.get_loc("Volume")] = 5_000_000.0  # leg_b's bars, roughly
+
+    sig_flag_off = compute_chan_pivot_macd_signals(df_rising, min_gap_bars=4, min_strokes=3, require_volume_confirmation=False)
+    assert np.flatnonzero(sig_flag_off["sell_signal"].to_numpy()).tolist() == [144]
+
+    sig_flag_on = compute_chan_pivot_macd_signals(df_rising, min_gap_bars=4, min_strokes=3, require_volume_confirmation=True)
+    assert not sig_flag_on["sell_signal"].any()
 
 
 # --- memoization shared with chan_structure.py (review fix 7) ---------------

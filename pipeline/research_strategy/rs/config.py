@@ -319,6 +319,32 @@ class StrategyConfig:
     chan_best_metric: str = "sharpe"  # "sharpe" or "cagr"
     chan_best_rebalance_freq_days: int = 21
 
+    # --- Chan Pivot Shift (MACD) Advanced (ChanPivotShiftMACDAdvStrategy):
+    # an enhanced SIBLING of Chan Pivot Shift (MACD) above -- that strategy/
+    # its config (chanm_*) are left completely untouched. Adds (Lessons
+    # 92-99/103/024/027/033/061): a MACD zero-axis entry gate, weekly-level
+    # 区间套 re-confirmation, a dangerous pivot-relation exit overlay, a
+    # 盘整背驰-vs-背驰 divergence-strength filter, an opt-in volume
+    # confirmation, and coincidence-based position sizing. See
+    # rs/chan_lesson_strategies.py. ---
+    chanm_adv_min_gap_bars: int = 4
+    chanm_adv_min_strokes: int = 3
+    chanm_adv_macd_fast: int = 12
+    chanm_adv_macd_slow: int = 26
+    chanm_adv_macd_signal: int = 9
+    chanm_adv_stop_loss_pct: Optional[float] = 0.08
+    chanm_adv_max_holding_days: Optional[int] = 90
+    chanm_adv_position_size_pct: float = 1.0
+    chanm_adv_require_cross_pivot_divergence: bool = True
+    chanm_adv_require_volume_confirmation: bool = False
+    chanm_adv_weak_signal_position_size_pct: float = 1.0
+    chanm_adv_use_trend_gate: bool = True
+    chanm_adv_trend_ma_period: int = 200
+    chanm_adv_suppress_top_div_in_uptrend: bool = True
+    chanm_adv_top_k: Optional[int] = 3
+    chanm_adv_trailing_activate_pct: Optional[float] = 0.08
+    chanm_adv_trailing_stop_pct: Optional[float] = 0.04
+
     # --- Chan Pivot-Oscillation Monitor (Zn, Lesson 92, 0844-...-092.md):
     # tracks each sub-swing's midpoint (Zn) inside a confirmed stroke-level
     # pivot vs. the pivot's own center (Z) to detect a strengthening/
@@ -453,6 +479,10 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.fibo_min_tier must be in [0, 8], got {self.fibo_min_tier}")
         if self.fibo_rebalance_freq_days <= 0:
             raise ValueError(f"StrategyConfig.fibo_rebalance_freq_days must be > 0, got {self.fibo_rebalance_freq_days}")
+        if self.chanm_adv_min_gap_bars <= 0:
+            raise ValueError(f"StrategyConfig.chanm_adv_min_gap_bars must be > 0, got {self.chanm_adv_min_gap_bars}")
+        if self.chanm_adv_min_strokes < 3:
+            raise ValueError(f"StrategyConfig.chanm_adv_min_strokes must be >= 3, got {self.chanm_adv_min_strokes}")
 
     @classmethod
     def from_dict(cls, data: dict) -> "StrategyConfig":

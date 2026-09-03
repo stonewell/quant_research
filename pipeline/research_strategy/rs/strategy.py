@@ -79,6 +79,7 @@ from .chan_lesson_strategies import (
     ChanFailedRetestBuyStrategy,
     ChanFiboSectorStrengthStrategy,
     ChanPivotOscillationStrategy,
+    ChanPivotShiftMACDAdvStrategy,
 )
 from .config import StrategyConfig
 from .nl_parser import ParsedStrategySpec, parse_plain_english_strategy
@@ -2008,6 +2009,7 @@ STRATEGY_CLASS_MAP = {
     "ChanMeanReversionDivergenceStrategy": ChanMeanReversionDivergenceStrategy,
     "ChanMultiTimeframeTrendStrategy": ChanMultiTimeframeTrendStrategy,
     "ChanPivotOscillationStrategy": ChanPivotOscillationStrategy,
+    "ChanPivotShiftMACDAdvStrategy": ChanPivotShiftMACDAdvStrategy,
     "ChanPivotShiftMACDStrategy": ChanPivotShiftMACDStrategy,
     "ChanPivotShiftStrategy": ChanPivotShiftStrategy,
     "ChanThreeTypeStrategy": ChanThreeTypeStrategy,

@@ -37,6 +37,11 @@ Pipeline added here:
     `macd_divergence`, made symmetric (both a top-divergence sell and a
     bottom-divergence buy). Powers `ChanPivotShiftMACDStrategy`, independent
     of and not consumed by `ChanThreeTypeStrategy`/`compute_chan3_signals`.
+    Also exposes (additive, `buy_signal`/`sell_signal` unchanged) a
+    盘整背驰-vs-背驰 divergence-strength classification
+    (`divergence_buy`/`sell`, `weak_divergence_buy`/`sell`) and an opt-in
+    volume-confirmation gate (`require_volume_confirmation`), consumed by
+    `ChanPivotShiftMACDAdvStrategy` (`rs/chan_lesson_strategies.py`).
 """
 
 from __future__ import annotations
@@ -394,6 +399,26 @@ def _compute_chan3_signals_impl(
     return result
 
 
+def _strokes_are_pivot_internal(pivots: pd.DataFrame, ia: int, ib: int) -> bool:
+    """True iff stroke indices `ia`/`ib` (original integer positions into the
+    full `strokes` frame) both fall inside the SAME confirmed pivot's
+    `[start_stroke_idx, end_stroke_idx]` span -- i.e. they're oscillating
+    around one consolidation (盘整背驰, weaker and context/position-dependent
+    per Lessons 024/027/033) rather than bracketing a genuine pivot-to-pivot
+    directional move (cross-pivot 背驰, stronger)."""
+    for _, piv in pivots.iterrows():
+        if int(piv["start_stroke_idx"]) <= ia and ib <= int(piv["end_stroke_idx"]):
+            return True
+    return False
+
+
+def _leg_volume_sum(row: pd.Series, merged: pd.DataFrame, volume_arr: np.ndarray) -> float:
+    lo = int(merged.iloc[int(row["start_pos"])]["orig_pos"])
+    hi = int(merged.iloc[int(row["end_pos"])]["orig_pos"])
+    window = volume_arr[lo : hi + 1]
+    return float(np.nansum(window))
+
+
 def compute_chan_pivot_macd_signals(
     df: pd.DataFrame,
     min_gap_bars: int = 4,
@@ -401,12 +426,16 @@ def compute_chan_pivot_macd_signals(
     macd_fast: int = 12,
     macd_slow: int = 26,
     macd_signal: int = 9,
+    require_volume_confirmation: bool = False,
 ) -> pd.DataFrame:
     """Cache-wrapped entry point (see `chan_structure._cached_signals`) --
     see `_compute_chan_pivot_macd_signals_impl` for the actual rule."""
     return _cached_signals(
-        "compute_chan_pivot_macd_signals", df, (min_gap_bars, min_strokes, macd_fast, macd_slow, macd_signal),
-        lambda: _compute_chan_pivot_macd_signals_impl(df, min_gap_bars, min_strokes, macd_fast, macd_slow, macd_signal),
+        "compute_chan_pivot_macd_signals", df,
+        (min_gap_bars, min_strokes, macd_fast, macd_slow, macd_signal, require_volume_confirmation),
+        lambda: _compute_chan_pivot_macd_signals_impl(
+            df, min_gap_bars, min_strokes, macd_fast, macd_slow, macd_signal, require_volume_confirmation
+        ),
     )
 
 
@@ -417,6 +446,7 @@ def _compute_chan_pivot_macd_signals_impl(
     macd_fast: int,
     macd_slow: int,
     macd_signal: int,
+    require_volume_confirmation: bool,
 ) -> pd.DataFrame:
     """A near-literal copy of `chan_structure.compute_chan_signals`'s pivot-band-shift
     buy/sell rules (stroke-based pivots -- deliberately NOT segments, unlike
@@ -431,17 +461,37 @@ def _compute_chan_pivot_macd_signals_impl(
     momentum), AND a bottom-divergence buy signal on weakening consecutive
     down-strokes (a new low on weaker momentum).
 
-    Returns `{"buy_signal": ..., "sell_signal": ...}`, aligned to `df.index`
-    -- identical shape to `compute_chan_signals`'s own output.
+    `buy_signal`/`sell_signal` are UNCHANGED from the original rule (still
+    the OR of the pivot-shift rule + any divergence, any strength) --
+    `rs/timing_aspects.py`'s `_entry_chanm_pivot`/`_exit_chanm_signal` aspects
+    and `ChanPivotShiftMACDStrategy` both only ever read these two columns,
+    so this stays a strict superset for them. Additive extension (used by
+    `ChanPivotShiftMACDAdvStrategy`, `rs/chan_lesson_strategies.py`):
+    `divergence_buy`/`divergence_sell` isolate the subset of `buy_signal`/
+    `sell_signal` sourced from divergence (not the pivot-shift rule);
+    `weak_divergence_buy`/`weak_divergence_sell` further flag which of those
+    are 盘整背驰 (`_strokes_are_pivot_internal`, Lessons 024/027/033).
+
+    `require_volume_confirmation` (Lesson 056's volume-as-confirmation idea,
+    default off): when True and `df` has a `Volume` column, a divergence
+    only fires if the later leg's summed volume is `<=` the earlier leg's
+    (weakening volume mirrors weakening price momentum) -- a no-op whenever
+    `Volume` is absent or the flag is off, so every existing Volume-less
+    fixture/caller is unaffected.
     """
     buy = pd.Series(False, index=df.index)
     sell = pd.Series(False, index=df.index)
+    divergence_buy = pd.Series(False, index=df.index)
+    divergence_sell = pd.Series(False, index=df.index)
+    weak_divergence_buy = pd.Series(False, index=df.index)
+    weak_divergence_sell = pd.Series(False, index=df.index)
 
     merged = merge_inclusion(df)
     fractals = find_fractals(merged)
     strokes = build_strokes(fractals, min_gap_bars)
     pivots = build_pivots(strokes, min_strokes)
     hist = macd(df["Close"], macd_fast, macd_slow, macd_signal)["hist"].reset_index(drop=True)
+    volume_arr = df["Volume"].to_numpy(dtype=float) if "Volume" in df.columns else None
 
     def _mark(series: pd.Series, fractal_pos: int) -> None:
         confirm_pos = fractal_pos + 1
@@ -453,6 +503,11 @@ def _compute_chan_pivot_macd_signals_impl(
             if strokes.iloc[si]["direction"] == direction:
                 return si
         return None
+
+    def _volume_confirms(earlier: pd.Series, later: pd.Series) -> bool:
+        if not require_volume_confirmation or volume_arr is None:
+            return True
+        return _leg_volume_sum(later, merged, volume_arr) <= _leg_volume_sum(earlier, merged, volume_arr)
 
     # Rules 1+2, copied verbatim from compute_chan_signals: buy/sell on a
     # pivot band stepping wholly above/below the prior pivot's band, timed to
@@ -470,18 +525,37 @@ def _compute_chan_pivot_macd_signals_impl(
                 _mark(sell, int(strokes.iloc[si]["end_pos"]))
 
     # Rule 3, replaced: real MACD divergence, symmetric top (sell) and bottom (buy).
-    up_strokes = strokes[strokes["direction"] == "up"].reset_index(drop=True)
+    up_strokes = strokes[strokes["direction"] == "up"]
+    up_positions = up_strokes.index.to_numpy()
     for idx in range(1, len(up_strokes)):
         a, b = up_strokes.iloc[idx - 1], up_strokes.iloc[idx]
         has_div, _, _ = macd_divergence(a, b, hist, merged)
-        if has_div:
-            _mark(sell, int(b["end_pos"]))
+        if has_div and _volume_confirms(a, b):
+            end_pos = int(b["end_pos"])
+            _mark(sell, end_pos)
+            _mark(divergence_sell, end_pos)
+            if _strokes_are_pivot_internal(pivots, int(up_positions[idx - 1]), int(up_positions[idx])):
+                _mark(weak_divergence_sell, end_pos)
 
-    down_strokes = strokes[strokes["direction"] == "down"].reset_index(drop=True)
+    down_strokes = strokes[strokes["direction"] == "down"]
+    down_positions = down_strokes.index.to_numpy()
     for idx in range(1, len(down_strokes)):
         a, b = down_strokes.iloc[idx - 1], down_strokes.iloc[idx]
         has_div, _, _ = macd_divergence(a, b, hist, merged)
-        if has_div:
-            _mark(buy, int(b["end_pos"]))
+        if has_div and _volume_confirms(a, b):
+            end_pos = int(b["end_pos"])
+            _mark(buy, end_pos)
+            _mark(divergence_buy, end_pos)
+            if _strokes_are_pivot_internal(pivots, int(down_positions[idx - 1]), int(down_positions[idx])):
+                _mark(weak_divergence_buy, end_pos)
 
-    return pd.DataFrame({"buy_signal": buy, "sell_signal": sell})
+    return pd.DataFrame(
+        {
+            "buy_signal": buy,
+            "sell_signal": sell,
+            "divergence_buy": divergence_buy,
+            "divergence_sell": divergence_sell,
+            "weak_divergence_buy": weak_divergence_buy,
+            "weak_divergence_sell": weak_divergence_sell,
+        }
+    )

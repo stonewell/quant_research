@@ -47,11 +47,21 @@ def _signal_cache_key(df: pd.DataFrame, *params) -> tuple:
     deliberately NOT `id(df)` (unsafe: object ids get reused once a
     garbage-collected frame's memory is reclaimed), just enough of the
     frame's shape/edges to make an accidental collision between two
-    genuinely different price series astronomically unlikely."""
+    genuinely different price series astronomically unlikely.
+
+    Includes a full hash of `Volume` (not just first/last, unlike `Close`
+    below) when present: `compute_chan_pivot_macd_signals`'s
+    `require_volume_confirmation` reads Volume, and a first/last-only
+    fingerprint failed to distinguish two frames with identical Close but a
+    Volume spike confined to the middle of the series (caught by this
+    module's own test suite) -- Close has no such caller today, so it keeps
+    the cheaper first/last heuristic."""
     close = df["Close"]
+    volume_fingerprint = hash(df["Volume"].to_numpy().tobytes()) if "Volume" in df.columns else None
     return (
         len(df), df.index[0], df.index[-1],
         round(float(close.iloc[0]), 8), round(float(close.iloc[-1]), 8),
+        volume_fingerprint,
         params,
     )
 

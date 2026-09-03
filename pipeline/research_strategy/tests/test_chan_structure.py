@@ -228,6 +228,24 @@ def test_compute_chan_signals_cache_miss_on_different_data_or_params():
     assert result_a_diff_params is not result_a
 
 
+def test_signal_cache_key_distinguishes_frames_that_differ_only_in_middle_volume():
+    """Regression: identical Close/index/length but a Volume difference
+    confined to the middle of the series (first/last values unchanged) must
+    NOT collide -- a first/last-only Volume fingerprint missed exactly this
+    case (caught by test_chan_signals.py's own volume-confirmation test)."""
+    from research_strategy.rs.chan_structure import _signal_cache_key
+
+    closes = np.linspace(100, 110, 60)
+    idx = pd.bdate_range("2020-01-01", periods=len(closes))
+    df_a = pd.DataFrame({"Open": closes, "High": closes + 0.5, "Low": closes - 0.5, "Close": closes}, index=idx)
+    df_a["Volume"] = 1_000_000.0
+
+    df_b = df_a.copy()
+    df_b.iloc[25:35, df_b.columns.get_loc("Volume")] = 5_000_000.0  # first/last Volume unchanged
+
+    assert _signal_cache_key(df_a, 4, 3) != _signal_cache_key(df_b, 4, 3)
+
+
 # --- classify_pivot_relations (Lessons 92-99 early-warning state machine) ---
 
 def _pivot_row(start_pos, end_pos, zg, zd, gg, dd, start_stroke_idx, end_stroke_idx):

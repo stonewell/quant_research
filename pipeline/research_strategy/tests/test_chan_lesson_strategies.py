@@ -4,6 +4,8 @@
 - ChanPivotOscillationStrategy (Lesson 92, 中枢震荡监视器)
 - ChanFiboSectorStrengthStrategy (Lesson 106, 斐波那契均线系统)
 - ChanFailedRetestBuyStrategy (Lesson 108, 下探失败买)
+- ChanPivotShiftMACDAdvStrategy (Lessons 92-99/103/024/027/033/056/061,
+  an enhanced sibling of ChanPivotShiftMACDStrategy)
 
 Guaranteed 100% offline using synthetic OHLCV data / hand-built fixtures --
 no network access.
@@ -27,6 +29,7 @@ from research_strategy.rs.chan_lesson_strategies import (
     ChanFailedRetestBuyStrategy,
     ChanFiboSectorStrengthStrategy,
     ChanPivotOscillationStrategy,
+    ChanPivotShiftMACDAdvStrategy,
     _FIBO_PERIODS,
     _failed_retest_confirmed,
     compute_fibo_tier,
@@ -219,12 +222,175 @@ def test_chan_failed_retest_buy_strategy_execution():
     assert isinstance(weights, pd.DataFrame)
 
 
+# --- ChanPivotShiftMACDAdvStrategy --------------------------------------------
+
+def _adv_universe(n=60):
+    idx = pd.bdate_range("2020-01-01", periods=n)
+    closes = 100.0 + np.arange(n) * 0.1
+    bars = pd.DataFrame({"Open": closes, "High": closes + 0.5, "Low": closes - 0.5, "Close": closes}, index=idx)
+    bil = pd.DataFrame({"Open": np.full(n, 100.0), "High": np.full(n, 100.5), "Low": np.full(n, 99.5), "Close": np.full(n, 100.0)}, index=idx)
+    return idx, {"SPY": bars, "BIL": bil}
+
+
+def _patch_adv_fakes(
+    monkeypatch,
+    buy_at=None, sell_at=None, weak_buy_at=None, weak_sell_at=None, divergence_buy_at=None,
+    zero_axis_true=True, weekly_regime_true=True, danger_from=None, coincidence_at=None,
+):
+    import research_strategy.rs.chan_lesson_strategies as cls_mod
+
+    def fake_pivot_macd_sig(bars_arg, **kwargs):
+        idx = bars_arg.index
+        cols = {
+            k: pd.Series(False, index=idx)
+            for k in ["buy_signal", "sell_signal", "divergence_buy", "divergence_sell", "weak_divergence_buy", "weak_divergence_sell"]
+        }
+        if buy_at is not None:
+            cols["buy_signal"].iloc[buy_at] = True
+        if sell_at is not None:
+            cols["sell_signal"].iloc[sell_at] = True
+        if weak_buy_at is not None:
+            cols["weak_divergence_buy"].iloc[weak_buy_at] = True
+        if weak_sell_at is not None:
+            cols["weak_divergence_sell"].iloc[weak_sell_at] = True
+        if divergence_buy_at is not None:
+            cols["divergence_buy"].iloc[divergence_buy_at] = True
+        return pd.DataFrame(cols)
+
+    def fake_chan3_sig(bars_arg, **kwargs):
+        idx = bars_arg.index
+        cols = {
+            k: pd.Series(False, index=idx)
+            for k in ["first_buy", "first_sell", "second_buy", "second_sell", "third_buy", "third_sell", "buy_signal", "sell_signal"]
+        }
+        if coincidence_at is not None:
+            cols["second_buy"].iloc[coincidence_at] = True
+        return pd.DataFrame(cols)
+
+    def fake_zero_axis(close, macd_fast, macd_slow, macd_signal):
+        return pd.Series(zero_axis_true, index=close.index)
+
+    def fake_weekly_regime(bars_arg, min_gap_bars, min_strokes, macd_fast, macd_slow, macd_signal):
+        return pd.Series(weekly_regime_true, index=bars_arg.index)
+
+    def fake_danger(bars_arg, min_gap_bars, min_strokes):
+        s = pd.Series(False, index=bars_arg.index)
+        if danger_from is not None:
+            s.iloc[danger_from:] = True
+        return s
+
+    monkeypatch.setattr(cls_mod, "compute_chan_pivot_macd_signals", fake_pivot_macd_sig)
+    monkeypatch.setattr(cls_mod, "compute_chan3_signals", fake_chan3_sig)
+    monkeypatch.setattr(cls_mod, "_macd_zero_axis_confirmed", fake_zero_axis)
+    monkeypatch.setattr(cls_mod, "_weekly_pivot_macd_regime_state", fake_weekly_regime)
+    monkeypatch.setattr(cls_mod, "_pivot_relation_danger_series", fake_danger)
+
+
+def test_chan_pivot_shift_macd_adv_strategy_execution():
+    cfg = StrategyConfig()
+    strat = ChanPivotShiftMACDAdvStrategy(cfg)
+
+    assert strat.warmup_bars() > 0
+    assert "chan_pivot_shift_macd_adv" in strat.explain_weights()
+
+    universe = create_mock_universe(n_days=300)
+    weights = strat.generate_weights(universe)
+    assert isinstance(weights, pd.DataFrame)
+
+
+def test_chan_pivot_shift_macd_adv_zero_axis_gate(monkeypatch):
+    """The zero-axis gate applies only to the DIVERGENCE-sourced portion of
+    buy_signal (bottom-fishing) -- a pivot-shift-sourced buy (not marked
+    divergence_buy) is a trend-continuation breakout, not a bottom-fish, and
+    is unaffected by this gate (see test_..._pivot_shift_bypasses_zero_axis_gate)."""
+    idx, universe = _adv_universe()
+    entry_bar = 10
+
+    _patch_adv_fakes(monkeypatch, buy_at=entry_bar, divergence_buy_at=entry_bar, zero_axis_true=False)
+    weights = ChanPivotShiftMACDAdvStrategy(StrategyConfig()).generate_weights(universe)
+    daily = weights.reindex(idx).ffill().fillna(0.0)
+    assert daily["SPY"].iloc[entry_bar] == 0.0, "divergence entry suppressed while MACD zero-axis gate fails"
+
+    _patch_adv_fakes(monkeypatch, buy_at=entry_bar, divergence_buy_at=entry_bar, zero_axis_true=True)
+    weights = ChanPivotShiftMACDAdvStrategy(StrategyConfig()).generate_weights(universe)
+    daily = weights.reindex(idx).ffill().fillna(0.0)
+    assert daily["SPY"].iloc[entry_bar] > 0.0, "entry fires once the zero-axis gate is satisfied"
+
+
+def test_chan_pivot_shift_macd_adv_pivot_shift_bypasses_zero_axis_gate(monkeypatch):
+    """A pivot-shift-sourced buy (buy_signal True, divergence_buy False) is a
+    trend-continuation breakout, not a bottom-fish -- Lesson 103's zero-axis
+    gate must NOT block it even while MACD is below zero."""
+    idx, universe = _adv_universe()
+    entry_bar = 10
+
+    _patch_adv_fakes(monkeypatch, buy_at=entry_bar, divergence_buy_at=None, zero_axis_true=False)
+    weights = ChanPivotShiftMACDAdvStrategy(StrategyConfig()).generate_weights(universe)
+    daily = weights.reindex(idx).ffill().fillna(0.0)
+    assert daily["SPY"].iloc[entry_bar] > 0.0, "pivot-shift entry fires regardless of the zero-axis gate"
+
+
+def test_chan_pivot_shift_macd_adv_weekly_regime_gate(monkeypatch):
+    idx, universe = _adv_universe()
+    entry_bar = 10
+
+    _patch_adv_fakes(monkeypatch, buy_at=entry_bar, weekly_regime_true=False)
+    weights = ChanPivotShiftMACDAdvStrategy(StrategyConfig()).generate_weights(universe)
+    daily = weights.reindex(idx).ffill().fillna(0.0)
+    assert daily["SPY"].iloc[entry_bar] == 0.0, "entry suppressed while the weekly regime disagrees"
+
+
+def test_chan_pivot_shift_macd_adv_exits_on_dangerous_pivot_relation(monkeypatch):
+    idx, universe = _adv_universe()
+    entry_bar, danger_bar = 5, 20
+
+    _patch_adv_fakes(monkeypatch, buy_at=entry_bar, danger_from=danger_bar)
+    weights = ChanPivotShiftMACDAdvStrategy(StrategyConfig()).generate_weights(universe)
+    daily = weights.reindex(idx).ffill().fillna(0.0)
+    assert daily["SPY"].iloc[entry_bar + 1] > 0.0, "position open before the dangerous pivot-relation flip"
+    assert daily["SPY"].iloc[danger_bar] == 0.0, "dangerous pivot-relation overlay forces an exit"
+
+
+def test_chan_pivot_shift_macd_adv_cross_pivot_divergence_filter(monkeypatch):
+    idx, universe = _adv_universe()
+    entry_bar = 10
+
+    _patch_adv_fakes(monkeypatch, buy_at=entry_bar, weak_buy_at=entry_bar)
+    cfg_on = StrategyConfig(chanm_adv_require_cross_pivot_divergence=True)
+    weights_on = ChanPivotShiftMACDAdvStrategy(cfg_on).generate_weights(universe)
+    daily_on = weights_on.reindex(idx).ffill().fillna(0.0)
+    assert daily_on["SPY"].iloc[entry_bar] == 0.0, "a weak (盘整背驰) divergence buy is filtered out by default"
+
+    _patch_adv_fakes(monkeypatch, buy_at=entry_bar, weak_buy_at=entry_bar)
+    cfg_off = StrategyConfig(chanm_adv_require_cross_pivot_divergence=False)
+    weights_off = ChanPivotShiftMACDAdvStrategy(cfg_off).generate_weights(universe)
+    daily_off = weights_off.reindex(idx).ffill().fillna(0.0)
+    assert daily_off["SPY"].iloc[entry_bar] > 0.0, "disabling the filter restores the full (including weak) divergence signal"
+
+
+def test_chan_pivot_shift_macd_adv_coincidence_sizing(monkeypatch):
+    idx, universe = _adv_universe()
+    entry_bar = 10
+    cfg = StrategyConfig(chanm_adv_position_size_pct=1.0, chanm_adv_weak_signal_position_size_pct=0.5)
+
+    _patch_adv_fakes(monkeypatch, buy_at=entry_bar, coincidence_at=entry_bar)
+    weights_coincident = ChanPivotShiftMACDAdvStrategy(cfg).generate_weights(universe)
+    daily_coincident = weights_coincident.reindex(idx).ffill().fillna(0.0)
+    assert daily_coincident["SPY"].iloc[entry_bar] == pytest.approx(1.0)
+
+    _patch_adv_fakes(monkeypatch, buy_at=entry_bar, coincidence_at=None)
+    weights_weak = ChanPivotShiftMACDAdvStrategy(cfg).generate_weights(universe)
+    daily_weak = weights_weak.reindex(idx).ffill().fillna(0.0)
+    assert daily_weak["SPY"].iloc[entry_bar] == pytest.approx(0.5)
+
+
 # --- Integration: strategies_config.json discovery ----------------------------
 
 @pytest.mark.parametrize("key", [
     "chan_pivot_oscillation",
     "chan_fibo_sector_strength",
     "chan_failed_retest_buy",
+    "chan_pivot_shift_macd_adv",
 ])
 def test_instantiate_strategy_from_config(key: str):
     config_dict = load_strategies_config()
