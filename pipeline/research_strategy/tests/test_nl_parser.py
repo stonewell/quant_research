@@ -18,7 +18,6 @@ if _REPO_ROOT not in sys.path:
 
 from research_strategy.rs.nl_parser import parse_plain_english_strategy
 from research_strategy.rs.strategy import (
-    CANONICAL_BAA_KELLER_TEXT,
     CANONICAL_DUAL_MOMENTUM_TEXT,
     CANONICAL_VOLATILITY_MANAGED_TEXT,
 )
@@ -96,13 +95,17 @@ def test_canonical_dual_momentum_text_parses_to_documented_lookbacks():
     assert spec.vol_lookback == 60
 
 
-def test_canonical_baa_text_includes_cash_proxy_in_defensive_universe():
-    # Regression test: BAA-G12's defensive universe explicitly lists BIL as
-    # a rankable candidate (it can win a top-3 slot on its own momentum, not
-    # just serve as the passive fallback for unallocated capital), but the
-    # ticker extractor used to unconditionally strip the cash-proxy symbol
-    # out of every extracted universe, including this one.
-    spec = parse_plain_english_strategy(CANONICAL_BAA_KELLER_TEXT)
+def test_explicit_defensive_universe_includes_cash_proxy_ticker():
+    # Regression test: an explicit defensive-universe clause can legitimately list the
+    # cash-proxy ticker as a rankable candidate (it can win a top-3 slot on its own momentum,
+    # not just serve as the passive fallback for unallocated capital), but the ticker extractor
+    # used to unconditionally strip the cash-proxy symbol out of every extracted universe,
+    # including this one.
+    text = (
+        "Rebalance monthly. Canary assets: SPY, EEM. Offensive assets: SPY, QQQ. "
+        "Defensive assets: TIP, IEF, TLT, BIL, AGG, DBC."
+    )
+    spec = parse_plain_english_strategy(text)
     assert set(spec.defensive_universe) == {"TIP", "IEF", "TLT", "BIL", "AGG", "DBC"}
 
 
@@ -156,6 +159,36 @@ def test_canary_universe_fallback_warns():
     assert any("canary-universe" in w for w in spec.warnings)
     assert any("offensive-universe" in w for w in spec.warnings)
     assert any("defensive-universe" in w for w in spec.warnings)
+
+
+def test_canary_universe_fallback_leaves_lists_as_none_not_hardcoded_default():
+    # Regression: a canary-logic description with no explicit tickers used to substitute
+    # DEFAULT_BAA_CANARY/OFFENSIVE/DEFENSIVE (hardcoded lists) -- it must now leave these as
+    # None instead, so generate_weights derives them from the runtime universe.
+    text = "Rebalance monthly. Canary logic enabled with no assets specified."
+    spec = parse_plain_english_strategy(text)
+    assert spec.canary_universe is None
+    assert spec.offensive_universe is None
+    assert spec.defensive_universe is None
+
+
+def test_baa_keller_json_description_parses_to_universe_derived_roles():
+    # The actual strategies_config.json baa_keller entry's description must no longer name any
+    # canary/offensive/defensive tickers -- confirms the JSON text itself achieves the
+    # universe-derived default, not just a synthetic example string.
+    import json
+    import os
+
+    config_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "strategies_config.json"
+    )
+    with open(config_path) as f:
+        config = json.load(f)
+    spec = parse_plain_english_strategy(config["baa_keller"]["plain_english_description"])
+    assert spec.use_canary_logic is True
+    assert spec.canary_universe is None
+    assert spec.offensive_universe is None
+    assert spec.defensive_universe is None
 
 
 def test_roc_explicit_day_unit_is_not_treated_as_months():

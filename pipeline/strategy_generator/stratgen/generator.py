@@ -24,7 +24,6 @@ from common.allocation_search import (
 )
 from common.allocation_templates import ALLOCATION_TEMPLATES
 from common.strategy_aspects import build_composite_candidates
-from .metrics import sharpe_ratio
 
 
 @dataclass

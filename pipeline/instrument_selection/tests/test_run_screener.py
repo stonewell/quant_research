@@ -7,7 +7,6 @@ import numpy as np
 import pandas as pd
 
 from common.cli_utils import shared_data_dir
-from selectorbot import data as selectorbot_data
 from selectorbot.config import SelectionConfig
 from run_screener import DATA_DIR, build_arg_parser, select_basket
 
@@ -30,12 +29,9 @@ def _make_scored(n=10):
 
 
 def test_data_dir_is_shared_workspace_wide_cache():
-    """After the OHLCV cache consolidation, run_screener.py and
-    selectorbot/data.py must both resolve their cache directory via the same
-    `shared_data_dir()` function, i.e. the literal same path."""
+    """After the OHLCV cache consolidation, run_screener.py resolves its
+    cache directory via the shared `shared_data_dir()` function."""
     assert DATA_DIR == shared_data_dir()
-    assert selectorbot_data.DATA_DIR == shared_data_dir()
-    assert DATA_DIR == selectorbot_data.DATA_DIR
 
 
 def test_cache_ttl_days_defaults_to_none():

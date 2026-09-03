@@ -10,9 +10,6 @@ from typing import List, Optional
 
 DEFAULT_RISKY_UNIVERSE = ["SPY", "QQQ", "IWM", "EFA", "EEM", "GLD", "TLT", "VNQ"]
 DEFAULT_CASH_PROXY = "BIL"
-DEFAULT_BAA_CANARY = ["SPY", "EEM", "EFA", "AGG"]
-DEFAULT_BAA_OFFENSIVE = ["SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "DBC"]
-DEFAULT_BAA_DEFENSIVE = ["TIP", "IEF", "TLT", "BIL", "AGG", "DBC"]
 
 STOP_WORDS = {
     "THE", "AND", "FOR", "TOP", "SMA", "ROC", "BAA", "GTAA", "ALL",
@@ -37,9 +34,13 @@ class ParsedStrategySpec:
 
     # Universes
     risky_universe: List[str] = field(default_factory=list)
-    canary_universe: List[str] = field(default_factory=list)
-    offensive_universe: List[str] = field(default_factory=list)
-    defensive_universe: List[str] = field(default_factory=list)
+    # canary/offensive/defensive default to None (not []) -- None means "the description
+    # named no tickers for this role, derive it from the runtime universe at generate_weights
+    # time"; an explicitly-set empty list means "deliberately narrowed to nothing" and must be
+    # respected as empty, not expanded (see generate_weights's canary-mode branch).
+    canary_universe: Optional[List[str]] = None
+    offensive_universe: Optional[List[str]] = None
+    defensive_universe: Optional[List[str]] = None
     cash_proxy: str = DEFAULT_CASH_PROXY
 
     # Trend / Gate Filters
@@ -84,9 +85,9 @@ class ParsedStrategySpec:
         if self.use_canary_logic:
             lines.extend([
                 f"Canary Turbulence State: ENABLED",
-                f"Canary Universe:         {', '.join(self.canary_universe) if self.canary_universe else 'None'}",
-                f"Offensive Universe:      {', '.join(self.offensive_universe) if self.offensive_universe else 'None'}",
-                f"Defensive Universe:      {', '.join(self.defensive_universe) if self.defensive_universe else 'None'}",
+                f"Canary Universe:         {', '.join(self.canary_universe) if self.canary_universe else '(derives from the runtime universe)'}",
+                f"Offensive Universe:      {', '.join(self.offensive_universe) if self.offensive_universe else '(derives from the runtime universe)'}",
+                f"Defensive Universe:      {', '.join(self.defensive_universe) if self.defensive_universe else '(derives from the runtime universe)'}",
             ])
         else:
             lines.append(f"Risky Universe:          {', '.join(self.risky_universe) if self.risky_universe else 'None'}")
@@ -184,38 +185,41 @@ def parse_plain_english_strategy(description: str, name: Optional[str] = None) -
     if "canary" in text_lower:
         spec.use_canary_logic = True
 
+        canary_tickers: List[str] = []
+        offensive_tickers: List[str] = []
+        defensive_tickers: List[str] = []
         for s in sentences:
             s_lower = s.lower()
             if "canary" in s_lower:
                 tickers = _extract_tickers(s)
-                if tickers:
-                    spec.canary_universe.extend([t for t in tickers if t not in spec.canary_universe])
+                canary_tickers.extend([t for t in tickers if t not in canary_tickers])
             if "offensive" in s_lower:
                 tickers = _extract_tickers(s)
-                if tickers:
-                    spec.offensive_universe.extend([t for t in tickers if t not in spec.offensive_universe])
+                offensive_tickers.extend([t for t in tickers if t not in offensive_tickers])
             if "defensive" in s_lower:
                 tickers = _extract_tickers(s)
-                if tickers:
-                    spec.defensive_universe.extend([t for t in tickers if t not in spec.defensive_universe])
+                defensive_tickers.extend([t for t in tickers if t not in defensive_tickers])
 
-        if not spec.canary_universe:
-            spec.canary_universe = list(DEFAULT_BAA_CANARY)
+        # None (not []) means "no tickers named" -- generate_weights derives this role from
+        # the runtime universe instead of expanding a deliberately-empty explicit list.
+        spec.canary_universe = canary_tickers or None
+        spec.offensive_universe = offensive_tickers or None
+        spec.defensive_universe = defensive_tickers or None
+
+        if spec.canary_universe is None:
             spec.warnings.append(
-                f"No canary-universe tickers found in description; defaulting to DEFAULT_BAA_CANARY "
-                f"({', '.join(DEFAULT_BAA_CANARY)})"
+                "No canary-universe tickers found in description; will use every symbol in the "
+                "runtime universe instead of a hardcoded default."
             )
-        if not spec.offensive_universe:
-            spec.offensive_universe = list(DEFAULT_BAA_OFFENSIVE)
+        if spec.offensive_universe is None:
             spec.warnings.append(
-                f"No offensive-universe tickers found in description; defaulting to DEFAULT_BAA_OFFENSIVE "
-                f"({', '.join(DEFAULT_BAA_OFFENSIVE)})"
+                "No offensive-universe tickers found in description; will use every symbol in the "
+                "runtime universe instead of a hardcoded default."
             )
-        if not spec.defensive_universe:
-            spec.defensive_universe = list(DEFAULT_BAA_DEFENSIVE)
+        if spec.defensive_universe is None:
             spec.warnings.append(
-                f"No defensive-universe tickers found in description; defaulting to DEFAULT_BAA_DEFENSIVE "
-                f"({', '.join(DEFAULT_BAA_DEFENSIVE)})"
+                "No defensive-universe tickers found in description; will use every symbol in the "
+                "runtime universe instead of a hardcoded default."
             )
     else:
         # General risky universe extraction

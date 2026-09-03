@@ -396,15 +396,6 @@ register_provider("yfinance", YFinanceDataProvider)
 register_provider("csv", CSVFolderDataProvider)
 register_provider("synthetic", SyntheticDataProvider)
 
-_DEFAULT_PROVIDER: Optional[BaseDataProvider] = None
-
-
-def set_default_data_provider(provider: BaseDataProvider):
-    """Sets global default data provider instance."""
-    global _DEFAULT_PROVIDER
-    _DEFAULT_PROVIDER = provider
-
-
 def _load_provider_from_specifier(specifier: str, **kwargs) -> BaseDataProvider:
     """Dynamically loads a data provider from a module specifier string
     (e.g., 'script.py:CustomProvider', 'module.path:CustomProvider', or 'script.py').
@@ -465,8 +456,6 @@ def get_data_provider(provider_name_or_instance: Union[str, BaseDataProvider, No
         return provider_name_or_instance
 
     if provider_name_or_instance is None:
-        if _DEFAULT_PROVIDER is not None:
-            return _DEFAULT_PROVIDER
         return YFinanceDataProvider(**kwargs)
 
     name = str(provider_name_or_instance).strip()
@@ -518,18 +507,4 @@ def fetch_fund_metadata(symbol: str, provider: Union[str, BaseDataProvider, None
     """Best-effort expense ratio / AUM lookup via metadata provider."""
     prov = get_data_provider(provider, **kwargs)
     return prov.fetch_metadata(symbol)
-
-
-# Re-export Universe Provider components for convenience
-from .universe import (
-    BaseUniverseProvider,
-    CodeUniverseProvider,
-    FileUniverseProvider,
-    StaticUniverseProvider,
-    add_universe_cli_args,
-    get_universe_provider,
-    register_universe_provider,
-    resolve_universe_from_args,
-    resolve_universe_symbols,
-)
 

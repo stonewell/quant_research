@@ -25,7 +25,6 @@ from common.data import (
     load_ohlcv,
     load_universe,
     register_provider,
-    set_default_data_provider,
 )
 
 
@@ -389,17 +388,6 @@ def test_load_universe_backward_compatibility():
     universe = load_universe(["SPY", "TLT"], start="2020-01-01", end="2020-01-15", use_cache=False, provider="synthetic")
     assert "SPY" in universe
     assert "TLT" in universe
-
-
-def test_set_default_data_provider():
-    dummy = CustomDummyProvider()
-    set_default_data_provider(dummy)
-
-    try:
-        prov = get_data_provider()
-        assert prov is dummy
-    finally:
-        set_default_data_provider(None)
 
 
 def test_data_provider_module_specifier_from_file():

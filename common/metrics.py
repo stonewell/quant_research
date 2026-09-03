@@ -44,25 +44,12 @@ def cagr(equity: pd.Series, periods_per_year: int = 252) -> float:
     return growth ** (1 / years) - 1.0
 
 
-def annualized_vol(returns: pd.Series, periods_per_year: int = 252) -> float:
-    return returns.std(ddof=1) * np.sqrt(periods_per_year)
-
-
 def sharpe_ratio(returns: pd.Series, risk_free: float = 0.0, periods_per_year: int = 252) -> float:
     excess = returns - risk_free / periods_per_year
     std = excess.std(ddof=1)
     if std == 0 or np.isnan(std):
         return 0.0
     return (excess.mean() / std) * np.sqrt(periods_per_year)
-
-
-def sortino_ratio(returns: pd.Series, risk_free: float = 0.0, periods_per_year: int = 252) -> float:
-    excess = returns - risk_free / periods_per_year
-    downside = excess[excess < 0]
-    dd_std = downside.std(ddof=1)
-    if dd_std == 0 or np.isnan(dd_std):
-        return 0.0
-    return (excess.mean() / dd_std) * np.sqrt(periods_per_year)
 
 
 def max_drawdown(equity: pd.Series) -> float:
@@ -115,10 +102,6 @@ def profit_factor_from_returns(returns: pd.Series) -> float:
     return float(pos.sum() / abs(neg.sum()))
 
 
-def pct_time_in_market(equity_curve: pd.DataFrame) -> float:
-    return equity_curve["in_position"].mean()
-
-
 # --- Relative/comparative metrics (strategy vs. a baseline return series) ---
 #
 # Everything above this point is an ABSOLUTE metric (computed from one return/
@@ -130,7 +113,7 @@ def pct_time_in_market(equity_curve: pd.DataFrame) -> float:
 # `closes.index.intersection(target_weights.index)` pattern elsewhere in this
 # workspace. Degenerate inputs (fewer than 2 overlapping periods, or a
 # zero/NaN-variance denominator) return 0.0 for every value here -- the same
-# "no ratio is computable" convention `sharpe_ratio`/`sortino_ratio` use for a
+# "no ratio is computable" convention `sharpe_ratio` uses for a
 # zero-std denominator above, deliberately NOT `profit_factor_from_returns`'s
 # `NaN` convention (that one signals a different kind of degeneracy: "no
 # losses exist to divide by", not "not enough data to compute anything").
@@ -145,7 +128,7 @@ def alpha_beta(strategy_returns: pd.Series, baseline_returns: pd.Series,
     alpha = (mean(strategy_excess) - beta * mean(baseline_excess)) * periods_per_year
 
     `alpha` is annualized via LINEAR scaling (per-period value * periods_per_year),
-    matching `annualized_vol`/`sharpe_ratio`'s sqrt-scaling conventions elsewhere
+    matching `sharpe_ratio`'s sqrt-scaling conventions elsewhere
     in this file -- not a compounding/CAGR-style annualization. Covariance-based
     beta is algebraically identical to a single-variable OLS slope, so this
     needs no regression library.

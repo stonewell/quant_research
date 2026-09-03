@@ -87,16 +87,3 @@ def compute_feature(curve: pd.DataFrame, name: str, lookback) -> pd.Series:
     if name == "williams_r":
         return williams_r(curve, lookback)
     raise ValueError(f"Unknown feature name '{name}'")
-
-
-def longest_lookback(feature_menu) -> int:
-    """Longest scalar lookback across a feature menu -- used as the default
-    exclusion-buffer width around real turning points in
-    `pattern_mining.mine_indicator_patterns`."""
-    lookbacks = []
-    for _, lb in feature_menu:
-        if isinstance(lb, (tuple, list)):
-            lookbacks.extend(lb)
-        else:
-            lookbacks.append(lb)
-    return max(lookbacks) if lookbacks else 0

@@ -51,7 +51,7 @@ from selectorbot.config import SelectionConfig
 from selectorbot.data import fetch_fund_metadata
 
 RESULTS_DIR = default_results_dir(__file__)
-DATA_DIR = shared_data_dir()  # same workspace-wide <repo_root>/data cache dir that selectorbot.data.DATA_DIR resolves to
+DATA_DIR = shared_data_dir()
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

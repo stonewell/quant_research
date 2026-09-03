@@ -40,7 +40,7 @@ def test_strategy_class_map_and_instantiate_helper_importable_from_rs_strategy()
 
     assert rrs.STRATEGY_CLASS_MAP is canonical_map
     assert rrs.instantiate_strategy_from_config_entry is canonical_fn
-    assert len(canonical_map) == 21
+    assert len(canonical_map) == 18
 
 
 def test_strategy_class_map_importable_via_research_strategy_namespace_package():
@@ -62,7 +62,7 @@ def test_strategy_class_map_importable_via_research_strategy_namespace_package()
     the same process."""
     from research_strategy.rs.strategy import STRATEGY_CLASS_MAP as namespaced_map
 
-    assert len(namespaced_map) == 21
+    assert len(namespaced_map) == 18
     assert set(namespaced_map.keys()) == set(rrs.STRATEGY_CLASS_MAP.keys())
 
 
@@ -153,6 +153,76 @@ def test_strategy_all_survives_one_strategy_hitting_empty_weights_path(tmp_path,
     ranked_keys = {entry["strategy_key"] for entry in top_summary["top_strategies"]}
     assert "accelerating_dual_momentum" not in ranked_keys
     assert "=== Top" in captured.out
+
+
+def test_vaa_strategy_requires_both_universe_flags_or_exits(tmp_path, monkeypatch, capsys):
+    """vigilant_asset_allocation no longer has a hardcoded default universe -- requesting it
+    directly without both --vaa-offensive-universe/--vaa-defensive-universe must exit(1) with a
+    clear message, not silently fall back to some default or crash with an unrelated error."""
+    monkeypatch.setattr(rrs, "RESULTS_DIR", str(tmp_path))
+    argv = [
+        "run_research_strategy.py",
+        "--strategy", "vigilant_asset_allocation",
+        "--data-provider", "synthetic",
+        "--n-days", "300",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with pytest.raises(SystemExit) as exc_info:
+        rrs.main()
+    assert exc_info.value.code == 1
+
+    captured = capsys.readouterr()
+    assert "vaa-offensive-universe" in captured.out
+    assert "vaa-defensive-universe" in captured.out
+
+
+def test_vaa_strategy_runs_with_both_universe_flags_supplied(tmp_path, monkeypatch):
+    monkeypatch.setattr(rrs, "RESULTS_DIR", str(tmp_path))
+    argv = [
+        "run_research_strategy.py",
+        "--strategy", "vigilant_asset_allocation",
+        "--data-provider", "synthetic",
+        "--n-days", "300",
+        "--vaa-offensive-universe", "SPY", "QQQ",
+        "--vaa-defensive-universe", "IEF", "BIL",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    rrs.main()  # must not raise/exit
+
+    report_path = tmp_path / "research_strategy_report.json"
+    assert report_path.exists()
+    with open(report_path) as f:
+        report_data = json.load(f)
+    assert "vigilant_asset_allocation" in report_data
+
+
+def test_strategy_all_skips_vaa_with_warning_when_universe_flags_missing(tmp_path, monkeypatch, capsys):
+    """--strategy all must not be blocked by VAA's new requirement -- it should skip just VAA
+    with a clear warning and let every other strategy in the run complete normally."""
+    monkeypatch.setattr(rrs, "RESULTS_DIR", str(tmp_path))
+    argv = [
+        "run_research_strategy.py",
+        "--strategy", "all",
+        "--data-provider", "synthetic",
+        "--seed", "7",
+        "--n-days", "300",
+        "--universe", *UNIVERSE_WITHOUT_SCZ,
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    rrs.main()  # must not raise/exit
+
+    report_path = tmp_path / "research_strategy_report.json"
+    with open(report_path) as f:
+        report_data = json.load(f)
+    assert "vigilant_asset_allocation" not in report_data
+    assert len(report_data) > 0
+
+    captured = capsys.readouterr()
+    assert "vigilant_asset_allocation" in captured.out
+    assert "WARNING" in captured.out
 
 
 def _fake_metrics(sharpe, cagr, strategy_name="Fake Strategy", raw_description="fake raw description"):

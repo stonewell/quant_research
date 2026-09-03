@@ -3,43 +3,38 @@
 Powered by NaturalLanguageStrategy: A plain English execution engine that interprets
 structured strategy rules (ParsedStrategySpec) and dynamically executes backtests.
 
-Canonical Preset Strategies:
-1. ActiveDualMomentumRiskParity (Antonacci 2014, Faber 2007)
-2. BoldAssetAllocation (Wouter Keller 2022 BAA-G12)
-3. VolatilityManagedStrategy (Moreira & Muir 2017)
-
 Standalone Research Strategies:
-4. AcceleratingDualMomentum (Ludlow & Hanly 2018, EngineeredPortfolio.com)
-5. VigilantAssetAllocation (Keller & Keuning 2017, SSRN #3002624, VAA-G4)
+1. AcceleratingDualMomentum (Ludlow & Hanly 2018, EngineeredPortfolio.com)
+2. VigilantAssetAllocation (Keller & Keuning 2017, SSRN #3002624, VAA-G4)
 
 Timing Strategies (ported from workspace side projects & extended for multi-asset):
-6. RSIMeanReversionStrategy
-7. SwingTrendPullbackStrategy
-8. AdaptiveGridStrategy
-9. EnsembleRegimeSwitchingStrategy
-10. TurtleBreakoutStrategy (Dennis & Eckhardt / Donchian)
+3. RSIMeanReversionStrategy
+4. SwingTrendPullbackStrategy
+5. AdaptiveGridStrategy
+6. EnsembleRegimeSwitchingStrategy
+7. TurtleBreakoutStrategy (Dennis & Eckhardt / Donchian)
 
 Modern Popular Portfolios (static, fixed-weight, no momentum/trend logic):
-11. PermanentPortfolioStrategy (Harry Browne)
-12. GoldenButterflyStrategy (Portfolio Charts)
-13. AllWeatherStrategy (Dalio-style retail risk-parity approximation)
-14. HFEAStrategy ("Hedgefundie's Excellent Adventure", leveraged UPRO/TMF)
+8. PermanentPortfolioStrategy (Harry Browne)
+9. GoldenButterflyStrategy (Portfolio Charts)
+10. AllWeatherStrategy (Dalio-style retail risk-parity approximation)
+11. HFEAStrategy ("Hedgefundie's Excellent Adventure", leveraged UPRO/TMF)
 
 Modern Systematic TAA Extensions:
-15. ProtectiveAssetAllocation (Keller & Keuning 2016, SSRN #2759734, PAA)
-16. AdaptiveAssetAllocation (Butler/Philbrick/Gordillo/Varadi 2012, SSRN #2328254, AAA)
+12. ProtectiveAssetAllocation (Keller & Keuning 2016, SSRN #2759734, PAA)
+13. AdaptiveAssetAllocation (Butler/Philbrick/Gordillo/Varadi 2012, SSRN #2328254, AAA)
 
 Original Structural Strategies (independent from-scratch implementations,
 not ports of any workspace side project or third-party library):
-17. ChanPivotShiftStrategy (缠中说禅/Chan-theory pivot-shift reading, see `chan_structure.py`)
-18. ChanThreeTypeStrategy (additive extension of #17: segments, real MACD
+14. ChanPivotShiftStrategy (缠中说禅/Chan-theory pivot-shift reading, see `chan_structure.py`)
+15. ChanThreeTypeStrategy (additive extension of #14: segments, real MACD
     divergence, formal 一/二/三类买卖点 taxonomy -- see `chan_signals.py`)
-19. ChanPivotShiftMACDStrategy (additive copy of #17: same pivot-shift buy/sell
+16. ChanPivotShiftMACDStrategy (additive copy of #14: same pivot-shift buy/sell
     rule, but its disclosed stroke-slope divergence proxy replaced by real
     MACD divergence, made symmetric -- see `chan_signals.py`)
 
 Value-Investing-Adapted Strategies:
-20. CompounderMarginOfSafetyStrategy (price-only proxy of a conservative valuation
+17. CompounderMarginOfSafetyStrategy (price-only proxy of a conservative valuation
     framework, see `docs/snowball_strategy.txt`; the real-fundamentals version lives
     in the separate `fundamental_screener` project)
 """
@@ -82,14 +77,6 @@ CANONICAL_DUAL_MOMENTUM_TEXT = (
     "Rank passing assets by 63d and 126d momentum, select top 3 assets, "
     "and allocate using 60d inverse volatility risk parity weighting. "
     "Assign unallocated capital to cash proxy BIL."
-)
-
-CANONICAL_BAA_KELLER_TEXT = (
-    "Rebalance monthly. Use canary assets: SPY, EEM, EFA, AGG. "
-    "If any canary asset has Close below 200d SMA or 126d ROC <= 0, market is turbulent. "
-    "In calm markets, select top 3 offensive assets from SPY, QQQ, IWM, EFA, EEM, TLT, LQD, DBC by 126d ROC with equal weighting. "
-    "In turbulent markets, select top 3 defensive assets from TIP, IEF, TLT, BIL, AGG, DBC with positive 126d ROC, "
-    "and assign remainder to cash proxy BIL."
 )
 
 CANONICAL_VOLATILITY_MANAGED_TEXT = (
@@ -218,9 +205,21 @@ class NaturalLanguageStrategy(AllocationTemplate):
 
         # MODE 1: BAA Canary Turbulence Logic
         if spec.use_canary_logic:
-            canary_symbols = [s for s in spec.canary_universe if s in symbols]
-            offensive_symbols = [s for s in spec.offensive_universe if s in symbols]
-            defensive_symbols = [s for s in spec.defensive_universe if s in symbols]
+            # None means "no tickers named in the description" -- derive from the runtime
+            # universe. An explicitly-set empty list is respected as empty (e.g. a caller
+            # deliberately narrowing offensive_universe to nothing), never expanded.
+            if spec.canary_universe is None:
+                canary_symbols = [s for s in symbols if s != cash_proxy]
+            else:
+                canary_symbols = [s for s in spec.canary_universe if s in symbols]
+            if spec.offensive_universe is None:
+                offensive_symbols = [s for s in symbols if s != cash_proxy]
+            else:
+                offensive_symbols = [s for s in spec.offensive_universe if s in symbols]
+            if spec.defensive_universe is None:
+                defensive_symbols = [s for s in symbols if s != cash_proxy]
+            else:
+                defensive_symbols = [s for s in spec.defensive_universe if s in symbols]
 
             for date in rebalance_dates:
                 turbulent = False
@@ -353,27 +352,6 @@ class NaturalLanguageStrategy(AllocationTemplate):
 
     def warmup_bars(self, params: dict = None) -> int:
         return max(200, self.spec.trend_sma_period, self.spec.mom_long_lookback)
-
-
-class ActiveDualMomentumRiskParity(NaturalLanguageStrategy):
-    """Preset Active Dual Momentum GTAA + Inverse Volatility Risk Parity Strategy."""
-    def __init__(self, config: StrategyConfig = None):
-        spec = parse_plain_english_strategy(CANONICAL_DUAL_MOMENTUM_TEXT, name="Active Dual Momentum GTAA")
-        super().__init__(spec, config=config)
-
-
-class BoldAssetAllocation(NaturalLanguageStrategy):
-    """Preset Wouter Keller's Bold Asset Allocation (BAA-G12) Strategy."""
-    def __init__(self, config: StrategyConfig = None):
-        spec = parse_plain_english_strategy(CANONICAL_BAA_KELLER_TEXT, name="Bold Asset Allocation (BAA-G12)")
-        super().__init__(spec, config=config)
-
-
-class VolatilityManagedStrategy(NaturalLanguageStrategy):
-    """Preset Moreira & Muir Volatility-Managed Strategy."""
-    def __init__(self, config: StrategyConfig = None):
-        spec = parse_plain_english_strategy(CANONICAL_VOLATILITY_MANAGED_TEXT, name="Volatility-Managed Portfolio")
-        super().__init__(spec, config=config)
 
 
 class AcceleratingDualMomentum(AllocationTemplate):
@@ -1409,11 +1387,12 @@ class CompounderMarginOfSafetyStrategy(AllocationTemplate):
 
         symbols = list(universe.keys())
         candidate_symbols = [s for s in candidate_universe if s in universe and s != benchmark_symbol]
+        if not candidate_symbols:
+            candidate_symbols = [s for s in symbols if s != cash_proxy and s != benchmark_symbol]
         if not candidate_symbols or benchmark_symbol not in universe:
             return pd.DataFrame()
 
-        master_index = universe[candidate_symbols[0]].index
-        n_bars = len(master_index)
+        master_index = _aligned_master_index(universe, candidate_symbols)
 
         benchmark_close = universe[benchmark_symbol]["Close"]
         # Annualized trailing return over lookback_days -- the benchmark's
@@ -1429,15 +1408,21 @@ class CompounderMarginOfSafetyStrategy(AllocationTemplate):
         raw_weights = {}
         for sym in candidate_symbols:
             close = universe[sym]["Close"]
+            n_bars = len(close)
             trend_ma = sma(close, trend_ma_period)
             vol = realized_vol(close, vol_lookback)
             trailing_return = (close / close.shift(lookback_days)) ** (252.0 / lookback_days) - 1.0
+            # Real market data doesn't guarantee the benchmark and every candidate share the
+            # exact same trading calendar -- reindex the benchmark comparator onto THIS symbol's
+            # own calendar (not the other way around, to avoid corrupting its own rolling
+            # indicators) so the comparison below is always index-aligned. Missing dates become
+            # NaN, which .fillna(True) below already treats as "exit" -- a safe default.
+            benchmark_trailing_return_aligned = benchmark_trailing_return.reindex(close.index)
 
             quality_ok = (close > trend_ma) & (vol <= max_volatility)
             entry_signal = (quality_ok & (trailing_return >= required_return)).fillna(False)
-            exit_signal = (~quality_ok | (trailing_return < benchmark_trailing_return)).fillna(True)
+            exit_signal = (~quality_ok | (trailing_return < benchmark_trailing_return_aligned)).fillna(True)
 
-            close_arr = close.to_numpy()
             entry_arr = entry_signal.to_numpy()
             exit_arr = exit_signal.to_numpy()
             raw = np.zeros(n_bars)
@@ -1452,7 +1437,7 @@ class CompounderMarginOfSafetyStrategy(AllocationTemplate):
                 elif entry_arr[i]:
                     in_position = True
                     raw[i] = 1.0
-            raw_weights[sym] = raw
+            raw_weights[sym] = pd.Series(raw, index=close.index).reindex(master_index).fillna(0.0).to_numpy()
 
         position_size_pct = 1.0 / len(candidate_symbols)
         daily = pd.DataFrame(raw_weights, index=master_index) * position_size_pct
@@ -1750,6 +1735,7 @@ class ProtectiveAssetAllocation(AllocationTemplate):
         rebal_freq = p.get("rebalance_freq_days", cfg.rebalance_freq_days)
         risky_universe = p.get("paa_universe", cfg.paa_universe)
         protection_symbol = p.get("paa_protection_symbol", cfg.paa_protection_symbol)
+        cash_proxy = p.get("cash_proxy", cfg.cash_proxy)
         lookback = p.get("paa_momentum_lookback", cfg.paa_momentum_lookback)
         top_k = p.get("paa_top_k", cfg.paa_top_k)
         protection_factor = p.get("paa_protection_factor", cfg.paa_protection_factor)
@@ -1761,8 +1747,15 @@ class ProtectiveAssetAllocation(AllocationTemplate):
         master_index = universe[symbols[0]].index
         rebalance_dates = _get_rebalance_dates(master_index, rebal_freq)
 
+        # If the configured protection asset isn't in the passed universe, fall back to
+        # cash_proxy as the safe-haven sleeve instead of silently dropping the protection
+        # allocation entirely (previously: weights simply summed to < 1.0 on turbulent days).
+        if protection_symbol not in symbols and cash_proxy in symbols:
+            protection_symbol = cash_proxy
         has_protection = protection_symbol in symbols
         risky_symbols = [s for s in risky_universe if s in symbols and s != protection_symbol]
+        if not risky_symbols:
+            risky_symbols = [s for s in symbols if s != protection_symbol]
         n_assets = len(risky_symbols)
 
         weights_rebal = pd.DataFrame(index=rebalance_dates, columns=symbols, data=0.0)
@@ -1874,6 +1867,7 @@ class AdaptiveAssetAllocation(AllocationTemplate):
         p = params or {}
         rebal_freq = p.get("rebalance_freq_days", cfg.rebalance_freq_days)
         aaa_universe = p.get("aaa_universe", cfg.aaa_universe)
+        cash_proxy = p.get("cash_proxy", cfg.cash_proxy)
         mom_lookback = p.get("aaa_momentum_lookback", cfg.aaa_momentum_lookback)
         top_k = p.get("aaa_top_k", cfg.aaa_top_k)
         vol_lookback = p.get("aaa_vol_lookback", cfg.aaa_vol_lookback)
@@ -1885,6 +1879,8 @@ class AdaptiveAssetAllocation(AllocationTemplate):
             return pd.DataFrame()
 
         universe_symbols = [s for s in aaa_universe if s in symbols]
+        if not universe_symbols:
+            universe_symbols = [s for s in symbols if s != cash_proxy]
         n_universe = len(universe_symbols)
         master_index = universe[symbols[0]].index
         rebalance_dates = _get_rebalance_dates(master_index, rebal_freq)
@@ -1970,11 +1966,9 @@ class AdaptiveAssetAllocation(AllocationTemplate):
 # reaches this module.
 STRATEGY_CLASS_MAP = {
     "AcceleratingDualMomentum": AcceleratingDualMomentum,
-    "ActiveDualMomentumRiskParity": ActiveDualMomentumRiskParity,
     "AdaptiveAssetAllocation": AdaptiveAssetAllocation,
     "AdaptiveGridStrategy": AdaptiveGridStrategy,
     "AllWeatherStrategy": AllWeatherStrategy,
-    "BoldAssetAllocation": BoldAssetAllocation,
     "ChanPivotShiftMACDStrategy": ChanPivotShiftMACDStrategy,
     "ChanPivotShiftStrategy": ChanPivotShiftStrategy,
     "ChanThreeTypeStrategy": ChanThreeTypeStrategy,
@@ -1989,7 +1983,6 @@ STRATEGY_CLASS_MAP = {
     "SwingTrendPullbackStrategy": SwingTrendPullbackStrategy,
     "TurtleBreakoutStrategy": TurtleBreakoutStrategy,
     "VigilantAssetAllocation": VigilantAssetAllocation,
-    "VolatilityManagedStrategy": VolatilityManagedStrategy,
 }
 
 

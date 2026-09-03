@@ -28,11 +28,11 @@ from research_strategy.rs.nl_parser import ParsedStrategySpec
 from research_strategy.run_research_strategy import instantiate_strategy_from_config_entry
 from research_strategy.rs.strategy import (
     AcceleratingDualMomentum,
-    ActiveDualMomentumRiskParity,
     AdaptiveAssetAllocation,
     AdaptiveGridStrategy,
     AllWeatherStrategy,
-    BoldAssetAllocation,
+    CANONICAL_DUAL_MOMENTUM_TEXT,
+    CANONICAL_VOLATILITY_MANAGED_TEXT,
     ChanPivotShiftMACDStrategy,
     ChanPivotShiftStrategy,
     ChanThreeTypeStrategy,
@@ -48,7 +48,6 @@ from research_strategy.rs.strategy import (
     SwingTrendPullbackStrategy,
     TurtleBreakoutStrategy,
     VigilantAssetAllocation,
-    VolatilityManagedStrategy,
     _min_variance_weights,
 )
 
@@ -109,7 +108,7 @@ def _daily(weights):
 
 def test_dual_momentum_trend_gate_and_cash_overlay():
     cfg = StrategyConfig(trend_sma_period=50, mom_long_lookback=50, rebalance_freq_days=20, top_k=3)
-    strat = ActiveDualMomentumRiskParity(cfg)
+    strat = NaturalLanguageStrategy(CANONICAL_DUAL_MOMENTUM_TEXT, cfg)
     universe = create_mock_universe(n_days=250)
 
     weights = strat.generate_weights(universe)
@@ -123,21 +122,43 @@ def test_dual_momentum_trend_gate_and_cash_overlay():
     assert pytest.approx(total_w, abs=1e-4) == 1.0
 
 
-def test_baa_canary_universe_switching():
-    cfg = StrategyConfig(rebalance_freq_days=20, top_k=3)
-    strat = BoldAssetAllocation(cfg)
-    universe = create_mock_universe(n_days=250)
-
-    dates = universe["EEM"].index
-    universe["EEM"].loc[dates[-50]:, "Close"] = 10.0
+def test_baa_canary_none_universes_derive_from_the_passed_universe():
+    # Regression: canary/offensive/defensive_universe=None (the new "not specified in the
+    # description" sentinel) must resolve to every non-cash symbol actually in the passed
+    # universe -- not an empty pool, and not the old hardcoded SPY/EEM/EFA/AGG-style lists.
+    spec = ParsedStrategySpec(
+        strategy_name="Universe-Derived BAA Test",
+        raw_description="test",
+        use_canary_logic=True,
+        canary_universe=None,
+        offensive_universe=None,
+        defensive_universe=None,
+        cash_proxy="BIL",
+        rebalance_freq_days=20,
+        trend_sma_period=50,
+        trend_roc_lookback=50,
+        top_k=2,
+    )
+    strat = NaturalLanguageStrategy(spec)
+    # A universe with NONE of the old hardcoded BAA tickers (SPY/EEM/EFA/AGG/QQQ/IWM/TLT/LQD/DBC/
+    # TIP/IEF/BIL-defensive-list) except the cash proxy -- if canary/offensive/defensive still
+    # fell back to the old hardcoded lists, none of these symbols would ever be considered.
+    n = 300
+    dates = pd.bdate_range("2020-01-01", periods=n)
+    t = np.arange(n)
+    universe = {
+        "XOM": make_ohlcv_from_closes(100.0 + 0.2 * t, start="2020-01-01"),
+        "CVX": make_ohlcv_from_closes(100.0 + 0.15 * t, start="2020-01-01"),
+        "BIL": make_ohlcv_from_closes([100.0] * n, start="2020-01-01"),
+    }
+    for df in universe.values():
+        df.index = dates
 
     weights = strat.generate_weights(universe)
-    rebal_dates = weights.dropna(how="all").index
-    last_rebal = rebal_dates[-1]
+    daily = weights.ffill().fillna(0.0)
 
-    assert weights.loc[last_rebal, "QQQ"] == 0.0
-    defensive_plus_cash = weights.loc[last_rebal, cfg.baa_defensive + [cfg.cash_proxy]].sum()
-    assert pytest.approx(defensive_plus_cash, abs=1e-4) == 1.0
+    assert not weights.empty
+    assert (daily["XOM"] > 0).any() or (daily["CVX"] > 0).any()
 
 
 def test_baa_canary_calm_market_with_no_offensive_candidates_does_not_mischaracterize_as_turbulent():
@@ -176,8 +197,8 @@ def test_baa_canary_calm_market_with_no_offensive_candidates_does_not_mischaract
 
 
 def test_volatility_managed_deleveraging():
-    cfg = StrategyConfig(rebalance_freq_days=20, vol_managed_target_vol=0.05, vol_managed_var_lookback=20)
-    strat = VolatilityManagedStrategy(cfg)
+    cfg = StrategyConfig(rebalance_freq_days=20)
+    strat = NaturalLanguageStrategy(CANONICAL_VOLATILITY_MANAGED_TEXT, cfg)
     universe = create_mock_universe(n_days=250)
 
     dates = universe["SPY"].index
@@ -223,11 +244,19 @@ def test_volatility_managed_excludes_a_symbol_with_no_data_in_window():
     universe["NEW"] = make_ohlcv_from_closes(new_close)
     universe["NEW"].index = dates
 
-    cfg = StrategyConfig(
-        risky_universe=["SPY", "QQQ", "GLD", "NEW"], cash_proxy="BIL",
-        rebalance_freq_days=20, vol_managed_var_lookback=20,
+    # A directly-built ParsedStrategySpec (not the CANONICAL text, which only ever names its own
+    # fixed 8-symbol risky_universe) so "NEW" is genuinely a candidate risky asset here, and its
+    # NaN-until-day-200 data -- not an absent-from-the-universe exclusion -- is what's being tested.
+    spec = ParsedStrategySpec(
+        strategy_name="Volatility-Managed NEW-symbol Test",
+        raw_description="test",
+        risky_universe=["SPY", "QQQ", "GLD", "NEW"],
+        cash_proxy="BIL",
+        rebalance_freq_days=20,
+        allocation_scheme="volatility_managed",
+        var_lookback=20,
     )
-    strat = VolatilityManagedStrategy(cfg)
+    strat = NaturalLanguageStrategy(spec)
     weights = strat.generate_weights(universe)
     rebal_dates = weights.dropna(how="all").index
 
@@ -1529,6 +1558,55 @@ def test_paa_missing_protection_symbol_still_allocates_risky_sleeve():
     assert "IEF" not in last_row.index or pd.isna(last_row.get("IEF"))
 
 
+def test_paa_missing_protection_symbol_falls_back_to_cash_proxy():
+    # Regression: previously, when the configured protection_symbol (default "IEF") wasn't in
+    # the universe, protection_fraction capital was silently never allocated anywhere (weights
+    # summed to < 1.0 on turbulent days). It must now fall back to cash_proxy instead.
+    n = 400
+    dates = pd.bdate_range("2020-01-01", periods=n)
+    t = np.arange(n)
+    falling = 100.0 - 0.05 * t  # every risky asset trending down -> full protection fraction
+
+    cfg = StrategyConfig(paa_momentum_lookback=50, rebalance_freq_days=21)
+    universe = {sym: make_ohlcv_from_closes(falling, start="2020-01-01") for sym in cfg.paa_universe}
+    universe["BIL"] = make_ohlcv_from_closes([100.0] * n, start="2020-01-01")
+    for df in universe.values():
+        df.index = dates
+    # cfg.paa_universe (the risky sleeve) never includes "IEF" itself -- the default
+    # protection_symbol -- so it's already absent from this universe by construction.
+
+    strat = ProtectiveAssetAllocation(cfg)
+    weights = strat.generate_weights(universe)
+    last_row = weights.dropna(how="all").iloc[-1]
+
+    assert last_row["BIL"] == pytest.approx(1.0, abs=1e-6)
+    np.testing.assert_allclose(last_row.sum(), 1.0, atol=1e-9)
+
+
+def test_paa_universe_falls_back_to_full_universe_when_hardcoded_list_misses():
+    n = 300
+    dates = pd.bdate_range("2020-01-01", periods=n)
+    t = np.arange(n)
+    rising = 100.0 + 0.1 * t
+
+    cfg = StrategyConfig(paa_momentum_lookback=50, rebalance_freq_days=21, paa_top_k=2)
+    # A universe that shares NOTHING with cfg.paa_universe (the hardcoded 11-ticker list).
+    universe = {
+        "XOM": make_ohlcv_from_closes(rising, start="2020-01-01"),
+        "CVX": make_ohlcv_from_closes(rising, start="2020-01-01"),
+        "BIL": make_ohlcv_from_closes([100.0] * n, start="2020-01-01"),
+    }
+    for df in universe.values():
+        df.index = dates
+
+    strat = ProtectiveAssetAllocation(cfg)
+    weights = strat.generate_weights(universe)
+    last_row = weights.dropna(how="all").iloc[-1]
+
+    assert not weights.empty
+    assert last_row["XOM"] > 0 or last_row["CVX"] > 0
+
+
 # --- Adaptive Asset Allocation (AAA) ---------------------------------------
 
 def test_min_variance_weights_favors_lower_variance_asset():
@@ -1588,6 +1666,24 @@ def test_aaa_warmup_bars_covers_longest_lookback():
 def test_aaa_empty_universe_returns_empty_frame():
     strat = AdaptiveAssetAllocation()
     assert strat.generate_weights({}).empty
+
+
+def test_aaa_universe_falls_back_to_full_universe_when_hardcoded_list_misses():
+    # Regression: aaa_universe (the hardcoded 8-ticker DEFAULT_AAA_UNIVERSE) used to have no
+    # fallback -- a universe sharing nothing with it produced an all-NaN weights frame instead
+    # of trading whatever was actually passed.
+    universe = create_mock_universe(n_days=300)
+    for sym in list(universe.keys()):
+        if sym not in ("SPY", "QQQ", "BIL"):
+            del universe[sym]
+
+    cfg = StrategyConfig(aaa_universe=["XOM", "CVX", "COP"], aaa_top_k=2)
+    strat = AdaptiveAssetAllocation(cfg)
+    weights = strat.generate_weights(universe)
+    daily = weights.ffill().fillna(0.0)
+
+    assert not weights.empty
+    assert (daily["SPY"] > 0).any() or (daily["QQQ"] > 0).any()
 
 
 # --- New strategies wired into JSON config --------------------------------
@@ -1706,6 +1802,47 @@ def test_cms_returns_empty_when_no_candidates_in_universe():
     }
     strat = CompounderMarginOfSafetyStrategy(StrategyConfig(cms_candidate_universe=["KO", "PG"]))
     assert strat.generate_weights(universe).empty
+
+
+def test_cms_candidate_universe_falls_back_to_full_universe_when_hardcoded_list_misses():
+    # Regression: cms_candidate_universe (the hardcoded 8-ticker blue-chip list) used to have no
+    # fallback -- a universe sharing nothing with it (beyond the benchmark/cash_proxy) produced
+    # an empty DataFrame instead of evaluating whatever candidates were actually passed.
+    universe = _cms_universe()
+    universe["XOM"] = universe["KO"]  # reuse KO's own strong, qualifying uptrend under a new symbol
+    del universe["KO"]
+    del universe["PG"]
+    cfg = StrategyConfig(
+        cms_candidate_universe=["ZZZZ", "YYYY"], cms_benchmark_symbol="SPY",
+        cms_lookback_days=60, cms_trend_ma_period=30, cms_vol_lookback=20,
+        cms_max_volatility=5.0, cms_required_return=0.10,
+    )
+    strat = CompounderMarginOfSafetyStrategy(cfg)
+    weights = strat.generate_weights(universe)
+    daily = weights.ffill().fillna(0.0)
+
+    assert not weights.empty
+    assert (daily["XOM"] > 0).any()
+
+
+def test_cms_handles_benchmark_calendar_mismatch_without_crashing():
+    # Regression test for a real crash: real market data doesn't guarantee the benchmark and
+    # every candidate symbol share the exact same trading calendar. The per-symbol trailing-
+    # return vs. benchmark-trailing-return comparison used to raise
+    # "ValueError: Can only compare identically-labeled Series objects" whenever the benchmark's
+    # index differed at all from a candidate's own index (e.g. one fewer trading day).
+    universe = _cms_universe(n_days=400, seed=11)
+    universe["SPY"] = universe["SPY"].iloc[:-1]  # one fewer trading day than the candidates
+
+    cfg = StrategyConfig(
+        cms_candidate_universe=["KO", "PG"], cms_benchmark_symbol="SPY",
+        cms_lookback_days=60, cms_trend_ma_period=30, cms_vol_lookback=20,
+        cms_max_volatility=5.0, cms_required_return=0.10,
+    )
+    strat = CompounderMarginOfSafetyStrategy(cfg)
+    weights = strat.generate_weights(universe)  # must not raise
+
+    assert isinstance(weights, pd.DataFrame)
 
 
 def test_compounder_margin_of_safety_instantiates_and_runs_from_json_config():

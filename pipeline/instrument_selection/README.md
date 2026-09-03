@@ -630,7 +630,7 @@ self-validating result:
 Shared code (the yfinance loader and standard indicators) lives one level up
 in `../../common/` and is used by every project in this workspace. Each module
 here re-exports the shared functions it needs and keeps only project-specific
-logic local, so the public API (`selectorbot.data.load_ohlcv`,
+logic local, so the public API (`selectorbot.data.fetch_fund_metadata`,
 `selectorbot.volatility.atr`, `selectorbot.persistence.hurst_exponent`, etc.)
 is unchanged for callers. `liquidity.py`, `correlation.py`, and `scoring.py`
 are unique to this project and unaffected.

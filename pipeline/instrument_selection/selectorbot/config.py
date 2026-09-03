@@ -100,7 +100,6 @@ class SelectionConfig:
     momentum_n_surrogates: int = 200  # shuffle-null draws for the significance test
 
     # --- correlation / diversification ---
-    correlation_window: int = 252
     max_cluster_correlation: float = 0.85  # candidates this correlated get flagged as redundant
 
     # --- ADX-based trend-strength convention (illustrative thresholds, see README) ---

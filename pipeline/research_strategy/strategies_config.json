@@ -13,7 +13,7 @@
   "baa_keller": {
     "name": "Bold Asset Allocation (BAA-G12)",
     "type": "natural_language",
-    "plain_english_description": "Rebalance monthly. Use canary assets: SPY, EEM, EFA, AGG. If any canary asset has Close below 200d SMA or 126d ROC <= 0, market is turbulent. In calm markets, select top 3 offensive assets from SPY, QQQ, IWM, EFA, EEM, TLT, LQD, DBC by 126d ROC with equal weighting. In turbulent markets, select top 3 defensive assets from TIP, IEF, TLT, BIL, AGG, DBC with positive 126d ROC, and assign remainder to cash proxy BIL.",
+    "plain_english_description": "Rebalance monthly. Use every asset in the universe as a canary indicator. If any canary asset has Close below 200d SMA or 126d ROC <= 0, market is turbulent. In calm markets, select top 3 offensive assets from the universe by 126d ROC with equal weighting. In turbulent markets, select top 3 defensive assets from the universe with positive 126d ROC. Assign remainder to cash proxy BIL.",
     "parameters": {
       "rebalance_freq_days": 21,
       "top_k": 3,
@@ -27,9 +27,6 @@
     "plain_english_description": "Rebalance monthly. Risky assets: SPY, QQQ, IWM, EFA, EEM, GLD, TLT, VNQ. Dynamically scale portfolio risk exposure using 20-day volatility-managed inverse variance scaling targeting 15% annual volatility, de-leveraging into cash proxy BIL when volatility spikes.",
     "parameters": {
       "rebalance_freq_days": 21,
-      "vol_managed_target_vol": 0.15,
-      "vol_managed_var_lookback": 20,
-      "vol_managed_max_leverage": 1.0,
       "cash_proxy": "BIL"
     },
     "factors": ["volatility_targeting"]
@@ -52,11 +49,9 @@
     "name": "Vigilant Asset Allocation (VAA-G4)",
     "type": "class",
     "class_name": "VigilantAssetAllocation",
-    "description": "Keller & Keuning (2017) 13612W momentum formula binary switching strategy between offensive and defensive universes.",
+    "description": "Keller & Keuning (2017) 13612W momentum formula binary switching strategy between offensive and defensive universes. Requires --vaa-offensive-universe/--vaa-defensive-universe on the command line (no hardcoded default universe).",
     "parameters": {
-      "rebalance_freq_days": 21,
-      "vaa_offensive_universe": ["SPY", "QQQ", "EFA", "EEM"],
-      "vaa_defensive_universe": ["IEF", "BIL"]
+      "rebalance_freq_days": 21
     },
     "factors": ["absolute_momentum_trend", "relative_momentum"]
   },

@@ -89,6 +89,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "<key>_strategy.json file under results/strategy_dumps/ (usable directly "
                         "with backtester/run_backtest.py --strategy-file), then exit without "
                         "loading any universe/market data or running a backtest evaluation")
+    p.add_argument("--vaa-offensive-universe", nargs="+", default=None, metavar="TICKER",
+                   help="vigilant_asset_allocation only: explicit offensive-pool tickers. "
+                        "strategies_config.json no longer hardcodes this -- both "
+                        "--vaa-offensive-universe and --vaa-defensive-universe are required to "
+                        "run this strategy (their tickers are automatically included in the "
+                        "loaded universe even if not also passed to --universe)")
+    p.add_argument("--vaa-defensive-universe", nargs="+", default=None, metavar="TICKER",
+                   help="vigilant_asset_allocation only: explicit defensive-pool tickers (see "
+                        "--vaa-offensive-universe)")
     p.add_argument("--description", type=str, help="Plain English strategy description text")
     p.add_argument("--description-file", type=str, help="Path to plain English strategy description text file")
     p.add_argument("--n-days", type=int, default=1200,
@@ -281,6 +290,33 @@ def build_and_dump_strategies_as_backtester_files(loaded_config, results_dir):
     return written
 
 
+def _resolve_vaa_entry_data(entry_data: dict, args) -> dict:
+    """VAA-G4 no longer hardcodes its offensive/defensive candidate pools in
+    strategies_config.json -- they're structurally two DIFFERENT-natured pools (offensive/risky
+    vs. defensive/safe-haven), so unlike every other strategy fixed this pass, they can't be
+    soundly auto-derived from one flat universe. Both --vaa-offensive-universe and
+    --vaa-defensive-universe must be supplied on the command line instead. Returns a copy of
+    entry_data with them injected into its "parameters" block (CLI always wins over whatever the
+    JSON might still contain), or None if either flag is missing -- the caller decides whether
+    that's a hard error (a single explicit --strategy request) or a skip-with-warning (--strategy
+    all, so one strategy's new requirement doesn't block every other strategy in the run)."""
+    if not args.vaa_offensive_universe or not args.vaa_defensive_universe:
+        return None
+    entry_data = dict(entry_data)
+    entry_data["parameters"] = {
+        **entry_data.get("parameters", {}),
+        "vaa_offensive_universe": args.vaa_offensive_universe,
+        "vaa_defensive_universe": args.vaa_defensive_universe,
+    }
+    return entry_data
+
+
+_VAA_MISSING_POOLS_MESSAGE = (
+    "'vigilant_asset_allocation' no longer has a hardcoded default universe -- both "
+    "--vaa-offensive-universe and --vaa-defensive-universe must be supplied."
+)
+
+
 def main():
     args = build_arg_parser().parse_args()
     cfg = StrategyConfig()
@@ -309,6 +345,12 @@ def main():
         data_kwargs["seed"] = args.seed
 
     universe_symbols = resolve_universe_from_args(args, default_symbols=DEFAULT_UNIVERSE_SYMBOLS)
+    # Make sure vigilant_asset_allocation's explicit pools actually get their OHLCV data loaded,
+    # even if the caller didn't also list them in --universe -- otherwise a pool would resolve
+    # non-empty at the argument level but empty once intersected against the loaded universe.
+    vaa_pool_symbols = list(dict.fromkeys((args.vaa_offensive_universe or []) + (args.vaa_defensive_universe or [])))
+    if vaa_pool_symbols:
+        universe_symbols = list(dict.fromkeys(universe_symbols + vaa_pool_symbols))
 
     universe = load_universe_with_banner(
         universe_symbols, start, end,
@@ -336,9 +378,21 @@ def main():
     else:
         if args.strategy == "all":
             for entry_key, entry_data in loaded_config.items():
+                if entry_key == "vigilant_asset_allocation":
+                    resolved = _resolve_vaa_entry_data(entry_data, args)
+                    if resolved is None:
+                        print(f"  WARNING: Skipping strategy '{entry_key}' -- {_VAA_MISSING_POOLS_MESSAGE}\n")
+                        continue
+                    entry_data = resolved
                 strategies_to_run[entry_key] = instantiate_strategy_from_config_entry(entry_key, entry_data)
         elif args.strategy in loaded_config:
             entry_data = loaded_config[args.strategy]
+            if args.strategy == "vigilant_asset_allocation":
+                resolved = _resolve_vaa_entry_data(entry_data, args)
+                if resolved is None:
+                    print(f"Error: {_VAA_MISSING_POOLS_MESSAGE}")
+                    sys.exit(1)
+                entry_data = resolved
             strategies_to_run[args.strategy] = instantiate_strategy_from_config_entry(args.strategy, entry_data)
         else:
             print(f"Error: Unknown strategy '{args.strategy}'. Available options in config: {', '.join(loaded_config.keys())}, or 'all'.")
