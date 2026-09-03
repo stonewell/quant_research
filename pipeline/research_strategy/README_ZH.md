@@ -173,6 +173,9 @@ uv run python research_strategy/run_research_strategy.py --strategy dual_momentu
 
 # 使用真实市场数据 (yfinance)
 uv run python research_strategy/run_research_strategy.py --strategy all --data-provider yfinance --no-cache
+
+# 将所有已配置的策略导出为可直接被 backtester 使用的 strategy.json (无需加载市场数据)
+uv run python research_strategy/run_research_strategy.py --dump-strategies
 ```
 
 ---

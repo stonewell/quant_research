@@ -5,5 +5,6 @@ __pycache__/
 **/results/*.png
 **/results/*.csv
 **/results/*.json
+**/results/strategy_dumps/
 .pytest_cache/
 uv.lock

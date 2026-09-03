@@ -245,3 +245,82 @@ def test_top_n_cli_arg_default_and_parsing():
 
     args = parser.parse_args(["--top-n", "3"])
     assert args.top_n == 3
+
+
+def test_dump_strategies_cli_arg_default_and_parsing():
+    parser = rrs.build_arg_parser()
+
+    args = parser.parse_args([])
+    assert args.dump_strategies is False
+
+    args = parser.parse_args(["--dump-strategies"])
+    assert args.dump_strategies is True
+
+
+def test_build_and_dump_strategies_writes_one_reloadable_file_per_config_entry(tmp_path):
+    """The real regression check: every strategies_config.json entry must round-trip through
+    common.strategy_spec.load_strategy_file + get_template, successfully reconstructing a live
+    strategy instance -- not just produce syntactically valid JSON."""
+    from common.strategy_spec import get_template, load_strategy_file
+
+    from rs.config import load_strategies_config
+
+    loaded_config = load_strategies_config()
+    written = rrs.build_and_dump_strategies_as_backtester_files(loaded_config, str(tmp_path))
+
+    assert len(written) == len(loaded_config)
+    dump_dir = tmp_path / "strategy_dumps"
+    for entry_key in loaded_config:
+        expected_path = dump_dir / f"{entry_key}_strategy.json"
+        assert str(expected_path) in written
+        assert expected_path.exists()
+
+        strategy_def = load_strategy_file(str(expected_path))
+        assert strategy_def["research_strategy_spec"]["strategy_key"] == entry_key
+        strat_obj = get_template(
+            strategy_def["template_name"],
+            research_strategy_spec=strategy_def["research_strategy_spec"],
+            params=strategy_def["params"],
+        )
+        assert strat_obj is not None
+        assert strat_obj.explain_weights()  # must not raise, must be non-empty
+
+
+def test_build_and_dump_strategies_skips_malformed_entry_with_warning(capsys, tmp_path):
+    loaded_config = {
+        "broken": {"name": "Broken", "type": "class", "class_name": "NotARealClass", "parameters": {}},
+        "dual_momentum": {
+            "name": "Active Dual Momentum GTAA",
+            "type": "natural_language",
+            "plain_english_description": "Rebalance monthly. Risky assets: SPY, QQQ. "
+                                          "Rank by 63d momentum, select top 1, equal weighting.",
+            "parameters": {"rebalance_freq_days": 21, "top_k": 1, "cash_proxy": "BIL"},
+        },
+    }
+
+    written = rrs.build_and_dump_strategies_as_backtester_files(loaded_config, str(tmp_path))
+
+    assert len(written) == 1
+    assert (tmp_path / "strategy_dumps" / "dual_momentum_strategy.json").exists()
+    assert not (tmp_path / "strategy_dumps" / "broken_strategy.json").exists()
+
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.out
+    assert "broken" in captured.out
+
+
+def test_dump_strategies_exits_before_loading_universe_or_writing_eval_artifacts(tmp_path, monkeypatch):
+    monkeypatch.setattr(rrs, "RESULTS_DIR", str(tmp_path))
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("--dump-strategies must not load any universe/market data")
+
+    monkeypatch.setattr(rrs, "load_universe_with_banner", _fail_if_called)
+    monkeypatch.setattr(sys, "argv", ["run_research_strategy.py", "--dump-strategies"])
+
+    rrs.main()  # must not raise, must not call load_universe_with_banner
+
+    assert (tmp_path / "strategy_dumps").is_dir()
+    assert not (tmp_path / "research_strategy_report.json").exists()
+    assert not (tmp_path / "factor_summary.json").exists()
+    assert not (tmp_path / "top_strategies_summary.json").exists()

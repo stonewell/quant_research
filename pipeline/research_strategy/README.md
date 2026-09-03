@@ -265,6 +265,7 @@ GLD, TLT, VNQ, AGG, TIP, IEF, LQD, DBC, BIL, SCZ, HYG, UPRO, TMF) if none are gi
 | `--universe-kwargs` | JSON str, default: none | Extra kwargs (as a JSON object string) passed to `--universe-provider` |
 | `--strategy` | str, default `"all"` | Which `strategies_config.json` entry to run (its key), or `"all"` to run every configured strategy |
 | `--config` | path, default: none | Alternate JSON config file (same schema as `strategies_config.json`, §2) instead of the built-in one |
+| `--dump-strategies` | flag, default off | Dump every strategy in the loaded config as its own backtester-compatible `<key>_strategy.json` under `results/strategy_dumps/` (usable directly with `backtester/run_backtest.py --strategy-file` or `pipeline/live_signal`), then exit without loading any universe/market data or running a backtest |
 | `--description` | str, default: none | One-off plain-English strategy text, parsed via `rs/nl_parser.py` instead of reading `strategies_config.json`/`--config` |
 | `--description-file` | path, default: none | Same as `--description`, but read the text from a file |
 | `--n-days` | int, default `1200` | Number of synthetic bars to generate (only used with `--data-provider synthetic`) |
@@ -298,6 +299,11 @@ uv run python research_strategy/run_research_strategy.py --strategy dual_momentu
 Pass a custom JSON configuration file:
 ```powershell
 uv run python research_strategy/run_research_strategy.py --config custom_config.json --strategy all
+```
+
+Dump every configured strategy as its own backtester-ready `strategy.json` (no market data needed):
+```powershell
+uv run python research_strategy/run_research_strategy.py --dump-strategies
 ```
 
 Evaluate custom plain English strategies via CLI text:

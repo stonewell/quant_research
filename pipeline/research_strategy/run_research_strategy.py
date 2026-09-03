@@ -22,6 +22,7 @@ Examples:
     python run_research_strategy.py --config custom_config.json --strategy all
     python run_research_strategy.py --description "Rebalance monthly. Select top 3 assets from SPY, QQQ, EEM, GLD, TLT with Close > 200d SMA. Rank by 126d return and allocate using 60d inverse volatility."
     python run_research_strategy.py --description-file strategy.txt
+    python run_research_strategy.py --dump-strategies
 """
 
 import argparse
@@ -83,6 +84,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    default="all",
                    help="Strategy key from JSON config to evaluate, or 'all' (default: 'all')")
     p.add_argument("--config", type=str, default=None, help="Path to custom strategies JSON config file")
+    p.add_argument("--dump-strategies", action="store_true",
+                   help="Dump every strategy in the loaded config as its own backtester-compatible "
+                        "<key>_strategy.json file under results/strategy_dumps/ (usable directly "
+                        "with backtester/run_backtest.py --strategy-file), then exit without "
+                        "loading any universe/market data or running a backtest evaluation")
     p.add_argument("--description", type=str, help="Plain English strategy description text")
     p.add_argument("--description-file", type=str, help="Path to plain English strategy description text file")
     p.add_argument("--n-days", type=int, default=1200,
@@ -246,9 +252,49 @@ def build_and_write_top_strategies_summary(report_data, strategy_factor_tags, lo
     return path, top_strategies
 
 
+def build_and_dump_strategies_as_backtester_files(loaded_config, results_dir):
+    """Writes every strategies_config.json entry as its own backtester-compatible
+    <key>_strategy.json (usable directly with `backtester/run_backtest.py --strategy-file` or
+    `pipeline/live_signal`), via the same `research_strategy_spec` shape
+    `common/strategy_spec.py`'s `get_template()` already knows how to reconstruct
+    (`instantiate_strategy_from_config_entry(strategy_key, entry_data)`). Returns the list of
+    written paths. A malformed entry (e.g. an unrecognized class_name) is skipped with a printed
+    warning rather than aborting the rest of the dump."""
+    dump_dir = os.path.join(results_dir, "strategy_dumps")
+    os.makedirs(dump_dir, exist_ok=True)
+    written = []
+    for entry_key, entry_data in loaded_config.items():
+        try:
+            strat_obj = instantiate_strategy_from_config_entry(entry_key, entry_data)
+        except ValueError as exc:
+            print(f"  WARNING: Skipping dump for strategy '{entry_key}' -- {exc}")
+            continue
+        strategy_def = {
+            "template_name": entry_key,
+            "params": entry_data.get("parameters", {}),
+            "explanation": strat_obj.explain_weights(),
+            "research_strategy_spec": {"strategy_key": entry_key, "entry_data": entry_data},
+        }
+        path = os.path.join(dump_dir, f"{entry_key}_strategy.json")
+        write_json_report(strategy_def, path)
+        written.append(path)
+    return written
+
+
 def main():
     args = build_arg_parser().parse_args()
     cfg = StrategyConfig()
+
+    loaded_config = load_strategies_config(args.config)
+
+    if args.dump_strategies:
+        os.makedirs(RESULTS_DIR, exist_ok=True)
+        written = build_and_dump_strategies_as_backtester_files(loaded_config, RESULTS_DIR)
+        print(f"Dumped {len(written)} strategy definition(s) to "
+              f"{os.path.join(RESULTS_DIR, 'strategy_dumps')}:")
+        for path in written:
+            print(f"  {path}")
+        return
 
     # Every provider (including "synthetic") now goes through the same
     # common.data.load_universe path -- SyntheticDataProvider gives the same
@@ -274,7 +320,6 @@ def main():
     )
     print()
 
-    loaded_config = load_strategies_config(args.config)
     strategies_to_run = {}
 
     if args.description:
