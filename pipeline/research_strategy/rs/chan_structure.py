@@ -29,11 +29,51 @@ prints):
 
 from __future__ import annotations
 
+from collections import OrderedDict
+
 import numpy as np
 import pandas as pd
 
 _STROKE_COLUMNS = ["start_pos", "end_pos", "start_price", "end_price", "direction", "bars"]
 _PIVOT_COLUMNS = ["start_pos", "end_pos", "zg", "zd", "gg", "dd", "start_stroke_idx", "end_stroke_idx"]
+_PIVOT_RELATION_COLUMNS = ["pivot_idx", "direction", "contained", "state"]
+
+_SIGNAL_CACHE: "OrderedDict" = OrderedDict()
+_SIGNAL_CACHE_MAXSIZE = 64
+
+
+def _signal_cache_key(df: pd.DataFrame, *params) -> tuple:
+    """Cheap content fingerprint for memoizing the Chan structural pipeline --
+    deliberately NOT `id(df)` (unsafe: object ids get reused once a
+    garbage-collected frame's memory is reclaimed), just enough of the
+    frame's shape/edges to make an accidental collision between two
+    genuinely different price series astronomically unlikely."""
+    close = df["Close"]
+    return (
+        len(df), df.index[0], df.index[-1],
+        round(float(close.iloc[0]), 8), round(float(close.iloc[-1]), 8),
+        params,
+    )
+
+
+def _cached_signals(prefix: str, df: pd.DataFrame, params: tuple, compute_fn):
+    """Bounded LRU memoization shared by `compute_chan_signals`,
+    `compute_chan3_signals`, and `compute_chan_pivot_macd_signals`
+    (`chan_signals.py` imports this helper). `ChanBestSelectorStrategy` runs
+    several sub-strategies that default to identical `(df, min_gap_bars,
+    min_strokes, macd_fast, macd_slow, macd_signal)` params per symbol --
+    this avoids redoing the full merge/fractal/stroke/pivot pipeline for
+    each of them."""
+    key = (prefix, _signal_cache_key(df, *params))
+    cached = _SIGNAL_CACHE.get(key)
+    if cached is not None:
+        _SIGNAL_CACHE.move_to_end(key)
+        return cached
+    result = compute_fn()
+    _SIGNAL_CACHE[key] = result
+    if len(_SIGNAL_CACHE) > _SIGNAL_CACHE_MAXSIZE:
+        _SIGNAL_CACHE.popitem(last=False)
+    return result
 
 
 def merge_inclusion(df: pd.DataFrame) -> pd.DataFrame:
@@ -236,6 +276,17 @@ def build_pivots(strokes: pd.DataFrame, min_strokes: int = 3) -> pd.DataFrame:
 
 
 def compute_chan_signals(df: pd.DataFrame, min_gap_bars: int = 4, min_strokes: int = 3) -> pd.DataFrame:
+    """Cache-wrapped entry point -- see `_compute_chan_signals_impl` for the
+    actual rule. Memoized (see `_cached_signals`) since several strategies
+    (notably `ChanBestSelectorStrategy`'s sub-strategies) call this with
+    identical `df`/params for the same symbol."""
+    return _cached_signals(
+        "compute_chan_signals", df, (min_gap_bars, min_strokes),
+        lambda: _compute_chan_signals_impl(df, min_gap_bars, min_strokes),
+    )
+
+
+def _compute_chan_signals_impl(df: pd.DataFrame, min_gap_bars: int, min_strokes: int) -> pd.DataFrame:
     """Derives per-bar `buy_signal`/`sell_signal` booleans (aligned to
     `df.index`) from the Chan structure above.
 
@@ -307,3 +358,53 @@ def compute_chan_signals(df: pd.DataFrame, min_gap_bars: int = 4, min_strokes: i
             _mark(sell, int(b["end_pos"]))
 
     return pd.DataFrame({"buy_signal": buy, "sell_signal": sell})
+
+
+def classify_pivot_relations(pivots: pd.DataFrame) -> pd.DataFrame:
+    """Classifies each pivot's relationship to the PRIOR pivot, per the
+    `(direction, contained)` early-warning notation from Lessons 92-99:
+    `direction` is +1/-1 for whether the pivot's own band midpoint
+    (`(zg+zd)/2`) moved up or down relative to the prior pivot's midpoint;
+    `contained` is `True` while the new pivot's own extreme stays within the
+    prior pivot's matching extreme (a healthy continuation -- an uptrend's
+    new pivot doesn't undercut the prior pivot's low `dd`; a downtrend's new
+    pivot doesn't poke back above the prior pivot's high `gg`), and `False`
+    once it instead breaks through against the trend -- the `(dir, 1)`
+    "dangerous consolidation" state the lessons use to bank cost / tighten
+    exits ahead of a formal sell point.
+
+    Simplification (disclosed): the lessons' own notation is richer (it
+    also tracks WHERE inside/outside the band the break happens); this
+    reduces it to the single binary "did the new pivot's relevant extreme
+    hold or break" comparison, which is what a downstream risk overlay
+    actually needs to act on.
+
+    Returns one row per pivot from the second onward: `pivot_idx` (integer
+    row-position into `pivots`), `direction` (+1/-1), `contained` (bool),
+    `state` (a readable label, e.g. `"(1,0)"`/`"(1,1)"`/`"(-1,0)"`/`"(-1,1)"`).
+    """
+    if len(pivots) < 2:
+        return pd.DataFrame(columns=_PIVOT_RELATION_COLUMNS)
+
+    rows = []
+    for k in range(1, len(pivots)):
+        prev_p, curr_p = pivots.iloc[k - 1], pivots.iloc[k]
+        prev_mid = (float(prev_p["zg"]) + float(prev_p["zd"])) / 2.0
+        curr_mid = (float(curr_p["zg"]) + float(curr_p["zd"])) / 2.0
+        direction = 1 if curr_mid >= prev_mid else -1
+
+        if direction == 1:
+            contained = float(curr_p["dd"]) >= float(prev_p["dd"])
+        else:
+            contained = float(curr_p["gg"]) <= float(prev_p["gg"])
+
+        rows.append(
+            {
+                "pivot_idx": k,
+                "direction": direction,
+                "contained": bool(contained),
+                "state": f"({direction},{0 if contained else 1})",
+            }
+        )
+
+    return pd.DataFrame(rows, columns=_PIVOT_RELATION_COLUMNS)

@@ -68,6 +68,18 @@ from common.position_exits import run_stop_timeout_exit
 from common.scheduling import get_rebalance_dates as _get_rebalance_dates
 from .chan_structure import compute_chan_signals
 from .chan_signals import compute_chan3_signals, compute_chan_pivot_macd_signals
+from .chan_advanced_strategies import (
+    ChanBestSelectorStrategy,
+    ChanCompositeStrategy,
+    ChanMeanReversionDivergenceStrategy,
+    ChanMultiTimeframeTrendStrategy,
+    ChanTrendThirdBuyStrategy,
+)
+from .chan_lesson_strategies import (
+    ChanFailedRetestBuyStrategy,
+    ChanFiboSectorStrengthStrategy,
+    ChanPivotOscillationStrategy,
+)
 from .config import StrategyConfig
 from .nl_parser import ParsedStrategySpec, parse_plain_english_strategy
 
@@ -1386,10 +1398,29 @@ class CompounderMarginOfSafetyStrategy(AllocationTemplate):
         required_return = p.get("cms_required_return", cfg.cms_required_return)
 
         symbols = list(universe.keys())
+        if benchmark_symbol not in universe:
+            # A silent empty return here is indistinguishable from "no entry signal ever fired"
+            # -- this is specifically "the benchmark comparator itself is missing", a distinct,
+            # actionable problem (e.g. --universe/--universe-file doesn't include it -- a
+            # separate --baseline-symbol on the backtester does NOT satisfy this; that loads its
+            # own comparison universe independently of the strategy's own cms_benchmark_symbol).
+            warnings.warn(
+                f"CompounderMarginOfSafetyStrategy: cms_benchmark_symbol '{benchmark_symbol}' is "
+                f"not in the passed universe -- returning empty weights every rebalance. Add it "
+                f"to --universe/--universe-file (it is this strategy's own sell-trigger "
+                f"comparator; it must be present even if you already pass it as the backtester's "
+                f"separate --baseline-symbol)."
+            )
+            return pd.DataFrame()
         candidate_symbols = [s for s in candidate_universe if s in universe and s != benchmark_symbol]
         if not candidate_symbols:
             candidate_symbols = [s for s in symbols if s != cash_proxy and s != benchmark_symbol]
-        if not candidate_symbols or benchmark_symbol not in universe:
+        if not candidate_symbols:
+            warnings.warn(
+                "CompounderMarginOfSafetyStrategy: no candidate symbols available in the passed "
+                "universe (after excluding cash_proxy and the benchmark) -- returning empty "
+                "weights every rebalance."
+            )
             return pd.DataFrame()
 
         master_index = _aligned_master_index(universe, candidate_symbols)
@@ -1964,14 +1995,23 @@ class AdaptiveAssetAllocation(AllocationTemplate):
 # volatility_managed), not just the class-based ones. See
 # `common/README.md`'s cross-project import convention note for how a consumer
 # reaches this module.
+
 STRATEGY_CLASS_MAP = {
     "AcceleratingDualMomentum": AcceleratingDualMomentum,
     "AdaptiveAssetAllocation": AdaptiveAssetAllocation,
     "AdaptiveGridStrategy": AdaptiveGridStrategy,
     "AllWeatherStrategy": AllWeatherStrategy,
+    "ChanBestSelectorStrategy": ChanBestSelectorStrategy,
+    "ChanCompositeStrategy": ChanCompositeStrategy,
+    "ChanFailedRetestBuyStrategy": ChanFailedRetestBuyStrategy,
+    "ChanFiboSectorStrengthStrategy": ChanFiboSectorStrengthStrategy,
+    "ChanMeanReversionDivergenceStrategy": ChanMeanReversionDivergenceStrategy,
+    "ChanMultiTimeframeTrendStrategy": ChanMultiTimeframeTrendStrategy,
+    "ChanPivotOscillationStrategy": ChanPivotOscillationStrategy,
     "ChanPivotShiftMACDStrategy": ChanPivotShiftMACDStrategy,
     "ChanPivotShiftStrategy": ChanPivotShiftStrategy,
     "ChanThreeTypeStrategy": ChanThreeTypeStrategy,
+    "ChanTrendThirdBuyStrategy": ChanTrendThirdBuyStrategy,
     "CompounderMarginOfSafetyStrategy": CompounderMarginOfSafetyStrategy,
     "EnsembleRegimeSwitchingStrategy": EnsembleRegimeSwitchingStrategy,
     "GoldenButterflyStrategy": GoldenButterflyStrategy,

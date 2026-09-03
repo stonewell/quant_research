@@ -40,7 +40,7 @@ def test_strategy_class_map_and_instantiate_helper_importable_from_rs_strategy()
 
     assert rrs.STRATEGY_CLASS_MAP is canonical_map
     assert rrs.instantiate_strategy_from_config_entry is canonical_fn
-    assert len(canonical_map) == 18
+    assert len(canonical_map) == 26
 
 
 def test_strategy_class_map_importable_via_research_strategy_namespace_package():
@@ -62,7 +62,7 @@ def test_strategy_class_map_importable_via_research_strategy_namespace_package()
     the same process."""
     from research_strategy.rs.strategy import STRATEGY_CLASS_MAP as namespaced_map
 
-    assert len(namespaced_map) == 18
+    assert len(namespaced_map) == 26
     assert set(namespaced_map.keys()) == set(rrs.STRATEGY_CLASS_MAP.keys())
 
 

@@ -46,7 +46,7 @@ import pandas as pd
 
 from common.indicators import macd
 
-from .chan_structure import _STROKE_COLUMNS, build_pivots, build_strokes, find_fractals, merge_inclusion
+from .chan_structure import _STROKE_COLUMNS, _cached_signals, build_pivots, build_strokes, find_fractals, merge_inclusion
 
 _SEGMENT_COLUMNS = _STROKE_COLUMNS + ["start_stroke_idx", "end_stroke_idx"]
 _POINT_COLUMNS = ["pos", "price", "kind", "pivot_idx"]
@@ -345,6 +345,22 @@ def compute_chan3_signals(
     macd_slow: int = 26,
     macd_signal: int = 9,
 ) -> pd.DataFrame:
+    """Cache-wrapped entry point (see `chan_structure._cached_signals`) --
+    see `_compute_chan3_signals_impl` for the actual rule."""
+    return _cached_signals(
+        "compute_chan3_signals", df, (min_gap_bars, min_strokes, macd_fast, macd_slow, macd_signal),
+        lambda: _compute_chan3_signals_impl(df, min_gap_bars, min_strokes, macd_fast, macd_slow, macd_signal),
+    )
+
+
+def _compute_chan3_signals_impl(
+    df: pd.DataFrame,
+    min_gap_bars: int,
+    min_strokes: int,
+    macd_fast: int,
+    macd_slow: int,
+    macd_signal: int,
+) -> pd.DataFrame:
     """Derives per-bar boolean signals for all three formal buy/sell-point
     types (aligned to `df.index`), mirroring `compute_chan_signals`'s own
     shape (single public entry point over the same merge/fractal/stroke
@@ -385,6 +401,22 @@ def compute_chan_pivot_macd_signals(
     macd_fast: int = 12,
     macd_slow: int = 26,
     macd_signal: int = 9,
+) -> pd.DataFrame:
+    """Cache-wrapped entry point (see `chan_structure._cached_signals`) --
+    see `_compute_chan_pivot_macd_signals_impl` for the actual rule."""
+    return _cached_signals(
+        "compute_chan_pivot_macd_signals", df, (min_gap_bars, min_strokes, macd_fast, macd_slow, macd_signal),
+        lambda: _compute_chan_pivot_macd_signals_impl(df, min_gap_bars, min_strokes, macd_fast, macd_slow, macd_signal),
+    )
+
+
+def _compute_chan_pivot_macd_signals_impl(
+    df: pd.DataFrame,
+    min_gap_bars: int,
+    min_strokes: int,
+    macd_fast: int,
+    macd_slow: int,
+    macd_signal: int,
 ) -> pd.DataFrame:
     """A near-literal copy of `chan_structure.compute_chan_signals`'s pivot-band-shift
     buy/sell rules (stroke-based pivots -- deliberately NOT segments, unlike

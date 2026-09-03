@@ -154,6 +154,145 @@
     },
     "factors": ["regime_trend_strength", "absolute_momentum_trend"]
   },
+  "chan_mtf_trend": {
+    "name": "Chan Multi-Timeframe Trend",
+    "type": "class",
+    "class_name": "ChanMultiTimeframeTrendStrategy",
+    "description": "Interval-nesting (区间套) strategy combining a macro 200-day SMA trend gate with sub-period Chan structural buy signals (B1/B2/B3).",
+    "parameters": {
+      "chan_mtf_trend_ma_period": 200,
+      "chan_mtf_min_gap_bars": 4,
+      "chan_mtf_min_strokes": 3,
+      "chan_mtf_stop_loss_pct": 0.08,
+      "chan_mtf_max_holding_days": 90,
+      "chan_mtf_position_size_pct": 1.0,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["regime_trend_strength", "absolute_momentum_trend"]
+  },
+  "chan_trend_third_buy": {
+    "name": "Chan Trend Third Buy",
+    "type": "class",
+    "class_name": "ChanTrendThirdBuyStrategy",
+    "description": "Focused high-momentum trend continuation trading 3rd-type buy points (B3 - pivot breakout retest holding above pivot upper band ZG).",
+    "parameters": {
+      "chan_b3_min_gap_bars": 4,
+      "chan_b3_min_strokes": 3,
+      "chan_b3_macd_fast": 12,
+      "chan_b3_macd_slow": 26,
+      "chan_b3_macd_signal": 9,
+      "chan_b3_stop_loss_pct": 0.08,
+      "chan_b3_max_holding_days": 90,
+      "chan_b3_position_size_pct": 1.0,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["regime_trend_strength", "relative_momentum"]
+  },
+  "chan_mean_reversion_divergence": {
+    "name": "Chan Mean-Reversion Divergence",
+    "type": "class",
+    "class_name": "ChanMeanReversionDivergenceStrategy",
+    "description": "Bottom-fishing on 1st-type buy points (B1 from MACD divergence) coupled with Lesson 103 '防狼术' tight risk controls (tight stop-loss, profit target, trailing stop, max holding cap).",
+    "parameters": {
+      "chan_mrd_min_gap_bars": 4,
+      "chan_mrd_min_strokes": 3,
+      "chan_mrd_macd_fast": 12,
+      "chan_mrd_macd_slow": 26,
+      "chan_mrd_macd_signal": 9,
+      "chan_mrd_stop_loss_pct": 0.05,
+      "chan_mrd_profit_target_pct": 0.15,
+      "chan_mrd_trailing_stop_pct": 0.04,
+      "chan_mrd_trailing_activate_pct": 0.08,
+      "chan_mrd_max_holding_days": 45,
+      "chan_mrd_position_size_pct": 1.0,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["mean_reversion", "volatility_targeting"]
+  },
+  "chan_composite": {
+    "name": "Chan Composite Multi-Stage Scaling",
+    "type": "class",
+    "class_name": "ChanCompositeStrategy",
+    "description": "Dynamic multi-stage position scaling across all 3 Chan buy point types (30% on B1 bottom divergence, +40% on B2 higher-low pullback, +30% on B3 pivot breakout retest).",
+    "parameters": {
+      "chan_comp_min_gap_bars": 4,
+      "chan_comp_min_strokes": 3,
+      "chan_comp_macd_fast": 12,
+      "chan_comp_macd_slow": 26,
+      "chan_comp_macd_signal": 9,
+      "chan_comp_b1_weight": 0.30,
+      "chan_comp_b2_weight": 0.40,
+      "chan_comp_b3_weight": 0.30,
+      "chan_comp_stop_loss_pct": 0.08,
+      "chan_comp_max_holding_days": 90,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["regime_trend_strength", "absolute_momentum_trend"]
+  },
+  "chan_best_selector": {
+    "name": "Chan Best Selector Compound Meta-Strategy",
+    "type": "class",
+    "class_name": "ChanBestSelectorStrategy",
+    "description": "Compound meta-strategy evaluating 7 Chan strategies in parallel, tracking rolling Sharpe/return performance over a 63-day lookback window, and dynamically allocating 100% of portfolio capital to the top-performing Chan strategy.",
+    "parameters": {
+      "chan_best_lookback_days": 63,
+      "chan_best_metric": "sharpe",
+      "chan_best_rebalance_freq_days": 21,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["regime_trend_strength", "relative_momentum", "volatility_targeting"]
+  },
+  "chan_pivot_oscillation": {
+    "name": "Chan Pivot-Oscillation Monitor",
+    "type": "class",
+    "class_name": "ChanPivotOscillationStrategy",
+    "description": "Lesson 92's Pivot-Oscillation Monitor (中枢震荡监视器): tracks each pivot sub-swing's midpoint (Zn) drift relative to the pivot's own center (Z) to trade a strengthening bias, avoiding wedge bull-/bear-trap breakouts and Lessons 92-99's dangerous pivot-relation state.",
+    "parameters": {
+      "pivot_osc_min_gap_bars": 4,
+      "pivot_osc_min_strokes": 3,
+      "pivot_osc_trap_confirm_bars": 6,
+      "pivot_osc_stop_loss_pct": 0.08,
+      "pivot_osc_max_holding_days": 90,
+      "pivot_osc_position_size_pct": 1.0,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["regime_trend_strength", "absolute_momentum_trend"]
+  },
+  "chan_fibo_sector_strength": {
+    "name": "Chan Fibonacci MA Sector-Strength Rotation",
+    "type": "class",
+    "class_name": "ChanFiboSectorStrengthStrategy",
+    "description": "Lesson 106's Fibonacci MA sector-strength system (斐波那契均线系统): ranks every risky symbol by how many Fibonacci-period SMAs (5/13/21/34/55/89/144/233) it trades above (tier 0-8), and rotates equal weight across the top-tier symbols.",
+    "parameters": {
+      "fibo_top_k": 3,
+      "fibo_min_tier": 3,
+      "fibo_rebalance_freq_days": 21,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["relative_momentum", "regime_trend_strength"]
+  },
+  "chan_failed_retest_buy": {
+    "name": "Chan Failed-Retest Buy",
+    "type": "class",
+    "class_name": "ChanFailedRetestBuyStrategy",
+    "description": "Lesson 108's precise bottom definition + '下探失败买' rule: only confirms a B1 entry once a second dip fails to make a new low relative to the first bottom fractal (a failed retest of the low), rather than entering on the raw divergence bottom itself.",
+    "parameters": {
+      "failed_retest_min_gap_bars": 4,
+      "failed_retest_min_strokes": 3,
+      "failed_retest_macd_fast": 12,
+      "failed_retest_macd_slow": 26,
+      "failed_retest_macd_signal": 9,
+      "failed_retest_confirm_window_bars": 20,
+      "failed_retest_stop_loss_pct": 0.05,
+      "failed_retest_profit_target_pct": 0.15,
+      "failed_retest_trailing_stop_pct": 0.04,
+      "failed_retest_trailing_activate_pct": 0.08,
+      "failed_retest_max_holding_days": 45,
+      "failed_retest_position_size_pct": 1.0,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["mean_reversion", "absolute_momentum_trend"]
+  },
   "compounder_margin_of_safety": {
     "name": "Compounder Margin of Safety",
     "type": "class",

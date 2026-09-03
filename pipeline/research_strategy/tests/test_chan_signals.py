@@ -428,3 +428,40 @@ def test_compute_chan_pivot_macd_signals_returns_expected_schema():
     assert sig.index.equals(df.index)
     assert not sig["buy_signal"].any()
     assert not sig["sell_signal"].any()
+
+
+# --- memoization shared with chan_structure.py (review fix 7) ---------------
+
+def test_compute_chan3_signals_cache_hit_returns_identical_object():
+    closes = np.linspace(100, 90, 60)
+    idx = pd.bdate_range("2020-01-01", periods=len(closes))
+    df = pd.DataFrame({"Open": closes, "High": closes + 0.5, "Low": closes - 0.5, "Close": closes}, index=idx)
+
+    first = compute_chan3_signals(df, min_gap_bars=4, min_strokes=3)
+    second = compute_chan3_signals(df, min_gap_bars=4, min_strokes=3)
+    assert second is first
+
+
+def test_compute_chan_pivot_macd_signals_cache_hit_returns_identical_object():
+    closes = np.linspace(100, 90, 60)
+    idx = pd.bdate_range("2020-01-01", periods=len(closes))
+    df = pd.DataFrame({"Open": closes, "High": closes + 0.5, "Low": closes - 0.5, "Close": closes}, index=idx)
+
+    first = compute_chan_pivot_macd_signals(df, min_gap_bars=4, min_strokes=3)
+    second = compute_chan_pivot_macd_signals(df, min_gap_bars=4, min_strokes=3)
+    assert second is first
+
+
+def test_compute_chan3_signals_cache_miss_on_different_data():
+    closes_a = np.linspace(100, 90, 60)
+    idx_a = pd.bdate_range("2020-01-01", periods=len(closes_a))
+    df_a = pd.DataFrame({"Open": closes_a, "High": closes_a + 0.5, "Low": closes_a - 0.5, "Close": closes_a}, index=idx_a)
+
+    closes_b = np.linspace(100, 90, 61)
+    idx_b = pd.bdate_range("2020-01-01", periods=len(closes_b))
+    df_b = pd.DataFrame({"Open": closes_b, "High": closes_b + 0.5, "Low": closes_b - 0.5, "Close": closes_b}, index=idx_b)
+
+    result_a = compute_chan3_signals(df_a, min_gap_bars=4, min_strokes=3)
+    result_b = compute_chan3_signals(df_b, min_gap_bars=4, min_strokes=3)
+    assert result_a is not result_b
+    assert len(result_a) == 60 and len(result_b) == 61

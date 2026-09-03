@@ -270,6 +270,97 @@ class StrategyConfig:
     chanm_max_holding_days: Optional[int] = 90    # None disables
     chanm_position_size_pct: float = 1.0
 
+    # --- Chan Multi-Timeframe Trend (Chan MTF) ---
+    chan_mtf_trend_ma_period: int = 200
+    chan_mtf_min_gap_bars: int = 4
+    chan_mtf_min_strokes: int = 3
+    chan_mtf_stop_loss_pct: Optional[float] = 0.08
+    chan_mtf_max_holding_days: Optional[int] = 90
+    chan_mtf_position_size_pct: float = 1.0
+    chan_mtf_pivot_osc_size_pct: float = 0.5   # reduced size when Lesson 107's precise-trend gate hasn't confirmed
+
+    # --- Chan Trend Third Buy (B3 Breakout Retest) ---
+    chan_b3_min_gap_bars: int = 4
+    chan_b3_min_strokes: int = 3
+    chan_b3_macd_fast: int = 12
+    chan_b3_macd_slow: int = 26
+    chan_b3_macd_signal: int = 9
+    chan_b3_stop_loss_pct: Optional[float] = 0.08
+    chan_b3_max_holding_days: Optional[int] = 90
+    chan_b3_position_size_pct: float = 1.0
+
+    # --- Chan Mean-Reversion Divergence (B1 + 防狼术 Risk Controls) ---
+    chan_mrd_min_gap_bars: int = 4
+    chan_mrd_min_strokes: int = 3
+    chan_mrd_macd_fast: int = 12
+    chan_mrd_macd_slow: int = 26
+    chan_mrd_macd_signal: int = 9
+    chan_mrd_stop_loss_pct: Optional[float] = 0.05
+    chan_mrd_profit_target_pct: Optional[float] = 0.15
+    chan_mrd_trailing_stop_pct: Optional[float] = 0.04
+    chan_mrd_trailing_activate_pct: Optional[float] = 0.08
+    chan_mrd_max_holding_days: Optional[int] = 45
+    chan_mrd_position_size_pct: float = 1.0
+
+    # --- Chan Composite (Multi-Stage Position Scaling B1/B2/B3) ---
+    chan_comp_min_gap_bars: int = 4
+    chan_comp_min_strokes: int = 3
+    chan_comp_macd_fast: int = 12
+    chan_comp_macd_slow: int = 26
+    chan_comp_macd_signal: int = 9
+    chan_comp_b1_weight: float = 0.30
+    chan_comp_b2_weight: float = 0.40
+    chan_comp_b3_weight: float = 0.30
+    chan_comp_stop_loss_pct: Optional[float] = 0.08
+    chan_comp_max_holding_days: Optional[int] = 90
+
+    # --- Chan Best Selector Meta-Strategy ---
+    chan_best_lookback_days: int = 63
+    chan_best_metric: str = "sharpe"  # "sharpe" or "cagr"
+    chan_best_rebalance_freq_days: int = 21
+
+    # --- Chan Pivot-Oscillation Monitor (Zn, Lesson 92, 0844-...-092.md):
+    # tracks each sub-swing's midpoint (Zn) inside a confirmed stroke-level
+    # pivot vs. the pivot's own center (Z) to detect a strengthening/
+    # weakening bias, and flags a breakout beyond the pivot band that
+    # immediately reverts as a wedge bull-/bear-trap (disclosed
+    # simplification of the lesson's fuller 3rd-buy/sell check) -- see
+    # rs/chan_lesson_strategies.py. ---
+    pivot_osc_min_gap_bars: int = 4
+    pivot_osc_min_strokes: int = 3
+    pivot_osc_trap_confirm_bars: int = 6
+    pivot_osc_stop_loss_pct: Optional[float] = 0.08
+    pivot_osc_max_holding_days: Optional[int] = 90
+    pivot_osc_position_size_pct: float = 1.0
+
+    # --- Chan Fibonacci MA Sector-Strength Rotation (Lesson 106,
+    # 1053-...-106.md): ranks every symbol into a tier (0-8) by how many
+    # Fibonacci-period SMAs (5/13/21/34/55/89/144/233) it currently trades
+    # above, then rotates capital into the top-tier symbols -- a
+    # cross-sectional selection/rotation strategy, not single-symbol timing.
+    # See rs/chan_lesson_strategies.py. ---
+    fibo_top_k: int = 3
+    fibo_min_tier: int = 3
+    fibo_rebalance_freq_days: int = 21
+
+    # --- Chan Failed-Retest Buy (Lesson 108, 1104-...-108.md): a stricter
+    # B1 variant that only confirms entry once a SECOND dip fails to make a
+    # new low relative to the first bottom fractal (下探失败买 -- a failed
+    # retest of the low), rather than entering on the raw first_buy
+    # divergence bottom. See rs/chan_lesson_strategies.py. ---
+    failed_retest_min_gap_bars: int = 4
+    failed_retest_min_strokes: int = 3
+    failed_retest_macd_fast: int = 12
+    failed_retest_macd_slow: int = 26
+    failed_retest_macd_signal: int = 9
+    failed_retest_confirm_window_bars: int = 20
+    failed_retest_stop_loss_pct: Optional[float] = 0.05
+    failed_retest_profit_target_pct: Optional[float] = 0.15
+    failed_retest_trailing_stop_pct: Optional[float] = 0.04
+    failed_retest_trailing_activate_pct: Optional[float] = 0.08
+    failed_retest_max_holding_days: Optional[int] = 45
+    failed_retest_position_size_pct: float = 1.0
+
     # --- Compounder Margin-of-Safety (price-proxy adaptation of a
     # conservative value-investing community's valuation framework, see
     # docs/snowball_strategy.txt) -- holds a candidate "quality compounder"
@@ -332,6 +423,36 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.chanm_min_gap_bars must be > 0, got {self.chanm_min_gap_bars}")
         if self.chanm_min_strokes < 3:
             raise ValueError(f"StrategyConfig.chanm_min_strokes must be >= 3, got {self.chanm_min_strokes}")
+        if self.chan_mtf_min_gap_bars <= 0:
+            raise ValueError(f"StrategyConfig.chan_mtf_min_gap_bars must be > 0, got {self.chan_mtf_min_gap_bars}")
+        if self.chan_mtf_min_strokes < 3:
+            raise ValueError(f"StrategyConfig.chan_mtf_min_strokes must be >= 3, got {self.chan_mtf_min_strokes}")
+        if self.chan_b3_min_gap_bars <= 0:
+            raise ValueError(f"StrategyConfig.chan_b3_min_gap_bars must be > 0, got {self.chan_b3_min_gap_bars}")
+        if self.chan_b3_min_strokes < 3:
+            raise ValueError(f"StrategyConfig.chan_b3_min_strokes must be >= 3, got {self.chan_b3_min_strokes}")
+        if self.chan_mrd_min_gap_bars <= 0:
+            raise ValueError(f"StrategyConfig.chan_mrd_min_gap_bars must be > 0, got {self.chan_mrd_min_gap_bars}")
+        if self.chan_mrd_min_strokes < 3:
+            raise ValueError(f"StrategyConfig.chan_mrd_min_strokes must be >= 3, got {self.chan_mrd_min_strokes}")
+        if self.chan_comp_min_gap_bars <= 0:
+            raise ValueError(f"StrategyConfig.chan_comp_min_gap_bars must be > 0, got {self.chan_comp_min_gap_bars}")
+        if self.chan_comp_min_strokes < 3:
+            raise ValueError(f"StrategyConfig.chan_comp_min_strokes must be >= 3, got {self.chan_comp_min_strokes}")
+        if self.pivot_osc_min_gap_bars <= 0:
+            raise ValueError(f"StrategyConfig.pivot_osc_min_gap_bars must be > 0, got {self.pivot_osc_min_gap_bars}")
+        if self.pivot_osc_min_strokes < 3:
+            raise ValueError(f"StrategyConfig.pivot_osc_min_strokes must be >= 3, got {self.pivot_osc_min_strokes}")
+        if self.failed_retest_min_gap_bars <= 0:
+            raise ValueError(f"StrategyConfig.failed_retest_min_gap_bars must be > 0, got {self.failed_retest_min_gap_bars}")
+        if self.failed_retest_min_strokes < 3:
+            raise ValueError(f"StrategyConfig.failed_retest_min_strokes must be >= 3, got {self.failed_retest_min_strokes}")
+        if self.fibo_top_k <= 0:
+            raise ValueError(f"StrategyConfig.fibo_top_k must be > 0, got {self.fibo_top_k}")
+        if not (0 <= self.fibo_min_tier <= 8):
+            raise ValueError(f"StrategyConfig.fibo_min_tier must be in [0, 8], got {self.fibo_min_tier}")
+        if self.fibo_rebalance_freq_days <= 0:
+            raise ValueError(f"StrategyConfig.fibo_rebalance_freq_days must be > 0, got {self.fibo_rebalance_freq_days}")
 
     @classmethod
     def from_dict(cls, data: dict) -> "StrategyConfig":

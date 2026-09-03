@@ -1182,6 +1182,22 @@ def test_strategy_config_from_dict():
     ("initial_capital", 0),
     ("cash_proxy", ""),
     ("risky_universe", "SPY,QQQ"),
+    ("chan_mtf_min_gap_bars", 0),
+    ("chan_mtf_min_strokes", 2),
+    ("chan_b3_min_gap_bars", 0),
+    ("chan_b3_min_strokes", 2),
+    ("chan_mrd_min_gap_bars", 0),
+    ("chan_mrd_min_strokes", 2),
+    ("chan_comp_min_gap_bars", 0),
+    ("chan_comp_min_strokes", 2),
+    ("pivot_osc_min_gap_bars", 0),
+    ("pivot_osc_min_strokes", 2),
+    ("failed_retest_min_gap_bars", 0),
+    ("failed_retest_min_strokes", 2),
+    ("fibo_top_k", 0),
+    ("fibo_min_tier", -1),
+    ("fibo_min_tier", 9),
+    ("fibo_rebalance_freq_days", 0),
 ])
 def test_strategy_config_rejects_invalid_values(field_name, bad_value):
     with pytest.raises(ValueError, match=field_name):

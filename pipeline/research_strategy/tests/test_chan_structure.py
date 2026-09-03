@@ -23,6 +23,7 @@ import pandas as pd
 from research_strategy.rs.chan_structure import (
     build_pivots,
     build_strokes,
+    classify_pivot_relations,
     compute_chan_signals,
     find_fractals,
     merge_inclusion,
@@ -195,3 +196,91 @@ def test_compute_chan_signals_no_signals_on_a_flat_series():
     sig = compute_chan_signals(df)
     assert not sig["buy_signal"].any()
     assert not sig["sell_signal"].any()
+
+
+# --- compute_chan_signals memoization (review fix 7) -------------------------
+
+def test_compute_chan_signals_cache_hit_returns_identical_object():
+    closes = np.linspace(100, 90, 60)
+    idx = pd.bdate_range("2020-01-01", periods=len(closes))
+    df = pd.DataFrame({"Open": closes, "High": closes + 0.5, "Low": closes - 0.5, "Close": closes}, index=idx)
+
+    first = compute_chan_signals(df, min_gap_bars=4, min_strokes=3)
+    second = compute_chan_signals(df, min_gap_bars=4, min_strokes=3)
+    assert second is first, "identical df/params should be served from cache, not recomputed"
+
+
+def test_compute_chan_signals_cache_miss_on_different_data_or_params():
+    closes_a = np.linspace(100, 90, 60)
+    idx_a = pd.bdate_range("2020-01-01", periods=len(closes_a))
+    df_a = pd.DataFrame({"Open": closes_a, "High": closes_a + 0.5, "Low": closes_a - 0.5, "Close": closes_a}, index=idx_a)
+
+    closes_b = np.linspace(100, 90, 61)  # different length -> different cache key, never stale
+    idx_b = pd.bdate_range("2020-01-01", periods=len(closes_b))
+    df_b = pd.DataFrame({"Open": closes_b, "High": closes_b + 0.5, "Low": closes_b - 0.5, "Close": closes_b}, index=idx_b)
+
+    result_a = compute_chan_signals(df_a, min_gap_bars=4, min_strokes=3)
+    result_b = compute_chan_signals(df_b, min_gap_bars=4, min_strokes=3)
+    assert result_a is not result_b
+    assert len(result_a) == 60 and len(result_b) == 61
+
+    result_a_diff_params = compute_chan_signals(df_a, min_gap_bars=5, min_strokes=3)
+    assert result_a_diff_params is not result_a
+
+
+# --- classify_pivot_relations (Lessons 92-99 early-warning state machine) ---
+
+def _pivot_row(start_pos, end_pos, zg, zd, gg, dd, start_stroke_idx, end_stroke_idx):
+    return {
+        "start_pos": start_pos, "end_pos": end_pos, "zg": zg, "zd": zd,
+        "gg": gg, "dd": dd, "start_stroke_idx": start_stroke_idx, "end_stroke_idx": end_stroke_idx,
+    }
+
+
+def test_classify_pivot_relations_healthy_uptrend_continuation():
+    pivots = pd.DataFrame(
+        [
+            _pivot_row(0, 30, 100, 90, 105, 85, 0, 2),
+            _pivot_row(40, 70, 115, 105, 120, 95, 3, 5),  # dd=95 >= prev dd=85 -> stays above the old low
+        ]
+    )
+    rel = classify_pivot_relations(pivots)
+    assert len(rel) == 1
+    row = rel.iloc[0]
+    assert row["pivot_idx"] == 1
+    assert row["direction"] == 1
+    assert row["contained"] == True
+    assert row["state"] == "(1,0)"
+
+
+def test_classify_pivot_relations_dangerous_uptrend_breakthrough():
+    pivots = pd.DataFrame(
+        [
+            _pivot_row(0, 30, 100, 90, 105, 85, 0, 2),
+            _pivot_row(40, 70, 115, 105, 120, 80, 3, 5),  # dd=80 < prev dd=85 -> undercuts the old low
+        ]
+    )
+    rel = classify_pivot_relations(pivots)
+    row = rel.iloc[0]
+    assert row["direction"] == 1
+    assert row["contained"] == False
+    assert row["state"] == "(1,1)"
+
+
+def test_classify_pivot_relations_dangerous_downtrend_breakthrough():
+    pivots = pd.DataFrame(
+        [
+            _pivot_row(0, 30, 100, 90, 105, 85, 0, 2),
+            _pivot_row(40, 70, 88, 78, 110, 78, 3, 5),  # gg=110 > prev gg=105 -> pokes back above the old high
+        ]
+    )
+    rel = classify_pivot_relations(pivots)
+    row = rel.iloc[0]
+    assert row["direction"] == -1
+    assert row["contained"] == False
+    assert row["state"] == "(-1,1)"
+
+
+def test_classify_pivot_relations_needs_at_least_two_pivots():
+    pivots = pd.DataFrame([_pivot_row(0, 30, 100, 90, 105, 85, 0, 2)])
+    assert classify_pivot_relations(pivots).empty
