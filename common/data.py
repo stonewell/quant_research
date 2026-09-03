@@ -290,6 +290,18 @@ def _is_valid_cached_ohlcv(df: pd.DataFrame) -> bool:
     return True
 
 
+def _cache_covers_requested_end(df: pd.DataFrame, end: str, now: Optional[pd.Timestamp] = None) -> bool:
+    """A cached file is only trustworthy for a requested `end` that has already elapsed -- if
+    `end` is still in the future, the provider legitimately couldn't have more data for it yet,
+    so a short cache is correct, not stale. `now` is injectable for deterministic tests."""
+    end_ts = pd.Timestamp(end)
+    if end_ts > (now if now is not None else pd.Timestamp.now()).normalize():
+        return True
+    if df.empty:
+        return False
+    return (end_ts - df.index[-1]) <= pd.Timedelta(days=7)  # weekend/holiday tolerance
+
+
 class CachedDataProvider(BaseDataProvider):
     """Wrapper provider that adds CSV disk caching around any inner BaseDataProvider."""
 
@@ -334,6 +346,11 @@ class CachedDataProvider(BaseDataProvider):
                 df = _drop_invalid_ohlcv_rows(df, symbol)
                 if df.empty:
                     raise ValueError("cached file contains no rows with valid OHLC values")
+                if not _cache_covers_requested_end(df, end):
+                    raise ValueError(
+                        f"cached file's last date {df.index[-1].date()} falls short of requested "
+                        f"end '{end}', which has already elapsed"
+                    )
                 return df
             except Exception as exc:
                 warnings.warn(f"Cache file '{cache_path}' is corrupt or invalid ({exc}); re-fetching from source.")

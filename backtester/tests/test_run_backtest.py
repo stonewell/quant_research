@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import warnings
 from unittest.mock import patch
 
 import numpy as np
@@ -26,6 +27,7 @@ from backtester.run_backtest import (
     _compute_standard_comparison,
     _merge_baseline_folds,
     _resolve_baseline_params,
+    _run_baseline,
     build_arg_parser,
     main,
     run_standard,
@@ -49,6 +51,40 @@ def test_align_universe():
     assert len(aligned["A"]) == len(expected_idx)
     assert len(aligned["B"]) == len(expected_idx)
     assert (aligned["A"].index == expected_idx).all()
+
+
+def test_align_universe_warns_and_names_limiting_symbol():
+    # "A" has a much shorter history than "B" -- the intersection must shrink to A's range,
+    # and a warning must name "A" as the limiter (not just silently trim).
+    idx_long = pd.bdate_range("2020-01-01", periods=300)
+    idx_short = pd.bdate_range("2020-01-01", periods=100)
+
+    universe = {
+        "A": pd.DataFrame({"Close": np.ones(100)}, index=idx_short),
+        "B": pd.DataFrame({"Close": np.ones(300)}, index=idx_long),
+    }
+
+    with pytest.warns(UserWarning, match=r"limiting the whole walk-forward range: \['A'\]"):
+        aligned = _align_universe(universe)
+
+    assert len(aligned["A"]) == 100
+    assert len(aligned["B"]) == 100
+
+
+def test_align_universe_no_warning_within_tolerance():
+    # A one-day gap (e.g. a single missing bar) is well within the 7-day tolerance and must
+    # NOT trigger the "limiting symbol" warning.
+    idx1 = pd.bdate_range("2020-01-01", periods=100)
+    idx2 = idx1[:-1]  # one bar shorter
+
+    universe = {
+        "A": pd.DataFrame({"Close": np.ones(len(idx2))}, index=idx2),
+        "B": pd.DataFrame({"Close": np.ones(len(idx1))}, index=idx1),
+    }
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        _align_universe(universe)  # must not raise/warn
 
 
 def test_data_dir_uses_shared_data_dir():
@@ -301,6 +337,21 @@ class _MomentumDivergenceProvider(BaseDataProvider):
 
 
 register_provider("momentum_divergence_test_provider", _MomentumDivergenceProvider)
+
+
+class _DivergentCalendarProvider(BaseDataProvider):
+    """Test-only provider giving --baseline-symbol SPY a LONGER calendar (same start date, more
+    bars) than the main --universe symbols -- reproducing the walk-forward baseline-always-NaN
+    bug (main universe's aligned calendar and SPY's independently-loaded calendar don't cover
+    the same date range, so fold-boundary bar-position arithmetic used to diverge)."""
+
+    def fetch_ohlcv(self, symbol, start, end, interval="1d"):
+        n = 900 if symbol == "SPY" else 600
+        closes = np.linspace(100, 110, n)
+        return make_df(closes, start="2020-01-01")
+
+
+register_provider("divergent_calendar_test_provider", _DivergentCalendarProvider)
 
 
 def test_main_skips_bad_symbol_and_continues(tmp_path, monkeypatch, capsys):
@@ -680,6 +731,74 @@ def test_main_baseline_symbol_walkforward_mode_adds_columns(tmp_path, monkeypatc
     assert os.path.exists(results_dir / "walkforward_summary.json")
 
 
+def test_run_baseline_trims_to_aligned_index(tmp_path):
+    """_run_baseline must trim the loaded baseline universe onto the given aligned_index before
+    running it through run_walkforward/run_standard, so its fold boundaries land on the exact
+    same dates as the main run's."""
+    idx_short = pd.bdate_range("2020-01-01", periods=200)
+
+    class Args:
+        baseline_symbol = "SPY"
+        baseline_template = "equal_weight"
+        baseline_params = None
+        start = "2020-01-01"
+        end = "2024-12-31"
+        interval = "1d"
+        no_cache = True
+        cache_ttl_days = None
+        mode = "walkforward"
+        window_years = 0.5
+        step_years = 0.25
+        initial_capital = 100_000.0
+        commission_pct = 0.0
+        slippage_pct = 0.0
+
+    baseline_folds, _ = _run_baseline(
+        Args(), cache_dir=str(tmp_path / "cache"), data_kwargs={"provider": "divergent_calendar_test_provider"},
+        aligned_index=idx_short,
+    )
+
+    # SPY's own loaded calendar is 900 bars (see _DivergentCalendarProvider); trimmed to
+    # idx_short (200 bars), the last fold must never extend past idx_short's own last date.
+    last_fold_end = pd.Timestamp(baseline_folds[-1]["end_date"])
+    assert last_fold_end <= idx_short[-1]
+
+
+def test_main_baseline_symbol_walkforward_mode_not_all_nan_with_divergent_calendars(tmp_path, monkeypatch):
+    """Regression test for the reported bug: --baseline-symbol SPY was always NaN in walk-forward
+    mode whenever SPY's own independently-loaded calendar didn't happen to exactly match the main
+    universe's aligned calendar (the common case with real market data). _DivergentCalendarProvider
+    gives SPY a longer history than A/B to reproduce that mismatch deterministically offline."""
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(strategy_path)
+    results_dir = tmp_path / "results"
+    cache_dir = tmp_path / "cache"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "A", "B",
+        "--baseline-symbol", "SPY",
+        "--mode", "walkforward",
+        "--data-provider", "divergent_calendar_test_provider",
+        "--no-cache",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    main()
+
+    folds_df = pd.read_csv(results_dir / "walkforward_report.csv")
+    assert len(folds_df) > 1  # sanity: more than one fold, so a real merge is being exercised
+    assert folds_df["baseline_sharpe_ratio"].notna().all()
+    assert folds_df["baseline_cagr"].notna().all()
+
+    with open(results_dir / "comparison_report.json") as f:
+        comparison_report = json.load(f)
+    assert comparison_report["baseline_calendar_mismatch"] is False
+
+
 def test_main_without_baseline_symbol_is_unchanged(tmp_path, monkeypatch):
     strategy_path = tmp_path / "strategy.json"
     _write_strategy_file(strategy_path)
@@ -747,8 +866,45 @@ def test_main_walkforward_writes_summary_json(tmp_path, monkeypatch):
     with open(summary_path) as f:
         summary = json.load(f)
     for key in ("mean_sharpe_ratio", "mean_cagr", "mean_max_drawdown", "mean_calmar_ratio",
-                "n_folds", "n_valid_folds", "fold_sharpe_std", "deflated_sharpe_ratio"):
+                "n_folds", "n_valid_folds", "fold_sharpe_std", "deflated_sharpe_ratio",
+                "requested_start", "requested_end", "actual_first_fold_start", "actual_last_fold_end"):
         assert key in summary
+    assert summary["requested_start"] == "2015-01-01"
+    assert summary["requested_end"] == "2024-12-31"
+
+
+def test_main_walkforward_prints_shortfall_note_when_data_falls_short_of_end(tmp_path, monkeypatch, capsys):
+    """--end far beyond what the (synthetic, fixed-length) loaded universe actually reaches must
+    print an explicit NOTE naming the shortfall, instead of silently under-running with no signal."""
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(strategy_path)
+    results_dir = tmp_path / "results"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "A", "B",
+        "--mode", "walkforward",
+        "--data-provider", "flaky_symbol_test_provider",  # fixed 60 synthetic bars from --start
+        "--start", "2020-01-01",
+        "--end", "2026-01-01",  # far beyond the 60 bars _FlakySymbolProvider actually returns
+        "--window-years", "0.1",
+        "--step-years", "0.05",
+        "--no-cache",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(tmp_path / "cache"),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    main()
+
+    captured = capsys.readouterr()
+    assert "NOTE: the last walk-forward fold ends" in captured.out
+    assert "short of the requested --end 2026-01-01" in captured.out
+
+    with open(results_dir / "walkforward_summary.json") as f:
+        summary = json.load(f)
+    assert summary["requested_end"] == "2026-01-01"
+    assert summary["actual_last_fold_end"] < "2026-01-01"
 
 
 def test_main_walkforward_summary_dsr_is_null_with_fewer_than_two_folds(tmp_path, monkeypatch):

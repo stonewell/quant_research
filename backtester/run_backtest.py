@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import sys
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -92,10 +93,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def _align_universe(universe: dict) -> dict:
     """Walk-forward's fold boundaries are bar-position-based, so every
     symbol must share the same trading calendar -- trim to the intersection
-    of all symbols' dates (an inner join)."""
+    of all symbols' dates (an inner join). Warns (naming the culprit) when
+    that intersection ends materially earlier than the latest date any
+    universe symbol actually reaches -- otherwise a single short-history
+    symbol silently shrinks the whole walk-forward range with no visible
+    signal that anything was cut short."""
     common_index = None
     for df in universe.values():
         common_index = df.index if common_index is None else common_index.intersection(df.index)
+    if universe and common_index is not None and len(common_index) > 0:
+        aligned_end = common_index[-1]
+        overall_latest = max(df.index[-1] for df in universe.values() if len(df))
+        if overall_latest - aligned_end > pd.Timedelta(days=7):
+            limiting_symbols = sorted(
+                sym for sym, df in universe.items() if len(df) and df.index[-1] <= aligned_end
+            )
+            warnings.warn(
+                f"_align_universe: aligned date range ends {aligned_end.date()}, "
+                f"{(overall_latest - aligned_end).days} day(s) short of the latest date available "
+                f"anywhere in the universe ({overall_latest.date()}). Symbol(s) with the shortest "
+                f"trading history are limiting the whole walk-forward range: {limiting_symbols}."
+            )
     return {symbol: df.loc[common_index] for symbol, df in universe.items()}
 
 
@@ -276,12 +294,22 @@ def _resolve_baseline_params(template, baseline_params_json: str = None) -> dict
     return {k: v[0] for k, v in template.param_grid.items()}
 
 
-def _run_baseline(args, cache_dir, data_kwargs):
+def _run_baseline(args, cache_dir, data_kwargs, aligned_index=None):
     """Loads --baseline-symbol and runs it through the same run_standard/
     run_walkforward path as the main strategy, using --baseline-template (a
     static template only -- no pattern_spec) and --baseline-params (or that
     template's first param_grid combination). Returns (baseline_out,
-    baseline_params)."""
+    baseline_params).
+
+    `aligned_index` (walkforward mode only): the main run's own aligned
+    calendar (see `_align_universe`). Trimming the baseline universe onto
+    this exact calendar before running `run_walkforward` forces its fold
+    boundaries (bar-position arithmetic over `n_bars`) to land on the same
+    dates as the main run's folds -- otherwise the baseline's independently-
+    loaded calendar essentially never lines up bar-for-bar with the main
+    universe's, and `_merge_baseline_folds`'s date-based join silently
+    matches zero rows (see that function's `baseline_calendar_mismatch`
+    docstring)."""
     print(f"\n=== Loading Baseline: {args.baseline_symbol} ({args.baseline_template}) ===")
     baseline_template = get_template(args.baseline_template)
     baseline_params = _resolve_baseline_params(baseline_template, args.baseline_params)
@@ -292,6 +320,17 @@ def _run_baseline(args, cache_dir, data_kwargs):
         data_kwargs=data_kwargs, require_nonempty=True,
         cache_max_age_days=args.cache_ttl_days,
     )
+
+    if aligned_index is not None:
+        spy_df = next(iter(baseline_universe.values()))
+        common = aligned_index.intersection(spy_df.index)
+        if len(common) < len(aligned_index):
+            warnings.warn(
+                f"--baseline-symbol {args.baseline_symbol}'s own calendar only covers "
+                f"{len(common)}/{len(aligned_index)} of the main universe's aligned dates -- "
+                f"baseline fold boundaries may not exactly match the main run's."
+            )
+        baseline_universe = {sym: df.loc[common] for sym, df in baseline_universe.items()}
 
     if args.mode == "standard":
         baseline_out = run_standard(baseline_universe, baseline_template, baseline_params, args)
@@ -575,7 +614,11 @@ def main():
         baseline_params = None
         baseline_calendar_mismatch = False
         if args.baseline_symbol:
-            baseline_folds, baseline_params = _run_baseline(args, cache_dir, data_kwargs)
+            main_aligned = _align_universe(universe)
+            main_calendar = next(iter(main_aligned.values())).index
+            baseline_folds, baseline_params = _run_baseline(
+                args, cache_dir, data_kwargs, aligned_index=main_calendar
+            )
             baseline_folds_df = pd.DataFrame(baseline_folds)
             folds_df, baseline_calendar_mismatch = _merge_baseline_folds(folds_df, baseline_folds_df)
 
@@ -616,7 +659,25 @@ def main():
             "n_valid_folds": n_valid_folds,
             "fold_sharpe_std": sharpe_std,
             "deflated_sharpe_ratio": dsr,
+            "requested_start": args.start,
+            "requested_end": args.end,
+            "actual_first_fold_start": folds_df["start_date"].iloc[0],
+            "actual_last_fold_end": folds_df["end_date"].iloc[-1],
         }
+        shortfall_days = (pd.Timestamp(args.end) - pd.Timestamp(folds_df["end_date"].iloc[-1])).days
+        # A fold needs a FULL window to fit (run_walkforward's `while start_idx + window_bars <=
+        # n_bars`), so up to (step_bars - 1) trading days of already-loaded data are always left
+        # unevaluated at the tail -- normal, not a bug. Scale the "is this shortfall suspicious"
+        # threshold to that expected slack (~7/5 calendar-to-trading-day ratio, plus a small
+        # holiday buffer) instead of a flat cutoff, so ordinary --step-years rounding doesn't
+        # trigger a false-positive "data didn't reach --end" note.
+        expected_max_shortfall_days = int(round(args.step_years * 252 * 7 / 5)) + 14
+        if shortfall_days > expected_max_shortfall_days:
+            print(f"\nNOTE: the last walk-forward fold ends {folds_df['end_date'].iloc[-1]}, "
+                  f"{shortfall_days} day(s) short of the requested --end {args.end}. Up to "
+                  f"(--step-years worth of bars) short is expected (a fold needs a full window to "
+                  f"fit); a shortfall this large usually means the loaded universe's actual data "
+                  f"didn't reach --end -- check for warnings above and the OHLCV cache under {cache_dir}.")
         print(f"Deflated Sharpe Ratio: {dsr:.3f} (n_trials={n_valid_folds}, fold Sharpe std={sharpe_std:.3f})")
         summary_path = os.path.join(results_dir, "walkforward_summary.json")
         write_json_report(summary, summary_path)

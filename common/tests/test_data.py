@@ -18,6 +18,7 @@ from common.data import (
     CachedDataProvider,
     SyntheticDataProvider,
     YFinanceDataProvider,
+    _cache_covers_requested_end,
     _drop_invalid_ohlcv_rows,
     fetch_fund_metadata,
     get_data_provider,
@@ -543,6 +544,82 @@ def test_cached_data_provider_respects_max_age(temp_csv_dir):
     assert calls["n"] == 2
 
 
+def test_cache_covers_requested_end_helper():
+    now = pd.Timestamp("2026-09-02")
+
+    # end already elapsed, cached data reaches it (within weekend/holiday tolerance) -> covers.
+    df = pd.DataFrame({"Close": [1.0]}, index=pd.DatetimeIndex(["2020-01-08"]))
+    assert _cache_covers_requested_end(df, "2020-01-10", now=now) is True
+
+    # end already elapsed, cached data falls well short -> does NOT cover.
+    df = pd.DataFrame({"Close": [1.0]}, index=pd.DatetimeIndex(["2020-01-02"]))
+    assert _cache_covers_requested_end(df, "2020-01-10", now=now) is False
+
+    # end still in the future relative to `now` -> trivially covers (nothing more to fetch yet).
+    df = pd.DataFrame({"Close": [1.0]}, index=pd.DatetimeIndex(["2020-01-02"]))
+    assert _cache_covers_requested_end(df, "2099-01-01", now=now) is True
+
+    # empty cached data, end already elapsed -> does NOT cover.
+    assert _cache_covers_requested_end(pd.DataFrame(), "2020-01-10", now=now) is False
+
+
+def test_cached_data_provider_refetches_when_cache_falls_short_of_elapsed_end(temp_csv_dir):
+    """Regression test for the walk-forward-stops-short-of---end bug: a cache file that was
+    written when the requested `end` was still in the future only got data through whatever
+    'today' was back then. Once that `end` has genuinely elapsed, the short cache must no longer
+    be trusted forever -- it must be detected as incomplete and re-fetched."""
+    calls = {"n": 0}
+
+    class CountingProvider(SyntheticDataProvider):
+        def fetch_ohlcv(self, symbol, start, end, interval="1d"):
+            calls["n"] += 1
+            return super().fetch_ohlcv(symbol, start, end, interval)
+
+    cached_provider = CachedDataProvider(CountingProvider(seed=42), cache_dir=temp_csv_dir)
+    cache_path = os.path.join(temp_csv_dir, "CountingProvider_SPY_1d_2020-01-01_2026-01-01.csv")
+
+    # Simulate a cache written back when 2026-01-01 was still in the future: only 5 bdates.
+    os.makedirs(temp_csv_dir, exist_ok=True)
+    short_dates = pd.bdate_range("2020-01-01", periods=5)
+    pd.DataFrame(
+        {"Open": [10.0] * 5, "High": [12.0] * 5, "Low": [9.0] * 5, "Close": [11.0] * 5, "Volume": [100.0] * 5},
+        index=short_dates,
+    ).to_csv(cache_path)
+
+    with pytest.warns(UserWarning, match="falls short of requested end"):
+        df = cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2026-01-01")
+
+    assert calls["n"] == 1  # re-fetched from source instead of trusting the short cache
+    assert df.index[-1] >= pd.Timestamp("2025-01-01")  # SyntheticDataProvider now reaches `end`
+
+
+def test_cached_data_provider_trusts_short_cache_when_end_still_in_the_future(temp_csv_dir):
+    """Mirror of the test above: if `end` HASN'T elapsed yet, a cache that doesn't reach it is
+    legitimately complete (there's nothing more to fetch), so it must NOT be refetched."""
+    calls = {"n": 0}
+
+    class CountingProvider(SyntheticDataProvider):
+        def fetch_ohlcv(self, symbol, start, end, interval="1d"):
+            calls["n"] += 1
+            return super().fetch_ohlcv(symbol, start, end, interval)
+
+    far_future_end = (pd.Timestamp.now() + pd.Timedelta(days=3650)).strftime("%Y-%m-%d")
+    cached_provider = CachedDataProvider(CountingProvider(seed=42), cache_dir=temp_csv_dir)
+    cache_path = os.path.join(temp_csv_dir, f"CountingProvider_SPY_1d_2020-01-01_{far_future_end}.csv")
+
+    os.makedirs(temp_csv_dir, exist_ok=True)
+    short_dates = pd.bdate_range("2020-01-01", periods=5)
+    pd.DataFrame(
+        {"Open": [10.0] * 5, "High": [12.0] * 5, "Low": [9.0] * 5, "Close": [11.0] * 5, "Volume": [100.0] * 5},
+        index=short_dates,
+    ).to_csv(cache_path)
+
+    df = cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end=far_future_end)
+
+    assert calls["n"] == 0  # cache trusted as-is -- `end` hasn't happened yet
+    assert len(df) == 5
+
+
 def test_csv_folder_data_provider_sorts_unsorted_csv(temp_csv_dir):
     # Regression test: fetch_ohlcv() used to read the CSV, date-filter it,
     # and return WITHOUT sorting -- silently violating the documented
@@ -642,14 +719,20 @@ def test_cached_data_provider_recovers_from_corrupt_cache_file(temp_csv_dir):
 
 
 def test_cached_data_provider_cleans_a_bad_row_from_a_cache_hit(temp_csv_dir):
-    dates = pd.bdate_range("2020-01-01", periods=3)
+    # Cache must span the FULL requested range (2020-01-01 through 2020-01-10) -- a cache that
+    # only covers a leading fragment of the requested range now correctly looks incomplete (see
+    # _cache_covers_requested_end) and would trigger a refetch instead of exercising this test's
+    # actual target: cleaning a single bad row out of an otherwise-COMPLETE cache hit. The bad row
+    # is placed in the middle (not the last row) so the cleaned cache still reaches 2020-01-10.
+    dates = pd.bdate_range("2020-01-01", "2020-01-10")
+    n = len(dates)
     cache_df = pd.DataFrame(
         {
-            "Open": [10.0] * 3,
-            "High": [12.0, 12.0, 12.0],
-            "Low": [9.0, 9.0, -1.0],  # row 2: negative price
-            "Close": [11.0] * 3,
-            "Volume": [100.0] * 3,
+            "Open": [10.0] * n,
+            "High": [12.0] * n,
+            "Low": [9.0 if i != 2 else -1.0 for i in range(n)],  # row 2: negative price
+            "Close": [11.0] * n,
+            "Volume": [100.0] * n,
         },
         index=dates,
     )
@@ -661,7 +744,7 @@ def test_cached_data_provider_cleans_a_bad_row_from_a_cache_hit(temp_csv_dir):
     with pytest.warns(UserWarning, match="Dropping 1 row"):
         df = cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
 
-    assert len(df) == 2
+    assert len(df) == n - 1
     assert dates[2] not in df.index
 
 
