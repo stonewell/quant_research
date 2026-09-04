@@ -73,3 +73,35 @@ def format_backtest_metrics_summary(result: dict) -> str:
         f"Calmar Ratio: {result['calmar_ratio']:.2f} | Win Rate: {result['win_rate']*100:.1f}% | "
         f"Profit Factor: {result['profit_factor']:.2f}"
     )
+
+
+def format_walkforward_performance_table(folds_df: pd.DataFrame) -> str:
+    """Formats walkforward folds DataFrame into a human-readable ASCII table string.
+
+    Ratios (Sharpe, Calmar, Profit Factor) are rounded to 2 decimal places, percentages
+    (CAGR, MaxDD, Win Rate, Outperformance) are formatted with '%' suffixes, and dates/counts
+    are preserved as-is.
+    """
+    if folds_df.empty:
+        return ""
+
+    formatted = folds_df.copy()
+
+    pct_cols = {"cagr", "max_drawdown", "win_rate", "baseline_cagr", "baseline_max_drawdown", "outperformance"}
+    ratio_cols = {"sharpe_ratio", "calmar_ratio", "profit_factor", "baseline_sharpe_ratio", "baseline_calmar_ratio"}
+
+    for col in formatted.columns:
+        if col in pct_cols:
+            formatted[col] = formatted[col].apply(
+                lambda x: f"{x * 100:.2f}%" if pd.notna(x) and np.isfinite(x) else ("N/A" if pd.isna(x) else str(x))
+            )
+        elif col in ratio_cols:
+            formatted[col] = formatted[col].apply(
+                lambda x: f"{x:.2f}" if pd.notna(x) and np.isfinite(x) else ("N/A" if pd.isna(x) else str(x))
+            )
+        elif col == "total_turnover":
+            formatted[col] = formatted[col].apply(
+                lambda x: f"{x:.2f}" if pd.notna(x) and np.isfinite(x) else ("N/A" if pd.isna(x) else str(x))
+            )
+
+    return formatted.to_string(index=False)

@@ -867,10 +867,36 @@ def test_main_walkforward_writes_summary_json(tmp_path, monkeypatch):
         summary = json.load(f)
     for key in ("mean_sharpe_ratio", "mean_cagr", "mean_max_drawdown", "mean_calmar_ratio",
                 "n_folds", "n_valid_folds", "fold_sharpe_std", "deflated_sharpe_ratio",
-                "requested_start", "requested_end", "actual_first_fold_start", "actual_last_fold_end"):
+                "requested_start", "requested_end", "actual_first_fold_start", "actual_last_fold_end",
+                "rolling_window_performance"):
         assert key in summary
+    assert isinstance(summary["rolling_window_performance"], list)
+    assert len(summary["rolling_window_performance"]) == summary["n_folds"]
     assert summary["requested_start"] == "2015-01-01"
     assert summary["requested_end"] == "2024-12-31"
+
+
+def test_main_walkforward_prints_deflated_sharpe_ratio_in_console(tmp_path, monkeypatch, capsys):
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(strategy_path)
+    results_dir = tmp_path / "results"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "A", "B",
+        "--mode", "walkforward",
+        "--data-provider", "synthetic",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(tmp_path / "cache"),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    main()
+
+    captured = capsys.readouterr()
+    assert "Deflated Sharpe Ratio:" in captured.out
+    assert "n_trials=" in captured.out
+    assert "fold Sharpe std=" in captured.out
 
 
 def test_main_walkforward_prints_shortfall_note_when_data_falls_short_of_end(tmp_path, monkeypatch, capsys):
@@ -1187,6 +1213,8 @@ def test_main_optimize_walkforward_mode_exercises_walkforward_score_fn(tmp_path,
         report = json.load(f)
     assert "folds" in report["original_result"]
     assert "folds" in report["best_result"]
+    assert "deflated_sharpe_ratio" in report["original_result"]
+    assert "deflated_sharpe_ratio" in report["best_result"]
 
 
 def test_main_optimize_walkforward_mode_improvement_cagr_is_finite(tmp_path, monkeypatch):

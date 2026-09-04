@@ -46,7 +46,11 @@ from common.cli_utils import (
 bootstrap_project_paths(_REPO_ROOT, __file__)
 from common.metrics import alpha_beta, deflated_sharpe_ratio, information_ratio, tracking_error
 from common import plotting
-from common.reporting import format_backtest_metrics_summary, write_json_report
+from common.reporting import (
+    format_backtest_metrics_summary,
+    format_walkforward_performance_table,
+    write_json_report,
+)
 from common.strategy_spec import get_template, load_strategy_file
 from common.universe import add_universe_cli_args, resolve_universe_from_args
 
@@ -269,9 +273,23 @@ def _walkforward_score_fn(universe, args):
         mean_calmar_ratio = float(np.mean(calmar_ratios)) if calmar_ratios else float("nan")
         total_rebalances = sum(f.get("total_rebalances", 0) for f in folds)
         total_turnover = sum(f.get("total_turnover", 0.0) for f in folds)
+
+        n_valid_folds = len(sharpes)
+        dsr = float("nan")
+        sharpe_std = float("nan")
+        if n_valid_folds >= 2:
+            sharpe_std = float(pd.Series(sharpes).std(ddof=1))
+            dsr = deflated_sharpe_ratio(
+                observed_sharpe=mean_sharpe,
+                n_trials=n_valid_folds,
+                n_obs=_resolve_window_bars(args.window_years),
+                sharpe_std=sharpe_std,
+            )
+
         return {
             "sharpe_ratio": mean_sharpe, "cagr": mean_cagr,
             "max_drawdown": mean_max_drawdown, "calmar_ratio": mean_calmar_ratio,
+            "deflated_sharpe_ratio": dsr,
             "total_rebalances": total_rebalances,
             "total_turnover": total_turnover, "folds": folds,
         }
@@ -623,20 +641,7 @@ def main():
             folds_df, baseline_calendar_mismatch = _merge_baseline_folds(folds_df, baseline_folds_df)
 
         print("\nRolling Windows Performance:")
-        print(folds_df.to_string(index=False))
-
-        print(f"\nMean Sharpe Ratio: {folds_df['sharpe_ratio'].mean():.2f} | "
-              f"Mean CAGR: {folds_df['cagr'].mean()*100:.2f}%")
-        print(f"Mean Max Drawdown: {folds_df['max_drawdown'].mean()*100:.1f}% | "
-              f"Mean Calmar Ratio: {folds_df['calmar_ratio'].mean():.2f}")
-
-        if args.baseline_symbol:
-            mean_baseline_sharpe = folds_df["baseline_sharpe_ratio"].mean()
-            mean_baseline_cagr = folds_df["baseline_cagr"].mean()
-            mean_outperformance = folds_df["outperformance"].mean()
-            print(f"Mean Baseline Sharpe Ratio: {mean_baseline_sharpe:.2f} | "
-                  f"Mean Baseline CAGR: {mean_baseline_cagr*100:.2f}%")
-            print(f"Mean Outperformance CAGR: {mean_outperformance*100:.2f}%")
+        print(format_walkforward_performance_table(folds_df))
 
         valid_sharpes = folds_df["sharpe_ratio"].dropna()
         n_valid_folds = len(valid_sharpes)
@@ -650,6 +655,23 @@ def main():
                 n_obs=_resolve_window_bars(args.window_years),
                 sharpe_std=sharpe_std,
             )
+
+        print(f"\nMean Sharpe Ratio: {folds_df['sharpe_ratio'].mean():.2f} | "
+              f"Mean CAGR: {folds_df['cagr'].mean()*100:.2f}%")
+        print(f"Mean Max Drawdown: {folds_df['max_drawdown'].mean()*100:.1f}% | "
+              f"Mean Calmar Ratio: {folds_df['calmar_ratio'].mean():.2f}")
+        dsr_str = f"{dsr:.3f}" if np.isfinite(dsr) else "N/A"
+        std_str = f"{sharpe_std:.3f}" if np.isfinite(sharpe_std) else "N/A"
+        print(f"Deflated Sharpe Ratio: {dsr_str} (n_trials={n_valid_folds}, fold Sharpe std={std_str})")
+
+        if args.baseline_symbol:
+            mean_baseline_sharpe = folds_df["baseline_sharpe_ratio"].mean()
+            mean_baseline_cagr = folds_df["baseline_cagr"].mean()
+            mean_outperformance = folds_df["outperformance"].mean()
+            print(f"Mean Baseline Sharpe Ratio: {mean_baseline_sharpe:.2f} | "
+                  f"Mean Baseline CAGR: {mean_baseline_cagr*100:.2f}%")
+            print(f"Mean Outperformance CAGR: {mean_outperformance*100:.2f}%")
+
         summary = {
             "mean_sharpe_ratio": float(folds_df["sharpe_ratio"].mean()),
             "mean_cagr": float(folds_df["cagr"].mean()),
@@ -663,6 +685,7 @@ def main():
             "requested_end": args.end,
             "actual_first_fold_start": folds_df["start_date"].iloc[0],
             "actual_last_fold_end": folds_df["end_date"].iloc[-1],
+            "rolling_window_performance": folds_df.to_dict(orient="records"),
         }
         shortfall_days = (pd.Timestamp(args.end) - pd.Timestamp(folds_df["end_date"].iloc[-1])).days
         # A fold needs a FULL window to fit (run_walkforward's `while start_idx + window_bars <=
@@ -678,7 +701,6 @@ def main():
                   f"(--step-years worth of bars) short is expected (a fold needs a full window to "
                   f"fit); a shortfall this large usually means the loaded universe's actual data "
                   f"didn't reach --end -- check for warnings above and the OHLCV cache under {cache_dir}.")
-        print(f"Deflated Sharpe Ratio: {dsr:.3f} (n_trials={n_valid_folds}, fold Sharpe std={sharpe_std:.3f})")
         summary_path = os.path.join(results_dir, "walkforward_summary.json")
         write_json_report(summary, summary_path)
         print(f"Saved walkforward summary to {summary_path}")

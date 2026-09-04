@@ -16,6 +16,7 @@ if _PROJECT_ROOT not in sys.path:
 
 from common.reporting import (
     format_backtest_metrics_summary,
+    format_walkforward_performance_table,
     format_weights_pct,
     to_dense_weights,
     utc_timestamp,
@@ -108,3 +109,30 @@ def test_format_backtest_metrics_summary_exact_text():
         "Sharpe Ratio: 1.23 | CAGR: 8.56% | Max Drawdown: 18.6%\n"
         "Calmar Ratio: 0.46 | Win Rate: 53.0% | Profit Factor: 1.15"
     )
+
+
+def test_format_walkforward_performance_table_empty_df():
+    assert format_walkforward_performance_table(pd.DataFrame()) == ""
+
+
+def test_format_walkforward_performance_table_formats_pct_and_ratios():
+    df = pd.DataFrame([
+        {
+            "start_date": "2020-01-01",
+            "end_date": "2020-12-31",
+            "sharpe_ratio": 1.234,
+            "cagr": 0.153,
+            "max_drawdown": 0.082,
+            "calmar_ratio": 1.865,
+            "win_rate": 0.55,
+            "profit_factor": 1.45,
+            "baseline_cagr": 0.10,
+            "outperformance": 0.053,
+        }
+    ])
+    formatted_str = format_walkforward_performance_table(df)
+    assert "2020-01-01" in formatted_str
+    assert "15.30%" in formatted_str
+    assert "8.20%" in formatted_str
+    assert "1.23" in formatted_str
+    assert "5.30%" in formatted_str
