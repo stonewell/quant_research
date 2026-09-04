@@ -31,6 +31,7 @@ from research_strategy.rs.chan_advanced_strategies import (
     ChanMeanReversionDivergenceStrategy,
     ChanMultiTimeframeTrendStrategy,
     ChanTrendThirdBuyStrategy,
+    ChanVaaCompoundStrategy,
     run_composite_position_loop,
     run_mrd_position_exit,
 )
@@ -361,6 +362,53 @@ def test_chan_composite_exits_on_dangerous_pivot_relation_overlay(monkeypatch):
     assert daily["SPY"].iloc[danger_bar] == 0.0, "dangerous pivot-relation overlay should force an exit"
 
 
+# --- ChanVaaCompoundStrategy Tests -----------------------------------------
+
+def test_chan_vaa_compound_generates_valid_weights():
+    universe = create_mock_universe(n_days=300)
+    cfg = StrategyConfig()
+    strat = ChanVaaCompoundStrategy(cfg)
+
+    weights = strat.generate_weights(universe)
+    assert not weights.empty
+    assert set(weights.columns) == {"SPY", "QQQ", "BIL"}
+
+    # Convert sparse to dense daily
+    daily = weights.reindex(universe["SPY"].index).ffill().fillna(0.0)
+
+    # All weights in [0, 1]
+    assert (daily >= -1e-6).all().all()
+    assert (daily <= 1.0 + 1e-6).all().all()
+
+    # Sum of weights per day <= 1.0 + epsilon
+    row_sums = daily.sum(axis=1)
+    assert (row_sums <= 1.0 + 1e-5).all()
+
+
+def test_chan_vaa_compound_regime_adaptive_and_fixed_modes():
+    universe = create_mock_universe(n_days=300)
+    cfg = StrategyConfig()
+    strat = ChanVaaCompoundStrategy(cfg)
+
+    # Fixed blend mode
+    w_fixed = strat.generate_weights(universe, params={"chan_vaa_mode": "fixed_blend", "chan_vaa_chan_weight": 0.5})
+    assert not w_fixed.empty
+
+    # Regime adaptive with gate in defensive
+    w_gated = strat.generate_weights(universe, params={"chan_vaa_mode": "regime_adaptive", "chan_vaa_gate_chan_in_defensive": True})
+    assert not w_gated.empty
+
+
+def test_chan_vaa_compound_warmup_and_explain():
+    cfg = StrategyConfig()
+    strat = ChanVaaCompoundStrategy(cfg)
+
+    assert strat.warmup_bars() == 252
+    explanation = strat.explain_weights()
+    assert "Chan Pivot Shift MACD + VAA Optimal Compound Strategy" in explanation
+    assert "Vigilant Asset Allocation" in explanation
+
+
 # --- Integration Tests: strategies_config.json Discovery -------------------
 
 @pytest.mark.parametrize("key", [
@@ -369,6 +417,7 @@ def test_chan_composite_exits_on_dangerous_pivot_relation_overlay(monkeypatch):
     "chan_mean_reversion_divergence",
     "chan_composite",
     "chan_best_selector",
+    "chan_vaa_compound",
 ])
 def test_instantiate_strategy_from_config(key: str):
     config_dict = load_strategies_config()

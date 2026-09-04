@@ -74,6 +74,7 @@ from .chan_advanced_strategies import (
     ChanMeanReversionDivergenceStrategy,
     ChanMultiTimeframeTrendStrategy,
     ChanTrendThirdBuyStrategy,
+    ChanVaaCompoundStrategy,
 )
 from .chan_lesson_strategies import (
     ChanFailedRetestBuyStrategy,
@@ -2025,6 +2026,7 @@ STRATEGY_CLASS_MAP = {
     "SwingTrendPullbackStrategy": SwingTrendPullbackStrategy,
     "TurtleBreakoutStrategy": TurtleBreakoutStrategy,
     "VigilantAssetAllocation": VigilantAssetAllocation,
+    "ChanVaaCompoundStrategy": ChanVaaCompoundStrategy,
 }
 
 

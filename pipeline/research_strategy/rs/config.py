@@ -319,6 +319,15 @@ class StrategyConfig:
     chan_best_metric: str = "sharpe"  # "sharpe" or "cagr"
     chan_best_rebalance_freq_days: int = 21
 
+    # --- Chan Pivot Shift MACD + VAA Optimal Compound Strategy (ChanVaaCompoundStrategy) ---
+    chan_vaa_chan_weight: float = 0.60
+    chan_vaa_mode: str = "regime_adaptive"   # "regime_adaptive" or "fixed_blend"
+    chan_vaa_defensive_boost: bool = True
+    chan_vaa_gate_chan_in_defensive: bool = False
+    chan_vaa_rebalance_freq_days: int = 21
+    chan_vaa_offensive_universe: List[str] = field(default_factory=lambda: list(DEFAULT_VAA_OFFENSIVE))
+    chan_vaa_defensive_universe: List[str] = field(default_factory=lambda: list(DEFAULT_VAA_DEFENSIVE))
+
     # --- Chan Pivot Shift (MACD) Advanced (ChanPivotShiftMACDAdvStrategy):
     # an enhanced SIBLING of Chan Pivot Shift (MACD) above -- that strategy/
     # its config (chanm_*) are left completely untouched. Adds (Lessons
@@ -483,6 +492,8 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.chanm_adv_min_gap_bars must be > 0, got {self.chanm_adv_min_gap_bars}")
         if self.chanm_adv_min_strokes < 3:
             raise ValueError(f"StrategyConfig.chanm_adv_min_strokes must be >= 3, got {self.chanm_adv_min_strokes}")
+        if self.chan_vaa_rebalance_freq_days <= 0:
+            raise ValueError(f"StrategyConfig.chan_vaa_rebalance_freq_days must be > 0, got {self.chan_vaa_rebalance_freq_days}")
 
     @classmethod
     def from_dict(cls, data: dict) -> "StrategyConfig":

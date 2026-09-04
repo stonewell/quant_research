@@ -263,6 +263,29 @@
     },
     "factors": ["regime_trend_strength", "relative_momentum", "volatility_targeting"]
   },
+  "chan_vaa_compound": {
+    "name": "Chan Pivot Shift MACD + VAA Optimal Compound Strategy",
+    "type": "class",
+    "class_name": "ChanVaaCompoundStrategy",
+    "description": "Optimal compound combination allocating between ChanPivotShiftMACD (structural trend-following alpha) and Vigilant Asset Allocation (VAA-G4 dual momentum regime crash protection).",
+    "parameters": {
+      "chan_vaa_chan_weight": 0.6,
+      "chan_vaa_mode": "regime_adaptive",
+      "chan_vaa_defensive_boost": true,
+      "chan_vaa_gate_chan_in_defensive": false,
+      "chan_vaa_rebalance_freq_days": 21,
+      "chanm_min_gap_bars": 4,
+      "chanm_min_strokes": 3,
+      "chanm_macd_fast": 12,
+      "chanm_macd_slow": 26,
+      "chanm_macd_signal": 9,
+      "chanm_stop_loss_pct": 0.08,
+      "chanm_max_holding_days": 90,
+      "chanm_position_size_pct": 1.0,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["regime_trend_strength", "absolute_momentum_trend", "relative_momentum", "breadth"]
+  },
   "chan_pivot_oscillation": {
     "name": "Chan Pivot-Oscillation Monitor",
     "type": "class",

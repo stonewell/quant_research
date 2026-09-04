@@ -33,7 +33,7 @@ from common.allocation_templates import (
     _fill_out_columns,
     _sparse_from_daily,
 )
-from common.indicators import macd, sma
+from common.indicators import macd, roc, sma
 from common.position_exits import run_stop_timeout_exit
 from common.scheduling import get_rebalance_dates as _get_rebalance_dates
 
@@ -802,3 +802,204 @@ class ChanBestSelectorStrategy(AllocationTemplate):
         lookback_days = p.get("chan_best_lookback_days", cfg.chan_best_lookback_days)
         sub_warmups = [s.warmup_bars(params) for s in self._get_sub_strategies(cfg).values()]
         return max(sub_warmups) + lookback_days
+
+
+class ChanVaaCompoundStrategy(AllocationTemplate):
+    """Chan Pivot Shift MACD + VAA Optimal Compound Strategy:
+
+    A multi-regime compound strategy combining:
+    1. Trend-following structural alpha from `ChanPivotShiftMACDStrategy` (中枢迁移买卖点 + MACD背驰/零轴确认)
+    2. Regime crash-protection from `VigilantAssetAllocation` (VAA 13612W 动量防崩塌模型)
+
+    Regime Logic:
+    - In Safe/Bull regime (all tracked offensive assets have 13612W momentum > 0):
+      Allocates base `chan_vaa_chan_weight` (default 60%) to Chan structural breakout
+      positions, and remaining 40% (plus any unallocated Chan capacity) to the leading VAA offensive asset.
+    - In Bear/Defensive regime (at least one offensive asset momentum <= 0):
+      Rotates primary capital into VAA's leading defensive asset (IEF/BIL), scaling down
+      or gating equity risk while strictly maintaining stop-losses.
+    """
+
+    def __init__(self, config: StrategyConfig = None):
+        self.config = config or StrategyConfig()
+        super().__init__(name="chan_vaa_compound", param_grid={})
+
+    def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
+        cfg = self.config
+        p = params or {}
+
+        symbols = list(universe.keys())
+        if not symbols:
+            return pd.DataFrame()
+
+        cash_proxy = p.get("cash_proxy", cfg.cash_proxy)
+        chan_weight = float(p.get("chan_vaa_chan_weight", cfg.chan_vaa_chan_weight))
+        mode = str(p.get("chan_vaa_mode", cfg.chan_vaa_mode))
+        defensive_boost = bool(p.get("chan_vaa_defensive_boost", cfg.chan_vaa_defensive_boost))
+        gate_in_defensive = bool(p.get("chan_vaa_gate_chan_in_defensive", cfg.chan_vaa_gate_chan_in_defensive))
+        rebal_freq = int(p.get("chan_vaa_rebalance_freq_days", cfg.chan_vaa_rebalance_freq_days))
+
+        # 1. Compute Chan Pivot Shift MACD raw weights for risky symbols
+        risky_symbols = _get_risky_symbols_helper(
+            universe, p,
+            cfg_symbol=getattr(cfg, "symbol", None),
+            cfg_risky_universe=getattr(cfg, "risky_universe", None),
+            cash_proxy=cash_proxy
+        )
+        if not risky_symbols:
+            return pd.DataFrame()
+
+        master_index = _aligned_master_index_helper(universe, risky_symbols)
+        if master_index is None or len(master_index) == 0:
+            return pd.DataFrame()
+
+        min_gap_bars = int(p.get("chanm_min_gap_bars", cfg.chanm_min_gap_bars))
+        min_strokes = int(p.get("chanm_min_strokes", cfg.chanm_min_strokes))
+        macd_fast = int(p.get("chanm_macd_fast", cfg.chanm_macd_fast))
+        macd_slow = int(p.get("chanm_macd_slow", cfg.chanm_macd_slow))
+        macd_signal = int(p.get("chanm_macd_signal", cfg.chanm_macd_signal))
+        stop_loss_pct = p.get("chanm_stop_loss_pct", cfg.chanm_stop_loss_pct)
+        max_holding_days = p.get("chanm_max_holding_days", cfg.chanm_max_holding_days)
+        position_size_pct = float(p.get("chanm_position_size_pct", cfg.chanm_position_size_pct))
+
+        chan_raw_weights: Dict[str, pd.Series] = {}
+        for sym in risky_symbols:
+            bars = universe[sym]
+            sig = compute_chan_pivot_macd_signals(
+                bars,
+                min_gap_bars=min_gap_bars,
+                min_strokes=min_strokes,
+                macd_fast=macd_fast,
+                macd_slow=macd_slow,
+                macd_signal=macd_signal,
+            )
+            entry_signal = sig["buy_signal"].reindex(master_index).fillna(False)
+            exit_signal = sig["sell_signal"].reindex(master_index).fillna(False)
+            close = bars["Close"].reindex(master_index)
+
+            chan_raw_weights[sym] = run_stop_timeout_exit(
+                close, entry_signal, exit_signal, stop_loss_pct, max_holding_days, position_size_pct
+            )
+
+        chan_daily = pd.DataFrame(chan_raw_weights, index=master_index)
+        # Normalize across active risky positions so sum <= 1.0
+        active_counts = (chan_daily > 0).sum(axis=1)
+        chan_scaled = chan_daily.copy()
+        for dt in master_index:
+            c = active_counts.loc[dt]
+            if c > 1:
+                chan_scaled.loc[dt] = chan_daily.loc[dt] / c
+
+        # 2. Compute VAA 13612W Momentum and Regime
+        offensive_universe = p.get("chan_vaa_offensive_universe", cfg.chan_vaa_offensive_universe)
+        defensive_universe = p.get("chan_vaa_defensive_universe", cfg.chan_vaa_defensive_universe)
+
+        offensive_symbols = [s for s in offensive_universe if s in symbols]
+        defensive_symbols = [s for s in defensive_universe if s in symbols]
+        all_tracked = list(dict.fromkeys(offensive_symbols + defensive_symbols))
+
+        def score_13612w(sym: str) -> pd.Series:
+            close = universe[sym]["Close"]
+            return 12 * roc(close, 21) + 4 * roc(close, 63) + 2 * roc(close, 126) + roc(close, 252)
+
+        scores = pd.DataFrame({sym: score_13612w(sym) for sym in all_tracked}) if all_tracked else pd.DataFrame()
+
+        rebalance_dates = _get_rebalance_dates(master_index, rebal_freq)
+        vaa_rebal_weights = pd.DataFrame(index=rebalance_dates, columns=symbols, data=0.0)
+        vaa_regime_series = pd.Series(index=rebalance_dates, dtype=object)
+
+        for date in rebalance_dates:
+            off_scores = scores.loc[date, offensive_symbols].dropna() if offensive_symbols else pd.Series(dtype=float)
+            # If not enough history yet, default to defensive/cash
+            if len(off_scores) < len(offensive_symbols) or off_scores.empty:
+                vaa_regime_series.loc[date] = "defensive"
+                def_scores = scores.loc[date, defensive_symbols].dropna() if defensive_symbols else pd.Series(dtype=float)
+                if not def_scores.empty:
+                    vaa_rebal_weights.loc[date, def_scores.idxmax()] = 1.0
+                elif cash_proxy in symbols:
+                    vaa_rebal_weights.loc[date, cash_proxy] = 1.0
+                continue
+
+            # Check if all offensive assets have positive 13612W momentum
+            if (off_scores > 0).all():
+                vaa_regime_series.loc[date] = "bull"
+                vaa_rebal_weights.loc[date, off_scores.idxmax()] = 1.0
+            else:
+                vaa_regime_series.loc[date] = "defensive"
+                def_scores = scores.loc[date, defensive_symbols].dropna() if defensive_symbols else pd.Series(dtype=float)
+                if not def_scores.empty:
+                    vaa_rebal_weights.loc[date, def_scores.idxmax()] = 1.0
+                elif cash_proxy in symbols:
+                    vaa_rebal_weights.loc[date, cash_proxy] = 1.0
+
+        # Forward-fill VAA targets and regime across all dates
+        vaa_daily = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
+        vaa_daily.loc[rebalance_dates] = vaa_rebal_weights
+        vaa_daily = vaa_daily.ffill().fillna(0.0)
+
+        vaa_regimes = pd.Series(index=master_index, dtype=object)
+        vaa_regimes.loc[rebalance_dates] = vaa_regime_series
+        vaa_regimes = vaa_regimes.ffill().fillna("defensive")
+
+        # 3. Blend allocations according to mode and regime
+        output_weights = pd.DataFrame(index=master_index, columns=symbols, data=0.0)
+
+        for date in master_index:
+            regime = vaa_regimes.loc[date]
+            v_weights = vaa_daily.loc[date]
+
+            if mode == "fixed_blend":
+                # Fixed proportion blend
+                w_chan = chan_scaled.loc[date] * chan_weight if date in chan_scaled.index else pd.Series(0.0, index=symbols)
+                w_vaa = v_weights * (1.0 - chan_weight)
+                for sym in symbols:
+                    output_weights.loc[date, sym] = (w_chan.get(sym, 0.0) if sym in w_chan else 0.0) + w_vaa.get(sym, 0.0)
+            else:
+                # Regime-adaptive blend
+                if regime == "bull":
+                    # Bull mode: Allocate chan_weight to Chan, remaining to VAA top offensive
+                    c_weights = chan_scaled.loc[date] if date in chan_scaled.index else pd.Series(0.0, index=symbols)
+                    c_sum = c_weights.sum()
+
+                    for sym in symbols:
+                        c_alloc = c_weights.get(sym, 0.0) * chan_weight
+                        v_alloc = v_weights.get(sym, 0.0) * (1.0 - chan_weight * c_sum)
+                        output_weights.loc[date, sym] = c_alloc + v_alloc
+                else:
+                    # Defensive / Bear mode: Crash protection
+                    if gate_in_defensive:
+                        # Zero out Chan entirely; 100% in VAA defensive asset
+                        output_weights.loc[date] = v_weights
+                    elif defensive_boost:
+                        # Scale down Chan exposure by 50% (or cap at 30%) and allocate balance to defensive asset
+                        c_weights = (chan_scaled.loc[date] * 0.5) if date in chan_scaled.index else pd.Series(0.0, index=symbols)
+                        c_sum = c_weights.sum()
+                        def_alloc = max(1.0 - c_sum, 0.70)
+                        for sym in symbols:
+                            output_weights.loc[date, sym] = c_weights.get(sym, 0.0) + v_weights.get(sym, 0.0) * def_alloc
+                    else:
+                        c_weights = chan_scaled.loc[date] if date in chan_scaled.index else pd.Series(0.0, index=symbols)
+                        c_sum = c_weights.sum()
+                        for sym in symbols:
+                            output_weights.loc[date, sym] = c_weights.get(sym, 0.0) * chan_weight + v_weights.get(sym, 0.0) * (1.0 - chan_weight)
+
+        output_weights = _cap_and_deroute_to_cash(output_weights, symbols, cash_proxy)
+        output_weights = _fill_out_columns(output_weights, symbols)
+        return _sparse_from_daily(output_weights)
+
+    def explain_weights(self, params: dict = None) -> str:
+        cfg = self.config
+        p = params or {}
+        chan_w = p.get("chan_vaa_chan_weight", cfg.chan_vaa_chan_weight)
+        mode = p.get("chan_vaa_mode", cfg.chan_vaa_mode)
+        def_boost = p.get("chan_vaa_defensive_boost", cfg.chan_vaa_defensive_boost)
+        return (
+            "Chan Pivot Shift MACD + VAA Optimal Compound Strategy (缠论中枢MACD与VAA动量混合最优策略): "
+            f"blends ChanPivotShiftMACD (trend structural breakout, base weight={chan_w:.0%}) "
+            f"with Vigilant Asset Allocation (VAA-G4 dual momentum regime crash protection). "
+            f"Mode={mode}, Defensive Boost={def_boost}."
+        )
+
+    def warmup_bars(self, params: dict = None) -> int:
+        return 252
+
