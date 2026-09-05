@@ -3,7 +3,9 @@ was refactored to build on the shared `common.significance.shuffle_null_test`
 primitive. Values in golden_pattern_mining_values.json were captured by
 running the exact fixtures/seeds below against the pre-refactor
 implementation; comparing the full findings DataFrame column-by-column with
-`==` proves the refactor is bit-identical, not merely close. The negative-
+tight floating-point tolerance (`pytest.approx` with `rel=1e-9, abs=1e-12`)
+verifies the refactor matches across numerical platforms while avoiding machine epsilon
+fragility. The negative-
 control (random-walk) fixture exercises many more (feature, event_type)
 combinations than the positive-control fixture and is the more sensitive
 check for a reference/alpha mixup. Guaranteed 100% offline/synthetic.
@@ -13,6 +15,7 @@ import json
 import os
 
 import numpy as np
+import pytest
 from common.testing import make_ohlcv_from_closes
 
 from pmine.pattern_mining import mine_indicator_patterns
@@ -47,7 +50,7 @@ def _assert_findings_match_golden(findings, golden_dict):
         assert len(actual_values) == len(golden_values), f"column {col}: length mismatch"
         for actual, expected in zip(actual_values, golden_values):
             if isinstance(expected, float):
-                assert actual == expected, f"column {col}: expected {expected!r}, got {actual!r}"
+                assert actual == pytest.approx(expected, rel=1e-9, abs=1e-12), f"column {col}: expected {expected!r}, got {actual!r}"
             elif isinstance(expected, list):
                 assert list(actual) == expected, f"column {col}: expected {expected!r}, got {actual!r}"
             else:

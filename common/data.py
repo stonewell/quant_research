@@ -508,3 +508,15 @@ def fetch_fund_metadata(symbol: str, provider: Union[str, BaseDataProvider, None
     prov = get_data_provider(provider, **kwargs)
     return prov.fetch_metadata(symbol)
 
+
+try:
+    from .financial_api import MarketDBDataProvider, FuyaoDataProvider
+
+    register_provider("marketdb", MarketDBDataProvider)
+    register_provider("fuyao", FuyaoDataProvider)
+    register_provider("financial_api", FuyaoDataProvider)
+    register_provider("hithink", FuyaoDataProvider)
+except Exception as _exc:
+    warnings.warn(f"Could not register Financial-API data providers: {_exc}")
+
+

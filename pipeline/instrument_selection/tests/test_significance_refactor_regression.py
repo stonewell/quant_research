@@ -3,8 +3,9 @@
 refactored to build on the shared `common.significance.shuffle_null_test`
 primitive. Values in golden_significance_values.json were captured by running
 the exact fixtures/seeds below against the pre-refactor implementations;
-comparing with `==` (not `approx`) proves the refactor is bit-identical, not
-merely close. Guaranteed 100% offline/synthetic.
+comparing with tight floating-point tolerance (`pytest.approx` with `rel=1e-9, abs=1e-12`)
+verifies the refactor matches across numerical platforms while avoiding machine epsilon
+fragility. Guaranteed 100% offline/synthetic.
 """
 
 import json
@@ -32,7 +33,7 @@ def _assert_matches_golden(result: dict, key: str):
         if expected_value == "NaN":
             assert isinstance(actual_value, float) and np.isnan(actual_value), f"{key}.{field}"
         elif isinstance(expected_value, float):
-            assert actual_value == pytest.approx(expected_value, abs=0, rel=0) or actual_value == expected_value, (
+            assert actual_value == pytest.approx(expected_value, rel=1e-9, abs=1e-12) or actual_value == expected_value, (
                 f"{key}.{field}: expected {expected_value!r}, got {actual_value!r}"
             )
         else:

@@ -52,7 +52,7 @@ def _fake_metadata(symbol, provider=None, **kwargs):
     })
 
 
-@patch("fundamental_screener.fscreen.fundamentals.fetch_fund_metadata", side_effect=_fake_metadata)
+@patch("fscreen.fundamentals.fetch_fund_metadata", side_effect=_fake_metadata)
 def test_main_writes_report_and_backtester_compatible_strategy_file(mock_fetch, tmp_path, monkeypatch):
     monkeypatch.setattr(rfs, "RESULTS_DIR", str(tmp_path))
     argv = [
