@@ -23,9 +23,10 @@ index. Don't duplicate a schema definition in a project README if it's already d
 ## 1. OHLCV DataFrame
 
 The universal price-data shape. Produced by every `BaseDataProvider` in `data.py`
-(`YFinanceDataProvider`, `CSVFolderDataProvider`, `SyntheticDataProvider`, `CachedDataProvider`) and
-by `common/testing.py`'s synthetic generators; consumed by every indicator function in
-`indicators.py`/`indicator_features.py` and every `AllocationTemplate`.
+(`YFinanceDataProvider`, `CSVFolderDataProvider`, `SyntheticDataProvider`, `CachedDataProvider`,
+`MarketDBDataProvider`, `FuyaoDataProvider`) and by `common/testing.py`'s synthetic generators;
+consumed by every indicator function in `indicators.py`/`indicator_features.py` and every
+`AllocationTemplate`.
 
 | | |
 |---|---|

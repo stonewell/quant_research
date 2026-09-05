@@ -10,7 +10,7 @@
 
 ## 1. OHLCV DataFrame
 
-通用价格数据结构。由 `data.py` 中的每个 `BaseDataProvider`（`YFinanceDataProvider`、`CSVFolderDataProvider`、`SyntheticDataProvider`、`CachedDataProvider`）及 `common/testing.py` 的合成生成器生成；被 `indicators.py`/`indicator_features.py` 中的每个指标函数及每个 `AllocationTemplate` 消费。
+通用价格数据结构。由 `data.py` 中的每个 `BaseDataProvider`（`YFinanceDataProvider`、`CSVFolderDataProvider`、`SyntheticDataProvider`、`CachedDataProvider`、`MarketDBDataProvider`、`FuyaoDataProvider`）及 `common/testing.py` 的合成生成器生成；被 `indicators.py`/`indicator_features.py` 中的每个指标函数及每个 `AllocationTemplate` 消费。
 
 | | |
 |---|---|
