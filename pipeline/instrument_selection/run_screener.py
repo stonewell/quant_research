@@ -43,6 +43,7 @@ from selectorbot import (
     screening,
     scoring,
     selection,
+    strategy_fit,
     volatility,
 )
 from common.reporting import utc_timestamp, write_json_report
@@ -78,6 +79,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--select-max-k", type=int, default=None,
                    help="optional cap on basket size for --select-method threshold/max_diversification "
                         "(which otherwise size themselves from the data)")
+    p.add_argument("--strategy", default=None,
+                   help="strategy key (e.g. 'chan_pivot_shift_macd', 'turtle_breakout_s1', 'dual_momentum'), "
+                        "class name, or style preset ('trend', 'mean_reversion', 'momentum', 'grid', 'multi_asset', 'volatility') "
+                        "to evaluate instrument fit against.")
+    p.add_argument("--strategy-file", default=None,
+                   help="path to a strategy JSON definition file (e.g. from strategy_dumps/ or results/strategy.json).")
+    p.add_argument("--no-simulation", action="store_true",
+                   help="skip single-asset empirical backtest simulation fit pass (use factor profile fit only).")
+    p.add_argument("--strategy-weight", type=float, default=0.40,
+                   help="weight of strategy_fit_score in overall_selection_score when a strategy is specified (default 0.40).")
     add_data_provider_cli_args(p)   # default_provider="yfinance" matches current default
     p.add_argument("--no-plots", action="store_true")
     return p
@@ -157,6 +168,51 @@ def main():
         print("  none excluded")
     data = {symbol: df for symbol, df in data.items() if symbol in metrics.index}
 
+    target_strategy = None
+    if args.strategy or args.strategy_file:
+        try:
+            target_strategy = strategy_fit.resolve_strategy_target(
+                strategy_name_or_key=args.strategy,
+                strategy_file=args.strategy_file,
+            )
+            print(f"\n=== Strategy Fit Target: {target_strategy.name} ===")
+            print(f"  Key/File:     {target_strategy.key}")
+            print(f"  Factor Tags:  {', '.join(target_strategy.factor_tags) if target_strategy.factor_tags else 'None'}")
+            print(f"  Style Label:  {target_strategy.style_label}")
+            print(f"  Description:  {target_strategy.description}")
+
+            # 1. Profile Fit
+            profile_fit_scores = strategy_fit.compute_strategy_profile_fit(
+                metrics,
+                factor_tags=target_strategy.factor_tags,
+                style_label=target_strategy.style_label,
+            )
+
+            # 2. Simulation Fit
+            sim_fit_df = None
+            if not args.no_simulation and target_strategy.strategy_instance is not None:
+                print(f"Running single-asset backtest simulation fit on {len(data)} instruments ...")
+                strat_cash_proxy = target_strategy.params.get("cash_proxy", "BIL")
+                sim_fit_df = strategy_fit.compute_strategy_simulation_fit(
+                    data,
+                    strategy_instance=target_strategy.strategy_instance,
+                    params=target_strategy.params,
+                    cash_proxy=strat_cash_proxy,
+                )
+
+            # 3. Combined Fit
+            strategy_fit_df = strategy_fit.compute_combined_strategy_fit(
+                profile_scores=profile_fit_scores,
+                sim_df=sim_fit_df,
+            )
+
+            for col in strategy_fit_df.columns:
+                metrics[col] = strategy_fit_df[col].reindex(metrics.index)
+
+        except Exception as e:
+            print(f"\n[WARNING] Strategy-fit evaluation failed: {e}. Proceeding with strategy-agnostic screening.")
+            target_strategy = None
+
     returns = correlation.returns_matrix(data)
     corr = correlation.correlation_matrix(returns)
     betas = correlation.beta_to_benchmark(returns, config.benchmark)
@@ -176,7 +232,11 @@ def main():
         metrics["expense_ratio"] = pd.to_numeric(meta_df["expense_ratio"], errors="coerce")
         metrics["total_assets"] = pd.to_numeric(meta_df["total_assets"], errors="coerce")
 
-    scored = scoring.score_universe(metrics, min_history_years_for_full_credit=config.min_history_years_for_full_credit)
+    scored = scoring.score_universe(
+        metrics,
+        min_history_years_for_full_credit=config.min_history_years_for_full_credit,
+        strategy_weight=args.strategy_weight if target_strategy is not None else None,
+    )
 
     pd.set_option("display.width", 160)
     pd.set_option("display.max_columns", 20)
@@ -197,6 +257,13 @@ def main():
                 "momentum_lookback_return", "pct_days_above_trend_ma", "momentum_label"]
     print(scored[[c for c in mom_cols if c in scored.columns]].round(3))
 
+    if target_strategy is not None and "strategy_fit_score" in scored.columns:
+        print(f"\n=== Strategy-Fit Evaluation: {target_strategy.name} ===")
+        fit_cols = ["strategy_fit_score", "strategy_profile_fit_score"]
+        if "sim_sharpe" in scored.columns:
+            fit_cols += ["sim_sharpe", "sim_cagr", "sim_max_dd", "sim_profit_factor", "sim_rebalances", "strategy_sim_fit_score"]
+        print(scored[[c for c in fit_cols if c in scored.columns]].sort_values(by="strategy_fit_score", ascending=False).round(3))
+
     print("\n=== Beta to benchmark ===")
     print(betas.round(2).sort_values(ascending=False))
 
@@ -213,8 +280,11 @@ def main():
     print(f"  spike ratio (stress/calm):              {regime_shift['spike_ratio']:.2f}x")
 
     print("\n=== Selection score components (0-100 each) ===")
-    score_cols = ["liquidity_score", "vol_adequacy_score", "predictability_score",
-                  "momentum_score", "candlestick_score", "diversification_score", "history_adequacy_score"]
+    score_cols = []
+    if "strategy_fit_score" in scored.columns:
+        score_cols.append("strategy_fit_score")
+    score_cols += ["liquidity_score", "vol_adequacy_score", "predictability_score",
+                   "momentum_score", "candlestick_score", "diversification_score", "history_adequacy_score"]
     if "etf_expense_score" in scored.columns:
         score_cols += ["etf_expense_score", "etf_aum_score"]
     print(scored[score_cols + ["overall_selection_score"]].round(1))
@@ -237,12 +307,39 @@ def main():
     print(f"\nSaved full report to {scored_path}")
 
     basket_json_path = os.path.join(RESULTS_DIR, "basket.json")
-    write_json_report({
+    basket_dict = {
         "basket": list(chosen),
         "method": args.select_method,
-        "date_generated": utc_timestamp()
-    }, basket_json_path)
+        "date_generated": utc_timestamp(),
+    }
+    if target_strategy is not None:
+        basket_dict["strategy_target"] = {
+            "name": target_strategy.name,
+            "key": target_strategy.key,
+            "style_label": target_strategy.style_label,
+            "factor_tags": target_strategy.factor_tags,
+        }
+    write_json_report(basket_dict, basket_json_path)
     print(f"Saved chosen basket to {basket_json_path}")
+
+    if target_strategy is not None and "strategy_fit_score" in scored.columns:
+        fit_summary_path = os.path.join(RESULTS_DIR, "strategy_fit_summary.json")
+        ranking_cols = [c for c in ["strategy_fit_score", "strategy_profile_fit_score", "strategy_sim_fit_score",
+                                    "sim_sharpe", "sim_cagr", "sim_max_dd", "overall_selection_score"] if c in scored.columns]
+        fit_summary_dict = {
+            "strategy_name": target_strategy.name,
+            "strategy_key": target_strategy.key,
+            "style_label": target_strategy.style_label,
+            "factor_tags": target_strategy.factor_tags,
+            "description": target_strategy.description,
+            "simulation_enabled": not args.no_simulation and (target_strategy.strategy_instance is not None),
+            "strategy_weight": args.strategy_weight,
+            "chosen_basket": list(chosen),
+            "instrument_fit_rankings": scored.sort_values(by="strategy_fit_score", ascending=False)[ranking_cols].to_dict(orient="index"),
+            "date_generated": utc_timestamp(),
+        }
+        write_json_report(fit_summary_dict, fit_summary_path)
+        print(f"Saved strategy fit summary to {fit_summary_path}")
 
     if not args.no_plots:
         p1 = plotting.plot_correlation_heatmap(corr)

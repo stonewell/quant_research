@@ -51,6 +51,19 @@ DEFAULT_WEIGHTS = {
     "etf_aum_score": 0.025,
 }
 
+STRATEGY_FIT_DEFAULT_WEIGHTS = {
+    "strategy_fit_score": 0.40,
+    "liquidity_score": 0.20,
+    "vol_adequacy_score": 0.15,
+    "diversification_score": 0.15,
+    "history_adequacy_score": 0.05,
+    "predictability_score": 0.02,
+    "momentum_score": 0.02,
+    "candlestick_score": 0.01,
+    "etf_expense_score": 0.025,
+    "etf_aum_score": 0.025,
+}
+
 
 def _pct_rank(series: pd.Series) -> pd.Series:
     # na_option="keep" (pandas' default) excludes NaN entries from both the
@@ -77,9 +90,22 @@ def _weighted_average(df: pd.DataFrame, weights: dict) -> pd.Series:
 
 
 def score_universe(metrics: pd.DataFrame, weights: dict = None,
-                    min_history_years_for_full_credit: float = 4.0) -> pd.DataFrame:
+                   min_history_years_for_full_credit: float = 4.0,
+                   strategy_weight: float = None) -> pd.DataFrame:
     df = metrics.copy()
-    weights = weights or DEFAULT_WEIGHTS
+    if weights is None:
+        if "strategy_fit_score" in df.columns:
+            weights = dict(STRATEGY_FIT_DEFAULT_WEIGHTS)
+            if strategy_weight is not None:
+                sw = max(min(float(strategy_weight), 0.95), 0.05)
+                rem = 1.0 - sw
+                other_sum = sum(v for k, v in STRATEGY_FIT_DEFAULT_WEIGHTS.items() if k != "strategy_fit_score")
+                weights = {"strategy_fit_score": sw}
+                for k, v in STRATEGY_FIT_DEFAULT_WEIGHTS.items():
+                    if k != "strategy_fit_score":
+                        weights[k] = (v / other_sum) * rem
+        else:
+            weights = DEFAULT_WEIGHTS
 
     # Liquidity: higher dollar volume is better, lower spread is better.
     df["liquidity_score"] = (

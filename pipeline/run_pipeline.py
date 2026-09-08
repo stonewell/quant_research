@@ -56,6 +56,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "instrument_selection/strategy_generator/backtester from their own "
              "'yfinance' default so one flag controls the whole run consistently. "
              "Pass 'yfinance' for a real end-to-end run.")
+    p.add_argument("--strategy", default=None,
+        help="Strategy key or style preset to pass to instrument_selection (step 2) for strategy-fit screening.")
+    p.add_argument("--strategy-file", default=None,
+        help="Strategy JSON file to pass to instrument_selection (step 2) for strategy-fit screening.")
     p.add_argument("--select-method",
         choices=["top_k", "cluster", "greedy", "threshold", "max_diversification"],
         default="threshold", help="instrument_selection --select-method passthrough (step 2).")
@@ -163,6 +167,12 @@ def main():
         step2_args = ["--universe", *args.universe] + step2_args
     if args.select_max_k is not None:
         step2_args += ["--select-max-k", str(args.select_max_k)]
+    if args.strategy:
+        step2_args += ["--strategy", args.strategy]
+    elif args.strategy_file:
+        step2_args += ["--strategy-file", args.strategy_file]
+    elif args.research_strategy and len(args.research_strategy) == 1:
+        step2_args += ["--strategy", args.research_strategy[0]]
 
     step3_args = ["--universe-file", BASKET_PATH, "--data-provider", args.data_provider]
 

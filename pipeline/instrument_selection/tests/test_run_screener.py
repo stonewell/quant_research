@@ -67,3 +67,86 @@ def test_max_diversification_respects_select_max_k_cap():
     args = build_arg_parser().parse_args(["--select-method", "max_diversification", "--select-max-k", "3"])
     chosen = select_basket(args, config, scored, corr)
     assert len(chosen) == 3
+
+
+def test_strategy_cli_args_parsing():
+    args = build_arg_parser().parse_args([])
+    assert args.strategy is None
+    assert args.strategy_file is None
+    assert args.no_simulation is False
+    assert args.strategy_weight == 0.40
+
+    args = build_arg_parser().parse_args([
+        "--strategy", "trend",
+        "--no-simulation",
+        "--strategy-weight", "0.50",
+    ])
+    assert args.strategy == "trend"
+    assert args.no_simulation is True
+    assert args.strategy_weight == 0.50
+
+
+def test_screener_main_runs_with_strategy_style_preset(monkeypatch, tmp_path):
+    import json
+    import run_screener
+
+    monkeypatch.setattr(run_screener, "RESULTS_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_screener.py",
+            "--data-provider", "synthetic",
+            "--universe", "SPY", "QQQ", "GLD", "TLT",
+            "--strategy", "trend",
+            "--no-plots",
+        ]
+    )
+    run_screener.main()
+
+    basket_path = tmp_path / "basket.json"
+    assert basket_path.exists()
+    with open(basket_path) as f:
+        data = json.load(f)
+    assert "strategy_target" in data
+    assert data["strategy_target"]["style_label"] == "trend"
+
+    fit_summary_path = tmp_path / "strategy_fit_summary.json"
+    assert fit_summary_path.exists()
+    with open(fit_summary_path) as f:
+        fit_data = json.load(f)
+    assert fit_data["strategy_name"] == "Trend-Following / Breakout Style"
+
+
+def test_screener_main_runs_with_strategy_file(monkeypatch, tmp_path):
+    import json
+    import run_screener
+
+    strat_file = tmp_path / "test_strat.json"
+    with open(strat_file, "w") as f:
+        json.dump({
+            "template_name": "equal_weight",
+            "name": "Test Strategy",
+            "params": {"rebalance_freq_days": 21},
+        }, f)
+
+    results_dir = tmp_path / "results"
+    monkeypatch.setattr(run_screener, "RESULTS_DIR", str(results_dir))
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_screener.py",
+            "--data-provider", "synthetic",
+            "--universe", "SPY", "QQQ", "GLD", "TLT",
+            "--strategy-file", str(strat_file),
+            "--no-plots",
+        ]
+    )
+    run_screener.main()
+
+    basket_path = results_dir / "basket.json"
+    assert basket_path.exists()
+    with open(basket_path) as f:
+        data = json.load(f)
+    assert "strategy_target" in data
+    assert data["strategy_target"]["name"] == "Test Strategy"
+
