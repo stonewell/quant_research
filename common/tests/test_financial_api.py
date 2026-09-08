@@ -25,8 +25,20 @@ from common.financial_api import (
     FuyaoDataProvider,
     MarketDBDataProvider,
     _resolve_duckdb_path,
+    is_etf_code,
     normalize_thscode,
 )
+
+
+def test_is_etf_code():
+    assert is_etf_code("510300.SH")
+    assert is_etf_code("560010.SH")
+    assert is_etf_code("588000.SH")
+    assert is_etf_code("159919.SZ")
+    assert is_etf_code("161725.SZ")
+    assert not is_etf_code("600519.SH")
+    assert not is_etf_code("000001.SZ")
+    assert not is_etf_code("SPY")
 
 
 def test_normalize_thscode():
@@ -269,10 +281,12 @@ def test_fuyao_provider_fetch_metadata_mocked():
         assert pytest.approx(meta["debt_to_equity"], rel=1e-3) == 0.25
 
 
-def test_provider_registration_and_caching(tmp_path):
-    # Test registered names
-    p_marketdb = get_data_provider("marketdb")
-    assert isinstance(p_marketdb, MarketDBDataProvider)
+def test_provider_registration_and_caching(tmp_path, in_memory_marketdb):
+    # Test registered names in registry
+    from common.data import _PROVIDER_REGISTRY
+    assert _PROVIDER_REGISTRY["marketdb"] is MarketDBDataProvider
+    assert _PROVIDER_REGISTRY["fuyao"] is FuyaoDataProvider
+    assert _PROVIDER_REGISTRY["financial_api"] is FuyaoDataProvider
 
     p_fuyao = get_data_provider("fuyao")
     assert isinstance(p_fuyao, FuyaoDataProvider)
@@ -280,8 +294,8 @@ def test_provider_registration_and_caching(tmp_path):
     p_fin = get_data_provider("financial_api")
     assert isinstance(p_fin, FuyaoDataProvider)
 
-    # Test CachedDataProvider wrapping
-    cached = CachedDataProvider(p_marketdb, cache_dir=str(tmp_path))
+    # Test CachedDataProvider wrapping using in-memory provider (100% offline, no real disk/network access)
+    cached = CachedDataProvider(in_memory_marketdb, cache_dir=str(tmp_path))
     df = cached.fetch_ohlcv("600519.SH", start="2024-01-01", end="2024-01-05")
     assert not df.empty
 

@@ -40,12 +40,16 @@ def _resolve_financial_api_path() -> Optional[str]:
         os.path.abspath(os.path.join(repo_root, "../../third-party/Financial-API")),
         os.path.abspath(os.path.join(repo_root, "../third-party/Financial-API")),
         os.path.abspath(os.path.join(repo_root, "third-party/Financial-API")),
-        "/home/stone/Work/third-party/Financial-API",
     ]
     for cand in candidates:
         if os.path.isdir(cand):
             return cand
     return None
+
+
+def is_etf_code(thscode: str) -> bool:
+    """True if thscode starts with known China A-share ETF/LOF prefixes."""
+    return thscode.startswith(("51", "56", "58", "15", "16"))
 
 
 def _load_env_file(env_path: str) -> None:
@@ -379,7 +383,7 @@ class FuyaoDataProvider(BaseDataProvider):
         self.prefer_local = prefer_local
         self.api_key = api_key
 
-        if self.api_key:
+        if self.api_key and os.environ.get("HITHINK_FINANCE_API_KEY") != self.api_key:
             os.environ["HITHINK_FINANCE_API_KEY"] = self.api_key
 
         self._local_provider: Optional[MarketDBDataProvider] = None
@@ -418,7 +422,7 @@ class FuyaoDataProvider(BaseDataProvider):
 
         items: List[dict] = []
         is_index = thscode.endswith(".TI") or thscode in _INDEX_CODES
-        is_etf = thscode.startswith(("51", "56", "58", "15", "16"))
+        is_etf = is_etf_code(thscode)
 
         try:
             import fuyao_client
@@ -534,7 +538,7 @@ class FuyaoDataProvider(BaseDataProvider):
         except ImportError:
             return result
 
-        is_etf = thscode.startswith(("51", "56", "58", "15", "16"))
+        is_etf = is_etf_code(thscode)
         if is_etf:
             try:
                 profile = fuyao_client.fund_profile_detail(thscode=thscode, fund_type="exchange")

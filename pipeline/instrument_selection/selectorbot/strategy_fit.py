@@ -18,10 +18,10 @@ into the overall selection score and discrete basket selection.
 """
 
 from dataclasses import dataclass, field
-import json
 import os
 import sys
 from typing import Any, Dict, List, Optional, Tuple
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -29,14 +29,14 @@ import pandas as pd
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-for _group in ("pipeline", "ml"):
-    _group_dir = os.path.join(_REPO_ROOT, _group)
-    if _group_dir not in sys.path:
-        sys.path.insert(0, _group_dir)
+_pipeline_dir = os.path.join(_REPO_ROOT, "pipeline")
+if _pipeline_dir not in sys.path:
+    sys.path.insert(0, _pipeline_dir)
 
 from common.allocation_backtester import run_allocation_backtest
 from common.allocation_templates import ALLOCATION_TEMPLATES, AllocationTemplate
 from common.strategy_spec import get_template, load_strategy_file
+from .scoring import _pct_rank
 
 
 STYLE_PRESETS: Dict[str, Dict[str, Any]] = {
@@ -103,16 +103,6 @@ class StrategyTarget:
     strategy_instance: Optional[Any] = None
     params: dict = field(default_factory=dict)
     is_style_preset: bool = False
-
-
-def _pct_rank(series: pd.Series) -> pd.Series:
-    """Helper to compute percentile rank in [0.0, 1.0]."""
-    if series.empty:
-        return series
-    s = series.dropna()
-    if len(s) <= 1 or s.nunique() <= 1:
-        return pd.Series(0.5, index=series.index)
-    return series.rank(pct=True).fillna(0.5)
 
 
 def _infer_style_label(factor_tags: List[str]) -> str:
@@ -501,7 +491,8 @@ def compute_strategy_simulation_fit(
                 "sim_turnover": turnover,
                 "sim_traded": traded,
             }
-        except Exception:
+        except Exception as exc:
+            warnings.warn(f"Simulation fit failed for symbol {sym}: {exc}")
             results[sym] = {
                 "sim_sharpe": 0.0,
                 "sim_cagr": 0.0,

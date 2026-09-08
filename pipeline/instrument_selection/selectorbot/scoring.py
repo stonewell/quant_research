@@ -54,8 +54,8 @@ DEFAULT_WEIGHTS = {
 STRATEGY_FIT_DEFAULT_WEIGHTS = {
     "strategy_fit_score": 0.40,
     "liquidity_score": 0.20,
-    "vol_adequacy_score": 0.15,
-    "diversification_score": 0.15,
+    "vol_adequacy_score": 0.125,
+    "diversification_score": 0.125,
     "history_adequacy_score": 0.05,
     "predictability_score": 0.02,
     "momentum_score": 0.02,
@@ -72,6 +72,15 @@ def _pct_rank(series: pd.Series) -> pd.Series:
     # one symbol's missing data can't silently compress everyone else's
     # percentile scores. (na_option="bottom" would count NaNs in the
     # denominator while still giving them the top rank -- wrong on both counts.)
+    if series.empty:
+        return series
+    s = series.dropna()
+    if len(s) == 0:
+        return pd.Series(np.nan, index=series.index)
+    if len(s) <= 1 or s.nunique() <= 1:
+        res = pd.Series(0.5, index=series.index)
+        res[series.isna()] = np.nan
+        return res
     return series.rank(pct=True)
 
 

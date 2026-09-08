@@ -397,6 +397,9 @@ def test_chan_vaa_compound_regime_adaptive_and_fixed_modes():
     # Regime adaptive with gate in defensive
     w_gated = strat.generate_weights(universe, params={"chan_vaa_mode": "regime_adaptive", "chan_vaa_gate_chan_in_defensive": True})
     assert not w_gated.empty
+    daily_gated = w_gated.reindex(universe["SPY"].index).ffill().fillna(0.0)
+    assert daily_gated["BIL"].max() > 0.0, "defensive periods must hold BIL rather than zeroing out cash"
+    assert (daily_gated.sum(axis=1) <= 1.0 + 1e-5).all()
 
 
 def test_chan_vaa_compound_warmup_and_explain():

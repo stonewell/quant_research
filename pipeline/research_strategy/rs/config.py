@@ -350,7 +350,6 @@ class StrategyConfig:
     chanm_adv_use_trend_gate: bool = True
     chanm_adv_trend_ma_period: int = 200
     chanm_adv_suppress_top_div_in_uptrend: bool = True
-    chanm_adv_top_k: Optional[int] = 3
     chanm_adv_trailing_activate_pct: Optional[float] = 0.08
     chanm_adv_trailing_stop_pct: Optional[float] = 0.04
 

@@ -974,16 +974,34 @@ class ChanVaaCompoundStrategy(AllocationTemplate):
                         # Scale down Chan exposure by 50% (or cap at 30%) and allocate balance to defensive asset
                         c_weights = (chan_scaled.loc[date] * 0.5) if date in chan_scaled.index else pd.Series(0.0, index=symbols)
                         c_sum = c_weights.sum()
-                        def_alloc = max(1.0 - c_sum, 0.70)
+                        if c_sum > 0.30:
+                            c_weights = c_weights * (0.30 / c_sum)
+                            c_sum = 0.30
+                        def_alloc = max(0.0, 1.0 - c_sum)
                         for sym in symbols:
                             output_weights.loc[date, sym] = c_weights.get(sym, 0.0) + v_weights.get(sym, 0.0) * def_alloc
                     else:
                         c_weights = chan_scaled.loc[date] if date in chan_scaled.index else pd.Series(0.0, index=symbols)
                         c_sum = c_weights.sum()
                         for sym in symbols:
-                            output_weights.loc[date, sym] = c_weights.get(sym, 0.0) * chan_weight + v_weights.get(sym, 0.0) * (1.0 - chan_weight)
+                            output_weights.loc[date, sym] = c_weights.get(sym, 0.0) * chan_weight + v_weights.get(sym, 0.0) * (1.0 - chan_weight * c_sum)
 
-        output_weights = _cap_and_deroute_to_cash(output_weights, symbols, cash_proxy)
+        # Scale down if total allocation exceeds 1.0, and route unallocated capital to cash_proxy
+        risky_cols = [s for s in symbols if s != cash_proxy]
+        current_cash = output_weights[cash_proxy].copy() if cash_proxy in symbols else 0.0
+        risky_daily = output_weights[risky_cols].copy()
+
+        total_alloc = risky_daily.sum(axis=1) + current_cash
+        scale = np.where(total_alloc > 1.0, 1.0 / total_alloc, 1.0)
+        risky_daily = risky_daily.mul(scale, axis=0)
+        current_cash = current_cash * scale
+
+        if cash_proxy in symbols:
+            output_weights[risky_cols] = risky_daily
+            output_weights[cash_proxy] = current_cash + np.maximum(0.0, 1.0 - (risky_daily.sum(axis=1) + current_cash))
+        else:
+            output_weights = risky_daily
+
         output_weights = _fill_out_columns(output_weights, symbols)
         return _sparse_from_daily(output_weights)
 

@@ -6,7 +6,7 @@ with a generic non-finite-float guard.
 """
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Union
 
 import numpy as np
@@ -38,7 +38,7 @@ def format_weights_pct(sparse_weights: pd.DataFrame, n: int, suffix: str = "%") 
 def utc_timestamp() -> str:
     """Current UTC time as an ISO-8601 string with a trailing 'Z', e.g.
     '2026-08-19T00:00:00.000000Z'."""
-    return datetime.utcnow().isoformat() + "Z"
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 
 def _sanitize(value):
