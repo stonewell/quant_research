@@ -82,6 +82,9 @@ from .chan_lesson_strategies import (
     ChanPivotOscillationStrategy,
     ChanPivotShiftMACDAdvStrategy,
 )
+from .bollinger_strategy import BollingerBandsStrategy
+from .taa_strategies import DefensiveAssetAllocationStrategy, HybridAssetAllocationStrategy
+from .residual_momentum_strategy import ResidualMomentumStrategy
 from .config import StrategyConfig
 from .nl_parser import ParsedStrategySpec, parse_plain_english_strategy
 
@@ -2003,6 +2006,7 @@ STRATEGY_CLASS_MAP = {
     "AdaptiveAssetAllocation": AdaptiveAssetAllocation,
     "AdaptiveGridStrategy": AdaptiveGridStrategy,
     "AllWeatherStrategy": AllWeatherStrategy,
+    "BollingerBandsStrategy": BollingerBandsStrategy,
     "ChanBestSelectorStrategy": ChanBestSelectorStrategy,
     "ChanCompositeStrategy": ChanCompositeStrategy,
     "ChanFailedRetestBuyStrategy": ChanFailedRetestBuyStrategy,
@@ -2015,18 +2019,21 @@ STRATEGY_CLASS_MAP = {
     "ChanPivotShiftStrategy": ChanPivotShiftStrategy,
     "ChanThreeTypeStrategy": ChanThreeTypeStrategy,
     "ChanTrendThirdBuyStrategy": ChanTrendThirdBuyStrategy,
+    "ChanVaaCompoundStrategy": ChanVaaCompoundStrategy,
     "CompounderMarginOfSafetyStrategy": CompounderMarginOfSafetyStrategy,
+    "DefensiveAssetAllocationStrategy": DefensiveAssetAllocationStrategy,
     "EnsembleRegimeSwitchingStrategy": EnsembleRegimeSwitchingStrategy,
     "GoldenButterflyStrategy": GoldenButterflyStrategy,
     "HFEAStrategy": HFEAStrategy,
+    "HybridAssetAllocationStrategy": HybridAssetAllocationStrategy,
     "NaturalLanguageStrategy": NaturalLanguageStrategy,
     "PermanentPortfolioStrategy": PermanentPortfolioStrategy,
     "ProtectiveAssetAllocation": ProtectiveAssetAllocation,
     "RSIMeanReversionStrategy": RSIMeanReversionStrategy,
+    "ResidualMomentumStrategy": ResidualMomentumStrategy,
     "SwingTrendPullbackStrategy": SwingTrendPullbackStrategy,
     "TurtleBreakoutStrategy": TurtleBreakoutStrategy,
     "VigilantAssetAllocation": VigilantAssetAllocation,
-    "ChanVaaCompoundStrategy": ChanVaaCompoundStrategy,
 }
 
 

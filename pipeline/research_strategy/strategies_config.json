@@ -486,5 +486,89 @@
       "aaa_corr_lookback": 126
     },
     "factors": ["relative_momentum", "correlation_diversification"]
+  },
+  "bollinger_breakout": {
+    "name": "Bollinger Bands Squeeze Breakout (Method I)",
+    "type": "class",
+    "class_name": "BollingerBandsStrategy",
+    "description": "John Bollinger Method I volatility squeeze breakout: monitors 126d BandWidth compression into bottom 20% quantile, enters on upper band breakout with 200d SMA trend filter, exits on 20d SMA mid-band or trailing stop.",
+    "parameters": {
+      "bb_mode": "breakout",
+      "bb_period": 20,
+      "bb_num_std": 2.0,
+      "bb_squeeze_lookback": 126,
+      "bb_squeeze_quantile": 0.20,
+      "bb_require_trend_filter": true,
+      "bb_trend_ma_period": 200,
+      "bb_stop_loss_pct": 0.06,
+      "bb_trailing_stop_pct": 0.04,
+      "bb_trailing_activate_pct": 0.06,
+      "bb_max_holding_days": 63,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["absolute_momentum_trend", "volatility_targeting", "regime_trend_strength"]
+  },
+  "bollinger_mean_reversion": {
+    "name": "Bollinger Bands Mean Reversion (Method III)",
+    "type": "class",
+    "class_name": "BollingerBandsStrategy",
+    "description": "John Bollinger Method III statistical mean reversion: enters oversold dips when %B < 0 with RSI(14) < 35 oversold filter in macro bull trend, exits upon 20d SMA mid-band mean reversion.",
+    "parameters": {
+      "bb_mode": "mean_reversion",
+      "bb_period": 20,
+      "bb_num_std": 2.0,
+      "bb_rsi_filter": true,
+      "bb_rsi_period": 14,
+      "bb_rsi_oversold": 35.0,
+      "bb_require_trend_filter": true,
+      "bb_trend_ma_period": 200,
+      "bb_stop_loss_pct": 0.06,
+      "bb_max_holding_days": 63,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["mean_reversion", "absolute_momentum_trend"]
+  },
+  "hybrid_asset_allocation": {
+    "name": "Hybrid Asset Allocation (HAA)",
+    "type": "class",
+    "class_name": "HybridAssetAllocationStrategy",
+    "description": "Keller & Keuning (2023, SSRN #4346906) dual momentum strategy using TIP canary to switch between top 4 offensive global assets and leading defensive asset (IEF vs BIL), with crash diversion.",
+    "parameters": {
+      "haa_canary_symbol": "TIP",
+      "haa_top_k": 4,
+      "haa_rebalance_freq_days": 21,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["relative_momentum", "absolute_momentum_trend", "breadth"]
+  },
+  "defensive_asset_allocation": {
+    "name": "Defensive Asset Allocation (DAA)",
+    "type": "class",
+    "class_name": "DefensiveAssetAllocationStrategy",
+    "description": "Keller & Keuning (2018, SSRN #3212862) graduated crash protection strategy using dual canaries (VWO, BND) for 3-tier cash fraction allocation (0%, 50%, 100%) across 12 global assets.",
+    "parameters": {
+      "daa_top_k": 6,
+      "daa_rebalance_freq_days": 21,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["breadth", "relative_momentum", "absolute_momentum_trend"]
+  },
+  "residual_momentum": {
+    "name": "Residual Momentum Strategy",
+    "type": "class",
+    "class_name": "ResidualMomentumStrategy",
+    "description": "Blitz, Huij & Martens (2011) + Barroso & Santa-Clara (2015) idiosyncratic momentum: extracts benchmark-neutral alpha via 252d rolling OLS regression (skipping 21d), selects top 3 assets, and scales exposure by 12% target volatility.",
+    "parameters": {
+      "resmom_lookback_days": 252,
+      "resmom_skip_days": 21,
+      "resmom_benchmark_symbol": "SPY",
+      "resmom_top_k": 3,
+      "resmom_target_vol": 0.12,
+      "resmom_rebalance_freq_days": 21,
+      "resmom_require_trend_filter": true,
+      "resmom_trend_ma_period": 200,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["relative_momentum", "volatility_targeting", "absolute_momentum_trend"]
   }
 }

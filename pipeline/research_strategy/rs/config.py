@@ -65,6 +65,15 @@ DEFAULT_PAA_PROTECTION_SYMBOL = "IEF"
 # 10-asset reproduction against real market data.
 DEFAULT_AAA_UNIVERSE = ["SPY", "EFA", "EEM", "VNQ", "IEF", "TLT", "DBC", "GLD"]
 
+# Hybrid Asset Allocation (HAA, Keller & Keuning 2023) universes.
+DEFAULT_HAA_OFFENSIVE = ["SPY", "IWM", "EFA", "EEM", "VNQ", "DBC", "IEF", "TLT"]
+DEFAULT_HAA_DEFENSIVE = ["IEF", "BIL"]
+
+# Defensive Asset Allocation (DAA, Keller & Keuning 2018) universes.
+DEFAULT_DAA_CANARY = ["VWO", "BND"]
+DEFAULT_DAA_RISKY = ["SPY", "QQQ", "IWM", "EFA", "EEM", "VNQ", "DBC", "GLD", "TLT", "HYG", "LQD"]
+DEFAULT_DAA_DEFENSIVE = ["IEF", "LQD", "BIL"]
+
 
 @dataclass
 class StrategyConfig:
@@ -417,6 +426,48 @@ class StrategyConfig:
     cms_max_volatility: float = 0.30
     cms_required_return: float = 0.12       # doc's normal-environment buy hurdle
 
+    # --- Bollinger Bands Trading Strategy (John Bollinger Methods I & III) ---
+    bb_period: int = 20
+    bb_num_std: float = 2.0
+    bb_mode: str = "breakout"                # "breakout" (Method I Squeeze) or "mean_reversion" (%B + RSI)
+    bb_squeeze_lookback: int = 126           # ~6 months for rolling BandWidth quantile
+    bb_squeeze_quantile: float = 0.20        # Squeeze defined as bottom 20% BandWidth
+    bb_require_trend_filter: bool = True     # 200-day SMA macro trend gate
+    bb_trend_ma_period: int = 200
+    bb_rsi_filter: bool = True               # RSI confirmation for mean reversion
+    bb_rsi_period: int = 14
+    bb_rsi_oversold: float = 35.0
+    bb_exit_mode: str = "mid_band"           # "mid_band" (20 SMA) or "opposite_band"
+    bb_stop_loss_pct: Optional[float] = 0.06
+    bb_trailing_stop_pct: Optional[float] = 0.04
+    bb_trailing_activate_pct: Optional[float] = 0.06
+    bb_max_holding_days: Optional[int] = 63
+    bb_position_size_pct: float = 1.0
+
+    # --- Hybrid Asset Allocation (HAA, Keller & Keuning 2023, SSRN #4346906) ---
+    haa_canary_symbol: str = "TIP"
+    haa_top_k: int = 4
+    haa_offensive_universe: List[str] = field(default_factory=lambda: list(DEFAULT_HAA_OFFENSIVE))
+    haa_defensive_universe: List[str] = field(default_factory=lambda: list(DEFAULT_HAA_DEFENSIVE))
+    haa_rebalance_freq_days: int = 21
+
+    # --- Defensive Asset Allocation (DAA, Keller & Keuning 2018, SSRN #3212862) ---
+    daa_canary_universe: List[str] = field(default_factory=lambda: list(DEFAULT_DAA_CANARY))
+    daa_top_k: int = 6
+    daa_risky_universe: List[str] = field(default_factory=lambda: list(DEFAULT_DAA_RISKY))
+    daa_defensive_universe: List[str] = field(default_factory=lambda: list(DEFAULT_DAA_DEFENSIVE))
+    daa_rebalance_freq_days: int = 21
+
+    # --- Residual Momentum Strategy (Blitz, Huij & Martens 2011; Barroso & Santa-Clara 2015) ---
+    resmom_lookback_days: int = 252          # ~12 months regression & standardization window
+    resmom_skip_days: int = 21               # Skip most recent 1 month to prevent short-term reversal
+    resmom_benchmark_symbol: str = "SPY"
+    resmom_top_k: int = 3
+    resmom_target_vol: float = 0.12          # 12% annualized target volatility
+    resmom_rebalance_freq_days: int = 21
+    resmom_require_trend_filter: bool = True
+    resmom_trend_ma_period: int = 200
+
     # Backtester execution defaults
     initial_capital: float = 100_000.0
     commission_pct: float = 0.0005          # 5 bps
@@ -493,6 +544,34 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.chanm_adv_min_strokes must be >= 3, got {self.chanm_adv_min_strokes}")
         if self.chan_vaa_rebalance_freq_days <= 0:
             raise ValueError(f"StrategyConfig.chan_vaa_rebalance_freq_days must be > 0, got {self.chan_vaa_rebalance_freq_days}")
+        if self.bb_period <= 0:
+            raise ValueError(f"StrategyConfig.bb_period must be > 0, got {self.bb_period}")
+        if self.bb_squeeze_lookback <= 0:
+            raise ValueError(f"StrategyConfig.bb_squeeze_lookback must be > 0, got {self.bb_squeeze_lookback}")
+        if not (0.0 <= self.bb_squeeze_quantile <= 1.0):
+            raise ValueError(f"StrategyConfig.bb_squeeze_quantile must be between 0 and 1, got {self.bb_squeeze_quantile}")
+        if self.bb_trend_ma_period <= 0:
+            raise ValueError(f"StrategyConfig.bb_trend_ma_period must be > 0, got {self.bb_trend_ma_period}")
+        if self.bb_rsi_period <= 0:
+            raise ValueError(f"StrategyConfig.bb_rsi_period must be > 0, got {self.bb_rsi_period}")
+        if self.haa_top_k <= 0:
+            raise ValueError(f"StrategyConfig.haa_top_k must be > 0, got {self.haa_top_k}")
+        if self.haa_rebalance_freq_days <= 0:
+            raise ValueError(f"StrategyConfig.haa_rebalance_freq_days must be > 0, got {self.haa_rebalance_freq_days}")
+        if self.daa_top_k <= 0:
+            raise ValueError(f"StrategyConfig.daa_top_k must be > 0, got {self.daa_top_k}")
+        if self.daa_rebalance_freq_days <= 0:
+            raise ValueError(f"StrategyConfig.daa_rebalance_freq_days must be > 0, got {self.daa_rebalance_freq_days}")
+        if self.resmom_lookback_days <= 0:
+            raise ValueError(f"StrategyConfig.resmom_lookback_days must be > 0, got {self.resmom_lookback_days}")
+        if self.resmom_skip_days < 0:
+            raise ValueError(f"StrategyConfig.resmom_skip_days must be >= 0, got {self.resmom_skip_days}")
+        if self.resmom_lookback_days <= self.resmom_skip_days:
+            raise ValueError(f"StrategyConfig.resmom_lookback_days ({self.resmom_lookback_days}) must be > resmom_skip_days ({self.resmom_skip_days})")
+        if self.resmom_top_k <= 0:
+            raise ValueError(f"StrategyConfig.resmom_top_k must be > 0, got {self.resmom_top_k}")
+        if self.resmom_rebalance_freq_days <= 0:
+            raise ValueError(f"StrategyConfig.resmom_rebalance_freq_days must be > 0, got {self.resmom_rebalance_freq_days}")
 
     @classmethod
     def from_dict(cls, data: dict) -> "StrategyConfig":
