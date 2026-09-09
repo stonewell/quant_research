@@ -109,6 +109,57 @@ def _weekly_regime_state(bars: pd.DataFrame, min_gap_bars: int, min_strokes: int
     return weekly_regime.reindex(combined_index).ffill().fillna(False).reindex(bars.index).ffill().fillna(False)
 
 
+def _failed_retest_confirmed(bars: pd.DataFrame, sig: pd.DataFrame, confirm_window_bars: int) -> pd.Series:
+    """Lesson 108's precise bottom definition + "下探失败买" rule
+    (1104-486e105c0100abkx-108.md): rather than entering on the raw
+    `first_buy` (B1) MACD-divergence bottom itself, only confirms entry once
+    a SECOND bottom fractal (顶分型/底分型) within `confirm_window_bars`
+    merged bars fails to make a new low relative to the bottom fractal
+    nearest the `first_buy` signal (a failed retest of the low). Returns a
+    boolean series aligned to `bars.index`, True only on the later
+    confirmation bar, never on the original `first_buy` bar itself.
+
+    Simplification (disclosed): `classify_points` doesn't expose the exact
+    fractal a first-type point's own bottom corresponds to, so the nearest
+    PRECEDING bottom fractal is used as a proxy for "the bottom this B1
+    divergence was fished from".
+    """
+    confirmed = pd.Series(False, index=bars.index)
+    first_buy = sig["first_buy"].reindex(bars.index).fillna(False)
+    if not first_buy.any():
+        return confirmed
+
+    merged = merge_inclusion(bars)
+    fractals = find_fractals(merged)
+    bottom_fractals = fractals[fractals["kind"] == "bottom"]
+    if bottom_fractals.empty:
+        return confirmed
+
+    merged_pos_by_ts = {ts: i for i, ts in enumerate(merged.index)}
+
+    for ts in first_buy.index[first_buy]:
+        if ts not in merged_pos_by_ts:
+            continue
+        signal_pos = merged_pos_by_ts[ts]
+        prior_bottoms = bottom_fractals[bottom_fractals["pos"] < signal_pos]
+        if prior_bottoms.empty:
+            continue
+        first_bottom_price = float(prior_bottoms.iloc[-1]["price"])
+
+        later_bottoms = bottom_fractals[
+            (bottom_fractals["pos"] >= signal_pos)
+            & (bottom_fractals["pos"] <= signal_pos + confirm_window_bars)
+        ]
+        for _, later in later_bottoms.iterrows():
+            if float(later["price"]) > first_bottom_price:
+                confirm_pos = int(later["pos"]) + 1
+                if confirm_pos < len(merged):
+                    confirmed.loc[merged.index[confirm_pos]] = True
+                break
+
+    return confirmed
+
+
 def _precise_trend_confirmed(sig: pd.DataFrame) -> pd.Series:
     """Lesson 107's precise trend definition (1092-...-107.md): 'hold and
     sleep' only once a pivot has produced a genuine, non-divergent 3rd-buy
@@ -501,14 +552,15 @@ class ChanTrendThirdBuyStrategy(AllocationTemplate):
 
 
 class ChanMeanReversionDivergenceStrategy(AllocationTemplate):
-    """Chan Mean-Reversion Divergence Strategy (一类买卖点背驰与防狼术策略):
+    """Chan Mean-Reversion Divergence Strategy (一类买卖点背驰与防狼术策略 / 下探失败买):
     Contrarian bottom-fishing strategy focusing on 1st-type buy points (B1) triggered by MACD
-    histogram area/peak divergence after a downward trend. Only enters once MACD (DIF/DEA)
-    has reclaimed the zero axis, per Lesson 103's actual '防狼术' rule (0952-...-103.md:
-    avoid any market whose MACD lines sit below the zero axis; only re-enter once it
-    re-stands on it) -- trades some bottom-timing edge for the lesson's own disclosed
-    defensive discipline. Also incorporates strict tight-risk exit controls: tight
-    stop-loss, quick profit target, trailing stop, and holding period cap.
+    histogram area/peak divergence after a downward trend. Supports modular entry confirmation modes:
+    - 'raw_b1': Enters directly on MACD histogram divergence first-buy signal.
+    - 'zero_axis': Only enters once MACD (DIF/DEA) reclaims the zero axis (Lesson 103 '防狼术').
+    - 'failed_retest': Confirms entry once a second dip fails to make a new low (Lesson 108 '下探失败买').
+    - 'combined': Requires both failed retest and MACD zero-axis reclaim.
+    Optionally gates entries behind a long-term SMA trend filter (e.g. 200d SMA).
+    Incorporates strict risk controls: stop-loss, profit target, trailing stop, and max holding timeout.
     """
 
     def __init__(self, config: StrategyConfig = None):
@@ -524,6 +576,11 @@ class ChanMeanReversionDivergenceStrategy(AllocationTemplate):
         macd_fast = p.get("chan_mrd_macd_fast", cfg.chan_mrd_macd_fast)
         macd_slow = p.get("chan_mrd_macd_slow", cfg.chan_mrd_macd_slow)
         macd_signal = p.get("chan_mrd_macd_signal", cfg.chan_mrd_macd_signal)
+        entry_mode = p.get("chan_mrd_entry_mode", getattr(cfg, "chan_mrd_entry_mode", "zero_axis"))
+        confirm_window_bars = p.get("chan_mrd_confirm_window_bars", getattr(cfg, "chan_mrd_confirm_window_bars", 20))
+        require_trend_filter = p.get("chan_mrd_require_trend_filter", getattr(cfg, "chan_mrd_require_trend_filter", False))
+        trend_ma_period = p.get("chan_mrd_trend_ma_period", getattr(cfg, "chan_mrd_trend_ma_period", 200))
+
         stop_loss_pct = p.get("chan_mrd_stop_loss_pct", cfg.chan_mrd_stop_loss_pct)
         profit_target_pct = p.get("chan_mrd_profit_target_pct", cfg.chan_mrd_profit_target_pct)
         trailing_stop_pct = p.get("chan_mrd_trailing_stop_pct", cfg.chan_mrd_trailing_stop_pct)
@@ -545,8 +602,27 @@ class ChanMeanReversionDivergenceStrategy(AllocationTemplate):
                 bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes,
                 macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal,
             )
-            zero_axis_ok = _macd_zero_axis_confirmed(bars["Close"], macd_fast, macd_slow, macd_signal).reindex(master_index).fillna(False)
-            entry_signal = sig["first_buy"].reindex(master_index).fillna(False) & zero_axis_ok
+            raw_first_buy = sig["first_buy"].reindex(master_index).fillna(False)
+
+            if entry_mode == "raw_b1":
+                entry_signal = raw_first_buy
+            elif entry_mode == "zero_axis":
+                zero_axis_ok = _macd_zero_axis_confirmed(bars["Close"], macd_fast, macd_slow, macd_signal).reindex(master_index).fillna(False)
+                entry_signal = raw_first_buy & zero_axis_ok
+            elif entry_mode == "failed_retest":
+                entry_signal = _failed_retest_confirmed(bars, sig, confirm_window_bars).reindex(master_index).fillna(False)
+            elif entry_mode == "combined":
+                retest_ok = _failed_retest_confirmed(bars, sig, confirm_window_bars).reindex(master_index).fillna(False)
+                zero_axis_ok = _macd_zero_axis_confirmed(bars["Close"], macd_fast, macd_slow, macd_signal).reindex(master_index).fillna(False)
+                entry_signal = retest_ok & zero_axis_ok
+            else:
+                entry_signal = raw_first_buy
+
+            if require_trend_filter:
+                trend_ma = sma(bars["Close"], trend_ma_period).reindex(master_index)
+                trend_ok = (bars["Close"].reindex(master_index) > trend_ma).fillna(False)
+                entry_signal = entry_signal & trend_ok
+
             exit_signal = sig["sell_signal"].reindex(master_index).fillna(False)
             close = bars["Close"].reindex(master_index)
 
@@ -570,11 +646,12 @@ class ChanMeanReversionDivergenceStrategy(AllocationTemplate):
     def explain_weights(self, params: dict = None) -> str:
         cfg = self.config
         p = params or {}
+        entry_mode = p.get("chan_mrd_entry_mode", getattr(cfg, "chan_mrd_entry_mode", "zero_axis"))
+        trend_req = p.get("chan_mrd_require_trend_filter", getattr(cfg, "chan_mrd_require_trend_filter", False))
         return (
-            "Chan Mean-Reversion Divergence Strategy (一类买卖点背驰与防狼术): "
-            "longs active risky symbols on 1st-type buy points (B1 - MACD histogram divergence after downward trend) "
-            "only once MACD (DIF/DEA) has reclaimed the zero axis, per Lesson 103's actual 防狼术 rule; "
-            "applies strict tight risk management (stop-loss, profit target, trailing stop, max holding cap)."
+            f"Chan Mean-Reversion Divergence Strategy (一类买卖点背驰与防狼术 / 下探失败买): "
+            f"entry_mode='{entry_mode}', trend_filter={trend_req}; longs active risky symbols on 1st-type buy points "
+            f"with configured entry filters and tight risk management (stop-loss, profit target, trailing stop, holding timeout)."
         )
 
     def warmup_bars(self, params: dict = None) -> int:
@@ -584,8 +661,15 @@ class ChanMeanReversionDivergenceStrategy(AllocationTemplate):
         min_strokes = p.get("chan_mrd_min_strokes", cfg.chan_mrd_min_strokes)
         macd_slow = p.get("chan_mrd_macd_slow", cfg.chan_mrd_macd_slow)
         macd_signal = p.get("chan_mrd_macd_signal", cfg.chan_mrd_macd_signal)
+        entry_mode = p.get("chan_mrd_entry_mode", getattr(cfg, "chan_mrd_entry_mode", "zero_axis"))
+        confirm_window_bars = p.get("chan_mrd_confirm_window_bars", getattr(cfg, "chan_mrd_confirm_window_bars", 20))
+        require_trend_filter = p.get("chan_mrd_require_trend_filter", getattr(cfg, "chan_mrd_require_trend_filter", False))
+        trend_ma_period = p.get("chan_mrd_trend_ma_period", getattr(cfg, "chan_mrd_trend_ma_period", 200))
+
         structural = (min_strokes**2) * 2 * (min_gap_bars + 2) + 2 * (min_gap_bars + 2)
-        return max(structural, macd_slow + macd_signal + 10)
+        extra_window = confirm_window_bars if entry_mode in ("failed_retest", "combined") else 0
+        ma_period = trend_ma_period if require_trend_filter else 0
+        return max(structural, macd_slow + macd_signal + 10, ma_period) + extra_window
 
 
 class ChanCompositeStrategy(AllocationTemplate):
@@ -696,9 +780,11 @@ class ChanBestSelectorStrategy(AllocationTemplate):
             ChanPivotShiftStrategy,
             ChanThreeTypeStrategy,
         )
+        from .chan_lesson_strategies import ChanPivotShiftMACDAdvStrategy
         return {
             "chan_pivot_shift": ChanPivotShiftStrategy(cfg),
             "chan_pivot_shift_macd": ChanPivotShiftMACDStrategy(cfg),
+            "chan_pivot_shift_macd_adv": ChanPivotShiftMACDAdvStrategy(cfg),
             "chan_three_type": ChanThreeTypeStrategy(cfg),
             "chan_mtf_trend": ChanMultiTimeframeTrendStrategy(cfg),
             "chan_trend_third_buy": ChanTrendThirdBuyStrategy(cfg),
@@ -791,7 +877,7 @@ class ChanBestSelectorStrategy(AllocationTemplate):
         p = params or {}
         return (
             "Chan Best Selector Meta-Strategy (动态最佳缠论策略选择器): "
-            f"evaluates 7 Chan strategies in parallel, evaluates rolling trailing {p.get('chan_best_metric', cfg.chan_best_metric)} "
+            f"evaluates 8 Chan strategies in parallel, evaluates rolling trailing {p.get('chan_best_metric', cfg.chan_best_metric)} "
             f"over a {p.get('chan_best_lookback_days', cfg.chan_best_lookback_days)}-day lookback window, and dynamically routes "
             "100% of allocation to the top-performing Chan strategy."
         )

@@ -267,7 +267,7 @@ def test_mean_reversion_divergence_suppresses_entry_below_macd_zero_axis(monkeyp
 
     monkeypatch.setattr(cas, "compute_chan3_signals", fake_sig)
 
-    cfg = StrategyConfig()
+    cfg = StrategyConfig(chan_mrd_entry_mode="zero_axis", chan_mrd_require_trend_filter=False)
     strat = cas.ChanMeanReversionDivergenceStrategy(cfg)
     weights = strat.generate_weights(universe)
     daily = weights.reindex(idx).ffill().fillna(0.0)
@@ -410,6 +410,25 @@ def test_chan_vaa_compound_warmup_and_explain():
     explanation = strat.explain_weights()
     assert "Chan Pivot Shift MACD + VAA Optimal Compound Strategy" in explanation
     assert "Vigilant Asset Allocation" in explanation
+
+
+def test_chan_mrd_modes_and_trend_filter():
+    from research_strategy.rs import chan_advanced_strategies as cas
+
+    n = 250
+    idx = pd.bdate_range("2020-01-01", periods=n)
+    closes = np.full(n, 100.0)
+    bars = pd.DataFrame({"Open": closes, "High": closes + 0.5, "Low": closes - 0.5, "Close": closes}, index=idx)
+    universe = {"SPY": bars, "BIL": bars.copy()}
+
+    cfg = StrategyConfig(chan_mrd_entry_mode="failed_retest", chan_mrd_require_trend_filter=True)
+    strat = cas.ChanMeanReversionDivergenceStrategy(cfg)
+    assert strat.warmup_bars() >= 200
+    assert "failed_retest" in strat.explain_weights()
+
+    for mode in ["raw_b1", "zero_axis", "failed_retest", "combined"]:
+        w = strat.generate_weights(universe, params={"chan_mrd_entry_mode": mode, "chan_mrd_require_trend_filter": False})
+        assert isinstance(w, pd.DataFrame)
 
 
 # --- Integration Tests: strategies_config.json Discovery -------------------

@@ -304,11 +304,15 @@ class StrategyConfig:
     chan_mrd_macd_fast: int = 12
     chan_mrd_macd_slow: int = 26
     chan_mrd_macd_signal: int = 9
+    chan_mrd_entry_mode: str = "raw_b1"   # "raw_b1", "zero_axis", "failed_retest", "combined"
+    chan_mrd_confirm_window_bars: int = 20
+    chan_mrd_require_trend_filter: bool = True
+    chan_mrd_trend_ma_period: int = 200
     chan_mrd_stop_loss_pct: Optional[float] = 0.05
     chan_mrd_profit_target_pct: Optional[float] = 0.15
     chan_mrd_trailing_stop_pct: Optional[float] = 0.04
     chan_mrd_trailing_activate_pct: Optional[float] = 0.08
-    chan_mrd_max_holding_days: Optional[int] = 45
+    chan_mrd_max_holding_days: Optional[int] = 30
     chan_mrd_position_size_pct: float = 1.0
 
     # --- Chan Composite (Multi-Stage Position Scaling B1/B2/B3) ---
@@ -385,24 +389,6 @@ class StrategyConfig:
     fibo_top_k: int = 3
     fibo_min_tier: int = 3
     fibo_rebalance_freq_days: int = 21
-
-    # --- Chan Failed-Retest Buy (Lesson 108, 1104-...-108.md): a stricter
-    # B1 variant that only confirms entry once a SECOND dip fails to make a
-    # new low relative to the first bottom fractal (下探失败买 -- a failed
-    # retest of the low), rather than entering on the raw first_buy
-    # divergence bottom. See rs/chan_lesson_strategies.py. ---
-    failed_retest_min_gap_bars: int = 4
-    failed_retest_min_strokes: int = 3
-    failed_retest_macd_fast: int = 12
-    failed_retest_macd_slow: int = 26
-    failed_retest_macd_signal: int = 9
-    failed_retest_confirm_window_bars: int = 20
-    failed_retest_stop_loss_pct: Optional[float] = 0.05
-    failed_retest_profit_target_pct: Optional[float] = 0.15
-    failed_retest_trailing_stop_pct: Optional[float] = 0.04
-    failed_retest_trailing_activate_pct: Optional[float] = 0.08
-    failed_retest_max_holding_days: Optional[int] = 45
-    failed_retest_position_size_pct: float = 1.0
 
     # --- Compounder Margin-of-Safety (price-proxy adaptation of a
     # conservative value-investing community's valuation framework, see
@@ -528,10 +514,10 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.pivot_osc_min_gap_bars must be > 0, got {self.pivot_osc_min_gap_bars}")
         if self.pivot_osc_min_strokes < 3:
             raise ValueError(f"StrategyConfig.pivot_osc_min_strokes must be >= 3, got {self.pivot_osc_min_strokes}")
-        if self.failed_retest_min_gap_bars <= 0:
-            raise ValueError(f"StrategyConfig.failed_retest_min_gap_bars must be > 0, got {self.failed_retest_min_gap_bars}")
-        if self.failed_retest_min_strokes < 3:
-            raise ValueError(f"StrategyConfig.failed_retest_min_strokes must be >= 3, got {self.failed_retest_min_strokes}")
+        if self.chan_mrd_confirm_window_bars <= 0:
+            raise ValueError(f"StrategyConfig.chan_mrd_confirm_window_bars must be > 0, got {self.chan_mrd_confirm_window_bars}")
+        if self.chan_mrd_trend_ma_period <= 0:
+            raise ValueError(f"StrategyConfig.chan_mrd_trend_ma_period must be > 0, got {self.chan_mrd_trend_ma_period}")
         if self.fibo_top_k <= 0:
             raise ValueError(f"StrategyConfig.fibo_top_k must be > 0, got {self.fibo_top_k}")
         if not (0 <= self.fibo_min_tier <= 8):

@@ -25,13 +25,12 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from research_strategy.rs.chan_advanced_strategies import _failed_retest_confirmed
 from research_strategy.rs.chan_lesson_strategies import (
-    ChanFailedRetestBuyStrategy,
     ChanFiboSectorStrengthStrategy,
     ChanPivotOscillationStrategy,
     ChanPivotShiftMACDAdvStrategy,
     _FIBO_PERIODS,
-    _failed_retest_confirmed,
     compute_fibo_tier,
     compute_pivot_oscillation_signals,
 )
@@ -123,7 +122,7 @@ def test_compute_fibo_tier_matches_direct_sma_computation():
 # --- _failed_retest_confirmed (Lesson 108) ------------------------------------
 
 def test_failed_retest_confirmed_only_fires_on_a_higher_second_low(monkeypatch):
-    import research_strategy.rs.chan_lesson_strategies as cls_mod
+    import research_strategy.rs.chan_advanced_strategies as cas_mod
 
     n = 20
     idx = pd.bdate_range("2020-01-01", periods=n)
@@ -139,8 +138,8 @@ def test_failed_retest_confirmed_only_fires_on_a_higher_second_low(monkeypatch):
         ]
     )
 
-    monkeypatch.setattr(cls_mod, "merge_inclusion", lambda df: merged)
-    monkeypatch.setattr(cls_mod, "find_fractals", lambda m: fractals)
+    monkeypatch.setattr(cas_mod, "merge_inclusion", lambda df: merged)
+    monkeypatch.setattr(cas_mod, "find_fractals", lambda m: fractals)
 
     first_buy = pd.Series(False, index=idx)
     first_buy.iloc[4] = True  # confirm bar right after the pos=3 bottom fractal
@@ -208,18 +207,6 @@ def test_chan_fibo_sector_strength_rotates_into_top_tier_symbols():
     daily = weights.reindex(idx).ffill().fillna(0.0)
     assert (daily["STRONG"].iloc[250:] > 0).any()
     assert not (daily["WEAK"].iloc[250:] > 0).any()
-
-
-def test_chan_failed_retest_buy_strategy_execution():
-    cfg = StrategyConfig()
-    strat = ChanFailedRetestBuyStrategy(cfg)
-
-    assert strat.warmup_bars() > 0
-    assert "下探失败买" in strat.explain_weights()
-
-    universe = create_mock_universe(n_days=300)
-    weights = strat.generate_weights(universe)
-    assert isinstance(weights, pd.DataFrame)
 
 
 # --- ChanPivotShiftMACDAdvStrategy --------------------------------------------
@@ -389,7 +376,6 @@ def test_chan_pivot_shift_macd_adv_coincidence_sizing(monkeypatch):
 @pytest.mark.parametrize("key", [
     "chan_pivot_oscillation",
     "chan_fibo_sector_strength",
-    "chan_failed_retest_buy",
     "chan_pivot_shift_macd_adv",
 ])
 def test_instantiate_strategy_from_config(key: str):

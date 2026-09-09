@@ -12,11 +12,7 @@ beyond the buy/sell-point basics already implemented in `chan_structure.py`/
    how many Fibonacci-period SMAs it trades above, then rotates capital
    into the strongest tier(s). A cross-sectional selection/rotation
    strategy, not single-symbol timing.
-3. `ChanFailedRetestBuyStrategy`: Lesson 108's precise bottom definition +
-   "下探失败买" rule -- only confirms a B1 entry once a second dip fails to
-   make a new low relative to the first bottom fractal (a failed retest of
-   the low), rather than entering on the raw divergence bottom itself.
-4. `ChanPivotShiftMACDAdvStrategy`: an enhanced SIBLING of
+3. `ChanPivotShiftMACDAdvStrategy`: an enhanced SIBLING of
    `ChanPivotShiftMACDStrategy` (`rs/strategy.py`, left completely
    untouched) -- layers 3 already-built overlays (MACD zero-axis entry gate,
    weekly 区间套 re-confirmation, dangerous pivot-relation exit brake) plus a
@@ -152,57 +148,6 @@ def compute_fibo_tier(close: pd.Series) -> pd.Series:
     return tier
 
 
-def _failed_retest_confirmed(bars: pd.DataFrame, sig: pd.DataFrame, confirm_window_bars: int) -> pd.Series:
-    """Lesson 108's precise bottom definition + "下探失败买" rule
-    (1104-486e105c0100abkx-108.md): rather than entering on the raw
-    `first_buy` (B1) MACD-divergence bottom itself, only confirms entry once
-    a SECOND bottom fractal (顶分型/底分型) within `confirm_window_bars`
-    merged bars fails to make a new low relative to the bottom fractal
-    nearest the `first_buy` signal (a failed retest of the low). Returns a
-    boolean series aligned to `bars.index`, True only on the later
-    confirmation bar, never on the original `first_buy` bar itself.
-
-    Simplification (disclosed): `classify_points` doesn't expose the exact
-    fractal a first-type point's own bottom corresponds to, so the nearest
-    PRECEDING bottom fractal is used as a proxy for "the bottom this B1
-    divergence was fished from".
-    """
-    confirmed = pd.Series(False, index=bars.index)
-    first_buy = sig["first_buy"].reindex(bars.index).fillna(False)
-    if not first_buy.any():
-        return confirmed
-
-    merged = merge_inclusion(bars)
-    fractals = find_fractals(merged)
-    bottom_fractals = fractals[fractals["kind"] == "bottom"]
-    if bottom_fractals.empty:
-        return confirmed
-
-    merged_pos_by_ts = {ts: i for i, ts in enumerate(merged.index)}
-
-    for ts in first_buy.index[first_buy]:
-        if ts not in merged_pos_by_ts:
-            continue
-        signal_pos = merged_pos_by_ts[ts]
-        prior_bottoms = bottom_fractals[bottom_fractals["pos"] < signal_pos]
-        if prior_bottoms.empty:
-            continue
-        first_bottom_price = float(prior_bottoms.iloc[-1]["price"])
-
-        later_bottoms = bottom_fractals[
-            (bottom_fractals["pos"] >= signal_pos)
-            & (bottom_fractals["pos"] <= signal_pos + confirm_window_bars)
-        ]
-        for _, later in later_bottoms.iterrows():
-            if float(later["price"]) > first_bottom_price:
-                confirm_pos = int(later["pos"]) + 1
-                if confirm_pos < len(merged):
-                    confirmed.loc[merged.index[confirm_pos]] = True
-                break
-
-    return confirmed
-
-
 class ChanPivotOscillationStrategy(AllocationTemplate):
     """Chan Pivot-Oscillation Monitor Strategy (中枢震荡监视器策略, Lesson 92):
     Tracks each pivot's sub-swing midpoint (Zn) drift relative to the
@@ -333,93 +278,6 @@ class ChanFiboSectorStrengthStrategy(AllocationTemplate):
 
     def warmup_bars(self, params: dict = None) -> int:
         return max(_FIBO_PERIODS) + 10
-
-
-class ChanFailedRetestBuyStrategy(AllocationTemplate):
-    """Chan Failed-Retest Buy Strategy (下探失败买策略, Lesson 108): a stricter
-    B1 variant that only confirms entry once a second dip fails to make a
-    new low relative to the first bottom fractal (a failed retest of the
-    low, per Lesson 108's precise bottom definition), rather than entering
-    on the raw first_buy MACD-divergence bottom itself. Exits via the same
-    tight '防狼术'-style risk controls as `ChanMeanReversionDivergenceStrategy`
-    (`run_mrd_position_exit`).
-    """
-
-    def __init__(self, config: StrategyConfig = None):
-        self.config = config or StrategyConfig()
-        super().__init__(name="chan_failed_retest_buy", param_grid={})
-
-    def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
-        cfg = self.config
-        p = params or {}
-        cash_proxy = p.get("cash_proxy", cfg.cash_proxy)
-        min_gap_bars = p.get("failed_retest_min_gap_bars", cfg.failed_retest_min_gap_bars)
-        min_strokes = p.get("failed_retest_min_strokes", cfg.failed_retest_min_strokes)
-        macd_fast = p.get("failed_retest_macd_fast", cfg.failed_retest_macd_fast)
-        macd_slow = p.get("failed_retest_macd_slow", cfg.failed_retest_macd_slow)
-        macd_signal_period = p.get("failed_retest_macd_signal", cfg.failed_retest_macd_signal)
-        confirm_window_bars = p.get("failed_retest_confirm_window_bars", cfg.failed_retest_confirm_window_bars)
-        stop_loss_pct = p.get("failed_retest_stop_loss_pct", cfg.failed_retest_stop_loss_pct)
-        profit_target_pct = p.get("failed_retest_profit_target_pct", cfg.failed_retest_profit_target_pct)
-        trailing_stop_pct = p.get("failed_retest_trailing_stop_pct", cfg.failed_retest_trailing_stop_pct)
-        trailing_activate_pct = p.get("failed_retest_trailing_activate_pct", cfg.failed_retest_trailing_activate_pct)
-        max_holding_days = p.get("failed_retest_max_holding_days", cfg.failed_retest_max_holding_days)
-        position_size_pct = p.get("failed_retest_position_size_pct", cfg.failed_retest_position_size_pct)
-
-        symbols = list(universe.keys())
-        risky_symbols = _get_risky_symbols_helper(universe, params, cfg_symbol=None, cfg_risky_universe=None, cash_proxy=cash_proxy)
-        if not risky_symbols:
-            return pd.DataFrame()
-
-        master_index = _aligned_master_index_helper(universe, risky_symbols)
-        raw_weights = {}
-
-        for sym in risky_symbols:
-            bars = universe[sym]
-            sig = compute_chan3_signals(
-                bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes,
-                macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal_period,
-            )
-            entry_signal = _failed_retest_confirmed(bars, sig, confirm_window_bars).reindex(master_index).fillna(False)
-            exit_signal = sig["sell_signal"].reindex(master_index).fillna(False)
-            close = bars["Close"].reindex(master_index)
-
-            raw_weights[sym] = run_mrd_position_exit(
-                close=close,
-                entry_signal=entry_signal,
-                exit_signal=exit_signal,
-                stop_loss_pct=stop_loss_pct,
-                profit_target_pct=profit_target_pct,
-                trailing_stop_pct=trailing_stop_pct,
-                trailing_activate_pct=trailing_activate_pct,
-                max_holding_days=max_holding_days,
-                position_size_pct=position_size_pct,
-            )
-
-        daily = pd.DataFrame(raw_weights, index=master_index)
-        daily = _cap_and_deroute_to_cash(daily, symbols, cash_proxy)
-        daily = _fill_out_columns(daily, symbols)
-        return _sparse_from_daily(daily)
-
-    def explain_weights(self, params: dict = None) -> str:
-        return (
-            "Chan Failed-Retest Buy Strategy (下探失败买, Lesson 108): "
-            "longs active risky symbols only once a second dip fails to make a new low relative to the "
-            "bottom fractal nearest a B1 MACD-divergence signal (a failed retest of the low), rather "
-            "than entering on the raw divergence bottom itself; applies the same tight risk management "
-            "as ChanMeanReversionDivergenceStrategy (stop-loss, profit target, trailing stop, max holding cap)."
-        )
-
-    def warmup_bars(self, params: dict = None) -> int:
-        cfg = self.config
-        p = params or {}
-        min_gap_bars = p.get("failed_retest_min_gap_bars", cfg.failed_retest_min_gap_bars)
-        min_strokes = p.get("failed_retest_min_strokes", cfg.failed_retest_min_strokes)
-        macd_slow = p.get("failed_retest_macd_slow", cfg.failed_retest_macd_slow)
-        macd_signal_period = p.get("failed_retest_macd_signal", cfg.failed_retest_macd_signal)
-        confirm_window_bars = p.get("failed_retest_confirm_window_bars", cfg.failed_retest_confirm_window_bars)
-        structural = (min_strokes**2) * 2 * (min_gap_bars + 2) + 2 * (min_gap_bars + 2)
-        return max(structural, macd_slow + macd_signal_period + 10) + confirm_window_bars
 
 
 def _weekly_pivot_macd_regime_state(

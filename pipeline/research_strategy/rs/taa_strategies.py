@@ -1,17 +1,23 @@
-"""Tactical Asset Allocation (TAA) Strategies: HAA and DAA.
+"""Tactical Asset Allocation (TAA) Strategies: VAA, DAA, and HAA.
 
-1. Hybrid Asset Allocation (HAA):
-   Wouter J. Keller & Jan Willem Keuning (2023, SSRN #4346906).
-   A streamlined dual-momentum model with a single canary asset (TIP).
-   Switches between 100% offensive allocation (top 4 of 8 global assets)
-   and 100% defensive allocation (IEF vs BIL) based on TIP's 13612W momentum.
-   Includes Keller's dual-momentum crash diversion for offensive assets with negative momentum.
+Unified Keller & Keuning TAA family sharing the 13612W momentum and canary defense engine:
+1. Vigilant Asset Allocation (VAA-G4):
+   Wouter J. Keller & Jan Willem Keuning (2017, SSRN #3002624).
+   Uses offensive universe breadth (all 4 assets > 0) to rotate into top offensive asset,
+   otherwise 100% into top defensive asset.
 
 2. Defensive Asset Allocation (DAA):
    Wouter J. Keller & Jan Willem Keuning (2018, SSRN #3212862).
    A multi-tier crash protection model using dual canary assets (VWO and BND).
    Dynamically scales Cash Fraction (0%, 50%, 100%) based on canary momentum breadth,
    allocating across 12 risky assets and 3 defensive assets (IEF, LQD, BIL).
+
+3. Hybrid Asset Allocation (HAA):
+   Wouter J. Keller & Jan Willem Keuning (2023, SSRN #4346906).
+   A streamlined dual-momentum model with a single canary asset (TIP).
+   Switches between 100% offensive allocation (top 4 of 8 global assets)
+   and 100% defensive allocation (IEF vs BIL) based on TIP's 13612W momentum.
+   Includes Keller's dual-momentum crash diversion for offensive assets with negative momentum.
 """
 
 from typing import Dict, List, Optional
@@ -48,7 +54,127 @@ def score_13612w(close: pd.Series) -> pd.Series:
     return 12 * roc(close, 21) + 4 * roc(close, 63) + 2 * roc(close, 126) + roc(close, 252)
 
 
-class HybridAssetAllocationStrategy(AllocationTemplate):
+class CanaryAssetAllocationBase(AllocationTemplate):
+    """Base class for Keller & Keuning's Tactical Asset Allocation (TAA) strategies:
+    VAA (2017), DAA (2018), and HAA (2023).
+
+    Shared mechanisms:
+    1. 13612W momentum scoring (12*r_1m + 4*r_3m + 2*r_6m + 1*r_12m).
+    2. Synchronized master date indexing and periodic rebalance scheduling.
+    3. Defensive asset selection (picking the highest scoring positive defensive asset,
+       or defaulting to cash proxy).
+    4. Dual-momentum crash diversion: diverting slots with non-positive scores to safe assets.
+    """
+
+    def __init__(self, name: str, config: Optional[StrategyConfig] = None):
+        self.config = config or StrategyConfig()
+        super().__init__(name=name, param_grid={})
+
+    def _compute_13612w_scores(
+        self,
+        universe: Dict[str, pd.DataFrame],
+        tracked_symbols: List[str],
+        master_index: pd.DatetimeIndex,
+    ) -> pd.DataFrame:
+        scores_dict = {}
+        for sym in tracked_symbols:
+            if sym in universe and "Close" in universe[sym].columns:
+                scores_dict[sym] = score_13612w(universe[sym]["Close"]).reindex(master_index)
+        return pd.DataFrame(scores_dict, index=master_index)
+
+    def _select_best_defensive(
+        self,
+        date_scores: pd.Series,
+        defensive_symbols: List[str],
+        cash_proxy: Optional[str] = None,
+        symbols: Optional[List[str]] = None,
+        require_positive: bool = True,
+    ) -> Optional[str]:
+        all_syms = symbols if symbols is not None else list(date_scores.index)
+        best_def = cash_proxy if cash_proxy and cash_proxy in all_syms else (defensive_symbols[0] if defensive_symbols else None)
+        valid_def = date_scores[defensive_symbols].dropna() if defensive_symbols else pd.Series(dtype=float)
+        if not valid_def.empty:
+            candidate = valid_def.idxmax()
+            if not require_positive or valid_def[candidate] > 0:
+                best_def = candidate
+            elif cash_proxy and cash_proxy in all_syms:
+                best_def = cash_proxy
+            else:
+                best_def = candidate
+        return best_def
+
+    def warmup_bars(self, params: Optional[dict] = None) -> int:
+        return 252
+
+
+class VigilantAssetAllocation(CanaryAssetAllocationBase):
+    """Vigilant Asset Allocation (VAA-G4).
+
+    Wouter J. Keller & Jan Willem Keuning (2017, SSRN #3002624).
+    Uses offensive universe breadth (all assets in offensive universe must have 13612W > 0)
+    to hold 100% in the single highest-scoring offensive asset; otherwise rotates 100%
+    into the single highest-scoring defensive asset.
+    """
+
+    def __init__(self, config: Optional[StrategyConfig] = None):
+        super().__init__(name="vigilant_asset_allocation", config=config)
+
+    def generate_weights(self, universe: Dict[str, pd.DataFrame], params: Optional[dict] = None) -> pd.DataFrame:
+        cfg = self.config
+        p = params or {}
+        rebal_freq = p.get("rebalance_freq_days", cfg.rebalance_freq_days)
+        offensive_universe = p.get("vaa_offensive_universe", cfg.vaa_offensive_universe)
+        defensive_universe = p.get("vaa_defensive_universe", cfg.vaa_defensive_universe)
+
+        symbols = list(universe.keys())
+        if not symbols:
+            return pd.DataFrame()
+
+        master_index = universe[symbols[0]].index
+        rebalance_dates = _get_rebalance_dates(master_index, rebal_freq)
+
+        offensive_symbols = [s for s in offensive_universe if s in symbols]
+        defensive_symbols = [s for s in defensive_universe if s in symbols]
+        all_tracked = list(dict.fromkeys(offensive_symbols + defensive_symbols))
+
+        scores = self._compute_13612w_scores(universe, all_tracked, master_index)
+
+        weights_rebal = pd.DataFrame(index=rebalance_dates, columns=symbols, data=0.0)
+
+        for date in rebalance_dates:
+            off_scores = scores.loc[date, offensive_symbols].dropna() if offensive_symbols else pd.Series(dtype=float)
+            if len(off_scores) < len(offensive_symbols):
+                continue
+
+            if not off_scores.empty and (off_scores > 0).all():
+                weights_rebal.loc[date, off_scores.idxmax()] = 1.0
+            else:
+                def_scores = scores.loc[date, defensive_symbols].dropna() if defensive_symbols else pd.Series(dtype=float)
+                if not def_scores.empty:
+                    weights_rebal.loc[date, def_scores.idxmax()] = 1.0
+
+        weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
+        weights_df.loc[rebalance_dates] = weights_rebal
+        return weights_df
+
+    def explain_weights(self, params: Optional[dict] = None) -> str:
+        cfg = self.config
+        p = params or {}
+        offensive_universe = p.get("vaa_offensive_universe", cfg.vaa_offensive_universe)
+        defensive_universe = p.get("vaa_defensive_universe", cfg.vaa_defensive_universe)
+        return (
+            f"Vigilant Asset Allocation -- VAA-G4 (Keller & Keuning 2017): Rebalances every "
+            f"{p.get('rebalance_freq_days', cfg.rebalance_freq_days)} days. "
+            f"Reasoning: Scores each asset via the 13612W formula (a 12/4/2/1-weighted blend of "
+            f"1/3/6/12-month returns). If every offensive asset ({', '.join(offensive_universe)}) scores "
+            f"positive, holds 100% of the single highest-scoring one. Otherwise rotates fully into the "
+            f"single highest-scoring defensive asset ({', '.join(defensive_universe)}). Fully concentrated, "
+            f"no diversification within the chosen sleeve. NOTE: offensive/defensive tickers here are "
+            f"illustrative, not a verified reproduction of the original paper's universe (see class docstring)."
+        )
+
+
+class HybridAssetAllocationStrategy(CanaryAssetAllocationBase):
     """Hybrid Asset Allocation (HAA, Keller & Keuning 2023).
 
     Uses TIP (TIPS bond ETF) as a single canary asset to toggle between offensive and defensive regimes:
@@ -62,8 +188,7 @@ class HybridAssetAllocationStrategy(AllocationTemplate):
     """
 
     def __init__(self, config: Optional[StrategyConfig] = None):
-        self.config = config or StrategyConfig()
-        super().__init__(name="hybrid_asset_allocation", param_grid={})
+        super().__init__(name="hybrid_asset_allocation", config=config)
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: Optional[dict] = None) -> pd.DataFrame:
         cfg = self.config
@@ -91,12 +216,7 @@ class HybridAssetAllocationStrategy(AllocationTemplate):
         master_index = _aligned_master_index_helper(universe, all_tracked if all_tracked else symbols)
         rebalance_dates = _get_rebalance_dates(master_index, rebal_freq)
 
-        # Precompute 13612W scores for all tracked assets
-        scores_dict = {}
-        for sym in all_tracked:
-            scores_dict[sym] = score_13612w(universe[sym]["Close"])
-        scores_df = pd.DataFrame(scores_dict, index=master_index)
-
+        scores_df = self._compute_13612w_scores(universe, all_tracked, master_index)
         weights_rebal = pd.DataFrame(index=rebalance_dates, columns=symbols, data=0.0)
 
         for date in rebalance_dates:
@@ -104,19 +224,9 @@ class HybridAssetAllocationStrategy(AllocationTemplate):
                 continue
 
             date_scores = scores_df.loc[date]
-
-            # Best defensive asset on this date
-            best_def = cash_proxy if cash_proxy in symbols else (defensive_symbols[0] if defensive_symbols else None)
-            valid_def_scores = date_scores[defensive_symbols].dropna() if defensive_symbols else pd.Series(dtype=float)
-            if not valid_def_scores.empty:
-                candidate_def = valid_def_scores.idxmax()
-                # Keller rule: only hold defensive asset if its score > 0, else cash_proxy
-                if valid_def_scores[candidate_def] > 0:
-                    best_def = candidate_def
-                elif cash_proxy in symbols:
-                    best_def = cash_proxy
-                else:
-                    best_def = candidate_def
+            best_def = self._select_best_defensive(
+                date_scores, defensive_symbols, cash_proxy=cash_proxy, symbols=symbols, require_positive=True
+            )
 
             # Check canary status
             canary_score = date_scores.get(canary_sym, np.nan)
@@ -128,7 +238,6 @@ class HybridAssetAllocationStrategy(AllocationTemplate):
                 canary_bullish = len(valid_off) > 0 and (valid_off > 0).mean() >= 0.5
 
             if canary_bullish and offensive_symbols:
-                # Offensive mode: pick top K offensive assets
                 valid_off = date_scores[offensive_symbols].dropna()
                 if not valid_off.empty:
                     ranked_off = valid_off.sort_values(ascending=False)
@@ -140,7 +249,7 @@ class HybridAssetAllocationStrategy(AllocationTemplate):
                         if sc > 0:
                             weights_rebal.loc[date, sym] += slot_weight
                         else:
-                            # Dual-momentum crash diversion: divert to best defensive asset
+                            # Dual-momentum crash diversion
                             if best_def and best_def in symbols:
                                 weights_rebal.loc[date, best_def] += slot_weight
                 else:
@@ -168,11 +277,8 @@ class HybridAssetAllocationStrategy(AllocationTemplate):
             f"In bear mode ({canary} <= 0), shifts 100% to leading defensive asset (IEF vs BIL)."
         )
 
-    def warmup_bars(self, params: Optional[dict] = None) -> int:
-        return 252
 
-
-class DefensiveAssetAllocationStrategy(AllocationTemplate):
+class DefensiveAssetAllocationStrategy(CanaryAssetAllocationBase):
     """Defensive Asset Allocation (DAA, Keller & Keuning 2018).
 
     Uses dual canary assets (VWO and BND) to implement graduated crash protection:
@@ -185,8 +291,7 @@ class DefensiveAssetAllocationStrategy(AllocationTemplate):
     """
 
     def __init__(self, config: Optional[StrategyConfig] = None):
-        self.config = config or StrategyConfig()
-        super().__init__(name="defensive_asset_allocation", param_grid={})
+        super().__init__(name="defensive_asset_allocation", config=config)
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: Optional[dict] = None) -> pd.DataFrame:
         cfg = self.config
@@ -215,12 +320,7 @@ class DefensiveAssetAllocationStrategy(AllocationTemplate):
         master_index = _aligned_master_index_helper(universe, all_tracked if all_tracked else symbols)
         rebalance_dates = _get_rebalance_dates(master_index, rebal_freq)
 
-        # Precompute 13612W scores
-        scores_dict = {}
-        for sym in all_tracked:
-            scores_dict[sym] = score_13612w(universe[sym]["Close"])
-        scores_df = pd.DataFrame(scores_dict, index=master_index)
-
+        scores_df = self._compute_13612w_scores(universe, all_tracked, master_index)
         weights_rebal = pd.DataFrame(index=rebalance_dates, columns=symbols, data=0.0)
 
         for date in rebalance_dates:
@@ -228,29 +328,18 @@ class DefensiveAssetAllocationStrategy(AllocationTemplate):
                 continue
 
             date_scores = scores_df.loc[date]
-
-            # Best defensive asset
-            best_def = cash_proxy if cash_proxy in symbols else (defensive_symbols[0] if defensive_symbols else None)
-            valid_def_scores = date_scores[defensive_symbols].dropna() if defensive_symbols else pd.Series(dtype=float)
-            if not valid_def_scores.empty:
-                candidate_def = valid_def_scores.idxmax()
-                if valid_def_scores[candidate_def] > 0:
-                    best_def = candidate_def
-                elif cash_proxy in symbols:
-                    best_def = cash_proxy
-                else:
-                    best_def = candidate_def
+            best_def = self._select_best_defensive(
+                date_scores, defensive_symbols, cash_proxy=cash_proxy, symbols=symbols, require_positive=True
+            )
 
             # Count canary signals with momentum <= 0
             if canary_symbols:
                 canary_scores = date_scores[canary_symbols].dropna()
                 bad_canaries = int((canary_scores <= 0).sum())
-                # If some canaries are missing due to NaN, scale bad count proportionally
                 if len(canary_scores) < len(canary_symbols) and len(canary_scores) > 0:
                     bad_ratio = bad_canaries / len(canary_scores)
                     bad_canaries = int(round(bad_ratio * len(canary_symbols)))
             else:
-                # If no canaries are in universe, use risky breadth
                 valid_risky = date_scores[risky_symbols].dropna() if risky_symbols else pd.Series(dtype=float)
                 if not valid_risky.empty:
                     pos_pct = (valid_risky > 0).mean()
@@ -317,10 +406,6 @@ class DefensiveAssetAllocationStrategy(AllocationTemplate):
         return (
             f"Defensive Asset Allocation (DAA, Keller & Keuning 2018): rebalances every {rebal} days. "
             f"Monitors dual canaries ({canary_str}) via 13612W momentum for graduated crash defense. "
-            f"0 bad canaries -> 100% in top {top_k} risky assets. "
-            f"1 bad canary -> 50% in top {max(1, top_k // 2)} risky / 50% defensive. "
-            f"2 bad canaries -> 100% defensive (IEF, LQD, BIL)."
+            f"0 bad canaries -> 100% across top {top_k} risky assets; 1 bad canary -> 50% cash fraction; "
+            f"2 bad canaries -> 100% cash fraction into leading defensive asset (IEF/LQD/BIL)."
         )
-
-    def warmup_bars(self, params: Optional[dict] = None) -> int:
-        return 252

@@ -77,13 +77,17 @@ from .chan_advanced_strategies import (
     ChanVaaCompoundStrategy,
 )
 from .chan_lesson_strategies import (
-    ChanFailedRetestBuyStrategy,
     ChanFiboSectorStrengthStrategy,
     ChanPivotOscillationStrategy,
     ChanPivotShiftMACDAdvStrategy,
 )
 from .bollinger_strategy import BollingerBandsStrategy
-from .taa_strategies import DefensiveAssetAllocationStrategy, HybridAssetAllocationStrategy
+from .taa_strategies import (
+    CanaryAssetAllocationBase,
+    DefensiveAssetAllocationStrategy,
+    HybridAssetAllocationStrategy,
+    VigilantAssetAllocation,
+)
 from .residual_momentum_strategy import ResidualMomentumStrategy
 from .config import StrategyConfig
 from .nl_parser import ParsedStrategySpec, parse_plain_english_strategy
@@ -444,78 +448,6 @@ class AcceleratingDualMomentum(AllocationTemplate):
 
     def warmup_bars(self, params: dict = None) -> int:
         return 126
-
-
-class VigilantAssetAllocation(AllocationTemplate):
-    """Vigilant Asset Allocation (VAA-G4).
-
-    Wouter J. Keller & Jan Willem Keuning (2017, SSRN #3002624).
-    """
-
-    def __init__(self, config: StrategyConfig = None):
-        self.config = config or StrategyConfig()
-        super().__init__(name="vigilant_asset_allocation", param_grid={})
-
-    def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
-        cfg = self.config
-        p = params or {}
-        rebal_freq = p.get("rebalance_freq_days", cfg.rebalance_freq_days)
-        offensive_universe = p.get("vaa_offensive_universe", cfg.vaa_offensive_universe)
-        defensive_universe = p.get("vaa_defensive_universe", cfg.vaa_defensive_universe)
-
-        symbols = list(universe.keys())
-        if not symbols:
-            return pd.DataFrame()
-
-        master_index = universe[symbols[0]].index
-        rebalance_dates = _get_rebalance_dates(master_index, rebal_freq)
-
-        offensive_symbols = [s for s in offensive_universe if s in symbols]
-        defensive_symbols = [s for s in defensive_universe if s in symbols]
-        all_tracked = list(dict.fromkeys(offensive_symbols + defensive_symbols))
-
-        def score_13612w(sym: str) -> pd.Series:
-            close = universe[sym]["Close"]
-            return 12 * roc(close, 21) + 4 * roc(close, 63) + 2 * roc(close, 126) + roc(close, 252)
-
-        scores = pd.DataFrame({sym: score_13612w(sym) for sym in all_tracked}) if all_tracked else pd.DataFrame()
-
-        weights_rebal = pd.DataFrame(index=rebalance_dates, columns=symbols, data=0.0)
-
-        for date in rebalance_dates:
-            off_scores = scores.loc[date, offensive_symbols].dropna() if offensive_symbols else pd.Series(dtype=float)
-            if len(off_scores) < len(offensive_symbols):
-                continue
-
-            if not off_scores.empty and (off_scores > 0).all():
-                weights_rebal.loc[date, off_scores.idxmax()] = 1.0
-            else:
-                def_scores = scores.loc[date, defensive_symbols].dropna() if defensive_symbols else pd.Series(dtype=float)
-                if not def_scores.empty:
-                    weights_rebal.loc[date, def_scores.idxmax()] = 1.0
-
-        weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
-        weights_df.loc[rebalance_dates] = weights_rebal
-        return weights_df
-
-    def explain_weights(self, params: dict = None) -> str:
-        cfg = self.config
-        p = params or {}
-        offensive_universe = p.get("vaa_offensive_universe", cfg.vaa_offensive_universe)
-        defensive_universe = p.get("vaa_defensive_universe", cfg.vaa_defensive_universe)
-        return (
-            f"Vigilant Asset Allocation -- VAA-G4 (Keller & Keuning 2017): Rebalances every "
-            f"{p.get('rebalance_freq_days', cfg.rebalance_freq_days)} days. "
-            f"Reasoning: Scores each asset via the 13612W formula (a 12/4/2/1-weighted blend of "
-            f"1/3/6/12-month returns). If every offensive asset ({', '.join(offensive_universe)}) scores "
-            f"positive, holds 100% of the single highest-scoring one. Otherwise rotates fully into the "
-            f"single highest-scoring defensive asset ({', '.join(defensive_universe)}). Fully concentrated, "
-            f"no diversification within the chosen sleeve. NOTE: offensive/defensive tickers here are "
-            f"illustrative, not a verified reproduction of the original paper's universe (see class docstring)."
-        )
-
-    def warmup_bars(self, params: dict = None) -> int:
-        return 252
 
 
 class RSIMeanReversionStrategy(AllocationTemplate):
@@ -2009,7 +1941,6 @@ STRATEGY_CLASS_MAP = {
     "BollingerBandsStrategy": BollingerBandsStrategy,
     "ChanBestSelectorStrategy": ChanBestSelectorStrategy,
     "ChanCompositeStrategy": ChanCompositeStrategy,
-    "ChanFailedRetestBuyStrategy": ChanFailedRetestBuyStrategy,
     "ChanFiboSectorStrengthStrategy": ChanFiboSectorStrengthStrategy,
     "ChanMeanReversionDivergenceStrategy": ChanMeanReversionDivergenceStrategy,
     "ChanMultiTimeframeTrendStrategy": ChanMultiTimeframeTrendStrategy,
