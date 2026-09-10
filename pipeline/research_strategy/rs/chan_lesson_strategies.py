@@ -53,7 +53,13 @@ from .chan_advanced_strategies import (
     run_mrd_position_exit,
 )
 from .chan_signals import compute_chan3_signals, compute_chan_pivot_macd_signals
-from .chan_structure import build_pivots, build_strokes, find_fractals, merge_inclusion
+from .chan_structure import (
+    build_pivots,
+    build_strokes,
+    compute_stroke_trend,
+    find_fractals,
+    merge_inclusion,
+)
 from .config import StrategyConfig
 
 _FIBO_PERIODS = (5, 13, 21, 34, 55, 89, 144, 233)
@@ -455,6 +461,9 @@ class ChanPivotShiftMACDAdvStrategy(AllocationTemplate):
         trailing_stop_pct = p.get(
             "chanm_adv_trailing_stop_pct", getattr(cfg, "chanm_adv_trailing_stop_pct", 0.04)
         )
+        require_weekly_regime = p.get(
+            "chanm_adv_require_weekly_regime", getattr(cfg, "chanm_adv_require_weekly_regime", False)
+        )
 
         symbols = list(universe.keys())
         risky_symbols = _get_risky_symbols_helper(universe, params, cfg_symbol=None, cfg_risky_universe=None, cash_proxy=cash_proxy)
@@ -490,13 +499,16 @@ class ChanPivotShiftMACDAdvStrategy(AllocationTemplate):
             gated_divergence_buy = divergence_buy & zero_axis_ok
 
             close = bars["Close"].reindex(master_index)
-            if use_trend_gate:
-                ma = sma(close, trend_ma_period)
-                ma_slope = ma.diff(50).fillna(0.0)
-                uptrend = (close > ma) | (ma_slope > 0) | ma.isna()
-                bull_run = (close > ma * 1.03) & (ma_slope > 0)
+            ma = sma(close, trend_ma_period)
+            ma_slope = ma.diff(50).fillna(0.0)
+            uptrend = (close > ma) | (ma_slope > 0) | ma.isna()
+            bull_run = (close > ma * 1.03) & (ma_slope > 0)
 
-                gated_divergence_buy = gated_divergence_buy & uptrend
+            stroke_trend = compute_stroke_trend(bars, min_gap_bars).reindex(master_index).ffill().fillna(False)
+            relaxed_trend = uptrend | stroke_trend
+
+            if use_trend_gate:
+                gated_divergence_buy = gated_divergence_buy & relaxed_trend
                 if suppress_top_div_in_uptrend:
                     sell_signal = sell_signal & ~bull_run
 
@@ -507,8 +519,12 @@ class ChanPivotShiftMACDAdvStrategy(AllocationTemplate):
             ).reindex(master_index).ffill().fillna(False)
             danger = _pivot_relation_danger_series(bars, min_gap_bars, min_strokes).reindex(master_index).ffill().fillna(False)
 
-            entry_signal = gated_buy_signal & weekly_regime
-            exit_signal = sell_signal | (~weekly_regime) | danger
+            if require_weekly_regime:
+                entry_signal = gated_buy_signal & weekly_regime
+                exit_signal = sell_signal | (~weekly_regime) | danger
+            else:
+                entry_signal = gated_buy_signal & relaxed_trend
+                exit_signal = sell_signal | danger | (~relaxed_trend & (close < ma * 0.95))
 
             sig3 = compute_chan3_signals(
                 bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes,
@@ -532,11 +548,13 @@ class ChanPivotShiftMACDAdvStrategy(AllocationTemplate):
         p = params or {}
         cross_pivot_on = p.get("chanm_adv_require_cross_pivot_divergence", cfg.chanm_adv_require_cross_pivot_divergence)
         volume_on = p.get("chanm_adv_require_volume_confirmation", cfg.chanm_adv_require_volume_confirmation)
+        weekly_req = p.get("chanm_adv_require_weekly_regime", getattr(cfg, "chanm_adv_require_weekly_regime", False))
         return (
             "Chan Pivot Shift (MACD) Advanced (chan_pivot_shift_macd_adv): an enhanced sibling of "
             "chan_pivot_shift_macd -- the same stroke-level pivot-band-shift + MACD-histogram-area "
-            "divergence rule, gated by a MACD zero-axis reclaim (Lesson 103), a genuine weekly-level "
-            "区间套 re-confirmation, and a dangerous pivot-relation exit brake (Lessons 92-99); "
+            "divergence rule, gated by a MACD zero-axis reclaim (Lesson 103), "
+            f"{'a genuine weekly-level 区间套 re-confirmation' if weekly_req else 'relaxed Lesson 107 gating (200d SMA or stroke trend)'}, "
+            "and a dangerous pivot-relation exit brake (Lessons 92-99); "
             f"{'only trades cross-pivot (not 盘整背驰) divergence' if cross_pivot_on else 'trades all divergence signals, any strength'}; "
             f"{'requires weakening volume to confirm divergence; ' if volume_on else ''}"
             "sizes down entries that don't coincide with a formal 2nd/3rd-type point (Lesson 061)."

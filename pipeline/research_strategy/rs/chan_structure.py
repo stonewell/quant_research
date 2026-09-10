@@ -56,7 +56,7 @@ def _signal_cache_key(df: pd.DataFrame, *params) -> tuple:
     Volume spike confined to the middle of the series (caught by this
     module's own test suite) -- Close has no such caller today, so it keeps
     the cheaper first/last heuristic."""
-    close = df["Close"]
+    close = df["Close"] if "Close" in df.columns else (df["High"] if "High" in df.columns else df.iloc[:, 0])
     volume_fingerprint = hash(df["Volume"].to_numpy().tobytes()) if "Volume" in df.columns else None
     return (
         len(df), df.index[0], df.index[-1],
@@ -418,3 +418,54 @@ def classify_pivot_relations(pivots: pd.DataFrame) -> pd.DataFrame:
         )
 
     return pd.DataFrame(rows, columns=_PIVOT_RELATION_COLUMNS)
+
+
+def compute_stroke_trend(df: pd.DataFrame, min_gap_bars: int = 4) -> pd.Series:
+    """Cache-wrapped entry point for stroke trend series (see `_compute_stroke_trend_impl`)."""
+    return _cached_signals(
+        "compute_stroke_trend",
+        df,
+        (min_gap_bars,),
+        lambda: _compute_stroke_trend_impl(df, min_gap_bars),
+    )
+
+
+def _compute_stroke_trend_impl(df: pd.DataFrame, min_gap_bars: int) -> pd.Series:
+    """Derives a per-bar boolean series indicating whether price is in a bullish stroke
+    trend (Lesson 107 stroke-level trend definition: up-stroke in progress or higher low established).
+    """
+    trend = pd.Series(False, index=df.index)
+    if len(df) < 5:
+        return trend
+    merged = merge_inclusion(df)
+    fractals = find_fractals(merged)
+    strokes = build_strokes(fractals, min_gap_bars)
+    if len(strokes) < 2:
+        return trend
+
+    trend_arr = np.zeros(len(df), dtype=bool)
+    n_strokes = len(strokes)
+    for i in range(len(strokes)):
+        s_curr = strokes.iloc[i]
+        confirm_merged_pos = int(s_curr["end_pos"]) + 1
+        if confirm_merged_pos >= len(merged):
+            confirm_merged_pos = int(s_curr["end_pos"])
+        confirm_ts = merged.index[confirm_merged_pos]
+        start_idx = df.index.get_indexer([confirm_ts])[0]
+        end_idx = len(df)
+        if i + 1 < n_strokes:
+            s_next = strokes.iloc[i + 1]
+            next_confirm_merged_pos = int(s_next["end_pos"]) + 1
+            if next_confirm_merged_pos >= len(merged):
+                next_confirm_merged_pos = int(s_next["end_pos"])
+            next_ts = merged.index[next_confirm_merged_pos]
+            end_idx = df.index.get_indexer([next_ts])[0]
+        is_up = s_curr["direction"] == "up"
+        higher_low = False
+        if not is_up and i >= 2:
+            s_prior_down = strokes.iloc[i - 2] if strokes.iloc[i - 2]["direction"] == "down" else None
+            if s_prior_down is not None and float(s_curr["end_price"]) > float(s_prior_down["end_price"]):
+                higher_low = True
+        trend_arr[start_idx:end_idx] = is_up or higher_low
+    return pd.Series(trend_arr, index=df.index)
+

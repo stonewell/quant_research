@@ -158,7 +158,7 @@
     "name": "Chan Pivot Shift (MACD) Advanced",
     "type": "class",
     "class_name": "ChanPivotShiftMACDAdvStrategy",
-    "description": "Enhanced sibling of chan_pivot_shift_macd (which is left unmodified): adds a MACD zero-axis entry gate (Lesson 103), weekly-level 区间套 re-confirmation, a dangerous pivot-relation exit brake (Lessons 92-99), a 盘整背驰-vs-背驰 divergence-strength filter, an opt-in volume confirmation, and coincidence-based position sizing (Lesson 061).",
+    "description": "Enhanced sibling of chan_pivot_shift_macd (which is left unmodified): adds a MACD zero-axis entry gate (Lesson 103), relaxed Lesson 107 gating (200d SMA or stroke trend), a dangerous pivot-relation exit brake (Lessons 92-99), a 盘整背驰-vs-背驰 divergence-strength filter, an opt-in volume confirmation, and coincidence-based position sizing (Lesson 061).",
     "parameters": {
       "chanm_adv_min_gap_bars": 4,
       "chanm_adv_min_strokes": 3,
@@ -171,6 +171,7 @@
       "chanm_adv_require_cross_pivot_divergence": true,
       "chanm_adv_require_volume_confirmation": false,
       "chanm_adv_weak_signal_position_size_pct": 0.5,
+      "chanm_adv_require_weekly_regime": false,
       "cash_proxy": "BIL"
     },
     "factors": ["regime_trend_strength", "absolute_momentum_trend"]
@@ -213,7 +214,7 @@
     "name": "Chan Mean-Reversion Divergence",
     "type": "class",
     "class_name": "ChanMeanReversionDivergenceStrategy",
-    "description": "Unified Chan B1 mean-reversion bottom fishing combining raw MACD divergence, failed-retest confirmation, and 200d SMA trend-gating with tight risk controls (5% stop-loss, 15% profit target, 4% trailing stop, 30d max hold).",
+    "description": "Unified Chan B1 mean-reversion bottom fishing combining segment/stroke MACD divergence, failed-retest confirmation, and relaxed 200d SMA or stroke trend-gating with tight risk controls (5% stop-loss, 15% profit target, 4% trailing stop, 30d max hold).",
     "parameters": {
       "chan_mrd_min_gap_bars": 4,
       "chan_mrd_min_strokes": 3,
@@ -289,6 +290,27 @@
       "cash_proxy": "BIL"
     },
     "factors": ["regime_trend_strength", "absolute_momentum_trend", "relative_momentum", "breadth"]
+  },
+  "regime_factor_compound": {
+    "name": "Macro Regime Factor Adaptive Compound Strategy",
+    "type": "class",
+    "class_name": "RegimeFactorCompoundStrategy",
+    "description": "Macro factor regime-adaptive compound strategy dynamically mapping 5 market-wide factors into 5 regimes across the Top 5 unleveraged strategies with fast rebound acceleration and Barroso/Santa-Clara volatility targeting for high DSR.",
+    "parameters": {
+      "regime_compound_rebalance_freq_days": 21,
+      "regime_compound_lookback_days": 63,
+      "regime_compound_breadth_bull_thresh": 0.60,
+      "regime_compound_breadth_bear_thresh": 0.35,
+      "regime_compound_breadth_mom_thresh": 0.65,
+      "regime_compound_vol_zscore_thresh": 1.0,
+      "regime_compound_hurst_trend_thresh": 0.52,
+      "regime_compound_hurst_meanrev_thresh": 0.48,
+      "regime_compound_mode": "discrete_winner",
+      "regime_compound_enable_vol_targeting": true,
+      "regime_compound_target_vol": 0.12,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["regime_trend_strength", "breadth", "absolute_momentum_trend", "relative_momentum", "volatility_targeting"]
   },
   "chan_pivot_oscillation": {
     "name": "Chan Pivot-Oscillation Monitor",
@@ -568,5 +590,21 @@
       "cash_proxy": "BIL"
     },
     "factors": ["relative_momentum", "volatility_targeting", "absolute_momentum_trend"]
+  },
+  "adaptive_fast_expansion": {
+    "name": "Adaptive Fast Expansion Strategy",
+    "type": "class",
+    "class_name": "AdaptiveFastExpansionStrategy",
+    "description": "Dual-horizon momentum strategy blending fast short-term acceleration (15d ROC) and structural medium-term trend (126d ROC), with Zweig breadth thrust fast recovery and continuous Barroso/Santa-Clara volatility targeting for high DSR.",
+    "parameters": {
+      "afe_fast_roc_days": 15,
+      "afe_slow_roc_days": 126,
+      "afe_target_vol": 0.12,
+      "afe_top_k": 3,
+      "afe_breadth_thrust_thresh": 0.65,
+      "afe_rebalance_freq_days": 10,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["relative_momentum", "volatility_targeting", "breadth", "absolute_momentum_trend"]
   }
 }

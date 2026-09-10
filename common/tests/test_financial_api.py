@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import tempfile
 from unittest.mock import MagicMock, patch
 
@@ -199,9 +200,12 @@ def test_fuyao_provider_fetch_ohlcv_mocked():
 
     provider = FuyaoDataProvider(prefer_local=False)
 
-    with patch("fuyao_client.prices_historical", return_value=mock_items) as mock_hist:
+    mock_fuyao = MagicMock()
+    mock_fuyao.prices_historical.return_value = mock_items
+
+    with patch.dict(sys.modules, {"fuyao_client": mock_fuyao}):
         df = provider.fetch_ohlcv("600519.SH", start="2024-01-02", end="2024-01-03")
-        mock_hist.assert_called_once()
+        mock_fuyao.prices_historical.assert_called_once()
         assert isinstance(df, pd.DataFrame)
         assert len(df) == 2
         assert list(df.columns) == ["Open", "High", "Low", "Close", "Volume"]
@@ -223,12 +227,6 @@ def test_fuyao_provider_index_and_etf_mocked():
             "turnover": 5000000.0,
         }
     ]
-    with patch("fuyao_client.index_prices_historical", return_value=mock_index_items) as mock_index:
-        df = provider.fetch_ohlcv("000300.SH", start="2024-01-02", end="2024-01-02")
-        mock_index.assert_called_once()
-        assert len(df) == 1
-        assert df["Close"].iloc[0] == 3020.0
-
     # ETF routing
     mock_etf_res = {
         "item": [
@@ -243,9 +241,18 @@ def test_fuyao_provider_index_and_etf_mocked():
             }
         ]
     }
-    with patch("fuyao_client.fund_market_historical", return_value=mock_etf_res) as mock_fund:
+    mock_fuyao = MagicMock()
+    mock_fuyao.index_prices_historical.return_value = mock_index_items
+    mock_fuyao.fund_market_historical.return_value = mock_etf_res
+
+    with patch.dict(sys.modules, {"fuyao_client": mock_fuyao}):
+        df = provider.fetch_ohlcv("000300.SH", start="2024-01-02", end="2024-01-02")
+        mock_fuyao.index_prices_historical.assert_called_once()
+        assert len(df) == 1
+        assert df["Close"].iloc[0] == 3020.0
+
         df = provider.fetch_ohlcv("510300.SH", start="2024-01-02", end="2024-01-02")
-        mock_fund.assert_called_once()
+        mock_fuyao.fund_market_historical.assert_called_once()
         assert len(df) == 1
         assert df["Close"].iloc[0] == 3.55
 
@@ -271,9 +278,11 @@ def test_fuyao_provider_fetch_metadata_mocked():
         ]
     }
 
-    with patch("fuyao_client.a_share_valuations_snapshot", return_value=mock_val), patch(
-        "fuyao_client.financials_indicators", return_value=mock_ind
-    ):
+    mock_fuyao = MagicMock()
+    mock_fuyao.a_share_valuations_snapshot.return_value = mock_val
+    mock_fuyao.financials_indicators.return_value = mock_ind
+
+    with patch.dict(sys.modules, {"fuyao_client": mock_fuyao}):
         meta = provider.fetch_metadata("600519.SH")
         assert meta["roe"] == 28.5
         assert meta["earnings_growth"] == 15.2

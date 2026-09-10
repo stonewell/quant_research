@@ -25,6 +25,7 @@ from research_strategy.rs.chan_structure import (
     build_strokes,
     classify_pivot_relations,
     compute_chan_signals,
+    compute_stroke_trend,
     find_fractals,
     merge_inclusion,
 )
@@ -32,7 +33,8 @@ from research_strategy.rs.chan_structure import (
 
 def _ohlc(highs, lows):
     idx = pd.bdate_range("2020-01-01", periods=len(highs))
-    return pd.DataFrame({"High": highs, "Low": lows}, index=idx)
+    c = (np.asarray(highs, dtype=float) + np.asarray(lows, dtype=float)) / 2.0
+    return pd.DataFrame({"High": highs, "Low": lows, "Close": c}, index=idx)
 
 
 # --- merge_inclusion -------------------------------------------------------
@@ -302,3 +304,24 @@ def test_classify_pivot_relations_dangerous_downtrend_breakthrough():
 def test_classify_pivot_relations_needs_at_least_two_pivots():
     pivots = pd.DataFrame([_pivot_row(0, 30, 100, 90, 105, 85, 0, 2)])
     assert classify_pivot_relations(pivots).empty
+
+
+def test_compute_stroke_trend_empty_or_short():
+    df = _ohlc(highs=[10, 11, 12], lows=[9, 10, 11])
+    trend = compute_stroke_trend(df)
+    assert isinstance(trend, pd.Series)
+    assert not trend.any()
+
+
+def test_compute_stroke_trend_uptrend_series():
+    n = 60
+    closes = np.linspace(100, 150, n)
+    idx = pd.bdate_range("2023-01-01", periods=n)
+    noise = np.tile([0.0, 2.0, -1.0, 3.0, 1.0, 4.0], n // 6)
+    highs = closes + noise + 1.0
+    lows = closes + noise - 1.0
+    df = pd.DataFrame({"High": highs, "Low": lows, "Close": closes}, index=idx)
+    trend = compute_stroke_trend(df, min_gap_bars=2)
+    assert isinstance(trend, pd.Series)
+    assert trend.sum() > 0
+

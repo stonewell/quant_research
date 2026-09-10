@@ -89,6 +89,8 @@ from .taa_strategies import (
     VigilantAssetAllocation,
 )
 from .residual_momentum_strategy import ResidualMomentumStrategy
+from .regime_factor_compound_strategy import RegimeFactorCompoundStrategy
+from .adaptive_fast_expansion_strategy import AdaptiveFastExpansionStrategy
 from .config import StrategyConfig
 from .nl_parser import ParsedStrategySpec, parse_plain_english_strategy
 
@@ -1936,6 +1938,7 @@ class AdaptiveAssetAllocation(AllocationTemplate):
 STRATEGY_CLASS_MAP = {
     "AcceleratingDualMomentum": AcceleratingDualMomentum,
     "AdaptiveAssetAllocation": AdaptiveAssetAllocation,
+    "AdaptiveFastExpansionStrategy": AdaptiveFastExpansionStrategy,
     "AdaptiveGridStrategy": AdaptiveGridStrategy,
     "AllWeatherStrategy": AllWeatherStrategy,
     "BollingerBandsStrategy": BollingerBandsStrategy,
@@ -1961,6 +1964,7 @@ STRATEGY_CLASS_MAP = {
     "PermanentPortfolioStrategy": PermanentPortfolioStrategy,
     "ProtectiveAssetAllocation": ProtectiveAssetAllocation,
     "RSIMeanReversionStrategy": RSIMeanReversionStrategy,
+    "RegimeFactorCompoundStrategy": RegimeFactorCompoundStrategy,
     "ResidualMomentumStrategy": ResidualMomentumStrategy,
     "SwingTrendPullbackStrategy": SwingTrendPullbackStrategy,
     "TurtleBreakoutStrategy": TurtleBreakoutStrategy,

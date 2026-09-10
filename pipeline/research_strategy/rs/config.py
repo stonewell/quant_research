@@ -365,6 +365,7 @@ class StrategyConfig:
     chanm_adv_suppress_top_div_in_uptrend: bool = True
     chanm_adv_trailing_activate_pct: Optional[float] = 0.08
     chanm_adv_trailing_stop_pct: Optional[float] = 0.04
+    chanm_adv_require_weekly_regime: bool = False
 
     # --- Chan Pivot-Oscillation Monitor (Zn, Lesson 92, 0844-...-092.md):
     # tracks each sub-swing's midpoint (Zn) inside a confirmed stroke-level
@@ -453,6 +454,27 @@ class StrategyConfig:
     resmom_rebalance_freq_days: int = 21
     resmom_require_trend_filter: bool = True
     resmom_trend_ma_period: int = 200
+
+    # --- Macro Regime Factor Compound Strategy ---
+    regime_compound_rebalance_freq_days: int = 21
+    regime_compound_lookback_days: int = 63
+    regime_compound_breadth_bull_thresh: float = 0.60
+    regime_compound_breadth_bear_thresh: float = 0.35
+    regime_compound_breadth_mom_thresh: float = 0.65
+    regime_compound_vol_zscore_thresh: float = 1.0
+    regime_compound_hurst_trend_thresh: float = 0.52
+    regime_compound_hurst_meanrev_thresh: float = 0.48
+    regime_compound_mode: str = "discrete_winner"  # "discrete_winner" or "smooth_blend"
+    regime_compound_enable_vol_targeting: bool = True
+    regime_compound_target_vol: float = 0.12
+
+    # --- Adaptive Fast Expansion Strategy ---
+    afe_fast_roc_days: int = 15
+    afe_slow_roc_days: int = 126
+    afe_target_vol: float = 0.12
+    afe_top_k: int = 3
+    afe_breadth_thrust_thresh: float = 0.65
+    afe_rebalance_freq_days: int = 10
 
     # Backtester execution defaults
     initial_capital: float = 100_000.0
@@ -558,6 +580,33 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.resmom_top_k must be > 0, got {self.resmom_top_k}")
         if self.resmom_rebalance_freq_days <= 0:
             raise ValueError(f"StrategyConfig.resmom_rebalance_freq_days must be > 0, got {self.resmom_rebalance_freq_days}")
+        if self.regime_compound_rebalance_freq_days <= 0:
+            raise ValueError(f"StrategyConfig.regime_compound_rebalance_freq_days must be > 0, got {self.regime_compound_rebalance_freq_days}")
+        if self.regime_compound_lookback_days <= 0:
+            raise ValueError(f"StrategyConfig.regime_compound_lookback_days must be > 0, got {self.regime_compound_lookback_days}")
+        if not (0.0 <= self.regime_compound_breadth_bear_thresh <= self.regime_compound_breadth_bull_thresh <= self.regime_compound_breadth_mom_thresh <= 1.0):
+            raise ValueError(
+                f"StrategyConfig: breadth thresholds must satisfy 0 <= bear ({self.regime_compound_breadth_bear_thresh}) "
+                f"<= bull ({self.regime_compound_breadth_bull_thresh}) <= mom ({self.regime_compound_breadth_mom_thresh}) <= 1"
+            )
+        if self.regime_compound_mode not in ("discrete_winner", "smooth_blend"):
+            raise ValueError(f"StrategyConfig.regime_compound_mode must be 'discrete_winner' or 'smooth_blend', got {self.regime_compound_mode}")
+        if self.afe_fast_roc_days <= 0:
+            raise ValueError(f"StrategyConfig.afe_fast_roc_days must be > 0, got {self.afe_fast_roc_days}")
+        if self.afe_slow_roc_days <= 0:
+            raise ValueError(f"StrategyConfig.afe_slow_roc_days must be > 0, got {self.afe_slow_roc_days}")
+        if self.afe_fast_roc_days >= self.afe_slow_roc_days:
+            raise ValueError(f"StrategyConfig: afe_fast_roc_days ({self.afe_fast_roc_days}) must be < afe_slow_roc_days ({self.afe_slow_roc_days})")
+        if self.afe_top_k <= 0:
+            raise ValueError(f"StrategyConfig.afe_top_k must be > 0, got {self.afe_top_k}")
+        if self.afe_rebalance_freq_days <= 0:
+            raise ValueError(f"StrategyConfig.afe_rebalance_freq_days must be > 0, got {self.afe_rebalance_freq_days}")
+        if not (0.0 < self.afe_breadth_thrust_thresh <= 1.0):
+            raise ValueError(f"StrategyConfig.afe_breadth_thrust_thresh must be between 0 and 1, got {self.afe_breadth_thrust_thresh}")
+        if self.afe_target_vol <= 0:
+            raise ValueError(f"StrategyConfig.afe_target_vol must be > 0, got {self.afe_target_vol}")
+        if self.regime_compound_target_vol <= 0:
+            raise ValueError(f"StrategyConfig.regime_compound_target_vol must be > 0, got {self.regime_compound_target_vol}")
 
     @classmethod
     def from_dict(cls, data: dict) -> "StrategyConfig":

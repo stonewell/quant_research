@@ -322,9 +322,21 @@ def test_chan_pivot_shift_macd_adv_weekly_regime_gate(monkeypatch):
     entry_bar = 10
 
     _patch_adv_fakes(monkeypatch, buy_at=entry_bar, weekly_regime_true=False)
-    weights = ChanPivotShiftMACDAdvStrategy(StrategyConfig()).generate_weights(universe)
+    cfg = StrategyConfig(chanm_adv_require_weekly_regime=True)
+    weights = ChanPivotShiftMACDAdvStrategy(cfg).generate_weights(universe)
     daily = weights.reindex(idx).ffill().fillna(0.0)
-    assert daily["SPY"].iloc[entry_bar] == 0.0, "entry suppressed while the weekly regime disagrees"
+    assert daily["SPY"].iloc[entry_bar] == 0.0, "entry suppressed while the weekly regime disagrees in strict mode"
+
+
+def test_chan_pivot_shift_macd_adv_relaxed_trend_gate(monkeypatch):
+    idx, universe = _adv_universe()
+    entry_bar = 10
+
+    _patch_adv_fakes(monkeypatch, buy_at=entry_bar, weekly_regime_true=False)
+    cfg = StrategyConfig(chanm_adv_require_weekly_regime=False)
+    weights = ChanPivotShiftMACDAdvStrategy(cfg).generate_weights(universe)
+    daily = weights.reindex(idx).ffill().fillna(0.0)
+    assert daily["SPY"].iloc[entry_bar] > 0.0, "relaxed gating allows entry when weekly regime is false but 200d SMA/stroke trend holds"
 
 
 def test_chan_pivot_shift_macd_adv_exits_on_dangerous_pivot_relation(monkeypatch):

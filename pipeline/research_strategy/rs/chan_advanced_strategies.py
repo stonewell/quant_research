@@ -42,6 +42,7 @@ from .chan_structure import (
     build_strokes,
     classify_pivot_relations,
     compute_chan_signals,
+    compute_stroke_trend,
     find_fractals,
     merge_inclusion,
 )
@@ -602,7 +603,11 @@ class ChanMeanReversionDivergenceStrategy(AllocationTemplate):
                 bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes,
                 macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal,
             )
-            raw_first_buy = sig["first_buy"].reindex(master_index).fillna(False)
+            stroke_sig = compute_chan_pivot_macd_signals(
+                bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes,
+                macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal,
+            )
+            raw_first_buy = (sig["first_buy"] | stroke_sig["divergence_buy"]).reindex(master_index).fillna(False)
 
             if entry_mode == "raw_b1":
                 entry_signal = raw_first_buy
@@ -619,11 +624,12 @@ class ChanMeanReversionDivergenceStrategy(AllocationTemplate):
                 entry_signal = raw_first_buy
 
             if require_trend_filter:
+                stroke_trend = compute_stroke_trend(bars, min_gap_bars).reindex(master_index).ffill().fillna(False)
                 trend_ma = sma(bars["Close"], trend_ma_period).reindex(master_index)
-                trend_ok = (bars["Close"].reindex(master_index) > trend_ma).fillna(False)
+                trend_ok = (bars["Close"].reindex(master_index) > trend_ma).fillna(False) | stroke_trend
                 entry_signal = entry_signal & trend_ok
 
-            exit_signal = sig["sell_signal"].reindex(master_index).fillna(False)
+            exit_signal = (sig["sell_signal"] | stroke_sig["divergence_sell"]).reindex(master_index).fillna(False)
             close = bars["Close"].reindex(master_index)
 
             raw_weights[sym] = run_mrd_position_exit(
@@ -650,7 +656,7 @@ class ChanMeanReversionDivergenceStrategy(AllocationTemplate):
         trend_req = p.get("chan_mrd_require_trend_filter", getattr(cfg, "chan_mrd_require_trend_filter", False))
         return (
             f"Chan Mean-Reversion Divergence Strategy (一类买卖点背驰与防狼术 / 下探失败买): "
-            f"entry_mode='{entry_mode}', trend_filter={trend_req}; longs active risky symbols on 1st-type buy points "
+            f"entry_mode='{entry_mode}', trend_filter={trend_req} (200d SMA or stroke trend); longs active risky symbols on 1st-type buy points "
             f"with configured entry filters and tight risk management (stop-loss, profit target, trailing stop, holding timeout)."
         )
 

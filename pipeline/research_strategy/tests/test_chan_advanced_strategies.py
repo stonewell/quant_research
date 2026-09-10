@@ -431,6 +431,49 @@ def test_chan_mrd_modes_and_trend_filter():
         assert isinstance(w, pd.DataFrame)
 
 
+def test_chan_mrd_relaxed_stroke_trend_gate(monkeypatch):
+    from research_strategy.rs import chan_advanced_strategies as cas
+
+    n = 250
+    idx = pd.bdate_range("2020-01-01", periods=n)
+    closes = np.linspace(150, 100, n)
+    bars = pd.DataFrame({"Open": closes, "High": closes + 0.5, "Low": closes - 0.5, "Close": closes}, index=idx)
+    universe = {"SPY": bars, "BIL": bars.copy()}
+
+    entry_bar = 240
+
+    def fake_chan3(bars_arg, **kwargs):
+        first_buy = pd.Series(False, index=bars_arg.index)
+        first_buy.iloc[entry_bar] = True
+        cols = {k: pd.Series(False, index=bars_arg.index) for k in
+                ["first_buy", "first_sell", "second_buy", "second_sell", "third_buy", "third_sell"]}
+        cols["first_buy"] = first_buy
+        cols["buy_signal"] = first_buy
+        cols["sell_signal"] = pd.Series(False, index=bars_arg.index)
+        return pd.DataFrame(cols)
+
+    def fake_stroke_sig(bars_arg, **kwargs):
+        cols = {k: pd.Series(False, index=bars_arg.index) for k in
+                ["buy_signal", "sell_signal", "divergence_buy", "divergence_sell"]}
+        return pd.DataFrame(cols)
+
+    def fake_stroke_trend(bars_arg, *args, **kwargs):
+        st = pd.Series(False, index=bars_arg.index)
+        st.iloc[entry_bar:] = True
+        return st
+
+    monkeypatch.setattr(cas, "compute_chan3_signals", fake_chan3)
+    monkeypatch.setattr(cas, "compute_chan_pivot_macd_signals", fake_stroke_sig)
+    monkeypatch.setattr(cas, "compute_stroke_trend", fake_stroke_trend)
+
+    cfg = StrategyConfig(chan_mrd_entry_mode="raw_b1", chan_mrd_require_trend_filter=True)
+    strat = cas.ChanMeanReversionDivergenceStrategy(cfg)
+    weights = strat.generate_weights(universe)
+    daily = weights.reindex(idx).ffill().fillna(0.0)
+
+    assert daily["SPY"].iloc[entry_bar] > 0.0, "relaxed trend gate should allow entry via stroke trend even below 200d SMA"
+
+
 # --- Integration Tests: strategies_config.json Discovery -------------------
 
 @pytest.mark.parametrize("key", [
