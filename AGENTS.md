@@ -68,9 +68,9 @@ available in the current shell.
 - Every strategy/allocation template is an `AllocationTemplate` subclass (`common/allocation_templates.py`)
   implementing `generate_weights(universe, params) -> DataFrame`, `explain_weights(params) -> str`,
   and `warmup_bars(params) -> int`. Two families implement this interface: the 9 static, zero-arg
-  templates in `common/allocation_templates.py`, and the 18 richer, `StrategyConfig`-driven
-  templates (basket presets + single-asset timing strategies) in
-  `pipeline/research_strategy/rs/strategy.py`.
+  templates in `common/allocation_templates.py`, and the 39 richer, `StrategyConfig`-driven
+  templates (basket presets, single-asset timing strategies, Chan structural models, macro factor
+  compounders, and multi-strategy alpha books) in `pipeline/research_strategy/rs/`.
 
 - **Sparse weights contract (critical):** `generate_weights` returns a DataFrame indexed by date
   where a row is `NaN` on every day EXCEPT an actual rebalance date, where it holds the real target

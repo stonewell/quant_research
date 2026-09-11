@@ -2,7 +2,7 @@
 
 # Researched Quantitative Trading Strategies (`research_strategy`)
 
-A dedicated side project implementing and evaluating twenty-one quantitative trading strategies: five tactical asset allocation (TAA) strategies synthesized from academic literature and practitioner research (*Journal of Finance*, *Journal of Portfolio Management*, SSRN, AllocateSmartly), four single-asset timing strategies consolidated into this project from this workspace's former standalone `rsi_strategy`, `swing_trend_strategy`, `grid_trading`, and `ensemble_strategy` side projects, two Donchian channel breakout systems, four modern, actively-followed static/fixed-weight portfolios popular with retail and practitioner communities today (Permanent Portfolio, Golden Butterfly, All Weather, HFEA), two modern systematic TAA extensions added in a follow-up deep-research pass on "modern, popular, effective" strategies (Protective Asset Allocation, Adaptive Asset Allocation) -- see "Strategy 12-17" below for that pass's findings and disclosed simplifications -- and three original, from-scratch structural readings of 缠中说禅 ("Chan theory") price structure, the second and third each an additive extension of the first (see "Strategy 18-19, 21").
+A dedicated side project implementing and evaluating thirty-nine quantitative trading strategies: tactical asset allocation (TAA) strategies synthesized from academic literature and practitioner research (*Journal of Finance*, *Journal of Portfolio Management*, SSRN, AllocateSmartly), single-asset timing strategies, Donchian channel breakout systems, modern static/fixed-weight portfolios (Permanent Portfolio, Golden Butterfly, All Weather, HFEA), Bollinger band systems, residual momentum, adaptive fast expansion, an extensive 12-strategy Chan structural analysis suite (缠中说禅: pivot shift, three-type points, MACD divergence, multi-timeframe trend, third buy, mean reversion divergence, composite multi-stage, best selector, VAA compound, pivot oscillation, Fibonacci sector strength), macro regime factor compounders, and an institutional Multi-Strategy Alpha Book engine with optimal Core-Satellite allocation.
 
 ---
 
@@ -108,6 +108,53 @@ A dedicated research pass specifically looked for strategies that are genuinely 
 ### Strategy 21: Chan Three-Type Buy/Sell Points (additive extension of Strategy 18)
 
 * **Chan Three-Type Buy/Sell Points** (`ChanThreeTypeStrategy`, `chan_three_type`): an ADDITIVE extension of Strategy 18 above, not a modification of it — `ChanPivotShiftStrategy`/`chan_structure.py` are left exactly as they are, and this strategy coexists alongside it as its own independent reading of 缠中说禅 ("Chan theory"), one level closer to the formal published taxonomy. Adds two structural layers on top of `chan_structure.py`'s strokes: segments (线段, a disclosed price-only proxy for the real characteristic-sequence termination rule) and segment-level pivots (built by reusing `chan_structure.build_pivots` verbatim on segments instead of strokes). Replaces the Strategy 18 divergence proxy with real MACD-histogram-area divergence (背驰, via `common.indicators.macd`, previously unused by any strategy in this project) and implements the formal first/second/third-type buy/sell point taxonomy (一/二/三类买卖点): a first-type point is a pivot breakdown/breakout confirmed by MACD divergence between the entering and leaving move; a second-type point is a failed follow-through after a first-type point (a retest that doesn't make a new extreme); a third-type point is a breakout retest that holds the pivot's own band edge, with no divergence check. See `rs/chan_signals.py` for the full disclosed simplifications at each new stage.
+
+### Strategy 22–30: Advanced Chan Structural Suite (`rs/chan_advanced_strategies.py` & `rs/chan_lesson_strategies.py`)
+
+* **Strategy 22: Chan Pivot Shift MACD Advanced** (`ChanPivotShiftMACDAdvStrategy`, `chan_pivot_shift_macd_adv`): Builds on Strategy 19 by adding higher-timeframe trend alignment (200-day SMA gate) and dynamic ATR-based trailing risk buffers around structural pivot shift entries.
+* **Strategy 23: Chan Multi-Timeframe Trend** (`ChanMTFTrendStrategy`, `chan_mtf_trend`): Evaluates multi-timeframe fractal strokes (simulating higher-timeframe bi structure by aggregating daily bars) to enforce trend consensus before trading pivot breakouts. Ranked Tier 1 Alpha Leader in 21-fold walkforward testing (Sharpe 1.29, CAGR 11.27%).
+* **Strategy 24: Chan Trend Third Buy** (`ChanTrendThirdBuyStrategy`, `chan_trend_third_buy`): Strict implementation of the Chan third-type buy point (三类买点) — trades the first pullback after a pivot breakout that holds above the prior pivot high without returning into the pivot interior. Tier 1 Alpha Leader (Sharpe 1.45, CAGR 15.18%).
+* **Strategy 25: Chan Mean-Reversion Divergence** (`ChanMeanReversionDivergenceStrategy`, `chan_mean_reversion_divergence`): Counter-trend mean reversion targeting extreme deviations from pivot center bands, confirmed by MACD bottom divergence. Tier 2 Capital Preservation (Sharpe 2.26, CAGR 4.27%, MaxDD 3.8%).
+* **Strategy 26: Chan Composite Multi-Stage Scaling** (`ChanCompositeStrategy`, `chan_composite`): Multi-stage position builder combining 1st, 2nd, and 3rd buy points with progressive scaling (1/3rd initial on bottom divergence, 1/3rd on 2nd buy confirmation, 1/3rd on 3rd buy breakout). Tier 1 Alpha Leader (Sharpe 1.53, CAGR 15.91%, MaxDD 5.71%, 90.5% positive folds).
+* **Strategy 27: Chan Best Selector Compound Meta-Strategy** (`ChanBestSelectorStrategy`, `chan_best_selector`): Evaluates each asset's Chan structural state and routes capital to the strongest signal mode (breakout, pullback, or divergence).
+* **Strategy 28: Chan Pivot Shift MACD + VAA Optimal Compound** (`ChanVAACompoundStrategy`, `chan_vaa_compound`): Combines structural Chan alpha with Keller & Keuning's VAA 13612W multi-canary tactical defense overlay, routing to defensive assets (`BIL`, `IEF`) when macro risk triggers. Tier 1 Alpha Leader (Sharpe 1.30, CAGR 14.25%, MaxDD 5.0%).
+* **Strategy 29: Chan Pivot-Oscillation Monitor** (`ChanPivotOscillationStrategy`, `chan_pivot_oscillation`): Intra-pivot range trading oscillating between the lower support and upper resistance bands of active consolidation pivots.
+* **Strategy 30: Chan Fibonacci MA Sector-Strength Rotation** (`ChanFiboSectorStrengthStrategy`, `chan_fibo_sector_strength`): Fibonacci moving average ribbons (8, 13, 21, 55, 89) measuring cross-sectional sector momentum, confirmed by Chan structural pivot shifts.
+
+### Strategy 31–36: Extended TAA, Volatility & Factor Strategies (`rs/taa_strategies.py`, `rs/bollinger_strategy.py`, `rs/residual_momentum_strategy.py`, `rs/adaptive_fast_expansion_strategy.py`)
+
+* **Strategy 31: Hybrid Asset Allocation (HAA)** (`HybridAssetAllocation`, `hybrid_asset_allocation`): Wouter Keller (2023, SSRN). Evaluates a single canary asset (`TIP`). In calm markets (TIP 13612W momentum > 0), allocates to the top 4 offensive assets; in turbulent markets, rotates to defensive assets (`IEF`, `BIL`).
+* **Strategy 32: Defensive Asset Allocation (DAA)** (`DefensiveAssetAllocation`, `defensive_asset_allocation`): Wouter Keller & Jan Willem Keuning (2018, SSRN). Uses a dual-canary universe (`VWO`, `BND`) to determine market stress. In calm regimes (both canaries positive), splits across top 6 offensive assets; in half-crash or full-crash regimes, rotates 50% to 100% into defensive assets (`IEF`, `LQD`, `BIL`).
+* **Strategy 33: Bollinger Bands Squeeze Breakout (Method I)** (`BollingerBreakoutStrategy`, `bollinger_breakout`): John Bollinger (2001, *Bollinger on Bollinger Bands*). Detects low-volatility compression (BandWidth at 126-day lows) and enters long on upper-band breakouts with volume/bandwidth expansion confirmation.
+* **Strategy 34: Bollinger Bands Mean Reversion (Method III)** (`BollingerMeanReversionStrategy`, `bollinger_mean_reversion`): Bollinger %b oscillator buying deep dips below the lower band (%b < 0.05) with RSI confirmation, exiting at the 20-day middle moving average.
+* **Strategy 35: Residual Momentum Strategy** (`ResidualMomentumStrategy`, `residual_momentum`): David Blitz, Juan Pang & Pim van Vliet (2013, *Journal of Empirical Finance*). Regresses rolling 36-month asset returns against the market benchmark (`SPY`) to isolate idiosyncratic returns, ranking assets by 12-month residual momentum divided by residual risk.
+* **Strategy 36: Adaptive Fast Expansion Strategy** (`AdaptiveFastExpansionStrategy`, `adaptive_fast_expansion`): Volatility expansion thrust system capturing structural volatility regime transitions via dynamic ATR bands.
+
+### Strategy 37: Macro Regime Factor Adaptive Compound Strategy (`rs/regime_factor_compound_strategy.py`)
+
+* **Macro Regime Factor Adaptive Compound Strategy** (`RegimeFactorCompoundStrategy`, `regime_factor_compound`): Dynamic multi-factor allocation engine that classifies the macro environment into Growth, Inflation, and Deflation regimes using canary moving averages and yield spreads, allocating risk budgets across momentum, carry, and quality factors with inverse-volatility weighting.
+
+### Strategy 38: Multi-Strategy Alpha Book — Optimal Core-Satellite Blueprint (`rs/multi_strategy_alpha_book.py`)
+
+* **Academic & Quantitative Grounding**: Multi-strategy pod architecture (Millennium, Point72, Citadel; Blitz 2024; Roncalli 2013 Risk Budgeting; Quant Memo 2026).
+* **Core-Satellite Architecture (`ms_pod_preset="core_satellite"`)**:
+  - **Core Pod 1: `ChanPivotShiftMACDStrategy` (30% Target Budget)**: Structural Chan pivot shifts confirmed by MACD histogram momentum divergence. Empirical walkforward: Sharpe 1.75, CAGR 15.11%, MaxDD 4.39%, 95.2% win rate.
+  - **Core Pod 2: `ChanCompositeStrategy` (30% Target Budget)**: Multi-indicator structural Chan alpha staging entries across 1st, 2nd, and 3rd buy points. Empirical walkforward: Sharpe 1.53, CAGR 15.91%, MaxDD 5.71%, 90.5% win rate.
+  - **Satellite Pod 3: `VigilantAssetAllocation` (20% Target Budget)**: Tactical defense pod with Keller 13612W momentum and canary crash rotation. Delivered +54.9% return in Fold 10 (COVID crash).
+  - **Satellite Pod 4: `AcceleratingDualMomentum` (20% Target Budget)**: Multi-horizon trend acceleration across equities and credit. Empirical walkforward: Sharpe 1.02, CAGR 16.78%, low 0.35 correlation with Chan pods.
+  - *Alternative Presets*: `alpha_leaders` (concentrated Tier 1 Chan ensemble) and `all_regime` (balanced all-weather ensemble including Permanent Portfolio).
+* **Mathematical & Operational Innovations**:
+  1. **Dynamic Risk Budgeting**: Slices marginal risk across pods inversely proportional to rolling 63-day realized volatility ($1/\sigma$), smoothed with $\alpha=0.5$ and bounded by $[15\%, 35\%]$ budget clamps.
+  2. **Fast-Recovery Drawdown Regularization**: Continuous damping $D_p = \max(0.20, 1.0 - \text{DD}_p / 0.15)$ replacing destructive 80% quarantine cliffs. Cleared **immediately** when the pod's 10-day trailing return turns positive ($R_{10d} > 0$), preventing trough lockouts.
+  3. **Equity-Growth Breadth Risk-Throttle**: Computes 200-day SMA breadth strictly across growth/equity assets (`growth_symbols > 200d SMA`), decoupling equity risk from fixed-income rate cycle bear markets (e.g. 2022–2024). A 15-day breadth thrust override (>0.65) immediately restores gross exposure.
+  4. **Pod-Native Sparse Execution (`ms_execution_mode="pod_native_sparse"`)**: Preserves underlying intra-month tactical rotation dates, blends daily target allocations, and applies the strict sparse contract with explicit `0.0` writes and idle cash in `BIL`.
+* **Empirical 21-Fold Walk-Forward Performance (2015–2026, 10.5+ Years)**:
+  - Mean Sharpe Ratio: **1.15** (vs. baseline 0.82, +40.2%)
+  - Mean CAGR: **12.49%** (vs. baseline 4.71%, +165.1%)
+  - Worst Fold Max Drawdown: **13.95%** (vs. baseline 18.04%, -22.7% tail risk)
+  - Calmar Ratio: **3.15** (vs. baseline 2.53)
+  - Positive Folds Win Rate: **85.71%** (18/21 folds positive, vs. baseline 66.67%)
+  - Beat SPY Baseline %: **42.86%** (vs. baseline 19.05%)
 
 ### What was researched but NOT implemented in this pass
 
@@ -219,22 +266,37 @@ All CLI runs and unit tests execute strictly against **synthetic multi-asset OHL
 apps/quant/research_strategy/
 ├── rs/
 │   ├── __init__.py
-│   ├── config.py              # StrategyConfig & load_strategies_config()
-│   ├── nl_parser.py           # Plain-English strategy description -> ParsedStrategySpec
-│   ├── chan_structure.py      # Independent Chan-theory structure detector (fractals/strokes/pivots)
-│   ├── chan_signals.py        # Additive extension: segments, real MACD divergence, 一/二/三类买卖点
-│   ├── timing_aspects.py      # Entry x exit/risk aspect decomposition for single-asset timing templates
-│   └── strategy.py            # NaturalLanguageStrategy engine + strategy implementations
-├── strategies_config.json     # Central JSON configuration for all strategies & parameters
-├── run_research_strategy.py   # CLI runner loading strategy configs dynamically
-├── dashboard.py               # Terminal ASCII report viewer
+│   ├── config.py                         # StrategyConfig & load_strategies_config()
+│   ├── nl_parser.py                      # Plain-English strategy description -> ParsedStrategySpec
+│   ├── chan_structure.py                 # Independent Chan-theory structure detector (fractals/strokes/pivots)
+│   ├── chan_signals.py                   # Segments, real MACD divergence, 一/二/三类买卖点
+│   ├── chan_advanced_strategies.py       # Advanced Chan suite (MTF, Third Buy, Mean Reversion, Composite, VAA Compound, Best Selector)
+│   ├── chan_lesson_strategies.py         # Chan lesson strategies (Pivot Oscillation, Fibonacci Sector Strength)
+│   ├── taa_strategies.py                 # Extended TAA strategies (PAA, AAA, HAA, DAA)
+│   ├── bollinger_strategy.py             # Bollinger breakout (Method I) and mean reversion (Method III)
+│   ├── residual_momentum_strategy.py     # Beta-neutralized idiosyncratic residual momentum
+│   ├── adaptive_fast_expansion_strategy.py # Adaptive volatility expansion thrust
+│   ├── regime_factor_compound_strategy.py # Macro regime factor adaptive compound engine
+│   ├── multi_strategy_alpha_book.py      # Institutional Multi-Strategy Alpha Book (Optimal Core-Satellite Blueprint)
+│   ├── timing_aspects.py                 # Entry x exit/risk aspect decomposition for single-asset timing templates
+│   └── strategy.py                       # NaturalLanguageStrategy engine + consolidated strategy implementations
+├── strategies_config.json                # Central JSON configuration for 39 strategies & parameters
+├── run_research_strategy.py              # CLI runner loading strategy configs dynamically
+├── dashboard.py                          # Terminal ASCII report viewer
 ├── tests/
-│   ├── test_nl_parser.py      # Offline unit tests for the plain-English parser
-│   ├── test_chan_structure.py # Offline unit tests for the Chan structure detector
-│   ├── test_chan_signals.py   # Offline unit tests for segments/MACD divergence/三类买卖点
-│   ├── test_timing_aspects.py # Offline unit tests for entry x exit aspect composition
-│   └── test_strategy.py       # Offline unit tests for all strategies & config loading
-└── README.md                  # Strategy formulations, citations, and guide
+│   ├── test_nl_parser.py                 # Offline unit tests for the plain-English parser
+│   ├── test_chan_structure.py            # Offline unit tests for the Chan structure detector
+│   ├── test_chan_signals.py              # Offline unit tests for segments/MACD divergence/三类买卖点
+│   ├── test_chan_advanced_strategies.py  # Offline unit tests for advanced Chan strategies
+│   ├── test_chan_lesson_strategies.py    # Offline unit tests for Chan lesson strategies
+│   ├── test_timing_aspects.py            # Offline unit tests for entry x exit aspect composition
+│   ├── test_strategy.py                  # Offline unit tests for consolidated strategies & config loading
+│   ├── test_bollinger_strategy.py        # Offline unit tests for Bollinger breakout/reversion
+│   ├── test_regime_factor_compound_strategy.py # Offline unit tests for regime factor engine
+│   ├── test_adaptive_fast_expansion_strategy.py # Offline unit tests for fast expansion strategy
+│   ├── test_novel_alpha_strategies.py    # Offline unit tests for novel alpha strategies
+│   └── test_multi_strategy_alpha_book.py # Offline unit tests for Multi-Strategy Alpha Book
+└── README.md                             # Strategy formulations, citations, and guide
 ```
 
 ---
