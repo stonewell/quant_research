@@ -111,19 +111,28 @@ def test_run_composite_position_loop_scaling():
 
 
 def test_run_composite_position_loop_ignores_b2_b3_while_flat():
-    """Review fix 3: only B1 (first_buy) may open a position from flat -- a
-    lone B2/B3 signal with no prior B1 is not actionable."""
+    """When allow_flat_b2_b3=False, only B1 may open from flat.
+    When allow_flat_b2_b3=True (relaxed), B2 opens at b2_w and B3 scales in."""
     close = np.array([100.0, 101.0, 102.0, 103.0, 104.0])
     first_buy = np.array([False, False, False, False, False])
     second_buy = np.array([False, True, False, False, False])
     third_buy = np.array([False, False, True, False, False])
     sell_sig = np.array([False, False, False, False, False])
 
-    raw = run_composite_position_loop(
+    raw_strict = run_composite_position_loop(
         close, first_buy, second_buy, third_buy, sell_sig,
         b1_w=0.30, b2_w=0.40, b3_w=0.30, stop_loss_pct=0.10, max_holding_days=10,
+        allow_flat_b2_b3=False,
     )
-    assert (raw == 0.0).all()
+    assert (raw_strict == 0.0).all()
+
+    raw_relaxed = run_composite_position_loop(
+        close, first_buy, second_buy, third_buy, sell_sig,
+        b1_w=0.30, b2_w=0.40, b3_w=0.30, stop_loss_pct=0.10, max_holding_days=10,
+        allow_flat_b2_b3=True,
+    )
+    assert raw_relaxed[1] == 0.40
+    assert raw_relaxed[2] == 0.70
 
 
 def test_run_composite_position_loop_weighted_average_cost_basis_on_scale_in():
@@ -495,3 +504,34 @@ def test_instantiate_strategy_from_config(key: str):
     assert hasattr(strat_inst, "generate_weights")
     assert hasattr(strat_inst, "explain_weights")
     assert hasattr(strat_inst, "warmup_bars")
+
+
+def test_chan_mtf_trend_produces_active_trades():
+    universe = create_mock_universe(n_days=400)
+    strat = ChanMultiTimeframeTrendStrategy(StrategyConfig())
+    weights = strat.generate_weights(universe)
+    assert not weights.empty
+    rebal = weights.dropna(how="all")
+    risky = rebal.drop(columns=["BIL"], errors="ignore")
+    assert (risky > 0).sum().sum() > 0
+
+
+def test_chan_trend_third_buy_produces_active_trades():
+    universe = create_mock_universe(n_days=400)
+    strat = ChanTrendThirdBuyStrategy(StrategyConfig())
+    weights = strat.generate_weights(universe)
+    assert not weights.empty
+    rebal = weights.dropna(how="all")
+    risky = rebal.drop(columns=["BIL"], errors="ignore")
+    assert (risky > 0).sum().sum() > 0
+
+
+def test_chan_composite_produces_active_trades():
+    universe = create_mock_universe(n_days=400)
+    strat = ChanCompositeStrategy(StrategyConfig())
+    weights = strat.generate_weights(universe)
+    assert not weights.empty
+    rebal = weights.dropna(how="all")
+    risky = rebal.drop(columns=["BIL"], errors="ignore")
+    assert (risky > 0).sum().sum() > 0
+

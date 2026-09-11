@@ -261,6 +261,7 @@ class StrategyConfig:
     chan3_stop_loss_pct: Optional[float] = 0.08   # None disables
     chan3_max_holding_days: Optional[int] = 90    # None disables
     chan3_position_size_pct: float = 1.0
+    chan3_include_stroke_signals: bool = True
 
     # --- Chan Pivot Shift (MACD) (additive copy of Chan Pivot Shift above --
     # see rs/chan_signals.py's compute_chan_pivot_macd_signals; NOT a
@@ -287,6 +288,7 @@ class StrategyConfig:
     chan_mtf_max_holding_days: Optional[int] = 90
     chan_mtf_position_size_pct: float = 1.0
     chan_mtf_pivot_osc_size_pct: float = 0.5   # reduced size when Lesson 107's precise-trend gate hasn't confirmed
+    chan_mtf_require_weekly_regime: bool = False
 
     # --- Chan Trend Third Buy (B3 Breakout Retest) ---
     chan_b3_min_gap_bars: int = 4
@@ -326,6 +328,7 @@ class StrategyConfig:
     chan_comp_b3_weight: float = 0.30
     chan_comp_stop_loss_pct: Optional[float] = 0.08
     chan_comp_max_holding_days: Optional[int] = 90
+    chan_comp_allow_flat_b2_b3: bool = True
 
     # --- Chan Best Selector Meta-Strategy ---
     chan_best_lookback_days: int = 63
@@ -464,7 +467,7 @@ class StrategyConfig:
     regime_compound_vol_zscore_thresh: float = 1.0
     regime_compound_hurst_trend_thresh: float = 0.52
     regime_compound_hurst_meanrev_thresh: float = 0.48
-    regime_compound_mode: str = "discrete_winner"  # "discrete_winner" or "smooth_blend"
+    regime_compound_mode: str = "discrete_winner"  # "discrete_winner", "smooth_blend", or "risk_budgeted"
     regime_compound_enable_vol_targeting: bool = True
     regime_compound_target_vol: float = 0.12
 
@@ -475,6 +478,18 @@ class StrategyConfig:
     afe_top_k: int = 3
     afe_breadth_thrust_thresh: float = 0.65
     afe_rebalance_freq_days: int = 10
+
+    # --- Multi-Strategy Alpha Book Strategy ---
+    ms_pod_preset: str = "core_satellite"   # 'core_satellite', 'alpha_leaders', 'all_regime'
+    ms_execution_mode: str = "pod_native_sparse"  # 'pod_native_sparse', 'periodic_sync'
+    ms_rebalance_freq_days: int = 21
+    ms_lookback_days: int = 63
+    ms_pod_max_drawdown_limit: float = 0.06
+    ms_drawdown_recovery_days: int = 10
+    ms_max_pod_budget: float = 0.35
+    ms_min_pod_budget: float = 0.15
+    ms_budget_smoothing_alpha: float = 0.50
+    ms_canary_breadth_thresh: float = 0.50
 
     # Backtester execution defaults
     initial_capital: float = 100_000.0
@@ -589,8 +604,8 @@ class StrategyConfig:
                 f"StrategyConfig: breadth thresholds must satisfy 0 <= bear ({self.regime_compound_breadth_bear_thresh}) "
                 f"<= bull ({self.regime_compound_breadth_bull_thresh}) <= mom ({self.regime_compound_breadth_mom_thresh}) <= 1"
             )
-        if self.regime_compound_mode not in ("discrete_winner", "smooth_blend"):
-            raise ValueError(f"StrategyConfig.regime_compound_mode must be 'discrete_winner' or 'smooth_blend', got {self.regime_compound_mode}")
+        if self.regime_compound_mode not in ("discrete_winner", "smooth_blend", "risk_budgeted"):
+            raise ValueError(f"StrategyConfig.regime_compound_mode must be 'discrete_winner', 'smooth_blend', or 'risk_budgeted', got {self.regime_compound_mode}")
         if self.afe_fast_roc_days <= 0:
             raise ValueError(f"StrategyConfig.afe_fast_roc_days must be > 0, got {self.afe_fast_roc_days}")
         if self.afe_slow_roc_days <= 0:
@@ -607,6 +622,26 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.afe_target_vol must be > 0, got {self.afe_target_vol}")
         if self.regime_compound_target_vol <= 0:
             raise ValueError(f"StrategyConfig.regime_compound_target_vol must be > 0, got {self.regime_compound_target_vol}")
+        if self.ms_rebalance_freq_days <= 0:
+            raise ValueError(f"StrategyConfig.ms_rebalance_freq_days must be > 0, got {self.ms_rebalance_freq_days}")
+        if self.ms_lookback_days <= 0:
+            raise ValueError(f"StrategyConfig.ms_lookback_days must be > 0, got {self.ms_lookback_days}")
+        valid_presets = {"core_satellite", "alpha_leaders", "all_regime"}
+        if self.ms_pod_preset not in valid_presets:
+            raise ValueError(f"StrategyConfig.ms_pod_preset must be one of {sorted(valid_presets)}, got {self.ms_pod_preset!r}")
+        valid_exec_modes = {"pod_native_sparse", "periodic_sync"}
+        if self.ms_execution_mode not in valid_exec_modes:
+            raise ValueError(f"StrategyConfig.ms_execution_mode must be one of {sorted(valid_exec_modes)}, got {self.ms_execution_mode!r}")
+        if self.ms_drawdown_recovery_days <= 0:
+            raise ValueError(f"StrategyConfig.ms_drawdown_recovery_days must be > 0, got {self.ms_drawdown_recovery_days}")
+        if not (0.0 < self.ms_pod_max_drawdown_limit < 1.0):
+            raise ValueError(f"StrategyConfig.ms_pod_max_drawdown_limit must be between 0 and 1, got {self.ms_pod_max_drawdown_limit}")
+        if not (0.0 < self.ms_min_pod_budget <= self.ms_max_pod_budget <= 1.0):
+            raise ValueError(f"StrategyConfig: ms_min_pod_budget ({self.ms_min_pod_budget}) must be <= ms_max_pod_budget ({self.ms_max_pod_budget}) and > 0")
+        if not (0.0 < self.ms_budget_smoothing_alpha <= 1.0):
+            raise ValueError(f"StrategyConfig.ms_budget_smoothing_alpha must be between 0 and 1, got {self.ms_budget_smoothing_alpha}")
+        if not (0.0 < self.ms_canary_breadth_thresh <= 1.0):
+            raise ValueError(f"StrategyConfig.ms_canary_breadth_thresh must be between 0 and 1, got {self.ms_canary_breadth_thresh}")
 
     @classmethod
     def from_dict(cls, data: dict) -> "StrategyConfig":

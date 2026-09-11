@@ -325,19 +325,20 @@ def run_composite_position_loop(
     b3_w: float = 0.30,
     stop_loss_pct: Optional[float] = 0.08,
     max_holding_days: Optional[int] = 90,
+    allow_flat_b2_b3: bool = True,
 ) -> np.ndarray:
     """Stateful position scaling loop for Chan Composite strategy:
-    - B1 (first_buy): opens the position (b1_w). B2/B3 while flat are not
-      actionable -- only B1 may open a new position.
-    - B2 (second_buy): add allocation (+b2_w), once already open
-    - B3 (third_buy): add allocation (+b3_w), once already open
+    - B1 (first_buy): opens the position (b1_w). When allow_flat_b2_b3=True,
+      B2/B3 can also open positions while flat at their respective weights.
+    - B2 (second_buy): add allocation (+b2_w)
+    - B3 (third_buy): add allocation (+b3_w)
     - Sell signal or stop-loss / timeout: clear back to 0.0
 
     `entry_price` is a weighted-average cost basis, updated on every B2/B3
     scale-in (`new_price = (old_price*old_weight + fill_price*added_weight)
     / new_weight`) so the stop-loss is measured against the position's real
     blended cost, not just the original B1 fill. `entry_idx` (holding-period
-    timeout) deliberately stays at the ORIGINAL B1 bar -- position age is
+    timeout) deliberately stays at the ORIGINAL entry bar -- position age is
     measured from when the thesis first opened, not reset on each add-on.
     """
     close_arr = np.asarray(close)
@@ -384,9 +385,16 @@ def run_composite_position_loop(
                 entry_price = close_arr[i]
                 entry_idx = i
                 raw[i] = current_weight
-            # B2/B3 do nothing while flat -- the strategy's own staged design
-            # (30% B1 -> +40% B2 -> +30% B3) only ever OPENS a position on
-            # B1; a lone B2/B3 signal with no prior B1 is not actionable.
+            elif allow_flat_b2_b3 and b2_arr[i]:
+                current_weight = b2_w
+                entry_price = close_arr[i]
+                entry_idx = i
+                raw[i] = current_weight
+            elif allow_flat_b2_b3 and b3_arr[i]:
+                current_weight = b3_w
+                entry_price = close_arr[i]
+                entry_idx = i
+                raw[i] = current_weight
 
     return raw
 
@@ -432,6 +440,8 @@ class ChanMultiTimeframeTrendStrategy(AllocationTemplate):
         master_index = _aligned_master_index_helper(universe, risky_symbols)
         raw_weights = {}
 
+        require_weekly = p.get("chan_mtf_require_weekly_regime", getattr(cfg, "chan_mtf_require_weekly_regime", False))
+
         for sym in risky_symbols:
             bars = universe[sym]
             close = bars["Close"].reindex(master_index)
@@ -439,14 +449,22 @@ class ChanMultiTimeframeTrendStrategy(AllocationTemplate):
             macro_trend_gate = (close > ma).fillna(False)
 
             sig = compute_chan3_signals(bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes)
-            chan_buy = sig["buy_signal"].reindex(master_index).fillna(False)
-            chan_sell = sig["sell_signal"].reindex(master_index).fillna(False)
+            stroke_sig = compute_chan_pivot_macd_signals(bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes)
+            chan_buy = (sig["buy_signal"] | stroke_sig["buy_signal"]).reindex(master_index).fillna(False)
+            chan_sell = (sig["sell_signal"] | stroke_sig["sell_signal"]).reindex(master_index).fillna(False)
 
-            weekly_regime = _weekly_regime_state(bars, min_gap_bars, min_strokes).reindex(master_index).ffill().fillna(False)
-            trend_confirmed = _precise_trend_confirmed(sig).reindex(master_index).ffill().fillna(False)
+            stroke_trend = compute_stroke_trend(bars, min_gap_bars).reindex(master_index).ffill().fillna(False)
+            relaxed_trend = macro_trend_gate | stroke_trend
 
-            entry_signal = chan_buy & macro_trend_gate & weekly_regime
-            exit_signal = chan_sell | (~macro_trend_gate) | (~weekly_regime)
+            if require_weekly:
+                weekly_regime = _weekly_regime_state(bars, min_gap_bars, min_strokes).reindex(master_index).ffill().fillna(False)
+                entry_signal = chan_buy & macro_trend_gate & weekly_regime
+                exit_signal = chan_sell | (~macro_trend_gate) | (~weekly_regime)
+            else:
+                entry_signal = chan_buy & relaxed_trend
+                exit_signal = chan_sell | (~relaxed_trend & (close < ma * 0.95))
+
+            trend_confirmed = _precise_trend_confirmed(sig).reindex(master_index).ffill().fillna(False) | stroke_trend
             size_at_entry = np.where(trend_confirmed.to_numpy(), position_size_pct, pivot_osc_size_pct)
 
             raw_weights[sym] = _run_variable_size_stop_timeout_exit(
@@ -461,13 +479,14 @@ class ChanMultiTimeframeTrendStrategy(AllocationTemplate):
     def explain_weights(self, params: dict = None) -> str:
         cfg = self.config
         p = params or {}
+        req_weekly = p.get("chan_mtf_require_weekly_regime", getattr(cfg, "chan_mtf_require_weekly_regime", False))
         return (
             "Chan Multi-Timeframe Trend Strategy (区间套与趋势共振): "
-            f"longs active risky symbols when daily Chan buy signals align with a macro "
-            f"{p.get('chan_mtf_trend_ma_period', cfg.chan_mtf_trend_ma_period)}-day SMA uptrend filter "
-            "AND a genuine weekly-level structural re-confirmation (区间套); uses full size once Lesson "
-            "107's precise trend gate (non-divergent B3 rally) confirms, a reduced size otherwise; "
-            "exits on Chan sell signals, macro trend loss, weekly regime loss, stop-loss, or max holding period."
+            f"longs active risky symbols when Chan buy signals (stroke + segment) align with a macro "
+            f"{p.get('chan_mtf_trend_ma_period', cfg.chan_mtf_trend_ma_period)}-day SMA uptrend filter or stroke trend "
+            f"{'AND weekly structural re-confirmation' if req_weekly else '(relaxed Lesson 107 gating)'}; "
+            "uses full size once Lesson 107's precise trend gate confirms, a reduced size otherwise; "
+            "exits on Chan sell signals, macro/stroke trend loss, stop-loss, or max holding period."
         )
 
     def warmup_bars(self, params: dict = None) -> int:
@@ -519,8 +538,13 @@ class ChanTrendThirdBuyStrategy(AllocationTemplate):
                 bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes,
                 macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal,
             )
-            entry_signal = sig["third_buy"].reindex(master_index).fillna(False)
-            exit_signal = sig["sell_signal"].reindex(master_index).fillna(False)
+            stroke_sig = compute_chan_pivot_macd_signals(
+                bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes,
+                macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal,
+            )
+            stroke_pivot_shift = stroke_sig["buy_signal"] & ~stroke_sig["divergence_buy"]
+            entry_signal = (sig["third_buy"] | stroke_pivot_shift).reindex(master_index).fillna(False)
+            exit_signal = (sig["sell_signal"] | stroke_sig["divergence_sell"]).reindex(master_index).fillna(False)
             close = bars["Close"].reindex(master_index)
 
             raw_weights[sym] = run_stop_timeout_exit(
@@ -537,8 +561,8 @@ class ChanTrendThirdBuyStrategy(AllocationTemplate):
         p = params or {}
         return (
             "Chan Trend Third Buy Strategy (第三类买卖点突破回踩): "
-            "longs active risky symbols on 3rd-type buy points (B3 - pivot breakout retest holding above pivot upper band ZG); "
-            "exits on 3rd-type sell points (S3), general sell signals, stop-loss, or max holding period."
+            "longs active risky symbols on 3rd-type buy points (segment B3 or stroke pivot breakout retest holding above pivot band); "
+            "exits on sell points, stop-loss, or max holding period."
         )
 
     def warmup_bars(self, params: dict = None) -> int:
@@ -708,6 +732,7 @@ class ChanCompositeStrategy(AllocationTemplate):
         b3_w = p.get("chan_comp_b3_weight", cfg.chan_comp_b3_weight)
         stop_loss_pct = p.get("chan_comp_stop_loss_pct", cfg.chan_comp_stop_loss_pct)
         max_holding_days = p.get("chan_comp_max_holding_days", cfg.chan_comp_max_holding_days)
+        allow_flat_b2_b3 = p.get("chan_comp_allow_flat_b2_b3", getattr(cfg, "chan_comp_allow_flat_b2_b3", True))
 
         symbols = list(universe.keys())
         risky_symbols = _get_risky_symbols_helper(universe, params, cfg_symbol=None, cfg_risky_universe=None, cash_proxy=cash_proxy)
@@ -723,11 +748,16 @@ class ChanCompositeStrategy(AllocationTemplate):
                 bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes,
                 macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal,
             )
-            first_buy = sig["first_buy"].reindex(master_index).fillna(False)
+            stroke_sig = compute_chan_pivot_macd_signals(
+                bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes,
+                macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal,
+            )
+            stroke_pivot_shift = stroke_sig["buy_signal"] & ~stroke_sig["divergence_buy"]
+            first_buy = (sig["first_buy"] | stroke_sig["divergence_buy"]).reindex(master_index).fillna(False)
             second_buy = sig["second_buy"].reindex(master_index).fillna(False)
-            third_buy = sig["third_buy"].reindex(master_index).fillna(False)
+            third_buy = (sig["third_buy"] | stroke_pivot_shift).reindex(master_index).fillna(False)
             pivot_danger = _pivot_relation_danger_series(bars, min_gap_bars, min_strokes).reindex(master_index).ffill().fillna(False)
-            sell_signal = sig["sell_signal"].reindex(master_index).fillna(False) | pivot_danger
+            sell_signal = (sig["sell_signal"] | stroke_sig["sell_signal"]).reindex(master_index).fillna(False) | pivot_danger
             close = bars["Close"].reindex(master_index)
 
             raw_weights[sym] = run_composite_position_loop(
@@ -741,6 +771,7 @@ class ChanCompositeStrategy(AllocationTemplate):
                 b3_w=b3_w,
                 stop_loss_pct=stop_loss_pct,
                 max_holding_days=max_holding_days,
+                allow_flat_b2_b3=allow_flat_b2_b3,
             )
 
         daily = pd.DataFrame(raw_weights, index=master_index)

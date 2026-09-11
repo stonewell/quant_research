@@ -33,12 +33,12 @@ from .config import StrategyConfig
 from .taa_strategies import score_13612w
 
 
-def _get_risky_symbols_helper(universe, params, cfg_symbol=None, cfg_risky_universe=None, cash_proxy="BIL"):
+def _get_risky_symbols_helper(universe, params, cfg_symbol=None, cfg_risky_universe=None, cash_proxy="BIL", benchmark_sym="SPY"):
     from .strategy import _get_risky_symbols
     risky = _get_risky_symbols(universe, params, cfg_symbol=cfg_symbol, cfg_risky_universe=cfg_risky_universe, cash_proxy=cash_proxy)
     # Exclude canary assets and benchmark from risky growth asset candidate pool
-    canary_and_bench = {"TIP", "IEF", "BIL", "SPY"}
-    # If the resolved universe is only SPY or canary, allow SPY
+    canary_and_bench = {"TIP", "IEF", "BIL", benchmark_sym}
+    # If the resolved universe is only benchmark or canary, allow benchmark
     filtered = [s for s in risky if s not in canary_and_bench]
     return filtered if filtered else risky
 
@@ -72,8 +72,17 @@ class AdaptiveFastExpansionStrategy(AllocationTemplate):
         if not symbols:
             return pd.DataFrame()
 
+        if benchmark_sym not in universe:
+            for b_cand in ["SPY", "QQQ", "VTI", "IWM"]:
+                if b_cand in universe:
+                    benchmark_sym = b_cand
+                    break
+            else:
+                non_cash = [s for s in symbols if s != cash_proxy]
+                benchmark_sym = non_cash[0] if non_cash else symbols[0]
+
         risky_symbols = _get_risky_symbols_helper(
-            universe, params, cfg_symbol=None, cfg_risky_universe=[], cash_proxy=cash_proxy
+            universe, params, cfg_symbol=None, cfg_risky_universe=[], cash_proxy=cash_proxy, benchmark_sym=benchmark_sym
         )
         if not risky_symbols:
             return pd.DataFrame()

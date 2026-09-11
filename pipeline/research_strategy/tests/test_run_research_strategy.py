@@ -40,7 +40,7 @@ def test_strategy_class_map_and_instantiate_helper_importable_from_rs_strategy()
 
     assert rrs.STRATEGY_CLASS_MAP is canonical_map
     assert rrs.instantiate_strategy_from_config_entry is canonical_fn
-    assert len(canonical_map) == 33
+    assert len(canonical_map) == 34
 
 
 def test_strategy_class_map_importable_via_research_strategy_namespace_package():
@@ -62,7 +62,7 @@ def test_strategy_class_map_importable_via_research_strategy_namespace_package()
     the same process."""
     from research_strategy.rs.strategy import STRATEGY_CLASS_MAP as namespaced_map
 
-    assert len(namespaced_map) == 33
+    assert len(namespaced_map) == 34
     assert set(namespaced_map.keys()) == set(rrs.STRATEGY_CLASS_MAP.keys())
 
 
@@ -79,14 +79,12 @@ def test_cache_ttl_days_arg_default_and_parsing():
     assert args.cache_ttl_days == 7.0
 
 
-# Every DEFAULT_UNIVERSE_SYMBOLS ticker except "SCZ" -- AcceleratingDualMomentum
-# (config key "accelerating_dual_momentum") requires adm_equity_b="SCZ" to be
-# present in the loaded universe; without it, its generate_weights() legitimately
-# returns an empty DataFrame (see test_accelerating_dual_momentum_missing_equity_returns_empty
-# in test_strategy.py), which drives run_allocation_backtest() into its
-# short-circuit {"equity_curve": pd.DataFrame(), "turnover": 0.0} return (no
-# "sharpe_ratio" key at all).
-UNIVERSE_WITHOUT_SCZ = [s for s in rrs.DEFAULT_UNIVERSE_SYMBOLS if s != "SCZ"]
+# Universe with only 1 equity ticker ("SPY") plus bonds and commodities -- AcceleratingDualMomentum
+# requires at least 2 distinct equities to perform its A vs. B relative momentum check.
+# With only 1 equity available, its generate_weights() legitimately returns an empty DataFrame
+# (see test_accelerating_dual_momentum_missing_equity_returns_empty in test_strategy.py),
+# which drives run_allocation_backtest() into its short-circuit return (no "sharpe_ratio" key).
+UNIVERSE_SINGLE_EQUITY = ["SPY", "TLT", "TIP", "BIL", "IEF", "AGG", "LQD", "SHY"]
 
 
 def test_strategy_all_survives_one_strategy_hitting_empty_weights_path(tmp_path, monkeypatch, capsys):
@@ -107,7 +105,7 @@ def test_strategy_all_survives_one_strategy_hitting_empty_weights_path(tmp_path,
         "--data-provider", "synthetic",
         "--seed", "7",
         "--n-days", "300",
-        "--universe", *UNIVERSE_WITHOUT_SCZ,
+        "--universe", *UNIVERSE_SINGLE_EQUITY,
     ]
     monkeypatch.setattr(sys, "argv", argv)
 
@@ -208,7 +206,7 @@ def test_strategy_all_skips_vaa_with_warning_when_universe_flags_missing(tmp_pat
         "--data-provider", "synthetic",
         "--seed", "7",
         "--n-days", "300",
-        "--universe", *UNIVERSE_WITHOUT_SCZ,
+        "--universe", *rrs.DEFAULT_UNIVERSE_SYMBOLS,
     ]
     monkeypatch.setattr(sys, "argv", argv)
 

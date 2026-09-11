@@ -91,6 +91,7 @@ from .taa_strategies import (
 from .residual_momentum_strategy import ResidualMomentumStrategy
 from .regime_factor_compound_strategy import RegimeFactorCompoundStrategy
 from .adaptive_fast_expansion_strategy import AdaptiveFastExpansionStrategy
+from .multi_strategy_alpha_book import MultiStrategyAlphaBookStrategy
 from .config import StrategyConfig
 from .nl_parser import ParsedStrategySpec, parse_plain_english_strategy
 
@@ -398,8 +399,38 @@ class AcceleratingDualMomentum(AllocationTemplate):
         bond_b = p.get("adm_bond_b", cfg.adm_bond_b)
 
         symbols = list(universe.keys())
-        if equity_a not in symbols or equity_b not in symbols:
+        if not symbols:
             return pd.DataFrame()
+
+        # Resilient symbol resolution for equity_a and equity_b
+        cash_proxy = p.get("cash_proxy", getattr(cfg, "cash_proxy", "BIL"))
+        known_fixed_income = {"TLT", "TIP", "IEF", "BIL", "BND", "AGG", "LQD", "SHY"}
+        equity_candidates = [s for s in symbols if s != cash_proxy and s not in known_fixed_income]
+
+        resolved_a = equity_a if equity_a in symbols else None
+        if resolved_a is None:
+            for cand in ["SPY", "QQQ", "VTI", "IWM"]:
+                if cand in symbols:
+                    resolved_a = cand
+                    break
+            if resolved_a is None and equity_candidates:
+                resolved_a = equity_candidates[0]
+
+        resolved_b = equity_b if equity_b in symbols and equity_b != resolved_a else None
+        if resolved_b is None:
+            for cand in ["SCZ", "EFA", "EEM", "IWM", "QQQ"]:
+                if cand in symbols and cand != resolved_a:
+                    resolved_b = cand
+                    break
+            if resolved_b is None:
+                remaining = [s for s in equity_candidates if s != resolved_a]
+                if remaining:
+                    resolved_b = remaining[0]
+
+        if not resolved_a or not resolved_b or resolved_a == resolved_b:
+            return pd.DataFrame()
+
+        equity_a, equity_b = resolved_a, resolved_b
 
         master_index = universe[symbols[0]].index
         rebalance_dates = _get_rebalance_dates(master_index, rebal_freq)
@@ -411,6 +442,10 @@ class AcceleratingDualMomentum(AllocationTemplate):
         mom_a = avg_momentum(equity_a)
         mom_b = avg_momentum(equity_b)
         bond_symbols = [s for s in (bond_a, bond_b) if s in symbols]
+        if not bond_symbols:
+            for b_cand in ["TLT", "TIP", "IEF", "BND", "AGG", "LQD", cash_proxy]:
+                if b_cand in symbols:
+                    bond_symbols.append(b_cand)
         bond_1m = {s: roc(universe[s]["Close"], 21) for s in bond_symbols}
 
         weights_rebal = pd.DataFrame(index=rebalance_dates, columns=symbols, data=0.0)
@@ -766,6 +801,7 @@ class ChanThreeTypeStrategy(AllocationTemplate):
         stop_loss_pct = p.get("chan3_stop_loss_pct", cfg.chan3_stop_loss_pct)
         max_holding_days = p.get("chan3_max_holding_days", cfg.chan3_max_holding_days)
         position_size_pct = p.get("chan3_position_size_pct", cfg.chan3_position_size_pct)
+        include_stroke = p.get("chan3_include_stroke_signals", getattr(cfg, "chan3_include_stroke_signals", True))
 
         symbols = list(universe.keys())
         risky_symbols = _get_risky_symbols(universe, params, cfg_symbol=None, cfg_risky_universe=None, cash_proxy=cash_proxy)
@@ -781,8 +817,16 @@ class ChanThreeTypeStrategy(AllocationTemplate):
                 bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes,
                 macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal,
             )
-            entry_signal = sig["buy_signal"].reindex(master_index).fillna(False)
-            exit_signal = sig["sell_signal"].reindex(master_index).fillna(False)
+            if include_stroke:
+                stroke_sig = compute_chan_pivot_macd_signals(
+                    bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes,
+                    macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal,
+                )
+                entry_signal = (sig["buy_signal"] | stroke_sig["buy_signal"]).reindex(master_index).fillna(False)
+                exit_signal = (sig["sell_signal"] | stroke_sig["sell_signal"]).reindex(master_index).fillna(False)
+            else:
+                entry_signal = sig["buy_signal"].reindex(master_index).fillna(False)
+                exit_signal = sig["sell_signal"].reindex(master_index).fillna(False)
             close = bars["Close"].reindex(master_index)
 
             raw_weights[sym] = run_stop_timeout_exit(
@@ -1338,19 +1382,30 @@ class CompounderMarginOfSafetyStrategy(AllocationTemplate):
 
         symbols = list(universe.keys())
         if benchmark_symbol not in universe:
-            # A silent empty return here is indistinguishable from "no entry signal ever fired"
-            # -- this is specifically "the benchmark comparator itself is missing", a distinct,
-            # actionable problem (e.g. --universe/--universe-file doesn't include it -- a
-            # separate --baseline-symbol on the backtester does NOT satisfy this; that loads its
-            # own comparison universe independently of the strategy's own cms_benchmark_symbol).
-            warnings.warn(
-                f"CompounderMarginOfSafetyStrategy: cms_benchmark_symbol '{benchmark_symbol}' is "
-                f"not in the passed universe -- returning empty weights every rebalance. Add it "
-                f"to --universe/--universe-file (it is this strategy's own sell-trigger "
-                f"comparator; it must be present even if you already pass it as the backtester's "
-                f"separate --baseline-symbol)."
-            )
-            return pd.DataFrame()
+            fallback_bench = None
+            for b_cand in ["SPY", "QQQ", "IWM", "VTI"]:
+                if b_cand in universe:
+                    fallback_bench = b_cand
+                    break
+            if not fallback_bench:
+                risky_cands = [s for s in symbols if s != cash_proxy]
+                if len(risky_cands) > 1:
+                    fallback_bench = risky_cands[0]
+            if fallback_bench:
+                warnings.warn(
+                    f"CompounderMarginOfSafetyStrategy: cms_benchmark_symbol '{benchmark_symbol}' is "
+                    f"not in the passed universe -- falling back to '{fallback_bench}' as benchmark comparator."
+                )
+                benchmark_symbol = fallback_bench
+            else:
+                warnings.warn(
+                    f"CompounderMarginOfSafetyStrategy: cms_benchmark_symbol '{benchmark_symbol}' is "
+                    f"not in the passed universe -- returning empty weights every rebalance. Add it "
+                    f"to --universe/--universe-file (it is this strategy's own sell-trigger "
+                    f"comparator; it must be present even if you already pass it as the backtester's "
+                    f"separate --baseline-symbol)."
+                )
+                return pd.DataFrame()
         candidate_symbols = [s for s in candidate_universe if s in universe and s != benchmark_symbol]
         if not candidate_symbols:
             candidate_symbols = [s for s in symbols if s != cash_proxy and s != benchmark_symbol]
@@ -1501,11 +1556,25 @@ class StaticAllocationStrategy(AllocationTemplate):
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
         p = params or {}
         rebal_freq = p.get("rebalance_freq_days", self.default_rebalance_freq_days)
-        weights = p.get("weights", self.weights)
+        weights = dict(p.get("weights", self.weights))
 
         symbols = list(universe.keys())
         if not symbols:
             return pd.DataFrame()
+
+        # If SPY is in weights but not in symbols, dynamically map equity sleeve to available equity
+        if "SPY" in weights and "SPY" not in symbols:
+            equity_fallback = None
+            for cand in ["VTI", "VOO", "QQQ", "IWM", "EFA", "EEM"]:
+                if cand in symbols and cand not in weights:
+                    equity_fallback = cand
+                    break
+            if equity_fallback is None:
+                non_weight = [s for s in symbols if s not in weights and s not in {"BIL", "SHY"}]
+                if non_weight:
+                    equity_fallback = non_weight[0]
+            if equity_fallback:
+                weights[equity_fallback] = weights.pop("SPY")
 
         master_index = universe[symbols[0]].index
         rebalance_dates = _get_rebalance_dates(master_index, rebal_freq)
@@ -1661,6 +1730,37 @@ class HFEAStrategy(StaticAllocationStrategy):
             name="hfea",
             config=config,
         )
+
+    def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
+        p = params or {}
+        symbols = list(universe.keys())
+        if not symbols:
+            return pd.DataFrame()
+
+        stock_sym = "UPRO"
+        if stock_sym not in symbols:
+            for cand in [p.get("hfea_stock_proxy"), "SPY", "QQQ", "VTI", "IWM", "EFA", "EEM"]:
+                if cand and cand in symbols:
+                    stock_sym = cand
+                    break
+            else:
+                non_cash = [s for s in symbols if s not in {"BIL", "SHY"}]
+                stock_sym = non_cash[0] if non_cash else symbols[0]
+
+        bond_sym = "TMF"
+        if bond_sym not in symbols:
+            for cand in [p.get("hfea_bond_proxy"), "TLT", "IEF", "BND", "AGG", "TIP"]:
+                if cand and cand in symbols and cand != stock_sym:
+                    bond_sym = cand
+                    break
+            else:
+                remaining = [s for s in symbols if s != stock_sym]
+                bond_sym = remaining[0] if remaining else stock_sym
+
+        resolved_weights = {stock_sym: 0.55, bond_sym: 0.45}
+        p_copy = dict(p)
+        p_copy["weights"] = resolved_weights
+        return super().generate_weights(universe, p_copy)
 
 
 class ProtectiveAssetAllocation(AllocationTemplate):
@@ -1960,6 +2060,7 @@ STRATEGY_CLASS_MAP = {
     "GoldenButterflyStrategy": GoldenButterflyStrategy,
     "HFEAStrategy": HFEAStrategy,
     "HybridAssetAllocationStrategy": HybridAssetAllocationStrategy,
+    "MultiStrategyAlphaBookStrategy": MultiStrategyAlphaBookStrategy,
     "NaturalLanguageStrategy": NaturalLanguageStrategy,
     "PermanentPortfolioStrategy": PermanentPortfolioStrategy,
     "ProtectiveAssetAllocation": ProtectiveAssetAllocation,

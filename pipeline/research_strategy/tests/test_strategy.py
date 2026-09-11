@@ -817,12 +817,19 @@ def _chan3_breakout_closes(tail=None):
 
 def test_chan3_enters_after_a_buy_point_confirms():
     universe = _timing_universe(make_ohlcv_from_closes(_chan3_breakout_closes()))
-    strat = ChanThreeTypeStrategy()
+    # Test segment-only parity mode
+    strat_seg = ChanThreeTypeStrategy(StrategyConfig(chan3_include_stroke_signals=False))
+    weights_seg = strat_seg.generate_weights(universe)
+    daily_seg = _daily(weights_seg)
+    assert not (daily_seg["SPY"].iloc[:300] > 0).any(), "no entry before segment buy point confirms"
+    assert (daily_seg["SPY"].iloc[300:] > 0).any(), "should enter once segment buy point confirms"
+
+    # Test relaxed default mode (stroke + segment signals)
+    strat = ChanThreeTypeStrategy(StrategyConfig(chan3_include_stroke_signals=True))
     weights = strat.generate_weights(universe)
     daily = _daily(weights)
-
-    assert not (daily["SPY"].iloc[:300] > 0).any(), "no entry before the buy point actually confirms"
-    assert (daily["SPY"].iloc[300:] > 0).any(), "should enter once a buy point (first/second/third-type) confirms"
+    assert not (daily["SPY"].iloc[:100] > 0).any(), "no entry during warm-up period"
+    assert (daily["SPY"].iloc[100:] > 0).any(), "should enter once stroke or segment buy point confirms"
 
 
 def test_chan3_no_entry_on_a_pure_monotonic_decline():
@@ -1871,5 +1878,59 @@ def test_compounder_margin_of_safety_instantiates_and_runs_from_json_config():
     )
     assert not weights.empty
     assert strat.explain_weights()
+
+
+def test_adm_resilient_resolution_without_scz_uses_international_proxy():
+    universe, dates = _adm_universe(n_days=200, spy_drift=0.1, scz_drift=0.2, tlt_drift=0.0, tip_drift=0.0)
+    for df in universe.values():
+        df.index = dates
+    universe["EFA"] = universe.pop("SCZ")  # Replace SCZ with EFA
+
+    strat = AcceleratingDualMomentum()
+    weights = strat.generate_weights(universe)
+    assert not weights.empty
+    rebal = weights.dropna(how="all")
+    assert len(rebal) > 0
+    # Must allocate to EFA since EFA had higher drift
+    last_row = rebal.iloc[-1]
+    assert last_row["EFA"] == 1.0
+
+
+def test_hfea_dynamic_proxy_resolution_without_upro_tmf():
+    universe = create_mock_universe(n_days=200)
+    del universe["UPRO"]
+    del universe["TMF"]
+
+    strat = HFEAStrategy()
+    weights = strat.generate_weights(universe)
+    assert not weights.empty
+    rebal = weights.dropna(how="all")
+    assert len(rebal) > 0
+    # Resolves UPRO -> SPY (0.55), TMF -> TLT (0.45)
+    last_row = rebal.iloc[-1]
+    assert last_row["SPY"] == pytest.approx(0.55)
+    assert last_row["TLT"] == pytest.approx(0.45)
+    assert last_row.sum() == pytest.approx(1.0)
+
+
+def test_cms_fallback_benchmark_when_spy_missing():
+    universe = _cms_universe(n_days=300)
+    universe["QQQ"] = universe.pop("SPY")
+    cfg = StrategyConfig(cms_benchmark_symbol="SPY")
+    strat = CompounderMarginOfSafetyStrategy(cfg)
+    with pytest.warns(UserWarning, match="falling back to 'QQQ'"):
+        weights = strat.generate_weights(universe)
+    assert not weights.empty
+
+
+def test_chan_three_type_produces_active_trades():
+    universe = create_mock_universe(n_days=300)
+    strat = ChanThreeTypeStrategy()
+    weights = strat.generate_weights(universe)
+    assert not weights.empty
+    rebal = weights.dropna(how="all")
+    risky = rebal.drop(columns=["BIL"], errors="ignore")
+    assert (risky > 0).sum().sum() > 0
+
 
 

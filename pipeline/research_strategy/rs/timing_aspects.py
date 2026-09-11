@@ -145,11 +145,19 @@ def _entry_chan3_point(df: pd.DataFrame, params: dict) -> pd.Series:
     macd_fast = params.get("chan3_macd_fast", 12)
     macd_slow = params.get("chan3_macd_slow", 26)
     macd_signal = params.get("chan3_macd_signal", 9)
+    include_stroke = params.get("chan3_include_stroke_signals", True)
     sig = compute_chan3_signals(
         df, min_gap_bars=min_gap_bars, min_strokes=min_strokes,
         macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal,
     )
-    return sig["buy_signal"].reindex(df.index).fillna(False)
+    buy = sig["buy_signal"]
+    if include_stroke:
+        stroke_sig = compute_chan_pivot_macd_signals(
+            df, min_gap_bars=min_gap_bars, min_strokes=min_strokes,
+            macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal,
+        )
+        buy = buy | stroke_sig["buy_signal"]
+    return buy.reindex(df.index).fillna(False)
 
 
 def _entry_chanm_pivot(df: pd.DataFrame, params: dict) -> pd.Series:
@@ -344,12 +352,20 @@ def _exit_chan3_point(df: pd.DataFrame, entry_signal: pd.Series, params: dict) -
     stop_loss_pct = params.get("chan3_stop_loss_pct", 0.08)
     max_holding_days = params.get("chan3_max_holding_days", 90)
     position_size_pct = params.get("chan3_position_size_pct", 1.0)
+    include_stroke = params.get("chan3_include_stroke_signals", True)
 
     sig = compute_chan3_signals(
         df, min_gap_bars=min_gap_bars, min_strokes=min_strokes,
         macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal,
     )
-    exit_signal = sig["sell_signal"].reindex(df.index).fillna(False).to_numpy()
+    sell = sig["sell_signal"]
+    if include_stroke:
+        stroke_sig = compute_chan_pivot_macd_signals(
+            df, min_gap_bars=min_gap_bars, min_strokes=min_strokes,
+            macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal,
+        )
+        sell = sell | stroke_sig["sell_signal"]
+    exit_signal = sell.reindex(df.index).fillna(False).to_numpy()
 
     return run_stop_timeout_exit(close, entry_signal, exit_signal, stop_loss_pct, max_holding_days, position_size_pct)
 

@@ -606,5 +606,25 @@
       "cash_proxy": "BIL"
     },
     "factors": ["relative_momentum", "volatility_targeting", "breadth", "absolute_momentum_trend"]
+  },
+  "multi_strategy_alpha_book": {
+    "name": "Multi-Strategy Alpha Book",
+    "type": "class",
+    "class_name": "MultiStrategyAlphaBookStrategy",
+    "description": "Institutional multi-strategy portfolio combining decorrelated alpha and tactical defense pods (Chan structural trend, Chan multi-signal composite, Vigilant Asset Allocation crash defense, and Accelerating Dual Momentum) with dynamic inverse-volatility risk budgeting, fast-recovery drawdown regularization, and dual-gate macro canary + equity-growth breadth risk-throttling.",
+    "parameters": {
+      "ms_pod_preset": "core_satellite",
+      "ms_execution_mode": "pod_native_sparse",
+      "ms_rebalance_freq_days": 21,
+      "ms_lookback_days": 63,
+      "ms_pod_max_drawdown_limit": 0.06,
+      "ms_drawdown_recovery_days": 10,
+      "ms_max_pod_budget": 0.35,
+      "ms_min_pod_budget": 0.15,
+      "ms_budget_smoothing_alpha": 0.50,
+      "ms_canary_breadth_thresh": 0.50,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["regime_trend_strength", "breadth", "relative_momentum", "volatility_targeting", "absolute_momentum_trend"]
   }
 }

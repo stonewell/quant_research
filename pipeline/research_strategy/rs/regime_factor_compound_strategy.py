@@ -282,6 +282,18 @@ class RegimeFactorCompoundStrategy(AllocationTemplate):
                     w_dense.loc[zero_alloc, cash_proxy] = 1.0
             sub_daily[reg_key] = w_dense
 
+        # If risk_budgeted mode, precompute daily return series of sub-strategies
+        sub_rets: Dict[str, pd.Series] = {}
+        if mode == "risk_budgeted":
+            prices = pd.DataFrame(
+                {s: universe[s]["Close"] for s in symbols if "Close" in universe[s].columns}
+            ).reindex(master_index).ffill()
+            asset_rets = prices.pct_change().fillna(0.0)
+            common_cols = [c for c in symbols if c in asset_rets.columns]
+            for reg_key, w_dense in sub_daily.items():
+                w_shifted = w_dense.shift(1).fillna(0.0)
+                sub_rets[reg_key] = (w_shifted[common_cols] * asset_rets[common_cols]).sum(axis=1)
+
         # 2. Dynamic factor rebalancing loop
         rebalance_dates = _get_rebalance_dates(master_index, rebal_freq)
         output_sparse = pd.DataFrame(np.nan, index=master_index, columns=symbols)
@@ -331,6 +343,42 @@ class RegimeFactorCompoundStrategy(AllocationTemplate):
                 else:  # VOLATILE_ROTATION
                     alt_weights = sub_daily["MOMENTUM_EXPANSION"].loc[date]
                     w = 0.60 * primary_weights + 0.40 * alt_weights
+            elif mode == "risk_budgeted":
+                dt_loc = master_index.get_loc(date)
+                if dt_loc >= 21 and sub_rets:
+                    window_len = min(dt_loc, lookback_days)
+                    vols = {}
+                    quarantine = {}
+                    for reg_key, s_ret in sub_rets.items():
+                        hist = s_ret.iloc[dt_loc - window_len : dt_loc]
+                        vol = float(hist.std() * np.sqrt(252))
+                        vols[reg_key] = max(vol, 0.02)
+                        cum_nav = (1.0 + hist).cumprod()
+                        peak = cum_nav.cummax()
+                        dd = (cum_nav - peak) / peak
+                        quarantine[reg_key] = float(dd.iloc[-1]) < -0.06
+
+                    inv_vols = {k: 1.0 / v for k, v in vols.items()}
+                    for k in inv_vols:
+                        if quarantine.get(k, False):
+                            inv_vols[k] *= 0.20
+
+                    if current_regime in inv_vols:
+                        inv_vols[current_regime] *= 1.50
+
+                    tot_iv = sum(inv_vols.values())
+                    b_weights = {k: v / tot_iv for k, v in inv_vols.items()} if tot_iv > 0 else {k: 0.20 for k in sub_daily}
+                else:
+                    b_weights = {k: 0.20 for k in sub_daily}
+
+                w = pd.Series(0.0, index=symbols)
+                for reg_key, b_w in b_weights.items():
+                    w = w + b_w * sub_daily[reg_key].loc[date]
+
+                breadth_val = float(factors.get("breadth", 0.50))
+                gross_throttle = float(np.clip(breadth_val / 0.50, 0.25, 1.0))
+                risky_cols = [s for s in symbols if s != cash_proxy]
+                w[risky_cols] = w[risky_cols] * gross_throttle
             else:
                 w = sub_daily[current_regime].loc[date].copy()
 
