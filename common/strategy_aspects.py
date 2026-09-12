@@ -100,6 +100,22 @@ def _chosen_symbols(selection: SelectionResult, date) -> list:
     return row[row].index.tolist()
 
 
+def _mask_unchosen_and_derisked(weights_rebal: pd.DataFrame, date, symbols: list, chosen: list, inv_frac: float) -> bool:
+    """Zeroes unchosen symbols and fully de-risked dates per the NaN-vs-0.0 contract.
+    Returns True if weighting calculation should proceed for chosen symbols,
+    or False if no symbols are chosen or the date is de-risked.
+    """
+    not_chosen = [s for s in symbols if s not in chosen]
+    if not_chosen:
+        weights_rebal.loc[date, not_chosen] = 0.0
+    if not chosen:
+        return False
+    if inv_frac <= 0:
+        weights_rebal.loc[date, chosen] = 0.0
+        return False
+    return True
+
+
 # --------------------------------------------------------------------------
 # Selection aspects
 # --------------------------------------------------------------------------
@@ -295,18 +311,7 @@ def _weight_inverse_vol(universe, selection: SelectionResult, params, master_ind
     for date in rebalance_dates:
         inv_frac = selection.invested_fraction.loc[date]
         chosen = _chosen_symbols(selection, date)
-        not_chosen = [s for s in symbols if s not in chosen]
-        if not_chosen:
-            weights_rebal.loc[date, not_chosen] = 0.0
-        if not chosen:
-            continue
-        if inv_frac <= 0:
-            # A fully de-risked date (only breadth_gated_topn ever produces
-            # this) is a definite, known decision, NOT a data-availability
-            # gap -- these symbols must be explicitly zeroed too, or they'd
-            # stay NaN and ffill a stale prior weight straight through the
-            # de-risk event instead of actually closing the position.
-            weights_rebal.loc[date, chosen] = 0.0
+        if not _mask_unchosen_and_derisked(weights_rebal, date, symbols, chosen, inv_frac):
             continue
         w = _inverse_vol_weights(vols_rebal.loc[date, chosen], scale=inv_frac, on_invalid="nan")
         weights_rebal.loc[date, chosen] = w.values
@@ -332,16 +337,7 @@ def _weight_hrp(universe, selection: SelectionResult, params, master_index, reba
     for date in rebalance_dates:
         inv_frac = selection.invested_fraction.loc[date]
         chosen = _chosen_symbols(selection, date)
-        not_chosen = [s for s in symbols if s not in chosen]
-        if not_chosen:
-            weights_rebal.loc[date, not_chosen] = 0.0
-        if not chosen:
-            continue
-        if inv_frac <= 0:
-            # See _weight_inverse_vol: a fully de-risked date is a definite
-            # decision, not a data gap -- these symbols must be explicitly
-            # zeroed too, not left NaN to ffill a stale prior weight.
-            weights_rebal.loc[date, chosen] = 0.0
+        if not _mask_unchosen_and_derisked(weights_rebal, date, symbols, chosen, inv_frac):
             continue
         loc = master_index.get_loc(date)
         if loc < lookback:
@@ -370,16 +366,7 @@ def _weight_min_variance(universe, selection: SelectionResult, params, master_in
     for date in rebalance_dates:
         inv_frac = selection.invested_fraction.loc[date]
         chosen = _chosen_symbols(selection, date)
-        not_chosen = [s for s in symbols if s not in chosen]
-        if not_chosen:
-            weights_rebal.loc[date, not_chosen] = 0.0
-        if not chosen:
-            continue
-        if inv_frac <= 0:
-            # See _weight_inverse_vol: a fully de-risked date is a definite
-            # decision, not a data gap -- these symbols must be explicitly
-            # zeroed too, not left NaN to ffill a stale prior weight.
-            weights_rebal.loc[date, chosen] = 0.0
+        if not _mask_unchosen_and_derisked(weights_rebal, date, symbols, chosen, inv_frac):
             continue
         loc = master_index.get_loc(date)
         if loc < lookback:
@@ -408,16 +395,7 @@ def _weight_max_diversification(universe, selection: SelectionResult, params, ma
     for date in rebalance_dates:
         inv_frac = selection.invested_fraction.loc[date]
         chosen = _chosen_symbols(selection, date)
-        not_chosen = [s for s in symbols if s not in chosen]
-        if not_chosen:
-            weights_rebal.loc[date, not_chosen] = 0.0
-        if not chosen:
-            continue
-        if inv_frac <= 0:
-            # See _weight_inverse_vol: a fully de-risked date is a definite
-            # decision, not a data gap -- these symbols must be explicitly
-            # zeroed too, not left NaN to ffill a stale prior weight.
-            weights_rebal.loc[date, chosen] = 0.0
+        if not _mask_unchosen_and_derisked(weights_rebal, date, symbols, chosen, inv_frac):
             continue
         loc = master_index.get_loc(date)
         if loc < lookback:

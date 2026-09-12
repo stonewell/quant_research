@@ -191,6 +191,20 @@ class MultiStrategyAlphaBookStrategy(AllocationTemplate):
         canary_candidates = ["TIP", "IEF", "BIL"]
         canary_symbols = [s for s in canary_candidates if s in universe and "Close" in universe[s].columns]
 
+        # Precompute indicators across full history to eliminate redundant O(dates * symbols) rolling slices
+        growth_ma200 = {}
+        growth_r15 = {}
+        for sym in growth_symbols:
+            if sym in universe and "Close" in universe[sym].columns:
+                c_full = universe[sym]["Close"]
+                growth_ma200[sym] = sma(c_full, 200)
+                growth_r15[sym] = roc(c_full, 15)
+
+        canary_scores = {}
+        for csym in canary_symbols:
+            c_full = universe[csym]["Close"]
+            canary_scores[csym] = score_13612w(c_full)
+
         # 4. Multi-strategy allocation & budget review schedule
         budget_dates = _get_rebalance_dates(master_index, rebal_freq)
         current_budgets = {pod_name: 1.0 / n_pods for pod_name in pod_names}
@@ -259,42 +273,38 @@ class MultiStrategyAlphaBookStrategy(AllocationTemplate):
             # 1. Growth Breadth: % of growth symbols > 200d SMA
             breadth_count = 0
             valid_breadth_syms = 0
-            for sym in growth_symbols:
-                if sym in universe and "Close" in universe[sym].columns:
-                    c_series = universe[sym]["Close"].loc[:date]
-                    if len(c_series) >= 200:
-                        ma200 = sma(c_series, 200).iloc[-1]
-                        if pd.notna(ma200) and c_series.iloc[-1] > ma200:
-                            breadth_count += 1
+            for sym, ma200_series in growth_ma200.items():
+                if date in ma200_series.index:
+                    ma200 = ma200_series.loc[date]
+                    c_val = universe[sym]["Close"].loc[date]
+                    if pd.notna(ma200) and pd.notna(c_val):
                         valid_breadth_syms += 1
+                        if c_val > ma200:
+                            breadth_count += 1
             growth_breadth = (breadth_count / valid_breadth_syms) if valid_breadth_syms > 0 else 0.50
 
             # 2. Canary Breadth: 13612W score on canary assets
             canary_pos = 0
             canary_total = 0
-            if canary_symbols:
-                for csym in canary_symbols:
-                    c_close = universe[csym]["Close"].loc[:date]
-                    if len(c_close) >= 252:
-                        s_series = score_13612w(c_close)
-                        s_val = s_series.iloc[-1] if not s_series.empty else np.nan
-                        if pd.notna(s_val):
-                            canary_total += 1
-                            if s_val > 0:
-                                canary_pos += 1
+            for csym, s_series in canary_scores.items():
+                if date in s_series.index:
+                    s_val = s_series.loc[date]
+                    if pd.notna(s_val):
+                        canary_total += 1
+                        if s_val > 0:
+                            canary_pos += 1
             canary_breadth = (canary_pos / canary_total) if canary_total > 0 else growth_breadth
 
             # 3. Short-Term 15-day Breadth Thrust (% growth assets with 15d ROC > 0)
             short_count = 0
             valid_short_syms = 0
-            for sym in growth_symbols:
-                if sym in universe and "Close" in universe[sym].columns:
-                    c_series = universe[sym]["Close"].loc[:date]
-                    if len(c_series) >= 15:
-                        r15 = roc(c_series, 15).iloc[-1]
-                        if pd.notna(r15) and r15 > 0:
-                            short_count += 1
+            for sym, r15_series in growth_r15.items():
+                if date in r15_series.index:
+                    r15 = r15_series.loc[date]
+                    if pd.notna(r15):
                         valid_short_syms += 1
+                        if r15 > 0:
+                            short_count += 1
             short_thrust = (short_count / valid_short_syms) if valid_short_syms > 0 else 0.50
 
             # Dual-gate continuous throttle

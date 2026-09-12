@@ -33,14 +33,7 @@ class StaticUniverseProvider(BaseUniverseProvider):
             self.symbols = [str(s).strip().upper() for s in symbols if str(s).strip()]
 
     def get_symbols(self, **kwargs) -> List[str]:
-        # Deduplicate preserving order
-        seen = set()
-        out = []
-        for s in self.symbols:
-            if s not in seen:
-                seen.add(s)
-                out.append(s)
-        return out
+        return list(dict.fromkeys(self.symbols))
 
 
 class FileUniverseProvider(BaseUniverseProvider):
@@ -104,15 +97,8 @@ class FileUniverseProvider(BaseUniverseProvider):
                     tokens = [t.strip().upper() for t in line.replace(",", " ").split() if t.strip()]
                     symbols.extend(tokens)
 
-        # Deduplicate preserving order
-        seen = set()
-        out = []
-        for s in symbols:
-            s_clean = str(s).strip().upper()
-            if s_clean and s_clean not in seen:
-                seen.add(s_clean)
-                out.append(s_clean)
-
+        cleaned = [str(s).strip().upper() for s in symbols if str(s).strip()]
+        out = list(dict.fromkeys(cleaned))
         if not out:
             raise ValueError(f"Universe file '{self.file_path}' resolved to zero valid ticker symbols.")
 
@@ -199,14 +185,8 @@ class CodeUniverseProvider(BaseUniverseProvider):
         if not isinstance(result, (list, tuple, set)):
             raise ValueError(f"Code universe provider output must be a sequence of symbols, got {type(result)}")
 
-        seen = set()
-        out = []
-        for s in result:
-            s_clean = str(s).strip().upper()
-            if s_clean and s_clean not in seen:
-                seen.add(s_clean)
-                out.append(s_clean)
-        return out
+        cleaned = [str(s).strip().upper() for s in result if str(s).strip()]
+        return list(dict.fromkeys(cleaned))
 
 
 _UNIVERSE_REGISTRY: Dict[str, Type[BaseUniverseProvider]] = {}

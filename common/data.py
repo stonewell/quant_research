@@ -435,9 +435,7 @@ def _load_provider_from_specifier(specifier: str, **kwargs) -> BaseDataProvider:
                 f"No BaseDataProvider subclass found in module '{path_or_module}'. Specify 'module:ClassName'."
             )
 
-    if isinstance(target_cls, type):
-        instance = target_cls(**kwargs)
-    elif callable(target_cls):
+    if callable(target_cls):
         instance = target_cls(**kwargs)
     else:
         instance = target_cls

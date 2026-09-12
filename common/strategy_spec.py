@@ -30,6 +30,8 @@ for _group in ("pipeline", "ml"):
 
 from common.allocation_templates import ALLOCATION_TEMPLATES, PatternBasedAllocationTemplate
 
+_STATIC_TEMPLATES = {cls.name: cls for cls in ALLOCATION_TEMPLATES}
+
 
 def get_template(template_name: str, pattern_spec: dict = None, research_strategy_spec: dict = None,
                   composite_spec: dict = None, params: dict = None, fundamental_spec: dict = None,
@@ -135,6 +137,9 @@ def get_template(template_name: str, pattern_spec: dict = None, research_strateg
             mined_p_value=pattern_spec.get("mined_p_value"),
             mined_n_events=pattern_spec.get("mined_n_events"),
         )
+    template_cls = _STATIC_TEMPLATES.get(template_name)
+    if template_cls is not None:
+        return template_cls()
     for cls in ALLOCATION_TEMPLATES:
         if cls.name == template_name:
             return cls()

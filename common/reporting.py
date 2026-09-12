@@ -88,7 +88,10 @@ def format_walkforward_performance_table(folds_df: pd.DataFrame) -> str:
     formatted = folds_df.copy()
 
     pct_cols = {"cagr", "max_drawdown", "win_rate", "baseline_cagr", "baseline_max_drawdown", "outperformance"}
-    ratio_cols = {"sharpe_ratio", "calmar_ratio", "profit_factor", "baseline_sharpe_ratio", "baseline_calmar_ratio"}
+    ratio_cols = {
+        "sharpe_ratio", "calmar_ratio", "profit_factor", "baseline_sharpe_ratio",
+        "baseline_calmar_ratio", "total_turnover",
+    }
 
     for col in formatted.columns:
         if col in pct_cols:
@@ -96,10 +99,6 @@ def format_walkforward_performance_table(folds_df: pd.DataFrame) -> str:
                 lambda x: f"{x * 100:.2f}%" if pd.notna(x) and np.isfinite(x) else ("N/A" if pd.isna(x) else str(x))
             )
         elif col in ratio_cols:
-            formatted[col] = formatted[col].apply(
-                lambda x: f"{x:.2f}" if pd.notna(x) and np.isfinite(x) else ("N/A" if pd.isna(x) else str(x))
-            )
-        elif col == "total_turnover":
             formatted[col] = formatted[col].apply(
                 lambda x: f"{x:.2f}" if pd.notna(x) and np.isfinite(x) else ("N/A" if pd.isna(x) else str(x))
             )
