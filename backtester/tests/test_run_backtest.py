@@ -515,6 +515,73 @@ def test_main_runs_research_strategy_strategy_walkforward_end_to_end(tmp_path, m
     assert folds_df["cagr"].notna().any()
 
 
+def test_main_standard_exports_detailed_rebalance_report(tmp_path, monkeypatch, capsys):
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(strategy_path, params={"rebalance_freq_days": 21})
+    results_dir = tmp_path / "results"
+    cache_dir = tmp_path / "cache"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "AAA", "BBB",
+        "--data-provider", "synthetic",
+        "--mode", "standard",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    main()
+
+    rebal_path = results_dir / "rebalance_report.csv"
+    assert os.path.exists(rebal_path)
+    df = pd.read_csv(rebal_path)
+    assert len(df) > 0
+    from common.allocation_backtester import REBALANCE_REPORT_COLUMNS
+    assert list(df.columns) == REBALANCE_REPORT_COLUMNS
+    assert set(df["symbol"]).issubset({"AAA", "BBB"})
+    assert set(df["action"]).issubset({"BUY", "SELL"})
+
+    captured = capsys.readouterr()
+    assert "Total Rebalance Trades:" in captured.out
+    assert "Recent Rebalance Trades:" in captured.out
+
+
+def test_main_walkforward_exports_detailed_rebalance_report(tmp_path, monkeypatch, capsys):
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(strategy_path, params={"rebalance_freq_days": 21})
+    results_dir = tmp_path / "results"
+    cache_dir = tmp_path / "cache"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "AAA", "BBB",
+        "--data-provider", "synthetic",
+        "--mode", "walkforward",
+        "--window-years", "1.0",
+        "--step-years", "0.5",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    main()
+
+    wf_rebal_path = results_dir / "walkforward_rebalances.csv"
+    assert os.path.exists(wf_rebal_path)
+    df = pd.read_csv(wf_rebal_path)
+    assert len(df) > 0
+    from common.allocation_backtester import REBALANCE_REPORT_COLUMNS
+    assert list(df.columns) == ["fold"] + REBALANCE_REPORT_COLUMNS
+    assert df["fold"].min() >= 1
+
+    captured = capsys.readouterr()
+    assert "Total Walkforward Rebalance Trades:" in captured.out
+    assert "Recent Walkforward Rebalance Trades:" in captured.out
+
+
 # --- Feature 1/2/3: baseline comparison, walkforward summary, equity charting ---
 
 

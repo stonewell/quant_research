@@ -65,7 +65,7 @@ all of them raises `ValueError("No universe symbols provided or resolved...")`.
 | `--data-provider` | str, default `"yfinance"` | `yfinance`, `csv`, `synthetic`, or a custom module specifier |
 | `--data-dir` | path, default: none | Folder path for the `csv` data provider |
 | `--no-cache` | flag, default off (cached) | Disable local CSV caching of fetched data |
-| `--results-dir` | path, default: none | Override where `backtest_equity.csv`/`backtest_weights.csv`/`walkforward_report.csv` are written (defaults to `backtester/results/`) |
+| `--results-dir` | path, default: none | Override where `backtest_equity.csv`/`backtest_weights.csv`/`rebalance_report.csv`/`walkforward_report.csv`/`walkforward_rebalances.csv` are written (defaults to `backtester/results/`) |
 | `--cache-dir` | path, default: none | Override the OHLCV CSV cache directory (defaults to the shared, workspace-wide `<repo_root>/data/` — see `common/README.md`'s "Shared OHLCV cache directory" section) |
 | `--cache-ttl-days` | float days, default: none | Re-fetch a cached OHLCV file older than N days instead of trusting it forever |
 | `--no-plots` | flag, default off (charts on) | Skip the `equity_curve.png` chart normally produced in `--mode standard` |

@@ -27,7 +27,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from common.allocation_backtester import run_allocation_backtest
+from common.allocation_backtester import REBALANCE_REPORT_COLUMNS, run_allocation_backtest
 from common.allocation_search import optimize_template
 from common.allocation_templates import ALLOCATION_TEMPLATES
 from common.cli_utils import (
@@ -48,6 +48,7 @@ from common.metrics import alpha_beta, deflated_sharpe_ratio, information_ratio,
 from common import plotting
 from common.reporting import (
     format_backtest_metrics_summary,
+    format_rebalance_trades_preview,
     format_walkforward_performance_table,
     write_json_report,
 )
@@ -188,6 +189,7 @@ def run_walkforward(universe: dict, template, params: dict, args) -> list:
             "sharpe_ratio": float("nan"), "cagr": float("nan"), "max_drawdown": float("nan"),
             "calmar_ratio": float("nan"), "win_rate": float("nan"), "profit_factor": float("nan"),
             "total_turnover": 0.0, "total_rebalances": 0,
+            "rebalance_report": pd.DataFrame(columns=REBALANCE_REPORT_COLUMNS),
         }
 
     folds = []
@@ -237,6 +239,7 @@ def run_walkforward(universe: dict, template, params: dict, args) -> list:
                         "profit_factor": result["profit_factor"],
                         "total_turnover": result["total_turnover"],
                         "total_rebalances": result["total_rebalances"],
+                        "rebalance_report": result.get("rebalance_report", pd.DataFrame(columns=REBALANCE_REPORT_COLUMNS)),
                     }
         except Exception as e:
             print(f"Error in window {start_date} to {end_date}: {e}")
@@ -567,6 +570,15 @@ def main():
         result["actual_weights"].to_csv(weights_path)
         print(f"Saved actual daily weights to {weights_path}")
 
+        rebal_df = result.get("rebalance_report", pd.DataFrame(columns=REBALANCE_REPORT_COLUMNS))
+        rebalance_report_path = os.path.join(results_dir, "rebalance_report.csv")
+        rebal_df.to_csv(rebalance_report_path, index=False)
+        print(f"Saved rebalance report to {rebalance_report_path}")
+        print(f"Total Rebalance Trades: {len(rebal_df)}")
+        if not rebal_df.empty:
+            print("\nRecent Rebalance Trades:")
+            print(format_rebalance_trades_preview(rebal_df))
+
         baseline_result = None
         if args.baseline_symbol:
             baseline_result, baseline_params = _run_baseline(args, cache_dir, data_kwargs)
@@ -627,7 +639,20 @@ def main():
                 params, args,
             )
 
-        folds_df = pd.DataFrame(folds)
+        all_wf_trades = []
+        for fold_idx, f in enumerate(folds, 1):
+            f_trades = f.get("rebalance_report")
+            if f_trades is not None and not f_trades.empty:
+                df = f_trades.copy()
+                df.insert(0, "fold", fold_idx)
+                all_wf_trades.append(df)
+        if all_wf_trades:
+            wf_trades_df = pd.concat(all_wf_trades, ignore_index=True)
+        else:
+            wf_trades_df = pd.DataFrame(columns=["fold"] + REBALANCE_REPORT_COLUMNS)
+
+        folds_clean = [{k: v for k, v in f.items() if k != "rebalance_report"} for f in folds]
+        folds_df = pd.DataFrame(folds_clean)
 
         baseline_params = None
         baseline_calendar_mismatch = False
@@ -722,6 +747,14 @@ def main():
         out_path = os.path.join(results_dir, "walkforward_report.csv")
         folds_df.to_csv(out_path, index=False)
         print(f"\nSaved walkforward report to {out_path}")
+
+        wf_trades_path = os.path.join(results_dir, "walkforward_rebalances.csv")
+        wf_trades_df.to_csv(wf_trades_path, index=False)
+        print(f"Saved walkforward rebalance report to {wf_trades_path}")
+        print(f"Total Walkforward Rebalance Trades: {len(wf_trades_df)}")
+        if not wf_trades_df.empty:
+            print("\nRecent Walkforward Rebalance Trades:")
+            print(format_rebalance_trades_preview(wf_trades_df))
 
 
 if __name__ == "__main__":

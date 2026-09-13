@@ -13,6 +13,25 @@ import pandas as pd
 
 from common.metrics import profit_factor_from_returns, win_rate_from_returns
 
+REBALANCE_REPORT_COLUMNS = [
+    "rebalance_id",
+    "date",
+    "symbol",
+    "action",
+    "price",
+    "prior_weight",
+    "target_weight",
+    "weight_change",
+    "trade_value",
+    "shares",
+    "prior_shares",
+    "target_shares",
+    "commission",
+    "slippage",
+    "total_cost",
+    "portfolio_equity",
+]
+
 
 def run_allocation_backtest(
     universe: Dict[str, pd.DataFrame],
@@ -87,6 +106,39 @@ def run_allocation_backtest(
     equity[0] -= equity[0] * turnover * cost_factor
     total_turnover += turnover
 
+    trades = []
+    rebalance_id = 0
+
+    if turnover > 1e-7:
+        rebalance_id += 1
+        day0_date = common_idx[0].strftime("%Y-%m-%d")
+        for i, sym in enumerate(symbols):
+            target_w = float(tgt_w_arr[0, i])
+            if abs(target_w) > 1e-7:
+                price = float(closes.iloc[0, i])
+                trade_val = float(abs(target_w) * initial_capital)
+                shares = float(trade_val / price) if price > 0 else 0.0
+                comm = float(trade_val * commission_pct)
+                slip = float(trade_val * slippage_pct)
+                trades.append({
+                    "rebalance_id": rebalance_id,
+                    "date": day0_date,
+                    "symbol": sym,
+                    "action": "BUY" if target_w > 0 else "SELL",
+                    "price": price,
+                    "prior_weight": 0.0,
+                    "target_weight": target_w,
+                    "weight_change": target_w,
+                    "trade_value": trade_val,
+                    "shares": shares,
+                    "prior_shares": 0.0,
+                    "target_shares": float(shares if target_w >= 0 else -shares),
+                    "commission": comm,
+                    "slippage": slip,
+                    "total_cost": comm + slip,
+                    "portfolio_equity": float(initial_capital),
+                })
+
     for t in range(1, n_days):
         # 1. Morning: Portfolio grows by the return of the assets held overnight
         # The return on day t applies to the weights held at the end of day t-1
@@ -102,17 +154,56 @@ def run_allocation_backtest(
         if is_rebalance[t]:
             # Rebalance required
             turnover = np.sum(np.abs(tgt_w_arr[t] - drifted_w))
+            pre_rebal_equity = float(equity[t])
             # Deduct costs from equity
             equity[t] -= equity[t] * turnover * cost_factor
             total_turnover += turnover
             # Set new actual weights to the target
             actual_w[t] = tgt_w_arr[t]
+
+            # Record trades for assets that were rebalanced
+            rebal_trades = []
+            for i, sym in enumerate(symbols):
+                prior_w = float(drifted_w[i])
+                target_w = float(tgt_w_arr[t, i])
+                delta_w = target_w - prior_w
+                if abs(delta_w) > 1e-7:
+                    price = float(closes.iloc[t, i])
+                    trade_val = float(abs(delta_w) * pre_rebal_equity)
+                    shares = float(trade_val / price) if price > 0 else 0.0
+                    prior_s = float((prior_w * pre_rebal_equity) / price) if price > 0 else 0.0
+                    target_s = float((target_w * pre_rebal_equity) / price) if price > 0 else 0.0
+                    comm = float(trade_val * commission_pct)
+                    slip = float(trade_val * slippage_pct)
+                    rebal_trades.append({
+                        "rebalance_id": rebalance_id + 1,
+                        "date": common_idx[t].strftime("%Y-%m-%d"),
+                        "symbol": sym,
+                        "action": "BUY" if delta_w > 0 else "SELL",
+                        "price": price,
+                        "prior_weight": prior_w,
+                        "target_weight": target_w,
+                        "weight_change": delta_w,
+                        "trade_value": trade_val,
+                        "shares": shares,
+                        "prior_shares": prior_s,
+                        "target_shares": target_s,
+                        "commission": comm,
+                        "slippage": slip,
+                        "total_cost": comm + slip,
+                        "portfolio_equity": pre_rebal_equity,
+                    })
+            if rebal_trades:
+                rebalance_id += 1
+                trades.extend(rebal_trades)
         else:
             # No rebalance, actual weights are just the drifted weights
             actual_w[t] = drifted_w
 
     equity_df = pd.DataFrame(index=common_idx)
     equity_df["equity"] = equity
+
+    rebalance_report_df = pd.DataFrame(trades, columns=REBALANCE_REPORT_COLUMNS) if trades else pd.DataFrame(columns=REBALANCE_REPORT_COLUMNS)
 
     # Reconstruct actual weights DataFrame for transparency
     actual_weights_df = pd.DataFrame(actual_w, index=common_idx, columns=symbols)
@@ -161,6 +252,7 @@ def run_allocation_backtest(
     return {
         "equity_curve": equity_df,
         "actual_weights": actual_weights_df,
+        "rebalance_report": rebalance_report_df,
         "total_turnover": total_turnover,
         "total_rebalances": int(is_rebalance.sum()),
         "total_return": total_return,

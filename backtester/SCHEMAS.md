@@ -78,6 +78,30 @@ The shared backtest result dict's `equity_curve` (`../common/README.md` §4), wr
 The shared backtest result dict's `actual_weights` (`../common/README.md` §4) — the DENSE daily
 weights actually held (post-drift, post-rebalance), one column per universe symbol.
 
+### `results/rebalance_report.csv` (`--mode standard`)
+
+Itemized trade-by-trade log for every asset balanced during portfolio rebalancing events. Only
+assets whose positions were adjusted (`|weight_change| > 1e-7`) are recorded (unallocated or
+unadjusted assets are omitted).
+
+Columns:
+- `rebalance_id` (`int`): Sequential index of the rebalance event (1, 2, ...).
+- `date` (`str`, `YYYY-MM-DD`): Date on which the rebalance trade executed (at the close).
+- `symbol` (`str`): Ticker of the asset traded.
+- `action` (`str`, `"BUY"` or `"SELL"`): Trade direction.
+- `price` (`float`): Close price at execution.
+- `prior_weight` (`float`): Weight held prior to rebalance (after mark-to-market drift, or 0.0 on Day 0).
+- `target_weight` (`float`): Target weight allocated by the strategy.
+- `weight_change` (`float`): `target_weight - prior_weight` (delta weight).
+- `trade_value` (`float`): Notional traded in dollars (`abs(weight_change) * portfolio_equity`).
+- `shares` (`float`): Number of shares traded (`trade_value / price`).
+- `prior_shares` (`float`): Shares held before rebalance (`(prior_weight * portfolio_equity) / price`).
+- `target_shares` (`float`): Target shares held after rebalance (`(target_weight * portfolio_equity) / price`).
+- `commission` (`float`): Commission cost incurred (`trade_value * commission_pct`).
+- `slippage` (`float`): Slippage cost incurred (`trade_value * slippage_pct`).
+- `total_cost` (`float`): Total transaction cost (`commission + slippage`).
+- `portfolio_equity` (`float`): Pre-rebalance portfolio equity before deducting turnover costs.
+
 ### `results/walkforward_report.csv` (`--mode walkforward`)
 
 One row per rolling fold. Columns: `start_date`, `end_date` (str, `YYYY-MM-DD`), `sharpe_ratio`,
@@ -92,6 +116,12 @@ strategy's fold rows by **`(start_date, end_date)`, not row position** — the s
 fold lists come from independently loaded calendars and bar-position arithmetic, so they are not
 guaranteed to line up row-for-row. A strategy fold whose `(start_date, end_date)` has no matching
 baseline fold gets `NaN` in all 5 columns rather than being dropped.
+
+### `results/walkforward_rebalances.csv` (`--mode walkforward`)
+
+Aggregated itemized rebalance trades across all rolling walkforward folds. Shares the exact same
+columns as `rebalance_report.csv`, with an additional leading `fold` (`int`, 1-indexed) column
+identifying which rolling window the trade belongs to.
 
 ### `results/baseline_equity.csv` (`--mode standard`, only when `--baseline-symbol` is set)
 

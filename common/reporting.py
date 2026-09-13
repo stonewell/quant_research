@@ -104,3 +104,31 @@ def format_walkforward_performance_table(folds_df: pd.DataFrame) -> str:
             )
 
     return formatted.to_string(index=False)
+
+
+def format_rebalance_trades_preview(rebalance_df: pd.DataFrame, n: int = 10) -> str:
+    """Formats the last `n` trade rows from a rebalance_report DataFrame into a
+    clean ASCII preview table.
+    """
+    if rebalance_df is None or rebalance_df.empty:
+        return "No rebalance trades recorded."
+
+    recent = rebalance_df.tail(n).copy()
+    formatted = pd.DataFrame(index=recent.index)
+
+    if "fold" in recent.columns:
+        formatted["fold"] = recent["fold"]
+    if "rebalance_id" in recent.columns:
+        formatted["rebal_id"] = recent["rebalance_id"]
+    formatted["date"] = recent["date"]
+    formatted["symbol"] = recent["symbol"]
+    formatted["action"] = recent["action"]
+    formatted["price"] = recent["price"].apply(lambda x: f"${x:,.2f}" if pd.notna(x) and np.isfinite(x) else "N/A")
+    formatted["prior_w"] = recent["prior_weight"].apply(lambda x: f"{x*100:.1f}%" if pd.notna(x) and np.isfinite(x) else "N/A")
+    formatted["target_w"] = recent["target_weight"].apply(lambda x: f"{x*100:.1f}%" if pd.notna(x) and np.isfinite(x) else "N/A")
+    formatted["delta_w"] = recent["weight_change"].apply(lambda x: f"{x*100:+.1f}%" if pd.notna(x) and np.isfinite(x) else "N/A")
+    formatted["trade_value"] = recent["trade_value"].apply(lambda x: f"${x:,.2f}" if pd.notna(x) and np.isfinite(x) else "N/A")
+    formatted["shares"] = recent["shares"].apply(lambda x: f"{x:,.2f}" if pd.notna(x) and np.isfinite(x) else "N/A")
+    formatted["cost"] = recent["total_cost"].apply(lambda x: f"${x:,.2f}" if pd.notna(x) and np.isfinite(x) else "N/A")
+
+    return formatted.to_string(index=False)

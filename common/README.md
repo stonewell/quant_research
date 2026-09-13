@@ -77,6 +77,7 @@ the single shared backtesting engine used by `backtester`, `research_strategy`, 
 |---|---|---|
 | `equity_curve` | `pd.DataFrame` (1 column: `equity`), `DatetimeIndex` | Daily portfolio equity, starting at `initial_capital` |
 | `actual_weights` | `pd.DataFrame`, `DatetimeIndex`, columns = symbols | DENSE daily weights actually held (post-drift, post-rebalance) — not sparse |
+| `rebalance_report` | `pd.DataFrame`, columns: `[rebalance_id, date, symbol, action, price, prior_weight, target_weight, weight_change, trade_value, shares, prior_shares, target_shares, commission, slippage, total_cost, portfolio_equity]` | Detailed trade-by-trade log for every asset balanced during portfolio rebalancing events |
 | `total_turnover` | `float` | Sum of absolute weight changes across every rebalance |
 | `total_rebalances` | `int` | Count of dates with an actual rebalance instruction |
 | `total_return`, `cagr`, `max_drawdown`, `sharpe_ratio`, `calmar_ratio`, `win_rate`, `profit_factor` | `float` | Standard performance metrics. `max_drawdown` is a **positive magnitude** (e.g. `0.18` for an 18% drawdown), matching `common/metrics.py`'s own convention. `win_rate`/`profit_factor` here are computed from the DAILY RETURN SERIES (`common.metrics.win_rate_from_returns`/`profit_factor_from_returns`) — a DIFFERENT convention from `common.metrics.win_rate`/`profit_factor`, which take a trades DataFrame (`side`/`pnl` columns); the two same-named pairs are NOT interchangeable, see `common/metrics.py`'s own docstrings |
