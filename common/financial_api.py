@@ -23,7 +23,10 @@ from .data import BaseDataProvider, _drop_invalid_ohlcv_rows, _validate_symbol_f
 
 # Standard A-share / Fuyao ticker normalization regexes
 _CODE_WITH_SUFFIX_RE = re.compile(r"^([0-9]{6})\.(SH|SZ|BJ|TI|OF|SS)$", re.IGNORECASE)
-_INDEX_CODES = {"000001.SH", "000300.SH", "000905.SH", "000852.SH", "399001.SZ", "399006.SZ"}
+_INDEX_CODES = {
+    "000001.SH", "000016.SH", "000300.SH", "000905.SH", "000852.SH",
+    "399001.SZ", "399005.SZ", "399006.SZ", "399300.SZ",
+}
 
 
 def _resolve_financial_api_path() -> Optional[str]:
@@ -417,11 +420,13 @@ class FuyaoDataProvider(BaseDataProvider):
         # 2. Remote REST API
         start_dt = pd.to_datetime(start) if start else pd.to_datetime("2015-01-01")
         end_dt = pd.to_datetime(end) if end else pd.Timestamp.now()
-        start_ms = int(start_dt.timestamp() * 1000)
-        end_ms = int(end_dt.timestamp() * 1000)
+        start_dt_cst = start_dt.tz_localize("Asia/Shanghai") if start_dt.tzinfo is None else start_dt.tz_convert("Asia/Shanghai")
+        end_dt_cst = end_dt.tz_localize("Asia/Shanghai") if end_dt.tzinfo is None else end_dt.tz_convert("Asia/Shanghai")
+        start_ms = int(start_dt_cst.timestamp() * 1000)
+        end_ms = int((end_dt_cst + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)).timestamp() * 1000)
 
         items: List[dict] = []
-        is_index = thscode.endswith(".TI") or thscode in _INDEX_CODES
+        is_index = thscode.endswith(".TI") or thscode in _INDEX_CODES or (thscode.endswith(".SZ") and thscode.startswith("399"))
         is_etf = is_etf_code(thscode)
 
         try:
@@ -432,12 +437,29 @@ class FuyaoDataProvider(BaseDataProvider):
             ) from exc
 
         if is_index:
-            items = fuyao_client.index_prices_historical(
-                thscode=thscode,
-                start_ms=start_ms,
-                end_ms=end_ms,
-                interval="1d",
-            )
+            # Fuyao API index historical prices (/api/a-share-index/prices/historical) only retain
+            # ~5 years of rolling history. Passing a start timestamp older than ~5 years causes
+            # the upstream API to return empty items ([]). Clamp start_ms to 5 years ago if needed.
+            now_ms = int(pd.Timestamp.now(tz="Asia/Shanghai").timestamp() * 1000)
+            five_years_ms = int(5 * 365 * 86400 * 1000)
+            min_index_start_ms = now_ms - five_years_ms
+            effective_start_ms = start_ms
+            if effective_start_ms < min_index_start_ms:
+                clamped_dt = pd.to_datetime(min_index_start_ms, unit="ms", utc=True).tz_convert("Asia/Shanghai").strftime("%Y-%m-%d")
+                req_start_str = start if start else start_dt.strftime("%Y-%m-%d")
+                warnings.warn(
+                    f"Fuyao index prices ({thscode}) only retain ~5 years of rolling history. "
+                    f"Clamping requested start '{req_start_str}' to '{clamped_dt}'."
+                )
+                effective_start_ms = min_index_start_ms
+
+            if effective_start_ms <= end_ms:
+                items = fuyao_client.index_prices_historical(
+                    thscode=thscode,
+                    start_ms=effective_start_ms,
+                    end_ms=end_ms,
+                    interval="1d",
+                )
         elif is_etf:
             try:
                 res = fuyao_client.fund_market_historical(
@@ -466,13 +488,14 @@ class FuyaoDataProvider(BaseDataProvider):
             )
 
         if not items:
-            raise ValueError(f"No price data returned from Fuyao API for {symbol} ({thscode}) between {start} and {end}")
+            extra = " (Fuyao API index history is limited to the last ~5 years)" if is_index else ""
+            raise ValueError(f"No price data returned from Fuyao API for {symbol} ({thscode}) between {start} and {end}{extra}")
 
         df = pd.DataFrame(items)
         if "date_ms" not in df.columns:
             raise ValueError(f"Unexpected response structure from Fuyao API: missing 'date_ms'")
 
-        df["date"] = pd.to_datetime(df["date_ms"], unit="ms").dt.normalize()
+        df["date"] = pd.to_datetime(df["date_ms"], unit="ms", utc=True).dt.tz_convert("Asia/Shanghai").dt.normalize().dt.tz_localize(None)
         df = df.set_index("date").sort_index()
 
         rename_map = {
@@ -594,3 +617,16 @@ class FuyaoDataProvider(BaseDataProvider):
             pass
 
         return result
+
+
+# Self-register into data provider registry once classes are fully defined
+try:
+    from .data import register_provider
+
+    register_provider("marketdb", MarketDBDataProvider)
+    register_provider("fuyao", FuyaoDataProvider)
+    register_provider("financial_api", FuyaoDataProvider)
+    register_provider("hithink", FuyaoDataProvider)
+except Exception:
+    pass
+

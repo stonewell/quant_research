@@ -257,6 +257,44 @@ def test_fuyao_provider_index_and_etf_mocked():
         assert df["Close"].iloc[0] == 3.55
 
 
+def test_fuyao_provider_index_clamps_old_start_date():
+    """Verify FuyaoDataProvider clamps start date for indices older than 5 years with a warning."""
+    import warnings
+
+    provider = FuyaoDataProvider(prefer_local=False)
+    mock_index_items = [
+        {
+            "date_ms": 1704153600000,
+            "open_price": 3000.0,
+            "high_price": 3050.0,
+            "low_price": 2980.0,
+            "close_price": 3020.0,
+            "volume": 50000.0,
+            "turnover": 5000000.0,
+        }
+    ]
+    mock_fuyao = MagicMock()
+    mock_fuyao.index_prices_historical.return_value = mock_index_items
+
+    with patch.dict(sys.modules, {"fuyao_client": mock_fuyao}):
+        with warnings.catch_warnings(record=True) as recorded_warnings:
+            warnings.simplefilter("always")
+            df = provider.fetch_ohlcv("000300.SH", start="2015-01-01", end="2024-01-02")
+
+        mock_fuyao.index_prices_historical.assert_called_once()
+        called_args, called_kwargs = mock_fuyao.index_prices_historical.call_args
+        # Verify the start_ms passed to index_prices_historical was clamped (greater than 2015-01-01 ms)
+        requested_start_ms = int(pd.to_datetime("2015-01-01").timestamp() * 1000)
+        assert called_kwargs["start_ms"] > requested_start_ms
+        assert len(df) == 1
+
+        # Check warning message
+        clamp_warnings = [w for w in recorded_warnings if "rolling history" in str(w.message)]
+        assert len(clamp_warnings) == 1
+        assert "000300.SH" in str(clamp_warnings[0].message)
+
+
+
 def test_fuyao_provider_fetch_metadata_mocked():
     provider = FuyaoDataProvider(prefer_local=False)
 

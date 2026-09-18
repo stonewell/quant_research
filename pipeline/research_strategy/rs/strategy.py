@@ -439,14 +439,14 @@ class AcceleratingDualMomentum(AllocationTemplate):
             close = universe[sym]["Close"]
             return (roc(close, 21) + roc(close, 63) + roc(close, 126)) / 3.0
 
-        mom_a = avg_momentum(equity_a)
-        mom_b = avg_momentum(equity_b)
+        mom_a = avg_momentum(equity_a).reindex(master_index)
+        mom_b = avg_momentum(equity_b).reindex(master_index)
         bond_symbols = [s for s in (bond_a, bond_b) if s in symbols]
         if not bond_symbols:
             for b_cand in ["TLT", "TIP", "IEF", "BND", "AGG", "LQD", cash_proxy]:
                 if b_cand in symbols:
                     bond_symbols.append(b_cand)
-        bond_1m = {s: roc(universe[s]["Close"], 21) for s in bond_symbols}
+        bond_1m = {s: roc(universe[s]["Close"], 21).reindex(master_index) for s in bond_symbols}
 
         weights_rebal = pd.DataFrame(index=rebalance_dates, columns=symbols, data=0.0)
 
@@ -1844,6 +1844,8 @@ class ProtectiveAssetAllocation(AllocationTemplate):
         k = min(top_k, n_assets)
 
         for date in rebalance_dates:
+            if date not in mom.index:
+                continue
             row = mom.loc[date].dropna()
             if len(row) < n_assets:
                 continue  # still warming up -- skip until every asset has a valid momentum reading
@@ -1968,6 +1970,8 @@ class AdaptiveAssetAllocation(AllocationTemplate):
         k = min(top_k, n_universe)
 
         for date in rebalance_dates:
+            if date not in mom.index:
+                continue
             mom_row = mom.loc[date].dropna()
             if len(mom_row) < n_universe:
                 continue  # still warming up

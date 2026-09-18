@@ -457,6 +457,7 @@ def get_data_provider(provider_name_or_instance: Union[str, BaseDataProvider, No
         return YFinanceDataProvider(**kwargs)
 
     name = str(provider_name_or_instance).strip()
+    _ensure_financial_api_registered()
     if name.lower() in _PROVIDER_REGISTRY:
         provider_cls = _PROVIDER_REGISTRY[name.lower()]
         return provider_cls(**kwargs)
@@ -507,14 +508,22 @@ def fetch_fund_metadata(symbol: str, provider: Union[str, BaseDataProvider, None
     return prov.fetch_metadata(symbol)
 
 
-try:
-    from .financial_api import MarketDBDataProvider, FuyaoDataProvider
+def _ensure_financial_api_registered() -> None:
+    """Lazily registers financial_api / fuyao data providers if available."""
+    if "fuyao" in _PROVIDER_REGISTRY:
+        return
+    try:
+        from .financial_api import MarketDBDataProvider, FuyaoDataProvider
 
-    register_provider("marketdb", MarketDBDataProvider)
-    register_provider("fuyao", FuyaoDataProvider)
-    register_provider("financial_api", FuyaoDataProvider)
-    register_provider("hithink", FuyaoDataProvider)
-except Exception as _exc:
-    warnings.warn(f"Could not register Financial-API data providers: {_exc}")
+        register_provider("marketdb", MarketDBDataProvider)
+        register_provider("fuyao", FuyaoDataProvider)
+        register_provider("financial_api", FuyaoDataProvider)
+        register_provider("hithink", FuyaoDataProvider)
+    except Exception:
+        pass
+
+
+_ensure_financial_api_registered()
+
 
 
