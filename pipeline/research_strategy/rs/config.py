@@ -188,6 +188,7 @@ class StrategyConfig:
     ensemble_rsi_period: int = 2
     ensemble_entry_rsi_threshold: float = 10.0
     ensemble_exit_rsi_threshold: float = 70.0
+    ensemble_min_weight_change: float = 0.02
 
     # --- Protective Asset Allocation (Keller & Keuning 2016, SSRN #2759734) ---
     # Breadth-based, continuously-scaled crash protection: the fraction of
@@ -230,6 +231,7 @@ class StrategyConfig:
     turtle_require_trend_filter: bool = True
     turtle_trend_ma_period: int = 200
     turtle_position_sizing_mode: str = "inverse_atr"  # "inverse_atr" or "equal_weight"
+    turtle_min_weight_change: float = 0.02
 
     # --- Chan Pivot Shift (original, from-scratch reading of 缠中说禅/Chan
     # theory -- see rs/chan_structure.py; NOT ported from the `czsc`
@@ -334,13 +336,18 @@ class StrategyConfig:
     chan_best_lookback_days: int = 63
     chan_best_metric: str = "sharpe"  # "sharpe" or "cagr"
     chan_best_rebalance_freq_days: int = 21
+    chan_best_min_weight_change: float = 0.02
 
-    # --- Chan Pivot Shift MACD + VAA Optimal Compound Strategy (ChanVaaCompoundStrategy) ---
+    # --- Chan VAA Compound Strategy ---
+    # Macro regime crash protection compounder: dynamically shifts allocation
+    # between Chan structural trend following (bullish alpha) and VAA-G4 dual
+    # momentum (crash defense with crash protection threshold).
     chan_vaa_chan_weight: float = 0.60
     chan_vaa_mode: str = "regime_adaptive"   # "regime_adaptive" or "fixed_blend"
     chan_vaa_defensive_boost: bool = True
     chan_vaa_gate_chan_in_defensive: bool = False
     chan_vaa_rebalance_freq_days: int = 21
+    chan_vaa_min_weight_change: float = 0.02
     chan_vaa_offensive_universe: List[str] = field(default_factory=lambda: list(DEFAULT_VAA_OFFENSIVE))
     chan_vaa_defensive_universe: List[str] = field(default_factory=lambda: list(DEFAULT_VAA_DEFENSIVE))
 
@@ -433,6 +440,7 @@ class StrategyConfig:
     bb_trailing_activate_pct: Optional[float] = 0.06
     bb_max_holding_days: Optional[int] = 63
     bb_position_size_pct: float = 1.0
+    bb_min_weight_change: float = 0.02
 
     # --- Hybrid Asset Allocation (HAA, Keller & Keuning 2023, SSRN #4346906) ---
     haa_canary_symbol: str = "TIP"
@@ -490,6 +498,21 @@ class StrategyConfig:
     ms_min_pod_budget: float = 0.15
     ms_budget_smoothing_alpha: float = 0.50
     ms_canary_breadth_thresh: float = 0.50
+    ms_min_weight_change: float = 0.02
+
+    # --- Chan Risk-Managed Blend Strategy (walkforward-validated ensemble) ---
+    # Derived from walkforward anomaly analysis: blends the top 3 adjusted-
+    # Sharpe Chan strategies with position limits, drawdown circuit breakers,
+    # and a minimum-weight-change threshold to curb excessive turnover.
+    crb_composite_weight: float = 0.50       # allocation to chan_composite
+    crb_three_type_weight: float = 0.30      # allocation to chan_three_type
+    crb_vaa_weight: float = 0.20             # allocation to chan_vaa_compound
+    crb_max_single_position: float = 0.20    # hard cap per stock (prevents 100% concentration)
+    crb_min_position_count: int = 5          # minimum diversification floor
+    crb_min_weight_change: float = 0.02      # skip rebalance trades below 2% change
+    crb_dd_reduce_thresh: float = 0.10       # drawdown level to halve position sizes
+    crb_dd_defensive_thresh: float = 0.15    # drawdown level to switch to VAA-only
+    crb_dd_stop_thresh: float = 0.20         # drawdown level to exit to 100% cash
 
     # Backtester execution defaults
     initial_capital: float = 100_000.0

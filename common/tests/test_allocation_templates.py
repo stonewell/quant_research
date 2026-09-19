@@ -11,7 +11,12 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from common.allocation_templates import MaxDiversificationAllocation, _inverse_vol_weights
+from common.allocation_templates import (
+    MaxDiversificationAllocation,
+    _inverse_vol_weights,
+    _sparse_from_daily,
+    apply_asset_inertia,
+)
 from common.testing import make_ohlcv_from_closes as make_df
 
 
@@ -94,3 +99,52 @@ def test_max_diversification_excludes_a_symbol_with_no_data_in_window():
     assert not early_rows["A"].isna().any()
     assert not early_rows["B"].isna().any()
     np.testing.assert_allclose(early_rows["A"] + early_rows["B"], 1.0, atol=1e-9)
+
+
+def test_apply_asset_inertia_freezes_small_changes():
+    dates = pd.bdate_range("2023-01-01", periods=6)
+    df = pd.DataFrame(
+        {
+            "A": [0.10, 0.105, 0.108, 0.20, 0.20, 0.05],
+            "B": [0.20, 0.201, 0.199, 0.198, 0.10, 0.10],
+            "CASH": [0.70, 0.694, 0.693, 0.602, 0.70, 0.85],
+        },
+        index=dates,
+    )
+    filtered = apply_asset_inertia(df, min_weight_change=0.02, cash_proxy="CASH")
+
+    # Day 1: A and B changed < 0.02, must freeze at day 0 weights
+    np.testing.assert_allclose(filtered.loc[dates[1], "A"], 0.10)
+    np.testing.assert_allclose(filtered.loc[dates[1], "B"], 0.20)
+    np.testing.assert_allclose(filtered.loc[dates[1], "CASH"], 0.70)
+
+    # Day 3: A jumped to 0.20 (>= 0.02), B changed by -0.002 (< 0.02)
+    # A is updated, B remains frozen at 0.20, CASH absorbs remainder
+    np.testing.assert_allclose(filtered.loc[dates[3], "A"], 0.20)
+    np.testing.assert_allclose(filtered.loc[dates[3], "B"], 0.20)
+    np.testing.assert_allclose(filtered.loc[dates[3], "CASH"], 0.60)
+
+    # Sparse conversion should drop day 1 and 2
+    sparse = _sparse_from_daily(df, min_weight_change=0.02, cash_proxy="CASH")
+    rebal_dates = sparse.dropna(how="all").index
+    assert dates[1] not in rebal_dates
+    assert dates[2] not in rebal_dates
+    assert dates[3] in rebal_dates
+
+
+def test_apply_asset_inertia_emergency_override():
+    dates = pd.bdate_range("2023-01-01", periods=3)
+    df = pd.DataFrame(
+        {
+            "A": [0.20, 0.195, 0.0],
+            "CASH": [0.80, 0.805, 1.0],
+        },
+        index=dates,
+    )
+    emergency_mask = pd.Series([False, True, True], index=dates)
+    filtered = apply_asset_inertia(df, min_weight_change=0.02, cash_proxy="CASH", emergency_mask=emergency_mask)
+
+    # On day 1, diff is -0.005 (< 0.02), but emergency_mask is True -> must update!
+    np.testing.assert_allclose(filtered.loc[dates[1], "A"], 0.195)
+    np.testing.assert_allclose(filtered.loc[dates[1], "CASH"], 0.805)
+

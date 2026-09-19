@@ -30,6 +30,7 @@ from research_strategy.rs.chan_advanced_strategies import (
     ChanCompositeStrategy,
     ChanMeanReversionDivergenceStrategy,
     ChanMultiTimeframeTrendStrategy,
+    ChanRiskManagedBlendStrategy,
     ChanTrendThirdBuyStrategy,
     ChanVaaCompoundStrategy,
     run_composite_position_loop,
@@ -534,4 +535,118 @@ def test_chan_composite_produces_active_trades():
     rebal = weights.dropna(how="all")
     risky = rebal.drop(columns=["BIL"], errors="ignore")
     assert (risky > 0).sum().sum() > 0
+
+
+def test_chan_risk_managed_blend_interface_and_config():
+    cfg = StrategyConfig()
+    strat = ChanRiskManagedBlendStrategy(cfg)
+    assert strat.name == "chan_risk_managed_blend"
+    assert strat.warmup_bars() == 252
+    assert "chan_composite" in strat.explain_weights()
+    assert "chan_three_type" in strat.explain_weights()
+    assert "chan_vaa_compound" in strat.explain_weights()
+
+    # Verify instantiation via strategies_config.json
+    configs = load_strategies_config()
+    assert "chan_risk_managed_blend" in configs
+    entry = configs["chan_risk_managed_blend"]
+    inst = instantiate_strategy_from_config_entry("chan_risk_managed_blend", entry)
+    assert isinstance(inst, ChanRiskManagedBlendStrategy)
+
+
+def test_chan_risk_managed_blend_execution_and_constraints():
+    universe = create_mock_universe(n_days=400)
+    cfg = StrategyConfig()
+    strat = ChanRiskManagedBlendStrategy(cfg)
+    weights = strat.generate_weights(universe)
+
+    assert not weights.empty
+    rebal_dates = weights.dropna(how="all").index
+    assert len(rebal_dates) > 0
+
+    # Test sparse weights contract: non-rebalance rows are all NaN
+    non_rebal = weights.drop(index=rebal_dates)
+    if not non_rebal.empty:
+        assert non_rebal.isna().all().all()
+
+    # Test position capping constraint: no individual risky stock > crb_max_single_position (0.20)
+    rebal_df = weights.loc[rebal_dates]
+    risky_df = rebal_df.drop(columns=["BIL"], errors="ignore")
+    assert (risky_df > 0.2000001).sum().sum() == 0
+
+    # Test leverage constraint: sum of risky weights <= 1.0
+    assert (risky_df.sum(axis=1) <= 1.000001).all()
+
+    # Test explicit zero floor: no NaNs inside any rebalance row
+    assert not rebal_df.isna().any().any()
+
+
+def test_chan_risk_managed_blend_circuit_breaker_triggers():
+    # Construct a universe where asset prices plunge sharply to trigger circuit breakers
+    dates = pd.bdate_range("2020-01-01", periods=360)
+    t = np.arange(360)
+
+    # Initial rally followed by catastrophic 40% crash
+    spy_close = np.where(t < 250, 100.0 + 0.3 * t, 175.0 - 1.5 * (t - 250))
+    qqq_close = np.where(t < 250, 100.0 + 0.4 * t, 200.0 - 2.0 * (t - 250))
+    bil_close = np.full(360, 100.0)
+
+    universe = {
+        "SPY": make_ohlcv_from_closes(spy_close),
+        "QQQ": make_ohlcv_from_closes(qqq_close),
+        "BIL": make_ohlcv_from_closes(bil_close),
+    }
+    for df in universe.values():
+        df.index = dates
+
+    cfg = StrategyConfig(crb_dd_reduce_thresh=0.08, crb_dd_defensive_thresh=0.12, crb_dd_stop_thresh=0.18)
+    strat = ChanRiskManagedBlendStrategy(cfg)
+    weights = strat.generate_weights(universe)
+
+    assert not weights.empty
+    rebal = weights.dropna(how="all")
+    # During the crash (after t=250), risky exposure should be reduced, shifted to VAA or stopped out
+    late_rebal = rebal.loc[rebal.index >= dates[280]]
+    if not late_rebal.empty:
+        risky_late = late_rebal.drop(columns=["BIL"], errors="ignore")
+        # Equity exposure should be strongly curtailed compared to unhedged levels
+        assert (risky_late.sum(axis=1) < 0.50).any()
+
+
+def test_chan_risk_managed_blend_asset_level_inertia_filter():
+    """Verifies Option A: in normal market regimes, non-zero target weight changes
+    satisfy |delta_w| >= crb_min_weight_change (0.02) and untouched assets are not diluted."""
+    universe = create_mock_universe(n_days=400)
+    cfg = StrategyConfig(
+        crb_composite_weight=0.50,
+        crb_three_type_weight=0.30,
+        crb_vaa_weight=0.20,
+        crb_max_single_position=0.20,
+        crb_min_weight_change=0.02,
+        crb_dd_reduce_thresh=0.50,  # disable emergency breaker to test pure inertia
+        crb_dd_defensive_thresh=0.60,
+        crb_dd_stop_thresh=0.70,
+    )
+    strat = ChanRiskManagedBlendStrategy(cfg)
+    weights = strat.generate_weights(universe)
+
+    rebal_rows = weights.dropna(how="all")
+    assert not rebal_rows.empty
+
+    diffs = (rebal_rows - rebal_rows.shift(1)).dropna(how="all")
+    risky_diffs = diffs.drop(columns=["BIL"], errors="ignore")
+
+    abs_diffs = risky_diffs.abs()
+    non_zero = abs_diffs[abs_diffs > 1e-6].values.flatten()
+    non_zero = non_zero[~np.isnan(non_zero)]
+
+    if len(non_zero) > 0:
+        # Every non-zero target change must be >= 0.01999 (respecting 2% threshold)
+        assert (non_zero >= 0.01999).all(), f"Found target changes < 0.02: {non_zero[non_zero < 0.01999]}"
+
+    # Total risky allocation never exceeds 1.0
+    risky_w = rebal_rows.drop(columns=["BIL"], errors="ignore")
+    assert (risky_w.sum(axis=1) <= 1.00001).all()
+
+
 

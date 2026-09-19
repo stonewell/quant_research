@@ -264,9 +264,29 @@
       "chan_best_lookback_days": 63,
       "chan_best_metric": "sharpe",
       "chan_best_rebalance_freq_days": 21,
+      "chan_best_min_weight_change": 0.02,
       "cash_proxy": "BIL"
     },
     "factors": ["regime_trend_strength", "relative_momentum", "volatility_targeting"]
+  },
+  "chan_risk_managed_blend": {
+    "name": "Chan Risk-Managed Blend Strategy",
+    "type": "class",
+    "class_name": "ChanRiskManagedBlendStrategy",
+    "description": "Walkforward-optimized institutional ensemble blending the top 3 Chan strategies (chan_composite 50%, chan_three_type 30%, chan_vaa_compound 20%) with institutional risk controls: 20% single-stock cap, multi-level drawdown circuit breakers (halve at 10%, defensive VAA at 15%, stop at 20%), and 2% turnover filter.",
+    "parameters": {
+      "crb_composite_weight": 0.50,
+      "crb_three_type_weight": 0.30,
+      "crb_vaa_weight": 0.20,
+      "crb_max_single_position": 0.20,
+      "crb_min_position_count": 5,
+      "crb_min_weight_change": 0.02,
+      "crb_dd_reduce_thresh": 0.10,
+      "crb_dd_defensive_thresh": 0.15,
+      "crb_dd_stop_thresh": 0.20,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["regime_trend_strength", "absolute_momentum_trend", "relative_momentum", "volatility_targeting"]
   },
   "chan_vaa_compound": {
     "name": "Chan Pivot Shift MACD + VAA Optimal Compound Strategy",
@@ -279,6 +299,7 @@
       "chan_vaa_defensive_boost": true,
       "chan_vaa_gate_chan_in_defensive": false,
       "chan_vaa_rebalance_freq_days": 21,
+      "chan_vaa_min_weight_change": 0.02,
       "chanm_min_gap_bars": 4,
       "chanm_min_strokes": 3,
       "chanm_macd_fast": 12,
@@ -396,6 +417,7 @@
       "ensemble_rsi_period": 2,
       "ensemble_entry_rsi_threshold": 10.0,
       "ensemble_exit_rsi_threshold": 70.0,
+      "ensemble_min_weight_change": 0.02,
       "cash_proxy": "BIL"
     },
     "factors": ["regime_trend_strength", "absolute_momentum_trend", "mean_reversion"]
@@ -412,6 +434,7 @@
       "turtle_atr_stop_mult": 2.0,
       "turtle_require_trend_filter": true,
       "turtle_trend_ma_period": 200,
+      "turtle_min_weight_change": 0.02,
       "cash_proxy": "BIL"
     },
     "factors": ["absolute_momentum_trend", "volatility_targeting"]
@@ -428,6 +451,7 @@
       "turtle_atr_stop_mult": 2.0,
       "turtle_require_trend_filter": true,
       "turtle_trend_ma_period": 200,
+      "turtle_min_weight_change": 0.02,
       "cash_proxy": "BIL"
     },
     "factors": ["absolute_momentum_trend", "volatility_targeting"]
@@ -444,6 +468,7 @@
       "turtle_atr_stop_mult": 2.0,
       "turtle_require_trend_filter": true,
       "turtle_trend_ma_period": 200,
+      "turtle_min_weight_change": 0.02,
       "cash_proxy": "BIL"
     },
     "factors": ["absolute_momentum_trend", "volatility_targeting"]
@@ -524,6 +549,7 @@
       "bb_trailing_stop_pct": 0.04,
       "bb_trailing_activate_pct": 0.06,
       "bb_max_holding_days": 63,
+      "bb_min_weight_change": 0.02,
       "cash_proxy": "BIL"
     },
     "factors": ["absolute_momentum_trend", "volatility_targeting", "regime_trend_strength"]
@@ -544,6 +570,7 @@
       "bb_trend_ma_period": 200,
       "bb_stop_loss_pct": 0.06,
       "bb_max_holding_days": 63,
+      "bb_min_weight_change": 0.02,
       "cash_proxy": "BIL"
     },
     "factors": ["mean_reversion", "absolute_momentum_trend"]
@@ -623,6 +650,7 @@
       "ms_min_pod_budget": 0.15,
       "ms_budget_smoothing_alpha": 0.50,
       "ms_canary_breadth_thresh": 0.50,
+      "ms_min_weight_change": 0.02,
       "cash_proxy": "BIL"
     },
     "factors": ["regime_trend_strength", "breadth", "relative_momentum", "volatility_targeting", "absolute_momentum_trend"]

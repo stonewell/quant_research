@@ -73,6 +73,7 @@ from .chan_advanced_strategies import (
     ChanCompositeStrategy,
     ChanMeanReversionDivergenceStrategy,
     ChanMultiTimeframeTrendStrategy,
+    ChanRiskManagedBlendStrategy,
     ChanTrendThirdBuyStrategy,
     ChanVaaCompoundStrategy,
 )
@@ -1117,6 +1118,7 @@ class EnsembleRegimeSwitchingStrategy(AllocationTemplate):
         rsi_period = p.get("ensemble_rsi_period", cfg.ensemble_rsi_period)
         entry_rsi_threshold = p.get("ensemble_entry_rsi_threshold", cfg.ensemble_entry_rsi_threshold)
         exit_rsi_threshold = p.get("ensemble_exit_rsi_threshold", cfg.ensemble_exit_rsi_threshold)
+        min_weight_change = float(p.get("ensemble_min_weight_change", getattr(cfg, "ensemble_min_weight_change", 0.02)))
 
         symbols = list(universe.keys())
         risky_symbols = _get_risky_symbols(universe, params, cfg_symbol=None, cfg_risky_universe=None, cash_proxy=cash_proxy)
@@ -1179,7 +1181,7 @@ class EnsembleRegimeSwitchingStrategy(AllocationTemplate):
             daily[cash_proxy] = np.maximum(0.0, 1.0 - daily.sum(axis=1))
 
         daily = _fill_out_columns(daily, symbols)
-        return _sparse_from_daily(daily)
+        return _sparse_from_daily(daily, min_weight_change=min_weight_change, cash_proxy=cash_proxy)
 
     def explain_weights(self, params: dict = None) -> str:
         cfg = self.config
@@ -1222,6 +1224,7 @@ class TurtleBreakoutStrategy(AllocationTemplate):
         require_trend_filter = p.get("turtle_require_trend_filter", cfg.turtle_require_trend_filter)
         trend_ma_period = p.get("turtle_trend_ma_period", cfg.turtle_trend_ma_period)
         position_sizing_mode = p.get("turtle_position_sizing_mode", cfg.turtle_position_sizing_mode)
+        min_weight_change = float(p.get("turtle_min_weight_change", getattr(cfg, "turtle_min_weight_change", 0.02)))
 
         symbols = list(universe.keys())
         risky_symbols = _get_risky_symbols(universe, params, cfg_symbol=None, cfg_risky_universe=None, cash_proxy=cash_proxy)
@@ -1315,7 +1318,7 @@ class TurtleBreakoutStrategy(AllocationTemplate):
             daily_weights[cash_proxy] = np.maximum(0.0, 1.0 - daily_weights.sum(axis=1))
 
         daily_weights = _fill_out_columns(daily_weights, symbols)
-        return _sparse_from_daily(daily_weights)
+        return _sparse_from_daily(daily_weights, min_weight_change=min_weight_change, cash_proxy=cash_proxy)
 
     def explain_weights(self, params: dict = None) -> str:
         cfg = self.config
@@ -2055,6 +2058,7 @@ STRATEGY_CLASS_MAP = {
     "ChanPivotShiftMACDAdvStrategy": ChanPivotShiftMACDAdvStrategy,
     "ChanPivotShiftMACDStrategy": ChanPivotShiftMACDStrategy,
     "ChanPivotShiftStrategy": ChanPivotShiftStrategy,
+    "ChanRiskManagedBlendStrategy": ChanRiskManagedBlendStrategy,
     "ChanThreeTypeStrategy": ChanThreeTypeStrategy,
     "ChanTrendThirdBuyStrategy": ChanTrendThirdBuyStrategy,
     "ChanVaaCompoundStrategy": ChanVaaCompoundStrategy,

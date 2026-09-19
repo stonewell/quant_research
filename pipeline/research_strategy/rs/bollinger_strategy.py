@@ -68,6 +68,7 @@ class BollingerBandsStrategy(AllocationTemplate):
         trailing_activate_pct = p.get("bb_trailing_activate_pct", cfg.bb_trailing_activate_pct)
         max_holding_days = p.get("bb_max_holding_days", cfg.bb_max_holding_days)
         position_size_pct = p.get("bb_position_size_pct", cfg.bb_position_size_pct)
+        min_weight_change = float(p.get("bb_min_weight_change", getattr(cfg, "bb_min_weight_change", 0.02)))
 
         symbols = list(universe.keys())
         risky_symbols = _get_risky_symbols_helper(
@@ -198,7 +199,7 @@ class BollingerBandsStrategy(AllocationTemplate):
             daily_weights[cash_proxy] = np.maximum(0.0, 1.0 - daily_weights.sum(axis=1))
 
         daily_weights = _fill_out_columns(daily_weights, symbols)
-        return _sparse_from_daily(daily_weights)
+        return _sparse_from_daily(daily_weights, min_weight_change=min_weight_change, cash_proxy=cash_proxy)
 
     def explain_weights(self, params: Optional[dict] = None) -> str:
         cfg = self.config

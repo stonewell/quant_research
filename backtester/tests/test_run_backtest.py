@@ -935,8 +935,10 @@ def test_main_walkforward_writes_summary_json(tmp_path, monkeypatch):
     for key in ("mean_sharpe_ratio", "mean_cagr", "mean_max_drawdown", "mean_calmar_ratio",
                 "n_folds", "n_valid_folds", "fold_sharpe_std", "deflated_sharpe_ratio",
                 "requested_start", "requested_end", "actual_first_fold_start", "actual_last_fold_end",
-                "rolling_window_performance"):
+                "rolling_window_performance", "strategy", "strategy_name"):
         assert key in summary
+    assert summary["strategy"] == "equal_weight"
+    assert summary["strategy_name"] == "equal_weight"
     assert isinstance(summary["rolling_window_performance"], list)
     assert len(summary["rolling_window_performance"]) == summary["n_folds"]
     assert summary["requested_start"] == "2015-01-01"

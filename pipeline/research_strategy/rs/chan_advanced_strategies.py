@@ -905,9 +905,10 @@ class ChanBestSelectorStrategy(AllocationTemplate):
             # Copy current best strategy's weights
             output_weights.loc[date] = sub_daily_weights[current_best_key].loc[date]
 
+        min_weight_change = float(p.get("chan_best_min_weight_change", getattr(cfg, "chan_best_min_weight_change", 0.02)))
         output_weights = _cap_and_deroute_to_cash(output_weights, symbols, cash_proxy)
         output_weights = _fill_out_columns(output_weights, symbols)
-        return _sparse_from_daily(output_weights)
+        return _sparse_from_daily(output_weights, min_weight_change=min_weight_change, cash_proxy=cash_proxy)
 
     def explain_weights(self, params: dict = None) -> str:
         cfg = self.config
@@ -1125,8 +1126,9 @@ class ChanVaaCompoundStrategy(AllocationTemplate):
         else:
             output_weights = risky_daily
 
+        min_weight_change = float(p.get("chan_vaa_min_weight_change", getattr(cfg, "chan_vaa_min_weight_change", 0.02)))
         output_weights = _fill_out_columns(output_weights, symbols)
-        return _sparse_from_daily(output_weights)
+        return _sparse_from_daily(output_weights, min_weight_change=min_weight_change, cash_proxy=cash_proxy)
 
     def explain_weights(self, params: dict = None) -> str:
         cfg = self.config
@@ -1143,4 +1145,246 @@ class ChanVaaCompoundStrategy(AllocationTemplate):
 
     def warmup_bars(self, params: dict = None) -> int:
         return 252
+
+
+class ChanRiskManagedBlendStrategy(AllocationTemplate):
+    """Chan Risk-Managed Blend Strategy (缠论风控混合配置策略):
+
+    Institutional multi-strategy portfolio combining the top 3 walkforward-validated
+    Chan strategies with strict institutional risk management and turnover controls:
+
+    1. Core Sub-Strategy Allocation:
+       - 50% `ChanCompositeStrategy` (Rank 1: multi-stage B1/B2/B3 position scaling, most consistent)
+       - 30% `ChanThreeTypeStrategy` (Rank 2: segment-level pivot structural alpha)
+       - 20% `ChanVaaCompoundStrategy` (Rank 3: dual-momentum regime crash protection buffer)
+
+    2. Key Trading Rules & Risk Controls:
+       - Concentration Cap: Hard cap of 20% NAV per individual stock (`crb_max_single_position = 0.20`),
+         preventing catastrophic idiosyncratic loss identified in walkforward analysis.
+       - Multi-Level Drawdown Circuit Breakers:
+         * DD >= 10% from High-Water Mark: Halve equity allocation (50% risk damping, balance to cash).
+         * DD >= 15% from High-Water Mark: Shift 100% of allocation to `ChanVaaCompoundStrategy` (which carries 70% cash buffer).
+         * DD >= 20% from High-Water Mark: Hard stop — exit 100% to cash_proxy.
+       - Turnover Filter:
+         * Ignores rebalance shifts < 2% (`crb_min_weight_change = 0.02`), eliminating daily micro-rebalancing
+           noise and preserving capital against A-share execution costs.
+       - Sparse Weights Contract Compliance:
+         * Guarantees explicit 0.0 for unheld assets, strictly adhering to workspace NaN-vs-0.0 rules.
+    """
+
+    def __init__(self, config: Optional[StrategyConfig] = None):
+        self.config = config or StrategyConfig()
+        super().__init__(
+            name="chan_risk_managed_blend",
+            param_grid={},
+            factor_tags=[
+                "regime_trend_strength",
+                "absolute_momentum_trend",
+                "relative_momentum",
+                "volatility_targeting",
+            ],
+        )
+
+    def _get_sub_strategies(self, cfg: StrategyConfig) -> Dict[str, AllocationTemplate]:
+        from .strategy import ChanThreeTypeStrategy
+        return {
+            "chan_composite": ChanCompositeStrategy(cfg),
+            "chan_three_type": ChanThreeTypeStrategy(cfg),
+            "chan_vaa_compound": ChanVaaCompoundStrategy(cfg),
+        }
+
+    def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
+        cfg = self.config
+        p = params or {}
+        cash_proxy = p.get("cash_proxy", cfg.cash_proxy)
+
+        comp_w = float(p.get("crb_composite_weight", cfg.crb_composite_weight))
+        three_w = float(p.get("crb_three_type_weight", cfg.crb_three_type_weight))
+        vaa_w = float(p.get("crb_vaa_weight", cfg.crb_vaa_weight))
+        max_single_pos = float(p.get("crb_max_single_position", cfg.crb_max_single_position))
+        min_weight_change = float(p.get("crb_min_weight_change", cfg.crb_min_weight_change))
+        dd_reduce_thresh = float(p.get("crb_dd_reduce_thresh", cfg.crb_dd_reduce_thresh))
+        dd_defensive_thresh = float(p.get("crb_dd_defensive_thresh", cfg.crb_dd_defensive_thresh))
+        dd_stop_thresh = float(p.get("crb_dd_stop_thresh", cfg.crb_dd_stop_thresh))
+
+        tot_w = comp_w + three_w + vaa_w
+        if tot_w > 0:
+            comp_w /= tot_w
+            three_w /= tot_w
+            vaa_w /= tot_w
+
+        symbols = list(universe.keys())
+        if not symbols:
+            return pd.DataFrame()
+
+        risky_symbols = _get_risky_symbols_helper(universe, params, cfg_symbol=None, cfg_risky_universe=None, cash_proxy=cash_proxy)
+        if not risky_symbols:
+            return pd.DataFrame()
+
+        master_index = _aligned_master_index_helper(universe, risky_symbols)
+        if master_index is None or len(master_index) == 0:
+            return pd.DataFrame()
+
+        # Run sub-strategies
+        sub_strats = self._get_sub_strategies(cfg)
+
+        w_comp_sparse = sub_strats["chan_composite"].generate_weights(universe, params)
+        w_comp_daily = w_comp_sparse.reindex(master_index).ffill().fillna(0.0) if not w_comp_sparse.empty else pd.DataFrame(0.0, index=master_index, columns=symbols)
+        w_comp_daily = _fill_out_columns(w_comp_daily, symbols)
+
+        w_three_sparse = sub_strats["chan_three_type"].generate_weights(universe, params)
+        w_three_daily = w_three_sparse.reindex(master_index).ffill().fillna(0.0) if not w_three_sparse.empty else pd.DataFrame(0.0, index=master_index, columns=symbols)
+        w_three_daily = _fill_out_columns(w_three_daily, symbols)
+
+        w_vaa_sparse = sub_strats["chan_vaa_compound"].generate_weights(universe, params)
+        w_vaa_daily = w_vaa_sparse.reindex(master_index).ffill().fillna(0.0) if not w_vaa_sparse.empty else pd.DataFrame(0.0, index=master_index, columns=symbols)
+        w_vaa_daily = _fill_out_columns(w_vaa_daily, symbols)
+
+        # Asset returns for tracking portfolio NAV and drawdown
+        asset_returns = pd.DataFrame(0.0, index=master_index, columns=risky_symbols)
+        for sym in risky_symbols:
+            c = universe[sym]["Close"].reindex(master_index).ffill()
+            asset_returns[sym] = c.pct_change().fillna(0.0)
+
+        # Step through time to enforce drawdown circuit breakers, position caps, and turnover filters
+        daily_weights = pd.DataFrame(0.0, index=master_index, columns=symbols)
+        cum_nav = 1.0
+        peak_nav = 1.0
+        current_held_w = pd.Series(0.0, index=symbols)
+        if cash_proxy in symbols:
+            current_held_w[cash_proxy] = 1.0
+
+        for t in range(len(master_index)):
+            date = master_index[t]
+
+            # Update NAV based on positions held from previous day
+            if t > 0:
+                prev_date = master_index[t - 1]
+                held_risky = daily_weights.loc[prev_date, risky_symbols]
+                port_ret = float((held_risky * asset_returns.loc[date]).sum())
+                cum_nav *= (1.0 + port_ret)
+                if cum_nav > peak_nav:
+                    peak_nav = cum_nav
+
+            current_dd = (cum_nav - peak_nav) / peak_nav if peak_nav > 0 else 0.0
+            dd_mag = abs(current_dd)
+
+            # Circuit breaker logic
+            if dd_mag >= dd_stop_thresh:
+                # Full stop: 100% cash
+                raw_w = pd.Series(0.0, index=symbols)
+                if cash_proxy in symbols:
+                    raw_w[cash_proxy] = 1.0
+                is_emergency = True
+            elif dd_mag >= dd_defensive_thresh:
+                # Defensive mode: 100% into VAA compound strategy (carries 70% cash buffer)
+                raw_w = w_vaa_daily.loc[date].copy()
+                is_emergency = True
+            elif dd_mag >= dd_reduce_thresh:
+                # Risk reduction: 50% damping on equity exposure
+                raw_blend = (
+                    comp_w * w_comp_daily.loc[date] +
+                    three_w * w_three_daily.loc[date] +
+                    vaa_w * w_vaa_daily.loc[date]
+                )
+                raw_w = pd.Series(0.0, index=symbols)
+                raw_w[risky_symbols] = raw_blend[risky_symbols] * 0.50
+                if cash_proxy in symbols:
+                    raw_w[cash_proxy] = max(0.0, 1.0 - raw_w[risky_symbols].sum())
+                is_emergency = True
+            else:
+                # Normal blend
+                raw_w = (
+                    comp_w * w_comp_daily.loc[date] +
+                    three_w * w_three_daily.loc[date] +
+                    vaa_w * w_vaa_daily.loc[date]
+                ).copy()
+                is_emergency = False
+
+            # Apply hard position cap per risky symbol
+            risky_w = raw_w[risky_symbols].copy().clip(lower=0.0, upper=max_single_pos)
+
+            # Ensure total risky allocation <= 1.0
+            tot_risky = float(risky_w.sum())
+            if tot_risky > 1.0:
+                risky_w = risky_w / tot_risky
+                tot_risky = 1.0
+
+            ideal_target_w = pd.Series(0.0, index=symbols)
+            ideal_target_w[risky_symbols] = risky_w
+            if cash_proxy in symbols:
+                ideal_target_w[cash_proxy] = max(0.0, 1.0 - tot_risky)
+
+            if t == 0:
+                current_held_w = ideal_target_w.copy()
+                daily_weights.loc[date] = ideal_target_w
+                continue
+
+            # Option A: Asset-Level Inertia Filtering
+            diff = ideal_target_w[risky_symbols] - current_held_w[risky_symbols]
+            sells = diff[diff <= -min_weight_change].index.tolist()
+            buys = diff[diff >= min_weight_change].index.tolist()
+
+            if is_emergency:
+                # Emergency circuit breaker override: liquidate/de-risk without threshold lag
+                sells = [s for s in risky_symbols if ideal_target_w[s] < current_held_w[s] and abs(ideal_target_w[s] - current_held_w[s]) >= 0.001]
+                buys = [s for s in risky_symbols if ideal_target_w[s] > current_held_w[s] and abs(ideal_target_w[s] - current_held_w[s]) >= min_weight_change]
+
+            if not sells and not buys:
+                # No asset changed >= min_weight_change: keep prior target weights (no rebalance)
+                daily_weights.loc[date] = current_held_w.copy()
+            else:
+                new_target = current_held_w.copy()
+                # 1. Execute sells first to release cash capacity
+                for s in sells:
+                    new_target[s] = ideal_target_w[s]
+
+                # 2. Execute buys up to available capacity without diluting untouched assets
+                non_buy_risky = [s for s in risky_symbols if s not in buys]
+                avail_cap = max(0.0, 1.0 - float(new_target[non_buy_risky].sum()))
+
+                buys_sorted = sorted(buys, key=lambda b: diff[b], reverse=True)
+                for b in buys_sorted:
+                    ideal_b = ideal_target_w[b]
+                    prior_b = current_held_w[b]
+                    buy_target = min(ideal_b, prior_b + avail_cap)
+
+                    if buy_target - prior_b >= min_weight_change:
+                        new_target[b] = buy_target
+                        avail_cap = max(0.0, avail_cap - (buy_target - prior_b))
+                    else:
+                        new_target[b] = prior_b
+
+                if cash_proxy in symbols:
+                    new_target[cash_proxy] = max(0.0, 1.0 - float(new_target[risky_symbols].sum()))
+
+                daily_weights.loc[date] = new_target
+                current_held_w = new_target.copy()
+
+        daily_weights = _fill_out_columns(daily_weights, symbols)
+        return _sparse_from_daily(daily_weights)
+
+    def explain_weights(self, params: dict = None) -> str:
+        cfg = self.config
+        p = params or {}
+        comp_w = p.get("crb_composite_weight", cfg.crb_composite_weight)
+        three_w = p.get("crb_three_type_weight", cfg.crb_three_type_weight)
+        vaa_w = p.get("crb_vaa_weight", cfg.crb_vaa_weight)
+        max_pos = p.get("crb_max_single_position", cfg.crb_max_single_position)
+        dd_red = p.get("crb_dd_reduce_thresh", cfg.crb_dd_reduce_thresh)
+        dd_def = p.get("crb_dd_defensive_thresh", cfg.crb_dd_defensive_thresh)
+        dd_stop = p.get("crb_dd_stop_thresh", cfg.crb_dd_stop_thresh)
+        min_chg = p.get("crb_min_weight_change", cfg.crb_min_weight_change)
+        return (
+            f"Chan Risk-Managed Blend Strategy (chan_risk_managed_blend): "
+            f"walkforward-optimized ensemble blending chan_composite ({comp_w:.0%}), "
+            f"chan_three_type ({three_w:.0%}), and chan_vaa_compound ({vaa_w:.0%}) "
+            f"with hard position cap ({max_pos:.0%} max per stock), "
+            f"drawdown circuit breakers (halve equity at {dd_red:.0%}, defensive VAA at {dd_def:.0%}, stop at {dd_stop:.0%}), "
+            f"and turnover filter (min trade change {min_chg:.0%})."
+        )
+
+    def warmup_bars(self, params: dict = None) -> int:
+        return 252
+
 

@@ -451,7 +451,16 @@ def main():
     fundamental_spec = strategy_def.get("fundamental_spec")
     bnn_spec = strategy_def.get("bnn_spec")
 
-    print(f"Loaded Strategy: {template_name}")
+    strategy_name = (
+        strategy_def.get("strategy_name")
+        or strategy_def.get("name")
+        or (research_strategy_spec.get("entry_data", {}).get("name") if isinstance(research_strategy_spec, dict) else None)
+        or (research_strategy_spec.get("strategy_key") if isinstance(research_strategy_spec, dict) else None)
+        or template_name
+    )
+
+    strat_label = f"{strategy_name} ({template_name})" if strategy_name != template_name else strategy_name
+    print(f"Loaded Strategy: {strat_label}")
     print(f"Parameters: {params}")
     print(f"Logic: {explanation}")
     if "trusted" in strategy_def and not strategy_def["trusted"]:
@@ -548,7 +557,7 @@ def main():
         print(f"Saved optimize report to {optimize_report_path}")
 
     if args.mode == "standard":
-        print("\n=== Running Standard Backtest ===")
+        print(f"\n=== Running Standard Backtest: {strategy_name} ===")
         if reused_result is not None:
             result = reused_result
         else:
@@ -558,6 +567,7 @@ def main():
                 params, args,
             )
 
+        print(f"\n=== Strategy: {strategy_name} ===")
         print(format_backtest_metrics_summary(result))
         print(f"Total Rebalances: {result['total_rebalances']}")
         print(f"Total Turnover: {result['total_turnover']:.2f}")
@@ -598,6 +608,8 @@ def main():
             print(f"Saved baseline equity curve to {baseline_equity_path}")
 
             comparison_report = {
+                "strategy": strategy_name,
+                "strategy_name": strategy_name,
                 "baseline_symbol": args.baseline_symbol,
                 "baseline_template": args.baseline_template,
                 "baseline_params": baseline_params,
@@ -627,7 +639,7 @@ def main():
             print(f"Saved equity curve chart to {chart_path}")
 
     elif args.mode == "walkforward":
-        print(f"\n=== Running Walkforward Rolling Evaluation ===")
+        print(f"\n=== Running Walkforward Rolling Evaluation: {strategy_name} ===")
         print(f"Window: {args.window_years} years, Step: {args.step_years} years")
 
         if reused_result is not None:
@@ -681,7 +693,8 @@ def main():
                 sharpe_std=sharpe_std,
             )
 
-        print(f"\nMean Sharpe Ratio: {folds_df['sharpe_ratio'].mean():.2f} | "
+        print(f"\n=== Walkforward Summary: {strategy_name} ===")
+        print(f"Mean Sharpe Ratio: {folds_df['sharpe_ratio'].mean():.2f} | "
               f"Mean CAGR: {folds_df['cagr'].mean()*100:.2f}%")
         print(f"Mean Max Drawdown: {folds_df['max_drawdown'].mean()*100:.1f}% | "
               f"Mean Calmar Ratio: {folds_df['calmar_ratio'].mean():.2f}")
@@ -698,6 +711,8 @@ def main():
             print(f"Mean Outperformance CAGR: {mean_outperformance*100:.2f}%")
 
         summary = {
+            "strategy": strategy_name,
+            "strategy_name": strategy_name,
             "mean_sharpe_ratio": float(folds_df["sharpe_ratio"].mean()),
             "mean_cagr": float(folds_df["cagr"].mean()),
             "mean_max_drawdown": float(folds_df["max_drawdown"].mean()),
@@ -732,6 +747,8 @@ def main():
 
         if args.baseline_symbol:
             comparison_report = {
+                "strategy": strategy_name,
+                "strategy_name": strategy_name,
                 "baseline_symbol": args.baseline_symbol,
                 "baseline_template": args.baseline_template,
                 "baseline_params": baseline_params,

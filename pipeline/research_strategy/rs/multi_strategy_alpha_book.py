@@ -139,6 +139,7 @@ class MultiStrategyAlphaBookStrategy(AllocationTemplate):
         min_budget = float(p.get("ms_min_pod_budget", getattr(cfg, "ms_min_pod_budget", 0.15)))
         alpha_smooth = float(p.get("ms_budget_smoothing_alpha", getattr(cfg, "ms_budget_smoothing_alpha", 0.50)))
         breadth_thresh = float(p.get("ms_canary_breadth_thresh", getattr(cfg, "ms_canary_breadth_thresh", 0.50)))
+        min_weight_change = float(p.get("ms_min_weight_change", getattr(cfg, "ms_min_weight_change", 0.02)))
 
         symbols = list(universe.keys())
         if not symbols:
@@ -391,7 +392,7 @@ class MultiStrategyAlphaBookStrategy(AllocationTemplate):
                 daily_final[cash_proxy] = np.maximum(0.0, 1.0 - tot_risky_series)
 
             # Compress to sparse weights contract
-            output_sparse = _sparse_from_daily(daily_final)
+            output_sparse = _sparse_from_daily(daily_final, min_weight_change=min_weight_change, cash_proxy=cash_proxy)
             return output_sparse
 
     def explain_weights(self, params: Optional[dict] = None) -> str:

@@ -17,7 +17,7 @@ uses the pre-ffill sparsity to find the real rebalance dates.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -185,9 +185,101 @@ def _fill_out_columns(daily: pd.DataFrame, symbols: list) -> pd.DataFrame:
     return daily[symbols]
 
 
-def _sparse_from_daily(daily: pd.DataFrame) -> pd.DataFrame:
+def apply_asset_inertia(
+    daily: pd.DataFrame,
+    min_weight_change: float = 0.02,
+    cash_proxy: Optional[str] = "CASH",
+    emergency_mask: Optional[pd.Series] = None,
+) -> pd.DataFrame:
+    """Filters daily target-weight allocations using asset-level inertia (Option A).
+
+    For each asset, if the change in ideal target weight versus the currently held
+    target weight is below `min_weight_change`, the asset's target weight is frozen
+    at its previous held value.
+
+    When significant changes occur (|diff| >= min_weight_change):
+    1. Sells execute first to release cash capacity.
+    2. Buys execute in order of priority up to available cash capacity without
+       diluting or modifying untouched assets.
+    3. Residual unallocated cash is routed to `cash_proxy` (if present).
+    4. Emergency dates (indicated by `emergency_mask`) bypass inertia to allow
+       immediate liquidation or de-risking without threshold delay.
+    """
+    if min_weight_change <= 0.0 or daily.empty:
+        return daily
+
+    symbols = list(daily.columns)
+    risky_symbols = [s for s in symbols if s != cash_proxy]
+    n_dates = len(daily)
+
+    filtered = daily.copy()
+    current_w = daily.iloc[0].copy()
+    filtered.iloc[0] = current_w
+
+    for t in range(1, n_dates):
+        ideal_w = daily.iloc[t]
+        is_emergency = bool(emergency_mask.iloc[t]) if emergency_mask is not None else False
+
+        if is_emergency:
+            current_w = ideal_w.copy()
+            filtered.iloc[t] = current_w
+            continue
+
+        diff = ideal_w[risky_symbols] - current_w[risky_symbols]
+        sells = diff[diff <= -min_weight_change].index.tolist()
+        buys = diff[diff >= min_weight_change].index.tolist()
+
+        if not sells and not buys:
+            filtered.iloc[t] = current_w
+        else:
+            new_w = current_w.copy()
+            # 1. Execute sells first to release cash capacity
+            for s in sells:
+                new_w[s] = ideal_w[s]
+
+            # 2. Execute buys up to available capacity without diluting untouched assets
+            non_buy_risky = [s for s in risky_symbols if s not in buys]
+            avail_cap = max(0.0, 1.0 - float(new_w[non_buy_risky].sum()))
+
+            buys_sorted = sorted(buys, key=lambda b: diff[b], reverse=True)
+            for b in buys_sorted:
+                ideal_b = ideal_w[b]
+                prior_b = current_w[b]
+                buy_target = min(ideal_b, prior_b + avail_cap)
+
+                if buy_target - prior_b >= min_weight_change:
+                    new_w[b] = buy_target
+                    avail_cap = max(0.0, avail_cap - (buy_target - prior_b))
+                else:
+                    new_w[b] = prior_b
+
+            if cash_proxy in symbols:
+                new_w[cash_proxy] = max(0.0, 1.0 - float(new_w[risky_symbols].sum()))
+
+            current_w = new_w.copy()
+            filtered.iloc[t] = current_w
+
+    return filtered
+
+
+def _sparse_from_daily(
+    daily: pd.DataFrame,
+    min_weight_change: float = 0.0,
+    cash_proxy: Optional[str] = None,
+    emergency_mask: Optional[pd.Series] = None,
+) -> pd.DataFrame:
     """Compress a dense daily target-weight DataFrame to the sparse contract:
-    NaN except on a day the target actually differs from the previous day's."""
+    NaN except on a day the target actually differs from the previous day's.
+
+    If `min_weight_change > 0.0`, applies asset-level inertia first so micro-shifts
+    below `min_weight_change` are suppressed rather than triggering rebalance rows.
+    """
+    if daily.empty:
+        return daily
+    if min_weight_change > 0.0:
+        daily = apply_asset_inertia(
+            daily, min_weight_change=min_weight_change, cash_proxy=cash_proxy, emergency_mask=emergency_mask
+        )
     changed = (daily != daily.shift(1)).any(axis=1)
     changed.iloc[0] = True
     return daily.where(changed)

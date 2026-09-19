@@ -569,7 +569,17 @@ class CompositeTimingTemplate(AllocationTemplate):
         daily = _cap_and_deroute_to_cash(daily, symbols, cash_proxy)
 
         daily = _fill_out_columns(daily, symbols)
-        return _sparse_from_daily(daily)
+        min_weight_change = 0.0
+        if "turtle" in self.name:
+            min_weight_change = float(p.get("turtle_min_weight_change", 0.0))
+        elif "ensemble" in self.name:
+            min_weight_change = float(p.get("ensemble_min_weight_change", 0.0))
+        elif "bollinger" in self.name:
+            min_weight_change = float(p.get("bb_min_weight_change", 0.0))
+        if "min_weight_change" in p:
+            min_weight_change = float(p["min_weight_change"])
+
+        return _sparse_from_daily(daily, min_weight_change=min_weight_change, cash_proxy=cash_proxy)
 
     def explain_weights(self, params: dict = None) -> str:
         p = {**self.default_params, **(params or {})}
