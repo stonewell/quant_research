@@ -279,3 +279,44 @@ def test_invalid_min_shares_raises_value_error():
     with pytest.raises(ValueError, match="min_shares must be an integer >= 1"):
         run_allocation_backtest(universe, target_weights, min_shares="1")
 
+    with pytest.raises(ValueError, match="min_shares must be an integer >= 1"):
+        run_allocation_backtest(universe, target_weights, min_shares=True)
+
+
+def test_min_shares_prevents_ghost_leverage_on_suppressed_sell():
+    # When asset A buys (+30%) but asset B's sell (-30%) is suppressed because
+    # B has a huge share price ($100k) making delta < min_shares,
+    # total exposure must not exceed 1.0 (ghost leverage prevention).
+    idx = pd.bdate_range("2020-01-01", periods=4)
+    universe = {
+        "A": make_df([10.0, 10.0, 10.0, 10.0], start="2020-01-01"),
+        "B": make_df([100_000.0, 100_000.0, 100_000.0, 100_000.0], start="2020-01-01"),
+    }
+    target_weights = pd.DataFrame(np.nan, index=idx, columns=["A", "B"])
+    # Day 0: 50% A ($50k -> 5000 shares), 50% B ($50k -> 0 shares because $100k stock > $50k)
+    target_weights.iloc[0] = [0.5, 0.5]
+    # Day 2: rebalance to 80% A, 20% B
+    target_weights.iloc[2] = [0.8, 0.2]
+
+    res = run_allocation_backtest(universe, target_weights, initial_capital=100_000.0, min_shares=1)
+    actual_w = res["actual_weights"]
+    for d in idx:
+        assert np.sum(np.abs(actual_w.loc[d])) <= 1.0 + 1e-7
+
+
+def test_min_shares_zero_target_with_zero_prior_shares():
+    # When target_w is 0.0 and prior_s is 0, it should safely clear weight without attempting an invalid trade
+    idx = pd.bdate_range("2020-01-01", periods=4)
+    universe = {
+        "A": make_df([100.0, 100.0, 100.0, 100.0], start="2020-01-01"),
+    }
+    target_weights = pd.DataFrame(np.nan, index=idx, columns=["A"])
+    target_weights.iloc[0] = [0.0]
+    target_weights.iloc[2] = [0.0]
+
+    res = run_allocation_backtest(universe, target_weights, initial_capital=100_000.0, min_shares=1)
+    rebal_df = res["rebalance_report"]
+    assert rebal_df.empty
+    assert (res["actual_weights"]["A"] == 0.0).all()
+
+

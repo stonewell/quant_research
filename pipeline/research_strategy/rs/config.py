@@ -513,6 +513,43 @@ class StrategyConfig:
     crb_dd_defensive_thresh: float = 0.15    # drawdown level to switch to VAA-only
     crb_dd_stop_thresh: float = 0.20         # drawdown level to exit to 100% cash
 
+    # --- Price Action Breakout & Retest Strategy (docs/chan_similar_trading.md Strategy 1) ---
+    pabr_box_window: int = 20                # consolidation box length (~4 weeks)
+    pabr_max_box_range_pct: float = 0.15     # max box range (high - low) / low
+    pabr_vol_contraction_ratio: float = 0.90 # box volume / baseline volume ratio
+    pabr_breakout_vol_mult: float = 1.25     # volume expansion threshold on breakout
+    pabr_retest_max_bars: int = 10           # max bars allowed for retest
+    pabr_retest_tolerance: float = 0.03      # retest proximity tolerance to box high
+    pabr_stop_loss_pct: float = 0.06         # max protective stop loss
+    pabr_take_profit_mult: float = 1.5       # profit target multiple of box height
+    pabr_max_holding_days: int = 60          # time stop
+    pabr_position_size_pct: float = 1.0      # single position allocation size
+
+    # --- Volume Profile POC Migration Strategy (docs/chan_similar_trading.md Strategy 2) ---
+    vp_lookback: int = 60                    # rolling volume profile window (~3 months)
+    vp_n_bins: int = 30                      # number of price bins for profile
+    vp_value_area_pct: float = 0.70          # standard value area coverage
+    vp_poc_step_lookback: int = 20           # step lookback for staircase check (~1 month)
+    vp_min_step_pct: float = 0.015           # minimum upward step in POC
+    vp_dip_tolerance: float = 0.03           # tolerance for dip to POC / VAL
+    vp_max_divergence_pct: float = 0.18      # profit taking divergence from POC
+    vp_poc_collapse_pct: float = 0.04        # exit trigger if POC drops
+    vp_stop_loss_pct: float = 0.06           # stop loss below entry/VAL
+    vp_max_holding_days: int = 60            # time stop
+    vp_position_size_pct: float = 1.0        # single position allocation size
+
+    # --- Modified Elliott Wave 3 Fibonacci Strategy (docs/chan_similar_trading.md Strategy 3) ---
+    w3_pivot_window: int = 5                 # local pivot extrema search window
+    w3_min_wave1_pct: float = 0.08           # minimum Wave 1 impulse gain
+    w3_fibo_min_retrace: float = 0.45        # Wave 2 golden pocket min retracement
+    w3_fibo_max_retrace: float = 0.65        # Wave 2 golden pocket max retracement
+    w3_vol_contraction_ratio: float = 0.70   # Wave 2 volume dry-up ratio vs Wave 1
+    w3_fibo_extension: float = 1.618         # Wave 3 profit target extension
+    w3_stop_buffer_pct: float = 0.02         # buffer below Wave 2 trough
+    w3_stop_loss_pct: float = 0.06           # maximum protective stop loss
+    w3_max_holding_days: int = 65            # time stop
+    w3_position_size_pct: float = 1.0        # single position allocation size
+
     # Backtester execution defaults
     initial_capital: float = 100_000.0
     commission_pct: float = 0.0005          # 5 bps

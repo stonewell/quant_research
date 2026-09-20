@@ -244,14 +244,13 @@ def apply_asset_inertia(
             buys_sorted = sorted(buys, key=lambda b: diff[b], reverse=True)
             for b in buys_sorted:
                 ideal_b = ideal_w[b]
-                prior_b = current_w[b]
-                buy_target = min(ideal_b, prior_b + avail_cap)
+                buy_target = min(ideal_b, avail_cap)
 
-                if buy_target - prior_b >= min_weight_change:
+                if buy_target - current_w[b] >= min_weight_change:
                     new_w[b] = buy_target
-                    avail_cap = max(0.0, avail_cap - (buy_target - prior_b))
+                    avail_cap = max(0.0, avail_cap - buy_target)
                 else:
-                    new_w[b] = prior_b
+                    new_w[b] = current_w[b]
 
             if cash_proxy in symbols:
                 new_w[cash_proxy] = max(0.0, 1.0 - float(new_w[risky_symbols].sum()))

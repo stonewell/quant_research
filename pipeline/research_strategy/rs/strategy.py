@@ -93,6 +93,11 @@ from .residual_momentum_strategy import ResidualMomentumStrategy
 from .regime_factor_compound_strategy import RegimeFactorCompoundStrategy
 from .adaptive_fast_expansion_strategy import AdaptiveFastExpansionStrategy
 from .multi_strategy_alpha_book import MultiStrategyAlphaBookStrategy
+from .chan_similar_strategies import (
+    PriceActionBreakoutRetestStrategy,
+    VolumeProfilePocMigrationStrategy,
+    Wave3FibonacciStrategy,
+)
 from .config import StrategyConfig
 from .nl_parser import ParsedStrategySpec, parse_plain_english_strategy
 
@@ -2071,6 +2076,7 @@ STRATEGY_CLASS_MAP = {
     "MultiStrategyAlphaBookStrategy": MultiStrategyAlphaBookStrategy,
     "NaturalLanguageStrategy": NaturalLanguageStrategy,
     "PermanentPortfolioStrategy": PermanentPortfolioStrategy,
+    "PriceActionBreakoutRetestStrategy": PriceActionBreakoutRetestStrategy,
     "ProtectiveAssetAllocation": ProtectiveAssetAllocation,
     "RSIMeanReversionStrategy": RSIMeanReversionStrategy,
     "RegimeFactorCompoundStrategy": RegimeFactorCompoundStrategy,
@@ -2078,6 +2084,8 @@ STRATEGY_CLASS_MAP = {
     "SwingTrendPullbackStrategy": SwingTrendPullbackStrategy,
     "TurtleBreakoutStrategy": TurtleBreakoutStrategy,
     "VigilantAssetAllocation": VigilantAssetAllocation,
+    "VolumeProfilePocMigrationStrategy": VolumeProfilePocMigrationStrategy,
+    "Wave3FibonacciStrategy": Wave3FibonacciStrategy,
 }
 
 

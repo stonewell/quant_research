@@ -60,7 +60,7 @@ def run_allocation_backtest(
     (default: 1). Fractional share trading is not allowed; all traded share
     quantities and holdings are integer share amounts.
     """
-    if not isinstance(min_shares, (int, np.integer)) or min_shares < 1:
+    if isinstance(min_shares, bool) or not isinstance(min_shares, (int, np.integer)) or min_shares < 1:
         raise ValueError(f"min_shares must be an integer >= 1, got {min_shares!r}")
 
     symbols = list(universe.keys())
@@ -123,7 +123,10 @@ def run_allocation_backtest(
             price = float(closes.iloc[0, i])
             if price > 0:
                 raw_shares = (abs(target_w) * initial_capital) / price
-                target_s = (int(raw_shares) // min_shares) * min_shares if min_shares > 1 else int(np.floor(raw_shares))
+                # round() before int() prevents IEEE 754 float truncation
+                # (e.g. 99.99999999997 → 99 → 0 lots instead of 100).
+                rounded_s = int(round(raw_shares, 6))
+                target_s = (rounded_s // min_shares) * min_shares if min_shares > 1 else rounded_s
             else:
                 target_s = 0
 
@@ -134,7 +137,7 @@ def run_allocation_backtest(
                 trade_val = float(trade_s * price)
                 comm = float(trade_val * commission_pct)
                 slip = float(trade_val * slippage_pct)
-                day0_actual_w[i] = target_w
+                day0_actual_w[i] = target_w  # tentative; overwritten below with share-based weight
                 day0_trades.append({
                     "rebalance_id": 1,
                     "date": common_idx[0].strftime("%Y-%m-%d"),
@@ -157,6 +160,9 @@ def run_allocation_backtest(
     if day0_trades:
         rebalance_id = 1
         trades.extend(day0_trades)
+        total_exposure = np.sum(np.abs(day0_actual_w))
+        if total_exposure > 1.0:
+            day0_actual_w = day0_actual_w / total_exposure
         actual_w[0] = day0_actual_w
         turnover = np.sum(np.abs(actual_w[0]))
         equity[0] -= equity[0] * turnover * cost_factor
@@ -179,8 +185,9 @@ def run_allocation_backtest(
         if is_rebalance[t]:
             pre_rebal_equity = float(equity[t])
             rebal_trades = []
-            traded_symbols = set()
 
+            # 1. Determine candidate trades for each symbol based on delta_w
+            candidates = []
             for i, sym in enumerate(symbols):
                 prior_s = held_shares[sym]
                 prior_w = float(drifted_w[i])
@@ -197,47 +204,117 @@ def run_allocation_backtest(
                     # Full liquidation allowed (closing out odd-lots)
                     trade_s = abs(prior_s)
                     action = "SELL" if prior_s > 0 else "BUY"
-                    new_s = 0
+                elif abs(target_w) < 1e-7 and prior_s == 0:
+                    # Target is zero and we already hold zero shares
+                    continue
                 else:
                     raw_val = abs(delta_w) * pre_rebal_equity
                     raw_s = raw_val / price
-                    trade_s = (int(raw_s) // min_shares) * min_shares if min_shares > 1 else int(np.floor(raw_s))
+                    rounded_s = int(round(raw_s, 6))
+                    trade_s = (rounded_s // min_shares) * min_shares if min_shares > 1 else rounded_s
                     if trade_s < min_shares:
                         continue
                     action = "BUY" if delta_w > 0 else "SELL"
-                    new_s = prior_s + (trade_s if delta_w > 0 else -trade_s)
 
+                candidates.append({
+                    "i": i,
+                    "symbol": sym,
+                    "action": action,
+                    "price": price,
+                    "prior_w": prior_w,
+                    "target_w": target_w,
+                    "delta_w": delta_w,
+                    "prior_s": prior_s,
+                    "trade_s": trade_s,
+                })
+
+            # Available cash before new trades: unallocated portfolio cash plus a discrete
+            # lot-rounding buffer so minor rounding across symbols isn't choked, while
+            # still blocking large-scale ghost leverage from suppressed sells.
+            prior_market_exposure = sum(max(0.0, float(drifted_w[idx_s])) for idx_s in range(len(symbols)))
+            lot_buffer = sum(min_shares * float(closes.iloc[t, idx_s]) for idx_s in range(len(symbols)))
+            avail_cash = max(0.0, (1.0 - prior_market_exposure) * pre_rebal_equity) + lot_buffer
+
+            sells = [c for c in candidates if c["action"] == "SELL"]
+            buys = [c for c in candidates if c["action"] == "BUY"]
+
+            # Execute sells first to release cash
+            for c in sells:
+                sym = c["symbol"]
+                price = c["price"]
+                trade_s = min(c["trade_s"], abs(c["prior_s"])) if c["prior_s"] != 0 else c["trade_s"]
+                if trade_s <= 0:
+                    continue
+                new_s = c["prior_s"] - trade_s if c["prior_s"] > 0 else c["prior_s"] + trade_s
                 trade_val = float(trade_s * price)
                 comm = float(trade_val * commission_pct)
                 slip = float(trade_val * slippage_pct)
+                avail_cash += trade_val
+                held_shares[sym] = new_s
                 rebal_trades.append({
                     "rebalance_id": rebalance_id + 1,
                     "date": common_idx[t].strftime("%Y-%m-%d"),
                     "symbol": sym,
-                    "action": action,
+                    "action": "SELL",
                     "price": price,
-                    "prior_weight": prior_w,
-                    "target_weight": target_w,
-                    "weight_change": delta_w,
+                    "prior_weight": c["prior_w"],
+                    "target_weight": c["target_w"],
+                    "weight_change": c["delta_w"],
                     "trade_value": trade_val,
                     "shares": float(trade_s),
-                    "prior_shares": float(prior_s),
+                    "prior_shares": float(c["prior_s"]),
                     "target_shares": float(new_s),
                     "commission": comm,
                     "slippage": slip,
                     "total_cost": comm + slip,
                     "portfolio_equity": pre_rebal_equity,
                 })
+
+            # Execute buys up to available cash capacity to prevent ghost leverage
+            for c in buys:
+                sym = c["symbol"]
+                price = c["price"]
+                max_affordable_s = int(round(avail_cash / price, 6))
+                max_lots_s = (max_affordable_s // min_shares) * min_shares if min_shares > 1 else max_affordable_s
+                trade_s = min(c["trade_s"], max_lots_s)
+                if trade_s < min_shares:
+                    continue
+                new_s = c["prior_s"] + trade_s
+                trade_val = float(trade_s * price)
+                comm = float(trade_val * commission_pct)
+                slip = float(trade_val * slippage_pct)
+                avail_cash = max(0.0, avail_cash - trade_val)
                 held_shares[sym] = new_s
-                traded_symbols.add(sym)
+                rebal_trades.append({
+                    "rebalance_id": rebalance_id + 1,
+                    "date": common_idx[t].strftime("%Y-%m-%d"),
+                    "symbol": sym,
+                    "action": "BUY",
+                    "price": price,
+                    "prior_weight": c["prior_w"],
+                    "target_weight": c["target_w"],
+                    "weight_change": c["delta_w"],
+                    "trade_value": trade_val,
+                    "shares": float(trade_s),
+                    "prior_shares": float(c["prior_s"]),
+                    "target_shares": float(new_s),
+                    "commission": comm,
+                    "slippage": slip,
+                    "total_cost": comm + slip,
+                    "portfolio_equity": pre_rebal_equity,
+                })
 
             if rebal_trades:
                 rebalance_id += 1
                 trades.extend(rebal_trades)
                 new_w = drifted_w.copy()
+                traded_symbols = {tr["symbol"] for tr in rebal_trades}
                 for i, sym in enumerate(symbols):
-                    if sym in traded_symbols:
+                    if sym in traded_symbols or (abs(tgt_w_arr[t, i]) < 1e-7 and held_shares[sym] == 0):
                         new_w[i] = tgt_w_arr[t, i]
+                total_exposure = np.sum(np.abs(new_w))
+                if total_exposure > 1.0:
+                    new_w = new_w / total_exposure
                 turnover = np.sum(np.abs(new_w - drifted_w))
                 equity[t] -= pre_rebal_equity * turnover * cost_factor
                 total_turnover += turnover

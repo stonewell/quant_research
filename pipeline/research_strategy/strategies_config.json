@@ -653,5 +653,66 @@
       "cash_proxy": "BIL"
     },
     "factors": ["regime_trend_strength", "breadth", "relative_momentum", "volatility_targeting", "absolute_momentum_trend"]
+  },
+  "pa_breakout_retest": {
+    "name": "Price Action Breakout & Retest Strategy",
+    "type": "class",
+    "class_name": "PriceActionBreakoutRetestStrategy",
+    "description": "Price Action Trading Range Breakout & Pullback/Retest Strategy (价格行为学：交易区间突破与二次回踩策略): identifies multi-week consolidation boxes (>4 weeks) with contracting volume, awaits volume-confirmed breakout, enters on low-volume retest holding above prior box top; exits on box midpoint stop or 1.5x target.",
+    "parameters": {
+      "pabr_box_window": 20,
+      "pabr_max_box_range_pct": 0.15,
+      "pabr_vol_contraction_ratio": 0.90,
+      "pabr_breakout_vol_mult": 1.25,
+      "pabr_retest_max_bars": 10,
+      "pabr_retest_tolerance": 0.03,
+      "pabr_stop_loss_pct": 0.06,
+      "pabr_take_profit_mult": 1.5,
+      "pabr_max_holding_days": 60,
+      "pabr_position_size_pct": 1.0,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["regime_trend_strength", "absolute_momentum_trend"]
+  },
+  "vp_poc_migration": {
+    "name": "Volume Profile POC Migration Strategy",
+    "type": "class",
+    "class_name": "VolumeProfilePocMigrationStrategy",
+    "description": "Volume Profile Point of Control Migration Strategy (筹码轮廓与控制点POC迁移策略): tracks institutional cost floor via rolling 60-day Volume Profile POC staircase migration; accumulates on washouts to POC/VAL, takes profit on +18% divergence or exits on POC downward collapse.",
+    "parameters": {
+      "vp_lookback": 60,
+      "vp_n_bins": 30,
+      "vp_value_area_pct": 0.70,
+      "vp_poc_step_lookback": 20,
+      "vp_min_step_pct": 0.015,
+      "vp_dip_tolerance": 0.03,
+      "vp_max_divergence_pct": 0.18,
+      "vp_poc_collapse_pct": 0.04,
+      "vp_stop_loss_pct": 0.06,
+      "vp_max_holding_days": 60,
+      "vp_position_size_pct": 1.0,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["absolute_momentum_trend", "relative_momentum"]
+  },
+  "wave3_fibonacci": {
+    "name": "Wave 3 Fibonacci Strategy",
+    "type": "class",
+    "class_name": "Wave3FibonacciStrategy",
+    "description": "Modified Elliott Wave 3 Fibonacci Golden Ratio Strategy (改良版波浪理论与黄金分割三浪主升策略): identifies Wave 1 impulse, enters on Wave 2 low-volume retracement into 0.50-0.618 golden pocket; targets 1.618x Fibonacci Wave 3 extension with stop loss strictly below Wave 2 trough.",
+    "parameters": {
+      "w3_pivot_window": 5,
+      "w3_min_wave1_pct": 0.08,
+      "w3_fibo_min_retrace": 0.45,
+      "w3_fibo_max_retrace": 0.65,
+      "w3_vol_contraction_ratio": 0.70,
+      "w3_fibo_extension": 1.618,
+      "w3_stop_buffer_pct": 0.02,
+      "w3_stop_loss_pct": 0.06,
+      "w3_max_holding_days": 65,
+      "w3_position_size_pct": 1.0,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["absolute_momentum_trend", "relative_momentum", "volatility_targeting"]
   }
 }
