@@ -1254,6 +1254,9 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
         if cash_proxy in symbols:
             current_held_w[cash_proxy] = 1.0
 
+        stop_counter = 0  # consecutive bars in Tier 3 full-stop
+        stop_cooldown_bars = 21  # ~1 month before allowing re-entry
+
         for t in range(len(master_index)):
             date = master_index[t]
 
@@ -1301,6 +1304,19 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
                 ).copy()
                 is_emergency = False
 
+            # Tier 3 cooldown: after spending stop_cooldown_bars in full cash,
+            # reset HWM to current NAV so the drawdown calculation can heal and
+            # the strategy can eventually re-enter risk assets. Without this,
+            # a single Tier 3 trigger permanently disables the strategy for the
+            # remainder of the backtest -- a real bug found during code review.
+            if dd_mag >= dd_stop_thresh:
+                stop_counter += 1
+                if stop_counter >= stop_cooldown_bars:
+                    peak_nav = cum_nav
+                    stop_counter = 0
+            else:
+                stop_counter = 0
+
             # Apply hard position cap per risky symbol
             risky_w = raw_w[risky_symbols].copy().clip(lower=0.0, upper=max_single_pos)
 
@@ -1346,14 +1362,13 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
                 buys_sorted = sorted(buys, key=lambda b: diff[b], reverse=True)
                 for b in buys_sorted:
                     ideal_b = ideal_target_w[b]
-                    prior_b = current_held_w[b]
-                    buy_target = min(ideal_b, prior_b + avail_cap)
+                    buy_target = min(ideal_b, avail_cap)
 
-                    if buy_target - prior_b >= min_weight_change:
+                    if buy_target - current_held_w[b] >= min_weight_change:
                         new_target[b] = buy_target
-                        avail_cap = max(0.0, avail_cap - (buy_target - prior_b))
+                        avail_cap = max(0.0, avail_cap - buy_target)
                     else:
-                        new_target[b] = prior_b
+                        new_target[b] = current_held_w[b]
 
                 if cash_proxy in symbols:
                     new_target[cash_proxy] = max(0.0, 1.0 - float(new_target[risky_symbols].sum()))

@@ -279,7 +279,6 @@
       "crb_three_type_weight": 0.30,
       "crb_vaa_weight": 0.20,
       "crb_max_single_position": 0.20,
-      "crb_min_position_count": 5,
       "crb_min_weight_change": 0.02,
       "crb_dd_reduce_thresh": 0.10,
       "crb_dd_defensive_thresh": 0.15,

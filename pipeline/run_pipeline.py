@@ -205,6 +205,8 @@ def main():
             step5_args += ["--min-rebalances-for-trust", str(args.min_rebalances_for_trust)]
 
     if args.min_shares is not None:
+        step1_args += ["--min-shares", str(args.min_shares)]
+        step4_args += ["--min-shares", str(args.min_shares)]
         step5_args += ["--min-shares", str(args.min_shares)]
 
     if args.cache_ttl_days is not None:

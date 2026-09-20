@@ -508,7 +508,6 @@ class StrategyConfig:
     crb_three_type_weight: float = 0.30      # allocation to chan_three_type
     crb_vaa_weight: float = 0.20             # allocation to chan_vaa_compound
     crb_max_single_position: float = 0.20    # hard cap per stock (prevents 100% concentration)
-    crb_min_position_count: int = 5          # minimum diversification floor
     crb_min_weight_change: float = 0.02      # skip rebalance trades below 2% change
     crb_dd_reduce_thresh: float = 0.10       # drawdown level to halve position sizes
     crb_dd_defensive_thresh: float = 0.15    # drawdown level to switch to VAA-only

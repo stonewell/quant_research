@@ -373,3 +373,23 @@ def test_n_trials_counts_configured_random_search_attempts_not_survivors():
     expected_grid_trials = sum(len(grid_combinations(t().param_grid)) for t in ALLOCATION_TEMPLATES)
     assert call_count["random"] == config.n_random_search  # sanity: all 10 were actually run
     assert result["n_trials"] == expected_grid_trials + config.n_random_search
+
+
+def test_generator_config_min_shares_validation():
+    # Valid min_shares
+    cfg = GeneratorConfig(min_shares=10)
+    assert cfg.min_shares == 10
+
+    # Invalid min_shares: zero, negative, float, bool, string
+    with pytest.raises(ValueError, match="GeneratorConfig.min_shares must be an integer >= 1"):
+        GeneratorConfig(min_shares=0)
+
+    with pytest.raises(ValueError, match="GeneratorConfig.min_shares must be an integer >= 1"):
+        GeneratorConfig(min_shares=-5)
+
+    with pytest.raises(ValueError, match="GeneratorConfig.min_shares must be an integer >= 1"):
+        GeneratorConfig(min_shares=True)
+
+    with pytest.raises(ValueError, match="GeneratorConfig.min_shares must be an integer >= 1"):
+        GeneratorConfig(min_shares="1")
+

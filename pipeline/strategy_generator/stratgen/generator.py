@@ -58,6 +58,10 @@ class GeneratorConfig:
     # combinatorial explosion over every known aspect.
     composition_top_k: int = 4
 
+    def __post_init__(self):
+        if not isinstance(self.min_shares, (int, np.integer)) or isinstance(self.min_shares, bool) or self.min_shares < 1:
+            raise ValueError(f"GeneratorConfig.min_shares must be an integer >= 1, got {self.min_shares!r}")
+
 
 @dataclass
 class GeneratedStrategySpec:

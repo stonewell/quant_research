@@ -1,5 +1,6 @@
-#!/usr/bin/bash
+#!/usr/bin/env bash
 set -x
+cd "$(dirname "$0")/.."
 
 find research_strategy/results/strategy_dumps/ -type f -name "*.json" -print0 | while IFS= read -r -d '' file; do
     # Get just the filename (e.g., "document.txt")
@@ -11,7 +12,7 @@ find research_strategy/results/strategy_dumps/ -type f -name "*.json" -print0 | 
     echo "$name_only"
 
 	uv run python ../backtester/run_backtest.py \
-	   --strategy-file $file \
+	   --strategy-file "$file" \
 	   --mode walkforward \
 	   --window-years 0.5 \
 	   --step-years 0.5 \

@@ -279,7 +279,7 @@ def test_dry_run_never_invokes_subprocess(monkeypatch, tmp_path):
     mock_run.assert_not_called()
 
 
-def test_main_passes_min_shares_to_step5(monkeypatch, tmp_path):
+def test_main_passes_min_shares_to_steps(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", ["run_pipeline.py", "--min-shares", "100"])
     monkeypatch.setattr(run_pipeline, "RESULTS_DIR", str(tmp_path))
 
@@ -290,7 +290,16 @@ def test_main_passes_min_shares_to_step5(monkeypatch, tmp_path):
 
     assert mock_run.call_count == 4
     calls = mock_run.call_args_list
+    # Step 1: research_strategy
+    step1_argv = calls[0].args[0]
+    assert "--min-shares" in step1_argv and "100" in step1_argv
+
+    # Step 4: strategy_generator
+    step4_argv = calls[2].args[0]
+    assert "--min-shares" in step4_argv and "100" in step4_argv
+
+    # Step 5: backtester
     step5_argv = calls[3].args[0]
-    assert "--min-shares" in step5_argv
-    assert "100" in step5_argv
+    assert "--min-shares" in step5_argv and "100" in step5_argv
+
 
