@@ -35,6 +35,7 @@ def test_build_arg_parser_defaults():
     assert args.n_random_search is None
     assert args.ers_percentile_threshold is None
     assert args.min_rebalances_for_trust is None
+    assert args.min_shares is None
     assert args.dry_run is False
 
 
@@ -276,3 +277,20 @@ def test_dry_run_never_invokes_subprocess(monkeypatch, tmp_path):
     run_pipeline.main()
 
     mock_run.assert_not_called()
+
+
+def test_main_passes_min_shares_to_step5(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "argv", ["run_pipeline.py", "--min-shares", "100"])
+    monkeypatch.setattr(run_pipeline, "RESULTS_DIR", str(tmp_path))
+
+    mock_run = MagicMock(return_value=_fake_result(returncode=0, stderr=""))
+    monkeypatch.setattr(run_pipeline.subprocess, "run", mock_run)
+
+    run_pipeline.main()
+
+    assert mock_run.call_count == 4
+    calls = mock_run.call_args_list
+    step5_argv = calls[3].args[0]
+    assert "--min-shares" in step5_argv
+    assert "100" in step5_argv
+

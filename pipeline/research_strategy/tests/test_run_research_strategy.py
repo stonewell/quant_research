@@ -392,3 +392,25 @@ def test_dump_strategies_exits_before_loading_universe_or_writing_eval_artifacts
     assert not (tmp_path / "research_strategy_report.json").exists()
     assert not (tmp_path / "factor_summary.json").exists()
     assert not (tmp_path / "top_strategies_summary.json").exists()
+
+
+def test_min_shares_arg_default_and_parsing():
+    parser = rrs.build_arg_parser()
+    args = parser.parse_args([])
+    assert args.min_shares == 1
+
+    args = parser.parse_args(["--min-shares", "50"])
+    assert args.min_shares == 50
+
+
+def test_strategy_config_min_shares_validation():
+    from rs.config import StrategyConfig
+    cfg = StrategyConfig(min_shares=10)
+    assert cfg.min_shares == 10
+
+    with pytest.raises(ValueError, match="StrategyConfig.min_shares must be an integer >= 1"):
+        StrategyConfig(min_shares=0)
+
+    with pytest.raises(ValueError, match="StrategyConfig.min_shares must be an integer >= 1"):
+        StrategyConfig(min_shares=-5)
+

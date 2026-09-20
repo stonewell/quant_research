@@ -19,6 +19,7 @@ find research_strategy/results/strategy_dumps/ -type f -name "*.json" -print0 | 
 	   --end  2026-01-01 \
 	   --start 2022-01-01 \
 	   --data-provider fuyao \
+	   --min-shares=100 \
 	   --results-dir results/$name_only \
 	   --baseline-symbol 000300.SH
 done

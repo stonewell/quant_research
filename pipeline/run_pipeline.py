@@ -93,6 +93,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-rebalances-for-trust", type=int, default=None,
         help="backtester --min-rebalances-for-trust passthrough (step 5); only meaningful "
              "together with --optimize. Omit for backtester's own default (4).")
+    p.add_argument("--min-shares", type=int, default=None,
+        help="backtester --min-shares passthrough (step 5) -- minimum amount of shares to trade each time (default: 1). No fractional shares.")
     p.add_argument("--no-plots", action="store_true",
         help="backtester/strategy_generator --no-plots passthrough -- skip equity-curve charts.")
     p.add_argument("--cache-ttl-days", type=float, default=None,
@@ -201,6 +203,9 @@ def main():
             step5_args += ["--ers-percentile-threshold", str(args.ers_percentile_threshold)]
         if args.min_rebalances_for_trust is not None:
             step5_args += ["--min-rebalances-for-trust", str(args.min_rebalances_for_trust)]
+
+    if args.min_shares is not None:
+        step5_args += ["--min-shares", str(args.min_shares)]
 
     if args.cache_ttl_days is not None:
         for step_args in (step1_args, step2_args, step3_args, step4_args, step5_args):

@@ -127,6 +127,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "search hybrid strategies that aren't any single static or --research-strategy template. "
                         "See common/strategy_aspects.py and research_strategy/rs/timing_aspects.py. Pass this "
                         "flag to restrict the search to only the templates explicitly named/loaded.")
+    p.add_argument("--min-shares", type=int, default=1,
+                   help="Minimum amount of shares to trade each time (default: 1). Fractional share trading is not allowed.")
     add_data_provider_cli_args(p)
     return p
 
@@ -137,6 +139,7 @@ def main():
         n_random_search=args.n_random_search,
         ers_percentile_threshold=args.ers_percentile_threshold,
         min_rebalances_for_trust=args.min_rebalances_for_trust,
+        min_shares=args.min_shares,
         factor_tiebreak_epsilon=args.factor_tiebreak_epsilon,
         enable_aspect_composition=not args.no_compose_aspects,
     )

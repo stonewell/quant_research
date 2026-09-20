@@ -106,6 +106,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--top-n", type=int, default=5,
                    help="Number of top-ranked strategies (by Sharpe ratio, CAGR tie-break) to include "
                         "in top_strategies_summary.json (default: 5)")
+    p.add_argument("--min-shares", type=int, default=1,
+                   help="Minimum number of shares to trade per rebalance order (default: 1). "
+                        "Fractional share trading is disallowed; trade sizes are integer multiples "
+                        "of min_shares (except full position exits which liquidate remaining shares).")
     add_data_provider_cli_args(p, default_provider="synthetic", no_cache_help="Disable local CSV caching of fetched data")
     return p
 
@@ -319,7 +323,7 @@ _VAA_MISSING_POOLS_MESSAGE = (
 
 def main():
     args = build_arg_parser().parse_args()
-    cfg = StrategyConfig()
+    cfg = StrategyConfig(min_shares=args.min_shares)
 
     loaded_config = load_strategies_config(args.config)
 
@@ -425,7 +429,8 @@ def main():
             target_weights,
             initial_capital=cfg.initial_capital,
             commission_pct=cfg.commission_pct,
-            slippage_pct=cfg.slippage_pct
+            slippage_pct=cfg.slippage_pct,
+            min_shares=cfg.min_shares,
         )
 
         # `run_allocation_backtest` deliberately short-circuits to

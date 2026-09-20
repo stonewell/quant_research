@@ -34,6 +34,7 @@ class GeneratorConfig:
     initial_capital: float = 100_000.0
     commission_pct: float = 0.0005
     slippage_pct: float = 0.0005
+    min_shares: int = 1
     seed: int = None
     # How close (as a fraction of the leading score, with `factor_tiebreak_epsilon`
     # itself also used as an absolute floor so near-zero Sharpe scores don't
@@ -107,7 +108,8 @@ def _portfolio_score(universe: dict, template, params: dict, config: GeneratorCo
             universe, target_weights,
             initial_capital=config.initial_capital,
             commission_pct=config.commission_pct,
-            slippage_pct=config.slippage_pct
+            slippage_pct=config.slippage_pct,
+            min_shares=getattr(config, "min_shares", 1),
         )
         return result
     except Exception as exc:

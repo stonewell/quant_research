@@ -518,6 +518,7 @@ class StrategyConfig:
     initial_capital: float = 100_000.0
     commission_pct: float = 0.0005          # 5 bps
     slippage_pct: float = 0.0005            # 5 bps
+    min_shares: int = 1
 
     def __post_init__(self):
         """Validates only the handful of fields used downstream as divisors,
@@ -538,6 +539,8 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.slippage_pct must be >= 0, got {self.slippage_pct}")
         if self.initial_capital <= 0:
             raise ValueError(f"StrategyConfig.initial_capital must be > 0, got {self.initial_capital}")
+        if not isinstance(self.min_shares, int) or self.min_shares < 1:
+            raise ValueError(f"StrategyConfig.min_shares must be an integer >= 1, got {self.min_shares!r}")
         if not self.cash_proxy or not isinstance(self.cash_proxy, str):
             raise ValueError(f"StrategyConfig.cash_proxy must be a non-empty string, got {self.cash_proxy!r}")
         if not isinstance(self.risky_universe, list):
