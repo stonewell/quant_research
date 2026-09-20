@@ -69,9 +69,17 @@ saved CSV is the DENSE, forward-filled daily weight series, not the sparse in-me
 
 ## 4. Portfolio backtest result dict
 
-Returned by `common.allocation_backtester.run_allocation_backtest(universe, target_weights, ...)` —
+Returned by `common.allocation_backtester.run_allocation_backtest(universe, target_weights, initial_capital=100_000.0, commission_pct=0.0005, slippage_pct=0.0005, min_shares=1)` —
 the single shared backtesting engine used by `backtester`, `research_strategy`, and
 `strategy_generator`.
+
+Parameters:
+- `universe` (`Dict[str, pd.DataFrame]`): OHLCV history per symbol.
+- `target_weights` (`pd.DataFrame`): Sparse target weights contract (§3).
+- `initial_capital` (`float`, default `100_000.0`): Starting portfolio equity.
+- `commission_pct` (`float`, default `0.0005`): Proportional commission per trade (5 bps).
+- `slippage_pct` (`float`, default `0.0005`): Proportional slippage per trade (5 bps).
+- `min_shares` (`int`, default `1`): Minimum shares traded per rebalance order (must be integer $\ge 1$). Disallows fractional share trading by discretizing order sizes into integer multiples of `min_shares` (trades smaller than `min_shares` are suppressed, except for full position exits where remaining odd lots are liquidated).
 
 | Key | Type | Meaning |
 |---|---|---|

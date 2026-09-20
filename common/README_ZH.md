@@ -41,12 +41,21 @@
 
 ## 4. 组合回测结果字典 (Portfolio backtest result dict)
 
-由 `common.allocation_backtester.run_allocation_backtest(universe, target_weights, ...)` 返回——这是 `backtester`、`research_strategy` 和 `strategy_generator` 共同使用的单个共享回测引擎。
+由 `common.allocation_backtester.run_allocation_backtest(universe, target_weights, initial_capital=100_000.0, commission_pct=0.0005, slippage_pct=0.0005, min_shares=1)` 返回——这是 `backtester`、`research_strategy` 和 `strategy_generator` 共同使用的单个共享回测引擎。
+
+参数：
+- `universe` (`Dict[str, pd.DataFrame]`): 每个标的的 OHLCV 历史数据。
+- `target_weights` (`pd.DataFrame`): 稀疏目标权重契约 (§3)。
+- `initial_capital` (`float`，默认 `100_000.0`): 初始组合资金。
+- `commission_pct` (`float`，默认 `0.0005`): 每笔交易的比例佣金（5 bps）。
+- `slippage_pct` (`float`，默认 `0.0005`): 每笔交易的比例滑点（5 bps）。
+- `min_shares` (`int`，默认 `1`): 每次再平衡委托的最小交易股数（必须为 $\ge 1$ 的整数）。通过将交易数量离散化为 `min_shares` 的整数倍禁止碎股/分数股交易（小于 `min_shares` 的微小交易被抑制不成交，完全平仓时清算剩余零股除外）。
 
 | 键 (Key) | 类型 | 含义 |
 |---|---|---|
 | `equity_curve` | `pd.DataFrame`（1 列：`equity`），`DatetimeIndex` | 每日组合权益，起始值为 `initial_capital` |
 | `actual_weights` | `pd.DataFrame`，`DatetimeIndex`，列 = 标的代码 | 实际持有的**稠密**每日权重（漂移后、再平衡后）——非稀疏 |
+| `rebalance_report` | `pd.DataFrame`，列：`[rebalance_id, date, symbol, action, price, prior_weight, target_weight, weight_change, trade_value, shares, prior_shares, target_shares, commission, slippage, total_cost, portfolio_equity]` | 投资组合再平衡事件中每个被调整资产的逐笔交易明细日志 |
 | `total_turnover` | `float` | 每次再平衡中绝对权重变化的总和 |
 | `total_rebalances` | `int` | 包含实际再平衡指令的日期计数 |
 | `total_return`、`cagr`、`max_drawdown`、`sharpe_ratio`、`calmar_ratio`、`win_rate`、`profit_factor` | `float` | 标准性能指标。`max_drawdown` 为**正数幅度**（例如 18% 回撤记为 `0.18`），符合 `common/metrics.py` 自身的规范。此处的 `win_rate`/`profit_factor` 根据**每日收益率序列**计算（`common.metrics.win_rate_from_returns`/`profit_factor_from_returns`）——与接收交易 DataFrame（`side`/`pnl` 列）的 `common.metrics.win_rate`/`profit_factor` **规范不同**；这两对同名函数不可互换，参阅 `common/metrics.py` 的 Docstring |

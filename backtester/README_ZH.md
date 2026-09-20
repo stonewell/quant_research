@@ -42,6 +42,7 @@ cd pipeline && uv sync
 | `--initial-capital` | 浮点数，默认值 `100000.0` | 初始组合资金 |
 | `--commission-pct` | 浮点数，默认值 `0.0005` | 每笔交易的佣金占交易名义价值的比例 |
 | `--slippage-pct` | 浮点数，默认值 `0.0005` | 每笔交易的滑点占交易名义价值的比例 |
+| `--min-shares` | 整数，默认值 `1` | 每次再平衡委托的最小交易股数。禁止碎股/分数股交易；交易数量为 `min_shares` 的整数倍（平仓清算剩余零股除外） |
 | `--baseline-symbol` | 字符串，默认值：无 | 可选的单一参考标的（如 `SPY`），用于与策略对比。默认关闭——除非设置此项，否则不会运行对比代码 |
 | `--baseline-template` | 字符串，默认值 `"equal_weight"` | 静态配置模板（`ALLOCATION_TEMPLATES` 中的 9 个之一——无 `pattern_*` 模板），用于将 `--baseline-symbol` 转换为基准权益曲线 |
 | `--baseline-params` | JSON 字符串，默认值：无 | `--baseline-template` 的参数（JSON 对象字符串，默认值：该模板的第一个 `param_grid` 组合） |

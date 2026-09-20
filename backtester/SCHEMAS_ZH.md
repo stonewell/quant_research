@@ -32,11 +32,37 @@ Schema 归属于 `strategy_generator` 并由其记录——参阅 `../pipeline/s
 
 共享回测结果字典的 `actual_weights` (`../common/README_ZH.md` §4) ——实际持有的**稠密**每日权重（漂移后、再平衡后），标的池中每个标的一列。
 
+### `results/rebalance_report.csv` (`--mode standard`)
+
+投资组合再平衡事件中每个被调整资产的逐笔交易明细日志。仅记录实际发生持仓调整的资产（`|weight_change| > 1e-7` 且成交股数 $\ge \text{min\_shares}$，或在完全平仓时清算剩余零股；未配置或未调整的资产不予记录）。
+
+字段列表：
+- `rebalance_id` (`int`): 再平衡事件的递增序号 (1, 2, ...)。
+- `date` (`str`, `YYYY-MM-DD`): 再平衡交易执行日期（收盘时）。
+- `symbol` (`str`): 交易标的代码。
+- `action` (`str`, `"BUY"` 或 `"SELL"`): 交易方向。
+- `price` (`float`): 执行时的收盘价。
+- `prior_weight` (`float`): 再平衡前的持有权重（按市值漂移后，或第 0 天为 0.0）。
+- `target_weight` (`float`): 策略分配的目标权重。
+- `weight_change` (`float`): `target_weight - prior_weight` (权重变化量)。
+- `trade_value` (`float`): 以美元计的名义交易额 (`shares * price`)。
+- `shares` (`float`): 实际成交的离散整数股数（按 `min_shares` 的整数倍向下取整，或在完全平仓时清算持有的全部零股；不允许分数股/碎股交易）。
+- `prior_shares` (`float`): 再平衡前持有的整股数。
+- `target_shares` (`float`): 再平衡后持有的目标整股数 (`prior_shares +/- shares`)。
+- `commission` (`float`): 产生的佣金费用 (`trade_value * commission_pct`)。
+- `slippage` (`float`): 产生的滑点成本 (`trade_value * slippage_pct`)。
+- `total_cost` (`float`): 总交易摩擦成本 (`commission + slippage`)。
+- `portfolio_equity` (`float`): 扣除交易摩擦前的再平衡前组合权益。
+
 ### `results/walkforward_report.csv` (`--mode walkforward`)
 
 每个滚动窗口一行。列：`start_date`、`end_date`（字符串，`YYYY-MM-DD`）、`sharpe_ratio`、`cagr`、`max_drawdown`、`calmar_ratio`、`win_rate`、`profit_factor`（均为 `float`，若模板生成了空权重或空权益曲线则为 `NaN`）、`total_turnover`（`float`，`NaN` 窗口上为 `0.0`）、`total_rebalances`（`int`，`NaN` 窗口上为 `0`）。
 
 当设置了 `--baseline-symbol` 时，附加 5 个额外列：`baseline_sharpe_ratio`、`baseline_cagr`、`baseline_max_drawdown`、`baseline_calmar_ratio`（基准运行同名的逐窗口指标）与 `outperformance`（`cagr - baseline_cagr`）。这些列通过 **`(start_date, end_date)` 而非行位置** 连接到策略的窗口行上——策略与基准的窗口列表来自独立加载的日历和位置计算，因此不保证逐行对应。在 `(start_date, end_date)` 上没有匹配基准窗口的策略窗口将在所有 5 列中获得 `NaN`，而非被丢弃。
+
+### `results/walkforward_rebalances.csv` (`--mode walkforward`)
+
+所有滚动 walkforward 窗口中汇总的逐笔再平衡交易明细。具有与 `rebalance_report.csv` 完全相同的列，并在最前增加一列 `fold` (`int`，从 1 开始计数)，用于标识该交易属于哪一个滚动窗口。
 
 ### `results/baseline_equity.csv` (`--mode standard`，仅当设置了 `--baseline-symbol` 时)
 

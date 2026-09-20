@@ -112,14 +112,14 @@ def test_rebalance_report_columns_and_reconciliation():
     np.testing.assert_allclose(a_trade["weight_change"], 0.5 - 2.0 / 3.0, atol=1e-4)
     np.testing.assert_allclose(b_trade["weight_change"], 0.5 - 1.0 / 3.0, atol=1e-4)
 
-    # Mathematical consistency: sum of trade values / equity equals turnover
+    # Mathematical consistency: sum of trade values / equity equals turnover (within discrete share rounding)
     pre_equity = a_trade["portfolio_equity"]
     turnover = abs(a_trade["weight_change"]) + abs(b_trade["weight_change"])
-    np.testing.assert_allclose(day2_trades["trade_value"].sum() / pre_equity, turnover)
+    np.testing.assert_allclose(day2_trades["trade_value"].sum() / pre_equity, turnover, atol=2e-3)
 
     # Cost reconciliation
     expected_day2_cost = pre_equity * turnover * (comm_pct + slip_pct)
-    np.testing.assert_allclose(day2_trades["total_cost"].sum(), expected_day2_cost)
+    np.testing.assert_allclose(day2_trades["total_cost"].sum(), expected_day2_cost, atol=0.5)
 
 
 def test_rebalance_report_skips_untraded_assets():
@@ -174,3 +174,108 @@ def test_format_rebalance_trades_preview():
     assert "BUY" in table_str
     assert "$475.50" in table_str
     assert "50.0%" in table_str
+
+
+def test_no_fractional_shares_trading_default():
+    # Verify that default min_shares=1 enforces whole shares with no fractions
+    idx = pd.bdate_range("2020-01-01", periods=5)
+    universe = {
+        "SPY": make_df([475.50, 480.25, 478.10, 482.00, 485.00], start="2020-01-01"),
+        "QQQ": make_df([312.33, 315.50, 310.00, 320.00, 322.00], start="2020-01-01"),
+    }
+    target_weights = pd.DataFrame(np.nan, index=idx, columns=["SPY", "QQQ"])
+    target_weights.iloc[0] = [0.5, 0.5]
+    target_weights.iloc[2] = [0.4, 0.6]
+
+    res = run_allocation_backtest(universe, target_weights, initial_capital=100_000.0)
+    rebal_df = res["rebalance_report"]
+    assert not rebal_df.empty
+
+    for _, row in rebal_df.iterrows():
+        # Shares must be exact integer values
+        assert row["shares"] > 0
+        assert row["shares"] == int(row["shares"])
+        assert row["prior_shares"] == int(row["prior_shares"])
+        assert row["target_shares"] == int(row["target_shares"])
+        # trade_value must equal shares * price
+        np.testing.assert_allclose(row["trade_value"], row["shares"] * row["price"])
+
+
+def test_min_shares_suppresses_micro_trades():
+    idx = pd.bdate_range("2020-01-01", periods=4)
+    # Very high stock price ($90,000) so tiny weight changes correspond to < 1 share
+    universe = {
+        "BRK": make_df([90_000.0, 90_000.0, 90_000.0, 90_000.0], start="2020-01-01"),
+    }
+    target_weights = pd.DataFrame(np.nan, index=idx, columns=["BRK"])
+    # Day 0: allocate 90% ($90k of $100k -> 1 share)
+    target_weights.iloc[0] = [0.90]
+    # Day 2: rebalance to 0.9001 (a tiny delta that is << 1 share of a $90k stock)
+    target_weights.iloc[2] = [0.9001]
+
+    res = run_allocation_backtest(universe, target_weights, initial_capital=100_000.0, min_shares=1)
+    rebal_df = res["rebalance_report"]
+    # Only Day 0 trade should exist; Day 2 micro-delta must be suppressed
+    assert len(rebal_df) == 1
+    assert rebal_df.iloc[0]["rebalance_id"] == 1
+
+
+def test_min_shares_lot_sizing():
+    idx = pd.bdate_range("2020-01-01", periods=4)
+    universe = {
+        "A": make_df([10.0, 10.0, 10.0, 10.0], start="2020-01-01"),
+        "B": make_df([10.0, 10.0, 10.0, 10.0], start="2020-01-01"),
+    }
+    target_weights = pd.DataFrame(np.nan, index=idx, columns=["A", "B"])
+    # Day 0: 50% A ($5,000 -> 500 shares), 50% B ($5,000 -> 500 shares)
+    target_weights.iloc[0] = [0.5, 0.5]
+    # Day 2: 70% A ($7,000 -> desired 700 shares, delta = +200 shares)
+    #        30% B ($3,000 -> desired 300 shares, delta = -200 shares)
+    target_weights.iloc[2] = [0.7, 0.3]
+
+    res = run_allocation_backtest(universe, target_weights, initial_capital=10_000.0, min_shares=100)
+    rebal_df = res["rebalance_report"]
+    assert len(rebal_df) == 4
+
+    for _, row in rebal_df.iterrows():
+        assert row["shares"] % 100 == 0
+        assert row["prior_shares"] % 100 == 0
+        assert row["target_shares"] % 100 == 0
+
+
+def test_min_shares_full_exit_liquidation():
+    # When min_shares=100 and an odd lot is held (e.g. 50 shares), full exit to 0.0 must sell all 50 shares
+    idx = pd.bdate_range("2020-01-01", periods=4)
+    universe = {
+        "A": make_df([100.0, 100.0, 100.0, 100.0], start="2020-01-01"),
+    }
+    target_weights = pd.DataFrame(np.nan, index=idx, columns=["A"])
+    # Day 0 with min_shares=50: buys 50 shares ($5,000 / 100)
+    target_weights.iloc[0] = [0.5]
+    # Day 2: strategy completely exits (target_weight = 0.0)
+    target_weights.iloc[2] = [0.0]
+
+    res = run_allocation_backtest(universe, target_weights, initial_capital=10_000.0, min_shares=50)
+    rebal_df = res["rebalance_report"]
+    assert len(rebal_df) == 2
+    exit_trade = rebal_df.iloc[1]
+    assert exit_trade["action"] == "SELL"
+    assert exit_trade["shares"] == 50.0
+    assert exit_trade["target_shares"] == 0.0
+    assert exit_trade["prior_shares"] == 50.0
+
+
+def test_invalid_min_shares_raises_value_error():
+    import pytest
+    universe = {"A": make_df([100.0] * 5)}
+    target_weights = pd.DataFrame(0.5, index=pd.bdate_range("2020-01-01", periods=5), columns=["A"])
+
+    with pytest.raises(ValueError, match="min_shares must be an integer >= 1"):
+        run_allocation_backtest(universe, target_weights, min_shares=0)
+
+    with pytest.raises(ValueError, match="min_shares must be an integer >= 1"):
+        run_allocation_backtest(universe, target_weights, min_shares=-10)
+
+    with pytest.raises(ValueError, match="min_shares must be an integer >= 1"):
+        run_allocation_backtest(universe, target_weights, min_shares="1")
+

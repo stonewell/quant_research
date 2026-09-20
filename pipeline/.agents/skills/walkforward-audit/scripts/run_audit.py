@@ -217,13 +217,44 @@ def audit_strategy_trades(results_dir: Path, dir_name: str, summary_data: dict):
     concentrated_trades = [t for t in trades if abs(t["target_weight"]) >= 0.80]
     all_in_trades = [t for t in trades if abs(t["target_weight"]) >= 0.99]
 
-    # 2. Weight sum per rebalance
+    # 2. Stateful tracking of actual held portfolio weights per fold
+    # NOTE: walkforward_rebalances.csv only records assets adjusted during a rebalance event
+    # (|weight_change| > 1e-7). In asynchronous or asset-level inertia strategies, untouched
+    # assets from prior rebalances do not emit rows. Naively summing target_weight in trade rows
+    # severely distorts the average invested weight (e.g. reporting 0.12 instead of 0.65).
+    # We maintain a stateful tracker of active positions across rebalance events per fold.
     rebal_groups = defaultdict(dict)
-    for t in trades:
-        rebal_groups[(t["fold"], t["rebalance_id"], t["date"])][t["symbol"]] = t["target_weight"]
-    weight_sums = [sum(ws.values()) for ws in rebal_groups.values()]
-    avg_weight_sum = statistics.mean(weight_sums) if weight_sums else 1.0
-    underinvested_rebals = sum(1 for ws in weight_sums if ws < 0.80)
+    held_weight_sums = []
+    underinvested_rebals = 0
+
+    for f_num in folds:
+        ft = [t for t in trades if t["fold"] == f_num]
+        event_dict = defaultdict(list)
+        events = []
+        for t in ft:
+            rebal_key = (t["fold"], t["rebalance_id"], t["date"])
+            rebal_groups[rebal_key][t["symbol"]] = t["target_weight"]
+
+            event_key = (t["rebalance_id"], t["date"])
+            if event_key not in event_dict:
+                events.append(event_key)
+            event_dict[event_key].append(t)
+
+        held_pos = {}
+        for ev in events:
+            for t in event_dict[ev]:
+                sym = t["symbol"]
+                tw = t["target_weight"]
+                if tw > 1e-7:
+                    held_pos[sym] = tw
+                else:
+                    held_pos.pop(sym, None)
+            total_invested = sum(held_pos.values())
+            held_weight_sums.append(total_invested)
+            if total_invested < 0.80:
+                underinvested_rebals += 1
+
+    avg_weight_sum = statistics.mean(held_weight_sums) if held_weight_sums else 1.0
 
     # 3. Warmup delay in Fold 1
     fold1_trades = [t for t in trades if t["fold"] == 1]

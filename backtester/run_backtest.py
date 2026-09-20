@@ -88,6 +88,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-random-search", type=int, default=200)
     p.add_argument("--ers-percentile-threshold", type=float, default=0.90)
     p.add_argument("--min-rebalances-for-trust", type=int, default=4)
+    p.add_argument("--min-shares", type=int, default=1,
+                   help="Minimum amount of shares to trade each time (default: 1). Fractional share trading is not allowed.")
     add_data_provider_cli_args(p)
     add_output_dir_override_args(p, RESULTS_DIR, DATA_DIR, "equity/weights/report CSVs")
     p.add_argument("--no-plots", action="store_true",
@@ -135,7 +137,8 @@ def run_standard(universe: dict, template, params: dict, args) -> dict:
         universe, target_weights,
         initial_capital=args.initial_capital,
         commission_pct=args.commission_pct,
-        slippage_pct=args.slippage_pct
+        slippage_pct=args.slippage_pct,
+        min_shares=getattr(args, "min_shares", 1),
     )
 
     if result["equity_curve"].empty:
@@ -222,7 +225,8 @@ def run_walkforward(universe: dict, template, params: dict, args) -> list:
                     eval_universe, eval_weights,
                     initial_capital=args.initial_capital,
                     commission_pct=args.commission_pct,
-                    slippage_pct=args.slippage_pct
+                    slippage_pct=args.slippage_pct,
+                    min_shares=getattr(args, "min_shares", 1),
                 )
                 if result["equity_curve"].empty:
                     fold_metrics = _nan_fold_metrics()

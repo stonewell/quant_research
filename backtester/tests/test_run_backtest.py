@@ -103,11 +103,20 @@ def test_arg_parser_cache_ttl_days_default_and_override():
     assert args.cache_ttl_days == 7.0
 
 
+def test_arg_parser_min_shares_default_and_override():
+    args = build_arg_parser().parse_args(["--strategy-file", "strategy.json"])
+    assert args.min_shares == 1
+
+    args = build_arg_parser().parse_args(["--strategy-file", "strategy.json", "--min-shares", "100"])
+    assert args.min_shares == 100
+
+
 class MockArgs:
     def __init__(self, **kwargs):
         self.initial_capital = 100_000.0
         self.commission_pct = 0.0
         self.slippage_pct = 0.0
+        self.min_shares = 1
         self.window_years = 0.1
         self.step_years = 0.05
         for k, v in kwargs.items():

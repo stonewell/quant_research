@@ -93,7 +93,8 @@ Refer to the [Anomaly Patterns Reference](./references/anomaly_patterns.md) for 
    - Check if the strategy takes 100% bets on single stocks (`target_weight >= 0.99`).
    - *Risk*: Catastrophic single-stock halt/gap-down risk in live trading.
 2. **Cash Drag / Capital Under-Investment**:
-   - Check if average rebalance weight sum $\sum w_i \ll 1.0$ (e.g. 0.30 in VAA compound).
+   - Check if average stateful held weight sum $\sum w_i \ll 1.0$ (e.g. 0.30 in VAA compound).
+   - *Critical*: Must track active positions statefully per fold; naively summing individual trade-event rows calculates marginal trade adjustments (which omit untouched holdings) and severely overstates idle cash.
    - *Risk*: Distorts raw MaxDD and CAGR comparisons; requires gross vs. net normalization.
 3. **Fold 1 Warmup Delay**:
    - Check the days from Fold 1 start to first trade (e.g. $+113$ days).

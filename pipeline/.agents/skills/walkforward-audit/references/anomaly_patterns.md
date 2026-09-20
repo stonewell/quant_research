@@ -32,11 +32,34 @@ Total sum of weights across all assets (including cash proxy) is significantly l
 - A strategy investing only 30% capital in risky assets will report artificially low Max Drawdown (e.g. 2.7%) and low CAGR (12.9%).
 - On a per-invested-dollar basis, the strategy might have 40%+ CAGR and 9% MaxDD. Comparing its raw Sharpe or Calmar directly against 100% invested strategies creates a misleading comparison.
 
-### Detection Rule
+### Detection Rule (Stateful Holdings Tracking)
+> [!WARNING]
+> `rebalance_report.csv` / `walkforward_rebalances.csv` only emits rows for assets whose positions were **adjusted** (`|weight_change| > 1e-7`). For asynchronous or asset-level inertia strategies, untouched held assets do not emit rows. Naively summing `target_weight` inside trade-event rows calculates **marginal rebalance flow**, not **portfolio holdings**, falsely reporting active portfolios as 80-90% idle cash!
+> 
+> You MUST track cumulative active holdings statefully per fold:
+
 ```python
-avg_weight_sum = statistics.mean([sum(rebal.values()) for rebal in rebalances])
+# Stateful position tracking across rebalance events per fold:
+held_weight_sums = []
+for fold in sorted(set(t["fold"] for t in trades)):
+    ft = [t for t in trades if t["fold"] == fold]
+    events = sorted(set((t["rebalance_id"], t["date"]) for t in ft))
+    event_trades = defaultdict(list)
+    for t in ft:
+        event_trades[(t["rebalance_id"], t["date"])].append(t)
+    
+    held = {}
+    for ev in events:
+        for t in event_trades[ev]:
+            if t["target_weight"] > 1e-7:
+                held[t["symbol"]] = t["target_weight"]
+            else:
+                held.pop(t["symbol"], None)
+        held_weight_sums.append(sum(held.values()))
+
+avg_weight_sum = statistics.mean(held_weight_sums) if held_weight_sums else 1.0
 if avg_weight_sum < 0.80:
-    # Strategy has substantial unallocated capital drag
+    # Strategy has genuine unallocated capital drag across active periods
 ```
 
 ### Remediation

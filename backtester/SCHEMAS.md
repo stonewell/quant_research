@@ -93,10 +93,10 @@ Columns:
 - `prior_weight` (`float`): Weight held prior to rebalance (after mark-to-market drift, or 0.0 on Day 0).
 - `target_weight` (`float`): Target weight allocated by the strategy.
 - `weight_change` (`float`): `target_weight - prior_weight` (delta weight).
-- `trade_value` (`float`): Notional traded in dollars (`abs(weight_change) * portfolio_equity`).
-- `shares` (`float`): Number of shares traded (`trade_value / price`).
-- `prior_shares` (`float`): Shares held before rebalance (`(prior_weight * portfolio_equity) / price`).
-- `target_shares` (`float`): Target shares held after rebalance (`(target_weight * portfolio_equity) / price`).
+- `trade_value` (`float`): Notional traded in dollars (`shares * price`).
+- `shares` (`float`): Discrete integer shares traded (floored to a multiple of `min_shares`, or liquidated odd lots on full position exit; fractional shares disallowed).
+- `prior_shares` (`float`): Whole shares held before rebalance.
+- `target_shares` (`float`): Target whole shares held after rebalance (`prior_shares +/- shares`).
 - `commission` (`float`): Commission cost incurred (`trade_value * commission_pct`).
 - `slippage` (`float`): Slippage cost incurred (`trade_value * slippage_pct`).
 - `total_cost` (`float`): Total transaction cost (`commission + slippage`).
