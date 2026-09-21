@@ -103,10 +103,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Apply Hong Kong equity market trading rules (board lot sizing, 0.1085% dual-sided stamp duty/levies, T+0 trading).")
     p.add_argument("--no-plots", action="store_true",
         help="backtester/strategy_generator --no-plots passthrough -- skip equity-curve charts.")
-    p.add_argument("--cache-ttl-days", type=float, default=None,
-        help=f"--cache-ttl-days passthrough to all {N_STEPS} steps -- max age, in days, of a cached "
-             f"OHLCV CSV file (shared across all {N_STEPS} steps via <repo_root>/data/, see "
-             "common/README.md) before it's re-fetched. Default: None = never expire.")
     p.add_argument("--dry-run", action="store_true",
         help=f"Print the {N_STEPS} resolved commands without executing anything.")
     return p
@@ -231,10 +227,6 @@ def main():
         step1_args += ["--hk-trading"]
         step4_args += ["--hk-trading"]
         step5_args += ["--hk-trading"]
-
-    if args.cache_ttl_days is not None:
-        for step_args in (step1_args, step2_args, step3_args, step4_args, step5_args):
-            step_args += ["--cache-ttl-days", str(args.cache_ttl_days)]
 
     do_step(1, "research_strategy (factor research)", "research_strategy", step1_args)
     do_step(2, "instrument_selection (universe screening)", "instrument_selection", step2_args)

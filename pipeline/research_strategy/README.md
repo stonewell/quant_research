@@ -335,8 +335,7 @@ GLD, TLT, VNQ, AGG, TIP, IEF, LQD, DBC, BIL, SCZ, HYG, UPRO, TMF) if none are gi
 | `--top-n` | int, default `5` | Number of top-ranked strategies (by Sharpe ratio, CAGR tie-break) written to `top_strategies_summary.json` (§7) |
 | `--data-provider` | str, default `"synthetic"` | `synthetic` (default — see §3's offline policy), `yfinance`, `csv`, or a custom registered/module-specifier provider |
 | `--data-dir` | path, default: none | Folder path for the `csv` data provider |
-| `--no-cache` | flag, default off (cached) | Disable local CSV caching of fetched data (only relevant to non-synthetic providers) |
-| `--cache-ttl-days` | float, default: none | Maximum age (in days) of a cached OHLCV file before it's treated as stale and re-fetched; `None` (default) never expires a cache entry on age alone |
+| `--no-cache` | flag, default off (cached) | Disable local DuckDB caching of fetched data (only relevant to non-synthetic providers) |
 
 Note: unlike the other 3 projects, this CLI's `--data-provider` **default is `synthetic`**, per
 §3's offline-testing policy. Real market data is fully supported (the CLI's own low-Sharpe warning

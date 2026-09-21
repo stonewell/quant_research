@@ -55,10 +55,9 @@ cd pipeline && uv sync
 | `--min-rebalances-for-trust` | 整数，默认值 `4` | 胜利组合在被信任之前必须达到的最小 `total_rebalances` 次数，即使其通过了 ERS 百分位 |
 | `--data-provider` | 字符串，默认值 `"yfinance"` | `yfinance`、`csv`、`synthetic` 或自定义模块规范 |
 | `--data-dir` | 路径，默认值：无 | `csv` 数据提供商的文件夹路径 |
-| `--no-cache` | 标志，默认关闭（已缓存） | 禁用本地 CSV 缓存已获取的数据 |
+| `--no-cache` | 标志，默认关闭（已缓存） | 禁用本地 DuckDB 缓存已获取的数据 |
 | `--results-dir` | 路径，默认值：无 | 覆盖 `backtest_equity.csv`/`backtest_weights.csv`/`walkforward_report.csv` 的写入位置（默认导出到 `backtester/results/`） |
-| `--cache-dir` | 路径，默认值：无 | 覆盖 OHLCV CSV 缓存目录（默认使用共享的工作区目录 `<repo_root>/data/` ——参阅 `common/README_ZH.md` 的“共享 OHLCV 缓存目录”章节） |
-| `--cache-ttl-days` | 浮点数天数，默认值：无 | 重新获取早于 N 天的缓存 OHLCV 文件，而非永久信任 |
+| `--cache-dir` | 路径，默认值：无 | 覆盖 OHLCV DuckDB 缓存目录（默认使用共享的工作区目录 `<repo_root>/data/` ——参阅 `common/README_ZH.md` 的“共享 DuckDB OHLCV 缓存”章节） |
 | `--no-plots` | 标志，默认关闭（生成图表） | 跳过 normally 在 `--mode standard` 下生成的 `equity_curve.png` 图表 |
 
 ### 示例命令

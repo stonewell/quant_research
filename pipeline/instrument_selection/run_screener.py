@@ -140,7 +140,7 @@ def main():
 
     data = load_universe_with_banner(universe, config.start, config.end, config.interval,
                                       use_cache=not args.no_cache, cache_dir=DATA_DIR, data_kwargs=data_kwargs,
-                                      require_nonempty=False, cache_max_age_days=args.cache_ttl_days,
+                                      require_nonempty=False,
                                       loading_msg=f"Loading {len(universe)} symbols from {config.start} to {config.end} ...")
 
     rows = {}

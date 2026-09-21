@@ -385,7 +385,8 @@ def test_provider_registration_and_caching(tmp_path, in_memory_marketdb):
     # Test CachedDataProvider wrapping using in-memory provider (100% offline, no real disk/network access)
     cached = CachedDataProvider(in_memory_marketdb, cache_dir=str(tmp_path))
     df = cached.fetch_ohlcv("600519.SH", start="2024-01-01", end="2024-01-05")
-    assert not df.empty
-
-    cache_file = tmp_path / "MarketDBDataProvider_600519.SH_1d_2024-01-01_2024-01-05.csv"
+    cache_file = tmp_path / "cache.duckdb"
     assert cache_file.exists()
+    # Second fetch is served from DuckDB cache
+    df2 = cached.fetch_ohlcv("600519.SH", start="2024-01-01", end="2024-01-05")
+    pd.testing.assert_frame_equal(df, df2)

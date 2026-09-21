@@ -91,13 +91,21 @@
 
 `plot_equity_curve(equity: pd.Series, results_dir: str, *, baseline: Optional[pd.Series] = None, strategy_label="Strategy", baseline_label="Baseline", title="Equity Curve", filename="equity_curve.png") -> str` —— 单线权益图（若提供了 `baseline`，则为双线图，例如策略旁边绘制买入持有基准）。`equity`/`baseline` 是普通的 `pd.Series`（日期索引 -> 组合价值）—— 传入 `result["equity_curve"]["equity"]` (§4)，而非原始 `run_allocation_backtest()` 字典。保存于 `results_dir` 下（若缺失则创建）并返回保存的绝对路径。由 `backtester/run_backtest.py` 与 `pipeline/strategy_generator/run_strategygen.py` 使用，用以生成伴随每次运行报告的权益曲线图表，使图表样式/行为在两者之间保持一致，而非按项目重复实现。
 
-## 9. 共享 OHLCV 缓存目录
+## 9. 共享 DuckDB OHLCV 缓存 (`cache.duckdb`)
 
-每个项目的 `run_*.py` 均通过 `common.cli_utils.shared_data_dir()` 解析其 `--cache-dir`/`DATA_DIR` 默认值，无论哪个项目调用它，它总是解析为单个 `<repo_root>/data/` 目录 —— 一个项目获取的标的/周期/日期范围数据会被其他所有项目复用，无需按项目分别下载/缓存。
+每个项目的 `run_*.py` 均通过 `common.cli_utils.shared_data_dir()` 解析其 `--cache-dir`/`DATA_DIR` 默认值，无论哪个项目调用它，它总是解析为单个 `<repo_root>/data/` 目录，存放统一的 DuckDB 缓存文件 `data/cache.duckdb`。
 
-`common.data.CachedDataProvider` 将每个缓存文件命名为 `{ProviderClassName}_{symbol}_{interval}_{start}_{end}.csv`（例如 `YFinanceDataProvider_SPY_1d_2015-01-01_2024-12-31.csv`）。提供商类前缀至关重要，而非装饰性的：`research_strategy` 默认使用 `--data-provider synthetic`，而其他 3 个项目默认使用 `--data-provider yfinance`，因此若没有前缀，两个从不同提供商针对该共享目录请求“相同”标的/周期/日期范围的项目会静默读回彼此（错误提供商）的缓存数据。
-
-缓存条目默认永不过期（`cache_max_age_days=None`，`CachedDataProvider` 的构造函数默认值）——每个 `run_*.py` 的 `--cache-ttl-days` 标志（通过 `add_data_provider_cli_args` 添加，因此其名称/行为在所有 4 个项目及 `run_pipeline.py` 的透传中完全一致）可选择重新获取早于 N 天的缓存文件。
+`common.duckdb_cache.DuckDBCache` 提供了集中式的存储引擎：
+- **存储结构 (Schema)**：
+  - `ohlcv_bars`：主键为 `(provider, symbol, date)`。按日线基准存储 OHLCV 数据，多周期（如 `1d`, `1wk`, `1mo` 等）与任意起止日期范围均在查询时动态聚合重采样（Resample）。
+  - `asset_sync_metadata`：主键为 `(provider, symbol)`。记录该资产由该数据源提供的最早可用日期 `earliest_available_date`、最新日期 `latest_available_date` 及 `is_earliest_known`（当查询早于资产上市日时标记）。避免重复向上游请求该标的不存在更早历史的数据。
+- **缓存策略与失效**：
+  - 缓存永不过期（移除 TTL 及最大时间限制）。
+  - 仅在查询范围超出当前已缓存的日期边界时，才会向上游数据源增量请求。
+- **合成数据 (Synthetic Data)**：
+  - 合成数据（`SyntheticDataProvider` / `'synthetic'`）完全跳过 DuckDB 缓存（不写入、不读取）。
+- **历史迁移**：
+  - 可通过 `scripts/migrate_cache_csv_to_duckdb.py` 迁移已有的旧 CSV 缓存到 `cache.duckdb`（自动跳过合成数据 CSV 文件）。
 
 ---
 

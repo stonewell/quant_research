@@ -229,41 +229,71 @@ def test_yfinance_data_provider_raises_when_every_row_is_invalid(mock_yf_downloa
 
 
 def test_cached_data_provider(temp_csv_dir):
-    inner_provider = SyntheticDataProvider(seed=42)
+    class MockCountingProvider(BaseDataProvider):
+        def __init__(self):
+            self.calls = 0
+        def fetch_ohlcv(self, symbol, start, end, interval="1d"):
+            self.calls += 1
+            dates = pd.bdate_range(start, end)
+            return pd.DataFrame({
+                "Open": [10.0] * len(dates),
+                "High": [12.0] * len(dates),
+                "Low": [9.0] * len(dates),
+                "Close": [11.0] * len(dates),
+                "Volume": [100.0] * len(dates),
+            }, index=dates)
+
+    inner_provider = MockCountingProvider()
     cached_provider = CachedDataProvider(inner_provider, cache_dir=temp_csv_dir)
 
-    # First call: cache miss, fetches from inner and writes to cache_dir
+    # First call: cache miss, fetches from inner and writes to DuckDB
     df1 = cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
-    cache_file = os.path.join(temp_csv_dir, "SyntheticDataProvider_SPY_1d_2020-01-01_2020-01-10.csv")
-    assert os.path.exists(cache_file)
+    assert inner_provider.calls == 1
+    assert os.path.exists(os.path.join(temp_csv_dir, "cache.duckdb"))
 
-    # Second call: cache hit, reads from cache_file
+    # Second call: cache hit, reads from DuckDB without calling inner
     df2 = cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
+    assert inner_provider.calls == 1
     pd.testing.assert_frame_equal(df1, df2, check_freq=False)
 
 
 def test_cached_data_provider_caches_through_fetch_universe(temp_csv_dir):
-    # Regression test: fetch_universe() used to delegate straight to
-    # inner_provider.fetch_universe(...), which calls the INNER provider's
-    # own (uncached) fetch_ohlcv per symbol -- silently skipping this
-    # class's cache entirely for any caller using load_universe() rather
-    # than per-symbol load_ohlcv() (e.g. instrument_selection, research_strategy).
-    inner_provider = SyntheticDataProvider(seed=42)
-    cached_provider = CachedDataProvider(inner_provider, cache_dir=temp_csv_dir)
+    class MockCountingProvider(BaseDataProvider):
+        def __init__(self):
+            self.calls = 0
+        def fetch_ohlcv(self, symbol, start, end, interval="1d"):
+            self.calls += 1
+            dates = pd.bdate_range(start, end)
+            return pd.DataFrame({
+                "Open": [10.0] * len(dates),
+                "High": [12.0] * len(dates),
+                "Low": [9.0] * len(dates),
+                "Close": [11.0] * len(dates),
+                "Volume": [100.0] * len(dates),
+            }, index=dates)
 
-    universe = cached_provider.fetch_universe(["SPY", "QQQ"], start="2020-01-01", end="2020-01-10")
-    assert set(universe.keys()) == {"SPY", "QQQ"}
-    for sym in ("SPY", "QQQ"):
-        assert os.path.exists(os.path.join(temp_csv_dir, f"SyntheticDataProvider_{sym}_1d_2020-01-01_2020-01-10.csv"))
+    inner = MockCountingProvider()
+    cached = CachedDataProvider(inner, cache_dir=temp_csv_dir)
+    uni = cached.fetch_universe(["SPY", "QQQ"], start="2020-01-01", end="2020-01-10")
+    assert set(uni.keys()) == {"SPY", "QQQ"}
+    assert inner.calls == 2
+
+    # Second call hits cache for both symbols without re-querying inner
+    uni2 = cached.fetch_universe(["SPY", "QQQ"], start="2020-01-01", end="2020-01-10")
+    assert set(uni2.keys()) == {"SPY", "QQQ"}
+    assert inner.calls == 2
 
 
-def test_cached_data_provider_filename_includes_provider_class_name(temp_csv_dir):
-    # Regression test for a real correctness bug: this cache directory is
-    # shared workspace-wide across projects with DIFFERENT default providers.
-    # Two providers of different classes fetching the SAME symbol/interval/
-    # date-range against the SAME cache_dir must land in two distinct cache
-    # files, and each must only ever read back its own -- never the other's.
-    class OtherProvider(BaseDataProvider):
+def test_cached_data_provider_isolates_by_provider_class_name(temp_csv_dir):
+    class ProviderA(BaseDataProvider):
+        def fetch_ohlcv(self, symbol, start, end, interval="1d"):
+            idx = pd.bdate_range(start, end)
+            return pd.DataFrame(
+                {"Open": 100.0, "High": 100.0, "Low": 100.0, "Close": 100.0, "Volume": 1.0},
+                index=idx,
+            )
+
+    class ProviderB(BaseDataProvider):
         def fetch_ohlcv(self, symbol, start, end, interval="1d"):
             idx = pd.bdate_range(start, end)
             return pd.DataFrame(
@@ -271,40 +301,45 @@ def test_cached_data_provider_filename_includes_provider_class_name(temp_csv_dir
                 index=idx,
             )
 
-    synthetic_cached = CachedDataProvider(SyntheticDataProvider(seed=42), cache_dir=temp_csv_dir)
-    other_cached = CachedDataProvider(OtherProvider(), cache_dir=temp_csv_dir)
+    cached_a = CachedDataProvider(ProviderA(), cache_dir=temp_csv_dir)
+    cached_b = CachedDataProvider(ProviderB(), cache_dir=temp_csv_dir)
 
-    df_synthetic = synthetic_cached.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
-    df_other = other_cached.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
+    df_a = cached_a.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
+    df_b = cached_b.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
 
-    assert os.path.exists(os.path.join(temp_csv_dir, "SyntheticDataProvider_SPY_1d_2020-01-01_2020-01-10.csv"))
-    assert os.path.exists(os.path.join(temp_csv_dir, "OtherProvider_SPY_1d_2020-01-01_2020-01-10.csv"))
-    assert not df_synthetic["Close"].eq(999.0).any()
-    assert df_other["Close"].eq(999.0).all()
+    assert df_a["Close"].eq(100.0).all()
+    assert df_b["Close"].eq(999.0).all()
 
-    # Re-fetching each must still read back its OWN cached file, not the other's.
-    df_synthetic_again = synthetic_cached.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
-    df_other_again = other_cached.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
-    pd.testing.assert_frame_equal(df_synthetic, df_synthetic_again, check_freq=False)
-    pd.testing.assert_frame_equal(df_other, df_other_again, check_freq=False)
+    # Re-fetching each must read back its own from DuckDB
+    df_a_again = cached_a.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
+    df_b_again = cached_b.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
+    pd.testing.assert_frame_equal(df_a, df_a_again, check_freq=False)
+    pd.testing.assert_frame_equal(df_b, df_b_again, check_freq=False)
 
 
-def test_load_ohlcv_threads_cache_max_age_days(temp_csv_dir):
+def test_cached_data_provider_synthetic_skips_cache(temp_csv_dir):
+    inner = SyntheticDataProvider(seed=42)
+    cached = CachedDataProvider(inner, cache_dir=temp_csv_dir)
+    df = cached.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
+    assert not df.empty
+    # DuckDB cache file is not created or used for synthetic data
+    assert cached.duckdb_cache is None
+
+
+def test_load_ohlcv_threads_cache_dir(temp_csv_dir):
     with patch("common.data.CachedDataProvider") as mock_cached:
         mock_cached.return_value.fetch_ohlcv.return_value = pd.DataFrame()
         load_ohlcv("SPY", "2020-01-01", "2020-01-10", cache_dir=temp_csv_dir,
-                   provider="synthetic", cache_max_age_days=3)
-        _, kwargs = mock_cached.call_args
-        assert kwargs.get("cache_max_age_days") == 3
+                   provider="synthetic")
+        assert mock_cached.call_args[0][1] == temp_csv_dir
 
 
-def test_load_universe_threads_cache_max_age_days(temp_csv_dir):
+def test_load_universe_threads_cache_dir(temp_csv_dir):
     with patch("common.data.CachedDataProvider") as mock_cached:
         mock_cached.return_value.fetch_universe.return_value = {}
         load_universe(["SPY"], "2020-01-01", "2020-01-10", cache_dir=temp_csv_dir,
-                      provider="synthetic", cache_max_age_days=5)
-        _, kwargs = mock_cached.call_args
-        assert kwargs.get("cache_max_age_days") == 5
+                      provider="synthetic")
+        assert mock_cached.call_args[0][1] == temp_csv_dir
 
 
 def test_synthetic_data_provider_is_reproducible_across_processes():
@@ -484,52 +519,26 @@ def test_yfinance_fetch_metadata_handles_ticker_exception(mock_ticker):
     assert np.isnan(metadata["roe"])
 
 
-def test_cached_data_provider_default_unlimited_age_unchanged(temp_csv_dir):
-    # Regression test pinning today's default behavior: with
-    # cache_max_age_days omitted, a cache hit is served no matter how old.
+def test_cached_data_provider_never_expires(temp_csv_dir):
     calls = {"n": 0}
 
-    class CountingProvider(SyntheticDataProvider):
+    class NonSyntheticCountingProvider(BaseDataProvider):
         def fetch_ohlcv(self, symbol, start, end, interval="1d"):
             calls["n"] += 1
-            return super().fetch_ohlcv(symbol, start, end, interval)
+            dates = pd.bdate_range(start, end)
+            return pd.DataFrame({
+                "Open": [10.0] * len(dates), "High": [12.0] * len(dates),
+                "Low": [9.0] * len(dates), "Close": [11.0] * len(dates),
+                "Volume": [100.0] * len(dates),
+            }, index=dates)
 
-    cached_provider = CachedDataProvider(CountingProvider(seed=42), cache_dir=temp_csv_dir)
-    cache_path = os.path.join(temp_csv_dir, "CountingProvider_SPY_1d_2020-01-01_2020-01-10.csv")
-
-    cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
+    cached_provider = CachedDataProvider(NonSyntheticCountingProvider(), cache_dir=temp_csv_dir)
+    cached_provider.fetch_ohlcv("TEST", start="2020-01-01", end="2020-01-10")
     assert calls["n"] == 1
 
-    # Backdate the cache file's mtime far into the past -- should still hit.
-    old_time = time.time() - (365 * 86400)
-    os.utime(cache_path, (old_time, old_time))
-
-    cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
+    # Second call: served from DuckDB cache without re-querying provider
+    cached_provider.fetch_ohlcv("TEST", start="2020-01-01", end="2020-01-10")
     assert calls["n"] == 1
-
-
-def test_cached_data_provider_respects_max_age(temp_csv_dir):
-    calls = {"n": 0}
-
-    class CountingProvider(SyntheticDataProvider):
-        def fetch_ohlcv(self, symbol, start, end, interval="1d"):
-            calls["n"] += 1
-            return super().fetch_ohlcv(symbol, start, end, interval)
-
-    cached_provider = CachedDataProvider(
-        CountingProvider(seed=42), cache_dir=temp_csv_dir, cache_max_age_days=1
-    )
-    cache_path = os.path.join(temp_csv_dir, "CountingProvider_SPY_1d_2020-01-01_2020-01-10.csv")
-
-    cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
-    assert calls["n"] == 1
-
-    # Backdate the cache file's mtime past the 1-day max age -- should re-fetch.
-    old_time = time.time() - (2 * 86400)
-    os.utime(cache_path, (old_time, old_time))
-
-    cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
-    assert calls["n"] == 2
 
 
 def test_cache_covers_requested_end_helper():
@@ -552,60 +561,61 @@ def test_cache_covers_requested_end_helper():
 
 
 def test_cached_data_provider_refetches_when_cache_falls_short_of_elapsed_end(temp_csv_dir):
-    """Regression test for the walk-forward-stops-short-of---end bug: a cache file that was
-    written when the requested `end` was still in the future only got data through whatever
-    'today' was back then. Once that `end` has genuinely elapsed, the short cache must no longer
-    be trusted forever -- it must be detected as incomplete and re-fetched."""
     calls = {"n": 0}
 
-    class CountingProvider(SyntheticDataProvider):
+    class CountingProvider(BaseDataProvider):
         def fetch_ohlcv(self, symbol, start, end, interval="1d"):
             calls["n"] += 1
-            return super().fetch_ohlcv(symbol, start, end, interval)
+            dates = pd.bdate_range(start, end)
+            return pd.DataFrame(
+                {"Open": [10.0] * len(dates), "High": [12.0] * len(dates), "Low": [9.0] * len(dates), "Close": [11.0] * len(dates), "Volume": [100.0] * len(dates)},
+                index=dates,
+            )
 
-    cached_provider = CachedDataProvider(CountingProvider(seed=42), cache_dir=temp_csv_dir)
-    cache_path = os.path.join(temp_csv_dir, "CountingProvider_SPY_1d_2020-01-01_2026-01-01.csv")
-
-    # Simulate a cache written back when 2026-01-01 was still in the future: only 5 bdates.
-    os.makedirs(temp_csv_dir, exist_ok=True)
-    short_dates = pd.bdate_range("2020-01-01", periods=5)
-    pd.DataFrame(
+    cached_provider = CachedDataProvider(CountingProvider(), cache_dir=temp_csv_dir)
+    # Pre-populate DuckDB cache with short range
+    short_df = pd.DataFrame(
         {"Open": [10.0] * 5, "High": [12.0] * 5, "Low": [9.0] * 5, "Close": [11.0] * 5, "Volume": [100.0] * 5},
-        index=short_dates,
-    ).to_csv(cache_path)
+        index=pd.bdate_range("2020-01-01", periods=5),
+    )
+    cached_provider.duckdb_cache.store_bars("CountingProvider", "SPY", short_df)
 
-    with pytest.warns(UserWarning, match="falls short of requested end"):
-        df = cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2026-01-01")
+    # 2024-01-01 has already elapsed; cache only has 2020-01-01 to 2020-01-07 -> re-fetches
+    df = cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2024-01-01")
 
     assert calls["n"] == 1  # re-fetched from source instead of trusting the short cache
-    assert df.index[-1] >= pd.Timestamp("2025-01-01")  # SyntheticDataProvider now reaches `end`
+    assert df.index[-1] >= pd.Timestamp("2024-01-01")
 
 
 def test_cached_data_provider_trusts_short_cache_when_end_still_in_the_future(temp_csv_dir):
-    """Mirror of the test above: if `end` HASN'T elapsed yet, a cache that doesn't reach it is
-    legitimately complete (there's nothing more to fetch), so it must NOT be refetched."""
     calls = {"n": 0}
 
-    class CountingProvider(SyntheticDataProvider):
+    class CountingProvider(BaseDataProvider):
         def fetch_ohlcv(self, symbol, start, end, interval="1d"):
             calls["n"] += 1
-            return super().fetch_ohlcv(symbol, start, end, interval)
+            dates = pd.bdate_range(start, end)
+            return pd.DataFrame(
+                {"Open": [10.0] * len(dates), "High": [12.0] * len(dates), "Low": [9.0] * len(dates), "Close": [11.0] * len(dates), "Volume": [100.0] * len(dates)},
+                index=dates,
+            )
 
     far_future_end = (pd.Timestamp.now() + pd.Timedelta(days=3650)).strftime("%Y-%m-%d")
-    cached_provider = CachedDataProvider(CountingProvider(seed=42), cache_dir=temp_csv_dir)
-    cache_path = os.path.join(temp_csv_dir, f"CountingProvider_SPY_1d_2020-01-01_{far_future_end}.csv")
+    cached_provider = CachedDataProvider(CountingProvider(), cache_dir=temp_csv_dir)
 
-    os.makedirs(temp_csv_dir, exist_ok=True)
-    short_dates = pd.bdate_range("2020-01-01", periods=5)
-    pd.DataFrame(
-        {"Open": [10.0] * 5, "High": [12.0] * 5, "Low": [9.0] * 5, "Close": [11.0] * 5, "Volume": [100.0] * 5},
+    # Pre-populate DuckDB cache with data reaching close to today
+    today = pd.Timestamp.now()
+    short_dates = pd.bdate_range(today - pd.Timedelta(days=10), today)
+    short_df = pd.DataFrame(
+        {"Open": [10.0] * len(short_dates), "High": [12.0] * len(short_dates), "Low": [9.0] * len(short_dates), "Close": [11.0] * len(short_dates), "Volume": [100.0] * len(short_dates)},
         index=short_dates,
-    ).to_csv(cache_path)
+    )
+    cached_provider.duckdb_cache.store_bars("CountingProvider", "SPY", short_df)
 
-    df = cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end=far_future_end)
+    # Querying far future end -> trusted as-is, 0 calls
+    df = cached_provider.fetch_ohlcv("SPY", start=short_dates[0].strftime("%Y-%m-%d"), end=far_future_end)
 
-    assert calls["n"] == 0  # cache trusted as-is -- `end` hasn't happened yet
-    assert len(df) == 5
+    assert calls["n"] == 0  # cache trusted as-is -- end hasn't happened yet
+    assert len(df) == len(short_dates)
 
 
 def test_csv_folder_data_provider_sorts_unsorted_csv(temp_csv_dir):
@@ -686,71 +696,43 @@ def test_yfinance_fetch_metadata_handles_info_returning_none(mock_ticker):
     assert np.isnan(metadata["roe"])
 
 
-def test_cached_data_provider_recovers_from_corrupt_cache_file(temp_csv_dir):
-    inner_provider = SyntheticDataProvider(seed=42)
-    cached_provider = CachedDataProvider(inner_provider, cache_dir=temp_csv_dir)
-    cache_path = os.path.join(temp_csv_dir, "SyntheticDataProvider_SPY_1d_2020-01-01_2020-01-10.csv")
+def test_cached_data_provider_cleans_a_bad_row_from_provider(temp_csv_dir):
+    class ProviderWithOneBadRow(BaseDataProvider):
+        def fetch_ohlcv(self, symbol, start, end, interval="1d"):
+            dates = pd.bdate_range(start, end)
+            n = len(dates)
+            return pd.DataFrame(
+                {
+                    "Open": [10.0] * n,
+                    "High": [12.0] * n,
+                    "Low": [9.0 if i != 2 else -1.0 for i in range(n)],  # row 2: negative price
+                    "Close": [11.0] * n,
+                    "Volume": [100.0] * n,
+                },
+                index=dates,
+            )
 
-    os.makedirs(temp_csv_dir, exist_ok=True)
-    with open(cache_path, "w", encoding="utf-8") as f:
-        f.write("not,a,valid,ohlcv,file\n1,2,3,4,5\n")
-
-    with pytest.warns(UserWarning, match="corrupt or invalid"):
-        df = cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
-
-    assert not df.empty
-    assert "Close" in df.columns
-
-    # The corrupt file should have been overwritten with valid data.
-    df2 = pd.read_csv(cache_path, index_col=0, parse_dates=True)
-    assert "Close" in df2.columns
-
-
-def test_cached_data_provider_cleans_a_bad_row_from_a_cache_hit(temp_csv_dir):
-    # Cache must span the FULL requested range (2020-01-01 through 2020-01-10) -- a cache that
-    # only covers a leading fragment of the requested range now correctly looks incomplete (see
-    # _cache_covers_requested_end) and would trigger a refetch instead of exercising this test's
-    # actual target: cleaning a single bad row out of an otherwise-COMPLETE cache hit. The bad row
-    # is placed in the middle (not the last row) so the cleaned cache still reaches 2020-01-10.
-    dates = pd.bdate_range("2020-01-01", "2020-01-10")
-    n = len(dates)
-    cache_df = pd.DataFrame(
-        {
-            "Open": [10.0] * n,
-            "High": [12.0] * n,
-            "Low": [9.0 if i != 2 else -1.0 for i in range(n)],  # row 2: negative price
-            "Close": [11.0] * n,
-            "Volume": [100.0] * n,
-        },
-        index=dates,
-    )
-    cache_path = os.path.join(temp_csv_dir, "SyntheticDataProvider_SPY_1d_2020-01-01_2020-01-10.csv")
-    os.makedirs(temp_csv_dir, exist_ok=True)
-    cache_df.to_csv(cache_path)
-
-    cached_provider = CachedDataProvider(SyntheticDataProvider(seed=42), cache_dir=temp_csv_dir)
+    cached_provider = CachedDataProvider(ProviderWithOneBadRow(), cache_dir=temp_csv_dir)
     with pytest.warns(UserWarning, match="Dropping 1 row"):
-        df = cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
+        df = cached_provider.fetch_ohlcv("TEST", start="2020-01-01", end="2020-01-10")
 
-    assert len(df) == n - 1
+    dates = pd.bdate_range("2020-01-01", "2020-01-10")
+    assert len(df) == len(dates) - 1
     assert dates[2] not in df.index
 
 
-def test_cached_data_provider_all_rows_invalid_triggers_refetch(temp_csv_dir):
-    dates = pd.bdate_range("2020-01-01", periods=2)
-    cache_df = pd.DataFrame(
-        {"Open": [10.0] * 2, "High": [1.0] * 2, "Low": [9.0] * 2, "Close": [11.0] * 2, "Volume": [100.0] * 2},
-        index=dates,
-    )  # every row has High < Low
-    cache_path = os.path.join(temp_csv_dir, "SyntheticDataProvider_SPY_1d_2020-01-01_2020-01-10.csv")
-    os.makedirs(temp_csv_dir, exist_ok=True)
-    cache_df.to_csv(cache_path)
+def test_cached_data_provider_all_rows_invalid_raises(temp_csv_dir):
+    class AllBadProvider(BaseDataProvider):
+        def fetch_ohlcv(self, symbol, start, end, interval="1d"):
+            dates = pd.bdate_range(start, periods=2)
+            return pd.DataFrame(
+                {"Open": [10.0] * 2, "High": [1.0] * 2, "Low": [9.0] * 2, "Close": [11.0] * 2, "Volume": [100.0] * 2},
+                index=dates,
+            )
 
-    cached_provider = CachedDataProvider(SyntheticDataProvider(seed=42), cache_dir=temp_csv_dir)
-    with pytest.warns(UserWarning, match="corrupt or invalid"):
-        df = cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2020-01-10")
-
-    assert not df.empty  # served fresh from the inner (synthetic) provider instead
+    cached_provider = CachedDataProvider(AllBadProvider(), cache_dir=temp_csv_dir)
+    with pytest.raises(ValueError, match="invalid OHLC"):
+        cached_provider.fetch_ohlcv("TEST", start="2020-01-01", end="2020-01-10")
 
 
 class _EmptyReturningProvider(BaseDataProvider):

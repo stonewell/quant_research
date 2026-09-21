@@ -37,11 +37,11 @@ def test_shared_data_dir_resolves_to_repo_root():
     assert shared_data_dir() == os.path.join(_PROJECT_ROOT, "data")
 
 
-def test_add_data_provider_cli_args_cache_ttl_days_default_and_parsing():
+def test_add_data_provider_cli_args_does_not_have_cache_ttl_days():
     p = argparse.ArgumentParser()
     add_data_provider_cli_args(p)
-    assert p.parse_args([]).cache_ttl_days is None
-    assert p.parse_args(["--cache-ttl-days", "3"]).cache_ttl_days == 3.0
+    args = p.parse_args([])
+    assert not hasattr(args, "cache_ttl_days")
 
 
 def test_add_data_provider_cli_args_default_yfinance():
@@ -128,15 +128,3 @@ def test_load_universe_with_banner_custom_loading_msg(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Custom banner text" in out
     assert "Loading 1 symbols ..." not in out
-
-
-def test_load_universe_with_banner_threads_cache_max_age_days(monkeypatch):
-    captured = {}
-
-    def _fake_load_universe(symbols, start, end, interval, use_cache=True, cache_dir=None, **kwargs):
-        captured.update(kwargs)
-        return {s: object() for s in symbols}
-
-    monkeypatch.setattr(cli_utils, "load_universe", _fake_load_universe)
-    load_universe_with_banner(["A"], "2020-01-01", "2020-12-31", cache_max_age_days=7)
-    assert captured.get("cache_max_age_days") == 7

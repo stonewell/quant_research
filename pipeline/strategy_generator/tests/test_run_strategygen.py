@@ -202,26 +202,11 @@ def test_main_no_plots_skips_equity_curve_chart(mock_gen_cls, mock_load, mock_pl
         os.remove(temp_path)
 
 
-def test_cache_ttl_days_arg_default_and_parsing():
-    """--cache-ttl-days is added automatically by add_data_provider_cli_args()
-    and must default to None, parsing to a float when supplied.
-    """
-    parser = build_arg_parser()
-
-    args = parser.parse_args([])
-    assert args.cache_ttl_days is None
-
-    args = parser.parse_args(["--cache-ttl-days", "7"])
-    assert args.cache_ttl_days == 7.0
-
-
 @patch("run_strategygen.load_universe_with_banner")
 @patch("run_strategygen.StrategyGenerator")
-def test_main_wires_shared_data_dir_and_cache_ttl(mock_gen_cls, mock_load):
+def test_main_wires_shared_data_dir(mock_gen_cls, mock_load):
     """cache_dir passed to load_universe_with_banner must resolve via the
     shared, repo-root-relative cache directory (common.cli_utils.shared_data_dir())
-    rather than a project-local path, and --cache-ttl-days must be threaded
-    through as cache_max_age_days -- now that the OHLCV cache is consolidated
     workspace-wide.
     """
     mock_gen_instance = mock_gen_cls.return_value
@@ -265,7 +250,6 @@ def test_main_wires_shared_data_dir_and_cache_ttl(mock_gen_cls, mock_load):
     try:
         test_args = [
             "run_strategygen.py", "--universe-file", temp_path, "--mode", "generate",
-            "--cache-ttl-days", "3.5",
         ]
         with patch.object(sys, "argv", test_args):
             main()
@@ -273,7 +257,7 @@ def test_main_wires_shared_data_dir_and_cache_ttl(mock_gen_cls, mock_load):
         assert mock_load.call_count == 1
         _, call_kwargs = mock_load.call_args
         assert call_kwargs["cache_dir"] == cli_utils.shared_data_dir()
-        assert call_kwargs["cache_max_age_days"] == 3.5
+        assert "cache_max_age_days" not in call_kwargs
     finally:
         os.remove(temp_path)
 

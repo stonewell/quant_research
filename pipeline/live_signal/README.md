@@ -44,7 +44,7 @@ already-generated strategy, exactly like `backtester` does, via the same reconst
 ## 2. Argument reference
 
 Universe-resolution flags (`--universe`/`--universe-file`/`--universe-provider`/`--universe-kwargs`)
-and the data-provider trio (`--data-provider`/`--data-dir`/`--no-cache`/`--cache-ttl-days`) are shared
+and the data-provider options (`--data-provider`/`--data-dir`/`--no-cache`) are shared
 with every other project — see `common/README.md`'s cross-reference index.
 
 | Flag | Type / default | Meaning |

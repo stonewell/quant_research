@@ -74,7 +74,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--interval", default="1d")
     p.add_argument("--seed", type=int, default=42, help="Random seed (only used with --data-provider synthetic)")
     add_data_provider_cli_args(p, default_provider="synthetic",
-                                no_cache_help="Disable local CSV caching of the benchmark's OHLCV history")
+                                no_cache_help="Disable local DuckDB caching of the benchmark's OHLCV history")
     return p
 
 
@@ -111,7 +111,7 @@ def main():
     price_universe = load_universe_with_banner(
         ohlcv_universe, args.start, args.end, args.interval,
         use_cache=not args.no_cache, cache_dir=DATA_DIR, data_kwargs=data_kwargs,
-        require_nonempty=False, cache_max_age_days=args.cache_ttl_days,
+        require_nonempty=False,
         loading_msg=f"Loading {len(ohlcv_universe)} symbols' OHLCV (benchmark comparator only) via "
                     f"provider '{args.data_provider}' ({args.start} to {args.end}) ...",
     )

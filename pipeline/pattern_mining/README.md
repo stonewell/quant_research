@@ -94,11 +94,10 @@ this project's own default universe (`["SPY", "QQQ"]`) if none are given.
 | `--pattern-lag-bars` | int, default `20` | How many trading days before each turning point to read indicators at (see §2) |
 | `--data-provider` | str, default `"yfinance"` | `yfinance`, `csv`, `synthetic`, or a custom module specifier |
 | `--data-dir` | path, default: none | Folder path for the `csv` data provider |
-| `--no-cache` | flag, default off (cached) | Disable local CSV caching of fetched data |
-| `--cache-ttl-days` | float, default: none | Maximum age (in days) of a cached OHLCV file before it's treated as stale and re-fetched |
+| `--no-cache` | flag, default off (cached) | Disable local DuckDB caching of fetched data |
 
-The local OHLCV cache directory resolves to the shared, workspace-wide location (`<repo_root>/data/`)
-— see `common/README.md`'s "Shared OHLCV cache directory" section.
+The local OHLCV cache resolves to the shared, workspace-wide database (`<repo_root>/data/cache.duckdb`)
+— see `common/README.md`'s "Shared DuckDB OHLCV cache" section.
 
 ## 4. Output: `results/pattern_report.json`
 

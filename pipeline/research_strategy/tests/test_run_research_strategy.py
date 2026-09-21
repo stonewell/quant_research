@@ -66,18 +66,6 @@ def test_strategy_class_map_importable_via_research_strategy_namespace_package()
     assert set(namespaced_map.keys()) == set(rrs.STRATEGY_CLASS_MAP.keys())
 
 
-def test_cache_ttl_days_arg_default_and_parsing():
-    """--cache-ttl-days is added automatically by add_data_provider_cli_args()
-    and must default to None, parsing to a float when supplied.
-    """
-    parser = rrs.build_arg_parser()
-
-    args = parser.parse_args([])
-    assert args.cache_ttl_days is None
-
-    args = parser.parse_args(["--cache-ttl-days", "7"])
-    assert args.cache_ttl_days == 7.0
-
 
 # Universe with only 1 equity ticker ("SPY") plus bonds and commodities -- AcceleratingDualMomentum
 # requires at least 2 distinct equities to perform its A vs. B relative momentum check.

@@ -72,7 +72,6 @@ def main():
         universe_symbols, args.start, args.end, args.interval,
         use_cache=not args.no_cache, cache_dir=shared_data_dir(),
         data_kwargs=data_kwargs, require_nonempty=True,
-        cache_max_age_days=args.cache_ttl_days,
     )
 
     os.makedirs(RESULTS_DIR, exist_ok=True)

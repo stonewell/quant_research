@@ -67,7 +67,7 @@ flowchart TD
     end
 ```
 
-所有 5 个阶段还共享位于仓库根目录 `data/` 的单个 OHLCV 缓存目录——任何阶段获取的标的/周期/日期范围数据都会被其他阶段复用，无需按项目重复下载和缓存。参阅 `common/README_ZH.md` 的“共享 OHLCV 缓存目录”章节了解缓存文件名规范及 `--cache-ttl-days` 过期控制。
+所有 5 个阶段还共享位于仓库根目录 `data/cache.duckdb` 的单个 DuckDB OHLCV 缓存数据库——任何阶段获取的标的/周期/日期范围数据都会被其他阶段复用，无需按项目重复下载和缓存。参阅 `common/README_ZH.md` 的“共享 DuckDB OHLCV 缓存”章节了解缓存数据表设计、动态重采样及最早可用日期追踪。
 
 ---
 
@@ -215,9 +215,6 @@ uv run python run_pipeline.py --universe SPY QQQ IWM EFA EEM GLD TLT --data-prov
 # 快速运行：跳过第 4/5 步输出的权益曲线图表
 uv run python run_pipeline.py --universe SPY QQQ IWM EFA EEM GLD TLT --data-provider synthetic --no-plots
 
-# 将共享的 data/ 缓存视为 1 天后过期（适用于滚动/实时 --end 日期；对于固定历史区间无影响）
-uv run python run_pipeline.py --universe SPY QQQ IWM EFA EEM GLD TLT --data-provider synthetic --cache-ttl-days 1
-
 # 融入 research_strategy 策略作为额外候选（第 4 步），并在最终回测前对胜者参数进行网格搜索 + ERS 验证（第 5 步）
 uv run python run_pipeline.py --universe SPY QQQ IWM EFA EEM GLD TLT --data-provider synthetic \
   --research-strategy baa_keller adaptive_grid --optimize --n-random-search 100
@@ -335,7 +332,7 @@ pipeline/.venv/Scripts/python.exe -m pytest backtester/tests -v
 |---|---|---|---|
 | `common/` (仓库根目录) | 共享核心基础设施、指标、数据加载器、配置模板和回测引擎；无独立的 `pyproject.toml` | 不适用 (被导入模块) | `common/README_ZH.md` |
 | `backtester/` (仓库根目录) | 独立的 CLI，在单次或滚动 Walk-Forward 窗口上评估固定策略文件；无独立的 `pyproject.toml` | `backtester/run_backtest.py` | `backtester/README_ZH.md`, `backtester/SCHEMAS_ZH.md` |
-| `data/` (仓库根目录) | 共享 OHLCV 缓存目录，由各个阶段读写（提供商感知的文件名，可选 `--cache-ttl-days` 过期控制） | 不适用 (缓存，非代码) | `common/README_ZH.md` §7 |
+| `data/` (仓库根目录) | 共享 DuckDB OHLCV 缓存目录 (`cache.duckdb`)，由各个阶段读写 | 不适用 (缓存，非代码) | `common/README_ZH.md` §9 |
 | `pipeline/` | 上述项目的共享 `uv` 环境，以及流水线编排器 | `pipeline/pyproject.toml` | -- |
 | `pipeline/research_strategy/` | 评估 39 种量化交易策略并导出因子研究汇总 | `pipeline/research_strategy/run_research_strategy.py` | `pipeline/research_strategy/README_ZH.md` |
 | `pipeline/instrument_selection/` | 特征化标的、执行硬性可投资性筛选并选择分散化资产组合 | `pipeline/instrument_selection/run_screener.py` | `pipeline/instrument_selection/README_ZH.md` |

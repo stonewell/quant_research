@@ -72,10 +72,10 @@ flowchart TD
     end
 ```
 
-All 5 stages also share a single OHLCV cache directory at `data/` (repo root) — a symbol/interval/
+All 5 stages also share a single DuckDB OHLCV cache database at `data/cache.duckdb` (repo root) — a symbol/interval/
 date-range fetched by one stage is reused by every other stage instead of being re-downloaded and
-cached separately per project. See `common/README.md`'s "Shared OHLCV cache directory" section for
-the cache filename convention and the `--cache-ttl-days` staleness knob.
+cached separately per project. See `common/README.md`'s "Shared DuckDB OHLCV cache" section for
+details on the cache schema, dynamic resampling, and earliest date tracking.
 
 ---
 
@@ -243,10 +243,6 @@ uv run python run_pipeline.py --universe SPY QQQ IWM EFA EEM GLD TLT --data-prov
 # Faster run: skip the equity-curve charts steps 4/5 would otherwise write
 uv run python run_pipeline.py --universe SPY QQQ IWM EFA EEM GLD TLT --data-provider synthetic --no-plots
 
-# Treat the shared data/ cache as stale after 1 day (useful for a rolling/live --end date;
-# irrelevant for a fixed historical range, which never goes stale)
-uv run python run_pipeline.py --universe SPY QQQ IWM EFA EEM GLD TLT --data-provider synthetic --cache-ttl-days 1
-
 # Blend in research_strategy strategies as additional candidates (step 4), and grid-search +
 # ERS-validate the winner's params on this universe before the final backtest (step 5)
 uv run python run_pipeline.py --universe SPY QQQ IWM EFA EEM GLD TLT --data-provider synthetic \
@@ -384,7 +380,7 @@ pipeline/.venv/Scripts/python.exe -m pytest backtester/tests -v
 |---|---|---|---|
 | `common/` (repo root) | Shared core infrastructure, indicators, data loaders, allocation templates, and backtester engine; no `pyproject.toml` of its own | N/A (Imported module) | `common/README.md` |
 | `backtester/` (repo root) | Standalone CLI evaluating fixed strategy files over single or rolling walkforward windows; no `pyproject.toml` of its own | `backtester/run_backtest.py` | `backtester/README.md`, `backtester/SCHEMAS.md` |
-| `data/` (repo root) | Shared OHLCV cache directory, written/read by every stage (provider-aware filenames, optional `--cache-ttl-days` staleness) | N/A (cache, not code) | `common/README.md` §7 |
+| `data/` (repo root) | Shared DuckDB OHLCV cache directory (`cache.duckdb`), written/read by every stage | N/A (cache, not code) | `common/README.md` §9 |
 | `pipeline/` | Shared `uv` environment for the projects below, plus the orchestrator | `pipeline/pyproject.toml` | -- |
 | `pipeline/research_strategy/` | Evaluates 39 quantitative trading strategies and exports factor research summaries | `pipeline/research_strategy/run_research_strategy.py` | `pipeline/research_strategy/README.md` |
 | `pipeline/instrument_selection/` | Characterizes instruments, performs hard investability screening, and selects diversified baskets | `pipeline/instrument_selection/run_screener.py` | `pipeline/instrument_selection/README.md` |

@@ -144,8 +144,7 @@ WMT, MCD, PEP) if none are given.
 | `--interval` | str, default `"1d"` | Bar interval passed to the data provider |
 | `--data-provider` | str, default `"synthetic"` | `synthetic`, `yfinance`, `csv`, or a custom module specifier |
 | `--data-dir` | path, default: none | Folder path for the `csv` data provider |
-| `--no-cache` | flag, default off (cached) | Disable local CSV caching of OHLCV history |
-| `--cache-ttl-days` | float, default: none | Maximum age (in days) of a cached OHLCV file before it's treated as stale and re-fetched |
+| `--no-cache` | flag, default off (cached) | Disable local DuckDB caching of OHLCV history |
 
 ### Sample commands
 
@@ -172,8 +171,6 @@ uv run python run_bnn_forecaster.py --universe-file ../../pipeline/instrument_se
 # Tune the buy/sell thresholds after inspecting a real run's actual ci_width output (see caveat above)
 uv run python run_bnn_forecaster.py --required-return 0.15 --max-ci-width 1.5 --data-provider yfinance
 
-# Re-fetch a stale cached OHLCV file after 1 day instead of trusting it forever
-uv run python run_bnn_forecaster.py --data-provider yfinance --cache-ttl-days 1
 ```
 
 ### Outputs (`results/`)

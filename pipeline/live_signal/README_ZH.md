@@ -36,7 +36,7 @@
 ## 2. 参数参考
 
 标的池解析标志（`--universe`/`--universe-file`/`--universe-provider`/`--universe-kwargs`）与数据
-提供商三件套（`--data-provider`/`--data-dir`/`--no-cache`/`--cache-ttl-days`）与其他项目共享——参阅
+提供商选项（`--data-provider`/`--data-dir`/`--no-cache`）与其他项目共享——参阅
 `common/README_ZH.md` 的交叉参考索引。
 
 | 标志 | 类型 / 默认值 | 含义 |

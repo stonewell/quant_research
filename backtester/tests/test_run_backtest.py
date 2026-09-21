@@ -115,13 +115,6 @@ def test_data_dir_uses_shared_data_dir():
     assert backtester.run_backtest.DATA_DIR == common.cli_utils.shared_data_dir()
 
 
-def test_arg_parser_cache_ttl_days_default_and_override():
-    args = build_arg_parser().parse_args(["--strategy-file", "strategy.json"])
-    assert args.cache_ttl_days is None
-
-    args = build_arg_parser().parse_args(["--strategy-file", "strategy.json", "--cache-ttl-days", "7"])
-    assert args.cache_ttl_days == 7.0
-
 
 def test_arg_parser_min_shares_default_and_override():
     args = build_arg_parser().parse_args(["--strategy-file", "strategy.json"])
@@ -443,7 +436,7 @@ def test_main_results_dir_and_cache_dir_overrides(tmp_path, monkeypatch):
         "run_backtest.py",
         "--strategy-file", str(strategy_path),
         "--universe", "AAA", "BBB",
-        "--data-provider", "synthetic",
+        "--data-provider", "divergent_calendar_test_provider",
         "--results-dir", str(results_dir),
         "--cache-dir", str(cache_dir),
     ]
@@ -453,7 +446,7 @@ def test_main_results_dir_and_cache_dir_overrides(tmp_path, monkeypatch):
 
     assert os.path.exists(results_dir / "backtest_equity.csv")
     assert os.path.exists(results_dir / "backtest_weights.csv")
-    assert len(list(cache_dir.glob("*.csv"))) == 2
+    assert (cache_dir / "cache.duckdb").exists()
 
 
 def test_main_runs_pattern_based_strategy_end_to_end(tmp_path, monkeypatch):
@@ -867,7 +860,6 @@ def test_run_baseline_trims_to_aligned_index(tmp_path):
         end = "2024-12-31"
         interval = "1d"
         no_cache = True
-        cache_ttl_days = None
         mode = "walkforward"
         window_years = 0.5
         step_years = 0.25

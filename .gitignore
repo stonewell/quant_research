@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 **/data/*.csv
+**/data/*.duckdb*
 **/results/*.png
 **/results/*.csv
 **/results/*.json

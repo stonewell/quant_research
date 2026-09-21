@@ -34,15 +34,6 @@ def test_data_dir_is_shared_workspace_wide_cache():
     assert DATA_DIR == shared_data_dir()
 
 
-def test_cache_ttl_days_defaults_to_none():
-    args = build_arg_parser().parse_args([])
-    assert args.cache_ttl_days is None
-
-
-def test_cache_ttl_days_parses_as_float():
-    args = build_arg_parser().parse_args(["--cache-ttl-days", "7"])
-    assert args.cache_ttl_days == 7.0
-
 
 def test_select_max_k_defaults_to_none():
     args = build_arg_parser().parse_args(["--select-method", "max_diversification"])

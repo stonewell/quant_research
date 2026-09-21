@@ -18,6 +18,7 @@ import pandas as pd
 import yfinance as yf
 
 from .universe import _parse_module_specifier
+from .duckdb_cache import DuckDBCache, is_synthetic_provider
 
 
 # Real ticker symbols (equities, ETFs, indices, FX pairs) are drawn from a
@@ -303,82 +304,91 @@ def _cache_covers_requested_end(df: pd.DataFrame, end: str, now: Optional[pd.Tim
 
 
 class CachedDataProvider(BaseDataProvider):
-    """Wrapper provider that adds CSV disk caching around any inner BaseDataProvider."""
+    """Wrapper provider that adds DuckDB disk caching around any inner BaseDataProvider.
 
-    def __init__(self, inner_provider: BaseDataProvider, cache_dir: str, cache_max_age_days: Optional[float] = None):
+    Bars and metadata are keyed strictly by (provider, symbol) in DuckDB (cache.duckdb).
+    Base daily bars are cached once and can serve any requested date range and interval.
+    Tracks each asset's earliest available date from the upstream provider to avoid
+    re-querying pre-inception date spans. Cached historical data never expires.
+    Synthetic data generators (SyntheticDataProvider) always bypass the cache.
+    """
+
+    def __init__(self, inner_provider: BaseDataProvider, cache_dir: str):
         self.inner_provider = inner_provider
         self.cache_dir = cache_dir
-        # None (default) preserves the original unlimited-cache behavior --
-        # a cached file is trusted forever regardless of age. Set this to
-        # force a re-fetch once a cached file is older than N days (useful
-        # for a rolling/live `end` date; irrelevant for a fixed historical
-        # range, which never goes stale).
-        self.cache_max_age_days = cache_max_age_days
-
-    def _is_stale(self, cache_path: str) -> bool:
-        if self.cache_max_age_days is None:
-            return False
-        age_days = (time.time() - os.path.getmtime(cache_path)) / 86400.0
-        return age_days > self.cache_max_age_days
+        self.is_synthetic = is_synthetic_provider(inner_provider)
+        if not self.is_synthetic and self.cache_dir:
+            self.duckdb_cache = DuckDBCache(db_path=self.cache_dir)
+        else:
+            self.duckdb_cache = None
 
     def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
-        if not self.cache_dir:
-            return self.inner_provider.fetch_ohlcv(symbol, start, end, interval)
-
         _validate_symbol_for_path(symbol)
-        os.makedirs(self.cache_dir, exist_ok=True)
-        # Prefixing with the inner provider's class name is load-bearing, not
-        # cosmetic: this cache directory is shared workspace-wide across
-        # projects with DIFFERENT default providers (e.g. research_strategy
-        # defaults to synthetic, the other 3 default to yfinance) -- without
-        # this, two projects fetching the same symbol/interval/date-range
-        # from different providers would silently read back each other's
-        # (wrong-provider) cached data.
+        if self.is_synthetic or not self.cache_dir or self.duckdb_cache is None:
+            return self.inner_provider.fetch_ohlcv(symbol, start, end, interval)
         provider_name = type(self.inner_provider).__name__
-        cache_path = os.path.join(self.cache_dir, f"{provider_name}_{symbol}_{interval}_{start}_{end}.csv")
 
-        if os.path.exists(cache_path) and not self._is_stale(cache_path):
-            try:
-                df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
-                df.index = pd.to_datetime(df.index)
-                if not _is_valid_cached_ohlcv(df):
-                    raise ValueError("cached file is missing expected OHLCV columns or is empty")
-                df = _drop_invalid_ohlcv_rows(df, symbol)
-                if df.empty:
-                    raise ValueError("cached file contains no rows with valid OHLC values")
-                if not _cache_covers_requested_end(df, end):
-                    raise ValueError(
-                        f"cached file's last date {df.index[-1].date()} falls short of requested "
-                        f"end '{end}', which has already elapsed"
-                    )
+        # 1. Fast cache hit check: is [start, end] covered in DuckDB?
+        if self.duckdb_cache.is_range_covered(provider_name, symbol, start=start, end=end):
+            df = self.duckdb_cache.query_bars(provider_name, symbol, start=start, end=end, interval=interval)
+            if not df.empty:
                 return df
-            except Exception as exc:
-                warnings.warn(f"Cache file '{cache_path}' is corrupt or invalid ({exc}); re-fetching from source.")
 
-        df = self.inner_provider.fetch_ohlcv(symbol, start, end, interval)
+        # 2. Re-query provider for missing range (fetch base daily bars)
+        try:
+            df = self.inner_provider.fetch_ohlcv(symbol, start, end, interval="1d")
+        except Exception:
+            # Fall back to user's requested interval if inner_provider only supports that interval
+            df = self.inner_provider.fetch_ohlcv(symbol, start, end, interval=interval)
+
         if df.empty:
-            # Both stock providers (YFinance/CSVFolder) now raise instead of
-            # returning empty (see _drop_invalid_ohlcv_rows call sites
-            # above), so this only fires for a custom/third-party provider
-            # that returns empty without raising -- must still surface as an
-            # error, not a silently "successfully loaded" empty symbol: a
-            # caller iterating fetch_universe() catches exceptions to skip a
-            # symbol with a warning, but has no such check for a merely
-            # EMPTY (non-raising) result, so it would otherwise count this
-            # symbol as loaded and hand an empty DataFrame downstream.
             raise ValueError(
-                f"{type(self.inner_provider).__name__} returned no data for {symbol} between {start} and {end}."
+                f"{provider_name} returned no data for {symbol} between {start} and {end}."
             )
-        df.to_csv(cache_path)
-        return df
 
-    # fetch_universe is deliberately NOT overridden here: BaseDataProvider's
-    # default implementation loops over symbols calling `self.fetch_ohlcv`
-    # (the cached version) for each -- delegating straight to
-    # `inner_provider.fetch_universe` instead, as a prior version of this
-    # method did, would call the INNER provider's fetch_ohlcv directly for
-    # every symbol, silently skipping this class's own cache entirely for
-    # any caller using load_universe() rather than per-symbol load_ohlcv().
+        df = _drop_invalid_ohlcv_rows(df, symbol)
+        if df.empty:
+            raise ValueError(
+                f"Data for {symbol} between {start} and {end} had rows, but every one was dropped as invalid OHLC."
+            )
+
+        # 3. Store into DuckDB cache (tracks earliest available date)
+        self.duckdb_cache.store_bars(
+            provider_name,
+            symbol,
+            df,
+            requested_start=start,
+            requested_end=end,
+        )
+
+        # 4. Return queried and properly resampled bars for requested range and interval
+        return self.duckdb_cache.query_bars(provider_name, symbol, start=start, end=end, interval=interval)
+
+    def fetch_universe(self, symbols: List[str], start: str, end: str, interval: str = "1d") -> Dict[str, pd.DataFrame]:
+        if self.is_synthetic or not self.cache_dir or self.duckdb_cache is None:
+            return super().fetch_universe(symbols, start, end, interval)
+
+        provider_name = type(self.inner_provider).__name__
+        covered_symbols = []
+
+        for symbol in symbols:
+            try:
+                _validate_symbol_for_path(symbol)
+                if self.duckdb_cache.is_range_covered(provider_name, symbol, start=start, end=end):
+                    covered_symbols.append(symbol)
+                else:
+                    self.fetch_ohlcv(symbol, start, end, interval=interval)
+                    covered_symbols.append(symbol)
+            except Exception as exc:
+                warnings.warn(f"Skipping {symbol}: {exc}")
+
+        return self.duckdb_cache.query_universe(
+            provider_name,
+            covered_symbols,
+            start=start,
+            end=end,
+            interval=interval,
+        )
 
     def fetch_metadata(self, symbol: str) -> dict:
         return self.inner_provider.fetch_metadata(symbol)
@@ -472,16 +482,14 @@ def get_data_provider(provider_name_or_instance: Union[str, BaseDataProvider, No
 
 def load_ohlcv(symbol: str, start: str, end: str, interval: str = "1d", use_cache: bool = True,
                cache_dir: str = None, provider: Union[str, BaseDataProvider, None] = None,
-               cache_max_age_days: Optional[float] = None, **kwargs) -> pd.DataFrame:
+               **kwargs) -> pd.DataFrame:
     """Download (or load cached) OHLCV data for symbol between start and end.
     Maintains backward compatibility with original load_ohlcv function signature.
-    `cache_max_age_days` (None by default -- cached files never expire) is
-    passed straight through to CachedDataProvider; it is NOT part of `**kwargs`
-    since those flow into the underlying provider's own constructor.
+    Cached historical data in DuckDB never expires.
     """
     base_prov = get_data_provider(provider, **kwargs)
     if use_cache and cache_dir:
-        prov = CachedDataProvider(base_prov, cache_dir, cache_max_age_days=cache_max_age_days)
+        prov = CachedDataProvider(base_prov, cache_dir)
     else:
         prov = base_prov
     return prov.fetch_ohlcv(symbol, start, end, interval)
@@ -489,14 +497,14 @@ def load_ohlcv(symbol: str, start: str, end: str, interval: str = "1d", use_cach
 
 def load_universe(symbols: list, start: str, end: str, interval: str = "1d", use_cache: bool = True,
                   cache_dir: str = None, provider: Union[str, BaseDataProvider, None] = None,
-                  cache_max_age_days: Optional[float] = None, **kwargs) -> dict:
+                  **kwargs) -> dict:
     """Load OHLCV for each symbol; skips (with a warning) any that fail.
     Maintains backward compatibility with original load_universe function signature.
-    See `load_ohlcv`'s docstring for `cache_max_age_days`.
+    Cached historical data in DuckDB never expires.
     """
     base_prov = get_data_provider(provider, **kwargs)
     if use_cache and cache_dir:
-        prov = CachedDataProvider(base_prov, cache_dir, cache_max_age_days=cache_max_age_days)
+        prov = CachedDataProvider(base_prov, cache_dir)
     else:
         prov = base_prov
     return prov.fetch_universe(symbols, start, end, interval)

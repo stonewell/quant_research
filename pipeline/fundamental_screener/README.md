@@ -68,9 +68,7 @@ WMT, MCD, PEP) if none are given.
 | `--interval` | str, default `"1d"` | Bar interval passed to the data provider |
 | `--seed` | int, default `42` | Random seed (only used with `--data-provider synthetic`) |
 | `--data-provider` | str, default `"synthetic"` | Only affects the benchmark's OHLCV history (see below) — `synthetic`, `yfinance`, `csv`, or a custom module specifier |
-| `--data-dir` | path, default: none | Folder path for the `csv` data provider |
-| `--no-cache` | flag, default off (cached) | Disable local CSV caching of the benchmark's OHLCV history |
-| `--cache-ttl-days` | float, default: none | Maximum age (in days) of a cached OHLCV file before it's treated as stale and re-fetched |
+| `--no-cache` | flag, default off (cached) | Disable local DuckDB caching of the benchmark's OHLCV history |
 
 `--data-provider` (default `synthetic`, matching this workspace's offline
 convention) only affects the benchmark's OHLCV history used for the
@@ -107,8 +105,6 @@ uv run python fundamental_screener/run_fundamental_screener.py \
 uv run python fundamental_screener/run_fundamental_screener.py --data-provider synthetic \
   --seed 7 --start 2018-01-01 --end 2024-12-31
 
-# Re-fetch a stale cached benchmark OHLCV file after 1 day instead of trusting it forever
-uv run python fundamental_screener/run_fundamental_screener.py --data-provider yfinance --cache-ttl-days 1
 ```
 
 ### Outputs (`results/`)

@@ -413,7 +413,6 @@ def _run_baseline(args, cache_dir, data_kwargs, aligned_index=None):
         [args.baseline_symbol], baseline_fetch_start, args.end, args.interval,
         use_cache=not args.no_cache, cache_dir=cache_dir,
         data_kwargs=data_kwargs, require_nonempty=True,
-        cache_max_age_days=args.cache_ttl_days,
     )
 
     if aligned_index is not None:
@@ -564,8 +563,7 @@ def main():
 
     universe = load_universe_with_banner(universe_symbols, fetch_start, args.end, args.interval,
                                           use_cache=not args.no_cache, cache_dir=cache_dir,
-                                          data_kwargs=data_kwargs, require_nonempty=True,
-                                          cache_max_age_days=args.cache_ttl_days)
+                                          data_kwargs=data_kwargs, require_nonempty=True)
 
     os.makedirs(results_dir, exist_ok=True)
 

@@ -126,7 +126,6 @@ def main():
         universe_symbols, start, as_of_date, args.interval,
         use_cache=not args.no_cache, cache_dir=cache_dir,
         data_kwargs=build_data_kwargs(args), require_nonempty=True,
-        cache_max_age_days=args.cache_ttl_days,
     )
     # Belt-and-suspenders: guarantee no lookahead regardless of what the
     # provider actually returned for `end`.

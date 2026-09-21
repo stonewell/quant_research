@@ -19,7 +19,7 @@ def test_build_arg_parser_defaults():
     assert args.data_provider == "yfinance"
     assert args.pattern_min_swing_pct == 0.05
     assert args.pattern_lag_bars == 20
-    assert args.cache_ttl_days is None
+    assert not hasattr(args, "cache_ttl_days")
 
 
 @patch("run_pattern_mining.load_universe_with_banner")
@@ -45,19 +45,19 @@ def test_main_writes_a_well_formed_pattern_report(mock_load, tmp_path, monkeypat
 
 
 @patch("run_pattern_mining.load_universe_with_banner")
-def test_main_wires_shared_data_dir_and_cache_ttl(mock_load, tmp_path, monkeypatch):
+def test_main_wires_shared_data_dir(mock_load, tmp_path, monkeypatch):
     monkeypatch.setattr("run_pattern_mining.RESULTS_DIR", str(tmp_path))
     closes = 100.0 + np.cumsum(np.random.default_rng(1).normal(0, 1, 400))
     mock_load.return_value = {"A": make_ohlcv_from_closes(closes)}
 
-    test_args = ["run_pattern_mining.py", "--universe", "A", "--cache-ttl-days", "3.5"]
+    test_args = ["run_pattern_mining.py", "--universe", "A"]
     with patch.object(sys, "argv", test_args):
         main()
 
     assert mock_load.call_count == 1
     _, call_kwargs = mock_load.call_args
     assert call_kwargs["cache_dir"] == cli_utils.shared_data_dir()
-    assert call_kwargs["cache_max_age_days"] == 3.5
+    assert "cache_max_age_days" not in call_kwargs
 
 
 def test_pattern_report_round_trip_reconstructs_equivalent_templates(tmp_path):

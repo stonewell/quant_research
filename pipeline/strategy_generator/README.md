@@ -287,14 +287,13 @@ falling back to this project's own default universe (`["SPY", "QQQ"]`) if none a
 | `--research-strategy` | space-separated `strategies_config.json` keys, default: none | Include one or more `research_strategy` strategies (e.g. `baa_keller`, `adaptive_grid`) as additional candidate templates (see above) |
 | `--data-provider` | str, default `"yfinance"` | `yfinance`, `csv`, `synthetic`, or a custom module specifier |
 | `--data-dir` | path, default: none | Folder path for the `csv` data provider |
-| `--no-cache` | flag, default off (cached) | Disable local CSV caching of fetched data |
-| `--cache-ttl-days` | float, default: none | Maximum age (in days) of a cached OHLCV file before it's treated as stale and re-fetched; `None` (default) never expires a cache entry on age alone |
+| `--no-cache` | flag, default off (cached) | Disable local DuckDB caching of fetched data |
 | `--no-plots` | flag, default off (charts on) | Skip writing the winning strategy's equity-curve chart (`results/equity_curve.png`) |
 | `--no-compose-aspects` | flag, default off (aspect composition ON) | Disable hybrid search across DIFFERENT templates' selection/weighting or entry/exit aspects (see "Optional: aspect composition" below); restricts the search to only the templates explicitly named/loaded |
 
-The local OHLCV cache directory now resolves to the shared, workspace-wide location
-(`<repo_root>/data/`) rather than a project-local folder — see `common/README.md`'s "Shared OHLCV
-cache directory" section (§7) for details.
+The local OHLCV cache resolves to the shared, workspace-wide database
+(`<repo_root>/data/cache.duckdb`) rather than a project-local folder — see `common/README.md`'s "Shared DuckDB
+OHLCV cache" section (§9) for details.
 
 ### Sample commands (real market data)
 
