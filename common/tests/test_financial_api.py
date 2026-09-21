@@ -294,6 +294,47 @@ def test_fuyao_provider_index_clamps_old_start_date():
         assert "000300.SH" in str(clamp_warnings[0].message)
 
 
+def test_fuyao_provider_etf_clamps_old_start_date():
+    """Verify FuyaoDataProvider clamps start date for ETFs older than 5 years with a warning,
+    and calls fund_market_historical (not falling through to prices_historical)."""
+    import warnings
+
+    provider = FuyaoDataProvider(prefer_local=False)
+    mock_etf_res = {
+        "item": [
+            {
+                "date_ms": 1704153600000,
+                "open_price": 1.0,
+                "high_price": 1.1,
+                "low_price": 0.9,
+                "close_price": 1.05,
+                "volume": 100000.0,
+                "turnover": 105000.0,
+            }
+        ]
+    }
+    mock_fuyao = MagicMock()
+    mock_fuyao.fund_market_historical.return_value = mock_etf_res
+
+    with patch.dict(sys.modules, {"fuyao_client": mock_fuyao}):
+        with warnings.catch_warnings(record=True) as recorded_warnings:
+            warnings.simplefilter("always")
+            df = provider.fetch_ohlcv("588000.SH", start="2015-01-01", end="2024-01-02")
+
+        mock_fuyao.fund_market_historical.assert_called_once()
+        mock_fuyao.prices_historical.assert_not_called()
+        called_args, called_kwargs = mock_fuyao.fund_market_historical.call_args
+        requested_start_ms = int(pd.to_datetime("2015-01-01").timestamp() * 1000)
+        assert called_kwargs["start_ms"] > requested_start_ms
+        assert len(df) == 1
+        assert df["Close"].iloc[0] == 1.05
+
+        clamp_warnings = [w for w in recorded_warnings if "rolling history" in str(w.message)]
+        assert len(clamp_warnings) == 1
+        assert "588000.SH" in str(clamp_warnings[0].message)
+
+
+
 
 def test_fuyao_provider_fetch_metadata_mocked():
     provider = FuyaoDataProvider(prefer_local=False)

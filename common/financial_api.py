@@ -461,23 +461,58 @@ class FuyaoDataProvider(BaseDataProvider):
                     interval="1d",
                 )
         elif is_etf:
-            try:
-                res = fuyao_client.fund_market_historical(
-                    thscode=thscode,
-                    start_ms=start_ms,
-                    end_ms=end_ms,
-                    interval="1d",
+            # Fuyao API fund historical prices (/api/fund/market/historical) only retain ~5 years
+            # of rolling history, and requires that end_ms <= _five_year_limit_ms(start_ms).
+            # Passing a start timestamp older than ~5 years causes the upstream API to return empty
+            # items ([]) or raises ValueError('fund history window must not exceed five years').
+            # Clamp start_ms to ~5 years ago and bound the window so fund_market_historical succeeds.
+            now_ms = int(pd.Timestamp.now(tz="Asia/Shanghai").timestamp() * 1000)
+            five_years_ms = int(5 * 365 * 86400 * 1000)
+            min_fund_start_ms = now_ms - five_years_ms
+            effective_start_ms = start_ms
+            if effective_start_ms < min_fund_start_ms:
+                clamped_dt = pd.to_datetime(min_fund_start_ms, unit="ms", utc=True).tz_convert("Asia/Shanghai").strftime("%Y-%m-%d")
+                req_start_str = start if start else start_dt.strftime("%Y-%m-%d")
+                warnings.warn(
+                    f"Fuyao fund/ETF prices ({thscode}) only retain ~5 years of rolling history. "
+                    f"Clamping requested start '{req_start_str}' to '{clamped_dt}'."
                 )
-                items = res.get("item", []) if isinstance(res, dict) else res
-            except Exception:
-                # Some symbols starting with 15/16/51 may be equities or need general endpoint
-                items = fuyao_client.prices_historical(
-                    thscode=thscode,
-                    start_ms=start_ms,
-                    end_ms=end_ms,
-                    interval="1d",
-                    adjust=self.adjust,
-                )
+                effective_start_ms = min_fund_start_ms
+
+            limit_fn = getattr(fuyao_client, "_five_year_limit_ms", None)
+            max_end_ms = effective_start_ms + five_years_ms
+            if callable(limit_fn):
+                try:
+                    res_limit = limit_fn(effective_start_ms)
+                    if isinstance(res_limit, (int, float)):
+                        max_end_ms = int(res_limit)
+                except Exception:
+                    pass
+            effective_end_ms = min(end_ms, max_end_ms)
+
+            items = []
+            if effective_start_ms <= effective_end_ms:
+                try:
+                    res = fuyao_client.fund_market_historical(
+                        thscode=thscode,
+                        start_ms=effective_start_ms,
+                        end_ms=effective_end_ms,
+                        interval="1d",
+                    )
+                    items = res.get("item", []) if isinstance(res, dict) else res
+                except Exception as fund_exc:
+                    # If fund_market_historical fails (e.g. symbol is actually an equity with 15/16/51 prefix),
+                    # fall back to general prices_historical
+                    try:
+                        items = fuyao_client.prices_historical(
+                            thscode=thscode,
+                            start_ms=start_ms,
+                            end_ms=end_ms,
+                            interval="1d",
+                            adjust=self.adjust,
+                        )
+                    except Exception:
+                        raise fund_exc
         else:
             items = fuyao_client.prices_historical(
                 thscode=thscode,
@@ -488,7 +523,11 @@ class FuyaoDataProvider(BaseDataProvider):
             )
 
         if not items:
-            extra = " (Fuyao API index history is limited to the last ~5 years)" if is_index else ""
+            extra = ""
+            if is_index:
+                extra = " (Fuyao API index history is limited to the last ~5 years)"
+            elif is_etf:
+                extra = " (Fuyao API fund/ETF history is limited to the last ~5 years)"
             raise ValueError(f"No price data returned from Fuyao API for {symbol} ({thscode}) between {start} and {end}{extra}")
 
         df = pd.DataFrame(items)
