@@ -649,4 +649,93 @@ def test_chan_risk_managed_blend_asset_level_inertia_filter():
     assert (risky_w.sum(axis=1) <= 1.00001).all()
 
 
+def test_chan_composite_single_stock_cap_and_cash_derouting():
+    """Verify that ChanCompositeStrategy never allocates > max_single_position (0.20)
+    to any single stock and deroutes the excess capital to cash_proxy (BIL)."""
+    from research_strategy.rs.strategy import ChanThreeTypeStrategy
+
+    universe = create_mock_universe(n_days=400)
+    cfg = StrategyConfig(
+        chan_comp_max_single_position=0.20,
+        chan_comp_min_weight_change=0.0,
+        cash_proxy="BIL",
+    )
+    strat = ChanCompositeStrategy(cfg)
+    weights = strat.generate_weights(universe)
+
+    rebal = weights.dropna(how="all")
+    assert not rebal.empty
+
+    risky = rebal.drop(columns=["BIL"], errors="ignore")
+    # No single stock should ever exceed 20%
+    assert (risky <= 0.200001).all().all(), f"Found weights > 0.20:\n{risky[risky > 0.20].dropna(how='all')}"
+
+    # Verify rows sum to 1.0 (with cash proxy)
+    assert np.allclose(rebal.sum(axis=1), 1.0, atol=1e-5)
+
+    # In single-signal periods where only 1 stock is held, BIL must hold >= 80%
+    held_counts = (risky > 1e-4).sum(axis=1)
+    single_held_rows = rebal[held_counts == 1]
+    if not single_held_rows.empty:
+        assert (single_held_rows["BIL"] >= 0.79999).all()
+
+
+def test_chan_three_type_single_stock_cap_and_cash_derouting():
+    """Verify that ChanThreeTypeStrategy never allocates > max_single_position (0.20)
+    to any single stock and deroutes the excess capital to cash_proxy (BIL)."""
+    from research_strategy.rs.strategy import ChanThreeTypeStrategy
+
+    universe = create_mock_universe(n_days=400)
+    cfg = StrategyConfig(
+        chan3_max_single_position=0.20,
+        chan3_min_weight_change=0.0,
+        cash_proxy="BIL",
+    )
+    strat = ChanThreeTypeStrategy(cfg)
+    weights = strat.generate_weights(universe)
+
+    rebal = weights.dropna(how="all")
+    assert not rebal.empty
+
+    risky = rebal.drop(columns=["BIL"], errors="ignore")
+    # No single stock should ever exceed 20%
+    assert (risky <= 0.200001).all().all(), f"Found weights > 0.20:\n{risky[risky > 0.20].dropna(how='all')}"
+
+    # Verify rows sum to 1.0 (with cash proxy)
+    assert np.allclose(rebal.sum(axis=1), 1.0, atol=1e-5)
+
+    # In single-signal periods where only 1 stock is held, BIL must hold >= 80%
+    held_counts = (risky > 1e-4).sum(axis=1)
+    single_held_rows = rebal[held_counts == 1]
+    if not single_held_rows.empty:
+        assert (single_held_rows["BIL"] >= 0.79999).all()
+
+
+def test_chan_composite_inertia_filter_suppresses_micro_trades():
+    """Verify that ChanCompositeStrategy's asset-level inertia suppresses
+    any non-zero target changes < chan_comp_min_weight_change (0.02)."""
+    universe = create_mock_universe(n_days=400)
+    cfg = StrategyConfig(
+        chan_comp_max_single_position=0.20,
+        chan_comp_min_weight_change=0.02,
+        cash_proxy="BIL",
+    )
+    strat = ChanCompositeStrategy(cfg)
+    weights = strat.generate_weights(universe)
+
+    rebal = weights.dropna(how="all")
+    assert not rebal.empty
+
+    diffs = (rebal - rebal.shift(1)).dropna(how="all")
+    risky_diffs = diffs.drop(columns=["BIL"], errors="ignore")
+
+    abs_diffs = risky_diffs.abs()
+    non_zero = abs_diffs[abs_diffs > 1e-6].values.flatten()
+    non_zero = non_zero[~np.isnan(non_zero)]
+
+    if len(non_zero) > 0:
+        assert (non_zero >= 0.01999).all(), f"Found target changes < 0.02: {non_zero[non_zero < 0.01999]}"
+
+
+
 

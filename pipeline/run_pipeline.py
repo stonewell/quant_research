@@ -95,6 +95,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "together with --optimize. Omit for backtester's own default (4).")
     p.add_argument("--min-shares", type=int, default=None,
         help="backtester --min-shares passthrough (step 5) -- minimum amount of shares to trade each time (default: 1). No fractional shares.")
+    p.add_argument("--china-trading", action="store_true",
+        help="Apply China A-share trading rules (price limit up/down blocks, T+1 settlement, 100-share minimum round lots, 5 bps sell stamp duty).")
+    p.add_argument("--us-trading", action="store_true",
+        help="Apply US equity market trading rules (1-share lots, SEC Section 31 sell fee, T+0 margin trading).")
+    p.add_argument("--hk-trading", action="store_true",
+        help="Apply Hong Kong equity market trading rules (board lot sizing, 0.1085% dual-sided stamp duty/levies, T+0 trading).")
     p.add_argument("--no-plots", action="store_true",
         help="backtester/strategy_generator --no-plots passthrough -- skip equity-curve charts.")
     p.add_argument("--cache-ttl-days", type=float, default=None,
@@ -147,6 +153,8 @@ def _write_manifest(started_at, args, step_records, status):
 
 def main():
     args = build_arg_parser().parse_args()
+    if sum([bool(args.china_trading), bool(args.us_trading), bool(args.hk_trading)]) > 1:
+        raise ValueError("Only one of --china-trading, --us-trading, --hk-trading may be enabled.")
     started_at = utc_timestamp()
     step_records = []
 
@@ -208,6 +216,21 @@ def main():
         step1_args += ["--min-shares", str(args.min_shares)]
         step4_args += ["--min-shares", str(args.min_shares)]
         step5_args += ["--min-shares", str(args.min_shares)]
+
+    if args.china_trading:
+        step1_args += ["--china-trading"]
+        step4_args += ["--china-trading"]
+        step5_args += ["--china-trading"]
+
+    if args.us_trading:
+        step1_args += ["--us-trading"]
+        step4_args += ["--us-trading"]
+        step5_args += ["--us-trading"]
+
+    if args.hk_trading:
+        step1_args += ["--hk-trading"]
+        step4_args += ["--hk-trading"]
+        step5_args += ["--hk-trading"]
 
     if args.cache_ttl_days is not None:
         for step_args in (step1_args, step2_args, step3_args, step4_args, step5_args):

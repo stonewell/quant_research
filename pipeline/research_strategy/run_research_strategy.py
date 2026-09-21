@@ -110,6 +110,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Minimum number of shares to trade per rebalance order (default: 1). "
                         "Fractional share trading is disallowed; trade sizes are integer multiples "
                         "of min_shares (except full position exits which liquidate remaining shares).")
+    p.add_argument("--china-trading", action="store_true",
+                   help="Apply China A-share trading rules (price limit up/down blocks, T+1 settlement, 100-share minimum round lots, 5 bps sell stamp duty).")
+    p.add_argument("--us-trading", action="store_true",
+                   help="Apply US equity market trading rules (1-share lots, SEC Section 31 sell fee, T+0 margin trading).")
+    p.add_argument("--hk-trading", action="store_true",
+                   help="Apply Hong Kong equity market trading rules (board lot sizing, 0.1085% dual-sided stamp duty/levies, T+0 trading).")
     add_data_provider_cli_args(p, default_provider="synthetic", no_cache_help="Disable local CSV caching of fetched data")
     return p
 
@@ -323,7 +329,14 @@ _VAA_MISSING_POOLS_MESSAGE = (
 
 def main():
     args = build_arg_parser().parse_args()
-    cfg = StrategyConfig(min_shares=args.min_shares)
+    if sum([bool(args.china_trading), bool(args.us_trading), bool(args.hk_trading)]) > 1:
+        raise ValueError("Only one of --china-trading, --us-trading, --hk-trading may be enabled.")
+    cfg = StrategyConfig(
+        min_shares=args.min_shares,
+        china_trading=args.china_trading,
+        us_trading=args.us_trading,
+        hk_trading=args.hk_trading,
+    )
 
     loaded_config = load_strategies_config(args.config)
 
@@ -431,6 +444,9 @@ def main():
             commission_pct=cfg.commission_pct,
             slippage_pct=cfg.slippage_pct,
             min_shares=cfg.min_shares,
+            china_trading=cfg.china_trading,
+            us_trading=cfg.us_trading,
+            hk_trading=cfg.hk_trading,
         )
 
         # `run_allocation_backtest` deliberately short-circuits to

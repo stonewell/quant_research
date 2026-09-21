@@ -39,7 +39,7 @@ _PIVOT_COLUMNS = ["start_pos", "end_pos", "zg", "zd", "gg", "dd", "start_stroke_
 _PIVOT_RELATION_COLUMNS = ["pivot_idx", "direction", "contained", "state"]
 
 _SIGNAL_CACHE: "OrderedDict" = OrderedDict()
-_SIGNAL_CACHE_MAXSIZE = 64
+_SIGNAL_CACHE_MAXSIZE = 4096
 
 
 def _signal_cache_key(df: pd.DataFrame, *params) -> tuple:
@@ -151,24 +151,61 @@ def find_fractals(merged: pd.DataFrame) -> pd.DataFrame:
     straddling both neighbors) is dropped rather than assigned a kind --
     it doesn't carry an unambiguous single-direction turning signal.
     """
-    if len(merged) < 3:
+    n = len(merged)
+    if n < 3:
         return pd.DataFrame(columns=["pos", "kind", "price"])
 
-    highs = merged["high"].to_numpy()
-    lows = merged["low"].to_numpy()
-    rows = []
-    for i in range(1, len(merged) - 1):
-        is_top = highs[i] > highs[i - 1] and highs[i] > highs[i + 1]
-        is_bottom = lows[i] < lows[i - 1] and lows[i] < lows[i + 1]
-        if is_top and not is_bottom:
-            rows.append((merged.index[i], i, "top", highs[i]))
-        elif is_bottom and not is_top:
-            rows.append((merged.index[i], i, "bottom", lows[i]))
+    highs = merged["high"].to_numpy(dtype=float)
+    lows = merged["low"].to_numpy(dtype=float)
 
-    if not rows:
+    h_mid = highs[1:-1]
+    l_mid = lows[1:-1]
+    is_top = (h_mid > highs[:-2]) & (h_mid > highs[2:])
+    is_bottom = (l_mid < lows[:-2]) & (l_mid < lows[2:])
+
+    top_only = is_top & ~is_bottom
+    bottom_only = is_bottom & ~is_top
+    valid = top_only | bottom_only
+
+    if not np.any(valid):
         return pd.DataFrame(columns=["pos", "kind", "price"])
-    idx, pos, kind, price = zip(*rows)
-    return pd.DataFrame({"pos": pos, "kind": kind, "price": price}, index=pd.Index(idx))
+
+    pos = np.flatnonzero(valid) + 1
+    kinds = np.where(top_only[valid], "top", "bottom")
+    prices = np.where(top_only[valid], highs[pos], lows[pos])
+
+    return pd.DataFrame({"pos": pos, "kind": kinds, "price": prices}, index=merged.index[pos])
+
+
+def build_strokes_from_arrays(kinds: np.ndarray, prices: np.ndarray, positions: np.ndarray, min_gap_bars: int):
+    """NumPy-native fast stroke construction avoiding DataFrame wrapping."""
+    n = len(kinds)
+    if n < 2:
+        return None
+
+    confirmed = [0]
+    for i in range(1, n):
+        k, p, pos = kinds[i], prices[i], positions[i]
+        last_idx = confirmed[-1]
+        last_k, last_p, last_pos = kinds[last_idx], prices[last_idx], positions[last_idx]
+        if k == last_k:
+            if (k == "top" and p > last_p) or (k == "bottom" and p < last_p):
+                confirmed[-1] = i
+        else:
+            if pos - last_pos >= min_gap_bars:
+                confirmed.append(i)
+
+    if len(confirmed) < 2:
+        return None
+
+    c_idx = np.array(confirmed)
+    starts = positions[c_idx[:-1]]
+    ends = positions[c_idx[1:]]
+    s_prices = prices[c_idx[:-1]]
+    e_prices = prices[c_idx[1:]]
+    dirs = np.where(kinds[c_idx[1:]] == "top", "up", "down")
+    bars = ends - starts
+    return starts, ends, s_prices, e_prices, dirs, bars
 
 
 def build_strokes(fractals: pd.DataFrame, min_gap_bars: int) -> pd.DataFrame:
@@ -188,39 +225,61 @@ def build_strokes(fractals: pd.DataFrame, min_gap_bars: int) -> pd.DataFrame:
     stroke ends at a top fractal, else `"down"`), `bars` (`end_pos -
     start_pos`).
     """
-    if len(fractals) < 2:
+    n = len(fractals)
+    if n < 2:
         return pd.DataFrame(columns=_STROKE_COLUMNS)
 
-    confirmed = [fractals.iloc[0]]
-    for i in range(1, len(fractals)):
-        fx = fractals.iloc[i]
-        last = confirmed[-1]
-        if fx["kind"] == last["kind"]:
-            if (fx["kind"] == "top" and fx["price"] > last["price"]) or (
-                fx["kind"] == "bottom" and fx["price"] < last["price"]
-            ):
-                confirmed[-1] = fx
-        else:
-            if fx["pos"] - last["pos"] >= min_gap_bars:
-                confirmed.append(fx)
-            # else: too close to be an independent turning point -- drop it.
+    kinds = fractals["kind"].to_numpy()
+    prices = fractals["price"].to_numpy(dtype=float)
+    positions = fractals["pos"].to_numpy(dtype=int)
 
-    if len(confirmed) < 2:
+    res = build_strokes_from_arrays(kinds, prices, positions, min_gap_bars)
+    if res is None:
         return pd.DataFrame(columns=_STROKE_COLUMNS)
+    starts, ends, s_prices, e_prices, dirs, bars = res
+    return pd.DataFrame({
+        "start_pos": starts,
+        "end_pos": ends,
+        "start_price": s_prices,
+        "end_price": e_prices,
+        "direction": dirs,
+        "bars": bars,
+    })
 
-    rows = []
-    for a, b in zip(confirmed[:-1], confirmed[1:]):
-        rows.append(
-            {
-                "start_pos": int(a["pos"]),
-                "end_pos": int(b["pos"]),
-                "start_price": float(a["price"]),
-                "end_price": float(b["price"]),
-                "direction": "up" if b["kind"] == "top" else "down",
-                "bars": int(b["pos"] - a["pos"]),
-            }
-        )
-    return pd.DataFrame(rows, columns=_STROKE_COLUMNS)
+
+def build_pivots_from_arrays(starts: np.ndarray, ends: np.ndarray, s_prices: np.ndarray, e_prices: np.ndarray, min_strokes: int = 3):
+    """NumPy-native fast pivot construction avoiding DataFrame wrapping.
+    Returns list of tuples (start_stroke_idx, end_stroke_idx, zg, zd, gg, dd).
+    """
+    n = len(starts)
+    if n < min_strokes:
+        return []
+
+    lows = np.minimum(s_prices, e_prices)
+    highs = np.maximum(s_prices, e_prices)
+    pivots = []
+    i = 0
+    while i + min_strokes <= n:
+        window_high = highs[i : i + min_strokes]
+        window_low = lows[i : i + min_strokes]
+        zg = float(window_high.min())
+        zd = float(window_low.max())
+        if zg <= zd:
+            i += 1
+            continue
+
+        gg = float(window_high.max())
+        dd = float(window_low.min())
+        j = i + min_strokes
+        while j < n and lows[j] < zg and highs[j] > zd:
+            gg = max(gg, float(highs[j]))
+            dd = min(dd, float(lows[j]))
+            j += 1
+
+        pivots.append((i, j - 1, zg, zd, gg, dd))
+        i = j
+
+    return pivots
 
 
 def build_pivots(strokes: pd.DataFrame, min_strokes: int = 3) -> pd.DataFrame:
@@ -244,59 +303,43 @@ def build_pivots(strokes: pd.DataFrame, min_strokes: int = 3) -> pd.DataFrame:
     if n < min_strokes:
         return pd.DataFrame(columns=_PIVOT_COLUMNS)
 
-    lows = np.minimum(strokes["start_price"].to_numpy(), strokes["end_price"].to_numpy())
-    highs = np.maximum(strokes["start_price"].to_numpy(), strokes["end_price"].to_numpy())
-    start_pos = strokes["start_pos"].to_numpy()
-    end_pos = strokes["end_pos"].to_numpy()
+    starts = strokes["start_pos"].to_numpy()
+    ends = strokes["end_pos"].to_numpy()
+    s_prices = strokes["start_price"].to_numpy(dtype=float)
+    e_prices = strokes["end_price"].to_numpy(dtype=float)
 
-    pivots = []
-    i = 0
-    while i + min_strokes <= n:
-        window_high = highs[i : i + min_strokes]
-        window_low = lows[i : i + min_strokes]
-        zg = float(window_high.min())
-        zd = float(window_low.max())
-        if zg <= zd:
-            i += 1
-            continue
+    raw_pivots = build_pivots_from_arrays(starts, ends, s_prices, e_prices, min_strokes)
+    if not raw_pivots:
+        return pd.DataFrame(columns=_PIVOT_COLUMNS)
 
-        gg = float(window_high.max())
-        dd = float(window_low.min())
-        j = i + min_strokes
-        while j < n and lows[j] < zg and highs[j] > zd:
-            gg = max(gg, float(highs[j]))
-            dd = min(dd, float(lows[j]))
-            j += 1
-
-        pivots.append(
-            {
-                "start_pos": int(start_pos[i]),
-                "end_pos": int(end_pos[j - 1]),
-                "zg": zg,
-                "zd": zd,
-                "gg": gg,
-                "dd": dd,
-                "start_stroke_idx": i,
-                "end_stroke_idx": j - 1,
-            }
-        )
-        i = j
-
+    pivots = [
+        {
+            "start_pos": int(starts[p[0]]),
+            "end_pos": int(ends[p[1]]),
+            "zg": p[2],
+            "zd": p[3],
+            "gg": p[4],
+            "dd": p[5],
+            "start_stroke_idx": p[0],
+            "end_stroke_idx": p[1],
+        }
+        for p in raw_pivots
+    ]
     return pd.DataFrame(pivots, columns=_PIVOT_COLUMNS)
 
 
-def compute_chan_signals(df: pd.DataFrame, min_gap_bars: int = 4, min_strokes: int = 3) -> pd.DataFrame:
+def compute_chan_signals(df: pd.DataFrame, min_gap_bars: int = 4, min_strokes: int = 3, causal: bool = False) -> pd.DataFrame:
     """Cache-wrapped entry point -- see `_compute_chan_signals_impl` for the
     actual rule. Memoized (see `_cached_signals`) since several strategies
     (notably `ChanBestSelectorStrategy`'s sub-strategies) call this with
     identical `df`/params for the same symbol."""
     return _cached_signals(
-        "compute_chan_signals", df, (min_gap_bars, min_strokes),
-        lambda: _compute_chan_signals_impl(df, min_gap_bars, min_strokes),
+        "compute_chan_signals", df, (min_gap_bars, min_strokes, causal),
+        lambda: _compute_chan_signals_impl(df, min_gap_bars, min_strokes, causal=causal),
     )
 
 
-def _compute_chan_signals_impl(df: pd.DataFrame, min_gap_bars: int, min_strokes: int) -> pd.DataFrame:
+def _compute_chan_signals_impl(df: pd.DataFrame, min_gap_bars: int, min_strokes: int, causal: bool = False) -> pd.DataFrame:
     """Derives per-bar `buy_signal`/`sell_signal` booleans (aligned to
     `df.index`) from the Chan structure above.
 
@@ -325,6 +368,127 @@ def _compute_chan_signals_impl(df: pd.DataFrame, min_gap_bars: int, min_strokes:
     before the pivot (and therefore the shift) was actually knowable, i.e.
     lookahead bias.
     """
+    if causal:
+        buy = pd.Series(False, index=df.index)
+        sell = pd.Series(False, index=df.index)
+        min_warmup = max(30, min_gap_bars * min_strokes * 2)
+        if len(df) <= min_warmup:
+            return pd.DataFrame({"buy_signal": buy, "sell_signal": sell})
+
+        highs = df["High"].to_numpy(dtype=float)
+        lows = df["Low"].to_numpy(dtype=float)
+        m_idx = [0]
+        m_high = [highs[0]]
+        m_low = [lows[0]]
+        direction = 0
+
+        for t in range(1, min_warmup):
+            h, l = highs[t], lows[t]
+            top_h, top_l = m_high[-1], m_low[-1]
+            included = (h <= top_h and l >= top_l) or (h >= top_h and l <= top_l)
+            if included:
+                if direction >= 0:
+                    m_high[-1] = max(top_h, h)
+                    m_low[-1] = max(top_l, l)
+                else:
+                    m_high[-1] = min(top_h, h)
+                    m_low[-1] = min(top_l, l)
+                m_idx[-1] = t
+            else:
+                if h > top_h and l > top_l:
+                    direction = 1
+                elif h < top_h and l < top_l:
+                    direction = -1
+                m_idx.append(t)
+                m_high.append(h)
+                m_low.append(l)
+
+        for t in range(min_warmup, len(df)):
+            h, l = highs[t], lows[t]
+            top_h, top_l = m_high[-1], m_low[-1]
+            included = (h <= top_h and l >= top_l) or (h >= top_h and l <= top_l)
+            if included:
+                if direction >= 0:
+                    m_high[-1] = max(top_h, h)
+                    m_low[-1] = max(top_l, l)
+                else:
+                    m_high[-1] = min(top_h, h)
+                    m_low[-1] = min(top_l, l)
+                m_idx[-1] = t
+            else:
+                if h > top_h and l > top_l:
+                    direction = 1
+                elif h < top_h and l < top_l:
+                    direction = -1
+                m_idx.append(t)
+                m_high.append(h)
+                m_low.append(l)
+
+            last_dt = df.index[t]
+            if m_idx[-1] != t:
+                continue
+            n_m = len(m_high)
+            if n_m < 3:
+                continue
+            i_m = n_m - 2
+            is_top = m_high[i_m] > m_high[i_m - 1] and m_high[i_m] > m_high[i_m + 1]
+            is_bottom = m_low[i_m] < m_low[i_m - 1] and m_low[i_m] < m_low[i_m + 1]
+            if not ((is_top and not is_bottom) or (is_bottom and not is_top)):
+                continue
+
+            last_m_pos = n_m - 1
+
+            h_arr = np.array(m_high)
+            l_arr = np.array(m_low)
+            h_mid = h_arr[1:-1]
+            l_mid = l_arr[1:-1]
+            t_top = (h_mid > h_arr[:-2]) & (h_mid > h_arr[2:])
+            b_bot = (l_mid < l_arr[:-2]) & (l_mid < l_arr[2:])
+            v_top = t_top & ~b_bot
+            v_bot = b_bot & ~t_top
+            valid = v_top | v_bot
+            if not np.any(valid):
+                continue
+            fx_pos = np.flatnonzero(valid) + 1
+            fx_kinds = np.where(v_top[valid], "top", "bottom")
+            fx_prices = np.where(v_top[valid], h_arr[fx_pos], l_arr[fx_pos])
+
+            st = build_strokes_from_arrays(fx_kinds, fx_prices, fx_pos, min_gap_bars)
+            if st is None:
+                continue
+            st_starts, st_ends, st_sprices, st_eprices, st_dirs, st_bars = st
+            pivots = build_pivots_from_arrays(st_starts, st_ends, st_sprices, st_eprices, min_strokes)
+
+            def _first_stroke_after(start_idx, d_str):
+                for si in range(start_idx, len(st_dirs)):
+                    if st_dirs[si] == d_str:
+                        return si
+                return None
+
+            for k in range(1, len(pivots)):
+                prev_p, curr_p = pivots[k - 1], pivots[k]
+                win_last = curr_p[0] + min_strokes - 1
+                if curr_p[3] >= prev_p[2]:  # zd >= prev.zg
+                    si = _first_stroke_after(win_last, "down")
+                    if si is not None and st_ends[si] + 1 == last_m_pos:
+                        buy.loc[last_dt] = True
+                if curr_p[2] <= prev_p[3]:  # zg <= prev.zd
+                    si = _first_stroke_after(win_last, "up")
+                    if si is not None and st_ends[si] + 1 == last_m_pos:
+                        sell.loc[last_dt] = True
+
+            up_idx = np.flatnonzero(st_dirs == "up")
+            if len(up_idx) >= 2:
+                b_si = up_idx[-1]
+                if st_ends[b_si] + 1 == last_m_pos:
+                    a_si = up_idx[-2]
+                    p_a = abs(st_eprices[a_si] - st_sprices[a_si]) / max(st_bars[a_si], 1)
+                    p_b = abs(st_eprices[b_si] - st_sprices[b_si]) / max(st_bars[b_si], 1)
+                    if st_eprices[b_si] > st_eprices[a_si] and p_b < p_a:
+                        sell.loc[last_dt] = True
+
+        return pd.DataFrame({"buy_signal": buy, "sell_signal": sell})
+
     buy = pd.Series(False, index=df.index)
     sell = pd.Series(False, index=df.index)
 

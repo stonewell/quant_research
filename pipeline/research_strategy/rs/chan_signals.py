@@ -51,7 +51,16 @@ import pandas as pd
 
 from common.indicators import macd
 
-from .chan_structure import _STROKE_COLUMNS, _cached_signals, build_pivots, build_strokes, find_fractals, merge_inclusion
+from .chan_structure import (
+    _STROKE_COLUMNS,
+    _cached_signals,
+    build_pivots,
+    build_pivots_from_arrays,
+    build_strokes,
+    build_strokes_from_arrays,
+    find_fractals,
+    merge_inclusion,
+)
 
 _SEGMENT_COLUMNS = _STROKE_COLUMNS + ["start_stroke_idx", "end_stroke_idx"]
 _POINT_COLUMNS = ["pos", "price", "kind", "pivot_idx"]
@@ -349,12 +358,13 @@ def compute_chan3_signals(
     macd_fast: int = 12,
     macd_slow: int = 26,
     macd_signal: int = 9,
+    causal: bool = False,
 ) -> pd.DataFrame:
     """Cache-wrapped entry point (see `chan_structure._cached_signals`) --
     see `_compute_chan3_signals_impl` for the actual rule."""
     return _cached_signals(
-        "compute_chan3_signals", df, (min_gap_bars, min_strokes, macd_fast, macd_slow, macd_signal),
-        lambda: _compute_chan3_signals_impl(df, min_gap_bars, min_strokes, macd_fast, macd_slow, macd_signal),
+        "compute_chan3_signals", df, (min_gap_bars, min_strokes, macd_fast, macd_slow, macd_signal, causal),
+        lambda: _compute_chan3_signals_impl(df, min_gap_bars, min_strokes, macd_fast, macd_slow, macd_signal, causal=causal),
     )
 
 
@@ -365,6 +375,7 @@ def _compute_chan3_signals_impl(
     macd_fast: int,
     macd_slow: int,
     macd_signal: int,
+    causal: bool = False,
 ) -> pd.DataFrame:
     """Derives per-bar boolean signals for all three formal buy/sell-point
     types (aligned to `df.index`), mirroring `compute_chan_signals`'s own
@@ -378,6 +389,100 @@ def _compute_chan3_signals_impl(
     drop-in wherever `compute_chan_signals`'s `buy_signal`/`sell_signal`
     frame is consumed today.
     """
+    if causal:
+        point_kinds = ["first_buy", "first_sell", "second_buy", "second_sell", "third_buy", "third_sell"]
+        out = {kind: pd.Series(False, index=df.index) for kind in point_kinds}
+        min_warmup = max(30, (macd_slow + macd_signal) * 2)
+        if len(df) <= min_warmup:
+            result = pd.DataFrame(out)
+            result["buy_signal"] = False
+            result["sell_signal"] = False
+            return result
+
+        hist = macd(df["Close"], macd_fast, macd_slow, macd_signal)["hist"].reset_index(drop=True)
+
+        highs = df["High"].to_numpy(dtype=float)
+        lows = df["Low"].to_numpy(dtype=float)
+        m_idx = [0]
+        m_high = [highs[0]]
+        m_low = [lows[0]]
+        direction = 0
+
+        for t in range(1, min_warmup):
+            h, l = highs[t], lows[t]
+            top_h, top_l = m_high[-1], m_low[-1]
+            included = (h <= top_h and l >= top_l) or (h >= top_h and l <= top_l)
+            if included:
+                if direction >= 0:
+                    m_high[-1] = max(top_h, h)
+                    m_low[-1] = max(top_l, l)
+                else:
+                    m_high[-1] = min(top_h, h)
+                    m_low[-1] = min(top_l, l)
+                m_idx[-1] = t
+            else:
+                if h > top_h and l > top_l:
+                    direction = 1
+                elif h < top_h and l < top_l:
+                    direction = -1
+                m_idx.append(t)
+                m_high.append(h)
+                m_low.append(l)
+
+        for t in range(min_warmup, len(df)):
+            h, l = highs[t], lows[t]
+            top_h, top_l = m_high[-1], m_low[-1]
+            included = (h <= top_h and l >= top_l) or (h >= top_h and l <= top_l)
+            if included:
+                if direction >= 0:
+                    m_high[-1] = max(top_h, h)
+                    m_low[-1] = max(top_l, l)
+                else:
+                    m_high[-1] = min(top_h, h)
+                    m_low[-1] = min(top_l, l)
+                m_idx[-1] = t
+            else:
+                if h > top_h and l > top_l:
+                    direction = 1
+                elif h < top_h and l < top_l:
+                    direction = -1
+                m_idx.append(t)
+                m_high.append(h)
+                m_low.append(l)
+
+            last_dt = df.index[t]
+            if m_idx[-1] != t:
+                continue
+            n_m = len(m_high)
+            if n_m < 3:
+                continue
+            i_m = n_m - 2
+            is_top = m_high[i_m] > m_high[i_m - 1] and m_high[i_m] > m_high[i_m + 1]
+            is_bottom = m_low[i_m] < m_low[i_m - 1] and m_low[i_m] < m_low[i_m + 1]
+            if not ((is_top and not is_bottom) or (is_bottom and not is_top)):
+                continue
+
+            last_m_pos = n_m - 1
+
+            curr_merged = pd.DataFrame({"high": list(m_high), "low": list(m_low), "orig_pos": list(m_idx)}, index=df.index[m_idx])
+            fractals = find_fractals(curr_merged)
+            strokes = build_strokes(fractals, min_gap_bars)
+            segments = build_segments(strokes, min_strokes)
+            pivots = build_pivots(segments, min_strokes)
+
+            sub_hist = hist.iloc[: t + 1]
+            points = classify_points(segments, pivots, sub_hist, curr_merged)
+
+            for _, row in points.iterrows():
+                confirm_pos = int(row["pos"]) + 1
+                if confirm_pos == last_m_pos:
+                    out[row["kind"]].loc[last_dt] = True
+
+        result = pd.DataFrame(out)
+        result["buy_signal"] = result["first_buy"] | result["second_buy"] | result["third_buy"]
+        result["sell_signal"] = result["first_sell"] | result["second_sell"] | result["third_sell"]
+        return result
+
     merged = merge_inclusion(df)
     fractals = find_fractals(merged)
     strokes = build_strokes(fractals, min_gap_bars)
@@ -427,14 +532,15 @@ def compute_chan_pivot_macd_signals(
     macd_slow: int = 26,
     macd_signal: int = 9,
     require_volume_confirmation: bool = False,
+    causal: bool = False,
 ) -> pd.DataFrame:
     """Cache-wrapped entry point (see `chan_structure._cached_signals`) --
     see `_compute_chan_pivot_macd_signals_impl` for the actual rule."""
     return _cached_signals(
         "compute_chan_pivot_macd_signals", df,
-        (min_gap_bars, min_strokes, macd_fast, macd_slow, macd_signal, require_volume_confirmation),
+        (min_gap_bars, min_strokes, macd_fast, macd_slow, macd_signal, require_volume_confirmation, causal),
         lambda: _compute_chan_pivot_macd_signals_impl(
-            df, min_gap_bars, min_strokes, macd_fast, macd_slow, macd_signal, require_volume_confirmation
+            df, min_gap_bars, min_strokes, macd_fast, macd_slow, macd_signal, require_volume_confirmation, causal=causal,
         ),
     )
 
@@ -447,6 +553,7 @@ def _compute_chan_pivot_macd_signals_impl(
     macd_slow: int,
     macd_signal: int,
     require_volume_confirmation: bool,
+    causal: bool = False,
 ) -> pd.DataFrame:
     """A near-literal copy of `chan_structure.compute_chan_signals`'s pivot-band-shift
     buy/sell rules (stroke-based pivots -- deliberately NOT segments, unlike
@@ -479,6 +586,200 @@ def _compute_chan_pivot_macd_signals_impl(
     `Volume` is absent or the flag is off, so every existing Volume-less
     fixture/caller is unaffected.
     """
+    if causal:
+        buy = pd.Series(False, index=df.index)
+        sell = pd.Series(False, index=df.index)
+        divergence_buy = pd.Series(False, index=df.index)
+        divergence_sell = pd.Series(False, index=df.index)
+        weak_divergence_buy = pd.Series(False, index=df.index)
+        weak_divergence_sell = pd.Series(False, index=df.index)
+
+        min_warmup = max(30, (macd_slow + macd_signal) * 2)
+        if len(df) <= min_warmup:
+            return pd.DataFrame(
+                {
+                    "buy_signal": buy,
+                    "sell_signal": sell,
+                    "divergence_buy": divergence_buy,
+                    "divergence_sell": divergence_sell,
+                    "weak_divergence_buy": weak_divergence_buy,
+                    "weak_divergence_sell": weak_divergence_sell,
+                }
+            )
+        hist_arr = macd(df["Close"], macd_fast, macd_slow, macd_signal)["hist"].to_numpy(dtype=float)
+        volume_arr = df["Volume"].to_numpy(dtype=float) if ("Volume" in df.columns and require_volume_confirmation) else None
+
+        highs = df["High"].to_numpy(dtype=float)
+        lows = df["Low"].to_numpy(dtype=float)
+        m_idx = [0]
+        m_high = [highs[0]]
+        m_low = [lows[0]]
+        direction = 0
+
+        for t in range(1, min_warmup):
+            h, l = highs[t], lows[t]
+            top_h, top_l = m_high[-1], m_low[-1]
+            included = (h <= top_h and l >= top_l) or (h >= top_h and l <= top_l)
+            if included:
+                if direction >= 0:
+                    m_high[-1] = max(top_h, h)
+                    m_low[-1] = max(top_l, l)
+                else:
+                    m_high[-1] = min(top_h, h)
+                    m_low[-1] = min(top_l, l)
+                m_idx[-1] = t
+            else:
+                if h > top_h and l > top_l:
+                    direction = 1
+                elif h < top_h and l < top_l:
+                    direction = -1
+                m_idx.append(t)
+                m_high.append(h)
+                m_low.append(l)
+
+        for t in range(min_warmup, len(df)):
+            h, l = highs[t], lows[t]
+            top_h, top_l = m_high[-1], m_low[-1]
+            included = (h <= top_h and l >= top_l) or (h >= top_h and l <= top_l)
+            if included:
+                if direction >= 0:
+                    m_high[-1] = max(top_h, h)
+                    m_low[-1] = max(top_l, l)
+                else:
+                    m_high[-1] = min(top_h, h)
+                    m_low[-1] = min(top_l, l)
+                m_idx[-1] = t
+            else:
+                if h > top_h and l > top_l:
+                    direction = 1
+                elif h < top_h and l < top_l:
+                    direction = -1
+                m_idx.append(t)
+                m_high.append(h)
+                m_low.append(l)
+
+            last_dt = df.index[t]
+            if m_idx[-1] != t:
+                continue
+            n_m = len(m_high)
+            if n_m < 3:
+                continue
+            i_m = n_m - 2
+            is_top = m_high[i_m] > m_high[i_m - 1] and m_high[i_m] > m_high[i_m + 1]
+            is_bottom = m_low[i_m] < m_low[i_m - 1] and m_low[i_m] < m_low[i_m + 1]
+            if not ((is_top and not is_bottom) or (is_bottom and not is_top)):
+                continue
+
+            last_m_pos = n_m - 1
+
+            h_arr = np.array(m_high)
+            l_arr = np.array(m_low)
+            h_mid = h_arr[1:-1]
+            l_mid = l_arr[1:-1]
+            t_top = (h_mid > h_arr[:-2]) & (h_mid > h_arr[2:])
+            b_bot = (l_mid < l_arr[:-2]) & (l_mid < l_arr[2:])
+            v_top = t_top & ~b_bot
+            v_bot = b_bot & ~t_top
+            valid = v_top | v_bot
+            if not np.any(valid):
+                continue
+            fx_pos = np.flatnonzero(valid) + 1
+            fx_kinds = np.where(v_top[valid], "top", "bottom")
+            fx_prices = np.where(v_top[valid], h_arr[fx_pos], l_arr[fx_pos])
+
+            st = build_strokes_from_arrays(fx_kinds, fx_prices, fx_pos, min_gap_bars)
+            if st is None:
+                continue
+            st_starts, st_ends, st_sprices, st_eprices, st_dirs, st_bars = st
+            pivots = build_pivots_from_arrays(st_starts, st_ends, st_sprices, st_eprices, min_strokes)
+
+            def _first_stroke_after(start_idx, d_str):
+                for si in range(start_idx, len(st_dirs)):
+                    if st_dirs[si] == d_str:
+                        return si
+                return None
+
+            for k in range(1, len(pivots)):
+                prev_p, curr_p = pivots[k - 1], pivots[k]
+                win_last = curr_p[0] + min_strokes - 1
+                if curr_p[3] >= prev_p[2]:  # zd >= prev.zg
+                    si = _first_stroke_after(win_last, "down")
+                    if si is not None and st_ends[si] + 1 == last_m_pos:
+                        buy.loc[last_dt] = True
+                if curr_p[2] <= prev_p[3]:  # zg <= prev.zd
+                    si = _first_stroke_after(win_last, "up")
+                    if si is not None and st_ends[si] + 1 == last_m_pos:
+                        sell.loc[last_dt] = True
+
+            up_idx = np.flatnonzero(st_dirs == "up")
+            if len(up_idx) >= 2:
+                b_si = up_idx[-1]
+                if st_ends[b_si] + 1 == last_m_pos:
+                    a_si = up_idx[-2]
+                    e_price_a = st_eprices[a_si]
+                    e_price_b = st_eprices[b_si]
+                    if e_price_b > e_price_a:
+                        lo_a = m_idx[st_starts[a_si]]
+                        hi_a = m_idx[st_ends[a_si]]
+                        win_a = hist_arr[lo_a : hi_a + 1]
+                        lo_b = m_idx[st_starts[b_si]]
+                        hi_b = m_idx[st_ends[b_si]]
+                        win_b = hist_arr[lo_b : hi_b + 1]
+                        if win_a.size > 0 and win_b.size > 0 and not (np.all(np.isnan(win_a)) or np.all(np.isnan(win_b))):
+                            area_a = float(np.clip(np.nan_to_num(win_a, nan=0.0), 0.0, None).sum())
+                            area_b = float(np.clip(np.nan_to_num(win_b, nan=0.0), 0.0, None).sum())
+                            if area_b < area_a:
+                                vol_ok = True
+                                if require_volume_confirmation and volume_arr is not None:
+                                    vol_a = float(np.nansum(volume_arr[lo_a : hi_a + 1]))
+                                    vol_b = float(np.nansum(volume_arr[lo_b : hi_b + 1]))
+                                    vol_ok = (vol_b <= vol_a)
+                                if vol_ok:
+                                    sell.loc[last_dt] = True
+                                    divergence_sell.loc[last_dt] = True
+                                    if any(piv[0] <= a_si and b_si <= piv[1] for piv in pivots):
+                                        weak_divergence_sell.loc[last_dt] = True
+
+            down_idx = np.flatnonzero(st_dirs == "down")
+            if len(down_idx) >= 2:
+                b_si = down_idx[-1]
+                if st_ends[b_si] + 1 == last_m_pos:
+                    a_si = down_idx[-2]
+                    e_price_a = st_eprices[a_si]
+                    e_price_b = st_eprices[b_si]
+                    if e_price_b < e_price_a:
+                        lo_a = m_idx[st_starts[a_si]]
+                        hi_a = m_idx[st_ends[a_si]]
+                        win_a = hist_arr[lo_a : hi_a + 1]
+                        lo_b = m_idx[st_starts[b_si]]
+                        hi_b = m_idx[st_ends[b_si]]
+                        win_b = hist_arr[lo_b : hi_b + 1]
+                        if win_a.size > 0 and win_b.size > 0 and not (np.all(np.isnan(win_a)) or np.all(np.isnan(win_b))):
+                            area_a = float((-np.clip(np.nan_to_num(win_a, nan=0.0), None, 0.0)).sum())
+                            area_b = float((-np.clip(np.nan_to_num(win_b, nan=0.0), None, 0.0)).sum())
+                            if area_b < area_a:
+                                vol_ok = True
+                                if require_volume_confirmation and volume_arr is not None:
+                                    vol_a = float(np.nansum(volume_arr[lo_a : hi_a + 1]))
+                                    vol_b = float(np.nansum(volume_arr[lo_b : hi_b + 1]))
+                                    vol_ok = (vol_b <= vol_a)
+                                if vol_ok:
+                                    buy.loc[last_dt] = True
+                                    divergence_buy.loc[last_dt] = True
+                                    if any(piv[0] <= a_si and b_si <= piv[1] for piv in pivots):
+                                        weak_divergence_buy.loc[last_dt] = True
+
+        return pd.DataFrame(
+            {
+                "buy_signal": buy,
+                "sell_signal": sell,
+                "divergence_buy": divergence_buy,
+                "divergence_sell": divergence_sell,
+                "weak_divergence_buy": weak_divergence_buy,
+                "weak_divergence_sell": weak_divergence_sell,
+            }
+        )
+
     buy = pd.Series(False, index=df.index)
     sell = pd.Series(False, index=df.index)
     divergence_buy = pd.Series(False, index=df.index)

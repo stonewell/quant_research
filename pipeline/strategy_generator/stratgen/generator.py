@@ -35,6 +35,9 @@ class GeneratorConfig:
     commission_pct: float = 0.0005
     slippage_pct: float = 0.0005
     min_shares: int = 1
+    china_trading: bool = False
+    us_trading: bool = False
+    hk_trading: bool = False
     seed: int = None
     # How close (as a fraction of the leading score, with `factor_tiebreak_epsilon`
     # itself also used as an absolute floor so near-zero Sharpe scores don't
@@ -59,8 +62,16 @@ class GeneratorConfig:
     composition_top_k: int = 4
 
     def __post_init__(self):
+        if sum([bool(self.china_trading), bool(self.us_trading), bool(self.hk_trading)]) > 1:
+            raise ValueError("Only one of china_trading, us_trading, hk_trading may be enabled.")
         if not isinstance(self.min_shares, (int, np.integer)) or isinstance(self.min_shares, bool) or self.min_shares < 1:
             raise ValueError(f"GeneratorConfig.min_shares must be an integer >= 1, got {self.min_shares!r}")
+        if not isinstance(self.china_trading, bool):
+            raise ValueError(f"GeneratorConfig.china_trading must be a boolean, got {self.china_trading!r}")
+        if not isinstance(self.us_trading, bool):
+            raise ValueError(f"GeneratorConfig.us_trading must be a boolean, got {self.us_trading!r}")
+        if not isinstance(self.hk_trading, bool):
+            raise ValueError(f"GeneratorConfig.hk_trading must be a boolean, got {self.hk_trading!r}")
 
 
 @dataclass
@@ -114,6 +125,9 @@ def _portfolio_score(universe: dict, template, params: dict, config: GeneratorCo
             commission_pct=config.commission_pct,
             slippage_pct=config.slippage_pct,
             min_shares=getattr(config, "min_shares", 1),
+            china_trading=getattr(config, "china_trading", False),
+            us_trading=getattr(config, "us_trading", False),
+            hk_trading=getattr(config, "hk_trading", False),
         )
         return result
     except Exception as exc:

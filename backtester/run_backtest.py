@@ -90,6 +90,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-rebalances-for-trust", type=int, default=4)
     p.add_argument("--min-shares", type=int, default=1,
                    help="Minimum amount of shares to trade each time (default: 1). Fractional share trading is not allowed.")
+    p.add_argument("--china-trading", action="store_true",
+                   help="Apply China A-share trading rules (price limit up/down blocks, T+1 settlement, 100-share minimum round lots, 5 bps sell stamp duty).")
+    p.add_argument("--us-trading", action="store_true",
+                   help="Apply US equity market trading rules (1-share lots, SEC Section 31 sell fee, T+0 margin trading).")
+    p.add_argument("--hk-trading", action="store_true",
+                   help="Apply Hong Kong equity market trading rules (board lot sizing, 0.1085% dual-sided stamp duty/levies, T+0 trading).")
     add_data_provider_cli_args(p)
     add_output_dir_override_args(p, RESULTS_DIR, DATA_DIR, "equity/weights/report CSVs")
     p.add_argument("--no-plots", action="store_true",
@@ -121,6 +127,18 @@ def _align_universe(universe: dict) -> dict:
                 f"anywhere in the universe ({overall_latest.date()}). Symbol(s) with the shortest "
                 f"trading history are limiting the whole walk-forward range: {limiting_symbols}."
             )
+        aligned_start = common_index[0]
+        overall_earliest = min(df.index[0] for df in universe.values() if len(df))
+        if aligned_start - overall_earliest > pd.Timedelta(days=7):
+            late_symbols = sorted(
+                sym for sym, df in universe.items() if len(df) and df.index[0] >= aligned_start
+            )
+            warnings.warn(
+                f"_align_universe: aligned date range starts {aligned_start.date()}, "
+                f"{(aligned_start - overall_earliest).days} day(s) later than the earliest date available "
+                f"anywhere in the universe ({overall_earliest.date()}). Symbol(s) listed latest "
+                f"are trimming the start date for the whole universe: {late_symbols}."
+            )
     return {symbol: df.loc[common_index] for symbol, df in universe.items()}
 
 
@@ -133,12 +151,27 @@ def run_standard(universe: dict, template, params: dict, args) -> dict:
     if target_weights.empty:
         raise ValueError("Template generated empty weights.")
 
+    eval_universe = universe
+    if getattr(args, "start", None):
+        start_ts = pd.Timestamp(args.start)
+        any_df = next(iter(universe.values()))
+        if any_df.index[0] < start_ts:
+            eval_index = any_df.loc[start_ts:].index
+            if len(eval_index) > 0:
+                eval_weights = target_weights.reindex(eval_index)
+                eval_weights.iloc[0] = target_weights.ffill().reindex(eval_index).iloc[0]
+                target_weights = eval_weights
+                eval_universe = {sym: df.loc[eval_index] for sym, df in universe.items()}
+
     result = run_allocation_backtest(
-        universe, target_weights,
+        eval_universe, target_weights,
         initial_capital=args.initial_capital,
         commission_pct=args.commission_pct,
         slippage_pct=args.slippage_pct,
         min_shares=getattr(args, "min_shares", 1),
+        china_trading=getattr(args, "china_trading", False),
+        us_trading=getattr(args, "us_trading", False),
+        hk_trading=getattr(args, "hk_trading", False),
     )
 
     if result["equity_curve"].empty:
@@ -195,9 +228,25 @@ def run_walkforward(universe: dict, template, params: dict, args) -> list:
             "rebalance_report": pd.DataFrame(columns=REBALANCE_REPORT_COLUMNS),
         }
 
+    base_start_idx = 0
+    if getattr(args, "start", None):
+        start_ts = pd.Timestamp(args.start)
+        if any_df.index[0] < start_ts:
+            locs = np.flatnonzero(any_df.index >= start_ts)
+            if len(locs) > 0:
+                base_start_idx = int(locs[0])
+
+    total_folds = 0
+    s_idx = base_start_idx
+    while s_idx + window_bars <= n_bars:
+        total_folds += 1
+        s_idx += step_bars
+
     folds = []
-    start_idx = 0
+    start_idx = base_start_idx
+    fold_idx = 0
     while start_idx + window_bars <= n_bars:
+        fold_idx += 1
         end_idx = start_idx + window_bars
         buffer_start_idx = max(0, start_idx - warmup_bars)
 
@@ -206,6 +255,7 @@ def run_walkforward(universe: dict, template, params: dict, args) -> list:
 
         start_date = any_df.index[start_idx].strftime("%Y-%m-%d")
         end_date = any_df.index[end_idx - 1].strftime("%Y-%m-%d")
+        print(f"[Fold {fold_idx}/{total_folds}] Evaluating {start_date} to {end_date}...", flush=True)
 
         try:
             full_weights = template.generate_weights(buffered_universe, params)
@@ -227,6 +277,9 @@ def run_walkforward(universe: dict, template, params: dict, args) -> list:
                     commission_pct=args.commission_pct,
                     slippage_pct=args.slippage_pct,
                     min_shares=getattr(args, "min_shares", 1),
+                    china_trading=getattr(args, "china_trading", False),
+                    us_trading=getattr(args, "us_trading", False),
+                    hk_trading=getattr(args, "hk_trading", False),
                 )
                 if result["equity_curve"].empty:
                     fold_metrics = _nan_fold_metrics()
@@ -248,6 +301,17 @@ def run_walkforward(universe: dict, template, params: dict, args) -> list:
         except Exception as e:
             print(f"Error in window {start_date} to {end_date}: {e}")
             fold_metrics = _nan_fold_metrics()
+
+        sr = fold_metrics.get("sharpe_ratio", float("nan"))
+        if np.isnan(sr):
+            print(f"  [Fold {fold_idx}/{total_folds}] Done: NaN metrics", flush=True)
+        else:
+            print(
+                f"  [Fold {fold_idx}/{total_folds}] Done: Sharpe={sr:.2f}, "
+                f"CAGR={fold_metrics['cagr']:.1%}, MaxDD={fold_metrics['max_drawdown']:.1%}, "
+                f"Rebalances={fold_metrics['total_rebalances']}",
+                flush=True,
+            )
 
         folds.append({"start_date": start_date, "end_date": end_date, **fold_metrics})
 
@@ -339,8 +403,14 @@ def _run_baseline(args, cache_dir, data_kwargs, aligned_index=None):
     baseline_template = get_template(args.baseline_template)
     baseline_params = _resolve_baseline_params(baseline_template, args.baseline_params)
 
+    baseline_fetch_start = args.start
+    if aligned_index is not None and len(aligned_index) > 0:
+        earliest_aligned = aligned_index[0].strftime("%Y-%m-%d")
+        if args.start and earliest_aligned < args.start:
+            baseline_fetch_start = earliest_aligned
+
     baseline_universe = load_universe_with_banner(
-        [args.baseline_symbol], args.start, args.end, args.interval,
+        [args.baseline_symbol], baseline_fetch_start, args.end, args.interval,
         use_cache=not args.no_cache, cache_dir=cache_dir,
         data_kwargs=data_kwargs, require_nonempty=True,
         cache_max_age_days=args.cache_ttl_days,
@@ -441,6 +511,8 @@ def _merge_baseline_folds(folds_df: pd.DataFrame, baseline_folds_df: pd.DataFram
 
 def main():
     args = build_arg_parser().parse_args()
+    if sum([bool(args.china_trading), bool(args.us_trading), bool(args.hk_trading)]) > 1:
+        raise ValueError("Only one of --china-trading, --us-trading, --hk-trading may be enabled.")
     results_dir = args.results_dir or RESULTS_DIR
     cache_dir = args.cache_dir or DATA_DIR
 
@@ -480,7 +552,17 @@ def main():
     if not universe_symbols:
         raise ValueError("No universe symbols provided or resolved. Pass --universe, --universe-file, or --universe-provider.")
 
-    universe = load_universe_with_banner(universe_symbols, args.start, args.end, args.interval,
+    warmup_template = get_template(
+        template_name, pattern_spec, research_strategy_spec, composite_spec, params, fundamental_spec, bnn_spec
+    )
+    warmup_bars = warmup_template.warmup_bars(params)
+    fetch_start = args.start
+    if warmup_bars > 0 and args.start:
+        # Convert trading bars into calendar days (~7/5 ratio) + 45 days buffer for holidays/weekends
+        warmup_calendar_days = int(round(warmup_bars * 7 / 5)) + 45
+        fetch_start = (pd.Timestamp(args.start) - pd.Timedelta(days=warmup_calendar_days)).strftime("%Y-%m-%d")
+
+    universe = load_universe_with_banner(universe_symbols, fetch_start, args.end, args.interval,
                                           use_cache=not args.no_cache, cache_dir=cache_dir,
                                           data_kwargs=data_kwargs, require_nonempty=True,
                                           cache_max_age_days=args.cache_ttl_days)

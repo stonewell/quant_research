@@ -87,6 +87,26 @@ def test_align_universe_no_warning_within_tolerance():
         _align_universe(universe)  # must not raise/warn
 
 
+def test_align_universe_warns_and_names_late_listed_symbol():
+    # "A" was listed late (starts 100 days after "B") -- the intersection must shrink
+    # to A's start date, and a warning must name "A" as trimming the start date.
+    idx_early = pd.bdate_range("2020-01-01", periods=300)
+    idx_late = pd.bdate_range("2020-06-01", periods=200)
+
+    universe = {
+        "A": pd.DataFrame({"Close": np.ones(len(idx_late))}, index=idx_late),
+        "B": pd.DataFrame({"Close": np.ones(len(idx_early))}, index=idx_early),
+    }
+
+    with pytest.warns(UserWarning, match=r"trimming the start date for the whole universe: \['A'\]"):
+        aligned = _align_universe(universe)
+
+    expected_len = len(idx_late.intersection(idx_early))
+    assert len(aligned["A"]) == expected_len
+    assert len(aligned["B"]) == expected_len
+
+
+
 def test_data_dir_uses_shared_data_dir():
     # Regression test: DATA_DIR used to be a per-project default_data_dir(__file__)
     # (this project's own default_data_dir was removed in the shared OHLCV cache
@@ -271,6 +291,32 @@ def test_run_walkforward_warms_up_indicator_lookback_before_each_fold():
     # of only the ones after its own in-window warmup period.
     for fold in folds[1:]:
         assert fold["total_rebalances"] == 12
+
+
+def test_run_walkforward_fold1_uses_prebuffered_warmup_when_start_arg_provided():
+    # When universe includes pre-buffered historical bars prior to args.start,
+    # Fold 1 starts at args.start and uses the pre-buffered bars for warmup,
+    # so even Fold 1 gets full scheduled rebalances.
+    idx = pd.bdate_range("2020-01-01", periods=252 * 2)
+    rng = np.random.default_rng(0)
+    closes_a = 100 + np.cumsum(rng.normal(0.05, 1.0, len(idx)))
+    closes_b = 100 + np.cumsum(rng.normal(0.05, 1.0, len(idx)))
+    universe = {
+        "A": make_df(closes_a, start="2020-01-01"),
+        "B": make_df(closes_b, start="2020-01-01"),
+    }
+
+    template = get_template("inverse_volatility")
+    params = {"vol_lookback": 120, "rebalance_freq_days": 21}
+    start_date = idx[130].strftime("%Y-%m-%d")
+    args = MockArgs(window_years=0.5, step_years=0.5, start=start_date)
+
+    folds = run_walkforward(universe, template, params, args)
+    # Fold 1's start date matches the requested args.start
+    assert folds[0]["start_date"] == start_date
+    # And Fold 1 gets the full ~126/21 = 6 rebalances without warmup delay
+    assert folds[0]["total_rebalances"] == 6
+
 
 
 def _write_strategy_file(path, template_name="equal_weight", params=None, pattern_spec=None,

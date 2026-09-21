@@ -32,7 +32,13 @@ from typing import Callable, Dict
 import numpy as np
 import pandas as pd
 
-from common.allocation_templates import AllocationTemplate, _cap_and_deroute_to_cash, _fill_out_columns, _sparse_from_daily
+from common.allocation_templates import (
+    AllocationTemplate,
+    _cap_and_deroute_to_cash,
+    _fill_out_columns,
+    _sparse_from_daily,
+    apply_asset_inertia,
+)
 from common.indicators import atr, cumulative_rsi, rsi, rsi_cutler, rsi_wilder, sma
 from common.position_exits import run_stop_timeout_exit
 
@@ -278,12 +284,15 @@ def _exit_rsi_cross(df: pd.DataFrame, entry_signal: pd.Series, params: dict) -> 
     else:
         raise ValueError(f"Unknown rsi_exit_mode: {exit_mode!r} (expected 'rsi_cross', 'ma_cross', or 'either')")
     exit_signal = exit_signal.fillna(False).to_numpy()
+    low = df["Low"] if "Low" in df.columns else None
+    high = df["High"] if "High" in df.columns else None
 
-    return run_stop_timeout_exit(close, entry_signal, exit_signal, stop_loss_pct, max_holding_days, position_size_pct)
+    return run_stop_timeout_exit(close, entry_signal, exit_signal, stop_loss_pct, max_holding_days, position_size_pct, low=low, high=high)
 
 
 def _exit_swing_stop_target(df: pd.DataFrame, entry_signal: pd.Series, params: dict) -> np.ndarray:
     close = df["Close"]
+    low = df["Low"] if "Low" in df.columns else close
     n_bars = len(close)
     rsi_period = params.get("swing_rsi_period", 5)
     exit_rsi_threshold = params.get("swing_exit_rsi_threshold", 90.0)
@@ -299,16 +308,18 @@ def _exit_swing_stop_target(df: pd.DataFrame, entry_signal: pd.Series, params: d
     profit_target_pct = stop_loss_pct * reward_risk_ratio
 
     close_arr = close.to_numpy()
+    low_arr = low.to_numpy()
     entry_arr = entry_signal.to_numpy()
     raw = np.zeros(n_bars)
     in_position, entry_idx, peak_price = False, 0, 0.0
     for i in range(n_bars):
         c = close_arr[i]
+        l = low_arr[i]
         if in_position:
             entry_price = close_arr[entry_idx]
             peak_price = max(peak_price, c)
             held = i - entry_idx
-            stopped = c <= entry_price * (1 - stop_loss_pct)
+            stopped = l <= entry_price * (1 - stop_loss_pct)
             targeted = c >= entry_price * (1 + profit_target_pct)
             trailed = (
                 use_trailing_stop and (peak_price / entry_price - 1) >= trailing_activate_pct
@@ -338,8 +349,10 @@ def _exit_chan_signal(df: pd.DataFrame, entry_signal: pd.Series, params: dict) -
 
     sig = compute_chan_signals(df, min_gap_bars=min_gap_bars, min_strokes=min_strokes)
     exit_signal = sig["sell_signal"].reindex(df.index).fillna(False).to_numpy()
+    low = df["Low"] if "Low" in df.columns else None
+    high = df["High"] if "High" in df.columns else None
 
-    return run_stop_timeout_exit(close, entry_signal, exit_signal, stop_loss_pct, max_holding_days, position_size_pct)
+    return run_stop_timeout_exit(close, entry_signal, exit_signal, stop_loss_pct, max_holding_days, position_size_pct, low=low, high=high)
 
 
 def _exit_chan3_point(df: pd.DataFrame, entry_signal: pd.Series, params: dict) -> np.ndarray:
@@ -366,8 +379,10 @@ def _exit_chan3_point(df: pd.DataFrame, entry_signal: pd.Series, params: dict) -
         )
         sell = sell | stroke_sig["sell_signal"]
     exit_signal = sell.reindex(df.index).fillna(False).to_numpy()
+    low = df["Low"] if "Low" in df.columns else None
+    high = df["High"] if "High" in df.columns else None
 
-    return run_stop_timeout_exit(close, entry_signal, exit_signal, stop_loss_pct, max_holding_days, position_size_pct)
+    return run_stop_timeout_exit(close, entry_signal, exit_signal, stop_loss_pct, max_holding_days, position_size_pct, low=low, high=high)
 
 
 def _exit_chanm_signal(df: pd.DataFrame, entry_signal: pd.Series, params: dict) -> np.ndarray:
@@ -386,8 +401,10 @@ def _exit_chanm_signal(df: pd.DataFrame, entry_signal: pd.Series, params: dict) 
         macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal,
     )
     exit_signal = sig["sell_signal"].reindex(df.index).fillna(False).to_numpy()
+    low = df["Low"] if "Low" in df.columns else None
+    high = df["High"] if "High" in df.columns else None
 
-    return run_stop_timeout_exit(close, entry_signal, exit_signal, stop_loss_pct, max_holding_days, position_size_pct)
+    return run_stop_timeout_exit(close, entry_signal, exit_signal, stop_loss_pct, max_holding_days, position_size_pct, low=low, high=high)
 
 
 def _exit_turtle_atr_trailing(df: pd.DataFrame, entry_signal: pd.Series, params: dict) -> np.ndarray:
@@ -568,7 +585,21 @@ class CompositeTimingTemplate(AllocationTemplate):
         daily = pd.DataFrame(raw_weights, index=master_index)
         daily = _cap_and_deroute_to_cash(daily, symbols, cash_proxy)
 
-        daily = _fill_out_columns(daily, symbols)
+        max_single_pos = None
+        if "chan3" in self.name:
+            max_single_pos = float(p.get("chan3_max_single_position", 0.20))
+        elif "chan_comp" in self.name:
+            max_single_pos = float(p.get("chan_comp_max_single_position", 0.20))
+        elif "max_single_position" in p:
+            max_single_pos = float(p["max_single_position"])
+
+        if max_single_pos is not None and max_single_pos < 1.0 and risky_symbols:
+            over_cap = (daily[risky_symbols] > max_single_pos)
+            if over_cap.any().any():
+                daily[risky_symbols] = np.minimum(daily[risky_symbols], max_single_pos)
+                if cash_proxy in symbols:
+                    daily[cash_proxy] = np.maximum(0.0, 1.0 - daily[risky_symbols].sum(axis=1))
+
         min_weight_change = 0.0
         if "turtle" in self.name:
             min_weight_change = float(p.get("turtle_min_weight_change", 0.0))
@@ -576,9 +607,20 @@ class CompositeTimingTemplate(AllocationTemplate):
             min_weight_change = float(p.get("ensemble_min_weight_change", 0.0))
         elif "bollinger" in self.name:
             min_weight_change = float(p.get("bb_min_weight_change", 0.0))
+        elif "chan3" in self.name:
+            min_weight_change = float(p.get("chan3_min_weight_change", 0.02))
+        elif "chan_comp" in self.name:
+            min_weight_change = float(p.get("chan_comp_min_weight_change", 0.02))
         if "min_weight_change" in p:
             min_weight_change = float(p["min_weight_change"])
 
+        if "chan3" in self.name or "chan_comp" in self.name:
+            if min_weight_change > 0.0:
+                daily = apply_asset_inertia(daily, min_weight_change=min_weight_change, cash_proxy=cash_proxy)
+            daily = _fill_out_columns(daily, symbols)
+            return _sparse_from_daily(daily)
+
+        daily = _fill_out_columns(daily, symbols)
         return _sparse_from_daily(daily, min_weight_change=min_weight_change, cash_proxy=cash_proxy)
 
     def explain_weights(self, params: dict = None) -> str:

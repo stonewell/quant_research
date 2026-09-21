@@ -56,6 +56,9 @@ all of them raises `ValueError("No universe symbols provided or resolved...")`.
 | `--commission-pct` | float, default `0.0005` | Per-trade commission, as a fraction of traded notional |
 | `--slippage-pct` | float, default `0.0005` | Per-trade slippage, as a fraction of traded notional |
 | `--min-shares` | int, default `1` | Minimum number of shares to trade per rebalance order. Fractional share trading is disallowed; trade sizes are integer multiples of `min_shares` (except full position exits which liquidate remaining shares) |
+| `--china-trading` | flag, default off | Apply China A-share trading rules: daily price limits (10% main board, 20% ChiNext/STAR, 30% BSE), limit-up blocks BUY, limit-down blocks SELL, T+1 settlement enforcement, 100-share minimum round lots, 5 bps sell-side stamp duty |
+| `--us-trading` | flag, default off | Apply US equity market trading rules: 1-share lots, SEC Section 31 sell-side regulatory transaction fee (0.00278%), T+0 margin day-trading |
+| `--hk-trading` | flag, default off | Apply Hong Kong equity market trading rules: board lot sizing (default 100 shares or stock-specific e.g. HSBC 400), dual-sided stamp duty & levies (0.1085% on both BUY and SELL), T+0 intraday trading |
 | `--baseline-symbol` | str, default: none | Optional single reference symbol (e.g. `SPY`) to compare the strategy against. Off by default — none of the comparison code runs unless this is set |
 | `--baseline-template` | str, default `"equal_weight"` | Static allocation template (one of the 9 in `ALLOCATION_TEMPLATES` — no `pattern_*` templates) used to turn `--baseline-symbol` into a baseline equity curve |
 | `--baseline-params` | JSON str, default: none | Params for `--baseline-template` as a JSON object string (default: that template's first `param_grid` combination) |

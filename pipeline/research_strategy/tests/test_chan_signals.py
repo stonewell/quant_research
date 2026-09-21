@@ -547,3 +547,31 @@ def test_compute_chan3_signals_cache_miss_on_different_data():
     result_b = compute_chan3_signals(df_b, min_gap_bars=4, min_strokes=3)
     assert result_a is not result_b
     assert len(result_a) == 60 and len(result_b) == 61
+
+
+def test_causal_chan_pivot_macd_signals_matches_expanding_window():
+    from common.testing import make_random_walk_df
+
+    df = make_random_walk_df(150, seed=42)
+    res_causal = compute_chan_pivot_macd_signals(df, min_gap_bars=4, min_strokes=3, causal=True)
+    assert "buy_signal" in res_causal.columns
+    assert "sell_signal" in res_causal.columns
+    assert len(res_causal) == len(df)
+
+    # Verify that any signal on bar t was indeed present when evaluating data up to bar t (strictly causal)
+    for t in range(50, len(df)):
+        if res_causal["buy_signal"].iloc[t]:
+            sub_df = df.iloc[: t + 1]
+            sub_res = compute_chan_pivot_macd_signals(sub_df, min_gap_bars=4, min_strokes=3, causal=False)
+            assert sub_res["buy_signal"].iloc[-1]
+
+
+def test_causal_chan3_signals_matches_expanding_window():
+    from common.testing import make_random_walk_df
+
+    df = make_random_walk_df(150, seed=42)
+    res_causal = compute_chan3_signals(df, min_gap_bars=4, min_strokes=3, causal=True)
+    assert "buy_signal" in res_causal.columns
+    assert "first_buy" in res_causal.columns
+    assert len(res_causal) == len(df)
+

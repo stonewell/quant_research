@@ -472,6 +472,7 @@ class ChanPivotShiftMACDAdvStrategy(AllocationTemplate):
 
         master_index = _aligned_master_index_helper(universe, risky_symbols)
         raw_weights = {}
+        chan_causal = bool(p.get("chan_causal_signals", getattr(cfg, "chan_causal_signals", True)))
 
         for sym in risky_symbols:
             bars = universe[sym]
@@ -479,6 +480,7 @@ class ChanPivotShiftMACDAdvStrategy(AllocationTemplate):
                 bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes,
                 macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal_period,
                 require_volume_confirmation=require_volume_confirmation,
+                causal=chan_causal,
             )
             buy_signal = sig["buy_signal"].reindex(master_index).fillna(False)
             sell_signal = sig["sell_signal"].reindex(master_index).fillna(False)
@@ -529,6 +531,7 @@ class ChanPivotShiftMACDAdvStrategy(AllocationTemplate):
             sig3 = compute_chan3_signals(
                 bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes,
                 macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal_period,
+                causal=chan_causal,
             )
             coincidence = (sig3["second_buy"] | sig3["third_buy"]).reindex(master_index).fillna(False)
             size_at_entry = np.where(coincidence.to_numpy(), position_size_pct, weak_signal_position_size_pct)

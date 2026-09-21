@@ -129,17 +129,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "flag to restrict the search to only the templates explicitly named/loaded.")
     p.add_argument("--min-shares", type=int, default=1,
                    help="Minimum amount of shares to trade each time (default: 1). Fractional share trading is not allowed.")
+    p.add_argument("--china-trading", action="store_true",
+                   help="Apply China A-share trading rules (price limit up/down blocks, T+1 settlement, 100-share minimum round lots, 5 bps sell stamp duty).")
+    p.add_argument("--us-trading", action="store_true",
+                   help="Apply US equity market trading rules (1-share lots, SEC Section 31 sell fee, T+0 margin trading).")
+    p.add_argument("--hk-trading", action="store_true",
+                   help="Apply Hong Kong equity market trading rules (board lot sizing, 0.1085% dual-sided stamp duty/levies, T+0 trading).")
     add_data_provider_cli_args(p)
     return p
 
 
 def main():
     args = build_arg_parser().parse_args()
+    if sum([bool(args.china_trading), bool(args.us_trading), bool(args.hk_trading)]) > 1:
+        raise ValueError("Only one of --china-trading, --us-trading, --hk-trading may be enabled.")
     gen_config = GeneratorConfig(
         n_random_search=args.n_random_search,
         ers_percentile_threshold=args.ers_percentile_threshold,
         min_rebalances_for_trust=args.min_rebalances_for_trust,
         min_shares=args.min_shares,
+        china_trading=args.china_trading,
+        us_trading=args.us_trading,
+        hk_trading=args.hk_trading,
         factor_tiebreak_epsilon=args.factor_tiebreak_epsilon,
         enable_aspect_composition=not args.no_compose_aspects,
     )

@@ -29,6 +29,7 @@ import pandas as pd
 
 from common.allocation_templates import (
     AllocationTemplate,
+    apply_asset_inertia,
     _cap_and_deroute_to_cash,
     _fill_out_columns,
     _sparse_from_daily,
@@ -326,6 +327,8 @@ def run_composite_position_loop(
     stop_loss_pct: Optional[float] = 0.08,
     max_holding_days: Optional[int] = 90,
     allow_flat_b2_b3: bool = True,
+    low: Optional[pd.Series | np.ndarray] = None,
+    high: Optional[pd.Series | np.ndarray] = None,
 ) -> np.ndarray:
     """Stateful position scaling loop for Chan Composite strategy:
     - B1 (first_buy): opens the position (b1_w). When allow_flat_b2_b3=True,
@@ -346,6 +349,7 @@ def run_composite_position_loop(
     b2_arr = np.asarray(second_buy)
     b3_arr = np.asarray(third_buy)
     sell_arr = np.asarray(sell_signal)
+    low_arr = np.asarray(low) if low is not None else None
     n = len(close_arr)
     raw = np.zeros(n)
 
@@ -357,7 +361,8 @@ def run_composite_position_loop(
         if current_weight > 0.0:
             held = i - entry_idx
             p = close_arr[i]
-            ret = p / entry_price - 1.0 if entry_price > 0 else 0.0
+            eval_p = low_arr[i] if low_arr is not None else p
+            ret = eval_p / entry_price - 1.0 if entry_price > 0 else 0.0
 
             stopped = stop_loss_pct is not None and ret <= -stop_loss_pct
             timed_out = max_holding_days is not None and held >= max_holding_days
@@ -441,6 +446,7 @@ class ChanMultiTimeframeTrendStrategy(AllocationTemplate):
         raw_weights = {}
 
         require_weekly = p.get("chan_mtf_require_weekly_regime", getattr(cfg, "chan_mtf_require_weekly_regime", False))
+        chan_causal = bool(p.get("chan_causal_signals", getattr(cfg, "chan_causal_signals", True)))
 
         for sym in risky_symbols:
             bars = universe[sym]
@@ -448,8 +454,8 @@ class ChanMultiTimeframeTrendStrategy(AllocationTemplate):
             ma = sma(close, trend_ma_period)
             macro_trend_gate = (close > ma).fillna(False)
 
-            sig = compute_chan3_signals(bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes)
-            stroke_sig = compute_chan_pivot_macd_signals(bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes)
+            sig = compute_chan3_signals(bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes, causal=chan_causal)
+            stroke_sig = compute_chan_pivot_macd_signals(bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes, causal=chan_causal)
             chan_buy = (sig["buy_signal"] | stroke_sig["buy_signal"]).reindex(master_index).fillna(False)
             chan_sell = (sig["sell_signal"] | stroke_sig["sell_signal"]).reindex(master_index).fillna(False)
 
@@ -524,6 +530,8 @@ class ChanTrendThirdBuyStrategy(AllocationTemplate):
         max_holding_days = p.get("chan_b3_max_holding_days", cfg.chan_b3_max_holding_days)
         position_size_pct = p.get("chan_b3_position_size_pct", cfg.chan_b3_position_size_pct)
 
+        chan_causal = bool(p.get("chan_causal_signals", getattr(cfg, "chan_causal_signals", True)))
+
         symbols = list(universe.keys())
         risky_symbols = _get_risky_symbols_helper(universe, params, cfg_symbol=None, cfg_risky_universe=None, cash_proxy=cash_proxy)
         if not risky_symbols:
@@ -537,18 +545,23 @@ class ChanTrendThirdBuyStrategy(AllocationTemplate):
             sig = compute_chan3_signals(
                 bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes,
                 macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal,
+                causal=chan_causal,
             )
             stroke_sig = compute_chan_pivot_macd_signals(
                 bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes,
                 macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal,
+                causal=chan_causal,
             )
             stroke_pivot_shift = stroke_sig["buy_signal"] & ~stroke_sig["divergence_buy"]
             entry_signal = (sig["third_buy"] | stroke_pivot_shift).reindex(master_index).fillna(False)
             exit_signal = (sig["sell_signal"] | stroke_sig["divergence_sell"]).reindex(master_index).fillna(False)
             close = bars["Close"].reindex(master_index)
+            low = bars["Low"].reindex(master_index) if "Low" in bars.columns else None
+            high = bars["High"].reindex(master_index) if "High" in bars.columns else None
 
             raw_weights[sym] = run_stop_timeout_exit(
-                close, entry_signal, exit_signal, stop_loss_pct, max_holding_days, position_size_pct
+                close, entry_signal, exit_signal, stop_loss_pct, max_holding_days, position_size_pct,
+                low=low, high=high,
             )
 
         daily = pd.DataFrame(raw_weights, index=master_index)
@@ -621,15 +634,19 @@ class ChanMeanReversionDivergenceStrategy(AllocationTemplate):
         master_index = _aligned_master_index_helper(universe, risky_symbols)
         raw_weights = {}
 
+        chan_causal = bool(p.get("chan_causal_signals", getattr(cfg, "chan_causal_signals", True)))
+
         for sym in risky_symbols:
             bars = universe[sym]
             sig = compute_chan3_signals(
                 bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes,
                 macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal,
+                causal=chan_causal,
             )
             stroke_sig = compute_chan_pivot_macd_signals(
                 bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes,
                 macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal,
+                causal=chan_causal,
             )
             raw_first_buy = (sig["first_buy"] | stroke_sig["divergence_buy"]).reindex(master_index).fillna(False)
 
@@ -733,6 +750,7 @@ class ChanCompositeStrategy(AllocationTemplate):
         stop_loss_pct = p.get("chan_comp_stop_loss_pct", cfg.chan_comp_stop_loss_pct)
         max_holding_days = p.get("chan_comp_max_holding_days", cfg.chan_comp_max_holding_days)
         allow_flat_b2_b3 = p.get("chan_comp_allow_flat_b2_b3", getattr(cfg, "chan_comp_allow_flat_b2_b3", True))
+        chan_causal = bool(p.get("chan_causal_signals", getattr(cfg, "chan_causal_signals", True)))
 
         symbols = list(universe.keys())
         risky_symbols = _get_risky_symbols_helper(universe, params, cfg_symbol=None, cfg_risky_universe=None, cash_proxy=cash_proxy)
@@ -747,10 +765,12 @@ class ChanCompositeStrategy(AllocationTemplate):
             sig = compute_chan3_signals(
                 bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes,
                 macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal,
+                causal=chan_causal,
             )
             stroke_sig = compute_chan_pivot_macd_signals(
                 bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes,
                 macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal,
+                causal=chan_causal,
             )
             stroke_pivot_shift = stroke_sig["buy_signal"] & ~stroke_sig["divergence_buy"]
             first_buy = (sig["first_buy"] | stroke_sig["divergence_buy"]).reindex(master_index).fillna(False)
@@ -759,9 +779,13 @@ class ChanCompositeStrategy(AllocationTemplate):
             pivot_danger = _pivot_relation_danger_series(bars, min_gap_bars, min_strokes).reindex(master_index).ffill().fillna(False)
             sell_signal = (sig["sell_signal"] | stroke_sig["sell_signal"]).reindex(master_index).fillna(False) | pivot_danger
             close = bars["Close"].reindex(master_index)
+            low = bars["Low"].reindex(master_index) if "Low" in bars.columns else None
+            high = bars["High"].reindex(master_index) if "High" in bars.columns else None
 
             raw_weights[sym] = run_composite_position_loop(
                 close=close,
+                low=low,
+                high=high,
                 first_buy=first_buy,
                 second_buy=second_buy,
                 third_buy=third_buy,
@@ -776,6 +800,20 @@ class ChanCompositeStrategy(AllocationTemplate):
 
         daily = pd.DataFrame(raw_weights, index=master_index)
         daily = _cap_and_deroute_to_cash(daily, symbols, cash_proxy)
+
+        max_single_pos = float(p.get("chan_comp_max_single_position", getattr(cfg, "chan_comp_max_single_position", 0.20)))
+        min_weight_change = float(p.get("chan_comp_min_weight_change", getattr(cfg, "chan_comp_min_weight_change", 0.02)))
+
+        if max_single_pos < 1.0 and risky_symbols:
+            over_cap = (daily[risky_symbols] > max_single_pos)
+            if over_cap.any().any():
+                daily[risky_symbols] = np.minimum(daily[risky_symbols], max_single_pos)
+                if cash_proxy in symbols:
+                    daily[cash_proxy] = np.maximum(0.0, 1.0 - daily[risky_symbols].sum(axis=1))
+
+        if min_weight_change > 0.0:
+            daily = apply_asset_inertia(daily, min_weight_change=min_weight_change, cash_proxy=cash_proxy)
+
         daily = _fill_out_columns(daily, symbols)
         return _sparse_from_daily(daily)
 
@@ -985,6 +1023,7 @@ class ChanVaaCompoundStrategy(AllocationTemplate):
         stop_loss_pct = p.get("chanm_stop_loss_pct", cfg.chanm_stop_loss_pct)
         max_holding_days = p.get("chanm_max_holding_days", cfg.chanm_max_holding_days)
         position_size_pct = float(p.get("chanm_position_size_pct", cfg.chanm_position_size_pct))
+        chan_causal = bool(p.get("chan_causal_signals", getattr(cfg, "chan_causal_signals", True)))
 
         chan_raw_weights: Dict[str, pd.Series] = {}
         for sym in risky_symbols:
@@ -996,13 +1035,17 @@ class ChanVaaCompoundStrategy(AllocationTemplate):
                 macd_fast=macd_fast,
                 macd_slow=macd_slow,
                 macd_signal=macd_signal,
+                causal=chan_causal,
             )
             entry_signal = sig["buy_signal"].reindex(master_index).fillna(False)
             exit_signal = sig["sell_signal"].reindex(master_index).fillna(False)
             close = bars["Close"].reindex(master_index)
+            low = bars["Low"].reindex(master_index) if "Low" in bars.columns else None
+            high = bars["High"].reindex(master_index) if "High" in bars.columns else None
 
             chan_raw_weights[sym] = run_stop_timeout_exit(
-                close, entry_signal, exit_signal, stop_loss_pct, max_holding_days, position_size_pct
+                close, entry_signal, exit_signal, stop_loss_pct, max_holding_days, position_size_pct,
+                low=low, high=high,
             )
 
         chan_daily = pd.DataFrame(chan_raw_weights, index=master_index)

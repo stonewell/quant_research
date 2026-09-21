@@ -19,29 +19,33 @@ def run_stop_timeout_exit(
     stop_loss_pct: float | None,
     max_holding_days: int | None,
     position_size_pct: float,
+    low=None,
+    high=None,
 ) -> np.ndarray:
     """Stateful single-symbol position loop: enters on `entry_signal`, holds
-    at `position_size_pct` until `exit_signal` fires, a stop-loss (close
+    at `position_size_pct` until `exit_signal` fires, a stop-loss (low or close
     dropping `stop_loss_pct` below the entry price) triggers, or
     `max_holding_days` elapses -- whichever comes first. Returns a per-bar
     raw weight array (explicit 0.0 on every de-risked/flat bar, never NaN,
     per the sparse-weights NaN-vs-0.0 contract).
 
-    `close`/`entry_signal`/`exit_signal` accept either a `pd.Series` or a
-    plain `np.ndarray` (via `np.asarray`) -- callers differ on which they
+    `close`/`entry_signal`/`exit_signal`/`low`/`high` accept either a `pd.Series`
+    or a plain `np.ndarray` (via `np.asarray`) -- callers differ on which they
     already have in hand by this point, and this loop only ever needs
     positional access, not the index.
     """
     close_arr = np.asarray(close)
     entry_arr = np.asarray(entry_signal)
     exit_arr = np.asarray(exit_signal)
+    low_arr = np.asarray(low) if low is not None else None
     n_bars = len(close_arr)
     raw = np.zeros(n_bars)
     in_position, entry_idx = False, 0
     for i in range(n_bars):
         if in_position:
             held = i - entry_idx
-            stopped = stop_loss_pct is not None and (close_arr[i] / close_arr[entry_idx] - 1) <= -stop_loss_pct
+            eval_p = low_arr[i] if low_arr is not None else close_arr[i]
+            stopped = stop_loss_pct is not None and (eval_p / close_arr[entry_idx] - 1) <= -stop_loss_pct
             timed_out = max_holding_days is not None and held >= max_holding_days
             if exit_arr[i] or stopped or timed_out:
                 in_position = False

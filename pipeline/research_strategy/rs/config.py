@@ -264,6 +264,8 @@ class StrategyConfig:
     chan3_max_holding_days: Optional[int] = 90    # None disables
     chan3_position_size_pct: float = 1.0
     chan3_include_stroke_signals: bool = True
+    chan3_max_single_position: float = 0.20        # Hard maximum weight per individual stock (default: 20%)
+    chan3_min_weight_change: float = 0.02          # Asset inertia filter threshold (default: 2%)
 
     # --- Chan Pivot Shift (MACD) (additive copy of Chan Pivot Shift above --
     # see rs/chan_signals.py's compute_chan_pivot_macd_signals; NOT a
@@ -331,6 +333,8 @@ class StrategyConfig:
     chan_comp_stop_loss_pct: Optional[float] = 0.08
     chan_comp_max_holding_days: Optional[int] = 90
     chan_comp_allow_flat_b2_b3: bool = True
+    chan_comp_max_single_position: float = 0.20    # Hard maximum weight per individual stock (default: 20%)
+    chan_comp_min_weight_change: float = 0.02      # Asset inertia filter threshold (default: 2%)
 
     # --- Chan Best Selector Meta-Strategy ---
     chan_best_lookback_days: int = 63
@@ -555,6 +559,10 @@ class StrategyConfig:
     commission_pct: float = 0.0005          # 5 bps
     slippage_pct: float = 0.0005            # 5 bps
     min_shares: int = 1
+    china_trading: bool = False              # Apply China A-share trading rules (T+1, price limits, stamp duty, 100-share lot)
+    us_trading: bool = False                 # Apply US market rules (1-share lot, SEC sell fee, T+0 margin)
+    hk_trading: bool = False                 # Apply HK market rules (board lot, 0.1085% dual-sided stamp/levies, T+0)
+    chan_causal_signals: bool = True         # Strictly causal point-in-time signal generation for Chan strategies (default ON)
 
     def __post_init__(self):
         """Validates only the handful of fields used downstream as divisors,
@@ -565,6 +573,8 @@ class StrategyConfig:
         over all ~60 fields; enum-like string fields (e.g. `ensemble_mode`,
         `rsi_method`) are left unvalidated since their strategies already
         handle an unrecognized value with an explicit fallback/error."""
+        if sum([bool(self.china_trading), bool(self.us_trading), bool(self.hk_trading)]) > 1:
+            raise ValueError("Only one of china_trading, us_trading, hk_trading may be enabled.")
         if self.rebalance_freq_days <= 0:
             raise ValueError(f"StrategyConfig.rebalance_freq_days must be > 0, got {self.rebalance_freq_days}")
         if self.top_k <= 0:
@@ -577,6 +587,14 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.initial_capital must be > 0, got {self.initial_capital}")
         if not isinstance(self.min_shares, int) or self.min_shares < 1:
             raise ValueError(f"StrategyConfig.min_shares must be an integer >= 1, got {self.min_shares!r}")
+        if not isinstance(self.china_trading, bool):
+            raise ValueError(f"StrategyConfig.china_trading must be a boolean, got {self.china_trading!r}")
+        if not isinstance(self.us_trading, bool):
+            raise ValueError(f"StrategyConfig.us_trading must be a boolean, got {self.us_trading!r}")
+        if not isinstance(self.hk_trading, bool):
+            raise ValueError(f"StrategyConfig.hk_trading must be a boolean, got {self.hk_trading!r}")
+        if not isinstance(self.chan_causal_signals, bool):
+            raise ValueError(f"StrategyConfig.chan_causal_signals must be a boolean, got {self.chan_causal_signals!r}")
         if not self.cash_proxy or not isinstance(self.cash_proxy, str):
             raise ValueError(f"StrategyConfig.cash_proxy must be a non-empty string, got {self.cash_proxy!r}")
         if not isinstance(self.risky_universe, list):
