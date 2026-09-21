@@ -28,6 +28,20 @@ from common.indicators import realized_vol, roc, rsi
 from common.scheduling import get_rebalance_dates as _get_rebalance_dates
 
 
+def _get_master_index(universe: Dict[str, pd.DataFrame]) -> pd.DatetimeIndex:
+    """Builds a unified master trading calendar from the union of all active
+    trading dates across non-empty symbols in the universe. If all symbols
+    share the identical DatetimeIndex, returns the original index object to
+    preserve its frequency and metadata."""
+    non_empty = [s for s, df in universe.items() if not df.empty]
+    if not non_empty:
+        return pd.DatetimeIndex([])
+    first_idx = universe[non_empty[0]].index
+    if all(len(universe[s].index) == len(first_idx) and universe[s].index.equals(first_idx) for s in non_empty[1:]):
+        return first_idx
+    return pd.DatetimeIndex(sorted(set().union(*(universe[s].index for s in non_empty))))
+
+
 @dataclass
 class AllocationTemplate:
     name: str
@@ -334,19 +348,19 @@ def build_aggregate_curve(universe: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     if not symbols:
         return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
 
-    master_index = universe[symbols[0]].index
-    for sym in symbols[1:]:
-        master_index = master_index.intersection(universe[sym].index)
-    master_index = master_index.sort_values()
+    master_index = pd.DatetimeIndex(sorted(set().union(*(universe[s].index for s in symbols))))
     if len(master_index) < 2:
         return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
 
     out = {}
     for field in ("Open", "High", "Low", "Close"):
-        normalized = pd.DataFrame({
-            sym: universe[sym][field].reindex(master_index) / universe[sym]["Close"].reindex(master_index).iloc[0]
-            for sym in symbols
-        })
+        normalized_cols = {}
+        for sym in symbols:
+            close_series = universe[sym]["Close"].dropna()
+            if not close_series.empty:
+                base_val = float(close_series.iloc[0])
+                normalized_cols[sym] = universe[sym][field].reindex(master_index) / base_val
+        normalized = pd.DataFrame(normalized_cols, index=master_index)
         out[field] = 100.0 * normalized.mean(axis=1, skipna=True)
 
     if all("Volume" in universe[sym].columns for sym in symbols):
@@ -369,19 +383,35 @@ class EqualWeightAllocation(AllocationTemplate):
         if not symbols:
             return pd.DataFrame()
 
-        # Use the first symbol's index as the master calendar (assumes aligned universe)
-        master_index = universe[symbols[0]].index
+        master_index = _get_master_index(universe)
+        if len(master_index) == 0:
+            return pd.DataFrame()
         rebalance_dates = _get_rebalance_dates(master_index, params["rebalance_freq_days"])
 
-        n_symbols = len(symbols)
-        weight = 1.0 / n_symbols if n_symbols > 0 else 0.0
+        # Fast path when all symbols share the identical calendar
+        non_empty = [s for s in symbols if not universe[s].empty]
+        first_idx = universe[non_empty[0]].index if non_empty else None
+        if non_empty and all(len(universe[s].index) == len(first_idx) and universe[s].index.equals(first_idx) for s in non_empty):
+            n_symbols = len(symbols)
+            weight = 1.0 / n_symbols if n_symbols > 0 else 0.0
+            weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
+            weights_df.loc[rebalance_dates, :] = weight
+            return weights_df
 
         weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
-        weights_df.loc[rebalance_dates, :] = weight
+        for d in rebalance_dates:
+            active_symbols = [
+                s for s in symbols
+                if s in universe and d in universe[s].index and pd.notna(universe[s].loc[d, "Close"])
+            ]
+            if active_symbols:
+                w = 1.0 / len(active_symbols)
+                for s in symbols:
+                    weights_df.loc[d, s] = w if s in active_symbols else 0.0
+            else:
+                for s in symbols:
+                    weights_df.loc[d, s] = 0.0
 
-        # Sparse: only the actual rebalance-date rows are set. The backtester
-        # forward-fills for simulation and uses this sparsity, not value
-        # equality, to find real rebalance dates (see module docstring).
         return weights_df
 
     def explain_weights(self, params: dict) -> str:
@@ -426,19 +456,28 @@ class InverseVolatilityAllocation(AllocationTemplate):
         if not symbols:
             return pd.DataFrame()
 
-        master_index = universe[symbols[0]].index
+        non_empty = [s for s in symbols if not universe[s].empty]
+        if not non_empty:
+            return pd.DataFrame()
+
+        master_index = _get_master_index(universe)
+        if len(master_index) == 0:
+            return pd.DataFrame()
         rebalance_dates = _get_rebalance_dates(master_index, params["rebalance_freq_days"])
 
         # Calculate daily volatility for all symbols
         vols = pd.DataFrame(index=master_index, columns=symbols, dtype=float)
         for sym, df in universe.items():
-            vols[sym] = realized_vol(df["Close"], window=params["vol_lookback"])
+            if not df.empty:
+                vols[sym] = realized_vol(df["Close"], window=params["vol_lookback"]).reindex(master_index)
 
         # Only keep values on rebalance dates
         vols_rebal = vols.loc[rebalance_dates]
 
         # Invert + normalize so weights sum to 1.0 across the row
         weights_rebal = vols_rebal.apply(lambda row: _inverse_vol_weights(row), axis=1)
+        has_valid = weights_rebal.notna().any(axis=1)
+        weights_rebal.loc[has_valid] = weights_rebal.loc[has_valid].fillna(0.0)
 
         weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
         weights_df.loc[rebalance_dates] = weights_rebal
@@ -472,13 +511,16 @@ class CrossSectionalMomentumAllocation(AllocationTemplate):
         if not symbols:
             return pd.DataFrame()
 
-        master_index = universe[symbols[0]].index
+        master_index = _get_master_index(universe)
+        if len(master_index) == 0:
+            return pd.DataFrame()
         rebalance_dates = _get_rebalance_dates(master_index, params["rebalance_freq_days"])
 
         # Calculate momentum (Rate of Change) for all symbols
         moms = pd.DataFrame(index=master_index, columns=symbols)
         for sym, df in universe.items():
-            moms[sym] = roc(df["Close"], period=params["mom_lookback"])
+            if not df.empty:
+                moms[sym] = roc(df["Close"], period=params["mom_lookback"]).reindex(master_index)
 
         moms_rebal = moms.loc[rebalance_dates]
 
@@ -527,12 +569,19 @@ class HierarchicalRiskParityAllocation(AllocationTemplate):
         if not symbols:
             return pd.DataFrame()
 
-        master_index = universe[symbols[0]].index
+        non_empty = [s for s in symbols if not universe[s].empty]
+        if not non_empty:
+            return pd.DataFrame()
+
+        master_index = _get_master_index(universe)
+        if len(master_index) == 0:
+            return pd.DataFrame()
         rebalance_dates = _get_rebalance_dates(master_index, params["rebalance_freq_days"])
 
         returns_df = pd.DataFrame(index=master_index, columns=symbols)
         for sym, df in universe.items():
-            returns_df[sym] = df["Close"].pct_change()
+            if not df.empty:
+                returns_df[sym] = df["Close"].pct_change().reindex(master_index)
 
         lookback = params["cov_lookback"]
         weights_rebal = pd.DataFrame(index=rebalance_dates, columns=symbols, data=np.nan)
@@ -556,7 +605,11 @@ class HierarchicalRiskParityAllocation(AllocationTemplate):
             cov = sub_ret[valid_symbols].cov().to_numpy()
             cov = denoise_covariance(cov, n_obs=len(sub_ret))
             w_hrp = _hrp_portfolio(cov)
-            weights_rebal.loc[date, valid_symbols] = w_hrp
+            if len(valid_symbols) == len(symbols):
+                weights_rebal.loc[date, :] = w_hrp
+            else:
+                weights_rebal.loc[date, :] = 0.0
+                weights_rebal.loc[date, valid_symbols] = w_hrp
 
         weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
         weights_df.loc[rebalance_dates] = weights_rebal
@@ -589,12 +642,15 @@ class DualMomentumAllocation(AllocationTemplate):
         if not symbols:
             return pd.DataFrame()
 
-        master_index = universe[symbols[0]].index
+        master_index = _get_master_index(universe)
+        if len(master_index) == 0:
+            return pd.DataFrame()
         rebalance_dates = _get_rebalance_dates(master_index, params["rebalance_freq_days"])
 
         moms = pd.DataFrame(index=master_index, columns=symbols)
         for sym, df in universe.items():
-            moms[sym] = roc(df["Close"], period=params["mom_lookback"])
+            if not df.empty:
+                moms[sym] = roc(df["Close"], period=params["mom_lookback"]).reindex(master_index)
 
         moms_rebal = moms.loc[rebalance_dates]
         n_symbols = len(symbols)
@@ -643,12 +699,15 @@ class MaxDiversificationAllocation(AllocationTemplate):
         if not symbols:
             return pd.DataFrame()
 
-        master_index = universe[symbols[0]].index
+        master_index = _get_master_index(universe)
+        if len(master_index) == 0:
+            return pd.DataFrame()
         rebalance_dates = _get_rebalance_dates(master_index, params["rebalance_freq_days"])
 
         returns_df = pd.DataFrame(index=master_index, columns=symbols)
         for sym, df in universe.items():
-            returns_df[sym] = df["Close"].pct_change()
+            if not df.empty:
+                returns_df[sym] = df["Close"].pct_change().reindex(master_index)
 
         lookback = params["vol_lookback"]
         weights_rebal = pd.DataFrame(index=rebalance_dates, columns=symbols, data=np.nan)
@@ -714,12 +773,15 @@ class MeanReversionAllocation(AllocationTemplate):
         if not symbols:
             return pd.DataFrame()
 
-        master_index = universe[symbols[0]].index
+        master_index = _get_master_index(universe)
+        if len(master_index) == 0:
+            return pd.DataFrame()
         rebalance_dates = _get_rebalance_dates(master_index, params["rebalance_freq_days"])
 
         rsis = pd.DataFrame(index=master_index, columns=symbols)
         for sym, df in universe.items():
-            rsis[sym] = rsi(df["Close"], period=params["rsi_period"])
+            if not df.empty:
+                rsis[sym] = rsi(df["Close"], period=params["rsi_period"]).reindex(master_index)
 
         rsis_rebal = rsis.loc[rebalance_dates]
         n_symbols = len(symbols)
@@ -768,12 +830,15 @@ class MinimumVarianceAllocation(AllocationTemplate):
         if not symbols:
             return pd.DataFrame()
 
-        master_index = universe[symbols[0]].index
+        master_index = _get_master_index(universe)
+        if len(master_index) == 0:
+            return pd.DataFrame()
         rebalance_dates = _get_rebalance_dates(master_index, params["rebalance_freq_days"])
 
         returns_df = pd.DataFrame(index=master_index, columns=symbols)
         for sym, df in universe.items():
-            returns_df[sym] = df["Close"].pct_change()
+            if not df.empty:
+                returns_df[sym] = df["Close"].pct_change().reindex(master_index)
 
         lookback = params["cov_lookback"]
         weights_rebal = pd.DataFrame(index=rebalance_dates, columns=symbols, data=np.nan)
@@ -795,7 +860,11 @@ class MinimumVarianceAllocation(AllocationTemplate):
             cov = sub_ret[valid_symbols].cov().to_numpy()
             cov = denoise_covariance(cov, n_obs=len(sub_ret))
             w_mv = _min_variance_weights(cov)
-            weights_rebal.loc[date, valid_symbols] = w_mv
+            if len(valid_symbols) == len(symbols):
+                weights_rebal.loc[date, :] = w_mv
+            else:
+                weights_rebal.loc[date, :] = 0.0
+                weights_rebal.loc[date, valid_symbols] = w_mv
 
         weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
         weights_df.loc[rebalance_dates] = weights_rebal
@@ -832,12 +901,15 @@ class BreadthGatedMomentumAllocation(AllocationTemplate):
         if not symbols:
             return pd.DataFrame()
 
-        master_index = universe[symbols[0]].index
+        master_index = _get_master_index(universe)
+        if len(master_index) == 0:
+            return pd.DataFrame()
         rebalance_dates = _get_rebalance_dates(master_index, params["rebalance_freq_days"])
 
         moms = pd.DataFrame(index=master_index, columns=symbols)
         for sym, df in universe.items():
-            moms[sym] = roc(df["Close"], period=params["mom_lookback"])
+            if not df.empty:
+                moms[sym] = roc(df["Close"], period=params["mom_lookback"]).reindex(master_index)
 
         moms_rebal = moms.loc[rebalance_dates]
         n_symbols = len(symbols)
@@ -1023,11 +1095,17 @@ class PatternBasedAllocationTemplate(AllocationTemplate):
         # Peak (bearish finding): invested baseline, de-risk to cash while active.
         invested = active if self.event_type == "trough" else ~active
 
-        n_symbols = len(symbols)
         weights_rebal = pd.DataFrame(index=rebalance_dates, columns=symbols, data=0.0)
         for date in rebalance_dates:
             if date in invested.index and bool(invested.loc[date]):
-                weights_rebal.loc[date, :] = 1.0 / n_symbols
+                active_symbols = [
+                    s for s in symbols
+                    if s in universe and date in universe[s].index and pd.notna(universe[s].loc[date, "Close"])
+                ]
+                if active_symbols:
+                    w = 1.0 / len(active_symbols)
+                    for s in active_symbols:
+                        weights_rebal.loc[date, s] = w
 
         weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
         weights_df.loc[rebalance_dates] = weights_rebal

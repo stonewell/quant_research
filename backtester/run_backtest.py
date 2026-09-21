@@ -147,22 +147,101 @@ def _resolve_window_bars(window_years: float) -> int:
     return int(round(window_years * 252))
 
 
+def _slice_universe_for_range(universe: dict, date_range: pd.DatetimeIndex) -> dict:
+    """Returns a subset of universe where each symbol has at least one bar within date_range,
+    with the dataframe sliced to the intersection with date_range.
+    
+    Temporarily removes assets that have no bars for the given date range.
+    """
+    sliced = {}
+    for sym, df in universe.items():
+        if df.empty:
+            continue
+        common = df.index.intersection(date_range)
+        if len(common) > 0:
+            sliced[sym] = df.loc[common]
+    return sliced
+
+
+def _resolve_master_calendar(
+    universe: dict,
+    start=None,
+    end=None,
+    min_coverage: float = 0.20,
+) -> tuple:
+    """Resolve master trading calendar across non-empty dataframes in universe.
+
+    Finds all distinct trading dates. Computes the earliest date where at least
+    min_coverage (default 20%) of universe assets have trading data.
+    If `start` is specified and precedes this 20% coverage date, the effective
+    start date is moved forward to the 20% coverage date and a warning is logged.
+
+    Returns (master_calendar: pd.DatetimeIndex, effective_start: pd.Timestamp).
+    """
+    non_empty = {sym: df for sym, df in universe.items() if not df.empty}
+    if not non_empty:
+        return pd.DatetimeIndex([]), pd.Timestamp.now()
+
+    all_dates = sorted(set().union(*(df.index for df in non_empty.values())))
+    if not all_dates:
+        return pd.DatetimeIndex([]), pd.Timestamp.now()
+
+    total_assets = len(universe)
+    min_assets = max(1, int(np.ceil(min_coverage * total_assets)))
+
+    date_counts = pd.Series(0, index=pd.DatetimeIndex(all_dates))
+    for df in non_empty.values():
+        date_counts.loc[df.index.unique()] += 1
+
+    valid_mask = date_counts >= min_assets
+    if not valid_mask.any():
+        earliest_20pct_date = all_dates[0]
+    else:
+        earliest_20pct_date = date_counts[valid_mask].index[0]
+
+    effective_start = earliest_20pct_date
+    if start:
+        start_ts = pd.Timestamp(start)
+        if start_ts < earliest_20pct_date:
+            warnings.warn(
+                f"Requested start date {start} precedes earliest date where at least "
+                f"{min_coverage*100:.0f}% of universe assets ({min_assets}/{total_assets}) "
+                f"have trading data ({earliest_20pct_date.strftime('%Y-%m-%d')}). "
+                f"Moving start date to {earliest_20pct_date.strftime('%Y-%m-%d')}."
+            )
+            effective_start = earliest_20pct_date
+        else:
+            effective_start = start_ts
+
+    cal_dates = [d for d in all_dates if d >= earliest_20pct_date]
+    if end:
+        end_ts = pd.Timestamp(end)
+        cal_dates = [d for d in cal_dates if d <= end_ts]
+
+    master_calendar = pd.DatetimeIndex(cal_dates)
+    return master_calendar, effective_start
+
+
 def run_standard(universe: dict, template, params: dict, args) -> dict:
+    master_calendar, effective_start = _resolve_master_calendar(
+        universe, getattr(args, "start", None), getattr(args, "end", None), min_coverage=0.20
+    )
+    if master_calendar.empty:
+        raise ValueError("Universe contains no valid trading dates.")
+
     target_weights = template.generate_weights(universe, params)
     if target_weights.empty:
         raise ValueError("Template generated empty weights.")
 
-    eval_universe = universe
-    if getattr(args, "start", None):
-        start_ts = pd.Timestamp(args.start)
-        any_df = next(iter(universe.values()))
-        if any_df.index[0] < start_ts:
-            eval_index = any_df.loc[start_ts:].index
-            if len(eval_index) > 0:
-                eval_weights = target_weights.reindex(eval_index)
-                eval_weights.iloc[0] = target_weights.ffill().reindex(eval_index).iloc[0]
-                target_weights = eval_weights
-                eval_universe = {sym: df.loc[eval_index] for sym, df in universe.items()}
+    eval_index = master_calendar[master_calendar >= effective_start]
+    eval_universe = _slice_universe_for_range(universe, eval_index)
+    eval_symbols = list(eval_universe.keys())
+    if len(eval_index) > 0 and len(eval_index) < len(target_weights):
+        eval_weights = target_weights.reindex(index=eval_index, columns=eval_symbols)
+        eval_weights.iloc[0] = target_weights.ffill().reindex(index=eval_index, columns=eval_symbols).iloc[0]
+        target_weights = eval_weights
+    else:
+        target_weights = target_weights.reindex(index=eval_index, columns=eval_symbols)
 
     result = run_allocation_backtest(
         eval_universe, target_weights,
@@ -186,13 +265,13 @@ def run_standard(universe: dict, template, params: dict, args) -> dict:
 
 
 def run_walkforward(universe: dict, template, params: dict, args) -> list:
-    aligned = _align_universe(universe)
-    if not aligned:
-        raise ValueError("Universe alignment resulted in empty data.")
+    master_calendar, effective_start = _resolve_master_calendar(
+        universe, getattr(args, "start", None), getattr(args, "end", None), min_coverage=0.20
+    )
+    if master_calendar.empty:
+        raise ValueError("Master calendar has no valid trading dates.")
 
-    any_df = next(iter(aligned.values()))
-    n_bars = len(any_df)
-
+    n_bars = len(master_calendar)
     window_bars = _resolve_window_bars(args.window_years)
     step_bars = int(round(args.step_years * 252))
 
@@ -208,7 +287,14 @@ def run_walkforward(universe: dict, template, params: dict, args) -> list:
             f"step_years={args.step_years}); a non-positive step would never advance "
             f"past the first fold, hanging the walk-forward loop forever."
         )
-    if window_bars >= n_bars:
+
+    base_start_idx = 0
+    if effective_start is not None and master_calendar[0] < effective_start:
+        locs = np.flatnonzero(master_calendar >= effective_start)
+        if len(locs) > 0:
+            base_start_idx = int(locs[0])
+
+    if window_bars >= n_bars or window_bars > (n_bars - base_start_idx):
         raise ValueError("Window size is larger than the available data.")
 
     # Lookback indicators (e.g. InverseVolatility's realized_vol,
@@ -229,14 +315,6 @@ def run_walkforward(universe: dict, template, params: dict, args) -> list:
             "rebalance_report": pd.DataFrame(columns=REBALANCE_REPORT_COLUMNS),
         }
 
-    base_start_idx = 0
-    if getattr(args, "start", None):
-        start_ts = pd.Timestamp(args.start)
-        if any_df.index[0] < start_ts:
-            locs = np.flatnonzero(any_df.index >= start_ts)
-            if len(locs) > 0:
-                base_start_idx = int(locs[0])
-
     total_folds = 0
     s_idx = base_start_idx
     while s_idx + window_bars <= n_bars:
@@ -251,54 +329,59 @@ def run_walkforward(universe: dict, template, params: dict, args) -> list:
         end_idx = start_idx + window_bars
         buffer_start_idx = max(0, start_idx - warmup_bars)
 
-        buffered_universe = {sym: df.iloc[buffer_start_idx:end_idx] for sym, df in aligned.items()}
-        eval_index = any_df.index[start_idx:end_idx]
+        fold_dates = master_calendar[buffer_start_idx:end_idx]
+        buffered_universe = _slice_universe_for_range(universe, fold_dates)
+        eval_index = master_calendar[start_idx:end_idx]
 
-        start_date = any_df.index[start_idx].strftime("%Y-%m-%d")
-        end_date = any_df.index[end_idx - 1].strftime("%Y-%m-%d")
+        start_date = master_calendar[start_idx].strftime("%Y-%m-%d")
+        end_date = master_calendar[end_idx - 1].strftime("%Y-%m-%d")
         print(f"[Fold {fold_idx}/{total_folds}] Evaluating {start_date} to {end_date}...", flush=True)
 
         try:
-            full_weights = template.generate_weights(buffered_universe, params)
-            if full_weights.empty:
+            if not buffered_universe:
                 fold_metrics = _nan_fold_metrics()
             else:
-                # Restrict to the eval window, but seed its first row with the
-                # carried-over (forward-filled) target as of the window's
-                # start -- otherwise a fold that starts between two
-                # buffer-period rebalances would open in all-cash instead of
-                # whatever the (now-warm) strategy actually held at that point.
-                eval_weights = full_weights.reindex(eval_index)
-                eval_weights.loc[eval_index[0]] = full_weights.ffill().reindex(eval_index).iloc[0]
-                eval_universe = {sym: df.loc[eval_index] for sym, df in aligned.items()}
-
-                result = run_allocation_backtest(
-                    eval_universe, eval_weights,
-                    initial_capital=args.initial_capital,
-                    commission_pct=args.commission_pct,
-                    slippage_pct=args.slippage_pct,
-                    min_shares=getattr(args, "min_shares", 1),
-                    china_trading=getattr(args, "china_trading", False),
-                    us_trading=getattr(args, "us_trading", False),
-                    hk_trading=getattr(args, "hk_trading", False),
-                )
-                if result["equity_curve"].empty:
+                full_weights = template.generate_weights(buffered_universe, params)
+                if full_weights.empty:
                     fold_metrics = _nan_fold_metrics()
                 else:
-                    # Same fields (and the same sign convention) run_standard
-                    # reports -- no separate recomputation, so the two modes
-                    # can't drift apart.
-                    fold_metrics = {
-                        "sharpe_ratio": result["sharpe_ratio"],
-                        "cagr": result["cagr"],
-                        "max_drawdown": result["max_drawdown"],
-                        "calmar_ratio": result["calmar_ratio"],
-                        "win_rate": result["win_rate"],
-                        "profit_factor": result["profit_factor"],
-                        "total_turnover": result["total_turnover"],
-                        "total_rebalances": result["total_rebalances"],
-                        "rebalance_report": result.get("rebalance_report", pd.DataFrame(columns=REBALANCE_REPORT_COLUMNS)),
-                    }
+                    # Restrict to the eval window, but seed its first row with the
+                    # carried-over (forward-filled) target as of the window's
+                    # start -- otherwise a fold that starts between two
+                    # buffer-period rebalances would open in all-cash instead of
+                    # whatever the (now-warm) strategy actually held at that point.
+                    eval_universe = _slice_universe_for_range(universe, eval_index)
+                    eval_symbols = list(eval_universe.keys())
+                    eval_weights = full_weights.reindex(index=eval_index, columns=eval_symbols)
+                    eval_weights.iloc[0] = full_weights.ffill().reindex(index=eval_index, columns=eval_symbols).iloc[0]
+
+                    result = run_allocation_backtest(
+                        eval_universe, eval_weights,
+                        initial_capital=args.initial_capital,
+                        commission_pct=args.commission_pct,
+                        slippage_pct=args.slippage_pct,
+                        min_shares=getattr(args, "min_shares", 1),
+                        china_trading=getattr(args, "china_trading", False),
+                        us_trading=getattr(args, "us_trading", False),
+                        hk_trading=getattr(args, "hk_trading", False),
+                    )
+                    if result["equity_curve"].empty:
+                        fold_metrics = _nan_fold_metrics()
+                    else:
+                        # Same fields (and the same sign convention) run_standard
+                        # reports -- no separate recomputation, so the two modes
+                        # can't drift apart.
+                        fold_metrics = {
+                            "sharpe_ratio": result["sharpe_ratio"],
+                            "cagr": result["cagr"],
+                            "max_drawdown": result["max_drawdown"],
+                            "calmar_ratio": result["calmar_ratio"],
+                            "win_rate": result["win_rate"],
+                            "profit_factor": result["profit_factor"],
+                            "total_turnover": result["total_turnover"],
+                            "total_rebalances": result["total_rebalances"],
+                            "rebalance_report": result.get("rebalance_report", pd.DataFrame(columns=REBALANCE_REPORT_COLUMNS)),
+                        }
         except Exception as e:
             print(f"Error in window {start_date} to {end_date}: {e}")
             fold_metrics = _nan_fold_metrics()
@@ -686,7 +769,10 @@ def main():
 
         baseline_result = None
         if args.baseline_symbol:
-            baseline_result, baseline_params = _run_baseline(args, cache_dir, data_kwargs)
+            main_calendar, _ = _resolve_master_calendar(universe, args.start, args.end, min_coverage=0.20)
+            baseline_result, baseline_params = _run_baseline(
+                args, cache_dir, data_kwargs, aligned_index=main_calendar
+            )
             comparison = _compute_standard_comparison(result, baseline_result)
 
             print(f"\n=== Baseline Comparison: {args.baseline_symbol} ({args.baseline_template}) ===")
@@ -764,8 +850,7 @@ def main():
         baseline_params = None
         baseline_calendar_mismatch = False
         if args.baseline_symbol:
-            main_aligned = _align_universe(universe)
-            main_calendar = next(iter(main_aligned.values())).index
+            main_calendar, _ = _resolve_master_calendar(universe, args.start, args.end, min_coverage=0.20)
             baseline_folds, baseline_params = _run_baseline(
                 args, cache_dir, data_kwargs, aligned_index=main_calendar
             )

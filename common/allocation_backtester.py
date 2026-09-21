@@ -159,7 +159,7 @@ def run_allocation_backtest(
     closes = closes.loc[common_idx]
     highs = highs.loc[common_idx]
     lows = lows.loc[common_idx]
-    sparse_weights = target_weights.loc[common_idx, symbols]
+    sparse_weights = target_weights.reindex(columns=symbols).loc[common_idx]
 
     # A row with ANY non-NaN value is an explicit rebalance instruction for
     # that date -- computed BEFORE forward-filling, since forward-filling (or
@@ -209,7 +209,7 @@ def run_allocation_backtest(
         if abs(target_w) > 1e-7:
             price = float(closes_arr[0, i])
             sym_min_shares = int(sym_min_shares_arr[i])
-            if price > 0:
+            if not np.isnan(price) and price > 0:
                 raw_shares = (abs(target_w) * initial_capital) / price
                 if sym_min_shares == 0:
                     target_s = raw_shares
@@ -304,7 +304,7 @@ def run_allocation_backtest(
                     continue
 
                 price = float(closes_arr[t, i])
-                if price <= 0:
+                if np.isnan(price) or not (price > 0):
                     continue
 
                 if china_trading:
@@ -372,7 +372,8 @@ def run_allocation_backtest(
             # lot-rounding buffer so minor rounding across symbols isn't choked, while
             # still blocking large-scale ghost leverage from suppressed sells.
             prior_market_exposure = float(np.sum(np.clip(drifted_w, 0.0, None)))
-            lot_buffer = float(np.dot(sym_min_shares_arr, closes_arr[t]))
+            valid_closes_t = np.nan_to_num(closes_arr[t], nan=0.0)
+            lot_buffer = float(np.dot(sym_min_shares_arr, valid_closes_t))
             avail_cash = max(0.0, (1.0 - prior_market_exposure) * pre_rebal_equity) + lot_buffer
 
             sells = [c for c in candidates if c["action"] == "SELL"]

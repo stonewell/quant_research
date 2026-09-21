@@ -165,17 +165,16 @@ def _aligned_master_index(universe: Dict[str, pd.DataFrame], risky_symbols: List
     share one exact trading calendar -- different listing dates, holiday
     calendars (e.g. international ETFs), or provider gaps can leave one
     symbol's index a few bars shorter/longer than another's even within the
-    same loaded universe. Now that `_get_risky_symbols` can return more than
-    one symbol by default (the basket behavior), every per-symbol raw-weight
-    array must be built and then aligned onto ONE common index before they
-    can be combined into a single DataFrame -- use the intersection of every
-    risky symbol's own index, the same alignment `backtester/run_backtest.py`'s
-    `_align_universe` already applies for walk-forward. For the (still common)
-    single-symbol case this is exactly that symbol's own index, unchanged."""
-    common_index = universe[risky_symbols[0]].index
-    for sym in risky_symbols[1:]:
-        common_index = common_index.intersection(universe[sym].index)
-    return common_index
+    same loaded universe. Build the master calendar from the sorted union
+    of all active trading dates across the non-empty risky symbols in the
+    universe. Symbols without bars on a given date reindex to NaN / 0.0 weight
+    until they have bars for the current trading range."""
+    non_empty = [s for s in risky_symbols if s in universe and not universe[s].empty]
+    if not non_empty:
+        return pd.DatetimeIndex([])
+    if len(non_empty) == 1:
+        return universe[non_empty[0]].index
+    return pd.DatetimeIndex(sorted(set().union(*(universe[s].index for s in non_empty))))
 
 
 def _rsi_signal(rsi_value: float, in_position: bool, entry_threshold: float, exit_threshold: float) -> int:

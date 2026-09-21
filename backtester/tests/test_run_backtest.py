@@ -27,7 +27,9 @@ from backtester.run_backtest import (
     _compute_standard_comparison,
     _merge_baseline_folds,
     _resolve_baseline_params,
+    _resolve_master_calendar,
     _run_baseline,
+    _slice_universe_for_range,
     build_arg_parser,
     main,
     run_standard,
@@ -1463,3 +1465,83 @@ def test_main_optimize_research_strategy_spec_empty_param_grid(tmp_path, monkeyp
     assert report["best_params"] == {}
     assert report["original_params"] == {}
     assert os.path.exists(results_dir / "backtest_equity.csv")
+
+
+def test_resolve_master_calendar_20pct_rule():
+    # Universe of 10 assets:
+    # Asset 0 starts on 2020-01-01
+    # Asset 1 starts on 2020-02-03 (10% on 2020-01-01, 20% reached on 2020-02-03: 2/10 = 20%)
+    # Assets 2..9 start on 2020-03-02
+    idx1 = pd.bdate_range("2020-01-01", "2020-04-01")
+    idx2 = pd.bdate_range("2020-02-03", "2020-04-01")
+    idx_rest = pd.bdate_range("2020-03-02", "2020-04-01")
+    universe = {
+        "A0": make_df(np.ones(len(idx1)), start=str(idx1[0].date())),
+        "A1": make_df(np.ones(len(idx2)), start=str(idx2[0].date())),
+    }
+    for i in range(2, 10):
+        universe[f"A{i}"] = make_df(np.ones(len(idx_rest)), start=str(idx_rest[0].date()))
+
+    # Case 1: Start date requested as 2020-01-01 -> should warn and move to 2020-02-03 (where 20% coverage is reached)
+    with pytest.warns(UserWarning, match=r"precedes earliest date where at least 20% of universe assets"):
+        cal, eff_start = _resolve_master_calendar(universe, start="2020-01-01")
+    assert eff_start == idx2[0]
+    assert cal[0] == idx2[0]
+
+    # Case 2: Start date requested as 2020-02-15 -> after 2020-02-03, no warning, eff_start is 2020-02-15
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        cal2, eff_start2 = _resolve_master_calendar(universe, start="2020-02-15")
+    assert eff_start2 == pd.Timestamp("2020-02-15")
+    # cal2 still includes pre-buffered dates from 2020-02-03 for warmup
+    assert cal2[0] == idx2[0]
+
+
+def test_slice_universe_for_range_temporary_removal():
+    idx1 = pd.bdate_range("2020-01-01", periods=50)
+    idx2 = pd.bdate_range("2020-03-15", periods=50)  # starts later, after idx1 ends
+    universe = {
+        "A": make_df(np.ones(len(idx1)), start=str(idx1[0].date())),
+        "B": make_df(np.ones(len(idx2)), start=str(idx2[0].date())),
+    }
+
+    # Range covering only idx1
+    range1 = idx1[:20]
+    sliced1 = _slice_universe_for_range(universe, range1)
+    assert "A" in sliced1
+    assert "B" not in sliced1  # temporarily removed!
+    assert len(sliced1["A"]) == 20
+
+    # Range covering idx2
+    range2 = idx2[:20]
+    sliced2 = _slice_universe_for_range(universe, range2)
+    assert "A" not in sliced2  # temporarily removed!
+    assert "B" in sliced2
+    assert len(sliced2["B"]) == 20
+
+
+def test_run_walkforward_dynamic_universe_with_late_listed_symbol():
+    # Universe of 5 assets:
+    # Assets 0..3 have 252 bars (1 year)
+    # Asset 4 lists halfway through (at bar 126)
+    idx_full = pd.bdate_range("2020-01-01", periods=252)
+    idx_late = idx_full[126:]
+    universe = {}
+    for i in range(4):
+        universe[f"A{i}"] = make_df(np.linspace(100, 200, 252), start="2020-01-01")
+    universe["LATE"] = make_df(np.linspace(50, 100, len(idx_late)), start=str(idx_late[0].date()))
+
+    template = get_template("equal_weight")
+    params = {"rebalance_freq_days": 10}
+    # 0.25 year window, 0.25 year step -> 4 folds
+    args = MockArgs(window_years=0.25, step_years=0.25, start="2020-01-01")
+
+    folds = run_walkforward(universe, template, params, args)
+    # Must evaluate all folds cleanly without truncating early folds!
+    assert len(folds) >= 3
+    # Check that Fold 0 (where LATE has no bars) ran successfully with finite metrics
+    assert np.isfinite(folds[0]["sharpe_ratio"])
+    assert folds[0]["total_rebalances"] > 0
+    # Fold where LATE is trading should also run successfully
+    assert np.isfinite(folds[-1]["sharpe_ratio"])
+    assert folds[-1]["total_rebalances"] > 0
