@@ -14,6 +14,7 @@ Example:
 """
 
 import argparse
+import copy
 import json
 import os
 import sys
@@ -426,10 +427,20 @@ def _run_baseline(args, cache_dir, data_kwargs, aligned_index=None):
             )
         baseline_universe = {sym: df.loc[common] for sym, df in baseline_universe.items()}
 
+    baseline_args = copy.copy(args)
+    # The baseline represents an unconstrained market benchmark portfolio (e.g. 000300.SH, SPY, ^GSPC).
+    # It must not be constrained by discrete equity board lots (e.g. min_shares=100 under china_trading)
+    # or market circuit breakers / T+1 / stamp duty, which would prevent an index priced at thousands
+    # of points from executing trades or cause artificial cash drag / 0-share execution.
+    baseline_args.min_shares = 0
+    baseline_args.china_trading = False
+    baseline_args.us_trading = False
+    baseline_args.hk_trading = False
+
     if args.mode == "standard":
-        baseline_out = run_standard(baseline_universe, baseline_template, baseline_params, args)
+        baseline_out = run_standard(baseline_universe, baseline_template, baseline_params, baseline_args)
     else:
-        baseline_out = run_walkforward(baseline_universe, baseline_template, baseline_params, args)
+        baseline_out = run_walkforward(baseline_universe, baseline_template, baseline_params, baseline_args)
 
     return baseline_out, baseline_params
 

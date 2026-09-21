@@ -133,11 +133,11 @@ def run_allocation_backtest(
         min_shares = 100
     elif hk_trading and min_shares == 1:
         min_shares = 100
-    elif us_trading:
+    elif us_trading and min_shares != 0:
         min_shares = 1
 
-    if isinstance(min_shares, bool) or not isinstance(min_shares, (int, np.integer)) or min_shares < 1:
-        raise ValueError(f"min_shares must be an integer >= 1, got {min_shares!r}")
+    if isinstance(min_shares, bool) or not isinstance(min_shares, (int, np.integer)) or min_shares < 0:
+        raise ValueError(f"min_shares must be an integer >= 0, got {min_shares!r}")
 
     symbols = list(universe.keys())
     if not symbols or target_weights.empty:
@@ -182,7 +182,7 @@ def run_allocation_backtest(
     lows_arr = lows.to_numpy(dtype=float)
 
     china_limit_pcts = np.array([_get_china_price_limit(s) for s in symbols], dtype=float) if china_trading else None
-    sym_min_shares_arr = np.array([_get_hk_board_lot(s, min_shares) for s in symbols], dtype=int) if hk_trading else np.full(len(symbols), min_shares, dtype=int)
+    sym_min_shares_arr = np.array([_get_hk_board_lot(s, min_shares) for s in symbols], dtype=int) if (hk_trading and min_shares > 0) else np.full(len(symbols), min_shares, dtype=int)
 
     # State tracking
     equity = np.zeros(n_days)
@@ -211,14 +211,19 @@ def run_allocation_backtest(
             sym_min_shares = int(sym_min_shares_arr[i])
             if price > 0:
                 raw_shares = (abs(target_w) * initial_capital) / price
-                # round() before int() prevents IEEE 754 float truncation
-                # (e.g. 99.99999999997 → 99 → 0 lots instead of 100).
-                rounded_s = int(round(raw_shares, 6))
-                target_s = (rounded_s // sym_min_shares) * sym_min_shares if sym_min_shares > 1 else rounded_s
+                if sym_min_shares == 0:
+                    target_s = raw_shares
+                elif sym_min_shares > 1:
+                    rounded_s = int(round(raw_shares, 6))
+                    target_s = (rounded_s // sym_min_shares) * sym_min_shares
+                else:
+                    rounded_s = int(round(raw_shares, 6))
+                    target_s = rounded_s
             else:
-                target_s = 0
+                target_s = 0.0
 
-            if target_s >= sym_min_shares:
+            should_trade = (target_s > 1e-9) if sym_min_shares == 0 else (target_s >= sym_min_shares)
+            if should_trade:
                 trade_s = target_s
                 held_s = trade_s if target_w >= 0 else -trade_s
                 held_shares[sym] = held_s
@@ -329,9 +334,18 @@ def run_allocation_backtest(
                 else:
                     raw_val = abs(delta_w) * pre_rebal_equity
                     raw_s = raw_val / price
-                    rounded_s = int(round(raw_s, 6))
-                    trade_s = (rounded_s // sym_min_shares) * sym_min_shares if sym_min_shares > 1 else rounded_s
-                    if trade_s < sym_min_shares:
+                    if sym_min_shares == 0:
+                        trade_s = raw_s
+                    elif sym_min_shares > 1:
+                        rounded_s = int(round(raw_s, 6))
+                        trade_s = (rounded_s // sym_min_shares) * sym_min_shares
+                    else:
+                        rounded_s = int(round(raw_s, 6))
+                        trade_s = rounded_s
+
+                    if sym_min_shares > 0 and trade_s < sym_min_shares:
+                        continue
+                    if sym_min_shares == 0 and trade_s <= 1e-9:
                         continue
                     action = "BUY" if delta_w > 0 else "SELL"
 
@@ -411,10 +425,19 @@ def run_allocation_backtest(
                 sym = c["symbol"]
                 price = c["price"]
                 sym_min_shares = c.get("sym_min_shares", min_shares)
-                max_affordable_s = int(round(avail_cash / price, 6))
-                max_lots_s = (max_affordable_s // sym_min_shares) * sym_min_shares if sym_min_shares > 1 else max_affordable_s
+                if sym_min_shares == 0:
+                    max_affordable_s = avail_cash / price
+                    max_lots_s = max_affordable_s
+                elif sym_min_shares > 1:
+                    max_affordable_s = int(round(avail_cash / price, 6))
+                    max_lots_s = (max_affordable_s // sym_min_shares) * sym_min_shares
+                else:
+                    max_affordable_s = int(round(avail_cash / price, 6))
+                    max_lots_s = max_affordable_s
                 trade_s = min(c["trade_s"], max_lots_s)
-                if trade_s < sym_min_shares:
+                if sym_min_shares > 0 and trade_s < sym_min_shares:
+                    continue
+                if sym_min_shares == 0 and trade_s <= 1e-9:
                     continue
                 new_s = c["prior_s"] + trade_s
                 trade_val = float(trade_s * price)

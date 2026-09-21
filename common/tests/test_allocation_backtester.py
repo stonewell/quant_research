@@ -270,17 +270,35 @@ def test_invalid_min_shares_raises_value_error():
     universe = {"A": make_df([100.0] * 5)}
     target_weights = pd.DataFrame(0.5, index=pd.bdate_range("2020-01-01", periods=5), columns=["A"])
 
-    with pytest.raises(ValueError, match="min_shares must be an integer >= 1"):
-        run_allocation_backtest(universe, target_weights, min_shares=0)
+    with pytest.raises(ValueError, match="min_shares must be an integer >= 0"):
+        run_allocation_backtest(universe, target_weights, min_shares=-1)
 
-    with pytest.raises(ValueError, match="min_shares must be an integer >= 1"):
+    with pytest.raises(ValueError, match="min_shares must be an integer >= 0"):
         run_allocation_backtest(universe, target_weights, min_shares=-10)
 
-    with pytest.raises(ValueError, match="min_shares must be an integer >= 1"):
+    with pytest.raises(ValueError, match="min_shares must be an integer >= 0"):
         run_allocation_backtest(universe, target_weights, min_shares="1")
 
-    with pytest.raises(ValueError, match="min_shares must be an integer >= 1"):
+    with pytest.raises(ValueError, match="min_shares must be an integer >= 0"):
         run_allocation_backtest(universe, target_weights, min_shares=True)
+
+
+def test_min_shares_zero_enables_fractional_trading():
+    import pytest
+    # min_shares=0 allows fractional / unconstrained trading (e.g. for benchmark index backtests)
+    universe = {"A": make_df([3000.0] * 5)}
+    idx = pd.bdate_range("2020-01-01", periods=5)
+    target_weights = pd.DataFrame(np.nan, index=idx, columns=["A"])
+    target_weights.iloc[0] = [1.0]
+
+    # With initial_capital=100k and price=3000:
+    # If min_shares=100 was required, 100*3000 = 300k > 100k -> 0 shares bought!
+    # With min_shares=0, fractional shares 100,000 / 3,000 = 33.3333 shares are bought.
+    result = run_allocation_backtest(universe, target_weights, initial_capital=100_000.0, min_shares=0, commission_pct=0.0, slippage_pct=0.0)
+    trades = result["rebalance_report"]
+    assert len(trades) == 1
+    assert np.isclose(trades.iloc[0]["shares"], 100_000.0 / 3000.0)
+    assert result["equity_curve"].iloc[-1]["equity"] == pytest.approx(100_000.0)
 
 
 def test_min_shares_prevents_ghost_leverage_on_suppressed_sell():
