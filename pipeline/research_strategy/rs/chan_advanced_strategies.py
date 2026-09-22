@@ -1253,6 +1253,7 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
         breadth_lookback = int(p.get("crb_breadth_lookback", getattr(cfg, "crb_breadth_lookback", 50)))
         breadth_bull_thresh = float(p.get("crb_breadth_bull_thresh", getattr(cfg, "crb_breadth_bull_thresh", 0.50)))
         target_bull_exposure = float(p.get("crb_target_bull_exposure", getattr(cfg, "crb_target_bull_exposure", 0.80)))
+        bull_max_pos = float(p.get("crb_bull_max_single_position", getattr(cfg, "crb_bull_max_single_position", 0.30)))
 
         tot_w = comp_w + three_w + vaa_w
         if tot_w > 0:
@@ -1373,20 +1374,23 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
 
             # Dynamic Cash Deployment: when breadth is bullish and no circuit breaker is active,
             # scale up high-conviction active risky holdings up to target_bull_exposure
+            # and dynamically expand the single-position cap from max_single_pos to bull_max_pos.
+            effective_cap = max_single_pos
             if not is_emergency and dynamic_cash:
                 breadth = float(daily_breadth.iloc[t])
                 if breadth >= breadth_bull_thresh:
+                    breadth_factor = np.clip((breadth - breadth_bull_thresh) / max(0.01, 0.75 - breadth_bull_thresh), 0.0, 1.0)
+                    target_exp = min(target_bull_exposure, 0.60 + breadth_factor * (target_bull_exposure - 0.60))
+                    effective_cap = min(bull_max_pos, max_single_pos * (1.0 + 0.50 * breadth_factor)) if bull_max_pos > max_single_pos else max_single_pos
+
                     active_risky = [s for s in risky_symbols if raw_w[s] > 1e-6]
                     tot_active = float(raw_w[active_risky].sum())
-                    if tot_active > 0:
-                        breadth_factor = np.clip((breadth - breadth_bull_thresh) / max(0.01, 0.80 - breadth_bull_thresh), 0.0, 1.0)
-                        target_exp = min(target_bull_exposure, 0.60 + breadth_factor * (target_bull_exposure - 0.60))
-                        if target_exp > tot_active:
-                            scale = target_exp / tot_active
-                            raw_w[active_risky] = (raw_w[active_risky] * scale).clip(upper=max_single_pos)
+                    if tot_active > 0 and target_exp > tot_active:
+                        scale = target_exp / tot_active
+                        raw_w[active_risky] = (raw_w[active_risky] * scale).clip(upper=effective_cap)
 
-            # Apply hard position cap per risky symbol
-            risky_w = raw_w[risky_symbols].copy().clip(lower=0.0, upper=max_single_pos)
+            # Apply hard position cap per risky symbol (dynamically expanded in bull breadth)
+            risky_w = raw_w[risky_symbols].copy().clip(lower=0.0, upper=effective_cap)
 
             # Ensure total risky allocation <= 1.0
             tot_risky = float(risky_w.sum())

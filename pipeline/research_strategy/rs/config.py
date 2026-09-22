@@ -520,6 +520,7 @@ class StrategyConfig:
     crb_breadth_lookback: int = 50           # lookback window for breadth SMA
     crb_breadth_bull_thresh: float = 0.50    # breadth threshold for deploying idle cash
     crb_target_bull_exposure: float = 0.80   # target equity exposure in bull breadth regime
+    crb_bull_max_single_position: float = 0.30 # dynamically expanded single-stock cap in bull breadth (defaults to 0.30)
 
     # --- Price Action Breakout & Retest Strategy (docs/chan_similar_trading.md Strategy 1) ---
     pabr_box_window: int = 20                # consolidation box length (~4 weeks)
@@ -734,6 +735,8 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.crb_breadth_bull_thresh must be between 0 and 1, got {self.crb_breadth_bull_thresh}")
         if self.crb_breadth_lookback <= 0:
             raise ValueError(f"StrategyConfig.crb_breadth_lookback must be > 0, got {self.crb_breadth_lookback}")
+        if not (0.0 < self.crb_bull_max_single_position <= 1.0):
+            raise ValueError(f"StrategyConfig.crb_bull_max_single_position must be between 0 and 1, got {self.crb_bull_max_single_position}")
 
     @classmethod
     def from_dict(cls, data: dict) -> "StrategyConfig":

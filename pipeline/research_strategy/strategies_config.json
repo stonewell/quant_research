@@ -291,6 +291,7 @@
       "crb_breadth_lookback": 50,
       "crb_breadth_bull_thresh": 0.50,
       "crb_target_bull_exposure": 0.80,
+      "crb_bull_max_single_position": 0.30,
       "cash_proxy": "BIL"
     },
     "factors": ["regime_trend_strength", "absolute_momentum_trend", "relative_momentum", "volatility_targeting"]

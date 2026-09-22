@@ -569,10 +569,10 @@ def test_chan_risk_managed_blend_execution_and_constraints():
     if not non_rebal.empty:
         assert non_rebal.isna().all().all()
 
-    # Test position capping constraint: no individual risky stock > crb_max_single_position (0.20)
+    # Test position capping constraint: no individual risky stock > max position cap (crb_bull_max_single_position = 0.30)
     rebal_df = weights.loc[rebal_dates]
     risky_df = rebal_df.drop(columns=["BIL"], errors="ignore")
-    assert (risky_df > 0.2000001).sum().sum() == 0
+    assert (risky_df > cfg.crb_bull_max_single_position + 1e-6).sum().sum() == 0
 
     # Test leverage constraint: sum of risky weights <= 1.0
     assert (risky_df.sum(axis=1) <= 1.000001).all()
@@ -759,8 +759,8 @@ def test_chan_risk_managed_blend_dynamic_cash_deployment():
     assert not rebal_dyn.empty
 
     risky_dyn = rebal_dyn.drop(columns=["BIL"], errors="ignore")
-    # Rule 1: No single stock ever exceeds max_single_position (0.20)
-    assert (risky_dyn <= 0.200001).all().all(), f"Found weights > 0.20:\n{risky_dyn[risky_dyn > 0.20].dropna(how='all')}"
+    # Rule 1: Dynamic mode scales up to crb_bull_max_single_position (0.30)
+    assert (risky_dyn <= cfg_dynamic.crb_bull_max_single_position + 1e-5).all().all(), f"Found weights > {cfg_dynamic.crb_bull_max_single_position}:\n{risky_dyn[risky_dyn > cfg_dynamic.crb_bull_max_single_position].dropna(how='all')}"
 
     # Rule 2: Rows sum to 1.0 with BIL
     assert np.allclose(rebal_dyn.sum(axis=1), 1.0, atol=1e-5)
@@ -777,6 +777,8 @@ def test_chan_risk_managed_blend_dynamic_cash_deployment():
     rebal_static = weights_static.dropna(how="all")
 
     risky_static = rebal_static.drop(columns=["BIL"], errors="ignore")
+    # Static mode without dynamic cash deployment strictly respects crb_max_single_position (0.20)
+    assert (risky_static <= 0.200001).all().all()
 
     # Common rebalance dates
     common_idx = rebal_dyn.index.intersection(rebal_static.index)
@@ -791,3 +793,29 @@ def test_chan_risk_managed_blend_dynamic_cash_deployment():
     active_days = common_idx[stat_risky_sum > 0.05]
     if len(active_days) > 0:
         assert (dyn_risky_sum.loc[active_days] >= stat_risky_sum.loc[active_days] - 1e-4).all()
+
+
+def test_chan_risk_managed_blend_bull_position_cap_expansion():
+    """Verify that specifying crb_bull_max_single_position > crb_max_single_position
+    allows positions to scale up to the expanded cap in bull breadth regimes."""
+    universe = create_mock_universe(n_days=400)
+    cfg_expanded = StrategyConfig(
+        crb_dynamic_cash_deployment=True,
+        crb_breadth_lookback=50,
+        crb_breadth_bull_thresh=0.50,
+        crb_target_bull_exposure=0.80,
+        crb_max_single_position=0.20,
+        crb_bull_max_single_position=0.30,
+        crb_min_weight_change=0.04,
+        cash_proxy="BIL",
+    )
+    strat_expanded = ChanRiskManagedBlendStrategy(cfg_expanded)
+    weights = strat_expanded.generate_weights(universe)
+    rebal_df = weights.dropna(how="all")
+    assert not rebal_df.empty
+
+    risky_df = rebal_df.drop(columns=["BIL"], errors="ignore")
+    # Weights should respect the expanded 0.30 cap
+    assert (risky_df <= 0.300001).all().all()
+    # At least some rebalance row should have taken advantage of the expanded cap (> 0.20)
+    assert (risky_df > 0.200001).sum().sum() > 0
