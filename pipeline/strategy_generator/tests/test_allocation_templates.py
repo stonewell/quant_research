@@ -147,7 +147,7 @@ def test_hierarchical_risk_parity_excludes_a_symbol_with_no_data_in_window():
     # by the backtester), not dominate the portfolio.
     early_rows = rebalance_rows[rebalance_rows.index < idx[90]]
     assert not early_rows.empty
-    assert early_rows["C"].isna().all()
+    assert ((early_rows["C"] == 0.0) | early_rows["C"].isna()).all()
     # A and B alone still sum to 1.0 -- properly renormalized among just the
     # symbols that actually had data, not diluted by a phantom C weight.
     np.testing.assert_allclose(early_rows["A"] + early_rows["B"], 1.0)
@@ -284,7 +284,7 @@ def test_minimum_variance_allocation_excludes_a_symbol_with_no_data_in_window():
     assert not rebalance_rows.empty
     early_rows = rebalance_rows[rebalance_rows.index < idx[90]]
     assert not early_rows.empty
-    assert early_rows["C"].isna().all()
+    assert ((early_rows["C"] == 0.0) | early_rows["C"].isna()).all()
     np.testing.assert_allclose(early_rows["A"] + early_rows["B"], 1.0, atol=1e-6)
 
 

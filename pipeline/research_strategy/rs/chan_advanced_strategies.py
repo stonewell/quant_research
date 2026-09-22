@@ -1197,8 +1197,8 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
     Chan strategies with strict institutional risk management and turnover controls:
 
     1. Core Sub-Strategy Allocation:
-       - 50% `ChanCompositeStrategy` (Rank 1: multi-stage B1/B2/B3 position scaling, most consistent)
-       - 30% `ChanThreeTypeStrategy` (Rank 2: segment-level pivot structural alpha)
+       - 45% `ChanCompositeStrategy` (Rank 1: multi-stage B1/B2/B3 position scaling, most consistent)
+       - 35% `ChanThreeTypeStrategy` (Rank 2: segment-level pivot structural alpha)
        - 20% `ChanVaaCompoundStrategy` (Rank 3: dual-momentum regime crash protection buffer)
 
     2. Key Trading Rules & Risk Controls:

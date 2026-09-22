@@ -2,7 +2,7 @@
 
 # 量化交易策略研究 (`research_strategy`)
 
-一个专门的子项目，实现并评估 39 种量化交易策略：从学术文献与从业者研究（*Journal of Finance*、*Journal of Portfolio Management*、SSRN、AllocateSmartly）中综合而成的战术资产配置 (TAA) 策略；单资产择时策略；Donchian 通道突破系统；现代热门静态/固定权重组合（永久组合、黄金蝴蝶、全天候、HFEA）；布林带通道突破与均值回归；残差动量与自适应快速扩张；涵盖 12 种策略的完整缠论结构分析体系（缠中说禅：笔中枢移动、三类买卖点、MACD 背驰、多周期趋势共振、三买回抽、均值回归背驰、多阶段复合阶梯建仓、最优选择器元策略、VAA 复合防御、中枢震荡监视器、斐波那契均线板块轮动）；宏观政体因子自适应复合引擎；以及采用核心-卫星配置架构的机构级多策略 Alpha 账簿 (`MultiStrategyAlphaBookStrategy`)。
+一个专门的子项目，实现并评估 43 种量化交易策略：从学术文献与从业者研究（*Journal of Finance*、*Journal of Portfolio Management*、SSRN、AllocateSmartly）中综合而成的战术资产配置 (TAA) 策略；单资产择时策略；Donchian 通道突破系统；现代热门静态/固定权重组合（永久组合、黄金蝴蝶、全天候、HFEA）；布林带通道突破与均值回归；残差动量与自适应快速扩张；涵盖 16 种策略的完整缠论及类似结构分析体系（缠中说禅：笔中枢移动、三类买卖点、MACD 背驰、多周期趋势共振、三买回抽、均值回归背驰、多阶段复合阶梯建仓、最优选择器元策略、风控混合策略、VAA 复合防御、中枢震荡监视器、斐波那契均线板块轮动，以及裸K形态回踩确认、成交量分布POC迁移与三浪斐波那契扩展）；宏观政体因子自适应复合引擎；以及采用核心-卫星配置架构的机构级多策略 Alpha 账簿 (`MultiStrategyAlphaBookStrategy`)。
 
 ---
 
@@ -178,14 +178,15 @@
 ## 4. 目录结构
 
 ```
-apps/quant/research_strategy/
+pipeline/research_strategy/
 ├── rs/
 │   ├── __init__.py
 │   ├── config.py                         # StrategyConfig & load_strategies_config()
 │   ├── nl_parser.py                      # 自然语言描述 -> ParsedStrategySpec
 │   ├── chan_structure.py                 # 独立缠论结构检测器（分型/笔/枢轴）
 │   ├── chan_signals.py                   # 增量扩展：线段、真实 MACD 背驰、一/二/三类买卖点
-│   ├── chan_advanced_strategies.py       # 高级缠论策略集（多周期共振、三买回抽、均值回归、阶梯复合、VAA 复合、最优选择）
+│   ├── chan_advanced_strategies.py       # 高级缠论策略集（多周期共振、三买回抽、均值回归、阶梯复合、风控混合、VAA 复合、最优选择）
+│   ├── chan_similar_strategies.py        # 缠论类似模型（裸K形态回踩确认、成交量分布POC迁移、三浪斐波那契扩展）
 │   ├── chan_lesson_strategies.py         # 缠论教程拓展策略（中枢震荡监视器、斐波那契均线板块轮动）
 │   ├── taa_strategies.py                 # 拓展战术资产配置策略（PAA、AAA、HAA、DAA）
 │   ├── bollinger_strategy.py             # 布林带突破（方法一）与均值回归（方法三）
@@ -195,7 +196,7 @@ apps/quant/research_strategy/
 │   ├── multi_strategy_alpha_book.py      # 机构级多策略 Alpha 账簿（最优核心-卫星蓝图）
 │   ├── timing_aspects.py                 # 单资产择时模板的入场 x 出场/风控要素分解
 │   └── strategy.py                       # NaturalLanguageStrategy 引擎与策略实现
-├── strategies_config.json                # 包含 39 个策略和参数的中央 JSON 配置
+├── strategies_config.json                # 包含 43 个策略和参数的中央 JSON 配置
 ├── run_research_strategy.py              # 动态加载策略配置的 CLI 运行器
 ├── dashboard.py                          # 终端 ASCII 报告查看器
 ├── tests/
@@ -203,6 +204,7 @@ apps/quant/research_strategy/
 │   ├── test_chan_structure.py            # 缠论结构检测器的离线单元测试
 │   ├── test_chan_signals.py              # 线段/MACD 背驰/三类买卖点的离线单元测试
 │   ├── test_chan_advanced_strategies.py  # 高级缠论策略的离线单元测试
+│   ├── test_chan_similar_strategies.py   # 缠论类似策略的离线单元测试
 │   ├── test_chan_lesson_strategies.py    # 缠论教程策略的离线单元测试
 │   ├── test_timing_aspects.py            # 入场 x 出场要素组合的离线单元测试
 │   ├── test_strategy.py                  # 策略实现与配置加载的离线单元测试

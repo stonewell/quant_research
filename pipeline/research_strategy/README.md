@@ -2,7 +2,7 @@
 
 # Researched Quantitative Trading Strategies (`research_strategy`)
 
-A dedicated side project implementing and evaluating thirty-nine quantitative trading strategies: tactical asset allocation (TAA) strategies synthesized from academic literature and practitioner research (*Journal of Finance*, *Journal of Portfolio Management*, SSRN, AllocateSmartly), single-asset timing strategies, Donchian channel breakout systems, modern static/fixed-weight portfolios (Permanent Portfolio, Golden Butterfly, All Weather, HFEA), Bollinger band systems, residual momentum, adaptive fast expansion, an extensive 12-strategy Chan structural analysis suite (缠中说禅: pivot shift, three-type points, MACD divergence, multi-timeframe trend, third buy, mean reversion divergence, composite multi-stage, best selector, VAA compound, pivot oscillation, Fibonacci sector strength), macro regime factor compounders, and an institutional Multi-Strategy Alpha Book engine with optimal Core-Satellite allocation.
+A dedicated side project implementing and evaluating forty-three (43) quantitative trading strategies: tactical asset allocation (TAA) strategies synthesized from academic literature and practitioner research (*Journal of Finance*, *Journal of Portfolio Management*, SSRN, AllocateSmartly), single-asset timing strategies, Donchian channel breakout systems, modern static/fixed-weight portfolios (Permanent Portfolio, Golden Butterfly, All Weather, HFEA), Bollinger band systems, residual momentum, adaptive fast expansion, an extensive Chan structural analysis suite (缠中说禅: pivot shift, three-type points, MACD divergence, multi-timeframe trend, third buy, mean reversion divergence, composite multi-stage, best selector, risk-managed blend, VAA compound, pivot oscillation, Fibonacci sector strength, plus Price Action, Volume Profile POC, and Wave 3 Fibonacci models), macro regime factor compounders, and an institutional Multi-Strategy Alpha Book engine with optimal Core-Satellite allocation.
 
 ---
 
@@ -263,14 +263,15 @@ All CLI runs and unit tests execute strictly against **synthetic multi-asset OHL
 ## 4. Directory Structure
 
 ```
-apps/quant/research_strategy/
+pipeline/research_strategy/
 ├── rs/
 │   ├── __init__.py
 │   ├── config.py                         # StrategyConfig & load_strategies_config()
 │   ├── nl_parser.py                      # Plain-English strategy description -> ParsedStrategySpec
 │   ├── chan_structure.py                 # Independent Chan-theory structure detector (fractals/strokes/pivots)
 │   ├── chan_signals.py                   # Segments, real MACD divergence, 一/二/三类买卖点
-│   ├── chan_advanced_strategies.py       # Advanced Chan suite (MTF, Third Buy, Mean Reversion, Composite, VAA Compound, Best Selector)
+│   ├── chan_advanced_strategies.py       # Advanced Chan suite (MTF, Third Buy, Mean Reversion, Composite, Risk-Managed Blend, VAA Compound, Best Selector)
+│   ├── chan_similar_strategies.py        # Chan-similar models (Price Action Breakout Retest, Volume Profile POC Migration, Wave 3 Fibonacci)
 │   ├── chan_lesson_strategies.py         # Chan lesson strategies (Pivot Oscillation, Fibonacci Sector Strength)
 │   ├── taa_strategies.py                 # Extended TAA strategies (PAA, AAA, HAA, DAA)
 │   ├── bollinger_strategy.py             # Bollinger breakout (Method I) and mean reversion (Method III)
@@ -280,7 +281,7 @@ apps/quant/research_strategy/
 │   ├── multi_strategy_alpha_book.py      # Institutional Multi-Strategy Alpha Book (Optimal Core-Satellite Blueprint)
 │   ├── timing_aspects.py                 # Entry x exit/risk aspect decomposition for single-asset timing templates
 │   └── strategy.py                       # NaturalLanguageStrategy engine + consolidated strategy implementations
-├── strategies_config.json                # Central JSON configuration for 39 strategies & parameters
+├── strategies_config.json                # Central JSON configuration for 43 strategies & parameters
 ├── run_research_strategy.py              # CLI runner loading strategy configs dynamically
 ├── dashboard.py                          # Terminal ASCII report viewer
 ├── tests/
@@ -288,6 +289,7 @@ apps/quant/research_strategy/
 │   ├── test_chan_structure.py            # Offline unit tests for the Chan structure detector
 │   ├── test_chan_signals.py              # Offline unit tests for segments/MACD divergence/三类买卖点
 │   ├── test_chan_advanced_strategies.py  # Offline unit tests for advanced Chan strategies
+│   ├── test_chan_similar_strategies.py   # Offline unit tests for Chan-similar strategies
 │   ├── test_chan_lesson_strategies.py    # Offline unit tests for Chan lesson strategies
 │   ├── test_timing_aspects.py            # Offline unit tests for entry x exit aspect composition
 │   ├── test_strategy.py                  # Offline unit tests for consolidated strategies & config loading

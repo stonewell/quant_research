@@ -373,7 +373,7 @@ class StrategyConfig:
     chanm_adv_position_size_pct: float = 1.0
     chanm_adv_require_cross_pivot_divergence: bool = True
     chanm_adv_require_volume_confirmation: bool = False
-    chanm_adv_weak_signal_position_size_pct: float = 1.0
+    chanm_adv_weak_signal_position_size_pct: float = 0.5
     chanm_adv_use_trend_gate: bool = True
     chanm_adv_trend_ma_period: int = 200
     chanm_adv_suppress_top_div_in_uptrend: bool = True
@@ -508,8 +508,8 @@ class StrategyConfig:
     # Derived from walkforward anomaly analysis: blends the top 3 adjusted-
     # Sharpe Chan strategies with position limits, drawdown circuit breakers,
     # and a minimum-weight-change threshold to curb excessive turnover.
-    crb_composite_weight: float = 0.50       # allocation to chan_composite
-    crb_three_type_weight: float = 0.30      # allocation to chan_three_type
+    crb_composite_weight: float = 0.45       # allocation to chan_composite
+    crb_three_type_weight: float = 0.35      # allocation to chan_three_type
     crb_vaa_weight: float = 0.20             # allocation to chan_vaa_compound
     crb_max_single_position: float = 0.20    # hard cap per stock (prevents 100% concentration)
     crb_min_weight_change: float = 0.04      # skip rebalance trades below 4% change
