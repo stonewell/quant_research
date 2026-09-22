@@ -60,3 +60,21 @@ Frequent micro-adjustments generate unnecessary slippage and brokerage fees.
 | **Participation Rate** | $\le 5\%$ of ADV | Keep orders below the radar of adverse selection algorithms. |
 | **Cost Model** | Stamp duty: 10bps (sell)<br>Commission: 3-5bps<br>Slippage: 10-20bps | Total round-trip budget: ~35–50bps. |
 | **Turnover Budget** | $\le 25\times$ annualized | Hard cap to protect net alpha from fee erosion. |
+
+---
+
+## 5. Dynamic Universe Pruning & Losing Asset Exclusion
+
+A quantitative strategy is only as good as the universe it trades. Unprofitable universe constituents dilute alpha and generate dead-weight transaction friction.
+
+### Exclusion Triggers
+An asset is flagged for universe exclusion if:
+1. **Negative Aggregate PnL**: Cumulative realized net cash flow $< 0$ across the evaluation window.
+2. **Negative ROI Drift**: Realized ROI $< -3.0\%$ with $>3$ rebalance cycles.
+3. **Fee Drag Exceeds Alpha**: Total brokerage and slippage costs exceed $50\%$ of gross trading gains.
+4. **Multi-Strategy Failure**: The asset incurs net losses across $\ge 2$ uncorrelated quantitative models.
+
+### Operational Workflow
+- Periodically audit candidate universes via `run_audit.py --deep-analyze --exclude-losers --universe-file <PATH>`.
+- Export the pruned universe file (`--export-pruned-universe <PATH>`).
+- Re-run rolling walkforward validations to verify outperformance before deploying capital live.

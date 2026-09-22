@@ -162,3 +162,48 @@ buy_hit_rate = sum(1 for t in buys if next_price > entry_price) / len(buys)
 # Genuine trend-following strategies typically have 45% - 55% hit rates.
 # An entry hit rate > 75% on large sample size indicates potential look-ahead leakage.
 ```
+
+---
+
+## 8. Chronic Asset-Level Loss Drag & Friction Bleed
+
+### Definition
+Certain individual assets in the universe systematically generate negative realized PnL across multiple rolling folds, where transaction fees (stamp duties, commissions, slippage) exceed gross price returns or structural downtrends repeatedly trigger stop-outs.
+
+### Why It Distorts Backtests
+- In walkforward backtests with broad universes (e.g. 30–50 symbols), a handful of chronic underperformers can shave 5–10% off cumulative CAGR.
+- High turnover on non-trending assets incurs significant friction without generating alpha, diluting winning stock contributions.
+
+### Detection Rule
+```python
+# Track stateful PnL per symbol across all folds:
+# Net PnL = Sells + Terminal Value - Buys - Costs
+net_pnl = st["sells"] + st["end_val"] - st["buys"] - st["costs"]
+if net_pnl < 0 and (roi < -3.0 or st["costs"] > abs(net_pnl) * 0.5):
+    # Flag as candidate for universe exclusion
+```
+
+### Remediation
+Exclude identified chronic losers from the universe definition file (e.g., pruning from 47 to 31 or 20 assets) and re-run rolling evaluations.
+
+---
+
+## 9. Single-Fold Profit Concentration ("One-Hit Wonder" Risk)
+
+### Definition
+A strategy produces attractive mean CAGR (e.g. 15–20%), but $>40\%$ to $60\%+$ of total positive returns originate from a single exceptional fold (e.g., Fold 5 catching an explosive beta rally), while remaining folds are flat or negative.
+
+### Why It Distorts Backtests
+- The strategy lacks all-weather robustness: it appears profitable on average only because one favorable macro window compensated for multiple losing quarters.
+- In live trading, deploying such a strategy during normal or hostile regimes exposes capital to extended drawdown before the favorable regime recurs.
+
+### Detection Rule
+```python
+pos_cagr_sum = sum(c for c in fold_cagrs if c > 0)
+max_fold_share = max(fold_cagrs) / pos_cagr_sum if pos_cagr_sum > 0 else 0.0
+if max_fold_share > 0.40 and len(fold_cagrs) > 2:
+    # Flag as regime-fragile "one-hit wonder"
+```
+
+### Remediation
+Apply an anomaly penalty in adjusted Sharpe rankings and verify fold win rate consistency ($\ge 60\%$ winning folds).

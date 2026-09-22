@@ -4,15 +4,16 @@ description: >-
   Audits walkforward backtest results, inspects fold-level trade records for
   quantitative anomalies (single-stock concentration, warmup delay, cash drag,
   equity outliers, turnover friction, look-ahead bias), computes anomaly-adjusted
-  Sharpe rankings, and formulates institutional live trading strategies with
-  drawdown circuit breakers and position caps. Use whenever the user asks to analyze
-  walkforward backtests, check trade records, find anomalies in top strategies,
-  reorder strategy rankings, or build risk-managed live trading strategies.
+  Sharpe rankings, deeply analyzes top 3 strategies for behavioral distortions,
+  and recommends losing assets to exclude from the universe. Use whenever the user
+  asks to analyze walkforward backtests, check trade records, find anomalies in top
+  strategies, reorder strategy rankings, recommend losing assets to exclude, or
+  build risk-managed live trading strategies.
 ---
 
 # Walkforward Audit & Live Strategy Formulation
 
-This skill implements a battle-tested 4-phase quantitative audit process to evaluate walkforward backtesting results, detect hidden backtest distortions in fold-level trade logs, compute realistic live-readiness rankings, and synthesize robust production trading strategies.
+This skill implements a battle-tested 5-phase quantitative audit process to evaluate walkforward backtesting results, detect hidden backtest distortions in fold-level trade logs, compute realistic live-readiness rankings, conduct deep behavioral analysis on top-3 strategies, identify persistent losing assets to prune from trading universes, and synthesize robust production trading strategies.
 
 ---
 
@@ -44,9 +45,20 @@ This skill implements a battle-tested 4-phase quantitative audit process to eval
                                  │
                                  ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ Phase 4: Production Strategy Synthesis                         │
-│ - Enforce hard 20% single-stock cap & 2% turnover filter        │
-│ - Implement multi-tier drawdown circuit breakers (10%/15%/20%)  │
+│ Phase 4: Top 3 Strategy Deep Behavioral & Anomaly Analysis      │
+│ - Analyze fold dynamics (best vs worst fold, return dispersion) │
+│ - Quantify cash drag, turnover velocity & friction tax (RMB)    │
+│ - Check single-fold profit concentration ("one-hit wonder")     │
+│ - Trace asset-level alpha attribution (top winners vs losers)   │
+└────────────────────────────────┬────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Phase 5: Asset-Level Loss Drag & Losing Asset Exclusion         │
+│ - Aggregate stateful PnL, ROI, and transaction costs by ticker  │
+│ - Classify chronic losers, negative ROI drift, friction bleed   │
+│ - Recommend losing assets to exclude from trading universe      │
+│ - Export pruned universe file & generate CLI rerun snippet      │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -134,28 +146,63 @@ $$\text{Adj Sharpe} = \text{Raw Sharpe} - \text{Penalties} + \text{Bonuses}$$
 
 ---
 
-### Step 4: Formulate and Implement Live Strategy
+### Step 4: Deep Behavioral & Anomaly Analysis of Top 3 Strategies
 
-Consult the [Institutional Live Risk Rules](./references/live_risk_rules.md) to package the winning strategies into a production-ready template:
+Run an in-depth diagnosis across the top-ranked strategies (defaults to top 3):
 
-1. **Multi-Strategy Blend**:
-   Combine the top adjusted candidates into an ensemble (e.g. 50% core consistent alpha, 30% structural trend, 20% tactical defensive buffer).
-2. **Hard Position Limits**:
-   Cap individual asset weights at $\le 20\%$ (`crb_max_single_position = 0.20`).
-3. **Drawdown Circuit Breakers**:
-   - **$10\%$ DD from HWM**: Halve equity exposure (50% risk damping).
-   - **$15\%$ DD from HWM**: Route 100% to tactical defensive engine.
-   - **$20\%$ DD from HWM**: Hard stop (100% cash preservation).
-4. **Turnover Filter**:
-   Skip rebalance executions if maximum weight shift $<2\%$ (`crb_min_weight_change = 0.02`).
-5. **Contract Compliance**:
-   Ensure explicit `0.0` writes for unheld positions and strict sparse weights format (`_sparse_from_daily`).
+```bash
+python3 .agents/skills/walkforward-audit/scripts/run_audit.py --results-dir <TARGET_DIR> --deep-analyze --deep-top-n 3
+```
+
+**Key Behavioral Checks for Each Top Strategy**:
+1. **Regime & Fold Fragility**:
+   - Check best fold vs worst fold CAGR and MaxDD.
+   - Check **Profit Concentration**: If a single fold generates $>40\%$ of all positive returns, flag "one-hit wonder" regime sensitivity.
+2. **Capital Efficiency vs Cash Drag**:
+   - Examine average active weight sum $\bar{w}_{\text{sum}}$. If idle cash $>50\%$, verify whether low drawdown is simply due to holding cash.
+3. **Turnover & Friction Tax**:
+   - Quantify total friction costs (commissions, slippage, stamp duty) in RMB and as a percentage of gross alpha.
+4. **Asset-Level Alpha Attribution**:
+   - Identify which specific stocks drove the alpha (Top Alpha Drivers) vs which stocks caused major drawdowns (Severe Loss Drags).
+
+---
+
+### Step 5: Asset-Level Loss Drag & Losing Asset Exclusion
+
+Consolidate asset PnL across the top evaluated strategies, identify chronic losers dragging down overall returns, and recommend a pruned universe:
+
+```bash
+python3 .agents/skills/walkforward-audit/scripts/run_audit.py --results-dir <TARGET_DIR> \
+  --deep-analyze \
+  --exclude-losers \
+  --universe-file docs/universe/china/original_universe.txt \
+  --export-pruned-universe docs/universe/china/pruned_universe.txt
+```
+
+**Exclusion Diagnosis Criteria**:
+- **Severe Loss Drag**: Cumulative net PnL $< -1,000$ RMB or ROI $< -3.0\%$.
+- **Friction Bleed**: Transaction costs exceed gross gains (churn eating alpha).
+- **Multi-Strategy Failure**: Asset produced negative PnL across $\ge 2$ different top strategies.
+- **Quantified Output**:
+  - Reports exact eliminated loss drag in RMB and friction fees saved.
+  - Automatically exports the cleaned universe file (`--export-pruned-universe`).
+  - Outputs the exact CLI command to re-run the backtester or pipeline with the pruned universe.
+
+---
+
+### Full Pipeline Run
+
+To execute the entire 5-phase audit in a single command:
+
+```bash
+python3 .agents/skills/walkforward-audit/scripts/run_audit.py --results-dir <TARGET_DIR> --all --deep-top-n 3
+```
 
 ---
 
 ## Quick Reference Scripts
 
 - **Complete Audit Runner**: [run_audit.py](./scripts/run_audit.py)
-  - Options: `--summary`, `--audit`, `--rank`, `--top-n N`, `--results-dir PATH`
+  - Options: `--all`, `--summary`, `--audit`, `--rank`, `--deep-analyze`, `--deep-top-n N`, `--exclude-losers`, `--universe-file PATH`, `--export-pruned-universe PATH`, `--results-dir PATH`
 - **Detailed Anomaly Reference**: [anomaly_patterns.md](./references/anomaly_patterns.md)
 - **Live Risk Management Guide**: [live_risk_rules.md](./references/live_risk_rules.md)

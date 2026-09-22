@@ -378,6 +378,8 @@ def run_ranking(strategies, results_dir: Path, top_n: int = 10):
 
         results.append({
             "strategy": s["strategy"],
+            "dir_name": s.get("dir_name", ""),
+            "summary": s,
             "raw_sharpe": raw_sharpe,
             "adj_sharpe": adj_sharpe,
             "cagr": s["mean_cagr"],
@@ -421,14 +423,314 @@ def run_ranking(strategies, results_dir: Path, top_n: int = 10):
     return results
 
 
+def audit_strategy_assets(results_dir: Path, dir_name: str):
+    """Performs stateful asset-level trade analysis and PnL attribution from walkforward_rebalances.csv."""
+    path = (results_dir / dir_name / "walkforward_rebalances.csv") if dir_name else (results_dir / "walkforward_rebalances.csv")
+    if not path.is_file():
+        return None
+
+    trades = []
+    with open(path) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                row["fold"] = int(row["fold"])
+                row["rebalance_id"] = int(row["rebalance_id"])
+                for k in ["price", "prior_weight", "target_weight", "weight_change",
+                           "trade_value", "shares", "prior_shares", "target_shares",
+                           "commission", "slippage", "total_cost", "portfolio_equity"]:
+                    row[k] = float(row.get(k, 0.0) or 0.0)
+                trades.append(row)
+            except Exception:
+                continue
+
+    if not trades:
+        return None
+
+    folds = sorted(set(t["fold"] for t in trades))
+    symbol_stats = defaultdict(lambda: {
+        "buys": 0.0, "sells": 0.0, "costs": 0.0, "end_val": 0.0,
+        "trades": 0, "buy_count": 0, "sell_count": 0, "folds_present": set(),
+    })
+
+    for f_num in folds:
+        ft = [t for t in trades if t["fold"] == f_num]
+        events = sorted(set((t["rebalance_id"], t["date"]) for t in ft))
+        event_dict = defaultdict(list)
+        for t in ft:
+            event_dict[(t["rebalance_id"], t["date"])].append(t)
+
+        held = {}
+        for ev in events:
+            for t in event_dict[ev]:
+                sym = t["symbol"]
+                val = t["trade_value"]
+                cost = t["total_cost"]
+                act = t["action"]
+                st = symbol_stats[sym]
+                st["costs"] += cost
+                st["trades"] += 1
+                st["folds_present"].add(f_num)
+                if act == "BUY":
+                    st["buys"] += val
+                    st["buy_count"] += 1
+                elif act == "SELL":
+                    st["sells"] += val
+                    st["sell_count"] += 1
+
+                if t["target_shares"] > 1e-4:
+                    held[sym] = (t["target_shares"], t["price"])
+                else:
+                    held.pop(sym, None)
+
+        for sym, (sh, pr) in held.items():
+            symbol_stats[sym]["end_val"] += sh * pr
+
+    assets = []
+    for sym, st in symbol_stats.items():
+        net_pnl = st["sells"] + st["end_val"] - st["buys"] - st["costs"]
+        roi = (net_pnl / st["buys"] * 100.0) if st["buys"] > 0 else 0.0
+        assets.append({
+            "symbol": sym,
+            "net_pnl": net_pnl,
+            "buys": st["buys"],
+            "sells": st["sells"],
+            "costs": st["costs"],
+            "end_val": st["end_val"],
+            "trades": st["trades"],
+            "buy_count": st["buy_count"],
+            "sell_count": st["sell_count"],
+            "folds": len(st["folds_present"]),
+            "roi": roi,
+        })
+
+    assets.sort(key=lambda a: a["net_pnl"], reverse=True)
+    winners = [a for a in assets if a["net_pnl"] > 0]
+    losers = [a for a in assets if a["net_pnl"] < 0]
+
+    return {
+        "trades": trades,
+        "assets": assets,
+        "winners": winners,
+        "losers": losers,
+        "total_cost": sum(a["costs"] for a in assets),
+        "total_bought": sum(a["buys"] for a in assets),
+        "total_sold": sum(a["sells"] for a in assets),
+        "total_net_pnl": sum(a["net_pnl"] for a in assets),
+    }
+
+
+def deep_analyze_top_strategies(
+    ranked_results: list,
+    results_dir: Path,
+    top_n: int = 3,
+    universe_file: str = None,
+    export_pruned_path: str = None,
+):
+    """Performs deep behavioral, regime, and asset-attribution audit on top N strategies and recommends losing asset exclusions."""
+    if not ranked_results:
+        print("No ranked strategies available for deep analysis.", file=sys.stderr)
+        return
+
+    top_strats = ranked_results[:top_n]
+    print("\n" + "=" * 140)
+    print(f"STAGE 4: TOP {len(top_strats)} STRATEGY DEEP BEHAVIORAL & ANOMALY ANALYSIS")
+    print("=" * 140)
+
+    agg_symbol_stats = defaultdict(lambda: {
+        "net_pnl": 0.0, "buys": 0.0, "sells": 0.0, "costs": 0.0,
+        "trades": 0, "win_strats": 0, "loss_strats": 0, "strats": set(),
+    })
+    all_observed_symbols = set()
+
+    for rank_idx, r in enumerate(top_strats, 1):
+        strat_name = r["strategy"]
+        dir_name = r.get("dir_name", "")
+        summary = r.get("summary", {})
+        folds_perf = summary.get("rolling_window_performance", [])
+
+        asset_data = audit_strategy_assets(results_dir, dir_name)
+        trade_audit = audit_strategy_trades(results_dir, dir_name, summary)
+
+        # Behavioral & Fold Metrics
+        cagrs = [f.get("cagr", 0.0) for f in folds_perf]
+        win_folds = sum(1 for c in cagrs if c > 0)
+
+        best_fold_idx = cagrs.index(max(cagrs)) if cagrs else 0
+        worst_fold_idx = cagrs.index(min(cagrs)) if cagrs else 0
+        pos_cagr_sum = sum(c for c in cagrs if c > 0)
+        max_fold_share = (max(cagrs) / pos_cagr_sum) if pos_cagr_sum > 0 else 0.0
+
+        # Capital & Friction
+        total_costs = asset_data["total_cost"] if asset_data else 0.0
+        total_pnl = asset_data["total_net_pnl"] if asset_data else 0.0
+        active_wsum = r.get("avg_wsum", 1.0)
+        idle_cash = max(0.0, 1.0 - active_wsum)
+
+        # Anomaly Diagnostics
+        anomalies = []
+        if r.get("all_in", 0) > 0:
+            anomalies.append(f"CONCENTRATION: {r['all_in']} all-in (>=99%) single-stock bets detected")
+        if idle_cash > 0.50:
+            anomalies.append(f"CASH DRAG: {idle_cash*100:.1f}% average uninvested idle capital cushion")
+        if r.get("turnover", 0.0) > 3.0:
+            anomalies.append(f"HIGH TURNOVER: {r['turnover']:.1f}x turnover per fold incurs severe execution friction")
+        if max_fold_share > 0.40 and len(cagrs) > 2:
+            anomalies.append(f"PROFIT CONCENTRATION: Best Fold {best_fold_idx+1} accounts for {max_fold_share*100:.1f}% of positive CAGR")
+        if r.get("p_warm", 0.0) > 0:
+            anomalies.append("WARMUP DELAY: Fold 1 delayed first trade > 60 days")
+        if r.get("max_jump", 0.0) > 0.30:
+            anomalies.append(f"OUTLIER EQUITY JUMP: Single rebalance equity jumped {r['max_jump']*100:.1f}%")
+        if trade_audit and trade_audit.get("buy_hit_rate", 0.5) > 0.70:
+            anomalies.append(f"LOOK-AHEAD RISK: Buy hit rate is {trade_audit['buy_hit_rate']*100:.1f}% (suspiciously high for equities)")
+
+        print(f"\n[{rank_idx}] {strat_name}")
+        print("-" * 140)
+        dsr_val = r.get("dsr", 0.0)
+        dsr_str = f"{dsr_val:.3f}" if dsr_val > 1e-5 else "~0"
+        print(f"  Overall: Adj Sharpe: {r.get('adj_sharpe', 0.0):.3f} | Raw Sharpe: {r.get('raw_sharpe', 0.0):.3f} | "
+              f"CAGR: {r.get('cagr', 0.0)*100:.2f}% | MaxDD: {r.get('maxdd', 0.0)*100:.1f}% | DSR: {dsr_str}")
+        if folds_perf:
+            best_f = folds_perf[best_fold_idx]
+            worst_f = folds_perf[worst_fold_idx]
+            print(f"  Fold Dynamics: {win_folds}/{len(folds_perf)} Winning Folds | "
+                  f"Best: Fold {best_fold_idx+1} ({best_f.get('start_date')} to {best_f.get('end_date')}, CAGR: {best_f.get('cagr', 0.0)*100:.1f}%, MaxDD: {best_f.get('max_drawdown', 0.0)*100:.1f}%) | "
+                  f"Worst: Fold {worst_fold_idx+1} ({worst_f.get('start_date')} to {worst_f.get('end_date')}, CAGR: {worst_f.get('cagr', 0.0)*100:.1f}%, MaxDD: {worst_f.get('max_drawdown', 0.0)*100:.1f}%)")
+        print(f"  Capital & Friction: Active Weight Sum: {active_wsum:.2f} (Idle Cash: {idle_cash*100:.0f}%) | "
+              f"Turnover: {r.get('turnover', 0.0):.1f}x | Total Friction Cost: {total_costs:,.2f} RMB | Net PnL: {total_pnl:,.2f} RMB")
+
+        if anomalies:
+            print("  Identified Anomalies & Friction Risks:")
+            for a in anomalies:
+                print(f"    - ⚠️  {a}")
+        else:
+            print("  Identified Anomalies: None (Clean institutional execution profile)")
+
+        if asset_data and asset_data["assets"]:
+            top_winners = asset_data["winners"][:3]
+            top_losers = asset_data["losers"][-3:]
+            w_str = ", ".join(f"{w['symbol']} (+{w['net_pnl']:,.0f} RMB, {w['roi']:+.1f}%)" for w in top_winners) if top_winners else "None"
+            l_str = ", ".join(f"{l['symbol']} ({l['net_pnl']:,.0f} RMB, {l['roi']:+.1f}%)" for l in top_losers) if top_losers else "None"
+            print(f"  Top Alpha Drivers : {w_str}")
+            print(f"  Severe Loss Drags : {l_str}")
+
+            for a in asset_data["assets"]:
+                sym = a["symbol"]
+                all_observed_symbols.add(sym)
+                st = agg_symbol_stats[sym]
+                st["net_pnl"] += a["net_pnl"]
+                st["buys"] += a["buys"]
+                st["sells"] += a["sells"]
+                st["costs"] += a["costs"]
+                st["trades"] += a["trades"]
+                st["strats"].add(strat_name)
+                if a["net_pnl"] < -1e-4:
+                    st["loss_strats"] += 1
+                elif a["net_pnl"] > 1e-4:
+                    st["win_strats"] += 1
+
+    # Stage 5: Consolidated Losing Assets & Exclusion Recommendations
+    print("\n" + "=" * 140)
+    print("STAGE 5: ASSET-LEVEL LOSS DRAG ATTRIBUTION & UNIVERSE EXCLUSION RECOMMENDATIONS")
+    print("=" * 140)
+
+    consolidated = []
+    for sym, st in agg_symbol_stats.items():
+        net = st["net_pnl"]
+        roi = (net / st["buys"] * 100.0) if st["buys"] > 0 else 0.0
+        consolidated.append({
+            "symbol": sym,
+            "net_pnl": net,
+            "buys": st["buys"],
+            "sells": st["sells"],
+            "costs": st["costs"],
+            "trades": st["trades"],
+            "roi": roi,
+            "loss_strats": st["loss_strats"],
+            "win_strats": st["win_strats"],
+            "n_strats": len(st["strats"]),
+        })
+
+    consolidated.sort(key=lambda x: x["net_pnl"])
+    recommended_losers = [c for c in consolidated if c["net_pnl"] < -1e-4]
+
+    if recommended_losers:
+        print(f"{'Symbol':<12} {'Net PnL (RMB)':>15} {'ROI%':>8} {'Trades':>8} {'Costs (RMB)':>14} {'Loss/Traded Strats':>20} {'Exclusion Diagnosis':<45}")
+        print("-" * 140)
+        for l in recommended_losers:
+            diag = []
+            if l["net_pnl"] < -2000:
+                diag.append("Heavy capital loss")
+            if l["roi"] < -3.0:
+                diag.append("Negative ROI drift")
+            if l["costs"] > abs(l["net_pnl"]) * 0.5:
+                diag.append("High turnover friction")
+            if l["loss_strats"] >= 2:
+                diag.append(f"Multi-strategy failure ({l['loss_strats']}/{l['n_strats']})")
+            diag_str = "; ".join(diag) if diag else "Net negative alpha contribution"
+
+            strat_ratio = f"{l['loss_strats']}/{l['n_strats']}"
+            print(f"{l['symbol']:<12} {l['net_pnl']:>15,.2f} {l['roi']:>7.1f}% {l['trades']:>8} {l['costs']:>14,.2f} {strat_ratio:>20} {diag_str:<45}")
+
+        total_loss_drag = sum(l["net_pnl"] for l in recommended_losers)
+        total_costs_saved = sum(l["costs"] for l in recommended_losers)
+        print("-" * 140)
+        print(f"SUMMARY: Identified {len(recommended_losers)} losing assets dragging down portfolio performance.")
+        print(f"Total Loss Drag Eliminated : {total_loss_drag:>15,.2f} RMB")
+        print(f"Total Friction Fees Saved  : {total_costs_saved:>15,.2f} RMB")
+    else:
+        print("No severe losing assets detected across the evaluated top strategies.")
+
+    # Determine base universe
+    base_universe = []
+    if universe_file and os.path.isfile(universe_file):
+        with open(universe_file) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    for sym in line.replace(",", " ").replace('"', '').replace("'", "").split():
+                        if sym:
+                            base_universe.append(sym)
+    else:
+        base_universe = sorted(all_observed_symbols)
+
+    losing_syms = set(l["symbol"] for l in recommended_losers)
+    pruned_universe = [s for s in base_universe if s not in losing_syms]
+
+    print("\n" + "-" * 140)
+    print(f"RECOMMENDED PRUNED UNIVERSE ({len(pruned_universe)} of {len(base_universe)} assets retained):")
+    print("-" * 140)
+    print(" ".join(pruned_universe))
+
+    if export_pruned_path:
+        out_p = Path(export_pruned_path)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_p, "w") as f:
+            for sym in pruned_universe:
+                f.write(f"{sym}\n")
+        print(f"\nSuccessfully exported pruned universe to: {out_p.resolve()}")
+
+    print("\nRecommended CLI Execution Snippet:")
+    if export_pruned_path:
+        print(f"  --universe-file {export_pruned_path}")
+    else:
+        print(f"  --universe {' '.join(pruned_universe[:10])} ...")
+    print("=" * 140)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Walkforward Audit & Trading Record Anomaly Analyzer")
     parser.add_argument("--results-dir", type=str, default=None, help="Path to results directory")
-    parser.add_argument("--all", action="store_true", help="Run full pipeline: summary, trade audit, and adjusted ranking")
+    parser.add_argument("--all", action="store_true", help="Run full pipeline: summary, trade audit, adjusted ranking, deep top-3 analysis, and losing asset exclusions")
     parser.add_argument("--summary", action="store_true", help="Run cross-strategy performance aggregation")
     parser.add_argument("--audit", action="store_true", help="Run deep-dive trading record anomaly audit")
     parser.add_argument("--rank", action="store_true", help="Compute anomaly-adjusted rankings")
-    parser.add_argument("--top-n", type=int, default=10, help="Number of top strategies to evaluate")
+    parser.add_argument("--deep-analyze", "--deep", action="store_true", help="Run deep behavioral & asset attribution audit on top strategies")
+    parser.add_argument("--deep-top-n", type=int, default=3, help="Number of top strategies for deep behavioral & asset analysis (default: 3)")
+    parser.add_argument("--exclude-losers", action="store_true", help="Identify and recommend losing assets to exclude from trading universe")
+    parser.add_argument("--universe-file", type=str, default=None, help="Path to original universe file to prune")
+    parser.add_argument("--export-pruned-universe", type=str, default=None, help="Path to export the pruned universe file")
+    parser.add_argument("--top-n", type=int, default=10, help="Number of top strategies to evaluate in ranking")
     parser.add_argument("--strategy", type=str, default=None, help="Analyze single strategy by name")
 
     args = parser.parse_args()
@@ -440,8 +742,10 @@ def main():
         print("No walkforward_summary.json files found.", file=sys.stderr)
         sys.exit(1)
 
-    if args.all or (not args.summary and not args.audit and not args.rank):
-        # Default: run all
+    has_specific_action = (args.summary or args.audit or args.rank or args.deep_analyze or args.exclude_losers)
+
+    if args.all or not has_specific_action:
+        # Full institutional audit pipeline
         run_summary(summaries)
         print("\n" + "#" * 100)
         print("# STAGE 2: TRADING RECORD ANOMALY AUDIT")
@@ -458,8 +762,16 @@ def main():
                       f"Turnover: {audit['avg_turnover']:.1f}x, "
                       f"Buy Hit Rate: {audit['buy_hit_rate']*100:.1f}%")
         print("\n")
-        run_ranking(summaries, results_dir, top_n=args.top_n)
+        ranked = run_ranking(summaries, results_dir, top_n=args.top_n)
+        deep_analyze_top_strategies(
+            ranked,
+            results_dir,
+            top_n=args.deep_top_n,
+            universe_file=args.universe_file,
+            export_pruned_path=args.export_pruned_universe,
+        )
     else:
+        ranked = None
         if args.summary:
             run_summary(summaries)
         if args.audit:
@@ -474,8 +786,19 @@ def main():
                           f"Max Equity Jump: {audit['max_equity_jump']*100:.1f}%, "
                           f"Turnover: {audit['avg_turnover']:.1f}x, "
                           f"Buy Hit Rate: {audit['buy_hit_rate']*100:.1f}%")
-        if args.rank:
-            run_ranking(summaries, results_dir, top_n=args.top_n)
+        if args.rank or args.deep_analyze or args.exclude_losers:
+            ranked = run_ranking(summaries, results_dir, top_n=args.top_n)
+
+        if args.deep_analyze or args.exclude_losers:
+            if ranked is None:
+                ranked = run_ranking(summaries, results_dir, top_n=args.top_n)
+            deep_analyze_top_strategies(
+                ranked,
+                results_dir,
+                top_n=args.deep_top_n,
+                universe_file=args.universe_file,
+                export_pruned_path=args.export_pruned_universe,
+            )
 
 
 if __name__ == "__main__":
