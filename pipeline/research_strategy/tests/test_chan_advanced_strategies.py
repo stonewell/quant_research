@@ -737,5 +737,57 @@ def test_chan_composite_inertia_filter_suppresses_micro_trades():
         assert (non_zero >= 0.01999).all(), f"Found target changes < 0.02: {non_zero[non_zero < 0.01999]}"
 
 
+def test_chan_risk_managed_blend_dynamic_cash_deployment():
+    """Verify that ChanRiskManagedBlendStrategy with dynamic cash deployment
+    scales up active risky holdings during bull breadth regimes (breadth >= 0.50)
+    towards target_bull_exposure (0.80) while respecting max_single_position (0.20)."""
+    universe = create_mock_universe(n_days=400)
+    # Enable dynamic cash deployment
+    cfg_dynamic = StrategyConfig(
+        crb_dynamic_cash_deployment=True,
+        crb_breadth_lookback=50,
+        crb_breadth_bull_thresh=0.50,
+        crb_target_bull_exposure=0.80,
+        crb_max_single_position=0.20,
+        crb_min_weight_change=0.04,
+        cash_proxy="BIL",
+    )
+    strat_dynamic = ChanRiskManagedBlendStrategy(cfg_dynamic)
+    weights_dynamic = strat_dynamic.generate_weights(universe)
 
+    rebal_dyn = weights_dynamic.dropna(how="all")
+    assert not rebal_dyn.empty
 
+    risky_dyn = rebal_dyn.drop(columns=["BIL"], errors="ignore")
+    # Rule 1: No single stock ever exceeds max_single_position (0.20)
+    assert (risky_dyn <= 0.200001).all().all(), f"Found weights > 0.20:\n{risky_dyn[risky_dyn > 0.20].dropna(how='all')}"
+
+    # Rule 2: Rows sum to 1.0 with BIL
+    assert np.allclose(rebal_dyn.sum(axis=1), 1.0, atol=1e-5)
+
+    # Disable dynamic cash deployment for comparison
+    cfg_static = StrategyConfig(
+        crb_dynamic_cash_deployment=False,
+        crb_max_single_position=0.20,
+        crb_min_weight_change=0.04,
+        cash_proxy="BIL",
+    )
+    strat_static = ChanRiskManagedBlendStrategy(cfg_static)
+    weights_static = strat_static.generate_weights(universe)
+    rebal_static = weights_static.dropna(how="all")
+
+    risky_static = rebal_static.drop(columns=["BIL"], errors="ignore")
+
+    # Common rebalance dates
+    common_idx = rebal_dyn.index.intersection(rebal_static.index)
+    assert len(common_idx) > 0
+
+    # In bull breadth periods where static held non-zero stocks, dynamic exposure should be >= static exposure
+    dyn_risky_sum = risky_dyn.loc[common_idx].sum(axis=1)
+    stat_risky_sum = risky_static.loc[common_idx].sum(axis=1)
+
+    # Across active days where static exposure was positive and didn't trigger circuit breaker,
+    # dynamic cash deployment should either increase or equal exposure (never decrease exposure during bull markets)
+    active_days = common_idx[stat_risky_sum > 0.05]
+    if len(active_days) > 0:
+        assert (dyn_risky_sum.loc[active_days] >= stat_risky_sum.loc[active_days] - 1e-4).all()

@@ -512,10 +512,14 @@ class StrategyConfig:
     crb_three_type_weight: float = 0.30      # allocation to chan_three_type
     crb_vaa_weight: float = 0.20             # allocation to chan_vaa_compound
     crb_max_single_position: float = 0.20    # hard cap per stock (prevents 100% concentration)
-    crb_min_weight_change: float = 0.02      # skip rebalance trades below 2% change
+    crb_min_weight_change: float = 0.04      # skip rebalance trades below 4% change
     crb_dd_reduce_thresh: float = 0.10       # drawdown level to halve position sizes
     crb_dd_defensive_thresh: float = 0.15    # drawdown level to switch to VAA-only
     crb_dd_stop_thresh: float = 0.20         # drawdown level to exit to 100% cash
+    crb_dynamic_cash_deployment: bool = True # dynamically deploy idle cash to active risky assets in bull breadth
+    crb_breadth_lookback: int = 50           # lookback window for breadth SMA
+    crb_breadth_bull_thresh: float = 0.50    # breadth threshold for deploying idle cash
+    crb_target_bull_exposure: float = 0.80   # target equity exposure in bull breadth regime
 
     # --- Price Action Breakout & Retest Strategy (docs/chan_similar_trading.md Strategy 1) ---
     pabr_box_window: int = 20                # consolidation box length (~4 weeks)
@@ -722,6 +726,14 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.ms_budget_smoothing_alpha must be between 0 and 1, got {self.ms_budget_smoothing_alpha}")
         if not (0.0 < self.ms_canary_breadth_thresh <= 1.0):
             raise ValueError(f"StrategyConfig.ms_canary_breadth_thresh must be between 0 and 1, got {self.ms_canary_breadth_thresh}")
+        if not (0.0 < self.crb_min_weight_change <= 1.0):
+            raise ValueError(f"StrategyConfig.crb_min_weight_change must be between 0 and 1, got {self.crb_min_weight_change}")
+        if not (0.0 < self.crb_target_bull_exposure <= 1.0):
+            raise ValueError(f"StrategyConfig.crb_target_bull_exposure must be between 0 and 1, got {self.crb_target_bull_exposure}")
+        if not (0.0 < self.crb_breadth_bull_thresh <= 1.0):
+            raise ValueError(f"StrategyConfig.crb_breadth_bull_thresh must be between 0 and 1, got {self.crb_breadth_bull_thresh}")
+        if self.crb_breadth_lookback <= 0:
+            raise ValueError(f"StrategyConfig.crb_breadth_lookback must be > 0, got {self.crb_breadth_lookback}")
 
     @classmethod
     def from_dict(cls, data: dict) -> "StrategyConfig":

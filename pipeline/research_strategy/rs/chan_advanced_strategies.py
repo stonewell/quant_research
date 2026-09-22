@@ -1249,6 +1249,10 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
         dd_reduce_thresh = float(p.get("crb_dd_reduce_thresh", cfg.crb_dd_reduce_thresh))
         dd_defensive_thresh = float(p.get("crb_dd_defensive_thresh", cfg.crb_dd_defensive_thresh))
         dd_stop_thresh = float(p.get("crb_dd_stop_thresh", cfg.crb_dd_stop_thresh))
+        dynamic_cash = bool(p.get("crb_dynamic_cash_deployment", getattr(cfg, "crb_dynamic_cash_deployment", True)))
+        breadth_lookback = int(p.get("crb_breadth_lookback", getattr(cfg, "crb_breadth_lookback", 50)))
+        breadth_bull_thresh = float(p.get("crb_breadth_bull_thresh", getattr(cfg, "crb_breadth_bull_thresh", 0.50)))
+        target_bull_exposure = float(p.get("crb_target_bull_exposure", getattr(cfg, "crb_target_bull_exposure", 0.80)))
 
         tot_w = comp_w + three_w + vaa_w
         if tot_w > 0:
@@ -1267,6 +1271,15 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
         master_index = _aligned_master_index_helper(universe, risky_symbols)
         if master_index is None or len(master_index) == 0:
             return pd.DataFrame()
+
+        # Precompute daily universe market breadth: fraction of non-empty risky symbols with Close > SMA(breadth_lookback)
+        breadth_matrix = pd.DataFrame(index=master_index, columns=risky_symbols, dtype=float)
+        for sym in risky_symbols:
+            if sym in universe and not universe[sym].empty:
+                c = universe[sym]["Close"].reindex(master_index).ffill()
+                ma = sma(c, breadth_lookback)
+                breadth_matrix[sym] = (c > ma).astype(float)
+        daily_breadth = breadth_matrix.mean(axis=1).fillna(0.50)
 
         # Run sub-strategies
         sub_strats = self._get_sub_strategies(cfg)
@@ -1349,9 +1362,7 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
 
             # Tier 3 cooldown: after spending stop_cooldown_bars in full cash,
             # reset HWM to current NAV so the drawdown calculation can heal and
-            # the strategy can eventually re-enter risk assets. Without this,
-            # a single Tier 3 trigger permanently disables the strategy for the
-            # remainder of the backtest -- a real bug found during code review.
+            # the strategy can eventually re-enter risk assets.
             if dd_mag >= dd_stop_thresh:
                 stop_counter += 1
                 if stop_counter >= stop_cooldown_bars:
@@ -1359,6 +1370,20 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
                     stop_counter = 0
             else:
                 stop_counter = 0
+
+            # Dynamic Cash Deployment: when breadth is bullish and no circuit breaker is active,
+            # scale up high-conviction active risky holdings up to target_bull_exposure
+            if not is_emergency and dynamic_cash:
+                breadth = float(daily_breadth.iloc[t])
+                if breadth >= breadth_bull_thresh:
+                    active_risky = [s for s in risky_symbols if raw_w[s] > 1e-6]
+                    tot_active = float(raw_w[active_risky].sum())
+                    if tot_active > 0:
+                        breadth_factor = np.clip((breadth - breadth_bull_thresh) / max(0.01, 0.80 - breadth_bull_thresh), 0.0, 1.0)
+                        target_exp = min(target_bull_exposure, 0.60 + breadth_factor * (target_bull_exposure - 0.60))
+                        if target_exp > tot_active:
+                            scale = target_exp / tot_active
+                            raw_w[active_risky] = (raw_w[active_risky] * scale).clip(upper=max_single_pos)
 
             # Apply hard position cap per risky symbol
             risky_w = raw_w[risky_symbols].copy().clip(lower=0.0, upper=max_single_pos)
@@ -1433,13 +1458,15 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
         dd_def = p.get("crb_dd_defensive_thresh", cfg.crb_dd_defensive_thresh)
         dd_stop = p.get("crb_dd_stop_thresh", cfg.crb_dd_stop_thresh)
         min_chg = p.get("crb_min_weight_change", cfg.crb_min_weight_change)
+        dyn_cash = p.get("crb_dynamic_cash_deployment", getattr(cfg, "crb_dynamic_cash_deployment", True))
         return (
             f"Chan Risk-Managed Blend Strategy (chan_risk_managed_blend): "
             f"walkforward-optimized ensemble blending chan_composite ({comp_w:.0%}), "
             f"chan_three_type ({three_w:.0%}), and chan_vaa_compound ({vaa_w:.0%}) "
             f"with hard position cap ({max_pos:.0%} max per stock), "
             f"drawdown circuit breakers (halve equity at {dd_red:.0%}, defensive VAA at {dd_def:.0%}, stop at {dd_stop:.0%}), "
-            f"and turnover filter (min trade change {min_chg:.0%})."
+            f"turnover filter (min trade change {min_chg:.0%}), "
+            f"and {'dynamic cash deployment in bull breadth' if dyn_cash else 'static cash buffer'}."
         )
 
     def warmup_bars(self, params: dict = None) -> int:

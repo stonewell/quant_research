@@ -277,16 +277,20 @@
     "name": "Chan Risk-Managed Blend Strategy",
     "type": "class",
     "class_name": "ChanRiskManagedBlendStrategy",
-    "description": "Walkforward-optimized institutional ensemble blending the top 3 Chan strategies (chan_composite 45%, chan_three_type 35%, chan_vaa_compound 20%) with institutional risk controls: 20% single-stock cap, multi-level drawdown circuit breakers (halve at 10%, defensive VAA at 15%, stop at 20%), and 2% turnover filter.",
+    "description": "Walkforward-optimized institutional ensemble blending the top 3 Chan strategies (chan_composite 45%, chan_three_type 35%, chan_vaa_compound 20%) with institutional risk controls: 20% single-stock cap, multi-level drawdown circuit breakers (halve at 10%, defensive VAA at 15%, stop at 20%), 4% turnover filter, and dynamic cash deployment in bull breadth.",
     "parameters": {
       "crb_composite_weight": 0.45,
       "crb_three_type_weight": 0.35,
       "crb_vaa_weight": 0.20,
       "crb_max_single_position": 0.20,
-      "crb_min_weight_change": 0.02,
+      "crb_min_weight_change": 0.04,
       "crb_dd_reduce_thresh": 0.10,
       "crb_dd_defensive_thresh": 0.15,
       "crb_dd_stop_thresh": 0.20,
+      "crb_dynamic_cash_deployment": true,
+      "crb_breadth_lookback": 50,
+      "crb_breadth_bull_thresh": 0.50,
+      "crb_target_bull_exposure": 0.80,
       "cash_proxy": "BIL"
     },
     "factors": ["regime_trend_strength", "absolute_momentum_trend", "relative_momentum", "volatility_targeting"]
