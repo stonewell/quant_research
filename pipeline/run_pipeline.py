@@ -100,7 +100,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--us-trading", action="store_true",
         help="Apply US equity market trading rules (1-share lots, SEC Section 31 sell fee, T+0 margin trading).")
     p.add_argument("--hk-trading", action="store_true",
-        help="Apply Hong Kong equity market trading rules (board lot sizing, 0.1085% dual-sided stamp duty/levies, T+0 trading).")
+        help="Apply Hong Kong equity market trading rules (board lot sizing, 0.1085%% dual-sided stamp duty/levies, T+0 trading).")
     p.add_argument("--no-plots", action="store_true",
         help="backtester/strategy_generator --no-plots passthrough -- skip equity-curve charts.")
     p.add_argument("--dry-run", action="store_true",

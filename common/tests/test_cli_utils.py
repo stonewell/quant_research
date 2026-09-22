@@ -128,3 +128,22 @@ def test_load_universe_with_banner_custom_loading_msg(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Custom banner text" in out
     assert "Loading 1 symbols ..." not in out
+
+
+def test_all_cli_tools_support_help_argument():
+    import subprocess
+    scripts = [
+        os.path.join(_PROJECT_ROOT, "backtester", "run_backtest.py"),
+        os.path.join(_PROJECT_ROOT, "pipeline", "research_strategy", "run_research_strategy.py"),
+        os.path.join(_PROJECT_ROOT, "pipeline", "strategy_generator", "run_strategygen.py"),
+        os.path.join(_PROJECT_ROOT, "pipeline", "run_pipeline.py"),
+        os.path.join(_PROJECT_ROOT, "pipeline", "instrument_selection", "run_screener.py"),
+        os.path.join(_PROJECT_ROOT, "pipeline", "fundamental_screener", "run_fundamental_screener.py"),
+        os.path.join(_PROJECT_ROOT, "pipeline", "live_signal", "run_live_signal.py"),
+        os.path.join(_PROJECT_ROOT, "pipeline", "pattern_mining", "run_pattern_mining.py"),
+        os.path.join(_PROJECT_ROOT, "scripts", "migrate_cache_csv_to_duckdb.py"),
+    ]
+    for script in scripts:
+        res = subprocess.run([sys.executable, script, "--help"], capture_output=True, text=True)
+        assert res.returncode == 0, f"{script} failed --help: {res.stderr}"
+        assert ("options:" in res.stdout or "optional arguments:" in res.stdout), f"{script} returned invalid help"

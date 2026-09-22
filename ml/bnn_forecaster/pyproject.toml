@@ -16,14 +16,15 @@ requires-python = ">=3.11"
 dependencies = [
     "pandas>=2.0",
     "numpy>=1.24,<2.1",   # tensorflow-probability==0.25.0's bundled bijector code still calls
-                          # np.reshape(..., newshape=...), removed in newer numpy
+    # np.reshape(..., newshape=...), removed in newer numpy
     "yfinance>=0.2",
     "matplotlib>=3.7",
     "scipy>=1.10",
     "autobnn",
     "jax<0.4.30",         # tensorflow-probability's JAX substrate calls
     "jaxlib<0.4.30",      # jax.interpreters.xla.pytype_aval_mappings, removed in newer jax;
-                          # jaxlib must track jax closely or jax refuses to import
+    # jaxlib must track jax closely or jax refuses to import
+    "duckdb>=1.1",
 ]
 
 [dependency-groups]

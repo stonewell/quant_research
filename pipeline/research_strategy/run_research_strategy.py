@@ -115,7 +115,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--us-trading", action="store_true",
                    help="Apply US equity market trading rules (1-share lots, SEC Section 31 sell fee, T+0 margin trading).")
     p.add_argument("--hk-trading", action="store_true",
-                   help="Apply Hong Kong equity market trading rules (board lot sizing, 0.1085% dual-sided stamp duty/levies, T+0 trading).")
+                   help="Apply Hong Kong equity market trading rules (board lot sizing, 0.1085%% dual-sided stamp duty/levies, T+0 trading).")
     add_data_provider_cli_args(p, default_provider="synthetic", no_cache_help="Disable local DuckDB caching of fetched data")
     return p
 
