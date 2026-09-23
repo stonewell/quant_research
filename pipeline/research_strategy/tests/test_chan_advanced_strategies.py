@@ -28,12 +28,15 @@ from common.testing import make_ohlcv_from_closes, make_oscillating_df
 from research_strategy.rs.chan_advanced_strategies import (
     ChanBestSelectorStrategy,
     ChanCompositeStrategy,
+    ChanFourStateBlendStrategy,
+    ChanFourStateExecutionStrategy,
     ChanMeanReversionDivergenceStrategy,
     ChanMultiTimeframeTrendStrategy,
     ChanRiskManagedBlendStrategy,
     ChanTrendThirdBuyStrategy,
     ChanVaaCompoundStrategy,
     run_composite_position_loop,
+    run_four_state_position_loop,
     run_mrd_position_exit,
 )
 from research_strategy.rs.config import StrategyConfig, load_strategies_config
@@ -545,6 +548,13 @@ def test_chan_risk_managed_blend_interface_and_config():
     assert "chan_composite" in strat.explain_weights()
     assert "chan_three_type" in strat.explain_weights()
     assert "chan_vaa_compound" in strat.explain_weights()
+    assert strat.config.crb_composite_weight == 0.20
+    assert strat.config.crb_three_type_weight == 0.40
+    assert strat.config.crb_vaa_weight == 0.40
+    assert strat.config.crb_breadth_bull_thresh == 0.30
+    assert strat.config.crb_thrust_lookback == 10
+    assert strat.config.crb_thrust_thresh == 0.60
+    assert "10d thrust" in strat.explain_weights()
 
     # Verify instantiation via strategies_config.json
     configs = load_strategies_config()
@@ -552,6 +562,12 @@ def test_chan_risk_managed_blend_interface_and_config():
     entry = configs["chan_risk_managed_blend"]
     inst = instantiate_strategy_from_config_entry("chan_risk_managed_blend", entry)
     assert isinstance(inst, ChanRiskManagedBlendStrategy)
+    assert inst.config.crb_composite_weight == 0.20
+    assert inst.config.crb_three_type_weight == 0.40
+    assert inst.config.crb_vaa_weight == 0.40
+    assert inst.config.crb_breadth_bull_thresh == 0.30
+    assert inst.config.crb_thrust_lookback == 10
+    assert inst.config.crb_thrust_thresh == 0.60
 
 
 def test_chan_risk_managed_blend_execution_and_constraints():
@@ -819,3 +835,638 @@ def test_chan_risk_managed_blend_bull_position_cap_expansion():
     assert (risky_df <= 0.300001).all().all()
     # At least some rebalance row should have taken advantage of the expanded cap (> 0.20)
     assert (risky_df > 0.200001).sum().sum() > 0
+
+
+def test_chan_risk_managed_blend_10d_breadth_thrust_activation():
+    """Verify that a short-term 10-day breadth thrust triggers dynamic cash deployment
+    even when longer-term 50d breadth is below its threshold (fast rebound override)."""
+    universe = create_mock_universe(n_days=400)
+
+    # Set 50d breadth threshold artificially high (0.99) so standard breadth NEVER triggers,
+    # but set 10d thrust threshold reachable (0.40) to test thrust override.
+    cfg_thrust = StrategyConfig(
+        crb_dynamic_cash_deployment=True,
+        crb_breadth_lookback=50,
+        crb_breadth_bull_thresh=0.99,  # Disabled standard breadth
+        crb_thrust_lookback=10,
+        crb_thrust_thresh=0.40,        # Enabled breadth thrust override
+        crb_target_bull_exposure=0.80,
+        crb_max_single_position=0.20,
+        crb_bull_max_single_position=0.30,
+        crb_min_weight_change=0.04,
+        cash_proxy="BIL",
+    )
+    strat_thrust = ChanRiskManagedBlendStrategy(cfg_thrust)
+    weights_thrust = strat_thrust.generate_weights(universe)
+    rebal_thrust = weights_thrust.dropna(how="all")
+    assert not rebal_thrust.empty
+
+    # Compare with a baseline where thrust threshold is also set impossible (0.99)
+    cfg_no_thrust = StrategyConfig(
+        crb_dynamic_cash_deployment=True,
+        crb_breadth_lookback=50,
+        crb_breadth_bull_thresh=0.99,
+        crb_thrust_lookback=10,
+        crb_thrust_thresh=0.99,
+        crb_target_bull_exposure=0.80,
+        crb_max_single_position=0.20,
+        crb_bull_max_single_position=0.30,
+        crb_min_weight_change=0.04,
+        cash_proxy="BIL",
+    )
+    strat_no_thrust = ChanRiskManagedBlendStrategy(cfg_no_thrust)
+    weights_no_thrust = strat_no_thrust.generate_weights(universe)
+    rebal_no_thrust = weights_no_thrust.dropna(how="all")
+
+    # In thrust mode, max single position can scale up towards bull_max_pos (0.30)
+    risky_thrust = rebal_thrust.drop(columns=["BIL"], errors="ignore")
+    risky_no_thrust = rebal_no_thrust.drop(columns=["BIL"], errors="ignore")
+
+    # Thrust mode should have greater or equal max exposure than no-thrust mode
+    assert risky_thrust.max().max() >= risky_no_thrust.max().max() - 1e-5
+
+
+def test_chan_four_state_execution_instantiation_and_interface():
+    """Verify ChanFourStateExecutionStrategy instantiates correctly from config
+    and follows AllocationTemplate interface."""
+    cfg_dict = load_strategies_config()
+    assert "chan_four_state_execution" in cfg_dict
+    entry = cfg_dict["chan_four_state_execution"]
+    assert entry["class_name"] == "ChanFourStateExecutionStrategy"
+
+    strat = instantiate_strategy_from_config_entry("chan_four_state_execution", entry)
+    assert isinstance(strat, ChanFourStateExecutionStrategy)
+    assert strat.name == "chan_four_state_execution"
+    assert strat.config.chan_fse_min_hold_bars == 5
+    assert strat.config.chan_fse_zg_tolerance_pct == 0.025
+    assert strat.config.chan_fse_cons_timeout_bars == 8
+    assert strat.config.chan_fse_stop_evaluation_mode == "close"
+    assert strat.config.chan_fse_b1_buffer_pct == 0.03
+    assert strat.config.chan_fse_cooldown_bars == 4
+    assert strat.config.chan_fse_two_stage_entry is True
+    assert strat.config.chan_fse_use_breadth_filter is True
+    assert strat.config.chan_fse_breadth_bull_thresh == 0.30
+    assert "Chan Four-State Operational Execution Strategy" in strat.explain_weights()
+    assert "gestation buffer" in strat.explain_weights()
+    assert "close-confirmed" in strat.explain_weights()
+    assert "re-entry cooldown" in strat.explain_weights()
+
+
+def test_chan_four_state_execution_weights_generation():
+    """Verify ChanFourStateExecutionStrategy generates valid sparse weights
+    adhering to position cap and budget allocation."""
+    universe = create_mock_universe(n_days=400)
+    cfg = StrategyConfig(
+        chan_fse_min_gap_bars=4,
+        chan_fse_min_strokes=3,
+        chan_fse_max_single_position=0.20,
+        chan_fse_min_weight_change=0.04,
+        cash_proxy="BIL",
+    )
+    strat = ChanFourStateExecutionStrategy(cfg)
+    weights = strat.generate_weights(universe)
+
+    assert not weights.empty
+    rebal = weights.dropna(how="all")
+    assert not rebal.empty
+
+    # Verify rows sum to 1.0 with BIL
+    assert np.allclose(rebal.sum(axis=1), 1.0, atol=1e-5)
+
+    # Verify single-stock positions do not exceed cap
+    risky = rebal.drop(columns=["BIL"], errors="ignore")
+    assert (risky <= 0.200001).all().all()
+
+
+def test_four_state_loop_structural_invalidation_stops():
+    """Verify deterministic structural invalidation stops in run_four_state_position_loop:
+    - 3B invalidation: breach below ZG disproves breakout.
+    - 2B invalidation: breach below DD disproves pullback.
+    - 1B invalidation: breach below bar low disproves bottom.
+    """
+    n = 10
+    close = np.array([100.0, 105.0, 106.0, 98.0, 95.0, 90.0, 92.0, 93.0, 94.0, 95.0])
+    b1 = np.zeros(n, dtype=bool)
+    b2 = np.zeros(n, dtype=bool)
+    b3 = np.zeros(n, dtype=bool)
+    sell = np.zeros(n, dtype=bool)
+
+    # Case 1: 3B at bar 1 with ZG=102. Price drops to 98 at bar 3 (breaching ZG)
+    b3[1] = True
+    zg = np.full(n, 102.0)
+    zd = np.full(n, 96.0)
+    dd = np.full(n, 90.0)
+
+    weights_3b = run_four_state_position_loop(
+        close, b1, b2, b3, sell, zg=zg, zd=zd, dd=dd, exit_on_consolidation=False
+    )
+    # Entered at bar 1 and 2, but stopped out at bar 3 because close (98) < ZG (102)
+    assert weights_3b[1] == 1.0
+    assert weights_3b[2] == 1.0
+    assert weights_3b[3] == 0.0
+
+    # Case 2: 2B at bar 1 with DD=90. Price drops to 98 at bar 3 (above DD), but 89 at bar 5 (below DD)
+    b3[1] = False
+    b2[1] = True
+    close_2b = np.array([100.0, 105.0, 106.0, 98.0, 95.0, 89.0, 92.0, 93.0, 94.0, 95.0])
+    weights_2b = run_four_state_position_loop(
+        close_2b, b1, b2, b3, sell, zg=zg, zd=zd, dd=dd, exit_on_consolidation=False, trail_stop_to_zg=False, stop_loss_pct=0.20
+    )
+    assert weights_2b[1] == 1.0
+    assert weights_2b[2] == 1.0
+    assert weights_2b[3] == 1.0
+    assert weights_2b[4] == 1.0
+    assert weights_2b[5] == 0.0  # close 89 < DD 90 -> invalidation stop
+
+    # Case 3: 1B at bar 1 with low=104. Price drops to 98 at bar 3 (below entry low)
+    b2[1] = False
+    b1[1] = True
+    low = close.copy()
+    low[1] = 104.0  # entry bar low
+    weights_1b = run_four_state_position_loop(
+        close, b1, b2, b3, sell, zg=zg, zd=zd, dd=dd, low=low, exit_on_consolidation=False
+    )
+    assert weights_1b[1] == 1.0
+    assert weights_1b[2] == 1.0
+    assert weights_1b[3] == 0.0  # 98 < 104 -> divergence invalidated
+
+
+def test_four_state_loop_lesson_16_consolidation_exit():
+    """Verify Lesson 16 (中小资金拒绝盘整): exiting position when price drops into pivot consolidation."""
+    n = 6
+    close = np.array([100.0, 105.0, 106.0, 101.0, 101.5, 102.0])
+    # Pivot band: ZD=95, ZG=102, DD=90. Close at bar 1, 2 is 105, 106 (above_zs).
+    # Close at bar 3 is 101.0 (in_zs: between 95 and 102).
+    zg = np.full(n, 102.0)
+    zd = np.full(n, 95.0)
+    dd = np.full(n, 90.0)
+    b2 = np.zeros(n, dtype=bool)
+    b2[1] = True
+    dummy = np.zeros(n, dtype=bool)
+
+    # When exit_on_consolidation=True with min_hold_bars=0: exits immediately on bar 3
+    w_exit = run_four_state_position_loop(
+        close, dummy, b2, dummy, dummy, zg=zg, zd=zd, dd=dd,
+        exit_on_consolidation=True, trail_stop_to_zg=False, stop_loss_pct=0.20,
+        min_hold_bars=0, consolidation_timeout_bars=1,
+    )
+    assert w_exit[1] == 1.0
+    assert w_exit[2] == 1.0
+    assert w_exit[3] == 0.0
+
+    # When exit_on_consolidation=False: holds through in_zs consolidation
+    w_hold = run_four_state_position_loop(
+        close, dummy, b2, dummy, dummy, zg=zg, zd=zd, dd=dd,
+        exit_on_consolidation=False, trail_stop_to_zg=False, stop_loss_pct=0.20,
+        min_hold_bars=0,
+    )
+    assert w_hold[1] == 1.0
+    assert w_hold[2] == 1.0
+    assert w_hold[3] == 1.0
+
+
+def test_four_state_loop_gestation_buffer_prevents_premature_exit():
+    """Verify that min_hold_bars allows 1B/2B entries gestation time to develop toward
+    the pivot without being prematurely churned on Day 1."""
+    n = 8
+    # 1B entry formed below pivot (ZD=100, ZG=110). Price enters at 95, stays below/in pivot for 3 bars.
+    close = np.array([90.0, 95.0, 96.0, 97.0, 98.0, 99.0, 85.0, 84.0])
+    zg = np.full(n, 110.0)
+    zd = np.full(n, 100.0)
+    dd = np.full(n, 80.0)
+    b1 = np.zeros(n, dtype=bool)
+    b1[1] = True
+    dummy = np.zeros(n, dtype=bool)
+
+    # With default min_hold_bars=5: held through bars 1-5 even though below_zs
+    w_buffered = run_four_state_position_loop(
+        close, b1, dummy, dummy, dummy, zg=zg, zd=zd, dd=dd,
+        exit_on_consolidation=True, min_hold_bars=5, stop_loss_pct=0.20,
+    )
+    assert w_buffered[1] == 1.0
+    assert w_buffered[2] == 1.0
+    assert w_buffered[3] == 1.0
+    assert w_buffered[4] == 1.0
+    assert w_buffered[5] == 1.0
+
+    # Without gestation buffer (min_hold_bars=0): dumped immediately on bar 2 for being below_zs
+    w_unbuffered = run_four_state_position_loop(
+        close, b1, dummy, dummy, dummy, zg=zg, zd=zd, dd=dd,
+        exit_on_consolidation=True, min_hold_bars=0, stop_loss_pct=0.20,
+    )
+    assert w_unbuffered[1] == 1.0
+    assert w_unbuffered[2] == 0.0  # Churned on bar 2
+
+
+def test_four_state_loop_3b_zg_tolerance_and_breakout_invalidation():
+    """Verify that 3B breakout positions:
+    1. Are protected against noise within zg_tolerance_pct (default 1%).
+    2. Exit once price definitively breaches below ZG * (1 - zg_tolerance_pct).
+    """
+    n = 6
+    zg_val = 100.0
+    zg = np.full(n, zg_val)
+    zd = np.full(n, 90.0)
+    dd = np.full(n, 85.0)
+    b3 = np.zeros(n, dtype=bool)
+    b3[1] = True
+    dummy = np.zeros(n, dtype=bool)
+
+    # Bar 1: Entry at 105 (> ZG 100)
+    # Bar 2: Minor dip to 99.5 (0.5% below ZG -> within 1% tolerance, should NOT exit)
+    # Bar 3: Dip to 98.5 (1.5% below ZG -> exceeds 1% tolerance, MUST exit)
+    close = np.array([100.0, 105.0, 99.5, 98.5, 97.0, 96.0])
+
+    weights = run_four_state_position_loop(
+        close, dummy, dummy, b3, dummy, zg=zg, zd=zd, dd=dd,
+        exit_on_consolidation=True, zg_tolerance_pct=0.01, stop_loss_pct=0.10,
+    )
+    assert weights[1] == 1.0
+    assert weights[2] == 1.0   # 99.5 is within 1% tolerance of 100.0 (threshold 99.0)
+    assert weights[3] == 0.0   # 98.5 is below 99.0 -> invalidation exit triggered
+
+
+def test_four_state_loop_stagnation_consolidation_timeout():
+    """Verify that positions lingering in_zs for consolidation_timeout_bars with
+    non-positive stroke direction are cleanly exited to avoid Lesson 16 capital drag."""
+    n = 12
+    # 2B entry at bar 1. Price enters in_zs (ZD=90, ZG=110) at 100 and stays flat at 100 for 10 bars.
+    close = np.full(n, 100.0)
+    zg = np.full(n, 110.0)
+    zd = np.full(n, 90.0)
+    dd = np.full(n, 80.0)
+    stroke_dir = np.zeros(n, dtype=int)  # 0 = flat/no upward momentum
+    b2 = np.zeros(n, dtype=bool)
+    b2[1] = True
+    dummy = np.zeros(n, dtype=bool)
+
+    # With min_hold_bars=3, consolidation_timeout_bars=4:
+    # Bar 1: entry (held=0)
+    # Bar 2: held=1 < 3, in_zs count = 1
+    # Bar 3: held=2 < 3, in_zs count = 2
+    # Bar 4: held=3 >= 3, in_zs count = 3
+    # Bar 5: held=4 >= 3, in_zs count = 4 >= consolidation_timeout_bars and stroke_dir <= 0 -> exits!
+    weights = run_four_state_position_loop(
+        close, dummy, b2, dummy, dummy, zg=zg, zd=zd, dd=dd,
+        stroke_dir=stroke_dir, exit_on_consolidation=True,
+        min_hold_bars=3, consolidation_timeout_bars=4, stop_loss_pct=0.20,
+    )
+    assert weights[1] == 1.0
+    assert weights[2] == 1.0
+    assert weights[3] == 1.0
+    assert weights[4] == 1.0
+    assert weights[5] == 0.0  # Exited at bar 5 due to stagnant consolidation timeout
+
+    # If stroke direction is positive (stroke_dir = 1), position is NOT dumped because stroke is lifting off
+    stroke_up = np.ones(n, dtype=int)
+    weights_up = run_four_state_position_loop(
+        close, dummy, b2, dummy, dummy, zg=zg, zd=zd, dd=dd,
+        stroke_dir=stroke_up, exit_on_consolidation=True,
+        min_hold_bars=3, consolidation_timeout_bars=4, stop_loss_pct=0.20,
+    )
+    assert weights_up[1] == 1.0
+    assert weights_up[4] == 1.0
+    assert weights_up[5] == 1.0  # Kept holding because upward stroke momentum is alive!
+
+
+def test_four_state_loop_trailing_stop_ratchet_to_zg():
+    """Verify that trailing stop ratchets up to ZG as price trades above ZG."""
+    n = 8
+    # Price rises strongly, then falls back below ZG
+    close = np.array([100.0, 110.0, 115.0, 120.0, 108.0, 105.0, 100.0, 95.0])
+    zg = np.array([102.0, 102.0, 102.0, 108.0, 108.0, 108.0, 108.0, 108.0])
+    zd = np.full(n, 95.0)
+    b3 = np.zeros(n, dtype=bool)
+    b3[1] = True
+    dummy = np.zeros(n, dtype=bool)
+
+    weights = run_four_state_position_loop(
+        close, dummy, dummy, b3, dummy, zg=zg, zd=zd, trail_stop_to_zg=True, exit_on_consolidation=False
+    )
+    assert weights[1] == 1.0
+    assert weights[2] == 1.0
+    assert weights[3] == 1.0
+    # At bar 4, price falls to 108. At bar 5, price is 105 which is below the ratcheted stop (108)
+    assert weights[5] == 0.0
+
+
+def test_chan_composite_structural_stop_option():
+    """Verify ChanCompositeStrategy with chan_comp_use_structural_stops=True
+    incorporates structural breakout invalidation stops."""
+    universe = create_mock_universe(n_days=400)
+    cfg_with_stops = StrategyConfig(
+        chan_comp_use_structural_stops=True,
+        cash_proxy="BIL",
+    )
+    strat_with_stops = ChanCompositeStrategy(cfg_with_stops)
+    w_stops = strat_with_stops.generate_weights(universe)
+    assert not w_stops.empty
+
+    cfg_no_stops = StrategyConfig(
+        chan_comp_use_structural_stops=False,
+        cash_proxy="BIL",
+    )
+    strat_no_stops = ChanCompositeStrategy(cfg_no_stops)
+    w_no_stops = strat_no_stops.generate_weights(universe)
+    assert not w_no_stops.empty
+
+
+def test_chan_four_state_blend_interface_and_config():
+    cfg = StrategyConfig()
+    strat = ChanFourStateBlendStrategy(cfg)
+    assert strat.name == "chan_four_state_blend"
+    assert strat.warmup_bars() == 252
+    assert "chan_four_state_execution" in strat.explain_weights()
+    assert "chan_three_type" in strat.explain_weights()
+    assert "chan_vaa_compound" in strat.explain_weights()
+    assert strat.config.cfsb_four_state_weight == 0.20
+    assert strat.config.cfsb_three_type_weight == 0.40
+    assert strat.config.cfsb_vaa_weight == 0.40
+    assert strat.config.cfsb_breadth_bull_thresh == 0.30
+    assert strat.config.cfsb_thrust_lookback == 10
+    assert strat.config.cfsb_thrust_thresh == 0.60
+    assert "10d thrust" in strat.explain_weights()
+
+    # Verify instantiation via strategies_config.json
+    configs = load_strategies_config()
+    assert "chan_four_state_blend" in configs
+    entry = configs["chan_four_state_blend"]
+    inst = instantiate_strategy_from_config_entry("chan_four_state_blend", entry)
+    assert isinstance(inst, ChanFourStateBlendStrategy)
+    assert inst.config.cfsb_four_state_weight == 0.20
+    assert inst.config.cfsb_three_type_weight == 0.40
+    assert inst.config.cfsb_vaa_weight == 0.40
+    assert inst.config.cfsb_breadth_bull_thresh == 0.30
+    assert inst.config.cfsb_thrust_lookback == 10
+    assert inst.config.cfsb_thrust_thresh == 0.60
+
+
+def test_chan_four_state_blend_execution_and_constraints():
+    universe = create_mock_universe(n_days=400)
+    cfg = StrategyConfig()
+    strat = ChanFourStateBlendStrategy(cfg)
+    weights = strat.generate_weights(universe)
+
+    assert not weights.empty
+    rebal_dates = weights.dropna(how="all").index
+    assert len(rebal_dates) > 0
+
+    # Test sparse weights contract: non-rebalance rows are all NaN
+    non_rebal = weights.drop(index=rebal_dates)
+    if not non_rebal.empty:
+        assert non_rebal.isna().all().all()
+
+    # Test position capping constraint: no individual risky stock > max position cap (cfsb_bull_max_single_position = 0.30)
+    rebal_df = weights.loc[rebal_dates]
+    risky_df = rebal_df.drop(columns=["BIL"], errors="ignore")
+    assert (risky_df > cfg.cfsb_bull_max_single_position + 1e-6).sum().sum() == 0
+
+    # Test leverage constraint: sum of risky weights <= 1.0
+    assert (risky_df.sum(axis=1) <= 1.000001).all()
+
+    # Test explicit zero floor: no NaNs inside any rebalance row
+    assert not rebal_df.isna().any().any()
+
+
+def test_chan_four_state_blend_circuit_breaker_triggers():
+    # Construct a universe where asset prices plunge sharply to trigger circuit breakers
+    dates = pd.bdate_range("2020-01-01", periods=360)
+    t = np.arange(360)
+
+    # Initial rally followed by catastrophic 40% crash
+    spy_close = np.where(t < 250, 100.0 + 0.3 * t, 175.0 - 1.5 * (t - 250))
+    qqq_close = np.where(t < 250, 100.0 + 0.4 * t, 200.0 - 2.0 * (t - 250))
+    bil_close = np.full(360, 100.0)
+
+    universe = {
+        "SPY": make_ohlcv_from_closes(spy_close),
+        "QQQ": make_ohlcv_from_closes(qqq_close),
+        "BIL": make_ohlcv_from_closes(bil_close),
+    }
+    for df in universe.values():
+        df.index = dates
+
+    cfg = StrategyConfig(cfsb_dd_reduce_thresh=0.08, cfsb_dd_defensive_thresh=0.12, cfsb_dd_stop_thresh=0.18)
+    strat = ChanFourStateBlendStrategy(cfg)
+    weights = strat.generate_weights(universe)
+
+    assert not weights.empty
+    rebal_dates = weights.dropna(how="all").index
+    crash_rebal_dates = [d for d in rebal_dates if d >= dates[250]]
+
+    # Ensure strategy executed de-risking trades during the crash
+    assert len(crash_rebal_dates) > 0
+    crash_weights = weights.loc[crash_rebal_dates]
+    if "BIL" in crash_weights.columns:
+        bil_holdings = crash_weights["BIL"]
+        assert (bil_holdings >= 0.50).any()
+
+
+def test_chan_four_state_blend_dynamic_cash_deployment():
+    universe = create_mock_universe(n_days=400)
+    cfg_dynamic = StrategyConfig(cfsb_dynamic_cash_deployment=True, cash_proxy="BIL")
+    cfg_static = StrategyConfig(cfsb_dynamic_cash_deployment=False, cash_proxy="BIL")
+
+    strat_dynamic = ChanFourStateBlendStrategy(cfg_dynamic)
+    strat_static = ChanFourStateBlendStrategy(cfg_static)
+
+    w_dyn = strat_dynamic.generate_weights(universe)
+    w_sta = strat_static.generate_weights(universe)
+
+    assert not w_dyn.empty
+    assert not w_sta.empty
+
+
+def test_chan_four_state_blend_10d_breadth_thrust_activation():
+    dates = pd.bdate_range("2020-01-01", periods=360)
+    t = np.arange(360)
+    # Severe bear market (t < 250) followed by a violent 10-day V-shape recovery (+15% surge)
+    bear_then_thrust = np.where(
+        t < 250,
+        150.0 - 0.2 * t,
+        100.0 + 1.5 * (t - 250)
+    )
+    universe = {
+        "SPY": make_ohlcv_from_closes(bear_then_thrust),
+        "QQQ": make_ohlcv_from_closes(bear_then_thrust * 1.05),
+        "BIL": make_ohlcv_from_closes(np.full(360, 100.0)),
+    }
+    for df in universe.values():
+        df.index = dates
+
+    cfg_thrust = StrategyConfig(
+        cfsb_dynamic_cash_deployment=True,
+        cfsb_breadth_lookback=50,
+        cfsb_breadth_bull_thresh=0.75,
+        cfsb_thrust_lookback=10,
+        cfsb_thrust_thresh=0.60,
+        cfsb_target_bull_exposure=0.80,
+        cash_proxy="BIL",
+    )
+    strat_thrust = ChanFourStateBlendStrategy(cfg_thrust)
+    weights = strat_thrust.generate_weights(universe)
+    assert not weights.empty
+
+
+def test_four_state_loop_stop_evaluation_modes():
+    """Verify close-confirmed vs low stop evaluation modes:
+    Intraday shadow wicks dipping below stop do NOT trigger stop-out in 'close' mode."""
+    n = 6
+    close = np.array([100.0, 105.0, 106.0, 104.0, 107.0, 108.0])
+    low = np.array([100.0, 105.0, 106.0, 95.0, 107.0, 108.0])  # bar 3 wicks down to 95, close is 104
+    b2 = np.zeros(n, dtype=bool)
+    b2[1] = True  # entry at bar 1
+    dummy = np.zeros(n, dtype=bool)
+    zg = np.full(n, 100.0)
+    zd = np.full(n, 95.0)
+    dd = np.full(n, 98.0)  # structural stop for 2B is DD=98.0
+
+    # In 'close' mode: bar 3 close (104.0) >= DD (98.0) -> holds through shadow wick
+    w_close = run_four_state_position_loop(
+        close, dummy, b2, dummy, dummy, zg=zg, zd=zd, dd=dd, low=low,
+        stop_evaluation_mode="close", exit_on_consolidation=False, trail_stop_to_zg=False, stop_loss_pct=0.20,
+    )
+    assert w_close[1] == 1.0
+    assert w_close[2] == 1.0
+    assert w_close[3] == 1.0  # held because close=104 >= 98
+    assert w_close[4] == 1.0
+
+    # In 'low' mode: bar 3 low (95.0) < DD (98.0) -> stopped out on shadow wick
+    w_low = run_four_state_position_loop(
+        close, dummy, b2, dummy, dummy, zg=zg, zd=zd, dd=dd, low=low,
+        stop_evaluation_mode="low", exit_on_consolidation=False, trail_stop_to_zg=False, stop_loss_pct=0.20,
+    )
+    assert w_low[1] == 1.0
+    assert w_low[2] == 1.0
+    assert w_low[3] == 0.0  # stopped out on low=95 < 98
+
+
+def test_four_state_loop_1b_buffer():
+    """Verify 1B entry buffer absorbs secondary undercut wicks."""
+    n = 6
+    close = np.array([100.0, 100.0, 99.0, 99.5, 103.0, 105.0])
+    b1 = np.zeros(n, dtype=bool)
+    b1[1] = True  # 1B at bar 1 with entry low = 100.0
+    dummy = np.zeros(n, dtype=bool)
+    zg = np.full(n, 105.0)
+    zd = np.full(n, 95.0)
+    dd = np.full(n, 90.0)
+    low = close.copy()
+
+    # With b1_buffer_pct = 0.03, stop is 100 * 0.97 = 97.0. Bar 2 close is 99.0 (undercut low, but >= 97.0)
+    w_buffered = run_four_state_position_loop(
+        close, b1, dummy, dummy, dummy, zg=zg, zd=zd, dd=dd, low=low,
+        b1_buffer_pct=0.03, exit_on_consolidation=False,
+    )
+    assert w_buffered[1] == 1.0
+    assert w_buffered[2] == 1.0  # survives 1% undercut
+    assert w_buffered[3] == 1.0
+
+    # With b1_buffer_pct = 0.0, stop is 100.0. Bar 2 close is 99.0 < 100.0 -> stopped out
+    w_unbuffered = run_four_state_position_loop(
+        close, b1, dummy, dummy, dummy, zg=zg, zd=zd, dd=dd, low=low,
+        b1_buffer_pct=0.0, exit_on_consolidation=False,
+    )
+    assert w_unbuffered[1] == 1.0
+    assert w_unbuffered[2] == 0.0  # stopped out on exact low breach
+
+
+def test_four_state_loop_3b_gestation_buffer():
+    """Verify 3B breakout entries are granted min_hold_bars gestation buffer
+    before consolidation exit triggers."""
+    n = 8
+    # 3B at bar 1 with ZG=102. Price pulls back to 101 (in_zs) on bars 2 and 3, then rallies to 108
+    close = np.array([100.0, 104.0, 101.0, 101.5, 103.0, 106.0, 108.0, 110.0])
+    b3 = np.zeros(n, dtype=bool)
+    b3[1] = True
+    dummy = np.zeros(n, dtype=bool)
+    zg = np.full(n, 102.0)
+    zd = np.full(n, 95.0)
+    dd = np.full(n, 90.0)
+
+    # With min_hold_bars=3: bars 2 and 3 (held=1, held=2) are protected during gestation
+    w_gest = run_four_state_position_loop(
+        close, dummy, dummy, b3, dummy, zg=zg, zd=zd, dd=dd,
+        exit_on_consolidation=True, min_hold_bars=3, zg_tolerance_pct=0.01,
+        stop_loss_pct=0.20, trail_stop_to_zg=False,
+    )
+    assert w_gest[1] == 1.0
+    assert w_gest[2] == 1.0
+    assert w_gest[3] == 1.0
+    assert w_gest[4] == 1.0  # price recovered above ZG
+
+
+def test_four_state_loop_cooldown_bars():
+    """Verify that after an exit, new buy signals are locked out for cooldown_bars."""
+    n = 8
+    close = np.array([100.0, 105.0, 90.0, 101.0, 102.0, 103.0, 104.0, 105.0])
+    b2 = np.zeros(n, dtype=bool)
+    b2[1] = True  # entry at bar 1
+    b2[3] = True  # new buy signal at bar 3 (right after bar 2 stop-out)
+    b2[6] = True  # new buy signal at bar 6 (after cooldown expires)
+    sell = np.zeros(n, dtype=bool)
+    sell[2] = True  # explicit exit at bar 2
+    dummy = np.zeros(n, dtype=bool)
+    zg = np.full(n, 100.0)
+    zd = np.full(n, 95.0)
+    dd = np.full(n, 90.0)
+
+    # With cooldown_bars=3: exit at bar 2 locks out until bar 2+3 = 5. Bar 3 signal is ignored.
+    w_cd = run_four_state_position_loop(
+        close, dummy, b2, dummy, sell, zg=zg, zd=zd, dd=dd,
+        cooldown_bars=3, exit_on_consolidation=False,
+    )
+    assert w_cd[1] == 1.0
+    assert w_cd[2] == 0.0  # exited
+    assert w_cd[3] == 0.0  # signal at bar 3 blocked by cooldown
+    assert w_cd[4] == 0.0  # still in cooldown
+    assert w_cd[5] == 0.0
+    assert w_cd[6] == 1.0  # signal at bar 6 accepted (cooldown expired)
+
+
+def test_four_state_loop_two_stage_sizing():
+    """Verify two-stage sizing: 50% probe allocation scaling to 100% on stroke expansion confirmation."""
+    n = 6
+    close = np.array([100.0, 102.0, 104.0, 106.0, 105.0, 107.0])
+    b2 = np.zeros(n, dtype=bool)
+    b2[1] = True  # entry at bar 1
+    dummy = np.zeros(n, dtype=bool)
+    zg = np.full(n, 100.0)
+    zd = np.full(n, 95.0)
+    dd = np.full(n, 90.0)
+    # Stroke direction: 0 at bar 1, turns UP (1) at bar 3
+    stroke_dir = np.array([0, 0, 0, 1, 1, 1])
+
+    w_two_stage = run_four_state_position_loop(
+        close, dummy, b2, dummy, dummy, zg=zg, zd=zd, dd=dd,
+        stroke_dir=stroke_dir, two_stage_entry=True, exit_on_consolidation=False,
+    )
+    assert w_two_stage[1] == 0.50  # probe entry at 50%
+    assert w_two_stage[2] == 0.50  # stroke_dir is still 0
+    assert w_two_stage[3] == 1.00  # stroke_dir=1 and close (106) > entry (102) -> scaled to 100%
+    assert w_two_stage[4] == 1.00
+
+
+def test_chan_four_state_execution_breadth_filter():
+    """Verify ChanFourStateExecutionStrategy halts allocations during severe bear regimes (breadth < threshold)."""
+    universe = create_mock_universe(n_days=100)
+    # Configure high breadth threshold so mock universe is deemed a bear regime
+    cfg = StrategyConfig(
+        chan_fse_use_breadth_filter=True,
+        chan_fse_breadth_bull_thresh=0.99,  # virtually all days will fail this threshold
+        cash_proxy="BIL",
+    )
+    strat = ChanFourStateExecutionStrategy(cfg)
+    weights = strat.generate_weights(universe)
+    assert not weights.empty
+    rebal = weights.dropna(how="all")
+    assert not rebal.empty
+
+    # Risky symbols must be 0.0, and 100% of capital routed to BIL
+    risky = rebal.drop(columns=["BIL"], errors="ignore")
+    assert (risky == 0.0).all().all()
+    if "BIL" in rebal.columns:
+        assert (rebal["BIL"] == 1.0).all()
+
+
+

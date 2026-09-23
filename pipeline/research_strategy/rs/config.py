@@ -335,6 +335,34 @@ class StrategyConfig:
     chan_comp_allow_flat_b2_b3: bool = True
     chan_comp_max_single_position: float = 0.20    # Hard maximum weight per individual stock (default: 20%)
     chan_comp_min_weight_change: float = 0.02      # Asset inertia filter threshold (default: 2%)
+    chan_comp_use_structural_stops: bool = True   # When True, enforces deterministic structural invalidation stops (Table 3)
+
+    # --- Chan Four-State Execution Strategy (chan_four_state_execution) ---
+    # Industrial-grade Chan execution strategy implementing the 4-state operational machine
+    # (BUY_CANDIDATE, HOLD, HOLD_ALERT, SELL_EXIT, WAIT_OBSERVE) with deterministic structural
+    # invalidation stops (1B bar low, 2B dd low, 3B zg pivot high), ratcheting trailing stop to ZG,
+    # moving average entanglement filter, and Lesson 16 zero-consolidation drag.
+    chan_fse_min_gap_bars: int = 4
+    chan_fse_min_strokes: int = 3
+    chan_fse_macd_fast: int = 12
+    chan_fse_macd_slow: int = 26
+    chan_fse_macd_signal: int = 9
+    chan_fse_stop_loss_pct: Optional[float] = 0.08
+    chan_fse_max_holding_days: Optional[int] = 90
+    chan_fse_exit_on_consolidation: bool = True
+    chan_fse_trail_stop_to_zg: bool = True
+    chan_fse_use_ma_filter: bool = True
+    chan_fse_max_single_position: float = 0.20
+    chan_fse_min_weight_change: float = 0.04
+    chan_fse_min_hold_bars: int = 5
+    chan_fse_zg_tolerance_pct: float = 0.025
+    chan_fse_cons_timeout_bars: int = 8
+    chan_fse_stop_evaluation_mode: str = "close"
+    chan_fse_b1_buffer_pct: float = 0.03
+    chan_fse_cooldown_bars: int = 4
+    chan_fse_two_stage_entry: bool = True
+    chan_fse_use_breadth_filter: bool = True
+    chan_fse_breadth_bull_thresh: float = 0.30
 
     # --- Chan Best Selector Meta-Strategy ---
     chan_best_lookback_days: int = 63
@@ -508,9 +536,9 @@ class StrategyConfig:
     # Derived from walkforward anomaly analysis: blends the top 3 adjusted-
     # Sharpe Chan strategies with position limits, drawdown circuit breakers,
     # and a minimum-weight-change threshold to curb excessive turnover.
-    crb_composite_weight: float = 0.45       # allocation to chan_composite
-    crb_three_type_weight: float = 0.35      # allocation to chan_three_type
-    crb_vaa_weight: float = 0.20             # allocation to chan_vaa_compound
+    crb_composite_weight: float = 0.20       # allocation to chan_composite
+    crb_three_type_weight: float = 0.40      # allocation to chan_three_type
+    crb_vaa_weight: float = 0.40             # allocation to chan_vaa_compound
     crb_max_single_position: float = 0.20    # hard cap per stock (prevents 100% concentration)
     crb_min_weight_change: float = 0.04      # skip rebalance trades below 4% change
     crb_dd_reduce_thresh: float = 0.10       # drawdown level to halve position sizes
@@ -518,9 +546,30 @@ class StrategyConfig:
     crb_dd_stop_thresh: float = 0.20         # drawdown level to exit to 100% cash
     crb_dynamic_cash_deployment: bool = True # dynamically deploy idle cash to active risky assets in bull breadth
     crb_breadth_lookback: int = 50           # lookback window for breadth SMA
-    crb_breadth_bull_thresh: float = 0.50    # breadth threshold for deploying idle cash
+    crb_breadth_bull_thresh: float = 0.30    # breadth threshold for deploying idle cash (lowered to 0.30)
+    crb_thrust_lookback: int = 10            # lookback window for short-term breadth thrust (Zweig 10-day thrust)
+    crb_thrust_thresh: float = 0.60          # breadth thrust threshold (fraction of assets with 10d ROC > 0)
     crb_target_bull_exposure: float = 0.80   # target equity exposure in bull breadth regime
     crb_bull_max_single_position: float = 0.30 # dynamically expanded single-stock cap in bull breadth (defaults to 0.30)
+
+    # --- Chan Four-State Risk-Managed Blend Strategy (chan_four_state_blend) ---
+    # Enhanced institutional ensemble blending ChanFourStateExecutionStrategy (20%),
+    # ChanThreeTypeStrategy (40%), and ChanVaaCompoundStrategy (40%) with institutional risk controls.
+    cfsb_four_state_weight: float = 0.20
+    cfsb_three_type_weight: float = 0.40
+    cfsb_vaa_weight: float = 0.40
+    cfsb_max_single_position: float = 0.20
+    cfsb_min_weight_change: float = 0.04
+    cfsb_dd_reduce_thresh: float = 0.10
+    cfsb_dd_defensive_thresh: float = 0.15
+    cfsb_dd_stop_thresh: float = 0.20
+    cfsb_dynamic_cash_deployment: bool = True
+    cfsb_breadth_lookback: int = 50
+    cfsb_breadth_bull_thresh: float = 0.30
+    cfsb_thrust_lookback: int = 10
+    cfsb_thrust_thresh: float = 0.60
+    cfsb_target_bull_exposure: float = 0.80
+    cfsb_bull_max_single_position: float = 0.30
 
     # --- Price Action Breakout & Retest Strategy (docs/chan_similar_trading.md Strategy 1) ---
     pabr_box_window: int = 20                # consolidation box length (~4 weeks)
@@ -650,6 +699,24 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.chanm_adv_min_gap_bars must be > 0, got {self.chanm_adv_min_gap_bars}")
         if self.chanm_adv_min_strokes < 3:
             raise ValueError(f"StrategyConfig.chanm_adv_min_strokes must be >= 3, got {self.chanm_adv_min_strokes}")
+        if self.chan_fse_min_gap_bars <= 0:
+            raise ValueError(f"StrategyConfig.chan_fse_min_gap_bars must be > 0, got {self.chan_fse_min_gap_bars}")
+        if self.chan_fse_min_strokes < 3:
+            raise ValueError(f"StrategyConfig.chan_fse_min_strokes must be >= 3, got {self.chan_fse_min_strokes}")
+        if self.chan_fse_min_hold_bars < 0:
+            raise ValueError(f"StrategyConfig.chan_fse_min_hold_bars must be >= 0, got {self.chan_fse_min_hold_bars}")
+        if self.chan_fse_zg_tolerance_pct < 0.0:
+            raise ValueError(f"StrategyConfig.chan_fse_zg_tolerance_pct must be >= 0, got {self.chan_fse_zg_tolerance_pct}")
+        if self.chan_fse_cons_timeout_bars < 0:
+            raise ValueError(f"StrategyConfig.chan_fse_cons_timeout_bars must be >= 0, got {self.chan_fse_cons_timeout_bars}")
+        if self.chan_fse_stop_evaluation_mode not in ("close", "low"):
+            raise ValueError(f"StrategyConfig.chan_fse_stop_evaluation_mode must be 'close' or 'low', got {self.chan_fse_stop_evaluation_mode}")
+        if self.chan_fse_b1_buffer_pct < 0.0:
+            raise ValueError(f"StrategyConfig.chan_fse_b1_buffer_pct must be >= 0, got {self.chan_fse_b1_buffer_pct}")
+        if self.chan_fse_cooldown_bars < 0:
+            raise ValueError(f"StrategyConfig.chan_fse_cooldown_bars must be >= 0, got {self.chan_fse_cooldown_bars}")
+        if not (0.0 <= self.chan_fse_breadth_bull_thresh <= 1.0):
+            raise ValueError(f"StrategyConfig.chan_fse_breadth_bull_thresh must be between 0 and 1, got {self.chan_fse_breadth_bull_thresh}")
         if self.chan_vaa_rebalance_freq_days <= 0:
             raise ValueError(f"StrategyConfig.chan_vaa_rebalance_freq_days must be > 0, got {self.chan_vaa_rebalance_freq_days}")
         if self.bb_period <= 0:
@@ -735,8 +802,26 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.crb_breadth_bull_thresh must be between 0 and 1, got {self.crb_breadth_bull_thresh}")
         if self.crb_breadth_lookback <= 0:
             raise ValueError(f"StrategyConfig.crb_breadth_lookback must be > 0, got {self.crb_breadth_lookback}")
+        if self.crb_thrust_lookback <= 0:
+            raise ValueError(f"StrategyConfig.crb_thrust_lookback must be > 0, got {self.crb_thrust_lookback}")
+        if not (0.0 < self.crb_thrust_thresh <= 1.0):
+            raise ValueError(f"StrategyConfig.crb_thrust_thresh must be between 0 and 1, got {self.crb_thrust_thresh}")
         if not (0.0 < self.crb_bull_max_single_position <= 1.0):
             raise ValueError(f"StrategyConfig.crb_bull_max_single_position must be between 0 and 1, got {self.crb_bull_max_single_position}")
+        if not (0.0 < self.cfsb_min_weight_change <= 1.0):
+            raise ValueError(f"StrategyConfig.cfsb_min_weight_change must be between 0 and 1, got {self.cfsb_min_weight_change}")
+        if not (0.0 < self.cfsb_target_bull_exposure <= 1.0):
+            raise ValueError(f"StrategyConfig.cfsb_target_bull_exposure must be between 0 and 1, got {self.cfsb_target_bull_exposure}")
+        if not (0.0 < self.cfsb_breadth_bull_thresh <= 1.0):
+            raise ValueError(f"StrategyConfig.cfsb_breadth_bull_thresh must be between 0 and 1, got {self.cfsb_breadth_bull_thresh}")
+        if self.cfsb_breadth_lookback <= 0:
+            raise ValueError(f"StrategyConfig.cfsb_breadth_lookback must be > 0, got {self.cfsb_breadth_lookback}")
+        if self.cfsb_thrust_lookback <= 0:
+            raise ValueError(f"StrategyConfig.cfsb_thrust_lookback must be > 0, got {self.cfsb_thrust_lookback}")
+        if not (0.0 < self.cfsb_thrust_thresh <= 1.0):
+            raise ValueError(f"StrategyConfig.cfsb_thrust_thresh must be between 0 and 1, got {self.cfsb_thrust_thresh}")
+        if not (0.0 < self.cfsb_bull_max_single_position <= 1.0):
+            raise ValueError(f"StrategyConfig.cfsb_bull_max_single_position must be between 0 and 1, got {self.cfsb_bull_max_single_position}")
 
     @classmethod
     def from_dict(cls, data: dict) -> "StrategyConfig":

@@ -2,7 +2,7 @@
 
 # 量化交易策略研究 (`research_strategy`)
 
-一个专门的子项目，实现并评估 43 种量化交易策略：从学术文献与从业者研究（*Journal of Finance*、*Journal of Portfolio Management*、SSRN、AllocateSmartly）中综合而成的战术资产配置 (TAA) 策略；单资产择时策略；Donchian 通道突破系统；现代热门静态/固定权重组合（永久组合、黄金蝴蝶、全天候、HFEA）；布林带通道突破与均值回归；残差动量与自适应快速扩张；涵盖 16 种策略的完整缠论及类似结构分析体系（缠中说禅：笔中枢移动、三类买卖点、MACD 背驰、多周期趋势共振、三买回抽、均值回归背驰、多阶段复合阶梯建仓、最优选择器元策略、风控混合策略、VAA 复合防御、中枢震荡监视器、斐波那契均线板块轮动，以及裸K形态回踩确认、成交量分布POC迁移与三浪斐波那契扩展）；宏观政体因子自适应复合引擎；以及采用核心-卫星配置架构的机构级多策略 Alpha 账簿 (`MultiStrategyAlphaBookStrategy`)。
+一个专门的子项目，实现并评估 44 种量化交易策略：从学术文献与从业者研究（*Journal of Finance*、*Journal of Portfolio Management*、SSRN、AllocateSmartly）中综合而成的战术资产配置 (TAA) 策略；单资产择时策略；Donchian 通道突破系统；现代热门静态/固定权重组合（永久组合、黄金蝴蝶、全天候、HFEA）；布林带通道突破与均值回归；残差动量与自适应快速扩张；涵盖 17 种策略的完整缠论及类似结构分析体系（缠中说禅：笔中枢移动、三类买卖点、MACD 背驰、多周期趋势共振、三买回抽、均值回归背驰、多阶段复合阶梯建仓、四态操作判定机、最优选择器元策略、风控混合策略、VAA 复合防御、中枢震荡监视器、斐波那契均线板块轮动，以及裸K形态回踩确认、成交量分布POC迁移与三浪斐波那契扩展）；宏观政体因子自适应复合引擎；以及采用核心-卫星配置架构的机构级多策略 Alpha 账簿 (`MultiStrategyAlphaBookStrategy`)。
 
 ---
 
@@ -105,32 +105,35 @@
 
 * **缠论三类买卖点** (`ChanThreeTypeStrategy`, `chan_three_type`)：对策略 18 的**增量扩展**，而非修改——`ChanPivotShiftStrategy`/`chan_structure.py` 保持原样不变，本策略作为对缠中说禅理论更贴近正式分类法的独立实现与其并存。在 `chan_structure.py` 的笔之上新增两层结构：线段（对真实特征序列终止规则的一种披露性价格近似）与线段级别的中枢（直接复用 `chan_structure.build_pivots`，仅将输入从笔换成线段）。将策略 18 的背驰代理替换为基于 `common.indicators.macd`（此前未被本项目任何策略使用）的真实 MACD 柱面积背驰，并实现正式的一/二/三类买卖点分类法：第一类买卖点是经 MACD 背驰确认的中枢突破/跌破；第二类买卖点是第一类点之后未创新极值的回抽失败点；第三类买卖点是突破后回抽不破中枢边缘的确认点（无需背驰）。完整的披露性简化见 `rs/chan_signals.py`。
 
-### 策略 22–30：高级缠论结构体系 (`rs/chan_advanced_strategies.py` 与 `rs/chan_lesson_strategies.py`)
+### 策略 22–32：高级缠论结构体系 (`rs/chan_advanced_strategies.py` 与 `rs/chan_lesson_strategies.py`)
 
 * **策略 22：缠论高级笔中枢移动 (MACD 版)** (`ChanPivotShiftMACDAdvStrategy`, `chan_pivot_shift_macd_adv`)：在策略 19 基础上引入大级别趋势过滤（200 日均线门控）与基于 ATR 的动态尾随风险缓冲区。
 * **策略 23：缠论多周期趋势共振** (`ChanMTFTrendStrategy`, `chan_mtf_trend`)：跨日线与模拟更高周期分型笔结构进行趋势共识验证，仅在多周期趋势共振向上时参与突破。在 21 折前行测试中位列 Tier 1 Alpha 领导者（夏普 1.29，CAGR 11.27%）。
 * **策略 24：缠论趋势第三类买点** (`ChanTrendThirdBuyStrategy`, `chan_trend_third_buy`)：严格实现第三类买点（三买）——捕获中枢向上突破后第一次次级别回抽且不跌回中枢上沿的强力趋势加速机会。Tier 1 Alpha 领导者（夏普 1.45，CAGR 15.18%）。
 * **策略 25：缠论均值回归背驰** (`ChanMeanReversionDivergenceStrategy`, `chan_mean_reversion_divergence`)：针对价格偏离中枢中心过远（极端中枢偏离度）并在 MACD 柱线上呈现明确底背驰时执行逆势高胜率反弹操作。Tier 2 稳健防守（夏普 2.26，CAGR 4.27%，最大回撤 3.8%）。
-* **策略 26：缠论多阶段阶梯复合** (`ChanCompositeStrategy`, `chan_composite`)：多阶段动态仓位构建体系，在一类底背驰（1/3 仓）、二类确认（1/3 仓）、三类突破（1/3 仓）顺势分批递增并附带跟踪止损。Tier 1 Alpha 领导者（夏普 1.53，CAGR 15.91%，最大回撤 5.71%，90.5% 正收益折数）。
-* **策略 27：缠论最优选择器元策略** (`ChanBestSelectorStrategy`, `chan_best_selector`)：动态评估各标的的缠论结构形态与所处阶段，为每只资产自适应路由最优信号模式（突破、回调或背驰）。
-* **策略 28：缠论中枢 MACD + VAA 复合策略** (`ChanVAACompoundStrategy`, `chan_vaa_compound`)：将缠论微观结构 Alpha 与 Keller & Keuning 的 VAA 13612W 金丝雀宏观风控结合，当宏观警报拉响时一键切换至避险防御资产（`BIL`、`IEF`）。Tier 1 Alpha 领导者（夏普 1.30，CAGR 14.25%，最大回撤 5.0%）。
-* **策略 29：缠论中枢区间震荡监视器** (`ChanPivotOscillationStrategy`, `chan_pivot_oscillation`)：在结构性盘整中枢形成期间，在中枢下沿边界逢低做多、中枢上沿减仓止盈的网格化区间策略。
-* **策略 30：缠论斐波那契均线板块强弱轮动** (`ChanFiboSectorStrengthStrategy`, `chan_fibo_sector_strength`)：利用 8/13/21/55/89 斐波那契均线束测算横截面板块动量强度，并以缠论中枢位确认突破质量。
+* **策略 26：缠论多阶段阶梯复合** (`ChanCompositeStrategy`, `chan_composite`)：多阶段动态仓位构建体系，在一类底背驰（1/3 仓）、二类确认（1/3 仓）、三类突破（1/3 仓）顺势分批递增并附带跟踪止损。支持可选的确定性结构失效止损（`chan_comp_use_structural_stops`）。Tier 1 Alpha 领导者（夏普 1.53，CAGR 15.91%，最大回撤 5.71%，90.5% 正收益折数）。
+* **策略 27：缠论四态操作判定机策略** (`ChanFourStateExecutionStrategy`, `chan_four_state_execution`)：工业级四态操作执行机（买入候选、持股、预警、退出与空仓观察），灵感源自缠论第 11–14、16、20、53 课。100% 原生实现于工作区基础设施之上，完全零外部库与代码仓依赖。严格落实确定性结构失效止损（1B 底分型低点、2B DD 次低点、3B ZG 突破中枢上沿）、跟踪止损抬升至 ZG、均线吻态缠绕过滤（Lessons 11-14 "吻"），以及第 16 课中小资金零盘整消耗原则（跌入中枢或盘整立即退出至 BIL 闲置资金代理）。
+* **策略 28：缠论最优选择器元策略** (`ChanBestSelectorStrategy`, `chan_best_selector`)：动态评估各标的的缠论结构形态与所处阶段，为每只资产自适应路由最优信号模式（突破、回调或背驰）。
+* **策略 29：缠论风控混合策略** (`ChanRiskManagedBlendStrategy`, `chan_risk_managed_blend`)：机构级组合策略，融合前行回测排名前三的缠论策略（VAA 复合 40%、三类买卖点 40%、阶梯复合 20%），并引入 20% 单票仓位上限（牛市广度扩容至 30%）、多阶回撤熔断（10% 减半、15% 切防守 VAA、20% 熔断）、4% 换手摩擦过滤、30% 市场宽度门槛，以及 10 日市场宽度冲力快速反弹动用现金机制。
+* **策略 30：缠论四态风控混合策略** (`ChanFourStateBlendStrategy`, `chan_four_state_blend`)：机构级组合策略，基于 `chan_risk_managed_blend`，将阶梯复合（Composite 20%）升级替换为缠论四态操作判定机（Four-State 20%），并保留三类买卖点（40%）与 VAA 复合（40%），配备 20% 单票仓位上限（牛市广度扩容至 30%）、多阶回撤熔断（10% 减半、15% 切防守 VAA、20% 熔断）、4% 换手摩擦过滤、30% 市场宽度门槛，以及 10 日市场宽度冲力快速反弹动用现金机制。
+* **策略 31：缠论中枢 MACD + VAA 复合策略** (`ChanVAACompoundStrategy`, `chan_vaa_compound`)：将缠论微观结构 Alpha 与 Keller & Keuning 的 VAA 13612W 金丝钱宏观风控结合，当宏观警报拉响时一键切换至避险防御资产（`BIL`、`IEF`）。Tier 1 Alpha 领导者（夏普 1.30，CAGR 14.25%，最大回撤 5.0%）。
+* **策略 32：缠论中枢区间震荡监视器** (`ChanPivotOscillationStrategy`, `chan_pivot_oscillation`)：在结构性盘整中枢形成期间，在中枢下沿边界逢低做多、中枢上沿减仓止盈的网格化区间策略。
+* **策略 33：缠论斐波那契均线板块强弱轮动** (`ChanFiboSectorStrengthStrategy`, `chan_fibo_sector_strength`)：利用 8/13/21/55/89 斐波那契均线束测算横截面板块动量强度，并以缠论中枢位确认突破质量。
 
-### 策略 31–36：扩展 TAA、波动率与因子策略 (`rs/taa_strategies.py`, `rs/bollinger_strategy.py`, `rs/residual_momentum_strategy.py`, `rs/adaptive_fast_expansion_strategy.py`)
+### 策略 34–39：扩展 TAA、波动率与因子策略 (`rs/taa_strategies.py`, `rs/bollinger_strategy.py`, `rs/residual_momentum_strategy.py`, `rs/adaptive_fast_expansion_strategy.py`)
 
-* **策略 31：混合资产配置 (HAA)** (`HybridAssetAllocation`, `hybrid_asset_allocation`)：Wouter Keller (2023, SSRN)。单金丝雀资产 (`TIP`) 驱动，在平静期持有前 4 种高动量进攻资产，在动荡期配置防御避险资产 (`IEF`, `BIL`)。
-* **策略 32：防御资产配置 (DAA)** (`DefensiveAssetAllocation`, `defensive_asset_allocation`)：Wouter Keller & Jan Willem Keuning (2018, SSRN)。双金丝雀 (`VWO`, `BND`) 动态预警，在平静期分配至前 6 只进攻资产，在半崩盘或全崩盘状态下按 50%–100% 比例转入防御资产 (`IEF`, `LQD`, `BIL`)。
-* **策略 33：布林带挤压突破（方法一）** (`BollingerBreakoutStrategy`, `bollinger_breakout`)：John Bollinger (2001, *Bollinger on Bollinger Bands*)。识别波动率极限压缩区间（带宽处于 126 日低位），在向上放量破轨时顺势做多。
-* **策略 34：布林带均值回归（方法三）** (`BollingerMeanReversionStrategy`, `bollinger_mean_reversion`)：布林带 %b 摆动指标，在价格深跌下破下轨（%b < 0.05）且 RSI 超卖时入场博取回归 20 日中轨。
-* **策略 35：残差动量策略** (`ResidualMomentumStrategy`, `residual_momentum`)：David Blitz, Juan Pang & Pim van Vliet (2013, *Journal of Empirical Finance*)。通过对基准 (`SPY`) 滚动 36 个月回归剥离市场 Beta 暴露，按 12 个月特质性残差收益与残差风险之比进行横截面排序配置。
-* **策略 36：自适应快速扩张策略** (`AdaptiveFastExpansionStrategy`, `adaptive_fast_expansion`)：利用自适应动态 ATR 管道捕捉波动率政体跳变初期的动能爆发。
+* **策略 34：混合资产配置 (HAA)** (`HybridAssetAllocation`, `hybrid_asset_allocation`)：Wouter Keller (2023, SSRN)。单金丝雀资产 (`TIP`) 驱动，在平静期持有前 4 种高动量进攻资产，在动荡期配置防御避险资产 (`IEF`, `BIL`)。
+* **策略 35：防御资产配置 (DAA)** (`DefensiveAssetAllocation`, `defensive_asset_allocation`)：Wouter Keller & Jan Willem Keuning (2018, SSRN)。双金丝雀 (`VWO`, `BND`) 动态预警，在平静期分配至前 6 只进攻资产，在半崩盘或全崩盘状态下按 50%–100% 比例转入防御资产 (`IEF`, `LQD`, `BIL`)。
+* **策略 36：布林带挤压突破（方法一）** (`BollingerBreakoutStrategy`, `bollinger_breakout`)：John Bollinger (2001, *Bollinger on Bollinger Bands*)。识别波动率极限压缩区间（带宽处于 126 日低位），在向上放量破轨时顺势做多。
+* **策略 37：布林带均值回归（方法三）** (`BollingerMeanReversionStrategy`, `bollinger_mean_reversion`)：布林带 %b 摆动指标，在价格深跌下破下轨（%b < 0.05）且 RSI 超卖时入场博取回归 20 日中轨。
+* **策略 38：残差动量策略** (`ResidualMomentumStrategy`, `residual_momentum`)：David Blitz, Juan Pang & Pim van Vliet (2013, *Journal of Empirical Finance*)。通过对基准 (`SPY`) 滚动 36 个月回归剥离市场 Beta 暴露，按 12 个月特质性残差收益与残差风险之比进行横截面排序配置。
+* **策略 39：自适应快速扩张策略** (`AdaptiveFastExpansionStrategy`, `adaptive_fast_expansion`)：利用自适应动态 ATR 管道捕捉波动率政体跳变初期的动能爆发。
 
-### 策略 37：宏观政体因子自适应复合策略 (`rs/regime_factor_compound_strategy.py`)
+### 策略 40：宏观政体因子自适应复合策略 (`rs/regime_factor_compound_strategy.py`)
 
 * **宏观政体因子自适应复合策略** (`RegimeFactorCompoundStrategy`, `regime_factor_compound`)：基于经济增长、通胀与流动性利率指标识别宏观政体（增长/通胀/紧缩），按逆波动率风险平价加权在动量、套息、低波与防御因子间动态分配风险预算。
 
-### 策略 38：机构级多策略 Alpha 账簿——最优核心-卫星蓝图 (`rs/multi_strategy_alpha_book.py`)
+### 策略 41：机构级多策略 Alpha 账簿——最优核心-卫星蓝图 (`rs/multi_strategy_alpha_book.py`)
 
 * **学术与从业者背景**：多策略 Pod 独立运行架构（Millennium、Point72、Citadel；Blitz 2024；Roncalli 2013 风险预算管理；Quant Memo 2026）。
 * **核心-卫星架构矩阵 (`ms_pod_preset="core_satellite"`)**：
@@ -151,6 +154,12 @@
   - Calmar 比率：**3.15**（升级前 2.53）
   - 正收益折胜率：**85.71%**（18/21 折盈利，升级前 66.67%）
   - 战胜 SPY 基准概率：**42.86%**（升级前 19.05%）
+
+### 策略 42–44：缠论类似结构与价格行为模型 (`rs/chan_similar_strategies.py`)
+
+* **策略 42：价格行为突破回踩确认策略** (`PriceActionBreakoutRetestStrategy`, `pa_breakout_retest`)：盘整箱体向上突破伴随成交量放大，且必须满足回踩不破箱体上沿的二次确认入场。
+* **策略 43：成交量分布 POC 迁移策略** (`VolumeProfilePocMigrationStrategy`, `vp_poc_migration`)：滚动计算成交量分布（Volume Profile），追踪控制点（POC）与价值区间（VA）的上移，回踩上涨 POC 时逢低建仓。
+* **策略 44：改进型艾略特三浪斐波那契策略** (`Wave3FibonacciStrategy`, `wave3_fibonacci`)：识别 5 浪推动结构，在二浪回调至斐波那契回撤位（38.2%–61.8%）时入场，博取强劲的三浪主升浪扩展。
 
 ---
 
@@ -185,7 +194,7 @@ pipeline/research_strategy/
 │   ├── nl_parser.py                      # 自然语言描述 -> ParsedStrategySpec
 │   ├── chan_structure.py                 # 独立缠论结构检测器（分型/笔/枢轴）
 │   ├── chan_signals.py                   # 增量扩展：线段、真实 MACD 背驰、一/二/三类买卖点
-│   ├── chan_advanced_strategies.py       # 高级缠论策略集（多周期共振、三买回抽、均值回归、阶梯复合、风控混合、VAA 复合、最优选择）
+│   ├── chan_advanced_strategies.py       # 高级缠论策略集（多周期共振、三买回抽、均值回归、阶梯复合、四态操作判定机、风控混合、VAA 复合、最优选择）
 │   ├── chan_similar_strategies.py        # 缠论类似模型（裸K形态回踩确认、成交量分布POC迁移、三浪斐波那契扩展）
 │   ├── chan_lesson_strategies.py         # 缠论教程拓展策略（中枢震荡监视器、斐波那契均线板块轮动）
 │   ├── taa_strategies.py                 # 拓展战术资产配置策略（PAA、AAA、HAA、DAA）
@@ -196,7 +205,7 @@ pipeline/research_strategy/
 │   ├── multi_strategy_alpha_book.py      # 机构级多策略 Alpha 账簿（最优核心-卫星蓝图）
 │   ├── timing_aspects.py                 # 单资产择时模板的入场 x 出场/风控要素分解
 │   └── strategy.py                       # NaturalLanguageStrategy 引擎与策略实现
-├── strategies_config.json                # 包含 43 个策略和参数的中央 JSON 配置
+├── strategies_config.json                # 包含 44 个策略和参数的中央 JSON 配置
 ├── run_research_strategy.py              # 动态加载策略配置的 CLI 运行器
 ├── dashboard.py                          # 终端 ASCII 报告查看器
 ├── tests/

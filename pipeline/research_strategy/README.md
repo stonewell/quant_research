@@ -2,7 +2,7 @@
 
 # Researched Quantitative Trading Strategies (`research_strategy`)
 
-A dedicated side project implementing and evaluating forty-three (43) quantitative trading strategies: tactical asset allocation (TAA) strategies synthesized from academic literature and practitioner research (*Journal of Finance*, *Journal of Portfolio Management*, SSRN, AllocateSmartly), single-asset timing strategies, Donchian channel breakout systems, modern static/fixed-weight portfolios (Permanent Portfolio, Golden Butterfly, All Weather, HFEA), Bollinger band systems, residual momentum, adaptive fast expansion, an extensive Chan structural analysis suite (缠中说禅: pivot shift, three-type points, MACD divergence, multi-timeframe trend, third buy, mean reversion divergence, composite multi-stage, best selector, risk-managed blend, VAA compound, pivot oscillation, Fibonacci sector strength, plus Price Action, Volume Profile POC, and Wave 3 Fibonacci models), macro regime factor compounders, and an institutional Multi-Strategy Alpha Book engine with optimal Core-Satellite allocation.
+A dedicated side project implementing and evaluating forty-four (44) quantitative trading strategies: tactical asset allocation (TAA) strategies synthesized from academic literature and practitioner research (*Journal of Finance*, *Journal of Portfolio Management*, SSRN, AllocateSmartly), single-asset timing strategies, Donchian channel breakout systems, modern static/fixed-weight portfolios (Permanent Portfolio, Golden Butterfly, All Weather, HFEA), Bollinger band systems, residual momentum, adaptive fast expansion, an extensive Chan structural analysis suite (缠中说禅: pivot shift, three-type points, MACD divergence, multi-timeframe trend, third buy, mean reversion divergence, composite multi-stage, four-state execution machine, best selector, risk-managed blend, VAA compound, pivot oscillation, Fibonacci sector strength, plus Price Action, Volume Profile POC, and Wave 3 Fibonacci models), macro regime factor compounders, and an institutional Multi-Strategy Alpha Book engine with optimal Core-Satellite allocation.
 
 ---
 
@@ -109,32 +109,35 @@ A dedicated research pass specifically looked for strategies that are genuinely 
 
 * **Chan Three-Type Buy/Sell Points** (`ChanThreeTypeStrategy`, `chan_three_type`): an ADDITIVE extension of Strategy 18 above, not a modification of it — `ChanPivotShiftStrategy`/`chan_structure.py` are left exactly as they are, and this strategy coexists alongside it as its own independent reading of 缠中说禅 ("Chan theory"), one level closer to the formal published taxonomy. Adds two structural layers on top of `chan_structure.py`'s strokes: segments (线段, a disclosed price-only proxy for the real characteristic-sequence termination rule) and segment-level pivots (built by reusing `chan_structure.build_pivots` verbatim on segments instead of strokes). Replaces the Strategy 18 divergence proxy with real MACD-histogram-area divergence (背驰, via `common.indicators.macd`, previously unused by any strategy in this project) and implements the formal first/second/third-type buy/sell point taxonomy (一/二/三类买卖点): a first-type point is a pivot breakdown/breakout confirmed by MACD divergence between the entering and leaving move; a second-type point is a failed follow-through after a first-type point (a retest that doesn't make a new extreme); a third-type point is a breakout retest that holds the pivot's own band edge, with no divergence check. See `rs/chan_signals.py` for the full disclosed simplifications at each new stage.
 
-### Strategy 22–30: Advanced Chan Structural Suite (`rs/chan_advanced_strategies.py` & `rs/chan_lesson_strategies.py`)
+### Strategy 22–33: Advanced Chan Structural Suite (`rs/chan_advanced_strategies.py` & `rs/chan_lesson_strategies.py`)
 
 * **Strategy 22: Chan Pivot Shift MACD Advanced** (`ChanPivotShiftMACDAdvStrategy`, `chan_pivot_shift_macd_adv`): Builds on Strategy 19 by adding higher-timeframe trend alignment (200-day SMA gate) and dynamic ATR-based trailing risk buffers around structural pivot shift entries.
 * **Strategy 23: Chan Multi-Timeframe Trend** (`ChanMTFTrendStrategy`, `chan_mtf_trend`): Evaluates multi-timeframe fractal strokes (simulating higher-timeframe bi structure by aggregating daily bars) to enforce trend consensus before trading pivot breakouts. Ranked Tier 1 Alpha Leader in 21-fold walkforward testing (Sharpe 1.29, CAGR 11.27%).
 * **Strategy 24: Chan Trend Third Buy** (`ChanTrendThirdBuyStrategy`, `chan_trend_third_buy`): Strict implementation of the Chan third-type buy point (三类买点) — trades the first pullback after a pivot breakout that holds above the prior pivot high without returning into the pivot interior. Tier 1 Alpha Leader (Sharpe 1.45, CAGR 15.18%).
 * **Strategy 25: Chan Mean-Reversion Divergence** (`ChanMeanReversionDivergenceStrategy`, `chan_mean_reversion_divergence`): Counter-trend mean reversion targeting extreme deviations from pivot center bands, confirmed by MACD bottom divergence. Tier 2 Capital Preservation (Sharpe 2.26, CAGR 4.27%, MaxDD 3.8%).
-* **Strategy 26: Chan Composite Multi-Stage Scaling** (`ChanCompositeStrategy`, `chan_composite`): Multi-stage position builder combining 1st, 2nd, and 3rd buy points with progressive scaling (1/3rd initial on bottom divergence, 1/3rd on 2nd buy confirmation, 1/3rd on 3rd buy breakout). Tier 1 Alpha Leader (Sharpe 1.53, CAGR 15.91%, MaxDD 5.71%, 90.5% positive folds).
-* **Strategy 27: Chan Best Selector Compound Meta-Strategy** (`ChanBestSelectorStrategy`, `chan_best_selector`): Evaluates each asset's Chan structural state and routes capital to the strongest signal mode (breakout, pullback, or divergence).
-* **Strategy 28: Chan Pivot Shift MACD + VAA Optimal Compound** (`ChanVAACompoundStrategy`, `chan_vaa_compound`): Combines structural Chan alpha with Keller & Keuning's VAA 13612W multi-canary tactical defense overlay, routing to defensive assets (`BIL`, `IEF`) when macro risk triggers. Tier 1 Alpha Leader (Sharpe 1.30, CAGR 14.25%, MaxDD 5.0%).
-* **Strategy 29: Chan Pivot-Oscillation Monitor** (`ChanPivotOscillationStrategy`, `chan_pivot_oscillation`): Intra-pivot range trading oscillating between the lower support and upper resistance bands of active consolidation pivots.
-* **Strategy 30: Chan Fibonacci MA Sector-Strength Rotation** (`ChanFiboSectorStrengthStrategy`, `chan_fibo_sector_strength`): Fibonacci moving average ribbons (8, 13, 21, 55, 89) measuring cross-sectional sector momentum, confirmed by Chan structural pivot shifts.
+* **Strategy 26: Chan Composite Multi-Stage Scaling** (`ChanCompositeStrategy`, `chan_composite`): Multi-stage position builder combining 1st, 2nd, and 3rd buy points with progressive scaling (1/3rd initial on bottom divergence, 1/3rd on 2nd buy confirmation, 1/3rd on 3rd buy breakout). Supports optional deterministic structural breakout invalidation stops (`chan_comp_use_structural_stops`). Tier 1 Alpha Leader (Sharpe 1.53, CAGR 15.91%, MaxDD 5.71%, 90.5% positive folds).
+* **Strategy 27: Chan Four-State Operational Machine** (`ChanFourStateExecutionStrategy`, `chan_four_state_execution`): Industrial-grade 4-state operational execution machine (BUY_CANDIDATE, HOLD, HOLD_ALERT, SELL_EXIT, WAIT_OBSERVE) inspired by Lessons 11-14, 16, 20, 53. Built 100% natively on workspace primitives with zero external library/repository dependencies. Enforces deterministic structural invalidation stops (1B fractal low, 2B dd swing low, 3B zg breakout pivot), ratcheting trailing stop to ZG, moving average entanglement filter, and Lesson 16 zero-consolidation drag (immediately exiting consolidation drag to 0.0 into BIL).
+* **Strategy 28: Chan Best Selector Compound Meta-Strategy** (`ChanBestSelectorStrategy`, `chan_best_selector`): Evaluates each asset's Chan structural state and routes capital to the strongest signal mode (breakout, pullback, or divergence).
+* **Strategy 29: Chan Risk-Managed Blend Strategy** (`ChanRiskManagedBlendStrategy`, `chan_risk_managed_blend`): Institutional ensemble blending the top 3 walkforward-optimized Chan strategies (chan_vaa_compound 40%, chan_three_type 40%, chan_composite 20%) with hard 20% single-stock caps (expanding to 30% in bull breadth), multi-tier drawdown circuit breakers (halve at 10%, defensive VAA at 15%, stop at 20%), 4% turnover friction filter, 30% breadth bull threshold, and 10-day breadth thrust fast recovery override.
+* **Strategy 30: Chan Four-State Risk-Managed Blend Strategy** (`ChanFourStateBlendStrategy`, `chan_four_state_blend`): Institutional ensemble based on Chan Risk-Managed Blend, replacing Chan Composite (20%) with Chan Four-State Execution Strategy (20%) alongside Chan Three-Type (40%) and Chan VAA Compound (40%), with hard 20% single-stock caps (expanding to 30% in bull breadth), multi-tier drawdown circuit breakers (halve at 10%, defensive VAA at 15%, stop at 20%), 4% turnover friction filter, 30% breadth bull threshold, and 10-day breadth thrust fast recovery override.
+* **Strategy 31: Chan Pivot Shift MACD + VAA Optimal Compound** (`ChanVAACompoundStrategy`, `chan_vaa_compound`): Combines structural Chan alpha with Keller & Keuning's VAA 13612W multi-canary tactical defense overlay, routing to defensive assets (`BIL`, `IEF`) when macro risk triggers. Tier 1 Alpha Leader (Sharpe 1.30, CAGR 14.25%, MaxDD 5.0%).
+* **Strategy 32: Chan Pivot-Oscillation Monitor** (`ChanPivotOscillationStrategy`, `chan_pivot_oscillation`): Intra-pivot range trading oscillating between the lower support and upper resistance bands of active consolidation pivots.
+* **Strategy 33: Chan Fibonacci MA Sector-Strength Rotation** (`ChanFiboSectorStrengthStrategy`, `chan_fibo_sector_strength`): Fibonacci moving average ribbons (8, 13, 21, 55, 89) measuring cross-sectional sector momentum, confirmed by Chan structural pivot shifts.
 
-### Strategy 31–36: Extended TAA, Volatility & Factor Strategies (`rs/taa_strategies.py`, `rs/bollinger_strategy.py`, `rs/residual_momentum_strategy.py`, `rs/adaptive_fast_expansion_strategy.py`)
+### Strategy 34–39: Extended TAA, Volatility & Factor Strategies (`rs/taa_strategies.py`, `rs/bollinger_strategy.py`, `rs/residual_momentum_strategy.py`, `rs/adaptive_fast_expansion_strategy.py`)
 
-* **Strategy 31: Hybrid Asset Allocation (HAA)** (`HybridAssetAllocation`, `hybrid_asset_allocation`): Wouter Keller (2023, SSRN). Evaluates a single canary asset (`TIP`). In calm markets (TIP 13612W momentum > 0), allocates to the top 4 offensive assets; in turbulent markets, rotates to defensive assets (`IEF`, `BIL`).
-* **Strategy 32: Defensive Asset Allocation (DAA)** (`DefensiveAssetAllocation`, `defensive_asset_allocation`): Wouter Keller & Jan Willem Keuning (2018, SSRN). Uses a dual-canary universe (`VWO`, `BND`) to determine market stress. In calm regimes (both canaries positive), splits across top 6 offensive assets; in half-crash or full-crash regimes, rotates 50% to 100% into defensive assets (`IEF`, `LQD`, `BIL`).
-* **Strategy 33: Bollinger Bands Squeeze Breakout (Method I)** (`BollingerBreakoutStrategy`, `bollinger_breakout`): John Bollinger (2001, *Bollinger on Bollinger Bands*). Detects low-volatility compression (BandWidth at 126-day lows) and enters long on upper-band breakouts with volume/bandwidth expansion confirmation.
-* **Strategy 34: Bollinger Bands Mean Reversion (Method III)** (`BollingerMeanReversionStrategy`, `bollinger_mean_reversion`): Bollinger %b oscillator buying deep dips below the lower band (%b < 0.05) with RSI confirmation, exiting at the 20-day middle moving average.
-* **Strategy 35: Residual Momentum Strategy** (`ResidualMomentumStrategy`, `residual_momentum`): David Blitz, Juan Pang & Pim van Vliet (2013, *Journal of Empirical Finance*). Regresses rolling 36-month asset returns against the market benchmark (`SPY`) to isolate idiosyncratic returns, ranking assets by 12-month residual momentum divided by residual risk.
-* **Strategy 36: Adaptive Fast Expansion Strategy** (`AdaptiveFastExpansionStrategy`, `adaptive_fast_expansion`): Volatility expansion thrust system capturing structural volatility regime transitions via dynamic ATR bands.
+* **Strategy 34: Hybrid Asset Allocation (HAA)** (`HybridAssetAllocation`, `hybrid_asset_allocation`): Wouter Keller (2023, SSRN). Evaluates a single canary asset (`TIP`). In calm markets (TIP 13612W momentum > 0), allocates to the top 4 offensive assets; in turbulent markets, rotates to defensive assets (`IEF`, `BIL`).
+* **Strategy 35: Defensive Asset Allocation (DAA)** (`DefensiveAssetAllocation`, `defensive_asset_allocation`): Wouter Keller & Jan Willem Keuning (2018, SSRN). Uses a dual-canary universe (`VWO`, `BND`) to determine market stress. In calm regimes (both canaries positive), splits across top 6 offensive assets; in half-crash or full-crash regimes, rotates 50% to 100% into defensive assets (`IEF`, `LQD`, `BIL`).
+* **Strategy 36: Bollinger Bands Squeeze Breakout (Method I)** (`BollingerBreakoutStrategy`, `bollinger_breakout`): John Bollinger (2001, *Bollinger on Bollinger Bands*). Detects low-volatility compression (BandWidth at 126-day lows) and enters long on upper-band breakouts with volume/bandwidth expansion confirmation.
+* **Strategy 37: Bollinger Bands Mean Reversion (Method III)** (`BollingerMeanReversionStrategy`, `bollinger_mean_reversion`): Bollinger %b oscillator buying deep dips below the lower band (%b < 0.05) with RSI confirmation, exiting at the 20-day middle moving average.
+* **Strategy 38: Residual Momentum Strategy** (`ResidualMomentumStrategy`, `residual_momentum`): David Blitz, Juan Pang & Pim van Vliet (2013, *Journal of Empirical Finance*). Regresses rolling 36-month asset returns against the market benchmark (`SPY`) to isolate idiosyncratic returns, ranking assets by 12-month residual momentum divided by residual risk.
+* **Strategy 39: Adaptive Fast Expansion Strategy** (`AdaptiveFastExpansionStrategy`, `adaptive_fast_expansion`): Volatility expansion thrust system capturing structural volatility regime transitions via dynamic ATR bands.
 
-### Strategy 37: Macro Regime Factor Adaptive Compound Strategy (`rs/regime_factor_compound_strategy.py`)
+### Strategy 40: Macro Regime Factor Adaptive Compound Strategy (`rs/regime_factor_compound_strategy.py`)
 
 * **Macro Regime Factor Adaptive Compound Strategy** (`RegimeFactorCompoundStrategy`, `regime_factor_compound`): Dynamic multi-factor allocation engine that classifies the macro environment into Growth, Inflation, and Deflation regimes using canary moving averages and yield spreads, allocating risk budgets across momentum, carry, and quality factors with inverse-volatility weighting.
 
-### Strategy 38: Multi-Strategy Alpha Book — Optimal Core-Satellite Blueprint (`rs/multi_strategy_alpha_book.py`)
+### Strategy 41: Multi-Strategy Alpha Book — Optimal Core-Satellite Blueprint (`rs/multi_strategy_alpha_book.py`)
 
 * **Academic & Quantitative Grounding**: Multi-strategy pod architecture (Millennium, Point72, Citadel; Blitz 2024; Roncalli 2013 Risk Budgeting; Quant Memo 2026).
 * **Core-Satellite Architecture (`ms_pod_preset="core_satellite"`)**:
@@ -148,13 +151,12 @@ A dedicated research pass specifically looked for strategies that are genuinely 
   2. **Fast-Recovery Drawdown Regularization**: Continuous damping $D_p = \max(0.20, 1.0 - \text{DD}_p / 0.15)$ replacing destructive 80% quarantine cliffs. Cleared **immediately** when the pod's 10-day trailing return turns positive ($R_{10d} > 0$), preventing trough lockouts.
   3. **Equity-Growth Breadth Risk-Throttle**: Computes 200-day SMA breadth strictly across growth/equity assets (`growth_symbols > 200d SMA`), decoupling equity risk from fixed-income rate cycle bear markets (e.g. 2022–2024). A 15-day breadth thrust override (>0.65) immediately restores gross exposure.
   4. **Pod-Native Sparse Execution (`ms_execution_mode="pod_native_sparse"`)**: Preserves underlying intra-month tactical rotation dates, blends daily target allocations, and applies the strict sparse contract with explicit `0.0` writes and idle cash in `BIL`.
-* **Empirical 21-Fold Walk-Forward Performance (2015–2026, 10.5+ Years)**:
-  - Mean Sharpe Ratio: **1.15** (vs. baseline 0.82, +40.2%)
-  - Mean CAGR: **12.49%** (vs. baseline 4.71%, +165.1%)
-  - Worst Fold Max Drawdown: **13.95%** (vs. baseline 18.04%, -22.7% tail risk)
-  - Calmar Ratio: **3.15** (vs. baseline 2.53)
-  - Positive Folds Win Rate: **85.71%** (18/21 folds positive, vs. baseline 66.67%)
-  - Beat SPY Baseline %: **42.86%** (vs. baseline 19.05%)
+
+### Strategy 42–44: Chan-Similar Structural & Price Action Models (`rs/chan_similar_strategies.py`)
+
+* **Strategy 42: Price Action Breakout & Retest Strategy** (`PriceActionBreakoutRetestStrategy`, `pa_breakout_retest`): Consolidation box breakout with volume expansion and strict pull-back retest confirmation above box high.
+* **Strategy 43: Volume Profile POC Migration Strategy** (`VolumeProfilePocMigrationStrategy`, `vp_poc_migration`): Rolling volume profile tracking upward Point of Control (POC) and Value Area migrations, buying pullbacks to rising POCs.
+* **Strategy 44: Modified Elliott Wave 3 Fibonacci Strategy** (`Wave3FibonacciStrategy`, `wave3_fibonacci`): Detects 5-wave impulsive structures, buying Wave 2 retracements (38.2% - 61.8%) targeting extended Wave 3 impulse expansions.
 
 ### What was researched but NOT implemented in this pass
 
@@ -270,7 +272,7 @@ pipeline/research_strategy/
 │   ├── nl_parser.py                      # Plain-English strategy description -> ParsedStrategySpec
 │   ├── chan_structure.py                 # Independent Chan-theory structure detector (fractals/strokes/pivots)
 │   ├── chan_signals.py                   # Segments, real MACD divergence, 一/二/三类买卖点
-│   ├── chan_advanced_strategies.py       # Advanced Chan suite (MTF, Third Buy, Mean Reversion, Composite, Risk-Managed Blend, VAA Compound, Best Selector)
+│   ├── chan_advanced_strategies.py       # Advanced Chan suite (MTF, Third Buy, Mean Reversion, Composite, Four-State Execution, Risk-Managed Blend, VAA Compound, Best Selector)
 │   ├── chan_similar_strategies.py        # Chan-similar models (Price Action Breakout Retest, Volume Profile POC Migration, Wave 3 Fibonacci)
 │   ├── chan_lesson_strategies.py         # Chan lesson strategies (Pivot Oscillation, Fibonacci Sector Strength)
 │   ├── taa_strategies.py                 # Extended TAA strategies (PAA, AAA, HAA, DAA)
@@ -281,7 +283,7 @@ pipeline/research_strategy/
 │   ├── multi_strategy_alpha_book.py      # Institutional Multi-Strategy Alpha Book (Optimal Core-Satellite Blueprint)
 │   ├── timing_aspects.py                 # Entry x exit/risk aspect decomposition for single-asset timing templates
 │   └── strategy.py                       # NaturalLanguageStrategy engine + consolidated strategy implementations
-├── strategies_config.json                # Central JSON configuration for 43 strategies & parameters
+├── strategies_config.json                # Central JSON configuration for 44 strategies & parameters
 ├── run_research_strategy.py              # CLI runner loading strategy configs dynamically
 ├── dashboard.py                          # Terminal ASCII report viewer
 ├── tests/

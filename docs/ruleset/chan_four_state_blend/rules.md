@@ -1,25 +1,30 @@
-# Chan Risk-Managed Blend: Live Trading Operating Manual & Rulebook
+# Chan Four-State Risk-Managed Blend Strategy: Live Trading Operating Manual & Rulebook
 
-> **Strategy Identifier**: `chan_risk_managed_blend` ([`ChanRiskManagedBlendStrategy`](file:///home/stone/Work/github/quant/pipeline/research_strategy/rs/chan_advanced_strategies.py#L1193-L1453))  
-> **Instrument Context**: Equity / ETF Universe (US Equities or China A-Shares) + Cash Proxy ([`BIL`](file:///home/stone/Work/github/quant/pipeline/research_strategy/strategies_config.json#L295) / `511880` / `511990` / Overnight Repo)  
-> **Trading Frequency**: Daily rebalance evaluation, executing primarily between **14:00 – 14:50** (to avoid open auction volatility and end-of-day market-on-close distortions).
+> **Strategy Identifier**: `chan_four_state_blend` ([`ChanFourStateBlendStrategy`](file:///home/stone/Work/github/quant/pipeline/research_strategy/rs/chan_advanced_strategies.py#L1768-L2078))  
+> **Instrument Context**: Equity / ETF Universe (US Equities or China A-Shares) + Cash Proxy ([`BIL`](file:///home/stone/Work/github/quant/pipeline/research_strategy/strategies_config.json) / `511880` / `511990` / Overnight Repo)  
+> **Trading Frequency**: Daily rebalance evaluation, executing primarily between **14:00 – 14:50** (to avoid open auction volatility and end-of-day market-on-close distortions).  
+> **Underlying Factors**: `regime_trend_strength`, `absolute_momentum_trend`, `relative_momentum`, `volatility_targeting`
 
 ---
 
 ## 1. Strategy Identity & Architecture Overview
 
-The **Chan Risk-Managed Blend Strategy** is an institutional multi-strategy portfolio designed to combine micro/macro structural price action alpha with rigorous risk controls and dynamic capital allocation.
+The **Chan Four-State Risk-Managed Blend Strategy** is an institutional multi-strategy portfolio based directly on the validated `ChanRiskManagedBlendStrategy` architecture, but replaces the multi-stage composite scaling sleeve with the industrial 4-state operational execution machine (`ChanFourStateExecutionStrategy`):
 
 ### Core Model Triad & Baseline Allocations
-* **40% `ChanVaaCompoundStrategy`**: VAA-G4 13612W dual-momentum macro regime crash protection buffer & defensive anchor.
+* **40% `ChanVaaCompoundStrategy`**: Dual-momentum VAA-G4 13612W macro regime crash protection buffer & defensive anchor.
 * **40% `ChanThreeTypeStrategy`**: Standard segment-level pivot structural breakout and divergence engine.
-* **20% `ChanCompositeStrategy`**: Dynamic multi-stage $B_1/B_2/B_3$ position pyramiding, equipped with the Lessons 92–99 dangerous pivot relation brake. (Note: applies internal 20% single-stock cap and 2% inertia filter before blending, contributing at most $20\% \times 20\% = 4\%$ per stock).
+* **20% `ChanFourStateExecutionStrategy`**: Industrial-grade 4-state operational execution machine (BUY_CANDIDATE, HOLD, HOLD_ALERT, SELL_EXIT, WAIT_OBSERVE) incorporating:
+  - 5-bar gestation buffer (`chan_fse_min_hold_bars = 5`) to allow structural pivots to develop without Day 1-2 churn.
+  - 1% breakout tolerance on ZG (`chan_fse_zg_tolerance_pct = 0.01`) to resist false breakdown noise.
+  - Moving average entanglement filter (`chan_fse_use_ma_filter = True`) to reject whipsaw consolidations.
+  - Lesson 16 zero-consolidation stagnation avoidance timeout (`chan_fse_cons_timeout_bars = 8`).
 
 ```mermaid
 flowchart TD
     Universe["Universe Data (Risky + Cash Proxy)"] --> Sub1["ChanVaaCompound (40%)<br>Dual-momentum crash protection"]
-    Universe --> Sub2["ChanThreeType (40%)<br>Segment pivot alpha"]
-    Universe --> Sub3["ChanComposite (20%)<br>Multi-stage B1/B2/B3 scaling"]
+    Universe --> Sub2["ChanThreeType (40%)<br>Segment pivot structural alpha"]
+    Universe --> Sub3["ChanFourStateExecution (20%)<br>4-state FSM execution machine"]
     
     Sub1 & Sub2 & Sub3 --> Blend["Raw Weighted Target Weights"]
     
@@ -65,11 +70,11 @@ $$\text{Drawdown} = \frac{\text{Current NAV} - \text{Peak NAV}}{\text{Peak NAV}}
   * Proceed to Step 2 with full risk budget. Standard single-stock cap = **$20\%$**.
 * **IF $10\% \le \text{Drawdown} < 15\%$ (Tier 1: Risk Damping)**:
   * **Action**: Cut all active stock positions by **$50\%$**.
-  * Maximum total equity exposure = **$50\%$**; remaining $50\%$ must sit in Cash Proxy.
+  * Maximum total equity exposure = **$50\%$**; remaining $50\%$ must sit in Cash Proxy (`BIL`).
   * No new breakout buys allowed unless funded from the $50\%$ reduced budget.
 * **IF $15\% \le \text{Drawdown} < 20\%$ (Tier 2: Tactical Defense)**:
-  * **Action**: Disengage composite and three-type models; route **100% of capital into `ChanVaaCompoundStrategy`**.
-  * **Behavior**: In defensive regime, VAA holds $70\%$ in Cash Proxy / Short-term Treasuries and up to $30\%$ in the strongest defensive asset. (If VAA momentum remains bullish, it holds disciplined momentum breakout positions).
+  * **Action**: Disengage four-state and three-type models; route **100% of capital into `ChanVaaCompoundStrategy`**.
+  * **Behavior**: In defensive regime, VAA holds $70\%$ in Cash Proxy / Short-term Treasuries and up to $30\%$ in the strongest defensive asset.
 * **IF Drawdown $\ge 20\%$ (Tier 3: Hard Stop / Emergency Halt)**:
   * **Action**: **Liquidate $100\%$ of all risk assets into Cash Proxy immediately**.
   * **Lockout**: **Do not buy for 21 consecutive trading days**. On Day 22, reset HWM to current NAV to allow fresh cycle re-entry.
@@ -77,14 +82,14 @@ $$\text{Drawdown} = \frac{\text{Current NAV} - \text{Peak NAV}}{\text{Peak NAV}}
 ---
 
 ### Step 2: Market Breadth & 10-Day Breadth Thrust Check (Capacity & Exposure Scaling)
-Calculate universe breadth: percentage of tracked stocks trading above their 50-day Simple Moving Average ($\text{Close} > \text{SMA}_{50}$, `crb_breadth_lookback = 50`) and short-term 10-day breadth thrust (percentage of stocks with positive 10-day return, $\text{ROC}_{10} > 0$, `crb_thrust_lookback = 10`):
+Calculate universe breadth: percentage of tracked stocks trading above their 50-day Simple Moving Average ($\text{Close} > \text{SMA}_{50}$, `cfsb_breadth_lookback = 50`) and short-term 10-day breadth thrust (percentage of stocks with positive 10-day return, $\text{ROC}_{10} > 0$, `cfsb_thrust_lookback = 10`):
 
 * **IF (Market Breadth $\ge 30\%$ OR 10-Day Breadth Thrust $\ge 60\%$) AND Drawdown $< 10\%$**:
   * **Dynamic Cash Deployment Triggered**:
-    * If 10-day breadth thrust $\ge 60\%$ (`crb_thrust_thresh = 0.60`): **Fast Rebound Override** immediately sets maximum bull scaling factor (1.0).
-    * If standard breadth $\ge 30\%$ (`crb_breadth_bull_thresh = 0.30`): scales smoothly from $30\%$ to $75\%$ breadth.
-  * **Max Single-Stock Cap**: Expands from $20\%$ up to **$30\%$** (`crb_bull_max_single_position`).
-  * **Target Total Equity Exposure**: Up to **$80\%$** (`crb_target_bull_exposure`), deploying idle cash into top conviction setups.
+    * If 10-day breadth thrust $\ge 60\%$ (`cfsb_thrust_thresh = 0.60`): **Fast Rebound Override** immediately sets maximum bull scaling factor (1.0).
+    * If standard breadth $\ge 30\%$ (`cfsb_breadth_bull_thresh = 0.30`): scales smoothly from $30\%$ to $75\%$ breadth.
+  * **Max Single-Stock Cap**: Expands from $20\%$ up to **$30\%$** (`cfsb_bull_max_single_position`).
+  * **Target Total Equity Exposure**: Up to **$80\%$** (`cfsb_target_bull_exposure`), deploying idle cash into top conviction setups.
 * **ELSE (Market Breadth $< 30\%$ AND Thrust $< 60\%$, OR Drawdown $\ge 10\%$)**:
   * **Max Single-Stock Cap**: Hard limit of **$20\%$** per stock.
   * **Target Total Equity Exposure**: Standard unscaled exposure (typically $40\%–60\%$, balance in Cash Proxy `BIL`).
@@ -100,35 +105,31 @@ Liquidate an asset down to **$0.0\%$** if **ANY** of the following conditions tr
    * **$S_1$ (Top Divergence / 顶背驰)**: Stock makes a new high, but MACD histogram area or amplitude is clearly smaller than the previous upward stroke.
    * **$S_2$ (Second Sell Point / 二卖)**: Upward rebound fails to break the prior high and prints a lower-high pivot.
    * **$S_3$ (Third Sell Point / 三卖)**: Downward stroke breaks through the lower boundary of a consolidation pivot, and the subsequent pullback fails to re-enter the pivot zone.
-2. **Structural Risk Brake (Lessons 92–99 Dangerous Pivot Violation)**:
-   * A newly formed pivot's extreme price penetrates past the prior pivot in the counter-trend direction $\rightarrow$ **Sell immediately**, even if no formal $S_1/S_2/S_3$ has completed.
-3. **Hard Stop-Loss**:
-   * Asset drops **$\ge 8\%$** below your average entry price $\rightarrow$ **Market exit immediately** (matching `stop_loss_pct = 0.08` across sub-strategies).
-4. **Time Stop (Stagnation Net)**:
-   * Position has been held for **$\ge 90$ trading days** without generating a higher pivot or new buy continuation $\rightarrow$ Close position and release capital (matching `max_holding_days = 90`).
+2. **Four-State Machine Structural Invalidation Stops**:
+   * **$B_1$ Entry Stop**: Close breaks below the lowest price of the $B_1$ bar low.
+   * **$B_2$ Entry Stop**: Close breaks below the lowest price of the preceding consolidation pivot low ($DD$).
+   * **$B_3$ Breakout Invalidation**: Close breaks below $ZG \times (1 - 0.01)$ (exceeds the 1% breakout tolerance band).
+   * **Trailing Ratchet Stop**: As price trades above $ZG$, ratchet the exit stop up to $ZG$. Any close below $ZG$ exits the position.
+3. **Lesson 16 Zero-Consolidation Stagnation Timeout**:
+   * Position has lingered inside consolidation (`in_zs`) for $\ge 8$ consecutive bars (`chan_fse_cons_timeout_bars = 8`) without positive stroke momentum (`stroke_dir <= 0`) $\rightarrow$ **Sell immediately** to eliminate capital drag.
+4. **Hard Stop-Loss**:
+   * Asset drops **$\ge 8\%$** below entry price $\rightarrow$ **Market exit immediately** (`chan_fse_stop_loss_pct = 0.08`).
+5. **Time Stop**:
+   * Position held for **$\ge 90$ trading days** without new structural continuation $\rightarrow$ Close position and release capital (`chan_fse_max_holding_days = 90`).
 
 ---
 
-### Step 4: Asset-Level Buy Rules (Tranche Pyramiding)
-Do not buy an entire position in a single order. Scale into positions using the 3 Chan buy points:
-
-```
-[B1: Bottom Divergence]   ──> Buy 30% of target position  (Left-side probe)
-           │
-[B2: Higher Low Pullback] ──> Add +40% of target position (Right-side confirmation)
-           │
-[B3: Pivot Breakout Retest]──> Add +30% of target position (Trend acceleration)
-```
-
-1. **Tranche 1: $B_1$ Bottom Divergence (Base 30%)**:
-   * **Setup**: Price makes a fresh low on a downward stroke, but MACD histogram area is smaller than the prior downward wave (momentum exhaustion).
-   * **Order**: Buy **$30\%$** of target position size (e.g., $6\%$ of total portfolio if target cap is $20\%$).
-2. **Tranche 2: $B_2$ Higher Low Pullback (Add +40%)**:
-   * **Setup**: First downward pullback after $B_1$ holds **above** the $B_1$ low, followed by a bullish reversal bar.
-   * **Order**: Add **$+40\%$** of target position size (total position now at $70\%$).
-3. **Tranche 3: $B_3$ Pivot Breakout Retest (Add +30%)**:
-   * **Setup**: Price breaks out strongly above a prior consolidation pivot; the subsequent pullback bar low remains strictly **above** the upper boundary of that pivot.
-   * **Order**: Add the remaining **$+30\%$** of target position size (total position now at $100\%$ of target cap).
+### Step 4: Asset-Level Buy Rules (Position Sizing & Entry Filters)
+Buy candidates qualify across the 3 sub-strategies:
+1. **Four-State Execution Sleeve (20%)**:
+   * **$B_1$ Bottom Fishing**: Requires price above MACD zero-axis reclaim or positive stroke divergence. Held with a **5-bar gestation buffer** (`min_hold_bars = 5`) to allow the pivot to develop.
+   * **$B_2$ Pullback Buy**: Higher-low pivot formation after upward stroke.
+   * **$B_3$ Breakout Buy**: Clear breakout above $ZG$. Gated by the **MA Entanglement Filter** (requires fast MA > slow MA and slope > 0 to avoid false range breakouts).
+2. **Three-Type Sleeve (40%)**:
+   * Allocates to confirmed $B_1, B_2, B_3$ setups across the universe with 20% single-stock ceiling.
+3. **VAA Macro Compound Sleeve (40%)**:
+   * Allocates to top 1-2 offensive assets with highest 13612W momentum score, or sweeps 70% to Cash Proxy when canary assets drop negative.
+4. **Single-Stock Cap**: Never allocate more than **$20\%$** of total portfolio NAV to any single ticker (expands to **$30\%$** during bull breadth regimes).
 
 ---
 
@@ -159,10 +160,9 @@ Keep this table handy during the market session:
 | **Regime** | **Market Breadth** | $< 30\%$ above SMA50 and Thrust $< 60\%$ | **CONSERVATIVE**: Keep single-stock cap at $20\%$; standard cash buffer. |
 | **Exit** | **Stop-Loss** | Loss $\ge 8\%$ from entry | **EXIT IMMEDIATELY**: Sell $100\%$ of position at market/limit. |
 | **Exit** | **Time Stop** | Held $\ge 90$ days no progress| **EXIT**: Close position to release capital. |
-| **Exit** | **Chan Sells** | $S_1, S_2, S_3$ or Pivot Danger | **EXIT**: Sell position to $0.0\%$. |
-| **Entry** | **Tranche 1 ($B_1$)**| Bottom MACD divergence | **BUY 30%** of target allocation. |
-| **Entry** | **Tranche 2 ($B_2$)**| Higher low pullback | **BUY +40%** of target allocation (cumulative 70%). |
-| **Entry** | **Tranche 3 ($B_3$)**| Breakout retest above pivot | **BUY +30%** of target allocation (cumulative 100%). |
+| **Exit** | **Stagnation Timeout** | Held $\ge 8$ bars in consolidation | **EXIT**: Sell position to avoid Lesson 16 drag. |
+| **Exit** | **Chan Sells / Invalidation**| $S_1, S_2, S_3$ or Breakout Stop | **EXIT**: Sell position to $0.0\%$. |
+| **Entry** | **Four-State Machine**| Valid $B_1/B_2/B_3$ + MA Filter | **BUY**: Allocate with 5-bar gestation buffer. |
 | **Execution**| **Friction Filter** | $|\Delta W| < 4\%$ | **SKIP**: Do not place order if change is under $4\%$ portfolio NAV. |
 | **Execution**| **Sequence** | Multi-asset rebalance | **SELLS FIRST** (free up cash) $\rightarrow$ **BUYS SECOND**. |
 
@@ -178,4 +178,4 @@ Keep this table handy during the market session:
    * For highly liquid instruments (large-cap ETFs/stocks): Use **limit orders pegged to current bid/ask** or TWAP slices over 15 minutes.
    * For emergency stop-losses or Tier 3 circuit breakers: Use **market or immediate-or-cancel limit orders** to guarantee execution.
 3. **Cash Proxy Management**:
-   * Any capital not allocated to stocks should be parked in risk-free yield assets (e.g., [`BIL`](file:///home/stone/Work/github/quant/pipeline/research_strategy/strategies_config.json#L295) / `SGOV` in US markets, or `511880` / `511990` / GC001 in China A-shares) rather than uninvested non-earning cash.
+   * Any capital not allocated to stocks should be parked in risk-free yield assets (e.g., [`BIL`](file:///home/stone/Work/github/quant/pipeline/research_strategy/strategies_config.json) / `SGOV` in US markets, or `511880` / `511990` / GC001 in China A-shares) rather than uninvested non-earning cash.
