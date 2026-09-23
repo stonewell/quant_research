@@ -2,7 +2,7 @@
 
 # 量化交易策略研究 (`research_strategy`)
 
-一个专门的子项目，实现并评估 44 种量化交易策略：从学术文献与从业者研究（*Journal of Finance*、*Journal of Portfolio Management*、SSRN、AllocateSmartly）中综合而成的战术资产配置 (TAA) 策略；单资产择时策略；Donchian 通道突破系统；现代热门静态/固定权重组合（永久组合、黄金蝴蝶、全天候、HFEA）；布林带通道突破与均值回归；残差动量与自适应快速扩张；涵盖 17 种策略的完整缠论及类似结构分析体系（缠中说禅：笔中枢移动、三类买卖点、MACD 背驰、多周期趋势共振、三买回抽、均值回归背驰、多阶段复合阶梯建仓、四态操作判定机、最优选择器元策略、风控混合策略、VAA 复合防御、中枢震荡监视器、斐波那契均线板块轮动，以及裸K形态回踩确认、成交量分布POC迁移与三浪斐波那契扩展）；宏观政体因子自适应复合引擎；以及采用核心-卫星配置架构的机构级多策略 Alpha 账簿 (`MultiStrategyAlphaBookStrategy`)。
+一个专门的子项目，实现并评估 45 种量化交易策略配置：从学术文献与从业者研究（*Journal of Finance*、*Journal of Portfolio Management*、SSRN、AllocateSmartly）中综合而成的战术资产配置 (TAA) 策略；单资产择时策略；Donchian 通道突破系统；现代热门静态/固定权重组合（永久组合、黄金蝴蝶、全天候、HFEA）；布林带通道突破与均值回归；残差动量与自适应快速扩张；涵盖 17 种策略的完整缠论及类似结构分析体系（缠中说禅：笔中枢移动、三类买卖点、MACD 背驰、多周期趋势共振、三买回抽、均值回归背驰、多阶段复合阶梯建仓、四态操作判定机、最优选择器元策略、风控混合策略、四态风控混合策略、VAA 复合防御、中枢震荡监视器、斐波那契均线板块轮动，以及裸K形态回踩确认、成交量分布POC迁移与三浪斐波那契扩展）；宏观政体因子自适应复合引擎；以及采用核心-卫星配置架构的机构级多策略 Alpha 账簿 (`MultiStrategyAlphaBookStrategy`)。
 
 ---
 
@@ -205,7 +205,7 @@ pipeline/research_strategy/
 │   ├── multi_strategy_alpha_book.py      # 机构级多策略 Alpha 账簿（最优核心-卫星蓝图）
 │   ├── timing_aspects.py                 # 单资产择时模板的入场 x 出场/风控要素分解
 │   └── strategy.py                       # NaturalLanguageStrategy 引擎与策略实现
-├── strategies_config.json                # 包含 44 个策略和参数的中央 JSON 配置
+├── strategies_config.json                # 包含 45 个策略和参数的中央 JSON 配置
 ├── run_research_strategy.py              # 动态加载策略配置的 CLI 运行器
 ├── dashboard.py                          # 终端 ASCII 报告查看器
 ├── tests/

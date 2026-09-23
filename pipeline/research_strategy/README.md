@@ -2,7 +2,7 @@
 
 # Researched Quantitative Trading Strategies (`research_strategy`)
 
-A dedicated side project implementing and evaluating forty-four (44) quantitative trading strategies: tactical asset allocation (TAA) strategies synthesized from academic literature and practitioner research (*Journal of Finance*, *Journal of Portfolio Management*, SSRN, AllocateSmartly), single-asset timing strategies, Donchian channel breakout systems, modern static/fixed-weight portfolios (Permanent Portfolio, Golden Butterfly, All Weather, HFEA), Bollinger band systems, residual momentum, adaptive fast expansion, an extensive Chan structural analysis suite (缠中说禅: pivot shift, three-type points, MACD divergence, multi-timeframe trend, third buy, mean reversion divergence, composite multi-stage, four-state execution machine, best selector, risk-managed blend, VAA compound, pivot oscillation, Fibonacci sector strength, plus Price Action, Volume Profile POC, and Wave 3 Fibonacci models), macro regime factor compounders, and an institutional Multi-Strategy Alpha Book engine with optimal Core-Satellite allocation.
+A dedicated side project implementing and evaluating forty-five (45) quantitative trading strategy configurations: tactical asset allocation (TAA) strategies synthesized from academic literature and practitioner research (*Journal of Finance*, *Journal of Portfolio Management*, SSRN, AllocateSmartly), single-asset timing strategies, Donchian channel breakout systems, modern static/fixed-weight portfolios (Permanent Portfolio, Golden Butterfly, All Weather, HFEA), Bollinger band systems, residual momentum, adaptive fast expansion, an extensive Chan structural analysis suite (缠中说禅: pivot shift, three-type points, MACD divergence, multi-timeframe trend, third buy, mean reversion divergence, composite multi-stage, four-state execution machine, best selector, risk-managed blend, four-state blend, VAA compound, pivot oscillation, Fibonacci sector strength, plus Price Action, Volume Profile POC, and Wave 3 Fibonacci models), macro regime factor compounders, and an institutional Multi-Strategy Alpha Book engine with optimal Core-Satellite allocation.
 
 ---
 
@@ -283,7 +283,7 @@ pipeline/research_strategy/
 │   ├── multi_strategy_alpha_book.py      # Institutional Multi-Strategy Alpha Book (Optimal Core-Satellite Blueprint)
 │   ├── timing_aspects.py                 # Entry x exit/risk aspect decomposition for single-asset timing templates
 │   └── strategy.py                       # NaturalLanguageStrategy engine + consolidated strategy implementations
-├── strategies_config.json                # Central JSON configuration for 44 strategies & parameters
+├── strategies_config.json                # Central JSON configuration for 45 strategies & parameters
 ├── run_research_strategy.py              # CLI runner loading strategy configs dynamically
 ├── dashboard.py                          # Terminal ASCII report viewer
 ├── tests/

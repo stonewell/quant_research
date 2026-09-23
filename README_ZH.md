@@ -7,7 +7,7 @@
 本工作区组织为两个项目组，每个项目组拥有独立的 `uv` 环境，以及位于仓库根目录的共享基础设施：
 
 - **`pipeline/`** -- 核心研究/回测流水线项目组（共享一个 `uv` 环境）：
-  - `research_strategy/`：量化交易策略研究（包含 44 种战术资产配置 TAA、定时择时、突破、缠论结构与相似模型、宏观因子复合与多策略 Alpha 账簿模型）及因子汇总导出器。
+  - `research_strategy/`：量化交易策略研究（包含 45 种战术资产配置 TAA、定时择时、突破、缠论结构与相似模型、宏观因子复合与多策略 Alpha 账簿模型）及因子汇总导出器。
   - `instrument_selection/`：策略无关的标的筛选、可预测性测试（Hurst 指数、蜡烛图形态、动量）、相关性聚类和组合篮子选择工具。
   - `pattern_mining/`：拐点指标模式挖掘（基于 Bonferroni 矫正的打乱置换零假设显著性检验），生成供 `strategy_generator` 消费的持久化 `pattern_report.json`。
   - `strategy_generator/`：组合策略生成器，搜索配置模板与挖掘出的拐点模式，通过等效随机搜索（ERS）验证并结合因子研究进行平局决胜。
@@ -334,7 +334,7 @@ pipeline/.venv/Scripts/python.exe -m pytest backtester/tests -v
 | `backtester/` (仓库根目录) | 独立的 CLI，在单次或滚动 Walk-Forward 窗口上评估固定策略文件；无独立的 `pyproject.toml` | `backtester/run_backtest.py` | `backtester/README_ZH.md`, `backtester/SCHEMAS_ZH.md` |
 | `data/` (仓库根目录) | 共享 DuckDB OHLCV 缓存目录 (`cache.duckdb`)，由各个阶段读写 | 不适用 (缓存，非代码) | `common/README_ZH.md` §9 |
 | `pipeline/` | 上述项目的共享 `uv` 环境，以及流水线编排器 | `pipeline/pyproject.toml` | -- |
-| `pipeline/research_strategy/` | 评估 44 种量化交易策略并导出因子研究汇总 | `pipeline/research_strategy/run_research_strategy.py` | `pipeline/research_strategy/README_ZH.md` |
+| `pipeline/research_strategy/` | 评估 45 种量化交易策略并导出因子研究汇总 | `pipeline/research_strategy/run_research_strategy.py` | `pipeline/research_strategy/README_ZH.md` |
 | `pipeline/instrument_selection/` | 特征化标的、执行硬性可投资性筛选并选择分散化资产组合 | `pipeline/instrument_selection/run_screener.py` | `pipeline/instrument_selection/README_ZH.md` |
 | `pipeline/pattern_mining/` | 通过 Bonferroni 矫正的打乱置换显著性检验挖掘拐点指标模式 | `pipeline/pattern_mining/run_pattern_mining.py` | `pipeline/pattern_mining/README_ZH.md` |
 | `pipeline/strategy_generator/` | 网格搜索配置模板和挖掘出的指标模式以生成经过验证的策略 | `pipeline/strategy_generator/run_strategygen.py` | `pipeline/strategy_generator/README_ZH.md` |

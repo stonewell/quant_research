@@ -134,6 +134,7 @@
       "chan3_position_size_pct": 1.0,
       "chan3_max_single_position": 0.20,
       "chan3_min_weight_change": 0.02,
+      "chan3_include_stroke_signals": true,
       "cash_proxy": "BIL"
     },
     "factors": ["regime_trend_strength", "absolute_momentum_trend"]
@@ -173,6 +174,11 @@
       "chanm_adv_require_cross_pivot_divergence": true,
       "chanm_adv_require_volume_confirmation": false,
       "chanm_adv_weak_signal_position_size_pct": 0.5,
+      "chanm_adv_use_trend_gate": true,
+      "chanm_adv_trend_ma_period": 200,
+      "chanm_adv_suppress_top_div_in_uptrend": true,
+      "chanm_adv_trailing_activate_pct": 0.08,
+      "chanm_adv_trailing_stop_pct": 0.04,
       "chanm_adv_require_weekly_regime": false,
       "cash_proxy": "BIL"
     },
@@ -190,6 +196,8 @@
       "chan_mtf_stop_loss_pct": 0.08,
       "chan_mtf_max_holding_days": 90,
       "chan_mtf_position_size_pct": 1.0,
+      "chan_mtf_pivot_osc_size_pct": 0.5,
+      "chan_mtf_require_weekly_regime": false,
       "cash_proxy": "BIL"
     },
     "factors": ["regime_trend_strength", "absolute_momentum_trend"]
@@ -256,6 +264,7 @@
       "chan_comp_max_single_position": 0.20,
       "chan_comp_min_weight_change": 0.02,
       "chan_comp_use_structural_stops": true,
+      "chan_comp_allow_flat_b2_b3": true,
       "cash_proxy": "BIL"
     },
     "factors": ["regime_trend_strength", "absolute_momentum_trend"]
@@ -502,6 +511,7 @@
       "turtle_require_trend_filter": true,
       "turtle_trend_ma_period": 200,
       "turtle_min_weight_change": 0.02,
+      "turtle_position_sizing_mode": "inverse_atr",
       "cash_proxy": "BIL"
     },
     "factors": ["absolute_momentum_trend", "volatility_targeting"]
@@ -519,6 +529,7 @@
       "turtle_require_trend_filter": true,
       "turtle_trend_ma_period": 200,
       "turtle_min_weight_change": 0.02,
+      "turtle_position_sizing_mode": "inverse_atr",
       "cash_proxy": "BIL"
     },
     "factors": ["absolute_momentum_trend", "volatility_targeting"]
@@ -536,6 +547,7 @@
       "turtle_require_trend_filter": true,
       "turtle_trend_ma_period": 200,
       "turtle_min_weight_change": 0.02,
+      "turtle_position_sizing_mode": "inverse_atr",
       "cash_proxy": "BIL"
     },
     "factors": ["absolute_momentum_trend", "volatility_targeting"]
@@ -595,7 +607,8 @@
       "aaa_momentum_lookback": 126,
       "aaa_top_k": 4,
       "aaa_vol_lookback": 20,
-      "aaa_corr_lookback": 126
+      "aaa_corr_lookback": 126,
+      "aaa_min_weight_pct": 0.02
     },
     "factors": ["relative_momentum", "correlation_diversification"]
   },
