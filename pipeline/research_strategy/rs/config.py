@@ -363,6 +363,9 @@ class StrategyConfig:
     chan_fse_two_stage_entry: bool = True
     chan_fse_use_breadth_filter: bool = True
     chan_fse_breadth_bull_thresh: float = 0.30
+    chan_fse_adx_filter: bool = True
+    chan_fse_adx_threshold: float = 20.0
+    chan_fse_adx_period: int = 14
 
     # --- Chan Best Selector Meta-Strategy ---
     chan_best_lookback_days: int = 63
@@ -536,14 +539,15 @@ class StrategyConfig:
     # Derived from walkforward anomaly analysis: blends the top 3 adjusted-
     # Sharpe Chan strategies with position limits, drawdown circuit breakers,
     # and a minimum-weight-change threshold to curb excessive turnover.
-    crb_composite_weight: float = 0.20       # allocation to chan_composite
-    crb_three_type_weight: float = 0.40      # allocation to chan_three_type
-    crb_vaa_weight: float = 0.40             # allocation to chan_vaa_compound
+    crb_composite_weight: float = 0.15       # allocation to chan_composite
+    crb_three_type_weight: float = 0.35      # allocation to chan_three_type
+    crb_vaa_weight: float = 0.50             # allocation to chan_vaa_compound
     crb_max_single_position: float = 0.20    # hard cap per stock (prevents 100% concentration)
     crb_min_weight_change: float = 0.04      # skip rebalance trades below 4% change
     crb_dd_reduce_thresh: float = 0.10       # drawdown level to halve position sizes
     crb_dd_defensive_thresh: float = 0.15    # drawdown level to switch to VAA-only
     crb_dd_stop_thresh: float = 0.20         # drawdown level to exit to 100% cash
+    crb_tier1_cooldown_bars: int = 15        # bars in Tier 1/2 drawdown before auto-healing HWM to current NAV
     crb_dynamic_cash_deployment: bool = True # dynamically deploy idle cash to active risky assets in bull breadth
     crb_breadth_lookback: int = 50           # lookback window for breadth SMA
     crb_breadth_bull_thresh: float = 0.30    # breadth threshold for deploying idle cash (lowered to 0.30)
@@ -553,16 +557,17 @@ class StrategyConfig:
     crb_bull_max_single_position: float = 0.30 # dynamically expanded single-stock cap in bull breadth (defaults to 0.30)
 
     # --- Chan Four-State Risk-Managed Blend Strategy (chan_four_state_blend) ---
-    # Enhanced institutional ensemble blending ChanFourStateExecutionStrategy (20%),
-    # ChanThreeTypeStrategy (40%), and ChanVaaCompoundStrategy (40%) with institutional risk controls.
-    cfsb_four_state_weight: float = 0.20
-    cfsb_three_type_weight: float = 0.40
-    cfsb_vaa_weight: float = 0.40
+    # Enhanced institutional ensemble blending ChanFourStateExecutionStrategy (15%),
+    # ChanThreeTypeStrategy (35%), and ChanVaaCompoundStrategy (50%) with institutional risk controls.
+    cfsb_four_state_weight: float = 0.15
+    cfsb_three_type_weight: float = 0.35
+    cfsb_vaa_weight: float = 0.50
     cfsb_max_single_position: float = 0.20
     cfsb_min_weight_change: float = 0.04
     cfsb_dd_reduce_thresh: float = 0.10
     cfsb_dd_defensive_thresh: float = 0.15
     cfsb_dd_stop_thresh: float = 0.20
+    cfsb_tier1_cooldown_bars: int = 15       # bars in Tier 1/2 drawdown before auto-healing HWM to current NAV
     cfsb_dynamic_cash_deployment: bool = True
     cfsb_breadth_lookback: int = 50
     cfsb_breadth_bull_thresh: float = 0.30
@@ -822,6 +827,14 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.cfsb_thrust_thresh must be between 0 and 1, got {self.cfsb_thrust_thresh}")
         if not (0.0 < self.cfsb_bull_max_single_position <= 1.0):
             raise ValueError(f"StrategyConfig.cfsb_bull_max_single_position must be between 0 and 1, got {self.cfsb_bull_max_single_position}")
+        if self.crb_tier1_cooldown_bars <= 0:
+            raise ValueError(f"StrategyConfig.crb_tier1_cooldown_bars must be > 0, got {self.crb_tier1_cooldown_bars}")
+        if self.cfsb_tier1_cooldown_bars <= 0:
+            raise ValueError(f"StrategyConfig.cfsb_tier1_cooldown_bars must be > 0, got {self.cfsb_tier1_cooldown_bars}")
+        if self.chan_fse_adx_threshold <= 0:
+            raise ValueError(f"StrategyConfig.chan_fse_adx_threshold must be > 0, got {self.chan_fse_adx_threshold}")
+        if self.chan_fse_adx_period <= 0:
+            raise ValueError(f"StrategyConfig.chan_fse_adx_period must be > 0, got {self.chan_fse_adx_period}")
 
     @classmethod
     def from_dict(cls, data: dict) -> "StrategyConfig":

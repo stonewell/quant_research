@@ -46,7 +46,7 @@ from common.allocation_templates import (
     _fill_out_columns,
     _sparse_from_daily,
 )
-from common.indicators import macd, roc, sma
+from common.indicators import adx, macd, roc, sma
 from common.position_exits import run_stop_timeout_exit
 from common.scheduling import get_rebalance_dates as _get_rebalance_dates
 
@@ -1559,6 +1559,7 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
         thrust_thresh = float(p.get("crb_thrust_thresh", getattr(cfg, "crb_thrust_thresh", 0.60)))
         target_bull_exposure = float(p.get("crb_target_bull_exposure", getattr(cfg, "crb_target_bull_exposure", 0.80)))
         bull_max_pos = float(p.get("crb_bull_max_single_position", getattr(cfg, "crb_bull_max_single_position", 0.30)))
+        tier1_cooldown_bars = int(p.get("crb_tier1_cooldown_bars", getattr(cfg, "crb_tier1_cooldown_bars", 15)))
 
         tot_w = comp_w + three_w + vaa_w
         if tot_w > 0:
@@ -1578,9 +1579,10 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
         if master_index is None or len(master_index) == 0:
             return pd.DataFrame()
 
-        # Precompute daily universe market breadth (fraction > SMA50) and 10-day breadth thrust (fraction with 10d ROC > 0)
+        # Precompute daily universe market breadth (fraction > SMA50), 10-day breadth thrust, and 10-day ROC matrix
         breadth_matrix = pd.DataFrame(index=master_index, columns=risky_symbols, dtype=float)
         thrust_matrix = pd.DataFrame(index=master_index, columns=risky_symbols, dtype=float)
+        roc_matrix = pd.DataFrame(index=master_index, columns=risky_symbols, dtype=float)
         for sym in risky_symbols:
             if sym in universe and not universe[sym].empty:
                 c = universe[sym]["Close"].reindex(master_index).ffill()
@@ -1588,6 +1590,7 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
                 breadth_matrix[sym] = (c > ma).astype(float)
                 c_prev = c.shift(thrust_lookback)
                 roc_thrust = (c / c_prev - 1.0)
+                roc_matrix[sym] = roc_thrust
                 thrust_matrix[sym] = (roc_thrust > 0.0).astype(float)
         daily_breadth = breadth_matrix.mean(axis=1).fillna(0.50)
         daily_thrust = thrust_matrix.mean(axis=1).fillna(0.50)
@@ -1617,12 +1620,13 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
         daily_weights = pd.DataFrame(0.0, index=master_index, columns=symbols)
         cum_nav = 1.0
         peak_nav = 1.0
+        nav_history = []
+        tier1_counter = 0
+        stop_counter = 0  # consecutive bars in Tier 3 full-stop
+        stop_cooldown_bars = 21  # ~1 month before allowing re-entry
         current_held_w = pd.Series(0.0, index=symbols)
         if cash_proxy in symbols:
             current_held_w[cash_proxy] = 1.0
-
-        stop_counter = 0  # consecutive bars in Tier 3 full-stop
-        stop_cooldown_bars = 21  # ~1 month before allowing re-entry
 
         for t in range(len(master_index)):
             date = master_index[t]
@@ -1635,33 +1639,76 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
                 cum_nav *= (1.0 + port_ret)
                 if cum_nav > peak_nav:
                     peak_nav = cum_nav
+            nav_history.append(cum_nav)
+
+            # Fast-Recovery Override indicators (Recommendation 1)
+            lookback_idx = max(0, len(nav_history) - 1 - 10)
+            r_10d = (cum_nav / nav_history[lookback_idx] - 1.0) if len(nav_history) > 10 else 0.0
+            thrust = float(daily_thrust.iloc[t])
+            thrust_active = thrust >= thrust_thresh
+            fast_recovery = thrust_active or (r_10d > 0.0)
 
             current_dd = (cum_nav - peak_nav) / peak_nav if peak_nav > 0 else 0.0
             dd_mag = abs(current_dd)
 
-            # Circuit breaker logic
+            # Auto-healing cooldown logic for Tier 3 and Tier 1/2 (Recommendation 2)
             if dd_mag >= dd_stop_thresh:
-                # Full stop: 100% cash
-                raw_w = pd.Series(0.0, index=symbols)
-                if cash_proxy in symbols:
-                    raw_w[cash_proxy] = 1.0
-                is_emergency = True
-            elif dd_mag >= dd_defensive_thresh:
-                # Defensive mode: 100% into VAA compound strategy (carries 70% cash buffer)
-                raw_w = w_vaa_daily.loc[date].copy()
-                is_emergency = True
+                stop_counter += 1
+                tier1_counter = 0
+                if stop_counter >= stop_cooldown_bars:
+                    peak_nav = cum_nav
+                    stop_counter = 0
+                    current_dd = 0.0
+                    dd_mag = 0.0
             elif dd_mag >= dd_reduce_thresh:
-                # Risk reduction: 50% damping on equity exposure
-                raw_blend = (
-                    comp_w * w_comp_daily.loc[date] +
-                    three_w * w_three_daily.loc[date] +
-                    vaa_w * w_vaa_daily.loc[date]
-                )
-                raw_w = pd.Series(0.0, index=symbols)
-                raw_w[risky_symbols] = raw_blend[risky_symbols] * 0.50
-                if cash_proxy in symbols:
-                    raw_w[cash_proxy] = max(0.0, 1.0 - raw_w[risky_symbols].sum())
-                is_emergency = True
+                tier1_counter += 1
+                stop_counter = 0
+                if tier1_counter >= tier1_cooldown_bars:
+                    peak_nav = cum_nav
+                    tier1_counter = 0
+                    current_dd = 0.0
+                    dd_mag = 0.0
+            else:
+                stop_counter = 0
+                tier1_counter = 0
+
+            # Circuit breaker logic with Fast-Recovery Override (Recommendation 1)
+            if dd_mag >= dd_stop_thresh:
+                if fast_recovery:
+                    # Fast recovery: downgrade from 100% cash stop to defensive VAA
+                    raw_w = w_vaa_daily.loc[date].copy()
+                    is_emergency = not thrust_active
+                else:
+                    # Full stop: 100% cash
+                    raw_w = pd.Series(0.0, index=symbols)
+                    if cash_proxy in symbols:
+                        raw_w[cash_proxy] = 1.0
+                    is_emergency = True
+            elif dd_mag >= dd_defensive_thresh:
+                # Defensive mode: 100% into VAA compound strategy (carries cash buffer)
+                raw_w = w_vaa_daily.loc[date].copy()
+                is_emergency = not thrust_active if fast_recovery else True
+            elif dd_mag >= dd_reduce_thresh:
+                if fast_recovery:
+                    # Fast recovery: restore full normal blend instead of 50% damping
+                    raw_w = (
+                        comp_w * w_comp_daily.loc[date] +
+                        three_w * w_three_daily.loc[date] +
+                        vaa_w * w_vaa_daily.loc[date]
+                    ).copy()
+                    is_emergency = False
+                else:
+                    # Risk reduction: 50% damping on equity exposure
+                    raw_blend = (
+                        comp_w * w_comp_daily.loc[date] +
+                        three_w * w_three_daily.loc[date] +
+                        vaa_w * w_vaa_daily.loc[date]
+                    )
+                    raw_w = pd.Series(0.0, index=symbols)
+                    raw_w[risky_symbols] = raw_blend[risky_symbols] * 0.50
+                    if cash_proxy in symbols:
+                        raw_w[cash_proxy] = max(0.0, 1.0 - raw_w[risky_symbols].sum())
+                    is_emergency = True
             else:
                 # Normal blend
                 raw_w = (
@@ -1671,25 +1718,12 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
                 ).copy()
                 is_emergency = False
 
-            # Tier 3 cooldown: after spending stop_cooldown_bars in full cash,
-            # reset HWM to current NAV so the drawdown calculation can heal and
-            # the strategy can eventually re-enter risk assets.
-            if dd_mag >= dd_stop_thresh:
-                stop_counter += 1
-                if stop_counter >= stop_cooldown_bars:
-                    peak_nav = cum_nav
-                    stop_counter = 0
-            else:
-                stop_counter = 0
-
             # Dynamic Cash Deployment: when breadth is bullish or 10-day breadth thrust triggers,
             # scale up high-conviction active risky holdings up to target_bull_exposure
             # and dynamically expand the single-position cap from max_single_pos to bull_max_pos.
             effective_cap = max_single_pos
             if not is_emergency and dynamic_cash:
                 breadth = float(daily_breadth.iloc[t])
-                thrust = float(daily_thrust.iloc[t])
-                thrust_active = thrust >= thrust_thresh
                 bull_active = (breadth >= breadth_bull_thresh) or thrust_active
 
                 if bull_active:
@@ -1706,6 +1740,26 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
                     if tot_active > 0 and target_exp > tot_active:
                         scale = target_exp / tot_active
                         raw_w[active_risky] = (raw_w[active_risky] * scale).clip(upper=effective_cap)
+
+                    # Recommendation 3: Pre-Emptive Breadth Thrust Cash Deployment
+                    # When a breadth thrust occurs, sub-strategies may have 0 or few active buy signals.
+                    # If total active risky allocation is still below target_exp, deploy the unallocated
+                    # exposure into the leading momentum assets that triggered the breadth thrust.
+                    tot_active = float(raw_w[risky_symbols].sum())
+                    if thrust_active and tot_active < target_exp:
+                        unallocated = target_exp - tot_active
+                        row_roc = roc_matrix.iloc[t]
+                        cand_rocs = {s: float(row_roc[s]) for s in risky_symbols if pd.notna(row_roc[s]) and row_roc[s] > 0.0}
+                        sorted_cands = sorted(cand_rocs.keys(), key=lambda s: cand_rocs[s], reverse=True)
+                        for cand in sorted_cands:
+                            if unallocated <= 1e-6:
+                                break
+                            current_w = float(raw_w[cand])
+                            space = max(0.0, effective_cap - current_w)
+                            if space > 0.01:
+                                alloc = min(space, unallocated)
+                                raw_w[cand] = current_w + alloc
+                                unallocated -= alloc
 
             # Apply hard position cap per risky symbol (dynamically expanded in bull breadth)
             risky_w = raw_w[risky_symbols].copy().clip(lower=0.0, upper=effective_cap)
@@ -1779,6 +1833,7 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
         dd_red = p.get("crb_dd_reduce_thresh", cfg.crb_dd_reduce_thresh)
         dd_def = p.get("crb_dd_defensive_thresh", cfg.crb_dd_defensive_thresh)
         dd_stop = p.get("crb_dd_stop_thresh", cfg.crb_dd_stop_thresh)
+        tier1_cd = p.get("crb_tier1_cooldown_bars", getattr(cfg, "crb_tier1_cooldown_bars", 15))
         min_chg = p.get("crb_min_weight_change", cfg.crb_min_weight_change)
         dyn_cash = p.get("crb_dynamic_cash_deployment", getattr(cfg, "crb_dynamic_cash_deployment", True))
         b_thresh = p.get("crb_breadth_bull_thresh", getattr(cfg, "crb_breadth_bull_thresh", 0.30))
@@ -1788,7 +1843,7 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
             f"walkforward-optimized ensemble blending chan_vaa_compound ({vaa_w:.0%}), "
             f"chan_three_type ({three_w:.0%}), and chan_composite ({comp_w:.0%}) "
             f"with hard position cap ({max_pos:.0%} max per stock), "
-            f"drawdown circuit breakers (halve equity at {dd_red:.0%}, defensive VAA at {dd_def:.0%}, stop at {dd_stop:.0%}), "
+            f"drawdown circuit breakers (halve equity at {dd_red:.0%}, defensive VAA at {dd_def:.0%}, stop at {dd_stop:.0%} with fast recovery & {tier1_cd}d auto-heal), "
             f"turnover filter (min trade change {min_chg:.0%}), "
             f"and {'dynamic cash deployment in bull breadth (>=' + f'{b_thresh:.0%}' + f' or {t_lookback}d thrust)' if dyn_cash else 'static cash buffer'}."
         )
@@ -1871,6 +1926,7 @@ class ChanFourStateBlendStrategy(AllocationTemplate):
         thrust_thresh = float(p.get("cfsb_thrust_thresh", getattr(cfg, "cfsb_thrust_thresh", 0.60)))
         target_bull_exposure = float(p.get("cfsb_target_bull_exposure", getattr(cfg, "cfsb_target_bull_exposure", 0.80)))
         bull_max_pos = float(p.get("cfsb_bull_max_single_position", getattr(cfg, "cfsb_bull_max_single_position", 0.30)))
+        tier1_cooldown_bars = int(p.get("cfsb_tier1_cooldown_bars", getattr(cfg, "cfsb_tier1_cooldown_bars", 15)))
 
         tot_w = fse_w + three_w + vaa_w
         if tot_w > 0:
@@ -1890,9 +1946,10 @@ class ChanFourStateBlendStrategy(AllocationTemplate):
         if master_index is None or len(master_index) == 0:
             return pd.DataFrame()
 
-        # Precompute daily universe market breadth (fraction > SMA50) and 10-day breadth thrust (fraction with 10d ROC > 0)
+        # Precompute daily universe market breadth (fraction > SMA50), 10-day breadth thrust, and 10-day ROC matrix
         breadth_matrix = pd.DataFrame(index=master_index, columns=risky_symbols, dtype=float)
         thrust_matrix = pd.DataFrame(index=master_index, columns=risky_symbols, dtype=float)
+        roc_matrix = pd.DataFrame(index=master_index, columns=risky_symbols, dtype=float)
         for sym in risky_symbols:
             if sym in universe and not universe[sym].empty:
                 c = universe[sym]["Close"].reindex(master_index).ffill()
@@ -1900,6 +1957,7 @@ class ChanFourStateBlendStrategy(AllocationTemplate):
                 breadth_matrix[sym] = (c > ma).astype(float)
                 c_prev = c.shift(thrust_lookback)
                 roc_thrust = (c / c_prev - 1.0)
+                roc_matrix[sym] = roc_thrust
                 thrust_matrix[sym] = (roc_thrust > 0.0).astype(float)
         daily_breadth = breadth_matrix.mean(axis=1).fillna(0.50)
         daily_thrust = thrust_matrix.mean(axis=1).fillna(0.50)
@@ -1929,12 +1987,13 @@ class ChanFourStateBlendStrategy(AllocationTemplate):
         daily_weights = pd.DataFrame(0.0, index=master_index, columns=symbols)
         cum_nav = 1.0
         peak_nav = 1.0
+        nav_history = []
+        tier1_counter = 0
+        stop_counter = 0  # consecutive bars in Tier 3 full-stop
+        stop_cooldown_bars = 21  # ~1 month before allowing re-entry
         current_held_w = pd.Series(0.0, index=symbols)
         if cash_proxy in symbols:
             current_held_w[cash_proxy] = 1.0
-
-        stop_counter = 0  # consecutive bars in Tier 3 full-stop
-        stop_cooldown_bars = 21  # ~1 month before allowing re-entry
 
         for t in range(len(master_index)):
             date = master_index[t]
@@ -1947,33 +2006,76 @@ class ChanFourStateBlendStrategy(AllocationTemplate):
                 cum_nav *= (1.0 + port_ret)
                 if cum_nav > peak_nav:
                     peak_nav = cum_nav
+            nav_history.append(cum_nav)
+
+            # Fast-Recovery Override indicators (Recommendation 1)
+            lookback_idx = max(0, len(nav_history) - 1 - 10)
+            r_10d = (cum_nav / nav_history[lookback_idx] - 1.0) if len(nav_history) > 10 else 0.0
+            thrust = float(daily_thrust.iloc[t])
+            thrust_active = thrust >= thrust_thresh
+            fast_recovery = thrust_active or (r_10d > 0.0)
 
             current_dd = (cum_nav - peak_nav) / peak_nav if peak_nav > 0 else 0.0
             dd_mag = abs(current_dd)
 
-            # Circuit breaker logic
+            # Auto-healing cooldown logic for Tier 3 and Tier 1/2 (Recommendation 2)
             if dd_mag >= dd_stop_thresh:
-                # Full stop: 100% cash
-                raw_w = pd.Series(0.0, index=symbols)
-                if cash_proxy in symbols:
-                    raw_w[cash_proxy] = 1.0
-                is_emergency = True
-            elif dd_mag >= dd_defensive_thresh:
-                # Defensive mode: 100% into VAA compound strategy (carries 70% cash buffer)
-                raw_w = w_vaa_daily.loc[date].copy()
-                is_emergency = True
+                stop_counter += 1
+                tier1_counter = 0
+                if stop_counter >= stop_cooldown_bars:
+                    peak_nav = cum_nav
+                    stop_counter = 0
+                    current_dd = 0.0
+                    dd_mag = 0.0
             elif dd_mag >= dd_reduce_thresh:
-                # Risk reduction: 50% damping on equity exposure
-                raw_blend = (
-                    fse_w * w_fse_daily.loc[date] +
-                    three_w * w_three_daily.loc[date] +
-                    vaa_w * w_vaa_daily.loc[date]
-                )
-                raw_w = pd.Series(0.0, index=symbols)
-                raw_w[risky_symbols] = raw_blend[risky_symbols] * 0.50
-                if cash_proxy in symbols:
-                    raw_w[cash_proxy] = max(0.0, 1.0 - raw_w[risky_symbols].sum())
-                is_emergency = True
+                tier1_counter += 1
+                stop_counter = 0
+                if tier1_counter >= tier1_cooldown_bars:
+                    peak_nav = cum_nav
+                    tier1_counter = 0
+                    current_dd = 0.0
+                    dd_mag = 0.0
+            else:
+                stop_counter = 0
+                tier1_counter = 0
+
+            # Circuit breaker logic with Fast-Recovery Override (Recommendation 1)
+            if dd_mag >= dd_stop_thresh:
+                if fast_recovery:
+                    # Fast recovery: downgrade from 100% cash stop to defensive VAA
+                    raw_w = w_vaa_daily.loc[date].copy()
+                    is_emergency = not thrust_active
+                else:
+                    # Full stop: 100% cash
+                    raw_w = pd.Series(0.0, index=symbols)
+                    if cash_proxy in symbols:
+                        raw_w[cash_proxy] = 1.0
+                    is_emergency = True
+            elif dd_mag >= dd_defensive_thresh:
+                # Defensive mode: 100% into VAA compound strategy (carries cash buffer)
+                raw_w = w_vaa_daily.loc[date].copy()
+                is_emergency = not thrust_active if fast_recovery else True
+            elif dd_mag >= dd_reduce_thresh:
+                if fast_recovery:
+                    # Fast recovery: restore full normal blend instead of 50% damping
+                    raw_w = (
+                        fse_w * w_fse_daily.loc[date] +
+                        three_w * w_three_daily.loc[date] +
+                        vaa_w * w_vaa_daily.loc[date]
+                    ).copy()
+                    is_emergency = False
+                else:
+                    # Risk reduction: 50% damping on equity exposure
+                    raw_blend = (
+                        fse_w * w_fse_daily.loc[date] +
+                        three_w * w_three_daily.loc[date] +
+                        vaa_w * w_vaa_daily.loc[date]
+                    )
+                    raw_w = pd.Series(0.0, index=symbols)
+                    raw_w[risky_symbols] = raw_blend[risky_symbols] * 0.50
+                    if cash_proxy in symbols:
+                        raw_w[cash_proxy] = max(0.0, 1.0 - raw_w[risky_symbols].sum())
+                    is_emergency = True
             else:
                 # Normal blend
                 raw_w = (
@@ -1983,25 +2085,12 @@ class ChanFourStateBlendStrategy(AllocationTemplate):
                 ).copy()
                 is_emergency = False
 
-            # Tier 3 cooldown: after spending stop_cooldown_bars in full cash,
-            # reset HWM to current NAV so the drawdown calculation can heal and
-            # the strategy can eventually re-enter risk assets.
-            if dd_mag >= dd_stop_thresh:
-                stop_counter += 1
-                if stop_counter >= stop_cooldown_bars:
-                    peak_nav = cum_nav
-                    stop_counter = 0
-            else:
-                stop_counter = 0
-
             # Dynamic Cash Deployment: when breadth is bullish or 10-day breadth thrust triggers,
             # scale up high-conviction active risky holdings up to target_bull_exposure
             # and dynamically expand the single-position cap from max_single_pos to bull_max_pos.
             effective_cap = max_single_pos
             if not is_emergency and dynamic_cash:
                 breadth = float(daily_breadth.iloc[t])
-                thrust = float(daily_thrust.iloc[t])
-                thrust_active = thrust >= thrust_thresh
                 bull_active = (breadth >= breadth_bull_thresh) or thrust_active
 
                 if bull_active:
@@ -2018,6 +2107,26 @@ class ChanFourStateBlendStrategy(AllocationTemplate):
                     if tot_active > 0 and target_exp > tot_active:
                         scale = target_exp / tot_active
                         raw_w[active_risky] = (raw_w[active_risky] * scale).clip(upper=effective_cap)
+
+                    # Recommendation 3: Pre-Emptive Breadth Thrust Cash Deployment
+                    # When a breadth thrust occurs, sub-strategies may have 0 or few active buy signals.
+                    # If total active risky allocation is still below target_exp, deploy the unallocated
+                    # exposure into the leading momentum assets that triggered the breadth thrust.
+                    tot_active = float(raw_w[risky_symbols].sum())
+                    if thrust_active and tot_active < target_exp:
+                        unallocated = target_exp - tot_active
+                        row_roc = roc_matrix.iloc[t]
+                        cand_rocs = {s: float(row_roc[s]) for s in risky_symbols if pd.notna(row_roc[s]) and row_roc[s] > 0.0}
+                        sorted_cands = sorted(cand_rocs.keys(), key=lambda s: cand_rocs[s], reverse=True)
+                        for cand in sorted_cands:
+                            if unallocated <= 1e-6:
+                                break
+                            current_w = float(raw_w[cand])
+                            space = max(0.0, effective_cap - current_w)
+                            if space > 0.01:
+                                alloc = min(space, unallocated)
+                                raw_w[cand] = current_w + alloc
+                                unallocated -= alloc
 
             # Apply hard position cap per risky symbol (dynamically expanded in bull breadth)
             risky_w = raw_w[risky_symbols].copy().clip(lower=0.0, upper=effective_cap)
@@ -2091,6 +2200,7 @@ class ChanFourStateBlendStrategy(AllocationTemplate):
         dd_red = p.get("cfsb_dd_reduce_thresh", getattr(cfg, "cfsb_dd_reduce_thresh", 0.10))
         dd_def = p.get("cfsb_dd_defensive_thresh", getattr(cfg, "cfsb_dd_defensive_thresh", 0.15))
         dd_stop = p.get("cfsb_dd_stop_thresh", getattr(cfg, "cfsb_dd_stop_thresh", 0.20))
+        tier1_cd = p.get("cfsb_tier1_cooldown_bars", getattr(cfg, "cfsb_tier1_cooldown_bars", 15))
         min_chg = p.get("cfsb_min_weight_change", getattr(cfg, "cfsb_min_weight_change", 0.04))
         dyn_cash = p.get("cfsb_dynamic_cash_deployment", getattr(cfg, "cfsb_dynamic_cash_deployment", True))
         b_thresh = p.get("cfsb_breadth_bull_thresh", getattr(cfg, "cfsb_breadth_bull_thresh", 0.30))
@@ -2100,7 +2210,7 @@ class ChanFourStateBlendStrategy(AllocationTemplate):
             f"institutional ensemble blending chan_vaa_compound ({vaa_w:.0%}), "
             f"chan_three_type ({three_w:.0%}), and chan_four_state_execution ({fse_w:.0%}) "
             f"with hard position cap ({max_pos:.0%} max per stock), "
-            f"drawdown circuit breakers (halve equity at {dd_red:.0%}, defensive VAA at {dd_def:.0%}, stop at {dd_stop:.0%}), "
+            f"drawdown circuit breakers (halve equity at {dd_red:.0%}, defensive VAA at {dd_def:.0%}, stop at {dd_stop:.0%} with fast recovery & {tier1_cd}d auto-heal), "
             f"turnover filter (min trade change {min_chg:.0%}), "
             f"and {'dynamic cash deployment in bull breadth (>=' + f'{b_thresh:.0%}' + f' or {t_lookback}d thrust)' if dyn_cash else 'static cash buffer'}."
         )
@@ -2173,6 +2283,9 @@ class ChanFourStateExecutionStrategy(AllocationTemplate):
         two_stage_entry = bool(p.get("chan_fse_two_stage_entry", getattr(cfg, "chan_fse_two_stage_entry", True)))
         use_breadth_filter = bool(p.get("chan_fse_use_breadth_filter", getattr(cfg, "chan_fse_use_breadth_filter", True)))
         breadth_bull_thresh = float(p.get("chan_fse_breadth_bull_thresh", getattr(cfg, "chan_fse_breadth_bull_thresh", 0.30)))
+        adx_filter = bool(p.get("chan_fse_adx_filter", getattr(cfg, "chan_fse_adx_filter", True)))
+        adx_threshold = float(p.get("chan_fse_adx_threshold", getattr(cfg, "chan_fse_adx_threshold", 20.0)))
+        adx_period = int(p.get("chan_fse_adx_period", getattr(cfg, "chan_fse_adx_period", 14)))
 
         symbols = list(universe.keys())
         risky_symbols = _get_risky_symbols_helper(universe, params, cfg_symbol=None, cfg_risky_universe=None, cash_proxy=cash_proxy)
@@ -2200,6 +2313,15 @@ class ChanFourStateExecutionStrategy(AllocationTemplate):
             third_buy = (sig["third_buy"] | stroke_pivot_shift).reindex(master_index).fillna(False)
             pivot_danger = _pivot_relation_danger_series(bars, min_gap_bars, min_strokes).reindex(master_index).ffill().fillna(False)
             sell_signal = (sig["sell_signal"] | stroke_sig["sell_signal"]).reindex(master_index).fillna(False) | pivot_danger
+
+            # ADX Trend Strength Gate (Recommendation 5):
+            # Suppress new buy signals during choppy / ranging periods where ADX < adx_threshold.
+            if adx_filter and "High" in bars.columns and "Low" in bars.columns and len(bars) >= adx_period:
+                adx_series = adx(bars, period=adx_period).reindex(master_index).ffill().fillna(0.0)
+                trend_ok = adx_series >= adx_threshold
+                first_buy = first_buy & trend_ok
+                second_buy = second_buy & trend_ok
+                third_buy = third_buy & trend_ok
 
             p_df = _extract_pivot_and_stroke_series(bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes)
             zg = p_df["zg"].reindex(master_index).ffill()
@@ -2289,11 +2411,14 @@ class ChanFourStateExecutionStrategy(AllocationTemplate):
         mode = str(p.get("chan_fse_stop_evaluation_mode", getattr(cfg, "chan_fse_stop_evaluation_mode", "close")))
         cd = int(p.get("chan_fse_cooldown_bars", getattr(cfg, "chan_fse_cooldown_bars", 4)))
         two_stage = bool(p.get("chan_fse_two_stage_entry", getattr(cfg, "chan_fse_two_stage_entry", True)))
+        adx_filt = bool(p.get("chan_fse_adx_filter", getattr(cfg, "chan_fse_adx_filter", True)))
+        adx_th = float(p.get("chan_fse_adx_threshold", getattr(cfg, "chan_fse_adx_threshold", 20.0)))
         return (
             f"Chan Four-State Operational Execution Strategy (chan_four_state_execution): "
             f"industrial-grade Chan execution FSM with deterministic structural invalidation stops "
             f"({mode}-confirmed, 1B fractal low with 3% buffer, 2B dd swing low, 3B zg breakout pivot), "
             f"ratcheting trailing stop to ZG ({zg_tol:.1%} buffer), MA entanglement warning filter, "
+            f"{'ADX trend strength gate (threshold ' + f'{adx_th:.0f}' + '), ' if adx_filt else ''}"
             f"max single position {max_pos:.0%}, fallback stop-loss {stop_loss:.0%}, {cd}d re-entry cooldown, "
             f"{'two-stage scaling sizing, ' if two_stage else ''}"
             f"and {'zero consolidation drag with ' + str(min_hold) + 'd gestation buffer (Lesson 16)' if exit_cons else 'standard consolidation hold'}."
@@ -2306,8 +2431,9 @@ class ChanFourStateExecutionStrategy(AllocationTemplate):
         min_strokes = p.get("chan_fse_min_strokes", getattr(cfg, "chan_fse_min_strokes", 3))
         macd_slow = p.get("chan_fse_macd_slow", getattr(cfg, "chan_fse_macd_slow", 26))
         macd_signal = p.get("chan_fse_macd_signal", getattr(cfg, "chan_fse_macd_signal", 9))
+        adx_period = int(p.get("chan_fse_adx_period", getattr(cfg, "chan_fse_adx_period", 14)))
         structural = (min_strokes**2) * 2 * (min_gap_bars + 2) + 2 * (min_gap_bars + 2)
-        return max(structural, macd_slow + macd_signal + 20, 20)
+        return max(structural, macd_slow + macd_signal + 20, adx_period + 20, 20)
 
 
 

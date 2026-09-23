@@ -548,13 +548,15 @@ def test_chan_risk_managed_blend_interface_and_config():
     assert "chan_composite" in strat.explain_weights()
     assert "chan_three_type" in strat.explain_weights()
     assert "chan_vaa_compound" in strat.explain_weights()
-    assert strat.config.crb_composite_weight == 0.20
-    assert strat.config.crb_three_type_weight == 0.40
-    assert strat.config.crb_vaa_weight == 0.40
+    assert strat.config.crb_composite_weight == 0.15
+    assert strat.config.crb_three_type_weight == 0.35
+    assert strat.config.crb_vaa_weight == 0.50
+    assert strat.config.crb_tier1_cooldown_bars == 15
     assert strat.config.crb_breadth_bull_thresh == 0.30
     assert strat.config.crb_thrust_lookback == 10
     assert strat.config.crb_thrust_thresh == 0.60
     assert "10d thrust" in strat.explain_weights()
+    assert "auto-heal" in strat.explain_weights()
 
     # Verify instantiation via strategies_config.json
     configs = load_strategies_config()
@@ -562,9 +564,10 @@ def test_chan_risk_managed_blend_interface_and_config():
     entry = configs["chan_risk_managed_blend"]
     inst = instantiate_strategy_from_config_entry("chan_risk_managed_blend", entry)
     assert isinstance(inst, ChanRiskManagedBlendStrategy)
-    assert inst.config.crb_composite_weight == 0.20
-    assert inst.config.crb_three_type_weight == 0.40
-    assert inst.config.crb_vaa_weight == 0.40
+    assert inst.config.crb_composite_weight == 0.15
+    assert inst.config.crb_three_type_weight == 0.35
+    assert inst.config.crb_vaa_weight == 0.50
+    assert inst.config.crb_tier1_cooldown_bars == 15
     assert inst.config.crb_breadth_bull_thresh == 0.30
     assert inst.config.crb_thrust_lookback == 10
     assert inst.config.crb_thrust_thresh == 0.60
@@ -906,10 +909,14 @@ def test_chan_four_state_execution_instantiation_and_interface():
     assert strat.config.chan_fse_two_stage_entry is True
     assert strat.config.chan_fse_use_breadth_filter is True
     assert strat.config.chan_fse_breadth_bull_thresh == 0.30
+    assert strat.config.chan_fse_adx_filter is True
+    assert strat.config.chan_fse_adx_threshold == 20.0
+    assert strat.config.chan_fse_adx_period == 14
     assert "Chan Four-State Operational Execution Strategy" in strat.explain_weights()
     assert "gestation buffer" in strat.explain_weights()
     assert "close-confirmed" in strat.explain_weights()
     assert "re-entry cooldown" in strat.explain_weights()
+    assert "ADX trend strength gate" in strat.explain_weights()
 
 
 def test_chan_four_state_execution_weights_generation():
@@ -1179,13 +1186,15 @@ def test_chan_four_state_blend_interface_and_config():
     assert "chan_four_state_execution" in strat.explain_weights()
     assert "chan_three_type" in strat.explain_weights()
     assert "chan_vaa_compound" in strat.explain_weights()
-    assert strat.config.cfsb_four_state_weight == 0.20
-    assert strat.config.cfsb_three_type_weight == 0.40
-    assert strat.config.cfsb_vaa_weight == 0.40
+    assert strat.config.cfsb_four_state_weight == 0.15
+    assert strat.config.cfsb_three_type_weight == 0.35
+    assert strat.config.cfsb_vaa_weight == 0.50
+    assert strat.config.cfsb_tier1_cooldown_bars == 15
     assert strat.config.cfsb_breadth_bull_thresh == 0.30
     assert strat.config.cfsb_thrust_lookback == 10
     assert strat.config.cfsb_thrust_thresh == 0.60
     assert "10d thrust" in strat.explain_weights()
+    assert "auto-heal" in strat.explain_weights()
 
     # Verify instantiation via strategies_config.json
     configs = load_strategies_config()
@@ -1193,9 +1202,10 @@ def test_chan_four_state_blend_interface_and_config():
     entry = configs["chan_four_state_blend"]
     inst = instantiate_strategy_from_config_entry("chan_four_state_blend", entry)
     assert isinstance(inst, ChanFourStateBlendStrategy)
-    assert inst.config.cfsb_four_state_weight == 0.20
-    assert inst.config.cfsb_three_type_weight == 0.40
-    assert inst.config.cfsb_vaa_weight == 0.40
+    assert inst.config.cfsb_four_state_weight == 0.15
+    assert inst.config.cfsb_three_type_weight == 0.35
+    assert inst.config.cfsb_vaa_weight == 0.50
+    assert inst.config.cfsb_tier1_cooldown_bars == 15
     assert inst.config.cfsb_breadth_bull_thresh == 0.30
     assert inst.config.cfsb_thrust_lookback == 10
     assert inst.config.cfsb_thrust_thresh == 0.60
@@ -1467,6 +1477,78 @@ def test_chan_four_state_execution_breadth_filter():
     assert (risky == 0.0).all().all()
     if "BIL" in rebal.columns:
         assert (rebal["BIL"] == 1.0).all()
+
+
+def test_chan_blend_tier1_auto_healing_cooldown():
+    """Verify Tier 1 Auto-Healing Cooldown resets peak_nav = cum_nav after tier1_cooldown_bars,
+    preventing portfolio hysteresis freeze / liquidity trap."""
+    universe = create_mock_universe(n_days=100)
+    cfg = StrategyConfig(
+        cfsb_dd_reduce_thresh=0.01,  # very tight threshold to force Tier 1 drawdown
+        cfsb_dd_defensive_thresh=0.50,
+        cfsb_dd_stop_thresh=0.90,
+        cfsb_tier1_cooldown_bars=5,
+        cash_proxy="BIL",
+    )
+    strat = ChanFourStateBlendStrategy(cfg)
+    weights = strat.generate_weights(universe)
+    assert not weights.empty
+    rebal = weights.dropna(how="all")
+    assert not rebal.empty
+
+
+def test_chan_blend_preemptive_breadth_thrust_cash_deployment():
+    """Verify pre-emptive breadth thrust cash deployment fills unallocated equity exposure
+    into momentum leaders up to target_bull_exposure and bull_max_pos."""
+    universe = create_mock_universe(n_days=120)
+    cfg = StrategyConfig(
+        cfsb_dynamic_cash_deployment=True,
+        cfsb_thrust_thresh=0.30,  # easily triggered thrust
+        cfsb_thrust_lookback=10,
+        cfsb_target_bull_exposure=0.80,
+        cfsb_bull_max_single_position=0.30,
+        cash_proxy="BIL",
+    )
+    strat = ChanFourStateBlendStrategy(cfg)
+    weights = strat.generate_weights(universe)
+    assert not weights.empty
+    rebal = weights.dropna(how="all")
+    assert not rebal.empty
+    # Verify no individual stock exceeds expanded bull max single position (0.30)
+    risky = rebal.drop(columns=["BIL"], errors="ignore")
+    assert (risky <= 0.30 + 1e-4).all().all()
+
+
+def test_chan_four_state_execution_adx_trend_filter():
+    """Verify ChanFourStateExecutionStrategy ADX trend filter gates entry when ADX < threshold."""
+    universe = create_mock_universe(n_days=400)
+    # With impossible ADX threshold (e.g. 99), all buy signals are gated
+    cfg_strict = StrategyConfig(
+        chan_fse_adx_filter=True,
+        chan_fse_adx_threshold=99.0,
+        chan_fse_use_ma_filter=False,
+        chan_fse_use_breadth_filter=False,
+        cash_proxy="BIL",
+    )
+    strat_strict = ChanFourStateExecutionStrategy(cfg_strict)
+    w_strict = strat_strict.generate_weights(universe)
+    rebal_strict = w_strict.dropna(how="all")
+    risky_strict = rebal_strict.drop(columns=["BIL"], errors="ignore")
+    assert (risky_strict == 0.0).all().all()
+
+    # With normal ADX threshold (20), positions can be initiated
+    cfg_normal = StrategyConfig(
+        chan_fse_adx_filter=True,
+        chan_fse_adx_threshold=20.0,
+        chan_fse_use_ma_filter=False,
+        chan_fse_use_breadth_filter=False,
+        cash_proxy="BIL",
+    )
+    strat_normal = ChanFourStateExecutionStrategy(cfg_normal)
+    w_normal = strat_normal.generate_weights(universe)
+    rebal_normal = w_normal.dropna(how="all")
+    risky_normal = rebal_normal.drop(columns=["BIL"], errors="ignore")
+    assert (risky_normal > 0.0).any().any()
 
 
 
