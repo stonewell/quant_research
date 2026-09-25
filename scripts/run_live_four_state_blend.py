@@ -193,7 +193,7 @@ def main():
     current_series = reference.reindex(all_symbols, fill_value=0.0)
 
     # 5. Build Execution Order Plan
-    min_trade_thresh = float(params.get("cfsb_min_weight_change", 0.04))
+    min_trade_thresh = float(params.get("cfsb_min_weight_change", 0.05))
     cash_proxy = params.get("cash_proxy", "BIL")
 
     rows = []

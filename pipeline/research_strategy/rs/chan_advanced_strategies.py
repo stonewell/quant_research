@@ -1499,8 +1499,8 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
     Chan strategies with strict institutional risk management and turnover controls:
 
     1. Core Sub-Strategy Allocation:
-       - 40% `ChanVaaCompoundStrategy` (Rank 1: dual-momentum regime crash protection buffer & defensive anchor)
-       - 40% `ChanThreeTypeStrategy` (Rank 2: segment-level pivot structural alpha)
+       - 35% `ChanVaaCompoundStrategy` (Rank 1: dual-momentum regime crash protection buffer & defensive anchor)
+       - 45% `ChanThreeTypeStrategy` (Rank 2: segment-level pivot structural alpha)
        - 20% `ChanCompositeStrategy` (Rank 3: multi-stage B1/B2/B3 position scaling)
 
     2. Key Trading Rules & Risk Controls:
@@ -1515,7 +1515,7 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
          * DD >= 15% from High-Water Mark: Shift 100% of allocation to `ChanVaaCompoundStrategy` (which carries 70% cash buffer).
          * DD >= 20% from High-Water Mark: Hard stop — exit 100% to cash_proxy.
        - Turnover Filter:
-         * Ignores rebalance shifts < 4% (`crb_min_weight_change = 0.04`), eliminating daily micro-rebalancing
+         * Ignores rebalance shifts < 5% (`crb_min_weight_change = 0.05`), eliminating daily micro-rebalancing
            noise and preserving capital against A-share execution costs.
        - Sparse Weights Contract Compliance:
          * Guarantees explicit 0.0 for unheld assets, strictly adhering to workspace NaN-vs-0.0 rules.
@@ -1547,11 +1547,11 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
         p = params or {}
         cash_proxy = p.get("cash_proxy", cfg.cash_proxy)
 
-        comp_w = float(p.get("crb_composite_weight", cfg.crb_composite_weight))
-        three_w = float(p.get("crb_three_type_weight", cfg.crb_three_type_weight))
-        vaa_w = float(p.get("crb_vaa_weight", cfg.crb_vaa_weight))
-        max_single_pos = float(p.get("crb_max_single_position", cfg.crb_max_single_position))
-        min_weight_change = float(p.get("crb_min_weight_change", cfg.crb_min_weight_change))
+        comp_w = float(p.get("crb_composite_weight", getattr(cfg, "crb_composite_weight", 0.20)))
+        three_w = float(p.get("crb_three_type_weight", getattr(cfg, "crb_three_type_weight", 0.45)))
+        vaa_w = float(p.get("crb_vaa_weight", getattr(cfg, "crb_vaa_weight", 0.35)))
+        max_single_pos = float(p.get("crb_max_single_position", getattr(cfg, "crb_max_single_position", 0.20)))
+        min_weight_change = float(p.get("crb_min_weight_change", getattr(cfg, "crb_min_weight_change", 0.05)))
         dd_reduce_thresh = float(p.get("crb_dd_reduce_thresh", cfg.crb_dd_reduce_thresh))
         dd_defensive_thresh = float(p.get("crb_dd_defensive_thresh", cfg.crb_dd_defensive_thresh))
         dd_stop_thresh = float(p.get("crb_dd_stop_thresh", cfg.crb_dd_stop_thresh))
@@ -1899,9 +1899,9 @@ class ChanFourStateBlendStrategy(AllocationTemplate):
     `ChanCompositeStrategy` with the 4-state operational execution machine (`ChanFourStateExecutionStrategy`):
 
     1. Core Sub-Strategy Allocation:
-       - 40% `ChanVaaCompoundStrategy` (Rank 1: dual-momentum regime crash protection buffer & defensive anchor)
-       - 40% `ChanThreeTypeStrategy` (Rank 2: segment-level pivot structural alpha)
-       - 20% `ChanFourStateExecutionStrategy` (Rank 3: 4-state operational machine with 5-bar gestation buffer,
+       - 30% `ChanVaaCompoundStrategy` (Rank 1: dual-momentum regime crash protection buffer & defensive anchor)
+       - 45% `ChanThreeTypeStrategy` (Rank 2: segment-level pivot structural alpha)
+       - 25% `ChanFourStateExecutionStrategy` (Rank 3: 4-state operational machine with 5-bar gestation buffer,
          1% ZG tolerance, moving average entanglement filter, and Lesson 16 stagnation avoidance)
 
     2. Key Trading Rules & Risk Controls:
@@ -1916,7 +1916,7 @@ class ChanFourStateBlendStrategy(AllocationTemplate):
          * DD >= 15% from High-Water Mark: Shift 100% of allocation to `ChanVaaCompoundStrategy` (which carries 70% cash buffer).
          * DD >= 20% from High-Water Mark: Hard stop — exit 100% to cash_proxy (21-bar cooldown).
        - Turnover Filter:
-         * Ignores rebalance shifts < 4% (`cfsb_min_weight_change = 0.04`), eliminating daily micro-rebalancing
+         * Ignores rebalance shifts < 5% (`cfsb_min_weight_change = 0.05`), eliminating daily micro-rebalancing
            noise and preserving capital against execution costs.
        - Sparse Weights Contract Compliance:
          * Guarantees explicit 0.0 for unheld assets, strictly adhering to workspace NaN-vs-0.0 rules.
@@ -1951,11 +1951,11 @@ class ChanFourStateBlendStrategy(AllocationTemplate):
         p = params or {}
         cash_proxy = p.get("cash_proxy", cfg.cash_proxy)
 
-        fse_w = float(p.get("cfsb_four_state_weight", getattr(cfg, "cfsb_four_state_weight", 0.20)))
-        three_w = float(p.get("cfsb_three_type_weight", getattr(cfg, "cfsb_three_type_weight", 0.40)))
-        vaa_w = float(p.get("cfsb_vaa_weight", getattr(cfg, "cfsb_vaa_weight", 0.40)))
+        fse_w = float(p.get("cfsb_four_state_weight", getattr(cfg, "cfsb_four_state_weight", 0.25)))
+        three_w = float(p.get("cfsb_three_type_weight", getattr(cfg, "cfsb_three_type_weight", 0.45)))
+        vaa_w = float(p.get("cfsb_vaa_weight", getattr(cfg, "cfsb_vaa_weight", 0.30)))
         max_single_pos = float(p.get("cfsb_max_single_position", getattr(cfg, "cfsb_max_single_position", 0.20)))
-        min_weight_change = float(p.get("cfsb_min_weight_change", getattr(cfg, "cfsb_min_weight_change", 0.04)))
+        min_weight_change = float(p.get("cfsb_min_weight_change", getattr(cfg, "cfsb_min_weight_change", 0.05)))
         dd_reduce_thresh = float(p.get("cfsb_dd_reduce_thresh", getattr(cfg, "cfsb_dd_reduce_thresh", 0.10)))
         dd_defensive_thresh = float(p.get("cfsb_dd_defensive_thresh", getattr(cfg, "cfsb_dd_defensive_thresh", 0.15)))
         dd_stop_thresh = float(p.get("cfsb_dd_stop_thresh", getattr(cfg, "cfsb_dd_stop_thresh", 0.20)))
@@ -2266,15 +2266,15 @@ class ChanFourStateBlendStrategy(AllocationTemplate):
     def explain_weights(self, params: dict = None) -> str:
         cfg = self.config
         p = params or {}
-        fse_w = p.get("cfsb_four_state_weight", getattr(cfg, "cfsb_four_state_weight", 0.20))
-        three_w = p.get("cfsb_three_type_weight", getattr(cfg, "cfsb_three_type_weight", 0.40))
-        vaa_w = p.get("cfsb_vaa_weight", getattr(cfg, "cfsb_vaa_weight", 0.40))
+        fse_w = p.get("cfsb_four_state_weight", getattr(cfg, "cfsb_four_state_weight", 0.25))
+        three_w = p.get("cfsb_three_type_weight", getattr(cfg, "cfsb_three_type_weight", 0.45))
+        vaa_w = p.get("cfsb_vaa_weight", getattr(cfg, "cfsb_vaa_weight", 0.30))
         max_pos = p.get("cfsb_max_single_position", getattr(cfg, "cfsb_max_single_position", 0.20))
         dd_red = p.get("cfsb_dd_reduce_thresh", getattr(cfg, "cfsb_dd_reduce_thresh", 0.10))
         dd_def = p.get("cfsb_dd_defensive_thresh", getattr(cfg, "cfsb_dd_defensive_thresh", 0.15))
         dd_stop = p.get("cfsb_dd_stop_thresh", getattr(cfg, "cfsb_dd_stop_thresh", 0.20))
         tier1_cd = p.get("cfsb_tier1_cooldown_bars", getattr(cfg, "cfsb_tier1_cooldown_bars", 15))
-        min_chg = p.get("cfsb_min_weight_change", getattr(cfg, "cfsb_min_weight_change", 0.04))
+        min_chg = p.get("cfsb_min_weight_change", getattr(cfg, "cfsb_min_weight_change", 0.05))
         dyn_cash = p.get("cfsb_dynamic_cash_deployment", getattr(cfg, "cfsb_dynamic_cash_deployment", True))
         b_thresh = p.get("cfsb_breadth_bull_thresh", getattr(cfg, "cfsb_breadth_bull_thresh", 0.30))
         t_lookback = p.get("cfsb_thrust_lookback", getattr(cfg, "cfsb_thrust_lookback", 10))

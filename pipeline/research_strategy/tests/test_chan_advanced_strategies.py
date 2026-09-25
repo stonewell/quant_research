@@ -548,9 +548,9 @@ def test_chan_risk_managed_blend_interface_and_config():
     assert "chan_composite" in strat.explain_weights()
     assert "chan_three_type" in strat.explain_weights()
     assert "chan_vaa_compound" in strat.explain_weights()
-    assert strat.config.crb_composite_weight == 0.15
-    assert strat.config.crb_three_type_weight == 0.35
-    assert strat.config.crb_vaa_weight == 0.50
+    assert strat.config.crb_composite_weight == 0.20
+    assert strat.config.crb_three_type_weight == 0.45
+    assert strat.config.crb_vaa_weight == 0.35
     assert strat.config.crb_tier1_cooldown_bars == 15
     assert strat.config.crb_breadth_bull_thresh == 0.30
     assert strat.config.crb_thrust_lookback == 10
@@ -564,9 +564,9 @@ def test_chan_risk_managed_blend_interface_and_config():
     entry = configs["chan_risk_managed_blend"]
     inst = instantiate_strategy_from_config_entry("chan_risk_managed_blend", entry)
     assert isinstance(inst, ChanRiskManagedBlendStrategy)
-    assert inst.config.crb_composite_weight == 0.15
-    assert inst.config.crb_three_type_weight == 0.35
-    assert inst.config.crb_vaa_weight == 0.50
+    assert inst.config.crb_composite_weight == 0.20
+    assert inst.config.crb_three_type_weight == 0.45
+    assert inst.config.crb_vaa_weight == 0.35
     assert inst.config.crb_tier1_cooldown_bars == 15
     assert inst.config.crb_breadth_bull_thresh == 0.30
     assert inst.config.crb_thrust_lookback == 10
@@ -1186,9 +1186,9 @@ def test_chan_four_state_blend_interface_and_config():
     assert "chan_four_state_execution" in strat.explain_weights()
     assert "chan_three_type" in strat.explain_weights()
     assert "chan_vaa_compound" in strat.explain_weights()
-    assert strat.config.cfsb_four_state_weight == 0.15
-    assert strat.config.cfsb_three_type_weight == 0.35
-    assert strat.config.cfsb_vaa_weight == 0.50
+    assert strat.config.cfsb_four_state_weight == 0.25
+    assert strat.config.cfsb_three_type_weight == 0.45
+    assert strat.config.cfsb_vaa_weight == 0.30
     assert strat.config.cfsb_tier1_cooldown_bars == 15
     assert strat.config.cfsb_breadth_bull_thresh == 0.30
     assert strat.config.cfsb_thrust_lookback == 10
@@ -1202,9 +1202,9 @@ def test_chan_four_state_blend_interface_and_config():
     entry = configs["chan_four_state_blend"]
     inst = instantiate_strategy_from_config_entry("chan_four_state_blend", entry)
     assert isinstance(inst, ChanFourStateBlendStrategy)
-    assert inst.config.cfsb_four_state_weight == 0.15
-    assert inst.config.cfsb_three_type_weight == 0.35
-    assert inst.config.cfsb_vaa_weight == 0.50
+    assert inst.config.cfsb_four_state_weight == 0.25
+    assert inst.config.cfsb_three_type_weight == 0.45
+    assert inst.config.cfsb_vaa_weight == 0.30
     assert inst.config.cfsb_tier1_cooldown_bars == 15
     assert inst.config.cfsb_breadth_bull_thresh == 0.30
     assert inst.config.cfsb_thrust_lookback == 10

@@ -539,11 +539,11 @@ class StrategyConfig:
     # Derived from walkforward anomaly analysis: blends the top 3 adjusted-
     # Sharpe Chan strategies with position limits, drawdown circuit breakers,
     # and a minimum-weight-change threshold to curb excessive turnover.
-    crb_composite_weight: float = 0.15       # allocation to chan_composite
-    crb_three_type_weight: float = 0.35      # allocation to chan_three_type
-    crb_vaa_weight: float = 0.50             # allocation to chan_vaa_compound
+    crb_composite_weight: float = 0.20       # allocation to chan_composite
+    crb_three_type_weight: float = 0.45      # allocation to chan_three_type
+    crb_vaa_weight: float = 0.35             # allocation to chan_vaa_compound
     crb_max_single_position: float = 0.20    # hard cap per stock (prevents 100% concentration)
-    crb_min_weight_change: float = 0.04      # skip rebalance trades below 4% change
+    crb_min_weight_change: float = 0.05      # skip rebalance trades below 5% change
     crb_dd_reduce_thresh: float = 0.10       # drawdown level to halve position sizes
     crb_dd_defensive_thresh: float = 0.15    # drawdown level to switch to VAA-only
     crb_dd_stop_thresh: float = 0.20         # drawdown level to exit to 100% cash
@@ -560,13 +560,13 @@ class StrategyConfig:
     crb_smooth_drawdown: bool = True          # smooth linear drawdown damping instead of cliff-edge drops
 
     # --- Chan Four-State Risk-Managed Blend Strategy (chan_four_state_blend) ---
-    # Enhanced institutional ensemble blending ChanFourStateExecutionStrategy (15%),
-    # ChanThreeTypeStrategy (35%), and ChanVaaCompoundStrategy (50%) with institutional risk controls.
-    cfsb_four_state_weight: float = 0.15
-    cfsb_three_type_weight: float = 0.35
-    cfsb_vaa_weight: float = 0.50
+    # Enhanced institutional ensemble blending ChanFourStateExecutionStrategy (25%),
+    # ChanThreeTypeStrategy (45%), and ChanVaaCompoundStrategy (30%) with institutional risk controls.
+    cfsb_four_state_weight: float = 0.25
+    cfsb_three_type_weight: float = 0.45
+    cfsb_vaa_weight: float = 0.30
     cfsb_max_single_position: float = 0.20
-    cfsb_min_weight_change: float = 0.04
+    cfsb_min_weight_change: float = 0.05
     cfsb_dd_reduce_thresh: float = 0.10
     cfsb_dd_defensive_thresh: float = 0.15
     cfsb_dd_stop_thresh: float = 0.20
