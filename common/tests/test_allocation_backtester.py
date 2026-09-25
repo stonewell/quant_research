@@ -338,3 +338,42 @@ def test_min_shares_zero_target_with_zero_prior_shares():
     assert (res["actual_weights"]["A"] == 0.0).all()
 
 
+def test_min_weight_change_suppresses_passive_drift_rebalance():
+    # Asset A and B held at 50/50.
+    # Natural price drift shifts A to 51% and B to 49%.
+    # A subsequent rebalance date targeting [0.50, 0.50] has delta ~1%.
+    # With min_weight_change=0.02, passive drift adjustment is suppressed (0 trades).
+    # Full liquidation (target=0.0) is still executed.
+    idx = pd.bdate_range("2020-01-01", periods=4)
+    universe = {
+        "A": make_df([10.0, 10.4, 10.4, 10.4], start="2020-01-01"),
+        "B": make_df([10.0, 10.0, 10.0, 10.0], start="2020-01-01"),
+    }
+    target_weights = pd.DataFrame(np.nan, index=idx, columns=["A", "B"])
+    # Day 0: Initial allocation 50/50
+    target_weights.iloc[0] = [0.50, 0.50]
+    # Day 1: Target row present with 50/50 (drift is ~1.9%)
+    target_weights.iloc[1] = [0.50, 0.50]
+    # Day 2: Full exit of A (target=0.0, B=1.0)
+    target_weights.iloc[2] = [0.0, 1.0]
+
+    # Without drift suppression: Day 1 generates trades to correct minor drift
+    res_no_thresh = run_allocation_backtest(universe, target_weights, min_weight_change=0.0)
+    trades_no_thresh = res_no_thresh["rebalance_report"]
+    # Rebalance on Day 1 was executed
+    day1_trades_no = trades_no_thresh[trades_no_thresh["date"] == idx[1].strftime("%Y-%m-%d")]
+    assert len(day1_trades_no) > 0
+
+    # With drift suppression min_weight_change=0.03: Day 1 drift is suppressed (< 3%), Day 2 exit succeeds
+    res_thresh = run_allocation_backtest(universe, target_weights, min_weight_change=0.03)
+    trades_thresh = res_thresh["rebalance_report"]
+    day1_trades_yes = trades_thresh[trades_thresh["date"] == idx[1].strftime("%Y-%m-%d")]
+    assert len(day1_trades_yes) == 0  # Drift suppressed!
+
+    # Day 2 full liquidation of A must execute even though prior_s != 0
+    day2_trades = trades_thresh[trades_thresh["date"] == idx[2].strftime("%Y-%m-%d")]
+    assert len(day2_trades) > 0
+    assert any(tr["symbol"] == "A" and tr["action"] == "SELL" and tr["target_weight"] == 0.0 for _, tr in day2_trades.iterrows())
+
+
+

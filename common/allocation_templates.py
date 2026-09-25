@@ -255,7 +255,7 @@ def apply_asset_inertia(
             non_buy_risky = [s for s in risky_symbols if s not in buys]
             avail_cap = max(0.0, 1.0 - float(new_w[non_buy_risky].sum()))
 
-            buys_sorted = sorted(buys, key=lambda b: diff[b], reverse=True)
+            buys_sorted = sorted(buys, key=lambda b: (-diff[b], b))
             for b in buys_sorted:
                 ideal_b = ideal_w[b]
                 buy_target = min(ideal_b, avail_cap)
@@ -532,8 +532,8 @@ class CrossSectionalMomentumAllocation(AllocationTemplate):
         for date, row in moms_rebal.iterrows():
             if row.isna().all():
                 continue
-            # Get the top N symbols by momentum
-            top_symbols = row.nlargest(top_n).index
+            # Get the top N symbols by momentum, breaking ties deterministically by symbol name
+            top_symbols = sorted(row.dropna().index, key=lambda s: (-row[s], s))[:top_n]
             # Equal weight among the top N
             weights_rebal.loc[date, top_symbols] = 1.0 / top_n
 
@@ -661,7 +661,7 @@ class DualMomentumAllocation(AllocationTemplate):
         for date, row in moms_rebal.iterrows():
             if row.isna().all():
                 continue
-            top_symbols = row.nlargest(top_n).index
+            top_symbols = sorted(row.dropna().index, key=lambda s: (-row[s], s))[:top_n]
             for sym in top_symbols:
                 if row[sym] > 0.0:
                     weights_rebal.loc[date, sym] = 1.0 / top_n
@@ -792,8 +792,8 @@ class MeanReversionAllocation(AllocationTemplate):
         for date, row in rsis_rebal.iterrows():
             if row.isna().all():
                 continue
-            # LOWEST RSI = most oversold -- Connors-style RSI(2) mean-reversion.
-            oversold_symbols = row.nsmallest(top_n).index
+            # LOWEST RSI = most oversold -- Connors-style RSI(2) mean-reversion, breaking ties deterministically
+            oversold_symbols = sorted(row.dropna().index, key=lambda s: (row[s], s))[:top_n]
             weights_rebal.loc[date, oversold_symbols] = 1.0 / top_n
 
         weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
@@ -938,7 +938,7 @@ class BreadthGatedMomentumAllocation(AllocationTemplate):
                 derisked_fraction = 0.0
             invested_fraction = 1.0 - derisked_fraction
 
-            top_symbols = row.nlargest(top_n).index
+            top_symbols = sorted(row.index, key=lambda s: (-row[s], s))[:top_n]
             if len(top_symbols) > 0:
                 weights_rebal.loc[date, top_symbols] = invested_fraction / len(top_symbols)
 

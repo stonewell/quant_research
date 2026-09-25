@@ -94,7 +94,7 @@ class CanaryAssetAllocationBase(AllocationTemplate):
         best_def = cash_proxy if cash_proxy and cash_proxy in all_syms else (defensive_symbols[0] if defensive_symbols else None)
         valid_def = date_scores[defensive_symbols].dropna() if defensive_symbols else pd.Series(dtype=float)
         if not valid_def.empty:
-            candidate = valid_def.idxmax()
+            candidate = max(valid_def.index, key=lambda s: (valid_def[s], s))
             if not require_positive or valid_def[candidate] > 0:
                 best_def = candidate
             elif cash_proxy and cash_proxy in all_syms:
@@ -147,11 +147,13 @@ class VigilantAssetAllocation(CanaryAssetAllocationBase):
                 continue
 
             if not off_scores.empty and (off_scores > 0).all():
-                weights_rebal.loc[date, off_scores.idxmax()] = 1.0
+                best_off = max(off_scores.index, key=lambda s: (off_scores[s], s))
+                weights_rebal.loc[date, best_off] = 1.0
             else:
                 def_scores = scores.loc[date, defensive_symbols].dropna() if defensive_symbols else pd.Series(dtype=float)
                 if not def_scores.empty:
-                    weights_rebal.loc[date, def_scores.idxmax()] = 1.0
+                    best_def = max(def_scores.index, key=lambda s: (def_scores[s], s))
+                    weights_rebal.loc[date, best_def] = 1.0
 
         weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
         weights_df.loc[rebalance_dates] = weights_rebal
@@ -240,12 +242,12 @@ class HybridAssetAllocationStrategy(CanaryAssetAllocationBase):
             if canary_bullish and offensive_symbols:
                 valid_off = date_scores[offensive_symbols].dropna()
                 if not valid_off.empty:
-                    ranked_off = valid_off.sort_values(ascending=False)
+                    ranked_off = sorted(valid_off.items(), key=lambda x: (-x[1], x[0]))
                     k = min(top_k, len(ranked_off))
-                    selected_off = ranked_off.iloc[:k]
+                    selected_off = ranked_off[:k]
                     slot_weight = 1.0 / k
 
-                    for sym, sc in selected_off.items():
+                    for sym, sc in selected_off:
                         if sc > 0:
                             weights_rebal.loc[date, sym] += slot_weight
                         else:
@@ -374,11 +376,11 @@ class DefensiveAssetAllocationStrategy(CanaryAssetAllocationBase):
             if risky_share > 0 and k > 0 and risky_symbols:
                 valid_risky = date_scores[risky_symbols].dropna()
                 if not valid_risky.empty:
-                    ranked_risky = valid_risky.sort_values(ascending=False)
-                    selected_risky = ranked_risky.iloc[:k]
+                    ranked_risky = sorted(valid_risky.items(), key=lambda x: (-x[1], x[0]))
+                    selected_risky = ranked_risky[:k]
                     slot_weight = risky_share / k
 
-                    for sym, sc in selected_risky.items():
+                    for sym, sc in selected_risky:
                         if sc > 0:
                             weights_rebal.loc[date, sym] += slot_weight
                         else:

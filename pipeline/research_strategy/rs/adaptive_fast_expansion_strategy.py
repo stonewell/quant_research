@@ -184,8 +184,8 @@ class AdaptiveFastExpansionStrategy(AllocationTemplate):
                     score = fast_w * f_roc + slow_w * s_roc
                     candidates.append((sym, score))
 
-            # Sort passing candidates by combined dual-horizon score
-            candidates.sort(key=lambda x: x[1], reverse=True)
+            # Sort passing candidates by combined dual-horizon score (deterministic tie-break by symbol)
+            candidates.sort(key=lambda x: (-x[1], x[0]))
             selected = candidates[:top_k]
 
             w_row = pd.Series(0.0, index=symbols)

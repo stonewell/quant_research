@@ -1381,7 +1381,8 @@ class ChanVaaCompoundStrategy(AllocationTemplate):
                 vaa_regime_series.loc[date] = "defensive"
                 def_scores = scores.loc[date, defensive_symbols].dropna() if defensive_symbols else pd.Series(dtype=float)
                 if not def_scores.empty:
-                    vaa_rebal_weights.loc[date, def_scores.idxmax()] = 1.0
+                    best_def = max(def_scores.index, key=lambda s: (def_scores[s], s))
+                    vaa_rebal_weights.loc[date, best_def] = 1.0
                 elif cash_proxy in symbols:
                     vaa_rebal_weights.loc[date, cash_proxy] = 1.0
                 continue
@@ -1389,12 +1390,14 @@ class ChanVaaCompoundStrategy(AllocationTemplate):
             # Check if all offensive assets have positive 13612W momentum
             if (off_scores > 0).all():
                 vaa_regime_series.loc[date] = "bull"
-                vaa_rebal_weights.loc[date, off_scores.idxmax()] = 1.0
+                best_off = max(off_scores.index, key=lambda s: (off_scores[s], s))
+                vaa_rebal_weights.loc[date, best_off] = 1.0
             else:
                 vaa_regime_series.loc[date] = "defensive"
                 def_scores = scores.loc[date, defensive_symbols].dropna() if defensive_symbols else pd.Series(dtype=float)
                 if not def_scores.empty:
-                    vaa_rebal_weights.loc[date, def_scores.idxmax()] = 1.0
+                    best_def = max(def_scores.index, key=lambda s: (def_scores[s], s))
+                    vaa_rebal_weights.loc[date, best_def] = 1.0
                 elif cash_proxy in symbols:
                     vaa_rebal_weights.loc[date, cash_proxy] = 1.0
 
@@ -1558,8 +1561,11 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
         thrust_lookback = int(p.get("crb_thrust_lookback", getattr(cfg, "crb_thrust_lookback", 10)))
         thrust_thresh = float(p.get("crb_thrust_thresh", getattr(cfg, "crb_thrust_thresh", 0.60)))
         target_bull_exposure = float(p.get("crb_target_bull_exposure", getattr(cfg, "crb_target_bull_exposure", 0.80)))
-        bull_max_pos = float(p.get("crb_bull_max_single_position", getattr(cfg, "crb_bull_max_single_position", 0.30)))
+        bull_max_pos = float(p.get("crb_bull_max_single_position", getattr(cfg, "crb_bull_max_single_position", 0.20)))
         tier1_cooldown_bars = int(p.get("crb_tier1_cooldown_bars", getattr(cfg, "crb_tier1_cooldown_bars", 15)))
+        enable_vol_targeting = bool(p.get("crb_enable_vol_targeting", getattr(cfg, "crb_enable_vol_targeting", True)))
+        target_vol = float(p.get("crb_target_vol", getattr(cfg, "crb_target_vol", 0.12)))
+        smooth_drawdown = bool(p.get("crb_smooth_drawdown", getattr(cfg, "crb_smooth_drawdown", True)))
 
         tot_w = comp_w + three_w + vaa_w
         if tot_w > 0:
@@ -1610,11 +1616,15 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
         w_vaa_daily = w_vaa_sparse.reindex(master_index).ffill().fillna(0.0) if not w_vaa_sparse.empty else pd.DataFrame(0.0, index=master_index, columns=symbols)
         w_vaa_daily = _fill_out_columns(w_vaa_daily, symbols)
 
-        # Asset returns for tracking portfolio NAV and drawdown
+        # Asset returns for tracking portfolio NAV, drawdown, and realized market volatility
         asset_returns = pd.DataFrame(0.0, index=master_index, columns=risky_symbols)
         for sym in risky_symbols:
             c = universe[sym]["Close"].reindex(master_index).ffill()
             asset_returns[sym] = c.pct_change().fillna(0.0)
+
+        # Precompute 21-day realized market volatility for Barroso & Santa-Clara (2015) volatility targeting
+        market_ret = asset_returns.mean(axis=1).fillna(0.0)
+        market_vol_21d = (market_ret.rolling(21, min_periods=10).std() * np.sqrt(252)).fillna(target_vol)
 
         # Step through time to enforce drawdown circuit breakers, position caps, and turnover filters
         daily_weights = pd.DataFrame(0.0, index=master_index, columns=symbols)
@@ -1672,7 +1682,13 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
                 stop_counter = 0
                 tier1_counter = 0
 
-            # Circuit breaker logic with Fast-Recovery Override (Recommendation 1)
+            # Circuit breaker logic with Fast-Recovery Override (Recommendation 1) & Smooth Drawdown Damping (Recommendation 4)
+            raw_blend = (
+                comp_w * w_comp_daily.loc[date] +
+                three_w * w_three_daily.loc[date] +
+                vaa_w * w_vaa_daily.loc[date]
+            )
+
             if dd_mag >= dd_stop_thresh:
                 if fast_recovery:
                     # Fast recovery: downgrade from 100% cash stop to defensive VAA
@@ -1684,38 +1700,34 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
                     if cash_proxy in symbols:
                         raw_w[cash_proxy] = 1.0
                     is_emergency = True
-            elif dd_mag >= dd_defensive_thresh:
-                # Defensive mode: 100% into VAA compound strategy (carries cash buffer)
-                raw_w = w_vaa_daily.loc[date].copy()
-                is_emergency = not thrust_active if fast_recovery else True
             elif dd_mag >= dd_reduce_thresh:
                 if fast_recovery:
-                    # Fast recovery: restore full normal blend instead of 50% damping
-                    raw_w = (
-                        comp_w * w_comp_daily.loc[date] +
-                        three_w * w_three_daily.loc[date] +
-                        vaa_w * w_vaa_daily.loc[date]
-                    ).copy()
+                    # Fast recovery: restore full normal blend instead of damping
+                    raw_w = raw_blend.copy()
                     is_emergency = False
+                elif smooth_drawdown:
+                    # Recommendation 4: Smooth continuous linear drawdown damping
+                    # Continuously ramp down exposure from 100% to 0% across [dd_reduce_thresh, dd_stop_thresh]
+                    scale_dd = max(0.0, 1.0 - (dd_mag - dd_reduce_thresh) / max(0.01, dd_stop_thresh - dd_reduce_thresh))
+                    raw_w = pd.Series(0.0, index=symbols)
+                    raw_w[risky_symbols] = raw_blend[risky_symbols] * scale_dd
+                    if cash_proxy in symbols:
+                        raw_w[cash_proxy] = max(0.0, 1.0 - float(raw_w[risky_symbols].sum()))
+                    is_emergency = (scale_dd < 0.30)
+                elif dd_mag >= dd_defensive_thresh:
+                    # Defensive mode: 100% into VAA compound strategy (carries cash buffer)
+                    raw_w = w_vaa_daily.loc[date].copy()
+                    is_emergency = True
                 else:
                     # Risk reduction: 50% damping on equity exposure
-                    raw_blend = (
-                        comp_w * w_comp_daily.loc[date] +
-                        three_w * w_three_daily.loc[date] +
-                        vaa_w * w_vaa_daily.loc[date]
-                    )
                     raw_w = pd.Series(0.0, index=symbols)
                     raw_w[risky_symbols] = raw_blend[risky_symbols] * 0.50
                     if cash_proxy in symbols:
-                        raw_w[cash_proxy] = max(0.0, 1.0 - raw_w[risky_symbols].sum())
+                        raw_w[cash_proxy] = max(0.0, 1.0 - float(raw_w[risky_symbols].sum()))
                     is_emergency = True
             else:
                 # Normal blend
-                raw_w = (
-                    comp_w * w_comp_daily.loc[date] +
-                    three_w * w_three_daily.loc[date] +
-                    vaa_w * w_vaa_daily.loc[date]
-                ).copy()
+                raw_w = raw_blend.copy()
                 is_emergency = False
 
             # Dynamic Cash Deployment: when breadth is bullish or 10-day breadth thrust triggers,
@@ -1741,25 +1753,49 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
                         scale = target_exp / tot_active
                         raw_w[active_risky] = (raw_w[active_risky] * scale).clip(upper=effective_cap)
 
-                    # Recommendation 3: Pre-Emptive Breadth Thrust Cash Deployment
+                    # Recommendation 3: Pre-Emptive Multi-Asset Breadth Thrust Cash Deployment
                     # When a breadth thrust occurs, sub-strategies may have 0 or few active buy signals.
                     # If total active risky allocation is still below target_exp, deploy the unallocated
-                    # exposure into the leading momentum assets that triggered the breadth thrust.
+                    # exposure across at least 5 distinct momentum leaders rather than greedy all-in loading.
                     tot_active = float(raw_w[risky_symbols].sum())
                     if thrust_active and tot_active < target_exp:
                         unallocated = target_exp - tot_active
                         row_roc = roc_matrix.iloc[t]
                         cand_rocs = {s: float(row_roc[s]) for s in risky_symbols if pd.notna(row_roc[s]) and row_roc[s] > 0.0}
-                        sorted_cands = sorted(cand_rocs.keys(), key=lambda s: cand_rocs[s], reverse=True)
-                        for cand in sorted_cands:
+                        sorted_cands = sorted(cand_rocs.keys(), key=lambda s: (-cand_rocs[s], s))
+                        min_thrust_assets = 5
+                        n_cands = min(len(sorted_cands), min_thrust_assets)
+                        thrust_slot_cap = min(effective_cap, max(0.04, unallocated / n_cands)) if n_cands > 0 else effective_cap
+
+                        # Pass 1: Spread evenly across top leaders up to thrust_slot_cap
+                        for cand in sorted_cands[:min_thrust_assets]:
                             if unallocated <= 1e-6:
                                 break
                             current_w = float(raw_w[cand])
                             space = max(0.0, effective_cap - current_w)
                             if space > 0.01:
-                                alloc = min(space, unallocated)
+                                alloc = min(space, min(thrust_slot_cap, unallocated))
                                 raw_w[cand] = current_w + alloc
                                 unallocated -= alloc
+
+                        # Pass 2: If unallocated remains, fill remaining space across available leaders up to effective_cap
+                        if unallocated > 1e-6:
+                            for cand in sorted_cands:
+                                if unallocated <= 1e-6:
+                                    break
+                                current_w = float(raw_w[cand])
+                                space = max(0.0, effective_cap - current_w)
+                                if space > 0.01:
+                                    alloc = min(space, unallocated)
+                                    raw_w[cand] = current_w + alloc
+                                    unallocated -= alloc
+
+            # Recommendation 4: Continuous Volatility Targeting Overlay (Barroso & Santa-Clara 2015)
+            # Scale active risky holdings by min(1.0, target_vol / realized_vol) to prevent tail-risk blowups
+            if enable_vol_targeting and not is_emergency:
+                r_vol = float(market_vol_21d.iloc[t]) if pd.notna(market_vol_21d.iloc[t]) and market_vol_21d.iloc[t] > 1e-4 else target_vol
+                vol_scale = min(1.0, target_vol / max(r_vol, 0.05))
+                raw_w[risky_symbols] = raw_w[risky_symbols] * vol_scale
 
             # Apply hard position cap per risky symbol (dynamically expanded in bull breadth)
             risky_w = raw_w[risky_symbols].copy().clip(lower=0.0, upper=effective_cap)
@@ -1803,7 +1839,7 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
                 non_buy_risky = [s for s in risky_symbols if s not in buys]
                 avail_cap = max(0.0, 1.0 - float(new_target[non_buy_risky].sum()))
 
-                buys_sorted = sorted(buys, key=lambda b: diff[b], reverse=True)
+                buys_sorted = sorted(buys, key=lambda b: (-diff[b], b))
                 for b in buys_sorted:
                     ideal_b = ideal_target_w[b]
                     buy_target = min(ideal_b, avail_cap)
@@ -1838,13 +1874,17 @@ class ChanRiskManagedBlendStrategy(AllocationTemplate):
         dyn_cash = p.get("crb_dynamic_cash_deployment", getattr(cfg, "crb_dynamic_cash_deployment", True))
         b_thresh = p.get("crb_breadth_bull_thresh", getattr(cfg, "crb_breadth_bull_thresh", 0.30))
         t_lookback = p.get("crb_thrust_lookback", getattr(cfg, "crb_thrust_lookback", 10))
+        vol_tgt = p.get("crb_enable_vol_targeting", getattr(cfg, "crb_enable_vol_targeting", True))
+        t_vol = p.get("crb_target_vol", getattr(cfg, "crb_target_vol", 0.12))
+        smooth_dd = p.get("crb_smooth_drawdown", getattr(cfg, "crb_smooth_drawdown", True))
         return (
             f"Chan Risk-Managed Blend Strategy (chan_risk_managed_blend): "
             f"walkforward-optimized ensemble blending chan_vaa_compound ({vaa_w:.0%}), "
             f"chan_three_type ({three_w:.0%}), and chan_composite ({comp_w:.0%}) "
             f"with hard position cap ({max_pos:.0%} max per stock), "
-            f"drawdown circuit breakers (halve equity at {dd_red:.0%}, defensive VAA at {dd_def:.0%}, stop at {dd_stop:.0%} with fast recovery & {tier1_cd}d auto-heal), "
+            f"drawdown circuit breakers ({'smooth damping' if smooth_dd else 'halve equity'} from {dd_red:.0%}, defensive VAA at {dd_def:.0%}, stop at {dd_stop:.0%} with fast recovery & {tier1_cd}d auto-heal), "
             f"turnover filter (min trade change {min_chg:.0%}), "
+            f"{'volatility targeting (' + f'{t_vol:.0%}' + ' target vol), ' if vol_tgt else ''}"
             f"and {'dynamic cash deployment in bull breadth (>=' + f'{b_thresh:.0%}' + f' or {t_lookback}d thrust)' if dyn_cash else 'static cash buffer'}."
         )
 
@@ -1925,8 +1965,11 @@ class ChanFourStateBlendStrategy(AllocationTemplate):
         thrust_lookback = int(p.get("cfsb_thrust_lookback", getattr(cfg, "cfsb_thrust_lookback", 10)))
         thrust_thresh = float(p.get("cfsb_thrust_thresh", getattr(cfg, "cfsb_thrust_thresh", 0.60)))
         target_bull_exposure = float(p.get("cfsb_target_bull_exposure", getattr(cfg, "cfsb_target_bull_exposure", 0.80)))
-        bull_max_pos = float(p.get("cfsb_bull_max_single_position", getattr(cfg, "cfsb_bull_max_single_position", 0.30)))
+        bull_max_pos = float(p.get("cfsb_bull_max_single_position", getattr(cfg, "cfsb_bull_max_single_position", 0.20)))
         tier1_cooldown_bars = int(p.get("cfsb_tier1_cooldown_bars", getattr(cfg, "cfsb_tier1_cooldown_bars", 15)))
+        enable_vol_targeting = bool(p.get("cfsb_enable_vol_targeting", getattr(cfg, "cfsb_enable_vol_targeting", True)))
+        target_vol = float(p.get("cfsb_target_vol", getattr(cfg, "cfsb_target_vol", 0.12)))
+        smooth_drawdown = bool(p.get("cfsb_smooth_drawdown", getattr(cfg, "cfsb_smooth_drawdown", True)))
 
         tot_w = fse_w + three_w + vaa_w
         if tot_w > 0:
@@ -1977,11 +2020,15 @@ class ChanFourStateBlendStrategy(AllocationTemplate):
         w_vaa_daily = w_vaa_sparse.reindex(master_index).ffill().fillna(0.0) if not w_vaa_sparse.empty else pd.DataFrame(0.0, index=master_index, columns=symbols)
         w_vaa_daily = _fill_out_columns(w_vaa_daily, symbols)
 
-        # Asset returns for tracking portfolio NAV and drawdown
+        # Asset returns for tracking portfolio NAV, drawdown, and realized market volatility
         asset_returns = pd.DataFrame(0.0, index=master_index, columns=risky_symbols)
         for sym in risky_symbols:
             c = universe[sym]["Close"].reindex(master_index).ffill()
             asset_returns[sym] = c.pct_change().fillna(0.0)
+
+        # Precompute 21-day realized market volatility for Barroso & Santa-Clara (2015) volatility targeting
+        market_ret = asset_returns.mean(axis=1).fillna(0.0)
+        market_vol_21d = (market_ret.rolling(21, min_periods=10).std() * np.sqrt(252)).fillna(target_vol)
 
         # Step through time to enforce drawdown circuit breakers, position caps, and turnover filters
         daily_weights = pd.DataFrame(0.0, index=master_index, columns=symbols)
@@ -2039,7 +2086,13 @@ class ChanFourStateBlendStrategy(AllocationTemplate):
                 stop_counter = 0
                 tier1_counter = 0
 
-            # Circuit breaker logic with Fast-Recovery Override (Recommendation 1)
+            # Circuit breaker logic with Fast-Recovery Override (Recommendation 1) & Smooth Drawdown Damping (Recommendation 4)
+            raw_blend = (
+                fse_w * w_fse_daily.loc[date] +
+                three_w * w_three_daily.loc[date] +
+                vaa_w * w_vaa_daily.loc[date]
+            )
+
             if dd_mag >= dd_stop_thresh:
                 if fast_recovery:
                     # Fast recovery: downgrade from 100% cash stop to defensive VAA
@@ -2051,38 +2104,34 @@ class ChanFourStateBlendStrategy(AllocationTemplate):
                     if cash_proxy in symbols:
                         raw_w[cash_proxy] = 1.0
                     is_emergency = True
-            elif dd_mag >= dd_defensive_thresh:
-                # Defensive mode: 100% into VAA compound strategy (carries cash buffer)
-                raw_w = w_vaa_daily.loc[date].copy()
-                is_emergency = not thrust_active if fast_recovery else True
             elif dd_mag >= dd_reduce_thresh:
                 if fast_recovery:
-                    # Fast recovery: restore full normal blend instead of 50% damping
-                    raw_w = (
-                        fse_w * w_fse_daily.loc[date] +
-                        three_w * w_three_daily.loc[date] +
-                        vaa_w * w_vaa_daily.loc[date]
-                    ).copy()
+                    # Fast recovery: restore full normal blend instead of damping
+                    raw_w = raw_blend.copy()
                     is_emergency = False
+                elif smooth_drawdown:
+                    # Recommendation 4: Smooth continuous linear drawdown damping
+                    # Continuously ramp down exposure from 100% to 0% across [dd_reduce_thresh, dd_stop_thresh]
+                    scale_dd = max(0.0, 1.0 - (dd_mag - dd_reduce_thresh) / max(0.01, dd_stop_thresh - dd_reduce_thresh))
+                    raw_w = pd.Series(0.0, index=symbols)
+                    raw_w[risky_symbols] = raw_blend[risky_symbols] * scale_dd
+                    if cash_proxy in symbols:
+                        raw_w[cash_proxy] = max(0.0, 1.0 - float(raw_w[risky_symbols].sum()))
+                    is_emergency = (scale_dd < 0.30)
+                elif dd_mag >= dd_defensive_thresh:
+                    # Defensive mode: 100% into VAA compound strategy (carries cash buffer)
+                    raw_w = w_vaa_daily.loc[date].copy()
+                    is_emergency = True
                 else:
                     # Risk reduction: 50% damping on equity exposure
-                    raw_blend = (
-                        fse_w * w_fse_daily.loc[date] +
-                        three_w * w_three_daily.loc[date] +
-                        vaa_w * w_vaa_daily.loc[date]
-                    )
                     raw_w = pd.Series(0.0, index=symbols)
                     raw_w[risky_symbols] = raw_blend[risky_symbols] * 0.50
                     if cash_proxy in symbols:
-                        raw_w[cash_proxy] = max(0.0, 1.0 - raw_w[risky_symbols].sum())
+                        raw_w[cash_proxy] = max(0.0, 1.0 - float(raw_w[risky_symbols].sum()))
                     is_emergency = True
             else:
                 # Normal blend
-                raw_w = (
-                    fse_w * w_fse_daily.loc[date] +
-                    three_w * w_three_daily.loc[date] +
-                    vaa_w * w_vaa_daily.loc[date]
-                ).copy()
+                raw_w = raw_blend.copy()
                 is_emergency = False
 
             # Dynamic Cash Deployment: when breadth is bullish or 10-day breadth thrust triggers,
@@ -2108,25 +2157,49 @@ class ChanFourStateBlendStrategy(AllocationTemplate):
                         scale = target_exp / tot_active
                         raw_w[active_risky] = (raw_w[active_risky] * scale).clip(upper=effective_cap)
 
-                    # Recommendation 3: Pre-Emptive Breadth Thrust Cash Deployment
+                    # Recommendation 3: Pre-Emptive Multi-Asset Breadth Thrust Cash Deployment
                     # When a breadth thrust occurs, sub-strategies may have 0 or few active buy signals.
                     # If total active risky allocation is still below target_exp, deploy the unallocated
-                    # exposure into the leading momentum assets that triggered the breadth thrust.
+                    # exposure across at least 5 distinct momentum leaders rather than greedy all-in loading.
                     tot_active = float(raw_w[risky_symbols].sum())
                     if thrust_active and tot_active < target_exp:
                         unallocated = target_exp - tot_active
                         row_roc = roc_matrix.iloc[t]
                         cand_rocs = {s: float(row_roc[s]) for s in risky_symbols if pd.notna(row_roc[s]) and row_roc[s] > 0.0}
-                        sorted_cands = sorted(cand_rocs.keys(), key=lambda s: cand_rocs[s], reverse=True)
-                        for cand in sorted_cands:
+                        sorted_cands = sorted(cand_rocs.keys(), key=lambda s: (-cand_rocs[s], s))
+                        min_thrust_assets = 5
+                        n_cands = min(len(sorted_cands), min_thrust_assets)
+                        thrust_slot_cap = min(effective_cap, max(0.04, unallocated / n_cands)) if n_cands > 0 else effective_cap
+
+                        # Pass 1: Spread evenly across top leaders up to thrust_slot_cap
+                        for cand in sorted_cands[:min_thrust_assets]:
                             if unallocated <= 1e-6:
                                 break
                             current_w = float(raw_w[cand])
                             space = max(0.0, effective_cap - current_w)
                             if space > 0.01:
-                                alloc = min(space, unallocated)
+                                alloc = min(space, min(thrust_slot_cap, unallocated))
                                 raw_w[cand] = current_w + alloc
                                 unallocated -= alloc
+
+                        # Pass 2: If unallocated remains, fill remaining space across available leaders up to effective_cap
+                        if unallocated > 1e-6:
+                            for cand in sorted_cands:
+                                if unallocated <= 1e-6:
+                                    break
+                                current_w = float(raw_w[cand])
+                                space = max(0.0, effective_cap - current_w)
+                                if space > 0.01:
+                                    alloc = min(space, unallocated)
+                                    raw_w[cand] = current_w + alloc
+                                    unallocated -= alloc
+
+            # Recommendation 4: Continuous Volatility Targeting Overlay (Barroso & Santa-Clara 2015)
+            # Scale active risky holdings by min(1.0, target_vol / realized_vol) to prevent tail-risk blowups
+            if enable_vol_targeting and not is_emergency:
+                r_vol = float(market_vol_21d.iloc[t]) if pd.notna(market_vol_21d.iloc[t]) and market_vol_21d.iloc[t] > 1e-4 else target_vol
+                vol_scale = min(1.0, target_vol / max(r_vol, 0.05))
+                raw_w[risky_symbols] = raw_w[risky_symbols] * vol_scale
 
             # Apply hard position cap per risky symbol (dynamically expanded in bull breadth)
             risky_w = raw_w[risky_symbols].copy().clip(lower=0.0, upper=effective_cap)
@@ -2170,7 +2243,7 @@ class ChanFourStateBlendStrategy(AllocationTemplate):
                 non_buy_risky = [s for s in risky_symbols if s not in buys]
                 avail_cap = max(0.0, 1.0 - float(new_target[non_buy_risky].sum()))
 
-                buys_sorted = sorted(buys, key=lambda b: diff[b], reverse=True)
+                buys_sorted = sorted(buys, key=lambda b: (-diff[b], b))
                 for b in buys_sorted:
                     ideal_b = ideal_target_w[b]
                     buy_target = min(ideal_b, avail_cap)
@@ -2205,13 +2278,17 @@ class ChanFourStateBlendStrategy(AllocationTemplate):
         dyn_cash = p.get("cfsb_dynamic_cash_deployment", getattr(cfg, "cfsb_dynamic_cash_deployment", True))
         b_thresh = p.get("cfsb_breadth_bull_thresh", getattr(cfg, "cfsb_breadth_bull_thresh", 0.30))
         t_lookback = p.get("cfsb_thrust_lookback", getattr(cfg, "cfsb_thrust_lookback", 10))
+        vol_tgt = p.get("cfsb_enable_vol_targeting", getattr(cfg, "cfsb_enable_vol_targeting", True))
+        t_vol = p.get("cfsb_target_vol", getattr(cfg, "cfsb_target_vol", 0.12))
+        smooth_dd = p.get("cfsb_smooth_drawdown", getattr(cfg, "cfsb_smooth_drawdown", True))
         return (
             f"Chan Four-State Risk-Managed Blend Strategy (chan_four_state_blend): "
             f"institutional ensemble blending chan_vaa_compound ({vaa_w:.0%}), "
             f"chan_three_type ({three_w:.0%}), and chan_four_state_execution ({fse_w:.0%}) "
             f"with hard position cap ({max_pos:.0%} max per stock), "
-            f"drawdown circuit breakers (halve equity at {dd_red:.0%}, defensive VAA at {dd_def:.0%}, stop at {dd_stop:.0%} with fast recovery & {tier1_cd}d auto-heal), "
+            f"drawdown circuit breakers ({'smooth damping' if smooth_dd else 'halve equity'} from {dd_red:.0%}, defensive VAA at {dd_def:.0%}, stop at {dd_stop:.0%} with fast recovery & {tier1_cd}d auto-heal), "
             f"turnover filter (min trade change {min_chg:.0%}), "
+            f"{'volatility targeting (' + f'{t_vol:.0%}' + ' target vol), ' if vol_tgt else ''}"
             f"and {'dynamic cash deployment in bull breadth (>=' + f'{b_thresh:.0%}' + f' or {t_lookback}d thrust)' if dyn_cash else 'static cash buffer'}."
         )
 

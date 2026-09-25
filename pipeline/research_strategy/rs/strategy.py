@@ -274,7 +274,7 @@ class NaturalLanguageStrategy(AllocationTemplate):
                 # the canary had actually signalled turbulence.
                 if turbulent:
                     scores = rocs_long.loc[date, defensive_symbols].dropna()
-                    positive_defensive = scores[scores > 0].nlargest(min(len(scores), top_k)).index.tolist()
+                    positive_defensive = sorted(scores[scores > 0].index, key=lambda s: (-scores[s], s))[:min(len(scores), top_k)]
                     if positive_defensive:
                         w_each = 1.0 / top_k
                         for da in positive_defensive:
@@ -288,7 +288,7 @@ class NaturalLanguageStrategy(AllocationTemplate):
                 elif offensive_symbols:
                     scores = rocs_long.loc[date, offensive_symbols].dropna()
                     if not scores.empty:
-                        top_assets = scores.nlargest(min(len(scores), top_k)).index.tolist()
+                        top_assets = sorted(scores.index, key=lambda s: (-scores[s], s))[:min(len(scores), top_k)]
                         w_each = 1.0 / len(top_assets) if top_assets else 0.0
                         for ta in top_assets:
                             weights_rebal.loc[date, ta] = w_each
@@ -358,7 +358,7 @@ class NaturalLanguageStrategy(AllocationTemplate):
                 m = len(passing_symbols)
                 if m > 0:
                     sym_scores = composite_mom.loc[date, passing_symbols].dropna()
-                    selected = sym_scores.nlargest(min(m, top_k)).index.tolist()
+                    selected = sorted(sym_scores.index, key=lambda s: (-sym_scores[s], s))[:min(m, top_k)]
 
                     if spec.allocation_scheme == "equal_weight":
                         w_each = (1.0 / top_k)
@@ -471,7 +471,7 @@ class AcceleratingDualMomentum(AllocationTemplate):
                 continue
             candidates = {s: bond_1m[s].loc[date] for s in bond_symbols if pd.notna(bond_1m[s].loc[date])}
             if candidates:
-                best_bond = max(candidates, key=candidates.get)
+                best_bond = max(candidates.keys(), key=lambda s: (candidates[s], s))
                 weights_rebal.loc[date, best_bond] = 1.0
 
         weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
@@ -1089,7 +1089,7 @@ class AdaptiveGridStrategy(AllocationTemplate):
                     n_open = sum(slot_state)
                     candidates = sorted(
                         (j for j in range(len(slot_state)) if not slot_state[j] and c <= levels[j]),
-                        key=lambda j: abs(levels[j] - center),
+                        key=lambda j: (abs(levels[j] - center), j),
                     )
                     for j in candidates:
                         if n_open >= max_open_slots or (n_open + 1) * position_size_pct > max_deployed:
@@ -1900,7 +1900,7 @@ class ProtectiveAssetAllocation(AllocationTemplate):
             else:
                 protection_fraction = 0.0
 
-            top_symbols = row.sort_values(ascending=False).index[:k]
+            top_symbols = sorted(row.index, key=lambda s: (-row[s], s))[:k]
             risky_fraction = 1.0 - protection_fraction
             if len(top_symbols) > 0:
                 weights_rebal.loc[date, top_symbols] = risky_fraction / len(top_symbols)
@@ -2017,7 +2017,7 @@ class AdaptiveAssetAllocation(AllocationTemplate):
             if len(mom_row) < n_universe:
                 continue  # still warming up
 
-            survivors = mom_row.sort_values(ascending=False).index[:k].tolist()
+            survivors = sorted(mom_row.index, key=lambda s: (-mom_row[s], s))[:k]
 
             hist = rets.loc[:date, survivors]
             corr_hist = hist.tail(corr_lookback)

@@ -554,7 +554,10 @@ class StrategyConfig:
     crb_thrust_lookback: int = 10            # lookback window for short-term breadth thrust (Zweig 10-day thrust)
     crb_thrust_thresh: float = 0.60          # breadth thrust threshold (fraction of assets with 10d ROC > 0)
     crb_target_bull_exposure: float = 0.80   # target equity exposure in bull breadth regime
-    crb_bull_max_single_position: float = 0.30 # dynamically expanded single-stock cap in bull breadth (defaults to 0.30)
+    crb_bull_max_single_position: float = 0.20 # dynamically expanded single-stock cap in bull breadth (capped at 0.20)
+    crb_enable_vol_targeting: bool = True     # enable Barroso & Santa-Clara continuous volatility targeting
+    crb_target_vol: float = 0.12              # 12% target annualized volatility
+    crb_smooth_drawdown: bool = True          # smooth linear drawdown damping instead of cliff-edge drops
 
     # --- Chan Four-State Risk-Managed Blend Strategy (chan_four_state_blend) ---
     # Enhanced institutional ensemble blending ChanFourStateExecutionStrategy (15%),
@@ -574,7 +577,10 @@ class StrategyConfig:
     cfsb_thrust_lookback: int = 10
     cfsb_thrust_thresh: float = 0.60
     cfsb_target_bull_exposure: float = 0.80
-    cfsb_bull_max_single_position: float = 0.30
+    cfsb_bull_max_single_position: float = 0.20
+    cfsb_enable_vol_targeting: bool = True
+    cfsb_target_vol: float = 0.12
+    cfsb_smooth_drawdown: bool = True
 
     # --- Price Action Breakout & Retest Strategy (docs/chan_similar_trading.md Strategy 1) ---
     pabr_box_window: int = 20                # consolidation box length (~4 weeks)
@@ -827,6 +833,10 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.cfsb_thrust_thresh must be between 0 and 1, got {self.cfsb_thrust_thresh}")
         if not (0.0 < self.cfsb_bull_max_single_position <= 1.0):
             raise ValueError(f"StrategyConfig.cfsb_bull_max_single_position must be between 0 and 1, got {self.cfsb_bull_max_single_position}")
+        if self.crb_target_vol <= 0.0:
+            raise ValueError(f"StrategyConfig.crb_target_vol must be > 0, got {self.crb_target_vol}")
+        if self.cfsb_target_vol <= 0.0:
+            raise ValueError(f"StrategyConfig.cfsb_target_vol must be > 0, got {self.cfsb_target_vol}")
         if self.crb_tier1_cooldown_bars <= 0:
             raise ValueError(f"StrategyConfig.crb_tier1_cooldown_bars must be > 0, got {self.crb_tier1_cooldown_bars}")
         if self.cfsb_tier1_cooldown_bars <= 0:

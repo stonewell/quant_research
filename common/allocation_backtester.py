@@ -81,6 +81,7 @@ def run_allocation_backtest(
     commission_pct: float = 0.0005,
     slippage_pct: float = 0.0005,
     min_shares: int = 1,
+    min_weight_change: float = 0.0,
     china_trading: bool = False,
     stamp_duty_pct: float = 0.0005,
     us_trading: bool = False,
@@ -106,6 +107,11 @@ def run_allocation_backtest(
     `min_shares` defines the minimal amount of shares trading each time
     (default: 1). Fractional share trading is not allowed; all traded share
     quantities and holdings are integer share amounts.
+
+    `min_weight_change`: minimum weight difference |delta_w| required to trigger
+    a rebalance on an already-held asset (default: 0.0). Suppresses sub-threshold
+    passive price drift rebalances when an asset's position has not intentionally
+    changed, while allowing new entries (prior_s == 0) and full exits (target_w == 0).
 
     `china_trading`: applies China A-share trading rules:
     - Board price limits: blocks BUY orders on limit-up (10%/20%/30%),
@@ -332,6 +338,12 @@ def run_allocation_backtest(
                     # Target is zero and we already hold zero shares
                     continue
                 else:
+                    # Recommendation 2: Passive drift suppression
+                    # If we already hold shares of this asset and the delta is smaller than min_weight_change,
+                    # treat this as passive price drift rather than an active portfolio adjustment.
+                    if min_weight_change > 0.0 and prior_s != 0 and abs(delta_w) < min_weight_change:
+                        continue
+
                     raw_val = abs(delta_w) * pre_rebal_equity
                     raw_s = raw_val / price
                     if sym_min_shares == 0:
@@ -376,8 +388,8 @@ def run_allocation_backtest(
             lot_buffer = float(np.dot(sym_min_shares_arr, valid_closes_t))
             avail_cash = max(0.0, (1.0 - prior_market_exposure) * pre_rebal_equity) + lot_buffer
 
-            sells = [c for c in candidates if c["action"] == "SELL"]
-            buys = [c for c in candidates if c["action"] == "BUY"]
+            sells = sorted([c for c in candidates if c["action"] == "SELL"], key=lambda c: (-abs(c["delta_w"]), c["symbol"]))
+            buys = sorted([c for c in candidates if c["action"] == "BUY"], key=lambda c: (-abs(c["delta_w"]), c["symbol"]))
 
             # Execute sells first to release cash
             for c in sells:

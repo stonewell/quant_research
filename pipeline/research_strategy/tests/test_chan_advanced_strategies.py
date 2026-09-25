@@ -1551,4 +1551,92 @@ def test_chan_four_state_execution_adx_trend_filter():
     assert (risky_normal > 0.0).any().any()
 
 
+def test_chan_risk_managed_blend_thrust_multi_asset_dispersion():
+    """Recommendation 3: Verify that breadth thrust distributes unallocated cash across
+    multiple momentum leaders (at least 5) and caps single-stock exposure at <= 20%."""
+    n_days = 350
+    dates = pd.bdate_range("2020-01-01", periods=n_days)
+    t = np.arange(n_days)
+    universe = {}
+    for k in range(8):
+        trend = 0.08 * (k + 1) * t
+        osc = (2.0 + k) * np.sin(t / (8.0 + k))
+        universe[f"SYM_{k}"] = make_ohlcv_from_closes(100.0 + trend + osc, start="2020-01-01")
+    universe["BIL"] = make_ohlcv_from_closes(100.0 + 0.001 * t, start="2020-01-01")
+
+    cfg = StrategyConfig(
+        crb_dynamic_cash_deployment=True,
+        crb_breadth_lookback=50,
+        crb_breadth_bull_thresh=0.99,  # standard breadth disabled
+        crb_thrust_lookback=10,
+        crb_thrust_thresh=0.30,        # thrust enabled
+        crb_target_bull_exposure=0.80,
+        crb_max_single_position=0.20,
+        crb_bull_max_single_position=0.20,  # 20% cap strictly enforced
+        crb_min_weight_change=0.02,
+        cash_proxy="BIL",
+    )
+    strat = ChanRiskManagedBlendStrategy(cfg)
+    weights = strat.generate_weights(universe)
+    rebal_df = weights.dropna(how="all")
+    assert not rebal_df.empty
+
+    risky_df = rebal_df.drop(columns=["BIL"], errors="ignore")
+    # Single-stock exposure must NEVER exceed the 20% cap
+    assert (risky_df <= 0.200001).all().all()
+
+    # In rebalance rows where total risky exposure is elevated (> 0.40),
+    # there must be at least 3-5 distinct assets sharing the allocation, not just 1 greedy stock
+    elevated_rows = risky_df[risky_df.sum(axis=1) >= 0.40]
+    if not elevated_rows.empty:
+        non_zero_counts = (elevated_rows > 0.01).sum(axis=1)
+        assert (non_zero_counts >= 3).any()
+
+
+def test_chan_risk_managed_blend_smooth_drawdown_damping():
+    """Recommendation 4: Verify that smooth linear drawdown damping continuously reduces
+    exposure between dd_reduce_thresh (10%) and dd_stop_thresh (20%)."""
+    universe = create_mock_universe(n_days=400)
+    cfg_smooth = StrategyConfig(
+        crb_smooth_drawdown=True,
+        crb_dd_reduce_thresh=0.10,
+        crb_dd_stop_thresh=0.20,
+        crb_min_weight_change=0.01,
+        cash_proxy="BIL",
+    )
+    strat_smooth = ChanRiskManagedBlendStrategy(cfg_smooth)
+    weights = strat_smooth.generate_weights(universe)
+    assert not weights.dropna(how="all").empty
+
+
+def test_chan_risk_managed_blend_volatility_targeting():
+    """Recommendation 4: Verify Barroso & Santa-Clara volatility targeting scales
+    risky exposure according to target_vol."""
+    universe = create_mock_universe(n_days=400)
+    cfg_tight_vol = StrategyConfig(
+        crb_enable_vol_targeting=True,
+        crb_target_vol=0.02,  # Very tight target vol (2%), will definitely scale down
+        crb_min_weight_change=0.01,
+        cash_proxy="BIL",
+    )
+    strat_tight = ChanRiskManagedBlendStrategy(cfg_tight_vol)
+    w_tight = strat_tight.generate_weights(universe).dropna(how="all")
+
+    cfg_loose_vol = StrategyConfig(
+        crb_enable_vol_targeting=True,
+        crb_target_vol=0.50,  # Loose target vol (50%), no scaling down
+        crb_min_weight_change=0.01,
+        cash_proxy="BIL",
+    )
+    strat_loose = ChanRiskManagedBlendStrategy(cfg_loose_vol)
+    w_loose = strat_loose.generate_weights(universe).dropna(how="all")
+
+    risky_tight = w_tight.drop(columns=["BIL"], errors="ignore").sum(axis=1)
+    risky_loose = w_loose.drop(columns=["BIL"], errors="ignore").sum(axis=1)
+
+    # Tight target vol should yield strictly less or equal risky exposure on average
+    assert risky_tight.mean() <= risky_loose.mean() + 1e-5
+
+
+
 

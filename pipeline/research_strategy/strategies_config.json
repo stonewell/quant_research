@@ -338,7 +338,10 @@
       "crb_thrust_lookback": 10,
       "crb_thrust_thresh": 0.60,
       "crb_target_bull_exposure": 0.80,
-      "crb_bull_max_single_position": 0.30,
+      "crb_bull_max_single_position": 0.20,
+      "crb_enable_vol_targeting": true,
+      "crb_target_vol": 0.12,
+      "crb_smooth_drawdown": true,
       "cash_proxy": "BIL"
     },
     "factors": ["regime_trend_strength", "absolute_momentum_trend", "relative_momentum", "volatility_targeting"]
@@ -364,7 +367,10 @@
       "cfsb_thrust_lookback": 10,
       "cfsb_thrust_thresh": 0.60,
       "cfsb_target_bull_exposure": 0.80,
-      "cfsb_bull_max_single_position": 0.30,
+      "cfsb_bull_max_single_position": 0.20,
+      "cfsb_enable_vol_targeting": true,
+      "cfsb_target_vol": 0.12,
+      "cfsb_smooth_drawdown": true,
       "cash_proxy": "BIL"
     },
     "factors": ["regime_trend_strength", "absolute_momentum_trend", "relative_momentum", "volatility_targeting"]

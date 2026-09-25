@@ -280,7 +280,7 @@ class MarketDBDataProvider(BaseDataProvider):
             return {}
 
         norm_map = {s: normalize_thscode(s) for s in symbols}
-        unique_thscodes = list(set(norm_map.values()))
+        unique_thscodes = list(dict.fromkeys(norm_map.values()))
         placeholders = ",".join(["?"] * len(unique_thscodes))
 
         clauses = [f"thscode IN ({placeholders})"]

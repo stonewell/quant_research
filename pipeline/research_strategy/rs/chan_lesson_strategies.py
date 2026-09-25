@@ -258,8 +258,9 @@ class ChanFiboSectorStrengthStrategy(AllocationTemplate):
         daily = pd.DataFrame(index=master_index, columns=symbols, dtype=float)
         for date in _get_rebalance_dates(master_index, rebalance_freq):
             row_tiers = tiers.loc[date]
-            qualifying = row_tiers[row_tiers >= min_tier].sort_values(ascending=False)
-            selected = list(qualifying.index[:top_k])
+            qualifying = [(s, float(row_tiers[s])) for s in risky_symbols if pd.notna(row_tiers[s]) and row_tiers[s] >= min_tier]
+            qualifying.sort(key=lambda x: (-x[1], x[0]))
+            selected = [s for s, _ in qualifying[:top_k]]
             row = {s: 0.0 for s in symbols}
             if selected:
                 w = 1.0 / len(selected)

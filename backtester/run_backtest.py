@@ -91,6 +91,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-rebalances-for-trust", type=int, default=4)
     p.add_argument("--min-shares", type=int, default=1,
                    help="Minimum amount of shares to trade each time (default: 1). Fractional share trading is not allowed.")
+    p.add_argument("--min-weight-change", type=float, default=0.0,
+                   help="Minimum weight change threshold (e.g. 0.02) to trigger a position rebalance, suppressing passive drift churn.")
     p.add_argument("--china-trading", action="store_true",
                    help="Apply China A-share trading rules (price limit up/down blocks, T+1 settlement, 100-share minimum round lots, 5 bps sell stamp duty).")
     p.add_argument("--us-trading", action="store_true",
@@ -249,6 +251,7 @@ def run_standard(universe: dict, template, params: dict, args) -> dict:
         commission_pct=args.commission_pct,
         slippage_pct=args.slippage_pct,
         min_shares=getattr(args, "min_shares", 1),
+        min_weight_change=getattr(args, "min_weight_change", 0.0),
         china_trading=getattr(args, "china_trading", False),
         us_trading=getattr(args, "us_trading", False),
         hk_trading=getattr(args, "hk_trading", False),
@@ -361,6 +364,7 @@ def run_walkforward(universe: dict, template, params: dict, args) -> list:
                         commission_pct=args.commission_pct,
                         slippage_pct=args.slippage_pct,
                         min_shares=getattr(args, "min_shares", 1),
+                        min_weight_change=getattr(args, "min_weight_change", 0.0),
                         china_trading=getattr(args, "china_trading", False),
                         us_trading=getattr(args, "us_trading", False),
                         hk_trading=getattr(args, "hk_trading", False),
@@ -516,6 +520,7 @@ def _run_baseline(args, cache_dir, data_kwargs, aligned_index=None):
     # or market circuit breakers / T+1 / stamp duty, which would prevent an index priced at thousands
     # of points from executing trades or cause artificial cash drag / 0-share execution.
     baseline_args.min_shares = 0
+    baseline_args.min_weight_change = 0.0
     baseline_args.china_trading = False
     baseline_args.us_trading = False
     baseline_args.hk_trading = False
@@ -638,6 +643,17 @@ def main():
               f"ers_percentile={strategy_def.get('ers_percentile')}) -- "
               f"treat these results as exploratory, not validated.")
     print()
+
+    # If min_weight_change was not explicitly supplied via CLI, inherit from strategy params if present
+    if getattr(args, "min_weight_change", 0.0) <= 0.0 and isinstance(params, dict):
+        strat_min_change = float(
+            params.get("min_weight_change")
+            or params.get("crb_min_weight_change")
+            or params.get("cfsb_min_weight_change")
+            or 0.0
+        )
+        if strat_min_change > 0.0:
+            args.min_weight_change = strat_min_change
 
     data_kwargs = build_data_kwargs(args)
 

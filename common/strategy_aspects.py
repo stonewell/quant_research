@@ -140,7 +140,8 @@ def _select_momentum_topn(universe, params, master_index, rebalance_dates) -> Se
     for date, row in moms_rebal.iterrows():
         if row.isna().all():
             continue
-        eligible.loc[date, row.nlargest(top_n).index] = True
+        top_symbols = sorted(row.dropna().index, key=lambda s: (-row[s], s))[:top_n]
+        eligible.loc[date, top_symbols] = True
 
     return SelectionResult(eligible=eligible, invested_fraction=pd.Series(1.0, index=rebalance_dates))
 
@@ -158,7 +159,7 @@ def _select_dual_momentum_topn(universe, params, master_index, rebalance_dates) 
     for date, row in moms_rebal.iterrows():
         if row.isna().all():
             continue
-        top_symbols = row.nlargest(top_n).index
+        top_symbols = sorted(row.dropna().index, key=lambda s: (-row[s], s))[:top_n]
         passing = [s for s in top_symbols if row[s] > 0.0]
         eligible.loc[date, passing] = True
 
@@ -179,7 +180,8 @@ def _select_mean_reversion_topn(universe, params, master_index, rebalance_dates)
         if row.isna().all():
             continue
         # LOWEST RSI = most oversold (Connors-style RSI(2) mean-reversion).
-        eligible.loc[date, row.nsmallest(top_n).index] = True
+        oversold_symbols = sorted(row.dropna().index, key=lambda s: (row[s], s))[:top_n]
+        eligible.loc[date, oversold_symbols] = True
 
     return SelectionResult(eligible=eligible, invested_fraction=pd.Series(1.0, index=rebalance_dates))
 
@@ -214,7 +216,8 @@ def _select_breadth_gated_topn(universe, params, master_index, rebalance_dates) 
         else:
             derisked_fraction = 0.0
         invested_fraction.loc[date] = 1.0 - derisked_fraction
-        eligible.loc[date, row.nlargest(top_n).index] = True
+        top_symbols = sorted(row.index, key=lambda s: (-row[s], s))[:top_n]
+        eligible.loc[date, top_symbols] = True
 
     return SelectionResult(eligible=eligible, invested_fraction=invested_fraction)
 
@@ -556,7 +559,7 @@ def build_composite_candidates(best_per_template: dict, top_k: int = 4) -> list:
     if len(decomposable) < 2:
         return []
 
-    decomposable.sort(key=lambda t: t[2]["score"], reverse=True)
+    decomposable.sort(key=lambda t: (-t[2]["score"], t[0]))
     top = decomposable[:top_k]
 
     existing_pairs = {aspects for _, aspects, _ in top}

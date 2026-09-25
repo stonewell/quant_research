@@ -271,7 +271,7 @@ def build_pattern_templates(
     if findings.empty:
         return []
 
-    significant = findings[findings["significant"]].sort_values("p_value").head(max_templates)
+    significant = findings[findings["significant"]].sort_values(["p_value", "feature", "lookback"]).head(max_templates)
     templates = []
     for _, row in significant.iterrows():
         templates.append(PatternBasedAllocationTemplate(

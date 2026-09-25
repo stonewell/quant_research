@@ -394,7 +394,7 @@ class DuckDBCache:
         if not symbols:
             return {}
 
-        unique_symbols = list(set(symbols))
+        unique_symbols = list(dict.fromkeys(symbols))
         placeholders = ",".join(["?"] * len(unique_symbols))
         clauses = ["provider = ?", f"symbol IN ({placeholders})"]
         params: List[Any] = [provider, *unique_symbols]

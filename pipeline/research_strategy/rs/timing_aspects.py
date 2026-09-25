@@ -659,7 +659,7 @@ def build_composite_timing_candidates(best_per_template: dict, top_k: int = 4) -
     if len(decomposable) < 2:
         return []
 
-    decomposable.sort(key=lambda t: t[2]["score"], reverse=True)
+    decomposable.sort(key=lambda t: (-t[2]["score"], t[0]))
     top = decomposable[:top_k]
 
     existing_pairs = {aspects for _, aspects, _, _ in top}

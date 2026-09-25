@@ -63,31 +63,31 @@ $$\text{Drawdown} = \frac{\text{Current NAV} - \text{Peak NAV}}{\text{Peak NAV}}
 
 * **IF Drawdown $< 10\%$ (Normal Regime)**:
   * Proceed to Step 2 with full risk budget. Standard single-stock cap = **$20\%$**.
-* **IF $10\% \le \text{Drawdown} < 15\%$ (Tier 1: Risk Damping)**:
-  * **Action**: Cut all active stock positions by **$50\%$**.
-  * Maximum total equity exposure = **$50\%$**; remaining $50\%$ must sit in Cash Proxy.
-  * No new breakout buys allowed unless funded from the $50\%$ reduced budget.
-* **IF $15\% \le \text{Drawdown} < 20\%$ (Tier 2: Tactical Defense)**:
-  * **Action**: Disengage composite and three-type models; route **100% of capital into `ChanVaaCompoundStrategy`**.
-  * **Behavior**: In defensive regime, VAA holds $70\%$ in Cash Proxy / Short-term Treasuries and up to $30\%$ in the strongest defensive asset. (If VAA momentum remains bullish, it holds disciplined momentum breakout positions).
+* **IF $10\% \le \text{Drawdown} < 20\%$ (Smooth Continuous Linear Drawdown Damping, `crb_smooth_drawdown = True`)**:
+  * **Action**: Discard cliff-edge step drops in favor of continuous linear damping:
+    $$\text{Scale}_{\text{dd}} = \max\left(0.0, 1.0 - \frac{\text{Drawdown} - 10\%}{20\% - 10\%}\right)$$
+  * **Behavior**: At 10% drawdown, 100% equity allocation is maintained; at 15% drawdown, exposure is smoothly halved to 50%; at 18% drawdown, exposure scales to 20%; all damped capital routes smoothly into cash.
+  * **Fast Recovery**: If 10-day return turns positive or 10-day breadth thrust fires, immediately restore full normal equity exposure.
+  * **Auto-Heal**: If drawdown lasts 15 trading days without making new lows, auto-heal HWM to current NAV to avoid perpetual cash lock.
 * **IF Drawdown $\ge 20\%$ (Tier 3: Hard Stop / Emergency Halt)**:
   * **Action**: **Liquidate $100\%$ of all risk assets into Cash Proxy immediately**.
   * **Lockout**: **Do not buy for 21 consecutive trading days**. On Day 22, reset HWM to current NAV to allow fresh cycle re-entry.
 
 ---
 
-### Step 2: Market Breadth & 10-Day Breadth Thrust Check (Capacity & Exposure Scaling)
-Calculate universe breadth: percentage of tracked stocks trading above their 50-day Simple Moving Average ($\text{Close} > \text{SMA}_{50}$, `crb_breadth_lookback = 50`) and short-term 10-day breadth thrust (percentage of stocks with positive 10-day return, $\text{ROC}_{10} > 0$, `crb_thrust_lookback = 10`):
-
-* **IF (Market Breadth $\ge 30\%$ OR 10-Day Breadth Thrust $\ge 60\%$) AND Drawdown $< 10\%$**:
-  * **Dynamic Cash Deployment Triggered**:
-    * If 10-day breadth thrust $\ge 60\%$ (`crb_thrust_thresh = 0.60`): **Fast Rebound Override** immediately sets maximum bull scaling factor (1.0).
-    * If standard breadth $\ge 30\%$ (`crb_breadth_bull_thresh = 0.30`): scales smoothly from $30\%$ to $75\%$ breadth.
-  * **Max Single-Stock Cap**: Expands from $20\%$ up to **$30\%$** (`crb_bull_max_single_position`).
-  * **Target Total Equity Exposure**: Up to **$80\%$** (`crb_target_bull_exposure`), deploying idle cash into top conviction setups.
-* **ELSE (Market Breadth $< 30\%$ AND Thrust $< 60\%$, OR Drawdown $\ge 10\%$)**:
-  * **Max Single-Stock Cap**: Hard limit of **$20\%$** per stock.
-  * **Target Total Equity Exposure**: Standard unscaled exposure (typically $40\%–60\%$, balance in Cash Proxy `BIL`).
+### Step 2: Market Breadth, 10-Day Breadth Thrust & Volatility Targeting Overlay
+1. **Continuous Realized Volatility Targeting (`crb_enable_vol_targeting = True`, `crb_target_vol = 0.12`)**:
+   * Grounding: Barroso & Santa-Clara (2015). Track trailing 21-day annualized realized universe return volatility $\sigma_{21d}$.
+   * When market turbulence spikes ($\sigma_{21d} > 12\%$), scale all active risky target weights by $\min(1.0, 12\% / \sigma_{21d})$, routing remainder to cash to remove crash/tail risk.
+2. **Market Breadth & Thrust Multi-Asset Dispersion**:
+   * Calculate universe breadth: percentage of tracked stocks trading above their 50-day Simple Moving Average ($\text{Close} > \text{SMA}_{50}$, `crb_breadth_lookback = 50`) and short-term 10-day breadth thrust (percentage of stocks with positive 10-day return, $\text{ROC}_{10} > 0$, `crb_thrust_lookback = 10`):
+   * **IF (Market Breadth $\ge 30\%$ OR 10-Day Breadth Thrust $\ge 60\%$) AND Drawdown $< 10\%$**:
+     * **Dynamic Cash Deployment**: Target total equity exposure up to **$80\%$** (`crb_target_bull_exposure`).
+     * **Single-Stock Cap Strictly $\le 20\%$** (`crb_bull_max_single_position = 0.20`): Caps individual stock positions at 20% to eliminate single-asset concentration blowups.
+     * **Multi-Asset Thrust Dispersion**: When breadth thrust triggers, deploy unallocated cash across **at least 5 distinct momentum leaders** (5%–8% each) rather than loading 30% into a single stock.
+   * **ELSE (Market Breadth $< 30\%$ AND Thrust $< 60\%$, OR Drawdown $\ge 10\%$)**:
+     * **Max Single-Stock Cap**: Hard limit of **$20\%$** per stock.
+     * **Target Total Equity Exposure**: Standard unscaled exposure (typically $40\%–60\%$, balance in Cash Proxy `BIL`).
 
 ---
 

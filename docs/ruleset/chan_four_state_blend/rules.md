@@ -31,15 +31,15 @@ flowchart TD
     Blend --> DDCheck{"Portfolio Drawdown from HWM"}
     
     DDCheck -- "DD < 10%" --> NormalMode["Normal Regime"]
-    DDCheck -- "10% <= DD < 15%" --> Tier1["Tier 1: Halve Equity (50% to Cash)"]
-    DDCheck -- "15% <= DD < 20%" --> Tier2["Tier 2: Switch 100% to ChanVaaCompound"]
+    DDCheck -- "10% <= DD < 20%" --> SmoothDD["Smooth Drawdown Damping (10%~20%)<br>scale = 1.0 - (DD-10%)/10%"]
     DDCheck -- "DD >= 20%" --> Tier3["Tier 3: 100% Cash Stop (21-bar Cooldown)"]
     
     NormalMode --> BreadthCheck{"Market Breadth >= 30%?<br>(Close > SMA50)<br>OR 10d Thrust >= 60%"}
-    BreadthCheck -- Yes --> DynamicCash["Dynamic Cash Deployment<br>Scale equity up to 80%<br>Expand cap 20% -> 30%"]
+    BreadthCheck -- Yes --> DynamicCash["Dynamic Cash Deployment<br>Scale equity up to 80%<br>Strict Single-Stock Cap <= 20%<br>Thrust dispersed across >= 5 leaders"]
     BreadthCheck -- No --> BaseCap["Hard Single-Stock Cap (20%)"]
     
-    DynamicCash & BaseCap & Tier1 & Tier2 & Tier3 --> InertiaFilter{"Asset Inertia Filter<br>|Delta W| >= 4%<br>(Emergency sells bypass at 0.1%)"}
+    DynamicCash & BaseCap & SmoothDD & Tier3 --> VolTarget["Volatility Targeting (12% Target)<br>scale = min(1.0, 12% / 21d realized vol)"]
+    VolTarget --> InertiaFilter{"Asset Inertia Filter<br>|Delta W| >= 4%<br>(Emergency sells bypass at 0.1%)"}
     InertiaFilter -- "Pass" --> OrderExec["Execution: 1. Sells First -> 2. Buys Second"]
     InertiaFilter -- "Fail" --> HoldPrior["Hold Prior Positions (No Trade)"]
 ```
@@ -52,7 +52,7 @@ A human trader must follow this 5-step daily routine in strict sequential order 
 
 ```mermaid
 flowchart LR
-    T1["Step 1: Drawdown Tier Check"] --> T2["Step 2: Market Breadth Check"]
+    T1["Step 1: Drawdown & Smooth Damping"] --> T2["Step 2: Breadth & Volatility Targeting"]
     T2 --> T3["Step 3: Execute Sells FIRST"]
     T3 --> T4["Step 4: Size & Execute Buys"]
     T4 --> T5["Step 5: Apply 4% Friction Filter"]
@@ -62,37 +62,37 @@ flowchart LR
 
 ## 3. Step-by-Step Decision Logic & Rules
 
-### Step 1: Drawdown Circuit Breaker Check (Portfolio Level)
+### Step 1: Drawdown Circuit Breaker & Continuous Damping (Portfolio Level)
 Calculate your current portfolio High-Water Mark (HWM) and peak-to-trough drawdown at 14:00:
 $$\text{Drawdown} = \frac{\text{Current NAV} - \text{Peak NAV}}{\text{Peak NAV}}$$
 
 * **IF Drawdown $< 10\%$ (Normal Regime)**:
   * Proceed to Step 2 with full risk budget. Standard single-stock cap = **$20\%$**.
-* **IF $10\% \le \text{Drawdown} < 15\%$ (Tier 1: Risk Damping)**:
-  * **Action**: Cut all active stock positions by **$50\%$**.
-  * Maximum total equity exposure = **$50\%$**; remaining $50\%$ must sit in Cash Proxy (`BIL`).
-  * No new breakout buys allowed unless funded from the $50\%$ reduced budget.
-* **IF $15\% \le \text{Drawdown} < 20\%$ (Tier 2: Tactical Defense)**:
-  * **Action**: Disengage four-state and three-type models; route **100% of capital into `ChanVaaCompoundStrategy`**.
-  * **Behavior**: In defensive regime, VAA holds $70\%$ in Cash Proxy / Short-term Treasuries and up to $30\%$ in the strongest defensive asset.
+* **IF $10\% \le \text{Drawdown} < 20\%$ (Continuous Smooth Damping, `cfsb_smooth_drawdown = True`)**:
+  * **Action**: Replaces step-cliff liquidation with **continuous linear exposure damping**:
+    $$\text{Scale}_{\text{dd}} = \max\left(0.0, 1.0 - \frac{\text{Drawdown} - 10\%}{20\% - 10\%}\right)$$
+  * **Behavior**: At $10\%$ drawdown, exposure remains $100\%$; at $15\%$ drawdown, smoothly damped to $50\%$; at $18\%$ drawdown, damped to $20\%$, sweeping released equity into Cash Proxy (`BIL`).
+  * **Fast Recovery**: If 10-day portfolio return turns positive or 10-day breadth thrust fires, drawdown penalty is immediately bypassed.
+  * **Automatic HWM Healing**: If drawdown persists for 15 consecutive bars without fresh lows, the reference peak auto-heals to current NAV to prevent perpetual cash drag.
 * **IF Drawdown $\ge 20\%$ (Tier 3: Hard Stop / Emergency Halt)**:
   * **Action**: **Liquidate $100\%$ of all risk assets into Cash Proxy immediately**.
   * **Lockout**: **Do not buy for 21 consecutive trading days**. On Day 22, reset HWM to current NAV to allow fresh cycle re-entry.
 
 ---
 
-### Step 2: Market Breadth & 10-Day Breadth Thrust Check (Capacity & Exposure Scaling)
-Calculate universe breadth: percentage of tracked stocks trading above their 50-day Simple Moving Average ($\text{Close} > \text{SMA}_{50}$, `cfsb_breadth_lookback = 50`) and short-term 10-day breadth thrust (percentage of stocks with positive 10-day return, $\text{ROC}_{10} > 0$, `cfsb_thrust_lookback = 10`):
-
-* **IF (Market Breadth $\ge 30\%$ OR 10-Day Breadth Thrust $\ge 60\%$) AND Drawdown $< 10\%$**:
-  * **Dynamic Cash Deployment Triggered**:
-    * If 10-day breadth thrust $\ge 60\%$ (`cfsb_thrust_thresh = 0.60`): **Fast Rebound Override** immediately sets maximum bull scaling factor (1.0).
-    * If standard breadth $\ge 30\%$ (`cfsb_breadth_bull_thresh = 0.30`): scales smoothly from $30\%$ to $75\%$ breadth.
-  * **Max Single-Stock Cap**: Expands from $20\%$ up to **$30\%$** (`cfsb_bull_max_single_position`).
-  * **Target Total Equity Exposure**: Up to **$80\%$** (`cfsb_target_bull_exposure`), deploying idle cash into top conviction setups.
-* **ELSE (Market Breadth $< 30\%$ AND Thrust $< 60\%$, OR Drawdown $\ge 10\%$)**:
-  * **Max Single-Stock Cap**: Hard limit of **$20\%$** per stock.
-  * **Target Total Equity Exposure**: Standard unscaled exposure (typically $40\%–60\%$, balance in Cash Proxy `BIL`).
+### Step 2: Market Breadth, 10-Day Thrust & Volatility Targeting (Capacity & Dispersion)
+1. **Continuous Realized Volatility Targeting (`cfsb_enable_vol_targeting = True`, `cfsb_target_vol = 0.12`)**:
+   * Grounded in Barroso & Santa-Clara (2015) volatility targeting, continuously tracking the rolling 21-day annualized market return volatility $\sigma_{21d}$.
+   * When market turbulence elevates ($\sigma_{21d} > 12\%$), all target equity weights are scaled by $\min(1.0, 12\% / \sigma_{21d})$, preserving the rest in Cash Proxy, eliminating catastrophic tail drawdown.
+2. **Market Breadth & Thrust Multi-Asset Dispersion**:
+   * Calculate universe breadth: percentage of tracked stocks trading above their 50-day Simple Moving Average ($\text{Close} > \text{SMA}_{50}$, `cfsb_breadth_lookback = 50`) and short-term 10-day breadth thrust (percentage of stocks with positive 10-day return, $\text{ROC}_{10} > 0$, `cfsb_thrust_lookback = 10`):
+   * **IF (Market Breadth $\ge 30\%$ OR 10-Day Breadth Thrust $\ge 60\%$) AND Drawdown $< 10\%$**:
+     * **Dynamic Cash Deployment Triggered**: Total equity exposure allowed up to **$80\%$** (`cfsb_target_bull_exposure`).
+     * **Max Single-Stock Cap Capped at $\le 20\%$** (`cfsb_bull_max_single_position = 0.20`): Strict limit prevents single-asset concentration blowups.
+     * **Multi-Asset Thrust Dispersion**: When breadth thrust triggers, idle cash is evenly dispersed across **at least 5 distinct momentum leaders** (5%–8% each), strictly banning greedy all-in loading on a single stock.
+   * **ELSE (Market Breadth $< 30\%$ AND Thrust $< 60\%$, OR Drawdown Active)**:
+     * **Max Single-Stock Cap**: Hard limit of **$20\%$** per stock.
+     * **Target Total Equity Exposure**: Standard unscaled exposure (typically $40\%–60\%$, balance in Cash Proxy `BIL`).
 
 ---
 
@@ -129,7 +129,7 @@ Buy candidates qualify across the 3 sub-strategies:
    * Allocates to confirmed $B_1, B_2, B_3$ setups across the universe with 20% single-stock ceiling.
 3. **VAA Macro Compound Sleeve (40%)**:
    * Allocates to top 1-2 offensive assets with highest 13612W momentum score, or sweeps 70% to Cash Proxy when canary assets drop negative.
-4. **Single-Stock Cap**: Never allocate more than **$20\%$** of total portfolio NAV to any single ticker (expands to **$30\%$** during bull breadth regimes).
+4. **Single-Stock Cap**: Never allocate more than **$20\%$** of total portfolio NAV to any single ticker (`cfsb_bull_max_single_position = 0.20`), eliminating excessive single-stock concentration during breadth thrusts.
 
 ---
 
@@ -153,16 +153,16 @@ Keep this table handy during the market session:
 
 | Check | Item | Condition | Human Trader Action |
 | :--- | :--- | :--- | :--- |
-| **Risk** | **HWM Drawdown** | $\ge 20\%$ | **STOP ALL TRADING**: Liquidate $100\%$ to cash proxy. Freeze 21 days (HWM resets Day 22). |
-| **Risk** | **HWM Drawdown** | $15\% - 19.9\%$ | **DEFENSIVE SHIFT**: Route $100\%$ to ChanVaaCompound (holds $70\%$ cash in defense mode). |
-| **Risk** | **HWM Drawdown** | $10\% - 14.9\%$ | **HALVE RISK**: Cut all open equity weights by $50\%$; sweep remainder to cash. |
-| **Regime** | **Market Breadth** | $\ge 30\%$ above SMA50 or 10d Thrust $\ge 60\%$ | **BULL SCALING**: Increase single-stock cap to $30\%$; total equity up to $80\%$. |
+| **Risk** | **HWM Drawdown** | $\ge 20\%$ | **STOP ALL TRADING (Tier 3)**: Liquidate $100\%$ to cash proxy. Freeze 21 days (HWM resets Day 22). |
+| **Risk** | **HWM Drawdown** | $10\% - 19.9\%$ | **SMOOTH DAMPING**: Scale exposure continuously via $1.0 - (\text{DD}-10\%)/10\%$, sweeping released equity to cash. |
+| **Risk** | **Market Volatility** | 21d realized vol $> 12\%$ | **VOL TARGETING**: Scale equity down continuously by $12\% / \sigma_{21d}$ to limit tail variance. |
+| **Regime** | **Market Breadth** | $\ge 30\%$ above SMA50 or 10d Thrust $\ge 60\%$ | **BULL SCALING**: Total equity up to $80\%$; strict single-stock cap $\le 20\%$; thrust dispersed across $\ge 5$ leaders. |
 | **Regime** | **Market Breadth** | $< 30\%$ above SMA50 and Thrust $< 60\%$ | **CONSERVATIVE**: Keep single-stock cap at $20\%$; standard cash buffer. |
 | **Exit** | **Stop-Loss** | Loss $\ge 8\%$ from entry | **EXIT IMMEDIATELY**: Sell $100\%$ of position at market/limit. |
 | **Exit** | **Time Stop** | Held $\ge 90$ days no progress| **EXIT**: Close position to release capital. |
 | **Exit** | **Stagnation Timeout** | Held $\ge 8$ bars in consolidation | **EXIT**: Sell position to avoid Lesson 16 drag. |
 | **Exit** | **Chan Sells / Invalidation**| $S_1, S_2, S_3$ or Breakout Stop | **EXIT**: Sell position to $0.0\%$. |
-| **Entry** | **Four-State Machine**| Valid $B_1/B_2/B_3$ + MA Filter | **BUY**: Allocate with 5-bar gestation buffer. |
+| **Entry** | **Four-State Machine**| Valid $B_1/B_2/B_3$ + MA Filter | **BUY**: Allocate with 5-bar gestation buffer ($\le 20\%$ cap). |
 | **Execution**| **Friction Filter** | $|\Delta W| < 4\%$ | **SKIP**: Do not place order if change is under $4\%$ portfolio NAV. |
 | **Execution**| **Sequence** | Multi-asset rebalance | **SELLS FIRST** (free up cash) $\rightarrow$ **BUYS SECOND**. |
 

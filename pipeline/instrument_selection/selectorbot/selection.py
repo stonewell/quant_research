@@ -111,9 +111,9 @@ def select_cluster_representatives(scores: pd.Series, corr: pd.DataFrame, distan
         members = clusters[clusters == cluster_id].index.tolist()
         if representative_rule == "lowest_volatility":
             member_vol = volatility.reindex(members).dropna()
-            best = member_vol.idxmin() if not member_vol.empty else scores.reindex(members).idxmax()
+            best = min(member_vol.index, key=lambda s: (member_vol[s], s)) if not member_vol.empty else max(members, key=lambda s: (scores.get(s, float("-inf")), s))
         else:
-            best = scores.reindex(members).idxmax()
+            best = max(members, key=lambda s: (scores.get(s, float("-inf")), s))
         chosen.append(best)
     return chosen
 
@@ -129,12 +129,12 @@ def select_diversified_greedy(scores: pd.Series, corr: pd.DataFrame, k: int, div
 
     while remaining and len(selected) < k:
         if not selected:
-            best = scores.reindex(remaining).idxmax()
+            best = max(remaining, key=lambda s: (scores[s], s))
         else:
             def marginal_gain(sym):
                 diversity = sum(dist.loc[sym, s] for s in selected)
                 return scores[sym] + diversity_weight * diversity
-            best = max(remaining, key=marginal_gain)
+            best = max(remaining, key=lambda s: (marginal_gain(s), s))
         selected.append(best)
         remaining.remove(best)
     return selected
@@ -147,7 +147,7 @@ def select_diversified_threshold_greedy(scores: pd.Series, corr: pd.DataFrame, m
     `max_correlation` -- the subset size is determined by the data, not
     fixed in advance, unless `max_k` caps it."""
     symbols = [s for s in corr.index if s in scores.index]
-    ranked = scores.reindex(symbols).sort_values(ascending=False).index.tolist()
+    ranked = sorted(symbols, key=lambda s: (-float(scores[s]), s))
     selected = []
     for sym in ranked:
         if max_k is not None and len(selected) >= max_k:
@@ -201,7 +201,7 @@ def select_max_diversification_ratio(scores: pd.Series, corr: pd.DataFrame, vola
     while remaining and len(selected) < k:
         if not selected:
             # Start with the highest individual score
-            best = max(remaining, key=lambda s: scores[s])
+            best = max(remaining, key=lambda s: (scores[s], s))
         else:
             def marginal_gain(sym):
                 cand = selected + [sym]
@@ -210,7 +210,7 @@ def select_max_diversification_ratio(scores: pd.Series, corr: pd.DataFrame, vola
                 norm_score = scores[sym] / 100.0 if 100.0 in scores.values or scores.max() > 1 else scores[sym]
                 return dr + score_weight * norm_score
 
-            best = max(remaining, key=marginal_gain)
+            best = max(remaining, key=lambda s: (marginal_gain(s), s))
 
         selected.append(best)
         remaining.remove(best)

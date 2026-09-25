@@ -172,16 +172,15 @@ class ResidualMomentumStrategy(AllocationTemplate):
                     weights_rebal.loc[date, cash_proxy] = 1.0
                 continue
 
-            # Rank candidates by standardized residual momentum score
-            ranked_series = pd.Series(candidate_scores).sort_values(ascending=False)
-            # Only consider positive residual momentum
-            positive_candidates = ranked_series[ranked_series > 0]
-            if positive_candidates.empty:
+            # Rank candidates by standardized residual momentum score, breaking ties by symbol name
+            cand_list = [(s, float(candidate_scores[s])) for s in candidate_scores if candidate_scores[s] > 0]
+            cand_list.sort(key=lambda x: (-x[1], x[0]))
+            if not cand_list:
                 if cash_proxy in symbols:
                     weights_rebal.loc[date, cash_proxy] = 1.0
                 continue
 
-            selected_syms = positive_candidates.index[:min(top_k, len(positive_candidates))].tolist()
+            selected_syms = [s for s, _ in cand_list[:min(top_k, len(cand_list))]]
 
             # Inverse volatility weighting across selected assets
             inv_vols = {s: 1.0 / candidate_vols[s] for s in selected_syms}
