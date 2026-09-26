@@ -248,3 +248,45 @@ def test_cli_argument_helpers():
         assert res == ["FILE_SYM"]
     finally:
         os.remove(json_path)
+
+
+def test_core_satellite_universes_exist_and_load():
+    """Verify that China, Hong Kong, and US core-satellite universes exist and load 22 valid symbols."""
+    repo_root = _PROJECT_ROOT
+
+    # 1. China
+    cn_path = os.path.join(
+        repo_root, "docs", "universe", "china", "核心卫星组合精选(央国企红利底仓+科技龙头增强)", "core_satellite_22_stocks.txt"
+    )
+    assert os.path.exists(cn_path), f"China universe missing at {cn_path}"
+    p_cn = FileUniverseProvider(cn_path)
+    symbols_cn = p_cn.get_symbols()
+    assert len(symbols_cn) == 22
+    assert "601872.SH" in symbols_cn
+    assert "300394.SZ" in symbols_cn
+
+    # 2. Hong Kong
+    hk_path = os.path.join(
+        repo_root, "docs", "universe", "hongkong", "核心卫星组合精选(高股息红利底仓+科技互联网增强)", "core_satellite_22_stocks.txt"
+    )
+    assert os.path.exists(hk_path), f"HK universe missing at {hk_path}"
+    p_hk = FileUniverseProvider(hk_path)
+    symbols_hk = p_hk.get_symbols()
+    assert len(symbols_hk) == 22
+    assert "0883.HK" in symbols_hk
+    assert "0700.HK" in symbols_hk
+    for s in symbols_hk:
+        assert s.endswith(".HK")
+
+    # 3. United States
+    us_path = os.path.join(
+        repo_root, "docs", "universe", "us", "核心卫星组合精选(价值现金流红利底仓+AI科技巨头增强)", "core_satellite_22_stocks.txt"
+    )
+    assert os.path.exists(us_path), f"US universe missing at {us_path}"
+    p_us = FileUniverseProvider(us_path)
+    symbols_us = p_us.get_symbols()
+    assert len(symbols_us) == 22
+    assert "BRK-B" in symbols_us
+    assert "NVDA" in symbols_us
+    assert "AAPL" in symbols_us
+

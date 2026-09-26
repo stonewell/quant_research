@@ -145,6 +145,11 @@ def test_hk_board_lot_lookup():
     assert _get_hk_board_lot("00941.HK") == 500
     assert _get_hk_board_lot("09618.HK") == 50
     assert _get_hk_board_lot("00700.HK") == 100
+    assert _get_hk_board_lot("00883.HK") == 1000
+    assert _get_hk_board_lot("0883.HK") == 1000
+    assert _get_hk_board_lot("01088.HK") == 500
+    assert _get_hk_board_lot("02899.HK") == 2000
+    assert _get_hk_board_lot("00388.HK") == 100
     assert _get_hk_board_lot("UNKNOWN.HK", default_lot=100) == 100
 
 
