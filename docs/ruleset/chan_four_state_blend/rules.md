@@ -19,7 +19,7 @@ flowchart TD
     Universe["Universe Data (Risky Basket + Cash Proxy: BIL)"] --> AlphaEngine["Quantitative Alpha & Signal Engine"]
     AlphaEngine --> RegimeCheck{"Macro Regime / Risk Checks"}
     RegimeCheck --> Sizing["Position Sizing & Concentration Caps (Max 20% per stock)"]
-    Sizing --> FrictionFilter{"Asset Turnover Inertia Filter (|Delta W| >= 4%)"}
+    Sizing --> FrictionFilter{"Asset Turnover Inertia Filter (|Delta W| >= 5%)"}
     FrictionFilter -- "Pass" --> OrderExec["Execution: 1. Sells First -> 2. Buys Second"]
     FrictionFilter -- "Fail" --> HoldPrior["Hold Prior Positions (No Trade)"]
 ```
@@ -35,7 +35,7 @@ flowchart LR
     T1["Step 1: Drawdown Tier Check"] --> T2["Step 2: Regime / Breadth Check"]
     T2 --> T3["Step 3: Execute Sells FIRST"]
     T3 --> T4["Step 4: Size & Execute Buys"]
-    T4 --> T5["Step 5: Apply 4% Friction Filter"]
+    T4 --> T5["Step 5: Apply 5% Friction Filter"]
 ```
 
 ---
@@ -88,17 +88,17 @@ Liquidate an asset down to **0.0%** if **ANY** of the following conditions trigg
 
 ---
 
-### Step 5: Turnover & Minimum Trade Filter (|Delta W| >= 4%)
+### Step 5: Turnover & Minimum Trade Filter (|Delta W| >= 5%)
 Before entering an order into your broker terminal, calculate the weight change:
 $$\Delta W = |W_{\text{target}} - W_{\text{current}}|$$
 
 * **Normal Trading Days**:
-  * **IF $\Delta W < 4%$**: **DO NOT TRADE**. Hold prior quantity to avoid transaction fee erosion.
-  * **IF $\Delta W \ge 4%$**: Place order.
+  * **IF $\Delta W < 5\%$**: **DO NOT TRADE**. Hold prior quantity to avoid transaction fee erosion.
+  * **IF $\Delta W \ge 5\%$**: Place order.
 * **Circuit Breaker Days (Emergency Override)**:
   * If a circuit breaker triggered or an asset hit a hard stop-loss:
-    * **Emergency Sells**: Bypass the 4% rule down to **0.1%** ($|\Delta W| \ge 0.001$) and execute sales immediately.
-    * **Emergency Buys**: Still require the full **4%** threshold ($|\Delta W| \ge 0.0400$) to avoid buying into falling markets.
+    * **Emergency Sells**: Bypass the 5% rule down to **0.1%** ($|\Delta W| \ge 0.001$) and execute sales immediately.
+    * **Emergency Buys**: Still require the full **5%** threshold ($|\Delta W| \ge 0.0500$) to avoid buying into falling markets.
 
 ---
 
@@ -115,7 +115,7 @@ $$\Delta W = |W_{\text{target}} - W_{\text{current}}|$$
 | **Exit** | **Time Stop** | Held >= 90 days no progress | **EXIT**: Close position to release capital. |
 | **Exit** | **Signal Exit** | Model Sell / S-point | **EXIT**: Sell position to 0.0%. |
 | **Entry** | **Signal Buy** | Valid Model Buy Signal | **SCALE IN**: Buy tranche up to single-stock cap (20%). |
-| **Execution**| **Friction Filter**| |Delta W| < 4% | **SKIP**: Do not place order if change is under 4% portfolio NAV. |
+| **Execution**| **Friction Filter**| |Delta W| < 5% | **SKIP**: Do not place order if change is under 5% portfolio NAV. |
 | **Execution**| **Sequence** | Multi-asset rebalance | **SELLS FIRST** (free up cash) -> **BUYS SECOND**. |
 
 ---

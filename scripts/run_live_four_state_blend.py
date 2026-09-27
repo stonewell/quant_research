@@ -34,6 +34,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from common.allocation_backtester import _get_hk_board_lot
 from common.cli_utils import (
     add_data_provider_cli_args,
     build_data_kwargs,
@@ -47,8 +48,21 @@ from pipeline.live_signal.lsig.signal import as_of_universe, latest_rebalance_ro
 DEFAULT_STRATEGY_FILE = os.path.join(
     _REPO_ROOT, "pipeline", "research_strategy", "results", "strategy_dumps", "chan_four_state_blend_strategy.json"
 )
-DEFAULT_UNIVERSE_FILE = os.path.join(_REPO_ROOT, "docs", "universe", "china", "14_stocks_pruned.txt")
+DEFAULT_UNIVERSE_FILE = os.path.join(_REPO_ROOT, "docs", "universe", "china", "core_satellite_22_stocks.txt")
 DEFAULT_OUTPUT_DIR = os.path.join(_REPO_ROOT, "docs", "ruleset", "chan_four_state_blend")
+
+
+def resolve_lot_size(sym: str, override_lot: Optional[int] = None) -> int:
+    """Resolve trading lot size by symbol context (100 for A-shares, 1 for US, board lot for HK)."""
+    if override_lot is not None:
+        return override_lot
+    clean = sym.strip()
+    if clean.endswith(".HK") or (clean.isdigit() and len(clean) in (4, 5)):
+        return _get_hk_board_lot(clean, default_lot=100)
+    elif clean.endswith(".SH") or clean.endswith(".SZ"):
+        return 100
+    else:
+        return 1
 
 
 def parse_args():
@@ -63,7 +77,7 @@ def parse_args():
     parser.add_argument(
         "--universe-file",
         default=DEFAULT_UNIVERSE_FILE,
-        help="Path to universe symbols file (default: 14_stocks_pruned.txt)",
+        help="Path to universe symbols file (default: core_satellite_22_stocks.txt)",
     )
     parser.add_argument(
         "--as-of-date",
@@ -98,8 +112,8 @@ def parse_args():
     parser.add_argument(
         "--lot-size",
         type=int,
-        default=100,
-        help="Trading lot size for buy order rounding (default: 100 shares for A-shares)",
+        default=None,
+        help="Trading lot size for buy order rounding (default: auto-detect 100 for A-shares, 1 for US, board lots for HK)",
     )
     parser.add_argument(
         "--output-dir",
@@ -226,8 +240,9 @@ def main():
         trade_val = delta_w * args.portfolio_value
 
         # Calculate lot-rounded shares for equities
+        sym_lot = resolve_lot_size(sym, args.lot_size)
         if sym != cash_proxy and price > 0:
-            target_shares = int(np.floor(target_val / price / args.lot_size) * args.lot_size) if action == "BUY" else int(np.round(target_val / price))
+            target_shares = int(np.floor(target_val / price / sym_lot) * sym_lot) if action == "BUY" else int(np.round(target_val / price))
             current_shares = int(np.round(current_val / price))
             delta_shares = target_shares - current_shares
         else:
@@ -245,6 +260,7 @@ def main():
             "current_shares": current_shares,
             "target_shares": target_shares,
             "delta_shares": delta_shares,
+            "trade_value": trade_val,
             "trade_value_rmb": trade_val,
         })
 
@@ -278,24 +294,24 @@ def main():
         print("  No sell orders required today.")
     else:
         for _, r in sells.iterrows():
-            print(f"  🔴 SELL {r['symbol']:<10} | Price: {r['price']:>7.2f} | Current: {r['current_weight']:>6.1%} -> Target: {r['target_weight']:>6.1%} ({r['delta_weight']:>+6.1%}) | Sell Qty: {abs(r['delta_shares']):>6} shares (~{abs(r['trade_value_rmb']):>8,.2f} RMB)")
+            print(f"  🔴 SELL {r['symbol']:<10} | Price: {r['price']:>7.2f} | Current: {r['current_weight']:>6.1%} -> Target: {r['target_weight']:>6.1%} ({r['delta_weight']:>+6.1%}) | Sell Qty: {abs(r['delta_shares']):>6} shares (~{abs(r['trade_value']):>8,.2f})")
 
     print("\n[PHASE 2: EXECUTE BUYS SECOND (Allocate Available Capital)]")
     if buys.empty:
         print("  No new buy orders required today.")
     else:
         for _, r in buys.iterrows():
-            print(f"  🟢 BUY  {r['symbol']:<10} | Price: {r['price']:>7.2f} | Current: {r['current_weight']:>6.1%} -> Target: {r['target_weight']:>6.1%} ({r['delta_weight']:>+6.1%}) | Buy Qty: {r['delta_shares']:>6} shares (~{r['trade_value_rmb']:>8,.2f} RMB)")
+            print(f"  🟢 BUY  {r['symbol']:<10} | Price: {r['price']:>7.2f} | Current: {r['current_weight']:>6.1%} -> Target: {r['target_weight']:>6.1%} ({r['delta_weight']:>+6.1%}) | Buy Qty: {r['delta_shares']:>6} shares (~{r['trade_value']:>8,.2f})")
 
-    print("\n[PHASE 3: POSITIONS HELD (Inertia Filtered < 4% or Unchanged)]")
+    print(f"\n[PHASE 3: POSITIONS HELD (Inertia Filtered < {min_trade_thresh:.0%} or Unchanged)]")
     for _, r in holds.iterrows():
-        reason = "Filtered (< 4% change)" if r["action"] == "HOLD_FILTERED" else "Optimal target maintained"
-        print(f"  ⚪ HOLD {r['symbol']:<10} | Weight: {r['target_weight']:>6.1%} | Held Value: ~{r['target_weight']*args.portfolio_value:>8,.2f} RMB | ({reason})")
+        reason = f"Filtered (< {min_trade_thresh:.0%} change)" if r["action"] == "HOLD_FILTERED" else "Optimal target maintained"
+        print(f"  ⚪ HOLD {r['symbol']:<10} | Weight: {r['target_weight']:>6.1%} | Held Value: ~{r['target_weight']*args.portfolio_value:>8,.2f} | ({reason})")
 
     if not cash_rows.empty:
         print("\n[PHASE 4: CASH PROXY & LIQUIDITY MANAGEMENT]")
         for _, r in cash_rows.iterrows():
-            print(f"  💰 CASH {r['symbol']:<10} | Balance: {r['target_weight']:>6.1%} (~{r['target_weight']*args.portfolio_value:>8,.2f} RMB) | Park in {r['symbol']} / 511880 / 国债逆回购")
+            print(f"  💰 CASH {r['symbol']:<10} | Balance: {r['target_weight']:>6.1%} (~{r['target_weight']*args.portfolio_value:>8,.2f}) | Park in {r['symbol']} / 511880 / 国债逆回购")
 
     # Save to CSV
     os.makedirs(args.output_dir, exist_ok=True)
