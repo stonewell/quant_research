@@ -1,0 +1,17 @@
+{
+  "as_of_date": "2026-09-27",
+  "current_nav": 100000.0,
+  "peak_nav": 100000.0,
+  "drawdown_pct": 0.0,
+  "circuit_breaker_tier": "NORMAL",
+  "tier1_consecutive_bars": 0,
+  "tier3_consecutive_bars": 0,
+  "freeze_remaining_bars": 0,
+  "nav_history_10d": [
+    100000.0,
+    100000.0,
+    100000.0,
+    100000.0,
+    100000.0
+  ]
+}

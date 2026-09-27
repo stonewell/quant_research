@@ -92,16 +92,24 @@ flowchart TD
 ```
 
 ### Detailed Execution Timeline:
-1. **14:00 – 14:15: Portfolio Health & Macro Valuation**
+1. **14:00 – 14:15: Stage 1 — Portfolio Health & Macro Valuation**
+   - Run the dedicated Stage 1 pre-trade health gate:
+     ```bash
+     uv run python scripts/check_live_portfolio_health.py \
+       --portfolio-value <ACCOUNT_NAV> \
+       --peak-nav <PEAK_HWM_NAV> \
+       --data-provider <marketdb|yfinance>
+     ```
    - Check current portfolio NAV against the High-Water Mark (HWM).
    - Verify if any drawdown circuit breaker tier is triggered:
-     - $\text{Drawdown} \ge 20\%$: Emergency halt (liquidate all risk assets to cash, 21-day trading freeze).
-     - $15\% \le \text{Drawdown} < 20\%$: Tactical defense (shift 100% to VAA compound defensive mode).
-     - $10\% \le \text{Drawdown} < 15\%$: Smooth linear damping (exposure reduces continuously towards 0%).
+     - $\text{Drawdown} \ge 20\%$: **🔴 NO-GO**: Emergency halt (liquidate all risk assets to cash, 21-day trading freeze).
+     - $15\% \le \text{Drawdown} < 20\%$: **🟠 CAUTION**: Tactical defense (shift 100% to VAA compound defensive mode).
+     - $10\% \le \text{Drawdown} < 15\%$: **🟡 CAUTION**: Smooth linear damping (exposure reduces continuously towards 0%).
+     - $\text{Drawdown} < 10\%$: **🟢 GO**: Normal risk budget.
    - Verify 50-day market breadth ($\ge 30\%$) and 10-day breadth thrust ($\ge 60\%$) to determine if bull cash deployment is active.
 
-2. **14:15 – 14:20: Generate Daily Execution Ticket**
-   - Run the operational runner against your brokerage portfolio:
+2. **14:15 – 14:20: Stage 2 — Generate Daily Execution Ticket**
+   - If Stage 1 directive is **🟢 GO** or **🟡 CAUTION**, run the operational ticket generator against your brokerage portfolio:
      ```bash
      uv run python scripts/run_live_four_state_blend.py \
        --portfolio-value <ACCOUNT_NAV> \
@@ -127,7 +135,47 @@ flowchart TD
 
 ## 4. Production CLI Run Commands
 
-### A. Daily Rebalance Against Brokerage Holdings File (China A-Shares)
+### 4.1 Stage 1: Portfolio Health & Macro Gate Commands (14:00 – 14:15)
+
+#### A. China A-Shares Portfolio Health Check
+```bash
+uv run python scripts/check_live_portfolio_health.py \
+  --portfolio-value 200000 \
+  --peak-nav 210000 \
+  --universe-file docs/universe/china/core_satellite_22_stocks.txt \
+  --data-provider marketdb
+```
+
+#### B. US Equities Portfolio Health Check
+```bash
+uv run python scripts/check_live_portfolio_health.py \
+  --portfolio-value 100000 \
+  --peak-nav 105000 \
+  --universe-file docs/universe/us/core_satellite_22_stocks.txt \
+  --data-provider yfinance
+```
+
+#### C. Hong Kong Stocks Portfolio Health Check
+```bash
+uv run python scripts/check_live_portfolio_health.py \
+  --portfolio-value 500000 \
+  --peak-nav 520000 \
+  --universe-file docs/universe/hongkong/core_satellite_22_stocks.txt \
+  --data-provider yfinance
+```
+
+#### D. Offline Sanity Check (Synthetic Data)
+```bash
+uv run python scripts/check_live_portfolio_health.py \
+  --data-provider synthetic \
+  --portfolio-value 100000
+```
+
+---
+
+### 4.2 Stage 2: Daily Order Ticket Generation Commands (14:15 – 14:50)
+
+#### A. Daily Rebalance Against Brokerage Holdings File (China A-Shares)
 Create a local `current_holdings.json` file representing your broker positions:
 ```json
 {
@@ -147,7 +195,7 @@ uv run python scripts/run_live_four_state_blend.py \
   --data-provider marketdb
 ```
 
-### B. Daily Rebalance for US Equities Portfolio
+#### B. Daily Rebalance for US Equities Portfolio
 ```bash
 uv run python scripts/run_live_four_state_blend.py \
   --universe-file docs/universe/us/core_satellite_22_stocks.txt \
@@ -156,7 +204,7 @@ uv run python scripts/run_live_four_state_blend.py \
   --data-provider yfinance
 ```
 
-### C. Daily Rebalance for Hong Kong Stocks Portfolio
+#### C. Daily Rebalance for Hong Kong Stocks Portfolio
 ```bash
 uv run python scripts/run_live_four_state_blend.py \
   --universe-file docs/universe/hongkong/core_satellite_22_stocks.txt \
@@ -164,7 +212,7 @@ uv run python scripts/run_live_four_state_blend.py \
   --data-provider yfinance
 ```
 
-### D. Offline Simulation / Sanity Check (Synthetic Data)
+#### D. Offline Ticket Simulation (Synthetic Data)
 ```bash
 uv run python scripts/run_live_four_state_blend.py \
   --data-provider synthetic \
@@ -197,7 +245,11 @@ uv run python scripts/run_live_four_state_blend.py \
 - **Serialized Strategy Dump**: [`pipeline/research_strategy/results/strategy_dumps/chan_four_state_blend_strategy.json`](file:///home/stone/Work/github/quant/pipeline/research_strategy/results/strategy_dumps/chan_four_state_blend_strategy.json)
 - **Live Trading Rules (English)**: [`docs/ruleset/chan_four_state_blend/rules.md`](file:///home/stone/Work/github/quant/docs/ruleset/chan_four_state_blend/rules.md)
 - **Live Trading Rules (Chinese)**: [`docs/ruleset/chan_four_state_blend/rules_cn.md`](file:///home/stone/Work/github/quant/docs/ruleset/chan_four_state_blend/rules_cn.md)
-- **Execution Script**: [`scripts/run_live_four_state_blend.py`](file:///home/stone/Work/github/quant/scripts/run_live_four_state_blend.py)
+- **Stage 1 Health Check Script**: [`scripts/check_live_portfolio_health.py`](file:///home/stone/Work/github/quant/scripts/check_live_portfolio_health.py)
+- **Stage 1 Health Report (Markdown)**: [`docs/ruleset/chan_four_state_blend/stage1_health_report.md`](file:///home/stone/Work/github/quant/docs/ruleset/chan_four_state_blend/stage1_health_report.md)
+- **Stage 1 Health Report (JSON)**: [`docs/ruleset/chan_four_state_blend/stage1_health_report.json`](file:///home/stone/Work/github/quant/docs/ruleset/chan_four_state_blend/stage1_health_report.json)
+- **Account State & Cooldown Tracker**: [`docs/ruleset/chan_four_state_blend/account_state.json`](file:///home/stone/Work/github/quant/docs/ruleset/chan_four_state_blend/account_state.json)
+- **Stage 2 Execution Script**: [`scripts/run_live_four_state_blend.py`](file:///home/stone/Work/github/quant/scripts/run_live_four_state_blend.py)
 - **Production Universes**:
   - China A-Shares: [`docs/universe/china/core_satellite_22_stocks.txt`](file:///home/stone/Work/github/quant/docs/universe/china/core_satellite_22_stocks.txt)
   - US Equities: [`docs/universe/us/core_satellite_22_stocks.txt`](file:///home/stone/Work/github/quant/docs/universe/us/core_satellite_22_stocks.txt)

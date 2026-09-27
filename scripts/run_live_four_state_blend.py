@@ -3,11 +3,11 @@
 
 Loads the validated `chan_four_state_blend` strategy configuration, fetches point-in-time
 market data up to `--as-of-date`, evaluates the 4-state FSM + 3-type + VAA composite logic,
-applies the drawdown circuit breakers, 30% breadth / 10d thrust cash deployment, and 4% inertia filter,
-and outputs a complete, actionable trading ticket (SELLS FIRST -> BUYS SECOND) with 100-share lot rounding.
+applies the drawdown circuit breakers, 30% breadth / 10d thrust cash deployment, and 5% inertia filter,
+and outputs a complete, actionable trading ticket (SELLS FIRST -> BUYS SECOND) with per-market lot rounding.
 
 Usage:
-    # 1. Run live check for today using the pruned 11-stock universe:
+    # 1. Run live check for today using the default Core-Satellite 22-stock universe:
     uv run python scripts/run_live_four_state_blend.py --data-provider synthetic
 
     # 2. Run with real market data (MarketDB or yfinance) as of a specific date:

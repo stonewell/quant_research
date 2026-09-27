@@ -92,15 +92,23 @@ flowchart TD
 ```
 
 ### 分时操作细则：
-1. **14:00 – 14:15: 组合健康度与宏观检查**
+1. **14:00 – 14:15: 第一阶段 — 组合健康度与宏观检查**
+   - 运行专属的第一阶段盘中健康与风控检查脚本：
+     ```bash
+     uv run python scripts/check_live_portfolio_health.py \
+       --portfolio-value <账户当前净值> \
+       --peak-nav <历史峰值HWM> \
+       --data-provider <marketdb|yfinance>
+     ```
    - 检查账户当前净值对比历史峰值净值 (HWM) 的回撤深度：
-     - 若回撤 $\ge 20\%$：三级熔断生效，市价清空所有风险持仓，未来 21 个交易日禁止交易。
-     - 若 $15\% \le \text{回撤} < 20\%$：二级熔断生效，切断进攻仓位，转入 VAA 防守模式（保留 70% 现金）。
-     - 若 $10\% \le \text{回撤} < 15\%$：一级熔断生效，启动线性阻尼平滑压缩权益仓位。
+     - 若回撤 $\ge 20\%$：**🔴 NO-GO 紧急熔断**，市价清空所有风险持仓，未来 21 个交易日冷冻。
+     - 若 $15\% \le \text{回撤} < 20\%$：**🟠 CAUTION 战术防守**，切断进攻仓位，转入 VAA 防守模式（保留 70% 现金）。
+     - 若 $10\% \le \text{回撤} < 15\%$：**🟡 CAUTION 线性阻尼**，启动平滑线性阻尼减仓。
+     - 若回撤 $< 10\%$：**🟢 GO 放行通过**，全额正常风险预算。
    - 检查全市场 50 日均线宽度（$\ge 30\%$）及 10 日冲力（$\ge 60\%$），确认牛市资金动用是否处于激活状态。
 
-2. **14:15 – 14:20: 生成交易执行票据**
-   - 在终端运行专属执行脚本（传入当前券商实际持仓）：
+2. **14:15 – 14:20: 第二阶段 — 生成交易执行票据**
+   - 当第一阶段指令为 **🟢 GO** 或 **🟡 CAUTION** 时，在终端运行调仓票据生成器：
      ```bash
      uv run python scripts/run_live_four_state_blend.py \
        --portfolio-value <账户总资产> \
@@ -126,7 +134,47 @@ flowchart TD
 
 ## 4. 生产常用执行命令
 
-### A. 结合真实券商持仓发单 (A 股核心-卫星池)
+### 4.1 第一阶段：组合健康度与宏观检查命令 (14:00 – 14:15)
+
+#### A. A 股投资组合健康度与风控门禁检查
+```bash
+uv run python scripts/check_live_portfolio_health.py \
+  --portfolio-value 200000 \
+  --peak-nav 210000 \
+  --universe-file docs/universe/china/core_satellite_22_stocks.txt \
+  --data-provider marketdb
+```
+
+#### B. 美股投资组合健康度检查
+```bash
+uv run python scripts/check_live_portfolio_health.py \
+  --portfolio-value 100000 \
+  --peak-nav 105000 \
+  --universe-file docs/universe/us/core_satellite_22_stocks.txt \
+  --data-provider yfinance
+```
+
+#### C. 港股投资组合健康度检查
+```bash
+uv run python scripts/check_live_portfolio_health.py \
+  --portfolio-value 500000 \
+  --peak-nav 520000 \
+  --universe-file docs/universe/hongkong/core_satellite_22_stocks.txt \
+  --data-provider yfinance
+```
+
+#### D. 盘前离线模拟检验 (合成数据)
+```bash
+uv run python scripts/check_live_portfolio_health.py \
+  --data-provider synthetic \
+  --portfolio-value 100000
+```
+
+---
+
+### 4.2 第二阶段：调仓发单票据生成命令 (14:15 – 14:50)
+
+#### A. 结合真实券商持仓发单 (A 股核心-卫星池)
 在本地创建 `current_holdings.json`：
 ```json
 {
@@ -146,7 +194,7 @@ uv run python scripts/run_live_four_state_blend.py \
   --data-provider marketdb
 ```
 
-### B. 美股核心-卫星池发单命令
+#### B. 美股核心-卫星池发单命令
 ```bash
 uv run python scripts/run_live_four_state_blend.py \
   --universe-file docs/universe/us/core_satellite_22_stocks.txt \
@@ -155,7 +203,7 @@ uv run python scripts/run_live_four_state_blend.py \
   --data-provider yfinance
 ```
 
-### C. 港股核心-卫星池发单命令
+#### C. 港股核心-卫星池发单命令
 ```bash
 uv run python scripts/run_live_four_state_blend.py \
   --universe-file docs/universe/hongkong/core_satellite_22_stocks.txt \
@@ -163,7 +211,7 @@ uv run python scripts/run_live_four_state_blend.py \
   --data-provider yfinance
 ```
 
-### D. 盘前/周末离线模拟检验 (合成数据)
+#### D. 离线模拟发单检验 (合成数据)
 ```bash
 uv run python scripts/run_live_four_state_blend.py \
   --data-provider synthetic \
@@ -196,7 +244,11 @@ uv run python scripts/run_live_four_state_blend.py \
 - **序列化策略快照**: [`pipeline/research_strategy/results/strategy_dumps/chan_four_state_blend_strategy.json`](file:///home/stone/Work/github/quant/pipeline/research_strategy/results/strategy_dumps/chan_four_state_blend_strategy.json)
 - **实盘操作手册 (中文版)**: [`docs/ruleset/chan_four_state_blend/rules_cn.md`](file:///home/stone/Work/github/quant/docs/ruleset/chan_four_state_blend/rules_cn.md)
 - **实盘操作手册 (英文版)**: [`docs/ruleset/chan_four_state_blend/rules.md`](file:///home/stone/Work/github/quant/docs/ruleset/chan_four_state_blend/rules.md)
-- **专属执行脚本**: [`scripts/run_live_four_state_blend.py`](file:///home/stone/Work/github/quant/scripts/run_live_four_state_blend.py)
+- **第一阶段组合健康与宏观检查脚本**: [`scripts/check_live_portfolio_health.py`](file:///home/stone/Work/github/quant/scripts/check_live_portfolio_health.py)
+- **第一阶段风控门禁审计报告 (Markdown)**: [`docs/ruleset/chan_four_state_blend/stage1_health_report.md`](file:///home/stone/Work/github/quant/docs/ruleset/chan_four_state_blend/stage1_health_report.md)
+- **第一阶段风控门禁审计报告 (JSON)**: [`docs/ruleset/chan_four_state_blend/stage1_health_report.json`](file:///home/stone/Work/github/quant/docs/ruleset/chan_four_state_blend/stage1_health_report.json)
+- **账户净值与冷冻期追踪状态文件**: [`docs/ruleset/chan_four_state_blend/account_state.json`](file:///home/stone/Work/github/quant/docs/ruleset/chan_four_state_blend/account_state.json)
+- **第二阶段调仓发单执行脚本**: [`scripts/run_live_four_state_blend.py`](file:///home/stone/Work/github/quant/scripts/run_live_four_state_blend.py)
 - **跨市场标的池**:
   - A 股核心-卫星池: [`docs/universe/china/core_satellite_22_stocks.txt`](file:///home/stone/Work/github/quant/docs/universe/china/core_satellite_22_stocks.txt)
   - 美股核心-卫星池: [`docs/universe/us/core_satellite_22_stocks.txt`](file:///home/stone/Work/github/quant/docs/universe/us/core_satellite_22_stocks.txt)

@@ -1906,7 +1906,7 @@ class ChanFourStateBlendStrategy(AllocationTemplate):
 
     2. Key Trading Rules & Risk Controls:
        - Concentration Cap: Hard cap of 20% NAV per individual stock (`cfsb_max_single_position = 0.20`),
-         dynamically expanding up to 30% (`cfsb_bull_max_single_position = 0.30`) during bull breadth regimes.
+         strictly held at 20% in all regimes (`cfsb_bull_max_single_position = 0.20`).
        - Dual-Horizon Breadth Throttle & 10-Day Breadth Thrust:
          * Medium-term breadth: fraction of universe with Close > 50d SMA >= 30% (`cfsb_breadth_bull_thresh = 0.30`).
          * Short-term 10-day breadth thrust (`cfsb_thrust_lookback = 10`): fraction of universe with 10d ROC > 0 >= 60%
