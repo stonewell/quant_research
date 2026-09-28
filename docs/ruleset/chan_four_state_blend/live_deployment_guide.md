@@ -152,6 +152,7 @@ uv run python scripts/check_live_portfolio_health.py \
   --portfolio-value 100000 \
   --peak-nav 105000 \
   --universe-file docs/universe/us/core_satellite_22_stocks.txt \
+  --output-dir docs/ruleset/chan_four_state_blend/us \
   --data-provider yfinance
 ```
 
@@ -161,6 +162,7 @@ uv run python scripts/check_live_portfolio_health.py \
   --portfolio-value 500000 \
   --peak-nav 520000 \
   --universe-file docs/universe/hongkong/core_satellite_22_stocks.txt \
+  --output-dir docs/ruleset/chan_four_state_blend/hongkong \
   --data-provider yfinance
 ```
 
@@ -199,6 +201,7 @@ uv run python scripts/run_live_four_state_blend.py \
 ```bash
 uv run python scripts/run_live_four_state_blend.py \
   --universe-file docs/universe/us/core_satellite_22_stocks.txt \
+  --output-dir docs/ruleset/chan_four_state_blend/us \
   --portfolio-value 100000 \
   --lot-size 1 \
   --data-provider yfinance
@@ -208,6 +211,7 @@ uv run python scripts/run_live_four_state_blend.py \
 ```bash
 uv run python scripts/run_live_four_state_blend.py \
   --universe-file docs/universe/hongkong/core_satellite_22_stocks.txt \
+  --output-dir docs/ruleset/chan_four_state_blend/hongkong \
   --portfolio-value 500000 \
   --data-provider yfinance
 ```

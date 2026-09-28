@@ -63,15 +63,26 @@ from common.strategy_spec import load_strategy_file
 from common.universe import resolve_universe_from_args
 from pipeline.live_signal.lsig.signal import as_of_universe
 
+def _resolve_path(p: Optional[str]) -> Optional[str]:
+    """Resolve path relative to repo root if it does not exist relative to CWD."""
+    if not p:
+        return p
+    if os.path.isabs(p) or os.path.exists(p):
+        return os.path.abspath(p)
+    candidate = os.path.join(_REPO_ROOT, p)
+    if os.path.exists(candidate):
+        return os.path.abspath(candidate)
+    return p
+
+
 DEFAULT_STRATEGY_FILE = os.path.join(
     _REPO_ROOT, "pipeline", "research_strategy", "results", "strategy_dumps", "chan_four_state_blend_strategy.json"
 )
 DEFAULT_UNIVERSE_FILE = os.path.join(_REPO_ROOT, "docs", "universe", "china", "core_satellite_22_stocks.txt")
 DEFAULT_OUTPUT_DIR = os.path.join(_REPO_ROOT, "docs", "ruleset", "chan_four_state_blend")
-DEFAULT_STATE_FILE = os.path.join(DEFAULT_OUTPUT_DIR, "account_state.json")
 
 
-def parse_args():
+def parse_args(args: Optional[List[str]] = None):
     parser = argparse.ArgumentParser(
         description="Stage 1 Live Deployment Runner: Portfolio Health & Macro Regime Inspection"
     )
@@ -91,8 +102,8 @@ def parse_args():
     )
     parser.add_argument(
         "--account-state-file",
-        default=DEFAULT_STATE_FILE,
-        help="Path to persistent account state JSON file (default: account_state.json)",
+        default=None,
+        help="Path to persistent account state JSON file (default: account_state.json in --output-dir)",
     )
     parser.add_argument(
         "--strategy-file",
@@ -122,6 +133,11 @@ def parse_args():
         help="Directory to save generated health reports (default: docs/ruleset/chan_four_state_blend)",
     )
     parser.add_argument(
+        "--cache-dir",
+        default=None,
+        help="Folder path for DuckDB / parquet market data cache (default: data/ in repo root)",
+    )
+    parser.add_argument(
         "--no-save-state",
         action="store_true",
         help="Do not persist updated state back to account-state-file",
@@ -132,7 +148,19 @@ def parse_args():
         help="If set and gate directive is GO/CAUTION, automatically run run_live_four_state_blend.py",
     )
     add_data_provider_cli_args(parser, default_provider="synthetic")
-    return parser.parse_args()
+    parsed = parser.parse_args(args)
+
+    # Dynamically resolve output_dir and default account_state_file
+    parsed.output_dir = _resolve_path(parsed.output_dir) or parsed.output_dir
+    if parsed.account_state_file is None:
+        parsed.account_state_file = os.path.join(parsed.output_dir, "account_state.json")
+    else:
+        parsed.account_state_file = _resolve_path(parsed.account_state_file)
+    parsed.strategy_file = _resolve_path(parsed.strategy_file)
+    parsed.universe_file = _resolve_path(parsed.universe_file)
+    if parsed.cache_dir:
+        parsed.cache_dir = _resolve_path(parsed.cache_dir)
+    return parsed
 
 
 def to_json_serializable(obj: Any) -> Any:
@@ -658,13 +686,14 @@ def main():
     if not universe_symbols:
         raise ValueError(f"Could not resolve universe symbols from {args.universe_file}")
 
+    cache_dir = args.cache_dir or shared_data_dir()
     universe = load_universe_with_banner(
         universe_symbols,
         start_date,
         as_of_date,
         interval="1d",
         use_cache=not args.no_cache,
-        cache_dir=shared_data_dir(),
+        cache_dir=cache_dir,
         data_kwargs=build_data_kwargs(args),
         require_nonempty=True,
     )
@@ -693,17 +722,19 @@ def main():
         if len(nav_hist) > 10:
             nav_hist.pop(0)
 
-        updated_state = {
+        updated_state = dict(state)
+        updated_state.update({
             "as_of_date": as_of_date,
             "current_nav": dd_info["current_nav"],
             "peak_nav": dd_info["peak_nav"],
             "drawdown_pct": dd_info["drawdown_pct"],
             "circuit_breaker_tier": dd_info["tier"],
+            "linear_equity_scale": dd_info["linear_equity_scale"],
             "tier1_consecutive_bars": dd_info["tier1_counter"],
             "tier3_consecutive_bars": dd_info["tier3_counter"],
             "freeze_remaining_bars": dd_info["freeze_remaining_bars"],
             "nav_history_10d": nav_hist,
-        }
+        })
         save_account_state(args.account_state_file, updated_state)
 
     # 7. Print Dashboard & Export Reports
@@ -754,9 +785,19 @@ def main():
                 args.strategy_file,
                 "--data-provider",
                 args.data_provider,
+                "--output-dir",
+                args.output_dir,
+                "--account-state-file",
+                args.account_state_file,
             ]
             if args.as_of_date:
                 cmd.extend(["--as-of-date", args.as_of_date])
+            if getattr(args, "cache_dir", None):
+                cmd.extend(["--cache-dir", args.cache_dir])
+            if getattr(args, "data_dir", None):
+                cmd.extend(["--data-dir", args.data_dir])
+            if getattr(args, "no_cache", False):
+                cmd.append("--no-cache")
             import subprocess
             subprocess.run(cmd, check=True)
 

@@ -230,3 +230,51 @@ def test_to_json_serializable():
     assert type(res["float_val"]) is float
     assert res["arr_val"] == [1, 2, 3]
     assert res["series_val"] == [4, 5, 6]
+
+
+def test_account_state_in_output_directory(tmp_path):
+    """Verify account_state.json is loaded and saved in custom output directory."""
+    state_file = str(tmp_path / "account_state.json")
+    state = {
+        "as_of_date": "2026-09-28",
+        "current_nav": 120000.0,
+        "peak_nav": 125000.0,
+        "circuit_breaker_tier": "NORMAL",
+    }
+    _mod.save_account_state(state_file, state)
+    assert os.path.exists(state_file)
+
+    loaded = _mod.load_account_state(state_file)
+    assert loaded["current_nav"] == 120000.0
+    assert loaded["peak_nav"] == 125000.0
+
+
+def test_parse_args_health_check_dynamic_output_dir(tmp_path):
+    """Verify parse_args dynamically binds account_state_file to output-dir."""
+    custom_dir = str(tmp_path / "my_run")
+    args = _mod.parse_args(["--output-dir", custom_dir])
+    assert args.output_dir == os.path.abspath(custom_dir)
+    assert args.account_state_file == os.path.join(os.path.abspath(custom_dir), "account_state.json")
+
+
+def test_parse_args_health_check_explicit_account_state(tmp_path):
+    """Verify explicit account-state-file is preserved even if output-dir is set."""
+    custom_dir = str(tmp_path / "my_run")
+    custom_state = str(tmp_path / "custom_state.json")
+    args = _mod.parse_args(["--output-dir", custom_dir, "--account-state-file", custom_state])
+    assert args.account_state_file == os.path.abspath(custom_state)
+
+
+def test_stage2_parse_args_dynamic_output_dir(tmp_path):
+    """Verify Stage 2 run_live_four_state_blend dynamically binds account_state_file to output-dir."""
+    _stage2_script = os.path.join(_PROJECT_ROOT, "scripts", "run_live_four_state_blend.py")
+    _spec2 = importlib.util.spec_from_file_location("run_live_four_state_blend", _stage2_script)
+    _mod2 = importlib.util.module_from_spec(_spec2)
+    _spec2.loader.exec_module(_mod2)
+
+    custom_dir = str(tmp_path / "orders")
+    args = _mod2.parse_args(["--output-dir", custom_dir])
+    assert args.output_dir == os.path.abspath(custom_dir)
+    assert args.account_state_file == os.path.join(os.path.abspath(custom_dir), "account_state.json")
+    assert args.health_report_file == os.path.join(os.path.abspath(custom_dir), "stage1_health_report.json")
+
