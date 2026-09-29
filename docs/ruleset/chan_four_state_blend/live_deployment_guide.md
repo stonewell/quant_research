@@ -178,13 +178,12 @@ uv run python scripts/check_live_portfolio_health.py \
 ### 4.2 Stage 2: Daily Order Ticket Generation Commands (14:15 – 14:50)
 
 #### A. Daily Rebalance Against Brokerage Holdings File (China A-Shares)
-Create a local `current_holdings.json` file representing your broker positions:
+Create a local `current_holdings.json` file representing your broker positions with **exact share counts** (no need to specify cash; cash and stock weights are computed automatically from `--portfolio-value`):
 ```json
 {
-  "300394.SZ": 0.10,
-  "601872.SH": 0.08,
-  "601728.SH": 0.08,
-  "BIL": 0.74
+  "300394.SZ": 200,
+  "601872.SH": 1000,
+  "601728.SH": 1000
 }
 ```
 

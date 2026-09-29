@@ -278,3 +278,83 @@ def test_stage2_parse_args_dynamic_output_dir(tmp_path):
     assert args.account_state_file == os.path.join(os.path.abspath(custom_dir), "account_state.json")
     assert args.health_report_file == os.path.join(os.path.abspath(custom_dir), "stage1_health_report.json")
 
+
+def test_resolve_holdings_weights_and_shares_quantities():
+    """Verify share counts are converted to exact weights and cash is derived from NAV."""
+    _stage2_script = os.path.join(_PROJECT_ROOT, "scripts", "run_live_four_state_blend.py")
+    _spec2 = importlib.util.spec_from_file_location("run_live_four_state_blend", _stage2_script)
+    _mod2 = importlib.util.module_from_spec(_spec2)
+    _spec2.loader.exec_module(_mod2)
+
+    universe = {
+        "STOCK_A": pd.DataFrame({"Close": [100.0]}),
+        "STOCK_B": pd.DataFrame({"Close": [50.0]}),
+    }
+    raw_holdings = {"STOCK_A": 200, "STOCK_B": 1000}
+    port_val = 100000.0
+
+    weights, shares, eq_val, cash_val = _mod2.resolve_holdings_weights_and_shares(
+        raw_holdings, universe, port_val, cash_proxy="BIL"
+    )
+
+    # STOCK_A: 200 * 100 = 20,000 (20%)
+    # STOCK_B: 1000 * 50 = 50,000 (50%)
+    # Total equity: 70,000 (70%)
+    # Implied cash: 30,000 (30%)
+    assert shares["STOCK_A"] == 200
+    assert shares["STOCK_B"] == 1000
+    assert eq_val == pytest.approx(70000.0)
+    assert cash_val == pytest.approx(30000.0)
+    assert weights["STOCK_A"] == pytest.approx(0.20)
+    assert weights["STOCK_B"] == pytest.approx(0.50)
+    assert weights["BIL"] == pytest.approx(0.30)
+
+
+def test_resolve_holdings_weights_and_shares_exceeds_nav():
+    """Verify cash is clamped at 0 when equity market value exceeds NAV."""
+    _stage2_script = os.path.join(_PROJECT_ROOT, "scripts", "run_live_four_state_blend.py")
+    _spec2 = importlib.util.spec_from_file_location("run_live_four_state_blend", _stage2_script)
+    _mod2 = importlib.util.module_from_spec(_spec2)
+    _spec2.loader.exec_module(_mod2)
+
+    universe = {
+        "STOCK_A": pd.DataFrame({"Close": [100.0]}),
+    }
+    raw_holdings = {"STOCK_A": 1200}  # 120,000 > 100,000
+    port_val = 100000.0
+
+    weights, shares, eq_val, cash_val = _mod2.resolve_holdings_weights_and_shares(
+        raw_holdings, universe, port_val, cash_proxy="BIL"
+    )
+
+    assert eq_val == pytest.approx(120000.0)
+    assert cash_val == pytest.approx(0.0)
+    assert weights["BIL"] == pytest.approx(0.0)
+    assert weights["STOCK_A"] == pytest.approx(1.20)
+
+
+def test_resolve_holdings_weights_and_shares_legacy_weights():
+    """Verify backward compatibility when fractional weights are passed."""
+    _stage2_script = os.path.join(_PROJECT_ROOT, "scripts", "run_live_four_state_blend.py")
+    _spec2 = importlib.util.spec_from_file_location("run_live_four_state_blend", _stage2_script)
+    _mod2 = importlib.util.module_from_spec(_spec2)
+    _spec2.loader.exec_module(_mod2)
+
+    universe = {
+        "STOCK_A": pd.DataFrame({"Close": [100.0]}),
+        "STOCK_B": pd.DataFrame({"Close": [50.0]}),
+    }
+    raw_holdings = {"STOCK_A": 0.20, "STOCK_B": 0.50}
+    port_val = 100000.0
+
+    weights, shares, eq_val, cash_val = _mod2.resolve_holdings_weights_and_shares(
+        raw_holdings, universe, port_val, cash_proxy="BIL"
+    )
+
+    assert weights["STOCK_A"] == pytest.approx(0.20)
+    assert weights["STOCK_B"] == pytest.approx(0.50)
+    assert weights["BIL"] == pytest.approx(0.30)
+    assert shares["STOCK_A"] == 200
+    assert shares["STOCK_B"] == 1000
+
+

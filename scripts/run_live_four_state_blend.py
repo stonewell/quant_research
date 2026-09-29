@@ -24,7 +24,7 @@ import json
 import os
 import sys
 from datetime import date, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -244,7 +244,7 @@ def parse_args(args: Optional[List[str]] = None):
     return parsed
 
 
-def load_holdings(args) -> Optional[Dict[str, float]]:
+def load_holdings(args) -> Optional[Dict[str, Any]]:
     if args.current_holdings and args.current_holdings_file:
         raise ValueError("Specify either --current-holdings or --current-holdings-file, not both.")
     if args.current_holdings:
@@ -269,6 +269,79 @@ def load_holdings(args) -> Optional[Dict[str, float]]:
         except Exception:
             pass
     return None
+
+
+def resolve_holdings_weights_and_shares(
+    raw_holdings: Optional[Dict[str, Any]],
+    universe: Dict[str, pd.DataFrame],
+    portfolio_value: float,
+    cash_proxy: str = "BIL",
+) -> Tuple[Dict[str, float], Dict[str, int], float, float]:
+    """Resolve user-supplied holdings (either share quantities or fractional weights)
+    into normalized portfolio weights and exact held share counts.
+
+    Returns:
+        (weights_dict, shares_dict, total_equity_val, cash_val)
+    """
+    if not raw_holdings:
+        return {}, {}, 0.0, portfolio_value
+
+    # Filter out 0 or null values
+    cleaned = {k.strip(): float(v) for k, v in raw_holdings.items() if v is not None and float(v) > 0}
+    if not cleaned:
+        return {}, {}, 0.0, portfolio_value
+
+    # Non-cash held assets
+    non_cash_items = {k: v for k, v in cleaned.items() if k not in (cash_proxy, "BIL", "CASH")}
+
+    # Detect weight mode: all non-cash values <= 1.0, sum <= 1.05, and has non-integer float
+    is_weight_mode = False
+    if non_cash_items:
+        all_le_1 = all(v <= 1.0 for v in non_cash_items.values())
+        sum_le_105 = sum(non_cash_items.values()) <= 1.05
+        has_fraction = any(not float(v).is_integer() for v in non_cash_items.values())
+        if all_le_1 and sum_le_105 and has_fraction:
+            is_weight_mode = True
+
+    weights_dict: Dict[str, float] = {}
+    shares_dict: Dict[str, int] = {}
+    total_equity_val = 0.0
+
+    if is_weight_mode:
+        # Legacy weight mode: user supplied fractional weights
+        for sym, w in non_cash_items.items():
+            weights_dict[sym] = float(w)
+            price = float(universe[sym]["Close"].iloc[-1]) if (sym in universe and not universe[sym].empty) else 0.0
+            eq_val = w * portfolio_value
+            total_equity_val += eq_val
+            shares_dict[sym] = int(np.round(eq_val / price)) if price > 0 else 0
+        cash_val = max(0.0, portfolio_value - total_equity_val)
+        weights_dict[cash_proxy] = max(0.0, cash_val / portfolio_value) if portfolio_value > 0 else 0.0
+    else:
+        # Quantity / Shares mode: user supplied share counts
+        for sym, qty in non_cash_items.items():
+            int_qty = int(np.round(qty))
+            shares_dict[sym] = int_qty
+            if sym in universe and not universe[sym].empty:
+                price = float(universe[sym]["Close"].iloc[-1])
+            else:
+                price = 0.0
+                print(f"[WARN] 无法获取标的 {sym} 的最新收盘价，持仓市值暂计为 0。")
+            eq_val = int_qty * price
+            total_equity_val += eq_val
+            weights_dict[sym] = (eq_val / portfolio_value) if portfolio_value > 0 else 0.0
+
+        cash_val = portfolio_value - total_equity_val
+        if cash_val < -1e-4:
+            print(f"[WARN] 股票总持仓市值 (¥{total_equity_val:,.2f}) 超过账户总资产 (¥{portfolio_value:,.2f})，推算现金比例置为 0。")
+            cash_val = 0.0
+            cash_w = 0.0
+        else:
+            cash_w = cash_val / portfolio_value if portfolio_value > 0 else 0.0
+
+        weights_dict[cash_proxy] = cash_w
+
+    return weights_dict, shares_dict, total_equity_val, cash_val
 
 
 def main():
@@ -309,6 +382,7 @@ def main():
     strategy_def = load_strategy_file(args.strategy_file)
     template_name = strategy_def["template_name"]
     params = strategy_def["params"]
+    cash_proxy = params.get("cash_proxy", "BIL")
     template = get_template(
         template_name,
         strategy_def.get("pattern_spec"),
@@ -317,15 +391,19 @@ def main():
         params,
     )
 
-    # 2. Load Universe
+    # 2. Load Universe (including any held symbols outside the universe list)
     universe_symbols = resolve_universe_from_args(args)
     if not universe_symbols:
         raise ValueError(f"Could not resolve universe symbols from {args.universe_file}")
     symbol_names = load_symbol_names(args.universe_file)
 
+    raw_user_holdings = load_holdings(args)
+    held_symbols = [s.strip() for s in (raw_user_holdings.keys() if raw_user_holdings else []) if s.strip() not in (cash_proxy, "BIL", "CASH")]
+    symbols_to_load = sorted(list(set(universe_symbols).union(set(held_symbols))))
+
     cache_dir = args.cache_dir or shared_data_dir()
     universe = load_universe_with_banner(
-        universe_symbols,
+        symbols_to_load,
         start_date,
         as_of_date,
         interval="1d",
@@ -362,10 +440,19 @@ def main():
             current_targets = current_targets * live_scale
 
     # 4. Resolve Reference Portfolio (Actual Holdings vs Strategy Last Rebalance)
-    user_holdings = load_holdings(args)
-    if user_holdings is not None:
-        reference = pd.Series(user_holdings, dtype=float)
+    current_shares_dict: Dict[str, int] = {}
+    if raw_user_holdings is not None:
+        reference_weights, current_shares_dict, total_eq_val, cash_bal_val = resolve_holdings_weights_and_shares(
+            raw_user_holdings, universe, args.portfolio_value, cash_proxy
+        )
+        reference = pd.Series(reference_weights)
         reference_source = "User-Supplied Actual Live Brokerage Holdings"
+        print("\n" + "-" * 110)
+        print("[持仓资产与闲置资金对账 (Holdings & Cash Reconciliation)]")
+        print(f"  当前股票持仓市值 : ¥{total_eq_val:>10,.2f} ({total_eq_val/args.portfolio_value:>5.1%})")
+        print(f"  推算账户闲置现金 : ¥{cash_bal_val:>10,.2f} ({cash_bal_val/args.portfolio_value:>5.1%})")
+        print(f"  账户总资产估值   : ¥{args.portfolio_value:>10,.2f}")
+        print("-" * 110)
     elif len(rebalances) >= 2:
         reference = rebalances.iloc[-2].fillna(0.0)
         reference_source = f"Strategy Prior Rebalance ({rebalances.index[-2].strftime('%Y-%m-%d')})"
@@ -379,7 +466,6 @@ def main():
 
     # 5. Build Execution Order Plan
     min_trade_thresh = float(params.get("cfsb_min_weight_change", 0.05))
-    cash_proxy = params.get("cash_proxy", "BIL")
 
     # Compute implied cash weight: strategy only outputs equity weights, remainder is cash
     equity_weight_sum = sum(float(target_series[s]) for s in target_series.index if s != cash_proxy)
@@ -426,27 +512,30 @@ def main():
 
         # Calculate lot-rounded shares for equities
         sym_lot = resolve_lot_size(sym, args.lot_size)
+        current_shares = current_shares_dict.get(sym, int(np.round(current_val / price))) if (price > 0 and current_val > 0) else current_shares_dict.get(sym, 0)
         if sym != cash_proxy and price > 0:
             if action == "BUY":
                 # Compute buy qty from trade delta value, round down to lot size
                 raw_buy_shares = trade_val / price
                 lot_buy_shares = int(np.floor(raw_buy_shares / sym_lot) * sym_lot)
-                if lot_buy_shares == 0 and raw_buy_shares > 0:
-                    lot_buy_shares = 0
-                delta_shares = lot_buy_shares
-                current_shares = int(np.round(current_val / price)) if current_val > 0 else 0
+                delta_shares = max(0, lot_buy_shares)
                 target_shares = current_shares + delta_shares
                 actual_trade_val = delta_shares * price
             elif action == "SELL":
-                # Compute sell qty from trade delta value, round up to lot size
-                raw_sell_shares = abs(trade_val) / price
-                lot_sell_shares = int(np.ceil(raw_sell_shares / sym_lot) * sym_lot)
-                delta_shares = -lot_sell_shares
-                current_shares = int(np.round(current_val / price)) if current_val > 0 else 0
-                target_shares = current_shares + delta_shares
-                actual_trade_val = delta_shares * price
+                if tgt_w <= 1e-6:
+                    # Full liquidation: sell 100% of currently held shares
+                    delta_shares = -current_shares
+                    target_shares = 0
+                    actual_trade_val = delta_shares * price
+                else:
+                    # Partial reduction: round up to lot size, capped at current_shares
+                    raw_sell_shares = abs(trade_val) / price
+                    lot_sell_shares = int(np.ceil(raw_sell_shares / sym_lot) * sym_lot)
+                    lot_sell_shares = min(lot_sell_shares, current_shares)
+                    delta_shares = -lot_sell_shares
+                    target_shares = current_shares + delta_shares
+                    actual_trade_val = delta_shares * price
             else:
-                current_shares = int(np.round(current_val / price)) if current_val > 0 else 0
                 target_shares = current_shares
                 delta_shares = 0
                 actual_trade_val = 0.0
@@ -544,7 +633,8 @@ def main():
         for _, r in actual_holds.iterrows():
             reason = f"调仓未超惰性阈值 (< {min_trade_thresh:.0%})" if r["action"] == "HOLD_FILTERED" else "最优目标权重维持"
             sym_col = pad_east_asian(f"{r['symbol']} ({r['name']})", 24)
-            print(f"  ⚪ HOLD {sym_col} | 维持仓位: {r['target_weight']:>5.1%} | 持仓市值: ~¥{r['target_weight']*args.portfolio_value:>9,.2f} | ({reason})")
+            shares_info = f"({int(r['current_shares'])} 股)" if r['current_shares'] > 0 else ""
+            print(f"  ⚪ HOLD {sym_col} | 维持仓位: {r['target_weight']:>5.1%} {shares_info:<10} | 持仓市值: ~¥{r['target_weight']*args.portfolio_value:>9,.2f} | ({reason})")
 
     if not cash_rows.empty:
         print("\n[PHASE 4: CASH PROXY & LIQUIDITY MANAGEMENT (第四阶段: 闲置资金对账)]")

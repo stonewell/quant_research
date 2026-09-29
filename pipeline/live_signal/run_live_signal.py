@@ -75,6 +75,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--current-holdings-file", type=str, default=None,
                    help="Path to a JSON file with the same {symbol: weight_fraction} shape as --current-holdings.")
     p.add_argument("--top-n", type=int, default=5, help="How many top buy candidates to highlight (ranked by target weight)")
+    p.add_argument("--portfolio-value", type=float, default=None,
+                   help="Total portfolio NAV in account currency. When provided alongside --current-holdings "
+                        "with share quantities, stock weights and residual cash are automatically calculated.")
     p.add_argument("--action-threshold", type=float, default=1e-6,
                    help="Minimum |weight delta| to count as a buy/sell rather than a hold (default: 1e-6)")
     p.add_argument("--interval", default="1d")
@@ -122,8 +125,13 @@ def main():
     if not universe_symbols:
         raise ValueError("No universe symbols provided or resolved. Pass --universe, --universe-file, or --universe-provider.")
 
+    holdings = _load_current_holdings(args)
+    cash_proxy = params.get("cash_proxy", "BIL")
+    held_symbols = [s.strip() for s in (holdings.keys() if holdings else []) if s.strip() not in (cash_proxy, "BIL", "CASH")]
+    symbols_to_load = sorted(list(set(universe_symbols).union(set(held_symbols))))
+
     universe = load_universe_with_banner(
-        universe_symbols, start, as_of_date, args.interval,
+        symbols_to_load, start, as_of_date, args.interval,
         use_cache=not args.no_cache, cache_dir=cache_dir,
         data_kwargs=build_data_kwargs(args), require_nonempty=True,
     )
@@ -156,14 +164,32 @@ def main():
     current_row = rebalances.iloc[-1]
     current_date = rebalances.index[-1]
 
-    holdings = _load_current_holdings(args)
     if holdings is not None:
-        # Intentionally NOT reindexed to current_row's own index here --
-        # a symbol the user actually holds that the strategy's universe
-        # doesn't cover must still show up as a full sell (compute_rebalance_
-        # instruction's own union-of-symbols alignment handles that).
-        reference = pd.Series(holdings, dtype=float)
-        reference_source = "user-supplied current holdings"
+        # Check if user provided share counts (e.g. any value > 1.0 or explicit portfolio_value)
+        non_cash = {k: float(v) for k, v in holdings.items() if k not in (cash_proxy, "BIL", "CASH")}
+        is_qty_mode = False
+        if args.portfolio_value is not None and non_cash:
+            if any(v > 1.0 for v in non_cash.values()) or any(isinstance(v, int) for v in holdings.values()):
+                is_qty_mode = True
+        elif any(v > 1.0 for v in non_cash.values()):
+            is_qty_mode = True
+
+        if is_qty_mode:
+            port_val = args.portfolio_value or 100000.0
+            tot_eq = 0.0
+            h_weights = {}
+            for sym, qty in non_cash.items():
+                price = float(universe[sym]["Close"].iloc[-1]) if (sym in universe and not universe[sym].empty) else 0.0
+                val = qty * price
+                tot_eq += val
+                h_weights[sym] = val / port_val
+            cash_val = max(0.0, port_val - tot_eq)
+            h_weights[cash_proxy] = cash_val / port_val
+            reference = pd.Series(h_weights, dtype=float)
+            reference_source = f"user-supplied current holdings (calculated from share counts & NAV ¥{port_val:,.2f})"
+        else:
+            reference = pd.Series(holdings, dtype=float)
+            reference_source = "user-supplied current holdings"
     elif len(rebalances) >= 2:
         reference = rebalances.iloc[-2].fillna(0.0)
         reference_source = "strategy's own previous rebalance"
