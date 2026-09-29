@@ -10,6 +10,7 @@ Provides BaseDataProvider implementations:
 
 from __future__ import annotations
 
+import datetime
 import os
 import re
 import sys
@@ -131,6 +132,62 @@ def normalize_thscode(symbol: str) -> str:
         return f"{sym}.SZ"
 
     return sym
+
+
+_TRADING_DAYS_CACHE: Optional[set[datetime.date]] = None
+
+
+def get_trading_days_calendar() -> set[datetime.date]:
+    """Retrieves and caches China A-share exchange trading days from fuyao_client."""
+    global _TRADING_DAYS_CACHE
+    if _TRADING_DAYS_CACHE is not None:
+        return _TRADING_DAYS_CACHE
+
+    try:
+        import fuyao_client
+        raw_items = fuyao_client.calendar_trading_days()
+        days: set[datetime.date] = set()
+        for item in raw_items:
+            ms = item.get("date_ms")
+            if ms:
+                d = pd.to_datetime(ms, unit="ms", utc=True).tz_convert("Asia/Shanghai").date()
+                days.add(d)
+        if days:
+            _TRADING_DAYS_CACHE = days
+            return _TRADING_DAYS_CACHE
+    except Exception:
+        pass
+
+    return set()
+
+
+def check_missing_trading_days(
+    latest_retrieved_date: datetime.date,
+    target_end_date: datetime.date,
+) -> list[datetime.date]:
+    """Returns a list of missing trading days in the open-closed interval (latest_retrieved_date, target_end_date].
+
+    If all days in the interval are non-trading days (weekends or official holidays), returns an empty list.
+    """
+    if target_end_date <= latest_retrieved_date:
+        return []
+
+    # Candidate calendar dates in (latest_retrieved_date, target_end_date]
+    delta = (target_end_date - latest_retrieved_date).days
+    candidates = [latest_retrieved_date + datetime.timedelta(days=i) for i in range(1, delta + 1)]
+
+    # Fast path: if all candidate dates are Saturday (5) or Sunday (6), no trading days are missed
+    if all(d.weekday() in (5, 6) for d in candidates):
+        return []
+
+    calendar = get_trading_days_calendar()
+    # If official calendar is available and covers up to target_end_date, use it to accurately filter holidays
+    if calendar and max(calendar) >= target_end_date:
+        return [d for d in candidates if d in calendar]
+
+    # Fallback when official calendar is unavailable or does not reach target date:
+    # consider non-weekend days (Monday..Friday) as candidate trading days
+    return [d for d in candidates if d.weekday() not in (5, 6)]
 
 
 def _resolve_duckdb_path(folder_path: Optional[str] = None, db_path: Optional[str] = None) -> Optional[str]:
@@ -400,24 +457,14 @@ class FuyaoDataProvider(BaseDataProvider):
             except Exception:
                 self._local_provider = None
 
-    def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+    def _fetch_remote_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+        """Fetches OHLCV directly from the Fuyao REST API via fuyao_client."""
         if interval != "1d":
             raise ValueError(f"FuyaoDataProvider only supports interval='1d', got '{interval}'")
 
         thscode = normalize_thscode(symbol)
         _validate_symbol_for_path(thscode)
 
-        # 1. Try local DuckDB if prefer_local is enabled
-        if self._local_provider is not None:
-            try:
-                df = self._local_provider.fetch_ohlcv(thscode, start, end, interval)
-                if not df.empty:
-                    return df
-            except Exception:
-                # Fallback to REST API
-                pass
-
-        # 2. Remote REST API
         start_dt = pd.to_datetime(start) if start else pd.to_datetime("2015-01-01")
         end_dt = pd.to_datetime(end) if end else pd.Timestamp.now()
         start_dt_cst = start_dt.tz_localize("Asia/Shanghai") if start_dt.tzinfo is None else start_dt.tz_convert("Asia/Shanghai")
@@ -562,27 +609,144 @@ class FuyaoDataProvider(BaseDataProvider):
 
         return df
 
+    def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+        if interval != "1d":
+            raise ValueError(f"FuyaoDataProvider only supports interval='1d', got '{interval}'")
+
+        thscode = normalize_thscode(symbol)
+        _validate_symbol_for_path(thscode)
+
+        now_cst = pd.Timestamp.now(tz="Asia/Shanghai").normalize().tz_localize(None)
+        target_end_dt = pd.to_datetime(end).normalize() if end else now_cst
+        effective_target_end = min(target_end_dt, now_cst) if target_end_dt > now_cst else target_end_dt
+
+        # 1. Try local DuckDB if prefer_local is enabled
+        local_df: Optional[pd.DataFrame] = None
+        if self._local_provider is not None:
+            try:
+                df = self._local_provider.fetch_ohlcv(thscode, start, end, interval)
+                if not df.empty:
+                    local_df = df
+            except Exception:
+                local_df = None
+
+        if local_df is None:
+            final_df = self._fetch_remote_ohlcv(symbol, start, end, interval)
+        else:
+            local_max_date = local_df.index[-1]
+            if local_max_date >= effective_target_end:
+                final_df = local_df
+            else:
+                # Local data ends before effective target end; fetch incremental bars from Fuyao REST API
+                try:
+                    inc_start_str = local_max_date.strftime("%Y-%m-%d")
+                    remote_df = self._fetch_remote_ohlcv(symbol, inc_start_str, end, interval)
+                    if not remote_df.empty:
+                        # Re-scale local data if a corporate action changed the forward-adjustment factor
+                        if local_max_date in remote_df.index:
+                            loc_c = local_df.loc[local_max_date, "Close"]
+                            rem_c = remote_df.loc[local_max_date, "Close"]
+                            if loc_c > 0 and abs(rem_c - loc_c) / loc_c > 1e-4:
+                                scale = rem_c / loc_c
+                                local_df[["Open", "High", "Low", "Close"]] *= scale
+                        final_df = pd.concat([local_df, remote_df])
+                        final_df = final_df[~final_df.index.duplicated(keep="last")].sort_index()
+                    else:
+                        final_df = local_df
+                except Exception as exc:
+                    if "No price data returned" not in str(exc):
+                        warnings.warn(
+                            f"Failed to fetch latest data for {symbol} from Fuyao API ({exc}); "
+                            f"falling back to local MarketDB data up to {local_max_date.strftime('%Y-%m-%d')}."
+                        )
+                    final_df = local_df
+
+        # Calendar-aware warning if query date is newer than retrieved data
+        if not final_df.empty:
+            retrieved_latest_date = final_df.index[-1].date()
+            query_target_date = target_end_dt.date()
+            if query_target_date > retrieved_latest_date:
+                missed = check_missing_trading_days(retrieved_latest_date, query_target_date)
+                if missed:
+                    missed_str = [d.strftime("%Y-%m-%d") for d in missed]
+                    warnings.warn(
+                        f"Query date '{query_target_date.strftime('%Y-%m-%d')}' is newer than "
+                        f"retrieved data range latest date '{retrieved_latest_date.strftime('%Y-%m-%d')}' "
+                        f"for {symbol} ({thscode}) (missing trading days: {missed_str})."
+                    )
+
+        return final_df
+
     def fetch_universe(
         self, symbols: List[str], start: str, end: str, interval: str = "1d"
     ) -> Dict[str, pd.DataFrame]:
-        # If local DuckDB covers all symbols, use fast batch fetch
+        if interval != "1d":
+            raise ValueError(f"FuyaoDataProvider only supports interval='1d', got '{interval}'")
+
+        if not symbols:
+            return {}
+
+        now_cst = pd.Timestamp.now(tz="Asia/Shanghai").normalize().tz_localize(None)
+        target_end_dt = pd.to_datetime(end).normalize() if end else now_cst
+        effective_target_end = min(target_end_dt, now_cst) if target_end_dt > now_cst else target_end_dt
+        query_target_date = target_end_dt.date()
+
+        # If local DuckDB is available, batch-fetch what is locally available
+        local_results: Dict[str, pd.DataFrame] = {}
         if self._local_provider is not None:
             try:
                 local_results = self._local_provider.fetch_universe(symbols, start, end, interval)
-                missing = [s for s in symbols if s not in local_results]
-                if not missing:
-                    return local_results
-                # If only partial, fetch remainder via individual fetch_ohlcv
-                for s in missing:
-                    try:
-                        local_results[s] = self.fetch_ohlcv(s, start, end, interval)
-                    except Exception as exc:
-                        warnings.warn(f"Skipping {s}: {exc}")
-                return local_results
             except Exception:
-                pass
+                local_results = {}
 
-        return super().fetch_universe(symbols, start, end, interval)
+        result: Dict[str, pd.DataFrame] = {}
+        for s in symbols:
+            thscode = normalize_thscode(s)
+            if s in local_results:
+                df = local_results[s]
+                if not df.empty and df.index[-1] < effective_target_end:
+                    local_max_date = df.index[-1]
+                    try:
+                        inc_start_str = local_max_date.strftime("%Y-%m-%d")
+                        remote_df = self._fetch_remote_ohlcv(s, inc_start_str, end, interval)
+                        if not remote_df.empty:
+                            if local_max_date in remote_df.index:
+                                loc_c = df.loc[local_max_date, "Close"]
+                                rem_c = remote_df.loc[local_max_date, "Close"]
+                                if loc_c > 0 and abs(rem_c - loc_c) / loc_c > 1e-4:
+                                    scale = rem_c / loc_c
+                                    df[["Open", "High", "Low", "Close"]] *= scale
+                            df = pd.concat([df, remote_df])
+                            df = df[~df.index.duplicated(keep="last")].sort_index()
+                    except Exception as exc:
+                        if "No price data returned" not in str(exc):
+                            warnings.warn(
+                                f"Failed to fetch latest data for {s} from Fuyao API ({exc}); "
+                                f"using local MarketDB data up to {local_max_date.strftime('%Y-%m-%d')}."
+                            )
+                result[s] = df
+            else:
+                try:
+                    result[s] = self.fetch_ohlcv(s, start, end, interval)
+                except Exception as exc:
+                    warnings.warn(f"Skipping {s}: {exc}")
+
+            # Warning check for symbols that came from local_results (fetch_ohlcv already checks for others)
+            if s in result and s in local_results:
+                df = result[s]
+                if not df.empty:
+                    retrieved_latest_date = df.index[-1].date()
+                    if query_target_date > retrieved_latest_date:
+                        missed = check_missing_trading_days(retrieved_latest_date, query_target_date)
+                        if missed:
+                            missed_str = [d.strftime("%Y-%m-%d") for d in missed]
+                            warnings.warn(
+                                f"Query date '{query_target_date.strftime('%Y-%m-%d')}' is newer than "
+                                f"retrieved data range latest date '{retrieved_latest_date.strftime('%Y-%m-%d')}' "
+                                f"for {s} ({thscode}) (missing trading days: {missed_str})."
+                            )
+
+        return result
 
     def fetch_metadata(self, symbol: str) -> dict:
         result = {

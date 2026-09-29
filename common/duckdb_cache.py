@@ -235,15 +235,36 @@ class DuckDBCache:
         # End coverage check
         current_time = now if now is not None else pd.Timestamp.now()
         current_date = current_time.date()
-        if end:
-            req_end_date = pd.to_datetime(end).date()
-            if req_end_date > current_date:
-                # End is in the future; data up to today covers as much as possible
-                end_covered = (current_date - latest_avail) <= datetime.timedelta(days=7)
+        req_end_date = pd.to_datetime(end).date() if end else current_date
+
+        last_sync = meta.get("last_sync_time")
+        if isinstance(last_sync, (datetime.datetime, pd.Timestamp)):
+            last_sync_date = last_sync.date()
+        elif last_sync is not None:
+            last_sync_date = pd.to_datetime(last_sync).date()
+        else:
+            last_sync_date = None
+
+        if req_end_date >= current_date:
+            # End is today or in the future
+            if latest_avail >= current_date:
+                end_covered = True
+            elif (
+                last_sync_date is not None
+                and last_sync_date >= current_date
+                and (current_date - latest_avail) <= datetime.timedelta(days=7)
+            ):
+                # Already synced today; recent latest_avail (within weekend/holiday tolerance) is as fresh as possible
+                end_covered = True
+            else:
+                # Has not been synced today; re-query upstream for today's market data
+                end_covered = False
+        else:
+            # End is in the past (historical query)
+            if latest_avail >= req_end_date:
+                end_covered = True
             else:
                 end_covered = (req_end_date - latest_avail) <= datetime.timedelta(days=7)
-        else:
-            end_covered = True
 
         if not (start_covered and end_covered):
             return False

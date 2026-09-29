@@ -193,3 +193,24 @@ def test_file_based_cache_persistence(tmp_path):
     retrieved = cache2.query_bars("DiskProvider", "MSFT")
     assert len(retrieved) == 5
     assert retrieved["Close"].iloc[0] == 101.0
+
+
+def test_is_range_covered_checks_last_sync_time_for_latest_data(mem_cache):
+    """Verifies that DuckDBCache.is_range_covered checks last_sync_time when
+    end is omitted (end=None) or today, so next-day queries refresh data.
+    """
+    df = _make_sample_ohlcv("2024-01-01", periods=2)  # 2024-01-01 and 2024-01-02
+    yesterday_sync = datetime.datetime(2024, 1, 2, 16, 0)
+    today_time = pd.Timestamp("2024-01-03 10:00:00")
+
+    mem_cache.store_bars("TestProvider", "AAPL", df, sync_time=yesterday_sync)
+
+    # 1. On today (2024-01-03), last sync was yesterday (2024-01-02), so cache is NOT covered
+    assert mem_cache.is_range_covered("TestProvider", "AAPL", start="2024-01-01", end=None, now=today_time) is False
+    assert mem_cache.is_range_covered("TestProvider", "AAPL", start="2024-01-01", end="2024-01-03", now=today_time) is False
+
+    # 2. Once synced today (2024-01-03), it is covered
+    today_sync = datetime.datetime(2024, 1, 3, 15, 30)
+    mem_cache.store_bars("TestProvider", "AAPL", df, sync_time=today_sync)
+    assert mem_cache.is_range_covered("TestProvider", "AAPL", start="2024-01-01", end=None, now=today_time) is True
+    assert mem_cache.is_range_covered("TestProvider", "AAPL", start="2024-01-01", end="2024-01-03", now=today_time) is True

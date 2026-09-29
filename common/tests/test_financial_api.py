@@ -390,3 +390,263 @@ def test_provider_registration_and_caching(tmp_path, in_memory_marketdb):
     # Second fetch is served from DuckDB cache
     df2 = cached.fetch_ohlcv("600519.SH", start="2024-01-01", end="2024-01-05")
     pd.testing.assert_frame_equal(df, df2)
+
+
+def test_fuyao_provider_downloads_latest_data_when_marketdb_stale():
+    """Verify FuyaoDataProvider downloads incremental latest data from Fuyao API
+    when local MarketDB is stale.
+    """
+    import duckdb
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE v_daily_qfq (thscode VARCHAR, date DATE, open DOUBLE, low DOUBLE, high DOUBLE, close DOUBLE, volume DOUBLE)")
+    # Local DuckDB only has 2024-01-01 and 2024-01-02
+    con.execute("INSERT INTO v_daily_qfq VALUES ('600519.SH', '2024-01-01', 100.0, 95.0, 105.0, 101.0, 1000.0)")
+    con.execute("INSERT INTO v_daily_qfq VALUES ('600519.SH', '2024-01-02', 101.0, 96.0, 106.0, 102.0, 1100.0)")
+
+    provider = FuyaoDataProvider(prefer_local=True)
+    provider._local_provider = MarketDBDataProvider(con=con)
+
+    # Fuyao REST API returns incremental bars starting from overlap date 2024-01-02 up to 2024-01-04
+    mock_items = [
+        {
+            "date_ms": 1704153600000,  # 2024-01-02
+            "open_price": 101.0,
+            "high_price": 106.0,
+            "low_price": 96.0,
+            "close_price": 102.0,
+            "volume": 1100.0,
+        },
+        {
+            "date_ms": 1704240000000,  # 2024-01-03
+            "open_price": 102.0,
+            "high_price": 107.0,
+            "low_price": 100.0,
+            "close_price": 105.0,
+            "volume": 1200.0,
+        },
+        {
+            "date_ms": 1704326400000,  # 2024-01-04
+            "open_price": 105.0,
+            "high_price": 110.0,
+            "low_price": 104.0,
+            "close_price": 108.0,
+            "volume": 1500.0,
+        },
+    ]
+
+    mock_fuyao = MagicMock()
+    mock_fuyao.prices_historical.return_value = mock_items
+
+    with patch.dict(sys.modules, {"fuyao_client": mock_fuyao}):
+        df = provider.fetch_ohlcv("600519.SH", start="2024-01-01", end="2024-01-04")
+        mock_fuyao.prices_historical.assert_called_once()
+        assert len(df) == 4
+        assert df.index[0] == pd.Timestamp("2024-01-01")
+        assert df.index[-1] == pd.Timestamp("2024-01-04")
+        assert df.loc[pd.Timestamp("2024-01-04"), "Close"] == 108.0
+
+    con.close()
+
+
+def test_fuyao_provider_warns_when_query_date_newer_than_retrieved_latest_date():
+    """Verify a UserWarning is emitted when query date is newer than retrieved data range latest date
+    and trading days occurred in between.
+    """
+    import duckdb
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE v_daily_qfq (thscode VARCHAR, date DATE, open DOUBLE, low DOUBLE, high DOUBLE, close DOUBLE, volume DOUBLE)")
+    # Local DuckDB only has up to Thursday 2024-01-04
+    con.execute("INSERT INTO v_daily_qfq VALUES ('600519.SH', '2024-01-04', 100.0, 95.0, 105.0, 101.0, 1000.0)")
+
+    provider = FuyaoDataProvider(prefer_local=True)
+    provider._local_provider = MarketDBDataProvider(con=con)
+
+    mock_fuyao = MagicMock()
+    # API has no newer data (returns empty items or only up to 2024-01-04)
+    mock_fuyao.prices_historical.return_value = [
+        {"date_ms": 1704326400000, "open_price": 100.0, "high_price": 105.0, "low_price": 95.0, "close_price": 101.0, "volume": 1000.0}
+    ]
+
+    with patch.dict(sys.modules, {"fuyao_client": mock_fuyao}):
+        # Query date is Wednesday 2024-01-10; intervening weekdays (Friday Jan 5, Mon Jan 8, Tue Jan 9, Wed Jan 10) are trading days
+        with pytest.warns(UserWarning, match="newer than retrieved data range latest date"):
+            df = provider.fetch_ohlcv("600519.SH", start="2024-01-01", end="2024-01-10")
+            assert df.index[-1] == pd.Timestamp("2024-01-04")
+
+    con.close()
+
+
+def test_fuyao_provider_suppresses_warning_on_weekends_and_holidays():
+    """Verify warning is suppressed when query date falls on a weekend or holiday with no missed trading days."""
+    import duckdb
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE v_daily_qfq (thscode VARCHAR, date DATE, open DOUBLE, low DOUBLE, high DOUBLE, close DOUBLE, volume DOUBLE)")
+    # Friday 2024-01-05 bar
+    con.execute("INSERT INTO v_daily_qfq VALUES ('600519.SH', '2024-01-05', 100.0, 95.0, 105.0, 101.0, 1000.0)")
+
+    provider = FuyaoDataProvider(prefer_local=True)
+    provider._local_provider = MarketDBDataProvider(con=con)
+
+    mock_fuyao = MagicMock()
+    mock_fuyao.prices_historical.return_value = [
+        {"date_ms": 1704412800000, "open_price": 100.0, "high_price": 105.0, "low_price": 95.0, "close_price": 101.0, "volume": 1000.0}
+    ]
+
+    with patch.dict(sys.modules, {"fuyao_client": mock_fuyao}):
+        # Case 1: Querying on Sunday 2024-01-07 when latest bar is Friday 2024-01-05
+        # Intervening days are Saturday Jan 6 and Sunday Jan 7 -> NO warning must be emitted
+        import warnings
+        with warnings.catch_warnings(record=True) as record:
+            warnings.simplefilter("always")
+            df = provider.fetch_ohlcv("600519.SH", start="2024-01-01", end="2024-01-07")
+            assert df.index[-1] == pd.Timestamp("2024-01-05")
+            lag_warnings = [w for w in record if "newer than retrieved data range latest date" in str(w.message)]
+            assert len(lag_warnings) == 0, f"Expected 0 warnings for weekend query, got: {lag_warnings}"
+
+        # Case 2: Querying across a statutory holiday (mocked trading calendar without the holiday)
+        # Friday 2023-12-29 retrieved, query is Monday 2024-01-01 (New Year holiday)
+        con.execute("DELETE FROM v_daily_qfq")
+        con.execute("INSERT INTO v_daily_qfq VALUES ('600519.SH', '2023-12-29', 100.0, 95.0, 105.0, 101.0, 1000.0)")
+        # Calendar only has 2023-12-29 and 2024-01-02 (2024-01-01 is a market holiday)
+        mock_fuyao.calendar_trading_days.return_value = [
+            {"date_ms": int(pd.Timestamp("2023-12-29", tz="Asia/Shanghai").timestamp() * 1000)},
+            {"date_ms": int(pd.Timestamp("2024-01-02", tz="Asia/Shanghai").timestamp() * 1000)},
+        ]
+        # Clear module calendar cache for clean test
+        import common.financial_api as fa
+        fa._TRADING_DAYS_CACHE = None
+
+        with warnings.catch_warnings(record=True) as record:
+            warnings.simplefilter("always")
+            df = provider.fetch_ohlcv("600519.SH", start="2023-12-01", end="2024-01-01")
+            lag_warnings = [w for w in record if "newer than retrieved data range latest date" in str(w.message)]
+            assert len(lag_warnings) == 0, f"Expected 0 warnings for holiday query, got: {lag_warnings}"
+
+    con.close()
+
+
+def test_fuyao_provider_rescales_on_corporate_action():
+    """Verify historical bars are properly re-scaled when a corporate action (e.g. split)
+    changed the forward adjustment factor between the local snapshot and remote API.
+    """
+    import duckdb
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE v_daily_qfq (thscode VARCHAR, date DATE, open DOUBLE, low DOUBLE, high DOUBLE, close DOUBLE, volume DOUBLE)")
+    # Local data prior to 1-for-2 split: 2024-01-01 Close=100.0, 2024-01-02 Close=100.0
+    con.execute("INSERT INTO v_daily_qfq VALUES ('600519.SH', '2024-01-01', 98.0, 96.0, 102.0, 100.0, 1000.0)")
+    con.execute("INSERT INTO v_daily_qfq VALUES ('600519.SH', '2024-01-02', 100.0, 98.0, 104.0, 100.0, 1000.0)")
+
+    provider = FuyaoDataProvider(prefer_local=True)
+    provider._local_provider = MarketDBDataProvider(con=con)
+
+    # Remote API returns after split: Close on 2024-01-02 is adjusted to 50.0 (scale = 0.5)
+    mock_items = [
+        {
+            "date_ms": 1704153600000,  # 2024-01-02
+            "open_price": 50.0,
+            "high_price": 52.0,
+            "low_price": 49.0,
+            "close_price": 50.0,
+            "volume": 2000.0,
+        },
+        {
+            "date_ms": 1704240000000,  # 2024-01-03
+            "open_price": 51.0,
+            "high_price": 53.0,
+            "low_price": 50.0,
+            "close_price": 52.0,
+            "volume": 2200.0,
+        },
+    ]
+    mock_fuyao = MagicMock()
+    mock_fuyao.prices_historical.return_value = mock_items
+
+    with patch.dict(sys.modules, {"fuyao_client": mock_fuyao}):
+        df = provider.fetch_ohlcv("600519.SH", start="2024-01-01", end="2024-01-03")
+        assert len(df) == 3
+        # 2024-01-01 historical Close was rescaled from 100.0 * 0.5 = 50.0
+        assert df.loc[pd.Timestamp("2024-01-01"), "Close"] == 50.0
+        assert df.loc[pd.Timestamp("2024-01-02"), "Close"] == 50.0
+        assert df.loc[pd.Timestamp("2024-01-03"), "Close"] == 52.0
+
+    con.close()
+
+
+def test_fuyao_provider_fetch_universe_incremental_sync():
+    """Verify fetch_universe incrementally fetches latest data for stale symbols
+    and loads missing symbols fully.
+    """
+    import duckdb
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE v_daily_qfq (thscode VARCHAR, date DATE, open DOUBLE, low DOUBLE, high DOUBLE, close DOUBLE, volume DOUBLE)")
+    con.execute("INSERT INTO v_daily_qfq VALUES ('600519.SH', '2024-01-01', 100.0, 95.0, 105.0, 101.0, 1000.0)")
+
+    provider = FuyaoDataProvider(prefer_local=True)
+    provider._local_provider = MarketDBDataProvider(con=con)
+
+    mock_items_stock = [
+        {"date_ms": 1704067200000, "open_price": 100.0, "high_price": 105.0, "low_price": 95.0, "close_price": 101.0, "volume": 1000.0},
+        {"date_ms": 1704153600000, "open_price": 101.0, "high_price": 106.0, "low_price": 98.0, "close_price": 103.0, "volume": 1100.0},
+    ]
+    mock_items_index = [
+        {"date_ms": 1704067200000, "open_price": 3000.0, "high_price": 3050.0, "low_price": 2980.0, "close_price": 3020.0, "volume": 50000.0},
+        {"date_ms": 1704153600000, "open_price": 3020.0, "high_price": 3060.0, "low_price": 3000.0, "close_price": 3040.0, "volume": 52000.0},
+    ]
+
+    mock_fuyao = MagicMock()
+    mock_fuyao.prices_historical.return_value = mock_items_stock
+    mock_fuyao.index_prices_historical.return_value = mock_items_index
+
+    with patch.dict(sys.modules, {"fuyao_client": mock_fuyao}):
+        uni = provider.fetch_universe(["600519.SH", "000300.SH"], start="2024-01-01", end="2024-01-02")
+        assert "600519.SH" in uni
+        assert "000300.SH" in uni
+        assert len(uni["600519.SH"]) == 2
+        assert len(uni["000300.SH"]) == 2
+
+    con.close()
+
+
+def test_fuyao_provider_graceful_fallback_when_api_fails():
+    """Verify FuyaoDataProvider warns and gracefully falls back to local data if Fuyao API errors."""
+    import duckdb
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE v_daily_qfq (thscode VARCHAR, date DATE, open DOUBLE, low DOUBLE, high DOUBLE, close DOUBLE, volume DOUBLE)")
+    con.execute("INSERT INTO v_daily_qfq VALUES ('600519.SH', '2024-01-01', 100.0, 95.0, 105.0, 101.0, 1000.0)")
+
+    provider = FuyaoDataProvider(prefer_local=True)
+    provider._local_provider = MarketDBDataProvider(con=con)
+
+    mock_fuyao = MagicMock()
+    mock_fuyao.prices_historical.side_effect = RuntimeError("Network connection error")
+
+    with patch.dict(sys.modules, {"fuyao_client": mock_fuyao}):
+        with pytest.warns(UserWarning, match="Failed to fetch latest data"):
+            df = provider.fetch_ohlcv("600519.SH", start="2024-01-01", end="2024-01-05")
+            assert len(df) == 1
+            assert df.index[0] == pd.Timestamp("2024-01-01")
+
+    con.close()
+
+
+def test_fuyao_provider_local_already_fresh_skips_api():
+    """Verify FuyaoDataProvider skips calling the remote API when local MarketDB already covers target."""
+    import duckdb
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE v_daily_qfq (thscode VARCHAR, date DATE, open DOUBLE, low DOUBLE, high DOUBLE, close DOUBLE, volume DOUBLE)")
+    con.execute("INSERT INTO v_daily_qfq VALUES ('600519.SH', '2024-01-01', 100.0, 95.0, 105.0, 101.0, 1000.0)")
+    con.execute("INSERT INTO v_daily_qfq VALUES ('600519.SH', '2024-01-02', 101.0, 96.0, 106.0, 102.0, 1100.0)")
+    con.execute("INSERT INTO v_daily_qfq VALUES ('600519.SH', '2024-01-03', 102.0, 97.0, 107.0, 103.0, 1200.0)")
+
+    provider = FuyaoDataProvider(prefer_local=True)
+    provider._local_provider = MarketDBDataProvider(con=con)
+
+    mock_fuyao = MagicMock()
+
+    with patch.dict(sys.modules, {"fuyao_client": mock_fuyao}):
+        df = provider.fetch_ohlcv("600519.SH", start="2024-01-01", end="2024-01-02")
+        mock_fuyao.prices_historical.assert_not_called()
+        assert len(df) == 2
+
+    con.close()
+
