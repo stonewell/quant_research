@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>实盘量化交易与风控部署平台 | Live Trading Station</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📈</text></svg>">
+</head>
+<body>
+    <!-- Top Header -->
+    <header class="app-header">
+        <div class="header-brand">
+            <span class="brand-icon">📈</span>
+            <div class="brand-title">
+                <h1>Live Trading Station</h1>
+                <span class="brand-subtitle">实盘量化交易·风控闸口·指令生成</span>
+            </div>
+        </div>
+
+        <!-- Global Operational Bar -->
+        <div class="header-controls">
+            <div class="control-item">
+                <label for="select-strategy">策略配置 (Strategy)</label>
+                <select id="select-strategy" class="form-input"></select>
+            </div>
+            <div class="control-item">
+                <label for="input-as-of-date">估值基准日 (Date)</label>
+                <input type="date" id="input-as-of-date" class="form-input">
+            </div>
+            <div class="control-item">
+                <label for="input-portfolio-value">账户净值 (NAV)</label>
+                <input type="number" id="input-portfolio-value" class="form-input" value="100000" step="1000">
+            </div>
+            <div class="control-item">
+                <label for="input-peak-nav">历史高位 (HWM)</label>
+                <input type="number" id="input-peak-nav" class="form-input" placeholder="自动读取" step="1000">
+            </div>
+            <div class="control-item">
+                <label for="select-provider">行情源 (Provider)</label>
+                <select id="select-provider" class="form-input">
+                    <option value="synthetic">Synthetic (合成回测)</option>
+                    <option value="marketdb">MarketDB (本地快照)</option>
+                    <option value="fuyao">Fuyao (复爻行情)</option>
+                    <option value="yfinance">Yahoo Finance</option>
+                </select>
+            </div>
+            <div class="header-actions">
+                <button id="btn-show-all-segments" class="btn btn-secondary" title="显示全部四大板块 (标的、持仓、风控、指令)">
+                    <span class="icon">📑</span> 全部板块
+                </button>
+                <button id="btn-run-health" class="btn btn-warning" title="运行第一阶段宏观与账户健康门禁">
+                    <span class="icon">🛡️</span> 1. 健康门禁
+                </button>
+                <button id="btn-run-deploy" class="btn btn-primary" title="运行第二阶段实盘调仓指令生成">
+                    <span class="icon">🚀</span> 2. 生成指令
+                </button>
+                <button id="btn-run-all" class="btn btn-success" title="一键全流程执行">
+                    <span class="icon">⚡</span> 全流程运行
+                </button>
+                <button id="btn-open-settings" class="btn btn-secondary btn-icon" title="系统路径与设置">
+                    ⚙️
+                </button>
+            </div>
+        </div>
+    </header>
+
+    <!-- Mobile Navigation Tab Bar (Visible on mobile/tablet) -->
+    <nav class="mobile-tabs" id="mobile-tabs">
+        <button class="mobile-tab active" data-tab="tab-all" id="tab-btn-all">📑 全部</button>
+        <button class="mobile-tab" data-tab="tab-setup">⚙️ 标的</button>
+        <button class="mobile-tab" data-tab="tab-holdings">💼 持仓</button>
+        <button class="mobile-tab" data-tab="tab-health">🛡️ 风控</button>
+        <button class="mobile-tab" data-tab="tab-orders">📋 指令</button>
+        <button class="mobile-tab" data-tab="tab-history">📅 归档</button>
+    </nav>
+
+    <!-- Main Workspace Container -->
+    <main class="app-workspace">
+        <!-- Left Column: Inputs (Universe & Current Holdings) -->
+        <section class="panel-left" id="panel-left">
+            <!-- Section 1: Universe Selection -->
+            <div class="card universe-card" id="card-universe">
+                <div class="card-header">
+                    <h2><span class="icon">🎯</span> 标的池配置 (Universe)</h2>
+                    <span class="badge" id="badge-universe-count">0 标的</span>
+                </div>
+                <div class="card-body">
+                    <div class="form-group">
+                        <label for="select-universe">预设与自选标的池 (Preset / Custom):</label>
+                        <select id="select-universe" class="form-input"></select>
+                    </div>
+                    <div class="form-group">
+                        <div class="label-row">
+                            <label for="textarea-custom-symbols">标的代码列表 (用空格、换行或逗号分隔):</label>
+                            <button id="btn-save-custom-universe" class="btn-text" title="将当前代码列表存为常用自选池">
+                                💾 保存为自选池
+                            </button>
+                        </div>
+                        <textarea id="textarea-custom-symbols" class="form-textarea" rows="4" placeholder="例如: 601872.SH, 601728.SH, 300394.SZ, BIL"></textarea>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Section 2: Interactive Holdings Management -->
+            <div class="card holdings-card" id="card-holdings">
+                <div class="card-header">
+                    <h2><span class="icon">💼</span> 当前实盘持仓 (Holdings)</h2>
+                    <div class="card-actions">
+                        <button id="btn-add-holding" class="btn btn-secondary btn-sm">➕ 增持标的</button>
+                        <button id="btn-save-holdings" class="btn btn-primary btn-sm">💾 保存持仓</button>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <div class="holdings-summary-bar">
+                        <div class="sum-item">
+                            <span class="sum-label">股票持仓市值:</span>
+                            <span class="sum-value" id="val-holdings-equity">¥0.00</span>
+                        </div>
+                        <div class="sum-item">
+                            <span class="sum-label">闲置可用现金:</span>
+                            <span class="sum-value text-success" id="val-holdings-cash">¥100,000.00</span>
+                        </div>
+                        <div class="sum-item">
+                            <span class="sum-label">现金占比:</span>
+                            <span class="sum-value" id="val-holdings-cash-ratio">100.0%</span>
+                        </div>
+                    </div>
+
+                    <div class="table-container holdings-table-container">
+                        <table class="data-table" id="table-holdings">
+                            <thead>
+                                <tr>
+                                    <th>标的代码</th>
+                                    <th>持仓股数 (股)</th>
+                                    <th>或目标权重 (%)</th>
+                                    <th>最新参考价</th>
+                                    <th>持仓市值</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="tbody-holdings">
+                                <!-- Dynamic rows -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Right Column: Outputs (Stage 1 Health, Stage 2 Ticket, Daily Archive) -->
+        <section class="panel-right" id="panel-right">
+            <!-- Historical Date Quick Selector Bar -->
+            <div class="history-bar" id="history-bar">
+                <span class="history-label">📅 历史记录归档查看:</span>
+                <select id="select-history-date" class="form-input form-input-sm">
+                    <option value="">-- 选择历史日期查看实盘归档 --</option>
+                </select>
+                <button id="btn-load-date" class="btn btn-secondary btn-sm">查看该日归档</button>
+                <button id="btn-today-view" class="btn btn-secondary btn-sm" title="退出历史归档，展示全部四大核心板块">
+                    🔙 返回最新全貌 (4板块)
+                </button>
+            </div>
+
+            <!-- Stage 1 Health Card -->
+            <div class="card health-card" id="card-health">
+                <div class="card-header">
+                    <h2><span class="icon">🛡️</span> 第一阶段: 账户健康与宏观风控闸口 (Health Gate)</h2>
+                    <span id="badge-gate-directive" class="badge badge-lg badge-neutral">待运行 (AWAITING)</span>
+                </div>
+                <div class="card-body">
+                    <div class="metrics-grid">
+                        <div class="metric-card">
+                            <span class="m-title">实盘最大回撤 (Drawdown)</span>
+                            <span class="m-val" id="m-drawdown">--%</span>
+                            <span class="m-sub" id="m-peak-info">HWM: --</span>
+                        </div>
+                        <div class="metric-card">
+                            <span class="m-title">熔断等级 (Breaker Tier)</span>
+                            <span class="m-val" id="m-tier">NORMAL</span>
+                            <span class="m-sub" id="m-tier-scale">仓位乘数: 100%</span>
+                        </div>
+                        <div class="metric-card">
+                            <span class="m-title">50日市场宽度 (Breadth)</span>
+                            <span class="m-val" id="m-breadth">--%</span>
+                            <span class="m-sub">基准线: &ge; 30%</span>
+                        </div>
+                        <div class="metric-card">
+                            <span class="m-title">10日动量冲击 (Thrust)</span>
+                            <span class="m-val" id="m-thrust">--%</span>
+                            <span class="m-sub">基准线: &ge; 60%</span>
+                        </div>
+                        <div class="metric-card">
+                            <span class="m-title">21日实现波动率 (Vol)</span>
+                            <span class="m-val" id="m-vol">--%</span>
+                            <span class="m-sub" id="m-vol-scale">Barroso缩放: 1.00x</span>
+                        </div>
+                    </div>
+
+                    <div class="directive-box" id="directive-box">
+                        <div class="directive-title" id="directive-title">尚未执行健康检查</div>
+                        <div class="directive-desc" id="directive-desc">点击上方「1. 健康门禁」评估账户回撤梯级、连续冷却状态与市场宽度。</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Stage 2 Live Trading Ticket Card -->
+            <div class="card orders-card" id="card-orders">
+                <div class="card-header">
+                    <h2><span class="icon">📋</span> 第二阶段: 今日实盘调仓指令单 (Trading Ticket)</h2>
+                    <div class="card-actions">
+                        <button id="btn-download-csv" class="btn btn-secondary btn-sm" disabled>
+                            📥 导出工单 CSV
+                        </button>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <div class="ticket-status-bar" id="ticket-status-bar">
+                        <span id="ticket-summary-text">尚未生成今日调仓指令。请点击上方「2. 生成指令」按最新行情计算。</span>
+                    </div>
+
+                    <div class="table-container orders-table-container">
+                        <table class="data-table" id="table-orders">
+                            <thead>
+                                <tr>
+                                    <th>阶段 / 动作</th>
+                                    <th>标的代码</th>
+                                    <th>标的名称</th>
+                                    <th>现价</th>
+                                    <th>当前持仓</th>
+                                    <th>目标仓位</th>
+                                    <th>权重变动</th>
+                                    <th>交易股数</th>
+                                    <th>预估交易额</th>
+                                </tr>
+                            </thead>
+                            <tbody id="tbody-orders">
+                                <tr>
+                                    <td colspan="9" class="text-center text-muted">暂无调仓指令</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Execution Real-time Console Log Drawer -->
+            <div class="card console-card" id="card-console">
+                <div class="card-header console-header" id="console-toggle">
+                    <h2><span class="icon">💻</span> 执行控制台输出 (Terminal Output)</h2>
+                    <span class="console-indicator" id="console-status">就绪 (Idle)</span>
+                </div>
+                <div class="card-body console-body" id="console-body">
+                    <pre class="console-output" id="console-output">Live Trading Station ready. 等待指令执行...</pre>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- Mobile Sticky Action Footer Bar (Visible on mobile screens) -->
+    <div class="mobile-action-bar">
+        <button id="m-btn-run-health" class="btn btn-warning btn-sm">🛡️ 健康检查</button>
+        <button id="m-btn-run-deploy" class="btn btn-primary btn-sm">🚀 生成指令</button>
+        <button id="m-btn-save-holdings" class="btn btn-success btn-sm">💾 保存持仓</button>
+    </div>
+
+    <!-- Modal: Settings & Path Configuration -->
+    <div class="modal" id="modal-settings">
+        <div class="modal-dialog">
+            <div class="modal-header">
+                <h3>⚙️ 系统与路径配置 (Settings - Zero Hardcoded Paths)</h3>
+                <button class="btn-close" id="btn-close-settings">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>工作区根目录 (Repo Root):</label>
+                    <input type="text" id="cfg-repo-root" class="form-input">
+                </div>
+                <div class="form-group">
+                    <label>策略配置存储目录 (Strategy Dumps Dir):</label>
+                    <input type="text" id="cfg-strategy-dir" class="form-input">
+                </div>
+                <div class="form-group">
+                    <label>标的池定义目录 (Universe Dir):</label>
+                    <input type="text" id="cfg-universe-dir" class="form-input">
+                </div>
+                <div class="form-group">
+                    <label>持久化数据存储目录 (Base Data Dir):</label>
+                    <input type="text" id="cfg-data-dir" class="form-input">
+                </div>
+                <div class="form-group">
+                    <label>每日运行历史归档目录 (Archive Runs Dir):</label>
+                    <input type="text" id="cfg-archive-dir" class="form-input">
+                </div>
+                <div class="form-group">
+                    <label>第一阶段健康门禁脚本 (Stage 1 Script):</label>
+                    <input type="text" id="cfg-stage1-script" class="form-input">
+                </div>
+                <div class="form-group">
+                    <label>第二阶段调仓指令脚本 (Stage 2 Script):</label>
+                    <input type="text" id="cfg-stage2-script" class="form-input">
+                </div>
+                <div class="form-group">
+                    <label>Python 执行器 (Python Executable):</label>
+                    <input type="text" id="cfg-python-bin" class="form-input">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="btn-save-settings" class="btn btn-primary">保存配置</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal: Save Custom Universe -->
+    <div class="modal" id="modal-save-universe">
+        <div class="modal-dialog">
+            <div class="modal-header">
+                <h3>⭐ 保存自选标的池 (Save Custom Universe)</h3>
+                <button class="btn-close" id="btn-close-universe-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label for="input-custom-universe-name">标的池名称 (Name):</label>
+                    <input type="text" id="input-custom-universe-name" class="form-input" placeholder="例如: 我的核心AI与红利池">
+                </div>
+                <div class="form-group">
+                    <label for="input-custom-universe-desc">说明备注 (Description):</label>
+                    <input type="text" id="input-custom-universe-desc" class="form-input" placeholder="例如: 包含5只央企高股息与3只科技领军">
+                </div>
+                <div class="form-group">
+                    <label>标的代码预览 (Symbols Preview):</label>
+                    <div id="preview-custom-symbols" class="symbol-preview-tags"></div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="btn-confirm-save-universe" class="btn btn-primary">确认保存标的池</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Global Loading Overlay -->
+    <div id="loading-overlay" class="loading-overlay">
+        <div class="loading-card">
+            <div class="spinner"></div>
+            <div class="loading-title" id="loading-title">正在执行实盘运算...</div>
+            <div class="loading-detail" id="loading-detail">正在同步最新行情、计算风控闸口与持仓对账，请稍候...</div>
+        </div>
+    </div>
+
+    <!-- Floating Toast Notification -->
+    <div id="toast-notification" class="toast-notification"></div>
+
+    <!-- Scripts -->
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
