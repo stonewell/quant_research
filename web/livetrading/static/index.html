@@ -26,7 +26,7 @@
             </div>
             <div class="control-item">
                 <label for="input-as-of-date">估值基准日 (Date)</label>
-                <input type="date" id="input-as-of-date" class="form-input">
+                <input type="date" id="input-as-of-date" class="form-input" title="点击打开日历选择日期">
             </div>
             <div class="control-item">
                 <label for="input-portfolio-value">账户净值 (NAV)</label>
@@ -39,10 +39,10 @@
             <div class="control-item">
                 <label for="select-provider">行情源 (Provider)</label>
                 <select id="select-provider" class="form-input">
-                    <option value="synthetic">Synthetic (合成回测)</option>
-                    <option value="marketdb">MarketDB (本地快照)</option>
+                    <option value="marketdb" selected>MarketDB (本地快照)</option>
                     <option value="fuyao">Fuyao (复爻行情)</option>
                     <option value="yfinance">Yahoo Finance</option>
+                    <option value="synthetic">Synthetic (合成回测)</option>
                 </select>
             </div>
             <div class="header-actions">
@@ -150,15 +150,15 @@
 
         <!-- Right Column: Outputs (Stage 1 Health, Stage 2 Ticket, Daily Archive) -->
         <section class="panel-right" id="panel-right">
-            <!-- Historical Date Quick Selector Bar -->
+            <!-- Historical Date Quick Selector Bar (Scoped to Strategy & Universe) -->
             <div class="history-bar" id="history-bar">
-                <span class="history-label">📅 历史记录归档查看:</span>
-                <select id="select-history-date" class="form-input form-input-sm">
-                    <option value="">-- 选择历史日期查看实盘归档 --</option>
+                <span class="history-label" id="history-label">📅 历史记录归档 [当前策略与标的池]:</span>
+                <select id="select-history-date" class="form-input form-input-sm" disabled>
+                    <option value="">-- 请先选择策略与标的池 --</option>
                 </select>
-                <button id="btn-load-date" class="btn btn-secondary btn-sm">查看该日归档</button>
-                <button id="btn-today-view" class="btn btn-secondary btn-sm" title="退出历史归档，展示全部四大核心板块">
-                    🔙 返回最新全貌 (4板块)
+                <button id="btn-load-date" class="btn btn-secondary btn-sm" disabled>查看该日归档</button>
+                <button id="btn-today-view" class="btn btn-secondary btn-sm" title="退出历史归档，展示最新运行全貌">
+                    🔙 返回最新运行
                 </button>
             </div>
 
@@ -303,6 +303,15 @@
                 <div class="form-group">
                     <label>Python 执行器 (Python Executable):</label>
                     <input type="text" id="cfg-python-bin" class="form-input">
+                </div>
+                <div class="form-group">
+                    <label>默认行情源 (Default Data Provider):</label>
+                    <select id="cfg-default-provider" class="form-input">
+                        <option value="marketdb">MarketDB (本地快照)</option>
+                        <option value="fuyao">Fuyao (复爻行情)</option>
+                        <option value="yfinance">Yahoo Finance</option>
+                        <option value="synthetic">Synthetic (合成回测)</option>
+                    </select>
                 </div>
             </div>
             <div class="modal-footer">

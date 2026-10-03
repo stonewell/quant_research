@@ -4,6 +4,7 @@
    ========================================================================== */
 
 :root {
+    color-scheme: dark;
     --bg-base: #0b0f17;
     --bg-surface: #131b26;
     --bg-card: #182232;
@@ -128,6 +129,29 @@ body {
 .form-input-sm {
     padding: 4px 8px;
     font-size: 12px;
+}
+
+/* Date Input & Webkit Calendar Picker Styling */
+input[type="date"] {
+    color-scheme: dark;
+    min-width: 145px;
+    cursor: pointer;
+    position: relative;
+}
+
+input[type="date"]::-webkit-calendar-picker-indicator {
+    cursor: pointer;
+    filter: invert(0.9) brightness(1.2);
+    opacity: 0.9;
+    padding: 3px;
+    border-radius: 4px;
+    transition: opacity 0.15s, background-color 0.15s, transform 0.15s;
+}
+
+input[type="date"]::-webkit-calendar-picker-indicator:hover {
+    opacity: 1;
+    background-color: rgba(56, 189, 248, 0.2);
+    transform: scale(1.15);
 }
 
 .form-input:focus, .form-textarea:focus {

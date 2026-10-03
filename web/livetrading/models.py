@@ -15,7 +15,7 @@ class SettingsModel(BaseModel):
     stage1_script: Optional[str] = Field(None, description="Path to Stage 1 Health Check runner script")
     stage2_script: Optional[str] = Field(None, description="Path to Stage 2 Live Deployment runner script")
     python_executable: Optional[str] = Field(None, description="Python executable for script execution")
-    default_data_provider: str = Field("synthetic", description="Default data provider")
+    default_data_provider: str = Field("marketdb", description="Default data provider")
     default_portfolio_value: float = Field(100000.0, description="Default portfolio NAV value")
 
 
@@ -44,11 +44,15 @@ class HoldingsUpdateModel(BaseModel):
     )
     date: Optional[str] = Field(None, description="Optional date (YYYY-MM-DD) for historical archival")
     portfolio_value: Optional[float] = Field(None, description="Total portfolio value for weight/share math")
+    strategy_key: Optional[str] = Field(None, description="Strategy identifier key")
+    universe_key: Optional[str] = Field(None, description="Universe identifier key")
 
 
 class AccountStateModel(BaseModel):
     """Persistent live account state model."""
     as_of_date: Optional[str] = None
+    strategy_key: Optional[str] = None
+    universe_key: Optional[str] = None
     current_nav: Optional[float] = None
     peak_nav: Optional[float] = None
     circuit_breaker_tier: Optional[str] = "NORMAL"
@@ -66,10 +70,14 @@ class RunHealthRequest(BaseModel):
     strategy_file: str
     universe_file: Optional[str] = None
     custom_symbols: Optional[List[str]] = None
+    strategy_key: Optional[str] = None
+    universe_key: Optional[str] = None
+    strategy_name: Optional[str] = None
+    universe_name: Optional[str] = None
     as_of_date: Optional[str] = None
     portfolio_value: float = 100000.0
     peak_nav: Optional[float] = None
-    data_provider: str = "synthetic"
+    data_provider: str = "marketdb"
 
 
 class RunDeployRequest(BaseModel):
@@ -77,11 +85,24 @@ class RunDeployRequest(BaseModel):
     strategy_file: str
     universe_file: Optional[str] = None
     custom_symbols: Optional[List[str]] = None
+    strategy_key: Optional[str] = None
+    universe_key: Optional[str] = None
+    strategy_name: Optional[str] = None
+    universe_name: Optional[str] = None
     as_of_date: Optional[str] = None
     portfolio_value: float = 100000.0
     current_holdings: Optional[Dict[str, Any]] = None
-    data_provider: str = "synthetic"
+    data_provider: str = "marketdb"
     lot_size: Optional[int] = None
+
+
+class QuotesRequestModel(BaseModel):
+    """Request payload for market quotes lookup."""
+    symbols: List[str] = Field(..., description="List of ticker symbols")
+    as_of_date: Optional[str] = Field(None, description="Valuation date (YYYY-MM-DD)")
+    data_provider: Optional[str] = Field(None, description="Data provider name (e.g. marketdb, fuyao, yfinance, synthetic)")
+    strategy_key: Optional[str] = Field(None, description="Strategy key filter for ticket price reference")
+    universe_key: Optional[str] = Field(None, description="Universe key filter for ticket price reference")
 
 
 class RunResponse(BaseModel):
@@ -89,6 +110,10 @@ class RunResponse(BaseModel):
     status: str
     message: str
     date: str
+    strategy_key: Optional[str] = None
+    strategy_name: Optional[str] = None
+    universe_key: Optional[str] = None
+    universe_name: Optional[str] = None
     stdout: str
     stderr: str
     health_report: Optional[Dict[str, Any]] = None

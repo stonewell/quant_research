@@ -13,6 +13,16 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 try:
+    from common.universe import get_stock_name
+except ImportError:
+    try:
+        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+        from common.universe import get_stock_name
+    except Exception:
+        def get_stock_name(sym: str, default: Optional[str] = None) -> str:
+            return default if default is not None else sym
+
+try:
     from .storage import StorageManager
 except (ImportError, ValueError):
     from storage import StorageManager
@@ -31,14 +41,33 @@ class ExecutionService:
         run_dir: str,
     ) -> str:
         """Resolve universe file path or materialize custom symbols to a universe file."""
+        # 1. If an actual preset universe file was selected, resolve it
+        if universe_file and universe_file != "__CUSTOM__":
+            if os.path.isabs(universe_file) and os.path.exists(universe_file):
+                return universe_file
+            candidate = os.path.join(self.storage.repo_root, universe_file)
+            if os.path.exists(candidate):
+                return candidate
+            candidate_u = os.path.join(self.storage.universe_dir, universe_file)
+            if os.path.exists(candidate_u):
+                return candidate_u
+
+        # 2. If custom symbols are provided (or custom universe selected), materialize them cleanly
         if custom_symbols and len(custom_symbols) > 0:
             custom_path = os.path.join(run_dir, "resolved_universe.txt")
             with open(custom_path, "w", encoding="utf-8") as f:
-                f.write(f"# Custom universe generated {datetime.now().isoformat()}\n")
+                f.write("# ==============================================================================\n")
+                f.write(f"# Auto-generated custom universe: {datetime.now().isoformat()}\n")
+                f.write("# ==============================================================================\n")
                 for s in custom_symbols:
                     if s and s.strip():
-                        f.write(f"{s.strip().upper()}\n")
+                        clean_sym = s.strip().upper()
+                        stock_name = get_stock_name(clean_sym)
+                        if stock_name and stock_name != clean_sym and stock_name.lower() != "custom":
+                            f.write(f"# {stock_name}\n")
+                        f.write(f"{clean_sym}\n")
             return custom_path
+
 
         if universe_file:
             if os.path.isabs(universe_file) and os.path.exists(universe_file):
@@ -85,11 +114,28 @@ class ExecutionService:
         as_of_date: Optional[str] = None,
         portfolio_value: float = 100000.0,
         peak_nav: Optional[float] = None,
-        data_provider: str = "synthetic",
+        data_provider: Optional[str] = None,
+        strategy_key: Optional[str] = None,
+        universe_key: Optional[str] = None,
+        strategy_name: Optional[str] = None,
+        universe_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Execute Stage 1 Health Check."""
+        provider = data_provider or self.storage.default_data_provider or "marketdb"
+        strat_key, univ_key, strat_name, univ_name = self.storage.resolve_keys(
+            strategy_file=strategy_file,
+            universe_file=universe_file,
+            custom_symbols=custom_symbols,
+            strategy_key=strategy_key,
+            universe_key=universe_key,
+        )
+        if strategy_name:
+            strat_name = strategy_name
+        if universe_name:
+            univ_name = universe_name
+
         val_date = as_of_date or date.today().isoformat()
-        run_dir = os.path.join(self.storage.archive_dir, val_date)
+        run_dir = self.storage.get_run_dir(strat_key, univ_key, val_date, prefer_existing=True)
         os.makedirs(run_dir, exist_ok=True)
 
         strat_path = self._resolve_strategy(strategy_file)
@@ -99,7 +145,7 @@ class ExecutionService:
         # Copy global account state to daily run_dir if not present
         if not os.path.exists(account_state_file) and os.path.exists(self.storage.account_state_file):
             try:
-                state_data = self.storage.get_account_state()
+                state_data = self.storage.get_account_state(date_str=val_date, strategy_key=strat_key, universe_key=univ_key)
                 self.storage._save_json(account_state_file, state_data)
             except Exception:
                 pass
@@ -113,7 +159,7 @@ class ExecutionService:
             "--portfolio-value", str(portfolio_value),
             "--output-dir", run_dir,
             "--account-state-file", account_state_file,
-            "--data-provider", data_provider,
+            "--data-provider", provider,
         ]
 
         if peak_nav is not None and peak_nav > 0:
@@ -168,7 +214,7 @@ class ExecutionService:
 
         # Update global account state
         if state_data:
-            self.storage.save_account_state(state_data)
+            self.storage.save_account_state(state_data, date_str=val_date, strategy_key=strat_key, universe_key=univ_key)
 
         # Write summary.json
         summary_file = os.path.join(run_dir, "summary.json")
@@ -176,10 +222,14 @@ class ExecutionService:
         summary.update({
             "timestamp": datetime.now().isoformat(),
             "date": val_date,
+            "strategy_key": strat_key,
+            "strategy_name": strat_name,
             "strategy_file": strat_path,
+            "universe_key": univ_key,
+            "universe_name": univ_name,
             "universe_file": univ_path,
             "portfolio_value": portfolio_value,
-            "data_provider": data_provider,
+            "data_provider": provider,
             "health_status": "SUCCESS" if success else "FAILED",
             "health_returncode": proc.returncode,
             "health_stdout": stdout,
@@ -191,6 +241,10 @@ class ExecutionService:
             "status": "success" if success else "error",
             "message": "Stage 1 Health Check executed successfully" if success else f"Execution failed with code {proc.returncode}",
             "date": val_date,
+            "strategy_key": strat_key,
+            "strategy_name": strat_name,
+            "universe_key": univ_key,
+            "universe_name": univ_name,
             "stdout": stdout,
             "stderr": stderr,
             "health_report": health_data,
@@ -205,12 +259,29 @@ class ExecutionService:
         as_of_date: Optional[str] = None,
         portfolio_value: float = 100000.0,
         current_holdings: Optional[Dict[str, Any]] = None,
-        data_provider: str = "synthetic",
+        data_provider: Optional[str] = None,
         lot_size: Optional[int] = None,
+        strategy_key: Optional[str] = None,
+        universe_key: Optional[str] = None,
+        strategy_name: Optional[str] = None,
+        universe_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Execute Stage 2 Live Deployment."""
+        provider = data_provider or self.storage.default_data_provider or "marketdb"
+        strat_key, univ_key, strat_name, univ_name = self.storage.resolve_keys(
+            strategy_file=strategy_file,
+            universe_file=universe_file,
+            custom_symbols=custom_symbols,
+            strategy_key=strategy_key,
+            universe_key=universe_key,
+        )
+        if strategy_name:
+            strat_name = strategy_name
+        if universe_name:
+            univ_name = universe_name
+
         val_date = as_of_date or date.today().isoformat()
-        run_dir = os.path.join(self.storage.archive_dir, val_date)
+        run_dir = self.storage.get_run_dir(strat_key, univ_key, val_date, prefer_existing=True)
         os.makedirs(run_dir, exist_ok=True)
 
         strat_path = self._resolve_strategy(strategy_file)
@@ -222,11 +293,11 @@ class ExecutionService:
         if current_holdings is not None:
             effective_holdings = current_holdings
         else:
-            effective_holdings = self.storage.get_holdings()
+            effective_holdings = self.storage.get_holdings(date_str=val_date, strategy_key=strat_key, universe_key=univ_key)
 
         # Save holdings snapshot in run_dir and globally
         holdings_file = os.path.join(run_dir, "holdings.json")
-        self.storage.save_holdings(effective_holdings, date_str=val_date)
+        self.storage.save_holdings(effective_holdings, date_str=val_date, strategy_key=strat_key, universe_key=univ_key)
 
         cmd = [
             self.storage.python_executable,
@@ -238,7 +309,7 @@ class ExecutionService:
             "--current-holdings-file", holdings_file,
             "--output-dir", run_dir,
             "--account-state-file", account_state_file,
-            "--data-provider", data_provider,
+            "--data-provider", provider,
         ]
 
         if os.path.exists(health_rep_file):
@@ -269,7 +340,27 @@ class ExecutionService:
             try:
                 df = pd.read_csv(csv_file)
                 ticket_records = df.to_dict(orient="records")
+                for r in ticket_records:
+                    if str(r.get("name")).lower() in ("custom", "universe", "none", "unknown", "") or r.get("name") == r.get("symbol"):
+                        r["name"] = get_stock_name(r.get("symbol"), r.get("symbol"))
                 self.storage._save_json(ticket_json_file, ticket_records)
+
+                # Save post_holdings.json for subsequent day carry-over
+                post_holdings = {}
+                for r in ticket_records:
+                    sym = str(r.get("symbol", "")).strip().upper()
+                    if not sym or sym == "BIL" or sym.startswith("CASH"):
+                        continue
+                    ts = r.get("target_shares")
+                    if ts is not None:
+                        try:
+                            s_int = int(float(ts))
+                            if s_int > 0:
+                                post_holdings[sym] = s_int
+                        except (ValueError, TypeError):
+                            pass
+                if post_holdings:
+                    self.storage._save_json(os.path.join(run_dir, "post_holdings.json"), post_holdings)
             except Exception as e:
                 print(f"[ExecutionService] Error converting ticket CSV to JSON: {e}")
 
@@ -277,7 +368,7 @@ class ExecutionService:
         health_data = self.storage._load_json(health_rep_file, default=None)
 
         if state_data:
-            self.storage.save_account_state(state_data)
+            self.storage.save_account_state(state_data, date_str=val_date, strategy_key=strat_key, universe_key=univ_key)
 
         # Update summary.json
         summary_file = os.path.join(run_dir, "summary.json")
@@ -285,10 +376,14 @@ class ExecutionService:
         summary.update({
             "timestamp": datetime.now().isoformat(),
             "date": val_date,
+            "strategy_key": strat_key,
+            "strategy_name": strat_name,
             "strategy_file": strat_path,
+            "universe_key": univ_key,
+            "universe_name": univ_name,
             "universe_file": univ_path,
             "portfolio_value": portfolio_value,
-            "data_provider": data_provider,
+            "data_provider": provider,
             "deploy_status": "SUCCESS" if success else "FAILED",
             "deploy_returncode": proc.returncode,
             "deploy_stdout": stdout,
@@ -301,6 +396,10 @@ class ExecutionService:
             "status": "success" if success else "error",
             "message": "Stage 2 Live Deployment executed successfully" if success else f"Execution failed with code {proc.returncode}",
             "date": val_date,
+            "strategy_key": strat_key,
+            "strategy_name": strat_name,
+            "universe_key": univ_key,
+            "universe_name": univ_name,
             "stdout": stdout,
             "stderr": stderr,
             "health_report": health_data,

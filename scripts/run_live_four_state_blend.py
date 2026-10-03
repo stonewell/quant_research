@@ -63,7 +63,7 @@ from common.cli_utils import (
     shared_data_dir,
 )
 from common.strategy_spec import get_template, load_strategy_file
-from common.universe import resolve_universe_from_args
+from common.universe import FALLBACK_STOCK_NAMES, get_stock_name, resolve_universe_from_args
 from pipeline.live_signal.lsig.signal import as_of_universe, latest_rebalance_rows
 
 DEFAULT_STRATEGY_FILE = os.path.join(
@@ -73,35 +73,33 @@ DEFAULT_UNIVERSE_FILE = os.path.join(_REPO_ROOT, "docs", "universe", "china", "c
 DEFAULT_OUTPUT_DIR = os.path.join(_REPO_ROOT, "docs", "ruleset", "chan_four_state_blend")
 
 
-_FALLBACK_STOCK_NAMES: Dict[str, str] = {
-    # 核心底仓 Core (A股央国企高股息红利蓝筹)
-    "601872.SH": "招商轮船", "601728.SH": "中国电信", "601288.SH": "农业银行",
-    "601225.SH": "陕西煤业", "601919.SH": "中远海控", "601111.SH": "中国国航",
-    "601857.SH": "中国石油", "601601.SH": "中国太保", "600941.SH": "中国移动",
-    "600028.SH": "中国石化", "601088.SH": "中国神华", "601398.SH": "工商银行",
-    "600362.SH": "江西铜业", "600000.SH": "浦发银行", "000157.SZ": "中联重科",
-    "601166.SH": "兴业银行", "601390.SH": "中国中铁",
-    # 卫星增强 Satellite (A股科技/成长/产业Alpha领军)
-    "300394.SZ": "天孚通信", "601899.SH": "紫金矿业", "600584.SH": "长电科技",
-    "600660.SH": "福耀玻璃", "000938.SZ": "紫光股份", "002371.SZ": "北方华创",
-    "688008.SH": "澜起科技", "603501.SH": "韦尔股份", "688012.SH": "中微公司",
-    "688041.SH": "海光信息", "688981.SH": "中芯国际", "002156.SZ": "通富微电",
-    "688072.SH": "拓荆科技", "688120.SH": "华海清科",
-    # 港股核心/卫星 (HK Stocks)
-    "0005.HK": "汇丰控股", "0386.HK": "中国石油化工", "0388.HK": "香港交易所",
-    "0700.HK": "腾讯控股", "0857.HK": "中国石油股份", "0883.HK": "中国海洋石油",
-    "0939.HK": "建设银行", "0941.HK": "中国移动", "0992.HK": "联想集团",
-    "1299.HK": "友邦保险", "1398.HK": "工商银行", "1810.HK": "小米集团-W",
-    "2318.HK": "中国平安", "2388.HK": "中银香港", "2800.HK": "盈富基金",
-    "3690.HK": "美团-W", "3988.HK": "中国银行", "9988.HK": "阿里巴巴-W",
-    # 美股核心/卫星 (US Stocks)
-    "AAPL": "苹果", "MSFT": "微软", "NVDA": "英伟达", "GOOGL": "谷歌",
-    "AMZN": "亚马逊", "META": "Meta", "TSLA": "特斯拉", "SPY": "标普500ETF",
-    "QQQ": "纳指100ETF", "JNJ": "强生", "PG": "宝洁", "KO": "可口可乐",
-    "JPM": "摩根大通", "XOM": "埃克森美孚", "CVX": "雪佛龙",
-    # 现金与固收管理
-    "BIL": "流动性现金", "SHV": "短期美债ETF", "511880.SH": "银华日利ETF", "511990.SH": "华宝添益ETF",
+_FALLBACK_STOCK_NAMES: Dict[str, str] = dict(FALLBACK_STOCK_NAMES)
+
+_INVALID_STOCK_NAME_WORDS = {
+    "custom", "universe", "generated", "portfolio", "strategy", "benchmark",
+    "index", "note", "notes", "warning", "attention", "header", "date",
+    "time", "stocks", "stock", "tickers", "ticker", "asset", "assets",
+    "selection", "selected", "source", "core", "satellite", "total", "temp",
+    "run", "runs", "phase", "config", "none", "unknown", "null", "undefined",
+    "china", "us", "hk", "hongkong", "america", "global", "etf", "etfs",
+    "架构定位", "定量来源", "沪深", "优质", "股票池", "精选", "核心底仓", "卫星增强",
 }
+
+
+def _clean_stock_name_candidate(cand: str) -> Optional[str]:
+    """Validate and clean a candidate stock name string, returning None if invalid."""
+    if not cand:
+        return None
+    cand = cand.strip().strip(":,;：，；")
+    if not cand or len(cand) > 12:
+        return None
+    cand_lower = cand.lower()
+    if cand_lower in _INVALID_STOCK_NAME_WORDS:
+        return None
+    for bad_w in ("generated", "universe", "copyright", "license", "table", "strategy", "portfolio", "custom"):
+        if bad_w in cand_lower:
+            return None
+    return cand
 
 
 def pad_east_asian(s: str, width: int) -> str:
@@ -121,20 +119,51 @@ def load_symbol_names(universe_file: Optional[str] = None) -> Dict[str, str]:
                 for line in f:
                     line = line.strip()
                     if not line:
+                        # Empty lines separate sections/headers; do not carry comments across
+                        last_comment = None
                         continue
                     if line.startswith("#"):
-                        if not line.startswith("# =") and not line.startswith("# -"):
-                            m = re.match(r"^#\s*([^\s(（]+)", line)
-                            if m:
-                                last_comment = m.group(1).strip()
-                    else:
-                        sym = line.replace(",", " ").split()[0].upper()
-                        if last_comment and len(last_comment) <= 12:
-                            names[sym] = last_comment
+                        after_hash = line.lstrip("#").strip()
+                        if not after_hash or after_hash[0] in "=*-~#/+_[]{}:!>@$%^&":
                             last_comment = None
+                            continue
+                        if "(" in after_hash or "（" in after_hash:
+                            raw_cand = after_hash.split("(")[0].split("（")[0].strip()
+                        else:
+                            words = after_hash.split()
+                            if len(words) > 1:
+                                raw_cand = words[0] if len(words) == 1 else None
+                            else:
+                                raw_cand = after_hash
+                        if raw_cand:
+                            cleaned = _clean_stock_name_candidate(raw_cand)
+                            last_comment = cleaned
+                        else:
+                            last_comment = None
+                    else:
+                        inline_name = None
+                        if "#" in line:
+                            parts = line.split("#", 1)
+                            sym = parts[0].replace(",", " ").split()[0].upper() if parts[0].strip() else ""
+                            raw_inline = parts[1].strip().split("(")[0].split("（")[0].strip()
+                            inline_name = _clean_stock_name_candidate(raw_inline)
+                        else:
+                            sym = line.replace(",", " ").split()[0].upper()
+
+                        cand_name = inline_name or last_comment
+                        if cand_name and sym:
+                            existing = _FALLBACK_STOCK_NAMES.get(sym)
+                            if not existing or any(ord(c) > 127 for c in cand_name):
+                                names[sym] = cand_name
+                        last_comment = None
         except Exception:
             pass
+    # Final sanity pass: ensure no symbol gets 'Custom' or invalid names
+    for s, n in list(names.items()):
+        if str(n).lower() in ("custom", "universe", "none", "unknown", "") or str(n) == s:
+            names[s] = _FALLBACK_STOCK_NAMES.get(s, s)
     return names
+
 
 
 def resolve_lot_size(sym: str, override_lot: Optional[int] = None) -> int:
@@ -546,6 +575,8 @@ def main():
             actual_trade_val = 0.0
 
         sym_name = symbol_names.get(sym, sym)
+        if str(sym_name).lower() in ("custom", "universe", "none", "unknown", "") or str(sym_name) == sym:
+            sym_name = _FALLBACK_STOCK_NAMES.get(sym, sym)
         rows.append({
             "symbol": sym,
             "name": sym_name,
