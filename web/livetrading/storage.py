@@ -28,19 +28,25 @@ def find_repo_root() -> str:
 
 
 try:
-    from common.universe import get_stock_name
+    from common.universe import get_stock_name, is_placeholder_stock_name
 except ImportError:
     try:
         sys.path.insert(0, find_repo_root())
-        from common.universe import get_stock_name
+        from common.universe import get_stock_name, is_placeholder_stock_name
     except Exception:
         def get_stock_name(sym: str, default: Optional[str] = None) -> str:
             return default if default is not None else sym
 
+        def is_placeholder_stock_name(name: object, symbol: object = None) -> bool:
+            n = "" if name is None else str(name).strip()
+            return n.lower() in ("custom", "universe", "none", "unknown", "nan", "") or (
+                symbol is not None and n == str(symbol).strip()
+            )
+
 
 def normalize_universe_key(key: Optional[str]) -> str:
     """Normalize a universe key for robust comparison across custom universe conventions.
-    
+
     Treats custom universe conventions equivalently:
       'custom_astock_202609_20' <-> 'astock_202609_20_custom' <-> 'astock_202609_20'
     """
@@ -100,6 +106,77 @@ def get_universe_key_variants(universe_key: Optional[str]) -> List[str]:
     return variants
 
 
+
+_SAFE_KEY_RE = re.compile(r"[^A-Za-z0-9_\-\u4e00-\u9fa5]+")
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# Ticket/cash names that never denote a real share position. BIL is included deliberately: the
+# Stage 2 runner (`resolve_holdings_weights_and_shares` in scripts/run_live_four_state_blend.py)
+# treats BIL/CASH/<cash_proxy> as the IMPLIED cash residual (NAV - equity value), never as a
+# share count, so carrying a BIL "share" quantity forward would be meaningless.
+_CASH_SYMBOLS = {"BIL", "CASH"}
+
+
+def sanitize_key(key: Optional[str]) -> Optional[str]:
+    """Make a strategy/universe key safe to use as a single path component.
+
+    Keys arrive from query strings / request bodies and are joined into archive paths, so any
+    separator or '..' must be neutralized (path traversal). Allowed: letters, digits, '_', '-', CJK.
+    """
+    if key is None:
+        return None
+    cleaned = _SAFE_KEY_RE.sub("_", str(key).strip()).strip("_")
+    return cleaned or None
+
+
+def validate_date_str(date_str: Optional[str]) -> Optional[str]:
+    """Validate an ISO YYYY-MM-DD date string (also a path component); raise ValueError if malformed."""
+    if date_str is None or date_str == "":
+        return None
+    s = str(date_str).strip()
+    if not _DATE_RE.match(s):
+        raise ValueError(f"Invalid date '{date_str}': expected YYYY-MM-DD")
+    return s
+
+
+def is_cash_symbol(sym: Optional[str]) -> bool:
+    s = str(sym or "").strip().upper()
+    return s in _CASH_SYMBOLS or s.startswith("CASH")
+
+
+def post_holdings_from_ticket(ticket: Any) -> Optional[Dict[str, int]]:
+    """Derive assumed post-trade share holdings from a ticket's `target_shares` column.
+
+    Returns None if the ticket carries no target_shares information at all, and a (possibly
+    EMPTY) dict otherwise -- an empty dict means "fully liquidated to cash", which callers must
+    not confuse with "unknown". Cash-proxy rows (BIL/CASH, or any SWEEP_CASH / RELEASE_CASH row,
+    which is how the Stage 2 runner tags its configured cash_proxy such as 511880.SH) are skipped
+    because cash is the implied residual, not a share position.
+    """
+    if not ticket or not isinstance(ticket, list):
+        return None
+    holdings: Dict[str, int] = {}
+    saw_target = False
+    for r in ticket:
+        if not isinstance(r, dict):
+            continue
+        sym = str(r.get("symbol", "")).strip().upper()
+        action = str(r.get("action", "")).upper()
+        if not sym or is_cash_symbol(sym) or "CASH" in action:
+            continue
+        ts = r.get("target_shares")
+        if ts is None or ts == "":
+            continue
+        try:
+            s_int = int(float(ts))
+        except (ValueError, TypeError):
+            continue
+        saw_target = True
+        if s_int > 0:
+            holdings[sym] = s_int
+    return holdings if saw_target else None
+
+
 def parse_ticket_csv(csv_path: str) -> List[Dict[str, Any]]:
     """Parse live_trading_ticket.csv into a structured list of ticket records if JSON is missing."""
     if not os.path.exists(csv_path):
@@ -112,7 +189,7 @@ def parse_ticket_csv(csv_path: str) -> List[Dict[str, Any]]:
             for row in reader:
                 sym = row.get("symbol", "").strip()
                 name = row.get("name", "").strip()
-                if not name or name.lower() in ("custom", "universe", "none", "unknown", "") or name == sym:
+                if is_placeholder_stock_name(name, sym):
                     name = get_stock_name(sym, sym)
                 row["name"] = name
                 for num_key in ("price", "current_weight", "target_weight", "delta_weight", "trade_value", "trade_value_rmb"):
@@ -532,59 +609,110 @@ class StorageManager:
     # --------------------------------------------------------------------------
     # Holdings Management (Global + Daily Archive)
     # --------------------------------------------------------------------------
-    def extract_post_run_holdings(self, run_dir: Optional[str]) -> Dict[str, Any]:
+    def extract_post_run_holdings(self, run_dir: Optional[str]) -> Optional[Dict[str, Any]]:
         """Extract the resulting post-rebalance holdings from a run directory.
-        
+
         Prioritizes:
-          1. post_holdings.json (if explicitly saved)
+          1. post_holdings.json (if explicitly saved -- an empty dict is a valid "all cash" state)
           2. target_shares in live_trading_ticket.json or live_trading_ticket.csv
-          3. holdings.json or current_holdings.json snapshot in run_dir
+          3. holdings.json or current_holdings.json snapshot in run_dir (no ticket => no trades)
+
+        Returns None when the run carries no holdings information at all, so callers can tell
+        "fully liquidated" ({}) apart from "unknown" and keep searching earlier runs only for the
+        latter. (Previously a ticket whose targets were all 0 fell through to the PRE-trade
+        snapshot and silently resurrected the liquidated positions on the next day.)
         """
-        if not run_dir or not os.path.exists(run_dir):
-            return {}
+        if not run_dir or not os.path.isdir(run_dir):
+            return None
 
         # 1. Check if post_holdings.json exists
         post_file = os.path.join(run_dir, "post_holdings.json")
         if os.path.exists(post_file):
-            data = self._load_json(post_file, default={})
-            if data and isinstance(data, dict):
+            data = self._load_json(post_file, default=None)
+            if isinstance(data, dict):
                 return data
 
-        # 2. Check ticket for non-zero target_shares
-        ticket_json = os.path.join(run_dir, "live_trading_ticket.json")
-        ticket = self._load_json(ticket_json)
+        # 2. Check ticket for target_shares
+        ticket = self._load_json(os.path.join(run_dir, "live_trading_ticket.json"))
         if not ticket:
             csv_path = os.path.join(run_dir, "live_trading_ticket.csv")
             if os.path.exists(csv_path):
                 ticket = parse_ticket_csv(csv_path)
-
-        if ticket and isinstance(ticket, list):
-            target_holdings = {}
-            for r in ticket:
-                if isinstance(r, dict):
-                    sym = str(r.get("symbol", "")).strip().upper()
-                    if not sym or sym == "BIL" or sym.startswith("CASH"):
-                        continue
-                    ts = r.get("target_shares")
-                    if ts is not None:
-                        try:
-                            s_int = int(float(ts))
-                            if s_int > 0:
-                                target_holdings[sym] = s_int
-                        except (ValueError, TypeError):
-                            pass
-            if target_holdings:
-                return target_holdings
+        target_holdings = post_holdings_from_ticket(ticket)
+        if target_holdings is not None:
+            return target_holdings
 
         # 3. Fallback to holdings.json or current_holdings.json in the run dir
         for fname in ("holdings.json", "current_holdings.json"):
-            h_path = os.path.join(run_dir, fname)
-            if os.path.exists(h_path):
-                data = self._load_json(h_path, default={})
-                if data and isinstance(data, dict) and data:
-                    return data
+            data = self._load_json(os.path.join(run_dir, fname), default=None)
+            if isinstance(data, dict):
+                return data
 
-        return {}
+        return None
+
+    def _load_snapshot_holdings(self, run_dir: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Holdings explicitly snapshotted for a run date (user-saved or Stage 2 pre-trade input)."""
+        if not run_dir:
+            return None
+        for fname in ("holdings.json", "current_holdings.json"):
+            data = self._load_json(os.path.join(run_dir, fname), default=None)
+            if isinstance(data, dict):
+                return data
+        return None
+
+    def _earlier_runs(
+        self,
+        date_str: Optional[str],
+        strategy_key: Optional[str],
+        universe_key: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        """Runs for (strategy, universe) strictly before date_str (all runs if None), newest first."""
+        if not strategy_key or not universe_key:
+            return []
+        runs = self.list_runs(strategy_key=strategy_key, universe_key=universe_key, require_both=True)
+        if date_str:
+            runs = [r for r in runs if r.get("date", "") < date_str]
+        return runs
+
+    def _carry_forward_holdings(
+        self,
+        date_str: Optional[str],
+        strategy_key: Optional[str],
+        universe_key: Optional[str],
+        runs: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Post-trade holdings of the most recent earlier run that has any holdings information.
+
+        Linear scan over one `list_runs` result -- replaces the old get_run -> get_previous_run ->
+        get_run recursion, which re-scanned the whole archive per level and could hit the
+        recursion limit after a long streak of Stage-1-only days.
+        """
+        if runs is None:
+            runs = self._earlier_runs(date_str, strategy_key, universe_key)
+        for r in runs:
+            h = self.extract_post_run_holdings(r.get("path"))
+            if h is not None:
+                return h
+        return None
+
+    def _carry_forward_account_state(
+        self,
+        date_str: Optional[str],
+        strategy_key: Optional[str],
+        universe_key: Optional[str],
+        runs: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """account_state.json of the most recent earlier run that has one (linear scan)."""
+        if runs is None:
+            runs = self._earlier_runs(date_str, strategy_key, universe_key)
+        for r in runs:
+            path = r.get("path")
+            if not path:
+                continue
+            st = self._load_json(os.path.join(path, "account_state.json"))
+            if st:
+                return st
+        return None
 
     def get_holdings(
         self,
@@ -592,53 +720,37 @@ class StorageManager:
         strategy_key: Optional[str] = None,
         universe_key: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """Holdings at the START of date_str (i.e. the input to that day's Stage 2 run).
+
+        Resolution order:
+          1. An explicit snapshot for that exact date (holdings.json / current_holdings.json) --
+             whether saved by the user or written by Stage 2 as its pre-trade input. This MUST win
+             over the same day's post_holdings.json: otherwise a manual correction saved on date D
+             is hidden by the strategy's assumed fills, and re-running Stage 2 on D reconciles
+             against targets as if they were already filled (zero / wrong orders).
+          2. Post-trade holdings carried forward from the most recent EARLIER run.
+          3. Legacy flat archive snapshot, then the global current_holdings.json.
+        With no date: post-trade holdings of the latest run for (strategy, universe).
+        """
+        date_str = validate_date_str(date_str)
         if date_str:
-            # 1. Check exact run dir for date_str
             run_dir = self.find_existing_run_dir(strategy_key, universe_key, date_str)
-            if run_dir:
-                post_h = self.extract_post_run_holdings(run_dir)
-                if post_h:
-                    return post_h
-                daily_file = os.path.join(run_dir, "holdings.json")
-                if os.path.exists(daily_file):
-                    d = self._load_json(daily_file, default={})
-                    if d:
-                        return d
-                curr_file = os.path.join(run_dir, "current_holdings.json")
-                if os.path.exists(curr_file):
-                    d = self._load_json(curr_file, default={})
-                    if d:
-                        return d
+            snap = self._load_snapshot_holdings(run_dir)
+            if snap is not None:
+                return snap
 
-            # 2. If date_str has no run or run had no holdings, fallback to previous available date run data
             if strategy_key and universe_key:
-                prev_run = self.get_previous_run(date_str, strategy_key=strategy_key, universe_key=universe_key)
-                if prev_run:
-                    prev_path = prev_run.get("path")
-                    if prev_path:
-                        prev_h = self.extract_post_run_holdings(prev_path)
-                        if prev_h:
-                            return prev_h
-                    if prev_run.get("holdings"):
-                        return prev_run["holdings"]
+                carried = self._carry_forward_holdings(date_str, strategy_key, universe_key)
+                if carried is not None:
+                    return carried
 
-            legacy_file = os.path.join(self.archive_dir, date_str, "holdings.json")
-            if os.path.exists(legacy_file):
-                d = self._load_json(legacy_file, default={})
-                if d:
-                    return d
-
-        # If date_str is None, but strategy and universe are provided, fallback to latest run
-        if strategy_key and universe_key:
-            latest = self.get_latest_run(strategy_key=strategy_key, universe_key=universe_key)
-            if latest:
-                latest_path = latest.get("path")
-                if latest_path:
-                    latest_h = self.extract_post_run_holdings(latest_path)
-                    if latest_h:
-                        return latest_h
-                if latest.get("holdings"):
-                    return latest["holdings"]
+            legacy = self._load_json(os.path.join(self.archive_dir, date_str, "holdings.json"), default=None)
+            if isinstance(legacy, dict):
+                return legacy
+        elif strategy_key and universe_key:
+            latest = self._carry_forward_holdings(None, strategy_key, universe_key)
+            if latest is not None:
+                return latest
 
         return self._load_json(self.current_holdings_file, default={})
 
@@ -649,6 +761,7 @@ class StorageManager:
         strategy_key: Optional[str] = None,
         universe_key: Optional[str] = None,
     ) -> None:
+        date_str = validate_date_str(date_str)
         self._save_json(self.current_holdings_file, holdings)
         if date_str:
             daily_dir = self.get_run_dir(strategy_key, universe_key, date_str, prefer_existing=True)
@@ -665,7 +778,7 @@ class StorageManager:
     ) -> Dict[str, Any]:
         """Fetch latest quotes and reference market prices for a list of ticker symbols."""
         provider_name = data_provider or self.default_data_provider or "marketdb"
-        target_date = as_of_date or date.today().isoformat()
+        target_date = validate_date_str(as_of_date) or date.today().isoformat()
         clean_symbols = [str(s).strip().upper() for s in symbols if s and str(s).strip()]
 
         quotes: Dict[str, Dict[str, Any]] = {}
@@ -787,38 +900,28 @@ class StorageManager:
         strategy_key: Optional[str] = None,
         universe_key: Optional[str] = None,
     ) -> Dict[str, Any]:
+        date_str = validate_date_str(date_str)
         if date_str:
-            # 1. Check exact run dir for date_str
+            # 1. Exact run dir for date_str
             run_dir = self.find_existing_run_dir(strategy_key, universe_key, date_str)
             if run_dir:
-                daily_file = os.path.join(run_dir, "account_state.json")
-                if os.path.exists(daily_file):
-                    d = self._load_json(daily_file, default={})
-                    if d:
-                        return d
-
-            # 2. If no exact run on date_str, fallback to previous available date run
-            if strategy_key and universe_key:
-                prev_run = self.get_previous_run(date_str, strategy_key=strategy_key, universe_key=universe_key)
-                if prev_run:
-                    if prev_run.get("account_state"):
-                        return prev_run["account_state"]
-                    elif prev_run.get("path"):
-                        prev_file = os.path.join(prev_run["path"], "account_state.json")
-                        if os.path.exists(prev_file):
-                            return self._load_json(prev_file, default={})
-
-            legacy_file = os.path.join(self.archive_dir, date_str, "account_state.json")
-            if os.path.exists(legacy_file):
-                d = self._load_json(legacy_file, default={})
+                d = self._load_json(os.path.join(run_dir, "account_state.json"))
                 if d:
                     return d
 
-        # If date_str is None, but strategy and universe are provided, fallback to latest run
-        if strategy_key and universe_key:
-            latest = self.get_latest_run(strategy_key=strategy_key, universe_key=universe_key)
-            if latest and latest.get("account_state"):
-                return latest["account_state"]
+            # 2. Carry forward from the most recent earlier run that has an account state
+            if strategy_key and universe_key:
+                carried = self._carry_forward_account_state(date_str, strategy_key, universe_key)
+                if carried:
+                    return carried
+
+            legacy = self._load_json(os.path.join(self.archive_dir, date_str, "account_state.json"))
+            if legacy:
+                return legacy
+        elif strategy_key and universe_key:
+            latest = self._carry_forward_account_state(None, strategy_key, universe_key)
+            if latest:
+                return latest
 
         return self._load_json(
             self.account_state_file,
@@ -844,6 +947,7 @@ class StorageManager:
         strategy_key: Optional[str] = None,
         universe_key: Optional[str] = None,
     ) -> None:
+        date_str = validate_date_str(date_str)
         self._save_json(self.account_state_file, state)
         if date_str:
             daily_dir = self.get_run_dir(strategy_key, universe_key, date_str, prefer_existing=True)
@@ -853,19 +957,39 @@ class StorageManager:
     # --------------------------------------------------------------------------
     # Daily Archive Runs Management (Keyed by Strategy and Universe)
     # --------------------------------------------------------------------------
+    def _assert_inside_archive(self, path: str) -> str:
+        """Defense in depth against path traversal: every archive path must stay under archive_dir."""
+        root = os.path.realpath(self.archive_dir)
+        real = os.path.realpath(path)
+        if os.path.commonpath([root, real]) != root:
+            raise ValueError(f"Refusing archive path outside archive_dir: {path}")
+        return path
+
     def find_existing_run_dir(
         self,
         strategy_key: Optional[str] = None,
         universe_key: Optional[str] = None,
         date_str: Optional[str] = None,
     ) -> Optional[str]:
-        """Find an existing run directory on disk, taking into account universe key variants and case insensitivity."""
+        """Find an existing run directory on disk, taking into account universe key variants and case insensitivity.
+
+        Search order is deterministic (exact path, then naming variants, then sorted directory
+        listings preferring exact case-insensitive matches) so the same keys always resolve to the
+        same folder regardless of filesystem listdir order.
+        """
+        strategy_key = sanitize_key(strategy_key)
+        universe_key = sanitize_key(universe_key)
+        date_str = validate_date_str(date_str)
+
         def _matches(p: str) -> bool:
             if not os.path.exists(p):
                 return False
             if date_str:
                 return is_run_dir(p)
             return os.path.isdir(p)
+
+        def _join(*parts: str) -> str:
+            return os.path.join(*[p for p in parts if p])
 
         if not strategy_key or not universe_key:
             if date_str:
@@ -885,26 +1009,21 @@ class StorageManager:
             if _matches(cand_var):
                 return cand_var
 
-        # 3. Check within strategy folder for any subfolder whose key matches
-        strat_dir = os.path.join(self.archive_dir, strategy_key)
-        if os.path.isdir(strat_dir):
-            for u_entry in os.listdir(strat_dir):
-                if keys_match(u_entry, universe_key):
-                    cand_entry = os.path.join(strat_dir, u_entry, date_str) if date_str else os.path.join(strat_dir, u_entry)
+        def _ordered_matches(entries: List[str], key: str) -> List[str]:
+            exact = sorted(e for e in entries if e.lower() == key.lower())
+            fuzzy = sorted(e for e in entries if e not in exact and keys_match(e, key))
+            return exact + fuzzy
+
+        # 3/4. Scan strategy folders (exact-case first, then case-insensitive) for a matching universe
+        if os.path.isdir(self.archive_dir):
+            for s_entry in _ordered_matches(os.listdir(self.archive_dir), strategy_key):
+                s_path = os.path.join(self.archive_dir, s_entry)
+                if not os.path.isdir(s_path):
+                    continue
+                for u_entry in _ordered_matches(os.listdir(s_path), universe_key):
+                    cand_entry = _join(s_path, u_entry, date_str or "")
                     if _matches(cand_entry):
                         return cand_entry
-
-        # 4. Search across all strategy folders in archive_dir
-        if os.path.isdir(self.archive_dir):
-            for s_entry in os.listdir(self.archive_dir):
-                if keys_match(s_entry, strategy_key):
-                    s_path = os.path.join(self.archive_dir, s_entry)
-                    if os.path.isdir(s_path):
-                        for u_entry in os.listdir(s_path):
-                            if keys_match(u_entry, universe_key):
-                                cand_entry = os.path.join(s_path, u_entry, date_str) if date_str else os.path.join(s_path, u_entry)
-                                if _matches(cand_entry):
-                                    return cand_entry
 
         return None
 
@@ -918,13 +1037,21 @@ class StorageManager:
         """Construct hierarchical archive directory: <archive_dir>/<strategy_key>/<universe_key>/<date_str>.
         If prefer_existing is True and a matching strategy/universe folder already exists on disk,
         reuse that folder to prevent directory fragmentation.
+
+        Keys are sanitized to single safe path components and date_str must be YYYY-MM-DD: both
+        arrive from HTTP query strings / bodies, and an unsanitized '../..' key previously let a
+        POST /api/holdings write files outside the archive.
         """
+        strategy_key = sanitize_key(strategy_key)
+        universe_key = sanitize_key(universe_key)
+        date_str = validate_date_str(date_str)
+
         if prefer_existing and strategy_key and universe_key:
             existing_univ_dir = self.find_existing_run_dir(strategy_key, universe_key, date_str=None)
             if existing_univ_dir and os.path.isdir(existing_univ_dir):
                 if date_str:
-                    return os.path.join(existing_univ_dir, date_str)
-                return existing_univ_dir
+                    return self._assert_inside_archive(os.path.join(existing_univ_dir, date_str))
+                return self._assert_inside_archive(existing_univ_dir)
 
         parts = [self.archive_dir]
         if strategy_key and universe_key:
@@ -932,7 +1059,7 @@ class StorageManager:
             parts.append(universe_key)
         if date_str:
             parts.append(date_str)
-        return os.path.join(*parts)
+        return self._assert_inside_archive(os.path.join(*parts))
 
     def save_daily_run(
         self,
@@ -1004,6 +1131,7 @@ class StorageManager:
             return []
 
         runs = []
+        custom_universes = self.list_custom_universes()
         # Walk archive_dir to discover run directories (both 3-level and legacy 1-level)
         for root, dirs, files in os.walk(self.archive_dir):
             if (
@@ -1055,7 +1183,7 @@ class StorageManager:
                         r_univ_name = un
 
                 if not r_univ_name and r_univ_key:
-                    for c in self.list_custom_universes():
+                    for c in custom_universes:
                         if keys_match(c.get("name", ""), r_univ_key):
                             r_univ_name = f"★ {c.get('name')} (Custom)"
                             break
@@ -1066,10 +1194,18 @@ class StorageManager:
                     r_strat_name = (r_strat_key or "Strategy").replace("_", " ").title()
 
                 # Apply filters using keys_match
-                if strategy_key and r_strat_key and not keys_match(strategy_key, r_strat_key):
-                    continue
-                if universe_key and r_univ_key and not keys_match(universe_key, r_univ_key):
-                    continue
+                if require_both:
+                    if not r_strat_key or not r_univ_key:
+                        continue
+                    if strategy_key and not keys_match(strategy_key, r_strat_key):
+                        continue
+                    if universe_key and not keys_match(universe_key, r_univ_key):
+                        continue
+                else:
+                    if strategy_key and (not r_strat_key or not keys_match(strategy_key, r_strat_key)):
+                        continue
+                    if universe_key and (not r_univ_key or not keys_match(universe_key, r_univ_key)):
+                        continue
 
                 directive = health_rep.get("directive") or health_rep.get("gate_code", "UNKNOWN")
                 tier = health_rep.get("circuit_breaker_tier") or health_rep.get("portfolio_health", {}).get("tier", "NORMAL")
@@ -1119,9 +1255,8 @@ class StorageManager:
         universe_key: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Retrieve the latest archived run strictly before date_str (or latest available if date_str is None)."""
-        runs = self.list_runs(strategy_key=strategy_key, universe_key=universe_key, require_both=True)
-        if not runs and (strategy_key or universe_key):
-            runs = self.list_runs(strategy_key=strategy_key, universe_key=universe_key, require_both=False)
+        both_provided = bool(strategy_key and universe_key)
+        runs = self.list_runs(strategy_key=strategy_key, universe_key=universe_key, require_both=both_provided)
         if not runs:
             return None
 
@@ -1174,11 +1309,11 @@ class StorageManager:
             for r in ticket:
                 if isinstance(r, dict):
                     name_val = str(r.get("name", "")).strip()
-                    if not name_val or name_val.lower() in ("custom", "universe", "none", "unknown") or name_val == r.get("symbol"):
+                    if is_placeholder_stock_name(name_val, r.get("symbol")):
                         r["name"] = get_stock_name(r.get("symbol", ""), r.get("symbol", ""))
 
-        strat_k = summary_data.get("strategy_key", strategy_key or "")
-        univ_k = universe_key or summary_data.get("universe_key", "")
+        strat_k = summary_data.get("strategy_key") or strategy_key or ""
+        univ_k = summary_data.get("universe_key") or universe_key or ""
         strat_n = summary_data.get("strategy_name", "")
         univ_n = summary_data.get("universe_name", "")
 
@@ -1189,15 +1324,11 @@ class StorageManager:
         if not holdings_data:
             holdings_data = self.extract_post_run_holdings(run_dir)
         if not holdings_data and strat_k and univ_k:
-            prev_run = self.get_previous_run(date_str, strategy_key=strat_k, universe_key=univ_k)
-            if prev_run:
-                holdings_data = self.extract_post_run_holdings(prev_run.get("path")) or prev_run.get("holdings", {})
+            holdings_data = self._carry_forward_holdings(date_str, strat_k, univ_k)
 
         account_state = self._load_json(os.path.join(run_dir, "account_state.json"))
         if not account_state and strat_k and univ_k:
-            prev_run = self.get_previous_run(date_str, strategy_key=strat_k, universe_key=univ_k)
-            if prev_run:
-                account_state = prev_run.get("account_state")
+            account_state = self._carry_forward_account_state(date_str, strat_k, univ_k)
 
         # If summary didn't have nice names, resolve from custom universes / strategies
         if not univ_n and univ_k:
@@ -1254,7 +1385,7 @@ class StorageManager:
                 run_dir = matching[0]["path"]
             else:
                 legacy = os.path.join(self.archive_dir, date_str)
-                if os.path.exists(legacy):
+                if is_run_dir(legacy):
                     run_dir = legacy
 
         if run_dir:

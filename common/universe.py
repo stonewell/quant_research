@@ -59,12 +59,20 @@ FALLBACK_STOCK_NAMES: Dict[str, str] = {
 def get_stock_name(symbol: str, default: Optional[str] = None) -> str:
     """Retrieve human-readable stock name for a symbol with fallback to symbol itself."""
     clean = str(symbol).strip().upper()
-    if clean in FALLBACK_STOCK_NAMES:
+    if clean in FALLBACK_STOCK_NAMES:  # keys are stored upper-case
         return FALLBACK_STOCK_NAMES[clean]
-    for k, v in FALLBACK_STOCK_NAMES.items():
-        if k.upper() == clean:
-            return v
     return default if default is not None else clean
+
+
+# Placeholder values that leaked into ticket "name" columns from universe-file header comments
+# (e.g. "# Custom universe generated ...") before the comment parser was hardened.
+PLACEHOLDER_STOCK_NAMES = frozenset({"custom", "universe", "none", "unknown", "nan", ""})
+
+
+def is_placeholder_stock_name(name: object, symbol: object = None) -> bool:
+    """True if `name` is missing / a known placeholder / just the symbol, i.e. needs resolving."""
+    n = "" if name is None else str(name).strip()
+    return n.lower() in PLACEHOLDER_STOCK_NAMES or (symbol is not None and n == str(symbol).strip())
 
 
 

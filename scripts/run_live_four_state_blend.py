@@ -63,7 +63,7 @@ from common.cli_utils import (
     shared_data_dir,
 )
 from common.strategy_spec import get_template, load_strategy_file
-from common.universe import FALLBACK_STOCK_NAMES, get_stock_name, resolve_universe_from_args
+from common.universe import FALLBACK_STOCK_NAMES, get_stock_name, is_placeholder_stock_name, resolve_universe_from_args
 from pipeline.live_signal.lsig.signal import as_of_universe, latest_rebalance_rows
 
 DEFAULT_STRATEGY_FILE = os.path.join(
@@ -131,10 +131,7 @@ def load_symbol_names(universe_file: Optional[str] = None) -> Dict[str, str]:
                             raw_cand = after_hash.split("(")[0].split("（")[0].strip()
                         else:
                             words = after_hash.split()
-                            if len(words) > 1:
-                                raw_cand = words[0] if len(words) == 1 else None
-                            else:
-                                raw_cand = after_hash
+                            raw_cand = words[0] if words else None
                         if raw_cand:
                             cleaned = _clean_stock_name_candidate(raw_cand)
                             last_comment = cleaned
@@ -160,7 +157,7 @@ def load_symbol_names(universe_file: Optional[str] = None) -> Dict[str, str]:
             pass
     # Final sanity pass: ensure no symbol gets 'Custom' or invalid names
     for s, n in list(names.items()):
-        if str(n).lower() in ("custom", "universe", "none", "unknown", "") or str(n) == s:
+        if is_placeholder_stock_name(n, s):
             names[s] = _FALLBACK_STOCK_NAMES.get(s, s)
     return names
 
@@ -575,7 +572,7 @@ def main():
             actual_trade_val = 0.0
 
         sym_name = symbol_names.get(sym, sym)
-        if str(sym_name).lower() in ("custom", "universe", "none", "unknown", "") or str(sym_name) == sym:
+        if is_placeholder_stock_name(sym_name, sym):
             sym_name = _FALLBACK_STOCK_NAMES.get(sym, sym)
         rows.append({
             "symbol": sym,

@@ -13,19 +13,24 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 try:
-    from common.universe import get_stock_name
+    from common.universe import get_stock_name, is_placeholder_stock_name
 except ImportError:
     try:
         sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
-        from common.universe import get_stock_name
+        from common.universe import get_stock_name, is_placeholder_stock_name
     except Exception:
         def get_stock_name(sym: str, default: Optional[str] = None) -> str:
             return default if default is not None else sym
+        def is_placeholder_stock_name(name: object, symbol: object = None) -> bool:
+            n = "" if name is None else str(name).strip()
+            return n.lower() in ("custom", "universe", "none", "unknown", "nan", "") or (
+                symbol is not None and n == str(symbol).strip()
+            )
 
 try:
-    from .storage import StorageManager
+    from .storage import StorageManager, post_holdings_from_ticket
 except (ImportError, ValueError):
-    from storage import StorageManager
+    from storage import StorageManager, post_holdings_from_ticket
 
 
 class ExecutionService:
@@ -51,6 +56,8 @@ class ExecutionService:
             candidate_u = os.path.join(self.storage.universe_dir, universe_file)
             if os.path.exists(candidate_u):
                 return candidate_u
+            if os.path.exists(universe_file):
+                return universe_file
 
         # 2. If custom symbols are provided (or custom universe selected), materialize them cleanly
         if custom_symbols and len(custom_symbols) > 0:
@@ -63,22 +70,10 @@ class ExecutionService:
                     if s and s.strip():
                         clean_sym = s.strip().upper()
                         stock_name = get_stock_name(clean_sym)
-                        if stock_name and stock_name != clean_sym and stock_name.lower() != "custom":
+                        if stock_name and not is_placeholder_stock_name(stock_name, clean_sym):
                             f.write(f"# {stock_name}\n")
                         f.write(f"{clean_sym}\n")
             return custom_path
-
-
-        if universe_file:
-            if os.path.isabs(universe_file) and os.path.exists(universe_file):
-                return universe_file
-            candidate = os.path.join(self.storage.repo_root, universe_file)
-            if os.path.exists(candidate):
-                return candidate
-            candidate_u = os.path.join(self.storage.universe_dir, universe_file)
-            if os.path.exists(candidate_u):
-                return candidate_u
-            return universe_file
 
         # Default fallback: China Core-Satellite 22
         default_u = os.path.join(self.storage.repo_root, "docs", "universe", "china", "core_satellite_22_stocks.txt")
@@ -341,25 +336,13 @@ class ExecutionService:
                 df = pd.read_csv(csv_file)
                 ticket_records = df.to_dict(orient="records")
                 for r in ticket_records:
-                    if str(r.get("name")).lower() in ("custom", "universe", "none", "unknown", "") or r.get("name") == r.get("symbol"):
+                    if is_placeholder_stock_name(r.get("name"), r.get("symbol")):
                         r["name"] = get_stock_name(r.get("symbol"), r.get("symbol"))
                 self.storage._save_json(ticket_json_file, ticket_records)
 
                 # Save post_holdings.json for subsequent day carry-over
-                post_holdings = {}
-                for r in ticket_records:
-                    sym = str(r.get("symbol", "")).strip().upper()
-                    if not sym or sym == "BIL" or sym.startswith("CASH"):
-                        continue
-                    ts = r.get("target_shares")
-                    if ts is not None:
-                        try:
-                            s_int = int(float(ts))
-                            if s_int > 0:
-                                post_holdings[sym] = s_int
-                        except (ValueError, TypeError):
-                            pass
-                if post_holdings:
+                post_holdings = post_holdings_from_ticket(ticket_records)
+                if post_holdings is not None:
                     self.storage._save_json(os.path.join(run_dir, "post_holdings.json"), post_holdings)
             except Exception as e:
                 print(f"[ExecutionService] Error converting ticket CSV to JSON: {e}")

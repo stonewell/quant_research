@@ -1020,4 +1020,92 @@ def test_app_js_holdings_value_and_provider_logic():
     assert "totalEquity += rowVal" in content
 
 
+def test_manual_same_day_holdings_override_ticket_fills(temp_workspace):
+    """Verify manual same-day holdings save overrides assumed ticket fills."""
+    storage, _ = temp_workspace
+    strat_k = "test_strat"
+    univ_k = "test_univ"
+    date_str = "2026-10-07"
+
+    # 1. Run completed with ticket targets 50 AAPL, 20 MSFT
+    run_dir = storage.get_run_dir(strat_k, univ_k, date_str)
+    os.makedirs(run_dir, exist_ok=True)
+    storage._save_json(os.path.join(run_dir, "post_holdings.json"), {"AAPL": 50, "MSFT": 20})
+
+    # 2. User manually corrects actual fill: only 30 AAPL filled, 0 MSFT
+    storage.save_holdings({"AAPL": 30}, date_str=date_str, strategy_key=strat_k, universe_key=univ_k)
+
+    # 3. get_holdings for same date MUST return user's explicit snapshot {"AAPL": 30}
+    loaded = storage.get_holdings(date_str, strategy_key=strat_k, universe_key=univ_k)
+    assert loaded == {"AAPL": 30}
+
+
+def test_path_traversal_sanitization(temp_workspace):
+    """Verify path traversal in strategy_key, universe_key, or date_str is blocked and sanitized."""
+    storage, _ = temp_workspace
+
+    # Keys containing path traversal sequences are sanitized
+    run_dir = storage.get_run_dir("../../escape", "../evil_univ", "2026-10-07")
+    # Must remain strictly inside archive_dir
+    real_archive = os.path.realpath(storage.archive_dir)
+    real_run = os.path.realpath(run_dir)
+    assert os.path.commonpath([real_archive, real_run]) == real_archive
+    assert ".." not in run_dir
+
+    # Invalid date string raises ValueError
+    with pytest.raises(ValueError):
+        storage.save_holdings({"AAPL": 10}, date_str="../../etc/passwd", strategy_key="strat", universe_key="univ")
+
+
+def test_previous_run_strict_universe_scoping_no_cross_contamination(temp_workspace):
+    """Verify get_previous_run never returns runs from a different universe when both keys are supplied."""
+    storage, _ = temp_workspace
+
+    # Archive a run for strat_a with china_stocks
+    storage.save_daily_run(
+        date_str="2026-10-01",
+        strategy_key="strat_a",
+        universe_key="china_stocks",
+        ticket_data=[{"symbol": "601872.SH", "action": "BUY", "target_shares": 1000}],
+        summary={"strategy_key": "strat_a", "universe_key": "china_stocks"},
+    )
+
+    # Query previous run for strat_a with us_stocks (which has no runs)
+    prev = storage.get_previous_run("2026-10-05", strategy_key="strat_a", universe_key="us_stocks")
+    assert prev is None
+
+
+def test_full_liquidation_carry_forward(temp_workspace):
+    """Verify full liquidation (target_shares=0) carries forward as empty holdings, not resurrecting old holdings."""
+    storage, _ = temp_workspace
+    strat_k = "strat_liq"
+    univ_k = "univ_liq"
+
+    # Day 1: Hold 100 shares of AAPL
+    storage.save_daily_run(
+        date_str="2026-10-01",
+        strategy_key=strat_k,
+        universe_key=univ_k,
+        ticket_data=[{"symbol": "AAPL", "action": "BUY", "current_shares": 0, "target_shares": 100}],
+        summary={"strategy_key": strat_k, "universe_key": univ_k},
+    )
+
+    # Day 2: Liquidate AAPL to 0
+    run_dir_day2 = storage.save_daily_run(
+        date_str="2026-10-02",
+        strategy_key=strat_k,
+        universe_key=univ_k,
+        ticket_data=[{"symbol": "AAPL", "action": "SELL", "current_shares": 100, "target_shares": 0}],
+        summary={"strategy_key": strat_k, "universe_key": univ_k},
+    )
+    # Target holdings from ticket should be empty dict {}
+    post_h = storage.extract_post_run_holdings(run_dir_day2)
+    assert post_h == {}
+
+    # Day 3: Query holdings for 2026-10-03 -> must carry forward {} (no AAPL revived)
+    h_day3 = storage.get_holdings("2026-10-03", strategy_key=strat_k, universe_key=univ_k)
+    assert h_day3 == {}
+
+
+
 

@@ -77,7 +77,7 @@ class RunHealthRequest(BaseModel):
     as_of_date: Optional[str] = None
     portfolio_value: float = 100000.0
     peak_nav: Optional[float] = None
-    data_provider: str = "marketdb"
+    data_provider: Optional[str] = None
 
 
 class RunDeployRequest(BaseModel):
@@ -92,7 +92,7 @@ class RunDeployRequest(BaseModel):
     as_of_date: Optional[str] = None
     portfolio_value: float = 100000.0
     current_holdings: Optional[Dict[str, Any]] = None
-    data_provider: str = "marketdb"
+    data_provider: Optional[str] = None
     lot_size: Optional[int] = None
 
 
