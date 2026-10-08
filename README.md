@@ -8,7 +8,7 @@ This workspace is organized into two project groups, each with its own `uv` envi
 shared infrastructure at the repo root:
 
 - **`pipeline/`** -- the core research/backtest pipeline family (one shared `uv` environment):
-  - `research_strategy/`: Researched quantitative trading strategies (45 TAA, timing, breakout, Chan structural & similar models, macro factor, and multi-strategy alpha book models) and factor summary exporter.
+  - `research_strategy/`: Researched quantitative trading strategies (51 TAA, timing, breakout, Chan structural & similar models, macro factor, multi-strategy alpha book, and WorldQuant 101 Formulaic Alpha models) and factor summary exporter.
   - `instrument_selection/`: Strategy-agnostic screening, predictability testing (Hurst, candlestick, momentum), correlation clustering, and basket selection tool.
   - `pattern_mining/`: Turning-point indicator pattern mining (Bonferroni-corrected shuffle-null significance test), writing a durable `pattern_report.json` for `strategy_generator` to consume.
   - `strategy_generator/`: Portfolio strategy generator searching allocation templates and mined turning-point patterns, validated via Equivalent Random Search (ERS) and factor research tie-breaking.

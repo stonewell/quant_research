@@ -112,6 +112,22 @@ class MultiStrategyAlphaBookStrategy(AllocationTemplate):
                 "tactical_defense": VigilantAssetAllocation(cfg),
                 "permanent_core": PermanentPortfolioStrategy(cfg),
             }
+        elif preset == "alpha_worldquant":
+            from .worldquant_alpha_strategy import WorldQuantMegaAlphaStrategy
+            return {
+                "structural_trend": ChanPivotShiftMACDStrategy(cfg),
+                "mega_alpha": WorldQuantMegaAlphaStrategy(cfg),
+                "tactical_defense": VigilantAssetAllocation(cfg),
+                "momentum_expansion": AcceleratingDualMomentum(cfg),
+            }
+        elif preset == "all_regime_worldquant":
+            from .worldquant_alpha_strategy import WorldQuantMegaAlphaStrategy
+            return {
+                "structural_trend": ChanPivotShiftMACDStrategy(cfg),
+                "mega_alpha": WorldQuantMegaAlphaStrategy(cfg),
+                "tactical_defense": VigilantAssetAllocation(cfg),
+                "permanent_core": PermanentPortfolioStrategy(cfg),
+            }
         else:  # core_satellite default
             return {
                 "trend_alpha": ChanPivotShiftMACDStrategy(cfg),

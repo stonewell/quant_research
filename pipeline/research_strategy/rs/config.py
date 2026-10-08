@@ -619,6 +619,17 @@ class StrategyConfig:
     w3_max_holding_days: int = 65            # time stop
     w3_position_size_pct: float = 1.0        # single position allocation size
 
+    # --- WorldQuant 101 Formulaic Alpha Strategy ---
+    wq_alpha_id: int = 101                   # 1 to 101
+    wq_rebalance_freq_days: int = 21         # Rebalance frequency (days)
+    wq_top_k: int = 3                        # Top K assets by alpha score
+    wq_weighting_mode: str = "equal"         # "equal", "alpha_rank", "inverse_vol"
+    wq_require_trend_filter: bool = True     # Require Close > 200d SMA
+    wq_trend_ma_period: int = 200            # Trend MA filter lookback
+    wq_smoothing_days: int = 1               # Decay linear smoothing on raw scores
+    wq_min_weight_change: float = 0.02       # Minimum target weight change threshold (inertia)
+    wq_ensemble_alphas: List[int] = field(default_factory=lambda: [6, 12, 41, 53, 101, 38])
+
     # Backtester execution defaults
     initial_capital: float = 100_000.0
     commission_pct: float = 0.0005          # 5 bps
@@ -789,7 +800,7 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.ms_rebalance_freq_days must be > 0, got {self.ms_rebalance_freq_days}")
         if self.ms_lookback_days <= 0:
             raise ValueError(f"StrategyConfig.ms_lookback_days must be > 0, got {self.ms_lookback_days}")
-        valid_presets = {"core_satellite", "alpha_leaders", "all_regime"}
+        valid_presets = {"core_satellite", "alpha_leaders", "all_regime", "alpha_worldquant", "all_regime_worldquant"}
         if self.ms_pod_preset not in valid_presets:
             raise ValueError(f"StrategyConfig.ms_pod_preset must be one of {sorted(valid_presets)}, got {self.ms_pod_preset!r}")
         valid_exec_modes = {"pod_native_sparse", "periodic_sync"}
@@ -845,6 +856,20 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.chan_fse_adx_threshold must be > 0, got {self.chan_fse_adx_threshold}")
         if self.chan_fse_adx_period <= 0:
             raise ValueError(f"StrategyConfig.chan_fse_adx_period must be > 0, got {self.chan_fse_adx_period}")
+        if not (1 <= self.wq_alpha_id <= 101):
+            raise ValueError(f"StrategyConfig.wq_alpha_id must be between 1 and 101, got {self.wq_alpha_id}")
+        if self.wq_rebalance_freq_days <= 0:
+            raise ValueError(f"StrategyConfig.wq_rebalance_freq_days must be > 0, got {self.wq_rebalance_freq_days}")
+        if self.wq_top_k <= 0:
+            raise ValueError(f"StrategyConfig.wq_top_k must be > 0, got {self.wq_top_k}")
+        if self.wq_trend_ma_period <= 0:
+            raise ValueError(f"StrategyConfig.wq_trend_ma_period must be > 0, got {self.wq_trend_ma_period}")
+        if self.wq_smoothing_days <= 0:
+            raise ValueError(f"StrategyConfig.wq_smoothing_days must be > 0, got {self.wq_smoothing_days}")
+        if not (0.0 <= self.wq_min_weight_change <= 1.0):
+            raise ValueError(f"StrategyConfig.wq_min_weight_change must be between 0 and 1, got {self.wq_min_weight_change}")
+        if not self.wq_ensemble_alphas or any(not (1 <= a <= 101) for a in self.wq_ensemble_alphas):
+            raise ValueError(f"StrategyConfig.wq_ensemble_alphas must be a non-empty list of ints in [1, 101], got {self.wq_ensemble_alphas}")
 
     @classmethod
     def from_dict(cls, data: dict) -> "StrategyConfig":

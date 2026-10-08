@@ -4,7 +4,8 @@
 
 Shared code used by every project in this workspace (`backtester`, `instrument_selection`,
 `research_strategy`, `strategy_generator`): market data loading (`data.py`), universe resolution
-(`universe.py`), technical indicators (`indicators.py`, `indicator_features.py`), the Hurst
+(`universe.py`), technical indicators (`indicators.py`, `indicator_features.py`), WorldQuant Alpha 101
+mathematical and cross-sectional operators (`alpha101_operators.py`), the Hurst
 exponent (`hurst.py`), performance metrics (`metrics.py`), the portfolio allocation backtester
 (`allocation_backtester.py`) and its templates (`allocation_templates.py`), shared grid-search +
 Equivalent Random Search validation (`allocation_search.py`), the shared factor taxonomy

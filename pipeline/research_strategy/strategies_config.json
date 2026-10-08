@@ -806,5 +806,96 @@
       "cash_proxy": "BIL"
     },
     "factors": ["absolute_momentum_trend", "relative_momentum", "volatility_targeting"]
+  },
+  "worldquant_mega_alpha": {
+    "name": "WorldQuant 101 Mega-Alpha Composite",
+    "type": "class",
+    "class_name": "WorldQuantMegaAlphaStrategy",
+    "description": "Zura Kakushadze (2015, arXiv:1601.00991) institutional multi-alpha ensemble combining decorrelated formulaic alphas across families (Alpha#6 vol-price correlation, Alpha#12 volume shock reversal, Alpha#41 VWAP geometric trend, Alpha#53 wick imbalance, Alpha#101 intraday efficiency, Alpha#38 range skew). Cross-sectionally standardized with trend gating, top-K selection, and unallocated capital in BIL.",
+    "parameters": {
+      "wq_ensemble_alphas": [6, 12, 41, 53, 101, 38],
+      "wq_rebalance_freq_days": 21,
+      "wq_top_k": 3,
+      "wq_weighting_mode": "inverse_vol",
+      "wq_require_trend_filter": true,
+      "wq_min_weight_change": 0.02,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["relative_momentum", "mean_reversion", "volatility_targeting", "absolute_momentum_trend"]
+  },
+  "worldquant_alpha6_vol_corr": {
+    "name": "WorldQuant Alpha#6 Volume-Price Correlation",
+    "type": "class",
+    "class_name": "WorldQuantAlphaStrategy",
+    "description": "Zura Kakushadze (2015) Alpha#6: -1 * correlation(open, volume, 10). Exploits volume-price decoupling and climactic exhaustion, allocating to top assets with 200d SMA trend filter.",
+    "parameters": {
+      "wq_alpha_id": 6,
+      "wq_rebalance_freq_days": 5,
+      "wq_top_k": 3,
+      "wq_weighting_mode": "equal",
+      "wq_require_trend_filter": true,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["relative_momentum", "mean_reversion"]
+  },
+  "worldquant_alpha12_reversal": {
+    "name": "WorldQuant Alpha#12 Volume Shock Reversal",
+    "type": "class",
+    "class_name": "WorldQuantAlphaStrategy",
+    "description": "Zura Kakushadze (2015) Alpha#12: sign(delta(volume, 1)) * (-1 * delta(close, 1)). Institutional volume absorption filter: buys dips when volume surges on down days, fades surges on high-volume up days.",
+    "parameters": {
+      "wq_alpha_id": 12,
+      "wq_rebalance_freq_days": 5,
+      "wq_top_k": 3,
+      "wq_weighting_mode": "equal",
+      "wq_require_trend_filter": true,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["mean_reversion", "relative_momentum"]
+  },
+  "worldquant_alpha41_vwap_trend": {
+    "name": "WorldQuant Alpha#41 VWAP Geometric Trend",
+    "type": "class",
+    "class_name": "WorldQuantAlphaStrategy",
+    "description": "Zura Kakushadze (2015) Alpha#41: ((high * low)^0.5) - vwap. Compares geometric center of daily range against VWAP institutional baseline, allocating to relative trend leaders.",
+    "parameters": {
+      "wq_alpha_id": 41,
+      "wq_rebalance_freq_days": 21,
+      "wq_top_k": 3,
+      "wq_weighting_mode": "inverse_vol",
+      "wq_require_trend_filter": true,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["relative_momentum", "volatility_targeting"]
+  },
+  "worldquant_alpha53_wick_imbalance": {
+    "name": "WorldQuant Alpha#53 Candle Wick Imbalance",
+    "type": "class",
+    "class_name": "WorldQuantAlphaStrategy",
+    "description": "Zura Kakushadze (2015) Alpha#53: -1 * delta((((close - low) - (high - close)) / (close - low)), 9). Inverts shifts in close location value (CLV) wick imbalance over 9 days.",
+    "parameters": {
+      "wq_alpha_id": 53,
+      "wq_rebalance_freq_days": 10,
+      "wq_top_k": 3,
+      "wq_weighting_mode": "equal",
+      "wq_require_trend_filter": true,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["mean_reversion", "relative_momentum"]
+  },
+  "worldquant_alpha101_intraday": {
+    "name": "WorldQuant Alpha#101 Intraday Efficiency",
+    "type": "class",
+    "class_name": "WorldQuantAlphaStrategy",
+    "description": "Zura Kakushadze (2015) Alpha#101: ((close - open) / ((high - low) + 0.001)). Normalized candlestick directional return relative to intraday range, selecting top intraday momentum leaders.",
+    "parameters": {
+      "wq_alpha_id": 101,
+      "wq_rebalance_freq_days": 5,
+      "wq_top_k": 3,
+      "wq_weighting_mode": "inverse_vol",
+      "wq_require_trend_filter": true,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["relative_momentum", "volatility_targeting"]
   }
 }

@@ -101,6 +101,10 @@ from .chan_similar_strategies import (
     VolumeProfilePocMigrationStrategy,
     Wave3FibonacciStrategy,
 )
+from .worldquant_alpha_strategy import (
+    WorldQuantAlphaStrategy,
+    WorldQuantMegaAlphaStrategy,
+)
 from .config import StrategyConfig
 from .nl_parser import ParsedStrategySpec, parse_plain_english_strategy
 
@@ -2121,6 +2125,8 @@ STRATEGY_CLASS_MAP = {
     "VigilantAssetAllocation": VigilantAssetAllocation,
     "VolumeProfilePocMigrationStrategy": VolumeProfilePocMigrationStrategy,
     "Wave3FibonacciStrategy": Wave3FibonacciStrategy,
+    "WorldQuantAlphaStrategy": WorldQuantAlphaStrategy,
+    "WorldQuantMegaAlphaStrategy": WorldQuantMegaAlphaStrategy,
 }
 
 

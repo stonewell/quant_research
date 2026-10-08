@@ -2,7 +2,7 @@
 
 # 量化交易策略研究 (`research_strategy`)
 
-一个专门的子项目，实现并评估 45 种量化交易策略配置：从学术文献与从业者研究（*Journal of Finance*、*Journal of Portfolio Management*、SSRN、AllocateSmartly）中综合而成的战术资产配置 (TAA) 策略；单资产择时策略；Donchian 通道突破系统；现代热门静态/固定权重组合（永久组合、黄金蝴蝶、全天候、HFEA）；布林带通道突破与均值回归；残差动量与自适应快速扩张；涵盖 17 种策略的完整缠论及类似结构分析体系（缠中说禅：笔中枢移动、三类买卖点、MACD 背驰、多周期趋势共振、三买回抽、均值回归背驰、多阶段复合阶梯建仓、四态操作判定机、最优选择器元策略、风控混合策略、四态风控混合策略、VAA 复合防御、中枢震荡监视器、斐波那契均线板块轮动，以及裸K形态回踩确认、成交量分布POC迁移与三浪斐波那契扩展）；宏观政体因子自适应复合引擎；以及采用核心-卫星配置架构的机构级多策略 Alpha 账簿 (`MultiStrategyAlphaBookStrategy`)。
+一个专门的子项目，实现并评估 51 种量化交易策略配置：从学术文献与从业者研究（*Journal of Finance*、*Journal of Portfolio Management*、SSRN、AllocateSmartly）中综合而成的战术资产配置 (TAA) 策略；单资产择时策略；Donchian 通道突破系统；现代热门静态/固定权重组合（永久组合、黄金蝴蝶、全天候、HFEA）；布林带通道突破与均值回归；残差动量与自适应快速扩张；涵盖 17 种策略的完整缠论及类似结构分析体系（缠中说禅：笔中枢移动、三类买卖点、MACD 背驰、多周期趋势共振、三买回抽、均值回归背驰、多阶段复合阶梯建仓、四态操作判定机、最优选择器元策略、风控混合策略、四态风控混合策略、VAA 复合防御、中枢震荡监视器、斐波那契均线板块轮动，以及裸K形态回踩确认、成交量分布POC迁移与三浪斐波那契扩展）；宏观政体因子自适应复合引擎；采用核心-卫星配置架构的机构级多策略 Alpha 账簿 (`MultiStrategyAlphaBookStrategy`)；以及包含完整 101 个公式化因子的 WorldQuant 101 Alpha 体系 (Kakushadze 2015)。
 
 ---
 
@@ -161,6 +161,28 @@
 * **策略 43：成交量分布 POC 迁移策略** (`VolumeProfilePocMigrationStrategy`, `vp_poc_migration`)：滚动计算成交量分布（Volume Profile），追踪控制点（POC）与价值区间（VA）的上移，回踩上涨 POC 时逢低建仓。
 * **策略 44：改进型艾略特三浪斐波那契策略** (`Wave3FibonacciStrategy`, `wave3_fibonacci`)：识别 5 浪推动结构，在二浪回调至斐波那契回撤位（38.2%–61.8%）时入场，博取强劲的三浪主升浪扩展。
 
+### 策略 45–46：WorldQuant 101 公式化阿尔法体系 (`rs/worldquant_alpha_strategy.py`, `rs/alpha101_factors.py`, `common/alpha101_operators.py`)
+
+* **学术与量化背景**：Zura Kakushadze (2015, *101 Formulaic Alphas*, arXiv:1601.00991 / *Wilmott Magazine*)。提供高保真度算子体系与 WorldQuant 发布的全部 101 个公式化 Alpha。
+* **全套量化算子库 (`common/alpha101_operators.py`)**：
+  - 时序算子 (Time-Series)：`ts_rank`、`ts_delay`、`ts_delta`、`ts_corr`、`ts_cov`、`ts_std`、`ts_min`、`ts_max`、`ts_argmin`、`ts_argmax`、`ts_sum`、`ts_product`、`decay_linear`、`ts_regression`、`ts_scale`。
+  - 横截面算子 (Cross-Sectional)：`rank`、`scale`、`indneutralize`、`truncate`。
+  - 数学与成交量辅助：`signed_power`、`ternary`、`adv`、`vwap_proxy`。
+* **完整 101 个公式化因子库 (`rs/alpha101_factors.py`)**：
+  - 通过 `Alpha101Data` 容器统一管理横截面矩阵数据（`open`, `high`, `low`, `close`, `volume`, `returns`, `vwap`）。
+  - 原生矩阵化实现全部 101 个因子（`alpha_1` 至 `alpha_101`），输出标准 `(date x symbol)` DataFrame 阿尔法分值。
+* **策略 45：WorldQuant 单阿尔法策略** (`WorldQuantAlphaStrategy`)：
+  可运行任意单个指定 Alpha（1–101），进行横截面排序、绝对均线趋势过滤（`Close > SMA`），并采用逆波动率或等权分配资金，严格执行稀疏权重契约与闲置现金存入 `BIL`。配置预设包含：
+  - `worldquant_alpha6_vol_corr`：开盘价与成交量相关性反转（$-\text{corr}(\text{open}, \text{volume}, 10)$）。
+  - `worldquant_alpha12_reversal`：成交量加权价格动量反转（$\text{sign}(\Delta \text{volume}) \cdot -\Delta \text{close}$）。
+  - `worldquant_alpha41_vwap_trend`：高成交量 VWAP 趋势突破（$\text{power}(\text{high} \times \text{low}, 0.5) - \text{vwap}$）。
+  - `worldquant_alpha53_wick_imbalance`：日内影线资金压力不平衡（$\frac{(\text{close}-\text{low}) - (\text{high}-\text{close})}{\text{close}-\text{open}}$）。
+  - `worldquant_alpha101_intraday`：日内振幅动量因子（$\frac{\text{close}-\text{open}}{\text{high}-\text{low}+0.001}$）。
+* **策略 46：WorldQuant Mega-Alpha 复合集成策略** (`WorldQuantMegaAlphaStrategy`, `worldquant_mega_alpha`)：
+  融合多家族不相关因子的复合集成策略（涵盖成交量反转、日内价差、VWAP趋势突破，默认融合 `[6, 12, 41, 53, 101, 38]`），对各 Alpha 分值进行横截面标准化与线性加权，叠加动态大盘趋势门控与逆波动率风险预算加权。
+* **机构级多策略 Alpha 账簿扩展**：
+  在 `MultiStrategyAlphaBookStrategy` 中新增 `alpha_worldquant`（顶级缠论 + WorldQuant Mega-Alpha + VAA）与 `all_regime_worldquant`（全天候永久组合 + 缠论 + WorldQuant）两大机构预设。
+
 ---
 
 ## 2. JSON 策略配置 (`strategies_config.json`)
@@ -204,8 +226,10 @@ pipeline/research_strategy/
 │   ├── regime_factor_compound_strategy.py # 宏观政体因子自适应复合引擎
 │   ├── multi_strategy_alpha_book.py      # 机构级多策略 Alpha 账簿（最优核心-卫星蓝图）
 │   ├── timing_aspects.py                 # 单资产择时模板的入场 x 出场/风控要素分解
+│   ├── alpha101_factors.py               # 完整 WorldQuant 101 公式化 Alpha 因子库与 Alpha101Data
+│   ├── worldquant_alpha_strategy.py      # 单 Alpha 与 Mega-Alpha 复合集成策略实现
 │   └── strategy.py                       # NaturalLanguageStrategy 引擎与策略实现
-├── strategies_config.json                # 包含 45 个策略和参数的中央 JSON 配置
+├── strategies_config.json                # 包含 51 个策略和参数的中央 JSON 配置
 ├── run_research_strategy.py              # 动态加载策略配置的 CLI 运行器
 ├── dashboard.py                          # 终端 ASCII 报告查看器
 ├── tests/
@@ -221,7 +245,9 @@ pipeline/research_strategy/
 │   ├── test_regime_factor_compound_strategy.py # 宏观政体策略离线单元测试
 │   ├── test_adaptive_fast_expansion_strategy.py # 自适应扩张策略离线单元测试
 │   ├── test_novel_alpha_strategies.py    # 新型阿尔法策略离线单元测试
-│   └── test_multi_strategy_alpha_book.py # 多策略 Alpha 账簿离线单元测试
+│   ├── test_multi_strategy_alpha_book.py # 多策略 Alpha 账簿离线单元测试
+│   ├── test_alpha101_factors.py          # 101 个 WorldQuant 阿尔法因子全量离线测试
+│   └── test_worldquant_alpha_strategy.py # WorldQuant 阿尔法策略模板离线测试
 └── README_ZH.md                          # 策略公式、引用与指南
 ```
 

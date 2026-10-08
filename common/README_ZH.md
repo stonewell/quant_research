@@ -2,7 +2,7 @@
 
 # `common` — 共享代码与数据 Schema
 
-本工作区中每个项目（`backtester`、`instrument_selection`、`research_strategy`、`strategy_generator`）共享的代码：市场数据加载（`data.py`）、标的池解析（`universe.py`）、技术指标（`indicators.py`、`indicator_features.py`）、Hurst 指数（`hurst.py`）、性能指标（`metrics.py`）、组合配置回测器（`allocation_backtester.py`）及其模板（`allocation_templates.py`）、共享网格搜索 + 等效随机搜索 (ERS) 验证（`allocation_search.py`）、共享因子分类学（`factor_taxonomy.py`）、再平衡调度（`scheduling.py`）、合成数据测试生成器（`testing.py`）、每个 `run_*.py` 入口的共享 CLI 脚手架（`cli_utils.py`）、共享输出写入规范（`reporting.py`）、共享打乱置换/安慰剂零假设显著性检验原语（`significance.py`）以及共享图表生成（`plotting.py`）。
+本工作区中每个项目（`backtester`、`instrument_selection`、`research_strategy`、`strategy_generator`）共享的代码：市场数据加载（`data.py`）、标的池解析（`universe.py`）、技术指标（`indicators.py`、`indicator_features.py`）、WorldQuant 101 阿尔法量化与横截面算子（`alpha101_operators.py`）、Hurst 指数（`hurst.py`）、性能指标（`metrics.py`）、组合配置回测器（`allocation_backtester.py`）及其模板（`allocation_templates.py`）、共享网格搜索 + 等效随机搜索 (ERS) 验证（`allocation_search.py`）、共享因子分类学（`factor_taxonomy.py`）、再平衡调度（`scheduling.py`）、合成数据测试生成器（`testing.py`）、每个 `run_*.py` 入口的共享 CLI 脚手架（`cli_utils.py`）、共享输出写入规范（`reporting.py`）、共享打乱置换/安慰剂零假设显著性检验原语（`significance.py`）以及共享图表生成（`plotting.py`）。
 
 **本文件是本工作区中由 2 个或以上项目共享的每个 DataFrame/数据集结构的唯一权威来源。** 每个项目自身的 README 仅记录其真正独特的 Schema，对于任何共享内容均链接回此处——参阅本文件底部的交叉参考索引。如果某 Schema 定义已在下方记录，请勿在项目 README 中重复定义。
 
