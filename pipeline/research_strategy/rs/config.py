@@ -558,6 +558,8 @@ class StrategyConfig:
     crb_enable_vol_targeting: bool = True     # enable Barroso & Santa-Clara continuous volatility targeting
     crb_target_vol: float = 0.12              # 12% target annualized volatility
     crb_smooth_drawdown: bool = True          # smooth linear drawdown damping instead of cliff-edge drops
+    crb_third_strategy_type: str = "composite" # "composite", "worldquant_alpha", "worldquant_mega_alpha"
+    crb_wq_alpha_id: Optional[int] = None     # WorldQuant Alpha ID (1-101) when crb_third_strategy_type == "worldquant_alpha"
 
     # --- Chan Four-State Risk-Managed Blend Strategy (chan_four_state_blend) ---
     # Enhanced institutional ensemble blending ChanFourStateExecutionStrategy (25%),
@@ -581,6 +583,57 @@ class StrategyConfig:
     cfsb_enable_vol_targeting: bool = True
     cfsb_target_vol: float = 0.12
     cfsb_smooth_drawdown: bool = True
+    cfsb_third_strategy_type: str = "four_state" # "four_state", "worldquant_alpha", "worldquant_mega_alpha"
+    cfsb_wq_alpha_id: Optional[int] = None       # WorldQuant Alpha ID (1-101) when cfsb_third_strategy_type == "worldquant_alpha"
+
+    # --- Chan Crisis Shield Blend Strategy (chan_crisis_shield_blend) ---
+    ccsb_three_type_weight: float = 0.45
+    ccsb_vaa_weight: float = 0.35
+    ccsb_shield_weight: float = 0.20
+    ccsb_shield_alpha_id: int = 12           # WorldQuant Alpha#12 (Volume Shock Reversal)
+    ccsb_shield_require_trend: bool = False
+    ccsb_max_single_position: float = 0.20
+    ccsb_min_weight_change: float = 0.05
+    ccsb_dd_reduce_thresh: float = 0.10
+    ccsb_dd_defensive_thresh: float = 0.15
+    ccsb_dd_stop_thresh: float = 0.20
+    ccsb_tier1_cooldown_bars: int = 15
+    ccsb_dynamic_cash_deployment: bool = True
+    ccsb_breadth_lookback: int = 50
+    ccsb_breadth_bull_thresh: float = 0.30
+    ccsb_thrust_lookback: int = 10
+    ccsb_thrust_thresh: float = 0.60
+    ccsb_target_bull_exposure: float = 0.80
+    ccsb_bull_max_single_position: float = 0.20
+    ccsb_enable_vol_targeting: bool = True
+    ccsb_target_vol: float = 0.12
+    ccsb_smooth_drawdown: bool = True
+
+    # --- Chan Dual Hybrid Alpha Blend Strategy (chan_dual_hybrid_blend) ---
+    cdhb_three_type_weight: float = 0.45
+    cdhb_vaa_weight: float = 0.35
+    cdhb_alpha1_weight: float = 0.10
+    cdhb_alpha2_weight: float = 0.10
+    cdhb_alpha1_id: int = 53                 # WorldQuant Alpha#53 (Candle Wick Imbalance)
+    cdhb_alpha2_id: int = 3                  # WorldQuant Alpha#3 (Volume-Price Rank Delta)
+    cdhb_alpha1_require_trend: bool = False  # Pure alpha extraction
+    cdhb_alpha2_require_trend: bool = False
+    cdhb_max_single_position: float = 0.20
+    cdhb_min_weight_change: float = 0.05
+    cdhb_dd_reduce_thresh: float = 0.10
+    cdhb_dd_defensive_thresh: float = 0.15
+    cdhb_dd_stop_thresh: float = 0.20
+    cdhb_tier1_cooldown_bars: int = 15
+    cdhb_dynamic_cash_deployment: bool = True
+    cdhb_breadth_lookback: int = 50
+    cdhb_breadth_bull_thresh: float = 0.30
+    cdhb_thrust_lookback: int = 10
+    cdhb_thrust_thresh: float = 0.60
+    cdhb_target_bull_exposure: float = 0.80
+    cdhb_bull_max_single_position: float = 0.20
+    cdhb_enable_vol_targeting: bool = True
+    cdhb_target_vol: float = 0.12
+    cdhb_smooth_drawdown: bool = True
 
     # --- Price Action Breakout & Retest Strategy (docs/chan_similar_trading.md Strategy 1) ---
     pabr_box_window: int = 20                # consolidation box length (~4 weeks)

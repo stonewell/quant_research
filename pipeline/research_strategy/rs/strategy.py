@@ -72,6 +72,8 @@ from .chan_signals import compute_chan3_signals, compute_chan_pivot_macd_signals
 from .chan_advanced_strategies import (
     ChanBestSelectorStrategy,
     ChanCompositeStrategy,
+    ChanCrisisShieldBlendStrategy,
+    ChanDualHybridBlendStrategy,
     ChanFourStateBlendStrategy,
     ChanFourStateExecutionStrategy,
     ChanMeanReversionDivergenceStrategy,
@@ -2093,6 +2095,8 @@ STRATEGY_CLASS_MAP = {
     "BollingerBandsStrategy": BollingerBandsStrategy,
     "ChanBestSelectorStrategy": ChanBestSelectorStrategy,
     "ChanCompositeStrategy": ChanCompositeStrategy,
+    "ChanCrisisShieldBlendStrategy": ChanCrisisShieldBlendStrategy,
+    "ChanDualHybridBlendStrategy": ChanDualHybridBlendStrategy,
     "ChanFiboSectorStrengthStrategy": ChanFiboSectorStrengthStrategy,
     "ChanFourStateBlendStrategy": ChanFourStateBlendStrategy,
     "ChanFourStateExecutionStrategy": ChanFourStateExecutionStrategy,

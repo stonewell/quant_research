@@ -28,6 +28,8 @@ from common.testing import make_ohlcv_from_closes, make_oscillating_df
 from research_strategy.rs.chan_advanced_strategies import (
     ChanBestSelectorStrategy,
     ChanCompositeStrategy,
+    ChanCrisisShieldBlendStrategy,
+    ChanDualHybridBlendStrategy,
     ChanFourStateBlendStrategy,
     ChanFourStateExecutionStrategy,
     ChanMeanReversionDivergenceStrategy,
@@ -1638,5 +1640,60 @@ def test_chan_risk_managed_blend_volatility_targeting():
     assert risky_tight.mean() <= risky_loose.mean() + 1e-5
 
 
+def test_chan_crisis_shield_blend_strategy():
+    """Verify ChanCrisisShieldBlendStrategy generates valid sparse weights,
+    honors max position cap, and properly routes capital."""
+    universe = create_mock_universe(n_days=400)
+    cfg = StrategyConfig(
+        ccsb_three_type_weight=0.45,
+        ccsb_vaa_weight=0.35,
+        ccsb_shield_weight=0.20,
+        ccsb_shield_alpha_id=12,
+        ccsb_max_single_position=0.20,
+        ccsb_min_weight_change=0.01,
+        cash_proxy="BIL",
+    )
+    strat = ChanCrisisShieldBlendStrategy(cfg)
+    assert "Alpha#12" in strat.explain_weights()
+    weights = strat.generate_weights(universe)
+    rebalances = weights.dropna(how="all")
+    assert not rebalances.empty
+
+    # Max single position constraint
+    for col in rebalances.columns:
+        if col != "BIL":
+            assert (rebalances[col] <= 0.20 + 1e-5).all()
+
+    # Weights sum to <= 1.0 (some can be in cash BIL)
+    assert (rebalances.sum(axis=1) <= 1.0 + 1e-5).all()
 
 
+def test_chan_dual_hybrid_blend_strategy():
+    """Verify ChanDualHybridBlendStrategy generates valid sparse weights,
+    integrates Alpha#53 and Alpha#3, and enforces risk controls."""
+    universe = create_mock_universe(n_days=400)
+    cfg = StrategyConfig(
+        cdhb_three_type_weight=0.45,
+        cdhb_vaa_weight=0.35,
+        cdhb_alpha1_weight=0.10,
+        cdhb_alpha2_weight=0.10,
+        cdhb_alpha1_id=53,
+        cdhb_alpha2_id=3,
+        cdhb_max_single_position=0.20,
+        cdhb_min_weight_change=0.01,
+        cash_proxy="BIL",
+    )
+    strat = ChanDualHybridBlendStrategy(cfg)
+    assert "Alpha#53" in strat.explain_weights()
+    assert "Alpha#3" in strat.explain_weights()
+    weights = strat.generate_weights(universe)
+    rebalances = weights.dropna(how="all")
+    assert not rebalances.empty
+
+    # Max single position constraint
+    for col in rebalances.columns:
+        if col != "BIL":
+            assert (rebalances[col] <= 0.20 + 1e-5).all()
+
+    # Weights sum to <= 1.0
+    assert (rebalances.sum(axis=1) <= 1.0 + 1e-5).all()

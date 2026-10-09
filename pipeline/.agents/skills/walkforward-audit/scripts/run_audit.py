@@ -333,7 +333,7 @@ def run_ranking(strategies, results_dir: Path, top_n: int = 10):
         dsr = s.get("deflated_sharpe_ratio") or 0.0
         folds = s.get("rolling_window_performance", [])
         sharpe_std = s.get("fold_sharpe_std", 1.0)
-        winning_folds = sum(1 for f in folds if f.get("sharpe_ratio", 0) > 0)
+        winning_folds = sum(1 for f in folds if (f.get("sharpe_ratio") or 0) > 0)
 
         if not audit:
             results.append({
@@ -553,7 +553,7 @@ def deep_analyze_top_strategies(
         trade_audit = audit_strategy_trades(results_dir, dir_name, summary)
 
         # Behavioral & Fold Metrics
-        cagrs = [f.get("cagr", 0.0) for f in folds_perf]
+        cagrs = [(f.get("cagr") or 0.0) for f in folds_perf]
         win_folds = sum(1 for c in cagrs if c > 0)
 
         best_fold_idx = cagrs.index(max(cagrs)) if cagrs else 0
@@ -593,9 +593,13 @@ def deep_analyze_top_strategies(
         if folds_perf:
             best_f = folds_perf[best_fold_idx]
             worst_f = folds_perf[worst_fold_idx]
+            best_cagr = (best_f.get('cagr') or 0.0) * 100
+            best_mdd = (best_f.get('max_drawdown') or 0.0) * 100
+            worst_cagr = (worst_f.get('cagr') or 0.0) * 100
+            worst_mdd = (worst_f.get('max_drawdown') or 0.0) * 100
             print(f"  Fold Dynamics: {win_folds}/{len(folds_perf)} Winning Folds | "
-                  f"Best: Fold {best_fold_idx+1} ({best_f.get('start_date')} to {best_f.get('end_date')}, CAGR: {best_f.get('cagr', 0.0)*100:.1f}%, MaxDD: {best_f.get('max_drawdown', 0.0)*100:.1f}%) | "
-                  f"Worst: Fold {worst_fold_idx+1} ({worst_f.get('start_date')} to {worst_f.get('end_date')}, CAGR: {worst_f.get('cagr', 0.0)*100:.1f}%, MaxDD: {worst_f.get('max_drawdown', 0.0)*100:.1f}%)")
+                  f"Best: Fold {best_fold_idx+1} ({best_f.get('start_date')} to {best_f.get('end_date')}, CAGR: {best_cagr:.1f}%, MaxDD: {best_mdd:.1f}%) | "
+                  f"Worst: Fold {worst_fold_idx+1} ({worst_f.get('start_date')} to {worst_f.get('end_date')}, CAGR: {worst_cagr:.1f}%, MaxDD: {worst_mdd:.1f}%)")
         print(f"  Capital & Friction: Active Weight Sum: {active_wsum:.2f} (Idle Cash: {idle_cash*100:.0f}%) | "
               f"Turnover: {r.get('turnover', 0.0):.1f}x | Total Friction Cost: {total_costs:,.2f} RMB | Net PnL: {total_pnl:,.2f} RMB")
 
