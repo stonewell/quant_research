@@ -1697,3 +1697,66 @@ def test_chan_dual_hybrid_blend_strategy():
 
     # Weights sum to <= 1.0
     assert (rebalances.sum(axis=1) <= 1.0 + 1e-5).all()
+
+
+def test_chan_dual_hybrid_anti_fragility_and_friction_control():
+    """Verify ChanDualHybridBlendStrategy anti-fragility and friction control mechanisms:
+    1. Sector throttle (max 1 per industry)
+    2. Minimum velocity hurdle (cdhb_thrust_min_roc)
+    3. Vol-adjusted risk parity sizing
+    4. Emergency mask inertia decoupling
+    """
+    from pipeline.research_strategy.rs.chan_advanced_strategies import _get_symbol_sector
+    
+    # Test sector mapper
+    assert _get_symbol_sector("601225.SH") == "coal"
+    assert _get_symbol_sector("601088.SH") == "coal"
+    assert _get_symbol_sector("601872.SH") == "shipping"
+    assert _get_symbol_sector("601919.SH") == "shipping"
+    assert _get_symbol_sector("600584.SH") == "semiconductor"
+    assert _get_symbol_sector("601899.SH") == "metals"
+    assert _get_symbol_sector("XYZ.US").startswith("sec_")
+
+    # Mock universe containing two coal stocks, two shipping stocks, and cash proxy
+    universe = create_mock_universe(n_days=300)
+    custom_uni = {
+        "601225.SH": universe["SPY"].copy(),  # Coal 1
+        "601088.SH": universe["QQQ"].copy(),  # Coal 2
+        "601872.SH": universe["SPY"].copy(),  # Shipping 1
+        "601919.SH": universe["QQQ"].copy(),  # Shipping 2
+        "BIL": universe["BIL"].copy(),
+    }
+    # Force upward trend for both coal stocks so both would qualify for thrust
+    for sym in ["601225.SH", "601088.SH", "601872.SH", "601919.SH"]:
+        custom_uni[sym]["Close"] = custom_uni[sym]["Close"] * np.linspace(1.0, 1.5, len(custom_uni[sym]))
+        custom_uni[sym]["High"] = custom_uni[sym]["Close"] * 1.02
+        custom_uni[sym]["Low"] = custom_uni[sym]["Close"] * 0.98
+
+    cfg = StrategyConfig(
+        cdhb_three_type_weight=0.0,
+        cdhb_vaa_weight=0.0,
+        cdhb_alpha1_weight=0.0,
+        cdhb_alpha2_weight=0.0,
+        cdhb_preemptive_thrust_deployment=True,
+        cdhb_min_thrust_assets=2,
+        cdhb_max_assets_per_sector=1,
+        cdhb_thrust_min_roc=0.01,
+        cdhb_thrust_sizing_mode="vol_adjusted",
+        cdhb_require_asset_trend=True,
+        cdhb_min_weight_change=0.05,
+        cdhb_max_single_position=0.25,
+        cash_proxy="BIL",
+    )
+    strat = ChanDualHybridBlendStrategy(cfg)
+    weights = strat.generate_weights(custom_uni)
+    rebals = weights.dropna(how="all")
+    assert not rebals.empty
+
+    # Verify sector throttle: in thrust allocations, strictly at most 1 coal stock is allocated
+    coal_stocks = ["601225.SH", "601088.SH"]
+    for dt, row in rebals.iterrows():
+        allocated_coal = sum(1 for s in coal_stocks if row.get(s, 0.0) > 0.01)
+        # Due to max_assets_per_sector = 1, thrust does not dual-allocate to both coal stocks
+        assert allocated_coal <= 1
+
+

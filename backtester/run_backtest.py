@@ -650,6 +650,8 @@ def main():
             params.get("min_weight_change")
             or params.get("crb_min_weight_change")
             or params.get("cfsb_min_weight_change")
+            or params.get("cdhb_min_weight_change")
+            or next((v for k, v in params.items() if k.endswith("_min_weight_change") and isinstance(v, (int, float))), 0.0)
             or 0.0
         )
         if strat_min_change > 0.0:

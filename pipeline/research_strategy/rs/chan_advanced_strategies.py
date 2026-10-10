@@ -35,6 +35,7 @@ All strategies inherit from `AllocationTemplate` and maximize code reuse from
 `rs/chan_structure.py`, `rs/chan_signals.py`, and `common.position_exits`.
 """
 
+from collections import defaultdict
 from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
@@ -2607,6 +2608,31 @@ class ChanCrisisShieldBlendStrategy(ChanRiskManagedBlendStrategy):
         )
 
 
+CHINA_EQUITY_SECTORS = {
+    "601225.SH": "coal", "601088.SH": "coal",
+    "601857.SH": "oil_petrochem", "600028.SH": "oil_petrochem",
+    "601872.SH": "shipping", "601919.SH": "shipping",
+    "601111.SH": "aviation",
+    "601728.SH": "telecom", "600941.SH": "telecom",
+    "601288.SH": "banking", "601398.SH": "banking", "600000.SH": "banking", "601166.SH": "banking",
+    "601601.SH": "insurance",
+    "601899.SH": "metals", "600362.SH": "metals",
+    "000157.SZ": "machinery",
+    "600584.SH": "semiconductor", "002371.SZ": "semiconductor",
+    "000938.SZ": "computer_ict",
+    "300394.SZ": "telecom_cpo",
+    "600660.SH": "auto_parts",
+    "601390.SH": "construction",
+}
+
+
+def _get_symbol_sector(sym: str) -> str:
+    if sym in CHINA_EQUITY_SECTORS:
+        return CHINA_EQUITY_SECTORS[sym]
+    raw = sym.split(".")[0]
+    return f"sec_{raw[:2]}" if len(raw) >= 2 else "sec_other"
+
+
 class ChanDualHybridBlendStrategy(AllocationTemplate):
     """Chan Dual Hybrid Alpha Blend Strategy (缠论双因子混合Alpha配置策略):
 
@@ -2684,6 +2710,13 @@ class ChanDualHybridBlendStrategy(AllocationTemplate):
         dd_stop_thresh = float(p.get("cdhb_dd_stop_thresh", getattr(cfg, "cdhb_dd_stop_thresh", 0.20)))
         tier1_cooldown_bars = int(p.get("cdhb_tier1_cooldown_bars", getattr(cfg, "cdhb_tier1_cooldown_bars", 15)))
         dynamic_cash = bool(p.get("cdhb_dynamic_cash_deployment", getattr(cfg, "cdhb_dynamic_cash_deployment", True)))
+        preemptive_thrust = bool(p.get("cdhb_preemptive_thrust_deployment", getattr(cfg, "cdhb_preemptive_thrust_deployment", True)))
+        min_thrust_assets = int(p.get("cdhb_min_thrust_assets", getattr(cfg, "cdhb_min_thrust_assets", 5)))
+        max_assets_per_sector = int(p.get("cdhb_max_assets_per_sector", getattr(cfg, "cdhb_max_assets_per_sector", 1)))
+        thrust_min_roc = float(p.get("cdhb_thrust_min_roc", getattr(cfg, "cdhb_thrust_min_roc", 0.01)))
+        thrust_sizing_mode = str(p.get("cdhb_thrust_sizing_mode", getattr(cfg, "cdhb_thrust_sizing_mode", "vol_adjusted")))
+        require_asset_trend = bool(p.get("cdhb_require_asset_trend", getattr(cfg, "cdhb_require_asset_trend", True)))
+        asset_stop_cooldown_bars = int(p.get("cdhb_asset_stop_cooldown_bars", getattr(cfg, "cdhb_asset_stop_cooldown_bars", 15)))
         breadth_lookback = int(p.get("cdhb_breadth_lookback", getattr(cfg, "cdhb_breadth_lookback", 50)))
         breadth_bull_thresh = float(p.get("cdhb_breadth_bull_thresh", getattr(cfg, "cdhb_breadth_bull_thresh", 0.30)))
         thrust_lookback = int(p.get("cdhb_thrust_lookback", getattr(cfg, "cdhb_thrust_lookback", 10)))
@@ -2691,7 +2724,7 @@ class ChanDualHybridBlendStrategy(AllocationTemplate):
         target_bull_exposure = float(p.get("cdhb_target_bull_exposure", getattr(cfg, "cdhb_target_bull_exposure", 0.80)))
         bull_max_pos = float(p.get("cdhb_bull_max_single_position", getattr(cfg, "cdhb_bull_max_single_position", 0.20)))
         enable_vol_targeting = bool(p.get("cdhb_enable_vol_targeting", getattr(cfg, "cdhb_enable_vol_targeting", True)))
-        target_vol = float(p.get("cdhb_target_vol", getattr(cfg, "cdhb_target_vol", 0.12)))
+        target_vol = float(p.get("cdhb_target_vol", getattr(cfg, "cdhb_target_vol", 0.14)))
         smooth_drawdown = bool(p.get("cdhb_smooth_drawdown", getattr(cfg, "cdhb_smooth_drawdown", True)))
 
         tot_w = three_w + vaa_w + a1_w + a2_w
@@ -2711,16 +2744,21 @@ class ChanDualHybridBlendStrategy(AllocationTemplate):
         if master_index is None or len(master_index) == 0:
             return pd.DataFrame()
 
-        # Precompute breadth & thrust
+        # Precompute breadth, thrust, 10-day ROC matrix, and 50-day trend matrix
         breadth_matrix = pd.DataFrame(index=master_index, columns=risky_symbols, dtype=float)
         thrust_matrix = pd.DataFrame(index=master_index, columns=risky_symbols, dtype=float)
+        roc_matrix = pd.DataFrame(index=master_index, columns=risky_symbols, dtype=float)
+        trend_50_matrix = pd.DataFrame(index=master_index, columns=risky_symbols, dtype=float)
         for sym in risky_symbols:
             if sym in universe and not universe[sym].empty:
                 c = universe[sym]["Close"].reindex(master_index).ffill()
                 ma = sma(c, breadth_lookback)
                 breadth_matrix[sym] = (c > ma).astype(float)
+                ma50 = sma(c, 50)
+                trend_50_matrix[sym] = (c >= ma50).astype(float)
                 c_prev = c.shift(thrust_lookback)
                 roc_thrust = (c / c_prev - 1.0)
+                roc_matrix[sym] = roc_thrust
                 thrust_matrix[sym] = (roc_thrust > 0.0).astype(float)
         daily_breadth = breadth_matrix.mean(axis=1).fillna(0.50)
         daily_thrust = thrust_matrix.mean(axis=1).fillna(0.50)
@@ -2748,6 +2786,7 @@ class ChanDualHybridBlendStrategy(AllocationTemplate):
             c = universe[sym]["Close"].reindex(master_index).ffill()
             asset_returns[sym] = c.pct_change().fillna(0.0)
 
+        asset_vol_21d = (asset_returns.rolling(21, min_periods=10).std() * np.sqrt(252)).fillna(target_vol)
         market_ret = asset_returns.mean(axis=1).fillna(0.0)
         market_vol_21d = (market_ret.rolling(21, min_periods=10).std() * np.sqrt(252)).fillna(target_vol)
 
@@ -2759,6 +2798,10 @@ class ChanDualHybridBlendStrategy(AllocationTemplate):
         stop_counter = 0
         stop_cooldown_bars = 21
 
+        asset_cooldown_until = {s: 0 for s in risky_symbols}
+        asset_entry_price = {s: None for s in risky_symbols}
+        emergency_flags = []
+
         for t in range(len(master_index)):
             date = master_index[t]
             if t > 0:
@@ -2769,6 +2812,20 @@ class ChanDualHybridBlendStrategy(AllocationTemplate):
                 if cum_nav > peak_nav:
                     peak_nav = cum_nav
             nav_history.append(cum_nav)
+
+            # Track asset-level stop loss (-8%) and asset cooldown
+            for s in risky_symbols:
+                prev_w = float(daily_weights.loc[prev_date, s]) if t > 0 else 0.0
+                curr_p = float(universe[s]["Close"].reindex(master_index).ffill().iloc[t]) if s in universe and not universe[s].empty else 0.0
+                if prev_w > 1e-4 and curr_p > 0:
+                    if asset_entry_price[s] is None or asset_entry_price[s] <= 0:
+                        asset_entry_price[s] = curr_p
+                    elif curr_p < asset_entry_price[s] * 0.92:  # -8% stop loss triggers cooldown
+                        asset_cooldown_until[s] = t + asset_stop_cooldown_bars
+                        asset_entry_price[s] = None
+                elif prev_w <= 1e-4:
+                    if t >= asset_cooldown_until[s]:
+                        asset_entry_price[s] = None
 
             lookback_idx = max(0, len(nav_history) - 1 - 10)
             r_10d = (cum_nav / nav_history[lookback_idx] - 1.0) if len(nav_history) > 10 else 0.0
@@ -2837,6 +2894,7 @@ class ChanDualHybridBlendStrategy(AllocationTemplate):
                 raw_w = raw_blend.copy()
                 is_emergency = False
 
+            emergency_flags.append(is_emergency)
             effective_cap = max_single_pos
             if not is_emergency and dynamic_cash:
                 breadth = float(daily_breadth.iloc[t])
@@ -2852,8 +2910,84 @@ class ChanDualHybridBlendStrategy(AllocationTemplate):
                             scale_factor = target_exp / cur_exp
                             for s in active_risky:
                                 raw_w[s] = min(effective_cap, raw_w[s] * scale_factor)
-                            if cash_proxy in symbols:
-                                raw_w[cash_proxy] = max(0.0, 1.0 - float(raw_w[risky_symbols].sum()))
+
+                    # Pre-Emptive Multi-Asset Breadth Thrust Cash Deployment with Volume-Price Confirmation & Anti-Fragility
+                    if thrust_active and preemptive_thrust:
+                        tot_active = float(raw_w[risky_symbols].sum())
+                        if tot_active < target_exp:
+                            unallocated = target_exp - tot_active
+                            row_roc = roc_matrix.iloc[t]
+                            row_trend = trend_50_matrix.iloc[t]
+                            # Composite scoring: 10d ROC momentum boosted by Alpha#3 volume-price rank delta weight
+                            cand_scores = {}
+                            cand_vols = {}
+                            for s in risky_symbols:
+                                if t < asset_cooldown_until[s]:
+                                    continue
+                                r_val = float(row_roc[s]) if pd.notna(row_roc[s]) else 0.0
+                                if r_val >= thrust_min_roc:
+                                    if require_asset_trend and float(row_trend[s]) < 0.5:
+                                        continue
+                                    a2_bonus = max(0.0, float(w_a2_daily.loc[date, s])) if s in w_a2_daily.columns else 0.0
+                                    cand_scores[s] = r_val * (1.0 + 5.0 * a2_bonus)
+                                    v = float(asset_vol_21d.iloc[t][s]) if pd.notna(asset_vol_21d.iloc[t][s]) else target_vol
+                                    cand_vols[s] = max(0.10, v)
+
+                            # Sector concentration throttle (Suggestion 2): count active holdings per sector
+                            all_sorted = sorted(cand_scores.keys(), key=lambda s: (-cand_scores[s], s))
+                            sorted_cands = []
+                            sector_counts = defaultdict(int)
+                            for s in risky_symbols:
+                                if float(raw_w[s]) > 0.01:
+                                    sec = _get_symbol_sector(s)
+                                    sector_counts[sec] += 1
+
+                            for cand in all_sorted:
+                                sec = _get_symbol_sector(cand)
+                                if sector_counts[sec] < max_assets_per_sector:
+                                    sorted_cands.append(cand)
+                                    sector_counts[sec] += 1
+                                if len(sorted_cands) >= min_thrust_assets:
+                                    break
+
+                            n_cands = len(sorted_cands)
+                            if n_cands > 0:
+                                # Anti-fragility sizing: inverse-volatility risk-balanced weights
+                                if thrust_sizing_mode == "vol_adjusted":
+                                    inv_vols = {c: (cand_scores[c] / cand_vols[c]) for c in sorted_cands}
+                                    tot_inv = sum(inv_vols.values()) or 1.0
+                                    target_shares = {c: inv_vols[c] / tot_inv for c in sorted_cands}
+                                else:
+                                    target_shares = {c: 1.0 / n_cands for c in sorted_cands}
+
+                                thrust_slot_cap = min(effective_cap, max(0.04, unallocated / n_cands))
+
+                                # Pass 1: Proportional risk-balanced allocation up to thrust_slot_cap
+                                for cand in sorted_cands:
+                                    if unallocated <= 1e-6:
+                                        break
+                                    current_w = float(raw_w[cand])
+                                    space = max(0.0, effective_cap - current_w)
+                                    if space > 0.01:
+                                        alloc_desired = unallocated * target_shares[cand]
+                                        alloc = min(space, min(thrust_slot_cap, alloc_desired))
+                                        raw_w[cand] = current_w + alloc
+                                        unallocated -= alloc
+
+                                # Pass 2: Fill remaining unallocated cash across qualified candidates up to effective_cap
+                                if unallocated > 1e-6:
+                                    for cand in sorted_cands:
+                                        if unallocated <= 1e-6:
+                                            break
+                                        current_w = float(raw_w[cand])
+                                        space = max(0.0, effective_cap - current_w)
+                                        if space > 0.01:
+                                            alloc = min(space, unallocated)
+                                            raw_w[cand] = current_w + alloc
+                                            unallocated -= alloc
+
+                    if cash_proxy in symbols:
+                        raw_w[cash_proxy] = max(0.0, 1.0 - float(raw_w[risky_symbols].sum()))
 
             if enable_vol_targeting:
                 current_mkt_vol = float(market_vol_21d.iloc[t])
@@ -2876,8 +3010,14 @@ class ChanDualHybridBlendStrategy(AllocationTemplate):
 
             daily_weights.loc[date] = raw_w
 
+        emergency_mask = pd.Series(emergency_flags, index=master_index) if emergency_flags else None
         if min_weight_change > 0.0:
-            daily_weights = apply_asset_inertia(daily_weights, min_weight_change=min_weight_change, cash_proxy=cash_proxy)
+            daily_weights = apply_asset_inertia(
+                daily_weights,
+                min_weight_change=min_weight_change,
+                cash_proxy=cash_proxy,
+                emergency_mask=emergency_mask,
+            )
         daily_weights = _fill_out_columns(daily_weights, symbols)
         return _sparse_from_daily(daily_weights)
 
@@ -2892,13 +3032,15 @@ class ChanDualHybridBlendStrategy(AllocationTemplate):
         a2_w = float(p.get("cdhb_alpha2_weight", getattr(cfg, "cdhb_alpha2_weight", 0.10)))
         max_pos = float(p.get("cdhb_max_single_position", getattr(cfg, "cdhb_max_single_position", 0.20)))
         min_chg = float(p.get("cdhb_min_weight_change", getattr(cfg, "cdhb_min_weight_change", 0.05)))
+        max_sec = int(p.get("cdhb_max_assets_per_sector", getattr(cfg, "cdhb_max_assets_per_sector", 1)))
         return (
             f"Chan Dual Hybrid Alpha Blend Strategy (chan_dual_hybrid_blend): "
-            f"walkforward-champion institutional ensemble blending chan_vaa_compound ({vaa_w:.0%}), "
+            f"anti-fragile institutional ensemble blending chan_vaa_compound ({vaa_w:.0%}), "
             f"chan_three_type ({three_w:.0%}), WorldQuant Alpha#{a1_id} Candle Wick Imbalance ({a1_w:.0%}), "
             f"and WorldQuant Alpha#{a2_id} Volume-Price Rank Delta ({a2_w:.0%}) with hard position cap ({max_pos:.0%} max per stock), "
             f"drawdown circuit breakers (smooth damping from 10%, defensive VAA at 15%, stop at 20% with fast recovery & 15d auto-heal), "
-            f"turnover filter (min trade change {min_chg:.0%}), volatility targeting (12% target vol), and dynamic cash deployment in bull breadth (>=30% or 10d thrust)."
+            f"turnover filter (min trade change {min_chg:.0%}), volatility targeting (14% target vol), "
+            f"and anti-fragile pre-emptive thrust cash deployment with sector throttle (max {max_sec} per industry) and inverse-vol risk parity sizing."
         )
 
     def warmup_bars(self, params: dict = None) -> int:

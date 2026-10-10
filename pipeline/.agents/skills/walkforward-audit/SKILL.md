@@ -5,15 +5,18 @@ description: >-
   quantitative anomalies (single-stock concentration, warmup delay, cash drag,
   equity outliers, turnover friction, look-ahead bias), computes anomaly-adjusted
   Sharpe rankings, deeply analyzes top 3 strategies for behavioral distortions,
-  and recommends losing assets to exclude from the universe. Use whenever the user
-  asks to analyze walkforward backtests, check trade records, find anomalies in top
-  strategies, reorder strategy rankings, recommend losing assets to exclude, or
-  build risk-managed live trading strategies.
+  recommends losing assets to exclude from the universe, and conducts forensic
+  anomaly and overfitting audits (Leave-One-Out asset fragility, superstar winner skew,
+  friction bleed, cash-normalized drawdown, overfit risk scoring, and safety grading).
+  Use whenever the user asks to analyze walkforward backtests, check trade records,
+  find anomalies in top strategies, audit for abnormalities and overfitting,
+  reorder strategy rankings, recommend losing assets to exclude, or build
+  risk-managed live trading strategies.
 ---
 
 # Walkforward Audit & Live Strategy Formulation
 
-This skill implements a battle-tested 5-phase quantitative audit process to evaluate walkforward backtesting results, detect hidden backtest distortions in fold-level trade logs, compute realistic live-readiness rankings, conduct deep behavioral analysis on top-3 strategies, identify persistent losing assets to prune from trading universes, and synthesize robust production trading strategies.
+This skill implements an institutional 6-phase quantitative audit process to evaluate walkforward backtesting results, detect hidden backtest distortions in fold-level trade logs, compute realistic live-readiness rankings, conduct deep behavioral analysis on top-3 strategies, identify persistent losing assets to prune from trading universes, and conduct forensic anomaly and overfitting audits with Leave-One-Out fragility testing and live-safety grading.
 
 ---
 
@@ -32,7 +35,7 @@ This skill implements a battle-tested 5-phase quantitative audit process to eval
 ┌─────────────────────────────────────────────────────────────────┐
 │ Phase 2: Audit Fold Trading Records                            │
 │ - Parse walkforward_rebalances.csv logs                         │
-│ - Detect 7 key anomaly patterns (concentration, warmup, jumps)  │
+│ - Detect key anomaly patterns (concentration, warmup, jumps)    │
 └────────────────────────────────┬────────────────────────────────┘
                                  │
                                  ▼
@@ -45,7 +48,7 @@ This skill implements a battle-tested 5-phase quantitative audit process to eval
                                  │
                                  ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ Phase 4: Top 3 Strategy Deep Behavioral & Anomaly Analysis      │
+│ Phase 4: Top 3 Strategy Deep Behavioral Analysis                │
 │ - Analyze fold dynamics (best vs worst fold, return dispersion) │
 │ - Quantify cash drag, turnover velocity & friction tax (RMB)    │
 │ - Check single-fold profit concentration ("one-hit wonder")     │
@@ -59,6 +62,17 @@ This skill implements a battle-tested 5-phase quantitative audit process to eval
 │ - Classify chronic losers, negative ROI drift, friction bleed   │
 │ - Recommend losing assets to exclude from trading universe      │
 │ - Export pruned universe file & generate CLI rerun snippet      │
+└────────────────────────────────┬────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Phase 6: Forensic Anomaly & Overfitting Audit                   │
+│ - Quantitative Anomaly & Overfit Inspection Matrix (9 metrics)  │
+│ - Leave-One-Out (LOO) Asset Fragility Analysis (Top 1/2/3)      │
+│ - Turnover Friction Bleed & Churn Asset Cluster Analysis        │
+│ - Capital Efficiency & Cash-Normalized Drawdown (Norm MaxDD)    │
+│ - Overfit Risk Index (0-100) & Safety Grade (Grade A/B/C/F)     │
+│ - Export Markdown Audit Report (--export-overfit-report)        │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -190,9 +204,58 @@ python3 .agents/skills/walkforward-audit/scripts/run_audit.py --results-dir <TAR
 
 ---
 
+### Step 6: Forensic Anomaly & Overfitting Audit
+
+Run the deep forensic anomaly and overfitting audit engine across candidate strategies (or the top N strategies):
+
+```bash
+# Terminal output with inspection matrix & LOO table
+python3 .agents/skills/walkforward-audit/scripts/run_audit.py --results-dir <TARGET_DIR> \
+  --abnormal-overfit --deep-top-n 3
+
+# Or export an audit report in GitHub-flavored Markdown
+python3 .agents/skills/walkforward-audit/scripts/run_audit.py --results-dir <TARGET_DIR> \
+  --abnormal-overfit --deep-top-n 3 \
+  --export-overfit-report docs/audit/forensic_overfit_report.md
+```
+
+**Quantitative Anomaly & Overfit Inspection Matrix**:
+1. **Look-Ahead Bias Check**:
+   - Buy hit rate: $45\% - 55\%$ is standard. If $>70\%$, flag as `DATA LEAKAGE RISK`.
+2. **Single-Stock Concentration**:
+   - Checks if any trade had $|w_i| \ge 80\%$ or $\ge 99\%$, and audits maximum single position against the $20\%$ cap.
+3. **Fold 1 Warmup Padding**:
+   - Checks if first trade in Fold 1 took $>60$ days to execute, artificially suppressing drawdown.
+4. **Outlier Equity Jumps**:
+   - Single-rebalance equity jump $>30\%$ indicates single-trade dependency or multi-bagger lucky timing.
+5. **Statistical Edge (DSR)**:
+   - Deflated Sharpe Ratio must be $>0.05$ (ideal $>0.50$). If $DSR \approx 0$, backtest alpha is likely data-mined noise.
+6. **Profit Concentration Skew ("One-Hit Wonder")**:
+   - If the single best fold generates $>40\%$ (or $>60\%$) of positive cumulative CAGR, flag `HIGH REGIME RISK`.
+7. **Superstar Asset Fragility & Leave-One-Out (LOO) Analysis**:
+   - Computes net profit share of Top 1, Top 2, Top 3 winning assets.
+   - **LOO Sensitivity Test**: Automatically tests removing Top 1, Top 2, and Top 3 winners. If excluding the #1 winner flips net PnL from positive to **negative**, the strategy has **CRITICAL FRAGILITY / SUPERSTAR OVERFIT**.
+8. **Friction Bleed Ratio**:
+   - Quantifies transaction friction (commissions, slippage, stamp duty) as a percentage of net gains:
+     $$\text{Friction Bleed} = \frac{\text{Total Friction Costs}}{\text{Net PnL}} \times 100\%$$
+   - $>15\%$ is elevated; $>30\%$ indicates severe churn eroding true alpha.
+9. **Capital Drag & Cash Flattery**:
+   - Computes average active risky exposure $\bar{w}_{\text{active}}$ and idle cash $\%$.
+   - Calculates **Cash-Normalized Maximum Drawdown**:
+     $$\text{MaxDD}_{\text{normalized}} = \frac{\text{MaxDD}_{\text{raw}}}{\max(\bar{w}_{\text{active}}, 0.10)}$$
+     Exposes whether low drawdowns are real alpha or simply cash flattery.
+
+**Overfit Risk Index (0-100) & Safety Grades**:
+- **Grade A (Institutional Grade, Risk $\le 20$)**: Distributed cross-sectional alpha, passes LOO test, disciplined friction, statistically significant.
+- **Grade B (Moderate Caution, Risk $21 - 40$)**: Viable edge with live risk constraints (position limits, turnover throttles).
+- **Grade C (High Overfit Risk, Risk $41 - 65$)**: Fragile; collapses if top winner or top fold is removed. Requires structural refactoring (anti-fragility engine, sector throttle).
+- **Grade F (Rejected, Risk $> 65$)**: Severe overfit, data leakage, or unviable live execution.
+
+---
+
 ### Full Pipeline Run
 
-To execute the entire 5-phase audit in a single command:
+To execute the entire 6-phase audit (including loss drag exclusion and forensic overfit audit) in a single command:
 
 ```bash
 python3 .agents/skills/walkforward-audit/scripts/run_audit.py --results-dir <TARGET_DIR> --all --deep-top-n 3
@@ -203,6 +266,17 @@ python3 .agents/skills/walkforward-audit/scripts/run_audit.py --results-dir <TAR
 ## Quick Reference Scripts
 
 - **Complete Audit Runner**: [run_audit.py](./scripts/run_audit.py)
-  - Options: `--all`, `--summary`, `--audit`, `--rank`, `--deep-analyze`, `--deep-top-n N`, `--exclude-losers`, `--universe-file PATH`, `--export-pruned-universe PATH`, `--results-dir PATH`
+  - Options:
+    - `--all`: Execute all 6 audit phases end-to-end.
+    - `--summary`: Cross-strategy performance & DSR aggregation.
+    - `--audit`: Fold trading record anomaly detection.
+    - `--rank`: Anomaly-adjusted Sharpe ranking.
+    - `--deep-analyze` / `--deep`: Behavioral fold & alpha driver attribution.
+    - `--exclude-losers`: Chronic loser classification & universe pruning.
+    - `--abnormal-overfit` / `--overfit`: Forensic anomaly & overfit audit (LOO fragility, inspection matrix, safety grade).
+    - `--export-overfit-report PATH`: Export forensic report in GitHub markdown.
+    - `--universe-file PATH` / `--export-pruned-universe PATH`: Cleaned universe export.
+    - `--results-dir PATH`: Target results directory to audit.
 - **Detailed Anomaly Reference**: [anomaly_patterns.md](./references/anomaly_patterns.md)
 - **Live Risk Management Guide**: [live_risk_rules.md](./references/live_risk_rules.md)
+

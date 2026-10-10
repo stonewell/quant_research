@@ -160,6 +160,33 @@ def load_all_summaries(results_dir: Path, strategy_name: str = None):
             strategies.append(data)
         except Exception as e:
             print(f"Warning: Failed to parse {summary_path}: {e}", file=sys.stderr)
+
+    if not strategies:
+        for entry in sorted(os.listdir(results_dir)):
+            sub = results_dir / entry
+            if not sub.is_dir():
+                continue
+            for sub_entry in sorted(os.listdir(sub)):
+                sub_sub = sub / sub_entry
+                if not sub_sub.is_dir():
+                    continue
+                summary_path = sub_sub / "walkforward_summary.json"
+                if not summary_path.is_file():
+                    continue
+                try:
+                    with open(summary_path) as f:
+                        data = json.load(f)
+                    strat = (
+                        data.get("strategy_name")
+                        or data.get("strategy")
+                        or _detect_strategy_name(sub_sub, strategy_name)
+                    )
+                    data["dir_name"] = f"{entry}/{sub_entry}"
+                    data["strategy"] = f"{strat} [Batch {entry}]"
+                    strategies.append(data)
+                except Exception as e:
+                    print(f"Warning: Failed to parse {summary_path}: {e}", file=sys.stderr)
+
     return strategies
 
 
@@ -722,16 +749,293 @@ def deep_analyze_top_strategies(
     print("=" * 140)
 
 
+def audit_abnormal_and_overfit(
+    ranked_results: list,
+    results_dir: Path,
+    top_n: int = 3,
+    export_report_path: str = None,
+):
+    """Conducts a forensic quantitative anomaly & overfitting audit on top N strategies.
+
+    Inspects:
+    1. Look-Ahead Bias & Directional Timing Anomalies (buy hit rate > 70%)
+    2. Single-Stock All-In Concentration (bets >= 80% or 99%)
+    3. Fold 1 Warmup Padding (first trade delayed > 60d)
+    4. Outlier Equity Jumps (single-rebalance jump > 30%)
+    5. Statistical Alpha Deflation (DSR < 0.05 vs > 0.50)
+    6. Profit Concentration / Regime Fragility ("One-Hit Wonder" fold share > 40%)
+    7. Superstar Asset Fragility & Leave-One-Out (LOO) Sensitivity Test
+    8. Turnover Friction Bleed (Transaction fees as % of gross/net PnL)
+    9. Capital Efficiency vs Cash Flattery (Cash-normalized MaxDD)
+    10. Overfitting Risk Score (0-100) & Live-Trading Safety Grade (A / B / C / F)
+    """
+    if not ranked_results:
+        print("No ranked strategies available for anomaly & overfit audit.", file=sys.stderr)
+        return
+
+    top_strats = ranked_results[:top_n]
+    print("\n" + "=" * 140)
+    print(f"STAGE 6: FORENSIC ANOMALY & OVERFITTING AUDIT (TOP {len(top_strats)} STRATEGIES)")
+    print("=" * 140)
+
+    report_markdown_blocks = []
+
+    for idx, r in enumerate(top_strats, 1):
+        strat_name = r["strategy"]
+        dir_name = r.get("dir_name", "")
+        summary = r.get("summary", {})
+        folds_perf = summary.get("rolling_window_performance", [])
+
+        asset_data = audit_strategy_assets(results_dir, dir_name)
+        trade_audit = audit_strategy_trades(results_dir, dir_name, summary)
+
+        # 1. Look-ahead bias
+        hit_rate = trade_audit.get("buy_hit_rate", 0.50) if trade_audit else 0.50
+        hit_rate_pct = hit_rate * 100.0
+        lookahead_status = "CLEAN" if hit_rate <= 0.65 else ("WARNING" if hit_rate <= 0.75 else "DATA LEAKAGE RISK")
+        lookahead_diag = "Realistic trend hit rate; no forward leakage" if hit_rate <= 0.65 else ("Elevated timing hit rate" if hit_rate <= 0.75 else "Suspiciously high directional accuracy")
+
+        # 2. All-in bets & concentration
+        all_in_cnt = r.get("all_in", 0)
+        trades = asset_data.get("trades", []) if asset_data else []
+        max_pos = max((abs(t["target_weight"]) for t in trades), default=0.0) * 100.0
+        allin_status = "CLEAN" if (all_in_cnt == 0 and max_pos <= 25.0) else ("WARNING" if max_pos <= 50.0 else "HIGH CONCENTRATION")
+        allin_diag = f"Strict position caps (Max pos: {max_pos:.1f}%)" if (all_in_cnt == 0 and max_pos <= 25.0) else f"{all_in_cnt} all-in trades; Max pos: {max_pos:.1f}%"
+
+        # 3. Warmup padding
+        warmup_days = trade_audit.get("warmup_days_fold1", 0) if trade_audit else 0
+        warmup_status = "CLEAN" if warmup_days <= 30 else ("WARNING" if warmup_days <= 60 else "PADDED")
+        warmup_diag = f"Immediate trade execution (+{warmup_days}d)" if warmup_days <= 30 else f"Delayed trading by +{warmup_days} days in Fold 1"
+
+        # 4. Outlier equity jump
+        max_jump = (r.get("max_jump", 0.0) or 0.0) * 100.0
+        jump_status = "CLEAN" if max_jump <= 15.0 else ("MODERATE" if max_jump <= 30.0 else "OUTLIER DRIVEN")
+        jump_diag = f"Equity curve grew incrementally (Max: {max_jump:.1f}%)" if max_jump <= 15.0 else f"Single rebalance jump of {max_jump:.1f}%"
+
+        # 5. DSR statistical edge
+        dsr = r.get("dsr", 0.0) or 0.0
+        dsr_status = "EXCELLENT" if dsr >= 0.50 else ("PASS" if dsr >= 0.05 else "FAIL / MINED")
+        dsr_diag = f"Deflated Sharpe confirms statistical alpha (DSR: {dsr:.4f})" if dsr >= 0.05 else f"DSR {dsr:.4f} indicates high data-mining / noise risk"
+
+        # 6. Profit concentration ("One-Hit Wonder")
+        cagrs = [(f.get("cagr") or 0.0) for f in folds_perf]
+        pos_cagr_sum = sum(c for c in cagrs if c > 0)
+        top_fold_share = (max(cagrs) / pos_cagr_sum * 100.0) if pos_cagr_sum > 0 else 0.0
+        best_fold_idx = (cagrs.index(max(cagrs)) + 1) if cagrs else 1
+        worst_fold_idx = (cagrs.index(min(cagrs)) + 1) if cagrs else 1
+        fold_status = "CLEAN" if top_fold_share <= 40.0 else ("WARNING" if top_fold_share <= 60.0 else "HIGH REGIME RISK")
+        fold_diag = f"Evenly distributed across folds (Fold {best_fold_idx}: {top_fold_share:.1f}%)" if top_fold_share <= 40.0 else f"Fold {best_fold_idx} generated {top_fold_share:.1f}% of positive returns"
+
+        # 7. Superstar asset fragility & Leave-One-Out (LOO) test
+        total_net_pnl = asset_data.get("total_net_pnl", 0.0) if asset_data else 0.0
+        winners = asset_data.get("winners", []) if asset_data else []
+        losers = asset_data.get("losers", []) if asset_data else []
+        assets_list = asset_data.get("assets", []) if asset_data else []
+
+        top1_pnl = winners[0]["net_pnl"] if len(winners) > 0 else 0.0
+        top2_pnl = (winners[0]["net_pnl"] + winners[1]["net_pnl"]) if len(winners) > 1 else top1_pnl
+        top3_pnl = sum(w["net_pnl"] for w in winners[:3]) if len(winners) > 0 else 0.0
+
+        top3_share = (top3_pnl / total_net_pnl * 100.0) if total_net_pnl > 1e-4 else (999.0 if top3_pnl > 0 else 0.0)
+        fragility_status = "ROBUST" if top3_share <= 60.0 else ("WARNING" if top3_share <= 100.0 else "HIGH FRAGILITY")
+        fragility_diag = f"Top 3 assets contributed {top3_share:.1f}% of net gain" if top3_share <= 100.0 else f"Top 3 contributed {top3_share:.1f}% (losers drained remaining gain)"
+
+        # LOO Calculations
+        loo_results = []
+        loo_results.append({
+            "scenario": f"Baseline (All {len(assets_list)} Assets)",
+            "pnl": total_net_pnl,
+            "drop_pct": 0.0,
+            "status": "Normal Operation",
+        })
+        if len(winners) >= 1:
+            pnl_ex1 = total_net_pnl - top1_pnl
+            drop_ex1 = (top1_pnl / total_net_pnl * 100.0) if total_net_pnl != 0 else 0.0
+            stat_ex1 = "VIABLE" if pnl_ex1 > 0 else "FLIPS UNPROFITABLE (CRITICAL)"
+            loo_results.append({
+                "scenario": f"Exclude Top 1 ({winners[0]['symbol']})",
+                "pnl": pnl_ex1,
+                "drop_pct": -drop_ex1,
+                "status": stat_ex1,
+            })
+        if len(winners) >= 2:
+            pnl_ex2 = total_net_pnl - top2_pnl
+            drop_ex2 = (top2_pnl / total_net_pnl * 100.0) if total_net_pnl != 0 else 0.0
+            stat_ex2 = "VIABLE" if pnl_ex2 > 0 else "UNPROFITABLE"
+            loo_results.append({
+                "scenario": f"Exclude Top 2 ({winners[0]['symbol']}, {winners[1]['symbol']})",
+                "pnl": pnl_ex2,
+                "drop_pct": -drop_ex2,
+                "status": stat_ex2,
+            })
+        if len(winners) >= 3:
+            pnl_ex3 = total_net_pnl - top3_pnl
+            drop_ex3 = (top3_pnl / total_net_pnl * 100.0) if total_net_pnl != 0 else 0.0
+            stat_ex3 = "VIABLE" if pnl_ex3 > 0 else "SEVERE LOSS DRAIN"
+            loo_results.append({
+                "scenario": f"Exclude Top 3 ({winners[0]['symbol']}, {winners[1]['symbol']}, {winners[2]['symbol']})",
+                "pnl": pnl_ex3,
+                "drop_pct": -drop_ex3,
+                "status": stat_ex3,
+            })
+
+        # 8. Friction drag ratio
+        total_costs = asset_data.get("total_cost", 0.0) if asset_data else 0.0
+        friction_net_drag = (total_costs / total_net_pnl * 100.0) if total_net_pnl > 1e-4 else (100.0 if total_costs > 0 else 0.0)
+        friction_status = "MINIMAL" if friction_net_drag <= 15.0 else ("ELEVATED" if friction_net_drag <= 30.0 else "SEVERE BLEED")
+        friction_diag = f"Friction fees consumed {friction_net_drag:.1f}% of net profit ({total_costs:,.2f} RMB)"
+
+        # 9. Capital drag & Cash-normalized MaxDD
+        active_wsum = r.get("avg_wsum", 1.0)
+        idle_cash = max(0.0, 1.0 - active_wsum) * 100.0
+        raw_maxdd = (r.get("maxdd", 0.0) or 0.0) * 100.0
+        raw_cagr = (r.get("cagr", 0.0) or 0.0) * 100.0
+        norm_maxdd = raw_maxdd / max(active_wsum, 0.10)
+        norm_cagr = raw_cagr / max(active_wsum, 0.10)
+        drag_status = "LOW" if idle_cash <= 25.0 else ("MODERATE" if idle_cash <= 50.0 else "HIGH CASH CUSHION")
+        drag_diag = f"Avg idle cash: {idle_cash:.1f}% | Norm MaxDD: {norm_maxdd:.1f}% (vs {raw_maxdd:.1f}% raw)"
+
+        # 10. Quantitative Overfitting Risk Score & Grade
+        overfit_score = 0
+        overfit_flags = []
+        if dsr < 0.05:
+            overfit_score += 25
+            overfit_flags.append(f"DSR {dsr:.4f} < 0.05 (High probability of data-mining / noise)")
+        if len(loo_results) > 1 and loo_results[1]["pnl"] <= 0:
+            overfit_score += 25
+            overfit_flags.append(f"Superstar Fragility: Omitting {winners[0]['symbol']} flips Net PnL to negative ({loo_results[1]['pnl']:,.2f} RMB)")
+        elif top3_share > 80.0:
+            overfit_score += 15
+            overfit_flags.append(f"High Winner Concentration: Top 3 generate {top3_share:.1f}% of net gain")
+        if top_fold_share > 50.0 and len(cagrs) > 2:
+            overfit_score += 15
+            overfit_flags.append(f"One-Hit Wonder Fold: Best Fold {best_fold_idx} accounts for {top_fold_share:.1f}% of positive returns")
+        if friction_net_drag > 25.0:
+            overfit_score += 10
+            overfit_flags.append(f"Friction Bleed: Transaction friction consumes {friction_net_drag:.1f}% of net profits")
+        if max_pos >= 80.0:
+            overfit_score += 15
+            overfit_flags.append(f"Extreme Concentration: Max single position reached {max_pos:.1f}%")
+        if max_jump > 30.0:
+            overfit_score += 10
+            overfit_flags.append(f"Outlier Equity Jump: Single rebalance equity jumped {max_jump:.1f}%")
+        if hit_rate > 0.70:
+            overfit_score += 25
+            overfit_flags.append(f"Look-Ahead Leakage Risk: Buy hit rate is {hit_rate_pct:.1f}%")
+        if warmup_days > 60:
+            overfit_score += 10
+            overfit_flags.append(f"Warmup Padding: Fold 1 delayed first trade by {warmup_days} days")
+
+        overfit_score = min(100, overfit_score)
+        if overfit_score <= 20:
+            grade_label = "Grade A (Institutional Grade - Highly Robust)"
+        elif overfit_score <= 40:
+            grade_label = "Grade B (Moderate Caution - Viable with Sizing Rules)"
+        elif overfit_score <= 65:
+            grade_label = "Grade C (High Overfit Risk - Fragile / Over-Parameterized)"
+        else:
+            grade_label = "Grade F (Rejected - Severe Overfit / Structural Dependency)"
+
+        # Console Output
+        print(f"\n[{idx}] {strat_name}")
+        print("-" * 140)
+        print(f"  Safety Grade: {grade_label} | Overfit Risk Index: {overfit_score} / 100")
+        if overfit_flags:
+            print("  Overfitting & Fragility Alerts:")
+            for flag in overfit_flags:
+                print(f"    - ⚠️  {flag}")
+        else:
+            print("  Overfitting Alerts: None detected (Institutional-grade robustness)")
+
+        print("\n  QUANTITATIVE ANOMALY & OVERFIT INSPECTION MATRIX:")
+        print("  " + "-" * 136)
+        print(f"  {'Inspection Dimension':<30} {'Audited Metric':<24} {'Safety Benchmark':<24} {'Status':<12} {'Forensic Diagnostic':<44}")
+        print("  " + "-" * 136)
+        matrix_rows = [
+            ("Look-Ahead Bias Check", f"{hit_rate_pct:.1f}% Hit Rate", "45.0% - 55.0%", lookahead_status, lookahead_diag),
+            ("Single-Stock Concentration", f"Max Pos: {max_pos:.1f}%", "< 25.0% (Cap: 20%)", allin_status, allin_diag),
+            ("Fold 1 Warmup Padding", f"+{warmup_days} Days", "< 60 Days", warmup_status, warmup_diag),
+            ("Outlier Equity Jumps", f"{max_jump:.1f}% Single Jump", "< 30.0%", jump_status, jump_diag),
+            ("Statistical Edge (DSR)", f"{dsr:.4f}", "> 0.0500", dsr_status, dsr_diag),
+            ("Profit Concentration Skew", f"{top_fold_share:.1f}% from Fold {best_fold_idx}", "< 40.0%", fold_status, fold_diag),
+            ("Superstar Asset Fragility", f"{top3_share:.1f}% from Top 3", "< 60.0%", fragility_status, fragility_diag),
+            ("Friction Bleed Ratio", f"{friction_net_drag:.1f}% Fee / Net PnL", "< 15.0%", friction_status, friction_diag),
+            ("Capital Drag & Cash Flattery", f"{idle_cash:.1f}% Idle Cash", "< 25.0%", drag_status, drag_diag),
+        ]
+        for dim, met, bench, stat, diag in matrix_rows:
+            print(f"  {dim:<30} {met:<24} {bench:<24} {stat:<12} {diag:<44}")
+        print("  " + "-" * 136)
+
+        print("\n  LEAVE-ONE-OUT (LOO) ASSET FRAGILITY ANALYSIS:")
+        print("  " + "-" * 136)
+        print(f"  {'Exclusion Scenario':<55} {'Resulting Net PnL':>22} {'PnL Drop %':>15} {'Strategy Viability Assessment':<40}")
+        print("  " + "-" * 136)
+        for loo in loo_results:
+            pnl_str = f"{loo['pnl']:>+18,.2f} RMB"
+            drop_str = f"{loo['drop_pct']:>14.1f}%"
+            print(f"  {loo['scenario']:<55} {pnl_str} {drop_str} {loo['status']:<40}")
+        print("  " + "-" * 136)
+
+        # Build Markdown section
+        md_block = f"""## {idx}. {strat_name}
+- **Safety Grade**: `{grade_label}`
+- **Overfit Risk Index**: `{overfit_score} / 100`
+
+### Quantitative Anomaly & Overfit Inspection Matrix
+
+| Inspection Dimension | Audited Metric | Safety Benchmark | Status | Forensic Diagnostic |
+| :--- | :--- | :--- | :--- | :--- |
+"""
+        for dim, met, bench, stat, diag in matrix_rows:
+            md_block += f"| **{dim}** | **{met}** | {bench} | `{stat}` | {diag} |\n"
+
+        md_block += f"""
+### Leave-One-Out (LOO) Fragility Analysis
+
+| Exclusion Scenario | Resulting Net PnL | PnL Drop % | Strategy Viability Assessment |
+| :--- | :--- | :--- | :--- |
+"""
+        for loo in loo_results:
+            md_block += f"| **{loo['scenario']}** | **{loo['pnl']:+,.2f} RMB** | `{loo['drop_pct']:+.1f}%` | {loo['status']} |\n"
+
+        if overfit_flags:
+            md_block += "\n### Identified Overfitting & Fragility Alerts\n"
+            for flag in overfit_flags:
+                md_block += f"- ⚠️ **{flag}**\n"
+
+        report_markdown_blocks.append(md_block)
+
+    if export_report_path:
+        out_p = Path(export_report_path)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        full_md = f"""# Walkforward Anomaly & Overfit Forensic Audit Report
+
+> **Audited Directory**: `{results_dir}`  
+> **Evaluation Window**: Walkforward Rolling Folds  
+> **Evaluated Top Strategies**: {len(top_strats)}  
+
+---
+
+""" + "\n---\n\n".join(report_markdown_blocks)
+        with open(out_p, "w", encoding="utf-8") as f:
+            f.write(full_md)
+        print(f"\nSuccessfully exported forensic anomaly & overfit audit report to: {out_p.resolve()}")
+
+    print("=" * 140)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Walkforward Audit & Trading Record Anomaly Analyzer")
     parser.add_argument("--results-dir", type=str, default=None, help="Path to results directory")
-    parser.add_argument("--all", action="store_true", help="Run full pipeline: summary, trade audit, adjusted ranking, deep top-3 analysis, and losing asset exclusions")
+    parser.add_argument("--all", action="store_true", help="Run full pipeline: summary, trade audit, adjusted ranking, deep top-3 analysis, losing asset exclusions, and forensic anomaly/overfit audit")
     parser.add_argument("--summary", action="store_true", help="Run cross-strategy performance aggregation")
     parser.add_argument("--audit", action="store_true", help="Run deep-dive trading record anomaly audit")
     parser.add_argument("--rank", action="store_true", help="Compute anomaly-adjusted rankings")
     parser.add_argument("--deep-analyze", "--deep", action="store_true", help="Run deep behavioral & asset attribution audit on top strategies")
     parser.add_argument("--deep-top-n", type=int, default=3, help="Number of top strategies for deep behavioral & asset analysis (default: 3)")
     parser.add_argument("--exclude-losers", action="store_true", help="Identify and recommend losing assets to exclude from trading universe")
+    parser.add_argument("--abnormal-overfit", "--overfit", "--audit-overfit", action="store_true", help="Run forensic quantitative anomaly & overfit audit (LOO fragility, superstar concentration, friction bleed, cash flattery)")
+    parser.add_argument("--export-overfit-report", type=str, default=None, help="Export detailed anomaly & overfitting markdown report to file")
     parser.add_argument("--universe-file", type=str, default=None, help="Path to original universe file to prune")
     parser.add_argument("--export-pruned-universe", type=str, default=None, help="Path to export the pruned universe file")
     parser.add_argument("--top-n", type=int, default=10, help="Number of top strategies to evaluate in ranking")
@@ -746,7 +1050,9 @@ def main():
         print("No walkforward_summary.json files found.", file=sys.stderr)
         sys.exit(1)
 
-    has_specific_action = (args.summary or args.audit or args.rank or args.deep_analyze or args.exclude_losers)
+    has_specific_action = (
+        args.summary or args.audit or args.rank or args.deep_analyze or args.exclude_losers or args.abnormal_overfit
+    )
 
     if args.all or not has_specific_action:
         # Full institutional audit pipeline
@@ -774,6 +1080,12 @@ def main():
             universe_file=args.universe_file,
             export_pruned_path=args.export_pruned_universe,
         )
+        audit_abnormal_and_overfit(
+            ranked,
+            results_dir,
+            top_n=args.deep_top_n,
+            export_report_path=args.export_overfit_report,
+        )
     else:
         ranked = None
         if args.summary:
@@ -784,13 +1096,13 @@ def main():
                 audit = audit_strategy_trades(results_dir, s["dir_name"], s)
                 if audit:
                     print(f"\n[{audit['strategy']}] Trades: {audit['total_trades']}, "
-                          f"All-In Events: {audit['all_in_trades']}, "
-                          f"Avg Weight Sum: {audit['avg_weight_sum']:.2f}, "
-                          f"Fold 1 Warmup: +{audit['warmup_days_fold1']}d, "
-                          f"Max Equity Jump: {audit['max_equity_jump']*100:.1f}%, "
-                          f"Turnover: {audit['avg_turnover']:.1f}x, "
-                          f"Buy Hit Rate: {audit['buy_hit_rate']*100:.1f}%")
-        if args.rank or args.deep_analyze or args.exclude_losers:
+                        f"All-In Events: {audit['all_in_trades']}, "
+                        f"Avg Weight Sum: {audit['avg_weight_sum']:.2f}, "
+                        f"Fold 1 Warmup: +{audit['warmup_days_fold1']}d, "
+                        f"Max Equity Jump: {audit['max_equity_jump']*100:.1f}%, "
+                        f"Turnover: {audit['avg_turnover']:.1f}x, "
+                        f"Buy Hit Rate: {audit['buy_hit_rate']*100:.1f}%")
+        if args.rank or args.deep_analyze or args.exclude_losers or args.abnormal_overfit:
             ranked = run_ranking(summaries, results_dir, top_n=args.top_n)
 
         if args.deep_analyze or args.exclude_losers:
@@ -804,6 +1116,17 @@ def main():
                 export_pruned_path=args.export_pruned_universe,
             )
 
+        if args.abnormal_overfit:
+            if ranked is None:
+                ranked = run_ranking(summaries, results_dir, top_n=args.top_n)
+            audit_abnormal_and_overfit(
+                ranked,
+                results_dir,
+                top_n=args.deep_top_n,
+                export_report_path=args.export_overfit_report,
+            )
+
 
 if __name__ == "__main__":
     main()
+

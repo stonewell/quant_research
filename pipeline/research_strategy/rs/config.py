@@ -631,8 +631,15 @@ class StrategyConfig:
     cdhb_thrust_thresh: float = 0.60
     cdhb_target_bull_exposure: float = 0.80
     cdhb_bull_max_single_position: float = 0.20
+    cdhb_preemptive_thrust_deployment: bool = True
+    cdhb_min_thrust_assets: int = 5
+    cdhb_max_assets_per_sector: int = 1      # Max assets permitted per sector during thrust deployment (Suggestion 2)
+    cdhb_thrust_min_roc: float = 0.01        # Minimum 10-day ROC velocity hurdle (filters flat/drifting assets)
+    cdhb_thrust_sizing_mode: str = "vol_adjusted"  # "vol_adjusted" (inverse-vol risk balanced) or "equal_dollar"
+    cdhb_require_asset_trend: bool = True    # Require P >= SMA50 or R20d > 0 for offensive thrust entries
+    cdhb_asset_stop_cooldown_bars: int = 15  # Cooldown bars for an individual asset after hitting -8% stop loss
     cdhb_enable_vol_targeting: bool = True
-    cdhb_target_vol: float = 0.12
+    cdhb_target_vol: float = 0.14
     cdhb_smooth_drawdown: bool = True
 
     # --- Price Action Breakout & Retest Strategy (docs/chan_similar_trading.md Strategy 1) ---
@@ -923,6 +930,14 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.wq_min_weight_change must be between 0 and 1, got {self.wq_min_weight_change}")
         if not self.wq_ensemble_alphas or any(not (1 <= a <= 101) for a in self.wq_ensemble_alphas):
             raise ValueError(f"StrategyConfig.wq_ensemble_alphas must be a non-empty list of ints in [1, 101], got {self.wq_ensemble_alphas}")
+        if self.cdhb_max_assets_per_sector <= 0:
+            raise ValueError(f"StrategyConfig.cdhb_max_assets_per_sector must be > 0, got {self.cdhb_max_assets_per_sector}")
+        if not (0.0 <= self.cdhb_thrust_min_roc <= 0.20):
+            raise ValueError(f"StrategyConfig.cdhb_thrust_min_roc must be between 0 and 0.20, got {self.cdhb_thrust_min_roc}")
+        if self.cdhb_thrust_sizing_mode not in ("vol_adjusted", "equal_dollar"):
+            raise ValueError(f"StrategyConfig.cdhb_thrust_sizing_mode must be 'vol_adjusted' or 'equal_dollar', got {self.cdhb_thrust_sizing_mode}")
+        if self.cdhb_asset_stop_cooldown_bars < 0:
+            raise ValueError(f"StrategyConfig.cdhb_asset_stop_cooldown_bars must be >= 0, got {self.cdhb_asset_stop_cooldown_bars}")
 
     @classmethod
     def from_dict(cls, data: dict) -> "StrategyConfig":
