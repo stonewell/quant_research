@@ -80,6 +80,7 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
             "data_providers": ["synthetic", "marketdb", "fuyao", "yfinance"],
             "default_date": date.today().isoformat(),
             "default_portfolio_value": storage.default_portfolio_value,
+            "default_strategy_key": getattr(storage, "default_strategy_key", "chan_four_state_blend"),
         }
 
     @app.get("/api/settings", summary="Get path and runtime settings")

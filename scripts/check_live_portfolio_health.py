@@ -208,6 +208,26 @@ def save_account_state(state_file: str, state: Dict[str, Any]) -> None:
         json.dump(serializable, f, indent=2, ensure_ascii=False, default=str)
 
 
+def resolve_blend_param(
+    params: Dict[str, Any],
+    name: str,
+    default: Any = None,
+    param_type: Optional[type] = None,
+) -> Any:
+    """Resolve configuration parameter across blend strategy prefix variants:
+    cfsb_*, crb_*, ccsb_*, cdhb_*, blend_*, or direct un-prefixed name.
+    """
+    for prefix in ("cfsb", "crb", "ccsb", "cdhb", "blend"):
+        k = f"{prefix}_{name}"
+        if k in params:
+            val = params[k]
+            return param_type(val) if param_type is not None and val is not None else val
+    if name in params:
+        val = params[name]
+        return param_type(val) if param_type is not None and val is not None else val
+    return default
+
+
 def inspect_portfolio_drawdown(
     current_nav: float,
     peak_nav: Optional[float],
@@ -215,11 +235,11 @@ def inspect_portfolio_drawdown(
     params: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Compute peak-to-trough drawdown, circuit breaker tiers, auto-healing, and fast recovery."""
-    dd_reduce_thresh = float(params.get("cfsb_dd_reduce_thresh", 0.10))
-    dd_defensive_thresh = float(params.get("cfsb_dd_defensive_thresh", 0.15))
-    dd_stop_thresh = float(params.get("cfsb_dd_stop_thresh", 0.20))
-    tier1_cooldown_bars = int(params.get("cfsb_tier1_cooldown_bars", 15))
-    stop_cooldown_bars = 21
+    dd_reduce_thresh = float(resolve_blend_param(params, "dd_reduce_thresh", 0.10, float))
+    dd_defensive_thresh = float(resolve_blend_param(params, "dd_defensive_thresh", 0.15, float))
+    dd_stop_thresh = float(resolve_blend_param(params, "dd_stop_thresh", 0.20, float))
+    tier1_cooldown_bars = int(resolve_blend_param(params, "tier1_cooldown_bars", 15, int))
+    stop_cooldown_bars = int(resolve_blend_param(params, "stop_cooldown_bars", 21, int))
 
     # Resolve HWM peak NAV
     saved_peak = state.get("peak_nav")
@@ -324,11 +344,11 @@ def evaluate_market_breadth_and_thrust(
     params: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Compute universe 50-day market breadth, 10-day momentum thrust, and top leaders."""
-    breadth_lookback = int(params.get("cfsb_breadth_lookback", 50))
-    breadth_bull_thresh = float(params.get("cfsb_breadth_bull_thresh", 0.30))
-    thrust_lookback = int(params.get("cfsb_thrust_lookback", 10))
-    thrust_thresh = float(params.get("cfsb_thrust_thresh", 0.60))
-    target_bull_exposure = float(params.get("cfsb_target_bull_exposure", 0.80))
+    breadth_lookback = int(resolve_blend_param(params, "breadth_lookback", 50, int))
+    breadth_bull_thresh = float(resolve_blend_param(params, "breadth_bull_thresh", 0.30, float))
+    thrust_lookback = int(resolve_blend_param(params, "thrust_lookback", 10, int))
+    thrust_thresh = float(resolve_blend_param(params, "thrust_thresh", 0.60, float))
+    target_bull_exposure = float(resolve_blend_param(params, "target_bull_exposure", 0.80, float))
     cash_proxy = params.get("cash_proxy", "BIL")
 
     symbols = [s for s in universe.keys() if s != cash_proxy and not universe[s].empty]
@@ -417,39 +437,53 @@ def evaluate_realized_volatility(
     params: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Compute 21-day realized market volatility and Barroso volatility targeting scaling factor."""
-    target_vol = float(params.get("cfsb_target_vol", 0.12))
+    target_vol = float(resolve_blend_param(params, "target_vol", 0.12, float))
+    vol_model = str(resolve_blend_param(params, "vol_model", "garman_klass", str)).lower()
     cash_proxy = params.get("cash_proxy", "BIL")
 
-    returns_list = []
+    vol_estimates = []
+    gk_count = 0
     for sym, df in universe.items():
         if sym == cash_proxy or df.empty or "Close" not in df:
             continue
+        # Extreme-value Garman-Klass (1980) volatility using OHLC bars
+        if vol_model == "garman_klass" and all(c in df.columns for c in ("High", "Low", "Close", "Open")):
+            h = df["High"].replace(0, np.nan)
+            l = df["Low"].replace(0, np.nan)
+            c = df["Close"].replace(0, np.nan)
+            o = df["Open"].replace(0, np.nan)
+            if not (h == l).all() and len(c.dropna()) >= 10:
+                log_hl = np.log((h / l).clip(lower=1e-6)) ** 2
+                log_co = np.log((c / o).clip(lower=1e-6)) ** 2
+                gk_var = 0.5 * log_hl - (2.0 * np.log(2.0) - 1.0) * log_co
+                gk_var = gk_var.clip(lower=0.0)
+                gk_vol = float(np.sqrt(gk_var.iloc[-21:].mean() * 252.0))
+                if not np.isnan(gk_vol) and gk_vol > 0:
+                    vol_estimates.append(gk_vol)
+                    gk_count += 1
+                    continue
+
+        # Close-to-close fallback
         c = df["Close"].dropna()
         if len(c) > 22:
-            returns_list.append(c.pct_change().dropna())
+            ret = c.pct_change().dropna()
+            cc_vol = float(ret.iloc[-21:].std() * np.sqrt(252))
+            if not np.isnan(cc_vol) and cc_vol > 0:
+                vol_estimates.append(cc_vol)
 
-    if not returns_list:
-        return {
-            "realized_vol_21d": target_vol,
-            "target_vol": target_vol,
-            "vol_scaling_factor": 1.0,
-            "vol_elevated": False,
-        }
-
-    combined_ret = pd.concat(returns_list, axis=1).mean(axis=1).dropna()
-    if len(combined_ret) >= 10:
-        vol_21d = float(combined_ret.iloc[-21:].std() * np.sqrt(252))
-        if np.isnan(vol_21d) or vol_21d <= 0:
-            vol_21d = target_vol
+    if vol_estimates:
+        vol_21d = float(np.median(vol_estimates))
     else:
         vol_21d = target_vol
 
     scale = min(1.0, target_vol / vol_21d) if vol_21d > 0 else 1.0
+    active_model = "Garman-Klass (1980)" if (gk_count > 0 and vol_model == "garman_klass") else "Close-to-Close"
     return {
         "realized_vol_21d": vol_21d,
         "target_vol": target_vol,
         "vol_scaling_factor": scale,
         "vol_elevated": vol_21d > target_vol,
+        "vol_model": active_model,
     }
 
 
@@ -517,6 +551,7 @@ def print_dashboard(
     as_of_date: str,
     universe_path: str,
     strategy_path: str,
+    strategy_info: Dict[str, Any],
     dd_info: Dict[str, Any],
     macro_info: Dict[str, Any],
     vol_info: Dict[str, Any],
@@ -529,6 +564,9 @@ def print_dashboard(
     print("STAGE 1 PRE-TRADE GATE: PORTFOLIO HEALTH & MACRO REGIME INSPECTION (14:00 – 14:15)")
     print("=" * 110)
     print(f"Valuation As-Of Date : {as_of_date}")
+    strat_disp = f"{strategy_info.get('strategy_name', 'N/A')} ({strategy_info.get('template_name', '')})"
+    print(f"Strategy Deployment  : {strat_disp}")
+    print(f"Weighting & Ortho    : Mode={strategy_info.get('weighting_mode', 'rolling_ic_ir')} | Orthogonalization={strategy_info.get('orthogonalization', True)}")
     print(f"Strategy Config      : {strategy_path}")
     print(f"Universe Source      : {universe_path} ({macro_info.get('tracked_symbols_count', 0)} assets)")
     print("-" * 110)
@@ -564,7 +602,8 @@ def print_dashboard(
     # 3. Volatility Targeting
     print("\n[3. REALIZED VOLATILITY TARGETING (BARROSO & SANTA-CLARA 2015)]")
     v_status = "⚠️ Scaled Down" if vol_info["vol_elevated"] else "🟢 Stable"
-    print(f"  21-Day Realized Vol   : {vol_info['realized_vol_21d']:>6.1%} (Target Vol: {vol_info['target_vol']:>5.1%}) | {v_status}")
+    vol_mod_lbl = f", Model: {vol_info.get('vol_model', 'N/A')}" if "vol_model" in vol_info else ""
+    print(f"  21-Day Realized Vol   : {vol_info['realized_vol_21d']:>6.1%} (Target Vol: {vol_info['target_vol']:>5.1%}{vol_mod_lbl}) | {v_status}")
     print(f"  Volatility Scaling    : {vol_info['vol_scaling_factor']:>6.2f}x")
 
     # 4. Directive & Trader Instructions
@@ -580,6 +619,7 @@ def print_dashboard(
 def generate_reports(
     output_dir: str,
     as_of_date: str,
+    strategy_info: Dict[str, Any],
     dd_info: Dict[str, Any],
     macro_info: Dict[str, Any],
     vol_info: Dict[str, Any],
@@ -594,6 +634,7 @@ def generate_reports(
 
     report_dict = {
         "as_of_date": as_of_date,
+        "strategy_info": strategy_info,
         "gate_code": gate_code,
         "gate_headline": gate_headline,
         "portfolio_health": dd_info,
@@ -609,6 +650,8 @@ def generate_reports(
     md_content = f"""# Stage 1 Live Pre-Trade Health & Macro Audit Report
 
 > **Valuation Date**: `{as_of_date}`  
+> **Strategy**: **{strategy_info.get('strategy_name', 'N/A')}** (`{strategy_info.get('template_name', '')}`)  
+> **Weighting & Ortho**: `{strategy_info.get('weighting_mode', 'rolling_ic_ir')}` | Orthogonalized: `{strategy_info.get('orthogonalization', True)}`  
 > **Gate Directive**: **{gate_headline}**  
 > **Report Timestamp**: Generated during 14:00 – 14:15 inspection window  
 
@@ -680,6 +723,17 @@ def main():
         raise FileNotFoundError(f"Strategy file not found at: {args.strategy_file}")
     strategy_def = load_strategy_file(args.strategy_file)
     params = strategy_def.get("params", {})
+    strat_name = (
+        strategy_def.get("strategy_name")
+        or strategy_def.get("research_strategy_spec", {}).get("entry_data", {}).get("name")
+        or strategy_def.get("template_name", "").replace("_", " ").title()
+    )
+    strategy_info = {
+        "strategy_name": strat_name,
+        "template_name": strategy_def.get("template_name", ""),
+        "weighting_mode": params.get("blend_weighting_mode", "rolling_ic_ir"),
+        "orthogonalization": params.get("blend_enable_orthogonalization", True),
+    }
 
     # 2. Load Universe Data
     universe_symbols = resolve_universe_from_args(args)
@@ -742,6 +796,7 @@ def main():
         as_of_date=as_of_date,
         universe_path=args.universe_file,
         strategy_path=args.strategy_file,
+        strategy_info=strategy_info,
         dd_info=dd_info,
         macro_info=macro_info,
         vol_info=vol_info,
@@ -753,6 +808,7 @@ def main():
     json_rep, md_rep = generate_reports(
         output_dir=args.output_dir,
         as_of_date=as_of_date,
+        strategy_info=strategy_info,
         dd_info=dd_info,
         macro_info=macro_info,
         vol_info=vol_info,

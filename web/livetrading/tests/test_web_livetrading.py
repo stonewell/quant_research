@@ -165,6 +165,7 @@ def test_fastapi_endpoints(temp_workspace):
     assert "strategies" in cfg
     assert "universes" in cfg
     assert "settings" in cfg
+    assert cfg.get("default_strategy_key") == "chan_four_state_blend"
 
     # 2. Settings update
     res = client.post("/api/settings", json={"default_portfolio_value": 150000.0})
@@ -322,13 +323,20 @@ def test_strategy_name_extraction_and_discovery(temp_workspace):
     names = {s["strategy_name"]: s for s in discovered}
     assert "Chan Four-State Structural Blend" in names
     assert names["Chan Four-State Structural Blend"]["strategy_key"] == "chan_four_state_blend"
+    assert names["Chan Four-State Structural Blend"]["is_blend"] is True
+    assert names["Chan Four-State Structural Blend"]["category"] == "Blend Ensemble"
     assert not names["Chan Four-State Structural Blend"]["strategy_name"].endswith(".json")
 
     assert "Dual Momentum Trend Following" in names
     assert names["Dual Momentum Trend Following"]["strategy_key"] == "dual_momentum"
+    assert names["Dual Momentum Trend Following"]["is_blend"] is False
 
     assert "Adaptive Asset Allocation" in names
     assert names["Adaptive Asset Allocation"]["strategy_key"] == "adaptive_asset_allocation"
+    assert names["Adaptive Asset Allocation"]["is_blend"] is False
+
+    # Production blend strategy must be prioritized at the top of discovered results
+    assert discovered[0]["strategy_key"] == "chan_four_state_blend"
 
 
 def test_keyed_archive_hierarchy_and_strict_scoping(temp_workspace):

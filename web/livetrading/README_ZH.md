@@ -13,16 +13,17 @@
    - 支持跨区域核心-卫星资产预设（中国 A 股、美股、港股、全球 ETF）。
    - 支持在 Web 界面实时自定义标的池并保存到个人标的库 (`custom_universes.json`)。
 2. **策略选择 (Strategy Selection)**：
-   - 自动扫描并加载策略转储文件（如 `chan_four_state_blend`、`chan_risk_managed_blend` 等）。
+   - 自动扫描并加载策略转储文件（如 `chan_four_state_blend`、`chan_risk_managed_blend`、`chan_crisis_shield_blend`、`chan_dual_hybrid_blend`、`generic_blend` 等）。
+   - 默认自动选中国家级/机构级实盘冠军：**缠论四状态风控混合策略** (`chan_four_state_blend`)，原生融合 60 日滚动 IC-IR 贝叶斯自适应赋权 ($t \ge 2.0$)、Löwdin 对称正交化去共线性 ($W^* = W(W^T W)^{-1/2}$)、Garman-Klass 极值波动率目标化及缠论有限状态机 (FSM) 中枢“拒绝盘整”空仓纪律。
 3. **交互式持仓与现金管理 (Interactive Holdings & Cash Management)**：
    - 增删改现有持仓（支持股数或目标权重）。
    - 实时计算组合总资产净值 (NAV)、闲置资金与现金占比。
    - 跨会话持久化存储 (`current_holdings.json`)。
 4. **一阶：组合健康度与宏观门禁 (Stage 1: Portfolio Health & Macro Gate)**：
    - 计算自历史最高净值 (HWM) 的峰谷回撤。
-   - 评估熔断层级（正常、一阶阻尼、二阶防守、三阶暂停冷冻）及自愈冷却计数。
+   - 评估熔断层级（正常、一阶阻尼、二阶防守、三阶暂停冷冻）及自愈冷却计数，全面兼容混合策略参数前缀 (`cfsb_`, `crb_`, `ccsb_`, `cdhb_`, `blend_`)。
    - 计算 50 日市场宽度 ($\ge 30\%$) 与 10 日动量冲力 ($\ge 60\%$)。
-   - 计算 Barroso 21 日实现波动率缩放因子 ($\sigma = 12\%$)。
+   - 计算 Barroso 21 日实现波动率缩放因子 ($\sigma = 12\%$)，优先采用 Garman-Klass (1980) OHLC 高精极值估计器（具备收盘价方差回退保障）。
    - 输出醒目的直观操作指令徽章：`🟢 GO`、`🟡 CAUTION`、`🔴 NO-GO`。
 5. **二阶：实盘交易单生成 (Stage 2: Live Trading Ticket Generation)**：
    - 将目标权重与当前持仓自动折算为具体委托交易单。

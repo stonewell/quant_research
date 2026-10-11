@@ -13,16 +13,17 @@ Features complete Stage 1 Health Gate inspection, Stage 2 live order generation 
    - Select from regional Core-Satellite presets (China A-Shares, US Equities, Hong Kong Stocks, Global ETFs).
    - Define custom universes in real-time and save them to your personal universe library (`custom_universes.json`).
 2. **Strategy Selection**:
-   - Browse and select from pre-configured strategy JSON dumps (e.g., `chan_four_state_blend`, `chan_risk_managed_blend`, etc.) scanned from configured strategy directories.
+   - Browse and select from pre-configured strategy JSON dumps (e.g., `chan_four_state_blend`, `chan_risk_managed_blend`, `chan_crisis_shield_blend`, `chan_dual_hybrid_blend`, `generic_blend`, etc.) scanned from configured strategy directories.
+   - Defaults automatically to the production-validated champion: **Chan Four-State Risk-Managed Blend Strategy** (`chan_four_state_blend`) featuring 60-day Rolling IC-IR adaptive weighting ($t \ge 2.0$), Löwdin symmetric orthogonalization ($W^* = W(W^T W)^{-1/2}$), Garman-Klass extreme-value volatility targeting, and Chan FSM `WAIT_OBSERVE` consolidation avoidance.
 3. **Interactive Holdings & Cash Management**:
    - Add, edit, or remove held positions (shares or target weights).
    - Real-time auto-calculation of total equity valuation, remaining idle cash, and cash allocation percentage.
    - Persistent storage across sessions (`current_holdings.json`).
 4. **Stage 1: Portfolio Health & Macro Gate**:
    - Evaluates peak-to-trough drawdown from High-Water Mark (HWM).
-   - Evaluates Circuit Breaker Tiers (Normal, Tier 1 Damping, Tier 2 Defensive, Tier 3 Halt) and auto-healing cooldowns.
+   - Evaluates Circuit Breaker Tiers (Normal, Tier 1 Damping, Tier 2 Defensive, Tier 3 Halt) and auto-healing cooldowns across all blend variants (`cfsb_`, `crb_`, `ccsb_`, `cdhb_`, `blend_`).
    - Calculates 50-day market breadth ($\ge 30\%$) and 10-day momentum thrust ($\ge 60\%$).
-   - Computes Barroso 21-day realized volatility scaling factor ($\sigma = 12\%$).
+   - Computes Barroso 21-day realized volatility scaling factor ($\sigma = 12\%$) via Garman-Klass (1980) OHLC extreme-value estimator (with Close-to-Close fallback).
    - Outputs visual directive badges: `🟢 GO`, `🟡 CAUTION`, `🔴 NO-GO`.
 5. **Stage 2: Live Trading Ticket Generation**:
    - Translates target weights vs. current holdings into concrete trading orders.

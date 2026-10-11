@@ -176,6 +176,26 @@ def resolve_lot_size(sym: str, override_lot: Optional[int] = None) -> int:
         return 1
 
 
+def resolve_blend_param(
+    params: Dict[str, Any],
+    name: str,
+    default: Any = None,
+    param_type: Optional[type] = None,
+) -> Any:
+    """Resolve configuration parameter across blend strategy prefix variants:
+    cfsb_*, crb_*, ccsb_*, cdhb_*, blend_*, or direct un-prefixed name.
+    """
+    for prefix in ("cfsb", "crb", "ccsb", "cdhb", "blend"):
+        k = f"{prefix}_{name}"
+        if k in params:
+            val = params[k]
+            return param_type(val) if param_type is not None and val is not None else val
+    if name in params:
+        val = params[name]
+        return param_type(val) if param_type is not None and val is not None else val
+    return default
+
+
 def parse_args(args: Optional[List[str]] = None):
     parser = argparse.ArgumentParser(
         description="Daily Live Trading Ticket Generator for Chan Four-State Risk-Managed Blend"
@@ -392,23 +412,22 @@ def main():
         else:
             args.portfolio_value = 100000.0
 
-    print("=" * 110)
-    print("CHAN FOUR-STATE RISK-MANAGED BLEND STRATEGY - DAILY LIVE EXECUTION RUNNER")
-    print("禅论四状态风险管理混合策略 - 每日实盘调仓指令生成器")
-    print("=" * 110)
-    print(f"策略配置 (Config)   : {args.strategy_file}")
-    print(f"标的资产 (Universe) : {args.universe_file}")
-    print(f"数据周期 (Window)   : {start_date} -> {as_of_date} (最新估值日: {as_of_date})")
-    print(f"账户资金 (NAV)      : {args.portfolio_value:,.2f} RMB")
-    print(f"行情数据 (Provider) : {args.data_provider}")
-
     # 1. Load Strategy Template
     if not os.path.exists(args.strategy_file):
         raise FileNotFoundError(f"Strategy file not found at: {args.strategy_file}")
     strategy_def = load_strategy_file(args.strategy_file)
     template_name = strategy_def["template_name"]
-    params = strategy_def["params"]
+    params = strategy_def.get("params", {})
+    strat_name = (
+        strategy_def.get("strategy_name")
+        or strategy_def.get("research_strategy_spec", {}).get("entry_data", {}).get("name")
+        or template_name.replace("_", " ").title()
+    )
     cash_proxy = params.get("cash_proxy", "BIL")
+    weighting_mode = params.get("blend_weighting_mode", "rolling_ic_ir")
+    ortho_enabled = params.get("blend_enable_orthogonalization", True)
+    vol_model = resolve_blend_param(params, "vol_model", "garman_klass", str)
+
     template = get_template(
         template_name,
         strategy_def.get("pattern_spec"),
@@ -416,6 +435,17 @@ def main():
         strategy_def.get("composite_spec"),
         params,
     )
+
+    print("=" * 110)
+    print("LIVE QUANTITATIVE TRADING EXECUTION RUNNER (实盘量化调仓指令生成器)")
+    print(f"策略方案 (Strategy) : {strat_name} ({template_name})")
+    print(f"配置模型 (Engine)   : 加权={weighting_mode} | 正交化={ortho_enabled} | 波动率模型={vol_model}")
+    print(f"策略配置 (Config)   : {args.strategy_file}")
+    print(f"标的资产 (Universe) : {args.universe_file}")
+    print(f"数据周期 (Window)   : {start_date} -> {as_of_date} (最新估值日: {as_of_date})")
+    print(f"账户资金 (NAV)      : {args.portfolio_value:,.2f} RMB")
+    print(f"行情数据 (Provider) : {args.data_provider}")
+    print("=" * 110)
 
     # 2. Load Universe (including any held symbols outside the universe list)
     universe_symbols = resolve_universe_from_args(args)
@@ -491,7 +521,7 @@ def main():
     current_series = reference.reindex(all_symbols, fill_value=0.0)
 
     # 5. Build Execution Order Plan
-    min_trade_thresh = float(params.get("cfsb_min_weight_change", 0.05))
+    min_trade_thresh = float(resolve_blend_param(params, "min_weight_change", 0.05, float))
 
     # Compute implied cash weight: strategy only outputs equity weights, remainder is cash
     equity_weight_sum = sum(float(target_series[s]) for s in target_series.index if s != cash_proxy)
@@ -523,6 +553,8 @@ def main():
             action = "NO_POSITION"   # not held, not targeted — skip entirely
         elif cur_w == 0.0 and tgt_w > 0.0:
             action = "BUY"           # fresh entry from zero — always a BUY, no inertia filter
+        elif tgt_w <= 1e-6 and cur_w > 0.0:
+            action = "SELL"          # full liquidation exit — always SELL, never hold remnant
         elif abs_delta < min_trade_thresh:
             action = "HOLD_FILTERED"  # user holds and change is below inertia threshold
         elif delta_w <= -min_trade_thresh:

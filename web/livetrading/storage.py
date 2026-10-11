@@ -339,6 +339,7 @@ class StorageManager:
         default_provider_fallback = "marketdb" if has_marketdb else "synthetic"
         self.default_data_provider = saved_settings.get("default_data_provider") or default_provider_fallback
         self.default_portfolio_value = float(saved_settings.get("default_portfolio_value", 100000.0))
+        self.default_strategy_key = saved_settings.get("default_strategy_key") or "chan_four_state_blend"
 
         # Files in data_dir
         self.custom_universes_file = os.path.join(self.data_dir, "custom_universes.json")
@@ -375,6 +376,7 @@ class StorageManager:
             "python_executable": self.python_executable,
             "default_data_provider": self.default_data_provider,
             "default_portfolio_value": self.default_portfolio_value,
+            "default_strategy_key": self.default_strategy_key,
         }
 
     def update_settings(self, new_settings: Dict[str, Any]) -> Dict[str, Any]:
@@ -536,6 +538,10 @@ class StorageManager:
                         data = self._load_json(full_path)
                         if isinstance(data, dict) and "template_name" in data:
                             strategy_key, strategy_name = self._extract_strategy_metadata(data, f)
+                            tpl = str(data.get("template_name", "")).lower()
+                            params = data.get("params", {})
+                            is_blend = "blend" in tpl or "blend" in strategy_key
+                            category = "Blend Ensemble" if is_blend else "Single Strategy"
                             results.append({
                                 "name": strategy_name,
                                 "strategy_name": strategy_name,
@@ -544,11 +550,30 @@ class StorageManager:
                                 "path": full_path,
                                 "rel_path": rel_path,
                                 "template_name": data.get("template_name", ""),
-                                "cash_proxy": data.get("params", {}).get("cash_proxy", "BIL"),
+                                "cash_proxy": params.get("cash_proxy", "BIL"),
                                 "description": data.get("description", ""),
+                                "is_blend": is_blend,
+                                "category": category,
+                                "weighting_mode": params.get("blend_weighting_mode"),
+                                "orthogonalization": params.get("blend_enable_orthogonalization"),
                             })
-        # Sort by strategy_name
-        results.sort(key=lambda x: x["strategy_name"])
+
+        # Prioritize production blend strategies at the top of the UI selector
+        def _strat_sort_key(x):
+            k = x.get("strategy_key", "")
+            if k == "chan_four_state_blend":
+                return (0, x.get("strategy_name", ""))
+            if k == "chan_risk_managed_blend":
+                return (1, x.get("strategy_name", ""))
+            if k == "chan_crisis_shield_blend":
+                return (2, x.get("strategy_name", ""))
+            if k == "chan_dual_hybrid_blend":
+                return (3, x.get("strategy_name", ""))
+            if x.get("is_blend"):
+                return (4, x.get("strategy_name", ""))
+            return (5, x.get("strategy_name", ""))
+
+        results.sort(key=_strat_sort_key)
         return results
 
     def discover_universes(self) -> List[Dict[str, Any]]:

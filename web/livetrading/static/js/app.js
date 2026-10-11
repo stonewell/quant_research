@@ -252,10 +252,22 @@
         try {
             const savedStratVal = localStorage.getItem(SESSION_KEYS.STRAT_VAL);
             const savedStratKey = localStorage.getItem(SESSION_KEYS.STRAT_KEY);
+            let stratMatched = false;
             if (savedStratVal || savedStratKey) {
                 for (let i = 0; i < el.selectStrategy.options.length; i++) {
                     const opt = el.selectStrategy.options[i];
                     if (opt.value === savedStratVal || (savedStratKey && opt.dataset.strategyKey === savedStratKey)) {
+                        el.selectStrategy.selectedIndex = i;
+                        stratMatched = true;
+                        break;
+                    }
+                }
+            }
+            if (!stratMatched) {
+                const targetKey = (state.config && state.config.default_strategy_key) || "chan_four_state_blend";
+                for (let i = 0; i < el.selectStrategy.options.length; i++) {
+                    const opt = el.selectStrategy.options[i];
+                    if (opt.dataset.strategyKey === targetKey || opt.value.includes(targetKey)) {
                         el.selectStrategy.selectedIndex = i;
                         break;
                     }
@@ -750,7 +762,8 @@
                 opt.value = st.rel_path || st.path;
                 opt.dataset.strategyKey = st.strategy_key || "";
                 opt.dataset.strategyName = st.strategy_name || st.name;
-                opt.textContent = st.strategy_name || st.name;
+                const star = (st.strategy_key === "chan_four_state_blend") ? "⭐ [推荐] " : (st.is_blend ? "🔹 " : "");
+                opt.textContent = `${star}${st.strategy_name || st.name}`;
                 el.selectStrategy.appendChild(opt);
             });
 
