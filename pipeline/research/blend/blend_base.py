@@ -359,16 +359,26 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         thrust_thresh = self.resolve_param(p, "thrust_thresh", 0.60, float)
         breadth_bull_thresh = self.resolve_param(p, "breadth_bull_thresh", 0.30, float)
 
+        # If all sub-strategies have zero base weights (e.g. explicitly disabled by caller), return as-is
+        if sum(base_weights.values()) <= 1e-6:
+            return base_weights
+
         if weighting_mode == "rolling_ic_ir":
             if sub_returns_slice.empty or len(sub_returns_slice) < 5:
                 return base_weights
             ir_map, _ = self._compute_rolling_sub_strategy_performance(sub_returns_slice, adaptive_min_tstat)
-            tot_ir = sum(max(0.0, ir_map.get(k, 0.0)) for k in base_weights)
+            active_keys = [k for k, bw in base_weights.items() if bw > 1e-6]
+            if not active_keys:
+                return base_weights
+            tot_ir = sum(max(0.0, ir_map.get(k, 0.0)) for k in active_keys)
             if tot_ir > 1e-6:
                 weights = {}
                 for k, bw in base_weights.items():
-                    raw_w = max(0.0, ir_map.get(k, 0.0)) / tot_ir
-                    weights[k] = (1.0 - adaptive_shrinkage) * raw_w + adaptive_shrinkage * bw
+                    if k in active_keys:
+                        raw_w = max(0.0, ir_map.get(k, 0.0)) / tot_ir
+                        weights[k] = (1.0 - adaptive_shrinkage) * raw_w + adaptive_shrinkage * bw
+                    else:
+                        weights[k] = 0.0
                 tot_w = sum(weights.values())
                 return {k: v / tot_w for k, v in weights.items()} if tot_w > 0 else base_weights
             return base_weights
@@ -384,9 +394,10 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                 budgets = {"momentum": 0.05, "reversal": 0.10, "defensive": 0.85}
 
             bucket_members = {"momentum": [], "reversal": [], "defensive": []}
-            for k in base_weights:
-                b_name = style_map.get(k, "momentum")
-                bucket_members[b_name].append(k)
+            for k, bw in base_weights.items():
+                if bw > 1e-6:
+                    b_name = style_map.get(k, "momentum")
+                    bucket_members[b_name].append(k)
 
             active_budgets = {b: budgets[b] for b in budgets if bucket_members[b]}
             tot_b = sum(active_budgets.values())
