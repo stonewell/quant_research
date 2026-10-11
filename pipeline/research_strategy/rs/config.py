@@ -560,6 +560,12 @@ class StrategyConfig:
     crb_smooth_drawdown: bool = True          # smooth linear drawdown damping instead of cliff-edge drops
     crb_third_strategy_type: str = "composite" # "composite", "worldquant_alpha", "worldquant_mega_alpha"
     crb_wq_alpha_id: Optional[int] = None     # WorldQuant Alpha ID (1-101) when crb_third_strategy_type == "worldquant_alpha"
+    crb_vol_model: str = "garman_klass"       # "garman_klass" or "close_to_close"
+    crb_stop_mode: str = "atr_trailing"       # "atr_trailing" (Chandelier Exit), "fixed_pct" (-8%), or "none"
+    crb_stop_atr_mult: float = 4.5            # Multiplier for ATR trailing stop
+    crb_adaptive_inertia: bool = True         # Volatility-scaled asymmetric rebalancing bands
+    crb_entry_threshold: float = 0.03         # Minimum initial position allocation threshold
+    crb_asset_stop_cooldown_bars: int = 5     # Cooldown bars for an asset after hitting stop loss
 
     # --- Chan Four-State Risk-Managed Blend Strategy (chan_four_state_blend) ---
     # Enhanced institutional ensemble blending ChanFourStateExecutionStrategy (25%),
@@ -585,6 +591,12 @@ class StrategyConfig:
     cfsb_smooth_drawdown: bool = True
     cfsb_third_strategy_type: str = "four_state" # "four_state", "worldquant_alpha", "worldquant_mega_alpha"
     cfsb_wq_alpha_id: Optional[int] = None       # WorldQuant Alpha ID (1-101) when cfsb_third_strategy_type == "worldquant_alpha"
+    cfsb_vol_model: str = "garman_klass"       # "garman_klass" or "close_to_close"
+    cfsb_stop_mode: str = "atr_trailing"       # "atr_trailing", "fixed_pct", or "none"
+    cfsb_stop_atr_mult: float = 4.5
+    cfsb_adaptive_inertia: bool = True
+    cfsb_entry_threshold: float = 0.03
+    cfsb_asset_stop_cooldown_bars: int = 5
 
     # --- Chan Crisis Shield Blend Strategy (chan_crisis_shield_blend) ---
     ccsb_three_type_weight: float = 0.45
@@ -608,6 +620,12 @@ class StrategyConfig:
     ccsb_enable_vol_targeting: bool = True
     ccsb_target_vol: float = 0.12
     ccsb_smooth_drawdown: bool = True
+    ccsb_vol_model: str = "garman_klass"
+    ccsb_stop_mode: str = "atr_trailing"
+    ccsb_stop_atr_mult: float = 4.5
+    ccsb_adaptive_inertia: bool = True
+    ccsb_entry_threshold: float = 0.03
+    ccsb_asset_stop_cooldown_bars: int = 5
 
     # --- Chan Dual Hybrid Alpha Blend Strategy (chan_dual_hybrid_blend) ---
     cdhb_three_type_weight: float = 0.45
@@ -656,6 +674,40 @@ class StrategyConfig:
     cdhb_alpha4_id: int = 101                # WorldQuant Alpha#101 (Intraday Price Efficiency)
     cdhb_stop_mode: str = "atr_trailing"     # "atr_trailing" (Chandelier Exit) or "fixed_pct" (-8%)
     cdhb_stop_atr_mult: float = 4.5          # Multiplier for ATR trailing stop
+
+    # --- Universal Base Blend Strategy Configuration ---
+    blend_max_single_position: float = 0.20
+    blend_bull_max_single_position: float = 0.20
+    blend_min_weight_change: float = 0.05
+    blend_entry_threshold: float = 0.03
+    blend_dd_reduce_thresh: float = 0.10
+    blend_dd_defensive_thresh: float = 0.15
+    blend_dd_stop_thresh: float = 0.20
+    blend_tier1_cooldown_bars: int = 15
+    blend_stop_cooldown_bars: int = 21
+    blend_dynamic_cash_deployment: bool = True
+    blend_breadth_lookback: int = 50
+    blend_breadth_bull_thresh: float = 0.30
+    blend_thrust_lookback: int = 10
+    blend_thrust_thresh: float = 0.60
+    blend_target_bull_exposure: float = 0.80
+    blend_enable_vol_targeting: bool = True
+    blend_target_vol: float = 0.12
+    blend_target_bull_vol: float = 0.24
+    blend_target_bear_vol: float = 0.12
+    blend_smooth_drawdown: bool = True
+    blend_vol_model: str = "garman_klass"     # "garman_klass" or "close_to_close"
+    blend_adaptive_inertia: bool = True
+    blend_stop_mode: str = "atr_trailing"     # "atr_trailing", "fixed_pct", or "none"
+    blend_stop_atr_mult: float = 4.5
+    blend_asset_stop_cooldown_bars: int = 5
+    blend_preemptive_thrust_deployment: bool = True
+    blend_min_thrust_assets: int = 5
+    blend_max_assets_per_sector: int = 1
+    blend_adaptive_sector_throttle: bool = False
+    blend_thrust_min_roc: float = 0.01
+    blend_thrust_sizing_mode: str = "vol_adjusted" # "vol_adjusted" or "equal_dollar"
+    blend_sub_strategies: Optional[dict] = None
 
     # --- Price Action Breakout & Retest Strategy (docs/chan_similar_trading.md Strategy 1) ---
     pabr_box_window: int = 20                # consolidation box length (~4 weeks)
@@ -955,10 +1007,18 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.cdhb_asset_stop_cooldown_bars must be >= 0, got {self.cdhb_asset_stop_cooldown_bars}")
         if self.cdhb_vol_model not in ("garman_klass", "close_to_close"):
             raise ValueError(f"StrategyConfig.cdhb_vol_model must be 'garman_klass' or 'close_to_close', got {self.cdhb_vol_model}")
-        if self.cdhb_stop_mode not in ("atr_trailing", "fixed_pct"):
+        if self.cdhb_stop_mode not in ("atr_trailing", "fixed_pct", "none"):
             raise ValueError(f"StrategyConfig.cdhb_stop_mode must be 'atr_trailing' or 'fixed_pct', got {self.cdhb_stop_mode}")
         if self.cdhb_stop_atr_mult <= 0.0:
             raise ValueError(f"StrategyConfig.cdhb_stop_atr_mult must be > 0, got {self.cdhb_stop_atr_mult}")
+        if self.crb_vol_model not in ("garman_klass", "close_to_close"):
+            raise ValueError(f"StrategyConfig.crb_vol_model must be 'garman_klass' or 'close_to_close', got {self.crb_vol_model}")
+        if self.cfsb_vol_model not in ("garman_klass", "close_to_close"):
+            raise ValueError(f"StrategyConfig.cfsb_vol_model must be 'garman_klass' or 'close_to_close', got {self.cfsb_vol_model}")
+        if self.blend_vol_model not in ("garman_klass", "close_to_close"):
+            raise ValueError(f"StrategyConfig.blend_vol_model must be 'garman_klass' or 'close_to_close', got {self.blend_vol_model}")
+        if self.blend_stop_mode not in ("atr_trailing", "fixed_pct", "none"):
+            raise ValueError(f"StrategyConfig.blend_stop_mode must be 'atr_trailing', 'fixed_pct', or 'none', got {self.blend_stop_mode}")
 
     @classmethod
     def from_dict(cls, data: dict) -> "StrategyConfig":

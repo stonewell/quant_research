@@ -70,6 +70,7 @@ from common.scheduling import get_rebalance_dates as _get_rebalance_dates
 from .chan_structure import compute_chan_signals
 from .chan_signals import compute_chan3_signals, compute_chan_pivot_macd_signals
 from .chan_advanced_strategies import (
+    BaseBlendAllocationStrategy,
     ChanBestSelectorStrategy,
     ChanCompositeStrategy,
     ChanCrisisShieldBlendStrategy,
@@ -81,6 +82,7 @@ from .chan_advanced_strategies import (
     ChanRiskManagedBlendStrategy,
     ChanTrendThirdBuyStrategy,
     ChanVaaCompoundStrategy,
+    GenericBlendStrategy,
 )
 from .chan_lesson_strategies import (
     ChanFiboSectorStrengthStrategy,
