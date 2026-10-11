@@ -9,7 +9,7 @@ END=${4:-"2026-01-01"}
 
 uv run python research_strategy/run_research_strategy.py --dump-strategies
 
-find research_strategy/results/strategy_dumps/ -type f -name "*dual*blend*.json" -print0 | while IFS= read -r -d '' file; do
+find research_strategy/results/strategy_dumps/ -type f -name "*blend*.json" -print0 | while IFS= read -r -d '' file; do
     # Get just the filename (e.g., "document.txt")
     filename=$(basename "$file")
 

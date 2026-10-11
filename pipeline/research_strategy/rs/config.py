@@ -620,6 +620,7 @@ class StrategyConfig:
     cdhb_alpha2_require_trend: bool = False
     cdhb_max_single_position: float = 0.20
     cdhb_min_weight_change: float = 0.05
+    cdhb_entry_threshold: float = 0.03
     cdhb_dd_reduce_thresh: float = 0.10
     cdhb_dd_defensive_thresh: float = 0.15
     cdhb_dd_stop_thresh: float = 0.20
@@ -633,14 +634,28 @@ class StrategyConfig:
     cdhb_bull_max_single_position: float = 0.20
     cdhb_preemptive_thrust_deployment: bool = True
     cdhb_min_thrust_assets: int = 5
-    cdhb_max_assets_per_sector: int = 1      # Max assets permitted per sector during thrust deployment (Suggestion 2)
-    cdhb_thrust_min_roc: float = 0.01        # Minimum 10-day ROC velocity hurdle (filters flat/drifting assets)
-    cdhb_thrust_sizing_mode: str = "vol_adjusted"  # "vol_adjusted" (inverse-vol risk balanced) or "equal_dollar"
-    cdhb_require_asset_trend: bool = True    # Require P >= SMA50 or R20d > 0 for offensive thrust entries
-    cdhb_asset_stop_cooldown_bars: int = 15  # Cooldown bars for an individual asset after hitting -8% stop loss
+    cdhb_max_assets_per_sector: int = 1      # Max assets permitted per sector during thrust deployment
+    cdhb_adaptive_sector_throttle: bool = False  # Expand sector limit to 2 for leading sectors when enabled
+    cdhb_thrust_min_roc: float = 0.01        # Minimum 10-day ROC velocity hurdle
+    cdhb_thrust_sizing_mode: str = "vol_adjusted"  # "vol_adjusted" or "equal_dollar"
+    cdhb_require_asset_trend: bool = True    # Require P >= SMA50 and 20d slope >= 0 for entries
+    cdhb_require_rs_rank: bool = True        # Require 60d relative strength >= median
+    cdhb_confluence_sizing: bool = True      # Multi-signal conviction weighting (1.5x-2.0x)
+    cdhb_elastic_drawdown_reset: bool = True # Instant reset of drawdown brake on confirmed thrust
+    cdhb_asset_stop_cooldown_bars: int = 5   # Cooldown bars for an asset after hitting stop loss
     cdhb_enable_vol_targeting: bool = True
-    cdhb_target_vol: float = 0.14
+    cdhb_target_vol: float = 0.18
+    cdhb_target_bull_vol: float = 0.24       # Expanded target vol during confirmed bull regimes
+    cdhb_target_bear_vol: float = 0.12       # Tightened target vol during bear regimes
     cdhb_smooth_drawdown: bool = True
+    cdhb_dynamic_regime_weights: bool = True # Dynamic regime-aware allocation (bull 50/20/30, bear 45/30/25, chop 45/25/30)
+    cdhb_vol_model: str = "garman_klass"     # "garman_klass" or "close_to_close"
+    cdhb_adaptive_inertia: bool = True       # Volatility-scaled asymmetric rebalancing bands
+    cdhb_expand_alpha_sleeve: bool = True    # Expand 20% alpha sleeve to 4 alphas (#53, #3, #41, #101)
+    cdhb_alpha3_id: int = 41                 # WorldQuant Alpha#41 (VWAP Geometric Trend Breakout)
+    cdhb_alpha4_id: int = 101                # WorldQuant Alpha#101 (Intraday Price Efficiency)
+    cdhb_stop_mode: str = "atr_trailing"     # "atr_trailing" (Chandelier Exit) or "fixed_pct" (-8%)
+    cdhb_stop_atr_mult: float = 4.5          # Multiplier for ATR trailing stop
 
     # --- Price Action Breakout & Retest Strategy (docs/chan_similar_trading.md Strategy 1) ---
     pabr_box_window: int = 20                # consolidation box length (~4 weeks)
@@ -938,6 +953,12 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.cdhb_thrust_sizing_mode must be 'vol_adjusted' or 'equal_dollar', got {self.cdhb_thrust_sizing_mode}")
         if self.cdhb_asset_stop_cooldown_bars < 0:
             raise ValueError(f"StrategyConfig.cdhb_asset_stop_cooldown_bars must be >= 0, got {self.cdhb_asset_stop_cooldown_bars}")
+        if self.cdhb_vol_model not in ("garman_klass", "close_to_close"):
+            raise ValueError(f"StrategyConfig.cdhb_vol_model must be 'garman_klass' or 'close_to_close', got {self.cdhb_vol_model}")
+        if self.cdhb_stop_mode not in ("atr_trailing", "fixed_pct"):
+            raise ValueError(f"StrategyConfig.cdhb_stop_mode must be 'atr_trailing' or 'fixed_pct', got {self.cdhb_stop_mode}")
+        if self.cdhb_stop_atr_mult <= 0.0:
+            raise ValueError(f"StrategyConfig.cdhb_stop_atr_mult must be > 0, got {self.cdhb_stop_atr_mult}")
 
     @classmethod
     def from_dict(cls, data: dict) -> "StrategyConfig":

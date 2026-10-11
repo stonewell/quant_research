@@ -17,7 +17,7 @@ uses the pre-ffill sparsity to find the real rebalance dates.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -201,15 +201,20 @@ def _fill_out_columns(daily: pd.DataFrame, symbols: list) -> pd.DataFrame:
 
 def apply_asset_inertia(
     daily: pd.DataFrame,
-    min_weight_change: float = 0.02,
+    min_weight_change: Union[float, Dict[str, float], pd.Series] = 0.02,
     cash_proxy: Optional[str] = "CASH",
     emergency_mask: Optional[pd.Series] = None,
+    asymmetric_sells: bool = False,
+    entry_threshold: Optional[float] = None,
 ) -> pd.DataFrame:
     """Filters daily target-weight allocations using asset-level inertia (Option A).
 
     For each asset, if the change in ideal target weight versus the currently held
     target weight is below `min_weight_change`, the asset's target weight is frozen
-    at its previous held value.
+    at its previous held value. Supports uniform float, per-asset dict, or pd.Series
+    thresholds, tighter asymmetric sell bands (60% threshold on trimming), and an
+    optional `entry_threshold` allowing new position initiations to enter without
+    being blocked by volatility-scaled rebalancing inertia.
 
     When significant changes occur (|diff| >= min_weight_change):
     1. Sells execute first to release cash capacity.
@@ -219,12 +224,25 @@ def apply_asset_inertia(
     4. Emergency dates (indicated by `emergency_mask`) bypass inertia to allow
        immediate liquidation or de-risking without threshold delay.
     """
-    if min_weight_change <= 0.0 or daily.empty:
+    if daily.empty:
         return daily
 
     symbols = list(daily.columns)
     risky_symbols = [s for s in symbols if s != cash_proxy]
     n_dates = len(daily)
+
+    if isinstance(min_weight_change, (int, float)):
+        if min_weight_change <= 0.0:
+            return daily
+        thresh = pd.Series(float(min_weight_change), index=risky_symbols)
+    elif isinstance(min_weight_change, dict):
+        thresh = pd.Series(min_weight_change).reindex(risky_symbols).fillna(0.02)
+    elif isinstance(min_weight_change, pd.Series):
+        thresh = min_weight_change.reindex(risky_symbols).fillna(0.02)
+    else:
+        thresh = pd.Series(0.02, index=risky_symbols)
+
+    sell_thresh = (thresh * 0.60) if asymmetric_sells else thresh
 
     filtered = daily.copy()
     current_w = daily.iloc[0].copy()
@@ -239,9 +257,14 @@ def apply_asset_inertia(
             filtered.iloc[t] = current_w
             continue
 
+        buy_thresh = thresh.copy()
+        if entry_threshold is not None:
+            new_entry_mask = (current_w[risky_symbols] <= 1e-4)
+            buy_thresh[new_entry_mask] = np.minimum(thresh[new_entry_mask], entry_threshold)
+
         diff = ideal_w[risky_symbols] - current_w[risky_symbols]
-        sells = diff[diff <= -min_weight_change].index.tolist()
-        buys = diff[diff >= min_weight_change].index.tolist()
+        sells = diff[diff <= -sell_thresh].index.tolist()
+        buys = diff[diff >= buy_thresh].index.tolist()
 
         if not sells and not buys:
             filtered.iloc[t] = current_w
@@ -260,7 +283,7 @@ def apply_asset_inertia(
                 ideal_b = ideal_w[b]
                 buy_target = min(ideal_b, avail_cap)
 
-                if buy_target - current_w[b] >= min_weight_change:
+                if buy_target - current_w[b] >= buy_thresh[b]:
                     new_w[b] = buy_target
                     avail_cap = max(0.0, avail_cap - buy_target)
                 else:
@@ -277,9 +300,10 @@ def apply_asset_inertia(
 
 def _sparse_from_daily(
     daily: pd.DataFrame,
-    min_weight_change: float = 0.0,
+    min_weight_change: Union[float, Dict[str, float], pd.Series] = 0.0,
     cash_proxy: Optional[str] = None,
     emergency_mask: Optional[pd.Series] = None,
+    asymmetric_sells: bool = False,
 ) -> pd.DataFrame:
     """Compress a dense daily target-weight DataFrame to the sparse contract:
     NaN except on a day the target actually differs from the previous day's.
@@ -289,9 +313,18 @@ def _sparse_from_daily(
     """
     if daily.empty:
         return daily
-    if min_weight_change > 0.0:
+    has_inertia = False
+    if isinstance(min_weight_change, (int, float)):
+        has_inertia = (min_weight_change > 0.0)
+    elif isinstance(min_weight_change, (dict, pd.Series)):
+        has_inertia = True
+    if has_inertia:
         daily = apply_asset_inertia(
-            daily, min_weight_change=min_weight_change, cash_proxy=cash_proxy, emergency_mask=emergency_mask
+            daily,
+            min_weight_change=min_weight_change,
+            cash_proxy=cash_proxy,
+            emergency_mask=emergency_mask,
+            asymmetric_sells=asymmetric_sells,
         )
     changed = (daily != daily.shift(1)).any(axis=1)
     changed.iloc[0] = True

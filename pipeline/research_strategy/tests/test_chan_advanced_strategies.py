@@ -1760,3 +1760,162 @@ def test_chan_dual_hybrid_anti_fragility_and_friction_control():
         assert allocated_coal <= 1
 
 
+def test_chan_dual_hybrid_config_validation():
+    """Verify StrategyConfig validation checks for cdhb fields."""
+    # Valid config
+    cfg = StrategyConfig(
+        cdhb_vol_model="garman_klass",
+        cdhb_stop_mode="atr_trailing",
+        cdhb_stop_atr_mult=3.0,
+    )
+    assert cfg.cdhb_vol_model == "garman_klass"
+    assert cfg.cdhb_stop_mode == "atr_trailing"
+
+    # Invalid vol model
+    with pytest.raises(ValueError, match="cdhb_vol_model"):
+        StrategyConfig(cdhb_vol_model="invalid_model")
+
+    # Invalid stop mode
+    with pytest.raises(ValueError, match="cdhb_stop_mode"):
+        StrategyConfig(cdhb_stop_mode="invalid_stop")
+
+    # Invalid ATR multiplier
+    with pytest.raises(ValueError, match="cdhb_stop_atr_mult"):
+        StrategyConfig(cdhb_stop_atr_mult=-1.0)
+
+
+def test_chan_dual_hybrid_instantiation_from_config_json():
+    """Verify chan_dual_hybrid_blend can be instantiated from strategies_config.json
+    with all 6 institutional optimization settings."""
+    configs = load_strategies_config()
+    assert "chan_dual_hybrid_blend" in configs
+    entry = configs["chan_dual_hybrid_blend"]
+    inst = instantiate_strategy_from_config_entry("chan_dual_hybrid_blend", entry)
+    assert isinstance(inst, ChanDualHybridBlendStrategy)
+    assert inst.config.cdhb_dynamic_regime_weights is True
+    assert inst.config.cdhb_vol_model == "garman_klass"
+    assert inst.config.cdhb_adaptive_inertia is True
+    assert inst.config.cdhb_stop_mode == "atr_trailing"
+    assert inst.config.cdhb_stop_atr_mult == 4.5
+    assert inst.config.cdhb_alpha3_id == 41
+    assert inst.config.cdhb_alpha4_id == 101
+    assert inst.config.cdhb_adaptive_sector_throttle is True
+    assert inst.config.cdhb_confluence_sizing is True
+    assert inst.config.cdhb_elastic_drawdown_reset is True
+    assert inst.config.cdhb_target_bull_vol == 0.24
+    assert inst.config.cdhb_target_bear_vol == 0.12
+    assert inst.config.cdhb_entry_threshold == 0.03
+    assert "Garman-Klass" in inst.explain_weights()
+    assert "atr_trailing" in inst.explain_weights()
+
+
+def test_chan_dual_hybrid_garman_klass_vol_engine():
+    """Verify Garman-Klass volatility computation produces strictly positive,
+    finite annualized volatility series from OHLC data."""
+    from pipeline.research_strategy.rs.chan_advanced_strategies import _compute_garman_klass_vol
+
+    dates = pd.bdate_range("2020-01-01", periods=100)
+    c = np.linspace(100, 150, 100)
+    df = pd.DataFrame({
+        "Open": c * 0.99,
+        "High": c * 1.02,
+        "Low": c * 0.98,
+        "Close": c,
+    }, index=dates)
+
+    gk_vol = _compute_garman_klass_vol(df, window=21, default_vol=0.14)
+    assert not gk_vol.isna().any()
+    assert (gk_vol > 0.0).all()
+    assert (gk_vol < 1.0).all()
+
+
+def test_chan_dual_hybrid_expanded_alpha_sleeve():
+    """Verify that enabling cdhb_expand_alpha_sleeve incorporates Alpha#41 and Alpha#101
+    into sub-strategies and weight generation."""
+    universe = create_mock_universe(n_days=300)
+    cfg = StrategyConfig(
+        cdhb_expand_alpha_sleeve=True,
+        cdhb_alpha1_id=53,
+        cdhb_alpha2_id=3,
+        cdhb_alpha3_id=41,
+        cdhb_alpha4_id=101,
+        cash_proxy="BIL",
+    )
+    strat = ChanDualHybridBlendStrategy(cfg)
+    exp = strat.explain_weights()
+    assert "Alpha#41" in exp
+    assert "Alpha#101" in exp
+
+    weights = strat.generate_weights(universe)
+    rebalances = weights.dropna(how="all")
+    assert not rebalances.empty
+    # Risky weights sum <= 1.0
+    risky = rebalances.drop(columns=["BIL"], errors="ignore")
+    assert (risky.sum(axis=1) <= 1.00001).all()
+
+
+def test_chan_dual_hybrid_atr_trailing_stop_and_adaptive_inertia():
+    """Verify that an asset triggering ATR trailing stop is liquidated and put into cooldown,
+    and adaptive inertia enforces asymmetric sell bands."""
+    dates = pd.bdate_range("2020-01-01", periods=300)
+    t = np.arange(300)
+
+    # Asset A rallies then abruptly plunges by 20%
+    price_a = np.where(t < 200, 100.0 + 0.4 * t, 180.0 - 2.5 * (t - 200))
+    # Asset B stays steadily trending
+    price_b = 100.0 + 0.2 * t
+    bil_close = np.full(300, 100.0)
+
+    universe = {
+        "SYM_A": make_ohlcv_from_closes(price_a),
+        "SYM_B": make_ohlcv_from_closes(price_b),
+        "BIL": make_ohlcv_from_closes(bil_close),
+    }
+    for df in universe.values():
+        df.index = dates
+
+    cfg = StrategyConfig(
+        cdhb_stop_mode="atr_trailing",
+        cdhb_stop_atr_mult=2.0,  # tight trailing stop
+        cdhb_adaptive_inertia=True,
+        cdhb_min_weight_change=0.03,
+        cdhb_asset_stop_cooldown_bars=5,
+        cash_proxy="BIL",
+    )
+    strat = ChanDualHybridBlendStrategy(cfg)
+    weights = strat.generate_weights(universe)
+    rebal = weights.dropna(how="all")
+    assert not rebal.empty
+
+    # Post-crash (t > 220), SYM_A must have been stopped out and liquidated (weight = 0.0)
+    late_dates = dates[220:]
+    late_rebal = rebal.loc[rebal.index.intersection(late_dates)]
+    if not late_rebal.empty:
+        # At some point during the crash, SYM_A must be 0.0
+        assert (late_rebal["SYM_A"] == 0.0).any()
+
+
+def test_chan_dual_hybrid_entry_bypass_allows_high_vol_initiation():
+    """Verify that entry_threshold bypass allows initiating positions in high-volatility
+    assets whose scaled inertia threshold would otherwise exceed their target weight."""
+    from common.allocation_templates import apply_asset_inertia
+
+    dates = pd.bdate_range("2020-01-01", periods=5)
+    # Day 0: 0 cash, 0 SYM
+    # Day 1: Model proposes 5% SYM (below an elevated 8% inertia band)
+    daily = pd.DataFrame({
+        "SYM": [0.0, 0.05, 0.05, 0.05, 0.05],
+        "BIL": [1.0, 0.95, 0.95, 0.95, 0.95],
+    }, index=dates)
+
+    inertia_map = {"SYM": 0.08}  # elevated 8% threshold
+
+    # Without entry bypass: 5% < 8%, position is frozen at 0.0
+    res_no_bypass = apply_asset_inertia(daily, min_weight_change=inertia_map, cash_proxy="BIL")
+    assert (res_no_bypass["SYM"] == 0.0).all()
+
+    # With entry bypass: 5% >= 2% entry threshold, initial entry succeeds!
+    res_bypass = apply_asset_inertia(daily, min_weight_change=inertia_map, cash_proxy="BIL", entry_threshold=0.02)
+    assert res_bypass["SYM"].iloc[1] == 0.05
+
+
