@@ -7,7 +7,8 @@
 本工作区组织为两个项目组，每个项目组拥有独立的 `uv` 环境，以及位于仓库根目录的共享基础设施：
 
 - **`pipeline/`** -- 核心研究/回测流水线项目组（共享一个 `uv` 环境）：
-  - `research_strategy/`：量化交易策略研究（包含 51 种战术资产配置 TAA、定时择时、突破、缠论结构与相似模型、宏观因子复合、多策略 Alpha 账簿与 WorldQuant 101 公式化阿尔法模型）及因子汇总导出器。
+  - `research_strategy/`：量化交易策略研究（包含 53 种战术资产配置 TAA、定时择时、突破、缠论结构与相似模型、宏观因子复合、多策略 Alpha 账簿、WorldQuant 101 公式化阿尔法模型及模块化混合策略）及因子汇总导出器。
+  - `research/blend/`：模块化机构级多策略混合资产配置系统（`BaseBlendAllocationStrategy`、`ChanRiskManagedBlendStrategy`、`ChanFourStateBlendStrategy`、`ChanCrisisShieldBlendStrategy`、`ChanDualHybridBlendStrategy`、`GenericBlendStrategy`）。
   - `instrument_selection/`：策略无关的标的筛选、可预测性测试（Hurst 指数、蜡烛图形态、动量）、相关性聚类和组合篮子选择工具。
   - `pattern_mining/`：拐点指标模式挖掘（基于 Bonferroni 矫正的打乱置换零假设显著性检验），生成供 `strategy_generator` 消费的持久化 `pattern_report.json`。
   - `strategy_generator/`：组合策略生成器，搜索配置模板与挖掘出的拐点模式，通过等效随机搜索（ERS）验证并结合因子研究进行平局决胜。
@@ -16,9 +17,13 @@
   - `run_pipeline.py`：通过子进程端到端串联 research_strategy -> instrument_selection -> pattern_mining -> strategy_generator -> `backtester`。
 - **`ml/`** -- 基于 ML/DL 的策略项目组，每个项目拥有**独立隔离**的 `uv` 环境：
   - `bnn_forecaster/`：独立（未接入流水线）的 AutoBNN 概率预测买入/卖出筛选器。
-- **根目录共享部分**（无独立的 `pyproject.toml`/虚拟环境 -- 由运行它们的项目组虚拟环境通过 `sys.path` 注入调用）：
+- **`web/`** -- 交互式 Web 应用：
+  - `livetrading/`：机构级实盘量化交易与风控部署平台（一阶宏观风控健康度门禁 + 二阶实盘交易单生成与执行）。
+- **根目录共享部分**（通过 `sys.path` 注入或独立执行）：
   - `common/`：共享的市场数据加载器、技术指标、组合回测器、配置模板、因子分类学、再平衡调度、打乱置换显著性检验、CLI/报告脚手架以及合成数据生成器。
   - `backtester/`：独立的策略回测引擎，评估固定策略规范（`strategy.json`）在标准区间或滚动 Walk-Forward 窗口下的表现。
+  - `scripts/`：实盘健康检查与风控审计脚本（`check_live_portfolio_health.py`）、实盘部署运行器（`run_live_four_state_blend.py`）及文档格式转换工具。
+  - `docs/universe/`：预先经过严格前行检验与审计的中美港三大核心卫星资产池。
 
 每个项目目录均包含独立的 README，附带完整的 CLI 参数说明、示例命令和数据 Schema 文档；`common/README_ZH.md` 是工作区内由 2 个或以上项目共享的每个 DataFrame/JSON 数据结构的唯一权威来源。本文件提供端到端的全景图；如需了解具体模块的详细信息，请参阅以下链接。
 
@@ -89,7 +94,7 @@ cd ml/bnn_forecaster && uv sync      # bnn_forecaster 独立的隔离环境 (Aut
 
 ### 第 1 步：因子研究 (`research_strategy`)
 
-在 21 种已实现的策略结构上运行量化因子研究，评估不同因子类别（`absolute_momentum_trend`、`relative_momentum`、`volatility_targeting`、`mean_reversion`、`breadth`、`correlation_diversification` 等）的表现特征。
+在 53 种已实现的策略结构上运行量化因子研究，评估不同因子类别（`absolute_momentum_trend`、`relative_momentum`、`volatility_targeting`、`mean_reversion`、`breadth`、`correlation_diversification` 等）的表现特征。
 
 ```bash
 # 从 pipeline/ 目录运行（或从根目录使用 pipeline/.venv/Scripts/python.exe）
@@ -334,7 +339,8 @@ pipeline/.venv/Scripts/python.exe -m pytest backtester/tests -v
 | `backtester/` (仓库根目录) | 独立的 CLI，在单次或滚动 Walk-Forward 窗口上评估固定策略文件；无独立的 `pyproject.toml` | `backtester/run_backtest.py` | `backtester/README_ZH.md`, `backtester/SCHEMAS_ZH.md` |
 | `data/` (仓库根目录) | 共享 DuckDB OHLCV 缓存目录 (`cache.duckdb`)，由各个阶段读写 | 不适用 (缓存，非代码) | `common/README_ZH.md` §9 |
 | `pipeline/` | 上述项目的共享 `uv` 环境，以及流水线编排器 | `pipeline/pyproject.toml` | -- |
-| `pipeline/research_strategy/` | 评估 45 种量化交易策略并导出因子研究汇总 | `pipeline/research_strategy/run_research_strategy.py` | `pipeline/research_strategy/README_ZH.md` |
+| `pipeline/research_strategy/` | 评估 53 种量化交易策略并导出因子研究汇总 | `pipeline/research_strategy/run_research_strategy.py` | `pipeline/research_strategy/README_ZH.md` |
+| `pipeline/research/blend/` | 模块化机构级多策略混合资产配置系统（基于 `BaseBlendAllocationStrategy`） | 不适用 (`pipeline/` 内置模块) | `pipeline/research_strategy/README_ZH.md` |
 | `pipeline/instrument_selection/` | 特征化标的、执行硬性可投资性筛选并选择分散化资产组合 | `pipeline/instrument_selection/run_screener.py` | `pipeline/instrument_selection/README_ZH.md` |
 | `pipeline/pattern_mining/` | 通过 Bonferroni 矫正的打乱置换显著性检验挖掘拐点指标模式 | `pipeline/pattern_mining/run_pattern_mining.py` | `pipeline/pattern_mining/README_ZH.md` |
 | `pipeline/strategy_generator/` | 网格搜索配置模板和挖掘出的指标模式以生成经过验证的策略 | `pipeline/strategy_generator/run_strategygen.py` | `pipeline/strategy_generator/README_ZH.md` |
@@ -342,3 +348,6 @@ pipeline/.venv/Scripts/python.exe -m pytest backtester/tests -v
 | `pipeline/live_signal/` | 独立（未接入流水线）的时点买卖信号与持仓感知再平衡指令工具，针对已生成的 `strategy.json`，评估今天或任意指定日期 | `pipeline/live_signal/run_live_signal.py` | `pipeline/live_signal/README_ZH.md` |
 | `pipeline/run_pipeline.py` | 通过子进程端到端串联 research_strategy -> instrument_selection -> pattern_mining -> strategy_generator -> `backtester`，自动将每步输出接入下一步 | `pipeline/run_pipeline.py` | 本 README |
 | `ml/bnn_forecaster/` | 独立（未接入流水线）的 AutoBNN 概率预测买入/卖出筛选器；拥有独立的隔离 `uv` 环境（参阅其 README） | `ml/bnn_forecaster/run_bnn_forecaster.py` | `ml/bnn_forecaster/README_ZH.md` |
+| `web/livetrading/` | 响应式实盘量化交易与风控部署平台（一阶健康度门禁 + 二阶实盘交易单生成） | `web/livetrading/app.py` | `web/livetrading/README.md` |
+| `scripts/` | 实盘组合健康检查 (`check_live_portfolio_health.py`) 与实盘执行运行器 (`run_live_four_state_blend.py`) | `scripts/run_live_four_state_blend.py` | `docs/ruleset/` |
+| `docs/universe/` | 经前行验证的中美港三大核心卫星股票池资产定义与说明 | 不适用 (数据与文档) | `docs/universe/` |

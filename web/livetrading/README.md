@@ -1,3 +1,5 @@
+[ English | [简体中文](README_ZH.md) ]
+
 # Live Trading Deployment Web Station (实盘量化交易与风控部署平台)
 
 An institutional-grade, responsive live trading dashboard and execution workstation deployed under `web/livetrading`.

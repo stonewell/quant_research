@@ -2,7 +2,7 @@
 
 # 量化交易策略研究 (`research_strategy`)
 
-一个专门的子项目，实现并评估 51 种量化交易策略配置：从学术文献与从业者研究（*Journal of Finance*、*Journal of Portfolio Management*、SSRN、AllocateSmartly）中综合而成的战术资产配置 (TAA) 策略；单资产择时策略；Donchian 通道突破系统；现代热门静态/固定权重组合（永久组合、黄金蝴蝶、全天候、HFEA）；布林带通道突破与均值回归；残差动量与自适应快速扩张；涵盖 17 种策略的完整缠论及类似结构分析体系（缠中说禅：笔中枢移动、三类买卖点、MACD 背驰、多周期趋势共振、三买回抽、均值回归背驰、多阶段复合阶梯建仓、四态操作判定机、最优选择器元策略、风控混合策略、四态风控混合策略、VAA 复合防御、中枢震荡监视器、斐波那契均线板块轮动，以及裸K形态回踩确认、成交量分布POC迁移与三浪斐波那契扩展）；宏观政体因子自适应复合引擎；采用核心-卫星配置架构的机构级多策略 Alpha 账簿 (`MultiStrategyAlphaBookStrategy`)；以及包含完整 101 个公式化因子的 WorldQuant 101 Alpha 体系 (Kakushadze 2015)。
+一个专门的子项目，实现并评估 53 种量化交易策略配置：从学术文献与从业者研究（*Journal of Finance*、*Journal of Portfolio Management*、SSRN、AllocateSmartly）中综合而成的战术资产配置 (TAA) 策略；单资产择时策略；Donchian 通道突破系统；现代热门静态/固定权重组合（永久组合、黄金蝴蝶、全天候、HFEA）；布林带通道突破与均值回归；残差动量与自适应快速扩张；涵盖 17 种策略的完整缠论及类似结构分析体系（缠中说禅：笔中枢移动、三类买卖点、MACD 背驰、多周期趋势共振、三买回抽、均值回归背驰、多阶段复合阶梯建仓、四态操作判定机、最优选择器元策略、风控混合策略、四态风控混合策略、危机护盾混合策略、双混合 Alpha 组合策略、VAA 复合防御、中枢震荡监视器、斐波那契均线板块轮动，以及裸K形态回踩确认、成交量分布POC迁移与三浪斐波那契扩展）；模块化机构级混合配置策略 (`pipeline/research/blend/`)；宏观政体因子自适应复合引擎；采用核心-卫星配置架构的机构级多策略 Alpha 账簿 (`MultiStrategyAlphaBookStrategy`)；以及包含完整 101 个公式化因子的 WorldQuant 101 Alpha 体系 (Kakushadze 2015)。
 
 ---
 
@@ -116,24 +116,28 @@
 * **策略 28：缠论最优选择器元策略** (`ChanBestSelectorStrategy`, `chan_best_selector`)：动态评估各标的的缠论结构形态与所处阶段，为每只资产自适应路由最优信号模式（突破、回调或背驰）。
 * **策略 29：缠论风控混合策略** (`ChanRiskManagedBlendStrategy`, `chan_risk_managed_blend`)：机构级组合策略，融合前行回测排名前三的缠论策略（VAA 复合 50%、三类买卖点 35%、阶梯复合 15%），配备 20% 单票仓位上限（牛市广度扩容至 30%）、附带 15 根 K 线自愈冷却与快速反弹超驰的多阶回撤熔断、4% 换手摩擦过滤、30% 市场宽度门槛，以及 10 日市场宽度冲力前置动用现金机制。
 * **策略 30：缠论四态风控混合策略** (`ChanFourStateBlendStrategy`, `chan_four_state_blend`)：机构级组合策略，基于 `chan_risk_managed_blend`，将阶梯复合（Composite 15%）升级替换为缠论四态操作判定机（Four-State 15%），并保留三类买卖点（35%）与 VAA 复合（50%），配备 20% 单票仓位上限（牛市广度扩容至 30%）、附带 15 根 K 线自愈冷却与快速反弹超驰的多阶回撤熔断、4% 换手摩擦过滤、30% 市场宽度门槛，以及 10 日市场宽度冲力前置动用现金机制。
-* **策略 31：缠论中枢 MACD + VAA 复合策略** (`ChanVAACompoundStrategy`, `chan_vaa_compound`)：将缠论微观结构 Alpha 与 Keller & Keuning 的 VAA 13612W 金丝钱宏观风控结合，当宏观警报拉响时一键切换至避险防御资产（`BIL`、`IEF`）。Tier 1 Alpha 领导者（夏普 1.30，CAGR 14.25%，最大回撤 5.0%）。
-* **策略 32：缠论中枢区间震荡监视器** (`ChanPivotOscillationStrategy`, `chan_pivot_oscillation`)：在结构性盘整中枢形成期间，在中枢下沿边界逢低做多、中枢上沿减仓止盈的网格化区间策略。
-* **策略 33：缠论斐波那契均线板块强弱轮动** (`ChanFiboSectorStrengthStrategy`, `chan_fibo_sector_strength`)：利用 8/13/21/55/89 斐波那契均线束测算横截面板块动量强度，并以缠论中枢位确认突破质量。
+* **策略 31：缠论危机护盾混合策略** (`ChanCrisisShieldBlendStrategy`, `chan_crisis_shield_blend`)：机构级组合策略，基于 `chan_risk_managed_blend`，将阶梯复合（20%）替换为 WorldQuant Alpha#12 成交量冲击反转（20%），并搭配三类买卖点（45%）与 VAA 复合（35%），配备 20% 单票仓位上限、附带 15 根 K 线自愈冷却的多阶回撤熔断、5% 换手摩擦过滤、30% 市场宽度牛市门槛，以及前置宽度冲力现金动用机制。
+* **策略 32：缠论双混合 Alpha 组合策略** (`ChanDualHybridBlendStrategy`, `chan_dual_hybrid_blend`)：反脆弱机构级组合策略，基于 `chan_risk_managed_blend` 架构，搭载动态政体自适应配比（牛市 50/20/30、熊市 45/30/25、震荡市 45/25/30）、Garman-Klass 极值波动率目标化（18% 目标波率）、ATR 跟踪止损（4.5x ATR，5 日冷却）、带新开仓旁路的自适应惯性再平衡（2% 调仓门槛）、行业单标的限额节流阀，以及 WorldQuant Alpha#53 影线失衡与 Alpha#3 量价相关性增量与缠论三买、VAA 复合的集成。
+* **模块化机构级混合框架 (`pipeline/research/blend/`)**：
+  所有混合策略均继承自基类 `BaseBlendAllocationStrategy` (`pipeline/research/blend/blend_base.py`)，建立了统一的子策略权重合成、动态政体切换、极值波动率缩放、多阶回撤熔断、行业节流（`CHINA_EQUITY_SECTORS`）及非对称调仓惯性过滤（`apply_asset_inertia`）标准架构。
+* **策略 33：缠论中枢 MACD + VAA 复合策略** (`ChanVAACompoundStrategy`, `chan_vaa_compound`)：将缠论微观结构 Alpha 与 Keller & Keuning 的 VAA 13612W 金丝钱宏观风控结合，当宏观警报拉响时一键切换至避险防御资产（`BIL`、`IEF`）。Tier 1 Alpha 领导者（夏普 1.30，CAGR 14.25%，最大回撤 5.0%）。
+* **策略 34：缠论中枢区间震荡监视器** (`ChanPivotOscillationStrategy`, `chan_pivot_oscillation`)：在结构性盘整中枢形成期间，在中枢下沿边界逢低做多、中枢上沿减仓止盈的网格化区间策略。
+* **策略 35：缠论斐波那契均线板块强弱轮动** (`ChanFiboSectorStrengthStrategy`, `chan_fibo_sector_strength`)：利用 8/13/21/55/89 斐波那契均线束测算横截面板块动量强度，并以缠论中枢位确认突破质量。
 
-### 策略 34–39：扩展 TAA、波动率与因子策略 (`rs/taa_strategies.py`, `rs/bollinger_strategy.py`, `rs/residual_momentum_strategy.py`, `rs/adaptive_fast_expansion_strategy.py`)
+### 策略 36–41：扩展 TAA、波动率与因子策略 (`rs/taa_strategies.py`, `rs/bollinger_strategy.py`, `rs/residual_momentum_strategy.py`, `rs/adaptive_fast_expansion_strategy.py`)
 
-* **策略 34：混合资产配置 (HAA)** (`HybridAssetAllocation`, `hybrid_asset_allocation`)：Wouter Keller (2023, SSRN)。单金丝雀资产 (`TIP`) 驱动，在平静期持有前 4 种高动量进攻资产，在动荡期配置防御避险资产 (`IEF`, `BIL`)。
-* **策略 35：防御资产配置 (DAA)** (`DefensiveAssetAllocation`, `defensive_asset_allocation`)：Wouter Keller & Jan Willem Keuning (2018, SSRN)。双金丝雀 (`VWO`, `BND`) 动态预警，在平静期分配至前 6 只进攻资产，在半崩盘或全崩盘状态下按 50%–100% 比例转入防御资产 (`IEF`, `LQD`, `BIL`)。
-* **策略 36：布林带挤压突破（方法一）** (`BollingerBreakoutStrategy`, `bollinger_breakout`)：John Bollinger (2001, *Bollinger on Bollinger Bands*)。识别波动率极限压缩区间（带宽处于 126 日低位），在向上放量破轨时顺势做多。
-* **策略 37：布林带均值回归（方法三）** (`BollingerMeanReversionStrategy`, `bollinger_mean_reversion`)：布林带 %b 摆动指标，在价格深跌下破下轨（%b < 0.05）且 RSI 超卖时入场博取回归 20 日中轨。
-* **策略 38：残差动量策略** (`ResidualMomentumStrategy`, `residual_momentum`)：David Blitz, Juan Pang & Pim van Vliet (2013, *Journal of Empirical Finance*)。通过对基准 (`SPY`) 滚动 36 个月回归剥离市场 Beta 暴露，按 12 个月特质性残差收益与残差风险之比进行横截面排序配置。
-* **策略 39：自适应快速扩张策略** (`AdaptiveFastExpansionStrategy`, `adaptive_fast_expansion`)：利用自适应动态 ATR 管道捕捉波动率政体跳变初期的动能爆发。
+* **策略 36：混合资产配置 (HAA)** (`HybridAssetAllocation`, `hybrid_asset_allocation`)：Wouter Keller (2023, SSRN)。单金丝雀资产 (`TIP`) 驱动，在平静期持有前 4 种高动量进攻资产，在动荡期配置防御避险资产 (`IEF`, `BIL`)。
+* **策略 37：防御资产配置 (DAA)** (`DefensiveAssetAllocation`, `defensive_asset_allocation`)：Wouter Keller & Jan Willem Keuning (2018, SSRN)。双金丝雀 (`VWO`, `BND`) 动态预警，在平静期分配至前 6 只进攻资产，在半崩盘或全崩盘状态下按 50%–100% 比例转入防御资产 (`IEF`, `LQD`, `BIL`)。
+* **策略 38：布林带挤压突破（方法一）** (`BollingerBreakoutStrategy`, `bollinger_breakout`)：John Bollinger (2001, *Bollinger on Bollinger Bands*)。识别波动率极限压缩区间（带宽处于 126 日低位），在向上放量破轨时顺势做多。
+* **策略 39：布林带均值回归（方法三）** (`BollingerMeanReversionStrategy`, `bollinger_mean_reversion`)：布林带 %b 摆动指标，在价格深跌下破下轨（%b < 0.05）且 RSI 超卖时入场博取回归 20 日中轨。
+* **策略 40：残差动量策略** (`ResidualMomentumStrategy`, `residual_momentum`)：David Blitz, Juan Pang & Pim van Vliet (2013, *Journal of Empirical Finance*)。通过对基准 (`SPY`) 滚动 36 个月回归剥离市场 Beta 暴露，按 12 个月特质性残差收益与残差风险之比进行横截面排序配置。
+* **策略 41：自适应快速扩张策略** (`AdaptiveFastExpansionStrategy`, `adaptive_fast_expansion`)：利用自适应动态 ATR 管道捕捉波动率政体跳变初期的动能爆发。
 
-### 策略 40：宏观政体因子自适应复合策略 (`rs/regime_factor_compound_strategy.py`)
+### 策略 42：宏观政体因子自适应复合策略 (`rs/regime_factor_compound_strategy.py`)
 
 * **宏观政体因子自适应复合策略** (`RegimeFactorCompoundStrategy`, `regime_factor_compound`)：基于经济增长、通胀与流动性利率指标识别宏观政体（增长/通胀/紧缩），按逆波动率风险平价加权在动量、套息、低波与防御因子间动态分配风险预算。
 
-### 策略 41：机构级多策略 Alpha 账簿——最优核心-卫星蓝图 (`rs/multi_strategy_alpha_book.py`)
+### 策略 43：机构级多策略 Alpha 账簿——最优核心-卫星蓝图 (`rs/multi_strategy_alpha_book.py`)
 
 * **学术与从业者背景**：多策略 Pod 独立运行架构（Millennium、Point72、Citadel；Blitz 2024；Roncalli 2013 风险预算管理；Quant Memo 2026）。
 * **核心-卫星架构矩阵 (`ms_pod_preset="core_satellite"`)**：
@@ -155,13 +159,13 @@
   - 正收益折胜率：**85.71%**（18/21 折盈利，升级前 66.67%）
   - 战胜 SPY 基准概率：**42.86%**（升级前 19.05%）
 
-### 策略 42–44：缠论类似结构与价格行为模型 (`rs/chan_similar_strategies.py`)
+### 策略 44–46：缠论类似结构与价格行为模型 (`rs/chan_similar_strategies.py`)
 
-* **策略 42：价格行为突破回踩确认策略** (`PriceActionBreakoutRetestStrategy`, `pa_breakout_retest`)：盘整箱体向上突破伴随成交量放大，且必须满足回踩不破箱体上沿的二次确认入场。
-* **策略 43：成交量分布 POC 迁移策略** (`VolumeProfilePocMigrationStrategy`, `vp_poc_migration`)：滚动计算成交量分布（Volume Profile），追踪控制点（POC）与价值区间（VA）的上移，回踩上涨 POC 时逢低建仓。
-* **策略 44：改进型艾略特三浪斐波那契策略** (`Wave3FibonacciStrategy`, `wave3_fibonacci`)：识别 5 浪推动结构，在二浪回调至斐波那契回撤位（38.2%–61.8%）时入场，博取强劲的三浪主升浪扩展。
+* **策略 44：价格行为突破回踩确认策略** (`PriceActionBreakoutRetestStrategy`, `pa_breakout_retest`)：盘整箱体向上突破伴随成交量放大，且必须满足回踩不破箱体上沿的二次确认入场。
+* **策略 45：成交量分布 POC 迁移策略** (`VolumeProfilePocMigrationStrategy`, `vp_poc_migration`)：滚动计算成交量分布（Volume Profile），追踪控制点（POC）与价值区间（VA）的上移，回踩上涨 POC 时逢低建仓。
+* **策略 46：改进型艾略特三浪斐波那契策略** (`Wave3FibonacciStrategy`, `wave3_fibonacci`)：识别 5 浪推动结构，在二浪回调至斐波那契回撤位（38.2%–61.8%）时入场，博取强劲的三浪主升浪扩展。
 
-### 策略 45–46：WorldQuant 101 公式化阿尔法体系 (`rs/worldquant_alpha_strategy.py`, `rs/alpha101_factors.py`, `common/alpha101_operators.py`)
+### 策略 47–48：WorldQuant 101 公式化阿尔法体系 (`rs/worldquant_alpha_strategy.py`, `rs/alpha101_factors.py`, `common/alpha101_operators.py`)
 
 * **学术与量化背景**：Zura Kakushadze (2015, *101 Formulaic Alphas*, arXiv:1601.00991 / *Wilmott Magazine*)。提供高保真度算子体系与 WorldQuant 发布的全部 101 个公式化 Alpha。
 * **全套量化算子库 (`common/alpha101_operators.py`)**：
@@ -171,14 +175,14 @@
 * **完整 101 个公式化因子库 (`rs/alpha101_factors.py`)**：
   - 通过 `Alpha101Data` 容器统一管理横截面矩阵数据（`open`, `high`, `low`, `close`, `volume`, `returns`, `vwap`）。
   - 原生矩阵化实现全部 101 个因子（`alpha_1` 至 `alpha_101`），输出标准 `(date x symbol)` DataFrame 阿尔法分值。
-* **策略 45：WorldQuant 单阿尔法策略** (`WorldQuantAlphaStrategy`)：
+* **策略 47：WorldQuant 单阿尔法策略** (`WorldQuantAlphaStrategy`)：
   可运行任意单个指定 Alpha（1–101），进行横截面排序、绝对均线趋势过滤（`Close > SMA`），并采用逆波动率或等权分配资金，严格执行稀疏权重契约与闲置现金存入 `BIL`。配置预设包含：
   - `worldquant_alpha6_vol_corr`：开盘价与成交量相关性反转（$-\text{corr}(\text{open}, \text{volume}, 10)$）。
   - `worldquant_alpha12_reversal`：成交量加权价格动量反转（$\text{sign}(\Delta \text{volume}) \cdot -\Delta \text{close}$）。
   - `worldquant_alpha41_vwap_trend`：高成交量 VWAP 趋势突破（$\text{power}(\text{high} \times \text{low}, 0.5) - \text{vwap}$）。
   - `worldquant_alpha53_wick_imbalance`：日内影线资金压力不平衡（$\frac{(\text{close}-\text{low}) - (\text{high}-\text{close})}{\text{close}-\text{open}}$）。
   - `worldquant_alpha101_intraday`：日内振幅动量因子（$\frac{\text{close}-\text{open}}{\text{high}-\text{low}+0.001}$）。
-* **策略 46：WorldQuant Mega-Alpha 复合集成策略** (`WorldQuantMegaAlphaStrategy`, `worldquant_mega_alpha`)：
+* **策略 48：WorldQuant Mega-Alpha 复合集成策略** (`WorldQuantMegaAlphaStrategy`, `worldquant_mega_alpha`)：
   融合多家族不相关因子的复合集成策略（涵盖成交量反转、日内价差、VWAP趋势突破，默认融合 `[6, 12, 41, 53, 101, 38]`），对各 Alpha 分值进行横截面标准化与线性加权，叠加动态大盘趋势门控与逆波动率风险预算加权。
 * **机构级多策略 Alpha 账簿扩展**：
   在 `MultiStrategyAlphaBookStrategy` 中新增 `alpha_worldquant`（顶级缠论 + WorldQuant Mega-Alpha + VAA）与 `all_regime_worldquant`（全天候永久组合 + 缠论 + WorldQuant）两大机构预设。
@@ -209,46 +213,58 @@
 ## 4. 目录结构
 
 ```
-pipeline/research_strategy/
-├── rs/
-│   ├── __init__.py
-│   ├── config.py                         # StrategyConfig & load_strategies_config()
-│   ├── nl_parser.py                      # 自然语言描述 -> ParsedStrategySpec
-│   ├── chan_structure.py                 # 独立缠论结构检测器（分型/笔/枢轴）
-│   ├── chan_signals.py                   # 增量扩展：线段、真实 MACD 背驰、一/二/三类买卖点
-│   ├── chan_advanced_strategies.py       # 高级缠论策略集（多周期共振、三买回抽、均值回归、阶梯复合、四态操作判定机、风控混合、VAA 复合、最优选择）
-│   ├── chan_similar_strategies.py        # 缠论类似模型（裸K形态回踩确认、成交量分布POC迁移、三浪斐波那契扩展）
-│   ├── chan_lesson_strategies.py         # 缠论教程拓展策略（中枢震荡监视器、斐波那契均线板块轮动）
-│   ├── taa_strategies.py                 # 拓展战术资产配置策略（PAA、AAA、HAA、DAA）
-│   ├── bollinger_strategy.py             # 布林带突破（方法一）与均值回归（方法三）
-│   ├── residual_momentum_strategy.py     # 剥离 Beta 的特质性残差动量
-│   ├── adaptive_fast_expansion_strategy.py # 自适应快速波动率扩张冲冲策略
-│   ├── regime_factor_compound_strategy.py # 宏观政体因子自适应复合引擎
-│   ├── multi_strategy_alpha_book.py      # 机构级多策略 Alpha 账簿（最优核心-卫星蓝图）
-│   ├── timing_aspects.py                 # 单资产择时模板的入场 x 出场/风控要素分解
-│   ├── alpha101_factors.py               # 完整 WorldQuant 101 公式化 Alpha 因子库与 Alpha101Data
-│   ├── worldquant_alpha_strategy.py      # 单 Alpha 与 Mega-Alpha 复合集成策略实现
-│   └── strategy.py                       # NaturalLanguageStrategy 引擎与策略实现
-├── strategies_config.json                # 包含 51 个策略和参数的中央 JSON 配置
-├── run_research_strategy.py              # 动态加载策略配置的 CLI 运行器
-├── dashboard.py                          # 终端 ASCII 报告查看器
-├── tests/
-│   ├── test_nl_parser.py                 # 自然语言解析器的离线单元测试
-│   ├── test_chan_structure.py            # 缠论结构检测器的离线单元测试
-│   ├── test_chan_signals.py              # 线段/MACD 背驰/三类买卖点的离线单元测试
-│   ├── test_chan_advanced_strategies.py  # 高级缠论策略的离线单元测试
-│   ├── test_chan_similar_strategies.py   # 缠论类似策略的离线单元测试
-│   ├── test_chan_lesson_strategies.py    # 缠论教程策略的离线单元测试
-│   ├── test_timing_aspects.py            # 入场 x 出场要素组合的离线单元测试
-│   ├── test_strategy.py                  # 策略实现与配置加载的离线单元测试
-│   ├── test_bollinger_strategy.py        # 布林带策略的离线单元测试
-│   ├── test_regime_factor_compound_strategy.py # 宏观政体策略离线单元测试
-│   ├── test_adaptive_fast_expansion_strategy.py # 自适应扩张策略离线单元测试
-│   ├── test_novel_alpha_strategies.py    # 新型阿尔法策略离线单元测试
-│   ├── test_multi_strategy_alpha_book.py # 多策略 Alpha 账簿离线单元测试
-│   ├── test_alpha101_factors.py          # 101 个 WorldQuant 阿尔法因子全量离线测试
-│   └── test_worldquant_alpha_strategy.py # WorldQuant 阿尔法策略模板离线测试
-└── README_ZH.md                          # 策略公式、引用与指南
+pipeline/
+├── research/
+│   └── blend/
+│       ├── __init__.py
+│       ├── base.py
+│       ├── blend_base.py                 # BaseBlendAllocationStrategy，极值波动率，行业分类映射
+│       ├── chan_risk_managed_blend.py    # ChanRiskManagedBlendStrategy
+│       ├── chan_four_state_blend.py      # ChanFourStateBlendStrategy
+│       ├── chan_crisis_shield_blend.py   # ChanCrisisShieldBlendStrategy
+│       ├── chan_dual_hybrid_blend.py     # ChanDualHybridBlendStrategy
+│       └── generic_blend.py              # GenericBlendStrategy
+└── research_strategy/
+    ├── rs/
+    │   ├── __init__.py
+    │   ├── config.py                     # StrategyConfig & load_strategies_config()
+    │   ├── nl_parser.py                  # 自然语言描述 -> ParsedStrategySpec
+    │   ├── chan_structure.py             # 独立缠论结构检测器（分型/笔/枢轴）
+    │   ├── chan_signals.py               # 增量扩展：线段、真实 MACD 背驰、一/二/三类买卖点
+    │   ├── chan_advanced_strategies.py   # 高级缠论策略集（多周期共振、三买回抽、均值回归、阶梯复合、四态操作判定机、最优选择；重导出混合策略）
+    │   ├── chan_similar_strategies.py    # 缠论类似模型（裸K形态回踩确认、成交量分布POC迁移、三浪斐波那契扩展）
+    │   ├── chan_lesson_strategies.py     # 缠论教程拓展策略（中枢震荡监视器、斐波那契均线板块轮动）
+    │   ├── taa_strategies.py             # 拓展战术资产配置策略（PAA、AAA、HAA、DAA）
+    │   ├── bollinger_strategy.py         # 布林带突破（方法一）与均值回归（方法三）
+    │   ├── residual_momentum_strategy.py # 剥离 Beta 的特质性残差动量
+    │   ├── adaptive_fast_expansion_strategy.py # 自适应快速波动率扩张冲冲策略
+    │   ├── regime_factor_compound_strategy.py # 宏观政体因子自适应复合引擎
+    │   ├── multi_strategy_alpha_book.py  # 机构级多策略 Alpha 账簿（最优核心-卫星蓝图）
+    │   ├── timing_aspects.py             # 单资产择时模板的入场 x 出场/风控要素分解
+    │   ├── alpha101_factors.py           # 完整 WorldQuant 101 公式化 Alpha 因子库与 Alpha101Data
+    │   ├── worldquant_alpha_strategy.py  # 单 Alpha 与 Mega-Alpha 复合集成策略实现
+    │   └── strategy.py                   # NaturalLanguageStrategy 引擎与策略实现
+    ├── strategies_config.json            # 包含 53 个策略和参数的中央 JSON 配置
+    ├── run_research_strategy.py          # 动态加载策略配置的 CLI 运行器
+    ├── dashboard.py                      # 终端 ASCII 报告查看器
+    ├── tests/
+    │   ├── test_nl_parser.py             # 自然语言解析器的离线单元测试
+    │   ├── test_chan_structure.py        # 缠论结构检测器的离线单元测试
+    │   ├── test_chan_signals.py          # 线段/MACD 背驰/三类买卖点的离线单元测试
+    │   ├── test_chan_advanced_strategies.py # 高级缠论策略的离线单元测试
+    │   ├── test_blend_strategies.py      # 模块化混合策略的离线单元测试
+    │   ├── test_chan_similar_strategies.py # 缠论类似策略的离线单元测试
+    │   ├── test_chan_lesson_strategies.py # 缠论教程策略的离线单元测试
+    │   ├── test_timing_aspects.py        # 入场 x 出场要素组合的离线单元测试
+    │   ├── test_strategy.py              # 策略实现与配置加载的离线单元测试
+    │   ├── test_bollinger_strategy.py    # 布林带策略的离线单元测试
+    │   ├── test_regime_factor_compound_strategy.py # 宏观政体策略离线单元测试
+    │   ├── test_adaptive_fast_expansion_strategy.py # 自适应扩张策略离线单元测试
+    │   ├── test_novel_alpha_strategies.py # 新型阿尔法策略离线单元测试
+    │   ├── test_multi_strategy_alpha_book.py # 多策略 Alpha 账簿离线单元测试
+    │   ├── test_alpha101_factors.py      # 101 个 WorldQuant 阿尔法因子全量离线测试
+    │   └── test_worldquant_alpha_strategy.py # WorldQuant 阿尔法策略模板离线测试
+    └── README_ZH.md                      # 策略公式、引用与指南
 ```
 
 ---

@@ -68,9 +68,10 @@ available in the current shell.
 - Every strategy/allocation template is an `AllocationTemplate` subclass (`common/allocation_templates.py`)
   implementing `generate_weights(universe, params) -> DataFrame`, `explain_weights(params) -> str`,
   and `warmup_bars(params) -> int`. Two families implement this interface: the 9 static, zero-arg
-  templates in `common/allocation_templates.py`, and the 51 richer, `StrategyConfig`-driven
+  templates in `common/allocation_templates.py`, and the 53 richer, `StrategyConfig`-driven
   templates (basket presets, single-asset timing strategies, Chan structural models, macro factor
-  compounders, multi-strategy alpha books, and WorldQuant formulaic alpha models) in `pipeline/research_strategy/rs/`.
+  compounders, multi-strategy alpha books, WorldQuant formulaic alpha models, and modular blend
+  allocation strategies in `pipeline/research/blend/`) in `pipeline/research_strategy/rs/`.
 
 - **Sparse weights contract (critical):** `generate_weights` returns a DataFrame indexed by date
   where a row is `NaN` on every day EXCEPT an actual rebalance date, where it holds the real target
@@ -109,6 +110,26 @@ available in the current shell.
   `composite_spec` block in `strategy.json` so `backtester` can reconstruct the exact instance. Read
   both modules' docstrings before extending this -- the NaN-vs-0.0 rule above is exactly what bit
   the first version of this feature.
+
+- **Modular Blend Allocation Strategies** (`pipeline/research/blend/`): Institutional multi-strategy
+  blend ensembles built on `BaseBlendAllocationStrategy` (`pipeline/research/blend/blend_base.py`),
+  including `ChanRiskManagedBlendStrategy`, `ChanFourStateBlendStrategy`, `ChanCrisisShieldBlendStrategy`,
+  `ChanDualHybridBlendStrategy`, and `GenericBlendStrategy`. Standardizes dynamic regime-adaptive
+  weighting, Garman-Klass volatility targeting, multi-tier drawdown circuit breakers with auto-healing
+  cooldowns, adaptive inertia rebalancing (`apply_asset_inertia`), sector throttling, and breadth thrust
+  cash deployment.
+
+- **Live Trading Deployment & Web Station** (`web/livetrading/`, `scripts/`):
+  Live operations follow a two-stage protocol:
+  - **Stage 1 (Macro Health Gate)** via `scripts/check_live_portfolio_health.py`: Evaluates
+    peak-to-trough drawdown from High-Water Mark (HWM), multi-tier circuit breaker triggers, market
+    breadth ($\ge 30\%$), and momentum thrust ($\ge 60\%$).
+  - **Stage 2 (Order Ticket Generation)** via `scripts/run_live_four_state_blend.py`: Enforces
+    execution hierarchy: Phase 1: SELLS FIRST (releases purchasing power) $\rightarrow$ Phase 2: BUYS
+    SECOND (lot-rounded entries) $\rightarrow$ Phase 3: CASH SWEEP (idle cash into `BIL`/`511880`/`GC001`).
+  - `web/livetrading` provides an interactive web UI with real-time portfolio management, daily immutable
+    snapshot archiving (`data/runs/<date>/`), and custom universe editing. Regional core-satellite
+    pools reside in `docs/universe/` (China A-Shares, US equities, Hong Kong stocks).
 
 ## Documentation & coding style conventions
 

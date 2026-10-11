@@ -8,7 +8,8 @@ This workspace is organized into two project groups, each with its own `uv` envi
 shared infrastructure at the repo root:
 
 - **`pipeline/`** -- the core research/backtest pipeline family (one shared `uv` environment):
-  - `research_strategy/`: Researched quantitative trading strategies (51 TAA, timing, breakout, Chan structural & similar models, macro factor, multi-strategy alpha book, and WorldQuant 101 Formulaic Alpha models) and factor summary exporter.
+  - `research_strategy/`: Researched quantitative trading strategies (53 TAA, timing, breakout, Chan structural & similar models, macro factor, multi-strategy alpha book, WorldQuant 101 Formulaic Alpha models, and modular blend strategies) and factor summary exporter.
+  - `research/blend/`: Modular institutional blend allocation strategies (`BaseBlendAllocationStrategy`, `ChanRiskManagedBlendStrategy`, `ChanFourStateBlendStrategy`, `ChanCrisisShieldBlendStrategy`, `ChanDualHybridBlendStrategy`, `GenericBlendStrategy`).
   - `instrument_selection/`: Strategy-agnostic screening, predictability testing (Hurst, candlestick, momentum), correlation clustering, and basket selection tool.
   - `pattern_mining/`: Turning-point indicator pattern mining (Bonferroni-corrected shuffle-null significance test), writing a durable `pattern_report.json` for `strategy_generator` to consume.
   - `strategy_generator/`: Portfolio strategy generator searching allocation templates and mined turning-point patterns, validated via Equivalent Random Search (ERS) and factor research tie-breaking.
@@ -17,10 +18,13 @@ shared infrastructure at the repo root:
   - `run_pipeline.py`: Chains research_strategy -> instrument_selection -> pattern_mining -> strategy_generator -> `backtester` end-to-end via subprocess.
 - **`ml/`** -- ML/DL-based strategy projects, each with its OWN isolated `uv` environment:
   - `bnn_forecaster/`: Standalone (not pipeline-wired) AutoBNN probabilistic-forecast buy/sell screener.
-- **Shared at the repo root** (no `pyproject.toml`/venv of their own -- reached via `sys.path`
-  injection from whichever group's venv is running them):
+- **`web/`** -- Interactive web applications:
+  - `livetrading/`: Institutional-grade live trading deployment web station & execution workstation (Stage 1 Health Gate + Stage 2 Live Trading Ticket Generation).
+- **Shared at the repo root** (reached via `sys.path` injection or standalone execution):
   - `common/`: Shared market data loaders, indicators, portfolio backtester, allocation templates, factor taxonomy, rebalance scheduling, shuffle-null significance testing, CLI/reporting scaffolding, and synthetic test generators.
   - `backtester/`: Standalone backtesting engine evaluating fixed strategy specifications (`strategy.json`) across standard or rolling walk-forward windows.
+  - `scripts/`: Production live trading health checks (`check_live_portfolio_health.py`), execution runners (`run_live_four_state_blend.py`), and documentation conversion tools.
+  - `docs/universe/`: Pre-screened core-satellite asset pools for China A-Shares, US equities, and Hong Kong stocks.
 
 Each project directory has its own README with a full CLI argument reference, sample commands, and
 data-shape/schema documentation; `common/README.md` is the workspace's single source of truth for
@@ -99,7 +103,7 @@ group's venv fits the strategy you're using, e.g. `pipeline/.venv/Scripts/python
 
 ### Step 1: Factor Research (`research_strategy`)
 
-Run quantitative factor research across 21 implemented strategy formulations to characterize performance across factor categories (`absolute_momentum_trend`, `relative_momentum`, `volatility_targeting`, `mean_reversion`, `breadth`, `correlation_diversification`, etc.).
+Run quantitative factor research across 53 implemented strategy configurations to characterize performance across factor categories (`absolute_momentum_trend`, `relative_momentum`, `volatility_targeting`, `mean_reversion`, `breadth`, `correlation_diversification`, etc.).
 
 ```bash
 # Run from inside pipeline/ (or use pipeline/.venv/Scripts/python.exe from the repo root)
@@ -382,7 +386,8 @@ pipeline/.venv/Scripts/python.exe -m pytest backtester/tests -v
 | `backtester/` (repo root) | Standalone CLI evaluating fixed strategy files over single or rolling walkforward windows; no `pyproject.toml` of its own | `backtester/run_backtest.py` | `backtester/README.md`, `backtester/SCHEMAS.md` |
 | `data/` (repo root) | Shared DuckDB OHLCV cache directory (`cache.duckdb`), written/read by every stage | N/A (cache, not code) | `common/README.md` §9 |
 | `pipeline/` | Shared `uv` environment for the projects below, plus the orchestrator | `pipeline/pyproject.toml` | -- |
-| `pipeline/research_strategy/` | Evaluates 45 quantitative trading strategies and exports factor research summaries | `pipeline/research_strategy/run_research_strategy.py` | `pipeline/research_strategy/README.md` |
+| `pipeline/research_strategy/` | Evaluates 53 quantitative trading strategies and exports factor research summaries | `pipeline/research_strategy/run_research_strategy.py` | `pipeline/research_strategy/README.md` |
+| `pipeline/research/blend/` | Modular institutional blend allocation strategies built on `BaseBlendAllocationStrategy` | N/A (Module in `pipeline/`) | `pipeline/research_strategy/README.md` |
 | `pipeline/instrument_selection/` | Characterizes instruments, performs hard investability screening, and selects diversified baskets | `pipeline/instrument_selection/run_screener.py` | `pipeline/instrument_selection/README.md` |
 | `pipeline/pattern_mining/` | Mines turning-point indicator patterns via a Bonferroni-corrected shuffle-null significance test | `pipeline/pattern_mining/run_pattern_mining.py` | `pipeline/pattern_mining/README.md` |
 | `pipeline/strategy_generator/` | Grid-searches allocation templates & mined indicator patterns to generate validated strategies | `pipeline/strategy_generator/run_strategygen.py` | `pipeline/strategy_generator/README.md` |
@@ -390,3 +395,6 @@ pipeline/.venv/Scripts/python.exe -m pytest backtester/tests -v
 | `pipeline/live_signal/` | Standalone (not pipeline-wired) point-in-time buy/sell signal + holdings-aware rebalance instruction for an already-generated `strategy.json`, as of today or any given date | `pipeline/live_signal/run_live_signal.py` | `pipeline/live_signal/README.md` |
 | `pipeline/run_pipeline.py` | Chains research_strategy -> instrument_selection -> pattern_mining -> strategy_generator -> `backtester` end-to-end via subprocess, auto-wiring each step's output into the next | `pipeline/run_pipeline.py` | This README |
 | `ml/bnn_forecaster/` | Standalone (not pipeline-wired) AutoBNN probabilistic-forecast buy/sell screener; own isolated `uv` environment (see its README) | `ml/bnn_forecaster/run_bnn_forecaster.py` | `ml/bnn_forecaster/README.md` |
+| `web/livetrading/` | Responsive live trading deployment web station & workstation (Stage 1 Health Gate + Stage 2 Ticket Generation) | `web/livetrading/app.py` | `web/livetrading/README.md` |
+| `scripts/` | Standalone live trading health audit (`check_live_portfolio_health.py`) and deployment runners (`run_live_four_state_blend.py`) | `scripts/run_live_four_state_blend.py` | `docs/ruleset/` |
+| `docs/universe/` | Pre-screened core-satellite asset pools for China A-Shares, US equities, and Hong Kong stocks | N/A (Data/Documentation) | `docs/universe/` |

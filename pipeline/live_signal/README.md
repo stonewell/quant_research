@@ -30,9 +30,7 @@ already-generated strategy, exactly like `backtester` does, via the same reconst
    **current target weights** — its most recent real rebalance row (the sparse-weights contract, see
    `common/README.md` §3) at or before `--as-of-date`.
 4. Compares that target against a **reference**:
-   - `--current-holdings`/`--current-holdings-file` (a `{symbol: weight_fraction}` JSON of your
-     ACTUAL current portfolio), if given — produces an exact trade list from your real holdings to
-     the strategy's target.
+   - `--current-holdings`/`--current-holdings-file` (either `{symbol: weight_fraction}` or `{symbol: share_quantity}` JSON of your ACTUAL current portfolio), if given — produces an exact trade list from your real holdings to the strategy's target. When share quantities are supplied (or `--portfolio-value` is specified), target weights and residual cash are automatically converted from market closing prices.
    - Otherwise, the strategy's own previous rebalance — a self-consistent signal with zero extra
      input, but it only tells you what CHANGED in the strategy's own recommendation, not what to
      actually trade if your real portfolio has drifted from it.
@@ -52,8 +50,9 @@ with every other project — see `common/README.md`'s cross-reference index.
 | `--strategy-file` | path, **required** | Path to the `strategy.json` exported by `strategy_generator` (or `backtester`-compatible equivalent from `research_strategy`/`fundamental_screener`/`bnn_forecaster`) |
 | `--as-of-date` | `YYYY-MM-DD`, default: today | Point-in-time date to evaluate the strategy at. Any past date works too (deterministic testing/debugging) — data after this date is never used. |
 | `--lookback-days` | int, default `800` | Calendar days of history to load before `--as-of-date` (~2.2 years — comfortably covers every existing template's `warmup_bars`). Raise this if you see the short-history warning. |
-| `--current-holdings` | JSON str, default: none | `{symbol: weight_fraction}` of your actual current portfolio. Omit (with `--current-holdings-file` too) to compare against the strategy's own previous rebalance instead. |
+| `--current-holdings` | JSON str, default: none | `{symbol: weight_fraction}` or `{symbol: share_quantity}` of your actual current portfolio. If integer share counts are passed (or values > 1.0), weights and residual cash are automatically calculated from close prices. Omit to compare against the strategy's own previous rebalance. |
 | `--current-holdings-file` | path, default: none | Same shape as `--current-holdings`, loaded from a file. Mutually exclusive with `--current-holdings`. |
+| `--portfolio-value` | float, default: none | Total portfolio NAV in account currency. When provided alongside share counts, stock weights and residual cash are automatically calculated using close prices as of `--as-of-date`. |
 | `--top-n` | int, default `5` | How many top buy candidates to highlight, ranked by target weight. |
 | `--action-threshold` | float, default `1e-6` | Minimum \|weight delta\| to count as a buy/sell rather than a hold. |
 | `--interval` | str, default `"1d"` | Bar interval passed to the data provider. |

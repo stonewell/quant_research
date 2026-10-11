@@ -49,7 +49,7 @@ uv run python run_pipeline.py --data-provider synthetic --universe SPY QQQ ...
 
 ## 核心领域模型 -- 修改模板/策略代码前必懂
 
-- 每个策略/配置模板均为 `AllocationTemplate` 的子类（`common/allocation_templates.py`），实现 `generate_weights(universe, params) -> DataFrame`、`explain_weights(params) -> str` 和 `warmup_bars(params) -> int`。两大家族实现了该接口：`common/allocation_templates.py` 中的 9 个静态无参模板，以及 `pipeline/research_strategy/rs/` 中 51 个更丰富、由 `StrategyConfig` 驱动的模板（组合预设、单资产择时、缠论结构分析、宏观因子复合、多策略 Alpha 账簿与 WorldQuant 公式化 Alpha 模型）。
+- 每个策略/配置模板均为 `AllocationTemplate` 的子类（`common/allocation_templates.py`），实现 `generate_weights(universe, params) -> DataFrame`、`explain_weights(params) -> str` 和 `warmup_bars(params) -> int`。两大家族实现了该接口：`common/allocation_templates.py` 中的 9 个静态无参模板，以及 `pipeline/research_strategy/rs/` 中 53 个更丰富、由 `StrategyConfig` 驱动的模板（组合预设、单资产择时、缠论结构分析、宏观因子复合、多策略 Alpha 账簿、WorldQuant 公式化 Alpha 模型以及 `pipeline/research/blend/` 下的模块化混合配置策略）。
 
 - **稀疏权重契约（至关重要）：** `generate_weights` 返回以日期为索引的 DataFrame，其中除**实际再平衡日**外，每一行的所有单元格均为 `NaN`；在再平衡日则包含真实的目标权重。模板**绝不能自行向前填充（forward-fill）其输出**--回测器（`common/allocation_backtester.py`）通过该行是否存在来区分“下达了再平衡指令”与“今天无事发生”，而非通过其数值是否相比前一行发生改变。
 
@@ -60,6 +60,14 @@ uv run python run_pipeline.py --data-provider synthetic --universe SPY QQQ ...
 - **因子分类学** (`common/factor_taxonomy.py`)：模板/策略上的标签（如 `relative_momentum`, `mean_reversion`, `volatility_targeting`）为 `strategy_generator` 可选的因子报告平局决胜提供支持--它仅能在顶级候选者非常接近时解决平局，绝不能覆盖在回测夏普比率上明显胜出的模板。
 
 - **切面组合 (Aspect Composition)** (`common/strategy_aspects.py` 针对篮子模板，`pipeline/research_strategy/rs/timing_aspects.py` 针对单资产择时模板)：`strategy_generator` 不再仅挑选单个整体模板。它将多个模板拆解为可复用的组件--*选择 (Selection)* + *加权 (Weighting)* 针对 9 个静态模板；*入场信号 (Entry)* + *出场/风控/仓位 (Exit)* 针对 4 个择时模板--并搜索跨不同来源模板的混合配对（如动量的选股 + 逆波动率的仓位）。胜出的混合策略会在 `strategy.json` 中嵌入 `composite_spec` 块，以便 `backtester` 重建确切实例。
+
+- **模块化混合配置策略 (Modular Blend Allocation Strategies)** (`pipeline/research/blend/`)：构建在 `BaseBlendAllocationStrategy` (`pipeline/research/blend/blend_base.py`) 之上的机构级多策略混合系统，包含 `ChanRiskManagedBlendStrategy`、`ChanFourStateBlendStrategy`、`ChanCrisisShieldBlendStrategy`、`ChanDualHybridBlendStrategy` 与 `GenericBlendStrategy`。统一规范了动态政体加权、Garman-Klass 极值波动率目标化、附带自愈冷却的多阶回撤熔断、自适应惯性再平衡 (`apply_asset_inertia`)、行业节流阀及市场宽度冲力现金动用机制。
+
+- **实盘部署平台与工作站 (Live Trading Deployment & Web Station)** (`web/livetrading/`, `scripts/`)：
+  实盘运营遵循两阶段标准化执行协议：
+  - **Stage 1（宏观健康度门禁）** 通过 `scripts/check_live_portfolio_health.py`：评估自最高历史净值（HWM）以来的峰谷回撤、多阶熔断触发器、市场宽度（$\ge 30\%$）及动量冲力（$\ge 60\%$）。
+  - **Stage 2（实盘交易单生成）** 通过 `scripts/run_live_four_state_blend.py`：强制执行阶段层级：第一阶段【先卖出】释放购买力 $\rightarrow$ 第二阶段【后买入】按整手取整建仓 $\rightarrow$ 第三阶段【闲置资金归集】入现金工具（`BIL`/`511880`/`GC001`）。
+  - `web/livetrading` 提供交互式 Web 交易工作站，支持实时持仓与现金管理、每日不可变运行快照归档（`data/runs/<date>/`）及自定义股票池管理。区域核心卫星池位于 `docs/universe/`（A 股、美股、港股）。
 
 ---
 
