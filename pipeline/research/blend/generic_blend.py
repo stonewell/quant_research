@@ -78,6 +78,14 @@ class GenericBlendStrategy(BaseBlendAllocationStrategy):
                 cfg_alpha = copy.deepcopy(cfg)
                 cfg_alpha.wq_alpha_id = alpha_id
                 sub_strats[name] = WorldQuantAlphaStrategy(cfg_alpha)
+            elif name.startswith("gtja_alpha") or name.startswith("gtja_"):
+                import re
+                match = re.search(r"\d+", name)
+                alpha_id = int(match.group()) if match else 16
+                from pipeline.research_strategy.rs.gtja191_factors import GTJAAlphaStrategy
+                cfg_alpha = copy.deepcopy(cfg)
+                cfg_alpha.gtja_alpha_id = alpha_id
+                sub_strats[name] = GTJAAlphaStrategy(cfg_alpha)
             else:
                 # Try finding case-insensitive match in STRATEGY_CLASS_MAP
                 found = False

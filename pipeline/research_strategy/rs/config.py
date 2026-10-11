@@ -18,6 +18,17 @@ Grounding:
    dependency on, the third-party `czsc` Rust/Python library. See
    `rs/chan_structure.py` for the structure detector and its disclosed
    simplifications.
+8. Modular Blend Allocation Strategies: Institutional multi-strategy blend
+   ensembles built on `BaseBlendAllocationStrategy` (`pipeline/research/blend/blend_base.py`),
+   including `ChanRiskManagedBlendStrategy`, `ChanFourStateBlendStrategy`,
+   `ChanCrisisShieldBlendStrategy`, `ChanDualHybridBlendStrategy`, and `GenericBlendStrategy`.
+   Features dynamic rolling IC-IR Bayesian adaptive weighting, Gu-Kelly-Xiu (2020)
+   macro regime-adaptive style routing, Löwdin symmetric orthogonalization,
+   Garman-Klass volatility targeting, multi-tier drawdown circuit breakers,
+   and adaptive inertia rebalancing.
+9. WorldQuant 101 Formulaic Alpha Strategy: Zura Kakushadze (2015/2016, Wilmott).
+10. GTJA 191 Microstructure Alpha Strategy: Guotai Junan Securities (2017)
+    with Cont-Kukanov-Stoikov (2014) OFI microstructure proxy.
 """
 
 import json
@@ -709,6 +720,17 @@ class StrategyConfig:
     blend_thrust_sizing_mode: str = "vol_adjusted" # "vol_adjusted" or "equal_dollar"
     blend_sub_strategies: Optional[dict] = None
 
+    # Blend Base Template 自适应与状态机通用参数
+    blend_weighting_mode: str = "rolling_ic_ir"  # static, rolling_ic_ir, regime_adaptive, regime_ic_ir_hybrid
+    blend_adaptive_lookback_days: int = 60      # 滚动性能视窗
+    blend_adaptive_min_tstat: float = 2.0       # 显著性门槛 (HLZ t-stat)
+    blend_adaptive_shrinkage: float = 0.20      # 贝叶斯向初始权重收缩系数
+    blend_enable_orthogonalization: bool = True # Löwdin 对称正交化开关
+
+    # Blend Base Template aliases (unprefixed versions for convenience)
+    weighting_mode: Optional[str] = None
+    enable_orthogonalization: Optional[bool] = None
+
     # --- Price Action Breakout & Retest Strategy (docs/chan_similar_trading.md Strategy 1) ---
     pabr_box_window: int = 20                # consolidation box length (~4 weeks)
     pabr_max_box_range_pct: float = 0.15     # max box range (high - low) / low
@@ -756,6 +778,16 @@ class StrategyConfig:
     wq_smoothing_days: int = 1               # Decay linear smoothing on raw scores
     wq_min_weight_change: float = 0.02       # Minimum target weight change threshold (inertia)
     wq_ensemble_alphas: List[int] = field(default_factory=lambda: [6, 12, 41, 53, 101, 38])
+
+    # --- GTJA 191 Microstructure Alpha Strategy ---
+    gtja_alpha_id: int = 16                     # 1 to 191 / 'ofi'
+    gtja_rebalance_freq_days: int = 5           # Rebalance frequency (days)
+    gtja_top_k: int = 3                         # Top K assets by alpha score
+    gtja_weighting_mode: str = "equal"          # "equal", "rank", "inv_vol"
+    gtja_require_trend_filter: bool = True      # Require Close > 200d SMA
+    gtja_trend_ma_period: int = 200             # Trend MA filter lookback
+    gtja_smoothing_days: int = 1                # Smoothing on raw scores
+    gtja_min_weight_change: float = 0.03        # Minimum target weight change threshold (inertia)
 
     # Backtester execution defaults
     initial_capital: float = 100_000.0
@@ -997,6 +1029,18 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.wq_min_weight_change must be between 0 and 1, got {self.wq_min_weight_change}")
         if not self.wq_ensemble_alphas or any(not (1 <= a <= 101) for a in self.wq_ensemble_alphas):
             raise ValueError(f"StrategyConfig.wq_ensemble_alphas must be a non-empty list of ints in [1, 101], got {self.wq_ensemble_alphas}")
+        if self.gtja_rebalance_freq_days <= 0:
+            raise ValueError(f"StrategyConfig.gtja_rebalance_freq_days must be > 0, got {self.gtja_rebalance_freq_days}")
+        if self.gtja_top_k <= 0:
+            raise ValueError(f"StrategyConfig.gtja_top_k must be > 0, got {self.gtja_top_k}")
+        if self.gtja_trend_ma_period <= 0:
+            raise ValueError(f"StrategyConfig.gtja_trend_ma_period must be > 0, got {self.gtja_trend_ma_period}")
+        if self.gtja_smoothing_days <= 0:
+            raise ValueError(f"StrategyConfig.gtja_smoothing_days must be > 0, got {self.gtja_smoothing_days}")
+        if not (0.0 <= self.gtja_min_weight_change <= 1.0):
+            raise ValueError(f"StrategyConfig.gtja_min_weight_change must be between 0 and 1, got {self.gtja_min_weight_change}")
+        if self.gtja_weighting_mode not in ("equal", "rank", "inv_vol"):
+            raise ValueError(f"StrategyConfig.gtja_weighting_mode must be one of 'equal', 'rank', 'inv_vol', got {self.gtja_weighting_mode}")
         if self.cdhb_max_assets_per_sector <= 0:
             raise ValueError(f"StrategyConfig.cdhb_max_assets_per_sector must be > 0, got {self.cdhb_max_assets_per_sector}")
         if not (0.0 <= self.cdhb_thrust_min_roc <= 0.20):
@@ -1020,16 +1064,51 @@ class StrategyConfig:
         if self.blend_stop_mode not in ("atr_trailing", "fixed_pct", "none"):
             raise ValueError(f"StrategyConfig.blend_stop_mode must be 'atr_trailing', 'fixed_pct', or 'none', got {self.blend_stop_mode}")
 
+        # Synchronize blend aliases
+        if self.weighting_mode is not None and self.weighting_mode != self.blend_weighting_mode:
+            if self.blend_weighting_mode == "rolling_ic_ir":
+                self.blend_weighting_mode = self.weighting_mode
+            else:
+                self.weighting_mode = self.blend_weighting_mode
+        elif self.weighting_mode is None:
+            self.weighting_mode = self.blend_weighting_mode
+
+        if self.enable_orthogonalization is not None and self.enable_orthogonalization != self.blend_enable_orthogonalization:
+            if self.blend_enable_orthogonalization is True:
+                self.blend_enable_orthogonalization = self.enable_orthogonalization
+            else:
+                self.enable_orthogonalization = self.blend_enable_orthogonalization
+        elif self.enable_orthogonalization is None:
+            self.enable_orthogonalization = self.blend_enable_orthogonalization
+
+        if self.blend_weighting_mode not in ("static", "rolling_ic_ir", "regime_adaptive", "regime_ic_ir_hybrid"):
+            raise ValueError(f"StrategyConfig.blend_weighting_mode must be one of 'static', 'rolling_ic_ir', 'regime_adaptive', 'regime_ic_ir_hybrid', got {self.blend_weighting_mode}")
+        if self.blend_adaptive_lookback_days <= 0:
+            raise ValueError(f"StrategyConfig.blend_adaptive_lookback_days must be > 0, got {self.blend_adaptive_lookback_days}")
+        if not (0.0 <= self.blend_adaptive_shrinkage <= 1.0):
+            raise ValueError(f"StrategyConfig.blend_adaptive_shrinkage must be between 0 and 1, got {self.blend_adaptive_shrinkage}")
+
     @classmethod
     def from_dict(cls, data: dict) -> "StrategyConfig":
         """Instantiates StrategyConfig from a dictionary, keeping only valid dataclass fields.
         Unknown keys are dropped (for forward-compatibility with newer config
         files) but a warning names them, rather than the previous total silence."""
+        data_copy = dict(data)
+        if "weighting_mode" in data_copy and "blend_weighting_mode" not in data_copy:
+            data_copy["blend_weighting_mode"] = data_copy["weighting_mode"]
+        elif "blend_weighting_mode" in data_copy and "weighting_mode" not in data_copy:
+            data_copy["weighting_mode"] = data_copy["blend_weighting_mode"]
+
+        if "enable_orthogonalization" in data_copy and "blend_enable_orthogonalization" not in data_copy:
+            data_copy["blend_enable_orthogonalization"] = data_copy["enable_orthogonalization"]
+        elif "blend_enable_orthogonalization" in data_copy and "enable_orthogonalization" not in data_copy:
+            data_copy["enable_orthogonalization"] = data_copy["blend_enable_orthogonalization"]
+
         valid_fields = {f.name for f in fields(cls)}
-        unknown_keys = set(data.keys()) - valid_fields
+        unknown_keys = set(data_copy.keys()) - valid_fields
         if unknown_keys:
             warnings.warn(f"StrategyConfig.from_dict: ignoring unknown key(s) {sorted(unknown_keys)}")
-        filtered = {k: v for k, v in data.items() if k in valid_fields}
+        filtered = {k: v for k, v in data_copy.items() if k in valid_fields}
         return cls(**filtered)
 
 

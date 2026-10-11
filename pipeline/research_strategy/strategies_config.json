@@ -342,6 +342,14 @@
       "crb_enable_vol_targeting": true,
       "crb_target_vol": 0.12,
       "crb_smooth_drawdown": true,
+      "crb_vol_model": "garman_klass",
+      "crb_adaptive_inertia": true,
+      "crb_stop_mode": "atr_trailing",
+      "crb_stop_atr_mult": 4.5,
+      "crb_entry_threshold": 0.03,
+      "crb_asset_stop_cooldown_bars": 5,
+      "blend_weighting_mode": "rolling_ic_ir",
+      "blend_enable_orthogonalization": true,
       "cash_proxy": "BIL"
     },
     "factors": ["regime_trend_strength", "absolute_momentum_trend", "relative_momentum", "volatility_targeting"]
@@ -371,6 +379,14 @@
       "cfsb_enable_vol_targeting": true,
       "cfsb_target_vol": 0.12,
       "cfsb_smooth_drawdown": true,
+      "cfsb_vol_model": "garman_klass",
+      "cfsb_adaptive_inertia": true,
+      "cfsb_stop_mode": "atr_trailing",
+      "cfsb_stop_atr_mult": 4.5,
+      "cfsb_entry_threshold": 0.03,
+      "cfsb_asset_stop_cooldown_bars": 5,
+      "blend_weighting_mode": "rolling_ic_ir",
+      "blend_enable_orthogonalization": true,
       "cash_proxy": "BIL"
     },
     "factors": ["regime_trend_strength", "absolute_momentum_trend", "relative_momentum", "volatility_targeting"]
@@ -402,6 +418,14 @@
       "ccsb_enable_vol_targeting": true,
       "ccsb_target_vol": 0.12,
       "ccsb_smooth_drawdown": true,
+      "ccsb_vol_model": "garman_klass",
+      "ccsb_adaptive_inertia": true,
+      "ccsb_stop_mode": "atr_trailing",
+      "ccsb_stop_atr_mult": 4.5,
+      "ccsb_entry_threshold": 0.03,
+      "ccsb_asset_stop_cooldown_bars": 5,
+      "blend_weighting_mode": "rolling_ic_ir",
+      "blend_enable_orthogonalization": true,
       "cash_proxy": "BIL"
     },
     "factors": ["regime_trend_strength", "absolute_momentum_trend", "relative_momentum", "volatility_targeting", "mean_reversion"]
@@ -458,9 +482,70 @@
       "cdhb_target_bull_vol": 0.24,
       "cdhb_target_bear_vol": 0.12,
       "cdhb_smooth_drawdown": true,
+      "blend_weighting_mode": "rolling_ic_ir",
+      "blend_enable_orthogonalization": true,
       "cash_proxy": "BIL"
     },
     "factors": ["regime_trend_strength", "absolute_momentum_trend", "relative_momentum", "volatility_targeting", "mean_reversion"]
+  },
+  "generic_blend": {
+    "name": "Generic Multi-Strategy Blend (Adaptive)",
+    "type": "class",
+    "class_name": "GenericBlendStrategy",
+    "description": "Institutional configurable multi-strategy blend supporting dynamic rolling IC-IR Bayesian adaptive weighting, Gu-Kelly-Xiu multi-regime style routing, and Lowdin symmetric orthogonalization across arbitrary quantitative strategies and alphas.",
+    "parameters": {
+      "blend_weighting_mode": "rolling_ic_ir",
+      "blend_adaptive_lookback_days": 60,
+      "blend_adaptive_min_tstat": 2.0,
+      "blend_adaptive_shrinkage": 0.20,
+      "blend_enable_orthogonalization": true,
+      "blend_sub_strategies": {
+        "wq_alpha6": 0.25,
+        "wq_alpha41": 0.25,
+        "gtja_alpha16": 0.50
+      },
+      "blend_max_single_position": 0.20,
+      "blend_min_weight_change": 0.05,
+      "blend_entry_threshold": 0.03,
+      "blend_dd_reduce_thresh": 0.10,
+      "blend_dd_defensive_thresh": 0.15,
+      "blend_dd_stop_thresh": 0.20,
+      "blend_tier1_cooldown_bars": 15,
+      "blend_dynamic_cash_deployment": true,
+      "blend_breadth_lookback": 50,
+      "blend_breadth_bull_thresh": 0.30,
+      "blend_thrust_lookback": 10,
+      "blend_thrust_thresh": 0.60,
+      "blend_target_bull_exposure": 0.80,
+      "blend_enable_vol_targeting": true,
+      "blend_target_vol": 0.12,
+      "blend_smooth_drawdown": true,
+      "blend_vol_model": "garman_klass",
+      "blend_adaptive_inertia": true,
+      "blend_stop_mode": "atr_trailing",
+      "blend_stop_atr_mult": 4.5,
+      "blend_asset_stop_cooldown_bars": 5,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["regime_trend_strength", "absolute_momentum_trend", "relative_momentum", "volatility_targeting", "mean_reversion"]
+  },
+  "gtja_alpha16_exhaustion": {
+    "name": "GTJA Alpha#16 Upper Shadow Exhaustion Reversal",
+    "type": "class",
+    "class_name": "GTJAAlphaStrategy",
+    "description": "Short-cycle microstructure systematic allocation exploiting upper shadow selling pressure exhaustion and gap imbalances from Guotai Junan 191 Factor Library.",
+    "parameters": {
+      "gtja_alpha_id": 16,
+      "gtja_rebalance_freq_days": 5,
+      "gtja_top_k": 3,
+      "gtja_weighting_mode": "equal",
+      "gtja_require_trend_filter": true,
+      "gtja_trend_ma_period": 200,
+      "gtja_smoothing_days": 1,
+      "gtja_min_weight_change": 0.03,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["mean_reversion", "relative_momentum", "volatility_targeting"]
   },
   "chan_vaa_compound": {
     "name": "Chan Pivot Shift MACD + VAA Optimal Compound Strategy",

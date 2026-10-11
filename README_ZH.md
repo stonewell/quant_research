@@ -8,7 +8,7 @@
 
 - **`pipeline/`** -- 核心研究/回测流水线项目组（共享一个 `uv` 环境）：
   - `research_strategy/`：量化交易策略研究（包含 53 种战术资产配置 TAA、定时择时、突破、缠论结构与相似模型、宏观因子复合、多策略 Alpha 账簿、WorldQuant 101 公式化阿尔法模型及模块化混合策略）及因子汇总导出器。
-  - `research/blend/`：模块化机构级多策略混合资产配置系统（`BaseBlendAllocationStrategy`、`ChanRiskManagedBlendStrategy`、`ChanFourStateBlendStrategy`、`ChanCrisisShieldBlendStrategy`、`ChanDualHybridBlendStrategy`、`GenericBlendStrategy`）。
+  - `research/blend/`：模块化机构级多策略混合资产配置系统（`BaseBlendAllocationStrategy`、`ChanRiskManagedBlendStrategy`、`ChanFourStateBlendStrategy`、`ChanCrisisShieldBlendStrategy`、`ChanDualHybridBlendStrategy`、`GenericBlendStrategy`），标准化集成动态滚动 IC-IR 贝叶斯自适应加权与 Löwdin 对称正交化降噪。
   - `instrument_selection/`：策略无关的标的筛选、可预测性测试（Hurst 指数、蜡烛图形态、动量）、相关性聚类和组合篮子选择工具。
   - `pattern_mining/`：拐点指标模式挖掘（基于 Bonferroni 矫正的打乱置换零假设显著性检验），生成供 `strategy_generator` 消费的持久化 `pattern_report.json`。
   - `strategy_generator/`：组合策略生成器，搜索配置模板与挖掘出的拐点模式，通过等效随机搜索（ERS）验证并结合因子研究进行平局决胜。

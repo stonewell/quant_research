@@ -61,7 +61,7 @@ uv run python run_pipeline.py --data-provider synthetic --universe SPY QQQ ...
 
 - **切面组合 (Aspect Composition)** (`common/strategy_aspects.py` 针对篮子模板，`pipeline/research_strategy/rs/timing_aspects.py` 针对单资产择时模板)：`strategy_generator` 不再仅挑选单个整体模板。它将多个模板拆解为可复用的组件--*选择 (Selection)* + *加权 (Weighting)* 针对 9 个静态模板；*入场信号 (Entry)* + *出场/风控/仓位 (Exit)* 针对 4 个择时模板--并搜索跨不同来源模板的混合配对（如动量的选股 + 逆波动率的仓位）。胜出的混合策略会在 `strategy.json` 中嵌入 `composite_spec` 块，以便 `backtester` 重建确切实例。
 
-- **模块化混合配置策略 (Modular Blend Allocation Strategies)** (`pipeline/research/blend/`)：构建在 `BaseBlendAllocationStrategy` (`pipeline/research/blend/blend_base.py`) 之上的机构级多策略混合系统，包含 `ChanRiskManagedBlendStrategy`、`ChanFourStateBlendStrategy`、`ChanCrisisShieldBlendStrategy`、`ChanDualHybridBlendStrategy` 与 `GenericBlendStrategy`。统一规范了动态政体加权、Garman-Klass 极值波动率目标化、附带自愈冷却的多阶回撤熔断、自适应惯性再平衡 (`apply_asset_inertia`)、行业节流阀及市场宽度冲力现金动用机制。
+- **模块化混合配置策略 (Modular Blend Allocation Strategies)** (`pipeline/research/blend/`)：构建在 `BaseBlendAllocationStrategy` (`pipeline/research/blend/blend_base.py`) 之上的机构级多策略混合系统，包含 `ChanRiskManagedBlendStrategy`、`ChanFourStateBlendStrategy`、`ChanCrisisShieldBlendStrategy`、`ChanDualHybridBlendStrategy` 与 `GenericBlendStrategy`。统一规范了动态政体加权、Garman-Klass 极值波动率目标化、附带自愈冷却的多阶回撤熔断、自适应惯性再平衡 (`apply_asset_inertia`)、行业节流阀及市场宽度冲力现金动用机制。全库统一将默认配置标准化为 `blend_weighting_mode="rolling_ic_ir"`（基于 Harvey-Liu-Zhu $t \ge 2.0$ 显著性门槛与 60 日滚动 IC-IR 贝叶斯收缩自适应）以及 `blend_enable_orthogonalization=true`（Löwdin 对称正交化算子 $W^* = W(W^T W)^{-1/2}$ 消除多策略共线性），由 `blend_6` 至 `blend_13` 的实证回测验证，实现了最高 37.35% CAGR、1.702 夏普与 0.9400 DSR 统计显著 Alpha。
 
 - **实盘部署平台与工作站 (Live Trading Deployment & Web Station)** (`web/livetrading/`, `scripts/`)：
   实盘运营遵循两阶段标准化执行协议：

@@ -126,6 +126,17 @@ def test_arg_parser_min_shares_default_and_override():
     assert args.min_shares == 100
 
 
+def test_arg_parser_strategy_params_default_and_override():
+    args = build_arg_parser().parse_args(["--strategy-file", "strategy.json"])
+    assert args.strategy_params is None
+
+    args = build_arg_parser().parse_args([
+        "--strategy-file", "strategy.json",
+        "--strategy-params", '{"blend_weighting_mode": "regime_adaptive"}'
+    ])
+    assert args.strategy_params == '{"blend_weighting_mode": "regime_adaptive"}'
+
+
 class MockArgs:
     def __init__(self, **kwargs):
         self.initial_capital = 100_000.0

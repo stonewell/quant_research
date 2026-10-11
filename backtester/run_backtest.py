@@ -80,6 +80,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Static allocation template used to turn --baseline-symbol into a baseline equity curve (default: equal_weight)")
     p.add_argument("--baseline-params", type=str, default=None,
                    help="JSON object string of params for --baseline-template (default: the template's first param_grid combination)")
+    p.add_argument("--strategy-params", type=str, default=None,
+                   help="JSON object string of params to merge/override in the loaded strategy.json")
     p.add_argument("--optimize", action="store_true",
         help="Grid-search the loaded strategy's template.param_grid on THIS universe (scored via "
              "the same --mode you selected) and Equivalent-Random-Search-validate the winner before "
@@ -624,6 +626,18 @@ def main():
     composite_spec = strategy_def.get("composite_spec")
     fundamental_spec = strategy_def.get("fundamental_spec")
     bnn_spec = strategy_def.get("bnn_spec")
+
+    if args.strategy_params:
+        try:
+            strat_overrides = json.loads(args.strategy_params)
+            if not isinstance(strat_overrides, dict):
+                raise ValueError(f"--strategy-params must be a JSON object, got {type(strat_overrides).__name__}.")
+            params.update(strat_overrides)
+            if isinstance(research_strategy_spec, dict) and "entry_data" in research_strategy_spec:
+                entry_params = research_strategy_spec["entry_data"].setdefault("parameters", {})
+                entry_params.update(strat_overrides)
+        except Exception as exc:
+            raise ValueError(f"Failed to parse --strategy-params JSON string: {exc}") from exc
 
     strategy_name = (
         strategy_def.get("strategy_name")

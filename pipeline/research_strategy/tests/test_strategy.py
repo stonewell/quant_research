@@ -1180,6 +1180,47 @@ def test_strategy_config_from_dict():
     assert not hasattr(cfg, "non_existent_param")
 
 
+def test_strategy_config_blend_aliases():
+    import warnings
+
+    # 1. Unprefixed aliases in from_dict should NOT emit warnings and must sync to blend_*
+    params = {
+        "weighting_mode": "regime_adaptive",
+        "enable_orthogonalization": True,
+    }
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        cfg = StrategyConfig.from_dict(params)
+    assert len(recorded) == 0, f"Expected no warnings, got: {[str(w.message) for w in recorded]}"
+    assert cfg.blend_weighting_mode == "regime_adaptive"
+    assert cfg.weighting_mode == "regime_adaptive"
+    assert cfg.blend_enable_orthogonalization is True
+    assert cfg.enable_orthogonalization is True
+
+    # 2. Both prefixed and unprefixed keys together should NOT emit warnings
+    params_both = {
+        "blend_weighting_mode": "regime_ic_ir_hybrid",
+        "weighting_mode": "regime_ic_ir_hybrid",
+        "blend_enable_orthogonalization": True,
+        "enable_orthogonalization": True,
+    }
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        cfg2 = StrategyConfig.from_dict(params_both)
+    assert len(recorded) == 0, f"Expected no warnings, got: {[str(w.message) for w in recorded]}"
+    assert cfg2.blend_weighting_mode == "regime_ic_ir_hybrid"
+    assert cfg2.weighting_mode == "regime_ic_ir_hybrid"
+    assert cfg2.blend_enable_orthogonalization is True
+    assert cfg2.enable_orthogonalization is True
+
+    # 3. Direct constructor call with unprefixed aliases
+    cfg3 = StrategyConfig(weighting_mode="rolling_ic_ir", enable_orthogonalization=True)
+    assert cfg3.blend_weighting_mode == "rolling_ic_ir"
+    assert cfg3.weighting_mode == "rolling_ic_ir"
+    assert cfg3.blend_enable_orthogonalization is True
+    assert cfg3.enable_orthogonalization is True
+
+
 @pytest.mark.parametrize("field_name,bad_value", [
     ("rebalance_freq_days", 0),
     ("rebalance_freq_days", -5),

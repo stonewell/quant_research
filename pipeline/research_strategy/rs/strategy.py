@@ -109,6 +109,7 @@ from .worldquant_alpha_strategy import (
     WorldQuantAlphaStrategy,
     WorldQuantMegaAlphaStrategy,
 )
+from .gtja191_factors import GTJAAlphaStrategy
 from .config import StrategyConfig
 from .nl_parser import ParsedStrategySpec, parse_plain_english_strategy
 
@@ -2116,6 +2117,8 @@ STRATEGY_CLASS_MAP = {
     "DefensiveAssetAllocationStrategy": DefensiveAssetAllocationStrategy,
     "EnsembleRegimeSwitchingStrategy": EnsembleRegimeSwitchingStrategy,
     "GoldenButterflyStrategy": GoldenButterflyStrategy,
+    "GenericBlendStrategy": GenericBlendStrategy,
+    "GTJAAlphaStrategy": GTJAAlphaStrategy,
     "HFEAStrategy": HFEAStrategy,
     "HybridAssetAllocationStrategy": HybridAssetAllocationStrategy,
     "MultiStrategyAlphaBookStrategy": MultiStrategyAlphaBookStrategy,

@@ -9,7 +9,7 @@ shared infrastructure at the repo root:
 
 - **`pipeline/`** -- the core research/backtest pipeline family (one shared `uv` environment):
   - `research_strategy/`: Researched quantitative trading strategies (53 TAA, timing, breakout, Chan structural & similar models, macro factor, multi-strategy alpha book, WorldQuant 101 Formulaic Alpha models, and modular blend strategies) and factor summary exporter.
-  - `research/blend/`: Modular institutional blend allocation strategies (`BaseBlendAllocationStrategy`, `ChanRiskManagedBlendStrategy`, `ChanFourStateBlendStrategy`, `ChanCrisisShieldBlendStrategy`, `ChanDualHybridBlendStrategy`, `GenericBlendStrategy`).
+  - `research/blend/`: Modular institutional blend allocation strategies (`BaseBlendAllocationStrategy`, `ChanRiskManagedBlendStrategy`, `ChanFourStateBlendStrategy`, `ChanCrisisShieldBlendStrategy`, `ChanDualHybridBlendStrategy`, `GenericBlendStrategy`) with standardized dynamic rolling IC-IR Bayesian adaptive weighting and Löwdin symmetric orthogonalization.
   - `instrument_selection/`: Strategy-agnostic screening, predictability testing (Hurst, candlestick, momentum), correlation clustering, and basket selection tool.
   - `pattern_mining/`: Turning-point indicator pattern mining (Bonferroni-corrected shuffle-null significance test), writing a durable `pattern_report.json` for `strategy_generator` to consume.
   - `strategy_generator/`: Portfolio strategy generator searching allocation templates and mined turning-point patterns, validated via Equivalent Random Search (ERS) and factor research tie-breaking.

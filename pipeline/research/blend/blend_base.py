@@ -235,6 +235,196 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         """
         return base_weights
 
+    def _classify_sub_strategy_styles(
+        self, sub_strats: Dict[str, AllocationTemplate], params: Optional[dict] = None
+    ) -> Dict[str, str]:
+        """Classifies sub-strategies into institutional style buckets:
+        - 'momentum': Trend following, multi-scale momentum, breakout (e.g. chan_three_type, wq_alpha41)
+        - 'reversal': Mean reversion, microstructure, shadow exhaustion (e.g. wq_alpha12, wq_alpha53, gtja_alpha16)
+        - 'defensive': Crash protection, carry, cash preservation (e.g. chan_vaa_compound, permanent, BIL)
+        """
+        classification = {}
+        for sname, strat in sub_strats.items():
+            name_lower = sname.lower()
+            tags = getattr(strat, "factor_tags", []) or []
+            tags_lower = [str(t).lower() for t in tags]
+
+            # Priority 1: Defensive / Carry
+            if (
+                any(k in name_lower for k in ("vaa", "defensive", "permanent", "bil", "hfea", "cash"))
+                or any(k in tags_lower for k in ("defensive", "carry", "cash"))
+            ):
+                classification[sname] = "defensive"
+            # Priority 2: Reversal / Microstructure
+            elif (
+                any(k in name_lower for k in ("reversal", "mean_reversion", "rsi", "gtja", "alpha12", "alpha53", "alpha101", "shadow", "microstructure"))
+                or any(k in tags_lower for k in ("mean_reversion", "reversal", "microstructure", "order_flow"))
+            ):
+                classification[sname] = "reversal"
+            # Priority 3: Momentum / Trend
+            elif (
+                any(k in name_lower for k in ("momentum", "trend", "breakout", "three_type", "turtle", "alpha41", "alpha6", "alpha38"))
+                or any(k in tags_lower for k in ("relative_momentum", "absolute_momentum_trend", "regime_trend_strength", "breakout"))
+            ):
+                classification[sname] = "momentum"
+            else:
+                if "vaa" in name_lower:
+                    classification[sname] = "defensive"
+                else:
+                    classification[sname] = "momentum"
+        return classification
+
+    def _compute_rolling_sub_strategy_performance(
+        self, sub_returns_slice: pd.DataFrame, min_tstat: float = 2.0
+    ) -> Tuple[Dict[str, float], Dict[str, float]]:
+        """Computes rolling annualized Information Ratio and Harvey-Liu-Zhu t-statistic.
+        Applies Harvey, Liu & Zhu (2016) significance hurdle: zero out IR if t-stat < min_tstat or mean <= 0.
+        """
+        ir_map = {}
+        tstat_map = {}
+        if sub_returns_slice.empty or len(sub_returns_slice) < 5:
+            return ir_map, tstat_map
+
+        n_bars = len(sub_returns_slice)
+        sqrt_n = np.sqrt(n_bars)
+        for col in sub_returns_slice.columns:
+            series = sub_returns_slice[col]
+            mu = float(series.mean())
+            sigma = float(series.std(ddof=1))
+            if sigma > 1e-8 and mu > 0.0:
+                t_stat = (mu / sigma) * sqrt_n
+                ir_ann = (mu / sigma) * np.sqrt(252.0)
+            else:
+                t_stat = 0.0
+                ir_ann = 0.0
+
+            tstat_map[col] = t_stat
+            if t_stat >= min_tstat:
+                ir_map[col] = ir_ann
+            else:
+                ir_map[col] = 0.0
+
+        return ir_map, tstat_map
+
+    def _apply_lowdin_orthogonalization(self, sub_weights_matrix: pd.DataFrame) -> pd.DataFrame:
+        """Applies Löwdin symmetric orthogonalization: W* = W (W^T W)^{-1/2}.
+        Removes collinearity while minimizing Frobenius distance to original weights.
+        """
+        W = sub_weights_matrix.values.astype(float)
+        n_assets, n_strats = W.shape
+        if n_strats <= 1 or np.all(np.abs(W) < 1e-6):
+            return sub_weights_matrix.copy()
+
+        col_sums = W.sum(axis=0)
+        active_cols = col_sums > 1e-6
+        if np.sum(active_cols) <= 1:
+            return sub_weights_matrix.copy()
+
+        S = W.T @ W
+        try:
+            eigvals, eigvecs = np.linalg.eigh(S)
+            eigvals_clipped = np.maximum(eigvals, 1e-6)
+            S_inv_sqrt = eigvecs @ np.diag(1.0 / np.sqrt(eigvals_clipped)) @ eigvecs.T
+            W_star = W @ S_inv_sqrt
+            W_star = np.maximum(0.0, W_star)
+            for j in range(n_strats):
+                csum = W_star[:, j].sum()
+                if csum > 1e-6 and col_sums[j] > 1e-6:
+                    W_star[:, j] = W_star[:, j] * (col_sums[j] / csum)
+            return pd.DataFrame(W_star, index=sub_weights_matrix.index, columns=sub_weights_matrix.columns)
+        except Exception:
+            return sub_weights_matrix.copy()
+
+    def _compute_adaptive_weights(
+        self,
+        sub_strats: Dict[str, AllocationTemplate],
+        base_weights: Dict[str, float],
+        sub_returns_slice: pd.DataFrame,
+        weighting_mode: str,
+        breadth_val: float,
+        thrust: float,
+        vol_z: float,
+        persistence: float,
+        adaptive_min_tstat: float,
+        adaptive_shrinkage: float,
+        date: Any,
+        params: Optional[dict] = None,
+    ) -> Dict[str, float]:
+        """Dynamically computes sub-strategy blend weights under selected weighting mode:
+        - 'rolling_ic_ir': Bayesian shrinkage on rolling annualized IR with HLZ t-stat filter.
+        - 'regime_adaptive': Gu-Kelly-Xiu macro style routing across Momentum / Reversal / Defensive.
+        - 'regime_ic_ir_hybrid': Two-layer hybrid combining macro style budget routing and intra-bucket rolling IC-IR.
+        """
+        p = params or {}
+        thrust_thresh = self.resolve_param(p, "thrust_thresh", 0.60, float)
+        breadth_bull_thresh = self.resolve_param(p, "breadth_bull_thresh", 0.30, float)
+
+        if weighting_mode == "rolling_ic_ir":
+            if sub_returns_slice.empty or len(sub_returns_slice) < 5:
+                return base_weights
+            ir_map, _ = self._compute_rolling_sub_strategy_performance(sub_returns_slice, adaptive_min_tstat)
+            tot_ir = sum(max(0.0, ir_map.get(k, 0.0)) for k in base_weights)
+            if tot_ir > 1e-6:
+                weights = {}
+                for k, bw in base_weights.items():
+                    raw_w = max(0.0, ir_map.get(k, 0.0)) / tot_ir
+                    weights[k] = (1.0 - adaptive_shrinkage) * raw_w + adaptive_shrinkage * bw
+                tot_w = sum(weights.values())
+                return {k: v / tot_w for k, v in weights.items()} if tot_w > 0 else base_weights
+            return base_weights
+
+        elif weighting_mode in ("regime_adaptive", "regime_ic_ir_hybrid"):
+            style_map = self._classify_sub_strategy_styles(sub_strats, p)
+            # Gu, Kelly & Xiu (2020) macro regime budget assignment
+            if (breadth_val >= 0.60) or (thrust >= thrust_thresh) or (persistence >= 0.65 and vol_z < 1.0):
+                budgets = {"momentum": 0.75, "reversal": 0.20, "defensive": 0.05}
+            elif (breadth_val >= breadth_bull_thresh and vol_z <= 2.0):
+                budgets = {"momentum": 0.20, "reversal": 0.65, "defensive": 0.15}
+            else:
+                budgets = {"momentum": 0.05, "reversal": 0.10, "defensive": 0.85}
+
+            bucket_members = {"momentum": [], "reversal": [], "defensive": []}
+            for k in base_weights:
+                b_name = style_map.get(k, "momentum")
+                bucket_members[b_name].append(k)
+
+            active_budgets = {b: budgets[b] for b in budgets if bucket_members[b]}
+            tot_b = sum(active_budgets.values())
+            if tot_b > 0:
+                norm_budgets = {b: v / tot_b for b, v in active_budgets.items()}
+            else:
+                return base_weights
+
+            weights = {}
+            if weighting_mode == "regime_adaptive" or sub_returns_slice.empty or len(sub_returns_slice) < 5:
+                for b, b_alloc in norm_budgets.items():
+                    members = bucket_members[b]
+                    sum_base = sum(base_weights[m] for m in members)
+                    for m in members:
+                        rel_bw = (base_weights[m] / sum_base) if sum_base > 0 else (1.0 / len(members))
+                        weights[m] = b_alloc * rel_bw
+            else:
+                # Two-layer hybrid: macro budget + intra-bucket rolling IC-IR
+                ir_map, _ = self._compute_rolling_sub_strategy_performance(sub_returns_slice, adaptive_min_tstat)
+                for b, b_alloc in norm_budgets.items():
+                    members = bucket_members[b]
+                    sum_base = sum(base_weights[m] for m in members)
+                    tot_ir_b = sum(max(0.0, ir_map.get(m, 0.0)) for m in members)
+                    for m in members:
+                        rel_bw = (base_weights[m] / sum_base) if sum_base > 0 else (1.0 / len(members))
+                        if tot_ir_b > 1e-6:
+                            raw_ir_w = max(0.0, ir_map.get(m, 0.0)) / tot_ir_b
+                            intra_w = (1.0 - adaptive_shrinkage) * raw_ir_w + adaptive_shrinkage * rel_bw
+                        else:
+                            intra_w = rel_bw
+                        weights[m] = b_alloc * intra_w
+
+            tot_w = sum(weights.values())
+            return {k: v / tot_w for k, v in weights.items()} if tot_w > 0 else base_weights
+
+        # Fallback to static compute_regime_weights hook
+        return self.compute_regime_weights(base_weights, breadth_val, thrust, date, p)
+
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
         cfg = self.config
         p = params or {}
@@ -279,6 +469,13 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         require_rs_rank = self.resolve_param(p, "require_rs_rank", (self.param_prefix == "cdhb"), bool)
         confluence_sizing = self.resolve_param(p, "confluence_sizing", (self.param_prefix == "cdhb"), bool)
         elastic_dd_reset = self.resolve_param(p, "elastic_drawdown_reset", (self.param_prefix == "cdhb"), bool)
+
+        # Blend Base adaptive and weighting mode configuration
+        weighting_mode = self.resolve_param(p, "weighting_mode", "rolling_ic_ir", str)
+        adaptive_lookback_days = self.resolve_param(p, "adaptive_lookback_days", 60, int)
+        adaptive_min_tstat = self.resolve_param(p, "adaptive_min_tstat", 2.0, float)
+        adaptive_shrinkage = self.resolve_param(p, "adaptive_shrinkage", 0.20, float)
+        enable_orthogonalization = self.resolve_param(p, "enable_orthogonalization", True, bool)
 
         symbols = list(universe.keys())
         if not symbols:
@@ -343,9 +540,13 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         daily_breadth = breadth_matrix.mean(axis=1).fillna(0.50)
         daily_thrust = thrust_matrix.mean(axis=1).fillna(0.50)
 
-        # Precompute diversified basket return volatility
+        # Precompute diversified basket return volatility and macro state indicators
         basket_ret = asset_returns.mean(axis=1).fillna(0.0)
         basket_vol_21d = (basket_ret.rolling(21, min_periods=10).std() * np.sqrt(252)).fillna(target_vol)
+        vol_mean_252 = basket_vol_21d.rolling(252, min_periods=20).mean().fillna(target_vol)
+        vol_std_252 = basket_vol_21d.rolling(252, min_periods=20).std().replace(0, np.nan).fillna(0.04)
+        vol_zscore_series = ((basket_vol_21d - vol_mean_252) / vol_std_252).fillna(0.0)
+        persistence_series = (basket_ret > 0).astype(float).rolling(20, min_periods=5).mean().fillna(0.50)
 
         # Step 2: Execute sub-strategies and get daily forward-filled weights
         sub_strats = self.get_sub_strategies(universe, p)
@@ -362,6 +563,13 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         raw_sub_weights = self.get_sub_strategy_weights(p)
         tot_sw = sum(raw_sub_weights.values())
         base_weights = {k: v / tot_sw for k, v in raw_sub_weights.items()} if tot_sw > 0 else raw_sub_weights
+
+        # Precompute sub-strategy daily portfolio returns history for causal rolling performance tracking
+        sub_returns_history = pd.DataFrame(0.0, index=master_index, columns=list(sub_strats.keys()))
+        for sname in sub_strats.keys():
+            if sname in sub_daily:
+                shifted_w = sub_daily[sname].shift(1)[risky_symbols].fillna(0.0)
+                sub_returns_history[sname] = (shifted_w * asset_returns[risky_symbols]).sum(axis=1).fillna(0.0)
 
         # Find defensive sub-strategy key if available (typically ChanVaaCompoundStrategy)
         defensive_key = None
@@ -477,12 +685,44 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                 stop_counter = 0
                 tier1_counter = 0
 
-            # Compute raw sub-strategy blended weights
-            cur_weights = self.compute_regime_weights(base_weights, breadth_val, thrust, date, p)
-            raw_blend = pd.Series(0.0, index=symbols)
-            for sname, sw in cur_weights.items():
-                if sname in sub_daily:
-                    raw_blend += sw * sub_daily[sname].loc[date]
+            # Compute raw sub-strategy blended weights based on weighting_mode
+            if weighting_mode == "static":
+                cur_weights = self.compute_regime_weights(base_weights, breadth_val, thrust, date, p)
+            else:
+                sub_ret_slice = sub_returns_history.iloc[max(0, t - adaptive_lookback_days) : t] if t >= 10 else pd.DataFrame()
+                cur_weights = self._compute_adaptive_weights(
+                    sub_strats=sub_strats,
+                    base_weights=base_weights,
+                    sub_returns_slice=sub_ret_slice,
+                    weighting_mode=weighting_mode,
+                    breadth_val=breadth_val,
+                    thrust=thrust,
+                    vol_z=float(vol_zscore_series.iloc[t]),
+                    persistence=float(persistence_series.iloc[t]),
+                    adaptive_min_tstat=adaptive_min_tstat,
+                    adaptive_shrinkage=adaptive_shrinkage,
+                    date=date,
+                    params=p,
+                )
+
+            # Optional Löwdin symmetric orthogonalization
+            if enable_orthogonalization and len(sub_strats) > 1:
+                mat = pd.DataFrame(
+                    {sname: sub_daily[sname].loc[date, risky_symbols] for sname in sub_strats if sname in sub_daily},
+                    index=risky_symbols,
+                )
+                mat_ortho = self._apply_lowdin_orthogonalization(mat)
+                raw_blend = pd.Series(0.0, index=symbols)
+                for sname, sw in cur_weights.items():
+                    if sname in mat_ortho.columns:
+                        raw_blend[risky_symbols] += sw * mat_ortho[sname]
+                        if cash_proxy in symbols and cash_proxy in sub_daily[sname].columns:
+                            raw_blend[cash_proxy] += sw * float(sub_daily[sname].loc[date, cash_proxy])
+            else:
+                raw_blend = pd.Series(0.0, index=symbols)
+                for sname, sw in cur_weights.items():
+                    if sname in sub_daily:
+                        raw_blend += sw * sub_daily[sname].loc[date]
 
             # Circuit breaker logic
             if dd_mag >= dd_stop_thresh:

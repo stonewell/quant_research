@@ -267,3 +267,147 @@ def test_instantiate_blend_strategies_from_config_entry():
         assert isinstance(inst, BaseBlendAllocationStrategy)
         assert inst.name == strat_name
         assert inst.warmup_bars() >= 200
+
+
+def test_base_blend_rolling_ic_ir_weighting():
+    """Tests rolling IC-IR adaptive weighting and HLZ t-stat significance hurdle."""
+    mock_universe = create_mock_universe(150)
+    cfg = StrategyConfig()
+    cfg.blend_sub_strategies = {
+        "chan_three_type": 0.50,
+        "chan_vaa_compound": 0.50,
+    }
+    cfg.blend_weighting_mode = "rolling_ic_ir"
+    cfg.blend_adaptive_lookback_days = 30
+    cfg.blend_adaptive_min_tstat = 1.5
+
+    strat = GenericBlendStrategy(cfg)
+    weights = strat.generate_weights(mock_universe)
+    assert not weights.empty
+    assert set(mock_universe.keys()).issubset(set(weights.columns))
+
+    # Sparse weights contract verification
+    nan_rows = weights.isna().all(axis=1)
+    assert nan_rows.sum() > 0
+
+    rebal_rows = weights[~nan_rows]
+    for dt, row in rebal_rows.iterrows():
+        assert not row.isna().any(), f"Rebalance row at {dt} contains NaN!"
+        assert np.isclose(row.sum(), 1.0, atol=1e-3)
+
+
+def test_base_blend_regime_adaptive_mode():
+    """Tests multi-regime adaptive style routing across momentum, reversal, and defensive pools."""
+    mock_universe = create_mock_universe(150)
+    cfg = StrategyConfig()
+    cfg.blend_sub_strategies = {
+        "chan_three_type": 0.40,
+        "gtja_alpha16": 0.30,
+        "chan_vaa_compound": 0.30,
+    }
+    cfg.blend_weighting_mode = "regime_adaptive"
+
+    strat = GenericBlendStrategy(cfg)
+    # Check style classification
+    sub_strats = strat.get_sub_strategies(mock_universe)
+    styles = strat._classify_sub_strategy_styles(sub_strats)
+    assert styles["chan_three_type"] == "momentum"
+    assert styles["gtja_alpha16"] == "reversal"
+    assert styles["chan_vaa_compound"] == "defensive"
+
+    weights = strat.generate_weights(mock_universe)
+    assert not weights.empty
+
+    nan_rows = weights.isna().all(axis=1)
+    assert nan_rows.sum() > 0
+
+
+def test_base_blend_regime_ic_ir_hybrid_mode():
+    """Tests two-tier hybrid mode: macro regime style budgets + intra-bucket rolling IC-IR."""
+    mock_universe = create_mock_universe(150)
+    cfg = StrategyConfig()
+    cfg.blend_sub_strategies = {
+        "chan_three_type": 0.35,
+        "wq_alpha41": 0.35,
+        "chan_vaa_compound": 0.30,
+    }
+    cfg.blend_weighting_mode = "regime_ic_ir_hybrid"
+    cfg.blend_adaptive_lookback_days = 40
+    cfg.blend_adaptive_min_tstat = 2.0
+    cfg.blend_adaptive_shrinkage = 0.20
+
+    strat = GenericBlendStrategy(cfg)
+    weights = strat.generate_weights(mock_universe)
+    assert not weights.empty
+
+    nan_rows = weights.isna().all(axis=1)
+    rebal_rows = weights[~nan_rows]
+    for dt, row in rebal_rows.iterrows():
+        assert not row.isna().any()
+        assert np.isclose(row.sum(), 1.0, atol=1e-3)
+
+
+def test_base_blend_lowdin_orthogonalization():
+    """Tests Löwdin symmetric orthogonalization operator on collinear strategy weight vectors."""
+    strat = BaseBlendAllocationStrategy()
+    symbols = ["S1", "S2", "S3"]
+    # Two identical strategies (perfect collinearity) + one distinct
+    mat = pd.DataFrame({
+        "strat_a": [0.5, 0.5, 0.0],
+        "strat_b": [0.5, 0.5, 0.0],
+        "strat_c": [0.0, 0.0, 1.0],
+    }, index=symbols)
+
+    mat_ortho = strat._apply_lowdin_orthogonalization(mat)
+    assert mat_ortho.shape == mat.shape
+    # Check non-negativity
+    assert (mat_ortho.values >= -1e-6).all()
+    # Check column preservation (sums match or scaled)
+    for col in mat.columns:
+        assert np.isclose(mat_ortho[col].sum(), mat[col].sum(), atol=1e-3)
+
+    # Full integration test with enable_orthogonalization=True
+    mock_universe = create_mock_universe(150)
+    cfg = StrategyConfig()
+    cfg.blend_sub_strategies = {
+        "chan_three_type": 0.50,
+        "chan_vaa_compound": 0.50,
+    }
+    cfg.blend_enable_orthogonalization = True
+
+    strat_ortho = GenericBlendStrategy(cfg)
+    weights = strat_ortho.generate_weights(mock_universe)
+    assert not weights.empty
+    rebal_rows = weights[~weights.isna().all(axis=1)]
+    for dt, row in rebal_rows.iterrows():
+        assert not row.isna().any()
+        assert np.isclose(row.sum(), 1.0, atol=1e-3)
+
+
+def test_generic_blend_with_worldquant_alphas_and_regime_hybrid():
+    """Validates GenericBlendStrategy combining multiple WQ/GTJA alphas under regime_ic_ir_hybrid."""
+    mock_universe = create_mock_universe(150)
+    cfg = StrategyConfig()
+    cfg.blend_sub_strategies = {
+        "wq_alpha6": 0.25,
+        "wq_alpha41": 0.25,
+        "gtja_alpha16": 0.50,
+    }
+    cfg.blend_weighting_mode = "regime_ic_ir_hybrid"
+    cfg.blend_adaptive_min_tstat = 2.0
+
+    strat = GenericBlendStrategy(cfg)
+    sub_strats = strat.get_sub_strategies(mock_universe)
+    assert len(sub_strats) == 3
+    assert "wq_alpha6" in sub_strats
+    assert "wq_alpha41" in sub_strats
+    assert "gtja_alpha16" in sub_strats
+
+    weights = strat.generate_weights(mock_universe)
+    assert not weights.empty
+    rebal_rows = weights[~weights.isna().all(axis=1)]
+    assert len(rebal_rows) > 0
+    for dt, row in rebal_rows.iterrows():
+        assert not row.isna().any()
+        assert np.isclose(row.sum(), 1.0, atol=1e-3)
+

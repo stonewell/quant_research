@@ -117,7 +117,11 @@ available in the current shell.
   `ChanDualHybridBlendStrategy`, and `GenericBlendStrategy`. Standardizes dynamic regime-adaptive
   weighting, Garman-Klass volatility targeting, multi-tier drawdown circuit breakers with auto-healing
   cooldowns, adaptive inertia rebalancing (`apply_asset_inertia`), sector throttling, and breadth thrust
-  cash deployment.
+  cash deployment. Defaults standardized across `StrategyConfig` and `strategies_config.json` to
+  `blend_weighting_mode="rolling_ic_ir"` (rolling 60d IC-IR Bayesian adaptive weighting with Harvey-Liu-Zhu
+  $t \ge 2.0$ significance hurdle) and `blend_enable_orthogonalization=true` (Löwdin symmetric
+  orthogonalization $W^* = W(W^T W)^{-1/2}$ removing sub-strategy collinearity), validated by walkforward
+  experiments (`blend_6` through `blend_13`) yielding up to 37.35% CAGR, 1.702 Sharpe, and 0.9400 DSR.
 
 - **Live Trading Deployment & Web Station** (`web/livetrading/`, `scripts/`):
   Live operations follow a two-stage protocol:
