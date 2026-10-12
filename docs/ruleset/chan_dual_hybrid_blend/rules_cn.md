@@ -262,3 +262,17 @@ $$\text{Drawdown} = \frac{\text{当前净值} - \text{历史最高净值}}{\text
    - 单笔金额 $\ge 50$ 万元人民币: 采用 15 分钟 TWAP 分批拆单算法，降低对盘口的直接冲击。
 4. **分红与除权除息处理**:
    - 收到现金分红当日直接计入账户 NAV，并自动参与 14:55 的 `GC001` 逆回购，在下一次调仓日重新计算分配。
+
+---
+
+## 7. 生产发单命令规范
+
+```bash
+# 每日生产发单标准指令 (推荐在 14:20 运行):
+uv run python scripts/run_live_strategy.py \
+  --strategy chan_dual_hybrid_blend \
+  --universe-file docs/universe/china/core_satellite_22_stocks.txt \
+  --output-dir docs/ruleset/chan_dual_hybrid_blend \
+  --portfolio-value 100000 \
+  --data-provider marketdb
+```

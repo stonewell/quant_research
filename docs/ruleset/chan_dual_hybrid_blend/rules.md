@@ -235,3 +235,16 @@ At 14:55 daily:
    - Orders $< 500,000$ RMB: Use limit orders pegged to opposite-side best bid/ask.
    - Orders $\ge 500,000$ RMB: Execute via 15-minute TWAP algorithm between 14:25 – 14:45.
 4. **Corporate Actions & Dividends**: Cash dividends automatically credited to NAV, swept overnight into `GC001`, and reinvested at subsequent rebalances.
+
+---
+
+## 7. Production CLI Execution
+
+```bash
+uv run python scripts/run_live_strategy.py \
+  --strategy chan_dual_hybrid_blend \
+  --universe-file docs/universe/china/core_satellite_22_stocks.txt \
+  --output-dir docs/ruleset/chan_dual_hybrid_blend \
+  --portfolio-value 100000 \
+  --data-provider marketdb
+```
