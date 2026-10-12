@@ -6,7 +6,7 @@
 > - **US Equities**: [`docs/universe/us/core_satellite_22_stocks.txt`](file:///home/stone/Work/github/quant/docs/universe/us/core_satellite_22_stocks.txt) (16 Value/Cash Cow Core + 6 AI Tech Leaders)  
 > - **Hong Kong Stocks**: [`docs/universe/hongkong/core_satellite_22_stocks.txt`](file:///home/stone/Work/github/quant/docs/universe/hongkong/core_satellite_22_stocks.txt) (16 High-Dividend SOEs + 6 Tech Platforms)  
 > **Cash Proxies**: `511880` / `511990` / `GC001` (A-Shares), [`BIL`](file:///home/stone/Work/github/quant/pipeline/research_strategy/strategies_config.json) / `SGOV` (US), USD/HKD Cash Equivalents (HK)  
-> **Daily Execution Tool**: [`scripts/run_live_four_state_blend.py`](file:///home/stone/Work/github/quant/scripts/run_live_four_state_blend.py)  
+> **Daily Execution Tool**: [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py) (alias: [`scripts/run_live_four_state_blend.py`](file:///home/stone/Work/github/quant/scripts/run_live_four_state_blend.py))  
 > **Deep Empirical Audit**: [`docs/reports/china/chan_four_state_blend/chan_four_state_blend_deep_analysis.md`](file:///home/stone/Work/github/quant/docs/reports/china/chan_four_state_blend/chan_four_state_blend_deep_analysis.md)  
 
 ---
@@ -252,7 +252,7 @@ uv run python scripts/run_live_four_state_blend.py \
 - **Stage 1 Health Report (Markdown)**: [`docs/ruleset/chan_four_state_blend/stage1_health_report.md`](file:///home/stone/Work/github/quant/docs/ruleset/chan_four_state_blend/stage1_health_report.md)
 - **Stage 1 Health Report (JSON)**: [`docs/ruleset/chan_four_state_blend/stage1_health_report.json`](file:///home/stone/Work/github/quant/docs/ruleset/chan_four_state_blend/stage1_health_report.json)
 - **Account State & Cooldown Tracker**: [`docs/ruleset/chan_four_state_blend/account_state.json`](file:///home/stone/Work/github/quant/docs/ruleset/chan_four_state_blend/account_state.json)
-- **Stage 2 Execution Script**: [`scripts/run_live_four_state_blend.py`](file:///home/stone/Work/github/quant/scripts/run_live_four_state_blend.py)
+- **Stage 2 Execution Script**: [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py) (alias: [`scripts/run_live_four_state_blend.py`](file:///home/stone/Work/github/quant/scripts/run_live_four_state_blend.py))
 - **Production Universes**:
   - China A-Shares: [`docs/universe/china/core_satellite_22_stocks.txt`](file:///home/stone/Work/github/quant/docs/universe/china/core_satellite_22_stocks.txt)
   - US Equities: [`docs/universe/us/core_satellite_22_stocks.txt`](file:///home/stone/Work/github/quant/docs/universe/us/core_satellite_22_stocks.txt)

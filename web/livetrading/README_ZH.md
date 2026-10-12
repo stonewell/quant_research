@@ -82,7 +82,7 @@ uv run --project web/livetrading python web/livetrading/app.py --port 8080
 | `--archive-dir` | `LIVETRADING_ARCHIVE_DIR` | `<data_dir>/runs` | 每日历史运行快照归档目录 |
 | `--cache-dir` | `LIVETRADING_CACHE_DIR` | `<repo_root>/data` | DuckDB 市场数据缓存目录 |
 | `--stage1-script` | `LIVETRADING_STAGE1_SCRIPT` | `scripts/check_live_portfolio_health.py` | 一阶健康度门禁执行脚本 |
-| `--stage2-script` | `LIVETRADING_STAGE2_SCRIPT` | `scripts/run_live_four_state_blend.py` | 二阶实盘交易单生成脚本 |
+| `--stage2-script` | `LIVETRADING_STAGE2_SCRIPT` | `scripts/run_live_strategy.py` | 二阶通用实盘交易单生成脚本 |
 | `--python-bin` | `LIVETRADING_PYTHON_BIN` | 当前 Python (`sys.executable`) | 脚本执行所用的 Python 解释器 |
 
 ---

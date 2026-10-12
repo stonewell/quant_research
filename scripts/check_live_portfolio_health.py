@@ -145,7 +145,7 @@ def parse_args(args: Optional[List[str]] = None):
     parser.add_argument(
         "--auto-run-stage2",
         action="store_true",
-        help="If set and gate directive is GO/CAUTION, automatically run run_live_four_state_blend.py",
+        help="If set and gate directive is GO/CAUTION, automatically run Stage 2 execution runner (scripts/run_live_strategy.py)",
     )
     add_data_provider_cli_args(parser, default_provider="synthetic")
     parsed = parser.parse_args(args)
@@ -828,8 +828,10 @@ def main():
             print("\n[STOP] Auto-run Stage 2 aborted due to 🔴 NO-GO / EMERGENCY HALT.")
             sys.exit(1)
         else:
-            print("\n[AUTO-EXECUTE] Launching Stage 2: run_live_four_state_blend.py ...")
-            stage2_script = os.path.join(_REPO_ROOT, "scripts", "run_live_four_state_blend.py")
+            stage2_script = os.path.join(_REPO_ROOT, "scripts", "run_live_strategy.py")
+            if not os.path.exists(stage2_script):
+                stage2_script = os.path.join(_REPO_ROOT, "scripts", "run_live_four_state_blend.py")
+            print(f"\n[AUTO-EXECUTE] Launching Stage 2: {os.path.basename(stage2_script)} ...")
             cmd = [
                 sys.executable,
                 stage2_script,

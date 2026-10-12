@@ -23,7 +23,7 @@ shared infrastructure at the repo root:
 - **Shared at the repo root** (reached via `sys.path` injection or standalone execution):
   - `common/`: Shared market data loaders, indicators, portfolio backtester, allocation templates, factor taxonomy, rebalance scheduling, shuffle-null significance testing, CLI/reporting scaffolding, and synthetic test generators.
   - `backtester/`: Standalone backtesting engine evaluating fixed strategy specifications (`strategy.json`) across standard or rolling walk-forward windows.
-  - `scripts/`: Production live trading health checks (`check_live_portfolio_health.py`), execution runners (`run_live_four_state_blend.py`), and documentation conversion tools.
+  - `scripts/`: Production live trading health checks (`check_live_portfolio_health.py`), universal execution runners (`run_live_strategy.py`, alias `run_live_four_state_blend.py`), and documentation conversion tools.
   - `docs/universe/`: Pre-screened core-satellite asset pools for China A-Shares, US equities, and Hong Kong stocks.
 
 Each project directory has its own README with a full CLI argument reference, sample commands, and
@@ -396,5 +396,5 @@ pipeline/.venv/Scripts/python.exe -m pytest backtester/tests -v
 | `pipeline/run_pipeline.py` | Chains research_strategy -> instrument_selection -> pattern_mining -> strategy_generator -> `backtester` end-to-end via subprocess, auto-wiring each step's output into the next | `pipeline/run_pipeline.py` | This README |
 | `ml/bnn_forecaster/` | Standalone (not pipeline-wired) AutoBNN probabilistic-forecast buy/sell screener; own isolated `uv` environment (see its README) | `ml/bnn_forecaster/run_bnn_forecaster.py` | `ml/bnn_forecaster/README.md` |
 | `web/livetrading/` | Responsive live trading deployment web station & workstation (Stage 1 Health Gate + Stage 2 Ticket Generation) | `web/livetrading/app.py` | `web/livetrading/README.md` |
-| `scripts/` | Standalone live trading health audit (`check_live_portfolio_health.py`) and deployment runners (`run_live_four_state_blend.py`) | `scripts/run_live_four_state_blend.py` | `docs/ruleset/` |
+| `scripts/` | Standalone live trading health audit (`check_live_portfolio_health.py`) and universal deployment runner (`run_live_strategy.py`) | `scripts/run_live_strategy.py` | `docs/ruleset/` |
 | `docs/universe/` | Pre-screened core-satellite asset pools for China A-Shares, US equities, and Hong Kong stocks | N/A (Data/Documentation) | `docs/universe/` |

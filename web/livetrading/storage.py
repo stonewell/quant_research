@@ -111,7 +111,7 @@ _SAFE_KEY_RE = re.compile(r"[^A-Za-z0-9_\-\u4e00-\u9fa5]+")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # Ticket/cash names that never denote a real share position. BIL is included deliberately: the
-# Stage 2 runner (`resolve_holdings_weights_and_shares` in scripts/run_live_four_state_blend.py)
+# Stage 2 runner (`resolve_holdings_weights_and_shares` in scripts/run_live_strategy.py)
 # treats BIL/CASH/<cash_proxy> as the IMPLIED cash residual (NAV - equity value), never as a
 # share count, so carrying a BIL "share" quantity forward would be meaningless.
 _CASH_SYMBOLS = {"BIL", "CASH"}
@@ -304,12 +304,17 @@ class StorageManager:
             or os.path.join(self.repo_root, "scripts", "check_live_portfolio_health.py")
         )
 
-        self.stage2_script = os.path.abspath(
+        stage2_candidate = (
             stage2_script
             or os.environ.get("LIVETRADING_STAGE2_SCRIPT")
             or saved_settings.get("stage2_script")
-            or os.path.join(self.repo_root, "scripts", "run_live_four_state_blend.py")
+            or os.path.join(self.repo_root, "scripts", "run_live_strategy.py")
         )
+        if stage2_candidate and stage2_candidate.endswith("run_live_four_state_blend.py"):
+            universal_candidate = os.path.join(self.repo_root, "scripts", "run_live_strategy.py")
+            if os.path.exists(universal_candidate):
+                stage2_candidate = universal_candidate
+        self.stage2_script = os.path.abspath(stage2_candidate)
 
         resolved_py = (
             python_executable

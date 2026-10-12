@@ -82,7 +82,7 @@ All paths can be configured via CLI flags or environment variables:
 | `--archive-dir` | `LIVETRADING_ARCHIVE_DIR` | `<data_dir>/runs` | Directory for daily historical run snapshots |
 | `--cache-dir` | `LIVETRADING_CACHE_DIR` | `<repo_root>/data` | DuckDB market data cache directory |
 | `--stage1-script` | `LIVETRADING_STAGE1_SCRIPT` | `scripts/check_live_portfolio_health.py` | Stage 1 health runner |
-| `--stage2-script` | `LIVETRADING_STAGE2_SCRIPT` | `scripts/run_live_four_state_blend.py` | Stage 2 live deployment runner |
+| `--stage2-script` | `LIVETRADING_STAGE2_SCRIPT` | `scripts/run_live_strategy.py` | Stage 2 universal live deployment runner |
 | `--python-bin` | `LIVETRADING_PYTHON_BIN` | Active Python (`sys.executable`) | Python interpreter for running scripts |
 
 ---

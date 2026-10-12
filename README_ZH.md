@@ -22,7 +22,7 @@
 - **根目录共享部分**（通过 `sys.path` 注入或独立执行）：
   - `common/`：共享的市场数据加载器、技术指标、组合回测器、配置模板、因子分类学、再平衡调度、打乱置换显著性检验、CLI/报告脚手架以及合成数据生成器。
   - `backtester/`：独立的策略回测引擎，评估固定策略规范（`strategy.json`）在标准区间或滚动 Walk-Forward 窗口下的表现。
-  - `scripts/`：实盘健康检查与风控审计脚本（`check_live_portfolio_health.py`）、实盘部署运行器（`run_live_four_state_blend.py`）及文档格式转换工具。
+  - `scripts/`：实盘健康检查与风控审计脚本（`check_live_portfolio_health.py`）、通用实盘部署运行器（`run_live_strategy.py`，兼容别名 `run_live_four_state_blend.py`）及文档格式转换工具。
   - `docs/universe/`：预先经过严格前行检验与审计的中美港三大核心卫星资产池。
 
 每个项目目录均包含独立的 README，附带完整的 CLI 参数说明、示例命令和数据 Schema 文档；`common/README_ZH.md` 是工作区内由 2 个或以上项目共享的每个 DataFrame/JSON 数据结构的唯一权威来源。本文件提供端到端的全景图；如需了解具体模块的详细信息，请参阅以下链接。
@@ -349,5 +349,5 @@ pipeline/.venv/Scripts/python.exe -m pytest backtester/tests -v
 | `pipeline/run_pipeline.py` | 通过子进程端到端串联 research_strategy -> instrument_selection -> pattern_mining -> strategy_generator -> `backtester`，自动将每步输出接入下一步 | `pipeline/run_pipeline.py` | 本 README |
 | `ml/bnn_forecaster/` | 独立（未接入流水线）的 AutoBNN 概率预测买入/卖出筛选器；拥有独立的隔离 `uv` 环境（参阅其 README） | `ml/bnn_forecaster/run_bnn_forecaster.py` | `ml/bnn_forecaster/README_ZH.md` |
 | `web/livetrading/` | 响应式实盘量化交易与风控部署平台（一阶健康度门禁 + 二阶实盘交易单生成） | `web/livetrading/app.py` | `web/livetrading/README.md` |
-| `scripts/` | 实盘组合健康检查 (`check_live_portfolio_health.py`) 与实盘执行运行器 (`run_live_four_state_blend.py`) | `scripts/run_live_four_state_blend.py` | `docs/ruleset/` |
+| `scripts/` | 实盘组合健康检查 (`check_live_portfolio_health.py`) 与通用实盘执行运行器 (`run_live_strategy.py`) | `scripts/run_live_strategy.py` | `docs/ruleset/` |
 | `docs/universe/` | 经前行验证的中美港三大核心卫星股票池资产定义与说明 | 不适用 (数据与文档) | `docs/universe/` |
