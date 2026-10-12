@@ -572,7 +572,7 @@ def test_load_symbol_names_with_custom_universe_header(tmp_path):
     """Test that load_symbol_names never misinterprets header comments as stock names."""
     import sys
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")))
-    from scripts.run_live_four_state_blend import load_symbol_names
+    from scripts.run_live_strategy import load_symbol_names
 
     # Universe file generated with header comment
     univ_file = tmp_path / "resolved_universe.txt"
@@ -612,7 +612,7 @@ def test_resolve_universe_materialization_and_clean_parsing(temp_workspace):
     assert "招商轮船" in content
 
     # Verify load_symbol_names on this generated file
-    from scripts.run_live_four_state_blend import load_symbol_names
+    from scripts.run_live_strategy import load_symbol_names
     names = load_symbol_names(resolved_path)
     assert names["601872.SH"] == "招商轮船"
     assert names["300394.SZ"] == "天孚通信"

@@ -23,7 +23,7 @@ shared infrastructure at the repo root:
 - **Shared at the repo root** (reached via `sys.path` injection or standalone execution):
   - `common/`: Shared market data loaders, indicators, portfolio backtester, allocation templates, factor taxonomy, rebalance scheduling, shuffle-null significance testing, CLI/reporting scaffolding, and synthetic test generators.
   - `backtester/`: Standalone backtesting engine evaluating fixed strategy specifications (`strategy.json`) across standard or rolling walk-forward windows.
-  - `scripts/`: Production live trading health checks (`check_live_portfolio_health.py`), universal execution runners (`run_live_strategy.py`, alias `run_live_four_state_blend.py`), and documentation conversion tools.
+  - `scripts/`: Production live trading health checks (`check_live_portfolio_health.py`), universal execution runners (`run_live_strategy.py`), and documentation conversion tools.
   - `docs/universe/`: Pre-screened core-satellite asset pools for China A-Shares, US equities, and Hong Kong stocks.
 
 Each project directory has its own README with a full CLI argument reference, sample commands, and

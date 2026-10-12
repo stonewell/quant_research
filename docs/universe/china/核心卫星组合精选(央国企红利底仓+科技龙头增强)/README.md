@@ -80,7 +80,7 @@ uv run --project pipeline python backtester/run_backtest.py \
 
 ### 3. 生成每日实盘交易信号与调仓计划
 ```bash
-uv run --project pipeline python scripts/run_live_four_state_blend.py \
+uv run --project pipeline python scripts/run_live_strategy.py \
   --universe-file docs/universe/china/core_satellite_22_stocks.txt \
   --data-provider fuyao \
   --cache-dir data \

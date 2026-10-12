@@ -193,7 +193,7 @@ AMZN AVGO BRK-B COST CVX GOOGL JPM KO META MSFT NVDA PG TSLA UNP WMT XOM
 ### 8.1 Execution Command
 ```bash
 # Live signal generation for US trading (executed daily after market close):
-uv run --project pipeline python scripts/run_live_four_state_blend.py \
+uv run --project pipeline python scripts/run_live_strategy.py \
   --universe AMZN AVGO BRK-B COST CVX GOOGL JPM KO META MSFT NVDA PG TSLA UNP WMT XOM \
   --data-provider yfinance \
   --portfolio-value 100000 \

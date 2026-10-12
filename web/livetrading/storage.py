@@ -310,10 +310,9 @@ class StorageManager:
             or saved_settings.get("stage2_script")
             or os.path.join(self.repo_root, "scripts", "run_live_strategy.py")
         )
-        if stage2_candidate and stage2_candidate.endswith("run_live_four_state_blend.py"):
-            universal_candidate = os.path.join(self.repo_root, "scripts", "run_live_strategy.py")
-            if os.path.exists(universal_candidate):
-                stage2_candidate = universal_candidate
+        universal_candidate = os.path.join(self.repo_root, "scripts", "run_live_strategy.py")
+        if not stage2_candidate or "run_live_four_state_blend.py" in stage2_candidate or not os.path.exists(stage2_candidate):
+            stage2_candidate = universal_candidate
         self.stage2_script = os.path.abspath(stage2_candidate)
 
         resolved_py = (

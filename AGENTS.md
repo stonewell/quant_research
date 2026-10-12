@@ -128,8 +128,7 @@ available in the current shell.
   - **Stage 1 (Macro Health Gate)** via `scripts/check_live_portfolio_health.py`: Evaluates
     peak-to-trough drawdown from High-Water Mark (HWM), multi-tier circuit breaker triggers, market
     breadth ($\ge 30\%$), and momentum thrust ($\ge 60\%$).
-  - **Stage 2 (Order Ticket Generation)** via `scripts/run_live_strategy.py` (backwards-compatible
-    alias `scripts/run_live_four_state_blend.py`): Enforces execution hierarchy: Phase 1: SELLS FIRST
+  - **Stage 2 (Order Ticket Generation)** via `scripts/run_live_strategy.py`: Enforces execution hierarchy: Phase 1: SELLS FIRST
     (releases purchasing power) $\rightarrow$ Phase 2: BUYS SECOND (lot-rounded entries) $\rightarrow$ Phase 3:
     POSITIONS HELD (inertia filtering) $\rightarrow$ Phase 4: CASH SWEEP (idle cash into `BIL`/`511880`/`GC001`).
     Supports all 55+ research strategies, 9 static templates, and custom strategy files via `--strategy`.

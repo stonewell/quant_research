@@ -829,8 +829,6 @@ def main():
             sys.exit(1)
         else:
             stage2_script = os.path.join(_REPO_ROOT, "scripts", "run_live_strategy.py")
-            if not os.path.exists(stage2_script):
-                stage2_script = os.path.join(_REPO_ROOT, "scripts", "run_live_four_state_blend.py")
             print(f"\n[AUTO-EXECUTE] Launching Stage 2: {os.path.basename(stage2_script)} ...")
             cmd = [
                 sys.executable,

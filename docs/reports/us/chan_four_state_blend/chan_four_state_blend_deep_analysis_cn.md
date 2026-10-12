@@ -193,7 +193,7 @@ AMZN AVGO BRK-B COST CVX GOOGL JPM KO META MSFT NVDA PG TSLA UNP WMT XOM
 ### 8.1 每日实盘调仓指令生成命令
 ```bash
 # 美股盘后生成次日执行清单 (包含 SELLS FIRST -> BUYS SECOND 挂单队列):
-uv run --project pipeline python scripts/run_live_four_state_blend.py \
+uv run --project pipeline python scripts/run_live_strategy.py \
   --universe AMZN AVGO BRK-B COST CVX GOOGL JPM KO META MSFT NVDA PG TSLA UNP WMT XOM \
   --data-provider yfinance \
   --portfolio-value 100000 \

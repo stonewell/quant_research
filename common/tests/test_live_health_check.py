@@ -266,9 +266,9 @@ def test_parse_args_health_check_explicit_account_state(tmp_path):
 
 
 def test_stage2_parse_args_dynamic_output_dir(tmp_path):
-    """Verify Stage 2 run_live_four_state_blend dynamically binds account_state_file to output-dir."""
-    _stage2_script = os.path.join(_PROJECT_ROOT, "scripts", "run_live_four_state_blend.py")
-    _spec2 = importlib.util.spec_from_file_location("run_live_four_state_blend", _stage2_script)
+    """Verify Stage 2 run_live_strategy dynamically binds account_state_file to output-dir."""
+    _stage2_script = os.path.join(_PROJECT_ROOT, "scripts", "run_live_strategy.py")
+    _spec2 = importlib.util.spec_from_file_location("run_live_strategy", _stage2_script)
     _mod2 = importlib.util.module_from_spec(_spec2)
     _spec2.loader.exec_module(_mod2)
 
@@ -281,8 +281,8 @@ def test_stage2_parse_args_dynamic_output_dir(tmp_path):
 
 def test_resolve_holdings_weights_and_shares_quantities():
     """Verify share counts are converted to exact weights and cash is derived from NAV."""
-    _stage2_script = os.path.join(_PROJECT_ROOT, "scripts", "run_live_four_state_blend.py")
-    _spec2 = importlib.util.spec_from_file_location("run_live_four_state_blend", _stage2_script)
+    _stage2_script = os.path.join(_PROJECT_ROOT, "scripts", "run_live_strategy.py")
+    _spec2 = importlib.util.spec_from_file_location("run_live_strategy", _stage2_script)
     _mod2 = importlib.util.module_from_spec(_spec2)
     _spec2.loader.exec_module(_mod2)
 
@@ -312,8 +312,8 @@ def test_resolve_holdings_weights_and_shares_quantities():
 
 def test_resolve_holdings_weights_and_shares_exceeds_nav():
     """Verify cash is clamped at 0 when equity market value exceeds NAV."""
-    _stage2_script = os.path.join(_PROJECT_ROOT, "scripts", "run_live_four_state_blend.py")
-    _spec2 = importlib.util.spec_from_file_location("run_live_four_state_blend", _stage2_script)
+    _stage2_script = os.path.join(_PROJECT_ROOT, "scripts", "run_live_strategy.py")
+    _spec2 = importlib.util.spec_from_file_location("run_live_strategy", _stage2_script)
     _mod2 = importlib.util.module_from_spec(_spec2)
     _spec2.loader.exec_module(_mod2)
 
@@ -335,8 +335,8 @@ def test_resolve_holdings_weights_and_shares_exceeds_nav():
 
 def test_resolve_holdings_weights_and_shares_legacy_weights():
     """Verify backward compatibility when fractional weights are passed."""
-    _stage2_script = os.path.join(_PROJECT_ROOT, "scripts", "run_live_four_state_blend.py")
-    _spec2 = importlib.util.spec_from_file_location("run_live_four_state_blend", _stage2_script)
+    _stage2_script = os.path.join(_PROJECT_ROOT, "scripts", "run_live_strategy.py")
+    _spec2 = importlib.util.spec_from_file_location("run_live_strategy", _stage2_script)
     _mod2 = importlib.util.module_from_spec(_spec2)
     _spec2.loader.exec_module(_mod2)
 

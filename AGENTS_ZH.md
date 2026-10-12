@@ -66,7 +66,7 @@ uv run python run_pipeline.py --data-provider synthetic --universe SPY QQQ ...
 - **实盘部署平台与工作站 (Live Trading Deployment & Web Station)** (`web/livetrading/`, `scripts/`)：
   实盘运营遵循两阶段标准化执行协议：
   - **Stage 1（宏观健康度门禁）** 通过 `scripts/check_live_portfolio_health.py`：评估自最高历史净值（HWM）以来的峰谷回撤、多阶熔断触发器、市场宽度（$\ge 30\%$）及动量冲力（$\ge 60\%$）。
-  - **Stage 2（实盘交易单生成）** 通过 `scripts/run_live_strategy.py`（向后兼容别名 `scripts/run_live_four_state_blend.py`）：强制执行四阶段层级：第一阶段【先卖出】释放购买力 $\rightarrow$ 第二阶段【后买入】按整手取整建仓 $\rightarrow$ 第三阶段【维持持仓】惰性过滤 $\rightarrow$ 第四阶段【闲置资金归集】入现金工具（`BIL`/`511880`/`GC001`）。全面支持 55+ 种研究策略、9 种静态配置模板及自定义 JSON 策略。
+  - **Stage 2（实盘交易单生成）** 通过 `scripts/run_live_strategy.py`：强制执行四阶段层级：第一阶段【先卖出】释放购买力 $\rightarrow$ 第二阶段【后买入】按整手取整建仓 $\rightarrow$ 第三阶段【维持持仓】惰性过滤 $\rightarrow$ 第四阶段【闲置资金归集】入现金工具（`BIL`/`511880`/`GC001`）。全面支持 55+ 种研究策略、9 种静态配置模板及自定义 JSON 策略。
   - `web/livetrading` 提供交互式 Web 交易工作站，支持实时持仓与现金管理、每日不可变运行快照归档（`data/runs/<date>/`）及自定义股票池管理。区域核心卫星池位于 `docs/universe/`（A 股、美股、港股）。
 
 ---

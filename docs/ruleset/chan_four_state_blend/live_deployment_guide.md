@@ -6,7 +6,7 @@
 > - **US Equities**: [`docs/universe/us/core_satellite_22_stocks.txt`](file:///home/stone/Work/github/quant/docs/universe/us/core_satellite_22_stocks.txt) (16 Value/Cash Cow Core + 6 AI Tech Leaders)  
 > - **Hong Kong Stocks**: [`docs/universe/hongkong/core_satellite_22_stocks.txt`](file:///home/stone/Work/github/quant/docs/universe/hongkong/core_satellite_22_stocks.txt) (16 High-Dividend SOEs + 6 Tech Platforms)  
 > **Cash Proxies**: `511880` / `511990` / `GC001` (A-Shares), [`BIL`](file:///home/stone/Work/github/quant/pipeline/research_strategy/strategies_config.json) / `SGOV` (US), USD/HKD Cash Equivalents (HK)  
-> **Daily Execution Tool**: [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py) (alias: [`scripts/run_live_four_state_blend.py`](file:///home/stone/Work/github/quant/scripts/run_live_four_state_blend.py))  
+> **Daily Execution Tool**: [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py)  
 > **Deep Empirical Audit**: [`docs/reports/china/chan_four_state_blend/chan_four_state_blend_deep_analysis.md`](file:///home/stone/Work/github/quant/docs/reports/china/chan_four_state_blend/chan_four_state_blend_deep_analysis.md)  
 
 ---
@@ -111,7 +111,7 @@ flowchart TD
 2. **14:15 – 14:20: Stage 2 — Generate Daily Execution Ticket**
    - If Stage 1 directive is **🟢 GO** or **🟡 CAUTION**, run the operational ticket generator against your brokerage portfolio:
      ```bash
-     uv run python scripts/run_live_four_state_blend.py \
+     uv run python scripts/run_live_strategy.py \
        --portfolio-value <ACCOUNT_NAV> \
        --current-holdings '<HOLDINGS_JSON>' \
        --data-provider <marketdb|yfinance>
@@ -189,7 +189,7 @@ Create a local `current_holdings.json` file representing your broker positions w
 
 Execute the ticket generator:
 ```bash
-uv run python scripts/run_live_four_state_blend.py \
+uv run python scripts/run_live_strategy.py \
   --current-holdings-file current_holdings.json \
   --portfolio-value 200000 \
   --universe-file docs/universe/china/core_satellite_22_stocks.txt \
@@ -198,7 +198,7 @@ uv run python scripts/run_live_four_state_blend.py \
 
 #### B. Daily Rebalance for US Equities Portfolio
 ```bash
-uv run python scripts/run_live_four_state_blend.py \
+uv run python scripts/run_live_strategy.py \
   --universe-file docs/universe/us/core_satellite_22_stocks.txt \
   --output-dir docs/ruleset/chan_four_state_blend/us \
   --portfolio-value 100000 \
@@ -208,7 +208,7 @@ uv run python scripts/run_live_four_state_blend.py \
 
 #### C. Daily Rebalance for Hong Kong Stocks Portfolio
 ```bash
-uv run python scripts/run_live_four_state_blend.py \
+uv run python scripts/run_live_strategy.py \
   --universe-file docs/universe/hongkong/core_satellite_22_stocks.txt \
   --output-dir docs/ruleset/chan_four_state_blend/hongkong \
   --portfolio-value 500000 \
@@ -217,7 +217,7 @@ uv run python scripts/run_live_four_state_blend.py \
 
 #### D. Offline Ticket Simulation (Synthetic Data)
 ```bash
-uv run python scripts/run_live_four_state_blend.py \
+uv run python scripts/run_live_strategy.py \
   --data-provider synthetic \
   --portfolio-value 100000
 ```
@@ -252,7 +252,7 @@ uv run python scripts/run_live_four_state_blend.py \
 - **Stage 1 Health Report (Markdown)**: [`docs/ruleset/chan_four_state_blend/stage1_health_report.md`](file:///home/stone/Work/github/quant/docs/ruleset/chan_four_state_blend/stage1_health_report.md)
 - **Stage 1 Health Report (JSON)**: [`docs/ruleset/chan_four_state_blend/stage1_health_report.json`](file:///home/stone/Work/github/quant/docs/ruleset/chan_four_state_blend/stage1_health_report.json)
 - **Account State & Cooldown Tracker**: [`docs/ruleset/chan_four_state_blend/account_state.json`](file:///home/stone/Work/github/quant/docs/ruleset/chan_four_state_blend/account_state.json)
-- **Stage 2 Execution Script**: [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py) (alias: [`scripts/run_live_four_state_blend.py`](file:///home/stone/Work/github/quant/scripts/run_live_four_state_blend.py))
+- **Stage 2 Execution Script**: [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py) (alias: [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py))
 - **Production Universes**:
   - China A-Shares: [`docs/universe/china/core_satellite_22_stocks.txt`](file:///home/stone/Work/github/quant/docs/universe/china/core_satellite_22_stocks.txt)
   - US Equities: [`docs/universe/us/core_satellite_22_stocks.txt`](file:///home/stone/Work/github/quant/docs/universe/us/core_satellite_22_stocks.txt)

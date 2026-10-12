@@ -6,7 +6,7 @@
 > - **美股核心-卫星池**: [`docs/universe/us/core_satellite_22_stocks.txt`](file:///home/stone/Work/github/quant/docs/universe/us/core_satellite_22_stocks.txt) (16只价值投资与充沛现金流底仓 + 6只AI科技前沿领航引擎)  
 > - **港股核心-卫星池**: [`docs/universe/hongkong/core_satellite_22_stocks.txt`](file:///home/stone/Work/github/quant/docs/universe/hongkong/core_satellite_22_stocks.txt) (16只高股息央国企及公用事业底仓 + 6只超级科技平台与出海领袖)  
 > **现金替代资产**: A 股 `511880` (银华日利) / `511990` (华宝添益) / 国债逆回购 `GC001`; 美股 [`BIL`](file:///home/stone/Work/github/quant/pipeline/research_strategy/strategies_config.json) / `SGOV`; 港股 美元/港币货币市场工具  
-> **专属发单工具**: [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py)（向后兼容别名：[`scripts/run_live_four_state_blend.py`](file:///home/stone/Work/github/quant/scripts/run_live_four_state_blend.py)）  
+> **专属发单工具**: [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py)（向后兼容别名：[`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py)）  
 > **深度研报论证**: [`docs/reports/china/chan_four_state_blend/chan_four_state_blend_deep_analysis_cn.md`](file:///home/stone/Work/github/quant/docs/reports/china/chan_four_state_blend/chan_four_state_blend_deep_analysis_cn.md)  
 
 ---
@@ -110,7 +110,7 @@ flowchart TD
 2. **14:15 – 14:20: 第二阶段 — 生成交易执行票据**
    - 当第一阶段指令为 **🟢 GO** 或 **🟡 CAUTION** 时，在终端运行调仓票据生成器：
      ```bash
-     uv run python scripts/run_live_four_state_blend.py \
+     uv run python scripts/run_live_strategy.py \
        --portfolio-value <账户总资产> \
        --current-holdings '<当前持仓JSON>' \
        --data-provider <marketdb|yfinance>
@@ -188,7 +188,7 @@ uv run python scripts/check_live_portfolio_health.py \
 
 执行生成当日调仓单：
 ```bash
-uv run python scripts/run_live_four_state_blend.py \
+uv run python scripts/run_live_strategy.py \
   --current-holdings-file current_holdings.json \
   --portfolio-value 200000 \
   --universe-file docs/universe/china/core_satellite_22_stocks.txt \
@@ -197,7 +197,7 @@ uv run python scripts/run_live_four_state_blend.py \
 
 #### B. 美股核心-卫星池发单命令
 ```bash
-uv run python scripts/run_live_four_state_blend.py \
+uv run python scripts/run_live_strategy.py \
   --universe-file docs/universe/us/core_satellite_22_stocks.txt \
   --output-dir docs/ruleset/chan_four_state_blend/us \
   --portfolio-value 100000 \
@@ -207,7 +207,7 @@ uv run python scripts/run_live_four_state_blend.py \
 
 #### C. 港股核心-卫星池发单命令
 ```bash
-uv run python scripts/run_live_four_state_blend.py \
+uv run python scripts/run_live_strategy.py \
   --universe-file docs/universe/hongkong/core_satellite_22_stocks.txt \
   --output-dir docs/ruleset/chan_four_state_blend/hongkong \
   --portfolio-value 500000 \
@@ -216,7 +216,7 @@ uv run python scripts/run_live_four_state_blend.py \
 
 #### D. 离线模拟发单检验 (合成数据)
 ```bash
-uv run python scripts/run_live_four_state_blend.py \
+uv run python scripts/run_live_strategy.py \
   --data-provider synthetic \
   --portfolio-value 100000
 ```
@@ -251,7 +251,7 @@ uv run python scripts/run_live_four_state_blend.py \
 - **第一阶段风控门禁审计报告 (Markdown)**: [`docs/ruleset/chan_four_state_blend/stage1_health_report.md`](file:///home/stone/Work/github/quant/docs/ruleset/chan_four_state_blend/stage1_health_report.md)
 - **第一阶段风控门禁审计报告 (JSON)**: [`docs/ruleset/chan_four_state_blend/stage1_health_report.json`](file:///home/stone/Work/github/quant/docs/ruleset/chan_four_state_blend/stage1_health_report.json)
 - **账户净值与冷冻期追踪状态文件**: [`docs/ruleset/chan_four_state_blend/account_state.json`](file:///home/stone/Work/github/quant/docs/ruleset/chan_four_state_blend/account_state.json)
-- **第二阶段调仓发单执行脚本**: [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py)（向后兼容别名：[`scripts/run_live_four_state_blend.py`](file:///home/stone/Work/github/quant/scripts/run_live_four_state_blend.py)）
+- **第二阶段调仓发单执行脚本**: [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py)（向后兼容别名：[`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py)）
 - **跨市场标的池**:
   - A 股核心-卫星池: [`docs/universe/china/core_satellite_22_stocks.txt`](file:///home/stone/Work/github/quant/docs/universe/china/core_satellite_22_stocks.txt)
   - 美股核心-卫星池: [`docs/universe/us/core_satellite_22_stocks.txt`](file:///home/stone/Work/github/quant/docs/universe/us/core_satellite_22_stocks.txt)

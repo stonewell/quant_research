@@ -93,7 +93,7 @@ uv run --project pipeline python backtester/run_backtest.py \
 ### 3. 生成美股每日实盘交易信号与调仓指令 (接入真实 yfinance 数据源)
 ```bash
 # 当实盘需要拉取 Yahoo Finance 真实行情时执行:
-uv run --project pipeline python scripts/run_live_four_state_blend.py \
+uv run --project pipeline python scripts/run_live_strategy.py \
   --universe-file "docs/universe/us/核心卫星组合精选(价值现金流红利底仓+AI科技巨头增强)/core_satellite_22_stocks.txt" \
   --data-provider yfinance \
   --portfolio-value 1000000

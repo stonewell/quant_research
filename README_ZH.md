@@ -22,7 +22,7 @@
 - **根目录共享部分**（通过 `sys.path` 注入或独立执行）：
   - `common/`：共享的市场数据加载器、技术指标、组合回测器、配置模板、因子分类学、再平衡调度、打乱置换显著性检验、CLI/报告脚手架以及合成数据生成器。
   - `backtester/`：独立的策略回测引擎，评估固定策略规范（`strategy.json`）在标准区间或滚动 Walk-Forward 窗口下的表现。
-  - `scripts/`：实盘健康检查与风控审计脚本（`check_live_portfolio_health.py`）、通用实盘部署运行器（`run_live_strategy.py`，兼容别名 `run_live_four_state_blend.py`）及文档格式转换工具。
+  - `scripts/`：实盘健康检查与风控审计脚本（`check_live_portfolio_health.py`）、通用实盘部署运行器（`run_live_strategy.py`）及文档格式转换工具。
   - `docs/universe/`：预先经过严格前行检验与审计的中美港三大核心卫星资产池。
 
 每个项目目录均包含独立的 README，附带完整的 CLI 参数说明、示例命令和数据 Schema 文档；`common/README_ZH.md` 是工作区内由 2 个或以上项目共享的每个 DataFrame/JSON 数据结构的唯一权威来源。本文件提供端到端的全景图；如需了解具体模块的详细信息，请参阅以下链接。
