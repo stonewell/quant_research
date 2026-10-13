@@ -28,9 +28,9 @@ except ImportError:
             )
 
 try:
-    from .storage import StorageManager, post_holdings_from_ticket
+    from .storage import StorageManager, parse_ticket_csv, post_holdings_from_ticket
 except (ImportError, ValueError):
-    from storage import StorageManager, post_holdings_from_ticket
+    from storage import StorageManager, parse_ticket_csv, post_holdings_from_ticket
 
 
 class ExecutionService:
@@ -327,25 +327,33 @@ class ExecutionService:
         stderr = proc.stderr
         success = proc.returncode == 0
 
-        # Load generated trading ticket CSV and convert to JSON
+        # Load generated trading ticket CSV/JSON
         csv_file = os.path.join(run_dir, "live_trading_ticket.csv")
         ticket_json_file = os.path.join(run_dir, "live_trading_ticket.json")
         ticket_records = []
-        if os.path.exists(csv_file):
-            try:
-                df = pd.read_csv(csv_file)
-                ticket_records = df.to_dict(orient="records")
-                for r in ticket_records:
-                    if is_placeholder_stock_name(r.get("name"), r.get("symbol")):
-                        r["name"] = get_stock_name(r.get("symbol"), r.get("symbol"))
+        try:
+            if os.path.exists(ticket_json_file) and os.path.exists(csv_file):
+                if os.path.getmtime(csv_file) > os.path.getmtime(ticket_json_file):
+                    ticket_records = parse_ticket_csv(csv_file)
+                    self.storage._save_json(ticket_json_file, ticket_records)
+                else:
+                    ticket_records = self.storage._load_json(ticket_json_file, default=[])
+            elif os.path.exists(ticket_json_file):
+                ticket_records = self.storage._load_json(ticket_json_file, default=[])
+            elif os.path.exists(csv_file):
+                ticket_records = parse_ticket_csv(csv_file)
                 self.storage._save_json(ticket_json_file, ticket_records)
 
+            if ticket_records and isinstance(ticket_records, list):
+                for r in ticket_records:
+                    if isinstance(r, dict) and is_placeholder_stock_name(r.get("name"), r.get("symbol")):
+                        r["name"] = get_stock_name(r.get("symbol"), r.get("symbol"))
                 # Save post_holdings.json for subsequent day carry-over
                 post_holdings = post_holdings_from_ticket(ticket_records)
                 if post_holdings is not None:
                     self.storage._save_json(os.path.join(run_dir, "post_holdings.json"), post_holdings)
-            except Exception as e:
-                print(f"[ExecutionService] Error converting ticket CSV to JSON: {e}")
+        except Exception as e:
+            print(f"[ExecutionService] Error loading or converting ticket: {e}")
 
         state_data = self.storage._load_json(account_state_file, default=None)
         health_data = self.storage._load_json(health_rep_file, default=None)

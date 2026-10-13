@@ -446,6 +446,8 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         bull_max_pos = self.resolve_param(p, "bull_max_single_position", 0.20, float)
         min_weight_change = self.resolve_param(p, "min_weight_change", 0.05, float)
         entry_thresh = self.resolve_param(p, "entry_threshold", 0.03, float)
+        min_holding_bars = self.resolve_param(p, "min_holding_bars", 2, int)
+        thrust_incumbent_bonus = self.resolve_param(p, "thrust_incumbent_bonus", 1.20, float)
         dd_reduce_thresh = self.resolve_param(p, "dd_reduce_thresh", 0.10, float)
         dd_defensive_thresh = self.resolve_param(p, "dd_defensive_thresh", 0.15, float)
         dd_stop_thresh = self.resolve_param(p, "dd_stop_thresh", 0.20, float)
@@ -603,6 +605,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         tier1_counter = 0
         stop_counter = 0
         emergency_flags = []
+        asset_emergency_df = pd.DataFrame(False, index=master_index, columns=risky_symbols)
 
         asset_cooldown_until = {s: 0 for s in risky_symbols}
         asset_entry_price = {s: None for s in risky_symbols}
@@ -651,6 +654,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                     is_stopped = True
 
                             if is_stopped:
+                                asset_emergency_df.loc[date, s] = True
                                 asset_cooldown_until[s] = t + asset_stop_cooldown_bars
                                 asset_entry_price[s] = None
                                 asset_peak_price[s] = None
@@ -770,6 +774,8 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                 is_emergency = False
 
             emergency_flags.append(is_emergency)
+            if is_emergency:
+                asset_emergency_df.loc[date, :] = True
 
             # Quality & Relative Strength Gate
             if require_asset_trend and t > 0:
@@ -847,7 +853,12 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                     if "wq_alpha2" in sub_daily and s in sub_daily["wq_alpha2"].columns:
                                         a2_bonus = max(0.0, float(sub_daily["wq_alpha2"].loc[date, s]))
 
-                                    cand_scores[s] = r_val * (1.0 + 5.0 * a2_bonus) * c_mult
+                                    base_score = r_val * (1.0 + 5.0 * a2_bonus) * c_mult
+                                    if t > 0:
+                                        prev_date = master_index[t - 1]
+                                        if float(daily_weights.loc[prev_date, s]) > 1e-4:
+                                            base_score *= thrust_incumbent_bonus
+                                    cand_scores[s] = base_score
                                     v = float(asset_vol_21d.iloc[t][s]) if pd.notna(asset_vol_21d.iloc[t][s]) else target_vol
                                     cand_vols[s] = max(0.10, v)
 
@@ -859,6 +870,22 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                 sec_rocs[sec].append(r_val)
                             sec_mean_roc = {sec: float(np.mean(vals)) for sec, vals in sec_rocs.items() if vals}
                             top_sec_thresh = float(pd.Series(sec_mean_roc).quantile(0.80)) if sec_mean_roc else 0.03
+
+                            # Track locked incumbents that cannot be sold due to min_holding_bars
+                            locked_incumbents = set()
+                            if t > 0 and min_holding_bars > 0:
+                                prev_date = master_index[t - 1]
+                                for s in risky_symbols:
+                                    if float(daily_weights.loc[prev_date, s]) > 1e-4:
+                                        k = t - 1
+                                        age = 0
+                                        while k >= 0 and float(daily_weights.iloc[k][s]) > 1e-4:
+                                            age += 1
+                                            k -= 1
+                                        if age < min_holding_bars and t < asset_cooldown_until[s]:
+                                            pass
+                                        elif age < min_holding_bars:
+                                            locked_incumbents.add(s)
 
                             all_sorted = sorted(cand_scores.keys(), key=lambda s: (-cand_scores[s], s))
                             sorted_cands = []
@@ -873,7 +900,10 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                 allowed_sec_cap = max_assets_per_sector
                                 if adaptive_sector_throttle and sec_mean_roc.get(sec, 0.0) >= max(0.02, top_sec_thresh):
                                     allowed_sec_cap = max(allowed_sec_cap, 2)
-                                if sector_counts[sec] < allowed_sec_cap:
+                                
+                                # An outside challenger cannot displace a locked incumbent in the same sector
+                                effective_occ = sector_counts[sec] + sum(1 for s in locked_incumbents if s != cand and _get_symbol_sector(s) == sec)
+                                if effective_occ < allowed_sec_cap:
                                     sorted_cands.append(cand)
                                     sector_counts[sec] += 1
                                 if len(sorted_cands) >= min_thrust_assets:
@@ -957,8 +987,8 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             daily_weights.loc[date] = raw_w
 
         # Step 4: Asset-level inertia filtering
-        emergency_mask = pd.Series(emergency_flags, index=master_index) if emergency_flags else None
-        if min_weight_change > 0.0:
+        emergency_mask = asset_emergency_df
+        if min_weight_change > 0.0 or min_holding_bars > 0:
             if adaptive_inertia:
                 mean_mkt_vol = float(asset_vol_21d.mean().mean())
                 inertia_map = {}
@@ -974,6 +1004,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                     emergency_mask=emergency_mask,
                     asymmetric_sells=asymmetric_sells,
                     entry_threshold=entry_thresh,
+                    min_holding_bars=min_holding_bars,
                 )
             else:
                 daily_weights = apply_asset_inertia(
@@ -983,6 +1014,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                     emergency_mask=emergency_mask,
                     asymmetric_sells=asymmetric_sells,
                     entry_threshold=entry_thresh,
+                    min_holding_bars=min_holding_bars,
                 )
 
         daily_weights = _fill_out_columns(daily_weights, symbols)

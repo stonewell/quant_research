@@ -385,7 +385,7 @@
         }
 
         try {
-            const res = await fetch(`/api/runs/latest?strategy=${encodeURIComponent(keys.stratKey)}&universe=${encodeURIComponent(keys.univKey)}`);
+            const res = await fetch(`/api/runs/latest?strategy=${encodeURIComponent(keys.stratKey)}&universe=${encodeURIComponent(keys.univKey)}`, { cache: "no-store" });
             if (res.ok) {
                 const bundle = await res.json();
                 renderRunBundle(bundle);
@@ -420,7 +420,7 @@
         }
 
         try {
-            const res = await fetch(`/api/runs?strategy=${encodeURIComponent(keys.stratKey)}&universe=${encodeURIComponent(keys.univKey)}&require_both=true`);
+            const res = await fetch(`/api/runs?strategy=${encodeURIComponent(keys.stratKey)}&universe=${encodeURIComponent(keys.univKey)}&require_both=true`, { cache: "no-store" });
             const runs = await res.json();
             state.historyRuns = runs || [];
 
@@ -482,7 +482,7 @@
 
         // 1. Try to load exact historical run bundle for targetDate
         try {
-            const res = await fetch(`/api/runs/${encodeURIComponent(keys.stratKey)}/${encodeURIComponent(keys.univKey)}/${encodeURIComponent(targetDate)}`);
+            const res = await fetch(`/api/runs/${encodeURIComponent(keys.stratKey)}/${encodeURIComponent(keys.univKey)}/${encodeURIComponent(targetDate)}`, { cache: "no-store" });
             if (res.ok) {
                 const bundle = await res.json();
                 const hasHealth = !!bundle.health_report;
@@ -512,7 +512,7 @@
 
         // Load account info and holdings from previous available date run data
         try {
-            const prevRes = await fetch(`/api/runs/previous?date=${encodeURIComponent(targetDate)}&strategy=${encodeURIComponent(keys.stratKey)}&universe=${encodeURIComponent(keys.univKey)}`);
+            const prevRes = await fetch(`/api/runs/previous?date=${encodeURIComponent(targetDate)}&strategy=${encodeURIComponent(keys.stratKey)}&universe=${encodeURIComponent(keys.univKey)}`, { cache: "no-store" });
             if (prevRes.ok) {
                 const prevData = await prevRes.json();
                 if (prevData.has_previous) {
@@ -1537,7 +1537,7 @@
         logConsole(`\n[ARCHIVE] 加载策略「${keys.stratName}」标的池「${keys.univName}」日期 ${dateStr} 的历史记录...`);
 
         try {
-            const res = await fetch(`/api/runs/${encodeURIComponent(sk)}/${encodeURIComponent(uk)}/${encodeURIComponent(dateStr)}`);
+            const res = await fetch(`/api/runs/${encodeURIComponent(sk)}/${encodeURIComponent(uk)}/${encodeURIComponent(dateStr)}`, { cache: "no-store" });
             if (!res.ok) throw new Error("无法加载该日期的历史归档");
             const bundle = await res.json();
 

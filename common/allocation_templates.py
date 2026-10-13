@@ -206,23 +206,25 @@ def apply_asset_inertia(
     emergency_mask: Optional[pd.Series] = None,
     asymmetric_sells: bool = False,
     entry_threshold: Optional[float] = None,
+    min_holding_bars: int = 0,
 ) -> pd.DataFrame:
     """Filters daily target-weight allocations using asset-level inertia (Option A).
 
     For each asset, if the change in ideal target weight versus the currently held
     target weight is below `min_weight_change`, the asset's target weight is frozen
     at its previous held value. Supports uniform float, per-asset dict, or pd.Series
-    thresholds, tighter asymmetric sell bands (60% threshold on trimming), and an
-    optional `entry_threshold` allowing new position initiations to enter without
-    being blocked by volatility-scaled rebalancing inertia.
+    thresholds, tighter asymmetric sell bands (60% threshold on trimming), an optional
+    `entry_threshold` allowing new position initiations to enter without being blocked
+    by volatility-scaled rebalancing inertia, and an optional `min_holding_bars` to
+    suppress premature sell/trim flips before a minimum holding tenure has elapsed.
 
     When significant changes occur (|diff| >= min_weight_change):
-    1. Sells execute first to release cash capacity.
+    1. Sells execute first to release cash capacity (subject to `min_holding_bars` unless emergency).
     2. Buys execute in order of priority up to available cash capacity without
        diluting or modifying untouched assets.
     3. Residual unallocated cash is routed to `cash_proxy` (if present).
-    4. Emergency dates (indicated by `emergency_mask`) bypass inertia to allow
-       immediate liquidation or de-risking without threshold delay.
+    4. Emergency dates (indicated by `emergency_mask`) bypass inertia and holding constraints
+       to allow immediate liquidation or de-risking without threshold delay.
     """
     if daily.empty:
         return daily
@@ -232,7 +234,7 @@ def apply_asset_inertia(
     n_dates = len(daily)
 
     if isinstance(min_weight_change, (int, float)):
-        if min_weight_change <= 0.0:
+        if min_weight_change <= 0.0 and min_holding_bars <= 0:
             return daily
         thresh = pd.Series(float(min_weight_change), index=risky_symbols)
     elif isinstance(min_weight_change, dict):
@@ -248,11 +250,29 @@ def apply_asset_inertia(
     current_w = daily.iloc[0].copy()
     filtered.iloc[0] = current_w
 
+    holding_age = {s: (1 if current_w[s] > 1e-4 else 0) for s in risky_symbols}
+
     for t in range(1, n_dates):
         ideal_w = daily.iloc[t]
-        is_emergency = bool(emergency_mask.iloc[t]) if emergency_mask is not None else False
+        if emergency_mask is not None:
+            em_row = emergency_mask.iloc[t]
+            if isinstance(em_row, pd.Series):
+                symbol_emergency = {s: bool(em_row.get(s, False)) for s in risky_symbols}
+                is_global_emergency = all(symbol_emergency.values()) if symbol_emergency else False
+            else:
+                is_global_emergency = bool(em_row)
+                symbol_emergency = {s: is_global_emergency for s in risky_symbols}
+        else:
+            is_global_emergency = False
+            symbol_emergency = {s: False for s in risky_symbols}
 
-        if is_emergency:
+        for s in risky_symbols:
+            if current_w[s] > 1e-4:
+                holding_age[s] += 1
+            else:
+                holding_age[s] = 0
+
+        if is_global_emergency:
             current_w = ideal_w.copy()
             filtered.iloc[t] = current_w
             continue
@@ -263,7 +283,18 @@ def apply_asset_inertia(
             buy_thresh[new_entry_mask] = np.minimum(thresh[new_entry_mask], entry_threshold)
 
         diff = ideal_w[risky_symbols] - current_w[risky_symbols]
-        sells = diff[diff <= -sell_thresh].index.tolist()
+        sells_raw = diff[diff <= -sell_thresh].index.tolist()
+
+        # Suppress sells if asset holding tenure is below min_holding_bars (unless emergency)
+        sells = []
+        for s in sells_raw:
+            if symbol_emergency.get(s, False):
+                sells.append(s)
+            elif min_holding_bars > 0 and holding_age[s] < min_holding_bars:
+                pass
+            else:
+                sells.append(s)
+
         buys = diff[diff >= buy_thresh].index.tolist()
 
         if not sells and not buys:

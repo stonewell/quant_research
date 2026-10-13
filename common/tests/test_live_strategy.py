@@ -15,6 +15,8 @@ from scripts.run_live_strategy import (
     pad_east_asian,
     resolve_lot_size,
     resolve_trade_inertia_threshold,
+    resolve_min_holding_bars,
+    resolve_holding_bars,
     resolve_strategy_definition,
     resolve_holdings_weights_and_shares,
     load_symbol_names,
@@ -106,3 +108,51 @@ def test_parse_args_dynamic_output_dir(tmp_path):
     assert args_default.output_dir == expected_default_dir
     assert args_default.account_state_file == os.path.join(expected_default_dir, "account_state.json")
     assert args_default.health_report_file == os.path.join(expected_default_dir, "stage1_health_report.json")
+
+
+def test_resolve_min_holding_bars():
+    # CLI override has highest priority
+    assert resolve_min_holding_bars({"cfsb_min_holding_bars": 3}, cli_override=5) == 5
+    # Prefixed blend params
+    assert resolve_min_holding_bars({"cfsb_min_holding_bars": 3}) == 3
+    assert resolve_min_holding_bars({"crb_min_holding_bars": 4}) == 4
+    assert resolve_min_holding_bars({"blend_min_holding_bars": 2}) == 2
+    assert resolve_min_holding_bars({"min_holding_bars": 3}) == 3
+    # Fallback default
+    assert resolve_min_holding_bars({}) == 2
+    assert resolve_min_holding_bars({}, default=1) == 1
+
+
+def test_resolve_holding_bars_account_state():
+    account_state = {"holding_bars": {"601872.SH": 1, "600941.SH": 3}}
+    holdings = {"601872.SH": 700, "600941.SH": 100, "000938.SZ": 300}
+    res = resolve_holding_bars(holdings, account_state=account_state, default_bars=1)
+    assert res["601872.SH"] == 1
+    assert res["600941.SH"] == 3
+    assert res["000938.SZ"] == 1
+
+
+def test_resolve_holding_bars_history_directory(tmp_path):
+    # Simulate hierarchical date folders: <run_dir>/2026-10-11/ and <run_dir>/2026-10-12/
+    base_dir = tmp_path / "runs" / "test_strat" / "test_univ"
+    d1 = base_dir / "2026-10-11"
+    d2 = base_dir / "2026-10-12"
+    d1.mkdir(parents=True)
+    d2.mkdir(parents=True)
+
+    # In 2026-10-11: 601872.SH was freshly BOUGHT (cur_shares=0, tgt_shares=700)
+    ticket_csv_11 = (
+        "symbol,name,action,price,current_weight,target_weight,delta_weight,current_shares,target_shares,delta_shares,trade_value,trade_value_rmb\n"
+        "601872.SH,招商轮船,BUY,22.0,0.0,0.08,0.08,0,700,700,15400,15400\n"
+        "601288.SH,农业银行,HOLD_FILTERED,7.0,0.1,0.1,0.0,3300,3300,0,0,0\n"
+    )
+    with open(d1 / "live_trading_ticket.csv", "w", encoding="utf-8") as f:
+        f.write(ticket_csv_11)
+
+    holdings_12 = {"601872.SH": 700, "601288.SH": 3300}
+    res = resolve_holding_bars(holdings_12, output_dir=str(d2), as_of_date="2026-10-12")
+
+    # 601872.SH was entered on 2026-10-11, so on 2026-10-12 it has held 1 bar
+    assert res["601872.SH"] == 1
+    # 601288.SH was held on 2026-10-11
+    assert res["601288.SH"] >= 1

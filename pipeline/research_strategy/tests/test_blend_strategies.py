@@ -101,12 +101,24 @@ def test_default_institutional_settings_on_all_blend_strategies():
     assert cfg.cdhb_vol_model == "garman_klass"
     assert cfg.cdhb_stop_mode == "atr_trailing"
     assert cfg.cdhb_adaptive_inertia is True
+    assert cfg.blend_min_holding_bars == 2
+    assert cfg.blend_thrust_incumbent_bonus == 1.20
+    assert cfg.crb_min_holding_bars == 2
+    assert cfg.crb_thrust_incumbent_bonus == 1.20
+    assert cfg.cfsb_min_holding_bars == 2
+    assert cfg.cfsb_thrust_incumbent_bonus == 1.20
+    assert cfg.ccsb_min_holding_bars == 2
+    assert cfg.ccsb_thrust_incumbent_bonus == 1.20
+    assert cfg.cdhb_min_holding_bars == 2
+    assert cfg.cdhb_thrust_incumbent_bonus == 1.20
 
     # Check instantiated strategy objects
     s_crb = ChanRiskManagedBlendStrategy()
     assert s_crb.resolve_param({}, "vol_model", "wrong") == "garman_klass"
     assert s_crb.resolve_param({}, "stop_mode", "wrong") == "atr_trailing"
     assert s_crb.resolve_param({}, "adaptive_inertia", False) is True
+    assert s_crb.resolve_param({}, "min_holding_bars", 0) == 2
+    assert s_crb.resolve_param({}, "thrust_incumbent_bonus", 1.0) == 1.20
 
     s_cfsb = ChanFourStateBlendStrategy()
     assert s_cfsb.resolve_param({}, "vol_model", "wrong") == "garman_klass"
@@ -410,4 +422,87 @@ def test_generic_blend_with_worldquant_alphas_and_regime_hybrid():
     for dt, row in rebal_rows.iterrows():
         assert not row.isna().any()
         assert np.isclose(row.sum(), 1.0, atol=1e-3)
+
+
+def test_min_holding_bars_suppresses_one_day_flips():
+    """Validates that apply_asset_inertia with min_holding_bars=2 suppresses 1-day exit flips."""
+    from common.allocation_templates import apply_asset_inertia
+
+    dates = pd.bdate_range("2020-01-01", periods=5)
+    # Day 0: 0.0, Day 1: 0.20 (buy), Day 2: 0.0 (ideal wants to flip sell), Day 3: 0.0, Day 4: 0.0
+    daily = pd.DataFrame({
+        "S1": [0.0, 0.20, 0.0, 0.0, 0.0],
+        "CASH": [1.0, 0.80, 1.0, 1.0, 1.0],
+    }, index=dates)
+
+    # Without min_holding_bars: flips out on day 2 (1-day hold)
+    res_no_hold = apply_asset_inertia(daily, min_weight_change=0.05, cash_proxy="CASH", min_holding_bars=0)
+    assert res_no_hold.loc[dates[2], "S1"] == 0.0  # Sold after 1 day!
+
+    # With min_holding_bars=2: holding tenure on day 2 is 1 bar (< 2), so sale is suppressed!
+    res_held = apply_asset_inertia(daily, min_weight_change=0.05, cash_proxy="CASH", min_holding_bars=2)
+    assert res_held.loc[dates[1], "S1"] == 0.20    # Bought on Day 1
+    assert res_held.loc[dates[2], "S1"] == 0.20    # Protected on Day 2 (holding tenure = 1 bar)
+    assert res_held.loc[dates[3], "S1"] == 0.0     # Cleanly liquidated on Day 3 (holding tenure = 2 bars >= 2)
+
+
+def test_emergency_mask_bypasses_min_holding_bars():
+    """Validates that emergency stop events (per-asset or global) bypass min_holding_bars."""
+    from common.allocation_templates import apply_asset_inertia
+
+    dates = pd.bdate_range("2020-01-01", periods=4)
+    daily = pd.DataFrame({
+        "S1": [0.0, 0.20, 0.0, 0.0],
+        "S2": [0.0, 0.20, 0.0, 0.0],
+        "CASH": [1.0, 0.60, 1.0, 1.0],
+    }, index=dates)
+
+    # Per-asset emergency mask: S1 is stopped out on day 2, S2 is not
+    emergency_df = pd.DataFrame({
+        "S1": [False, False, True, False],
+        "S2": [False, False, False, False],
+    }, index=dates)
+
+    res = apply_asset_inertia(daily, min_weight_change=0.05, cash_proxy="CASH", emergency_mask=emergency_df, min_holding_bars=2)
+    # S1 had emergency -> liquidated immediately on Day 2 despite tenure < 2
+    assert res.loc[dates[2], "S1"] == 0.0
+    # S2 had NO emergency -> protected on Day 2
+    assert res.loc[dates[2], "S2"] == 0.20
+
+
+def test_blend_strategy_no_one_day_trades_in_backtest():
+    """Integration test verifying that ChanRiskManagedBlendStrategy produces 0 one-day holding trades."""
+    mock_universe = create_mock_universe(120)
+    cfg = StrategyConfig()
+    cfg.crb_min_holding_bars = 2
+    cfg.crb_thrust_incumbent_bonus = 1.20
+
+    strat = ChanRiskManagedBlendStrategy(cfg)
+    sparse_w = strat.generate_weights(mock_universe)
+    assert not sparse_w.empty
+
+    # Reconstruct dense holding series
+    dense_w = sparse_w.ffill().fillna(0.0)
+    risky_symbols = [s for s in sparse_w.columns if s != "BIL"]
+
+    # Measure holding run lengths for each symbol
+    one_day_holds = 0
+    for sym in risky_symbols:
+        held = (dense_w[sym] > 1e-4).astype(int)
+        # Identify start and end of holding spells
+        diff = held.diff().fillna(held.iloc[0])
+        entries = held.index[diff == 1].tolist()
+        exits = held.index[diff == -1].tolist()
+        
+        # Check every completed trade spell
+        for entry_dt in entries:
+            future_exits = [ex for ex in exits if ex > entry_dt]
+            if future_exits:
+                exit_dt = future_exits[0]
+                bars_held = len(dense_w.loc[entry_dt:exit_dt]) - 1
+                if bars_held == 1:
+                    one_day_holds += 1
+
+    assert one_day_holds == 0, f"Expected 0 one-day holding trades, found {one_day_holds}"
+
 

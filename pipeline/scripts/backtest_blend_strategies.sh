@@ -9,8 +9,8 @@ UNIVERSE="../docs/universe/china/50_stock.txt"
 RESULTS="results"
 START="2022-01-01"
 END="2026-01-01"
-WEIGHTING_MODE="${WEIGHTING_MODE:-"static"}"
-ENABLE_ORTHOGONALIZATION="${ENABLE_ORTHOGONALIZATION:-"false"}"
+WEIGHTING_MODE="${WEIGHTING_MODE:-"rolling_ic_ir"}"
+ENABLE_ORTHOGONALIZATION="${ENABLE_ORTHOGONALIZATION:-"true"}"
 
 # Parse named flags and/or positional arguments
 positional_args=()

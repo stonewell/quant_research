@@ -63,6 +63,15 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
         allow_headers=["*"],
     )
 
+    @app.middleware("http")
+    async def add_no_cache_headers(request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+        return response
+
     # Attach storage and service to app state for testability and route access
     app.state.storage = storage
     app.state.execution_service = execution_service

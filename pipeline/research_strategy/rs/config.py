@@ -577,6 +577,8 @@ class StrategyConfig:
     crb_adaptive_inertia: bool = True         # Volatility-scaled asymmetric rebalancing bands
     crb_entry_threshold: float = 0.03         # Minimum initial position allocation threshold
     crb_asset_stop_cooldown_bars: int = 5     # Cooldown bars for an asset after hitting stop loss
+    crb_min_holding_bars: int = 2             # Minimum holding bars to suppress 1-day whipsaws (0 disables)
+    crb_thrust_incumbent_bonus: float = 1.20  # Score multiplier for held assets during candidate selection
 
     # --- Chan Four-State Risk-Managed Blend Strategy (chan_four_state_blend) ---
     # Enhanced institutional ensemble blending ChanFourStateExecutionStrategy (25%),
@@ -608,6 +610,8 @@ class StrategyConfig:
     cfsb_adaptive_inertia: bool = True
     cfsb_entry_threshold: float = 0.03
     cfsb_asset_stop_cooldown_bars: int = 5
+    cfsb_min_holding_bars: int = 2
+    cfsb_thrust_incumbent_bonus: float = 1.20
 
     # --- Chan Crisis Shield Blend Strategy (chan_crisis_shield_blend) ---
     ccsb_three_type_weight: float = 0.45
@@ -637,6 +641,8 @@ class StrategyConfig:
     ccsb_adaptive_inertia: bool = True
     ccsb_entry_threshold: float = 0.03
     ccsb_asset_stop_cooldown_bars: int = 5
+    ccsb_min_holding_bars: int = 2
+    ccsb_thrust_incumbent_bonus: float = 1.20
 
     # --- Chan Dual Hybrid Alpha Blend Strategy (chan_dual_hybrid_blend) ---
     cdhb_three_type_weight: float = 0.45
@@ -685,12 +691,16 @@ class StrategyConfig:
     cdhb_alpha4_id: int = 101                # WorldQuant Alpha#101 (Intraday Price Efficiency)
     cdhb_stop_mode: str = "atr_trailing"     # "atr_trailing" (Chandelier Exit) or "fixed_pct" (-8%)
     cdhb_stop_atr_mult: float = 4.5          # Multiplier for ATR trailing stop
+    cdhb_min_holding_bars: int = 2           # Minimum holding bars to suppress 1-day whipsaws (0 disables)
+    cdhb_thrust_incumbent_bonus: float = 1.20 # Score multiplier for held assets during candidate selection
 
     # --- Universal Base Blend Strategy Configuration ---
     blend_max_single_position: float = 0.20
     blend_bull_max_single_position: float = 0.20
     blend_min_weight_change: float = 0.05
     blend_entry_threshold: float = 0.03
+    blend_min_holding_bars: int = 2          # Minimum holding bars to suppress 1-day whipsaws (0 disables)
+    blend_thrust_incumbent_bonus: float = 1.20 # Score multiplier for held assets during candidate selection
     blend_dd_reduce_thresh: float = 0.10
     blend_dd_defensive_thresh: float = 0.15
     blend_dd_stop_thresh: float = 0.20
@@ -1087,6 +1097,14 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.blend_adaptive_lookback_days must be > 0, got {self.blend_adaptive_lookback_days}")
         if not (0.0 <= self.blend_adaptive_shrinkage <= 1.0):
             raise ValueError(f"StrategyConfig.blend_adaptive_shrinkage must be between 0 and 1, got {self.blend_adaptive_shrinkage}")
+
+        for pfx in ("crb", "cfsb", "ccsb", "cdhb", "blend"):
+            val = getattr(self, f"{pfx}_min_holding_bars", None)
+            if val is not None and val < 0:
+                raise ValueError(f"StrategyConfig.{pfx}_min_holding_bars must be >= 0, got {val}")
+            bonus = getattr(self, f"{pfx}_thrust_incumbent_bonus", None)
+            if bonus is not None and bonus < 1.0:
+                raise ValueError(f"StrategyConfig.{pfx}_thrust_incumbent_bonus must be >= 1.0, got {bonus}")
 
     @classmethod
     def from_dict(cls, data: dict) -> "StrategyConfig":

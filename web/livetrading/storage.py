@@ -1328,11 +1328,18 @@ class StorageManager:
             return None
 
         summary_data = self._load_json(os.path.join(run_dir, "summary.json"), default={})
-        ticket = self._load_json(os.path.join(run_dir, "live_trading_ticket.json"))
-        if not ticket:
-            csv_path = os.path.join(run_dir, "live_trading_ticket.csv")
-            if os.path.exists(csv_path):
+        csv_path = os.path.join(run_dir, "live_trading_ticket.csv")
+        json_path = os.path.join(run_dir, "live_trading_ticket.json")
+        ticket = None
+        if os.path.exists(csv_path) and os.path.exists(json_path):
+            if os.path.getmtime(csv_path) > os.path.getmtime(json_path):
                 ticket = parse_ticket_csv(csv_path)
+            else:
+                ticket = self._load_json(json_path)
+        elif os.path.exists(json_path):
+            ticket = self._load_json(json_path)
+        elif os.path.exists(csv_path):
+            ticket = parse_ticket_csv(csv_path)
 
         if ticket and isinstance(ticket, list):
             for r in ticket:

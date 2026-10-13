@@ -252,6 +252,148 @@ def resolve_trade_inertia_threshold(params: Dict[str, Any], default: float = 0.0
     return float(default)
 
 
+def resolve_min_holding_bars(
+    params: Dict[str, Any],
+    cli_override: Optional[int] = None,
+    default: int = 2,
+) -> int:
+    """Resolve minimum continuous holding bars/tenure threshold across all strategies.
+
+    Precedence:
+    1. Direct CLI override (--min-holding-bars)
+    2. Strategy parameter via resolve_blend_param (cfsb_min_holding_bars, crb_min_holding_bars, etc., or min_holding_bars)
+    3. Strategy parameter matching ending with '_min_holding_bars'
+    4. Fallback default (2).
+    """
+    if cli_override is not None:
+        return max(0, int(cli_override))
+    val = resolve_blend_param(params, "min_holding_bars", None, int)
+    if val is not None:
+        return max(0, int(val))
+    for k, v in params.items():
+        if k.endswith("_min_holding_bars") and v is not None:
+            return max(0, int(v))
+    return int(default)
+
+
+def resolve_holding_bars(
+    current_holdings: Dict[str, Any],
+    account_state: Optional[Dict[str, Any]] = None,
+    output_dir: Optional[str] = None,
+    current_holdings_file: Optional[str] = None,
+    as_of_date: Optional[str] = None,
+    default_bars: int = 1,
+) -> Dict[str, int]:
+    """Resolves continuous holding bars/tenure for currently held assets.
+
+    Resolution sources (in priority order):
+    1. account_state.json's 'holding_bars' dictionary (if available).
+    2. Historical run folders in the parent directory of output_dir / current_holdings_file:
+       Walks backwards across previous date folders (YYYY-MM-DD), inspecting
+       live_trading_ticket.csv, post_holdings.json, or holdings.json to count
+       consecutive holding periods and identify the entry trade date.
+    3. Fallback: default_bars (defaults to 1).
+    """
+    holding_bars: Dict[str, int] = {}
+    cand_parents = []
+    if output_dir:
+        cand_parents.append(os.path.dirname(os.path.abspath(output_dir)))
+        cand_parents.append(os.path.abspath(output_dir))
+    if current_holdings_file:
+        cand_parents.append(os.path.dirname(os.path.abspath(current_holdings_file)))
+        cand_parents.append(os.path.dirname(os.path.dirname(os.path.abspath(current_holdings_file))))
+
+    date_re = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+    cur_date = as_of_date or (
+        os.path.basename(output_dir)
+        if output_dir and date_re.match(os.path.basename(output_dir))
+        else "9999-99-99"
+    )
+
+    parent_dir = None
+    prior_dates: List[str] = []
+    for p in cand_parents:
+        if os.path.isdir(p):
+            sub_dates = sorted([d for d in os.listdir(p) if date_re.match(d) and d < cur_date], reverse=True)
+            if sub_dates:
+                parent_dir = p
+                prior_dates = sub_dates
+                break
+
+    for sym in current_holdings:
+        if current_holdings[sym] is None:
+            continue
+        try:
+            qty_or_w = float(current_holdings[sym])
+        except (ValueError, TypeError):
+            continue
+        if qty_or_w <= 0:
+            continue
+        clean_sym = str(sym).strip()
+
+        age = 0
+        found_in_history = False
+        if parent_dir and prior_dates:
+            for d in prior_dates:
+                d_dir = os.path.join(parent_dir, d)
+                d_ticket = os.path.join(d_dir, "live_trading_ticket.csv")
+                d_post = os.path.join(d_dir, "post_holdings.json")
+                d_hold = os.path.join(d_dir, "holdings.json")
+
+                held_on_d = False
+                is_entry_on_d = False
+                if os.path.exists(d_ticket):
+                    try:
+                        df = pd.read_csv(d_ticket)
+                        row = df[df["symbol"] == clean_sym]
+                        if not row.empty:
+                            r = row.iloc[0]
+                            tgt_sh = float(r.get("target_shares", 0))
+                            tgt_w = float(r.get("target_weight", 0))
+                            cur_sh = float(r.get("current_shares", 0))
+                            act = str(r.get("action", ""))
+                            if tgt_sh > 0 or tgt_w > 0:
+                                held_on_d = True
+                                if act == "BUY" and cur_sh == 0:
+                                    is_entry_on_d = True
+                    except Exception:
+                        pass
+                elif os.path.exists(d_post):
+                    try:
+                        with open(d_post, "r", encoding="utf-8") as pf:
+                            ph = json.load(pf)
+                            held_on_d = float(ph.get(clean_sym, 0)) > 0
+                    except Exception:
+                        pass
+                elif os.path.exists(d_hold):
+                    try:
+                        with open(d_hold, "r", encoding="utf-8") as hf:
+                            hh = json.load(hf)
+                            held_on_d = float(hh.get(clean_sym, 0)) > 0
+                    except Exception:
+                        pass
+
+                if held_on_d:
+                    age += 1
+                    found_in_history = True
+                    if is_entry_on_d:
+                        break  # entered on date d, stop counting backwards
+                else:
+                    break  # continuity broken
+
+        if found_in_history:
+            holding_bars[clean_sym] = age
+        elif account_state and isinstance(account_state.get("holding_bars"), dict) and clean_sym in account_state["holding_bars"]:
+            try:
+                holding_bars[clean_sym] = int(account_state["holding_bars"][clean_sym])
+            except (ValueError, TypeError):
+                holding_bars[clean_sym] = default_bars
+        else:
+            holding_bars[clean_sym] = default_bars
+
+    return holding_bars
+
+
 _STATIC_NAME_ALIASES = {
     "risk_parity": "hierarchical_risk_parity",
     "hrp": "hierarchical_risk_parity",
@@ -442,6 +584,12 @@ def parse_args(args: Optional[List[str]] = None):
         type=int,
         default=None,
         help="Trading lot size for buy order rounding (default: auto-detect 100 for A-shares, 1 for US, board lots for HK)",
+    )
+    parser.add_argument(
+        "--min-holding-bars",
+        type=int,
+        default=None,
+        help="Minimum continuous holding bars before exit/liquidation is permitted (default: resolved from strategy config or 2)",
     )
     parser.add_argument(
         "--output-dir",
@@ -650,8 +798,9 @@ def main():
         else:
             args.portfolio_value = 100000.0
 
-    # Universal inertia / turnover threshold
+    # Universal inertia / turnover threshold and holding tenure constraints
     min_trade_thresh = resolve_trade_inertia_threshold(params, default=0.05)
+    min_holding_bars = resolve_min_holding_bars(params, args.min_holding_bars, default=2)
 
     # Build descriptive engine banner information
     engine_parts = []
@@ -663,6 +812,7 @@ def main():
         engine_parts.append(f"波动率模型={vm}")
     if "rebalance_freq_days" in params:
         engine_parts.append(f"调仓周期={params['rebalance_freq_days']}日")
+    engine_parts.append(f"最低持仓={min_holding_bars}日")
     engine_parts.append(f"惰性过滤={min_trade_thresh:.1%}")
     engine_info = " | ".join(engine_parts)
 
@@ -704,6 +854,16 @@ def main():
     )
     universe = as_of_universe(universe, as_of_date)
 
+    # Resolve actual continuous holding tenure across previous runs / account state
+    holding_bars = resolve_holding_bars(
+        raw_user_holdings or {},
+        account_state=account_state,
+        output_dir=args.output_dir,
+        current_holdings_file=args.current_holdings_file,
+        as_of_date=as_of_date,
+        default_bars=1,
+    )
+
     # 3. Generate Weights & Extract Latest Rebalance
     sparse_weights = template.generate_weights(universe, params)
     rebalances = latest_rebalance_rows(sparse_weights)
@@ -713,6 +873,13 @@ def main():
 
     latest_rebal_date = rebalances.index[-1].strftime("%Y-%m-%d")
     current_targets = rebalances.iloc[-1].fillna(0.0)
+
+    is_today_rebal = (pd.Timestamp(as_of_date) in sparse_weights.index) and (
+        not sparse_weights.loc[pd.Timestamp(as_of_date)].dropna().empty
+    )
+    if not is_today_rebal:
+        print(f"\n[INFO] 今日 ({as_of_date}) 非模型既定调仓日 (最近调仓信号日: {latest_rebal_date})。")
+        print(f"       将严格执行最低持仓锁定期 (min_holding_bars={min_holding_bars})，锁定未满期持仓，避免日内/隔日频繁反向开平仓。")
 
     # Check circuit breaker from account_state
     circuit_tier = account_state.get("circuit_breaker_tier")
@@ -778,23 +945,50 @@ def main():
         else:
             price = 1.0  # Cash proxy default
 
+        # Check tenure lock (prohibit premature selling before min_holding_bars)
+        held_age = holding_bars.get(sym, min_holding_bars)
+        is_circuit_halt = (circuit_tier == "TIER_3_HALT" or freeze_rem > 0)
+        is_tenure_locked = (held_age < min_holding_bars) and not is_circuit_halt
+
+        reason = ""
         # Determine action
         if sym == cash_proxy:
             action = "SWEEP_CASH" if delta_w > 0 else "RELEASE_CASH"
+            reason = "流动性闲置资金归集/释放"
         elif cur_w == 0.0 and tgt_w == 0.0:
             action = "NO_POSITION"   # not held, not targeted — skip entirely
         elif cur_w == 0.0 and tgt_w > 0.0:
             action = "BUY"           # fresh entry from zero — always a BUY, no inertia filter
+            reason = "策略模型新开仓信号"
         elif tgt_w <= 1e-6 and cur_w > 0.0:
-            action = "SELL"          # full liquidation exit — always SELL, never hold remnant
+            if is_tenure_locked:
+                action = "HOLD_FILTERED"
+                tgt_w = cur_w
+                delta_w = 0.0
+                abs_delta = 0.0
+                reason = f"未满最低持仓周期 (持仓 {held_age} 日 < 最低 {min_holding_bars} 日，锁定防洗盘)"
+            else:
+                action = "SELL"          # full liquidation exit — always SELL, never hold remnant
+                reason = "策略模型平仓信号 (已满最低持仓周期)"
         elif abs_delta < min_trade_thresh:
             action = "HOLD_FILTERED"  # user holds and change is below inertia threshold
+            reason = f"调仓未超惰性阈值 (< {min_trade_thresh:.0%})"
         elif delta_w <= -min_trade_thresh:
-            action = "SELL"
+            if is_tenure_locked:
+                action = "HOLD_FILTERED"
+                tgt_w = cur_w
+                delta_w = 0.0
+                abs_delta = 0.0
+                reason = f"未满最低持仓周期 (持仓 {held_age} 日 < 最低 {min_holding_bars} 日，锁定防洗盘)"
+            else:
+                action = "SELL"
+                reason = "策略模型减仓调仓"
         elif delta_w >= min_trade_thresh:
             action = "BUY"
+            reason = "策略模型加仓调仓"
         else:
             action = "HOLD"
+            reason = "最优目标权重维持"
 
         current_val = cur_w * args.portfolio_value
         trade_val = delta_w * args.portfolio_value
@@ -807,7 +1001,11 @@ def main():
             else current_shares_dict.get(sym, 0)
         )
         if sym != cash_proxy and price > 0:
-            if action == "BUY":
+            if action in ("HOLD_FILTERED", "HOLD"):
+                target_shares = current_shares
+                delta_shares = 0
+                actual_trade_val = 0.0
+            elif action == "BUY":
                 # Compute buy qty from trade delta value, round down to lot size
                 raw_buy_shares = trade_val / price
                 lot_buy_shares = int(np.floor(raw_buy_shares / sym_lot) * sym_lot)
@@ -854,7 +1052,31 @@ def main():
             "delta_shares": delta_shares,
             "trade_value": actual_trade_val,
             "trade_value_rmb": actual_trade_val,
+            "holding_bars": held_age if cur_w > 0 else 0,
+            "reason": reason,
         })
+
+    # Purchasing power constraint: total buys cannot exceed available cash + sales proceeds
+    initial_cash_val = current_series.get(cash_proxy, 0.0) * args.portfolio_value
+    total_sales_proceeds = abs(sum(r["trade_value"] for r in rows if r["action"] == "SELL" and r["symbol"] != cash_proxy))
+    available_purchasing_power = max(0.0, initial_cash_val + total_sales_proceeds)
+
+    total_desired_buys = sum(r["trade_value"] for r in rows if r["action"] == "BUY" and r["symbol"] != cash_proxy)
+    if total_desired_buys > available_purchasing_power and total_desired_buys > 0:
+        buy_scale = available_purchasing_power / total_desired_buys
+        print(f"\n[RISK ALERT / 购买力约束] 计划买入总额 (¥{total_desired_buys:,.2f}) 超过可用资金 (¥{available_purchasing_power:,.2f})。")
+        print(f"                       自动按购买力系数 {buy_scale:.2%} 调整买入股数，防止可用资金击穿。")
+        for r in rows:
+            if r["action"] == "BUY" and r["symbol"] != cash_proxy and r["price"] > 0:
+                sym_lot = resolve_lot_size(r["symbol"], args.lot_size)
+                scaled_val = r["trade_value"] * buy_scale
+                scaled_shares = int(np.floor(scaled_val / r["price"] / sym_lot) * sym_lot)
+                r["delta_shares"] = max(0, scaled_shares)
+                r["target_shares"] = r["current_shares"] + r["delta_shares"]
+                r["trade_value"] = r["delta_shares"] * r["price"]
+                r["trade_value_rmb"] = r["trade_value"]
+                r["target_weight"] = (r["target_shares"] * r["price"]) / args.portfolio_value
+                r["delta_weight"] = r["target_weight"] - r["current_weight"]
 
     order_df = pd.DataFrame(rows)
 
@@ -862,7 +1084,6 @@ def main():
     cash_mask = order_df["symbol"] == cash_proxy
     if cash_mask.any():
         equity_trades_val = order_df.loc[~cash_mask, "trade_value"].sum()
-        initial_cash_val = current_series.get(cash_proxy, 0.0) * args.portfolio_value
         actual_post_trade_cash = initial_cash_val - equity_trades_val
         actual_cash_weight = max(0.0, actual_post_trade_cash / args.portfolio_value)
         order_df.loc[cash_mask, "target_weight"] = actual_cash_weight
@@ -925,10 +1146,12 @@ def main():
         print("  今日无既有持仓需要维持。")
     else:
         for _, r in actual_holds.iterrows():
-            reason = f"调仓未超惰性阈值 (< {min_trade_thresh:.0%})" if r["action"] == "HOLD_FILTERED" else "最优目标权重维持"
+            reason = r.get("reason") or (f"调仓未超惰性阈值 (< {min_trade_thresh:.0%})" if r["action"] == "HOLD_FILTERED" else "最优目标权重维持")
             sym_col = pad_east_asian(f"{r['symbol']} ({r['name']})", 24)
             shares_info = f"({int(r['current_shares'])} 股)" if r['current_shares'] > 0 else ""
-            print(f"  ⚪ HOLD {sym_col} | 维持仓位: {r['target_weight']:>5.1%} {shares_info:<10} | 持仓市值: ~¥{r['target_weight']*args.portfolio_value:>9,.2f} | ({reason})")
+            h_bar = int(r.get("holding_bars", 0))
+            tenure_str = f" [持仓{h_bar}日]" if h_bar > 0 else ""
+            print(f"  ⚪ HOLD {sym_col} | 维持仓位: {r['target_weight']:>5.1%} {shares_info:<10}{tenure_str} | 持仓市值: ~¥{r['target_weight']*args.portfolio_value:>9,.2f} | ({reason})")
 
     if not cash_rows.empty:
         print("\n[PHASE 4: CASH PROXY & LIQUIDITY MANAGEMENT (第四阶段: 闲置资金对账)]")
@@ -936,12 +1159,52 @@ def main():
             sym_col = pad_east_asian(f"{r['symbol']} ({r['name']})", 24)
             print(f"  💰 CASH {sym_col} | 闲置现金: {r['target_weight']:>5.1%} (~¥{r['target_weight']*args.portfolio_value:>9,.2f}) | 停泊于 {r['symbol']} / 511880 / 国债逆回购")
 
-    # Save to CSV
+    # Update post-trade holdings and holding_bars
+    updated_holding_bars = {}
+    post_holdings = {}
+    for _, r in order_df.iterrows():
+        sym = r["symbol"]
+        if sym == cash_proxy:
+            continue
+        tgt_sh = int(r["target_shares"])
+        if tgt_sh > 0:
+            post_holdings[sym] = tgt_sh
+            if r["action"] == "BUY" and int(r["current_shares"]) == 0:
+                updated_holding_bars[sym] = 0
+            else:
+                updated_holding_bars[sym] = int(r.get("holding_bars", 1))
+
+    # Save to CSV and JSON
     os.makedirs(args.output_dir, exist_ok=True)
     out_csv = os.path.join(args.output_dir, "live_trading_ticket.csv")
     order_df.to_csv(out_csv, index=False)
+    out_json = os.path.join(args.output_dir, "live_trading_ticket.json")
+    try:
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump(order_df.to_dict(orient="records"), f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"[WARN] Failed to write live_trading_ticket.json: {e}")
     print("\n" + "=" * 110)
-    print(f"[SUCCESS] 交易指令单已导出至: {out_csv}")
+    print(f"[SUCCESS] 交易指令单已导出至: {out_csv} 及 {out_json}")
+
+    # Save post_holdings.json if output_dir is given
+    post_holdings_path = os.path.join(args.output_dir, "post_holdings.json")
+    try:
+        with open(post_holdings_path, "w", encoding="utf-8") as f:
+            json.dump(post_holdings, f, indent=2, ensure_ascii=False)
+        print(f"[SUCCESS] 预测持仓已导出至: {post_holdings_path}")
+    except Exception as e:
+        print(f"[WARN] Failed to write post_holdings.json: {e}")
+
+    # Persist updated holding_bars into account_state.json if available
+    if args.account_state_file:
+        account_state["holding_bars"] = updated_holding_bars
+        try:
+            with open(args.account_state_file, "w", encoding="utf-8") as f:
+                json.dump(account_state, f, indent=2, ensure_ascii=False)
+            print(f"[SUCCESS] 账户状态持仓周期已更新至: {args.account_state_file}")
+        except Exception as e:
+            print(f"[WARN] Failed to update account state file: {e}")
     print("=" * 110)
 
 
