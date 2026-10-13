@@ -1,0 +1,40 @@
+[
+  {
+    "symbol": "601088.SH",
+    "name": "中国神华",
+    "action": "BUY",
+    "price": 85.48649287765801,
+    "current_weight": 0.0,
+    "target_weight": 0.085486492877658,
+    "delta_weight": 0.085486492877658,
+    "current_shares": 0,
+    "target_shares": 100,
+    "delta_shares": 100,
+    "trade_value": 8548.6492877658,
+    "trade_value_rmb": 8548.6492877658,
+    "gross_buy_shares": 0,
+    "gross_sell_shares": 0,
+    "crossed_shares": 0,
+    "holding_bars": 0,
+    "reason": "多策略协同新开仓"
+  },
+  {
+    "symbol": "BIL",
+    "name": "现金及现金管理工具",
+    "action": "RELEASE_CASH",
+    "price": 1.0,
+    "current_weight": 1.0,
+    "target_weight": 0.914513507122342,
+    "delta_weight": -0.08548649287765797,
+    "current_shares": 100000,
+    "target_shares": 91451,
+    "delta_shares": -8549,
+    "trade_value": 8548.649287765802,
+    "trade_value_rmb": 8548.649287765802,
+    "gross_buy_shares": 0,
+    "gross_sell_shares": 0,
+    "crossed_shares": 0,
+    "holding_bars": 999,
+    "reason": "多策略净额化流动性资金归集/释放"
+  }
+]

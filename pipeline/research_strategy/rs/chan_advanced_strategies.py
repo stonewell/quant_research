@@ -69,6 +69,7 @@ try:
         ChanRiskManagedBlendStrategy,
         ChanFourStateBlendStrategy,
         ChanCrisisShieldBlendStrategy,
+        ChanFourStateShieldBlendStrategy,
         ChanDualHybridBlendStrategy,
         GenericBlendStrategy,
         CHINA_EQUITY_SECTORS,
@@ -81,6 +82,7 @@ except ImportError:
         ChanRiskManagedBlendStrategy,
         ChanFourStateBlendStrategy,
         ChanCrisisShieldBlendStrategy,
+        ChanFourStateShieldBlendStrategy,
         ChanDualHybridBlendStrategy,
         GenericBlendStrategy,
         CHINA_EQUITY_SECTORS,
@@ -536,6 +538,7 @@ def run_four_state_position_loop(
     b1_buffer_pct: float = 0.03,
     cooldown_bars: int = 0,
     two_stage_entry: bool = False,
+    min_entry_bars: int = 1,
 ) -> np.ndarray:
     """Stateful 4-state execution position loop for Chan theory trading:
     Implements a deterministic finite state machine (FSM) following Chan Lessons 11-14, 16, 20, 53:
@@ -587,6 +590,9 @@ def run_four_state_position_loop(
     structural_stop = -np.inf
     cooldown_until = -1
     stage2_confirmed = False
+    pending_entry_bars = 0
+    pending_buy_type = "1B"
+    pending_inv_stop = -np.inf
 
     for i in range(n):
         p = close_arr[i]
@@ -679,44 +685,79 @@ def run_four_state_position_loop(
         else:
             # Check re-entry cooldown
             if i < cooldown_until:
+                pending_entry_bars = 0
                 raw[i] = 0.0
                 continue
+
+            # If we had a pending entry candidate from prior bar:
+            if pending_entry_bars > 0:
+                eval_p = close_arr[i] if stop_evaluation_mode == "close" else eval_low
+                struct_failed = (pending_inv_stop > -np.inf and eval_p < pending_inv_stop)
+                sell_fired = bool(sell_arr[i])
+                if struct_failed or sell_fired:
+                    # Invalidation / false alarm: abort entry!
+                    pending_entry_bars = 0
+                    raw[i] = 0.0
+                    continue
+                else:
+                    # Confirmed! Enter position on bar i
+                    in_position = True
+                    entry_idx = i
+                    entry_price = p
+                    entry_buy_type = pending_buy_type
+                    structural_stop = pending_inv_stop
+                    bars_in_zs = 0
+                    pending_entry_bars = 0
+                    stage2_confirmed = False
+                    raw[i] = (position_size_pct * 0.50) if two_stage_entry else position_size_pct
+                    continue
 
             b1 = b1_arr[i]
             b2 = b2_arr[i]
             b3 = b3_arr[i]
 
             if not (b1 or b2 or b3):
+                pending_entry_bars = 0
                 raw[i] = 0.0
                 continue
 
             # MA filter on entry: for 3B breakouts, require MA5 >= MA20 (bullish arrangement)
             if use_ma_filter and ma5_arr is not None and ma20_arr is not None:
                 if b3 and not (b1 or b2) and ma5_arr[i] < ma20_arr[i]:
+                    pending_entry_bars = 0
                     raw[i] = 0.0
                     continue
 
             # Deterministic structural invalidation stop price & buy type tracking
             if b3:
                 inv_stop = (curr_zg * (1.0 - zg_tolerance_pct)) if curr_zg is not None else (eval_low * (1.0 - (stop_loss_pct or 0.08)))
-                entry_buy_type = "3B"
+                cand_buy_type = "3B"
             elif b2:
                 inv_stop = curr_dd if curr_dd is not None else (eval_low * (1.0 - (stop_loss_pct or 0.08)))
-                entry_buy_type = "2B"
+                cand_buy_type = "2B"
             else:
                 # 1B entry: apply b1_buffer_pct cushion below fractal bar low to absorb secondary undercut wicks
                 inv_stop = eval_low * (1.0 - b1_buffer_pct)
-                entry_buy_type = "1B"
+                cand_buy_type = "1B"
 
             if stop_loss_pct is not None:
-                structural_stop = max(inv_stop, p * (1.0 - stop_loss_pct))
-            else:
-                structural_stop = inv_stop
+                inv_stop = max(inv_stop, p * (1.0 - stop_loss_pct))
 
+            # Entry persistence confirmation filter ("avoid 1-day trading by not entering"):
+            if min_entry_bars > 1:
+                pending_entry_bars = 1
+                pending_buy_type = cand_buy_type
+                pending_inv_stop = inv_stop
+                raw[i] = 0.0
+                continue
+
+            entry_buy_type = cand_buy_type
+            structural_stop = inv_stop
             in_position = True
             entry_idx = i
             entry_price = p
             bars_in_zs = 0
+            pending_entry_bars = 0
             stage2_confirmed = False
             raw[i] = (position_size_pct * 0.50) if two_stage_entry else position_size_pct
 
@@ -1591,6 +1632,7 @@ class ChanFourStateExecutionStrategy(AllocationTemplate):
         adx_filter = bool(p.get("chan_fse_adx_filter", getattr(cfg, "chan_fse_adx_filter", True)))
         adx_threshold = float(p.get("chan_fse_adx_threshold", getattr(cfg, "chan_fse_adx_threshold", 20.0)))
         adx_period = int(p.get("chan_fse_adx_period", getattr(cfg, "chan_fse_adx_period", 14)))
+        min_entry_bars = int(p.get("chan_fse_min_entry_bars", getattr(cfg, "chan_fse_min_entry_bars", 2)))
 
         symbols = list(universe.keys())
         risky_symbols = _get_risky_symbols_helper(universe, params, cfg_symbol=None, cfg_risky_universe=None, cash_proxy=cash_proxy)
@@ -1667,6 +1709,7 @@ class ChanFourStateExecutionStrategy(AllocationTemplate):
                 b1_buffer_pct=b1_buffer_pct,
                 cooldown_bars=cooldown_bars,
                 two_stage_entry=two_stage_entry,
+                min_entry_bars=min_entry_bars,
             )
 
         daily = pd.DataFrame(raw_weights, index=master_index)
@@ -1718,12 +1761,14 @@ class ChanFourStateExecutionStrategy(AllocationTemplate):
         two_stage = bool(p.get("chan_fse_two_stage_entry", getattr(cfg, "chan_fse_two_stage_entry", True)))
         adx_filt = bool(p.get("chan_fse_adx_filter", getattr(cfg, "chan_fse_adx_filter", True)))
         adx_th = float(p.get("chan_fse_adx_threshold", getattr(cfg, "chan_fse_adx_threshold", 20.0)))
+        min_entry = int(p.get("chan_fse_min_entry_bars", getattr(cfg, "chan_fse_min_entry_bars", 2)))
         return (
             f"Chan Four-State Operational Execution Strategy (chan_four_state_execution): "
             f"industrial-grade Chan execution FSM with deterministic structural invalidation stops "
             f"({mode}-confirmed, 1B fractal low with 3% buffer, 2B dd swing low, 3B zg breakout pivot), "
             f"ratcheting trailing stop to ZG ({zg_tol:.1%} buffer), MA entanglement warning filter, "
             f"{'ADX trend strength gate (threshold ' + f'{adx_th:.0f}' + '), ' if adx_filt else ''}"
+            f"{f'{min_entry}d entry confirmation gate, ' if min_entry > 1 else ''}"
             f"max single position {max_pos:.0%}, fallback stop-loss {stop_loss:.0%}, {cd}d re-entry cooldown, "
             f"{'two-stage scaling sizing, ' if two_stage else ''}"
             f"and {'zero consolidation drag with ' + str(min_hold) + 'd gestation buffer (Lesson 16)' if exit_cons else 'standard consolidation hold'}."

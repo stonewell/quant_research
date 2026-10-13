@@ -219,9 +219,9 @@ def resolve_blend_param(
     param_type: Optional[type] = None,
 ) -> Any:
     """Resolve configuration parameter across blend strategy prefix variants:
-    cfsb_*, crb_*, ccsb_*, cdhb_*, blend_*, or direct un-prefixed name.
+    cfsb_*, crb_*, ccsb_*, cfssb_*, cdhb_*, blend_*, or direct un-prefixed name.
     """
-    for prefix in ("cfsb", "crb", "ccsb", "cdhb", "blend"):
+    for prefix in ("cfsb", "crb", "ccsb", "cfssb", "cdhb", "blend"):
         k = f"{prefix}_{name}"
         if k in params:
             val = params[k]
@@ -250,6 +250,30 @@ def resolve_trade_inertia_threshold(params: Dict[str, Any], default: float = 0.0
         if (k.endswith("_min_weight_change") or k.endswith("_min_weight_pct")) and v is not None:
             return float(v)
     return float(default)
+
+
+def resolve_min_entry_bars(
+    params: Dict[str, Any],
+    cli_override: Optional[int] = None,
+    default: int = 2,
+) -> int:
+    """Resolve minimum entry confirmation bars threshold across all strategies.
+
+    Precedence:
+    1. Direct CLI override (--min-entry-bars)
+    2. Strategy parameter via resolve_blend_param (cfsb_min_entry_bars, cfssb_min_entry_bars, etc., or min_entry_bars)
+    3. Strategy parameter matching ending with '_min_entry_bars'
+    4. Fallback default (2).
+    """
+    if cli_override is not None:
+        return max(1, int(cli_override))
+    val = resolve_blend_param(params, "min_entry_bars", None, int)
+    if val is not None:
+        return max(1, int(val))
+    for k, v in params.items():
+        if k.endswith("_min_entry_bars") and v is not None:
+            return max(1, int(v))
+    return int(default)
 
 
 def resolve_min_holding_bars(
@@ -586,6 +610,12 @@ def parse_args(args: Optional[List[str]] = None):
         help="Trading lot size for buy order rounding (default: auto-detect 100 for A-shares, 1 for US, board lots for HK)",
     )
     parser.add_argument(
+        "--min-entry-bars",
+        type=int,
+        default=None,
+        help="Minimum continuous signal confirmation bars before initial entry (default: resolved from strategy config or 2)",
+    )
+    parser.add_argument(
         "--min-holding-bars",
         type=int,
         default=None,
@@ -801,6 +831,9 @@ def main():
     # Universal inertia / turnover threshold and holding tenure constraints
     min_trade_thresh = resolve_trade_inertia_threshold(params, default=0.05)
     min_holding_bars = resolve_min_holding_bars(params, args.min_holding_bars, default=2)
+    min_entry_bars = resolve_min_entry_bars(params, args.min_entry_bars, default=2)
+    if args.min_entry_bars is not None:
+        params["min_entry_bars"] = min_entry_bars
 
     # Build descriptive engine banner information
     engine_parts = []
@@ -812,6 +845,7 @@ def main():
         engine_parts.append(f"波动率模型={vm}")
     if "rebalance_freq_days" in params:
         engine_parts.append(f"调仓周期={params['rebalance_freq_days']}日")
+    engine_parts.append(f"买入确认={min_entry_bars}日")
     engine_parts.append(f"最低持仓={min_holding_bars}日")
     engine_parts.append(f"惰性过滤={min_trade_thresh:.1%}")
     engine_info = " | ".join(engine_parts)

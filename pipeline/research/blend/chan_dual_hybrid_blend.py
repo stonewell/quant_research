@@ -192,6 +192,7 @@ class ChanDualHybridBlendStrategy(BaseBlendAllocationStrategy):
             sleeve_desc += f", Alpha#{a3_id} (5%), Alpha#{a4_id} (5%)"
 
         vol_name = "Garman-Klass" if vol_m == "garman_klass" else vol_m.replace('_', ' ').title()
+        min_entry = int(self.resolve_param(p, "min_entry_bars", getattr(cfg, "cdhb_min_entry_bars", 2), int))
 
         return (
             f"Chan Dual Hybrid Alpha Blend Strategy (chan_dual_hybrid_blend): "
@@ -199,7 +200,9 @@ class ChanDualHybridBlendStrategy(BaseBlendAllocationStrategy):
             f"chan_three_type ({three_w:.0%}), and {sleeve_desc} "
             f"with hard position cap ({max_pos:.0%} max per stock), "
             f"drawdown circuit breakers (smooth damping from 10%, defensive VAA at 15%, stop at 20% with fast recovery & 15d auto-heal), "
-            f"turnover filter (min trade change {min_chg:.0%}), volatility targeting ({t_vol:.0%} target vol via {vol_name}), "
+            f"turnover filter (min trade change {min_chg:.0%}), "
+            f"{f'{min_entry}d entry confirmation gate, ' if min_entry > 1 else ''}"
+            f"volatility targeting ({t_vol:.0%} target vol via {vol_name}), "
             f"and {stop_m} stop ({stop_mult:.1f}x ATR)."
         )
 

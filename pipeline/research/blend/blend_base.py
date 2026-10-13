@@ -447,6 +447,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         min_weight_change = self.resolve_param(p, "min_weight_change", 0.05, float)
         entry_thresh = self.resolve_param(p, "entry_threshold", 0.03, float)
         min_holding_bars = self.resolve_param(p, "min_holding_bars", 2, int)
+        min_entry_bars = self.resolve_param(p, "min_entry_bars", 2, int)
         thrust_incumbent_bonus = self.resolve_param(p, "thrust_incumbent_bonus", 1.20, float)
         dd_reduce_thresh = self.resolve_param(p, "dd_reduce_thresh", 0.10, float)
         dd_defensive_thresh = self.resolve_param(p, "dd_defensive_thresh", 0.15, float)
@@ -610,6 +611,8 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         asset_cooldown_until = {s: 0 for s in risky_symbols}
         asset_entry_price = {s: None for s in risky_symbols}
         asset_peak_price = {s: None for s in risky_symbols}
+        entry_signal_bars = {s: 0 for s in risky_symbols}
+        expansion_signal_bars = {s: 0 for s in risky_symbols}
 
         for t in range(len(master_index)):
             date = master_index[t]
@@ -975,6 +978,37 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                     raw_w[s] = 0.0
                 elif raw_w[s] > effective_cap:
                     raw_w[s] = effective_cap
+
+            # Pre-emptive Entry Confirmation Filter ("avoid 1-day trading by not entering")
+            if min_entry_bars > 1:
+                prev_date_w = master_index[t - 1] if t > 0 else None
+                for s in risky_symbols:
+                    prev_w = float(daily_weights.loc[prev_date_w, s]) if prev_date_w is not None else 0.0
+                    target_w = float(raw_w[s])
+
+                    # 1. New position entry filter (prev_w <= 1e-4):
+                    # Requires signal to persist for at least min_entry_bars consecutive trading days
+                    # before opening the position. Single-day transient spikes are suppressed to 0.0.
+                    if prev_w <= 1e-4:
+                        if target_w >= entry_thresh:
+                            entry_signal_bars[s] += 1
+                            if entry_signal_bars[s] < min_entry_bars:
+                                raw_w[s] = 0.0  # Pending confirmation on Day 1; do NOT enter!
+                        else:
+                            entry_signal_bars[s] = 0
+                            raw_w[s] = 0.0
+
+                    # 2. Incremental expansion filter on existing positions:
+                    # If target demands significant expansion (>= min_weight_change), require persistence
+                    # so 1-day thrust spikes don't pump and dump existing holdings.
+                    else:
+                        entry_signal_bars[s] = min_entry_bars  # Incumbent position has confirmed entry
+                        if target_w - prev_w >= min_weight_change:
+                            expansion_signal_bars[s] += 1
+                            if expansion_signal_bars[s] < min_entry_bars:
+                                raw_w[s] = prev_w  # Suppress expansion until confirmed for min_entry_bars
+                        else:
+                            expansion_signal_bars[s] = 0
 
             tot_risky = float(raw_w[risky_symbols].sum())
             if tot_risky > 1.0:

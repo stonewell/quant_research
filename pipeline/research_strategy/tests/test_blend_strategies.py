@@ -34,6 +34,7 @@ from pipeline.research.blend import (
     ChanCrisisShieldBlendStrategy,
     ChanDualHybridBlendStrategy,
     ChanFourStateBlendStrategy,
+    ChanFourStateShieldBlendStrategy,
     ChanRiskManagedBlendStrategy,
     GenericBlendStrategy,
 )
@@ -69,6 +70,7 @@ def test_base_blend_reexport_and_aliases():
     assert issubclass(ChanRiskManagedBlendStrategy, BaseBlendAllocationStrategy)
     assert issubclass(ChanFourStateBlendStrategy, BaseBlendAllocationStrategy)
     assert issubclass(ChanCrisisShieldBlendStrategy, BaseBlendAllocationStrategy)
+    assert issubclass(ChanFourStateShieldBlendStrategy, BaseBlendAllocationStrategy)
     assert issubclass(ChanDualHybridBlendStrategy, BaseBlendAllocationStrategy)
     assert issubclass(GenericBlendStrategy, BaseBlendAllocationStrategy)
 
@@ -78,6 +80,7 @@ def test_blend_strategy_class_map_registration():
     assert "ChanRiskManagedBlendStrategy" in STRATEGY_CLASS_MAP
     assert "ChanFourStateBlendStrategy" in STRATEGY_CLASS_MAP
     assert "ChanCrisisShieldBlendStrategy" in STRATEGY_CLASS_MAP
+    assert "ChanFourStateShieldBlendStrategy" in STRATEGY_CLASS_MAP
     assert "ChanDualHybridBlendStrategy" in STRATEGY_CLASS_MAP
 
 
@@ -98,19 +101,31 @@ def test_default_institutional_settings_on_all_blend_strategies():
     assert cfg.ccsb_vol_model == "garman_klass"
     assert cfg.ccsb_stop_mode == "atr_trailing"
     assert cfg.ccsb_adaptive_inertia is True
+    assert cfg.cfssb_vol_model == "garman_klass"
+    assert cfg.cfssb_stop_mode == "atr_trailing"
+    assert cfg.cfssb_adaptive_inertia is True
     assert cfg.cdhb_vol_model == "garman_klass"
     assert cfg.cdhb_stop_mode == "atr_trailing"
     assert cfg.cdhb_adaptive_inertia is True
     assert cfg.blend_min_holding_bars == 2
+    assert cfg.blend_min_entry_bars == 2
     assert cfg.blend_thrust_incumbent_bonus == 1.20
     assert cfg.crb_min_holding_bars == 2
+    assert cfg.crb_min_entry_bars == 2
     assert cfg.crb_thrust_incumbent_bonus == 1.20
     assert cfg.cfsb_min_holding_bars == 2
+    assert cfg.cfsb_min_entry_bars == 2
     assert cfg.cfsb_thrust_incumbent_bonus == 1.20
     assert cfg.ccsb_min_holding_bars == 2
+    assert cfg.ccsb_min_entry_bars == 2
     assert cfg.ccsb_thrust_incumbent_bonus == 1.20
+    assert cfg.cfssb_min_holding_bars == 2
+    assert cfg.cfssb_min_entry_bars == 2
+    assert cfg.cfssb_thrust_incumbent_bonus == 1.20
     assert cfg.cdhb_min_holding_bars == 2
+    assert cfg.cdhb_min_entry_bars == 2
     assert cfg.cdhb_thrust_incumbent_bonus == 1.20
+    assert cfg.chan_fse_min_entry_bars == 2
 
     # Check instantiated strategy objects
     s_crb = ChanRiskManagedBlendStrategy()
@@ -118,17 +133,30 @@ def test_default_institutional_settings_on_all_blend_strategies():
     assert s_crb.resolve_param({}, "stop_mode", "wrong") == "atr_trailing"
     assert s_crb.resolve_param({}, "adaptive_inertia", False) is True
     assert s_crb.resolve_param({}, "min_holding_bars", 0) == 2
+    assert s_crb.resolve_param({}, "min_entry_bars", 0) == 2
     assert s_crb.resolve_param({}, "thrust_incumbent_bonus", 1.0) == 1.20
 
     s_cfsb = ChanFourStateBlendStrategy()
     assert s_cfsb.resolve_param({}, "vol_model", "wrong") == "garman_klass"
     assert s_cfsb.resolve_param({}, "stop_mode", "wrong") == "atr_trailing"
     assert s_cfsb.resolve_param({}, "adaptive_inertia", False) is True
+    assert s_cfsb.resolve_param({}, "min_holding_bars", 0) == 2
+    assert s_cfsb.resolve_param({}, "min_entry_bars", 0) == 2
 
     s_ccsb = ChanCrisisShieldBlendStrategy()
     assert s_ccsb.resolve_param({}, "vol_model", "wrong") == "garman_klass"
     assert s_ccsb.resolve_param({}, "stop_mode", "wrong") == "atr_trailing"
     assert s_ccsb.resolve_param({}, "adaptive_inertia", False) is True
+    assert s_ccsb.resolve_param({}, "min_holding_bars", 0) == 2
+    assert s_ccsb.resolve_param({}, "min_entry_bars", 0) == 2
+
+    s_cfssb = ChanFourStateShieldBlendStrategy()
+    assert s_cfssb.resolve_param({}, "vol_model", "wrong") == "garman_klass"
+    assert s_cfssb.resolve_param({}, "stop_mode", "wrong") == "atr_trailing"
+    assert s_cfssb.resolve_param({}, "adaptive_inertia", False) is True
+    assert s_cfssb.resolve_param({}, "min_holding_bars", 0) == 2
+    assert s_cfssb.resolve_param({}, "min_entry_bars", 0) == 2
+    assert s_cfssb.resolve_param({}, "thrust_incumbent_bonus", 1.0) == 1.20
 
     s_cdhb = ChanDualHybridBlendStrategy()
     assert s_cdhb.resolve_param({}, "vol_model", "wrong") == "garman_klass"
@@ -178,6 +206,7 @@ def test_all_blend_strategies_sparse_weights_contract():
         ChanRiskManagedBlendStrategy(),
         ChanFourStateBlendStrategy(),
         ChanCrisisShieldBlendStrategy(),
+        ChanFourStateShieldBlendStrategy(),
         ChanDualHybridBlendStrategy(),
         GenericBlendStrategy(),
     ]
@@ -264,6 +293,7 @@ def test_instantiate_blend_strategies_from_config_entry():
     class_map = {
         "chan_risk_managed_blend": "ChanRiskManagedBlendStrategy",
         "chan_four_state_blend": "ChanFourStateBlendStrategy",
+        "chan_four_state_shield_blend": "ChanFourStateShieldBlendStrategy",
         "chan_crisis_shield_blend": "ChanCrisisShieldBlendStrategy",
         "chan_dual_hybrid_blend": "ChanDualHybridBlendStrategy",
     }
@@ -279,6 +309,41 @@ def test_instantiate_blend_strategies_from_config_entry():
         assert isinstance(inst, BaseBlendAllocationStrategy)
         assert inst.name == strat_name
         assert inst.warmup_bars() >= 200
+
+
+def test_chan_four_state_shield_blend_strategy_sub_strategies_and_regimes():
+    """Verify ChanFourStateShieldBlendStrategy correctly builds its 4 sub-strategies and adapts regime weights."""
+    universe = create_mock_universe(n_days=270)
+    strat = ChanFourStateShieldBlendStrategy()
+    sub_strats = strat.get_sub_strategies(universe)
+    assert set(sub_strats.keys()) == {"chan_three_type", "chan_vaa_compound", "chan_four_state", "wq_alpha12"}
+
+    # Base weights
+    base_w = strat.get_sub_strategy_weights()
+    assert abs(sum(base_w.values()) - 1.0) < 1e-5
+    assert base_w["chan_three_type"] == 0.35
+    assert base_w["chan_vaa_compound"] == 0.25
+    assert base_w["chan_four_state"] == 0.20
+    assert base_w["wq_alpha12"] == 0.20
+
+    # Bull regime
+    bull_w = strat.compute_regime_weights(base_w, breadth=0.70, thrust=0.65, date="2020-05-01")
+    assert bull_w["chan_three_type"] == 0.40
+    assert bull_w["chan_four_state"] == 0.25
+    assert bull_w["chan_vaa_compound"] == 0.15
+    assert bull_w["wq_alpha12"] == 0.20
+
+    # Bear regime
+    bear_w = strat.compute_regime_weights(base_w, breadth=0.20, thrust=0.30, date="2020-05-01")
+    assert bear_w["chan_vaa_compound"] == 0.35
+    assert bear_w["wq_alpha12"] == 0.25
+    assert bear_w["chan_three_type"] == 0.25
+    assert bear_w["chan_four_state"] == 0.15
+
+    # Weights explanation
+    exp = strat.explain_weights()
+    assert "Alpha#12" in exp
+    assert "chan_four_state_execution" in exp
 
 
 def test_base_blend_rolling_ic_ir_weighting():
@@ -504,5 +569,93 @@ def test_blend_strategy_no_one_day_trades_in_backtest():
                     one_day_holds += 1
 
     assert one_day_holds == 0, f"Expected 0 one-day holding trades, found {one_day_holds}"
+
+
+def test_chan_four_state_blend_no_one_day_trades_in_backtest():
+    """Integration test verifying that ChanFourStateBlendStrategy produces 0 one-day holding trades."""
+    mock_universe = create_mock_universe(120)
+    cfg = StrategyConfig()
+    cfg.cfsb_min_holding_bars = 2
+    cfg.cfsb_min_entry_bars = 2
+
+    strat = ChanFourStateBlendStrategy(cfg)
+    sparse_w = strat.generate_weights(mock_universe)
+    assert not sparse_w.empty
+
+    dense_w = sparse_w.ffill().fillna(0.0)
+    risky_symbols = [s for s in sparse_w.columns if s != "BIL"]
+
+    one_day_holds = 0
+    for sym in risky_symbols:
+        held = (dense_w[sym] > 1e-4).astype(int)
+        diff = held.diff().fillna(held.iloc[0])
+        entries = held.index[diff == 1].tolist()
+        exits = held.index[diff == -1].tolist()
+
+        for entry_dt in entries:
+            future_exits = [ex for ex in exits if ex > entry_dt]
+            if future_exits:
+                exit_dt = future_exits[0]
+                bars_held = len(dense_w.loc[entry_dt:exit_dt]) - 1
+                if bars_held == 1:
+                    one_day_holds += 1
+
+    assert one_day_holds == 0, f"Expected 0 one-day holding trades in ChanFourStateBlendStrategy, found {one_day_holds}"
+
+
+def test_chan_fse_min_entry_bars_fsm_confirmation():
+    """Validates that ChanFourStateExecutionStrategy's FSM confirms entry on bar 2 and aborts on invalidation."""
+    from pipeline.research_strategy.rs.chan_advanced_strategies import run_four_state_position_loop
+
+    n = 5
+    # Scenario A: Bar 1 triggers 1B at 10.0, but bar 2 plunges to 9.0 (below 8% stop) -> invalidation aborts entry!
+    close_fail = np.array([10.0, 10.0, 9.0, 9.0, 9.0])
+    b1_signal = np.array([False, True, False, False, False])
+    f = np.zeros(n, dtype=bool)
+
+    raw_aborted = run_four_state_position_loop(
+        close=close_fail, first_buy=b1_signal, second_buy=f, third_buy=f, sell_signal=f,
+        min_entry_bars=2, stop_loss_pct=0.08,
+    )
+    assert np.all(raw_aborted == 0.0), f"Expected 0.0 allocation on aborted entry, got {raw_aborted}"
+
+    # Scenario B: Bar 1 triggers 1B at 10.0, bar 2 holds at 10.2 -> confirmation succeeds on bar 2!
+    close_hold = np.array([10.0, 10.0, 10.2, 10.5, 10.6])
+    raw_confirmed = run_four_state_position_loop(
+        close=close_hold, first_buy=b1_signal, second_buy=f, third_buy=f, sell_signal=f,
+        min_entry_bars=2, stop_loss_pct=0.08,
+    )
+    assert raw_confirmed[0] == 0.0
+    assert raw_confirmed[1] == 0.0  # Pending confirmation on Day 1 (not entered yet!)
+    assert raw_confirmed[2] > 0.0   # Confirmed entry on Day 2!
+    assert raw_confirmed[3] > 0.0   # Held on Day 3
+
+
+def test_apply_asset_inertia_day0_and_incremental_protection():
+    """Validates that apply_asset_inertia with min_holding_bars=2 protects both Day-0 entries and incremental add-ons from 1-day sells."""
+    from common.allocation_templates import apply_asset_inertia
+
+    dates = pd.bdate_range("2020-01-01", periods=4)
+
+    # 1. Day 0 entry protection
+    daily_day0 = pd.DataFrame({
+        "S1": [0.20, 0.0, 0.0, 0.0],
+        "CASH": [0.80, 1.0, 1.0, 1.0],
+    }, index=dates)
+    res_day0 = apply_asset_inertia(daily_day0, min_weight_change=0.05, cash_proxy="CASH", min_holding_bars=2)
+    assert res_day0.loc[dates[0], "S1"] == 0.20
+    assert res_day0.loc[dates[1], "S1"] == 0.20  # Day 1 sale was SUPPRESSED!
+    assert res_day0.loc[dates[2], "S1"] == 0.0   # Day 2 sale was allowed!
+
+    # 2. Incremental add-on protection
+    daily_addon = pd.DataFrame({
+        "S1": [0.05, 0.15, 0.05, 0.05],
+        "CASH": [0.95, 0.85, 0.95, 0.95],
+    }, index=dates)
+    res_addon = apply_asset_inertia(daily_addon, min_weight_change=0.05, cash_proxy="CASH", min_holding_bars=2)
+    assert res_addon.loc[dates[1], "S1"] == 0.15  # Bought add-on at Day 1
+    assert res_addon.loc[dates[2], "S1"] == 0.15  # Day 2 reduction is SUPPRESSED!
+    assert res_addon.loc[dates[3], "S1"] == 0.05  # Day 3 reduction is allowed!
+
 
 

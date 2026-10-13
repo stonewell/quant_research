@@ -398,3 +398,132 @@ class ExecutionService:
             "account_state": state_data,
             "holdings": effective_holdings,
         }
+
+    def run_multi_strategy_netted_deploy(
+        self,
+        matrix_id: str = "tri_core_blend",
+        strategies: Optional[List[Dict[str, Any]]] = None,
+        universe_file: Optional[str] = None,
+        custom_symbols: Optional[List[str]] = None,
+        as_of_date: Optional[str] = None,
+        portfolio_value: float = 100000.0,
+        current_holdings: Optional[Dict[str, Any]] = None,
+        data_provider: Optional[str] = None,
+        min_holding_bars: int = 2,
+        inertia_threshold: float = 0.05,
+    ) -> Dict[str, Any]:
+        """Execute Multi-Strategy Order Netting & Live Deployment."""
+        provider = data_provider or self.storage.default_data_provider or "synthetic"
+        val_date = as_of_date or date.today().isoformat()
+        run_dir = self.storage.get_multi_netting_run_dir(matrix_id, val_date)
+        os.makedirs(run_dir, exist_ok=True)
+
+        univ_path = self._resolve_universe(universe_file, custom_symbols, run_dir)
+
+        # Resolve strategy pairs
+        strat_args = []
+        if strategies and isinstance(strategies, list):
+            for s in strategies:
+                k = s.get("strategy_key") or s.get("key")
+                w = s.get("capital_weight", 1.0)
+                if k:
+                    strat_args.append(f"{k}:{w}")
+        else:
+            # Fall back to configured matrix
+            cfgs = self.storage.get_multi_strategy_configs()
+            target_cfg = next((c for c in cfgs if c.get("matrix_id") == matrix_id), cfgs[0] if cfgs else None)
+            if target_cfg and "strategies" in target_cfg:
+                for s in target_cfg["strategies"]:
+                    strat_args.append(f"{s['strategy_key']}:{s.get('capital_weight', 1.0)}")
+            else:
+                strat_args = [
+                    "chan_crisis_shield_blend:0.40",
+                    "chan_risk_managed_blend:0.35",
+                    "chan_four_state_shield_blend:0.25",
+                ]
+
+        # Resolve holdings
+        if current_holdings is not None:
+            effective_holdings = current_holdings
+        else:
+            effective_holdings = self.storage.get_holdings(date_str=val_date)
+
+        holdings_file = os.path.join(run_dir, "holdings.json")
+        self.storage._save_json(holdings_file, effective_holdings or {"BIL": portfolio_value})
+
+        cmd = [
+            self.storage.python_executable,
+            self.storage.multi_netting_script,
+            "--strategies", *strat_args,
+            "--universe-file", univ_path,
+            "--as-of-date", val_date,
+            "--portfolio-value", str(portfolio_value),
+            "--current-holdings-file", holdings_file,
+            "--output-dir", run_dir,
+            "--data-provider", provider,
+            "--min-holding-bars", str(min_holding_bars),
+            "--inertia-threshold", str(inertia_threshold),
+        ]
+        if self.storage.cache_dir:
+            cmd.extend(["--cache-dir", self.storage.cache_dir])
+
+        print(f"[ExecutionService] Running Multi-Strategy Netting Deploy: {' '.join(cmd)}")
+        proc = subprocess.run(
+            cmd,
+            cwd=self.storage.repo_root,
+            env=self._get_subprocess_env(),
+            capture_output=True,
+            text=True,
+        )
+
+        stdout = proc.stdout
+        stderr = proc.stderr
+        success = proc.returncode == 0
+
+        # Load generated netting artifacts
+        ticket_json_file = os.path.join(run_dir, "netted_trading_ticket.json")
+        savings_json_file = os.path.join(run_dir, "friction_savings_report.json")
+        ledgers_json_file = os.path.join(run_dir, "sub_ledgers.json")
+
+        ticket_records = self.storage._load_json(ticket_json_file, default=[])
+        savings_data = self.storage._load_json(savings_json_file, default={})
+        ledgers_data = self.storage._load_json(ledgers_json_file, default={})
+
+        if ticket_records and isinstance(ticket_records, list):
+            for r in ticket_records:
+                if isinstance(r, dict) and is_placeholder_stock_name(r.get("name"), r.get("symbol")):
+                    r["name"] = get_stock_name(r.get("symbol"), r.get("symbol"))
+
+        # Update summary.json
+        summary_file = os.path.join(run_dir, "summary.json")
+        summary = {
+            "timestamp": datetime.now().isoformat(),
+            "date": val_date,
+            "matrix_id": matrix_id,
+            "universe_file": univ_path,
+            "portfolio_value": portfolio_value,
+            "data_provider": provider,
+            "deploy_status": "SUCCESS" if success else "FAILED",
+            "deploy_returncode": proc.returncode,
+            "deploy_stdout": stdout,
+            "deploy_stderr": stderr,
+            "friction_savings": savings_data,
+            "strategies": strat_args,
+            "trades_count": len([r for r in ticket_records if r.get("action") in ("BUY", "SELL")]),
+        }
+        self.storage._save_json(summary_file, summary)
+
+        return {
+            "status": "success" if success else "error",
+            "message": "Multi-Strategy Netting Deploy executed successfully" if success else f"Execution failed with code {proc.returncode}",
+            "date": val_date,
+            "matrix_id": matrix_id,
+            "stdout": stdout,
+            "stderr": stderr,
+            "trading_ticket": ticket_records,
+            "friction_savings": savings_data,
+            "sub_ledgers": ledgers_data,
+            "summary": summary,
+            "holdings": effective_holdings,
+        }
+

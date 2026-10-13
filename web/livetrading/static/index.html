@@ -21,7 +21,21 @@
         <!-- Global Operational Bar -->
         <div class="header-controls">
             <div class="control-item">
-                <label for="select-strategy">策略配置 (Strategy)</label>
+                <label for="select-mode">运行模式 (Mode)</label>
+                <select id="select-mode" class="form-input">
+                    <option value="multi" selected>🔀 多策略协同 (Multi-Strategy)</option>
+                    <option value="single">🔹 单策略独立 (Single Strategy)</option>
+                </select>
+            </div>
+            <div class="control-item" id="ctrl-multi-matrix">
+                <div class="label-row" style="margin-bottom: 2px;">
+                    <label for="select-multi-matrix" style="margin-bottom: 0;">协同矩阵 (Matrix)</label>
+                    <button id="btn-config-matrix" class="btn-link-xs" title="配置各子策略权重与组合">⚙️ 权重</button>
+                </div>
+                <select id="select-multi-matrix" class="form-input"></select>
+            </div>
+            <div class="control-item" id="ctrl-single-strategy" style="display: none;">
+                <label for="select-strategy">单策略配置 (Strategy)</label>
                 <select id="select-strategy" class="form-input"></select>
             </div>
             <div class="control-item">
@@ -46,14 +60,14 @@
                 </select>
             </div>
             <div class="header-actions">
-                <button id="btn-show-all-segments" class="btn btn-secondary" title="显示全部四大板块 (标的、持仓、风控、指令)">
+                <button id="btn-show-all-segments" class="btn btn-secondary" title="显示全部板块 (标的、持仓、风控、指令)">
                     <span class="icon">📑</span> 全部板块
                 </button>
                 <button id="btn-run-health" class="btn btn-warning" title="运行第一阶段宏观与账户健康门禁">
                     <span class="icon">🛡️</span> 1. 健康门禁
                 </button>
                 <button id="btn-run-deploy" class="btn btn-primary" title="运行第二阶段实盘调仓指令生成">
-                    <span class="icon">🚀</span> 2. 生成指令
+                    <span class="icon" id="icon-run-deploy">🔀</span> <span id="label-run-deploy">2. 净额调仓</span>
                 </button>
                 <button id="btn-run-all" class="btn btn-success" title="一键全流程执行">
                     <span class="icon">⚡</span> 全流程运行
@@ -204,6 +218,60 @@
                 </div>
             </div>
 
+            <!-- Friction Savings & Internal Crossing Audit Card -->
+            <div class="card friction-card" id="card-friction" style="display: none;">
+                <div class="card-header">
+                    <h2><span class="icon">✨</span> 内部对冲与摩擦成本削减审计 (Friction Savings & Crossing Audit)</h2>
+                    <div class="card-actions">
+                        <button id="btn-view-subledgers" class="btn btn-secondary btn-sm" title="查看各子策略虚拟账本与意向拆解">
+                            📊 查看子账本明细
+                        </button>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <div class="friction-summary-banner">
+                        <div class="f-stat-card highlight">
+                            <span class="f-stat-title">内部对冲化解股数</span>
+                            <span class="f-stat-val text-success" id="val-crossed-shares">0 股</span>
+                            <span class="f-stat-sub" id="val-churn-reduction">无效换手削减率: 0.0%</span>
+                        </div>
+                        <div class="f-stat-card highlight">
+                            <span class="f-stat-title">总节省摩擦成本</span>
+                            <span class="f-stat-val text-success font-mono" id="val-total-friction-saved">¥0.00</span>
+                            <span class="f-stat-sub">增厚净收益 / 零市场冲击</span>
+                        </div>
+                        <div class="f-stat-card">
+                            <span class="f-stat-title">节省卖出印花税 (0.05%)</span>
+                            <span class="f-stat-val font-mono" id="val-saved-stamp-duty">¥0.00</span>
+                            <span class="f-stat-sub">免向财政缴付单边税</span>
+                        </div>
+                        <div class="f-stat-card">
+                            <span class="f-stat-title">节省券商佣金 (0.03%)</span>
+                            <span class="f-stat-val font-mono" id="val-saved-commission">¥0.00</span>
+                            <span class="f-stat-sub">避免双边通道磨损</span>
+                        </div>
+                        <div class="f-stat-card">
+                            <span class="f-stat-title">节省滑点冲击 (0.05%)</span>
+                            <span class="f-stat-val font-mono" id="val-saved-slippage">¥0.00</span>
+                            <span class="f-stat-sub">避免买卖盘口摩擦</span>
+                        </div>
+                    </div>
+
+                    <!-- Turnover comparison bar -->
+                    <div class="turnover-bar-container">
+                        <div class="turnover-item">
+                            <span class="t-label">毛调仓意向总额:</span>
+                            <span class="t-val font-mono" id="val-gross-turnover">¥0.00</span>
+                        </div>
+                        <div class="turnover-arrow">➔ 内部对冲化解 <span class="text-success font-mono" id="val-saved-turnover">¥0.00</span> ➔</div>
+                        <div class="turnover-item">
+                            <span class="t-label">实际净调仓额:</span>
+                            <span class="t-val font-mono text-primary" id="val-net-turnover">¥0.00</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <!-- Stage 2 Live Trading Ticket Card -->
             <div class="card orders-card" id="card-orders">
                 <div class="card-header">
@@ -216,7 +284,7 @@
                 </div>
                 <div class="card-body">
                     <div class="ticket-status-bar" id="ticket-status-bar">
-                        <span id="ticket-summary-text">尚未生成今日调仓指令。请点击上方「2. 生成指令」按最新行情计算。</span>
+                        <span id="ticket-summary-text">尚未生成今日调仓指令。请点击上方「2. 净额调仓」按最新行情计算。</span>
                     </div>
 
                     <div class="table-container orders-table-container">
@@ -230,13 +298,15 @@
                                     <th>当前持仓</th>
                                     <th>目标仓位</th>
                                     <th>权重变动</th>
-                                    <th>交易股数</th>
+                                    <th>净交易股数</th>
+                                    <th>内部对冲</th>
                                     <th>预估交易额</th>
+                                    <th>调仓动因 / 状态</th>
                                 </tr>
                             </thead>
                             <tbody id="tbody-orders">
                                 <tr>
-                                    <td colspan="9" class="text-center text-muted">暂无调仓指令</td>
+                                    <td colspan="11" class="text-center text-muted">暂无调仓指令</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -343,6 +413,52 @@
             </div>
             <div class="modal-footer">
                 <button id="btn-confirm-save-universe" class="btn btn-primary">确认保存标的池</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal: Multi-Strategy Matrix Configuration -->
+    <div class="modal" id="modal-matrix-config">
+        <div class="modal-dialog">
+            <div class="modal-header">
+                <h3>🔀 协同资金矩阵配置 (Multi-Strategy Matrix Config)</h3>
+                <button class="btn-close" id="btn-close-matrix-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label for="input-matrix-preset">矩阵预设选择 (Matrix Preset):</label>
+                    <select id="input-matrix-preset" class="form-input"></select>
+                </div>
+                <div class="form-group">
+                    <label>子策略与资金分配权重 (Capital Weights):</label>
+                    <div id="container-strategy-weights" class="strategy-weights-list"></div>
+                </div>
+                <div class="form-group">
+                    <span class="text-muted" style="font-size: 11px;">
+                        💡 提示：权重加和建议为 100%（系统在撮合时将自动按总权重做比例归一化）。各子策略将按该权重划分子账本，并通过内部撮合化解对冲股数。
+                    </span>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="btn-save-matrix-config" class="btn btn-primary">应用并保存矩阵配置</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal: Virtual Sub-Ledgers Breakdown -->
+    <div class="modal" id="modal-sub-ledgers">
+        <div class="modal-dialog" style="max-width: 800px;">
+            <div class="modal-header">
+                <h3>📊 子策略虚拟账本与意向明细 (Virtual Sub-Ledgers Breakdown)</h3>
+                <button class="btn-close" id="btn-close-subledgers-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="container-subledgers-content">
+                    <p class="text-muted text-center">暂无子账本数据，请先执行多策略净额调仓。</p>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="btn-close-subledgers-footer" class="btn btn-secondary">关闭</button>
             </div>
         </div>
     </div>

@@ -70,7 +70,41 @@
 
 ---
 
-## 3. Chan Four-State Risk-Managed Blend Strategy [Batch 1]
+## 3. Chan Single Crisis Shield Blend Strategy [Batch 2]
+- **Safety Grade**: `Grade C (High Overfit Risk - Fragile / Over-Parameterized)`
+- **Overfit Risk Index**: `55 / 100`
+
+### Quantitative Anomaly & Overfit Inspection Matrix
+
+| Inspection Dimension | Audited Metric | Safety Benchmark | Status | Forensic Diagnostic |
+| :--- | :--- | :--- | :--- | :--- |
+| **Look-Ahead Bias Check** | **42.3% Hit Rate** | 45.0% - 55.0% | `CLEAN` | Realistic trend hit rate; no forward leakage |
+| **Single-Stock Concentration** | **Max Pos: 20.0%** | < 25.0% (Cap: 20%) | `CLEAN` | Strict position caps (Max pos: 20.0%) |
+| **Fold 1 Warmup Padding** | **+0 Days** | < 60 Days | `CLEAN` | Immediate trade execution (+0d) |
+| **Outlier Equity Jumps** | **9.0% Single Jump** | < 30.0% | `CLEAN` | Equity curve grew incrementally (Max: 9.0%) |
+| **Statistical Edge (DSR)** | **0.0000** | > 0.0500 | `FAIL / MINED` | DSR 0.0000 indicates high data-mining / noise risk |
+| **Profit Concentration Skew** | **74.1% from Fold 1** | < 40.0% | `HIGH REGIME RISK` | Fold 1 generated 74.1% of positive returns |
+| **Superstar Asset Fragility** | **140.8% from Top 3** | < 60.0% | `HIGH FRAGILITY` | Top 3 contributed 140.8% (losers drained remaining gain) |
+| **Friction Bleed Ratio** | **17.5% Fee / Net PnL** | < 15.0% | `ELEVATED` | Friction fees consumed 17.5% of net profit (816.01 RMB) |
+| **Capital Drag & Cash Flattery** | **33.1% Idle Cash** | < 25.0% | `MODERATE` | Avg idle cash: 33.1% | Norm MaxDD: 6.9% (vs 4.6% raw) |
+
+### Leave-One-Out (LOO) Fragility Analysis
+
+| Exclusion Scenario | Resulting Net PnL | PnL Drop % | Strategy Viability Assessment |
+| :--- | :--- | :--- | :--- |
+| **Baseline (All 20 Assets)** | **+4,662.26 RMB** | `+0.0%` | Normal Operation |
+| **Exclude Top 1 (601899.SH)** | **+1,404.68 RMB** | `-69.9%` | VIABLE |
+| **Exclude Top 2 (601899.SH, 000938.SZ)** | **-1,003.83 RMB** | `-121.5%` | UNPROFITABLE |
+| **Exclude Top 3 (601899.SH, 000938.SZ, 601728.SH)** | **-1,902.18 RMB** | `-140.8%` | SEVERE LOSS DRAIN |
+
+### Identified Overfitting & Fragility Alerts
+- ⚠️ **DSR 0.0000 < 0.05 (High probability of data-mining / noise)**
+- ⚠️ **High Winner Concentration: Top 3 generate 140.8% of net gain**
+- ⚠️ **One-Hit Wonder Fold: Best Fold 1 accounts for 74.1% of positive returns**
+
+---
+
+## 4. Chan Four-State Risk-Managed Blend Strategy [Batch 1]
 - **Safety Grade**: `Grade B (Moderate Caution - Viable with Sizing Rules)`
 - **Overfit Risk Index**: `25 / 100`
 
@@ -102,7 +136,7 @@
 
 ---
 
-## 4. Chan Dual Hybrid Alpha Blend Strategy [Batch 1]
+## 5. Chan Dual Hybrid Alpha Blend Strategy [Batch 1]
 - **Safety Grade**: `Grade C (High Overfit Risk - Fragile / Over-Parameterized)`
 - **Overfit Risk Index**: `50 / 100`
 
@@ -133,36 +167,3 @@
 - ⚠️ **DSR 0.0000 < 0.05 (High probability of data-mining / noise)**
 - ⚠️ **High Winner Concentration: Top 3 generate 84.7% of net gain**
 - ⚠️ **Friction Bleed: Transaction friction consumes 33.8% of net profits**
-
----
-
-## 5. Generic Multi-Strategy Blend (Adaptive) [Batch 1]
-- **Safety Grade**: `Grade B (Moderate Caution - Viable with Sizing Rules)`
-- **Overfit Risk Index**: `35 / 100`
-
-### Quantitative Anomaly & Overfit Inspection Matrix
-
-| Inspection Dimension | Audited Metric | Safety Benchmark | Status | Forensic Diagnostic |
-| :--- | :--- | :--- | :--- | :--- |
-| **Look-Ahead Bias Check** | **52.2% Hit Rate** | 45.0% - 55.0% | `CLEAN` | Realistic trend hit rate; no forward leakage |
-| **Single-Stock Concentration** | **Max Pos: 20.0%** | < 25.0% (Cap: 20%) | `CLEAN` | Strict position caps (Max pos: 20.0%) |
-| **Fold 1 Warmup Padding** | **+0 Days** | < 60 Days | `CLEAN` | Immediate trade execution (+0d) |
-| **Outlier Equity Jumps** | **6.9% Single Jump** | < 30.0% | `CLEAN` | Equity curve grew incrementally (Max: 6.9%) |
-| **Statistical Edge (DSR)** | **0.0000** | > 0.0500 | `FAIL / MINED` | DSR 0.0000 indicates high data-mining / noise risk |
-| **Profit Concentration Skew** | **32.9% from Fold 5** | < 40.0% | `CLEAN` | Evenly distributed across folds (Fold 5: 32.9%) |
-| **Superstar Asset Fragility** | **66.4% from Top 3** | < 60.0% | `WARNING` | Top 3 assets contributed 66.4% of net gain |
-| **Friction Bleed Ratio** | **58.6% Fee / Net PnL** | < 15.0% | `SEVERE BLEED` | Friction fees consumed 58.6% of net profit (18,132.90 RMB) |
-| **Capital Drag & Cash Flattery** | **20.0% Idle Cash** | < 25.0% | `LOW` | Avg idle cash: 20.0% | Norm MaxDD: 9.1% (vs 7.3% raw) |
-
-### Leave-One-Out (LOO) Fragility Analysis
-
-| Exclusion Scenario | Resulting Net PnL | PnL Drop % | Strategy Viability Assessment |
-| :--- | :--- | :--- | :--- |
-| **Baseline (All 22 Assets)** | **+30,929.27 RMB** | `+0.0%` | Normal Operation |
-| **Exclude Top 1 (601288.SH)** | **+23,093.95 RMB** | `-25.3%` | VIABLE |
-| **Exclude Top 2 (601288.SH, 600362.SH)** | **+16,724.29 RMB** | `-45.9%` | VIABLE |
-| **Exclude Top 3 (601288.SH, 600362.SH, 300394.SZ)** | **+10,380.06 RMB** | `-66.4%` | VIABLE |
-
-### Identified Overfitting & Fragility Alerts
-- ⚠️ **DSR 0.0000 < 0.05 (High probability of data-mining / noise)**
-- ⚠️ **Friction Bleed: Transaction friction consumes 58.6% of net profits**

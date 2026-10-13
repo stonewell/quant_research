@@ -1115,5 +1115,149 @@ def test_full_liquidation_carry_forward(temp_workspace):
     assert h_day3 == {}
 
 
+def test_multi_strategy_configs_and_netting_endpoints(temp_workspace):
+    """Verify multi-strategy configuration endpoints and netting execution."""
+    storage, _ = temp_workspace
+    client = TestClient(create_app(storage))
+
+    # 1. GET /api/config includes multi_strategy_presets
+    res_cfg = client.get("/api/config")
+    assert res_cfg.status_code == 200
+    cfg_data = res_cfg.json()
+    assert "multi_strategy_presets" in cfg_data
+    assert len(cfg_data["multi_strategy_presets"]) >= 3
+    matrix_ids = [m["matrix_id"] for m in cfg_data["multi_strategy_presets"]]
+    assert "tri_core_blend" in matrix_ids
+
+    # 2. GET /api/multi-strategy/configs
+    res_m = client.get("/api/multi-strategy/configs")
+    assert res_m.status_code == 200
+    configs = res_m.json()
+    assert len(configs) >= 3
+
+    # 3. POST /api/multi-strategy/configs
+    new_preset = {
+        "matrix_id": "test_matrix",
+        "name": "Test Custom Matrix",
+        "description": "Test Matrix Description",
+        "portfolio_value": 150000.0,
+        "strategies": [
+            {"strategy_key": "chan_crisis_shield_blend", "capital_weight": 0.60},
+            {"strategy_key": "chan_risk_managed_blend", "capital_weight": 0.40},
+        ],
+    }
+    res_save = client.post("/api/multi-strategy/configs", json=new_preset)
+    assert res_save.status_code == 200
+    saved_list = res_save.json()
+    assert any(m["matrix_id"] == "test_matrix" for m in saved_list)
+
+    # 4. Storage get_multi_netting_run_dir
+    run_dir = storage.get_multi_netting_run_dir("test_matrix", "2026-10-12")
+    assert "multi_netted_test_matrix" in run_dir
+    os.makedirs(run_dir, exist_ok=True)
+
+    # 5. Populate netting run files
+    netted_ticket = [
+        {
+            "symbol": "600519.SH",
+            "name": "贵州茅台",
+            "action": "BUY",
+            "price": 1800.0,
+            "current_weight": 0.0,
+            "target_weight": 0.25,
+            "delta_weight": 0.25,
+            "current_shares": 0,
+            "target_shares": 200,
+            "delta_shares": 200,
+            "crossed_shares": 100,
+            "trade_value": 360000.0,
+            "reason": "多策略净额加仓",
+        },
+        {
+            "symbol": "000858.SZ",
+            "name": "五粮液",
+            "action": "HOLD_FILTERED",
+            "price": 150.0,
+            "current_weight": 0.15,
+            "target_weight": 0.15,
+            "delta_weight": 0.0,
+            "current_shares": 1000,
+            "target_shares": 1000,
+            "delta_shares": 0,
+            "crossed_shares": 0,
+            "trade_value": 0.0,
+            "reason": "全局调仓未超惰性阈值 (< 5%)",
+        },
+    ]
+    friction_savings = {
+        "total_gross_shares": 500,
+        "total_net_shares": 300,
+        "total_crossed_shares": 100,
+        "churn_reduction_ratio": 0.40,
+        "total_gross_turnover": 720000.0,
+        "total_net_turnover": 360000.0,
+        "saved_turnover": 360000.0,
+        "saved_stamp_duty": 180.0,
+        "saved_commission": 216.0,
+        "saved_slippage": 360.0,
+        "total_friction_saved": 756.0,
+    }
+    sub_ledgers = {
+        "chan_crisis_shield_blend": {
+            "strategy_key": "chan_crisis_shield_blend",
+            "strategy_name": "危机盾牌对冲策略",
+            "capital_weight": 0.60,
+            "allocated_nav": 600000.0,
+            "virtual_equity_value": 360000.0,
+            "virtual_cash": 240000.0,
+            "equity_ratio": 0.60,
+            "cash_ratio": 0.40,
+            "holdings": {"600519.SH": 200},
+        }
+    }
+    storage._save_json(os.path.join(run_dir, "netted_trading_ticket.json"), netted_ticket)
+    storage._save_json(os.path.join(run_dir, "friction_savings_report.json"), friction_savings)
+    storage._save_json(os.path.join(run_dir, "sub_ledgers.json"), sub_ledgers)
+    storage._save_json(os.path.join(run_dir, "summary.json"), {
+        "matrix_id": "test_matrix",
+        "date": "2026-10-12",
+        "directive": "GO",
+        "net_orders_count": 2,
+    })
+
+    csv_text = (
+        "symbol,name,action,price,target_shares,delta_shares,crossed_shares,reason\n"
+        "600519.SH,贵州茅台,BUY,1800.0,200,200,100,多策略净额加仓\n"
+        "000858.SZ,五粮液,HOLD_FILTERED,150.0,1000,0,0,全局调仓未超惰性阈值 (< 5%)\n"
+    )
+    with open(os.path.join(run_dir, "netted_trading_ticket.csv"), "w", encoding="utf-8") as f:
+        f.write(csv_text)
+
+    # 6. GET /api/deploy/multi/latest
+    res_latest = client.get("/api/deploy/multi/latest?matrix_id=test_matrix&date=2026-10-12")
+    assert res_latest.status_code == 200
+    bundle = res_latest.json()
+    assert len(bundle["trading_ticket"]) == 2
+    assert bundle["friction_savings"]["total_crossed_shares"] == 100
+    assert bundle["sub_ledgers"]["chan_crisis_shield_blend"]["capital_weight"] == 0.60
+
+    # 7. GET /api/deploy/multi/latest/csv
+    res_csv = client.get("/api/deploy/multi/latest/csv?matrix_id=test_matrix&date=2026-10-12")
+    assert res_csv.status_code == 200
+    assert "attachment; filename=netted_trading_ticket_test_matrix_2026-10-12.csv" in res_csv.headers.get("content-disposition", "")
+    assert "600519.SH" in res_csv.text
+
+    # 8. Transparent load via storage.get_run and get_run_csv
+    run_arch = storage.get_run("2026-10-12", strategy_key="test_matrix")
+    assert run_arch is not None
+    assert len(run_arch["trading_ticket"]) == 2
+    assert run_arch["friction_savings"]["total_friction_saved"] == 756.0
+
+    csv_arch = storage.get_run_csv("2026-10-12", strategy_key="test_matrix")
+    assert csv_arch is not None
+    assert "600519.SH" in csv_arch
+
+
+
 
 

@@ -1,0 +1,26 @@
+{
+  "chan_four_state_blend": {
+    "strategy_key": "chan_four_state_blend",
+    "strategy_name": "Chan Four-State Risk-Managed Blend Strategy",
+    "capital_weight": 0.5,
+    "allocated_nav": 50000.0,
+    "virtual_equity_value": 0.0,
+    "virtual_cash": 50000.0,
+    "equity_ratio": 0.0,
+    "cash_ratio": 1.0,
+    "holdings": {},
+    "last_updated": "2026-10-12"
+  },
+  "chan_risk_managed_blend": {
+    "strategy_key": "chan_risk_managed_blend",
+    "strategy_name": "Chan Risk-Managed Blend Strategy",
+    "capital_weight": 0.5,
+    "allocated_nav": 50000.0,
+    "virtual_equity_value": 0.0,
+    "virtual_cash": 50000.0,
+    "equity_ratio": 0.0,
+    "cash_ratio": 1.0,
+    "holdings": {},
+    "last_updated": "2026-10-12"
+  }
+}

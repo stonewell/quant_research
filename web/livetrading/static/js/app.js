@@ -8,13 +8,27 @@
     // -------------------------------------------------------------------------
     const state = {
         config: null,
+        mode: "multi", // "multi" (netting) or "single"
+        multiConfigs: [],
+        selectedMatrixId: "tri_core_blend",
         currentDate: new Date().toISOString().split("T")[0],
         holdings: {},
         accountState: {},
         activeTicket: [],
         activeHealth: null,
+        activeFrictionSavings: null,
+        activeSubLedgers: null,
         historyRuns: [],
         isHistoricalView: false,
+    };
+
+    const KNOWN_STRAT_NAMES = {
+        "chan_crisis_shield_blend": "🛡️ 危机盾动态防守策略",
+        "chan_risk_managed_blend": "⚖️ 风险平价自适应策略",
+        "chan_four_state_shield_blend": "🔄 四态周期极盾轮动策略",
+        "chan_four_state_blend": "📈 缠论四态自适应混合策略",
+        "chan_dual_hybrid_blend": "⚡ 双混动量自适应策略",
+        "generic_blend": "🌐 通用多因子自适应策略",
     };
 
     const KNOWN_STOCK_NAMES = {
@@ -48,6 +62,13 @@
 
     // DOM Elements
     const el = {
+        selectMode: document.getElementById("select-mode"),
+        ctrlMultiMatrix: document.getElementById("ctrl-multi-matrix"),
+        ctrlSingleStrategy: document.getElementById("ctrl-single-strategy"),
+        selectMultiMatrix: document.getElementById("select-multi-matrix"),
+        btnConfigMatrix: document.getElementById("btn-config-matrix"),
+        iconRunDeploy: document.getElementById("icon-run-deploy"),
+        labelRunDeploy: document.getElementById("label-run-deploy"),
         selectStrategy: document.getElementById("select-strategy"),
         inputDate: document.getElementById("input-as-of-date"),
         inputValue: document.getElementById("input-portfolio-value"),
@@ -92,6 +113,19 @@
         directiveDesc: document.getElementById("directive-desc"),
         directiveBox: document.getElementById("directive-box"),
 
+        // Friction Savings Card
+        cardFriction: document.getElementById("card-friction"),
+        btnViewSubledgers: document.getElementById("btn-view-subledgers"),
+        valCrossedShares: document.getElementById("val-crossed-shares"),
+        valChurnReduction: document.getElementById("val-churn-reduction"),
+        valTotalFrictionSaved: document.getElementById("val-total-friction-saved"),
+        valSavedStampDuty: document.getElementById("val-saved-stamp-duty"),
+        valSavedCommission: document.getElementById("val-saved-commission"),
+        valSavedSlippage: document.getElementById("val-saved-slippage"),
+        valGrossTurnover: document.getElementById("val-gross-turnover"),
+        valSavedTurnover: document.getElementById("val-saved-turnover"),
+        valNetTurnover: document.getElementById("val-net-turnover"),
+
         // Orders Outputs
         btnDownloadCsv: document.getElementById("btn-download-csv"),
         ticketSummaryText: document.getElementById("ticket-summary-text"),
@@ -119,6 +153,18 @@
         inputCustomUnivName: document.getElementById("input-custom-universe-name"),
         inputCustomUnivDesc: document.getElementById("input-custom-universe-desc"),
         previewCustomSymbols: document.getElementById("preview-custom-symbols"),
+
+        // Multi-Strategy Modals
+        modalMatrixConfig: document.getElementById("modal-matrix-config"),
+        btnCloseMatrixModal: document.getElementById("btn-close-matrix-modal"),
+        inputMatrixPreset: document.getElementById("input-matrix-preset"),
+        containerStrategyWeights: document.getElementById("container-strategy-weights"),
+        btnSaveMatrixConfig: document.getElementById("btn-save-matrix-config"),
+
+        modalSubLedgers: document.getElementById("modal-sub-ledgers"),
+        btnCloseSubLedgersModal: document.getElementById("btn-close-subledgers-modal"),
+        btnCloseSubLedgersFooter: document.getElementById("btn-close-subledgers-footer"),
+        containerSubLedgersContent: document.getElementById("container-subledgers-content"),
 
         // Running overlay & toast
         loadingOverlay: document.getElementById("loading-overlay"),
@@ -185,6 +231,8 @@
     // Session State Management (localStorage)
     // -------------------------------------------------------------------------
     const SESSION_KEYS = {
+        OP_MODE: "livetrading_session_op_mode",
+        MATRIX_ID: "livetrading_session_matrix_id",
         STRAT_KEY: "livetrading_session_strat_key",
         STRAT_VAL: "livetrading_session_strat_val",
         UNIV_KEY: "livetrading_session_univ_key",
@@ -193,17 +241,93 @@
         DATA_PROVIDER: "livetrading_session_data_provider",
     };
 
-    function getActiveKeys() {
-        const stratOpt = el.selectStrategy ? el.selectStrategy.selectedOptions[0] : null;
-        const univOpt = el.selectUniverse ? el.selectUniverse.selectedOptions[0] : null;
+    function applyModeUI(mode) {
+        state.mode = mode;
+        if (mode === "multi") {
+            if (el.ctrlMultiMatrix) el.ctrlMultiMatrix.style.display = "";
+            if (el.ctrlSingleStrategy) el.ctrlSingleStrategy.style.display = "none";
+            if (el.iconRunDeploy) el.iconRunDeploy.textContent = "🔀";
+            if (el.labelRunDeploy) el.labelRunDeploy.textContent = "2. 净额调仓";
+            if (el.btnRunDeploy) el.btnRunDeploy.title = "运行多策略撮合与净额化调仓指令生成";
+            if (el.mBtnRunDeploy) el.mBtnRunDeploy.textContent = "🔀 净额调仓";
+        } else {
+            if (el.ctrlMultiMatrix) el.ctrlMultiMatrix.style.display = "none";
+            if (el.ctrlSingleStrategy) el.ctrlSingleStrategy.style.display = "";
+            if (el.iconRunDeploy) el.iconRunDeploy.textContent = "🚀";
+            if (el.labelRunDeploy) el.labelRunDeploy.textContent = "2. 生成指令";
+            if (el.btnRunDeploy) el.btnRunDeploy.title = "运行单策略实盘调仓指令生成";
+            if (el.mBtnRunDeploy) el.mBtnRunDeploy.textContent = "🚀 生成指令";
+        }
+    }
 
-        const stratKey = stratOpt?.dataset.strategyKey || "";
-        const stratName = stratOpt?.dataset.strategyName || stratOpt?.textContent || "";
-        const stratVal = stratOpt?.value || "";
+    function onModeChange() {
+        const mode = el.selectMode ? el.selectMode.value : "multi";
+        applyModeUI(mode);
+        saveSessionState();
+        updateScopedHistoryRuns();
+        loadLatestRunForCurrentPair(true);
+    }
+
+    function populateMultiStrategySelect(configs) {
+        if (!el.selectMultiMatrix) return;
+        el.selectMultiMatrix.innerHTML = "";
+        (configs || []).forEach(cfg => {
+            const opt = document.createElement("option");
+            opt.value = cfg.matrix_id;
+            opt.dataset.matrixId = cfg.matrix_id;
+            opt.dataset.matrixName = cfg.name || cfg.matrix_id;
+            const star = (cfg.matrix_id === "tri_core_blend") ? "⭐ [推荐] " : "🔀 ";
+            opt.textContent = `${star}${cfg.name || cfg.matrix_id}`;
+            el.selectMultiMatrix.appendChild(opt);
+        });
+
+        // Set default or restore
+        const savedMatrixId = localStorage.getItem(SESSION_KEYS.MATRIX_ID) || "tri_core_blend";
+        if (savedMatrixId) {
+            for (let i = 0; i < el.selectMultiMatrix.options.length; i++) {
+                if (el.selectMultiMatrix.options[i].value === savedMatrixId) {
+                    el.selectMultiMatrix.selectedIndex = i;
+                    state.selectedMatrixId = savedMatrixId;
+                    break;
+                }
+            }
+        }
+    }
+
+    async function onMatrixChange() {
+        if (el.selectMultiMatrix) {
+            state.selectedMatrixId = el.selectMultiMatrix.value;
+            try {
+                localStorage.setItem(SESSION_KEYS.MATRIX_ID, state.selectedMatrixId);
+            } catch (e) {}
+        }
+        saveSessionState();
+        await updateScopedHistoryRuns();
+        await loadLatestRunForCurrentPair(true);
+    }
+
+    function getActiveKeys() {
+        let stratKey = "";
+        let stratName = "";
+        let stratVal = "";
+
+        if (state.mode === "multi") {
+            const matrixOpt = el.selectMultiMatrix ? el.selectMultiMatrix.selectedOptions[0] : null;
+            stratKey = matrixOpt ? matrixOpt.value : (state.selectedMatrixId || "tri_core_blend");
+            stratName = matrixOpt ? (matrixOpt.dataset.matrixName || matrixOpt.textContent) : "多策略协同矩阵";
+            stratVal = stratKey;
+        } else {
+            const stratOpt = el.selectStrategy ? el.selectStrategy.selectedOptions[0] : null;
+            stratKey = stratOpt?.dataset.strategyKey || "";
+            stratName = stratOpt?.dataset.strategyName || stratOpt?.textContent || "";
+            stratVal = stratOpt?.value || "";
+        }
 
         let univKey = "";
         let univName = "";
-        let univVal = univOpt?.value || "";
+        let univVal = "";
+        const univOpt = el.selectUniverse ? el.selectUniverse.selectedOptions[0] : null;
+        univVal = univOpt?.value || "";
 
         if (univVal === "__CUSTOM__") {
             const customText = el.textCustomSymbols ? el.textCustomSymbols.value.trim() : "";
@@ -229,6 +353,10 @@
     function saveSessionState() {
         const keys = getActiveKeys();
         try {
+            localStorage.setItem(SESSION_KEYS.OP_MODE, state.mode);
+            if (state.selectedMatrixId) {
+                localStorage.setItem(SESSION_KEYS.MATRIX_ID, state.selectedMatrixId);
+            }
             if (keys.stratKey) {
                 localStorage.setItem(SESSION_KEYS.STRAT_KEY, keys.stratKey);
                 localStorage.setItem(SESSION_KEYS.STRAT_VAL, keys.stratVal);
@@ -250,6 +378,26 @@
 
     function restoreSessionState() {
         try {
+            const savedMode = localStorage.getItem(SESSION_KEYS.OP_MODE);
+            if (savedMode && (savedMode === "multi" || savedMode === "single")) {
+                state.mode = savedMode;
+                if (el.selectMode) el.selectMode.value = savedMode;
+                applyModeUI(savedMode);
+            } else {
+                applyModeUI("multi");
+            }
+
+            const savedMatrixId = localStorage.getItem(SESSION_KEYS.MATRIX_ID);
+            if (savedMatrixId && el.selectMultiMatrix) {
+                for (let i = 0; i < el.selectMultiMatrix.options.length; i++) {
+                    if (el.selectMultiMatrix.options[i].value === savedMatrixId) {
+                        el.selectMultiMatrix.selectedIndex = i;
+                        state.selectedMatrixId = savedMatrixId;
+                        break;
+                    }
+                }
+            }
+
             const savedStratVal = localStorage.getItem(SESSION_KEYS.STRAT_VAL);
             const savedStratKey = localStorage.getItem(SESSION_KEYS.STRAT_KEY);
             let stratMatched = false;
@@ -316,6 +464,17 @@
             renderTradingTicket(bundle.trading_ticket);
             el.btnDownloadCsv.disabled = false;
         }
+        if (bundle.friction_savings) {
+            state.activeFrictionSavings = bundle.friction_savings;
+            renderFrictionSavings(bundle.friction_savings);
+        } else {
+            state.activeFrictionSavings = null;
+            if (el.cardFriction) el.cardFriction.style.display = "none";
+        }
+        if (bundle.sub_ledgers) {
+            state.activeSubLedgers = bundle.sub_ledgers;
+        }
+
         const priceMap = bundle.prices ? { ...bundle.prices } : {};
         if (bundle.trading_ticket && Array.isArray(bundle.trading_ticket)) {
             bundle.trading_ticket.forEach(t => {
@@ -372,8 +531,12 @@
         el.directiveTitle.textContent = "尚未执行健康检查";
         el.directiveDesc.textContent = reason || "点击上方「1. 健康门禁」评估账户回撤梯级、连续冷却状态与市场宽度。";
 
-        el.tbodyOrders.innerHTML = '<tr><td colspan="9" class="text-center text-muted">暂无调仓指令</td></tr>';
-        el.ticketSummaryText.textContent = reason || "尚未生成调仓指令。请点击上方「2. 生成指令」按最新行情计算。";
+        state.activeFrictionSavings = null;
+        state.activeSubLedgers = null;
+        if (el.cardFriction) el.cardFriction.style.display = "none";
+
+        el.tbodyOrders.innerHTML = '<tr><td colspan="11" class="text-center text-muted">暂无调仓指令</td></tr>';
+        el.ticketSummaryText.textContent = reason || (state.mode === "multi" ? "尚未生成多策略净额调仓指令。请点击上方「2. 净额调仓」按最新行情计算。" : "尚未生成调仓指令。请点击上方「2. 生成指令」按最新行情计算。");
         el.btnDownloadCsv.disabled = true;
     }
 
@@ -575,6 +738,24 @@
 
         // Check if redirected/refreshed with specific URL query parameters
         const urlParams = new URLSearchParams(window.location.search);
+        const qMode = urlParams.get("mode");
+        if (qMode && (qMode === "multi" || qMode === "single")) {
+            applyModeUI(qMode);
+            if (el.selectMode) el.selectMode.value = qMode;
+        }
+
+        const qMatrix = urlParams.get("matrix");
+        if (qMatrix && el.selectMultiMatrix) {
+            for (let i = 0; i < el.selectMultiMatrix.options.length; i++) {
+                const opt = el.selectMultiMatrix.options[i];
+                if (opt.value === qMatrix) {
+                    el.selectMultiMatrix.selectedIndex = i;
+                    state.selectedMatrixId = qMatrix;
+                    break;
+                }
+            }
+        }
+
         const qStrat = urlParams.get("strategy");
         const qUniv = urlParams.get("universe");
         const qDate = urlParams.get("date");
@@ -685,6 +866,18 @@
             });
         }
 
+        // Mode and Matrix Selection
+        if (el.selectMode) el.selectMode.addEventListener("change", onModeChange);
+        if (el.selectMultiMatrix) el.selectMultiMatrix.addEventListener("change", onMatrixChange);
+        if (el.btnConfigMatrix) el.btnConfigMatrix.addEventListener("click", openMatrixModal);
+        if (el.btnCloseMatrixModal) el.btnCloseMatrixModal.addEventListener("click", () => el.modalMatrixConfig.classList.remove("active"));
+        if (el.btnSaveMatrixConfig) el.btnSaveMatrixConfig.addEventListener("click", saveMatrixConfig);
+
+        // Sub-Ledgers Modal
+        if (el.btnViewSubledgers) el.btnViewSubledgers.addEventListener("click", openSubLedgersModal);
+        if (el.btnCloseSubLedgersModal) el.btnCloseSubLedgersModal.addEventListener("click", () => el.modalSubLedgers.classList.remove("active"));
+        if (el.btnCloseSubLedgersFooter) el.btnCloseSubLedgersFooter.addEventListener("click", () => el.modalSubLedgers.classList.remove("active"));
+
         // Strategy, Universe & Data Provider Change
         el.selectStrategy.addEventListener("change", onStrategyChange);
         el.selectUniverse.addEventListener("change", () => onUniverseChange(true));
@@ -698,11 +891,11 @@
 
         // Run Actions
         el.btnRunHealth.addEventListener("click", () => runHealthCheck(el.btnRunHealth));
-        el.btnRunDeploy.addEventListener("click", () => runLiveDeploy(el.btnRunDeploy));
+        el.btnRunDeploy.addEventListener("click", () => handleDeployAction(el.btnRunDeploy));
         el.btnRunAll.addEventListener("click", () => runFullWorkflow(el.btnRunAll));
 
         if (el.mBtnRunHealth) el.mBtnRunHealth.addEventListener("click", () => runHealthCheck(el.mBtnRunHealth));
-        if (el.mBtnRunDeploy) el.mBtnRunDeploy.addEventListener("click", () => runLiveDeploy(el.mBtnRunDeploy));
+        if (el.mBtnRunDeploy) el.mBtnRunDeploy.addEventListener("click", () => handleDeployAction(el.mBtnRunDeploy));
         if (el.mBtnSaveHoldings) el.mBtnSaveHoldings.addEventListener("click", () => saveHoldings());
 
         // Custom Universe Modal
@@ -754,6 +947,10 @@
             const res = await fetch("/api/config");
             const data = await res.json();
             state.config = data;
+
+            // Populate Multi-Strategy Presets
+            state.multiConfigs = data.multi_strategy_presets || [];
+            populateMultiStrategySelect(state.multiConfigs);
 
             // Populate Strategies: SHOW ONLY STRATEGY NAME, NOT FILE NAME!
             el.selectStrategy.innerHTML = "";
@@ -1252,6 +1449,91 @@
         }
     }
 
+    async function handleDeployAction(activeBtn = el.btnRunDeploy) {
+        if (state.mode === "multi") {
+            return await runMultiStrategyNettingDeploy(activeBtn);
+        } else {
+            return await runLiveDeploy(activeBtn);
+        }
+    }
+
+    async function runMultiStrategyNettingDeploy(activeBtn = el.btnRunDeploy) {
+        const baseParams = getExecutionParams();
+        const keys = getActiveKeys();
+        const holdings = getHoldingsFromTable();
+        const matrixId = (el.selectMultiMatrix && el.selectMultiMatrix.value) || state.selectedMatrixId || "tri_core_blend";
+
+        const currentCfg = (state.multiConfigs || []).find(c => c.matrix_id === matrixId);
+        const subStrategies = currentCfg && currentCfg.strategies ? currentCfg.strategies : null;
+
+        const deployParams = {
+            matrix_id: matrixId,
+            strategies: subStrategies,
+            universe_file: baseParams.universe_file,
+            custom_symbols: baseParams.custom_symbols,
+            as_of_date: baseParams.as_of_date,
+            portfolio_value: baseParams.portfolio_value,
+            current_holdings: holdings,
+            data_provider: baseParams.data_provider,
+            min_holding_bars: 2,
+            inertia_threshold: 0.05,
+        };
+
+        setRunningIndicator(true, "正在执行多策略虚拟账本划分、目标权重聚合、内部对冲与净额化撮合...", activeBtn);
+        logConsole(`\n[Stage 2 - Multi-Strategy Netting] 启动多策略撮合净额化调仓...\n矩阵: ${keys.stratName} (${matrixId})\n标的池: ${keys.univName}\n持仓数: ${Object.keys(holdings).length} | 数据源: ${deployParams.data_provider}`);
+
+        try {
+            const res = await fetch("/api/deploy/multi", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(deployParams),
+            });
+            const data = await res.json();
+
+            if (data.stdout) logConsole(data.stdout);
+            if (data.stderr) logConsole(`[STDERR]\n${data.stderr}`);
+
+            if (data.status === "error") {
+                throw new Error(data.message || "多策略撮合执行返回错误");
+            }
+
+            state.activeTicket = data.trading_ticket || [];
+            state.activeFrictionSavings = data.friction_savings || null;
+            state.activeSubLedgers = data.sub_ledgers || null;
+
+            if (data.trading_ticket) {
+                renderTradingTicket(data.trading_ticket);
+                if (el.btnDownloadCsv) el.btnDownloadCsv.disabled = false;
+            }
+            if (data.friction_savings) {
+                renderFrictionSavings(data.friction_savings);
+            }
+            if (data.account_state) {
+                state.accountState = data.account_state;
+            }
+
+            saveSessionState();
+            await updateScopedHistoryRuns();
+
+            setRunningIndicator(false);
+            const savedCrossed = (data.friction_savings && data.friction_savings.total_crossed_shares) || 0;
+            const savedMoney = (data.friction_savings && data.friction_savings.total_friction_saved) || 0;
+            showToast(`✅ 多策略净额调仓完成！化解 ${savedCrossed.toLocaleString()} 股对冲，节省摩擦 ¥${savedMoney.toFixed(2)}`, "success");
+
+            const targetDate = deployParams.as_of_date || state.currentDate;
+            const newUrl = `${window.location.pathname}?strategy=${encodeURIComponent(matrixId)}&universe=${encodeURIComponent(keys.univKey)}&date=${encodeURIComponent(targetDate)}&tab=orders`;
+            window.history.pushState({}, document.title, newUrl);
+
+            const targetEl = document.getElementById("card-friction") || document.getElementById("card-orders");
+            if (targetEl) targetEl.scrollIntoView({ behavior: "smooth", block: "start" });
+            return data;
+        } catch (err) {
+            logConsole(`[ERROR] 多策略净额调仓失败: ${err.message || err}`);
+            setRunningIndicator(false);
+            showToast(`❌ 多策略净额调仓失败: ${err.message || err}`, "error");
+        }
+    }
+
     async function runLiveDeploy(activeBtn = el.btnRunDeploy) {
         const baseParams = getExecutionParams();
         const keys = getActiveKeys();
@@ -1319,8 +1601,8 @@
             current_holdings: holdings,
         };
 
-        setRunningIndicator(true, "正在依次执行 Stage 1 健康门禁 与 Stage 2 实盘调仓工单生成...", activeBtn);
-        logConsole(`\n[WORKFLOW] 启动全流程执行 (Stage 1 + Stage 2)...\n策略: ${keys.stratName}\n标的池: ${keys.univName}`);
+        setRunningIndicator(true, "正在依次执行 Stage 1 健康门禁 与 Stage 2 调仓工单生成...", activeBtn);
+        logConsole(`\n[WORKFLOW] 启动全流程执行 (Stage 1 + Stage 2)...\n模式: ${state.mode === "multi" ? "多策略净额协同" : "单策略独立"}\n标的池: ${keys.univName}`);
 
         try {
             // Stage 1
@@ -1341,24 +1623,68 @@
             }
 
             // Stage 2
-            if (el.loadingDetail) el.loadingDetail.textContent = "第 2/2 步: 正在执行 Stage 2 实盘调仓工单生成与买卖对账...";
-            const resDeploy = await fetch("/api/run-deploy", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(deployParams),
-            });
-            const dataDeploy = await resDeploy.json();
-            if (dataDeploy.stdout) logConsole(dataDeploy.stdout);
-            if (dataDeploy.stderr) logConsole(`[STDERR]\n${dataDeploy.stderr}`);
-            if (dataDeploy.status === "error") {
-                throw new Error(`Stage 2 失败: ${dataDeploy.message}`);
-            }
-            if (dataDeploy.trading_ticket) {
-                renderTradingTicket(dataDeploy.trading_ticket);
-                el.btnDownloadCsv.disabled = false;
-            }
-            if (dataDeploy.account_state) {
-                state.accountState = dataDeploy.account_state;
+            if (state.mode === "multi") {
+                if (el.loadingDetail) el.loadingDetail.textContent = "第 2/2 步: 正在执行多策略虚拟账本划分、内部对冲与净额化调仓...";
+                const matrixId = (el.selectMultiMatrix && el.selectMultiMatrix.value) || state.selectedMatrixId || "tri_core_blend";
+                const currentCfg = (state.multiConfigs || []).find(c => c.matrix_id === matrixId);
+                const subStrategies = currentCfg && currentCfg.strategies ? currentCfg.strategies : null;
+
+                const multiDeployParams = {
+                    matrix_id: matrixId,
+                    strategies: subStrategies,
+                    universe_file: baseParams.universe_file,
+                    custom_symbols: baseParams.custom_symbols,
+                    as_of_date: baseParams.as_of_date,
+                    portfolio_value: baseParams.portfolio_value,
+                    current_holdings: holdings,
+                    data_provider: baseParams.data_provider,
+                    min_holding_bars: 2,
+                    inertia_threshold: 0.05,
+                };
+                const resDeploy = await fetch("/api/deploy/multi", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(multiDeployParams),
+                });
+                const dataDeploy = await resDeploy.json();
+                if (dataDeploy.stdout) logConsole(dataDeploy.stdout);
+                if (dataDeploy.stderr) logConsole(`[STDERR]\n${dataDeploy.stderr}`);
+                if (dataDeploy.status === "error") {
+                    throw new Error(`Stage 2 多策略撮合失败: ${dataDeploy.message}`);
+                }
+                state.activeTicket = dataDeploy.trading_ticket || [];
+                state.activeFrictionSavings = dataDeploy.friction_savings || null;
+                state.activeSubLedgers = dataDeploy.sub_ledgers || null;
+                if (dataDeploy.trading_ticket) {
+                    renderTradingTicket(dataDeploy.trading_ticket);
+                    if (el.btnDownloadCsv) el.btnDownloadCsv.disabled = false;
+                }
+                if (dataDeploy.friction_savings) {
+                    renderFrictionSavings(dataDeploy.friction_savings);
+                }
+                if (dataDeploy.account_state) {
+                    state.accountState = dataDeploy.account_state;
+                }
+            } else {
+                if (el.loadingDetail) el.loadingDetail.textContent = "第 2/2 步: 正在执行 Stage 2 实盘调仓工单生成与买卖对账...";
+                const resDeploy = await fetch("/api/run-deploy", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(deployParams),
+                });
+                const dataDeploy = await resDeploy.json();
+                if (dataDeploy.stdout) logConsole(dataDeploy.stdout);
+                if (dataDeploy.stderr) logConsole(`[STDERR]\n${dataDeploy.stderr}`);
+                if (dataDeploy.status === "error") {
+                    throw new Error(`Stage 2 失败: ${dataDeploy.message}`);
+                }
+                if (dataDeploy.trading_ticket) {
+                    renderTradingTicket(dataDeploy.trading_ticket);
+                    el.btnDownloadCsv.disabled = false;
+                }
+                if (dataDeploy.account_state) {
+                    state.accountState = dataDeploy.account_state;
+                }
             }
 
             saveSessionState();
@@ -1426,10 +1752,39 @@
         el.directiveDesc.textContent = rep.directive_summary || "宏观宽度、动量冲击与账户回撤已综合核算。";
     }
 
+    function renderFrictionSavings(savings) {
+        if (!el.cardFriction) return;
+        if (!savings) {
+            el.cardFriction.style.display = "none";
+            return;
+        }
+
+        el.cardFriction.style.display = "block";
+        const crossedSh = savings.total_crossed_shares || 0;
+        const churnRed = savings.churn_reduction_ratio || 0;
+        const totalSaved = savings.total_friction_saved || 0;
+        const savedTax = savings.saved_stamp_duty || 0;
+        const savedComm = savings.saved_commission || 0;
+        const savedSlip = savings.saved_slippage || 0;
+        const grossTurnover = savings.total_gross_turnover || 0;
+        const savedTurnover = savings.saved_turnover || 0;
+        const netTurnover = savings.total_net_turnover || 0;
+
+        if (el.valCrossedShares) el.valCrossedShares.textContent = `${crossedSh.toLocaleString()} 股`;
+        if (el.valChurnReduction) el.valChurnReduction.textContent = `无效换手削减率: ${(churnRed * 100).toFixed(1)}%`;
+        if (el.valTotalFrictionSaved) el.valTotalFrictionSaved.textContent = `¥${totalSaved.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+        if (el.valSavedStampDuty) el.valSavedStampDuty.textContent = `¥${savedTax.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+        if (el.valSavedCommission) el.valSavedCommission.textContent = `¥${savedComm.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+        if (el.valSavedSlippage) el.valSavedSlippage.textContent = `¥${savedSlip.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+        if (el.valGrossTurnover) el.valGrossTurnover.textContent = `¥${grossTurnover.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+        if (el.valSavedTurnover) el.valSavedTurnover.textContent = `¥${savedTurnover.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+        if (el.valNetTurnover) el.valNetTurnover.textContent = `¥${netTurnover.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+    }
+
     function renderTradingTicket(ticketRows) {
         el.tbodyOrders.innerHTML = "";
         if (!ticketRows || ticketRows.length === 0) {
-            el.tbodyOrders.innerHTML = '<tr><td colspan="9" class="text-center text-muted">今日无需执行任何调仓指令</td></tr>';
+            el.tbodyOrders.innerHTML = '<tr><td colspan="11" class="text-center text-muted">今日无需执行任何调仓指令</td></tr>';
             el.ticketSummaryText.textContent = "今日无需调仓 (No trades required).";
             return;
         }
@@ -1458,9 +1813,12 @@
                 badge.textContent = "🟢 BUY (买入)";
                 buysCount++;
                 totalBuyVal += Math.abs(r.trade_value || 0);
-            } else if (act.includes("CASH") || act.includes("SWEEP")) {
+            } else if (act === "HOLD_FILTERED") {
+                badge.classList.add("badge-hold-filtered");
+                badge.textContent = "🟡 HOLD (锁仓/过滤)";
+            } else if (act.includes("CASH") || act.includes("SWEEP") || act.includes("RELEASE")) {
                 badge.classList.add("badge-sweep");
-                badge.textContent = "💰 CASH SWEEP";
+                badge.textContent = act.includes("RELEASE") ? "💰 CASH RELEASE" : "💰 CASH SWEEP";
             } else {
                 badge.classList.add("badge-hold");
                 badge.textContent = "⚪ HOLD (维持)";
@@ -1498,10 +1856,30 @@
             const deltaShares = r.delta_shares || 0;
             tdShares.textContent = deltaShares !== 0 ? `${deltaShares > 0 ? "+" : ""}${deltaShares.toLocaleString()}` : "0";
 
+            // Internal Crossing Column
+            const tdCrossed = document.createElement("td");
+            tdCrossed.className = "text-right font-mono";
+            const crossedSh = r.crossed_shares || 0;
+            if (crossedSh > 0) {
+                const sp = document.createElement("span");
+                sp.className = "badge badge-crossed font-mono";
+                sp.textContent = `⚡ ${crossedSh.toLocaleString()} 股`;
+                tdCrossed.appendChild(sp);
+            } else {
+                tdCrossed.textContent = "--";
+                tdCrossed.classList.add("text-muted");
+            }
+
             const tdVal = document.createElement("td");
             tdVal.className = "text-right font-mono";
             const tradeVal = r.trade_value || 0;
             tdVal.textContent = tradeVal !== 0 ? `¥${Math.abs(tradeVal).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}` : "--";
+
+            // Reason / Narrative Column
+            const tdReason = document.createElement("td");
+            tdReason.className = "text-muted";
+            tdReason.style.fontSize = "11px";
+            tdReason.textContent = r.reason || (act === "SELL" ? "目标调降卖出" : (act === "BUY" ? "增配开仓买入" : "维持"));
 
             tr.appendChild(tdAct);
             tr.appendChild(tdSym);
@@ -1511,12 +1889,20 @@
             tr.appendChild(tdTgtW);
             tr.appendChild(tdDeltaW);
             tr.appendChild(tdShares);
+            tr.appendChild(tdCrossed);
             tr.appendChild(tdVal);
+            tr.appendChild(tdReason);
 
             el.tbodyOrders.appendChild(tr);
         });
 
-        el.ticketSummaryText.textContent = `调仓计划: 卖出 ${sellsCount} 只 (~¥${totalSellVal.toLocaleString()}) | 买入 ${buysCount} 只 (~¥${totalBuyVal.toLocaleString()})`;
+        if (state.activeFrictionSavings && (state.activeFrictionSavings.total_crossed_shares || 0) > 0) {
+            const cSh = state.activeFrictionSavings.total_crossed_shares || 0;
+            const fSav = state.activeFrictionSavings.total_friction_saved || 0;
+            el.ticketSummaryText.textContent = `调仓计划: 卖出 ${sellsCount} 只 (~¥${totalSellVal.toLocaleString()}) | 买入 ${buysCount} 只 (~¥${totalBuyVal.toLocaleString()}) | 内部对冲化解 ${cSh.toLocaleString()} 股 (免摩擦 ¥${fSav.toFixed(2)})`;
+        } else {
+            el.ticketSummaryText.textContent = `调仓计划: 卖出 ${sellsCount} 只 (~¥${totalSellVal.toLocaleString()}) | 买入 ${buysCount} 只 (~¥${totalBuyVal.toLocaleString()})`;
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -1573,7 +1959,10 @@
     function downloadTicketCsv() {
         const keys = getActiveKeys();
         const dateVal = el.inputDate.value || state.currentDate;
-        if (keys.isBothSelected) {
+        if (state.mode === "multi") {
+            const matrixId = (el.selectMultiMatrix && el.selectMultiMatrix.value) || state.selectedMatrixId || "tri_core_blend";
+            window.open(`/api/deploy/multi/latest/csv?matrix_id=${encodeURIComponent(matrixId)}&date=${encodeURIComponent(dateVal)}`, "_blank");
+        } else if (keys.isBothSelected) {
             window.open(`/api/runs/${encodeURIComponent(keys.stratKey)}/${encodeURIComponent(keys.univKey)}/${encodeURIComponent(dateVal)}/csv`, "_blank");
         } else {
             window.open(`/api/runs/${encodeURIComponent(dateVal)}/csv`, "_blank");
@@ -1683,6 +2072,207 @@
     }
 
     // -------------------------------------------------------------------------
+    // Modals: Multi-Strategy Matrix & Virtual Sub-Ledgers
+    // -------------------------------------------------------------------------
+    function openMatrixModal() {
+        if (!el.inputMatrixPreset) return;
+        el.inputMatrixPreset.innerHTML = "";
+        (state.multiConfigs || []).forEach(cfg => {
+            const opt = document.createElement("option");
+            opt.value = cfg.matrix_id;
+            opt.textContent = `${cfg.name || cfg.matrix_id} (${cfg.matrix_id})`;
+            el.inputMatrixPreset.appendChild(opt);
+        });
+
+        const activeId = (el.selectMultiMatrix && el.selectMultiMatrix.value) || state.selectedMatrixId || "tri_core_blend";
+        el.inputMatrixPreset.value = activeId;
+
+        renderMatrixWeightInputs(activeId);
+        if (!el.inputMatrixPreset._hasMatrixChangeListener) {
+            el.inputMatrixPreset.addEventListener("change", () => {
+                renderMatrixWeightInputs(el.inputMatrixPreset.value);
+            });
+            el.inputMatrixPreset._hasMatrixChangeListener = true;
+        }
+
+        if (el.modalMatrixConfig) el.modalMatrixConfig.classList.add("active");
+    }
+
+    function renderMatrixWeightInputs(matrixId) {
+        if (!el.containerStrategyWeights) return;
+        el.containerStrategyWeights.innerHTML = "";
+        const cfg = (state.multiConfigs || []).find(c => c.matrix_id === matrixId);
+        if (!cfg || !cfg.strategies || cfg.strategies.length === 0) {
+            el.containerStrategyWeights.innerHTML = '<div class="text-muted text-center" style="padding: 10px;">暂无该矩阵的子策略配置</div>';
+            return;
+        }
+
+        cfg.strategies.forEach(st => {
+            const row = document.createElement("div");
+            row.className = "strategy-weight-row";
+
+            const label = document.createElement("div");
+            label.className = "strat-name";
+            label.innerHTML = `${st.name || st.key} <span class="text-muted font-mono" style="font-size:11px;">(${st.key})</span>`;
+
+            const inputWrap = document.createElement("div");
+            inputWrap.style.display = "flex";
+            inputWrap.style.alignItems = "center";
+            inputWrap.style.gap = "4px";
+
+            const input = document.createElement("input");
+            input.type = "number";
+            input.min = "0";
+            input.max = "100";
+            input.step = "5";
+            input.className = "form-input strat-weight-input font-mono text-right";
+            input.dataset.stratKey = st.key;
+            input.dataset.stratName = st.name || st.key;
+            input.value = Math.round((st.capital_weight || 0) * 100);
+
+            const suffix = document.createElement("span");
+            suffix.className = "text-muted font-mono";
+            suffix.style.fontSize = "12px";
+            suffix.textContent = "%";
+
+            inputWrap.appendChild(input);
+            inputWrap.appendChild(suffix);
+
+            row.appendChild(label);
+            row.appendChild(inputWrap);
+            el.containerStrategyWeights.appendChild(row);
+        });
+    }
+
+    async function saveMatrixConfig() {
+        const matrixId = el.inputMatrixPreset ? el.inputMatrixPreset.value : (state.selectedMatrixId || "tri_core_blend");
+        const weightInputs = el.containerStrategyWeights ? el.containerStrategyWeights.querySelectorAll(".strat-weight-input") : [];
+        if (!weightInputs || weightInputs.length === 0) return;
+
+        let totalWeight = 0;
+        const strategies = [];
+        weightInputs.forEach(inp => {
+            const wVal = parseFloat(inp.value) || 0;
+            totalWeight += wVal;
+            strategies.push({
+                key: inp.dataset.stratKey,
+                name: inp.dataset.stratName || inp.dataset.stratKey,
+                capital_weight: wVal / 100.0,
+            });
+        });
+
+        if (totalWeight <= 0) {
+            alert("子策略权重加和必须大于 0%！");
+            return;
+        }
+
+        try {
+            const payload = {
+                matrix_id: matrixId,
+                strategies: strategies,
+            };
+            const res = await fetch("/api/multi-strategy/configs", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload),
+            });
+            if (!res.ok) {
+                const errData = await res.json().catch(() => ({}));
+                throw new Error(errData.detail || "保存配置失败");
+            }
+            const updatedList = await res.json();
+            state.multiConfigs = updatedList;
+
+            // Update main matrix dropdown options if modified
+            populateMultiStrategySelect(state.multiConfigs);
+
+            if (el.modalMatrixConfig) el.modalMatrixConfig.classList.remove("active");
+            showToast("✅ 协同资金矩阵权重已保存生效！", "success");
+            logConsole(`[CONFIG] 矩阵「${matrixId}」配置已更新并固化，当前权重: ${strategies.map(s => `${s.key}: ${(s.capital_weight * 100).toFixed(0)}%`).join(", ")}`);
+        } catch (err) {
+            alert(`保存矩阵权重失败: ${err.message || err}`);
+        }
+    }
+
+    function openSubLedgersModal() {
+        if (!el.containerSubLedgersContent) return;
+        const ledgers = state.activeSubLedgers;
+        if (!ledgers || Object.keys(ledgers).length === 0) {
+            el.containerSubLedgersContent.innerHTML = '<p class="text-muted text-center" style="padding: 24px;">当前尚无子策略虚拟账本数据。<br>请在「多策略协同」模式下执行净额调仓后查看。</p>';
+            if (el.modalSubLedgers) el.modalSubLedgers.classList.add("active");
+            return;
+        }
+
+        el.containerSubLedgersContent.innerHTML = "";
+        const grid = document.createElement("div");
+        grid.className = "subledger-grid";
+
+        Object.values(ledgers).forEach(ledger => {
+            const col = document.createElement("div");
+            col.className = "subledger-col";
+
+            const h4 = document.createElement("h4");
+            h4.innerHTML = `<span>${ledger.strategy_name || ledger.strategy_key}</span> <span class="badge badge-sm badge-go" style="float:right;">${((ledger.capital_weight || 0) * 100).toFixed(0)}% 资本</span>`;
+            col.appendChild(h4);
+
+            const statsDiv = document.createElement("div");
+            statsDiv.style.fontSize = "12px";
+            statsDiv.style.marginBottom = "10px";
+            statsDiv.style.lineHeight = "1.6";
+            statsDiv.innerHTML = `
+                <div>分配总资本: <strong class="font-mono">¥${(ledger.allocated_nav || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</strong></div>
+                <div>股票持仓市值: <span class="font-mono text-primary">¥${(ledger.virtual_equity_value || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</span> (${((ledger.equity_ratio || 0) * 100).toFixed(1)}%)</div>
+                <div>虚拟保留现金: <span class="font-mono text-muted">¥${(ledger.virtual_cash || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</span> (${((ledger.cash_ratio || 0) * 100).toFixed(1)}%)</div>
+            `;
+            col.appendChild(statsDiv);
+
+            const tableContainer = document.createElement("div");
+            tableContainer.style.maxHeight = "220px";
+            tableContainer.style.overflowY = "auto";
+
+            const holdings = ledger.holdings || {};
+            const syms = Object.keys(holdings);
+
+            if (syms.length === 0) {
+                tableContainer.innerHTML = '<div class="text-muted text-center" style="font-size: 11px; padding: 10px;">当前子策略持有 100% 现金，无持股</div>';
+            } else {
+                const table = document.createElement("table");
+                table.className = "data-table";
+                table.style.fontSize = "11px";
+                table.innerHTML = `
+                    <thead>
+                        <tr>
+                            <th>标的代码</th>
+                            <th>标的名称</th>
+                            <th class="text-right">子账本持股</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${syms.map(sym => {
+                            const sh = holdings[sym];
+                            const name = resolveStockDisplayName(sym, sym);
+                            return `
+                                <tr>
+                                    <td class="font-mono">${sym}</td>
+                                    <td>${name}</td>
+                                    <td class="text-right font-mono">${(sh || 0).toLocaleString()} 股</td>
+                                </tr>
+                            `;
+                        }).join("")}
+                    </tbody>
+                `;
+                tableContainer.appendChild(table);
+            }
+
+            col.appendChild(tableContainer);
+            grid.appendChild(col);
+        });
+
+        el.containerSubLedgersContent.appendChild(grid);
+        if (el.modalSubLedgers) el.modalSubLedgers.classList.add("active");
+    }
+
+    // -------------------------------------------------------------------------
     // Four Segments View Controller (Universe, Holdings, Health, Orders)
     // -------------------------------------------------------------------------
     function showAllFourSegments(clearArchive = true) {
@@ -1691,6 +2281,7 @@
         const cardUniv = document.getElementById("card-universe");
         const cardHold = document.getElementById("card-holdings");
         const cardHealth = document.getElementById("card-health");
+        const cardFriction = document.getElementById("card-friction");
         const cardOrders = document.getElementById("card-orders");
         const cardConsole = document.getElementById("card-console");
         const histBar = document.getElementById("history-bar");
@@ -1699,6 +2290,9 @@
         [cardUniv, cardHold, cardHealth, cardOrders, cardConsole].forEach(c => {
             if (c) c.style.display = "";
         });
+        if (cardFriction) {
+            cardFriction.style.display = state.activeFrictionSavings ? "block" : "none";
+        }
         if (leftPanel) leftPanel.style.display = "";
         if (rightPanel) rightPanel.style.display = "";
         if (histBar) histBar.style.display = "";
@@ -1751,12 +2345,13 @@
         const cardUniv = document.getElementById("card-universe");
         const cardHold = document.getElementById("card-holdings");
         const cardHealth = document.getElementById("card-health");
+        const cardFriction = document.getElementById("card-friction");
         const cardOrders = document.getElementById("card-orders");
         const cardConsole = document.getElementById("card-console");
         const histBar = document.getElementById("history-bar");
 
         // Hide all cards first on mobile
-        [cardUniv, cardHold, cardHealth, cardOrders, cardConsole].forEach(c => {
+        [cardUniv, cardHold, cardHealth, cardFriction, cardOrders, cardConsole].forEach(c => {
             if (c) c.style.display = "none";
         });
         if (leftPanel) leftPanel.style.display = "flex";
@@ -1774,6 +2369,7 @@
             if (histBar) histBar.style.display = "none";
         } else if (tabId === "tab-orders") {
             if (leftPanel) leftPanel.style.display = "none";
+            if (cardFriction && state.activeFrictionSavings) cardFriction.style.display = "block";
             if (cardOrders) cardOrders.style.display = "block";
             if (histBar) histBar.style.display = "none";
         } else if (tabId === "tab-history") {
@@ -1809,6 +2405,7 @@
             const cardUniv = document.getElementById("card-universe");
             const cardHold = document.getElementById("card-holdings");
             const cardHealth = document.getElementById("card-health");
+            const cardFriction = document.getElementById("card-friction");
             const cardOrders = document.getElementById("card-orders");
             const cardConsole = document.getElementById("card-console");
             const histBar = document.getElementById("history-bar");
@@ -1816,6 +2413,9 @@
             [cardUniv, cardHold, cardHealth, cardOrders, cardConsole].forEach(c => {
                 if (c) c.style.display = "";
             });
+            if (cardFriction) {
+                cardFriction.style.display = state.activeFrictionSavings ? "block" : "none";
+            }
             if (leftPanel) leftPanel.style.display = "";
             if (rightPanel) rightPanel.style.display = "";
             if (histBar) histBar.style.display = "";

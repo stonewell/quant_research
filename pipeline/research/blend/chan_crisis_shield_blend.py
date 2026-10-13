@@ -87,6 +87,7 @@ class ChanCrisisShieldBlendStrategy(BaseBlendAllocationStrategy):
         min_chg = float(self.resolve_param(p, "min_weight_change", getattr(cfg, "ccsb_min_weight_change", 0.05), float))
         vol_m = str(self.resolve_param(p, "vol_model", getattr(cfg, "ccsb_vol_model", "garman_klass"), str))
         stop_m = str(self.resolve_param(p, "stop_mode", getattr(cfg, "ccsb_stop_mode", "atr_trailing"), str))
+        min_entry = int(self.resolve_param(p, "min_entry_bars", getattr(cfg, "ccsb_min_entry_bars", 2), int))
 
         return (
             f"Chan Crisis Shield Blend Strategy (chan_crisis_shield_blend): "
@@ -94,7 +95,9 @@ class ChanCrisisShieldBlendStrategy(BaseBlendAllocationStrategy):
             f"chan_three_type ({three_w:.0%}), and WorldQuant Alpha#{shield_id} Volume Shock Reversal ({shield_w:.0%}) "
             f"with hard position cap ({max_pos:.0%} max per stock), "
             f"drawdown circuit breakers (smooth damping from 10%, defensive VAA at 15%, stop at 20% with fast recovery & 15d auto-heal), "
-            f"turnover filter (min trade change {min_chg:.0%}), volatility targeting (12% target vol via {vol_m}), "
+            f"turnover filter (min trade change {min_chg:.0%}), "
+            f"{f'{min_entry}d entry confirmation gate, ' if min_entry > 1 else ''}"
+            f"volatility targeting (12% target vol via {vol_m}), "
             f"{'stop mode (' + stop_m + '), ' if stop_m != 'none' else ''}"
             f"and dynamic cash deployment in bull breadth (>=30% or 10d thrust)."
         )

@@ -19,6 +19,7 @@ try:
         AccountStateModel,
         CustomUniverseModel,
         HoldingsUpdateModel,
+        MultiStrategyDeployRequest,
         QuotesRequestModel,
         RunDeployRequest,
         RunHealthRequest,
@@ -32,6 +33,7 @@ except (ImportError, ValueError):
         AccountStateModel,
         CustomUniverseModel,
         HoldingsUpdateModel,
+        MultiStrategyDeployRequest,
         QuotesRequestModel,
         RunDeployRequest,
         RunHealthRequest,
@@ -86,6 +88,7 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
             "strategies": storage.discover_strategies(),
             "universes": storage.discover_universes(),
             "settings": storage.get_settings(),
+            "multi_strategy_presets": storage.get_multi_strategy_configs(),
             "data_providers": ["synthetic", "marketdb", "fuyao", "yfinance"],
             "default_date": date.today().isoformat(),
             "default_portfolio_value": storage.default_portfolio_value,
@@ -236,6 +239,75 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
             )
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
+
+    # --------------------------------------------------------------------------
+    # API Routes: Multi-Strategy Collaborative Netting Deployment
+    # --------------------------------------------------------------------------
+    @app.get("/api/multi-strategy/configs", summary="List multi-strategy collaborative matrix configs")
+    async def list_multi_strategy_configs() -> List[Dict[str, Any]]:
+        return storage.get_multi_strategy_configs()
+
+    @app.post("/api/multi-strategy/configs", summary="Save multi-strategy matrix configuration")
+    async def save_multi_strategy_config(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        try:
+            return storage.save_multi_strategy_config(payload)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    @app.post("/api/deploy/multi", summary="Execute Multi-Strategy Order Netting Deployment")
+    async def run_multi_strategy_deploy(payload: MultiStrategyDeployRequest) -> Dict[str, Any]:
+        try:
+            strat_list = [s.model_dump() for s in payload.strategies] if payload.strategies else None
+            return execution_service.run_multi_strategy_netted_deploy(
+                matrix_id=payload.matrix_id,
+                strategies=strat_list,
+                universe_file=payload.universe_file,
+                custom_symbols=payload.custom_symbols,
+                as_of_date=payload.as_of_date,
+                portfolio_value=payload.portfolio_value,
+                current_holdings=payload.current_holdings,
+                data_provider=payload.data_provider,
+                min_holding_bars=payload.min_holding_bars,
+                inertia_threshold=payload.inertia_threshold,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    @app.get("/api/deploy/multi/latest", summary="Get latest multi-strategy netting run result")
+    async def get_latest_multi_netting_run(
+        matrix_id: str = Query("tri_core_blend", description="Collaborative matrix identifier"),
+        date_str: Optional[str] = Query(None, alias="date", description="Valuation date (default: today)"),
+    ) -> Dict[str, Any]:
+        val_date = date_str or date.today().isoformat()
+        bundle = storage.get_multi_netting_run(val_date, matrix_id)
+        if not bundle:
+            raise HTTPException(status_code=404, detail=f"No netting run found for matrix '{matrix_id}' on {val_date}")
+        return bundle
+
+    @app.get("/api/deploy/multi/latest/csv", summary="Download latest multi-strategy netted ticket CSV")
+    async def download_latest_multi_netting_csv(
+        matrix_id: str = Query("tri_core_blend", description="Collaborative matrix identifier"),
+        date_str: Optional[str] = Query(None, alias="date", description="Valuation date (default: today)"),
+    ) -> Response:
+        val_date = date_str or date.today().isoformat()
+        bundle = storage.get_multi_netting_run(val_date, matrix_id)
+        if not bundle:
+            raise HTTPException(status_code=404, detail=f"No netting run found for matrix '{matrix_id}' on {val_date}")
+        run_dir = bundle.get("path")
+        if not run_dir or not os.path.isdir(run_dir):
+            raise HTTPException(status_code=404, detail="Run directory not found")
+        csv_file = os.path.join(run_dir, "netted_trading_ticket.csv")
+        if not os.path.exists(csv_file):
+            raise HTTPException(status_code=404, detail="Netted trading ticket CSV not found")
+        with open(csv_file, "r", encoding="utf-8") as f:
+            content = f.read()
+        filename = f"netted_trading_ticket_{matrix_id}_{val_date}.csv"
+        return Response(
+            content=content,
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
+
 
     # --------------------------------------------------------------------------
     # API Routes: Historical Runs Archive (Scoped by Strategy & Universe)

@@ -861,3 +861,145 @@ input[type="date"]::-webkit-calendar-picker-indicator:hover {
     to { opacity: 1; transform: translate(-50%, 0); }
 }
 
+/* --------------------------------------------------------------------------
+   Multi-Strategy Netting & Friction Savings Audit
+   -------------------------------------------------------------------------- */
+.btn-link-xs {
+    background: none;
+    border: none;
+    color: var(--accent-primary);
+    font-size: 11px;
+    cursor: pointer;
+    padding: 0 4px;
+    text-decoration: underline;
+    font-weight: 600;
+}
+.btn-link-xs:hover {
+    color: #7dd3fc;
+}
+
+.friction-summary-banner {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+.f-stat-card {
+    background-color: var(--bg-surface);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.f-stat-card.highlight {
+    border-color: rgba(16, 185, 129, 0.4);
+    background-color: rgba(16, 185, 129, 0.08);
+}
+
+.f-stat-title {
+    font-size: 11px;
+    color: var(--text-muted);
+    font-weight: 600;
+}
+
+.f-stat-val {
+    font-size: 16px;
+    font-weight: 700;
+    font-family: var(--font-mono);
+}
+
+.f-stat-sub {
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+
+.turnover-bar-container {
+    background-color: var(--bg-surface);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 10px 14px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    font-size: 13px;
+}
+
+.turnover-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.turnover-item .t-label {
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+.turnover-arrow {
+    color: var(--text-muted);
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.badge-hold-filtered {
+    background-color: rgba(245, 158, 11, 0.15);
+    color: #fbbf24;
+    border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+.badge-crossed {
+    background-color: rgba(56, 189, 248, 0.15);
+    color: #38bdf8;
+    border: 1px solid rgba(56, 189, 248, 0.3);
+}
+
+.strategy-weight-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 8px;
+    padding: 8px 12px;
+    background-color: var(--bg-surface);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+}
+
+.strategy-weight-row .strat-name {
+    flex: 1;
+    font-weight: 600;
+    font-size: 13px;
+}
+
+.strategy-weight-row .strat-weight-input {
+    width: 90px;
+}
+
+.subledger-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 12px;
+    margin-top: 10px;
+}
+
+.subledger-col {
+    background-color: var(--bg-surface);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 12px;
+}
+
+.subledger-col h4 {
+    font-size: 13px;
+    color: var(--accent-primary);
+    margin-bottom: 8px;
+    border-bottom: 1px solid var(--border-color);
+    padding-bottom: 4px;
+}
+
+

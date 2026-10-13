@@ -215,9 +215,9 @@ def resolve_blend_param(
     param_type: Optional[type] = None,
 ) -> Any:
     """Resolve configuration parameter across blend strategy prefix variants:
-    cfsb_*, crb_*, ccsb_*, cdhb_*, blend_*, or direct un-prefixed name.
+    cfsb_*, crb_*, ccsb_*, cfssb_*, cdhb_*, blend_*, or direct un-prefixed name.
     """
-    for prefix in ("cfsb", "crb", "ccsb", "cdhb", "blend"):
+    for prefix in ("cfsb", "crb", "ccsb", "cfssb", "cdhb", "blend"):
         k = f"{prefix}_{name}"
         if k in params:
             val = params[k]

@@ -377,6 +377,7 @@ class StrategyConfig:
     chan_fse_adx_filter: bool = True
     chan_fse_adx_threshold: float = 20.0
     chan_fse_adx_period: int = 14
+    chan_fse_min_entry_bars: int = 2          # Consecutive signal bars required before entry confirmation (1 disables)
 
     # --- Chan Best Selector Meta-Strategy ---
     chan_best_lookback_days: int = 63
@@ -578,6 +579,7 @@ class StrategyConfig:
     crb_entry_threshold: float = 0.03         # Minimum initial position allocation threshold
     crb_asset_stop_cooldown_bars: int = 5     # Cooldown bars for an asset after hitting stop loss
     crb_min_holding_bars: int = 2             # Minimum holding bars to suppress 1-day whipsaws (0 disables)
+    crb_min_entry_bars: int = 2               # Consecutive signal bars required before entry confirmation (1 disables)
     crb_thrust_incumbent_bonus: float = 1.20  # Score multiplier for held assets during candidate selection
 
     # --- Chan Four-State Risk-Managed Blend Strategy (chan_four_state_blend) ---
@@ -611,6 +613,7 @@ class StrategyConfig:
     cfsb_entry_threshold: float = 0.03
     cfsb_asset_stop_cooldown_bars: int = 5
     cfsb_min_holding_bars: int = 2
+    cfsb_min_entry_bars: int = 2
     cfsb_thrust_incumbent_bonus: float = 1.20
 
     # --- Chan Crisis Shield Blend Strategy (chan_crisis_shield_blend) ---
@@ -642,7 +645,42 @@ class StrategyConfig:
     ccsb_entry_threshold: float = 0.03
     ccsb_asset_stop_cooldown_bars: int = 5
     ccsb_min_holding_bars: int = 2
+    ccsb_min_entry_bars: int = 2
     ccsb_thrust_incumbent_bonus: float = 1.20
+
+    # --- Chan Four-State Shield Blend Strategy (chan_four_state_shield_blend) ---
+    cfssb_three_type_weight: float = 0.35
+    cfssb_vaa_weight: float = 0.25
+    cfssb_four_state_weight: float = 0.20
+    cfssb_shield_weight: float = 0.20
+    cfssb_shield_alpha_id: int = 12          # WorldQuant Alpha#12 (Volume Shock Reversal)
+    cfssb_shield_require_trend: bool = False
+    cfssb_dynamic_regime_weights: bool = True
+    cfssb_max_single_position: float = 0.20
+    cfssb_min_weight_change: float = 0.05
+    cfssb_dd_reduce_thresh: float = 0.10
+    cfssb_dd_defensive_thresh: float = 0.15
+    cfssb_dd_stop_thresh: float = 0.20
+    cfssb_tier1_cooldown_bars: int = 15
+    cfssb_dynamic_cash_deployment: bool = True
+    cfssb_breadth_lookback: int = 50
+    cfssb_breadth_bull_thresh: float = 0.30
+    cfssb_thrust_lookback: int = 10
+    cfssb_thrust_thresh: float = 0.60
+    cfssb_target_bull_exposure: float = 0.80
+    cfssb_bull_max_single_position: float = 0.20
+    cfssb_enable_vol_targeting: bool = True
+    cfssb_target_vol: float = 0.12
+    cfssb_smooth_drawdown: bool = True
+    cfssb_vol_model: str = "garman_klass"
+    cfssb_stop_mode: str = "atr_trailing"
+    cfssb_stop_atr_mult: float = 4.5
+    cfssb_adaptive_inertia: bool = True
+    cfssb_entry_threshold: float = 0.03
+    cfssb_asset_stop_cooldown_bars: int = 5
+    cfssb_min_holding_bars: int = 2
+    cfssb_min_entry_bars: int = 2
+    cfssb_thrust_incumbent_bonus: float = 1.20
 
     # --- Chan Dual Hybrid Alpha Blend Strategy (chan_dual_hybrid_blend) ---
     cdhb_three_type_weight: float = 0.45
@@ -692,6 +730,7 @@ class StrategyConfig:
     cdhb_stop_mode: str = "atr_trailing"     # "atr_trailing" (Chandelier Exit) or "fixed_pct" (-8%)
     cdhb_stop_atr_mult: float = 4.5          # Multiplier for ATR trailing stop
     cdhb_min_holding_bars: int = 2           # Minimum holding bars to suppress 1-day whipsaws (0 disables)
+    cdhb_min_entry_bars: int = 2             # Consecutive signal bars required before entry confirmation (1 disables)
     cdhb_thrust_incumbent_bonus: float = 1.20 # Score multiplier for held assets during candidate selection
 
     # --- Universal Base Blend Strategy Configuration ---
@@ -700,6 +739,7 @@ class StrategyConfig:
     blend_min_weight_change: float = 0.05
     blend_entry_threshold: float = 0.03
     blend_min_holding_bars: int = 2          # Minimum holding bars to suppress 1-day whipsaws (0 disables)
+    blend_min_entry_bars: int = 2            # Consecutive signal bars required before entry confirmation (1 disables)
     blend_thrust_incumbent_bonus: float = 1.20 # Score multiplier for held assets during candidate selection
     blend_dd_reduce_thresh: float = 0.10
     blend_dd_defensive_thresh: float = 0.15
@@ -908,6 +948,8 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.chan_fse_cooldown_bars must be >= 0, got {self.chan_fse_cooldown_bars}")
         if not (0.0 <= self.chan_fse_breadth_bull_thresh <= 1.0):
             raise ValueError(f"StrategyConfig.chan_fse_breadth_bull_thresh must be between 0 and 1, got {self.chan_fse_breadth_bull_thresh}")
+        if self.chan_fse_min_entry_bars < 1:
+            raise ValueError(f"StrategyConfig.chan_fse_min_entry_bars must be >= 1, got {self.chan_fse_min_entry_bars}")
         if self.chan_vaa_rebalance_freq_days <= 0:
             raise ValueError(f"StrategyConfig.chan_vaa_rebalance_freq_days must be > 0, got {self.chan_vaa_rebalance_freq_days}")
         if self.bb_period <= 0:
@@ -1098,10 +1140,13 @@ class StrategyConfig:
         if not (0.0 <= self.blend_adaptive_shrinkage <= 1.0):
             raise ValueError(f"StrategyConfig.blend_adaptive_shrinkage must be between 0 and 1, got {self.blend_adaptive_shrinkage}")
 
-        for pfx in ("crb", "cfsb", "ccsb", "cdhb", "blend"):
+        for pfx in ("crb", "cfsb", "ccsb", "cfssb", "cdhb", "blend"):
             val = getattr(self, f"{pfx}_min_holding_bars", None)
             if val is not None and val < 0:
                 raise ValueError(f"StrategyConfig.{pfx}_min_holding_bars must be >= 0, got {val}")
+            entry_bars = getattr(self, f"{pfx}_min_entry_bars", None)
+            if entry_bars is not None and entry_bars < 1:
+                raise ValueError(f"StrategyConfig.{pfx}_min_entry_bars must be >= 1, got {entry_bars}")
             bonus = getattr(self, f"{pfx}_thrust_incumbent_bonus", None)
             if bonus is not None and bonus < 1.0:
                 raise ValueError(f"StrategyConfig.{pfx}_thrust_incumbent_bonus must be >= 1.0, got {bonus}")

@@ -102,6 +102,7 @@ class ChanFourStateBlendStrategy(BaseBlendAllocationStrategy):
         smooth_dd = bool(self.resolve_param(p, "smooth_drawdown", getattr(cfg, "cfsb_smooth_drawdown", True), bool))
         vol_m = str(self.resolve_param(p, "vol_model", getattr(cfg, "cfsb_vol_model", "garman_klass"), str))
         stop_m = str(self.resolve_param(p, "stop_mode", getattr(cfg, "cfsb_stop_mode", "atr_trailing"), str))
+        min_entry = int(self.resolve_param(p, "min_entry_bars", getattr(cfg, "cfsb_min_entry_bars", 2), int))
 
         return (
             f"Chan Four-State Risk-Managed Blend Strategy (chan_four_state_blend): "
@@ -110,6 +111,7 @@ class ChanFourStateBlendStrategy(BaseBlendAllocationStrategy):
             f"with hard position cap ({max_pos:.0%} max per stock), "
             f"drawdown circuit breakers ({'smooth damping' if smooth_dd else 'halve equity'} from {dd_red:.0%}, defensive VAA at {dd_def:.0%}, stop at {dd_stop:.0%} with fast recovery & {tier1_cd}d auto-heal), "
             f"turnover filter (min trade change {min_chg:.0%}), "
+            f"{f'{min_entry}d entry confirmation gate, ' if min_entry > 1 else ''}"
             f"{'volatility targeting (' + f'{t_vol:.0%}' + f' target vol via {vol_m}), ' if vol_tgt else ''}"
             f"{'stop mode (' + stop_m + '), ' if stop_m != 'none' else ''}"
             f"and {'dynamic cash deployment in bull breadth (>=' + f'{b_thresh:.0%}' + f' or {t_lookback}d thrust)' if dyn_cash else 'static cash buffer'}."

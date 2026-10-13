@@ -1,0 +1,3 @@
+﻿symbol,name,action,price,current_weight,target_weight,delta_weight,current_shares,target_shares,delta_shares,trade_value,trade_value_rmb,gross_buy_shares,gross_sell_shares,crossed_shares,holding_bars,reason
+601088.SH,中国神华,BUY,85.48649287765801,0.0,0.085486492877658,0.085486492877658,0,100,100,8548.6492877658,8548.6492877658,0,0,0,0,多策略协同新开仓
+BIL,现金及现金管理工具,RELEASE_CASH,1.0,1.0,0.914513507122342,-0.08548649287765797,100000,91451,-8549,8548.649287765802,8548.649287765802,0,0,0,999,多策略净额化流动性资金归集/释放

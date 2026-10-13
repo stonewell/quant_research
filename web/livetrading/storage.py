@@ -224,6 +224,8 @@ def is_run_dir(path: Optional[str]) -> bool:
             "stage1_health_report.json",
             "live_trading_ticket.json",
             "live_trading_ticket.csv",
+            "netted_trading_ticket.json",
+            "netted_trading_ticket.csv",
             "summary.json",
             "post_holdings.json",
             "holdings.json",
@@ -314,6 +316,7 @@ class StorageManager:
         if not stage2_candidate or "run_live_four_state_blend.py" in stage2_candidate or not os.path.exists(stage2_candidate):
             stage2_candidate = universal_candidate
         self.stage2_script = os.path.abspath(stage2_candidate)
+        self.multi_netting_script = os.path.abspath(os.path.join(self.repo_root, "scripts", "run_live_multi_strategy.py"))
 
         resolved_py = (
             python_executable
@@ -377,6 +380,7 @@ class StorageManager:
             "cache_dir": self.cache_dir,
             "stage1_script": self.stage1_script,
             "stage2_script": self.stage2_script,
+            "multi_netting_script": self.multi_netting_script,
             "python_executable": self.python_executable,
             "default_data_provider": self.default_data_provider,
             "default_portfolio_value": self.default_portfolio_value,
@@ -1166,12 +1170,18 @@ class StorageManager:
             if (
                 "stage1_health_report.json" in files
                 or "live_trading_ticket.json" in files
+                or "netted_trading_ticket.json" in files
                 or "summary.json" in files
                 or "live_trading_ticket.csv" in files
+                or "netted_trading_ticket.csv" in files
             ):
                 health_path = os.path.join(root, "stage1_health_report.json")
                 ticket_path = os.path.join(root, "live_trading_ticket.json")
+                if not os.path.exists(ticket_path):
+                    ticket_path = os.path.join(root, "netted_trading_ticket.json")
                 csv_path = os.path.join(root, "live_trading_ticket.csv")
+                if not os.path.exists(csv_path):
+                    csv_path = os.path.join(root, "netted_trading_ticket.csv")
                 summary_path = os.path.join(root, "summary.json")
 
                 health_rep = self._load_json(health_path, default={})
@@ -1181,13 +1191,25 @@ class StorageManager:
                 if not ticket_rep and os.path.exists(csv_path):
                     ticket_rep = parse_ticket_csv(csv_path)
 
+                base_name = os.path.basename(root)
                 # Determine date from summary or directory basename
-                date_val = summary_rep.get("date") or os.path.basename(root)
+                date_val = summary_rep.get("date")
+                if not date_val:
+                    if base_name.startswith("multi_netted_"):
+                        date_val = os.path.basename(os.path.dirname(root))
+                    else:
+                        date_val = base_name
 
                 # Determine strategy and universe keys
-                r_strat_key = summary_rep.get("strategy_key")
+                r_strat_key = summary_rep.get("strategy_key") or summary_rep.get("matrix_id")
+                if not r_strat_key and base_name.startswith("multi_netted_"):
+                    r_strat_key = base_name.replace("multi_netted_", "")
+
                 r_univ_key = summary_rep.get("universe_key")
-                r_strat_name = summary_rep.get("strategy_name")
+                if not r_univ_key and base_name.startswith("multi_netted_"):
+                    r_univ_key = "multi_matrix"
+
+                r_strat_name = summary_rep.get("strategy_name") or summary_rep.get("name")
                 r_univ_name = summary_rep.get("universe_name")
 
                 # If missing from summary, deduce from relative path or strategy_file
@@ -1197,7 +1219,7 @@ class StorageManager:
                         r_strat_key = rel_parts[0]
                     if not r_univ_key:
                         r_univ_key = rel_parts[1]
-                else:
+                elif not base_name.startswith("multi_netted_"):
                     # Legacy flat runs
                     strat_file = summary_rep.get("strategy_file") or ""
                     univ_file = summary_rep.get("universe_file") or ""
@@ -1311,6 +1333,10 @@ class StorageManager:
     ) -> Optional[Dict[str, Any]]:
         """Retrieve complete archived artifacts for a date, optionally matching strategy & universe."""
         run_dir = self.find_existing_run_dir(strategy_key, universe_key, date_str)
+        if not run_dir and strategy_key and date_str:
+            cand_netted = self.get_multi_netting_run_dir(strategy_key, date_str)
+            if is_run_dir(cand_netted):
+                run_dir = cand_netted
         if not run_dir:
             # Search list_runs
             matching = [
@@ -1330,6 +1356,14 @@ class StorageManager:
         summary_data = self._load_json(os.path.join(run_dir, "summary.json"), default={})
         csv_path = os.path.join(run_dir, "live_trading_ticket.csv")
         json_path = os.path.join(run_dir, "live_trading_ticket.json")
+        if not os.path.exists(json_path) and not os.path.exists(csv_path):
+            netted_json = os.path.join(run_dir, "netted_trading_ticket.json")
+            netted_csv = os.path.join(run_dir, "netted_trading_ticket.csv")
+            if os.path.exists(netted_json):
+                json_path = netted_json
+            if os.path.exists(netted_csv):
+                csv_path = netted_csv
+
         ticket = None
         if os.path.exists(csv_path) and os.path.exists(json_path):
             if os.path.getmtime(csv_path) > os.path.getmtime(json_path):
@@ -1348,7 +1382,7 @@ class StorageManager:
                     if is_placeholder_stock_name(name_val, r.get("symbol")):
                         r["name"] = get_stock_name(r.get("symbol", ""), r.get("symbol", ""))
 
-        strat_k = summary_data.get("strategy_key") or strategy_key or ""
+        strat_k = summary_data.get("strategy_key") or summary_data.get("matrix_id") or strategy_key or ""
         univ_k = summary_data.get("universe_key") or universe_key or ""
         strat_n = summary_data.get("strategy_name", "")
         univ_n = summary_data.get("universe_name", "")
@@ -1389,6 +1423,9 @@ class StorageManager:
                     except (ValueError, TypeError):
                         pass
 
+        friction_savings = self._load_json(os.path.join(run_dir, "friction_savings_report.json"))
+        sub_ledgers = self._load_json(os.path.join(run_dir, "sub_ledgers.json"))
+
         return {
             "date": date_str,
             "path": run_dir,
@@ -1398,11 +1435,13 @@ class StorageManager:
             "universe_name": univ_n,
             "health_report": self._load_json(os.path.join(run_dir, "stage1_health_report.json")),
             "trading_ticket": ticket,
+            "friction_savings": friction_savings,
+            "sub_ledgers": sub_ledgers,
             "summary": summary_data,
             "holdings": holdings_data or {},
             "prices": prices_map,
             "account_state": account_state,
-            "has_csv": os.path.exists(os.path.join(run_dir, "live_trading_ticket.csv")),
+            "has_csv": os.path.exists(os.path.join(run_dir, "live_trading_ticket.csv")) or os.path.exists(os.path.join(run_dir, "netted_trading_ticket.csv")),
         }
 
     def get_run_csv(
@@ -1412,6 +1451,10 @@ class StorageManager:
         universe_key: Optional[str] = None,
     ) -> Optional[str]:
         run_dir = self.find_existing_run_dir(strategy_key, universe_key, date_str)
+        if not run_dir and strategy_key and date_str:
+            cand_netted = self.get_multi_netting_run_dir(strategy_key, date_str)
+            if is_run_dir(cand_netted):
+                run_dir = cand_netted
         if not run_dir:
             matching = [
                 r for r in self.list_runs(strategy_key=strategy_key, universe_key=universe_key)
@@ -1424,10 +1467,121 @@ class StorageManager:
                 if is_run_dir(legacy):
                     run_dir = legacy
 
-        if run_dir:
-            csv_file = os.path.join(run_dir, "live_trading_ticket.csv")
-            if os.path.exists(csv_file):
-                with open(csv_file, "r", encoding="utf-8") as f:
+        if not run_dir or not is_run_dir(run_dir):
+            return None
+
+        for cand_name in ("live_trading_ticket.csv", "netted_trading_ticket.csv"):
+            cand_p = os.path.join(run_dir, cand_name)
+            if os.path.exists(cand_p):
+                with open(cand_p, "r", encoding="utf-8") as f:
                     return f.read()
         return None
+
+    # ==========================================================================
+    # Multi-Strategy Order Netting & Portfolio Matrix Management
+    # ==========================================================================
+    def get_multi_strategy_presets(self) -> List[Dict[str, Any]]:
+        """Default recommended multi-strategy collaborative matrix presets."""
+        return [
+            {
+                "matrix_id": "tri_core_blend",
+                "name": "三核协同旗舰组合 (Tri-Core Blend Matrix)",
+                "description": "危机盾40% + 风控盾35% + 四象危机盾25% 协同撮合净额化",
+                "universe_file": "docs/universe/china/pruned_core_satellite_blend_16.txt",
+                "portfolio_value": 100000.0,
+                "strategies": [
+                    {"strategy_key": "chan_crisis_shield_blend", "capital_weight": 0.40, "name": "Chan Single Crisis Shield Blend"},
+                    {"strategy_key": "chan_risk_managed_blend", "capital_weight": 0.35, "name": "Chan Risk-Managed Blend"},
+                    {"strategy_key": "chan_four_state_shield_blend", "capital_weight": 0.25, "name": "Chan Four-State Shield Blend"},
+                ],
+            },
+            {
+                "matrix_id": "dual_core_shield",
+                "name": "双核攻守对冲组合 (Dual-Core Crisis-Defense Matrix)",
+                "description": "危机盾50% + 风控盾50% 经典双核平衡净额化",
+                "universe_file": "docs/universe/china/pruned_core_satellite_blend_16.txt",
+                "portfolio_value": 100000.0,
+                "strategies": [
+                    {"strategy_key": "chan_crisis_shield_blend", "capital_weight": 0.50, "name": "Chan Single Crisis Shield Blend"},
+                    {"strategy_key": "chan_risk_managed_blend", "capital_weight": 0.50, "name": "Chan Risk-Managed Blend"},
+                ],
+            },
+            {
+                "matrix_id": "four_state_duo",
+                "name": "缠论四象主升组合 (Four-State Alpha Duo)",
+                "description": "四象危机盾50% + 四象风控盾50% 拒绝盘整纯趋势配置",
+                "universe_file": "docs/universe/china/pruned_core_satellite_blend_16.txt",
+                "portfolio_value": 100000.0,
+                "strategies": [
+                    {"strategy_key": "chan_four_state_shield_blend", "capital_weight": 0.50, "name": "Chan Four-State Shield Blend"},
+                    {"strategy_key": "chan_four_state_blend", "capital_weight": 0.50, "name": "Chan Four-State Risk-Managed Blend"},
+                ],
+            },
+        ]
+
+    def get_multi_strategy_configs(self) -> List[Dict[str, Any]]:
+        """Load configured multi-strategy matrix presets."""
+        cfg_file = os.path.join(self.data_dir, "multi_strategy_configs.json")
+        saved = self._load_json(cfg_file, default=None)
+        if saved and isinstance(saved, list) and len(saved) > 0:
+            return saved
+        # Return default presets and save
+        presets = self.get_multi_strategy_presets()
+        self._save_json(cfg_file, presets)
+        return presets
+
+    def save_multi_strategy_config(self, config: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Save or update a multi-strategy matrix preset."""
+        configs = self.get_multi_strategy_configs()
+        m_id = config.get("matrix_id")
+        if not m_id:
+            m_id = sanitize_key(config.get("name", "custom_matrix")) or "custom_matrix"
+            config["matrix_id"] = m_id
+
+        found = False
+        for i, c in enumerate(configs):
+            if c.get("matrix_id") == m_id:
+                configs[i] = config
+                found = True
+                break
+        if not found:
+            configs.append(config)
+
+        cfg_file = os.path.join(self.data_dir, "multi_strategy_configs.json")
+        self._save_json(cfg_file, configs)
+        return configs
+
+    def get_multi_netting_run_dir(self, matrix_id: str, date_str: str) -> str:
+        """Resolve archive directory path for a multi-strategy netting run."""
+        clean_m = sanitize_key(matrix_id) or "matrix"
+        clean_d = validate_date_str(date_str) or date.today().isoformat()
+        return os.path.join(self.archive_dir, clean_d, f"multi_netted_{clean_m}")
+
+    def get_multi_netting_run(self, date_str: str, matrix_id: str) -> Optional[Dict[str, Any]]:
+        """Load netted run artifacts for specified matrix and date."""
+        run_dir = self.get_multi_netting_run_dir(matrix_id, date_str)
+        if not os.path.exists(run_dir):
+            # Check fallback to default ruleset folder if archive does not exist yet
+            fallback_dir = os.path.join(self.repo_root, "docs", "ruleset", "multi_strategy_netted")
+            if os.path.exists(fallback_dir) and os.path.exists(os.path.join(fallback_dir, "netted_trading_ticket.json")):
+                run_dir = fallback_dir
+            else:
+                return None
+
+        ticket_json = self._load_json(os.path.join(run_dir, "netted_trading_ticket.json"), default=[])
+        savings_json = self._load_json(os.path.join(run_dir, "friction_savings_report.json"), default={})
+        ledgers_json = self._load_json(os.path.join(run_dir, "sub_ledgers.json"), default={})
+        summary_json = self._load_json(os.path.join(run_dir, "summary.json"), default={})
+
+        return {
+            "date": date_str,
+            "matrix_id": matrix_id,
+            "path": run_dir,
+            "trading_ticket": ticket_json,
+            "friction_savings": savings_json,
+            "sub_ledgers": ledgers_json,
+            "summary": summary_json,
+            "has_csv": os.path.exists(os.path.join(run_dir, "netted_trading_ticket.csv")),
+        }
+
 

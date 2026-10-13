@@ -120,3 +120,27 @@ class RunResponse(BaseModel):
     trading_ticket: Optional[List[Dict[str, Any]]] = None
     account_state: Optional[Dict[str, Any]] = None
     holdings: Optional[Dict[str, Any]] = None
+
+
+class SubStrategyConfigModel(BaseModel):
+    """Configuration for a single sub-strategy in a collaborative portfolio."""
+    strategy_key: str
+    capital_weight: float = 1.0
+    name: Optional[str] = None
+    universe_file: Optional[str] = None
+
+
+class MultiStrategyDeployRequest(BaseModel):
+    """Request payload for multi-strategy order netting deployment."""
+    matrix_id: str = "tri_core_blend"
+    matrix_name: Optional[str] = None
+    strategies: Optional[List[SubStrategyConfigModel]] = None
+    universe_file: Optional[str] = None
+    custom_symbols: Optional[List[str]] = None
+    as_of_date: Optional[str] = None
+    portfolio_value: float = 100000.0
+    current_holdings: Optional[Dict[str, Any]] = None
+    data_provider: Optional[str] = None
+    min_holding_bars: int = 2
+    inertia_threshold: float = 0.05
+

@@ -15,6 +15,7 @@ from .blend_base import (
 from .chan_risk_managed_blend import ChanRiskManagedBlendStrategy
 from .chan_four_state_blend import ChanFourStateBlendStrategy
 from .chan_crisis_shield_blend import ChanCrisisShieldBlendStrategy
+from .chan_four_state_shield_blend import ChanFourStateShieldBlendStrategy
 from .chan_dual_hybrid_blend import ChanDualHybridBlendStrategy
 from .generic_blend import GenericBlendStrategy
 
@@ -23,6 +24,7 @@ __all__ = [
     "ChanRiskManagedBlendStrategy",
     "ChanFourStateBlendStrategy",
     "ChanCrisisShieldBlendStrategy",
+    "ChanFourStateShieldBlendStrategy",
     "ChanDualHybridBlendStrategy",
     "GenericBlendStrategy",
     "CHINA_EQUITY_SECTORS",

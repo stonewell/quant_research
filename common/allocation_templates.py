@@ -250,7 +250,8 @@ def apply_asset_inertia(
     current_w = daily.iloc[0].copy()
     filtered.iloc[0] = current_w
 
-    holding_age = {s: (1 if current_w[s] > 1e-4 else 0) for s in risky_symbols}
+    holding_age = {s: 0 for s in risky_symbols}
+    last_buy_bar = {s: (0 if current_w[s] > 1e-4 else -999) for s in risky_symbols}
 
     for t in range(1, n_dates):
         ideal_w = daily.iloc[t]
@@ -285,12 +286,12 @@ def apply_asset_inertia(
         diff = ideal_w[risky_symbols] - current_w[risky_symbols]
         sells_raw = diff[diff <= -sell_thresh].index.tolist()
 
-        # Suppress sells if asset holding tenure is below min_holding_bars (unless emergency)
+        # Suppress sells if asset holding tenure or time since last buy is below min_holding_bars (unless emergency)
         sells = []
         for s in sells_raw:
             if symbol_emergency.get(s, False):
                 sells.append(s)
-            elif min_holding_bars > 0 and holding_age[s] < min_holding_bars:
+            elif min_holding_bars > 0 and (holding_age[s] < min_holding_bars or (t - last_buy_bar[s]) < min_holding_bars):
                 pass
             else:
                 sells.append(s)
@@ -304,6 +305,8 @@ def apply_asset_inertia(
             # 1. Execute sells first to release cash capacity
             for s in sells:
                 new_w[s] = ideal_w[s]
+                if new_w[s] <= 1e-4:
+                    last_buy_bar[s] = -999
 
             # 2. Execute buys up to available capacity without diluting untouched assets
             non_buy_risky = [s for s in risky_symbols if s not in buys]
@@ -316,6 +319,7 @@ def apply_asset_inertia(
 
                 if buy_target - current_w[b] >= buy_thresh[b]:
                     new_w[b] = buy_target
+                    last_buy_bar[b] = t
                     avail_cap = max(0.0, avail_cap - buy_target)
                 else:
                     new_w[b] = current_w[b]

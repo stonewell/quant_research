@@ -15,6 +15,7 @@ from scripts.run_live_strategy import (
     pad_east_asian,
     resolve_lot_size,
     resolve_trade_inertia_threshold,
+    resolve_min_entry_bars,
     resolve_min_holding_bars,
     resolve_holding_bars,
     resolve_strategy_definition,
@@ -110,11 +111,26 @@ def test_parse_args_dynamic_output_dir(tmp_path):
     assert args_default.health_report_file == os.path.join(expected_default_dir, "stage1_health_report.json")
 
 
+def test_resolve_min_entry_bars():
+    # CLI override has highest priority
+    assert resolve_min_entry_bars({"cfsb_min_entry_bars": 3}, cli_override=4) == 4
+    # Prefixed blend params
+    assert resolve_min_entry_bars({"cfsb_min_entry_bars": 2}) == 2
+    assert resolve_min_entry_bars({"cfssb_min_entry_bars": 3}) == 3
+    assert resolve_min_entry_bars({"crb_min_entry_bars": 4}) == 4
+    assert resolve_min_entry_bars({"blend_min_entry_bars": 2}) == 2
+    assert resolve_min_entry_bars({"min_entry_bars": 3}) == 3
+    # Fallback default
+    assert resolve_min_entry_bars({}) == 2
+    assert resolve_min_entry_bars({}, default=1) == 1
+
+
 def test_resolve_min_holding_bars():
     # CLI override has highest priority
     assert resolve_min_holding_bars({"cfsb_min_holding_bars": 3}, cli_override=5) == 5
     # Prefixed blend params
     assert resolve_min_holding_bars({"cfsb_min_holding_bars": 3}) == 3
+    assert resolve_min_holding_bars({"cfssb_min_holding_bars": 4}) == 4
     assert resolve_min_holding_bars({"crb_min_holding_bars": 4}) == 4
     assert resolve_min_holding_bars({"blend_min_holding_bars": 2}) == 2
     assert resolve_min_holding_bars({"min_holding_bars": 3}) == 3
