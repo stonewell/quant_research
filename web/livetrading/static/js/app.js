@@ -20,6 +20,7 @@
         activeSubLedgers: null,
         historyRuns: [],
         isHistoricalView: false,
+        activeTab: "tab-all",
     };
 
     const KNOWN_STRAT_NAMES = {
@@ -62,6 +63,9 @@
 
     // DOM Elements
     const el = {
+        btnToggleMobileParams: document.getElementById("btn-toggle-mobile-params"),
+        headerControls: document.getElementById("header-controls"),
+        mParamSummary: document.getElementById("m-param-summary"),
         selectMode: document.getElementById("select-mode"),
         ctrlMultiMatrix: document.getElementById("ctrl-multi-matrix"),
         ctrlSingleStrategy: document.getElementById("ctrl-single-strategy"),
@@ -132,6 +136,7 @@
         tbodyOrders: document.getElementById("tbody-orders"),
 
         // Console
+        cardConsole: document.getElementById("card-console"),
         consoleToggle: document.getElementById("console-toggle"),
         consoleBody: document.getElementById("console-body"),
         consoleOutput: document.getElementById("console-output"),
@@ -502,7 +507,7 @@
         if (bundle.account_state) {
             state.accountState = bundle.account_state;
             if (bundle.account_state.peak_nav && el.inputPeakNav) {
-                el.inputPeakNav.placeholder = `历史高位: ¥${bundle.account_state.peak_nav.toLocaleString()}`;
+                el.inputPeakNav.placeholder = `自动: ¥${bundle.account_state.peak_nav.toLocaleString()}`;
             }
             if (bundle.account_state.current_nav && el.inputValue) {
                 el.inputValue.value = bundle.account_state.current_nav;
@@ -684,7 +689,7 @@
                     state.accountState = prevData.account_state || {};
                     if (prevData.account_state) {
                         if (prevData.account_state.peak_nav && el.inputPeakNav) {
-                            el.inputPeakNav.placeholder = `历史高位: ¥${prevData.account_state.peak_nav.toLocaleString()}`;
+                            el.inputPeakNav.placeholder = `自动: ¥${prevData.account_state.peak_nav.toLocaleString()}`;
                         }
                         if (prevData.account_state.current_nav && el.inputValue) {
                             el.inputValue.value = prevData.account_state.current_nav;
@@ -810,23 +815,16 @@
             await loadLatestRunForCurrentPair(false);
             recalcHoldings();
         }
+        updateMobileParamSummary();
 
-        // If on mobile, switch tab; on desktop, keep all four segments visible
-        if (window.innerWidth <= 1024 && qTab && qTab !== "all") {
-            if (qTab === "orders") {
-                handleMobileTabSwitch("tab-orders");
-                const tabBtn = el.mobileTabs?.querySelector('[data-tab="tab-orders"]');
-                if (tabBtn) {
-                    el.mobileTabs.querySelectorAll(".mobile-tab").forEach(t => t.classList.remove("active"));
-                    tabBtn.classList.add("active");
-                }
-            } else if (qTab === "health") {
-                handleMobileTabSwitch("tab-health");
-                const tabBtn = el.mobileTabs?.querySelector('[data-tab="tab-health"]');
-                if (tabBtn) {
-                    el.mobileTabs.querySelectorAll(".mobile-tab").forEach(t => t.classList.remove("active"));
-                    tabBtn.classList.add("active");
-                }
+        // If on mobile, switch to focused tab; on desktop, keep all four segments visible
+        if (window.innerWidth <= 1024) {
+            const targetTab = (qTab && qTab !== "all") ? (qTab === "orders" ? "tab-orders" : "tab-health") : "tab-orders";
+            handleMobileTabSwitch(targetTab);
+            const tabBtn = el.mobileTabs?.querySelector(`[data-tab="${targetTab}"]`);
+            if (tabBtn) {
+                el.mobileTabs.querySelectorAll(".mobile-tab").forEach(t => t.classList.remove("active"));
+                tabBtn.classList.add("active");
             }
         } else {
             showAllFourSegments(false);
@@ -866,9 +864,24 @@
             });
         }
 
+        // Mobile Parameter Drawer Toggle
+        if (el.btnToggleMobileParams && el.headerControls) {
+            el.btnToggleMobileParams.addEventListener("click", () => {
+                const isOpen = el.headerControls.classList.toggle("mobile-open");
+                const icon = el.btnToggleMobileParams.querySelector(".toggle-icon");
+                if (icon) icon.textContent = isOpen ? "▲" : "▾";
+            });
+        }
+
         // Mode and Matrix Selection
-        if (el.selectMode) el.selectMode.addEventListener("change", onModeChange);
-        if (el.selectMultiMatrix) el.selectMultiMatrix.addEventListener("change", onMatrixChange);
+        if (el.selectMode) el.selectMode.addEventListener("change", () => {
+            onModeChange();
+            updateMobileParamSummary();
+        });
+        if (el.selectMultiMatrix) el.selectMultiMatrix.addEventListener("change", () => {
+            onMatrixChange();
+            updateMobileParamSummary();
+        });
         if (el.btnConfigMatrix) el.btnConfigMatrix.addEventListener("click", openMatrixModal);
         if (el.btnCloseMatrixModal) el.btnCloseMatrixModal.addEventListener("click", () => el.modalMatrixConfig.classList.remove("active"));
         if (el.btnSaveMatrixConfig) el.btnSaveMatrixConfig.addEventListener("click", saveMatrixConfig);
@@ -879,7 +892,10 @@
         if (el.btnCloseSubLedgersFooter) el.btnCloseSubLedgersFooter.addEventListener("click", () => el.modalSubLedgers.classList.remove("active"));
 
         // Strategy, Universe & Data Provider Change
-        el.selectStrategy.addEventListener("change", onStrategyChange);
+        el.selectStrategy.addEventListener("change", () => {
+            onStrategyChange();
+            updateMobileParamSummary();
+        });
         el.selectUniverse.addEventListener("change", () => onUniverseChange(true));
         el.textCustomSymbols.addEventListener("input", onCustomSymbolsInput);
         if (el.selectProvider) {
@@ -906,7 +922,10 @@
         // Holdings
         el.btnAddHolding.addEventListener("click", () => addHoldingRow("", 0, null));
         el.btnSaveHoldings.addEventListener("click", () => saveHoldings());
-        el.inputValue.addEventListener("input", recalcHoldings);
+        el.inputValue.addEventListener("input", () => {
+            recalcHoldings();
+            updateMobileParamSummary();
+        });
 
         // History
         el.btnLoadDate.addEventListener("click", onLoadDateClicked);
@@ -916,10 +935,15 @@
         // Orders
         el.btnDownloadCsv.addEventListener("click", downloadTicketCsv);
 
-        // Console
-        el.consoleToggle.addEventListener("click", () => {
-            el.consoleBody.style.display = el.consoleBody.style.display === "none" ? "block" : "none";
-        });
+        // Console Drawer Toggle
+        if (el.consoleToggle) {
+            el.consoleToggle.addEventListener("click", () => {
+                const isCollapsed = el.cardConsole ? el.cardConsole.classList.toggle("collapsed") : false;
+                if (el.consoleStatus) {
+                    el.consoleStatus.textContent = isCollapsed ? "就绪 (Idle) ▾" : "就绪 (Idle) ▴";
+                }
+            });
+        }
 
         // Settings Modal
         el.btnSettings.addEventListener("click", openSettingsModal);
@@ -937,6 +961,15 @@
                 });
             });
         }
+    }
+
+    function updateMobileParamSummary() {
+        if (!el.mParamSummary) return;
+        const mode = el.selectMode ? (el.selectMode.value === "multi" ? "🔀 多策略" : "🔹 单策略") : "";
+        const date = el.inputDate ? el.inputDate.value : "";
+        const navVal = parseFloat(el.inputValue?.value) || 100000;
+        const navK = navVal >= 10000 ? `${(navVal / 10000).toFixed(0)}万` : `${(navVal / 1000).toFixed(0)}k`;
+        el.mParamSummary.textContent = `${mode} · ${date || "今日"} · ${navK}`;
     }
 
     // -------------------------------------------------------------------------
@@ -1097,6 +1130,7 @@
             recalcHoldings();
             debounceFetchQuotes();
         });
+        tdSym.setAttribute("data-label", "标的代码");
         tdSym.appendChild(inSym);
 
         const tdShares = document.createElement("td");
@@ -1104,8 +1138,9 @@
         inShares.type = "number";
         inShares.className = "form-input form-input-sm holding-shares";
         inShares.value = (shares !== null && shares > 0) ? shares : "";
-        inShares.placeholder = "股数 (优先)";
+        inShares.placeholder = "股数";
         inShares.addEventListener("input", recalcHoldings);
+        tdShares.setAttribute("data-label", "持仓股数");
         tdShares.appendChild(inShares);
 
         const tdWeight = document.createElement("td");
@@ -1116,6 +1151,7 @@
         inWeight.placeholder = "%";
         inWeight.step = "0.1";
         inWeight.addEventListener("input", recalcHoldings);
+        tdWeight.setAttribute("data-label", "目标权重");
         tdWeight.appendChild(inWeight);
 
         const tdPrice = document.createElement("td");
@@ -1127,10 +1163,12 @@
             tdPrice.textContent = "--";
             tdPrice.dataset.price = "";
         }
+        tdPrice.setAttribute("data-label", "参考价格");
 
         const tdVal = document.createElement("td");
         tdVal.className = "holding-val font-mono";
         tdVal.textContent = "¥0.00";
+        tdVal.setAttribute("data-label", "持仓市值");
 
         const tdAction = document.createElement("td");
         const btnDel = document.createElement("button");
@@ -1141,6 +1179,7 @@
             tr.remove();
             recalcHoldings();
         });
+        tdAction.setAttribute("data-label", "操作");
         tdAction.appendChild(btnDel);
 
         tr.appendChild(tdSym);
@@ -1324,7 +1363,7 @@
                 const data = await res.json();
                 state.accountState = data || {};
                 if (data.peak_nav && el.inputPeakNav) {
-                    el.inputPeakNav.placeholder = `历史高位: ¥${data.peak_nav.toLocaleString()}`;
+                    el.inputPeakNav.placeholder = `自动: ¥${data.peak_nav.toLocaleString()}`;
                 }
                 if (data.current_nav && el.inputValue) {
                     el.inputValue.value = data.current_nav;
@@ -1799,6 +1838,8 @@
 
             // Action Badge
             const tdAct = document.createElement("td");
+            tdAct.setAttribute("data-label", "动作");
+            tdAct.classList.add("col-action", "col-header-group");
             const badge = document.createElement("span");
             badge.className = "badge";
             const act = r.action || "HOLD";
@@ -1827,25 +1868,31 @@
 
             const tdSym = document.createElement("td");
             tdSym.className = "font-mono";
+            tdSym.setAttribute("data-label", "标的代码");
             tdSym.textContent = r.symbol;
 
             const tdName = document.createElement("td");
+            tdName.setAttribute("data-label", "标的名称");
             tdName.textContent = resolveStockDisplayName(r.symbol, r.name);
 
             const tdPrice = document.createElement("td");
             tdPrice.className = "text-right font-mono";
+            tdPrice.setAttribute("data-label", "现价");
             tdPrice.textContent = r.price ? r.price.toFixed(2) : "--";
 
             const tdCurW = document.createElement("td");
             tdCurW.className = "text-right font-mono";
+            tdCurW.setAttribute("data-label", "当前仓位");
             tdCurW.textContent = `${((r.current_weight || 0) * 100).toFixed(1)}%`;
 
             const tdTgtW = document.createElement("td");
             tdTgtW.className = "text-right font-mono";
+            tdTgtW.setAttribute("data-label", "目标仓位");
             tdTgtW.textContent = `${((r.target_weight || 0) * 100).toFixed(1)}%`;
 
             const tdDeltaW = document.createElement("td");
             tdDeltaW.className = "text-right font-mono";
+            tdDeltaW.setAttribute("data-label", "权重变动");
             const delta = (r.delta_weight || 0) * 100;
             tdDeltaW.textContent = `${delta >= 0 ? "+" : ""}${delta.toFixed(1)}%`;
             if (delta > 0.01) tdDeltaW.classList.add("text-success");
@@ -1853,12 +1900,14 @@
 
             const tdShares = document.createElement("td");
             tdShares.className = "text-right font-mono";
+            tdShares.setAttribute("data-label", "净交易股数");
             const deltaShares = r.delta_shares || 0;
             tdShares.textContent = deltaShares !== 0 ? `${deltaShares > 0 ? "+" : ""}${deltaShares.toLocaleString()}` : "0";
 
             // Internal Crossing Column
             const tdCrossed = document.createElement("td");
             tdCrossed.className = "text-right font-mono";
+            tdCrossed.setAttribute("data-label", "内部对冲");
             const crossedSh = r.crossed_shares || 0;
             if (crossedSh > 0) {
                 const sp = document.createElement("span");
@@ -1872,12 +1921,14 @@
 
             const tdVal = document.createElement("td");
             tdVal.className = "text-right font-mono";
+            tdVal.setAttribute("data-label", "预估交易额");
             const tradeVal = r.trade_value || 0;
             tdVal.textContent = tradeVal !== 0 ? `¥${Math.abs(tradeVal).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}` : "--";
 
             // Reason / Narrative Column
             const tdReason = document.createElement("td");
-            tdReason.className = "text-muted";
+            tdReason.className = "text-muted col-reason-group";
+            tdReason.setAttribute("data-label", "调仓动因");
             tdReason.style.fontSize = "11px";
             tdReason.textContent = r.reason || (act === "SELL" ? "目标调降卖出" : (act === "BUY" ? "增配开仓买入" : "维持"));
 
@@ -2276,6 +2327,10 @@
     // Four Segments View Controller (Universe, Holdings, Health, Orders)
     // -------------------------------------------------------------------------
     function showAllFourSegments(clearArchive = true) {
+        state.activeTab = "tab-all";
+        const workspace = document.querySelector(".app-workspace");
+        if (workspace) workspace.classList.remove("single-focus");
+
         const leftPanel = document.getElementById("panel-left");
         const rightPanel = document.getElementById("panel-right");
         const cardUniv = document.getElementById("card-universe");
@@ -2332,13 +2387,19 @@
     }
 
     // -------------------------------------------------------------------------
-    // Mobile Tab Navigation
+    // Mobile & Desktop Tab Navigation
     // -------------------------------------------------------------------------
     function handleMobileTabSwitch(tabId) {
+        state.activeTab = tabId;
+        const workspace = document.querySelector(".app-workspace");
+
         if (tabId === "tab-all") {
+            if (workspace) workspace.classList.remove("single-focus");
             showAllFourSegments(true);
             return;
         }
+
+        if (workspace) workspace.classList.add("single-focus");
 
         const leftPanel = document.getElementById("panel-left");
         const rightPanel = document.getElementById("panel-right");
@@ -2350,7 +2411,7 @@
         const cardConsole = document.getElementById("card-console");
         const histBar = document.getElementById("history-bar");
 
-        // Hide all cards first on mobile
+        // Hide all cards first
         [cardUniv, cardHold, cardHealth, cardFriction, cardOrders, cardConsole].forEach(c => {
             if (c) c.style.display = "none";
         });
@@ -2378,6 +2439,17 @@
             if (cardOrders) cardOrders.style.display = "block";
             if (histBar) histBar.style.display = "flex";
         }
+
+        // Keep active tab styling in sync
+        if (el.mobileTabs) {
+            el.mobileTabs.querySelectorAll(".mobile-tab").forEach(t => {
+                if (t.dataset.tab === tabId) {
+                    t.classList.add("active");
+                } else {
+                    t.classList.remove("active");
+                }
+            });
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -2389,16 +2461,24 @@
     }
 
     function setConsoleStatus(text, isBusy) {
-        el.consoleStatus.textContent = text;
-        if (isBusy) {
-            el.consoleStatus.classList.add("text-warning");
-        } else {
-            el.consoleStatus.classList.remove("text-warning");
+        if (el.consoleStatus) {
+            el.consoleStatus.textContent = text;
+            if (isBusy) {
+                el.consoleStatus.classList.add("text-warning");
+            } else {
+                el.consoleStatus.classList.remove("text-warning");
+            }
+        }
+        if (isBusy && el.cardConsole) {
+            el.cardConsole.classList.remove("collapsed");
         }
     }
 
-    // Window Resize Handler: Ensure desktop always displays all 4 segments
+    // Window Resize Handler: Ensure desktop always displays all 4 segments unless a tab was chosen
     window.addEventListener("resize", () => {
+        if (state.activeTab && state.activeTab !== "tab-all") {
+            return;
+        }
         if (window.innerWidth > 1024) {
             const leftPanel = document.getElementById("panel-left");
             const rightPanel = document.getElementById("panel-right");
@@ -2409,6 +2489,7 @@
             const cardOrders = document.getElementById("card-orders");
             const cardConsole = document.getElementById("card-console");
             const histBar = document.getElementById("history-bar");
+            const workspace = document.querySelector(".app-workspace");
 
             [cardUniv, cardHold, cardHealth, cardOrders, cardConsole].forEach(c => {
                 if (c) c.style.display = "";
@@ -2419,6 +2500,7 @@
             if (leftPanel) leftPanel.style.display = "";
             if (rightPanel) rightPanel.style.display = "";
             if (histBar) histBar.style.display = "";
+            if (workspace) workspace.classList.remove("single-focus");
         }
     });
 

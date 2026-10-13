@@ -8,86 +8,94 @@
     <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📈</text></svg>">
 </head>
 <body>
-    <!-- Top Header -->
+    <!-- Top Header: System Brand & Operating Parameters -->
     <header class="app-header">
         <div class="header-brand">
             <span class="brand-icon">📈</span>
             <div class="brand-title">
-                <h1>Live Trading Station</h1>
-                <span class="brand-subtitle">实盘量化交易·风控闸口·指令生成</span>
+                <h1>实盘交易控制台</h1>
+                <span class="brand-subtitle">Live Trading</span>
             </div>
         </div>
 
-        <!-- Global Operational Bar -->
-        <div class="header-controls">
+        <!-- Mobile Parameter Drawer Trigger Button (Only visible on screens <= 1024px) -->
+        <button class="btn btn-secondary btn-compact mobile-param-btn" id="btn-toggle-mobile-params" title="展开/收起运行参数设置" type="button">
+            ⚙️ <span id="m-param-summary">参数</span> <span class="toggle-icon">▾</span>
+        </button>
+
+        <!-- Global Operational Bar (Parameters) -->
+        <div class="header-controls" id="header-controls">
             <div class="control-item">
-                <label for="select-mode">运行模式 (Mode)</label>
+                <label for="select-mode">模式</label>
                 <select id="select-mode" class="form-input">
-                    <option value="multi" selected>🔀 多策略协同 (Multi-Strategy)</option>
-                    <option value="single">🔹 单策略独立 (Single Strategy)</option>
+                    <option value="multi" selected>🔀 多策略 (Multi)</option>
+                    <option value="single">🔹 单策略 (Single)</option>
                 </select>
             </div>
             <div class="control-item" id="ctrl-multi-matrix">
                 <div class="label-row" style="margin-bottom: 2px;">
-                    <label for="select-multi-matrix" style="margin-bottom: 0;">协同矩阵 (Matrix)</label>
+                    <label for="select-multi-matrix" style="margin-bottom: 0;">协同矩阵</label>
                     <button id="btn-config-matrix" class="btn-link-xs" title="配置各子策略权重与组合">⚙️ 权重</button>
                 </div>
                 <select id="select-multi-matrix" class="form-input"></select>
             </div>
             <div class="control-item" id="ctrl-single-strategy" style="display: none;">
-                <label for="select-strategy">单策略配置 (Strategy)</label>
+                <label for="select-strategy">单策略</label>
                 <select id="select-strategy" class="form-input"></select>
             </div>
             <div class="control-item">
-                <label for="input-as-of-date">估值基准日 (Date)</label>
-                <input type="date" id="input-as-of-date" class="form-input" title="点击打开日历选择日期">
-            </div>
-            <div class="control-item">
-                <label for="input-portfolio-value">账户净值 (NAV)</label>
-                <input type="number" id="input-portfolio-value" class="form-input" value="100000" step="1000">
-            </div>
-            <div class="control-item">
-                <label for="input-peak-nav">历史高位 (HWM)</label>
-                <input type="number" id="input-peak-nav" class="form-input" placeholder="自动读取" step="1000">
-            </div>
-            <div class="control-item">
-                <label for="select-provider">行情源 (Provider)</label>
+                <label for="select-provider">行情源</label>
                 <select id="select-provider" class="form-input">
-                    <option value="marketdb" selected>MarketDB (本地快照)</option>
-                    <option value="fuyao">Fuyao (复爻行情)</option>
+                    <option value="marketdb" selected>MarketDB (本地)</option>
+                    <option value="fuyao">Fuyao (复爻)</option>
                     <option value="yfinance">Yahoo Finance</option>
-                    <option value="synthetic">Synthetic (合成回测)</option>
+                    <option value="synthetic">Synthetic (合成)</option>
                 </select>
-            </div>
-            <div class="header-actions">
-                <button id="btn-show-all-segments" class="btn btn-secondary" title="显示全部板块 (标的、持仓、风控、指令)">
-                    <span class="icon">📑</span> 全部板块
-                </button>
-                <button id="btn-run-health" class="btn btn-warning" title="运行第一阶段宏观与账户健康门禁">
-                    <span class="icon">🛡️</span> 1. 健康门禁
-                </button>
-                <button id="btn-run-deploy" class="btn btn-primary" title="运行第二阶段实盘调仓指令生成">
-                    <span class="icon" id="icon-run-deploy">🔀</span> <span id="label-run-deploy">2. 净额调仓</span>
-                </button>
-                <button id="btn-run-all" class="btn btn-success" title="一键全流程执行">
-                    <span class="icon">⚡</span> 全流程运行
-                </button>
-                <button id="btn-open-settings" class="btn btn-secondary btn-icon" title="系统路径与设置">
-                    ⚙️
-                </button>
             </div>
         </div>
     </header>
 
-    <!-- Mobile Navigation Tab Bar (Visible on mobile/tablet) -->
-    <nav class="mobile-tabs" id="mobile-tabs">
-        <button class="mobile-tab active" data-tab="tab-all" id="tab-btn-all">📑 全部</button>
-        <button class="mobile-tab" data-tab="tab-setup">⚙️ 标的</button>
-        <button class="mobile-tab" data-tab="tab-holdings">💼 持仓</button>
-        <button class="mobile-tab" data-tab="tab-health">🛡️ 风控</button>
-        <button class="mobile-tab" data-tab="tab-orders">📋 指令</button>
-        <button class="mobile-tab" data-tab="tab-history">📅 归档</button>
-    </nav>
+    <!-- Row 2: Account Financials & Benchmark Date Bar -->
+    <div class="app-account-bar" id="app-account-bar">
+        <div class="control-item">
+            <label for="input-as-of-date">基准日</label>
+            <input type="date" id="input-as-of-date" class="form-input" title="点击打开日历选择日期">
+        </div>
+        <div class="control-item">
+            <label for="input-portfolio-value">净值(NAV)</label>
+            <input type="number" id="input-portfolio-value" class="form-input" value="100000" step="1000">
+        </div>
+        <div class="control-item" id="ctrl-peak-nav">
+            <label for="input-peak-nav">高位(HWM)</label>
+            <input type="number" id="input-peak-nav" class="form-input" placeholder="自动: 历史高位" step="1000">
+        </div>
+    </div>
+
+    <!-- Navigation & Execution Toolbar (Row 3: Tabs on Left, Action Buttons on Right) -->
+    <div class="app-toolbar" id="app-toolbar">
+        <nav class="app-tabs mobile-tabs" id="mobile-tabs">
+            <button class="mobile-tab active" data-tab="tab-all" id="tab-btn-all">📑 全部全景</button>
+            <button class="mobile-tab" data-tab="tab-orders">📋 调仓指令</button>
+            <button class="mobile-tab" data-tab="tab-health">🛡️ 风控门禁</button>
+            <button class="mobile-tab" data-tab="tab-holdings">💼 实盘持仓</button>
+            <button class="mobile-tab" data-tab="tab-setup">🎯 标的池</button>
+            <button class="mobile-tab" data-tab="tab-history">📅 历史归档</button>
+        </nav>
+        <div class="header-actions" id="header-actions">
+            <button id="btn-run-all" class="btn btn-success btn-compact" title="一键全流程执行 (门禁+调仓)">
+                <span class="icon">⚡</span> 全流程
+            </button>
+            <button id="btn-run-health" class="btn btn-warning btn-compact" title="运行第一阶段宏观与账户健康门禁">
+                <span class="icon">🛡️</span> 1.风控
+            </button>
+            <button id="btn-run-deploy" class="btn btn-primary btn-compact" title="运行第二阶段实盘调仓指令生成">
+                <span class="icon" id="icon-run-deploy">🔀</span> <span id="label-run-deploy">2.调仓</span>
+            </button>
+            <button id="btn-open-settings" class="btn btn-secondary btn-icon btn-compact" title="系统路径与设置">
+                ⚙️
+            </button>
+        </div>
+    </div>
 
     <!-- Main Workspace Container -->
     <main class="app-workspace">
@@ -100,18 +108,18 @@
                     <span class="badge" id="badge-universe-count">0 标的</span>
                 </div>
                 <div class="card-body">
-                    <div class="form-group">
-                        <label for="select-universe">预设与自选标的池 (Preset / Custom):</label>
+                    <div class="form-group" style="margin-bottom: 8px;">
+                        <label for="select-universe">预设/自选池:</label>
                         <select id="select-universe" class="form-input"></select>
                     </div>
-                    <div class="form-group">
+                    <div class="form-group" style="margin-bottom: 0;">
                         <div class="label-row">
-                            <label for="textarea-custom-symbols">标的代码列表 (用空格、换行或逗号分隔):</label>
+                            <label for="textarea-custom-symbols">代码列表 (空格/换行/逗号):</label>
                             <button id="btn-save-custom-universe" class="btn-text" title="将当前代码列表存为常用自选池">
-                                💾 保存为自选池
+                                💾 存为自选
                             </button>
                         </div>
-                        <textarea id="textarea-custom-symbols" class="form-textarea" rows="4" placeholder="例如: 601872.SH, 601728.SH, 300394.SZ, BIL"></textarea>
+                        <textarea id="textarea-custom-symbols" class="form-textarea" rows="2" placeholder="如: 601872.SH, 601728.SH, 300394.SZ, BIL"></textarea>
                     </div>
                 </div>
             </div>
@@ -315,10 +323,10 @@
             </div>
 
             <!-- Execution Real-time Console Log Drawer -->
-            <div class="card console-card" id="card-console">
-                <div class="card-header console-header" id="console-toggle">
-                    <h2><span class="icon">💻</span> 执行控制台输出 (Terminal Output)</h2>
-                    <span class="console-indicator" id="console-status">就绪 (Idle)</span>
+            <div class="card console-card collapsed" id="card-console">
+                <div class="card-header console-header" id="console-toggle" title="点击展开/折叠终端输出">
+                    <h2><span class="icon">💻</span> 控制台输出 (Terminal Output)</h2>
+                    <span class="console-indicator" id="console-status">就绪 (Idle) ▾</span>
                 </div>
                 <div class="card-body console-body" id="console-body">
                     <pre class="console-output" id="console-output">Live Trading Station ready. 等待指令执行...</pre>

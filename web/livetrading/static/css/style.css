@@ -24,6 +24,12 @@
     
     --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+    --header-height: 40px;
+    --account-bar-height: 34px;
+    --toolbar-height: 36px;
+    --mobile-header-height: 42px;
+    --mobile-bar-height: 54px;
 }
 
 * {
@@ -32,12 +38,17 @@
     padding: 0;
 }
 
+html, body {
+    max-width: 100vw;
+    overflow-x: hidden;
+}
+
 body {
     background-color: var(--bg-base);
     color: var(--text-primary);
     font-family: var(--font-sans);
-    font-size: 14px;
-    line-height: 1.5;
+    font-size: 13px;
+    line-height: 1.4;
     min-height: 100vh;
     display: flex;
     flex-direction: column;
@@ -49,9 +60,9 @@ body {
 .app-header {
     background-color: var(--bg-surface);
     border-bottom: 1px solid var(--border-color);
-    padding: 10px 16px;
+    padding: 0 14px;
+    height: var(--header-height);
     display: flex;
-    flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
     gap: 12px;
@@ -63,52 +74,136 @@ body {
 .header-brand {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 8px;
+    flex-shrink: 0;
 }
 
 .brand-icon {
-    font-size: 26px;
+    font-size: 20px;
 }
 
 .brand-title h1 {
-    font-size: 16px;
+    font-size: 14px;
     font-weight: 700;
     color: var(--accent-primary);
     letter-spacing: -0.02em;
+    white-space: nowrap;
 }
 
 .brand-subtitle {
-    font-size: 11px;
+    font-size: 10px;
     color: var(--text-muted);
+    white-space: nowrap;
+}
+
+@media (max-width: 1400px) {
+    .brand-subtitle {
+        display: none;
+    }
+}
+
+/* Parameter Drawer Trigger (Mobile) */
+.mobile-param-btn {
+    display: none;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 8px;
+    font-size: 11.5px;
+}
+
+.mobile-param-btn .toggle-icon {
+    color: var(--accent-primary);
+    font-size: 10px;
+}
+
+#m-param-summary {
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    display: inline-block;
+    vertical-align: middle;
 }
 
 .header-controls {
     display: flex;
-    flex-wrap: wrap;
     align-items: center;
-    gap: 10px;
+    gap: 8px;
     flex: 1;
     justify-content: flex-end;
 }
 
 .control-item {
     display: flex;
-    flex-direction: column;
-    gap: 2px;
+    flex-direction: row;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
 }
 
 .control-item label {
-    font-size: 10px;
-    text-transform: uppercase;
+    font-size: 11px;
     color: var(--text-muted);
     font-weight: 600;
+    white-space: nowrap;
 }
 
+.control-item .form-input {
+    height: 28px;
+    padding: 2px 6px;
+    font-size: 12px;
+}
+
+.control-item input[type="number"] {
+    width: 90px;
+}
+
+#input-portfolio-value {
+    width: 95px !important;
+}
+
+#input-peak-nav {
+    width: 140px !important;
+}
+
+.control-item input[type="date"] {
+    min-width: 120px;
+    width: 125px;
+}
+
+/* Remove number input spinner arrows */
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+input[type="number"] {
+    -moz-appearance: textfield;
+}
+
+/* Header & Toolbar Actions */
 .header-actions {
     display: flex;
     align-items: center;
-    gap: 8px;
-    margin-left: 6px;
+    gap: 6px;
+    margin-left: auto;
+    flex-shrink: 0;
+}
+
+.btn-compact {
+    padding: 3px 8px;
+    height: 26px;
+    font-size: 11.5px;
+}
+
+.desktop-only-btn {
+    display: inline-flex;
+}
+
+@media (max-width: 1024px) {
+    .desktop-only-btn {
+        display: none;
+    }
 }
 
 /* --------------------------------------------------------------------------
@@ -247,60 +342,151 @@ input[type="date"]::-webkit-calendar-picker-indicator:hover {
 }
 
 /* --------------------------------------------------------------------------
-   Mobile Tabs
+   App Account Bar (Row 2: Date, NAV, HWM)
    -------------------------------------------------------------------------- */
-.mobile-tabs {
-    display: none;
-    background-color: var(--bg-surface);
+.app-account-bar {
+    background-color: var(--bg-card);
     border-bottom: 1px solid var(--border-color);
-    padding: 4px 8px;
+    padding: 0 14px;
+    height: var(--account-bar-height);
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    position: sticky;
+    top: var(--header-height);
+    z-index: 98;
     overflow-x: auto;
     white-space: nowrap;
-    gap: 4px;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+}
+
+.app-account-bar::-webkit-scrollbar {
+    display: none;
+}
+
+.app-account-bar .control-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
+.app-account-bar .control-item label {
+    font-size: 11px;
+    color: var(--text-muted);
+    font-weight: 600;
+}
+
+.app-account-bar #input-as-of-date {
+    width: 130px;
+    min-width: 125px;
+    height: 26px;
+}
+
+.app-account-bar #input-portfolio-value {
+    width: 105px !important;
+    height: 26px;
+}
+
+.app-account-bar #input-peak-nav {
+    width: 155px !important;
+    height: 26px;
+}
+
+/* --------------------------------------------------------------------------
+   App Toolbar (Row 3: Tabs on Left, Actions on Right)
+   -------------------------------------------------------------------------- */
+.app-toolbar {
+    background-color: var(--bg-surface);
+    border-bottom: 1px solid var(--border-color);
+    padding: 3px 14px;
+    height: var(--toolbar-height);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    position: sticky;
+    top: calc(var(--header-height) + var(--account-bar-height));
+    z-index: 95;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.15);
+}
+
+.app-tabs, .mobile-tabs {
+    display: flex !important;
+    align-items: center;
+    gap: 6px;
+    overflow-x: auto;
+    white-space: nowrap;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    border: none;
+    padding: 0;
+    background: none;
+    box-shadow: none;
+    flex: 1;
+}
+
+.app-tabs::-webkit-scrollbar, .mobile-tabs::-webkit-scrollbar {
+    display: none;
 }
 
 .mobile-tab {
     background: none;
-    border: none;
+    border: 1px solid transparent;
     color: var(--text-secondary);
-    padding: 8px 12px;
-    font-size: 13px;
+    padding: 5px 12px;
+    font-size: 12px;
     font-weight: 600;
     border-radius: 6px;
     cursor: pointer;
+    transition: all 0.15s ease;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    user-select: none;
+}
+
+.mobile-tab:hover {
+    color: var(--text-primary);
+    background-color: rgba(255, 255, 255, 0.05);
 }
 
 .mobile-tab.active {
-    background-color: var(--bg-card);
+    background-color: rgba(56, 189, 248, 0.15);
     color: var(--accent-primary);
-    border: 1px solid var(--border-color);
+    border-color: rgba(56, 189, 248, 0.4);
 }
 
 /* --------------------------------------------------------------------------
-   Workspace Layout (Desktop: Dual Column)
+   Workspace Layout (Base & Desktop Viewport-Fit)
    -------------------------------------------------------------------------- */
 .app-workspace {
     flex: 1;
     display: grid;
     grid-template-columns: minmax(360px, 420px) 1fr;
-    gap: 16px;
-    padding: 16px;
-    max-width: 1800px;
+    gap: 12px;
+    padding: 12px;
+    max-width: 1920px;
     margin: 0 auto;
     width: 100%;
+}
+
+.app-workspace.single-focus {
+    grid-template-columns: 1fr !important;
 }
 
 .panel-left, .panel-right {
     display: flex;
     flex-direction: column;
-    gap: 16px;
+    gap: 10px;
 }
 
 /* Cards */
 .card {
     background-color: var(--bg-card);
     border: 1px solid var(--border-color);
-    border-radius: 8px;
+    border-radius: 6px;
     overflow: hidden;
     box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2);
 }
@@ -308,30 +494,30 @@ input[type="date"]::-webkit-calendar-picker-indicator:hover {
 .card-header {
     background-color: var(--bg-surface);
     border-bottom: 1px solid var(--border-color);
-    padding: 10px 14px;
+    padding: 6px 12px;
     display: flex;
     align-items: center;
     justify-content: space-between;
 }
 
 .card-header h2 {
-    font-size: 14px;
+    font-size: 13px;
     font-weight: 700;
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
     color: var(--text-primary);
 }
 
 .card-body {
-    padding: 14px;
+    padding: 10px;
 }
 
 .form-group {
     display: flex;
     flex-direction: column;
-    gap: 6px;
-    margin-bottom: 12px;
+    gap: 4px;
+    margin-bottom: 8px;
 }
 
 .label-row {
@@ -341,7 +527,7 @@ input[type="date"]::-webkit-calendar-picker-indicator:hover {
 }
 
 .form-group label {
-    font-size: 12px;
+    font-size: 11px;
     color: var(--text-secondary);
     font-weight: 600;
 }
@@ -350,18 +536,18 @@ input[type="date"]::-webkit-calendar-picker-indicator:hover {
 .badge {
     display: inline-flex;
     align-items: center;
-    padding: 2px 8px;
+    padding: 2px 6px;
     border-radius: 4px;
-    font-size: 12px;
+    font-size: 11px;
     font-weight: 600;
     background-color: #334155;
     color: var(--text-primary);
 }
 
 .badge-lg {
-    padding: 4px 12px;
-    font-size: 13px;
-    border-radius: 6px;
+    padding: 3px 8px;
+    font-size: 12px;
+    border-radius: 5px;
 }
 
 .badge-go {
@@ -417,16 +603,16 @@ input[type="date"]::-webkit-calendar-picker-indicator:hover {
     background-color: var(--bg-surface);
     border: 1px solid var(--border-color);
     border-radius: 6px;
-    padding: 8px 12px;
-    margin-bottom: 12px;
-    gap: 8px;
+    padding: 5px 10px;
+    margin-bottom: 8px;
+    gap: 6px;
 }
 
 .sum-item {
     display: flex;
     align-items: center;
-    gap: 6px;
-    font-size: 13px;
+    gap: 4px;
+    font-size: 12px;
 }
 
 .sum-label {
@@ -448,11 +634,11 @@ input[type="date"]::-webkit-calendar-picker-indicator:hover {
 .data-table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 12px;
+    font-size: 11.5px;
 }
 
 .data-table th, .data-table td {
-    padding: 8px 10px;
+    padding: 5px 8px;
     text-align: left;
     border-bottom: 1px solid var(--border-color);
     white-space: nowrap;
@@ -471,6 +657,25 @@ input[type="date"]::-webkit-calendar-picker-indicator:hover {
     background-color: var(--bg-card-hover);
 }
 
+.holding-sym {
+    width: 100%;
+    min-width: 70px;
+    padding: 3px 6px;
+    font-size: 11.5px;
+}
+
+.holding-shares {
+    width: 68px;
+    padding: 3px 6px;
+    font-size: 11.5px;
+}
+
+.holding-weight {
+    width: 48px;
+    padding: 3px 6px;
+    font-size: 11.5px;
+}
+
 .text-center { text-align: center; }
 .text-right { text-align: right; }
 .text-success { color: var(--accent-success); }
@@ -485,16 +690,17 @@ input[type="date"]::-webkit-calendar-picker-indicator:hover {
     background-color: var(--bg-card);
     border: 1px solid var(--border-color);
     border-radius: 6px;
-    padding: 8px 14px;
+    padding: 5px 10px;
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 10px;
+    gap: 8px;
+    font-size: 12px;
 }
 
 .history-label {
     font-weight: 600;
-    font-size: 13px;
+    font-size: 12px;
     color: var(--accent-primary);
 }
 
@@ -503,56 +709,56 @@ input[type="date"]::-webkit-calendar-picker-indicator:hover {
    -------------------------------------------------------------------------- */
 .metrics-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
-    gap: 10px;
-    margin-bottom: 14px;
+    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+    gap: 8px;
+    margin-bottom: 8px;
 }
 
 .metric-card {
     background-color: var(--bg-surface);
     border: 1px solid var(--border-color);
     border-radius: 6px;
-    padding: 10px;
+    padding: 6px 8px;
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 2px;
 }
 
 .m-title {
-    font-size: 11px;
+    font-size: 10px;
     color: var(--text-muted);
     font-weight: 600;
     text-transform: uppercase;
 }
 
 .m-val {
-    font-size: 18px;
+    font-size: 16px;
     font-weight: 700;
     font-family: var(--font-mono);
     color: var(--text-primary);
 }
 
 .m-sub {
-    font-size: 11px;
+    font-size: 10px;
     color: var(--text-secondary);
 }
 
 .directive-box {
     background-color: var(--bg-surface);
-    border-left: 4px solid var(--accent-primary);
+    border-left: 3px solid var(--accent-primary);
     border-radius: 4px;
-    padding: 10px 14px;
+    padding: 6px 10px;
 }
 
 .directive-title {
     font-weight: 700;
-    font-size: 14px;
-    margin-bottom: 4px;
+    font-size: 12px;
+    margin-bottom: 2px;
     color: var(--text-primary);
 }
 
 .directive-desc {
-    font-size: 12px;
+    font-size: 11px;
     color: var(--text-secondary);
 }
 
@@ -560,19 +766,32 @@ input[type="date"]::-webkit-calendar-picker-indicator:hover {
    Orders Ticket & Console Output
    -------------------------------------------------------------------------- */
 .ticket-status-bar {
-    font-size: 12px;
+    font-size: 11.5px;
     color: var(--text-secondary);
-    margin-bottom: 10px;
+    margin-bottom: 6px;
 }
 
 .console-header {
     cursor: pointer;
     user-select: none;
+    padding: 6px 12px;
 }
 
 .console-indicator {
-    font-size: 12px;
+    font-size: 11px;
     color: var(--text-muted);
+}
+
+.console-card {
+    transition: all 0.2s ease;
+}
+
+.console-card.collapsed .console-body {
+    display: none;
+}
+
+.console-card.collapsed .console-header {
+    padding: 6px 10px;
 }
 
 .console-output {
@@ -580,13 +799,182 @@ input[type="date"]::-webkit-calendar-picker-indicator:hover {
     color: #38bdf8;
     font-family: var(--font-mono);
     font-size: 11px;
-    padding: 12px;
+    padding: 8px 10px;
     border-radius: 6px;
-    max-height: 240px;
+    max-height: 160px;
     overflow-y: auto;
     white-space: pre-wrap;
     word-break: break-all;
     border: 1px solid var(--border-color);
+}
+
+/* Desktop Viewport-Fit Mode: Zero Page Scroll (>=1025px) */
+@media (min-width: 1025px) {
+    body {
+        height: 100vh;
+        overflow: hidden;
+    }
+
+    .app-workspace {
+        height: calc(100vh - var(--header-height) - var(--account-bar-height) - var(--toolbar-height));
+        display: grid;
+        grid-template-columns: 380px 1fr;
+        gap: 10px;
+        padding: 10px 14px;
+        overflow: hidden;
+        max-width: 100%;
+        margin: 0;
+    }
+
+    .app-workspace.single-focus {
+        grid-template-columns: 1fr !important;
+    }
+
+    .panel-left, .panel-right {
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        overflow: hidden;
+        min-height: 0;
+    }
+
+    .universe-card {
+        flex-shrink: 0;
+    }
+
+    .universe-card .card-body {
+        padding: 8px 12px;
+    }
+
+    .holdings-card {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        overflow: hidden;
+    }
+
+    .holdings-card .card-body {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        padding: 8px 12px;
+        overflow: hidden;
+    }
+
+    .holdings-table-container {
+        flex: 1;
+        overflow-y: auto;
+        overflow-x: hidden;
+        min-height: 0;
+        max-height: unset;
+    }
+
+    .history-bar {
+        flex-shrink: 0;
+        padding: 5px 10px;
+        gap: 8px;
+    }
+
+    .health-card {
+        flex-shrink: 0;
+    }
+
+    .health-card .card-body {
+        padding: 8px 12px;
+    }
+
+    .metrics-grid {
+        display: flex;
+        flex-wrap: nowrap;
+        gap: 8px;
+        margin-bottom: 6px;
+        overflow-x: auto;
+    }
+
+    .metric-card {
+        flex: 1;
+        min-width: 90px;
+        padding: 6px 8px;
+        gap: 2px;
+    }
+
+    .directive-box {
+        padding: 6px 10px;
+        font-size: 11px;
+    }
+
+    .friction-card {
+        flex-shrink: 0;
+    }
+
+    .friction-card .card-body {
+        padding: 8px 12px;
+    }
+
+    .friction-summary-banner {
+        display: flex;
+        gap: 8px;
+        margin-bottom: 6px;
+        overflow-x: auto;
+    }
+
+    .f-stat-card {
+        flex: 1;
+        min-width: 110px;
+        padding: 6px 8px;
+    }
+
+    .turnover-bar-container {
+        padding: 6px 10px;
+        font-size: 11.5px;
+    }
+
+    .orders-card {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        overflow: hidden;
+    }
+
+    .orders-card .card-body {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        padding: 8px 12px;
+        overflow: hidden;
+    }
+
+    .orders-table-container {
+        flex: 1;
+        overflow-y: auto;
+        overflow-x: auto;
+        min-height: 0;
+        max-height: unset;
+    }
+
+    .console-card {
+        flex-shrink: 0;
+        transition: max-height 0.2s ease;
+    }
+
+    .console-card.collapsed .console-body {
+        display: none;
+    }
+
+    .console-card.collapsed .console-header {
+        padding: 5px 10px;
+    }
+
+    .console-card:not(.collapsed) .console-body {
+        display: block;
+        max-height: 140px;
+        padding: 6px 10px;
+    }
 }
 
 /* --------------------------------------------------------------------------
@@ -698,53 +1086,281 @@ input[type="date"]::-webkit-calendar-picker-indicator:hover {
    Responsive Media Queries (Mobile & Tablet)
    -------------------------------------------------------------------------- */
 @media (max-width: 1024px) {
-    .app-workspace {
-        grid-template-columns: 1fr;
-        padding: 10px;
-        margin-bottom: 60px; /* Space for mobile action bar */
+    .app-header {
+        height: var(--mobile-header-height);
+        padding: 0 12px;
     }
 
-    .mobile-tabs {
+    .mobile-param-toggle {
         display: flex;
+    }
+
+    /* Parameter drawer (collapsible on mobile) */
+    .header-controls {
+        position: fixed;
+        top: var(--mobile-header-height);
+        left: 0;
+        right: 0;
+        background-color: var(--bg-surface);
+        border-bottom: 2px solid var(--border-color);
+        padding: 12px 14px;
+        display: none;
+        flex-direction: column;
+        gap: 8px;
+        z-index: 150;
+        box-shadow: 0 16px 32px rgba(0, 0, 0, 0.6);
+        max-height: calc(100vh - 110px);
+        overflow-y: auto;
+    }
+
+    .header-controls.mobile-open {
+        display: flex;
+        animation: fadeIn 0.2s ease;
+    }
+
+    .control-item {
+        flex-direction: column;
+        align-items: flex-start;
+        width: 100%;
+        gap: 2px;
+    }
+
+    .control-item label {
+        font-size: 11px;
+    }
+
+    .control-item .form-input {
+        width: 100%;
+        height: 32px;
+    }
+
+    .control-item input[type="date"],
+    .control-item input[type="number"] {
+        width: 100%;
+        min-width: unset;
+    }
+
+    .header-actions {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        margin-left: auto;
+        flex-shrink: 0;
+    }
+
+    .header-actions .btn {
+        padding: 4px 6px;
+        font-size: 11px;
+    }
+
+    .mobile-param-btn {
+        display: inline-flex;
+    }
+
+    .app-account-bar {
+        height: var(--account-bar-height);
+        padding: 0 10px;
+        top: var(--mobile-header-height);
+        gap: 10px;
+    }
+
+    .app-account-bar .control-item {
+        flex-direction: row;
+        align-items: center;
+        gap: 4px;
+        width: auto;
+    }
+
+    .app-account-bar .control-item label {
+        font-size: 10.5px;
+    }
+
+    .app-account-bar .form-input {
+        height: 26px;
+    }
+
+    .app-account-bar #input-as-of-date {
+        width: 115px;
+        min-width: 115px;
+    }
+
+    .app-account-bar #input-portfolio-value {
+        width: 80px !important;
+    }
+
+    .app-account-bar #input-peak-nav {
+        width: 125px !important;
+    }
+
+    .app-toolbar {
+        height: var(--toolbar-height);
+        padding: 0 10px;
+        top: calc(var(--mobile-header-height) + var(--account-bar-height));
+    }
+
+    .app-workspace {
+        grid-template-columns: 1fr;
+        padding: 8px;
+        margin-bottom: 64px; /* Space for mobile action bar */
+        gap: 10px;
     }
 
     .mobile-action-bar {
         display: flex;
-    }
-
-    .header-controls {
-        width: 100%;
-        justify-content: space-between;
-    }
-
-    .control-item {
-        flex: 1 1 120px;
-    }
-
-    .header-actions {
-        width: 100%;
-        justify-content: stretch;
-    }
-
-    .header-actions .btn {
-        flex: 1;
-        font-size: 12px;
-        padding: 6px 8px;
+        padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
     }
 }
 
 @media (max-width: 640px) {
-    .control-item {
-        flex: 1 1 100%;
+    #header-actions #btn-run-health,
+    #header-actions #btn-run-deploy,
+    #header-actions .desktop-only-btn {
+        display: none;
     }
 
-    .data-table th, .data-table td {
-        padding: 6px 8px;
+    .header-actions {
+        gap: 3px;
+    }
+
+    .header-actions .btn {
+        padding: 3px 5px;
         font-size: 11px;
     }
 
+    #m-param-summary {
+        max-width: 70px;
+    }
+    /* Metrics on phone */
     .metrics-grid {
         grid-template-columns: repeat(2, 1fr);
+        gap: 6px;
+    }
+
+    .friction-summary-banner {
+        grid-template-columns: repeat(2, 1fr);
+        gap: 6px;
+    }
+
+    .turnover-bar-container {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 6px;
+    }
+
+    /* Convert wide orders table to responsive cards with zero horizontal scroll */
+    #table-orders thead {
+        display: none;
+    }
+
+    #table-orders, #table-orders tbody {
+        display: block;
+        width: 100%;
+    }
+
+    #table-orders tbody tr {
+        display: flex;
+        flex-direction: column;
+        background-color: var(--bg-surface);
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        margin-bottom: 8px;
+        padding: 10px;
+        gap: 5px;
+        width: 100%;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.15);
+    }
+
+    #table-orders td {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 2px 0;
+        border: none;
+        white-space: normal;
+        font-size: 12px;
+    }
+
+    #table-orders td[data-label]::before {
+        content: attr(data-label);
+        font-weight: 600;
+        color: var(--text-muted);
+        font-size: 11px;
+        margin-right: 8px;
+        flex-shrink: 0;
+    }
+
+    #table-orders td.col-header-group {
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        padding-bottom: 4px;
+        margin-bottom: 2px;
+    }
+
+    #table-orders td.col-reason-group {
+        border-top: 1px solid rgba(255, 255, 255, 0.05);
+        padding-top: 4px;
+        margin-top: 2px;
+        font-size: 11px;
+    }
+
+    /* Convert holdings table to responsive rows on mobile */
+    #table-holdings thead {
+        display: none;
+    }
+
+    #table-holdings, #table-holdings tbody {
+        display: block;
+        width: 100%;
+    }
+
+    #table-holdings tbody tr {
+        display: flex;
+        flex-direction: column;
+        background-color: var(--bg-surface);
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        margin-bottom: 8px;
+        padding: 10px;
+        gap: 6px;
+        width: 100%;
+    }
+
+    #table-holdings td {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 2px 0;
+        border: none;
+        white-space: normal;
+    }
+
+    #table-holdings td[data-label]::before {
+        content: attr(data-label);
+        font-weight: 600;
+        color: var(--text-muted);
+        font-size: 11px;
+        margin-right: 8px;
+        flex-shrink: 0;
+    }
+
+    #table-holdings td input {
+        max-width: 140px;
+        height: 28px;
+    }
+
+    .orders-table-container,
+    .holdings-table-container {
+        overflow-x: hidden; /* Zero horizontal scroll on mobile */
+        border: none;
+    }
+}
+
+@media (max-width: 480px) {
+    .brand-title h1 {
+        display: none;
+    }
+
+    #m-param-summary {
+        max-width: 32px;
     }
 }
 
