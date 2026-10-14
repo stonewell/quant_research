@@ -1,26 +1,30 @@
 {
-  "chan_four_state_blend": {
-    "strategy_key": "chan_four_state_blend",
-    "strategy_name": "Chan Four-State Risk-Managed Blend Strategy",
+  "chan_crisis_shield_blend": {
+    "strategy_key": "chan_crisis_shield_blend",
+    "strategy_name": "Chan Single Crisis Shield Blend Strategy",
     "capital_weight": 0.5,
     "allocated_nav": 50000.0,
-    "virtual_equity_value": 0.0,
-    "virtual_cash": 50000.0,
-    "equity_ratio": 0.0,
-    "cash_ratio": 1.0,
-    "holdings": {},
-    "last_updated": "2026-10-12"
+    "virtual_equity_value": 2659.9457039377357,
+    "virtual_cash": 47340.05429606226,
+    "equity_ratio": 0.05319891407875472,
+    "cash_ratio": 0.9468010859212452,
+    "holdings": {
+      "AAPL": 25
+    },
+    "last_updated": "2026-10-13"
   },
   "chan_risk_managed_blend": {
     "strategy_key": "chan_risk_managed_blend",
     "strategy_name": "Chan Risk-Managed Blend Strategy",
     "capital_weight": 0.5,
     "allocated_nav": 50000.0,
-    "virtual_equity_value": 0.0,
-    "virtual_cash": 50000.0,
-    "equity_ratio": 0.0,
-    "cash_ratio": 1.0,
-    "holdings": {},
-    "last_updated": "2026-10-12"
+    "virtual_equity_value": 2872.7413602527545,
+    "virtual_cash": 47127.25863974725,
+    "equity_ratio": 0.05745482720505509,
+    "cash_ratio": 0.942545172794945,
+    "holdings": {
+      "AAPL": 27
+    },
+    "last_updated": "2026-10-13"
   }
 }

@@ -1,3 +1,6 @@
-﻿symbol,name,action,price,current_weight,target_weight,delta_weight,current_shares,target_shares,delta_shares,trade_value,trade_value_rmb,gross_buy_shares,gross_sell_shares,crossed_shares,holding_bars,reason
-601088.SH,中国神华,BUY,85.48649287765801,0.0,0.085486492877658,0.085486492877658,0,100,100,8548.6492877658,8548.6492877658,0,0,0,0,多策略协同新开仓
-BIL,现金及现金管理工具,RELEASE_CASH,1.0,1.0,0.914513507122342,-0.08548649287765797,100000,91451,-8549,8548.649287765802,8548.649287765802,0,0,0,999,多策略净额化流动性资金归集/释放
+﻿symbol,name,action,price,current_weight,target_weight,delta_weight,current_shares,target_shares,delta_shares,trade_value,trade_value_rmb,gross_buy_shares,gross_sell_shares,crossed_shares,holding_bars,market,lot_size,currency,reason
+601872.SH,招商轮船,SELL,151.8070729144714,1.5180707291447142,0.0,-1.5180707291447142,1000,0,-1000,151807.0729144714,151807.0729144714,0,0,0,2,CHINA,100,CNY,多策略协同全额清仓 (已满持有期)
+00005.HK,00005.HK,SELL,153.5906585777309,0.6143626343109236,0.0,-0.6143626343109236,400,0,-400,61436.26343109236,61436.26343109236,0,0,0,2,HONGKONG,400,HKD,多策略协同全额清仓 (已满持有期)
+601728.SH,中国电信,BUY,99.65750197721691,0.0,0.0996575019772169,0.0996575019772169,0,100,100,9965.75019772169,9965.75019772169,0,0,0,0,CHINA,100,CNY,多策略协同新开仓
+AAPL,苹果,HOLD_FILTERED,106.39782815750942,0.05319891407875472,0.05319891407875472,0.0,50,50,0,0.0,0.0,52,0,0,2,US,1,USD,全局调仓未超惰性阈值 (< 5%)
+BIL,现金及现金管理工具,SWEEP_CASH,1.0,0.5,2.532775861478421,2.032775861478421,50000,253278,203278,203277.58614784208,203277.58614784208,0,0,0,999,CASH,1,CNY,多策略净额化流动性资金归集/释放

@@ -304,3 +304,232 @@ def test_friction_savings_math():
     assert abs(fs.saved_slippage - 20.0) < 1e-4
     assert abs(fs.total_friction_saved - 42.0) < 1e-4
 
+
+def test_hkex_board_lot_and_dual_sided_stamp_duty():
+    """Verify HKEX stock-specific board lots (400, 500, 2000, 50) and dual-sided 0.1085% stamp duty."""
+    engine = OrderNettingEngine(
+        hk_stamp_duty=0.001085,
+        commission=0.0003,
+        slippage=0.0005,
+    )
+
+    # Check board lot resolution
+    assert engine.resolve_lot_size("00005.HK") == 400   # HSBC
+    assert engine.resolve_lot_size("01211.HK") == 500   # BYD
+    assert engine.resolve_lot_size("09618.HK") == 50    # JD
+    assert engine.resolve_lot_size("02899.HK") == 2000  # Zijin Mining
+    assert engine.resolve_lot_size("00700.HK") == 100   # Tencent
+
+    # Strategy 1 wants to buy HSBC (target 24,000 HKD / 60 = 400 shares, exactly 1 board lot)
+    # Strategy 2 wants to sell HSBC (prior held 400 shares)
+    intents = [
+        SubStrategyIntent(
+            strategy_key="hk_bull",
+            strategy_name="HK Bull",
+            capital_weight=0.5,
+            allocated_capital=50000.0,
+            target_weights={"00005.HK": 0.48},  # 24,000 / 60 = 400 shares
+            current_weights={"00005.HK": 0.0},
+        ),
+        SubStrategyIntent(
+            strategy_key="hk_bear",
+            strategy_name="HK Bear",
+            capital_weight=0.5,
+            allocated_capital=50000.0,
+            target_weights={"00005.HK": 0.0},
+            current_weights={"00005.HK": 0.48},
+        ),
+    ]
+
+    prior_sub_ledgers = {
+        "hk_bull": {"holdings": {"00005.HK": 0}},
+        "hk_bear": {"holdings": {"00005.HK": 400}},
+    }
+
+    res = engine.net_portfolio_orders(
+        intents=intents,
+        current_holdings={"00005.HK": 400, "BIL": 76000.0},
+        portfolio_value=100000.0,
+        latest_prices={"00005.HK": 60.0},
+        prior_sub_ledgers=prior_sub_ledgers,
+    )
+
+    fs = res.friction_savings
+    assert fs.total_crossed_shares == 400
+    # Crossed turnover = 400 * 2 * 60 = 48,000 HKD
+    # Avoided HK stamp duty & levies = 48,000 * 0.001085 = 52.08 HKD (both buy and sell legs saved!)
+    expected_saved_hk_stamp = 400 * 2 * 60.0 * 0.001085
+    assert abs(fs.saved_stamp_duty - expected_saved_hk_stamp) < 1e-4
+
+    detail = [c for c in res.crossed_details if c.symbol == "00005.HK"][0]
+    assert detail.market == "HONGKONG"
+    assert detail.lot_size == 400
+    assert detail.currency == "HKD"
+    assert abs(detail.saved_stamp_duty - expected_saved_hk_stamp) < 1e-4
+
+
+def test_us_equity_1_share_lot_and_sec_fee():
+    """Verify US equity 1-share lot resolution, T+0 tenure defense bypass, and SEC fee savings."""
+    engine = OrderNettingEngine(
+        us_sec_fee=0.0000278,
+        commission=0.0003,
+        slippage=0.0005,
+    )
+
+    # Check US lot size is 1
+    assert engine.resolve_lot_size("AAPL") == 1
+    assert engine.resolve_lot_size("NVDA") == 1
+    assert engine.resolve_lot_size("SPY") == 1
+
+    intents = [
+        SubStrategyIntent(
+            strategy_key="us_growth",
+            strategy_name="US Growth",
+            capital_weight=0.5,
+            allocated_capital=50000.0,
+            target_weights={"AAPL": 0.30},  # 15,000 USD / 150 = 100 shares
+            current_weights={"AAPL": 0.0},
+        ),
+        SubStrategyIntent(
+            strategy_key="us_value",
+            strategy_name="US Value",
+            capital_weight=0.5,
+            allocated_capital=50000.0,
+            target_weights={"AAPL": 0.0},
+            current_weights={"AAPL": 0.30},  # sells 100 shares
+        ),
+    ]
+
+    prior_sub_ledgers = {
+        "us_growth": {"holdings": {"AAPL": 0}},
+        "us_value": {"holdings": {"AAPL": 100}},
+    }
+
+    # AAPL held for 0 days (held_age = 0), but in US market T+0 trading is allowed
+    res = engine.net_portfolio_orders(
+        intents=intents,
+        current_holdings={"AAPL": 100, "BIL": 85000.0},
+        portfolio_value=100000.0,
+        latest_prices={"AAPL": 150.0},
+        holding_bars={"AAPL": 0},
+        min_holding_bars=2,
+        prior_sub_ledgers=prior_sub_ledgers,
+    )
+
+    fs = res.friction_savings
+    assert fs.total_crossed_shares == 100
+    # US market has 0 stamp duty, SEC Section 31 fee on sells = 100 * 150 * 0.0000278 = 0.417 USD
+    expected_sec_fee = 100 * 150.0 * 0.0000278
+    assert abs(fs.saved_sec_fee - expected_sec_fee) < 1e-4
+    assert abs(fs.saved_stamp_duty - 0.0) < 1e-4
+
+    detail = [c for c in res.crossed_details if c.symbol == "AAPL"][0]
+    assert detail.market == "US"
+    assert detail.lot_size == 1
+    assert detail.currency == "USD"
+    assert abs(detail.saved_sec_fee - expected_sec_fee) < 1e-4
+
+
+def test_cross_border_multi_strategy_portfolio():
+    """Verify simultaneous multi-strategy crossing across China, HK, and US assets."""
+    engine = OrderNettingEngine()
+
+    intents = [
+        SubStrategyIntent(
+            strategy_key="strat_alpha",
+            strategy_name="Alpha",
+            capital_weight=0.5,
+            allocated_capital=100000.0,
+            target_weights={"601872.SH": 0.20, "00005.HK": 0.20, "AAPL": 0.20},
+            current_weights={"601872.SH": 0.0, "00005.HK": 0.0, "AAPL": 0.0},
+        ),
+        SubStrategyIntent(
+            strategy_key="strat_beta",
+            strategy_name="Beta",
+            capital_weight=0.5,
+            allocated_capital=100000.0,
+            target_weights={"601872.SH": 0.0, "00005.HK": 0.0, "AAPL": 0.0},
+            current_weights={"601872.SH": 0.20, "00005.HK": 0.20, "AAPL": 0.20},
+        ),
+    ]
+
+    prices = {"601872.SH": 10.0, "00005.HK": 50.0, "AAPL": 200.0}
+    # Strat Beta holds:
+    # 601872.SH: 20,000 / 10 = 2,000 shares (multiple of 100)
+    # 00005.HK: 20,000 / 50 = 400 shares (multiple of 400 board lot)
+    # AAPL: 20,000 / 200 = 100 shares (multiple of 1)
+    holdings = {"601872.SH": 2000, "00005.HK": 400, "AAPL": 100, "BIL": 140000.0}
+    prior_ledgers = {
+        "strat_alpha": {"holdings": {"601872.SH": 0, "00005.HK": 0, "AAPL": 0}},
+        "strat_beta": {"holdings": {"601872.SH": 2000, "00005.HK": 400, "AAPL": 100}},
+    }
+
+    res = engine.net_portfolio_orders(
+        intents=intents,
+        current_holdings=holdings,
+        portfolio_value=200000.0,
+        latest_prices=prices,
+        prior_sub_ledgers=prior_ledgers,
+    )
+
+    fs = res.friction_savings
+    assert fs.total_crossed_shares == (2000 + 400 + 100)
+    assert fs.saved_by_market["CHINA"] > 0
+    assert fs.saved_by_market["HONGKONG"] > 0
+    assert fs.saved_by_market["US"] > 0
+
+    # Verify order ticket records have correct market tags and lot sizes
+    orders_by_sym = {o["symbol"]: o for o in res.net_orders}
+    assert orders_by_sym["601872.SH"]["market"] == "CHINA"
+    assert orders_by_sym["601872.SH"]["lot_size"] == 100
+    assert orders_by_sym["00005.HK"]["market"] == "HONGKONG"
+    assert orders_by_sym["00005.HK"]["lot_size"] == 400
+    assert orders_by_sym["AAPL"]["market"] == "US"
+    assert orders_by_sym["AAPL"]["lot_size"] == 1
+
+
+def test_initial_launch_integer_lot_preservation():
+    """Verify that launching without prior sub-ledgers preserves integer board lots without odd lots."""
+    engine = OrderNettingEngine()
+
+    # Master portfolio holds 1,000 shares of BYD (01211.HK, lot size 500)
+    # Two strategies with 60% and 40% capital weights
+    intents = [
+        SubStrategyIntent(
+            strategy_key="strat_x",
+            strategy_name="Strat X",
+            capital_weight=0.60,
+            allocated_capital=60000.0,
+            target_weights={"01211.HK": 0.50},  # 30,000 / 200 = 150 shares -> floor(150/500)*500 = 0
+        ),
+        SubStrategyIntent(
+            strategy_key="strat_y",
+            strategy_name="Strat Y",
+            capital_weight=0.40,
+            allocated_capital=40000.0,
+            target_weights={"01211.HK": 0.50},
+        ),
+    ]
+
+    holdings = {"01211.HK": 1000, "BIL": 100000.0}
+    prices = {"01211.HK": 200.0}
+
+    # No prior_sub_ledgers passed (initial launch)
+    res = engine.net_portfolio_orders(
+        intents=intents,
+        current_holdings=holdings,
+        portfolio_value=100000.0,
+        latest_prices=prices,
+        prior_sub_ledgers=None,
+    )
+
+    # 1,000 shares (2 lots of 500) divided 60% and 40%:
+    # Hare-Niemeyer allocation gives 1 lot (500) to strat_x and 1 lot (500) to strat_y.
+    # Neither strategy receives 600 or 400 (which would be non-board lots of 500).
+    for detail in res.crossed_details:
+        if detail.symbol == "01211.HK":
+            for contrib in detail.contributing_strategies:
+                assert contrib["current_shares"] % 500 == 0, f"Odd lot in prior shares: {contrib['current_shares']}"
+                assert contrib["target_shares"] % 500 == 0, f"Odd lot in target shares: {contrib['target_shares']}"
+
+

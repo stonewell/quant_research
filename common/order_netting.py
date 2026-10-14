@@ -27,11 +27,89 @@ Academic & Operational Grounding:
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from common.allocation_backtester import _get_hk_board_lot
 from common.universe import get_stock_name, is_placeholder_stock_name
+
+
+class MarketType(str, Enum):
+    """Regional market taxonomy for execution rules and statutory taxes."""
+    CHINA = "CHINA"
+    HONGKONG = "HONGKONG"
+    US = "US"
+    CASH = "CASH"
+
+
+def classify_market(symbol: str, cash_proxy: str = "BIL") -> str:
+    """Classifies symbol into MarketType: CASH, CHINA, HONGKONG, or US."""
+    sym = symbol.strip().upper()
+    if sym in (cash_proxy, "BIL", "SHV", "CASH", "GC001", "R-001", "511880.SH", "511990.SH"):
+        return MarketType.CASH.value
+    if sym.endswith((".SH", ".SZ", ".BJ")):
+        return MarketType.CHINA.value
+    if sym.endswith(".HK"):
+        return MarketType.HONGKONG.value
+    if sym.isdigit():
+        if len(sym) == 6:
+            return MarketType.CHINA.value
+        if len(sym) in (4, 5):
+            return MarketType.HONGKONG.value
+    return MarketType.US.value
+
+
+def get_market_currency(market: str) -> str:
+    """Returns currency code for a given market type."""
+    if market == MarketType.CHINA.value:
+        return "CNY"
+    if market == MarketType.HONGKONG.value:
+        return "HKD"
+    if market == MarketType.US.value:
+        return "USD"
+    return "CNY"
+
+
+def get_market_label(market: str) -> str:
+    """Returns human-readable Chinese market badge."""
+    if market == MarketType.CHINA.value:
+        return "A股"
+    if market == MarketType.HONGKONG.value:
+        return "港股"
+    if market == MarketType.US.value:
+        return "美股"
+    return "现金"
+
+
+def allocate_integer_lots(total_shares: int, weights: List[float], lot: int) -> List[int]:
+    """Deterministically allocates total_shares across strategies according to weights
+    in exact multiples of lot (using Hare-Niemeyer / Largest Remainder Method)."""
+    if total_shares <= 0 or lot <= 0 or not weights:
+        return [0] * len(weights)
+    if lot == 1:
+        quotas = [total_shares * w for w in weights]
+        floors = [int(np.floor(q)) for q in quotas]
+        rem = total_shares - sum(floors)
+        diffs = sorted(range(len(weights)), key=lambda i: quotas[i] - floors[i], reverse=True)
+        for i in range(min(rem, len(diffs))):
+            floors[diffs[i]] += 1
+        return floors
+
+    total_lots = total_shares // lot
+    quotas = [total_lots * w for w in weights]
+    floors = [int(np.floor(q)) for q in quotas]
+    rem_lots = total_lots - sum(floors)
+    diffs = sorted(range(len(weights)), key=lambda i: quotas[i] - floors[i], reverse=True)
+    for i in range(min(rem_lots, len(diffs))):
+        floors[diffs[i]] += 1
+    res = [f * lot for f in floors]
+    odd_residual = total_shares - sum(res)
+    if odd_residual > 0 and len(res) > 0:
+        max_idx = int(np.argmax(weights))
+        res[max_idx] += odd_residual
+    return res
 
 
 @dataclass
@@ -75,6 +153,12 @@ class CrossedSymbolDetail:
     crossed_trade_value: float
     action: str  # NET_BUY, NET_SELL, NETTED_ZERO, HOLD
     contributing_strategies: List[Dict[str, Any]]
+    market: str = "CHINA"
+    lot_size: int = 100
+    currency: str = "CNY"
+    saved_stamp_duty: float = 0.0
+    saved_sec_fee: float = 0.0
+    saved_friction: float = 0.0
 
 
 @dataclass
@@ -87,10 +171,12 @@ class FrictionSavings:
     total_gross_turnover: float
     total_net_turnover: float
     saved_turnover: float
-    saved_stamp_duty: float    # 0.05% of crossed sells
-    saved_commission: float    # 2 * 0.03% of crossed volume
-    saved_slippage: float      # 2 * 0.05% of crossed volume
+    saved_stamp_duty: float       # Avoided stamp duty (China sell 0.05% + HK dual-sided 0.1085%)
+    saved_commission: float       # Avoided broker commission
+    saved_slippage: float         # Avoided slippage
     total_friction_saved: float
+    saved_sec_fee: float = 0.0    # Avoided US SEC Section 31 fee on sells
+    saved_by_market: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -125,27 +211,36 @@ class OrderNettingEngine:
     def __init__(
         self,
         lot_size_default: int = 100,
-        stamp_duty: float = 0.0005,      # 0.05% A-share sell stamp duty
+        stamp_duty: float = 0.0005,      # 0.05% China A-share sell stamp duty
+        hk_stamp_duty: float = 0.001085, # 0.1085% HKEX dual-sided stamp duty & levies
+        us_sec_fee: float = 0.0000278,   # 0.00278% US SEC Section 31 fee on sells
         commission: float = 0.0003,      # 0.03% broker commission
         slippage: float = 0.0005,        # 0.05% execution slippage
         cash_proxy: str = "BIL",
     ):
         self.lot_size_default = lot_size_default
         self.stamp_duty = stamp_duty
+        self.china_stamp_duty = stamp_duty
+        self.hk_stamp_duty = hk_stamp_duty
+        self.us_sec_fee = us_sec_fee
         self.commission = commission
         self.slippage = slippage
         self.cash_proxy = cash_proxy
 
+    def classify_market(self, symbol: str) -> str:
+        """Classify symbol into MarketType: CASH, CHINA, HONGKONG, or US."""
+        return classify_market(symbol, self.cash_proxy)
+
     def resolve_lot_size(self, symbol: str) -> int:
-        """Resolve round lot size for symbol."""
-        sym_clean = symbol.strip().upper()
-        if sym_clean in (self.cash_proxy, "BIL", "CASH", "511880.SH", "GC001"):
+        """Resolve round lot size for symbol according to market trading rules."""
+        market = self.classify_market(symbol)
+        if market in (MarketType.CASH.value, MarketType.US.value):
             return 1
-        if sym_clean.endswith(".SH") or sym_clean.endswith(".SZ") or sym_clean.endswith(".BJ"):
+        if market == MarketType.CHINA.value:
             return 100
-        if sym_clean.endswith(".HK"):
-            return 100  # Default HK standard lot fallback
-        return 1  # US equities default lot is 1
+        if market == MarketType.HONGKONG.value:
+            return _get_hk_board_lot(symbol, default_lot=100)
+        return self.lot_size_default
 
     def net_portfolio_orders(
         self,
@@ -236,7 +331,18 @@ class OrderNettingEngine:
             global_target_weights[sym] = float(w_sum)
 
         # 5. Calculate Sub-Strategy Desired Trades (Gross Intentions per strategy)
-        # Each strategy has a virtual target shares: round_down( (w_k * allocated_capital) / price )
+        # Precompute initial proportional holdings for each symbol across strategies
+        strat_weights = [it.capital_weight for it in normalized_intents]
+        initial_sub_holdings_by_sym: Dict[str, Dict[str, int]] = {}
+        for sym in equity_symbols:
+            lot = self.resolve_lot_size(sym)
+            master_sh = master_current_shares.get(sym, 0)
+            allocations = allocate_integer_lots(master_sh, strat_weights, lot)
+            initial_sub_holdings_by_sym[sym] = {
+                it.strategy_key: allocations[idx]
+                for idx, it in enumerate(normalized_intents)
+            }
+
         per_strat_shares: Dict[str, Dict[str, Dict[str, Any]]] = {}
         for it in normalized_intents:
             strat_orders = {}
@@ -247,13 +353,12 @@ class OrderNettingEngine:
                 sub_tgt_val = tgt_w * it.allocated_capital
                 sub_tgt_shares = int(np.floor(sub_tgt_val / price / lot) * lot) if price > 0 else 0
 
-                # Prior virtual shares (from prior_sub_ledgers if available, else proportional)
+                # Prior virtual shares (from prior_sub_ledgers if available, else proportional lot-aligned)
                 prior_sub_shares = 0
                 if prior_sub_ledgers and it.strategy_key in prior_sub_ledgers:
                     prior_sub_shares = int(prior_sub_ledgers[it.strategy_key].get("holdings", {}).get(sym, 0))
                 else:
-                    # Initial launch: infer proportional share of master holdings
-                    prior_sub_shares = int(np.round(master_current_shares.get(sym, 0) * it.capital_weight))
+                    prior_sub_shares = initial_sub_holdings_by_sym.get(sym, {}).get(it.strategy_key, 0)
 
                 delta_shares = sub_tgt_shares - prior_sub_shares
                 strat_action = "HOLD"
@@ -286,11 +391,22 @@ class OrderNettingEngine:
         total_gross_turnover = 0.0
         total_net_turnover = 0.0
         total_crossed_turnover = 0.0
-        crossed_sells_value = 0.0
+
+        total_saved_stamp_duty = 0.0
+        total_saved_sec_fee = 0.0
+        total_saved_comm = 0.0
+        total_saved_slip = 0.0
+        market_savings: Dict[str, float] = {
+            MarketType.CHINA.value: 0.0,
+            MarketType.HONGKONG.value: 0.0,
+            MarketType.US.value: 0.0,
+        }
 
         for sym in equity_symbols:
             price = float(latest_prices.get(sym, 1.0))
+            market = self.classify_market(sym)
             lot = self.resolve_lot_size(sym)
+            currency = get_market_currency(market)
             cur_master_shares = master_current_shares[sym]
             cur_master_w = master_current_weights[sym]
             tgt_master_w = global_target_weights[sym]
@@ -325,9 +441,13 @@ class OrderNettingEngine:
             delta_w = tgt_master_w - cur_master_w
             abs_delta_w = abs(delta_w)
 
-            # Tenure Lock Check (T+1 holding tenure constraint on master account)
+            # Tenure Lock Check: China A-shares strictly enforce T+1 tenure
             held_age = bars_map.get(sym, min_holding_bars)
-            is_tenure_locked = (held_age < min_holding_bars) and (cur_master_shares > 0)
+            if market == MarketType.CHINA.value:
+                is_tenure_locked = (held_age < min_holding_bars) and (cur_master_shares > 0)
+            else:
+                # HK and US markets are T+0 intraday settlement
+                is_tenure_locked = False
 
             # Action Determination with Inertia and Tenure Filter
             action = "HOLD"
@@ -375,13 +495,36 @@ class OrderNettingEngine:
 
             trade_val = abs(final_delta_shares) * price
             gross_val = (gross_buy + gross_sell) * price
-            crossed_val = crossed_sh * 2 * price
+            crossed_turnover = crossed_sh * 2 * price
             crossed_sells_val = crossed_sh * price
 
             total_gross_turnover += gross_val
             total_net_turnover += trade_val
-            total_crossed_turnover += crossed_val
-            crossed_sells_value += crossed_sells_val
+            total_crossed_turnover += crossed_turnover
+
+            # Statutory Taxes & Reg Fees avoidance per market
+            sym_saved_stamp = 0.0
+            sym_saved_sec = 0.0
+            if market == MarketType.CHINA.value:
+                # China A-shares: 0.05% stamp duty on sells avoided
+                sym_saved_stamp = crossed_sells_val * self.china_stamp_duty
+            elif market == MarketType.HONGKONG.value:
+                # HKEX: 0.1085% stamp duty + statutory levies on BOTH buy and sell legs avoided
+                sym_saved_stamp = crossed_turnover * self.hk_stamp_duty
+            elif market == MarketType.US.value:
+                # US: 0% stamp duty, 0.00278% SEC Section 31 fee on sells avoided
+                sym_saved_sec = crossed_sells_val * self.us_sec_fee
+
+            sym_saved_comm = crossed_turnover * self.commission
+            sym_saved_slip = crossed_turnover * self.slippage
+            sym_total_friction = sym_saved_stamp + sym_saved_sec + sym_saved_comm + sym_saved_slip
+
+            total_saved_stamp_duty += sym_saved_stamp
+            total_saved_sec_fee += sym_saved_sec
+            total_saved_comm += sym_saved_comm
+            total_saved_slip += sym_saved_slip
+            if market in market_savings:
+                market_savings[market] += sym_total_friction
 
             # Resolve readable Chinese name
             sym_name = names_map.get(sym, sym)
@@ -398,9 +541,15 @@ class OrderNettingEngine:
                 crossed_shares=crossed_sh,
                 gross_trade_value=gross_val,
                 net_trade_value=trade_val,
-                crossed_trade_value=crossed_val,
+                crossed_trade_value=crossed_turnover,
                 action=action,
                 contributing_strategies=contribs,
+                market=market,
+                lot_size=lot,
+                currency=currency,
+                saved_stamp_duty=sym_saved_stamp,
+                saved_sec_fee=sym_saved_sec,
+                saved_friction=sym_total_friction,
             )
             crossed_details.append(crossed_detail)
 
@@ -423,17 +572,16 @@ class OrderNettingEngine:
                     "gross_sell_shares": gross_sell,
                     "crossed_shares": crossed_sh,
                     "holding_bars": held_age if cur_master_shares > 0 else 0,
+                    "market": market,
+                    "lot_size": lot,
+                    "currency": currency,
                     "reason": reason,
                 })
 
         # 7. Compute Quantified Friction & Tax Savings
-        saved_stamp_duty = crossed_sells_value * self.stamp_duty
-        saved_comm = (total_crossed_shares * 2 * price if False else total_crossed_turnover) * self.commission
-        saved_slip = total_crossed_turnover * self.slippage
-        total_friction_saved = saved_stamp_duty + saved_comm + saved_slip
-
+        total_friction_saved = total_saved_stamp_duty + total_saved_sec_fee + total_saved_comm + total_saved_slip
         total_gross_shares = total_gross_buy_shares + total_gross_sell_shares
-        total_net_shares = sum(abs(r["delta_shares"]) for r in global_rows)
+        total_net_shares = sum(abs(r["delta_shares"]) for r in global_rows if r["symbol"] != self.cash_proxy)
         churn_red_ratio = (total_crossed_shares * 2.0 / total_gross_shares) if total_gross_shares > 0 else 0.0
 
         friction_savings = FrictionSavings(
@@ -444,10 +592,12 @@ class OrderNettingEngine:
             total_gross_turnover=total_gross_turnover,
             total_net_turnover=total_net_turnover,
             saved_turnover=total_crossed_turnover,
-            saved_stamp_duty=saved_stamp_duty,
-            saved_commission=saved_comm,
-            saved_slippage=saved_slip,
+            saved_stamp_duty=total_saved_stamp_duty,
+            saved_commission=total_saved_comm,
+            saved_slippage=total_saved_slip,
             total_friction_saved=total_friction_saved,
+            saved_sec_fee=total_saved_sec_fee,
+            saved_by_market=market_savings,
         )
 
         # 8. Apply Global Master Purchasing Power Constraint
@@ -503,6 +653,9 @@ class OrderNettingEngine:
             "gross_sell_shares": 0,
             "crossed_shares": 0,
             "holding_bars": 999,
+            "market": MarketType.CASH.value,
+            "lot_size": 1,
+            "currency": "CNY",
             "reason": "多策略净额化流动性资金归集/释放",
         }
         global_rows.append(cash_row)
@@ -548,9 +701,11 @@ class OrderNettingEngine:
             "total_crossed_shares": total_crossed_shares,
             "churn_reduction_ratio": churn_red_ratio,
             "total_friction_saved_rmb": total_friction_saved,
-            "saved_stamp_duty_rmb": saved_stamp_duty,
-            "saved_commission_rmb": saved_comm,
-            "saved_slippage_rmb": saved_slip,
+            "saved_stamp_duty_rmb": total_saved_stamp_duty,
+            "saved_sec_fee_rmb": total_saved_sec_fee,
+            "saved_commission_rmb": total_saved_comm,
+            "saved_slippage_rmb": total_saved_slip,
+            "saved_by_market": market_savings,
             "net_sells_count": len([r for r in net_orders_list if r.get("action") == "SELL"]),
             "net_buys_count": len([r for r in net_orders_list if r.get("action") == "BUY"]),
             "post_trade_cash_rmb": post_trade_cash_val,

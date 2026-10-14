@@ -61,9 +61,12 @@ from common.cli_utils import (
 )
 from common.order_netting import (
     FrictionSavings,
+    MarketType,
     NettingResult,
     OrderNettingEngine,
     SubStrategyIntent,
+    get_market_currency,
+    get_market_label,
 )
 from common.strategy_spec import get_template, load_strategy_file
 from common.universe import (
@@ -338,6 +341,13 @@ def main():
         prior_sub_ledgers=prior_sub_ledgers,
     )
 
+    def curr_sym(m_or_c: str) -> str:
+        if m_or_c in ("HONGKONG", "HKD"):
+            return "HK$"
+        if m_or_c in ("US", "USD"):
+            return "$"
+        return "¥"
+
     # 6. Display Internal Crossing Audit & Friction Savings
     fs = res.friction_savings
     print("\n" + "=" * 115)
@@ -348,23 +358,29 @@ def main():
     print(f"内部对冲化解股数 (Crossed Shares: {fs.total_crossed_shares:>10,d} 股")
     print(f"无效换手削减比例 (Churn Reduction: {fs.churn_reduction_ratio:>10.2%}")
     print("-" * 115)
-    print(f"  • 节约卖出印花税 (0.05% 印花税) : ¥{fs.saved_stamp_duty:>10,.2f} RMB")
-    print(f"  • 节约双边佣金   (0.03% 券商佣金) : ¥{fs.saved_commission:>10,.2f} RMB")
-    print(f"  • 节约双边滑点   (0.05% 冲击成本) : ¥{fs.saved_slippage:>10,.2f} RMB")
-    print(f"  ★ 合计为账户挽回摩擦损耗        : ¥{fs.total_friction_saved:>10,.2f} RMB")
+    print(f"  • 节约印花税及规费 (A股卖出0.05% / 港股双边0.1085%) : ¥{fs.saved_stamp_duty:>10,.2f} RMB")
+    if fs.saved_sec_fee > 0:
+        print(f"  • 节约美股监管规费 (SEC Section 31 0.00278%)        : ¥{fs.saved_sec_fee:>10,.2f} RMB")
+    print(f"  • 节约双边券商佣金 (0.03% 券商佣金)                 : ¥{fs.saved_commission:>10,.2f} RMB")
+    print(f"  • 节约双边冲击成本 (0.05% 买卖滑点)                 : ¥{fs.saved_slippage:>10,.2f} RMB")
+    if fs.saved_by_market:
+        m_parts = [f"{get_market_label(m)}: ¥{val:,.2f}" for m, val in fs.saved_by_market.items() if val > 0]
+        if m_parts:
+            print(f"  • 各市场节约分布   ({', '.join(m_parts)})")
+    print(f"  ★ 合计为账户挽回摩擦损耗                           : ¥{fs.total_friction_saved:>10,.2f} RMB")
     print("=" * 115)
 
     # Display Active Crossing Symbols
     active_crossed = [c for c in res.crossed_details if c.crossed_shares > 0]
     if active_crossed:
         print("\n[高对冲标的明细表 (Internally Crossed Assets Breakdown)]")
-        print(f"{'代码 (Symbol)':<12} {'名称 (Name)':<10} {'现价':>8} {'毛买股数':>9} {'毛卖股数':>9} {'对冲股数':>9} {'净执行股数':>10} {'节约金额':>10}")
-        print("-" * 88)
+        print(f"{'代码 (Symbol)':<11} {'市场':<4} {'一手':>5} {'名称 (Name)':<10} {'现价':>8} {'毛买股数':>9} {'毛卖股数':>9} {'对冲股数':>9} {'净执行股数':>10} {'节约金额':>10}")
+        print("-" * 105)
         for c in active_crossed:
-            saved_val = c.crossed_trade_value * (0.0005 + 0.0003 + 0.0005)
-            print(f"{c.symbol:<12} {pad_east_asian(c.name, 10)} {c.price:>8.2f} {c.gross_buy_shares:>9,d} "
-                  f"{c.gross_sell_shares:>9,d} {c.crossed_shares:>9,d} {c.net_shares:>10,d} ¥{saved_val:>9,.2f}")
-        print("-" * 88)
+            cs = curr_sym(c.market)
+            print(f"{c.symbol:<11} {get_market_label(c.market):<4} {c.lot_size:>5d} {pad_east_asian(c.name, 10)} {c.price:>8.2f} "
+                  f"{c.gross_buy_shares:>9,d} {c.gross_sell_shares:>9,d} {c.crossed_shares:>9,d} {c.net_shares:>10,d} {cs}{c.saved_friction:>9,.2f}")
+        print("-" * 105)
 
     # 7. Display Standard 4-Phase Netted Execution Ticket
     print("\n" + "=" * 115)
@@ -379,37 +395,40 @@ def main():
 
     if not sells.empty:
         print("\n【阶段一：净卖出优先执行 (PHASE 1: NET SELLS FIRST - 释放购买力)】")
-        print(f"{'代码 (Symbol)':<12} {'名称 (Name)':<10} {'现价':>8} {'当前股数':>9} {'目标股数':>9} {'净卖股数':>9} {'释放资金':>12} {'说明理由':<25}")
-        print("-" * 105)
+        print(f"{'代码 (Symbol)':<11} {'市场':<4} {'一手':>5} {'名称 (Name)':<10} {'现价':>8} {'当前股数':>9} {'目标股数':>9} {'净卖股数':>9} {'释放资金':>12} {'说明理由':<25}")
+        print("-" * 115)
         for _, r in sells.iterrows():
-            print(f"{r['symbol']:<12} {pad_east_asian(r['name'], 10)} {r['price']:>8.2f} {r['current_shares']:>9,d} "
-                  f"{r['target_shares']:>9,d} {abs(r['delta_shares']):>9,d} ¥{r['trade_value']:>11,.2f} {r['reason']}")
+            cs = curr_sym(r.get("market", "CHINA"))
+            print(f"{r['symbol']:<11} {get_market_label(r.get('market', 'CHINA')):<4} {r.get('lot_size', 100):>5d} {pad_east_asian(r['name'], 10)} {r['price']:>8.2f} "
+                  f"{r['current_shares']:>9,d} {r['target_shares']:>9,d} {abs(r['delta_shares']):>9,d} {cs}{r['trade_value']:>11,.2f} {r['reason']}")
     else:
         print("\n【阶段一：净卖出优先执行 (PHASE 1: NET SELLS FIRST)】: 今日无卖出指令 (No Sell Orders)")
 
     if not buys.empty:
-        print("\n【阶段二：净买入规范执行 (PHASE 2: NET BUYS SECOND - 整百手建仓)】")
-        print(f"{'代码 (Symbol)':<12} {'名称 (Name)':<10} {'现价':>8} {'当前股数':>9} {'目标股数':>9} {'净买股数':>9} {'所需资金':>12} {'说明理由':<25}")
-        print("-" * 105)
+        print("\n【阶段二：净买入规范执行 (PHASE 2: NET BUYS SECOND - 整手建仓)】")
+        print(f"{'代码 (Symbol)':<11} {'市场':<4} {'一手':>5} {'名称 (Name)':<10} {'现价':>8} {'当前股数':>9} {'目标股数':>9} {'净买股数':>9} {'所需资金':>12} {'说明理由':<25}")
+        print("-" * 115)
         for _, r in buys.iterrows():
-            print(f"{r['symbol']:<12} {pad_east_asian(r['name'], 10)} {r['price']:>8.2f} {r['current_shares']:>9,d} "
-                  f"{r['target_shares']:>9,d} {r['delta_shares']:>9,d} ¥{r['trade_value']:>11,.2f} {r['reason']}")
+            cs = curr_sym(r.get("market", "CHINA"))
+            print(f"{r['symbol']:<11} {get_market_label(r.get('market', 'CHINA')):<4} {r.get('lot_size', 100):>5d} {pad_east_asian(r['name'], 10)} {r['price']:>8.2f} "
+                  f"{r['current_shares']:>9,d} {r['target_shares']:>9,d} {r['delta_shares']:>9,d} {cs}{r['trade_value']:>11,.2f} {r['reason']}")
     else:
         print("\n【阶段二：净买入规范执行 (PHASE 2: NET BUYS SECOND)】: 今日无买入指令 (No Buy Orders)")
 
     if not holds.empty:
         print(f"\n【阶段三：持仓维持与锁仓 (PHASE 3: NET POSITIONS HELD - {len(holds)} 只标的)】")
-        print(f"{'代码 (Symbol)':<12} {'名称 (Name)':<10} {'现价':>8} {'持有股数':>9} {'持仓市值':>12} {'当前权重':>8} {'目标权重':>8} {'说明状态':<25}")
-        print("-" * 105)
+        print(f"{'代码 (Symbol)':<11} {'市场':<4} {'一手':>5} {'名称 (Name)':<10} {'现价':>8} {'持有股数':>9} {'持仓市值':>12} {'当前权重':>8} {'目标权重':>8} {'说明状态':<25}")
+        print("-" * 115)
         for _, r in holds.iterrows():
             mval = r['target_shares'] * r['price']
-            print(f"{r['symbol']:<12} {pad_east_asian(r['name'], 10)} {r['price']:>8.2f} {r['target_shares']:>9,d} "
-                  f"¥{mval:>11,.2f} {r['current_weight']:>7.1%} {r['target_weight']:>7.1%} {r['reason']}")
+            cs = curr_sym(r.get("market", "CHINA"))
+            print(f"{r['symbol']:<11} {get_market_label(r.get('market', 'CHINA')):<4} {r.get('lot_size', 100):>5d} {pad_east_asian(r['name'], 10)} {r['price']:>8.2f} "
+                  f"{r['target_shares']:>9,d} {cs}{mval:>11,.2f} {r['current_weight']:>7.1%} {r['target_weight']:>7.1%} {r['reason']}")
 
     if not cash.empty:
         print("\n【阶段四：闲置资金现金管理 (PHASE 4: GLOBAL CASH SWEEP)】")
         r_cash = cash.iloc[0]
-        print(f"  现金管理工具代码 : {r_cash['symbol']} (银华日利 / 国债逆回购 GC001)")
+        print(f"  现金管理工具代码 : {r_cash['symbol']} (银华日利 / 国债逆回购 GC001 / 美元国债 BIL)")
         print(f"  执行后可用现金   : ¥{r_cash['target_shares']:>10,.2f} ({r_cash['target_weight']:>5.1%})")
         print(f"  调仓净发生变化   : ¥{r_cash['delta_shares']:>10,.2f}")
         print(f"  执行动作状态     : {r_cash['action']} ({r_cash['reason']})")
