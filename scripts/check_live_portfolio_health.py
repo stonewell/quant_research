@@ -30,6 +30,7 @@ Usage:
 """
 
 import argparse
+import copy
 import json
 import os
 import sys
@@ -233,6 +234,7 @@ def inspect_portfolio_drawdown(
     peak_nav: Optional[float],
     state: Dict[str, Any],
     params: Dict[str, Any],
+    as_of_date: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Compute peak-to-trough drawdown, circuit breaker tiers, auto-healing, and fast recovery."""
     dd_reduce_thresh = float(resolve_blend_param(params, "dd_reduce_thresh", 0.10, float))
@@ -240,6 +242,10 @@ def inspect_portfolio_drawdown(
     dd_stop_thresh = float(resolve_blend_param(params, "dd_stop_thresh", 0.20, float))
     tier1_cooldown_bars = int(resolve_blend_param(params, "tier1_cooldown_bars", 15, int))
     stop_cooldown_bars = int(resolve_blend_param(params, "stop_cooldown_bars", 21, int))
+
+    # If state was already updated for as_of_date and has prior_state, use pre-day baseline
+    if as_of_date and state.get("as_of_date") == as_of_date and isinstance(state.get("prior_state"), dict):
+        state = state["prior_state"]
 
     # Resolve HWM peak NAV
     saved_peak = state.get("peak_nav")
@@ -755,11 +761,37 @@ def main():
 
     # 3. Load Account State & Evaluate Portfolio Drawdown
     state = load_account_state(args.account_state_file)
+
+    # Establish baseline state for evaluation:
+    # If state was already updated for this exact as_of_date (same-day re-run),
+    # roll back to prior_state (state entering today) to ensure complete idempotency.
+    is_same_day = (state.get("as_of_date") == as_of_date)
+    if is_same_day and isinstance(state.get("prior_state"), dict):
+        baseline_state = copy.deepcopy(state["prior_state"])
+        prior_state_to_preserve = copy.deepcopy(state["prior_state"])
+    elif is_same_day and "prior_state" not in state:
+        # Fallback for states created before prior_state tracking was added:
+        # Prevent double-incrementing counters and duplicate nav_hist entries on same-day re-runs
+        baseline_state = copy.deepcopy(state)
+        if baseline_state.get("tier1_consecutive_bars", 0) > 0:
+            baseline_state["tier1_consecutive_bars"] -= 1
+        if baseline_state.get("tier3_consecutive_bars", 0) > 0:
+            baseline_state["tier3_consecutive_bars"] -= 1
+        if baseline_state.get("nav_history_10d"):
+            baseline_state["nav_history_10d"] = baseline_state["nav_history_10d"][:-1]
+        prior_state_to_preserve = copy.deepcopy(baseline_state)
+    else:
+        # First run on a new date: baseline is the current state
+        baseline_state = copy.deepcopy(state)
+        prior_state_to_preserve = copy.deepcopy(state)
+        prior_state_to_preserve.pop("prior_state", None)
+
     dd_info = inspect_portfolio_drawdown(
         current_nav=args.portfolio_value,
         peak_nav=args.peak_nav,
-        state=state,
+        state=baseline_state,
         params=params,
+        as_of_date=as_of_date,
     )
 
     # 4. Evaluate Universe Breadth, Thrust & Volatility
@@ -771,7 +803,7 @@ def main():
 
     # 6. Update Account State
     if not args.no_save_state:
-        nav_hist = state.get("nav_history_10d", [])
+        nav_hist = list(baseline_state.get("nav_history_10d", []))
         nav_hist.append(args.portfolio_value)
         if len(nav_hist) > 10:
             nav_hist.pop(0)
@@ -788,6 +820,7 @@ def main():
             "tier3_consecutive_bars": dd_info["tier3_counter"],
             "freeze_remaining_bars": dd_info["freeze_remaining_bars"],
             "nav_history_10d": nav_hist,
+            "prior_state": prior_state_to_preserve,
         })
         save_account_state(args.account_state_file, updated_state)
 

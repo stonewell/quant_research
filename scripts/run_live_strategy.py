@@ -405,11 +405,25 @@ def resolve_holding_bars(
                 else:
                     break  # continuity broken
 
+        acc_bars = None
+        if account_state and isinstance(account_state, dict):
+            # If account_state was already updated today, its top-level holding_bars
+            # contains today's post-trade targets (with fresh BUYs reset to 0).
+            # We must resolve against the pre-trade baseline entering today (prior_state).
+            if account_state.get("as_of_date") == cur_date and isinstance(account_state.get("prior_state"), dict):
+                prior_hb = account_state["prior_state"].get("holding_bars")
+                if isinstance(prior_hb, dict):
+                    acc_bars = prior_hb
+            elif account_state.get("as_of_date") != cur_date:
+                hb = account_state.get("holding_bars")
+                if isinstance(hb, dict):
+                    acc_bars = hb
+
         if found_in_history:
             holding_bars[clean_sym] = age
-        elif account_state and isinstance(account_state.get("holding_bars"), dict) and clean_sym in account_state["holding_bars"]:
+        elif acc_bars is not None and clean_sym in acc_bars:
             try:
-                holding_bars[clean_sym] = int(account_state["holding_bars"][clean_sym])
+                holding_bars[clean_sym] = int(acc_bars[clean_sym])
             except (ValueError, TypeError):
                 holding_bars[clean_sym] = default_bars
         else:
@@ -1232,6 +1246,8 @@ def main():
 
     # Persist updated holding_bars into account_state.json if available
     if args.account_state_file:
+        if isinstance(account_state.get("prior_state"), dict) and "holding_bars" not in account_state["prior_state"]:
+            account_state["prior_state"]["holding_bars"] = dict(holding_bars)
         account_state["holding_bars"] = updated_holding_bars
         try:
             with open(args.account_state_file, "w", encoding="utf-8") as f:

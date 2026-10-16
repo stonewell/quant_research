@@ -1258,6 +1258,120 @@ def test_multi_strategy_configs_and_netting_endpoints(temp_workspace):
     assert "600519.SH" in csv_arch
 
 
+def test_same_day_rerun_idempotency(temp_workspace):
+    """Test that re-running Stage 1 and Stage 2 on the same day produces strictly idempotent results."""
+    storage, temp_dir = temp_workspace
+    service = ExecutionService(storage)
+
+    strategy_file = os.path.join(
+        _REPO_ROOT,
+        "pipeline",
+        "research_strategy",
+        "results",
+        "strategy_dumps",
+        "chan_four_state_blend_strategy.json",
+    )
+    if not os.path.exists(strategy_file):
+        pytest.skip(f"Strategy file not found at {strategy_file}")
+
+    custom_symbols = ["601872.SH", "300394.SZ"]
+    val_date = "2024-05-10"
+
+    # Seed an initial baseline state from prior date
+    prior_state = {
+        "as_of_date": "2024-05-09",
+        "current_nav": 100000.0,
+        "peak_nav": 100000.0,
+        "tier1_consecutive_bars": 0,
+        "tier3_consecutive_bars": 0,
+        "freeze_remaining_bars": 0,
+        "nav_history_10d": [100000.0] * 5,
+        "holding_bars": {"601872.SH": 3},
+    }
+    storage.save_account_state(prior_state, date_str="2024-05-09", strategy_key="chan_four_state_blend", universe_key="custom")
+    storage._save_json(storage.account_state_file, prior_state)
+
+    # -------------------------------------------------------------
+    # 1. Stage 1 Health Check - Run 1 (Drawdown triggers Tier 1)
+    # -------------------------------------------------------------
+    res1 = service.run_health_check(
+        strategy_file=strategy_file,
+        custom_symbols=custom_symbols,
+        as_of_date=val_date,
+        portfolio_value=88000.0,
+        peak_nav=100000.0,
+        data_provider="synthetic",
+    )
+    assert res1["status"] == "success"
+    st1 = res1["account_state"]
+    assert st1["tier1_consecutive_bars"] == 1
+    assert len(st1["nav_history_10d"]) == 6
+    assert st1["nav_history_10d"][-1] == 88000.0
+
+    # -------------------------------------------------------------
+    # 2. Stage 1 Health Check - Run 2 (Same day re-run must be idempotent!)
+    # -------------------------------------------------------------
+    res2 = service.run_health_check(
+        strategy_file=strategy_file,
+        custom_symbols=custom_symbols,
+        as_of_date=val_date,
+        portfolio_value=88000.0,
+        peak_nav=100000.0,
+        data_provider="synthetic",
+    )
+    assert res2["status"] == "success"
+    st2 = res2["account_state"]
+    # tier1_consecutive_bars MUST remain 1, NOT increment to 2!
+    assert st2["tier1_consecutive_bars"] == 1
+    # nav_history_10d MUST NOT duplicate 88000.0!
+    assert len(st2["nav_history_10d"]) == 6
+    assert st2["nav_history_10d"][-1] == 88000.0
+    assert res2["health_report"]["portfolio_health"]["tier1_counter"] == 1
+
+    # -------------------------------------------------------------
+    # 3. Stage 2 Live Deploy - Run 1
+    # -------------------------------------------------------------
+    initial_holdings = {"601872.SH": 1000}
+    dep1 = service.run_live_deploy(
+        strategy_file=strategy_file,
+        custom_symbols=custom_symbols,
+        as_of_date=val_date,
+        portfolio_value=88000.0,
+        current_holdings=initial_holdings,
+        data_provider="synthetic",
+    )
+    assert dep1["status"] == "success"
+    ticket1 = dep1["trading_ticket"]
+    assert ticket1 is not None and len(ticket1) > 0
+
+    # Verify storage.get_run returns pre-trade holdings for UI reconciliation
+    run_bundle = storage.get_run(val_date)
+    assert run_bundle is not None
+    assert run_bundle["holdings"] == initial_holdings
+    assert "post_holdings" in run_bundle
+    assert isinstance(run_bundle["post_holdings"], dict)
+
+    # -------------------------------------------------------------
+    # 4. Stage 2 Live Deploy - Run 2 (Same day re-run with same pre-trade holdings)
+    # -------------------------------------------------------------
+    dep2 = service.run_live_deploy(
+        strategy_file=strategy_file,
+        custom_symbols=custom_symbols,
+        as_of_date=val_date,
+        portfolio_value=88000.0,
+        current_holdings=run_bundle["holdings"],
+        data_provider="synthetic",
+    )
+    assert dep2["status"] == "success"
+    ticket2 = dep2["trading_ticket"]
+    assert ticket2 is not None
+
+    # Actions and target shares must be strictly identical across re-runs
+    sym_to_action1 = {t["symbol"]: (t["action"], t.get("target_shares"), t.get("delta_shares")) for t in ticket1}
+    sym_to_action2 = {t["symbol"]: (t["action"], t.get("target_shares"), t.get("delta_shares")) for t in ticket2}
+    assert sym_to_action1 == sym_to_action2
+
+
 
 
 

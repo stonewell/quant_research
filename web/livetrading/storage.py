@@ -1387,14 +1387,19 @@ class StorageManager:
         strat_n = summary_data.get("strategy_name", "")
         univ_n = summary_data.get("universe_name", "")
 
-        # Holdings extraction: holdings.json first, then current_holdings.json, then post_holdings, then previous run
+        # Holdings extraction: pre-trade snapshot first (holdings.json / current_holdings.json),
+        # then carry forward from earlier runs (< date_str).
+        # We must NOT fall back to extract_post_run_holdings for bundle["holdings"],
+        # because bundle["holdings"] is used as the pre-trade baseline in the UI!
         holdings_data = self._load_json(os.path.join(run_dir, "holdings.json"))
         if not holdings_data:
             holdings_data = self._load_json(os.path.join(run_dir, "current_holdings.json"))
-        if not holdings_data:
-            holdings_data = self.extract_post_run_holdings(run_dir)
         if not holdings_data and strat_k and univ_k:
             holdings_data = self._carry_forward_holdings(date_str, strat_k, univ_k)
+        if not holdings_data:
+            holdings_data = self.get_holdings(date_str, strat_k, univ_k)
+
+        post_holdings_data = self.extract_post_run_holdings(run_dir)
 
         account_state = self._load_json(os.path.join(run_dir, "account_state.json"))
         if not account_state and strat_k and univ_k:
@@ -1439,6 +1444,7 @@ class StorageManager:
             "sub_ledgers": sub_ledgers,
             "summary": summary_data,
             "holdings": holdings_data or {},
+            "post_holdings": post_holdings_data or {},
             "prices": prices_map,
             "account_state": account_state,
             "has_csv": os.path.exists(os.path.join(run_dir, "live_trading_ticket.csv")) or os.path.exists(os.path.join(run_dir, "netted_trading_ticket.csv")),

@@ -30,6 +30,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -89,6 +90,56 @@ DEFAULT_UNIVERSE_FILE = os.path.join(
     _REPO_ROOT, "docs", "universe", "china", "pruned_core_satellite_blend_16.txt"
 )
 DEFAULT_OUTPUT_DIR = os.path.join(_REPO_ROOT, "docs", "ruleset", "multi_strategy_netted")
+
+
+def resolve_prior_sub_ledgers(
+    val_date: str,
+    output_dir: Optional[str],
+    sub_ledgers_file_arg: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Resolves prior sub-ledgers strictly before val_date to ensure re-run idempotency."""
+    out_file = os.path.join(output_dir, "sub_ledgers.json") if output_dir else ""
+    if sub_ledgers_file_arg and os.path.exists(sub_ledgers_file_arg):
+        # Only use if it is not today's own output file
+        if not out_file or os.path.abspath(sub_ledgers_file_arg) != os.path.abspath(out_file):
+            try:
+                with open(sub_ledgers_file_arg, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+
+    # Search earlier date runs strictly before val_date
+    cand_parents = []
+    if output_dir:
+        cand_parents.append(os.path.dirname(os.path.abspath(output_dir)))
+        cand_parents.append(os.path.dirname(os.path.dirname(os.path.abspath(output_dir))))
+
+    date_re = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+    for parent in cand_parents:
+        if not os.path.isdir(parent):
+            continue
+        sub_dates = sorted([d for d in os.listdir(parent) if date_re.match(d) and d < val_date], reverse=True)
+        for d in sub_dates:
+            d_path = os.path.join(parent, d)
+            cands = [
+                os.path.join(d_path, "sub_ledgers.json"),
+            ]
+            if output_dir:
+                cands.append(os.path.join(d_path, os.path.basename(output_dir), "sub_ledgers.json"))
+            if os.path.isdir(d_path):
+                for sub in os.listdir(d_path):
+                    if sub.startswith("multi_netted_"):
+                        cands.append(os.path.join(d_path, sub, "sub_ledgers.json"))
+            for cand in cands:
+                if os.path.exists(cand):
+                    try:
+                        with open(cand, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                            if data and isinstance(data, dict):
+                                return data
+                    except Exception:
+                        pass
+    return None
 
 
 def parse_args():
@@ -300,14 +351,11 @@ def main():
     else:
         master_holdings_dict = {"BIL": args.portfolio_value}
 
-    sub_ledgers_file = args.sub_ledgers_file or os.path.join(args.output_dir, "sub_ledgers.json")
-    prior_sub_ledgers = None
-    if os.path.exists(sub_ledgers_file):
-        try:
-            with open(sub_ledgers_file, "r", encoding="utf-8") as f:
-                prior_sub_ledgers = json.load(f)
-        except Exception:
-            pass
+    prior_sub_ledgers = resolve_prior_sub_ledgers(
+        val_date=val_date,
+        output_dir=args.output_dir,
+        sub_ledgers_file_arg=args.sub_ledgers_file,
+    )
 
     holding_bars = resolve_holding_bars(
         raw_user_holdings or {},
@@ -445,14 +493,14 @@ def main():
         json.dump(res.net_orders, f, indent=2, ensure_ascii=False)
     with open(savings_json, "w", encoding="utf-8") as f:
         json.dump(res.to_dict()["friction_savings"], f, indent=2, ensure_ascii=False)
-    with open(sub_ledgers_file, "w", encoding="utf-8") as f:
+    with open(ledgers_json, "w", encoding="utf-8") as f:
         json.dump(res.sub_ledgers, f, indent=2, ensure_ascii=False)
 
     print(f"\n[✓] 净额化调仓票据已成功导出至:")
     print(f"    工单表格 (CSV)  : {ticket_csv}")
     print(f"    工单数据 (JSON) : {ticket_json}")
     print(f"    节约报告 (JSON) : {savings_json}")
-    print(f"    虚拟账本 (JSON) : {sub_ledgers_file}")
+    print(f"    虚拟账本 (JSON) : {ledgers_json}")
 
 
 if __name__ == "__main__":

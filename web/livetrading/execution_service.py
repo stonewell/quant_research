@@ -137,11 +137,24 @@ class ExecutionService:
         univ_path = self._resolve_universe(universe_file, custom_symbols, run_dir)
         account_state_file = os.path.join(run_dir, "account_state.json")
 
-        # Copy global account state to daily run_dir if not present
-        if not os.path.exists(account_state_file) and os.path.exists(self.storage.account_state_file):
+        # Ensure account_state_file in daily run_dir has proper pre-trade baseline
+        if os.path.exists(account_state_file):
             try:
-                state_data = self.storage.get_account_state(date_str=val_date, strategy_key=strat_key, universe_key=univ_key)
-                self.storage._save_json(account_state_file, state_data)
+                existing_st = self.storage._load_json(account_state_file)
+                if existing_st and existing_st.get("as_of_date") == val_date and "prior_state" not in existing_st:
+                    carried = self.storage._carry_forward_account_state(val_date, strat_key, univ_key)
+                    if carried:
+                        existing_st["prior_state"] = carried
+                        self.storage._save_json(account_state_file, existing_st)
+            except Exception:
+                pass
+        else:
+            try:
+                state_data = self.storage._carry_forward_account_state(val_date, strat_key, univ_key)
+                if not state_data:
+                    state_data = self.storage.get_account_state(date_str=val_date, strategy_key=strat_key, universe_key=univ_key)
+                if state_data:
+                    self.storage._save_json(account_state_file, state_data)
             except Exception:
                 pass
 
