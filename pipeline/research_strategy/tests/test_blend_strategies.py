@@ -658,4 +658,40 @@ def test_apply_asset_inertia_day0_and_incremental_protection():
     assert res_addon.loc[dates[3], "S1"] == 0.05  # Day 3 reduction is allowed!
 
 
+def test_apply_asset_inertia_never_exceeds_100_pct_when_expanding_existing_positions():
+    """Regression test: expanding multiple already-held positions must never push total risky weight > 1.0."""
+    from common.allocation_templates import apply_asset_inertia
 
+    dates = pd.bdate_range("2020-01-01", periods=3)
+    daily = pd.DataFrame({
+        "A": [0.40, 0.70, 0.70],
+        "B": [0.40, 0.46, 0.46],
+        "CASH": [0.20, 0.0, 0.0],
+    }, index=dates)
+
+    res = apply_asset_inertia(daily, min_weight_change=0.05, cash_proxy="CASH")
+    risky_sum = res[["A", "B"]].sum(axis=1)
+    assert (risky_sum <= 1.0 + 1e-9).all(), f"Risky sum exceeded 1.0: {risky_sum.to_dict()}"
+    assert np.isclose(res.loc[dates[1], "A"], 0.60)
+    assert np.isclose(res.loc[dates[1], "B"], 0.40)
+    assert np.isclose(res.loc[dates[1], "CASH"], 0.0)
+
+
+def test_base_blend_causal_adaptive_inertia_no_future_vol_lookahead():
+    """Regression test: adaptive_inertia uses causal expanding volatility so future volatility spikes
+    do not alter historical rebalance weights."""
+    univ_full = create_mock_universe(n_days=160)
+    cutoff = 120
+    univ_trunc = {sym: df.iloc[:cutoff].copy() for sym, df in univ_full.items()}
+
+    # Inject massive volatility after cutoff in univ_full
+    univ_shocked = {sym: df.copy() for sym, df in univ_full.items()}
+    shock_idx = univ_shocked["601225.SH"].index[cutoff:]
+    univ_shocked["601225.SH"].loc[shock_idx, "High"] *= 3.0
+    univ_shocked["601225.SH"].loc[shock_idx, "Low"] *= 0.3
+
+    strat = ChanRiskManagedBlendStrategy()
+    w_trunc = strat.generate_weights(univ_trunc)
+    w_shocked = strat.generate_weights(univ_shocked).iloc[:cutoff]
+
+    pd.testing.assert_frame_equal(w_trunc, w_shocked)

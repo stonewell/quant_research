@@ -217,6 +217,7 @@ class OrderNettingEngine:
         commission: float = 0.0003,      # 0.03% broker commission
         slippage: float = 0.0005,        # 0.05% execution slippage
         cash_proxy: str = "BIL",
+        fx_rates: Optional[Dict[str, float]] = None,
     ):
         self.lot_size_default = lot_size_default
         self.stamp_duty = stamp_duty
@@ -226,6 +227,7 @@ class OrderNettingEngine:
         self.commission = commission
         self.slippage = slippage
         self.cash_proxy = cash_proxy
+        self.fx_rates = dict(fx_rates) if fx_rates else {}
 
     def classify_market(self, symbol: str) -> str:
         """Classify symbol into MarketType: CASH, CHINA, HONGKONG, or US."""
@@ -254,6 +256,7 @@ class OrderNettingEngine:
         inertia_threshold: float = 0.05,
         symbol_names: Optional[Dict[str, str]] = None,
         prior_sub_ledgers: Optional[Dict[str, Any]] = None,
+        fx_rates: Optional[Dict[str, float]] = None,
     ) -> NettingResult:
         """Performs multi-strategy target aggregation, internal crossing, and netting.
 
@@ -268,6 +271,7 @@ class OrderNettingEngine:
             inertia_threshold: Global weight change threshold below which trades are filtered.
             symbol_names: Optional mapping from ticker symbol to human Chinese company name.
             prior_sub_ledgers: Previous day virtual sub-ledgers for continuous tracking.
+            fx_rates: Optional currency-to-RMB conversion rates {'CNY': 1.0, 'HKD': 0.92, 'USD': 7.20}.
 
         Returns:
             NettingResult with net tickets, crossed details, friction savings, and sub-ledgers.
@@ -275,6 +279,9 @@ class OrderNettingEngine:
         val_date = as_of_date or datetime.now().strftime("%Y-%m-%d")
         names_map = symbol_names or {}
         bars_map = holding_bars or {}
+        eff_fx_rates = dict(self.fx_rates)
+        if fx_rates:
+            eff_fx_rates.update(fx_rates)
 
         # 1. Normalize sub-strategy capital weights sum to 1.0
         total_strat_weight = sum(intent.capital_weight for intent in intents)
@@ -493,14 +500,16 @@ class OrderNettingEngine:
                 action = "HOLD"
                 reason = "最优权重维持"
 
+            fx_rate = float(eff_fx_rates.get(currency, 1.0))
             trade_val = abs(final_delta_shares) * price
+            trade_val_rmb = trade_val * fx_rate
             gross_val = (gross_buy + gross_sell) * price
             crossed_turnover = crossed_sh * 2 * price
             crossed_sells_val = crossed_sh * price
 
-            total_gross_turnover += gross_val
-            total_net_turnover += trade_val
-            total_crossed_turnover += crossed_turnover
+            total_gross_turnover += gross_val * fx_rate
+            total_net_turnover += trade_val_rmb
+            total_crossed_turnover += crossed_turnover * fx_rate
 
             # Statutory Taxes & Reg Fees avoidance per market
             sym_saved_stamp = 0.0
@@ -519,10 +528,10 @@ class OrderNettingEngine:
             sym_saved_slip = crossed_turnover * self.slippage
             sym_total_friction = sym_saved_stamp + sym_saved_sec + sym_saved_comm + sym_saved_slip
 
-            total_saved_stamp_duty += sym_saved_stamp
-            total_saved_sec_fee += sym_saved_sec
-            total_saved_comm += sym_saved_comm
-            total_saved_slip += sym_saved_slip
+            total_saved_stamp_duty += sym_saved_stamp * fx_rate
+            total_saved_sec_fee += sym_saved_sec * fx_rate
+            total_saved_comm += sym_saved_comm * fx_rate
+            total_saved_slip += sym_saved_slip * fx_rate
             if market in market_savings:
                 market_savings[market] += sym_total_friction
 
@@ -561,13 +570,13 @@ class OrderNettingEngine:
                     "action": action,
                     "price": price,
                     "current_weight": cur_master_w,
-                    "target_weight": (final_tgt_shares * price) / portfolio_value if portfolio_value > 0 else tgt_master_w,
-                    "delta_weight": ((final_tgt_shares - cur_master_shares) * price) / portfolio_value if portfolio_value > 0 else delta_w,
+                    "target_weight": (final_tgt_shares * price * fx_rate) / portfolio_value if portfolio_value > 0 else tgt_master_w,
+                    "delta_weight": ((final_tgt_shares - cur_master_shares) * price * fx_rate) / portfolio_value if portfolio_value > 0 else delta_w,
                     "current_shares": cur_master_shares,
                     "target_shares": final_tgt_shares,
                     "delta_shares": final_delta_shares,
                     "trade_value": trade_val,
-                    "trade_value_rmb": trade_val,
+                    "trade_value_rmb": trade_val_rmb,
                     "gross_buy_shares": gross_buy,
                     "gross_sell_shares": gross_sell,
                     "crossed_shares": crossed_sh,
@@ -578,7 +587,54 @@ class OrderNettingEngine:
                     "reason": reason,
                 })
 
-        # 7. Compute Quantified Friction & Tax Savings
+        # 7. Apply Global Master Purchasing Power Constraint
+        # Net buys cannot exceed master initial cash + master sales proceeds
+        cash_raw = None
+        for ck in (self.cash_proxy, "BIL", "CASH"):
+            if ck in current_holdings and float(current_holdings[ck]) > 0.0:
+                cash_raw = float(current_holdings[ck])
+                break
+        if cash_raw is not None:
+            if cash_raw <= 1.0:  # Weight representation
+                initial_cash_val = cash_raw * portfolio_value
+            else:
+                initial_cash_val = float(cash_raw)
+        else:
+            # Infer unallocated cash from portfolio_value minus current equity market value
+            current_equity_val = sum(
+                master_current_shares[sym] * float(latest_prices.get(sym, 1.0)) * float(eff_fx_rates.get(get_market_currency(self.classify_market(sym)), 1.0))
+                for sym in equity_symbols
+            )
+            initial_cash_val = max(0.0, float(portfolio_value) - current_equity_val)
+
+        total_sales_proceeds = sum(r["trade_value_rmb"] for r in global_rows if r["action"] == "SELL")
+        available_purchasing_power = max(0.0, initial_cash_val + total_sales_proceeds)
+        total_desired_buys = sum(r["trade_value_rmb"] for r in global_rows if r["action"] == "BUY")
+
+        detail_by_sym = {c.symbol: c for c in crossed_details}
+        if total_desired_buys > available_purchasing_power and total_desired_buys > 0:
+            buy_scale = available_purchasing_power / total_desired_buys
+            for r in global_rows:
+                if r["action"] == "BUY" and r["price"] > 0:
+                    lot = self.resolve_lot_size(r["symbol"])
+                    fx_rate = float(eff_fx_rates.get(r["currency"], 1.0))
+                    scaled_val_local = r["trade_value"] * buy_scale
+                    scaled_shares = int(np.floor(scaled_val_local / r["price"] / lot) * lot)
+                    r["delta_shares"] = max(0, scaled_shares)
+                    r["target_shares"] = r["current_shares"] + r["delta_shares"]
+                    r["trade_value"] = r["delta_shares"] * r["price"]
+                    r["trade_value_rmb"] = r["trade_value"] * fx_rate
+                    r["target_weight"] = (r["target_shares"] * r["price"] * fx_rate) / portfolio_value if portfolio_value > 0 else 0.0
+                    r["delta_weight"] = r["target_weight"] - r["current_weight"]
+                    if r["delta_shares"] == 0:
+                        r["action"] = "HOLD"
+                    if r["symbol"] in detail_by_sym:
+                        detail_by_sym[r["symbol"]].net_shares = abs(r["delta_shares"])
+                        detail_by_sym[r["symbol"]].net_trade_value = r["trade_value"]
+                        detail_by_sym[r["symbol"]].action = r["action"]
+
+        # 8. Compute Quantified Friction & Tax Savings (post-scaling)
+        total_net_turnover = sum(r["trade_value_rmb"] for r in global_rows if r["symbol"] != self.cash_proxy)
         total_friction_saved = total_saved_stamp_duty + total_saved_sec_fee + total_saved_comm + total_saved_slip
         total_gross_shares = total_gross_buy_shares + total_gross_sell_shares
         total_net_shares = sum(abs(r["delta_shares"]) for r in global_rows if r["symbol"] != self.cash_proxy)
@@ -600,35 +656,15 @@ class OrderNettingEngine:
             saved_by_market=market_savings,
         )
 
-        # 8. Apply Global Master Purchasing Power Constraint
-        # Net buys cannot exceed master initial cash + master sales proceeds
-        initial_cash_val = float(current_holdings.get(self.cash_proxy, 0.0))
-        if initial_cash_val <= 1.0:  # Weight representation
-            initial_cash_val = initial_cash_val * portfolio_value
-        else:
-            initial_cash_val = float(initial_cash_val)
-
-        total_sales_proceeds = sum(r["trade_value"] for r in global_rows if r["action"] == "SELL")
-        available_purchasing_power = max(0.0, initial_cash_val + total_sales_proceeds)
-        total_desired_buys = sum(r["trade_value"] for r in global_rows if r["action"] == "BUY")
-
-        if total_desired_buys > available_purchasing_power and total_desired_buys > 0:
-            buy_scale = available_purchasing_power / total_desired_buys
-            for r in global_rows:
-                if r["action"] == "BUY" and r["price"] > 0:
-                    lot = self.resolve_lot_size(r["symbol"])
-                    scaled_val = r["trade_value"] * buy_scale
-                    scaled_shares = int(np.floor(scaled_val / r["price"] / lot) * lot)
-                    r["delta_shares"] = max(0, scaled_shares)
-                    r["target_shares"] = r["current_shares"] + r["delta_shares"]
-                    r["trade_value"] = r["delta_shares"] * r["price"]
-                    r["trade_value_rmb"] = r["trade_value"]
-                    r["target_weight"] = (r["target_shares"] * r["price"]) / portfolio_value
-                    r["delta_weight"] = r["target_weight"] - r["current_weight"]
+        # Build post-trade master share map for virtual sub-ledger reconciliation
+        master_post_shares: Dict[str, int] = {sym: 0 for sym in equity_symbols}
+        for r in global_rows:
+            if r["symbol"] in master_post_shares:
+                master_post_shares[r["symbol"]] = int(r["target_shares"])
 
         # 9. Append Cash Proxy Sweep / Release Row
         actual_equity_trades_val = sum(
-            r["trade_value"] if r["action"] == "BUY" else (-r["trade_value"] if r["action"] == "SELL" else 0.0)
+            r["trade_value_rmb"] if r["action"] == "BUY" else (-r["trade_value_rmb"] if r["action"] == "SELL" else 0.0)
             for r in global_rows
         )
         post_trade_cash_val = max(0.0, initial_cash_val - actual_equity_trades_val)
@@ -686,6 +722,8 @@ class OrderNettingEngine:
             portfolio_value=portfolio_value,
             prior_sub_ledgers=prior_sub_ledgers,
             as_of_date=val_date,
+            master_post_shares=master_post_shares,
+            eff_fx_rates=eff_fx_rates,
         )
 
         summary = {
@@ -732,8 +770,51 @@ class OrderNettingEngine:
         portfolio_value: float,
         prior_sub_ledgers: Optional[Dict[str, Any]],
         as_of_date: str,
+        master_post_shares: Optional[Dict[str, int]] = None,
+        eff_fx_rates: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
-        """Maintains independent virtual accounting ledgers for each sub-strategy."""
+        """Maintains independent virtual accounting ledgers for each sub-strategy,
+        reconciled against post-trade master account holdings so virtual sub-ledgers
+        never drift when master trades are tenure-locked, inertia-filtered, or cash-scaled.
+        """
+        fx_map = eff_fx_rates or {}
+        reconciled_by_sym: Dict[str, Dict[str, int]] = {}
+        if master_post_shares is not None:
+            for sym, master_tgt in master_post_shares.items():
+                raw_targets = [
+                    int(per_strat_shares[it.strategy_key].get(sym, {}).get("target_shares", 0))
+                    for it in normalized_intents
+                ]
+                raw_sum = sum(raw_targets)
+                if raw_sum == master_tgt:
+                    reconciled_by_sym[sym] = {
+                        it.strategy_key: raw_targets[idx]
+                        for idx, it in enumerate(normalized_intents)
+                    }
+                elif master_tgt <= 0:
+                    reconciled_by_sym[sym] = {it.strategy_key: 0 for it in normalized_intents}
+                else:
+                    lot = self.resolve_lot_size(sym)
+                    if raw_sum > 0:
+                        weights = [t / raw_sum for t in raw_targets]
+                        allocs = allocate_integer_lots(master_tgt, weights, lot)
+                    else:
+                        cur_list = [
+                            int(per_strat_shares[it.strategy_key].get(sym, {}).get("current_shares", 0))
+                            for it in normalized_intents
+                        ]
+                        cur_sum = sum(cur_list)
+                        if cur_sum == master_tgt:
+                            allocs = cur_list
+                        elif cur_sum > 0:
+                            allocs = allocate_integer_lots(master_tgt, [c / cur_sum for c in cur_list], lot)
+                        else:
+                            allocs = allocate_integer_lots(master_tgt, [it.capital_weight for it in normalized_intents], lot)
+                    reconciled_by_sym[sym] = {
+                        it.strategy_key: allocs[idx]
+                        for idx, it in enumerate(normalized_intents)
+                    }
+
         ledgers = {}
         for it in normalized_intents:
             s_key = it.strategy_key
@@ -743,10 +824,15 @@ class OrderNettingEngine:
             sub_holdings: Dict[str, int] = {}
             sub_equity_val = 0.0
             for sym, o in strat_orders.items():
-                sh = int(o["target_shares"])
+                if sym in reconciled_by_sym:
+                    sh = int(reconciled_by_sym[sym].get(s_key, 0))
+                else:
+                    sh = int(o["target_shares"])
                 if sh > 0:
                     sub_holdings[sym] = sh
-                    sub_equity_val += sh * float(latest_prices.get(sym, 1.0))
+                    market = self.classify_market(sym)
+                    fx_rate = float(fx_map.get(get_market_currency(market), 1.0))
+                    sub_equity_val += sh * float(latest_prices.get(sym, 1.0)) * fx_rate
 
             sub_nav = it.allocated_capital
             sub_cash = max(0.0, sub_nav - sub_equity_val)

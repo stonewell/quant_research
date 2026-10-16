@@ -199,11 +199,99 @@ def _fill_out_columns(daily: pd.DataFrame, symbols: list) -> pd.DataFrame:
     return daily[symbols]
 
 
+def _step_asset_inertia(
+    t: int,
+    ideal_w: pd.Series,
+    current_w: pd.Series,
+    risky_symbols: list,
+    symbols: list,
+    thresh_t: pd.Series,
+    holding_age: Dict[str, int],
+    last_buy_bar: Dict[str, int],
+    cash_proxy: Optional[str] = "CASH",
+    em_row: Optional[Union[bool, pd.Series]] = None,
+    asymmetric_sells: bool = False,
+    entry_threshold: Optional[float] = None,
+    min_holding_bars: int = 0,
+) -> pd.Series:
+    """Single-bar asset-level inertia filter step updating `holding_age` and `last_buy_bar` in place."""
+    if em_row is not None:
+        if isinstance(em_row, pd.Series):
+            symbol_emergency = {s: bool(em_row.get(s, False)) for s in risky_symbols}
+            is_global_emergency = all(symbol_emergency.values()) if symbol_emergency else False
+        else:
+            is_global_emergency = bool(em_row)
+            symbol_emergency = {s: is_global_emergency for s in risky_symbols}
+    else:
+        is_global_emergency = False
+        symbol_emergency = {s: False for s in risky_symbols}
+
+    for s in risky_symbols:
+        if current_w[s] > 1e-4:
+            holding_age[s] += 1
+        else:
+            holding_age[s] = 0
+
+    if is_global_emergency:
+        return ideal_w.copy()
+
+    sell_thresh = (thresh_t * 0.60) if asymmetric_sells else thresh_t
+    buy_thresh = thresh_t.copy()
+    if entry_threshold is not None:
+        new_entry_mask = (current_w[risky_symbols] <= 1e-4)
+        buy_thresh[new_entry_mask] = np.minimum(thresh_t[new_entry_mask], entry_threshold)
+
+    diff = ideal_w[risky_symbols] - current_w[risky_symbols]
+    sells_raw = diff[diff <= -sell_thresh].index.tolist()
+
+    # Suppress sells if asset holding tenure or time since last buy is below min_holding_bars (unless emergency)
+    sells = []
+    for s in sells_raw:
+        if symbol_emergency.get(s, False):
+            sells.append(s)
+        elif min_holding_bars > 0 and (holding_age[s] < min_holding_bars or (t - last_buy_bar[s]) < min_holding_bars):
+            pass
+        else:
+            sells.append(s)
+
+    buys = diff[diff >= buy_thresh].index.tolist()
+
+    if not sells and not buys:
+        return current_w.copy()
+
+    new_w = current_w.copy()
+    # 1. Execute sells first to release cash capacity
+    for s in sells:
+        new_w[s] = ideal_w[s]
+        if new_w[s] <= 1e-4:
+            last_buy_bar[s] = -999
+
+    # 2. Execute buys up to incremental available capacity without diluting untouched or held assets
+    avail_inc = max(0.0, 1.0 - float(new_w[risky_symbols].sum()))
+
+    buys_sorted = sorted(buys, key=lambda b: (-diff[b], b))
+    for b in buys_sorted:
+        desired_inc = max(0.0, float(ideal_w[b] - current_w[b]))
+        actual_inc = min(desired_inc, avail_inc)
+
+        if actual_inc >= buy_thresh[b]:
+            new_w[b] = current_w[b] + actual_inc
+            last_buy_bar[b] = t
+            avail_inc = max(0.0, avail_inc - actual_inc)
+        else:
+            new_w[b] = current_w[b]
+
+    if cash_proxy in symbols:
+        new_w[cash_proxy] = max(0.0, 1.0 - float(new_w[risky_symbols].sum()))
+
+    return new_w
+
+
 def apply_asset_inertia(
     daily: pd.DataFrame,
-    min_weight_change: Union[float, Dict[str, float], pd.Series] = 0.02,
+    min_weight_change: Union[float, Dict[str, float], pd.Series, pd.DataFrame] = 0.02,
     cash_proxy: Optional[str] = "CASH",
-    emergency_mask: Optional[pd.Series] = None,
+    emergency_mask: Optional[Union[pd.Series, pd.DataFrame]] = None,
     asymmetric_sells: bool = False,
     entry_threshold: Optional[float] = None,
     min_holding_bars: int = 0,
@@ -212,16 +300,17 @@ def apply_asset_inertia(
 
     For each asset, if the change in ideal target weight versus the currently held
     target weight is below `min_weight_change`, the asset's target weight is frozen
-    at its previous held value. Supports uniform float, per-asset dict, or pd.Series
-    thresholds, tighter asymmetric sell bands (60% threshold on trimming), an optional
-    `entry_threshold` allowing new position initiations to enter without being blocked
-    by volatility-scaled rebalancing inertia, and an optional `min_holding_bars` to
-    suppress premature sell/trim flips before a minimum holding tenure has elapsed.
+    at its previous held value. Supports uniform float, per-asset dict, pd.Series,
+    or date-indexed pd.DataFrame thresholds, tighter asymmetric sell bands (60%
+    threshold on trimming), an optional `entry_threshold` allowing new position
+    initiations to enter without being blocked by volatility-scaled rebalancing
+    inertia, and an optional `min_holding_bars` to suppress premature sell/trim
+    flips before a minimum holding tenure has elapsed.
 
     When significant changes occur (|diff| >= min_weight_change):
     1. Sells execute first to release cash capacity (subject to `min_holding_bars` unless emergency).
-    2. Buys execute in order of priority up to available cash capacity without
-       diluting or modifying untouched assets.
+    2. Buys execute in order of priority up to available incremental cash capacity without
+       diluting or modifying untouched assets or exceeding 100% total risky weight.
     3. Residual unallocated cash is routed to `cash_proxy` (if present).
     4. Emergency dates (indicated by `emergency_mask`) bypass inertia and holding constraints
        to allow immediate liquidation or de-risking without threshold delay.
@@ -233,6 +322,7 @@ def apply_asset_inertia(
     risky_symbols = [s for s in symbols if s != cash_proxy]
     n_dates = len(daily)
 
+    is_df_thresh = isinstance(min_weight_change, pd.DataFrame)
     if isinstance(min_weight_change, (int, float)):
         if min_weight_change <= 0.0 and min_holding_bars <= 0:
             return daily
@@ -241,10 +331,10 @@ def apply_asset_inertia(
         thresh = pd.Series(min_weight_change).reindex(risky_symbols).fillna(0.02)
     elif isinstance(min_weight_change, pd.Series):
         thresh = min_weight_change.reindex(risky_symbols).fillna(0.02)
+    elif is_df_thresh:
+        thresh = None
     else:
         thresh = pd.Series(0.02, index=risky_symbols)
-
-    sell_thresh = (thresh * 0.60) if asymmetric_sells else thresh
 
     filtered = daily.copy()
     current_w = daily.iloc[0].copy()
@@ -255,80 +345,28 @@ def apply_asset_inertia(
 
     for t in range(1, n_dates):
         ideal_w = daily.iloc[t]
-        if emergency_mask is not None:
-            em_row = emergency_mask.iloc[t]
-            if isinstance(em_row, pd.Series):
-                symbol_emergency = {s: bool(em_row.get(s, False)) for s in risky_symbols}
-                is_global_emergency = all(symbol_emergency.values()) if symbol_emergency else False
-            else:
-                is_global_emergency = bool(em_row)
-                symbol_emergency = {s: is_global_emergency for s in risky_symbols}
+        em_row = emergency_mask.iloc[t] if emergency_mask is not None else None
+        if is_df_thresh:
+            thresh_t = min_weight_change.iloc[t].reindex(risky_symbols).fillna(0.02)
         else:
-            is_global_emergency = False
-            symbol_emergency = {s: False for s in risky_symbols}
+            thresh_t = thresh
 
-        for s in risky_symbols:
-            if current_w[s] > 1e-4:
-                holding_age[s] += 1
-            else:
-                holding_age[s] = 0
-
-        if is_global_emergency:
-            current_w = ideal_w.copy()
-            filtered.iloc[t] = current_w
-            continue
-
-        buy_thresh = thresh.copy()
-        if entry_threshold is not None:
-            new_entry_mask = (current_w[risky_symbols] <= 1e-4)
-            buy_thresh[new_entry_mask] = np.minimum(thresh[new_entry_mask], entry_threshold)
-
-        diff = ideal_w[risky_symbols] - current_w[risky_symbols]
-        sells_raw = diff[diff <= -sell_thresh].index.tolist()
-
-        # Suppress sells if asset holding tenure or time since last buy is below min_holding_bars (unless emergency)
-        sells = []
-        for s in sells_raw:
-            if symbol_emergency.get(s, False):
-                sells.append(s)
-            elif min_holding_bars > 0 and (holding_age[s] < min_holding_bars or (t - last_buy_bar[s]) < min_holding_bars):
-                pass
-            else:
-                sells.append(s)
-
-        buys = diff[diff >= buy_thresh].index.tolist()
-
-        if not sells and not buys:
-            filtered.iloc[t] = current_w
-        else:
-            new_w = current_w.copy()
-            # 1. Execute sells first to release cash capacity
-            for s in sells:
-                new_w[s] = ideal_w[s]
-                if new_w[s] <= 1e-4:
-                    last_buy_bar[s] = -999
-
-            # 2. Execute buys up to available capacity without diluting untouched assets
-            non_buy_risky = [s for s in risky_symbols if s not in buys]
-            avail_cap = max(0.0, 1.0 - float(new_w[non_buy_risky].sum()))
-
-            buys_sorted = sorted(buys, key=lambda b: (-diff[b], b))
-            for b in buys_sorted:
-                ideal_b = ideal_w[b]
-                buy_target = min(ideal_b, avail_cap)
-
-                if buy_target - current_w[b] >= buy_thresh[b]:
-                    new_w[b] = buy_target
-                    last_buy_bar[b] = t
-                    avail_cap = max(0.0, avail_cap - buy_target)
-                else:
-                    new_w[b] = current_w[b]
-
-            if cash_proxy in symbols:
-                new_w[cash_proxy] = max(0.0, 1.0 - float(new_w[risky_symbols].sum()))
-
-            current_w = new_w.copy()
-            filtered.iloc[t] = current_w
+        current_w = _step_asset_inertia(
+            t=t,
+            ideal_w=ideal_w,
+            current_w=current_w,
+            risky_symbols=risky_symbols,
+            symbols=symbols,
+            thresh_t=thresh_t,
+            holding_age=holding_age,
+            last_buy_bar=last_buy_bar,
+            cash_proxy=cash_proxy,
+            em_row=em_row,
+            asymmetric_sells=asymmetric_sells,
+            entry_threshold=entry_threshold,
+            min_holding_bars=min_holding_bars,
+        )
+        filtered.iloc[t] = current_w
 
     return filtered
 

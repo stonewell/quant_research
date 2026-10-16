@@ -32,6 +32,7 @@ from common.allocation_templates import (
     apply_asset_inertia,
     _fill_out_columns,
     _sparse_from_daily,
+    _step_asset_inertia,
 )
 from common.indicators import atr, sma
 from pipeline.research_strategy.rs.config import StrategyConfig
@@ -614,6 +615,20 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         entry_signal_bars = {s: 0 for s in risky_symbols}
         expansion_signal_bars = {s: 0 for s in risky_symbols}
 
+        use_inertia = (min_weight_change > 0.0 or min_holding_bars > 0)
+        inertia_thresh_df = None
+        static_inertia_thresh = pd.Series(float(min_weight_change), index=risky_symbols)
+        if use_inertia and adaptive_inertia and risky_symbols:
+            clip_min = max(0.02, 0.5 * min_weight_change)
+            clip_max = max(clip_min, min(0.08, 2.0 * min_weight_change))
+            expanding_asset_vol = asset_vol_21d[risky_symbols].expanding(min_periods=1).mean().fillna(target_vol)
+            expanding_mkt_vol = expanding_asset_vol.mean(axis=1).clip(lower=0.01)
+            inertia_thresh_df = (
+                expanding_asset_vol.div(expanding_mkt_vol, axis=0) * min_weight_change
+            ).clip(lower=clip_min, upper=clip_max)
+        holding_age = {s: 0 for s in risky_symbols}
+        last_buy_bar = {s: -999 for s in risky_symbols}
+
         for t in range(len(master_index)):
             date = master_index[t]
 
@@ -1018,38 +1033,34 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             elif cash_proxy in symbols:
                 raw_w[cash_proxy] = max(0.0, 1.0 - tot_risky)
 
-            daily_weights.loc[date] = raw_w
-
-        # Step 4: Asset-level inertia filtering
-        emergency_mask = asset_emergency_df
-        if min_weight_change > 0.0 or min_holding_bars > 0:
-            if adaptive_inertia:
-                mean_mkt_vol = float(asset_vol_21d.mean().mean())
-                inertia_map = {}
-                clip_min = max(0.02, 0.5 * min_weight_change)
-                clip_max = max(clip_min, min(0.08, 2.0 * min_weight_change))
-                for s in risky_symbols:
-                    s_vol = float(asset_vol_21d[s].mean()) if pd.notna(asset_vol_21d[s].mean()) else target_vol
-                    inertia_map[s] = float(np.clip(min_weight_change * (s_vol / max(0.01, mean_mkt_vol)), clip_min, clip_max))
-                daily_weights = apply_asset_inertia(
-                    daily_weights,
-                    min_weight_change=inertia_map,
-                    cash_proxy=cash_proxy,
-                    emergency_mask=emergency_mask,
-                    asymmetric_sells=asymmetric_sells,
-                    entry_threshold=entry_thresh,
-                    min_holding_bars=min_holding_bars,
-                )
+            # Inline causal asset-level inertia filtering so daily_weights[date]
+            # reflects actual post-inertia positions for subsequent NAV/stop/tenure tracking
+            if use_inertia:
+                if t == 0:
+                    current_w = raw_w.copy()
+                    for s in risky_symbols:
+                        last_buy_bar[s] = 0 if current_w[s] > 1e-4 else -999
+                else:
+                    prev_w_series = daily_weights.iloc[t - 1]
+                    thresh_t = inertia_thresh_df.iloc[t] if inertia_thresh_df is not None else static_inertia_thresh
+                    current_w = _step_asset_inertia(
+                        t=t,
+                        ideal_w=raw_w,
+                        current_w=prev_w_series,
+                        risky_symbols=risky_symbols,
+                        symbols=symbols,
+                        thresh_t=thresh_t,
+                        holding_age=holding_age,
+                        last_buy_bar=last_buy_bar,
+                        cash_proxy=cash_proxy,
+                        em_row=asset_emergency_df.iloc[t],
+                        asymmetric_sells=asymmetric_sells,
+                        entry_threshold=entry_thresh,
+                        min_holding_bars=min_holding_bars,
+                    )
+                daily_weights.loc[date] = current_w
             else:
-                daily_weights = apply_asset_inertia(
-                    daily_weights,
-                    min_weight_change=min_weight_change,
-                    cash_proxy=cash_proxy,
-                    emergency_mask=emergency_mask,
-                    asymmetric_sells=asymmetric_sells,
-                    entry_threshold=entry_thresh,
-                    min_holding_bars=min_holding_bars,
-                )
+                daily_weights.loc[date] = raw_w
 
         daily_weights = _fill_out_columns(daily_weights, symbols)
         return _sparse_from_daily(daily_weights)

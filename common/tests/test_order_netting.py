@@ -533,3 +533,89 @@ def test_initial_launch_integer_lot_preservation():
                 assert contrib["target_shares"] % 500 == 0, f"Odd lot in target shares: {contrib['target_shares']}"
 
 
+def test_cash_inference_when_cash_proxy_omitted_or_zero():
+    """Regression test: when current_holdings omits BIL (or passes BIL=0) while
+    portfolio_value exceeds equity value, unallocated cash is inferred so buys are not zeroed out."""
+    engine = OrderNettingEngine(lot_size_default=100)
+    intents = [
+        SubStrategyIntent(
+            strategy_key="strat_a",
+            strategy_name="Strat A",
+            capital_weight=1.0,
+            allocated_capital=100000.0,
+            target_weights={"601872.SH": 0.10, "600028.SH": 0.20},
+        ),
+    ]
+    # Hold 1000 shares of 601872.SH (worth 10,000 RMB) out of 100,000 NAV, no BIL key passed
+    res = engine.net_portfolio_orders(
+        intents=intents,
+        current_holdings={"601872.SH": 1000},
+        portfolio_value=100000.0,
+        latest_prices={"601872.SH": 10.0, "600028.SH": 5.0},
+    )
+    buy_row = [r for r in res.net_orders if r["symbol"] == "600028.SH"][0]
+    assert buy_row["action"] == "BUY"
+    assert buy_row["delta_shares"] == 4000
+    assert buy_row["target_shares"] == 4000
+
+
+def test_virtual_sub_ledger_reconciliation_on_tenure_lock_and_cash_scaling():
+    """Regression test: virtual sub-ledgers reconcile against actual master post-trade shares
+    when a sell is blocked by tenure lock (HOLD_FILTERED) or buys are scaled by cash."""
+    engine = OrderNettingEngine(lot_size_default=100)
+    intents = [
+        SubStrategyIntent(
+            strategy_key="strat_exit",
+            strategy_name="Exit Strat",
+            capital_weight=1.0,
+            allocated_capital=100000.0,
+            target_weights={"601872.SH": 0.0},
+        )
+    ]
+    res = engine.net_portfolio_orders(
+        intents=intents,
+        current_holdings={"601872.SH": 1000, "BIL": 90000.0},
+        portfolio_value=100000.0,
+        latest_prices={"601872.SH": 10.0},
+        holding_bars={"601872.SH": 1},
+        min_holding_bars=2,
+        prior_sub_ledgers={"strat_exit": {"holdings": {"601872.SH": 1000}}},
+    )
+    # Master blocked the liquidation via HOLD_FILTERED -> still holds 1,000 shares
+    # Virtual sub-ledger must also retain 1,000 shares (not drift to 0)
+    assert res.sub_ledgers["strat_exit"]["holdings"].get("601872.SH") == 1000
+
+
+def test_fx_rates_conversion_in_multi_currency_portfolio():
+    """Verify fx_rates converts HKD and USD turnovers and friction savings into RMB."""
+    engine = OrderNettingEngine(fx_rates={"CNY": 1.0, "HKD": 0.90, "USD": 7.0})
+    intents = [
+        SubStrategyIntent(
+            strategy_key="s1",
+            strategy_name="S1",
+            capital_weight=0.5,
+            allocated_capital=100000.0,
+            target_weights={"AAPL": 0.35},
+            current_weights={"AAPL": 0.0},
+        ),
+        SubStrategyIntent(
+            strategy_key="s2",
+            strategy_name="S2",
+            capital_weight=0.5,
+            allocated_capital=100000.0,
+            target_weights={"AAPL": 0.0},
+            current_weights={"AAPL": 0.35},
+        ),
+    ]
+    res = engine.net_portfolio_orders(
+        intents=intents,
+        current_holdings={"AAPL": 100, "BIL": 130000.0},
+        portfolio_value=200000.0,
+        latest_prices={"AAPL": 100.0},
+        prior_sub_ledgers={
+            "s1": {"holdings": {"AAPL": 0}},
+            "s2": {"holdings": {"AAPL": 100}},
+        },
+    )
+    # 100 shares of AAPL @ $100 crossed -> $20,000 crossed USD turnover -> 140,000 RMB
+    assert res.friction_savings.saved_turnover > 0
