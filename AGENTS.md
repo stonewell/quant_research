@@ -136,6 +136,19 @@ available in the current shell.
     snapshot archiving (`data/runs/<date>/`), and custom universe editing. Regional core-satellite
     pools reside in `docs/universe/` (China A-Shares, US equities, Hong Kong stocks).
 
+## Subagent & model routing policy
+
+This section serves as an explicit standing user instruction for `invoke_subagent` `Model` selection and primary-agent role separation (overriding the default `inherit` fallback):
+
+- **Heavy reasoning models (Claude & Gemini Pro) -- thinking, planning & review only (no direct workspace file edits):**
+  - When the primary agent is running on a **Claude** model or **Gemini Pro** (heavy) model, it must **only** perform high-level thinking work: planning, architectural design, code/plan review, quantitative auditing, debugging diagnosis, and subagent orchestration (creating plan/review artifacts in the brain artifact directory is permitted).
+  - **All real workspace file editing (`replace_file_content`, `write_to_file` on repo files) must be delegated to a subagent** (`TypeName="self"`) using a light model (`Model="flash"` or `Model="flash_lite"`), passing the exact specification or diff to apply.
+- **Delegate lightweight tasks to subagents:** Offload self-contained, routine, or context-heavy lightweight work to a subagent (`TypeName="research"` for read-only codebase exploration, file reading, and web/doc lookups; `TypeName="self"` when file edits or test/command runs are required) to keep the primary context window lean.
+- **Model tier routing (`Model` parameter in `invoke_subagent`):**
+  - **`Model="flash"` (Lightweight tasks & file editing -- default for delegation):** Use for executing planned file edits, applying code changes from a specification, running tests, codebase searches, reading/summarizing files or logs, checking schemas/configs, and doc lookups.
+  - **`Model="flash_lite"` (Trivial one-step tasks):** Use for ultra-simple single-step lookups, trivial one-line/boilerplate edits, formatting, or quick status checks.
+  - **`Model="inherit"` / `Model="pro"` (Complex reasoning only):** Reserve strictly for subagents that must independently perform deep quantitative reasoning, multi-step architectural planning, or forensic walkforward auditing.
+
 ## Documentation & coding style conventions
 
 This codebase is unusually disclosure-heavy -- match it, don't strip it out:

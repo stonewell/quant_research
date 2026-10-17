@@ -71,6 +71,21 @@ uv run python run_pipeline.py --data-provider synthetic --universe SPY QQQ ...
 
 ---
 
+## 子代理与模型路由策略 -- 调用 Subagent 与修改文件前必读
+
+本章节作为用户的显式常驻指令，用于指导 `invoke_subagent` 的 `Model` 参数选择及主代理职责划分（覆盖默认的 `inherit` 策略）：
+
+- **重型推理模型（Claude 与 Gemini Pro）—— 仅负责思考、规划与审查（禁止直接编辑工作区文件）：**
+  - 当主代理运行在 **Claude** 模型或 **Gemini Pro**（重型）模型上时，**仅**执行高阶思考工作：方案规划 (Plan)、架构设计、代码/文档审查 (Review)、量化归因审计、问题诊断及子代理编排（允许在 brain 制品目录中创建计划或审查 Artifact）。
+  - **所有实际的工作区文件修改（对仓库文件调用 `replace_file_content`、`write_to_file`）必须委派给子代理**（`TypeName="self"`），并指定合适的轻量模型（`Model="flash"` 或 `Model="flash_lite"`），将明确的修改规范或 Diff 交由子代理执行。
+- **轻量级任务委派给子代理 (Subagent)：** 将独立、常规或容易占用大量上下文的轻量级任务委派给子代理（只读代码探索、文件阅读、文档/网页检索使用 `TypeName="research"`；需要文件修改或运行命令/测试时使用 `TypeName="self"`），以保持主对话上下文精简高效。
+- **模型层级路由 (`invoke_subagent` 中的 `Model` 参数)：**
+  - **`Model="flash"`（轻量级任务与文件编辑 —— 委派默认选项）：** 适用于执行已规划的文件修改、按规范编写代码、运行测试、代码库搜索、文件/日志阅读与摘要、Schema/配置检查及文档查询。
+  - **`Model="flash_lite"`（极简单步任务）：** 适用于极度简单的单步查询、单行/样板微调、格式整理或快速状态检查。
+  - **`Model="inherit"` / `Model="pro"`（仅限复杂推理）：** 严格保留给需要独立进行深度量化推理、多步架构规划或 Walkforward 归因审计的子代理任务。
+
+---
+
 ## 文档与代码风格规范
 
 本代码库非常注重披露与文档注释--请保持一致，不要删减：
