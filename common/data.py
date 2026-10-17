@@ -18,7 +18,7 @@ import pandas as pd
 import yfinance as yf
 
 from .universe import _parse_module_specifier
-from .duckdb_cache import DuckDBCache, is_synthetic_provider
+from .duckdb_cache import DuckDBCache, is_synthetic_provider, is_intraday_interval
 
 
 # Real ticker symbols (equities, ETFs, indices, FX pairs) are drawn from a
@@ -210,6 +210,37 @@ class CSVFolderDataProvider(BaseDataProvider):
         return df
 
 
+def _generate_bridge_segment(
+    t_a: int,
+    t_b: int,
+    p_a: float,
+    p_b: float,
+    low_d: float,
+    high_d: float,
+    intra_rng: np.random.Generator,
+) -> np.ndarray:
+    """Generates a pinned 1D Brownian bridge on discrete steps [t_a, t_b] connecting p_a to p_b."""
+    n = t_b - t_a
+    if n <= 0:
+        return np.array([p_a])
+    if n == 1:
+        return np.array([p_a, p_b])
+
+    t = np.arange(n + 1)
+    dt = 1.0 / n
+    dW = intra_rng.normal(0.0, np.sqrt(dt), size=n)
+    W = np.concatenate([[0.0], np.cumsum(dW)])
+    B = W - (t / n) * W[-1]
+
+    span = high_d - low_d
+    sigma = span * 0.15
+    X = p_a + (t / n) * (p_b - p_a) + B * sigma
+    X = np.clip(X, low_d, high_d)
+    X[0] = p_a
+    X[-1] = p_b
+    return X
+
+
 class SyntheticDataProvider(BaseDataProvider):
     """Data provider generating synthetic geometric Brownian motion OHLCV data."""
 
@@ -219,33 +250,165 @@ class SyntheticDataProvider(BaseDataProvider):
         self.vol = vol
 
     def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+        if not is_intraday_interval(interval):
+            start_dt = pd.to_datetime(start) if start else pd.to_datetime("2020-01-01")
+            end_dt = pd.to_datetime(end) if end else start_dt + pd.Timedelta(days=1200)
+
+            dates = pd.bdate_range(start_dt, end_dt)
+            n_days = len(dates)
+            if n_days <= 0:
+                n_days = 252
+                dates = pd.bdate_range("2020-01-01", periods=n_days)
+
+            # Python's builtin hash() is randomized per-process for strings
+            # (PYTHONHASHSEED), so it must NOT be used here -- it would silently
+            # make `seed` non-reproducible across runs (the same seed producing
+            # different data every process invocation). A stable digest gives
+            # the same per-symbol offset regardless of process/interpreter.
+            symbol_seed = self.seed + (int(hashlib.md5(symbol.encode("utf-8")).hexdigest(), 16) % 10000)
+            rng = np.random.default_rng(symbol_seed)
+
+            rets = rng.normal(self.drift, self.vol, n_days)
+            closes = 100.0 * np.exp(np.cumsum(rets))
+
+            df = pd.DataFrame(index=dates)
+            df["Close"] = closes
+            df["Open"] = closes * (1.0 + rng.normal(0, 0.002, n_days))
+            df["High"] = np.maximum(df["Open"], df["Close"]) * (1.0 + np.abs(rng.normal(0, 0.004, n_days)))
+            df["Low"] = np.minimum(df["Open"], df["Close"]) * (1.0 - np.abs(rng.normal(0, 0.004, n_days)))
+            df["Volume"] = (rng.uniform(1e5, 1e7, n_days)).astype(float)
+            return df[["Open", "High", "Low", "Close", "Volume"]]
+
+        # Intraday generation via Piecewise Pinned Brownian Bridge
         start_dt = pd.to_datetime(start) if start else pd.to_datetime("2020-01-01")
         end_dt = pd.to_datetime(end) if end else start_dt + pd.Timedelta(days=1200)
 
-        dates = pd.bdate_range(start_dt, end_dt)
-        n_days = len(dates)
-        if n_days <= 0:
-            n_days = 252
-            dates = pd.bdate_range("2020-01-01", periods=n_days)
+        # Generate base daily data using the exact same daily logic
+        daily_start_str = start_dt.strftime("%Y-%m-%d")
+        daily_end_str = end_dt.strftime("%Y-%m-%d")
+        daily_df = self.fetch_ohlcv(symbol, start=daily_start_str, end=daily_end_str, interval="1d")
 
-        # Python's builtin hash() is randomized per-process for strings
-        # (PYTHONHASHSEED), so it must NOT be used here -- it would silently
-        # make `seed` non-reproducible across runs (the same seed producing
-        # different data every process invocation). A stable digest gives
-        # the same per-symbol offset regardless of process/interpreter.
         symbol_seed = self.seed + (int(hashlib.md5(symbol.encode("utf-8")).hexdigest(), 16) % 10000)
-        rng = np.random.default_rng(symbol_seed)
+        intra_rng = np.random.default_rng(symbol_seed + 1_000_000)
 
-        rets = rng.normal(self.drift, self.vol, n_days)
-        closes = 100.0 * np.exp(np.cumsum(rets))
+        intraday_days: List[pd.DataFrame] = []
 
-        df = pd.DataFrame(index=dates)
-        df["Close"] = closes
-        df["Open"] = closes * (1.0 + rng.normal(0, 0.002, n_days))
-        df["High"] = np.maximum(df["Open"], df["Close"]) * (1.0 + np.abs(rng.normal(0, 0.004, n_days)))
-        df["Low"] = np.minimum(df["Open"], df["Close"]) * (1.0 - np.abs(rng.normal(0, 0.004, n_days)))
-        df["Volume"] = (rng.uniform(1e5, 1e7, n_days)).astype(float)
-        return df[["Open", "High", "Low", "Close", "Volume"]]
+        for date_idx, daily_row in daily_df.iterrows():
+            d = date_idx.date()
+            date_str = d.strftime("%Y-%m-%d")
+
+            # 48 A-share 5m timestamps: 24 morning + 24 afternoon
+            m_times = pd.date_range(f"{date_str} 09:35:00", f"{date_str} 11:30:00", freq="5min")
+            a_times = pd.date_range(f"{date_str} 13:05:00", f"{date_str} 15:00:00", freq="5min")
+            day_times = m_times.append(a_times)
+
+            O_d = float(daily_row["Open"])
+            H_d = float(daily_row["High"])
+            L_d = float(daily_row["Low"])
+            C_d = float(daily_row["Close"])
+            V_d = float(daily_row["Volume"])
+
+            # R2 Piecewise Pinned Brownian Bridge
+            j_H, j_L = intra_rng.choice(np.arange(1, 47), size=2, replace=False)
+
+            if j_H < j_L:
+                j_1, P_1 = int(j_H), H_d
+                j_2, P_2 = int(j_L), L_d
+            else:
+                j_1, P_1 = int(j_L), L_d
+                j_2, P_2 = int(j_H), H_d
+
+            # Allocate 48 close prices
+            C = np.zeros(48, dtype=float)
+            seg1 = _generate_bridge_segment(0, j_1, O_d, P_1, L_d, H_d, intra_rng)
+            C[0 : j_1 + 1] = seg1
+            seg2 = _generate_bridge_segment(j_1, j_2, P_1, P_2, L_d, H_d, intra_rng)
+            C[j_1 : j_2 + 1] = seg2
+            seg3 = _generate_bridge_segment(j_2, 47, P_2, C_d, L_d, H_d, intra_rng)
+            C[j_2 : 48] = seg3
+
+            C = np.clip(C, L_d, H_d)
+            C[0] = O_d
+            C[47] = C_d
+
+            # Bar opens
+            O = np.empty(48, dtype=float)
+            O[0] = O_d
+            O[1:] = C[:-1]
+
+            # Bar highs and lows
+            upper = np.maximum(O, C)
+            lower = np.minimum(O, C)
+            span = H_d - L_d
+            if span > 1e-8:
+                h_noise = np.abs(intra_rng.normal(0.0, span * 0.05, size=48))
+                l_noise = np.abs(intra_rng.normal(0.0, span * 0.05, size=48))
+                H = np.clip(upper + h_noise, upper, H_d)
+                L = np.clip(lower - l_noise, L_d, lower)
+            else:
+                H = upper.copy()
+                L = lower.copy()
+
+            # Explicitly pin extrema
+            H[j_H] = H_d
+            L[j_L] = L_d
+
+            # U-shaped intraday volume profile
+            j_idx = np.arange(48)
+            u = 1.0 + 1.8 * (((j_idx - 23.5) / 23.5) ** 2)
+            noise_v = intra_rng.normal(0.0, 0.15, size=48)
+            u_tilde = u * np.exp(noise_v)
+            weights = u_tilde / np.sum(u_tilde)
+            V = V_d * weights
+            # Exact sum conservation to machine precision
+            V[-1] += V_d - V.sum()
+
+            day_df = pd.DataFrame(
+                {
+                    "Open": O,
+                    "High": H,
+                    "Low": L,
+                    "Close": C,
+                    "Volume": V,
+                },
+                index=day_times,
+            )
+            intraday_days.append(day_df)
+
+        if not intraday_days:
+            return pd.DataFrame(columns=_REQUIRED_OHLCV_COLUMNS)
+
+        full_intra_df = pd.concat(intraday_days, axis=0)
+        full_intra_df.index.name = "Date"
+
+        # Filter by requested start and end timestamps if needed
+        if start:
+            start_ts = pd.to_datetime(start)
+            full_intra_df = full_intra_df[full_intra_df.index >= start_ts]
+        if end:
+            end_str = str(end).strip()
+            if len(end_str) <= 10 or ":" not in end_str:
+                end_ts = pd.to_datetime(end).replace(hour=23, minute=59, second=59, microsecond=999999)
+            else:
+                end_ts = pd.to_datetime(end)
+            full_intra_df = full_intra_df[full_intra_df.index <= end_ts]
+
+        if interval == "5m" or interval == "1m":
+            return full_intra_df
+
+        rule_map = {
+            "15m": "15min",
+            "30m": "30min",
+            "60m": "60min",
+            "1h": "1h",
+        }
+        rule = rule_map.get(interval.lower(), None)
+        if rule:
+            agg_spec = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
+            resampled = full_intra_df.resample(rule, closed="right", label="right").agg(agg_spec).dropna(subset=["Open", "High", "Low", "Close"])
+            return resampled
+
+        return full_intra_df
 
 
 _REQUIRED_OHLCV_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
@@ -329,17 +492,20 @@ class CachedDataProvider(BaseDataProvider):
         provider_name = type(self.inner_provider).__name__
 
         # 1. Fast cache hit check: is [start, end] covered in DuckDB?
-        if self.duckdb_cache.is_range_covered(provider_name, symbol, start=start, end=end):
+        if self.duckdb_cache.is_range_covered(provider_name, symbol, start=start, end=end, interval=interval):
             df = self.duckdb_cache.query_bars(provider_name, symbol, start=start, end=end, interval=interval)
             if not df.empty:
                 return df
 
-        # 2. Re-query provider for missing range (fetch base daily bars)
-        try:
-            df = self.inner_provider.fetch_ohlcv(symbol, start, end, interval="1d")
-        except Exception:
-            # Fall back to user's requested interval if inner_provider only supports that interval
+        # 2. Re-query provider for missing range (fetch base daily bars or requested intraday bars)
+        if is_intraday_interval(interval):
             df = self.inner_provider.fetch_ohlcv(symbol, start, end, interval=interval)
+        else:
+            try:
+                df = self.inner_provider.fetch_ohlcv(symbol, start, end, interval="1d")
+            except Exception:
+                # Fall back to user's requested interval if inner_provider only supports that interval
+                df = self.inner_provider.fetch_ohlcv(symbol, start, end, interval=interval)
 
         if df.empty:
             raise ValueError(
@@ -352,13 +518,14 @@ class CachedDataProvider(BaseDataProvider):
                 f"Data for {symbol} between {start} and {end} had rows, but every one was dropped as invalid OHLC."
             )
 
-        # 3. Store into DuckDB cache (tracks earliest available date)
+        # 3. Store into DuckDB cache (tracks earliest available date/ts)
         self.duckdb_cache.store_bars(
             provider_name,
             symbol,
             df,
             requested_start=start,
             requested_end=end,
+            interval=interval,
         )
 
         # 4. Return queried and properly resampled bars for requested range and interval
@@ -374,7 +541,7 @@ class CachedDataProvider(BaseDataProvider):
         for symbol in symbols:
             try:
                 _validate_symbol_for_path(symbol)
-                if self.duckdb_cache.is_range_covered(provider_name, symbol, start=start, end=end):
+                if self.duckdb_cache.is_range_covered(provider_name, symbol, start=start, end=end, interval=interval):
                     covered_symbols.append(symbol)
                 else:
                     self.fetch_ohlcv(symbol, start, end, interval=interval)

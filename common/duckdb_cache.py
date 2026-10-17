@@ -70,6 +70,21 @@ def _get_resample_rule(interval: str) -> Optional[str]:
     return norm
 
 
+def _parse_intraday_end(end: Any) -> Optional[pd.Timestamp]:
+    """R13: If end is date-only (e.g. len <= 10 or no ':' in string), expand to 23:59:59.999999."""
+    if end is None:
+        return None
+    end_dt = pd.to_datetime(end)
+    end_str = str(end).strip()
+    if isinstance(end, datetime.date) and not isinstance(end, datetime.datetime):
+        end_dt = end_dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+    elif len(end_str) <= 10 or ":" not in end_str:
+        end_dt = end_dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+    elif end_dt.time() == datetime.time(0, 0, 0) and ("00:00" not in end_str):
+        end_dt = end_dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+    return end_dt
+
+
 def resample_ohlcv(df: pd.DataFrame, interval: str) -> pd.DataFrame:
     """Resamples a daily OHLCV DataFrame with DatetimeIndex to a target interval
     (e.g., '1wk', '1mo') using standard financial aggregation rules.
@@ -163,7 +178,7 @@ class DuckDBCache:
                 raise
 
     def _init_tables(self, con) -> None:
-        """Initializes ohlcv_bars and asset_sync_metadata tables."""
+        """Initializes ohlcv_bars, asset_sync_metadata, and intraday cache tables."""
         con.execute("""
             CREATE TABLE IF NOT EXISTS ohlcv_bars (
                 provider VARCHAR NOT NULL,
@@ -186,6 +201,33 @@ class DuckDBCache:
                 PRIMARY KEY (provider, symbol)
             );
             CREATE INDEX IF NOT EXISTS idx_ohlcv_lookup ON ohlcv_bars(provider, symbol, date);
+
+            CREATE TABLE IF NOT EXISTS intraday_ohlcv_bars (
+                provider VARCHAR NOT NULL,
+                symbol VARCHAR NOT NULL,
+                interval VARCHAR NOT NULL,
+                ts TIMESTAMP NOT NULL,
+                open DOUBLE NOT NULL,
+                high DOUBLE NOT NULL,
+                low DOUBLE NOT NULL,
+                close DOUBLE NOT NULL,
+                volume DOUBLE NOT NULL,
+                PRIMARY KEY (provider, symbol, interval, ts)
+            );
+
+            CREATE TABLE IF NOT EXISTS intraday_sync_metadata (
+                provider VARCHAR NOT NULL,
+                symbol VARCHAR NOT NULL,
+                interval VARCHAR NOT NULL,
+                earliest_available_ts TIMESTAMP NOT NULL,
+                is_earliest_known BOOLEAN NOT NULL DEFAULT FALSE,
+                latest_available_ts TIMESTAMP NOT NULL,
+                latest_close_ref DOUBLE,
+                last_sync_time TIMESTAMP NOT NULL,
+                PRIMARY KEY (provider, symbol, interval)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_intraday_lookup ON intraday_ohlcv_bars(provider, symbol, interval, ts);
         """)
 
     def get_asset_metadata(self, provider: str, symbol: str) -> Optional[dict]:
@@ -214,6 +256,117 @@ class DuckDBCache:
             "last_sync_time": row[3],
         }
 
+    def get_intraday_metadata(self, provider: str, symbol: str, interval: str = "5m") -> Optional[dict]:
+        """Returns synchronization metadata for (provider, symbol, interval), or None if not found."""
+        if is_synthetic_provider(provider):
+            return None
+
+        con = self._get_connection(read_only=True)
+        try:
+            row = con.execute(
+                "SELECT earliest_available_ts, is_earliest_known, latest_available_ts, latest_close_ref, last_sync_time "
+                "FROM intraday_sync_metadata WHERE provider = ? AND symbol = ? AND interval = ?",
+                [provider, symbol, interval],
+            ).fetchone()
+        finally:
+            if not self.is_memory:
+                con.close()
+
+        if not row:
+            return None
+
+        return {
+            "earliest_available_ts": pd.Timestamp(row[0]),
+            "is_earliest_known": bool(row[1]),
+            "latest_available_ts": pd.Timestamp(row[2]),
+            "latest_close_ref": float(row[3]) if row[3] is not None else None,
+            "last_sync_time": pd.Timestamp(row[4]) if row[4] is not None else None,
+        }
+
+    def is_intraday_range_covered(
+        self,
+        provider: str,
+        symbol: str,
+        interval: str = "5m",
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        now: Optional[pd.Timestamp] = None,
+    ) -> bool:
+        """Checks if the requested intraday date/time range [start, end] is fully covered by cached bars."""
+        if is_synthetic_provider(provider):
+            return False
+
+        meta = self.get_intraday_metadata(provider, symbol, interval)
+        if not meta:
+            return False
+
+        earliest_avail = meta["earliest_available_ts"]
+        is_earliest_known = meta["is_earliest_known"]
+        latest_avail = meta["latest_available_ts"]
+
+        # Start coverage check
+        if start:
+            req_start_ts = pd.to_datetime(start)
+            if req_start_ts >= earliest_avail - datetime.timedelta(days=7):
+                start_covered = True
+            else:
+                start_covered = is_earliest_known
+        else:
+            start_covered = is_earliest_known
+
+        # End coverage check
+        current_time = now if now is not None else pd.Timestamp.now()
+        current_date = current_time.date()
+
+        if end:
+            end_dt = _parse_intraday_end(end)
+            req_end_date = pd.to_datetime(end).date()
+        else:
+            end_dt = current_time
+            req_end_date = current_date
+
+        last_sync = meta.get("last_sync_time")
+        if isinstance(last_sync, (datetime.datetime, pd.Timestamp)):
+            last_sync_date = last_sync.date()
+        elif last_sync is not None:
+            last_sync_date = pd.to_datetime(last_sync).date()
+        else:
+            last_sync_date = None
+
+        latest_avail_date = latest_avail.date()
+
+        if req_end_date >= current_date:
+            if latest_avail >= current_time or latest_avail_date > current_date:
+                end_covered = True
+            elif (
+                last_sync_date is not None
+                and last_sync_date >= current_date
+                and (current_date - latest_avail_date) <= datetime.timedelta(days=7)
+            ):
+                end_covered = True
+            else:
+                end_covered = False
+        else:
+            if latest_avail >= end_dt or latest_avail_date >= req_end_date:
+                end_covered = True
+            else:
+                end_covered = (req_end_date - latest_avail_date) <= datetime.timedelta(days=7)
+
+        if not (start_covered and end_covered):
+            return False
+
+        con = self._get_connection(read_only=True)
+        try:
+            count = con.execute(
+                "SELECT count(*) FROM intraday_ohlcv_bars WHERE provider = ? AND symbol = ? AND interval = ?",
+                [provider, symbol, interval],
+            ).fetchone()[0]
+        finally:
+            if not self.is_memory:
+                con.close()
+
+        return count > 0
+
     def is_range_covered(
         self,
         provider: str,
@@ -221,10 +374,18 @@ class DuckDBCache:
         start: Optional[str] = None,
         end: Optional[str] = None,
         now: Optional[pd.Timestamp] = None,
+        interval: str = "1d",
     ) -> bool:
         """Checks if the requested date range [start, end] is fully covered by cached bars.
         Cached historical data never expires.
         """
+        if isinstance(now, str) and (is_intraday_interval(now) or now in ("1d", "daily")):
+            interval = now
+            now = None
+        if is_intraday_interval(interval):
+            return self.is_intraday_range_covered(
+                provider, symbol, interval=interval, start=start, end=end, now=now
+            )
         if is_synthetic_provider(provider):
             return False
 
@@ -296,6 +457,115 @@ class DuckDBCache:
 
         return count > 0
 
+    def store_intraday_bars(
+        self,
+        provider: str,
+        symbol: str,
+        df: pd.DataFrame,
+        interval: str = "5m",
+        requested_start: Optional[str] = None,
+        requested_end: Optional[str] = None,
+        sync_time: Optional[datetime.datetime] = None,
+    ) -> None:
+        """Upserts intraday OHLCV bars into intraday_ohlcv_bars and updates intraday_sync_metadata.
+        Enforces R4 QFQ Split/Dividend Drift detection and R13 End-Date expansion.
+        """
+        if is_synthetic_provider(provider) or df.empty:
+            return
+
+        for col in ["Open", "High", "Low", "Close"]:
+            if col not in df.columns:
+                raise ValueError(f"DataFrame missing required OHLCV column '{col}'")
+
+        df_to_store = pd.DataFrame(index=pd.to_datetime(df.index))
+        for col in ["Open", "High", "Low", "Close"]:
+            df_to_store[col] = df[col].astype(float)
+        df_to_store["Volume"] = df["Volume"].astype(float) if "Volume" in df.columns else 0.0
+        df_to_store = df_to_store.sort_index()
+
+        min_ts = df_to_store.index.min()
+        max_ts = df_to_store.index.max()
+
+        # R4 QFQ Split/Dividend Drift Check
+        meta = self.get_intraday_metadata(provider, symbol, interval)
+        if meta and meta.get("latest_close_ref") is not None and meta["latest_close_ref"] > 0:
+            cached_ts = pd.Timestamp(meta["latest_available_ts"])
+            if cached_ts in df_to_store.index:
+                val = df_to_store.loc[cached_ts, "Close"]
+                new_close = float(val.iloc[-1] if isinstance(val, (pd.Series, np.ndarray)) else val)
+                ref_close = float(meta["latest_close_ref"])
+                if abs(new_close - ref_close) / ref_close > 1e-4:
+                    # Drift detected: purge all existing bars & metadata for this asset/interval
+                    con = self._get_connection(read_only=False)
+                    try:
+                        con.execute(
+                            "DELETE FROM intraday_ohlcv_bars WHERE provider = ? AND symbol = ? AND interval = ?",
+                            [provider, symbol, interval],
+                        )
+                        con.execute(
+                            "DELETE FROM intraday_sync_metadata WHERE provider = ? AND symbol = ? AND interval = ?",
+                            [provider, symbol, interval],
+                        )
+                    finally:
+                        if not self.is_memory:
+                            con.close()
+                    meta = None
+
+        if meta:
+            earliest_avail = min(pd.Timestamp(meta["earliest_available_ts"]), pd.Timestamp(min_ts))
+            latest_avail = max(pd.Timestamp(meta["latest_available_ts"]), pd.Timestamp(max_ts))
+            is_earliest_known = meta["is_earliest_known"]
+        else:
+            earliest_avail = pd.Timestamp(min_ts)
+            latest_avail = pd.Timestamp(max_ts)
+            is_earliest_known = False
+
+        if requested_start:
+            req_start_ts = pd.to_datetime(requested_start)
+            if req_start_ts < min_ts - datetime.timedelta(days=7):
+                earliest_avail = pd.Timestamp(min_ts)
+                is_earliest_known = True
+
+        latest_close_ref = float(df_to_store["Close"].iloc[-1])
+        sync_ts = sync_time if sync_time is not None else datetime.datetime.now()
+
+        records_df = pd.DataFrame({
+            "provider": provider,
+            "symbol": symbol,
+            "interval": interval,
+            "ts": df_to_store.index,
+            "open": df_to_store["Open"].values,
+            "high": df_to_store["High"].values,
+            "low": df_to_store["Low"].values,
+            "close": df_to_store["Close"].values,
+            "volume": df_to_store["Volume"].values,
+        })
+
+        con = self._get_connection(read_only=False)
+        try:
+            con.register("temp_intraday_bars_to_insert", records_df)
+            con.execute("""
+                INSERT OR REPLACE INTO intraday_ohlcv_bars
+                SELECT provider, symbol, interval, ts, open, high, low, close, volume
+                FROM temp_intraday_bars_to_insert
+            """)
+            con.execute("""
+                INSERT OR REPLACE INTO intraday_sync_metadata
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, [
+                provider,
+                symbol,
+                interval,
+                earliest_avail.to_pydatetime(),
+                is_earliest_known,
+                latest_avail.to_pydatetime(),
+                latest_close_ref,
+                sync_ts,
+            ])
+        finally:
+            if not self.is_memory:
+                con.close()
+
     def store_bars(
         self,
         provider: str,
@@ -304,8 +574,20 @@ class DuckDBCache:
         requested_start: Optional[str] = None,
         requested_end: Optional[str] = None,
         sync_time: Optional[datetime.datetime] = None,
+        interval: str = "1d",
     ) -> None:
         """Upserts daily OHLCV bars into ohlcv_bars and updates asset_sync_metadata."""
+        if is_intraday_interval(interval):
+            return self.store_intraday_bars(
+                provider,
+                symbol,
+                df,
+                interval=interval,
+                requested_start=requested_start,
+                requested_end=requested_end,
+                sync_time=sync_time,
+            )
+
         if is_synthetic_provider(provider) or df.empty:
             return
 
@@ -369,6 +651,56 @@ class DuckDBCache:
             if not self.is_memory:
                 con.close()
 
+    def query_intraday_bars(
+        self,
+        provider: str,
+        symbol: str,
+        interval: str = "5m",
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """Retrieves intraday OHLCV bars for (provider, symbol, interval) across [start, end]."""
+        clauses = ["provider = ?", "symbol = ?", "interval = ?"]
+        params: List[Any] = [provider, symbol, interval]
+
+        if start:
+            clauses.append("ts >= ?")
+            params.append(pd.to_datetime(start).to_pydatetime())
+        if end:
+            end_dt = _parse_intraday_end(end)
+            clauses.append("ts <= ?")
+            params.append(end_dt.to_pydatetime())
+
+        sql = (
+            f"SELECT ts, open, high, low, close, volume FROM intraday_ohlcv_bars "
+            f"WHERE {' AND '.join(clauses)} ORDER BY ts"
+        )
+
+        con = self._get_connection(read_only=True)
+        try:
+            res_df = con.execute(sql, params).df()
+        finally:
+            if not self.is_memory:
+                con.close()
+
+        if res_df.empty:
+            return pd.DataFrame(columns=_REQUIRED_OHLCV_COLUMNS)
+
+        res_df["ts"] = pd.to_datetime(res_df["ts"])
+        res_df = res_df.set_index("ts").sort_index()
+        res_df.index.name = "Date"
+        res_df = res_df.rename(
+            columns={
+                "open": "Open",
+                "high": "High",
+                "low": "Low",
+                "close": "Close",
+                "volume": "Volume",
+            }
+        )[_REQUIRED_OHLCV_COLUMNS].astype(float)
+
+        return res_df
+
     def query_bars(
         self,
         provider: str,
@@ -378,6 +710,15 @@ class DuckDBCache:
         interval: str = "1d",
     ) -> pd.DataFrame:
         """Retrieves OHLCV bars for (provider, symbol) across [start, end], resampled to interval."""
+        if is_intraday_interval(interval):
+            return self.query_intraday_bars(
+                provider,
+                symbol,
+                interval=interval,
+                start=start,
+                end=end,
+            )
+
         clauses = ["provider = ?", "symbol = ?"]
         params: List[Any] = [provider, symbol]
 
@@ -417,6 +758,69 @@ class DuckDBCache:
 
         return resample_ohlcv(res_df, interval)
 
+    def query_intraday_universe(
+        self,
+        provider: str,
+        symbols: List[str],
+        interval: str = "5m",
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+    ) -> Dict[str, pd.DataFrame]:
+        """Batch-queries intraday OHLCV bars for multiple symbols in a single SQL query."""
+        if not symbols:
+            return {}
+
+        unique_symbols = list(dict.fromkeys(symbols))
+        placeholders = ",".join(["?"] * len(unique_symbols))
+        clauses = ["provider = ?", "interval = ?", f"symbol IN ({placeholders})"]
+        params: List[Any] = [provider, interval, *unique_symbols]
+
+        if start:
+            clauses.append("ts >= ?")
+            params.append(pd.to_datetime(start).to_pydatetime())
+        if end:
+            end_dt = _parse_intraday_end(end)
+            clauses.append("ts <= ?")
+            params.append(end_dt.to_pydatetime())
+
+        sql = (
+            f"SELECT symbol, ts, open, high, low, close, volume FROM intraday_ohlcv_bars "
+            f"WHERE {' AND '.join(clauses)} ORDER BY symbol, ts"
+        )
+
+        con = self._get_connection(read_only=True)
+        try:
+            full_df = con.execute(sql, params).df()
+        finally:
+            if not self.is_memory:
+                con.close()
+
+        result: Dict[str, pd.DataFrame] = {}
+        if full_df.empty:
+            return result
+
+        full_df["ts"] = pd.to_datetime(full_df["ts"])
+        grouped = full_df.groupby("symbol")
+
+        for sym in unique_symbols:
+            if sym not in grouped.groups:
+                continue
+            group = grouped.get_group(sym)
+            df = group.set_index("ts").sort_index()
+            df.index.name = "Date"
+            df = df.rename(
+                columns={
+                    "open": "Open",
+                    "high": "High",
+                    "low": "Low",
+                    "close": "Close",
+                    "volume": "Volume",
+                }
+            )[_REQUIRED_OHLCV_COLUMNS].astype(float)
+            result[sym] = df
+
+        return result
+
     def query_universe(
         self,
         provider: str,
@@ -426,6 +830,15 @@ class DuckDBCache:
         interval: str = "1d",
     ) -> Dict[str, pd.DataFrame]:
         """Batch-queries OHLCV bars for multiple symbols in a single SQL query."""
+        if is_intraday_interval(interval):
+            return self.query_intraday_universe(
+                provider,
+                symbols,
+                interval=interval,
+                start=start,
+                end=end,
+            )
+
         if not symbols:
             return {}
 
