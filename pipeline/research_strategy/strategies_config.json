@@ -1128,5 +1128,42 @@
       "cash_proxy": "BIL"
     },
     "factors": ["relative_momentum", "volatility_targeting"]
+  },
+  "chan_vp_hybrid": {
+    "name": "Chan Volume Profile Hybrid Strategy",
+    "type": "class",
+    "class_name": "ChanVolumeProfileHybridStrategy",
+    "description": "Multi-theory quantitative synthesis coupling Chan Third Buy (B3) breakout retests with Volume Profile High Volume Node (HVN) pivot validation, Wyckoff effort-vs-result vacuum traverse, and dynamic Naked POC take-profit exits.",
+    "parameters": {
+      "chan_vp_lookback": 60,
+      "chan_vp_n_bins": 30,
+      "chan_vp_val_pct": 0.70,
+      "chan_vp_min_consolidation_density": 0.45,
+      "chan_vp_min_gap_bars": 4,
+      "chan_vp_min_strokes": 3,
+      "chan_vp_stop_loss_pct": 0.06,
+      "chan_vp_max_holding_days": 60,
+      "chan_vp_position_size_pct": 1.0,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["regime_trend_strength", "relative_momentum", "absolute_momentum_trend"]
+  },
+  "wyckoff_chan_spring": {
+    "name": "Wyckoff-Chan Spring Strategy",
+    "type": "class",
+    "class_name": "WyckoffChanSpringStrategy",
+    "description": "Systematic turning-point strategy coupling causal Chan pivot support ZD with Wyckoff Spring undercut-reclaim and scale-free extremum curvature, featuring strict sub-spring stop-loss and two-stage profit scaling.",
+    "parameters": {
+      "wyckoff_spring_max_penetration": 0.04,
+      "wyckoff_spring_min_penetration": 0.005,
+      "wyckoff_spring_min_curvature": 1.5,
+      "wyckoff_spring_min_rel_vol": 1.0,
+      "wyckoff_spring_stop_buffer_pct": 0.005,
+      "wyckoff_spring_max_holding_days": 30,
+      "wyckoff_spring_position_size_pct": 1.0,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["mean_reversion", "regime_trend_strength"]
   }
 }
+

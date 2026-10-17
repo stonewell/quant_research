@@ -231,3 +231,66 @@ def test_generate_weights_discrete_winner_and_smooth_blend():
     explanation = strat_disc.explain_weights()
     assert "Macro Regime Factor" in explanation
     assert strat_disc.warmup_bars() == 252
+
+
+def test_regime_enable_fractal_curvature_backward_compatibility():
+    universe = make_multi_asset_synthetic_universe(n_days=270)
+    cfg_default = StrategyConfig()
+    assert cfg_default.regime_enable_fractal_curvature is False
+
+    strat_default = RegimeFactorCompoundStrategy(cfg_default)
+    w_default = strat_default.generate_weights(universe)
+
+    strat_explicit_false = RegimeFactorCompoundStrategy(cfg_default)
+    w_false = strat_explicit_false.generate_weights(universe, params={"regime_enable_fractal_curvature": False})
+
+    pd.testing.assert_frame_equal(w_default, w_false)
+
+
+def test_regime_enable_fractal_curvature_factor_and_classification():
+    strat = RegimeFactorCompoundStrategy()
+
+    # 1. Fast rebound from CRASH_RISK_OFF via kappa >= 1.5
+    factors_rebound = {
+        "canary_breadth": 0.40,
+        "market_breadth": 0.30,
+        "vol_zscore": 0.4,
+        "hurst_exponent": 0.50,
+        "bench_above_ma200": False,
+        "extremum_curvature": 1.6,
+        "fractal_dimension": 1.50,
+    }
+    # When enabled, kappa >= 1.5 triggers MOMENTUM_EXPANSION fast rebound
+    reg_enabled = strat._classify_regime(
+        factors_rebound, prev_regime="CRASH_RISK_OFF", enable_fractal_curvature=True
+    )
+    assert reg_enabled == "MOMENTUM_EXPANSION"
+
+    # When disabled, it stays CRASH_RISK_OFF because canaries & breadth are low
+    reg_disabled = strat._classify_regime(
+        factors_rebound, prev_regime="CRASH_RISK_OFF", enable_fractal_curvature=False
+    )
+    assert reg_disabled == "CRASH_RISK_OFF"
+
+    # 2. Bull trend with D < 1.45
+    factors_bull = {
+        "canary_breadth": 0.70,
+        "market_breadth": 0.65,
+        "vol_zscore": 0.2,
+        "hurst_exponent": 0.50,  # Below classic 0.52 threshold
+        "bench_above_ma200": True,
+        "fractal_dimension": 1.40,  # D < 1.45 persistent trend
+    }
+    assert strat._classify_regime(factors_bull, prev_regime="BULL_TREND", enable_fractal_curvature=True) == "BULL_TREND"
+
+    # 3. Range-bound with D > 1.55
+    factors_range = {
+        "canary_breadth": 0.60,
+        "market_breadth": 0.50,
+        "vol_zscore": 0.3,
+        "hurst_exponent": 0.50,  # Above classic 0.48 mean-rev threshold
+        "bench_above_ma200": False,
+        "fractal_dimension": 1.60,  # D > 1.55 anti-persistent chop
+    }
+    assert strat._classify_regime(factors_range, prev_regime="RANGE_BOUND", enable_fractal_curvature=True) == "RANGE_BOUND"
+

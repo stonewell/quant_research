@@ -50,6 +50,11 @@ from common.allocation_templates import (
 from common.indicators import adx, macd, roc, sma
 from common.position_exits import run_stop_timeout_exit
 from common.scheduling import get_rebalance_dates as _get_rebalance_dates
+from common.structural_factors import (
+    consolidation_density,
+    extremum_curvature,
+    wyckoff_spring,
+)
 
 from .chan_structure import (
     build_pivots,
@@ -889,6 +894,8 @@ class ChanTrendThirdBuyStrategy(AllocationTemplate):
         stop_loss_pct = p.get("chan_b3_stop_loss_pct", cfg.chan_b3_stop_loss_pct)
         max_holding_days = p.get("chan_b3_max_holding_days", cfg.chan_b3_max_holding_days)
         position_size_pct = p.get("chan_b3_position_size_pct", cfg.chan_b3_position_size_pct)
+        enable_vp_filter = bool(p.get("chan_b3_enable_vp_filter", getattr(cfg, "chan_b3_enable_vp_filter", False)))
+        min_density = float(p.get("chan_vp_min_consolidation_density", getattr(cfg, "chan_vp_min_consolidation_density", 0.40)))
 
         chan_causal = bool(p.get("chan_causal_signals", getattr(cfg, "chan_causal_signals", True)))
 
@@ -914,6 +921,13 @@ class ChanTrendThirdBuyStrategy(AllocationTemplate):
             )
             stroke_pivot_shift = stroke_sig["buy_signal"] & ~stroke_sig["divergence_buy"]
             entry_signal = (sig["third_buy"] | stroke_pivot_shift).reindex(master_index).fillna(False)
+
+            if enable_vp_filter:
+                piv_df = _extract_pivot_and_stroke_series(bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes)
+                cd_s = consolidation_density(bars, zd=piv_df["zd"], zg=piv_df["zg"], window=20)
+                vp_ok = (cd_s >= min_density).reindex(master_index).fillna(False)
+                entry_signal = entry_signal & vp_ok
+
             exit_signal = (sig["sell_signal"] | stroke_sig["divergence_sell"]).reindex(master_index).fillna(False)
             close = bars["Close"].reindex(master_index)
             low = bars["Low"].reindex(master_index) if "Low" in bars.columns else None
@@ -1010,7 +1024,7 @@ class ChanMeanReversionDivergenceStrategy(AllocationTemplate):
             )
             raw_first_buy = (sig["first_buy"] | stroke_sig["divergence_buy"]).reindex(master_index).fillna(False)
 
-            if entry_mode == "raw_b1":
+            if entry_mode in ("raw_b1", "classic"):
                 entry_signal = raw_first_buy
             elif entry_mode == "zero_axis":
                 zero_axis_ok = _macd_zero_axis_confirmed(bars["Close"], macd_fast, macd_slow, macd_signal).reindex(master_index).fillna(False)
@@ -1021,6 +1035,32 @@ class ChanMeanReversionDivergenceStrategy(AllocationTemplate):
                 retest_ok = _failed_retest_confirmed(bars, sig, confirm_window_bars).reindex(master_index).fillna(False)
                 zero_axis_ok = _macd_zero_axis_confirmed(bars["Close"], macd_fast, macd_slow, macd_signal).reindex(master_index).fillna(False)
                 entry_signal = retest_ok & zero_axis_ok
+            elif entry_mode == "wyckoff_spring":
+                piv_df = _extract_pivot_and_stroke_series(bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes)
+                low_s = bars["Low"] if "Low" in bars.columns else bars["Close"]
+                support_s = piv_df["zd"].fillna(low_s.rolling(20, min_periods=5).min())
+                max_pen = float(p.get("wyckoff_spring_max_penetration", getattr(cfg, "wyckoff_spring_max_penetration", 0.04)))
+                min_pen = float(p.get("wyckoff_spring_min_penetration", getattr(cfg, "wyckoff_spring_min_penetration", 0.005)))
+                min_rel_vol = float(p.get("wyckoff_spring_min_rel_vol", getattr(cfg, "wyckoff_spring_min_rel_vol", 1.0)))
+                spring_score = wyckoff_spring(bars, support_series=support_s, max_penetration=max_pen, min_penetration=min_pen, volume_lookback=20)
+                entry_signal = (spring_score >= min_rel_vol).reindex(master_index).fillna(False)
+            elif entry_mode == "curvature_v_bottom":
+                min_curv = float(p.get("wyckoff_spring_min_curvature", getattr(cfg, "wyckoff_spring_min_curvature", 1.5)))
+                curv = extremum_curvature(bars["Close"], window=5, min_periods=3)
+                entry_signal = (curv >= min_curv).reindex(master_index).fillna(False)
+            elif entry_mode == "spring_curvature_combined":
+                piv_df = _extract_pivot_and_stroke_series(bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes)
+                low_s = bars["Low"] if "Low" in bars.columns else bars["Close"]
+                support_s = piv_df["zd"].fillna(low_s.rolling(20, min_periods=5).min())
+                max_pen = float(p.get("wyckoff_spring_max_penetration", getattr(cfg, "wyckoff_spring_max_penetration", 0.04)))
+                min_pen = float(p.get("wyckoff_spring_min_penetration", getattr(cfg, "wyckoff_spring_min_penetration", 0.005)))
+                min_rel_vol = float(p.get("wyckoff_spring_min_rel_vol", getattr(cfg, "wyckoff_spring_min_rel_vol", 1.0)))
+                min_curv = float(p.get("wyckoff_spring_min_curvature", getattr(cfg, "wyckoff_spring_min_curvature", 1.5)))
+                spring_score = wyckoff_spring(bars, support_series=support_s, max_penetration=max_pen, min_penetration=min_pen, volume_lookback=20)
+                curv = extremum_curvature(bars["Close"], window=5, min_periods=3)
+                spring_ok = (spring_score >= min_rel_vol).reindex(master_index).fillna(False)
+                curv_ok = (curv >= min_curv).reindex(master_index).fillna(False)
+                entry_signal = spring_ok & curv_ok
             else:
                 entry_signal = raw_first_buy
 

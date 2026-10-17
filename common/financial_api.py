@@ -14,13 +14,17 @@ import datetime
 import os
 import re
 import sys
+import threading
+import time
 import warnings
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
+import requests
 
 from .data import BaseDataProvider, _drop_invalid_ohlcv_rows, _validate_symbol_for_path
+from .duckdb_cache import is_intraday_interval
 
 # Standard A-share / Fuyao ticker normalization regexes
 _CODE_WITH_SUFFIX_RE = re.compile(r"^([0-9]{6})\.(SH|SZ|BJ|TI|OF|SS)$", re.IGNORECASE)
@@ -132,6 +136,35 @@ def normalize_thscode(symbol: str) -> str:
         return f"{sym}.SZ"
 
     return sym
+
+
+def is_index_symbol(symbol: str) -> bool:
+    """Returns True for known China A-share broad-market indices (e.g. 000001.SH, 000300.SH, 399001.SZ)."""
+    norm_sym = normalize_thscode(symbol)
+    if norm_sym in _INDEX_CODES:
+        return True
+    ticker, _, suffix = norm_sym.partition(".")
+    if suffix == "SZ" and ticker.startswith("399"):
+        return True
+    if suffix == "SH" and (ticker.startswith("000") or ticker.startswith("001")):
+        return True
+    return False
+
+
+def to_baostock_code(symbol: str) -> str:
+    """Converts a symbol to BaoStock format (e.g. '600519.SH' -> 'sh.600519', '000001.SZ' -> 'sz.000001')."""
+    norm = normalize_thscode(symbol)
+    ticker, _, suffix = norm.partition(".")
+    return f"{suffix.lower()}.{ticker}"
+
+
+def to_eastmoney_secid(symbol: str) -> str:
+    """Converts symbol to EastMoney secid format ('1.ticker' for SH, '0.ticker' for SZ and BJ)."""
+    norm = normalize_thscode(symbol)
+    ticker, _, suffix = norm.partition(".")
+    if suffix == "SH" or ticker.startswith(("6", "5", "9")):
+        return f"1.{ticker}"
+    return f"0.{ticker}"
 
 
 _TRADING_DAYS_CACHE: Optional[set[datetime.date]] = None
@@ -822,6 +855,373 @@ class FuyaoDataProvider(BaseDataProvider):
         return result
 
 
+class BaoStockDataProvider(BaseDataProvider):
+    """Data provider sourcing historical daily and intraday K-lines from BaoStock (100% offline-mockable).
+
+    Features:
+    - Thread-safe socket queries via class-level lock.
+    - Lazy baostock import inside _get_bs().
+    - Frequency mapping ('5m'->'5', '15m'->'15', '30m'->'30', '60m'->'60', '1h'->'60', '1d'->'d', '1wk'->'w', '1mo'->'m').
+    - Strict field restriction: intraday omits preclose, turn, peTTM, pctChg, isST.
+    - 180-day chunking for intraday intervals to avoid BaoStock's 10,000-row limit.
+    - 17-digit time parsing (YYYYMMDDHHMMSSsss -> YYYY-MM-DD HH:MM:SS).
+    - Warnings and empty DataFrame for BSE (.BJ) or index intraday queries (not supported by BaoStock).
+    """
+
+    _lock = threading.Lock()
+    _BAOSTOCK_FREQ_MAP = {
+        "5m": "5",
+        "15m": "15",
+        "30m": "30",
+        "60m": "60",
+        "1h": "60",
+        "1d": "d",
+        "1wk": "w",
+        "1mo": "m",
+    }
+
+    def __init__(self, adjustflag: str = "2", **kwargs):
+        self.adjustflag = str(adjustflag)
+
+    def _get_bs(self):
+        try:
+            import baostock as bs
+            return bs
+        except ImportError as exc:
+            raise ImportError(
+                "baostock is required to use BaoStockDataProvider. Install it via 'pip install baostock'."
+            ) from exc
+
+    def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+        if interval not in self._BAOSTOCK_FREQ_MAP:
+            raise ValueError(
+                f"Unsupported interval '{interval}' for BaoStockDataProvider. "
+                f"Supported intervals: {list(self._BAOSTOCK_FREQ_MAP.keys())}"
+            )
+        freq = self._BAOSTOCK_FREQ_MAP[interval]
+        norm_sym = normalize_thscode(symbol)
+        is_intraday = is_intraday_interval(interval)
+
+        # BaoStock does not support intraday K-lines for BSE stocks (.BJ) or broad-market indices
+        if is_intraday and (norm_sym.endswith(".BJ") or is_index_symbol(norm_sym)):
+            warnings.warn(
+                f"BaoStock does not support intraday bars for BSE stocks or indices ({symbol}). "
+                "Returning empty DataFrame."
+            )
+            return pd.DataFrame(
+                columns=["Open", "High", "Low", "Close", "Volume"],
+                index=pd.DatetimeIndex([], name="Date"),
+            )
+
+        # Strict field list restriction
+        if is_intraday:
+            fields = "date,time,code,open,high,low,close,volume,amount,adjustflag"
+        else:
+            fields = "date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,pctChg,isST"
+
+        start_dt = pd.to_datetime(start).date()
+        end_dt = pd.to_datetime(end).date()
+        if start_dt > end_dt:
+            return pd.DataFrame(
+                columns=["Open", "High", "Low", "Close", "Volume"],
+                index=pd.DatetimeIndex([], name="Date"),
+            )
+
+        # 180-day chunking for intraday intervals
+        if is_intraday:
+            chunks = []
+            curr = start_dt
+            while curr <= end_dt:
+                nxt = min(curr + datetime.timedelta(days=179), end_dt)
+                chunks.append((curr.strftime("%Y-%m-%d"), nxt.strftime("%Y-%m-%d")))
+                curr = nxt + datetime.timedelta(days=1)
+        else:
+            chunks = [(start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"))]
+
+        bs_code = to_baostock_code(symbol)
+        dfs = []
+
+        with self._lock:
+            bs = self._get_bs()
+            lg = bs.login()
+            if hasattr(lg, "error_code") and lg.error_code != "0":
+                warnings.warn(f"BaoStock login failed: {getattr(lg, 'error_msg', 'unknown error')}")
+                return pd.DataFrame(
+                    columns=["Open", "High", "Low", "Close", "Volume"],
+                    index=pd.DatetimeIndex([], name="Date"),
+                )
+            try:
+                for c_start, c_end in chunks:
+                    rs = bs.query_history_k_data_plus(
+                        bs_code,
+                        fields,
+                        start_date=c_start,
+                        end_date=c_end,
+                        frequency=freq,
+                        adjustflag=self.adjustflag,
+                    )
+                    if hasattr(rs, "error_code") and rs.error_code != "0":
+                        warnings.warn(f"BaoStock query error: {getattr(rs, 'error_msg', '')}")
+                        continue
+
+                    chunk_df = None
+                    if hasattr(rs, "get_data"):
+                        chunk_df = rs.get_data()
+                    elif hasattr(rs, "next"):
+                        data_list = []
+                        while rs.error_code == "0" and rs.next():
+                            data_list.append(rs.get_row_data())
+                        if data_list:
+                            chunk_df = pd.DataFrame(data_list, columns=fields.split(","))
+
+                    if chunk_df is not None and not chunk_df.empty:
+                        dfs.append(chunk_df)
+            finally:
+                try:
+                    bs.logout()
+                except Exception:
+                    pass
+
+        if not dfs:
+            return pd.DataFrame(
+                columns=["Open", "High", "Low", "Close", "Volume"],
+                index=pd.DatetimeIndex([], name="Date"),
+            )
+
+        raw_df = pd.concat(dfs, ignore_index=True)
+        if raw_df.empty:
+            return pd.DataFrame(
+                columns=["Open", "High", "Low", "Close", "Volume"],
+                index=pd.DatetimeIndex([], name="Date"),
+            )
+
+        # Parse DatetimeIndex: 17-digit time parsing for intraday intervals
+        if is_intraday and "time" in raw_df.columns:
+            ts_str = raw_df["time"].astype(str).str.strip().str[:14]
+            idx = pd.to_datetime(ts_str, format="%Y%m%d%H%M%S", errors="coerce")
+        else:
+            idx = pd.to_datetime(raw_df["date"], format="%Y-%m-%d", errors="coerce")
+
+        raw_df.index = idx
+        raw_df.index.name = "Date"
+        raw_df = raw_df[raw_df.index.notna()]
+
+        col_map = {
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "volume": "Volume",
+            "amount": "Amount",
+        }
+        available_cols = {k: v for k, v in col_map.items() if k in raw_df.columns}
+        df = raw_df[list(available_cols.keys())].rename(columns=available_cols)
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # Deduplicate index and sort
+        df = df[~df.index.duplicated(keep="last")]
+        df = df.sort_index()
+
+        for req_col in ["Open", "High", "Low", "Close", "Volume"]:
+            if req_col not in df.columns:
+                df[req_col] = np.nan
+
+        # Filter requested date range
+        if is_intraday:
+            start_ts = pd.Timestamp(start_dt)
+            end_ts = pd.Timestamp(end_dt) + pd.Timedelta(days=1, microseconds=-1)
+            df = df.loc[(df.index >= start_ts) & (df.index <= end_ts)]
+        else:
+            df = df.loc[(df.index.date >= start_dt) & (df.index.date <= end_dt)]
+
+        return _drop_invalid_ohlcv_rows(df, symbol)
+
+
+class EastMoneyDataProvider(BaseDataProvider):
+    """Data provider sourcing real-time and historical K-lines from EastMoney (push2his.eastmoney.com).
+
+    Features:
+    - Direct connection to EastMoney Push2His endpoint.
+    - O-C-H-L field order correction (EastMoney returns Open, Close, High, Low).
+    - Mandatory lots-to-shares volume scaling (f56 is in lots of 100 shares).
+    - Cross-check implied VWAP against amount / volume.
+    - Reusable requests.Session with browser User-Agent/Referer and 0.15s rate-limit throttling.
+    - Exponential backoff on HTTP 429 or transient network errors.
+    """
+
+    _lock = threading.Lock()
+    _EASTMONEY_KLT_MAP = {
+        "1m": "1",
+        "5m": "5",
+        "15m": "15",
+        "30m": "30",
+        "60m": "60",
+        "1h": "60",
+        "1d": "101",
+        "1wk": "102",
+        "1mo": "103",
+    }
+
+    def __init__(
+        self,
+        session: Optional[requests.Session] = None,
+        adjust: str = "qfq",
+        min_interval_sec: float = 0.15,
+        **kwargs,
+    ):
+        self.adjust = adjust
+        self.fqt = "1" if adjust == "qfq" else ("2" if adjust == "hfq" else "0")
+        self.min_interval_sec = min_interval_sec
+        self._last_request_time = 0.0
+        if session is None:
+            self.session = requests.Session()
+            self.session.headers.update({
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Referer": "https://quote.eastmoney.com/",
+            })
+        else:
+            self.session = session
+
+    def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+        if interval not in self._EASTMONEY_KLT_MAP:
+            raise ValueError(
+                f"Unsupported interval '{interval}' for EastMoneyDataProvider. "
+                f"Supported intervals: {list(self._EASTMONEY_KLT_MAP.keys())}"
+            )
+        klt = self._EASTMONEY_KLT_MAP[interval]
+        secid = to_eastmoney_secid(symbol)
+
+        start_dt = pd.to_datetime(start).date()
+        end_dt = pd.to_datetime(end).date()
+        if start_dt > end_dt:
+            return pd.DataFrame(
+                columns=["Open", "High", "Low", "Close", "Volume"],
+                index=pd.DatetimeIndex([], name="Date"),
+            )
+
+        beg_str = start_dt.strftime("%Y%m%d")
+        end_str = end_dt.strftime("%Y%m%d")
+        url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+        params = {
+            "secid": secid,
+            "klt": klt,
+            "fqt": self.fqt,
+            "lmt": "10000",
+            "beg": beg_str,
+            "end": end_str,
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+        }
+
+        resp = None
+        max_retries = 3
+        for attempt in range(max_retries):
+            with self._lock:
+                now = time.time()
+                elapsed = now - self._last_request_time
+                if elapsed < self.min_interval_sec:
+                    time.sleep(self.min_interval_sec - elapsed)
+                self._last_request_time = time.time()
+            try:
+                r = self.session.get(url, params=params, timeout=10)
+                if r.status_code == 429:
+                    retry_after = r.headers.get("Retry-After")
+                    wait_time = float(retry_after) if retry_after else 0.5 * (2 ** attempt)
+                    time.sleep(wait_time)
+                    continue
+                r.raise_for_status()
+                resp = r
+                break
+            except Exception as exc:
+                if attempt == max_retries - 1:
+                    warnings.warn(f"EastMoney request failed for {symbol}: {exc}")
+                    return pd.DataFrame(
+                        columns=["Open", "High", "Low", "Close", "Volume"],
+                        index=pd.DatetimeIndex([], name="Date"),
+                    )
+                time.sleep(0.5 * (2 ** attempt))
+
+        if resp is None:
+            return pd.DataFrame(
+                columns=["Open", "High", "Low", "Close", "Volume"],
+                index=pd.DatetimeIndex([], name="Date"),
+            )
+
+        try:
+            data = resp.json()
+        except Exception:
+            return pd.DataFrame(
+                columns=["Open", "High", "Low", "Close", "Volume"],
+                index=pd.DatetimeIndex([], name="Date"),
+            )
+
+        d = data.get("data") if isinstance(data, dict) else None
+        klines = d.get("klines") if isinstance(d, dict) else None
+        if not klines:
+            return pd.DataFrame(
+                columns=["Open", "High", "Low", "Close", "Volume"],
+                index=pd.DatetimeIndex([], name="Date"),
+            )
+
+        records = []
+        timestamps = []
+        is_index = is_index_symbol(symbol)
+        for line in klines:
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 6:
+                continue
+            ts_str = parts[0]
+            # O-C-H-L field mapping: parts[1]=Open, parts[2]=Close, parts[3]=High, parts[4]=Low
+            o = float(parts[1])
+            c = float(parts[2])
+            h = float(parts[3])
+            l = float(parts[4])
+            # Mandatory lots-to-shares volume scaling (f56 is in lots of 100 shares)
+            vol = float(parts[5]) * 100.0
+            amount = float(parts[6]) if len(parts) > 6 else float("nan")
+
+            if vol > 0 and not np.isnan(amount) and amount > 0 and not is_index:
+                implied_vwap = amount / vol
+            else:
+                implied_vwap = (h + l + c) / 3.0
+
+            timestamps.append(ts_str)
+            records.append({
+                "Open": o,
+                "High": h,
+                "Low": l,
+                "Close": c,
+                "Volume": vol,
+                "Amount": amount,
+                "VWAP": implied_vwap,
+            })
+
+        if not records:
+            return pd.DataFrame(
+                columns=["Open", "High", "Low", "Close", "Volume"],
+                index=pd.DatetimeIndex([], name="Date"),
+            )
+
+        df = pd.DataFrame(records, index=pd.to_datetime(timestamps))
+        df.index.name = "Date"
+        df = df[~df.index.duplicated(keep="last")]
+        df = df.sort_index()
+
+        is_intraday = is_intraday_interval(interval)
+        if is_intraday:
+            start_ts = pd.Timestamp(start_dt)
+            end_ts = pd.Timestamp(end_dt) + pd.Timedelta(days=1, microseconds=-1)
+            df = df.loc[(df.index >= start_ts) & (df.index <= end_ts)]
+        else:
+            df = df.loc[(df.index.date >= start_dt) & (df.index.date <= end_dt)]
+
+        return _drop_invalid_ohlcv_rows(df, symbol)
+
+
 # Self-register into data provider registry once classes are fully defined
 try:
     from .data import register_provider
@@ -830,6 +1230,8 @@ try:
     register_provider("fuyao", FuyaoDataProvider)
     register_provider("financial_api", FuyaoDataProvider)
     register_provider("hithink", FuyaoDataProvider)
+    register_provider("baostock", BaoStockDataProvider)
+    register_provider("eastmoney", EastMoneyDataProvider)
 except Exception:
     pass
 

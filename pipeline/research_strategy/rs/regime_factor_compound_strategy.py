@@ -33,6 +33,7 @@ from common.allocation_templates import (
 from common.hurst import hurst_exponent
 from common.indicators import roc, sma
 from common.scheduling import get_rebalance_dates as _get_rebalance_dates
+from common.structural_factors import extremum_curvature, fractal_dimension
 from .config import StrategyConfig
 
 
@@ -82,6 +83,7 @@ class RegimeFactorCompoundStrategy(AllocationTemplate):
         canary_symbols: List[str],
         benchmark_sym: str,
         lookback_days: int = 63,
+        enable_fractal_curvature: bool = False,
     ) -> Dict[str, float]:
         """Calculates point-in-time macro factors on a rebalance date."""
         # 1. Market Breadth: fraction of risky symbols > 200d SMA
@@ -171,7 +173,7 @@ class RegimeFactorCompoundStrategy(AllocationTemplate):
                         rets_21.append(r)
         dispersion = float(np.std(rets_21)) if len(rets_21) >= 2 else 0.0
 
-        return {
+        factors = {
             "market_breadth": breadth,
             "bench_above_ma200": bench_above_ma200,
             "vol_zscore": vol_zscore,
@@ -181,6 +183,21 @@ class RegimeFactorCompoundStrategy(AllocationTemplate):
             "dispersion": dispersion,
             "recent_vol": recent_vol if len(bench_close) >= 63 and 'recent_vol' in locals() else 0.15,
         }
+
+        if enable_fractal_curvature:
+            fd_val = 1.50
+            curv_val = 0.0
+            if len(bench_close) >= 32:
+                fd_s = fractal_dimension(bench_close, window=min(lookback_days, 60))
+                if len(fd_s) > 0 and pd.notna(fd_s.iloc[-1]):
+                    fd_val = float(fd_s.iloc[-1])
+                curv_s = extremum_curvature(bench_close, window=5)
+                if len(curv_s) > 0 and pd.notna(curv_s.iloc[-1]):
+                    curv_val = float(curv_s.iloc[-1])
+            factors["fractal_dimension"] = fd_val
+            factors["extremum_curvature"] = curv_val
+
+        return factors
 
     def _classify_regime(
         self,
@@ -192,6 +209,7 @@ class RegimeFactorCompoundStrategy(AllocationTemplate):
         vol_z_thresh: float = 1.0,
         hurst_trend_thresh: float = 0.52,
         hurst_meanrev_thresh: float = 0.48,
+        enable_fractal_curvature: bool = False,
     ) -> str:
         """Classifies the market regime across 5 regimes with hysteresis and fast rebound acceleration."""
         cb = factors["canary_breadth"]
@@ -200,13 +218,20 @@ class RegimeFactorCompoundStrategy(AllocationTemplate):
         h = factors["hurst_exponent"]
         bench_trend = factors["bench_above_ma200"]
         sb = factors.get("short_breadth", 0.5)
+        curv = factors.get("extremum_curvature", 0.0)
+        fd = factors.get("fractal_dimension", 2.0 - h)
 
         # 0. Fast Rebound Acceleration Override:
         # If in CRASH_RISK_OFF but canaries recover (cb >= 0.60) and short-term breadth exhibits
         # an explosive thrust (sb >= 0.65), immediately exit crash mode into MOMENTUM_EXPANSION
         # without lagging behind slow 200d SMA or long-term breadth confirmation.
-        if prev_regime == "CRASH_RISK_OFF" and cb >= 0.60 and sb >= 0.65 and vz < 1.0:
-            return "MOMENTUM_EXPANSION"
+        # When enable_fractal_curvature is True, kappa >= 1.5 triggers fast rebound directly.
+        if prev_regime == "CRASH_RISK_OFF":
+            fast_rebound = (cb >= 0.60 and sb >= 0.65 and vz < 1.0)
+            if enable_fractal_curvature and curv >= 1.5 and vz < 1.0:
+                fast_rebound = True
+            if fast_rebound:
+                return "MOMENTUM_EXPANSION"
 
         # 1. Crash Risk-Off check
         # Hysteresis: if already in crash mode, require canary_breadth >= 0.60, vz < 0.5, and mb >= bear_thresh to exit
@@ -222,12 +247,14 @@ class RegimeFactorCompoundStrategy(AllocationTemplate):
         if cb >= 0.99 and mb >= breadth_mom_thresh and bench_trend and vz < 0.8:
             return "MOMENTUM_EXPANSION"
 
-        # 3. Bull Trend Expansion: broad breadth, bench above MA200, persistent Hurst
-        if mb >= breadth_bull_thresh and bench_trend and h >= hurst_trend_thresh:
+        # 3. Bull Trend Expansion: broad breadth, bench above MA200, persistent Hurst / D < 1.45
+        trend_persistent = (fd < 1.45) if enable_fractal_curvature else (h >= hurst_trend_thresh)
+        if mb >= breadth_bull_thresh and bench_trend and trend_persistent:
             return "BULL_TREND"
 
-        # 4. Range-Bound Consolidation: anti-persistent Hurst, calm volatility
-        if h <= hurst_meanrev_thresh and vz < 0.5:
+        # 4. Range-Bound Consolidation: anti-persistent Hurst / D > 1.55, calm volatility
+        range_bound_cond = (fd > 1.55) if enable_fractal_curvature else (h <= hurst_meanrev_thresh)
+        if range_bound_cond and vz < 0.5:
             return "RANGE_BOUND"
 
         # 5. Volatile Rotation: default / rotational / elevated dispersion
@@ -247,6 +274,7 @@ class RegimeFactorCompoundStrategy(AllocationTemplate):
         vol_z_thresh = float(p.get("regime_compound_vol_zscore_thresh", getattr(cfg, "regime_compound_vol_zscore_thresh", 1.0)))
         hurst_trend_thresh = float(p.get("regime_compound_hurst_trend_thresh", getattr(cfg, "regime_compound_hurst_trend_thresh", 0.52)))
         hurst_meanrev_thresh = float(p.get("regime_compound_hurst_meanrev_thresh", getattr(cfg, "regime_compound_hurst_meanrev_thresh", 0.48)))
+        enable_fc = bool(p.get("regime_enable_fractal_curvature", getattr(cfg, "regime_enable_fractal_curvature", False)))
         enable_vol_targeting = bool(p.get("regime_compound_enable_vol_targeting", getattr(cfg, "regime_compound_enable_vol_targeting", True)))
         target_vol = float(p.get("regime_compound_target_vol", getattr(cfg, "regime_compound_target_vol", 0.12)))
 
@@ -309,6 +337,7 @@ class RegimeFactorCompoundStrategy(AllocationTemplate):
                 canary_symbols=canary_symbols,
                 benchmark_sym=benchmark_sym,
                 lookback_days=lookback_days,
+                enable_fractal_curvature=enable_fc,
             )
 
             # Classify regime
@@ -321,6 +350,7 @@ class RegimeFactorCompoundStrategy(AllocationTemplate):
                 vol_z_thresh=vol_z_thresh,
                 hurst_trend_thresh=hurst_trend_thresh,
                 hurst_meanrev_thresh=hurst_meanrev_thresh,
+                enable_fractal_curvature=enable_fc,
             )
 
             # Route allocation based on active regime & mode

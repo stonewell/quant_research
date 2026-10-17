@@ -1919,3 +1919,73 @@ def test_chan_dual_hybrid_entry_bypass_allows_high_vol_initiation():
     assert res_bypass["SYM"].iloc[1] == 0.05
 
 
+def test_chan_trend_third_buy_vp_filter():
+    universe = create_mock_universe(300)
+    cfg = StrategyConfig()
+    strat_default = ChanTrendThirdBuyStrategy(cfg)
+    w_default = strat_default.generate_weights(universe)
+
+    # 1. Default (False) should be 100% identical to explicit False
+    w_explicit_false = strat_default.generate_weights(universe, params={"chan_b3_enable_vp_filter": False})
+    pd.testing.assert_frame_equal(w_default, w_explicit_false)
+
+    # 2. When True with very high consolidation density (0.99), entries on normal oscillating mock universe are gated
+    w_strict_vp = strat_default.generate_weights(
+        universe,
+        params={
+            "chan_b3_enable_vp_filter": True,
+            "chan_vp_min_consolidation_density": 0.99,
+        },
+    )
+    assert isinstance(w_strict_vp, pd.DataFrame)
+    # The strict filter should result in fewer or zero risky allocations
+    if not w_strict_vp.empty and "SPY" in w_strict_vp.columns:
+        spy_strict = w_strict_vp["SPY"].fillna(0.0)
+        spy_def = w_default["SPY"].fillna(0.0)
+        assert (spy_strict <= spy_def).all()
+
+
+def test_chan_mrd_entry_modes_and_backward_compatibility():
+    universe = create_mock_universe(300)
+    cfg = StrategyConfig()
+    strat = ChanMeanReversionDivergenceStrategy(cfg)
+
+    # 1. 'classic' must be identical to 'raw_b1'
+    w_raw_b1 = strat.generate_weights(universe, params={"chan_mrd_entry_mode": "raw_b1"})
+    w_classic = strat.generate_weights(universe, params={"chan_mrd_entry_mode": "classic"})
+    pd.testing.assert_frame_equal(w_raw_b1, w_classic)
+
+    # 2. 'wyckoff_spring', 'curvature_v_bottom', 'spring_curvature_combined' generate valid sparse frames
+    w_spring = strat.generate_weights(
+        universe,
+        params={
+            "chan_mrd_entry_mode": "wyckoff_spring",
+            "wyckoff_spring_min_rel_vol": 0.5,
+        },
+    )
+    assert isinstance(w_spring, pd.DataFrame)
+    assert not w_spring.empty
+
+    w_curv = strat.generate_weights(
+        universe,
+        params={
+            "chan_mrd_entry_mode": "curvature_v_bottom",
+            "wyckoff_spring_min_curvature": 1.0,
+        },
+    )
+    assert isinstance(w_curv, pd.DataFrame)
+    assert not w_curv.empty
+
+    w_comb = strat.generate_weights(
+        universe,
+        params={
+            "chan_mrd_entry_mode": "spring_curvature_combined",
+            "wyckoff_spring_min_rel_vol": 0.5,
+            "wyckoff_spring_min_curvature": 1.0,
+        },
+    )
+    assert isinstance(w_comb, pd.DataFrame)
+    assert not w_comb.empty
+
+
+

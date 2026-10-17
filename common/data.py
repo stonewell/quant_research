@@ -684,16 +684,23 @@ def fetch_fund_metadata(symbol: str, provider: Union[str, BaseDataProvider, None
 
 
 def _ensure_financial_api_registered() -> None:
-    """Lazily registers financial_api / fuyao data providers if available."""
-    if "fuyao" in _PROVIDER_REGISTRY:
+    """Lazily registers financial_api, fuyao, baostock, and eastmoney data providers if available."""
+    if "baostock" in _PROVIDER_REGISTRY and "eastmoney" in _PROVIDER_REGISTRY and "fuyao" in _PROVIDER_REGISTRY:
         return
     try:
-        from .financial_api import MarketDBDataProvider, FuyaoDataProvider
+        from .financial_api import (
+            MarketDBDataProvider,
+            FuyaoDataProvider,
+            BaoStockDataProvider,
+            EastMoneyDataProvider,
+        )
 
         register_provider("marketdb", MarketDBDataProvider)
         register_provider("fuyao", FuyaoDataProvider)
         register_provider("financial_api", FuyaoDataProvider)
         register_provider("hithink", FuyaoDataProvider)
+        register_provider("baostock", BaoStockDataProvider)
+        register_provider("eastmoney", EastMoneyDataProvider)
     except Exception:
         pass
 

@@ -321,7 +321,7 @@ class StrategyConfig:
     chan_mrd_macd_fast: int = 12
     chan_mrd_macd_slow: int = 26
     chan_mrd_macd_signal: int = 9
-    chan_mrd_entry_mode: str = "raw_b1"   # "raw_b1", "zero_axis", "failed_retest", "combined"
+    chan_mrd_entry_mode: str = "raw_b1"   # "raw_b1", "classic", "zero_axis", "failed_retest", "combined", "wyckoff_spring", "curvature_v_bottom", "spring_curvature_combined"
     chan_mrd_confirm_window_bars: int = 20
     chan_mrd_require_trend_filter: bool = True
     chan_mrd_trend_ma_period: int = 200
@@ -839,6 +839,37 @@ class StrategyConfig:
     gtja_smoothing_days: int = 1                # Smoothing on raw scores
     gtja_min_weight_change: float = 0.03        # Minimum target weight change threshold (inertia)
 
+    # --- Multi-Theory Quantitative Synthesis & Structural Factor Parameters ---
+    chan_vp_lookback: int = 60
+    chan_vp_n_bins: int = 30
+    chan_vp_val_pct: float = 0.70
+    chan_vp_min_consolidation_density: float = 0.45
+    chan_vp_min_gap_bars: int = 4
+    chan_vp_min_strokes: int = 3
+    chan_vp_stop_loss_pct: float = 0.06
+    chan_vp_max_holding_days: int = 60
+    chan_vp_position_size_pct: float = 1.0
+
+    wyckoff_spring_max_penetration: float = 0.04
+    wyckoff_spring_min_penetration: float = 0.005
+    wyckoff_spring_min_curvature: float = 1.5
+    wyckoff_spring_min_rel_vol: float = 1.0
+    wyckoff_spring_stop_buffer_pct: float = 0.005
+    wyckoff_spring_max_holding_days: int = 30
+    wyckoff_spring_position_size_pct: float = 1.0
+
+    # Backward-compatible single-strategy enhancement flags (default False)
+    chan_b3_enable_vp_filter: bool = False
+    regime_enable_fractal_curvature: bool = False
+
+    # Modular Blend base enhancement flags (default False)
+    blend_enable_structural_regime: bool = False
+    blend_enable_cyq_quality_gate: bool = False
+    blend_min_cyq_winner_ratio: float = 0.20
+    blend_enable_vp_confluence_sizing: bool = False
+    blend_enable_spring_fast_entry: bool = False
+    blend_enable_structural_chandelier_stop: bool = False
+
     # Backtester execution defaults
     initial_capital: float = 100_000.0
     commission_pct: float = 0.0005          # 5 bps
@@ -1150,6 +1181,61 @@ class StrategyConfig:
             bonus = getattr(self, f"{pfx}_thrust_incumbent_bonus", None)
             if bonus is not None and bonus < 1.0:
                 raise ValueError(f"StrategyConfig.{pfx}_thrust_incumbent_bonus must be >= 1.0, got {bonus}")
+
+        valid_mrd_modes = {
+            "raw_b1",
+            "classic",
+            "zero_axis",
+            "failed_retest",
+            "combined",
+            "wyckoff_spring",
+            "curvature_v_bottom",
+            "spring_curvature_combined",
+        }
+        if self.chan_mrd_entry_mode not in valid_mrd_modes:
+            raise ValueError(f"StrategyConfig.chan_mrd_entry_mode must be one of {sorted(valid_mrd_modes)}, got {self.chan_mrd_entry_mode!r}")
+
+        if self.chan_vp_lookback <= 0:
+            raise ValueError(f"StrategyConfig.chan_vp_lookback must be > 0, got {self.chan_vp_lookback}")
+        if self.chan_vp_n_bins <= 0:
+            raise ValueError(f"StrategyConfig.chan_vp_n_bins must be > 0, got {self.chan_vp_n_bins}")
+        if not (0.0 < self.chan_vp_val_pct < 1.0):
+            raise ValueError(f"StrategyConfig.chan_vp_val_pct must be between 0 and 1, got {self.chan_vp_val_pct}")
+        if not (0.0 <= self.chan_vp_min_consolidation_density <= 1.0):
+            raise ValueError(f"StrategyConfig.chan_vp_min_consolidation_density must be between 0 and 1, got {self.chan_vp_min_consolidation_density}")
+        if self.chan_vp_min_gap_bars <= 0:
+            raise ValueError(f"StrategyConfig.chan_vp_min_gap_bars must be > 0, got {self.chan_vp_min_gap_bars}")
+        if self.chan_vp_min_strokes < 3:
+            raise ValueError(f"StrategyConfig.chan_vp_min_strokes must be >= 3, got {self.chan_vp_min_strokes}")
+        if self.chan_vp_stop_loss_pct <= 0.0:
+            raise ValueError(f"StrategyConfig.chan_vp_stop_loss_pct must be > 0, got {self.chan_vp_stop_loss_pct}")
+        if self.chan_vp_max_holding_days <= 0:
+            raise ValueError(f"StrategyConfig.chan_vp_max_holding_days must be > 0, got {self.chan_vp_max_holding_days}")
+        if self.chan_vp_position_size_pct <= 0.0:
+            raise ValueError(f"StrategyConfig.chan_vp_position_size_pct must be > 0, got {self.chan_vp_position_size_pct}")
+
+        if self.wyckoff_spring_max_penetration <= 0.0:
+            raise ValueError(f"StrategyConfig.wyckoff_spring_max_penetration must be > 0, got {self.wyckoff_spring_max_penetration}")
+        if self.wyckoff_spring_min_penetration < 0.0:
+            raise ValueError(f"StrategyConfig.wyckoff_spring_min_penetration must be >= 0, got {self.wyckoff_spring_min_penetration}")
+        if self.wyckoff_spring_min_penetration > self.wyckoff_spring_max_penetration:
+            raise ValueError(
+                f"StrategyConfig.wyckoff_spring_min_penetration ({self.wyckoff_spring_min_penetration}) "
+                f"must be <= wyckoff_spring_max_penetration ({self.wyckoff_spring_max_penetration})"
+            )
+        if self.wyckoff_spring_min_curvature <= 0.0:
+            raise ValueError(f"StrategyConfig.wyckoff_spring_min_curvature must be > 0, got {self.wyckoff_spring_min_curvature}")
+        if self.wyckoff_spring_min_rel_vol < 0.0:
+            raise ValueError(f"StrategyConfig.wyckoff_spring_min_rel_vol must be >= 0, got {self.wyckoff_spring_min_rel_vol}")
+        if self.wyckoff_spring_stop_buffer_pct < 0.0:
+            raise ValueError(f"StrategyConfig.wyckoff_spring_stop_buffer_pct must be >= 0, got {self.wyckoff_spring_stop_buffer_pct}")
+        if self.wyckoff_spring_max_holding_days <= 0:
+            raise ValueError(f"StrategyConfig.wyckoff_spring_max_holding_days must be > 0, got {self.wyckoff_spring_max_holding_days}")
+        if self.wyckoff_spring_position_size_pct <= 0.0:
+            raise ValueError(f"StrategyConfig.wyckoff_spring_position_size_pct must be > 0, got {self.wyckoff_spring_position_size_pct}")
+
+        if not (0.0 <= self.blend_min_cyq_winner_ratio <= 1.0):
+            raise ValueError(f"StrategyConfig.blend_min_cyq_winner_ratio must be between 0 and 1, got {self.blend_min_cyq_winner_ratio}")
 
     @classmethod
     def from_dict(cls, data: dict) -> "StrategyConfig":

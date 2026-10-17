@@ -110,6 +110,8 @@ from .worldquant_alpha_strategy import (
     WorldQuantAlphaStrategy,
     WorldQuantMegaAlphaStrategy,
 )
+from .chan_vp_hybrid_strategy import ChanVolumeProfileHybridStrategy
+from .wyckoff_chan_strategy import WyckoffChanSpringStrategy
 from .gtja191_factors import GTJAAlphaStrategy
 from .config import StrategyConfig
 from .nl_parser import ParsedStrategySpec, parse_plain_english_strategy
@@ -2115,6 +2117,7 @@ STRATEGY_CLASS_MAP = {
     "ChanThreeTypeStrategy": ChanThreeTypeStrategy,
     "ChanTrendThirdBuyStrategy": ChanTrendThirdBuyStrategy,
     "ChanVaaCompoundStrategy": ChanVaaCompoundStrategy,
+    "ChanVolumeProfileHybridStrategy": ChanVolumeProfileHybridStrategy,
     "CompounderMarginOfSafetyStrategy": CompounderMarginOfSafetyStrategy,
     "DefensiveAssetAllocationStrategy": DefensiveAssetAllocationStrategy,
     "EnsembleRegimeSwitchingStrategy": EnsembleRegimeSwitchingStrategy,
@@ -2138,6 +2141,7 @@ STRATEGY_CLASS_MAP = {
     "Wave3FibonacciStrategy": Wave3FibonacciStrategy,
     "WorldQuantAlphaStrategy": WorldQuantAlphaStrategy,
     "WorldQuantMegaAlphaStrategy": WorldQuantMegaAlphaStrategy,
+    "WyckoffChanSpringStrategy": WyckoffChanSpringStrategy,
 }
 
 
