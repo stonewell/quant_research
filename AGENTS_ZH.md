@@ -95,3 +95,14 @@ uv run python run_pipeline.py --data-provider synthetic --universe SPY QQQ ...
 - 优先复用现有的共享原语（`common/indicators.py`, `common/allocation_search.py`, `common/covariance.py`, `common/scheduling.py`, `common/testing.py`），避免重复实现已存在的数学逻辑。
 - Git 提交信息需保持简洁、小写、现在时态摘要（例如 "add chan pivot", "add denoise"）。
 - **任务拆解与路线图唯一权威中心 (`docs/development_plan.md`)：** 整个代码库的所有定量研究、基础设施升级、高频特征提取、多流派策略研发及实盘交易护栏工程的任务拆解、状态跟踪、优先级队列与执行路线图，必须且仅在 `docs/development_plan.md` 中集中维护。`docs/` 下的各专项研究与架构设计方案仅承载理论建模、代码审计与模块详设，任务清单与进度编排统一查阅 `docs/development_plan.md`。
+
+---
+
+## 已知问题与数据源避坑指南 (Known Issues & Data Provider Gotchas)
+
+- `HierarchicalRiskParityAllocation` 在某些极小或退化的合成标的池上可能抛出 `IndexError`。`_portfolio_score` 已捕获该异常并将其夏普比率降级为 `-inf`，不会中断运行。
+- **BaoStock `ResultData` 分页死循环 OOM 与单进程顺序下载规范 (`common/financial_api.py`)：**
+  - **OOM 与首页丢失根因：** 在 `baostock/data/resultset.py` 中，当单次查询跨越多个分页（`> 10,000` 行）时，`ResultData.get_data()` 内部会调用 Pandas 2.x 已移除的 `df.append(...)`；且在抛出 `AttributeError` 之前，`self.next()` 已将 `rs.data` 中的第 1 页数据覆盖为第 2 页。此外，`ResultData.next()` 在请求下一网络分页前会检查 `if self.cur_row_num < len(self.data): return True`。若调用方通过 `data_list.extend(rs.data)` 批量提取整页数据而未同步更新游标 `rs.cur_row_num = len(rs.data)`，`rs.cur_row_num` 将永远停留在 `0`，导致 `while rs.next():` 陷入无限死循环并在数秒内耗尽系统内存（OOM）。
+  - **强制解决方案：** 在 Pandas 2.x 环境下绝不对真实 `baostock.data.resultset.ResultData` 调用 `rs.get_data()`；使用 `data_list.extend(rs.data)` 批量读取首页及 `while rs.next():` 后续分页时，**必须在每次 `extend` 后立即执行 `rs.cur_row_num = len(rs.data)`** 推进游标（或逐行调用 `rs.get_row_data()`），且分钟线查询须保持按 `<= 180` 自然日分块请求。
+  - **严禁多进程/并发下载：** 绝不对 BaoStock 使用多进程（`multiprocessing`）或多线程并发下载，以免触发服务端封禁或 Socket 阻塞；必须使用单进程顺序下载（复用持久会话 `keep_logged_in=True`），并按单标的粒度增量写入 `DuckDBCache`。
+

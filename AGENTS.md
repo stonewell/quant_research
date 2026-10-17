@@ -171,8 +171,28 @@ This codebase is unusually disclosure-heavy -- match it, don't strip it out:
   codebase audits, and module specifications, and must link to `docs/development_plan.md` for task
   lists and execution tracking.
 
-## Known pre-existing issues (not yet fixed -- don't be alarmed)
+## Known pre-existing issues & data provider gotchas
 
 - `HierarchicalRiskParityAllocation` can raise `IndexError` on some small/degenerate synthetic
   universes. It's already caught and degraded to `-inf` Sharpe by `_portfolio_score`, so it doesn't
   break a run -- that candidate just loses -- but you may see the warning in output.
+- **BaoStock `ResultData` pagination OOM & sequential-only downloading (`common/financial_api.py`):**
+  - **OOM & Page-1 loss root cause:** In `baostock/data/resultset.py`, `ResultData.get_data()` calls
+    `df.append(...)` when a query spans multiple pages (`> 10,000` rows), which raises `AttributeError`
+    in Pandas 2.x *after* `self.next()` has already overwritten Page 1 in `rs.data` with Page 2.
+    Furthermore, `ResultData.next()` checks `if self.cur_row_num < len(self.data): return True` before
+    requesting the next socket page. If a caller extracts rows in bulk via `data_list.extend(rs.data)`
+    inside `while rs.next():` without advancing `rs.cur_row_num = len(rs.data)` after each page,
+    `rs.cur_row_num` stays `0` forever and `while rs.next():` becomes an infinite tight loop that
+    exhausts all system RAM (OOM) in seconds.
+  - **Mandatory solution:** Never call `rs.get_data()` on real `baostock.data.resultset.ResultData`
+    instances in Pandas 2.x, and never loop `while rs.next(): data_list.extend(rs.data)` without
+    advancing the cursor. Always advance `rs.cur_row_num = len(rs.data)` immediately after
+    `data_list.extend(rs.data)` on both the initial page and inside every `while rs.next():` iteration
+    (or advance row-by-row via `rs.get_row_data()`), and keep intraday queries chunked (`<= 180`
+    calendar days per request).
+  - **No parallel/multiprocessing downloaders:** Never use `multiprocessing` or multi-threaded
+    parallel sessions with BaoStock (`baostock.com` blocks concurrent socket floods from the same IP).
+    Always download sequentially in a single process using a persistent session (`keep_logged_in=True`)
+    and persist each symbol incrementally to `DuckDBCache`.
+

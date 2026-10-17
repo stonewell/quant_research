@@ -529,3 +529,144 @@ def test_intraday_snapshot_aggregator_and_parquet(tmp_path):
         pd.Timestamp("2026-10-16 09:40:00"),
         pd.Timestamp("2026-10-16 09:45:00"),
     ]
+
+
+def test_normalize_thscode_and_baostock_index_fields():
+    """Verify bare index code normalization and BaoStock index daily fields & adjustflag='3'."""
+    from common.financial_api import (
+        normalize_thscode,
+        BaoStockDataProvider,
+    )
+
+    # 1. Verification of bare index code mapping vs Ping An Bank
+    assert normalize_thscode("000300") == "000300.SH"
+    assert normalize_thscode("000905") == "000905.SH"
+    assert normalize_thscode("000852") == "000852.SH"
+    assert normalize_thscode("000016") == "000016.SH"
+    assert normalize_thscode("000688") == "000688.SH"
+    assert normalize_thscode("000001") == "000001.SZ"
+    assert normalize_thscode("000001.SH") == "000001.SH"
+
+    # 2. BaoStockDataProvider index daily query fields and adjustflag='3'
+    mock_bs = MagicMock()
+    mock_login_res = MagicMock()
+    mock_login_res.error_code = "0"
+    mock_bs.login.return_value = mock_login_res
+
+    query_calls = []
+
+    def fake_query(code, fields, start_date, end_date, frequency, adjustflag):
+        query_calls.append({
+            "code": code,
+            "fields": fields,
+            "start_date": start_date,
+            "end_date": end_date,
+            "frequency": frequency,
+            "adjustflag": adjustflag,
+        })
+        mock_rs = MagicMock()
+        mock_rs.error_code = "0"
+        mock_rs.get_data.return_value = pd.DataFrame({
+            "date": ["2020-01-02"],
+            "code": [code],
+            "open": ["4000.0"],
+            "high": ["4050.0"],
+            "low": ["3980.0"],
+            "close": ["4020.0"],
+            "preclose": ["3990.0"],
+            "volume": ["100000000"],
+            "amount": ["200000000000"],
+            "pctChg": ["0.75"],
+        })
+        return mock_rs
+
+    mock_bs.query_history_k_data_plus.side_effect = fake_query
+
+    b_prov = BaoStockDataProvider(adjustflag="2")
+    with patch.object(b_prov, "_get_bs", return_value=mock_bs):
+        df_res = b_prov.fetch_ohlcv("000300.SH", "2020-01-01", "2020-06-01", interval="1d")
+        assert not df_res.empty
+        assert len(query_calls) == 1
+        call = query_calls[0]
+        assert call["code"] == "sh.000300"
+        assert call["fields"] == "date,code,open,high,low,close,preclose,volume,amount,pctChg"
+        assert call["adjustflag"] == "3"
+        assert call["frequency"] == "d"
+
+
+def test_marketdb_and_fuyao_index_gap_fallback_stitching():
+    """Verify MarketDBDataProvider and FuyaoDataProvider index fallbacks and 5y/trailing stitching."""
+    from common.financial_api import (
+        MarketDBDataProvider,
+        FuyaoDataProvider,
+        BaoStockDataProvider,
+        EastMoneyDataProvider,
+    )
+
+    # 1. MarketDBDataProvider fallback on index symbol
+    mock_con = MagicMock()
+    mock_res = MagicMock()
+    mock_res.df.return_value = pd.DataFrame()  # empty query
+    mock_con.execute.return_value = mock_res
+
+    fake_idx_df = pd.DataFrame(
+        {"Open": [4000.0], "High": [4050.0], "Low": [3980.0], "Close": [4020.0], "Volume": [1e8]},
+        index=pd.date_range("2020-01-02", periods=1, freq="D"),
+    )
+
+    mdb_prov = MarketDBDataProvider(con=mock_con)
+    with patch.object(BaoStockDataProvider, "fetch_ohlcv", return_value=fake_idx_df) as mock_bs_fetch:
+        df_out = mdb_prov.fetch_ohlcv("000300.SH", "2020-01-01", "2020-01-10", interval="1d")
+        assert not df_out.empty
+        mock_bs_fetch.assert_called_once()
+        assert df_out.iloc[0]["Close"] == 4020.0
+
+    # 2. FuyaoDataProvider index historical pre-5y and trailing stitching
+    pre_df = pd.DataFrame(
+        {
+            "Open": [3500.0, 3510.0],
+            "High": [3550.0, 3560.0],
+            "Low": [3480.0, 3490.0],
+            "Close": [3520.0, 3530.0],
+            "Volume": [1e7, 1e7],
+        },
+        index=pd.to_datetime(["2016-01-04", "2016-01-05"]),
+    )
+    fuyao_items = [
+        {
+            "date_ms": int(pd.Timestamp("2021-01-04").timestamp() * 1000),
+            "open_price": 5000.0,
+            "high_price": 5050.0,
+            "low_price": 4980.0,
+            "close_price": 5020.0,
+            "volume": 2e7,
+        },
+        {
+            "date_ms": int(pd.Timestamp("2021-01-05").timestamp() * 1000),
+            "open_price": 5020.0,
+            "high_price": 5080.0,
+            "low_price": 5000.0,
+            "close_price": 5060.0,
+            "volume": 2e7,
+        },
+    ]
+    post_df = pd.DataFrame(
+        {
+            "Open": [3900.0, 3920.0],
+            "High": [3950.0, 3960.0],
+            "Low": [3880.0, 3900.0],
+            "Close": [3930.0, 3950.0],
+            "Volume": [3e7, 3e7],
+        },
+        index=pd.to_datetime(["2026-10-15", "2026-10-16"]),
+    )
+
+    fuyao_prov = FuyaoDataProvider(prefer_local=False)
+    with patch("fuyao_client.index_prices_historical", return_value=fuyao_items), \
+         patch.object(BaoStockDataProvider, "fetch_ohlcv", return_value=pre_df), \
+         patch.object(EastMoneyDataProvider, "fetch_ohlcv", return_value=post_df):
+        df_stitched = fuyao_prov.fetch_ohlcv("000300.SH", "2016-01-01", "2026-10-16", interval="1d")
+        assert not df_stitched.empty
+        assert df_stitched.index.min() == pd.Timestamp("2016-01-04")
+        assert df_stitched.index.max() == pd.Timestamp("2026-10-16")
+        assert len(df_stitched) == 6

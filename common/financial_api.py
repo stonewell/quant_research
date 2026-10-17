@@ -29,9 +29,10 @@ from .duckdb_cache import is_intraday_interval
 # Standard A-share / Fuyao ticker normalization regexes
 _CODE_WITH_SUFFIX_RE = re.compile(r"^([0-9]{6})\.(SH|SZ|BJ|TI|OF|SS)$", re.IGNORECASE)
 _INDEX_CODES = {
-    "000001.SH", "000016.SH", "000300.SH", "000905.SH", "000852.SH",
+    "000001.SH", "000016.SH", "000300.SH", "000905.SH", "000852.SH", "000688.SH",
     "399001.SZ", "399005.SZ", "399006.SZ", "399300.SZ",
 }
+_BARE_SH_INDEX_CODES = {"000300", "000905", "000852", "000016", "000688"}
 
 
 def _resolve_financial_api_path() -> Optional[str]:
@@ -119,6 +120,8 @@ def normalize_thscode(symbol: str) -> str:
 
     # Bare 6-digit code inference
     if len(sym) == 6 and sym.isdigit():
+        if sym in _BARE_SH_INDEX_CODES:
+            return f"{sym}.SH"
         if sym.startswith(("600", "601", "603", "605", "688", "689")):
             return f"{sym}.SH"
         if sym.startswith(("000", "001", "002", "003", "300", "301")):
@@ -338,6 +341,19 @@ class MarketDBDataProvider(BaseDataProvider):
                 con.close()
 
         if df.empty:
+            if is_index_symbol(thscode):
+                try:
+                    fallback_df = BaoStockDataProvider().fetch_ohlcv(thscode, start, end, interval)
+                    if not fallback_df.empty:
+                        return fallback_df
+                except Exception:
+                    pass
+                try:
+                    fallback_df = EastMoneyDataProvider().fetch_ohlcv(thscode, start, end, interval)
+                    if not fallback_df.empty:
+                        return fallback_df
+                except Exception:
+                    pass
             raise ValueError(f"No data returned for {symbol} ({thscode}) between {start} and {end} in {self.view}")
 
         df["date"] = pd.to_datetime(df["date"])
@@ -506,15 +522,26 @@ class FuyaoDataProvider(BaseDataProvider):
         end_ms = int((end_dt_cst + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)).timestamp() * 1000)
 
         items: List[dict] = []
-        is_index = thscode.endswith(".TI") or thscode in _INDEX_CODES or (thscode.endswith(".SZ") and thscode.startswith("399"))
+        is_index = is_index_symbol(thscode) or thscode.endswith(".TI")
         is_etf = is_etf_code(thscode)
+
+        rename_map = {
+            "open_price": "Open",
+            "high_price": "High",
+            "low_price": "Low",
+            "close_price": "Close",
+            "volume": "Volume",
+        }
 
         try:
             import fuyao_client
         except ImportError as exc:
-            raise ImportError(
-                "fuyao_client could not be imported. Ensure Financial-API repository is present."
-            ) from exc
+            if is_index:
+                fuyao_client = None
+            else:
+                raise ImportError(
+                    "fuyao_client could not be imported. Ensure Financial-API repository is present."
+                ) from exc
 
         if is_index:
             # Fuyao API index historical prices (/api/a-share-index/prices/historical) only retain
@@ -533,13 +560,94 @@ class FuyaoDataProvider(BaseDataProvider):
                 )
                 effective_start_ms = min_index_start_ms
 
-            if effective_start_ms <= end_ms:
-                items = fuyao_client.index_prices_historical(
-                    thscode=thscode,
-                    start_ms=effective_start_ms,
-                    end_ms=end_ms,
-                    interval="1d",
-                )
+            df = pd.DataFrame()
+            if fuyao_client is not None and effective_start_ms <= end_ms:
+                try:
+                    items = fuyao_client.index_prices_historical(
+                        thscode=thscode,
+                        start_ms=effective_start_ms,
+                        end_ms=end_ms,
+                        interval="1d",
+                    )
+                    if items:
+                        raw_df = pd.DataFrame(items)
+                        if "date_ms" in raw_df.columns:
+                            raw_df["date"] = pd.to_datetime(raw_df["date_ms"], unit="ms", utc=True).dt.tz_convert("Asia/Shanghai").dt.normalize().dt.tz_localize(None)
+                            raw_df = raw_df.set_index("date").sort_index()
+                            for src_col, target_col in rename_map.items():
+                                if src_col in raw_df.columns:
+                                    raw_df[target_col] = raw_df[src_col].astype(float)
+                            cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in raw_df.columns]
+                            if len(cols) == 5:
+                                df = raw_df[cols]
+                except Exception:
+                    df = pd.DataFrame()
+
+            # If Fuyao returned empty or failed, fall back to BaoStock and then EastMoney
+            if df.empty:
+                try:
+                    df = BaoStockDataProvider().fetch_ohlcv(thscode, start, end, interval)
+                except Exception:
+                    df = pd.DataFrame()
+                if df.empty:
+                    try:
+                        df = EastMoneyDataProvider().fetch_ohlcv(thscode, start, end, interval)
+                    except Exception:
+                        df = pd.DataFrame()
+
+            # Pre-5y historical stitching from BaoStock if requested start is earlier than df.index.min()
+            if not df.empty and start:
+                req_start_date = pd.to_datetime(start).date()
+                if req_start_date < df.index.min().date():
+                    try:
+                        pre_df = BaoStockDataProvider().fetch_ohlcv(
+                            thscode,
+                            req_start_date.strftime("%Y-%m-%d"),
+                            df.index.min().strftime("%Y-%m-%d"),
+                            interval=interval,
+                        )
+                        if not pre_df.empty:
+                            df = pd.concat([pre_df[pre_df.index < df.index.min()], df])
+                    except Exception:
+                        pass
+
+            # Trailing recent bars stitching from EastMoney / BaoStock if df lags behind end
+            if not df.empty and end:
+                req_end_date = pd.to_datetime(end).date()
+                if req_end_date > df.index.max().date():
+                    try:
+                        post_df = EastMoneyDataProvider().fetch_ohlcv(
+                            thscode,
+                            df.index.max().strftime("%Y-%m-%d"),
+                            req_end_date.strftime("%Y-%m-%d"),
+                            interval=interval,
+                        )
+                        if post_df.empty:
+                            post_df = BaoStockDataProvider().fetch_ohlcv(
+                                thscode,
+                                df.index.max().strftime("%Y-%m-%d"),
+                                req_end_date.strftime("%Y-%m-%d"),
+                                interval=interval,
+                            )
+                        if not post_df.empty:
+                            df = pd.concat([df, post_df[post_df.index > df.index.max()]])
+                    except Exception:
+                        pass
+
+            if not df.empty:
+                df = df[~df.index.duplicated(keep="last")].sort_index()
+                if start:
+                    df = df[df.index >= pd.to_datetime(start)]
+                if end:
+                    df = df[df.index <= pd.to_datetime(end)]
+                df = _drop_invalid_ohlcv_rows(df, symbol)
+                if not df.empty:
+                    return df
+
+            raise ValueError(
+                f"No price data returned from Fuyao API / fallbacks for {symbol} ({thscode}) between {start} and {end} "
+                "(Fuyao API index history is limited to the last ~5 years)"
+            )
         elif is_etf:
             # Fuyao API fund historical prices (/api/fund/market/historical) only retain ~5 years
             # of rolling history, and requires that end_ms <= _five_year_limit_ms(start_ms).
@@ -603,11 +711,7 @@ class FuyaoDataProvider(BaseDataProvider):
             )
 
         if not items:
-            extra = ""
-            if is_index:
-                extra = " (Fuyao API index history is limited to the last ~5 years)"
-            elif is_etf:
-                extra = " (Fuyao API fund/ETF history is limited to the last ~5 years)"
+            extra = " (Fuyao API fund/ETF history is limited to the last ~5 years)" if is_etf else ""
             raise ValueError(f"No price data returned from Fuyao API for {symbol} ({thscode}) between {start} and {end}{extra}")
 
         df = pd.DataFrame(items)
@@ -617,13 +721,6 @@ class FuyaoDataProvider(BaseDataProvider):
         df["date"] = pd.to_datetime(df["date_ms"], unit="ms", utc=True).dt.tz_convert("Asia/Shanghai").dt.normalize().dt.tz_localize(None)
         df = df.set_index("date").sort_index()
 
-        rename_map = {
-            "open_price": "Open",
-            "high_price": "High",
-            "low_price": "Low",
-            "close_price": "Close",
-            "volume": "Volume",
-        }
         for src_col, target_col in rename_map.items():
             if src_col in df.columns:
                 df[target_col] = df[src_col].astype(float)
@@ -666,6 +763,22 @@ class FuyaoDataProvider(BaseDataProvider):
         if local_df is None:
             final_df = self._fetch_remote_ohlcv(symbol, start, end, interval)
         else:
+            is_index = is_index_symbol(thscode) or thscode.endswith(".TI")
+            if is_index and start:
+                req_start_dt = pd.to_datetime(start).normalize()
+                if local_df.index[0] > req_start_dt:
+                    try:
+                        pre_df = BaoStockDataProvider().fetch_ohlcv(
+                            thscode,
+                            req_start_dt.strftime("%Y-%m-%d"),
+                            local_df.index[0].strftime("%Y-%m-%d"),
+                            interval=interval,
+                        )
+                        if not pre_df.empty:
+                            local_df = pd.concat([pre_df[pre_df.index < local_df.index[0]], local_df])
+                    except Exception:
+                        pass
+
             local_max_date = local_df.index[-1]
             if local_max_date >= effective_target_end:
                 final_df = local_df
@@ -880,8 +993,27 @@ class BaoStockDataProvider(BaseDataProvider):
         "1mo": "m",
     }
 
-    def __init__(self, adjustflag: str = "2", **kwargs):
+    def __init__(self, adjustflag: str = "2", keep_logged_in: bool = False, **kwargs):
         self.adjustflag = str(adjustflag)
+        self._keep_logged_in = bool(keep_logged_in)
+        self._is_logged_in = False
+
+    def logout(self) -> None:
+        """Explicitly log out of BaoStock if keep_logged_in was used."""
+        with self._lock:
+            if self._is_logged_in:
+                try:
+                    bs = self._get_bs()
+                    bs.logout()
+                except Exception:
+                    pass
+                self._is_logged_in = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.logout()
 
     def _get_bs(self):
         try:
@@ -901,9 +1033,10 @@ class BaoStockDataProvider(BaseDataProvider):
         freq = self._BAOSTOCK_FREQ_MAP[interval]
         norm_sym = normalize_thscode(symbol)
         is_intraday = is_intraday_interval(interval)
+        is_index = is_index_symbol(norm_sym)
 
         # BaoStock does not support intraday K-lines for BSE stocks (.BJ) or broad-market indices
-        if is_intraday and (norm_sym.endswith(".BJ") or is_index_symbol(norm_sym)):
+        if is_intraday and (norm_sym.endswith(".BJ") or is_index):
             warnings.warn(
                 f"BaoStock does not support intraday bars for BSE stocks or indices ({symbol}). "
                 "Returning empty DataFrame."
@@ -913,11 +1046,16 @@ class BaoStockDataProvider(BaseDataProvider):
                 index=pd.DatetimeIndex([], name="Date"),
             )
 
-        # Strict field list restriction
+        # Strict field list restriction & adjustflag
         if is_intraday:
             fields = "date,time,code,open,high,low,close,volume,amount,adjustflag"
+            req_adjustflag = self.adjustflag
+        elif is_index:
+            fields = "date,code,open,high,low,close,preclose,volume,amount,pctChg"
+            req_adjustflag = "3"
         else:
             fields = "date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,pctChg,isST"
+            req_adjustflag = self.adjustflag
 
         start_dt = pd.to_datetime(start).date()
         end_dt = pd.to_datetime(end).date()
@@ -943,13 +1081,16 @@ class BaoStockDataProvider(BaseDataProvider):
 
         with self._lock:
             bs = self._get_bs()
-            lg = bs.login()
-            if hasattr(lg, "error_code") and lg.error_code != "0":
-                warnings.warn(f"BaoStock login failed: {getattr(lg, 'error_msg', 'unknown error')}")
-                return pd.DataFrame(
-                    columns=["Open", "High", "Low", "Close", "Volume"],
-                    index=pd.DatetimeIndex([], name="Date"),
-                )
+            if not self._keep_logged_in or not self._is_logged_in:
+                lg = bs.login()
+                if hasattr(lg, "error_code") and lg.error_code != "0":
+                    warnings.warn(f"BaoStock login failed: {getattr(lg, 'error_msg', 'unknown error')}")
+                    return pd.DataFrame(
+                        columns=["Open", "High", "Low", "Close", "Volume"],
+                        index=pd.DatetimeIndex([], name="Date"),
+                    )
+                if self._keep_logged_in:
+                    self._is_logged_in = True
             try:
                 for c_start, c_end in chunks:
                     rs = bs.query_history_k_data_plus(
@@ -958,18 +1099,38 @@ class BaoStockDataProvider(BaseDataProvider):
                         start_date=c_start,
                         end_date=c_end,
                         frequency=freq,
-                        adjustflag=self.adjustflag,
+                        adjustflag=req_adjustflag,
                     )
                     if hasattr(rs, "error_code") and rs.error_code != "0":
                         warnings.warn(f"BaoStock query error: {getattr(rs, 'error_msg', '')}")
                         continue
 
                     chunk_df = None
-                    if hasattr(rs, "get_data"):
+                    if (
+                        hasattr(rs, "data")
+                        and isinstance(getattr(rs, "data", None), list)
+                        and hasattr(rs, "cur_row_num")
+                    ):
+                        # Real BaoStock ResultData: extract page-by-page by advancing cur_row_num = len(rs.data)
+                        # (Avoids baostock's broken Pandas-1.x df.append in rs.get_data() and avoids row-by-row overhead)
+                        data_list = []
+                        if rs.data:
+                            data_list.extend(rs.data)
+                            rs.cur_row_num = len(rs.data)
+                            while getattr(rs, "error_code", "0") == "0" and rs.next():
+                                if rs.data:
+                                    data_list.extend(rs.data)
+                                    rs.cur_row_num = len(rs.data)
+                                else:
+                                    break
+                        if data_list:
+                            col_names = rs.fields if (hasattr(rs, "fields") and rs.fields) else fields.split(",")
+                            chunk_df = pd.DataFrame(data_list, columns=col_names)
+                    elif hasattr(rs, "get_data"):
                         chunk_df = rs.get_data()
                     elif hasattr(rs, "next"):
                         data_list = []
-                        while rs.error_code == "0" and rs.next():
+                        while getattr(rs, "error_code", "0") == "0" and rs.next():
                             data_list.append(rs.get_row_data())
                         if data_list:
                             chunk_df = pd.DataFrame(data_list, columns=fields.split(","))
@@ -977,10 +1138,11 @@ class BaoStockDataProvider(BaseDataProvider):
                     if chunk_df is not None and not chunk_df.empty:
                         dfs.append(chunk_df)
             finally:
-                try:
-                    bs.logout()
-                except Exception:
-                    pass
+                if not self._keep_logged_in:
+                    try:
+                        bs.logout()
+                    except Exception:
+                        pass
 
         if not dfs:
             return pd.DataFrame(
@@ -1036,6 +1198,26 @@ class BaoStockDataProvider(BaseDataProvider):
             df = df.loc[(df.index.date >= start_dt) & (df.index.date <= end_dt)]
 
         return _drop_invalid_ohlcv_rows(df, symbol)
+
+    def fetch_universe(
+        self, symbols: List[str], start: str, end: str, interval: str = "1d"
+    ) -> Dict[str, pd.DataFrame]:
+        was_logged_in = self._keep_logged_in
+        self._keep_logged_in = True
+        try:
+            res: Dict[str, pd.DataFrame] = {}
+            for sym in symbols:
+                try:
+                    df = self.fetch_ohlcv(sym, start, end, interval)
+                    if not df.empty:
+                        res[sym] = df
+                except Exception as exc:
+                    warnings.warn(f"BaoStockDataProvider failed for {sym}: {exc}")
+            return res
+        finally:
+            if not was_logged_in:
+                self._keep_logged_in = False
+                self.logout()
 
 
 class EastMoneyDataProvider(BaseDataProvider):
