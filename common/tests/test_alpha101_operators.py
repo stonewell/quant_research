@@ -3,6 +3,13 @@
 100% offline: Uses synthetic data only.
 """
 
+import os
+import sys
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -147,3 +154,32 @@ def test_signed_power_and_ternary(sample_data):
     tern = ternary(cond, 100.0, -100.0)
     assert tern.iloc[0]["A"] == -100.0
     assert tern.iloc[1]["A"] == 100.0
+
+
+def test_vwap_proxy_with_and_without_vwap():
+    dates = pd.bdate_range("2023-01-01", periods=4)
+    high = pd.DataFrame({"A": [11.0, 12.0, 13.0, 14.0], "B": [21.0, 22.0, 23.0, 24.0]}, index=dates)
+    low = pd.DataFrame({"A": [9.0, 10.0, 11.0, 12.0], "B": [19.0, 20.0, 21.0, 22.0]}, index=dates)
+    close = pd.DataFrame({"A": [10.0, 11.0, 12.0, 13.0], "B": [20.0, 21.0, 22.0, 23.0]}, index=dates)
+    typical = (high + low + close) / 3.0
+
+    # 1. Without vwap (None) -> returns typical price exactly
+    res_none = vwap_proxy(high, low, close)
+    pd.testing.assert_frame_equal(res_none, typical)
+
+    # 2. With partial-NaN vwap
+    vwap_partial = pd.DataFrame({
+        "A": [np.nan, 11.5, np.nan, 13.2],
+        "B": [20.2, np.nan, 22.1, np.nan],
+    }, index=dates)
+    res_partial = vwap_proxy(high, low, close, vwap=vwap_partial)
+
+    # Where vwap is provided, use vwap; where NaN, use typical price
+    expected = vwap_partial.fillna(typical)
+    pd.testing.assert_frame_equal(res_partial, expected)
+    # Check specific values
+    assert res_partial.loc[dates[0], "A"] == typical.loc[dates[0], "A"]
+    assert res_partial.loc[dates[1], "A"] == 11.5
+    assert res_partial.loc[dates[0], "B"] == 20.2
+    assert res_partial.loc[dates[1], "B"] == typical.loc[dates[1], "B"]
+

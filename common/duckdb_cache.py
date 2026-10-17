@@ -23,6 +23,16 @@ import pandas as pd
 
 _REQUIRED_OHLCV_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 
+_INTRADAY_INTERVALS = {"1m", "5m", "15m", "30m", "60m", "1h"}
+
+
+def is_intraday_interval(interval: str) -> bool:
+    """Returns True if the interval represents an intraday frequency."""
+    if not interval or not isinstance(interval, str):
+        return False
+    return interval.strip().lower() in _INTRADAY_INTERVALS
+
+
 # Resampling frequency mapping
 _INTERVAL_RULES: Dict[str, Optional[str]] = {
     "1d": None,
@@ -33,8 +43,8 @@ _INTERVAL_RULES: Dict[str, Optional[str]] = {
     "1w": "W-FRI",
     "weekly": "W-FRI",
     "1mo": "ME",
+    "mo": "ME",
     "m": "ME",
-    "1m": "ME",
     "monthly": "ME",
     "1q": "QE",
     "q": "QE",
@@ -47,11 +57,15 @@ _INTERVAL_RULES: Dict[str, Optional[str]] = {
 
 def _get_resample_rule(interval: str) -> Optional[str]:
     """Returns pandas resample rule or None if interval is daily."""
+    if not interval or not isinstance(interval, str):
+        return None
     norm = interval.strip().lower()
+    if is_intraday_interval(norm):
+        return None
     if norm in _INTERVAL_RULES:
         return _INTERVAL_RULES[norm]
     # Check pandas version for ME vs M
-    if norm.endswith("mo") or norm.endswith("m"):
+    if norm.endswith("mo"):
         return "ME"
     return norm
 

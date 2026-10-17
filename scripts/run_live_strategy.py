@@ -806,6 +806,43 @@ def resolve_holdings_weights_and_shares(
     return weights_dict, shares_dict, total_equity_val, cash_val
 
 
+def apply_intraday_distribution_gate(
+    target_series: pd.Series,
+    current_series: pd.Series,
+    cash_proxy: str,
+    health_report: Optional[Dict[str, Any]] = None,
+    account_state: Optional[Dict[str, Any]] = None,
+) -> pd.Series:
+    """Applies Stage 1 intraday distribution gating to target weights.
+
+    When gate_code is 'CAUTION_INTRADAY_DISTRIBUTION', all Phase 1 sell orders remain
+    100% untouched, but buy increments (target > current) for non-cash assets are scaled down
+    by intraday_buy_scale (default 0.50). The unallocated weight automatically sweeps into cash.
+    """
+    health_report = health_report or {}
+    account_state = account_state or {}
+    gate_code = health_report.get("gate_code") or account_state.get("gate_code")
+    if gate_code != "CAUTION_INTRADAY_DISTRIBUTION":
+        return target_series
+
+    intraday_buy_scale = float(
+        health_report.get("intraday_buy_scale", account_state.get("intraday_buy_scale", 0.50))
+    )
+    print("\n" + "!" * 110)
+    print(f"[INTRADAY DISTRIBUTION ALERT / 日内冲高派发预警] 检测到 Stage 1 门禁指令: CAUTION_INTRADAY_DISTRIBUTION")
+    print(f"根据实盘风控守则，所有 Phase 1 卖单正常执行，新开/加仓风险资产的目标买入增量压缩至: {intraday_buy_scale:.1%}")
+    print("!" * 110 + "\n")
+
+    scaled_target = target_series.copy()
+    for s in scaled_target.index:
+        if s != cash_proxy and scaled_target[s] > current_series.get(s, 0.0):
+            cur_w = float(current_series.get(s, 0.0))
+            delta_w = float(scaled_target[s]) - cur_w
+            scaled_target[s] = cur_w + delta_w * intraday_buy_scale
+
+    return scaled_target
+
+
 def main():
     args = parse_args()
     as_of_date = args.as_of_date or date.today().isoformat()
@@ -833,6 +870,15 @@ def main():
                 account_state = json.load(f)
         except Exception as e:
             print(f"[WARN] Failed to read account state from {args.account_state_file}: {e}")
+
+    health_report = {}
+    if args.health_report_file and os.path.exists(args.health_report_file):
+        try:
+            with open(args.health_report_file, "r", encoding="utf-8") as f:
+                health_report = json.load(f)
+            print(f"[INFO] 成功读取 Stage 1 门禁报告: {args.health_report_file}")
+        except Exception as e:
+            print(f"[WARN] Failed to read health report from {args.health_report_file}: {e}")
 
     # Resolve portfolio NAV: priority CLI > account_state.json current_nav > default 100,000
     if args.portfolio_value is None:
@@ -929,17 +975,21 @@ def main():
         print(f"\n[INFO] 今日 ({as_of_date}) 非模型既定调仓日 (最近调仓信号日: {latest_rebal_date})。")
         print(f"       将严格执行最低持仓锁定期 (min_holding_bars={min_holding_bars})，锁定未满期持仓，避免日内/隔日频繁反向开平仓。")
 
-    # Check circuit breaker from account_state
-    circuit_tier = account_state.get("circuit_breaker_tier")
-    freeze_rem = int(account_state.get("freeze_remaining_bars", 0))
+    # Check circuit breaker from account_state or health_report
+    circuit_tier = account_state.get("circuit_breaker_tier") or health_report.get("circuit_breaker_tier")
+    freeze_rem = int(account_state.get("freeze_remaining_bars", health_report.get("freeze_remaining_bars", 0)))
     if circuit_tier == "TIER_3_HALT" or freeze_rem > 0:
         print("\n" + "!" * 110)
         print(f"[CIRCUIT BREAKER ENGAGED / 熔断器生效] 账户处于第三级熔断停牌期 (Tier 3 Emergency Halt, 剩余冷冻: {freeze_rem} 交易日)")
         print("根据风控守则，所有风险标的持仓清零，全额切换为现金停泊 (100% Cash Sweep).")
         print("!" * 110 + "\n")
         current_targets = pd.Series(0.0, index=current_targets.index)
-    elif account_state.get("linear_equity_scale") is not None:
-        live_scale = float(account_state["linear_equity_scale"])
+    elif account_state.get("linear_equity_scale") is not None or health_report.get("linear_equity_scale") is not None:
+        live_scale = float(
+            account_state.get("linear_equity_scale")
+            if account_state.get("linear_equity_scale") is not None
+            else health_report.get("linear_equity_scale")
+        )
         if live_scale < 0.999:
             print(f"[RISK DAMPING / 风险阻尼] 根据账户实盘回撤，线性压缩股票仓位比例至: {live_scale:.1%}")
             current_targets = current_targets * live_scale
@@ -968,6 +1018,15 @@ def main():
     all_symbols = sorted(list(set(current_targets.index).union(set(reference.index))))
     target_series = current_targets.reindex(all_symbols, fill_value=0.0)
     current_series = reference.reindex(all_symbols, fill_value=0.0)
+
+    # Apply Stage 1 intraday distribution gating (CAUTION_INTRADAY_DISTRIBUTION)
+    target_series = apply_intraday_distribution_gate(
+        target_series,
+        current_series,
+        cash_proxy,
+        health_report=health_report,
+        account_state=account_state,
+    )
 
     # 5. Build Execution Order Plan
     # Compute implied cash weight: strategy outputs equity weights, remainder is cash

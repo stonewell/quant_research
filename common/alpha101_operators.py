@@ -34,12 +34,21 @@ def _to_int_days(d: Union[int, float]) -> int:
     return max(1, val)
 
 
-def vwap_proxy(high: pd.DataFrame, low: pd.DataFrame, close: pd.DataFrame,
-               volume: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+def vwap_proxy(
+    high: pd.DataFrame,
+    low: pd.DataFrame,
+    close: pd.DataFrame,
+    volume: Optional[pd.DataFrame] = None,
+    vwap: Optional[Union[pd.DataFrame, pd.Series]] = None,
+) -> Union[pd.DataFrame, pd.Series]:
     """Computes typical price proxy for VWAP when intraday tick data is unavailable:
-    (High + Low + Close) / 3.
+    (High + Low + Close) / 3. If real intraday vwap is provided, falls back to typical
+    price only where vwap is NaN.
     """
-    return (high + low + close) / 3.0
+    typical = (high + low + close) / 3.0
+    if vwap is not None:
+        return vwap.fillna(typical)
+    return typical
 
 
 def adv(volume: pd.DataFrame, close: pd.DataFrame, d: Union[int, float]) -> pd.DataFrame:

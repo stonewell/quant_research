@@ -22,6 +22,7 @@ from scripts.run_live_strategy import (
     resolve_holdings_weights_and_shares,
     load_symbol_names,
     parse_args,
+    apply_intraday_distribution_gate,
 )
 
 
@@ -172,3 +173,90 @@ def test_resolve_holding_bars_history_directory(tmp_path):
     assert res["601872.SH"] == 1
     # 601288.SH was held on 2026-10-11
     assert res["601288.SH"] >= 1
+
+
+def test_apply_intraday_distribution_gate_scaling():
+    """Verifies that CAUTION_INTRADAY_DISTRIBUTION scales buy increments down by intraday_buy_scale
+    while leaving all sell orders and holds 100% untouched.
+    """
+    target = pd.Series({"SYM_SELL": 0.10, "SYM_BUY": 0.20, "SYM_ADD": 0.30, "SYM_HOLD": 0.15, "BIL": 0.25})
+    current = pd.Series({"SYM_SELL": 0.20, "SYM_BUY": 0.00, "SYM_ADD": 0.10, "SYM_HOLD": 0.15, "BIL": 0.55})
+
+    # Case 1: Normal gate_code -> no scaling applied
+    normal_report = {"gate_code": "NORMAL"}
+    res_normal = apply_intraday_distribution_gate(target, current, cash_proxy="BIL", health_report=normal_report)
+    pd.testing.assert_series_equal(res_normal, target)
+
+    # Case 2: CAUTION_INTRADAY_DISTRIBUTION with intraday_buy_scale = 0.50 from health_report
+    dist_report = {"gate_code": "CAUTION_INTRADAY_DISTRIBUTION", "intraday_buy_scale": 0.50}
+    res_dist = apply_intraday_distribution_gate(target, current, cash_proxy="BIL", health_report=dist_report)
+
+    # SYM_SELL: current 0.20 -> target 0.10 (sell order) must be 100% UNTOUCHED
+    assert res_dist["SYM_SELL"] == pytest.approx(0.10)
+    # SYM_BUY: current 0.00 -> target 0.20 (buy increment +0.20) scaled by 50% -> 0.00 + 0.20 * 0.5 = 0.10
+    assert res_dist["SYM_BUY"] == pytest.approx(0.10)
+    # SYM_ADD: current 0.10 -> target 0.30 (buy increment +0.20) scaled by 50% -> 0.10 + 0.20 * 0.5 = 0.20
+    assert res_dist["SYM_ADD"] == pytest.approx(0.20)
+    # SYM_HOLD: current 0.15 -> target 0.15 (no change) remains 0.15
+    assert res_dist["SYM_HOLD"] == pytest.approx(0.15)
+    # BIL: cash proxy remains untouched by the asset loop
+    assert res_dist["BIL"] == pytest.approx(0.25)
+
+
+def test_apply_intraday_distribution_gate_cash_sweep():
+    """Verifies that unallocated buying weight from intraday distribution scaling
+    sweeps 100% into implied cash.
+    """
+    cash_proxy = "BIL"
+    current = pd.Series({"SYM_SELL": 0.20, "SYM_BUY": 0.00, "SYM_ADD": 0.10, "SYM_HOLD": 0.15, cash_proxy: 0.55})
+    target = pd.Series({"SYM_SELL": 0.10, "SYM_BUY": 0.20, "SYM_ADD": 0.30, "SYM_HOLD": 0.15})
+
+    # Un-gated implied cash:
+    # equity_weight_sum = 0.10 + 0.20 + 0.30 + 0.15 = 0.75 -> implied cash = 0.25
+    dist_report = {"gate_code": "CAUTION_INTRADAY_DISTRIBUTION", "intraday_buy_scale": 0.50}
+    gated_target = apply_intraday_distribution_gate(target, current, cash_proxy=cash_proxy, health_report=dist_report)
+
+    # Compute implied cash weight as done in Stage 2 runner:
+    equity_weight_sum = sum(float(gated_target[s]) for s in gated_target.index if s != cash_proxy)
+    implied_cash_weight = max(0.0, 1.0 - equity_weight_sum)
+    gated_target[cash_proxy] = implied_cash_weight
+
+    # Gated equity sum: 0.10 + 0.10 + 0.20 + 0.15 = 0.55
+    assert equity_weight_sum == pytest.approx(0.55)
+    # Implied cash weight must absorb the freed 0.20 weight -> 1.0 - 0.55 = 0.45
+    assert gated_target[cash_proxy] == pytest.approx(0.45)
+    # Total portfolio weight must sum to 1.0
+    assert sum(gated_target.values) == pytest.approx(1.0)
+
+
+def test_apply_intraday_distribution_gate_account_state_fallback():
+    """Verifies fallback to account_state when health_report has no gate_code."""
+    current = pd.Series({"A": 0.0, "BIL": 1.0})
+    target = pd.Series({"A": 0.40})
+    account_state = {"gate_code": "CAUTION_INTRADAY_DISTRIBUTION", "intraday_buy_scale": 0.25}
+
+    gated = apply_intraday_distribution_gate(target, current, cash_proxy="BIL", account_state=account_state)
+    # Buy increment 0.40 scaled by 0.25 -> 0.10
+    assert gated["A"] == pytest.approx(0.10)
+
+
+def test_health_report_file_parsing(tmp_path):
+    """Verifies that health_report_file JSON path is parsed and loaded correctly."""
+    report_file = tmp_path / "stage1_health_report.json"
+    data = {
+        "gate_code": "CAUTION_INTRADAY_DISTRIBUTION",
+        "intraday_buy_scale": 0.50,
+        "circuit_breaker_tier": "TIER_1_WARNING",
+    }
+    with open(report_file, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+    args = parse_args(["--strategy", "equal_weight", "--health-report-file", str(report_file)])
+    assert os.path.exists(args.health_report_file)
+    with open(args.health_report_file, "r", encoding="utf-8") as f:
+        loaded = json.load(f)
+    assert loaded["gate_code"] == "CAUTION_INTRADAY_DISTRIBUTION"
+    assert loaded["intraday_buy_scale"] == 0.50
+    assert loaded["circuit_breaker_tier"] == "TIER_1_WARNING"
+
+

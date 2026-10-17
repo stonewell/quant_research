@@ -112,10 +112,15 @@ class Alpha101Data:
             else:
                 v = pd.Series(1e6, index=master_index)
 
+            typical_price = (h + l + c) / 3.0
             if "VWAP" in df.columns:
-                vw = df["VWAP"].ffill().bfill()
+                # HONEST CAVEAT (R3): Never use .bfill() (lookahead leak across years) or .ffill() (carries stale
+                # prior-day price across 5m coverage gaps). Note: on partial-history universes where 5m coverage
+                # starts mid-sample, rolling ts_rank/correlation windows spanning the start date transition from
+                # typical_price to true 5m VWAP (~20 bars).
+                vw = df["VWAP"].fillna(typical_price)
             else:
-                vw = (h + l + c) / 3.0
+                vw = typical_price
 
             open_dict[sym] = o
             high_dict[sym] = h

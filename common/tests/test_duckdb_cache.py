@@ -20,6 +20,8 @@ from common.duckdb_cache import (
     DuckDBCache,
     is_synthetic_provider,
     resample_ohlcv,
+    is_intraday_interval,
+    _get_resample_rule,
 )
 
 
@@ -214,3 +216,43 @@ def test_is_range_covered_checks_last_sync_time_for_latest_data(mem_cache):
     mem_cache.store_bars("TestProvider", "AAPL", df, sync_time=today_sync)
     assert mem_cache.is_range_covered("TestProvider", "AAPL", start="2024-01-01", end=None, now=today_time) is True
     assert mem_cache.is_range_covered("TestProvider", "AAPL", start="2024-01-01", end="2024-01-03", now=today_time) is True
+
+
+def test_intraday_interval_resampling_rules():
+    """Verifies is_intraday_interval and _get_resample_rule mapping for intraday,
+    daily, weekly, and monthly frequencies.
+    """
+    intraday_intervals = ["1m", "5m", "15m", "30m", "60m", "1h"]
+    for interval in intraday_intervals:
+        assert is_intraday_interval(interval) is True, f"{interval} should be recognized as intraday"
+        # Never upsample daily bars to intraday intervals
+        assert _get_resample_rule(interval) is None, f"{interval} should not have a resample rule"
+
+    # Daily frequencies
+    for daily_inv in ["1d", "d", "daily"]:
+        assert is_intraday_interval(daily_inv) is False
+        assert _get_resample_rule(daily_inv) is None
+
+    # Weekly frequencies
+    for weekly_inv in ["1wk", "w", "1w", "weekly"]:
+        assert is_intraday_interval(weekly_inv) is False
+        assert _get_resample_rule(weekly_inv) == "W-FRI"
+
+    # Monthly frequencies
+    monthly_intervals = ["1mo", "mo", "m", "monthly"]
+    for monthly_inv in monthly_intervals:
+        assert is_intraday_interval(monthly_inv) is False
+        assert _get_resample_rule(monthly_inv) == "ME"
+
+    # Edge cases
+    assert is_intraday_interval("") is False
+    assert is_intraday_interval(None) is False
+    assert _get_resample_rule("") is None
+    assert _get_resample_rule(None) is None
+
+    # Verify resample_ohlcv with intraday does not resample to month-end or raise
+    df = _make_sample_ohlcv("2024-01-01", periods=5)
+    for interval in ["1m", "5m", "15m"]:
+        res = resample_ohlcv(df, interval)
+        assert len(res) == len(df), f"resample_ohlcv({interval}) should leave daily DataFrame untouched"
+

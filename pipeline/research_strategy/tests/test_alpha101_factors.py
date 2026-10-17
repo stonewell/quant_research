@@ -70,3 +70,36 @@ def test_invalid_alpha_id_raises_value_error(synthetic_alpha_data):
         compute_alpha(0, synthetic_alpha_data)
     with pytest.raises(ValueError, match="Unknown alpha_id: 102"):
         compute_alpha(102, synthetic_alpha_data)
+
+
+def test_alpha101_data_from_universe_vwap_no_lookahead():
+    """Verifies that Alpha101Data.from_universe falls back to typical price (H+L+C)/3
+    when VWAP is NaN, without leaking future VWAP backwards via bfill() or carrying
+    stale prior-day VWAP across gaps via ffill().
+    """
+    dates = pd.bdate_range("2023-01-01", periods=6)
+    # Day 0, 1: VWAP is NaN. Day 2: VWAP = 999.0. Day 3: VWAP is NaN. Day 4, 5: VWAP = 500.0.
+    df = pd.DataFrame({
+        "Open": [10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
+        "High": [12.0, 22.0, 32.0, 42.0, 52.0, 62.0],
+        "Low": [8.0, 18.0, 28.0, 38.0, 48.0, 58.0],
+        "Close": [10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
+        "Volume": [1000.0] * 6,
+        "VWAP": [np.nan, np.nan, 999.0, np.nan, 500.0, 500.0],
+    }, index=dates)
+
+    universe = {"TEST": df}
+    data = Alpha101Data.from_universe(universe)
+
+    # Typical price for each day is (High + Low + Close) / 3
+    # Day 0: (12 + 8 + 10) / 3 = 10.0
+    # Day 1: (22 + 18 + 20) / 3 = 20.0
+    # Day 2: VWAP is 999.0
+    # Day 3: VWAP is NaN -> typical price (42 + 38 + 40) / 3 = 40.0 (NOT 999.0 from ffill!)
+    # Day 4: VWAP is 500.0
+    # Day 5: VWAP is 500.0
+    expected_vwap = [10.0, 20.0, 999.0, 40.0, 500.0, 500.0]
+
+    actual_vwap = data.vwap["TEST"].tolist()
+    assert np.allclose(actual_vwap, expected_vwap)
+
