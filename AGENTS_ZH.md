@@ -94,3 +94,4 @@ uv run python run_pipeline.py --data-provider synthetic --universe SPY QQQ ...
 - 注释解释*为什么 (Why)*，通常会指出当前代码形式所修复的具体历史 Bug--在修改附近代码时请勿将这些注释作为“显而易见”的内容删掉。
 - 优先复用现有的共享原语（`common/indicators.py`, `common/allocation_search.py`, `common/covariance.py`, `common/scheduling.py`, `common/testing.py`），避免重复实现已存在的数学逻辑。
 - Git 提交信息需保持简洁、小写、现在时态摘要（例如 "add chan pivot", "add denoise"）。
+- **任务拆解与路线图唯一权威中心 (`docs/development_plan.md`)：** 整个代码库的所有定量研究、基础设施升级、高频特征提取、多流派策略研发及实盘交易护栏工程的任务拆解、状态跟踪、优先级队列与执行路线图，必须且仅在 `docs/development_plan.md` 中集中维护。`docs/` 下的各专项研究与架构设计方案仅承载理论建模、代码审计与模块详设，任务清单与进度编排统一查阅 `docs/development_plan.md`。

@@ -164,6 +164,12 @@ This codebase is unusually disclosure-heavy -- match it, don't strip it out:
 - Git commit messages in this repo are terse, lowercase, present-tense summaries (e.g. "add chan
   pivot", "add denoise", "pattern mining merge with current strategy gen instead of separated
   pipeline").
+- **Single Source of Truth for task breakdowns & roadmaps (`docs/development_plan.md`):** All
+  quantitative engineering task breakdowns, status tracking, priority queues, and execution
+  roadmaps must be centralized exclusively in `docs/development_plan.md` (in Chinese). Individual
+  architecture and research plan documents in `docs/` should contain only theoretical modeling,
+  codebase audits, and module specifications, and must link to `docs/development_plan.md` for task
+  lists and execution tracking.
 
 ## Known pre-existing issues (not yet fixed -- don't be alarmed)
 

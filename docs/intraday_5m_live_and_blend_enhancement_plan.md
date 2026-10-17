@@ -2,7 +2,7 @@
 # (Deep Analysis & Implementation Plan: 5-Minute Intraday Data Enhancement for Live Trading Go/No-Go & Modular Blend Strategies)
 
 > [!IMPORTANT]
-> **2026-10-17 评审修订（二轮终审已全量合入正文）**：本方案已完成两轮代码级深度评审，所有修订项（R1–R14 及 §9.3 细节澄清：截断 bar 数、钉扎式布朗桥、VWAP `ffill` 泄漏与结构断点披露、跨源复权与截断时点无量纲对齐 R4/R6、`DuckDBCache` 日期型 `end` 截断当天 48 根 K 线修复 R13、盘中 HWM 回测一致性 R5、5m 缠论按需惰性求值 R9、涨跌停精确判据与 Phase 4 现金归集防透支 R10/R14、主动/被动双限价引导 R11、合成日线 `Is_Partial_Bar` 标记 R12、开关默认关闭 R7 及 Phase 0 / Phase 6 消融验证）**均已直接合入第一至第八章正文规范**，完整对照表见 [第九章 评审修订记录](#九-评审修订记录与待办-review-amendments--open-items-2026-10-17)。
+> **2026-10-17 评审修订（二轮终审已全量合入正文）**：本方案已完成两轮代码级深度评审，所有修订项（R1–R14 及 §8.3 细节澄清：截断 bar 数、钉扎式布朗桥、VWAP `ffill` 泄漏与结构断点披露、跨源复权与截断时点无量纲对齐 R4/R6、`DuckDBCache` 日期型 `end` 截断当天 48 根 K 线修复 R13、盘中 HWM 回测一致性 R5、5m 缠论按需惰性求值 R9、涨跌停精确判据与 Phase 4 现金归集防透支 R10/R14、主动/被动双限价引导 R11、合成日线 `Is_Partial_Bar` 标记 R12、开关默认关闭 R7 及 Phase 0 / Phase 6 消融验证）**均已直接合入第一至第七章正文规范**，完整对照表见 [第八章 评审修订记录](#八-评审修订记录与待办-review-amendments--open-items-2026-10-17)。
 
 ---
 
@@ -625,23 +625,12 @@ flowchart LR
     blend_intraday_cutoff_time: Optional[str] = "14:15"  # R6: 回测与实盘统一信息集截断（Stage 1 实盘传 "14:00"）；None = 全天 15:00（含前视优势，仅供对照）
 ```
 
----
-
-## 七、 分阶段落地路线图与改动文件清单 (Phased Implementation Roadmap & File Manifest)
-
-| 阶段 | 目标模块 | 涉及文件路径 | 操作类型 | 核心交付内容 |
-| :--- | :--- | :--- | :--- | :--- |
-| **Phase 0**（评审新增，可立即合并） | 独立 Bug 修复 | [`common/duckdb_cache.py`](file:///home/stone/Work/github/quant/common/duckdb_cache.py)<br>[`pipeline/research_strategy/rs/alpha101_factors.py`](file:///home/stone/Work/github/quant/pipeline/research_strategy/rs/alpha101_factors.py)<br>[`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py) | `MODIFY` | 1. 修复 `_get_resample_rule("5m"/"1m")` 误映射 `"ME"`；<br>2. `Alpha101Data.from_universe` 改为 `df["VWAP"].fillna(typical_price)`（去除 `ffill().bfill()`）；<br>3. Stage 2 实际读取 `--health-report-file`。三者与 5m 功能解耦，附离线单测即可合并。 |
-| **Phase 1** | 三层混合数据与缓存底座 | [`common/duckdb_cache.py`](file:///home/stone/Work/github/quant/common/duckdb_cache.py)<br>[`common/data.py`](file:///home/stone/Work/github/quant/common/data.py)<br>[`common/financial_api.py`](file:///home/stone/Work/github/quant/common/financial_api.py)<br>`scripts/record_intraday_5m.py`<br>[`pipeline/pyproject.toml`](file:///home/stone/Work/github/quant/pipeline/pyproject.toml) | `MODIFY`<br>`MODIFY`<br>`MODIFY`<br>`NEW`<br>`MODIFY` | 1. 修复 `_INTERVAL_RULES` (`"1m": "ME"`) 与 `_get_resample_rule("5m")` 误映射 `"ME"` 的 Bug；<br>2. 新增 `intraday_ohlcv_bars` 与 `intraday_sync_metadata` DuckDB 缓存表（`TIMESTAMP` 主键）；<br>3. 升级 `CachedDataProvider.fetch_ohlcv` 与 `fetch_universe` 支持分钟级缓存读写；<br>4. 扩展 `SyntheticDataProvider` 支持与日线严格对齐的 48根/日 5m 极值锁定布朗桥合成数据；<br>5. 新增 `BaoStockDataProvider`（`--data-provider baostock`，$T-1$ 深度历史底座）与 `EastMoneyDataProvider`（`--data-provider eastmoney`，盘中实时+近30日 5m 直连，含 `O-C-H-L` 矫正与 `Volume=f56*100` 量纲转换）；<br>6. 新增 `scripts/record_intraday_5m.py`（基于 `fuyao_client` 批量实时快照差分合成 5m 桶 + 无锁原子 Parquet 落盘 + 东财空洞回补）。 |
-| **Phase 2** | 5m 日内特征与算子库 | [`common/intraday_features.py`](file:///home/stone/Work/github/quant/common/intraday_features.py)<br>[`common/alpha101_operators.py`](file:///home/stone/Work/github/quant/common/alpha101_operators.py)<br>[`pipeline/research_strategy/rs/alpha101_factors.py`](file:///home/stone/Work/github/quant/pipeline/research_strategy/rs/alpha101_factors.py) | `NEW`<br>`MODIFY`<br>`MODIFY` | 1. 实现 `compute_daily_intraday_features`、`enrich_universe_with_intraday_features` 与三层桥接器 `load_intraday_5m_universe`（含时点因果截断器 `cutoff_time` 与成交量季节性外推校正）；<br>2. 计算纯日内 `VWAP`, `RV_5m`, `RS_Down_5m`, `BPV_5m`, `UpVol_Ratio_5m`, 剥离隔夜跳空的 `SmartMoney_Q_5m`, 以及因果截断窗口下的 `Chan_5m_Buy_Confluence`, `Chan_5m_Sell_Trigger`；<br>3. 修复 `Alpha101Data.from_universe` 中对 `VWAP` 误用 `.bfill()` 的前视偏差，升级 `vwap_proxy`。 |
-| **Phase 3** | Blend 混合策略引擎升级 | [`pipeline/research_strategy/rs/config.py`](file:///home/stone/Work/github/quant/pipeline/research_strategy/rs/config.py)<br>[`pipeline/research/blend/blend_base.py`](file:///home/stone/Work/github/quant/pipeline/research/blend/blend_base.py) | `MODIFY` | 1. 在 `BaseBlendAllocationStrategy` 中接入缠论日线 $\times$ 5m 区间套（首日共振加速入场 + 5m 破位否决）；<br>2. 升级 `vol_surge_matrix` 为有符号主买量能共振（对历史 `NaN` 100% 兼容回退）；<br>3. 接入 5m 下行半方差风险平价/波动率目标缩放与 5m 防毛刺止损/三卖止盈；<br>4. 严格保持稀疏权重 `NaN` vs `0.0` 契约。 |
-| **Phase 4** | 实盘 Stage 1 & Stage 2 升级 | [`scripts/check_live_portfolio_health.py`](file:///home/stone/Work/github/quant/scripts/check_live_portfolio_health.py)<br>[`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py) | `MODIFY` | 1. Stage 1 增加 14:00 盘中 5m 净值轨迹回撤检测、日内 VWAP 宽度、午后跳水门禁（`CAUTION_INTRADAY_DISTRIBUTION`）与下行半方差目标波动率，并将状态同步至 `account_state.json`；<br>2. Stage 2 增加 Stage 1 派发警戒联动、14:15 卖单分板块跌停封死购买力冻结、买单 T+1 涨停/透支拦截与限价单引导字段。 |
-| **Phase 5** | 离线单元测试与回归验证 | `common/tests/test_intraday_features.py`<br>`pipeline/research_strategy/tests/test_blend_intraday_5m.py` | `NEW` | 100% 离线合成数据与 Mock 测试（遵循 `AGENTS.md` 严禁网络调用的测试铁律），验证因果截断、缓存读写、东财/BaoStock/快照合成解析、稀疏权重契约及 Go/No-Go 门禁状态转换。 |
-| **Phase 6**（评审新增，开关默认值翻转前置门槛） | Walkforward 消融与过拟合验证 | `pipeline/research/blend/experiments/`（walkforward 配置）<br>`walkforward-audit` skill | `NEW` | 1. 对增强 4.1–4.5 及 Stage 1/2 护栏逐项 on/off 消融，统一 `blend_intraday_cutoff_time="14:15"`；<br>2. 按尝试变体数校正的 DSR；<br>3. 仅对最终胜出配置跑**一次** ERS（遵循 `AGENTS.md`）；<br>4. 用 `walkforward-audit` 做 LOO 资产脆弱性与过拟合评分；<br>5. 5m 覆盖不足（如 ETF 仅约 9 个月）的 universe 不得作为开启依据。 |
+> [!NOTE]
+> **全局落地路线图与原子任务跟踪**：本方案的分阶段任务拆解（`T0.1`–`T6.2` 共 19 个任务）及合并优先级路线图已全量收敛至全局唯一权威总表 [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md)。原子任务进度、前置依赖与五级主优先级编排请统一查阅总表。
 
 ---
 
-## 八、 验证与离线测试方案 (Verification & Offline Testing Plan)
+## 七、 验证与离线测试方案 (Verification & Offline Testing Plan)
 
 严格遵循 [`AGENTS.md`](file:///home/stone/Work/github/quant/AGENTS.md) 的测试准则（所有测试 100% 离线运行于 `SyntheticDataProvider` 或离线 Mock，绝不发起真实网络请求）：
 
@@ -686,7 +675,7 @@ uv run --project pipeline python scripts/run_live_strategy.py \
 
 ---
 
-## 九、 评审修订记录与待办 (Review Amendments & Open Items, 2026-10-17)
+## 八、 评审修订记录与待办 (Review Amendments & Open Items, 2026-10-17)
 
 > [!NOTE]
 > 第二章的代码审计结论已逐项对照源码核实无误（`_INTERVAL_RULES` 的 `"1m": "ME"` 与 `.endswith("m")` 兜底、`financial_api.py` 五处 `interval != "1d"` 与 L584 `.dt.normalize()`、`alpha101_factors.py` L116 `.ffill().bfill()`、`run_live_strategy.py` 定义但从未读取 `--health-report-file`）。经过两轮深度评审，**全部 14 项核心修订（R1–R14）及 §9.3 细节澄清均已直接合入第一至第八章正文规范**，正文与本章 100% 自洽。
@@ -722,13 +711,3 @@ uv run --project pipeline python scripts/run_live_strategy.py \
 - **东财 `f56` 单位与 `"1h"` 别名**：已在模块 1.5 中加入 `"1h": "60"` 映射及 `not is_index_symbol(symbol)` 的隐含均价硬断言校验。
 - **快照采集器特殊时段与存储规模治理**：已在模块 1.6 中明确 `09:25` 竞价基线、`11:30–13:00` 午休静默、`14:57–15:00` 收盘竞价归并，以及 DuckDB 仅存目标 Universe + 全市场 Parquet 90 日滚动保留策略。
 
-### 9.4 修订后的落地顺序
-
-```mermaid
-flowchart LR
-    P0["Phase 0: 独立 Bug 修复\n(resample / VWAP bfill / health report)"] --> P1["Phase 1: 分钟缓存表 (含 R4/R13) +\n钉扎式合成 5m + 离线 Mock provider"]
-    P1 --> P2["Phase 2: intraday_features.py\n(回测/实盘统一 14:15 截断 + κ_t 复权对齐)"]
-    P2 --> P34["Phase 3/4: Blend 与实盘增强\n(默认关闭 R7 + Phase 2/4 双向防透支 R14)"]
-    P34 --> P5["Phase 5: 离线单测 (测试 1–10)"]
-    P5 --> P6["Phase 6: Walkforward 消融 + DSR + ERS\n(通过后方可翻转默认值)"]
-```
