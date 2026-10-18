@@ -3,10 +3,15 @@
 import os
 import re
 import shutil
+import sys
 import tempfile
 import time
 import warnings
 from unittest.mock import MagicMock, patch
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import numpy as np
 import pandas as pd
@@ -761,4 +766,142 @@ def test_cached_data_provider_raises_instead_of_silently_returning_empty(temp_cs
     # "this symbol failed" path already behaves.
     universe = cached_provider.fetch_universe(["SPY"], start="2020-01-01", end="2020-01-10")
     assert universe == {}
+
+
+def test_fundamental_metrics_dataclass():
+    """Verify FundamentalMetrics frozen dataclass contract and defaults."""
+    from common.data import FundamentalMetrics
+    from dataclasses import FrozenInstanceError
+
+    metrics = FundamentalMetrics(
+        symbol="AAPL",
+        report_year=2023,
+        stat_date="2023-09-30",
+        roe=1.5,
+        net_profit=97000000000.0,
+        net_profit_5yr_cagr=0.10,
+        cfo=110000000000.0,
+        cfo_to_net_profit=1.13,
+        total_assets=352000000000.0,
+        total_liabilities=290000000000.0,
+        debt_to_assets=0.82,
+        debt_to_equity=4.67,
+        interest_bearing_debt=100000000000.0,
+        dividend_yield=0.005,
+        dividend_payout_ratio=0.15,
+        pe_ttm=29.0,
+        pb=45.0,
+        total_shares=15500000000.0,
+        market_cap=2800000000000.0,
+    )
+    assert metrics.symbol == "AAPL"
+    assert metrics.industry_name == "Unknown"
+    assert metrics.industry_tier == "tier3_manufacturing"
+    assert metrics.terminal_pe == 10.0
+    assert metrics.is_blacklisted is False
+    assert metrics.blacklist_reason is None
+
+    with pytest.raises(FrozenInstanceError):
+        metrics.roe = 2.0
+
+
+def test_base_provider_fetch_financial_indicators_defaults():
+    """Verify BaseDataProvider returns NaN-filled FundamentalMetrics without raising."""
+    provider = SyntheticDataProvider()
+    metrics = provider.fetch_financial_indicators("TEST", as_of_date="2023-12-31")
+    assert metrics.symbol == "TEST"
+    assert metrics.report_year == 2023
+    assert metrics.stat_date == "2023-12-31"
+    assert np.isnan(metrics.roe)
+    assert np.isnan(metrics.net_profit)
+    assert np.isnan(metrics.cfo)
+    assert np.isnan(metrics.debt_to_equity)
+    assert np.isnan(metrics.pe_ttm)
+
+
+@patch("yfinance.Ticker")
+def test_yfinance_fetch_financial_indicators(mock_ticker):
+    """Verify YFinanceDataProvider extracts financial metrics from .info and statements."""
+    ticker_inst = MagicMock()
+    ticker_inst.info = {
+        "returnOnEquity": 0.28,
+        "trailingPE": 22.5,
+        "priceToBook": 5.4,
+        "dividendYield": 0.02,
+        "payoutRatio": 0.45,
+        "sharesOutstanding": 1000000000,
+        "marketCap": 50000000000,
+        "totalDebt": 10000000000,
+        "debtToEquity": 80.0,  # 80%
+        "industry": "Beverages",
+    }
+    dates = pd.to_datetime(["2023-12-31", "2022-12-31", "2021-12-31"])
+    ticker_inst.financials = pd.DataFrame(
+        {"2023-12-31": [1000000000.0], "2022-12-31": [900000000.0], "2021-12-31": [800000000.0]},
+        index=["Net Income Common Stockholders"],
+    )
+    ticker_inst.cashflow = pd.DataFrame(
+        {"2023-12-31": [1200000000.0]},
+        index=["Operating Cash Flow"],
+    )
+    ticker_inst.balance_sheet = pd.DataFrame(
+        {"2023-12-31": [20000000000.0, 10000000000.0]},
+        index=["Total Assets", "Total Liabilities Net Minority Interest"],
+    )
+    mock_ticker.return_value = ticker_inst
+
+    provider = YFinanceDataProvider()
+    metrics = provider.fetch_financial_indicators("KO", as_of_date="2023-12-31")
+    assert metrics.symbol == "KO"
+    assert metrics.roe == pytest.approx(0.28)
+    assert metrics.pe_ttm == pytest.approx(22.5)
+    assert metrics.pb == pytest.approx(5.4)
+    assert metrics.net_profit == pytest.approx(1000000000.0)
+    assert metrics.cfo == pytest.approx(1200000000.0)
+    assert metrics.cfo_to_net_profit == pytest.approx(1.2)
+    assert metrics.debt_to_equity == pytest.approx(0.8)
+    assert metrics.industry_name == "Beverages"
+
+
+def test_cached_data_provider_fetch_financial_indicators(tmp_path):
+    """Verify CachedDataProvider forwards fetch_financial_indicators and integrates DuckDB cache."""
+    from common.data import FundamentalMetrics
+
+    class _MockProvider(BaseDataProvider):
+        def fetch_ohlcv(self, symbol, start, end, interval="1d"):
+            return pd.DataFrame()
+
+        def fetch_financial_indicators(self, symbol, as_of_date=None, lookback_years=5):
+            return FundamentalMetrics(
+                symbol=symbol,
+                report_year=2023,
+                stat_date="2023-12-31",
+                roe=0.25,
+                net_profit=5000000.0,
+                net_profit_5yr_cagr=0.12,
+                cfo=4500000.0,
+                cfo_to_net_profit=0.9,
+                total_assets=10000000.0,
+                total_liabilities=4000000.0,
+                debt_to_assets=0.4,
+                debt_to_equity=0.67,
+                interest_bearing_debt=1000000.0,
+                dividend_yield=0.03,
+                dividend_payout_ratio=0.4,
+                pe_ttm=15.0,
+                pb=2.5,
+                total_shares=1000000.0,
+                market_cap=25000000.0,
+            )
+
+    cached_provider = CachedDataProvider(_MockProvider(), cache_dir=str(tmp_path))
+    metrics1 = cached_provider.fetch_financial_indicators("TEST", as_of_date="2023-12-31")
+    assert metrics1.symbol == "TEST"
+    assert metrics1.roe == 0.25
+
+    # Second query should hit DuckDB cache
+    metrics2 = cached_provider.fetch_financial_indicators("TEST", as_of_date="2023-12-31")
+    assert metrics2.symbol == "TEST"
+    assert metrics2.roe == 0.25
+    assert metrics2.report_year == 2023
 

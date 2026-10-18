@@ -11,6 +11,10 @@ import sys
 import tempfile
 from unittest.mock import MagicMock, patch
 
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import duckdb
 import numpy as np
 import pandas as pd
@@ -276,7 +280,9 @@ def test_fuyao_provider_index_clamps_old_start_date():
     mock_fuyao = MagicMock()
     mock_fuyao.index_prices_historical.return_value = mock_index_items
 
-    with patch.dict(sys.modules, {"fuyao_client": mock_fuyao}):
+    with patch.dict(sys.modules, {"fuyao_client": mock_fuyao}), patch(
+        "common.financial_api.BaoStockDataProvider.fetch_ohlcv", return_value=pd.DataFrame()
+    ):
         with warnings.catch_warnings(record=True) as recorded_warnings:
             warnings.simplefilter("always")
             df = provider.fetch_ohlcv("000300.SH", start="2015-01-01", end="2024-01-02")
@@ -597,7 +603,9 @@ def test_fuyao_provider_fetch_universe_incremental_sync():
     mock_fuyao.prices_historical.return_value = mock_items_stock
     mock_fuyao.index_prices_historical.return_value = mock_items_index
 
-    with patch.dict(sys.modules, {"fuyao_client": mock_fuyao}):
+    with patch.dict(sys.modules, {"fuyao_client": mock_fuyao}), patch(
+        "common.financial_api.BaoStockDataProvider.fetch_ohlcv", return_value=pd.DataFrame()
+    ):
         uni = provider.fetch_universe(["600519.SH", "000300.SH"], start="2024-01-01", end="2024-01-02")
         assert "600519.SH" in uni
         assert "000300.SH" in uni
@@ -649,4 +657,119 @@ def test_fuyao_provider_local_already_fresh_skips_api():
         assert len(df) == 2
 
     con.close()
+
+
+def _make_mock_bs_result(fields, data):
+    mock_rs = MagicMock()
+    mock_rs.error_code = "0"
+    mock_rs.fields = fields
+    mock_rs.data = data
+    mock_rs.cur_row_num = 0
+    rows = list(data)
+    idx = [-1]
+
+    def _next():
+        idx[0] += 1
+        return idx[0] < len(rows)
+
+    def _get_row():
+        return rows[idx[0]]
+
+    mock_rs.next = _next
+    mock_rs.get_row_data = _get_row
+    return mock_rs
+
+
+def test_baostock_fetch_financial_indicators(tmp_path):
+    """Verify BaoStockDataProvider.fetch_financial_indicators queries all 6 endpoints,
+    populates FundamentalMetrics, and caches into DuckDBCache.
+    """
+    from common.financial_api import BaoStockDataProvider
+
+    mock_bs = MagicMock()
+    mock_lg = MagicMock(error_code="0")
+    mock_bs.login.return_value = mock_lg
+
+    # 1. Industry
+    mock_bs.query_stock_industry.return_value = _make_mock_bs_result(
+        ["updateDate", "code", "code_name", "industry", "industryClassification"],
+        [["2023-12-31", "sh.600519", "贵州茅台", "食品饮料", "申万一级"]],
+    )
+    # 2. Profit
+    mock_bs.query_profit_data.return_value = _make_mock_bs_result(
+        ["code", "pubDate", "statDate", "roeAvg", "npMargin", "gpMargin", "netProfit", "epsTTM", "MBRevenue", "totalShare", "liqaShare"],
+        [["sh.600519", "2024-04-03", "2023-12-31", "34.12", "50.1", "91.8", "74734000000.0", "59.49", "147694000000.0", "1256197800", "1256197800"]],
+    )
+    # 3. Growth
+    mock_bs.query_growth_data.return_value = _make_mock_bs_result(
+        ["code", "pubDate", "statDate", "YOYEquity", "YOYAsset", "YOYNI", "YOYEPSBasic", "YOYPNI"],
+        [["sh.600519", "2024-04-03", "2023-12-31", "17.8", "16.5", "18.2", "18.2", "18.2"]],
+    )
+    # 4. Balance
+    mock_bs.query_balance_data.return_value = _make_mock_bs_result(
+        ["code", "pubDate", "statDate", "currentRatio", "quickRatio", "cashRatio", "YOYLiability", "liabilityToAsset", "assetToEquity"],
+        [["sh.600519", "2024-04-03", "2023-12-31", "3.5", "3.2", "3.0", "12.0", "18.5", "1.22"]],
+    )
+    # 5. Cash flow
+    mock_bs.query_cash_flow_data.return_value = _make_mock_bs_result(
+        ["code", "pubDate", "statDate", "CAToAsset", "NCAToAsset", "tangibleAssetToAsset", "ebitToInterest", "CFOToOR", "CFOToNP", "CFOToGr"],
+        [["sh.600519", "2024-04-03", "2023-12-31", "0.7", "0.3", "0.9", "100.0", "0.45", "0.89", "0.45"]],
+    )
+    # 6. Dividend
+    mock_bs.query_dividend_data.return_value = _make_mock_bs_result(
+        ["code", "diviPretaxPerShare", "diviPercent"],
+        [["sh.600519", "30.876", "51.9"]],
+    )
+    # 7. K-data
+    mock_bs.query_history_k_data_plus.return_value = _make_mock_bs_result(
+        ["date", "close", "peTTM", "pbMRQ"],
+        [["2023-12-29", "1726.0", "28.5", "8.2"]],
+    )
+
+    provider = BaoStockDataProvider(cache_dir=str(tmp_path))
+    provider._get_bs = MagicMock(return_value=mock_bs)
+
+    metrics = provider.fetch_financial_indicators("600519.SH", as_of_date="2023-12-31")
+
+    assert metrics.symbol == "600519.SH"
+    assert metrics.report_year == 2023
+    assert metrics.stat_date == "2023-12-31"
+    assert metrics.roe == pytest.approx(0.3412)
+    assert metrics.net_profit == pytest.approx(74734000000.0)
+    assert metrics.cfo_to_net_profit == pytest.approx(0.89)
+    assert metrics.cfo == pytest.approx(74734000000.0 * 0.89)
+    assert metrics.industry_name == "食品饮料"
+    assert metrics.industry_tier == "tier2_consumer"
+    assert metrics.terminal_pe == 20.0
+    assert metrics.is_blacklisted is False
+    assert metrics.pe_ttm == pytest.approx(28.5)
+    assert metrics.pb == pytest.approx(8.2)
+    assert metrics.total_shares == pytest.approx(1256197800.0)
+    assert metrics.market_cap == pytest.approx(1726.0 * 1256197800.0)
+    assert metrics.dividend_payout_ratio == pytest.approx(0.519)
+    assert metrics.dividend_yield == pytest.approx(30.876 / 1726.0)
+
+    # Verify query cache hit on second call
+    mock_bs.query_profit_data.reset_mock()
+    cached_metrics = provider.fetch_financial_indicators("600519.SH", as_of_date="2023-12-31")
+    assert cached_metrics.symbol == "600519.SH"
+    assert cached_metrics.roe == pytest.approx(0.3412)
+    mock_bs.query_profit_data.assert_not_called()
+
+
+def test_baostock_fetch_financial_indicators_error_graceful():
+    """Verify BaoStockDataProvider handles login failure or exceptions gracefully without raising."""
+    from common.financial_api import BaoStockDataProvider
+
+    mock_bs = MagicMock()
+    mock_bs.login.return_value = MagicMock(error_code="-1", error_msg="connection refused")
+
+    provider = BaoStockDataProvider()
+    provider._get_bs = MagicMock(return_value=mock_bs)
+
+    metrics = provider.fetch_financial_indicators("600519.SH", as_of_date="2023-12-31")
+    assert metrics.symbol == "600519.SH"
+    assert metrics.report_year == 2023
+    assert np.isnan(metrics.roe)
+    assert np.isnan(metrics.net_profit)
 

@@ -17,14 +17,14 @@ import sys
 import threading
 import time
 import warnings
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
 import requests
 
-from .data import BaseDataProvider, _drop_invalid_ohlcv_rows, _validate_symbol_for_path
-from .duckdb_cache import is_intraday_interval
+from .data import BaseDataProvider, FundamentalMetrics, _drop_invalid_ohlcv_rows, _validate_symbol_for_path
+from .duckdb_cache import DuckDBCache, is_intraday_interval
 
 # Standard A-share / Fuyao ticker normalization regexes
 _CODE_WITH_SUFFIX_RE = re.compile(r"^([0-9]{6})\.(SH|SZ|BJ|TI|OF|SS)$", re.IGNORECASE)
@@ -968,6 +968,46 @@ class FuyaoDataProvider(BaseDataProvider):
         return result
 
 
+_INDUSTRY_TIER_MAP: Dict[str, Tuple[str, float]] = {
+    # Tier 1: Technology & High Growth (terminal_pe: 25.0)
+    "电子": ("tier1_technology", 25.0),
+    "计算机": ("tier1_technology", 25.0),
+    "通信": ("tier1_technology", 25.0),
+    "传媒": ("tier1_technology", 25.0),
+    "半导体": ("tier1_technology", 25.0),
+    # Tier 2: Consumer & Healthcare (terminal_pe: 20.0)
+    "医药生物": ("tier2_consumer", 20.0),
+    "食品饮料": ("tier2_consumer", 20.0),
+    "农林牧渔": ("tier2_consumer", 18.0),
+    "家用电器": ("tier2_consumer", 18.0),
+    "社会服务": ("tier2_consumer", 18.0),
+    "商贸零售": ("tier2_consumer", 18.0),
+    "美容护理": ("tier2_consumer", 20.0),
+    # Tier 3: Advanced Manufacturing & Materials (terminal_pe: 15.0)
+    "电力设备": ("tier3_manufacturing", 16.0),
+    "机械设备": ("tier3_manufacturing", 15.0),
+    "汽车": ("tier3_manufacturing", 15.0),
+    "国防军工": ("tier3_manufacturing", 18.0),
+    "基础化工": ("tier3_manufacturing", 14.0),
+    "有色金属": ("tier3_manufacturing", 14.0),
+    "轻工制造": ("tier3_manufacturing", 14.0),
+    # Tier 4: Utilities, Energy & Cyclicals (terminal_pe: 12.0)
+    "公用事业": ("tier4_utilities", 12.0),
+    "交通运输": ("tier4_utilities", 12.0),
+    "煤炭": ("tier4_utilities", 10.0),
+    "石油石化": ("tier4_utilities", 10.0),
+    "钢铁": ("tier4_utilities", 10.0),
+    "建筑材料": ("tier4_utilities", 12.0),
+    "建筑装饰": ("tier4_utilities", 10.0),
+    "环保": ("tier4_utilities", 12.0),
+    # Tier 5: Financials & Real Estate (terminal_pe: 8.0)
+    "银行": ("tier5_financials", 7.0),
+    "非银金融": ("tier5_financials", 10.0),
+    "房地产": ("tier5_financials", 8.0),
+    "综合": ("tier3_manufacturing", 12.0),
+}
+
+
 class BaoStockDataProvider(BaseDataProvider):
     """Data provider sourcing historical daily and intraday K-lines from BaoStock (100% offline-mockable).
 
@@ -993,10 +1033,23 @@ class BaoStockDataProvider(BaseDataProvider):
         "1mo": "m",
     }
 
-    def __init__(self, adjustflag: str = "2", keep_logged_in: bool = False, **kwargs):
+    def __init__(
+        self,
+        adjustflag: str = "2",
+        keep_logged_in: bool = False,
+        cache_dir: Optional[str] = None,
+        cache: Optional[DuckDBCache] = None,
+        **kwargs,
+    ):
         self.adjustflag = str(adjustflag)
         self._keep_logged_in = bool(keep_logged_in)
         self._is_logged_in = False
+        if cache is not None:
+            self._duckdb_cache = cache
+        elif cache_dir is not None:
+            self._duckdb_cache = DuckDBCache(db_path=cache_dir)
+        else:
+            self._duckdb_cache = DuckDBCache(db_path="data") if os.path.exists("data") else None
 
     def logout(self) -> None:
         """Explicitly log out of BaoStock if keep_logged_in was used."""
@@ -1218,6 +1271,288 @@ class BaoStockDataProvider(BaseDataProvider):
             if not was_logged_in:
                 self._keep_logged_in = False
                 self.logout()
+
+    def fetch_financial_indicators(
+        self, symbol: str, as_of_date: Optional[str] = None, lookback_years: int = 5
+    ) -> FundamentalMetrics:
+        """Fetch fundamental financial indicators for a China A-share from BaoStock with DuckDB caching."""
+        # 1. Parse target year
+        if as_of_date:
+            as_of_str = str(as_of_date).strip()
+            if len(as_of_str) == 4 and as_of_str.isdigit():
+                target_year = int(as_of_str)
+                req_end_date = f"{target_year}-12-31"
+            else:
+                as_of_dt = pd.to_datetime(as_of_date)
+                req_end_date = as_of_dt.strftime("%Y-%m-%d")
+                target_year = as_of_dt.year if as_of_dt.month >= 5 else as_of_dt.year - 1
+        else:
+            now_dt = datetime.datetime.now()
+            req_end_date = now_dt.strftime("%Y-%m-%d")
+            target_year = now_dt.year - 1
+
+        # 2. Check DuckDB cache first if available
+        if self._duckdb_cache is not None:
+            cached = self._duckdb_cache.query_fundamentals("BaoStockDataProvider", symbol, report_year=target_year)
+            if cached is not None:
+                return cached
+
+        # Default fallback metrics
+        base_metrics = super().fetch_financial_indicators(symbol, as_of_date=as_of_date, lookback_years=lookback_years)
+
+        def _to_float(v: Any) -> float:
+            if v is None:
+                return float("nan")
+            try:
+                s = str(v).strip()
+                if not s or s.lower() in ("none", "nan", "null"):
+                    return float("nan")
+                val = float(s)
+                return val if np.isfinite(val) else float("nan")
+            except (ValueError, TypeError):
+                return float("nan")
+
+        bs_code = to_baostock_code(symbol)
+
+        with self._lock:
+            try:
+                bs = self._get_bs()
+            except Exception as exc:
+                warnings.warn(f"BaoStock import failed: {exc}")
+                return base_metrics
+
+            if not self._keep_logged_in or not self._is_logged_in:
+                lg = bs.login()
+                if hasattr(lg, "error_code") and lg.error_code != "0":
+                    warnings.warn(f"BaoStock login failed: {getattr(lg, 'error_msg', 'unknown error')}")
+                    return base_metrics
+                if self._keep_logged_in:
+                    self._is_logged_in = True
+
+            try:
+                # Safe row extraction avoiding Pandas 2.x broken rs.get_data()
+                def _safe_rows(rs) -> List[Dict[str, Any]]:
+                    rows = []
+                    if rs is None or (hasattr(rs, "error_code") and rs.error_code != "0"):
+                        return rows
+                    fields = rs.fields if (hasattr(rs, "fields") and rs.fields) else []
+                    if hasattr(rs, "data") and isinstance(getattr(rs, "data", None), list) and hasattr(rs, "cur_row_num"):
+                        raw_list = []
+                        if rs.data:
+                            raw_list.extend(rs.data)
+                            rs.cur_row_num = len(rs.data)
+                            while getattr(rs, "error_code", "0") == "0" and rs.next():
+                                if rs.data:
+                                    raw_list.extend(rs.data)
+                                    rs.cur_row_num = len(rs.data)
+                                else:
+                                    break
+                        for item in raw_list:
+                            if fields and len(fields) == len(item):
+                                rows.append(dict(zip(fields, item)))
+                            else:
+                                rows.append({f"col_{i}": v for i, v in enumerate(item)})
+                    elif hasattr(rs, "next"):
+                        while getattr(rs, "error_code", "0") == "0" and rs.next():
+                            item = rs.get_row_data()
+                            if fields and len(fields) == len(item):
+                                rows.append(dict(zip(fields, item)))
+                            else:
+                                rows.append({f"col_{i}": v for i, v in enumerate(item)})
+                    return rows
+
+                # 1. Industry metadata
+                industry_name = "Unknown"
+                industry_tier = "tier3_manufacturing"
+                terminal_pe = 10.0
+                is_blacklisted = False
+                blacklist_reason = None
+
+                rs_ind = bs.query_stock_industry(code=bs_code)
+                ind_rows = _safe_rows(rs_ind)
+                if ind_rows:
+                    row_i = ind_rows[0]
+                    industry_name = row_i.get("industry") or "Unknown"
+                    code_name = row_i.get("code_name", "")
+                    if "*ST" in code_name or "ST" in code_name or "退" in code_name:
+                        is_blacklisted = True
+                        blacklist_reason = f"Special treatment / delisting risk ({code_name})"
+
+                    for ind_key, (t_tier, t_pe) in _INDUSTRY_TIER_MAP.items():
+                        if ind_key in industry_name:
+                            industry_tier = t_tier
+                            terminal_pe = t_pe
+                            break
+
+                # 2. Profit data (Q4 annual)
+                rs_profit = bs.query_profit_data(code=bs_code, year=target_year, quarter=4)
+                profit_rows = _safe_rows(rs_profit)
+                if not profit_rows and target_year > 2000:
+                    target_year -= 1
+                    rs_profit = bs.query_profit_data(code=bs_code, year=target_year, quarter=4)
+                    profit_rows = _safe_rows(rs_profit)
+
+                stat_date = f"{target_year}-12-31"
+                roe = float("nan")
+                net_profit = float("nan")
+                total_shares = float("nan")
+
+                if profit_rows:
+                    p_row = profit_rows[0]
+                    stat_date = p_row.get("statDate") or f"{target_year}-12-31"
+                    roe_val = _to_float(p_row.get("roeAvg"))
+                    if not np.isnan(roe_val):
+                        roe = roe_val / 100.0 if abs(roe_val) > 1.0 else roe_val
+                    net_profit = _to_float(p_row.get("netProfit"))
+                    total_shares = _to_float(p_row.get("totalShare"))
+
+                # 3. Growth data & 5-year CAGR
+                rs_growth = bs.query_growth_data(code=bs_code, year=target_year, quarter=4)
+                growth_rows = _safe_rows(rs_growth)
+
+                cagr_5yr = float("nan")
+                try:
+                    past_year = target_year - lookback_years
+                    rs_past_profit = bs.query_profit_data(code=bs_code, year=past_year, quarter=4)
+                    past_profit_rows = _safe_rows(rs_past_profit)
+                    if past_profit_rows:
+                        np_start = _to_float(past_profit_rows[0].get("netProfit"))
+                        if not np.isnan(np_start) and not np.isnan(net_profit) and np_start > 0 and net_profit > 0:
+                            cagr_5yr = float((net_profit / np_start) ** (1.0 / lookback_years) - 1.0)
+                except Exception:
+                    pass
+
+                if np.isnan(cagr_5yr) and growth_rows:
+                    yoy_ni = _to_float(growth_rows[0].get("YOYNI"))
+                    if not np.isnan(yoy_ni):
+                        cagr_5yr = yoy_ni / 100.0 if abs(yoy_ni) > 1.0 else yoy_ni
+
+                # 4. Balance data
+                rs_balance = bs.query_balance_data(code=bs_code, year=target_year, quarter=4)
+                balance_rows = _safe_rows(rs_balance)
+                debt_to_assets = float("nan")
+                debt_to_equity = float("nan")
+                if balance_rows:
+                    b_row = balance_rows[0]
+                    l_to_a = _to_float(b_row.get("liabilityToAsset"))
+                    if not np.isnan(l_to_a):
+                        debt_to_assets = l_to_a / 100.0 if l_to_a > 1.0 else l_to_a
+                    a_to_e = _to_float(b_row.get("assetToEquity"))
+                    if not np.isnan(a_to_e) and a_to_e > 1.0:
+                        debt_to_equity = a_to_e - 1.0
+                    elif not np.isnan(debt_to_assets) and debt_to_assets < 1.0:
+                        debt_to_equity = debt_to_assets / (1.0 - debt_to_assets)
+
+                # 5. Cash flow data
+                rs_cf = bs.query_cash_flow_data(code=bs_code, year=target_year, quarter=4)
+                cf_rows = _safe_rows(rs_cf)
+                cfo_to_net_profit = float("nan")
+                cfo = float("nan")
+                if cf_rows:
+                    cf_row = cf_rows[0]
+                    cfo_np_raw = _to_float(cf_row.get("CFOToNP"))
+                    if not np.isnan(cfo_np_raw):
+                        cfo_to_net_profit = cfo_np_raw
+                        if not np.isnan(net_profit):
+                            cfo = cfo_to_net_profit * net_profit
+
+                # 6. Dividend data
+                rs_div = bs.query_dividend_data(code=bs_code, year=target_year)
+                div_rows = _safe_rows(rs_div)
+                div_per_share = float("nan")
+                dividend_payout_ratio = float("nan")
+                if div_rows:
+                    d_row = div_rows[-1]
+                    div_per_share = _to_float(d_row.get("diviPretaxPerShare"))
+                    d_pct = _to_float(d_row.get("diviPercent"))
+                    if not np.isnan(d_pct):
+                        dividend_payout_ratio = d_pct / 100.0 if d_pct > 1.0 else d_pct
+
+                # 7. Recent daily K-lines for latest peTTM, pbMRQ, close
+                k_end = req_end_date
+                k_start = (pd.to_datetime(k_end) - datetime.timedelta(days=40)).strftime("%Y-%m-%d")
+                rs_k = bs.query_history_k_data_plus(
+                    bs_code,
+                    "date,close,peTTM,pbMRQ",
+                    start_date=k_start,
+                    end_date=k_end,
+                    frequency="d",
+                    adjustflag="2",
+                )
+                k_rows = _safe_rows(rs_k)
+                close_price = float("nan")
+                pe_ttm = float("nan")
+                pb = float("nan")
+                if k_rows:
+                    last_k = k_rows[-1]
+                    close_price = _to_float(last_k.get("close"))
+                    pe_ttm = _to_float(last_k.get("peTTM"))
+                    pb = _to_float(last_k.get("pbMRQ"))
+
+                market_cap = (
+                    close_price * total_shares
+                    if (not np.isnan(close_price) and not np.isnan(total_shares))
+                    else float("nan")
+                )
+                dividend_yield = (
+                    div_per_share / close_price
+                    if (not np.isnan(div_per_share) and not np.isnan(close_price) and close_price > 0)
+                    else float("nan")
+                )
+
+                # Total assets and liabilities estimation
+                total_assets = float("nan")
+                total_liabilities = float("nan")
+                if not np.isnan(market_cap) and not np.isnan(pb) and pb > 0:
+                    equity = market_cap / pb
+                    if not np.isnan(debt_to_assets) and 0 <= debt_to_assets < 1.0:
+                        total_assets = equity / (1.0 - debt_to_assets)
+                        total_liabilities = total_assets * debt_to_assets
+                    else:
+                        total_assets = equity
+
+                metrics = FundamentalMetrics(
+                    symbol=symbol,
+                    report_year=target_year,
+                    stat_date=stat_date,
+                    roe=roe,
+                    net_profit=net_profit,
+                    net_profit_5yr_cagr=cagr_5yr,
+                    cfo=cfo,
+                    cfo_to_net_profit=cfo_to_net_profit,
+                    total_assets=total_assets,
+                    total_liabilities=total_liabilities,
+                    debt_to_assets=debt_to_assets,
+                    debt_to_equity=debt_to_equity,
+                    interest_bearing_debt=float("nan"),
+                    dividend_yield=dividend_yield,
+                    dividend_payout_ratio=dividend_payout_ratio,
+                    pe_ttm=pe_ttm,
+                    pb=pb,
+                    total_shares=total_shares,
+                    market_cap=market_cap,
+                    industry_name=industry_name,
+                    industry_tier=industry_tier,
+                    terminal_pe=terminal_pe,
+                    is_blacklisted=is_blacklisted,
+                    blacklist_reason=blacklist_reason,
+                )
+
+                # Store into DuckDB cache if available
+                if self._duckdb_cache is not None:
+                    self._duckdb_cache.store_fundamentals("BaoStockDataProvider", metrics)
+
+                return metrics
+
+            except Exception as exc:
+                warnings.warn(f"BaoStock fundamental indicators query failed for {symbol}: {exc}")
+                return base_metrics
+            finally:
+                if not self._keep_logged_in:
+                    try:
+                        bs.logout()
+                    except Exception:
+                        pass
 
 
 class EastMoneyDataProvider(BaseDataProvider):

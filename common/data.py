@@ -3,6 +3,7 @@ local CSV caching, used across every project in this workspace.
 """
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 import hashlib
 import importlib
 import importlib.util
@@ -19,6 +20,34 @@ import yfinance as yf
 
 from .universe import _parse_module_specifier
 from .duckdb_cache import DuckDBCache, is_synthetic_provider, is_intraday_interval
+
+
+@dataclass(frozen=True)
+class FundamentalMetrics:
+    symbol: str
+    report_year: int
+    stat_date: str
+    roe: float
+    net_profit: float
+    net_profit_5yr_cagr: float
+    cfo: float
+    cfo_to_net_profit: float
+    total_assets: float
+    total_liabilities: float
+    debt_to_assets: float
+    debt_to_equity: float
+    interest_bearing_debt: float
+    dividend_yield: float
+    dividend_payout_ratio: float
+    pe_ttm: float
+    pb: float
+    total_shares: float
+    market_cap: float
+    industry_name: str = "Unknown"
+    industry_tier: str = "tier3_manufacturing"
+    terminal_pe: float = 10.0
+    is_blacklisted: bool = False
+    blacklist_reason: Optional[str] = None
 
 
 # Real ticker symbols (equities, ETFs, indices, FX pairs) are drawn from a
@@ -75,6 +104,36 @@ class BaseDataProvider(ABC):
             "roe": float("nan"), "dividend_yield": float("nan"),
             "earnings_growth": float("nan"), "debt_to_equity": float("nan"),
         }
+
+    def fetch_financial_indicators(
+        self, symbol: str, as_of_date: Optional[str] = None, lookback_years: int = 5
+    ) -> FundamentalMetrics:
+        """Fetch fundamental financial indicators for a symbol as of a date.
+        Returns a default NaN-filled FundamentalMetrics instance.
+        """
+        year = pd.to_datetime(as_of_date).year if as_of_date else pd.Timestamp.now().year
+        stat_date = as_of_date or f"{year}-12-31"
+        return FundamentalMetrics(
+            symbol=symbol,
+            report_year=int(year),
+            stat_date=stat_date,
+            roe=float("nan"),
+            net_profit=float("nan"),
+            net_profit_5yr_cagr=float("nan"),
+            cfo=float("nan"),
+            cfo_to_net_profit=float("nan"),
+            total_assets=float("nan"),
+            total_liabilities=float("nan"),
+            debt_to_assets=float("nan"),
+            debt_to_equity=float("nan"),
+            interest_bearing_debt=float("nan"),
+            dividend_yield=float("nan"),
+            dividend_payout_ratio=float("nan"),
+            pe_ttm=float("nan"),
+            pb=float("nan"),
+            total_shares=float("nan"),
+            market_cap=float("nan"),
+        )
 
 
 class YFinanceDataProvider(BaseDataProvider):
@@ -157,6 +216,143 @@ class YFinanceDataProvider(BaseDataProvider):
                     break
 
         return result
+
+    def fetch_financial_indicators(
+        self, symbol: str, as_of_date: Optional[str] = None, lookback_years: int = 5
+    ) -> FundamentalMetrics:
+        """Best-effort fundamental indicators from yfinance via `.info` and `.financials` / `.cashflow`."""
+        base_metrics = super().fetch_financial_indicators(symbol, as_of_date, lookback_years)
+        try:
+            ticker = yf.Ticker(symbol)
+            info = ticker.info if isinstance(ticker.info, dict) else {}
+        except Exception:
+            return base_metrics
+
+        def _get_float(d: dict, *keys: str) -> float:
+            for k in keys:
+                v = d.get(k)
+                if v is not None:
+                    try:
+                        val = float(v)
+                        if not np.isnan(val):
+                            return val
+                    except (ValueError, TypeError):
+                        pass
+            return float("nan")
+
+        roe = _get_float(info, "returnOnEquity")
+        pe_ttm = _get_float(info, "trailingPE")
+        pb = _get_float(info, "priceToBook")
+        dividend_yield = _get_float(info, "dividendYield")
+        dividend_payout_ratio = _get_float(info, "payoutRatio")
+        total_shares = _get_float(info, "sharesOutstanding")
+        market_cap = _get_float(info, "marketCap")
+        interest_bearing_debt = _get_float(info, "totalDebt")
+        debt_to_equity = _get_float(info, "debtToEquity")
+        if not np.isnan(debt_to_equity) and debt_to_equity > 10.0:
+            debt_to_equity = debt_to_equity / 100.0
+
+        industry_name = info.get("industry") or info.get("sector") or "Unknown"
+
+        net_profit = float("nan")
+        cagr_5yr = float("nan")
+        cfo = float("nan")
+        total_assets = _get_float(info, "totalAssets", "netAssets")
+        total_liabilities = float("nan")
+        stat_date = base_metrics.stat_date
+        report_year = base_metrics.report_year
+
+        try:
+            fin = getattr(ticker, "financials", None)
+            if fin is not None and not fin.empty:
+                ni_rows = [idx for idx in fin.index if "net income" in str(idx).lower()]
+                if ni_rows:
+                    ni_series = fin.loc[ni_rows[0]].dropna()
+                    if not ni_series.empty:
+                        net_profit = float(ni_series.iloc[0])
+                        col_date = ni_series.index[0]
+                        if hasattr(col_date, "year"):
+                            report_year = int(col_date.year)
+                            stat_date = str(col_date.strftime("%Y-%m-%d"))
+                        if len(ni_series) >= 2:
+                            k = min(len(ni_series) - 1, lookback_years)
+                            val_start = float(ni_series.iloc[k])
+                            val_end = float(ni_series.iloc[0])
+                            if val_start > 0 and val_end > 0 and k > 0:
+                                cagr_5yr = float((val_end / val_start) ** (1.0 / k) - 1.0)
+        except Exception:
+            pass
+
+        try:
+            cf = getattr(ticker, "cashflow", None)
+            if cf is not None and not cf.empty:
+                cfo_rows = [
+                    idx for idx in cf.index
+                    if any(term in str(idx).lower() for term in ["operating cash flow", "cash flow from continuing operating activities", "total cash from operating activities"])
+                ]
+                if cfo_rows:
+                    cfo_series = cf.loc[cfo_rows[0]].dropna()
+                    if not cfo_series.empty:
+                        cfo = float(cfo_series.iloc[0])
+        except Exception:
+            pass
+
+        try:
+            bs = getattr(ticker, "balance_sheet", None)
+            if bs is not None and not bs.empty:
+                if np.isnan(total_assets):
+                    ta_rows = [idx for idx in bs.index if "total assets" in str(idx).lower()]
+                    if ta_rows:
+                        ta_series = bs.loc[ta_rows[0]].dropna()
+                        if not ta_series.empty:
+                            total_assets = float(ta_series.iloc[0])
+
+                tl_rows = [
+                    idx for idx in bs.index
+                    if any(term in str(idx).lower() for term in ["total liabilities net minority interest", "total liabilities"])
+                ]
+                if tl_rows:
+                    tl_series = bs.loc[tl_rows[0]].dropna()
+                    if not tl_series.empty:
+                        total_liabilities = float(tl_series.iloc[0])
+        except Exception:
+            pass
+
+        cfo_to_net_profit = (
+            float(cfo / net_profit) if (not np.isnan(cfo) and not np.isnan(net_profit) and net_profit != 0) else float("nan")
+        )
+        debt_to_assets = (
+            float(total_liabilities / total_assets)
+            if (not np.isnan(total_liabilities) and not np.isnan(total_assets) and total_assets > 0)
+            else float("nan")
+        )
+        if np.isnan(debt_to_equity) and not np.isnan(total_liabilities) and not np.isnan(total_assets):
+            equity = total_assets - total_liabilities
+            if equity > 0:
+                debt_to_equity = float(total_liabilities / equity)
+
+        return FundamentalMetrics(
+            symbol=symbol,
+            report_year=report_year,
+            stat_date=stat_date,
+            roe=roe,
+            net_profit=net_profit,
+            net_profit_5yr_cagr=cagr_5yr,
+            cfo=cfo,
+            cfo_to_net_profit=cfo_to_net_profit,
+            total_assets=total_assets,
+            total_liabilities=total_liabilities,
+            debt_to_assets=debt_to_assets,
+            debt_to_equity=debt_to_equity,
+            interest_bearing_debt=interest_bearing_debt,
+            dividend_yield=dividend_yield,
+            dividend_payout_ratio=dividend_payout_ratio,
+            pe_ttm=pe_ttm,
+            pb=pb,
+            total_shares=total_shares,
+            market_cap=market_cap,
+            industry_name=industry_name,
+        )
 
 
 class CSVFolderDataProvider(BaseDataProvider):
@@ -559,6 +755,23 @@ class CachedDataProvider(BaseDataProvider):
 
     def fetch_metadata(self, symbol: str) -> dict:
         return self.inner_provider.fetch_metadata(symbol)
+
+    def fetch_financial_indicators(
+        self, symbol: str, as_of_date: Optional[str] = None, lookback_years: int = 5
+    ) -> FundamentalMetrics:
+        """Forward fundamental indicators query to inner provider (with DuckDB cache support)."""
+        _validate_symbol_for_path(symbol)
+        if self.duckdb_cache is not None and not self.is_synthetic:
+            provider_name = type(self.inner_provider).__name__
+            req_year = pd.to_datetime(as_of_date).year if as_of_date else None
+            cached = self.duckdb_cache.query_fundamentals(provider_name, symbol, report_year=req_year)
+            if cached is not None:
+                return cached
+            metrics = self.inner_provider.fetch_financial_indicators(symbol, as_of_date=as_of_date, lookback_years=lookback_years)
+            if metrics is not None and not np.isnan(metrics.roe) and not np.isnan(metrics.net_profit):
+                self.duckdb_cache.store_fundamentals(provider_name, metrics)
+            return metrics
+        return self.inner_provider.fetch_financial_indicators(symbol, as_of_date=as_of_date, lookback_years=lookback_years)
 
 
 _PROVIDER_REGISTRY: Dict[str, Type[BaseDataProvider]] = {}
