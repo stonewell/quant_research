@@ -86,6 +86,8 @@ uv run python run_pipeline.py --data-provider synthetic --universe SPY QQQ ...
    - 在实际调仓日行中，标的若需平仓或回避风险必须显式赋予 `0.0`；若保留为 `NaN`，回测引擎的列级前向填充会将上期持仓权重隐式延续。
 4. **等价随机搜索唯一校验 (Single ERS)**：
    - ERS 验证（`common/allocation_search.py`）在单次搜索中**仅执行一次**，且仅对最终选出的冠军策略/参数组合进行校验，绝不逐个候选模板运行 ERS。
+5. **股票池标的剔除与黑名单档案规范 (SSOT 于 `docs/black_list.md`)**：
+   - 任何时候当 Agent 建议或执行从任何股票池/ETF池/投资组合中剔除某个标的或资产时（无论是因为单手超高价资金失真、结构性失血负Alpha、财务造假/ST风险、恶性价格战内卷、还是高摩擦频繁假突破等原因），必须在 `docs/black_list.md` 中用中文建立并维护完备的剔除档案与深度原因记录，以供后续轮次研究核验与永久避坑。
 
 ---
 

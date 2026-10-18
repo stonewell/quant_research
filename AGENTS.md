@@ -151,6 +151,8 @@ available in the current shell.
    - Inside an actual rebalance row, a cell value of `0.0` explicitly de-risks or exits an asset. Leaving a cell `NaN` carries forward the previous held weight due to global backtester column-wise `ffill()`.
 4. **Single Equivalent Random Search (ERS)**:
    - Run ERS validation (`common/allocation_search.py`) exactly **once per search**, exclusively on the already-chosen winning strategy. Never run ERS once per candidate template.
+5. **Universe Asset Removal & Blacklist Documentation (SSOT in `docs/black_list.md`)**:
+   - Anytime an agent suggests or executes removing a stock, ETF, or asset from any universe/portfolio (whether due to high unit price, structural loss, negative Alpha, fraud/ST risk, cyclical price wars, or friction bleed), the agent must record the asset symbol, name, removal date, removal trigger/category, and detailed quantitative/fundamental rationale in `docs/black_list.md` (in Chinese) for future reference and persistent memory.
 
 
 ## Documentation & coding style conventions
