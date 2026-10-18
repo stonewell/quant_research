@@ -43,6 +43,17 @@ class ScreenerConfig:
     # needs real OHLCV history, not fundamentals.
     lookback_days: int = 1260              # ~5 years, mirrors the doc's own 5-year framing
 
+    # Snowball Valuation Engine (F2.1, F2.2, F2.3) parameters
+    discount_rate: float = 0.12
+    benchmark_expected_return: float = 0.07
+    margin_of_safety: float = 0.15
+    max_earnings_growth: float = 0.12
+    min_cfo_to_profit: float = 0.80
+    max_debt_to_assets: float = 0.60
+    min_dividend_payout: float = 0.20
+    max_dividend_payout: float = 0.85
+    enable_industry_blacklist: bool = True
+
     def __post_init__(self):
         if self.top_n <= 0:
             raise ValueError(f"ScreenerConfig.top_n must be > 0, got {self.top_n}")
