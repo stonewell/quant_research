@@ -13,12 +13,15 @@ import datetime
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 import warnings
 
 import duckdb
 import numpy as np
 import pandas as pd
+
+if TYPE_CHECKING:
+    from .data import FundamentalMetrics
 
 
 _REQUIRED_OHLCV_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
@@ -228,6 +231,46 @@ class DuckDBCache:
             );
 
             CREATE INDEX IF NOT EXISTS idx_intraday_lookup ON intraday_ohlcv_bars(provider, symbol, interval, ts);
+
+            CREATE TABLE IF NOT EXISTS stock_fundamentals_annual (
+                provider VARCHAR NOT NULL,
+                symbol VARCHAR NOT NULL,
+                report_year INTEGER NOT NULL,
+                stat_date DATE NOT NULL,
+                roe DOUBLE,
+                net_profit DOUBLE,
+                net_profit_5yr_cagr DOUBLE,
+                cfo DOUBLE,
+                cfo_to_net_profit DOUBLE,
+                total_assets DOUBLE,
+                total_liabilities DOUBLE,
+                debt_to_assets DOUBLE,
+                debt_to_equity DOUBLE,
+                interest_bearing_debt DOUBLE,
+                dividend_yield DOUBLE,
+                dividend_payout_ratio DOUBLE,
+                pe_ttm DOUBLE,
+                pb DOUBLE,
+                total_shares DOUBLE,
+                market_cap DOUBLE,
+                last_sync_time TIMESTAMP NOT NULL,
+                PRIMARY KEY (provider, symbol, report_year)
+            );
+
+            CREATE TABLE IF NOT EXISTS stock_industry_metadata (
+                provider VARCHAR NOT NULL,
+                symbol VARCHAR NOT NULL,
+                industry_name VARCHAR NOT NULL,
+                industry_tier VARCHAR NOT NULL,
+                terminal_pe DOUBLE NOT NULL,
+                is_blacklisted BOOLEAN NOT NULL DEFAULT FALSE,
+                blacklist_reason VARCHAR,
+                last_sync_time TIMESTAMP NOT NULL,
+                PRIMARY KEY (provider, symbol)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_fundamentals_lookup ON stock_fundamentals_annual(provider, symbol, report_year);
+            CREATE INDEX IF NOT EXISTS idx_industry_metadata_lookup ON stock_industry_metadata(provider, symbol);
         """)
 
     def get_asset_metadata(self, provider: str, symbol: str) -> Optional[dict]:
@@ -890,3 +933,209 @@ class DuckDBCache:
             result[sym] = resample_ohlcv(df, interval)
 
         return result
+
+    def store_fundamentals(self, provider: str, metrics: FundamentalMetrics) -> None:
+        """Stores or updates annual fundamental metrics into stock_fundamentals_annual and stock_industry_metadata."""
+        if is_synthetic_provider(provider):
+            return
+
+        sync_ts = datetime.datetime.now()
+        stat_date_val = pd.to_datetime(metrics.stat_date).date() if metrics.stat_date else datetime.date(metrics.report_year, 12, 31)
+
+        def _clean_float(val: Any) -> Optional[float]:
+            if val is None:
+                return None
+            try:
+                f = float(val)
+                return None if np.isnan(f) else f
+            except (ValueError, TypeError):
+                return None
+
+        con = self._get_connection(read_only=False)
+        try:
+            con.execute("""
+                INSERT OR REPLACE INTO stock_fundamentals_annual
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, [
+                provider,
+                metrics.symbol,
+                int(metrics.report_year),
+                stat_date_val,
+                _clean_float(metrics.roe),
+                _clean_float(metrics.net_profit),
+                _clean_float(metrics.net_profit_5yr_cagr),
+                _clean_float(metrics.cfo),
+                _clean_float(metrics.cfo_to_net_profit),
+                _clean_float(metrics.total_assets),
+                _clean_float(metrics.total_liabilities),
+                _clean_float(metrics.debt_to_assets),
+                _clean_float(metrics.debt_to_equity),
+                _clean_float(metrics.interest_bearing_debt),
+                _clean_float(metrics.dividend_yield),
+                _clean_float(metrics.dividend_payout_ratio),
+                _clean_float(metrics.pe_ttm),
+                _clean_float(metrics.pb),
+                _clean_float(metrics.total_shares),
+                _clean_float(metrics.market_cap),
+                sync_ts,
+            ])
+            con.execute("""
+                INSERT OR REPLACE INTO stock_industry_metadata
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, [
+                provider,
+                metrics.symbol,
+                metrics.industry_name or "Unknown",
+                metrics.industry_tier or "tier3_manufacturing",
+                float(metrics.terminal_pe) if metrics.terminal_pe is not None and not np.isnan(metrics.terminal_pe) else 10.0,
+                bool(metrics.is_blacklisted),
+                metrics.blacklist_reason,
+                sync_ts,
+            ])
+        finally:
+            if not self.is_memory:
+                con.close()
+
+    def query_fundamentals(
+        self, provider: str, symbol: str, report_year: Optional[int] = None
+    ) -> Optional[FundamentalMetrics]:
+        """Queries annual fundamental metrics for (provider, symbol), optionally by report_year.
+        Returns FundamentalMetrics instance or None if not found.
+        """
+        if is_synthetic_provider(provider):
+            return None
+
+        from .data import FundamentalMetrics
+
+        clauses = ["provider = ?", "symbol = ?"]
+        params: List[Any] = [provider, symbol]
+        if report_year is not None:
+            clauses.append("report_year = ?")
+            params.append(int(report_year))
+            order_clause = ""
+        else:
+            order_clause = "ORDER BY report_year DESC LIMIT 1"
+
+        sql = f"""
+            SELECT provider, symbol, report_year, stat_date, roe, net_profit,
+                   net_profit_5yr_cagr, cfo, cfo_to_net_profit, total_assets,
+                   total_liabilities, debt_to_assets, debt_to_equity,
+                   interest_bearing_debt, dividend_yield, dividend_payout_ratio,
+                   pe_ttm, pb, total_shares, market_cap, last_sync_time
+            FROM stock_fundamentals_annual
+            WHERE {' AND '.join(clauses)}
+            {order_clause}
+        """
+
+        con = self._get_connection(read_only=True)
+        try:
+            row = con.execute(sql, params).fetchone()
+            if not row:
+                return None
+
+            meta_row = con.execute("""
+                SELECT industry_name, industry_tier, terminal_pe, is_blacklisted, blacklist_reason
+                FROM stock_industry_metadata
+                WHERE provider = ? AND symbol = ?
+            """, [provider, symbol]).fetchone()
+        finally:
+            if not self.is_memory:
+                con.close()
+
+        industry_name = meta_row[0] if meta_row else "Unknown"
+        industry_tier = meta_row[1] if meta_row else "tier3_manufacturing"
+        terminal_pe = float(meta_row[2]) if meta_row and meta_row[2] is not None else 10.0
+        is_blacklisted = bool(meta_row[3]) if meta_row else False
+        blacklist_reason = meta_row[4] if meta_row else None
+
+        def _val(x):
+            return float(x) if x is not None else float("nan")
+
+        return FundamentalMetrics(
+            symbol=row[1],
+            report_year=int(row[2]),
+            stat_date=str(row[3]),
+            roe=_val(row[4]),
+            net_profit=_val(row[5]),
+            net_profit_5yr_cagr=_val(row[6]),
+            cfo=_val(row[7]),
+            cfo_to_net_profit=_val(row[8]),
+            total_assets=_val(row[9]),
+            total_liabilities=_val(row[10]),
+            debt_to_assets=_val(row[11]),
+            debt_to_equity=_val(row[12]),
+            interest_bearing_debt=_val(row[13]),
+            dividend_yield=_val(row[14]),
+            dividend_payout_ratio=_val(row[15]),
+            pe_ttm=_val(row[16]),
+            pb=_val(row[17]),
+            total_shares=_val(row[18]),
+            market_cap=_val(row[19]),
+            industry_name=industry_name,
+            industry_tier=industry_tier,
+            terminal_pe=terminal_pe,
+            is_blacklisted=is_blacklisted,
+            blacklist_reason=blacklist_reason,
+        )
+
+    def store_industry_metadata(
+        self,
+        provider: str,
+        symbol: str,
+        industry_name: str,
+        industry_tier: str,
+        terminal_pe: float,
+        is_blacklisted: bool = False,
+        blacklist_reason: Optional[str] = None,
+    ) -> None:
+        """Stores or updates stock industry and valuation metadata."""
+        if is_synthetic_provider(provider):
+            return
+        sync_ts = datetime.datetime.now()
+        con = self._get_connection(read_only=False)
+        try:
+            con.execute("""
+                INSERT OR REPLACE INTO stock_industry_metadata
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, [
+                provider,
+                symbol,
+                industry_name,
+                industry_tier,
+                float(terminal_pe),
+                bool(is_blacklisted),
+                blacklist_reason,
+                sync_ts,
+            ])
+        finally:
+            if not self.is_memory:
+                con.close()
+
+    def query_industry_metadata(self, provider: str, symbol: str) -> Optional[dict]:
+        """Queries stock industry and valuation metadata."""
+        if is_synthetic_provider(provider):
+            return None
+        con = self._get_connection(read_only=True)
+        try:
+            row = con.execute("""
+                SELECT provider, symbol, industry_name, industry_tier, terminal_pe, is_blacklisted, blacklist_reason, last_sync_time
+                FROM stock_industry_metadata
+                WHERE provider = ? AND symbol = ?
+            """, [provider, symbol]).fetchone()
+        finally:
+            if not self.is_memory:
+                con.close()
+
+        if not row:
+            return None
+
+        return {
+            "provider": row[0],
+            "symbol": row[1],
+            "industry_name": row[2],
+            "industry_tier": row[3],
+            "terminal_pe": float(row[4]),
+            "is_blacklisted": bool(row[5]),
+            "blacklist_reason": row[6],
+            "last_sync_time": row[7],
+        }

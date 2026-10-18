@@ -256,3 +256,72 @@ def test_intraday_interval_resampling_rules():
         res = resample_ohlcv(df, interval)
         assert len(res) == len(df), f"resample_ohlcv({interval}) should leave daily DataFrame untouched"
 
+
+def test_fundamentals_table_schema_and_crud(mem_cache):
+    """Verifies stock_fundamentals_annual and stock_industry_metadata tables, storage and query."""
+    from common.data import FundamentalMetrics
+
+    con = mem_cache._get_connection(read_only=True)
+    tables = [r[0] for r in con.execute("SHOW TABLES").fetchall()]
+    assert "stock_fundamentals_annual" in tables
+    assert "stock_industry_metadata" in tables
+
+    metrics = FundamentalMetrics(
+        symbol="600519.SH",
+        report_year=2023,
+        stat_date="2023-12-31",
+        roe=0.35,
+        net_profit=74734000000.0,
+        net_profit_5yr_cagr=0.18,
+        cfo=66592000000.0,
+        cfo_to_net_profit=0.89,
+        total_assets=272710000000.0,
+        total_liabilities=50000000000.0,
+        debt_to_assets=0.183,
+        debt_to_equity=0.224,
+        interest_bearing_debt=0.0,
+        dividend_yield=0.025,
+        dividend_payout_ratio=0.519,
+        pe_ttm=28.5,
+        pb=8.2,
+        total_shares=1256000000.0,
+        market_cap=2100000000000.0,
+        industry_name="食品饮料",
+        industry_tier="tier2_consumer",
+        terminal_pe=20.0,
+        is_blacklisted=False,
+        blacklist_reason=None,
+    )
+
+    mem_cache.store_fundamentals("BaoStockDataProvider", metrics)
+
+    # Query latest (report_year=None)
+    queried = mem_cache.query_fundamentals("BaoStockDataProvider", "600519.SH")
+    assert queried is not None
+    assert queried.symbol == "600519.SH"
+    assert queried.report_year == 2023
+    assert queried.stat_date == "2023-12-31"
+    assert abs(queried.roe - 0.35) < 1e-4
+    assert abs(queried.cfo_to_net_profit - 0.89) < 1e-4
+    assert queried.industry_name == "食品饮料"
+    assert queried.industry_tier == "tier2_consumer"
+    assert abs(queried.terminal_pe - 20.0) < 1e-4
+    assert queried.is_blacklisted is False
+
+    # Query specific report_year
+    queried_2023 = mem_cache.query_fundamentals("BaoStockDataProvider", "600519.SH", report_year=2023)
+    assert queried_2023 is not None
+    assert queried_2023.report_year == 2023
+
+    # Query non-existent year
+    queried_2020 = mem_cache.query_fundamentals("BaoStockDataProvider", "600519.SH", report_year=2020)
+    assert queried_2020 is None
+
+    # Query industry metadata
+    meta = mem_cache.query_industry_metadata("BaoStockDataProvider", "600519.SH")
+    assert meta is not None
+    assert meta["industry_name"] == "食品饮料"
+    assert meta["industry_tier"] == "tier2_consumer"
+    assert meta["terminal_pe"] == 20.0
+    assert meta["is_blacklisted"] is False
+
