@@ -11,7 +11,7 @@
 
 ## 一、 跨方案架构协同总览 (Cross-Track Architectural Synergy)
 
-当前代码库正处于从“纯日线形态/中枢回测”向“**5分钟日内高频微观结构共振（Track T）** + **形态学/拍卖理论/A股筹码分布多流派量化融合（Track C）**”跨越的关键阶段。两大轨道并非割裂运作，而是深度共享底层基础设施，并在特征层、策略层与实盘层形成强烈的非线性 Alpha 乘数效应：
+当前代码库正处于从“纯日线形态/中枢回测”向“**5分钟日内高频微观结构共振（Track T）** + **形态学/拍卖理论/A股筹码分布多流派量化融合（Track C）** + **SuperTrend 自适应趋势跟踪与切面止损体系（Track S）**”三大轨道跨越的关键阶段。三大轨道并非割裂运作，而是深度共享底层基础设施，并在特征算子层、切面解耦层、策略层与实盘层形成强烈的非线性 Alpha 乘数效应与单向棘轮风险锁死机制：
 
 ```mermaid
 flowchart TD
@@ -20,26 +20,28 @@ flowchart TD
         DATA["common/data.py & common/financial_api.py\n(BaoStock T-1底座 + 东财盘中直连 + 极值锁定布朗桥合成器)"]
     end
 
-    subgraph OPERATORS["2. 算子与特征层 (Dual Factor & Feature Engines)"]
+    subgraph OPERATORS["2. 算子与特征层 (Triple Factor & Feature Engines)"]
         TRACK_T_FEAT["Track T: 因果日内高频特征聚合\ncommon/intraday_features.py\n(VWAP, RV_5m, RS_Down_5m, UpVol_Ratio, SmartMoney)"]
         TRACK_C_FACT["Track C: 结构形态与筹码动力学算子\ncommon/structural_factors.py\n(Curvature κ, Divergence, Wyckoff Spring, CYQ 筹码)"]
+        TRACK_S_FACT["Track S: 趋势跟踪与自适应算子\ncommon/indicators.py\n(supertrend, adaptive_supertrend, kaufman_efficiency_ratio)"]
     end
 
     subgraph SYNERGY["3. 核心跨方案交汇与数据共振 (Core Synergies)"]
         SYN1["协同 1: 48倍真微观 Volume Profile\n(intraday_features 复用 structural_factors.compute_rolling_poc_series)"]
         SYN2["协同 2: 5m 真实成交核驱动 CYQ 筹码分布\n(以 48根 5m 真实分箱替代日线三角核代理)"]
         SYN3["协同 3: 日内 + 日线双级防洗盘止损\n(早盘毛刺止损豁免与 Wyckoff 弹簧破底翻共振)"]
+        SYN4["协同 4: SuperTrend 追踪止损切面解耦\n(通用单向棘轮风控切面，可与任意 Alpha 入场模型即插即用无缝挂载)"]
     end
 
     subgraph STRATEGY["4. 策略与配置层 (Strategies & Modular Blend Base)"]
         CONFIG["pipeline/research_strategy/rs/config.py\n(全部新增参数默认 False，100% 向后兼容)"]
-        STRATS["旗舰新策略库\n• chan_vp_hybrid (中枢筹码混合)\n• wyckoff_chan_spring (弹簧破底翻)"]
-        BLEND["pipeline/research/blend/blend_base.py (及五大子类)\n• 锚点 1: 分形维数 D_t 宏观状态机风格预算\n• 锚点 2: CYQ 获利盘比例与假中枢质量门禁\n• 锚点 3: VAH 突破与筹码单峰冲力共振定仓\n• 锚点 4: 破底翻 Day 1 加速建仓与顶背驰否决\n• 锚点 5: 结构化 ZG/VAL 吊灯止损与 NPOC 止盈\n• 锚点 6: Rolling IC-IR 与 Löwdin 正交化"]
+        STRATS["旗舰新策略与切面组合库\n• chan_vp_hybrid (中枢筹码混合)\n• wyckoff_chan_spring (弹簧破底翻)\n• supertrend_timing (自适应趋势跟踪择时)\n• timing_aspects (SuperTrend 入场与风控出场切面)"]
+        BLEND["pipeline/research/blend/blend_base.py (及五大子类)\n• 锚点 1: 分形维数 D_t 宏观状态机风格预算\n• 锚点 2: CYQ 获利盘比例与假中枢质量门禁\n• 锚点 3: VAH 突破与筹码单峰冲力共振定仓\n• 锚点 4: 破底翻 Day 1 加速建仓与顶背驰否决\n• 锚点 5: 结构化 ZG/VAL 吊灯止损与 NPOC 止盈\n• 锚点 6: Rolling IC-IR 与 Löwdin 正交化\n• 锚点 7: 宏观宽基 SuperTrend 状态机折半风险预算\n• 锚点 8: 标的级 SuperTrend 下穿动量防线一票否决置 0.0"]
     end
 
     subgraph LIVE["5. 实盘执行护栏 (Two-Stage Live Execution)"]
-        STAGE1["scripts/check_live_portfolio_health.py @ 14:00\n(逐笔盯市 HWM 回撤、午后跳水门禁、下行半方差缩放)"]
-        STAGE2["scripts/run_live_strategy.py @ 14:15\n(跌停封死双向冻结防透支、T+1涨停拦截、双模式限价引导)"]
+        STAGE1["scripts/check_live_portfolio_health.py @ 14:00\n(逐笔盯市 HWM 回撤、午后跳水门禁、下行半方差缩放、CAUTION_SUPERTREND_BREAK 破位预警)"]
+        STAGE2["scripts/run_live_strategy.py @ 14:15\n(跌停封死双向冻结防透支、T+1涨停拦截、双模式限价引导、supertrend_stop_level 动态止损单)"]
     end
 
     INFRA --> OPERATORS
@@ -51,7 +53,7 @@ flowchart TD
 
 ---
 
-## 二、 原子任务全量拆解清单（共 28 个原子任务）
+## 二、 原子任务全量拆解清单（共 35 个原子任务）
 
 ### 2.1 《5分钟高频日内数据方案》原子任务表（`T0.1`–`T6.2`，共 19 个任务）
 
@@ -97,6 +99,20 @@ flowchart TD
 
 ---
 
+### 2.3 《SuperTrend 自适应趋势跟踪与切面止损体系方案》原子任务表（`S1.1`–`S4.2`，共 7 个任务）
+
+| 任务编号 | 状态 | 任务名称 | 涉及核心文件与符号 | 核心交付内容与验收标准 (含单向棘轮机制与 8 大 Blend 锚点协同) | 配套离线单测 | 规模 | 前置依赖 |
+| :--- | :---: | :--- | :--- | :--- | :--- | :---: | :--- |
+| **`S1.1`** | `[ ]` | 实现 SuperTrend 基础算子与单向棘轮机制 | [`common/indicators.py`](file:///home/stone/Work/github/quant/common/indicators.py)<br>`supertrend` | 1. 实现经典 SuperTrend 算法：计算基础带轨 $BasicUpper = (H+L)/2 + m \times ATR$ 与 $BasicLower = (H+L)/2 - m \times ATR$；<br>2. 严格实现因果单向棘轮机制 (One-Way Ratchet)：多头态时下轨 $FinalLower_t = \max(BasicLower_t, FinalLower_{t-1})$（仅当 $C_{t-1} > FinalLower_{t-1}$ 时向上抬升），空头态时上轨 $FinalUpper_t = \min(BasicUpper_t, FinalUpper_{t-1})$（仅向下压低），严禁回退松动；<br>3. 状态翻转因果判别：收盘价下穿 $FinalLower_{t-1}$ 时翻转为看空状态并重置基准，上穿 $FinalUpper_{t-1}$ 时翻转为看多状态；<br>4. 输出 DataFrame 包含 `supertrend`（当前有效带轨）、`supertrend_direction`（+1 看多 / -1 看空）、`supertrend_upper` 与 `supertrend_lower`，杜绝未来函数。 | `test_indicators.py` | **S** | 无 |
+| **`S1.2`** | `[ ]` | 实现自适应考夫曼效率比 (ER) 与多空非对称乘数扩展 | [`common/indicators.py`](file:///home/stone/Work/github/quant/common/indicators.py)<br>`adaptive_supertrend`<br>`kaufman_efficiency_ratio` | 1. 实现考夫曼效率比算子 `kaufman_efficiency_ratio(close, period=10)`：$ER_t = \frac{\|C_t - C_{t-n}\|}{\sum_{i=0}^{n-1} \|C_{t-i} - C_{t-i-1}\|}$，反映趋势纯度（$ER \in [0, 1]$）；<br>2. 动态自适应 ATR 乘数映射：$m_t = m_{\min} + (1 - ER_t) \times (m_{\max} - m_{\min})$，强趋势阶段乘数收紧（防利润大幅回吐），震荡整理阶段乘数放大（防噪音频繁假破位洗盘）；<br>3. 支持多空非对称乘数（`multiplier_up` vs `multiplier_down`）以契合 A 股多头单向主导及“牛短熊长、暴跌缓涨”非对称波动特征；<br>4. 完善零波动保护（分母为 0 时返回 0.0）与向前对齐处理，输出无前视偏差浮点序列。 | `test_indicators.py` | **M** | `S1.1` |
+| **`S2.1`** | `[ ]` | 研发 SuperTrend 择时策略模板与配置参数组 | [`pipeline/research_strategy/rs/supertrend_strategy.py`](file:///home/stone/Work/github/quant/pipeline/research_strategy/rs/supertrend_strategy.py)<br>[`pipeline/research_strategy/rs/config.py`](file:///home/stone/Work/github/quant/pipeline/research_strategy/rs/config.py)<br>`SuperTrendTimingStrategy`<br>`StrategyConfig` | 1. 策略标识 `supertrend_timing`，继承 `AllocationTemplate`，实现 `generate_weights`, `explain_weights`, `warmup_bars`；<br>2. 配置参数扩展：`supertrend_period=10`, `supertrend_multiplier=3.0`, `supertrend_adaptive=False`, `supertrend_er_period=10`, `supertrend_min_mult=1.5`, `supertrend_max_mult=4.0`；<br>3. 严格遵循稀疏权重契约：未调仓日全量填充 `NaN`，仅在状态翻转及周期重平衡日输出显式目标权重；<br>4. 标的出场或空仓时**强制写入显式 `0.0`**（严禁保留 `NaN` 导致回测引擎错误向后继承旧仓位，牢记 `AGENTS.md` 铁律）；<br>5. 继承 `apply_asset_inertia` 支持调仓死区惰性过滤，防范频繁微调交易滑点磨损。 | `test_supertrend_strategy.py` | **M** | `S1.1`, `S1.2` |
+| **`S2.2`** | `[ ]` | SuperTrend 模块化切面解耦与 Aspect Composition 搜索支持 | [`pipeline/research_strategy/rs/timing_aspects.py`](file:///home/stone/Work/github/quant/pipeline/research_strategy/rs/timing_aspects.py)<br>`SuperTrendEntryAspect`<br>`SuperTrendRiskExitAspect`<br>[`common/strategy_aspects.py`](file:///home/stone/Work/github/quant/common/strategy_aspects.py) | 1. 解耦出 `SuperTrendEntryAspect`：当趋势由空转多或处于多头强化通道时输出建仓/加仓意愿信号；<br>2. 解耦出 `SuperTrendRiskExitAspect`：作为独立通用风控切面，单向锁定止损线，向下击穿即刻发出清仓信号，可跨策略任意即插即用挂载；<br>3. 接入 `CompositeTimingTemplate` 组合框架，支持与既有 4 大时序策略（RSI, Swing, ChanPivot, Turtle）切面自由交叉配对搜索；<br>4. 生成策略合规 `composite_spec` JSON 描述块，确保 `backtester` 可完美无损反序列化复现。 | `test_timing_aspects.py` | **M** | `S2.1` |
+| **`S3.1`** | `[ ]` | Blend 宏观风险预算门禁与资产级动量防线集成 | [`pipeline/research/blend/blend_base.py`](file:///home/stone/Work/github/quant/pipeline/research/blend/blend_base.py)<br>`BaseBlendAllocationStrategy`<br>锚点 7, 锚点 8 | 1. **锚点 7（宏观 SuperTrend 状态机与风险预算）**：新增 `blend_enable_macro_supertrend=False`，追踪全市场基准（沪深300/中证500）SuperTrend 轨道；若指数下穿 SuperTrend（处于看空态），自动将组合全局风险敞口/仓位上限折半（`risk_scale = 0.50`），将腾出资金引导至现金管理；<br>2. **锚点 8（资产级 SuperTrend 动量防线一票否决）**：新增 `blend_enable_asset_supertrend_defense=False`，个股/ETF 无论在 Alpha 层面评分多高或出现中枢/三买/突破，若其收盘价跌破自身 SuperTrend 止损下轨（`direction == -1`），触发一票否决权，当日目标权重直接置显式 `0.0`；<br>3. 默认参数保持 `False`（100% 向后兼容既有 `blend_6..13` 回测结果）。 | `test_blend_supertrend.py` | **M** | `S1.1`, `S2.1` |
+| **`S4.1`** | `[ ]` | 实盘两阶段执行护栏与交割单止损价位引导 | [`scripts/check_live_portfolio_health.py`](file:///home/stone/Work/github/quant/scripts/check_live_portfolio_health.py)<br>[`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py)<br>`CAUTION_SUPERTREND_BREAK`<br>`supertrend_stop_level` | 1. **Stage 1 健康检查升级 (14:00)**：在检查持仓健康度时计算各标的 SuperTrend 轨线，若持仓标的盘中最新价跌破下轨，生成 `CAUTION_SUPERTREND_BREAK` 告警并写入 `stage1_health_report.json`；<br>2. **Stage 2 实盘执行升级 (14:15)**：解析 Stage 1 报告，对触发破位的持仓标的在 Phase 1 优先挂单清仓；<br>3. **交割单字段增强**：在 `generate_orders` 生成的订单列表中新增 `supertrend_stop_level`（次日绝对止损参考价）与 `supertrend_status`（多头持仓/空头防守），供交易员执行盘中条件单挂单盯盘。 | `test_live_supertrend_guard.py` | **M** | `S1.1`, `S3.1` |
+| **`S4.2`** | `[ ]` | 离线全套测试套件、消融实验与 Walkforward 审计 | `common/tests/test_indicators.py`<br>`pipeline/research_strategy/tests/test_supertrend_strategy.py`<br>`test_blend_supertrend.py`<br>`test_live_supertrend_guard.py`<br>[`walkforward-audit`](file:///home/stone/Work/github/quant/.agents/skills/walkforward-audit/SKILL.md) | 1. 编写 100% 离线单测（单向棘轮单调性断言、自适应 ER 边界验证、NaN vs 0.0 稀疏权重契约测试、实盘两阶段破位拦截模拟）；<br>2. 运行 Phase 6 逐项消融实验，分别对比开启锚点 7（宏观预算）与锚点 8（资产防线）对夏普比率、卡玛比率与最大回撤的边际改善；<br>3. 调取 `walkforward-audit` 技能进行 Deflated Sharpe Ratio (DSR) 变体数惩罚检验与 Leave-One-Out (LOO) 资产脆弱性审计，生成审计结论报告。 | `pytest` 全绿 | **L** | `S2.2`, `S3.1`, `S4.1` |
+
+---
+
 ## 三、 五级主优先级执行路线图与并行波次编排（`Tier P0` $\to$ `Tier P4`）
 
 ```mermaid
@@ -108,34 +124,40 @@ flowchart TD
         C11["C1.1: Volume Profile 算子下沉解耦\n(common/structural_factors.py)"]
     end
 
-    subgraph WAVE1["Wave 1 (Tier P0/P1: 算子实现与数据底座扩展) - 双轨并行"]
+    subgraph WAVE1["Wave 1 (Tier P0/P1: 算子实现与数据底座扩展) - 三轨并行"]
         C12["C1.2: M1-M4 核心形态学动力学算子\n(Curvature, Divergence, Spring, Effort)"]
         C13["C1.3: A股 CYQ 换手衰减递归引擎\n(WinnerRatio & 90% Cost Concentration)"]
         T11["T1.1: DuckDB 分钟双轨缓存表\n(intraday_ohlcv_bars, R4/R13)"]
         T12["T1.2: Synthetic 钉扎布朗桥 5m 生成器\n(极值与日线 100% 严格对齐, R2)"]
+        S11["S1.1: SuperTrend 基础算子与单向棘轮\n(common/indicators.py, supertrend)"]
+        S12["S1.2: 自适应 ER 与多空非对称乘数\n(adaptive_supertrend, kaufman_er)"]
     end
 
-    subgraph WAVE2["Wave 2 (Tier P1/P2: 旗舰新策略研发与外部行情接口接入)"]
+    subgraph WAVE2["Wave 2 (Tier P1/P2: 旗舰新策略研发、切面解耦与外部行情接口接入)"]
         C21["C2.1: 旗舰新策略 chan_vp_hybrid\n(HVN 中枢校验 + 三买微观 POC)"]
         C22["C2.2: 旗舰新策略 wyckoff_chan_spring\n(因果支撑破底翻 + 高曲率 V 反)"]
         C23["C2.3: 既有单策略向后兼容升级\n(ThirdBuy, MRD, RegimeCompound, M6)"]
+        S21["S2.1: SuperTrend 择时策略与稀疏权重契约\n(supertrend_strategy.py, NaN vs 0.0)"]
+        S22["S2.2: SuperTrend 模块化切面解耦与 Aspect 组合\n(timing_aspects.py, Entry/RiskExit)"]
         T13["T1.3: BaoStockDataProvider T-1 深度底座"]
         T14["T1.4: EastMoneyDataProvider 盘中直连"]
         T15["T1.5: scripts/record_intraday_5m.py 守护"]
     end
 
-    subgraph WAVE3["Wave 3 (Tier P2/P3: 因果特征聚合与 Blend 底座宏观/质量增强)"]
+    subgraph WAVE3["Wave 3 (Tier P2/P3: 因果特征聚合与 Blend 底座宏观/质量/风险预算增强)"]
         T21["T2.1: intraday_features 因果截断器\n(14:15 截断 + κ_t 复权对齐, R1/R4/R6/R12)"]
         T22["T2.2: 隔夜跳空剥离聪明钱与主买量能"]
         T23["T2.3: 5m 缠论次级别结构惰性计算 (R9)"]
         C31["C3.1: Blend 状态机、CYQ 门禁与冲力共振\n(blend_base.py 锚点 1, 2, 3)"]
+        S31["S3.1: Blend 宏观风险预算与资产动量防线\n(blend_base.py 锚点 7 状态机 + 锚点 8 资产防线)"]
     end
 
-    subgraph WAVE4["Wave 4 (Tier P3: Blend 入场/出场全链路闭环与实盘微观护栏)"]
+    subgraph WAVE4["Wave 4 (Tier P3: Blend 入场/出场全链路闭环与实盘微观/止损护栏)"]
         T31["T3.1: Blend 缠论日线 × 5m 区间套"]
         T32["T3.2: Blend 有符号量能与下行波动率定仓"]
         T33["T3.3: Blend 5m 防毛刺止损与三卖止盈"]
         C32["C3.2: Blend 弹簧加速、结构止损与正交化\n(blend_base.py 锚点 4, 5, 6)"]
+        S41["S4.1: 实盘两阶段执行护栏与交割单止损引导\n(Stage 1 破位预警 + Stage 2 止损单)"]
         T41["T4.1: Stage 1 盘中回撤与午后跳水门禁 (R5)"]
         T42["T4.2: Stage 2 卖单跌停双向冻结防透支 (R10/R14)"]
         T43["T4.3: Stage 2 交割单双模式限价引导 (R11)"]
@@ -145,6 +167,7 @@ flowchart TD
         T51["T5.1: test_intraday_features.py (测试 1-7)"]
         T52["T5.2: test_blend_intraday_5m.py (测试 8-10)"]
         C41["C4.1: test_structural_factors.py 及新策略单测"]
+        S42["S4.2: SuperTrend 离线测试套件与 Walkforward 审计\n(单向棘轮单测 + 消融实验 + LOO 审计)"]
         T61["T6.1: Phase 6 Walkforward 逐项消融实验"]
         T62["T6.2: DSR 校正 + 单次 ERS + LOO 脆弱性终审"]
     end
@@ -161,10 +184,10 @@ flowchart TD
 | 优先级梯队 (Tier) | 执行波次与并行轨道 | 包含任务 ID 清单 | 优先级排序依据 (Why This Priority) | 阶段准出标准 (Exit Criteria) |
 | :--- | :--- | :--- | :--- | :--- |
 | **Tier P0**<br>(基础设施基石) | **Wave 0**<br>(零依赖独立快速修复) | `T0.1`, `T0.2`, `T0.3`<br>`C1.1` | **无依赖致命缺陷先行**：`T0.1`–`T0.3` 均为代码库既有致命 Bug（如 `1m` 误映射月末、VWAP 前视泄漏、实盘健康报告未读取），修复不仅零依赖，且能立即解除后续所有模块的底层隐患；`C1.1` 将 POC 下沉为共享库解除分层循环依赖。 | 修复通过代码审查与离线单测，`import common.structural_factors` 无警告，`Alpha101` 无前视。 |
-| **Tier P1**<br>(数据与新策略) | **Wave 1 & 2**<br>(Track T 数据底座 + Track C 旗舰新策略) | `C1.2`, `C1.3`, `T1.1`, `T1.2`<br>`C2.1`, `C2.2`, `C2.3`<br>`T1.3`, `T1.4`, `T1.5` | **双轨并行解耦加速**：在有了 `T1.2` 钉扎布朗桥与 `C1.2`/`C1.3` 算子库后，两只旗舰新策略 `C2.1`/`C2.2` 可在纯日线与合成数据下完全独立研发，与外部网络行情源接入（`T1.3`–`T1.5`）互不阻塞。 | 钉扎布朗桥按日聚合与日线比特级一致；两只新策略跑通 `generate_weights`，严格遵守稀疏权重契约。 |
-| **Tier P2**<br>(特征与宏观底座) | **Wave 3**<br>(高频特征聚合 + Blend 宏观/质量增强) | `T2.1`, `T2.2`, `T2.3`<br>`C3.1` | **自下而上驱动底座**：先由因果截断引擎输出标准的特征矩阵，再将特征注入 `BaseBlendAllocationStrategy` 的状态机（锚点 1）、质量门禁（锚点 2）与冲力共振（锚点 3）。 | `enrich_universe_with_intraday_features` 满足 $\kappa_t$ 复权对齐；Blend 在开关开启后准确过滤深套与空心标的。 |
-| **Tier P3**<br>(全链路与实盘护栏) | **Wave 4**<br>(微观共振闭环 + 实盘 Stage 1/2 护栏) | `T3.1`, `T3.2`, `T3.3`<br>`C3.2`<br>`T4.1`, `T4.2`, `T4.3` | **高阶微观整合与实盘风控防护**：在入场端实现弹簧与 5m 区间套双通道加速，在出场端实现结构化吊灯止损；同时在实盘 Stage 1/2 筑牢跌停封死双向冻结（R14）与双模式限价单引导（R11）。 | 威科夫弹簧实现 Day 1 加速建仓；跌停卖单未成交资金在 Phase 2 与 Phase 4 彻底冻结，交割单无透支。 |
-| **Tier P4**<br>(单测与终审验证) | **Wave 5**<br>(全套离线单测 + 严苛消融终审) | `T5.1`, `T5.2`<br>`C4.1`<br>`T6.1`, `T6.2` | **质量终审与防过拟合铁律**：全部代码合入后，默认配置严格保持 `False`。必须通过全套离线测试、逐项 Walkforward 消融实验、DSR 显著性惩罚与单次 ERS 检验，方可批准生产翻转。 | 100% 离线单测通过（0 网络请求）；DSR 显著；通过 `walkforward-audit` LOO 脆弱性审计并给出正式评级。 |
+| **Tier P1**<br>(数据与新策略) | **Wave 1 & 2**<br>(Track T 数据底座 + Track C/S 旗舰新策略与切面) | `C1.2`, `C1.3`, `T1.1`, `T1.2`<br>`S1.1`, `S1.2`<br>`C2.1`, `C2.2`, `C2.3`<br>`S2.1`, `S2.2`<br>`T1.3`, `T1.4`, `T1.5` | **三轨并行解耦加速**：在有了 `T1.2` 钉扎布朗桥与 `C1.2`/`C1.3`、`S1.1`/`S1.2` 基础算子库后，旗舰新策略 `C2.1`/`C2.2` 与 `S2.1`（SuperTrend 择时）可在纯日线与合成数据下完全独立研发，并推进 `S2.2` 切面解耦，与外部网络行情源接入（`T1.3`–`T1.5`）互不阻塞。 | 钉扎布朗桥按日聚合与日线比特级一致；新策略跑通 `generate_weights` 并严格遵守稀疏权重契约（无 `NaN` 扩散）；SuperTrend 算子通过单向棘轮单调性断言；切面解耦模块可与 Turtle/RSI 自由交叉配对。 |
+| **Tier P2**<br>(特征与宏观底座) | **Wave 3**<br>(高频特征聚合 + Blend 宏观/质量/风险预算增强) | `T2.1`, `T2.2`, `T2.3`<br>`C3.1`, `S3.1` | **自下而上驱动底座**：先由因果截断引擎输出标准的特征矩阵，再将特征与趋势轨线注入 `BaseBlendAllocationStrategy` 的状态机（锚点 1）、质量门禁（锚点 2）、冲力共振（锚点 3）、宏观风险预算折半（锚点 7）与资产动量防线（锚点 8）。 | `enrich_universe_with_intraday_features` 满足 $\kappa_t$ 复权对齐；Blend 策略在开启锚点 1/2/3/7/8 后，能准确在指数空头态折半全局预算，对深套、空心及破位标的精准置 `0.0` 否决。 |
+| **Tier P3**<br>(全链路与实盘护栏) | **Wave 4**<br>(微观共振闭环 + 实盘 Stage 1/2 护栏) | `T3.1`, `T3.2`, `T3.3`<br>`C3.2`, `S4.1`<br>`T4.1`, `T4.2`, `T4.3` | **高阶微观整合与实盘风控防护**：在入场端实现弹簧与 5m 区间套双通道加速，在出场端实现结构化吊灯止损；同时在实盘 Stage 1/2 筑牢跌停封死双向冻结（R14）、双模式限价单引导（R11）与 SuperTrend 盘中破位预警（`CAUTION_SUPERTREND_BREAK`）联动次日止损单生成。 | 威科夫弹簧实现 Day 1 加速建仓；跌停卖单未成交资金在 Phase 2 与 Phase 4 彻底冻结；实盘 Stage 1 精准识别 SuperTrend 破位并写入健康报告，Stage 2 优先平仓且交割单精准包含动态止损参考价 `supertrend_stop_level`。 |
+| **Tier P4**<br>(单测与终审验证) | **Wave 5**<br>(全套离线单测 + 严苛消融终审) | `T5.1`, `T5.2`<br>`C4.1`, `S4.2`<br>`T6.1`, `T6.2` | **质量终审与防过拟合铁律**：全部代码合入后，默认配置严格保持 `False`。必须通过全套离线测试（含 SuperTrend 单向棘轮、稀疏权重及切面测试）、逐项 Walkforward 消融实验、DSR 显著性惩罚与单次 ERS 检验，方可批准生产翻转。 | 100% 离线单测通过（0 网络请求）；消融实验证明宏观预算与资产防线显著降低组合最大回撤；DSR 显著；通过 `walkforward-audit` LOO 脆弱性审计并给出正式评级。 |
 
 ---
 
@@ -177,21 +200,30 @@ flowchart TD
 # 1. 运行结构化算子库与数学量纲修正测试 (M1-M5, C1.1-C1.3)
 uv run --project pipeline pytest pipeline/research_strategy/tests/test_structural_factors.py -v
 
-# 2. 运行两只旗舰新策略独立单元测试 (稀疏权重 NaN vs 0.0 契约验证, C2.1-C2.2)
+# 2. 运行 SuperTrend 底层自适应算子与单向棘轮测试 (S1.1, S1.2)
+uv run --project pipeline pytest common/tests/test_indicators.py -k "supertrend" -v
+
+# 3. 运行两只旗舰新策略独立单元测试 (稀疏权重 NaN vs 0.0 契约验证, C2.1-C2.2)
 uv run --project pipeline pytest pipeline/research_strategy/tests/test_chan_vp_hybrid.py -v
 uv run --project pipeline pytest pipeline/research_strategy/tests/test_wyckoff_chan_strategy.py -v
 
-# 3. 运行 5m 日内缓存、数据解析与特征因果截断测试 (测试 1-7, T5.1)
+# 4. 运行 SuperTrend 择时策略、Aspect 切面解耦与 Blend 防线单元测试 (S2.1, S2.2, S3.1, S4.2)
+uv run --project pipeline pytest pipeline/research_strategy/tests/test_supertrend_strategy.py -v
+uv run --project pipeline pytest pipeline/research_strategy/tests/test_timing_aspects.py -k "supertrend" -v
+uv run --project pipeline pytest pipeline/research_strategy/tests/test_blend_supertrend.py -v
+uv run --project pipeline pytest pipeline/research_strategy/tests/test_live_supertrend_guard.py -v
+
+# 5. 运行 5m 日内缓存、数据解析与特征因果截断测试 (测试 1-7, T5.1)
 uv run --project pipeline pytest common/tests/test_intraday_features.py -v
 
-# 4. 运行 Blend 策略 5m 区间套加速、结构化止损与实盘跌停冻结测试 (测试 8-10, T5.2)
+# 6. 运行 Blend 策略 5m 区间套加速、结构化止损与实盘跌停冻结测试 (测试 8-10, T5.2)
 uv run --project pipeline pytest pipeline/research_strategy/tests/test_blend_intraday_5m.py -v
 
-# 5. 回归测试既有 55+ 策略库与 Allocation Templates (100% 向后兼容)
+# 7. 回归测试既有 55+ 策略库与 Allocation Templates (100% 向后兼容)
 uv run --project pipeline pytest pipeline/research_strategy/tests/test_chan_advanced_strategies.py -q
 uv run --project pipeline pytest pipeline/research_strategy/tests/test_allocation_templates.py -q
 
-# 6. 离线全流程实盘模拟演练 (Stage 1 @ 14:00 + Stage 2 @ 14:15)
+# 8. 离线全流程实盘模拟演练 (Stage 1 @ 14:00 + Stage 2 @ 14:15)
 uv run --project pipeline python scripts/check_live_portfolio_health.py \
     --data-provider synthetic \
     --enable-intraday-5m \
@@ -222,7 +254,8 @@ uv run --project pipeline python scripts/run_live_strategy.py \
    - 增量 3：叠加 `blend_enable_vp_confluence_sizing`（VAH 突破冲力共振）；
    - 增量 4：叠加 `blend_enable_spring_fast_entry`（弹簧破底翻首日加速）；
    - 增量 5：叠加 `blend_enable_structural_chandelier_stop`（结构化吊灯止损）；
-   - 增量 6：叠加 5m 日内特征共振（`blend_enable_intraday_5m`, `blend_enable_5m_interval_nesting`）。
+   - 增量 6：叠加 5m 日内特征共振（`blend_enable_intraday_5m`, `blend_enable_5m_interval_nesting`）；
+   - 增量 7：叠加 SuperTrend 宏观状态机与资产级动量防线（`blend_enable_macro_supertrend`, `blend_enable_asset_supertrend_defense`）。
    **准入要求**：每一项增益必须在不劣质化最大回撤（MDD）的前提下显著增厚 CAGR 或提升夏普比率（Sharpe Ratio）。
 2. **Deflated Sharpe Ratio (DSR) 变体数惩罚校正**：
    将全部消融测试中尝试过的变体总数 $N$ 纳入多重检验惩罚（Harvey, Liu & Zhu, 2016），要求最终胜出配置的 $DSR \ge 0.95$（对应 $t \ge 2.0$ 统计显著性）。
