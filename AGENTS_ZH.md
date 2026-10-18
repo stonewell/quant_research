@@ -71,18 +71,21 @@ uv run python run_pipeline.py --data-provider synthetic --universe SPY QQQ ...
 
 ---
 
-## 子代理与模型路由策略 -- 调用 Subagent 与修改文件前必读
+## 核心量化工程规范 (Core Quantitative Engineering Rules)
 
-本章节作为用户的显式常驻指令，用于指导 `invoke_subagent` 的 `Model` 参数选择及主代理职责划分（覆盖默认的 `inherit` 策略）：
-
-- **重型推理模型（Claude 与 Gemini Pro）—— 仅负责思考、规划与审查（禁止直接编辑工作区文件）：**
-  - 当主代理运行在 **Claude** 模型或 **Gemini Pro**（重型）模型上时，**仅**执行高阶思考工作：方案规划 (Plan)、架构设计、代码/文档审查 (Review)、量化归因审计、问题诊断及子代理编排（允许在 brain 制品目录中创建计划或审查 Artifact）。
-  - **所有实际的工作区文件修改（对仓库文件调用 `replace_file_content`、`write_to_file`）必须委派给子代理**（`TypeName="self"`），并指定合适的轻量模型（`Model="flash"` 或 `Model="flash_lite"`），将明确的修改规范或 Diff 交由子代理执行。
-- **轻量级任务委派给子代理 (Subagent)：** 将独立、常规或容易占用大量上下文的轻量级任务委派给子代理（只读代码探索、文件阅读、文档/网页检索使用 `TypeName="research"`；需要文件修改或运行命令/测试时使用 `TypeName="self"`），以保持主对话上下文精简高效。
-- **模型层级路由 (`invoke_subagent` 中的 `Model` 参数)：**
-  - **`Model="flash"`（轻量级任务与文件编辑 —— 委派默认选项）：** 适用于执行已规划的文件修改、按规范编写代码、运行测试、代码库搜索、文件/日志阅读与摘要、Schema/配置检查及文档查询。
-  - **`Model="flash_lite"`（极简单步任务）：** 适用于极度简单的单步查询、单行/样板微调、格式整理或快速状态检查。
-  - **`Model="inherit"` / `Model="pro"`（仅限复杂推理）：** 严格保留给需要独立进行深度量化推理、多步架构规划或 Walkforward 归因审计的子代理任务。
+1. **100% 离线测试规范 (100% Offline Testing)**：
+   - 单元测试与示例命令中严禁使用真实市场数据或网络请求。
+   - 所有测试套件必须通过 `SyntheticDataProvider` 或 `common/testing.py` 的合成 OHLCV 生成器 100% 离线运行。
+   - 命令行参数默认值必须为 `--data-provider synthetic`。
+2. **任务与路线图唯一事实来源 (SSOT)**：
+   - 所有量化工程任务拆解、状态追踪、优先级队列及执行路线图统一集中在 `docs/development_plan.md` 中维护。
+   - `docs/` 下的各模块设计与架构文档必须链接至 `docs/development_plan.md` 查看任务清单和执行状态。
+3. **稀疏权重契约与单元格 NaN vs 0.0 (Sparse Weights Contract & Cell-level NaN vs. 0.0)**：
+   - `generate_weights(universe, params)` 返回的权重矩阵仅在实际调仓日记录目标权重，其余非调仓日必须保持为 `NaN`。
+   - 模板内部绝不进行前向填充 (`ffill()`)。
+   - 在实际调仓日行中，标的若需平仓或回避风险必须显式赋予 `0.0`；若保留为 `NaN`，回测引擎的列级前向填充会将上期持仓权重隐式延续。
+4. **等价随机搜索唯一校验 (Single ERS)**：
+   - ERS 验证（`common/allocation_search.py`）在单次搜索中**仅执行一次**，且仅对最终选出的冠军策略/参数组合进行校验，绝不逐个候选模板运行 ERS。
 
 ---
 

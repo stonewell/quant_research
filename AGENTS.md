@@ -136,18 +136,22 @@ available in the current shell.
     snapshot archiving (`data/runs/<date>/`), and custom universe editing. Regional core-satellite
     pools reside in `docs/universe/` (China A-Shares, US equities, Hong Kong stocks).
 
-## Subagent & model routing policy
+## Core quantitative engineering rules
 
-This section serves as an explicit standing user instruction for `invoke_subagent` `Model` selection and primary-agent role separation (overriding the default `inherit` fallback):
+1. **100% Offline Testing**:
+   - Never use real market data or network access in tests or example commands.
+   - Every test suite must run 100% offline via `SyntheticDataProvider` or `common/testing.py` synthetic OHLCV generators.
+   - CLI defaults must be `--data-provider synthetic`.
+2. **Single Source of Truth (SSOT)**:
+   - All quantitative engineering task breakdowns, status tracking, priority queues, and execution roadmaps must be centralized exclusively in `docs/development_plan.md` (in Chinese).
+   - Module specification and architecture docs in `docs/` must link to `docs/development_plan.md` for task lists and status.
+3. **Sparse Weights Contract & Cell-level NaN vs. 0.0**:
+   - `generate_weights(universe, params)` must return sparse weights with target weights only on actual rebalance dates, leaving intermediate non-rebalance dates as `NaN`.
+   - Never forward-fill (`ffill()`) weights within the template itself.
+   - Inside an actual rebalance row, a cell value of `0.0` explicitly de-risks or exits an asset. Leaving a cell `NaN` carries forward the previous held weight due to global backtester column-wise `ffill()`.
+4. **Single Equivalent Random Search (ERS)**:
+   - Run ERS validation (`common/allocation_search.py`) exactly **once per search**, exclusively on the already-chosen winning strategy. Never run ERS once per candidate template.
 
-- **Heavy reasoning models (Claude & Gemini Pro) -- thinking, planning & review only (no direct workspace file edits):**
-  - When the primary agent is running on a **Claude** model or **Gemini Pro** (heavy) model, it must **only** perform high-level thinking work: planning, architectural design, code/plan review, quantitative auditing, debugging diagnosis, and subagent orchestration (creating plan/review artifacts in the brain artifact directory is permitted).
-  - **All real workspace file editing (`replace_file_content`, `write_to_file` on repo files) must be delegated to a subagent** (`TypeName="self"`) using a light model (`Model="flash"` or `Model="flash_lite"`), passing the exact specification or diff to apply.
-- **Delegate lightweight tasks to subagents:** Offload self-contained, routine, or context-heavy lightweight work to a subagent (`TypeName="research"` for read-only codebase exploration, file reading, and web/doc lookups; `TypeName="self"` when file edits or test/command runs are required) to keep the primary context window lean.
-- **Model tier routing (`Model` parameter in `invoke_subagent`):**
-  - **`Model="flash"` (Lightweight tasks & file editing -- default for delegation):** Use for executing planned file edits, applying code changes from a specification, running tests, codebase searches, reading/summarizing files or logs, checking schemas/configs, and doc lookups.
-  - **`Model="flash_lite"` (Trivial one-step tasks):** Use for ultra-simple single-step lookups, trivial one-line/boilerplate edits, formatting, or quick status checks.
-  - **`Model="inherit"` / `Model="pro"` (Complex reasoning only):** Reserve strictly for subagents that must independently perform deep quantitative reasoning, multi-step architectural planning, or forensic walkforward auditing.
 
 ## Documentation & coding style conventions
 

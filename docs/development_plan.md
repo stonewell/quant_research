@@ -11,19 +11,20 @@
 
 ## 一、 跨方案架构协同总览 (Cross-Track Architectural Synergy)
 
-当前代码库正处于从“纯日线形态/中枢回测”向“**5分钟日内高频微观结构共振（Track T）** + **形态学/拍卖理论/A股筹码分布多流派量化融合（Track C）** + **SuperTrend 自适应趋势跟踪与切面止损体系（Track S）**”三大轨道跨越的关键阶段。三大轨道并非割裂运作，而是深度共享底层基础设施，并在特征算子层、切面解耦层、策略层与实盘层形成强烈的非线性 Alpha 乘数效应与单向棘轮风险锁死机制：
+当前代码库正处于从“纯日线形态/中枢回测”向“**5分钟日内高频微观结构共振（Track T）** + **形态学/拍卖理论/A股筹码分布多流派量化融合（Track C）** + **SuperTrend 自适应趋势跟踪与切面止损体系（Track S）** + **雪球价值投资双估值与安全边际选股体系（Track F）**”四大体系协同演进的关键阶段。四大体系并非割裂运作，而是深度共享底层基础设施，并在特征算子层、切面解耦层、策略层与实盘层形成强烈的非线性 Alpha 乘数效应、基本面确定性安全边际与单向棘轮风险锁死机制：
 
 ```mermaid
 flowchart TD
     subgraph INFRA["1. 共享底层基础设施与数据层 (Shared Infrastructure)"]
-        CACHE["common/duckdb_cache.py\n(双轨存储: ohlcv_bars 日线 + intraday_ohlcv_bars 5m 分钟线)"]
-        DATA["common/data.py & common/financial_api.py\n(BaoStock T-1底座 + 东财盘中直连 + 极值锁定布朗桥合成器)"]
+        CACHE["common/duckdb_cache.py\n(多轨列式存储: ohlcv_bars 日线 + intraday_ohlcv_bars 5m + stock_fundamentals_annual 基本面)"]
+        DATA["common/data.py & common/financial_api.py\n(BaoStock T-1基本面/5m底座 + 东财盘中直连 + 极值锁定布朗桥合成器)"]
     end
 
-    subgraph OPERATORS["2. 算子与特征层 (Triple Factor & Feature Engines)"]
+    subgraph OPERATORS["2. 算子、特征与基本面估值层 (Four Factor & Feature Engines)"]
         TRACK_T_FEAT["Track T: 因果日内高频特征聚合\ncommon/intraday_features.py\n(VWAP, RV_5m, RS_Down_5m, UpVol_Ratio, SmartMoney)"]
         TRACK_C_FACT["Track C: 结构形态与筹码动力学算子\ncommon/structural_factors.py\n(Curvature κ, Divergence, Wyckoff Spring, CYQ 筹码)"]
         TRACK_S_FACT["Track S: 趋势跟踪与自适应算子\ncommon/indicators.py\n(supertrend, adaptive_supertrend, kaufman_efficiency_ratio)"]
+        TRACK_F_FACT["Track F: 价值投资双估值与基本面引擎\npipeline/fundamental_screener/fscreen/valuation_models.py\n(Model 1 终值折现, Model 2 股息资本化, MoS 20%, 行业分类)"]
     end
 
     subgraph SYNERGY["3. 核心跨方案交汇与数据共振 (Core Synergies)"]
@@ -31,11 +32,12 @@ flowchart TD
         SYN2["协同 2: 5m 真实成交核驱动 CYQ 筹码分布\n(以 48根 5m 真实分箱替代日线三角核代理)"]
         SYN3["协同 3: 日内 + 日线双级防洗盘止损\n(早盘毛刺止损豁免与 Wyckoff 弹簧破底翻共振)"]
         SYN4["协同 4: SuperTrend 追踪止损切面解耦\n(通用单向棘轮风控切面，可与任意 Alpha 入场模型即插即用无缝挂载)"]
+        SYN5["协同 5: 基本面质地硬门禁与安全边际定价\n(5大财务底线过滤垃圾资产，MoS 20% 安全边际防守)"]
     end
 
     subgraph STRATEGY["4. 策略与配置层 (Strategies & Modular Blend Base)"]
         CONFIG["pipeline/research_strategy/rs/config.py\n(全部新增参数默认 False，100% 向后兼容)"]
-        STRATS["旗舰新策略与切面组合库\n• chan_vp_hybrid (中枢筹码混合)\n• wyckoff_chan_spring (弹簧破底翻)\n• supertrend_timing (自适应趋势跟踪择时)\n• timing_aspects (SuperTrend 入场与风控出场切面)"]
+        STRATS["旗舰新策略与切面组合库\n• chan_vp_hybrid (中枢筹码混合)\n• wyckoff_chan_spring (弹簧破底翻)\n• supertrend_timing (自适应趋势跟踪择时)\n• timing_aspects (SuperTrend 入场与风控出场切面)\n• fundamental_screener (雪球双估值与五大硬门禁选股)"]
         BLEND["pipeline/research/blend/blend_base.py (及五大子类)\n• 锚点 1: 分形维数 D_t 宏观状态机风格预算\n• 锚点 2: CYQ 获利盘比例与假中枢质量门禁\n• 锚点 3: VAH 突破与筹码单峰冲力共振定仓\n• 锚点 4: 破底翻 Day 1 加速建仓与顶背驰否决\n• 锚点 5: 结构化 ZG/VAL 吊灯止损与 NPOC 止盈\n• 锚点 6: Rolling IC-IR 与 Löwdin 正交化\n• 锚点 7: 宏观宽基 SuperTrend 状态机折半风险预算\n• 锚点 8: 标的级 SuperTrend 下穿动量防线一票否决置 0.0"]
     end
 
@@ -53,7 +55,7 @@ flowchart TD
 
 ---
 
-## 二、 原子任务全量拆解清单（共 35 个原子任务）
+## 二、 原子任务全量拆解清单（共 42 个原子任务）
 
 ### 2.1 《5分钟高频日内数据方案》原子任务表（`T0.1`–`T6.2`，共 19 个任务）
 
@@ -113,6 +115,20 @@ flowchart TD
 
 ---
 
+### 2.4 《雪球价值投资估值与选股体系方案》原子任务表（`F1.1`–`F3.2`，共 7 个任务）
+
+| 任务编号 | 状态 | 任务名称 | 涉及核心文件与符号 | 核心交付内容与验收标准 (含数学公式与工程细节) | 配套离线单测 | 规模 | 前置依赖 |
+| :--- | :---: | :--- | :--- | :--- | :--- | :---: | :--- |
+| **`F1.1`** | `[x]` | DuckDB 基本面与行业分类列式存储底座 | [`common/duckdb_cache.py`](file:///home/stone/Work/github/quant/common/duckdb_cache.py)<br>`_init_tables`<br>`store_fundamentals`<br>`query_fundamentals`<br>`store_industry_metadata`<br>`query_industry_metadata` | 1. 新建 `stock_fundamentals_annual` 列式表（主键 `(provider, symbol, report_year)`），持久化存储净利润、ROE、5年净利CAGR、经营现金流CFO、资产负债率、股息率、分红率、PE/PB等 21 个核心字段与 `last_sync_time`；<br>2. 新建 `stock_industry_metadata` 表（主键 `(provider, symbol)`），持久化 `industry_name`、`industry_tier`、`terminal_pe`、`is_blacklisted` 及 `blacklist_reason`；<br>3. 实现幂等写入（`INSERT OR REPLACE`）与高效倒排查询（`ORDER BY report_year DESC LIMIT 1`），内存模式与磁盘文件模式 100% 行为一致。 | `test_duckdb_cache.py`<br>`test_duckdb_cache_stock_fundamentals_and_industry_metadata` | **M** | 无 |
+| **`F1.2`** | `[x]` | 数据层标准化财务接口与 BaoStock 落地 | [`common/data.py`](file:///home/stone/Work/github/quant/common/data.py)<br>`FundamentalMetrics`<br>`BaseDataProvider.fetch_financial_indicators`<br>`CachedDataProvider`<br>[`common/financial_api.py`](file:///home/stone/Work/github/quant/common/financial_api.py)<br>`BaoStockDataProvider.fetch_financial_indicators` | 1. 在 `common/data.py` 定义高内聚不可变数据容器 `FundamentalMetrics`（规范化 23 个基本面与估值元数据属性）；<br>2. `BaseDataProvider` 定义抽象契约 `fetch_financial_indicators(symbol, as_of_date=None, lookback_years=5)`，`SyntheticDataProvider` 提供纯离线确定性回退，`YFinanceDataProvider` 补齐字段映射；<br>3. `BaoStockDataProvider` 落地真实财务数据拉取：依次串行查询盈利/成长/负债/现金流/分红及收盘行情，严格遵守单进程串行与分页防 OOM 铁律，计算真实 5 年归母净利复合增速 $CAGR = (NP_t / NP_{t-5})^{1/5} - 1$，自动持久化至 DuckDB。 | `test_data.py`<br>`test_financial_api.py` | **L** | `F1.1` |
+| **`F2.1`** | `[x]` | 研发行业自动分类映射与黑名单过滤引擎 | [`pipeline/fundamental_screener/fscreen/valuation_models.py`](file:///home/stone/Work/github/quant/pipeline/fundamental_screener/fscreen/valuation_models.py)<br>`classify_industry_and_terminal_pe`<br>`_BLACKLIST_FINANCIALS`<br>`_BLACKLIST_TECH_ITERATION`<br>`_BLACKLIST_CYCLICALS`<br>`_BLACKLIST_DETERIORATING`<br>`_TIER1_CONSUMER`<br>`_TIER2_CONCESSION`<br>`_TIER3_MANUFACTURING` | 1. 落地雪球价值投资行业三梯队保守终值市盈率（Terminal P/E）基准：<br>&nbsp;&nbsp;• **Tier 1（高端消费/医药商业/品牌中药/家电）**：$PE_{term} = 15.0$；<br>&nbsp;&nbsp;• **Tier 2（公用事业/水电/高速/港口/特许经营）**：$PE_{term} = 13.5$；<br>&nbsp;&nbsp;• **Tier 3（优质制造/机械设备/通用工业龙头）**：$PE_{term} = 10.0$；<br>2. 构建硬核黑名单一票否决引擎：<br>&nbsp;&nbsp;• **金融行业（银行/保险/证券/信托）**：资产质量黑箱与高杠杆不可穿透；<br>&nbsp;&nbsp;• **强技术迭代（芯片/半导体/AI/创新药/软件IT）**：5年盈利不可预测，淘汰极快；<br>&nbsp;&nbsp;• **强周期（钢铁/化工/煤炭/有色/采矿）**：周期顶部暴利失真，均值回归剧烈；<br>&nbsp;&nbsp;• **格局恶化（房地产/光伏/锂电/建筑装饰）**：严重产能过剩与毛利率持续下行；<br>&nbsp;&nbsp;• **资本市场污点**：`*ST`、`ST`、退市整理期标的；<br>3. 支持中英文双语关键字匹配，返回 `(tier_name, terminal_pe, is_blacklisted, blacklist_reason)`。 | `test_valuation_models.py`<br>`test_industry_tier_mapping`<br>`test_blacklist_hard_rejection` | **M** | `F1.2` |
+| **`F2.2`** | `[x]` | 研发双估值模型封闭解析解与安全边际定价 | [`pipeline/fundamental_screener/fscreen/valuation_models.py`](file:///home/stone/Work/github/quant/pipeline/fundamental_screener/fscreen/valuation_models.py)<br>`calc_model1_terminal_discount`<br>`calc_model2_growth_dividend_cap`<br>`evaluate_snowball_valuation` | 1. **模型一（5年期末终值折现模型解析解，[`docs/snowball_strategy.txt`](file:///home/stone/Work/github/quant/docs/snowball_strategy.txt) Model 1）**：<br>&nbsp;&nbsp;定义公比 $\rho = \frac{1+g}{1+r}$，当 $\rho \ne 1$ 时闭式解为：<br>&nbsp;&nbsp;$$MV_1 = E_0 \cdot \left[ \rho^5 \cdot PE_{term} + d \cdot \frac{\rho (1 - \rho^5)}{1 - \rho} \right]$$<br>&nbsp;&nbsp;当 $\rho = 1$ 时解析退化为 $MV_1 = E_0 \cdot [PE_{term} + 5d]$，彻底消灭逐年迭代循环；<br>2. **模型二（成长股息资本化与奇点防护封顶模型，Model 2）**：<br>&nbsp;&nbsp;计算当期分红 $Div_0 = E_0 \cdot d$，设置利差分母奇点保护下界：<br>&nbsp;&nbsp;$$\text{Spread} = \max(r - g, 0.015)$$<br>&nbsp;&nbsp;计算无约束市值 $MV_{raw} = \frac{Div_0}{\text{Spread}}$，并施加保守期末终值封顶：<br>&nbsp;&nbsp;$$\text{Cap} = E_0 \cdot (1+g) \cdot PE_{term}$$<br>&nbsp;&nbsp;$$MV_2 = \min(MV_{raw}, \text{Cap})$$<br>&nbsp;&nbsp;前瞻预期收益率 $ExpectedReturn = g + \frac{Div_0}{MV_2}$；<br>3. **保守公允价值与安全边际买入价**：<br>&nbsp;&nbsp;$$FairMV = \min(MV_1, MV_2)$$<br>&nbsp;&nbsp;$$BuyMV = FairMV \cdot (1 - MoS) \quad (MoS = 0.20)$$<br>&nbsp;&nbsp;$$BuyPrice = \frac{BuyMV}{Shares}$$<br>&nbsp;&nbsp;计算当前安全边际比例 $MoSRatio = \frac{FairMV - MarketCap}{FairMV}$。 | `test_valuation_models.py`<br>`test_model1_analytical_solution_vs_manual_calculation`<br>`test_model2_singularity_guard_and_growth_cap`<br>`test_buy_target_price_and_mos_ratio_calculation` | **M** | `F2.1` |
+| **`F2.3`** | `[x]` | 重构准入硬门禁与卖出触发规则 | [`pipeline/fundamental_screener/fscreen/rules.py`](file:///home/stone/Work/github/quant/pipeline/fundamental_screener/fscreen/rules.py)<br>`quality_ok`<br>`evaluate_buy_sell`<br>`rank_buy_sell`<br>[`pipeline/fundamental_screener/fscreen/valuation_models.py`](file:///home/stone/Work/github/quant/pipeline/fundamental_screener/fscreen/valuation_models.py)<br>`evaluate_sell_trigger` | 1. 重构 `quality_ok` 准入硬门禁，严格核验 5 大财务底线（缺失值一票否决）：<br>&nbsp;&nbsp;• 稳健成长区间：$5\% \le g \le 12\%$（杜绝虚假爆发与负增长）；<br>&nbsp;&nbsp;• 高资本回报：$ROE \ge 12\%$；<br>&nbsp;&nbsp;• 真实盈利含金量：$CFO / NetProfit \ge 0.80$（杜绝应收账款虚增利润）；<br>&nbsp;&nbsp;• 偿债安全冗余：$DebtToAssets \le 50\%$ 或 $DebtToEquity \le 1.0$；<br>&nbsp;&nbsp;• 稳定分红回馈：分红率 $d \in [20\%, 70\%]$ 或股息率 $> 2.0\%$；<br>&nbsp;&nbsp;• 行业黑名单一票否决；<br>2. 落地双重卖出触发决策引擎（`evaluate_sell_trigger`）：<br>&nbsp;&nbsp;• **触发条件 1（逻辑破损与基本面恶化）**：跌破上述任一质地门禁或沦为黑名单标的，立即止损/清仓；<br>&nbsp;&nbsp;• **触发条件 2（性价比衰减）**：前瞻预期收益率低于基准要求收益率（$ExpectedReturn < r_{benchmark}$）；<br>3. `evaluate_buy_sell` 重构：保持 **Sell Overrides Buy** 冲突仲裁机制，输出包含模型1/模型2估值、公允市值、买入目标价、安全边际比例与具体卖出原因的增强分析表。 | `test_rules.py`<br>`test_valuation_models.py`<br>`test_sell_trigger_when_expected_return_below_benchmark_or_quality_fails` | **M** | `F2.2` |
+| **`F3.1`** | `[ ]` | 升级 CLI 筛选报告与回测策略适配 | [`pipeline/fundamental_screener/fscreen/config.py`](file:///home/stone/Work/github/quant/pipeline/fundamental_screener/fscreen/config.py)<br>[`pipeline/fundamental_screener/run_fundamental_screener.py`](file:///home/stone/Work/github/quant/pipeline/fundamental_screener/run_fundamental_screener.py)<br>[`pipeline/fundamental_screener/strategy.py`](file:///home/stone/Work/github/quant/pipeline/fundamental_screener/strategy.py) | 1. 扩展 `ScreenerConfig`：新增 `max_earnings_growth=0.12`, `min_cfo_to_profit=0.80`, `max_debt_to_assets=0.50`, `min_dividend_payout=0.20`, `max_dividend_payout=0.70`, `margin_of_safety=0.20`, `enable_industry_blacklist=True`；<br>2. 升级 `run_fundamental_screener.py` CLI 交互与报告输出：<br>&nbsp;&nbsp;• 支持 `--enable-snowball-valuation` 开关与财务门禁参数自定义；<br>&nbsp;&nbsp;• 终端输出与 `report.txt`/`report.json` 中详细展示：行业梯队分类、终值市盈率、模型一市值、模型二市值、保守公允市值、买入参考价、当前安全边际比率、买入/卖出清单及触发卖出的具体审计原因；<br>3. 升级 `FundamentalScreenerStrategy`（`strategy.py`）：<br>&nbsp;&nbsp;• 将双估值模型及安全边际价格整合进 `AllocationTemplate` 的 `generate_weights` 计算；<br>&nbsp;&nbsp;• 严格遵守稀疏权重契约：仅在调仓日计算最新财报与市场价，符合安全边际且质地过关标的等权或按 MoS 赋权，卖出标的显式置 `0.0`，非调仓日全量填充 `NaN`。 | `test_run_fundamental_screener.py`<br>`test_strategy.py` | **M** | `F2.3` |
+| **`F3.2`** | `[ ]` | 编写 100% 离线单测套件与回测回归验证 | `pipeline/fundamental_screener/tests/`<br>`test_valuation_models.py`<br>`test_rules.py`<br>`test_strategy.py`<br>`test_run_fundamental_screener.py`<br>`common/tests/test_data.py`<br>`test_duckdb_cache.py` | 1. 验证 `test_valuation_models.py` 覆盖：几何级数封闭解析解与手动递推数值精度（$<10^{-9}$）、分母奇点防护、行业分类与黑名单拦截、买入目标价与 MoS 计算、双触发卖出原因断言；<br>2. 升级 `test_rules.py` 与 `test_run_fundamental_screener.py` 断言新准入 5 门禁、黑名单及 CLI 增强报告 JSON 结构；<br>3. 验证 `test_strategy.py` 稀疏权重契约（无 `NaN` 扩散，卖出置 `0.0`），验证与 `backtester` 回测引擎兼容性；<br>4. 保证 `pipeline/fundamental_screener/tests/` 100% 离线运行通过（0 网络请求）。 | `pytest` 全绿 | **M** | `F3.1` |
+
+---
+
 ## 三、 五级主优先级执行路线图与并行波次编排（`Tier P0` $\to$ `Tier P4`）
 
 ```mermaid
@@ -124,35 +140,40 @@ flowchart TD
         C11["C1.1: Volume Profile 算子下沉解耦\n(common/structural_factors.py)"]
     end
 
-    subgraph WAVE1["Wave 1 (Tier P0/P1: 算子实现与数据底座扩展) - 三轨并行"]
+    subgraph WAVE1["Wave 1 (Tier P0/P1: 算子实现与数据底座扩展) - 多轨并行"]
         C12["C1.2: M1-M4 核心形态学动力学算子\n(Curvature, Divergence, Spring, Effort)"]
         C13["C1.3: A股 CYQ 换手衰减递归引擎\n(WinnerRatio & 90% Cost Concentration)"]
         T11["T1.1: DuckDB 分钟双轨缓存表\n(intraday_ohlcv_bars, R4/R13)"]
         T12["T1.2: Synthetic 钉扎布朗桥 5m 生成器\n(极值与日线 100% 严格对齐, R2)"]
         S11["S1.1: SuperTrend 基础算子与单向棘轮\n(common/indicators.py, supertrend)"]
         S12["S1.2: 自适应 ER 与多空非对称乘数\n(adaptive_supertrend, kaufman_er)"]
+        F11["F1.1: DuckDB 基本面与行业元数据表\n(stock_fundamentals_annual)"]
     end
 
-    subgraph WAVE2["Wave 2 (Tier P1/P2: 旗舰新策略研发、切面解耦与外部行情接口接入)"]
+    subgraph WAVE2["Wave 2 (Tier P1/P2: 旗舰新策略研发、切面解耦与外部数据源接入)"]
         C21["C2.1: 旗舰新策略 chan_vp_hybrid\n(HVN 中枢校验 + 三买微观 POC)"]
         C22["C2.2: 旗舰新策略 wyckoff_chan_spring\n(因果支撑破底翻 + 高曲率 V 反)"]
         C23["C2.3: 既有单策略向后兼容升级\n(ThirdBuy, MRD, RegimeCompound, M6)"]
         S21["S2.1: SuperTrend 择时策略与稀疏权重契约\n(supertrend_strategy.py, NaN vs 0.0)"]
         S22["S2.2: SuperTrend 模块化切面解耦与 Aspect 组合\n(timing_aspects.py, Entry/RiskExit)"]
+        F12["F1.2: 标准化财务接口与 BaoStock 落地\n(FundamentalMetrics, fetch_financial_indicators)"]
+        F21["F2.1: 行业分类映射与黑名单引擎\n(classify_industry_and_terminal_pe)"]
+        F22["F2.2: 双估值封闭解与安全边际定价\n(calc_model1/model2, MoS)"]
         T13["T1.3: BaoStockDataProvider T-1 深度底座"]
         T14["T1.4: EastMoneyDataProvider 盘中直连"]
         T15["T1.5: scripts/record_intraday_5m.py 守护"]
     end
 
-    subgraph WAVE3["Wave 3 (Tier P2/P3: 因果特征聚合与 Blend 底座宏观/质量/风险预算增强)"]
+    subgraph WAVE3["Wave 3 (Tier P2/P3: 因果特征聚合与 Blend 底座/门禁规则重构)"]
         T21["T2.1: intraday_features 因果截断器\n(14:15 截断 + κ_t 复权对齐, R1/R4/R6/R12)"]
         T22["T2.2: 隔夜跳空剥离聪明钱与主买量能"]
         T23["T2.3: 5m 缠论次级别结构惰性计算 (R9)"]
         C31["C3.1: Blend 状态机、CYQ 门禁与冲力共振\n(blend_base.py 锚点 1, 2, 3)"]
         S31["S3.1: Blend 宏观风险预算与资产动量防线\n(blend_base.py 锚点 7 状态机 + 锚点 8 资产防线)"]
+        F23["F2.3: 准入五大门禁与卖出双重触发\n(quality_ok, evaluate_sell_trigger)"]
     end
 
-    subgraph WAVE4["Wave 4 (Tier P3: Blend 入场/出场全链路闭环与实盘微观/止损护栏)"]
+    subgraph WAVE4["Wave 4 (Tier P3: Blend 入场/出场全链路闭环与实盘护栏/CLI 适配)"]
         T31["T3.1: Blend 缠论日线 × 5m 区间套"]
         T32["T3.2: Blend 有符号量能与下行波动率定仓"]
         T33["T3.3: Blend 5m 防毛刺止损与三卖止盈"]
@@ -161,6 +182,7 @@ flowchart TD
         T41["T4.1: Stage 1 盘中回撤与午后跳水门禁 (R5)"]
         T42["T4.2: Stage 2 卖单跌停双向冻结防透支 (R10/R14)"]
         T43["T4.3: Stage 2 交割单双模式限价引导 (R11)"]
+        F31["F3.1: CLI 筛选报告与回测策略适配\n(run_fundamental_screener.py, strategy.py)"]
     end
 
     subgraph WAVE5["Wave 5 (Tier P4: 100% 离线单测套件与 Walkforward 终审门禁)"]
@@ -168,6 +190,7 @@ flowchart TD
         T52["T5.2: test_blend_intraday_5m.py (测试 8-10)"]
         C41["C4.1: test_structural_factors.py 及新策略单测"]
         S42["S4.2: SuperTrend 离线测试套件与 Walkforward 审计\n(单向棘轮单测 + 消融实验 + LOO 审计)"]
+        F32["F3.2: 基本面双估值单测与回测回归\n(test_valuation_models.py, test_rules.py)"]
         T61["T6.1: Phase 6 Walkforward 逐项消融实验"]
         T62["T6.2: DSR 校正 + 单次 ERS + LOO 脆弱性终审"]
     end
@@ -184,10 +207,10 @@ flowchart TD
 | 优先级梯队 (Tier) | 执行波次与并行轨道 | 包含任务 ID 清单 | 优先级排序依据 (Why This Priority) | 阶段准出标准 (Exit Criteria) |
 | :--- | :--- | :--- | :--- | :--- |
 | **Tier P0**<br>(基础设施基石) | **Wave 0**<br>(零依赖独立快速修复) | `T0.1`, `T0.2`, `T0.3`<br>`C1.1` | **无依赖致命缺陷先行**：`T0.1`–`T0.3` 均为代码库既有致命 Bug（如 `1m` 误映射月末、VWAP 前视泄漏、实盘健康报告未读取），修复不仅零依赖，且能立即解除后续所有模块的底层隐患；`C1.1` 将 POC 下沉为共享库解除分层循环依赖。 | 修复通过代码审查与离线单测，`import common.structural_factors` 无警告，`Alpha101` 无前视。 |
-| **Tier P1**<br>(数据与新策略) | **Wave 1 & 2**<br>(Track T 数据底座 + Track C/S 旗舰新策略与切面) | `C1.2`, `C1.3`, `T1.1`, `T1.2`<br>`S1.1`, `S1.2`<br>`C2.1`, `C2.2`, `C2.3`<br>`S2.1`, `S2.2`<br>`T1.3`, `T1.4`, `T1.5` | **三轨并行解耦加速**：在有了 `T1.2` 钉扎布朗桥与 `C1.2`/`C1.3`、`S1.1`/`S1.2` 基础算子库后，旗舰新策略 `C2.1`/`C2.2` 与 `S2.1`（SuperTrend 择时）可在纯日线与合成数据下完全独立研发，并推进 `S2.2` 切面解耦，与外部网络行情源接入（`T1.3`–`T1.5`）互不阻塞。 | 钉扎布朗桥按日聚合与日线比特级一致；新策略跑通 `generate_weights` 并严格遵守稀疏权重契约（无 `NaN` 扩散）；SuperTrend 算子通过单向棘轮单调性断言；切面解耦模块可与 Turtle/RSI 自由交叉配对。 |
-| **Tier P2**<br>(特征与宏观底座) | **Wave 3**<br>(高频特征聚合 + Blend 宏观/质量/风险预算增强) | `T2.1`, `T2.2`, `T2.3`<br>`C3.1`, `S3.1` | **自下而上驱动底座**：先由因果截断引擎输出标准的特征矩阵，再将特征与趋势轨线注入 `BaseBlendAllocationStrategy` 的状态机（锚点 1）、质量门禁（锚点 2）、冲力共振（锚点 3）、宏观风险预算折半（锚点 7）与资产动量防线（锚点 8）。 | `enrich_universe_with_intraday_features` 满足 $\kappa_t$ 复权对齐；Blend 策略在开启锚点 1/2/3/7/8 后，能准确在指数空头态折半全局预算，对深套、空心及破位标的精准置 `0.0` 否决。 |
-| **Tier P3**<br>(全链路与实盘护栏) | **Wave 4**<br>(微观共振闭环 + 实盘 Stage 1/2 护栏) | `T3.1`, `T3.2`, `T3.3`<br>`C3.2`, `S4.1`<br>`T4.1`, `T4.2`, `T4.3` | **高阶微观整合与实盘风控防护**：在入场端实现弹簧与 5m 区间套双通道加速，在出场端实现结构化吊灯止损；同时在实盘 Stage 1/2 筑牢跌停封死双向冻结（R14）、双模式限价单引导（R11）与 SuperTrend 盘中破位预警（`CAUTION_SUPERTREND_BREAK`）联动次日止损单生成。 | 威科夫弹簧实现 Day 1 加速建仓；跌停卖单未成交资金在 Phase 2 与 Phase 4 彻底冻结；实盘 Stage 1 精准识别 SuperTrend 破位并写入健康报告，Stage 2 优先平仓且交割单精准包含动态止损参考价 `supertrend_stop_level`。 |
-| **Tier P4**<br>(单测与终审验证) | **Wave 5**<br>(全套离线单测 + 严苛消融终审) | `T5.1`, `T5.2`<br>`C4.1`, `S4.2`<br>`T6.1`, `T6.2` | **质量终审与防过拟合铁律**：全部代码合入后，默认配置严格保持 `False`。必须通过全套离线测试（含 SuperTrend 单向棘轮、稀疏权重及切面测试）、逐项 Walkforward 消融实验、DSR 显著性惩罚与单次 ERS 检验，方可批准生产翻转。 | 100% 离线单测通过（0 网络请求）；消融实验证明宏观预算与资产防线显著降低组合最大回撤；DSR 显著；通过 `walkforward-audit` LOO 脆弱性审计并给出正式评级。 |
+| **Tier P1**<br>(数据与新策略) | **Wave 1 & 2**<br>(Track T 数据底座 + Track C/S 旗舰新策略与切面 + Track F 估值模型) | `C1.2`, `C1.3`, `T1.1`, `T1.2`<br>`S1.1`, `S1.2`<br>`F1.1`, `F1.2`<br>`C2.1`, `C2.2`, `C2.3`<br>`S2.1`, `S2.2`<br>`F2.1`, `F2.2`<br>`T1.3`, `T1.4`, `T1.5` | **多轨并行解耦加速**：在有了 `T1.2` 钉扎布朗桥与 `C1.2`/`C1.3`、`S1.1`/`S1.2`、`F1.1`/`F1.2` 基础算子与数据底座后，旗舰新策略 `C2.1`/`C2.2`、`S2.1`（SuperTrend 择时）与 `F2.1`/`F2.2`（雪球双估值解析解与行业黑名单）可完全独立研发，并推进 `S2.2` 切面解耦，与外部网络行情源接入（`T1.3`–`T1.5`）互不阻塞。 | 钉扎布朗桥按日聚合与日线比特级一致；新策略跑通 `generate_weights` 并严格遵守稀疏权重契约（无 `NaN` 扩散）；SuperTrend 算子通过单向棘轮单调性断言；切面解耦模块可自由交叉配对；雪球双估值解析解数值精度达到 $10^{-9}$ 且奇点防护无除零崩溃。 |
+| **Tier P2**<br>(特征与宏观底座) | **Wave 3**<br>(高频特征聚合 + Blend 宏观/质量/风险预算增强 + 质地门禁重构) | `T2.1`, `T2.2`, `T2.3`<br>`C3.1`, `S3.1`<br>`F2.3` | **自下而上驱动底座**：先由因果截断引擎输出标准特征矩阵，再将特征与趋势轨线注入 `BaseBlendAllocationStrategy` 的状态机（锚点 1）、质量门禁（锚点 2）、冲力共振（锚点 3）、宏观风险预算折半（锚点 7）与资产动量防线（锚点 8）；同时在 Track F 落地准入 5 大财务底线（`F2.3`）与逻辑破损/性价比衰减双重卖出触发。 | `enrich_universe_with_intraday_features` 满足 $\kappa_t$ 复权对齐；Blend 策略在开启锚点 1/2/3/7/8 后，能准确在指数空头态折半全局预算，对深套、空心及破位标的精准置 `0.0` 否决；`quality_ok` 对财务造假、高杠杆及黑名单标的一票否决。 |
+| **Tier P3**<br>(全链路与实盘护栏) | **Wave 4**<br>(微观共振闭环 + 实盘 Stage 1/2 护栏 + 筛选报告与策略适配) | `T3.1`, `T3.2`, `T3.3`<br>`C3.2`, `S4.1`<br>`F3.1`<br>`T4.1`, `T4.2`, `T4.3` | **高阶微观整合与实盘风控防护**：在入场端实现弹簧与 5m 区间套双通道加速，在出场端实现结构化吊灯止损；实盘 Stage 1/2 筑牢跌停封死双向冻结（R14）、双模式限价单引导（R11）与 SuperTrend 破位预警；同时在 Track F 升级 CLI 筛选报告与 `FundamentalScreenerStrategy` 稀疏权重生成适配（`F3.1`）。 | 威科夫弹簧实现 Day 1 加速建仓；跌停卖单未成交资金在 Phase 2 与 Phase 4 彻底冻结；实盘 Stage 1 精准识别 SuperTrend 破位并写入健康报告；基本面选股策略输出合规稀疏权重，CLI 生成包含行业梯队、终值PE、公允市值与卖出审计原因的完整报告。 |
+| **Tier P4**<br>(单测与终审验证) | **Wave 5**<br>(全套离线单测 + 严苛消融终审) | `T5.1`, `T5.2`<br>`C4.1`, `S4.2`<br>`F3.2`<br>`T6.1`, `T6.2` | **质量终审与防过拟合铁律**：全部代码合入后，默认配置严格保持 `False`。必须通过全套离线测试（含 SuperTrend 单向棘轮、稀疏权重及切面测试、雪球双估值全套单测 `F3.2`）、逐项 Walkforward 消融实验、DSR 显著性惩罚与单次 ERS 检验，方可批准生产翻转。 | 100% 离线单测通过（0 网络请求）；消融实验证明宏观预算与资产防线显著降低组合最大回撤；DSR 显著；通过 `walkforward-audit` LOO 脆弱性审计并给出正式评级；基本面筛选策略通过离线回测验证。 |
 
 ---
 
