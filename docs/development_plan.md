@@ -55,7 +55,7 @@ flowchart TD
 
 ---
 
-## 二、 原子任务全量拆解清单（共 42 个原子任务）
+## 二、 原子任务全量拆解清单（共 47 个原子任务）
 
 ### 2.1 《5分钟高频日内数据方案》原子任务表（`T0.1`–`T6.2`，共 19 个任务）
 
@@ -129,6 +129,18 @@ flowchart TD
 
 ---
 
+### 2.5 《实盘调仓防抖与执行风控专项方案》原子任务表（`L1.1`–`L1.5`，共 5 个任务）
+
+| 任务编号 | 状态 | 任务名称 | 涉及核心文件与符号 | 核心交付内容与验收标准 (含抗洗盘风控与防抖确认) | 配套离线单测 | 规模 | 前置依赖 |
+| :--- | :---: | :--- | :--- | :--- | :--- | :---: | :--- |
+| **`L1.1`** | `[x]` | `--start-date` 显式数据回溯窗口与统一调度参数扩展 | `scripts/run_live_strategy.py`<br>`scripts/check_live_portfolio_health.py`<br>`scripts/run_live_multi_strategy.py`<br>`web/livetrading/models.py`<br>`web/livetrading/storage.py`<br>`web/livetrading/execution_service.py`<br>`web/livetrading/server.py` | 1. 实盘执行脚本增加 `--start-date`，显式指定行情数据加载起点，未提供时平滑回退至 `as_of_date - lookback_days`；<br>2. Stage 1 健康检查自动传递 `--start-date` 至 Stage 2 自动调度链路；<br>3. 多策略净额化及 Web 站点后端全链路支持 `default_start_date`（"2024-01-01"），彻底杜绝跨年数据加载截断与指标冷启动盲区。 | `test_live_strategy.py`<br>`test_web_livetrading.py` | **S** | 无 |
+| **`L1.2`** | `[x]` | 平仓再入场冷却期与交易日距离感知解算 | `scripts/run_live_strategy.py`<br>`resolve_exit_cooldown` | 1. 实现 `resolve_exit_cooldown(symbols, account_state, output_dir, as_of_date)`；<br>2. 严格读取 `account_state["last_exit_date"]` 及历史归档工单，调用 `check_missing_trading_days` 精确解算离场后已过去交易日天数；<br>3. 新增 `--reentry-cooldown-bars`（默认 2 日），离场不满冷却期强制标记 `HOLD_FILTERED` 并输出审计理由：“平仓后处于再入场冷却期 (离场 X 日 < 冷却 Y 日，防追高洗盘)”。 | `test_live_strategy.py`<br>`test_resolve_exit_cooldown` | **M** | `L1.1` |
+| **`L1.3`** | `[x]` | 开仓/再入场连续信号确认期与最低建仓门槛 | `scripts/run_live_strategy.py`<br>`account_state`<br>`entry_signal_streak` | 1. 在 `account_state.json` 中持久化记录 `entry_signal_streak` 连续信号计数器；<br>2. 新增 `--entry-confirm-bars`（默认 2 日），首次出现买入信号进入确认期（第 1/2 日待确认，防脉冲假突破），标记 `HOLD_FILTERED`，持续 2 日方才确认生效；<br>3. 新增 `--min-entry-threshold`（默认 0.03），目标仓位低于 3% 时强制置 0.0 并标记 `HOLD_FILTERED`，杜绝微量试错与零星碎股损耗。 | `test_live_strategy.py` | **M** | `L1.2` |
+| **`L1.4`** | `[x]` | 宏观冲力与放量突破即刻入场豁免机制 | `scripts/run_live_strategy.py`<br>`volume-breakout-mult`<br>`is_thrust_breakout_exempt` | 1. 深度联动 Stage 1 门禁报告：`thrust_active` 生效或 `breadth_thrust_10d >= 0.60`；<br>2. 标的当前成交量较 20 日均量放大达标（`vol_ratio >= getattr(args, "volume_breakout_mult", 1.5)`）；<br>3. 满足宏观冲力放量突破时，即刻豁免冷冻期与确认期直接发单买入（`BUY`），工单记录：“宏观冲力爆量突破 (冲力生效且成交量放大 X.Xx)，豁免确认期即刻买入”。 | `test_live_strategy.py` | **S** | `L1.3` |
+| **`L1.5`** | `[x]` | 全持仓清仓退出确认带与 -8% 硬止损/熔断穿透保护 | `scripts/run_live_strategy.py`<br>`exit_confirm_bars`<br>`zero_target_streak`<br>`is_hard_stop` | 1. 统一平仓退出确认带（`--exit-confirm-bars`，默认 2 日），在 `account_state.json` 跟踪 `zero_target_streak`，彻底覆盖所有持仓标的（杜绝大仓位跳过确认期误抛）；<br>2. 连续 0 目标信号未满确认期时统一标记 `HOLD_FILTERED`（“平仓信号进入确认期 (第 X/Y 日待确认，防单日脉冲假平仓)”），满期方才 `SELL` 生效；<br>3. **强风控最高优先级穿透**：持仓标的自建仓成本跌幅 $\ge 8\%$（触发 `-8%` 硬止损）或账户触及三级熔断时，无条件穿透全部确认带与持仓锁，在 Phase 1 立即市价清仓。 | `test_live_strategy.py` | **M** | `L1.3` |
+
+---
+
 ## 三、 五级主优先级执行路线图与并行波次编排（`Tier P0` $\to$ `Tier P4`）
 
 ```mermaid
@@ -183,6 +195,7 @@ flowchart TD
         T42["T4.2: Stage 2 卖单跌停双向冻结防透支 (R10/R14)"]
         T43["T4.3: Stage 2 交割单双模式限价引导 (R11)"]
         F31["F3.1: CLI 筛选报告与回测策略适配\n(run_fundamental_screener.py, strategy.py)"]
+        L1["L1.1–L1.5: 实盘调仓防抖与执行风控\n(冷冻期/连续确认/放量冲力豁免/-8%硬止损)"]
     end
 
     subgraph WAVE5["Wave 5 (Tier P4: 100% 离线单测套件与 Walkforward 终审门禁)"]
@@ -209,7 +222,7 @@ flowchart TD
 | **Tier P0**<br>(基础设施基石) | **Wave 0**<br>(零依赖独立快速修复) | `T0.1`, `T0.2`, `T0.3`<br>`C1.1` | **无依赖致命缺陷先行**：`T0.1`–`T0.3` 均为代码库既有致命 Bug（如 `1m` 误映射月末、VWAP 前视泄漏、实盘健康报告未读取），修复不仅零依赖，且能立即解除后续所有模块的底层隐患；`C1.1` 将 POC 下沉为共享库解除分层循环依赖。 | 修复通过代码审查与离线单测，`import common.structural_factors` 无警告，`Alpha101` 无前视。 |
 | **Tier P1**<br>(数据与新策略) | **Wave 1 & 2**<br>(Track T 数据底座 + Track C/S 旗舰新策略与切面 + Track F 估值模型) | `C1.2`, `C1.3`, `T1.1`, `T1.2`<br>`S1.1`, `S1.2`<br>`F1.1`, `F1.2`<br>`C2.1`, `C2.2`, `C2.3`<br>`S2.1`, `S2.2`<br>`F2.1`, `F2.2`<br>`T1.3`, `T1.4`, `T1.5` | **多轨并行解耦加速**：在有了 `T1.2` 钉扎布朗桥与 `C1.2`/`C1.3`、`S1.1`/`S1.2`、`F1.1`/`F1.2` 基础算子与数据底座后，旗舰新策略 `C2.1`/`C2.2`、`S2.1`（SuperTrend 择时）与 `F2.1`/`F2.2`（雪球双估值解析解与行业黑名单）可完全独立研发，并推进 `S2.2` 切面解耦，与外部网络行情源接入（`T1.3`–`T1.5`）互不阻塞。 | 钉扎布朗桥按日聚合与日线比特级一致；新策略跑通 `generate_weights` 并严格遵守稀疏权重契约（无 `NaN` 扩散）；SuperTrend 算子通过单向棘轮单调性断言；切面解耦模块可自由交叉配对；雪球双估值解析解数值精度达到 $10^{-9}$ 且奇点防护无除零崩溃。 |
 | **Tier P2**<br>(特征与宏观底座) | **Wave 3**<br>(高频特征聚合 + Blend 宏观/质量/风险预算增强 + 质地门禁重构) | `T2.1`, `T2.2`, `T2.3`<br>`C3.1`, `S3.1`<br>`F2.3` | **自下而上驱动底座**：先由因果截断引擎输出标准特征矩阵，再将特征与趋势轨线注入 `BaseBlendAllocationStrategy` 的状态机（锚点 1）、质量门禁（锚点 2）、冲力共振（锚点 3）、宏观风险预算折半（锚点 7）与资产动量防线（锚点 8）；同时在 Track F 落地准入 5 大财务底线（`F2.3`）与逻辑破损/性价比衰减双重卖出触发。 | `enrich_universe_with_intraday_features` 满足 $\kappa_t$ 复权对齐；Blend 策略在开启锚点 1/2/3/7/8 后，能准确在指数空头态折半全局预算，对深套、空心及破位标的精准置 `0.0` 否决；`quality_ok` 对财务造假、高杠杆及黑名单标的一票否决。 |
-| **Tier P3**<br>(全链路与实盘护栏) | **Wave 4**<br>(微观共振闭环 + 实盘 Stage 1/2 护栏 + 筛选报告与策略适配) | `T3.1`, `T3.2`, `T3.3`<br>`C3.2`, `S4.1`<br>`F3.1`<br>`T4.1`, `T4.2`, `T4.3` | **高阶微观整合与实盘风控防护**：在入场端实现弹簧与 5m 区间套双通道加速，在出场端实现结构化吊灯止损；实盘 Stage 1/2 筑牢跌停封死双向冻结（R14）、双模式限价单引导（R11）与 SuperTrend 破位预警；同时在 Track F 升级 CLI 筛选报告与 `FundamentalScreenerStrategy` 稀疏权重生成适配（`F3.1`）。 | 威科夫弹簧实现 Day 1 加速建仓；跌停卖单未成交资金在 Phase 2 与 Phase 4 彻底冻结；实盘 Stage 1 精准识别 SuperTrend 破位并写入健康报告；基本面选股策略输出合规稀疏权重，CLI 生成包含行业梯队、终值PE、公允市值与卖出审计原因的完整报告。 |
+| **Tier P3**<br>(全链路与实盘护栏) | **Wave 4**<br>(微观共振闭环 + 实盘 Stage 1/2 护栏 + 筛选报告与策略适配) | `T3.1`, `T3.2`, `T3.3`<br>`C3.2`, `S4.1`<br>`F3.1`<br>`T4.1`, `T4.2`, `T4.3`<br>`L1.1`–`L1.5` | **高阶微观整合与实盘风控防护**：在入场端实现弹簧与 5m 区间套双通道加速，在出场端实现结构化吊灯止损；实盘 Stage 1/2 筑牢跌停封死双向冻结（R14）、双模式限价单引导（R11）、SuperTrend 破位预警以及实盘防抖执行风控（`L1.1`–`L1.5` 再入场冷却期、连续确认、宏观冲力突破豁免与 -8% 硬止损）；同时在 Track F 升级 CLI 筛选报告与 `FundamentalScreenerStrategy` 稀疏权重生成适配（`F3.1`）。 | 威科夫弹簧实现 Day 1 加速建仓；跌停卖单未成交资金在 Phase 2 与 Phase 4 彻底冻结；实盘 Stage 1 精准识别 SuperTrend 破位并写入健康报告；基本面选股策略输出合规稀疏权重；实盘执行全链路支持防抖冷却、连续信号确认与硬止损穿透防护。 |
 | **Tier P4**<br>(单测与终审验证) | **Wave 5**<br>(全套离线单测 + 严苛消融终审) | `T5.1`, `T5.2`<br>`C4.1`, `S4.2`<br>`F3.2`<br>`T6.1`, `T6.2` | **质量终审与防过拟合铁律**：全部代码合入后，默认配置严格保持 `False`。必须通过全套离线测试（含 SuperTrend 单向棘轮、稀疏权重及切面测试、雪球双估值全套单测 `F3.2`）、逐项 Walkforward 消融实验、DSR 显著性惩罚与单次 ERS 检验，方可批准生产翻转。 | 100% 离线单测通过（0 网络请求）；消融实验证明宏观预算与资产防线显著降低组合最大回撤；DSR 显著；通过 `walkforward-audit` LOO 脆弱性审计并给出正式评级；基本面筛选策略通过离线回测验证。 |
 
 ---
@@ -261,6 +274,10 @@ uv run --project pipeline python scripts/run_live_strategy.py \
     --cutoff-time 14:15 \
     --universe-file docs/universe/china/core_satellite_22_stocks.txt \
     --portfolio-value 105000
+
+# 9. 运行实盘调仓防抖与执行风控单元测试套件 (L1.1-L1.5)
+uv run --project pipeline pytest common/tests/test_live_strategy.py common/tests/test_live_health_check.py -v
+uv run --project web/livetrading pytest web/livetrading/tests -q
 ```
 
 ---

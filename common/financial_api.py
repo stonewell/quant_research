@@ -780,10 +780,11 @@ class FuyaoDataProvider(BaseDataProvider):
                         pass
 
             local_max_date = local_df.index[-1]
-            if local_max_date >= effective_target_end:
+            missing_days = check_missing_trading_days(local_max_date.date(), effective_target_end.date())
+            if local_max_date >= effective_target_end or not missing_days:
                 final_df = local_df
             else:
-                # Local data ends before effective target end; fetch incremental bars from Fuyao REST API
+                # Local data ends before effective target end AND genuine trading days are missing; fetch incremental
                 try:
                     inc_start_str = local_max_date.strftime("%Y-%m-%d")
                     remote_df = self._fetch_remote_ohlcv(symbol, inc_start_str, end, interval)
@@ -850,26 +851,28 @@ class FuyaoDataProvider(BaseDataProvider):
             thscode = normalize_thscode(s)
             if s in local_results:
                 df = local_results[s]
-                if not df.empty and df.index[-1] < effective_target_end:
+                if not df.empty:
                     local_max_date = df.index[-1]
-                    try:
-                        inc_start_str = local_max_date.strftime("%Y-%m-%d")
-                        remote_df = self._fetch_remote_ohlcv(s, inc_start_str, end, interval)
-                        if not remote_df.empty:
-                            if local_max_date in remote_df.index:
-                                loc_c = df.loc[local_max_date, "Close"]
-                                rem_c = remote_df.loc[local_max_date, "Close"]
-                                if loc_c > 0 and abs(rem_c - loc_c) / loc_c > 1e-4:
-                                    scale = rem_c / loc_c
-                                    df[["Open", "High", "Low", "Close"]] *= scale
-                            df = pd.concat([df, remote_df])
-                            df = df[~df.index.duplicated(keep="last")].sort_index()
-                    except Exception as exc:
-                        if "No price data returned" not in str(exc):
-                            warnings.warn(
-                                f"Failed to fetch latest data for {s} from Fuyao API ({exc}); "
-                                f"using local MarketDB data up to {local_max_date.strftime('%Y-%m-%d')}."
-                            )
+                    missing_days = check_missing_trading_days(local_max_date.date(), effective_target_end.date())
+                    if df.index[-1] < effective_target_end and missing_days:
+                        try:
+                            inc_start_str = local_max_date.strftime("%Y-%m-%d")
+                            remote_df = self._fetch_remote_ohlcv(s, inc_start_str, end, interval)
+                            if not remote_df.empty:
+                                if local_max_date in remote_df.index:
+                                    loc_c = df.loc[local_max_date, "Close"]
+                                    rem_c = remote_df.loc[local_max_date, "Close"]
+                                    if loc_c > 0 and abs(rem_c - loc_c) / loc_c > 1e-4:
+                                        scale = rem_c / loc_c
+                                        df[["Open", "High", "Low", "Close"]] *= scale
+                                df = pd.concat([df, remote_df])
+                                df = df[~df.index.duplicated(keep="last")].sort_index()
+                        except Exception as exc:
+                            if "No price data returned" not in str(exc):
+                                warnings.warn(
+                                    f"Failed to fetch latest data for {s} from Fuyao API ({exc}); "
+                                    f"using local MarketDB data up to {local_max_date.strftime('%Y-%m-%d')}."
+                                )
                 result[s] = df
             else:
                 try:

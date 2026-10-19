@@ -173,6 +173,11 @@ def parse_args():
         help="Valuation as-of-date (YYYY-MM-DD)",
     )
     parser.add_argument(
+        "--start-date",
+        default=None,
+        help="Lookback start date for historical market data loading (YYYY-MM-DD, default: as_of_date - lookback_days)",
+    )
+    parser.add_argument(
         "--lookback-days",
         type=int,
         default=800,
@@ -262,7 +267,10 @@ def parse_strategy_specs(strategies_arg: List[str], config_file: Optional[str]) 
 def main():
     args = parse_args()
     val_date = args.as_of_date or date.today().isoformat()
-    start_date = (pd.Timestamp(val_date) - timedelta(days=args.lookback_days)).date().isoformat()
+    if getattr(args, "start_date", None):
+        start_date = args.start_date
+    else:
+        start_date = (pd.Timestamp(val_date) - timedelta(days=args.lookback_days)).date().isoformat()
     os.makedirs(args.output_dir, exist_ok=True)
 
     strategy_specs = parse_strategy_specs(args.strategies, args.config_file)

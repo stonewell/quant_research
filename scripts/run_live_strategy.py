@@ -90,6 +90,7 @@ from common.cli_utils import (
     load_universe_with_banner,
     shared_data_dir,
 )
+from common.financial_api import check_missing_trading_days
 from common.strategy_spec import _STATIC_TEMPLATES, get_template, load_strategy_file
 from common.universe import (
     FALLBACK_STOCK_NAMES,
@@ -432,6 +433,80 @@ def resolve_holding_bars(
     return holding_bars
 
 
+def resolve_exit_cooldown(
+    symbols: List[str],
+    account_state: Optional[Dict[str, Any]] = None,
+    output_dir: Optional[str] = None,
+    as_of_date: Optional[str] = None,
+    default_bars: int = 999,
+) -> Dict[str, int]:
+    """Calculates elapsed trading days since the last full exit for each symbol.
+
+    Reads last_exit_date from account_state (or historical run folders), and uses
+    check_missing_trading_days from common.financial_api to determine elapsed trading days
+    in the open-closed interval (last_exit_date, as_of_date].
+    """
+    as_of_d = pd.Timestamp(as_of_date).date() if as_of_date else date.today()
+    account_state = account_state or {}
+    last_exit_dates: Dict[str, str] = {}
+    if isinstance(account_state.get("last_exit_date"), dict):
+        last_exit_dates.update(account_state["last_exit_date"])
+
+    if isinstance(account_state.get("prior_state"), dict) and isinstance(account_state["prior_state"].get("last_exit_date"), dict):
+        for k, v in account_state["prior_state"]["last_exit_date"].items():
+            if k not in last_exit_dates:
+                last_exit_dates[k] = v
+
+    unresolved = [s for s in symbols if s not in last_exit_dates]
+    if unresolved and output_dir:
+        cand_parents = [os.path.dirname(os.path.abspath(output_dir)), os.path.abspath(output_dir)]
+        date_re = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+        cur_date_str = as_of_d.isoformat()
+        prior_dates = []
+        parent_dir = None
+        for p in cand_parents:
+            if os.path.isdir(p):
+                sub_dates = sorted([d for d in os.listdir(p) if date_re.match(d) and d < cur_date_str], reverse=True)
+                if sub_dates:
+                    parent_dir = p
+                    prior_dates = sub_dates
+                    break
+        if parent_dir and prior_dates:
+            for sym in unresolved:
+                for d in prior_dates:
+                    d_ticket = os.path.join(parent_dir, d, "live_trading_ticket.csv")
+                    if os.path.exists(d_ticket):
+                        try:
+                            df = pd.read_csv(d_ticket)
+                            row = df[df["symbol"] == sym]
+                            if not row.empty:
+                                act = str(row.iloc[0].get("action", ""))
+                                tgt_w = float(row.iloc[0].get("target_weight", 0.0))
+                                if act == "SELL" or tgt_w == 0.0:
+                                    last_exit_dates[sym] = d
+                                    break
+                        except Exception:
+                            pass
+
+    exit_bars: Dict[str, int] = {}
+    for sym in symbols:
+        exit_date_str = last_exit_dates.get(sym)
+        if not exit_date_str:
+            exit_bars[sym] = default_bars
+            continue
+        try:
+            exit_d = pd.Timestamp(exit_date_str).date()
+            if as_of_d <= exit_d:
+                exit_bars[sym] = 0
+            else:
+                missed = check_missing_trading_days(exit_d, as_of_d)
+                exit_bars[sym] = len(missed)
+        except Exception:
+            exit_bars[sym] = default_bars
+
+    return exit_bars
+
+
 _STATIC_NAME_ALIASES = {
     "risk_parity": "hierarchical_risk_parity",
     "hrp": "hierarchical_risk_parity",
@@ -594,10 +669,46 @@ def parse_args(args: Optional[List[str]] = None):
         help="Point-in-time valuation date (YYYY-MM-DD, default: today)",
     )
     parser.add_argument(
+        "--start-date",
+        type=str,
+        default=None,
+        help="Lookback start date for historical market data loading (YYYY-MM-DD, default: as_of_date - lookback_days)",
+    )
+    parser.add_argument(
         "--lookback-days",
         type=int,
         default=800,
         help="Lookback calendar days for indicator warmup (default: 800 days)",
+    )
+    parser.add_argument(
+        "--entry-confirm-bars",
+        type=int,
+        default=2,
+        help="Consecutive bars required to confirm a new BUY signal (default: 2)",
+    )
+    parser.add_argument(
+        "--exit-confirm-bars",
+        type=int,
+        default=2,
+        help="Consecutive bars required to confirm liquidation for small positions below inertia threshold (default: 2)",
+    )
+    parser.add_argument(
+        "--reentry-cooldown-bars",
+        type=int,
+        default=2,
+        help="Trading days cooldown after full exit before permitting re-entry (default: 2)",
+    )
+    parser.add_argument(
+        "--min-entry-threshold",
+        type=float,
+        default=0.03,
+        help="Minimum target weight threshold for fresh entry (default: 0.03 / 3%)",
+    )
+    parser.add_argument(
+        "--volume-breakout-mult",
+        type=float,
+        default=1.5,
+        help="Volume multiplier over 20-day MA volume to qualify as breakout exempting confirmation (default: 1.5)",
     )
     parser.add_argument(
         "--portfolio-value",
@@ -846,7 +957,10 @@ def apply_intraday_distribution_gate(
 def main():
     args = parse_args()
     as_of_date = args.as_of_date or date.today().isoformat()
-    start_date = (pd.Timestamp(as_of_date) - timedelta(days=args.lookback_days)).date().isoformat()
+    if getattr(args, "start_date", None):
+        start_date = args.start_date
+    else:
+        start_date = (pd.Timestamp(as_of_date) - timedelta(days=args.lookback_days)).date().isoformat()
 
     strategy_def = args._strategy_def
     strategy_key = args._strategy_key
@@ -871,6 +985,23 @@ def main():
         except Exception as e:
             print(f"[WARN] Failed to read account state from {args.account_state_file}: {e}")
 
+    # Track streak counters and historical entry prices from account_state
+    entry_signal_streak: Dict[str, int] = dict(account_state.get("entry_signal_streak", {}))
+    zero_target_streak: Dict[str, int] = dict(account_state.get("zero_target_streak", {}))
+    entry_prices: Dict[str, float] = dict(account_state.get("entry_prices", {}))
+    last_exit_date: Dict[str, str] = dict(account_state.get("last_exit_date", {}))
+
+    if account_state.get("as_of_date") == as_of_date and isinstance(account_state.get("prior_state"), dict):
+        ps = account_state["prior_state"]
+        if isinstance(ps.get("entry_signal_streak"), dict):
+            entry_signal_streak = dict(ps["entry_signal_streak"])
+        if isinstance(ps.get("zero_target_streak"), dict):
+            zero_target_streak = dict(ps["zero_target_streak"])
+        if isinstance(ps.get("entry_prices"), dict):
+            entry_prices = dict(ps["entry_prices"])
+        if isinstance(ps.get("last_exit_date"), dict):
+            last_exit_date = dict(ps["last_exit_date"])
+
     health_report = {}
     if args.health_report_file and os.path.exists(args.health_report_file):
         try:
@@ -891,9 +1022,11 @@ def main():
     # Universal inertia / turnover threshold and holding tenure constraints
     min_trade_thresh = resolve_trade_inertia_threshold(params, default=0.05)
     min_holding_bars = resolve_min_holding_bars(params, args.min_holding_bars, default=2)
-    min_entry_bars = resolve_min_entry_bars(params, args.min_entry_bars, default=2)
+    entry_confirm_bars = getattr(args, "entry_confirm_bars", 2)
     if args.min_entry_bars is not None:
-        params["min_entry_bars"] = min_entry_bars
+        entry_confirm_bars = resolve_min_entry_bars(params, args.min_entry_bars, default=2)
+    min_entry_bars = entry_confirm_bars
+    params["min_entry_bars"] = min_entry_bars
 
     # Build descriptive engine banner information
     engine_parts = []
@@ -1039,6 +1172,24 @@ def main():
     else:
         target_series[cash_proxy] = implied_cash_weight
 
+    # Resolve exit cooldown bars since last full exit for each symbol
+    exit_cooldown = resolve_exit_cooldown(
+        all_symbols,
+        account_state=account_state,
+        output_dir=args.output_dir,
+        as_of_date=as_of_date,
+    )
+
+    # Detect macro thrust & volume breakout
+    macro_dict = health_report.get("market_macro", {})
+    thrust_active = (
+        bool(macro_dict.get("thrust_active", False))
+        or bool(health_report.get("thrust_active", False))
+        or float(macro_dict.get("thrust", 0.0) or 0.0) >= 0.60
+        or float(macro_dict.get("breadth_thrust_10d", 0.0) or 0.0) >= 0.60
+        or float(health_report.get("breadth_thrust_10d", 0.0) or 0.0) >= 0.60
+    )
+
     rows = []
     for sym in all_symbols:
         tgt_w = float(target_series[sym])
@@ -1052,10 +1203,37 @@ def main():
         else:
             price = 1.0  # Cash proxy default
 
+        # Check volume breakout ratio
+        cur_v = 0.0
+        ma_v = 0.0
+        vol_ratio = 1.0
+        if sym in universe and not universe[sym].empty and "Volume" in universe[sym].columns:
+            v_series = universe[sym]["Volume"].dropna()
+            if len(v_series) > 0:
+                cur_v = float(v_series.iloc[-1])
+                ma_v = float(v_series.iloc[-20:].mean()) if len(v_series) >= 1 else cur_v
+                if ma_v > 0:
+                    vol_ratio = cur_v / ma_v
+
+        is_thrust_breakout_exempt = thrust_active and (vol_ratio >= getattr(args, "volume_breakout_mult", 1.5))
+
+        # Check hard stop loss (-8% threshold)
+        entry_p = entry_prices.get(sym)
+        pnl_pct = 0.0
+        is_hard_stop = False
+        if entry_p and entry_p > 0 and price > 0:
+            pnl_pct = (price - entry_p) / entry_p
+            is_hard_stop = (pnl_pct <= -0.08)
+
         # Check tenure lock (prohibit premature selling before min_holding_bars)
         held_age = holding_bars.get(sym, min_holding_bars)
         is_circuit_halt = (circuit_tier == "TIER_3_HALT" or freeze_rem > 0)
         is_tenure_locked = (held_age < min_holding_bars) and not is_circuit_halt
+
+        bars_since_exit = exit_cooldown.get(sym, 999)
+        reentry_cooldown_bars = getattr(args, "reentry_cooldown_bars", 2)
+        min_entry_thresh = getattr(args, "min_entry_threshold", 0.03)
+        exit_confirm_bars = getattr(args, "exit_confirm_bars", 2)
 
         reason = ""
         # Determine action
@@ -1064,38 +1242,86 @@ def main():
             reason = "流动性闲置资金归集/释放"
         elif cur_w == 0.0 and tgt_w == 0.0:
             action = "NO_POSITION"   # not held, not targeted — skip entirely
+            entry_signal_streak.pop(sym, None)
         elif cur_w == 0.0 and tgt_w > 0.0:
-            action = "BUY"           # fresh entry from zero — always a BUY, no inertia filter
-            reason = "策略模型新开仓信号"
-        elif tgt_w <= 1e-6 and cur_w > 0.0:
-            if is_tenure_locked:
+            zero_target_streak.pop(sym, None)
+            if bars_since_exit < reentry_cooldown_bars and not is_thrust_breakout_exempt:
                 action = "HOLD_FILTERED"
-                tgt_w = cur_w
+                tgt_w = 0.0
                 delta_w = 0.0
                 abs_delta = 0.0
-                reason = f"未满最低持仓周期 (持仓 {held_age} 日 < 最低 {min_holding_bars} 日，锁定防洗盘)"
+                reason = f"平仓后处于再入场冷却期 (离场 {bars_since_exit} 日 < 冷却 {reentry_cooldown_bars} 日，防追高洗盘)"
+            elif tgt_w < min_entry_thresh:
+                action = "HOLD_FILTERED"
+                tgt_w = 0.0
+                delta_w = 0.0
+                abs_delta = 0.0
+                reason = f"目标仓位低于最低建仓门槛 (目标 {tgt_w:.1%} < 最低门槛 {min_entry_thresh:.1%}，防微量试错损耗)"
+            elif is_thrust_breakout_exempt:
+                action = "BUY"
+                reason = f"宏观冲力爆量突破 (冲力生效且成交量放大 {vol_ratio:.1f}x)，豁免确认期即刻买入"
+                entry_signal_streak[sym] = max(entry_confirm_bars, entry_signal_streak.get(sym, 0) + 1)
             else:
-                action = "SELL"          # full liquidation exit — always SELL, never hold remnant
-                reason = "策略模型平仓信号 (已满最低持仓周期)"
-        elif abs_delta < min_trade_thresh:
-            action = "HOLD_FILTERED"  # user holds and change is below inertia threshold
-            reason = f"调仓未超惰性阈值 (< {min_trade_thresh:.0%})"
-        elif delta_w <= -min_trade_thresh:
-            if is_tenure_locked:
+                entry_signal_streak[sym] = entry_signal_streak.get(sym, 0) + 1
+                if entry_signal_streak[sym] < entry_confirm_bars:
+                    action = "HOLD_FILTERED"
+                    tgt_w = 0.0
+                    delta_w = 0.0
+                    abs_delta = 0.0
+                    reason = f"开仓/再入场信号进入确认期 (第 {entry_signal_streak[sym]}/{entry_confirm_bars} 日待确认，防脉冲假突破)"
+                else:
+                    action = "BUY"
+                    reason = f"开仓/再入场信号持续 {entry_signal_streak[sym]} 日确认生效"
+        elif tgt_w <= 1e-6 and cur_w > 0.0:
+            entry_signal_streak.pop(sym, None)
+            zero_target_streak[sym] = zero_target_streak.get(sym, 0) + 1
+            if is_hard_stop:
+                action = "SELL"
+                reason = f"触发个股 -8% 硬止损风控 (当前价格 {price:.2f} 较成本 {entry_p:.2f} 跌幅 {pnl_pct:.1%} <= -8.0%)"
+            elif is_circuit_halt:
+                action = "SELL"
+                reason = "触发账户熔断保护强制平仓"
+            elif is_tenure_locked:
                 action = "HOLD_FILTERED"
                 tgt_w = cur_w
                 delta_w = 0.0
                 abs_delta = 0.0
                 reason = f"未满最低持仓周期 (持仓 {held_age} 日 < 最低 {min_holding_bars} 日，锁定防洗盘)"
+            elif zero_target_streak[sym] < exit_confirm_bars:
+                action = "HOLD_FILTERED"
+                tgt_w = cur_w
+                delta_w = 0.0
+                abs_delta = 0.0
+                reason = f"平仓信号进入确认期 (第 {zero_target_streak[sym]}/{exit_confirm_bars} 日待确认，防单日脉冲假平仓)"
             else:
                 action = "SELL"
-                reason = "策略模型减仓调仓"
-        elif delta_w >= min_trade_thresh:
-            action = "BUY"
-            reason = "策略模型加仓调仓"
+                reason = f"策略模型平仓信号持续 {zero_target_streak[sym]} 日确认生效"
         else:
-            action = "HOLD"
-            reason = "最优目标权重维持"
+            # tgt_w > 0.0 and cur_w > 0.0
+            zero_target_streak.pop(sym, None)
+            entry_signal_streak[sym] = max(entry_confirm_bars, entry_signal_streak.get(sym, 0) + 1)
+            if abs_delta < min_trade_thresh:
+                action = "HOLD_FILTERED"
+                tgt_w = cur_w
+                delta_w = 0.0
+                abs_delta = 0.0
+                reason = f"调仓未超惰性阈值 (< {min_trade_thresh:.0%})"
+            elif delta_w <= -min_trade_thresh:
+                if is_tenure_locked:
+                    action = "HOLD_FILTERED"
+                    tgt_w = cur_w
+                    delta_w = 0.0
+                    abs_delta = 0.0
+                    reason = f"未满最低持仓周期 (持仓 {held_age} 日 < 最低 {min_holding_bars} 日，锁定防洗盘)"
+                else:
+                    action = "SELL"
+                    reason = "策略模型减仓调仓"
+            elif delta_w >= min_trade_thresh:
+                action = "BUY"
+                reason = "策略模型加仓调仓"
+            else:
+                action = "HOLD"
+                reason = "最优目标权重维持"
 
         current_val = cur_w * args.portfolio_value
         trade_val = delta_w * args.portfolio_value
@@ -1247,7 +1473,7 @@ def main():
             print(f"  🟢 BUY  {sym_col} | 现价: {r['price']:>7.2f} | 仓位: {r['current_weight']:>5.1%} -> 目标: {r['target_weight']:>5.1%} ({r['delta_weight']:>+5.1%}) | 买入: {qty_str} 股 (~¥{r['trade_value']:>9,.2f}){suffix}")
 
     # Phase 3: only show positions the user actually holds (cur_w > 0) or that have a real target weight
-    actual_holds = holds[(holds["current_weight"] > 0) | (holds["target_weight"] > 0)]
+    actual_holds = holds[(holds["current_weight"] > 0) | (holds["target_weight"] > 0) | (holds["action"] == "HOLD_FILTERED")]
     print(f"\n[PHASE 3: POSITIONS HELD (第三阶段: 维持既有持仓/惰性过滤 < {min_trade_thresh:.0%})]")
     if actual_holds.empty:
         print("  今日无既有持仓需要维持。")
@@ -1266,20 +1492,46 @@ def main():
             sym_col = pad_east_asian(f"{r['symbol']} ({r['name']})", 24)
             print(f"  💰 CASH {sym_col} | 闲置现金: {r['target_weight']:>5.1%} (~¥{r['target_weight']*args.portfolio_value:>9,.2f}) | 停泊于 {r['symbol']} / 511880 / 国债逆回购")
 
-    # Update post-trade holdings and holding_bars
+    # Update post-trade holdings and state tracking
     updated_holding_bars = {}
     post_holdings = {}
+    updated_entry_prices = dict(entry_prices)
+    updated_last_exit_date = dict(last_exit_date)
+
     for _, r in order_df.iterrows():
         sym = r["symbol"]
         if sym == cash_proxy:
             continue
         tgt_sh = int(r["target_shares"])
+        act = r["action"]
+        cur_sh = int(r["current_shares"])
+        p = float(r["price"])
+
         if tgt_sh > 0:
             post_holdings[sym] = tgt_sh
-            if r["action"] == "BUY" and int(r["current_shares"]) == 0:
+            if act == "BUY" and cur_sh == 0:
                 updated_holding_bars[sym] = 0
+                if p > 0:
+                    updated_entry_prices[sym] = p
+                updated_last_exit_date.pop(sym, None)
             else:
                 updated_holding_bars[sym] = int(r.get("holding_bars", 1))
+                if sym not in updated_entry_prices and p > 0:
+                    updated_entry_prices[sym] = p
+        else:
+            if cur_sh > 0 and act == "SELL":
+                updated_last_exit_date[sym] = as_of_date
+                updated_entry_prices.pop(sym, None)
+                updated_holding_bars.pop(sym, None)
+                zero_target_streak.pop(sym, None)
+                entry_signal_streak.pop(sym, None)
+
+    updated_exit_bars_ago = resolve_exit_cooldown(
+        list(updated_last_exit_date.keys()),
+        {"last_exit_date": updated_last_exit_date},
+        output_dir=args.output_dir,
+        as_of_date=as_of_date,
+    )
 
     # Save to CSV and JSON
     os.makedirs(args.output_dir, exist_ok=True)
@@ -1303,15 +1555,29 @@ def main():
     except Exception as e:
         print(f"[WARN] Failed to write post_holdings.json: {e}")
 
-    # Persist updated holding_bars into account_state.json if available
+    # Persist updated state into account_state.json if available
     if args.account_state_file:
-        if isinstance(account_state.get("prior_state"), dict) and "holding_bars" not in account_state["prior_state"]:
-            account_state["prior_state"]["holding_bars"] = dict(holding_bars)
+        if isinstance(account_state.get("prior_state"), dict):
+            if "holding_bars" not in account_state["prior_state"]:
+                account_state["prior_state"]["holding_bars"] = dict(holding_bars)
+            if "entry_signal_streak" not in account_state["prior_state"]:
+                account_state["prior_state"]["entry_signal_streak"] = dict(account_state.get("entry_signal_streak", {}))
+            if "zero_target_streak" not in account_state["prior_state"]:
+                account_state["prior_state"]["zero_target_streak"] = dict(account_state.get("zero_target_streak", {}))
+            if "last_exit_date" not in account_state["prior_state"]:
+                account_state["prior_state"]["last_exit_date"] = dict(account_state.get("last_exit_date", {}))
+            if "entry_prices" not in account_state["prior_state"]:
+                account_state["prior_state"]["entry_prices"] = dict(account_state.get("entry_prices", {}))
         account_state["holding_bars"] = updated_holding_bars
+        account_state["entry_prices"] = updated_entry_prices
+        account_state["last_exit_date"] = updated_last_exit_date
+        account_state["exit_bars_ago"] = updated_exit_bars_ago
+        account_state["entry_signal_streak"] = entry_signal_streak
+        account_state["zero_target_streak"] = zero_target_streak
         try:
             with open(args.account_state_file, "w", encoding="utf-8") as f:
                 json.dump(account_state, f, indent=2, ensure_ascii=False)
-            print(f"[SUCCESS] 账户状态持仓周期已更新至: {args.account_state_file}")
+            print(f"[SUCCESS] 账户状态持仓周期与防抖跟踪已更新至: {args.account_state_file}")
         except Exception as e:
             print(f"[WARN] Failed to update account state file: {e}")
     print("=" * 110)

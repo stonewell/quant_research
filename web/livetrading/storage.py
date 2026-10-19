@@ -347,6 +347,7 @@ class StorageManager:
         self.default_data_provider = saved_settings.get("default_data_provider") or default_provider_fallback
         self.default_portfolio_value = float(saved_settings.get("default_portfolio_value", 100000.0))
         self.default_strategy_key = saved_settings.get("default_strategy_key") or "chan_four_state_blend"
+        self.default_start_date = saved_settings.get("default_start_date") or "2024-01-01"
 
         # Files in data_dir
         self.custom_universes_file = os.path.join(self.data_dir, "custom_universes.json")
@@ -385,6 +386,7 @@ class StorageManager:
             "default_data_provider": self.default_data_provider,
             "default_portfolio_value": self.default_portfolio_value,
             "default_strategy_key": self.default_strategy_key,
+            "default_start_date": self.default_start_date,
         }
 
     def update_settings(self, new_settings: Dict[str, Any]) -> Dict[str, Any]:

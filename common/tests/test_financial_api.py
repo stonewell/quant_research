@@ -605,6 +605,8 @@ def test_fuyao_provider_fetch_universe_incremental_sync():
 
     with patch.dict(sys.modules, {"fuyao_client": mock_fuyao}), patch(
         "common.financial_api.BaoStockDataProvider.fetch_ohlcv", return_value=pd.DataFrame()
+    ), patch(
+        "common.financial_api.EastMoneyDataProvider.fetch_ohlcv", return_value=pd.DataFrame()
     ):
         uni = provider.fetch_universe(["600519.SH", "000300.SH"], start="2024-01-01", end="2024-01-02")
         assert "600519.SH" in uni
@@ -772,4 +774,47 @@ def test_baostock_fetch_financial_indicators_error_graceful():
     assert metrics.report_year == 2023
     assert np.isnan(metrics.roe)
     assert np.isnan(metrics.net_profit)
+
+
+def test_calendar_check_missing_trading_days_and_skip_fetch():
+    """Verify check_missing_trading_days accurately detects missing trading days
+    and FuyaoDataProvider skips incremental remote fetching when no trading days are missing.
+    """
+    import datetime
+    from common.financial_api import check_missing_trading_days
+
+    # Friday to Sunday (no missing trading days)
+    friday = datetime.date(2024, 1, 5)
+    sunday = datetime.date(2024, 1, 7)
+    assert check_missing_trading_days(friday, sunday) == []
+
+    # Friday to next Tuesday (Monday and Tuesday are missing trading days)
+    tuesday = datetime.date(2024, 1, 9)
+    missing = check_missing_trading_days(friday, tuesday)
+    assert datetime.date(2024, 1, 8) in missing
+    assert datetime.date(2024, 1, 9) in missing
+
+    # Test FuyaoDataProvider skips remote fetch when no missing trading days
+    import duckdb
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE v_daily_qfq (thscode VARCHAR, date DATE, open DOUBLE, low DOUBLE, high DOUBLE, close DOUBLE, volume DOUBLE)")
+    con.execute("INSERT INTO v_daily_qfq VALUES ('600519.SH', '2024-01-05', 100.0, 95.0, 105.0, 101.0, 1000.0)")
+
+    provider = FuyaoDataProvider(prefer_local=True)
+    provider._local_provider = MarketDBDataProvider(con=con)
+
+    mock_fuyao = MagicMock()
+    with patch.dict(sys.modules, {"fuyao_client": mock_fuyao}):
+        # Query on Sunday when latest local is Friday: skips remote fetch!
+        df = provider.fetch_ohlcv("600519.SH", start="2024-01-01", end="2024-01-07")
+        mock_fuyao.prices_historical.assert_not_called()
+        assert df.index[-1] == pd.Timestamp("2024-01-05")
+
+        # fetch_universe on Sunday when latest local is Friday: also skips remote fetch!
+        uni = provider.fetch_universe(["600519.SH"], start="2024-01-01", end="2024-01-07")
+        mock_fuyao.prices_historical.assert_not_called()
+        assert uni["600519.SH"].index[-1] == pd.Timestamp("2024-01-05")
+
+    con.close()
+
 

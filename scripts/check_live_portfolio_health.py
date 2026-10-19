@@ -123,6 +123,12 @@ def parse_args(args: Optional[List[str]] = None):
         help="Point-in-time valuation date (YYYY-MM-DD, default: today)",
     )
     parser.add_argument(
+        "--start-date",
+        type=str,
+        default=None,
+        help="Lookback start date for historical market data loading (YYYY-MM-DD, default: as_of_date - lookback_days)",
+    )
+    parser.add_argument(
         "--lookback-days",
         type=int,
         default=800,
@@ -722,7 +728,10 @@ def generate_reports(
 def main():
     args = parse_args()
     as_of_date = args.as_of_date or date.today().isoformat()
-    start_date = (pd.Timestamp(as_of_date) - timedelta(days=args.lookback_days)).date().isoformat()
+    if getattr(args, "start_date", None):
+        start_date = args.start_date
+    else:
+        start_date = (pd.Timestamp(as_of_date) - timedelta(days=args.lookback_days)).date().isoformat()
 
     # 1. Load Strategy Definition
     if not os.path.exists(args.strategy_file):
@@ -881,6 +890,8 @@ def main():
             ]
             if args.as_of_date:
                 cmd.extend(["--as-of-date", args.as_of_date])
+            if getattr(args, "start_date", None):
+                cmd.extend(["--start-date", args.start_date])
             if getattr(args, "cache_dir", None):
                 cmd.extend(["--cache-dir", args.cache_dir])
             if getattr(args, "data_dir", None):

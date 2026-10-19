@@ -107,6 +107,7 @@ class ExecutionService:
         universe_file: Optional[str] = None,
         custom_symbols: Optional[List[str]] = None,
         as_of_date: Optional[str] = None,
+        start_date: Optional[str] = None,
         portfolio_value: float = 100000.0,
         peak_nav: Optional[float] = None,
         data_provider: Optional[str] = None,
@@ -170,6 +171,9 @@ class ExecutionService:
             "--data-provider", provider,
         ]
 
+        start_d = start_date or getattr(self.storage, "default_start_date", None)
+        if start_d:
+            cmd.extend(["--start-date", start_d])
         if peak_nav is not None and peak_nav > 0:
             cmd.extend(["--peak-nav", str(peak_nav)])
         if self.storage.cache_dir:
@@ -265,6 +269,7 @@ class ExecutionService:
         universe_file: Optional[str] = None,
         custom_symbols: Optional[List[str]] = None,
         as_of_date: Optional[str] = None,
+        start_date: Optional[str] = None,
         portfolio_value: float = 100000.0,
         current_holdings: Optional[Dict[str, Any]] = None,
         data_provider: Optional[str] = None,
@@ -320,6 +325,9 @@ class ExecutionService:
             "--data-provider", provider,
         ]
 
+        start_d = start_date or getattr(self.storage, "default_start_date", None)
+        if start_d:
+            cmd.extend(["--start-date", start_d])
         if os.path.exists(health_rep_file):
             cmd.extend(["--health-report-file", health_rep_file])
         if lot_size is not None and lot_size > 0:
@@ -419,6 +427,7 @@ class ExecutionService:
         universe_file: Optional[str] = None,
         custom_symbols: Optional[List[str]] = None,
         as_of_date: Optional[str] = None,
+        start_date: Optional[str] = None,
         portfolio_value: float = 100000.0,
         current_holdings: Optional[Dict[str, Any]] = None,
         data_provider: Optional[str] = None,
@@ -477,6 +486,9 @@ class ExecutionService:
             "--min-holding-bars", str(min_holding_bars),
             "--inertia-threshold", str(inertia_threshold),
         ]
+        start_d = start_date or getattr(self.storage, "default_start_date", None)
+        if start_d:
+            cmd.extend(["--start-date", start_d])
         if self.storage.cache_dir:
             cmd.extend(["--cache-dir", self.storage.cache_dir])
 

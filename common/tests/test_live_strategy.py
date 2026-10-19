@@ -18,6 +18,7 @@ from scripts.run_live_strategy import (
     resolve_min_entry_bars,
     resolve_min_holding_bars,
     resolve_holding_bars,
+    resolve_exit_cooldown,
     resolve_strategy_definition,
     resolve_holdings_weights_and_shares,
     load_symbol_names,
@@ -258,5 +259,146 @@ def test_health_report_file_parsing(tmp_path):
     assert loaded["gate_code"] == "CAUTION_INTRADAY_DISTRIBUTION"
     assert loaded["intraday_buy_scale"] == 0.50
     assert loaded["circuit_breaker_tier"] == "TIER_1_WARNING"
+
+
+def test_resolve_exit_cooldown():
+    """Verify resolve_exit_cooldown calculates elapsed trading days accurately."""
+    account_state = {
+        "last_exit_date": {
+            "601872.SH": "2025-08-20",
+            "000938.SZ": "2025-08-22",
+        }
+    }
+    # As of 2025-08-22 (Friday)
+    cooldowns = resolve_exit_cooldown(
+        ["601872.SH", "000938.SZ", "NEW_SYM"],
+        account_state=account_state,
+        as_of_date="2025-08-22",
+    )
+    # 2025-08-20 -> 2025-08-22 is 2 trading days (21st, 22nd)
+    assert cooldowns["601872.SH"] == 2
+    # Exited on 2025-08-22 as of 2025-08-22 is 0 days elapsed
+    assert cooldowns["000938.SZ"] == 0
+    # Not in last_exit_date returns default 999
+    assert cooldowns["NEW_SYM"] == 999
+
+
+def test_parse_args_anti_whipsaw_options():
+    """Verify new anti-whipsaw CLI arguments in parse_args."""
+    args = parse_args([
+        "--strategy", "equal_weight",
+        "--start-date", "2024-01-01",
+        "--entry-confirm-bars", "3",
+        "--exit-confirm-bars", "3",
+        "--reentry-cooldown-bars", "4",
+        "--min-entry-threshold", "0.05",
+        "--volume-breakout-mult", "2.0",
+    ])
+    assert args.start_date == "2024-01-01"
+    assert args.entry_confirm_bars == 3
+    assert args.exit_confirm_bars == 3
+    assert args.reentry_cooldown_bars == 4
+    assert args.min_entry_threshold == pytest.approx(0.05)
+    assert args.volume_breakout_mult == pytest.approx(2.0)
+
+
+def test_exit_confirmation_streak_protection_and_hard_stop(tmp_path, monkeypatch):
+    """Verifies that 2-day exit confirmation uniformly protects held positions (> 5% weight)
+    on Day 1 (HOLD_FILTERED) and only triggers SELL on Day 2, while -8% hard stop loss
+    immediately penetrates on Day 1.
+    """
+    from unittest.mock import patch
+    from common.allocation_templates import EqualWeightAllocation
+    from scripts.run_live_strategy import main
+
+    univ_file = str(tmp_path / "univ.txt")
+    with open(univ_file, "w", encoding="utf-8") as f:
+        f.write("600000.SH\n601398.SH\n")
+
+    holdings_file = str(tmp_path / "holdings.json")
+    with open(holdings_file, "w", encoding="utf-8") as f:
+        json.dump({"600000.SH": 1000, "601398.SH": 1700}, f)
+
+    state_file = str(tmp_path / "account_state.json")
+    with open(state_file, "w", encoding="utf-8") as f:
+        json.dump({
+            "holding_bars": {"600000.SH": 5, "601398.SH": 5},
+            "zero_target_streak": {},
+        }, f)
+
+    cmd_args = [
+        "run_live_strategy.py",
+        "--strategy", "equal_weight",
+        "--universe-file", univ_file,
+        "--current-holdings-file", holdings_file,
+        "--account-state-file", state_file,
+        "--output-dir", str(tmp_path),
+        "--as-of-date", "2024-05-10",
+        "--start-date", "2024-01-01",
+        "--data-provider", "synthetic",
+        "--portfolio-value", "100000",
+        "--exit-confirm-bars", "2",
+    ]
+    monkeypatch.setattr(sys, "argv", cmd_args)
+
+    orig_gen = EqualWeightAllocation.generate_weights
+    def mock_gen(self, universe, params):
+        df = orig_gen(self, universe, params)
+        df["601398.SH"] = 0.0
+        return df
+
+    # --- Day 1 Execution: zero_target_streak is 0 -> increments to 1 (< 2) ---
+    with patch.object(EqualWeightAllocation, "generate_weights", mock_gen):
+        main()
+
+    with open(tmp_path / "live_trading_ticket.json", "r", encoding="utf-8") as f:
+        tickets_d1 = json.load(f)
+
+    icbc_d1 = next(t for t in tickets_d1 if t["symbol"] == "601398.SH")
+    assert icbc_d1["action"] == "HOLD_FILTERED"
+    assert icbc_d1["target_shares"] == 1700
+    assert "平仓信号进入确认期 (第 1/2 日待确认，防单日脉冲假平仓)" in icbc_d1["reason"]
+
+    with open(state_file, "r", encoding="utf-8") as f:
+        st_d1 = json.load(f)
+    assert st_d1["zero_target_streak"]["601398.SH"] == 1
+
+    # --- Day 2 Execution: zero_target_streak is 1 -> increments to 2 (>= 2) ---
+    with patch.object(EqualWeightAllocation, "generate_weights", mock_gen):
+        main()
+
+    with open(tmp_path / "live_trading_ticket.json", "r", encoding="utf-8") as f:
+        tickets_d2 = json.load(f)
+
+    icbc_d2 = next(t for t in tickets_d2 if t["symbol"] == "601398.SH")
+    assert icbc_d2["action"] == "SELL"
+    assert icbc_d2["target_shares"] == 0
+    assert icbc_d2["delta_shares"] == -1700
+    assert "策略模型平仓信号持续 2 日确认生效" in icbc_d2["reason"]
+
+    with open(state_file, "r", encoding="utf-8") as f:
+        st_d2 = json.load(f)
+    assert "601398.SH" not in st_d2["zero_target_streak"]
+
+    # --- Hard Stop Scenario: -8% loss penetrates confirmation immediately on Day 1 ---
+    with open(state_file, "w", encoding="utf-8") as f:
+        json.dump({
+            "holding_bars": {"601398.SH": 5},
+            "entry_prices": {"601398.SH": 120.0},  # Price is ~96.6 -> -19.5% loss
+            "zero_target_streak": {},
+        }, f)
+
+    with patch.object(EqualWeightAllocation, "generate_weights", mock_gen):
+        main()
+
+    with open(tmp_path / "live_trading_ticket.json", "r", encoding="utf-8") as f:
+        tickets_stop = json.load(f)
+
+    icbc_stop = next(t for t in tickets_stop if t["symbol"] == "601398.SH")
+    assert icbc_stop["action"] == "SELL"
+    assert icbc_stop["target_shares"] == 0
+    assert "触发个股 -8% 硬止损风控" in icbc_stop["reason"]
+
+
 
 

@@ -17,6 +17,7 @@ class SettingsModel(BaseModel):
     python_executable: Optional[str] = Field(None, description="Python executable for script execution")
     default_data_provider: str = Field("marketdb", description="Default data provider")
     default_portfolio_value: float = Field(100000.0, description="Default portfolio NAV value")
+    default_start_date: Optional[str] = Field("2024-01-01", description="Default start date for execution lookback")
 
 
 class CustomUniverseModel(BaseModel):
@@ -63,6 +64,12 @@ class AccountStateModel(BaseModel):
     freeze_remaining_bars: Optional[int] = 0
     nav_history_10d: Optional[List[float]] = []
     holdings: Optional[Dict[str, Any]] = None
+    holding_bars: Optional[Dict[str, int]] = None
+    entry_prices: Optional[Dict[str, float]] = None
+    last_exit_date: Optional[Dict[str, str]] = None
+    exit_bars_ago: Optional[Dict[str, int]] = None
+    entry_signal_streak: Optional[Dict[str, int]] = None
+    zero_target_streak: Optional[Dict[str, int]] = None
 
 
 class RunHealthRequest(BaseModel):
@@ -75,6 +82,7 @@ class RunHealthRequest(BaseModel):
     strategy_name: Optional[str] = None
     universe_name: Optional[str] = None
     as_of_date: Optional[str] = None
+    start_date: Optional[str] = None
     portfolio_value: float = 100000.0
     peak_nav: Optional[float] = None
     data_provider: Optional[str] = None
@@ -90,6 +98,7 @@ class RunDeployRequest(BaseModel):
     strategy_name: Optional[str] = None
     universe_name: Optional[str] = None
     as_of_date: Optional[str] = None
+    start_date: Optional[str] = None
     portfolio_value: float = 100000.0
     current_holdings: Optional[Dict[str, Any]] = None
     data_provider: Optional[str] = None
@@ -138,6 +147,7 @@ class MultiStrategyDeployRequest(BaseModel):
     universe_file: Optional[str] = None
     custom_symbols: Optional[List[str]] = None
     as_of_date: Optional[str] = None
+    start_date: Optional[str] = None
     portfolio_value: float = 100000.0
     current_holdings: Optional[Dict[str, Any]] = None
     data_provider: Optional[str] = None

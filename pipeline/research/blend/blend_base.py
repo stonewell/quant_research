@@ -35,7 +35,10 @@ from common.allocation_templates import (
     _step_asset_inertia,
 )
 from common.indicators import atr, sma
-from pipeline.research_strategy.rs.config import StrategyConfig
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pipeline.research_strategy.rs.config import StrategyConfig
 
 
 
@@ -139,10 +142,14 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         name: str = "base_blend",
         param_prefix: str = "blend",
         alt_param_prefixes: Optional[List[str]] = None,
-        config: Optional[StrategyConfig] = None,
+        config: Optional["StrategyConfig"] = None,
         factor_tags: Optional[List[str]] = None,
     ):
-        self.config = config or StrategyConfig()
+        if config is None:
+            from pipeline.research_strategy.rs.config import StrategyConfig
+            self.config = StrategyConfig()
+        else:
+            self.config = config
         self.param_prefix = param_prefix
         self.alt_param_prefixes = alt_param_prefixes or []
         tags = factor_tags or [
@@ -478,6 +485,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         min_thrust_assets = self.resolve_param(p, "min_thrust_assets", 5, int)
         max_assets_per_sector = self.resolve_param(p, "max_assets_per_sector", 1, int)
         adaptive_sector_throttle = self.resolve_param(p, "adaptive_sector_throttle", False, bool)
+        sector_incumbent_hurdle = self.resolve_param(p, "sector_incumbent_hurdle", 0.03, float)
         thrust_min_roc = self.resolve_param(p, "thrust_min_roc", 0.01, float)
         thrust_sizing_mode = self.resolve_param(p, "thrust_sizing_mode", "vol_adjusted", str)
         require_asset_trend = self.resolve_param(p, "require_asset_trend", (self.param_prefix == "cdhb"), bool)
@@ -889,21 +897,25 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                             sec_mean_roc = {sec: float(np.mean(vals)) for sec, vals in sec_rocs.items() if vals}
                             top_sec_thresh = float(pd.Series(sec_mean_roc).quantile(0.80)) if sec_mean_roc else 0.03
 
-                            # Track locked incumbents that cannot be sold due to min_holding_bars
+                            # Track held and locked incumbents from the prior day
+                            held_incumbents = set()
                             locked_incumbents = set()
-                            if t > 0 and min_holding_bars > 0:
+                            if t > 0:
                                 prev_date = master_index[t - 1]
                                 for s in risky_symbols:
                                     if float(daily_weights.loc[prev_date, s]) > 1e-4:
-                                        k = t - 1
-                                        age = 0
-                                        while k >= 0 and float(daily_weights.iloc[k][s]) > 1e-4:
-                                            age += 1
-                                            k -= 1
-                                        if age < min_holding_bars and t < asset_cooldown_until[s]:
-                                            pass
-                                        elif age < min_holding_bars:
-                                            locked_incumbents.add(s)
+                                        if t >= asset_cooldown_until[s]:
+                                            held_incumbents.add(s)
+                                        if min_holding_bars > 0:
+                                            k = t - 1
+                                            age = 0
+                                            while k >= 0 and float(daily_weights.iloc[k][s]) > 1e-4:
+                                                age += 1
+                                                k -= 1
+                                            if age < min_holding_bars and t < asset_cooldown_until[s]:
+                                                pass
+                                            elif age < min_holding_bars:
+                                                locked_incumbents.add(s)
 
                             all_sorted = sorted(cand_scores.keys(), key=lambda s: (-cand_scores[s], s))
                             sorted_cands = []
@@ -914,11 +926,39 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                     sector_counts[sec] += 1
 
                             for cand in all_sorted:
+                                if cand in sorted_cands:
+                                    continue
                                 sec = _get_symbol_sector(cand)
                                 allowed_sec_cap = max_assets_per_sector
                                 if adaptive_sector_throttle and sec_mean_roc.get(sec, 0.0) >= max(0.02, top_sec_thresh):
                                     allowed_sec_cap = max(allowed_sec_cap, 2)
-                                
+
+                                # Sector incumbent protection: outside challenger must beat held incumbent's ROC by at least sector_incumbent_hurdle
+                                sec_incumbents = [
+                                    s for s in held_incumbents
+                                    if _get_symbol_sector(s) == sec and s not in sorted_cands and float(raw_w[s]) <= 0.01
+                                ]
+                                if cand not in held_incumbents and sec_incumbents:
+                                    best_inc = max(sec_incumbents, key=lambda s: float(row_roc[s]) if pd.notna(row_roc[s]) else 0.0)
+                                    inc_roc = float(row_roc[best_inc]) if pd.notna(row_roc[best_inc]) else 0.0
+                                    cand_roc = float(row_roc[cand]) if pd.notna(row_roc[cand]) else 0.0
+                                    if cand_roc < inc_roc + sector_incumbent_hurdle:
+                                        # Challenger fails hurdle; retain existing incumbent to fill sector quota
+                                        effective_occ = sector_counts[sec] + sum(
+                                            1 for s in locked_incumbents if s != best_inc and _get_symbol_sector(s) == sec
+                                        )
+                                        if effective_occ < allowed_sec_cap:
+                                            if best_inc not in cand_scores:
+                                                cand_scores[best_inc] = max(0.001, inc_roc) * thrust_incumbent_bonus
+                                            if best_inc not in cand_vols:
+                                                v = float(asset_vol_21d.iloc[t][best_inc]) if pd.notna(asset_vol_21d.iloc[t][best_inc]) else target_vol
+                                                cand_vols[best_inc] = max(0.10, v)
+                                            sorted_cands.append(best_inc)
+                                            sector_counts[sec] += 1
+                                        if len(sorted_cands) >= min_thrust_assets:
+                                            break
+                                        continue
+
                                 # An outside challenger cannot displace a locked incumbent in the same sector
                                 effective_occ = sector_counts[sec] + sum(1 for s in locked_incumbents if s != cand and _get_symbol_sector(s) == sec)
                                 if effective_occ < allowed_sec_cap:

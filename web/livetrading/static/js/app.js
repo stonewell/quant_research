@@ -1194,15 +1194,22 @@
         tdVal.setAttribute("data-label", "持仓市值");
 
         const tdAction = document.createElement("td");
+        tdAction.className = "col-action text-center";
+        tdAction.setAttribute("data-label", "操作");
+
         const btnDel = document.createElement("button");
-        btnDel.className = "btn btn-secondary btn-sm";
-        btnDel.textContent = "✕";
-        btnDel.title = "删除此行";
+        btnDel.type = "button";
+        btnDel.className = "btn-del-holding";
+        btnDel.innerHTML = "🗑️";
+        btnDel.title = "删除此行持仓";
+        btnDel.setAttribute("aria-label", "删除此行持仓");
         btnDel.addEventListener("click", () => {
             tr.remove();
             recalcHoldings();
+            if (el.tbodyHoldings.querySelectorAll("tr").length === 0) {
+                addHoldingRow("", 0, null, null);
+            }
         });
-        tdAction.setAttribute("data-label", "操作");
         tdAction.appendChild(btnDel);
 
         tr.appendChild(tdSym);
