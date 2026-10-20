@@ -137,7 +137,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
     and adaptive turnover filters so any blend strategy can inherit them cleanly.
     """
 
-    BASE_VERSION: str = "1.0.0"
+    BASE_VERSION: str = "1.1.0"
     version: str = "1.0.0"
 
     def __init__(
@@ -157,7 +157,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             self.config = config
         self.param_prefix = param_prefix
         self.alt_param_prefixes = alt_param_prefixes or []
-        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "1.0.0")
+        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "1.1.0")
         strat_version: str = version or getattr(self.__class__, "version", "1.0.0")
         tags = factor_tags or [
             "regime_trend_strength",
@@ -297,13 +297,13 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                 classification[sname] = "defensive"
             # Priority 2: Reversal / Microstructure
             elif (
-                any(k in name_lower for k in ("reversal", "mean_reversion", "rsi", "gtja", "alpha12", "alpha53", "alpha101", "shadow", "microstructure"))
+                any(k in name_lower for k in ("reversal", "mean_reversion", "rsi", "gtja", "alpha12", "alpha53", "alpha101", "shadow", "microstructure", "spring", "wyckoff"))
                 or any(k in tags_lower for k in ("mean_reversion", "reversal", "microstructure", "order_flow"))
             ):
                 classification[sname] = "reversal"
             # Priority 3: Momentum / Trend
             elif (
-                any(k in name_lower for k in ("momentum", "trend", "breakout", "three_type", "turtle", "alpha41", "alpha6", "alpha38"))
+                any(k in name_lower for k in ("momentum", "trend", "breakout", "three_type", "turtle", "alpha41", "alpha6", "alpha38", "chan_vp"))
                 or any(k in tags_lower for k in ("relative_momentum", "absolute_momentum_trend", "regime_trend_strength", "breakout"))
             ):
                 classification[sname] = "momentum"
@@ -389,6 +389,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         adaptive_shrinkage: float,
         date: Any,
         params: Optional[dict] = None,
+        median_d: Optional[float] = None,
     ) -> Dict[str, float]:
         """Dynamically computes sub-strategy blend weights under selected weighting mode:
         - 'rolling_ic_ir': Bayesian shrinkage on rolling annualized IR with HLZ t-stat filter.
@@ -398,6 +399,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         p = params or {}
         thrust_thresh = self.resolve_param(p, "thrust_thresh", 0.60, float)
         breadth_bull_thresh = self.resolve_param(p, "breadth_bull_thresh", 0.30, float)
+        enable_structural_regime = self.resolve_param(p, "enable_structural_regime", False, bool)
 
         # If all sub-strategies have zero base weights (e.g. explicitly disabled by caller), return as-is
         if sum(base_weights.values()) <= 1e-6:
@@ -425,13 +427,22 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
 
         elif weighting_mode in ("regime_adaptive", "regime_ic_ir_hybrid"):
             style_map = self._classify_sub_strategy_styles(sub_strats, p)
-            # Gu, Kelly & Xiu (2020) macro regime budget assignment
-            if (breadth_val >= 0.60) or (thrust >= thrust_thresh) or (persistence >= 0.65 and vol_z < 1.0):
-                budgets = {"momentum": 0.75, "reversal": 0.20, "defensive": 0.05}
-            elif (breadth_val >= breadth_bull_thresh and vol_z <= 2.0):
-                budgets = {"momentum": 0.20, "reversal": 0.65, "defensive": 0.15}
+            # Track C Anchor 1: Macro State Machine Budgeting with Fractal Dimension D_t
+            if enable_structural_regime and median_d is not None and not np.isnan(median_d):
+                if (breadth_val >= 0.60) or (thrust >= thrust_thresh) or (median_d < 1.45 and vol_z < 1.0):
+                    budgets = {"momentum": 0.80, "reversal": 0.15, "defensive": 0.05}
+                elif (breadth_val >= breadth_bull_thresh and vol_z <= 2.0) or (median_d > 1.55):
+                    budgets = {"momentum": 0.15, "reversal": 0.75, "defensive": 0.10}
+                else:
+                    budgets = {"momentum": 0.05, "reversal": 0.10, "defensive": 0.85}
             else:
-                budgets = {"momentum": 0.05, "reversal": 0.10, "defensive": 0.85}
+                # Gu, Kelly & Xiu (2020) macro regime budget assignment
+                if (breadth_val >= 0.60) or (thrust >= thrust_thresh) or (persistence >= 0.65 and vol_z < 1.0):
+                    budgets = {"momentum": 0.75, "reversal": 0.20, "defensive": 0.05}
+                elif (breadth_val >= breadth_bull_thresh and vol_z <= 2.0):
+                    budgets = {"momentum": 0.20, "reversal": 0.65, "defensive": 0.15}
+                else:
+                    budgets = {"momentum": 0.05, "reversal": 0.10, "defensive": 0.85}
 
             bucket_members = {"momentum": [], "reversal": [], "defensive": []}
             for k, bw in base_weights.items():
@@ -541,6 +552,14 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         enable_5m_stop_filter = self.resolve_param(p, "enable_5m_stop_filter", False, bool)
         intraday_cutoff_time = self.resolve_param(p, "intraday_cutoff_time", "14:15", str)
 
+        # Track C Multi-Theory Quantitative Synthesis Parameters (Anchors 1-5)
+        enable_structural_regime = self.resolve_param(p, "enable_structural_regime", False, bool)
+        enable_cyq_quality_gate = self.resolve_param(p, "enable_cyq_quality_gate", False, bool)
+        min_cyq_winner_ratio = self.resolve_param(p, "min_cyq_winner_ratio", 0.20, float)
+        enable_vp_confluence_sizing = self.resolve_param(p, "enable_vp_confluence_sizing", False, bool)
+        enable_spring_fast_entry = self.resolve_param(p, "enable_spring_fast_entry", False, bool)
+        enable_structural_chandelier_stop = self.resolve_param(p, "enable_structural_chandelier_stop", False, bool)
+
         symbols = list(universe.keys())
         if not symbols:
             return pd.DataFrame()
@@ -635,6 +654,24 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         vol_std_252 = basket_vol_21d.rolling(252, min_periods=20).std().replace(0, np.nan).fillna(0.04)
         vol_zscore_series = ((basket_vol_21d - vol_mean_252) / vol_std_252).fillna(0.0)
         persistence_series = (basket_ret > 0).astype(float).rolling(20, min_periods=5).mean().fillna(0.50)
+
+        # Precompute cross-sectional median fractal dimension D_t (Track C Anchor 1)
+        fractal_d_series = None
+        if enable_structural_regime:
+            fd_cols = [
+                universe[s]["fractal_dimension"].reindex(master_index)
+                for s in risky_symbols
+                if s in universe and not universe[s].empty and "fractal_dimension" in universe[s].columns
+            ]
+            if fd_cols:
+                fractal_d_series = pd.concat(fd_cols, axis=1).median(axis=1).ffill().bfill()
+            else:
+                try:
+                    from common.structural_factors import fractal_dimension
+                    basket_price = (1.0 + basket_ret).cumprod()
+                    fractal_d_series = fractal_dimension(basket_price, window=60).reindex(master_index).ffill().bfill()
+                except Exception:
+                    fractal_d_series = None
 
         # Step 2: Execute sub-strategies and get daily forward-filled weights
         sub_strats = self.get_sub_strategies(universe, p)
@@ -736,6 +773,20 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                 peak_p = asset_peak_price[s] or curr_p
                                 if peak_p >= asset_entry_price[s] * 1.05:
                                     trailing_stop_p = max(asset_entry_price[s] * 0.92, peak_p - stop_atr_mult * cur_atr)
+                                    # Track C Anchor 5: Structural ZG/VAL Chandelier Stop floor
+                                    if enable_structural_chandelier_stop and s in universe and not universe[s].empty:
+                                        df_u = universe[s]
+                                        if date in df_u.index:
+                                            cols_u = df_u.columns
+                                            zg = df_u.loc[date, "ZG"] if "ZG" in cols_u else (df_u.loc[date, "zg"] if "zg" in cols_u else np.nan)
+                                            val = df_u.loc[date, "VAL"] if "VAL" in cols_u else (df_u.loc[date, "val"] if "val" in cols_u else np.nan)
+                                            if pd.notna(zg) and pd.notna(val):
+                                                struct_floor = min(float(zg), float(val)) * 0.985
+                                                trailing_stop_p = max(trailing_stop_p, struct_floor)
+                                            elif pd.notna(zg):
+                                                trailing_stop_p = max(trailing_stop_p, float(zg) * 0.985)
+                                            elif pd.notna(val):
+                                                trailing_stop_p = max(trailing_stop_p, float(val) * 0.985)
                                 else:
                                     trailing_stop_p = asset_entry_price[s] * 0.92
                                 if curr_p < trailing_stop_p:
@@ -750,6 +801,20 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                                 upvol = df_u.loc[date, "UpVol_Ratio_5m"] if "UpVol_Ratio_5m" in df_u.columns else np.nan
                                                 if pd.notna(aft_low) and aft_low >= trailing_stop_p and (pd.isna(vwap_prem) or vwap_prem >= 0.0) and (pd.isna(upvol) or upvol >= 0.60):
                                                     is_stopped = False
+
+                                # Track C Anchor 5: Naked POC profit taking protection
+                                if not is_stopped and enable_structural_chandelier_stop and asset_entry_price[s] and curr_p >= asset_entry_price[s] * 1.10:
+                                    if s in universe and not universe[s].empty:
+                                        df_u = universe[s]
+                                        if date in df_u.index:
+                                            cols_u = df_u.columns
+                                            npoc_col = "NPOC" if "NPOC" in cols_u else ("npoc" if "npoc" in cols_u else None)
+                                            if npoc_col and "standardized_divergence" in cols_u:
+                                                npoc_val = df_u.loc[date, npoc_col]
+                                                div_val = df_u.loc[date, "standardized_divergence"]
+                                                if pd.notna(npoc_val) and pd.notna(div_val):
+                                                    if curr_p >= float(npoc_val) and float(div_val) < -1.0:
+                                                        is_stopped = True
 
                                 # Sub-level 3S take-profit lock:
                                 # When holding asset with floating profit >= 8% from entry, and pullback from peak >= 2 * ATR
@@ -831,6 +896,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                     adaptive_shrinkage=adaptive_shrinkage,
                     date=date,
                     params=p,
+                    median_d=(float(fractal_d_series.iloc[t]) if (fractal_d_series is not None and pd.notna(fractal_d_series.iloc[t])) else None),
                 )
 
             # Optional Löwdin symmetric orthogonalization
@@ -891,17 +957,44 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                 asset_emergency_df.loc[date, :] = True
 
             # Quality & Relative Strength Gate
-            if require_asset_trend and t > 0:
-                row_roc60 = roc_60_matrix.iloc[t]
-                roc60_median = float(row_roc60.median()) if not row_roc60.empty else 0.0
-                row_slope = ma20_slope_matrix.iloc[t]
-                row_trend50 = trend_50_matrix.iloc[t]
+            if t > 0:
                 prev_date = master_index[t - 1]
-                for s in risky_symbols:
-                    prev_w_s = float(daily_weights.loc[prev_date, s])
-                    if prev_w_s <= 1e-4 and float(raw_w[s]) > 0.01:
-                        if float(row_trend50[s]) < 0.5 and float(row_slope[s]) < 0.5 and float(row_roc60[s]) < roc60_median:
-                            raw_w[s] = 0.0
+                if require_asset_trend:
+                    row_roc60 = roc_60_matrix.iloc[t]
+                    roc60_median = float(row_roc60.median()) if not row_roc60.empty else 0.0
+                    row_slope = ma20_slope_matrix.iloc[t]
+                    row_trend50 = trend_50_matrix.iloc[t]
+                    for s in risky_symbols:
+                        prev_w_s = float(daily_weights.loc[prev_date, s])
+                        if prev_w_s <= 1e-4 and float(raw_w[s]) > 0.01:
+                            if float(row_trend50[s]) < 0.5 and float(row_slope[s]) < 0.5 and float(row_roc60[s]) < roc60_median:
+                                raw_w[s] = 0.0
+
+                # Track C Anchor 2: CYQ Quality Gate & Consolidation Density Gate
+                if enable_cyq_quality_gate:
+                    for s in risky_symbols:
+                        prev_w_s = float(daily_weights.loc[prev_date, s])
+                        if prev_w_s <= 1e-4 and float(raw_w[s]) > 0.01 and s in universe and not universe[s].empty:
+                            df_u = universe[s]
+                            cols = df_u.columns
+                            if date in df_u.index:
+                                if "cyq_winner_ratio" in cols:
+                                    c_wr = df_u.loc[date, "cyq_winner_ratio"]
+                                    if pd.notna(c_wr) and float(c_wr) < min_cyq_winner_ratio:
+                                        # Wyckoff spring exemption: if spring >= 1.25 and curvature >= 1.5, allow pass
+                                        is_exempt = False
+                                        if "wyckoff_spring" in cols and "extremum_curvature" in cols:
+                                            w_sp = df_u.loc[date, "wyckoff_spring"]
+                                            e_curv = df_u.loc[date, "extremum_curvature"]
+                                            if pd.notna(w_sp) and pd.notna(e_curv) and float(w_sp) >= 1.25 and float(e_curv) >= 1.5:
+                                                is_exempt = True
+                                        if not is_exempt:
+                                            raw_w[s] = 0.0
+
+                                if float(raw_w[s]) > 0.01 and "consolidation_density" in cols:
+                                    c_dens = df_u.loc[date, "consolidation_density"]
+                                    if pd.notna(c_dens) and float(c_dens) < 0.40:
+                                        raw_w[s] = 0.0
 
             # Dynamic cash deployment & pre-emptive thrust cash deployment
             effective_cap = max_single_pos
@@ -953,6 +1046,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                                 conf_count += 1
                                         if float(vol_surge_matrix.iloc[t][s]) > 0.5:
                                             conf_count += 1
+                                        damping_5m = 1.0
                                         if enable_intraday_5m and s in universe and not universe[s].empty:
                                             df_u = universe[s]
                                             if date in df_u.index:
@@ -961,13 +1055,36 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                                 if q_val < -0.002 and up_val >= 0.55:
                                                     conf_count += 1
                                                 elif up_val < 0.42:
-                                                    c_mult *= 0.5
+                                                    damping_5m = 0.5
+
+                                        # Track C Anchor 3: VP Confluence & Wyckoff Effort-Result Sizing
+                                        damping_vp = 1.0
+                                        if enable_vp_confluence_sizing and s in universe and not universe[s].empty:
+                                            df_u = universe[s]
+                                            if date in df_u.index:
+                                                cols_u = df_u.columns
+                                                curr_close_s = float(df_u.loc[date, "Close"]) if "Close" in cols_u else 0.0
+                                                if "VAH" in cols_u and "cyq_cost_concentration" in cols_u:
+                                                    vah_val = df_u.loc[date, "VAH"]
+                                                    conc_val = df_u.loc[date, "cyq_cost_concentration"]
+                                                    if pd.notna(vah_val) and pd.notna(conc_val) and curr_close_s >= float(vah_val) and float(conc_val) >= 0.85:
+                                                        conf_count += 1
+                                                if "wyckoff_effort_result" in cols_u and "High" in cols_u and "Low" in cols_u:
+                                                    er_val = df_u.loc[date, "wyckoff_effort_result"]
+                                                    h_val = df_u.loc[date, "High"]
+                                                    l_val = df_u.loc[date, "Low"]
+                                                    if pd.notna(er_val) and pd.notna(h_val) and pd.notna(l_val):
+                                                        mid_bar = (float(h_val) + float(l_val)) / 2.0
+                                                        if float(er_val) < 0.35 and curr_close_s < mid_bar:
+                                                            damping_vp = 0.6
+
                                         if conf_count >= 3:
                                             c_mult = 1.6
                                         elif conf_count >= 2:
                                             c_mult = 1.1
                                         else:
                                             c_mult = 0.6
+                                        c_mult *= damping_5m * damping_vp
                                     confluence_mults[s] = c_mult
 
                                     # Alpha#3 / sub-strategy boost if available
@@ -1162,8 +1279,26 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                         vwap_prem = df_u.loc[date, "VWAP_Prem_5m"] if "VWAP_Prem_5m" in df_u.columns else np.nan
                                         if c_conf == 2 and (pd.isna(upvol) or upvol >= intraday_upvol_thresh) and (pd.isna(vwap_prem) or vwap_prem >= 0.0):
                                             entry_signal_bars[s] = min_entry_bars  # Fast-track entry Day 1 bypass
+                                elif enable_spring_fast_entry and entry_signal_bars[s] == 1 and s in universe and not universe[s].empty:
+                                    df_u = universe[s]
+                                    if date in df_u.index and "wyckoff_spring" in df_u.columns and "extremum_curvature" in df_u.columns:
+                                        w_sp = df_u.loc[date, "wyckoff_spring"]
+                                        e_curv = df_u.loc[date, "extremum_curvature"]
+                                        if pd.notna(w_sp) and pd.notna(e_curv) and float(w_sp) >= 1.25 and float(e_curv) >= 1.5:
+                                            entry_signal_bars[s] = min_entry_bars  # Track C Anchor 4: Wyckoff Spring Day 1 fast-track entry bypass
                                 if entry_signal_bars[s] < min_entry_bars:
                                     raw_w[s] = 0.0  # Pending confirmation on Day 1; do NOT enter!
+
+                            # Track C Anchor 4: Extreme kinetic top divergence veto
+                            if enable_spring_fast_entry and float(raw_w[s]) > 0.0 and s in universe and not universe[s].empty:
+                                df_u = universe[s]
+                                if date in df_u.index and "standardized_divergence" in df_u.columns and "POC" in df_u.columns:
+                                    s_div = df_u.loc[date, "standardized_divergence"]
+                                    poc_val = df_u.loc[date, "POC"]
+                                    curr_p_s = float(df_u.loc[date, "Close"]) if "Close" in df_u.columns else 0.0
+                                    if pd.notna(s_div) and pd.notna(poc_val) and float(s_div) < -1.2 and curr_p_s < float(poc_val):
+                                        raw_w[s] = 0.0
+                                        entry_signal_bars[s] = 0
                         else:
                             entry_signal_bars[s] = 0
                             raw_w[s] = 0.0
@@ -1199,6 +1334,20 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                     aft_ret = df_u.loc[date, "Afternoon_Ret_5m"] if "Afternoon_Ret_5m" in df_u.columns else 0.0
                                     if pd.notna(aft_ret) and aft_ret < -0.015:
                                         raw_w[s] = 0.0  # Sub-level veto on entry
+
+            # Track C Anchor 4: Extreme kinetic top divergence veto for new entries when min_entry_bars <= 1
+            if min_entry_bars <= 1 and enable_spring_fast_entry:
+                prev_date_w = master_index[t - 1] if t > 0 else None
+                for s in risky_symbols:
+                    prev_w = float(daily_weights.loc[prev_date_w, s]) if prev_date_w is not None else 0.0
+                    if prev_w <= 1e-4 and float(raw_w[s]) >= entry_thresh and s in universe and not universe[s].empty:
+                        df_u = universe[s]
+                        if date in df_u.index and "standardized_divergence" in df_u.columns and "POC" in df_u.columns:
+                            s_div = df_u.loc[date, "standardized_divergence"]
+                            poc_val = df_u.loc[date, "POC"]
+                            curr_p_s = float(df_u.loc[date, "Close"]) if "Close" in df_u.columns else 0.0
+                            if pd.notna(s_div) and pd.notna(poc_val) and float(s_div) < -1.2 and curr_p_s < float(poc_val):
+                                raw_w[s] = 0.0
 
             tot_risky = float(raw_w[risky_symbols].sum())
             if tot_risky > 1.0:

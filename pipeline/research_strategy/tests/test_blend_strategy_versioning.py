@@ -39,10 +39,10 @@ def test_blend_base_versioning_and_properties():
             return {}
 
     b1 = DummyBlend()
-    assert b1.BASE_VERSION == "1.0.0"
+    assert b1.BASE_VERSION == "1.1.0"
     assert b1.version == "1.0.0"
-    assert b1.base_version == "1.0.0"
-    assert b1.version_string == "v1.0.0 [base: v1.0.0]"
+    assert b1.base_version == "1.1.0"
+    assert b1.version_string == "v1.0.0 [base: v1.1.0]"
 
     # Subclass with custom version
     class CustomBlend(BaseBlendAllocationStrategy):
@@ -54,14 +54,14 @@ def test_blend_base_versioning_and_properties():
 
     b2 = CustomBlend()
     assert b2.version == "2.0.0"
-    assert b2.base_version == "1.0.0"
-    assert b2.version_string == "v2.0.0 [base: v1.0.0]"
+    assert b2.base_version == "1.1.0"
+    assert b2.version_string == "v2.0.0 [base: v1.1.0]"
 
     # Custom version passed at instantiation
     b3 = CustomBlend(version="2.1.0")
     assert b3.version == "2.1.0"
-    assert b3.base_version == "1.0.0"
-    assert b3.version_string == "v2.1.0 [base: v1.0.0]"
+    assert b3.base_version == "1.1.0"
+    assert b3.version_string == "v2.1.0 [base: v1.1.0]"
 
 
 def test_six_institutional_blend_subclasses():
@@ -78,13 +78,13 @@ def test_six_institutional_blend_subclasses():
     for b_cls in blend_classes:
         inst = b_cls()
         assert inst.version == "1.0.0", f"{b_cls.__name__} version should be '1.0.0'"
-        assert inst.base_version == "1.0.0"
-        assert "v1.0.0 [base: v1.0.0]" in inst.version_string
+        assert inst.base_version == "1.1.0"
+        assert "v1.0.0 [base: v1.1.0]" in inst.version_string
 
         v_info = inst.get_version_info()
         assert isinstance(v_info, dict)
         assert v_info["version"] == "1.0.0"
-        assert v_info["base_version"] == "1.0.0"
+        assert v_info["base_version"] == "1.1.0"
         assert "sub_strategies" in v_info
         assert isinstance(v_info["sub_strategies"], dict)
 
@@ -101,7 +101,7 @@ def test_blend_version_info_structure():
     info = strat.get_version_info()
     assert info["strategy_class"] == "ChanFourStateBlendStrategy"
     assert info["version"] == "1.0.0"
-    assert info["base_version"] == "1.0.0"
+    assert info["base_version"] == "1.1.0"
     assert "chan_four_state" in info["sub_strategies"]
     assert "chan_three_type" in info["sub_strategies"]
     assert "chan_vaa_compound" in info["sub_strategies"]

@@ -886,6 +886,14 @@ class StrategyConfig:
     blend_enable_spring_fast_entry: bool = False
     blend_enable_structural_chandelier_stop: bool = False
 
+    # Modular Blend base enhancement aliases (unprefixed versions for convenience)
+    enable_structural_regime: Optional[bool] = None
+    enable_cyq_quality_gate: Optional[bool] = None
+    min_cyq_winner_ratio: Optional[float] = None
+    enable_vp_confluence_sizing: Optional[bool] = None
+    enable_spring_fast_entry: Optional[bool] = None
+    enable_structural_chandelier_stop: Optional[bool] = None
+
     # Backtester execution defaults
     initial_capital: float = 100_000.0
     commission_pct: float = 0.0005          # 5 bps
@@ -1180,6 +1188,27 @@ class StrategyConfig:
         elif self.enable_orthogonalization is None:
             self.enable_orthogonalization = self.blend_enable_orthogonalization
 
+        for alias, blend_attr in [
+            ("enable_intraday_5m", "blend_enable_intraday_5m"),
+            ("enable_5m_interval_nesting", "blend_enable_5m_interval_nesting"),
+            ("intraday_upvol_thresh", "blend_intraday_upvol_thresh"),
+            ("use_intraday_downside_vol", "blend_use_intraday_downside_vol"),
+            ("enable_5m_stop_filter", "blend_enable_5m_stop_filter"),
+            ("intraday_cutoff_time", "blend_intraday_cutoff_time"),
+            ("enable_structural_regime", "blend_enable_structural_regime"),
+            ("enable_cyq_quality_gate", "blend_enable_cyq_quality_gate"),
+            ("min_cyq_winner_ratio", "blend_min_cyq_winner_ratio"),
+            ("enable_vp_confluence_sizing", "blend_enable_vp_confluence_sizing"),
+            ("enable_spring_fast_entry", "blend_enable_spring_fast_entry"),
+            ("enable_structural_chandelier_stop", "blend_enable_structural_chandelier_stop"),
+        ]:
+            val = getattr(self, alias, None)
+            blend_val = getattr(self, blend_attr, None)
+            if val is not None and val != blend_val:
+                setattr(self, blend_attr, val)
+            elif val is None and blend_val is not None:
+                setattr(self, alias, blend_val)
+
         if self.blend_weighting_mode not in ("static", "rolling_ic_ir", "regime_adaptive", "regime_ic_ir_hybrid"):
             raise ValueError(f"StrategyConfig.blend_weighting_mode must be one of 'static', 'rolling_ic_ir', 'regime_adaptive', 'regime_ic_ir_hybrid', got {self.blend_weighting_mode}")
         if self.blend_adaptive_lookback_days <= 0:
@@ -1259,15 +1288,26 @@ class StrategyConfig:
         Unknown keys are dropped (for forward-compatibility with newer config
         files) but a warning names them, rather than the previous total silence."""
         data_copy = dict(data)
-        if "weighting_mode" in data_copy and "blend_weighting_mode" not in data_copy:
-            data_copy["blend_weighting_mode"] = data_copy["weighting_mode"]
-        elif "blend_weighting_mode" in data_copy and "weighting_mode" not in data_copy:
-            data_copy["weighting_mode"] = data_copy["blend_weighting_mode"]
-
-        if "enable_orthogonalization" in data_copy and "blend_enable_orthogonalization" not in data_copy:
-            data_copy["blend_enable_orthogonalization"] = data_copy["enable_orthogonalization"]
-        elif "blend_enable_orthogonalization" in data_copy and "enable_orthogonalization" not in data_copy:
-            data_copy["enable_orthogonalization"] = data_copy["blend_enable_orthogonalization"]
+        for alias, blend_attr in [
+            ("weighting_mode", "blend_weighting_mode"),
+            ("enable_orthogonalization", "blend_enable_orthogonalization"),
+            ("enable_intraday_5m", "blend_enable_intraday_5m"),
+            ("enable_5m_interval_nesting", "blend_enable_5m_interval_nesting"),
+            ("intraday_upvol_thresh", "blend_intraday_upvol_thresh"),
+            ("use_intraday_downside_vol", "blend_use_intraday_downside_vol"),
+            ("enable_5m_stop_filter", "blend_enable_5m_stop_filter"),
+            ("intraday_cutoff_time", "blend_intraday_cutoff_time"),
+            ("enable_structural_regime", "blend_enable_structural_regime"),
+            ("enable_cyq_quality_gate", "blend_enable_cyq_quality_gate"),
+            ("min_cyq_winner_ratio", "blend_min_cyq_winner_ratio"),
+            ("enable_vp_confluence_sizing", "blend_enable_vp_confluence_sizing"),
+            ("enable_spring_fast_entry", "blend_enable_spring_fast_entry"),
+            ("enable_structural_chandelier_stop", "blend_enable_structural_chandelier_stop"),
+        ]:
+            if alias in data_copy and blend_attr not in data_copy:
+                data_copy[blend_attr] = data_copy[alias]
+            elif blend_attr in data_copy and alias not in data_copy:
+                data_copy[alias] = data_copy[blend_attr]
 
         valid_fields = {f.name for f in fields(cls)}
         unknown_keys = set(data_copy.keys()) - valid_fields
