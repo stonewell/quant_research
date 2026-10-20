@@ -267,12 +267,19 @@ def evaluate_snowball_valuation(
     buy_mv = float(fair_mv * (1.0 - cfg.margin_of_safety))
 
     # Buy target price derivation
+    close_price = getattr(metrics, "close_price", float("nan"))
     if metrics.total_shares > 0 and not np.isnan(metrics.total_shares):
         buy_price = float(buy_mv / metrics.total_shares)
-    elif metrics.market_cap > 0 and not np.isnan(metrics.market_cap):
-        buy_price = float(buy_mv / metrics.market_cap)
+    elif (
+        metrics.market_cap > 0
+        and not np.isnan(metrics.market_cap)
+        and close_price is not None
+        and not np.isnan(close_price)
+        and close_price > 0
+    ):
+        buy_price = float(close_price * (buy_mv / metrics.market_cap))
     else:
-        buy_price = 0.0
+        buy_price = float("nan")
 
     # Margin of Safety ratio: (Fair MV - Current Market Cap) / Fair MV
     if fair_mv > 0 and metrics.market_cap > 0 and not np.isnan(metrics.market_cap):

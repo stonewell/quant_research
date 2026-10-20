@@ -43,6 +43,7 @@ class FundamentalMetrics:
     pb: float
     total_shares: float
     market_cap: float
+    close_price: float = float("nan")
     industry_name: str = "Unknown"
     industry_tier: str = "tier3_manufacturing"
     terminal_pe: float = 10.0

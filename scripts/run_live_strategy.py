@@ -1465,6 +1465,20 @@ def main():
                     current_weight=cur_w,
                 )
 
+            # Pre-execution brokerage reconciliation:
+            # If the brokerage account has zero shares/weight but UPLSM thinks it is holding,
+            # reconcile to FLAT or COOLDOWN to prevent phantom position locks.
+            if (current_shares == 0 or cur_w <= 1e-6) and state.is_holding():
+                state.state = PositionState.COOLDOWN if (state.cooldown_remaining > 0 or bars_since_exit < reentry_cooldown_bars) else PositionState.FLAT
+                if state.state == PositionState.COOLDOWN and state.cooldown_remaining <= 0:
+                    state.cooldown_remaining = max(1, reentry_cooldown_bars - bars_since_exit)
+                state.held_bars = 0
+                state.current_weight = 0.0
+                state.entry_price = 0.0
+                state.peak_price = 0.0
+                state.entry_streak = 0
+                state.exit_streak = 0
+
             decision = step_position_lifecycle(
                 state=state,
                 raw_target_weight=tgt_w,
@@ -1549,6 +1563,43 @@ def main():
             delta_shares = 0
             actual_trade_val = 0.0
             raw_shares = 0.0
+
+        # Post-calculation lot-rounding zero shares liquidation:
+        # When current_shares > 0 and after lot rounding target_shares == 0
+        # (whether raw tgt_w <= 1e-6 or because lot rounding rounded it down to 0),
+        # the asset has been fully liquidated. Reconcile state to COOLDOWN.
+        if sym != cash_proxy and current_shares > 0 and target_shares == 0:
+            state.state = PositionState.COOLDOWN
+            state.cooldown_remaining = reentry_cooldown_bars
+            state.held_bars = 0
+            state.current_weight = 0.0
+            state.entry_price = 0.0
+            state.peak_price = 0.0
+            state.last_exit_type = ExitType.NORMAL.value
+            state.entry_streak = 0
+            state.exit_streak = 0
+            updated_lifecycle_states[sym] = state.to_dict()
+            held_age = 0
+            is_tenure_locked = False
+            action = "SELL"
+            tgt_w = 0.0
+            delta_w = -cur_w
+            abs_delta = abs(delta_w)
+            if not reason or reason == "最优权重微调":
+                reason = "目标仓位不足单手或整手归零清仓"
+        elif sym != cash_proxy and current_shares == 0 and target_shares == 0 and state.is_holding():
+            # If a BUY was attempted from FLAT but lot rounding rounded down to 0 shares,
+            # revert lifecycle state back to FLAT to avoid phantom gestation.
+            state.state = PositionState.FLAT
+            state.held_bars = 0
+            state.current_weight = 0.0
+            state.entry_price = 0.0
+            state.peak_price = 0.0
+            state.entry_streak = 0
+            state.exit_streak = 0
+            updated_lifecycle_states[sym] = state.to_dict()
+            held_age = 0
+            is_tenure_locked = False
 
         # Sector throttle and dimension signals
         sec = _get_symbol_sector(sym) if sym != cash_proxy else "cash"
@@ -1787,35 +1838,50 @@ def main():
 
         if tgt_sh > 0:
             post_holdings[sym] = tgt_sh
-            if act == "BUY" and cur_sh == 0:
-                dual_holding_bars[sym] = 0
-                if p > 0:
-                    dual_entry_prices[sym] = p
-                updated_last_exit_date.pop(sym, None)
+            if act == "BUY":
+                dual_zero_target_streak.pop(sym, None)
                 if sym in updated_lifecycle_states:
-                    updated_lifecycle_states[sym]["held_bars"] = 0
+                    updated_lifecycle_states[sym]["exit_streak"] = 0
+                if cur_sh == 0:
+                    dual_holding_bars[sym] = 0
                     if p > 0:
-                        updated_lifecycle_states[sym]["entry_price"] = p
-                        updated_lifecycle_states[sym]["peak_price"] = p
+                        dual_entry_prices[sym] = p
+                    updated_last_exit_date.pop(sym, None)
+                    if sym in updated_lifecycle_states:
+                        updated_lifecycle_states[sym]["held_bars"] = 0
+                        if p > 0:
+                            updated_lifecycle_states[sym]["entry_price"] = p
+                            updated_lifecycle_states[sym]["peak_price"] = p
             else:
                 if sym not in dual_holding_bars:
                     dual_holding_bars[sym] = int(r.get("holding_bars", 1))
                 if sym not in dual_entry_prices and p > 0:
                     dual_entry_prices[sym] = p
         else:
-            if cur_sh > 0 and act == "SELL":
+            if act == "BUY":
+                dual_zero_target_streak.pop(sym, None)
+                if sym in updated_lifecycle_states:
+                    updated_lifecycle_states[sym]["exit_streak"] = 0
+            if cur_sh > 0 and (act == "SELL" or tgt_sh == 0):
                 updated_last_exit_date[sym] = as_of_date
                 dual_entry_prices.pop(sym, None)
                 dual_holding_bars.pop(sym, None)
                 dual_zero_target_streak.pop(sym, None)
                 dual_entry_signal_streak.pop(sym, None)
                 if sym in updated_lifecycle_states:
+                    updated_lifecycle_states[sym]["state"] = PositionState.COOLDOWN.value
+                    updated_lifecycle_states[sym]["cooldown_remaining"] = reentry_cooldown_bars
                     updated_lifecycle_states[sym]["held_bars"] = 0
                     updated_lifecycle_states[sym]["entry_price"] = 0.0
                     updated_lifecycle_states[sym]["peak_price"] = 0.0
                     updated_lifecycle_states[sym]["current_weight"] = 0.0
                     updated_lifecycle_states[sym]["exit_streak"] = 0
                     updated_lifecycle_states[sym]["entry_streak"] = 0
+                    if not updated_lifecycle_states[sym].get("last_exit_type"):
+                        updated_lifecycle_states[sym]["last_exit_type"] = ExitType.NORMAL.value
+            elif cur_sh == 0 and tgt_sh == 0:
+                dual_holding_bars.pop(sym, None)
+                dual_entry_prices.pop(sym, None)
 
     updated_exit_bars_ago = resolve_exit_cooldown(
         list(updated_last_exit_date.keys()),

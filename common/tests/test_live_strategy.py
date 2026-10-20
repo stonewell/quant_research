@@ -416,5 +416,224 @@ def test_exit_confirmation_streak_protection_and_hard_stop(tmp_path, monkeypatch
     assert "触发个股 -8% 硬止损风控" in icbc_stop["reason"]
 
 
+def test_phantom_held_position_reconciliation_when_zero_shares(tmp_path, monkeypatch):
+    """Fix 2 (Part a): Verifies that if broker account has 0 shares (current_shares == 0)
+    but prior account_state / UPLSM had it as HELD_ACTIVE with held_bars,
+    pre-execution brokerage reconciliation resets it to FLAT (held_bars = 0)
+    so it is not blocked or phantom-locked under min_holding_bars.
+    """
+    from scripts.run_live_strategy import main
+
+    univ_file = str(tmp_path / "univ.txt")
+    with open(univ_file, "w", encoding="utf-8") as f:
+        f.write("600000.SH\n601088.SH\n")
+
+    # Broker holdings: 601088.SH is 0 shares (physically flat)
+    holdings_file = str(tmp_path / "holdings.json")
+    with open(holdings_file, "w", encoding="utf-8") as f:
+        json.dump({"600000.SH": 1000, "601088.SH": 0}, f)
+
+    # Prior state had 601088.SH as HELD_ACTIVE (phantom held position)
+    state_file = str(tmp_path / "account_state.json")
+    with open(state_file, "w", encoding="utf-8") as f:
+        json.dump({
+            "holding_bars": {"600000.SH": 5, "601088.SH": 1},
+            "lifecycle_states": {
+                "600000.SH": {
+                    "symbol": "600000.SH",
+                    "state": "HELD_ACTIVE",
+                    "held_bars": 5,
+                    "entry_streak": 2,
+                    "exit_streak": 0,
+                    "cooldown_remaining": 0,
+                    "entry_price": 10.0,
+                    "peak_price": 11.0,
+                    "current_weight": 0.5,
+                    "last_exit_type": None,
+                },
+                "601088.SH": {
+                    "symbol": "601088.SH",
+                    "state": "HELD_ACTIVE",
+                    "held_bars": 1,
+                    "entry_streak": 2,
+                    "exit_streak": 0,
+                    "cooldown_remaining": 0,
+                    "entry_price": 50.0,
+                    "peak_price": 52.0,
+                    "current_weight": 0.1,
+                    "last_exit_type": None,
+                },
+            },
+            "zero_target_streak": {},
+        }, f)
+
+    cmd_args = [
+        "run_live_strategy.py",
+        "--strategy", "equal_weight",
+        "--universe-file", univ_file,
+        "--current-holdings-file", holdings_file,
+        "--account-state-file", state_file,
+        "--output-dir", str(tmp_path),
+        "--as-of-date", "2024-05-10",
+        "--start-date", "2024-01-01",
+        "--data-provider", "synthetic",
+        "--portfolio-value", "100000",
+        "--min-holding-bars", "3",
+    ]
+    monkeypatch.setattr(sys, "argv", cmd_args)
+
+    main()
+
+    with open(state_file, "r", encoding="utf-8") as f:
+        st = json.load(f)
+
+    # Pre-execution reconciliation must have cleared phantom holding
+    lc_601088 = st["lifecycle_states"]["601088.SH"]
+    assert lc_601088["state"] != "HELD_ACTIVE"
+    # And dual holding bars must not report 601088 as held
+    assert "601088.SH" not in st.get("holding_bars", {})
+
+
+def test_lot_rounding_zero_shares_liquidation_to_cooldown(tmp_path, monkeypatch):
+    """Fix 2 (Part b & c): Verifies that when an asset is held (current_shares > 0)
+    and strategy target weight is small (> 0) such that lot rounding rounds target_shares to 0,
+    the position is completely liquidated and transitions to COOLDOWN with held_bars = 0,
+    and all tracking dicts (holding_bars, zero_target_streak, entry_prices) are purged.
+    """
+    from unittest.mock import patch
+    from common.allocation_templates import EqualWeightAllocation
+    from scripts.run_live_strategy import main
+
+    univ_file = str(tmp_path / "univ.txt")
+    with open(univ_file, "w", encoding="utf-8") as f:
+        f.write("600000.SH\n601088.SH\n")
+
+    # Current holdings: 601088.SH has 400 shares
+    holdings_file = str(tmp_path / "holdings.json")
+    with open(holdings_file, "w", encoding="utf-8") as f:
+        json.dump({"600000.SH": 1000, "601088.SH": 400}, f)
+
+    state_file = str(tmp_path / "account_state.json")
+    with open(state_file, "w", encoding="utf-8") as f:
+        json.dump({
+            "holding_bars": {"600000.SH": 5, "601088.SH": 2},
+            "entry_prices": {"601088.SH": 50.0},
+            "zero_target_streak": {},
+        }, f)
+
+    cmd_args = [
+        "run_live_strategy.py",
+        "--strategy", "equal_weight",
+        "--universe-file", univ_file,
+        "--current-holdings-file", holdings_file,
+        "--account-state-file", state_file,
+        "--output-dir", str(tmp_path),
+        "--as-of-date", "2024-05-10",
+        "--start-date", "2024-01-01",
+        "--data-provider", "synthetic",
+        "--portfolio-value", "100000",
+        "--reentry-cooldown-bars", "2",
+    ]
+    monkeypatch.setattr(sys, "argv", cmd_args)
+
+    orig_gen = EqualWeightAllocation.generate_weights
+    def mock_gen(self, universe, params):
+        df = orig_gen(self, universe, params)
+        # Allocate tiny target weight 0.005 (0.5% = 500 RMB < 100 shares * price)
+        df["601088.SH"] = 0.005
+        return df
+
+    with patch.object(EqualWeightAllocation, "generate_weights", mock_gen):
+        main()
+
+    with open(tmp_path / "live_trading_ticket.json", "r", encoding="utf-8") as f:
+        tickets = json.load(f)
+
+    r_601088 = next(t for t in tickets if t["symbol"] == "601088.SH")
+    assert r_601088["action"] == "SELL"
+    assert r_601088["target_shares"] == 0
+    assert r_601088["delta_shares"] == -400
+
+    with open(state_file, "r", encoding="utf-8") as f:
+        st = json.load(f)
+
+    lc = st["lifecycle_states"]["601088.SH"]
+    assert lc["state"] == "COOLDOWN"
+    assert lc["held_bars"] == 0
+    assert lc["current_weight"] == 0.0
+    assert lc["cooldown_remaining"] == 2
+    assert lc["last_exit_type"] == "NORMAL"
+
+    assert "601088.SH" not in st.get("holding_bars", {})
+    assert "601088.SH" not in st.get("entry_prices", {})
+    assert "601088.SH" not in st.get("zero_target_streak", {})
+    assert st["last_exit_date"]["601088.SH"] == "2024-05-10"
+    assert st["exit_bars_ago"]["601088.SH"] == 0
+
+
+def test_buy_resets_zero_target_streak_and_exit_streak(tmp_path, monkeypatch):
+    """Fix 3: Verifies that when an asset executes BUY, dual_zero_target_streak.pop(sym, None)
+    and lifecycle_states[sym]["exit_streak"] = 0 ensure no stale zero target streak persists.
+    """
+    from scripts.run_live_strategy import main
+
+    univ_file = str(tmp_path / "univ.txt")
+    with open(univ_file, "w", encoding="utf-8") as f:
+        f.write("600000.SH\n601857.SH\n")
+
+    holdings_file = str(tmp_path / "holdings.json")
+    with open(holdings_file, "w", encoding="utf-8") as f:
+        json.dump({"600000.SH": 1000, "601857.SH": 0}, f)
+
+    state_file = str(tmp_path / "account_state.json")
+    with open(state_file, "w", encoding="utf-8") as f:
+        json.dump({
+            "holding_bars": {"600000.SH": 5},
+            "zero_target_streak": {"601857.SH": 1},
+            "entry_signal_streak": {"601857.SH": 1},
+            "lifecycle_states": {
+                "601857.SH": {
+                    "symbol": "601857.SH",
+                    "state": "PENDING_ENTRY",
+                    "held_bars": 0,
+                    "entry_streak": 1,
+                    "exit_streak": 1,
+                    "cooldown_remaining": 0,
+                    "entry_price": 0.0,
+                    "peak_price": 0.0,
+                    "current_weight": 0.0,
+                    "last_exit_type": None,
+                }
+            },
+        }, f)
+
+    cmd_args = [
+        "run_live_strategy.py",
+        "--strategy", "equal_weight",
+        "--universe-file", univ_file,
+        "--current-holdings-file", holdings_file,
+        "--account-state-file", state_file,
+        "--output-dir", str(tmp_path),
+        "--as-of-date", "2024-05-10",
+        "--start-date", "2024-01-01",
+        "--data-provider", "synthetic",
+        "--portfolio-value", "100000",
+        "--entry-confirm-bars", "2",
+    ]
+    monkeypatch.setattr(sys, "argv", cmd_args)
+
+    main()
+
+    with open(state_file, "r", encoding="utf-8") as f:
+        st = json.load(f)
+
+    # 601857.SH should have completed entry streak (1 -> 2) -> BUY into gestation
+    assert "601857.SH" not in st.get("zero_target_streak", {})
+    lc = st["lifecycle_states"]["601857.SH"]
+    assert lc["exit_streak"] == 0
+    assert lc["state"] == "HELD_GESTATION"
+
+
+
 
 

@@ -43,16 +43,20 @@ class ScreenerConfig:
     # needs real OHLCV history, not fundamentals.
     lookback_days: int = 1260              # ~5 years, mirrors the doc's own 5-year framing
 
-    # Snowball Valuation Engine (F2.1, F2.2, F2.3) parameters
+    # Snowball Valuation Engine (F2.1, F2.2, F2.3, F3.1) parameters
     discount_rate: float = 0.12
     benchmark_expected_return: float = 0.07
-    margin_of_safety: float = 0.15
+    margin_of_safety: float = 0.20
     max_earnings_growth: float = 0.12
     min_cfo_to_profit: float = 0.80
-    max_debt_to_assets: float = 0.60
+    max_debt_to_assets: float = 0.50
     min_dividend_payout: float = 0.20
-    max_dividend_payout: float = 0.85
+    max_dividend_payout: float = 0.70
     enable_industry_blacklist: bool = True
+    enable_snowball_valuation: bool = True
+    weighting_mode: str = "equal"          # "equal" or "mos"
+    rebalance_freq_days: int = 63
+    cash_proxy: str = "BIL"
 
     def __post_init__(self):
         if self.top_n <= 0:
@@ -61,3 +65,7 @@ class ScreenerConfig:
             raise ValueError("ScreenerConfig.benchmark_symbol must be a non-empty string")
         if not self.universe:
             raise ValueError("ScreenerConfig.universe must be a non-empty list")
+        if self.weighting_mode not in ("equal", "mos"):
+            raise ValueError(f"ScreenerConfig.weighting_mode must be 'equal' or 'mos', got '{self.weighting_mode}'")
+        if self.rebalance_freq_days <= 0:
+            raise ValueError(f"ScreenerConfig.rebalance_freq_days must be > 0, got {self.rebalance_freq_days}")

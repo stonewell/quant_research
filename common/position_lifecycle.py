@@ -193,6 +193,8 @@ def step_position_lifecycle(
             )
         else:
             state.state = PositionState.FLAT
+            state.entry_streak = 0
+            state.exit_streak = 0
 
     # 2. If holding (HELD_GESTATION, HELD_ACTIVE, or PENDING_EXIT)
     if state.state in (PositionState.HELD_GESTATION, PositionState.HELD_ACTIVE, PositionState.PENDING_EXIT):
@@ -345,6 +347,7 @@ def step_position_lifecycle(
         entry_gate = cfg.min_entry_threshold if cfg.min_entry_threshold is not None else cfg.inertia_threshold
         if raw_target_weight > 0.0 and raw_target_weight < entry_gate:
             state.entry_streak = 0
+            state.exit_streak = 0
             state.state = PositionState.FLAT
             return LifecycleDecision(
                 action="HOLD_FILTERED",
@@ -385,6 +388,7 @@ def step_position_lifecycle(
                 state.state = PositionState.HELD_GESTATION
                 state.held_bars = 0
                 state.entry_streak = cfg.guard_latency_bars
+                state.exit_streak = 0
                 state.entry_price = current_price
                 state.peak_price = current_price
                 state.current_weight = raw_target_weight
@@ -413,6 +417,7 @@ def step_position_lifecycle(
             if state.entry_streak >= cfg.guard_latency_bars:
                 state.state = PositionState.HELD_GESTATION
                 state.held_bars = 0
+                state.exit_streak = 0
                 state.entry_price = current_price
                 state.peak_price = current_price
                 state.current_weight = raw_target_weight
@@ -445,6 +450,7 @@ def step_position_lifecycle(
                 )
         else:
             state.entry_streak = 0
+            state.exit_streak = 0
             state.state = PositionState.FLAT
             return LifecycleDecision(
                 action="HOLD",

@@ -107,12 +107,14 @@ def quality_ok(row, cfg: ScreenerConfig) -> bool:
     return True
 
 
-def _row_to_fundamental_metrics(sym: Any, row: pd.Series) -> FundamentalMetrics:
+def _row_to_fundamental_metrics(sym: Any, row: pd.Series, close_price: float = float("nan")) -> FundamentalMetrics:
     symbol_str = str(row.get("symbol", sym))
     np_val = row.get("net_profit", 100.0)
     growth = row.get("earnings_growth", row.get("net_profit_5yr_cagr", 0.08))
     mcap = row.get("market_cap", 1000.0)
     shares = row.get("total_shares", 10.0)
+    cp = row.get("close_price", close_price)
+    cp_val = float(cp) if cp is not None and not pd.isna(cp) else float("nan")
     return FundamentalMetrics(
         symbol=symbol_str,
         report_year=int(row.get("report_year", 2024)),
@@ -133,6 +135,7 @@ def _row_to_fundamental_metrics(sym: Any, row: pd.Series) -> FundamentalMetrics:
         pb=float(row.get("pb", float("nan"))),
         total_shares=float(shares),
         market_cap=float(mcap),
+        close_price=cp_val,
         industry_name=str(row.get("industry_name", "Unknown")),
         industry_tier=str(row.get("industry_tier", "tier3_manufacturing")),
         terminal_pe=float(row.get("terminal_pe", 10.0)),
@@ -167,13 +170,20 @@ def evaluate_buy_sell(fundamentals_df: pd.DataFrame, benchmark_return: float, cf
         sell_reasons.append(reason)
 
     val_df = pd.DataFrame(snowball_results, index=df.index)
-    for col in ["model1_mv", "model2_mv", "fair_mv", "buy_mv", "buy_price", "mos_ratio"]:
+    val_cols = [
+        "model1_mv", "model2_mv", "fair_mv", "buy_mv", "buy_price",
+        "mos_ratio", "terminal_pe", "industry_tier", "is_blacklisted", "blacklist_reason"
+    ]
+    for col in val_cols:
         if col in val_df.columns:
             df[col] = val_df[col]
 
     df["sell_reason"] = sell_reasons
     df["sell_flag"] = (~df["quality_ok"]) | (df["expected_return"] < benchmark_return) | pd.Series(sell_trigger_flags, index=df.index)
-    df["buy_flag"] = df["quality_ok"] & (df["expected_return"] >= cfg.required_return) & (~df["sell_flag"])
+    if cfg.enable_snowball_valuation:
+        df["buy_flag"] = df["quality_ok"] & (df["expected_return"] >= cfg.required_return) & (df["mos_ratio"] > 0) & (~df["sell_flag"])
+    else:
+        df["buy_flag"] = df["quality_ok"] & (df["expected_return"] >= cfg.required_return) & (~df["sell_flag"])
     return df
 
 

@@ -40,10 +40,20 @@ def test_quality_ok_passes_when_every_gate_clears():
     ({"dividend_yield": 0.0}, False),          # must be > min_dividend_yield, not >=
     ({"debt_to_equity": 500.0}, False),        # above max_debt_to_equity
     ({"earnings_growth": 0.01}, False),        # below min_earnings_growth
+    ({"earnings_growth": 0.25}, False),        # above max_earnings_growth (0.12)
+    ({"cfo_to_net_profit": 0.50}, False),      # below min_cfo_to_profit (0.80)
+    ({"debt_to_assets": 0.75}, False),         # above max_debt_to_assets (0.50)
+    ({"dividend_payout_ratio": 0.05}, False),  # below min_dividend_payout (0.20)
+    ({"dividend_payout_ratio": 0.90}, False),  # above max_dividend_payout (0.70)
+    ({"is_blacklisted": True}, False),         # hard blacklist flag
+    ({"industry_name": "银行"}, False),         # hard blacklist sector
 ])
 def test_quality_ok_fails_on_each_individual_gate(overrides, should_pass):
     cfg = ScreenerConfig()
-    row = _row(**overrides)
+    row = pd.Series({
+        "roe": 0.20, "dividend_yield": 0.02, "earnings_growth": 0.08, "debt_to_equity": 50.0,
+        **overrides,
+    })
     assert bool(quality_ok(row, cfg)) is should_pass
 
 

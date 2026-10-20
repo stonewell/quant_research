@@ -216,6 +216,24 @@ def test_buy_target_price_and_mos_ratio_calculation():
     assert res["mos_ratio"] == pytest.approx(0.04, rel=1e-3)
 
 
+def test_buy_price_market_cap_and_close_price_derivation():
+    """Verify buy target price fallback when total_shares is absent or NaN."""
+    # Case 1: total_shares is NaN, close_price and market_cap present
+    metrics_no_shares = _sample_metrics(market_cap=1200.0, total_shares=float("nan"))
+    metrics_no_shares = replace(metrics_no_shares, close_price=120.0)
+    cfg = ScreenerConfig(discount_rate=0.12, margin_of_safety=0.15)
+
+    res = evaluate_snowball_valuation(metrics_no_shares, cfg)
+    # buy_mv = 1062.5, close_price = 120.0, market_cap = 1200.0 -> buy_price = 120.0 * (1062.5 / 1200.0) = 106.25
+    assert res["buy_price"] == pytest.approx(106.25, rel=1e-3)
+
+    # Case 2: Neither total_shares nor close_price available -> buy_price is NaN
+    metrics_no_price = _sample_metrics(market_cap=1200.0, total_shares=0.0)
+    metrics_no_price = replace(metrics_no_price, close_price=float("nan"))
+    res_no_price = evaluate_snowball_valuation(metrics_no_price, cfg)
+    assert np.isnan(res_no_price["buy_price"])
+
+
 def test_sell_trigger_when_expected_return_below_benchmark_or_quality_fails():
     """Verify dual sell triggers: fundamental quality degradation or return edge decay."""
     cfg = ScreenerConfig(min_roe=0.15, min_cfo_to_profit=0.80, max_debt_to_assets=0.60)

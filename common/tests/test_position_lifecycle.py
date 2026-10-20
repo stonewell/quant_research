@@ -508,3 +508,58 @@ def test_market_closed_freezes_lifecycle():
     assert state_cd.cooldown_remaining == 2
     assert state_cd.state == PositionState.COOLDOWN
 
+
+def test_entry_resets_exit_streak():
+    """Fix 3: Asserts that when transitioning to HELD_GESTATION (both confirmation and fast-path),
+    exit_streak is strictly reset to 0 even if it held a non-zero residual count before.
+    """
+    cfg = PositionLifecycleConfig(
+        guard_latency_bars=2,
+        min_holding_bars=1,
+        volume_surge_multiplier=1.5,
+        breadth_thrust_threshold=0.60,
+        enable_entry_fast_path=True,
+    )
+
+    # 1. Standard 2-day entry confirmation path with residual exit_streak
+    state_conf = AssetLifecycleState(
+        symbol="601857.SH",
+        state=PositionState.FLAT,
+        exit_streak=2,  # Residual exit streak from prior liquidation
+        entry_streak=0,
+    )
+    # Day 1: First buy signal -> PENDING_ENTRY
+    d1 = step_position_lifecycle(state_conf, raw_target_weight=0.10, current_price=10.0, cfg=cfg)
+    assert d1.action == "HOLD_FILTERED"
+    assert state_conf.state == PositionState.PENDING_ENTRY
+    assert state_conf.entry_streak == 1
+
+    # Day 2: Second buy signal -> BUY into HELD_GESTATION
+    d2 = step_position_lifecycle(state_conf, raw_target_weight=0.10, current_price=10.2, cfg=cfg)
+    assert d2.action == "BUY"
+    assert state_conf.state == PositionState.HELD_GESTATION
+    assert state_conf.entry_streak == 2
+    assert state_conf.exit_streak == 0, "exit_streak must be reset to 0 on entry confirmation"
+
+    # 2. Fast-path volume breakout entry with residual exit_streak
+    state_fast = AssetLifecycleState(
+        symbol="601857.SH",
+        state=PositionState.FLAT,
+        exit_streak=3,  # Residual exit streak
+        entry_streak=0,
+    )
+    d_fast = step_position_lifecycle(
+        state_fast,
+        raw_target_weight=0.15,
+        current_price=10.5,
+        cfg=cfg,
+        current_volume=3000.0,
+        ma20_volume=1000.0,  # 3.0x > 2.5x super surge
+        market_breadth=0.50,
+    )
+    assert d_fast.action == "BUY"
+    assert d_fast.fast_path_triggered == "VOLUME_BREAKOUT"
+    assert state_fast.state == PositionState.HELD_GESTATION
+    assert state_fast.exit_streak == 0, "exit_streak must be reset to 0 on fast-path entry"
+
+

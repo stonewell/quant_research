@@ -65,7 +65,7 @@ def test_generate_weights_honors_params_overrides_not_just_config_defaults():
         relaxed_weights = strat.generate_weights(universe, {
             "universe": ["PG"], "benchmark_symbol": "SPY", "lookback_days": 100,
             "min_roe": 0.01, "required_return": 0.01, "max_debt_to_equity": 500.0,
-            "min_earnings_growth": 0.0,
+            "min_earnings_growth": 0.0, "enable_snowball_valuation": False,
         })
     daily = relaxed_weights.ffill().fillna(0.0)
     assert (daily["PG"] > 0).any(), "relaxed min_roe/required_return via params must actually be honored"
@@ -157,3 +157,61 @@ def test_explain_weights_mentions_the_constant_signal_limitation():
     explanation = strat.explain_weights()
     assert "CONSTANT" in explanation
     assert "docs/snowball_strategy.txt" in explanation
+
+
+def test_strategy_sparse_weights_contract():
+    """Verify strict sparse weights contract: only rebalance dates have values, others are NaN."""
+    universe = _linear_universe(drifts={"KO": 0.20, "SPY": 0.05, "BIL": 0.0})
+    cfg = ScreenerConfig(
+        universe=["KO"], benchmark_symbol="SPY", lookback_days=100,
+        required_return=0.10, rebalance_freq_days=63, cash_proxy="BIL"
+    )
+    strat = FundamentalMarginOfSafetyStrategy(cfg)
+
+    with patch("fundamental_screener.fscreen.fundamentals.fetch_fund_metadata", side_effect=_fake_metadata({"KO": GOOD_META})):
+        weights = strat.generate_weights(universe)
+
+    assert not weights.empty
+    master_index = universe["KO"].index
+    rebalance_idx = set(range(0, len(master_index), 63))
+
+    # Check that non-rebalance rows are 100% NaN
+    for i in range(len(master_index)):
+        if i not in rebalance_idx:
+            assert weights.iloc[i].isna().all(), f"Row {i} is a non-rebalance date and must be NaN"
+        else:
+            # On rebalance dates, weights must be populated (not NaN)
+            assert weights.iloc[i].notna().all(), f"Row {i} is a rebalance date and must be non-NaN"
+            # Explicit 0.0 for non-selected or benchmark
+            assert weights.iloc[i]["SPY"] == 0.0
+
+
+def test_strategy_weighting_mode_mos_proportionality():
+    """Verify weighting_mode='mos' sizes positions proportionally to Margin of Safety."""
+    universe = _linear_universe(drifts={"KO": 0.20, "PEP": 0.15, "SPY": 0.01, "BIL": 0.0})
+    cfg = ScreenerConfig(
+        universe=["KO", "PEP"], benchmark_symbol="SPY", lookback_days=100,
+        required_return=0.05, weighting_mode="mos", rebalance_freq_days=63, cash_proxy="BIL"
+    )
+    strat = FundamentalMarginOfSafetyStrategy(cfg)
+
+    table = {
+        "KO": {"roe": 0.35, "dividend_yield": 0.03, "dividend_payout_ratio": 0.50, "earnings_growth": 0.10, "debt_to_equity": 50.0, "market_cap": 800.0},
+        "PEP": {"roe": 0.25, "dividend_yield": 0.03, "dividend_payout_ratio": 0.40, "earnings_growth": 0.08, "debt_to_equity": 60.0, "market_cap": 800.0},
+    }
+    with patch("fundamental_screener.fscreen.fundamentals.fetch_fund_metadata", side_effect=_fake_metadata(table)):
+        weights = strat.generate_weights(universe)
+
+    # At rebalance date 126, both KO and PEP should be held, with KO having higher weight due to higher MoS
+    w_row = weights.iloc[126]
+    assert w_row["KO"] > 0
+    assert w_row["PEP"] > 0
+    assert w_row["KO"] > w_row["PEP"], "KO has higher growth/fair MV and must receive higher MoS weight than PEP"
+
+
+def test_strategy_reexport_and_alias():
+    """Verify top-level strategy re-export and FundamentalScreenerStrategy alias."""
+    from fundamental_screener.strategy import FundamentalMarginOfSafetyStrategy as FMS, FundamentalScreenerStrategy as FSS
+    assert FSS is FMS
+    assert issubclass(FSS, FundamentalMarginOfSafetyStrategy)
+
