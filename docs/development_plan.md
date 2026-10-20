@@ -21,6 +21,7 @@
 | [`docs/wheel_strategy_research.md`](file:///home/stone/Work/github/quant/docs/wheel_strategy_research.md) | 轮式期权复合量化策略 (Options Wheel Strategy) 状态机、VRP方差溢价捕获与缠论支撑门控架构蓝图 | Track W | 规划中 |
 | [`docs/six_defects_parity_audit.md`](file:///home/stone/Work/github/quant/docs/six_defects_parity_audit.md) | 基于 Vidovich & Zerjal (2024/2026) 理论的实盘与回测对齐取证审计报告 (六大缺陷排查) | Track P | 规划中 |
 | [`common/position_lifecycle.py`](file:///home/stone/Work/github/quant/common/position_lifecycle.py) | 统一持仓生命周期状态机 (UPLSM) 6 状态 FSM、非对称快通道（放量突破 0-delay 闪电建仓 / -8% 止损 0-delay 避险平仓）与两日门禁精简整合方案 | Track G | 已落地 |
+| [`common/allocation_backtester.py`](file:///home/stone/Work/github/quant/common/allocation_backtester.py) | 回测系统高并发、跨窗口指标记忆缓存与高拟真度执行引擎升级方案 (记账修复、多进程并行与微观结构拟真) | Track B | 规划中 |
 | [`docs/black_list.md`](file:///home/stone/Work/github/quant/docs/black_list.md) | 核心股票池剔除标的权威黑名单档案与失血归因 (SSOT) | 全局 / Live | 已落地 |
 
 ### 1.2 跨体系因果交汇与架构拓扑 (Cross-Track Architectural Synergy)
@@ -69,7 +70,7 @@ flowchart TD
 
 ---
 
-## 二、 原子任务全量拆解清单（共 66 个原子任务）
+## 二、 原子任务全量拆解清单（共 78 个原子任务）
 
 ### 2.1 《5分钟高频日内数据方案》原子任务表（`T0.1`–`T6.2`，共 19 个任务）
 
@@ -109,8 +110,8 @@ flowchart TD
 | **`C2.1`** | `[x]` | 研发旗舰新策略一：`ChanVolumeProfileHybridStrategy` | [`pipeline/research_strategy/rs/chan_vp_hybrid_strategy.py`](file:///home/stone/Work/github/quant/pipeline/research_strategy/rs/chan_vp_hybrid_strategy.py)<br>[`pipeline/research_strategy/rs/config.py`](file:///home/stone/Work/github/quant/pipeline/research_strategy/rs/config.py) | 1. 策略标识 `chan_vp_hybrid`，集成 HVN 中枢校验（`consolidation_density >= 0.45` 且 $POC \in [ZD, ZG]$）；<br>2. 三买微观 POC 接受确认（离开段快速穿过 LVN，回踩站稳 $ZG$ 与 $VAH$ 并在上方沉淀新 POC）；<br>3. 动态锚定上方未测试控制点（Naked POC）止盈，严格恪守稀疏权重 `NaN` vs `0.0` 契约。 | `test_chan_vp_hybrid.py` | **M** | `C1.2`, `C1.3` |
 | **`C2.2`** | `[x]` | 研发旗舰新策略二：`WyckoffChanSpringStrategy` | [`pipeline/research_strategy/rs/wyckoff_chan_strategy.py`](file:///home/stone/Work/github/quant/pipeline/research_strategy/rs/wyckoff_chan_strategy.py)<br>[`pipeline/research_strategy/rs/config.py`](file:///home/stone/Work/github/quant/pipeline/research_strategy/rs/config.py) | 1. 策略标识 `wyckoff_chan_spring`，解决传统缠论一买胜率低、回撤大痛点；<br>2. 前一日最低价刺破 $ZD$（$0.5\%\sim 4.0\%$），当日放量收回 $ZD$ 之上且 $\kappa \ge 1.5$；<br>3. 止损精准设于弹簧最低点下方 $0.5\%$，目标位看至 $ZG$ 与 $1.2\times$ 箱体高度。 | `test_wyckoff_chan_strategy.py` | **M** | `C1.2` |
 | **`C2.3`** | `[x]` | 既有单策略向后兼容平滑升级 | [`pipeline/research_strategy/rs/chan_advanced_strategies.py`](file:///home/stone/Work/github/quant/pipeline/research_strategy/rs/chan_advanced_strategies.py)<br>[`pipeline/research_strategy/rs/regime_factor_compound.py`](file:///home/stone/Work/github/quant/pipeline/research_strategy/rs/regime_factor_compound.py) | 1. `chan_trend_third_buy` 增加 `chan_b3_enable_vp_filter=False` 前置中枢 VP 校验；<br>2. `chan_mean_reversion_divergence` 扩展入场模式 `chan_mrd_entry_mode="classic"`；<br>3. `regime_factor_compound` 增加 `regime_enable_fractal_curvature=False` 扩展宏观状态判别（M6 约束）。 | `test_chan_advanced_strategies.py` | **S** | `C1.2` |
-| **`C3.1`** | `[ ]` | `BaseBlendAllocationStrategy` 宏观状态机、质量门禁与冲力共振升级 | [`pipeline/research/blend/blend_base.py`](file:///home/stone/Work/github/quant/pipeline/research/blend/blend_base.py)<br>`L387-L408`<br>`L799-L810`<br>`L853-L882` | 1. **锚点 1（状态机预算）**：全市场中位数分形维数 $\bar{D}_t < 1.45$ 提升动量预算至 $0.80$，$\bar{D}_t > 1.55$ 提升反转预算至 $0.75$；<br>2. **锚点 2（质量门禁）**：`cyq_winner_ratio < 0.20` 且无弹簧豁免者一票否决置 `0.0`，过滤无量假中枢；<br>3. **锚点 3（冲力共振）**：突破 60d VAH 且筹码单峰密集（$\ge 0.85$）赋予 1.6x 顶格共振，放量滞涨（EffortResult $<0.35$）0.6x 折减。 | `test_blend_intraday_5m.py` | **L** | `C1.2`, `C1.3` |
-| **`C3.2`** | `[ ]` | `BaseBlendAllocationStrategy` 入场加速、结构化止损与正交化 | [`pipeline/research/blend/blend_base.py`](file:///home/stone/Work/github/quant/pipeline/research/blend/blend_base.py)<br>`L997-L1027`<br>`L648-L683`<br>[`pipeline/research/blend/`](file:///home/stone/Work/github/quant/pipeline/research/blend/) | 1. **锚点 4（入场加速/否决）**：弹簧 $\ge 1.25$ 且 $\kappa \ge 1.5$ 在 Day 1 豁免 `min_entry_bars` 立即加速建仓，极端顶背驰（$<-1.2$）立即否决；<br>2. **锚点 5（结构化止损/止盈）**：吊灯止损升级为 $\max(\text{Entry}\times 0.92, \text{Peak}-4.5\times\text{ATR}, \min(ZG, VAL)\times 0.985)$，触及上方 NPOC 且动能衰竭主动止盈置 `0.0`；<br>3. **锚点 6（正交化扩展）**：五大 Blend 子类全量接入，两只新策略纳入 Löwdin 对称正交化矩阵。 | `test_blend_intraday_5m.py` | **L** | `C3.1`, `C2.1`, `C2.2` |
+| **`C3.1`** | `[x]` | `BaseBlendAllocationStrategy` 宏观状态机、质量门禁与冲力共振升级 | [`pipeline/research/blend/blend_base.py`](file:///home/stone/Work/github/quant/pipeline/research/blend/blend_base.py)<br>`L387-L408`<br>`L799-L810`<br>`L853-L882` | 1. **锚点 1（状态机预算）**：全市场中位数分形维数 $\bar{D}_t < 1.45$ 提升动量预算至 $0.80$，$\bar{D}_t > 1.55$ 提升反转预算至 $0.75$；<br>2. **锚点 2（质量门禁）**：`cyq_winner_ratio < 0.20` 且无弹簧豁免者一票否决置 `0.0`，过滤无量假中枢；<br>3. **锚点 3（冲力共振）**：突破 60d VAH 且筹码单峰密集（$\ge 0.85$）赋予 1.6x 顶格共振，放量滞涨（EffortResult $<0.35$）0.6x 折减。 | `test_blend_intraday_5m.py`<br>`test_blend_track_c.py` | **L** | `C1.2`, `C1.3` |
+| **`C3.2`** | `[x]` | `BaseBlendAllocationStrategy` 入场加速、结构化止损与正交化 | [`pipeline/research/blend/blend_base.py`](file:///home/stone/Work/github/quant/pipeline/research/blend/blend_base.py)<br>`L997-L1027`<br>`L648-L683`<br>[`pipeline/research/blend/`](file:///home/stone/Work/github/quant/pipeline/research/blend/) | 1. **锚点 4（入场加速/否决）**：弹簧 $\ge 1.25$ 且 $\kappa \ge 1.5$ 在 Day 1 豁免 `min_entry_bars` 立即加速建仓，极端顶背驰（$<-1.2$）立即否决；<br>2. **锚点 5（结构化止损/止盈）**：吊灯止损升级为 $\max(\text{Entry}\times 0.92, \text{Peak}-4.5\times\text{ATR}, \min(ZG, VAL)\times 0.985)$，触及上方 NPOC 且动能衰竭主动止盈置 `0.0`；<br>3. **锚点 6（正交化扩展）**：五大 Blend 子类全量接入，两只新策略纳入 Löwdin 对称正交化矩阵。 | `test_blend_intraday_5m.py`<br>`test_blend_track_c.py` | **L** | `C3.1`, `C2.1`, `C2.2` |
 | **`C4.1`** | `[ ]` | 100% 离线单元测试与既有策略回归套件 | `pipeline/research_strategy/tests/`<br>`test_structural_factors.py`<br>`test_chan_vp_hybrid.py`<br>`test_wyckoff_chan_strategy.py` | 1. 验证 M1–M5 全部算子在单序列与 DataFrame 上的数学收敛性与无 `NaN` 扩散；<br>2. 验证两只新策略独立运行 `generate_weights` 的稀疏权重契约；<br>3. 验证 55+ 既有策略与 allocation templates 回归测试 100% 通过。 | `pytest` 全绿 | **M** | `C2.1`..`C3.2` |
 
 ---
@@ -201,6 +202,26 @@ flowchart TD
 | **`G1.4`** | `[x]` | 研发策略回测引擎对齐 | [`pipeline/research/blend/blend_base.py`](file:///home/stone/Work/github/quant/pipeline/research/blend/blend_base.py)<br>`apply_asset_inertia`<br>`_step_asset_inertia` | 在 `pipeline/research/blend/blend_base.py` 中接入放量突破快通道、正常离场 1 日冷却、止损 5 日冷却与行业老持仓解锁，消除回测与实盘分道扬镳。 | `test_blend_intraday_5m.py` | **M** | `G1.1`, `G1.3` |
 | **`G1.5`** | `[x]` | 多策略净额撮合与 Web 控制台统一参数展现 | [`common/order_netting.py`](file:///home/stone/Work/github/quant/common/order_netting.py)<br>`web/livetrading/models.py`<br>`web/livetrading/execution_service.py`<br>`web/livetrading/static/js/app.js` | 在 `common/order_netting.py` 中引入止损穿透，在 `web/livetrading/` 中接入主控参数与 UPLSM 动因徽章呈现。 | `test_order_netting.py`<br>`test_web_livetrading.py` | **M** | `G1.1`..`G1.4` |
 
+---
+
+### 2.10 《回测系统高并发、指标缓存与高拟真度执行升级方案》（Track B，共 12 个任务，Wave 1–5 高性能与真实度演进）
+
+| 任务编号 | 状态 | 任务名称 | 涉及核心文件与符号 | 核心交付内容与验收标准 (含记账修复、并发引擎与拟真度扩展) | 配套离线单测 | 规模 | 前置依赖 |
+| :--- | :---: | :--- | :--- | :--- | :--- | :---: | :--- |
+| **`B1.1`** | `[ ]` | 修复 `actual_w` 强制折回目标权重的记账失真 Bug | [`common/allocation_backtester.py`](file:///home/stone/Work/github/quant/common/allocation_backtester.py)<br>`run_allocation_backtest`<br>`actual_w`<br>`held_shares` | 1. 废除第 506–508 行 `new_w[i] = tgt_w_arr[t, i]` 的强制覆盖；<br>2. 改为以真实持仓股数与当日收盘价计算真实权重 $\text{actual\_w}_i = (\text{held\_shares}_i \times P_i) / \text{Equity}$；<br>3. 彻底消除 100 股整手截断现金闲置与资金耗尽部分成交时引发的“幽灵杠杆与收益虚增”；<br>4. 保证持仓股数流水与逐日收益计提 100% 账实相符。 | `test_allocation_backtester.py`<br>`test_ledger_parity` | **M** | 无 |
+| **`B1.2`** | `[ ]` | 研发轻量无开销评估模式与 ERS 抽样加速 | [`common/allocation_backtester.py`](file:///home/stone/Work/github/quant/common/allocation_backtester.py)<br>[`common/allocation_search.py`](file:///home/stone/Work/github/quant/common/allocation_search.py)<br>`minimal_metrics` | 1. `run_allocation_backtest` 新增 `minimal_metrics: bool = False` 参数；<br>2. 开启时跳过创建 `rebalance_report_df` 与 `actual_weights_df` 庞大 DataFrame，直接输出纯标量指标；<br>3. `common/allocation_search.py` 的 ERS 200 次随机抽样全面启用轻量模式；<br>4. 抽样阶段内存分配降低 90%，耗时缩减 40% 以上。 | `test_allocation_search.py`<br>`test_minimal_metrics_equivalence` | **S** | `B1.1` |
+| **`B1.3`** | `[ ]` | 补齐微观停牌 (Volume==0) 硬拦截与 ST 股 5% 涨跌停判定 | [`common/allocation_backtester.py`](file:///home/stone/Work/github/quant/common/allocation_backtester.py)<br>`_get_china_price_limit`<br>`run_allocation_backtest` | 1. 增加停牌判定：若 $Volume \le 0$ 或缺失，买卖双向拒绝成交；<br>2. 扩展 `_get_china_price_limit`：识别标的代码或名称中的 `ST`/`*ST` 属性，将其涨跌停板阈值自适应设为 5%；<br>3. 记录停牌拦截日志，彻底消除停牌期“幽灵成交”偏差。 | `test_allocation_backtester.py`<br>`test_suspension_guard` | **S** | 无 |
+| **`B2.1`** | `[ ]` | 研发因果特征算子与子策略信号跨窗口记忆缓存 | [`common/allocation_templates.py`](file:///home/stone/Work/github/quant/common/allocation_templates.py)<br>[`backtester/run_backtest.py`](file:///home/stone/Work/github/quant/backtester/run_backtest.py)<br>`SignalMemoizationCache` | 1. 构建特征算子记忆缓存容器，对 SMA, ATR, Garman-Klass, POC 等因果算子支持全周期单次计算、窗口按需切片；<br>2. 支持 `--fast-walkforward` 标志：对满足严格前向因果的策略在全历史区间单次生成 `target_weights` 并切片验证；<br>3. 消除 40 个 Fold 之间 85% 历史数据的无谓重复计算。 | `test_run_backtest.py`<br>`test_signal_memoization` | **M** | `B1.1` |
+| **`B2.2`** | `[ ]` | `run_walkforward` 窗口级多进程并行调度引擎 | [`backtester/run_backtest.py`](file:///home/stone/Work/github/quant/backtester/run_backtest.py)<br>`run_walkforward`<br>`ProcessPoolExecutor` | 1. CLI 增加 `--n-jobs / -j` 参数（默认并发数根据 CPU 核数自适应）；<br>2. 将 40 个独立的 rolling fold 任务分发至 `concurrent.futures.ProcessPoolExecutor`；<br>3. 保持输出 `folds_df` 与 `walkforward_rebalances.csv` 与单线程模式比特级一致；<br>4. 8 核环境下实现 6x 以上线性加速。 | `test_run_backtest.py`<br>`test_walkforward_parallel` | **M** | `B1.2` |
+| **`B2.3`** | `[ ]` | 统一多策略批量回测入口替代 Shell 串行循环 | `scripts/run_batch_backtest.py`<br>[`pipeline/scripts/backtest_blend_strategies.sh`](file:///home/stone/Work/github/quant/pipeline/scripts/backtest_blend_strategies.sh) | 1. 研发 `scripts/run_batch_backtest.py`：单次拉起进程，单次加载 50 标的 Universe 常驻内存；<br>2. 内部多进程并发批处理 55+ 策略的 Walkforward 回测；<br>3. 取代 Shell `while` 循环中的 55 次 Python 解释器冷启动和 55 次 DuckDB 重复查询开销；<br>4. 聚合输出全局策略夏普比率、卡玛比率与最大回撤横向排名矩阵。 | `test_run_batch_backtest.py` | **M** | `B2.2` |
+| **`B2.4`** | `[ ]` | `common/allocation_search.py` 网格寻优与 ERS 并行化 | [`common/allocation_search.py`](file:///home/stone/Work/github/quant/common/allocation_search.py)<br>`grid_search_template`<br>`run_ers_validation` | 1. 将网格搜索中的候选参数评估分发至进程池；<br>2. 将 ERS 200 次随机权重抽样改写为分块多进程并发评估；<br>3. 保持随机数种子确定性与可复现性（`SeedSequence` 独立派生）；<br>4. 显著提升 `--optimize` 执行效率。 | `test_allocation_search.py` | **M** | `B1.2` |
+| **`B3.1`** | `[ ]` | 多元成交时点与次日开盘价/均价模拟架构 | [`common/allocation_backtester.py`](file:///home/stone/Work/github/quant/common/allocation_backtester.py)<br>[`backtester/run_backtest.py`](file:///home/stone/Work/github/quant/backtester/run_backtest.py)<br>`--execution-price` | 1. 新增 `--execution-price {close, next_open, next_vwap, intraday_twap}` 参数；<br>2. 实现 `next_open` 模式：T 日收盘发信号，T+1 日以开盘价撮合成交（开盘一字涨跌停则顺延）；<br>3. 评估策略在次日隔夜跳空与开盘滑点冲击下的真实衰减，与实盘交易无缝对齐。 | `test_allocation_backtester.py`<br>`test_execution_price_modes` | **M** | `B1.1` |
+| **`B3.2`** | `[ ]` | 基于 ADV20 换手的非线性平方根冲击成本与成交量封顶 | [`common/allocation_backtester.py`](file:///home/stone/Work/github/quant/common/allocation_backtester.py)<br>`run_allocation_backtest`<br>`adv20` | 1. 引入 Almgren-Chriss 平方根定律冲击模型：$\text{Slippage} = \sigma \cdot \gamma \cdot \sqrt{\text{Shares} / \text{ADV}_{20}}$；<br>2. 引入流动性硬约束：单日成交股数严禁超过当日成交量的 10%（`max_volume_participation=0.10`），超额部分自动递延；<br>3. 准确反映大资金运作时的流动性容量瓶颈。 | `test_allocation_backtester.py`<br>`test_market_impact_model` | **M** | `B1.1` |
+| **`B3.3`** | `[ ]` | 闲置现金自动归集国债逆回购利息计提 | [`common/allocation_backtester.py`](file:///home/stone/Work/github/quant/common/allocation_backtester.py)<br>`--cash-sweep-rate` | 1. 新增 `--cash-sweep-rate`（默认 0.0，可选 0.02 即年化 2%）；<br>2. 每日闭市时对未分配股票的纯闲置现金按日化计息并累加至总权益；<br>3. 真实模拟机构资金在熊市防御期及现金管理期的收益增益。 | `test_allocation_backtester.py`<br>`test_cash_sweep_interest` | **S** | `B1.1` |
+| **`B3.4`** | `[ ]` | 融券做空机制高拟真度扩展 | [`common/allocation_backtester.py`](file:///home/stone/Work/github/quant/common/allocation_backtester.py)<br>`borrow_fee_pct` | 1. 支持做空标的计提年化借券成本（`borrow_fee_pct`，默认 4.5%）；<br>2. 引入维持保证金比例监控与空头爆仓强平线检测；<br>3. 补齐当前空头无成本持仓的虚高收益偏差。 | `test_allocation_backtester.py`<br>`test_short_borrow_fees` | **S** | `B1.1` |
+| **`B4.1`** | `[ ]` | Numba JIT 逐日回测状态机内核试验与压测报告 | `common/allocation_backtester_fast.py`<br>基准压测脚本 | 1. 试验将 `run_allocation_backtest` 核心状态机抽取为纯 Numpy `@numba.njit` 函数；<br>2. 对比原生 Python 循环与 JIT 内核的加速比与精度误差；<br>3. 输出基准性能评估报告，供后续极端大规模寻优选用。 | `test_allocation_backtester_fast.py` | **M** | `B1.1` |
+| **`B4.2`** | `[ ]` | 100% 离线测试套件与全策略回归验证 | `common/tests/test_allocation_backtester_fidelity.py`<br>`backtester/tests/test_walkforward_parallel.py` | 1. 覆盖上述 B1.1–B3.4 全部特性的离线单测（0 网络请求，纯合成/Mock 数据）；<br>2. 验证多进程模式与单进程模式结果比特级一致；<br>3. 验证 55+ 既有策略与 9 大静态模板回归 100% 通过。 | `pytest` 全绿 | **M** | `B1.1`..`B3.4` |
+
 
 ---
 
@@ -224,6 +245,9 @@ flowchart TD
         S12["S1.2: 自适应 ER 与多空非对称乘数\n(adaptive_supertrend, kaufman_er)"]
         F11["F1.1: DuckDB 基本面与行业元数据表\n(stock_fundamentals_annual)"]
         V11["V1.1: AllocationTemplate 版本字段与静态模板标注\n(common/allocation_templates.py)"]
+        B11["B1.1: 修复 actual_w 记账背离\n(common/allocation_backtester.py)"]
+        B12["B1.2: 轻量无开销 ERS 模式\n(common/allocation_backtester.py)"]
+        B13["B1.3: 停牌与 ST 限价板拦截\n(common/allocation_backtester.py)"]
     end
 
     subgraph WAVE2["Wave 2 (Tier P1/P2: 旗舰新策略研发、切面解耦、语义版本与外部数据源接入)"]
@@ -240,6 +264,9 @@ flowchart TD
         T13["T1.3: BaoStockDataProvider T-1 深度底座"]
         T14["T1.4: EastMoneyDataProvider 盘中直连"]
         T15["T1.5: scripts/record_intraday_5m.py 守护"]
+        B21["B2.1: 跨窗口特征记忆缓存\n(SignalMemoizationCache)"]
+        B22["B2.2: Walkforward 多进程并行\n(backtester/run_backtest.py)"]
+        B24["B2.4: ERS 随机检验并行化\n(common/allocation_search.py)"]
     end
 
     subgraph WAVE3["Wave 3 (Tier P2/P3: 因果特征聚合与 Blend 底座/门禁规则重构)"]
@@ -249,6 +276,7 @@ flowchart TD
         C31["C3.1: Blend 状态机、CYQ 门禁与冲力共振\n(blend_base.py 锚点 1, 2, 3)"]
         S31["S3.1: Blend 宏观风险预算与资产动量防线\n(blend_base.py 锚点 7 状态机 + 锚点 8 资产防线)"]
         F23["F2.3: 准入五大门禁与卖出双重触发\n(quality_ok, evaluate_sell_trigger)"]
+        B23["B2.3: 统一多策略批量回测器\n(scripts/run_batch_backtest.py)"]
     end
 
     subgraph WAVE4["Wave 4 (Tier P3: Blend 入场/出场全链路闭环、实盘护栏、衍生品策略与详细动因溯源)"]
@@ -269,6 +297,7 @@ flowchart TD
         W13["W1.3: 策略平台注册与元数据提取 (strategy.py)"]
         W14["W1.4: 轮式期权 100% 离线单测套件 (test_synthetic_wheel_strategy.py)"]
         W15["W1.5: 轮式配置预设与基准回测 (strategies_config.json)"]
+        B31["B3.1-B3.4: 微观拟真度与执行时点扩展\n(execution-price, impact, cash-sweep)"]
     end
 
     subgraph WAVE5["Wave 5 (Tier P4: 100% 离线单测套件、对齐测试床与 Walkforward 终审门禁)"]
@@ -284,6 +313,7 @@ flowchart TD
         G11["G1.1–G1.5: UPLSM 统一持仓生命周期状态机\n(6状态FSM/非对称快通道/回测实盘对齐/Web动因)"]
         T61["T6.1: Phase 6 Walkforward 逐项消融实验"]
         T62["T6.2: DSR 校正 + 单次 ERS + LOO 脆弱性终审"]
+        B41["B4.1-B4.2: Numba 内核试验与 100% 离线回归\n(test_allocation_backtester_fidelity.py)"]
     end
 
     WAVE0 --> WAVE1
@@ -298,10 +328,10 @@ flowchart TD
 | 优先级梯队 (Tier) | 执行波次与并行轨道 | 包含任务 ID 清单 | 优先级排序依据 (Why This Priority) | 阶段准出标准 (Exit Criteria) |
 | :--- | :--- | :--- | :--- | :--- |
 | **Tier P0**<br>(基础设施基石) | **Wave 0**<br>(零依赖独立快速修复) | `T0.1`, `T0.2`, `T0.3`<br>`C1.1` | **无依赖致命缺陷先行**：`T0.1`–`T0.3` 均为代码库既有致命 Bug（如 `1m` 误映射月末、VWAP 前视泄漏、实盘健康报告未读取），修复不仅零依赖，且能立即解除后续所有模块的底层隐患；`C1.1` 将 POC 下沉为共享库解除分层循环依赖。 | 修复通过代码审查与离线单测，`import common.structural_factors` 无警告，`Alpha101` 无前视。 |
-| **Tier P1**<br>(数据与新策略) | **Wave 1 & 2**<br>(Track T 数据底座 + Track C/S 旗舰新策略与切面 + Track F 估值模型 + Track V 语义版本管理) | `C1.2`, `C1.3`, `T1.1`, `T1.2`<br>`S1.1`, `S1.2`<br>`F1.1`, `F1.2`<br>`C2.1`, `C2.2`, `C2.3`<br>`S2.1`, `S2.2`<br>`F2.1`, `F2.2`<br>`T1.3`, `T1.4`, `T1.5`<br>`V1.1`, `V1.2`, `V1.3` | **多轨并行解耦加速**：在有了 `T1.2` 钉扎布朗桥与 `C1.2`/`C1.3`、`S1.1`/`S1.2`、`F1.1`/`F1.2` 基础算子与数据底座后，旗舰新策略 `C2.1`/`C2.2`、`S2.1`（SuperTrend 择时）与 `F2.1`/`F2.2`（雪球双估值解析解与行业黑名单）可完全独立研发，并推进 `S2.2` 切面解耦，与外部网络行情源接入（`T1.3`–`T1.5`）互不阻塞；同时推进策略语义化版本管理基石（`V1.1`–`V1.3`），实现 `AllocationTemplate` 与 `BaseBlendAllocationStrategy` 基础引擎版本（`BASE_VERSION`）与具体策略版本（`version`）双轴解耦及子策略层级内省。 | 钉扎布朗桥按日聚合与日线比特级一致；新策略跑通 `generate_weights` 并严格遵守稀疏权重契约（无 `NaN` 扩散）；SuperTrend 算子通过单向棘轮单调性断言；切面解耦模块可自由交叉配对；雪球双估值解析解数值精度达到 $10^{-9}$ 且奇点防护无除零崩溃；模板与子类具备显式版本字段且 dataclass 继承不被静默覆盖，策略 dump 成功持久化版本元数据。 |
-| **Tier P2**<br>(特征与宏观底座) | **Wave 3**<br>(高频特征聚合 + Blend 宏观/质量/风险预算增强 + 质地门禁重构) | `T2.1`, `T2.2`, `T2.3`<br>`C3.1`, `S3.1`<br>`F2.3` | **自下而上驱动底座**：先由因果截断引擎输出标准特征矩阵，再将特征与趋势轨线注入 `BaseBlendAllocationStrategy` 的状态机（锚点 1）、质量门禁（锚点 2）、冲力共振（锚点 3）、宏观风险预算折半（锚点 7）与资产动量防线（锚点 8）；同时在 Track F 落地准入 5 大财务底线（`F2.3`）与逻辑破损/性价比衰减双重卖出触发。 | `enrich_universe_with_intraday_features` 满足 $\kappa_t$ 复权对齐；Blend 策略在开启锚点 1/2/3/7/8 后，能准确在指数空头态折半全局预算，对深套、空心及破位标的精准置 `0.0` 否决；`quality_ok` 对财务造假、高杠杆及黑名单标的一票否决。 |
-| **Tier P3**<br>(全链路、衍生品与实盘护栏) | **Wave 4**<br>(微观共振闭环 + 实盘 Stage 1/2 护栏 + 筛选报告与策略适配 + 轮式期权复合策略 + 实战动因审计) | `T3.1`, `T3.2`, `T3.3`<br>`C3.2`, `S4.1`<br>`F3.1`<br>`T4.1`, `T4.2`, `T4.3`<br>`L1.1`–`L1.5`<br>`V1.4`, `V1.5`<br>`W1.1`–`W1.5` | **高阶微观整合与实盘风控防护**：在入场端实现弹簧与 5m 区间套双通道加速，在出场端实现结构化吊灯止损；实盘 Stage 1/2 筑牢跌停封死双向冻结（R14）、双模式限价单引导（R11）、SuperTrend 破位预警以及实盘防抖执行风控（`L1.1`–`L1.5` 再入场冷却期、连续确认、宏观冲力突破豁免与 -8% 硬止损）；在 Track F 升级 CLI 筛选报告与 `FundamentalScreenerStrategy` 稀疏权重生成适配（`F3.1`）；在 Track V 落地实盘执行引擎多维详细动因生成器与工单字段扩展（`V1.4`），以及 Web Station 调仓工单表格动因链接与详细审计弹窗（`V1.5`）；在 Track W 研发合成轮式期权复合策略（`W1.1`–`W1.5`），系统性收割 VRP 方差溢价与正向 Theta 衰减，引入缠论中枢下轨支撑锚定与防深套硬止损熔断。 | 威科夫弹簧实现 Day 1 加速建仓；跌停卖单未成交资金在 Phase 2 与 Phase 4 彻底冻结；实盘 Stage 1 精准识别 SuperTrend 破位并写入健康报告；基本面选股策略输出合规稀疏权重；实盘执行全链路支持防抖冷却、连续信号确认与硬止损穿透防护；工单具备完整详细动因（对账、子策略拆解、冲力/波动率阻尼、配额挤出、防抖门禁等）并在 Web 交互弹窗清晰呈现；轮式期权策略跑通 CSP/CC/Cash Shield 三态 FSM 状态机流转，BSM Greeks 逆解行权价误差 $<10^{-4}$，严格遵循稀疏权重契约（调仓日非空、显式 0.0）。 |
-| **Tier P4**<br>(单测、对齐测试床与终审验证) | **Wave 5**<br>(全套离线单测 + 对齐测试床 + 严苛消融终审) | `T5.1`, `T5.2`<br>`C4.1`, `S4.2`<br>`F3.2`<br>`V1.6`<br>`P1.1`–`P1.3`<br>`G1.1`–`G1.5`<br>`T6.1`, `T6.2` | **质量终审与防过拟合铁律**：全部代码合入后，默认配置严格保持 `False`。必须通过全套离线测试（含 SuperTrend 单向棘轮、稀疏权重及切面测试、雪球双估值全套单测 `F3.2`、策略版本双轴解耦与工单 Schema 兼容性单测 `V1.6`、轮式期权离线单测 `W1.4`、UPLSM 统一生命周期状态机与多策略净额穿透离线单测 `G1.2/G1.5`）；在 Track P 构建基于 Vidovich & Zerjal (2024/2026) 理论的双轨 Parity Harness 回放测试床与 AST 语法树穿透静态分析器（`P1.1`–`P1.3`），全面排查并阻断实盘与回测六大系统性分歧缺陷；逐项运行 Walkforward 消融实验、DSR 显著性惩罚与单次 ERS 检验，方可批准生产翻转。 | 100% 离线单测通过（0 网络请求）；消融实验证明宏观预算与资产防线显著降低组合最大回撤；DSR 显著；通过 `walkforward-audit` LOO 脆弱性审计并给出正式评级；基本面筛选策略通过离线回测验证；版本双轴解耦与实盘工单 Schema 兼容性单测全绿；UPLSM 6状态FSM与非对称快通道测试全绿且回测实盘对齐；Parity Harness 双轨回放测试床对齐实盘快照与回测订单（$\|\Delta w\| < 10^{-4}, \Delta \text{Shares} \equiv 0$），AST 静态分析器确认核心配置参数 0 僵尸引用（0 Dead Config），实盘自动拉起脚本参数显式传递。 |
+| **Tier P1**<br>(数据与新策略) | **Wave 1 & 2**<br>(Track T 数据底座 + Track C/S 旗舰新策略与切面 + Track F 估值模型 + Track V 语义版本管理 + Track B 记账修复与并行抽样) | `C1.2`, `C1.3`, `T1.1`, `T1.2`<br>`S1.1`, `S1.2`<br>`F1.1`, `F1.2`<br>`C2.1`, `C2.2`, `C2.3`<br>`S2.1`, `S2.2`<br>`F2.1`, `F2.2`<br>`T1.3`, `T1.4`, `T1.5`<br>`V1.1`, `V1.2`, `V1.3`<br>`B1.1`–`B1.3`, `B2.1`, `B2.2`, `B2.4` | **多轨并行解耦加速**：在有了 `T1.2` 钉扎布朗桥与 `C1.2`/`C1.3`、`S1.1`/`S1.2`、`F1.1`/`F1.2` 基础算子与数据底座后，旗舰新策略 `C2.1`/`C2.2`、`S2.1`（SuperTrend 择时）与 `F2.1`/`F2.2`（雪球双估值解析解与行业黑名单）可完全独立研发，并推进 `S2.2` 切面解耦，与外部网络行情源接入（`T1.3`–`T1.5`）互不阻塞；同时推进策略语义化版本管理基石（`V1.1`–`V1.3`），实现 `AllocationTemplate` 与 `BaseBlendAllocationStrategy` 基础引擎版本（`BASE_VERSION`）与具体策略版本（`version`）双轴解耦及子策略层级内省；同步推进 Track B `actual_w` 真实记账修复（`B1.1`）、轻量无开销评估（`B1.2`）与 Walkforward 多进程并行引擎（`B2.2`），消除账实背离并实现 6x 以上计算加速。 | 钉扎布朗桥按日聚合与日线比特级一致；新策略跑通 `generate_weights` 并严格遵守稀疏权重契约（无 `NaN` 扩散）；SuperTrend 算子通过单向棘轮单调性断言；切面解耦模块可自由交叉配对；雪球双估值解析解数值精度达到 $10^{-9}$ 且奇点防护无除零崩溃；模板与子类具备显式版本字段且 dataclass 继承不被静默覆盖，策略 dump 成功持久化版本元数据；回测持仓真实记账无幽灵杠杆，多进程与单进程比特级一致。 |
+| **Tier P2**<br>(特征与宏观底座) | **Wave 3**<br>(高频特征聚合 + Blend 宏观/质量/风险预算增强 + 质地门禁重构 + 统一批量回测) | `T2.1`, `T2.2`, `T2.3`<br>`C3.1`, `S3.1`<br>`F2.3`<br>`B2.3` | **自下而上驱动底座**：先由因果截断引擎输出标准特征矩阵，再将特征与趋势轨线注入 `BaseBlendAllocationStrategy` 的状态机（锚点 1）、质量门禁（锚点 2）、冲力共振（锚点 3）、宏观风险预算折半（锚点 7）与资产动量防线（锚点 8）；同时在 Track F 落地准入 5 大财务底线（`F2.3`）与逻辑破损/性价比衰减双重卖出触发；在 Track B 研发统一多策略批量回测入口（`B2.3`），终结 Shell 串行冷启动开销。 | `enrich_universe_with_intraday_features` 满足 $\kappa_t$ 复权对齐；Blend 策略在开启锚点 1/2/3/7/8 后，能准确在指数空头态折半全局预算，对深套、空心及破位标的精准置 `0.0` 否决；`quality_ok` 对财务造假、高杠杆及黑名单标的一票否决；批量回测器一次常驻内存秒级评估 55+ 策略矩阵。 |
+| **Tier P3**<br>(全链路、衍生品与实盘护栏) | **Wave 4**<br>(微观共振闭环 + 实盘 Stage 1/2 护栏 + 筛选报告与策略适配 + 轮式期权复合策略 + 实战动因审计 + 微观执行拟真) | `T3.1`, `T3.2`, `T3.3`<br>`C3.2`, `S4.1`<br>`F3.1`<br>`T4.1`, `T4.2`, `T4.3`<br>`L1.1`–`L1.5`<br>`V1.4`, `V1.5`<br>`W1.1`–`W1.5`<br>`B3.1`–`B3.4` | **高阶微观整合与实盘风控防护**：在入场端实现弹簧与 5m 区间套双通道加速，在出场端实现结构化吊灯止损；实盘 Stage 1/2 筑牢跌停封死双向冻结（R14）、双模式限价单引导（R11）、SuperTrend 破位预警以及实盘防抖执行风控（`L1.1`–`L1.5` 再入场冷却期、连续确认、宏观冲力突破豁免与 -8% 硬止损）；在 Track F 升级 CLI 筛选报告与 `FundamentalScreenerStrategy` 稀疏权重生成适配（`F3.1`）；在 Track V 落地实盘执行引擎多维详细动因生成器与工单字段扩展（`V1.4`），以及 Web Station 调仓工单表格动因链接与详细审计弹窗（`V1.5`）；在 Track W 研发合成轮式期权复合策略（`W1.1`–`W1.5`），系统性收割 VRP 方差溢价与正向 Theta 衰减，引入缠论中枢下轨支撑锚定与防深套硬止损熔断；在 Track B 扩增次日开盘价撮合、平方根冲击成本、闲置现金逆回购利息与做空借券费（`B3.1`–`B3.4`），全面对齐真实交易微观摩擦。 | 威科夫弹簧实现 Day 1 加速建仓；跌停卖单未成交资金在 Phase 2 与 Phase 4 彻底冻结；实盘 Stage 1 精准识别 SuperTrend 破位并写入健康报告；基本面选股策略输出合规稀疏权重；实盘执行全链路支持防抖冷却、连续信号确认与硬止损穿透防护；工单具备完整详细动因（对账、子策略拆解、冲力/波动率阻尼、配额挤出、防抖门禁等）并在 Web 交互弹窗清晰呈现；轮式期权策略跑通 CSP/CC/Cash Shield 三态 FSM 状态机流转，BSM Greeks 逆解行权价误差 $<10^{-4}$，严格遵循稀疏权重契约（调仓日非空、显式 0.0）；次日开盘价与冲击模型准确反映大资金容量边界。 |
+| **Tier P4**<br>(单测、对齐测试床与终审验证) | **Wave 5**<br>(全套离线单测 + 对齐测试床 + 严苛消融终审 + Numba 压测) | `T5.1`, `T5.2`<br>`C4.1`, `S4.2`<br>`F3.2`<br>`V1.6`<br>`P1.1`–`P1.3`<br>`G1.1`–`G1.5`<br>`T6.1`, `T6.2`<br>`B4.1`, `B4.2` | **质量终审与防过拟合铁律**：全部代码合入后，默认配置严格保持 `False`。必须通过全套离线测试（含 SuperTrend 单向棘轮、稀疏权重及切面测试、雪球双估值全套单测 `F3.2`、策略版本双轴解耦与工单 Schema 兼容性单测 `V1.6`、轮式期权离线单测 `W1.4`、UPLSM 统一生命周期状态机与多策略净额穿透离线单测 `G1.2/G1.5`、Track B 回测拟真度与并行测试套件 `B4.2`）；在 Track P 构建基于 Vidovich & Zerjal (2024/2026) 理论的双轨 Parity Harness 回放测试床与 AST 语法树穿透静态分析器（`P1.1`–`P1.3`），全面排查并阻断实盘与回测六大系统性分歧缺陷；在 Track B 试验 Numba JIT 内核并产出基准压测报告（`B4.1`）；逐项运行 Walkforward 消融实验、DSR 显著性惩罚与单次 ERS 检验，方可批准生产翻转。 | 100% 离线单测通过（0 网络请求）；消融实验证明宏观预算与资产防线显著降低组合最大回撤；DSR 显著；通过 `walkforward-audit` LOO 脆弱性审计并给出正式评级；基本面筛选策略通过离线回测验证；版本双轴解耦与实盘工单 Schema 兼容性单测全绿；UPLSM 6状态FSM与非对称快通道测试全绿且回测实盘对齐；Parity Harness 双轨回放测试床对齐实盘快照与回测订单（$\|\Delta w\| < 10^{-4}, \Delta \text{Shares} \equiv 0$），AST 静态分析器确认核心配置参数 0 僵尸引用（0 Dead Config），实盘自动拉起脚本参数显式传递；Track B 100% 离线测试全绿且 55+ 既有策略回归全通。 |
 
 ---
 
@@ -370,6 +400,9 @@ uv run --project pipeline pytest tests/test_parity_harness.py tests/test_config_
 # 13. 运行 UPLSM 统一持仓生命周期状态机与多策略净额穿透测试套件 (G1.1-G1.5)
 PYTHONPATH=. uv run --project pipeline pytest common/tests/test_position_lifecycle.py common/tests/test_order_netting.py -v
 uv run --project web/livetrading pytest web/livetrading/tests -v
+
+# 14. 运行回测系统高并发与拟真度升级验证测试套件 (B1.1-B4.2)
+uv run --project pipeline pytest common/tests/test_allocation_backtester.py common/tests/test_allocation_search.py backtester/tests -v
 ```
 
 ---
