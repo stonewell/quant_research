@@ -27,7 +27,9 @@ class ChanDualHybridBlendStrategy(BaseBlendAllocationStrategy):
     and adaptive inertia rebalancing.
     """
 
-    def __init__(self, config: Optional[StrategyConfig] = None):
+    version: str = "1.0.0"
+
+    def __init__(self, config: Optional[StrategyConfig] = None, version: Optional[str] = None):
         cfg = config or StrategyConfig()
         super().__init__(
             name="chan_dual_hybrid_blend",
@@ -39,6 +41,7 @@ class ChanDualHybridBlendStrategy(BaseBlendAllocationStrategy):
                 "relative_momentum",
                 "volatility_targeting",
             ],
+            version=version,
         )
 
     def get_sub_strategies(

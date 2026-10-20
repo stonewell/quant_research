@@ -288,11 +288,37 @@ def build_and_dump_strategies_as_backtester_files(loaded_config, results_dir):
         except ValueError as exc:
             print(f"  WARNING: Skipping dump for strategy '{entry_key}' -- {exc}")
             continue
+
+        strategy_version = getattr(strat_obj, "version", "1.0.0")
+        base_version = getattr(strat_obj, "base_version", None)
+        get_vi = getattr(strat_obj, "get_version_info", None)
+        if callable(get_vi):
+            try:
+                version_info = get_vi()
+            except Exception:
+                version_info = {
+                    "version": str(strategy_version),
+                    "template_name": entry_key,
+                }
+        else:
+            version_info = {
+                "version": str(strategy_version),
+                "template_name": entry_key,
+            }
+
+        entry_data_out = dict(entry_data)
+        entry_data_out["version"] = str(strategy_version)
+        if base_version is not None:
+            entry_data_out["base_version"] = str(base_version)
+
         strategy_def = {
             "template_name": entry_key,
+            "strategy_version": str(strategy_version),
+            "base_version": str(base_version) if base_version else None,
+            "version_info": version_info,
             "params": entry_data.get("parameters", {}),
             "explanation": strat_obj.explain_weights(),
-            "research_strategy_spec": {"strategy_key": entry_key, "entry_data": entry_data},
+            "research_strategy_spec": {"strategy_key": entry_key, "entry_data": entry_data_out},
         }
         path = os.path.join(dump_dir, f"{entry_key}_strategy.json")
         write_json_report(strategy_def, path)

@@ -471,6 +471,50 @@
         </div>
     </div>
 
+    <!-- Modal: Order Detail & Multi-Dimensional Reason -->
+    <div class="modal" id="modal-order-detail">
+        <div class="modal-dialog" style="max-width: 820px;">
+            <div class="modal-header">
+                <h3>🔍 调仓动因多维解析 (Order Detail & Factor Breakdown) - <span id="modal-order-symbol"></span></h3>
+                <button class="btn-close" id="btn-close-order-detail-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <!-- Summary Reason Card -->
+                <div class="order-detail-card mb-3">
+                    <div class="order-detail-card-title">📌 核心决策摘要 (Decision Summary)</div>
+                    <div class="order-detail-card-body" id="modal-summary-reason">--</div>
+                </div>
+
+                <!-- Strategy Version Card -->
+                <div class="order-detail-card mb-3">
+                    <div class="order-detail-card-title">🏷️ 策略版本元数据 (Strategy Versioning)</div>
+                    <div class="order-detail-card-body" id="modal-strategy-version">--</div>
+                </div>
+
+                <!-- Dimension Signals Breakdown Card -->
+                <div class="order-detail-card mb-3">
+                    <div class="order-detail-card-title">📊 维度信号强度 (Sub-Strategy / Factor Dimension Signals)</div>
+                    <div class="order-detail-card-body" id="modal-dimension-signals">--</div>
+                </div>
+
+                <!-- Risk Checks & Gating Card -->
+                <div class="order-detail-card mb-3">
+                    <div class="order-detail-card-title">🛡️ 风控与门禁状态 (Risk Checks & Gating Status)</div>
+                    <div class="order-detail-card-body" id="modal-risk-checks">--</div>
+                </div>
+
+                <!-- Lot Rounding & Execution Sizing Card -->
+                <div class="order-detail-card">
+                    <div class="order-detail-card-title">📐 整手规整与执行测算 (Lot Rounding & Execution Sizing)</div>
+                    <div class="order-detail-card-body" id="modal-lot-rounding">--</div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="btn-close-order-detail-footer" class="btn btn-secondary">关闭</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Global Loading Overlay -->
     <div id="loading-overlay" class="loading-overlay">
         <div class="loading-card">

@@ -27,7 +27,7 @@ weight-shaping/exit-loop helpers (`common.allocation_templates`,
 """
 
 from dataclasses import asdict, dataclass
-from typing import Callable, Dict
+from typing import Any, Callable, Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -539,7 +539,15 @@ class CompositeTimingTemplate(AllocationTemplate):
     percent-stop-loss/max-holding-days exit. See
     `build_composite_timing_candidates` for how/when these are constructed."""
 
-    def __init__(self, entry: EntrySignalAspect, exit_: ExitRiskAspect, default_params: dict = None):
+    version: str = "1.0.0"
+
+    def __init__(
+        self,
+        entry: EntrySignalAspect,
+        exit_: ExitRiskAspect,
+        default_params: dict = None,
+        version: Optional[str] = None,
+    ):
         """`default_params`, if given, backstops any key the entry/exit
         functions read but a caller's own `params` omits. Since
         `param_grid` is always `{}` here (these source templates only ever
@@ -554,7 +562,25 @@ class CompositeTimingTemplate(AllocationTemplate):
         self.exit = exit_
         self.default_params = default_params or {}
         factor_tags = list(dict.fromkeys(entry.factor_tags + exit_.factor_tags))
-        super().__init__(name=f"{entry.key}__{exit_.key}", param_grid={}, factor_tags=factor_tags)
+        strat_version = version or getattr(self.__class__, "version", "1.0.0")
+        super().__init__(
+            name=f"{entry.key}__{exit_.key}",
+            param_grid={},
+            factor_tags=factor_tags,
+            version=strat_version,
+        )
+
+    def get_version_info(self) -> Dict[str, Any]:
+        return {
+            "version": str(self.version),
+            "template_name": self.name,
+            "entry_aspect": self.entry.key,
+            "exit_aspect": self.exit.key,
+            "aspect_keys": {
+                "entry": self.entry.key,
+                "exit": self.exit.key,
+            },
+        }
 
     def generate_weights(self, universe, params: dict = None) -> pd.DataFrame:
         p = {**self.default_params, **(params or {})}

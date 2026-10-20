@@ -30,7 +30,7 @@ byte-for-byte reconstruction of that atomic template.
 """
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -489,7 +489,15 @@ class CompositeAllocationTemplate(AllocationTemplate):
     template in `common/allocation_templates.py`. See
     `build_composite_candidates` for how/when these are constructed."""
 
-    def __init__(self, selection: SelectionAspect, weighting: WeightingAspect, default_params: dict = None):
+    version: str = "1.0.0"
+
+    def __init__(
+        self,
+        selection: SelectionAspect,
+        weighting: WeightingAspect,
+        default_params: dict = None,
+        version: Optional[str] = None,
+    ):
         """`default_params`, if given, backstops any key `generate_weights`
         needs but a caller's own `params` omits -- notably
         `rebalance_freq_days`, which belongs to NEITHER aspect's own
@@ -505,11 +513,25 @@ class CompositeAllocationTemplate(AllocationTemplate):
         self.default_params = default_params or {}
         param_grid = {**selection.param_grid, **weighting.param_grid}
         factor_tags = list(dict.fromkeys(selection.factor_tags + weighting.factor_tags))
+        strat_version = version or getattr(self.__class__, "version", "1.0.0")
         super().__init__(
             name=f"{selection.key}__{weighting.key}",
             param_grid=param_grid,
             factor_tags=factor_tags,
+            version=strat_version,
         )
+
+    def get_version_info(self) -> Dict[str, Any]:
+        return {
+            "version": str(self.version),
+            "template_name": self.name,
+            "selection_aspect": self.selection.key,
+            "weighting_aspect": self.weighting.key,
+            "aspect_keys": {
+                "selection": self.selection.key,
+                "weighting": self.weighting.key,
+            },
+        }
 
     def generate_weights(self, universe, params: dict) -> pd.DataFrame:
         symbols = list(universe.keys())

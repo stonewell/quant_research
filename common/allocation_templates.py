@@ -17,7 +17,7 @@ uses the pre-ffill sparsity to find the real rebalance dates.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -53,6 +53,21 @@ class AllocationTemplate:
     # Default empty: a template that doesn't declare tags simply never
     # participates in factor-based tie-breaking.
     factor_tags: list = field(default_factory=list)
+    version: Optional[str] = None
+
+    def __post_init__(self):
+        if self.version is None:
+            self.version = getattr(self.__class__, "version", "1.0.0") or "1.0.0"
+
+    def get_version_info(self) -> Dict[str, Any]:
+        return {
+            "version": str(self.version),
+            "template_name": self.name,
+        }
+
+    @property
+    def version_string(self) -> str:
+        return f"v{self.version}"
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict) -> pd.DataFrame:
         """Returns a DataFrame indexed by date, with columns for each symbol.
@@ -483,6 +498,7 @@ class EqualWeightAllocation(AllocationTemplate):
         "rebalance_freq_days": [5, 21, 63]  # Weekly, Monthly, Quarterly
     })
     factor_tags: list = field(default_factory=lambda: ["static_fixed_weight"])
+    version: str = "1.0.0"
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict) -> pd.DataFrame:
         symbols = list(universe.keys())
@@ -556,6 +572,7 @@ class InverseVolatilityAllocation(AllocationTemplate):
         "rebalance_freq_days": [5, 21, 63]
     })
     factor_tags: list = field(default_factory=lambda: ["volatility_targeting"])
+    version: str = "1.0.0"
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict) -> pd.DataFrame:
         symbols = list(universe.keys())
@@ -611,6 +628,7 @@ class CrossSectionalMomentumAllocation(AllocationTemplate):
         "rebalance_freq_days": [21, 63]  # Monthly, Quarterly
     })
     factor_tags: list = field(default_factory=lambda: ["relative_momentum"])
+    version: str = "1.0.0"
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict) -> pd.DataFrame:
         symbols = list(universe.keys())
@@ -669,6 +687,7 @@ class HierarchicalRiskParityAllocation(AllocationTemplate):
         "rebalance_freq_days": [21, 63]
     })
     factor_tags: list = field(default_factory=lambda: ["correlation_diversification"])
+    version: str = "1.0.0"
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict) -> pd.DataFrame:
         symbols = list(universe.keys())
@@ -742,6 +761,7 @@ class DualMomentumAllocation(AllocationTemplate):
         "rebalance_freq_days": [21, 63]
     })
     factor_tags: list = field(default_factory=lambda: ["absolute_momentum_trend", "relative_momentum"])
+    version: str = "1.0.0"
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict) -> pd.DataFrame:
         symbols = list(universe.keys())
@@ -799,6 +819,7 @@ class MaxDiversificationAllocation(AllocationTemplate):
         "rebalance_freq_days": [21, 63]
     })
     factor_tags: list = field(default_factory=lambda: ["volatility_targeting", "correlation_diversification"])
+    version: str = "1.0.0"
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict) -> pd.DataFrame:
         symbols = list(universe.keys())
@@ -873,6 +894,7 @@ class MeanReversionAllocation(AllocationTemplate):
         "rebalance_freq_days": [5, 21],
     })
     factor_tags: list = field(default_factory=lambda: ["mean_reversion"])
+    version: str = "1.0.0"
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict) -> pd.DataFrame:
         symbols = list(universe.keys())
@@ -930,6 +952,7 @@ class MinimumVarianceAllocation(AllocationTemplate):
         "rebalance_freq_days": [21, 63],
     })
     factor_tags: list = field(default_factory=lambda: ["correlation_diversification"])
+    version: str = "1.0.0"
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict) -> pd.DataFrame:
         symbols = list(universe.keys())
@@ -1001,6 +1024,7 @@ class BreadthGatedMomentumAllocation(AllocationTemplate):
         "rebalance_freq_days": [21, 63],
     })
     factor_tags: list = field(default_factory=lambda: ["breadth", "relative_momentum"])
+    version: str = "1.0.0"
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict) -> pd.DataFrame:
         symbols = list(universe.keys())
@@ -1110,6 +1134,8 @@ _FEATURE_FACTOR_TAGS = {
 
 
 class PatternBasedAllocationTemplate(AllocationTemplate):
+    version: str = "1.0.0"
+
     """A trading signal built from ONE indicator pattern discovered by the
     `pattern_mining` stage's (`pipeline/pattern_mining/pmine/pattern_mining.py`)
     turning-point pattern mining -- deliberately NOT in `ALLOCATION_TEMPLATES`

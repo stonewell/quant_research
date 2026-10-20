@@ -58,9 +58,12 @@ class WorldQuantAlphaStrategy(AllocationTemplate):
     Configurable via `wq_alpha_id` (1 to 101).
     """
 
-    def __init__(self, config: Optional[StrategyConfig] = None):
+    version: str = "1.0.0"
+
+    def __init__(self, config: Optional[StrategyConfig] = None, version: Optional[str] = None):
         self.config = config or StrategyConfig()
-        super().__init__(name="worldquant_alpha", param_grid={})
+        strat_version = version or getattr(self.__class__, "version", "1.0.0")
+        super().__init__(name="worldquant_alpha", param_grid={}, version=strat_version)
 
     def warmup_bars(self, params: Optional[dict] = None) -> int:
         p = params or {}
@@ -220,9 +223,12 @@ class WorldQuantMegaAlphaStrategy(AllocationTemplate):
     - Range Skew / Timing: Alpha#38
     """
 
-    def __init__(self, config: Optional[StrategyConfig] = None):
+    version: str = "1.0.0"
+
+    def __init__(self, config: Optional[StrategyConfig] = None, version: Optional[str] = None):
         self.config = config or StrategyConfig()
-        super().__init__(name="worldquant_mega_alpha", param_grid={})
+        strat_version = version or getattr(self.__class__, "version", "1.0.0")
+        super().__init__(name="worldquant_mega_alpha", param_grid={}, version=strat_version)
 
     def warmup_bars(self, params: Optional[dict] = None) -> int:
         p = params or {}

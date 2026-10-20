@@ -1131,9 +1131,12 @@ class ChanCompositeStrategy(AllocationTemplate):
     the trend) even absent a formal sell point, as an additional risk brake.
     """
 
-    def __init__(self, config: StrategyConfig = None):
+    version: str = "1.0.0"
+
+    def __init__(self, config: StrategyConfig = None, version: Optional[str] = None):
         self.config = config or StrategyConfig()
-        super().__init__(name="chan_composite", param_grid={})
+        strat_version = version or getattr(self.__class__, "version", "1.0.0")
+        super().__init__(name="chan_composite", param_grid={}, version=strat_version)
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
         cfg = self.config
@@ -1389,9 +1392,12 @@ class ChanVaaCompoundStrategy(AllocationTemplate):
       or gating equity risk while strictly maintaining stop-losses.
     """
 
-    def __init__(self, config: StrategyConfig = None):
+    version: str = "1.0.0"
+
+    def __init__(self, config: StrategyConfig = None, version: Optional[str] = None):
         self.config = config or StrategyConfig()
-        super().__init__(name="chan_vaa_compound", param_grid={})
+        strat_version = version or getattr(self.__class__, "version", "1.0.0")
+        super().__init__(name="chan_vaa_compound", param_grid={}, version=strat_version)
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
         cfg = self.config
@@ -1639,9 +1645,12 @@ class ChanFourStateExecutionStrategy(AllocationTemplate):
     `chanpy`, or `czsc`).
     """
 
-    def __init__(self, config: StrategyConfig = None):
+    version: str = "1.0.0"
+
+    def __init__(self, config: StrategyConfig = None, version: Optional[str] = None):
         self.config = config or StrategyConfig()
-        super().__init__(name="chan_four_state_execution", param_grid={})
+        strat_version = version or getattr(self.__class__, "version", "1.0.0")
+        super().__init__(name="chan_four_state_execution", param_grid={}, version=strat_version)
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
         cfg = self.config

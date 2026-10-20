@@ -22,7 +22,9 @@ class GenericBlendStrategy(BaseBlendAllocationStrategy):
     new strategy classes.
     """
 
-    def __init__(self, config: Optional[StrategyConfig] = None):
+    version: str = "1.0.0"
+
+    def __init__(self, config: Optional[StrategyConfig] = None, version: Optional[str] = None):
         cfg = config or StrategyConfig()
         super().__init__(
             name="generic_blend",
@@ -34,6 +36,7 @@ class GenericBlendStrategy(BaseBlendAllocationStrategy):
                 "relative_momentum",
                 "volatility_targeting",
             ],
+            version=version,
         )
 
     def _resolve_sub_strategies_spec(self, params: Optional[dict] = None) -> Dict[str, float]:

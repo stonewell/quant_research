@@ -39,7 +39,7 @@ Value-Investing-Adapted Strategies:
     in the separate `fundamental_screener` project)
 """
 
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 import warnings
 
 import numpy as np
@@ -810,9 +810,12 @@ class ChanThreeTypeStrategy(AllocationTemplate):
     stop-loss, or a max-holding-days safety net.
     """
 
-    def __init__(self, config: StrategyConfig = None):
+    version: str = "1.0.0"
+
+    def __init__(self, config: StrategyConfig = None, version: Optional[str] = None):
         self.config = config or StrategyConfig()
-        super().__init__(name="chan_three_type", param_grid={})
+        strat_version = version or getattr(self.__class__, "version", "1.0.0")
+        super().__init__(name="chan_three_type", param_grid={}, version=strat_version)
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
         cfg = self.config
@@ -2172,7 +2175,7 @@ def instantiate_strategy_from_config_entry(entry_key: str, entry_data: dict):
             )
         name = entry_data.get("name", entry_key)
         spec = parse_plain_english_strategy(plain_english, name=name)
-        return NaturalLanguageStrategy(spec, config=cfg)
+        strat_obj = NaturalLanguageStrategy(spec, config=cfg)
     elif strat_type == "class":
         cls_name = entry_data.get("class_name", "")
         if not cls_name:
@@ -2180,7 +2183,13 @@ def instantiate_strategy_from_config_entry(entry_key: str, entry_data: dict):
         cls_obj = STRATEGY_CLASS_MAP.get(cls_name)
         if not cls_obj:
             raise ValueError(f"Unrecognized strategy class_name '{cls_name}' for strategy key '{entry_key}'")
-        return cls_obj(config=cfg)
+        strat_obj = cls_obj(config=cfg)
     else:
         raise ValueError(f"Unknown strategy type '{strat_type}' for strategy key '{entry_key}'")
+
+    if "version" in entry_data:
+        strat_obj.version = entry_data["version"]
+    if "base_version" in entry_data:
+        strat_obj.base_version = entry_data["base_version"]
+    return strat_obj
 

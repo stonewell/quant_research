@@ -24,7 +24,9 @@ class ChanRiskManagedBlendStrategy(BaseBlendAllocationStrategy):
     volatility targeting, ATR trailing stops, and turnover controls.
     """
 
-    def __init__(self, config: Optional[StrategyConfig] = None):
+    version: str = "1.0.0"
+
+    def __init__(self, config: Optional[StrategyConfig] = None, version: Optional[str] = None):
         cfg = config or StrategyConfig()
         super().__init__(
             name="chan_risk_managed_blend",
@@ -36,6 +38,7 @@ class ChanRiskManagedBlendStrategy(BaseBlendAllocationStrategy):
                 "relative_momentum",
                 "volatility_targeting",
             ],
+            version=version,
         )
 
     def get_sub_strategies(

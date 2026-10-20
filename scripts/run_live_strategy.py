@@ -100,6 +100,17 @@ from common.universe import (
 )
 from pipeline.live_signal.lsig.signal import as_of_universe, latest_rebalance_rows
 
+try:
+    from pipeline.research.blend.blend_base import _get_symbol_sector
+except ImportError:
+    try:
+        from research.blend.blend_base import _get_symbol_sector
+    except ImportError:
+        def _get_symbol_sector(sym: str) -> str:
+            raw = sym.split(".")[0]
+            return f"sec_{raw[:2]}" if len(raw) >= 2 else "sec_other"
+
+
 DEFAULT_STRATEGY_KEY = "chan_four_state_blend"
 DEFAULT_STRATEGY_FILE = os.path.join(
     _REPO_ROOT,
@@ -639,6 +650,30 @@ def resolve_strategy_definition(
                 params[k] = v[0]
         strategy_def["params"] = params
 
+    # Extract version metadata
+    strat_version = getattr(template, "version", None) or strategy_def.get("strategy_version") or "1.0.0"
+    base_version = getattr(template, "base_version", None) or strategy_def.get("base_version")
+    if hasattr(template, "get_version_info"):
+        try:
+            strat_version_info = template.get_version_info(params=params)
+        except Exception:
+            try:
+                strat_version_info = template.get_version_info()
+            except Exception:
+                strat_version_info = {
+                    "version": str(strat_version),
+                    "template_name": template_name,
+                }
+    else:
+        strat_version_info = strategy_def.get("version_info") or {
+            "version": str(strat_version),
+            "template_name": template_name,
+        }
+
+    strategy_def["strategy_version"] = str(strat_version)
+    strategy_def["base_version"] = str(base_version) if base_version else None
+    strategy_def["strategy_version_info"] = strat_version_info
+
     return strategy_def, strategy_key, resolved_desc, template
 
 
@@ -1043,9 +1078,24 @@ def main():
     engine_parts.append(f"惰性过滤={min_trade_thresh:.1%}")
     engine_info = " | ".join(engine_parts)
 
+    strat_ver = strategy_def.get("strategy_version", "1.0.0")
+    base_ver = strategy_def.get("base_version")
+    strategy_version_info = strategy_def.get("version_info")
+    if strategy_version_info is None and hasattr(template, "get_version_info"):
+        try:
+            strategy_version_info = template.get_version_info()
+        except Exception:
+            pass
+    if strategy_version_info is None:
+        strategy_version_info = {"version": strat_ver}
+        if base_ver:
+            strategy_version_info["base_version"] = base_ver
+    ver_str = f"v{strat_ver}" + (f" [base: v{base_ver}]" if base_ver else "")
+
     print("=" * 110)
     print("UNIVERSAL QUANTITATIVE LIVE TRADING EXECUTION RUNNER (实盘量化调仓指令生成器)")
     print(f"策略方案 (Strategy) : {strat_name} ({template_name} / {strategy_key})")
+    print(f"策略版本 (Version)  : {ver_str}")
     print(f"配置模型 (Engine)   : {engine_info}")
     print(f"策略来源 (Config)   : {resolved_desc}")
     print(f"标的资产 (Universe) : {args.universe_file}")
@@ -1190,6 +1240,37 @@ def main():
         or float(health_report.get("breadth_thrust_10d", 0.0) or 0.0) >= 0.60
     )
 
+    # Precompute sub-strategy signals for blend strategies
+    sub_strategy_weights_by_symbol: Dict[str, Dict[str, float]] = {}
+    if hasattr(template, "get_sub_strategies"):
+        try:
+            sub_strats = template.get_sub_strategies(universe, params)
+            for sname, s_strat in sub_strats.items():
+                w_sp = s_strat.generate_weights(universe, params)
+                if not w_sp.empty:
+                    rebal_sub = latest_rebalance_rows(w_sp)
+                    if not rebal_sub.empty:
+                        last_w = rebal_sub.iloc[-1]
+                        for sym_k, val_k in last_w.items():
+                            if pd.notna(val_k):
+                                if sym_k not in sub_strategy_weights_by_symbol:
+                                    sub_strategy_weights_by_symbol[sym_k] = {}
+                                sub_strategy_weights_by_symbol[sym_k][sname] = round(float(val_k), 4)
+        except Exception:
+            pass
+
+    # Sector holding counts & throttle limit
+    sector_counts: Dict[str, int] = {}
+    for sym_c, w_c in current_series.items():
+        if sym_c != cash_proxy and w_c > 1e-4:
+            sec_c = _get_symbol_sector(sym_c)
+            sector_counts[sec_c] = sector_counts.get(sec_c, 0) + 1
+    max_assets_per_sector = int(params.get("max_assets_per_sector", 3))
+
+    breadth_val = float(macro_dict.get("breadth", health_report.get("breadth", 0.50)) or 0.50)
+    thrust_val = float(macro_dict.get("thrust", health_report.get("thrust", 0.50)) or 0.50)
+    macro_passed = not (circuit_tier == "TIER_3_HALT" or freeze_rem > 0)
+
     rows = []
     for sym in all_symbols:
         tgt_w = float(target_series[sym])
@@ -1333,14 +1414,17 @@ def main():
             if (price > 0 and current_val > 0)
             else current_shares_dict.get(sym, 0)
         )
+        raw_shares = 0.0
         if sym != cash_proxy and price > 0:
             if action in ("HOLD_FILTERED", "HOLD"):
                 target_shares = current_shares
                 delta_shares = 0
                 actual_trade_val = 0.0
+                raw_shares = 0.0
             elif action == "BUY":
                 # Compute buy qty from trade delta value, round down to lot size
                 raw_buy_shares = trade_val / price
+                raw_shares = raw_buy_shares
                 lot_buy_shares = int(np.floor(raw_buy_shares / sym_lot) * sym_lot)
                 delta_shares = max(0, lot_buy_shares)
                 target_shares = current_shares + delta_shares
@@ -1348,12 +1432,14 @@ def main():
             elif action == "SELL":
                 if tgt_w <= 1e-6:
                     # Full liquidation: sell 100% of currently held shares
+                    raw_shares = -float(current_shares)
                     delta_shares = -current_shares
                     target_shares = 0
                     actual_trade_val = delta_shares * price
                 else:
                     # Partial reduction: round up to lot size, capped at current_shares
                     raw_sell_shares = abs(trade_val) / price
+                    raw_shares = -raw_sell_shares
                     lot_sell_shares = int(np.ceil(raw_sell_shares / sym_lot) * sym_lot)
                     lot_sell_shares = min(lot_sell_shares, current_shares)
                     delta_shares = -lot_sell_shares
@@ -1363,11 +1449,70 @@ def main():
                 target_shares = current_shares
                 delta_shares = 0
                 actual_trade_val = 0.0
+                raw_shares = 0.0
         else:
             target_shares = 0
             current_shares = 0
             delta_shares = 0
             actual_trade_val = 0.0
+            raw_shares = 0.0
+
+        # Formulate human-readable summary reason
+        summary_reason = reason
+        if not summary_reason:
+            if action == "BUY":
+                summary_reason = f"目标仓位增至 {tgt_w:.1%} (变动 {delta_w:+.1%})，突破惯性阈值并满足入场准则，执行买入"
+            elif action == "SELL":
+                summary_reason = f"目标仓位减至 {tgt_w:.1%} (变动 {delta_w:+.1%})，满足最小持仓锁定，执行卖出"
+            elif action == "HOLD_FILTERED":
+                summary_reason = f"调仓未超惰性阈值 (< {min_trade_thresh:.0%})"
+            else:
+                summary_reason = "最优目标权重维持"
+
+        # Sector throttle and dimension signals
+        sec = _get_symbol_sector(sym) if sym != cash_proxy else "cash"
+        cur_sec_holdings = sector_counts.get(sec, 0)
+        if sym in sub_strategy_weights_by_symbol:
+            dim_signals = sub_strategy_weights_by_symbol[sym]
+        else:
+            dim_signals = {strategy_key: round(tgt_w, 4)}
+
+        # Structured multi-dimensional detail reason
+        detail_reason = {
+            "summary_reason": summary_reason,
+            "dimension_signals": dim_signals,
+            "inertia_check": {
+                "delta_weight": round(delta_w, 4),
+                "threshold": float(min_trade_thresh),
+                "triggered": bool(abs_delta >= min_trade_thresh),
+            },
+            "holding_lock": {
+                "bars_held": int(held_age if cur_w > 0 else 0),
+                "min_holding_bars": int(min_holding_bars),
+                "locked": bool(is_tenure_locked),
+            },
+            "cooldown_status": {
+                "bars_since_exit": int(bars_since_exit),
+                "min_cooldown_bars": int(reentry_cooldown_bars),
+                "in_cooldown": bool(bars_since_exit < reentry_cooldown_bars and cur_w == 0.0 and tgt_w > 0.0),
+            },
+            "sector_throttle": {
+                "sector": sec,
+                "max_allowed": max_assets_per_sector,
+                "current_sector_holdings": cur_sec_holdings,
+                "throttled": False,
+            },
+            "macro_gate": {
+                "passed": bool(macro_passed),
+                "breadth": round(breadth_val, 4),
+                "thrust": round(thrust_val, 4),
+            },
+            "lot_rounding": {
+                "target_shares_raw": round(float(raw_shares), 2),
+                "shares": int(abs(delta_shares)),
+                "lot_size": int(sym_lot),
+            },
+        }
 
         sym_name = symbol_names.get(sym, sym)
         if is_placeholder_stock_name(sym_name, sym):
@@ -1383,10 +1528,15 @@ def main():
             "current_shares": current_shares,
             "target_shares": target_shares,
             "delta_shares": delta_shares,
+            "shares": int(abs(delta_shares)),
             "trade_value": actual_trade_val,
             "trade_value_rmb": actual_trade_val,
             "holding_bars": held_age if cur_w > 0 else 0,
             "reason": reason,
+            "summary_reason": summary_reason,
+            "detail_reason": detail_reason,
+            "strategy_version": strat_ver,
+            "base_version": base_ver,
         })
 
     # Purchasing power constraint: total buys cannot exceed available cash + sales proceeds
@@ -1405,13 +1555,21 @@ def main():
                 scaled_val = r["trade_value"] * buy_scale
                 scaled_shares = int(np.floor(scaled_val / r["price"] / sym_lot) * sym_lot)
                 r["delta_shares"] = max(0, scaled_shares)
+                r["shares"] = int(r["delta_shares"])
                 r["target_shares"] = r["current_shares"] + r["delta_shares"]
                 r["trade_value"] = r["delta_shares"] * r["price"]
                 r["trade_value_rmb"] = r["trade_value"]
                 r["target_weight"] = (r["target_shares"] * r["price"]) / args.portfolio_value
                 r["delta_weight"] = r["target_weight"] - r["current_weight"]
+                if "detail_reason" in r and isinstance(r["detail_reason"], dict):
+                    if "lot_rounding" in r["detail_reason"]:
+                        r["detail_reason"]["lot_rounding"]["shares"] = int(r["delta_shares"])
+                        r["detail_reason"]["lot_rounding"]["target_shares_raw"] = round(scaled_val / r["price"], 2)
+                    if "inertia_check" in r["detail_reason"]:
+                        r["detail_reason"]["inertia_check"]["delta_weight"] = round(r["delta_weight"], 4)
 
     order_df = pd.DataFrame(rows)
+
 
     # Reconcile cash proxy: actual post-trade cash = initial cash - net equity purchases
     cash_mask = order_df["symbol"] == cash_proxy
@@ -1574,6 +1732,11 @@ def main():
         account_state["exit_bars_ago"] = updated_exit_bars_ago
         account_state["entry_signal_streak"] = entry_signal_streak
         account_state["zero_target_streak"] = zero_target_streak
+        account_state["strategy_version"] = strat_ver
+        if base_ver:
+            account_state["base_version"] = base_ver
+        if strategy_version_info:
+            account_state["strategy_version_info"] = strategy_version_info
         try:
             with open(args.account_state_file, "w", encoding="utf-8") as f:
                 json.dump(account_state, f, indent=2, ensure_ascii=False)

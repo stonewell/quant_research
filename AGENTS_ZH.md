@@ -88,6 +88,12 @@ uv run python run_pipeline.py --data-provider synthetic --universe SPY QQQ ...
    - ERS 验证（`common/allocation_search.py`）在单次搜索中**仅执行一次**，且仅对最终选出的冠军策略/参数组合进行校验，绝不逐个候选模板运行 ERS。
 5. **股票池标的剔除与黑名单档案规范 (SSOT 于 `docs/black_list.md`)**：
    - 任何时候当 Agent 建议或执行从任何股票池/ETF池/投资组合中剔除某个标的或资产时（无论是因为单手超高价资金失真、结构性失血负Alpha、财务造假/ST风险、恶性价格战内卷、还是高摩擦频繁假突破等原因），必须在 `docs/black_list.md` 中用中文建立并维护完备的剔除档案与深度原因记录，以供后续轮次研究核验与永久避坑。
+6. **模型分级选择与思考优先级规范 (Model Selection Policy)**：
+   - 在需要深度思考、架构设计、数学推导与全景审计选择 Heavy / Pro 级别模型时，严格遵循以下优先级阶梯：
+     - **第一优先级：Claude**（若有可用额度/Credit，优先使用 Claude 3.7 / 3.5 Sonnet 进行深度推理）。
+     - **第二优先级：Gemini Pro**（若 Claude 额度耗尽或不可用，接替使用 Gemini 2.5 / 1.5 Pro）。
+     - **第三优先级：降级回退至 Flash**（仅在 Pro 级别额度完全受限或耗尽时，才回退至 Gemini Flash / Flash-Medium）。
+
 
 ---
 

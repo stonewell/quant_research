@@ -204,6 +204,11 @@ def parse_ticket_csv(csv_path: str) -> List[Dict[str, Any]]:
                             row[int_key] = int(float(row[int_key]))
                         except ValueError:
                             pass
+                if "detail_reason" in row and row["detail_reason"]:
+                    try:
+                        row["detail_reason"] = json.loads(row["detail_reason"])
+                    except Exception:
+                        pass
                 records.append(row)
     except Exception:
         pass

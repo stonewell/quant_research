@@ -194,6 +194,17 @@
         btnCloseSubLedgersFooter: document.getElementById("btn-close-subledgers-footer"),
         containerSubLedgersContent: document.getElementById("container-subledgers-content"),
 
+        // Order Detail Modal Elements
+        modalOrderDetail: document.getElementById("modal-order-detail"),
+        btnCloseOrderDetailModal: document.getElementById("btn-close-order-detail-modal"),
+        btnCloseOrderDetailFooter: document.getElementById("btn-close-order-detail-footer"),
+        modalOrderSymbol: document.getElementById("modal-order-symbol"),
+        modalSummaryReason: document.getElementById("modal-summary-reason"),
+        modalStrategyVersion: document.getElementById("modal-strategy-version"),
+        modalDimensionSignals: document.getElementById("modal-dimension-signals"),
+        modalRiskChecks: document.getElementById("modal-risk-checks"),
+        modalLotRounding: document.getElementById("modal-lot-rounding"),
+
         // Running overlay & toast
         loadingOverlay: document.getElementById("loading-overlay"),
         loadingTitle: document.getElementById("loading-title"),
@@ -913,6 +924,11 @@
         if (el.btnViewSubledgers) el.btnViewSubledgers.addEventListener("click", openSubLedgersModal);
         if (el.btnCloseSubLedgersModal) el.btnCloseSubLedgersModal.addEventListener("click", () => el.modalSubLedgers.classList.remove("active"));
         if (el.btnCloseSubLedgersFooter) el.btnCloseSubLedgersFooter.addEventListener("click", () => el.modalSubLedgers.classList.remove("active"));
+
+        // Order Detail Modal
+        if (el.btnCloseOrderDetailModal) el.btnCloseOrderDetailModal.addEventListener("click", () => el.modalOrderDetail && el.modalOrderDetail.classList.remove("active"));
+        if (el.btnCloseOrderDetailFooter) el.btnCloseOrderDetailFooter.addEventListener("click", () => el.modalOrderDetail && el.modalOrderDetail.classList.remove("active"));
+        if (el.modalOrderDetail) el.modalOrderDetail.addEventListener("click", (e) => { if (e.target === el.modalOrderDetail) el.modalOrderDetail.classList.remove("active"); });
 
         // Strategy, Universe & Data Provider Change
         el.selectStrategy.addEventListener("change", () => {
@@ -1960,7 +1976,18 @@
             tdReason.className = "text-muted col-reason-group";
             tdReason.setAttribute("data-label", "调仓动因");
             tdReason.style.fontSize = "11px";
-            tdReason.textContent = r.reason || (act === "SELL" ? "目标调降卖出" : (act === "BUY" ? "增配开仓买入" : "维持"));
+            const reasonText = r.summary_reason || r.reason || (act === "SELL" ? "目标调降卖出" : (act === "BUY" ? "增配开仓买入" : "维持"));
+            tdReason.textContent = reasonText;
+
+            const btnDetail = document.createElement("button");
+            btnDetail.type = "button";
+            btnDetail.className = "btn btn-sm btn-outline-info ms-2 py-0 px-1 btn-order-detail";
+            btnDetail.textContent = "🔍 详细动因";
+            btnDetail.addEventListener("click", (e) => {
+                e.stopPropagation();
+                showOrderDetailModal(r);
+            });
+            tdReason.appendChild(btnDetail);
 
             tr.appendChild(tdAct);
             tr.appendChild(tdSym);
@@ -2351,6 +2378,133 @@
 
         el.containerSubLedgersContent.appendChild(grid);
         if (el.modalSubLedgers) el.modalSubLedgers.classList.add("active");
+    }
+
+    // -------------------------------------------------------------------------
+    // Order Detail & Multi-Dimensional Reason Modal
+    // -------------------------------------------------------------------------
+    function showOrderDetailModal(ticket) {
+        if (!el.modalOrderDetail || !ticket) return;
+
+        // 1. Symbol & Name Title
+        const displayName = resolveStockDisplayName(ticket.symbol, ticket.name);
+        if (el.modalOrderSymbol) {
+            el.modalOrderSymbol.textContent = `${ticket.symbol} (${displayName})`;
+        }
+
+        let dr = ticket.detail_reason || {};
+        if (typeof dr === "string") {
+            try {
+                dr = JSON.parse(dr);
+            } catch (e) {
+                dr = { summary_reason: dr };
+            }
+        }
+
+        // 2. Summary Reason
+        if (el.modalSummaryReason) {
+            const summary = dr.summary_reason || ticket.summary_reason || ticket.reason || "最优目标权重维持";
+            el.modalSummaryReason.innerHTML = `<div style="font-weight: 600; color: #38bdf8; font-size: 13px;">${summary}</div>`;
+        }
+
+        // 3. Strategy Version
+        if (el.modalStrategyVersion) {
+            const stratVer = ticket.strategy_version || "1.0.0";
+            const baseVer = ticket.base_version;
+            let vHtml = `<span class="badge badge-go font-mono">策略版本: v${stratVer}</span>`;
+            if (baseVer) {
+                vHtml += ` <span class="badge badge-sweep font-mono ms-2">基类版本: v${baseVer}</span>`;
+            }
+            el.modalStrategyVersion.innerHTML = vHtml;
+        }
+
+        // 4. Dimension Signals
+        if (el.modalDimensionSignals) {
+            const dims = dr.dimension_signals || {};
+            const dimEntries = Object.entries(dims);
+            if (dimEntries.length === 0) {
+                el.modalDimensionSignals.innerHTML = '<span class="text-muted">单策略单一维度信号</span>';
+            } else {
+                let dTable = '<table class="order-detail-table"><thead><tr><th>子策略 / 因子维度</th><th>模型输出权重</th><th>信号倾向</th></tr></thead><tbody>';
+                dimEntries.forEach(([dName, dWeight]) => {
+                    const wVal = parseFloat(dWeight) || 0;
+                    const pct = (wVal * 100).toFixed(1);
+                    const tag = wVal > 0.05
+                        ? '<span class="badge badge-go">积极做多</span>'
+                        : (wVal > 0.0 ? '<span class="badge badge-sweep">轻度配置</span>' : '<span class="badge badge-hold">空仓/防守</span>');
+                    dTable += `<tr><td><code style="color: #cbd5e1;">${dName}</code></td><td class="font-mono"><strong>${pct}%</strong></td><td>${tag}</td></tr>`;
+                });
+                dTable += '</tbody></table>';
+                el.modalDimensionSignals.innerHTML = dTable;
+            }
+        }
+
+        // 5. Risk Checks & Gating
+        if (el.modalRiskChecks) {
+            const ic = dr.inertia_check || {};
+            const hl = dr.holding_lock || {};
+            const cd = dr.cooldown_status || {};
+            const st = dr.sector_throttle || {};
+            const mg = dr.macro_gate || {};
+
+            let rHtml = '<table class="order-detail-table"><thead><tr><th>风控门禁检查项</th><th>当前指标值</th><th>规则基准 / 阈值</th><th>门禁判定</th></tr></thead><tbody>';
+
+            // 1. Inertia Check
+            const dPct = (Math.abs(ic.delta_weight !== undefined ? ic.delta_weight : (ticket.delta_weight || 0)) * 100).toFixed(1);
+            const thPct = (((ic.threshold !== undefined ? ic.threshold : 0.05)) * 100).toFixed(1);
+            const icTriggered = ic.triggered !== undefined ? ic.triggered : (Math.abs(ticket.delta_weight || 0) >= 0.05);
+            rHtml += `<tr><td><strong>换手惰性过滤 (Turnover Inertia)</strong></td><td class="font-mono">调仓变动: ${dPct}%</td><td class="font-mono">阈值: &ge; ${thPct}%</td><td>${icTriggered ? '<span class="badge badge-go">突破阈值 (触发调仓)</span>' : '<span class="badge badge-caution">未超阈值 (惰性过滤)</span>'}</td></tr>`;
+
+            // 2. Holding Lock
+            const barsHeld = hl.bars_held !== undefined ? hl.bars_held : (ticket.holding_bars || 0);
+            const minBars = hl.min_holding_bars !== undefined ? hl.min_holding_bars : 2;
+            const isLocked = hl.locked !== undefined ? hl.locked : false;
+            rHtml += `<tr><td><strong>最低持仓锁定期 (Min Holding Tenure)</strong></td><td class="font-mono">已持仓: ${barsHeld} 交易日</td><td class="font-mono">要求: &ge; ${minBars} 日</td><td>${isLocked ? '<span class="badge badge-caution">锁定保护中 (禁止卖出)</span>' : '<span class="badge badge-go">满足周期 (准许调仓)</span>'}</td></tr>`;
+
+            // 3. Cooldown Status
+            const exitBars = cd.bars_since_exit !== undefined ? cd.bars_since_exit : 999;
+            const minCd = cd.min_cooldown_bars !== undefined ? cd.min_cooldown_bars : 2;
+            const inCd = cd.in_cooldown !== undefined ? cd.in_cooldown : false;
+            const exitStr = exitBars >= 999 ? "无近期平仓" : `${exitBars} 交易日`;
+            rHtml += `<tr><td><strong>再入场冷却期 (Re-entry Cooldown)</strong></td><td class="font-mono">离场间隔: ${exitStr}</td><td class="font-mono">要求: &ge; ${minCd} 日</td><td>${inCd ? '<span class="badge badge-caution">冷却防追高中</span>' : '<span class="badge badge-go">正常准入</span>'}</td></tr>`;
+
+            // 4. Sector Throttle
+            const secName = st.sector || "sec_other";
+            const maxAllowed = st.max_allowed !== undefined ? st.max_allowed : 3;
+            const curSec = st.current_sector_holdings !== undefined ? st.current_sector_holdings : 0;
+            const isThrottled = st.throttled !== undefined ? st.throttled : false;
+            rHtml += `<tr><td><strong>行业板块集中度 (Sector Throttle)</strong></td><td class="font-mono">${secName} (${curSec} 只)</td><td class="font-mono">上限: ${maxAllowed} 只</td><td>${isThrottled ? '<span class="badge badge-nogo">行业超限拦截</span>' : '<span class="badge badge-go">额度充裕</span>'}</td></tr>`;
+
+            // 5. Macro Gate
+            const mgPassed = mg.passed !== false;
+            const bPct = (((mg.breadth !== undefined ? mg.breadth : 0.5)) * 100).toFixed(1);
+            const tPct = (((mg.thrust !== undefined ? mg.thrust : 0.5)) * 100).toFixed(1);
+            rHtml += `<tr><td><strong>宏观与账户健康门禁 (Health Gate)</strong></td><td class="font-mono">宽度: ${bPct}%, 冲力: ${tPct}%</td><td>Stage 1 门禁指令</td><td>${mgPassed ? '<span class="badge badge-go">门禁准许 (GO)</span>' : '<span class="badge badge-nogo">熔断拦截 (HALT)</span>'}</td></tr>`;
+
+            rHtml += '</tbody></table>';
+            el.modalRiskChecks.innerHTML = rHtml;
+        }
+
+        // 6. Lot Rounding & Execution Sizing
+        if (el.modalLotRounding) {
+            const lr = dr.lot_rounding || {};
+            const rawSh = lr.target_shares_raw !== undefined ? lr.target_shares_raw : (ticket.delta_shares || 0);
+            const shares = lr.shares !== undefined ? lr.shares : Math.abs(ticket.delta_shares || 0);
+            const lotSize = lr.lot_size !== undefined ? lr.lot_size : 100;
+            const price = parseFloat(ticket.price) || 0;
+            const tradeVal = shares * price;
+
+            let lrHtml = '<table class="order-detail-table"><tbody>';
+            lrHtml += `<tr><td><strong>目标测算理论股数 (Raw Model Shares)</strong></td><td class="font-mono text-right">${rawSh.toLocaleString()} 股</td></tr>`;
+            lrHtml += `<tr><td><strong>交易板单手基准 (Exchange Board Lot)</strong></td><td class="font-mono text-right">${lotSize} 股 / 手</td></tr>`;
+            lrHtml += `<tr><td><strong>实际整手规整股数 (Executable Shares)</strong></td><td class="font-mono text-right text-primary" style="font-weight:700;">${shares.toLocaleString()} 股</td></tr>`;
+            lrHtml += `<tr><td><strong>单手基准金额 (1 Lot Value)</strong></td><td class="font-mono text-right">¥${(lotSize * price).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</td></tr>`;
+            lrHtml += `<tr><td><strong>最终预估交易额 (Estimated Trade Value)</strong></td><td class="font-mono text-right text-success" style="font-weight:700;">¥${tradeVal.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</td></tr>`;
+            lrHtml += '</tbody></table>';
+            el.modalLotRounding.innerHTML = lrHtml;
+        }
+
+        el.modalOrderDetail.classList.add("active");
     }
 
     // -------------------------------------------------------------------------

@@ -137,6 +137,9 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
     and adaptive turnover filters so any blend strategy can inherit them cleanly.
     """
 
+    BASE_VERSION: str = "1.0.0"
+    version: str = "1.0.0"
+
     def __init__(
         self,
         name: str = "base_blend",
@@ -144,6 +147,8 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         alt_param_prefixes: Optional[List[str]] = None,
         config: Optional["StrategyConfig"] = None,
         factor_tags: Optional[List[str]] = None,
+        version: Optional[str] = None,
+        base_version: Optional[str] = None,
     ):
         if config is None:
             from pipeline.research_strategy.rs.config import StrategyConfig
@@ -152,13 +157,40 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             self.config = config
         self.param_prefix = param_prefix
         self.alt_param_prefixes = alt_param_prefixes or []
+        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "1.0.0")
+        strat_version: str = version or getattr(self.__class__, "version", "1.0.0")
         tags = factor_tags or [
             "regime_trend_strength",
             "absolute_momentum_trend",
             "relative_momentum",
             "volatility_targeting",
         ]
-        super().__init__(name=name, param_grid={}, factor_tags=tags)
+        super().__init__(name=name, param_grid={}, factor_tags=tags, version=strat_version)
+
+    def get_version_info(self, params: Optional[dict] = None) -> Dict[str, Any]:
+        sub_strats = {}
+        try:
+            sub_strats = self.get_sub_strategies(universe={}, params=params)
+        except Exception:
+            sub_strats = {}
+        return {
+            "version": str(self.version),
+            "base_version": str(self.base_version),
+            "composite_version": f"{self.version} [base: {self.base_version}]",
+            "template_name": self.name,
+            "strategy_class": self.__class__.__name__,
+            "sub_strategies": {
+                k: {
+                    "class": inst.__class__.__name__,
+                    "version": getattr(inst, "version", "1.0.0"),
+                }
+                for k, inst in (sub_strats or {}).items()
+            },
+        }
+
+    @property
+    def version_string(self) -> str:
+        return f"v{self.version} [base: v{self.base_version}]"
 
     def resolve_param(
         self,

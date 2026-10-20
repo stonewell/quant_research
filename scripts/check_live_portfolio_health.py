@@ -647,6 +647,9 @@ def generate_reports(
     report_dict = {
         "as_of_date": as_of_date,
         "strategy_info": strategy_info,
+        "strategy_version": strategy_info.get("strategy_version", "1.0.0"),
+        "base_version": strategy_info.get("base_version"),
+        "version_info": strategy_info.get("version_info"),
         "gate_code": gate_code,
         "gate_headline": gate_headline,
         "portfolio_health": dd_info,
@@ -659,10 +662,12 @@ def generate_reports(
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(serializable_report, f, indent=2, ensure_ascii=False, default=str)
 
+    strat_ver_display = f"v{strategy_info.get('strategy_version', '1.0.0')}" + (f" [base: v{strategy_info.get('base_version')}]" if strategy_info.get('base_version') else "")
     md_content = f"""# Stage 1 Live Pre-Trade Health & Macro Audit Report
 
 > **Valuation Date**: `{as_of_date}`  
 > **Strategy**: **{strategy_info.get('strategy_name', 'N/A')}** (`{strategy_info.get('template_name', '')}`)  
+> **Strategy Version**: `{strat_ver_display}`  
 > **Weighting & Ortho**: `{strategy_info.get('weighting_mode', 'rolling_ic_ir')}` | Orthogonalized: `{strategy_info.get('orthogonalization', True)}`  
 > **Gate Directive**: **{gate_headline}**  
 > **Report Timestamp**: Generated during 14:00 – 14:15 inspection window  
@@ -743,9 +748,15 @@ def main():
         or strategy_def.get("research_strategy_spec", {}).get("entry_data", {}).get("name")
         or strategy_def.get("template_name", "").replace("_", " ").title()
     )
+    strat_ver = strategy_def.get("strategy_version", "1.0.0")
+    base_ver = strategy_def.get("base_version")
+    ver_info = strategy_def.get("version_info")
     strategy_info = {
         "strategy_name": strat_name,
         "template_name": strategy_def.get("template_name", ""),
+        "strategy_version": str(strat_ver),
+        "base_version": str(base_ver) if base_ver else None,
+        "version_info": ver_info,
         "weighting_mode": params.get("blend_weighting_mode", "rolling_ic_ir"),
         "orthogonalization": params.get("blend_enable_orthogonalization", True),
     }

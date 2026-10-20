@@ -1372,6 +1372,31 @@ def test_same_day_rerun_idempotency(temp_workspace):
     assert sym_to_action1 == sym_to_action2
 
 
+def test_parse_ticket_csv_detail_reason(tmp_path):
+    """Verify parse_ticket_csv parses detail_reason JSON string into dict."""
+    import json
+    from web.livetrading.storage import parse_ticket_csv
+
+    csv_file = tmp_path / "live_trading_ticket.csv"
+    dr_data = {
+        "summary_reason": "突破均线买入",
+        "dimension_signals": {"trend": 0.6},
+        "risk_checks": {"passed": True},
+    }
+    content = (
+        "symbol,action,price,current_shares,target_shares,delta_shares,detail_reason\n"
+        f'600519,BUY,1800.0,0,100,100,"{json.dumps(dr_data).replace(chr(34), chr(34)+chr(34))}"\n'
+    )
+    csv_file.write_text(content, encoding="utf-8")
+    records = parse_ticket_csv(str(csv_file))
+    assert len(records) == 1
+    assert records[0]["symbol"] == "600519"
+    assert isinstance(records[0]["detail_reason"], dict)
+    assert records[0]["detail_reason"]["summary_reason"] == "突破均线买入"
+    assert records[0]["detail_reason"]["dimension_signals"]["trend"] == 0.6
+
+
+
 
 
 

@@ -24,7 +24,9 @@ class ChanFourStateBlendStrategy(BaseBlendAllocationStrategy):
     (`ChanFourStateExecutionStrategy`) and applying unified institutional risk controls.
     """
 
-    def __init__(self, config: Optional[StrategyConfig] = None):
+    version: str = "1.0.0"
+
+    def __init__(self, config: Optional[StrategyConfig] = None, version: Optional[str] = None):
         cfg = config or StrategyConfig()
         super().__init__(
             name="chan_four_state_blend",
@@ -36,6 +38,7 @@ class ChanFourStateBlendStrategy(BaseBlendAllocationStrategy):
                 "relative_momentum",
                 "volatility_targeting",
             ],
+            version=version,
         )
 
     def get_sub_strategies(
