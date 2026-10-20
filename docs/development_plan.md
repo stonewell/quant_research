@@ -20,6 +20,7 @@
 | [`docs/snowball_strategy.txt`](file:///home/stone/Work/github/quant/docs/snowball_strategy.txt) | 雪球价值投资双估值模型（5年期末终值折现与成长股息资本化）与安全边际准入体系 | Track F | 实施中 |
 | [`docs/wheel_strategy_research.md`](file:///home/stone/Work/github/quant/docs/wheel_strategy_research.md) | 轮式期权复合量化策略 (Options Wheel Strategy) 状态机、VRP方差溢价捕获与缠论支撑门控架构蓝图 | Track W | 规划中 |
 | [`docs/six_defects_parity_audit.md`](file:///home/stone/Work/github/quant/docs/six_defects_parity_audit.md) | 基于 Vidovich & Zerjal (2024/2026) 理论的实盘与回测对齐取证审计报告 (六大缺陷排查) | Track P | 规划中 |
+| [`common/position_lifecycle.py`](file:///home/stone/Work/github/quant/common/position_lifecycle.py) | 统一持仓生命周期状态机 (UPLSM) 6 状态 FSM、非对称快通道（放量突破 0-delay 闪电建仓 / -8% 止损 0-delay 避险平仓）与两日门禁精简整合方案 | Track G | 已落地 |
 | [`docs/black_list.md`](file:///home/stone/Work/github/quant/docs/black_list.md) | 核心股票池剔除标的权威黑名单档案与失血归因 (SSOT) | 全局 / Live | 已落地 |
 
 ### 1.2 跨体系因果交汇与架构拓扑 (Cross-Track Architectural Synergy)
@@ -68,7 +69,7 @@ flowchart TD
 
 ---
 
-## 二、 原子任务全量拆解清单（共 61 个原子任务）
+## 二、 原子任务全量拆解清单（共 66 个原子任务）
 
 ### 2.1 《5分钟高频日内数据方案》原子任务表（`T0.1`–`T6.2`，共 19 个任务）
 
@@ -190,6 +191,19 @@ flowchart TD
 
 ---
 
+### 2.9 《统一持仓生命周期状态机与两日门禁精简整合方案》（UPLSM - Track G，共 5 个任务，Wave 5 实盘调仓对齐与执行效率跃迁）
+
+| 任务编号 | 状态 | 任务名称 | 涉及核心文件与符号 | 核心交付内容与验收标准 (含 6 状态 FSM、非对称快通道与全链路对齐) | 配套离线单测 | 规模 | 前置依赖 |
+| :--- | :---: | :--- | :--- | :--- | :--- | :---: | :--- |
+| **`G1.1`** | `[x]` | 共享核心状态机模块 | [`common/position_lifecycle.py`](file:///home/stone/Work/github/quant/common/position_lifecycle.py)<br>`PositionLifecycleManager`<br>`PositionLifecycleState`<br>`PositionState` | 编写 `common/position_lifecycle.py`，实现 6 状态 FSM、非对称快通道（放量突破 0-delay 闪电建仓、-8% 止损/ATR 吊灯 0-delay 避险平仓并严守 A 股 T+1）与 JSON 状态双向序列化。 | `test_position_lifecycle.py` | **M** | 无 |
+| **`G1.2`** | `[x]` | 核心模块离线单元测试套件 | `common/tests/test_position_lifecycle.py`<br>[`common/allocation_templates.py`](file:///home/stone/Work/github/quant/common/allocation_templates.py)<br>`_step_asset_inertia` | 编写 `common/tests/test_position_lifecycle.py`，100% 离线测试覆盖 8 大场景与 `_step_asset_inertia` 增配反向锁母仓 Bug 修复。 | `pytest` 全绿 | **M** | `G1.1` |
+| **`G1.3`** | `[x]` | 实盘执行引擎整合与双写平滑迁移 | [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py)<br>`--guard-latency-bars`<br>`account_state.json` | 在 `scripts/run_live_strategy.py` 中接入 UPLSM，修复 `AdaptiveGridStrategy` P0 级无限冷却死锁，统一 `--guard-latency-bars` 主控参数与 `account_state.json` 双写。 | `test_live_strategy.py` | **M** | `G1.1` |
+| **`G1.4`** | `[x]` | 研发策略回测引擎对齐 | [`pipeline/research/blend/blend_base.py`](file:///home/stone/Work/github/quant/pipeline/research/blend/blend_base.py)<br>`apply_asset_inertia`<br>`_step_asset_inertia` | 在 `pipeline/research/blend/blend_base.py` 中接入放量突破快通道、正常离场 1 日冷却、止损 5 日冷却与行业老持仓解锁，消除回测与实盘分道扬镳。 | `test_blend_intraday_5m.py` | **M** | `G1.1`, `G1.3` |
+| **`G1.5`** | `[x]` | 多策略净额撮合与 Web 控制台统一参数展现 | [`common/order_netting.py`](file:///home/stone/Work/github/quant/common/order_netting.py)<br>`web/livetrading/models.py`<br>`web/livetrading/execution_service.py`<br>`web/livetrading/static/js/app.js` | 在 `common/order_netting.py` 中引入止损穿透，在 `web/livetrading/` 中接入主控参数与 UPLSM 动因徽章呈现。 | `test_order_netting.py`<br>`test_web_livetrading.py` | **M** | `G1.1`..`G1.4` |
+
+
+---
+
 ## 三、 五级主优先级执行路线图与并行波次编排（`Tier P0` $\to$ `Tier P4`）
 
 ```mermaid
@@ -267,6 +281,7 @@ flowchart TD
         P11["P1.1: Parity Harness 双轨回放对齐测试床\n(tests/test_parity_harness.py)"]
         P12["P1.2: AST 配置穿透静态分析防僵尸配置\n(tests/test_config_wiring.py)"]
         P13["P1.3: 自动拉起脚本命令行参数加固\n(scripts/check_live_portfolio_health.py)"]
+        G11["G1.1–G1.5: UPLSM 统一持仓生命周期状态机\n(6状态FSM/非对称快通道/回测实盘对齐/Web动因)"]
         T61["T6.1: Phase 6 Walkforward 逐项消融实验"]
         T62["T6.2: DSR 校正 + 单次 ERS + LOO 脆弱性终审"]
     end
@@ -286,7 +301,7 @@ flowchart TD
 | **Tier P1**<br>(数据与新策略) | **Wave 1 & 2**<br>(Track T 数据底座 + Track C/S 旗舰新策略与切面 + Track F 估值模型 + Track V 语义版本管理) | `C1.2`, `C1.3`, `T1.1`, `T1.2`<br>`S1.1`, `S1.2`<br>`F1.1`, `F1.2`<br>`C2.1`, `C2.2`, `C2.3`<br>`S2.1`, `S2.2`<br>`F2.1`, `F2.2`<br>`T1.3`, `T1.4`, `T1.5`<br>`V1.1`, `V1.2`, `V1.3` | **多轨并行解耦加速**：在有了 `T1.2` 钉扎布朗桥与 `C1.2`/`C1.3`、`S1.1`/`S1.2`、`F1.1`/`F1.2` 基础算子与数据底座后，旗舰新策略 `C2.1`/`C2.2`、`S2.1`（SuperTrend 择时）与 `F2.1`/`F2.2`（雪球双估值解析解与行业黑名单）可完全独立研发，并推进 `S2.2` 切面解耦，与外部网络行情源接入（`T1.3`–`T1.5`）互不阻塞；同时推进策略语义化版本管理基石（`V1.1`–`V1.3`），实现 `AllocationTemplate` 与 `BaseBlendAllocationStrategy` 基础引擎版本（`BASE_VERSION`）与具体策略版本（`version`）双轴解耦及子策略层级内省。 | 钉扎布朗桥按日聚合与日线比特级一致；新策略跑通 `generate_weights` 并严格遵守稀疏权重契约（无 `NaN` 扩散）；SuperTrend 算子通过单向棘轮单调性断言；切面解耦模块可自由交叉配对；雪球双估值解析解数值精度达到 $10^{-9}$ 且奇点防护无除零崩溃；模板与子类具备显式版本字段且 dataclass 继承不被静默覆盖，策略 dump 成功持久化版本元数据。 |
 | **Tier P2**<br>(特征与宏观底座) | **Wave 3**<br>(高频特征聚合 + Blend 宏观/质量/风险预算增强 + 质地门禁重构) | `T2.1`, `T2.2`, `T2.3`<br>`C3.1`, `S3.1`<br>`F2.3` | **自下而上驱动底座**：先由因果截断引擎输出标准特征矩阵，再将特征与趋势轨线注入 `BaseBlendAllocationStrategy` 的状态机（锚点 1）、质量门禁（锚点 2）、冲力共振（锚点 3）、宏观风险预算折半（锚点 7）与资产动量防线（锚点 8）；同时在 Track F 落地准入 5 大财务底线（`F2.3`）与逻辑破损/性价比衰减双重卖出触发。 | `enrich_universe_with_intraday_features` 满足 $\kappa_t$ 复权对齐；Blend 策略在开启锚点 1/2/3/7/8 后，能准确在指数空头态折半全局预算，对深套、空心及破位标的精准置 `0.0` 否决；`quality_ok` 对财务造假、高杠杆及黑名单标的一票否决。 |
 | **Tier P3**<br>(全链路、衍生品与实盘护栏) | **Wave 4**<br>(微观共振闭环 + 实盘 Stage 1/2 护栏 + 筛选报告与策略适配 + 轮式期权复合策略 + 实战动因审计) | `T3.1`, `T3.2`, `T3.3`<br>`C3.2`, `S4.1`<br>`F3.1`<br>`T4.1`, `T4.2`, `T4.3`<br>`L1.1`–`L1.5`<br>`V1.4`, `V1.5`<br>`W1.1`–`W1.5` | **高阶微观整合与实盘风控防护**：在入场端实现弹簧与 5m 区间套双通道加速，在出场端实现结构化吊灯止损；实盘 Stage 1/2 筑牢跌停封死双向冻结（R14）、双模式限价单引导（R11）、SuperTrend 破位预警以及实盘防抖执行风控（`L1.1`–`L1.5` 再入场冷却期、连续确认、宏观冲力突破豁免与 -8% 硬止损）；在 Track F 升级 CLI 筛选报告与 `FundamentalScreenerStrategy` 稀疏权重生成适配（`F3.1`）；在 Track V 落地实盘执行引擎多维详细动因生成器与工单字段扩展（`V1.4`），以及 Web Station 调仓工单表格动因链接与详细审计弹窗（`V1.5`）；在 Track W 研发合成轮式期权复合策略（`W1.1`–`W1.5`），系统性收割 VRP 方差溢价与正向 Theta 衰减，引入缠论中枢下轨支撑锚定与防深套硬止损熔断。 | 威科夫弹簧实现 Day 1 加速建仓；跌停卖单未成交资金在 Phase 2 与 Phase 4 彻底冻结；实盘 Stage 1 精准识别 SuperTrend 破位并写入健康报告；基本面选股策略输出合规稀疏权重；实盘执行全链路支持防抖冷却、连续信号确认与硬止损穿透防护；工单具备完整详细动因（对账、子策略拆解、冲力/波动率阻尼、配额挤出、防抖门禁等）并在 Web 交互弹窗清晰呈现；轮式期权策略跑通 CSP/CC/Cash Shield 三态 FSM 状态机流转，BSM Greeks 逆解行权价误差 $<10^{-4}$，严格遵循稀疏权重契约（调仓日非空、显式 0.0）。 |
-| **Tier P4**<br>(单测、对齐测试床与终审验证) | **Wave 5**<br>(全套离线单测 + 对齐测试床 + 严苛消融终审) | `T5.1`, `T5.2`<br>`C4.1`, `S4.2`<br>`F3.2`<br>`V1.6`<br>`P1.1`–`P1.3`<br>`T6.1`, `T6.2` | **质量终审与防过拟合铁律**：全部代码合入后，默认配置严格保持 `False`。必须通过全套离线测试（含 SuperTrend 单向棘轮、稀疏权重及切面测试、雪球双估值全套单测 `F3.2`、策略版本双轴解耦与工单 Schema 兼容性单测 `V1.6`、轮式期权离线单测 `W1.4`）；在 Track P 构建基于 Vidovich & Zerjal (2024/2026) 理论的双轨 Parity Harness 回放测试床与 AST 语法树穿透静态分析器（`P1.1`–`P1.3`），全面排查并阻断实盘与回测六大系统性分歧缺陷；逐项运行 Walkforward 消融实验、DSR 显著性惩罚与单次 ERS 检验，方可批准生产翻转。 | 100% 离线单测通过（0 网络请求）；消融实验证明宏观预算与资产防线显著降低组合最大回撤；DSR 显著；通过 `walkforward-audit` LOO 脆弱性审计并给出正式评级；基本面筛选策略通过离线回测验证；版本双轴解耦与实盘工单 Schema 兼容性单测全绿；Parity Harness 双轨回放测试床对齐实盘快照与回测订单（$\|\Delta w\| < 10^{-4}, \Delta \text{Shares} \equiv 0$），AST 静态分析器确认核心配置参数 0 僵尸引用（0 Dead Config），实盘自动拉起脚本参数显式传递。 |
+| **Tier P4**<br>(单测、对齐测试床与终审验证) | **Wave 5**<br>(全套离线单测 + 对齐测试床 + 严苛消融终审) | `T5.1`, `T5.2`<br>`C4.1`, `S4.2`<br>`F3.2`<br>`V1.6`<br>`P1.1`–`P1.3`<br>`G1.1`–`G1.5`<br>`T6.1`, `T6.2` | **质量终审与防过拟合铁律**：全部代码合入后，默认配置严格保持 `False`。必须通过全套离线测试（含 SuperTrend 单向棘轮、稀疏权重及切面测试、雪球双估值全套单测 `F3.2`、策略版本双轴解耦与工单 Schema 兼容性单测 `V1.6`、轮式期权离线单测 `W1.4`、UPLSM 统一生命周期状态机与多策略净额穿透离线单测 `G1.2/G1.5`）；在 Track P 构建基于 Vidovich & Zerjal (2024/2026) 理论的双轨 Parity Harness 回放测试床与 AST 语法树穿透静态分析器（`P1.1`–`P1.3`），全面排查并阻断实盘与回测六大系统性分歧缺陷；逐项运行 Walkforward 消融实验、DSR 显著性惩罚与单次 ERS 检验，方可批准生产翻转。 | 100% 离线单测通过（0 网络请求）；消融实验证明宏观预算与资产防线显著降低组合最大回撤；DSR 显著；通过 `walkforward-audit` LOO 脆弱性审计并给出正式评级；基本面筛选策略通过离线回测验证；版本双轴解耦与实盘工单 Schema 兼容性单测全绿；UPLSM 6状态FSM与非对称快通道测试全绿且回测实盘对齐；Parity Harness 双轨回放测试床对齐实盘快照与回测订单（$\|\Delta w\| < 10^{-4}, \Delta \text{Shares} \equiv 0$），AST 静态分析器确认核心配置参数 0 僵尸引用（0 Dead Config），实盘自动拉起脚本参数显式传递。 |
 
 ---
 
@@ -351,6 +366,10 @@ uv run --project pipeline pytest pipeline/research_strategy/tests/test_synthetic
 
 # 12. 运行实盘回测对齐测试床与 AST 配置穿透静态分析 (P1.1-P1.3)
 uv run --project pipeline pytest tests/test_parity_harness.py tests/test_config_wiring.py -v
+
+# 13. 运行 UPLSM 统一持仓生命周期状态机与多策略净额穿透测试套件 (G1.1-G1.5)
+PYTHONPATH=. uv run --project pipeline pytest common/tests/test_position_lifecycle.py common/tests/test_order_netting.py -v
+uv run --project web/livetrading pytest web/livetrading/tests -v
 ```
 
 ---

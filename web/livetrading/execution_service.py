@@ -278,6 +278,7 @@ class ExecutionService:
         universe_key: Optional[str] = None,
         strategy_name: Optional[str] = None,
         universe_name: Optional[str] = None,
+        guard_latency_bars: int = 2,
     ) -> Dict[str, Any]:
         """Execute Stage 2 Live Deployment."""
         provider = data_provider or self.storage.default_data_provider or "marketdb"
@@ -334,6 +335,8 @@ class ExecutionService:
             cmd.extend(["--lot-size", str(lot_size)])
         if self.storage.cache_dir:
             cmd.extend(["--cache-dir", self.storage.cache_dir])
+        if guard_latency_bars is not None:
+            cmd.extend(["--guard-latency-bars", str(guard_latency_bars)])
 
         print(f"[ExecutionService] Running Stage 2 Live Deployment: {' '.join(cmd)}")
         proc = subprocess.run(

@@ -6,6 +6,7 @@ from common.order_netting import (
     OrderNettingEngine,
     SubStrategyIntent,
     NettingResult,
+    execute_netting,
 )
 
 
@@ -619,3 +620,104 @@ def test_fx_rates_conversion_in_multi_currency_portfolio():
     )
     # 100 shares of AAPL @ $100 crossed -> $20,000 crossed USD turnover -> 140,000 RMB
     assert res.friction_savings.saved_turnover > 0
+
+
+def test_netting_emergency_stop_loss_penetrates_tenure_lock():
+    """Confirms that emergency stops liquidate immediately on Day 1 by penetrating tenure lock.
+
+    Tests 3 critical scenarios:
+    1. Direct emergency_symbols argument on Day 1 (held_age = 1 >= 1) penetrates tenure lock (min_holding_bars=2).
+    2. Sub-strategy ticket carrying -8% hard stop-loss reason auto-penetrates tenure lock on Day 1.
+    3. Day 0 purchase (held_age = 0 < 1) strictly obeys China A-share statutory T+1 law and remains locked.
+    """
+    engine = OrderNettingEngine(lot_size_default=100)
+    current_holdings = {"601872.SH": 1000, "BIL": 90000.0}
+    latest_prices = {"601872.SH": 10.0}
+
+    intents = [
+        SubStrategyIntent(
+            strategy_key="strat_exit",
+            strategy_name="Exit Strat",
+            capital_weight=1.0,
+            allocated_capital=100000.0,
+            target_weights={"601872.SH": 0.0},
+        )
+    ]
+
+    # Baseline: Normal exit on Day 1 with min_holding_bars=2 is locked
+    res_normal = engine.net_portfolio_orders(
+        intents=intents,
+        current_holdings=current_holdings,
+        portfolio_value=100000.0,
+        latest_prices=latest_prices,
+        holding_bars={"601872.SH": 1},
+        min_holding_bars=2,
+    )
+    stock_row_normal = [r for r in res_normal.net_orders if r["symbol"] == "601872.SH"][0]
+    assert stock_row_normal["action"] == "HOLD_FILTERED"
+    assert stock_row_normal["delta_shares"] == 0
+
+    # Scenario 1: Emergency symbols explicitly passed -> penetrates tenure lock on Day 1
+    res_em = engine.net_portfolio_orders(
+        intents=intents,
+        current_holdings=current_holdings,
+        portfolio_value=100000.0,
+        latest_prices=latest_prices,
+        holding_bars={"601872.SH": 1},
+        min_holding_bars=2,
+        emergency_symbols={"601872.SH"},
+    )
+    stock_row_em = [r for r in res_em.net_orders if r["symbol"] == "601872.SH"][0]
+    assert stock_row_em["action"] == "SELL"
+    assert stock_row_em["delta_shares"] == -1000
+    assert stock_row_em["target_shares"] == 0
+    assert stock_row_em["fast_path_triggered"] == "STOP_LOSS"
+    assert "止损穿透" in stock_row_em["reason"]
+
+    # Scenario 2: Sub-strategy raw orders carry -8% hard stop reason -> auto-penetrates via execute_netting
+    intents_with_stop_ticket = [
+        SubStrategyIntent(
+            strategy_key="strat_exit",
+            strategy_name="Exit Strat",
+            capital_weight=1.0,
+            allocated_capital=100000.0,
+            target_weights={"601872.SH": 0.0},
+            raw_orders=[
+                {
+                    "symbol": "601872.SH",
+                    "action": "SELL",
+                    "reason": "触发个股 -8% 硬止损风控 (当前价格 9.20 较成本 10.00 跌幅 -8.0%)",
+                }
+            ],
+        )
+    ]
+    res_auto = execute_netting(
+        intents=intents_with_stop_ticket,
+        current_holdings=current_holdings,
+        portfolio_value=100000.0,
+        latest_prices=latest_prices,
+        holding_bars={"601872.SH": 1},
+        min_holding_bars=2,
+    )
+    stock_row_auto = [r for r in res_auto.net_orders if r["symbol"] == "601872.SH"][0]
+    assert stock_row_auto["action"] == "SELL"
+    assert stock_row_auto["delta_shares"] == -1000
+    assert stock_row_auto["target_shares"] == 0
+    assert stock_row_auto["fast_path_triggered"] == "STOP_LOSS"
+
+    # Scenario 3: Statutory T+1 protection on Day 0 (holding_bars = 0)
+    # Even if emergency stop is requested, statutory A-share T+1 cannot execute intraday
+    res_day0 = engine.net_portfolio_orders(
+        intents=intents,
+        current_holdings=current_holdings,
+        portfolio_value=100000.0,
+        latest_prices=latest_prices,
+        holding_bars={"601872.SH": 0},
+        min_holding_bars=2,
+        emergency_symbols={"601872.SH"},
+    )
+    stock_row_day0 = [r for r in res_day0.net_orders if r["symbol"] == "601872.SH"][0]
+    assert stock_row_day0["action"] == "HOLD_FILTERED"
+    assert stock_row_day0["delta_shares"] == 0
+    assert "未满最低持仓周期" in stock_row_day0["reason"]
+

@@ -1060,6 +1060,33 @@ def test_grid_drawdown_circuit_breaker_flattens_and_cools_down():
     assert daily["SPY"].iloc[-1] == 0.0
 
 
+def test_grid_resumes_trading_after_cooldown_finishes():
+    """Verifies that when drawdown stop cooldown finishes, peak_equity resets and grid resumes."""
+    n = 450
+    rng = np.random.default_rng(42)
+    t = np.arange(n)
+    # Range 0-150: oscillating around 100
+    closes = 100.0 + 3.0 * np.sin(t / 8.0) + rng.normal(0, 0.1, n)
+    # Range 150-180: sharp crash from 100 down to 75 (-25%)
+    closes[150:180] = np.linspace(closes[149], 75.0, 30)
+    # Range 180-450: oscillating around 75 with gentle upward trend
+    t_after = np.arange(len(closes[180:]))
+    closes[180:] = 75.0 + 0.05 * t_after + 2.0 * np.sin(t_after / 6.0)
+
+    universe = _timing_universe(make_ohlcv_from_closes(closes))
+    cfg = StrategyConfig(grid_cooldown_bars_after_stop=20, grid_drawdown_stop_pct=0.15)
+    strat = AdaptiveGridStrategy(cfg)
+    weights = strat.generate_weights(universe)
+    daily = _daily(weights)
+
+    # 1. Capital was deployed before crash
+    assert (daily["SPY"].iloc[:150] > 0).any()
+    # 2. Capital was flattened during crash / cooldown
+    assert daily["SPY"].iloc[180:200].sum() == 0.0
+    # 3. Capital resumes trading after cooldown finishes and drawdown auto-heals
+    assert (daily["SPY"].iloc[250:] > 0).any(), "grid should resume deploying capital after cooldown finishes"
+
+
 def test_grid_ignores_stale_symbol_param_and_trades_universe_instead():
     universe = _timing_universe(make_oscillating_df(n=100))
     default_weights = AdaptiveGridStrategy(StrategyConfig()).generate_weights(universe)

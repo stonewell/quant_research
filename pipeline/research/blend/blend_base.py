@@ -485,9 +485,9 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         max_single_pos = self.resolve_param(p, "max_single_position", 0.20, float)
         bull_max_pos = self.resolve_param(p, "bull_max_single_position", 0.20, float)
         min_weight_change = self.resolve_param(p, "min_weight_change", 0.05, float)
-        entry_thresh = self.resolve_param(p, "entry_threshold", 0.03, float)
+        entry_thresh = self.resolve_param(p, "entry_threshold", min_weight_change, float)
         min_holding_bars = self.resolve_param(p, "min_holding_bars", 2, int)
-        min_entry_bars = self.resolve_param(p, "min_entry_bars", 2, int)
+        min_entry_bars = self.resolve_param(p, "min_entry_bars", self.resolve_param(p, "guard_latency_bars", 2, int), int)
         thrust_incumbent_bonus = self.resolve_param(p, "thrust_incumbent_bonus", 1.20, float)
         dd_reduce_thresh = self.resolve_param(p, "dd_reduce_thresh", 0.10, float)
         dd_defensive_thresh = self.resolve_param(p, "dd_defensive_thresh", 0.15, float)
@@ -511,6 +511,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         stop_mode = self.resolve_param(p, "stop_mode", "atr_trailing", str)
         stop_atr_mult = self.resolve_param(p, "stop_atr_mult", 4.5, float)
         asset_stop_cooldown_bars = self.resolve_param(p, "asset_stop_cooldown_bars", 5, int)
+        normal_cooldown_bars = self.resolve_param(p, "normal_cooldown_bars", self.resolve_param(p, "reentry_cooldown_bars", 1, int), int)
         adaptive_inertia = self.resolve_param(p, "adaptive_inertia", True, bool)
         asymmetric_sells = self.resolve_param(p, "asymmetric_sells", (self.param_prefix == "cdhb"), bool)
         preemptive_thrust = self.resolve_param(p, "preemptive_thrust_deployment", True, bool)
@@ -552,6 +553,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         trend_50_matrix = pd.DataFrame(index=master_index, columns=risky_symbols, dtype=float)
         ma20_slope_matrix = pd.DataFrame(index=master_index, columns=risky_symbols, dtype=float)
         vol_surge_matrix = pd.DataFrame(index=master_index, columns=risky_symbols, dtype=float)
+        vol_breakout_matrix = pd.DataFrame(0.0, index=master_index, columns=risky_symbols, dtype=float)
         asset_returns = pd.DataFrame(0.0, index=master_index, columns=risky_symbols)
         asset_vol_21d = pd.DataFrame(0.0, index=master_index, columns=risky_symbols)
         atr_14_matrix = pd.DataFrame(0.0, index=master_index, columns=risky_symbols)
@@ -576,8 +578,10 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                     v = df_s["Volume"].reindex(master_index).ffill()
                     v_ma20 = sma(v, 20)
                     vol_surge_matrix[sym] = (v >= 1.2 * v_ma20).astype(float)
+                    vol_breakout_matrix[sym] = ((v >= 1.5 * v_ma20) & (v_ma20 > 0)).astype(float).fillna(0.0)
                 else:
                     vol_surge_matrix[sym] = 1.0
+                    vol_breakout_matrix[sym] = 0.0
 
                 asset_returns[sym] = c.pct_change().fillna(0.0)
                 if vol_model == "garman_klass":
@@ -716,6 +720,8 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                 asset_cooldown_until[s] = t + asset_stop_cooldown_bars
                                 asset_entry_price[s] = None
                                 asset_peak_price[s] = None
+                                entry_signal_bars[s] = 0
+                                expansion_signal_bars[s] = 0
                     elif prev_w <= 1e-4:
                         if t >= asset_cooldown_until[s]:
                             asset_entry_price[s] = None
@@ -936,7 +942,8 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                 prev_date = master_index[t - 1]
                                 for s in risky_symbols:
                                     if float(daily_weights.loc[prev_date, s]) > 1e-4:
-                                        if t >= asset_cooldown_until[s]:
+                                        has_stopped = bool(asset_emergency_df.loc[date, s]) or (t < asset_cooldown_until[s])
+                                        if not has_stopped and not is_emergency:
                                             held_incumbents.add(s)
                                         if min_holding_bars > 0:
                                             k = t - 1
@@ -944,9 +951,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                             while k >= 0 and float(daily_weights.iloc[k][s]) > 1e-4:
                                                 age += 1
                                                 k -= 1
-                                            if age < min_holding_bars and t < asset_cooldown_until[s]:
-                                                pass
-                                            elif age < min_holding_bars:
+                                            if age < min_holding_bars and not has_stopped and not is_emergency:
                                                 locked_incumbents.add(s)
 
                             all_sorted = sorted(cand_scores.keys(), key=lambda s: (-cand_scores[s], s))
@@ -1076,11 +1081,18 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                     # 1. New position entry filter (prev_w <= 1e-4):
                     # Requires signal to persist for at least min_entry_bars consecutive trading days
                     # before opening the position. Single-day transient spikes are suppressed to 0.0.
+                    # UPLSM Parity: Strict confluence of Volume breakout (>= 1.5x MA20) AND market breadth >= 60%
+                    # allows Day 1 fast-path bypass.
                     if prev_w <= 1e-4:
                         if target_w >= entry_thresh:
                             entry_signal_bars[s] += 1
+                            is_vol = bool(vol_breakout_matrix.iloc[t][s] > 0.5) if s in vol_breakout_matrix.columns else False
+                            is_breadth = (breadth_val >= 0.60)
                             if entry_signal_bars[s] < min_entry_bars:
-                                raw_w[s] = 0.0  # Pending confirmation on Day 1; do NOT enter!
+                                if is_vol and is_breadth:
+                                    entry_signal_bars[s] = min_entry_bars  # Fast-path bypass Day 1 confirmation (strict confluence)
+                                else:
+                                    raw_w[s] = 0.0  # Pending confirmation on Day 1; do NOT enter!
                         else:
                             entry_signal_bars[s] = 0
                             raw_w[s] = 0.0
@@ -1088,12 +1100,17 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                     # 2. Incremental expansion filter on existing positions:
                     # If target demands significant expansion (>= min_weight_change), require persistence
                     # so 1-day thrust spikes don't pump and dump existing holdings.
+                    # UPLSM Parity: Volume breakout (>= 1.5x MA20) allows immediate expansion bypass.
                     else:
                         entry_signal_bars[s] = min_entry_bars  # Incumbent position has confirmed entry
                         if target_w - prev_w >= min_weight_change:
                             expansion_signal_bars[s] += 1
+                            is_vol = bool(vol_breakout_matrix.iloc[t][s] > 0.5) if s in vol_breakout_matrix.columns else False
                             if expansion_signal_bars[s] < min_entry_bars:
-                                raw_w[s] = prev_w  # Suppress expansion until confirmed for min_entry_bars
+                                if is_vol:
+                                    expansion_signal_bars[s] = min_entry_bars  # Fast-path bypass for expansions
+                                else:
+                                    raw_w[s] = prev_w  # Suppress expansion until confirmed for min_entry_bars
                         else:
                             expansion_signal_bars[s] = 0
 
@@ -1133,6 +1150,25 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                 daily_weights.loc[date] = current_w
             else:
                 daily_weights.loc[date] = raw_w
+
+            # Cooldown Parity: Track normal strategic exits (when target drops to 0.0)
+            # and enforce normal_cooldown_bars to prevent immediate 1-bar whipsaw re-entry.
+            if t > 0:
+                prev_date_w = master_index[t - 1]
+                for s in risky_symbols:
+                    prev_w_val = float(daily_weights.loc[prev_date_w, s])
+                    curr_w_val = float(daily_weights.loc[date, s])
+                    if prev_w_val > 1e-4 and curr_w_val <= 1e-4:
+                        if not bool(asset_emergency_df.loc[date, s]):
+                            if normal_cooldown_bars > 0:
+                                asset_cooldown_until[s] = max(
+                                    asset_cooldown_until[s],
+                                    t + 1 + normal_cooldown_bars,
+                                )
+                        entry_signal_bars[s] = 0
+                        expansion_signal_bars[s] = 0
+                        asset_entry_price[s] = None
+                        asset_peak_price[s] = None
 
         daily_weights = _fill_out_columns(daily_weights, symbols)
         return _sparse_from_daily(daily_weights)

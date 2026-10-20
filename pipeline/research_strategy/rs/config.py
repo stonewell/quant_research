@@ -610,7 +610,7 @@ class StrategyConfig:
     cfsb_stop_mode: str = "atr_trailing"       # "atr_trailing", "fixed_pct", or "none"
     cfsb_stop_atr_mult: float = 4.5
     cfsb_adaptive_inertia: bool = True
-    cfsb_entry_threshold: float = 0.03
+    cfsb_entry_threshold: float = 0.05
     cfsb_asset_stop_cooldown_bars: int = 5
     cfsb_min_holding_bars: int = 2
     cfsb_min_entry_bars: int = 2

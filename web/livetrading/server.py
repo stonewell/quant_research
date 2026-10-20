@@ -238,6 +238,7 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
                 universe_key=payload.universe_key,
                 strategy_name=payload.strategy_name,
                 universe_name=payload.universe_name,
+                guard_latency_bars=payload.guard_latency_bars,
             )
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))

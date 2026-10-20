@@ -1396,6 +1396,52 @@ def test_parse_ticket_csv_detail_reason(tmp_path):
     assert records[0]["detail_reason"]["dimension_signals"]["trend"] == 0.6
 
 
+def test_run_strategy_request_guard_latency_bars():
+    """Verify RunDeployRequest and RunStrategyRequest models support guard_latency_bars."""
+    from web.livetrading.models import RunDeployRequest, RunStrategyRequest
+
+    req = RunDeployRequest(strategy_file="dummy.json")
+    assert req.guard_latency_bars == 2
+
+    req2 = RunStrategyRequest(strategy_file="dummy.json", guard_latency_bars=3)
+    assert req2.guard_latency_bars == 3
+
+
+def test_execution_service_passes_guard_latency_bars(temp_workspace, monkeypatch):
+    """Verify execution_service passes --guard-latency-bars to run_live_strategy.py."""
+    import subprocess
+    storage, temp_dir = temp_workspace
+    service = ExecutionService(storage=storage)
+
+    captured_cmds = []
+    def mock_run(cmd, *args, **kwargs):
+        captured_cmds.append(cmd)
+        class MockProc:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return MockProc()
+
+    monkeypatch.setattr(subprocess, "run", mock_run)
+
+    strat_file = os.path.join(temp_dir, "test_strat.json")
+    storage._save_json(strat_file, {"template_name": "dummy", "params": {}})
+
+    service.run_live_deploy(
+        strategy_file=strat_file,
+        custom_symbols=["600519.SH"],
+        as_of_date="2024-05-10",
+        portfolio_value=100000.0,
+        guard_latency_bars=4,
+    )
+
+    assert len(captured_cmds) == 1
+    assert "--guard-latency-bars" in captured_cmds[0]
+    idx = captured_cmds[0].index("--guard-latency-bars")
+    assert captured_cmds[0][idx + 1] == "4"
+
+
+
 
 
 

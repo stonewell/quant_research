@@ -28,7 +28,7 @@ Academic & Operational Grounding:
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 
@@ -257,6 +257,7 @@ class OrderNettingEngine:
         symbol_names: Optional[Dict[str, str]] = None,
         prior_sub_ledgers: Optional[Dict[str, Any]] = None,
         fx_rates: Optional[Dict[str, float]] = None,
+        emergency_symbols: Optional[Set[str]] = None,
     ) -> NettingResult:
         """Performs multi-strategy target aggregation, internal crossing, and netting.
 
@@ -272,6 +273,7 @@ class OrderNettingEngine:
             symbol_names: Optional mapping from ticker symbol to human Chinese company name.
             prior_sub_ledgers: Previous day virtual sub-ledgers for continuous tracking.
             fx_rates: Optional currency-to-RMB conversion rates {'CNY': 1.0, 'HKD': 0.92, 'USD': 7.20}.
+            emergency_symbols: Optional set of symbols with emergency / stop-loss liquidation intent.
 
         Returns:
             NettingResult with net tickets, crossed details, friction savings, and sub-ledgers.
@@ -301,6 +303,33 @@ class OrderNettingEngine:
                 raw_orders=intent.raw_orders,
                 meta=dict(intent.meta),
             ))
+
+        # Detect emergency stop-loss / risk-off liquidation symbols from arguments or sub-order tickets
+        active_emergency_symbols: Set[str] = set(
+            s.strip().upper() for s in (emergency_symbols or set()) if s
+        )
+        for it in normalized_intents:
+            if it.raw_orders:
+                for ord_item in it.raw_orders:
+                    sym_code = str(ord_item.get("symbol", "")).strip().upper()
+                    act = str(ord_item.get("action", "")).upper()
+                    rsn = str(ord_item.get("reason", ""))
+                    det = str(ord_item.get("detail_reason", ""))
+                    fast_p = str(ord_item.get("fast_path_triggered", "")).upper()
+                    is_stop_loss = (
+                        "-8%" in rsn
+                        or "止损" in rsn
+                        or "stop_loss" in rsn.lower()
+                        or "stop-loss" in rsn.lower()
+                        or "熔断" in rsn
+                        or "emergency" in rsn.lower()
+                        or "circuit_breaker" in rsn.lower()
+                        or "hard_stop" in det.lower()
+                        or "trailing_stop" in det.lower()
+                        or fast_p == "STOP_LOSS"
+                    )
+                    if sym_code and is_stop_loss and act in ("SELL", "HOLD_FILTERED"):
+                        active_emergency_symbols.add(sym_code)
 
         # 2. Gather all universe symbols across all strategies and master holdings
         all_symbols = set()
@@ -448,10 +477,14 @@ class OrderNettingEngine:
             delta_w = tgt_master_w - cur_master_w
             abs_delta_w = abs(delta_w)
 
-            # Tenure Lock Check: China A-shares strictly enforce T+1 tenure
+            # Tenure Lock Check: China A-shares strictly enforce statutory T+1 tenure
             held_age = bars_map.get(sym, min_holding_bars)
+            is_emergency = sym in active_emergency_symbols
             if market == MarketType.CHINA.value:
+                # Statutory China A-shares require holding at least until T+1 (held_age >= 1)
                 is_tenure_locked = (held_age < min_holding_bars) and (cur_master_shares > 0)
+                if is_emergency and held_age >= 1:
+                    is_tenure_locked = False
             else:
                 # HK and US markets are T+0 intraday settlement
                 is_tenure_locked = False
@@ -473,13 +506,16 @@ class OrderNettingEngine:
                     reason = f"未满最低持仓周期 (持仓 {held_age} 日 < {min_holding_bars} 日，锁仓防洗盘)"
                 else:
                     action = "SELL"
-                    reason = "多策略协同全额清仓 (已满持有期)"
+                    if is_emergency:
+                        reason = "紧急风控止损穿透清仓 (已满法定 T+1)"
+                    else:
+                        reason = "多策略协同全额清仓 (已满持有期)"
             elif abs_delta_w < 1e-6 or raw_delta_shares == 0:
                 action = "HOLD"
                 final_tgt_shares = cur_master_shares
                 final_delta_shares = 0
                 reason = "最优权重维持"
-            elif abs_delta_w < inertia_threshold:
+            elif abs_delta_w < inertia_threshold and not is_emergency:
                 action = "HOLD_FILTERED"
                 final_tgt_shares = cur_master_shares
                 final_delta_shares = 0
@@ -492,7 +528,10 @@ class OrderNettingEngine:
                     reason = f"未满最低持仓周期 (持仓 {held_age} 日 < {min_holding_bars} 日，锁仓防洗盘)"
                 else:
                     action = "SELL"
-                    reason = "多策略净额减仓"
+                    if is_emergency:
+                        reason = "紧急风控止损穿透减仓 (已满法定 T+1)"
+                    else:
+                        reason = "多策略净额减仓"
             elif raw_delta_shares > 0:
                 action = "BUY"
                 reason = "多策略净额加仓"
@@ -585,6 +624,7 @@ class OrderNettingEngine:
                     "lot_size": lot,
                     "currency": currency,
                     "reason": reason,
+                    "fast_path_triggered": "STOP_LOSS" if (is_emergency and action == "SELL") else None,
                 })
 
         # 7. Apply Global Master Purchasing Power Constraint
@@ -850,3 +890,68 @@ class OrderNettingEngine:
                 "last_updated": as_of_date,
             }
         return ledgers
+
+    def execute_netting(
+        self,
+        intents: List[SubStrategyIntent],
+        current_holdings: Dict[str, Any],
+        portfolio_value: float,
+        latest_prices: Dict[str, float],
+        as_of_date: Optional[str] = None,
+        holding_bars: Optional[Dict[str, int]] = None,
+        min_holding_bars: int = 2,
+        inertia_threshold: float = 0.05,
+        symbol_names: Optional[Dict[str, str]] = None,
+        prior_sub_ledgers: Optional[Dict[str, Any]] = None,
+        fx_rates: Optional[Dict[str, float]] = None,
+        emergency_symbols: Optional[Set[str]] = None,
+    ) -> NettingResult:
+        """Alias for net_portfolio_orders supporting hard stop-loss penetration."""
+        return self.net_portfolio_orders(
+            intents=intents,
+            current_holdings=current_holdings,
+            portfolio_value=portfolio_value,
+            latest_prices=latest_prices,
+            as_of_date=as_of_date,
+            holding_bars=holding_bars,
+            min_holding_bars=min_holding_bars,
+            inertia_threshold=inertia_threshold,
+            symbol_names=symbol_names,
+            prior_sub_ledgers=prior_sub_ledgers,
+            fx_rates=fx_rates,
+            emergency_symbols=emergency_symbols,
+        )
+
+
+def execute_netting(
+    intents: List[SubStrategyIntent],
+    current_holdings: Dict[str, Any],
+    portfolio_value: float,
+    latest_prices: Dict[str, float],
+    as_of_date: Optional[str] = None,
+    holding_bars: Optional[Dict[str, int]] = None,
+    min_holding_bars: int = 2,
+    inertia_threshold: float = 0.05,
+    symbol_names: Optional[Dict[str, str]] = None,
+    prior_sub_ledgers: Optional[Dict[str, Any]] = None,
+    fx_rates: Optional[Dict[str, float]] = None,
+    emergency_symbols: Optional[Set[str]] = None,
+    lot_size_default: int = 100,
+    cash_proxy: str = "BIL",
+) -> NettingResult:
+    """Convenience functional interface for OrderNettingEngine.net_portfolio_orders."""
+    engine = OrderNettingEngine(lot_size_default=lot_size_default, cash_proxy=cash_proxy)
+    return engine.net_portfolio_orders(
+        intents=intents,
+        current_holdings=current_holdings,
+        portfolio_value=portfolio_value,
+        latest_prices=latest_prices,
+        as_of_date=as_of_date,
+        holding_bars=holding_bars,
+        min_holding_bars=min_holding_bars,
+        inertia_threshold=inertia_threshold,
+        symbol_names=symbol_names,
+        prior_sub_ledgers=prior_sub_ledgers,
+        fx_rates=fx_rates,
+        emergency_symbols=emergency_symbols,
+    )

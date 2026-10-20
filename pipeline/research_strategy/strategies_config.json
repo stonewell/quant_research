@@ -386,7 +386,7 @@
       "cfsb_adaptive_inertia": true,
       "cfsb_stop_mode": "atr_trailing",
       "cfsb_stop_atr_mult": 4.5,
-      "cfsb_entry_threshold": 0.03,
+      "cfsb_entry_threshold": 0.05,
       "cfsb_asset_stop_cooldown_bars": 5,
       "cfsb_min_holding_bars": 2,
       "cfsb_min_entry_bars": 2,

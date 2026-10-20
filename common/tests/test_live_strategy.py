@@ -300,6 +300,16 @@ def test_parse_args_anti_whipsaw_options():
     assert args.reentry_cooldown_bars == 4
     assert args.min_entry_threshold == pytest.approx(0.05)
     assert args.volume_breakout_mult == pytest.approx(2.0)
+    assert args.guard_latency_bars == 3
+
+    # Direct --guard-latency-bars sets both entry and exit confirm bars
+    args2 = parse_args([
+        "--strategy", "equal_weight",
+        "--guard-latency-bars", "4",
+    ])
+    assert args2.guard_latency_bars == 4
+    assert args2.entry_confirm_bars == 4
+    assert args2.exit_confirm_bars == 4
 
 
 def test_exit_confirmation_streak_protection_and_hard_stop(tmp_path, monkeypatch):
@@ -362,6 +372,9 @@ def test_exit_confirmation_streak_protection_and_hard_stop(tmp_path, monkeypatch
     with open(state_file, "r", encoding="utf-8") as f:
         st_d1 = json.load(f)
     assert st_d1["zero_target_streak"]["601398.SH"] == 1
+    assert "lifecycle_states" in st_d1
+    assert st_d1["lifecycle_states"]["601398.SH"]["state"] == "PENDING_EXIT"
+    assert st_d1["lifecycle_states"]["601398.SH"]["exit_streak"] == 1
 
     # --- Day 2 Execution: zero_target_streak is 1 -> increments to 2 (>= 2) ---
     with patch.object(EqualWeightAllocation, "generate_weights", mock_gen):
@@ -379,6 +392,9 @@ def test_exit_confirmation_streak_protection_and_hard_stop(tmp_path, monkeypatch
     with open(state_file, "r", encoding="utf-8") as f:
         st_d2 = json.load(f)
     assert "601398.SH" not in st_d2["zero_target_streak"]
+    assert "lifecycle_states" in st_d2
+    assert st_d2["lifecycle_states"]["601398.SH"]["state"] == "COOLDOWN"
+    assert st_d2["lifecycle_states"]["601398.SH"]["last_exit_type"] == "NORMAL"
 
     # --- Hard Stop Scenario: -8% loss penetrates confirmation immediately on Day 1 ---
     with open(state_file, "w", encoding="utf-8") as f:

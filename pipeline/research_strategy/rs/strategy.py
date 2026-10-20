@@ -1114,6 +1114,10 @@ class AdaptiveGridStrategy(AllocationTemplate):
 
                 raw[i] = min(1.0, sum(slot_state) * position_size_pct)
 
+                if cooldown_until >= 0 and i == cooldown_until + 1:
+                    # Unfreeze from stop cooldown: reset peak equity to clear stale drawdown
+                    peak_equity = notional_equity
+
                 if i > 0 and pd.notna(close.iloc[i - 1]) and close.iloc[i - 1] > 0:
                     day_ret = c / close.iloc[i - 1] - 1.0
                     notional_equity *= (1.0 + raw[i - 1] * day_ret)
@@ -1124,6 +1128,7 @@ class AdaptiveGridStrategy(AllocationTemplate):
                     slot_state = [False] * len(slot_state)
                     raw[i] = 0.0
                     cooldown_until = i + cooldown_bars_after_stop
+                    peak_equity = notional_equity
 
             raw_weights[sym] = pd.Series(raw, index=close.index).reindex(master_index).fillna(0.0).to_numpy()
 

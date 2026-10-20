@@ -2429,10 +2429,16 @@
                 dimEntries.forEach(([dName, dWeight]) => {
                     const wVal = parseFloat(dWeight) || 0;
                     const pct = (wVal * 100).toFixed(1);
-                    const tag = wVal > 0.05
-                        ? '<span class="badge badge-go">积极做多</span>'
-                        : (wVal > 0.0 ? '<span class="badge badge-sweep">轻度配置</span>' : '<span class="badge badge-hold">空仓/防守</span>');
-                    dTable += `<tr><td><code style="color: #cbd5e1;">${dName}</code></td><td class="font-mono"><strong>${pct}%</strong></td><td>${tag}</td></tr>`;
+                    if (dName === "macro_breadth_thrust") {
+                        const titleHtml = `<code style="color: #38bdf8;">🚀 宏观动量冲力预部署 (Macro Breadth Thrust)</code><div class="text-muted" style="font-size: 11px; margin-top: 2px;">大盘动量冲力 ≥ 60% 时，将闲置资金自动配置于 20日 ROC 强势龙头，杜绝现金拖累。</div>`;
+                        const tag = '<span class="badge badge-go">牛市冲力扫单</span>';
+                        dTable += `<tr><td>${titleHtml}</td><td class="font-mono"><strong>${pct}%</strong></td><td>${tag}</td></tr>`;
+                    } else {
+                        const tag = wVal > 0.05
+                            ? '<span class="badge badge-go">积极做多</span>'
+                            : (wVal > 0.0 ? '<span class="badge badge-sweep">轻度配置</span>' : '<span class="badge badge-hold">空仓/防守</span>');
+                        dTable += `<tr><td><code style="color: #cbd5e1;">${dName}</code></td><td class="font-mono"><strong>${pct}%</strong></td><td>${tag}</td></tr>`;
+                    }
                 });
                 dTable += '</tbody></table>';
                 el.modalDimensionSignals.innerHTML = dTable;
@@ -2447,13 +2453,77 @@
             const st = dr.sector_throttle || {};
             const mg = dr.macro_gate || {};
 
+            // UPLSM Lifecycle State & Fast-Path detection
+            const ls = dr.lifecycle_state || ticket.lifecycle_state || {};
+            const rawState = ls.state || dr.state_after || ticket.state_after || dr.uplsm_state || ticket.uplsm_state || dr.position_state || ticket.position_state || "";
+            const validUplsmStates = ["HELD_GESTATION", "HELD_ACTIVE", "COOLDOWN", "PENDING_ENTRY", "PENDING_EXIT", "FLAT"];
+            const uplsmState = validUplsmStates.includes(rawState) ? rawState : (rawState && validUplsmStates.find(s => rawState.toUpperCase().includes(s)) || "");
+            const fastPath = dr.fast_path_triggered || ticket.fast_path_triggered || (dr.lifecycle_decision && dr.lifecycle_decision.fast_path_triggered) || "";
+
+            let bannerHtml = '';
+            if (uplsmState || fastPath) {
+                let badgeClass = "badge-hold";
+                let stateNameCn = uplsmState;
+                if (uplsmState === "HELD_ACTIVE") {
+                    badgeClass = "badge-go";
+                    stateNameCn = "成熟持仓 (HELD_ACTIVE)";
+                } else if (uplsmState === "HELD_GESTATION") {
+                    badgeClass = "badge-sweep";
+                    stateNameCn = "培育观察期 (HELD_GESTATION)";
+                } else if (uplsmState === "COOLDOWN") {
+                    badgeClass = "badge-caution";
+                    stateNameCn = "冷却冷静期 (COOLDOWN)";
+                } else if (uplsmState === "PENDING_ENTRY") {
+                    badgeClass = "badge-sweep";
+                    stateNameCn = "入场确认中 (PENDING_ENTRY)";
+                } else if (uplsmState === "PENDING_EXIT") {
+                    badgeClass = "badge-caution";
+                    stateNameCn = "离场确认中 (PENDING_EXIT)";
+                } else if (uplsmState === "FLAT") {
+                    badgeClass = "badge-hold";
+                    stateNameCn = "空仓观察 (FLAT)";
+                }
+
+                bannerHtml = '<div style="display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px; padding: 10px 14px; background: rgba(30, 41, 59, 0.7); border-radius: 6px; border-left: 3px solid #38bdf8;">';
+                if (uplsmState) {
+                    bannerHtml += `<div><span style="color: #94a3b8; font-size: 12px; margin-right: 6px;">生命周期状态:</span><span class="badge ${badgeClass} font-mono">${stateNameCn}</span></div>`;
+                }
+                if (fastPath) {
+                    const fpText = fastPath === "VOLUME_BREAKOUT" ? "放量突破闪电入场 (0-delay)" : (fastPath === "STOP_LOSS" ? "硬止损/跟踪止损紧急避险 (0-delay)" : fastPath);
+                    bannerHtml += `<div><span style="color: #94a3b8; font-size: 12px; margin-right: 6px;">风控穿透快通道:</span><span class="badge badge-nogo font-mono" style="background: rgba(239, 68, 68, 0.2); border: 1px solid #ef4444; color: #fca5a5;">⚡ ${fpText}</span></div>`;
+                }
+                bannerHtml += '</div>';
+            }
+
             let rHtml = '<table class="order-detail-table"><thead><tr><th>风控门禁检查项</th><th>当前指标值</th><th>规则基准 / 阈值</th><th>门禁判定</th></tr></thead><tbody>';
+
+            // UPLSM Lifecycle State Row (if present)
+            if (uplsmState) {
+                const barsHeld = ls.held_bars !== undefined ? ls.held_bars : (ticket.holding_bars || 0);
+                const cdRemaining = ls.cooldown_remaining !== undefined ? ls.cooldown_remaining : (cd.cooldown_remaining || 0);
+                let metricInfo = `状态: ${uplsmState}`;
+                if (uplsmState === "HELD_GESTATION" || uplsmState === "HELD_ACTIVE") {
+                    metricInfo += ` (已持仓 ${barsHeld} 日)`;
+                } else if (uplsmState === "COOLDOWN") {
+                    metricInfo += ` (剩余冷却 ${cdRemaining} 日)`;
+                }
+                let stBadge = uplsmState === "COOLDOWN" ? '<span class="badge badge-caution">冷却防追高</span>' : (uplsmState === "HELD_ACTIVE" ? '<span class="badge badge-go">活跃持仓</span>' : `<span class="badge badge-sweep">${uplsmState}</span>`);
+                rHtml += `<tr><td><strong>生命周期状态机 (UPLSM)</strong></td><td class="font-mono">${metricInfo}</td><td class="font-mono">6 状态有限状态机</td><td>${stBadge}</td></tr>`;
+            }
+
+            // Fast-Path Row (if present)
+            if (fastPath) {
+                rHtml += `<tr><td><strong>非对称快通道 (Fast-Path Gating)</strong></td><td class="font-mono" style="color: #f87171;">⚡ ${fastPath}</td><td class="font-mono">0-Delay 闪电穿透 (守 A 股 T+1)</td><td><span class="badge badge-nogo">已激活快通道</span></td></tr>`;
+            }
 
             // 1. Inertia Check
             const dPct = (Math.abs(ic.delta_weight !== undefined ? ic.delta_weight : (ticket.delta_weight || 0)) * 100).toFixed(1);
             const thPct = (((ic.threshold !== undefined ? ic.threshold : 0.05)) * 100).toFixed(1);
             const icTriggered = ic.triggered !== undefined ? ic.triggered : (Math.abs(ticket.delta_weight || 0) >= 0.05);
-            rHtml += `<tr><td><strong>换手惰性过滤 (Turnover Inertia)</strong></td><td class="font-mono">调仓变动: ${dPct}%</td><td class="font-mono">阈值: &ge; ${thPct}%</td><td>${icTriggered ? '<span class="badge badge-go">突破阈值 (触发调仓)</span>' : '<span class="badge badge-caution">未超阈值 (惰性过滤)</span>'}</td></tr>`;
+            const icBadge = icTriggered
+                ? '<span class="badge badge-go">突破阈值 (触发调仓)</span>'
+                : `<span class="badge badge-caution">🛡️ 未超 ${thPct}% 惰性门槛 (已拦截过滤)</span>`;
+            rHtml += `<tr><td><strong>换手惰性过滤 (Turnover Inertia)</strong></td><td class="font-mono">调仓变动: ${dPct}%</td><td class="font-mono">阈值: &ge; ${thPct}%</td><td>${icBadge}</td></tr>`;
 
             // 2. Holding Lock
             const barsHeld = hl.bars_held !== undefined ? hl.bars_held : (ticket.holding_bars || 0);
@@ -2482,7 +2552,7 @@
             rHtml += `<tr><td><strong>宏观与账户健康门禁 (Health Gate)</strong></td><td class="font-mono">宽度: ${bPct}%, 冲力: ${tPct}%</td><td>Stage 1 门禁指令</td><td>${mgPassed ? '<span class="badge badge-go">门禁准许 (GO)</span>' : '<span class="badge badge-nogo">熔断拦截 (HALT)</span>'}</td></tr>`;
 
             rHtml += '</tbody></table>';
-            el.modalRiskChecks.innerHTML = rHtml;
+            el.modalRiskChecks.innerHTML = bannerHtml + rHtml;
         }
 
         // 6. Lot Rounding & Execution Sizing

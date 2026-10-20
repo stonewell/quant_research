@@ -259,13 +259,21 @@ def _step_asset_inertia(
     diff = ideal_w[risky_symbols] - current_w[risky_symbols]
     sells_raw = diff[diff <= -sell_thresh].index.tolist()
 
-    # Suppress sells if asset holding tenure or time since last buy is below min_holding_bars (unless emergency)
+    # Suppress sells if asset holding tenure is below min_holding_bars (unless emergency)
+    # Note: Incremental adds to an existing mother position do not reset the mother position's holding tenure lock.
     sells = []
     for s in sells_raw:
         if symbol_emergency.get(s, False):
             sells.append(s)
-        elif min_holding_bars > 0 and (holding_age[s] < min_holding_bars or (t - last_buy_bar[s]) < min_holding_bars):
-            pass
+        elif min_holding_bars > 0:
+            if holding_age[s] < min_holding_bars:
+                # Mother position has not elapsed min_holding_bars: suppress all sells
+                pass
+            elif ideal_w[s] > 1e-4 and (t - last_buy_bar[s]) < min_holding_bars:
+                # Partial trimming of a recently added position (< min_holding_bars): suppress trim
+                pass
+            else:
+                sells.append(s)
         else:
             sells.append(s)
 

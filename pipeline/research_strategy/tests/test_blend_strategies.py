@@ -695,3 +695,211 @@ def test_base_blend_causal_adaptive_inertia_no_future_vol_lookahead():
     w_shocked = strat.generate_weights(univ_shocked).iloc[:cutoff]
 
     pd.testing.assert_frame_equal(w_trunc, w_shocked)
+
+
+def test_base_blend_uplsm_fast_path_and_cooldown_parity():
+    """Validates UPLSM Phase 3 parity features in BaseBlendAllocationStrategy:
+    1. Day 1 entry bypass requires strict confluence of volume breakout (V >= 1.5 * MA20) AND market breadth >= 0.60
+    2. Expansion bypass on volume breakout
+    3. Normal strategic exit 1-bar rotation cooldown
+    """
+    class DummySubStrategy:
+        def __init__(self, target_df):
+            self.target_df = target_df
+        def generate_weights(self, universe, params=None):
+            return self.target_df
+
+    class DummyUPLSMBlend(BaseBlendAllocationStrategy):
+        name = "dummy_uplsm_blend"
+        def __init__(self, target_df, config=None):
+            super().__init__(config=config)
+            self._target_df = target_df
+        def get_sub_strategies(self, universe, params=None):
+            return {"dummy": DummySubStrategy(self._target_df)}
+        def get_sub_strategy_weights(self, params=None):
+            return {"dummy": 1.0}
+
+    n_days = 80
+    dates = pd.bdate_range("2020-01-01", periods=n_days)
+    t = np.arange(n_days)
+
+    # Base down-trending universe: breadth is 0.0 after warmup
+    close_down = 100.0 - 0.05 * t
+    df_down = make_ohlcv_from_closes(close_down)
+    df_down.index = dates
+    df_down["Volume"] = 1000.0
+
+    df_bil = make_ohlcv_from_closes(np.full(n_days, 100.0))
+    df_bil.index = dates
+    df_bil["Volume"] = 1000.0
+
+    univ_down = {
+        "S1": df_down.copy(),
+        "BIL": df_bil.copy(),
+    }
+
+    # Case 1: Standard entry confirmation without fast-path (min_entry_bars=2)
+    # Downward trend -> breadth is 0.0 < 0.60; Volume is flat 1000.0 -> no volume breakout.
+    # Signal appears at index 55 for 1 bar only -> should be suppressed on Day 1
+    sig_1d = pd.DataFrame(0.0, index=dates, columns=["S1", "BIL"])
+    sig_1d.iloc[55, 0] = 0.20
+    strat_1 = DummyUPLSMBlend(sig_1d)
+    w1 = strat_1.generate_weights(univ_down, {
+        "min_entry_bars": 2,
+        "normal_cooldown_bars": 1,
+        "breadth_lookback": 50,
+    }).ffill().fillna(0.0)
+    assert w1.iloc[55]["S1"] == 0.0, "Day 1 transient signal should be suppressed when no fast-path"
+
+    # Case 2: Volume breakout alone without breadth thrust (breadth = 0.0 < 0.60)
+    # Volume spikes to 2000.0 on Day 1 (2.0x MA20), but no macro thrust -> suppressed under strict confluence!
+    univ_vol = {s: d.copy() for s, d in univ_down.items()}
+    univ_vol["S1"].iloc[55, univ_vol["S1"].columns.get_loc("Volume")] = 2000.0
+    strat_2 = DummyUPLSMBlend(sig_1d)
+    w2 = strat_2.generate_weights(univ_vol, {
+        "min_entry_bars": 2,
+        "normal_cooldown_bars": 1,
+        "breadth_lookback": 50,
+    }).ffill().fillna(0.0)
+    assert w2.iloc[55]["S1"] == 0.0, "Volume breakout alone without breadth thrust should be suppressed!"
+
+    # Case 3: Market Breadth alone without volume breakout
+    # Up-trending universe: close > 50d SMA at index 55 -> breadth = 1.0 >= 0.60, but Volume is flat 1000.0
+    close_up = 100.0 + 0.05 * t
+    df_up = make_ohlcv_from_closes(close_up)
+    df_up.index = dates
+    df_up["Volume"] = 1000.0
+    univ_up = {"S1": df_up.copy(), "BIL": df_bil.copy()}
+
+    strat_3 = DummyUPLSMBlend(sig_1d)
+    w3 = strat_3.generate_weights(univ_up, {
+        "min_entry_bars": 2,
+        "normal_cooldown_bars": 1,
+        "breadth_lookback": 50,
+    }).ffill().fillna(0.0)
+    assert w3.iloc[55]["S1"] == 0.0, "Breadth thrust alone without volume breakout should be suppressed!"
+
+    # Case 3b: Strict Confluence: BOTH Volume Breakout (2.0x MA20) AND Market Breadth (>= 0.60) -> immediate Day 1 fast path!
+    univ_confluence = {s: d.copy() for s, d in univ_up.items()}
+    univ_confluence["S1"].iloc[55, univ_confluence["S1"].columns.get_loc("Volume")] = 2000.0
+    strat_confluence = DummyUPLSMBlend(sig_1d)
+    w_confluence = strat_confluence.generate_weights(univ_confluence, {
+        "min_entry_bars": 2,
+        "normal_cooldown_bars": 1,
+        "breadth_lookback": 50,
+    }).ffill().fillna(0.0)
+    assert w_confluence.iloc[55]["S1"] > 0.0, "Day 1 signal should execute on strict confluence of volume and breadth!"
+
+    # Case 4: Expansion volume breakout bypass
+    # Position held at 0.10, demands expansion to 0.20 on index 56
+    sig_exp = pd.DataFrame(0.0, index=dates, columns=["S1", "BIL"])
+    sig_exp.iloc[55:60, 0] = 0.10
+    sig_exp.iloc[56, 0] = 0.20  # Spike on day 56
+
+    # 4a. Without volume breakout on down-trending market: expansion suppressed on Day 1
+    strat_exp_normal = DummyUPLSMBlend(sig_exp)
+    w_exp_normal = strat_exp_normal.generate_weights(univ_down, {
+        "min_entry_bars": 2,
+        "min_weight_change": 0.05,
+        "breadth_lookback": 50,
+    }).ffill().fillna(0.0)
+    # At index 56, should be suppressed to prev_w (which was 0.0 because index 55 had no fast path)
+    # Let's ensure index 55 was confirmed by giving 2 bars of entry signal before expansion:
+    sig_exp2 = pd.DataFrame(0.0, index=dates, columns=["S1", "BIL"])
+    sig_exp2.iloc[54:60, 0] = 0.10
+    sig_exp2.iloc[56, 0] = 0.20  # Demands expansion on day 56 (held since day 55)
+
+    w_exp_suppressed = DummyUPLSMBlend(sig_exp2).generate_weights(univ_down, {
+        "min_entry_bars": 2,
+        "min_weight_change": 0.05,
+        "breadth_lookback": 50,
+    }).ffill().fillna(0.0)
+    assert np.isclose(w_exp_suppressed.iloc[56]["S1"], 0.10), "Expansion without volume surge should be suppressed to prev_w"
+
+    # 4b. With volume breakout on day 56: expansion allowed immediately!
+    univ_exp_vol = {s: d.copy() for s, d in univ_down.items()}
+    univ_exp_vol["S1"].iloc[56, univ_exp_vol["S1"].columns.get_loc("Volume")] = 2500.0  # Surge!
+    w_exp_surge = DummyUPLSMBlend(sig_exp2).generate_weights(univ_exp_vol, {
+        "min_entry_bars": 2,
+        "min_weight_change": 0.05,
+        "breadth_lookback": 50,
+    }).ffill().fillna(0.0)
+    assert w_exp_surge.iloc[56]["S1"] > 0.15, "Expansion with volume surge should be allowed immediately!"
+
+    # Case 5: Normal Strategic Exit 1-bar rotation cooldown
+    # Position held on days 54-56. Exits to 0.0 on day 57.
+    # Attempts immediate re-entry on day 58.
+    sig_exit = pd.DataFrame(0.0, index=dates, columns=["S1", "BIL"])
+    sig_exit.iloc[54:57, 0] = 0.20
+    sig_exit.iloc[57, 0] = 0.0      # Exit on day 57
+    sig_exit.iloc[58:62, 0] = 0.20  # Re-entry attempt on day 58
+
+    strat_exit = DummyUPLSMBlend(sig_exit)
+    w_exit = strat_exit.generate_weights(univ_up, {
+        "min_entry_bars": 1,
+        "normal_cooldown_bars": 1,
+        "min_holding_bars": 1,
+        "min_weight_change": 0.02,
+        "breadth_lookback": 50,
+    }).ffill().fillna(0.0)
+
+    assert w_exit.iloc[56]["S1"] > 0.0, "Held on day 56"
+    assert w_exit.iloc[57]["S1"] == 0.0, "Exited on day 57"
+    assert w_exit.iloc[58]["S1"] == 0.0, "Day 58 must be blocked by normal_cooldown_bars=1!"
+    assert w_exit.iloc[59]["S1"] > 0.0, "Day 59 cooldown expired, re-entry permitted!"
+
+
+def test_base_blend_uplsm_sector_incumbent_stop_unlock():
+    """Validates that an incumbent that triggers a stop-loss is NOT locked in locked_incumbents,
+    allowing an outside challenger in the same sector to enter without being blocked by sector limits.
+    """
+    class DummyThrustBlend(BaseBlendAllocationStrategy):
+        name = "dummy_thrust_blend"
+        def get_sub_strategies(self, universe, params=None):
+            return {}
+        def get_sub_strategy_weights(self, params=None):
+            return {}
+
+    n_days = 80
+    dates = pd.bdate_range("2020-01-01", periods=n_days)
+    t = np.arange(n_days)
+
+    # Two assets in same sector 'sec_60'
+    close_a = 100.0 + 0.10 * t
+    df_a = make_ohlcv_from_closes(close_a)
+    df_a.index = dates
+    df_a["Volume"] = 1000.0
+
+    close_b = 100.0 + 0.10 * t
+    df_b = make_ohlcv_from_closes(close_b)
+    df_b.index = dates
+    df_b["Volume"] = 1000.0
+
+    df_bil = make_ohlcv_from_closes(np.full(n_days, 100.0))
+    df_bil.index = dates
+    df_bil["Volume"] = 1000.0
+
+    # On day 55, stock A plunges to trigger fixed_pct stop loss
+    df_a.iloc[55, df_a.columns.get_loc("Close")] = 80.0
+    df_a.iloc[55, df_a.columns.get_loc("Low")] = 79.0
+
+    universe = {
+        "601225.SH": df_a,
+        "601857.SH": df_b,
+        "BIL": df_bil,
+    }
+
+    strat = DummyThrustBlend()
+    # Execute with preemptive thrust deployment enabled and max 1 asset per sector
+    w = strat.generate_weights(universe, {
+        "stop_mode": "fixed_pct",
+        "min_holding_bars": 5,
+        "preemptive_thrust_deployment": True,
+        "max_assets_per_sector": 1,
+        "breadth_lookback": 20,
+    }).ffill().fillna(0.0)
+
+    # On day 55, 601225.SH is stopped out
+    assert w.iloc[55]["601225.SH"] == 0.0
+
+

@@ -103,6 +103,11 @@ class RunDeployRequest(BaseModel):
     current_holdings: Optional[Dict[str, Any]] = None
     data_provider: Optional[str] = None
     lot_size: Optional[int] = None
+    guard_latency_bars: int = Field(2, description="UPLSM entry confirmation latency guard bars (default 2)")
+
+
+# Harmonized alias for Stage 2 live strategy request
+RunStrategyRequest = RunDeployRequest
 
 
 class QuotesRequestModel(BaseModel):
