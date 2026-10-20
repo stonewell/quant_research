@@ -53,6 +53,7 @@ _REPO_ROOT = _find_repo_root()
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from common.data import get_data_provider
 from common.cli_utils import (
     add_data_provider_cli_args,
     build_data_kwargs,
@@ -153,6 +154,21 @@ def parse_args(args: Optional[List[str]] = None):
         "--auto-run-stage2",
         action="store_true",
         help="If set and gate directive is GO/CAUTION, automatically run Stage 2 execution runner (scripts/run_live_strategy.py)",
+    )
+    parser.add_argument(
+        "--enable-intraday-5m",
+        action="store_true",
+        help="Enable 5-minute intraday mark-to-market drawdown, VWAP breadth, and afternoon distribution gates",
+    )
+    parser.add_argument(
+        "--cutoff-time",
+        default="14:00",
+        help="Intraday cutoff time for Stage 1 health gate (default: 14:00, 36 5m bars)",
+    )
+    parser.add_argument(
+        "--current-holdings-file",
+        default=None,
+        help="Path to current holdings JSON file for mark-to-market intraday NAV tracking",
     )
     add_data_provider_cli_args(parser, default_provider="synthetic")
     parsed = parser.parse_args(args)
@@ -490,6 +506,36 @@ def evaluate_realized_volatility(
 
     scale = min(1.0, target_vol / vol_21d) if vol_21d > 0 else 1.0
     active_model = "Garman-Klass (1980)" if (gk_count > 0 and vol_model == "garman_klass") else "Close-to-Close"
+
+    # Downside semivariance & jump check
+    downside_estimates = []
+    signed_jumps = []
+    for sym, df in universe.items():
+        if sym == cash_proxy or df.empty:
+            continue
+        if "RS_Down_5m" in df.columns:
+            rs_down_s = df["RS_Down_5m"].dropna()
+            if len(rs_down_s) >= 5:
+                down_vol = float(np.sqrt(252.0 * (2.0 * rs_down_s).iloc[-21:].mean()))
+                if not np.isnan(down_vol) and down_vol > 0:
+                    downside_estimates.append(down_vol)
+        if "Signed_Jump_5m" in df.columns:
+            sj = df["Signed_Jump_5m"].dropna()
+            if len(sj) > 0:
+                signed_jumps.append(float(sj.iloc[-1]))
+
+    if downside_estimates:
+        downside_vol_21d = float(np.median(downside_estimates))
+        med_jump = float(np.median(signed_jumps)) if signed_jumps else 0.0
+        if med_jump >= 0.0:
+            eff_vol = downside_vol_21d
+            active_model = "5m Downside Semivariance (Patton & Sheppard 2015)"
+        else:
+            eff_vol = max(vol_21d, downside_vol_21d)
+            active_model = "Garman-Klass / Downside Vol Max"
+        scale = min(1.0, target_vol / eff_vol) if eff_vol > 0 else 1.0
+        vol_21d = eff_vol
+
     return {
         "realized_vol_21d": vol_21d,
         "target_vol": target_vol,
@@ -503,6 +549,7 @@ def resolve_gate_directive(
     dd_info: Dict[str, Any],
     macro_info: Dict[str, Any],
     vol_info: Dict[str, Any],
+    intraday_5m_info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str, List[str]]:
     """Synthesize health checks into an actionable trading gate directive."""
     actions = []
@@ -534,21 +581,34 @@ def resolve_gate_directive(
         actions.append(f"Scale equity exposure to {dd_info['linear_equity_scale']:.1%} of standard model weights.")
         actions.append("Sweep released capital into Cash Proxy; execute SELLS FIRST.")
     else:
-        # Normal
-        code = "GO"
-        if macro_info["thrust_active"]:
-            headline = "🟢 GO: RAPID REBOUND / BREADTH THRUST MODE ACTIVE"
-            actions.append(f"10-Day Momentum Thrust Active ({macro_info['thrust']:.1%} >= {macro_info['thrust_thresh']:.0%}).")
-            actions.append(f"Bull exposure scaled up to {macro_info['target_exposure']:.0%}, dispersed across >= 5 leaders.")
-            actions.append("Strictly maintain 20% single-stock ceiling across all assets.")
-        elif macro_info["breadth_active"]:
-            headline = "🟢 GO: STEADY BULL BREADTH REGIME"
-            actions.append(f"50-Day Market Breadth Active ({macro_info['breadth']:.1%} >= {macro_info['breadth_thresh']:.0%}).")
-            actions.append(f"Target equity exposure dynamically deployed up to {macro_info['target_exposure']:.0%}.")
+        # Evaluate intraday afternoon distribution and trough alerts
+        if intraday_5m_info and intraday_5m_info.get("distribution_alert"):
+            code = "CAUTION_INTRADAY_DISTRIBUTION"
+            headline = "🟡 CAUTION: INTRADAY AFTERNOON DISTRIBUTION DETECTED"
+            actions.append("Intraday Afternoon Distribution: Morning breakout failed with afternoon volume dump.")
+            actions.append("Stage 2 BUY orders will be scaled down to 50% (intraday_buy_scale = 0.50). SELLS execute normally.")
+        elif intraday_5m_info and intraday_5m_info.get("trough_alert"):
+            code = "CAUTION_INTRADAY_TROUGH"
+            headline = "🟡 CAUTION: INTRADAY NAV FLASH DRAWDOWN DETECTED"
+            dd_tr = intraday_5m_info.get("dd_trough", 0.0)
+            actions.append(f"Intraday mark-to-market trough drawdown reached {abs(dd_tr):.1%}, exceeding tactical defense line.")
+            actions.append("Diagnostic warning only (R5 backtest parity): monitoring intraday volatility without forced tier escalation.")
         else:
-            headline = "🟢 GO: CONSERVATIVE / SELECTIVE MARKET REGIME"
-            actions.append("Standard unscaled allocation (40%–60% equity, balance in Cash Proxy).")
-            actions.append("Standard 20% single-stock cap strictly applied.")
+            # Normal
+            code = "GO"
+            if macro_info["thrust_active"]:
+                headline = "🟢 GO: RAPID REBOUND / BREADTH THRUST MODE ACTIVE"
+                actions.append(f"10-Day Momentum Thrust Active ({macro_info['thrust']:.1%} >= {macro_info['thrust_thresh']:.0%}).")
+                actions.append(f"Bull exposure scaled up to {macro_info['target_exposure']:.0%}, dispersed across >= 5 leaders.")
+                actions.append("Strictly maintain 20% single-stock ceiling across all assets.")
+            elif macro_info["breadth_active"]:
+                headline = "🟢 GO: STEADY BULL BREADTH REGIME"
+                actions.append(f"50-Day Market Breadth Active ({macro_info['breadth']:.1%} >= {macro_info['breadth_thresh']:.0%}).")
+                actions.append(f"Target equity exposure dynamically deployed up to {macro_info['target_exposure']:.0%}.")
+            else:
+                headline = "🟢 GO: CONSERVATIVE / SELECTIVE MARKET REGIME"
+                actions.append("Standard unscaled allocation (40%–60% equity, balance in Cash Proxy).")
+                actions.append("Standard 20% single-stock cap strictly applied.")
 
     if vol_info["vol_elevated"]:
         actions.append(
@@ -570,6 +630,7 @@ def print_dashboard(
     gate_code: str,
     gate_headline: str,
     actions: List[str],
+    intraday_5m_info: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Print an executive-level pre-trade terminal dashboard."""
     print("=" * 110)
@@ -618,6 +679,16 @@ def print_dashboard(
     print(f"  21-Day Realized Vol   : {vol_info['realized_vol_21d']:>6.1%} (Target Vol: {vol_info['target_vol']:>5.1%}{vol_mod_lbl}) | {v_status}")
     print(f"  Volatility Scaling    : {vol_info['vol_scaling_factor']:>6.2f}x")
 
+    if intraday_5m_info and intraday_5m_info.get("enabled"):
+        print("\n[4. 5-MINUTE INTRADAY MICROSTRUCTURE & MARK-TO-MARKET (14:00)]")
+        print(f"  Intraday VWAP Breadth : {intraday_5m_info['intraday_vwap_breadth']:>6.1%} (Threshold: 25.0%)")
+        print(f"  Afternoon Return Mean : {intraday_5m_info['afternoon_return_mean']:>+6.2%} (Breakdown Ratio: {intraday_5m_info['afternoon_vwap_breakdown_ratio']:.1%})")
+        print(f"  Intraday Trough DD    : {intraday_5m_info['dd_trough']:>11.2%} (Intraday Peak: ¥{intraday_5m_info['hwm_intra']:,.2f})")
+        if intraday_5m_info.get("distribution_alert"):
+            print("  ⚠️ ALERT              : Afternoon Distribution detected! Stage 2 BUY budget halved (intraday_buy_scale=0.5).")
+        if intraday_5m_info.get("trough_alert"):
+            print("  ⚠️ ALERT              : Intraday Flash Trough Drawdown breached tactical defense line.")
+
     # 4. Directive & Trader Instructions
     print("-" * 110)
     print(f"FINAL PRE-TRADE DIRECTIVE : {gate_headline}")
@@ -638,6 +709,7 @@ def generate_reports(
     gate_code: str,
     gate_headline: str,
     actions: List[str],
+    intraday_5m_info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str]:
     """Generate and write structured JSON and Markdown summary reports."""
     os.makedirs(output_dir, exist_ok=True)
@@ -655,6 +727,7 @@ def generate_reports(
         "portfolio_health": dd_info,
         "market_macro": macro_info,
         "volatility_targeting": vol_info,
+        "intraday_5m_metrics": intraday_5m_info,
         "trader_actions": actions,
     }
 
@@ -730,8 +803,8 @@ def generate_reports(
     return json_path, md_path
 
 
-def main():
-    args = parse_args()
+def main(cli_args: Optional[List[str]] = None):
+    args = parse_args(cli_args)
     as_of_date = args.as_of_date or date.today().isoformat()
     if getattr(args, "start_date", None):
         start_date = args.start_date
@@ -814,12 +887,149 @@ def main():
         as_of_date=as_of_date,
     )
 
-    # 4. Evaluate Universe Breadth, Thrust & Volatility
+    # 4. Evaluate Universe Breadth, Thrust & Volatility (and optional 5m Intraday Enrichment)
+    intraday_5m_info = None
+    if getattr(args, "enable_intraday_5m", False):
+        try:
+            from common.intraday_features import (
+                IntradayFeatureConfig,
+                load_intraday_5m_universe,
+                enrich_universe_with_intraday_features,
+            )
+            provider = get_data_provider(args.data_provider, **build_data_kwargs(args))
+            cutoff_t = getattr(args, "cutoff_time", "14:00") or "14:00"
+            universe_5m = load_intraday_5m_universe(
+                universe_symbols,
+                start=start_date,
+                end=as_of_date,
+                data_provider=provider,
+                cutoff_time=cutoff_t,
+            )
+            universe = enrich_universe_with_intraday_features(
+                universe, universe_5m, config=IntradayFeatureConfig(cutoff_time=cutoff_t), synthesize_intraday_bar=True
+            )
+
+            # Evaluate Afternoon Distribution & VWAP breadth
+            vwap_ok_count = 0
+            risky_count = 0
+            afternoon_rets = []
+            breakdown_count = 0
+            cash_proxy = params.get("cash_proxy", "BIL")
+            for sym in universe_symbols:
+                if sym == cash_proxy or sym not in universe:
+                    continue
+                df_sym = universe[sym]
+                if df_sym.empty:
+                    continue
+                risky_count += 1
+                row = df_sym.iloc[-1]
+                vwap_prem = float(row["VWAP_Prem_5m"]) if "VWAP_Prem_5m" in row and pd.notna(row["VWAP_Prem_5m"]) else 0.0
+                upvol = float(row["UpVol_Ratio_5m"]) if "UpVol_Ratio_5m" in row and pd.notna(row["UpVol_Ratio_5m"]) else 0.5
+                aft_ret = float(row["Afternoon_Ret_5m"]) if "Afternoon_Ret_5m" in row and pd.notna(row["Afternoon_Ret_5m"]) else 0.0
+
+                if vwap_prem >= 0.0 and upvol >= 0.50:
+                    vwap_ok_count += 1
+                afternoon_rets.append(aft_ret)
+                if vwap_prem < 0.0 and aft_ret < -0.01:
+                    breakdown_count += 1
+
+            intraday_vwap_breadth = vwap_ok_count / risky_count if risky_count > 0 else 0.5
+            afternoon_ret_mean = float(np.mean(afternoon_rets)) if afternoon_rets else 0.0
+            breakdown_ratio = breakdown_count / risky_count if risky_count > 0 else 0.0
+            distribution_alert = (intraday_vwap_breadth < 0.25) or (afternoon_ret_mean < -0.012 and breakdown_ratio >= 0.50)
+
+            # Intraday NAV trough evaluation (R5: Diagnostic only, do NOT overwrite peak_nav)
+            hwm_intra = float(dd_info["peak_nav"])
+            dd_trough = float(dd_info["drawdown_pct"])
+            trough_alert = False
+
+            # Load holdings to calculate mark-to-market NAV
+            holdings = {}
+            if getattr(args, "current_holdings_file", None) and os.path.exists(args.current_holdings_file):
+                try:
+                    with open(args.current_holdings_file, "r", encoding="utf-8") as f:
+                        holdings_data = json.load(f)
+                    if isinstance(holdings_data, dict):
+                        holdings = holdings_data.get("holdings", holdings_data)
+                except Exception as e:
+                    print(f"[WARN] Failed to read current_holdings_file: {e}")
+            elif state.get("current_holdings"):
+                holdings = state["current_holdings"]
+            elif state.get("positions"):
+                holdings = state["positions"]
+
+            if holdings and universe_5m:
+                ref_ts = None
+                for sym, df_5 in universe_5m.items():
+                    if not df_5.empty and sym in holdings:
+                        ts_sub = [idx for idx in df_5.index if str(idx.date()) == as_of_date and idx.time() <= pd.Timestamp(cutoff_t).time()]
+                        if len(ts_sub) > 0:
+                            ref_ts = ts_sub
+                            break
+
+                if ref_ts and len(ref_ts) > 0:
+                    nav_series = []
+                    for ts_bar in ref_ts:
+                        bar_nav = 0.0
+                        total_weight = 0.0
+                        for sym, pos_val in holdings.items():
+                            shares = 0
+                            weight = 0.0
+                            if isinstance(pos_val, (int, float)):
+                                if pos_val > 1.0:
+                                    shares = pos_val
+                                else:
+                                    weight = pos_val
+                            elif isinstance(pos_val, dict):
+                                shares = pos_val.get("shares", 0)
+                                weight = pos_val.get("weight", 0.0)
+
+                            if sym in universe_5m and ts_bar in universe_5m[sym].index:
+                                p_close = float(universe_5m[sym].loc[ts_bar, "Close"])
+                                if shares > 0:
+                                    bar_nav += shares * p_close
+                                elif weight > 0:
+                                    bar_nav += weight * args.portfolio_value
+                                    total_weight += weight
+                            elif sym == cash_proxy:
+                                if weight > 0:
+                                    bar_nav += weight * args.portfolio_value
+                                    total_weight += weight
+
+                        if bar_nav > 0:
+                            if total_weight > 0 and total_weight < 1.0:
+                                bar_nav += (1.0 - total_weight) * args.portfolio_value
+                            nav_series.append(bar_nav)
+
+                    if nav_series:
+                        intra_peak = max(nav_series)
+                        intra_min = min(nav_series)
+                        hwm_intra = max(float(dd_info["peak_nav"]), intra_peak)
+                        dd_trough = (intra_min - hwm_intra) / hwm_intra if hwm_intra > 0 else 0.0
+                        dd_defensive = float(resolve_blend_param(params, "dd_defensive_thresh", 0.15, float))
+                        if abs(dd_trough) >= dd_defensive and abs(dd_info["drawdown_pct"]) < dd_defensive:
+                            trough_alert = True
+
+            intraday_5m_info = {
+                "enabled": True,
+                "cutoff_time": cutoff_t,
+                "intraday_vwap_breadth": intraday_vwap_breadth,
+                "afternoon_return_mean": afternoon_ret_mean,
+                "afternoon_vwap_breakdown_ratio": breakdown_ratio,
+                "distribution_alert": distribution_alert,
+                "trough_alert": trough_alert,
+                "hwm_intra": hwm_intra,
+                "dd_trough": dd_trough,
+                "intraday_buy_scale": 0.50 if distribution_alert else 1.0,
+            }
+        except Exception as exc:
+            print(f"[WARN] Failed to evaluate 5m intraday features: {exc}")
+
     macro_info = evaluate_market_breadth_and_thrust(universe, params)
     vol_info = evaluate_realized_volatility(universe, params)
 
     # 5. Synthesize Gate Directive
-    gate_code, gate_headline, actions = resolve_gate_directive(dd_info, macro_info, vol_info)
+    gate_code, gate_headline, actions = resolve_gate_directive(dd_info, macro_info, vol_info, intraday_5m_info)
 
     # 6. Update Account State
     if not args.no_save_state:
@@ -839,6 +1049,8 @@ def main():
             "tier1_consecutive_bars": dd_info["tier1_counter"],
             "tier3_consecutive_bars": dd_info["tier3_counter"],
             "freeze_remaining_bars": dd_info["freeze_remaining_bars"],
+            "gate_code": gate_code,
+            "intraday_buy_scale": intraday_5m_info.get("intraday_buy_scale", 1.0) if intraday_5m_info else 1.0,
             "nav_history_10d": nav_hist,
             "prior_state": prior_state_to_preserve,
         })
@@ -856,6 +1068,7 @@ def main():
         gate_code=gate_code,
         gate_headline=gate_headline,
         actions=actions,
+        intraday_5m_info=intraday_5m_info,
     )
 
     json_rep, md_rep = generate_reports(
@@ -868,6 +1081,7 @@ def main():
         gate_code=gate_code,
         gate_headline=gate_headline,
         actions=actions,
+        intraday_5m_info=intraday_5m_info,
     )
     print(f"\n[SUCCESS] Reports exported:")
     print(f"  Markdown: {md_rep}")
@@ -911,6 +1125,16 @@ def main():
                 cmd.append("--no-cache")
             import subprocess
             subprocess.run(cmd, check=True)
+
+    return {
+        "gate_code": gate_code,
+        "gate_headline": gate_headline,
+        "actions": actions,
+        "dd_info": dd_info,
+        "macro_info": macro_info,
+        "vol_info": vol_info,
+        "intraday_5m_info": intraday_5m_info,
+    }
 
 
 if __name__ == "__main__":

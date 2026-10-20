@@ -670,3 +670,247 @@ def test_marketdb_and_fuyao_index_gap_fallback_stitching():
         assert df_stitched.index.min() == pd.Timestamp("2016-01-04")
         assert df_stitched.index.max() == pd.Timestamp("2026-10-16")
         assert len(df_stitched) == 6
+
+
+def test_intraday_features_causal_truncation_and_kappa_alignment():
+    """Test 6 (T2.1, T5.1): Causal truncation (36/39/48 bars, R1), anti-lookahead, kappa_t alignment (R4/R6), and Is_Partial_Bar (R12)."""
+    from common.intraday_features import (
+        IntradayFeatureConfig,
+        compute_daily_intraday_features,
+        enrich_universe_with_intraday_features,
+    )
+
+    # 1. Construct 5 days of 5m data: 4 normal historical days + 1 crash day (2026-10-16)
+    days = pd.bdate_range("2026-10-12", "2026-10-16")  # 5 business days
+    dfs = []
+    base_p = 100.0
+
+    for d in days:
+        date_str = d.strftime("%Y-%m-%d")
+        m_times = pd.date_range(f"{date_str} 09:35:00", f"{date_str} 11:30:00", freq="5min")
+        a_times = pd.date_range(f"{date_str} 13:05:00", f"{date_str} 15:00:00", freq="5min")
+        times = m_times.append(a_times)
+        n = len(times)  # 48
+
+        if date_str == "2026-10-16":
+            # On 2026-10-16:
+            # 09:35..14:15 (first 39 bars): steady at 100.0
+            # 14:20..15:00 (last 9 bars): sudden plunge to 92.0 (-8% crash)
+            c = np.full(n, 100.0)
+            c[39:] = np.linspace(98.0, 92.0, 9)
+            o = np.concatenate([[100.0], c[:-1]])
+            h = np.maximum(o, c) + 0.2
+            l = np.minimum(o, c) - 0.2
+            v = np.full(n, 1000.0)
+            v[39:] = 5000.0  # panic volume in final 9 bars
+        else:
+            c = base_p + np.linspace(0.0, 1.0, n)
+            o = np.concatenate([[base_p], c[:-1]])
+            h = np.maximum(o, c) + 0.3
+            l = np.minimum(o, c) - 0.3
+            v = np.full(n, 1000.0)
+            base_p += 1.0
+
+        df_day = pd.DataFrame(
+            {"Open": o, "High": h, "Low": l, "Close": c, "Volume": v},
+            index=times,
+        )
+        dfs.append(df_day)
+
+    df_5m = pd.concat(dfs, axis=0)
+
+    # Assert bar counts per cutoff (R1)
+    d_crash = pd.Timestamp("2026-10-16")
+    crash_day_bars = df_5m.loc[df_5m.index.normalize() == d_crash]
+
+    bars_1400 = crash_day_bars.loc[crash_day_bars.index.time <= datetime.time(14, 0)]
+    bars_1415 = crash_day_bars.loc[crash_day_bars.index.time <= datetime.time(14, 15)]
+    bars_full = crash_day_bars.loc[crash_day_bars.index.time <= datetime.time(15, 0)]
+
+    assert len(bars_1400) == 36, f"Expected 36 bars at 14:00, got {len(bars_1400)}"
+    assert len(bars_1415) == 39, f"Expected 39 bars at 14:15, got {len(bars_1415)}"
+    assert len(bars_full) == 48, f"Expected 48 bars at full day, got {len(bars_full)}"
+
+    # Compute features under 14:00, 14:15, and full day
+    feat_1400 = compute_daily_intraday_features(df_5m, config=IntradayFeatureConfig(cutoff_time="14:00"))
+    feat_1415 = compute_daily_intraday_features(df_5m, config=IntradayFeatureConfig(cutoff_time="14:15"))
+    feat_full = compute_daily_intraday_features(df_5m, config=IntradayFeatureConfig(cutoff_time=None))
+
+    # Causal assertions on crash day:
+    # At 14:00 and 14:15, price is ~100.0, completely unaware of the 14:30 plunge
+    assert feat_1400.loc[d_crash, "Close_5m_Cutoff"] == pytest.approx(100.0)
+    assert feat_1415.loc[d_crash, "Close_5m_Cutoff"] == pytest.approx(100.0)
+    assert feat_full.loc[d_crash, "Close_5m_Cutoff"] == pytest.approx(92.0)
+
+    # Is_Partial_Bar flag assertions (R12)
+    assert feat_1400.loc[d_crash, "Is_Partial_Bar"] == 1
+    assert feat_1415.loc[d_crash, "Is_Partial_Bar"] == 1
+    assert feat_full.loc[d_crash, "Is_Partial_Bar"] == 0
+
+    # Chan 5m sub-level structure & lazy candidate date assertions (T2.3, R9)
+    assert "Chan_5m_Buy_Confluence" in feat_1415.columns
+    assert "Chan_5m_Sell_Trigger" in feat_1415.columns
+    assert "Chan_5m_State" in feat_1415.columns
+    assert feat_1415.loc[d_crash, "Chan_5m_Buy_Confluence"] in (0, 1, 2)
+    assert feat_1415.loc[d_crash, "Chan_5m_Sell_Trigger"] in (0, 1)
+
+    # Lazy candidate dates: only d_crash is evaluated, days[0] defaults to neutral
+    feat_lazy = compute_daily_intraday_features(
+        df_5m,
+        config=IntradayFeatureConfig(cutoff_time="14:15"),
+        chan_candidate_dates={d_crash},
+    )
+    assert feat_lazy.loc[days[0], "Chan_5m_State"] == "5m_NEUTRAL"
+    assert feat_lazy.loc[d_crash, "Chan_5m_Buy_Confluence"] == feat_1415.loc[d_crash, "Chan_5m_Buy_Confluence"]
+
+    # Test kappa_t cross-source split ratio alignment (R4, R6)
+    # Suppose universe_1d has Close = 200.0 on crash day (due to 2:1 split basis difference)
+    # while 5m close at 14:15 cutoff is 100.0 -> kappa_t = 2.0
+    daily_rows = []
+    for d in days:
+        d_bars = df_5m.loc[df_5m.index.normalize() == d]
+        daily_rows.append({
+            "Open": float(d_bars["Open"].iloc[0]) * 2.0,
+            "High": float(d_bars["High"].max()) * 2.0,
+            "Low": float(d_bars["Low"].min()) * 2.0,
+            "Close": float(d_bars["Close"].iloc[-1]) * 2.0,
+            "Volume": float(d_bars["Volume"].sum()) / 2.0,
+        })
+    df_1d = pd.DataFrame(daily_rows, index=days)
+
+    universe_1d = {"SYM_TEST": df_1d}
+    universe_5m = {"SYM_TEST": df_5m}
+
+    enriched = enrich_universe_with_intraday_features(
+        universe_1d,
+        universe_5m,
+        config=IntradayFeatureConfig(cutoff_time="14:15"),
+        synthesize_intraday_bar=False,
+    )
+    df_enriched = enriched["SYM_TEST"]
+
+    # 1. VWAP must be multiplied by kappa_t, placing it on the 200.0 / 184.0 price basis
+    kappa_t = df_1d.loc[d_crash, "Close"] / feat_1415.loc[d_crash, "Close_5m_Cutoff"]
+    raw_vwap_1415 = feat_1415.loc[d_crash, "VWAP"]
+    aligned_vwap = df_enriched.loc[d_crash, "VWAP"]
+    assert aligned_vwap == pytest.approx(raw_vwap_1415 * kappa_t, rel=1e-4)
+
+    # 2. VWAP_Prem_5m is dimensionless and immune to split basis
+    assert df_enriched.loc[d_crash, "VWAP_Prem_5m"] == pytest.approx(feat_1415.loc[d_crash, "VWAP_Prem_5m"], rel=1e-5)
+
+    # 3. Alpha#41 = sqrt(High * Low) - VWAP is on the 200.0 scale without dimensional mismatch
+    alpha41 = np.sqrt(df_enriched.loc[d_crash, "High"] * df_enriched.loc[d_crash, "Low"]) - df_enriched.loc[d_crash, "VWAP"]
+    assert abs(alpha41) < 10.0  # reasonable residual on ~200 scale, not blown up by a 100 vs 200 basis mismatch
+
+    # 4. synthesize_intraday_bar=True sets Is_Partial_Bar=1 for the truncated day
+    enriched_synth = enrich_universe_with_intraday_features(
+        universe_1d,
+        universe_5m,
+        config=IntradayFeatureConfig(cutoff_time="14:15"),
+        synthesize_intraday_bar=True,
+    )
+    df_synth = enriched_synth["SYM_TEST"]
+    assert df_synth.loc[d_crash, "Is_Partial_Bar"] == 1
+    # Prior days with complete history remain 0
+    assert df_synth.loc[days[0], "Is_Partial_Bar"] == 0
+
+
+def test_smart_money_upvol_ratio_and_semivariance():
+    """Test 7 (T2.2, T5.1): Realized semivariance decomposition, SmartMoney_Q_5m, UpVol_Ratio_5m, and Afternoon_Ret_5m."""
+    from common.intraday_features import (
+        IntradayFeatureConfig,
+        compute_daily_intraday_features,
+    )
+
+    date_str = "2026-10-16"
+    m_times = pd.date_range(f"{date_str} 09:35:00", f"{date_str} 11:30:00", freq="5min")
+    a_times = pd.date_range(f"{date_str} 13:05:00", f"{date_str} 15:00:00", freq="5min")
+    times = m_times.append(a_times)
+    n = len(times)  # 48
+
+    # Sample A: Low-level morning accumulation + afternoon push up
+    # Morning (bars 0..23): prices 98..99 with high efficiency moves (|C - O| = 0.30, V = 1000).
+    # Smartness S is high in morning at price ~98.5.
+    # Afternoon (bars 24..47): heavy volume churn (V = 4000, |C - O| = 0.05) pushing price up to 102.
+    c_a = np.zeros(n)
+    o_a = np.zeros(n)
+    v_a = np.zeros(n)
+
+    for i in range(24):  # morning accumulation
+        o_a[i] = 98.0 + (i * 0.04)
+        c_a[i] = o_a[i] + 0.30  # high efficiency price advance
+        v_a[i] = 1000.0
+
+    for i in range(24, n):  # afternoon steady push on heavy volume
+        o_a[i] = 99.0 + ((i - 24) * 0.12)
+        c_a[i] = o_a[i] + 0.05
+        v_a[i] = 4000.0
+
+    h_a = np.maximum(o_a, c_a) + 0.05
+    l_a = np.minimum(o_a, c_a) - 0.05
+
+    df_a = pd.DataFrame(
+        {"Open": o_a, "High": h_a, "Low": l_a, "Close": c_a, "Volume": v_a},
+        index=times,
+    )
+
+    # Sample B: Morning pump to 105 at 11:30 (high S at high prices) + afternoon heavy volume dump
+    # Morning (bars 0..23): high smartness pump at prices 104..105 (|C - O| = 0.30, V = 1000).
+    # Afternoon (bars 24..47): heavy volume dump (V = 4000, C < O) dumping price down to 98.
+    c_b = np.zeros(n)
+    o_b = np.zeros(n)
+    v_b = np.zeros(n)
+
+    for i in range(24):  # morning pump
+        o_b[i] = 103.5 + (i * 0.06)
+        c_b[i] = o_b[i] + 0.25  # high efficiency pump at high prices
+        v_b[i] = 1000.0
+
+    for i in range(24, n):  # afternoon heavy volume dump
+        o_b[i] = 104.5 - ((i - 24) * 0.25)
+        c_b[i] = o_b[i] - 0.15  # red bars
+        v_b[i] = 4000.0  # heavy dump volume
+
+    h_b = np.maximum(o_b, c_b) + 0.05
+    l_b = np.minimum(o_b, c_b) - 0.05
+
+    df_b = pd.DataFrame(
+        {"Open": o_b, "High": h_b, "Low": l_b, "Close": c_b, "Volume": v_b},
+        index=times,
+    )
+
+    # Compute features for both
+    feat_a = compute_daily_intraday_features(df_a, config=IntradayFeatureConfig(cutoff_time="14:15"))
+    feat_b = compute_daily_intraday_features(df_b, config=IntradayFeatureConfig(cutoff_time="14:15"))
+
+    d_test = pd.Timestamp(date_str)
+    row_a = feat_a.loc[d_test]
+    row_b = feat_b.loc[d_test]
+
+    # 1. UpVol_Ratio_5m in [0, 1]
+    assert 0.0 <= row_a["UpVol_Ratio_5m"] <= 1.0
+    assert 0.0 <= row_b["UpVol_Ratio_5m"] <= 1.0
+    assert row_a["UpVol_Ratio_5m"] > 0.60, f"Sample A UpVol ratio {row_a['UpVol_Ratio_5m']} expected > 0.60"
+    assert row_b["UpVol_Ratio_5m"] < 0.40, f"Sample B UpVol ratio {row_b['UpVol_Ratio_5m']} expected < 0.40"
+
+    # 2. SmartMoney_Q_5m
+    # Sample A accumulated low -> Q < 0, close above VWAP -> VWAP_Prem > 0
+    assert row_a["SmartMoney_Q_5m"] < 0.0, f"Sample A Q {row_a['SmartMoney_Q_5m']} expected < 0"
+    assert row_a["VWAP_Prem_5m"] > 0.0
+    # Sample B dumped high volume in afternoon -> Q > 0, close below VWAP -> VWAP_Prem < 0
+    assert row_b["SmartMoney_Q_5m"] > 0.0, f"Sample B Q {row_b['SmartMoney_Q_5m']} expected > 0"
+    assert row_b["VWAP_Prem_5m"] < 0.0
+
+    # 3. Semivariance decomposition: RS_Up + RS_Down == RV
+    assert row_a["RS_Up_5m"] + row_a["RS_Down_5m"] == pytest.approx(row_a["RV_5m"], rel=1e-8, abs=1e-10)
+    assert row_b["RS_Up_5m"] + row_b["RS_Down_5m"] == pytest.approx(row_b["RV_5m"], rel=1e-8, abs=1e-10)
+    # Sample A has more upside variance than downside variance
+    assert row_a["RS_Up_5m"] > row_a["RS_Down_5m"]
+    # Sample B has more downside variance than upside variance
+    assert row_b["RS_Down_5m"] > row_b["RS_Up_5m"]
+
+    # 4. Afternoon_Ret_5m
+    # Sample B dropped from ~104 at 11:30 to ~98 at 14:15 -> Afternoon_Ret_5m < -0.01
+    assert row_b["Afternoon_Ret_5m"] < -0.01, f"Sample B afternoon return {row_b['Afternoon_Ret_5m']} expected < -0.01"
+    assert row_a["Afternoon_Ret_5m"] > 0.0
+

@@ -841,6 +841,12 @@ def get_data_provider(provider_name_or_instance: Union[str, BaseDataProvider, No
     """Factory to instantiate or retrieve a provider instance. Accepts registered provider names,
     instances, or module specifier strings (e.g. 'script.py:CustomProvider' or 'module.path:CustomProvider').
     """
+    kwargs = dict(kwargs)
+    if provider_name_or_instance is None and "provider" in kwargs:
+        provider_name_or_instance = kwargs.pop("provider")
+    else:
+        kwargs.pop("provider", None)
+
     if isinstance(provider_name_or_instance, BaseDataProvider):
         return provider_name_or_instance
 

@@ -533,6 +533,14 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         adaptive_shrinkage = self.resolve_param(p, "adaptive_shrinkage", 0.20, float)
         enable_orthogonalization = self.resolve_param(p, "enable_orthogonalization", True, bool)
 
+        # 5-Minute Intraday Microstructure & Interval Nesting Parameters
+        enable_intraday_5m = self.resolve_param(p, "enable_intraday_5m", False, bool)
+        enable_5m_interval_nesting = self.resolve_param(p, "enable_5m_interval_nesting", False, bool)
+        intraday_upvol_thresh = self.resolve_param(p, "intraday_upvol_thresh", 0.58, float)
+        use_intraday_downside_vol = self.resolve_param(p, "use_intraday_downside_vol", False, bool)
+        enable_5m_stop_filter = self.resolve_param(p, "enable_5m_stop_filter", False, bool)
+        intraday_cutoff_time = self.resolve_param(p, "intraday_cutoff_time", "14:15", str)
+
         symbols = list(universe.keys())
         if not symbols:
             return pd.DataFrame()
@@ -577,14 +585,35 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                 if "Volume" in df_s.columns:
                     v = df_s["Volume"].reindex(master_index).ffill()
                     v_ma20 = sma(v, 20)
-                    vol_surge_matrix[sym] = (v >= 1.2 * v_ma20).astype(float)
+                    base_surge = (v >= 1.2 * v_ma20)
+                    if enable_intraday_5m and "UpVol_Ratio_5m" in df_s.columns:
+                        up_vol_s = df_s["UpVol_Ratio_5m"].reindex(master_index)
+                        if "VWAP_Prem_5m" in df_s.columns:
+                            vwap_prem_s = df_s["VWAP_Prem_5m"].reindex(master_index)
+                            vwap_ok = vwap_prem_s.isna() | (vwap_prem_s >= 0.0)
+                        elif "VWAP" in df_s.columns:
+                            vwap_s = df_s["VWAP"].reindex(master_index)
+                            vwap_ok = vwap_s.isna() | (c >= vwap_s)
+                        else:
+                            vwap_ok = True
+                        up_vol_ok = up_vol_s.isna() | (up_vol_s >= intraday_upvol_thresh)
+                        vol_surge_matrix[sym] = (base_surge & up_vol_ok & vwap_ok).astype(float)
+                    else:
+                        vol_surge_matrix[sym] = base_surge.astype(float)
                     vol_breakout_matrix[sym] = ((v >= 1.5 * v_ma20) & (v_ma20 > 0)).astype(float).fillna(0.0)
                 else:
                     vol_surge_matrix[sym] = 1.0
                     vol_breakout_matrix[sym] = 0.0
 
                 asset_returns[sym] = c.pct_change().fillna(0.0)
-                if vol_model == "garman_klass":
+                if use_intraday_downside_vol and "RS_Down_5m" in df_s.columns:
+                    rs_down = df_s["RS_Down_5m"].reindex(master_index)
+                    # 21-day rolling mean of (2 * RS_Down_5m), annualized by sqrt(252)
+                    df_sym = df_s.reindex(master_index).ffill()
+                    gk_fallback = _compute_garman_klass_vol(df_sym, 21, target_vol)
+                    downside_vol = np.sqrt(252.0 * (2.0 * rs_down).rolling(21, min_periods=5).mean())
+                    asset_vol_21d[sym] = downside_vol.fillna(gk_fallback).fillna(target_vol)
+                elif vol_model == "garman_klass":
                     df_sym = df_s.reindex(master_index).ffill()
                     asset_vol_21d[sym] = _compute_garman_klass_vol(df_sym, 21, target_vol)
                 else:
@@ -711,6 +740,26 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                     trailing_stop_p = asset_entry_price[s] * 0.92
                                 if curr_p < trailing_stop_p:
                                     is_stopped = True
+                                    # Anti-washout stop loss exemption (morning dip recovery filter)
+                                    if enable_5m_stop_filter and curr_p >= trailing_stop_p * 0.97:
+                                        if s in universe and not universe[s].empty:
+                                            df_u = universe[s]
+                                            if "Afternoon_Low_5m" in df_u.columns and date in df_u.index:
+                                                aft_low = df_u.loc[date, "Afternoon_Low_5m"]
+                                                vwap_prem = df_u.loc[date, "VWAP_Prem_5m"] if "VWAP_Prem_5m" in df_u.columns else np.nan
+                                                upvol = df_u.loc[date, "UpVol_Ratio_5m"] if "UpVol_Ratio_5m" in df_u.columns else np.nan
+                                                if pd.notna(aft_low) and aft_low >= trailing_stop_p and (pd.isna(vwap_prem) or vwap_prem >= 0.0) and (pd.isna(upvol) or upvol >= 0.60):
+                                                    is_stopped = False
+
+                                # Sub-level 3S take-profit lock:
+                                # When holding asset with floating profit >= 8% from entry, and pullback from peak >= 2 * ATR
+                                if not is_stopped and asset_entry_price[s] and (curr_p >= asset_entry_price[s] * 1.08 or peak_p >= asset_entry_price[s] * 1.08):
+                                    if curr_p <= peak_p - 2.0 * cur_atr:
+                                        if (enable_intraday_5m or enable_5m_stop_filter) and s in universe and not universe[s].empty:
+                                            df_u = universe[s]
+                                            if "Chan_5m_Sell_Trigger" in df_u.columns and date in df_u.index:
+                                                if df_u.loc[date, "Chan_5m_Sell_Trigger"] == 1:
+                                                    is_stopped = True
                             elif stop_mode == "fixed_pct":
                                 if curr_p < asset_entry_price[s] * 0.92:
                                     is_stopped = True
@@ -904,6 +953,15 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                                 conf_count += 1
                                         if float(vol_surge_matrix.iloc[t][s]) > 0.5:
                                             conf_count += 1
+                                        if enable_intraday_5m and s in universe and not universe[s].empty:
+                                            df_u = universe[s]
+                                            if date in df_u.index:
+                                                q_val = float(df_u.loc[date, "SmartMoney_Q_5m"]) if "SmartMoney_Q_5m" in df_u.columns and pd.notna(df_u.loc[date, "SmartMoney_Q_5m"]) else 0.0
+                                                up_val = float(df_u.loc[date, "UpVol_Ratio_5m"]) if "UpVol_Ratio_5m" in df_u.columns and pd.notna(df_u.loc[date, "UpVol_Ratio_5m"]) else 0.5
+                                                if q_val < -0.002 and up_val >= 0.55:
+                                                    conf_count += 1
+                                                elif up_val < 0.42:
+                                                    c_mult *= 0.5
                                         if conf_count >= 3:
                                             c_mult = 1.6
                                         elif conf_count >= 2:
@@ -918,6 +976,11 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                         a2_bonus = max(0.0, float(sub_daily["wq_alpha2"].loc[date, s]))
 
                                     base_score = r_val * (1.0 + 5.0 * a2_bonus) * c_mult
+                                    if enable_intraday_5m and s in universe and not universe[s].empty:
+                                        df_u = universe[s]
+                                        if "SmartMoney_Q_5m" in df_u.columns and date in df_u.index:
+                                            q_sm = float(df_u.loc[date, "SmartMoney_Q_5m"]) if pd.notna(df_u.loc[date, "SmartMoney_Q_5m"]) else 0.0
+                                            base_score *= (1.0 + 3.0 * max(0.0, -q_sm))
                                     if t > 0:
                                         prev_date = master_index[t - 1]
                                         if float(daily_weights.loc[prev_date, s]) > 1e-4:
@@ -1091,7 +1154,15 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                             if entry_signal_bars[s] < min_entry_bars:
                                 if is_vol and is_breadth:
                                     entry_signal_bars[s] = min_entry_bars  # Fast-path bypass Day 1 confirmation (strict confluence)
-                                else:
+                                elif (enable_intraday_5m or enable_5m_interval_nesting) and s in universe and not universe[s].empty:
+                                    df_u = universe[s]
+                                    if "Chan_5m_Buy_Confluence" in df_u.columns and date in df_u.index:
+                                        c_conf = df_u.loc[date, "Chan_5m_Buy_Confluence"]
+                                        upvol = df_u.loc[date, "UpVol_Ratio_5m"] if "UpVol_Ratio_5m" in df_u.columns else np.nan
+                                        vwap_prem = df_u.loc[date, "VWAP_Prem_5m"] if "VWAP_Prem_5m" in df_u.columns else np.nan
+                                        if c_conf == 2 and (pd.isna(upvol) or upvol >= intraday_upvol_thresh) and (pd.isna(vwap_prem) or vwap_prem >= 0.0):
+                                            entry_signal_bars[s] = min_entry_bars  # Fast-track entry Day 1 bypass
+                                if entry_signal_bars[s] < min_entry_bars:
                                     raw_w[s] = 0.0  # Pending confirmation on Day 1; do NOT enter!
                         else:
                             entry_signal_bars[s] = 0
@@ -1113,6 +1184,21 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                     raw_w[s] = prev_w  # Suppress expansion until confirmed for min_entry_bars
                         else:
                             expansion_signal_bars[s] = 0
+
+            # Sub-level veto for new entries (Task T3.1):
+            if (enable_intraday_5m or enable_5m_interval_nesting):
+                prev_date_w = master_index[t - 1] if t > 0 else None
+                for s in risky_symbols:
+                    prev_w = float(daily_weights.loc[prev_date_w, s]) if prev_date_w is not None else 0.0
+                    target_w = float(raw_w[s])
+                    if prev_w <= 1e-4 and target_w >= entry_thresh:
+                        if s in universe and not universe[s].empty:
+                            df_u = universe[s]
+                            if "Chan_5m_Sell_Trigger" in df_u.columns and date in df_u.index:
+                                if df_u.loc[date, "Chan_5m_Sell_Trigger"] == 1:
+                                    aft_ret = df_u.loc[date, "Afternoon_Ret_5m"] if "Afternoon_Ret_5m" in df_u.columns else 0.0
+                                    if pd.notna(aft_ret) and aft_ret < -0.015:
+                                        raw_w[s] = 0.0  # Sub-level veto on entry
 
             tot_risky = float(raw_w[risky_symbols].sum())
             if tot_risky > 1.0:

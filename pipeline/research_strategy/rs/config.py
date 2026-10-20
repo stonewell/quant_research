@@ -781,6 +781,22 @@ class StrategyConfig:
     weighting_mode: Optional[str] = None
     enable_orthogonalization: Optional[bool] = None
 
+    # --- 5-Minute Intraday Microstructure & Interval Nesting Enhancement Parameters ---
+    blend_enable_intraday_5m: bool = False
+    blend_enable_5m_interval_nesting: bool = False
+    blend_intraday_upvol_thresh: float = 0.58
+    blend_use_intraday_downside_vol: bool = False
+    blend_enable_5m_stop_filter: bool = False
+    blend_intraday_cutoff_time: Optional[str] = "14:15"
+
+    # Intraday 5m aliases (unprefixed versions for convenience)
+    enable_intraday_5m: Optional[bool] = None
+    enable_5m_interval_nesting: Optional[bool] = None
+    intraday_upvol_thresh: Optional[float] = None
+    use_intraday_downside_vol: Optional[bool] = None
+    enable_5m_stop_filter: Optional[bool] = None
+    intraday_cutoff_time: Optional[str] = None
+
     # --- Price Action Breakout & Retest Strategy (docs/chan_similar_trading.md Strategy 1) ---
     pabr_box_window: int = 20                # consolidation box length (~4 weeks)
     pabr_max_box_range_pct: float = 0.15     # max box range (high - low) / low

@@ -83,6 +83,7 @@ def _resolve_path(p: Optional[str]) -> Optional[str]:
     return p
 
 
+from common.data import get_data_provider
 from common.allocation_backtester import _get_hk_board_lot
 from common.cli_utils import (
     add_data_provider_cli_args,
@@ -751,7 +752,7 @@ def parse_args(args: Optional[List[str]] = None):
         "--min-entry-threshold",
         type=float,
         default=None,
-        help="Minimum target weight threshold for fresh entry (default: inherits trade inertia threshold, e.g. 0.05 / 5%)",
+        help="Minimum target weight threshold for fresh entry (default: inherits trade inertia threshold, e.g. 0.05 / 5%%)",
     )
     parser.add_argument(
         "--volume-breakout-mult",
@@ -814,6 +815,16 @@ def parse_args(args: Optional[List[str]] = None):
         "--cache-dir",
         default=None,
         help="Folder path for DuckDB / parquet market data cache (default: data/ in repo root)",
+    )
+    parser.add_argument(
+        "--enable-intraday-5m",
+        action="store_true",
+        help="Enable 5-minute intraday execution price guidance and microstructure checks",
+    )
+    parser.add_argument(
+        "--cutoff-time",
+        default="14:15",
+        help="Intraday cutoff time for Stage 2 order generation (default: 14:15, 39 5m bars)",
     )
     add_data_provider_cli_args(parser, default_provider="synthetic")
     parsed = parser.parse_args(args)
@@ -1023,8 +1034,8 @@ def apply_intraday_distribution_gate(
     return scaled_target
 
 
-def main():
-    args = parse_args()
+def main(cli_args: Optional[List[str]] = None):
+    args = parse_args(cli_args)
     as_of_date = args.as_of_date or date.today().isoformat()
     if getattr(args, "start_date", None):
         start_date = args.start_date
@@ -1194,11 +1205,34 @@ def main():
     )
     universe = as_of_universe(universe, as_of_date)
 
+    if getattr(args, "enable_intraday_5m", False):
+        try:
+            from common.intraday_features import (
+                IntradayFeatureConfig,
+                load_intraday_5m_universe,
+                enrich_universe_with_intraday_features,
+            )
+            provider = get_data_provider(args.data_provider, **build_data_kwargs(args))
+            cutoff_t = getattr(args, "cutoff_time", "14:15") or "14:15"
+            universe_5m = load_intraday_5m_universe(
+                symbols_to_load,
+                start=start_date,
+                end=as_of_date,
+                data_provider=provider,
+                cutoff_time=cutoff_t,
+            )
+            universe = enrich_universe_with_intraday_features(
+                universe, universe_5m, config=IntradayFeatureConfig(cutoff_time=cutoff_t), synthesize_intraday_bar=True
+            )
+            print(f"[INFO] 成功加载并聚合 5m 日内特征 (截断时点: {cutoff_t}, 标的数: {len(universe)})")
+        except Exception as exc:
+            print(f"[WARN] Failed to load 5m intraday features in Stage 2 runner: {exc}")
+
     # Check if as_of_date is an open trading day
     as_of_dt = pd.Timestamp(as_of_date)
     as_of_d = as_of_dt.date()
     is_weekend = as_of_dt.weekday() in (5, 6)
-    official_cal = get_trading_days_calendar()
+    official_cal = get_trading_days_calendar() if getattr(args, "data_provider", "") != "synthetic" else None
     is_calendar_holiday = bool(official_cal and (max(official_cal) >= as_of_d) and (as_of_d not in official_cal))
 
     has_market_bars = False
@@ -1523,6 +1557,57 @@ def main():
             is_tenure_locked = bool(state.held_bars < min_holding_bars if state.is_holding() else False)
             updated_lifecycle_states[sym] = state.to_dict()
 
+        # Determine board price limits and 5m microstructure indicators (R10 & R11)
+        sym_name = symbol_names.get(sym, sym)
+        if is_placeholder_stock_name(sym_name, sym):
+            sym_name = _FALLBACK_STOCK_NAMES.get(sym, sym)
+        is_st = ("ST" in sym_name.upper()) if sym_name else False
+        is_etf = (sym.startswith("51") or sym.startswith("15") or sym.startswith("56") or sym.startswith("58") or sym.startswith("16"))
+        decimals = 3 if is_etf else 2
+        tick_tol = 0.001 if is_etf else 0.01
+
+        if is_st:
+            limit_pct = 0.05
+        elif sym.endswith(".BJ") or sym.startswith("43") or sym.startswith("83") or sym.startswith("87") or sym.startswith("92"):
+            limit_pct = 0.30
+        elif sym.startswith("688") or sym.startswith("300") or sym.startswith("301"):
+            limit_pct = 0.20
+        else:
+            limit_pct = 0.10
+
+        df_sym_all = universe.get(sym, pd.DataFrame())
+        is_new_stock = (len(df_sym_all) <= 5)
+        if is_new_stock:
+            limit_pct = 1.0  # exempt
+
+        prev_close = price
+        if len(df_sym_all) >= 2:
+            prev_close = float(df_sym_all["Close"].iloc[-2])
+
+        p_limit_up = round(prev_close * (1.0 + limit_pct), decimals) if limit_pct < 1.0 else price * 2.0
+        p_limit_down = round(prev_close * (1.0 - limit_pct), decimals) if limit_pct < 1.0 else 0.01
+
+        last_locked = 0
+        intraday_vwap = None
+        vwap_prem_pct = None
+        chan_5m_state = "N/A"
+        chan_5m_zg = 0.0
+
+        if not df_sym_all.empty:
+            last_row = df_sym_all.iloc[-1]
+            if "Last_3Bars_Locked_Limit" in last_row and pd.notna(last_row["Last_3Bars_Locked_Limit"]):
+                last_locked = int(last_row["Last_3Bars_Locked_Limit"])
+            if "VWAP" in last_row and pd.notna(last_row["VWAP"]):
+                intraday_vwap = float(last_row["VWAP"])
+            if "VWAP_Prem_5m" in last_row and pd.notna(last_row["VWAP_Prem_5m"]):
+                vwap_prem_pct = float(last_row["VWAP_Prem_5m"])
+            if "Chan_5m_State" in last_row and pd.notna(last_row["Chan_5m_State"]):
+                chan_5m_state = str(last_row["Chan_5m_State"])
+            if "Chan_5m_ZG" in last_row and pd.notna(last_row["Chan_5m_ZG"]):
+                chan_5m_zg = float(last_row["Chan_5m_ZG"])
+
+        execution_warning = None
+
         trade_val = delta_w * args.portfolio_value
         raw_shares = 0.0
         if sym != cash_proxy and price > 0:
@@ -1532,13 +1617,39 @@ def main():
                 actual_trade_val = 0.0
                 raw_shares = 0.0
             elif action == "BUY":
-                raw_buy_shares = trade_val / price
-                raw_shares = raw_buy_shares
-                lot_buy_shares = int(np.floor(raw_buy_shares / sym_lot) * sym_lot)
-                delta_shares = max(0, lot_buy_shares)
-                target_shares = current_shares + delta_shares
-                actual_trade_val = delta_shares * price
+                # Check LIMIT_UP_LOCKED (R10)
+                if limit_pct < 1.0 and (price >= p_limit_up - tick_tol or last_locked == 1):
+                    action = "HOLD_FILTERED"
+                    target_shares = current_shares
+                    delta_shares = 0
+                    actual_trade_val = 0.0
+                    raw_shares = 0.0
+                    tgt_w = cur_w
+                    delta_w = 0.0
+                    abs_delta = 0.0
+                    reason = "涨停封板无法买入 (LIMIT_UP_LOCKED)"
+                    execution_warning = "LIMIT_UP_LOCKED"
+                else:
+                    raw_buy_shares = trade_val / price
+                    raw_shares = raw_buy_shares
+                    lot_buy_shares = int(np.floor(raw_buy_shares / sym_lot) * sym_lot)
+                    delta_shares = max(0, lot_buy_shares)
+
+                    # Check INTRADAY_OVEREXTENDED_TRIM
+                    if vwap_prem_pct is not None and vwap_prem_pct > 0.035 and not df_sym_all.empty and df_sym_all.iloc[-1].get("Chan_5m_Sell_Trigger") == 1:
+                        trimmed_shares = int(np.floor((delta_shares * 0.5) / sym_lot) * sym_lot)
+                        if trimmed_shares < delta_shares:
+                            delta_shares = max(0, trimmed_shares)
+                            reason = f"{reason} [日内透支追高降档 INTRADAY_OVEREXTENDED_TRIM]"
+
+                    target_shares = current_shares + delta_shares
+                    actual_trade_val = delta_shares * price
             elif action == "SELL":
+                # Check LIMIT_DOWN_ILLIQUID_RISK (R10 & R14)
+                if limit_pct < 1.0 and (price <= p_limit_down + tick_tol or last_locked == -1 or cur_v == 0.0):
+                    execution_warning = "LIMIT_DOWN_ILLIQUID_RISK"
+                    reason = f"{reason} [跌停封死/流动性枯竭警示 LIMIT_DOWN_ILLIQUID_RISK]"
+
                 if tgt_w <= 1e-6:
                     raw_shares = -float(current_shares)
                     delta_shares = -current_shares
@@ -1563,6 +1674,27 @@ def main():
             delta_shares = 0
             actual_trade_val = 0.0
             raw_shares = 0.0
+
+        # Suggested limit prices (R11)
+        suggested_limit_price = price
+        passive_support_limit_price = price
+        if sym != cash_proxy and price > 0:
+            if action == "BUY":
+                suggested_limit_price = min(p_limit_up, round(price * 1.002, decimals))
+                if intraday_vwap and intraday_vwap > 0:
+                    support_anchor = max(intraday_vwap, chan_5m_zg) if chan_5m_zg > 0 else intraday_vwap
+                    passive_support_limit_price = min(
+                        round(price * 1.002, decimals),
+                        round(support_anchor * 1.005, decimals),
+                    )
+                else:
+                    passive_support_limit_price = suggested_limit_price
+            elif action == "SELL":
+                if "止损" in reason or "HALT" in reason or "EMERGENCY" in reason:
+                    suggested_limit_price = max(p_limit_down, round(price * 0.997, decimals))
+                else:
+                    suggested_limit_price = max(p_limit_down, round(price * 0.998, decimals))
+                passive_support_limit_price = suggested_limit_price
 
         # Post-calculation lot-rounding zero shares liquidation:
         # When current_shares > 0 and after lot rounding target_shares == 0
@@ -1695,11 +1827,21 @@ def main():
             "detail_reason": detail_reason,
             "strategy_version": strat_ver,
             "base_version": base_ver,
+            "execution_warning": execution_warning,
+            "intraday_vwap": intraday_vwap,
+            "vwap_premium_pct": vwap_prem_pct,
+            "chan_5m_state": chan_5m_state,
+            "suggested_limit_price": suggested_limit_price,
+            "passive_support_limit_price": passive_support_limit_price,
         })
 
     # Purchasing power constraint: total buys cannot exceed available cash + sales proceeds
     initial_cash_val = current_series.get(cash_proxy, 0.0) * args.portfolio_value
-    total_sales_proceeds = abs(sum(r["trade_value"] for r in rows if r["action"] == "SELL" and r["symbol"] != cash_proxy))
+    # Double freeze R14: exclude unexecutable LIMIT_DOWN_ILLIQUID_RISK sell orders from purchasing power
+    total_sales_proceeds = abs(sum(
+        r["trade_value"] for r in rows
+        if r["action"] == "SELL" and r["symbol"] != cash_proxy and r.get("execution_warning") != "LIMIT_DOWN_ILLIQUID_RISK"
+    ))
     available_purchasing_power = max(0.0, initial_cash_val + total_sales_proceeds)
 
     total_desired_buys = sum(r["trade_value"] for r in rows if r["action"] == "BUY" and r["symbol"] != cash_proxy)
@@ -1728,11 +1870,12 @@ def main():
 
     order_df = pd.DataFrame(rows)
 
-
     # Reconcile cash proxy: actual post-trade cash = initial cash - net equity purchases
     cash_mask = order_df["symbol"] == cash_proxy
     if cash_mask.any():
-        equity_trades_val = order_df.loc[~cash_mask, "trade_value"].sum()
+        # Double freeze R14: exclude LIMIT_DOWN_ILLIQUID_RISK sell orders from equity_trades_val so idle cash sweep does not overdraft
+        valid_equity_mask = (~cash_mask) & (order_df.get("execution_warning") != "LIMIT_DOWN_ILLIQUID_RISK")
+        equity_trades_val = order_df.loc[valid_equity_mask, "trade_value"].sum()
         actual_post_trade_cash = initial_cash_val - equity_trades_val
         actual_cash_weight = max(0.0, actual_post_trade_cash / args.portfolio_value)
         order_df.loc[cash_mask, "target_weight"] = actual_cash_weight
@@ -1771,13 +1914,20 @@ def main():
     else:
         for _, r in sells.iterrows():
             sym_col = pad_east_asian(f"{r['symbol']} ({r['name']})", 24)
-            print(f"  🔴 SELL {sym_col} | 现价: {r['price']:>7.2f} | 仓位: {r['current_weight']:>5.1%} -> 目标: {r['target_weight']:>5.1%} ({r['delta_weight']:>+5.1%}) | 卖出: {abs(r['delta_shares']):>6} 股 (~¥{abs(r['trade_value']):>9,.2f})")
+            warn_tag = " ⚠️ [LIMIT_DOWN_ILLIQUID_RISK / 资金已冻结]" if r.get("execution_warning") == "LIMIT_DOWN_ILLIQUID_RISK" else ""
+            limit_p = r.get("suggested_limit_price", r["price"])
+            print(f"  🔴 SELL {sym_col} | 现价: {r['price']:>7.2f} (建议限价: {limit_p:.2f}) | 仓位: {r['current_weight']:>5.1%} -> 目标: {r['target_weight']:>5.1%} ({r['delta_weight']:>+5.1%}) | 卖出: {abs(r['delta_shares']):>6} 股 (~¥{abs(r['trade_value']):>9,.2f}){warn_tag}")
 
     print("\n[PHASE 2: EXECUTE BUYS SECOND (第二阶段: 买入建仓/加仓资金配置)]")
     if buys.empty:
         print("  今日无需执行任何买入指令 (No buy orders required today).")
     else:
         for _, r in buys.iterrows():
+            sym_col = pad_east_asian(f"{r['symbol']} ({r['name']})", 24)
+            price_info = f"建议限价: {r.get('suggested_limit_price', r['price']):.2f}"
+            if r.get("passive_support_limit_price") and r.get("passive_support_limit_price") != r.get("suggested_limit_price"):
+                price_info += f" (被动支撑: {r['passive_support_limit_price']:.2f})"
+            print(f"  🟢 BUY  {sym_col} | 现价: {r['price']:>7.2f} | 仓位: {r['current_weight']:>5.1%} -> 目标: {r['target_weight']:>5.1%} ({r['delta_weight']:>+5.1%}) | 买入: {r['shares']:>6} 股 (~¥{r['trade_value']:>9,.2f}) | {price_info}")
             qty_str = f"{r['delta_shares']:>6}"
             suffix = ""
             if r['delta_shares'] == 0:
@@ -1946,6 +2096,7 @@ def main():
         except Exception as e:
             print(f"[WARN] Failed to update account state file: {e}")
     print("=" * 110)
+    return order_df
 
 
 if __name__ == "__main__":
