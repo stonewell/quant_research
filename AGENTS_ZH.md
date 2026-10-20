@@ -93,6 +93,16 @@ uv run python run_pipeline.py --data-provider synthetic --universe SPY QQQ ...
      - **第一优先级：Claude**（若有可用额度/Credit，优先使用 Claude 3.7 / 3.5 Sonnet 进行深度推理）。
      - **第二优先级：Gemini Pro**（若 Claude 额度耗尽或不可用，接替使用 Gemini 2.5 / 1.5 Pro）。
      - **第三优先级：降级回退至 Flash**（仅在 Pro 级别额度完全受限或耗尽时，才回退至 Gemini Flash / Flash-Medium）。
+7. **策略修改与语义化版本递增规范 (Strategy Version Upgrade & Dual-Axis Decoupling)**：
+   - 仓库内所有量化策略与资产配置模板必须严格维护其语义化版本（`VERSION` / `version` 与 `BASE_VERSION`）。
+   - **每次修改策略必须同步递增版本号 (Mandatory Version Bump on Strategy Edit)**：
+     - **底座引擎升级 (`BASE_VERSION`)**：任何时候当修改、扩展或优化 `BaseBlendAllocationStrategy`（`pipeline/research/blend/blend_base.py`）或 `AllocationTemplate`（`common/allocation_templates.py`）的基础算法、风险覆盖或算子逻辑时，**必须递增 `BASE_VERSION`**（向后兼容的功能新增递增 Minor，如 `1.0.0` $\to$ `1.1.0`；重大不兼容变更递增 Major，如 `1.1.0` $\to$ `2.0.0`）。
+     - **具体子类策略升级 (`version`)**：任何时候当修改某个具体策略类的信号逻辑、调仓机制、默认参数或子策略成分时（如在 `pipeline/research/blend/*.py`、`pipeline/research_strategy/rs/*.py`、`common/allocation_templates.py` 中），**必须递增该策略的 `version`**（如 `1.0.0` $\to$ `1.1.0`）。
+     - **四步联动固化要求 (Four-step Synchronized Requirements)**：递增版本号时，必须同步执行以下四项动作：
+       1. 同步更新单元测试断言（`pipeline/research_strategy/tests/test_blend_strategy_versioning.py` 与 `common/tests/test_strategy_versioning.py`）；
+       2. 运行 `uv run python pipeline/research_strategy/run_research_strategy.py --dump-strategies` 刷新 `strategy_dumps/*.json` 持久化元数据；
+       3. 确保实盘工单（`run_live_strategy.py` 导出的 `live_trading_ticket.json`）记录的 `strategy_version` 与 `base_version` 比特级对齐；
+       4. **版本变更日志持久化 (SSOT 于 `docs/version.md`)**：每次策略版本（`version`）或底座引擎版本（`BASE_VERSION`）发生变更时，必须在 `docs/version.md` 中用中文追加记录该版本的变更日志与摘要（包含变更日期、策略名称/底座标识、旧版本号 $\to$ 新版本号、算法/信号/风控核心变动点、参数增减、以及配套单测验证结论），确保策略历史沿革具备不可篡改的审计追踪能力。
 
 
 ---
