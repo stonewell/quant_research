@@ -171,8 +171,8 @@ def parse_args():
     parser.add_argument(
         "--weighting-mode",
         type=str,
-        default="rolling_ic_ir",
-        help="Blend sub-strategy weighting mode (default: rolling_ic_ir)",
+        default="regime_ic_ir_hybrid",
+        help="Blend sub-strategy weighting mode (default: regime_ic_ir_hybrid)",
     )
     parser.add_argument(
         "--enable-orthogonalization",

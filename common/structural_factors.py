@@ -16,12 +16,12 @@ across both pipeline and ML execution environments and to prevent architectural
 inversion and circular dependency bugs.
 """
 
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
 from common.hurst import hurst_exponent
-from common.indicators import atr, sma
+from common.indicators import atr, macd, sma
 
 __all__ = [
     "compute_rolling_poc_series",
@@ -34,6 +34,7 @@ __all__ = [
     "cyq_chip_distribution",
     "cyq_winner_ratio",
     "cyq_cost_concentration",
+    "enrich_universe_with_structural_features",
 ]
 
 
@@ -667,3 +668,138 @@ def cyq_cost_concentration(bars: pd.DataFrame, **kwargs) -> pd.Series:
     """Convenience wrapper returning cyq_cost_concentration Series."""
     _, cc = cyq_chip_distribution(bars, **kwargs)
     return cc
+
+
+def enrich_universe_with_structural_features(
+    universe: Dict[str, pd.DataFrame],
+    lookback: int = 60,
+    inplace: bool = False,
+) -> Dict[str, pd.DataFrame]:
+    """Pre-computes and attaches structural, Wyckoff, fractal, and volume profile features.
+
+    Task B2.1 (Memoized Pre-Enrichment Pipeline):
+    Extracts rolling POC/VAL/VAH, NPOC, Wyckoff Spring, quadratic extremum curvature,
+    standardized MACD divergence, Wyckoff effort-result, fractal dimension D_t,
+    consolidation density, and CYQ chip distribution (winner ratio & cost concentration)
+    across the full historical universe once. Enables walkforward backtest folds to reuse
+    memoized structural features without redundant re-computation.
+
+    Parameters
+    ----------
+    universe : Dict[str, pd.DataFrame]
+        Dictionary mapping symbols to daily OHLCV DataFrames.
+    lookback : int, default 60
+        Lookback window in bars for Volume Profile calculation.
+    inplace : bool, default False
+        Whether to modify DataFrames in-place or operate on copies.
+
+    Returns
+    -------
+    Dict[str, pd.DataFrame]
+        Enriched dictionary mapping symbols to DataFrames with attached feature columns.
+    """
+    required_cols = [
+        "cyq_winner_ratio",
+        "cyq_cost_concentration",
+        "wyckoff_spring",
+        "extremum_curvature",
+        "standardized_divergence",
+        "wyckoff_effort_result",
+        "fractal_dimension",
+        "consolidation_density",
+        "POC",
+        "VAL",
+        "VAH",
+        "NPOC",
+    ]
+
+    out: Dict[str, pd.DataFrame] = {}
+
+    for sym, df in universe.items():
+        if df is None or len(df) == 0:
+            out[sym] = df
+            continue
+
+        if all(col in df.columns for col in required_cols):
+            out[sym] = df if inplace else df.copy()
+            continue
+
+        d = df if inplace else df.copy()
+
+        # 1. Rolling POC, VAL, VAH and Naked POC (NPOC)
+        need_vp = not all(c in d.columns for c in ["POC", "VAL", "VAH", "NPOC"])
+        if need_vp:
+            poc_arr, val_arr, vah_arr = compute_rolling_poc_series(d, lookback=lookback)
+            poc_s = pd.Series(poc_arr, index=d.index, name="POC")
+            val_s = pd.Series(val_arr, index=d.index, name="VAL")
+            vah_s = pd.Series(vah_arr, index=d.index, name="VAH")
+            npoc_s = pd.Series(poc_arr, index=d.index, name="NPOC").shift(5).bfill()
+            if "POC" not in d.columns:
+                d["POC"] = poc_s
+            if "VAL" not in d.columns:
+                d["VAL"] = val_s
+            if "VAH" not in d.columns:
+                d["VAH"] = vah_s
+            if "NPOC" not in d.columns:
+                d["NPOC"] = npoc_s
+        else:
+            poc_s = d["POC"]
+            val_s = d["VAL"]
+            vah_s = d["VAH"]
+
+        # 2. Wyckoff Spring and Scale-free Quadratic Extremum Curvature
+        if "wyckoff_spring" not in d.columns:
+            low_s = d["Low"] if "Low" in d.columns else (d["Close"] if "Close" in d.columns else d.iloc[:, 0])
+            fallback_supp = low_s.rolling(20, min_periods=1).min()
+            if "zd" in d.columns:
+                supp = d["zd"].fillna(fallback_supp)
+            elif "ZD" in d.columns:
+                supp = d["ZD"].fillna(fallback_supp)
+            elif not val_s.isna().all():
+                supp = val_s.fillna(fallback_supp)
+            else:
+                supp = fallback_supp
+            d["wyckoff_spring"] = wyckoff_spring(d, support_series=supp)
+
+        if "extremum_curvature" not in d.columns:
+            close_s = d["Close"] if "Close" in d.columns else d.iloc[:, 0]
+            d["extremum_curvature"] = extremum_curvature(close_s, window=5, min_periods=3)
+
+        # 3. Standardized MACD Divergence and Wyckoff Effort-Result
+        if "standardized_divergence" not in d.columns:
+            close_s = d["Close"] if "Close" in d.columns else d.iloc[:, 0]
+            macd_df = macd(close_s, fast=12, slow=26, signal=9)
+            macd_hist = macd_df["hist"]
+            d["standardized_divergence"] = standardized_divergence(close_s, macd_hist, lag=5, vol_lookback=20)
+
+        if "wyckoff_effort_result" not in d.columns:
+            d["wyckoff_effort_result"] = wyckoff_effort_result(d, lag=5, volume_lookback=20)
+
+        # 4. Fractal Dimension and Consolidation Density
+        if "fractal_dimension" not in d.columns:
+            close_s = d["Close"] if "Close" in d.columns else d.iloc[:, 0]
+            d["fractal_dimension"] = fractal_dimension(close_s, window=60)
+
+        if "consolidation_density" not in d.columns:
+            if "zd" in d.columns and "zg" in d.columns:
+                zd_s, zg_s = d["zd"], d["zg"]
+            elif "ZD" in d.columns and "ZG" in d.columns:
+                zd_s, zg_s = d["ZD"], d["ZG"]
+            else:
+                zd_s, zg_s = val_s, vah_s
+            d["consolidation_density"] = consolidation_density(d, zd=zd_s, zg=zg_s, window=20)
+
+        # 5. CYQ Chip Distribution (Winner Ratio and Cost Concentration)
+        need_wr = "cyq_winner_ratio" not in d.columns
+        need_cc = "cyq_cost_concentration" not in d.columns
+        if need_wr or need_cc:
+            wr, cc = cyq_chip_distribution(d)
+            if need_wr:
+                d["cyq_winner_ratio"] = wr
+            if need_cc:
+                d["cyq_cost_concentration"] = cc
+
+        out[sym] = d
+
+    return out
+

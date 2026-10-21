@@ -816,6 +816,8 @@ def load_intraday_5m_universe(
     data_provider: Optional[Any] = None,
     parquet_dir: str = "data/intraday_5m",
     cutoff_time: Optional[str] = "14:15",
+    cache_dir: Optional[str] = None,
+    **kwargs: Any,
 ) -> Dict[str, pd.DataFrame]:
     """Three-layer intraday data loading pipeline (Section 1.6 / line 383).
 
@@ -823,6 +825,10 @@ def load_intraday_5m_universe(
     Step 2: Read Day-T lock-free Parquet if present (data/intraday_5m/{YYYY-MM-DD}.parquet).
     Step 3: On-demand EastMoney fallback if intraday bucket hole is detected.
     """
+    if cache_dir and parquet_dir == "data/intraday_5m":
+        cand = os.path.join(cache_dir, "intraday_5m")
+        if os.path.isdir(cand):
+            parquet_dir = cand
     out: Dict[str, pd.DataFrame] = {}
 
     for sym in symbols:
