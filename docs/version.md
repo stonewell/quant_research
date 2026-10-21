@@ -13,18 +13,18 @@
 ```
                 ┌────────────────────────────────────────────────────────┐
                 │          底座引擎版本 (Engine BASE_VERSION)              │
-                │  - BaseBlendAllocationStrategy: v1.3.0                 │
+                │  - BaseBlendAllocationStrategy: v1.4.0                 │
                 │  - AllocationTemplate: v1.0.0                          │
                 └──────────────────────────┬─────────────────────────────┘
                                            │ 继承与多态注入
                                            ▼
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │                          具体策略子类版本 (Strategy Class version)                        │
-│  - ChanRiskManagedBlendStrategy: v1.0.0 [base: v1.3.0]                                 │
-│  - ChanFourStateBlendStrategy:   v2.0.0 [base: v1.3.0]                                 │
-│  - ChanCrisisShieldBlendStrategy: v2.1.0 [base: v1.3.0]                                │
-│  - ChanDualHybridBlendStrategy:  v1.0.0 [base: v1.3.0]                                 │
-│  - GenericBlendStrategy:         v1.0.0 [base: v1.3.0]                                 │
+│  - ChanRiskManagedBlendStrategy: v1.0.0 [base: v1.4.0]                                 │
+│  - ChanFourStateBlendStrategy:   v2.0.0 [base: v1.4.0]                                 │
+│  - ChanCrisisShieldBlendStrategy: v2.1.0 [base: v1.4.0]                                │
+│  - ChanDualHybridBlendStrategy:  v1.0.0 [base: v1.4.0]                                 │
+│  - GenericBlendStrategy:         v1.0.0 [base: v1.4.0]                                 │
 │  - 9 大静态配置模板 (EqualWeight, RiskParity ...): v1.0.0                             │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -52,6 +52,36 @@
 ---
 
 ## 2. 底座引擎核心版本沿革 (Base Engine Changelog)
+
+### `BaseBlendAllocationStrategy`: `v1.4.0` (2026-10-21)
+* **变更类型**：Minor 生产环境参数固化与实盘 Track T 全流程微观结构启用升级（向后兼容）。
+* **前序版本**：`v1.3.0`
+* **对应提交/变更范围**：`pipeline/research/blend/blend_base.py`，`pipeline/research_strategy/rs/config.py`，`pipeline/research_strategy/strategies_config.json`，`common/intraday_features.py`，`scripts/check_live_portfolio_health.py`，`scripts/run_live_strategy.py`，`web/livetrading/execution_service.py`
+* **单测覆盖**：
+  - `common/tests/test_strategy_versioning.py` (PASS)
+  - `pipeline/research_strategy/tests/test_blend_strategy_versioning.py` (PASS)
+  - `pipeline/research_strategy/tests/test_blend_track_c.py` (PASS)
+  - `pipeline/research_strategy/tests/test_blend_intraday_5m.py` (PASS)
+  - `common/tests/test_intraday_features.py` (PASS)
+  - `common/tests/test_live_health_check.py` (PASS)
+  - `common/tests/test_live_strategy.py` (PASS)
+
+#### 核心升级特性详述：
+1. **生产环境默认核心参数固化**：
+   - `blend_enable_structural_regime` 默认开启（`True`）：激活 Track C 分形维数与状态机宏观预算路由，实现分形状态机自动轮动动量/均值回复。
+   - `blend_enable_cyq_quality_gate` 默认开启（`True`）：激活筹码获利盘门禁（`min_cyq_winner_ratio = 0.20`），过滤高位套牢盘与假中枢，结合 Wyckoff Spring 破底翻放行。
+   - `blend_enable_adaptive_stop_atr` 默认开启（`True`）：低波资产动态展宽至 3.5~7.5x ATR 宽幅自适应止损防洗盘。
+   - `blend_enable_low_beta_inertia` 默认开启（`True`）：低波蓝筹年化波动率 < 22% 自动提高持仓锁定周期至 10 天，杜绝频繁倒手摩擦。
+   - 细分行业持仓配额上限统一放宽为 2 只（`blend_max_assets_per_sector: 2` 与 `cdhb_max_assets_per_sector: 2`），允许同行业龙头共振进攻。
+2. **配置文件与底座默认值双向同步**：
+   - 同步更新 `pipeline/research_strategy/rs/config.py` 默认参数与 `pipeline/research_strategy/strategies_config.json`（涵盖 `chan_risk_managed_blend`, `chan_four_state_blend`, `chan_four_state_shield_blend`, `chan_crisis_shield_blend`, `chan_dual_hybrid_blend`, `generic_blend` 六大策略），并重新导出 58 个策略 Dump JSON。
+3. **实盘交易全流程启用 Track T 5分钟高频微观结构**：
+   - `common/intraday_features.py`：`load_intraday_5m_universe` 新增 DuckDBCache 自动 fallback 查询机制，当数据源返回空或未指定时无缝回退读取本地 DuckDB 缓存（`data/cache.duckdb`）。
+   - `scripts/check_live_portfolio_health.py`：支持 `--enable-intraday-5m` 与策略参数 `enable_intraday_5m` 双通道激活，并在自动串联 Stage 2 时穿透转发 `--enable-intraday-5m`。
+   - `scripts/run_live_strategy.py`：支持 `--enable-intraday-5m` 与策略参数双通道激活，交割单原生计算日内 VWAP 偏离度、主动可成交限价与被动支撑限价，激活跌停封死双向冻结与防透支机制。
+   - `web/livetrading/execution_service.py`：Stage 1、Stage 2 与多策略净额化部署默认附带 `--enable-intraday-5m`，使 Web 实盘工作站开箱即用 5m 微观结构共振。
+
+---
 
 ### `BaseBlendAllocationStrategy`: `v1.3.0` (2026-10-21)
 * **变更类型**：Minor 功能性增强与风控参数自适应升级（向后兼容）。

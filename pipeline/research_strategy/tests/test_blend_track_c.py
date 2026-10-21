@@ -46,9 +46,9 @@ def test_track_c_param_resolution():
     """Verify Track C parameter resolution across defaults and overrides."""
     strat = GenericBlendStrategy()
 
-    # Defaults
-    assert strat.resolve_param({}, "enable_structural_regime", False, bool) is False
-    assert strat.resolve_param({}, "enable_cyq_quality_gate", False, bool) is False
+    # Defaults (Production parameters solidified to True)
+    assert strat.resolve_param({}, "enable_structural_regime", False, bool) is True
+    assert strat.resolve_param({}, "enable_cyq_quality_gate", False, bool) is True
     assert strat.resolve_param({}, "min_cyq_winner_ratio", 0.20, float) == pytest.approx(0.20)
     assert strat.resolve_param({}, "enable_vp_confluence_sizing", False, bool) is False
     assert strat.resolve_param({}, "enable_spring_fast_entry", False, bool) is False
@@ -56,15 +56,15 @@ def test_track_c_param_resolution():
 
     # Runtime overrides with blend_ prefix
     p = {
-        "blend_enable_structural_regime": True,
-        "blend_enable_cyq_quality_gate": True,
+        "blend_enable_structural_regime": False,
+        "blend_enable_cyq_quality_gate": False,
         "blend_min_cyq_winner_ratio": 0.25,
         "blend_enable_vp_confluence_sizing": True,
         "blend_enable_spring_fast_entry": True,
         "blend_enable_structural_chandelier_stop": True,
     }
-    assert strat.resolve_param(p, "enable_structural_regime", False, bool) is True
-    assert strat.resolve_param(p, "enable_cyq_quality_gate", False, bool) is True
+    assert strat.resolve_param(p, "enable_structural_regime", True, bool) is False
+    assert strat.resolve_param(p, "enable_cyq_quality_gate", True, bool) is False
     assert strat.resolve_param(p, "min_cyq_winner_ratio", 0.20, float) == pytest.approx(0.25)
     assert strat.resolve_param(p, "enable_vp_confluence_sizing", False, bool) is True
     assert strat.resolve_param(p, "enable_spring_fast_entry", False, bool) is True

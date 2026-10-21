@@ -268,8 +268,8 @@ def test_blend_volume_surge_and_anti_washout_stop():
     strat.get_sub_strategies = lambda u, p=None: {"always_a": AlwaysHoldStockA()}
     strat.get_sub_strategy_weights = lambda p=None: {"always_a": 1.0}
 
-    params_stop_off = {"cash_proxy": "BIL", "stop_mode": "atr_trailing", "enable_5m_stop_filter": False}
-    params_stop_on = {"cash_proxy": "BIL", "stop_mode": "atr_trailing", "enable_5m_stop_filter": True}
+    params_stop_off = {"cash_proxy": "BIL", "stop_mode": "atr_trailing", "stop_atr_mult": 2.5, "enable_5m_stop_filter": False, "enable_adaptive_stop_atr": False, "enable_cyq_quality_gate": False}
+    params_stop_on = {"cash_proxy": "BIL", "stop_mode": "atr_trailing", "stop_atr_mult": 2.5, "enable_5m_stop_filter": True, "enable_adaptive_stop_atr": False, "enable_cyq_quality_gate": False}
 
     w_stop_off = strat.generate_weights(universe, params=params_stop_off)
     w_stop_on = strat.generate_weights(universe, params=params_stop_on)
