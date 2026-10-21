@@ -1,30 +1,535 @@
 [
   {
+    "symbol": "300394.SZ",
+    "name": "天孚通信",
+    "action": "SELL",
+    "price": 133.82756310111589,
+    "current_weight": 0.05149751565157833,
+    "target_weight": 0.0,
+    "delta_weight": -0.05149751565157833,
+    "current_shares": 38,
+    "target_shares": 0,
+    "delta_shares": -38,
+    "shares": 38,
+    "trade_value": -5085.447397842404,
+    "trade_value_rmb": -5085.447397842404,
+    "holding_bars": 0,
+    "reason": "触发个股 ATR 跟踪止损风控 (当前价格 133.83 < 跟踪止损价 205.01) ⚡[STOP_LOSS]",
+    "summary_reason": "触发个股 ATR 跟踪止损风控 (当前价格 133.83 < 跟踪止损价 205.01) ⚡[STOP_LOSS]",
+    "detail_reason": {
+      "summary_reason": "触发个股 ATR 跟踪止损风控 (当前价格 133.83 < 跟踪止损价 205.01) ⚡[STOP_LOSS]",
+      "dimension_signals": {
+        "chan_four_state": 0.0,
+        "chan_three_type": 0.0769,
+        "chan_vaa_compound": 0.0231
+      },
+      "lifecycle_state": {
+        "symbol": "300394.SZ",
+        "state": "COOLDOWN",
+        "held_bars": 0,
+        "entry_streak": 0,
+        "exit_streak": 0,
+        "cooldown_remaining": 2,
+        "entry_price": 0.0,
+        "peak_price": 0.0,
+        "current_weight": 0.0,
+        "last_exit_type": "NORMAL"
+      },
+      "lifecycle_decision": {
+        "loss_pct": 0.0002188144440828932,
+        "current_price": 133.82756310111589,
+        "entry_price": 133.7982861035229,
+        "peak_price": 212.8,
+        "atr": 1.730787299684428,
+        "trailing_stop": 205.01145715142007,
+        "is_emergency_halt": false,
+        "last_exit_type": "TRAILING_STOP"
+      },
+      "inertia_check": {
+        "delta_weight": -0.0515,
+        "threshold": 0.05,
+        "triggered": true
+      },
+      "holding_lock": {
+        "bars_held": 0,
+        "min_holding_bars": 2,
+        "locked": false
+      },
+      "cooldown_status": {
+        "bars_since_exit": 999,
+        "cooldown_remaining": 2,
+        "min_cooldown_bars": 2,
+        "in_cooldown": true
+      },
+      "sector_throttle": {
+        "sector": "telecom_cpo",
+        "max_allowed": 3,
+        "current_sector_holdings": 1,
+        "throttled": false
+      },
+      "macro_gate": {
+        "passed": true,
+        "breadth": 0.3636,
+        "thrust": 0.3636
+      },
+      "lot_rounding": {
+        "target_shares_raw": -38.0,
+        "shares": 38,
+        "lot_size": 100
+      },
+      "fast_path_badge": "⚡[STOP_LOSS]",
+      "fast_path_triggered": "STOP_LOSS"
+    },
+    "strategy_version": "1.0.0",
+    "base_version": "1.4.0",
+    "execution_warning": null,
+    "intraday_vwap": null,
+    "vwap_premium_pct": null,
+    "chan_5m_state": "N/A",
+    "suggested_limit_price": 133.43,
+    "passive_support_limit_price": 133.43
+  },
+  {
+    "symbol": "600028.SH",
+    "name": "中国石化",
+    "action": "BUY",
+    "price": 136.81364820182213,
+    "current_weight": 0.10190589786063196,
+    "target_weight": 0.10190589786063196,
+    "delta_weight": 0.0,
+    "current_shares": 74,
+    "target_shares": 74,
+    "delta_shares": 0,
+    "shares": 0,
+    "trade_value": 0.0,
+    "trade_value_rmb": 0.0,
+    "holding_bars": 0,
+    "reason": "开仓/再入场信号持续 3 日确认生效",
+    "summary_reason": "开仓/再入场信号持续 3 日确认生效",
+    "detail_reason": {
+      "summary_reason": "开仓/再入场信号持续 3 日确认生效",
+      "dimension_signals": {
+        "chan_four_state": 0.3333,
+        "chan_three_type": 0.0625,
+        "chan_vaa_compound": 0.0273
+      },
+      "lifecycle_state": {
+        "symbol": "600028.SH",
+        "state": "HELD_GESTATION",
+        "held_bars": 0,
+        "entry_streak": 3,
+        "exit_streak": 0,
+        "cooldown_remaining": 0,
+        "entry_price": 136.81364820182213,
+        "peak_price": 136.81364820182213,
+        "current_weight": 0.10190589786063196,
+        "last_exit_type": null
+      },
+      "lifecycle_decision": {
+        "entry_streak": 3,
+        "guard_latency_bars": 2,
+        "target_weight": 0.10190589786063196
+      },
+      "inertia_check": {
+        "delta_weight": 0.0,
+        "threshold": 0.05,
+        "triggered": false
+      },
+      "holding_lock": {
+        "bars_held": 0,
+        "min_holding_bars": 2,
+        "locked": true
+      },
+      "cooldown_status": {
+        "bars_since_exit": 999,
+        "cooldown_remaining": 0,
+        "min_cooldown_bars": 2,
+        "in_cooldown": false
+      },
+      "sector_throttle": {
+        "sector": "oil_petrochem",
+        "max_allowed": 3,
+        "current_sector_holdings": 1,
+        "throttled": false
+      },
+      "macro_gate": {
+        "passed": true,
+        "breadth": 0.3636,
+        "thrust": 0.3636
+      },
+      "lot_rounding": {
+        "target_shares_raw": 0.0,
+        "shares": 0,
+        "lot_size": 100
+      }
+    },
+    "strategy_version": "1.0.0",
+    "base_version": "1.4.0",
+    "execution_warning": null,
+    "intraday_vwap": null,
+    "vwap_premium_pct": null,
+    "chan_5m_state": "N/A",
+    "suggested_limit_price": 137.09,
+    "passive_support_limit_price": 137.09
+  },
+  {
+    "symbol": "600941.SH",
+    "name": "中国移动",
+    "action": "BUY",
+    "price": 131.471789016864,
+    "current_weight": 0.07708045131046895,
+    "target_weight": 0.07708045131046895,
+    "delta_weight": 0.0,
+    "current_shares": 59,
+    "target_shares": 59,
+    "delta_shares": 0,
+    "shares": 0,
+    "trade_value": 0.0,
+    "trade_value_rmb": 0.0,
+    "holding_bars": 0,
+    "reason": "开仓/再入场信号持续 3 日确认生效",
+    "summary_reason": "开仓/再入场信号持续 3 日确认生效",
+    "detail_reason": {
+      "summary_reason": "开仓/再入场信号持续 3 日确认生效",
+      "dimension_signals": {
+        "chan_four_state": 0.0,
+        "chan_three_type": 0.0769,
+        "chan_vaa_compound": 0.03
+      },
+      "lifecycle_state": {
+        "symbol": "600941.SH",
+        "state": "HELD_GESTATION",
+        "held_bars": 0,
+        "entry_streak": 3,
+        "exit_streak": 0,
+        "cooldown_remaining": 0,
+        "entry_price": 131.471789016864,
+        "peak_price": 131.471789016864,
+        "current_weight": 0.07708045131046895,
+        "last_exit_type": null
+      },
+      "lifecycle_decision": {
+        "entry_streak": 3,
+        "guard_latency_bars": 2,
+        "target_weight": 0.07708045131046895
+      },
+      "inertia_check": {
+        "delta_weight": 0.0,
+        "threshold": 0.05,
+        "triggered": false
+      },
+      "holding_lock": {
+        "bars_held": 0,
+        "min_holding_bars": 2,
+        "locked": true
+      },
+      "cooldown_status": {
+        "bars_since_exit": 999,
+        "cooldown_remaining": 0,
+        "min_cooldown_bars": 2,
+        "in_cooldown": false
+      },
+      "sector_throttle": {
+        "sector": "telecom",
+        "max_allowed": 3,
+        "current_sector_holdings": 2,
+        "throttled": false
+      },
+      "macro_gate": {
+        "passed": true,
+        "breadth": 0.3636,
+        "thrust": 0.3636
+      },
+      "lot_rounding": {
+        "target_shares_raw": 0.0,
+        "shares": 0,
+        "lot_size": 100
+      }
+    },
+    "strategy_version": "1.0.0",
+    "base_version": "1.4.0",
+    "execution_warning": null,
+    "intraday_vwap": null,
+    "vwap_premium_pct": null,
+    "chan_5m_state": "N/A",
+    "suggested_limit_price": 131.73,
+    "passive_support_limit_price": 131.73
+  },
+  {
+    "symbol": "601225.SH",
+    "name": "陕西煤业",
+    "action": "BUY",
+    "price": 158.61063679900568,
+    "current_weight": 0.07041609854046586,
+    "target_weight": 0.07041609854046586,
+    "delta_weight": 0.0,
+    "current_shares": 44,
+    "target_shares": 44,
+    "delta_shares": 0,
+    "shares": 0,
+    "trade_value": 0.0,
+    "trade_value_rmb": 0.0,
+    "holding_bars": 0,
+    "reason": "开仓/再入场信号持续 3 日确认生效",
+    "summary_reason": "开仓/再入场信号持续 3 日确认生效",
+    "detail_reason": {
+      "summary_reason": "开仓/再入场信号持续 3 日确认生效",
+      "dimension_signals": {
+        "chan_four_state": 0.0,
+        "chan_three_type": 0.0769,
+        "chan_vaa_compound": 0.0273
+      },
+      "lifecycle_state": {
+        "symbol": "601225.SH",
+        "state": "HELD_GESTATION",
+        "held_bars": 0,
+        "entry_streak": 3,
+        "exit_streak": 0,
+        "cooldown_remaining": 0,
+        "entry_price": 158.61063679900568,
+        "peak_price": 158.61063679900568,
+        "current_weight": 0.07041609854046586,
+        "last_exit_type": null
+      },
+      "lifecycle_decision": {
+        "entry_streak": 3,
+        "guard_latency_bars": 2,
+        "target_weight": 0.07041609854046586
+      },
+      "inertia_check": {
+        "delta_weight": 0.0,
+        "threshold": 0.05,
+        "triggered": false
+      },
+      "holding_lock": {
+        "bars_held": 0,
+        "min_holding_bars": 2,
+        "locked": true
+      },
+      "cooldown_status": {
+        "bars_since_exit": 999,
+        "cooldown_remaining": 0,
+        "min_cooldown_bars": 2,
+        "in_cooldown": false
+      },
+      "sector_throttle": {
+        "sector": "coal",
+        "max_allowed": 3,
+        "current_sector_holdings": 2,
+        "throttled": false
+      },
+      "macro_gate": {
+        "passed": true,
+        "breadth": 0.3636,
+        "thrust": 0.3636
+      },
+      "lot_rounding": {
+        "target_shares_raw": 0.0,
+        "shares": 0,
+        "lot_size": 100
+      }
+    },
+    "strategy_version": "1.0.0",
+    "base_version": "1.4.0",
+    "execution_warning": null,
+    "intraday_vwap": null,
+    "vwap_premium_pct": null,
+    "chan_5m_state": "N/A",
+    "suggested_limit_price": 158.93,
+    "passive_support_limit_price": 158.93
+  },
+  {
+    "symbol": "601899.SH",
+    "name": "紫金矿业",
+    "action": "BUY",
+    "price": 166.07896577439294,
+    "current_weight": 0.07708045131046895,
+    "target_weight": 0.07708045131046895,
+    "delta_weight": 0.0,
+    "current_shares": 46,
+    "target_shares": 46,
+    "delta_shares": 0,
+    "shares": 0,
+    "trade_value": 0.0,
+    "trade_value_rmb": 0.0,
+    "holding_bars": 0,
+    "reason": "开仓/再入场信号持续 3 日确认生效",
+    "summary_reason": "开仓/再入场信号持续 3 日确认生效",
+    "detail_reason": {
+      "summary_reason": "开仓/再入场信号持续 3 日确认生效",
+      "dimension_signals": {
+        "chan_four_state": 0.0,
+        "chan_three_type": 0.0769,
+        "chan_vaa_compound": 0.03
+      },
+      "lifecycle_state": {
+        "symbol": "601899.SH",
+        "state": "HELD_GESTATION",
+        "held_bars": 0,
+        "entry_streak": 3,
+        "exit_streak": 0,
+        "cooldown_remaining": 0,
+        "entry_price": 166.07896577439294,
+        "peak_price": 166.07896577439294,
+        "current_weight": 0.07708045131046895,
+        "last_exit_type": null
+      },
+      "lifecycle_decision": {
+        "entry_streak": 3,
+        "guard_latency_bars": 2,
+        "target_weight": 0.07708045131046895
+      },
+      "inertia_check": {
+        "delta_weight": 0.0,
+        "threshold": 0.05,
+        "triggered": false
+      },
+      "holding_lock": {
+        "bars_held": 0,
+        "min_holding_bars": 2,
+        "locked": true
+      },
+      "cooldown_status": {
+        "bars_since_exit": 999,
+        "cooldown_remaining": 0,
+        "min_cooldown_bars": 2,
+        "in_cooldown": false
+      },
+      "sector_throttle": {
+        "sector": "metals",
+        "max_allowed": 3,
+        "current_sector_holdings": 1,
+        "throttled": false
+      },
+      "macro_gate": {
+        "passed": true,
+        "breadth": 0.3636,
+        "thrust": 0.3636
+      },
+      "lot_rounding": {
+        "target_shares_raw": 0.0,
+        "shares": 0,
+        "lot_size": 100
+      }
+    },
+    "strategy_version": "1.0.0",
+    "base_version": "1.4.0",
+    "execution_warning": null,
+    "intraday_vwap": null,
+    "vwap_premium_pct": null,
+    "chan_5m_state": "N/A",
+    "suggested_limit_price": 166.41,
+    "passive_support_limit_price": 166.41
+  },
+  {
+    "symbol": "601601.SH",
+    "name": "中国太保",
+    "action": "BUY",
+    "price": 192.45363110690755,
+    "current_weight": 0.009910225105121495,
+    "target_weight": 0.10655903447267981,
+    "delta_weight": 0.09664880936755832,
+    "current_shares": 5,
+    "target_shares": 5,
+    "delta_shares": 0,
+    "shares": 0,
+    "trade_value": 0.0,
+    "trade_value_rmb": 0.0,
+    "holding_bars": 0,
+    "reason": "开仓/再入场信号持续 3 日确认生效",
+    "summary_reason": "开仓/再入场信号持续 3 日确认生效",
+    "detail_reason": {
+      "summary_reason": "开仓/再入场信号持续 3 日确认生效",
+      "dimension_signals": {
+        "chan_four_state": 0.3333,
+        "chan_three_type": 0.0714,
+        "chan_vaa_compound": 0.0231
+      },
+      "lifecycle_state": {
+        "symbol": "601601.SH",
+        "state": "HELD_GESTATION",
+        "held_bars": 0,
+        "entry_streak": 3,
+        "exit_streak": 0,
+        "cooldown_remaining": 0,
+        "entry_price": 192.45363110690755,
+        "peak_price": 192.45363110690755,
+        "current_weight": 0.10655903447267981,
+        "last_exit_type": null
+      },
+      "lifecycle_decision": {
+        "entry_streak": 3,
+        "guard_latency_bars": 2,
+        "target_weight": 0.10655903447267981
+      },
+      "inertia_check": {
+        "delta_weight": 0.0966,
+        "threshold": 0.05,
+        "triggered": true
+      },
+      "holding_lock": {
+        "bars_held": 0,
+        "min_holding_bars": 2,
+        "locked": true
+      },
+      "cooldown_status": {
+        "bars_since_exit": 999,
+        "cooldown_remaining": 0,
+        "min_cooldown_bars": 2,
+        "in_cooldown": false
+      },
+      "sector_throttle": {
+        "sector": "insurance",
+        "max_allowed": 3,
+        "current_sector_holdings": 1,
+        "throttled": false
+      },
+      "macro_gate": {
+        "passed": true,
+        "breadth": 0.3636,
+        "thrust": 0.3636
+      },
+      "lot_rounding": {
+        "target_shares_raw": 50.22,
+        "shares": 0,
+        "lot_size": 100
+      }
+    },
+    "strategy_version": "1.0.0",
+    "base_version": "1.4.0",
+    "execution_warning": null,
+    "intraday_vwap": null,
+    "vwap_premium_pct": null,
+    "chan_5m_state": "N/A",
+    "suggested_limit_price": 192.84,
+    "passive_support_limit_price": 192.84
+  },
+  {
     "symbol": "BIL",
     "name": "流动性现金",
     "action": "SWEEP_CASH",
     "price": 1.0,
-    "current_weight": 0.22727177079231284,
-    "target_weight": 0.22727177079231284,
-    "delta_weight": 0.0,
+    "current_weight": 0.0,
+    "target_weight": 0.05085447397842404,
+    "delta_weight": 0.05085447397842404,
     "current_shares": 0,
     "target_shares": 0,
     "delta_shares": 0,
     "shares": 0,
-    "trade_value": -0.0,
-    "trade_value_rmb": -0.0,
+    "trade_value": 5085.447397842404,
+    "trade_value_rmb": 5085.447397842404,
     "holding_bars": 0,
     "reason": "流动性闲置资金归集/释放",
     "summary_reason": "流动性闲置资金归集/释放",
     "detail_reason": {
       "summary_reason": "流动性闲置资金归集/释放",
       "dimension_signals": {
-        "chan_four_state_blend": 0.4481
+        "chan_four_state_blend": 0.1163
       },
       "lifecycle_state": {},
       "lifecycle_decision": {},
       "inertia_check": {
-        "delta_weight": 0.2209,
+        "delta_weight": 0.1163,
         "threshold": 0.05,
         "triggered": true
       },
@@ -47,8 +552,8 @@
       },
       "macro_gate": {
         "passed": true,
-        "breadth": 0.5,
-        "thrust": 0.5
+        "breadth": 0.3636,
+        "thrust": 0.3636
       },
       "lot_rounding": {
         "target_shares_raw": 0.0,
@@ -57,781 +562,37 @@
       }
     },
     "strategy_version": "1.0.0",
-    "base_version": "1.0.0"
-  },
-  {
-    "symbol": "000157.SZ",
-    "name": "中联重科",
-    "action": "HOLD_FILTERED",
-    "price": 5.89,
-    "current_weight": 0.0,
-    "target_weight": 0.0,
-    "delta_weight": 0.0,
-    "current_shares": 0,
-    "target_shares": 0,
-    "delta_shares": 0,
-    "shares": 0,
-    "trade_value": 0.0,
-    "trade_value_rmb": 0.0,
-    "holding_bars": 0,
-    "reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "detail_reason": {
-      "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-      "dimension_signals": {
-        "chan_four_state": 0.0,
-        "chan_three_type": 0.0,
-        "chan_vaa_compound": 0.0
-      },
-      "lifecycle_state": {
-        "symbol": "000157.SZ",
-        "state": "PENDING_ENTRY",
-        "held_bars": 0,
-        "entry_streak": 2,
-        "exit_streak": 0,
-        "cooldown_remaining": 0,
-        "entry_price": 113.4205708117684,
-        "peak_price": 113.4205708117684,
-        "current_weight": 0.0,
-        "last_exit_type": null
-      },
-      "lifecycle_decision": {
-        "is_market_open": false
-      },
-      "inertia_check": {
-        "delta_weight": 0.0,
-        "threshold": 0.05,
-        "triggered": false
-      },
-      "holding_lock": {
-        "bars_held": 0,
-        "min_holding_bars": 2,
-        "locked": false
-      },
-      "cooldown_status": {
-        "bars_since_exit": 999,
-        "cooldown_remaining": 0,
-        "min_cooldown_bars": 2,
-        "in_cooldown": false
-      },
-      "sector_throttle": {
-        "sector": "machinery",
-        "max_allowed": 3,
-        "current_sector_holdings": 0,
-        "throttled": false
-      },
-      "macro_gate": {
-        "passed": true,
-        "breadth": 0.5,
-        "thrust": 0.5
-      },
-      "lot_rounding": {
-        "target_shares_raw": 0.0,
-        "shares": 0,
-        "lot_size": 100
-      }
-    },
-    "strategy_version": "1.0.0",
-    "base_version": "1.0.0"
-  },
-  {
-    "symbol": "000938.SZ",
-    "name": "紫光股份",
-    "action": "HOLD_FILTERED",
-    "price": 25.32,
-    "current_weight": 0.050742652385776424,
-    "target_weight": 0.050742652385776424,
-    "delta_weight": 0.0,
-    "current_shares": 400,
-    "target_shares": 400,
-    "delta_shares": 0,
-    "shares": 0,
-    "trade_value": 0.0,
-    "trade_value_rmb": 0.0,
-    "holding_bars": 1,
-    "reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "detail_reason": {
-      "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-      "dimension_signals": {
-        "chan_four_state": 0.0,
-        "chan_three_type": 0.0,
-        "chan_vaa_compound": 0.0
-      },
-      "lifecycle_state": {
-        "symbol": "000938.SZ",
-        "state": "HELD_ACTIVE",
-        "held_bars": 1,
-        "entry_streak": 2,
-        "exit_streak": 0,
-        "cooldown_remaining": 0,
-        "entry_price": 142.5299771541008,
-        "peak_price": 142.5299771541008,
-        "current_weight": 0.050742652385776424,
-        "last_exit_type": null
-      },
-      "lifecycle_decision": {
-        "is_market_open": false
-      },
-      "inertia_check": {
-        "delta_weight": 0.0,
-        "threshold": 0.05,
-        "triggered": false
-      },
-      "holding_lock": {
-        "bars_held": 1,
-        "min_holding_bars": 2,
-        "locked": true
-      },
-      "cooldown_status": {
-        "bars_since_exit": 999,
-        "cooldown_remaining": 0,
-        "min_cooldown_bars": 2,
-        "in_cooldown": false
-      },
-      "sector_throttle": {
-        "sector": "computer_ict",
-        "max_allowed": 3,
-        "current_sector_holdings": 1,
-        "throttled": false
-      },
-      "macro_gate": {
-        "passed": true,
-        "breadth": 0.5,
-        "thrust": 0.5
-      },
-      "lot_rounding": {
-        "target_shares_raw": 0.0,
-        "shares": 0,
-        "lot_size": 100
-      }
-    },
-    "strategy_version": "1.0.0",
-    "base_version": "1.0.0"
-  },
-  {
-    "symbol": "300394.SZ",
-    "name": "天孚通信",
-    "action": "HOLD_FILTERED",
-    "price": 212.8,
-    "current_weight": 0.1066156835277767,
-    "target_weight": 0.1066156835277767,
-    "delta_weight": 0.0,
-    "current_shares": 100,
-    "target_shares": 100,
-    "delta_shares": 0,
-    "shares": 0,
-    "trade_value": 0.0,
-    "trade_value_rmb": 0.0,
-    "holding_bars": 12,
-    "reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "detail_reason": {
-      "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-      "dimension_signals": {
-        "chan_four_state": 0.0,
-        "chan_three_type": 0.2,
-        "chan_vaa_compound": 0.06
-      },
-      "lifecycle_state": {
-        "symbol": "300394.SZ",
-        "state": "HELD_ACTIVE",
-        "held_bars": 12,
-        "entry_streak": 2,
-        "exit_streak": 0,
-        "cooldown_remaining": 0,
-        "entry_price": 133.7982861035229,
-        "peak_price": 212.8,
-        "current_weight": 0.1066156835277767,
-        "last_exit_type": null
-      },
-      "lifecycle_decision": {
-        "is_market_open": false
-      },
-      "inertia_check": {
-        "delta_weight": 0.0,
-        "threshold": 0.05,
-        "triggered": false
-      },
-      "holding_lock": {
-        "bars_held": 12,
-        "min_holding_bars": 2,
-        "locked": false
-      },
-      "cooldown_status": {
-        "bars_since_exit": 999,
-        "cooldown_remaining": 0,
-        "min_cooldown_bars": 2,
-        "in_cooldown": false
-      },
-      "sector_throttle": {
-        "sector": "telecom_cpo",
-        "max_allowed": 3,
-        "current_sector_holdings": 1,
-        "throttled": false
-      },
-      "macro_gate": {
-        "passed": true,
-        "breadth": 0.5,
-        "thrust": 0.5
-      },
-      "lot_rounding": {
-        "target_shares_raw": 0.0,
-        "shares": 0,
-        "lot_size": 100
-      }
-    },
-    "strategy_version": "1.0.0",
-    "base_version": "1.0.0"
-  },
-  {
-    "symbol": "600000.SH",
-    "name": "浦发银行",
-    "action": "HOLD_FILTERED",
-    "price": 9.73,
-    "current_weight": 0.0,
-    "target_weight": 0.0,
-    "delta_weight": 0.0,
-    "current_shares": 0,
-    "target_shares": 0,
-    "delta_shares": 0,
-    "shares": 0,
-    "trade_value": 0.0,
-    "trade_value_rmb": 0.0,
-    "holding_bars": 0,
-    "reason": "目标仓位未达最低建仓/调仓门槛 (目标 1.5% < 门槛 5%，防微量试错损耗)",
-    "summary_reason": "目标仓位未达最低建仓/调仓门槛 (目标 1.5% < 门槛 5%，防微量试错损耗)",
-    "detail_reason": {
-      "summary_reason": "目标仓位未达最低建仓/调仓门槛 (目标 1.5% < 门槛 5%，防微量试错损耗)",
-      "dimension_signals": {
-        "chan_four_state": 0.0,
-        "chan_three_type": 0.0,
-        "chan_vaa_compound": 0.0
-      },
-      "lifecycle_state": {
-        "symbol": "600000.SH",
-        "state": "PENDING_ENTRY",
-        "held_bars": 0,
-        "entry_streak": 2,
-        "exit_streak": 0,
-        "cooldown_remaining": 0,
-        "entry_price": 124.00187607641439,
-        "peak_price": 124.00187607641439,
-        "current_weight": 0.0,
-        "last_exit_type": null
-      },
-      "lifecycle_decision": {
-        "is_market_open": false
-      },
-      "inertia_check": {
-        "delta_weight": 0.0,
-        "threshold": 0.05,
-        "triggered": false
-      },
-      "holding_lock": {
-        "bars_held": 0,
-        "min_holding_bars": 2,
-        "locked": false
-      },
-      "cooldown_status": {
-        "bars_since_exit": 999,
-        "cooldown_remaining": 0,
-        "min_cooldown_bars": 2,
-        "in_cooldown": false
-      },
-      "sector_throttle": {
-        "sector": "banking",
-        "max_allowed": 3,
-        "current_sector_holdings": 2,
-        "throttled": false
-      },
-      "macro_gate": {
-        "passed": true,
-        "breadth": 0.5,
-        "thrust": 0.5
-      },
-      "lot_rounding": {
-        "target_shares_raw": 0.0,
-        "shares": 0,
-        "lot_size": 100
-      }
-    },
-    "strategy_version": "1.0.0",
-    "base_version": "1.0.0"
-  },
-  {
-    "symbol": "600028.SH",
-    "name": "中国石化",
-    "action": "HOLD_FILTERED",
-    "price": 5.53,
-    "current_weight": 0.0,
-    "target_weight": 0.0,
-    "delta_weight": 0.0,
-    "current_shares": 0,
-    "target_shares": 0,
-    "delta_shares": 0,
-    "shares": 0,
-    "trade_value": 0.0,
-    "trade_value_rmb": 0.0,
-    "holding_bars": 0,
-    "reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "detail_reason": {
-      "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-      "dimension_signals": {
-        "chan_four_state": 0.3333,
-        "chan_three_type": 0.0,
-        "chan_vaa_compound": 0.0
-      },
-      "lifecycle_state": {
-        "symbol": "600028.SH",
-        "state": "PENDING_ENTRY",
-        "held_bars": 0,
-        "entry_streak": 2,
-        "exit_streak": 0,
-        "cooldown_remaining": 0,
-        "entry_price": 136.48669962089252,
-        "peak_price": 136.48669962089252,
-        "current_weight": 0.0,
-        "last_exit_type": null
-      },
-      "lifecycle_decision": {
-        "is_market_open": false
-      },
-      "inertia_check": {
-        "delta_weight": 0.0,
-        "threshold": 0.05,
-        "triggered": false
-      },
-      "holding_lock": {
-        "bars_held": 0,
-        "min_holding_bars": 2,
-        "locked": false
-      },
-      "cooldown_status": {
-        "bars_since_exit": 999,
-        "cooldown_remaining": 0,
-        "min_cooldown_bars": 2,
-        "in_cooldown": false
-      },
-      "sector_throttle": {
-        "sector": "oil_petrochem",
-        "max_allowed": 3,
-        "current_sector_holdings": 0,
-        "throttled": false
-      },
-      "macro_gate": {
-        "passed": true,
-        "breadth": 0.5,
-        "thrust": 0.5
-      },
-      "lot_rounding": {
-        "target_shares_raw": 0.0,
-        "shares": 0,
-        "lot_size": 100
-      }
-    },
-    "strategy_version": "1.0.0",
-    "base_version": "1.0.0"
-  },
-  {
-    "symbol": "600362.SH",
-    "name": "江西铜业",
-    "action": "HOLD_FILTERED",
-    "price": 39.43,
-    "current_weight": 0.019754964292764264,
-    "target_weight": 0.019754964292764264,
-    "delta_weight": 0.0,
-    "current_shares": 100,
-    "target_shares": 100,
-    "delta_shares": 0,
-    "shares": 0,
-    "trade_value": 0.0,
-    "trade_value_rmb": 0.0,
-    "holding_bars": 9,
-    "reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "detail_reason": {
-      "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-      "dimension_signals": {
-        "chan_four_state": 0.0,
-        "chan_three_type": 0.0,
-        "chan_vaa_compound": 0.0
-      },
-      "lifecycle_state": {
-        "symbol": "600362.SH",
-        "state": "HELD_ACTIVE",
-        "held_bars": 9,
-        "entry_streak": 2,
-        "exit_streak": 0,
-        "cooldown_remaining": 0,
-        "entry_price": 117.24378085178313,
-        "peak_price": 117.24378085178313,
-        "current_weight": 0.019754964292764264,
-        "last_exit_type": null
-      },
-      "lifecycle_decision": {
-        "is_market_open": false
-      },
-      "inertia_check": {
-        "delta_weight": 0.0,
-        "threshold": 0.05,
-        "triggered": false
-      },
-      "holding_lock": {
-        "bars_held": 9,
-        "min_holding_bars": 2,
-        "locked": false
-      },
-      "cooldown_status": {
-        "bars_since_exit": 999,
-        "cooldown_remaining": 0,
-        "min_cooldown_bars": 2,
-        "in_cooldown": false
-      },
-      "sector_throttle": {
-        "sector": "metals",
-        "max_allowed": 3,
-        "current_sector_holdings": 1,
-        "throttled": false
-      },
-      "macro_gate": {
-        "passed": true,
-        "breadth": 0.5,
-        "thrust": 0.5
-      },
-      "lot_rounding": {
-        "target_shares_raw": 0.0,
-        "shares": 0,
-        "lot_size": 100
-      }
-    },
-    "strategy_version": "1.0.0",
-    "base_version": "1.0.0"
-  },
-  {
-    "symbol": "600584.SH",
-    "name": "长电科技",
-    "action": "HOLD_FILTERED",
-    "price": 56.96,
-    "current_weight": 0.0,
-    "target_weight": 0.0,
-    "delta_weight": 0.0,
-    "current_shares": 0,
-    "target_shares": 0,
-    "delta_shares": 0,
-    "shares": 0,
-    "trade_value": 0.0,
-    "trade_value_rmb": 0.0,
-    "holding_bars": 0,
-    "reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "detail_reason": {
-      "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-      "dimension_signals": {
-        "chan_four_state": 0.0,
-        "chan_three_type": 0.2,
-        "chan_vaa_compound": 0.06
-      },
-      "lifecycle_state": {
-        "symbol": "600584.SH",
-        "state": "FLAT",
-        "held_bars": 0,
-        "entry_streak": 0,
-        "exit_streak": 0,
-        "cooldown_remaining": 0,
-        "entry_price": 0.0,
-        "peak_price": 0.0,
-        "current_weight": 0.0,
-        "last_exit_type": null
-      },
-      "lifecycle_decision": {
-        "is_market_open": false
-      },
-      "inertia_check": {
-        "delta_weight": 0.0,
-        "threshold": 0.05,
-        "triggered": false
-      },
-      "holding_lock": {
-        "bars_held": 0,
-        "min_holding_bars": 2,
-        "locked": false
-      },
-      "cooldown_status": {
-        "bars_since_exit": 999,
-        "cooldown_remaining": 0,
-        "min_cooldown_bars": 2,
-        "in_cooldown": false
-      },
-      "sector_throttle": {
-        "sector": "semiconductor",
-        "max_allowed": 3,
-        "current_sector_holdings": 0,
-        "throttled": false
-      },
-      "macro_gate": {
-        "passed": true,
-        "breadth": 0.5,
-        "thrust": 0.5
-      },
-      "lot_rounding": {
-        "target_shares_raw": 0.0,
-        "shares": 0,
-        "lot_size": 100
-      }
-    },
-    "strategy_version": "1.0.0",
-    "base_version": "1.0.0"
-  },
-  {
-    "symbol": "600660.SH",
-    "name": "福耀玻璃",
-    "action": "HOLD_FILTERED",
-    "price": 54.78,
-    "current_weight": 0.1097820891663836,
-    "target_weight": 0.1097820891663836,
-    "delta_weight": 0.0,
-    "current_shares": 400,
-    "target_shares": 400,
-    "delta_shares": 0,
-    "shares": 0,
-    "trade_value": 0.0,
-    "trade_value_rmb": 0.0,
-    "holding_bars": 12,
-    "reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "detail_reason": {
-      "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-      "dimension_signals": {
-        "chan_four_state": 0.0,
-        "chan_three_type": 0.2,
-        "chan_vaa_compound": 0.06
-      },
-      "lifecycle_state": {
-        "symbol": "600660.SH",
-        "state": "HELD_ACTIVE",
-        "held_bars": 12,
-        "entry_streak": 2,
-        "exit_streak": 0,
-        "cooldown_remaining": 0,
-        "entry_price": 123.96126372315983,
-        "peak_price": 123.96126372315983,
-        "current_weight": 0.1097820891663836,
-        "last_exit_type": null
-      },
-      "lifecycle_decision": {
-        "is_market_open": false
-      },
-      "inertia_check": {
-        "delta_weight": 0.0,
-        "threshold": 0.05,
-        "triggered": false
-      },
-      "holding_lock": {
-        "bars_held": 12,
-        "min_holding_bars": 2,
-        "locked": false
-      },
-      "cooldown_status": {
-        "bars_since_exit": 999,
-        "cooldown_remaining": 0,
-        "min_cooldown_bars": 2,
-        "in_cooldown": false
-      },
-      "sector_throttle": {
-        "sector": "auto_parts",
-        "max_allowed": 3,
-        "current_sector_holdings": 1,
-        "throttled": false
-      },
-      "macro_gate": {
-        "passed": true,
-        "breadth": 0.5,
-        "thrust": 0.5
-      },
-      "lot_rounding": {
-        "target_shares_raw": 0.0,
-        "shares": 0,
-        "lot_size": 100
-      }
-    },
-    "strategy_version": "1.0.0",
-    "base_version": "1.0.0"
-  },
-  {
-    "symbol": "600941.SH",
-    "name": "中国移动",
-    "action": "HOLD_FILTERED",
-    "price": 101.4,
-    "current_weight": 0.0,
-    "target_weight": 0.0,
-    "delta_weight": 0.0,
-    "current_shares": 0,
-    "target_shares": 0,
-    "delta_shares": 0,
-    "shares": 0,
-    "trade_value": 0.0,
-    "trade_value_rmb": 0.0,
-    "holding_bars": 0,
-    "reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "detail_reason": {
-      "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-      "dimension_signals": {
-        "chan_four_state": 0.0,
-        "chan_three_type": 0.0,
-        "chan_vaa_compound": 0.0
-      },
-      "lifecycle_state": {
-        "symbol": "600941.SH",
-        "state": "PENDING_ENTRY",
-        "held_bars": 0,
-        "entry_streak": 2,
-        "exit_streak": 0,
-        "cooldown_remaining": 0,
-        "entry_price": 130.58329815650444,
-        "peak_price": 130.58329815650444,
-        "current_weight": 0.0,
-        "last_exit_type": null
-      },
-      "lifecycle_decision": {
-        "is_market_open": false
-      },
-      "inertia_check": {
-        "delta_weight": 0.0,
-        "threshold": 0.05,
-        "triggered": false
-      },
-      "holding_lock": {
-        "bars_held": 0,
-        "min_holding_bars": 2,
-        "locked": false
-      },
-      "cooldown_status": {
-        "bars_since_exit": 999,
-        "cooldown_remaining": 0,
-        "min_cooldown_bars": 2,
-        "in_cooldown": false
-      },
-      "sector_throttle": {
-        "sector": "telecom",
-        "max_allowed": 3,
-        "current_sector_holdings": 1,
-        "throttled": false
-      },
-      "macro_gate": {
-        "passed": true,
-        "breadth": 0.5,
-        "thrust": 0.5
-      },
-      "lot_rounding": {
-        "target_shares_raw": 0.0,
-        "shares": 0,
-        "lot_size": 100
-      }
-    },
-    "strategy_version": "1.0.0",
-    "base_version": "1.0.0"
-  },
-  {
-    "symbol": "601088.SH",
-    "name": "中国神华",
-    "action": "HOLD_FILTERED",
-    "price": 50.98,
-    "current_weight": 0.10216668320011384,
-    "target_weight": 0.10216668320011384,
-    "delta_weight": 0.0,
-    "current_shares": 400,
-    "target_shares": 400,
-    "delta_shares": 0,
-    "shares": 0,
-    "trade_value": 0.0,
-    "trade_value_rmb": 0.0,
-    "holding_bars": 5,
-    "reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "detail_reason": {
-      "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-      "dimension_signals": {
-        "chan_four_state": 0.0,
-        "chan_three_type": 0.0,
-        "chan_vaa_compound": 0.0
-      },
-      "lifecycle_state": {
-        "symbol": "601088.SH",
-        "state": "HELD_ACTIVE",
-        "held_bars": 5,
-        "entry_streak": 2,
-        "exit_streak": 0,
-        "cooldown_remaining": 0,
-        "entry_price": 85.48649287765801,
-        "peak_price": 85.48649287765801,
-        "current_weight": 0.10216668320011384,
-        "last_exit_type": null
-      },
-      "lifecycle_decision": {
-        "is_market_open": false
-      },
-      "inertia_check": {
-        "delta_weight": 0.0,
-        "threshold": 0.05,
-        "triggered": false
-      },
-      "holding_lock": {
-        "bars_held": 5,
-        "min_holding_bars": 2,
-        "locked": false
-      },
-      "cooldown_status": {
-        "bars_since_exit": 999,
-        "cooldown_remaining": 0,
-        "min_cooldown_bars": 2,
-        "in_cooldown": false
-      },
-      "sector_throttle": {
-        "sector": "coal",
-        "max_allowed": 3,
-        "current_sector_holdings": 1,
-        "throttled": false
-      },
-      "macro_gate": {
-        "passed": true,
-        "breadth": 0.5,
-        "thrust": 0.5
-      },
-      "lot_rounding": {
-        "target_shares_raw": 0.0,
-        "shares": 0,
-        "lot_size": 100
-      }
-    },
-    "strategy_version": "1.0.0",
-    "base_version": "1.0.0"
+    "base_version": "1.4.0",
+    "execution_warning": null,
+    "intraday_vwap": null,
+    "vwap_premium_pct": null,
+    "chan_5m_state": "N/A",
+    "suggested_limit_price": 1.0,
+    "passive_support_limit_price": 1.0
   },
   {
     "symbol": "601111.SH",
     "name": "中国国航",
     "action": "HOLD_FILTERED",
-    "price": 5.65,
-    "current_weight": 0.0,
+    "price": 87.38219263557102,
+    "current_weight": 0.03792918815184976,
     "target_weight": 0.0,
-    "delta_weight": 0.0,
-    "current_shares": 0,
-    "target_shares": 0,
+    "delta_weight": -0.03792918815184976,
+    "current_shares": 43,
+    "target_shares": 43,
     "delta_shares": 0,
     "shares": 0,
     "trade_value": 0.0,
     "trade_value_rmb": 0.0,
     "holding_bars": 0,
-    "reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
+    "reason": "目标仓位未达最低建仓/调仓门槛 (目标 3.8% < 门槛 5%，防微量试错损耗)",
+    "summary_reason": "目标仓位未达最低建仓/调仓门槛 (目标 3.8% < 门槛 5%，防微量试错损耗)",
     "detail_reason": {
-      "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
+      "summary_reason": "目标仓位未达最低建仓/调仓门槛 (目标 3.8% < 门槛 5%，防微量试错损耗)",
       "dimension_signals": {
         "chan_four_state": 0.0,
-        "chan_three_type": 0.2,
-        "chan_vaa_compound": 0.06
+        "chan_three_type": 0.0472,
+        "chan_vaa_compound": 0.0
       },
       "lifecycle_state": {
         "symbol": "601111.SH",
@@ -842,14 +603,17 @@
         "cooldown_remaining": 0,
         "entry_price": 0.0,
         "peak_price": 0.0,
-        "current_weight": 0.0,
+        "current_weight": 0.03792918815184976,
         "last_exit_type": null
       },
       "lifecycle_decision": {
-        "is_market_open": false
+        "delta_w": 0.03792918815184976,
+        "inertia_threshold": 0.05,
+        "raw_target_weight": 0.03792918815184976,
+        "current_weight": 0.0
       },
       "inertia_check": {
-        "delta_weight": 0.0,
+        "delta_weight": -0.0379,
         "threshold": 0.05,
         "triggered": false
       },
@@ -867,13 +631,13 @@
       "sector_throttle": {
         "sector": "aviation",
         "max_allowed": 3,
-        "current_sector_holdings": 0,
+        "current_sector_holdings": 1,
         "throttled": false
       },
       "macro_gate": {
         "passed": true,
-        "breadth": 0.5,
-        "thrust": 0.5
+        "breadth": 0.3636,
+        "thrust": 0.3636
       },
       "lot_rounding": {
         "target_shares_raw": 0.0,
@@ -882,13 +646,271 @@
       }
     },
     "strategy_version": "1.0.0",
-    "base_version": "1.0.0"
+    "base_version": "1.4.0",
+    "execution_warning": null,
+    "intraday_vwap": null,
+    "vwap_premium_pct": null,
+    "chan_5m_state": "N/A",
+    "suggested_limit_price": 87.38219263557102,
+    "passive_support_limit_price": 87.38219263557102
   },
   {
-    "symbol": "601225.SH",
-    "name": "陕西煤业",
+    "symbol": "000938.SZ",
+    "name": "紫光股份",
+    "action": "HOLD",
+    "price": 141.23354421089792,
+    "current_weight": 0.05083771925876584,
+    "target_weight": 0.05083771925876584,
+    "delta_weight": 0.0,
+    "current_shares": 36,
+    "target_shares": 36,
+    "delta_shares": 0,
+    "shares": 0,
+    "trade_value": 0.0,
+    "trade_value_rmb": 0.0,
+    "holding_bars": 2,
+    "reason": "调仓未超惰性阈值 (< 5%)",
+    "summary_reason": "调仓未超惰性阈值 (< 5%)",
+    "detail_reason": {
+      "summary_reason": "调仓未超惰性阈值 (< 5%)",
+      "dimension_signals": {
+        "chan_four_state": 0.0,
+        "chan_three_type": 0.0769,
+        "chan_vaa_compound": 0.03
+      },
+      "lifecycle_state": {
+        "symbol": "000938.SZ",
+        "state": "HELD_ACTIVE",
+        "held_bars": 2,
+        "entry_streak": 2,
+        "exit_streak": 0,
+        "cooldown_remaining": 0,
+        "entry_price": 142.5299771541008,
+        "peak_price": 142.5299771541008,
+        "current_weight": 0.05083771925876584,
+        "last_exit_type": null
+      },
+      "lifecycle_decision": {
+        "delta_w": 0.0,
+        "inertia_threshold": 0.05,
+        "raw_target_weight": 0.05083771925876584,
+        "current_weight": 0.05083771925876584
+      },
+      "inertia_check": {
+        "delta_weight": 0.0,
+        "threshold": 0.05,
+        "triggered": false
+      },
+      "holding_lock": {
+        "bars_held": 2,
+        "min_holding_bars": 2,
+        "locked": false
+      },
+      "cooldown_status": {
+        "bars_since_exit": 999,
+        "cooldown_remaining": 0,
+        "min_cooldown_bars": 2,
+        "in_cooldown": false
+      },
+      "sector_throttle": {
+        "sector": "computer_ict",
+        "max_allowed": 3,
+        "current_sector_holdings": 1,
+        "throttled": false
+      },
+      "macro_gate": {
+        "passed": true,
+        "breadth": 0.3636,
+        "thrust": 0.3636
+      },
+      "lot_rounding": {
+        "target_shares_raw": 0.0,
+        "shares": 0,
+        "lot_size": 100
+      }
+    },
+    "strategy_version": "1.0.0",
+    "base_version": "1.4.0",
+    "execution_warning": null,
+    "intraday_vwap": null,
+    "vwap_premium_pct": null,
+    "chan_5m_state": "N/A",
+    "suggested_limit_price": 141.23354421089792,
+    "passive_support_limit_price": 141.23354421089792
+  },
+  {
+    "symbol": "600660.SH",
+    "name": "福耀玻璃",
+    "action": "HOLD",
+    "price": 123.12775628203431,
+    "current_weight": 0.021442969858912683,
+    "target_weight": 0.021442969858912683,
+    "delta_weight": 0.0,
+    "current_shares": 17,
+    "target_shares": 17,
+    "delta_shares": 0,
+    "shares": 0,
+    "trade_value": 0.0,
+    "trade_value_rmb": 0.0,
+    "holding_bars": 13,
+    "reason": "调仓未超惰性阈值 (< 5%)",
+    "summary_reason": "调仓未超惰性阈值 (< 5%)",
+    "detail_reason": {
+      "summary_reason": "调仓未超惰性阈值 (< 5%)",
+      "dimension_signals": {
+        "chan_four_state": 0.0,
+        "chan_three_type": 0.0769,
+        "chan_vaa_compound": 0.0214
+      },
+      "lifecycle_state": {
+        "symbol": "600660.SH",
+        "state": "HELD_ACTIVE",
+        "held_bars": 13,
+        "entry_streak": 2,
+        "exit_streak": 0,
+        "cooldown_remaining": 0,
+        "entry_price": 123.96126372315983,
+        "peak_price": 123.96126372315983,
+        "current_weight": 0.021442969858912683,
+        "last_exit_type": null
+      },
+      "lifecycle_decision": {
+        "delta_w": 0.0,
+        "inertia_threshold": 0.05,
+        "raw_target_weight": 0.021442969858912683,
+        "current_weight": 0.021442969858912683
+      },
+      "inertia_check": {
+        "delta_weight": 0.0,
+        "threshold": 0.05,
+        "triggered": false
+      },
+      "holding_lock": {
+        "bars_held": 13,
+        "min_holding_bars": 2,
+        "locked": false
+      },
+      "cooldown_status": {
+        "bars_since_exit": 999,
+        "cooldown_remaining": 0,
+        "min_cooldown_bars": 2,
+        "in_cooldown": false
+      },
+      "sector_throttle": {
+        "sector": "auto_parts",
+        "max_allowed": 3,
+        "current_sector_holdings": 1,
+        "throttled": false
+      },
+      "macro_gate": {
+        "passed": true,
+        "breadth": 0.3636,
+        "thrust": 0.3636
+      },
+      "lot_rounding": {
+        "target_shares_raw": 0.0,
+        "shares": 0,
+        "lot_size": 100
+      }
+    },
+    "strategy_version": "1.0.0",
+    "base_version": "1.4.0",
+    "execution_warning": null,
+    "intraday_vwap": null,
+    "vwap_premium_pct": null,
+    "chan_5m_state": "N/A",
+    "suggested_limit_price": 123.12775628203431,
+    "passive_support_limit_price": 123.12775628203431
+  },
+  {
+    "symbol": "601088.SH",
+    "name": "中国神华",
+    "action": "HOLD",
+    "price": 86.01031899628383,
+    "current_weight": 0.07708045131046895,
+    "target_weight": 0.07708045131046895,
+    "delta_weight": 0.0,
+    "current_shares": 90,
+    "target_shares": 90,
+    "delta_shares": 0,
+    "shares": 0,
+    "trade_value": 0.0,
+    "trade_value_rmb": 0.0,
+    "holding_bars": 6,
+    "reason": "调仓未超惰性阈值 (< 5%)",
+    "summary_reason": "调仓未超惰性阈值 (< 5%)",
+    "detail_reason": {
+      "summary_reason": "调仓未超惰性阈值 (< 5%)",
+      "dimension_signals": {
+        "chan_four_state": 0.0,
+        "chan_three_type": 0.0769,
+        "chan_vaa_compound": 0.03
+      },
+      "lifecycle_state": {
+        "symbol": "601088.SH",
+        "state": "HELD_ACTIVE",
+        "held_bars": 6,
+        "entry_streak": 2,
+        "exit_streak": 0,
+        "cooldown_remaining": 0,
+        "entry_price": 85.48649287765801,
+        "peak_price": 86.01031899628383,
+        "current_weight": 0.07708045131046895,
+        "last_exit_type": null
+      },
+      "lifecycle_decision": {
+        "delta_w": 0.0,
+        "inertia_threshold": 0.05,
+        "raw_target_weight": 0.07708045131046895,
+        "current_weight": 0.07708045131046895
+      },
+      "inertia_check": {
+        "delta_weight": 0.0,
+        "threshold": 0.05,
+        "triggered": false
+      },
+      "holding_lock": {
+        "bars_held": 6,
+        "min_holding_bars": 2,
+        "locked": false
+      },
+      "cooldown_status": {
+        "bars_since_exit": 999,
+        "cooldown_remaining": 0,
+        "min_cooldown_bars": 2,
+        "in_cooldown": false
+      },
+      "sector_throttle": {
+        "sector": "coal",
+        "max_allowed": 3,
+        "current_sector_holdings": 2,
+        "throttled": false
+      },
+      "macro_gate": {
+        "passed": true,
+        "breadth": 0.3636,
+        "thrust": 0.3636
+      },
+      "lot_rounding": {
+        "target_shares_raw": 0.0,
+        "shares": 0,
+        "lot_size": 100
+      }
+    },
+    "strategy_version": "1.0.0",
+    "base_version": "1.4.0",
+    "execution_warning": null,
+    "intraday_vwap": null,
+    "vwap_premium_pct": null,
+    "chan_5m_state": "N/A",
+    "suggested_limit_price": 86.01031899628383,
+    "passive_support_limit_price": 86.01031899628383
+  },
+  {
+    "symbol": "601166.SH",
+    "name": "兴业银行",
     "action": "HOLD_FILTERED",
-    "price": 28.28,
+    "price": 88.01286925815232,
     "current_weight": 0.0,
     "target_weight": 0.0,
     "delta_weight": 0.0,
@@ -899,29 +921,30 @@
     "trade_value": 0.0,
     "trade_value_rmb": 0.0,
     "holding_bars": 0,
-    "reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
+    "reason": "开仓/再入场信号进入确认期 (第 1/2 日待确认，防脉冲假突破)",
+    "summary_reason": "开仓/再入场信号进入确认期 (第 1/2 日待确认，防脉冲假突破)",
     "detail_reason": {
-      "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
+      "summary_reason": "开仓/再入场信号进入确认期 (第 1/2 日待确认，防脉冲假突破)",
       "dimension_signals": {
         "chan_four_state": 0.3333,
-        "chan_three_type": 0.0,
-        "chan_vaa_compound": 0.0
+        "chan_three_type": 0.0231,
+        "chan_vaa_compound": 0.0214
       },
       "lifecycle_state": {
-        "symbol": "601225.SH",
+        "symbol": "601166.SH",
         "state": "PENDING_ENTRY",
         "held_bars": 0,
-        "entry_streak": 2,
+        "entry_streak": 1,
         "exit_streak": 0,
         "cooldown_remaining": 0,
-        "entry_price": 156.88115955837873,
-        "peak_price": 156.88115955837873,
+        "entry_price": 0.0,
+        "peak_price": 0.0,
         "current_weight": 0.0,
         "last_exit_type": null
       },
       "lifecycle_decision": {
-        "is_market_open": false
+        "entry_streak": 1,
+        "guard_latency_bars": 2
       },
       "inertia_check": {
         "delta_weight": 0.0,
@@ -940,15 +963,15 @@
         "in_cooldown": false
       },
       "sector_throttle": {
-        "sector": "coal",
+        "sector": "banking",
         "max_allowed": 3,
-        "current_sector_holdings": 1,
+        "current_sector_holdings": 0,
         "throttled": false
       },
       "macro_gate": {
         "passed": true,
-        "breadth": 0.5,
-        "thrust": 0.5
+        "breadth": 0.3636,
+        "thrust": 0.3636
       },
       "lot_rounding": {
         "target_shares_raw": 0.0,
@@ -957,46 +980,139 @@
       }
     },
     "strategy_version": "1.0.0",
-    "base_version": "1.0.0"
+    "base_version": "1.4.0",
+    "execution_warning": null,
+    "intraday_vwap": null,
+    "vwap_premium_pct": null,
+    "chan_5m_state": "N/A",
+    "suggested_limit_price": 88.01286925815232,
+    "passive_support_limit_price": 88.01286925815232
   },
   {
-    "symbol": "601288.SH",
-    "name": "农业银行",
-    "action": "HOLD_FILTERED",
-    "price": 7.24,
-    "current_weight": 0.11970215746455079,
-    "target_weight": 0.11970215746455079,
+    "symbol": "601390.SH",
+    "name": "中国中铁",
+    "action": "HOLD",
+    "price": 147.72914193468532,
+    "current_weight": 0.07708045131046895,
+    "target_weight": 0.07708045131046895,
     "delta_weight": 0.0,
-    "current_shares": 3300,
-    "target_shares": 3300,
+    "current_shares": 52,
+    "target_shares": 52,
+    "delta_shares": 0,
+    "shares": 0,
+    "trade_value": 0.0,
+    "trade_value_rmb": 0.0,
+    "holding_bars": 2,
+    "reason": "调仓未超惰性阈值 (< 5%)",
+    "summary_reason": "调仓未超惰性阈值 (< 5%)",
+    "detail_reason": {
+      "summary_reason": "调仓未超惰性阈值 (< 5%)",
+      "dimension_signals": {
+        "chan_four_state": 0.0,
+        "chan_three_type": 0.0769,
+        "chan_vaa_compound": 0.03
+      },
+      "lifecycle_state": {
+        "symbol": "601390.SH",
+        "state": "HELD_ACTIVE",
+        "held_bars": 2,
+        "entry_streak": 0,
+        "exit_streak": 0,
+        "cooldown_remaining": 0,
+        "entry_price": 0.0,
+        "peak_price": 147.72914193468532,
+        "current_weight": 0.07708045131046895,
+        "last_exit_type": null
+      },
+      "lifecycle_decision": {
+        "delta_w": 0.0,
+        "inertia_threshold": 0.05,
+        "raw_target_weight": 0.07708045131046895,
+        "current_weight": 0.07708045131046895
+      },
+      "inertia_check": {
+        "delta_weight": 0.0,
+        "threshold": 0.05,
+        "triggered": false
+      },
+      "holding_lock": {
+        "bars_held": 2,
+        "min_holding_bars": 2,
+        "locked": false
+      },
+      "cooldown_status": {
+        "bars_since_exit": 999,
+        "cooldown_remaining": 0,
+        "min_cooldown_bars": 2,
+        "in_cooldown": false
+      },
+      "sector_throttle": {
+        "sector": "construction",
+        "max_allowed": 3,
+        "current_sector_holdings": 1,
+        "throttled": false
+      },
+      "macro_gate": {
+        "passed": true,
+        "breadth": 0.3636,
+        "thrust": 0.3636
+      },
+      "lot_rounding": {
+        "target_shares_raw": 0.0,
+        "shares": 0,
+        "lot_size": 100
+      }
+    },
+    "strategy_version": "1.0.0",
+    "base_version": "1.4.0",
+    "execution_warning": null,
+    "intraday_vwap": null,
+    "vwap_premium_pct": null,
+    "chan_5m_state": "N/A",
+    "suggested_limit_price": 147.72914193468532,
+    "passive_support_limit_price": 147.72914193468532
+  },
+  {
+    "symbol": "601728.SH",
+    "name": "中国电信",
+    "action": "HOLD",
+    "price": 99.65750197721691,
+    "current_weight": 0.04124338905832216,
+    "target_weight": 0.04124338905832216,
+    "delta_weight": 0.0,
+    "current_shares": 41,
+    "target_shares": 41,
     "delta_shares": 0,
     "shares": 0,
     "trade_value": 0.0,
     "trade_value_rmb": 0.0,
     "holding_bars": 12,
-    "reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
+    "reason": "调仓未超惰性阈值 (< 5%)",
+    "summary_reason": "调仓未超惰性阈值 (< 5%)",
     "detail_reason": {
-      "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
+      "summary_reason": "调仓未超惰性阈值 (< 5%)",
       "dimension_signals": {
         "chan_four_state": 0.0,
-        "chan_three_type": 0.0,
-        "chan_vaa_compound": 0.0
+        "chan_three_type": 0.0513,
+        "chan_vaa_compound": 0.02
       },
       "lifecycle_state": {
-        "symbol": "601288.SH",
+        "symbol": "601728.SH",
         "state": "HELD_ACTIVE",
         "held_bars": 12,
         "entry_streak": 2,
         "exit_streak": 0,
         "cooldown_remaining": 0,
-        "entry_price": 137.63624088084728,
-        "peak_price": 137.63624088084728,
-        "current_weight": 0.11970215746455079,
+        "entry_price": 99.26903453331846,
+        "peak_price": 99.65750197721691,
+        "current_weight": 0.04124338905832216,
         "last_exit_type": null
       },
       "lifecycle_decision": {
-        "is_market_open": false
+        "delta_w": 0.0,
+        "inertia_threshold": 0.05,
+        "raw_target_weight": 0.04124338905832216,
+        "current_weight": 0.04124338905832216
       },
       "inertia_check": {
         "delta_weight": 0.0,
@@ -1015,240 +1131,15 @@
         "in_cooldown": false
       },
       "sector_throttle": {
-        "sector": "banking",
-        "max_allowed": 3,
-        "current_sector_holdings": 2,
-        "throttled": false
-      },
-      "macro_gate": {
-        "passed": true,
-        "breadth": 0.5,
-        "thrust": 0.5
-      },
-      "lot_rounding": {
-        "target_shares_raw": 0.0,
-        "shares": 0,
-        "lot_size": 100
-      }
-    },
-    "strategy_version": "1.0.0",
-    "base_version": "1.0.0"
-  },
-  {
-    "symbol": "601398.SH",
-    "name": "工商银行",
-    "action": "HOLD_FILTERED",
-    "price": 8.48,
-    "current_weight": 0.0807233032424595,
-    "target_weight": 0.0807233032424595,
-    "delta_weight": 0.0,
-    "current_shares": 1900,
-    "target_shares": 1900,
-    "delta_shares": 0,
-    "shares": 0,
-    "trade_value": 0.0,
-    "trade_value_rmb": 0.0,
-    "holding_bars": 2,
-    "reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "detail_reason": {
-      "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-      "dimension_signals": {
-        "chan_four_state": 0.0,
-        "chan_three_type": 0.0,
-        "chan_vaa_compound": 0.0
-      },
-      "lifecycle_state": {
-        "symbol": "601398.SH",
-        "state": "HELD_ACTIVE",
-        "held_bars": 2,
-        "entry_streak": 0,
-        "exit_streak": 0,
-        "cooldown_remaining": 0,
-        "entry_price": 0.0,
-        "peak_price": 8.48,
-        "current_weight": 0.0807233032424595,
-        "last_exit_type": null
-      },
-      "lifecycle_decision": {
-        "is_market_open": false
-      },
-      "inertia_check": {
-        "delta_weight": 0.0,
-        "threshold": 0.05,
-        "triggered": false
-      },
-      "holding_lock": {
-        "bars_held": 2,
-        "min_holding_bars": 2,
-        "locked": false
-      },
-      "cooldown_status": {
-        "bars_since_exit": 999,
-        "cooldown_remaining": 0,
-        "min_cooldown_bars": 2,
-        "in_cooldown": false
-      },
-      "sector_throttle": {
-        "sector": "banking",
-        "max_allowed": 3,
-        "current_sector_holdings": 2,
-        "throttled": false
-      },
-      "macro_gate": {
-        "passed": true,
-        "breadth": 0.5,
-        "thrust": 0.5
-      },
-      "lot_rounding": {
-        "target_shares_raw": 0.0,
-        "shares": 0,
-        "lot_size": 100
-      }
-    },
-    "strategy_version": "1.0.0",
-    "base_version": "1.0.0"
-  },
-  {
-    "symbol": "601601.SH",
-    "name": "中国太保",
-    "action": "HOLD_FILTERED",
-    "price": 29.32,
-    "current_weight": 0.0,
-    "target_weight": 0.0,
-    "delta_weight": 0.0,
-    "current_shares": 0,
-    "target_shares": 0,
-    "delta_shares": 0,
-    "shares": 0,
-    "trade_value": 0.0,
-    "trade_value_rmb": 0.0,
-    "holding_bars": 0,
-    "reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "detail_reason": {
-      "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-      "dimension_signals": {
-        "chan_four_state": 0.0,
-        "chan_three_type": 0.0,
-        "chan_vaa_compound": 0.0
-      },
-      "lifecycle_state": {
-        "symbol": "601601.SH",
-        "state": "PENDING_ENTRY",
-        "held_bars": 0,
-        "entry_streak": 2,
-        "exit_streak": 0,
-        "cooldown_remaining": 0,
-        "entry_price": 190.19462353852646,
-        "peak_price": 190.19462353852646,
-        "current_weight": 0.0,
-        "last_exit_type": null
-      },
-      "lifecycle_decision": {
-        "is_market_open": false
-      },
-      "inertia_check": {
-        "delta_weight": 0.0,
-        "threshold": 0.05,
-        "triggered": false
-      },
-      "holding_lock": {
-        "bars_held": 0,
-        "min_holding_bars": 2,
-        "locked": false
-      },
-      "cooldown_status": {
-        "bars_since_exit": 999,
-        "cooldown_remaining": 0,
-        "min_cooldown_bars": 2,
-        "in_cooldown": false
-      },
-      "sector_throttle": {
-        "sector": "insurance",
-        "max_allowed": 3,
-        "current_sector_holdings": 0,
-        "throttled": false
-      },
-      "macro_gate": {
-        "passed": true,
-        "breadth": 0.5,
-        "thrust": 0.5
-      },
-      "lot_rounding": {
-        "target_shares_raw": 0.0,
-        "shares": 0,
-        "lot_size": 100
-      }
-    },
-    "strategy_version": "1.0.0",
-    "base_version": "1.0.0"
-  },
-  {
-    "symbol": "601728.SH",
-    "name": "中国电信",
-    "action": "HOLD_FILTERED",
-    "price": 6.85,
-    "current_weight": 0.15786936973497387,
-    "target_weight": 0.15786936973497387,
-    "delta_weight": 0.0,
-    "current_shares": 4600,
-    "target_shares": 4600,
-    "delta_shares": 0,
-    "shares": 0,
-    "trade_value": 0.0,
-    "trade_value_rmb": 0.0,
-    "holding_bars": 11,
-    "reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "detail_reason": {
-      "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-      "dimension_signals": {
-        "chan_four_state": 0.0,
-        "chan_three_type": 0.2,
-        "chan_vaa_compound": 0.06
-      },
-      "lifecycle_state": {
-        "symbol": "601728.SH",
-        "state": "HELD_ACTIVE",
-        "held_bars": 11,
-        "entry_streak": 2,
-        "exit_streak": 0,
-        "cooldown_remaining": 0,
-        "entry_price": 99.26903453331846,
-        "peak_price": 99.26903453331846,
-        "current_weight": 0.15786936973497387,
-        "last_exit_type": null
-      },
-      "lifecycle_decision": {
-        "is_market_open": false
-      },
-      "inertia_check": {
-        "delta_weight": 0.0,
-        "threshold": 0.05,
-        "triggered": false
-      },
-      "holding_lock": {
-        "bars_held": 11,
-        "min_holding_bars": 2,
-        "locked": false
-      },
-      "cooldown_status": {
-        "bars_since_exit": 999,
-        "cooldown_remaining": 0,
-        "min_cooldown_bars": 2,
-        "in_cooldown": false
-      },
-      "sector_throttle": {
         "sector": "telecom",
         "max_allowed": 3,
-        "current_sector_holdings": 1,
+        "current_sector_holdings": 2,
         "throttled": false
       },
       "macro_gate": {
         "passed": true,
-        "breadth": 0.5,
-        "thrust": 0.5
+        "breadth": 0.3636,
+        "thrust": 0.3636
       },
       "lot_rounding": {
         "target_shares_raw": 0.0,
@@ -1257,306 +1148,12 @@
       }
     },
     "strategy_version": "1.0.0",
-    "base_version": "1.0.0"
-  },
-  {
-    "symbol": "601857.SH",
-    "name": "中国石油",
-    "action": "HOLD_FILTERED",
-    "price": 12.76,
-    "current_weight": 0.0,
-    "target_weight": 0.0,
-    "delta_weight": 0.0,
-    "current_shares": 0,
-    "target_shares": 0,
-    "delta_shares": 0,
-    "shares": 0,
-    "trade_value": 0.0,
-    "trade_value_rmb": 0.0,
-    "holding_bars": 0,
-    "reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "detail_reason": {
-      "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-      "dimension_signals": {
-        "chan_four_state": 0.3333,
-        "chan_three_type": 0.0,
-        "chan_vaa_compound": 0.0
-      },
-      "lifecycle_state": {
-        "symbol": "601857.SH",
-        "state": "PENDING_ENTRY",
-        "held_bars": 0,
-        "entry_streak": 2,
-        "exit_streak": 0,
-        "cooldown_remaining": 0,
-        "entry_price": 77.98496399694037,
-        "peak_price": 77.98496399694037,
-        "current_weight": 0.0,
-        "last_exit_type": null
-      },
-      "lifecycle_decision": {
-        "is_market_open": false
-      },
-      "inertia_check": {
-        "delta_weight": 0.0,
-        "threshold": 0.05,
-        "triggered": false
-      },
-      "holding_lock": {
-        "bars_held": 0,
-        "min_holding_bars": 2,
-        "locked": false
-      },
-      "cooldown_status": {
-        "bars_since_exit": 999,
-        "cooldown_remaining": 0,
-        "min_cooldown_bars": 2,
-        "in_cooldown": false
-      },
-      "sector_throttle": {
-        "sector": "oil_petrochem",
-        "max_allowed": 3,
-        "current_sector_holdings": 0,
-        "throttled": false
-      },
-      "macro_gate": {
-        "passed": true,
-        "breadth": 0.5,
-        "thrust": 0.5
-      },
-      "lot_rounding": {
-        "target_shares_raw": 0.0,
-        "shares": 0,
-        "lot_size": 100
-      }
-    },
-    "strategy_version": "1.0.0",
-    "base_version": "1.0.0"
-  },
-  {
-    "symbol": "601872.SH",
-    "name": "招商轮船",
-    "action": "HOLD_FILTERED",
-    "price": 18.19,
-    "current_weight": 0.0,
-    "target_weight": 0.0,
-    "delta_weight": 0.0,
-    "current_shares": 0,
-    "target_shares": 0,
-    "delta_shares": 0,
-    "shares": 0,
-    "trade_value": 0.0,
-    "trade_value_rmb": 0.0,
-    "holding_bars": 0,
-    "reason": "目标仓位未达最低建仓/调仓门槛 (目标 1.7% < 门槛 5%，防微量试错损耗)",
-    "summary_reason": "目标仓位未达最低建仓/调仓门槛 (目标 1.7% < 门槛 5%，防微量试错损耗)",
-    "detail_reason": {
-      "summary_reason": "目标仓位未达最低建仓/调仓门槛 (目标 1.7% < 门槛 5%，防微量试错损耗)",
-      "dimension_signals": {
-        "chan_four_state": 0.0,
-        "chan_three_type": 0.0,
-        "chan_vaa_compound": 0.0
-      },
-      "lifecycle_state": {
-        "symbol": "601872.SH",
-        "state": "PENDING_ENTRY",
-        "held_bars": 0,
-        "entry_streak": 2,
-        "exit_streak": 0,
-        "cooldown_remaining": 0,
-        "entry_price": 152.76326247058174,
-        "peak_price": 152.76326247058174,
-        "current_weight": 0.0,
-        "last_exit_type": null
-      },
-      "lifecycle_decision": {
-        "is_market_open": false
-      },
-      "inertia_check": {
-        "delta_weight": 0.0,
-        "threshold": 0.05,
-        "triggered": false
-      },
-      "holding_lock": {
-        "bars_held": 0,
-        "min_holding_bars": 2,
-        "locked": false
-      },
-      "cooldown_status": {
-        "bars_since_exit": 999,
-        "cooldown_remaining": 0,
-        "min_cooldown_bars": 2,
-        "in_cooldown": false
-      },
-      "sector_throttle": {
-        "sector": "shipping",
-        "max_allowed": 3,
-        "current_sector_holdings": 1,
-        "throttled": false
-      },
-      "macro_gate": {
-        "passed": true,
-        "breadth": 0.5,
-        "thrust": 0.5
-      },
-      "lot_rounding": {
-        "target_shares_raw": 0.0,
-        "shares": 0,
-        "lot_size": 100
-      }
-    },
-    "strategy_version": "1.0.0",
-    "base_version": "1.0.0"
-  },
-  {
-    "symbol": "601899.SH",
-    "name": "紫金矿业",
-    "action": "HOLD_FILTERED",
-    "price": 29.92,
-    "current_weight": 0.0,
-    "target_weight": 0.0,
-    "delta_weight": 0.0,
-    "current_shares": 0,
-    "target_shares": 0,
-    "delta_shares": 0,
-    "shares": 0,
-    "trade_value": 0.0,
-    "trade_value_rmb": 0.0,
-    "holding_bars": 0,
-    "reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "detail_reason": {
-      "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-      "dimension_signals": {
-        "chan_four_state": 0.0,
-        "chan_three_type": 0.0,
-        "chan_vaa_compound": 0.0
-      },
-      "lifecycle_state": {
-        "symbol": "601899.SH",
-        "state": "PENDING_ENTRY",
-        "held_bars": 0,
-        "entry_streak": 2,
-        "exit_streak": 0,
-        "cooldown_remaining": 0,
-        "entry_price": 162.66242285900697,
-        "peak_price": 162.66242285900697,
-        "current_weight": 0.0,
-        "last_exit_type": null
-      },
-      "lifecycle_decision": {
-        "is_market_open": false
-      },
-      "inertia_check": {
-        "delta_weight": 0.0,
-        "threshold": 0.05,
-        "triggered": false
-      },
-      "holding_lock": {
-        "bars_held": 0,
-        "min_holding_bars": 2,
-        "locked": false
-      },
-      "cooldown_status": {
-        "bars_since_exit": 999,
-        "cooldown_remaining": 0,
-        "min_cooldown_bars": 2,
-        "in_cooldown": false
-      },
-      "sector_throttle": {
-        "sector": "metals",
-        "max_allowed": 3,
-        "current_sector_holdings": 1,
-        "throttled": false
-      },
-      "macro_gate": {
-        "passed": true,
-        "breadth": 0.5,
-        "thrust": 0.5
-      },
-      "lot_rounding": {
-        "target_shares_raw": 0.0,
-        "shares": 0,
-        "lot_size": 100
-      }
-    },
-    "strategy_version": "1.0.0",
-    "base_version": "1.0.0"
-  },
-  {
-    "symbol": "601919.SH",
-    "name": "中远海控",
-    "action": "HOLD_FILTERED",
-    "price": 16.88,
-    "current_weight": 0.025371326192888212,
-    "target_weight": 0.025371326192888212,
-    "delta_weight": 0.0,
-    "current_shares": 300,
-    "target_shares": 300,
-    "delta_shares": 0,
-    "shares": 0,
-    "trade_value": 0.0,
-    "trade_value_rmb": 0.0,
-    "holding_bars": 2,
-    "reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-    "detail_reason": {
-      "summary_reason": "非交易日/休市日，状态机与门禁计数器冻结维持",
-      "dimension_signals": {
-        "chan_four_state": 0.0,
-        "chan_three_type": 0.0,
-        "chan_vaa_compound": 0.0
-      },
-      "lifecycle_state": {
-        "symbol": "601919.SH",
-        "state": "HELD_ACTIVE",
-        "held_bars": 2,
-        "entry_streak": 0,
-        "exit_streak": 0,
-        "cooldown_remaining": 0,
-        "entry_price": 0.0,
-        "peak_price": 16.88,
-        "current_weight": 0.025371326192888212,
-        "last_exit_type": null
-      },
-      "lifecycle_decision": {
-        "is_market_open": false
-      },
-      "inertia_check": {
-        "delta_weight": 0.0,
-        "threshold": 0.05,
-        "triggered": false
-      },
-      "holding_lock": {
-        "bars_held": 2,
-        "min_holding_bars": 2,
-        "locked": false
-      },
-      "cooldown_status": {
-        "bars_since_exit": 999,
-        "cooldown_remaining": 0,
-        "min_cooldown_bars": 2,
-        "in_cooldown": false
-      },
-      "sector_throttle": {
-        "sector": "shipping",
-        "max_allowed": 3,
-        "current_sector_holdings": 1,
-        "throttled": false
-      },
-      "macro_gate": {
-        "passed": true,
-        "breadth": 0.5,
-        "thrust": 0.5
-      },
-      "lot_rounding": {
-        "target_shares_raw": 0.0,
-        "shares": 0,
-        "lot_size": 100
-      }
-    },
-    "strategy_version": "1.0.0",
-    "base_version": "1.0.0"
+    "base_version": "1.4.0",
+    "execution_warning": null,
+    "intraday_vwap": null,
+    "vwap_premium_pct": null,
+    "chan_5m_state": "N/A",
+    "suggested_limit_price": 99.65750197721691,
+    "passive_support_limit_price": 99.65750197721691
   }
 ]
