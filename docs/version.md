@@ -13,18 +13,18 @@
 ```
                 ┌────────────────────────────────────────────────────────┐
                 │          底座引擎版本 (Engine BASE_VERSION)              │
-                │  - BaseBlendAllocationStrategy: v1.1.0                 │
+                │  - BaseBlendAllocationStrategy: v1.3.0                 │
                 │  - AllocationTemplate: v1.0.0                          │
                 └──────────────────────────┬─────────────────────────────┘
                                            │ 继承与多态注入
                                            ▼
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │                          具体策略子类版本 (Strategy Class version)                        │
-│  - ChanRiskManagedBlendStrategy: v1.0.0 [base: v1.1.0]                                 │
-│  - ChanFourStateBlendStrategy:   v2.0.0 [base: v1.1.0]                                 │
-│  - ChanCrisisShieldBlendStrategy: v2.1.0 [base: v1.1.0]                                │
-│  - ChanDualHybridBlendStrategy:  v1.0.0 [base: v1.1.0]                                 │
-│  - GenericBlendStrategy:         v1.0.0 [base: v1.1.0]                                 │
+│  - ChanRiskManagedBlendStrategy: v1.0.0 [base: v1.3.0]                                 │
+│  - ChanFourStateBlendStrategy:   v2.0.0 [base: v1.3.0]                                 │
+│  - ChanCrisisShieldBlendStrategy: v2.1.0 [base: v1.3.0]                                │
+│  - ChanDualHybridBlendStrategy:  v1.0.0 [base: v1.3.0]                                 │
+│  - GenericBlendStrategy:         v1.0.0 [base: v1.3.0]                                 │
 │  - 9 大静态配置模板 (EqualWeight, RiskParity ...): v1.0.0                             │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -52,6 +52,56 @@
 ---
 
 ## 2. 底座引擎核心版本沿革 (Base Engine Changelog)
+
+### `BaseBlendAllocationStrategy`: `v1.3.0` (2026-10-21)
+* **变更类型**：Minor 功能性增强与风控参数自适应升级（向后兼容）。
+* **前序版本**：`v1.2.0`
+* **对应提交/变更范围**：`pipeline/research/blend/blend_base.py`，`pipeline/research_strategy/rs/config.py`，`.agents/skills/walkforward-audit/scripts/run_audit.py`
+* **单测覆盖**：
+  - `common/tests/test_strategy_versioning.py` (PASS)
+  - `pipeline/research_strategy/tests/test_blend_strategy_versioning.py` (PASS)
+  - `pipeline/research_strategy/tests/test_blend_track_c.py` (PASS)
+  - `pipeline/research_strategy/tests/test_blend_intraday_5m.py` (PASS)
+  - `common/tests/test_structural_factors.py` (PASS)
+
+#### 核心升级特性详述：
+1. **修复 `walkforward-audit` 季度期末持仓估值 Bug（消除虚假亏损）**：
+   - 修复 `.agents/skills/walkforward-audit/scripts/run_audit.py` 在 `audit_strategy_assets()` 中以成交价结算期末持仓导致的未平仓权益估值失真缺陷。
+   - 引入逐季末收盘价（Mark-to-Market）公允盯市估值机制（`universe[sym].loc[:end_date, 'Close'].iloc[-1]`），彻底消除低换手核心持仓（如 600900.SH、601857.SH、601899.SH）因未平仓产生的假性失血计算偏差。
+2. **资产波动率自适应止损倍数 (`enable_adaptive_stop_atr`)**：
+   - 在 `BaseBlendAllocationStrategy.generate_weights` 中引入资产截面波动率对比动态止损机制：低波股票（如公共事业、银行、煤炭）自动根据截面中位数波动率与自身波动率比值展开止损乘数，动态截断在 `[3.5, 7.5]` 范围。
+   - 彻底解决低波高股息资产在日常正常波动中被 4.5x 紧凑 ATR 假性洗盘震出局的痛点。
+3. **低波高股息资产防抖锁定 (`enable_low_beta_inertia`)**：
+   - 引入年化波动率防抖阻尼门限：当标的 21 日年化波动率 $< 22\%$ 时，底座自动将其最短持仓周期 `min_holding_bars` 提升至 10 个交易日（在未触发硬止损或熔断紧急状态时硬性锁定），大幅压降低波防守标的的频繁微利来回倒手摩擦。
+4. **放宽细分行业持仓配额上限 (`max_assets_per_sector: 1 -> 2`)**：
+   - 底座默认细分行业持仓上限从 1 只放宽至 2 只，且在 `StrategyConfig` 中原生支持 `blend_max_assets_per_sector: int = 2` 与无前缀别名双向映射。
+   - 允许同行业双龙头（如中国海油 + 中国石油、陕西煤业 + 中国神华、中金黄金 + 紫金矿业）共振进攻，消除单一行业过度节流引发的大牛股近亲相残与假性踏空。
+
+---
+
+### `BaseBlendAllocationStrategy`: `v1.2.0` (2026-10-20)
+* **变更类型**：Minor 功能性增强与因果特征预计算记忆管道扩展（向后兼容）。
+* **前序版本**：`v1.1.0`
+* **对应提交/变更范围**：`pipeline/research/blend/blend_base.py`，`common/structural_factors.py`，`backtester/run_backtest.py`，`pipeline/scripts/run_blend_cross_matrix.py`
+* **单测覆盖**：
+  - `common/tests/test_structural_factors.py` (PASS)
+  - `pipeline/research_strategy/tests/test_blend_strategy_versioning.py` (PASS)
+  - `common/tests/test_strategy_versioning.py` (PASS)
+  - `pipeline/research_strategy/tests/test_blend_track_c.py` (PASS)
+  - `pipeline/research_strategy/tests/test_blend_intraday_5m.py` (PASS)
+
+#### 核心升级特性详述：
+1. **Track B 任务 B2.1：全历史因果形态与筹码特征预计算记忆管道 (`enrich_universe_with_structural_features`)**
+   - 在 `common/structural_factors.py` 中实现了通用特征预计算与富集管道 `enrich_universe_with_structural_features(universe, lookback=60, inplace=False)`。
+   - 单次遍历计算并绑定 12 大微观形态、动力学与筹码特征字段：`cyq_winner_ratio`、`cyq_cost_concentration`、`wyckoff_spring`、`extremum_curvature`、`standardized_divergence`、`wyckoff_effort_result`、`fractal_dimension`、`consolidation_density`、`POC`、`VAL`、`VAH`、`NPOC`。
+   - 具备幂等性与跨窗口特征记忆：已计算特征自动跳过，避免回测框架中数十个 Walkforward Fold 重复计算相同历史数据，计算开销降低 80%+。
+2. **回测底座跨窗口记忆预富集 (`backtester/run_backtest.py`)**
+   - 在 `main()` 数据加载阶段，自动检测策略配置中是否启用了 Track C 或 Track T 标志。
+   - 若启用 Track C，预先调用 `enrich_universe_with_structural_features` 对全量历史 Universe 进行单次预富集；若启用 Track T，预先调用 `load_intraday_5m_universe` 与 `enrich_universe_with_intraday_features` 预富集日内 5m 特征，确保各折回测无缝复用预计算特征。
+3. **底座权重生成自动按需富集降级保障 (`generate_weights`)**
+   - 在 `BaseBlendAllocationStrategy.generate_weights` 中新增防御性自愈检测：当开启 Track C 任意锚点且风险资产 DataFrame 缺少 `cyq_winner_ratio` 时，自动按需调用 `enrich_universe_with_structural_features` 完成特征补全，兼顾单测与外部调用易用性。
+4. **交叉消融矩阵加权模式升级 (`regime_ic_ir_hybrid`)**
+   - 更新 `pipeline/scripts/run_blend_cross_matrix.py` 中的 `--weighting-mode` 默认值为 `"regime_ic_ir_hybrid"`，激活 Track C Anchor 1 的分形维数与宏观状态机风格路由。
 
 ### `BaseBlendAllocationStrategy`: `v1.1.0` (2026-10-20)
 * **变更类型**：Minor 功能性增强与高频微观结构风控扩展（向后兼容）。
@@ -111,12 +161,12 @@
 
 | 策略类名 (`Strategy Class`) | 内部标识 (`Strategy ID`) | 当前版本 (`version`) | 所属底座版本 (`base_version`) | 复合版本标识 (`version_string`) | 核心流派与组合机制说明 |
 | :--- | :--- | :---: | :---: | :---: | :--- |
-| `ChanRiskManagedBlendStrategy` | `chan_risk_managed_blend` | **`1.0.0`** | `1.1.0` | `v1.0.0 [base: v1.1.0]` | 缠论结构与风控增强多流派配置策略，主打回撤控制与稳健复合收益 |
-| `ChanFourStateBlendStrategy` | `chan_four_state_blend` | **`2.0.0`** | `1.1.0` | `v2.0.0 [base: v1.1.0]` | 四状态缠论状态机驱动（趋势/盘整/背驰/反转）动态调权配置旗舰策略 |
-| `ChanCrisisShieldBlendStrategy` | `chan_crisis_shield_blend` | **`2.1.0`** | `1.1.0` | `v2.1.0 [base: v1.1.0]` | 危机防御型盾牌策略，内置极端熊市熔断、防崩盘流动性保护与对冲卸载 |
-| `ChanDualHybridBlendStrategy` | `chan_dual_hybrid_blend` | **`1.0.0`** | `1.1.0` | `v1.0.0 [base: v1.1.0]` | 双轨混动策略，结合缠论短波段择时与中长周期资产动量/反转配置 |
-| `GenericBlendStrategy` | `generic_blend` | **`1.0.0`** | `1.1.0` | `v1.0.0 [base: v1.1.0]` | 通用多流派 Blend 组合框架，支持任意配置文件的子策略插拔与动态正交加权 |
-| `ChanFourStateShieldBlendStrategy` | `chan_four_state_shield_blend` | **`1.0.0`** | `1.1.0` | `v1.0.0 [base: v1.1.0]` | 四状态状态机与全景危机防护装甲合体策略 |
+| `ChanRiskManagedBlendStrategy` | `chan_risk_managed_blend` | **`1.0.0`** | `1.3.0` | `v1.0.0 [base: v1.3.0]` | 缠论结构与风控增强多流派配置策略，主打回撤控制与稳健复合收益 |
+| `ChanFourStateBlendStrategy` | `chan_four_state_blend` | **`2.0.0`** | `1.3.0` | `v2.0.0 [base: v1.3.0]` | 四状态缠论状态机驱动（趋势/盘整/背驰/反转）动态调权配置旗舰策略 |
+| `ChanCrisisShieldBlendStrategy` | `chan_crisis_shield_blend` | **`2.1.0`** | `1.3.0` | `v2.1.0 [base: v1.3.0]` | 危机防御型盾牌策略，内置极端熊市熔断、防崩盘流动性保护与对冲卸载 |
+| `ChanDualHybridBlendStrategy` | `chan_dual_hybrid_blend` | **`1.0.0`** | `1.3.0` | `v1.0.0 [base: v1.3.0]` | 双轨混动策略，结合缠论短波段择时与中长周期资产动量/反转配置 |
+| `GenericBlendStrategy` | `generic_blend` | **`1.0.0`** | `1.3.0` | `v1.0.0 [base: v1.3.0]` | 通用多流派 Blend 组合框架，支持任意配置文件的子策略插拔与动态正交加权 |
+| `ChanFourStateShieldBlendStrategy` | `chan_four_state_shield_blend` | **`1.0.0`** | `1.3.0` | `v1.0.0 [base: v1.3.0]` | 四状态状态机与全景危机防护装甲合体策略 |
 
 ---
 

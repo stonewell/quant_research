@@ -70,7 +70,7 @@ flowchart TD
 
 ---
 
-## 二、 原子任务全量拆解清单（共 78 个原子任务）
+## 二、 原子任务全量拆解清单（共 79 个原子任务）
 
 ### 2.1 《5分钟高频日内数据方案》原子任务表（`T0.1`–`T6.2`，共 19 个任务）
 
@@ -156,7 +156,7 @@ flowchart TD
 
 ---
 
-### 2.6 《策略语义化版本管理、实战深度动因审计与 Web 端交互溯源方案》原子任务表（`V1.1`–`V1.6`，共 6 个任务）
+### 2.6 《策略语义化版本管理、实战深度动因审计与 Web 端交互溯源方案》原子任务表（`V1.1`–`V1.7`，共 7 个任务）
 
 | 任务编号 | 状态 | 任务名称 | 涉及核心文件与符号 | 核心交付内容与验收标准 (含版本双轴解耦与深度动因审计) | 配套离线单测 | 规模 | 前置依赖 |
 | :--- | :---: | :--- | :--- | :--- | :--- | :---: | :--- |
@@ -166,6 +166,7 @@ flowchart TD
 | **`V1.4`** | `[x]` | 实盘执行引擎多维详细动因生成器与工单字段扩展 | [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py)<br>[`scripts/check_live_portfolio_health.py`](file:///home/stone/Work/github/quant/scripts/check_live_portfolio_health.py)<br>`build_detailed_trade_reason` | 1. 实现详细动因生成器 `build_detailed_trade_reason(...)`：输出包含持仓对账、子策略权重拆解、宏观冲力与 Garman-Klass 波动率阻尼、细分行业配额挤出、最低持仓锁（已持X日 vs 最低Y日）、连续确认带（第X/Y日待确认）、再入场冷却期、5% 调仓惰性死区等全维度定量说明；<br>2. `order_df` 增加 `strategy_version`、`base_version`、`detail_reason` 字段，导出至 `live_trading_ticket.csv` 与 `.json`；<br>3. 终端横幅、`stage1_health_report.json/.md`、`account_state.json` 记录完整版本元数据。 | `test_live_strategy.py`<br>`test_blend_strategy_versioning.py` | **M** | `V1.2` |
 | **`V1.5`** | `[x]` | Web Station 调仓工单表格动因链接与详细审计弹窗 | `web/livetrading/static/index.html`<br>`web/livetrading/static/js/app.js`<br>`web/livetrading/static/css/style.css`<br>`web/livetrading/execution_service.py` | 1. 网页工单表格调仓动因列增加 `🔍 详细动因` 可点击交互链接；<br>2. 新增 `#modal-order-detail` 弹窗，卡片化结构展示：基础对账、多策略拆解、宏观风控阻尼、防抖门禁及详细裁决理由；<br>3. 多策略净额化及 `summary.json` 归档保存版本与详细动因字段。 | `test_web_livetrading.py` | **M** | `V1.4` |
 | **`V1.6`** | `[x]` | 100% 离线测试套件与实盘工单 Schema 兼容性验证 | `common/tests/test_strategy_versioning.py`<br>`pipeline/research_strategy/tests/test_blend_strategy_versioning.py`<br>`web/livetrading/tests/test_web_livetrading.py` | 1. 编写模板版本继承、子类类属性覆盖、显式重载测试；<br>2. 验证 Base 引擎版本自增独立性与子策略层级内省字典；<br>3. 验证工单 JSON 列表 Schema 兼容性及 Web API 返回数据完整性。 | `pytest` 全绿 | **M** | `V1.1`..`V1.5` |
+| **`V1.7`** | `[x]` | BaseBlendAllocationStrategy v1.3.0 低波自适应止损、持仓锁定防抖与行业配额放宽升级 | [`pipeline/research/blend/blend_base.py`](file:///home/stone/Work/github/quant/pipeline/research/blend/blend_base.py)<br>[`pipeline/research_strategy/rs/config.py`](file:///home/stone/Work/github/quant/pipeline/research_strategy/rs/config.py)<br>`.agents/skills/walkforward-audit/scripts/run_audit.py` | 1. 修复 `run_audit.py` 季度期末持仓估值 Bug（引入 Mark-to-Market 消除未平仓虚假亏损）；<br>2. 引入资产波动率自适应止损倍数（低波股票自动展宽至 6.5~7.5x ATR 防洗盘）；<br>3. 引入低波高股息资产防抖锁定（年化波动率 < 22% 自动提高 min_holding_bars 至 10 天）；<br>4. 放宽行业持仓上限（`max_assets_per_sector: 1 -> 2`），消除同行业资源品大牛股近亲相残；<br>5. 升级 `BASE_VERSION = "1.3.0"` 并完成版本四步联动。 | `test_blend_strategy_versioning.py`<br>`test_strategy_versioning.py` | **M** | `V1.6` |
 
 
 ---
@@ -211,7 +212,7 @@ flowchart TD
 | **`B1.1`** | `[ ]` | 修复 `actual_w` 强制折回目标权重的记账失真 Bug | [`common/allocation_backtester.py`](file:///home/stone/Work/github/quant/common/allocation_backtester.py)<br>`run_allocation_backtest`<br>`actual_w`<br>`held_shares` | 1. 废除第 506–508 行 `new_w[i] = tgt_w_arr[t, i]` 的强制覆盖；<br>2. 改为以真实持仓股数与当日收盘价计算真实权重 $\text{actual\_w}_i = (\text{held\_shares}_i \times P_i) / \text{Equity}$；<br>3. 彻底消除 100 股整手截断现金闲置与资金耗尽部分成交时引发的“幽灵杠杆与收益虚增”；<br>4. 保证持仓股数流水与逐日收益计提 100% 账实相符。 | `test_allocation_backtester.py`<br>`test_ledger_parity` | **M** | 无 |
 | **`B1.2`** | `[ ]` | 研发轻量无开销评估模式与 ERS 抽样加速 | [`common/allocation_backtester.py`](file:///home/stone/Work/github/quant/common/allocation_backtester.py)<br>[`common/allocation_search.py`](file:///home/stone/Work/github/quant/common/allocation_search.py)<br>`minimal_metrics` | 1. `run_allocation_backtest` 新增 `minimal_metrics: bool = False` 参数；<br>2. 开启时跳过创建 `rebalance_report_df` 与 `actual_weights_df` 庞大 DataFrame，直接输出纯标量指标；<br>3. `common/allocation_search.py` 的 ERS 200 次随机抽样全面启用轻量模式；<br>4. 抽样阶段内存分配降低 90%，耗时缩减 40% 以上。 | `test_allocation_search.py`<br>`test_minimal_metrics_equivalence` | **S** | `B1.1` |
 | **`B1.3`** | `[ ]` | 补齐微观停牌 (Volume==0) 硬拦截与 ST 股 5% 涨跌停判定 | [`common/allocation_backtester.py`](file:///home/stone/Work/github/quant/common/allocation_backtester.py)<br>`_get_china_price_limit`<br>`run_allocation_backtest` | 1. 增加停牌判定：若 $Volume \le 0$ 或缺失，买卖双向拒绝成交；<br>2. 扩展 `_get_china_price_limit`：识别标的代码或名称中的 `ST`/`*ST` 属性，将其涨跌停板阈值自适应设为 5%；<br>3. 记录停牌拦截日志，彻底消除停牌期“幽灵成交”偏差。 | `test_allocation_backtester.py`<br>`test_suspension_guard` | **S** | 无 |
-| **`B2.1`** | `[ ]` | 研发因果特征算子与子策略信号跨窗口记忆缓存 | [`common/allocation_templates.py`](file:///home/stone/Work/github/quant/common/allocation_templates.py)<br>[`backtester/run_backtest.py`](file:///home/stone/Work/github/quant/backtester/run_backtest.py)<br>`SignalMemoizationCache` | 1. 构建特征算子记忆缓存容器，对 SMA, ATR, Garman-Klass, POC 等因果算子支持全周期单次计算、窗口按需切片；<br>2. 支持 `--fast-walkforward` 标志：对满足严格前向因果的策略在全历史区间单次生成 `target_weights` 并切片验证；<br>3. 消除 40 个 Fold 之间 85% 历史数据的无谓重复计算。 | `test_run_backtest.py`<br>`test_signal_memoization` | **M** | `B1.1` |
+| **`B2.1`** | `[x]` | 研发因果特征算子与子策略信号跨窗口记忆缓存 | [`common/allocation_templates.py`](file:///home/stone/Work/github/quant/common/allocation_templates.py)<br>[`backtester/run_backtest.py`](file:///home/stone/Work/github/quant/backtester/run_backtest.py)<br>`SignalMemoizationCache` | 1. 构建特征算子记忆缓存容器，对 SMA, ATR, Garman-Klass, POC 等因果算子支持全周期单次计算、窗口按需切片；<br>2. 支持 `--fast-walkforward` 标志：对满足严格前向因果的策略在全历史区间单次生成 `target_weights` 并切片验证；<br>3. 消除 40 个 Fold 之间 85% 历史数据的无谓重复计算。 | `test_run_backtest.py`<br>`test_signal_memoization` | **M** | `B1.1` |
 | **`B2.2`** | `[ ]` | `run_walkforward` 窗口级多进程并行调度引擎 | [`backtester/run_backtest.py`](file:///home/stone/Work/github/quant/backtester/run_backtest.py)<br>`run_walkforward`<br>`ProcessPoolExecutor` | 1. CLI 增加 `--n-jobs / -j` 参数（默认并发数根据 CPU 核数自适应）；<br>2. 将 40 个独立的 rolling fold 任务分发至 `concurrent.futures.ProcessPoolExecutor`；<br>3. 保持输出 `folds_df` 与 `walkforward_rebalances.csv` 与单线程模式比特级一致；<br>4. 8 核环境下实现 6x 以上线性加速。 | `test_run_backtest.py`<br>`test_walkforward_parallel` | **M** | `B1.2` |
 | **`B2.3`** | `[ ]` | 统一多策略批量回测入口替代 Shell 串行循环 | `scripts/run_batch_backtest.py`<br>[`pipeline/scripts/backtest_blend_strategies.sh`](file:///home/stone/Work/github/quant/pipeline/scripts/backtest_blend_strategies.sh) | 1. 研发 `scripts/run_batch_backtest.py`：单次拉起进程，单次加载 50 标的 Universe 常驻内存；<br>2. 内部多进程并发批处理 55+ 策略的 Walkforward 回测；<br>3. 取代 Shell `while` 循环中的 55 次 Python 解释器冷启动和 55 次 DuckDB 重复查询开销；<br>4. 聚合输出全局策略夏普比率、卡玛比率与最大回撤横向排名矩阵。 | `test_run_batch_backtest.py` | **M** | `B2.2` |
 | **`B2.4`** | `[ ]` | `common/allocation_search.py` 网格寻优与 ERS 并行化 | [`common/allocation_search.py`](file:///home/stone/Work/github/quant/common/allocation_search.py)<br>`grid_search_template`<br>`run_ers_validation` | 1. 将网格搜索中的候选参数评估分发至进程池；<br>2. 将 ERS 200 次随机权重抽样改写为分块多进程并发评估；<br>3. 保持随机数种子确定性与可复现性（`SeedSequence` 独立派生）；<br>4. 显著提升 `--optimize` 执行效率。 | `test_allocation_search.py` | **M** | `B1.2` |
