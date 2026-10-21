@@ -16,7 +16,7 @@ Implements tasks T2.1, T2.2, and T2.3 from docs/intraday_5m_live_and_blend_enhan
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import datetime
 import glob
 import logging
@@ -698,6 +698,7 @@ def enrich_universe_with_intraday_features(
     universe_5m: Dict[str, pd.DataFrame],
     config: Optional[IntradayFeatureConfig] = None,
     synthesize_intraday_bar: bool = False,
+    cutoff_time: Optional[Union[str, datetime.time]] = None,
 ) -> Dict[str, pd.DataFrame]:
     """Enrich daily universe DataFrames with aligned 5m intraday features and split alignment (R4, R6, R12).
 
@@ -712,6 +713,9 @@ def enrich_universe_with_intraday_features(
     synthesize_intraday_bar : bool
         If True (Stage 1 / Stage 2 live mode), synthesizes or updates the current partial day's
         OHLCV bar using truncated 5m data and seasonality volume scaling, setting Is_Partial_Bar=1.
+    cutoff_time : Optional[Union[str, datetime.time]]
+        Optional time cutoff string (e.g. '14:00', '14:15', '15:00') or datetime.time.
+        If provided, overrides config.cutoff_time.
 
     Returns
     -------
@@ -720,6 +724,14 @@ def enrich_universe_with_intraday_features(
     """
     if config is None:
         config = IntradayFeatureConfig()
+    else:
+        config = replace(config)
+
+    if cutoff_time is not None:
+        if isinstance(cutoff_time, datetime.time):
+            config.cutoff_time = cutoff_time.strftime("%H:%M")
+        else:
+            config.cutoff_time = str(cutoff_time)
 
     cutoff_t = _parse_time_cutoff(config.cutoff_time)
     enriched_universe: Dict[str, pd.DataFrame] = {}

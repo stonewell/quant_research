@@ -914,3 +914,71 @@ def test_smart_money_upvol_ratio_and_semivariance():
     assert row_b["Afternoon_Ret_5m"] < -0.01, f"Sample B afternoon return {row_b['Afternoon_Ret_5m']} expected < -0.01"
     assert row_a["Afternoon_Ret_5m"] > 0.0
 
+
+def test_enrich_universe_with_cutoff_time_kwarg():
+    """Verify enrich_universe_with_intraday_features supports cutoff_time keyword argument."""
+    from common.intraday_features import enrich_universe_with_intraday_features, IntradayFeatureConfig
+
+    df_5m = _generate_test_3day_5m_bars("2026-10-14")
+    days = pd.bdate_range("2026-10-14", periods=3)
+
+    daily_rows = []
+    for d in days:
+        d_bars = df_5m.loc[df_5m.index.normalize() == d]
+        daily_rows.append({
+            "Open": float(d_bars["Open"].iloc[0]),
+            "High": float(d_bars["High"].max()),
+            "Low": float(d_bars["Low"].min()),
+            "Close": float(d_bars["Close"].iloc[-1]),
+            "Volume": float(d_bars["Volume"].sum()),
+        })
+    df_1d = pd.DataFrame(daily_rows, index=days)
+    universe_1d = {"SYM_A": df_1d}
+    universe_5m = {"SYM_A": df_5m}
+
+    # 1. Test passing cutoff_time as string without explicit config
+    enriched_1400 = enrich_universe_with_intraday_features(
+        universe_1d,
+        universe_5m,
+        cutoff_time="14:00",
+    )
+    assert "SYM_A" in enriched_1400
+    df_1400 = enriched_1400["SYM_A"]
+    assert "Close_5m_Cutoff" in df_1400.columns
+
+    # 2. Test passing cutoff_time="15:00"
+    enriched_1500 = enrich_universe_with_intraday_features(
+        universe_1d,
+        universe_5m,
+        cutoff_time="15:00",
+    )
+    df_1500 = enriched_1500["SYM_A"]
+
+    # Close_5m_Cutoff at 14:00 should be the 36th bar's close, which is < 48th bar's close
+    d_last = days[-1]
+    assert df_1400.loc[d_last, "Close_5m_Cutoff"] < df_1500.loc[d_last, "Close_5m_Cutoff"]
+
+    # 3. Test cutoff_time overrides config.cutoff_time without mutating caller config
+    config_1500 = IntradayFeatureConfig(cutoff_time="15:00")
+    enriched_override = enrich_universe_with_intraday_features(
+        universe_1d,
+        universe_5m,
+        config=config_1500,
+        cutoff_time="14:00",
+    )
+    assert config_1500.cutoff_time == "15:00"
+    assert enriched_override["SYM_A"].loc[d_last, "Close_5m_Cutoff"] == pytest.approx(
+        df_1400.loc[d_last, "Close_5m_Cutoff"]
+    )
+
+    # 4. Test cutoff_time as datetime.time
+    enriched_time_obj = enrich_universe_with_intraday_features(
+        universe_1d,
+        universe_5m,
+        cutoff_time=datetime.time(14, 0),
+    )
+    assert enriched_time_obj["SYM_A"].loc[d_last, "Close_5m_Cutoff"] == pytest.approx(
+        df_1400.loc[d_last, "Close_5m_Cutoff"]
+    )
+
+
