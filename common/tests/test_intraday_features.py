@@ -915,9 +915,16 @@ def test_smart_money_upvol_ratio_and_semivariance():
     assert row_a["Afternoon_Ret_5m"] > 0.0
 
 
-def test_enrich_universe_with_cutoff_time_kwarg():
-    """Verify enrich_universe_with_intraday_features supports cutoff_time keyword argument."""
-    from common.intraday_features import enrich_universe_with_intraday_features, IntradayFeatureConfig
+def test_enrich_universe_with_intraday_features_cutoff_time_kwarg():
+    """Verify enrich_universe_with_intraday_features supports cutoff_time keyword argument,
+    overrides default 14:15 cutoff (36 bars vs 39 bars), supports datetime.time objects,
+    and updates config via replace(config) while preserving other config attributes.
+    """
+    from common.intraday_features import (
+        IntradayFeatureConfig,
+        compute_daily_intraday_features,
+        enrich_universe_with_intraday_features,
+    )
 
     df_5m = _generate_test_3day_5m_bars("2026-10-14")
     days = pd.bdate_range("2026-10-14", periods=3)
@@ -936,49 +943,77 @@ def test_enrich_universe_with_cutoff_time_kwarg():
     universe_1d = {"SYM_A": df_1d}
     universe_5m = {"SYM_A": df_5m}
 
-    # 1. Test passing cutoff_time as string without explicit config
+    d_last = days[-1]
+    d_last_bars = df_5m.loc[df_5m.index.normalize() == d_last]
+    # 36th bar corresponds to 14:00 (index 35, 24 morning + 12 afternoon)
+    assert d_last_bars.index[35].time() == datetime.time(14, 0)
+    bar_36_close = float(d_last_bars.iloc[35]["Close"])
+    # 39th bar corresponds to 14:15 (index 38, 24 morning + 15 afternoon)
+    assert d_last_bars.index[38].time() == datetime.time(14, 15)
+    bar_39_close = float(d_last_bars.iloc[38]["Close"])
+    assert bar_36_close != bar_39_close
+
+    # 1. Default behavior: cutoff_time defaults to 14:15 (uses 39 bars)
+    enriched_default = enrich_universe_with_intraday_features(
+        universe_1d,
+        universe_5m,
+    )
+    assert "SYM_A" in enriched_default
+    df_default = enriched_default["SYM_A"]
+    assert "Close_5m_Cutoff" in df_default.columns
+    assert df_default.loc[d_last, "Close_5m_Cutoff"] == pytest.approx(bar_39_close)
+
+    # 2. String cutoff_time="14:00" overrides default 14:15 (uses 36 bars instead of 39 bars)
     enriched_1400 = enrich_universe_with_intraday_features(
         universe_1d,
         universe_5m,
         cutoff_time="14:00",
     )
-    assert "SYM_A" in enriched_1400
     df_1400 = enriched_1400["SYM_A"]
-    assert "Close_5m_Cutoff" in df_1400.columns
+    assert df_1400.loc[d_last, "Close_5m_Cutoff"] == pytest.approx(bar_36_close)
+    assert df_1400.loc[d_last, "Close_5m_Cutoff"] != df_default.loc[d_last, "Close_5m_Cutoff"]
 
-    # 2. Test passing cutoff_time="15:00"
-    enriched_1500 = enrich_universe_with_intraday_features(
-        universe_1d,
-        universe_5m,
-        cutoff_time="15:00",
-    )
-    df_1500 = enriched_1500["SYM_A"]
-
-    # Close_5m_Cutoff at 14:00 should be the 36th bar's close, which is < 48th bar's close
-    d_last = days[-1]
-    assert df_1400.loc[d_last, "Close_5m_Cutoff"] < df_1500.loc[d_last, "Close_5m_Cutoff"]
-
-    # 3. Test cutoff_time overrides config.cutoff_time without mutating caller config
-    config_1500 = IntradayFeatureConfig(cutoff_time="15:00")
-    enriched_override = enrich_universe_with_intraday_features(
-        universe_1d,
-        universe_5m,
-        config=config_1500,
-        cutoff_time="14:00",
-    )
-    assert config_1500.cutoff_time == "15:00"
-    assert enriched_override["SYM_A"].loc[d_last, "Close_5m_Cutoff"] == pytest.approx(
-        df_1400.loc[d_last, "Close_5m_Cutoff"]
-    )
-
-    # 4. Test cutoff_time as datetime.time
+    # 3. datetime.time(14, 0) works without raising errors and gives identical result
     enriched_time_obj = enrich_universe_with_intraday_features(
         universe_1d,
         universe_5m,
         cutoff_time=datetime.time(14, 0),
     )
-    assert enriched_time_obj["SYM_A"].loc[d_last, "Close_5m_Cutoff"] == pytest.approx(
-        df_1400.loc[d_last, "Close_5m_Cutoff"]
+    df_time_obj = enriched_time_obj["SYM_A"]
+    assert df_time_obj.loc[d_last, "Close_5m_Cutoff"] == pytest.approx(bar_36_close)
+
+    # 4. When config is provided along with cutoff_time, replace(config) updates cutoff_time
+    #    while preserving other config attributes without mutating caller config.
+    orig_config = IntradayFeatureConfig(
+        cutoff_time="15:00",
+        smart_money_top_pct=0.35,
+        enable_chan_5m=False,
+        volume_seasonality_lookback_days=10,
     )
+    with patch("common.intraday_features.compute_daily_intraday_features", wraps=compute_daily_intraday_features) as spy:
+        enriched_custom = enrich_universe_with_intraday_features(
+            universe_1d,
+            universe_5m,
+            config=orig_config,
+            cutoff_time="14:00",
+        )
+        assert spy.called
+        called_config = spy.call_args.kwargs["config"]
+        # replace() created a new instance with updated cutoff_time
+        assert called_config is not orig_config
+        assert called_config.cutoff_time == "14:00"
+        # Preserved other attributes
+        assert called_config.smart_money_top_pct == 0.35
+        assert called_config.enable_chan_5m is False
+        assert called_config.volume_seasonality_lookback_days == 10
+        # Original config is unmutated
+        assert orig_config.cutoff_time == "15:00"
+
+    assert enriched_custom["SYM_A"].loc[d_last, "Close_5m_Cutoff"] == pytest.approx(bar_36_close)
+
+
+# Alias for backward compatibility
+test_enrich_universe_with_cutoff_time_kwarg = test_enrich_universe_with_intraday_features_cutoff_time_kwarg
+
 
 
