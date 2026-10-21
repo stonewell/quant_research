@@ -161,13 +161,13 @@ def test_blend_strategies_versioning():
     ]
     for b_cls in blend_classes:
         inst = b_cls()
-        assert inst.BASE_VERSION == "1.1.0"
+        assert inst.BASE_VERSION == "1.3.0"
         assert inst.version == "1.0.0"
-        assert inst.base_version == "1.1.0"
-        assert "v1.0.0 [base: v1.1.0]" in inst.version_string
+        assert inst.base_version == "1.3.0"
+        assert "v1.0.0 [base: v1.3.0]" in inst.version_string
         v_info = inst.get_version_info()
         assert v_info["version"] == "1.0.0"
-        assert v_info["base_version"] == "1.1.0"
+        assert v_info["base_version"] == "1.3.0"
         assert "sub_strategies" in v_info
         assert len(v_info["sub_strategies"]) > 0
 

@@ -137,7 +137,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
     and adaptive turnover filters so any blend strategy can inherit them cleanly.
     """
 
-    BASE_VERSION: str = "1.1.0"
+    BASE_VERSION: str = "1.3.0"
     version: str = "1.0.0"
 
     def __init__(
@@ -157,7 +157,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             self.config = config
         self.param_prefix = param_prefix
         self.alt_param_prefixes = alt_param_prefixes or []
-        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "1.1.0")
+        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "1.3.0")
         strat_version: str = version or getattr(self.__class__, "version", "1.0.0")
         tags = factor_tags or [
             "regime_trend_strength",
@@ -527,7 +527,9 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         asymmetric_sells = self.resolve_param(p, "asymmetric_sells", (self.param_prefix == "cdhb"), bool)
         preemptive_thrust = self.resolve_param(p, "preemptive_thrust_deployment", True, bool)
         min_thrust_assets = self.resolve_param(p, "min_thrust_assets", 5, int)
-        max_assets_per_sector = self.resolve_param(p, "max_assets_per_sector", 1, int)
+        enable_adaptive_stop_atr = self.resolve_param(p, "enable_adaptive_stop_atr", True, bool)
+        enable_low_beta_inertia = self.resolve_param(p, "enable_low_beta_inertia", True, bool)
+        max_assets_per_sector = self.resolve_param(p, "max_assets_per_sector", 2, int)
         adaptive_sector_throttle = self.resolve_param(p, "adaptive_sector_throttle", False, bool)
         sector_incumbent_hurdle = self.resolve_param(p, "sector_incumbent_hurdle", 0.03, float)
         thrust_min_roc = self.resolve_param(p, "thrust_min_roc", 0.01, float)
@@ -567,6 +569,23 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         risky_symbols = _get_risky_symbols_helper(universe, p, cfg_symbol=None, cfg_risky_universe=None, cash_proxy=cash_proxy)
         if not risky_symbols:
             return pd.DataFrame()
+
+        # Fallback on-demand structural feature enrichment if not pre-enriched
+        if (
+            enable_cyq_quality_gate
+            or enable_vp_confluence_sizing
+            or enable_spring_fast_entry
+            or enable_structural_chandelier_stop
+        ):
+            needs_enrich = any(
+                sym in universe
+                and not universe[sym].empty
+                and "cyq_winner_ratio" not in universe[sym].columns
+                for sym in risky_symbols
+            )
+            if needs_enrich:
+                from common.structural_factors import enrich_universe_with_structural_features
+                universe = enrich_universe_with_structural_features(universe)
 
         master_index = _aligned_master_index_helper(universe, risky_symbols)
         if master_index is None or len(master_index) == 0:
@@ -772,7 +791,13 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                 cur_atr = float(atr_14_matrix[s].iloc[t]) if s in atr_14_matrix.columns else (curr_p * 0.02)
                                 peak_p = asset_peak_price[s] or curr_p
                                 if peak_p >= asset_entry_price[s] * 1.05:
-                                    trailing_stop_p = max(asset_entry_price[s] * 0.92, peak_p - stop_atr_mult * cur_atr)
+                                    eff_stop_mult = stop_atr_mult
+                                    if enable_adaptive_stop_atr:
+                                        s_vol = float(asset_vol_21d.iloc[t][s]) if (s in asset_vol_21d.columns and pd.notna(asset_vol_21d.iloc[t][s])) else target_vol
+                                        med_vol = float(asset_vol_21d.iloc[t].median()) if not asset_vol_21d.iloc[t].empty else target_vol
+                                        if s_vol > 0.05 and med_vol > 0.05:
+                                            eff_stop_mult = float(np.clip(stop_atr_mult * (med_vol / s_vol), 3.5, 7.5))
+                                    trailing_stop_p = max(asset_entry_price[s] * 0.92, peak_p - eff_stop_mult * cur_atr)
                                     # Track C Anchor 5: Structural ZG/VAL Chandelier Stop floor
                                     if enable_structural_chandelier_stop and s in universe and not universe[s].empty:
                                         df_u = universe[s]
@@ -1131,7 +1156,12 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                             while k >= 0 and float(daily_weights.iloc[k][s]) > 1e-4:
                                                 age += 1
                                                 k -= 1
-                                            if age < min_holding_bars and not has_stopped and not is_emergency:
+                                            eff_min_holding = min_holding_bars
+                                            if enable_low_beta_inertia:
+                                                s_vol = float(asset_vol_21d.iloc[t][s]) if (s in asset_vol_21d.columns and pd.notna(asset_vol_21d.iloc[t][s])) else target_vol
+                                                if s_vol < 0.22:
+                                                    eff_min_holding = max(eff_min_holding, 10)
+                                            if age < eff_min_holding and not has_stopped and not is_emergency:
                                                 locked_incumbents.add(s)
 
                             all_sorted = sorted(cand_scores.keys(), key=lambda s: (-cand_scores[s], s))

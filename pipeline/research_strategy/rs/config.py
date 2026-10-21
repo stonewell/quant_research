@@ -761,10 +761,12 @@ class StrategyConfig:
     blend_adaptive_inertia: bool = True
     blend_stop_mode: str = "atr_trailing"     # "atr_trailing", "fixed_pct", or "none"
     blend_stop_atr_mult: float = 4.5
+    blend_enable_adaptive_stop_atr: bool = True
+    blend_enable_low_beta_inertia: bool = True
     blend_asset_stop_cooldown_bars: int = 5
     blend_preemptive_thrust_deployment: bool = True
     blend_min_thrust_assets: int = 5
-    blend_max_assets_per_sector: int = 1
+    blend_max_assets_per_sector: int = 2
     blend_adaptive_sector_throttle: bool = False
     blend_thrust_min_roc: float = 0.01
     blend_thrust_sizing_mode: str = "vol_adjusted" # "vol_adjusted" or "equal_dollar"
@@ -780,6 +782,9 @@ class StrategyConfig:
     # Blend Base Template aliases (unprefixed versions for convenience)
     weighting_mode: Optional[str] = None
     enable_orthogonalization: Optional[bool] = None
+    enable_adaptive_stop_atr: Optional[bool] = None
+    enable_low_beta_inertia: Optional[bool] = None
+    max_assets_per_sector: Optional[int] = None
 
     # --- 5-Minute Intraday Microstructure & Interval Nesting Enhancement Parameters ---
     blend_enable_intraday_5m: bool = False
@@ -1201,6 +1206,9 @@ class StrategyConfig:
             ("enable_vp_confluence_sizing", "blend_enable_vp_confluence_sizing"),
             ("enable_spring_fast_entry", "blend_enable_spring_fast_entry"),
             ("enable_structural_chandelier_stop", "blend_enable_structural_chandelier_stop"),
+            ("enable_adaptive_stop_atr", "blend_enable_adaptive_stop_atr"),
+            ("enable_low_beta_inertia", "blend_enable_low_beta_inertia"),
+            ("max_assets_per_sector", "blend_max_assets_per_sector"),
         ]:
             val = getattr(self, alias, None)
             blend_val = getattr(self, blend_attr, None)
@@ -1215,6 +1223,8 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.blend_adaptive_lookback_days must be > 0, got {self.blend_adaptive_lookback_days}")
         if not (0.0 <= self.blend_adaptive_shrinkage <= 1.0):
             raise ValueError(f"StrategyConfig.blend_adaptive_shrinkage must be between 0 and 1, got {self.blend_adaptive_shrinkage}")
+        if self.blend_max_assets_per_sector <= 0:
+            raise ValueError(f"StrategyConfig.blend_max_assets_per_sector must be > 0, got {self.blend_max_assets_per_sector}")
 
         for pfx in ("crb", "cfsb", "ccsb", "cfssb", "cdhb", "blend"):
             val = getattr(self, f"{pfx}_min_holding_bars", None)
@@ -1303,6 +1313,9 @@ class StrategyConfig:
             ("enable_vp_confluence_sizing", "blend_enable_vp_confluence_sizing"),
             ("enable_spring_fast_entry", "blend_enable_spring_fast_entry"),
             ("enable_structural_chandelier_stop", "blend_enable_structural_chandelier_stop"),
+            ("enable_adaptive_stop_atr", "blend_enable_adaptive_stop_atr"),
+            ("enable_low_beta_inertia", "blend_enable_low_beta_inertia"),
+            ("max_assets_per_sector", "blend_max_assets_per_sector"),
         ]:
             if alias in data_copy and blend_attr not in data_copy:
                 data_copy[blend_attr] = data_copy[alias]
