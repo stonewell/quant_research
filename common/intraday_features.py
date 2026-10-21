@@ -852,6 +852,28 @@ def load_intraday_5m_universe(
             except Exception as exc:
                 logger.debug("Provider fetch 5m failed for %s: %s", sym, exc)
 
+        # Step 1.5: DuckDBCache fallback if provider returned empty or was not specified
+        if df_sym.empty:
+            try:
+                from common.duckdb_cache import DuckDBCache
+                cand_db_paths = [
+                    os.path.join(cache_dir or "data", "cache.duckdb"),
+                    os.path.join("data", "cache.duckdb"),
+                    os.path.join("pipeline", "data", "cache.duckdb"),
+                ]
+                for db_p in cand_db_paths:
+                    if os.path.exists(db_p):
+                        duck_c = DuckDBCache(db_p)
+                        for p_name in ["BaoStockDataProvider", "EastMoneyDataProvider", "fuyao"]:
+                            df_cand = duck_c.query_intraday_bars(p_name, sym, interval="5m", start=start, end=end)
+                            if not df_cand.empty:
+                                df_sym = df_cand
+                                break
+                    if not df_sym.empty:
+                        break
+            except Exception as exc:
+                logger.debug("DuckDBCache 5m fallback failed for %s: %s", sym, exc)
+
         # Step 2: Check local lock-free parquets
         if os.path.isdir(parquet_dir):
             parquet_files = sorted(glob.glob(os.path.join(parquet_dir, "*.parquet")))

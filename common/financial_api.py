@@ -217,11 +217,21 @@ def check_missing_trading_days(
         return []
 
     calendar = get_trading_days_calendar()
-    # If official calendar is available and covers up to target_end_date, use it to accurately filter holidays
-    if calendar and max(calendar) >= target_end_date:
-        return [d for d in candidates if d in calendar]
+    # If official calendar is available, use it when candidates fall within its coverage window
+    if calendar:
+        min_cal = min(calendar)
+        max_cal = max(calendar)
+        result = []
+        for d in candidates:
+            if min_cal <= d <= max_cal:
+                if d in calendar:
+                    result.append(d)
+            else:
+                if d.weekday() not in (5, 6):
+                    result.append(d)
+        return result
 
-    # Fallback when official calendar is unavailable or does not reach target date:
+    # Fallback when official calendar is unavailable:
     # consider non-weekend days (Monday..Friday) as candidate trading days
     return [d for d in candidates if d.weekday() not in (5, 6)]
 

@@ -1205,7 +1205,10 @@ def main(cli_args: Optional[List[str]] = None):
     )
     universe = as_of_universe(universe, as_of_date)
 
-    if getattr(args, "enable_intraday_5m", False):
+    enable_intraday_5m = getattr(args, "enable_intraday_5m", False) or bool(
+        resolve_blend_param(params, "enable_intraday_5m", False, bool)
+    )
+    if enable_intraday_5m:
         try:
             from common.intraday_features import (
                 IntradayFeatureConfig,

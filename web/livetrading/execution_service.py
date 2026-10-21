@@ -178,6 +178,7 @@ class ExecutionService:
             cmd.extend(["--peak-nav", str(peak_nav)])
         if self.storage.cache_dir:
             cmd.extend(["--cache-dir", self.storage.cache_dir])
+        cmd.append("--enable-intraday-5m")
 
         print(f"[ExecutionService] Running Stage 1 Health Check: {' '.join(cmd)}")
         proc = subprocess.run(
@@ -335,6 +336,7 @@ class ExecutionService:
             cmd.extend(["--lot-size", str(lot_size)])
         if self.storage.cache_dir:
             cmd.extend(["--cache-dir", self.storage.cache_dir])
+        cmd.append("--enable-intraday-5m")
         if guard_latency_bars is not None:
             cmd.extend(["--guard-latency-bars", str(guard_latency_bars)])
 
@@ -494,6 +496,7 @@ class ExecutionService:
             cmd.extend(["--start-date", start_d])
         if self.storage.cache_dir:
             cmd.extend(["--cache-dir", self.storage.cache_dir])
+        cmd.append("--enable-intraday-5m")
 
         print(f"[ExecutionService] Running Multi-Strategy Netting Deploy: {' '.join(cmd)}")
         proc = subprocess.run(

@@ -888,8 +888,11 @@ def main(cli_args: Optional[List[str]] = None):
     )
 
     # 4. Evaluate Universe Breadth, Thrust & Volatility (and optional 5m Intraday Enrichment)
+    enable_intraday_5m = getattr(args, "enable_intraday_5m", False) or bool(
+        resolve_blend_param(params, "enable_intraday_5m", False, bool)
+    )
     intraday_5m_info = None
-    if getattr(args, "enable_intraday_5m", False):
+    if enable_intraday_5m:
         try:
             from common.intraday_features import (
                 IntradayFeatureConfig,
@@ -1123,6 +1126,8 @@ def main(cli_args: Optional[List[str]] = None):
                 cmd.extend(["--data-dir", args.data_dir])
             if getattr(args, "no_cache", False):
                 cmd.append("--no-cache")
+            if enable_intraday_5m:
+                cmd.append("--enable-intraday-5m")
             import subprocess
             subprocess.run(cmd, check=True)
 
