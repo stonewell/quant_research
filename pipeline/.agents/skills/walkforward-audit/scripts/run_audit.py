@@ -450,11 +450,35 @@ def run_ranking(strategies, results_dir: Path, top_n: int = 10):
     return results
 
 
-def audit_strategy_assets(results_dir: Path, dir_name: str):
+def audit_strategy_assets(results_dir: Path, dir_name: str = ""):
     """Performs stateful asset-level trade analysis and PnL attribution from walkforward_rebalances.csv."""
-    path = (results_dir / dir_name / "walkforward_rebalances.csv") if dir_name else (results_dir / "walkforward_rebalances.csv")
+    strat_dir = (results_dir / dir_name) if dir_name else Path(results_dir)
+    path = strat_dir / "walkforward_rebalances.csv"
     if not path.is_file():
         return None
+
+    # Read fold end dates from walkforward_report.csv or walkforward_summary.json
+    fold_ends = {}
+    report_csv = strat_dir / "walkforward_report.csv"
+    summary_json = strat_dir / "walkforward_summary.json"
+    if report_csv.is_file():
+        try:
+            with open(report_csv) as f:
+                r = csv.DictReader(f)
+                for idx, row in enumerate(r, 1):
+                    if "end_date" in row and row["end_date"]:
+                        fold_ends[idx] = row["end_date"].strip()
+        except Exception:
+            pass
+    if not fold_ends and summary_json.is_file():
+        try:
+            with open(summary_json) as f:
+                sdata = json.load(f)
+            for idx, rwp in enumerate(sdata.get("rolling_window_performance", []), 1):
+                if "end_date" in rwp and rwp["end_date"]:
+                    fold_ends[idx] = rwp["end_date"].strip()
+        except Exception:
+            pass
 
     trades = []
     with open(path) as f:
@@ -473,6 +497,27 @@ def audit_strategy_assets(results_dir: Path, dir_name: str):
 
     if not trades:
         return None
+
+    # Load universe close prices for mark-to-market valuation at fold end
+    universe = {}
+    symbols = sorted(list(set(t["symbol"] for t in trades)))
+    if symbols:
+        try:
+            cur_p = Path(__file__).resolve()
+            for parent_p in [cur_p.parents[4], Path.cwd(), Path.cwd().parent]:
+                if (parent_p / "common").is_dir() and str(parent_p) not in sys.path:
+                    sys.path.insert(0, str(parent_p))
+            from common.cli_utils import load_universe_with_banner
+            start_date = min(t["date"] for t in trades)
+            end_date_all = max(fold_ends.values()) if fold_ends else max(t["date"] for t in trades)
+            universe = load_universe_with_banner(
+                symbols, start_date, end_date_all, '1d',
+                data_kwargs={'provider': 'fuyao'},
+                require_nonempty=False,
+                loading_msg=""
+            )
+        except Exception:
+            universe = {}
 
     folds = sorted(set(t["fold"] for t in trades))
     symbol_stats = defaultdict(lambda: {
@@ -510,8 +555,16 @@ def audit_strategy_assets(results_dir: Path, dir_name: str):
                 else:
                     held.pop(sym, None)
 
+        end_date = fold_ends.get(f_num)
         for sym, (sh, pr) in held.items():
-            symbol_stats[sym]["end_val"] += sh * pr
+            if fold_ends and (sym in universe) and end_date:
+                try:
+                    close_p = float(universe[sym].loc[:end_date, 'Close'].iloc[-1])
+                    symbol_stats[sym]["end_val"] += sh * close_p
+                except Exception:
+                    symbol_stats[sym]["end_val"] += sh * pr
+            else:
+                symbol_stats[sym]["end_val"] += sh * pr
 
     assets = []
     for sym, st in symbol_stats.items():
