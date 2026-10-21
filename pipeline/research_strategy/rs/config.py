@@ -707,7 +707,7 @@ class StrategyConfig:
     cdhb_bull_max_single_position: float = 0.20
     cdhb_preemptive_thrust_deployment: bool = True
     cdhb_min_thrust_assets: int = 5
-    cdhb_max_assets_per_sector: int = 1      # Max assets permitted per sector during thrust deployment
+    cdhb_max_assets_per_sector: int = 2      # Max assets permitted per sector during thrust deployment
     cdhb_adaptive_sector_throttle: bool = False  # Expand sector limit to 2 for leading sectors when enabled
     cdhb_thrust_min_roc: float = 0.01        # Minimum 10-day ROC velocity hurdle
     cdhb_thrust_sizing_mode: str = "vol_adjusted"  # "vol_adjusted" or "equal_dollar"
@@ -883,9 +883,9 @@ class StrategyConfig:
     chan_b3_enable_vp_filter: bool = False
     regime_enable_fractal_curvature: bool = False
 
-    # Modular Blend base enhancement flags (default False)
-    blend_enable_structural_regime: bool = False
-    blend_enable_cyq_quality_gate: bool = False
+    # Modular Blend base enhancement flags (default True for production)
+    blend_enable_structural_regime: bool = True
+    blend_enable_cyq_quality_gate: bool = True
     blend_min_cyq_winner_ratio: float = 0.20
     blend_enable_vp_confluence_sizing: bool = False
     blend_enable_spring_fast_entry: bool = False

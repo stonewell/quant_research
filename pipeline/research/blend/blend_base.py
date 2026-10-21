@@ -137,7 +137,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
     and adaptive turnover filters so any blend strategy can inherit them cleanly.
     """
 
-    BASE_VERSION: str = "1.3.0"
+    BASE_VERSION: str = "1.4.0"
     version: str = "1.0.0"
 
     def __init__(
@@ -157,7 +157,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             self.config = config
         self.param_prefix = param_prefix
         self.alt_param_prefixes = alt_param_prefixes or []
-        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "1.3.0")
+        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "1.4.0")
         strat_version: str = version or getattr(self.__class__, "version", "1.0.0")
         tags = factor_tags or [
             "regime_trend_strength",
@@ -399,7 +399,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         p = params or {}
         thrust_thresh = self.resolve_param(p, "thrust_thresh", 0.60, float)
         breadth_bull_thresh = self.resolve_param(p, "breadth_bull_thresh", 0.30, float)
-        enable_structural_regime = self.resolve_param(p, "enable_structural_regime", False, bool)
+        enable_structural_regime = self.resolve_param(p, "enable_structural_regime", True, bool)
 
         # If all sub-strategies have zero base weights (e.g. explicitly disabled by caller), return as-is
         if sum(base_weights.values()) <= 1e-6:
@@ -555,8 +555,8 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         intraday_cutoff_time = self.resolve_param(p, "intraday_cutoff_time", "14:15", str)
 
         # Track C Multi-Theory Quantitative Synthesis Parameters (Anchors 1-5)
-        enable_structural_regime = self.resolve_param(p, "enable_structural_regime", False, bool)
-        enable_cyq_quality_gate = self.resolve_param(p, "enable_cyq_quality_gate", False, bool)
+        enable_structural_regime = self.resolve_param(p, "enable_structural_regime", True, bool)
+        enable_cyq_quality_gate = self.resolve_param(p, "enable_cyq_quality_gate", True, bool)
         min_cyq_winner_ratio = self.resolve_param(p, "min_cyq_winner_ratio", 0.20, float)
         enable_vp_confluence_sizing = self.resolve_param(p, "enable_vp_confluence_sizing", False, bool)
         enable_spring_fast_entry = self.resolve_param(p, "enable_spring_fast_entry", False, bool)

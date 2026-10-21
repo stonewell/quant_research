@@ -353,6 +353,11 @@
       "crb_thrust_incumbent_bonus": 1.20,
       "blend_weighting_mode": "rolling_ic_ir",
       "blend_enable_orthogonalization": true,
+      "blend_enable_structural_regime": true,
+      "blend_enable_cyq_quality_gate": true,
+      "blend_enable_adaptive_stop_atr": true,
+      "blend_enable_low_beta_inertia": true,
+      "blend_max_assets_per_sector": 2,
       "cash_proxy": "BIL"
     },
     "factors": ["regime_trend_strength", "absolute_momentum_trend", "relative_momentum", "volatility_targeting"]
@@ -393,6 +398,11 @@
       "cfsb_thrust_incumbent_bonus": 1.20,
       "blend_weighting_mode": "rolling_ic_ir",
       "blend_enable_orthogonalization": true,
+      "blend_enable_structural_regime": true,
+      "blend_enable_cyq_quality_gate": true,
+      "blend_enable_adaptive_stop_atr": true,
+      "blend_enable_low_beta_inertia": true,
+      "blend_max_assets_per_sector": 2,
       "cash_proxy": "BIL"
     },
     "factors": ["regime_trend_strength", "absolute_momentum_trend", "relative_momentum", "volatility_targeting"]
@@ -437,6 +447,11 @@
       "cfssb_thrust_incumbent_bonus": 1.20,
       "blend_weighting_mode": "rolling_ic_ir",
       "blend_enable_orthogonalization": true,
+      "blend_enable_structural_regime": true,
+      "blend_enable_cyq_quality_gate": true,
+      "blend_enable_adaptive_stop_atr": true,
+      "blend_enable_low_beta_inertia": true,
+      "blend_max_assets_per_sector": 2,
       "cash_proxy": "BIL"
     },
     "factors": ["regime_trend_strength", "absolute_momentum_trend", "relative_momentum", "volatility_targeting", "mean_reversion"]
@@ -479,6 +494,11 @@
       "ccsb_thrust_incumbent_bonus": 1.20,
       "blend_weighting_mode": "rolling_ic_ir",
       "blend_enable_orthogonalization": true,
+      "blend_enable_structural_regime": true,
+      "blend_enable_cyq_quality_gate": true,
+      "blend_enable_adaptive_stop_atr": true,
+      "blend_enable_low_beta_inertia": true,
+      "blend_max_assets_per_sector": 2,
       "cash_proxy": "BIL"
     },
     "factors": ["regime_trend_strength", "absolute_momentum_trend", "relative_momentum", "volatility_targeting", "mean_reversion"]
@@ -521,7 +541,7 @@
       "cdhb_bull_max_single_position": 0.20,
       "cdhb_preemptive_thrust_deployment": true,
       "cdhb_min_thrust_assets": 5,
-      "cdhb_max_assets_per_sector": 1,
+      "cdhb_max_assets_per_sector": 2,
       "cdhb_adaptive_sector_throttle": true,
       "cdhb_thrust_min_roc": 0.01,
       "cdhb_thrust_sizing_mode": "vol_adjusted",
@@ -540,6 +560,11 @@
       "cdhb_thrust_incumbent_bonus": 1.20,
       "blend_weighting_mode": "rolling_ic_ir",
       "blend_enable_orthogonalization": true,
+      "blend_enable_structural_regime": true,
+      "blend_enable_cyq_quality_gate": true,
+      "blend_enable_adaptive_stop_atr": true,
+      "blend_enable_low_beta_inertia": true,
+      "blend_max_assets_per_sector": 2,
       "cash_proxy": "BIL"
     },
     "factors": ["regime_trend_strength", "absolute_momentum_trend", "relative_momentum", "volatility_targeting", "mean_reversion"]
@@ -584,6 +609,11 @@
       "blend_min_holding_bars": 2,
       "blend_min_entry_bars": 2,
       "blend_thrust_incumbent_bonus": 1.20,
+      "blend_enable_structural_regime": true,
+      "blend_enable_cyq_quality_gate": true,
+      "blend_enable_adaptive_stop_atr": true,
+      "blend_enable_low_beta_inertia": true,
+      "blend_max_assets_per_sector": 2,
       "cash_proxy": "BIL"
     },
     "factors": ["regime_trend_strength", "absolute_momentum_trend", "relative_momentum", "volatility_targeting", "mean_reversion"]
