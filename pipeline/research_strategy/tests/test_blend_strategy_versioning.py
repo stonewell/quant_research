@@ -65,7 +65,7 @@ def test_blend_base_versioning_and_properties():
 
 
 def test_six_institutional_blend_subclasses():
-    """Verify all 6 institutional blend subclasses declare version 1.0.0 and introspect sub-strategies."""
+    """Verify all 6 institutional blend subclasses declare their expected version and introspect sub-strategies."""
     blend_classes = [
         ChanFourStateBlendStrategy,
         ChanRiskManagedBlendStrategy,
@@ -74,16 +74,25 @@ def test_six_institutional_blend_subclasses():
         ChanDualHybridBlendStrategy,
         GenericBlendStrategy,
     ]
+    expected_versions = {
+        ChanFourStateBlendStrategy: "1.1.0",
+        ChanRiskManagedBlendStrategy: "1.1.0",
+        ChanCrisisShieldBlendStrategy: "1.0.1",
+        ChanFourStateShieldBlendStrategy: "1.0.0",
+        ChanDualHybridBlendStrategy: "1.0.0",
+        GenericBlendStrategy: "1.0.0",
+    }
 
     for b_cls in blend_classes:
+        exp = expected_versions[b_cls]
         inst = b_cls()
-        assert inst.version == "1.0.0", f"{b_cls.__name__} version should be '1.0.0'"
+        assert inst.version == exp, f"{b_cls.__name__} version should be '{exp}'"
         assert inst.base_version == "1.4.0"
-        assert "v1.0.0 [base: v1.4.0]" in inst.version_string
+        assert f"v{exp} [base: v1.4.0]" in inst.version_string
 
         v_info = inst.get_version_info()
         assert isinstance(v_info, dict)
-        assert v_info["version"] == "1.0.0"
+        assert v_info["version"] == exp
         assert v_info["base_version"] == "1.4.0"
         assert "sub_strategies" in v_info
         assert isinstance(v_info["sub_strategies"], dict)
@@ -100,9 +109,12 @@ def test_blend_version_info_structure():
     strat = ChanFourStateBlendStrategy()
     info = strat.get_version_info()
     assert info["strategy_class"] == "ChanFourStateBlendStrategy"
-    assert info["version"] == "1.0.0"
+    assert info["version"] == "1.1.0"
     assert info["base_version"] == "1.4.0"
     assert "chan_four_state" in info["sub_strategies"]
     assert "chan_three_type" in info["sub_strategies"]
     assert "chan_vaa_compound" in info["sub_strategies"]
     assert info["sub_strategies"]["chan_three_type"]["version"] == "1.0.0"
+    # Regression: the chan_four_state leg must resolve to the four-state execution
+    # machine, not the global WorldQuantAlphaStrategy #101 (see docs/version.md).
+    assert info["sub_strategies"]["chan_four_state"]["class"] == "ChanFourStateExecutionStrategy"

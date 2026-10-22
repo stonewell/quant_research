@@ -25,7 +25,7 @@ class ChanCrisisShieldBlendStrategy(BaseBlendAllocationStrategy):
     WorldQuant Alpha#12 (Volume Shock Reversal).
     """
 
-    version: str = "1.0.0"
+    version: str = "1.0.1"
 
     def __init__(self, config: Optional[StrategyConfig] = None, version: Optional[str] = None):
         cfg = config or StrategyConfig()
@@ -53,7 +53,12 @@ class ChanCrisisShieldBlendStrategy(BaseBlendAllocationStrategy):
 
         cfg = self.config
         p = params or {}
-        wq_id = int(self.resolve_param(p, "shield_alpha_id", self.resolve_param(p, "wq_alpha_id", getattr(cfg, "ccsb_shield_alpha_id", 12), int), int))
+        # Note: resolves the shield WorldQuant alpha id directly. The previous
+        # nested bare-name "wq_alpha_id" fallback was dead code (ccsb_shield_alpha_id
+        # always short-circuits) AND a latent footgun -- the bare "wq_alpha_id" would
+        # have leaked the global StrategyConfig.wq_alpha_id=101 if ccsb_shield_alpha_id
+        # were ever None. See docs/version.md.
+        wq_id = int(self.resolve_param(p, "shield_alpha_id", getattr(cfg, "ccsb_shield_alpha_id", 12), int))
         req_trend = bool(self.resolve_param(p, "shield_require_trend", getattr(cfg, "ccsb_shield_require_trend", False), bool))
 
         cfg_wq = copy.deepcopy(cfg)
@@ -82,7 +87,7 @@ class ChanCrisisShieldBlendStrategy(BaseBlendAllocationStrategy):
     def explain_weights(self, params: dict = None) -> str:
         cfg = self.config
         p = params or {}
-        shield_id = int(self.resolve_param(p, "shield_alpha_id", self.resolve_param(p, "wq_alpha_id", getattr(cfg, "ccsb_shield_alpha_id", 12), int), int))
+        shield_id = int(self.resolve_param(p, "shield_alpha_id", getattr(cfg, "ccsb_shield_alpha_id", 12), int))
         three_w = float(self.resolve_param(p, "three_type_weight", getattr(cfg, "ccsb_three_type_weight", 0.45), float))
         vaa_w = float(self.resolve_param(p, "vaa_weight", getattr(cfg, "ccsb_vaa_weight", 0.35), float))
         shield_w = float(self.resolve_param(p, "shield_weight", self.resolve_param(p, "composite_weight", getattr(cfg, "ccsb_shield_weight", 0.20), float), float))

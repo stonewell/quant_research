@@ -20,9 +20,9 @@
                                            ▼
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │                          具体策略子类版本 (Strategy Class version)                        │
-│  - ChanRiskManagedBlendStrategy: v1.0.0 [base: v1.4.0]                                 │
-│  - ChanFourStateBlendStrategy:   v2.0.0 [base: v1.4.0]                                 │
-│  - ChanCrisisShieldBlendStrategy: v2.1.0 [base: v1.4.0]                                │
+│  - ChanRiskManagedBlendStrategy: v1.1.0 [base: v1.4.0]                                 │
+│  - ChanFourStateBlendStrategy:   v1.1.0 [base: v1.4.0]                                 │
+│  - ChanCrisisShieldBlendStrategy: v1.0.1 [base: v1.4.0]                                │
 │  - ChanDualHybridBlendStrategy:  v1.0.0 [base: v1.4.0]                                 │
 │  - GenericBlendStrategy:         v1.0.0 [base: v1.4.0]                                 │
 │  - 9 大静态配置模板 (EqualWeight, RiskParity ...): v1.0.0                             │
@@ -191,12 +191,12 @@
 
 | 策略类名 (`Strategy Class`) | 内部标识 (`Strategy ID`) | 当前版本 (`version`) | 所属底座版本 (`base_version`) | 复合版本标识 (`version_string`) | 核心流派与组合机制说明 |
 | :--- | :--- | :---: | :---: | :---: | :--- |
-| `ChanRiskManagedBlendStrategy` | `chan_risk_managed_blend` | **`1.0.0`** | `1.3.0` | `v1.0.0 [base: v1.3.0]` | 缠论结构与风控增强多流派配置策略，主打回撤控制与稳健复合收益 |
-| `ChanFourStateBlendStrategy` | `chan_four_state_blend` | **`2.0.0`** | `1.3.0` | `v2.0.0 [base: v1.3.0]` | 四状态缠论状态机驱动（趋势/盘整/背驰/反转）动态调权配置旗舰策略 |
-| `ChanCrisisShieldBlendStrategy` | `chan_crisis_shield_blend` | **`2.1.0`** | `1.3.0` | `v2.1.0 [base: v1.3.0]` | 危机防御型盾牌策略，内置极端熊市熔断、防崩盘流动性保护与对冲卸载 |
-| `ChanDualHybridBlendStrategy` | `chan_dual_hybrid_blend` | **`1.0.0`** | `1.3.0` | `v1.0.0 [base: v1.3.0]` | 双轨混动策略，结合缠论短波段择时与中长周期资产动量/反转配置 |
-| `GenericBlendStrategy` | `generic_blend` | **`1.0.0`** | `1.3.0` | `v1.0.0 [base: v1.3.0]` | 通用多流派 Blend 组合框架，支持任意配置文件的子策略插拔与动态正交加权 |
-| `ChanFourStateShieldBlendStrategy` | `chan_four_state_shield_blend` | **`1.0.0`** | `1.3.0` | `v1.0.0 [base: v1.3.0]` | 四状态状态机与全景危机防护装甲合体策略 |
+| `ChanRiskManagedBlendStrategy` | `chan_risk_managed_blend` | **`1.1.0`** | `1.4.0` | `v1.1.0 [base: v1.4.0]` | 缠论结构与风控增强多流派配置策略，主打回撤控制与稳健复合收益 |
+| `ChanFourStateBlendStrategy` | `chan_four_state_blend` | **`1.1.0`** | `1.4.0` | `v1.1.0 [base: v1.4.0]` | 四状态缠论状态机驱动（趋势/盘整/背驰/反转）动态调权配置旗舰策略 |
+| `ChanCrisisShieldBlendStrategy` | `chan_crisis_shield_blend` | **`1.0.1`** | `1.4.0` | `v1.0.1 [base: v1.4.0]` | 危机防御型盾牌策略，内置极端熊市熔断、防崩盘流动性保护与对冲卸载 |
+| `ChanDualHybridBlendStrategy` | `chan_dual_hybrid_blend` | **`1.0.0`** | `1.4.0` | `v1.0.0 [base: v1.4.0]` | 双轨混动策略，结合缠论短波段择时与中长周期资产动量/反转配置 |
+| `GenericBlendStrategy` | `generic_blend` | **`1.0.0`** | `1.4.0` | `v1.0.0 [base: v1.4.0]` | 通用多流派 Blend 组合框架，支持任意配置文件的子策略插拔与动态正交加权 |
+| `ChanFourStateShieldBlendStrategy` | `chan_four_state_shield_blend` | **`1.0.0`** | `1.4.0` | `v1.0.0 [base: v1.4.0]` | 四状态状态机与全景危机防护装甲合体策略 |
 
 ---
 
@@ -267,3 +267,44 @@ pipeline/.venv/bin/python scripts/run_live_strategy.py \
     --strategy equal_weight --data-provider synthetic \
     --output-dir data/test_run/ --lookback-days 300
 ```
+
+---
+
+## 7. 子类策略修复变更日志 (Subclass Strategy Bugfix Changelog)
+
+### 修复背景：裸名 `resolve_param` 回退泄漏全局 `wq_alpha_id` 导致子策略被静默替换
+
+**根因**：`BaseBlendAllocationStrategy.resolve_param()` 的解析优先级末尾（第 8 级）为 `getattr(cfg, name)` 裸名回退。当调用方使用裸名 `"wq_alpha_id"` 时，`cfsb_wq_alpha_id` / `crb_wq_alpha_id` 为 `None`（被第 5 级的 `if val is not None` 跳过），且不存在 `blend_wq_alpha_id` 字段（第 7 级无法拦截），最终泄漏全局 `StrategyConfig.wq_alpha_id=101`（独立 `WorldQuantAlphaStrategy` 的默认值）。结果 `get_sub_strategies()` 中 `if strat_type in (...) or wq_id is not None:` 恒为真，`chan_four_state` / `chan_composite` 子策略被静默替换为 `WorldQuantAlphaStrategy(#101)`，与策略名、docstring、`strategies_config.json` 描述及配置默认值（`cfsb_third_strategy_type="four_state"`）相矛盾。实盘（`scripts/run_live_strategy.py`）与回测（`backtester/run_backtest.py`）共用 `common.strategy_spec.get_template → instantiate_strategy_from_config_entry` 路径，因此两者同时受影响。
+
+**修复方案**：`get_sub_strategies()` 改为仅解析策略前缀键，杜绝裸名回退泄漏全局字段。
+
+**配套配置变更**：在 `pipeline/research_strategy/strategies_config.json` 中为 `chan_four_state_blend` 与 `chan_risk_managed_blend` 显式声明子策略选择参数（`"cfsb_third_strategy_type": "four_state"`、`"crb_third_strategy_type": "composite"`），与 `chan_four_state_shield_blend` / `chan_crisis_shield_blend` 已显式声明的 `cfssb_shield_alpha_id` / `ccsb_shield_alpha_id`、以及 `chan_dual_hybrid_blend` 已显式声明的 `cdhb_alpha1_id` 等保持一致的“子策略意图显式化”约定，避免仅依赖 `config.py` 类默认值承载战略选择。
+
+### `ChanFourStateBlendStrategy`: `v1.0.0` → `v1.1.0` (2026-10-21)
+* **变更类型**：Minor —— 修复子策略解析缺陷（行为变更：`chan_four_state` 子策略实体由 `WorldQuantAlphaStrategy(#101)` 更正为 `ChanFourStateExecutionStrategy`）。
+* **改动位置**：`pipeline/research/blend/chan_four_state_blend.py` `get_sub_strategies()`。
+* **修复前**：`wq_id = self.resolve_param(p, "wq_alpha_id", getattr(cfg, "cfsb_wq_alpha_id", None))` → 恒解析为 `101`。
+* **修复后**：`wq_id = p.get("cfsb_wq_alpha_id", getattr(cfg, "cfsb_wq_alpha_id", None))` → 默认 `None`，正确落入 `ChanFourStateExecutionStrategy` 分支。
+* **单测覆盖**：`test_blend_sub_strategy_class_resolution_regression` (PASS)、`pipeline/research_strategy/tests/test_blend_strategy_versioning.py` (PASS)、`common/tests/test_strategy_versioning.py` (PASS)、`test_chan_advanced_strategies.py` 四态 blend 用例 (PASS)。
+
+### `ChanRiskManagedBlendStrategy`: `v1.0.0` → `v1.1.0` (2026-10-21)
+* **变更类型**：Minor —— 同类缺陷修复（行为变更：`chan_composite` 子策略实体由 `WorldQuantAlphaStrategy(#101)` 更正为 `ChanCompositeStrategy`）。
+* **改动位置**：`pipeline/research/blend/chan_risk_managed_blend.py` `get_sub_strategies()`。
+* **修复后**：`wq_id = p.get("crb_wq_alpha_id", getattr(cfg, "crb_wq_alpha_id", None))`。
+* **单测覆盖**：同上（`test_blend_sub_strategy_class_resolution_regression` 断言 `chan_composite` 为 `ChanCompositeStrategy`）。
+
+### `ChanCrisisShieldBlendStrategy`: `v1.0.0` → `v1.0.1` (2026-10-21)
+* **变更类型**：Patch —— 移除 `get_sub_strategies()` 与 `explain_weights()` 中嵌套裸名 `wq_alpha_id` 的死代码回退（`ccsb_shield_alpha_id=12` 恒短路使内层永不生效），该死代码同时是潜在脚枪（若 `ccsb_shield_alpha_id` 为 `None` 将泄漏全局 `wq_alpha_id=101`）。**输出无变化（仍为 Alpha#12）**。
+* **改动位置**：`pipeline/research/blend/chan_crisis_shield_blend.py`。
+* **单测覆盖**：`test_blend_sub_strategy_class_resolution_regression` 断言 `chan_composite` 为 `WorldQuantAlphaStrategy` 且 `wq_alpha_id == 12` (PASS)。
+
+### 全量审计结论
+对 `pipeline/research/blend/` 下 6 个 Blend 策略逐一重建并调用 `get_sub_strategies()` 审计结果：
+| 策略 | 受影响 | 说明 |
+| :--- | :---: | :--- |
+| `chan_four_state_blend` | ✅ 已修复 | `chan_four_state` → `ChanFourStateExecutionStrategy`（原误用 Alpha#101） |
+| `chan_risk_managed_blend` | ✅ 已修复 | `chan_composite` → `ChanCompositeStrategy`（原误用 Alpha#101） |
+| `chan_crisis_shield_blend` | ✅ 已清理 | 死代码回退移除，输出仍为 Alpha#12 |
+| `chan_four_state_shield_blend` | ❌ 无 | 正确解析 `chan_four_state` 与 `wq_alpha12` |
+| `chan_dual_hybrid_blend` | ❌ 无 | 正确解析 Alpha#53/#3/#41/#101 |
+| `generic_blend` | ❌ 无 | 使用 `blend_sub_strategies` 名册映射，无裸名回退 |

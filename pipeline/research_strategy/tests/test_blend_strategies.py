@@ -346,6 +346,56 @@ def test_chan_four_state_shield_blend_strategy_sub_strategies_and_regimes():
     assert "chan_four_state_execution" in exp
 
 
+def test_blend_sub_strategy_class_resolution_regression():
+    """Regression test for the bare-name resolve_param collision that silently
+    substituted WorldQuantAlphaStrategy #101 for ChanFourStateExecutionStrategy /
+    ChanCompositeStrategy.
+
+    The bug: get_sub_strategies() resolved a bare "wq_alpha_id" param, whose
+    resolve_param fallback leaked the global StrategyConfig.wq_alpha_id=101,
+    making the `wq_id is not None` branch always true. See docs/version.md.
+    """
+    from pipeline.research_strategy.rs.chan_advanced_strategies import (
+        ChanCompositeStrategy,
+        ChanFourStateExecutionStrategy,
+        ChanVaaCompoundStrategy,
+    )
+    from pipeline.research_strategy.rs.strategy import ChanThreeTypeStrategy
+    from pipeline.research_strategy.rs.worldquant_alpha_strategy import WorldQuantAlphaStrategy
+
+    # 1. chan_four_state_blend: the chan_four_state leg MUST be the four-state
+    #    execution machine (not a WorldQuant alpha).
+    subs = ChanFourStateBlendStrategy().get_sub_strategies({})
+    assert isinstance(subs["chan_four_state"], ChanFourStateExecutionStrategy)
+    assert not isinstance(subs["chan_four_state"], WorldQuantAlphaStrategy)
+    assert isinstance(subs["chan_three_type"], ChanThreeTypeStrategy)
+    assert isinstance(subs["chan_vaa_compound"], ChanVaaCompoundStrategy)
+
+    # 2. chan_risk_managed_blend: the chan_composite leg MUST be ChanCompositeStrategy.
+    subs = ChanRiskManagedBlendStrategy().get_sub_strategies({})
+    assert isinstance(subs["chan_composite"], ChanCompositeStrategy)
+    assert not isinstance(subs["chan_composite"], WorldQuantAlphaStrategy)
+
+    # 3. chan_crisis_shield_blend: chan_composite is INTENTIONALLY WorldQuant Alpha #12.
+    subs = ChanCrisisShieldBlendStrategy().get_sub_strategies({})
+    assert isinstance(subs["chan_composite"], WorldQuantAlphaStrategy)
+    assert subs["chan_composite"].config.wq_alpha_id == 12
+
+    # 4. chan_four_state_shield_blend: real four-state machine + Alpha #12 shield.
+    subs = ChanFourStateShieldBlendStrategy().get_sub_strategies({})
+    assert isinstance(subs["chan_four_state"], ChanFourStateExecutionStrategy)
+    assert isinstance(subs["wq_alpha12"], WorldQuantAlphaStrategy)
+    assert subs["wq_alpha12"].config.wq_alpha_id == 12
+
+    # 5. chan_dual_hybrid_blend: alphas #53 / #3 (expanded sleeve #41 / #101).
+    subs = ChanDualHybridBlendStrategy().get_sub_strategies({})
+    assert isinstance(subs["wq_alpha1"], WorldQuantAlphaStrategy)
+    assert subs["wq_alpha1"].config.wq_alpha_id == 53
+    assert subs["wq_alpha2"].config.wq_alpha_id == 3
+    assert subs["wq_alpha3"].config.wq_alpha_id == 41
+    assert subs["wq_alpha4"].config.wq_alpha_id == 101
+
+
 def test_base_blend_rolling_ic_ir_weighting():
     """Tests rolling IC-IR adaptive weighting and HLZ t-stat significance hurdle."""
     mock_universe = create_mock_universe(150)

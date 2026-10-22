@@ -24,7 +24,7 @@ class ChanRiskManagedBlendStrategy(BaseBlendAllocationStrategy):
     volatility targeting, ATR trailing stops, and turnover controls.
     """
 
-    version: str = "1.0.0"
+    version: str = "1.1.0"
 
     def __init__(self, config: Optional[StrategyConfig] = None, version: Optional[str] = None):
         cfg = config or StrategyConfig()
@@ -53,7 +53,12 @@ class ChanRiskManagedBlendStrategy(BaseBlendAllocationStrategy):
         cfg = self.config
         p = params or {}
         strat_type = str(self.resolve_param(p, "third_strategy_type", getattr(cfg, "crb_third_strategy_type", "composite"), str)).lower()
-        wq_id = self.resolve_param(p, "wq_alpha_id", getattr(cfg, "crb_wq_alpha_id", None))
+        # BUGFIX (2026-10-21): resolve only the strategy-prefixed WorldQuant alpha
+        # id. The bare "wq_alpha_id" name previously let resolve_param's final
+        # fallback grab the global StrategyConfig.wq_alpha_id=101 (the standalone
+        # WorldQuantAlphaStrategy default), silently replacing ChanCompositeStrategy
+        # with WorldQuantAlphaStrategy #101. See docs/version.md for the audit record.
+        wq_id = p.get("crb_wq_alpha_id", getattr(cfg, "crb_wq_alpha_id", None))
 
         if strat_type in ("worldquant_alpha", "wq_alpha") or wq_id is not None:
             from pipeline.research_strategy.rs.worldquant_alpha_strategy import WorldQuantAlphaStrategy

@@ -123,6 +123,22 @@ available in the current shell.
   orthogonalization $W^* = W(W^T W)^{-1/2}$ removing sub-strategy collinearity), validated by walkforward
   experiments (`blend_6` through `blend_13`) yielding up to 37.35% CAGR, 1.702 Sharpe, and 0.9400 DSR.
 
+- **Blend sub-strategy hookup & the bare-name `resolve_param` collision (critical -- caused a real
+  bug, fixed 2026-10-21):** each blend strategy's `get_sub_strategies(universe, params)` builds its
+  sub-strategy instances by resolving selection params through `BaseBlendAllocationStrategy.resolve_param`.
+  `resolve_param`'s final fallback is a bare-name `getattr(cfg, name)`, so any param name that collides
+  with a *global* `StrategyConfig` field (and has no `blend_<name>` in between) silently leaks that
+  global's value. The concrete casualty was `wq_alpha_id`: `chan_four_state_blend` and
+  `chan_risk_managed_blend` resolved `resolve_param(p, "wq_alpha_id", ...)`, which leaked the global
+  `StrategyConfig.wq_alpha_id=101` (the standalone `WorldQuantAlphaStrategy` default) and silently
+  swapped `ChanFourStateExecutionStrategy` / `ChanCompositeStrategy` for `WorldQuantAlphaStrategy(#101)`.
+  **Rule: blend `get_sub_strategies` must resolve sub-strategy-selection params via the
+  strategy-PREFIXED key (`p.get("cfsb_wq_alpha_id", ...)` / `p.get("crb_wq_alpha_id", ...)`), never a
+  bare name that collides with a global config field.** The prefixed selection params
+  (`cfsb_third_strategy_type`, `crb_third_strategy_type`) are also declared explicitly in
+  `strategies_config.json`. See `docs/version.md` §7 for the full audit and regression test
+  `test_blend_sub_strategy_class_resolution_regression`.
+
 - **Live Trading Deployment & Web Station** (`web/livetrading/`, `scripts/`):
   Live operations follow a two-stage protocol:
   - **Stage 1 (Macro Health Gate)** via `scripts/check_live_portfolio_health.py`: Evaluates
