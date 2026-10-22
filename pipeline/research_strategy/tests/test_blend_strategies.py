@@ -752,6 +752,11 @@ def test_base_blend_uplsm_fast_path_and_cooldown_parity():
     1. Day 1 entry bypass requires strict confluence of volume breakout (V >= 1.5 * MA20) AND market breadth >= 0.60
     2. Expansion bypass on volume breakout
     3. Normal strategic exit 1-bar rotation cooldown
+
+    NOTE: each generate_weights call passes enable_cyq_quality_gate=False so the
+    unrelated Track-C CYQ structural gate (which defaults ON and triggers on-demand
+    structural enrichment of the synthetic universe) does not zero out the new entry
+    and mask the UPLSM fast-path feature this test isolates.
     """
     class DummySubStrategy:
         def __init__(self, target_df):
@@ -795,6 +800,7 @@ def test_base_blend_uplsm_fast_path_and_cooldown_parity():
     sig_1d.iloc[55, 0] = 0.20
     strat_1 = DummyUPLSMBlend(sig_1d)
     w1 = strat_1.generate_weights(univ_down, {
+        "enable_cyq_quality_gate": False,
         "min_entry_bars": 2,
         "normal_cooldown_bars": 1,
         "breadth_lookback": 50,
@@ -807,6 +813,7 @@ def test_base_blend_uplsm_fast_path_and_cooldown_parity():
     univ_vol["S1"].iloc[55, univ_vol["S1"].columns.get_loc("Volume")] = 2000.0
     strat_2 = DummyUPLSMBlend(sig_1d)
     w2 = strat_2.generate_weights(univ_vol, {
+        "enable_cyq_quality_gate": False,
         "min_entry_bars": 2,
         "normal_cooldown_bars": 1,
         "breadth_lookback": 50,
@@ -823,6 +830,7 @@ def test_base_blend_uplsm_fast_path_and_cooldown_parity():
 
     strat_3 = DummyUPLSMBlend(sig_1d)
     w3 = strat_3.generate_weights(univ_up, {
+        "enable_cyq_quality_gate": False,
         "min_entry_bars": 2,
         "normal_cooldown_bars": 1,
         "breadth_lookback": 50,
@@ -834,6 +842,7 @@ def test_base_blend_uplsm_fast_path_and_cooldown_parity():
     univ_confluence["S1"].iloc[55, univ_confluence["S1"].columns.get_loc("Volume")] = 2000.0
     strat_confluence = DummyUPLSMBlend(sig_1d)
     w_confluence = strat_confluence.generate_weights(univ_confluence, {
+        "enable_cyq_quality_gate": False,
         "min_entry_bars": 2,
         "normal_cooldown_bars": 1,
         "breadth_lookback": 50,
@@ -849,6 +858,7 @@ def test_base_blend_uplsm_fast_path_and_cooldown_parity():
     # 4a. Without volume breakout on down-trending market: expansion suppressed on Day 1
     strat_exp_normal = DummyUPLSMBlend(sig_exp)
     w_exp_normal = strat_exp_normal.generate_weights(univ_down, {
+        "enable_cyq_quality_gate": False,
         "min_entry_bars": 2,
         "min_weight_change": 0.05,
         "breadth_lookback": 50,
@@ -860,6 +870,7 @@ def test_base_blend_uplsm_fast_path_and_cooldown_parity():
     sig_exp2.iloc[56, 0] = 0.20  # Demands expansion on day 56 (held since day 55)
 
     w_exp_suppressed = DummyUPLSMBlend(sig_exp2).generate_weights(univ_down, {
+        "enable_cyq_quality_gate": False,
         "min_entry_bars": 2,
         "min_weight_change": 0.05,
         "breadth_lookback": 50,
@@ -870,6 +881,7 @@ def test_base_blend_uplsm_fast_path_and_cooldown_parity():
     univ_exp_vol = {s: d.copy() for s, d in univ_down.items()}
     univ_exp_vol["S1"].iloc[56, univ_exp_vol["S1"].columns.get_loc("Volume")] = 2500.0  # Surge!
     w_exp_surge = DummyUPLSMBlend(sig_exp2).generate_weights(univ_exp_vol, {
+        "enable_cyq_quality_gate": False,
         "min_entry_bars": 2,
         "min_weight_change": 0.05,
         "breadth_lookback": 50,
@@ -886,6 +898,7 @@ def test_base_blend_uplsm_fast_path_and_cooldown_parity():
 
     strat_exit = DummyUPLSMBlend(sig_exit)
     w_exit = strat_exit.generate_weights(univ_up, {
+        "enable_cyq_quality_gate": False,
         "min_entry_bars": 1,
         "normal_cooldown_bars": 1,
         "min_holding_bars": 1,
