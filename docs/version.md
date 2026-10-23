@@ -406,3 +406,254 @@ pipeline/.venv/bin/python scripts/run_live_strategy.py \
 * **`entry_streak` 重置**：`601857.SH` 的 `entry_streak=1/2` 未持久化进 `account_state.json` 的 `entry_signal_streak`（该字典仅含 000999/600584/600660/600900/601728），且模型 10-22 目标为 0.0 触发 FLAT 分支清零。属跨 run 入场确认信号持久化链路的已知局限，留待后续专项（本次 8 项 P0/P1 缺陷的非直接成因）。
 * **字节级陈旧价格**：`live_analysis` 疑点 2 指出 5 只标的（600660 51.28、600900 29.57、600362 37.95、600584 57.23、601728 6.62）票据价格与 10-21 逐位相同，而 000999（25.54→25.00）与 601288（7.29→7.40）正常变动，高度怀疑 Stage-2 对这 5 只读取到缓存中停在 10-21 的最后一根 bar。属数据/缓存层的陈旧切片问题，不影响本次修复，建议后续在数据加载层增加"前收盘≠当日收盘"陈旧性告警。
 * **目标权重向量合计 101.78%**（附带发现）：股票腿 0.5737 + BIL 0.4441 = 1.0178，因 `target_weight` 用未取整目标股数计算、现金腿用已取整市值反推所致。账面自洽，但把该向量当概率分布归一化的下游会偏差 1.2–2.7pp，建议后续统一口径。
+
+---
+
+## 9. 数据缓存层缺陷修复与数据基准变更日志 (Data-Cache Defect Fix & Data Basis Changelog) (2026-10-22)
+
+> **重要定界（请先读）**：本节记录的是**数据/缓存层**的写入语义缺陷修复与**行情数据基准**变更，**不是策略逻辑变更，也不是底座引擎变更**。因此：
+> - **不消耗任何语义化版本号**：`BaseBlendAllocationStrategy.BASE_VERSION` 与全部子类 `version` 均保持不变；
+> - 不触发 §1.2 的"四步联动"（单测断言 / `--dump-strategies` / 实盘工单版本对齐 / 版本日志归档）；
+> - 请勿把本节误当作 §7（子类策略修复）或 §2（底座引擎升级）的同类条目。
+>
+> 但本节**必须**持久化，因为 §9.2 的复权基准变更会让 2026-10-22 之前的回测数字**不再比特级可复现**——这属于必须留痕的事实变更。
+
+### 9.1 `asset_sync_metadata` upsert 非单调性缺陷（earliest 被反向下调 + `is_earliest_known` 被清空）
+
+#### 缺陷现象（2026-10-22 21:34:31 真实 Fuyao 同步写入）
+一次真实同步把 6 只标的的 `asset_sync_metadata.earliest_available_date` **统一下调为 `2024-01-02`**（该值即当次同步的取数起点），而 `ohlcv_bars` 中的 2017–2021 年历史行**一行未动**；`601728.SH` 的 `is_earliest_known` 由 `True` 变成 `False`。元数据与其描述的数据自此自相矛盾。
+
+| 标的（`provider='FuyaoDataProvider'`） | 修复前 `earliest_available_date` | 修复前 `is_earliest_known` | 被写入后 | `ohlcv_bars` 实际最早 bar |
+| :--- | :---: | :---: | :---: | :---: |
+| `600362.SH` | 2017-01-18 | False | 2024-01-02 ❌ | 2017-01-18（未动） |
+| `600584.SH` | 2020-11-30 | False | 2024-01-02 ❌ | 2020-11-30（未动） |
+| `600660.SH` | 2017-01-18 | False | 2024-01-02 ❌ | 2017-01-18（未动） |
+| `600900.SH` | 2017-01-18 | False | 2024-01-02 ❌ | 2017-01-18（未动） |
+| `601728.SH` | 2021-08-20 | **True** | 2024-01-02 ❌ / `is_earliest_known` → **False** ❌ | 2021-08-20（未动） |
+| `601872.SH` | 2017-01-18 | False | 2024-01-02 ❌ | 2017-01-18（未动） |
+
+（取证依据：`data/cache.duckdb` 只读对比 `data/cache.duckdb.bak.20261022-213155`；`latest_available_date` 由 2026-10-21 变为 2026-10-22 属**正常**前移，同一批次确实新落了 2026-10-22 的 bar，不需要修复。）
+
+**影响面**：任何"由 `earliest_available_date` 推导可回测区间/冷启动长度/是否值得回补历史"的逻辑，都会被静默截断约 7 年历史；且由于同步总是从某个起点取数并把它记成"最早可用"，**每一次从更晚起点发起的同步都会继续加深伤害**（单调恶化，不会自愈）。
+
+#### 根因（`common/duckdb_cache.py::store_bars`）
+1. **无条件的整行覆盖**：写入使用 `INSERT OR REPLACE INTO asset_sync_metadata VALUES (?, ?, ?, ?, ?, ?)`——它把 `earliest_available_date` / `is_earliest_known` / `latest_available_date` 全部当作"入参权威"，数据库层没有任何"只允许单向移动"的约束。一旦进程侧读取到的既有元数据缺失或读取路径不同（旧 CSV 迁移、中断的同步、并发写入者），就会退化为"按当前取数窗口从零重建事实"。
+2. **`requested_start` 分支的显式覆盖**：旧逻辑在"请求起点早于返回首根 bar 7 天以上"时执行裸赋值 `earliest_avail = min_date; is_earliest_known = True`，把"上游没有更早数据"当作结论直接覆盖既有更早的认知。而事实上"**我们没有去看更早**" ≠ "**更早的数据不存在**"（上游会滚动截断历史，例如 Fuyao 对指数仅保留约 5 年窗口）。
+
+**归因取证（已离线复现）**：上面第 1 条是本次观察到的 6 只标的最终状态（`earliest=2024-01-02`、`is_earliest_known=False`、`latest=2026-10-22`）的**唯一**可复现路径——因为它恰好等于"按当前取数窗口从零写入"的结果；若走第 2 条分支，`is_earliest_known` 会被写成 `True`，与观测不符。换言之，21:34 的写入方**没有看到既有的元数据行**（读取缺失/不同的写入者/行被重建），随后盲写把 2024 当作事实。**由于写入方未必在本仓库内，本轮不改任何外部脚本**，而是把防线下沉到缓存层：无论上游怎样调用、是否读到旧行，数据库层都不再允许把事实写坏（下面的 `LEAST`/`GREATEST`/`OR` + `ohlcv_bars` 交叉校验）。
+
+#### 修复（只改写入语义，不改任何读取/判定逻辑）
+`store_bars` 的元数据写入改为**方向性（单调）upsert**：
+
+```sql
+INSERT INTO asset_sync_metadata AS existing
+    (provider, symbol, earliest_available_date, is_earliest_known,
+     latest_available_date, last_sync_time)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT (provider, symbol) DO UPDATE SET
+    earliest_available_date = LEAST(
+        COALESCE(existing.earliest_available_date, excluded.earliest_available_date),
+        COALESCE(excluded.earliest_available_date, existing.earliest_available_date)
+    ),
+    is_earliest_known = existing.is_earliest_known OR excluded.is_earliest_known,
+    latest_available_date = GREATEST(
+        COALESCE(existing.latest_available_date, excluded.latest_available_date),
+        COALESCE(excluded.latest_available_date, existing.latest_available_date)
+    ),
+    last_sync_time = excluded.last_sync_time
+```
+
+- `earliest_available_date`：**MIN 语义，绝不用 GREATEST**——只有真正向更早回补的同步才能把它前移；
+- `is_earliest_known`：**OR 语义（True 粘滞）**——一次"False"的写入永远不能抹掉已确认的 True，只有人工显式 `UPDATE` 才能复位；
+- `latest_available_date`：**GREATEST 语义**——抓到陈旧数据的同步不能把已记录的最近日期倒退；
+- `last_sync_time`：可自由覆盖（它记录的是**最后一次尝试**，不是关于数据的事实）；
+- `COALESCE` 显式覆盖 NULL 组合（existing 为 NULL 取 incoming，incoming 为 NULL 保留 existing，两者皆 NULL 则 NULL），尽管当前 schema 上这三列是 `NOT NULL`。
+
+同时，Python 侧候选值也改为单调，并**用 `ohlcv_bars` 的真实 `MIN(date)/MAX(date)` 交叉校验**元数据：即使元数据行意外缺失，也不会再"从当前窗口重建"出一个 2024 起始的伪事实。`is_earliest_known=True` 的推断条件也收紧为"请求起点严格早于**已知道的最早日期**（而非本帧首行）7 天以上"，因此"从 2024-01-02 起取数"这一类请求在结构上已不可能声称"最早已知 = 2024"。
+
+#### 回归测试（`common/tests/test_duckdb_cache.py`，100% 离线合成数据）
+- `test_store_bars_later_window_does_not_downgrade_earliest_available_date`（2017 bar → 2024-01-02 起窗口，earliest 仍为 2017-01-18，`is_earliest_known` 不变，2017 行未被改写）
+- `test_store_bars_is_earliest_known_is_sticky_true`（True 之后写入 False ⇒ 仍为 True）
+- `test_store_bars_stale_latest_window_does_not_roll_back_latest_available_date`（最新 2026-10-22 之后写入止于 2026-10-21 的陈旧窗口 ⇒ 仍为 2026-10-22）
+- `test_store_bars_earliest_can_still_improve_when_sync_reaches_further_back`（2024 → 回补 2017，MIN 仍允许改进）
+- `test_store_bars_first_insert_records_incoming_values_verbatim`（无既有行时按入参逐字记录）
+- `test_store_bars_metadata_upsert_is_idempotent`（同一帧写两次，三个单调字段不变，仅 `last_sync_time` 前移）
+
+**验证计数（本轮实跑，100% 离线）**：`common/tests/test_duckdb_cache.py` 23 passed；`common/tests` 383 passed / 1 skipped / 1 failed（该 failed 为已知的 CWD 相关既有失败 `test_strategy_versioning.py::test_live_ticket_detail_reason_and_version_structure`，与本次改动无关）；`pipeline/tests` 20 passed；`backtester/tests` 52 passed。
+
+**数据修复说明**：本轮只修**写入代码**，`data/cache.duckdb` 从未以读写方式打开，更未写入（仅以 `duckdb.connect(..., read_only=True)` 做过只读取证；文件 mtime 仍为 2026-10-22 21:34:31）；6 只标的被污染的元数据由后续独立的数据修复步骤按 `ohlcv_bars` 真实 `MIN(date)`/历史 `is_earliest_known` 回填。
+
+### 9.2 【数据基准】2026-10-22 前复权（QFQ）重基准
+
+> 本节记录的是**行情数据本身**的基准变更，不是代码缺陷。
+
+2026-10-22 的 Fuyao 同步在"重叠日对齐"步骤（`scripts/sync_china_5m_and_indices.py` 的 QFQ 比例对齐）对四处历史区间做了**价格重基准**，成交量为 0 改动：
+
+| 标的 | 受影响行数 | 区间 | 变更性质 |
+| :--- | :---: | :--- | :--- |
+| `600362.SH` | 485 | 2024-01-02 → 2025-12-31 | 全区间 OHLC 统一乘以 **0.99663988** |
+| `600660.SH` | 132 | 2024-01-02 → 2024-07-19 | 全区间 OHLC 统一乘以 **0.98141264** |
+| `600660.SH` | 126 | 2026-03-09 → 2026-09-11 | O/H/L 按 **比例 1.0** 重写（相对变化恰为 1，即只有重写/精度层面的差异，无实质缩放）；该窗口为何被单独重写尚未解释 |
+| `600900.SH` | 17 | 同批次短窗口（区间未标注） | 仅浮点 ULP 噪声，收盘价最大相对差 **1.11e-16**（即数值上未被实质改动） |
+
+- **成交量**：以上四处**全部未改动**。
+- **影响（必须明示）**：这**改变了历史价格**，因此 **2026-10-22 之前产出的历史回测结果不再比特级可复现**（同一策略、同一代码重跑会得到不同的净值曲线，差异幅度由上述复权因子决定）。
+- **处置**：新的前复权基准**被接受为权威基准**（它就是按上游最新除权信息重算的正确值），不做回滚；此前的回测数字仅作历史参考，横向比较须以新基准重跑为准。
+- **未解释项（已在 `docs/development_plan.md` 立项跟踪，不属本修复范围）**：`600362.SH` 在 2025-12-31 **整齐截断**、`600660.SH` **跳过 2024-07-20 → 2026-03-08** 这两处"有界且不连续"的窗口，其上游复权语义尚未解释清楚；在查清之前，这两段边界的可信度低于其余历史区间。
+
+---
+
+## 10. 实盘执行链路六项可信化加固 (Live-Path Credibility Hardening) (2026-10-22)
+
+> **重要定界（请先读）**：本节记录的是**实盘执行链路的可观测性与拒绝执行语义**修复（Stage-1 健康门禁 + Stage-2 工单生成 + 生命周期决策标签），**不是策略逻辑变更，也不是底座引擎变更**。因此：
+> - **不消耗任何语义化版本号**：`BaseBlendAllocationStrategy.BASE_VERSION` 与全部子类 `version` 均保持不变；
+> - **未运行 `--dump-strategies`**（该命令须真实 provider，且会重写 `strategy_dumps/*.json`），`strategy_dumps/` 未改动；
+> - 请勿把本节误当作 §7（子类策略修复）或 §2（底座引擎升级）的同类条目；§8 的 Fix 8"仅报告"三项，本节正式落地其中的可见性部分（模型侧根因仍归 §8）。
+>
+> **为什么必须留痕**：本节修复前，Stage 2 可以"工单完全正常地"用**前一日收盘价**给 5 只持仓定价、Stage 1 可以把**没有数据**报告成**门禁通过（breadth 1.0）**、工单可以把**被打断的入场确认期**整行抹掉。三者共同特征是**静默且格式良好**——这是实盘执行器最坏的失败模式，必须记录。
+
+### 10.1 事故取证与六项缺陷
+
+**证据来源**：2026-10-22 `chan_four_state_blend` 实盘运行的 `live_trading_ticket.json`、Stage-1/Stage-2 日志与根因审计（`/home/stone/Work/stock/.../root_cause_audit_2026-10-22.md`，只读，未改动）。
+
+| 编号 | 事故事实（修复前） | 级别 |
+| :--- | :--- | :---: |
+| Fix A / FIX 1 | 配置的 `FuyaoDataProvider` 对任何 `interval != "1d"` 直接抛错 ⇒ 5m universe **全空** ⇒ `enrich_universe_with_intraday_features` 提前返回未增强帧，`intraday_vwap` / `vwap_premium_pct` / `chan_5m_state` 全为 `None`；但 Stage-2 仍打印 `成功加载并聚合 5m 日内特征 (截断时点: 14:15, 标的数: 20)`（计的是**日线**标的数）。Stage-1 更严重：把 NaN 逐字段替换为默认值（`VWAP_Prem_5m`→`0.0`、`UpVol_Ratio_5m`→`0.5`、`Afternoon_Ret_5m`→`0.0`）再相除，得出 `intraday_vwap_breadth = 1.0`、`afternoon_return_mean = 0.0`、`afternoon_vwap_breakdown_ratio = 0.0`——**breadth 1.0 是分布门禁的通过值**，等于用"不存在的数据"通过了门禁 | P0 |
+| Fix B / FIX 2 | 盯市价取 `float(universe[sym]["Close"].iloc[-1])`（"最后一根可用 bar"）。当日 6 只标的缓存止于 2026-10-21 而 `as_of_date = 2026-10-22`，其中 5 只在仓标的按 10-21 收盘计价（票据价格与 10-21 逐位相同），NAV 少计约 **0.70%**，全部目标股数基于过期价格计算，**零告警**。`has_market_bars` 只要求**一只**标的足够新鲜，因此单一陈旧标的不会触发"休市"路径——正是本事故的形状 | P0 |
+| Fix C+D / FIX 3+4 | `PENDING_ENTRY` 资产的入场信号消失时，返回裸 `action="HOLD"`、reason `空仓维持`——与"从未有过信号、长期空仓"的决策**逐字节相同**。Stage-2 因此按 `cur_w==0 and tgt_w==0 and action=="HOLD"` 重分类为 `NO_POSITION`，再被 `order_df[action != "NO_POSITION"]` 过滤，**整行消失**；601857.SH（Stage-1 动量榜首、本应 2/2 确认买入）就是这样不见的，连"确认期被打断"这件事都无从得知 | P1 |
+| Fix E / FIX 5 | `entry_signal_streak` 稀疏持久化（只写 `>0` 的键），归零等于**键消失**。`account_state.json` 里 601857.SH 的 `1/2` 进度事后不可读，读起来像"从未排队"；且**没有任何日志**记录这一跳变与被清零的数值 | P1 |
+| Fix F / FIX 6 | 宏观冲力残差写作 `max(0.0, tgt_w - sub_total_w)`，而 `tgt_w` 已被 `step_position_lifecycle()` 改写为**生命周期后**目标。恰在标的被压平（确认期未满 / 惯性过滤 / 锁仓）时残差恒为 0，`detail_reason.dimension_signals.macro_breadth_thrust` 静默消失，工单反过来声称"该标的本无冲力配置"——审计线索指向错误结论 | P2 |
+
+### 10.2 修复内容
+
+#### 新建 `common/freshness.py`：陈旧价格的**唯一 owner**
+- `class StalePriceError(ValueError)`、`latest_close(universe, sym, expected_session, strict) -> float`、`is_stale_bar(df, expected_session) -> bool`、`last_bar_session(df) -> Optional[str]`。
+- **契约**：`expected_session is None` ⇒ 遗留/研究路径，**永不抛错**（保证回测无墙钟依赖、live/backtest 平价可证）；`strict=True` 且最后一根 bar 早于 `expected_session` ⇒ 抛 `StalePriceError`（消息同时点明标的、实际 bar 日期、期望 session）；`strict=False` ⇒ 打印醒目告警并返回陈旧收盘价。返回**纯 float**（无 tuple/dict），以便后续"市场时钟"阶段只替换函数体。
+- **"完全没有数据"与"数据陈旧"严格区分**：空/缺失帧的兜底（现金腿 `price = 1.0`、持仓腿 `0.0`）留在**调用点**，永不进入 `latest_close`。
+- **单一 owner 原则**：bar 日期与期望 session 的比较、以及 strict/allow-stale 策略，全仓库只有这一处实现；`scripts/run_live_strategy.py` 内的 `resolve_mark_price` / `_last_bar_date` 已删除，避免"两套新鲜度判定各自漂移"——这正是本事故的同类失败模式。
+- 依赖仅 `pandas` + 标准库 + `logging`，**不 import** `duckdb_cache` 或任何 provider（只处理已加载的帧与 session 字符串）。
+
+#### `scripts/run_live_strategy.py`
+1. **三处盯市价站点**全部走 `latest_close`：持仓对账（数量口径 `~:1003`、权重口径 `~:1022`）与下单循环（`~:1550`）。空帧兜底留在调用点。
+2. 新增 `--allow-stale-prices`（**危险紧急开关**，help 文本明示）：默认拒绝执行；开启后降级为告警、$run$ 继续，且每行受影响工单带 `price_stale=True` + `price_bar_date`，`reason` 追加 `[陈旧价格 PRICE_STALE: 价格K线=... != as_of=...]`，并在工单末尾打印 `[STALE PRICE WARNING]` 横幅。
+3. **5m 诚实日志**：改为统计**非空** 5m 帧数量与真实最新 5m 时间戳；为 0 时打印 `[WARN] 5m 日内特征不可用 ... 常见原因：provider does not support 5m`，部分缺失时列出缺失标的；`成功加载并聚合` 这句误导性成功文案已删除。
+4. **`NO_POSITION` 显式白名单**：只有 `action in ("HOLD", "COOLDOWN_BLOCKED")` 且空仓的真空仓行才会被重分类；`CANCEL_PENDING` 绝不被吞掉，并在 `[PHASE 3b: PENDING ENTRY CANCELLED]` 块中以"仅记录、无买卖指令"的形式打印（含被取消的确认进度）。
+5. **streak 可见化**：任何"上一轮 > 0、本轮归零"的标的都写入**显式 `0`** 并打印 `[INFO] entry_signal_streak reset: <sym> (was N)`；磁盘 schema 不变（仍是 `symbol -> int`），旧稀疏文件继续可读（所有读者都是 `.get(sym, 0) > 0`）。
+6. **冲力归因改用 `raw_tgt_w`**（生命周期前冻结），仅进入 `detail_reason.dimension_signals`；`trade_value` / `delta_shares` / `target_shares` / `target_weight` 的计算路径**一字未动**。
+
+#### `scripts/check_live_portfolio_health.py`
+- 新增**诚实性门禁**：先判定"有多少标的真的测到了 `VWAP_Prem_5m`"，为 0 时**不做任何 NaN→默认值替换**，输出 `intraday_features_available=false` + `distribution_gate_status="SKIPPED"` + `unavailable_reason`，所有未测得指标为 `null`；部分测得时只在已测得集合上计算，缺失标的记入 `symbols_missing_features` 并从分母剔除。
+- `distribution_alert=None`（未知）与 `False`（已评估、无警报）严格区分；`intraday_buy_scale` 仅在**正向检出**时为 0.50。
+- `resolve_gate_directive` 增加 `SKIPPED / UNKNOWN` 动作行，明示"未测得数据不会被当作 PASS，也不会缩放买入预算"。
+- 仪表盘与 Markdown 报告用 `_fmt_metric` 渲染 `N/A`；报告新增 `intraday_features_available`（顶层镜像）、`distribution_gate_status`、`symbols_5m_available`、`symbols_measured`、`symbols_vwap_measured`、`symbols_missing_features`、`unavailable_reason`、`note`。
+
+#### Stage-1 `directive` 契约修复（跨层集成问题，本轮一并收口）
+**问题**：Stage 1 一直输出的是**细分** gate code（`GO` / `CAUTION_DAMPING` / `CAUTION_DEFENSIVE` / `CAUTION_RECOVERING` / `CAUTION_INTRADAY_DISTRIBUTION` / `CAUTION_INTRADAY_TROUGH` / `NO_GO_EMERGENCY`），而下游全体消费者（`web/livetrading/execution_service.py`、`storage.py`、`static/js/app.js`、web 测试）只认 **3 值枚举** `GO` / `CAUTION` / `NO_GO`。二者此前"看起来一致"纯粹是因为 Fix A 之前日内分支**不可达**（NaN→默认值使 `intraday_vwap_breadth = 1.0`，永不触发日内告警）。恢复诚实的日内测量后，`CAUTION_INTRADAY_DISTRIBUTION` **首次可达**，契约裂缝立即显形：web 测试断言硬失败，`app.js` 更会把这条"仅把买入预算降到 50%、卖出照常"的告警渲染成**红色 NO-GO「熔断停牌 / 严禁开仓」**。
+
+**决策（显式二选一，选"保持 3 值枚举稳定 + 细分另立字段"）**：
+1. **不新增、不删除任何 `directive` 枚举值**。`directive` 由**生产者**显式写出为 `GO` / `CAUTION` / `NO_GO`（新增 `coarse_directive(gate_code)`，按前缀家族归类；未知 code **fail-safe 归 CAUTION**，绝不归 GO，也绝不伪造 NO_GO）。
+2. **细分原因仍由 `gate_code` 承载**（原值一字不改）。因此运维仍可区分"因测量到的午后分布而 CAUTION"与"因回撤阻尼梯级而 CAUTION"，也可区分日内分布与日内闪崩两类。
+3. **UI 改为按家族前缀匹配**（`app.js`），并把真正无法识别的值渲染成中性 `❔ UNKNOWN DIRECTIVE`，不再默认落入红色 NO-GO 分支——这一条同时修好**历史归档报告**（它们没有 `directive` 字段，落入 `directive or gate_code` 后本就带着细分 code）。
+4. web 测试在原断言之外**补一条契约断言**：`gate_code` 必须存在且隶属于 `directive` 家族，防止两侧再次漂移。
+
+**与 Fix A（5m 诚实性）的关系**：日内 CAUTION **不是**本次"5m 不再自欺"的机制——它只在**确有测量**时发出。数据缺失时 `distribution_alert=None`、`distribution_gate_status="SKIPPED"`/`UNKNOWN`、并附独立动作行，directive 根本不会进入任何 `CAUTION_INTRADAY_*`。因此"缺失 5m ⇒ 永不 PASS"与"缺失数据不得伪装成风险结论"**同时成立**；`intraday_features_available` 与 `distribution_gate_status` 才是"这道门禁到底跑没跑"的权威信号。
+
+**顺带修掉的同类造假（同一原则的另一方向）**：breadth 的**分子**要求 `UpVol_Ratio_5m` 已测得，但此前**分母**只要求 `VWAP_Prem_5m` 已测得。于是"VWAP 测到、上行量比没测到"的标的会以 0 计入分子却仍占分母 ⇒ 凭空造出 `breadth = 0.0 < 25%` 的"午后分布"伪告警（缺失数据伪装成风险结论，方向与 Fix A 相反但性质相同）。现在此类标的**同时退出分母**并记入 `symbols_missing_features`；`symbols_measured` 改报"真正喂进 breadth 的标的数"，另加 `symbols_vwap_measured` 表示"具备 VWAP 溢价的标的数"（两者相等时门禁健康，不等时即为部分测量）。
+
+#### `web/livetrading/static/js/app.js`
+- `renderHealthReport` 的指令徽章改为**家族前缀匹配**（`GO*` / `CAUTION*` / `NO_GO*` / 其他），并对 `rep.gate_code` 兜底；未知值显示中性 `❔ UNKNOWN DIRECTIVE`。**仅显示层**，不改变任何下单/风控逻辑。
+
+#### `common/position_lifecycle.py`
+- 新增 `action="CANCEL_PENDING"` 与该分支专属字段 `LifecycleDecision.cancelled_entry_streak`（追加字段，默认 `0`，同时进 `detail_reason` 与 `to_dict()`）。
+- **经济含义未变**：`target_weight` 仍为 `0.0`，两条 streak 均清零，状态回 `FLAT`（信号重现须重新挣满确认 bars）。改变的只是**标签与可观测性**。
+
+### 10.3 版本结论：不升版（明确理由）
+
+- AGENTS.md §7 的双轴版本规则只覆盖 `BaseBlendAllocationStrategy`（`BASE_VERSION`）、`AllocationTemplate` 与各子类策略（`version`）。本轮**未改动**这三者中的任何一个：`pipeline/research/blend/blend_base.py`、`common/allocation_templates.py`、`pipeline/research_strategy/rs/*`、`strategies_config.json` 均无改动。
+- `common/position_lifecycle.py` 与新建的 `common/freshness.py` 不在该规则覆盖范围内；`step_position_lifecycle` 的生产调用方只有 `scripts/run_live_strategy.py`（与单测），`backtester/` 完全不引用。
+- 因此**不升版、不改单测版本断言、不跑 `--dump-strategies`**、`strategy_dumps/*.json` 保持原样。实盘工单中的 `strategy_version` / `base_version` 注入逻辑未受影响。
+
+### 10.4 回测影响：零（三条独立论证）
+1. **生命周期标签**：`backtester/` 无 `step_position_lifecycle` / `LifecycleDecision` 引用；`CANCEL_PENDING` 仅在 live runner 被消费。
+2. **新鲜度**：回测/研究侧调用 `latest_close(..., expected_session=None)`（或根本不经该模块），该路径恒不抛错、不读墙钟，故回测结果逐位不变、且仍可离线确定性复现。
+3. **归因与日志**：Fix F 只写 `detail_reason` 审计块；Fix A 只改日志与 Stage-1 报告字段。
+
+### 10.5 离线验证（本轮实跑，精确计数）
+
+命令均在 `pipeline/` 工作目录下以 `pipeline/.venv/bin/python -m pytest` 执行，100% 离线（合成 provider，无网络，未读写 `data/cache.duckdb`）：
+
+| 命令 | 结果 |
+| :--- | :--- |
+| `pytest ../pipeline/tests -q` | **25 passed**（含新增 `test_live_path_hardening.py` 16 项与既有 `test_run_pipeline.py` 9 项） |
+| `pytest ../common/tests -q`（从**仓库根目录**执行） | **378 passed, 1 skipped**（`common/tests/test_position_lifecycle.py` + `test_live_strategy.py` + `test_live_health_check.py` 单跑：**58 passed**） |
+| `pytest tests -q`（`pipeline/research_strategy`） | **585 passed** |
+| `pytest ../backtester/tests -q` | **52 passed** |
+| `uv run --offline --project web/livetrading pytest web/livetrading/tests -q`（仓库根目录） | **41 passed**（最后三次连跑：35 / 35 / 41 —— 计数变化来自**同事实时新增测试**，非本仓库不稳定；期间插入的一次运行出现 29 个 setup ERROR，经查是同批并行写文件导致的采集中断，重跑即全绿） |
+
+> **已知 CWD 相关既有问题（非本轮引入）**：`common/tests/test_strategy_versioning.py::test_live_ticket_detail_reason_and_version_structure` 内部硬编码 `pipeline/.venv/bin/python scripts/run_live_strategy.py`（相对**仓库根目录**），因此从 `pipeline/` 目录运行时会以 `sh: pipeline/.venv/bin/python: not found` 失败（返回码 32512）；从仓库根目录运行则 **1 passed**。本轮未改动该测试（无需升版，故不在允许改动范围内）。
+
+**新增测试清单（`pipeline/tests/test_live_path_hardening.py`，16 项全部通过）**：
+- `test_latest_close_without_expected_session_never_raises`（`expected_session=None` 在**极端陈旧**帧上恒不抛错，`strict` 两值均验证）
+- `test_latest_close_strict_raises_on_stale_bar_and_loose_warns`（异常消息含标的/实际 bar/期望 session；`isinstance(..., ValueError)`；非 strict 返回陈旧价并告警）
+- `test_latest_close_fresh_bar_is_returned_silently`
+- `test_live_run_aborts_on_stale_price_by_default`（单只标的少一根 bar ⇒ `StalePriceError`，验证事故形状）
+- `test_allow_stale_prices_downgrades_to_flagged_ticket_row`（`price_stale=True`、`price_bar_date="2024-05-09"`、reason 含 `PRICE_STALE`、横幅出现、新鲜标的不受污染）
+- `test_pending_entry_cancellation_is_recorded_in_ticket`（601857 回归：`CANCEL_PENDING` 行保留、`shares==0`、`cancelled_entry_streak==1`、Phase 3b 打印）
+- `test_entry_streak_reset_is_persisted_and_logged`（`account_state.json` 显式 `0` + 日志 `was 1`）
+- `test_thrust_attribution_survives_lifecycle_flattening`（生命周期压平后 `dimension_signals.macro_breadth_thrust == 0.30`）
+- `test_live_runner_5m_logging_reports_absence_honestly`（空 5m ⇒ `5m 日内特征不可用` + `provider does not support 5m`，且不再出现旧成功文案）
+- `test_health_report_marks_intraday_gate_skipped_not_passed`（`SKIPPED` / 全 `null` / 仪表盘 `N/A` / JSON 落盘同真）
+- `test_coarse_directive_covers_every_gate_code`（每个既有 gate code 均映射进 3 值枚举；未知 code fail-safe 归 `CAUTION`）
+- `test_intraday_absence_never_masquerades_as_risk_verdict`（4 参数化用例：`SKIPPED` 与 `UNKNOWN` 都不得产出 `CAUTION_INTRADAY_*`，仅"确有测量者"可产出）
+- `test_execution_phase_ordering_sells_before_buys`（执行层级：SELL 先于 BUY）
+
+### 10.6 下游消费者与外溢
+
+- **Stage-1 `directive` 契约（本轮已收口，见 §10.2）**：`directive` = `GO`/`CAUTION`/`NO_GO`（生产者显式写出），`gate_code` = 细分原因（原值不变）。消费者：`web/livetrading/execution_service.py`（读 `directive`，缺失时回退 `gate_code`）、`web/livetrading/storage.py`（`directive or gate_code`，用于运行列表）、`web/livetrading/static/js/app.js`（徽章，已改为家族前缀匹配）。任何新增 gate code 都必须落在上述三个家族之一，否则 UI 显示中性 UNKNOWN（不再伪装成 NO-GO）。
+- `web/livetrading/storage.py`（`post_holdings_from_ticket`）按 `"CASH" in action` 跳过现金行 ⇒ `CANCEL_PENDING` 会被当普通行读取（其 `delta_shares==0`，无副作用）。
+- `web/livetrading/execution_service.py` 只统计 `BUY` / `SELL` ⇒ 新标签被忽略，安全。
+- `web/livetrading/static/js/app.js` 对未知 `action` 回退为 `⚪ HOLD (维持)` 徽章 ⇒ **显示层**会把 `CANCEL_PENDING` 显示成 HOLD，属后续 UI 跟进项（不影响下单）。
+- `backtester/tests/test_run_backtest.py` 只断言 `BUY` / `SELL`。
+- Stage-1 报告 schema 的变化（新增键 + 未测得指标为 `null`）已在 §10.2 披露；任何把 `intraday_vwap_breadth` 读作"通过值"的下游必须改为"`null` ⇒ UNKNOWN"。
+
+### 10.7 运营侧待办
+
+1. 真实运行前刷新行情缓存（使全部标的 `latest` 抵达当日）；否则 Stage 2 将**按设计拒绝执行**（`StalePriceError`），这是预期行为，不要用 `--allow-stale-prices` 掩盖——该开关只允许用于非交易日演练/已知数据源缺口，且必须在工单上人工复核 `price_stale=true` 的行。
+2. 5m 数据源缺口（`provider does not support 5m`）在接入真实 5m 源之前不会自愈；期间 Stage-1 日内门禁恒为 `SKIPPED`，Stage-2 日内执行价指引字段恒为空值，均属**已知且已诚实披露**的状态。
+3. Web 站点 `CANCEL_PENDING` 徽章显示（§10.6）留待后续 UI 专项。
+
+### 10.8 复核追补：`CANCEL_PENDING` 冷却期锚定缺陷（2026-10-22）
+
+> 本节由**独立只读复核**（不是实现者自述）追补。§10.1–§10.7 的结论**全部维持不变**（不升版、回测影响为零、六项修复行为不变）；本节只记录复核发现的一处**未披露副作用**及其最小修复。
+
+**1. 发现途径与缺陷形状**
+`scripts/run_live_strategy.py::resolve_exit_cooldown` 从历史 `live_trading_ticket.csv` **由新到旧**逐日扫描，重建 `last_exit_date`，其锚定条件是 `if act == "SELL" or tgt_w == 0.0:`。§10.2 引入的 `CANCEL_PENDING` 行（`target_weight == 0.0`、标的**从未持有**）从此**进入归档**，于是被这条启发式误读为「已清仓」：一个从未建仓的标的凭空获得冷却锚点，且锚点日期比修复前**晚一天**，可能让该标的在冷却期边界多等一天。
+
+**2. 为何这是本次改动唯一的未披露副作用**
+实现时的声明是「`CANCEL_PENDING` 只改标签、不改语义」。该声明对**下单量 / 合计 / 对账**成立，但对这一个**读归档历史**的函数不成立——因为这一行此前被重分类为 `NO_POSITION` 而**丢弃、根本不入档**，现在入档了。归档是下游重建状态的**输入**，所以"只改标签"不再等价于"不改语义"。§10.6 已列出消费者，但只覆盖了 `web/` 与 `backtester/`，**未覆盖 `scripts/` 自身的归档回读路径**，这是本次披露缺口的来源。
+
+**3. 修法（以及被明确否决的方案）**
+- **已落地（最小修复）**：`if act == "SELL" or (tgt_w == 0.0 and act != "CANCEL_PENDING"):` —— 仅排除 `CANCEL_PENDING`，**保留**其余一切 action 的既有 `target_weight == 0.0` 锚定（含 `HOLD_FILTERED`）。同步在 `resolve_exit_cooldown` docstring 追加 `Archive-scan anchoring caveat` 段落，把"例外 + 为何保留 + 待决编号"写在代码旁，避免只存在于变更日志。
+- **被否决**：把锚定条件收窄为 `action == "SELL"`。语义上更干净（`HOLD_FILTERED` 的 `target_weight == 0.0` 行同样可能"实际未成交"），但会改变**事故之外**的既有实盘再入场节奏，属热修范围之外；已登记为 `docs/development_plan.md` `L2.21` 待决。
+
+**4. 非空洞证明（先让它变红，再让它变绿）**
+把条件退回旧式 `if act == "SELL" or tgt_w == 0.0:` 后，两条回归用例**双双失败**，失败信息原文：
+
+- `test_cancel_pending_row_never_anchors_exit_cooldown`：`resolved anchor must be day1, got [datetime.date(2024, 5, 10)]`
+- `test_cancel_pending_only_archive_leaves_symbol_unanchored`：`a never-held symbol must not produce an exit anchor, got [datetime.date(2024, 5, 9)]`
+
+恢复修复后 `pipeline/tests/test_live_path_hardening.py` **19 passed**（§10.5 的 16 项 + 本节新增 3 项：`test_cancel_pending_row_never_anchors_exit_cooldown` / `test_sell_row_still_anchors_at_newest_date` / `test_cancel_pending_only_archive_leaves_symbol_unanchored`）。第三条是**反向护栏**：它确认 `SELL` 行仍按新到旧扫描取**最新**锚点，防止"顺手把整条启发式删掉"式的过度修复。
+
+**5. 相邻读者已核查**
+`scripts/run_live_strategy.py::resolve_holding_bars` 是**另一个**归档 ticket 读取者。它确实读 `target_weight`，但用法不同：以「`target_shares > 0 or target_weight > 0`」判定"当日持有"、以「`action == "BUY"` 且 `current_shares == 0`」判定"当日开仓"，**从不把 `target_weight == 0.0` 当作退出锚点**。`CANCEL_PENDING` 行恰为 `target_shares == 0` 且 `target_weight == 0.0`，故被判为"未持有"并中断向后计数——与修复前该行根本不入档时的结果**一致**（两条路径都是 `held_on_d = False` ⇒ `break`）。因此它不受本启发式影响，无需修改。
+
+**6. 未改版本号**
+本次仅修改实盘执行辅助启发式 + 其 docstring，未触及 `AllocationTemplate`、`BaseBlendAllocationStrategy` 或任何策略类（`pipeline/research/blend/*`、`pipeline/research_strategy/rs/*`、`strategies_config.json` 均无改动），按 `AGENTS.md` §7 无需 bump，`strategy_dumps/*.json` 未改动。
+
+**7. 复核提出、但不改代码即接受的两条 INFO 级事项**
+- `common/freshness.py::latest_close` 的"不抛异常"**只针对陈旧性**：空/缺失帧仍抛 `ValueError`。这不是护栏漏洞，而是**调用方契约错误**——"完全没有数据"的兜底（现金腿 `1.0`、持仓腿 `0.0`）按 §10.2 的设计留在调用点，不得进入 `latest_close`。
+- `strict=False` **每次调用都会告警**，两个调用点不去重。这是可接受的噪声：静默去重会掩盖"同一标的被多处分别以陈旧价定价"这一事实，而该事实正是 §10.1 Fix B 需要被看见的东西。
+
+**8. 交叉引用**
+`docs/development_plan.md` `L2.20`（前端把 `CANCEL_PENDING` 渲染成 `⚪ HOLD (维持)` 的**纯展示**缺陷，不影响下单量）与 `L2.21`（上述锚定语义待决项）。
+
