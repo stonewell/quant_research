@@ -122,6 +122,12 @@ available in the current shell.
   $t \ge 2.0$ significance hurdle) and `blend_enable_orthogonalization=true` (Löwdin symmetric
   orthogonalization $W^* = W(W^T W)^{-1/2}$ removing sub-strategy collinearity), validated by walkforward
   experiments (`blend_6` through `blend_13`) yielding up to 37.35% CAGR, 1.702 Sharpe, and 0.9400 DSR.
+  **Documented EXCEPTION (2026-10-22):** `chan_four_state_blend` deliberately runs
+  `blend_weighting_mode="regime_ic_ir_hybrid"` (the mode its live deployment uses), pinned in
+  `strategies_config.json` and asserted by `test_cfsb_deployed_regime_mode_and_inertia_ratio_config`.
+  Do NOT "normalize" it back to `rolling_ic_ir` -- a `--dump-strategies` pass did exactly that and
+  silently switched the deployed engine, which also made the regime-branch defenses (bucket
+  delta-clamp / thrust hysteresis) inert. See `docs/version.md` §8.
 
 - **Blend sub-strategy hookup & the bare-name `resolve_param` collision (critical -- caused a real
   bug, fixed 2026-10-21):** each blend strategy's `get_sub_strategies(universe, params)` builds its

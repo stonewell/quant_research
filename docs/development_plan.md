@@ -480,4 +480,33 @@ uv run --project pipeline pytest common/tests/test_allocation_backtester.py comm
    - 实盘股票池：[`docs/universe/china/core_satellite_200k_stocks.txt`](file:///home/stone/Work/github/quant/docs/universe/china/core_satellite_200k_stocks.txt) 与 [`docs/universe/china/core_satellite_100_stocks.txt`](file:///home/stone/Work/github/quant/docs/universe/china/core_satellite_100_stocks.txt)；
    - 黑名单权威档案 (SSOT)：[`docs/black_list.md`](file:///home/stone/Work/github/quant/docs/black_list.md)。
 
+---
+
+## 4.5 `chan_four_state_blend` 实盘 8 项缺陷修复 (Live-Trading Defect Fix) (2026-10-22) ✅ 已完成
+
+**任务定位**：依据 2026-10-22 实盘运行根因审计（`/home/stone/Work/stock/.../root_cause_audit_2026-10-22.md`，只读证据），修复 `chan_four_state_blend` 在实盘工单生成中暴露的 8 项缺陷（含 3 项 P0、2 项 P1、3 项 P2 与 1 项仅报告项）；复核轮另追加 1 项 P0 安全修复（Fix 3.5：锁定误拦止损清仓，见下）。
+
+| 编号 | 缺陷 | 级别 | 状态 |
+| :--- | :--- | :---: | :---: |
+| Fix 1 | 部分减仓未校验最低持仓周期，锁定持有被卖出（000999.SZ / 600900.SH） | P0 | ✅ 已修复 |
+| Fix 2 | Stage-2 工单循环对 UPLSM SELL 结果缺二次锁定兜底 | P0 | ✅ 已修复 |
+| Fix 3 | `regime_*` 分支防御桶单日 4 倍跳变，无平滑钳制 | P1 | ✅ 已修复 |
+| Fix 4 | 推力信号 0.60→0.50 单日翻转，缺迟滞 | P1 | ✅ 已修复 |
+| Fix 5 | Stage-1 `target_exposure` 咨询值被误读为可执行权益仓位 | P2 | ✅ 已修复 |
+| Fix 6 | `account_state.json` 持久化目标权重而非券商真实持仓 | P2 | ✅ 已修复 |
+| Fix 7 | 微观减仓抖动（delta 仅超阈值 0.0082pp），缺相对仓位门槛 | P2 | ✅ 已修复（首轮 0.25 相对门槛经复算为数学无效值，已修正为 0.30 — 见下） |
+| Fix 3.5 | **新增安全修复**：最低持仓锁定误拦止损/熔断清仓（锁仅保留在信号全平与部分减仓上） | P0 | ✅ 已修复 |
+| Fix 8 | 601857.SH 消失 / entry_streak 重置 / 字节级陈旧价格 | 报告 | 📝 仅报告（无代码变更） |
+
+**版本升级**：`BaseBlendAllocationStrategy.BASE_VERSION` `1.4.0 → 1.5.0`；`ChanFourStateBlendStrategy.version` `1.1.0 → 1.2.0 → 1.2.1`（1.2.1 为复核修正轮：止损豁免 + 相对门槛 0.25→0.30 + 权重模式恢复）。
+
+**交付物**：
+- 代码：`common/position_lifecycle.py`（Fix 1/3.5/6/7）、`scripts/run_live_strategy.py`（Fix 2/5/6/7）、`scripts/check_live_portfolio_health.py`（Fix 5）、`pipeline/research/blend/blend_base.py`（Fix 3/4）、`pipeline/research_strategy/rs/config.py`、`pipeline/research_strategy/strategies_config.json`。
+- 权重模式（已定稿，勿"修回"）：`chan_four_state_blend.blend_weighting_mode` 在 SSOT 中**显式定为 `regime_ic_ir_hybrid`**——它是 `rolling_ic_ir` 默认值的**已记录例外**（2026-10-22 实盘即在此模式下运行，用户明确选择保留该模式）。首轮 `--dump-strategies` 曾把它同步成 `rolling_ic_ir`，导致（a）实盘引擎被静默切换、（b）Fix 3/4 完全惰性；本轮已恢复 `regime_ic_ir_hybrid` 并新增配置断言测试防复发。详见 `docs/version.md` §8。
+- 版本与变更日志：`docs/version.md` §8（2026-10-22）；测试断言同步更新（`test_blend_strategy_versioning.py`、`test_strategy_versioning.py`）；新增回归测试（`test_position_lifecycle.py` 8 项、`test_blend_track_c.py` 4 项，含端到端事故复现与部署配置断言）。
+- 离线验证（本轮复跑，精确计数）：`common/tests` 365 passed 1 skipped；`pipeline/research_strategy/tests` 585 passed；`pipeline/tests` 9 passed；`backtester/tests` 52 passed。
+
+**遗留风险（后续专项）**：Fix 8 涉及 601857 制度路由+空桶导致的 entry_streak 重置、5 只标的缓存陈旧价格、目标权重向量 101.78% 口径，源于制度路由/空桶（同 Fix 3 根因）、跨 run 状态持久化链路与数据缓存层，未在本轮改动中触及。`regime_ic_ir_hybrid` 下 Fix 3/4 已实际生效（不再惰性）；若日后再次把该策略切回 `rolling_ic_ir`，Fix 3/4 将重新失效（配置断言测试会先行报警）。
+
+
 

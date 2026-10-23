@@ -13,18 +13,18 @@
 ```
                 ┌────────────────────────────────────────────────────────┐
                 │          底座引擎版本 (Engine BASE_VERSION)              │
-                │  - BaseBlendAllocationStrategy: v1.4.0                 │
+                │  - BaseBlendAllocationStrategy: v1.5.0                 │
                 │  - AllocationTemplate: v1.0.0                          │
                 └──────────────────────────┬─────────────────────────────┘
                                            │ 继承与多态注入
                                            ▼
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │                          具体策略子类版本 (Strategy Class version)                        │
-│  - ChanRiskManagedBlendStrategy: v1.1.0 [base: v1.4.0]                                 │
-│  - ChanFourStateBlendStrategy:   v1.1.0 [base: v1.4.0]                                 │
-│  - ChanCrisisShieldBlendStrategy: v1.0.1 [base: v1.4.0]                                │
-│  - ChanDualHybridBlendStrategy:  v1.0.0 [base: v1.4.0]                                 │
-│  - GenericBlendStrategy:         v1.0.0 [base: v1.4.0]                                 │
+│  - ChanRiskManagedBlendStrategy: v1.1.0 [base: v1.5.0]                                 │
+│  - ChanFourStateBlendStrategy:   v1.2.1 [base: v1.5.0]                                 │
+│  - ChanCrisisShieldBlendStrategy: v1.0.1 [base: v1.5.0]                                │
+│  - ChanDualHybridBlendStrategy:  v1.0.0 [base: v1.5.0]                                 │
+│  - GenericBlendStrategy:         v1.0.0 [base: v1.5.0]                                 │
 │  - 9 大静态配置模板 (EqualWeight, RiskParity ...): v1.0.0                             │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -191,12 +191,12 @@
 
 | 策略类名 (`Strategy Class`) | 内部标识 (`Strategy ID`) | 当前版本 (`version`) | 所属底座版本 (`base_version`) | 复合版本标识 (`version_string`) | 核心流派与组合机制说明 |
 | :--- | :--- | :---: | :---: | :---: | :--- |
-| `ChanRiskManagedBlendStrategy` | `chan_risk_managed_blend` | **`1.1.0`** | `1.4.0` | `v1.1.0 [base: v1.4.0]` | 缠论结构与风控增强多流派配置策略，主打回撤控制与稳健复合收益 |
-| `ChanFourStateBlendStrategy` | `chan_four_state_blend` | **`1.1.0`** | `1.4.0` | `v1.1.0 [base: v1.4.0]` | 四状态缠论状态机驱动（趋势/盘整/背驰/反转）动态调权配置旗舰策略 |
-| `ChanCrisisShieldBlendStrategy` | `chan_crisis_shield_blend` | **`1.0.1`** | `1.4.0` | `v1.0.1 [base: v1.4.0]` | 危机防御型盾牌策略，内置极端熊市熔断、防崩盘流动性保护与对冲卸载 |
-| `ChanDualHybridBlendStrategy` | `chan_dual_hybrid_blend` | **`1.0.0`** | `1.4.0` | `v1.0.0 [base: v1.4.0]` | 双轨混动策略，结合缠论短波段择时与中长周期资产动量/反转配置 |
-| `GenericBlendStrategy` | `generic_blend` | **`1.0.0`** | `1.4.0` | `v1.0.0 [base: v1.4.0]` | 通用多流派 Blend 组合框架，支持任意配置文件的子策略插拔与动态正交加权 |
-| `ChanFourStateShieldBlendStrategy` | `chan_four_state_shield_blend` | **`1.0.0`** | `1.4.0` | `v1.0.0 [base: v1.4.0]` | 四状态状态机与全景危机防护装甲合体策略 |
+| `ChanRiskManagedBlendStrategy` | `chan_risk_managed_blend` | **`1.1.0`** | `1.5.0` | `v1.1.0 [base: v1.5.0]` | 缠论结构与风控增强多流派配置策略，主打回撤控制与稳健复合收益 |
+| `ChanFourStateBlendStrategy` | `chan_four_state_blend` | **`1.2.1`** | `1.5.0` | `v1.2.1 [base: v1.5.0]` | 四状态缠论状态机驱动（趋势/盘整/背驰/反转）动态调权配置旗舰策略（权重模式 `regime_ic_ir_hybrid` 为 `rolling_ic_ir` 默认值的已记录例外，见 §8） |
+| `ChanCrisisShieldBlendStrategy` | `chan_crisis_shield_blend` | **`1.0.1`** | `1.5.0` | `v1.0.1 [base: v1.5.0]` | 危机防御型盾牌策略，内置极端熊市熔断、防崩盘流动性保护与对冲卸载 |
+| `ChanDualHybridBlendStrategy` | `chan_dual_hybrid_blend` | **`1.0.0`** | `1.5.0` | `v1.0.0 [base: v1.5.0]` | 双轨混动策略，结合缠论短波段择时与中长周期资产动量/反转配置 |
+| `GenericBlendStrategy` | `generic_blend` | **`1.0.0`** | `1.5.0` | `v1.0.0 [base: v1.5.0]` | 通用多流派 Blend 组合框架，支持任意配置文件的子策略插拔与动态正交加权 |
+| `ChanFourStateShieldBlendStrategy` | `chan_four_state_shield_blend` | **`1.0.0`** | `1.5.0` | `v1.0.0 [base: v1.5.0]` | 四状态状态机与全景危机防护装甲合体策略 |
 
 ---
 
@@ -308,3 +308,101 @@ pipeline/.venv/bin/python scripts/run_live_strategy.py \
 | `chan_four_state_shield_blend` | ❌ 无 | 正确解析 `chan_four_state` 与 `wq_alpha12` |
 | `chan_dual_hybrid_blend` | ❌ 无 | 正确解析 Alpha#53/#3/#41/#101 |
 | `generic_blend` | ❌ 无 | 使用 `blend_sub_strategies` 名册映射，无裸名回退 |
+
+---
+
+## 8. 实盘缺陷修复变更日志 (Live-Trading Defect Fix Changelog) (2026-10-22)
+
+### 修复背景：`chan_four_state_blend` 实盘 8 项缺陷（锁定卖出、防御桶 4 倍跳变、咨询值误读、状态陈旧）
+
+**根因审计依据**：`/home/stone/Work/stock/simulate/202609/runs/chan_four_state_blend/custom_astock_202609_20_new/2026-10-22/root_cause_audit_2026-10-22.md`（只读证据，未改动）。
+
+实盘工单 `live_trading_ticket.json` 暴露以下缺陷：
+1. **锁定卖出 (P0)**：`000999.SZ` / `600900.SH` 在 `held_bars=1 < min_holding_bars=2` 时仍被卖出。根因是 `common/position_lifecycle.py` 的部分减仓分支只对止损快路径和全平仓路径校验 `can_sell`，从未对部分减仓（partial trim）校验。
+2. **最低持仓周期锁定绕过兜底 (P0)**：Stage-2 工单生成循环在 UPLSM 返回 SELL 后未二次校验 `is_tenure_locked`，需加兜底防线。
+3. **防御桶 4 倍跳变 (P1)**：`regime_ic_ir_hybrid` 分支的宏观状态机预算在单日 regime 翻转时，防御桶从 0.10 一次性跳至 0.40（renormalize 放大），无平滑钳制。
+4. **推力信号单日翻转 (P1)**：Zweig 10 日动量推力 0.60→0.50 单日翻转导致状态机从动量预算（0.80）直接切换至防御预算（0.85），无迟滞。
+5. **咨询值误读 (P2)**：Stage-1 `target_exposure`（0.7111）被误读为 Stage-2 的可执行权益仓位，而工单实际 BIL 现金停泊目标为 0.444087。
+6. **`account_state.json` 状态陈旧 (P2)**：`AssetLifecycleState.current_weight` 在持久化前被状态机改写为目标权重，导致 `lifecycle_state.current_weight` 记录的是 TARGET（0.06731049）而非券商实际持仓（0.13934551）。
+7. **微观减仓抖动 (P2)**：`600660` 持仓 17 日，delta 0.050082 vs 阈值 0.05（仅超 0.0082pp），产生实际减仓订单（约 ¥10,256），缺乏相对仓位比例的减仓门槛。
+8. **标的消失/streak 重置/字节级陈旧价格 (报告项)**：`601857.SH` 从 universe 消失、`entry_streak` 重置、及字节级完全相同的陈旧价格，详见本节末尾"Fix 8 调查结论"（仅报告，不改代码）。
+
+### 修复方案与版本升级
+
+#### 底座引擎升级 `BaseBlendAllocationStrategy`: `v1.4.0` → `v1.5.0`
+* **变更类型**：Minor —— 向后兼容的功能新增（新增可选参数均默认 no-op，其他策略回测数字字节级不变）。
+* **改动位置**：`pipeline/research/blend/blend_base.py`。
+* **新增能力**：
+  - **Fix 3（防御桶平滑钳制）**：`_compute_adaptive_weights` 的 `regime_adaptive` / `regime_ic_ir_hybrid` 分支新增 `blend_bucket_renorm_max_delta`（默认 `None` = 行为不变）。非 `None` 时，每根 K 线的风格桶预算相对上一根桶权重的最大变动量被钳制在 `bucket_renorm_max_delta` 内再归一化；同时新增 `logging` 空桶告警、逐根 DEBUG 成员/预算日志。
+  - **Fix 4（推力迟滞）**：新增 `blend_enable_regime_hysteresis`（默认 `False` = 单阈值路径不变）、`blend_thrust_enter_thresh`（0.62）、`blend_thrust_exit_thresh`（0.58）。启用后，推力标志仅在推力升至进入阈值时置位、仅在跌至退出阈值时复位，消除 0.60 附近的单日抖动。`_compute_adaptive_weights` 新增 `thrust_active` 可选入参（默认 `None` = 沿用旧比较逻辑），`generate_weights` 循环以 `prev_state` 线程传递迟滞状态。
+* **向后兼容**：`test_blend_track_c.py` 直调 `_compute_adaptive_weights` 的旧关键字调用无需改动（新 kwargs 全部默认干净）。底座层默认值保持 no-op；`chan_four_state_blend` 在 `strategies_config.json` 中显式开启（`blend_enable_regime_hysteresis=true`、`blend_bucket_renorm_max_delta=0.15`），因此在 `regime_ic_ir_hybrid` 模式下**实际生效**。
+
+#### 子类策略升级 `ChanFourStateBlendStrategy`: `v1.1.0` → `v1.2.0` → `v1.2.1`
+* **变更类型**：Minor（`1.1.0` → `1.2.0`，首轮实盘缺陷修复）+ Minor（`1.2.0` → `1.2.1`，复核修正轮）。两次均为行为变更。
+* **`v1.2.0` 内容**：部分减仓锁定（Fix 1）、Stage-2 兜底（Fix 2）、桶钳制（Fix 3）、推力迟滞（Fix 4）、相对减仓门槛（Fix 7）、券商权重快照（Fix 6）、咨询值标注（Fix 5）。
+* **`v1.2.1` 内容（本轮复核发现并修正）**：
+  1. **安全修复（Fix 3.5）**：最低持仓锁定不再拦截止损 / 熔断清仓路径（详见下节 "Fix 3.5"）。
+  2. **Fix 7 生效化**：`cfsb_inertia_relative_ratio` 由 `0.25` 上调至 `0.30`——`0.25 × 0.20（单票上限）= 0.05`，与绝对门槛 `cfsb_min_weight_change = 0.05` **完全相等**，即 `max(0.05, 0.25·w)` 恒等于 0.05，属**数学无效值（no-op）**，首轮"已修复"结论错误，此处更正。
+  3. **权重模式恢复**：`blend_weighting_mode` 在 SSOT 中定为 `regime_ic_ir_hybrid`（见 "权重模式：已记录例外"）。
+* **改动位置**：`pipeline/research/blend/chan_four_state_blend.py`（版本号）、`common/position_lifecycle.py`、`scripts/run_live_strategy.py`、`scripts/check_live_portfolio_health.py`、`pipeline/research_strategy/rs/config.py`、`pipeline/research_strategy/strategies_config.json`。
+
+#### Fix 1 + Fix 2（锁定卖出，P0）
+* **Fix 1（承重修复，与权重模式无关）**：`common/position_lifecycle.py` 部分减仓分支：SELL 方向在 `can_sell` 为 False 时返回 `HOLD_FILTERED`（reason=`未满最低持仓周期`，权重锁定在 `current_weight`），BUY 方向加仓在锁定期仍允许。这是唯一直接消除 000999.SZ / 600900.SH 锁定卖出的改动——无论权重模式是 `regime_ic_ir_hybrid` 还是 `rolling_ic_ir` 都有效，因此它是本次事故的**承重修复**。
+* **Fix 2（兜底防线，防御纵深）**：`scripts/run_live_strategy.py` 兜底：`is_tenure_locked and asset_market == "china" and action == "SELL" and tgt_w > 0` 时降级为 `HOLD_FILTERED`、`tgt_w=cur_w`、`delta_w=0.0`、并回写 `state.current_weight=cur_w`（全平仓 tgt_w<=0 不拦截，止损/熔断快路径仍可锁定期清仓）。`asset_market == "china"` 范围限定与 `can_sell` 的 `market != "china"` 豁免保持一致，避免误拦美股/港股策略的部分减仓（T+1 妊娠锁仅对中国 A 股有意义）。在 Fix 1 已生效的前提下，该层正常情况下不会被触发，属**第二道防线**，不应被当作主要修复。
+
+#### Fix 3.5（安全修复：锁定不再拦截止损/熔断，P0）
+* **问题**：`can_sell`（最低持仓锁）此前同时门控止损快路径。后果是"昨天买入、今天触发硬止损 / Tier-3 紧急熔断"的中国仓位**当日无法清仓**——把有界止损变成无界尾部风险，危害大于原始事故。
+* **修复**：`common/position_lifecycle.py` 止损/熔断快路径**豁免** tenure lock，并在覆盖发生时输出 `WARNING` 日志（`tenure lock overridden by risk exit for <symbol>`），使锁定被绕过在实盘日志中可见。
+* **保留锁定的路径**：(i) 信号驱动全平仓（`raw_target_weight == 0.0` 且非止损/熔断）；(ii) 部分减仓（SELL 方向 trim）。
+* **同步修正**：`scripts/run_live_strategy.py` 兜底层原注释声称"止损/熔断路径本来就可在锁定期清仓"，现改为与实际代码一致（止损/熔断 SELL 不在此层拦截，信号全平仓已被 Fix 1 降级，正常不会到达）。
+* **既有测试连带修正**：`common/tests/test_position_lifecycle.py::test_china_t_plus_one_gestation` 原用 `30.0 → 25.0`（-16.7%，本身就是硬止损）来验证"信号全平仓被锁定"，在豁免后该场景应清仓；已改为 `30.0 → 29.8`（-0.67%，不触发止损）以**只**验证信号全平仓路径，并在注释中说明原因。
+
+#### Fix 6（券商权重快照，P2）
+* `AssetLifecycleState` 新增 `broker_weight` 字段（dataclass + `to_dict` + `from_dict`，`d.get("broker_weight", 0.0)` 向后兼容）；`step_position_lifecycle` 绝不改写该字段。
+* `scripts/run_live_strategy.py` 在恢复旧状态（`state.broker_weight = cur_w`）与新建状态（`broker_weight=cur_w`）时，先于状态机改写 `current_weight` 快照券商真实持仓。
+* `delta_w` 改为有符号 `raw_target - current`，与 `inertia_check.delta_weight` 约定统一。
+
+#### Fix 7（相对减仓门槛，P2；噪声交易阻尼器）
+* `PositionLifecycleConfig.inertia_relative_ratio`（**通用默认 0.0 = 禁用**，不影响其他策略与回测数字）：SELL 减仓有效门槛 = `max(inertia_threshold, ratio * current_weight)`。
+* `StrategyConfig.cfsb_inertia_relative_ratio = 0.30`（策略专属字段）并同步进 `strategies_config.json`，经 `run_live_strategy.py` 的 `resolve_blend_param` 注入 UPLSM。
+* **取 0.30 而非 0.25 的推导（首轮 0.25 为 no-op，已更正）**：单票上限 `cfsb_max_single_position = 0.20`，故在职持仓权重上限约 0.20。
+  - `0.25 × 0.20 = 0.05`，与绝对门槛 `cfsb_min_weight_change = 0.05` 相等 → `max(0.05, 0.05)` 永远等于 0.05，**门槛从未真正抬高**（这正是首轮"已修复"判断错误的原因）。
+  - `0.30 × 0.20 = 0.06 > 0.05` → 上限处确有阻尼。
+  - 事故中 600660 的在职权重 `w = 0.1819`，门槛 `0.30 × 0.1819 = 0.05457`，恰好过滤其 `0.050093` 的微减仓（首轮 0.25 时门槛 0.0455 < 0.05，被绝对门槛 0.05 放行）。
+* 定位：**噪声交易阻尼器**，不是本次事故的根因修复（根因是锁定卖出 + 制度模式）。
+
+#### Fix 5（咨询值标注，P2）
+* `scripts/check_live_portfolio_health.py`：`market_macro` 新增 `target_exposure_is_advisory: true`；仪表盘与 Markdown 中 `Target Equity Exposure` 标注 `(Stage-1 advisory; Stage-2 model weights govern orders)`。
+* `scripts/run_live_strategy.py`：横幅新增提示语；权重生成后打印模型可执行权益/现金拆分（`模型目标仓位 (Model Targets)`）。
+
+#### 权重模式：`chan_four_state_blend` 是 `rolling_ic_ir` 默认值的已记录例外（2026-10-22）
+* **事实链**：`AGENTS.md` 记录的 blend 默认权重模式是 `rolling_ic_ir`；但 `chan_four_state_blend` 的**实盘部署模式是 `regime_ic_ir_hybrid`**（2026-10-22 实盘运行即在此模式下执行，含空桶 renormalize 与推力翻转行为）。本策略自本日起为**文档化例外**：`strategies_config.json` 中 `chan_four_state_blend.blend_weighting_mode = "regime_ic_ir_hybrid"`，其余五个 blend 策略仍为 `rolling_ic_ir`。
+* **发现的漂移（dump vs config）**：首轮 `--dump-strategies` 时 SSOT 仍是 `rolling_ic_ir`，而 10-22 实盘加载的 dump 携带 `regime_ic_ir_hybrid`（含未前缀别名 `weighting_mode` / `enable_orthogonalization`）。首轮把 dump "对齐" 成 `rolling_ic_ir`，等于**静默切换了实盘引擎**，并让 Fix 3/4（仅在 `regime_*` 分支执行）完全惰性。
+* **定稿处置**：按用户明确选择**恢复 `regime_ic_ir_hybrid`**（SSOT + dump 双向一致，dump 已复跑确认：`chan_four_state_blend_strategy.json` → `strategy_version 1.2.1` / `base_version 1.5.0` / `blend_weighting_mode regime_ic_ir_hybrid` / `cfsb_inertia_relative_ratio 0.3` / `blend_enable_regime_hysteresis true` / `blend_bucket_renorm_max_delta 0.15`；其余五个 blend dump 的权重模式逐字节未变，仍为 `rolling_ic_ir`）。
+* **防复发**：新增 `test_cfsb_deployed_regime_mode_and_inertia_ratio_config` 直接断言 SSOT 中该策略为 `regime_ic_ir_hybrid`、其余五个为 `rolling_ic_ir`、ratio 0.30、迟滞/钳制参数值——任何人把该策略"修回"默认值都会先打红测试。
+
+#### 修复分层与重要度（不夸大，按承重次序）
+| 层 | 项目 | 与权重模式的依赖 | 定位 |
+| :--- | :--- | :--- | :--- |
+| 承重 | Fix 1（部分减仓 `can_sell` 门控） | 无（模式无关） | **唯一直接消除事故卖出**的修复 |
+| 安全 | Fix 3.5（止损/熔断豁免锁定） | 无 | 防止锁定把有界止损变无界尾部风险 |
+| 兜底 | Fix 2（Stage-2 二次锁定） | 无 | 第二道防线，正常情况下不触发 |
+| 纵深 | Fix 3（桶 delta 钳制）、Fix 4（推力迟滞） | **是**（仅 `regime_*` 分支） | 恢复 `regime_ic_ir_hybrid` 后才**真正生效**的防御纵深 |
+| 阻尼 | Fix 7（相对减仓门槛 0.30） | 无 | 噪声交易阻尼，非根因修复 |
+| 可读性 | Fix 5（咨询值标注）、Fix 6（券商权重快照） | 无 | 口径/状态准确性，不改变交易决策 |
+
+#### 单测覆盖（全部 PASS）
+* `common/tests/test_position_lifecycle.py`（新增 8 项 + 修正 1 项既有用例）：`test_locked_partial_trim_sell_blocked`、`test_locked_partial_trim_buy_allowed`、`test_tenure_lock_exempted_for_stop_loss_but_not_signal_exits`（止损放行 / 信号全平仓仍拦 / 部分减仓仍拦）、`test_signed_delta_w_convention`、`test_broker_weight_serialization_roundtrip`、`test_relative_trim_side_inertia_threshold`、`test_relative_trim_side_inertia_threshold_at_position_cap`（w=0.20 → 门槛 0.06）、`test_relative_trim_side_inertia_threshold_600660_incident`（w=0.1819、delta 0.0501 → 过滤且非 SELL）；`test_china_t_plus_one_gestation` 改用非止损价格以隔离信号路径。
+* `pipeline/research_strategy/tests/test_blend_track_c.py`（新增 4 项）：`test_regime_hysteresis_thrust_override`、`test_bucket_renorm_max_delta_clamp`、`test_cfsb_deployed_regime_mode_and_inertia_ratio_config`、`test_incident_2026_10_22_end_to_end_replay`（事故端到端复现：迟滞在 0.59 噪声带不翻转、0.50 复位被钳制在 +0.15、000999/600900 → `HOLD_FILTERED`、600660 → `HOLD`，全天**零 SELL**）。
+* 版本断言：`test_blend_strategy_versioning.py`、`test_strategy_versioning.py` 全部更新为 `1.5.0` / `1.2.1`。
+* 全量离线套件（本轮复跑，精确计数）：`common/tests` 365 passed 1 skipped；`pipeline/research_strategy/tests` 585 passed；`pipeline/tests` 9 passed；`backtester/tests` 52 passed。100% 离线（`SyntheticDataProvider` / `common/testing.py`），无网络、无真实行情。
+
+#### 事故复盘的诚实结论（勿引用旧数字）
+* 新配置下重放 2026-10-22 当日三个持仓 → **零卖出**：权益账簿维持 **75.88%**，相对 Stage-1 咨询权益目标 71.11% 为 **+4.77pp**（而非实盘实际落入的 44.4% 现金 / 约 55.6% 权益），被卖出的 40,041 RMB 不再涌入现金。
+* **诚实披露（不夸大）**：10d 推力 0.60 → 0.50 中，0.50 < 退出阈值 0.58，**迟滞本身会在该 bar 释放制度标志**；真正阻止"单日组合跳变"的是 Fix 3 的桶 delta 钳制（防御桶 0.0588 → 0.2088，即 +0.15，而非未钳制的 0.40）。迟滞的作用域是 0.58–0.62 噪声带（如 0.59 不再触发翻转）。
+
+### Fix 8 调查结论（仅报告，无代码变更）
+* **`601857.SH`（中国石油）整行消失**：`601857.SH` 实际仍在校验 universe（`resolved_universe.txt` 第 11 行）且为 Stage-1 动量榜首（10 日 ROC +9.58%、站上 SMA50）。根因是 10-21 其为 `PENDING_ENTRY`、`entry_streak = 1/2`，10-22 本应确认至 2/2 并买入，但 10-22 制度状态机翻转入 reversal 分支、且该 universe 无任何 `reversal` 分类子策略（空桶），导致模型对 `601857.SH` 输出目标权重 0.0，`step_position_lifecycle` 的 FLAT 分支将 `entry_streak` 重置为 0 而非推进确认，最终票据中连一行都没有。属制度路由 + 空桶（同 Fix 3 根因）与跨 run `entry_streak` 持久化缺口的叠加，非生命周期状态机本身逻辑错误。
+* **`entry_streak` 重置**：`601857.SH` 的 `entry_streak=1/2` 未持久化进 `account_state.json` 的 `entry_signal_streak`（该字典仅含 000999/600584/600660/600900/601728），且模型 10-22 目标为 0.0 触发 FLAT 分支清零。属跨 run 入场确认信号持久化链路的已知局限，留待后续专项（本次 8 项 P0/P1 缺陷的非直接成因）。
+* **字节级陈旧价格**：`live_analysis` 疑点 2 指出 5 只标的（600660 51.28、600900 29.57、600362 37.95、600584 57.23、601728 6.62）票据价格与 10-21 逐位相同，而 000999（25.54→25.00）与 601288（7.29→7.40）正常变动，高度怀疑 Stage-2 对这 5 只读取到缓存中停在 10-21 的最后一根 bar。属数据/缓存层的陈旧切片问题，不影响本次修复，建议后续在数据加载层增加"前收盘≠当日收盘"陈旧性告警。
+* **目标权重向量合计 101.78%**（附带发现）：股票腿 0.5737 + BIL 0.4441 = 1.0178，因 `target_weight` 用未取整目标股数计算、现金腿用已取整市值反推所致。账面自洽，但把该向量当概率分布归一化的下游会偏差 1.2–2.7pp，建议后续统一口径。
