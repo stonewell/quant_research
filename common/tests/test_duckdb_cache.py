@@ -200,6 +200,11 @@ def test_file_based_cache_persistence(tmp_path):
 def test_is_range_covered_checks_last_sync_time_for_latest_data(mem_cache):
     """Verifies that DuckDBCache.is_range_covered checks last_sync_time when
     end is omitted (end=None) or today, so next-day queries refresh data.
+
+    The "already synced today" short-circuit is only a *metadata* fast path: since the
+    2026-10-22 incident it can no longer claim coverage on its own -- a bar at the requested
+    end date must also exist (see the dedicated regression tests below). Both halves of that
+    contract are asserted here.
     """
     df = _make_sample_ohlcv("2024-01-01", periods=2)  # 2024-01-01 and 2024-01-02
     yesterday_sync = datetime.datetime(2024, 1, 2, 16, 0)
@@ -211,11 +216,261 @@ def test_is_range_covered_checks_last_sync_time_for_latest_data(mem_cache):
     assert mem_cache.is_range_covered("TestProvider", "AAPL", start="2024-01-01", end=None, now=today_time) is False
     assert mem_cache.is_range_covered("TestProvider", "AAPL", start="2024-01-01", end="2024-01-03", now=today_time) is False
 
-    # 2. Once synced today (2024-01-03), it is covered
+    # 2. Synced today (2024-01-03) is still NOT coverage by itself: the bars only reach
+    #    2024-01-02, i.e. the sync ran before upstream published today's bar -> must re-fetch.
+    #    (This is exactly the 2026-10-22 incident: fresh metadata, bars one day short.)
     today_sync = datetime.datetime(2024, 1, 3, 15, 30)
     mem_cache.store_bars("TestProvider", "AAPL", df, sync_time=today_sync)
+    assert mem_cache.is_range_covered("TestProvider", "AAPL", start="2024-01-01", end=None, now=today_time) is False
+    assert mem_cache.is_range_covered("TestProvider", "AAPL", start="2024-01-01", end="2024-01-03", now=today_time) is False
+
+    # 3. Once a bar for 2024-01-03 actually lands, the same-day fast path applies again
+    df_with_today = _make_sample_ohlcv("2024-01-01", periods=3)  # 2024-01-01 .. 2024-01-03
+    mem_cache.store_bars("TestProvider", "AAPL", df_with_today, sync_time=today_sync)
     assert mem_cache.is_range_covered("TestProvider", "AAPL", start="2024-01-01", end=None, now=today_time) is True
     assert mem_cache.is_range_covered("TestProvider", "AAPL", start="2024-01-01", end="2024-01-03", now=today_time) is True
+
+
+def _force_sync_metadata(cache, provider, symbol, latest_available_date, sync_time):
+    """Forces `asset_sync_metadata` to claim a latest date that the stored bars do NOT reach.
+
+    Reproduces the 2026-10-22 incident state: the sync bookkeeping says "up to today, synced
+    today" while `ohlcv_bars` stops on the previous session (the fetch happened before the
+    upstream provider published the new bar). `store_bars` itself derives latest_available_date
+    from the bar max, so this inconsistent state has to be injected directly.
+    """
+    con = cache._get_connection(read_only=False)
+    try:
+        con.execute(
+            "UPDATE asset_sync_metadata SET latest_available_date = ?, last_sync_time = ? "
+            "WHERE provider = ? AND symbol = ?",
+            [latest_available_date, sync_time, provider, symbol],
+        )
+    finally:
+        if not cache.is_memory:
+            con.close()
+
+
+def test_is_range_covered_false_when_metadata_claims_end_but_bars_stop_one_day_short(mem_cache):
+    """2026-10-22 REGRESSION: `latest_available_date == req_end` and `last_sync == today` used
+    to be accepted as coverage even though the bars stopped a day short, so the live path was
+    never re-fetched and marked five positions to the 2026-10-21 close (NAV understated
+    ~0.70%, limit prices below the true market). The bar layer must reject it.
+    """
+    df = _make_sample_ohlcv("2026-10-19", periods=3)  # 10-19, 10-20, 10-21 (no 10-22 bar)
+    mem_cache.store_bars("IncidentProvider", "SPY", df, sync_time=datetime.datetime(2026, 10, 22, 10, 0))
+    _force_sync_metadata(
+        mem_cache, "IncidentProvider", "SPY",
+        latest_available_date=datetime.date(2026, 10, 22),
+        sync_time=datetime.datetime(2026, 10, 22, 10, 0),
+    )
+
+    now = pd.Timestamp("2026-10-22 10:35:00")
+    assert mem_cache.is_range_covered("IncidentProvider", "SPY", start="2026-10-19", end="2026-10-22", now=now) is False
+    # end omitted (= today) must be just as strict -- no stale-mark hole for that call shape
+    assert mem_cache.is_range_covered("IncidentProvider", "SPY", start="2026-10-19", end=None, now=now) is False
+
+    # Querying up to the last stored bar is genuinely covered (nothing more was asked for)
+    assert mem_cache.is_range_covered("IncidentProvider", "SPY", start="2026-10-19", end="2026-10-21", now=now) is True
+
+
+def test_is_range_covered_true_when_bars_reach_requested_end(mem_cache):
+    """The same metadata state is covered once the bar for `req_end` actually exists."""
+    df = _make_sample_ohlcv("2026-10-19", periods=4)  # includes the 2026-10-22 bar
+    mem_cache.store_bars("IncidentProvider", "SPY", df, sync_time=datetime.datetime(2026, 10, 22, 16, 0))
+
+    now = pd.Timestamp("2026-10-22 16:05:00")
+    assert mem_cache.is_range_covered("IncidentProvider", "SPY", start="2026-10-19", end="2026-10-22", now=now) is True
+    assert mem_cache.is_range_covered("IncidentProvider", "SPY", start="2026-10-19", end=None, now=now) is True
+
+
+def test_is_range_covered_false_when_no_bars_stored(mem_cache):
+    """Fresh metadata with an empty `ohlcv_bars` table must never report coverage."""
+    df = _make_sample_ohlcv("2026-10-19", periods=4)
+    mem_cache.store_bars("IncidentProvider", "SPY", df, sync_time=datetime.datetime(2026, 10, 22, 16, 0))
+
+    con = mem_cache._get_connection(read_only=False)
+    try:
+        con.execute("DELETE FROM ohlcv_bars WHERE provider = ? AND symbol = ?", ["IncidentProvider", "SPY"])
+    finally:
+        if not mem_cache.is_memory:
+            con.close()
+
+    now = pd.Timestamp("2026-10-22 16:05:00")
+    assert mem_cache.is_range_covered("IncidentProvider", "SPY", start="2026-10-19", end="2026-10-22", now=now) is False
+
+
+def test_is_range_covered_true_on_weekend_when_bars_reach_friday(mem_cache):
+    """Weekend guard against an infinite re-fetch loop: `end` = Saturday 2026-10-24 with bars
+    through Friday 2026-10-23 must count as covered (no exchange session on the Saturday).
+    """
+    df = _make_sample_ohlcv("2026-10-19", periods=5)  # Mon 10-19 .. Fri 10-23
+    mem_cache.store_bars("IncidentProvider", "SPY", df, sync_time=datetime.datetime(2026, 10, 24, 9, 0))
+
+    saturday = pd.Timestamp("2026-10-24 09:00:00")
+    assert saturday.weekday() == 5
+    assert mem_cache.is_range_covered("IncidentProvider", "SPY", start="2026-10-19", end="2026-10-24", now=saturday) is True
+    assert mem_cache.is_range_covered("IncidentProvider", "SPY", start="2026-10-19", end=None, now=saturday) is True
+
+    # ...but a weekday request that is short is still uncovered, even inside the 7-day tolerance
+    short_df = _make_sample_ohlcv("2026-10-19", periods=4)  # Mon 10-19 .. Thu 10-22
+    mem_cache.store_bars("IncidentProvider", "SHORT", short_df, sync_time=datetime.datetime(2026, 10, 24, 9, 0))
+    assert mem_cache.is_range_covered("IncidentProvider", "SHORT", start="2026-10-19", end="2026-10-23", now=saturday) is False
+
+
+def test_is_range_covered_is_per_symbol_not_per_provider(mem_cache):
+    """One short symbol must not contaminate, nor be masked by, a complete sibling symbol
+    under the same provider (the incident hit 6 of 20 symbols in one universe)."""
+    short_df = _make_sample_ohlcv("2026-10-19", periods=3)   # stops 2026-10-21
+    full_df = _make_sample_ohlcv("2026-10-19", periods=4)    # reaches 2026-10-22
+    now = pd.Timestamp("2026-10-22 16:00:00")
+
+    mem_cache.store_bars("IncidentProvider", "SHORT", short_df, sync_time=datetime.datetime(2026, 10, 22, 10, 0))
+    _force_sync_metadata(
+        mem_cache, "IncidentProvider", "SHORT",
+        latest_available_date=datetime.date(2026, 10, 22),
+        sync_time=datetime.datetime(2026, 10, 22, 10, 0),
+    )
+    mem_cache.store_bars("IncidentProvider", "FULL", full_df, sync_time=datetime.datetime(2026, 10, 22, 16, 0))
+
+    assert mem_cache.is_range_covered("IncidentProvider", "SHORT", start="2026-10-19", end="2026-10-22", now=now) is False
+    assert mem_cache.is_range_covered("IncidentProvider", "FULL", start="2026-10-19", end="2026-10-22", now=now) is True
+
+
+def test_is_range_covered_future_end_not_judged_by_bar_layer(mem_cache):
+    """A requested `end` beyond today can never have a stored bar, so the bar layer must not
+    reject it (otherwise every "give me everything up to a far-future date" call re-fetches
+    forever). Only the metadata freshness rules apply there.
+    """
+    now = pd.Timestamp("2026-10-22 16:05:00")
+    df = _make_sample_ohlcv("2026-10-19", periods=4)
+    mem_cache.store_bars("IncidentProvider", "SPY", df, sync_time=datetime.datetime(2026, 10, 22, 16, 0))
+
+    far_future_end = (now + pd.Timedelta(days=3650)).strftime("%Y-%m-%d")
+    assert mem_cache.is_range_covered("IncidentProvider", "SPY", start="2026-10-19", end=far_future_end, now=now) is True
+
+
+# ---------------------------------------------------------------------------------------------
+# 2026-10-22 REGRESSION: `asset_sync_metadata` upsert monotonicity.
+#
+# A real Fuyao sync that started fetching at 2024-01-02 rewrote `earliest_available_date` to
+# 2024-01-02 for six symbols whose `ohlcv_bars` still begin in 2017-01-18 / 2020-11-30 /
+# 2021-08-20, and cleared `is_earliest_known` on 601728.SH (True -> False). The recorded metadata
+# then contradicted the bars it describes, so any logic deriving a backtestable range from
+# `earliest_available_date` silently truncated ~7 years of history. Each sync from a later start
+# date damaged the field further. The upsert must therefore be directional:
+#   earliest -> MIN, latest -> MAX, is_earliest_known -> sticky True.
+# ---------------------------------------------------------------------------------------------
+
+
+def _make_daily_ohlcv(start: str, end: str, base_price: float = 100.0) -> pd.DataFrame:
+    """Business-day OHLCV frame covering [start, end] inclusive (synthetic, offline)."""
+    dates = pd.bdate_range(start, end)
+    n = len(dates)
+    return pd.DataFrame(
+        {
+            "Open": [base_price] * n,
+            "High": [base_price + 2.0] * n,
+            "Low": [base_price - 1.0] * n,
+            "Close": [base_price + 1.0] * n,
+            "Volume": [1000.0] * n,
+        },
+        index=dates,
+    )
+
+
+def test_store_bars_later_window_does_not_downgrade_earliest_available_date(mem_cache):
+    """2026-10-22 REGRESSION (six symbols): bars from 2017, then a sync window starting
+    2024-01-02 must leave `earliest_available_date` reporting the 2017 date and must leave
+    `is_earliest_known` unchanged. A sync that never looked before 2024 has learned nothing
+    about 2017 and must not overwrite that knowledge.
+    """
+    provider, symbol = "FuyaoDataProvider", "600362.SH"
+    mem_cache.store_bars(provider, symbol, _make_daily_ohlcv("2017-01-18", "2017-02-28"))
+    before = mem_cache.get_asset_metadata(provider, symbol)
+    assert before["earliest_available_date"] == datetime.date(2017, 1, 18)
+    assert before["is_earliest_known"] is False
+
+    # The incident: a sync that starts at 2024-01-02 (requested_start == first returned bar)
+    mem_cache.store_bars(
+        provider, symbol, _make_daily_ohlcv("2024-01-02", "2024-02-29"), requested_start="2024-01-02"
+    )
+
+    after = mem_cache.get_asset_metadata(provider, symbol)
+    assert after["earliest_available_date"] == datetime.date(2017, 1, 18), (
+        "earliest_available_date was downgraded to 2024-01-02 while ohlcv_bars still holds 2017 rows"
+    )
+    assert after["is_earliest_known"] is False
+    # The 2017 bars themselves were never touched (metadata must describe the data, not replace it)
+    assert mem_cache.query_bars(provider, symbol)["Close"].index.min() == pd.Timestamp("2017-01-18")
+
+
+def test_store_bars_is_earliest_known_is_sticky_true(mem_cache):
+    """2026-10-22 REGRESSION (601728.SH): once `is_earliest_known` is True it must stay True even
+    when a later sync writes a row that says False (only a human may reset it explicitly)."""
+    provider, symbol = "FuyaoDataProvider", "601728.SH"
+    mem_cache.store_bars(
+        provider, symbol, _make_daily_ohlcv("2024-01-02", "2024-01-31"), requested_start="2000-01-01"
+    )
+    assert mem_cache.get_asset_metadata(provider, symbol)["is_earliest_known"] is True
+
+    mem_cache.store_bars(provider, symbol, _make_daily_ohlcv("2024-02-01", "2024-02-29"), requested_start="2024-02-01")
+    assert mem_cache.get_asset_metadata(provider, symbol)["is_earliest_known"] is True
+
+
+def test_store_bars_stale_latest_window_does_not_roll_back_latest_available_date(mem_cache):
+    """A stale/regressed fetch (ending 2026-10-21 after 2026-10-22 was already recorded) must not
+    move `latest_available_date` backwards -- MAX(existing, incoming), never greatest-latest-wins."""
+    provider, symbol = "FuyaoDataProvider", "600900.SH"
+    mem_cache.store_bars(provider, symbol, _make_daily_ohlcv("2026-10-01", "2026-10-22"))
+    assert mem_cache.get_asset_metadata(provider, symbol)["latest_available_date"] == datetime.date(2026, 10, 22)
+
+    mem_cache.store_bars(provider, symbol, _make_daily_ohlcv("2026-10-01", "2026-10-21"))
+    assert mem_cache.get_asset_metadata(provider, symbol)["latest_available_date"] == datetime.date(2026, 10, 22)
+
+
+def test_store_bars_earliest_can_still_improve_when_sync_reaches_further_back(mem_cache):
+    """MIN semantics must not freeze the field: a sync that genuinely reaches back to 2017 still
+    moves an existing 2024 earliest date earlier."""
+    provider, symbol = "FuyaoDataProvider", "600584.SH"
+    mem_cache.store_bars(provider, symbol, _make_daily_ohlcv("2024-01-02", "2024-01-31"))
+    assert mem_cache.get_asset_metadata(provider, symbol)["earliest_available_date"] == datetime.date(2024, 1, 2)
+
+    mem_cache.store_bars(provider, symbol, _make_daily_ohlcv("2017-01-18", "2017-01-31"))
+    assert mem_cache.get_asset_metadata(provider, symbol)["earliest_available_date"] == datetime.date(2017, 1, 18)
+
+
+def test_store_bars_first_insert_records_incoming_values_verbatim(mem_cache):
+    """With no existing row, the incoming window is recorded as-is (no MIN/MAX partner to compare
+    against), including the `requested_start` earliest-known inference."""
+    provider, symbol = "FuyaoDataProvider", "600660.SH"
+    mem_cache.store_bars(
+        provider, symbol, _make_daily_ohlcv("2021-08-20", "2021-09-30"), requested_start="2021-08-20"
+    )
+
+    meta = mem_cache.get_asset_metadata(provider, symbol)
+    assert meta["earliest_available_date"] == datetime.date(2021, 8, 20)
+    assert meta["latest_available_date"] == datetime.date(2021, 9, 30)
+    assert meta["is_earliest_known"] is False
+
+
+def test_store_bars_metadata_upsert_is_idempotent(mem_cache):
+    """Storing the same frame twice must not change any of the three monotone fields (only the
+    freely-overwritable `last_sync_time` may move)."""
+    provider, symbol = "FuyaoDataProvider", "601872.SH"
+    df = _make_daily_ohlcv("2020-11-30", "2021-02-26")
+    mem_cache.store_bars(provider, symbol, df, requested_start="2020-11-30", sync_time=datetime.datetime(2026, 10, 22, 19, 0))
+    first = mem_cache.get_asset_metadata(provider, symbol)
+
+    mem_cache.store_bars(provider, symbol, df, requested_start="2020-11-30", sync_time=datetime.datetime(2026, 10, 22, 21, 34, 31))
+    second = mem_cache.get_asset_metadata(provider, symbol)
+
+    assert second["earliest_available_date"] == first["earliest_available_date"]
+    assert second["latest_available_date"] == first["latest_available_date"]
+    assert second["is_earliest_known"] == first["is_earliest_known"]
+    assert first["last_sync_time"] != second["last_sync_time"]  # last attempt, not a data fact
+    # Bars were replaced, not duplicated (primary key keeps them unique)
+    assert len(mem_cache.query_bars(provider, symbol)) == len(df)
 
 
 def test_intraday_interval_resampling_rules():

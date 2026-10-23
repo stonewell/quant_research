@@ -421,6 +421,47 @@ class DuckDBCache:
     ) -> bool:
         """Checks if the requested date range [start, end] is fully covered by cached bars.
         Cached historical data never expires.
+
+        Coverage is a TWO-layer contract, and both layers must pass:
+
+          1. Metadata layer (`asset_sync_metadata`): the provider's earliest/latest known
+             dates plus `last_sync_time` decide whether cache *bookkeeping* says this range
+             has been synced (weekend/holiday-tolerant 7-day window, plus a "did anybody
+             already sync today?" short-circuit).
+          2. Bar layer (`ohlcv_bars`): the maximum stored bar date must actually reach the
+             requested end. The metadata layer alone records what a sync *attempted*, not
+             what landed on disk, so it can never be trusted by itself.
+
+        Why layer 2 exists (2026-10-22 live incident): a live run requested daily bars
+        ending 2026-10-22. Fourteen symbols were fetched after the upstream provider had
+        published that day's bar; six were fetched *before* publication, so their bars
+        stopped at 2026-10-21 while `asset_sync_metadata.latest_available_date` and
+        `last_sync_time` still said "synced today". The old layer-1-only `count(*) > 0`
+        check therefore reported those six as covered for the rest of the calendar day,
+        they were never re-fetched, and the live path fell back to `.iloc[-1]` = the
+        2026-10-21 close: five held positions were marked to stale prices, NAV was
+        understated by ~0.70%, and suggested limit prices came out below the true market.
+        Never accept "metadata says today but bars stop yesterday".
+
+        Contract for callers: pass a *trading-session* date as `end`. This check is
+        deliberately calendar-free (the market clock is owned elsewhere), so it tolerates
+        the one unambiguous non-session case it can detect without a holiday calendar: an
+        `end` falling on a Saturday/Sunday is treated as covered once bars reach the
+        preceding Friday -- otherwise every weekend run would look uncovered forever and
+        re-fetch pointlessly. Weekday exchange holidays are NOT inferred: if a caller passes
+        a weekday holiday as `end`, the bars legitimately stop on the prior session and this
+        method reports "uncovered", costing one redundant upstream fetch. That is a
+        deliberate fail-safe trade -- a redundant fetch is cheap, a stale mark-to-market is
+        not.
+
+        An `end` in the future (beyond today) is never judged by the bar layer: no provider
+        could have a bar for a date that has not happened yet.
+
+        The 2026-10-22 staleness defect historically existed in a second, independent
+        implementation (`common/data.py::_cache_covers_requested_end`); that helper had
+        zero production callers and was removed as dead code on 2026-10-22, so this
+        method is now the only freshness gate. If a non-DuckDB disk cache is ever added,
+        port the rule FROM HERE, not from a remembered copy.
         """
         if isinstance(now, str) and (is_intraday_interval(now) or now in ("1d", "daily")):
             interval = now
@@ -487,18 +528,37 @@ class DuckDBCache:
         if not (start_covered and end_covered):
             return False
 
-        # Verify bars exist in the table
+        # Layer 2 (2026-10-22 incident -- see docstring): metadata freshness is NOT proof that a
+        # bar for the requested end date actually landed in the table. Read the last bar at or
+        # before `req_end_date` and require it to reach `req_end_date`. A NULL result also means
+        # the symbol has no bars at all in/ before this range -- this replaces the old
+        # `count(*) > 0` check, which reported "covered" even for a symbol whose only bars sat
+        # entirely outside the requested range.
         con = self._get_connection(read_only=True)
         try:
-            count = con.execute(
-                "SELECT count(*) FROM ohlcv_bars WHERE provider = ? AND symbol = ?",
-                [provider, symbol],
-            ).fetchone()[0]
+            max_row = con.execute(
+                "SELECT MAX(date) FROM ohlcv_bars WHERE provider = ? AND symbol = ? AND date <= ?",
+                [provider, symbol, req_end_date],
+            ).fetchone()
         finally:
             if not self.is_memory:
                 con.close()
 
-        return count > 0
+        max_bar_date = max_row[0] if max_row else None
+        if max_bar_date is None:
+            return False
+        if isinstance(max_bar_date, (pd.Timestamp, datetime.datetime)):
+            max_bar_date = max_bar_date.date()
+
+        if max_bar_date < req_end_date and req_end_date <= current_date:
+            # Weekend tolerance: a Saturday/Sunday `end` can never have a bar, so "bars reach the
+            # preceding Friday" counts as covered. Without it every weekend run would look
+            # uncovered forever and re-fetch the same data pointlessly. Weekday exchange
+            # holidays are intentionally NOT inferred (see the docstring's caller contract).
+            if req_end_date.weekday() < 5:
+                return False
+
+        return True
 
     def store_intraday_bars(
         self,
@@ -619,7 +679,14 @@ class DuckDBCache:
         sync_time: Optional[datetime.datetime] = None,
         interval: str = "1d",
     ) -> None:
-        """Upserts daily OHLCV bars into ohlcv_bars and updates asset_sync_metadata."""
+        """Upserts daily OHLCV bars into ohlcv_bars and updates asset_sync_metadata.
+
+        Metadata is updated with a MONOTONIC upsert (see the long comment at the write site):
+        `earliest_available_date` can only move earlier, `latest_available_date` only later, and
+        `is_earliest_known` becomes True at most once (never reverts). Storing a window that
+        starts later than the known history therefore leaves the recorded earliest date intact --
+        "we did not look earlier" is not "it is not there" (2026-10-22 downgrade incident).
+        """
         if is_intraday_interval(interval):
             return self.store_intraday_bars(
                 provider,
@@ -643,26 +710,8 @@ class DuckDBCache:
         for col in ["Open", "High", "Low", "Close"]:
             df_to_store[col] = df[col]
         df_to_store["Volume"] = df["Volume"] if "Volume" in df.columns else 0.0
-        min_date = df_to_store.index.min().date()
-        max_date = df_to_store.index.max().date()
-
-        # Update metadata state
-        meta = self.get_asset_metadata(provider, symbol)
-        if meta:
-            earliest_avail = min(meta["earliest_available_date"], min_date)
-            latest_avail = max(meta["latest_available_date"], max_date)
-            is_earliest_known = meta["is_earliest_known"]
-        else:
-            earliest_avail = min_date
-            latest_avail = max_date
-            is_earliest_known = False
-
-        # If user requested earlier than returned min_date - 7 days, provider has no earlier data
-        if requested_start:
-            req_start_date = pd.to_datetime(requested_start).date()
-            if req_start_date < min_date - datetime.timedelta(days=7):
-                earliest_avail = min_date
-                is_earliest_known = True
+        frame_min_date = df_to_store.index.min().date()
+        frame_max_date = df_to_store.index.max().date()
 
         sync_ts = sync_time if sync_time is not None else datetime.datetime.now()
 
@@ -686,10 +735,95 @@ class DuckDBCache:
                 SELECT provider, symbol, date, open, high, low, close, volume
                 FROM temp_bars_to_insert
             """)
+
+            # ------------------------------------------------------------------------------
+            # MONOTONIC `asset_sync_metadata` upsert (fix for the 2026-10-22 downgrade)
+            #
+            # 2026-10-22 21:34:31 incident: a real Fuyao sync that started fetching at
+            # 2024-01-02 rewrote `earliest_available_date` to 2024-01-02 for six symbols whose
+            # `ohlcv_bars` still begin in 2017-01-18 / 2020-11-30 / 2021-08-20, and cleared
+            # `is_earliest_known` on 601728.SH (True -> False). The metadata then contradicted
+            # the data it describes, and anything deriving a backtestable range from
+            # `earliest_available_date` silently truncated ~7 years of history. Every sync from
+            # a later start date damaged the field further.
+            #
+            # The invariant enforced below is directional on purpose:
+            #   * earliest_available_date: MIN(existing, incoming) -- NEVER GREATEST. "We did not
+            #     look earlier" is NOT "it isn't there": a sync beginning at 2024-01-02 has
+            #     learned nothing about 2017 and must not overwrite that knowledge. Only a sync
+            #     that genuinely reaches further back may move it (MIN still allows that).
+            #   * is_earliest_known: monotonic True -- `existing OR incoming`, so a sync that
+            #     says False can never erase a previously confirmed True (only a human/explicit
+            #     UPDATE may reset it).
+            #   * latest_available_date: MAX(existing, incoming) -- a stale fetch must not roll
+            #     the recorded latest date backwards.
+            #   * last_sync_time: overwritten freely; it records the last *attempt*, not a fact
+            #     about the data.
+            # This replaces a blind `INSERT OR REPLACE INTO asset_sync_metadata VALUES (...)`.
+            # The Python-level candidates below are also monotone, but the SQL LEAST/GREATEST/OR
+            # is what actually makes the contract atomic (wrong-by-construction incoming values,
+            # or a concurrent writer, can no longer damage it). COALESCE keeps the NULL cases
+            # well-defined (existing NULL -> incoming, incoming NULL -> existing, both NULL ->
+            # NULL) even though the columns are currently NOT NULL.
+            # ------------------------------------------------------------------------------
+            prior = con.execute(
+                "SELECT earliest_available_date, is_earliest_known, latest_available_date "
+                "FROM asset_sync_metadata WHERE provider = ? AND symbol = ?",
+                [provider, symbol],
+            ).fetchone()
+            bars_span = con.execute(
+                "SELECT MIN(date), MAX(date) FROM ohlcv_bars WHERE provider = ? AND symbol = ?",
+                [provider, symbol],
+            ).fetchone()
+            bars_min_date, bars_max_date = bars_span if bars_span else (None, None)
+
+            prior_earliest = prior[0] if prior else None
+            prior_earliest_known = bool(prior[1]) if prior else False
+            prior_latest = prior[2] if prior else None
+
+            # Prior metadata, the bars actually on disk, and this frame are all evidence of what
+            # is available. Cross-checking the bars table matters because metadata can legitimately
+            # be missing (legacy imports, interrupted syncs) while the bars are present -- falling
+            # back to the frame alone is exactly how 2017-era history got "forgotten".
+            known_dates = [d for d in (prior_earliest, bars_min_date, frame_min_date) if d is not None]
+            earliest_candidate = min(known_dates)
+            known_latest_dates = [d for d in (prior_latest, bars_max_date, frame_max_date) if d is not None]
+            latest_candidate = max(known_latest_dates)
+
+            # Asking for a start strictly earlier than everything we already know, and getting
+            # nothing older back, is the ONLY evidence that the earliest date really is the first
+            # bar. It is measured against the earliest KNOWN date (not this frame's first row):
+            # a request starting 2024-01-02 must not be able to claim "earliest known = 2024".
+            probed_before_earliest = False
+            if requested_start:
+                req_start_date = pd.to_datetime(requested_start).date()
+                probed_before_earliest = req_start_date < earliest_candidate - datetime.timedelta(days=7)
+            is_earliest_known_candidate = prior_earliest_known or probed_before_earliest
+
             con.execute("""
-                INSERT OR REPLACE INTO asset_sync_metadata
+                INSERT INTO asset_sync_metadata AS existing
+                    (provider, symbol, earliest_available_date, is_earliest_known,
+                     latest_available_date, last_sync_time)
                 VALUES (?, ?, ?, ?, ?, ?)
-            """, [provider, symbol, earliest_avail, is_earliest_known, latest_avail, sync_ts])
+                ON CONFLICT (provider, symbol) DO UPDATE SET
+                    earliest_available_date = LEAST(
+                        COALESCE(existing.earliest_available_date, excluded.earliest_available_date),
+                        COALESCE(excluded.earliest_available_date, existing.earliest_available_date)
+                    ),
+                    is_earliest_known = existing.is_earliest_known OR excluded.is_earliest_known,
+                    latest_available_date = GREATEST(
+                        COALESCE(existing.latest_available_date, excluded.latest_available_date),
+                        COALESCE(excluded.latest_available_date, existing.latest_available_date)
+                    ),
+                    last_sync_time = excluded.last_sync_time
+            """, [
+                provider,
+                symbol,
+                earliest_candidate,
+                is_earliest_known_candidate,
+                latest_candidate,
+                sync_ts,
+            ])
         finally:
             if not self.is_memory:
                 con.close()
