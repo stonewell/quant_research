@@ -23,7 +23,6 @@ from common.data import (
     CachedDataProvider,
     SyntheticDataProvider,
     YFinanceDataProvider,
-    _cache_covers_requested_end,
     _drop_invalid_ohlcv_rows,
     fetch_fund_metadata,
     get_data_provider,
@@ -546,23 +545,44 @@ def test_cached_data_provider_never_expires(temp_csv_dir):
     assert calls["n"] == 1
 
 
-def test_cache_covers_requested_end_helper():
-    now = pd.Timestamp("2026-09-02")
+def test_cached_data_provider_refetches_when_cached_bars_stop_before_requested_end(temp_csv_dir):
+    """2026-10-22 REGRESSION, provider level: `CachedDataProvider.fetch_ohlcv` trusted
+    `is_range_covered` for a request whose `end` was only ONE session past the last cached bar
+    (the 7-day metadata tolerance said "covered"), so a pre-publication fetch was served stale
+    forever -- exactly the six symbols of the incident. `is_range_covered`'s bar layer now
+    forces a re-fetch, and `fetch_ohlcv` must propagate that (it is the single choke point
+    Stage-1 and Stage-2 both read through).
+    """
+    calls = {"n": 0}
 
-    # end already elapsed, cached data reaches it (within weekend/holiday tolerance) -> covers.
-    df = pd.DataFrame({"Close": [1.0]}, index=pd.DatetimeIndex(["2020-01-08"]))
-    assert _cache_covers_requested_end(df, "2020-01-10", now=now) is True
+    class CountingProvider(BaseDataProvider):
+        def fetch_ohlcv(self, symbol, start, end, interval="1d"):
+            calls["n"] += 1
+            dates = pd.bdate_range(start, end)
+            return pd.DataFrame(
+                {"Open": [10.0] * len(dates), "High": [12.0] * len(dates), "Low": [9.0] * len(dates), "Close": [11.0] * len(dates), "Volume": [100.0] * len(dates)},
+                index=dates,
+            )
 
-    # end already elapsed, cached data falls well short -> does NOT cover.
-    df = pd.DataFrame({"Close": [1.0]}, index=pd.DatetimeIndex(["2020-01-02"]))
-    assert _cache_covers_requested_end(df, "2020-01-10", now=now) is False
+    cached_provider = CachedDataProvider(CountingProvider(), cache_dir=temp_csv_dir)
 
-    # end still in the future relative to `now` -> trivially covers (nothing more to fetch yet).
-    df = pd.DataFrame({"Close": [1.0]}, index=pd.DatetimeIndex(["2020-01-02"]))
-    assert _cache_covers_requested_end(df, "2099-01-01", now=now) is True
+    # Cache populated through 2024-01-02 only: the fetch ran before the 01-03 bar was published,
+    # and `store_bars` stamped `last_sync_time` with "now" -- i.e. metadata looks perfectly fresh.
+    short_df = pd.DataFrame(
+        {"Open": [10.0] * 2, "High": [12.0] * 2, "Low": [9.0] * 2, "Close": [11.0] * 2, "Volume": [100.0] * 2},
+        index=pd.bdate_range("2024-01-01", periods=2),
+    )
+    cached_provider.duckdb_cache.store_bars("CountingProvider", "SPY", short_df)
 
-    # empty cached data, end already elapsed -> does NOT cover.
-    assert _cache_covers_requested_end(pd.DataFrame(), "2020-01-10", now=now) is False
+    # Pre-fix this returned True (1-day gap <= 7-day tolerance + count(*) > 0) => stale served.
+    assert cached_provider.duckdb_cache.is_range_covered(
+        "CountingProvider", "SPY", start="2024-01-01", end="2024-01-03"
+    ) is False
+
+    df = cached_provider.fetch_ohlcv("SPY", start="2024-01-01", end="2024-01-03")
+
+    assert calls["n"] == 1  # re-fetched instead of silently serving the 01-02 close
+    assert df.index[-1] == pd.Timestamp("2024-01-03")
 
 
 def test_cached_data_provider_refetches_when_cache_falls_short_of_elapsed_end(temp_csv_dir):

@@ -1,5 +1,5 @@
-"""Shared historical OHLCV data loading with extensible data provider interface and
-local CSV caching, used across every project in this workspace.
+"""Shared historical OHLCV data loading with an extensible data provider interface and
+DuckDB disk caching, used across every project in this workspace.
 """
 
 from abc import ABC, abstractmethod
@@ -10,7 +10,6 @@ import importlib.util
 import os
 import re
 import sys
-import time
 from typing import Dict, List, Optional, Type, Union
 import warnings
 
@@ -52,11 +51,12 @@ class FundamentalMetrics:
 
 
 # Real ticker symbols (equities, ETFs, indices, FX pairs) are drawn from a
-# small, well-known alphabet. Both CSVFolderDataProvider and
-# CachedDataProvider interpolate `symbol` directly into a filesystem path
-# (e.g. f"{symbol}.csv") -- without this allow-list, a `symbol` containing
-# path separators/traversal (e.g. "../../evil") could escape the intended
-# folder entirely.
+# small, well-known alphabet. CSVFolderDataProvider interpolates `symbol`
+# directly into a filesystem path (e.g. f"{symbol}.csv") -- without this
+# allow-list, a `symbol` containing path separators/traversal (e.g.
+# "../../evil") could escape the intended folder entirely. CachedDataProvider
+# applies the same check as a defense-in-depth boundary on the symbols it
+# stores and returns.
 _SAFE_SYMBOL_RE = re.compile(r"^[A-Za-z0-9_.\-^=]+$")
 
 
@@ -639,30 +639,6 @@ def _drop_invalid_ohlcv_rows(df: pd.DataFrame, symbol: str = None) -> pd.DataFra
     return df
 
 
-def _is_valid_cached_ohlcv(df: pd.DataFrame) -> bool:
-    """Sanity-checks a CSV read back from CachedDataProvider's disk cache:
-    non-empty, has the expected OHLCV columns, and a real DatetimeIndex."""
-    if df.empty:
-        return False
-    if not all(col in df.columns for col in _REQUIRED_OHLCV_COLUMNS):
-        return False
-    if not isinstance(df.index, pd.DatetimeIndex):
-        return False
-    return True
-
-
-def _cache_covers_requested_end(df: pd.DataFrame, end: str, now: Optional[pd.Timestamp] = None) -> bool:
-    """A cached file is only trustworthy for a requested `end` that has already elapsed -- if
-    `end` is still in the future, the provider legitimately couldn't have more data for it yet,
-    so a short cache is correct, not stale. `now` is injectable for deterministic tests."""
-    end_ts = pd.Timestamp(end)
-    if end_ts > (now if now is not None else pd.Timestamp.now()).normalize():
-        return True
-    if df.empty:
-        return False
-    return (end_ts - df.index[-1]) <= pd.Timedelta(days=7)  # weekend/holiday tolerance
-
-
 class CachedDataProvider(BaseDataProvider):
     """Wrapper provider that adds DuckDB disk caching around any inner BaseDataProvider.
 
@@ -689,6 +665,14 @@ class CachedDataProvider(BaseDataProvider):
         provider_name = type(self.inner_provider).__name__
 
         # 1. Fast cache hit check: is [start, end] covered in DuckDB?
+        # (2026-10-22 incident) This gate is the single choke point through which every
+        # freshness defect in `DuckDBCache.is_range_covered` reaches ALL consumers -- Stage-1
+        # (`load_universe`) and Stage-2 both read through `CachedDataProvider`, which is why
+        # they showed identical stale prices (one poisoned cache read twice, not two
+        # independent errors). `is_range_covered` requires the stored bars to actually
+        # reach `end` (bar layer), and it is now the ONLY freshness gate: the CSV disk cache
+        # this provider once kept (and its lenient 7-day-tolerance helper) is gone, so there
+        # is no second lenient path left to keep in sync.
         if self.duckdb_cache.is_range_covered(provider_name, symbol, start=start, end=end, interval=interval):
             df = self.duckdb_cache.query_bars(provider_name, symbol, start=start, end=end, interval=interval)
             if not df.empty:
