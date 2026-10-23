@@ -109,6 +109,16 @@ from common.universe import (
 )
 from pipeline.live_signal.lsig.signal import as_of_universe, latest_rebalance_rows
 
+
+# (2026-10-22 incident, Fix 2) Freshness policy -- bar-date-vs-expected-session
+# comparison and the strict/allow-stale decision -- has exactly ONE owner:
+# `common/freshness.py`. Do NOT re-implement `df.index[-1].date() != as_of_date`
+# anywhere in this file; two drifting freshness checks is the same class of bug
+# the incident was. The re-export below keeps `scripts.run_live_strategy.StalePriceError`
+# working for callers/tests that already reference it here.
+from common.freshness import StalePriceError, is_stale_bar, last_bar_session, latest_close
+
+
 try:
     from pipeline.research.blend.blend_base import _get_symbol_sector
 except ImportError:
@@ -465,6 +475,17 @@ def resolve_exit_cooldown(
     Reads last_exit_date from account_state (or historical run folders), and uses
     check_missing_trading_days from common.financial_api to determine elapsed trading days
     in the open-closed interval (last_exit_date, as_of_date].
+
+    Archive-scan anchoring caveat (2026-10-22 review finding): when reconstructing
+    last_exit_date from historical live_trading_ticket.csv files, a row anchors an
+    exit if action == "SELL" OR target_weight == 0.0 -- with ONE deliberate
+    exception: CANCEL_PENDING rows never anchor, because they record a cancelled
+    PENDING_ENTRY for a symbol that was never held (its target went to 0.0 before
+    any position existed). The target_weight == 0.0 leg is retained on purpose for
+    every other action (e.g. HOLD_FILTERED); narrowing it to action == "SELL" is a
+    separate, undecided semantics question (development_plan.md L2.21). The
+    companion reader resolve_holding_bars classifies by holdings/entry columns and
+    is NOT affected by this heuristic.
     """
     as_of_d = pd.Timestamp(as_of_date).date() if as_of_date else date.today()
     account_state = account_state or {}
@@ -502,7 +523,14 @@ def resolve_exit_cooldown(
                             if not row.empty:
                                 act = str(row.iloc[0].get("action", ""))
                                 tgt_w = float(row.iloc[0].get("target_weight", 0.0))
-                                if act == "SELL" or tgt_w == 0.0:
+                                # (2026-10-22 incident, review finding) CANCEL_PENDING is a RECORD row
+                                # for a symbol that was NEVER held -- its target went to 0.0 while still
+                                # in PENDING_ENTRY. Reading it as "full exit" would anchor a phantom
+                                # cooldown one day later than before this fix. Note this deliberately
+                                # keeps the pre-existing `tgt_w == 0.0` anchor for every other action
+                                # (e.g. HOLD_FILTERED): changing that is a separate, out-of-scope
+                                # semantics decision.
+                                if act == "SELL" or (tgt_w == 0.0 and act != "CANCEL_PENDING"):
                                     last_exit_dates[sym] = d
                                     break
                         except Exception:
@@ -826,6 +854,17 @@ def parse_args(args: Optional[List[str]] = None):
         default="14:15",
         help="Intraday cutoff time for Stage 2 order generation (default: 14:15, 39 5m bars)",
     )
+    parser.add_argument(
+        "--allow-stale-prices",
+        action="store_true",
+        help=(
+            "DANGEROUS EMERGENCY OVERRIDE. By default Stage 2 REFUSES to run (raises StalePriceError) "
+            "when any mark-to-market close is not the --as-of-date bar, because a stale close silently "
+            "corrupts NAV, weights and share quantities. With this flag the mismatch is downgraded to a "
+            "loud warning, the run continues, and every affected ticket row carries price_stale=true plus "
+            "a [陈旧价格] note in its reason. Intended only for non-trading-day dry runs / known provider gaps."
+        ),
+    )
     add_data_provider_cli_args(parser, default_provider="synthetic")
     parsed = parser.parse_args(args)
 
@@ -929,12 +968,22 @@ def resolve_holdings_weights_and_shares(
     universe: Dict[str, pd.DataFrame],
     portfolio_value: float,
     cash_proxy: str = "BIL",
+    as_of_date: Optional[str] = None,
+    allow_stale_prices: bool = False,
 ) -> Tuple[Dict[str, float], Dict[str, int], float, float]:
     """Resolve user-supplied holdings (either share quantities or fractional weights)
     into normalized portfolio weights and exact held share counts.
 
     Returns:
         (weights_dict, shares_dict, total_equity_val, cash_val)
+
+    (2026-10-22 incident, Fix 2) This is a mark-to-market path: `total_equity_val`
+    / `cash_val` / each holding's weight are all derived from the symbol's last
+    close. A stale last bar therefore silently rewrites the whole reference book,
+    not just one number. Every price here is resolved through
+    `common.freshness.latest_close()`, the single owner of the bar-date-vs-
+    expected-session comparison, which raises `StalePriceError` on a mismatch
+    unless `allow_stale_prices=True` (operator's `--allow-stale-prices`).
     """
     if not raw_holdings:
         return {}, {}, 0.0, portfolio_value
@@ -964,7 +1013,17 @@ def resolve_holdings_weights_and_shares(
         # Legacy weight mode: user supplied fractional weights
         for sym, w in non_cash_items.items():
             weights_dict[sym] = float(w)
-            price = float(universe[sym]["Close"].iloc[-1]) if (sym in universe and not universe[sym].empty) else 0.0
+            if sym in universe and not universe[sym].empty:
+                # Same mark-to-market concept as the order loop's price site:
+                # routed through the single freshness owner (common/freshness.py).
+                price = latest_close(
+                    universe,
+                    sym,
+                    as_of_date,
+                    strict=not allow_stale_prices,
+                )
+            else:
+                price = 0.0
             eq_val = w * portfolio_value
             total_equity_val += eq_val
             shares_dict[sym] = int(np.round(eq_val / price)) if price > 0 else 0
@@ -976,7 +1035,14 @@ def resolve_holdings_weights_and_shares(
             int_qty = int(np.round(qty))
             shares_dict[sym] = int_qty
             if sym in universe and not universe[sym].empty:
-                price = float(universe[sym]["Close"].iloc[-1])
+                # Same mark-to-market concept as the order loop's price site:
+                # routed through the single freshness owner (common/freshness.py).
+                price = latest_close(
+                    universe,
+                    sym,
+                    as_of_date,
+                    strict=not allow_stale_prices,
+                )
             else:
                 price = 0.0
                 print(f"[WARN] 无法获取标的 {sym} 的最新收盘价，持仓市值暂计为 0。")
@@ -1238,7 +1304,49 @@ def main(cli_args: Optional[List[str]] = None):
             universe = enrich_universe_with_intraday_features(
                 universe, universe_5m, config=IntradayFeatureConfig(cutoff_time=cutoff_t), synthesize_intraday_bar=True
             )
-            print(f"[INFO] 成功加载并聚合 5m 日内特征 (截断时点: {cutoff_t}, 标的数: {len(universe)})")
+            # (2026-10-22 incident, Fix 1) This line used to print
+            # "成功加载并聚合 5m 日内特征 ... 标的数: {len(universe)}" -- a SUCCESS
+            # message whose count was the DAILY symbol count. On 2026-10-22 the
+            # configured provider (FuyaoDataProvider) raises on any
+            # interval != "1d", so EVERY 5m fetch failed, the 5m universe was
+            # empty, enrich_universe_with_intraday_features early-returned an
+            # un-enriched frame, and downstream VWAP/Chan-5m fields were all
+            # None -- while this line still claimed 20 symbols of intraday
+            # microstructure had been aggregated. Report what actually arrived:
+            # count symbols with a NON-EMPTY 5m frame and the real last 5m
+            # timestamp, and say WARN + the reason when there are none.
+            n_5m_ok = sum(
+                1
+                for _s, _df in universe_5m.items()
+                if _df is not None and not _df.empty
+            )
+            if n_5m_ok == 0:
+                print(
+                    f"[WARN] 5m 日内特征不可用：{len(symbols_to_load)} 个标的的 5m 数据帧全部为空 "
+                    f"(provider={args.data_provider}, 截断时点={cutoff_t})。"
+                    "常见原因：provider does not support 5m (该数据源仅支持日线 interval='1d')。"
+                    "后续 intraday_vwap / vwap_premium_pct / chan_5m_state 等日内字段将为空值，"
+                    "Stage-2 仅按日线信号生成工单；请勿把本行理解为日内特征已生效。"
+                )
+            else:
+                _last_5m_ts = max(
+                    _df.index.max().to_pydatetime()
+                    for _df in universe_5m.values()
+                    if _df is not None and not _df.empty
+                )
+                print(
+                    f"[INFO] 5m 日内特征已聚合: 有效标的数 {n_5m_ok}/{len(symbols_to_load)} "
+                    f"(截断时点: {cutoff_t}, 最新 5m K 线: {_last_5m_ts})"
+                )
+                if n_5m_ok < len(symbols_to_load):
+                    _missing_5m = sorted(
+                        _s for _s in symbols_to_load
+                        if _s not in universe_5m or universe_5m[_s] is None or universe_5m[_s].empty
+                    )
+                    print(
+                        f"[WARN] 以下 {len(_missing_5m)} 个标的缺少 5m 数据，日内字段为空: "
+                        f"{', '.join(_missing_5m[:20])}{' ...' if len(_missing_5m) > 20 else ''}"
+                    )
         except Exception as exc:
             print(f"[WARN] Failed to load 5m intraday features in Stage 2 runner: {exc}")
 
@@ -1333,7 +1441,12 @@ def main(cli_args: Optional[List[str]] = None):
     current_shares_dict: Dict[str, int] = {}
     if raw_user_holdings is not None:
         reference_weights, current_shares_dict, total_eq_val, cash_bal_val = resolve_holdings_weights_and_shares(
-            raw_user_holdings, universe, args.portfolio_value, cash_proxy
+            raw_user_holdings,
+            universe,
+            args.portfolio_value,
+            cash_proxy,
+            as_of_date=as_of_date,
+            allow_stale_prices=bool(getattr(args, "allow_stale_prices", False)),
         )
         reference = pd.Series(reference_weights)
         reference_source = "User-Supplied Actual Live Brokerage Holdings"
@@ -1425,17 +1538,50 @@ def main(cli_args: Optional[List[str]] = None):
 
     updated_lifecycle_states: Dict[str, Any] = {}
     rows = []
+    stale_price_symbols: List[str] = []
     for sym in all_symbols:
         tgt_w = float(target_series[sym])
+        # (2026-10-22 incident, Fix 6) FREEZE the raw strategy target here, before
+        # step_position_lifecycle() overwrites `tgt_w` with
+        # `decision.target_weight`. Thrust attribution used to subtract the
+        # sub-strategy total from the POST-lifecycle target, so a symbol whose
+        # allocation came from the macro breadth-thrust bucket but whose
+        # lifecycle decision later flattened it (PENDING_ENTRY confirmation
+        # pending, inertia filter, tenure lock) showed a residual of exactly 0.0
+        # and `macro_breadth_thrust` was silently dropped from
+        # `detail_reason.dimension_signals` -- the ticket then claimed the symbol
+        # had no thrust allocation at all. This is AUDIT metadata only: every
+        # downstream share/trade computation keeps using the lifecycle-adjusted
+        # `tgt_w` exactly as before.
+        raw_tgt_w = tgt_w
         cur_w = float(current_series[sym])
         delta_w = tgt_w - cur_w
         abs_delta = abs(delta_w)
 
-        # Get latest close price
+        # Get latest close price -- and never silently accept a bar that is not
+        # the as_of_date bar (2026-10-22 incident, Fix 2: five held symbols were
+        # priced at the 2026-10-21 close with no warning). All freshness policy
+        # lives in common/freshness.py; the "no data at all" fallback stays here
+        # because a missing frame and a stale frame are different conditions.
+        price_stale = False
+        price_bar_date: Optional[str] = None
         if sym in universe and not universe[sym].empty:
-            price = float(universe[sym]["Close"].iloc[-1])
+            price = latest_close(universe, sym, as_of_date, strict=not getattr(args, "allow_stale_prices", False))
+            price_bar_date = last_bar_session(universe[sym])
+            price_stale = is_stale_bar(universe[sym], as_of_date)
+            if price_stale and sym not in stale_price_symbols:
+                stale_price_symbols.append(sym)
         else:
             price = 1.0  # Cash proxy default
+            # A non-cash symbol with no frame at all is priced at a placeholder
+            # 1.0 -- just as fabricated as a stale close, so it is flagged too
+            # (but not raised: the loader already warned / skipped it, and the
+            # cash proxy legitimately has no frame when absent from the universe).
+            if sym != cash_proxy:
+                price_stale = True
+                if sym not in stale_price_symbols:
+                    stale_price_symbols.append(sym)
+                print(f"[WARN] 标的 {sym} 无可用行情数据，价格以占位值 1.0 计; 工单该行标记 price_stale=True。")
 
         # Calculate lot-rounded shares for equities
         sym_lot = resolve_lot_size(sym, args.lot_size)
@@ -1583,7 +1729,18 @@ def main(cli_args: Optional[List[str]] = None):
             if action == "COOLDOWN_BLOCKED":
                 action = "HOLD_FILTERED"
 
-            if cur_w == 0.0 and tgt_w == 0.0 and action in ("HOLD", "COOLDOWN_BLOCKED") and not state.is_holding():
+            # (2026-10-22 incident, Fix 4a) Explicit allow-list, NOT an
+            # implicit "everything that is not HOLD". CANCEL_PENDING must never
+            # collapse into NO_POSITION: NO_POSITION rows are dropped from the
+            # ticket a few lines below, which is precisely how 601857.SH became
+            # invisible. Only a genuinely flat, never-signalled HOLD is a
+            # no-position row.
+            if (
+                cur_w == 0.0
+                and tgt_w == 0.0
+                and action in ("HOLD", "COOLDOWN_BLOCKED")
+                and not state.is_holding()
+            ):
                 action = "NO_POSITION"
 
             held_age = state.held_bars if state.is_holding() else 0
@@ -1684,7 +1841,11 @@ def main(cli_args: Optional[List[str]] = None):
         trade_val = delta_w * args.portfolio_value
         raw_shares = 0.0
         if sym != cash_proxy and price > 0:
-            if action in ("HOLD_FILTERED", "HOLD", "COOLDOWN_BLOCKED", "NO_POSITION"):
+            # (2026-10-22 incident, Fix 4b) CANCEL_PENDING is a RECORD row, not an
+            # order: it keeps the existing share count and trades nothing. Listing
+            # it explicitly (rather than letting it fall through to the trailing
+            # `else`) keeps the "no tradable instruction" guarantee self-evident.
+            if action in ("HOLD_FILTERED", "HOLD", "COOLDOWN_BLOCKED", "NO_POSITION", "CANCEL_PENDING"):
                 target_shares = current_shares
                 delta_shares = 0
                 actual_trade_val = 0.0
@@ -1814,9 +1975,32 @@ def main(cli_args: Optional[List[str]] = None):
         else:
             dim_signals = {strategy_key: round(tgt_w, 4)}
         sub_total_w = sum(dim_signals.values()) if sym in sub_strategy_weights_by_symbol else 0.0
-        macro_thrust_w = max(0.0, tgt_w - sub_total_w)
+        # (2026-10-22 incident, Fix 6) Residual thrust attribution must be measured
+        # against the PRE-lifecycle target `raw_tgt_w`, not the post-lifecycle
+        # `tgt_w`. When the lifecycle machine flattens an allocation (PENDING_ENTRY
+        # still confirming, inertia filter, tenure lock) `tgt_w` becomes 0.0, so
+        # `max(0.0, tgt_w - sub_total_w)` was always 0.0 for exactly the symbols
+        # whose thrust allocation had been suppressed -- the audit block claimed
+        # `macro_breadth_thrust` did not exist, hiding the reason the symbol was
+        # silent. `raw_tgt_w` is AUDIT-ONLY: it never enters trade_val /
+        # delta_shares / any order field (grep: the variable is read solely here
+        # and in the `thrust_attribution` audit block below).
+        # Disclosed limitation: for symbols with no sub-strategy decomposition we
+        # cannot split the residual further, so the whole raw target is attributed
+        # to the thrust bucket (pre-existing behaviour, unchanged).
+        macro_thrust_w = max(0.0, raw_tgt_w - sub_total_w)
         if macro_thrust_w > 0.001 and thrust_active:
             dim_signals["macro_breadth_thrust"] = round(macro_thrust_w, 4)
+
+        # (2026-10-22 incident, Fix 2) A stale close must be visible in the row's
+        # own text, not only in the machine-readable `price_stale` column: the
+        # printed/CSV ticket is what a human actually executes from.
+        if price_stale:
+            _stale_tag = (
+                f" [陈旧价格 PRICE_STALE: 价格K线={price_bar_date or '无行情'} != as_of={as_of_date}]"
+            )
+            if "PRICE_STALE" not in reason:
+                reason = f"{reason}{_stale_tag}"
 
         # Formulate human-readable summary reason
         summary_reason = reason
@@ -1901,6 +2085,14 @@ def main(cli_args: Optional[List[str]] = None):
             "strategy_version": strat_ver,
             "base_version": base_ver,
             "execution_warning": execution_warning,
+            # (2026-10-22 incident, Fix 2) Explicit per-row freshness mark so a
+            # stale close can never hide inside a well-formed ticket row. True
+            # either because the bar is not the as_of_date session (only possible
+            # with --allow-stale-prices, otherwise StalePriceError aborted the
+            # run) or because the symbol had no frame at all and was priced at a
+            # placeholder 1.0.
+            "price_stale": bool(price_stale),
+            "price_bar_date": price_bar_date,
             "intraday_vwap": intraday_vwap,
             "vwap_premium_pct": vwap_prem_pct,
             "chan_5m_state": chan_5m_state,
@@ -1957,6 +2149,11 @@ def main(cli_args: Optional[List[str]] = None):
         order_df.loc[cash_mask, "trade_value_rmb"] = -equity_trades_val
 
     # Sort: SELLS FIRST -> BUYS SECOND -> HOLDS; drop NO_POSITION rows (0% on both sides)
+    # (2026-10-22 incident, Fix 4) CANCEL_PENDING rows are RECORDS, not orders,
+    # and must survive this filter: a symbol whose entry confirmation was
+    # cancelled is exactly the case an operator needs to see. Dropping it (as the
+    # NO_POSITION reclassification used to) is how 601857.SH vanished from the
+    # ticket entirely.
     order_df = order_df[order_df["action"] != "NO_POSITION"]
 
     def sort_priority(act):
@@ -2025,6 +2222,34 @@ def main(cli_args: Optional[List[str]] = None):
             tenure_str = f" [持仓{h_bar}日]" if h_bar > 0 else ""
             print(f"  ⚪ HOLD {sym_col} | 维持仓位: {r['target_weight']:>5.1%} {shares_info:<10}{tenure_str} | 持仓市值: ~¥{r['target_weight']*args.portfolio_value:>9,.2f} | ({reason})")
 
+    # (2026-10-22 incident, Fix 4) PENDING_ENTRY cancellations are printed in
+    # their own block so an operator can see that a confirmation period was
+    # aborted (and how far it had progressed) WITHOUT mistaking it for an order.
+    # Deliberately outside Phase 1/2/3/4: it trades nothing.
+    cancel_pending_rows = order_df[order_df["action"] == "CANCEL_PENDING"]
+    if not cancel_pending_rows.empty:
+        print("\n[PHASE 3b: PENDING ENTRY CANCELLED (第三阶段附: 待确认开仓信号消失 — 仅记录, 非交易指令)]")
+        for _, r in cancel_pending_rows.iterrows():
+            sym_col = pad_east_asian(f"{r['symbol']} ({r['name']})", 24)
+            lost_streak = (r.get("detail_reason") or {}).get("lifecycle_decision", {}).get("cancelled_entry_streak", 0) \
+                if isinstance(r.get("detail_reason"), dict) else 0
+            print(
+                f"  ⛔ CANCEL_PENDING {sym_col} | 目标仓位已归零 (0.0%), 取消的确认进度: {lost_streak} 日 | "
+                f"无买卖指令, 仅登记状态变化 | ({r.get('reason', '')})"
+            )
+
+    # (2026-10-22 incident, Fix 2) End-of-ticket staleness banner: impossible to
+    # miss even for an operator who only reads the last screen of output.
+    if stale_price_symbols:
+        print("\n" + "!" * 110)
+        print(
+            f"[STALE PRICE WARNING / 陈旧价格警告] 以下 {len(stale_price_symbols)} 个标的的价格不是 as_of_date="
+            f"{as_of_date} 的收盘价（工单行已标记 price_stale=true）:"
+        )
+        print(f"    {', '.join(stale_price_symbols)}")
+        print("  下单前必须人工核对这些标的最新价；NAV / 权重 / 股数均基于该过期价格计算。")
+        print("!" * 110)
+
     if not cash_rows.empty:
         print("\n[PHASE 4: CASH PROXY & LIQUIDITY MANAGEMENT (第四阶段: 闲置资金对账)]")
         for _, r in cash_rows.iterrows():
@@ -2049,6 +2274,37 @@ def main(cli_args: Optional[List[str]] = None):
             dual_zero_target_streak[s] = st_obj.exit_streak
         if st_obj.entry_price > 0:
             dual_entry_prices[s] = st_obj.entry_price
+
+    # (2026-10-22 incident, Fix 5) A streak RESET used to be invisible: the dict
+    # above only ever writes entries whose streak is > 0, so a symbol that fell
+    # from 2 back to 0 simply LOST its key. `account_state.json` then read as if
+    # that symbol had never been queued at all (601857.SH's 1/2 confirmation was
+    # unreadable the next day), and no log line recorded the loss. We now (a)
+    # persist an EXPLICIT 0 for any symbol that was queued on entry and is no
+    # longer, and (b) log the transition with the value it lost -- so a cancelled
+    # or abandoned confirmation is permanently auditable.
+    # Backward compatibility: the on-disk schema is unchanged (a symbol -> int
+    # dict). Legacy sparse files keep working, because every reader uses
+    # `.get(sym, 0) > 0` semantics; nothing interprets a present key as "queued".
+    prior_entry_streaks = entry_signal_streak or {}
+    for s_prev, v_prev in prior_entry_streaks.items():
+        try:
+            prev_streak = int(v_prev or 0)
+        except (TypeError, ValueError):
+            continue
+        if prev_streak <= 0:
+            continue
+        st_now = updated_lifecycle_states.get(s_prev)
+        if st_now is None:
+            continue
+        try:
+            now_streak = int(st_now.get("entry_streak", 0) or 0)
+        except (TypeError, ValueError):
+            now_streak = 0
+        if now_streak > 0:
+            continue
+        dual_entry_signal_streak[s_prev] = 0
+        print(f"[INFO] entry_signal_streak reset: {s_prev} (was {prev_streak})")
 
     for _, r in order_df.iterrows():
         sym = r["symbol"]
