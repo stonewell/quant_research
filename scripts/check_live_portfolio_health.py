@@ -84,6 +84,20 @@ DEFAULT_UNIVERSE_FILE = os.path.join(_REPO_ROOT, "docs", "universe", "china", "c
 DEFAULT_OUTPUT_DIR = os.path.join(_REPO_ROOT, "docs", "ruleset", "chan_four_state_blend")
 
 
+def _fmt_metric(value: Any, spec: str, na: str = "N/A") -> str:
+    """Format a possibly-None metric for the dashboard, rendering N/A when unmeasured.
+
+    (2026-10-22 incident, Fix 1) Unavailable intraday features must render as
+    "N/A", never as a number a human could mistake for a measurement.
+    """
+    if value is None:
+        return na
+    try:
+        return format(value, spec)
+    except (TypeError, ValueError):
+        return na
+
+
 def parse_args(args: Optional[List[str]] = None):
     parser = argparse.ArgumentParser(
         description="Stage 1 Live Deployment Runner: Portfolio Health & Macro Regime Inspection"
@@ -587,6 +601,29 @@ def resolve_gate_directive(
         actions.append(f"Scale equity exposure to {dd_info['linear_equity_scale']:.1%} of standard model weights.")
         actions.append("Sweep released capital into Cash Proxy; execute SELLS FIRST.")
     else:
+        # (2026-10-22 incident, Fix 1) An intraday gate that could NOT be
+        # evaluated must say so out loud. Previously the health script fed
+        # NaN-substituted defaults (breadth 1.0) into this branch, which looked
+        # like a comfortably-passing gate. Neither the alert branch nor a "pass"
+        # claim is emitted now: the gate is explicitly SKIPPED/UNKNOWN.
+        if intraday_5m_info and intraday_5m_info.get("intraday_features_available") is False:
+            actions.append(
+                "⚠️ Intraday distribution gate SKIPPED / UNKNOWN — 5m 日内特征不可用"
+                f"（{intraday_5m_info.get('unavailable_reason', 'no measured intraday features')}）。"
+                "该门禁既未通过也未触发；未测得数据不会被当作 PASS，也不会缩放买入预算。"
+            )
+        elif intraday_5m_info and intraday_5m_info.get("distribution_gate_status") == "UNKNOWN":
+            # Partially-measured case (2026-10-22 live-path hardening): some
+            # symbols carry a VWAP premium but too few carry every component for
+            # the aggregate to be judged. Silence here would read as "no
+            # distribution detected", so state the uncertainty explicitly.
+            actions.append(
+                "⚠️ Intraday distribution gate UNKNOWN — 日内特征仅部分测得，"
+                f"聚合指标无法判定（已测得标的 {intraday_5m_info.get('symbols_measured', 0)} 个，"
+                f"缺失 {len(intraday_5m_info.get('symbols_missing_features') or [])} 个，"
+                f"截断时点 {intraday_5m_info.get('cutoff_time', 'N/A')}）。"
+                "该门禁未通过也未触发，不会被当作 PASS，也不会缩放买入预算。"
+            )
         # Evaluate intraday afternoon distribution and trough alerts
         if intraday_5m_info and intraday_5m_info.get("distribution_alert"):
             code = "CAUTION_INTRADAY_DISTRIBUTION"
@@ -596,7 +633,7 @@ def resolve_gate_directive(
         elif intraday_5m_info and intraday_5m_info.get("trough_alert"):
             code = "CAUTION_INTRADAY_TROUGH"
             headline = "🟡 CAUTION: INTRADAY NAV FLASH DRAWDOWN DETECTED"
-            dd_tr = intraday_5m_info.get("dd_trough", 0.0)
+            dd_tr = intraday_5m_info.get("dd_trough") or 0.0
             actions.append(f"Intraday mark-to-market trough drawdown reached {abs(dd_tr):.1%}, exceeding tactical defense line.")
             actions.append("Diagnostic warning only (R5 backtest parity): monitoring intraday volatility without forced tier escalation.")
         else:
@@ -687,9 +724,25 @@ def print_dashboard(
 
     if intraday_5m_info and intraday_5m_info.get("enabled"):
         print("\n[4. 5-MINUTE INTRADAY MICROSTRUCTURE & MARK-TO-MARKET (14:00)]")
-        print(f"  Intraday VWAP Breadth : {intraday_5m_info['intraday_vwap_breadth']:>6.1%} (Threshold: 25.0%)")
-        print(f"  Afternoon Return Mean : {intraday_5m_info['afternoon_return_mean']:>+6.2%} (Breakdown Ratio: {intraday_5m_info['afternoon_vwap_breakdown_ratio']:.1%})")
-        print(f"  Intraday Trough DD    : {intraday_5m_info['dd_trough']:>11.2%} (Intraday Peak: ¥{intraday_5m_info['hwm_intra']:,.2f})")
+        # (2026-10-22 incident, Fix 1) Render UNMEASURED metrics as N/A. The old
+        # dashboard printed fabricate-looking numbers (breadth 100.0%) computed
+        # from NaN-substituted constants on a run whose 5m frame was empty.
+        if intraday_5m_info.get("intraday_features_available") is False:
+            print(f"  ⚠️ 状态               : SKIPPED / UNKNOWN — 5m 日内特征不可用 (不影响日线门禁)")
+            print(f"  原因 (Reason)         : {intraday_5m_info.get('unavailable_reason', 'N/A')}")
+        print(
+            f"  Intraday VWAP Breadth : {_fmt_metric(intraday_5m_info.get('intraday_vwap_breadth'), '>6.1%'):>6} "
+            "(Threshold: 25.0%)"
+        )
+        print(
+            f"  Afternoon Return Mean : {_fmt_metric(intraday_5m_info.get('afternoon_return_mean'), '>+6.2%'):>6} "
+            f"(Breakdown Ratio: {_fmt_metric(intraday_5m_info.get('afternoon_vwap_breakdown_ratio'), '.1%')})"
+        )
+        print(
+            f"  Intraday Trough DD    : {_fmt_metric(intraday_5m_info.get('dd_trough'), '>11.2%'):>11} "
+            f"(Intraday Peak: {_fmt_metric(intraday_5m_info.get('hwm_intra'), ',.2f')})"
+        )
+        print(f"  Distribution Gate     : {intraday_5m_info.get('distribution_gate_status', 'EVALUATED')}")
         if intraday_5m_info.get("distribution_alert"):
             print("  ⚠️ ALERT              : Afternoon Distribution detected! Stage 2 BUY budget halved (intraday_buy_scale=0.5).")
         if intraday_5m_info.get("trough_alert"):
@@ -703,6 +756,47 @@ def print_dashboard(
     for i, act in enumerate(actions, start=1):
         print(f"  {i}. {act}")
     print("=" * 110)
+
+
+def coarse_directive(gate_code: Optional[str]) -> str:
+    """Map the granular Stage-1 `gate_code` onto the 3-value operator directive.
+
+    (2026-10-22 live-path hardening, FIX 1 reconciliation) Stage 1 has ALWAYS
+    emitted granular gate codes -- `GO`, `CAUTION_DAMPING`, `CAUTION_DEFENSIVE`,
+    `CAUTION_RECOVERING`, `CAUTION_INTRADAY_DISTRIBUTION`,
+    `CAUTION_INTRADAY_TROUGH`, `NO_GO_EMERGENCY` -- while every downstream
+    consumer (`web/livetrading/execution_service.py`, `storage.py`,
+    `static/js/app.js`, and the web tests) speaks a strict 3-value enum
+    `GO` / `CAUTION` / `NO_GO`. The two only ever agreed because, before this
+    fix, the intraday branch was unreachable: NaN-substituted defaults made
+    `intraday_vwap_breadth` come out as 1.0, so no intraday caution could fire.
+    Restoring honest intraday measurement made `CAUTION_INTRADAY_DISTRIBUTION`
+    reachable for the first time and the mismatch surfaced as a hard contract
+    break (the web test rejected the value, and `app.js` would have rendered it
+    as the RED "NO-GO / 严禁开仓" badge -- the most alarming possible display for
+    a 50%-buy-scale caution).
+
+    Resolution: the producer now OWNS the coarse field instead of making the
+    consumer guess. `directive` is the 3-value enum; `gate_code` keeps full
+    granularity, so an operator can still tell "genuinely CAUTION because
+    measured afternoon distribution" from "CAUTION because the drawdown tier is
+    damping". Unavailability never reaches a CAUTION code at all: FIX 1 sets
+    `distribution_alert=None` and emits a separate SKIPPED/UNKNOWN action line,
+    so `intraday_features_available` / `distribution_gate_status` remain the
+    authoritative "did this gate actually run?" signals.
+
+    Unknown codes fail SAFE toward `CAUTION` (never `GO`, never a fabricated
+    `NO_GO`): a code this mapping does not recognise is not evidence that risk
+    is normal.
+    """
+    code = (gate_code or "").strip().upper()
+    if code.startswith("NO_GO"):
+        return "NO_GO"
+    if code.startswith("CAUTION"):
+        return "CAUTION"
+    if code.startswith("GO"):
+        return "GO"
+    return "CAUTION"
 
 
 def generate_reports(
@@ -728,11 +822,27 @@ def generate_reports(
         "strategy_version": strategy_info.get("strategy_version", "1.0.0"),
         "base_version": strategy_info.get("base_version"),
         "version_info": strategy_info.get("version_info"),
+        # (2026-10-22 live-path hardening, FIX 1 reconciliation) `directive` is
+        # the coarse 3-value enum every web/API consumer and the operator UI
+        # speaks; `gate_code` retains the granular cause. Do NOT collapse these
+        # into one field: the coarse enum drives the banner colour, the granular
+        # code drives the explanation (see `coarse_directive` docstring).
+        "directive": coarse_directive(gate_code),
         "gate_code": gate_code,
         "gate_headline": gate_headline,
         "portfolio_health": dd_info,
         "market_macro": macro_info,
         "volatility_targeting": vol_info,
+        # (2026-10-22 incident, Fix 1) SCHEMA CHANGE, disclosed: when the intraday
+        # block is enabled, `intraday_5m_metrics` now carries
+        # `intraday_features_available` (bool) and `distribution_gate_status`
+        # ("EVALUATED" | "UNKNOWN" | "SKIPPED"), and every unmeasured metric is
+        # JSON `null` instead of a fabricated 1.0/0.0. Consumers must treat null
+        # as UNKNOWN, never as a passing value. Top-level mirror added for
+        # consumers that do not read the nested block.
+        "intraday_features_available": (
+            intraday_5m_info.get("intraday_features_available") if intraday_5m_info else None
+        ),
         "intraday_5m_metrics": intraday_5m_info,
         "trader_actions": actions,
     }
@@ -794,10 +904,36 @@ def generate_reports(
 - **Assessment**: {"⚠️ Elevated volatility: Rescaling portfolio equity exposure downwards." if vol_info['vol_elevated'] else "🟢 Realized market variance within standard bounds."}
 
 ---
-
-## 4. Mandatory Human Trader Actions (Stage 2 Execution)
-
 """
+    # (2026-10-22 incident, Fix 1) Intraday metrics are rendered only when they
+    # were actually measured; otherwise the section states UNAVAILABLE and every
+    # number is `N/A`. A missing measurement must never be printed as a value.
+    if intraday_5m_info and intraday_5m_info.get("enabled"):
+        _id_avail = intraday_5m_info.get("intraday_features_available")
+        md_content += "\n## 4. 5-Minute Intraday Microstructure\n\n"
+        if _id_avail is False:
+            md_content += (
+                "> **UNAVAILABLE — gate status `SKIPPED` / `UNKNOWN` (NOT passed).**\n"
+                f"> {intraday_5m_info.get('unavailable_reason', 'no measured intraday features')}\n"
+                f"> {intraday_5m_info.get('note', '')}\n\n"
+            )
+        md_content += (
+            "| Metric | Value | Note |\n"
+            "| :--- | :--- | :--- |\n"
+            f"| **Intraday VWAP Breadth** | `{_fmt_metric(intraday_5m_info.get('intraday_vwap_breadth'), '.1%')}` | Threshold: 25.0% |\n"
+            f"| **Afternoon Return Mean** | `{_fmt_metric(intraday_5m_info.get('afternoon_return_mean'), '+.2%')}` | Since 11:30 |\n"
+            f"| **Afternoon VWAP Breakdown Ratio** | `{_fmt_metric(intraday_5m_info.get('afternoon_vwap_breakdown_ratio'), '.1%')}` | |\n"
+            f"| **Intraday Trough Drawdown** | `{_fmt_metric(intraday_5m_info.get('dd_trough'), '.2%')}` | Diagnostic only (R5) |\n"
+            f"| **Distribution Gate Status** | `{intraday_5m_info.get('distribution_gate_status', 'EVALUATED')}` | `SKIPPED`/`UNKNOWN` never means PASS |\n"
+            f"| **Intraday Buy Scale** | `{intraday_5m_info.get('intraday_buy_scale', 1.0):.2f}` | 0.50 only on a positive detection |\n\n"
+        )
+        md_content += "\n---\n"
+
+    md_content += (
+        "\n## "
+        + ("5" if (intraday_5m_info and intraday_5m_info.get("enabled")) else "4")
+        + ". Mandatory Human Trader Actions (Stage 2 Execution)\n\n"
+    )
     for i, act in enumerate(actions, start=1):
         md_content += f"{i}. {act}\n"
 
@@ -918,119 +1054,241 @@ def main(cli_args: Optional[List[str]] = None):
                 universe, universe_5m, config=IntradayFeatureConfig(cutoff_time=cutoff_t), synthesize_intraday_bar=True
             )
 
-            # Evaluate Afternoon Distribution & VWAP breadth
-            vwap_ok_count = 0
-            risky_count = 0
-            afternoon_rets = []
-            breakdown_count = 0
+            # (2026-10-22 incident, Fix 1) HONESTY GATE. This block used to
+            # substitute NaN -> defaults for every microstructure field
+            # (`VWAP_Prem_5m` -> 0.0, `UpVol_Ratio_5m` -> 0.5, `Afternoon_Ret_5m`
+            # -> 0.0) and then divide, producing `intraday_vwap_breadth = 1.0`,
+            # `afternoon_return_mean = 0.0`, `afternoon_vwap_breakdown_ratio =
+            # 0.0` on a run where the 5m frame was EMPTY (the configured provider
+            # raises on interval != "1d"). A breadth of 1.0 is a PASSING value for
+            # the distribution gate, so the gate reported success on data that
+            # did not exist. The defaults are now GONE: we first determine how
+            # many symbols actually carry a measured feature, and when none do we
+            # emit None + `intraday_features_available: false` +
+            # `distribution_gate_status: "SKIPPED"` with a logged reason.
             cash_proxy = params.get("cash_proxy", "BIL")
+            n_5m_ok = sum(
+                1
+                for _s in universe_symbols
+                if _s in universe_5m and universe_5m[_s] is not None and not universe_5m[_s].empty
+            )
+            measured_syms: List[str] = []
             for sym in universe_symbols:
                 if sym == cash_proxy or sym not in universe:
                     continue
                 df_sym = universe[sym]
-                if df_sym.empty:
+                if df_sym.empty or "VWAP_Prem_5m" not in df_sym.columns:
                     continue
-                risky_count += 1
-                row = df_sym.iloc[-1]
-                vwap_prem = float(row["VWAP_Prem_5m"]) if "VWAP_Prem_5m" in row and pd.notna(row["VWAP_Prem_5m"]) else 0.0
-                upvol = float(row["UpVol_Ratio_5m"]) if "UpVol_Ratio_5m" in row and pd.notna(row["UpVol_Ratio_5m"]) else 0.5
-                aft_ret = float(row["Afternoon_Ret_5m"]) if "Afternoon_Ret_5m" in row and pd.notna(row["Afternoon_Ret_5m"]) else 0.0
+                if pd.isna(df_sym["VWAP_Prem_5m"].iloc[-1]):
+                    continue
+                measured_syms.append(sym)
 
-                if vwap_prem >= 0.0 and upvol >= 0.50:
-                    vwap_ok_count += 1
-                afternoon_rets.append(aft_ret)
-                if vwap_prem < 0.0 and aft_ret < -0.01:
-                    breakdown_count += 1
+            if not measured_syms:
+                _unavail_reason = (
+                    f"5m 日内特征缺失: {len(universe_symbols)} 个标的中 5m 数据帧非空的仅 {n_5m_ok} 个，"
+                    "且无任何标的具备已测得的 VWAP_Prem_5m 特征 "
+                    f"(provider={args.data_provider})。常见原因: provider does not support 5m。"
+                )
+                print(f"[WARN] {_unavail_reason}")
+                print("[WARN] 日内分布门禁状态 = SKIPPED (UNKNOWN)：未测得数据不得视为 PASS，本次不会因日内跳水下调买入预算。")
+                intraday_5m_info = {
+                    "enabled": True,
+                    "available": False,
+                    "intraday_features_available": False,
+                    "cutoff_time": cutoff_t,
+                    "unavailable_reason": _unavail_reason,
+                    "note": (
+                        "5m 日内指标未测得，全部以 null 表达；distribution gate = SKIPPED (UNKNOWN), "
+                        "不是 PASS。intraday_buy_scale 保持 1.0 仅表示未施加任何缩放。"
+                    ),
+                    "symbols_5m_available": n_5m_ok,
+                    "symbols_measured": 0,
+                    "symbols_vwap_measured": 0,
+                    # Everything that should have carried a feature is, by
+                    # definition, missing one here -- named rather than silently
+                    # counted, so the operator can see the blast radius.
+                    "symbols_missing_features": [
+                        _s for _s in universe_symbols if _s != cash_proxy
+                    ],
+                    # Measured metrics: genuinely unknown -> null (never a
+                    # fabricated 1.0/0.0 that could read as "gate passed").
+                    "intraday_vwap_breadth": None,
+                    "afternoon_return_mean": None,
+                    "afternoon_vwap_breakdown_ratio": None,
+                    "distribution_alert": None,
+                    "distribution_gate_status": "SKIPPED",
+                    "trough_alert": None,
+                    "hwm_intra": None,
+                    "dd_trough": None,
+                    "intraday_buy_scale": 1.0,
+                }
+            else:
 
-            intraday_vwap_breadth = vwap_ok_count / risky_count if risky_count > 0 else 0.5
-            afternoon_ret_mean = float(np.mean(afternoon_rets)) if afternoon_rets else 0.0
-            breakdown_ratio = breakdown_count / risky_count if risky_count > 0 else 0.0
-            distribution_alert = (intraday_vwap_breadth < 0.25) or (afternoon_ret_mean < -0.012 and breakdown_ratio >= 0.50)
+                # Evaluate Afternoon Distribution & VWAP breadth (measured symbols only)
+                vwap_ok_count = 0
+                risky_count = 0
+                afternoon_rets = []
+                breakdown_count = 0
+                missing_feature_syms: List[str] = []
+                for sym in universe_symbols:
+                    if sym == cash_proxy or sym not in universe:
+                        continue
+                    df_sym = universe[sym]
+                    if df_sym.empty:
+                        continue
+                    row = df_sym.iloc[-1]
+                    if sym not in measured_syms:
+                        # Never fabricate: a symbol without a measured feature is
+                        # excluded from the breadth denominator and named in the report.
+                        missing_feature_syms.append(sym)
+                        continue
+                    has_upvol = "UpVol_Ratio_5m" in row and pd.notna(row["UpVol_Ratio_5m"])
+                    has_aft = "Afternoon_Ret_5m" in row and pd.notna(row["Afternoon_Ret_5m"])
+                    if not has_upvol:
+                        # (2026-10-22 live-path hardening, FIX 1) The breadth
+                        # NUMERATOR requires a measured up-volume ratio, so a
+                        # symbol without one can never count as a hit. Keeping it
+                        # in the DENOMINATOR would then manufacture a breadth of
+                        # 0.0 -- which is below the 25% alert line, i.e. missing
+                        # data would fabricate a genuine-looking
+                        # "afternoon distribution detected" CAUTION. Missing
+                        # data must never masquerade as a risk assessment in
+                        # EITHER direction, so such symbols leave the denominator
+                        # too and are named in `symbols_missing_features`.
+                        missing_feature_syms.append(sym)
+                        continue
+                    risky_count += 1
+                    vwap_prem = float(row["VWAP_Prem_5m"])
+                    upvol = float(row["UpVol_Ratio_5m"])
+                    aft_ret = float(row["Afternoon_Ret_5m"]) if has_aft else None
 
-            # Intraday NAV trough evaluation (R5: Diagnostic only, do NOT overwrite peak_nav)
-            hwm_intra = float(dd_info["peak_nav"])
-            dd_trough = float(dd_info["drawdown_pct"])
-            trough_alert = False
+                    # A breadth hit requires BOTH measured conditions; a missing
+                    # up-volume ratio can no longer be counted as a favourable 0.5.
+                    if vwap_prem >= 0.0 and upvol >= 0.50:
+                        vwap_ok_count += 1
+                    if aft_ret is not None:
+                        afternoon_rets.append(aft_ret)
+                    if vwap_prem < 0.0 and aft_ret is not None and aft_ret < -0.01:
+                        breakdown_count += 1
 
-            # Load holdings to calculate mark-to-market NAV
-            holdings = {}
-            if getattr(args, "current_holdings_file", None) and os.path.exists(args.current_holdings_file):
-                try:
-                    with open(args.current_holdings_file, "r", encoding="utf-8") as f:
-                        holdings_data = json.load(f)
-                    if isinstance(holdings_data, dict):
-                        holdings = holdings_data.get("holdings", holdings_data)
-                except Exception as e:
-                    print(f"[WARN] Failed to read current_holdings_file: {e}")
-            elif state.get("current_holdings"):
-                holdings = state["current_holdings"]
-            elif state.get("positions"):
-                holdings = state["positions"]
+                intraday_vwap_breadth = vwap_ok_count / risky_count if risky_count > 0 else None
+                afternoon_ret_mean = float(np.mean(afternoon_rets)) if afternoon_rets else None
+                breakdown_ratio = (breakdown_count / risky_count) if risky_count > 0 else None
+                # The alert can only be evaluated from measured values; an absent
+                # component makes the aggregate unknown rather than "no alert".
+                if intraday_vwap_breadth is None:
+                    distribution_alert = None
+                elif intraday_vwap_breadth < 0.25:
+                    distribution_alert = True
+                elif afternoon_ret_mean is not None and breakdown_ratio is not None:
+                    distribution_alert = bool(afternoon_ret_mean < -0.012 and breakdown_ratio >= 0.50)
+                else:
+                    distribution_alert = False
 
-            if holdings and universe_5m:
-                ref_ts = None
-                for sym, df_5 in universe_5m.items():
-                    if not df_5.empty and sym in holdings:
-                        ts_sub = [idx for idx in df_5.index if str(idx.date()) == as_of_date and idx.time() <= pd.Timestamp(cutoff_t).time()]
-                        if len(ts_sub) > 0:
-                            ref_ts = ts_sub
-                            break
+                # Intraday NAV trough evaluation (R5: Diagnostic only, do NOT overwrite peak_nav)
+                hwm_intra = float(dd_info["peak_nav"])
+                dd_trough = float(dd_info["drawdown_pct"])
+                trough_alert = False
 
-                if ref_ts and len(ref_ts) > 0:
-                    nav_series = []
-                    for ts_bar in ref_ts:
-                        bar_nav = 0.0
-                        total_weight = 0.0
-                        for sym, pos_val in holdings.items():
-                            shares = 0
-                            weight = 0.0
-                            if isinstance(pos_val, (int, float)):
-                                if pos_val > 1.0:
-                                    shares = pos_val
-                                else:
-                                    weight = pos_val
-                            elif isinstance(pos_val, dict):
-                                shares = pos_val.get("shares", 0)
-                                weight = pos_val.get("weight", 0.0)
+                # Load holdings to calculate mark-to-market NAV
+                holdings = {}
+                if getattr(args, "current_holdings_file", None) and os.path.exists(args.current_holdings_file):
+                    try:
+                        with open(args.current_holdings_file, "r", encoding="utf-8") as f:
+                            holdings_data = json.load(f)
+                        if isinstance(holdings_data, dict):
+                            holdings = holdings_data.get("holdings", holdings_data)
+                    except Exception as e:
+                        print(f"[WARN] Failed to read current_holdings_file: {e}")
+                elif state.get("current_holdings"):
+                    holdings = state["current_holdings"]
+                elif state.get("positions"):
+                    holdings = state["positions"]
 
-                            if sym in universe_5m and ts_bar in universe_5m[sym].index:
-                                p_close = float(universe_5m[sym].loc[ts_bar, "Close"])
-                                if shares > 0:
-                                    bar_nav += shares * p_close
-                                elif weight > 0:
-                                    bar_nav += weight * args.portfolio_value
-                                    total_weight += weight
-                            elif sym == cash_proxy:
-                                if weight > 0:
-                                    bar_nav += weight * args.portfolio_value
-                                    total_weight += weight
+                if holdings and universe_5m:
+                    ref_ts = None
+                    for sym, df_5 in universe_5m.items():
+                        if not df_5.empty and sym in holdings:
+                            ts_sub = [idx for idx in df_5.index if str(idx.date()) == as_of_date and idx.time() <= pd.Timestamp(cutoff_t).time()]
+                            if len(ts_sub) > 0:
+                                ref_ts = ts_sub
+                                break
 
-                        if bar_nav > 0:
-                            if total_weight > 0 and total_weight < 1.0:
-                                bar_nav += (1.0 - total_weight) * args.portfolio_value
-                            nav_series.append(bar_nav)
+                    if ref_ts and len(ref_ts) > 0:
+                        nav_series = []
+                        for ts_bar in ref_ts:
+                            bar_nav = 0.0
+                            total_weight = 0.0
+                            for sym, pos_val in holdings.items():
+                                shares = 0
+                                weight = 0.0
+                                if isinstance(pos_val, (int, float)):
+                                    if pos_val > 1.0:
+                                        shares = pos_val
+                                    else:
+                                        weight = pos_val
+                                elif isinstance(pos_val, dict):
+                                    shares = pos_val.get("shares", 0)
+                                    weight = pos_val.get("weight", 0.0)
 
-                    if nav_series:
-                        intra_peak = max(nav_series)
-                        intra_min = min(nav_series)
-                        hwm_intra = max(float(dd_info["peak_nav"]), intra_peak)
-                        dd_trough = (intra_min - hwm_intra) / hwm_intra if hwm_intra > 0 else 0.0
-                        dd_defensive = float(resolve_blend_param(params, "dd_defensive_thresh", 0.15, float))
-                        if abs(dd_trough) >= dd_defensive and abs(dd_info["drawdown_pct"]) < dd_defensive:
-                            trough_alert = True
+                                if sym in universe_5m and ts_bar in universe_5m[sym].index:
+                                    p_close = float(universe_5m[sym].loc[ts_bar, "Close"])
+                                    if shares > 0:
+                                        bar_nav += shares * p_close
+                                    elif weight > 0:
+                                        bar_nav += weight * args.portfolio_value
+                                        total_weight += weight
+                                elif sym == cash_proxy:
+                                    if weight > 0:
+                                        bar_nav += weight * args.portfolio_value
+                                        total_weight += weight
 
-            intraday_5m_info = {
-                "enabled": True,
-                "cutoff_time": cutoff_t,
-                "intraday_vwap_breadth": intraday_vwap_breadth,
-                "afternoon_return_mean": afternoon_ret_mean,
-                "afternoon_vwap_breakdown_ratio": breakdown_ratio,
-                "distribution_alert": distribution_alert,
-                "trough_alert": trough_alert,
-                "hwm_intra": hwm_intra,
-                "dd_trough": dd_trough,
-                "intraday_buy_scale": 0.50 if distribution_alert else 1.0,
-            }
+                            if bar_nav > 0:
+                                if total_weight > 0 and total_weight < 1.0:
+                                    bar_nav += (1.0 - total_weight) * args.portfolio_value
+                                nav_series.append(bar_nav)
+
+                        if nav_series:
+                            intra_peak = max(nav_series)
+                            intra_min = min(nav_series)
+                            hwm_intra = max(float(dd_info["peak_nav"]), intra_peak)
+                            dd_trough = (intra_min - hwm_intra) / hwm_intra if hwm_intra > 0 else 0.0
+                            dd_defensive = float(resolve_blend_param(params, "dd_defensive_thresh", 0.15, float))
+                            if abs(dd_trough) >= dd_defensive and abs(dd_info["drawdown_pct"]) < dd_defensive:
+                                trough_alert = True
+
+                intraday_5m_info = {
+                    "enabled": True,
+                    "available": True,
+                    "intraday_features_available": True,
+                    "cutoff_time": cutoff_t,
+                    "symbols_5m_available": n_5m_ok,
+                    # `symbols_measured` = symbols that actually fed the breadth
+                    # aggregate (VWAP premium AND up-volume both measured);
+                    # `symbols_vwap_measured` = symbols with a VWAP premium at
+                    # all, which is what makes the gate "available". They differ
+                    # exactly when a symbol has one feature but not the other.
+                    "symbols_measured": risky_count,
+                    "symbols_vwap_measured": len(measured_syms),
+                    "symbols_missing_features": missing_feature_syms,
+                    # An UNKNOWN alert (None) is preserved as None: it means the
+                    # aggregate could not be evaluated, which is NOT the same as
+                    # "no distribution detected".
+                    "intraday_vwap_breadth": intraday_vwap_breadth,
+                    "afternoon_return_mean": afternoon_ret_mean,
+                    "afternoon_vwap_breakdown_ratio": breakdown_ratio,
+                    "distribution_alert": distribution_alert,
+                    "distribution_gate_status": (
+                        "UNKNOWN" if distribution_alert is None else "EVALUATED"
+                    ),
+                    "trough_alert": trough_alert,
+                    "hwm_intra": hwm_intra,
+                    "dd_trough": dd_trough,
+                    # Scaling is only ever applied on a POSITIVE detection; an
+                    # unavailable/unknown gate never silently scales and never
+                    # claims to have passed.
+                    "intraday_buy_scale": 0.50 if distribution_alert else 1.0,
+                }
         except Exception as exc:
             print(f"[WARN] Failed to evaluate 5m intraday features: {exc}")
 
