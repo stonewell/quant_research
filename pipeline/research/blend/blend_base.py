@@ -23,6 +23,7 @@ Features provided across all blend strategies:
 
 from collections import defaultdict
 import copy
+import logging
 from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
@@ -40,6 +41,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from pipeline.research_strategy.rs.config import StrategyConfig
 
+
+_LOGGER = logging.getLogger(__name__)
 
 
 CHINA_EQUITY_SECTORS = {
@@ -137,7 +140,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
     and adaptive turnover filters so any blend strategy can inherit them cleanly.
     """
 
-    BASE_VERSION: str = "1.4.0"
+    BASE_VERSION: str = "1.5.0"
     version: str = "1.0.0"
 
     def __init__(
@@ -157,7 +160,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             self.config = config
         self.param_prefix = param_prefix
         self.alt_param_prefixes = alt_param_prefixes or []
-        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "1.4.0")
+        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "1.5.0")
         strat_version: str = version or getattr(self.__class__, "version", "1.0.0")
         tags = factor_tags or [
             "regime_trend_strength",
@@ -390,6 +393,19 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         date: Any,
         params: Optional[dict] = None,
         median_d: Optional[float] = None,
+        # (2026-10-22 incident) Optional hooks threaded from generate_weights:
+        # - thrust_active: hysteresis-adjusted macro thrust flag. When None the
+        #   legacy `thrust >= thrust_thresh` comparison is used unchanged.
+        # - prev_bucket_weights: previous bar's normalized style-bucket weights
+        #   used to delta-clamp renormalization (Fix 3).
+        # - bucket_renorm_max_delta: max per-bar style-bucket weight change;
+        #   None disables clamping (unchanged legacy behavior).
+        # - bucket_weights_out: mutable dict mutated in place to record this
+        #   bar's normalized bucket weights for the next iteration.
+        thrust_active: Optional[bool] = None,
+        prev_bucket_weights: Optional[Dict[str, float]] = None,
+        bucket_renorm_max_delta: Optional[float] = None,
+        bucket_weights_out: Optional[Dict[str, float]] = None,
     ) -> Dict[str, float]:
         """Dynamically computes sub-strategy blend weights under selected weighting mode:
         - 'rolling_ic_ir': Bayesian shrinkage on rolling annualized IR with HLZ t-stat filter.
@@ -400,6 +416,11 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         thrust_thresh = self.resolve_param(p, "thrust_thresh", 0.60, float)
         breadth_bull_thresh = self.resolve_param(p, "breadth_bull_thresh", 0.30, float)
         enable_structural_regime = self.resolve_param(p, "enable_structural_regime", True, bool)
+        if bucket_renorm_max_delta is None:
+            bucket_renorm_max_delta = self.resolve_param(p, "bucket_renorm_max_delta", None, float)
+        # Hysteresis-adjusted thrust gate: use the threaded flag when present,
+        # otherwise fall back to the exact legacy comparison.
+        thrust_on = (thrust >= thrust_thresh) if thrust_active is None else bool(thrust_active)
 
         # If all sub-strategies have zero base weights (e.g. explicitly disabled by caller), return as-is
         if sum(base_weights.values()) <= 1e-6:
@@ -429,7 +450,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             style_map = self._classify_sub_strategy_styles(sub_strats, p)
             # Track C Anchor 1: Macro State Machine Budgeting with Fractal Dimension D_t
             if enable_structural_regime and median_d is not None and not np.isnan(median_d):
-                if (breadth_val >= 0.60) or (thrust >= thrust_thresh) or (median_d < 1.45 and vol_z < 1.0):
+                if (breadth_val >= 0.60) or thrust_on or (median_d < 1.45 and vol_z < 1.0):
                     budgets = {"momentum": 0.80, "reversal": 0.15, "defensive": 0.05}
                 elif (breadth_val >= breadth_bull_thresh and vol_z <= 2.0) or (median_d > 1.55):
                     budgets = {"momentum": 0.15, "reversal": 0.75, "defensive": 0.10}
@@ -437,7 +458,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                     budgets = {"momentum": 0.05, "reversal": 0.10, "defensive": 0.85}
             else:
                 # Gu, Kelly & Xiu (2020) macro regime budget assignment
-                if (breadth_val >= 0.60) or (thrust >= thrust_thresh) or (persistence >= 0.65 and vol_z < 1.0):
+                if (breadth_val >= 0.60) or thrust_on or (persistence >= 0.65 and vol_z < 1.0):
                     budgets = {"momentum": 0.75, "reversal": 0.20, "defensive": 0.05}
                 elif (breadth_val >= breadth_bull_thresh and vol_z <= 2.0):
                     budgets = {"momentum": 0.20, "reversal": 0.65, "defensive": 0.15}
@@ -450,12 +471,57 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                     b_name = style_map.get(k, "momentum")
                     bucket_members[b_name].append(k)
 
+            # (2026-10-22 incident) Empty style buckets previously went unnoticed:
+            # a fully-renormalized budget that silently omitted a style bucket
+            # concentrated the portfolio (e.g. defensive bucket jump). Warn so a
+            # missing classification is visible instead of silently renormalizing.
+            empty_buckets = [b for b in ("momentum", "reversal", "defensive") if not bucket_members[b]]
+            if empty_buckets:
+                _LOGGER.warning(
+                    "regime weighting: empty style bucket(s) %s at date=%s — sub-strategy style classification may be incomplete",
+                    empty_buckets,
+                    date,
+                )
+            _LOGGER.debug(
+                "regime weighting bar=%s breadth=%.3f thrust=%.3f budgets=%s members=%s",
+                date, breadth_val, thrust, budgets, {b: len(v) for b, v in bucket_members.items()},
+            )
+
             active_budgets = {b: budgets[b] for b in budgets if bucket_members[b]}
             tot_b = sum(active_budgets.values())
             if tot_b > 0:
                 norm_budgets = {b: v / tot_b for b, v in active_budgets.items()}
             else:
+                if bucket_weights_out is not None:
+                    bucket_weights_out.clear()
                 return base_weights
+
+            _LOGGER.debug("regime weighting bar=%s pre-renorm=%s", date, norm_budgets)
+
+            # (2026-10-22 incident) Delta-clamp bucket renormalization toward the
+            # previous bar's bucket weights to prevent a single-bar regime flip
+            # from 4x-ing a style bucket (defensive 0.10 -> 0.40). The new bucket
+            # allocation may move at most `bucket_renorm_max_delta` from its prior
+            # value, then renormalizes. None leaves legacy behavior unchanged.
+            if bucket_renorm_max_delta is not None and prev_bucket_weights:
+                clamped = {}
+                for b, alloc in norm_budgets.items():
+                    prev = float(prev_bucket_weights.get(b, 0.0))
+                    if alloc > prev + bucket_renorm_max_delta:
+                        clamped[b] = prev + bucket_renorm_max_delta
+                    elif alloc < prev - bucket_renorm_max_delta:
+                        clamped[b] = max(0.0, prev - bucket_renorm_max_delta)
+                    else:
+                        clamped[b] = alloc
+                tot_clamped = sum(max(0.0, v) for v in clamped.values())
+                if tot_clamped > 0:
+                    norm_budgets = {b: max(0.0, v) / tot_clamped for b, v in clamped.items()}
+                    _LOGGER.debug("regime weighting bar=%s delta-clamped=%s", date, norm_budgets)
+
+            # Record this bar's normalized bucket weights for next iteration.
+            if bucket_weights_out is not None:
+                bucket_weights_out.clear()
+                bucket_weights_out.update(norm_budgets)
 
             weights = {}
             if weighting_mode == "regime_adaptive" or sub_returns_slice.empty or len(sub_returns_slice) < 5:
@@ -545,6 +611,14 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         adaptive_min_tstat = self.resolve_param(p, "adaptive_min_tstat", 2.0, float)
         adaptive_shrinkage = self.resolve_param(p, "adaptive_shrinkage", 0.20, float)
         enable_orthogonalization = self.resolve_param(p, "enable_orthogonalization", True, bool)
+
+        # (2026-10-22 incident) Regime hysteresis (Fix 4) + bucket renormalization
+        # delta-clamp (Fix 3). All default to no-op so other strategies' backtest
+        # numbers are byte-for-byte unchanged.
+        enable_regime_hysteresis = self.resolve_param(p, "enable_regime_hysteresis", False, bool)
+        thrust_enter_thresh = self.resolve_param(p, "thrust_enter_thresh", 0.62, float)
+        thrust_exit_thresh = self.resolve_param(p, "thrust_exit_thresh", 0.58, float)
+        bucket_renorm_max_delta = self.resolve_param(p, "bucket_renorm_max_delta", None, float)
 
         # 5-Minute Intraday Microstructure & Interval Nesting Parameters
         enable_intraday_5m = self.resolve_param(p, "enable_intraday_5m", False, bool)
@@ -758,6 +832,12 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         holding_age = {s: 0 for s in risky_symbols}
         last_buy_bar = {s: -999 for s in risky_symbols}
 
+        # (2026-10-22 incident) Per-bar regime state threaded across iterations:
+        # `prev_state["thrust_active"]` feeds regime hysteresis (Fix 4) and
+        # `prev_bucket_weights` feeds bucket renormalization delta-clamp (Fix 3).
+        prev_state: Dict[str, Any] = {"thrust_active": False}
+        prev_bucket_weights: Dict[str, float] = {}
+
         for t in range(len(master_index)):
             date = master_index[t]
 
@@ -870,8 +950,24 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             lookback_idx = max(0, len(nav_history) - 1 - 10)
             r_10d = (cum_nav / nav_history[lookback_idx] - 1.0) if len(nav_history) > 10 else 0.0
             thrust = float(daily_thrust.iloc[t])
-            thrust_active = thrust >= thrust_thresh
             breadth_val = float(daily_breadth.iloc[t])
+
+            # (2026-10-22 incident, Fix 4) Regime hysteresis on the Zweig thrust
+            # gate: a single bar flipping 0.60 -> 0.50 used to slam the regime
+            # state machine from the momentum budget into the defensive budget.
+            # With hysteresis the thrust flag only ENTERS when thrust rises to
+            # `thrust_enter_thresh` (0.62) and only EXITS when it falls below
+            # `thrust_exit_thresh` (0.58), so noise around 0.60 no longer flips
+            # the portfolio. Disabled by default (legacy single-threshold path).
+            if enable_regime_hysteresis:
+                prev_thrust_active = bool(prev_state.get("thrust_active", False))
+                if prev_thrust_active:
+                    thrust_active = thrust >= thrust_exit_thresh
+                else:
+                    thrust_active = thrust >= thrust_enter_thresh
+            else:
+                thrust_active = thrust >= thrust_thresh
+
             fast_recovery = thrust_active or (r_10d > 0.0) or (breadth_val >= 0.60)
 
             current_dd = (cum_nav - peak_nav) / peak_nav if peak_nav > 0 else 0.0
@@ -908,6 +1004,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                 cur_weights = self.compute_regime_weights(base_weights, breadth_val, thrust, date, p)
             else:
                 sub_ret_slice = sub_returns_history.iloc[max(0, t - adaptive_lookback_days) : t] if t >= 10 else pd.DataFrame()
+                bucket_weights_out: Dict[str, float] = {}
                 cur_weights = self._compute_adaptive_weights(
                     sub_strats=sub_strats,
                     base_weights=base_weights,
@@ -922,7 +1019,16 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                     date=date,
                     params=p,
                     median_d=(float(fractal_d_series.iloc[t]) if (fractal_d_series is not None and pd.notna(fractal_d_series.iloc[t])) else None),
+                    # (2026-10-22 incident) Hysteresis flag threaded only when
+                    # enabled (None preserves the legacy internal comparison),
+                    # plus bucket delta-clamp state for Fix 3.
+                    thrust_active=(thrust_active if enable_regime_hysteresis else None),
+                    prev_bucket_weights=(prev_bucket_weights or None),
+                    bucket_renorm_max_delta=bucket_renorm_max_delta,
+                    bucket_weights_out=bucket_weights_out,
                 )
+                if bucket_weights_out:
+                    prev_bucket_weights = dict(bucket_weights_out)
 
             # Optional Löwdin symmetric orthogonalization
             if enable_orthogonalization and len(sub_strats) > 1:
@@ -1434,6 +1540,10 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                         expansion_signal_bars[s] = 0
                         asset_entry_price[s] = None
                         asset_peak_price[s] = None
+
+            # (2026-10-22 incident, Fix 4) Persist this bar's hysteresis-adjusted
+            # thrust flag for the next iteration's enter/exit boundary decision.
+            prev_state["thrust_active"] = thrust_active
 
         daily_weights = _fill_out_columns(daily_weights, symbols)
         return _sparse_from_daily(daily_weights)
