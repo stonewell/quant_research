@@ -8,9 +8,13 @@ across both backtesting and live execution engines.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Optional
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class PositionState(str, Enum):
@@ -39,6 +43,14 @@ class PositionLifecycleConfig:
     normal_cooldown_bars: int = 1
     stop_cooldown_bars: int = 5
     inertia_threshold: float = 0.05
+    # (2026-10-22 incident) Relative trim-side inertia ratio. When > 0.0, a
+    # SELL-direction partial trim must clear BOTH the absolute
+    # `inertia_threshold` AND a proportional fraction of the current weight
+    # (`ratio * current_weight`) before it is allowed. Prevents micro-trims
+    # (e.g. a -0.0082pp trim on a 17-bar incumbent) from being emitted as real
+    # SELL orders that merely round to a handful of shares. 0.0 disables the
+    # proportional hurdle and preserves the legacy absolute-only gate.
+    inertia_relative_ratio: float = 0.0
     min_entry_threshold: Optional[float] = None
     hard_stop_loss_pct: float = 0.08
     atr_multiplier: float = 4.5
@@ -60,6 +72,14 @@ class AssetLifecycleState:
     entry_price: float = 0.0
     peak_price: float = 0.0
     current_weight: float = 0.0
+    # (2026-10-22 incident) Pre-trade brokerage weight snapshot, hydrated from
+    # the actual holdings (cur_w) by run_live_strategy.py before
+    # step_position_lifecycle mutates `current_weight` to the post-rebalance
+    # target. Persisting `broker_weight` alongside `current_weight` prevents
+    # account_state.json from silently storing the TARGET as if it were the
+    # broker weight (000999.SZ persisted 0.06731049 while the broker held
+    # 0.13934551). The lifecycle machine itself never mutates this field.
+    broker_weight: float = 0.0
     last_exit_type: Optional[str] = None
 
     def is_holding(self) -> bool:
@@ -82,6 +102,7 @@ class AssetLifecycleState:
             "entry_price": float(self.entry_price),
             "peak_price": float(self.peak_price),
             "current_weight": float(self.current_weight),
+            "broker_weight": float(self.broker_weight),
             "last_exit_type": self.last_exit_type,
         }
 
@@ -100,6 +121,7 @@ class AssetLifecycleState:
             entry_price=float(d.get("entry_price", 0.0)),
             peak_price=float(d.get("peak_price", 0.0)),
             current_weight=float(d.get("current_weight", 0.0)),
+            broker_weight=float(d.get("broker_weight", 0.0)),
             last_exit_type=d.get("last_exit_type"),
         )
 
@@ -209,7 +231,21 @@ def step_position_lifecycle(
             or is_emergency_halt
         )
 
-        if is_stop and can_sell and cfg.enable_exit_fast_path:
+        # (2026-10-22 incident, follow-up safety fix) The min-holding tenure lock
+        # (`can_sell`) is a 2-bar anti-whipsaw guard for SIGNAL-driven exits and
+        # partial trims — it must NEVER block a risk exit. A China position
+        # bought yesterday that trips its hard stop / trailing stop / Tier-3
+        # emergency halt today must be liquidated today; otherwise the lock
+        # converts a bounded stop into an unbounded tail loss. The lock is
+        # therefore EXEMPTED here for the stop/emergency-halt fast path, and the
+        # override is logged so a lock bypass is visible in live runs.
+        if is_stop and cfg.enable_exit_fast_path:
+            if not can_sell:
+                _LOGGER.warning(
+                    "tenure lock overridden by risk exit for %s: held_bars=%d < min_holding_bars=%d "
+                    "(stop-loss / emergency-halt liquidation must never be blocked by the anti-whipsaw lock)",
+                    state.symbol, state.held_bars, cfg.min_holding_bars,
+                )
             state.state = PositionState.COOLDOWN
             state.cooldown_remaining = cfg.stop_cooldown_bars
             if is_emergency_halt:
@@ -308,15 +344,30 @@ def step_position_lifecycle(
             if state.held_bars >= cfg.min_holding_bars:
                 state.state = PositionState.HELD_ACTIVE
 
-            delta_w = abs(raw_target_weight - state.current_weight)
-            if delta_w < cfg.inertia_threshold:
+            # Signed delta (raw_target - current), unified with the signed
+            # `inertia_check.delta_weight` convention emitted by
+            # run_live_strategy.py. The ABSOLUTE value still gates inertia.
+            delta_w = raw_target_weight - state.current_weight
+            # (2026-10-22 incident) Relative trim-side inertia hurdle: SELL
+            # trims must clear both the absolute threshold AND a proportional
+            # fraction of the current weight. BUY-direction rebalances keep the
+            # absolute-only gate so rebalancing UP is never over-restricted.
+            effective_threshold = cfg.inertia_threshold
+            if delta_w < 0.0 and cfg.inertia_relative_ratio > 0.0:
+                effective_threshold = max(
+                    cfg.inertia_threshold,
+                    cfg.inertia_relative_ratio * state.current_weight,
+                )
+            if abs(delta_w) < effective_threshold:
                 return LifecycleDecision(
                     action="HOLD",
                     target_weight=state.current_weight,
-                    reason=f"调仓未超惰性阈值 (< {cfg.inertia_threshold:.0%})",
+                    reason=f"调仓未超惰性阈值 (< {effective_threshold:.0%})",
                     detail_reason={
                         "delta_w": delta_w,
                         "inertia_threshold": cfg.inertia_threshold,
+                        "effective_threshold": effective_threshold,
+                        "inertia_relative_ratio": cfg.inertia_relative_ratio,
                         "raw_target_weight": raw_target_weight,
                         "current_weight": state.current_weight,
                     },
@@ -326,6 +377,50 @@ def step_position_lifecycle(
                 )
             else:
                 action = "BUY" if raw_target_weight > state.current_weight else "SELL"
+                if action == "SELL" and not can_sell:
+                    # (2026-10-22 live incident) `can_sell` (the min-holding
+                    # tenure lock) was previously enforced ONLY on the stop-loss
+                    # fast-path (line ~212) and the full-exit path
+                    # (raw_target_weight == 0.0), NEVER on partial trims.
+                    # 000999.SZ / 600900.SH were sold at held_bars=1 <
+                    # min_holding_bars=2 because this branch emitted SELL
+                    # without consulting `can_sell`. Enforce it here, mirroring
+                    # the full-exit HOLD_FILTERED reason. BUY-direction trims
+                    # (raw_target_weight > current_weight) remain allowed so
+                    # re-balancing UP during the lock is not delayed.
+                    return LifecycleDecision(
+                        action="HOLD_FILTERED",
+                        target_weight=state.current_weight,
+                        reason=f"未满最低持仓周期 (持仓 {state.held_bars} 日 < 最低 {cfg.min_holding_bars} 日，锁定防洗盘)",
+                        detail_reason={
+                            "held_bars": state.held_bars,
+                            "min_holding_bars": cfg.min_holding_bars,
+                            "raw_target_weight": raw_target_weight,
+                            "current_weight": state.current_weight,
+                            "delta_w": delta_w,
+                        },
+                        state_before=state_before,
+                        state_after=state.state,
+                        fast_path_triggered=None,
+                    )
+                # (2026-10-22 live incident, ticket-level audit artifact) The
+                # mutation below stages the post-rebalance TARGET into
+                # `state.current_weight`, which is what the backtester and the
+                # next bar need. But the forensic `detail_reason` must describe
+                # the PRE-TRADE broker weight, not the target: reading
+                # `state.current_weight` AFTER the mutation made the ticket
+                # self-contradictory — it recorded
+                # `current_weight == raw_target_weight` while `delta_w` (computed
+                # one line above from the pre-mutation weight) was non-zero.
+                # 600660.SH emitted a ticket whose `lifecycle_decision` block
+                # showed current_weight == raw_target_weight == 0.131807 next to
+                # a non-zero delta_w, making the trim un-auditable by hand.
+                # Snapshot the broker/pre-trade weight BEFORE mutating, so the
+                # record reads: current_weight = broker weight,
+                # raw_target_weight = target, delta_w = target - broker.
+                # (`AssetLifecycleState.broker_weight` was the persisted-state
+                # half of the same fix; this is the remaining ticket half.)
+                prev_weight = state.current_weight
                 state.current_weight = raw_target_weight
                 return LifecycleDecision(
                     action=action,
@@ -335,7 +430,7 @@ def step_position_lifecycle(
                         "delta_w": delta_w,
                         "inertia_threshold": cfg.inertia_threshold,
                         "raw_target_weight": raw_target_weight,
-                        "current_weight": state.current_weight,
+                        "current_weight": prev_weight,
                     },
                     state_before=state_before,
                     state_after=state.state,

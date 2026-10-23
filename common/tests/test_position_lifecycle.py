@@ -247,15 +247,21 @@ def test_china_t_plus_one_gestation():
     assert state.state == PositionState.HELD_GESTATION
     assert state.held_bars == 0
 
-    # Day 1: held_bars increments to 1 (< 2). Selling must be blocked!
-    d_blocked = step_position_lifecycle(state, raw_target_weight=0.0, current_price=25.0, cfg=cfg, market="china")
+    # Day 1: held_bars increments to 1 (< 2). A SIGNAL-driven full exit must still be
+    # blocked. NOTE (2026-10-22 incident, safety fix): the price here is deliberately
+    # a mild -0.67% drift rather than the old 30.0 -> 25.0 (-16.7%) move, because a
+    # -16.7% move trips `hard_stop_loss_pct=8%` and the tenure lock is now EXEMPTED
+    # for stop-loss / emergency-halt liquidations (a 2-bar anti-whipsaw lock must
+    # never block a risk exit). See
+    # `test_tenure_lock_exempted_for_stop_loss_but_not_signal_exits` for that path.
+    d_blocked = step_position_lifecycle(state, raw_target_weight=0.0, current_price=29.8, cfg=cfg, market="china")
     assert d_blocked.action == "HOLD_FILTERED"
     assert d_blocked.target_weight == 0.10
     assert "未满最低持仓周期" in d_blocked.reason
     assert state.held_bars == 1
 
     # Day 2: held_bars increments to 2 (>= 2). Selling is now allowed!
-    d_allowed = step_position_lifecycle(state, raw_target_weight=0.0, current_price=25.0, cfg=cfg, market="china")
+    d_allowed = step_position_lifecycle(state, raw_target_weight=0.0, current_price=29.8, cfg=cfg, market="china")
     assert d_allowed.action == "SELL"
     assert d_allowed.target_weight == 0.0
 
@@ -561,5 +567,315 @@ def test_entry_resets_exit_streak():
     assert d_fast.fast_path_triggered == "VOLUME_BREAKOUT"
     assert state_fast.state == PositionState.HELD_GESTATION
     assert state_fast.exit_streak == 0, "exit_streak must be reset to 0 on fast-path entry"
+
+
+def test_locked_partial_trim_sell_blocked():
+    """Fix 1 (P0): partial-trim SELL during min-holding lock downgrades to HOLD_FILTERED.
+
+    Regression for 000999.SZ / 600900.SH being sold at held_bars=1 < min_holding_bars=2.
+    """
+    cfg = PositionLifecycleConfig(
+        guard_latency_bars=1,
+        min_holding_bars=2,
+        inertia_threshold=0.05,
+    )
+    state = AssetLifecycleState(
+        symbol="000999.SZ",
+        state=PositionState.HELD_GESTATION,
+        held_bars=0,
+        entry_price=10.0,
+        peak_price=10.0,
+        current_weight=0.20,
+    )
+    # held_bars increments to 1 (< 2). Strategy trims 0.20 -> 0.13 (delta -0.07 >= 0.05).
+    d = step_position_lifecycle(state, raw_target_weight=0.13, current_price=10.0, cfg=cfg, market="china")
+    assert d.action == "HOLD_FILTERED"
+    assert d.target_weight == 0.20
+    assert "未满最低持仓周期" in d.reason
+    assert state.current_weight == 0.20  # weight must NOT advance to the trim target
+
+
+def test_locked_partial_trim_buy_allowed():
+    """Fix 1 (P0): BUY-direction rebalance during min-holding lock remains allowed."""
+    cfg = PositionLifecycleConfig(
+        guard_latency_bars=1,
+        min_holding_bars=2,
+        inertia_threshold=0.05,
+    )
+    state = AssetLifecycleState(
+        symbol="000999.SZ",
+        state=PositionState.HELD_GESTATION,
+        held_bars=0,
+        entry_price=10.0,
+        peak_price=10.0,
+        current_weight=0.10,
+    )
+    # held_bars increments to 1 (< 2). Strategy adds 0.10 -> 0.25 (delta +0.15 >= 0.05).
+    d = step_position_lifecycle(state, raw_target_weight=0.25, current_price=10.0, cfg=cfg, market="china")
+    assert d.action == "BUY"
+    assert d.target_weight == 0.25
+    assert state.current_weight == 0.25
+
+
+def test_tenure_lock_exempted_for_stop_loss_but_not_signal_exits():
+    """Fix 3 (P0 safety): the min-holding tenure lock must never block a risk exit.
+
+    A China position bought yesterday (held_bars becomes 1 < min_holding_bars=2)
+    that trips a hard stop / emergency halt must still liquidate today — otherwise
+    the anti-whipsaw lock converts a bounded stop into an unbounded tail loss. In
+    contrast, SIGNAL-driven full exits and partial trims remain locked.
+    """
+    cfg = PositionLifecycleConfig(
+        guard_latency_bars=1,
+        min_holding_bars=2,
+        inertia_threshold=0.05,
+        hard_stop_loss_pct=0.08,
+        atr_multiplier=4.5,
+        stop_cooldown_bars=5,
+        enable_exit_fast_path=True,
+    )
+
+    # (a) locked position + hard stop -> liquidation ALLOWED despite the lock
+    state_stop = AssetLifecycleState(
+        symbol="000999.SZ",
+        state=PositionState.HELD_GESTATION,
+        held_bars=0,   # increments to 1 < 2 -> tenure locked
+        entry_price=20.0,
+        peak_price=20.0,
+        current_weight=0.1393,
+    )
+    # price collapses to 18.0 (loss -10% <= -8%) -> stop trips despite the lock
+    d_stop = step_position_lifecycle(
+        state_stop, raw_target_weight=0.067310, current_price=18.0, cfg=cfg, market="china"
+    )
+    assert d_stop.action == "SELL"
+    assert d_stop.target_weight == 0.0
+    assert d_stop.fast_path_triggered == "STOP_LOSS"
+    assert state_stop.state == PositionState.COOLDOWN
+
+    # (b) locked position + signal-driven full exit -> still BLOCKED
+    state_full = AssetLifecycleState(
+        symbol="600900.SH",
+        state=PositionState.HELD_GESTATION,
+        held_bars=0,   # increments to 1 < 2 -> tenure locked
+        entry_price=20.0,
+        peak_price=20.0,
+        current_weight=0.1948,
+    )
+    d_full = step_position_lifecycle(
+        state_full, raw_target_weight=0.0, current_price=19.5, cfg=cfg, market="china"
+    )
+    assert d_full.action == "HOLD_FILTERED"
+    assert d_full.target_weight == 0.1948
+    assert "未满最低持仓周期" in d_full.reason
+
+    # (c) locked position + partial trim SELL -> still BLOCKED
+    state_trim = AssetLifecycleState(
+        symbol="000999.SZ",
+        state=PositionState.HELD_GESTATION,
+        held_bars=0,   # increments to 1 < 2 -> tenure locked
+        entry_price=20.0,
+        peak_price=20.0,
+        current_weight=0.1393,
+    )
+    # trim 0.1393 -> 0.067310 (delta -0.07199 >= 0.05) -> SELL direction, but locked
+    d_trim = step_position_lifecycle(
+        state_trim, raw_target_weight=0.067310, current_price=19.5, cfg=cfg, market="china"
+    )
+    assert d_trim.action == "HOLD_FILTERED"
+    assert d_trim.target_weight == 0.1393
+    assert state_trim.current_weight == 0.1393
+
+
+def test_signed_delta_w_convention():
+    """Fix 6 (P2): delta_w is signed (raw_target - current), consistent with inertia_check."""
+    cfg = PositionLifecycleConfig(inertia_threshold=0.05, min_holding_bars=1)
+    state = AssetLifecycleState(
+        symbol="SYM",
+        state=PositionState.HELD_ACTIVE,
+        held_bars=5,
+        entry_price=10.0,
+        peak_price=11.0,
+        current_weight=0.20,
+    )
+    d = step_position_lifecycle(state, raw_target_weight=0.13, current_price=10.5, cfg=cfg)
+    assert d.action == "SELL"
+    assert d.detail_reason["delta_w"] == pytest.approx(-0.07)
+
+
+def test_broker_weight_serialization_roundtrip():
+    """Fix 6 (P2): broker_weight snapshot survives serialization independently of current_weight.
+
+    Regression: account_state.json persisted the TARGET (0.06731049) as if it were
+    the broker weight (0.13934551) because current_weight was mutated before to_dict().
+    """
+    state = AssetLifecycleState(
+        symbol="000999.SZ",
+        state=PositionState.HELD_ACTIVE,
+        held_bars=1,
+        current_weight=0.06731049,
+        broker_weight=0.13934551,
+    )
+    d = state.to_dict()
+    assert d["broker_weight"] == pytest.approx(0.13934551)
+    assert d["current_weight"] == pytest.approx(0.06731049)
+
+    restored = AssetLifecycleState.from_dict(json.loads(json.dumps(d)))
+    assert restored.broker_weight == pytest.approx(0.13934551)
+    assert restored.current_weight == pytest.approx(0.06731049)
+
+    # Backward compatibility: a persisted state without broker_weight defaults to 0.0
+    legacy = AssetLifecycleState.from_dict({"symbol": "SYM", "state": "HELD_ACTIVE", "current_weight": 0.10})
+    assert legacy.broker_weight == 0.0
+
+
+def test_relative_trim_side_inertia_threshold():
+    """Fix 7 (P2): SELL trim must clear max(inertia_threshold, ratio * current_weight)."""
+    cfg = PositionLifecycleConfig(
+        inertia_threshold=0.05,
+        inertia_relative_ratio=0.30,
+        min_holding_bars=1,
+    )
+    state = AssetLifecycleState(
+        symbol="600660.SH",
+        state=PositionState.HELD_ACTIVE,
+        held_bars=17,
+        entry_price=10.0,
+        peak_price=12.0,
+        current_weight=0.40,
+    )
+    # delta -0.10: abs(0.10) >= 0.05 (absolute passes) but 0.10 < 0.30*0.40=0.12 -> HOLD
+    d1 = step_position_lifecycle(state, raw_target_weight=0.30, current_price=11.0, cfg=cfg)
+    assert d1.action == "HOLD"
+    assert d1.detail_reason["effective_threshold"] == pytest.approx(0.12)
+    assert state.current_weight == 0.40  # unchanged
+
+    # delta -0.15: abs(0.15) >= max(0.05, 0.12) -> SELL
+    d2 = step_position_lifecycle(state, raw_target_weight=0.25, current_price=11.0, cfg=cfg)
+    assert d2.action == "SELL"
+    assert state.current_weight == 0.25
+
+
+def test_relative_trim_side_inertia_threshold_at_position_cap():
+    """Fix 7 (P2, re-parameterized): at the 0.20 single-position cap, ratio 0.30
+    yields hurdle 0.06 (> the 0.05 absolute floor), proving the 0.25 ratio was a
+    mathematical no-op (0.25*0.20 == 0.05 exactly)."""
+    cfg = PositionLifecycleConfig(
+        inertia_threshold=0.05,
+        inertia_relative_ratio=0.30,
+        min_holding_bars=1,
+    )
+    state = AssetLifecycleState(
+        symbol="SYM",
+        state=PositionState.HELD_ACTIVE,
+        held_bars=5,
+        entry_price=10.0,
+        peak_price=12.0,
+        current_weight=0.20,
+    )
+    # delta -0.055: abs(0.055) >= 0.05 (absolute passes) but 0.055 < 0.30*0.20=0.06 -> HOLD
+    d1 = step_position_lifecycle(state, raw_target_weight=0.145, current_price=11.0, cfg=cfg)
+    assert d1.action == "HOLD"
+    assert d1.detail_reason["effective_threshold"] == pytest.approx(0.06)
+    assert state.current_weight == 0.20  # unchanged
+
+    # delta -0.065: abs(0.065) >= max(0.05, 0.06) -> SELL
+    d2 = step_position_lifecycle(state, raw_target_weight=0.135, current_price=11.0, cfg=cfg)
+    assert d2.action == "SELL"
+    assert state.current_weight == 0.135
+
+
+def test_relative_trim_side_inertia_threshold_600660_incident():
+    """Fix 7 (P2, re-parameterized): the actual 600660 incident micro-trim
+    (held 17 bars, delta 0.0501) is filtered under ratio 0.30 because the hurdle
+    0.30*0.1819=0.05457 exceeds the 0.0501 trim. Under the old 0.25 ratio the
+    hurdle was 0.25*0.1819=0.0455 < 0.05, so the absolute 0.05 floor let it pass."""
+    cfg = PositionLifecycleConfig(
+        inertia_threshold=0.05,
+        inertia_relative_ratio=0.30,
+        min_holding_bars=1,
+    )
+    state = AssetLifecycleState(
+        symbol="600660.SH",
+        state=PositionState.HELD_ACTIVE,
+        held_bars=17,
+        entry_price=10.0,
+        peak_price=12.0,
+        current_weight=0.1819,
+    )
+    # delta = 0.131807 - 0.1819 = -0.050093
+    d = step_position_lifecycle(state, raw_target_weight=0.131807, current_price=11.0, cfg=cfg)
+    assert d.action == "HOLD"
+    assert d.action != "SELL"  # the live run emitted ~10,256 RMB of sells here
+    assert d.detail_reason["effective_threshold"] == pytest.approx(0.30 * 0.1819, abs=1e-4)
+    assert state.current_weight == 0.1819  # unchanged (no micro-trim emitted)
+
+
+def test_detail_reason_current_weight_is_pre_trade_broker_weight():
+    """Fix 8 (P2, ticket-level audit artifact): `detail_reason["current_weight"]`
+    must report the PRE-TRADE broker weight, never the post-rebalance target.
+
+    Regression (2026-10-22 live incident, 600660.SH): the partial-trim branch did
+    `state.current_weight = raw_target_weight` BEFORE building `detail_reason`, so
+    the serialized ticket's `lifecycle_decision` block showed
+    `current_weight == raw_target_weight` (0.131807) next to a NON-ZERO `delta_w`
+    (-0.050093) — a self-contradictory audit record that made the trim
+    un-auditable by hand. `AssetLifecycleState.broker_weight` was the persisted-state
+    half of that fix; this asserts the ticket half. The state mutation itself is
+    unchanged (the backtester and the next bar still need the target), so the fix
+    is a pure observability change: snapshot before mutating, report the snapshot.
+    """
+    cfg = PositionLifecycleConfig(
+        inertia_threshold=0.05,
+        min_holding_bars=1,
+    )
+
+    # (a) partial-trim SELL branch (the branch that mutated before reporting).
+    # 600660.SH: held 17 bars, broker weight 0.1819, target 0.131807,
+    # delta -0.050093 >= 0.05 floor -> a real trim.
+    state_trim = AssetLifecycleState(
+        symbol="600660.SH",
+        state=PositionState.HELD_ACTIVE,
+        held_bars=17,
+        entry_price=10.0,
+        peak_price=12.0,
+        current_weight=0.1819,
+        broker_weight=0.1819,
+    )
+    d_trim = step_position_lifecycle(state_trim, raw_target_weight=0.131807, current_price=11.0, cfg=cfg)
+    assert d_trim.action == "SELL"
+    assert d_trim.target_weight == pytest.approx(0.131807)
+    # current_weight now reads the broker weight, NOT the target ...
+    assert d_trim.detail_reason["current_weight"] == pytest.approx(0.1819)
+    assert d_trim.detail_reason["raw_target_weight"] == pytest.approx(0.131807)
+    assert abs(d_trim.detail_reason["current_weight"] - d_trim.detail_reason["raw_target_weight"]) > 1e-6
+    # ... and delta_w stays internally consistent with that pair.
+    assert d_trim.detail_reason["delta_w"] == pytest.approx(
+        d_trim.detail_reason["raw_target_weight"] - d_trim.detail_reason["current_weight"]
+    )
+    # No behavioural change: the state still advances to the target, and the
+    # machine never touches the caller-supplied broker snapshot.
+    assert state_trim.current_weight == pytest.approx(0.131807)
+    assert state_trim.broker_weight == pytest.approx(0.1819)
+
+    # (b) HOLD / inertia deadband branch — verified already correct (no mutation
+    # precedes its detail_reason), pinned here so a future refactor cannot regress
+    # it into the same target-as-current bug. Same 600660-style figures with a
+    # 0.0482 delta, which sits below the 0.05 absolute floor.
+    state_hold = AssetLifecycleState(
+        symbol="600660.SH",
+        state=PositionState.HELD_ACTIVE,
+        held_bars=17,
+        entry_price=10.0,
+        peak_price=12.0,
+        current_weight=0.18,
+        broker_weight=0.18,
+    )
+    d_hold = step_position_lifecycle(state_hold, raw_target_weight=0.1318, current_price=11.0, cfg=cfg)
+    assert d_hold.action == "HOLD"
+    assert d_hold.detail_reason["current_weight"] == pytest.approx(0.18)
+    assert d_hold.detail_reason["raw_target_weight"] == pytest.approx(0.1318)
+    assert d_hold.detail_reason["delta_w"] == pytest.approx(0.1318 - 0.18)
+    assert state_hold.current_weight == pytest.approx(0.18)  # unchanged
 
 
