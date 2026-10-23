@@ -455,6 +455,12 @@ def evaluate_market_breadth_and_thrust(
         "bull_active": bull_active,
         "breadth_factor": breadth_factor,
         "target_exposure": target_exp,
+        # (2026-10-22 incident) `target_exposure` is a Stage-1 REGIME advisory
+        # (a macro "should" level), NOT an executable order. Stage-2
+        # (`run_live_strategy.py`) derives actual equity/cash weights from the
+        # model's generate_weights output. Persisting this flag prevents the
+        # 0.7111 advisory being misread as the literal 0.444087 BIL target.
+        "target_exposure_is_advisory": True,
         "tracked_symbols_count": tot,
         "leaders": top_leaders,
     }
@@ -667,7 +673,7 @@ def print_dashboard(
     t_status = "🚀 Thrust Active" if macro_info["thrust_active"] else "⚪ Inactive"
     print(f"  50-Day Market Breadth : {macro_info['breadth']:>6.1%} (Threshold: {macro_info['breadth_thresh']:>5.1%}) | {b_status}")
     print(f"  10-Day Momentum Thrust: {macro_info['thrust']:>6.1%} (Threshold: {macro_info['thrust_thresh']:>5.1%}) | {t_status}")
-    print(f"  Target Total Equity   : {macro_info['target_exposure']:>6.1%} (Max Single-Stock Cap: 20.0%)")
+    print(f"  Target Total Equity   : {macro_info['target_exposure']:>6.1%} (Max Single-Stock Cap: 20.0%) [Stage-1 advisory, ignored by Stage-2 orders]")
 
     if macro_info.get("leaders"):
         print("  Top Momentum Leaders  : " + ", ".join([f"{x['symbol']} ({x['roc_10d']:>+.1%})" for x in macro_info["leaders"]]))
@@ -767,7 +773,7 @@ def generate_reports(
 | :--- | :--- | :--- | :--- |
 | **50-Day Market Breadth** | `{macro_info['breadth']:.1%}` | `30.0%` | {"🟢 Bullish Breadth" if macro_info['breadth_active'] else "⚪ Conservative"} |
 | **10-Day Momentum Thrust** | `{macro_info['thrust']:.1%}` | `60.0%` | {"🚀 Rapid Rebound Thrust" if macro_info['thrust_active'] else "⚪ Standard"} |
-| **Target Equity Exposure** | `{macro_info['target_exposure']:.0%}` | Standard: 50% / Bull: Up to 80% | {"Bullish Expansion" if macro_info['target_exposure'] > 0.50 else "Standard Exposure"} |
+| **Target Equity Exposure** | `{macro_info['target_exposure']:.0%}` | Standard: 50% / Bull: Up to 80% | {"Bullish Expansion" if macro_info['target_exposure'] > 0.50 else "Standard Exposure"} (Stage-1 advisory; Stage-2 model weights govern orders) |
 | **Single-Stock Cap** | `20.0%` | Fixed hard limit | Enforced across all regimes |
 
 ### Top Momentum Leaders (10-Day ROC)

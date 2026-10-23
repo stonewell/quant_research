@@ -1126,6 +1126,11 @@ def main(cli_args: Optional[List[str]] = None):
         normal_cooldown_bars=getattr(args, "reentry_cooldown_bars", 2),
         stop_cooldown_bars=max(5, getattr(args, "reentry_cooldown_bars", 2)),
         inertia_threshold=min_trade_thresh,
+        # (2026-10-22 incident) Relative trim-side inertia hurdle (Fix 7):
+        # SELL trims must clear max(inertia_threshold, ratio * current_weight).
+        # Resolved via cfsb_inertia_relative_ratio for chan_four_state_blend;
+        # 0.0 (disabled) everywhere else so other strategies are unaffected.
+        inertia_relative_ratio=resolve_blend_param(params, "inertia_relative_ratio", 0.0, float),
         min_entry_threshold=min_entry_thresh,
         hard_stop_loss_pct=0.08,
         atr_multiplier=4.5,
@@ -1176,6 +1181,12 @@ def main(cli_args: Optional[List[str]] = None):
     print(f"数据周期 (Window)   : {start_date} -> {as_of_date} (最新估值日: {as_of_date})")
     print(f"账户资金 (NAV)      : {args.portfolio_value:,.2f} RMB")
     print(f"行情数据 (Provider) : {args.data_provider}")
+    # (2026-10-22 incident) Stage-1 `target_exposure` is an advisory macro
+    # "should" level, NOT an executable equity weight. The executable equity /
+    # cash split is the model's generate_weights output printed below after
+    # computation. This note prevents the Stage-1 advisory (e.g. 71.1% equity)
+    # being misread as the literal Stage-2 cash-proxy target (e.g. 44.4% BIL).
+    print("提示 (Note)         : Stage-1 target_exposure 为咨询值；实际权益/现金仓位以下方模型权重输出为准")
     print("=" * 110)
 
     # 2. Load Universe (including any held symbols outside the universe list)
@@ -1281,6 +1292,16 @@ def main(cli_args: Optional[List[str]] = None):
 
     latest_rebal_date = rebalances.index[-1].strftime("%Y-%m-%d")
     current_targets = rebalances.iloc[-1].fillna(0.0)
+
+    # (2026-10-22 incident) Surface the MODEL's executable equity/cash split so
+    # it is clearly distinguishable from the Stage-1 advisory target_exposure.
+    # The model's equity weight is the sum of risky-symbol targets; the cash
+    # weight is the cash proxy target (plus any residual to 100%).
+    model_equity_target = float(current_targets.drop(cash_proxy, errors="ignore").sum())
+    model_cash_target = float(current_targets.get(cash_proxy, 0.0))
+    model_residual = max(0.0, 1.0 - model_equity_target - model_cash_target)
+    print(f"\n[INFO] 模型目标仓位 (Model Targets): 权益 {model_equity_target:.1%} | 现金停泊 {model_cash_target:.1%} | 未分配 {model_residual:.1%}")
+    print(f"       (Stage-1 target_exposure 仅为咨询值；实际执行以本行模型权益/现金拆分为准)")
 
     is_today_rebal = (pd.Timestamp(as_of_date) in sparse_weights.index) and (
         not sparse_weights.loc[pd.Timestamp(as_of_date)].dropna().empty
@@ -1470,6 +1491,12 @@ def main(cli_args: Optional[List[str]] = None):
             if sym in lifecycle_states_raw:
                 state = AssetLifecycleState.from_dict(lifecycle_states_raw[sym])
                 state.current_weight = cur_w
+                # (2026-10-22 incident) Capture the actual brokerage weight as
+                # a pre-trade snapshot BEFORE step_position_lifecycle mutates
+                # `current_weight` to the post-rebalance target. Without this,
+                # account_state.json persists the TARGET as if it were the
+                # broker weight (see docs/version.md §8).
+                state.broker_weight = cur_w
                 if entry_prices.get(sym, 0.0) > 0 and state.entry_price <= 0:
                     state.entry_price = float(entry_prices.get(sym, 0.0))
                 if state.entry_price > 0:
@@ -1500,6 +1527,9 @@ def main(cli_args: Optional[List[str]] = None):
                     entry_price=entry_p,
                     peak_price=peak_p,
                     current_weight=cur_w,
+                    # (2026-10-22 incident) New-state creation must also capture
+                    # the actual brokerage weight snapshot (see hydration branch).
+                    broker_weight=cur_w,
                 )
 
             # Pre-execution brokerage reconciliation:
@@ -1558,6 +1588,46 @@ def main(cli_args: Optional[List[str]] = None):
 
             held_age = state.held_bars if state.is_holding() else 0
             is_tenure_locked = bool(state.held_bars < min_holding_bars if state.is_holding() else False)
+
+            # (2026-10-22 incident, belt-and-suspenders) Fix 1 already gates
+            # partial-trim SELLs on `can_sell` inside position_lifecycle.py.
+            # This is a SECOND defensive layer for any residual code path that
+            # still emits a SELL while the asset is tenure-locked: a positive
+            # target weight (partial trim) is downgraded to HOLD_FILTERED and
+            # the weight is pinned to the current holding so no SELL order is
+            # ever generated during the minimum-holding lock.
+            #
+            # Full exits (tgt_w <= 0) are intentionally NOT re-blocked here:
+            #  - Stop-loss / emergency-halt SELLs (tgt_w == 0) are emitted by
+            #    position_lifecycle.py REGARDLESS of the tenure lock (the lock
+            #    is explicitly EXEMPTED for risk exits — see
+            #    common/position_lifecycle.py), so they must flow through
+            #    untouched and liquidate today.
+            #  - Signal-driven full exits on a locked position are already
+            #    downgraded to HOLD_FILTERED by position_lifecycle.py's
+            #    `can_sell` gate, so they never reach this layer as a SELL.
+            #
+            # (2026-10-22 incident) The tenure lock is a China T+1 gestation
+            # concept; `can_sell` inside position_lifecycle.py is
+            # `market != "china" or held_bars >= min_holding_bars`. The
+            # `is_tenure_locked` flag above is held_bars-only, so it must be
+            # re-scoped to `asset_market == "china"` here to avoid over-blocking
+            # partial-trim SELLs for non-China (US/HK) strategies where the
+            # lock does not apply.
+            if is_tenure_locked and asset_market == "china" and action == "SELL" and tgt_w > 0:
+                action = "HOLD_FILTERED"
+                tgt_w = cur_w
+                delta_w = 0.0
+                abs_delta = 0.0
+                # Keep the persisted lifecycle weight consistent with the
+                # downgraded no-trade decision (no SELL order is emitted, so
+                # current_weight must remain the broker weight, not the
+                # unexecuted trim target that step_position_lifecycle may have
+                # already staged into state.current_weight).
+                state.current_weight = cur_w
+                lock_reason = f"未满最低持仓周期 (持仓 {state.held_bars} 日 < 最低 {min_holding_bars} 日，锁定防洗盘)"
+                reason = f"{lock_reason} | 原信号: {reason}" if reason and reason != lock_reason else lock_reason
+
             updated_lifecycle_states[sym] = state.to_dict()
 
         # Determine board price limits and 5m microstructure indicators (R10 & R11)
