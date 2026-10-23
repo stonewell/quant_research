@@ -24,7 +24,22 @@ class ChanFourStateBlendStrategy(BaseBlendAllocationStrategy):
     (`ChanFourStateExecutionStrategy`) and applying unified institutional risk controls.
     """
 
-    version: str = "1.1.0"
+    # 1.1.0 -> 1.2.0 (2026-10-22, first fix round): partial-trim tenure lock,
+    #   bucket-renorm clamp (Fix 3), regime hysteresis (Fix 4), relative trim
+    #   inertia (Fix 7), broker_weight snapshot (Fix 6), advisory labelling (Fix 5).
+    # 1.2.0 -> 1.2.1 (2026-10-22, correction round): behavioural corrections found
+    #   while verifying the first round against the live incident --
+    #   (a) SAFETY: the min-holding tenure lock no longer gates the stop-loss /
+    #       emergency-halt liquidation path (a 2-bar anti-whipsaw lock must never
+    #       convert a bounded stop into an unbounded tail loss);
+    #   (b) Fix 7's `cfsb_inertia_relative_ratio` raised 0.25 -> 0.30 because
+    #       0.25 * 0.20 (position cap) == 0.05 == the absolute floor, i.e. a
+    #       mathematical no-op;
+    #   (c) `blend_weighting_mode` restored to `regime_ic_ir_hybrid` in
+    #       strategies_config.json (the mode the 2026-10-22 live run executed
+    #       under; the first round's re-dump had silently reverted it to
+    #       `rolling_ic_ir`, which made Fix 3/4 inert). See docs/version.md §8.
+    version: str = "1.2.1"
 
     def __init__(self, config: Optional[StrategyConfig] = None, version: Optional[str] = None):
         cfg = config or StrategyConfig()

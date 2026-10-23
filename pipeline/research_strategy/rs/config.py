@@ -615,6 +615,19 @@ class StrategyConfig:
     cfsb_min_holding_bars: int = 2
     cfsb_min_entry_bars: int = 2
     cfsb_thrust_incumbent_bonus: float = 1.20
+    # (2026-10-22 incident, Fix 7) Relative trim-side inertia hurdle: a SELL
+    # trim must clear max(inertia_threshold, ratio * current_weight). Prevents
+    # micro-trims from being emitted as real SELL orders.
+    #
+    # Derivation vs the position cap: `cfsb_max_single_position` is 0.20, so the
+    # maximum incumbent weight any symbol can reach is ~0.20. A ratio of 0.25
+    # yields a hurdle of only 0.25*0.20 = 0.05, exactly equal to the absolute
+    # `cfsb_min_weight_change` (0.05) — i.e. a mathematical no-op (max(0.05, 0.05)
+    # never raises the hurdle). 0.30 restores a real damper: at the 0.20 cap the
+    # hurdle is 0.30*0.20 = 0.06 (> 0.05), and at the observed 600660 incumbent
+    # weight w=0.18 the hurdle is 0.30*0.18 = 0.054, which filters the 0.0501
+    # micro-trim that previously slipped through on the absolute 0.05 gate.
+    cfsb_inertia_relative_ratio: float = 0.30
 
     # --- Chan Crisis Shield Blend Strategy (chan_crisis_shield_blend) ---
     ccsb_three_type_weight: float = 0.45
@@ -778,6 +791,12 @@ class StrategyConfig:
     blend_adaptive_min_tstat: float = 2.0       # 显著性门槛 (HLZ t-stat)
     blend_adaptive_shrinkage: float = 0.20      # 贝叶斯向初始权重收缩系数
     blend_enable_orthogonalization: bool = True # Löwdin 对称正交化开关
+    # (2026-10-22 incident) Regime hysteresis (Fix 4) + bucket renormalization
+    # delta-clamp (Fix 3). Defaults are no-ops preserving legacy backtest parity.
+    blend_enable_regime_hysteresis: bool = False
+    blend_thrust_enter_thresh: float = 0.62
+    blend_thrust_exit_thresh: float = 0.58
+    blend_bucket_renorm_max_delta: Optional[float] = None
 
     # Blend Base Template aliases (unprefixed versions for convenience)
     weighting_mode: Optional[str] = None
