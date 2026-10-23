@@ -239,6 +239,182 @@ def is_run_dir(path: Optional[str]) -> bool:
     )
 
 
+# ---------------------------------------------------------------------------
+# Pytest-only safety net: live production paths must not be resolvable by accident
+# ---------------------------------------------------------------------------
+# FORENSIC CONTEXT (why this net exists -- it is not defensive paranoia):
+#   A bare `StorageManager(repo_root=<repo>)` resolves `cache_dir` to `<repo>/data`,
+#   the production directory holding the real `cache.duckdb`.  Worse, it loads the
+#   checked-in `web/livetrading/data/settings.json`, which pins `data_dir` /
+#   `archive_dir` to a LIVE portfolio directory OUTSIDE the repo.  So any unit test,
+#   ad-hoc script, or new feature that forgot to pass an explicit `cache_dir`
+#   silently wrote into the production market cache by default (observed in practice).
+#   `web/livetrading/tests/conftest.py` isolates the tests that live in that package
+#   through the env-var layer; this net closes the hole at the RESOLVER, so a scratch
+#   test in any other package, a doctest, or a future test module is covered too.
+#
+#   ZERO production behaviour change: everything below is gated on
+#   `PYTEST_CURRENT_TEST`, a variable only pytest sets.  When it is absent nothing is
+#   read, compared, logged, or raised -- resolution is exactly what it always was,
+#   with the same parameter > environment > settings.json > dynamic-default order.
+#   The guard inspects the FINAL resolved path (after `os.path.abspath`), so
+#   `./data`, `data/../data`, and symlinked aliases all collide with the real
+#   target instead of bypassing the check.
+#
+#   Escape hatch: `LIVETRADING_ALLOW_PRODUCTION_PATHS=1` for the rare test that
+#   genuinely must point at the real cache / live portfolio (deliberate read-only
+#   inspection tests).  The variable is honoured so an operator can always unblock
+#   themselves instead of deleting this net.
+
+_PYTEST_MARKER_ENV = "PYTEST_CURRENT_TEST"
+_ALLOW_PRODUCTION_ENV = "LIVETRADING_ALLOW_PRODUCTION_PATHS"
+_TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on", "y", "t"})
+#: Environment variables StorageManager consults for each guarded directory, so the
+#: actionable error can name the exact knob instead of a guessed variable name.
+_PATH_ENV_VARS = {
+    "data_dir": "LIVETRADING_DATA_DIR",
+    "archive_dir": "LIVETRADING_ARCHIVE_DIR",
+    "cache_dir": "LIVETRADING_CACHE_DIR",
+}
+#: The checked-in (committed) settings file, read only to learn which live
+#: directories the default resolution chain can reach.  Deliberately independent
+#: of the resolved `data_dir`, so the guard works before `data_dir` is trusted.
+_CHECKED_IN_SETTINGS_REL = os.path.join("web", "livetrading", "data", "settings.json")
+
+
+class ProductionPathError(RuntimeError):
+    """A pytest process tried to resolve a writable path onto live production state."""
+
+
+def _canonical_path(path: Any) -> str:
+    """Absolute, symlink- and `..`-resolved form of `path` for alias-proof comparison."""
+    return os.path.realpath(os.path.abspath(os.fspath(path)))
+
+
+def _is_within(path: Any, root: Any) -> bool:
+    """True when `path` is `root` or a descendant of it (both canonicalized first)."""
+    path_c = _canonical_path(path)
+    root_c = _canonical_path(root)
+    if path_c == root_c:
+        return True
+    try:
+        return os.path.commonpath([path_c, root_c]) == root_c
+    except ValueError:  # different drives (Windows): cannot possibly be nested
+        return False
+
+
+def _truthy_env(name: str) -> bool:
+    return str(os.environ.get(name, "")).strip().lower() in _TRUE_ENV_VALUES
+
+
+def production_guard_active() -> bool:
+    """True only when running under pytest without an explicit operator opt-in.
+
+    Single source of truth for the gate: `LIVETRADING_ALLOW_PRODUCTION_PATHS=1`
+    disables it, and outside pytest (`PYTEST_CURRENT_TEST` unset) it is always
+    inactive, which is what keeps production resolution untouched.
+    """
+    return bool(os.environ.get(_PYTEST_MARKER_ENV)) and not _truthy_env(_ALLOW_PRODUCTION_ENV)
+
+
+def production_path_roots(repo_root: str) -> List[Tuple[str, str]]:
+    """(label, directory) pairs a pytest process must never resolve a writable path into.
+
+    Two categories:
+      1. `<repo_root>/data` -- the repo's production market cache (`cache.duckdb`).
+      2. Any absolute directory the checked-in `settings.json` pins OUTSIDE the repo
+         -- i.e. the live portfolio directory (and therefore its `<dir>/runs` archive,
+         which the containment check catches as a descendant).
+    In-repo pins are skipped: they are either covered by (1) or ordinary workspace
+    directories (e.g. `docs/universe`), which tests are allowed to read.
+    """
+    roots: List[Tuple[str, str]] = [
+        (
+            "the production market cache (<repo_root>/data, holds cache.duckdb)",
+            os.path.join(repo_root, "data"),
+        ),
+    ]
+
+    settings_path = os.path.join(repo_root, _CHECKED_IN_SETTINGS_REL)
+    try:
+        with open(settings_path, "r", encoding="utf-8") as f:
+            checked_in = json.load(f)
+    except Exception:
+        checked_in = {}
+    if not isinstance(checked_in, dict):
+        return roots
+
+    # Collect the out-of-repo pins, merging keys that live under the same root
+    # (`data_dir=/live` and `archive_dir=/live/runs` are one location).
+    pinned: List[Tuple[str, List[str]]] = []
+    for key in ("data_dir", "archive_dir", "cache_dir"):
+        value = checked_in.get(key)
+        if not isinstance(value, str) or not value.strip() or not os.path.isabs(value):
+            continue
+        value_abs = os.path.abspath(value)
+        if _is_within(value_abs, repo_root):
+            continue
+        if any(_is_within(value_abs, root) for _, root in roots):
+            continue
+        for known_root, keys in pinned:
+            if _is_within(value_abs, known_root):
+                keys.append(key)
+                break
+        else:
+            pinned.append((value_abs, [key]))
+
+    for known_root, keys in pinned:
+        roots.append((
+            f"the live portfolio directory pinned by {_CHECKED_IN_SETTINGS_REL} "
+            f"(settings key(s) {', '.join(keys)})",
+            known_root,
+        ))
+    return roots
+
+
+def refuse_production_path(
+    kind: str,
+    path: str,
+    source: str,
+    roots: List[Tuple[str, str]],
+) -> None:
+    """Raise `ProductionPathError` if `path` lands on a live production location.
+
+    `source` names the leg of the precedence chain that produced the path, so the
+    message can tell the reader which knob to turn (`data_dir=` / env var /
+    `settings.json`) instead of only that something is wrong.
+    """
+    for label, root in roots:
+        if _is_within(path, root):
+            raise ProductionPathError(
+                f"Refusing to use {kind}={_canonical_path(path)} while running under pytest "
+                f"({_PYTEST_MARKER_ENV} is set): it resolves into {label} "
+                f"({_canonical_path(root)}), which is LIVE production state -- a test must "
+                f"never read or write it.\n"
+                f"  resolved from: {source}\n"
+                f"  fix: pass an explicit {kind}=<temporary directory> to StorageManager "
+                f"(or set the {_PATH_ENV_VARS.get(kind, 'LIVETRADING_' + kind.upper() + '_DIR')} "
+                f"environment variable), e.g. "
+                f"StorageManager({kind}=tmp_path / '{kind}'), and keep test data under "
+                f"the OS temporary root.\n"
+                f"  If this test genuinely must use production paths, opt in explicitly "
+                f"with {_ALLOW_PRODUCTION_ENV}=1."
+            )
+
+
+def _first_defined(*candidates: Tuple[str, Any]) -> Tuple[Any, str]:
+    """First truthy (value, source-label) pair -- the historical `a or b or c` chain.
+
+    Returns the source label too, purely so the pytest guard can name the exact leg
+    that resolved a bad path.  Semantics are identical to `or`-chaining (falsy
+    values such as None/""/0 are skipped).
+    """
+    for label, value in candidates:
+        if value:
+            return value, label
+    return None, ""
+
+
 class StorageManager:
     """Manages paths, settings, custom universes, holdings, account states, and daily archives."""
 
@@ -262,12 +438,31 @@ class StorageManager:
         )
         self.repo_root = os.path.abspath(self.repo_root)
 
-        # 2. Base data_dir
-        self.data_dir = os.path.abspath(
-            data_dir
-            or os.environ.get("LIVETRADING_DATA_DIR")
-            or os.path.join(self.repo_root, "web", "livetrading", "data")
+        # 1b. Pytest-only production-path net (a single env lookup in production).
+        #     Disabled entirely unless PYTEST_CURRENT_TEST is set, so resolution is
+        #     byte-for-byte unchanged for the live app, the CLI and the scripts.
+        _prod_guard_active = production_guard_active()
+        _prod_roots: List[Tuple[str, str]] = (
+            production_path_roots(self.repo_root) if _prod_guard_active else []
         )
+
+        def _guard_pytest_path(kind: str, value: str, source: str) -> None:
+            """Refuse to resolve a writable directory onto live production state under pytest."""
+            if _prod_guard_active:
+                refuse_production_path(kind, value, source, _prod_roots)
+
+        # 2. Base data_dir
+        _data_dir_value, _data_dir_source = _first_defined(
+            ("explicit data_dir argument", data_dir),
+            ("LIVETRADING_DATA_DIR environment variable", os.environ.get("LIVETRADING_DATA_DIR")),
+            (
+                "dynamic default <repo_root>/web/livetrading/data",
+                os.path.join(self.repo_root, "web", "livetrading", "data"),
+            ),
+        )
+        self.data_dir = os.path.abspath(_data_dir_value)
+        # Guard BEFORE makedirs: a refused path must not be created on disk.
+        _guard_pytest_path("data_dir", self.data_dir, _data_dir_source)
         os.makedirs(self.data_dir, exist_ok=True)
 
         # 3. Load persistent settings from settings.json if present
@@ -275,12 +470,17 @@ class StorageManager:
         saved_settings = self._load_json(self.settings_file, default={})
 
         # 4. Resolve remaining paths with hierarchy: Parameter > Env > Settings > Dynamic Default
-        self.archive_dir = os.path.abspath(
-            archive_dir
-            or os.environ.get("LIVETRADING_ARCHIVE_DIR")
-            or saved_settings.get("archive_dir")
-            or os.path.join(self.data_dir, "runs")
+        _archive_dir_value, _archive_dir_source = _first_defined(
+            ("explicit archive_dir argument", archive_dir),
+            ("LIVETRADING_ARCHIVE_DIR environment variable", os.environ.get("LIVETRADING_ARCHIVE_DIR")),
+            (f"settings.json key 'archive_dir' ({self.settings_file})", saved_settings.get("archive_dir")),
+            ("dynamic default <data_dir>/runs", os.path.join(self.data_dir, "runs")),
         )
+        self.archive_dir = os.path.abspath(_archive_dir_value)
+        # The daily run archive IS a production write target: the checked-in
+        # settings.json pins it to `<live portfolio>/runs`, and the dynamic default
+        # lands inside data_dir. Guarded for the same reason as cache_dir.
+        _guard_pytest_path("archive_dir", self.archive_dir, _archive_dir_source)
         os.makedirs(self.archive_dir, exist_ok=True)
 
         self.strategy_dir = os.path.abspath(
@@ -297,12 +497,14 @@ class StorageManager:
             or os.path.join(self.repo_root, "docs", "universe")
         )
 
-        self.cache_dir = os.path.abspath(
-            cache_dir
-            or os.environ.get("LIVETRADING_CACHE_DIR")
-            or saved_settings.get("cache_dir")
-            or os.path.join(self.repo_root, "data")
+        _cache_dir_value, _cache_dir_source = _first_defined(
+            ("explicit cache_dir argument", cache_dir),
+            ("LIVETRADING_CACHE_DIR environment variable", os.environ.get("LIVETRADING_CACHE_DIR")),
+            (f"settings.json key 'cache_dir' ({self.settings_file})", saved_settings.get("cache_dir")),
+            ("dynamic default <repo_root>/data", os.path.join(self.repo_root, "data")),
         )
+        self.cache_dir = os.path.abspath(_cache_dir_value)
+        _guard_pytest_path("cache_dir", self.cache_dir, _cache_dir_source)
 
         self.stage1_script = os.path.abspath(
             stage1_script

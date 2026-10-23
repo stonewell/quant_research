@@ -18,27 +18,359 @@ for p in [_WEB_DIR, _REPO_ROOT]:
 
 from execution_service import ExecutionService
 from server import create_app
-from storage import StorageManager, find_repo_root
+from storage import (
+    ProductionPathError,
+    StorageManager,
+    find_repo_root,
+    production_guard_active,
+    production_path_roots,
+)
 
 
 @pytest.fixture
 def temp_workspace():
-    """Create a temporary workspace directory for test data and archives."""
+    """Create a temporary workspace directory for test data and archives.
+
+    ``cache_dir`` is pinned here explicitly (defence in depth): without it
+    ``StorageManager`` falls back to ``<repo_root>/data``, the real production
+    directory holding ``cache.duckdb``.  The package-wide autouse fixture in
+    ``conftest.py`` already re-points every derived directory at ``tmp_path``,
+    but this fixture must stay hermetic even in isolation.
+    """
     temp_dir = tempfile.mkdtemp()
     data_dir = os.path.join(temp_dir, "data")
     archive_dir = os.path.join(temp_dir, "runs")
+    cache_dir = os.path.join(temp_dir, "duckdb_cache")
     os.makedirs(data_dir, exist_ok=True)
     os.makedirs(archive_dir, exist_ok=True)
+    os.makedirs(cache_dir, exist_ok=True)
 
     storage = StorageManager(
         repo_root=_REPO_ROOT,
         data_dir=data_dir,
         archive_dir=archive_dir,
+        cache_dir=cache_dir,
     )
 
     yield storage, temp_dir
 
     shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Hermeticity guard: the production DuckDB cache must be structurally
+# unreachable from this test package.
+# ---------------------------------------------------------------------------
+#: Paths no web test may ever treat as a writable workspace.  ``data`` is the
+#: live market cache (``data/cache.duckdb``); ``web/livetrading/data`` is the
+#: live ``settings.json`` / holdings / account-state directory whose
+#: ``settings.json`` itself pins ``cache_dir`` to the production cache.
+_PRODUCTION_CACHE_DIR = os.path.join(_REPO_ROOT, "data")
+_PRODUCTION_WEB_DATA_DIR = os.path.join(_WEB_DIR, "data")
+
+
+def _canonical(path):
+    return os.path.realpath(os.path.abspath(os.fspath(path)))
+
+
+def _is_inside(path, root):
+    path_c, root_c = _canonical(path), _canonical(root)
+    return path_c == root_c or path_c.startswith(root_c + os.sep)
+
+
+def _assert_hermetic(path, label):
+    """Loudly fail if ``path`` can reach the production cache or live state."""
+    resolved = _canonical(path)
+    for forbidden in (_PRODUCTION_CACHE_DIR, _PRODUCTION_WEB_DATA_DIR):
+        assert not _is_inside(resolved, forbidden), (
+            f"PRODUCTION-CACHE HAZARD: {label}={resolved} resolves into the "
+            f"production directory {forbidden}. A test in this suite would write to "
+            f"the live DuckDB market cache (data/cache.duckdb) or live portfolio "
+            f"state. Fix the hermetic autouse fixture in "
+            f"web/livetrading/tests/conftest.py (LIVETRADING_CACHE_DIR / "
+            f"LIVETRADING_DATA_DIR / LIVETRADING_ARCHIVE_DIR) instead of relaxing "
+            f"this guard."
+        )
+    assert not _is_inside(resolved, _REPO_ROOT), (
+        f"PRODUCTION-CACHE HAZARD: {label}={resolved} lives inside the repository "
+        f"checkout {_REPO_ROOT}. Tests must keep every writable storage path under "
+        f"the OS temporary root so a dropped data_provider kwarg cannot touch "
+        f"data/cache.duckdb."
+    )
+    assert _is_inside(resolved, tempfile.gettempdir()), (
+        f"PRODUCTION-CACHE HAZARD: {label}={resolved} is outside the OS temporary "
+        f"root {tempfile.gettempdir()}; the test workspace is no longer hermetic."
+    )
+    return resolved
+
+
+def test_storage_cache_dir_never_escapes_the_temp_workspace(temp_workspace):
+    """GUARD: storage/execution paths must resolve under tmp, never to repo data.
+
+    A ``StorageManager`` built with only ``repo_root`` exercises the full
+    default resolution chain (environment -> checked-in ``settings.json`` ->
+    ``<repo_root>/data``).  If the conftest hermetic fixture is deleted or
+    renamed, or ``StorageManager``'s precedence changes, this test fails loudly
+    instead of letting a later test silently write to the production cache.
+    """
+    storage, temp_dir = temp_workspace
+
+    # 1. Default resolution chain (the exact code path the audit flagged).
+    default_storage = StorageManager(repo_root=_REPO_ROOT)
+    for attr in ("cache_dir", "data_dir", "archive_dir"):
+        _assert_hermetic(getattr(default_storage, attr), f"StorageManager().{attr}")
+
+    # 2. Explicitly the same check for the production file the layer would open.
+    db_path = os.path.join(default_storage.cache_dir, "cache.duckdb")
+    _assert_hermetic(db_path, "StorageManager().cache_dir/cache.duckdb")
+    assert _canonical(default_storage.cache_dir) != _canonical(_PRODUCTION_CACHE_DIR)
+
+    # 3. The shared per-test fixture must be hermetic on its own as well.
+    assert _assert_hermetic(storage.cache_dir, "temp_workspace.cache_dir") == _canonical(
+        os.path.join(temp_dir, "duckdb_cache")
+    )
+    _assert_hermetic(storage.archive_dir, "temp_workspace.archive_dir")
+    _assert_hermetic(storage.data_dir, "temp_workspace.data_dir")
+
+
+def test_execution_service_argv_never_targets_production_cache(temp_workspace, monkeypatch):
+    """GUARD: run_live_deploy must shell out with a hermetic ``--cache-dir``.
+
+    This mirrors the audit's worst case: no ``data_provider`` kwarg is passed, so
+    the default provider chain (``"marketdb"`` when available) is exercised, and
+    only the monkeypatched ``subprocess.run`` keeps the command from executing.
+    """
+    import subprocess
+
+    storage, temp_dir = temp_workspace
+    service = ExecutionService(storage=storage)
+
+    captured_cmds = []
+
+    def mock_run(cmd, *args, **kwargs):
+        captured_cmds.append(cmd)
+
+        class MockProc:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return MockProc()
+
+    monkeypatch.setattr(subprocess, "run", mock_run)
+
+    strat_file = os.path.join(temp_dir, "guard_strat.json")
+    storage._save_json(strat_file, {"template_name": "dummy", "params": {}})
+
+    service.run_live_deploy(
+        strategy_file=strat_file,
+        custom_symbols=["600519.SH"],
+        as_of_date="2024-05-10",
+        portfolio_value=100000.0,
+    )
+
+    assert captured_cmds, "expected run_live_deploy to invoke run_live_strategy.py"
+    cmd = captured_cmds[0]
+    assert "--cache-dir" in cmd, f"run_live_deploy must pin --cache-dir explicitly: {cmd}"
+    cache_arg = cmd[cmd.index("--cache-dir") + 1]
+    _assert_hermetic(cache_arg, "run_live_deploy --cache-dir")
+    assert _canonical(cache_arg) == _canonical(storage.cache_dir)
+
+
+# ---------------------------------------------------------------------------
+# Resolver-level production-path guard (``storage.ProductionPathError``).
+#
+# ``conftest.py``'s autouse fixture protects THIS package by setting
+# ``LIVETRADING_{CACHE,DATA,ARCHIVE}_DIR``; the tests below prove the second,
+# independent layer: ``StorageManager`` itself refuses to resolve a writable
+# directory onto live production state whenever ``PYTEST_CURRENT_TEST`` is set,
+# so a scratch test elsewhere in the repo (or a future module that drops the
+# fixture) cannot write to ``data/cache.duckdb`` or the live portfolio dir.
+# ---------------------------------------------------------------------------
+#: Env vars the conftest fixture uses to isolate the workspace; cleared in the
+#: tests that need to exercise the *un-isolated* resolution chain.
+_ISOLATION_ENV_VARS = ("LIVETRADING_CACHE_DIR", "LIVETRADING_DATA_DIR", "LIVETRADING_ARCHIVE_DIR")
+
+
+def _clear_isolation_env(monkeypatch):
+    """Undo the conftest isolation (and any opt-in) so the raw chain is exercised."""
+    for name in _ISOLATION_ENV_VARS + ("LIVETRADING_ALLOW_PRODUCTION_PATHS",):
+        monkeypatch.delenv(name, raising=False)
+
+
+def _live_portfolio_dir_from_checked_in_settings():
+    """The out-of-repo live portfolio directory pinned by the committed settings.json."""
+    import json
+
+    settings_path = os.path.join(_PRODUCTION_WEB_DATA_DIR, "settings.json")
+    with open(settings_path, "r", encoding="utf-8") as f:
+        checked_in = json.load(f)
+    live_dir = checked_in.get("data_dir")
+    if not live_dir or _is_inside(live_dir, _REPO_ROOT):
+        return None
+    return live_dir
+
+
+def test_pytest_guard_refuses_repo_data_cache_dir(monkeypatch, tmp_path):
+    """GUARD: un-isolated resolution must not hand out ``<repo>/data`` under pytest.
+
+    ``data_dir`` is pinned to ``tmp_path`` on purpose so the checked-in
+    ``settings.json`` (which pins the live portfolio dir) is NOT loaded: this
+    isolates the single leg under test -- the dynamic default
+    ``<repo_root>/data`` for ``cache_dir`` -- and asserts the resolver refuses it
+    with an actionable message instead of silently returning the production path.
+    """
+    _clear_isolation_env(monkeypatch)
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_web_livetrading.py::test_x (call)")
+    assert production_guard_active() is True
+
+    with pytest.raises(ProductionPathError) as excinfo:
+        StorageManager(repo_root=_REPO_ROOT, data_dir=str(tmp_path / "data"))
+
+    msg = str(excinfo.value)
+    assert _canonical(_PRODUCTION_CACHE_DIR) in msg, msg
+    assert "production market cache" in msg, msg
+    assert "cache_dir=" in msg, msg
+    # ... and the message must name the fix, both escape routes.
+    assert "LIVETRADING_CACHE_DIR" in msg, msg
+    assert "LIVETRADING_ALLOW_PRODUCTION_PATHS=1" in msg, msg
+    # The refused value is the repo data dir itself, never some tmp surrogate.
+    assert not _is_inside(tmp_path / "data", _PRODUCTION_CACHE_DIR)
+
+
+def test_pytest_guard_refuses_live_portfolio_dir_and_wins_before_makedirs(monkeypatch):
+    """GUARD: the checked-in ``settings.json`` live portfolio dir is refused too.
+
+    ``data_dir`` deliberately points at the checked-in ``web/livetrading/data`` so the
+    committed ``settings.json`` is loaded, whose ``archive_dir`` is
+    ``<live portfolio>/runs``.  That archive path must be rejected, and the rejection
+    must happen BEFORE ``os.makedirs`` -- a refused path may never be created on disk.
+    """
+    live_dir = _live_portfolio_dir_from_checked_in_settings()
+    if not live_dir:
+        pytest.skip("checked-in settings.json pins no out-of-repo portfolio directory")
+
+    _clear_isolation_env(monkeypatch)
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_web_livetrading.py::test_y (call)")
+
+    created = []
+    real_makedirs = os.makedirs
+
+    def spy_makedirs(path, *args, **kwargs):
+        created.append(_canonical(path))
+        return real_makedirs(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "makedirs", spy_makedirs)
+
+    with pytest.raises(ProductionPathError) as excinfo:
+        StorageManager(repo_root=_REPO_ROOT, data_dir=_PRODUCTION_WEB_DATA_DIR)
+
+    msg = str(excinfo.value)
+    assert "live portfolio directory" in msg, msg
+    assert _canonical(live_dir) in msg, msg
+    assert "archive_dir=" in msg, msg
+    assert "settings.json" in msg, msg
+
+    leaked = [p for p in created if _is_inside(p, live_dir)]
+    assert not leaked, f"guard must fire before makedirs; created live dirs: {leaked}"
+
+
+def test_pytest_guard_opt_in_allows_production_cache(monkeypatch, tmp_path):
+    """``LIVETRADING_ALLOW_PRODUCTION_PATHS=1`` must restore the legacy resolution."""
+    _clear_isolation_env(monkeypatch)
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_web_livetrading.py::test_z (call)")
+    monkeypatch.setenv("LIVETRADING_ALLOW_PRODUCTION_PATHS", "1")
+
+    assert production_guard_active() is False
+    storage = StorageManager(repo_root=_REPO_ROOT, data_dir=str(tmp_path / "data"))
+    # Same construction that raised above now resolves exactly as production does...
+    assert _canonical(storage.cache_dir) == _canonical(_PRODUCTION_CACHE_DIR)
+    # ...without opening/creating anything (a path string is all we asked for).
+    assert not os.path.exists(os.path.join(str(tmp_path / "data"), "settings.json"))
+
+
+def test_resolution_is_untouched_outside_pytest(monkeypatch, tmp_path):
+    """ZERO-BEHAVIOUR-CHANGE PROOF: with ``PYTEST_CURRENT_TEST`` absent, legacy wins.
+
+    This is the production path: no marker, so the guard is never even consulted and
+    ``cache_dir`` still falls back to ``<repo_root>/data`` exactly as before.
+    """
+    _clear_isolation_env(monkeypatch)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    assert production_guard_active() is False
+
+    storage = StorageManager(repo_root=_REPO_ROOT, data_dir=str(tmp_path / "data"))
+    assert _canonical(storage.cache_dir) == _canonical(_PRODUCTION_CACHE_DIR)
+    assert os.path.isdir(storage.data_dir)
+    assert os.path.isdir(storage.archive_dir)
+
+
+def test_pytest_guard_catches_path_aliasing_and_symlinks(monkeypatch, tmp_path):
+    """``data/../data``, ``./data`` and a symlink to ``<repo>/data`` must all be caught."""
+    _clear_isolation_env(monkeypatch)
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_web_livetrading.py::test_alias (call)")
+
+    # 1. Dot-dot aliasing through the environment-variable leg.
+    aliased = os.path.join(_PRODUCTION_CACHE_DIR, "..", "data")
+    monkeypatch.setenv("LIVETRADING_CACHE_DIR", aliased)
+    with pytest.raises(ProductionPathError) as excinfo:
+        StorageManager(
+            repo_root=_REPO_ROOT,
+            data_dir=str(tmp_path / "data"),
+            archive_dir=str(tmp_path / "runs"),
+        )
+    assert "LIVETRADING_CACHE_DIR" in str(excinfo.value), str(excinfo.value)
+
+    # 2. A symlink pointing at the production cache.
+    link = tmp_path / "symlinked_cache"
+    os.symlink(_PRODUCTION_CACHE_DIR, str(link), target_is_directory=True)
+    monkeypatch.setenv("LIVETRADING_CACHE_DIR", str(link))
+    with pytest.raises(ProductionPathError) as excinfo:
+        StorageManager(
+            repo_root=_REPO_ROOT,
+            data_dir=str(tmp_path / "data"),
+            archive_dir=str(tmp_path / "runs"),
+        )
+    assert _canonical(_PRODUCTION_CACHE_DIR) in str(excinfo.value), str(excinfo.value)
+
+    # 3. The same alias on the data_dir leg (guarded before makedirs).
+    monkeypatch.delenv("LIVETRADING_CACHE_DIR", raising=False)
+    monkeypatch.setenv("LIVETRADING_DATA_DIR", os.path.join(_REPO_ROOT, "data", "..", "data"))
+    with pytest.raises(ProductionPathError) as excinfo:
+        StorageManager(repo_root=_REPO_ROOT)
+    assert "data_dir=" in str(excinfo.value), str(excinfo.value)
+
+
+def test_conftest_isolation_wins_before_the_pytest_guard(monkeypatch):
+    """ORDERING: env vars are consulted before the guard, so the fixture still wins.
+
+    ``PYTEST_CURRENT_TEST`` is genuinely set here (pytest sets it for every test) and
+    the autouse fixture has exported the three isolation variables.  A bare
+    ``StorageManager`` therefore resolves to ``tmp_path`` and the guard never fires --
+    which is exactly why the pre-existing hermeticity tests keep passing.
+    """
+    assert os.environ.get("PYTEST_CURRENT_TEST"), "pytest must set PYTEST_CURRENT_TEST"
+    assert production_guard_active() is True
+    for name in _ISOLATION_ENV_VARS:
+        assert os.environ.get(name), f"conftest must export {name}"
+
+    storage = StorageManager(repo_root=_REPO_ROOT)  # bare: no explicit dirs at all
+    for attr, env_name in (
+        ("cache_dir", "LIVETRADING_CACHE_DIR"),
+        ("data_dir", "LIVETRADING_DATA_DIR"),
+        ("archive_dir", "LIVETRADING_ARCHIVE_DIR"),
+    ):
+        resolved = getattr(storage, attr)
+        assert _canonical(resolved) == _canonical(os.environ[env_name]), (attr, resolved)
+        _assert_hermetic(resolved, f"bare StorageManager().{attr}")
+
+    # The second guarded root (the live portfolio pinned by the checked-in settings)
+    # is discoverable without ever resolving into it.
+    roots = production_path_roots(_REPO_ROOT)
+    assert any(_is_inside(_PRODUCTION_CACHE_DIR, root) for _, root in roots)
+    live_dir = _live_portfolio_dir_from_checked_in_settings()
+    if live_dir:
+        assert any(_is_inside(live_dir, root) for _, root in roots)
 
 
 def test_storage_manager_path_resolution(temp_workspace):
@@ -255,6 +587,17 @@ def test_execution_service_synthetic_runs(temp_workspace):
     assert health_res["health_report"] is not None
     assert "directive" in health_res["health_report"]
     assert health_res["health_report"]["directive"] in ("GO", "CAUTION", "NO_GO")
+    # (2026-10-22 live-path hardening, FIX 1 reconciliation) The coarse
+    # `directive` enum is NOT the whole story: Stage 1 also emits the granular
+    # `gate_code` (e.g. CAUTION_INTRADAY_DISTRIBUTION), which is what tells an
+    # operator "CAUTION because measured afternoon distribution" apart from
+    # "CAUTION because the drawdown tier is damping". Pin the relationship so
+    # neither side can drift: the granular code must map into the coarse family.
+    gate_code = health_res["health_report"].get("gate_code")
+    assert gate_code, "Stage 1 must keep emitting the granular gate_code"
+    assert gate_code == health_res["health_report"]["directive"] or gate_code.startswith(
+        health_res["health_report"]["directive"]
+    ), f"gate_code {gate_code} does not belong to directive {health_res['health_report']['directive']}"
 
     # 2. Stage 2 Live Deployment
     initial_holdings = {"601872.SH": 1000}
