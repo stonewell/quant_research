@@ -1795,17 +1795,32 @@
         if (!rep) return;
 
         // Directive Badge
-        const dir = rep.directive || "UNKNOWN";
+        // (2026-10-22 live-path hardening, FIX 1 reconciliation) Stage 1 emits
+        // GRANULAR gate codes (GO / CAUTION_DAMPING / CAUTION_DEFENSIVE /
+        // CAUTION_RECOVERING / CAUTION_INTRADAY_DISTRIBUTION /
+        // CAUTION_INTRADAY_TROUGH / NO_GO_EMERGENCY) alongside the coarse
+        // 3-value `directive`. Reports archived before that field existed still
+        // carry a granular value here, and the previous exact-match test painted
+        // ANY of them as the red "NO-GO / 严禁开仓" badge -- i.e. an
+        // intraday-distribution caution (BUY budget halved, sells unaffected)
+        // was displayed as a full emergency halt. Match by FAMILY instead, and
+        // render a genuinely unrecognised value as a neutral "unknown" badge
+        // rather than silently claiming the most extreme state.
+        const dir = rep.directive || rep.gate_code || "UNKNOWN";
+        const dirFam = String(dir).toUpperCase();
         el.badgeDirective.className = "badge badge-lg";
-        if (dir === "GO") {
+        if (dirFam.startsWith("GO")) {
             el.badgeDirective.classList.add("badge-go");
             el.badgeDirective.textContent = "🟢 GO (准许交易 / 正常风控预算)";
-        } else if (dir === "CAUTION") {
+        } else if (dirFam.startsWith("CAUTION")) {
             el.badgeDirective.classList.add("badge-caution");
             el.badgeDirective.textContent = "🟡 CAUTION (防守阻尼 / 缩减仓位)";
-        } else {
+        } else if (dirFam.startsWith("NO_GO")) {
             el.badgeDirective.classList.add("badge-nogo");
             el.badgeDirective.textContent = "🔴 NO-GO (熔断停牌 / 严禁开仓)";
+        } else {
+            el.badgeDirective.classList.add("badge-neutral");
+            el.badgeDirective.textContent = `❔ UNKNOWN DIRECTIVE (${dir})`;
         }
 
         // Metrics
