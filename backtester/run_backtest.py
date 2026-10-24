@@ -390,6 +390,7 @@ def _nan_fold_metrics() -> dict:
         "calmar_ratio": float("nan"), "win_rate": float("nan"), "profit_factor": float("nan"),
         "total_turnover": 0.0, "total_rebalances": 0,
         "rebalance_report": pd.DataFrame(columns=REBALANCE_REPORT_COLUMNS),
+        "actual_weights": pd.DataFrame(),
     }
 
 
@@ -483,6 +484,7 @@ def _evaluate_walkforward_fold(ctx: dict, spec: dict) -> tuple:
                         "total_turnover": result["total_turnover"],
                         "total_rebalances": result["total_rebalances"],
                         "rebalance_report": result.get("rebalance_report", pd.DataFrame(columns=REBALANCE_REPORT_COLUMNS)),
+                        "actual_weights": result.get("actual_weights", pd.DataFrame()),
                     }
     except Exception as e:  # noqa: BLE001 -- pre-B2.2 fail-soft contract, per fold
         return _nan_fold_metrics(), str(e)
@@ -1356,7 +1358,19 @@ def main():
         else:
             wf_trades_df = pd.DataFrame(columns=["fold"] + REBALANCE_REPORT_COLUMNS)
 
-        folds_clean = [{k: v for k, v in f.items() if k != "rebalance_report"} for f in folds]
+        all_wf_weights = []
+        for fold_idx, f in enumerate(folds, 1):
+            f_weights = f.get("actual_weights")
+            if f_weights is not None and not f_weights.empty:
+                df_w = f_weights.copy()
+                df_w.insert(0, "fold", fold_idx)
+                all_wf_weights.append(df_w)
+        if all_wf_weights:
+            wf_weights_df = pd.concat(all_wf_weights)
+        else:
+            wf_weights_df = pd.DataFrame()
+
+        folds_clean = [{k: v for k, v in f.items() if k not in ("rebalance_report", "actual_weights")} for f in folds]
         folds_df = pd.DataFrame(folds_clean)
 
         baseline_params = None
@@ -1464,6 +1478,10 @@ def main():
         if not wf_trades_df.empty:
             print("\nRecent Walkforward Rebalance Trades:")
             print(format_rebalance_trades_preview(wf_trades_df))
+
+        wf_weights_path = os.path.join(results_dir, "walkforward_weights.csv")
+        wf_weights_df.to_csv(wf_weights_path, index=True, index_label="date")
+        print(f"Saved walkforward actual weights to {wf_weights_path}")
 
 
 if __name__ == "__main__":

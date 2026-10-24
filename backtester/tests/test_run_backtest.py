@@ -1808,3 +1808,90 @@ def test_baseline_arm_forces_frictionless_trading_but_keeps_commission_and_slipp
 
     # The captured universe is the single baseline symbol, trimmed to one column.
     assert list(captured["universe"].keys()) == ["SPY"]
+
+
+# --- L2.37: Persist post-execution actual_weights in walkforward backtests ---
+
+
+def test_nan_fold_metrics_includes_empty_actual_weights():
+    """L2.37: _nan_fold_metrics includes actual_weights DataFrame."""
+    from backtester.run_backtest import _nan_fold_metrics
+    metrics = _nan_fold_metrics()
+    assert "actual_weights" in metrics
+    assert isinstance(metrics["actual_weights"], pd.DataFrame)
+    assert metrics["actual_weights"].empty
+
+
+def test_run_walkforward_includes_actual_weights_in_folds():
+    """L2.37: run_walkforward returns fold dictionaries containing actual_weights."""
+    universe = {
+        "A": make_df(np.linspace(100, 200, 252), start="2020-01-01"),
+        "B": make_df(np.linspace(100, 150, 252), start="2020-01-01"),
+    }
+    template = get_template("equal_weight")
+    params = {"rebalance_freq_days": 10}
+    args = MockArgs(window_years=0.5, step_years=0.25, start="2020-01-01")
+    folds = run_walkforward(universe, template, params, args)
+    assert len(folds) >= 2
+    for f in folds:
+        assert "actual_weights" in f
+        assert isinstance(f["actual_weights"], pd.DataFrame)
+        assert not f["actual_weights"].empty
+        assert "A" in f["actual_weights"].columns
+        assert "B" in f["actual_weights"].columns
+
+
+def test_walkforward_writes_walkforward_weights_csv(tmp_path, monkeypatch):
+    """L2.37: Walkforward backtest exports post-execution actual_weights to walkforward_weights.csv."""
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(strategy_path, template_name="equal_weight", params={"rebalance_freq_days": 21})
+    results_dir = tmp_path / "results_wf"
+    cache_dir = tmp_path / "cache_wf"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "AAPL", "MSFT",
+        "--data-provider", "synthetic",
+        "--mode", "walkforward",
+        "--window-years", "0.5",
+        "--step-years", "0.25",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    main()
+
+    # 1. Verify walkforward_weights.csv exists
+    weights_path = results_dir / "walkforward_weights.csv"
+    assert weights_path.exists()
+
+    # 2. Load walkforward_weights.csv and verify structure
+    df_weights = pd.read_csv(weights_path)
+    assert "date" in df_weights.columns
+    assert "fold" in df_weights.columns
+    assert "AAPL" in df_weights.columns
+    assert "MSFT" in df_weights.columns
+    assert len(df_weights) > 0
+
+    # 3. Verify folds are ordered 1..N
+    unique_folds = list(df_weights["fold"].unique())
+    assert unique_folds == list(range(1, len(unique_folds) + 1))
+
+    # 4. Verify post-execution weights sum to approximately 1.0
+    for fold in unique_folds:
+        fold_rows = df_weights[df_weights["fold"] == fold]
+        assert len(fold_rows) > 0
+        total_w = fold_rows["AAPL"] + fold_rows["MSFT"]
+        assert (total_w >= 0.95).all() and (total_w <= 1.05).all()
+
+    # 5. Verify scalar metrics in walkforward_report.csv remain scalar
+    report_path = results_dir / "walkforward_report.csv"
+    assert report_path.exists()
+    df_report = pd.read_csv(report_path)
+    assert "actual_weights" not in df_report.columns
+    assert "rebalance_report" not in df_report.columns
+    assert "sharpe_ratio" in df_report.columns
+    assert "cagr" in df_report.columns
+    assert "total_rebalances" in df_report.columns
+
