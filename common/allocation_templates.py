@@ -228,6 +228,7 @@ def _step_asset_inertia(
     asymmetric_sells: bool = False,
     entry_threshold: Optional[float] = None,
     min_holding_bars: int = 0,
+    asymmetric_sell_ratio: float = 0.60,
 ) -> pd.Series:
     """Single-bar asset-level inertia filter step updating `holding_age` and `last_buy_bar` in place."""
     if em_row is not None:
@@ -250,7 +251,7 @@ def _step_asset_inertia(
     if is_global_emergency:
         return ideal_w.copy()
 
-    sell_thresh = (thresh_t * 0.60) if asymmetric_sells else thresh_t
+    sell_thresh = (thresh_t * float(asymmetric_sell_ratio)) if asymmetric_sells else thresh_t
     buy_thresh = thresh_t.copy()
     if entry_threshold is not None:
         new_entry_mask = (current_w[risky_symbols] <= 1e-4)
@@ -318,17 +319,19 @@ def apply_asset_inertia(
     asymmetric_sells: bool = False,
     entry_threshold: Optional[float] = None,
     min_holding_bars: int = 0,
+    asymmetric_sell_ratio: float = 0.60,
 ) -> pd.DataFrame:
     """Filters daily target-weight allocations using asset-level inertia (Option A).
 
     For each asset, if the change in ideal target weight versus the currently held
     target weight is below `min_weight_change`, the asset's target weight is frozen
     at its previous held value. Supports uniform float, per-asset dict, pd.Series,
-    or date-indexed pd.DataFrame thresholds, tighter asymmetric sell bands (60%
-    threshold on trimming), an optional `entry_threshold` allowing new position
-    initiations to enter without being blocked by volatility-scaled rebalancing
-    inertia, and an optional `min_holding_bars` to suppress premature sell/trim
-    flips before a minimum holding tenure has elapsed.
+    or date-indexed pd.DataFrame thresholds, tighter asymmetric sell bands (default
+    60% threshold on trimming, parameterized via `asymmetric_sell_ratio`), an
+    optional `entry_threshold` allowing new position initiations to enter without
+    being blocked by volatility-scaled rebalancing inertia, and an optional
+    `min_holding_bars` to suppress premature sell/trim flips before a minimum
+    holding tenure has elapsed.
 
     When significant changes occur (|diff| >= min_weight_change):
     1. Sells execute first to release cash capacity (subject to `min_holding_bars` unless emergency).
@@ -388,6 +391,7 @@ def apply_asset_inertia(
             asymmetric_sells=asymmetric_sells,
             entry_threshold=entry_threshold,
             min_holding_bars=min_holding_bars,
+            asymmetric_sell_ratio=asymmetric_sell_ratio,
         )
         filtered.iloc[t] = current_w
 
@@ -400,6 +404,7 @@ def _sparse_from_daily(
     cash_proxy: Optional[str] = None,
     emergency_mask: Optional[pd.Series] = None,
     asymmetric_sells: bool = False,
+    asymmetric_sell_ratio: float = 0.60,
 ) -> pd.DataFrame:
     """Compress a dense daily target-weight DataFrame to the sparse contract:
     NaN except on a day the target actually differs from the previous day's.
@@ -421,6 +426,7 @@ def _sparse_from_daily(
             cash_proxy=cash_proxy,
             emergency_mask=emergency_mask,
             asymmetric_sells=asymmetric_sells,
+            asymmetric_sell_ratio=asymmetric_sell_ratio,
         )
     changed = (daily != daily.shift(1)).any(axis=1)
     changed.iloc[0] = True

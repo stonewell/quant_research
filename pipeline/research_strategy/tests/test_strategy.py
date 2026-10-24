@@ -1088,9 +1088,10 @@ def test_grid_resumes_trading_after_cooldown_finishes():
 
 
 def test_grid_ignores_stale_symbol_param_and_trades_universe_instead():
+    assert not hasattr(StrategyConfig(), "grid_symbol")
     universe = _timing_universe(make_oscillating_df(n=100))
     default_weights = AdaptiveGridStrategy(StrategyConfig()).generate_weights(universe)
-    stale_weights = AdaptiveGridStrategy(StrategyConfig(grid_symbol="NOT_IN_UNIVERSE")).generate_weights(universe)
+    stale_weights = AdaptiveGridStrategy(StrategyConfig()).generate_weights(universe, params={"grid_symbol": "NOT_IN_UNIVERSE"})
     pd.testing.assert_frame_equal(default_weights, stale_weights)
 
 
@@ -1145,9 +1146,10 @@ def test_ensemble_downtrend_always_forces_cash_regardless_of_mode():
 
 
 def test_ensemble_ignores_stale_symbol_param_and_trades_universe_instead():
+    assert not hasattr(StrategyConfig(), "ensemble_symbol")
     universe = _timing_universe(make_trending_pullback_df(n=100))
     default_weights = EnsembleRegimeSwitchingStrategy(StrategyConfig()).generate_weights(universe)
-    stale_weights = EnsembleRegimeSwitchingStrategy(StrategyConfig(ensemble_symbol="NOT_IN_UNIVERSE")).generate_weights(universe)
+    stale_weights = EnsembleRegimeSwitchingStrategy(StrategyConfig()).generate_weights(universe, params={"ensemble_symbol": "NOT_IN_UNIVERSE"})
     pd.testing.assert_frame_equal(default_weights, stale_weights)
 
 

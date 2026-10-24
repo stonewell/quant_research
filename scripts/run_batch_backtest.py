@@ -297,7 +297,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Equivalent of the old serial shell loop (pipeline/scripts/backtest_blend_strategies.sh):\n"
             "  uv run python scripts/run_batch_backtest.py \\\n"
             "    --strategies-glob 'pipeline/research_strategy/results/strategy_dumps/*blend*.json' \\\n"
-            "    --universe-file docs/universe/china/50_stock.txt \\\n"
+            "    --universe-file docs/universe/china/core_satellite_22_stocks.txt \\\n"
             "    --start 2022-01-01 --end 2026-01-01 \\\n"
             "    --window-years 0.25 --step-years 0.25 --min-shares 100 --china-trading \\\n"
             "    --baseline-symbol 000300.SH --data-provider fuyao \\\n"
@@ -316,6 +316,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "'pipeline/research_strategy/results/strategy_dumps/*blend*.json'. Preferred over letting "
              "bash expand a bare glob: an empty expansion is reported as an error instead of being "
              "passed through as a literal filename.",
+    )
+    p.add_argument(
+        "--dump-strategies-first", action="store_true",
+        help="Run research_strategy/run_research_strategy.py --dump-strategies before starting "
+             "the batch backtest so strategy_dumps/*.json are fresh.",
     )
     add_universe_cli_args(p)
     p.add_argument("--start", default="2015-01-01")
@@ -343,6 +348,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "research_strategy_spec.entry_data.parameters), exactly like run_backtest.py's "
                         "own --strategy-params. The old shell script's WEIGHTING_MODE / "
                         "ENABLE_ORTHOGONALIZATION / EXTRA_PARAMS env vars map onto this.")
+    p.add_argument("--extra-params", "--extra", dest="extra_params",
+                   default=os.environ.get("EXTRA_PARAMS", None),
+                   help="JSON object merged into strategy params (fallback to EXTRA_PARAMS env var).")
     p.add_argument("--seed", type=int, default=None,
                    help="Master seed forwarded to run_backtest's per-fold SeedSequence derivation.")
     p.add_argument("--inner-n-jobs", type=parse_n_jobs_arg, default=1, metavar="N",
@@ -1551,6 +1559,14 @@ def _print_ranking(ranking: pd.DataFrame, top: int) -> None:
         print(f"... {len(ranking) - len(shown)} more row(s) in batch_ranking.csv")
 
 
+def dump_strategies_first(repo_root=None) -> None:
+    """Run `research_strategy/run_research_strategy.py --dump-strategies`."""
+    root = repo_root or _REPO_ROOT
+    run_rs = os.path.join(root, "pipeline", "research_strategy", "run_research_strategy.py")
+    print(f"Running dump_strategies first: {run_rs} --dump-strategies ...", flush=True)
+    subprocess.run([sys.executable, run_rs, "--dump-strategies"], check=True)
+
+
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
@@ -1567,16 +1583,39 @@ def run_batch(args) -> dict:
     if sum([bool(args.china_trading), bool(args.us_trading), bool(args.hk_trading)]) > 1:
         raise ValueError("Only one of --china-trading, --us-trading, --hk-trading may be enabled.")
 
+    if getattr(args, "dump_strategies_first", False):
+        dump_strategies_first()
+
     overrides = {}
-    if args.strategy_params:
-        try:
-            overrides = json.loads(args.strategy_params)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Failed to parse --strategy-params JSON string: {exc}") from exc
+    if getattr(args, "strategy_params", None):
+        if isinstance(args.strategy_params, dict):
+            overrides = dict(args.strategy_params)
+        else:
+            try:
+                overrides = json.loads(args.strategy_params)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Failed to parse --strategy-params JSON string: {exc}") from exc
         if not isinstance(overrides, dict):
             raise ValueError(
                 f"--strategy-params must be a JSON object, got {type(overrides).__name__}."
             )
+
+    if getattr(args, "extra_params", None):
+        if isinstance(args.extra_params, dict):
+            extra_dict = args.extra_params
+        else:
+            try:
+                extra_dict = json.loads(args.extra_params)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Failed to parse --extra-params JSON string: {exc}") from exc
+        if not isinstance(extra_dict, dict):
+            raise ValueError(
+                f"--extra-params must be a JSON object, got {type(extra_dict).__name__}."
+            )
+        overrides.update(extra_dict)
+
+    if overrides:
+        args.strategy_params = json.dumps(overrides)
 
     strategy_files = resolve_strategy_files(args)
     subdirs = _unique_stems(strategy_files)

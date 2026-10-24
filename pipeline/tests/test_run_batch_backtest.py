@@ -803,3 +803,132 @@ def test_collect_provenance_never_breaks_the_run_when_every_probe_fails(tmp_path
     assert "git not found" in summary["provenance"]["errors"]["git_commit"]
     assert summary["n_ok"] == 1
     assert os.path.exists(os.path.join(out, summary["provenance_file"]))
+
+
+# --------------------------------------------------------------------------- #
+# B5.1: --dump-strategies-first & EXTRA_PARAMS tests
+# --------------------------------------------------------------------------- #
+def test_dump_strategies_first_arg_and_invocation(tmp_path, monkeypatch):
+    """Test --dump-strategies-first CLI flag and that dump_strategies_first is called."""
+    parser = batch.build_arg_parser()
+    args = parser.parse_args(["--dump-strategies-first"])
+    assert args.dump_strategies_first is True
+
+    called = []
+    def _mock_dump(repo_root=None):
+        called.append(repo_root)
+
+    monkeypatch.setattr(batch, "dump_strategies_first", _mock_dump)
+    u_file = _write_universe_file(tmp_path)
+    strat = _write_strategy(tmp_path, "strat1", "equal_weight", {})
+    args = parser.parse_args([
+        "--strategies", strat,
+        "--universe-file", u_file,
+        "--dump-strategies-first",
+        "--output-dir", str(tmp_path / "out"),
+    ])
+
+    def _mock_run_serial(tasks, state):
+        return [{
+            "strategy": t["name"], "stem": t["stem"], "path": t["path"],
+            "template_name": t.get("template_name"), "results_dir": t["results_dir"],
+            "status": "ok", "error": None, "traceback": None,
+            "summary": {"n_folds": 1, "n_valid_folds": 1, "mean_sharpe_ratio": 1.0,
+                        "mean_cagr": 0.1, "mean_max_drawdown": 0.05, "mean_calmar_ratio": 2.0,
+                        "deflated_sharpe_ratio": 0.9, "fold_sharpe_std": 0.0, "rolling_window_performance": []},
+            "elapsed_seconds": 0.1,
+        } for t in tasks]
+
+    monkeypatch.setattr(batch, "_run_serial", _mock_run_serial)
+    batch.run_batch(args)
+    assert len(called) == 1
+
+
+def test_dump_strategies_first_subprocess_call(monkeypatch):
+    """Test dump_strategies_first invokes run_research_strategy.py --dump-strategies."""
+    calls = []
+    def _mock_subp_run(cmd, check):
+        calls.append((cmd, check))
+
+    monkeypatch.setattr(subprocess, "run", _mock_subp_run)
+    batch.dump_strategies_first("/mock/repo")
+    assert len(calls) == 1
+    cmd, check = calls[0]
+    assert cmd[0] == sys.executable
+    assert cmd[1].endswith(os.path.join("pipeline", "research_strategy", "run_research_strategy.py"))
+    assert cmd[2] == "--dump-strategies"
+    assert check is True
+
+
+def test_extra_params_cli_and_alias():
+    """Verify --extra-params and --extra alias parse correctly."""
+    parser = batch.build_arg_parser()
+    args1 = parser.parse_args(["--extra-params", '{"alpha": 1}'])
+    assert args1.extra_params == '{"alpha": 1}'
+
+    args2 = parser.parse_args(["--extra", '{"beta": 2}'])
+    assert args2.extra_params == '{"beta": 2}'
+
+
+def test_extra_params_env_var_fallback(monkeypatch):
+    """Verify EXTRA_PARAMS environment variable serves as fallback."""
+    monkeypatch.setenv("EXTRA_PARAMS", '{"env_key": "val"}')
+    parser = batch.build_arg_parser()
+    args = parser.parse_args([])
+    assert args.extra_params == '{"env_key": "val"}'
+
+    # CLI flag overrides env var
+    args_cli = parser.parse_args(["--extra-params", '{"cli_key": "cli_val"}'])
+    assert args_cli.extra_params == '{"cli_key": "cli_val"}'
+
+
+def test_extra_params_merge_into_strategy_params(tmp_path, monkeypatch):
+    """Verify extra_params merges into strategy_params and overrides."""
+    u_file = _write_universe_file(tmp_path)
+    strat = _write_strategy(tmp_path, "strat_m", "equal_weight", {"base_p": 10})
+    parser = batch.build_arg_parser()
+    args = parser.parse_args([
+        "--strategies", strat,
+        "--universe-file", u_file,
+        "--strategy-params", '{"p1": 1, "p2": 2}',
+        "--extra-params", '{"p2": 99, "p3": 3}',
+        "--output-dir", str(tmp_path / "out_m"),
+    ])
+
+    captured_overrides = []
+    orig_probe = batch._probe_strategy
+    def _spy_probe(path, a, overrides):
+        captured_overrides.append(overrides)
+        return orig_probe(path, a, overrides)
+
+    def _mock_run_serial(tasks, state):
+        return [{
+            "strategy": t["name"], "stem": t["stem"], "path": t["path"],
+            "template_name": t.get("template_name"), "results_dir": t["results_dir"],
+            "status": "ok", "error": None, "traceback": None,
+            "summary": {"n_folds": 1, "n_valid_folds": 1, "mean_sharpe_ratio": 1.0,
+                        "mean_cagr": 0.1, "mean_max_drawdown": 0.05, "mean_calmar_ratio": 2.0,
+                        "deflated_sharpe_ratio": 0.9, "fold_sharpe_std": 0.0, "rolling_window_performance": []},
+            "elapsed_seconds": 0.1,
+        } for t in tasks]
+
+    monkeypatch.setattr(batch, "_probe_strategy", _spy_probe)
+    monkeypatch.setattr(batch, "_run_serial", _mock_run_serial)
+    batch.run_batch(args)
+
+    assert len(captured_overrides) == 1
+    assert captured_overrides[0] == {"p1": 1, "p2": 99, "p3": 3}
+    assert json.loads(args.strategy_params) == {"p1": 1, "p2": 99, "p3": 3}
+
+
+def test_extra_params_invalid_json_raises(tmp_path):
+    """Verify malformed JSON in --extra-params raises ValueError."""
+    parser = batch.build_arg_parser()
+    args = parser.parse_args(["--extra-params", "{bad_json}"])
+    with pytest.raises(ValueError, match="Failed to parse --extra-params JSON string"):
+        batch.run_batch(args)
+
+    args_not_dict = parser.parse_args(["--extra-params", '["not", "dict"]'])
+    with pytest.raises(ValueError, match="--extra-params must be a JSON object"):
+        batch.run_batch(args_not_dict)
+

@@ -148,3 +148,50 @@ def test_apply_asset_inertia_emergency_override():
     np.testing.assert_allclose(filtered.loc[dates[1], "A"], 0.195)
     np.testing.assert_allclose(filtered.loc[dates[1], "CASH"], 0.805)
 
+
+def test_apply_asset_inertia_asymmetric_sells_ratio_anchor():
+    """Verify asymmetric_sell_ratio parameterization and default 0.60 backward compatibility."""
+    dates = pd.bdate_range("2023-01-01", periods=4)
+    # Asset A starts at 0.50.
+    # Day 1: drops to 0.43 (diff = -0.07). With thresh=0.10:
+    #   ratio=0.60 -> sell_thresh = 0.06 -> diff <= -0.06 -> sells! (weight = 0.43)
+    #   ratio=0.80 -> sell_thresh = 0.08 -> diff > -0.08 -> suppressed! (weight = 0.50)
+    df1 = pd.DataFrame(
+        {
+            "A": [0.50, 0.43, 0.43, 0.43],
+            "CASH": [0.50, 0.57, 0.57, 0.57],
+        },
+        index=dates,
+    )
+    # Default ratio (0.60) vs explicit ratio=0.60 parity
+    res_default = apply_asset_inertia(df1, min_weight_change=0.10, cash_proxy="CASH", asymmetric_sells=True)
+    res_explicit_06 = apply_asset_inertia(df1, min_weight_change=0.10, cash_proxy="CASH", asymmetric_sells=True, asymmetric_sell_ratio=0.60)
+    pd.testing.assert_frame_equal(res_default, res_explicit_06)
+    # Day 1 sells because diff (-0.07) <= -0.06
+    np.testing.assert_allclose(res_default.loc[dates[1], "A"], 0.43)
+
+    # With ratio=0.80, sell_thresh is 0.08, so diff=-0.07 does not trigger sell
+    res_08 = apply_asset_inertia(df1, min_weight_change=0.10, cash_proxy="CASH", asymmetric_sells=True, asymmetric_sell_ratio=0.80)
+    np.testing.assert_allclose(res_08.loc[dates[1], "A"], 0.50)
+
+    # df2 for ratio=0.40 test:
+    df2 = pd.DataFrame(
+        {
+            "A": [0.50, 0.45, 0.45, 0.45],
+            "CASH": [0.50, 0.55, 0.55, 0.55],
+        },
+        index=dates,
+    )
+    # With ratio=0.60, diff=-0.05 > -0.06 -> suppressed (0.50)
+    res_06_df2 = apply_asset_inertia(df2, min_weight_change=0.10, cash_proxy="CASH", asymmetric_sells=True, asymmetric_sell_ratio=0.60)
+    np.testing.assert_allclose(res_06_df2.loc[dates[1], "A"], 0.50)
+
+    # With ratio=0.40, sell_thresh is 0.04, diff=-0.05 <= -0.04 -> sells (0.45)
+    res_04_df2 = apply_asset_inertia(df2, min_weight_change=0.10, cash_proxy="CASH", asymmetric_sells=True, asymmetric_sell_ratio=0.40)
+    np.testing.assert_allclose(res_04_df2.loc[dates[1], "A"], 0.45)
+
+    # When asymmetric_sells=False, asymmetric_sell_ratio has no effect (thresh stays 0.10)
+    res_sym = apply_asset_inertia(df1, min_weight_change=0.10, cash_proxy="CASH", asymmetric_sells=False, asymmetric_sell_ratio=0.40)
+    np.testing.assert_allclose(res_sym.loc[dates[1], "A"], 0.50)
+
+

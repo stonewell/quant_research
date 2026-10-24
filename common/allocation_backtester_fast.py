@@ -670,6 +670,58 @@ else:
 
 _ACTIVE_KERNEL = JIT_KERNEL if JIT_KERNEL is not None else close_mode_kernel
 
+UNPORTED_PRODUCTION_KEYS = frozenset({
+    "deferral_report",
+    "cash_carry_report",
+    "total_market_impact",
+    "total_cash_interest",
+    "total_borrow_fees",
+    "total_borrow_fees_unpaid",
+})
+
+
+class FastBacktestResult(dict):
+    """Result dictionary from `run_allocation_backtest_fast` (task B5.3).
+
+    Guards against schema drift by raising NotImplementedError when accessing
+    unported production keys that exist in `run_allocation_backtest` but are not
+    supported by the fast array kernel. All THREE read paths are guarded --
+    `res[key]`, `res.get(key)` and `key in res` -- so `in` can never answer False
+    for a key `[]`/`.get()` refuse to answer at all (that disagreement was a real
+    hole in the first version of this guard).
+    """
+
+    def __getitem__(self, key):
+        if key in UNPORTED_PRODUCTION_KEYS:
+            raise NotImplementedError(
+                f"run_allocation_backtest_fast does not port production key {key!r}; "
+                f"use run_allocation_backtest for full production reports."
+            )
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        if key in UNPORTED_PRODUCTION_KEYS:
+            raise NotImplementedError(
+                f"run_allocation_backtest_fast does not port production key {key!r}; "
+                f"use run_allocation_backtest for full production reports."
+            )
+        return super().get(key, default)
+
+    def __contains__(self, key):
+        # Without this override, `"deferral_report" in res` fell through to dict's
+        # C-level membership test and answered False while `res["deferral_report"]`
+        # and `res.get("deferral_report")` raised -- i.e. `in` DISAGREED with both,
+        # so the exact drift guard B5.3 installed could be bypassed by a `has_key`
+        # style probe (`if "deferral_report" in res: ...` then never touching []).
+        # `dict.__contains__` (not `super().__contains__`) keeps this off the
+        # `__getitem__` path and makes the recursion impossible in principle.
+        if key in UNPORTED_PRODUCTION_KEYS:
+            raise NotImplementedError(
+                f"run_allocation_backtest_fast does not port production key {key!r}; "
+                f"use run_allocation_backtest for full production reports."
+            )
+        return dict.__contains__(self, key)
+
 
 def run_allocation_backtest_fast(
     universe: Dict[str, pd.DataFrame],
@@ -708,6 +760,11 @@ def run_allocation_backtest_fast(
     绩效指标（sharpe/cagr/...）：本内核的交付物是**账本本身**，指标由调用方
     从 `equity_curve` 自行计算，避免第二处定义漂移。
     """
+    if minimal_metrics:
+        raise NotImplementedError(
+            "run_allocation_backtest_fast does not implement minimal_metrics=True; "
+            "use run_allocation_backtest."
+        )
     if execution_price != "close":
         raise ValueError(
             "run_allocation_backtest_fast only implements execution_price='close' "
@@ -744,7 +801,7 @@ def run_allocation_backtest_fast(
 
     symbols = list(universe.keys())
     if not symbols or target_weights.empty:
-        return {"equity_curve": pd.DataFrame(), "turnover": 0.0}
+        return FastBacktestResult({"equity_curve": pd.DataFrame(), "turnover": 0.0})
 
     closes = pd.DataFrame({sym: df["Close"] for sym, df in universe.items()})
     highs = pd.DataFrame({sym: df["High"] if "High" in df.columns else df["Close"] for sym, df in universe.items()})
@@ -752,7 +809,7 @@ def run_allocation_backtest_fast(
 
     common_idx = closes.index.intersection(target_weights.index)
     if len(common_idx) == 0:
-        return {"equity_curve": pd.DataFrame(), "turnover": 0.0}
+        return FastBacktestResult({"equity_curve": pd.DataFrame(), "turnover": 0.0})
     closes = closes.loc[common_idx]
     highs = highs.loc[common_idx]
     lows = lows.loc[common_idx]
@@ -853,7 +910,7 @@ def run_allocation_backtest_fast(
     equity_df["equity"] = out_equity
     actual_weights_df = pd.DataFrame(out_actual_w, index=common_idx, columns=symbols)
 
-    return {
+    return FastBacktestResult({
         "equity_curve": equity_df,
         "actual_weights": actual_weights_df,
         "rebalance_report": rebalance_report_df,
@@ -864,4 +921,4 @@ def run_allocation_backtest_fast(
         "kernel": "numba" if JIT_KERNEL is not None else "numpy",
         "kernel_version": KERNEL_VERSION,
         "kernel_status": KERNEL_STATUS,
-    }
+    })

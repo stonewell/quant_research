@@ -1635,17 +1635,21 @@ def run_allocation_backtest(
         for c in sells:
             sym = c["symbol"]
             price = c["price"]
-            # (B3.5) SIGN CONVENTION: a SELL is a NEGATIVE signed share delta
+            # (B3.5 / B5.2) SIGN CONVENTION: a SELL is a NEGATIVE signed share delta
             # for EVERY prior sign. Reducing a long and ADDING to a short are
             # the same arithmetic, `new_s = prior_s - trade_s`. The pre-B3.5
             # `prior_s + trade_s if prior_s <= 0` branch inverted it: a short
             # opened from flat became a LONG of `+trade_s` shares (and a short
             # top-up covered instead of extending), while the cash flow was
-            # booked with the inverted sign too. The `|prior_s|` clamp below is
-            # a LONG-ONLY guard (a sell may never be financed past flat by
-            # shares the book does not own); a short needs no clamp, since
-            # adding to it only ever releases cash.
-            trade_s = min(c["trade_s"], c["prior_s"]) if c["prior_s"] > 0 else c["trade_s"]
+            # booked with the inverted sign too. The `|prior_s|` clamp is a
+            # LONG-TARGET guard: when target_w >= -1e-7, a sell may never be
+            # financed past flat into an unintended short; but when target_w < -1e-7
+            # (a long-to-short flip or short expansion), trade_s spans across flat
+            # and must NOT be clamped to prior_s.
+            if c["target_w"] >= -1e-7 and c["prior_s"] > 0:
+                trade_s = min(c["trade_s"], c["prior_s"])
+            else:
+                trade_s = c["trade_s"]
             if trade_s <= 0:
                 continue
             new_s = c["prior_s"] - trade_s
@@ -1676,7 +1680,7 @@ def run_allocation_backtest(
             pending_remaining[c["i"]] = bool(c.get("capped", False))
             if c.get("capped", False):
                 _record_deferral(
-                    day, c["i"], "SELL" if c["prior_s"] > 0 else "BUY",
+                    day, c["i"], "SELL",
                     "volume_participation_cap", price, c["target_w"],
                 )
             n_fills += 1
@@ -2200,12 +2204,14 @@ def run_allocation_backtest(
             for c in sells:
                 sym = c["symbol"]
                 price = c["price"]
-                # (B3.5) Same sign convention as `_execute_pending`: a SELL is a
-                # negative signed share delta for EVERY prior sign, so the
-                # "make the short more negative" case (`prior_s < 0`,
-                # `delta_w < 0`) extends the short instead of covering it. See
-                # the B3.5 note in the `next_*` sell loop.
-                trade_s = min(c["trade_s"], c["prior_s"]) if c["prior_s"] > 0 else c["trade_s"]
+                # (B3.5 / B5.2) Same sign convention as `_execute_pending`: a SELL is a
+                # negative signed share delta for EVERY prior sign. The clamp to prior_s
+                # is a LONG-TARGET guard (target_w >= -1e-7); for target_w < -1e-7
+                # (long-to-short flip), trade_s spans across flat and must NOT be clamped to prior_s.
+                if c["target_w"] >= -1e-7 and c["prior_s"] > 0:
+                    trade_s = min(c["trade_s"], c["prior_s"])
+                else:
+                    trade_s = c["trade_s"]
                 # (B3.2) Liquidity budget, applied AFTER every sizing rule so it
                 # can only cut. The unfilled remainder goes back on the B3.1
                 # queue (`_queue_residual`) and is retried at a later close --

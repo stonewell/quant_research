@@ -168,7 +168,6 @@ class StrategyConfig:
     # floor/ceiling), gated by a trend filter and an equity drawdown circuit
     # breaker. See `AdaptiveGridStrategy`'s docstring for the CLOSE-based
     # (vs. the original's intrabar High/Low) approximation this port makes.
-    grid_symbol: str = "SPY"
     grid_atr_period: int = 14
     grid_atr_multiplier: float = 1.0
     grid_min_spacing_pct: float = 0.01
@@ -190,7 +189,6 @@ class StrategyConfig:
     # range-bound, cash below the 200d SMA. `ensemble_mode` selects which
     # sleeve(s) are active, matching the original project's
     # component-decomposition CLI ("ensemble", "trend_only", "meanrev_only").
-    ensemble_symbol: str = "SPY"
     ensemble_mode: str = "ensemble"
     ensemble_trend_ma_period: int = 200
     ensemble_adx_period: int = 14

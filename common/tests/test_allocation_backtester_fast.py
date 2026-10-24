@@ -29,10 +29,12 @@ if _PROJECT_ROOT not in sys.path:
 from common import allocation_backtester as prod_backtester
 from common.allocation_backtester import run_allocation_backtest
 from common.allocation_backtester_fast import (
+    FastBacktestResult,
     JIT_KERNEL,
     KERNEL_STATUS,
     KERNEL_VERSION,
     NUMBA_AVAILABLE,
+    UNPORTED_PRODUCTION_KEYS,
     _lot_round,
     _tradable,
     close_mode_kernel,
@@ -579,3 +581,51 @@ def test_kernel_accepts_arrays_only_and_returns_expected_arity():
     n_fill, n_susp, turnover, rebalance_id = out
     assert n_fill == 3 and n_susp == 0 and rebalance_id == 1
     assert turnover > 0.0
+
+
+# --------------------------------------------------------------------------- #
+# B5.3: Schema drift guardrails tests
+# --------------------------------------------------------------------------- #
+def test_minimal_metrics_raises_not_implemented_error():
+    """Verify minimal_metrics=True raises NotImplementedError."""
+    universe = _make_universe(n_days=20, n_sym=2, seed=1)
+    tw = _sparse_weights(universe, {0: {"S0": 0.5, "S1": 0.5}})
+    with pytest.raises(NotImplementedError, match="minimal_metrics=True"):
+        run_allocation_backtest_fast(universe, tw, minimal_metrics=True)
+
+
+def test_unported_production_keys_raise_not_implemented_error():
+    """Every read path on `FastBacktestResult` must agree about unported keys.
+
+    `[]`, `.get()` and `in` are the three ways a caller can probe the result dict.
+    If `in` answered False while the other two raised, a `has_key`-style guard
+    (`if "deferral_report" in res:`) would silently take the "not available" branch
+    and the B5.3 drift guard would never fire -- exactly the hole this asserts shut.
+    """
+    universe = _make_universe(n_days=20, n_sym=2, seed=1)
+    tw = _sparse_weights(universe, {0: {"S0": 0.5, "S1": 0.5}})
+    res = run_allocation_backtest_fast(universe, tw)
+    assert isinstance(res, FastBacktestResult)
+
+    # Positive control: a PORTED key still answers True through the new override,
+    # and an unknown key still answers False -- so `__contains__` is a guard, not a
+    # blanket raise.
+    assert "equity_curve" in res
+    assert res["equity_curve"] is res.get("equity_curve")
+    assert "no_such_key_at_all" not in res
+    assert res.get("no_such_key_at_all") is None
+
+    # Standard supported keys work as normal dict access
+    assert not res["equity_curve"].empty
+    assert res.get("execution_price") == "close"
+    assert res["kernel_status"] == KERNEL_STATUS
+
+    # Unported production keys raise NotImplementedError through ALL THREE paths
+    for key in UNPORTED_PRODUCTION_KEYS:
+        with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
+            _ = res[key]
+        with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
+            res.get(key)
+        with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
+            _ = key in res
+

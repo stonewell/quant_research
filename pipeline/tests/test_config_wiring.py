@@ -47,16 +47,14 @@ cannot rot silently if `blend_base.py` is refactored.
 
 Known blind spots (explicitly NOT silently skipped -- see report in P1.2):
   * `<sym>_symbol` fields (`rsi_symbol`, `swing_symbol`, `chan_symbol`,
-    `chan3_symbol`, `chanm_symbol`, `turtle_symbol`, `grid_symbol`,
-    `ensemble_symbol`): the strategies resolve their traded symbol from the UNIVERSE,
-    not from the cfg attribute. `symbol_param_key="rsi_symbol"` in
-    `rs/timing_aspects.py` is a key into the per-run `params` dict, so the *name*
-    survives on the dynamic surface while `StrategyConfig.rsi_symbol` itself is never
-    read. Statically we can prove the name is referenced; we CANNOT prove which
-    object (cfg vs. params dict) that dynamic key binds to. Classified as a
-    `symbol_param_key` ref (form (d)), not as a cfg read -- which is why
-    `grid_symbol` / `ensemble_symbol`, which have no aspect entry at all, land in the
-    exemption ledger instead.
+    `chan3_symbol`, `chanm_symbol`, `turtle_symbol`): the strategies resolve their
+    traded symbol from the UNIVERSE, not from the cfg attribute.
+    `symbol_param_key="rsi_symbol"` in `rs/timing_aspects.py` is a key into the
+    per-run `params` dict, so the *name* survives on the dynamic surface while
+    `StrategyConfig.rsi_symbol` itself is never read. Statically we can prove the
+    name is referenced; we CANNOT prove which object (cfg vs. params dict) that
+    dynamic key binds to. Classified as a `symbol_param_key` ref (form (d)), not as
+    a cfg read.
   * Prefixed-family fields are matched by bare name, so the analyzer cannot tell
     WHICH strategy reads `blend_target_vol` -- only that some `resolve_param` call
     makes it reachable. Proving per-strategy reachability would require symbolic
@@ -66,7 +64,26 @@ Known blind spots (explicitly NOT silently skipped -- see report in P1.2):
     type checker; a false "consumed" only weakens one field, while a false "zombie"
     would be a red build.
 
-Nothing here deletes or mutates a config field: unread fields are either wired up
+Three-way disposition of every analysed field
+---------------------------------------------
+A field declared in `StrategyConfig` / `ScreenerConfig` ends up in exactly one of
+three buckets, and the ledger that records it is part of this module's contract:
+
+  1. **True zombie** (no consumer at all) -> recorded in `_EXEMPT_FIELDS` with
+     `reason` / `evidence` / `recommended_action`, and
+     `test_exemption_ledger_is_auditable_and_not_stale` keeps that entry honest
+     (field must still be declared AND still unwired). This bucket is currently
+     EMPTY: P1.5 deleted the last two occupants, `grid_symbol` / `ensemble_symbol`.
+  2. **Read through a dynamic key** (form (c): `p.get("x")`,
+     `resolve_param(p, "x")`, `resolve_blend_param(params, "x")`, ...) -> the field
+     is genuinely consumed, just never spelled as `cfg.x`.
+  3. **Linked indirectly through a registry** (form (d): a timing-aspect
+     `symbol_param_key="..."` or an aspect-basket param key) -> the field STRING
+     survives in a registry even though the attribute is never dereferenced; these
+     are pinned one by one in `_KNOWN_DYNAMIC_READ_POINTS`, which asserts the field
+     is still declared and the reading token still appears in the target file.
+
+Nothing here deletes or mutates a config field: an unread field is either wired up
 (recommended, out of P1.2 scope) or recorded in `_EXEMPT_FIELDS` with a reason that
 names the exact defect, so a reviewer can act on it.
 
@@ -77,8 +94,10 @@ analysed modules, no network, no writes.
 from __future__ import annotations
 
 import ast
+import io
 import os
 import sys
+import tokenize
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -102,7 +121,14 @@ _SKIP_DIR_NAMES = {"__pycache__", ".venv", ".git", "node_modules", ".pytest_cach
 _DYNAMIC_PARAM_PREFIXES = ("cfssb_", "cfsb_", "ccsb_", "cdhb_", "crb_", "blend_")
 
 # (call name) -> positional index of the string argument that names a config field.
-_DYNAMIC_RESOLVER_ARG_INDEX = {"get": 0, "setdefault": 0, "pop": 0, "getattr": 1, "resolve_param": 1}
+_DYNAMIC_RESOLVER_ARG_INDEX = {
+    "get": 0,
+    "setdefault": 0,
+    "pop": 0,
+    "getattr": 1,
+    "resolve_param": 1,
+    "resolve_blend_param": 1,
+}
 
 # Keyword arguments whose string value is a params-dict key rather than a cfg read.
 _DYNAMIC_KEY_KEYWORDS = {"symbol_param_key"}
@@ -139,78 +165,97 @@ _CONFIG_SPECS = (
 
 
 # ---------------------------------------------------------------------------
-# Zombie / exemption ledger  (P1.2 -- read the reasons, do not "just" delete)
+# Zombie / exemption ledger  (P1.2 & P1.7)
 #
-# Every entry below was produced by the analyzer, then verified by hand:
-# `grep -rn <field>` over the repo. Format:
-#   kind      -- "zombie" (no business read site at all)
-#   refs      -- every reference that DOES exist, with file:line
-#   verdict   -- KEEP+WIRE or DELETE, i.e. what should happen to the field
-#   reason    -- why that verdict follows from the reference evidence
+# With P1.5 deleting `grid_symbol` and `ensemble_symbol`, and P1.7 wiring
+# `cfsb_inertia_relative_ratio` into `_DYNAMIC_RESOLVER_ARG_INDEX` via
+# `resolve_blend_param` in `scripts/run_live_strategy.py`, there are currently
+# zero zombie fields in StrategyConfig and ScreenerConfig.
 # ---------------------------------------------------------------------------
 
-_EXEMPT_FIELDS: Dict[Tuple[str, str], Dict[str, str]] = {
-    ("StrategyConfig", "cfsb_inertia_relative_ratio"): {
-        "kind": "zombie",
-        "refs": (
-            "declaration pipeline/research_strategy/rs/config.py:630 (12-line 'Fix 7' comment); "
-            "pipeline/research_strategy/strategies_config.json:401; "
-            "results/strategy_dumps/chan_four_state_blend_strategy.json:56,108; "
-            "tests/test_blend_track_c.py:472-488 (test-only: asserts the default and does "
-            "the ratio*cap arithmetic ITSELF -- never exercises a reader); "
-            "one PROSE comment in pipeline/research/blend/chan_four_state_blend.py:35"
-        ),
-        "verdict": "KEEP the field, IMPLEMENT the read (do NOT delete)",
-        "reason": (
-            "Real defect, not clutter: the declaration and strategies_config.json both "
-            "advertise a SELL-trim hurdle of max(min_weight_change, ratio*current_weight) "
-            "(0.30*0.18 = 0.054, meant to filter the 0.0501 micro-trim from the 2026-10-22 "
-            "incident), but NO code multiplies by it. `common/allocation_templates.py:"
-            "apply_asset_inertia` only applies `min_weight_change` plus a hard-coded 0.6 "
-            "asymmetric-sell factor, and `chan_four_state_blend` only reads "
-            "`min_weight_change`. Live micro-trim filtering is therefore WEAKER than the "
-            "config documentation claims. Deleting the field would silently drop a "
-            "documented live safety knob, so it stays (wiring it up is out of P1.2 scope)."
-        ),
-    },
-    ("StrategyConfig", "grid_symbol"): {
-        "kind": "zombie",
-        "refs": (
-            "declaration pipeline/research_strategy/rs/config.py:171; "
-            "pipeline/research_strategy/tests/test_strategy.py:1093 "
-            "(`test_grid_ignores_stale_symbol_param_and_trades_universe_instead` asserts "
-            "the field is IGNORED)"
-        ),
-        "verdict": "DELETE the field (recommended), keep the regression assertion as a comment",
-        "reason": (
-            "No read site and no params-key path: `AdaptiveGridStrategy` resolves its "
-            "traded symbol from the universe, and unlike `rsi_symbol`/`chan_symbol` this "
-            "name is not even registered as a `symbol_param_key`, so it is not reachable "
-            "through aspect composition either. The single reference is a test that pins "
-            "the field's USELESSNESS -- i.e. the test documents a dead field instead of a "
-            "behaviour. Deletion is out of P1.2 scope (no config-field deletions), so it "
-            "is exempted with this verdict rather than silently tolerated."
-        ),
-    },
-    ("StrategyConfig", "ensemble_symbol"): {
-        "kind": "zombie",
-        "refs": (
-            "declaration pipeline/research_strategy/rs/config.py:193; "
-            "pipeline/research_strategy/tests/test_strategy.py:1150 "
-            "(`test_ensemble_ignores_stale_symbol_param_and_trades_universe_instead` "
-            "asserts the field is IGNORED)"
-        ),
-        "verdict": "DELETE the field (recommended), keep the regression assertion as a comment",
-        "reason": (
-            "Same shape as `grid_symbol`: `EnsembleRegimeSwitchingStrategy` symbols come "
-            "from the universe, no `symbol_param_key` registers this name, and the only "
-            "reference is a test asserting the value has no effect. A field whose sole "
-            "documented property is 'ignored' is a trap for an operator editing "
-            "strategies_config.json; delete it rather than keep the illusion. Out of "
-            "P1.2 scope (no deletions), hence exempted."
-        ),
-    },
-}
+_EXEMPT_FIELDS: Dict[Tuple[str, str], Dict[str, str]] = {}
+
+
+# ---------------------------------------------------------------------------
+# Known dynamic read points ledger (P1.7)
+#
+# Explicitly tracks fields consumed via indirect registries (such as timing
+# aspect symbol_param_key) or dynamic prefix resolvers (such as
+# resolve_blend_param). Each point is asserted to be declared in StrategyConfig
+# and present in the target source file.
+#
+# TOKEN PRECISION: `token` is matched as a plain substring, so it must be the
+# unambiguous CALL form -- never a bare param name. `inertia_relative_ratio`
+# appears in the explanatory comment directly above the real read in
+# `scripts/run_live_strategy.py`, so a bare-name token stayed green after the
+# actual `resolve_blend_param(...)` call was deleted (a comment was the only
+# remaining hit). `test_known_dynamic_read_points_are_valid_and_not_stale`
+# therefore asserts the call form; keep new tokens in that shape too.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DynamicReadPoint:
+    class_name: str
+    field_name: str
+    target_rel_path: str
+    token: str
+    reason: str
+
+
+_KNOWN_DYNAMIC_READ_POINTS: Sequence[DynamicReadPoint] = (
+    DynamicReadPoint(
+        class_name="StrategyConfig",
+        field_name="cfsb_inertia_relative_ratio",
+        target_rel_path="scripts/run_live_strategy.py",
+        # Call form, not the bare name: the bare name also occurs in the comment
+        # immediately above the read, so it would stay green if the call vanished.
+        token='resolve_blend_param(params, "inertia_relative_ratio"',
+        reason="Read dynamically via resolve_blend_param(params, 'inertia_relative_ratio', 0.0, float) in Stage 2 runner",
+    ),
+    DynamicReadPoint(
+        class_name="StrategyConfig",
+        field_name="rsi_symbol",
+        target_rel_path="pipeline/research_strategy/rs/timing_aspects.py",
+        token='symbol_param_key="rsi_symbol"',
+        reason="Registered as dynamic symbol_param_key for RSI oversold entry aspect",
+    ),
+    DynamicReadPoint(
+        class_name="StrategyConfig",
+        field_name="swing_symbol",
+        target_rel_path="pipeline/research_strategy/rs/timing_aspects.py",
+        token='symbol_param_key="swing_symbol"',
+        reason="Registered as dynamic symbol_param_key for swing entry aspect",
+    ),
+    DynamicReadPoint(
+        class_name="StrategyConfig",
+        field_name="chan_symbol",
+        target_rel_path="pipeline/research_strategy/rs/timing_aspects.py",
+        token='symbol_param_key="chan_symbol"',
+        reason="Registered as dynamic symbol_param_key for Chan pivot entry aspect",
+    ),
+    DynamicReadPoint(
+        class_name="StrategyConfig",
+        field_name="chan3_symbol",
+        target_rel_path="pipeline/research_strategy/rs/timing_aspects.py",
+        token='symbol_param_key="chan3_symbol"',
+        reason="Registered as dynamic symbol_param_key for Chan 3-point entry aspect",
+    ),
+    DynamicReadPoint(
+        class_name="StrategyConfig",
+        field_name="chanm_symbol",
+        target_rel_path="pipeline/research_strategy/rs/timing_aspects.py",
+        token='symbol_param_key="chanm_symbol"',
+        reason="Registered as dynamic symbol_param_key for Chan MTF entry aspect",
+    ),
+    DynamicReadPoint(
+        class_name="StrategyConfig",
+        field_name="turtle_symbol",
+        target_rel_path="pipeline/research_strategy/rs/timing_aspects.py",
+        token='symbol_param_key="turtle_symbol"',
+        reason="Registered as dynamic symbol_param_key for Turtle breakout entry aspect",
+    ),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -225,13 +270,16 @@ class Ref:
     kind: str  # "attr" | "subscript" | "resolver" | "symbol_param_key"
 
 
-def _iter_python_files(roots: Sequence[str]) -> Iterable[str]:
+def _iter_python_files(
+    roots: Sequence[str], extensions: Sequence[str] = (".py",)
+) -> Iterable[str]:
+    suffixes = tuple(extensions)
     for root in roots:
         base = os.path.join(_REPO_ROOT, root)
         for dirpath, dirnames, filenames in os.walk(base):
             dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIR_NAMES)
             for filename in sorted(filenames):
-                if filename.endswith(".py"):
+                if filename.endswith(suffixes):
                     yield os.path.join(dirpath, filename)
 
 
@@ -253,6 +301,27 @@ def _parse(path: str) -> Optional[ast.AST]:
             return ast.parse(fh.read(), filename=path)
     except (SyntaxError, UnicodeDecodeError):
         return None
+
+
+def _strip_python_comments(source: str) -> str:
+    """Return `source` with every COMMENT token blanked out, line structure intact.
+
+    Used by the dynamic-read-point ledger: a token that survives only inside a
+    comment does NOT prove the field is read. Blanking (rather than deleting) keeps
+    line/column positions, so an inline `x = 1  # foo` stays `x = 1      `.
+    """
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+    except (tokenize.TokenError, IndentationError):  # pragma: no cover - unparsable target
+        return source
+    lines = source.splitlines(keepends=True)
+    for tok in tokens:
+        if tok.type != tokenize.COMMENT:
+            continue
+        (row, start_col), (_, end_col) = tok.start, tok.end
+        line = lines[row - 1]
+        lines[row - 1] = line[:start_col] + " " * (max(end_col - start_col, 0)) + line[end_col:]
+    return "".join(lines)
 
 
 def _declared_fields(tree: ast.AST, class_name: str) -> Dict[str, int]:
@@ -564,3 +633,84 @@ def test_resolve_param_dynamic_fallback_unchanged():
         "prefix-family exemption in _consumed_fields must be re-derived"
     )
     assert "getattr(cfg, f\"blend_{name}\")" in body
+
+
+# ---------------------------------------------------------------------------
+# 4. Dynamic read points & personal path guards (P1.6, P1.7)
+# ---------------------------------------------------------------------------
+
+
+def test_known_dynamic_read_points_are_valid_and_not_stale():
+    """P1.7: Validates that each known dynamic read point corresponds to an existing StrategyConfig
+    field and that the target file exists and contains the expected reader token.
+    """
+    for pt in _KNOWN_DYNAMIC_READ_POINTS:
+        spec = next((s for s in _CONFIG_SPECS if s.class_name == pt.class_name), None)
+        assert spec is not None, f"Unknown config class {pt.class_name!r}"
+        decl_abs = os.path.join(_REPO_ROOT, spec.relative_path)
+        tree = _parse(decl_abs)
+        fields = _declared_fields(tree, pt.class_name)
+        assert pt.field_name in fields, (
+            f"Dynamic read point for {pt.class_name}.{pt.field_name} is STALE: field no longer declared."
+        )
+        target_abs = os.path.join(_REPO_ROOT, pt.target_rel_path)
+        assert os.path.isfile(target_abs), (
+            f"Dynamic read target file missing: {pt.target_rel_path}"
+        )
+        with open(target_abs, "r", encoding="utf-8") as fh:
+            content = fh.read()
+        assert pt.token in content, (
+            f"Target {pt.target_rel_path} does not contain expected dynamic read token {pt.token!r}"
+        )
+        # ... and the token must be CODE, not a stale mention left behind in a
+        # comment. A bare param name collides with the explanatory comment directly
+        # above the real read (`inertia_relative_ratio`), which let the guard stay
+        # green after the actual call was deleted. Tokens are now call forms, and
+        # this assertion makes a comment-only hit a hard failure.
+        assert pt.token in _strip_python_comments(content), (
+            f"Target {pt.target_rel_path} mentions the dynamic read token {pt.token!r} "
+            f"only inside a COMMENT -- the real read has been deleted or renamed. "
+            f"Fix the code or update _KNOWN_DYNAMIC_READ_POINTS."
+        )
+
+
+def test_strip_python_comments_blanks_comments_only():
+    """Anti-vacuity: the comment-stripping helper must blank whole-line AND inline
+    comments while leaving code (and line structure) intact -- otherwise the
+    comment-only check added above could be checking something else entirely."""
+    source = (
+        '# only a comment mentioning resolve_blend_param(params, "x"\n'
+        'y = resolve_blend_param(params, "x", 0.0, float)  # trailing mention\n'
+        'z = "a # not a comment"\n'
+    )
+    stripped = _strip_python_comments(source)
+    assert stripped.count("\n") == source.count("\n")
+    assert 'resolve_blend_param(params, "x"' in stripped  # the real call survives
+    assert 'trailing mention' not in stripped
+    assert '"a # not a comment"' in stripped
+
+
+def test_no_hardcoded_personal_paths_in_python_scripts():
+    """P1.6: Assert that personal/machine-specific path /home/stone/Work/stock never appears
+    in any repository Python files (excluding this test file itself).
+
+    Extended to `.sh` on 2026-10-24: the two committed batch wrappers under
+    `pipeline/scripts/` are executable code too, and they are exactly where the
+    pre-P1.6 style of hardcoded default used to hide (a `.py`-only scan cannot see
+    them).
+    """
+    forbidden = "/home/stone/Work/stock"
+    hits = []
+    this_file = os.path.abspath(__file__)
+    for path in _iter_python_files(_SCAN_ROOTS, (".py", ".sh")):
+        if os.path.abspath(path) == this_file:
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                content = fh.read()
+            if forbidden in content:
+                hits.append(_rel(path))
+        except (UnicodeDecodeError, OSError):
+            continue
+    assert not hits, f"Found hardcoded personal path {forbidden!r} in: {hits}"
+

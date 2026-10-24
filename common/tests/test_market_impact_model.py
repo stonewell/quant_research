@@ -598,3 +598,59 @@ def test_participation_cap_is_inert_without_a_volume_column():
         run_allocation_backtest({"A": frame}, tw, market_impact=True, impact_gamma=-1.0)
     with pytest.raises(ValueError, match="impact_vol_window"):
         run_allocation_backtest({"A": frame}, tw, market_impact=True, impact_vol_window=0)
+
+
+def test_participation_cap_long_to_short_flip_residual_deferred_not_dropped():
+    """Task B5.2: Flipping from long to short under a participation cap must defer and fill, never drop.
+
+    When flipping from a positive holding (e.g. +0.50, 500 shares) to a short target
+    (e.g. -0.50, -500 shares), `trade_s` spans across 0 (1,000 shares total). The long-only
+    guard `min(c["trade_s"], c["prior_s"])` must NOT clamp the sell when `target_w < -1e-7`.
+    Instead, the sell fills up to `max_volume_participation * volume` per session,
+    the unfilled excess is deferred with `reason="volume_participation_cap"` and `action="SELL"`,
+    and subsequent sessions continue selling until the full negative position is established.
+    Tested in both `close` and `next_open` modes, verifying ledger reconciliation.
+    """
+    prices = np.full(20, 100.0)
+    vol = np.full(20, 2_000.0)
+    # Day 0 has ample volume to enter +0.5 cleanly in close mode
+    vol[0] = 10_000.0
+    universe = {"A": _bar_frame(prices, vol)}
+    idx = universe["A"].index
+    # Row 0: enter long +0.5. Row 5: flip to short -0.5.
+    tw = _sparse(idx, {0: [0.5], 5: [-0.5]})
+
+    for mode in ("close", "next_open"):
+        res = run_allocation_backtest(
+            universe, tw, initial_capital=100_000.0, commission_pct=0.0, slippage_pct=0.0,
+            max_volume_participation=0.10, execution_price=mode, min_shares=0,
+        )
+        rep = res["rebalance_report"]
+        assert not rep.empty
+
+        # 1. Participation cap holds: no single fill exceeds 10% * 2,000 = 200 shares (except day 0 in close mode where vol was 10,000)
+        sells = rep[rep["action"] == "SELL"]
+        assert not sells.empty
+        assert (sells["shares"] <= 200.0 + 1e-9).all()
+
+        # 2. Final position reached: short -0.5 weight (-500 shares)
+        final_w = float(res["actual_weights"].iloc[-1]["A"])
+        assert final_w == pytest.approx(-0.5, abs=1e-4)
+
+        # 3. Deferrals correctly tracked:
+        d = res["deferral_report"]
+        cap_defs = d[d["reason"] == "volume_participation_cap"]
+        assert not cap_defs.empty
+        # Sell deferrals have action="SELL" and target_weight=-0.5
+        sell_defs = cap_defs[cap_defs["target_weight"] == -0.5]
+        assert not sell_defs.empty
+        assert (sell_defs["action"] == "SELL").all()
+
+        # 4. Ledger reconciliation
+        eq, _w, cash = _replay_ledger(
+            100_000.0, rep, res["equity_curve"].index,
+            pd.DataFrame({"A": universe["A"]["Close"]}), ["A"],
+        )
+        np.testing.assert_allclose(res["equity_curve"]["equity"].to_numpy(), eq, rtol=1e-12, atol=1e-8)
+        assert (cash >= -1e-9).all()
+
