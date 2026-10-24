@@ -201,3 +201,54 @@ def test_build_stage2_command_rejects_unresolved_paths():
     args.account_state_file = None
     with pytest.raises(ValueError, match="account-state-file"):
         _mod.build_stage2_command(args)
+
+
+# ---------------------------------------------------------------------------
+# 4. Writer/reader agreement on the DEFAULT output directory
+# ---------------------------------------------------------------------------
+
+
+def test_default_output_dir_is_one_shared_resolution_for_both_stages():
+    """Stage 1 and Stage 2 must default to ONE directory -- by construction, not by luck.
+
+    The coupling is bidirectional and invisible in either file alone:
+      * Stage 1 WRITES `stage1_health_report.json` into its `--output-dir` and reads
+        `account_state.json` from it;
+      * Stage 2 READS that report back out of ITS `--output-dir` and rewrites the state.
+    Two literals that merely happen to match is exactly how "health check writes here,
+    tickets read there" splits silently -- and until 2026-10-23 both literals pointed
+    into `docs/ruleset/`, a hand-authored documentation tree. This pins the single
+    resolver (`scripts/live_paths.py`): re-spelling the path OR the strategy key in
+    either script turns this red.
+    """
+    from scripts import live_paths
+
+    stage2 = _load_script("run_live_strategy", os.path.join("scripts", "run_live_strategy.py"))
+
+    expected = live_paths.default_live_output_dir(live_paths.DEFAULT_STRATEGY_KEY)
+
+    # Stage 1 has no --strategy of its own: it must name the SAME key by importing it.
+    stage1_args = _stage1_args()
+    # Stage 2 binds the default to the resolved strategy key.
+    stage2_args = stage2.parse_args(["--strategy", live_paths.DEFAULT_STRATEGY_KEY])
+
+    assert stage1_args.output_dir == expected
+    assert stage2_args.output_dir == expected
+
+    # The report Stage 1 writes is the file Stage 2 reads back: same directory, same name.
+    assert os.path.dirname(stage2_args.health_report_file) == stage1_args.output_dir
+    assert os.path.basename(stage2_args.health_report_file) == _mod.STAGE1_HEALTH_REPORT_JSON
+
+    # The account state that both sides own is one file, not one per stage.
+    assert stage1_args.account_state_file == stage2_args.account_state_file
+    assert stage1_args.account_state_file == os.path.join(expected, "account_state.json")
+
+    # The whole point of the change: no default path may be inside `docs/` (let alone
+    # `docs/ruleset/`), so neither stage can create that tree by default any more.
+    docs_root = os.path.join(_REPO_ROOT, "docs")
+    for path in (stage1_args.output_dir, stage2_args.output_dir, expected):
+        assert os.path.relpath(os.path.abspath(path), docs_root).startswith(".."), path
+        assert "ruleset" not in os.path.normpath(path).split(os.sep), path
+
+    # A moved `scripts/live_paths.py` would silently retarget every default above.
+    assert live_paths.REPO_ROOT == _REPO_ROOT

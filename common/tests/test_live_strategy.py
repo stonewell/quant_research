@@ -25,6 +25,7 @@ from scripts.run_live_strategy import (
     parse_args,
     apply_intraday_distribution_gate,
 )
+from scripts.live_paths import DEFAULT_STRATEGY_KEY, default_live_output_dir
 
 
 def test_pad_east_asian():
@@ -107,10 +108,86 @@ def test_parse_args_dynamic_output_dir(tmp_path):
 
     # Case 2: Default output dir binding based on strategy key
     args_default = parse_args(["--strategy", "equal_weight"])
-    expected_default_dir = os.path.join(_PROJECT_ROOT, "docs", "ruleset", "equal_weight")
+    # Was `<repo>/docs/ruleset/equal_weight` until 2026-10-23. The default now comes
+    # from the shared resolver in `scripts/live_paths.py` (the same one Stage 1's
+    # `check_live_portfolio_health.py` uses), never from a literal in this script.
+    expected_default_dir = default_live_output_dir("equal_weight")
     assert args_default.output_dir == expected_default_dir
     assert args_default.account_state_file == os.path.join(expected_default_dir, "account_state.json")
     assert args_default.health_report_file == os.path.join(expected_default_dir, "stage1_health_report.json")
+
+
+def test_default_output_dir_is_not_under_docs():
+    """Regression guard: a live run's default output must never land in `docs/`.
+
+    Before 2026-10-23 `--output-dir` defaulted to `<repo>/docs/ruleset/<strategy_key>`.
+    That tree holds the hand-authored operating manuals (`rules.md` / `rules_cn.md` /
+    PDFs), yet it was also where a live run dropped its generated order tickets,
+    `account_state.json` and the Stage-1 health report -- and any invocation that
+    forgot `--output-dir` therefore CREATED `docs/ruleset/` by default. This asserts
+    no strategy key can reintroduce that.
+    """
+    docs_root = os.path.join(_PROJECT_ROOT, "docs")
+
+    for strategy_key in (DEFAULT_STRATEGY_KEY, "equal_weight", "turtle_breakout"):
+        out_dir = default_live_output_dir(strategy_key)
+        assert os.path.isabs(out_dir), out_dir
+        # `os.path.relpath` (not `commonpath`) so a cross-drive Windows path cannot
+        # raise here and masquerade as a failure of something else.
+        assert os.path.relpath(os.path.abspath(out_dir), docs_root).startswith(".."), out_dir
+        assert "ruleset" not in os.path.normpath(out_dir).split(os.sep), out_dir
+        # ... and the CLI's own binding agrees with the resolver (no second literal).
+        assert parse_args(["--strategy", strategy_key]).output_dir == out_dir
+
+
+def test_default_output_dir_created_only_when_a_ticket_is_written(tmp_path, monkeypatch):
+    """`parse_args` must resolve the default without materializing it on disk.
+
+    The directory is an ordinary workspace artifact directory now, but it must still
+    be created lazily -- by the single write site in `main`
+    (`os.makedirs(args.output_dir, exist_ok=True)`) -- so that merely parsing the CLI
+    (or a run that aborts at the market-window gate) leaves nothing behind. The
+    default is redirected under `tmp_path`: no test may write into the real
+    `scripts/results/live/` tree.
+    """
+    from scripts import run_live_strategy as rls
+
+    live_root = tmp_path / "live"
+    monkeypatch.setattr(
+        rls,
+        "default_live_output_dir",
+        lambda strategy_key=None: os.path.join(str(live_root), strategy_key or "default"),
+    )
+
+    # 1. Parsing resolves the default and creates nothing.
+    parsed = rls.parse_args(["--strategy", "equal_weight"])
+    assert parsed.output_dir == os.path.join(str(live_root), "equal_weight")
+    assert not os.path.exists(parsed.output_dir)
+
+    # 2. Running to completion writes the ticket and creates it then.
+    universe_file = str(tmp_path / "univ.txt")
+    with open(universe_file, "w", encoding="utf-8") as f:
+        f.write("600000.SH\n601398.SH\n")
+
+    real_default_dir = default_live_output_dir(DEFAULT_STRATEGY_KEY)
+    real_default_existed = os.path.exists(real_default_dir)
+
+    order_df = rls.main([
+        "--strategy", "equal_weight",
+        "--universe-file", universe_file,
+        "--as-of-date", "2024-05-10",
+        "--start-date", "2024-01-01",
+        "--data-provider", "synthetic",
+        "--portfolio-value", "100000",
+        "--no-cache",
+    ])
+
+    assert not order_df.empty
+    assert os.path.isdir(parsed.output_dir)
+    assert os.path.isfile(os.path.join(parsed.output_dir, "live_trading_ticket.csv"))
+    assert os.path.isfile(os.path.join(parsed.output_dir, "live_trading_ticket.json"))
+    # The run must not have touched the real (unredirected) default tree.
+    assert os.path.exists(real_default_dir) == real_default_existed
 
 
 def test_resolve_min_entry_bars():

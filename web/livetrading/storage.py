@@ -63,6 +63,36 @@ except ImportError:  # pragma: no cover - repo root not yet importable
     from common.freshness import is_stale_bar
 
 
+# Directory the multi-strategy netting CLI (`scripts/run_live_multi_strategy.py`)
+# writes its netted ticket / sub-ledgers into when the operator does not pass
+# `--output-dir`. The reader below falls back to it when a matrix has no dated archive
+# run yet -- i.e. when the ticket was produced from the CLI rather than by this web
+# app's own deploy path (which always passes `--output-dir <archive>/<date>/multi_netted_<matrix>`).
+#
+# Why this is imported, not spelled: until 2026-10-23 both ends named
+# `docs/ruleset/multi_strategy_netted` independently. `docs/ruleset/` is the
+# hand-authored operating-manual tree and is being deleted; a fallback that still
+# pointed there would be a silent-empty-read (the CLI now writes elsewhere), and a
+# second literal would let "CLI writes here, web reads there" split again. So the path
+# and the `multi_strategy_netted` key both come from `scripts/live_paths.py`, the same
+# resolver the writer imports.
+#
+# `default_live_output_dir()` is self-locating (`live_paths.__file__` -> repo root), so
+# this follows the checkout that actually CONTAINS the writer script rather than this
+# StorageManager's configurable `repo_root`. That is the correct anchor: a
+# `repo_root` that does not contain `scripts/run_live_multi_strategy.py` has no default
+# run output to read in the first place.
+try:
+    from scripts.live_paths import MULTI_STRATEGY_KEY, default_live_output_dir
+except ImportError:  # pragma: no cover - repo root not yet importable
+    sys.path.insert(0, find_repo_root())
+    from scripts.live_paths import MULTI_STRATEGY_KEY, default_live_output_dir
+
+#: Resolved fallback location for `get_multi_netting_run`. One owner above; nothing in
+#: this module may re-spell it.
+MULTI_NETTING_FALLBACK_DIR = default_live_output_dir(MULTI_STRATEGY_KEY)
+
+
 def normalize_universe_key(key: Optional[str]) -> str:
     """Normalize a universe key for robust comparison across custom universe conventions.
 
@@ -2021,8 +2051,13 @@ class StorageManager:
         """Load netted run artifacts for specified matrix and date."""
         run_dir = self.get_multi_netting_run_dir(matrix_id, date_str)
         if not os.path.exists(run_dir):
-            # Check fallback to default ruleset folder if archive does not exist yet
-            fallback_dir = os.path.join(self.repo_root, "docs", "ruleset", "multi_strategy_netted")
+            # No dated archive run for this matrix: fall back to the directory the
+            # netting CLI writes when it is invoked without `--output-dir` (a
+            # CLI-produced ticket is never copied into the archive). Resolved by
+            # `scripts/live_paths.py` -- the same owner as the writer, so this can
+            # never point at a code tree the CLI has stopped writing to (as
+            # `docs/ruleset/multi_strategy_netted` now is).
+            fallback_dir = MULTI_NETTING_FALLBACK_DIR
             if os.path.exists(fallback_dir) and os.path.exists(os.path.join(fallback_dir, "netted_trading_ticket.json")):
                 run_dir = fallback_dir
             else:

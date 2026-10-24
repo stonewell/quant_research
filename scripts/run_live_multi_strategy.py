@@ -80,6 +80,7 @@ from common.universe import (
     resolve_universe_from_args,
 )
 from pipeline.live_signal.lsig.signal import as_of_universe, latest_rebalance_rows
+from scripts.live_paths import MULTI_STRATEGY_KEY, default_live_output_dir
 from scripts.run_live_strategy import (
     announce_run_mode,
     load_holdings,
@@ -95,7 +96,14 @@ from scripts.run_live_strategy import (
 DEFAULT_UNIVERSE_FILE = os.path.join(
     _REPO_ROOT, "docs", "universe", "china", "pruned_core_satellite_blend_16.txt"
 )
-DEFAULT_OUTPUT_DIR = os.path.join(_REPO_ROOT, "docs", "ruleset", "multi_strategy_netted")
+# Default netted-ticket output dir: `<repo_root>/scripts/results/live/multi_strategy_netted`.
+# Owned by `scripts/live_paths.py` -- NOT `docs/ruleset/multi_strategy_netted` any more.
+# That tree holds hand-authored operating manuals; a netting run must not write its
+# generated ticket / sub-ledgers into it, and nothing may CREATE it by default. The
+# web app reads this directory back when a dated archive run does not exist yet
+# (`web/livetrading/storage.py::StorageManager.get_multi_netting_run`), so the path and
+# the `multi_strategy_netted` key are derived here, never re-spelled at either end.
+DEFAULT_OUTPUT_DIR = default_live_output_dir(MULTI_STRATEGY_KEY)
 
 
 def resolve_prior_sub_ledgers(
@@ -225,7 +233,11 @@ def parse_args():
     parser.add_argument(
         "--output-dir",
         default=DEFAULT_OUTPUT_DIR,
-        help="Output directory to save netted trading ticket and reports",
+        help=(
+            "Output directory to save netted trading ticket and reports (default: "
+            "scripts/results/live/multi_strategy_netted, an ordinary workspace artifact "
+            "directory -- never docs/ruleset/)"
+        ),
     )
     parser.add_argument(
         "--min-holding-bars",

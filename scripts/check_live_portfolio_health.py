@@ -70,6 +70,11 @@ from common.strategy_spec import load_strategy_file
 from common.universe import resolve_universe_from_args
 from pipeline.live_signal.lsig.signal import as_of_universe
 
+# Default output-directory owner (Stage 1 and Stage 2 must resolve ONE directory:
+# Stage 1 writes `stage1_health_report.json` / reads `account_state.json` there, and
+# Stage 2 reads/writes the same two files). See `scripts/live_paths.py`.
+from scripts.live_paths import DEFAULT_STRATEGY_KEY, default_live_output_dir
+
 def _resolve_path(p: Optional[str]) -> Optional[str]:
     """Resolve path relative to repo root if it does not exist relative to CWD."""
     if not p:
@@ -86,7 +91,18 @@ DEFAULT_STRATEGY_FILE = os.path.join(
     _REPO_ROOT, "pipeline", "research_strategy", "results", "strategy_dumps", "chan_four_state_blend_strategy.json"
 )
 DEFAULT_UNIVERSE_FILE = os.path.join(_REPO_ROOT, "docs", "universe", "china", "core_satellite_22_stocks.txt")
-DEFAULT_OUTPUT_DIR = os.path.join(_REPO_ROOT, "docs", "ruleset", "chan_four_state_blend")
+# Default *output directory* owner -- shared with Stage 2
+# (`scripts/run_live_strategy.py`), which reads back the `stage1_health_report.json`
+# this script writes there (and rewrites the `account_state.json` this script reads).
+# Both sides resolve it through `scripts/live_paths.py` so "health check writes here,
+# tickets read there" cannot split; neither file may re-spell the path or the key.
+DEFAULT_OUTPUT_DIR = default_live_output_dir(DEFAULT_STRATEGY_KEY)
+
+#: Filename Stage 1 writes and Stage 2 reads back. One owner: `generate_reports`
+#: writes it, `build_stage2_command` passes it, and Stage 2's own
+#: `--health-report-file` default reconstructs the identical name. Never re-spell
+#: this literal at either end.
+STAGE1_HEALTH_REPORT_JSON = "stage1_health_report.json"
 
 
 def _fmt_metric(value: Any, spec: str, na: str = "N/A") -> str:
@@ -162,7 +178,11 @@ def parse_args(args: Optional[List[str]] = None):
     parser.add_argument(
         "--output-dir",
         default=DEFAULT_OUTPUT_DIR,
-        help="Directory to save generated health reports (default: docs/ruleset/chan_four_state_blend)",
+        help=(
+            "Directory to save generated health reports (default: "
+            "scripts/results/live/chan_four_state_blend -- the same directory Stage 2 "
+            "defaults to, never docs/ruleset/)"
+        ),
     )
     parser.add_argument(
         "--cache-dir",
@@ -841,7 +861,7 @@ def generate_reports(
 ) -> Tuple[str, str]:
     """Generate and write structured JSON and Markdown summary reports."""
     os.makedirs(output_dir, exist_ok=True)
-    json_path = os.path.join(output_dir, "stage1_health_report.json")
+    json_path = os.path.join(output_dir, STAGE1_HEALTH_REPORT_JSON)
     md_path = os.path.join(output_dir, "stage1_health_report.md")
 
     report_dict = {
@@ -978,8 +998,8 @@ def generate_reports(
     return json_path, md_path
 
 
-# Filename `generate_reports` writes (and Stage 2 must read back).
-STAGE1_HEALTH_REPORT_JSON = "stage1_health_report.json"
+# Filename `generate_reports` writes (and Stage 2 must read back) is owned by
+# `STAGE1_HEALTH_REPORT_JSON`, declared with the module constants above.
 
 
 def _absolutize_child_arg(path: Optional[str]) -> Optional[str]:
@@ -998,7 +1018,7 @@ def _absolutize_child_arg(path: Optional[str]) -> Optional[str]:
     `_REPO_ROOT` here -- instead of `os.path.abspath`, which is CWD-dependent -- is
     both order-independent and CWD-independent. `_REPO_ROOT` is preferred over the
     CWD deliberately: the repo is the documented base for every relative path this
-    script accepts (`docs/universe/...`, `data/`, `docs/ruleset/...`).
+    script accepts (`docs/universe/...`, `data/`, `scripts/results/live/...`).
     """
     if not path:
         return path

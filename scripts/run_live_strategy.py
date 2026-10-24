@@ -123,6 +123,14 @@ from common.universe import (
 )
 from pipeline.live_signal.lsig.signal import as_of_universe, latest_rebalance_rows
 
+# Default *output directory* owner -- shared with Stage 1
+# (`scripts/check_live_portfolio_health.py`), which writes the very
+# `stage1_health_report.json` / `account_state.json` this script reads back out of
+# its own `--output-dir`. Moving the default in one file and not the other would
+# silently split "tickets written here, health check reads there", so neither file
+# may re-spell the path. See `scripts/live_paths.py` for the layout and its evidence.
+from scripts.live_paths import DEFAULT_STRATEGY_KEY, default_live_output_dir
+
 
 # (2026-10-22 incident, Fix 2) Freshness policy -- bar-date-vs-expected-session
 # comparison and the strict/allow-stale decision -- has exactly ONE owner:
@@ -150,7 +158,6 @@ except ImportError:
             return f"sec_{raw[:2]}" if len(raw) >= 2 else "sec_other"
 
 
-DEFAULT_STRATEGY_KEY = "chan_four_state_blend"
 DEFAULT_STRATEGY_FILE = os.path.join(
     _REPO_ROOT,
     "pipeline",
@@ -160,7 +167,13 @@ DEFAULT_STRATEGY_FILE = os.path.join(
     "chan_four_state_blend_strategy.json",
 )
 DEFAULT_UNIVERSE_FILE = os.path.join(_REPO_ROOT, "docs", "universe", "china", "core_satellite_22_stocks.txt")
-DEFAULT_OUTPUT_DIR = os.path.join(_REPO_ROOT, "docs", "ruleset", DEFAULT_STRATEGY_KEY)
+# Default output dir: `<repo_root>/scripts/results/live/<strategy_key>`.
+# Owned by `scripts/live_paths.py` and shared with Stage 1 -- NOT `docs/ruleset/`
+# any more (that tree is hand-authored manuals; a live run must not write tickets
+# into it, and nothing may create it by default). The effective default is bound to
+# the *resolved* strategy key in `parse_args`; this constant only documents the
+# unparameterised case, so it must be derived, never re-spelled.
+DEFAULT_OUTPUT_DIR = default_live_output_dir(DEFAULT_STRATEGY_KEY)
 
 _FALLBACK_STOCK_NAMES: Dict[str, str] = dict(FALLBACK_STOCK_NAMES)
 
@@ -1103,7 +1116,11 @@ def parse_args(args: Optional[List[str]] = None):
     parser.add_argument(
         "--output-dir",
         default=None,
-        help="Directory to save generated trading orders CSV (default: docs/ruleset/<strategy_key>)",
+        help=(
+            "Directory to save generated trading orders CSV (default: "
+            "scripts/results/live/<strategy_key>, an ordinary workspace artifact "
+            "directory -- never docs/ruleset/)"
+        ),
     )
     parser.add_argument(
         "--account-state-file",
@@ -1185,9 +1202,15 @@ def parse_args(args: Optional[List[str]] = None):
     parsed._resolved_desc = resolved_desc
     parsed._template = template
 
-    # 2. Dynamically bind output directory to strategy key if not explicitly given
+    # 2. Dynamically bind output directory to strategy key if not explicitly given.
+    #    The path comes from `scripts.live_paths.default_live_output_dir` -- the same
+    #    resolver Stage 1 (`scripts/check_live_portfolio_health.py`) uses for its own
+    #    `--output-dir` default. Stage 1 writes `stage1_health_report.json` and
+    #    `account_state.json` there and this script reads them back, so the two
+    #    defaults MUST resolve to one directory; they do so by sharing a function,
+    #    not by two literals that happen to match.
     if parsed.output_dir is None:
-        parsed.output_dir = os.path.join(_REPO_ROOT, "docs", "ruleset", strategy_key)
+        parsed.output_dir = default_live_output_dir(strategy_key)
     else:
         parsed.output_dir = _resolve_path(parsed.output_dir) or parsed.output_dir
 

@@ -349,5 +349,5 @@ pipeline/.venv/Scripts/python.exe -m pytest backtester/tests -v
 | `pipeline/run_pipeline.py` | 通过子进程端到端串联 research_strategy -> instrument_selection -> pattern_mining -> strategy_generator -> `backtester`，自动将每步输出接入下一步 | `pipeline/run_pipeline.py` | 本 README |
 | `ml/bnn_forecaster/` | 独立（未接入流水线）的 AutoBNN 概率预测买入/卖出筛选器；拥有独立的隔离 `uv` 环境（参阅其 README） | `ml/bnn_forecaster/run_bnn_forecaster.py` | `ml/bnn_forecaster/README_ZH.md` |
 | `web/livetrading/` | 响应式实盘量化交易与风控部署平台（一阶健康度门禁 + 二阶实盘交易单生成） | `web/livetrading/app.py` | `web/livetrading/README.md` |
-| `scripts/` | 实盘组合健康检查 (`check_live_portfolio_health.py`) 与通用实盘执行运行器 (`run_live_strategy.py`) | `scripts/run_live_strategy.py` | `docs/ruleset/` |
+| `scripts/` | 实盘组合健康检查 (`check_live_portfolio_health.py`) 与通用实盘执行运行器 (`run_live_strategy.py`) | `scripts/run_live_strategy.py` | `scripts/results/live/` |
 | `docs/universe/` | 经前行验证的中美港三大核心卫星股票池资产定义与说明 | 不适用 (数据与文档) | `docs/universe/` |
