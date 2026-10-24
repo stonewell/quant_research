@@ -72,18 +72,26 @@ def test_chan_vp_hybrid_generate_weights_sparse_contract():
 
     # Sparse weights contract verification:
     # 1. Non-rebalance rows must be all NaN
-    # 2. Rebalance rows must have non-NaN values summing to <= 1.0 (with cash proxy)
-    non_nan_rows = weights.dropna(how="all")
+    # 2. Rebalance rows must be fully populated (explicit 0.0 for anything
+    #    de-risked -- a NaN there would let the ledger's column-wise ffill
+    #    keep holding the stale prior position, per AGENTS.md), with target
+    #    weights summing to at most 1.0.
+    # (C4.1: the previous version of this test only asserted
+    # `len(non_nan_rows) > 0` + "sum <= 1.0", which the strategy's initial
+    # all-zero row alone satisfies -- i.e. it passed even if the strategy never
+    # traded. The invariants below are the actual contract.)
+    per_row_nan = weights.isna().sum(axis=1)
+    non_nan_rows = weights[per_row_nan == 0]
+    nan_rows = weights[per_row_nan == weights.shape[1]]
     assert len(non_nan_rows) > 0, "Strategy should have at least one rebalance row"
+    assert len(non_nan_rows) + len(nan_rows) == len(weights), (
+        "every row must be either a fully-populated rebalance row or all-NaN"
+    )
+    assert len(nan_rows) > 0, "Sparse weights contract requires non-rebalance days to be NaN (no self-ffill)"
 
-    # All non-rebalance rows must be entirely NaN
-    nan_rows = weights[weights.isna().all(axis=1)]
-    assert len(nan_rows) > 0, "Sparse weights contract requires non-rebalance days to be NaN"
-
-    # Row sums on active rebalance days must sum close to 1.0
-    for idx, row in non_nan_rows.iterrows():
-        valid_sum = row.sum()
-        assert np.isclose(valid_sum, 1.0, atol=1e-3) or valid_sum < 1.0
+    row_sums = non_nan_rows.sum(axis=1)
+    assert (row_sums <= 1.0 + 1e-9).all(), f"target weights must never exceed 1.0, max={row_sums.max()}"
+    assert (non_nan_rows.values >= -1e-12).all(), "no negative target weights"
 
 
 def test_chan_vp_hybrid_backtester_integration():

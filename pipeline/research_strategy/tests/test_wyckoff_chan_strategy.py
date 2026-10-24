@@ -70,15 +70,24 @@ def test_wyckoff_chan_spring_generate_weights_sparse_contract():
     assert set(universe.keys()).issubset(set(weights.columns))
 
     # Sparse weights contract verification:
-    non_nan_rows = weights.dropna(how="all")
+    # 1. Non-rebalance rows must be all NaN
+    # 2. Rebalance rows must be fully populated (explicit 0.0 on exit / for any
+    #    de-risked symbol, never NaN -- the ledger's column-wise ffill would
+    #    otherwise keep the stale position), summing to at most 1.0.
+    # (C4.1: strengthened from the previous "len(non_nan_rows) > 0" check,
+    # which the initial all-zero row alone satisfied.)
+    per_row_nan = weights.isna().sum(axis=1)
+    non_nan_rows = weights[per_row_nan == 0]
+    nan_rows = weights[per_row_nan == weights.shape[1]]
     assert len(non_nan_rows) > 0, "Strategy should produce rebalances"
+    assert len(non_nan_rows) + len(nan_rows) == len(weights), (
+        "every row must be either a fully-populated rebalance row or all-NaN"
+    )
+    assert len(nan_rows) > 0, "Sparse weights contract requires non-rebalance days to be NaN (no self-ffill)"
 
-    nan_rows = weights[weights.isna().all(axis=1)]
-    assert len(nan_rows) > 0, "Sparse weights contract requires non-rebalance days to be NaN"
-
-    for idx, row in non_nan_rows.iterrows():
-        valid_sum = row.sum()
-        assert np.isclose(valid_sum, 1.0, atol=1e-3) or valid_sum < 1.0
+    row_sums = non_nan_rows.sum(axis=1)
+    assert (row_sums <= 1.0 + 1e-9).all(), f"target weights must never exceed 1.0, max={row_sums.max()}"
+    assert (non_nan_rows.values >= -1e-12).all(), "no negative target weights"
 
 
 def test_wyckoff_chan_spring_backtester_integration():
