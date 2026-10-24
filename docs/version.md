@@ -1734,18 +1734,20 @@ flag）；`fixtures/parity/` 下 **4 套合成归档**（`aligned_china_2026_10_
 
 | 字段 | 声明处 | 本轮核查结论 |
 | :--- | :--- | :--- |
-| `cfsb_inertia_relative_ratio` | `rs/config.py:630`（12 行注释承诺 `max(0.05, 0.30·w)` 减仓门槛） | **静态判 zombie 是漏报**；实盘 lifecycle 阶段**已生效**；缺口在模板层（见下） |
-| `grid_symbol` | `rs/config.py:171` | 真僵尸：无任何读取点，且未注册 `symbol_param_key`；唯一引用是一条"断言它被忽略"的测试 |
-| `ensemble_symbol` | `rs/config.py:193` | 同上 |
+| `cfsb_inertia_relative_ratio` | `rs/config.py` 的 `StrategyConfig` 字段（撰写时 ≈`:630`，**当前 ≈`:628`**）（12 行注释承诺 `max(0.05, 0.30·w)` 减仓门槛） | **静态判 zombie 是漏报**；实盘 lifecycle 阶段**已生效**；缺口在模板层（见下） |
+| `grid_symbol` | `rs/config.py` 原字段（撰写时 ≈`:171`；**该字段已于 `P1.5` 删除**，故现无对应行） | 真僵尸：无任何读取点，且未注册 `symbol_param_key`；唯一引用是一条"断言它被忽略"的测试 |
+| `ensemble_symbol` | `rs/config.py` 原字段（撰写时 ≈`:193`；**该字段已于 `P1.5` 删除**，故现无对应行） | 同上 |
 
 > **更正（重要）**：任务简报（以及 `pipeline/tests/test_config_wiring.py:153` 的豁免账本）称
 > `cfsb_inertia_relative_ratio` **"全业务路径零读取点"**、"实盘只有绝对 0.05"。
 > **实测不成立**：读取链在 `HEAD` 就已存在（不是本轮引入）——
-> `scripts/run_live_strategy.py:1288` 用 `resolve_blend_param(params, "inertia_relative_ratio", 0.0)` 解析出
+> `scripts/run_live_strategy.py` 中 `inertia_relative_ratio=resolve_blend_param(params, "inertia_relative_ratio", 0.0, float)`
+> 的赋值（撰写本节时 ≈`:1288`，**当前 ≈`:1531`**；行号会漂移，请以调用形式为引用主体）解析出
 > `cfsb_inertia_relative_ratio`（`strategies_config.json:401` = 0.30）→ 注入
-> `PositionLifecycleConfig.inertia_relative_ratio` → `common/position_lifecycle.py:494`–`499` 执行
-> `effective = max(inertia_threshold, ratio · current_weight)`，且该 decision 真的驱动下单
-> （`step_position_lifecycle` 在 `run_live_strategy.py:1813` 调用）。因此**实盘 lifecycle 层的减仓门槛与文档一致**。
+> `PositionLifecycleConfig.inertia_relative_ratio` → `common/position_lifecycle.py` 的 `step_position_lifecycle` 执行
+> `effective_threshold = max(cfg.inertia_threshold, cfg.inertia_relative_ratio * state.current_weight)`
+> （撰写本节时 ≈`:494`–`499`，**当前 ≈`:504-509`**），且该 decision 真的驱动下单
+> （`step_position_lifecycle` 在 `run_live_strategy.py` 的日循环里调用，撰写本节时 ≈`:1813`，**当前 ≈`:2083`**）。因此**实盘 lifecycle 层的减仓门槛与文档一致**。
 >
 > 账本之所以把它判为 zombie，是因为分析器只受理 `self.resolve_param(p, "x", …)` 形式的动态解析
 > （`common/` 下的 `resolve_blend_param` 不在清单里）⇒ **静态分析的假阳性**，账本里那句
@@ -2348,9 +2350,9 @@ exit: 1
 - **数据完整性重叠：5 / 20（25%）**。本池与 2026-10-23 QFQ 修复/回改触及的 `600362.SH` `600660.SH` `601225.SH`
   `601288.SH` `601398.SH` **完全重合**（5 只全在池内）——即池内每 4 只就有 1 只落在本次改写半径内。叠加 §16.15.5 的
   "产物不绑定库状态"，`blend_17_baseline` 的折级数字**不能**当作"修复后干净基准"引用。
-- **建议（提案，非既成事实）**：将该池文件纳入仓库（如 `docs/universe/china/core_satellite_20_stocks.txt`）使引用可回溯；
-  并让 `scripts/run_batch_backtest.py` 把 `universe_file` / `universe_sha256` / `db_sha256` 持久化进 `batch_summary.json`，
-  令"跑的是哪份池、哪个库"成为机械可验事实，而不是时间窗推断。
+- **建议（提案，非既成事实；判定：未落地 / 并未采纳）**：将该池文件纳入仓库（如 `docs/universe/china/core_satellite_20_stocks.txt`）使引用可回溯；并让 `scripts/run_batch_backtest.py` 把 `universe_file` / `universe_sha256` / `db_sha256` 持久化进 `batch_summary.json`，令"跑的是哪份池、哪个库"成为机械可验事实，而不是时间窗推断。
+  - **2026-10-24 状态补注（只补状态，不改上文）**：**该 20 名池从未入库**（仓库内既无此文件、git 历史亦无），故「纳入仓库」这条建议**未落地、且已决定不再采纳**——它是仓外快照，与上一段登记的 `sha256` 一起只能作为**当时那一次 run 的出处凭证**使用。仓库内现行（且唯一在库）的中国核心-卫星默认池是 `docs/universe/china/core_satellite_22_stocks.txt`（22 个符号，见 §19.10）。**不得**再据本条把 `core_satellite_20_stocks.txt` 当作"应存在但没找到"的文件去补齐或去引用——`P1.6` 第一次修复正是这样踩空的。
+  - **第二个诉求同样仍是提案**：`batch_summary.json` 的 `config` 目前只有 `universe`（符号列表）、`universe_size`、`universe_load_start`，**没有** `universe_file` / `universe_sha256`（`db_sha256` 一侧另有独立的来源校验实现）。本批未实现该项，勿据上文误以为宇宙出处已可机械复核。
 
 #### 16.15.9 测量口径更正（2026-10-23 归因复核）
 
@@ -2928,3 +2930,337 @@ exit: 1
   4. **版本轴审计**：
      - 本项仅改进回测引擎外部导出包装，未触及 `AllocationTemplate` 与 `BaseBlendAllocationStrategy` 算法底座，按照 `AGENTS.md` §7 规范，无需升级 `BASE_VERSION` 或 `version`。
 
+---
+
+## 19. Tier P4 终审验证与回测系统拟真度升级变更日志（`P1.4`–`P1.7`, `B4.2`, `B5.1`–`B5.3`）(2026-10-24)
+
+本节记录 2026-10-24 完成的 Tier P4 全量 8 项关键任务（`P1.4`, `P1.5`, `P1.6`, `P1.7`, `B4.2`, `B5.1`, `B5.2`, `B5.3`）的落地、回测系统拟真度与静态分析器加固。本轮交付使 Track P 达到 100%（7/7）、Track B 达到 100%（16/16），Tier P4 梯队全量清零。
+
+```
+                ┌────────────────────────────────────────────────────────┐
+                │          Tier P4 终审保障与对齐防线 (100% Cleared)      │
+                │  - Track P (7/7): 双轨回放 + AST 分析 + 参数显式传递   │
+                │  - Track B (16/16): 真实记账 + 并发调度 + 高拟真回测  │
+                └──────────────────────────┬─────────────────────────────┘
+                                           │
+         ┌─────────────────────────────────┴─────────────────────────────────┐
+         ▼                                                                   ▼
+┌─────────────────────────────────┐               ┌─────────────────────────────────┐
+│     Track P 代码/配置穿透加固   │               │     Track B 回测拟真度与批跑    │
+│ P1.4 非对称减仓阈值参数化与规范 │               │ B4.2 100% 离线高拟真全套回归    │
+│ P1.5 清除 grid/ensemble 僵尸    │               │ B5.1 dump-strategies-first 自动化│
+│ P1.6 run_blend 消除个人路径     │               │ B5.2 多翻空受限单拆解与递延     │
+│ P1.7 动态前缀与白名单纠偏       │               │ B5.3 快速内核 Schema 漂移防线   │
+└─────────────────────────────────┘               └─────────────────────────────────┘
+```
+
+### 19.1 `P1.4` 非对称减仓阈值参数化与架构规范交付 (Asymmetric Sells Ratio Parameterization & Spec)
+
+- **缺陷背景与真实缺口**：
+  - 在资产再平衡惯性层（[`common/allocation_templates.py`](file:///home/stone/Work/github/quant/common/allocation_templates.py) 中的 `_step_asset_inertia` / `apply_asset_inertia` / `_sparse_from_daily`）中，当开启 `asymmetric_sells=True` 时，减仓触发门槛被硬编码为固定系数 `0.60`：`sell_thresh = thresh_t * 0.60`，缺乏向外暴露的参数化调优接口。
+- **参数化改造**：
+  - 在 `_step_asset_inertia`、`apply_asset_inertia` 与 `_sparse_from_daily` 签名中统一引入 `asymmetric_sell_ratio: float = 0.60` 参数。
+  - 默认值严格保持 $0.60$，保证对所有既有策略回测与历史基线结果 100% 严格向后兼容。
+- **架构理论规范交付**：
+  - 撰写并签入系统性规范文档 [`docs/p1_4_asymmetric_sells_specification.md`](file:///home/stone/Work/github/quant/docs/p1_4_asymmetric_sells_specification.md)。
+  - 严格辨析底层资产再平衡绝对阈值缩放 $\alpha_{\text{asym}}$（`asymmetric_sell_ratio`，针对 $\theta_t$ 单向收紧以实现快速避险防守）与策略特化生命周期状态机层持仓体量相对比例 $r_{\text{rel}}$（`cfsb_inertia_relative_ratio`，针对当前权重 $w_{\text{cur}}$ 双向放大以防大底仓微调磨损）的正交性与解耦维度。
+- **测试验证**：
+  - 在 [`common/tests/test_allocation_templates.py`](file:///home/stone/Work/github/quant/common/tests/test_allocation_templates.py) 中新增自定义比例与非对称卖出行为测试（默认值锚定用例 `test_apply_asset_inertia_asymmetric_sells_ratio_anchor`），100% 离线通过。
+- **版本轴审计（`AGENTS.md` §7 双轴规则）**——按该节要求，「**不升版必须写明理由**，不能只写『没升』」：
+  - **改动位置决定了"没有唯一正确的类版本可升"**：`asymmetric_sell_ratio: float = 0.60` 加在**模块级自由函数** `_step_asset_inertia` / `apply_asset_inertia` / `_sparse_from_daily` 的签名与内部算术上。这三者是**共享的再平衡机制**，被 9 个静态模板、[`pipeline/research/blend/blend_base.py`](file:///home/stone/Work/github/quant/pipeline/research/blend/blend_base.py) 与 [`ml/bnn_forecaster/bnnf/strategy.py`](file:///home/stone/Work/github/quant/ml/bnn_forecaster/bnnf/strategy.py) 共同消费，**不属于任何一个模板类**。因此不存在"唯一应当递增的那个 class `version`"；随便挑一个类去升，反而会让该类"变过"的信号失真。
+  - **该文件没有文件级 `BASE_VERSION`，本轮也没有新增**：`common/allocation_templates.py` 从来只有一个 `AllocationTemplate` 基类与 9 个静态模板类、各自持有 `version`，**没有**文件级 `BASE_VERSION`（规则 7 已明文：不要去找、也不要为对齐而新增）。本项**未**修改 `blend_base.py`，故 `BaseBlendAllocationStrategy.BASE_VERSION` 保持 **`1.6.0`** 不动（与 §18.5 同）。
+  - **零交易行为变化的实测依据（这才是"不需要升版"的实体，而不是一句判断）**：默认值 `0.60` 与旧硬编码 `thresh_t * 0.60` **逐位等价**。已实测 `apply_asset_inertia` 的输出权重矩阵在 `asymmetric_sells=True` 与 `asymmetric_sells=False` 两种设置下，带/不带该新参数与 `HEAD` 的输出**完全一致（bit-for-bit）**。参数化只是把既有常量暴露出来，没有改变任何一条交易路径、阈值或默认开合状态。
+  - **因此本项的四项联动义务均"不触发"，逐条写明**：①不递增任何模板/策略类的 `version`；②不修改 `common/tests/test_strategy_versioning.py` 的断言（无版本变化可断言）；③不重跑 `--dump-strategies`（`strategy_dumps/*.json` 的 `strategy_version` / `base_version` 均不变，重导只会产生无意义的 mtime 变化）；④`BASE_VERSION` 不动（`blend_base.py` 本批零改动）。
+  - **范围偏差（如实记录，不静默忽略）**：`P1.4` 任务行原文写的是「本行**只**产出『参数化方案 + 影响面清单』，**落地另立任务**」，而实际落地（三处签名参数化 + 默认值锚定单测 + 规范文档）**就发生在同一批**。之所以照此记录而非回避：改动已被实测证明为零行为变化、且有离线单测锁死默认值 `0.60`，不构成对「改默认值即改变交易行为、须先有 walkforward 证据」这条红线（该行第 4 条前置义务）的违反——**红线约束的是改默认值，不是参数化本身**。若后续要把默认值改成 ≠`0.60`，仍属独立任务，须先有 walkforward 证据。
+
+---
+
+### 19.2 `P1.5` 清理无效配置字段 (Removal of Dead Config Fields `grid_symbol` & `ensemble_symbol`)
+
+- **清理背景**：
+  - `StrategyConfig` 中遗留历史字段 `grid_symbol` 与 `ensemble_symbol`，其功能早已被策略 Universe 解析机制取代，全仓零生产业务读取点，仅在断言其被忽略的单测中出现，极易误导使用者。
+- **落地改动**：
+  - 从 [`pipeline/research_strategy/rs/config.py:StrategyConfig`](file:///home/stone/Work/github/quant/pipeline/research_strategy/rs/config.py) 中彻底删除 `grid_symbol` 与 `ensemble_symbol`。
+  - 同步更新 [`pipeline/research_strategy/tests/test_strategy.py`](file:///home/stone/Work/github/quant/pipeline/research_strategy/tests/test_strategy.py) 中的陈旧断言，消除静态分析器报出的死字段告警。
+
+---
+
+### 19.3 `P1.6` 跨消融矩阵脚本消除个人绝对路径 (Removal of Hardcoded Personal Path)
+
+- **安全隐患**：
+  - [`pipeline/scripts/run_blend_cross_matrix.py`](file:///home/stone/Work/github/quant/pipeline/scripts/run_blend_cross_matrix.py) 的 `--universe` 参数默认值硬编码了开发者个人环境的生产路径 `/home/stone/Work/stock/simulate/202609/core_satellite_20_stocks.txt`，违背了测试隔离与路径规范。
+- **修复与护栏**：
+  - 将 `--universe` 默认值重定向为相对于代码库根目录的标准相对路径 `docs/universe/china/core_satellite_22_stocks.txt`（**二次修复后的最终值**；本条首版写的是 `core_satellite_20_stocks.txt`——该 20 名池从未入库、只是 §16.15.8 的一条建议，故首版默认值本身不可解析，裸调用必抛 `FileNotFoundError`。完整根因、最终默认值、两个 shell 包装器的同类失效与护栏测试见 §19.10，阅本条请以 §19.10 为准）。
+  - 在 [`pipeline/tests/test_config_wiring.py`](file:///home/stone/Work/github/quant/pipeline/tests/test_config_wiring.py) 中新增常驻安全护栏测试 `test_no_hardcoded_personal_paths_in_python_scripts`，静态扫描全仓所有 Python 脚本**与 shell 脚本**（2026-10-24 扩至 `.sh`——两个批量包装器的硬编码默认值正是旧版 `.py`-only 扫描看不见的藏身处，见 §19.10），断言个人路径 0 残留。
+
+---
+
+### 19.4 `P1.7` 静态分析器动态前缀与白名单纠偏 (Static Analyzer Dynamic Prefix & Reader Whitelist)
+
+- **纠偏背景**：
+  - 静态分析器此前仅支持字面量匹配，无法穿透由 `resolve_blend_param` 动态拼接前缀读取的字段，导致运行期真实生效的 `cfsb_inertia_relative_ratio` 被误判为僵尸字段（假阳性）；同时对 `symbol_param_key` 间接关联的 6 个动态切面参数缺乏可验证追踪（假阴性）。
+- **机制升级**：
+  - 在 `pipeline/tests/test_config_wiring.py` 的 `_DYNAMIC_RESOLVER_ARG_INDEX` 注册表中添加 `"resolve_blend_param": 1`，使分析器能穿透「按策略前缀拼键」的动态读取——即实盘侧 `PositionLifecycleConfig` 组装处的 `inertia_relative_ratio=resolve_blend_param(params, "inertia_relative_ratio", 0.0, float)`（[`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py)，**当前 ≈`:1531`**）。**引用纪律：行号必然漂移，一律以函数/调用形式为主体、行号只作 `≈` 提示**，不得把某个具体行号当作事实引用。该注册使 `cfsb_inertia_relative_ratio` 移出僵尸豁免台账——本批后 `_EXEMPT_FIELDS` 已为**空字典**，两个受检配置类的僵尸字段数为 **0**。
+  - 定义 `DynamicReadPoint` 数据结构，字段为 `class_name` / `field_name` / `target_rel_path` / `token` / `reason`——**不含行号**；据此建立 7 个动态读取点的白名单 `_KNOWN_DYNAMIC_READ_POINTS`，并新增常驻测试 `test_known_dynamic_read_points_are_valid_and_not_stale`。该测试对每个读取点断言**三轮**：①字段**仍在**对应配置类中被声明（AST 解析 `_declared_fields`，字段被删即判 "STALE"）；②`target_rel_path` 指向的文件**存在**；③文件内容**仍含**约定的读取 token（如 `inertia_relative_ratio`、`symbol_param_key="rsi_symbol"`）。**因此这条过期防线是「路径 + token + 字段仍被声明」，不是行号比对**——它是语义级的，不会被重构挪行误伤。
+  - 6 个经 `symbol_param_key` 间接消费的切面参数（`rsi_symbol` / `swing_symbol` / `chan_symbol` / `chan3_symbol` / `chanm_symbol` / `turtle_symbol`）的注册点在 [`pipeline/research_strategy/rs/timing_aspects.py`](file:///home/stone/Work/github/quant/pipeline/research_strategy/rs/timing_aspects.py)：字段声明在 `EntrySignalAspect.symbol_param_key`（**当前 ≈`:63`**），6 条切面注册项集中在 **≈`:203-248`**，运行期消费点为切面跑批函数内的 `cfg_symbol = p.get(self.entry.symbol_param_key)`（**当前 ≈`:599`**）。
+- **两条门槛的正交性（`α_asym` 与 `r_rel` 不共用同一个变量，勿混引）**：
+  - `asymmetric_sell_ratio`（本项）收窄的是模板再平衡层 `apply_asset_inertia` 的**绝对**阈值：`sell_thresh = thresh_t * asymmetric_sell_ratio`（仅 `asymmetric_sells=True` 生效）。
+  - `cfsb_inertia_relative_ratio` 生效在生命周期状态机层 `step_position_lifecycle` 的 `effective_threshold = max(cfg.inertia_threshold, cfg.inertia_relative_ratio * state.current_weight)`，且**仅对 `delta_w < 0` 生效**（买入方向仍用绝对门槛），[`common/position_lifecycle.py`](file:///home/stone/Work/github/quant/common/position_lifecycle.py) **当前 ≈`:504-509`**。
+  - 二者一个是"缩窄绝对门槛的比例"、一个是"随当前权重放大的相对门槛"，读取点分处两层、变量不同名，**不存在互相替代关系**；本项不改变 `r_rel` 的任何语义。
+
+---
+
+### 19.5 `B4.2` 100% 离线回测系统拟真度与全策略回归测试套件 (100% Offline Backtester Fidelity & Regression Suite)
+
+- **套件交付**：
+  - 交付综合性测试套件 [`common/tests/test_allocation_backtester_fidelity.py`](file:///home/stone/Work/github/quant/common/tests/test_allocation_backtester_fidelity.py)（单文件，100% 离线合成数据，0 网络请求；行数随用例增补而变，**不作为引用事实**）。
+- **覆盖维度**：
+  1. **B1.1–B3.4 全部拟真度特性融合**：次日开盘价 (`next_open`) 跨日撮合、次日 VWAP (`next_vwap`)、日内 TWAP (`intraday_twap`)、Almgren-Chriss 平方根市场冲击模型、流动性参与率上限 (`max_volume_participation`) 截断与重入队递延、闲置资金国债逆回购利息计提、融券做空借券费计提、停牌双向拦截、ST 5% 涨跌停拦截、`minimal_metrics` 标量指标等价性。
+  2. **Walkforward 多进程一致性**：断言 `run_walkforward` 在 `-j2` 多进程与单进程模式下所有 Fold 结果与流水比特级一致。
+  3. **9 大静态模板约束**：断言①稀疏权重契约（非调仓行全为 `NaN`、无前向填充）；②调仓行预算（`target_w.sum(axis=1) <= 1.0 + 1e-6`）；③回测后实际持仓的预算与符号（`actual_w.sum() <= 1.0`、`actual_w >= -1e-9`）、权益曲线非空/有限/逐 bar `> 0`；④`rebalance_report` 的列契约与 `portfolio_equity > 0` / `total_cost >= 0`；⑤**权益恒等式**——由 `test_ledger_parity.py::_replay_ledger(initial_capital, rebalance_report, dates, closes, symbols)` 从**成交带**重放现金与持股（`initial_capital` → 每笔成交的 `shares × price ± total_cost` → 逐 bar 以收盘价 mark），再断言 `equity == replayed_equity`、`actual_w == replayed_w`、`replayed_cash >= 0`，容差 `rtol=0, atol=1e-6`。
+     **引用纪律（这条断言最容易写过火，务必按此描述）**：恒等式是**「重放对账」式的机械验证**（报出的 `equity` 必须等于由成交带独立重建的 `cash + Σ held×close`），**不是**把引擎内部现金/持仓直接抄出来比一遍——引擎**不暴露**逐 bar 的 `cash` 与 `holdings`，若用 `weights × equity` 反推再比 `equity`，那将是自证循环（`weights` 本就由同一 `equity` 导出，已在用例注释中写明）。因此引用时必须说清"**经 `_replay_ledger` 重放 + `atol=1e-6`**"，不得只写"断言了严格权益恒等式"。
+     同一 helper 亦是 `common/tests/test_market_impact_model.py` 中该恒等式的断言来源；**若后续改动把这条重放断言移出本用例，必须同步把本句改指向仍然包含它的文件 + 用例名**，不得留下"名字里有 identity、实际没断言"的悬空声明。
+
+---
+
+### 19.6 `B5.1` 批量回测器 `--dump-strategies-first` 与 `EXTRA_PARAMS` 自动化映射 (Batch Backtest Automated Dump & Extra Params)
+
+- **背景与痛点**：
+  - 旧 Shell 批跑流程包含前置策略 dump 步骤，且依赖环境变量 `EXTRA_PARAMS` 注入参数；统一 Python 批量回测器此前未自动衔接该两步。
+- **功能增强**：
+  - 在 [`scripts/run_batch_backtest.py`](file:///home/stone/Work/github/quant/scripts/run_batch_backtest.py) 中新增 `--dump-strategies-first`：批跑启动前，`dump_strategies_first()` **无条件重新执行一次** `subprocess.run([sys.executable, <repo>/pipeline/research_strategy/run_research_strategy.py, "--dump-strategies"], check=True)`。**机制说明（不要读成"陈旧检测"）**：这里**没有任何陈旧性探测或比对**，没有 mtime/哈希/版本号的"是否过期"判断；它是「**每轮先无条件重导，再批跑**」，陈旧 JSON 不会进入本轮批跑靠的是**被无条件覆写**而非被识别。`check=True` 的作用是子进程非零退出即抛 `CalledProcessError` **中止整轮批跑**——即 dump 失败时批跑根本不会开始，也不会带着半成品 dump 继续跑。
+  - 新增 `--extra-params / --extra` 参数，并内置对环境变量 `EXTRA_PARAMS` 的自动回退解析，与 `--strategy-params` 深度合并。
+  - 在 [`pipeline/tests/test_run_batch_backtest.py`](file:///home/stone/Work/github/quant/pipeline/tests/test_run_batch_backtest.py) 中增补单元测试验证。
+
+---
+
+### 19.7 `B5.2` 多头向空头翻转受限挂单拆解与递延 (Long-to-Short Flip Residual Deferral under Liquidity Caps)
+
+- **缺陷根因**：
+  - 当策略发出多翻空（`target_w < -1e-7`）调仓指令且触发单日流动性参与率上限（`max_volume_participation`）约束时，旧逻辑在 `c["prior_s"] > 0` 分支中将 `trade_s` 错误钳制在 `min(trade_s, prior_s)`，导致超出平仓到 0 的反向做空余量被静默丢弃。
+- **修复落地**：
+  - 在 [`common/allocation_backtester.py`](file:///home/stone/Work/github/quant/common/allocation_backtester.py)（`_execute_pending` 与日内结算处）重构判断逻辑，将钳制条件收紧为仅在非空头目标（`target_w >= -1e-7`）时生效；对于跨 0 轴的翻空单，允许 `trade_s` 跨越平仓边界，超额未成交部分通过 `_queue_residual` 重新入队并记录至 `deferral_report`。
+  - 在 [`common/tests/test_market_impact_model.py`](file:///home/stone/Work/github/quant/common/tests/test_market_impact_model.py) 增补受限翻转单测，验证账本现金与持仓股数恒等式严格成立。
+
+---
+
+### 19.8 `B5.3` 快速回测内核 Schema 漂移防线加固 (Fast Array Kernel Schema Drift Guards)
+
+- **背景与隐患**：
+  - 快速数组内核 [`common/allocation_backtester_fast.py`](file:///home/stone/Work/github/quant/common/allocation_backtester_fast.py)（Numba/NumPy JIT）此前签名中 `minimal_metrics=True` 被静默忽略，且返回字典缺失生产引擎特有的报告字段（按生产调用会抛未定义 KeyError）。
+- **防线收敛**：
+  - 在 `run_allocation_backtest_fast` 中对 `minimal_metrics=True` 显式抛出 `NotImplementedError`。
+  - 引入包装类 `FastBacktestResult(dict)`，当调用方尝试访问未移植的生产字段（`deferral_report`, `cash_carry_report`, `total_market_impact` 等）时显式抛出包含清晰指引的 `NotImplementedError`。
+  - 在 [`common/tests/test_allocation_backtester_fast.py`](file:///home/stone/Work/github/quant/common/tests/test_allocation_backtester_fast.py) 增设 schema 契约对拍单测。
+
+---
+
+### 19.9 Tier P4 全量离线回归验证结果汇总
+
+**计数口径（"合计"据此可复算，务必照此读表）**：表内"用例数量"= **pytest 采集项数**，即 `pipeline/.venv/bin/python -m pytest <file> --collect-only -q` 末行 `N tests collected` 的 `N`。参数化用例**逐项计入**，因此该列**不等于**文件内 `def test_` 的函数个数（例：`pipeline/tests/test_config_wiring.py` 只有 8 个 `def test_`，但两个 `@pytest.mark.parametrize` 展开后采集为 **12** 项；`common/tests/test_allocation_backtester_fast.py` 22 个函数采集为 **25** 项）。**本轮实测（2026-10-24，最后一次重测在 §20 落地之后，快照，可逐文件复跑）：`9 + 12 + 12 + 27 + 9 + 25 + 42 + 9 + 11 + 7 + 13 = 176`**；**合计行必须始终等于上方十一行之和**——后续任何文件新增用例时，请改该行数字并同步合计，不要只改一处。
+
+**本表的四段沿革（勿混读）**：① 首版六行（`P1.4`/`P1.5`–`P1.7`/`B4.2`/`B5.1`/`B5.2`/`B5.3`）= `9 + 12 + 12 + 27 + 9 + 25 = 94`，该 94 仍是**那六份文件**的子集小计；② §19.10 为 `P1.6` 补了两份默认路径护栏文件，故新增两行、合计 `94 + 18 + 9 = 121`；③ §19.10.7–19.10.11 的加固轮把 `test_script_default_paths.py` 由 18 抬到 **26**（+8：降级软链 / 仅注释池 / 裸 `DRY_RUN` 无效 / 命名空间静态守卫，每项在两 wrapper 上参数化），并随批登记第九份文件 `test_walkforward_audit_script.py`（**11**），故 `121 + 8 + 11 = 140`；④ §20 落地后：`test_script_default_paths.py` 再由 **26 → 42**（+16，§20.7 的 `--results` 解析序 / `Results Dir:` 绝对路径 / 结果目录从不创建 / `--help` 任意位置四组用例的跨 wrapper 参数化），并登记 §20 的两份事故护栏文件 `test_strategy_dumps_invariants.py`（**7**）与 `test_blend_dump_overrides.py`（**13**），故 `140 + 16 + 7 + 13 = 176`。`test_config_wiring.py` 因护栏扫描面由 `.py` 扩至 `.py`+`.sh` 而**改动的是测试体、不是用例条数**，采集项仍为 **12**（已重测确认，不是漏改）。
+
+| 测试套件文件 | 覆盖任务 | 用例数量 | 测试状态 |
+| :--- | :--- | :---: | :---: |
+| `common/tests/test_allocation_templates.py` | `P1.4` (非对称减仓) | 9 | **PASS** |
+| `pipeline/tests/test_config_wiring.py` | `P1.5`, `P1.6`, `P1.7` (配置/路径/白名单，扫描面含 `.sh`) | 12 | **PASS** |
+| `common/tests/test_allocation_backtester_fidelity.py` | `B4.2` (拟真度与全模板回归) | 12 | **PASS** |
+| `pipeline/tests/test_run_batch_backtest.py` | `B5.1` (批跑 dump 与 extra) | 27 | **PASS** |
+| `common/tests/test_market_impact_model.py` | `B5.2` (多翻空受限单拆解) | 9 | **PASS** |
+| `common/tests/test_allocation_backtester_fast.py` | `B5.3` (快内核 schema 漂移) | 25 | **PASS** |
+| `pipeline/tests/test_script_default_paths.py` | `P1.6`（§19.10 补：包装脚本默认值必须可解析；§19.10.7/19.10.8 加固：dry-run 命名空间 + universe 内容校验；§20.7 加固：`--results` 解析序 + `--help` 任意位置） | 42 | **PASS** |
+| `pipeline/tests/test_run_blend_cross_matrix_defaults.py` | `P1.6`（§19.10 补：`--universe` 默认值存在性与 fail-fast） | 9 | **PASS** |
+| `pipeline/tests/test_walkforward_audit_script.py` | `P1.6` 附带（§19.10.10：`run_audit.py` 输入守卫；非 Tier P4 任务，随批登记） | 11 | **PASS** |
+| `pipeline/tests/test_strategy_dumps_invariants.py` | §20.6 事故护栏（dump 必须等于配置；cfsb 钉住值字面断言；旧 Step 2 盖戳必须被检测器抓到） | 7 | **PASS** |
+| `pipeline/tests/test_blend_dump_overrides.py` | §20.6 事故护栏（覆盖副本行为学：零注入 / 源只读 / 原子写 / 拒写实盘 / 实盘哈希不变） | 13 | **PASS** |
+| **Tier P4 专项单测总计** | **全部 8 项任务 / 9 份文件 + §20 事故护栏 2 份文件**（第 9 份为随批加固登记的审计脚本守卫；末 2 份为 §20 事故护栏，归属非 Tier P4，随表登记以免另立账） | **176** | **100% 离线通过** |
+
+- 十一份文件合并执行复核（单次调用、`--import-mode=importlib`、100% 离线）：**176 passed, 0 failed**（本轮实测 `176 passed, 2 warnings in 26.40s`；两条 warning 是 `ablation_intraday_5m.py:317` 的 `invalid escape sequence '\%'`，与断言无关）。
+- 快内核（`B5.3`）本批新增 2 项：`test_minimal_metrics_raises_not_implemented_error` 与 `test_unported_production_keys_raise_not_implemented_error`；同批新增用例数为 `B5.1` **6** 项、`B5.3` **2** 项、`P1.4`（默认比例锚定）/`P1.6`（个人路径护栏）/`P1.7`（动态读取点白名单）/`B5.2`（受限翻转）各 **1** 项，故上表数字可与本批 diff 的新增用例数交叉核对（表内是**采集项总数**、不是本批新增数）。**§19.10.7–19.10.11 加固轮另计**：`test_script_default_paths.py` +8（18 → 26）、`test_walkforward_audit_script.py` 全文件 +11。**§20.6/§20.7 另计**：`test_script_default_paths.py` 再 +16（26 → 42）、`test_strategy_dumps_invariants.py` 全文件 +7、`test_blend_dump_overrides.py` 全文件 +13，合计 +36（140 → 176）。
+
+---
+
+### 19.10 P1.6 默认路径二次修复与全仓默认路径审计
+
+**前置结论（先读这条，否则会把 §19.3 读成已完成）**：§19.3 记录的 P1.6 修复**本身是坏的**——它把个人绝对路径换成了一个**从未存在于本仓库**的路径，于是「消除了硬编码」的同时把「裸调用可用」也一起弄丢了。本节登记第二次（也是最终）修复：默认值、包装脚本、护栏测试三处一起补齐。**本节不含任何策略/配置字段逻辑改动，故不涉及 `version` / `BASE_VERSION` 版本轴**（无策略类、无 `BaseBlendAllocationStrategy` 改动，按 `AGENTS.md` 第 7 条无需递增，也无需 `--dump-strategies` 重导）。
+
+#### 19.10.1 根因：幻影路径 `core_satellite_20_stocks.txt`
+
+- **这个文件从来没有进过仓库**：`docs/version.md` §16.15.8 明确记着它只是**一条建议**（"建议（提案，非既成事实）"），并同时记下原始出处在仓外——`/home/stone/Work/stock/simulate/202609/core_satellite_20_stocks.txt`、`sha256 = ed48e922…9526`、实读 20 个符号，**"该文件在仓库之外，git 历史里不存在，故不可从版本控制恢复"**。
+- **首次修复因此必然是死路**：`run_blend_cross_matrix.py` 的 `--universe` 被指向 `docs/universe/china/core_satellite_20_stocks.txt`，而该路径既不在 HEAD、也不在任何历史提交里。裸调用 ⇒ `FileNotFoundError`；且因为 `--universe` 是被转发给 `backtest_blend_strategies.sh` → `--universe-file` → `common.universe.FileUniverseProvider` **在批量 worker 池深处**消费的，报错现场离病因极远（更坏的情况是静默拿到一个缩水的宇宙）。**静态 grep 标签（"个人路径零残留"）永远抓不到这一类**——这正是护栏必须落到**文件系统存在性**而不是字符串形状的原因。
+- **口径教训**：`docs/version.md` 里「建议」「提案」「宜」这类动词后面的路径**不得**被当成既成事实引用（§16.15.8 已在原地改成"未落地 / 并未采纳"，见该节本次补注）。
+
+#### 19.10.2 最终默认值：`docs/universe/china/core_satellite_22_stocks.txt`
+
+- **为什么是它**：这是仓库内**唯一**现行在库的中国核心-卫星池（22 个符号，`#` 注释，行形 `<6 位数字>.<SH|SZ>`），且是全仓**实际在用**的那一份——`scripts/run_live_strategy.py`（≈`:169`）、`scripts/check_live_portfolio_health.py`（≈`:93`）、`web/livetrading/execution_service.py`（≈`:451`/`:649`）、`scripts/sync_china_5m_and_indices.py`（≈`:1267`）以及全部中国 blend walkforward 报告头都指向它。**引用纪律同上：行号只作 `≈` 提示，以路径与函数为主体。**
+  - **例外（勿照抄成"全部实盘脚本都用 22 名池"）**：`scripts/run_live_multi_strategy.py`（≈`:96`）的 `DEFAULT_UNIVERSE_FILE` 用的是**另一份同样在库**的池 `docs/universe/china/pruned_core_satellite_blend_16.txt`（blend_16 剪枝池）。它**不是**失效路径，因此不在本次修复范围；本节只登记事实，不擅自统一（换池＝换持仓域，须单独证据）。
+- **实现**：`pipeline/scripts/run_blend_cross_matrix.py` 用 `__file__` 上溯得 `_REPO_ROOT`，拼出绝对化的 `_DEFAULT_UNIVERSE`（不再依赖 `$PWD`、也不再写任何个人前缀）；新增 `load_universe_symbols()`——注释/空行感知、逗号视作分隔、符号大写化（与 `FileUniverseProvider` 同规则），并对三类失败分别给出**点名文件**的异常：文件不存在（`FileNotFoundError`）、有效符号数 `< 2`（`ValueError`）、符号不符合 `<6 位数字>.<SH|SZ|BJ>`（`ValueError`，附前 5 个反例）。`main()` 在**启动任何子进程之前**调用它，失败即 `Error: …` + `exit(1)`；banner 额外打印 `(<N> symbols)`，把"跑到的是哪份池"变成肉眼可验。
+- **保留的历史注释**：`run_blend_cross_matrix.py:146` 特意留了一行点名 `core_satellite_20_stocks.txt` 的注释，用来说明"第一次修复为何注定失败"。**这是刻意保留的病因档案，不是漏改**，不得当作残留硬编码删除。
+
+#### 19.10.3 同类失效：两个 shell 包装器的 `50_stock.txt` 默认值
+
+- `pipeline/scripts/backtest_blend_strategies.sh`（≈`:53`）与 `pipeline/scripts/backtest_all_strategies.sh`（≈`:5`）的 `UNIVERSE` 默认值都是 `../docs/universe/china/50_stock.txt`——该池在提交 `89f8388` 被**改名迁入中文子目录** `docs/universe/china/50只A股高流动性优质股票精选/`，裸路径自此不再解析。表现与 19.10.1 同构但更糟：`--dump-strategies` 会先把 50+ 份策略 dump 落盘，**之后**才在 `run_backtest.py` 里炸掉（或按空宇宙跑完）。
+- **统一修复**：`SCRIPT_DIR` 取自 `${BASH_SOURCE[0]}`（不是 `$PWD`）→ `REPO_ROOT` → `cd "${REPO_ROOT}/pipeline"`；并在 `cd` **之前**捕获 `INVOKE_DIR`，使 `--universe my.txt` 仍解释为"我当前目录下的 my.txt"。默认值改为 `DEFAULT_UNIVERSE="${REPO_ROOT}/docs/universe/china/core_satellite_22_stocks.txt"`。
+- **解析顺序（两脚本一致）**：绝对路径 → 调用者 cwd（`INVOKE_DIR`） → 仓库根（`REPO_ROOT`，文档片段一贯的写法） → `pipeline/` 工作目录（历史行为）；全部落空则原样返回。
+- **fail-fast 守卫（初始版：仅 `[[ -f ]]`；已被 §19.10.8 的内容校验升级，勿照此实现）**：在 dump/批量之前校验，缺失即 `Error: universe file not found at '<path>'` 并附「如何用 `--universe` 覆盖」与「内置默认值是哪个」，`exit 1`。**这条缺失分支至今未改、且已经有测试钉住**（`test_missing_universe_fails_fast_with_the_path_quoted` / `test_all_strategy_script_missing_universe_fails_fast` 回显操作者原串）。
+- **`--help` / `-h` 与 `BLEND_BATCH_DRY_RUN=1`**：`--help` 打印用法 + `Default universe: <abs path>` 并标注 `(exists)` / `(MISSING)`，**不碰 `uv`、不碰缓存、不碰网络**；`BLEND_BATCH_DRY_RUN=1` 走完解析与**内容**校验后停在 dump 之前，**唯一输出行**为 `DRY RUN (BLEND_BATCH_DRY_RUN=1): resolved <path> (<N> valid symbols); stopping before the strategy dump.`，随即 `exit 0`（dump 与回测均未执行、未写仓库）。**开关名变更见 §19.10.7**：旧的裸 `DRY_RUN` 已**不再被识别、也不是别名**。
+- **epilog 同步**：`scripts/run_batch_backtest.py` 的 argparse epilog 里那段可复制粘贴的示例原写 `--universe-file docs/universe/china/50_stock.txt`，已改为 22 名池。
+
+#### 19.10.4 全仓默认路径审计（扫描数字与分类）
+
+- **扫描规模（代码侧审计口径）**：全仓 `docs/universe/` 相关池路径引用 **90 处**，其中目标不存在 **22 处**。分类后：**可执行默认值 / 用法示例 3 处**（即 19.10.2/19.10.3/19.10.3-epilog 这三处，**已全部修掉**）；其余为**运行时产物**（如 `resolved_universe.txt`、`web/livetrading/data/custom_universes.json` 里的历史条目）、**`tmp_path` 测试夹具**、**占位符**（`docs/universe/...` 这类省略写法）、**刻意的历史注释**（含 19.10.2 那条病因档案）。**结论：不存在第 4 处会真正执行到的失效默认值。**
+- **口径差异披露（我不把 90/22 当唯一真值）**：本次复核用一个独立、可复跑的更粗口径（工作树 `.py/.sh/.md/.json/.txt`、`docs/universe/` 前缀、排除 `.venv/.git`）得到 **94 处引用 / 28 处不可解析**，逐类为：幻影 20 名池 **7**、父目录含括号被正则截断的**假缺失 10**、`...` 省略号占位 **5**、URL 编码形式的**假缺失 2**、`50_stock.txt` **2**、输出路径 `pruned_universe.txt` **1**、失效输入 `original_universe.txt` **1**。**两套数字的差别来自正则与文件范围，不代表新发现的缺陷**；唯一需要行动的仍是 3 处可执行引用（已修）+ 1 处技能文档输入（本节 19.10.5 已修）。
+- **`git grep -n '/home/stone/Work/stock'`：可执行代码 0 处**（**数字会随本节自身引用该串而增长，故只把"可执行 0 处"当结论**）：工作树实测 **12 行** —— `docs/development_plan.md` **4**、`docs/version.md` **6**、`pipeline/tests/test_config_wiring.py` **2**（**护栏测试自身的 `forbidden` 字面量与 docstring**，该测试在运行期显式跳过自己）。`docs/version.md` 的 6 行里，2 行（§19.10.1 的"仓外原文件"与本节原先那句统计）**就是本节自己在引用这条路经**，故该串的计数只增不减、不具可比性；`HEAD` 时点该文件的计数是 **3 行**。`/home/stone/Work/stock` 在非文档、非护栏的代码中**零命中**。
+
+#### 19.10.5 技能文档里的失效输入（非代码，一并收口）
+
+- `pipeline/.agents/skills/walkforward-audit/SKILL.md` 的 Step 5 复制粘贴块把 `--universe-file` 指向同样不存在的 `docs/universe/china/original_universe.txt`。已改为 22 名池，并在块首注释里写明判据：**`--universe-file` 是输入、必须存在；`--export-pruned-universe` 是输出、无需预先存在**。输出路径 `docs/universe/china/pruned_universe.txt` 原样保留。
+- **附带收益（改这处示例路径时挖出的既有缺陷）**：`run_audit.py` 有两处「输出看起来正常、结论却建立在一个谁都没批准过的输入上」的静默回退，已一并收口，见 §19.10.10。
+
+#### 19.10.6 护栏测试（把"默认值能解析"变成机械事实）
+
+- 新增 `pipeline/tests/test_run_blend_cross_matrix_defaults.py`（**9** 项）：`--universe` 默认值必须是**仓库内真实文件**（不得逃出仓库）、必须解析出符合 `<6 位数字>.<SH|SZ|BJ>` 形状的非平凡中国符号表、模块内其余 `_REPO_ROOT` 派生的路径默认值都必须存在、缺失/畸形宇宙必须在 `main()` 里变成 `exit(1)` 且**点名文件**（不得是栈深处的裸 `FileNotFoundError`）。
+- 新增 `pipeline/tests/test_script_default_paths.py`（**本节初版 18 项 → 加固后 26 项**，逐文件 `--collect-only -q` 实测，见 §19.10.11）：两个 shell 脚本 `bash -n` 通过；`BLEND_BATCH_DRY_RUN=1`（初版为裸 `DRY_RUN=1`，已改名，见 §19.10.7）在**仓库根 / 脚本自身目录 / 无关 cwd(`tmp_path`)** 三种调用点都能解析默认池、退出 0、**不调用 `uv`**（PATH 上放毒化的 `uv` 垫片证明之）、不写仓库；`--help` 退出 0 且把默认池标为 `exists`；缺失池报 `Error: universe file not found at '<path>'` + `exit 1` 并回显操作者原串；`--universe docs/universe/china/...` 这种**仓库根相对**写法在 `cd` 之后仍能解析；两脚本的 `*_UNIVERSE=` 赋值不得再出现被删的 `50_stock.txt`，`run_batch_backtest.py` 的 epilog 必须指向真实存在的文件。**加固新增 4 个测试函数、采集为 8 项**（每个都在两个 wrapper 上参数化）：降级软链（内容是链接目标，`[[ -f ]]` 会通过）、仅注释池、裸 `DRY_RUN` 无效、命名空间静态守卫。
+- 新增 `pipeline/tests/test_walkforward_audit_script.py`（**11** 项，`tmp_path` 全离线，夹具 schema 照 loader 实际读取构造；**刻意不落 `walkforward_rebalances.csv`**，以免触发取价即触网）：`run_audit.py` 的输入守卫回归，详见 §19.10.10。
+- `pipeline/tests/test_config_wiring.py::test_no_hardcoded_personal_paths_in_python_scripts` 的扫描面由 `*.py` **扩至 `*.py` + `*.sh`**——这正是 pre-P1.6 那类"个人路径藏在 shell 里"的盲区（`.py`-only 扫描看不见包装脚本）。该文件采集项数**仍为 12**（改的是测试体，不是用例条数）。
+- **合计**：`9 + 26 + 11 = 46` 项（本节初版只有前两份，为 `9 + 18 = 27`），全部 100% 离线（无网络、无缓存、无 `uv`）；§19.9 的**九**文件合并单次执行实测 **140 passed, 0 failed**（本轮复跑：`140 passed, 2 warnings in 26.42s`，两条 warning 仍是 `ablation_intraday_5m.py:317` 的 `invalid escape sequence '\%'`）。**⚠ 该 46 / 140 是本节当轮快照，已被 §20 超越：现行数字为 `test_script_default_paths.py` 42 与 §19.9 表的 11 行 / 176 项（`176 passed, 2 warnings in 26.40s`），以 §19.9 为准。**
+
+#### 19.10.7 dry-run 开关改名 `BLEND_BATCH_DRY_RUN`（命名空间化，旧 `DRY_RUN` 不是别名）
+
+- **变更**：两个批量包装器（`backtest_blend_strategies.sh` / `backtest_all_strategies.sh`）的 dry-run 开关统一为 `BLEND_BATCH_DRY_RUN`，两脚本同名。**`DRY_RUN` 不再被识别、也不是别名**——传 `DRY_RUN=1` 时脚本照常往下走到真实 dump/回测。
+- **为什么要改名（不是洁癖）**：`DRY_RUN` 是 CI 镜像、docker env 与无关工具里极常见的导出变量。沿用旧名意味着操作者环境里一个残留的 `DRY_RUN=1` 会让一次**真实的多小时批跑被静默跳过**——退出码 0、日志干净、什么都没跑，属于最危险的一类静默失败。命名空间化把"误触发"从"默认可能发生"变成"必须显式键入本项目的变量名"。
+- **置 1 时的唯一输出行（逐字，之后立即 `exit 0`，位于 dump/backtest 之前）**：
+  `DRY RUN (BLEND_BATCH_DRY_RUN=1): resolved <path> (<N> valid symbols); stopping before the strategy dump.`
+  该行把「解析到哪份池、多少个有效符号」一并打印，故 dry run 也不可能被误读成"跑完了"。
+- **静态守卫测试 `test_dry_run_switch_is_namespaced_in_code`**：逐行扫描两个 wrapper，断言**没有任何可执行行**使用裸 `DRY_RUN`（只豁免整行注释——文件里保留了说明改名缘由的历史注释，那是病因档案，不是漏改）。行为侧另有 `test_legacy_dry_run_var_has_no_effect`（两脚本各一条）作证：给出 `DRY_RUN=1` 但不给命名空间变量时，脚本越过守卫进入真实流程（毒化的 `uv` 垫片留下标记即证明），故"不再被识别"是行为事实而非仅靠文案。
+
+#### 19.10.8 universe 守卫升级：先解析路径、再校验内容（`[[ -f ]]` 不足以证明"这是一份池"）
+
+- **背景事实（本仓库已有确证案例，故不是假想威胁）**：`docs/universe/` 下 5 个池全部是**`mode 120000`、目标为相对路径的 git symlink**，而它们的目标文件本身入库为 `100644`：
+  - `docs/universe/china/core_satellite_{22,100,200k}_stocks.txt` → `核心卫星组合精选(央国企红利底仓+科技龙头增强)/…`
+  - `docs/universe/hongkong/core_satellite_22_stocks.txt` → `核心卫星组合精选(高股息红利底仓+科技互联网增强)/…`
+  - `docs/universe/us/core_satellite_22_stocks.txt` → `核心卫星组合精选(价值现金流红利底仓+AI科技巨头增强)/…`
+- **不是幽灵路径（已实测）**：用 `git archive HEAD` 导出到干净目录后直接读文件，中国池分别解析出 **22 / 100 / 100** 行有效 `NNNNNN.SH|SZ|BJ` 符号（本轮复核重跑了同一步）。港美两池的目标文件同样在库内可读，但它们装的是非中国标的，按中国 A 股正则计为 **0** —— 正因如此，≥5 这条阈值只能装在中国池的两个 wrapper 上，**不得**套用到港美池。
+- **真正的失效形态**：Windows 无 Developer Mode 的检出用 `core.symlinks=false`（git 的 Windows 默认），软链被落成"**内容是链接目标的普通文本文件**"。此时旧的仅 `[[ -f ]]` 守卫**会通过**，ticker 解析器把 `核心卫星组合精选(...)/core_satellite_22_stocks.txt` 这 1 个 token 当成宇宙 —— 批跑于是在一个 1 token 的垃圾池上静默跑完，且日志一切正常。
+- **升级后的守卫（两脚本一致）**：①先 `resolve_universe_path` 解析路径，缺失仍报**未改动**的 `Error: universe file not found at '<path>'`（该分支已有测试钉住）；②再校验**内容**——有效 `NNNNNN.SH|SZ|BJ` 行少于 **5** 行即失败：
+  `Error: universe file '<path>' parsed to only <N> valid China A-share ticker(s); at least 5 'NNNNNN.SH|SZ|BJ' tickers are required (one per line, blank lines and '#' comments ignored).`
+  并附 `Hint: if this is a git symlink materialised as a text file, the checkout has core.symlinks=false` + `(git's Windows default without Developer Mode): such a file's content is the LINK TARGET, not a pool.` + `git ls-files -s <path>`（应见 `120000`）与 `cat <path>` 的诊断提示 + 修复建议 `git -c core.symlinks=true checkout -- <path>` 或开启 Developer Mode + 内置默认值回显。解析口径：一行一符号、空行与 `#` 注释跳过、逗号也算分隔、大小写不敏感、容忍 CRLF。
+- **阈值 ≥5 的取值理由**：`docs/universe/china/` 下每份真实池都远超该线，而"链接目标字符串"（1 token）与"仅注释/空行文件"（0 token）必然触发；它比 Python 侧更早也更严。
+- **与 Python 侧的关系（谁先失败）**：`pipeline/scripts/run_blend_cross_matrix.load_universe_symbols` 同样会拒绝（`<2` 个符号即 `ValueError`，格式不符亦 `ValueError`，附前 5 个反例），但它跑在 `run_blend_cross_matrix.py` 内部——**此时 wrapper 早已 dump 完 50+ 份策略**。因此 shell 侧现在是**更早、措辞同构**的那道闸：阈值更严（≥5 vs ≥2），且发生在任何 dump 之前。
+
+#### 19.10.9 仓库根 `.agents/skills` 软链：目标由机器绝对路径改为仓库相对
+
+- **变更**：`.agents/skills` 的目标 `/home/stone/Work/github/quant/pipeline/.agents/skills` → `../pipeline/.agents/skills`。旧目标写死了本机路径，在任何别的机器/克隆点上都是悬空链接。
+- **它是全仓唯一一条绝对目标软链**：`git ls-files -s` 里 `120000` 共 6 条 —— 5 个 `docs/universe/` 池（目标均为相对路径）+ 这 1 条；改完后绝对目标为 **0** 条。
+- **⚠ 已提交的 blob 仍是旧绝对目标，本次只修好了工作树**：`git cat-file -p "$(git rev-parse HEAD:.agents/skills)"` 至今仍回显绝对路径 —— 软链的**目标串本身就是 blob 内容**，改工作树里的链接不会改变索引里的对象，须随本批提交才真正生效。这是"改好工作树 ≠ 改好仓库"的具体一例，记在此处以免下次又被当成已完成。
+- `SKILL.md` 的「工作目录约定」已同步把该链接描述为**仓库相对**，并继续要求调用时使用 `pipeline/.agents/skills/...` 前缀路径（不得缩写成 `.agents/skills/...`——那会经由这条软链，在未开启软链的检出上直接失效）。
+
+#### 19.10.10 `run_audit.py` 两处静默回退收敛为硬失败／显式播报
+
+- **缺陷类别**：与 §19.10.7 同族 —— "**输出看起来完全正常，但结论是算在一个没人批准过的输入上**"。均位于 `pipeline/.agents/skills/walkforward-audit/scripts/run_audit.py`：
+  1. **`--universe-file` 显式给出但不存在** → `Error: universe file not found at '<path>'` + 说明「观测符号集回退仅在完全不传该参数时使用，传入绝不静默忽略」，`exit 1`；解析发生在**任何分析之前**（`main()` 前置 + `deep_analyze_top_strategies()` 内二次校验，防直接调用该函数绕过 CLI）。旧行为是静默改用"这些回测恰好碰到的符号"，于是 pruned universe 看起来正常却与操作者给的池无关。
+  2. **省略 `--universe-file` 时仍允许回退，但必须播报**：`Warning: no --universe-file supplied; pruning against the <N> observed-symbol fallback set (NOT a filtered or complete universe).`（保留便利性，取消"无声"）。
+  3. **结果目录自动发现落到 `<repo>/pipeline/results` → 拒绝**：`Error: refusing to auto-audit '<path>'` + 原因（该目录是即用即弃的实验产物，`SKILL.md` 明确禁止审计）+ `exit 1`；只有**显式** `--results-dir` 才放行（并打印警告说明这是被点名要求的那一个）。旧行为是从 `pipeline/` 下裸调用时安静地审计了这些实验产物 —— 与 `L2.35` 记录的"结果目录不可回溯"叠加后尤其危险。
+  4. **任何情况下都播报来源**：`Using results directory: <abs>` 并说明选择原因（`--results-dir` 显式 / `./results` 在 cwd 下自动发现）；显式目录**为空也不是静默成功**（点名该目录、指出其中没有 `walkforward_summary.json`、`exit 1`）。
+- **统一助手** `_require_existing_input()` + `AuditInputError`（`FileNotFoundError` 子类，故旧的 `except FileNotFoundError` 调用方合约不破）供 `--universe-file` 与 `--results-dir` 共用"给了就必须存在、绝不静默替换"这一条规则。
+- **范围红线**：**数值逻辑、阈值、报告文案一律未动**——本轮只动输入解析与出口措辞，故审计结论口径与历史报告保持可比。
+- **测试**：新增 `pipeline/tests/test_walkforward_audit_script.py`（**11** 项，`tmp_path` 全离线；夹具 schema 按 loader 实际读取构造：`load_all_summaries` 只需可解析的 `walkforward_summary.json`，`run_ranking` 读 `mean_sharpe_ratio` / `mean_cagr` / `mean_max_drawdown` / `deflated_sharpe_ratio` / `rolling_window_performance`，Stage 4 读 `rolling_window_performance[*].cagr`；**故意不写 `walkforward_rebalances.csv`**，这样 trade/asset 审计器返回 `None`、不触发取价，从而不会触网）。
+
+#### 19.10.11 本轮测试账重测与版本轴判定
+
+- **逐文件实测**（`pipeline/.venv/bin/python -m pytest <file> --collect-only -q | tail -3`，采集项数）：`common/tests/test_allocation_templates.py` **9**、`pipeline/tests/test_config_wiring.py` **12**、`common/tests/test_allocation_backtester_fidelity.py` **12**、`pipeline/tests/test_run_batch_backtest.py` **27**、`common/tests/test_market_impact_model.py` **9**、`common/tests/test_allocation_backtester_fast.py` **25**、`pipeline/tests/test_script_default_paths.py` **26**（18 → 26，+8）、`pipeline/tests/test_run_blend_cross_matrix_defaults.py` **9**、`pipeline/tests/test_walkforward_audit_script.py` **11**（新）⇒ `9 + 12 + 12 + 27 + 9 + 25 + 26 + 9 + 11 =` **140**；与 §19.9 表内八行小计 `129` + 新行 `11` **完全相等**（无差额）。**⚠ 这是 §19.10 当轮快照，已被 §20 超越**：`test_script_default_paths.py` 现为 **42**，并新增 §20 的两份护栏文件（7 / 13），故现行账为 **11 行 / 176 项**、`pipeline/tests` 采集 **330**，一律以 §19.9 为准。
+- **目录级核对**：`pipeline/tests` 采集 **275 → 294**（+19 = `test_script_default_paths.py` +8 与新增文件 11）；`common/tests` 采集 **730**（= **729 passed / 1 skipped**，与改动前一致）。
+- **版本轴判定：本节（含 19.10.7–19.10.11）全部不涉及 `version` / `BASE_VERSION`** —— 没有策略/模板逻辑或默认参数变化，`common/allocation_templates.py` 与 `pipeline/research/blend/blend_base.py` 本轮均未再改，故按 `AGENTS.md` 第 7 条无需递增，也无需 `--dump-strategies` 重导。
+
+---
+
+## 20. 实盘策略 dump 漂移事故与 blend 批跑覆盖机制重构（2026-10-24）
+
+本节记录的是一次**已实际发生、已复现、已修复、已验证**的实盘策略产物漂移事故。它与 `AGENTS.md` §8 警告的那一类缺陷同族（产物静默改写了实盘引擎的取值域），而且比 §8 那一次更隐蔽：**配置一直是对的，测试一直是绿的，坏掉的只有产物**。之所以单列一节并按节固定其结论，是因为下一次同样的破坏只需要一条命令——把「批跑覆盖」重新做成「就地盖戳」。任何想把 `pipeline/scripts/backtest_blend_strategies.sh` 的 Step 2 改回「对所有 `*blend*.json` 无条件写 `blend_weighting_mode`」的改动，都是在重造本事故。
+
+#### 20.1 事故现象与判定
+
+- **现象（时间戳级证据）**：2026-10-24 **16:11:41**，[`pipeline/research_strategy/results/strategy_dumps/`](file:///home/stone/Work/github/quant/pipeline/research_strategy/results/strategy_dumps) 下的 **58** 个 dump 被整体重写：**52** 个非 blend 文件按配置顺序落在 `.563–.593`，一个 **140 ms** 的空档之后，恰好 **6** 个 `*blend*.json` 落在 `.727–.728`。两段之间那道空档就是「另一次写入动作」的指纹——它不是同一次序列化循环的自然产物。
+- **后果**：`chan_four_state_blend_strategy.json` 的 `params.blend_weighting_mode` **与** `research_strategy_spec.entry_data.parameters` 镜像**同时**变成 `rolling_ic_ir`，而 [`pipeline/research_strategy/strategies_config.json`](file:///home/stone/Work/github/quant/pipeline/research_strategy/strategies_config.json)（**≈`:402`**）钉的是 `regime_ic_ir_hybrid`。
+- **这是实盘风险，不是文档瑕疵（判定的关键，勿把它降级读成"文档瑕疵"）**：[`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py) 的 `DEFAULT_STRATEGY_FILE`（**≈`:162-167`**）**就是**这个 dump 文件本身——该路径**不回读** `strategies_config.json`，没有任何一层会把配置里的钉住值重新盖回来。实测走真实解析链得到的结论是 `cfg.blend_weighting_mode = rolling_ic_ir`。行为后果是一条**短路**：[`pipeline/research/blend/blend_base.py`](file:///home/stone/Work/github/quant/pipeline/research/blend/blend_base.py) 在 **`:445`** 的 `if weighting_mode == "rolling_ic_ir":` 处直接返回，**根本走不到 `:465` 的 `regime_*` 分支**——于是 `bucket_renorm_max_delta` 的桶增量钳制（`:522-529`）与 thrust 迟滞**双双变成死代码**。这不是"回测口径不同"，是**运行中的实盘引擎换了一台**。[`scripts/check_live_portfolio_health.py`](file:///home/stone/Work/github/quant/scripts/check_live_portfolio_health.py)（**≈`:1144-1152`**，其 `strategy_info["weighting_mode"] = params.get("blend_weighting_mode", "rolling_ic_ir")`）打印的健康报告同样被污染；[`web/livetrading`](file:///home/stone/Work/github/quant/web/livetrading) 是通过 shell 出去调上述脚本取数的，故 Web 端一并受影响。
+- **票据版本号本身是对的，别把它当作"没事"的证据**：事故后票据里的 `strategy_version = 1.2.1` / `base_version = 1.6.0` 均正确——版本字段来自类属性路径，与 `blend_weighting_mode` 的取值路径**互不相干**。**"版本号对得上"不构成任何保护。**
+- **漂移面很窄，但很准（这是为什么它能活过肉眼复查）**：逐字节比对后，**52/58** 与"按当前配置重生成"完全相同；差异只集中在 **6** 个 blend。其中**语义漂移只有 `chan_four_state_blend.blend_weighting_mode` 这一个键**——另外 5 个 blend 被注入的模式**恰好等于**它们各自的钉住值（都是 `rolling_ic_ir`），所以从这 5 个文件上看不出任何异常。另有 **3 个注入别名键**（`weighting_mode` / `blend_enable_orthogonalization` / `enable_orthogonalization`）作为"多出来的东西"存在，但不改变语义。
+- **6 个 blend dump 的钉住值与注入值的对齐情况（本节唯一的表，勿扩列）**：
+
+| blend dump | 钉住值（`strategies_config.json`） | 事故注入值 / 判定 |
+| :--- | :--- | :--- |
+| `chan_four_state_blend_strategy.json` | `regime_ic_ir_hybrid` | `rolling_ic_ir` —— **唯一语义漂移，实盘受损点** |
+| `chan_risk_managed_blend_strategy.json` | `rolling_ic_ir` | `rolling_ic_ir` —— 数值未变，仅多出 3 个别名键 |
+| `chan_crisis_shield_blend_strategy.json` | `rolling_ic_ir` | `rolling_ic_ir` —— 同上 |
+| `chan_dual_hybrid_blend_strategy.json` | `rolling_ic_ir` | `rolling_ic_ir` —— 同上 |
+| `chan_four_state_shield_blend_strategy.json` | `rolling_ic_ir` | `rolling_ic_ir` —— 同上 |
+| `generic_blend_strategy.json` | `rolling_ic_ir` | `rolling_ic_ir` —— 同上 |
+
+#### 20.2 根因
+
+- **不是 `--dump-strategies` 本身（先排掉最容易背锅的那个）**：`run_research_strategy.py --dump-strategies` 把 `params` **原样写自** `entry_data["parameters"]`，按当前配置重生成即得到正确值，且**不产生任何别名键**（已实测）。它是"照抄配置"的那一环，不是"改写配置"的那一环。
+- **真正的根因是批跑包装器的 Step 2（旧版 ≈`pipeline/scripts/backtest_blend_strategies.sh:416-446`）**：它在 dump 之后用一段**内联 `uv run python -c`** 对**所有** `*blend*.json` **无条件**盖戳 `params['blend_weighting_mode'] = ${WEIGHTING_MODE:-rolling_ic_ir}`（`WEIGHTING_MODE` 默认即 `rolling_ic_ir`），同时写 3 个别名键，并把这套值**镜像**进 `research_strategy_spec.entry_data.parameters`。任何人跑一次 blend 批跑（哪怕只想回测），实盘 dump 就被就地改写一次。
+- **结构性错误（比"默认值选错"严重得多）**：Step 2 给 6 个 blend 盖**同一个**模式，而本仓库**要求** `chan_four_state_blend` 是例外。两者不可能同时满足 ⇒ **不存在任何一个 `WEIGHTING_MODE` 取值能让全部 6 个策略同时正确**。换句话说，该脚本不是"默认值配错了"，而是**在结构上无法表达既定例外**——所以修默认值、加 `if` 分支都不算修好，必须换机制。
+
+#### 20.3 为什么整个测试套件是绿的（必须写死的盲点）
+
+- **既有断言只看配置，不看产物**：[`pipeline/research_strategy/tests/test_blend_track_c.py`](file:///home/stone/Work/github/quant/pipeline/research_strategy/tests/test_blend_track_c.py) 的 `test_cfsb_deployed_regime_mode_and_inertia_ratio_config`（**≈`:444-494`**）断言的是 `strategies_config.json` 的取值以及 `StrategyConfig` / `PositionLifecycleConfig` 的类默认值——它**从不打开** `results/strategy_dumps/*.json`。于是「配置钉住了」「产物漂移了」「套件全绿」三件事可以**同时成立**且互不矛盾。这就是本次事故能发生的**制度原因**：护栏守的是地图，不是地形。
+- **结论句（请按这句引用，不要软化）**：**配置是被钉住的，产物不是；只断言配置的测试不构成对实盘行为的保护。**
+- **同一盲点的第二半**：`strategy_dumps/` 被 `pipeline/.gitignore` 的 `results/` 规则忽略，因此该目录的漂移在 `git status` 里**完全不可见**——它既不会被 diff 看见，也不会被 code review 看见。漂移只能靠**机械断言**抓，不能靠看。
+
+#### 20.4 事故处置（已执行并验证）
+
+- **恢复动作**：用 `pipeline/.venv/bin/python pipeline/research_strategy/run_research_strategy.py --dump-strategies`（**离线**执行，**未用 `uv`**、未联网）重新导出 58 个文件。结果：仅 6 个 blend 发生变化，其余 52 个用 `cmp` 逐字节比对**完全相同**——这同时反证了"漂移只发生在 blend 子集上"的判定。
+- **恢复后 cfsb 的实测状态**：`params.blend_weighting_mode` 与 `research_strategy_spec.entry_data.parameters` 镜像**均为** `regime_ic_ir_hybrid`；**别名键消失**；`cfsb_inertia_relative_ratio = 0.3`；`strategy_version = 1.2.1`、`base_version = 1.6.0`。另外 5 个 blend 仍各自等于其钉住值（`rolling_ic_ir`）。
+- **别名键可以安全消失（逐个消费方核实过，不是推断）**：`blend_base.py` 的取值优先级（**≈`:625`** 起，经 `resolve_param`）是 `cfsb_weighting_mode` → 其他策略前缀 → `blend_weighting_mode` → `weighting_mode`——**别名是最后一档兜底**，只在前面全缺时才会被读到；而 `run_live_strategy.py` 与 `check_live_portfolio_health.py` **只读** `blend_weighting_mode`。即：别名不仅多余，还是**一个会说谎的第二真相源**（它可以在 `blend_weighting_mode` 正确的情况下携带错误值）。删除它是修复的一部分，**不是清理**。
+- **实盘路径复验输出（照抄实测，勿改写）**：
+  - `dump params['blend_weighting_mode'] : 'regime_ic_ir_hybrid'`
+  - `template.resolve_param(p,'weighting_mode','rolling_ic_ir') -> 'regime_ic_ir_hybrid'`
+  - `rls.resolve_blend_param(...) -> 'regime_ic_ir_hybrid'`
+  - `health-checker: weighting_mode='regime_ic_ir_hybrid' orthogonalization=True`
+  - 四行分别覆盖 dump 落盘值、模板层解析、实盘脚本层解析、健康检查层读取——**四层一致**才算修好。
+
+#### 20.5 持久修复：批跑覆盖机制重构
+
+- **新模块** [`pipeline/scripts/blend_dump_overrides.py`](file:///home/stone/Work/github/quant/pipeline/scripts/blend_dump_overrides.py)（**491** 行）：`materialise_dump_overrides(source_dir, dest_dir, *, weighting_mode, enable_orthogonalization, extra_params, pinned_modes, pattern)` → `OverrideReport(written / overridden / unchanged / pinned_deviations / applied)`；`load_pinned_modes()` 从 `strategies_config.json` 逐个读策略的钉住值；`format_report()` 输出名单与警告。
+- **语义（四条，缺一不可）**：
+  1. **默认零注入**。未传 `--weighting-mode` / `--enable-orthogonalization` 时 `WEIGHTING_MODE` 为空（`WEIGHTING_MODE="${WEIGHTING_MODE:-}"`，并配 `WEIGHTING_MODE_EXPLICIT` 显式标志），批跑**就地**读各 dump 自己的配置——cfsb 因此**天然**保持 `regime_ic_ir_hybrid`，不需要任何特殊分支。**"不请求"与"请求默认值"被显式区分**：旧实现把两者混为一谈，这正是缺陷的语义内核。
+  2. **显式传参时不改实盘 dump**。覆盖结果写到 `<results>/_strategy_dumps_override/`，批跑的 `--strategies-glob` 指向**副本**，`strategy_dumps/` **字节不变**。副本落在 `${RESULTS}` 下，故被 `PROVENANCE.json` 记录路径与哈希，消融仍可复现；"跑完再恢复"这个概念**不存在**，也不需要 `trap`。
+  3. **只写前缀键、拒绝重新引入别名（就"落盘"而言）**。覆盖副本只落 `blend_weighting_mode` / `blend_enable_orthogonalization`（`WEIGHTING_MODE_KEY` / `ORTHOGONALIZATION_KEY`），**不再写入** `weighting_mode` / `enable_orthogonalization` 这两个曾经撒谎的短名。**据实披露一处不对称（勿误读为漏改）**：同一步里构造的 `--strategy-params` **运行时载荷**仍同时带上短名（`base['blend_weighting_mode'] = mode` 与 `base['weighting_mode'] = mode` 并列），这是为了兼容 `run_backtest.py` / `resolve_param` 的短名消费路径。它与本节要消灭的东西**性质不同**：那是**进程内的临时参数**，生命周期止于本次批跑，**从不落盘**、不会成为第二个真相源、也不会被实盘脚本读到。允许的区别判据是「会不会被持久化」，不是键名的形状。
+  4. **原子性 + 拒写实盘**。先在 staging 目录建完全部副本再 `os.rename` 换入；中途失败**不触碰**源目录与既有副本（`finally` 清 staging）。`dest == source` 或 `dest` 位于 `source` 之内一律拒绝（分别为 `dest_dir must differ from source_dir … this helper exists precisely so the LIVE strategy dumps are never written by a backtest run` 与 `dest_dir … is inside source_dir …`）；glob 匹配为空也拒绝（否则批跑会拿着空 glob 去跑）。
+- **钉住例外被显式覆盖时必须高声告警（照抄关键句，勿改措辞）**：
+  - 首尾各一行 `!!! WARNING: PINNED WEIGHTING-MODE EXCEPTION OVERRIDDEN !!!`；
+  - 正文：`chan_four_state_blend is PINNED to blend_weighting_mode='regime_ic_ir_hybrid' … but this run explicitly requested 'rolling_ic_ir'. The request is KEPT -- an ablation may legitimately explore another mode -- but the deviation is REAL: with anything other than 'regime_ic_ir_hybrid', blend_base.py:445 takes the rolling_ic_ir branch and RETURNS before the regime_* branch at :465 …, so the bucket_renorm_max_delta clamp (:522-529) and the thrust hysteresis are INERT. Scope of this override: ONLY the run-local copy … (plus this run's --strategy-params). The live dump, and therefore scripts/run_live_strategy.py's DEFAULT_STRATEGY_FILE, is NOT modified.`
+  - **设计取舍**：告警而**不中止**。研究消融本来就有权探索别的模式，禁止它会让人绕过机制；但**不允许静默**。
+  - **已知脆弱点（如实披露）**：这段告警把 `blend_base.py:445` / `:465` / `:522-529` 三个**行号硬编码在字符串里**，行号漂移后告警文案会指向错处。这是刻意用"文案必须点出确切死代码位置"换取可读性。**没有任何测试守卫这三个数字**（§20.6 的 ⑦ 号护栏守的是"盖戳会被检测到"，不是"行号仍正确"）——若日后 `blend_base.py` 结构大改，须人工同步这段字符串；这是本节留下的、已知且已声明的小额技术债，不要当成已解决。
+- **实证（用投毒 `uv` 垫片记录 argv、不真跑）**：一次完整的 `--weighting-mode rolling_ic_ir` + `--no-orthogonalization` 运行后，6 个 blend dump 的 sha256 与运行前**完全相同**（`27f374c5…a8e7`）。记录的批跑 argv：默认运行 `--strategies-glob …/strategy_dumps/*blend*.json` 且**无** `--strategy-params`；覆盖运行时 `--strategies-glob …/_strategy_dumps_override/*blend*.json` + `--strategy-params {...}`。
+- **可复现性代价（明写，免得下一个人以为是坏掉）**：复现旧的 `rolling_ic_ir` 全量盖戳，现在**必须显式**传 `--weighting-mode rolling_ic_ir`。以前"跑一次批跑就顺手改坏实盘"是免费副作用，现在需要一条明确的命令行。
+- **披露：`run_blend_cross_matrix.py` 的连带影响**。[`pipeline/scripts/run_blend_cross_matrix.py`](file:///home/stone/Work/github/quant/pipeline/scripts/run_blend_cross_matrix.py)（**≈`:415-424`**）**总是**显式传 `--weighting-mode` / `--enable-orthogonalization`，因此每个 matrix round 现在会多生成一份覆盖副本，且当请求模式 ≠ cfsb 钉住值时**会打印上述警告**。这是**正确行为**（研究实验本来就在探索别的模式，就该被告知自己在覆盖例外），但会让输出更吵、磁盘占用增加。其 `--weighting-mode` 的默认值是否应该改成"不传"（即默认继承各策略配置），**值得其所有者另立任务复核**——本节不擅自改动，因为那会改变既有 matrix 实验的可比性。
+
+#### 20.6 新增护栏（防止再犯）
+
+- **`pipeline/tests/test_strategy_dumps_invariants.py`（7 用例，实测 0.86 s）**：全部在 `tmp_path` 里重生成 dump，**不读**被 gitignore 的真实 dump 目录（否则测试会随本机状态时红时绿）。七个用例：
+  1. `test_every_config_entry_is_dumped` —— 配置条目与 dump **1:1**，不多不少；
+  2. `test_params_are_exactly_the_config_parameters` —— **`dump["params"] == config["parameters"]` 完全相等**（不缺 / 不多 / 不改），且 `research_strategy_spec.entry_data.parameters` 镜像与之逐键一致。这是本文件的主不变式；失败信息点名策略与具体键（`missing=` / `injected=` / `changed=`）；
+  3. `test_blend_dumps_carry_no_unprefixed_alias_keys` —— blend dump 不得含未在其配置中声明的**别名键**；
+  4. `test_blend_weighting_mode_matches_config_pin` —— 6 个 blend 的 `blend_weighting_mode` 必须等于各自钉住值；
+  5. `test_cfsb_dump_pins_deployed_regime_mode` —— cfsb 必须**字面**等于 `regime_ic_ir_hybrid`（**即使配置与脚本一起漂移也能抓到**，因为常量写死在测试里），且 `cfsb_inertia_relative_ratio ≈ 0.30`；
+  6. `test_cfsb_dump_versions_match_class_attributes` —— dump 的 `strategy_version` / `base_version` / `version_info` / `entry_data.*` 等于类属性；
+  7. `test_drift_checker_catches_the_shell_step2_stamp` —— **把旧 Step 2 的盖戳逻辑原样重放**，检测器必须报警。这一条是"检测器自身也是被检测对象"的元测试：没有它，前六条可能因为检测器写错而永远为绿。
+  - **有效性反证（已实测）**：把这套断言指向**恢复前**的真实漂移副本，会报 **19 处失败**。它抓得住真实事故，不是"刚好对得上"。
+- **`pipeline/tests/test_blend_dump_overrides.py`（13 用例，实测 0.16 s）**：`test_no_override_copies_are_byte_identical`（零覆盖时源目标逐字节相同）、`test_override_stamps_both_containers_and_never_writes_source`（覆盖只写目标、源不变，且两个容器都写）、`test_pinned_deviation_is_reported_and_still_applied`（钉住偏差被上报但仍应用）、`test_pinned_equal_request_is_not_flagged`（请求值等于钉住值时不误报）、`test_ortho_only_override_keeps_the_configured_weighting_mode`（仅正交化覆盖不动模式——旧实现做不到）、`test_failed_write_leaves_no_partial_destination`（写失败不留半成品）、`test_dest_equal_to_or_inside_source_is_refused`、`test_empty_source_dir_is_refused`、`test_load_pinned_modes_reads_the_repo_config`、`test_wrapper_has_no_inline_dump_stamp`（**静态断言 wrapper 不再有内联盖戳**）、`test_default_run_never_stamps_the_dumps_and_reads_them_in_place`、`test_override_run_never_stamps_the_dumps_and_points_the_batch_at_the_copy`（两种运行的 argv 落点）、`test_repo_live_dumps_are_untouched_across_an_override_run`（**完整覆盖运行前后实盘 dump 哈希不变**）。
+- **两条护栏的分工（别把其中一条当全部）**：`test_strategy_dumps_invariants.py` 守**产物正确性**（dump 与配置一致、例外值正确、版本一致），`test_blend_dump_overrides.py` 守**改写行为学**（谁能写、写哪儿、失败怎么办、有没有重新引入别名）。前者是体检，后者是行为约束。
+
+#### 20.7 `--results` / `--help` 的两个静默缺陷（同一批 wrapper 加固，顺带修）
+
+- **`--results` 的双重嵌套**：原先 `--results` 被相对 `pipeline/`（脚本 `cd` 之后）解析，导致文档里可复制的 `--results pipeline/results/blend_16` 静默落到 `pipeline/pipeline/results/blend_16`——**目录建出来了、跑完了、日志干净**，唯一的异常是一个没人会去看的多余嵌套目录。现在与 `--universe` 走**同一解析序**（绝对路径 → 调用者 cwd → 仓库根 → `pipeline/`；**默认路径绕开解析**，仍是 `<repo>/pipeline/results`），并且**始终在 `Results Dir:` 横幅打印绝对路径**——把"落对了没有"从推断变成肉眼可验。
+- **`--help` 只在 `argv[1]` 生效**：`--help` / `-h` 原先仅当它是第一个参数时才被识别，出现在后面会被当成 RESULTS 位置参数——**一次全量串跑会把结果写进一个名为 `--help` 的目录**。现在两个 wrapper 都在参数映射**之前全表预扫描**，任意位置生效并 `exit 0`。护栏：`test_help_flag_is_honoured_in_any_argument_position`。
+- **顺带记录两条容易误判的事实**：①wrapper **从不创建**结果目录——真正的创建发生在 `run_batch_backtest.py` / `run_backtest.py`，故 dry-run 只报目标、不落文件（这点已有 `test_explicit_results_dir_is_reported_but_never_created` 钉住）；②`<repo>/results/` 是一个空的**未跟踪残骸目录**，无任何代码写入，可忽略，**不要提交**。
+- **本节 `test_script_default_paths.py` 由 26 项增至 42 项**（+16，即上述 `--results` 解析、`Results Dir:` 绝对路径、结果目录不创建、`--help` 任意位置四组用例在等长调用点上的参数化展开）。§19.9 的表已同步到 42。
+
+#### 20.8 版本轴
+
+- **以上全部不涉及 `version` / `BASE_VERSION`**。理由（按 `AGENTS.md` 第 7 条，不升版必须写明实体理由，不能只写"没升"）：本节的改动全部落在**交付链**上——`strategies_config.json`（未改）、`pipeline/scripts/*.sh`（wrapper）、新增 `pipeline/scripts/blend_dump_overrides.py`、新增两份测试。**没有一行改动触及任何策略类的信号计算、参数默认值或子策略组成**；`blend_base.py` 与 `common/allocation_templates.py` 本节零改动。`base_version` 仍为 **1.6.0**，cfsb 的 `version` 仍为 **1.2.1**。
+- **因而不触发的四项联动义务**：①不递增任何 `version` / `BASE_VERSION`；②不改 `test_blend_strategy_versioning.py` / `test_strategy_versioning.py` 的断言；③`--dump-strategies` 的重跑**目的不是升版**，而是**把被外部脚本改坏的产物恢复成配置事实**（§20.4），恢复前后 58 个文件的 `strategy_version` / `base_version` 全部不变；④实盘票据的 `strategy_version` / `base_version` 不变。
+- **一句话总结本节的性质**：这不是一次策略变更，是一次**产物被外部脚本越权改写**的事故；修的也不是策略，是**谁有权写产物**。

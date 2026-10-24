@@ -21,17 +21,91 @@ from datetime import datetime
 from pathlib import Path
 
 
+# Resolved location of the `pipeline/` project this script ships inside. Used only to
+# recognise `<repo>/pipeline/results`, the throwaway/experimental directory SKILL.md forbids
+# auditing, so an auto-discovered fallback can be refused instead of silently audited.
+# `parents[4]` is `pipeline/`: scripts -> walkforward-audit -> skills -> .agents -> pipeline.
+_PIPELINE_PROJECT_DIR = Path(__file__).resolve().parents[4]
+
+_UNIVERSE_FALLBACK_HINT = (
+    "The observed-symbol fallback is used ONLY when --universe-file is omitted entirely; "
+    "a supplied path is never silently ignored."
+)
+_RESULTS_DIR_HINT = (
+    "--results-dir must name an existing directory holding walkforward_summary.json files."
+)
+_PIPELINE_RESULTS_REFUSAL_HINT = (
+    "<repo>/pipeline/results holds throwaway/experimental runs, not auditable walkforward output. "
+    "Pass --results-dir explicitly (or run from the repo root) to select the intended directory."
+)
+
+
+class AuditInputError(FileNotFoundError):
+    """An explicitly supplied CLI input could not be resolved.
+
+    Subclasses FileNotFoundError so any pre-existing caller catching the old
+    FileNotFoundError contract keeps working. Raised instead of falling back, because
+    both fallbacks this replaces (universal observed-symbol set / `./results`) produced
+    output that looked completely normal while being computed from the wrong input.
+    """
+
+    def __init__(self, message: str, hint: str = ""):
+        super().__init__(message)
+        self.hint = hint
+
+
+def _require_existing_input(explicit_path, label: str, hint: str, kind: str = "file"):
+    """Resolve an explicitly supplied CLI path, or hard-fail -- never silently substitute.
+
+    Shared by `--universe-file` and `--results-dir` so the "given but missing" rule and its
+    error wording live in exactly one place. `None` (flag omitted) returns `None`; the
+    caller then owns whatever deliberate fallback it documents.
+    """
+    if explicit_path is None:
+        return None
+    p = Path(explicit_path)
+    ok = p.is_dir() if kind == "dir" else p.is_file()
+    if not ok:
+        raise AuditInputError(f"{label} not found at '{explicit_path}'", hint)
+    return p
+
+
+def _is_pipeline_throwaway_results(path: Path) -> bool:
+    """True when `path` is `<repo>/pipeline/results` (the directory to never auto-audit)."""
+    try:
+        return Path(path).resolve() == (_PIPELINE_PROJECT_DIR / "results").resolve()
+    except OSError:
+        return False
+
+
 def find_results_dir(explicit_path=None) -> Path:
-    if explicit_path:
-        p = Path(explicit_path)
-        if p.is_dir():
-            return p
-        raise FileNotFoundError(f"Specified results directory not found: {explicit_path}")
+    explicit = _require_existing_input(
+        explicit_path, "results directory", _RESULTS_DIR_HINT, kind="dir"
+    )
+    if explicit is not None:
+        resolved = explicit.resolve()
+        if _is_pipeline_throwaway_results(resolved):
+            # Explicit operator intent wins, but say so out loud: this is the one directory
+            # SKILL.md tells agents not to use, so an explicit pass is worth flagging.
+            print(
+                f"Warning: --results-dir explicitly selects {resolved}, which holds "
+                "throwaway/experimental runs; continuing because it was requested.",
+                file=sys.stderr,
+            )
+        return resolved
 
     # Only check ./results in the current working directory if no explicit path given
     cwd_results = Path.cwd() / "results"
     if cwd_results.is_dir():
-        return cwd_results
+        resolved = cwd_results.resolve()
+        if _is_pipeline_throwaway_results(resolved):
+            # Previously this silently audited pipeline/results when the CLI was invoked
+            # from pipeline/ -- a clean-looking report over throwaway runs.
+            raise AuditInputError(
+                f"refusing to auto-audit '{resolved}'",
+                _PIPELINE_RESULTS_REFUSAL_HINT,
+            )
+        return resolved
 
     raise FileNotFoundError("No results directory specified. Pass --results-dir explicitly.")
 
@@ -767,7 +841,10 @@ def deep_analyze_top_strategies(
 
     # Determine base universe
     base_universe = []
-    if universe_file and os.path.isfile(universe_file):
+    if universe_file:
+        # main() validates this before any analysis runs; re-checking here keeps a direct
+        # caller from resurrecting the old silent fallback to observed symbols.
+        _require_existing_input(universe_file, "universe file", _UNIVERSE_FALLBACK_HINT)
         with open(universe_file) as f:
             for line in f:
                 line = line.strip()
@@ -777,6 +854,14 @@ def deep_analyze_top_strategies(
                             base_universe.append(sym)
     else:
         base_universe = sorted(all_observed_symbols)
+        # Deliberate convenience fallback: with no --universe-file we can only prune against
+        # what these backtests touched. Say so, so it can never be mistaken for a filtered
+        # (or complete) universe -- the pruned list is indicative, not authoritative.
+        print(
+            f"Warning: no --universe-file supplied; pruning against the {len(base_universe)} "
+            "observed-symbol fallback set (NOT a filtered or complete universe).",
+            file=sys.stderr,
+        )
 
     losing_syms = set(l["symbol"] for l in recommended_losers)
     pruned_universe = [s for s in base_universe if s not in losing_syms]
@@ -1095,12 +1180,38 @@ def main():
     parser.add_argument("--strategy", type=str, default=None, help="Analyze single strategy by name")
 
     args = parser.parse_args()
-    results_dir = find_results_dir(args.results_dir)
-    print(f"Using results directory: {results_dir}\n")
+
+    # Validate explicitly supplied inputs BEFORE any analysis: a typo'd / wrong-cwd
+    # --universe-file used to silently prune against the observed-symbol set instead.
+    try:
+        universe_path = _require_existing_input(
+            args.universe_file, "universe file", _UNIVERSE_FALLBACK_HINT
+        )
+        results_dir = find_results_dir(args.results_dir)
+    except AuditInputError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        if exc.hint:
+            print(f"       {exc.hint}", file=sys.stderr)
+        sys.exit(1)
+    except FileNotFoundError as exc:  # pre-existing message, wording unchanged
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Using results directory: {results_dir}")
+    if args.results_dir:
+        print("  (selected because --results-dir was passed explicitly)\n")
+    else:
+        print(f"  (selected because ./results was auto-discovered under cwd={Path.cwd()})\n")
 
     summaries = load_all_summaries(results_dir, strategy_name=args.strategy)
     if not summaries:
         print("No walkforward_summary.json files found.", file=sys.stderr)
+        if args.results_dir:
+            print(
+                f"       --results-dir '{args.results_dir}' was given explicitly but no "
+                f"walkforward_summary.json exists in '{results_dir}' or its subdirectories.",
+                file=sys.stderr,
+            )
         sys.exit(1)
 
     has_specific_action = (
@@ -1130,7 +1241,7 @@ def main():
             ranked,
             results_dir,
             top_n=args.deep_top_n,
-            universe_file=args.universe_file,
+            universe_file=str(universe_path) if universe_path else None,
             export_pruned_path=args.export_pruned_universe,
         )
         audit_abnormal_and_overfit(
@@ -1165,7 +1276,7 @@ def main():
                 ranked,
                 results_dir,
                 top_n=args.deep_top_n,
-                universe_file=args.universe_file,
+                universe_file=str(universe_path) if universe_path else None,
                 export_pruned_path=args.export_pruned_universe,
             )
 

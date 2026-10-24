@@ -18,6 +18,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
 from typing import Any, Dict, List, Optional
@@ -137,12 +138,82 @@ ROUNDS_CONFIG = [
 ]
 
 
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# (P1.6, corrected 2026-10-24) The pre-P1.6 default was a developer-machine
+# absolute path (`.../simulate/202609/core_satellite_20_stocks.txt`, outside the
+# repo; docs/version.md §16.15.8 records it as unrecoverable from git). P1.6
+# redirected it to `docs/universe/china/core_satellite_20_stocks.txt` -- a path that
+# was only ever a PROPOSAL in §16.15.8 and was never committed, so a bare invocation
+# died with FileNotFoundError. The in-repo pool the China blend reports in
+# `docs/reports/china/chan_*_blend/` were actually produced with (and which
+# docs/chan_volume_profile_and_multi_theory_quant_synthesis_plan.md,
+# docs/development_plan.md and docs/version.md all cite as
+# `--universe docs/universe/china/core_satellite_22_stocks.txt`) is this one: 22
+# symbols, `#`-comments, `<6 digits>.<SH|SZ>` rows -- exactly the format
+# `backtest_blend_strategies.sh --universe` -> `--universe-file` ->
+# `common.universe.FileUniverseProvider` reads.
+_DEFAULT_UNIVERSE = os.path.join(_REPO_ROOT, "docs", "universe", "china", "core_satellite_22_stocks.txt")
+
+# `FileUniverseProvider` also accepts bare tickers, but every pool file under
+# docs/universe/china is `<6 digits>.<SH|SZ|BJ>`. A default that does not parse to that
+# shape points at the wrong kind of file, not at a universe -- fail loudly instead of
+# handing 22 garbage "symbols" to 6 matrix cells x 2 rounds of backtests.
+_UNIVERSE_SYMBOL_RE = re.compile(r"^\d{6}\.(SH|SZ|BJ)$")
+_MIN_UNIVERSE_SYMBOLS = 2
+
+
+def load_universe_symbols(path: str) -> List[str]:
+    """Parse `path` as a universe file, naming every failure mode explicitly.
+
+    `--universe` is forwarded to `scripts/backtest_blend_strategies.sh` ->
+    `--universe-file` -> `FileUniverseProvider`, i.e. it is consumed deep inside a
+    batch worker pool; a bad path therefore surfaced as an opaque subprocess failure
+    (or, worse, a silent short universe). This guard runs in the orchestrator before
+    any subprocess so the operator sees which file failed and why.
+
+    Format mirrors `FileUniverseProvider`: blank lines and `#` comments are skipped,
+    commas count as separators, symbols are upper-cased.
+    """
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"Universe file not found: {path!r}. Pass --universe <path-to-symbols-file>; "
+            f"the in-repo default is {_DEFAULT_UNIVERSE!r}."
+        )
+
+    symbols: List[str] = []
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            symbols.extend(tok.strip().upper() for tok in line.replace(",", " ").split() if tok.strip())
+
+    if len(symbols) < _MIN_UNIVERSE_SYMBOLS:
+        raise ValueError(
+            f"Universe file {path!r} yielded {len(symbols)} symbol(s); at least "
+            f"{_MIN_UNIVERSE_SYMBOLS} are required. Is this a universe file "
+            f"(one symbol per line, '#' for comments)?"
+        )
+
+    malformed = [sym for sym in symbols if not _UNIVERSE_SYMBOL_RE.match(sym)]
+    if malformed:
+        preview = malformed[:5]
+        suffix = "..." if len(malformed) > len(preview) else ""
+        raise ValueError(
+            f"Universe file {path!r} holds {len(malformed)} symbol(s) that are not in the "
+            f"'<6 digits>.<SH|SZ|BJ>' form, e.g. {preview}{suffix}. This orchestrator runs "
+            f"the China A-share blend batch, which resolves .SH/.SZ tickers."
+        )
+    return symbols
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Cross-Ablation Matrix Orchestrator for Blend Strategies")
     parser.add_argument(
         "--universe",
         type=str,
-        default="/home/stone/Work/stock/simulate/202609/core_satellite_20_stocks.txt",
+        default=_DEFAULT_UNIVERSE,
         help="Path to universe symbols file",
     )
     parser.add_argument(
@@ -294,6 +365,13 @@ def main():
         print(f"Error: Backtest script not found at {backtest_script}", file=sys.stderr)
         sys.exit(1)
 
+    # Fail here, not inside a worker pool, if the universe is missing or malformed.
+    try:
+        universe_symbols = load_universe_symbols(args.universe)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     # Parse requested matrix runs
     try:
         requested_ids = [int(x.strip()) for x in args.matrix_runs.split(",") if x.strip()]
@@ -314,7 +392,7 @@ def main():
 
     print("=" * 80)
     print("Blend Strategies Cross-Ablation Matrix Orchestrator")
-    print(f"Universe:                 {args.universe}")
+    print(f"Universe:                 {args.universe} ({len(universe_symbols)} symbols)")
     print(f"Weighting Mode:           {args.weighting_mode}")
     print(f"Enable Orthogonalization: {args.enable_orthogonalization}")
     print(f"Start Run ID:             {args.start_run_id}")
