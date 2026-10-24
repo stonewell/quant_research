@@ -12,6 +12,7 @@ Covers:
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import pytest
@@ -221,15 +222,30 @@ def test_live_ticket_detail_reason_and_version_structure():
         out_account_state = os.path.join(tmp_dir, "account_state.json")
         universe_file = os.path.join(_PROJECT_ROOT, "docs", "universe", "china", "core_satellite_22_stocks.txt")
 
-        # Run live strategy check via python runner
-        cmd = (
-            f"pipeline/.venv/bin/python scripts/run_live_strategy.py "
-            f"--strategy equal_weight --data-provider synthetic "
-            f"--universe-file {universe_file} "
-            f"--output-dir {tmp_dir} --account-state-file {out_account_state} "
-            f"--lookback-days 300"
+        # Run live strategy check via python runner.
+        # Both paths MUST be absolute: the child process resolves relative paths
+        # against its own CWD (inherited from pytest), so "pipeline/.venv/bin/python"
+        # only worked when pytest was launched from the repo root.
+        _venv_bin = os.path.join(
+            _PROJECT_ROOT, "pipeline", ".venv", "Scripts" if os.name == "nt" else "bin"
         )
-        ret = os.system(cmd)
+        python_exe = os.path.abspath(sys.executable) if sys.executable else os.path.join(
+            _venv_bin, "python.exe" if os.name == "nt" else "python"
+        )
+        runner_script = os.path.join(_PROJECT_ROOT, "scripts", "run_live_strategy.py")
+        cmd = [
+            python_exe,
+            runner_script,
+            "--strategy", "equal_weight",
+            "--data-provider", "synthetic",
+            "--universe-file", universe_file,
+            "--output-dir", tmp_dir,
+            "--account-state-file", out_account_state,
+            "--lookback-days", "300",
+        ]
+        # cwd=_PROJECT_ROOT pins the child's working directory instead of silently
+        # inheriting pytest's, keeping the result independent of where we run from.
+        ret = subprocess.run(cmd, cwd=_PROJECT_ROOT).returncode
         assert ret == 0, f"run_live_strategy.py command failed with code {ret}"
 
         assert os.path.exists(out_ticket_json), "live_trading_ticket.json was not created"
