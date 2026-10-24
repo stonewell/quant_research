@@ -89,7 +89,7 @@ instrument_selection/
 
 ```bash
 # 从 pipeline/ 目录运行
-# 默认标的池运行
+# 默认标的池运行（数据源默认 `synthetic`，离线安全；改用 `--data-provider yfinance` 取真实行情）
 uv run python instrument_selection/run_screener.py
 
 # 指定标的池与基准

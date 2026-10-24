@@ -19,10 +19,68 @@ if _REPO_ROOT not in sys.path:
 
 import pandas as pd
 from common.data import CachedDataProvider, get_data_provider
-from common.duckdb_cache import DuckDBCache
+# why: `_HISTORY_REWRITE_RTOL` is imported rather than re-typed so the dry-run preview below
+# cannot drift from the authoritative write gate in `store_bars`. It is private to the
+# cache module by naming convention only -- this script is the *documented* escape hatch for
+# that gate (L2.33), so it must speak the gate's exact tolerance.
+from common.duckdb_cache import DuckDBCache, _HISTORY_REWRITE_RTOL
 from common.market_clock import MARKET_US, infer_market_from_symbols, market_now
 
 _DEFAULT_DB = os.path.join(_REPO_ROOT, "data", "cache.duckdb")
+
+# The five value columns `store_bars`' history-rewrite gate compares (see `diff_columns` in
+# `common/duckdb_cache.py::store_bars`, L2.32). Kept as the same list, in the same order, so a
+# preview diff and the real gate answer the same question.
+_GATE_DIFF_COLUMNS = ("Open", "High", "Low", "Close", "Volume")
+
+
+def history_rewrite_diff_mask(
+    stored: pd.DataFrame,
+    incoming: pd.DataFrame,
+    columns: tuple[str, ...] = _GATE_DIFF_COLUMNS,
+) -> pd.Series:
+    """Which aligned bars the cache's history-rewrite gate would call materially different.
+
+    Read-only replica of the SQL predicate in `common/duckdb_cache.py::store_bars`
+    (`_HISTORY_REWRITE_RTOL`, rtol 1e-9 with a 0.0 absolute floor) applied to the five
+    value columns instead of `Close` alone. The earlier preview compared `Close` only, so a
+    volume-only or OHLC-only basis shift printed "no differences" while `store_bars` would
+    then refuse (or flag) the very same write -- a preview that disagrees with the gate is
+    worse than none.
+
+    Semantics mirrored one-to-one from the SQL CASE:
+      * both NULL/NaN          -> equal (the gate's `WHEN o.c IS NULL AND t.c IS NULL THEN FALSE`)
+      * exactly one NULL/NaN   -> different ("a vanished/added value is material")
+      * otherwise              -> different iff NOT(|stored - incoming| <= rtol * GREATEST(|stored|, |incoming|))
+        i.e. the tolerance denominator is the *larger* magnitude, not just the stored one.
+      * NaN vs NaN: treated as both-NULL (equal), matching DuckDB's total order where
+        `NaN <= NaN` is TRUE, so the gate would also not report a difference.
+
+    `stored` and `incoming` must already be aligned on the same index (the caller does
+    `.loc[overlap]` on both, mirroring the gate's join on `(provider, symbol, date)`).
+
+    `# why:` this lives here (duplicated predicate) instead of in `common/duckdb_cache.py`:
+    the gate is a SQL string interpolated into one hot-path query, and this script does not
+    own that module. If the gate's columns or tolerance ever change, change them HERE too.
+    """
+    mask = pd.Series(False, index=stored.index)
+    for col in columns:
+        if col not in stored.columns or col not in incoming.columns:
+            # why: all five columns are NOT NULL in `ohlcv_bars`, so the gate has no
+            # "column absent" branch to mirror. Skipping keeps this a faithful replica
+            # instead of inventing a difference for a shape the cache cannot hold.
+            continue
+        a = stored[col]
+        b = incoming[col]
+        both_null = a.isna() & b.isna()
+        one_null = a.isna() ^ b.isna()
+        # GREATEST(abs(o), abs(t)) -- NaN for NULL rows, harmlessly: the comparison below
+        # then yields False and the XOR term decides.
+        scale = pd.concat([a.abs(), b.abs()], axis=1).max(axis=1)
+        too_far = (a - b).abs() > (_HISTORY_REWRITE_RTOL * scale)
+        col_diff = (too_far.fillna(False) | one_null) & ~both_null
+        mask = mask | col_diff
+    return mask
 
 
 def default_end_date(symbol: str) -> str:
@@ -148,16 +206,34 @@ def main(args: Optional[list[str]] = None) -> int:
         overlap = cached_df.index.intersection(fresh_df.index)
         print(f"Fresh bars fetched: {len(fresh_df)} row(s). Overlapping with cache: {len(overlap)} row(s).")
         if len(overlap) > 0:
-            diff_mask = (cached_df.loc[overlap, "Close"] - fresh_df.loc[overlap, "Close"]).abs() > 1e-9 * cached_df.loc[overlap, "Close"].abs()
+            stored = cached_df.loc[overlap]
+            incoming = fresh_df.loc[overlap]
+            # 5-column predicate, identical to the gate `store_bars` will apply on write --
+            # previewing on `Close` alone made volume-only/OHLC-only drift look clean.
+            diff_mask = history_rewrite_diff_mask(stored, incoming)
             n_diff = int(diff_mask.sum())
+            difference_columns = []
+            for col in _GATE_DIFF_COLUMNS:
+                if col not in stored.columns or col not in incoming.columns:
+                    continue
+                count = int(history_rewrite_diff_mask(stored, incoming, columns=(col,)).sum())
+                if count:
+                    difference_columns.append(f"{col}={count}")
             if n_diff > 0:
-                worst_ratio = (fresh_df.loc[overlap, "Close"] / cached_df.loc[overlap, "Close"]).replace([float("inf"), float("-inf")], float("nan"))
-                min_ratio = float(worst_ratio.min())
-                max_ratio = float(worst_ratio.max())
-                print(f"Price differences detected in {n_diff}/{len(overlap)} overlapping bar(s).")
-                print(f"Adjustment ratio range: min {min_ratio:.4f}, max {max_ratio:.4f}.")
+                print(
+                    f"Material differences detected in {n_diff}/{len(overlap)} overlapping bar(s)"
+                    f" ({', '.join(difference_columns)}; rtol={_HISTORY_REWRITE_RTOL:g})."
+                )
+                if any(s.split("=")[0] == "Close" for s in difference_columns):
+                    worst_ratio = (incoming["Close"] / stored["Close"]).replace([float("inf"), float("-inf")], float("nan"))
+                    print(f"Close adjustment ratio range: min {float(worst_ratio.min()):.4f}, max {float(worst_ratio.max()):.4f}.")
+                else:
+                    print("Close agrees within tolerance; drift is confined to Open/High/Low/Volume.")
             else:
-                print("No price differences detected between cached bars and upstream bars.")
+                print(
+                    "No differences detected between cached and upstream bars "
+                    f"(open/high/low/close/volume, rtol={_HISTORY_REWRITE_RTOL:g})."
+                )
         print("[DRY RUN] Would call rebase_corporate_action with allow_history_rewrite=True. No changes written.")
         return 0
 

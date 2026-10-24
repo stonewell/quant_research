@@ -35,6 +35,13 @@ def test_data_dir_is_shared_workspace_wide_cache():
 
 
 
+def test_data_provider_defaults_to_synthetic():
+    """AGENTS.md: a bare CLI invocation must be offline-safe, so the
+    `--data-provider` default is `synthetic`, not `yfinance`."""
+    args = build_arg_parser().parse_args([])
+    assert args.data_provider == "synthetic"
+
+
 def test_select_max_k_defaults_to_none():
     args = build_arg_parser().parse_args(["--select-method", "max_diversification"])
     assert args.select_max_k is None

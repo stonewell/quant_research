@@ -694,15 +694,17 @@ QQQ, IWM, DIA, EFA, EEM, GLD, SLV, USO, TLT, IEF, XLE, XLF, XLK, XLV, XLU) if no
 | `--select-method` | `top_k` \| `cluster` \| `greedy` \| `threshold` \| `max_diversification`, default `"threshold"` | `top_k` (naive baseline, needs `--select-k`), `cluster` (ACC-style representative-per-cluster), `greedy` (Max-Sum Diversification, **requires** `--select-k`), `threshold` (gated by `--max-cluster-correlation`, sizes itself), `max_diversification` (optimizer-based) |
 | `--select-k` | int, default: none | Basket size for `top_k`/`greedy` (required for `greedy`) |
 | `--select-max-k` | int, default: none | Optional cap on basket size for `threshold`/`max_diversification` (which otherwise size themselves from the data) |
-| `--data-provider` | str, default `"yfinance"` | `yfinance`, `csv`, `synthetic`, or a custom registered/module-specifier provider |
+| `--data-provider` | str, default `"synthetic"` | `synthetic` (offline default), `yfinance`, `csv`, or a custom registered/module-specifier provider |
 | `--data-dir` | path, default: none | Folder path for the `csv` data provider |
 | `--no-cache` | flag, default off (cached) | Disable local DuckDB caching of fetched data |
 | `--no-plots` | flag, default off (plots written) | Skip writing the 3 chart files to `results/` |
 
-### Sample commands (real market data)
+### Sample commands
 
 ```bash
 # Default broad-ETF universe, default date range (run from inside pipeline/)
+# NOTE: the --data-provider default is `synthetic` (offline-safe); pass
+# `--data-provider yfinance` for real market data.
 uv run python instrument_selection/run_screener.py
 
 # Explicit universe + benchmark + custom date range

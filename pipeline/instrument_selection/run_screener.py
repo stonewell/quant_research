@@ -89,7 +89,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="skip single-asset empirical backtest simulation fit pass (use factor profile fit only).")
     p.add_argument("--strategy-weight", type=float, default=0.40,
                    help="weight of strategy_fit_score in overall_selection_score when a strategy is specified (default 0.40).")
-    add_data_provider_cli_args(p)   # default_provider="yfinance" matches current default
+    add_data_provider_cli_args(p, default_provider="synthetic")   # offline-safe bare invocation (AGENTS.md)
     p.add_argument("--no-plots", action="store_true")
     return p
 
