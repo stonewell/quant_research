@@ -1085,3 +1085,208 @@ def test_backtest_and_research_paths_never_pass_an_expected_last_session(temp_cs
 
     assert observed, "the coverage gate was never reached -- the guard would be vacuous"
     assert set(observed) == {None}, f"a research path passed a session expectation: {observed}"
+
+
+def test_auto_adjust_routine_fetch_universe_still_fails_loud_on_unannounced_rewrite(tmp_path):
+    """L2.33: Routine fetch_universe strictly enforces allow_history_rewrite=False.
+
+    If an upstream provider (e.g. an auto-adjusting data source) changes historical prices
+    without an explicit administrative corporate-action rebase, fetch_universe must fail loud
+    (raising RuntimeError chaining HistoryRewriteRefused) instead of silently overwriting or
+    dropping the symbol.
+    """
+    scale = {"val": 1.0}
+
+    class AutoAdjustingProvider(BaseDataProvider):
+        def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+            dates = pd.bdate_range(start, end)
+            n = len(dates)
+            s = scale["val"]
+            return pd.DataFrame(
+                {
+                    "Open": [100.0 * s] * n,
+                    "High": [105.0 * s] * n,
+                    "Low": [95.0 * s] * n,
+                    "Close": [100.0 * s] * n,
+                    "Volume": [1000.0] * n,
+                },
+                index=dates,
+            )
+
+    cached_provider = CachedDataProvider(AutoAdjustingProvider(), cache_dir=str(tmp_path))
+    # 1. Initial sync seeds cache with basis = 1.0 for 2024-01-01 .. 2024-01-05
+    cached_provider.fetch_ohlcv("AAPL", start="2024-01-01", end="2024-01-05")
+    initial_bars = cached_provider.duckdb_cache.query_bars("AutoAdjustingProvider", "AAPL")
+    assert len(initial_bars) == 5
+    assert (initial_bars["Close"] == 100.0).all()
+
+    # 2. Upstream provider now changes basis (e.g. 4-for-1 split or dividend adjustment, scale = 0.25)
+    scale["val"] = 0.25
+
+    # 3. Routine fetch_universe for an expanded window (2024-01-01 .. 2024-01-10) detects the unannounced
+    # rewrite on the overlapping rows 2024-01-01 .. 2024-01-05 and fails loud.
+    with pytest.raises(RuntimeError) as exc_info:
+        cached_provider.fetch_universe(["AAPL"], start="2024-01-01", end="2024-01-10")
+
+    assert "were refused by store_bars' history-rewrite gate" in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, HistoryRewriteRefused)
+
+    # 4. Confirm cache was not corrupted/rewritten
+    preserved_bars = cached_provider.duckdb_cache.query_bars("AutoAdjustingProvider", "AAPL")
+    assert len(preserved_bars) == 5
+    assert (preserved_bars["Close"] == 100.0).all()
+
+
+def test_rebase_corporate_action_succeeds_with_audit_reason(tmp_path, caplog):
+    """L2.33: Administrative rebase_corporate_action allows audited rewrite."""
+    import logging
+    import common.duckdb_cache as duckdb_cache_module
+
+    scale = {"val": 1.0}
+
+    class CorporateActionProvider(BaseDataProvider):
+        def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+            dates = pd.bdate_range(start, end)
+            n = len(dates)
+            s = scale["val"]
+            return pd.DataFrame(
+                {
+                    "Open": [400.0 * s] * n,
+                    "High": [410.0 * s] * n,
+                    "Low": [390.0 * s] * n,
+                    "Close": [400.0 * s] * n,
+                    "Volume": [1000.0] * n,
+                },
+                index=dates,
+            )
+
+    cached_provider = CachedDataProvider(CorporateActionProvider(), cache_dir=str(tmp_path))
+    # 1. Initial pre-split data cached: Close = 400.0
+    cached_provider.fetch_ohlcv("AAPL", start="2020-08-01", end="2020-08-10")
+    initial_bars = cached_provider.duckdb_cache.query_bars("CorporateActionProvider", "AAPL")
+    assert (initial_bars["Close"] == 400.0).all()
+
+    # 2. Corporate action occurs (4-for-1 split, new basis = 0.25 -> Close = 100.0)
+    scale["val"] = 0.25
+    audit_reason = "AAPL 4-for-1 stock split effective 2020-08-31"
+
+    # Routine fetch fails loud:
+    with pytest.raises(HistoryRewriteRefused):
+        cached_provider.fetch_ohlcv("AAPL", start="2020-08-01", end="2020-08-31")
+
+    # 3. Explicit administrative rebase succeeds and logs audit warning
+    with caplog.at_level(logging.WARNING, logger=duckdb_cache_module.__name__):
+        rebased_df = cached_provider.rebase_corporate_action(
+            symbol="AAPL",
+            start="2020-08-01",
+            end="2020-08-31",
+            reason=audit_reason,
+        )
+
+    assert not rebased_df.empty
+    assert (rebased_df["Close"] == 100.0).all()
+
+    # Verify DuckDB cache was updated with new values
+    stored_bars = cached_provider.duckdb_cache.query_bars("CorporateActionProvider", "AAPL")
+    assert len(stored_bars) == len(rebased_df)
+    assert (stored_bars["Close"] == 100.0).all()
+
+    # Verify audit reason is preserved in log record
+    assert any(
+        "HISTORY REWRITE allowed" in rec.getMessage() and f"[CORPORATE_ACTION_REBASE] {audit_reason}" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+def test_rebase_corporate_action_rejects_blank_reason(tmp_path):
+    """L2.33: rebase_corporate_action requires at least 10 non-whitespace characters."""
+    class DummyProvider(BaseDataProvider):
+        def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+            dates = pd.bdate_range(start, end)
+            n = len(dates)
+            return pd.DataFrame(
+                {"Open": [10.0] * n, "High": [11.0] * n, "Low": [9.0] * n, "Close": [10.0] * n, "Volume": [100.0] * n},
+                index=dates,
+            )
+
+    cached_provider = CachedDataProvider(DummyProvider(), cache_dir=str(tmp_path))
+    cached_provider.fetch_ohlcv("AAPL", start="2020-01-01", end="2020-01-05")
+
+    invalid_reasons = [
+        None,
+        "",
+        "   ",
+        "\t\n",
+        "split",  # 5 chars (< 10)
+        "  split  ",  # stripped len 5 (< 10)
+    ]
+    for reason in invalid_reasons:
+        with pytest.raises(ValueError, match="rebase_corporate_action requires a descriptive reason"):
+            cached_provider.rebase_corporate_action("AAPL", start="2020-01-01", end="2020-01-05", reason=reason)
+
+
+def test_rebase_corporate_action_cli_script(tmp_path, capsys):
+    """L2.33: Verify scripts/rebase_auto_adjust_cache.py CLI execution (dry-run and apply)."""
+    from scripts.rebase_auto_adjust_cache import main as cli_main
+
+    # Create dummy provider file for dynamic loading via CLI
+    code = (
+        "from common.data import BaseDataProvider\n"
+        "import pandas as pd\n"
+        "class DynamicSplitProvider(BaseDataProvider):\n"
+        "    def fetch_ohlcv(self, symbol, start, end, interval='1d'):\n"
+        "        dates = pd.bdate_range(start or '2020-01-01', periods=5)\n"
+        "        return pd.DataFrame({'Open': 50.0, 'High': 55.0, 'Low': 45.0, 'Close': 50.0, 'Volume': 500}, index=dates)\n"
+    )
+    prov_script = tmp_path / "split_provider.py"
+    prov_script.write_text(code)
+
+    db_file = tmp_path / "test_cache.duckdb"
+
+    # Pre-populate cache with older higher prices (Close = 200.0)
+    from common.duckdb_cache import DuckDBCache
+    cache = DuckDBCache(db_path=str(db_file))
+    old_df = pd.DataFrame(
+        {"Open": 200.0, "High": 210.0, "Low": 190.0, "Close": 200.0, "Volume": 100},
+        index=pd.bdate_range("2020-01-01", periods=5),
+    )
+    cache.store_bars("DynamicSplitProvider", "SPLIT_TEST", old_df)
+
+    # 1. Test CLI Dry-Run
+    dry_run_args = [
+        "--provider", str(prov_script),
+        "--symbol", "SPLIT_TEST",
+        "--start", "2020-01-01",
+        "--end", "2020-01-10",
+        "--reason", "Test 4-for-1 split adjustment dry run",
+        "--db", str(db_file),
+        "--dry-run",
+    ]
+    ret = cli_main(dry_run_args)
+    assert ret == 0
+    captured = capsys.readouterr().out
+    assert "[DRY RUN]" in captured
+    assert "Would call rebase_corporate_action" in captured
+
+    # Verify no rewrite happened during dry-run
+    bars = cache.query_bars("DynamicSplitProvider", "SPLIT_TEST")
+    assert (bars["Close"] == 200.0).all()
+
+    # 2. Test CLI Apply
+    apply_args = [
+        "--provider", str(prov_script),
+        "--symbol", "SPLIT_TEST",
+        "--start", "2020-01-01",
+        "--end", "2020-01-10",
+        "--reason", "Test 4-for-1 split adjustment apply execution",
+        "--db", str(db_file),
+    ]
+    ret = cli_main(apply_args)
+    assert ret == 0
+    captured = capsys.readouterr().out
+    assert "[SUCCESS] Rebase completed" in captured
+
+    # Verify rewrite succeeded in database
+    updated_bars = cache.query_bars("DynamicSplitProvider", "SPLIT_TEST")
+    assert (updated_bars["Close"] == 50.0).all()
+

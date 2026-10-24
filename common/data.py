@@ -835,6 +835,71 @@ class CachedDataProvider(BaseDataProvider):
             interval=interval,
         )
 
+    def rebase_corporate_action(
+        self,
+        symbol: str,
+        start: str,
+        end: str,
+        reason: str,
+        interval: str = "1d",
+    ) -> pd.DataFrame:
+        """Administrative method to rebase cached bars following a corporate action (L2.33).
+
+        Validates that a descriptive audit reason is provided (at least 10 non-whitespace characters),
+        fetches fresh data from the inner provider, and stores it into the DuckDB cache
+        with `allow_history_rewrite=True` and an audit reason prefix.
+        Routine `fetch_ohlcv` and `fetch_universe` strictly enforce `allow_history_rewrite=False`
+        so unannounced historical overwrites fail loud.
+        """
+        if not reason or not isinstance(reason, str) or len(reason.strip()) < 10:
+            raise ValueError(
+                f"rebase_corporate_action requires a descriptive reason (at least 10 non-whitespace characters), got {reason!r}"
+            )
+        _validate_symbol_for_path(symbol)
+        if self.is_synthetic or not self.cache_dir or self.duckdb_cache is None:
+            raise RuntimeError(
+                f"Cannot rebase corporate action for {symbol}: DuckDB cache is not enabled or provider is synthetic."
+            )
+
+        provider_name = type(self.inner_provider).__name__
+        if is_intraday_interval(interval):
+            df = self.inner_provider.fetch_ohlcv(symbol, start, end, interval=interval)
+        else:
+            try:
+                df = self.inner_provider.fetch_ohlcv(symbol, start, end, interval="1d")
+            except Exception:
+                df = self.inner_provider.fetch_ohlcv(symbol, start, end, interval=interval)
+
+        if df is None or df.empty:
+            raise ValueError(
+                f"{provider_name} returned no data for {symbol} between {start} and {end}."
+            )
+
+        df = _drop_invalid_ohlcv_rows(df, symbol)
+        if df.empty:
+            raise ValueError(
+                f"Data for {symbol} between {start} and {end} had rows, but every one was dropped as invalid OHLC."
+            )
+
+        self.duckdb_cache.store_bars(
+            provider_name,
+            symbol,
+            df,
+            requested_start=start,
+            requested_end=end,
+            interval=interval,
+            allow_history_rewrite=True,
+            rewrite_reason=f"[CORPORATE_ACTION_REBASE] {reason.strip()}",
+        )
+
+        return self.duckdb_cache.query_bars(
+            provider_name,
+            symbol,
+            start=start,
+            end=end,
+            interval=interval,
+        )
+
     def fetch_metadata(self, symbol: str) -> dict:
         return self.inner_provider.fetch_metadata(symbol)
 
