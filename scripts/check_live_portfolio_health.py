@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Stage 1 Operational Live Deployment Runner: Portfolio Health & Macro Regime Inspection.
 
-Evaluates the mandatory 14:00 – 14:15 pre-trade health gate before Stage 2 order generation:
+Evaluates the mandatory pre-trade health gate -- design §8 window: (13:55, 14:20) in the
+MARKET's own local time (China/HK/US), not the host's clock -- before Stage 2 order generation:
 1. Calculates portfolio High-Water Mark (HWM) peak-to-trough drawdown and circuit breaker tiers:
    - Normal (DD < 10%): Full risk budget, proceed to Stage 2.
    - Tier 1 (10% <= DD < 15%): Smooth linear damping towards cash (15-day auto-healing).
@@ -56,10 +57,14 @@ if _REPO_ROOT not in sys.path:
 from common.data import get_data_provider
 from common.cli_utils import (
     add_data_provider_cli_args,
+    add_market_clock_cli_args,
     build_data_kwargs,
-    load_universe_with_banner,
+    load_live_universe,
+    persist_run_metadata,
+    resolve_live_clock_context,
     shared_data_dir,
 )
+from common.freshness import assert_fresh_universe
 from common.indicators import sma
 from common.strategy_spec import load_strategy_file
 from common.universe import resolve_universe_from_args
@@ -135,7 +140,12 @@ def parse_args(args: Optional[List[str]] = None):
         "--as-of-date",
         type=str,
         default=None,
-        help="Point-in-time valuation date (YYYY-MM-DD, default: today)",
+        help=(
+            "Point-in-time valuation date (YYYY-MM-DD). Default: the market clock's as_of_trading_date "
+            "(close + publication grace, in the market's own timezone), never the host's local date. "
+            "An explicit value must be a --market trading day and may not be later than the latest "
+            "published session."
+        ),
     )
     parser.add_argument(
         "--start-date",
@@ -177,14 +187,30 @@ def parse_args(args: Optional[List[str]] = None):
     parser.add_argument(
         "--cutoff-time",
         default="14:00",
-        help="Intraday cutoff time for Stage 1 health gate (default: 14:00, 36 5m bars)",
+        help=(
+            "Intraday cutoff time for Stage 1, expressed in the MARKET's local wall clock (not the "
+            "host's; default: 14:00, 36 5m bars). Used only for 5m microstructure/drawdown monitoring; "
+            "daily-bar valuation always uses the as-of session from the market clock."
+        ),
     )
     parser.add_argument(
         "--current-holdings-file",
         default=None,
         help="Path to current holdings JSON file for mark-to-market intraday NAV tracking",
     )
+    parser.add_argument(
+        "--allow-stale-prices",
+        action="store_true",
+        help=(
+            "DANGEROUS EMERGENCY OVERRIDE (equivalent to --no-strict-freshness). Stage 1 refuses to run "
+            "when any universe symbol's latest bar predates the as-of session, because breadth/thrust/vol "
+            "would then be computed on yesterday's closes. This downgrades that hard failure to a loud "
+            "warning and records freshness_summary=FAIL in the report."
+        ),
+    )
     add_data_provider_cli_args(parser, default_provider="synthetic")
+    # (L2.3) as-of / market / run-window gate / strict freshness / probe retry limit.
+    add_market_clock_cli_args(parser, stage="stage1")
     parsed = parser.parse_args(args)
 
     # Dynamically resolve output_dir and default account_state_file
@@ -677,7 +703,7 @@ def print_dashboard(
 ) -> None:
     """Print an executive-level pre-trade terminal dashboard."""
     print("=" * 110)
-    print("STAGE 1 PRE-TRADE GATE: PORTFOLIO HEALTH & MACRO REGIME INSPECTION (14:00 – 14:15)")
+    print("STAGE 1 PRE-TRADE GATE: PORTFOLIO HEALTH & MACRO REGIME INSPECTION (13:55 – 14:20 market-local)")
     print("=" * 110)
     print(f"Valuation As-Of Date : {as_of_date}")
     strat_disp = f"{strategy_info.get('strategy_name', 'N/A')} ({strategy_info.get('template_name', '')})"
@@ -810,6 +836,8 @@ def generate_reports(
     gate_headline: str,
     actions: List[str],
     intraday_5m_info: Optional[Dict[str, Any]] = None,
+    clock_ctx: Any = None,
+    freshness_summary: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str]:
     """Generate and write structured JSON and Markdown summary reports."""
     os.makedirs(output_dir, exist_ok=True)
@@ -818,6 +846,11 @@ def generate_reports(
 
     report_dict = {
         "as_of_date": as_of_date,
+        # (L2.3, design §9) One clock snapshot + one per-symbol freshness verdict, so
+        # every report can answer "which instant, which session, which bars?" without
+        # cross-referencing the console log.
+        "clock": (clock_ctx.stamp_fields() if clock_ctx is not None else None),
+        "freshness_summary": freshness_summary,
         "strategy_info": strategy_info,
         "strategy_version": strategy_info.get("strategy_version", "1.0.0"),
         "base_version": strategy_info.get("base_version"),
@@ -859,7 +892,7 @@ def generate_reports(
 > **Strategy Version**: `{strat_ver_display}`  
 > **Weighting & Ortho**: `{strategy_info.get('weighting_mode', 'rolling_ic_ir')}` | Orthogonalized: `{strategy_info.get('orthogonalization', True)}`  
 > **Gate Directive**: **{gate_headline}**  
-> **Report Timestamp**: Generated during 14:00 – 14:15 inspection window  
+> **Report Timestamp**: Generated during the market-local 13:55 – 14:20 inspection window  
 
 ---
 
@@ -945,9 +978,125 @@ def generate_reports(
     return json_path, md_path
 
 
+# Filename `generate_reports` writes (and Stage 2 must read back).
+STAGE1_HEALTH_REPORT_JSON = "stage1_health_report.json"
+
+
+def _absolutize_child_arg(path: Optional[str]) -> Optional[str]:
+    """Anchors a path destined for the Stage-2 child process to an explicit base.
+
+    (P1.3 -- six-defect audit, Defect 6 follow-up) The child process must never
+    re-resolve a path against ITS CWD, because the only thing that guarantees the
+    child inherits the same CWD as Stage 1 is that we happen to launch it with
+    `subprocess.run` from the same process. Handing it an already-absolute path
+    removes that implicit dependency entirely.
+
+    Anchor policy == `parse_args`'s own `_resolve_path` fallback, made explicit:
+    by the time this runs, `_resolve_path` has already turned every path that
+    existed relative to the CWD into an absolute path, so anything still relative
+    was resolved against `_REPO_ROOT` (or not found anywhere). Anchoring those to
+    `_REPO_ROOT` here -- instead of `os.path.abspath`, which is CWD-dependent -- is
+    both order-independent and CWD-independent. `_REPO_ROOT` is preferred over the
+    CWD deliberately: the repo is the documented base for every relative path this
+    script accepts (`docs/universe/...`, `data/`, `docs/ruleset/...`).
+    """
+    if not path:
+        return path
+    if os.path.isabs(path):
+        return os.path.normpath(path)
+    return os.path.normpath(os.path.join(_REPO_ROOT, path))
+
+
+def build_stage2_command(args: argparse.Namespace, enable_intraday_5m: bool = False) -> List[str]:
+    """Builds the argv for the auto-launched Stage 2 runner (`--auto-run-stage2`).
+
+    (P1.3) `--health-report-file` is passed EXPLICITLY instead of relying on
+    Stage 2's implicit `os.path.join(output_dir, "stage1_health_report.json")`
+    default. That default is reconstructed inside the child from whatever
+    `--output-dir` it was handed; if that value were relative, the child would
+    resolve it against its own CWD and silently read a DIFFERENT (or missing)
+    gate report -- exactly the class of defect that made `--health-report-file`
+    a dangling argument before T0.3. Both flags now carry the same absolute
+    path, and that path is the one `generate_reports` actually wrote.
+
+    Every path-valued flag is absolutized (see `_absolutize_child_arg`), so the
+    resulting argv is identical no matter which directory the operator ran
+    Stage 1 from.
+    """
+    for required in ("output_dir", "universe_file", "strategy_file", "account_state_file"):
+        if not getattr(args, required, None):
+            raise ValueError(
+                f"build_stage2_command: --{required.replace('_', '-')} must be resolved "
+                "before Stage 2 can be auto-launched"
+            )
+
+    stage2_script = os.path.join(_REPO_ROOT, "scripts", "run_live_strategy.py")
+    output_dir = _absolutize_child_arg(args.output_dir)
+    # Same filename `generate_reports` wrote above (see STAGE1_HEALTH_REPORT_JSON).
+    health_report_file = os.path.join(output_dir, STAGE1_HEALTH_REPORT_JSON)
+
+    cmd = [
+        sys.executable,
+        stage2_script,
+        "--portfolio-value",
+        str(args.portfolio_value),
+        "--universe-file",
+        _absolutize_child_arg(args.universe_file),
+        "--strategy-file",
+        _absolutize_child_arg(args.strategy_file),
+        "--data-provider",
+        args.data_provider,
+        "--output-dir",
+        output_dir,
+        "--account-state-file",
+        _absolutize_child_arg(args.account_state_file),
+        # Explicit, absolute, and identical to the file this process just wrote.
+        "--health-report-file",
+        health_report_file,
+    ]
+    if args.as_of_date:
+        cmd.extend(["--as-of-date", args.as_of_date])
+    if getattr(args, "start_date", None):
+        cmd.extend(["--start-date", args.start_date])
+    if getattr(args, "cache_dir", None):
+        cmd.extend(["--cache-dir", _absolutize_child_arg(args.cache_dir)])
+    if getattr(args, "data_dir", None):
+        cmd.extend(["--data-dir", _absolutize_child_arg(args.data_dir)])
+    if getattr(args, "no_cache", False):
+        cmd.append("--no-cache")
+    if enable_intraday_5m:
+        cmd.append("--enable-intraday-5m")
+    # (L2.3) Forward the market-clock policy the operator chose for Stage 1 so the
+    # auto-launched Stage 2 resolves the SAME market/as-of/grace and applies the same
+    # gate strictness. Without this, Stage 1 could run under `--market hk` (or an
+    # explicitly downgraded gate) and Stage 2 would silently re-infer both.
+    if getattr(args, "market", None):
+        cmd.extend(["--market", args.market])
+    if getattr(args, "allow_intraday", False):
+        cmd.append("--allow-intraday")
+    if not getattr(args, "strict_market_clock", True):
+        cmd.append("--no-strict-market-clock")
+    if not getattr(args, "strict_freshness", True) or getattr(args, "allow_stale_prices", False):
+        cmd.append("--no-strict-freshness")
+    if getattr(args, "publication_grace_minutes", None) is not None:
+        cmd.extend(["--publication-grace-minutes", str(args.publication_grace_minutes)])
+    if getattr(args, "max_probe_attempts", None) is not None:
+        cmd.extend(["--max-probe-attempts", str(args.max_probe_attempts)])
+    return cmd
+
+
 def main(cli_args: Optional[List[str]] = None):
     args = parse_args(cli_args)
-    as_of_date = args.as_of_date or date.today().isoformat()
+
+    # (L2.3) The as-of date is the MARKET's latest published session, resolved by
+    # `common/market_clock.py`; `date.today()` on a UTC-7 host is not an acceptable
+    # substitute (design §2/§5). The run-window gate runs before any data load, so a
+    # 10:05-style invocation (2026-10-22) is refused before it can produce a report.
+    universe_symbols = resolve_universe_from_args(args)
+    if not universe_symbols:
+        raise ValueError(f"Could not resolve universe symbols from {args.universe_file}")
+    clock_ctx = resolve_live_clock_context(args, universe_symbols, stage="stage1")
+    as_of_date = clock_ctx.as_of_date
     if getattr(args, "start_date", None):
         start_date = args.start_date
     else:
@@ -977,22 +1126,32 @@ def main(cli_args: Optional[List[str]] = None):
     }
 
     # 2. Load Universe Data
-    universe_symbols = resolve_universe_from_args(args)
     if not universe_symbols:
         raise ValueError(f"Could not resolve universe symbols from {args.universe_file}")
 
     cache_dir = args.cache_dir or shared_data_dir()
-    universe = load_universe_with_banner(
+    universe, probe_attempts = load_live_universe(
+        args,
         universe_symbols,
         start_date,
         as_of_date,
-        interval="1d",
+        clock_ctx=clock_ctx,
         use_cache=not args.no_cache,
         cache_dir=cache_dir,
         data_kwargs=build_data_kwargs(args),
         require_nonempty=True,
     )
     universe = as_of_universe(universe, as_of_date)
+    # (L2.3) A stale bar here means breadth/thrust/vol would be computed on yesterday's
+    # closes -- the same silent substitution the incident was made of, one stage earlier.
+    freshness_summary = assert_fresh_universe(
+        universe,
+        as_of_date,
+        strict=clock_ctx.freshness_strict,
+        expected_symbols=universe_symbols,
+        exclude=(params.get("cash_proxy", "BIL"),),
+        stage="stage1",
+    )
 
     # 3. Load Account State & Evaluate Portfolio Drawdown
     state = load_account_state(args.account_state_file)
@@ -1349,6 +1508,17 @@ def main(cli_args: Optional[List[str]] = None):
         gate_headline=gate_headline,
         actions=actions,
         intraday_5m_info=intraday_5m_info,
+        clock_ctx=clock_ctx,
+        freshness_summary=freshness_summary,
+    )
+    # (L2.3, design §9) `summary.json` is the shared per-run archive key/value store the
+    # web layer merges into; the clock + freshness blocks land there too.
+    persist_run_metadata(
+        args.output_dir,
+        clock_ctx,
+        freshness_summary=freshness_summary,
+        probe_attempts=probe_attempts,
+        extra={"date": as_of_date, "stage": "stage1", "gate_code": gate_code},
     )
     print(f"\n[SUCCESS] Reports exported:")
     print(f"  Markdown: {md_rep}")
@@ -1362,36 +1532,11 @@ def main(cli_args: Optional[List[str]] = None):
             print("\n[STOP] Auto-run Stage 2 aborted due to 🔴 NO-GO / EMERGENCY HALT.")
             sys.exit(1)
         else:
-            stage2_script = os.path.join(_REPO_ROOT, "scripts", "run_live_strategy.py")
-            print(f"\n[AUTO-EXECUTE] Launching Stage 2: {os.path.basename(stage2_script)} ...")
-            cmd = [
-                sys.executable,
-                stage2_script,
-                "--portfolio-value",
-                str(args.portfolio_value),
-                "--universe-file",
-                args.universe_file,
-                "--strategy-file",
-                args.strategy_file,
-                "--data-provider",
-                args.data_provider,
-                "--output-dir",
-                args.output_dir,
-                "--account-state-file",
-                args.account_state_file,
-            ]
-            if args.as_of_date:
-                cmd.extend(["--as-of-date", args.as_of_date])
-            if getattr(args, "start_date", None):
-                cmd.extend(["--start-date", args.start_date])
-            if getattr(args, "cache_dir", None):
-                cmd.extend(["--cache-dir", args.cache_dir])
-            if getattr(args, "data_dir", None):
-                cmd.extend(["--data-dir", args.data_dir])
-            if getattr(args, "no_cache", False):
-                cmd.append("--no-cache")
-            if enable_intraday_5m:
-                cmd.append("--enable-intraday-5m")
+            # (P1.3) argv construction lives in `build_stage2_command` so the offline
+            # suite can assert the exact flag set (notably the explicit absolute
+            # `--health-report-file`) without launching a child process.
+            cmd = build_stage2_command(args, enable_intraday_5m=enable_intraday_5m)
+            print(f"\n[AUTO-EXECUTE] Launching Stage 2: {os.path.basename(cmd[1])} ...")
             import subprocess
             subprocess.run(cmd, check=True)
 

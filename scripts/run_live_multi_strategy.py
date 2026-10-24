@@ -56,10 +56,14 @@ for _group in ("pipeline", "ml"):
 
 from common.cli_utils import (
     add_data_provider_cli_args,
+    add_market_clock_cli_args,
     build_data_kwargs,
-    load_universe_with_banner,
+    load_live_universe,
+    persist_run_metadata,
+    resolve_live_clock_context,
     shared_data_dir,
 )
+from common.freshness import assert_fresh_universe, latest_close
 from common.order_netting import (
     FrictionSavings,
     MarketType,
@@ -170,7 +174,11 @@ def parse_args():
     parser.add_argument(
         "--as-of-date",
         default=None,
-        help="Valuation as-of-date (YYYY-MM-DD)",
+        help=(
+            "Valuation as-of-date (YYYY-MM-DD). Default: the market clock's as_of_trading_date "
+            "(close + publication grace, market-local), never the host's local date. An explicit "
+            "value must be a --market trading day and may not be later than the latest published session."
+        ),
     )
     parser.add_argument(
         "--start-date",
@@ -233,6 +241,8 @@ def parse_args():
     )
 
     add_data_provider_cli_args(parser)
+    # (L2.3) as-of / market / run-window gate / strict freshness / probe retry limit.
+    add_market_clock_cli_args(parser, stage="stage2")
     return parser.parse_args()
 
 
@@ -266,7 +276,13 @@ def parse_strategy_specs(strategies_arg: List[str], config_file: Optional[str]) 
 
 def main():
     args = parse_args()
-    val_date = args.as_of_date or date.today().isoformat()
+    # (L2.3) Netted live deployment: as-of + run-window gate resolved from the market
+    # clock exactly as in Stage 2, before any data load.
+    universe_symbols = resolve_universe_from_args(args)
+    if not universe_symbols:
+        raise ValueError(f"Could not resolve universe from {args.universe_file}")
+    clock_ctx = resolve_live_clock_context(args, universe_symbols, stage="stage2")
+    val_date = clock_ctx.as_of_date
     if getattr(args, "start_date", None):
         start_date = args.start_date
     else:
@@ -287,7 +303,6 @@ def main():
     print("=" * 115)
 
     # 1. Load Universe symbols
-    universe_symbols = resolve_universe_from_args(args)
     if not universe_symbols:
         raise ValueError(f"Could not resolve universe from {args.universe_file}")
     symbol_names = load_symbol_names(args.universe_file)
@@ -301,22 +316,42 @@ def main():
     all_symbols_to_load = sorted(list(set(universe_symbols).union(set(held_symbols))))
 
     cache_dir = args.cache_dir or shared_data_dir()
-    universe = load_universe_with_banner(
+    universe, probe_attempts = load_live_universe(
+        args,
         all_symbols_to_load,
         start_date,
         val_date,
-        interval="1d",
+        clock_ctx=clock_ctx,
         use_cache=not args.no_cache,
         cache_dir=cache_dir,
         data_kwargs=build_data_kwargs(args),
         require_nonempty=True,
     )
     universe = as_of_universe(universe, val_date)
+    freshness_summary = assert_fresh_universe(
+        universe,
+        val_date,
+        strict=clock_ctx.freshness_strict,
+        expected_symbols=all_symbols_to_load,
+        exclude=("BIL", "CASH"),
+        stage="multi_strategy_netted",
+    )
+    persist_run_metadata(
+        args.output_dir,
+        clock_ctx,
+        freshness_summary=freshness_summary,
+        probe_attempts=probe_attempts,
+        extra={"date": val_date, "stage": "multi_strategy_netted"},
+    )
 
+    # (2026-10-22 incident, Fix 2 / L2.3) Netting prices come from the SAME single
+    # freshness owner as Stage 2 (`common.freshness.latest_close`), not `.iloc[-1]`.
     latest_prices = {}
     for sym in all_symbols_to_load:
         if sym in universe and not universe[sym].empty:
-            latest_prices[sym] = float(universe[sym]["Close"].iloc[-1])
+            latest_prices[sym] = latest_close(
+                universe, sym, val_date, strict=clock_ctx.freshness_strict
+            )
         else:
             latest_prices[sym] = 1.0
 
