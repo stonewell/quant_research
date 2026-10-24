@@ -1595,3 +1595,153 @@ def test_detail_reason_is_liquidation_follows_action_not_target_weight(
     detail = _ast.literal_eval(csv_df[csv_df["symbol"] == "600000.SH"].iloc[0]["detail_reason"])
     assert detail["is_liquidation"] is True
 
+
+def test_live_linear_equity_scale_portfolio_deleverage(tmp_path, patched_weights, capsys):
+    """L2.40: linear_equity_scale < 0.999 triggers is_portfolio_deleverage in Stage 2 runner.
+
+    Verifies:
+    1. Risky asset targets are scaled down by linear_equity_scale.
+    2. Residual cash is swept to cash proxy (BIL).
+    3. Partial trim bypasses inertia gate and tenure lock for held assets with held_bars >= 1.
+    4. Order action is SELL with reason containing '组合级去杠杆风控减仓'.
+    """
+    from scripts.run_live_strategy import main as live_main
+
+    del_dir = tmp_path / "live_deleverage"
+    del_dir.mkdir()
+    universe_file = _write_universe(del_dir, ["600000.SH", "BIL"])
+    holdings_file = _write_json(del_dir, "holdings.json", {"600000.SH": 0.50, "BIL": 0.50})
+
+    state_payload = {
+        "linear_equity_scale": 0.95,
+        "holding_bars": {"600000.SH": 1},
+        "lifecycle_states": {
+            "600000.SH": {
+                "symbol": "600000.SH",
+                "state": "HELD_GESTATION",
+                "held_bars": 1,
+                "current_weight": 0.50,
+                "broker_weight": 0.50,
+                "entry_price": 10.0,
+                "peak_price": 10.0,
+            }
+        },
+    }
+    state_file = _write_json(del_dir, "account_state.json", state_payload)
+
+    # Strategy model wants 50% in 600000.SH, 50% in BIL
+    # linear_equity_scale=0.95 scales 600000.SH to 0.50 * 0.95 = 0.475, delta = -0.025 (< default inertia 0.05)
+    # and held_bars=1 < min_holding_bars=2.
+    # Normally both inertia (0.025 < 0.05) and tenure lock (1 < 2) would block partial trim.
+    # Under is_portfolio_deleverage, both are bypassed, order emits SELL trim with reason containing '组合级去杠杆风控减仓'.
+    patched_weights({"600000.SH": 0.50, "BIL": 0.50})
+
+    order_df = live_main(
+        _live_args(
+            del_dir,
+            universe_file,
+            state_file,
+            _AS_OF_SECOND,
+            extra=[
+                "--current-holdings-file", holdings_file,
+                "--min-holding-bars", "2",
+            ],
+        )
+    )
+    capsys.readouterr()
+    row = order_df[order_df["symbol"] == "600000.SH"].iloc[0]
+    assert row["action"] == "SELL"
+    assert float(row["target_weight"]) == pytest.approx(0.475)
+    assert "组合级去杠杆风控减仓" in str(row["reason"])
+
+    bil_row = order_df[order_df["symbol"] == "BIL"].iloc[0]
+    assert bil_row["action"] == "SWEEP_CASH"
+    assert float(bil_row["target_weight"]) >= 0.525
+
+
+def test_live_fast_recovery_override_tier3_parity(tmp_path, patched_weights, capsys):
+    """L2.42: Stage 2 receiving CAUTION_RECOVERING (even with circuit_breaker_tier=TIER_3_HALT
+    and freeze_remaining_bars > 0) does NOT liquidate 100% to 0.0, but scales risky targets
+    to 30% (0.30) with is_portfolio_deleverage=True.
+    """
+    from scripts.run_live_strategy import main as live_main
+
+    rec_dir = tmp_path / "live_recovery"
+    rec_dir.mkdir()
+    universe_file = _write_universe(rec_dir, ["600000.SH", "BIL"])
+    holdings_file = _write_json(rec_dir, "holdings.json", {"600000.SH": 0.50, "BIL": 0.50})
+
+    # Account state has TIER_3_HALT and freeze_remaining_bars=3, but gate_code=CAUTION_RECOVERING
+    state_payload = {
+        "current_nav": 100000.0,
+        "peak_nav": 120000.0,
+        "circuit_breaker_tier": "TIER_3_HALT",
+        "freeze_remaining_bars": 3,
+        "gate_code": "CAUTION_RECOVERING",
+        "linear_equity_scale": 0.30,
+        "lifecycle_states": {
+            "600000.SH": {
+                "symbol": "600000.SH",
+                "state": "HELD_GESTATION",
+                "held_bars": 1,
+                "current_weight": 0.50,
+                "broker_weight": 0.50,
+                "entry_price": 10.0,
+                "peak_price": 10.0,
+            }
+        },
+    }
+    state_file = _write_json(rec_dir, "account_state.json", state_payload)
+
+    # Strategy model wants 50% in 600000.SH, 50% in BIL
+    # Under CAUTION_RECOVERING, risky target scales to 0.50 * 0.30 = 0.15
+    patched_weights({"600000.SH": 0.50, "BIL": 0.50})
+
+    order_df = live_main(
+        _live_args(
+            rec_dir,
+            universe_file,
+            state_file,
+            _AS_OF_SECOND,
+            extra=[
+                "--current-holdings-file", holdings_file,
+                "--min-holding-bars", "2",
+            ],
+        )
+    )
+    capsys.readouterr()
+
+    row = order_df[order_df["symbol"] == "600000.SH"].iloc[0]
+    # Must NOT be 0.0 liquidation; must be partial trim to 0.15
+    assert row["action"] == "SELL"
+    assert float(row["target_weight"]) == pytest.approx(0.15)
+    assert "组合级去杠杆风控减仓" in str(row["reason"])
+
+    bil_row = order_df[order_df["symbol"] == "BIL"].iloc[0]
+    assert bil_row["action"] == "SWEEP_CASH"
+    assert float(bil_row["target_weight"]) >= 0.80
+
+    # Also verify fallback when linear_equity_scale was legacy 0.0 or None in state
+    state_legacy = dict(state_payload)
+    state_legacy["linear_equity_scale"] = 0.0
+    state_legacy_file = _write_json(rec_dir, "account_state_legacy.json", state_legacy)
+
+    order_df_legacy = live_main(
+        _live_args(
+            rec_dir,
+            universe_file,
+            state_legacy_file,
+            _AS_OF_SECOND,
+            extra=[
+                "--current-holdings-file", holdings_file,
+                "--min-holding-bars", "2",
+            ],
+        )
+    )
+    capsys.readouterr()
+
+    row_legacy = order_df_legacy[order_df_legacy["symbol"] == "600000.SH"].iloc[0]
+    assert row_legacy["action"] == "SELL"
+    assert float(row_legacy["target_weight"]) == pytest.approx(0.15)
+
+

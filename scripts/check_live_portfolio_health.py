@@ -623,18 +623,23 @@ def resolve_gate_directive(
     fast_rec = dd_info["fast_recovery_nav"] or macro_info["thrust_active"]
     freeze = dd_info["freeze_remaining_bars"]
 
-    if freeze > 0 or (tier == "TIER_3_HALT" and not fast_rec):
+    if (tier == "TIER_3_HALT" or freeze > 0) and fast_rec:
+        code = "CAUTION_RECOVERING"
+        headline = "🟡 CAUTION: TIER 3 DOWNGRADED VIA FAST RECOVERY OVERRIDE"
+        # L2.42: Synchronize dd_info fields so persisted account_state.json and
+        # stage1_health_report.json emit consistent Tier-2 defensive scaling (0.30)
+        dd_info["tier"] = "TIER_2_DEFENSIVE"
+        dd_info["tier_label"] = "🟡 TIER 2 (Defensive Mode / Fast Recovery Override)"
+        dd_info["linear_equity_scale"] = 0.30
+        actions.append("Fast Recovery Active: 10d NAV recovery > 0 or Breadth Thrust >= 60%.")
+        actions.append("Downgrade from 100% Cash Stop to Tier 2 Defensive Mode (ChanVaaCompound with 70% cash).")
+        actions.append("Prioritize structural exits before opening limited defensive positions.")
+    elif freeze > 0 or tier == "TIER_3_HALT":
         code = "NO_GO_EMERGENCY"
         headline = "🔴 NO-GO: EMERGENCY HALT & 100% CASH LIQUIDATION"
         actions.append("HALT ALL RISK ASSET PURCHASES: Do NOT place any buy orders today.")
         actions.append(f"Execute 100% liquidation of all risky assets into Cash Proxy ({freeze} freeze days remaining).")
         actions.append("Park proceeds in yield-bearing cash proxy (511880 / GC001 / BIL).")
-    elif tier == "TIER_3_HALT" and fast_rec:
-        code = "CAUTION_RECOVERING"
-        headline = "🟡 CAUTION: TIER 3 DOWNGRADED VIA FAST RECOVERY OVERRIDE"
-        actions.append("Fast Recovery Active: 10d NAV recovery > 0 or Breadth Thrust >= 60%.")
-        actions.append("Downgrade from 100% Cash Stop to Tier 2 Defensive Mode (ChanVaaCompound with 70% cash).")
-        actions.append("Prioritize structural exits before opening limited defensive positions.")
     elif tier == "TIER_2_DEFENSIVE":
         code = "CAUTION_DEFENSIVE"
         headline = "🟠 CAUTION: TIER 2 TACTICAL DEFENSE MODE ACTIVE"

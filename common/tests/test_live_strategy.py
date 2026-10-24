@@ -207,12 +207,15 @@ def test_resolve_min_entry_bars():
 def test_resolve_min_holding_bars():
     # CLI override has highest priority
     assert resolve_min_holding_bars({"cfsb_min_holding_bars": 3}, cli_override=5) == 5
-    # Prefixed blend params
-    assert resolve_min_holding_bars({"cfsb_min_holding_bars": 3}) == 3
+    assert resolve_min_holding_bars({"chan_fse_min_hold_bars": 5}, cli_override=3) == 3
+    # Prefixed blend params and short suffix (L2.39)
+    assert resolve_min_holding_bars({"cfsb_min_holding_bars": 4}) == 4
+    assert resolve_min_holding_bars({"chan_fse_min_hold_bars": 5}) == 5
     assert resolve_min_holding_bars({"cfssb_min_holding_bars": 4}) == 4
     assert resolve_min_holding_bars({"crb_min_holding_bars": 4}) == 4
     assert resolve_min_holding_bars({"blend_min_holding_bars": 2}) == 2
     assert resolve_min_holding_bars({"min_holding_bars": 3}) == 3
+    assert resolve_min_holding_bars({"min_hold_bars": 3}) == 3
     # Fallback default
     assert resolve_min_holding_bars({}) == 2
     assert resolve_min_holding_bars({}, default=1) == 1

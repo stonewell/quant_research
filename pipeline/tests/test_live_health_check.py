@@ -252,3 +252,66 @@ def test_default_output_dir_is_one_shared_resolution_for_both_stages():
 
     # A moved `scripts/live_paths.py` would silently retarget every default above.
     assert live_paths.REPO_ROOT == _REPO_ROOT
+
+
+# ---------------------------------------------------------------------------
+# 5. L2.42: Tier-3 Fast Recovery Override Parity in Stage 1
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_gate_directive_fast_recovery_downgrades_tier3_to_tier2_defensive():
+    """L2.42: When fast_recovery_nav or thrust_active is True during TIER_3_HALT or freeze,
+    resolve_gate_directive must return CAUTION_RECOVERING, synchronize dd_info['tier'] to
+    TIER_2_DEFENSIVE, and set dd_info['linear_equity_scale'] to 0.30.
+    """
+    resolve_gate_directive = _mod.resolve_gate_directive
+
+    vol_info = {"vol_elevated": False}
+
+    # Case 1: TIER_3_HALT with fast_recovery_nav=True
+    dd_info_1 = {
+        "tier": "TIER_3_HALT",
+        "tier_label": "🔴 TIER 3 (Emergency Halt / 100% Cash)",
+        "linear_equity_scale": 0.0,
+        "fast_recovery_nav": True,
+        "freeze_remaining_bars": 0,
+    }
+    macro_info_1 = {"thrust_active": False, "breadth_active": False}
+    code1, headline1, actions1 = resolve_gate_directive(dd_info_1, macro_info_1, vol_info)
+
+    assert code1 == "CAUTION_RECOVERING"
+    assert "TIER 3 DOWNGRADED VIA FAST RECOVERY OVERRIDE" in headline1
+    assert dd_info_1["tier"] == "TIER_2_DEFENSIVE"
+    assert dd_info_1["linear_equity_scale"] == pytest.approx(0.30)
+    assert "Defensive Mode / Fast Recovery Override" in dd_info_1["tier_label"]
+
+    # Case 2: In freeze period (freeze_remaining_bars > 0) with thrust_active=True
+    dd_info_2 = {
+        "tier": "TIER_3_HALT",
+        "tier_label": "🔴 TIER 3 (Emergency Halt / 100% Cash)",
+        "linear_equity_scale": 0.0,
+        "fast_recovery_nav": False,
+        "freeze_remaining_bars": 3,
+    }
+    macro_info_2 = {"thrust_active": True, "thrust": 0.65, "thrust_thresh": 0.60, "target_exposure": 0.80}
+    code2, headline2, actions2 = resolve_gate_directive(dd_info_2, macro_info_2, vol_info)
+
+    assert code2 == "CAUTION_RECOVERING"
+    assert dd_info_2["tier"] == "TIER_2_DEFENSIVE"
+    assert dd_info_2["linear_equity_scale"] == pytest.approx(0.30)
+
+    # Case 3: Counter-check without fast recovery -> stays NO_GO_EMERGENCY
+    dd_info_3 = {
+        "tier": "TIER_3_HALT",
+        "tier_label": "🔴 TIER 3 (Emergency Halt / 100% Cash)",
+        "linear_equity_scale": 0.0,
+        "fast_recovery_nav": False,
+        "freeze_remaining_bars": 3,
+    }
+    macro_info_3 = {"thrust_active": False, "breadth_active": False}
+    code3, headline3, actions3 = resolve_gate_directive(dd_info_3, macro_info_3, vol_info)
+
+    assert code3 == "NO_GO_EMERGENCY"
+    assert dd_info_3["tier"] == "TIER_3_HALT"
+    assert dd_info_3["linear_equity_scale"] == pytest.approx(0.0)
+

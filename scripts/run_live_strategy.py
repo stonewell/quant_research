@@ -350,16 +350,20 @@ def resolve_min_holding_bars(
     Precedence:
     1. Direct CLI override (--min-holding-bars)
     2. Strategy parameter via resolve_blend_param (cfsb_min_holding_bars, crb_min_holding_bars, etc., or min_holding_bars)
-    3. Strategy parameter matching ending with '_min_holding_bars'
-    4. Fallback default (2).
+    3. Strategy parameter via resolve_blend_param with min_hold_bars (chan_fse_min_hold_bars, etc.)
+    4. Strategy parameter matching ending with '_min_holding_bars' or '_min_hold_bars'
+    5. Fallback default (2).
     """
     if cli_override is not None:
         return max(0, int(cli_override))
     val = resolve_blend_param(params, "min_holding_bars", None, int)
     if val is not None:
         return max(0, int(val))
+    val_short = resolve_blend_param(params, "min_hold_bars", None, int)
+    if val_short is not None:
+        return max(0, int(val_short))
     for k, v in params.items():
-        if k.endswith("_min_holding_bars") and v is not None:
+        if (k.endswith("_min_holding_bars") or k.endswith("_min_hold_bars")) and v is not None:
             return max(0, int(v))
     return int(default)
 
@@ -1772,12 +1776,33 @@ def main(cli_args: Optional[List[str]] = None):
     # Check circuit breaker from account_state or health_report
     circuit_tier = account_state.get("circuit_breaker_tier") or health_report.get("circuit_breaker_tier")
     freeze_rem = int(account_state.get("freeze_remaining_bars", health_report.get("freeze_remaining_bars", 0)))
-    if circuit_tier == "TIER_3_HALT" or freeze_rem > 0:
+    gate_code = account_state.get("gate_code") or health_report.get("gate_code")
+    is_recovering = (gate_code == "CAUTION_RECOVERING" or circuit_tier == "CAUTION_RECOVERING")
+    is_portfolio_deleverage = False
+    if (circuit_tier == "TIER_3_HALT" or freeze_rem > 0) and not is_recovering:
         print("\n" + "!" * 110)
         print(f"[CIRCUIT BREAKER ENGAGED / 熔断器生效] 账户处于第三级熔断停牌期 (Tier 3 Emergency Halt, 剩余冷冻: {freeze_rem} 交易日)")
         print("根据风控守则，所有风险标的持仓清零，全额切换为现金停泊 (100% Cash Sweep).")
         print("!" * 110 + "\n")
         current_targets = pd.Series(0.0, index=current_targets.index)
+        if cash_proxy in current_targets.index:
+            current_targets[cash_proxy] = 1.0
+    elif is_recovering:
+        raw_scale = (
+            account_state.get("linear_equity_scale")
+            if account_state.get("linear_equity_scale") is not None
+            else health_report.get("linear_equity_scale")
+        )
+        rec_scale = float(raw_scale) if raw_scale is not None else 0.30
+        if rec_scale <= 0.0 or rec_scale >= 0.999:
+            rec_scale = 0.30
+        print(f"[FAST RECOVERY OVERRIDE / 快速恢复] 账户处于快速恢复期 (CAUTION_RECOVERING)，降级为 Tier 2 防御模式，股票仓位比例控制在: {rec_scale:.1%}")
+        is_portfolio_deleverage = True
+        risky_syms_in_targets = [s for s in current_targets.index if s != cash_proxy]
+        current_targets[risky_syms_in_targets] = current_targets[risky_syms_in_targets] * rec_scale
+        if cash_proxy in current_targets.index:
+            tot_risky = float(current_targets[risky_syms_in_targets].sum())
+            current_targets[cash_proxy] = max(0.0, 1.0 - tot_risky)
     elif account_state.get("linear_equity_scale") is not None or health_report.get("linear_equity_scale") is not None:
         live_scale = float(
             account_state.get("linear_equity_scale")
@@ -1786,7 +1811,13 @@ def main(cli_args: Optional[List[str]] = None):
         )
         if live_scale < 0.999:
             print(f"[RISK DAMPING / 风险阻尼] 根据账户实盘回撤，线性压缩股票仓位比例至: {live_scale:.1%}")
-            current_targets = current_targets * live_scale
+            is_portfolio_deleverage = True
+            live_scale_clamped = max(0.0, live_scale)
+            risky_syms_in_targets = [s for s in current_targets.index if s != cash_proxy]
+            current_targets[risky_syms_in_targets] = current_targets[risky_syms_in_targets] * live_scale_clamped
+            if cash_proxy in current_targets.index:
+                tot_risky = float(current_targets[risky_syms_in_targets].sum())
+                current_targets[cash_proxy] = max(0.0, 1.0 - tot_risky)
 
     # 4. Resolve Reference Portfolio (Actual Holdings vs Strategy Last Rebalance)
     current_shares_dict: Dict[str, int] = {}
@@ -1889,7 +1920,7 @@ def main(cli_args: Optional[List[str]] = None):
 
     breadth_val = float(macro_dict.get("breadth", health_report.get("breadth", 0.50)) or 0.50)
     thrust_val = float(macro_dict.get("thrust", health_report.get("thrust", 0.50)) or 0.50)
-    macro_passed = not (circuit_tier == "TIER_3_HALT" or freeze_rem > 0)
+    macro_passed = not ((circuit_tier == "TIER_3_HALT" or freeze_rem > 0) and not is_recovering)
 
     updated_lifecycle_states: Dict[str, Any] = {}
     rows = []
@@ -1947,7 +1978,7 @@ def main(cli_args: Optional[List[str]] = None):
             else current_shares_dict.get(sym, 0)
         )
 
-        is_circuit_halt = (circuit_tier == "TIER_3_HALT" or freeze_rem > 0)
+        is_circuit_halt = ((circuit_tier == "TIER_3_HALT" or freeze_rem > 0) and not is_recovering)
         bars_since_exit = exit_cooldown.get(sym, account_state.get("exit_bars_ago", {}).get(sym, 999))
         reentry_cooldown_bars = getattr(args, "reentry_cooldown_bars", 2)
 
@@ -2061,6 +2092,7 @@ def main(cli_args: Optional[List[str]] = None):
                 atr=sym_atr,
                 is_emergency_halt=is_circuit_halt,
                 is_market_open=is_market_open,
+                is_portfolio_deleverage=is_portfolio_deleverage,
             )
 
             action = decision.action
@@ -2126,6 +2158,8 @@ def main(cli_args: Optional[List[str]] = None):
 
             held_age = state.held_bars if state.is_holding() else 0
             is_tenure_locked = bool(state.held_bars < min_holding_bars if state.is_holding() else False)
+            is_china_t1_gestation = (asset_market == "china" and state.held_bars < 1)
+            should_block_tenure = is_china_t1_gestation or (is_tenure_locked and not is_portfolio_deleverage)
 
             # (2026-10-22 incident, belt-and-suspenders) Fix 1 already gates
             # partial-trim SELLs on `can_sell` inside position_lifecycle.py.
@@ -2152,7 +2186,10 @@ def main(cli_args: Optional[List[str]] = None):
             # re-scoped to `asset_market == "china"` here to avoid over-blocking
             # partial-trim SELLs for non-China (US/HK) strategies where the
             # lock does not apply.
-            if is_tenure_locked and asset_market == "china" and action == "SELL" and tgt_w > 0:
+            # (L2.40) When portfolio deleveraging is active (`is_portfolio_deleverage`),
+            # partial trims are permitted provided China T+1 gestation (`held_bars >= 1`)
+            # is satisfied.
+            if should_block_tenure and asset_market == "china" and action == "SELL" and tgt_w > 0:
                 action = "HOLD_FILTERED"
                 tgt_w = cur_w
                 delta_w = 0.0
