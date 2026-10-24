@@ -1,4 +1,11 @@
-"""Unit tests for Stage 1 live trading portfolio health & macro regime check script."""
+"""Unit tests for Stage 1 live trading portfolio health & macro regime check script.
+
+NOTE (2026-10-24): a companion file of the same name lives at
+`pipeline/tests/test_live_health_check.py`. The two are NOT duplicates -- they
+cover disjoint surfaces (this one: drawdown tiers, breadth/thrust, volatility,
+gate directives, state I/O, holdings resolution; that one: the Stage-1 -> Stage-2
+argv contract). Keep both, and keep the gate-directive semantics in sync.
+"""
 
 import os
 import sys
@@ -165,7 +172,7 @@ def test_evaluate_realized_volatility():
 
 
 def test_resolve_gate_directive():
-    """Verify gate directives for GO, CAUTION, and NO-GO."""
+    """Verify gate directives for GO, CAUTION, NO-GO, and the fast-recovery override."""
     # Scenario 1: Normal regime -> GO
     dd_normal = {
         "tier": "NORMAL",
@@ -203,16 +210,57 @@ def test_resolve_gate_directive():
     assert code == "CAUTION_DAMPING"
     assert "CAUTION:" in headline
 
-    # Scenario 3: Tier 3 full stop -> NO-GO
+    # Scenario 3: Tier 3 full stop with NO recovery signal -> NO-GO.
+    # (2026-10-24) The counter-check must use a NO-THRUST macro snapshot.
+    # `resolve_gate_directive` computes `fast_rec = fast_recovery_nav or
+    # macro_info["thrust_active"]`, so pairing a TIER_3_HALT / active-freeze
+    # case with `thrust_active=True` no longer reaches this branch at all --
+    # it is the fast-recovery override (Scenario 4 below). Reusing
+    # `macro_bull` here asserted the pre-3f64f83 precedence and is exactly what
+    # broke; see pipeline/tests/test_live_health_check.py, which is the
+    # companion suite covering a disjoint surface (the Stage-2 argv contract).
     dd_tier3 = {
         "tier": "TIER_3_HALT",
         "fast_recovery_nav": False,
         "freeze_remaining_bars": 21,
         "linear_equity_scale": 0.0,
     }
-    code, headline, actions = resolve_gate_directive(dd_tier3, macro_bull, vol_normal)
+    macro_no_thrust = {
+        "thrust_active": False,
+        "thrust": 0.50,
+        "thrust_thresh": 0.60,
+        "target_exposure": 0.80,
+        "breadth_active": False,
+        "breadth": 0.20,
+        "breadth_thresh": 0.30,
+    }
+    code, headline, actions = resolve_gate_directive(dd_tier3, macro_no_thrust, vol_normal)
     assert code == "NO_GO_EMERGENCY"
     assert "NO-GO:" in headline
+    # No override fired, so the halt state must survive untouched.
+    assert dd_tier3["tier"] == "TIER_3_HALT"
+    assert dd_tier3["linear_equity_scale"] == pytest.approx(0.0)
+
+    # Scenario 4: the fast-recovery override OUTRANKS an ACTIVE freeze window
+    # (commit 3f64f83). Both recovery triggers downgrade TIER_3_HALT to Tier-2
+    # defensive AND synchronize dd_info so the persisted account_state.json /
+    # stage1_health_report.json carry the 0.30 scale rather than the stale 0.0.
+    for recovery in (
+        {"fast_recovery_nav": True, "freeze_remaining_bars": 3},
+        {"fast_recovery_nav": False, "freeze_remaining_bars": 3},  # thrust-only
+    ):
+        dd_freeze = {
+            "tier": "TIER_3_HALT",
+            "fast_recovery_nav": recovery["fast_recovery_nav"],
+            "freeze_remaining_bars": recovery["freeze_remaining_bars"],
+            "linear_equity_scale": 0.0,
+        }
+        code, headline, actions = resolve_gate_directive(dd_freeze, macro_bull, vol_normal)
+        assert code == "CAUTION_RECOVERING", recovery
+        assert "TIER 3 DOWNGRADED VIA FAST RECOVERY OVERRIDE" in headline
+        assert dd_freeze["tier"] == "TIER_2_DEFENSIVE"
+        assert dd_freeze["linear_equity_scale"] == pytest.approx(0.30)
+        assert "Fast Recovery Override" in dd_freeze["tier_label"]
 
 
 def test_to_json_serializable():
