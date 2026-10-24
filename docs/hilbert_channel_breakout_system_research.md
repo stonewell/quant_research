@@ -763,7 +763,7 @@ flowchart LR
 | **波次一 (Wave 1)** | `common/indicators.py`<br>`common/tests/` | 1. 落地 `ehlers_hilbert_transform` (4-bar WMA, 7-tap FIR, Homodyne)<br>2. 落地 `hilbert_donchian_channel`<br>3. 单元测试覆盖群延迟对齐、极限周期限幅与 `safe_div` | `pytest common/tests/test_indicators.py -q` |
 | **波次二 (Wave 2)** | `pipeline/research_strategy/rs/`<br>`timing_aspects.py` | 1. 扩充 `StrategyConfig` 希尔伯特配置参数（向后兼容默认关闭）<br>2. 封装 `hilbert_breakout_entry` 与 `hilbert_itrend_exit` 切面<br>3. 实现独立单策略 `HilbertChannelBreakoutStrategy` | `pytest pipeline/research_strategy/tests/test_allocation_templates.py -q` |
 | **波次三 (Wave 3)** | `pipeline/research/blend/`<br>`blend_base.py` | 1. 注入 Anchor 9: 宏观主导周期状态机路由<br>2. 震荡态通道突破熔断禁买与模式突变强平机制<br>3. 瞬时振幅反波动率定仓集成 | `pytest pipeline/tests/ -q --import-mode=importlib` |
-| **波次四 (Wave 4)** | `scripts/`<br>`docs/ruleset/` | 1. `check_live_portfolio_health.py` 接入主导周期与正弦波健康巡检<br>2. `run_live_strategy.py` 实盘工单生成验证<br>3. 生成双语实盘操作规程手册 `rules.md` / `rules_cn.md` | 离线合成数据实测验证<br>`--data-provider synthetic` |
+| **波次四 (Wave 4)** | `scripts/`<br>`docs/ruleset/`（该目录已于 2026-10-23 随 ruleset 产出链删除，重建见 `docs/development_plan.md` `L2.41`） | 1. `check_live_portfolio_health.py` 接入主导周期与正弦波健康巡检<br>2. `run_live_strategy.py` 实盘工单生成验证<br>3. 生成双语实盘操作规程手册 `rules.md` / `rules_cn.md`（已随该链删除，内容见 git 历史 `f4343fc`） | 离线合成数据实测验证<br>`--data-provider synthetic` |
 
 ---
 

@@ -4,7 +4,7 @@
 > **Evaluation Period**: 2022-01-04 → 2026-09-07 (4.7 Years, Multi-generational Walkforward Folds)  
 > **Strategy Implementation**: [`pipeline/research/blend/chan_crisis_shield_blend.py`](file:///home/stone/Work/github/quant/pipeline/research/blend/chan_crisis_shield_blend.py)  
 > **Live Execution Runner**: [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py) | **Macro Health Gate**: [`scripts/check_live_portfolio_health.py`](file:///home/stone/Work/github/quant/scripts/check_live_portfolio_health.py)  
-> **Live Operating Manual**: [`docs/ruleset/chan_crisis_shield_blend/rules.md`](file:///home/stone/Work/github/quant/docs/ruleset/chan_crisis_shield_blend/rules.md)  
+> **Live Operating Manual**: removed with the ruleset pipeline on 2026-10-23 — recoverable from git history at `f4343fc`  
 > **Live Readiness Score**: **80.5 / 100 (Grade B Tactical Aggressive Live Ready)**
 
 ---

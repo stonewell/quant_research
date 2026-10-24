@@ -4,7 +4,7 @@
 > **回测验证周期**: 2022-01-04 → 2026-09-07（跨度 4.7 年，多代际前向步进回测验证）  
 > **策略代码实现**: [`pipeline/research/blend/chan_dual_hybrid_blend.py`](file:///home/stone/Work/github/quant/pipeline/research/blend/chan_dual_hybrid_blend.py)  
 > **通用实盘发单**: [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py) | **宏观健康门禁**: [`scripts/check_live_portfolio_health.py`](file:///home/stone/Work/github/quant/scripts/check_live_portfolio_health.py)  
-> **实盘规则手册**: [`docs/ruleset/chan_dual_hybrid_blend/rules_cn.md`](file:///home/stone/Work/github/quant/docs/ruleset/chan_dual_hybrid_blend/rules_cn.md)  
+> **实盘规则手册**: 该文件已随 ruleset 产出链于 2026-10-23 删除，内容可从 git 历史 `f4343fc` 取回  
 > **实盘就绪度评级**: **87.5 / 100 (Grade B+ 稳健实盘级别 / Institutional Live Ready)**
 
 ---

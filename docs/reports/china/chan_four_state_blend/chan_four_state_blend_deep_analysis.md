@@ -4,7 +4,7 @@
 > **Evaluation Period**: 2022-01-04 → 2026-09-07 (4.7 Years, 18 Walkforward Folds across Full History & OOS)  
 > **Strategy Implementation**: [`pipeline/research/blend/chan_four_state_blend.py`](file:///home/stone/Work/github/quant/pipeline/research/blend/chan_four_state_blend.py)  
 > **Live Execution Runner**: [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py) | **Macro Health Gate**: [`scripts/check_live_portfolio_health.py`](file:///home/stone/Work/github/quant/scripts/check_live_portfolio_health.py)  
-> **Live Operating Manual**: [`docs/ruleset/chan_four_state_blend/rules.md`](file:///home/stone/Work/github/quant/docs/ruleset/chan_four_state_blend/rules.md)  
+> **Live Operating Manual**: removed with the ruleset pipeline on 2026-10-23 — recoverable from git history at `f4343fc`  
 > **Live Readiness Score**: **92.0 / 100 (Grade A+ Institutional Gold Standard)**
 
 ---

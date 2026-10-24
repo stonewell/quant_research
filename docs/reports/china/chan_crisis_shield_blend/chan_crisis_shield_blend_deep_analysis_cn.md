@@ -4,7 +4,7 @@
 > **回测验证周期**: 2022-01-04 → 2026-09-07（跨度 4.7 年，多代际前向步进回测验证）  
 > **策略代码实现**: [`pipeline/research/blend/chan_crisis_shield_blend.py`](file:///home/stone/Work/github/quant/pipeline/research/blend/chan_crisis_shield_blend.py)  
 > **通用实盘发单**: [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py) | **宏观健康门禁**: [`scripts/check_live_portfolio_health.py`](file:///home/stone/Work/github/quant/scripts/check_live_portfolio_health.py)  
-> **实盘规则手册**: [`docs/ruleset/chan_crisis_shield_blend/rules_cn.md`](file:///home/stone/Work/github/quant/docs/ruleset/chan_crisis_shield_blend/rules_cn.md)  
+> **实盘规则手册**: 该文件已随 ruleset 产出链于 2026-10-23 删除，内容可从 git 历史 `f4343fc` 取回  
 > **实盘就绪度评级**: **80.5 / 100 (Grade B 进取战术型实盘级 / Tactical Aggressive Live Ready)**
 
 ---
@@ -148,7 +148,7 @@ $$\text{DSR} = Z\left(\frac{(\widehat{SR} - SR_0)\sqrt{N - 1}}{\sqrt{1 - \wideha
 > **实盘致命风险提示：严禁市价追单！**
 > Alpha#12 的底层逻辑是在标的**放量暴跌**时介入。在 A 股实盘撮合机制中：
 > - 放量下跌日的次日开盘往往伴随激烈的盘口博弈，如果交易员在早盘使用**市价单（Market Order）盲目追单**，极易遭遇盘中高冲击成本与恶劣滑点，瞬间磨损 1%～2% 的理论 Alpha；
-> - **实盘操作铁律**：必须严格遵循 [`docs/ruleset/chan_crisis_shield_blend/rules_cn.md`](file:///home/stone/Work/github/quant/docs/ruleset/chan_crisis_shield_blend/rules_cn.md) 规定，在 **14:20–14:45** 尾盘采用**限价单（Limit Order）挂单于买一价**，或通过 TWAP 算法被动分批成交，严禁盘中急躁追高！
+> - **实盘操作铁律**：原 `docs/ruleset/chan_crisis_shield_blend/rules_cn.md` 已随 ruleset 产出链于 2026-10-23 删除（内容可从 git 历史 `f4343fc` 取回）；其规定为：在 **14:20–14:45** 尾盘采用**限价单（Limit Order）挂单于买一价**，或通过 TWAP 算法被动分批成交，严禁盘中急躁追高！
 
 ---
 
