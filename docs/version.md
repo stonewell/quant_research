@@ -13,18 +13,18 @@
 ```
                 ┌────────────────────────────────────────────────────────┐
                 │          底座引擎版本 (Engine BASE_VERSION)              │
-                │  - BaseBlendAllocationStrategy: v1.5.0                 │
+                │  - BaseBlendAllocationStrategy: v1.6.0                 │
                 │  - AllocationTemplate: v1.0.0                          │
                 └──────────────────────────┬─────────────────────────────┘
                                            │ 继承与多态注入
                                            ▼
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │                          具体策略子类版本 (Strategy Class version)                        │
-│  - ChanRiskManagedBlendStrategy: v1.1.0 [base: v1.5.0]                                 │
-│  - ChanFourStateBlendStrategy:   v1.2.1 [base: v1.5.0]                                 │
-│  - ChanCrisisShieldBlendStrategy: v1.0.1 [base: v1.5.0]                                │
-│  - ChanDualHybridBlendStrategy:  v1.0.0 [base: v1.5.0]                                 │
-│  - GenericBlendStrategy:         v1.0.0 [base: v1.5.0]                                 │
+│  - ChanRiskManagedBlendStrategy: v1.1.0 [base: v1.6.0]                                 │
+│  - ChanFourStateBlendStrategy:   v1.2.1 [base: v1.6.0]                                 │
+│  - ChanCrisisShieldBlendStrategy: v1.0.1 [base: v1.6.0]                                │
+│  - ChanDualHybridBlendStrategy:  v1.0.0 [base: v1.6.0]                                 │
+│  - GenericBlendStrategy:         v1.0.0 [base: v1.6.0]                                 │
 │  - 9 大静态配置模板 (EqualWeight, RiskParity ...): v1.0.0                             │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -52,6 +52,51 @@
 ---
 
 ## 2. 底座引擎核心版本沿革 (Base Engine Changelog)
+
+### `BaseBlendAllocationStrategy`: `v1.6.0` (2026-10-24)
+* **变更类型**：Minor 组合级回撤去杠杆重构、调仓惯性入场窄带消除与企业行动重标定审计出口升级（向后兼容）。
+* **前序版本**：`v1.5.0`
+* **对应提交/变更范围**：`pipeline/research/blend/blend_base.py`，`common/allocation_templates.py`，`common/position_lifecycle.py`，`scripts/run_live_strategy.py`，`common/data.py`，`scripts/rebase_auto_adjust_cache.py`，`scripts/repair_qfq_alignment.py`
+* **单测覆盖**：
+  - `common/tests/test_strategy_versioning.py` (PASS)
+  - `pipeline/research_strategy/tests/test_blend_strategy_versioning.py` (PASS)
+  - `common/tests/test_data.py` (PASS)
+  - `common/tests/test_position_lifecycle.py` (PASS)
+  - `pipeline/research_strategy/tests/test_blend_strategies.py` (PASS)
+  - `pipeline/tests/test_live_path_hardening.py` (PASS)
+
+#### 核心升级特性详述：
+1. **组合级回撤去杠杆与现金代理清扫（`L2.40` Option (b) 落地）**：
+   - 底座新增 `_apply_portfolio_deleverage` 原子算子，设立与 `daily_weights` 同步追踪的未去杠杆期望权重帧 `desired_weights`。
+   - 逐资产惯性门 `_step_asset_inertia` 统一参照 `desired_weights.iloc[t-1]` 评估，写回亦记录 `desired_weights`，去杠杆作为唯一的原子后处理生效（`daily_weights.loc[date] = _apply_portfolio_deleverage(desired_weights.loc[date], ...)`）。
+   - 彻底解决由于惯性门参照去杠杆权重导致的 `(scale_dd)^k` 复合萎缩缺陷，并杜绝逐资产惯性门吞掉 Tier 1/2 回撤缩放的风险。
+   - 在 `common/position_lifecycle.py` 中增加 `is_portfolio_deleverage: bool = False` 通道，带只减不增纵深防御（`delta_w < 0.0 and 0.0 <= raw_target_weight <= state.current_weight`）；在 `scripts/run_live_strategy.py` 中当 `live_scale < 0.999` 时置位，旁路逐资产惯性与最低持仓锁定（同时严格保留中国 A 股 T+1 `held_bars < 1` 妊娠锁）。
+2. **回测与实盘新建仓门槛严格对齐（`L2.38` 落地）**：
+   - 在 `common/allocation_templates.py:_step_asset_inertia` 中直接赋值 `buy_thresh[new_entry_mask] = entry_threshold`，废止旧有的 `np.minimum(thresh_t[new_entry_mask], entry_threshold)`。
+   - 彻底消除回测在 `[2.5%, entry_threshold)` 窄带内建仓而实盘拒单的口径差异。
+3. **企业行动与自动复权重标定显式审计路径（`L2.33` 落地）**：
+   - 在 `common/data.py` 中新增 `CachedDataProvider.rebase_corporate_action`，强制要求合规审计理由（`len >= 10`），带 `[CORPORATE_ACTION_REBASE]` 前缀写入。
+   - 新增 CLI 运维工具 `scripts/rebase_auto_adjust_cache.py`，日常行情抓取保持对隐式历史重写的硬拦截。
+4. **全量 58 份策略 JSON 导出同步刷新**：
+   - 重新执行 `--dump-strategies`，6 份旗舰 blend 策略配置导出统一刷新为 `base_version = "1.6.0"`。
+
+---
+
+### `BaseBlendAllocationStrategy`: `v1.5.0` (2026-10-23)
+* **变更类型**：Minor 实盘四状态调仓防抖加固、防御桶平滑钳制与推力迟滞过滤（向后兼容）。
+* **前序版本**：`v1.4.0`
+* **对应提交/变更范围**：`pipeline/research/blend/blend_base.py`，`pipeline/research_strategy/strategies_config.json`，`common/position_lifecycle.py`，`scripts/run_live_strategy.py`
+* **单测覆盖**：
+  - `common/tests/test_strategy_versioning.py` (PASS)
+  - `pipeline/research_strategy/tests/test_blend_strategy_versioning.py` (PASS)
+  - `pipeline/research_strategy/tests/test_cfsb_deployed_regime_mode.py` (PASS)
+
+#### 核心升级特性详述：
+1. **防御桶平滑钳制 (`blend_bucket_renorm_max_delta`)**：每根 K 线风格桶预算相对上一根桶权重的最大变动量进行钳制，消除突变抖动。
+2. **推力迟滞过滤 (`blend_enable_regime_hysteresis`)**：进入阈值 0.62 / 退出阈值 0.58，消除在 0.60 临界附近的单日频繁翻转。
+3. **实盘调仓锁与止损快通道豁免**：修复最低持仓锁误拦截止损/熔断清仓的问题，确保风险退出路径绝对畅通。
+
+---
 
 ### `BaseBlendAllocationStrategy`: `v1.4.0` (2026-10-21)
 * **变更类型**：Minor 生产环境参数固化与实盘 Track T 全流程微观结构启用升级（向后兼容）。
@@ -191,12 +236,12 @@
 
 | 策略类名 (`Strategy Class`) | 内部标识 (`Strategy ID`) | 当前版本 (`version`) | 所属底座版本 (`base_version`) | 复合版本标识 (`version_string`) | 核心流派与组合机制说明 |
 | :--- | :--- | :---: | :---: | :---: | :--- |
-| `ChanRiskManagedBlendStrategy` | `chan_risk_managed_blend` | **`1.1.0`** | `1.5.0` | `v1.1.0 [base: v1.5.0]` | 缠论结构与风控增强多流派配置策略，主打回撤控制与稳健复合收益 |
-| `ChanFourStateBlendStrategy` | `chan_four_state_blend` | **`1.2.1`** | `1.5.0` | `v1.2.1 [base: v1.5.0]` | 四状态缠论状态机驱动（趋势/盘整/背驰/反转）动态调权配置旗舰策略（权重模式 `regime_ic_ir_hybrid` 为 `rolling_ic_ir` 默认值的已记录例外，见 §8） |
-| `ChanCrisisShieldBlendStrategy` | `chan_crisis_shield_blend` | **`1.0.1`** | `1.5.0` | `v1.0.1 [base: v1.5.0]` | 危机防御型盾牌策略，内置极端熊市熔断、防崩盘流动性保护与对冲卸载 |
-| `ChanDualHybridBlendStrategy` | `chan_dual_hybrid_blend` | **`1.0.0`** | `1.5.0` | `v1.0.0 [base: v1.5.0]` | 双轨混动策略，结合缠论短波段择时与中长周期资产动量/反转配置 |
-| `GenericBlendStrategy` | `generic_blend` | **`1.0.0`** | `1.5.0` | `v1.0.0 [base: v1.5.0]` | 通用多流派 Blend 组合框架，支持任意配置文件的子策略插拔与动态正交加权 |
-| `ChanFourStateShieldBlendStrategy` | `chan_four_state_shield_blend` | **`1.0.0`** | `1.5.0` | `v1.0.0 [base: v1.5.0]` | 四状态状态机与全景危机防护装甲合体策略 |
+| `ChanRiskManagedBlendStrategy` | `chan_risk_managed_blend` | **`1.1.0`** | `1.6.0` | `v1.1.0 [base: v1.6.0]` | 缠论结构与风控增强多流派配置策略，主打回撤控制与稳健复合收益 |
+| `ChanFourStateBlendStrategy` | `chan_four_state_blend` | **`1.2.1`** | `1.6.0` | `v1.2.1 [base: v1.6.0]` | 四状态缠论状态机驱动（趋势/盘整/背驰/反转）动态调权配置旗舰策略（权重模式 `regime_ic_ir_hybrid` 为 `rolling_ic_ir` 默认值的已记录例外，见 §8） |
+| `ChanCrisisShieldBlendStrategy` | `chan_crisis_shield_blend` | **`1.0.1`** | `1.6.0` | `v1.0.1 [base: v1.6.0]` | 危机防御型盾牌策略，内置极端熊市熔断、防崩盘流动性保护与对冲卸载 |
+| `ChanDualHybridBlendStrategy` | `chan_dual_hybrid_blend` | **`1.0.0`** | `1.6.0` | `v1.0.0 [base: v1.6.0]` | 双轨混动策略，结合缠论短波段择时与中长周期资产动量/反转配置 |
+| `GenericBlendStrategy` | `generic_blend` | **`1.0.0`** | `1.6.0` | `v1.0.0 [base: v1.6.0]` | 通用多流派 Blend 组合框架，支持任意配置文件的子策略插拔与动态正交加权 |
+| `ChanFourStateShieldBlendStrategy` | `chan_four_state_shield_blend` | **`1.0.0`** | `1.6.0` | `v1.0.0 [base: v1.6.0]` | 四状态状态机与全景危机防护装甲合体策略 |
 
 ---
 
@@ -2681,3 +2726,205 @@ exit: 1
 | 九套件合计（见 17.5） | **1931 passed, 0 failed, 1 xfailed, 1 skipped** |
 | `grep -rn --include=*.py 'date.today()' scripts/` | 非注释行**零命中**（6 处命中全为注释/文档字符串） |
 | `python -c "count dump strategy_version"` | 58 份 dump，`1.1.0` 4 份（3 份本轮 + 1 份既有），`1.0.0` 52 份，`1.0.1` 1 份，`1.2.1` 1 份 |
+
+---
+
+## 18. 底座引擎升级 v1.6.0、组合级去杠杆 (b) 方案闭环与数据/实盘/回测对齐结案（`L2.8`, `L2.33`, `L2.37`, `L2.38`, `L2.39`, `L2.40`, `L2.42`）(2026-10-24)
+
+本节记录 2026-10-24 完成的底座引擎 `BaseBlendAllocationStrategy.BASE_VERSION` 由 `1.5.0` 升至 `1.6.0` 的核心改动，以及 Track L 关键任务 `L2.8`、`L2.33`、`L2.37`、`L2.38`、`L2.39`、`L2.40`、`L2.42` 的实施与闭环验收。
+
+```
+                ┌────────────────────────────────────────────────────────┐
+                │          底座引擎版本 (Engine BASE_VERSION)              │
+                │  - BaseBlendAllocationStrategy: v1.5.0 → v1.6.0        │
+                └──────────────────────────┬─────────────────────────────┘
+                                           │
+         ┌─────────────────────────────────┴─────────────────────────────────┐
+         ▼                                                                   ▼
+┌─────────────────────────────────┐               ┌─────────────────────────────────┐
+│     L2.38 建仓门槛口径对齐        │               │     L2.40 组合级去杠杆 (b) 方案   │
+│ buy_thresh = entry_threshold    │               │ desired_weights 追踪 + 现金代理  │
+│ 彻底消除 [2.5%, entry) 窄带分歧  │               │ 消除 (scale_dd)^k 萎缩与风控稀释 │
+└─────────────────────────────────┘               └─────────────────────────────────┘
+```
+
+### 18.1 `L2.38` 回测与实盘新建仓门槛口径对齐 (Backtest & Live New-Entry Threshold Parity)
+
+- **缺陷背景与根因**：
+  - 在此前回测逻辑中（`common/allocation_templates.py:_step_asset_inertia`），新开仓门槛使用了自适应波动率阈值与指定建仓阈值的较小值：
+    `buy_thresh[new_entry_mask] = np.minimum(thresh_t[new_entry_mask], entry_threshold)`
+  - 由于自适应阈值 `thresh_t` 动态截断在 `[2.5%, 8.0%]` 之间（当基准为 5% 时），若策略设置 `entry_threshold = 0.05`（或 0.03），则当低波标的 `thresh_t` 下探至 2.5% 时，回测门槛下探至 2.5%，而实盘交易（`scripts/run_live_strategy.py` 与 `common/position_lifecycle.py`）严格使用固定的 `entry_threshold`（如 5% 或 3%）。
+  - 这导致在 `[2.5%, entry_threshold)` 这一窄带内，回测会合法开仓，而实盘会被 `HOLD_FILTERED`（理由：`防微量试错损耗`）拦截拒单，且日常监控不报警（两边各执己词均判定自身“合规”）。
+- **对齐改造**：
+  - 在 `common/allocation_templates.py:_step_asset_inertia` 中直接赋值：
+    ```python
+    if entry_threshold is not None:
+        new_entry_mask = (current_w[risky_symbols] <= 1e-4)
+        buy_thresh[new_entry_mask] = entry_threshold
+    ```
+  - 彻底废除 `np.minimum(thresh_t, entry_threshold)`，消除了 `[2.5%, entry_threshold)` 窄带内的口径漂移，实现回测与实盘在新建仓准入门槛上的比特级严格对齐。
+
+---
+
+### 18.2 `L2.40` 组合级去杠杆与现金代理清扫（Option (b) Portfolio-Level Deleverage）
+
+- **缺陷背景与审计结论（承接 §16.15.16）**：
+  - 多级回撤熔断（Circuit Breaker Tier 1/2）初版实现为逐资产的比例缩放（`raw_w[risky] = raw_blend[risky] * scale_dd` 与实盘 `current_targets = current_targets * live_scale`）。
+  - **严重缺陷一（风控被换手门吞噬）**：每一笔减仓（trim）都必须过资产级换手惰性门（`inertia_threshold`），小于门槛的减仓被静默拒绝（返回 `HOLD`），导致实盘账户风险未按声明缩减。
+  - **严重缺陷二（朴素后处理复合萎缩 Bug）**：若仅在惯性后简单乘 `scale_dd`，由于惯性参照 `daily_weights.iloc[t-1]`（已缩放权重）与未缩放的 full 期望比对，在差额小于买入门槛时继续维持旧权重，导致每日被乘一次 `scale_dd`，形成 `(scale_dd)^k` 灾难性指数复合萎缩（10% → 9% → 8.1% → 7.29%...）。
+  - **两路分歧**：回测在 `dd > 0.17`（`scale_dd < 0.30`）即短路旁路惯性，而实盘在 `dd >= 0.20`（Tier 3）才短路，导致 `dd ∈ (0.17, 0.20)` 区间两端行为相反。
+- **架构落地（用户裁定方案 (b)）**：
+  1. **未去杠杆期望权重追踪与原子后处理 (`pipeline/research/blend/blend_base.py`)**：
+     - 新增独立未去杠杆期望状态追踪矩阵 `desired_weights`（与 `daily_weights` 同尺寸初始化为 0.0）。
+     - 逐资产调仓惯性 `_step_asset_inertia`、incumbent 保护、建仓与退出冷却统一参照 `desired_weights.iloc[t-1]` 评估，写回亦记录 `desired_weights`。
+     - 组合去杠杆成为唯一的原子后处理算子 `_apply_portfolio_deleverage`：
+       ```python
+       def _apply_portfolio_deleverage(desired_row, risky_symbols, cash_proxy, scale):
+           out = desired_row.copy()
+           if scale < 1.0:
+               s_clamped = max(0.0, float(scale))
+               out[risky_symbols] = out[risky_symbols] * s_clamped
+               if cash_proxy and cash_proxy in out.index:
+                   out[cash_proxy] = max(0.0, 1.0 - float(out[risky_symbols].sum()))
+           return out
+       ```
+       并在每日步进末端由 `daily_weights.loc[date] = _apply_portfolio_deleverage(...)` 统一生成真实持有权重。
+     - 彻底根除 `(scale_dd)^k` 复合萎缩，保持子策略资产相对配比，闲置资金自动清扫至 `cash_proxy`（`BIL` / `511880` / `GC001`）。
+  2. **生命周期状态机风控减仓通道与纵深防御 (`common/position_lifecycle.py`)**：
+     - `step_position_lifecycle` 新增 `is_portfolio_deleverage: bool = False` 参数。
+     - 实施只减不增的**纵深防御校验**：
+       ```python
+       if is_portfolio_deleverage:
+           if not (delta_w < 0.0 and 0.0 <= raw_target_weight <= state.current_weight):
+               is_portfolio_deleverage = False
+       ```
+       杜绝任何利用去杠杆标志进行逆向加仓或非法建仓的可能。
+     - 当 `is_portfolio_deleverage=True` 时，放行减仓订单，旁路资产级换手惰性门与最低持有期锁定（`min_holding_bars`），生成 action 为 `SELL`、理由为 `组合级去杠杆风控减仓` 的合规调仓指令。
+  3. **实盘工单生成器串联与 T+1 铁律守卫 (`scripts/run_live_strategy.py`)**：
+     - 当检测到账户或健康报告 `live_scale < 0.999` 时，组合级计算一次性布尔 `is_portfolio_deleverage = True`，并在 Phase 3 / 逐标的状态机评估中透明下传。
+     - 在第二层 tenure 拦截处增加兜底护栏：
+       `is_china_t1_gestation = (asset_market == "china" and state.held_bars < 1)`
+       `should_block_tenure = is_china_t1_gestation or (is_tenure_locked and not is_portfolio_deleverage)`
+     - 在放行风控减仓的同时，**坚决守住中国 A 股交易所 T+1 交易制度底线**（买入当日 `held_bars < 1` 绝对不可卖出）。
+
+---
+
+### 18.3 `L2.33` 非中国/自动复权数据源显式重标定出口 (Corporate-Action / Auto-Adjust Rebase Path)
+
+- **问题背景**：
+  - `L2.32` 在缓存底座（`common/duckdb_cache.py:store_bars`）落地了严格的值级只追加保护门禁（`_HISTORY_REWRITE_RTOL = 1e-9`），杜绝隐式改写既有历史行情。
+  - 然而非中国数据源（如 `yfinance` 的 `auto_adjust=True`）在除权除息时会合法、周期性地追溯调整全历史复权收盘价。缺少受控的重标定通道会导致 `fetch_universe` 遇到常规分红即触发 `HistoryRewriteRefused` 硬报错崩溃。
+- **解决方案与交付**：
+  1. **管理型显式重标定接口 (`common/data.py:CachedDataProvider.rebase_corporate_action`)**：
+     - 新增合规管理方法：`rebase_corporate_action(symbol, start, end, reason, interval="1d")`。
+     - 严格要求调用方提供长度 $\ge 10$ 字符的合规审计原因（`reason`），禁止空串或敷衍标记。
+     - 内部以 `allow_history_rewrite=True` 与 `rewrite_reason=f"[CORPORATE_ACTION_REBASE] {reason.strip()}"` 调用 `store_bars`，完成全量除权调整并记录审计证据。
+     - 日常 `fetch_ohlcv` 与 `fetch_universe` 维持 `allow_history_rewrite=False`，对未申报的历史篡改坚决 Fail-Loud。
+  2. **CLI 运维工具 (`scripts/rebase_auto_adjust_cache.py`)**：
+     - 提供交互式与批处理命令行入口：
+       `python scripts/rebase_auto_adjust_cache.py --provider yfinance --symbol AAPL --reason "Q3 cash dividend split auto-adjust rebase"`
+     - 补齐离线测试用例 `test_cached_data_provider_rebase_corporate_action_*`，验证审计理由门禁、重标定成功与元数据留痕。
+
+---
+
+### 18.4 `L2.8` 生产 DuckDB 前复权对齐修复与闭环结案 (Production DuckDB QFQ Repair Closure)
+
+- **事故回溯**：
+  - 2026-10-23 21:26 曾对生产库执行 QFQ 修复，但由于当时只追加门禁未下沉至底座，21:38:50 生产库被外部未受保护流程再次写入，导致 5 只标的中的 4 只被逐字节还原回受损状态（`L2.8` 重新打开）。
+- **最终执行与复核（2026-10-24）**：
+  - 在 `L2.32` 底座值级门禁与事务保护确立后，运维团队在独占停机窗口下重新执行生产修复：
+    `python scripts/repair_qfq_alignment.py --db data/cache.duckdb --baseline data/cache.duckdb.bak --additional-baseline data/cache.duckdb.bak.20261022-213155 --apply --i-know-this-is-production --backup-dir data`
+  - **修复执行明细（5 ops / 5,973 行）**：
+    1. `600660.SH` restore: 883 行
+    2. `601225.SH` restore: 1,417 行
+    3. `601288.SH` restore: 1,417 行
+    4. `601398.SH` restore: 1,417 行
+    5. `601872.SH` restore: 839 行
+  - **哈希与完整性指纹验证**：
+    - 修复前冷备：`data/cache.duckdb.bak.20261024-125524`（SHA256: `38abb80c2e98cc9bf50340750aab2a0c767ffa214208488ae75b20e806a726b6`）。
+    - 修复后生产库：`data/cache.duckdb`（SHA256: `9e475f33f2d05ad245342b3b6bb3b0ac5b3f8ece9189c6613ed5621676fd6866`）。
+    - 库结构与行数不变式：总行数严格守恒在 **568,474 行**，318 对 `(provider, symbol)` 组完全守恒。
+    - 收尾 Dry-run 审查：以去除 `--apply` 后的命令重新扫描，输出 `nothing to repair: the census found no damage block in any symbol of FuyaoDataProvider`，**退出码 0，残差 `residual_damage = 0`**。
+    - `L2.8` 彻底圆满闭环结案。
+
+---
+
+### 18.5 版本双轴演进与配置同步验证 (`AGENTS.md` §7 闭环)
+
+| 构件 / 策略 | 旧版本 | 新版本 | 升级依据与影响范围 |
+| :--- | :---: | :---: | :--- |
+| `BaseBlendAllocationStrategy.BASE_VERSION` | `1.5.0` | **`1.6.0`** | `L2.38` & `L2.40`：底层通用惯性门对齐与组合级回撤去杠杆重构 |
+| `ChanRiskManagedBlendStrategy` | `v1.1.0 [base: v1.5.0]` | **`v1.1.0 [base: v1.6.0]`** | 继承底座 v1.6.0，策略子类逻辑无改动 |
+| `ChanFourStateBlendStrategy` | `v1.2.1 [base: v1.5.0]` | **`v1.2.1 [base: v1.6.0]`** | 继承底座 v1.6.0，策略子类逻辑无改动 |
+| `ChanCrisisShieldBlendStrategy` | `v1.0.1 [base: v1.5.0]` | **`v1.0.1 [base: v1.6.0]`** | 继承底座 v1.6.0，策略子类逻辑无改动 |
+| `ChanDualHybridBlendStrategy` | `v1.0.0 [base: v1.5.0]` | **`v1.0.0 [base: v1.6.0]`** | 继承底座 v1.6.0，策略子类逻辑无改动 |
+| `GenericBlendStrategy` | `v1.0.0 [base: v1.5.0]` | **`v1.0.0 [base: v1.6.0]`** | 继承底座 v1.6.0，策略子类逻辑无改动 |
+| `ChanFourStateShieldBlendStrategy` | `v1.0.0 [base: v1.5.0]` | **`v1.0.0 [base: v1.6.0]`** | 继承底座 v1.6.0，策略子类逻辑无改动 |
+
+- **配置持久化刷新**：已完整运行 `pipeline/research_strategy/run_research_strategy.py --dump-strategies`，`pipeline/research_strategy/results/strategy_dumps/` 下全量 58 份策略 JSON 文件中，6 份 blend 策略均更新为 `base_version: "1.6.0"`，其余 52 份非 blend 策略保持 `base_version: null`。
+- **离线测试全绿验证**：
+  - `common/tests/test_strategy_versioning.py` (PASS)
+  - `pipeline/research_strategy/tests/test_blend_strategy_versioning.py` (PASS)
+  - `common/tests/test_data.py` (PASS)
+  - `common/tests/test_position_lifecycle.py` (PASS)
+  - `pipeline/research_strategy/tests/test_blend_strategies.py` (PASS)
+  - `pipeline/tests/test_live_path_hardening.py` (PASS)
+  - `pipeline/tests/test_live_health_check.py` (PASS)
+  - `backtester/tests/test_run_backtest.py` (PASS)
+  - 核心套件 161 项单测与回测/健康套件 108 项单测 100% 离线通过，0 失败。
+
+---
+
+### 18.6 `L2.42` Tier-3 快速恢复两端口径严格对齐 (Tier-3 Fast Recovery Override Parity across Stage 1 & Stage 2)
+
+- **缺陷背景与两端分歧根因**：
+  - 在此前实现中，Stage 1 宏观健康门禁（`scripts/check_live_portfolio_health.py`）在快速恢复生效（`fast_rec = dd_info["fast_recovery_nav"] or macro_info["thrust_active"]`）时，会将告警降级为 `code = "CAUTION_RECOVERING"`，headline 声明 `TIER 3 DOWNGRADED VIA FAST RECOVERY OVERRIDE`，并建议进入 Tier 2 防御模式（ChanVaaCompound with 70% cash / 30% 股票仓位）。
+  - 然而在健康脚本内部，`linear_equity_scale` 却依然硬编码为 `0.0`；同时在 Stage 2 实盘工单生成器（`scripts/run_live_strategy.py`）中，只要检测到 `circuit_tier == "TIER_3_HALT"` 或 `freeze_rem > 0`，就无条件短路并将 `current_targets` 置为全零（100% 现金清算）。
+  - 这导致健康报告声称“已降级并进入防御仓位”，实盘工单却依然执行 100% 现金清仓，出现严重的跨阶段口径背离与实盘执行混乱。
+- **用户裁定方案 (a) 降级联动防御性恢复落地**：
+  1. **Stage 1 门禁指令与状态同步 (`scripts/check_live_portfolio_health.py:resolve_gate_directive`)**：
+     - 将快速恢复判定 `if (tier == "TIER_3_HALT" or freeze > 0) and fast_rec:` 置于普通 Tier-3 紧急熔断分支之前，享有绝对优先权；
+     - 触发快速恢复时，不仅返回 `code = "CAUTION_RECOVERING"`，且直接将 `dd_info["tier"]` 状态同步降级为 `"TIER_2_DEFENSIVE"`，`dd_info["tier_label"]` 降级为 `"🟡 TIER 2 (Defensive Mode / Fast Recovery Override)"`，并将 `dd_info["linear_equity_scale"]` 精准赋值为 `0.30`（与 70% 现金防御声明比特级对齐），确保写入 `stage1_health_report.json` 与 `account_state.json` 的指标完全自洽。
+  2. **Stage 2 工单生成器防御性仓位与去杠杆通道联动 (`scripts/run_live_strategy.py`)**：
+     - 解析门禁码与熔断层级：`is_recovering = (circuit_tier == "CAUTION_RECOVERING" or gate_code == "CAUTION_RECOVERING")`；
+     - 豁免 100% 现金清仓：`is_circuit_halt` 与 `macro_passed` 在 `is_recovering=True` 时不再被 Tier 3 冻结；
+     - 激活 30% 仓位缩放与去杠杆：在目标仓位处理中，若 `is_recovering`，读取 `rec_scale = 0.30`，置位 `is_portfolio_deleverage = True`，将风险标的按 30% 线性缩放（`current_targets[risky] *= rec_scale`），并将剩余 70% 资产清扫至 `cash_proxy`（`BIL`/`511880`/`GC001`）；
+     - `is_portfolio_deleverage` 参数同步透传给 `step_position_lifecycle` 与持仓锁校验，合规放行去杠杆减仓，实现实盘工单与健康门禁在快速恢复期的比特级双端闭环。
+
+---
+
+### 18.7 `L2.39` 实盘持仓锁定 tenure 参数后缀兼容与解析对齐 (Tenure Lock Parameter Suffix Alignment)
+
+- **缺陷背景与根因**：
+  - 在 `scripts/run_live_strategy.py` 的持仓锁解析函数 `resolve_min_holding_bars(params, cli_override, default=2)` 中，此前仅尝试 `resolve_blend_param(params, "min_holding_bars", ...)` 以及扫描 `k.endswith("_min_holding_bars")`。
+  - 然而在策略配置文件 `pipeline/research_strategy/strategies_config.json` 中，`chan_four_state_execution` 的配置键名为 `chan_fse_min_hold_bars: 5`（缩写后缀 `_min_hold_bars` 而非 `_min_holding_bars`）。
+  - 这导致解析器无法匹配该参数，无声回落到 fallback `default=2`，实盘出票持仓锁定为 2 根 bar，而策略设计与配置声明为 5 根 bar。
+- **采纳方案 (b) 兼容扩展与对齐改造**：
+  - 在 `scripts/run_live_strategy.py:resolve_min_holding_bars` 中：
+    1. 增加针对 `min_hold_bars` 的 `resolve_blend_param` 解析；
+    2. 扩展键名扫描条件为 `(k.endswith("_min_holding_bars") or k.endswith("_min_hold_bars"))`。
+  - 既完整尊重了子策略 FSM 层的配置命名历史（解耦各策略子模块的独立参数风格），又确保实盘工单生成器精准捕获 `chan_fse_min_hold_bars: 5`，使持仓锁周期严格解析为 5，消除了因后缀拼写差异导致的非预期锁定周期缩短。
+
+---
+
+### 18.8 `L2.37` Walkforward 回测产物成交后真实权重持久化 (Persist Post-Execution actual_weights in Walkforward Backtests)
+
+- **缺陷背景与根因（承接 §16.15.13 稳态换手测量警示）**：
+  - 在此前 Walkforward 滚动回测实现中（`backtester/run_backtest.py`），只有 `--mode standard` 会持久化输出 `backtest_weights.csv`。
+  - 在 `--mode walkforward` 模式下，`_evaluate_walkforward_fold` 在打包 `fold_metrics` 时丢弃了 `result["actual_weights"]`，随后的 `folds_clean` 又仅保留标量字典，导致回测产物（`walkforward_summary.json`、`walkforward_report.csv`、`walkforward_rebalances.csv`）中完全缺失成交后真实权重（Post-Execution Actual Weights）。
+  - 研究员与风控审计人员在核验真实风险暴露、真实换手轨迹与去杠杆效果时，无法直接读取历史权重矩阵，只能整批重跑全量回测。
+- **轻量持久化与零副作用落地**：
+  1. **折级指标保留与异常兜底**：
+     - 在 `_evaluate_walkforward_fold` 中保留 `fold_metrics["actual_weights"] = result.get("actual_weights", pd.DataFrame())`；
+     - 在 `_nan_fold_metrics()` 补齐空 `DataFrame()`，确保异常或失败折满足键名契约。
+  2. **干净折隔离与既有产物守恒**：
+     - 在生成汇总表时，`folds_clean` 显式过滤掉 `rebalance_report` 与 `actual_weights`：
+       `folds_clean = [{k: v for k, v in f.items() if k not in ("rebalance_report", "actual_weights")} for f in folds]`
+     - 确保 `walkforward_report.csv` 与 `walkforward_summary.json` 等既有标量指标产物**比特级严格守恒**。
+  3. **标准权重矩阵导出 (`walkforward_weights.csv`)**：
+     - 遍历各 fold 的 `actual_weights`，在首列插入整数 `fold` 索引标识当前切片折次；
+     - 纵向拼接后以 `to_csv(..., index=True, index_label="date")` 格式导出至结果目录下的 `walkforward_weights.csv`；
+     - 离线测试全绿：验证了既有标量产物完全不变，且 `walkforward_weights.csv` 正确生成、包含 `fold` 与日期索引，彻底满足了 Walkforward 真实暴露的持久化复核需求。
+  4. **版本轴审计**：
+     - 本项仅改进回测引擎外部导出包装，未触及 `AllocationTemplate` 与 `BaseBlendAllocationStrategy` 算法底座，按照 `AGENTS.md` §7 规范，无需升级 `BASE_VERSION` 或 `version`。
+
