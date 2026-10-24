@@ -16,9 +16,13 @@ Example:
 import argparse
 import copy
 import json
+import multiprocessing
 import os
+import random
 import sys
 import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 
 import numpy as np
 import pandas as pd
@@ -60,6 +64,51 @@ RESULTS_DIR = default_results_dir(__file__)
 DATA_DIR = shared_data_dir()
 
 
+# --------------------------------------------------------------------------- #
+# (L2.3, design §11) BACKTEST FRESHNESS GUARD -- strengthened by `L2.5`
+# --------------------------------------------------------------------------- #
+#: The one legal `expected_last_session` value on the backtest side of the boundary.
+_LEGAL_BACKTEST_SESSION = None
+
+
+class BacktestSessionLeakError(RuntimeError):
+    """A non-None `expected_last_session` reached a backtest data load.
+
+    Subclasses `RuntimeError` so existing callers/tests that catch the historical
+    type keep working, while giving the failure a name an operator can grep for.
+    """
+
+
+def backtest_expected_last_session(value=_LEGAL_BACKTEST_SESSION):
+    """Pass `expected_last_session=None` into the cache from a BACKTEST, or fail.
+
+    The whole market-clock feature exists because live runs must demand a specific
+    session; a backtest must never do so, otherwise its results become a function of
+    the wall clock (today's date decides whether a bar is "covered" -> a re-fetch ->
+    potentially different data and different numbers for the same command). There is
+    therefore exactly one legal value on this side of the boundary: `None`.
+
+    (`L2.5`) The rejection is on the VALUE, so **any** non-None argument fails --
+    `0`, `""`, `False`, a `datetime.date`, a `pd.Timestamp` or a wall-clock-derived
+    string are all a real session request in disguise. There is deliberately no
+    truthiness/type check that could let a falsey non-None value through.
+
+    Call sites use `expected_last_session=backtest_expected_last_session()`, so any
+    future edit that tries to thread a real session in here raises immediately instead
+    of silently making backtests non-reproducible.
+    `backtester/tests/test_backtest_freshness_guard.py` asserts every load call in
+    this file carries that marker (with NO argument), and
+    `pipeline/tests/test_live_market_clock_wiring.py` pins the static
+    "no live-clock call on the backtest side" guardrail.
+    """
+    if value is not _LEGAL_BACKTEST_SESSION:  # identity, not equality: `0 == False`
+        raise BacktestSessionLeakError(
+            "Backtests must pass expected_last_session=None (design §11): a real session makes "
+            f"cache coverage, and therefore the backtest result, depend on the wall clock (got {value!r})."
+        )
+    return _LEGAL_BACKTEST_SESSION
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Standalone Basket Allocation Backtester")
     p.add_argument("--strategy-file", required=True, help="Path to strategy.json file exported by strategy_generator")
@@ -95,6 +144,55 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Minimum amount of shares to trade each time (default: 1). Fractional share trading is not allowed.")
     p.add_argument("--min-weight-change", type=float, default=0.0,
                    help="Minimum weight change threshold (e.g. 0.02) to trigger a position rebalance, suppressing passive drift churn.")
+    p.add_argument("--execution-price", type=str, default="close",
+                   choices=["close", "next_open", "next_vwap", "intraday_twap"],
+                   help="WHEN a rebalance signal is filled (task B3.1). 'close' (default) fills the "
+                        "signal dated T at T's close -- the pre-B3.1 engine, bit-for-bit. 'next_open' "
+                        "queues it at T's close and fills at T+1's open, so an overnight gap hits the "
+                        "strategy and the trade is booked on T+1 (one-word limit boards and suspended "
+                        "bars DEFER the order to the next tradable session; every deferral is written "
+                        "to the deferral_report). 'next_vwap' does the same at the execution day's "
+                        "amount/volume VWAP, and 'intraday_twap' at the mean of its 5m typical prices. "
+                        "The last two need data this CLI does not load (a VWAP/Amount column, and 5m "
+                        "bars respectively) and fail with an explicit ValueError rather than silently "
+                        "degrading to another price.")
+    p.add_argument("--market-impact", action="store_true",
+                   help="(B3.2) Charge an Almgren-Chriss SQUARE-ROOT temporary market impact on every "
+                        "fill: cost = notional * sigma * gamma * sqrt(shares / ADV20), where sigma is the "
+                        "symbol's daily return vol over the past 20 sessions and ADV20 the mean volume "
+                        "over the past 20 sessions (both strictly prior to the fill, so no look-ahead). "
+                        "Charged to CASH on top of --commission/--slippage (a size-dependent execution "
+                        "concession, not a duplicate of the flat bps terms) and reported in the "
+                        "`slippage` column plus a `total_market_impact` total. OFF by default, which is the "
+                        "pre-B3.2 engine bit-for-bit.")
+    p.add_argument("--market-impact-gamma", type=float, default=1.0,
+                   help="(B3.2) Dimensionless square-root impact prefactor (default: 1.0, the conservative "
+                        "end of the Toth et al. 2011 / Almgren et al. 2005 range). Only used with "
+                        "--market-impact. 0.0 disables the charge while keeping the model wired.")
+    p.add_argument("--max-volume-participation", type=float, default=None, metavar="PCT",
+                   help="(B3.2) Hard liquidity cap: no symbol may trade more than volume_today * PCT shares "
+                        "in one session (e.g. 0.10). The unfilled excess is DEFERRED to the next tradable "
+                        "session through the same order queue --execution-price uses, and every capped "
+                        "attempt is written to deferral_report with reason 'volume_participation_cap'. "
+                        "Default: unset = no cap (bit-identical to the pre-B3.2 engine).")
+    p.add_argument("--cash-sweep-rate", type=float, default=None, metavar="ANNUAL",
+                   help="(B3.3) Annualized repo/逆回购 rate credited on the UNINVESTED cash balance, "
+                        "as a FRACTION of 1 (0.02 = 2%%/yr -- not percent). Accrues on ACTUAL CALENDAR "
+                        "DAYS / 365, so a Friday balance earns three days of carry by Monday and a "
+                        "holiday week earns its full week. Settles daily inside the normal loop as a "
+                        "credit to cash (reported in cash_carry_report / total_cash_interest); it is "
+                        "never charged on a cash SUBSTITUTE's notional (BIL/511880/GC001 earn their "
+                        "carry through their own price series). Default: unset = off, which is the "
+                        "pre-B3.3 engine bit-for-bit.")
+    p.add_argument("--borrow-fee-annual", type=float, default=None, metavar="ANNUAL",
+                   help="(B3.4) Annualized securities-borrow fee charged on the SHORT book's market "
+                        "value (marked at the prior close), as a FRACTION of 1 (0.045 = 4.5%%/yr). "
+                        "Deducted from cash daily on the opening (overnight) position, so a short "
+                        "opened at T's close first pays at T+1 and the cover day still pays for the "
+                        "night held; reported in cash_carry_report / total_borrow_fees. This is a "
+                        "FINANCING cost, not a fill: rebalance_report (commission/slippage/stamp/"
+                        "impact) is unchanged by it. Default: unset = off (the pre-B3.4 engine "
+                        "bit-for-bit), NOT the task table's 4.5%% -- pass 0.045 to enable it.")
     p.add_argument("--china-trading", action="store_true",
                    help="Apply China A-share trading rules (price limit up/down blocks, T+1 settlement, 100-share minimum round lots, 5 bps sell stamp duty).")
     p.add_argument("--us-trading", action="store_true",
@@ -105,6 +203,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     add_output_dir_override_args(p, RESULTS_DIR, DATA_DIR, "equity/weights/report CSVs")
     p.add_argument("--no-plots", action="store_true",
                    help="Skip the equity-curve chart normally produced in --mode standard (charts are ON by default).")
+    # (B2.2) Window-level parallelism for --mode walkforward only (standard mode is
+    # one monolithic backtest call, nothing to fan out).
+    p.add_argument("--n-jobs", "-j", type=int, default=None, metavar="N",
+                   help="Worker processes for the rolling folds of --mode walkforward. "
+                        "Default (unset/None) = auto: min(os.cpu_count(), n_folds). "
+                        "-1 (as well as 0) = same auto rule, spelled explicitly. "
+                        "1 = the historical fully serial in-process loop. "
+                        "If a process pool cannot be created here (e.g. a platform whose only "
+                        "start method is 'spawn', or a container that forbids fork), the run "
+                        "falls back to that serial loop with a WARNING instead of failing. "
+                        "Note --optimize: the fold fan-out then runs once per candidate; pass "
+                        "-j 1 there if the search layer (common/allocation_search.py) already "
+                        "fans out on its own, to avoid nesting pools.")
+    p.add_argument("--seed", type=int, default=None,
+                   help="Optional master seed for walkforward folds. Each fold derives its own "
+                        "independent seed via numpy SeedSequence(entropy=--seed, "
+                        "spawn_key=(fold_index,)), so the same --seed gives identical results "
+                        "whatever --n-jobs is, while different folds never share a random stream. "
+                        "Unset (default) leaves the global RNG untouched -- the pre-B2.2 behavior.")
     return p
 
 
@@ -226,6 +343,348 @@ def _resolve_master_calendar(
     return master_calendar, effective_start
 
 
+# --------------------------------------------------------------------------- #
+# (B2.2) WALKFORWARD WINDOW-LEVEL MULTIPROCESS SCHEDULER
+# --------------------------------------------------------------------------- #
+# Payload contract -- a hard requirement, do NOT "simplify" it into
+# `executor.submit(fold_worker, universe, template, params, ...)`:
+#
+#   * The ONLY thing that crosses the process boundary per task is an integer
+#     FOLD INDEX. The fold's payload -- the already-loaded `universe` (tens of
+#     MB of OHLCV), the template instance, params, args and the fold grid -- is
+#     published in `_WALKFORWARD_WORKER_CTX` and INHERITED by each worker at
+#     fork time (copy-on-write: ONE physical copy of the frames in RAM, mapped
+#     read-only into every child). Nothing is pickled per task, and no worker
+#     ever touches the OHLCV cache, so a parallel walk-forward puts exactly ONE
+#     reader on `common/duckdb_cache.py` no matter how many workers or folds
+#     there are. (The rejected alternative -- every worker re-reads the cache --
+#     would put N concurrent DuckDB readers on it; DuckDB does allow concurrent
+#     read-only connections opened AFTER the database exists, but it would also
+#     multiply decompression/parse cost by N and expose the run to write races
+#     from any other process refreshing the shared cache. Nothing here needs
+#     that risk.)
+#   * On platforms whose only start method is "spawn" (Windows) that inheritance
+#     is unavailable, and the two remaining designs are (a) pickle the whole
+#     universe into every worker or (b) have every worker re-read the cache.
+#     Both are explicitly rejected, so `_walkforward_pool_context()` raises
+#     `WalkforwardPoolUnavailable` and `run_walkforward` degrades to the serial
+#     loop with a loud WARNING -- never silently, never by crashing.
+#
+# Determinism / ordering: a fold's metrics are computed by exactly the same
+# function in both modes, results are collected KEYED BY FOLD INDEX, and the
+# returned fold list is assembled in fold order -- never in completion order.
+# `folds_df` rows, column order and `walkforward_rebalances.csv` rows are
+# therefore bit-identical between `--n-jobs 1` and any `--n-jobs N`.
+_WALKFORWARD_WORKER_CTX = None
+
+
+class WalkforwardPoolUnavailable(RuntimeError):
+    """A process pool cannot be used for this run: degrade to serial, loudly."""
+
+
+def _nan_fold_metrics() -> dict:
+    """All-NaN metrics for a fold that produced nothing. Module-level (and used
+    by both the serial and the parallel path) so the two can never drift."""
+    return {
+        "sharpe_ratio": float("nan"), "cagr": float("nan"), "max_drawdown": float("nan"),
+        "calmar_ratio": float("nan"), "win_rate": float("nan"), "profit_factor": float("nan"),
+        "total_turnover": 0.0, "total_rebalances": 0,
+        "rebalance_report": pd.DataFrame(columns=REBALANCE_REPORT_COLUMNS),
+    }
+
+
+def _evaluate_walkforward_fold(ctx: dict, spec: dict) -> tuple:
+    """Evaluate ONE rolling fold, self-contained.
+
+    Returns `(fold_metrics, error_message_or_None)`. This is the single
+    implementation both the serial loop and the process pool call, so
+    "parallel == serial" is structural rather than something two copies of the
+    code have to keep agreeing on. A fold's failure is captured here (the
+    pre-B2.2 contract: warn and emit NaN metrics, never abort the whole
+    walk-forward) and reported by the caller in fold order.
+
+    Deliberately performs NO data loading: the universe is handed in already
+    loaded. That is both the fork/COW data-sharing requirement above and what
+    keeps the `L2.3` freshness guard intact -- no fold ever reaches
+    `expected_last_session` at all, so there is nothing that could thread a
+    real session in.
+    """
+    universe = ctx["universe"]
+    template = ctx["template"]
+    params = ctx["params"]
+    args = ctx["args"]
+    master_calendar = ctx["master_calendar"]
+    warmup_bars = ctx["warmup_bars"]
+
+    start_idx = spec["start_idx"]
+    end_idx = spec["end_idx"]
+    buffer_start_idx = max(0, start_idx - warmup_bars)
+
+    fold_dates = master_calendar[buffer_start_idx:end_idx]
+    buffered_universe = _slice_universe_for_range(universe, fold_dates)
+    eval_index = master_calendar[start_idx:end_idx]
+
+    try:
+        if not buffered_universe:
+            fold_metrics = _nan_fold_metrics()
+        else:
+            full_weights = template.generate_weights(buffered_universe, params)
+            if full_weights.empty:
+                fold_metrics = _nan_fold_metrics()
+            else:
+                # Restrict to the eval window, but seed its first row with the
+                # carried-over (forward-filled) target as of the window's
+                # start -- otherwise a fold that starts between two
+                # buffer-period rebalances would open in all-cash instead of
+                # whatever the (now-warm) strategy actually held at that point.
+                eval_universe = _slice_universe_for_range(universe, eval_index)
+                eval_symbols = list(eval_universe.keys())
+                eval_weights = full_weights.reindex(index=eval_index, columns=eval_symbols)
+                eval_weights.iloc[0] = full_weights.ffill().reindex(index=eval_index, columns=eval_symbols).iloc[0]
+
+                result = run_allocation_backtest(
+                    eval_universe, eval_weights,
+                    initial_capital=args.initial_capital,
+                    commission_pct=args.commission_pct,
+                    slippage_pct=args.slippage_pct,
+                    min_shares=getattr(args, "min_shares", 1),
+                    min_weight_change=getattr(args, "min_weight_change", 0.0),
+                    china_trading=getattr(args, "china_trading", False),
+                    us_trading=getattr(args, "us_trading", False),
+                    hk_trading=getattr(args, "hk_trading", False),
+                    # (B3.1) `close` by default == the pre-B3.1 engine; a fold that
+                    # used a different execution mode would not be comparable to
+                    # the standard-mode run, so the CLI value is threaded through
+                    # unchanged (see `--execution-price`).
+                    execution_price=getattr(args, "execution_price", "close"),
+                    # (B3.2) same reasoning: both default to the pre-B3.2 engine,
+                    # and a fold must be measured exactly like the standard run.
+                    market_impact=getattr(args, "market_impact", False),
+                    impact_gamma=getattr(args, "market_impact_gamma", 1.0),
+                    max_volume_participation=getattr(args, "max_volume_participation", None),
+                    # (B3.3 / B3.4) both default to None = off, so a fold is measured
+                    # exactly like the standard run (and like every pre-B3.3 fold).
+                    cash_yield_annual=getattr(args, "cash_sweep_rate", None),
+                    borrow_fee_annual=getattr(args, "borrow_fee_annual", None),
+                )
+                if result["equity_curve"].empty:
+                    fold_metrics = _nan_fold_metrics()
+                else:
+                    # Same fields (and the same sign convention) run_standard
+                    # reports -- no separate recomputation, so the two modes
+                    # can't drift apart.
+                    fold_metrics = {
+                        "sharpe_ratio": result["sharpe_ratio"],
+                        "cagr": result["cagr"],
+                        "max_drawdown": result["max_drawdown"],
+                        "calmar_ratio": result["calmar_ratio"],
+                        "win_rate": result["win_rate"],
+                        "profit_factor": result["profit_factor"],
+                        "total_turnover": result["total_turnover"],
+                        "total_rebalances": result["total_rebalances"],
+                        "rebalance_report": result.get("rebalance_report", pd.DataFrame(columns=REBALANCE_REPORT_COLUMNS)),
+                    }
+    except Exception as e:  # noqa: BLE001 -- pre-B2.2 fail-soft contract, per fold
+        return _nan_fold_metrics(), str(e)
+
+    return fold_metrics, None
+
+
+def walkforward_fold_seed(base_seed, fold_index: int):
+    """Per-fold seed derived from the master seed via `SeedSequence`.
+
+    `spawn_key=(fold_index,)` gives every fold an INDEPENDENT stream (folds
+    never share or shift each other's draws), and the mapping is a pure
+    function of `(--seed, fold_index)` -- so fold k draws the same numbers
+    whether it runs first on 1 process or last on 8 workers. `None` means "no
+    seeding at all", which is the pre-B2.2 behavior (today's templates are
+    deterministic and never touch the global RNG, so this only matters for
+    future stochastic ones).
+    """
+    if base_seed is None:
+        return None
+    ss = np.random.SeedSequence(entropy=int(base_seed), spawn_key=(int(fold_index),))
+    return int(ss.generate_state(1)[0])
+
+
+def _run_fold_with_seed(ctx: dict, spec: dict) -> tuple:
+    """`_evaluate_walkforward_fold` wrapped in per-fold RNG isolation.
+
+    Seeds numpy's AND `random`'s global RNGs from the fold's own SeedSequence
+    before the fold, then restores the caller's RNG state afterwards, so a fold
+    cannot leak randomness into its neighbours (which would make fold order --
+    and therefore worker count -- observable in the results).
+    """
+    seed = walkforward_fold_seed(ctx.get("base_seed"), spec["fold_index"])
+    if seed is None:
+        return _evaluate_walkforward_fold(ctx, spec)
+
+    np_state = np.random.get_state()
+    py_state = random.getstate()
+    try:
+        np.random.seed(seed)
+        random.seed(seed)
+        return _evaluate_walkforward_fold(ctx, spec)
+    finally:
+        np.random.set_state(np_state)
+        random.setstate(py_state)
+
+
+def _walkforward_fold_worker(position: int) -> tuple:
+    """Process-pool entry point. Takes only the fold's POSITION in the fold
+    grid; reads the payload from the fork-inherited module global (see the
+    payload contract above). Returns the fold's 1-based index so the caller can
+    reassemble in fold order regardless of completion order."""
+    ctx = _WALKFORWARD_WORKER_CTX
+    if ctx is None:
+        raise RuntimeError("walkforward worker started without a published fold context")
+    spec = ctx["fold_specs"][position]
+    metrics, error = _run_fold_with_seed(ctx, spec)
+    return spec["fold_index"], metrics, error
+
+
+def _walkforward_pool_context():
+    """Return a multiprocessing context that can SHARE the parent's universe by
+    fork/COW, or raise `WalkforwardPoolUnavailable` explaining why it cannot.
+
+    Only "fork" qualifies: the payload must be inherited, not serialized. (A
+    forked child inherits the whole address space, so `_WALKFORWARD_WORKER_CTX`
+    and the DataFrames inside it cost zero bytes of copying until written --
+    and folds never write them.)"""
+    try:
+        available = multiprocessing.get_all_start_methods()
+    except (ImportError, OSError) as exc:  # pragma: no cover - exotic platforms
+        raise WalkforwardPoolUnavailable(f"multiprocessing unavailable ({exc})") from exc
+    if "fork" not in available:
+        raise WalkforwardPoolUnavailable(
+            f"start method 'fork' is unavailable (available: {available}), so the loaded universe "
+            f"cannot be shared with workers without pickling it N times or re-reading the cache N times"
+        )
+    try:
+        return multiprocessing.get_context("fork")
+    except (ValueError, OSError) as exc:  # pragma: no cover - exotic platforms
+        raise WalkforwardPoolUnavailable(f"cannot create a 'fork' context ({exc})") from exc
+
+
+def resolve_n_jobs(requested, n_folds: int) -> int:
+    """Resolve `--n-jobs` into an actual worker count.
+
+    * `None` / `-1` / `0` -> AUTO: `min(os.cpu_count(), n_folds)` (never more
+      workers than there are folds, never fewer than 1).
+    * anything `>= 1` -> that many workers, capped at `n_folds`.
+    * `< -1` -> ValueError (only `-1` is a legal sentinel).
+    """
+    n_folds = max(1, int(n_folds))
+    if requested is None or requested == -1 or requested == 0:
+        cpu = os.cpu_count() or 1
+        return max(1, min(int(cpu), n_folds))
+    if isinstance(requested, bool) or not isinstance(requested, int):
+        raise ValueError(f"--n-jobs must be an integer, got {type(requested).__name__}.")
+    if requested < -1:
+        raise ValueError(
+            f"--n-jobs must be -1 (auto), 0 (auto), 1 (serial) or a positive worker count; got {requested}."
+        )
+    return max(1, min(int(requested), n_folds))
+
+
+def _run_walkforward_folds_parallel(ctx: dict, fold_specs: list, n_jobs: int) -> tuple:
+    """Fan the folds out to a `ProcessPoolExecutor`, returning
+    `({fold_index: metrics}, {fold_index: error})`.
+
+    The result mapping is keyed by fold index, so completion order is
+    irrelevant to the caller. Any pool-level failure (fork refused by the
+    container, broken pool, ...) is re-raised as `WalkforwardPoolUnavailable`
+    for the caller to degrade on -- the fold-level failures themselves are
+    already captured inside `_evaluate_walkforward_fold`."""
+    global _WALKFORWARD_WORKER_CTX
+
+    mp_ctx = _walkforward_pool_context()
+    _WALKFORWARD_WORKER_CTX = dict(ctx, fold_specs=fold_specs)
+    results, errors = {}, {}
+    try:
+        try:
+            executor = ProcessPoolExecutor(max_workers=n_jobs, mp_context=mp_ctx)
+        except (OSError, ImportError, PermissionError, ValueError, NotImplementedError) as exc:
+            # e.g. "[Errno 38] Function not implemented" from a container that
+            # forbids fork, or no /dev/shm for the pool's semaphores.
+            raise WalkforwardPoolUnavailable(
+                f"cannot start a process pool ({type(exc).__name__}: {exc})"
+            ) from exc
+
+        with executor:
+            futures = {
+                executor.submit(_walkforward_fold_worker, position): position
+                for position in range(len(fold_specs))
+            }
+            for future in as_completed(futures):
+                position = futures[future]
+                try:
+                    fold_index, metrics, error = future.result()
+                except BrokenProcessPool as exc:
+                    # A worker died (OOM-kill, segfault, fork restriction hit
+                    # late): the pool is unusable, degrade -- don't crash.
+                    raise WalkforwardPoolUnavailable(
+                        f"walkforward worker pool broke on fold {position + 1}: {exc}"
+                    ) from exc
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                results[fold_index] = metrics
+                if error is not None:
+                    errors[fold_index] = error
+    finally:
+        # Do not leak the (large) universe reference into any later pool.
+        _WALKFORWARD_WORKER_CTX = None
+    return results, errors
+
+
+def _collect_walkforward_folds(ctx: dict, fold_specs: list, n_jobs: int) -> tuple:
+    """Evaluate every fold, serially or on a process pool, and return
+    `({fold_index: metrics}, {fold_index: error})`.
+
+    The serial branch is the pre-B2.2 loop verbatim (same print sequence, same
+    fail-soft per fold); it is also the documented fallback when the pool
+    cannot be created, in which case a WARNING is emitted first -- degradation
+    is never silent. (On that degraded path the `Evaluating ...` lines are
+    legitimately printed twice: once for the dispatch attempt that failed, once
+    for the serial pass that produced the numbers.)"""
+    total_folds = len(fold_specs)
+    if total_folds == 0:
+        return {}, {}
+
+    if n_jobs > 1 and total_folds > 1:
+        print(
+            f"Parallel walkforward: dispatching {total_folds} folds to {n_jobs} worker process(es); "
+            f"results are re-ordered by fold index before assembly.",
+            flush=True,
+        )
+        for spec in fold_specs:
+            print(
+                f"[Fold {spec['fold_index']}/{total_folds}] Evaluating {spec['start_date']} to {spec['end_date']}...",
+                flush=True,
+            )
+        try:
+            return _run_walkforward_folds_parallel(ctx, fold_specs, n_jobs)
+        except WalkforwardPoolUnavailable as exc:
+            message = (
+                f"walkforward process pool unavailable ({exc}); falling back to the serial fold loop. "
+                f"Results are identical, only slower."
+            )
+            warnings.warn(message)
+            print(f"WARNING: {message}", flush=True)
+
+    results, errors = {}, {}
+    for spec in fold_specs:
+        print(
+            f"[Fold {spec['fold_index']}/{total_folds}] Evaluating {spec['start_date']} to {spec['end_date']}...",
+            flush=True,
+        )
+        metrics, error = _run_fold_with_seed(ctx, spec)
+        results[spec["fold_index"]] = metrics
+        if error is not None:
+            errors[spec["fold_index"]] = error
+    return results, errors
+
+
 def run_standard(universe: dict, template, params: dict, args) -> dict:
     master_calendar, effective_start = _resolve_master_calendar(
         universe, getattr(args, "start", None), getattr(args, "end", None), min_coverage=0.20
@@ -257,6 +716,15 @@ def run_standard(universe: dict, template, params: dict, args) -> dict:
         china_trading=getattr(args, "china_trading", False),
         us_trading=getattr(args, "us_trading", False),
         hk_trading=getattr(args, "hk_trading", False),
+        # (B3.1) default "close" leaves every pre-B3.1 result bit-identical.
+        execution_price=getattr(args, "execution_price", "close"),
+        # (B3.2) both default OFF (False / None) == the pre-B3.2 engine.
+        market_impact=getattr(args, "market_impact", False),
+        impact_gamma=getattr(args, "market_impact_gamma", 1.0),
+        max_volume_participation=getattr(args, "max_volume_participation", None),
+        # (B3.3 / B3.4) both default to None = off == the pre-B3.3 engine.
+        cash_yield_annual=getattr(args, "cash_sweep_rate", None),
+        borrow_fee_annual=getattr(args, "borrow_fee_annual", None),
     )
 
     if result["equity_curve"].empty:
@@ -312,100 +780,62 @@ def run_walkforward(universe: dict, template, params: dict, args) -> list:
     # unchanged.
     warmup_bars = template.warmup_bars(params)
 
-    def _nan_fold_metrics() -> dict:
-        return {
-            "sharpe_ratio": float("nan"), "cagr": float("nan"), "max_drawdown": float("nan"),
-            "calmar_ratio": float("nan"), "win_rate": float("nan"), "profit_factor": float("nan"),
-            "total_turnover": 0.0, "total_rebalances": 0,
-            "rebalance_report": pd.DataFrame(columns=REBALANCE_REPORT_COLUMNS),
-        }
+    # (B2.2) Enumerate the fold grid up front. Fold boundaries are pure
+    # bar-position arithmetic over `master_calendar` -- identical whether the
+    # folds are then evaluated serially or on a process pool, which is what
+    # makes the two modes directly comparable.
+    fold_specs = []
+    start_idx = base_start_idx
+    while start_idx + window_bars <= n_bars:
+        end_idx = start_idx + window_bars
+        fold_specs.append({
+            "fold_index": len(fold_specs) + 1,
+            "start_idx": start_idx,
+            "end_idx": end_idx,
+            "start_date": master_calendar[start_idx].strftime("%Y-%m-%d"),
+            "end_date": master_calendar[end_idx - 1].strftime("%Y-%m-%d"),
+        })
+        start_idx += step_bars
 
-    total_folds = 0
-    s_idx = base_start_idx
-    while s_idx + window_bars <= n_bars:
-        total_folds += 1
-        s_idx += step_bars
+    ctx = {
+        "universe": universe,
+        "template": template,
+        "params": params,
+        "args": args,
+        "warmup_bars": warmup_bars,
+        "master_calendar": master_calendar,
+        # Programmatic callers that predate B2.2 (and this module's own unit
+        # tests) construct a bare namespace without `n_jobs`: they keep the
+        # historical entirely-serial behavior. Only the CLI defaults to auto.
+        "base_seed": getattr(args, "seed", None),
+    }
+    n_jobs = resolve_n_jobs(getattr(args, "n_jobs", 1), len(fold_specs))
+
+    fold_metrics_by_index, fold_errors_by_index = _collect_walkforward_folds(ctx, fold_specs, n_jobs)
 
     folds = []
-    start_idx = base_start_idx
-    fold_idx = 0
-    while start_idx + window_bars <= n_bars:
-        fold_idx += 1
-        end_idx = start_idx + window_bars
-        buffer_start_idx = max(0, start_idx - warmup_bars)
-
-        fold_dates = master_calendar[buffer_start_idx:end_idx]
-        buffered_universe = _slice_universe_for_range(universe, fold_dates)
-        eval_index = master_calendar[start_idx:end_idx]
-
-        start_date = master_calendar[start_idx].strftime("%Y-%m-%d")
-        end_date = master_calendar[end_idx - 1].strftime("%Y-%m-%d")
-        print(f"[Fold {fold_idx}/{total_folds}] Evaluating {start_date} to {end_date}...", flush=True)
-
-        try:
-            if not buffered_universe:
-                fold_metrics = _nan_fold_metrics()
-            else:
-                full_weights = template.generate_weights(buffered_universe, params)
-                if full_weights.empty:
-                    fold_metrics = _nan_fold_metrics()
-                else:
-                    # Restrict to the eval window, but seed its first row with the
-                    # carried-over (forward-filled) target as of the window's
-                    # start -- otherwise a fold that starts between two
-                    # buffer-period rebalances would open in all-cash instead of
-                    # whatever the (now-warm) strategy actually held at that point.
-                    eval_universe = _slice_universe_for_range(universe, eval_index)
-                    eval_symbols = list(eval_universe.keys())
-                    eval_weights = full_weights.reindex(index=eval_index, columns=eval_symbols)
-                    eval_weights.iloc[0] = full_weights.ffill().reindex(index=eval_index, columns=eval_symbols).iloc[0]
-
-                    result = run_allocation_backtest(
-                        eval_universe, eval_weights,
-                        initial_capital=args.initial_capital,
-                        commission_pct=args.commission_pct,
-                        slippage_pct=args.slippage_pct,
-                        min_shares=getattr(args, "min_shares", 1),
-                        min_weight_change=getattr(args, "min_weight_change", 0.0),
-                        china_trading=getattr(args, "china_trading", False),
-                        us_trading=getattr(args, "us_trading", False),
-                        hk_trading=getattr(args, "hk_trading", False),
-                    )
-                    if result["equity_curve"].empty:
-                        fold_metrics = _nan_fold_metrics()
-                    else:
-                        # Same fields (and the same sign convention) run_standard
-                        # reports -- no separate recomputation, so the two modes
-                        # can't drift apart.
-                        fold_metrics = {
-                            "sharpe_ratio": result["sharpe_ratio"],
-                            "cagr": result["cagr"],
-                            "max_drawdown": result["max_drawdown"],
-                            "calmar_ratio": result["calmar_ratio"],
-                            "win_rate": result["win_rate"],
-                            "profit_factor": result["profit_factor"],
-                            "total_turnover": result["total_turnover"],
-                            "total_rebalances": result["total_rebalances"],
-                            "rebalance_report": result.get("rebalance_report", pd.DataFrame(columns=REBALANCE_REPORT_COLUMNS)),
-                        }
-        except Exception as e:
-            print(f"Error in window {start_date} to {end_date}: {e}")
-            fold_metrics = _nan_fold_metrics()
+    for spec in fold_specs:
+        i = spec["fold_index"]
+        total_folds = len(fold_specs)
+        # A fold that blew up reports its exception text here, in FOLD order
+        # (the worker only hands the message back -- it never prints), so the
+        # console transcript stays byte-identical to the serial loop's.
+        if i in fold_errors_by_index:
+            print(f"Error in window {spec['start_date']} to {spec['end_date']}: {fold_errors_by_index[i]}")
+        fold_metrics = fold_metrics_by_index[i]
 
         sr = fold_metrics.get("sharpe_ratio", float("nan"))
         if np.isnan(sr):
-            print(f"  [Fold {fold_idx}/{total_folds}] Done: NaN metrics", flush=True)
+            print(f"  [Fold {i}/{total_folds}] Done: NaN metrics", flush=True)
         else:
             print(
-                f"  [Fold {fold_idx}/{total_folds}] Done: Sharpe={sr:.2f}, "
+                f"  [Fold {i}/{total_folds}] Done: Sharpe={sr:.2f}, "
                 f"CAGR={fold_metrics['cagr']:.1%}, MaxDD={fold_metrics['max_drawdown']:.1%}, "
                 f"Rebalances={fold_metrics['total_rebalances']}",
                 flush=True,
             )
 
-        folds.append({"start_date": start_date, "end_date": end_date, **fold_metrics})
-
-        start_idx += step_bars
+        folds.append({"start_date": spec["start_date"], "end_date": spec["end_date"], **fold_metrics})
 
     return folds
 
@@ -503,6 +933,7 @@ def _run_baseline(args, cache_dir, data_kwargs, aligned_index=None):
         [args.baseline_symbol], baseline_fetch_start, args.end, args.interval,
         use_cache=not args.no_cache, cache_dir=cache_dir,
         data_kwargs=data_kwargs, require_nonempty=True,
+        expected_last_session=backtest_expected_last_session(),
     )
 
     if aligned_index is not None:
@@ -689,7 +1120,8 @@ def main():
 
     universe = load_universe_with_banner(universe_symbols, fetch_start, args.end, args.interval,
                                           use_cache=not args.no_cache, cache_dir=cache_dir,
-                                          data_kwargs=data_kwargs, require_nonempty=True)
+                                          data_kwargs=data_kwargs, require_nonempty=True,
+                                          expected_last_session=backtest_expected_last_session())
 
     # Task B2.1: Memoized Pre-Enrichment across full historical universe
     track_c_flags = {

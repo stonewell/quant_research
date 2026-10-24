@@ -137,6 +137,66 @@ def test_arg_parser_strategy_params_default_and_override():
     assert args.strategy_params == '{"blend_weighting_mode": "regime_adaptive"}'
 
 
+def test_arg_parser_execution_price_default_and_override():
+    """(B3.1) `--execution-price` defaults to `close` and accepts the four modes.
+
+    Defaulting to `close` is a correctness requirement, not a preference: the
+    pre-B3.1 engine fills on the signal bar's close, so any other default would
+    silently change every existing backtest's numbers.
+    """
+    args = build_arg_parser().parse_args(["--strategy-file", "strategy.json"])
+    assert args.execution_price == "close"
+
+    for mode in ("close", "next_open", "next_vwap", "intraday_twap"):
+        args = build_arg_parser().parse_args(
+            ["--strategy-file", "strategy.json", "--execution-price", mode]
+        )
+        assert args.execution_price == mode
+
+    with pytest.raises(SystemExit):
+        build_arg_parser().parse_args(["--strategy-file", "strategy.json", "--execution-price", "twap"])
+
+
+def test_execution_price_is_threaded_into_both_backtest_modes(monkeypatch):
+    """`--execution-price` must reach `run_allocation_backtest` in BOTH modes.
+
+    A parse-only test would not catch the value being dropped on the floor
+    between the CLI and the engine -- so this spies on the engine itself, from
+    `run_standard` AND from the walkforward fold evaluator, and also pins that a
+    legacy programmatic `args` object without the attribute still gets `close`
+    (the pre-B3.1 behavior).
+    """
+    seen = []
+    real = backtester.run_backtest.run_allocation_backtest
+
+    def spy(universe, target_weights, **kwargs):
+        seen.append(kwargs.get("execution_price", "<<MISSING>>"))
+        return real(universe, target_weights, **kwargs)
+
+    monkeypatch.setattr(backtester.run_backtest, "run_allocation_backtest", spy)
+
+    idx = pd.bdate_range("2020-01-01", periods=120)
+    universe = {"A": make_df(np.linspace(100, 140, 120), start="2020-01-01")}
+    template = get_template("equal_weight")
+    params = {"rebalance_freq_days": 10}
+
+    run_standard(universe, template, params, MockArgs(execution_price="next_open"))
+    assert seen and all(v == "next_open" for v in seen)
+
+    seen.clear()
+    folds = run_walkforward(
+        universe, template, params,
+        MockArgs(execution_price="next_open", window_years=0.4, step_years=0.2),
+    )
+    assert folds, "fixture must produce at least one fold"
+    assert seen and all(v == "next_open" for v in seen), seen
+
+    # A pre-B3.1 caller (no attribute on its args namespace) keeps `close`.
+    seen.clear()
+    run_standard(universe, template, params, MockArgs())
+    assert seen == ["close"]
+
+
 class MockArgs:
     def __init__(self, **kwargs):
         self.initial_capital = 100_000.0
