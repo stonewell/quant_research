@@ -1062,3 +1062,118 @@ def test_coerce_blocking_reason_tolerates_legacy_and_garbage(raw, expected):
     """Historical archives lack the column; readers must degrade to NONE, not raise."""
     assert coerce_blocking_reason(raw) is expected
     assert blocking_reason_label(raw)  # always renderable, never an empty label
+
+
+def test_step_asset_inertia_l2_38_entry_threshold_alignment():
+    """L2.38: _step_asset_inertia sets buy_thresh[new_entry_mask] = entry_threshold directly
+
+    without taking np.minimum(thresh_t, entry_threshold), preventing adaptive inertia from
+    lowering the entry threshold below the specified parameter.
+    """
+    from common.allocation_templates import _step_asset_inertia
+
+    symbols = ["SYM_A", "CASH"]
+    risky_symbols = ["SYM_A"]
+    thresh_t = pd.Series({"SYM_A": 0.02})  # adaptive thresh lower than entry_threshold 0.05
+    current_w = pd.Series({"SYM_A": 0.0, "CASH": 1.0})
+    ideal_w = pd.Series({"SYM_A": 0.035, "CASH": 0.65})  # 0.02 <= 0.035 < 0.05
+
+    holding_age = {"SYM_A": 0}
+    last_buy_bar = {"SYM_A": -999}
+
+    res = _step_asset_inertia(
+        t=1,
+        ideal_w=ideal_w,
+        current_w=current_w,
+        risky_symbols=risky_symbols,
+        symbols=symbols,
+        thresh_t=thresh_t,
+        holding_age=holding_age,
+        last_buy_bar=last_buy_bar,
+        cash_proxy="CASH",
+        entry_threshold=0.05,
+    )
+
+    # Since entry_threshold=0.05 and ideal_w is 0.035 < 0.05, new entry must NOT be permitted (remains 0.0)
+    assert res["SYM_A"] == 0.0
+    assert res["CASH"] == 1.0
+
+    # If ideal_w is 0.055 >= 0.05, entry proceeds
+    ideal_w2 = pd.Series({"SYM_A": 0.055, "CASH": 0.45})
+    res2 = _step_asset_inertia(
+        t=1,
+        ideal_w=ideal_w2,
+        current_w=current_w,
+        risky_symbols=risky_symbols,
+        symbols=symbols,
+        thresh_t=thresh_t,
+        holding_age=holding_age,
+        last_buy_bar=last_buy_bar,
+        cash_proxy="CASH",
+        entry_threshold=0.05,
+    )
+    assert res2["SYM_A"] == pytest.approx(0.055)
+
+
+def test_step_position_lifecycle_l2_40_portfolio_deleverage_bypasses_inertia_and_tenure():
+    """L2.40: Portfolio-level drawdown deleveraging bypasses per-asset inertia threshold and tenure lock."""
+    cfg = PositionLifecycleConfig(
+        inertia_threshold=0.05,
+        min_holding_bars=2,
+    )
+
+    def _make_state():
+        return AssetLifecycleState(
+            symbol="600519.SH",
+            state=PositionState.HELD_GESTATION,
+            held_bars=0,
+            current_weight=0.20,
+            entry_price=100.0,
+            peak_price=100.0,
+        )
+
+    # 1. Normal rebalance with small trim: delta = -0.02 (< inertia_threshold 0.05)
+    # Without is_portfolio_deleverage: blocked by inertia -> HOLD
+    d_normal = step_position_lifecycle(
+        state=_make_state(),
+        raw_target_weight=0.18,
+        current_price=100.0,
+        cfg=cfg,
+        market="china",
+        is_portfolio_deleverage=False,
+    )
+    assert d_normal.action == "HOLD"
+    assert d_normal.target_weight == pytest.approx(0.20)
+    assert d_normal.blocking_reason == BlockingReason.INERTIA
+
+    # 2. Portfolio-level deleveraging active:
+    # Bypasses inertia check AND partial trim tenure lock -> SELL trim
+    state_del = _make_state()
+    d_del = step_position_lifecycle(
+        state=state_del,
+        raw_target_weight=0.18,
+        current_price=100.0,
+        cfg=cfg,
+        market="china",
+        is_portfolio_deleverage=True,
+    )
+    assert d_del.action == "SELL"
+    assert d_del.target_weight == pytest.approx(0.18)
+    assert "组合级去杠杆风控减仓" in d_del.reason
+    assert d_del.detail_reason.get("is_portfolio_deleverage") is True
+    assert state_del.current_weight == pytest.approx(0.18)
+
+    # 3. Defense-in-depth: if raw_target_weight > current_weight, is_portfolio_deleverage is reset
+    state_buy = _make_state()
+    d_buy = step_position_lifecycle(
+        state=state_buy,
+        raw_target_weight=0.22,  # increase, not deleverage
+        current_price=100.0,
+        cfg=cfg,
+        market="china",
+        is_portfolio_deleverage=True,
+    )
+    # Delta is +0.02 < inertia_threshold 0.05 -> blocked by inertia
+    assert d_buy.action == "HOLD"
+    assert d_buy.blocking_reason == BlockingReason.INERTIA
+

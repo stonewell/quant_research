@@ -966,3 +966,83 @@ def test_base_blend_uplsm_sector_incumbent_stop_unlock():
     assert w.iloc[55]["601225.SH"] == 0.0
 
 
+def test_apply_portfolio_deleverage_helper():
+    """L2.40: _apply_portfolio_deleverage helper scales risky assets and sweeps residual to cash proxy."""
+    from pipeline.research.blend.blend_base import _apply_portfolio_deleverage
+
+    row = pd.Series({"AAPL": 0.30, "MSFT": 0.30, "BIL": 0.40})
+    risky = ["AAPL", "MSFT"]
+
+    # 1. Scale = 1.0 (no deleverage)
+    res_1 = _apply_portfolio_deleverage(row, risky, "BIL", scale=1.0)
+    assert res_1["AAPL"] == pytest.approx(0.30)
+    assert res_1["MSFT"] == pytest.approx(0.30)
+    assert res_1["BIL"] == pytest.approx(0.40)
+
+    # 2. Scale = 0.50 (50% reduction)
+    res_half = _apply_portfolio_deleverage(row, risky, "BIL", scale=0.50)
+    assert res_half["AAPL"] == pytest.approx(0.15)
+    assert res_half["MSFT"] == pytest.approx(0.15)
+    assert res_half["BIL"] == pytest.approx(0.70)  # 1.0 - (0.15 + 0.15) = 0.70
+
+    # 3. Scale = 0.0 (full halt / liquidation)
+    res_zero = _apply_portfolio_deleverage(row, risky, "BIL", scale=0.0)
+    assert res_zero["AAPL"] == pytest.approx(0.0)
+    assert res_zero["MSFT"] == pytest.approx(0.0)
+    assert res_zero["BIL"] == pytest.approx(1.0)
+
+
+def test_blend_portfolio_deleverage_not_blocked_by_inertia():
+    """L2.40: Drawdown circuit breaker deleveraging scales daily_weights without being blocked by per-asset inertia."""
+    from common.allocation_templates import AllocationTemplate
+    from pipeline.research.blend.blend_base import BaseBlendAllocationStrategy
+
+    class MockStrategy(AllocationTemplate):
+        def generate_weights(self, universe, params=None):
+            dates = pd.bdate_range("2020-01-01", periods=10)
+            df = pd.DataFrame(index=dates)
+            df["601225.SH"] = 0.50
+            df["BIL"] = 0.50
+            return df
+
+    class DeleverageBlend(BaseBlendAllocationStrategy):
+        def get_sub_strategies(self, universe, params):
+            return {"mock": MockStrategy("mock", {})}
+        def get_sub_strategy_weights(self, params):
+            return {"mock": 1.0}
+
+    dates = pd.bdate_range("2020-01-01", periods=10)
+    close_vals = [100.0, 100.0, 95.0, 90.0, 85.0, 80.0, 75.0, 70.0, 65.0, 60.0]
+    df_a = pd.DataFrame({
+        "Open": close_vals,
+        "High": close_vals,
+        "Low": close_vals,
+        "Close": close_vals,
+        "Volume": 1000.0,
+    }, index=dates)
+    df_bil = pd.DataFrame({
+        "Open": 100.0, "High": 100.0, "Low": 100.0, "Close": 100.0, "Volume": 1000.0,
+    }, index=dates)
+
+    universe = {"601225.SH": df_a, "BIL": df_bil}
+    strat = DeleverageBlend()
+    # High inertia threshold (0.10) with smooth_drawdown
+    w = strat.generate_weights(universe, {
+        "drawdown_stop_threshold": 0.20,
+        "drawdown_reduce_threshold": 0.05,
+        "smooth_drawdown": True,
+        "min_weight_change": 0.10,
+        "dynamic_cash": False,
+        "enable_vol_targeting": False,
+        "min_entry_bars": 1,
+    }).ffill().fillna(0.0)
+
+    # After price drops, drawdown exceeds 5%, deleveraging scales risky weight below 0.50
+    # and sweeps residual to BIL, proving per-asset inertia (0.10) did not freeze weights at 0.50.
+    last_row = w.iloc[-1]
+    assert last_row["601225.SH"] < 0.50
+    assert last_row["BIL"] > 0.50
+    assert pytest.approx(float(last_row["601225.SH"] + last_row["BIL"])) == 1.0
+
+
+

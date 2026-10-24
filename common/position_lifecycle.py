@@ -280,6 +280,7 @@ def step_position_lifecycle(
     atr: Optional[float] = None,
     is_emergency_halt: bool = False,
     is_market_open: bool = True,
+    is_portfolio_deleverage: bool = False,
 ) -> LifecycleDecision:
     """Transitions an asset's position lifecycle state for a single bar.
 
@@ -296,6 +297,10 @@ def step_position_lifecycle(
         is_emergency_halt: Macro circuit breaker emergency halt flag.
         is_market_open: Whether current bar is an open trading day. If False,
             all lifecycle counters, gestation timers, and cooldowns remain frozen.
+        is_portfolio_deleverage: Portfolio-level drawdown deleveraging active.
+            When True and trimming an existing holding (0.0 <= raw_target < current_weight),
+            bypasses asset-level inertia threshold and tenure lock to prevent risk-control
+            dilution.
 
     Returns:
         LifecycleDecision containing actionable target weight, trade action,
@@ -486,6 +491,12 @@ def step_position_lifecycle(
             # `inertia_check.delta_weight` convention emitted by
             # run_live_strategy.py. The ABSOLUTE value still gates inertia.
             delta_w = raw_target_weight - state.current_weight
+
+            # Defense-in-depth: if raw_target_weight > state.current_weight or < 0.0, reset is_portfolio_deleverage = False
+            if is_portfolio_deleverage:
+                if not (delta_w < 0.0 and 0.0 <= raw_target_weight <= state.current_weight):
+                    is_portfolio_deleverage = False
+
             # (2026-10-22 incident) Relative trim-side inertia hurdle: SELL
             # trims must clear both the absolute threshold AND a proportional
             # fraction of the current weight. BUY-direction rebalances keep the
@@ -496,7 +507,7 @@ def step_position_lifecycle(
                     cfg.inertia_threshold,
                     cfg.inertia_relative_ratio * state.current_weight,
                 )
-            if abs(delta_w) < effective_threshold:
+            if not is_portfolio_deleverage and abs(delta_w) < effective_threshold:
                 return LifecycleDecision(
                     action="HOLD",
                     target_weight=state.current_weight,
@@ -516,7 +527,7 @@ def step_position_lifecycle(
                 )
             else:
                 action = "BUY" if raw_target_weight > state.current_weight else "SELL"
-                if action == "SELL" and not can_sell:
+                if action == "SELL" and not can_sell and not is_portfolio_deleverage:
                     # (2026-10-22 live incident) `can_sell` (the min-holding
                     # tenure lock) was previously enforced ONLY on the stop-loss
                     # fast-path (line ~212) and the full-exit path
@@ -563,16 +574,20 @@ def step_position_lifecycle(
                 # half of the same fix; this is the remaining ticket half.)
                 prev_weight = state.current_weight
                 state.current_weight = raw_target_weight
+                trim_reason = "组合级去杠杆风控减仓" if is_portfolio_deleverage else "最优权重微调"
+                detail_dict = {
+                    "delta_w": delta_w,
+                    "inertia_threshold": cfg.inertia_threshold,
+                    "raw_target_weight": raw_target_weight,
+                    "current_weight": prev_weight,
+                }
+                if is_portfolio_deleverage:
+                    detail_dict["is_portfolio_deleverage"] = True
                 return LifecycleDecision(
                     action=action,
                     target_weight=raw_target_weight,
-                    reason="最优权重微调",
-                    detail_reason={
-                        "delta_w": delta_w,
-                        "inertia_threshold": cfg.inertia_threshold,
-                        "raw_target_weight": raw_target_weight,
-                        "current_weight": prev_weight,
-                    },
+                    reason=trim_reason,
+                    detail_reason=detail_dict,
                     state_before=state_before,
                     state_after=state.state,
                     fast_path_triggered=None,

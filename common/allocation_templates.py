@@ -254,7 +254,7 @@ def _step_asset_inertia(
     buy_thresh = thresh_t.copy()
     if entry_threshold is not None:
         new_entry_mask = (current_w[risky_symbols] <= 1e-4)
-        buy_thresh[new_entry_mask] = np.minimum(thresh_t[new_entry_mask], entry_threshold)
+        buy_thresh[new_entry_mask] = entry_threshold
 
     diff = ideal_w[risky_symbols] - current_w[risky_symbols]
     sells_raw = diff[diff <= -sell_thresh].index.tolist()

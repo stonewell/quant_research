@@ -132,6 +132,22 @@ def _aligned_master_index_helper(universe: Dict[str, pd.DataFrame], risky_symbol
     return pd.DatetimeIndex(sorted(set().union(*(universe[s].index for s in non_empty))))
 
 
+def _apply_portfolio_deleverage(
+    desired_row: pd.Series,
+    risky_symbols: List[str],
+    cash_proxy: Optional[str],
+    scale: float,
+) -> pd.Series:
+    """Scales risky assets by portfolio-level deleveraging scale and sweeps residual to cash proxy."""
+    out = desired_row.copy()
+    if scale < 1.0:
+        s_clamped = max(0.0, float(scale))
+        out[risky_symbols] = out[risky_symbols] * s_clamped
+        if cash_proxy and cash_proxy in out.index:
+            out[cash_proxy] = max(0.0, 1.0 - float(out[risky_symbols].sum()))
+    return out
+
+
 class BaseBlendAllocationStrategy(AllocationTemplate):
     """Institutional Multi-Strategy Base Blend Allocation Engine.
 
@@ -140,7 +156,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
     and adaptive turnover filters so any blend strategy can inherit them cleanly.
     """
 
-    BASE_VERSION: str = "1.5.0"
+    BASE_VERSION: str = "1.6.0"
     version: str = "1.0.0"
 
     def __init__(
@@ -160,7 +176,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             self.config = config
         self.param_prefix = param_prefix
         self.alt_param_prefixes = alt_param_prefixes or []
-        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "1.5.0")
+        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "1.6.0")
         strat_version: str = version or getattr(self.__class__, "version", "1.0.0")
         tags = factor_tags or [
             "regime_trend_strength",
@@ -803,6 +819,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
 
         # Step 3: Simulation loop tracking portfolio NAV, drawdown, stops, and dynamic cash
         daily_weights = pd.DataFrame(0.0, index=master_index, columns=symbols)
+        desired_weights = pd.DataFrame(0.0, index=master_index, columns=symbols)
         cum_nav = 1.0
         peak_nav = 1.0
         nav_history = []
@@ -1050,38 +1067,40 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                         raw_blend += sw * sub_daily[sname].loc[date]
 
             # Circuit breaker logic
+            deleverage_scale = 1.0
             if dd_mag >= dd_stop_thresh:
                 if fast_recovery and defensive_key is not None:
                     raw_w = sub_daily[defensive_key].loc[date].copy()
                     is_emergency = not thrust_active
+                    deleverage_scale = 1.0
                 else:
                     raw_w = pd.Series(0.0, index=symbols)
                     if cash_proxy in symbols:
                         raw_w[cash_proxy] = 1.0
                     is_emergency = True
+                    deleverage_scale = 0.0
             elif dd_mag >= dd_reduce_thresh:
                 if fast_recovery:
                     raw_w = raw_blend.copy()
                     is_emergency = False
+                    deleverage_scale = 1.0
                 elif smooth_drawdown:
                     scale_dd = max(0.0, 1.0 - (dd_mag - dd_reduce_thresh) / max(0.01, dd_stop_thresh - dd_reduce_thresh))
-                    raw_w = pd.Series(0.0, index=symbols)
-                    raw_w[risky_symbols] = raw_blend[risky_symbols] * scale_dd
-                    if cash_proxy in symbols:
-                        raw_w[cash_proxy] = max(0.0, 1.0 - float(raw_w[risky_symbols].sum()))
+                    raw_w = raw_blend.copy()
+                    deleverage_scale = scale_dd
                     is_emergency = (scale_dd < 0.30)
                 elif dd_mag >= dd_defensive_thresh and defensive_key is not None:
                     raw_w = sub_daily[defensive_key].loc[date].copy()
                     is_emergency = True
+                    deleverage_scale = 1.0
                 else:
-                    raw_w = pd.Series(0.0, index=symbols)
-                    raw_w[risky_symbols] = raw_blend[risky_symbols] * 0.50
-                    if cash_proxy in symbols:
-                        raw_w[cash_proxy] = max(0.0, 1.0 - float(raw_w[risky_symbols].sum()))
+                    raw_w = raw_blend.copy()
+                    deleverage_scale = 0.50
                     is_emergency = True
             else:
                 raw_w = raw_blend.copy()
                 is_emergency = False
+                deleverage_scale = 1.0
 
             emergency_flags.append(is_emergency)
             if is_emergency:
@@ -1096,7 +1115,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                     row_slope = ma20_slope_matrix.iloc[t]
                     row_trend50 = trend_50_matrix.iloc[t]
                     for s in risky_symbols:
-                        prev_w_s = float(daily_weights.loc[prev_date, s])
+                        prev_w_s = float(desired_weights.loc[prev_date, s])
                         if prev_w_s <= 1e-4 and float(raw_w[s]) > 0.01:
                             if float(row_trend50[s]) < 0.5 and float(row_slope[s]) < 0.5 and float(row_roc60[s]) < roc60_median:
                                 raw_w[s] = 0.0
@@ -1104,7 +1123,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                 # Track C Anchor 2: CYQ Quality Gate & Consolidation Density Gate
                 if enable_cyq_quality_gate:
                     for s in risky_symbols:
-                        prev_w_s = float(daily_weights.loc[prev_date, s])
+                        prev_w_s = float(desired_weights.loc[prev_date, s])
                         if prev_w_s <= 1e-4 and float(raw_w[s]) > 0.01 and s in universe and not universe[s].empty:
                             df_u = universe[s]
                             cols = df_u.columns
@@ -1241,7 +1260,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                             base_score *= (1.0 + 3.0 * max(0.0, -q_sm))
                                     if t > 0:
                                         prev_date = master_index[t - 1]
-                                        if float(daily_weights.loc[prev_date, s]) > 1e-4:
+                                        if float(desired_weights.loc[prev_date, s]) > 1e-4:
                                             base_score *= thrust_incumbent_bonus
                                     cand_scores[s] = base_score
                                     v = float(asset_vol_21d.iloc[t][s]) if pd.notna(asset_vol_21d.iloc[t][s]) else target_vol
@@ -1262,14 +1281,14 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                             if t > 0:
                                 prev_date = master_index[t - 1]
                                 for s in risky_symbols:
-                                    if float(daily_weights.loc[prev_date, s]) > 1e-4:
+                                    if float(desired_weights.loc[prev_date, s]) > 1e-4:
                                         has_stopped = bool(asset_emergency_df.loc[date, s]) or (t < asset_cooldown_until[s])
                                         if not has_stopped and not is_emergency:
                                             held_incumbents.add(s)
                                         if min_holding_bars > 0:
                                             k = t - 1
                                             age = 0
-                                            while k >= 0 and float(daily_weights.iloc[k][s]) > 1e-4:
+                                            while k >= 0 and float(desired_weights.iloc[k][s]) > 1e-4:
                                                 age += 1
                                                 k -= 1
                                             eff_min_holding = min_holding_bars
@@ -1401,7 +1420,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             if min_entry_bars > 1:
                 prev_date_w = master_index[t - 1] if t > 0 else None
                 for s in risky_symbols:
-                    prev_w = float(daily_weights.loc[prev_date_w, s]) if prev_date_w is not None else 0.0
+                    prev_w = float(desired_weights.loc[prev_date_w, s]) if prev_date_w is not None else 0.0
                     target_w = float(raw_w[s])
 
                     # 1. New position entry filter (prev_w <= 1e-4):
@@ -1477,7 +1496,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             if (enable_intraday_5m or enable_5m_interval_nesting):
                 prev_date_w = master_index[t - 1] if t > 0 else None
                 for s in risky_symbols:
-                    prev_w = float(daily_weights.loc[prev_date_w, s]) if prev_date_w is not None else 0.0
+                    prev_w = float(desired_weights.loc[prev_date_w, s]) if prev_date_w is not None else 0.0
                     target_w = float(raw_w[s])
                     if prev_w <= 1e-4 and target_w >= entry_thresh:
                         if s in universe and not universe[s].empty:
@@ -1492,7 +1511,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             if min_entry_bars <= 1 and enable_spring_fast_entry:
                 prev_date_w = master_index[t - 1] if t > 0 else None
                 for s in risky_symbols:
-                    prev_w = float(daily_weights.loc[prev_date_w, s]) if prev_date_w is not None else 0.0
+                    prev_w = float(desired_weights.loc[prev_date_w, s]) if prev_date_w is not None else 0.0
                     if prev_w <= 1e-4 and float(raw_w[s]) >= entry_thresh and s in universe and not universe[s].empty:
                         df_u = universe[s]
                         if date in df_u.index and "standardized_divergence" in df_u.columns and "POC" in df_u.columns:
@@ -1518,7 +1537,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                     for s in risky_symbols:
                         last_buy_bar[s] = 0 if current_w[s] > 1e-4 else -999
                 else:
-                    prev_w_series = daily_weights.iloc[t - 1]
+                    prev_w_series = desired_weights.iloc[t - 1]
                     thresh_t = inertia_thresh_df.iloc[t] if inertia_thresh_df is not None else static_inertia_thresh
                     current_w = _step_asset_inertia(
                         t=t,
@@ -1535,17 +1554,21 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                         entry_threshold=entry_thresh,
                         min_holding_bars=min_holding_bars,
                     )
-                daily_weights.loc[date] = current_w
+                desired_weights.loc[date] = current_w
             else:
-                daily_weights.loc[date] = raw_w
+                desired_weights.loc[date] = raw_w
+
+            daily_weights.loc[date] = _apply_portfolio_deleverage(
+                desired_weights.loc[date], risky_symbols, cash_proxy, deleverage_scale
+            )
 
             # Cooldown Parity: Track normal strategic exits (when target drops to 0.0)
             # and enforce normal_cooldown_bars to prevent immediate 1-bar whipsaw re-entry.
             if t > 0:
                 prev_date_w = master_index[t - 1]
                 for s in risky_symbols:
-                    prev_w_val = float(daily_weights.loc[prev_date_w, s])
-                    curr_w_val = float(daily_weights.loc[date, s])
+                    prev_w_val = float(desired_weights.loc[prev_date_w, s])
+                    curr_w_val = float(desired_weights.loc[date, s])
                     if prev_w_val > 1e-4 and curr_w_val <= 1e-4:
                         if not bool(asset_emergency_df.loc[date, s]):
                             if normal_cooldown_bars > 0:
