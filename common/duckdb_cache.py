@@ -996,10 +996,10 @@ class DuckDBCache:
             bar" passed on the date alone -- the 2026-10-22 staleness copied onto 5m. Lunch
             breaks need no special state: an 11:30 bar is hours short of the afternoon-close
             deadline, so "mid-lunch" and "closed early" are told apart by the clock itself.
-            Known gap (deliberately not faked): half-days / early closes are NOT modelled
-            (`common/market_holidays.py` tracks full-day closures only), so a US 13:00 early
-            close looks "short" until the next session. See `L2.26` in
-            `docs/development_plan.md`.
+            Early closes are now modelled: `common/market_holidays.py`'s per-market
+            early-close tables + `MarketSpec.close_time_on(day)` / `MarketSpec.early_close_on(day)`
+            feed `market_clock.last_expected_bar_ts(...)` (session-date-aware: US 13:00 -> 12:55,
+            HK 12:00 -> 11:55, 5m). 2026/2027 dates `PROVISIONAL`. See `L2.26`, `docs/development_plan.md`.
 
         L2.7 disclosure: this is a PREVENTATIVE fix. Fuyao does not serve 5m at all
         (`common/financial_api.py` raises for any non-`1d` interval), so no real intraday cache

@@ -26,12 +26,17 @@ tz database; holiday data is pure literal dates in this file).
 |---|---|
 | `holidays_for(market, year)` | raises `HolidayCalendarCoverageError` |
 | `holidays_for_or_none(market, year)` | returns `None` (**UNKNOWN**) |
+| `early_closes_for(market, year)` | raises `HolidayCalendarCoverageError` |
+| `early_closes_for_or_none(market, year)` | returns `None` (**UNKNOWN**) |
 | `is_covered(market, year)` / `calendar_status(...)` | `False` / `"uncovered"` |
 
-`None` is UNKNOWN and is **distinguishable** from `frozenset()`, which would mean
+`None` is UNKNOWN and is **distinguishable** from `frozenset()` / `{}`, which would mean
 "known, and genuinely no holidays".  No caller may ever coerce the two together.
 This is "fail loud" (raise) by default, with an explicit tri-state accessor for
-callers that want to record the reason instead of crashing.
+callers that want to record the reason instead of crashing.  The single documented
+exception is `early_close_time_or_none`, which collapses UNKNOWN onto "full session"
+for the session-*geometry* accessors -- see its docstring for why raising there would
+be worse than the stale deadline it reports.
 
 **Scope / honest limitations (read before widening the window):**
 
@@ -39,12 +44,23 @@ callers that want to record the reason instead of crashing.
    2026 and 2027 are flagged `PROVISIONAL_YEARS`: their statutory arrangements are
    still subject to exchange notices, so they must be re-verified before this
    table is trusted for an order-authorising gate.  2020-2025 are stable history.
-2. **Only full-day closures are modelled.**  Half-days are NOT: HK closes early on
-   Lunar-New-Year's Eve / Christmas Eve / New Year's Eve, and US equities close at
-   13:00 on the day after Thanksgiving and similar eves.  A half-day is therefore
-   still reported as fully `OPEN` after its real close -- conservative in the wrong
-   direction for a trading gate, which is why it is disclosed here rather than
-   silently ignored.  A half-day table is a separate task.
+2. **Full-day closures AND scheduled early closes are modelled** (`L2.27`).  The
+   closure tables (`*_HOLIDAYS`) and the early-close tables (`*_EARLY_CLOSES`) are
+   separate on purpose: a holiday is "no session today", an early close is "a shorter
+   session today" -- collapsing them would make `is_trading_day` wrong.  Early closes
+   are stored as a **per-date close time** in market-local wall clock (US 13:00 on the
+   day after Thanksgiving / July 3 / Christmas Eve when those are sessions; HK 12:00
+   with no afternoon session on the eves of Christmas, New Year and Lunar New Year;
+   China: none -- A-share shortened days are always full closures, already in the
+   holiday table).  An early-close date is therefore *still a trading day* and still
+   reported `OPEN` after its real close by `common/market_clock.py::session_state()`,
+   which keeps `L2.1`'s as-of/completed-session semantics untouched -- only the
+   session-*geometry* accessors (`session_close_time` / `last_expected_bar_ts`) take
+   the shortened close.  That residual gap is disclosed, not hidden: see
+   `MarketSpec.close_time_on`'s docstring in `common/market_clock.py`.
+   Early closes shift the *last bar* obligation, which is exactly what the `L2.26`
+   intraday freshness gate compares against; without this table the 13:00 US days
+   were permanently "not covered" and re-fetched upstream forever.
 3. **Weekend dates inside a holiday block are omitted.**  These markets never trade
    on Sat/Sun (`weekday() >= 5` in `common/market_clock.py`), so listing e.g.
    `2026-02-21` would add no information.  A China "调休" make-up *working* Saturday
@@ -58,7 +74,10 @@ callers that want to record the reason instead of crashing.
 
 **Provenance obligation.**  Entries were transcribed by hand from each exchange's
 published closure calendar.  Any edit here is a data change, not a code change: cite
-the source notice in the per-block comment and bump `TABLE_REVISION`.
+the source notice in the per-block comment and bump `TABLE_REVISION`.  The same applies
+to the `*_EARLY_CLOSES` tables (`L2.27`): 2020-2025 are pinned from published
+NYSE/Nasdaq and HKEX half-day notices, **2026-2027 are `PROVISIONAL`** (rule-derived,
+not yet re-verified against the official notices -- see each block's comment).
 """
 
 from __future__ import annotations
@@ -67,7 +86,8 @@ import datetime as _dt
 from typing import Dict, FrozenSet, Optional, Tuple
 
 #: Bump on every edit to the literal tables below (audit trail for archives).
-TABLE_REVISION = "2026-10-23.1"
+#: `2026-10-23.2` = `L2.27` early-close (half-day) tables added.
+TABLE_REVISION = "2026-10-23.2"
 
 #: First and last calendar year for which the tables below are populated.
 COVERAGE_START_YEAR = 2020
@@ -130,6 +150,22 @@ class HolidayCalendarCoverageError(ValueError):
 def _d(year: int, *month_days: Tuple[int, int]) -> FrozenSet[_dt.date]:
     """Build a holiday set from `(month, day)` pairs (readability over brevity)."""
     return frozenset(_dt.date(year, month, day) for month, day in month_days)
+
+
+def _et(year: int, *entries: Tuple[int, int, int, int]) -> Dict[_dt.date, _dt.time]:
+    """Build an early-close table from `(month, day, hour, minute)` tuples (`L2.27`).
+
+    A dict rather than a set because a half-day needs *when* it stops, not just that it
+    is short: two markets/day-types can close at different hours, and a future 11:30
+    close would need no new structure.
+    """
+    table: Dict[_dt.date, _dt.time] = {}
+    for month, day, hour, minute in entries:
+        date = _dt.date(year, month, day)
+        if date in table:
+            raise ValueError(f"duplicate early-close entry for {date.isoformat()}")
+        table[date] = _dt.time(hour, minute)
+    return table
 
 
 # --- China A-share (SSE / SZSE / BSE) -------------------------------------- #
@@ -330,7 +366,8 @@ HK_HOLIDAYS: Dict[int, FrozenSet[_dt.date]] = {
 # 2021-06-19 statute took effect after that session), Independence Day, Labor Day
 # (1st Mon Sep), Thanksgiving (4th Thu Nov), Christmas.
 # 2025-01-09 is an ad-hoc closure (national day of mourning for President Carter).
-# NOT modelled: 13:00 early closes (day after Thanksgiving, eves).
+# 13:00 early closes live in `US_EARLY_CLOSES` below (L2.27), not here -- a half-day is
+# a shorter *session*, not a closure.
 US_HOLIDAYS: Dict[int, FrozenSet[_dt.date]] = {
     2020: _d(
         2020,
@@ -378,6 +415,89 @@ _TABLES: Dict[str, Dict[int, FrozenSet[_dt.date]]] = {
     MARKET_CHINA: CHINA_HOLIDAYS,
     MARKET_HK: HK_HOLIDAYS,
     MARKET_US: US_HOLIDAYS,
+}
+
+
+# --------------------------------------------------------------------------- #
+# Early-close (half-day) tables -- `L2.27`
+#
+# A half-day is a SHORTER SESSION, not a closure, so it lives beside the closure tables
+# instead of inside them: `is_trading_day()` must keep answering True for these dates.
+# Values are the market-local wall-clock **final close of continuous trading**, the same
+# quantity `common/market_clock.py::MarketSpec.close_time` carries for a normal day, so a
+# consumer never has to know which kind of day it is looking at.
+#
+# Every date below is a weekday that is NOT already a full closure in the table above.
+# That invariant is asserted in `common/tests/test_market_clock.py`
+# (`test_early_close_tables_are_trading_weekdays_inside_the_covered_years`), because a
+# half-day on a holiday would be silently inert *and* would hide a data-entry mistake.
+# --------------------------------------------------------------------------- #
+EarlyCloseTable = Dict[_dt.date, _dt.time]
+
+
+# --- China A-shares: none --------------------------------------------------- #
+# SSE/SZSE/BSE publish no scheduled half-day sessions in the covered window: a shortened
+# trading day (Spring Festival run-up, 调休 adjustments) is always a FULL closure, which
+# `CHINA_HOLIDAYS` already records. The years are listed as explicit EMPTY dicts so
+# "known, and there are none" stays distinguishable from UNKNOWN (`None`), exactly as the
+# `frozenset()` vs `None` discipline requires for closures.
+CHINA_EARLY_CLOSES: Dict[int, EarlyCloseTable] = {
+    year: {} for year in range(COVERAGE_START_YEAR, COVERAGE_END_YEAR + 1)
+}
+
+# --- Hong Kong (HKEX): 12:00, no afternoon session -------------------------- #
+# Rule (HKEX trading calendar): there is NO afternoon trading session on the eves of
+# Christmas, New Year and Lunar New Year, i.e. the day's last continuous bar ends at
+# 12:00 instead of 16:00. An eve that falls on a weekend (Sat/Sun) is not a session at
+# all, so it is simply absent. Source: HKEX "Trading hours" / half-day trading notice.
+HK_EARLY_CLOSES: Dict[int, EarlyCloseTable] = {
+    2020: _et(2020, (1, 24, 12, 0), (12, 24, 12, 0), (12, 31, 12, 0)),
+    2021: _et(2021, (2, 11, 12, 0), (12, 24, 12, 0), (12, 31, 12, 0)),
+    2022: _et(2022, (1, 31, 12, 0)),
+    # 2023: LNY Eve 01-21 and New-Year's Eve 12-31 are Saturdays, Christmas Eve 12-24 is
+    # a Sunday -> no half-day session in the year.
+    2023: _et(2023),
+    2024: _et(2024, (2, 9, 12, 0), (12, 24, 12, 0), (12, 31, 12, 0)),
+    2025: _et(2025, (1, 28, 12, 0), (12, 24, 12, 0), (12, 31, 12, 0)),
+    # PROVISIONAL: 2026 eves (LNY 2026-02-17 -> Eve 02-16 Mon). Re-verify with HKEX.
+    2026: _et(2026, (2, 16, 12, 0), (12, 24, 12, 0), (12, 31, 12, 0)),
+    # PROVISIONAL: 2027 eves (LNY 2027-02-06 -> Eve 02-05 Fri).
+    2027: _et(2027, (2, 5, 12, 0), (12, 24, 12, 0), (12, 31, 12, 0)),
+}
+
+# --- United States (NYSE / Nasdaq): 13:00 ---------------------------------- #
+# Rule-derived, then pinned as literals (auditable, and the rule has exceptions):
+#   * day after Thanksgiving (4th Thu Nov + 1 day)          -> 13:00
+#   * July 3, when it is itself a business day              -> 13:00
+#     (if July 4 falls on a Sat the observed holiday is Fri July 3, a FULL closure; if
+#      July 4 is a Sunday the observed holiday is Mon July 5 and Fri July 2 is a normal
+#      full session -- so those years have no July entry, see 2020/2021/2022/2026/2027)
+#   * Christmas Eve (Dec 24), when it is itself a session   -> 13:00
+#     (Dec 24 Sat/Sun -> nothing; when Dec 25 falls on Sat/Sun the observed closure is
+#      Dec 24 or Dec 26 -- 2021's Dec 24 and 2027's Dec 24 are FULL closures above)
+# NOT modelled / deliberately absent: New Year's Eve (Dec 31) is a full session for US
+# equities (the 14:00 SIFMA recommendation is a bond-market convention, not NYSE/Nasdaq).
+US_EARLY_CLOSES: Dict[int, EarlyCloseTable] = {
+    2020: _et(2020, (11, 27, 13, 0), (12, 24, 13, 0)),
+    # 2021-12-24 is the observed Christmas closure (see US_HOLIDAYS), not a half-day.
+    2021: _et(2021, (11, 26, 13, 0)),
+    2022: _et(2022, (11, 25, 13, 0)),
+    2023: _et(2023, (7, 3, 13, 0), (11, 24, 13, 0)),
+    2024: _et(2024, (7, 3, 13, 0), (11, 29, 13, 0), (12, 24, 13, 0)),
+    2025: _et(2025, (7, 3, 13, 0), (11, 28, 13, 0), (12, 24, 13, 0)),
+    # PROVISIONAL: 2026 (July 3 is the observed Independence Day closure; Thanksgiving
+    # 2026-11-26 -> 11-27; Christmas 12-25 Fri -> Eve 12-24 Thu a half-day).
+    # Re-verify against the NYSE 2026 holiday calendar notice.
+    2026: _et(2026, (11, 27, 13, 0), (12, 24, 13, 0)),
+    # PROVISIONAL: 2027 (Christmas 12-25 Sat -> observed closure 12-24 Fri, already in
+    # US_HOLIDAYS, so 2027 has a single early close). Re-verify with NYSE.
+    2027: _et(2027, (11, 26, 13, 0)),
+}
+
+_EARLY_CLOSE_TABLES: Dict[str, Dict[int, EarlyCloseTable]] = {
+    MARKET_CHINA: CHINA_EARLY_CLOSES,
+    MARKET_HK: HK_EARLY_CLOSES,
+    MARKET_US: US_EARLY_CLOSES,
 }
 
 
@@ -489,6 +609,68 @@ def holidays_in_range(
     return frozenset(d for d in covered if start <= d <= end)
 
 
+def early_closes_for(market: str, year: int) -> EarlyCloseTable:
+    """`{date: market-local close time}` for the early closes of `year` (`L2.27`).
+
+    An **empty dict** means "covered year, no early closes" (China always).  Raises
+    `HolidayCalendarCoverageError` when `year` is outside the static table -- UNKNOWN is
+    never reported as "no half-days", same discipline as `holidays_for`.
+
+    The mapping is returned as a *copy*: the literal tables are process-wide state, and a
+    caller that mutated them would corrupt every later freshness decision in the process.
+    """
+    canonical = normalize_market(market)
+    table = _TABLES[canonical]
+    try:
+        return dict(_EARLY_CLOSE_TABLES[canonical][int(year)])
+    except (KeyError, ValueError):
+        raise HolidayCalendarCoverageError(
+            f"early-close calendar for market={canonical!r} has no data for year={year!r}: "
+            f"covered range is {min(table)}-{max(table)} (table revision {TABLE_REVISION}). "
+            "This is UNKNOWN, not 'no early closes' -- extend the `*_EARLY_CLOSES` tables "
+            "in common/market_holidays.py after checking the official exchange notice."
+        ) from None
+
+
+def early_closes_for_or_none(market: str, year: int) -> Optional[EarlyCloseTable]:
+    """Tri-state accessor: the early-close map, or `None` meaning **UNKNOWN**.
+
+    `None` (uncovered year) stays distinct from `{}` (covered, no early closes), exactly
+    as in `holidays_for_or_none`.
+    """
+    canonical = normalize_market(market)
+    table = _EARLY_CLOSE_TABLES[canonical].get(int(year))
+    return None if table is None else dict(table)
+
+
+def early_close_time(market: str, day: _dt.date) -> Optional[_dt.time]:
+    """Early-close time of `day`, or `None` when it is a normal full session.
+
+    Raises `HolidayCalendarCoverageError` for an uncovered year (UNKNOWN is not "normal").
+    Use `early_close_time_or_none` for the session-geometry call sites that must not
+    raise into a coverage predicate.
+    """
+    return early_closes_for(market, day.year).get(day)
+
+
+def early_close_time_or_none(market: str, day: _dt.date) -> Optional[_dt.time]:
+    """Early-close time of `day`, or `None` -- **the one deliberate tri-state collapse**.
+
+    `None` here covers both "normal full session" and "year not in the static table
+    (UNKNOWN)".  This is the only place in this module where those two are merged, and it
+    is merged on purpose: the consumer is session *geometry* (`MarketSpec.close_time_on`
+    -> `common/market_clock.py::last_expected_bar_ts`), whose answer feeds a boolean
+    coverage predicate.  Raising there would abort the predicate and make the caller
+    (`common/data.py::fetch_universe`) silently drop the asset -- a worse failure than the
+    one it reports.  The safe direction is kept: falling back to the FULL session close
+    means a genuinely short session is judged "not covered" (a redundant re-fetch), never
+    "covered" with a truncated day.  Callers that must distinguish the two states use
+    `is_covered()` / `early_closes_for()`.
+    """
+    table = early_closes_for_or_none(market, day.year)
+    return None if table is None else table.get(day)
+
+
 def table_revision() -> str:
     """Revision string of the literal tables (for archive/audit logs)."""
     return TABLE_REVISION
@@ -498,7 +680,11 @@ __all__ = [
     "COVERAGE_START_YEAR",
     "COVERAGE_END_YEAR",
     "CHINA_HOLIDAYS",
+    "CHINA_EARLY_CLOSES",
+    "EarlyCloseTable",
+    "HK_EARLY_CLOSES",
     "HK_HOLIDAYS",
+    "US_EARLY_CLOSES",
     "US_HOLIDAYS",
     "HolidayCalendarCoverageError",
     "MARKET_CHINA",
@@ -511,6 +697,10 @@ __all__ = [
     "all_holidays",
     "calendar_status",
     "coverage_years",
+    "early_close_time",
+    "early_close_time_or_none",
+    "early_closes_for",
+    "early_closes_for_or_none",
     "holidays_for",
     "holidays_for_or_none",
     "holidays_in_range",

@@ -60,6 +60,13 @@ from pipeline.research_strategy.rs.chan_advanced_strategies import (
     ChanVaaCompoundStrategy,
     ChanFourStateExecutionStrategy,
     ChanCompositeStrategy,
+    ChanMeanReversionDivergenceStrategy,
+)
+from pipeline.research_strategy.rs.chan_vp_hybrid_strategy import (
+    ChanVolumeProfileHybridStrategy,
+)
+from pipeline.research_strategy.rs.wyckoff_chan_strategy import (
+    WyckoffChanSpringStrategy,
 )
 from pipeline.research_strategy.rs.worldquant_alpha_strategy import (
     WorldQuantAlphaStrategy,
@@ -183,18 +190,31 @@ def test_blend_strategies_versioning():
 
 
 def test_research_strategies_versioning():
-    """Verify research strategy classes have version='1.0.0'."""
-    strats = [
-        ChanThreeTypeStrategy(),
-        ChanVaaCompoundStrategy(),
-        ChanFourStateExecutionStrategy(),
-        ChanCompositeStrategy(),
-        WorldQuantAlphaStrategy(),
-        WorldQuantMegaAlphaStrategy(),
-    ]
-    for s in strats:
-        assert getattr(s, "version", None) == "1.0.0", f"{type(s).__name__} should have version 1.0.0"
-        assert s.version_string == "v1.0.0"
+    """Verify research strategy classes carry the expected version.
+
+    Tasks C5.1/C5.2 bumped three strategies from 1.0.0 -> 1.1.0:
+    - WyckoffChanSpringStrategy / ChanMeanReversionDivergenceStrategy: curvature
+      gates moved off the structurally unreachable 1.5 default.
+    - ChanVolumeProfileHybridStrategy: HVN validation now uses the same-window
+      value area (VAL/VAH) instead of the stale confirmed pivot [ZD, ZG].
+    """
+    expected_versions = {
+        ChanThreeTypeStrategy: "1.0.0",
+        ChanVaaCompoundStrategy: "1.0.0",
+        ChanFourStateExecutionStrategy: "1.0.0",
+        ChanCompositeStrategy: "1.0.0",
+        WorldQuantAlphaStrategy: "1.0.0",
+        WorldQuantMegaAlphaStrategy: "1.0.0",
+        WyckoffChanSpringStrategy: "1.1.0",
+        ChanMeanReversionDivergenceStrategy: "1.1.0",
+        ChanVolumeProfileHybridStrategy: "1.1.0",
+    }
+    for cls, expected in expected_versions.items():
+        s = cls()
+        assert getattr(s, "version", None) == expected, (
+            f"{cls.__name__} should have version {expected}"
+        )
+        assert s.version_string == f"v{expected}"
 
 
 def test_instantiate_strategy_from_config_entry():

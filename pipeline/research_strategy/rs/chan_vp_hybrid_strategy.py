@@ -7,10 +7,14 @@ Academic Grounding:
 
 Quantitative Mechanics:
 1. HVN Pivot Validation:
-   - Identifies causal Chan pivots [ZD, ZG] via stroke/fractal extraction.
+   - Identifies causal Chan pivots [ZD, ZG] via stroke/fractal extraction (used for the
+     structural breakout/retest and stop levels).
    - Computes rolling Volume Profile (POC, VAL, VAH) and consolidation volume density.
-   - Confirms pivot validity only when consolidation density >= min_density (default 0.45)
-     and POC resides within [ZD, ZG], filtering out hollow false pivots.
+   - Confirms an HVN only when the SAME-WINDOW value area density >= min_density
+     (default 0.45) and POC resides within [VAL, VAH], filtering out hollow false pivots.
+     Task C5.2: this used to test POC against the already-confirmed (lagged) pivot
+     [ZD, ZG]; the 60d POC and stale ZD/ZG had zero overlap on the synthetic universe,
+     so hvn_valid was always False and the strategy never traded.
 2. SanMai (Third Buy) Value Acceptance & Vacuum Traverse:
    - Gated on Third Buy (B3) breakout retest holding above ZG and VAH.
    - Confirms high push efficiency via Wyckoff Effort-vs-Result (effort_result >= 0.80).
@@ -156,6 +160,10 @@ class ChanVolumeProfileHybridStrategy(AllocationTemplate):
     breakout retest entries across liquidity vacuums.
     """
 
+    # Task C5.2: 1.0.0 -> 1.1.0 -- HVN validation re-based from the stale
+    # confirmed pivot [ZD, ZG] onto the same-window value area [VAL, VAH].
+    version: str = "1.1.0"
+
     def __init__(self, config: StrategyConfig = None):
         self.config = config or StrategyConfig()
         super().__init__(
@@ -206,11 +214,25 @@ class ChanVolumeProfileHybridStrategy(AllocationTemplate):
                 bars, lookback=vp_lookback, n_bins=n_bins, value_area_pct=val_pct
             )
             poc_s = pd.Series(poc_arr, index=bars.index)
+            val_s = pd.Series(val_arr, index=bars.index)
             vah_s = pd.Series(vah_arr, index=bars.index)
 
             # 3. Consolidation Density & HVN validation
-            cd_s = consolidation_density(bars, zd=zd_s, zg=zg_s, window=20)
-            hvn_instant = (cd_s >= min_density) & (poc_s >= zd_s) & (poc_s <= zg_s) & (zg_s > zd_s)
+            # Task C5.2: measure density against the SAME-WINDOW value area
+            # [VAL, VAH] that the rolling profile just produced. Passing the
+            # confirmed pivot [ZD, ZG] here was the bug: a Chan pivot is only
+            # known a stroke/segment late, so on synthetic data the 60d POC had
+            # exactly zero overlap with the stale band, hvn_valid was always
+            # False, and the strategy could never open a position. [ZD, ZG]
+            # remain structural inputs further below (breakout/retest vs ZG,
+            # stop vs ZD, hvn_recent freshness vs ZG) and are untouched.
+            cd_s = consolidation_density(bars, zd=val_s, zg=vah_s, window=20)
+            # NOTE: POC in [VAL, VAH] holds BY CONSTRUCTION of
+            # compute_rolling_poc_series (the value area is grown outward from
+            # the POC bin), so the POC clause is a cheap sanity/integrity check,
+            # not an independent filter -- the effective gate here is the
+            # same-window value-area density >= min_density.
+            hvn_instant = (cd_s >= min_density) & (poc_s >= val_s) & (poc_s <= vah_s) & (vah_s > val_s)
             hvn_recent = hvn_instant.rolling(vp_lookback, min_periods=1).max().astype(bool)
             hvn_valid = hvn_instant | (hvn_recent & (bars["Close"] >= zg_s * 0.99))
 

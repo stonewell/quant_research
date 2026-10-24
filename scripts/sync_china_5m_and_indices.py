@@ -56,6 +56,7 @@ from common.financial_api import (
     is_index_symbol,
     normalize_thscode,
 )
+from common.market_clock import MARKET_CHINA, market_now
 
 MAJOR_INDICES = [
     "000300.SH",  # CSI 300
@@ -66,6 +67,24 @@ MAJOR_INDICES = [
     "399001.SZ",  # SZSE Component
     "399006.SZ",  # ChiNext
 ]
+
+
+def default_end_date(now: Optional[datetime.datetime] = None) -> str:
+    """`--end` default: the current **market** calendar day, never the host's.
+
+    (development_plan.md `L2.31`) Owner of "today in the A-share calendar" is
+    `common/market_clock.py`; `date.today()` on a UTC-7 host at 2026-10-23T00:30Z says
+    2026-10-22 while Shanghai is already 2026-10-23, so the sync would silently end a day
+    early -- and, on the intraday path, never fetch the session the recorder is writing.
+
+    Deliberately the market **calendar** date (`market_now(...).local_date()`), not
+    `as_of_trading_date` (close + publication grace): `--end` is a *fetch bound*, not a
+    valuation date. Pinning it to the last published session would make a mid-afternoon
+    run skip today entirely, so a daily tail sync could never catch up until the next day;
+    the two-day lag tolerances in this script (`end_date - timedelta(days=2)`) already
+    absorb an unpublished day.
+    """
+    return market_now(MARKET_CHINA, now=now).local_date().isoformat()
 
 
 def load_universe(file_path: str) -> List[str]:
@@ -1250,7 +1269,15 @@ def main():
     )
     parser.add_argument("--start-5m", default="2022-01-01", help="Start date for 5m intraday sync")
     parser.add_argument("--start-1d", default="2016-01-01", help="Start date for index daily sync")
-    parser.add_argument("--end", default=datetime.date.today().strftime("%Y-%m-%d"), help="End date for sync")
+    parser.add_argument(
+        "--end",
+        default=default_end_date(),
+        help=(
+            "End date for sync (YYYY-MM-DD). Default: today in the A-share MARKET calendar "
+            "(`common/market_clock`), not the host's local calendar date -- a UTC-7 host "
+            "would otherwise stop one session early."
+        ),
+    )
     parser.add_argument("--cache-dir", default=os.path.join(_REPO_ROOT, "data"), help="DuckDB cache folder")
 
     args = parser.parse_args()

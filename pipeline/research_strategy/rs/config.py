@@ -892,7 +892,12 @@ class StrategyConfig:
 
     wyckoff_spring_max_penetration: float = 0.04
     wyckoff_spring_min_penetration: float = 0.005
-    wyckoff_spring_min_curvature: float = 1.5
+    # Task C5.1: 1.5 -> 0.8 (interim reachability default). extremum_curvature
+    # z-scores its window before the quadratic fit, so on a full window=5 fit
+    # |kappa| <= 2*sqrt(5/14) ~= 1.1952 -- a 1.5 gate is structurally
+    # unreachable and made every curvature-gated branch untradeable. 0.8 is NOT
+    # a walkforward-optimised threshold; that calibration is a separate task.
+    wyckoff_spring_min_curvature: float = 0.8
     wyckoff_spring_min_rel_vol: float = 1.0
     wyckoff_spring_stop_buffer_pct: float = 0.005
     wyckoff_spring_max_holding_days: int = 30

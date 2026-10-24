@@ -81,12 +81,14 @@ from common.universe import (
 )
 from pipeline.live_signal.lsig.signal import as_of_universe, latest_rebalance_rows
 from scripts.run_live_strategy import (
+    announce_run_mode,
     load_holdings,
     load_symbol_names,
     pad_east_asian,
     resolve_holding_bars,
     resolve_holdings_weights_and_shares,
     resolve_lot_size,
+    resolve_run_mode,
     resolve_strategy_definition,
 )
 
@@ -177,7 +179,10 @@ def parse_args():
         help=(
             "Valuation as-of-date (YYYY-MM-DD). Default: the market clock's as_of_trading_date "
             "(close + publication grace, market-local), never the host's local date. An explicit "
-            "value must be a --market trading day and may not be later than the latest published session."
+            "value must be a --market trading day and may not be later than the latest published session. "
+            "WARN: a PAST trading day is a deliberate history replay -- the run-window gate is skipped by "
+            "design (盘中手工回放仍能出工单) and the run is marked run_mode=replay in summary.json; do not "
+            "archive that netted ticket as a same-day live one or use it for attribution."
         ),
     )
     parser.add_argument(
@@ -283,6 +288,15 @@ def main():
         raise ValueError(f"Could not resolve universe from {args.universe_file}")
     clock_ctx = resolve_live_clock_context(args, universe_symbols, stage="stage2")
     val_date = clock_ctx.as_of_date
+    # (L2.30) This entrypoint resolves the clock EXACTLY as Stage 2 does
+    # (`add_market_clock_cli_args` + `resolve_live_clock_context`) and declares its own
+    # `--as-of-date`, so a pinned past session bypasses the run-window gate here too and a
+    # full netted ticket still comes out. Without this the archived summary would look like a
+    # same-day real run -- the precise failure mode L2.30 exists to prevent. Both helpers are
+    # imported from `scripts.run_live_strategy` on purpose: there must be exactly ONE replay
+    # predicate in the codebase, not a second copy that can drift.
+    run_mode = resolve_run_mode(clock_ctx)
+    announce_run_mode(clock_ctx, run_mode)
     if getattr(args, "start_date", None):
         start_date = args.start_date
     else:
@@ -341,7 +355,7 @@ def main():
         clock_ctx,
         freshness_summary=freshness_summary,
         probe_attempts=probe_attempts,
-        extra={"date": val_date, "stage": "multi_strategy_netted"},
+        extra={"date": val_date, "stage": "multi_strategy_netted", "run_mode": run_mode},
     )
 
     # (2026-10-22 incident, Fix 2 / L2.3) Netting prices come from the SAME single

@@ -27,10 +27,14 @@ lands in pytest's `tmp_path`.
 """
 
 import ast
+import contextlib
 import datetime as dt
+import io
 import json
 import os
 import sys
+import time
+import tokenize
 from zoneinfo import ZoneInfo
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -613,3 +617,447 @@ def test_load_universe_with_banner_forwards_expected_last_session(monkeypatch):
         ["600000.SH"], "2026-01-01", "2026-10-22", expected_last_session=dt.date(2026, 10, 22)
     )
     assert seen.get("expected_last_session") == dt.date(2026, 10, 22)
+
+
+# --------------------------------------------------------------------------- #
+# L2.30 -- `--as-of-date` replay: loud banner + `run_mode` marker
+# --------------------------------------------------------------------------- #
+def _summary(tmp_path):
+    return json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+
+
+def test_replay_run_warns_and_marks_summary_run_mode(monkeypatch, tmp_path, capsys):
+    """A pinned PAST session skips the run-window gate BY DESIGN -- and must say so.
+
+    Same instant as `test_explicit_earlier_as_of_is_a_labelled_replay` (Beijing 09:59, i.e.
+    a live-time run would be refused), so the only thing that lets this run produce a ticket
+    is the replay semantics. The ticket must therefore be unmistakable: a WARN banner on the
+    terminal plus `run_mode=replay` in the machine-readable archive.
+    """
+    from scripts.run_live_strategy import main as live_main
+
+    _freeze(monkeypatch, _BEIJING_0959)
+    live_main(_stage2_args(tmp_path, "2026-10-20"))
+
+    out = capsys.readouterr().out
+    assert "REPLAY MODE" in out
+    assert "run_mode=replay" in out
+    assert "盘中手工回放仍能出工单" in out  # the exact operational caveat, not a vague hint
+
+    summary = _summary(tmp_path)
+    assert summary["run_mode"] == "replay"
+    assert summary["date"] == "2026-10-20"
+    assert summary["stage"] == "stage2"
+    # The marker does not replace the existing clock block -- it is added next to it.
+    assert summary["clock"]["run_window_gate"] == "not_applicable_replay"
+    assert summary["clock"]["as_of_trading_date"] == "2026-10-20"
+    # A replay still emits a real ticket: that is why the marker exists.
+    assert (tmp_path / "live_trading_ticket.csv").exists()
+
+
+def test_default_live_run_has_no_replay_marker(monkeypatch, tmp_path, capsys):
+    """No `--as-of-date`: as-of is the clock's published session -> `run_mode=live`."""
+    from scripts.run_live_strategy import main as live_main
+
+    _freeze(monkeypatch, _BEIJING_1530)  # 15:30 Beijing, as_of 2026-10-23
+    live_main(_stage2_args(tmp_path))
+
+    out = capsys.readouterr().out
+    assert "REPLAY MODE" not in out
+    summary = _summary(tmp_path)
+    assert summary["run_mode"] == "live"
+    assert summary["date"] == _AS_OF_PUBLISHED
+
+
+def test_explicit_same_day_as_of_is_live_not_replay(monkeypatch, tmp_path, capsys):
+    """An explicit `--as-of-date` EQUAL to the clock's session is still a live run.
+
+    This is the shape the web layer passes; it must not be labelled a replay (bit-for-bit
+    unchanged apart from the added `run_mode=live` key).
+    """
+    from scripts.run_live_strategy import main as live_main
+
+    _freeze(monkeypatch, _BEIJING_1530)
+    live_main(_stage2_args(tmp_path, _AS_OF_PUBLISHED))
+
+    out = capsys.readouterr().out
+    assert "REPLAY MODE" not in out
+    summary = _summary(tmp_path)
+    assert summary["run_mode"] == "live"
+    assert summary["clock"]["run_window_gate"] == "not_applicable"
+    assert summary["clock"]["as_of_source"] == "explicit"
+
+
+def test_resolve_run_mode_agrees_with_the_gate_verdict():
+    """One predicate, two spellings: the marker may never contradict `window_gate`."""
+
+    def _ctx(gate, as_of, clock_as_of, source):
+        return type(
+            "Ctx",
+            (),
+            {
+                "window_gate": gate,
+                "as_of_date": as_of,
+                "clock_as_of": clock_as_of,
+                "as_of_source": source,
+            },
+        )()
+
+    from scripts.run_live_strategy import resolve_run_mode
+
+    # The gate's own replay verdict is authoritative.
+    assert resolve_run_mode(_ctx("not_applicable_replay", "2026-10-20", "2026-10-23", "explicit")) == "replay"
+    # The defensive second spelling (gate label renamed, same predicate).
+    assert resolve_run_mode(_ctx("something_else", "2026-10-20", "2026-10-23", "explicit")) == "replay"
+    # Same-day explicit, clock-derived, and in-window runs are all live.
+    assert resolve_run_mode(_ctx("not_applicable", "2026-10-23", "2026-10-23", "explicit")) == "live"
+    assert resolve_run_mode(_ctx("in_window", "2026-10-23", "2026-10-23", "market_clock")) == "live"
+    # A future as-of never reaches the marker (the clock rejects it earlier), but even if it
+    # did, it must not be reported as a replay of a past session.
+    assert resolve_run_mode(_ctx("in_window", "2026-10-24", "2026-10-23", "explicit")) == "live"
+
+
+# --------------------------------------------------------------------------- #
+# L2.31 -- the 5 script-layer `date.today()` sites are MARKET-clock dates
+# --------------------------------------------------------------------------- #
+#: Host-vs-market discriminator: 2026-10-23T00:30Z is 17:30 THU 10-22 in Los Angeles
+#: (UTC-7, PDT) but 08:30 FRI 10-23 in Shanghai. A host-calendar answer and the market
+#: answer therefore differ by a full day -- exactly the off-by-one this task removes.
+_L5_INSTANT = dt.datetime(2026, 10, 23, 0, 30, tzinfo=_UTC)
+_L5_MARKET_DAY = dt.date(2026, 10, 23)          # market calendar day at the instant
+_L5_MARKET_AS_OF = dt.date(2026, 10, 22)        # close+grace: today is PRE_OPEN -> prior day
+
+
+# --------------------------------------------------------------------------- #
+# TEST-ISOLATION CONTRACT (read before touching anything below)
+# --------------------------------------------------------------------------- #
+# `L2.31` needs "host TZ != market TZ", and the only honest way to express that is to
+# mutate the process's `TZ` + `time.tzset()`. That is inherently GLOBAL state, so this
+# module keeps every such mutation inside a restored context manager and every clock
+# freeze inside `monkeypatch`:
+#
+#   * `_host_timezone(...)` -- a `@contextlib.contextmanager` whose `finally` restores the
+#     previous `TZ` (or pops it) AND re-calls `time.tzset()`, so it is safe even on error;
+#   * `_freeze(...)` / `_freeze_module_clock(...)` -- `monkeypatch.setattr`, which pytest
+#     undoes per test. They are deliberately NOT `pytest.fixture(scope="module")` and
+#     never write to a module-level variable.
+#
+# DO NOT replace any of these with a module/session-scoped fixture, a bare
+# `os.environ["TZ"] = ...`, or `unittest.mock.patch` without `addCleanup`: a leaked TZ or
+# a leaked frozen clock silently rewrites "what day is it" for every later test in the
+# session (it is exactly the class of bug `L2.31` itself removes). If a future test needs
+# a frozen clock, use `monkeypatch` so teardown is automatic.
+# --------------------------------------------------------------------------- #
+
+
+@contextlib.contextmanager
+def _host_timezone(tz_name):
+    """Run a block with the process's local timezone set to `tz_name` (POSIX `TZ`).
+
+    `date.today()` reads the host zone; setting `TZ` + `time.tzset()` is what makes the
+    host-calendar answer observably wrong on a non-market host, so it is the only honest
+    way to pin "host TZ != market TZ". Restored even on failure.
+    """
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = tz_name
+    time.tzset()
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()
+
+
+def _freeze_module_clock(monkeypatch, module, instant):
+    """Freeze `module.market_now` (the script modules import it by name)."""
+    real = module.market_now
+
+    def _frozen(market=None, now=None, holidays=None, publication_grace_minutes=None):
+        return real(
+            market,
+            now=now if now is not None else instant,
+            holidays=holidays,
+            publication_grace_minutes=publication_grace_minutes,
+        )
+
+    monkeypatch.setattr(module, "market_now", _frozen)
+
+
+def test_host_timezone_context_restores_even_on_exception():
+    """The `TZ` mutation is process-global, so it MUST be undone -- including on error.
+
+    A leaked `TZ` (or a leaked frozen clock) silently shifts "what day is it" for every
+    later test in the session, which is the reported cross-file pollution class and the
+    very bug `L2.31` removes one layer down. This pins the restore contract that makes
+    `test_five_script_date_sites_follow_the_market_clock` safe to run before any other
+    file. See this module's TEST-ISOLATION CONTRACT block.
+    """
+    before_env = os.environ.get("TZ")
+    before_offset = dt.datetime.now().astimezone().utcoffset()
+
+    with pytest.raises(RuntimeError):
+        with _host_timezone("America/Los_Angeles"):
+            assert dt.datetime.now().astimezone().utcoffset() == dt.timedelta(hours=-7)
+            raise RuntimeError("boom")
+
+    assert os.environ.get("TZ") == before_env
+    assert dt.datetime.now().astimezone().utcoffset() == before_offset
+
+
+@pytest.mark.parametrize(
+    "host_tz,host_day",
+    [
+        ("America/Los_Angeles", dt.date(2026, 10, 22)),  # UTC-7: one day BEHIND the market
+        ("Asia/Shanghai", dt.date(2026, 10, 23)),        # market zone: same day
+    ],
+)
+def test_five_script_date_sites_follow_the_market_clock(host_tz, host_day, monkeypatch):
+    """All 5 former `date.today()` decision points must answer with the MARKET date.
+
+    Sites (development_plan.md `L2.31`):
+      1. `run_live_strategy.resolve_exit_cooldown` -> holding/cooldown fallback as-of;
+      2. `sync_china_5m_and_indices` `--end` default;
+      3. `record_intraday_5m` EastMoney intraday fallback fetch window;
+      4. `record_intraday_5m.cleanup_old_parquet_files` retention age;
+      5. `record_intraday_5m.main` `{date}.parquet` key.
+    """
+    from common.market_clock import as_of_trading_date
+    from scripts import record_intraday_5m as rec
+    from scripts import run_live_strategy as rls
+    from scripts import sync_china_5m_and_indices as sync
+    import pandas as pd
+
+    # Precondition of the test itself: the host calendar really does disagree on UTC-7.
+    assert _L5_INSTANT.astimezone(ZoneInfo(host_tz)).date() == host_day
+
+    with _host_timezone(host_tz):
+        clock_as_of = as_of_trading_date(now=_L5_INSTANT, market="china")
+        assert clock_as_of == _L5_MARKET_AS_OF
+
+        # --- site 1: cooldown/tenure fallback -------------------------------------
+        seen = []
+
+        def _recorder(exit_d, as_of_d):
+            seen.append((exit_d, as_of_d))
+            return []
+
+        monkeypatch.setattr(rls, "check_missing_trading_days", _recorder)
+        rls.resolve_exit_cooldown(
+            ["600000.SH"],
+            account_state={"last_exit_date": {"600000.SH": "2026-10-20"}},
+            as_of_date=None,  # exercise the fallback under test
+            now=_L5_INSTANT,
+        )
+        assert seen == [(dt.date(2026, 10, 20), _L5_MARKET_AS_OF)]
+        # ... and the as-of resolution alone (no calendar call needed):
+        assert rls.resolve_market_as_of_date(["600000.SH"], now=_L5_INSTANT) == _L5_MARKET_AS_OF
+        # An unrecognisable/mixed symbol list cannot pick a calendar -> documented A-share
+        # default instead of an exception (which callers swallow as "no anchor").
+        assert rls.resolve_market_as_of_date(["NEW_SYM"], now=_L5_INSTANT) == _L5_MARKET_AS_OF
+        assert rls.resolve_market_as_of_date(["600000.SH", "AAPL"], now=_L5_INSTANT) == _L5_MARKET_AS_OF
+
+        # --- site 2: `--end` default ----------------------------------------------
+        assert sync.default_end_date(now=_L5_INSTANT) == "2026-10-23"
+
+        # --- site 3: EastMoney intraday fallback fetch window ---------------------
+        _freeze_module_clock(monkeypatch, rec, _L5_INSTANT)
+        windows = []
+
+        class _RecordingEastMoney:
+            def __init__(self, *a, **k):
+                pass
+
+            def fetch_ohlcv(self, symbol, start, end, interval="5m"):
+                windows.append((symbol, start, end))
+                return pd.DataFrame()
+
+        monkeypatch.setattr(rec, "EastMoneyDataProvider", _RecordingEastMoney)
+        etfs = ["510300.SH", "510500.SH", "159919.SZ", "511880.SH", "512100.SH", "588000.SH"]
+        rec.FuyaoThrottledClient(client=object()).get_snapshots(etfs)
+        assert len(windows) == len(etfs)
+        assert {(start, end) for _, start, end in windows} == {("2026-10-23", "2026-10-23")}
+
+        # --- site 4: retention age, on the same calendar as the filename key ------
+        assert rec.market_today() == _L5_MARKET_DAY
+        kept = rec.market_today() - dt.timedelta(days=90)     # age == 90 -> keep
+        expired = rec.market_today() - dt.timedelta(days=91)  # age == 91 -> delete
+        assert kept == dt.date(2026, 7, 25) and expired == dt.date(2026, 7, 24)
+
+        # --- site 5: the `{date}.parquet` key -------------------------------------
+        assert rec.market_today_str() == "2026-10-23"
+
+        # Host-TZ invariance: the answers above did not depend on `host_tz`.
+        assert rec.market_today() == _L5_MARKET_DAY
+        assert sync.default_end_date(now=_L5_INSTANT) == "2026-10-23"
+
+
+@pytest.mark.parametrize("host_tz", ["America/Los_Angeles", "Asia/Shanghai"])
+def test_retention_cleanup_uses_the_market_day(host_tz, monkeypatch, tmp_path):
+    """Site 4 behaviourally: a UTC-7 host must not keep an extra day of parquet files."""
+    from scripts import record_intraday_5m as rec
+
+    _freeze_module_clock(monkeypatch, rec, _L5_INSTANT)
+    with _host_timezone(host_tz):
+        keep = tmp_path / "2026-07-25.parquet"   # age 90 vs market day 2026-10-23
+        drop = tmp_path / "2026-07-24.parquet"   # age 91
+        for path in (keep, drop):
+            path.write_bytes(b"x")
+
+        deleted = rec.cleanup_old_parquet_files(str(tmp_path), retention_days=90)
+
+        assert keep.exists(), "a file exactly at the retention boundary must be kept"
+        assert not drop.exists(), "a file past the retention boundary must be deleted"
+        assert deleted == [str(drop)]
+
+
+def test_main_keys_the_daily_parquet_file_on_the_market_day():
+    """Site 5 structurally: a long-running recorder must never revert to `date.today()`."""
+    import inspect
+
+    from scripts import record_intraday_5m as rec
+
+    src = inspect.getsource(rec.main)
+    assert "market_today_str()" in src
+    # `--once` runs write `{market day}.parquet` through `writer.write_bars(..., today_str)`.
+    assert "today_str" in src
+
+
+def _date_today_call_lines(path):
+    """Line numbers of real `date.today()` CALLS (comments/strings never count).
+
+    Token-level, so a comment or docstring that records the `L2.31` history keeps its
+    literal without failing the guard -- while any live call, however it is spelled
+    (`date.today()`, `datetime.date.today()`), is caught.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        source = f.read()
+    skip = {tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT}
+    toks = [t for t in tokenize.generate_tokens(io.StringIO(source).readline) if t.type not in skip]
+    hits = []
+    for i in range(len(toks) - 3):
+        a, b, c, d = toks[i], toks[i + 1], toks[i + 2], toks[i + 3]
+        if (
+            a.type == tokenize.NAME
+            and a.string == "date"
+            and b.string == "."
+            and c.type == tokenize.NAME
+            and c.string == "today"
+            and d.string == "("
+        ):
+            hits.append(a.start[0])
+    return hits
+
+
+def test_no_bare_date_today_call_left_in_scripts():
+    """`grep -rn "date.today()" scripts/` == zero NON-COMMENT hits (L2.31 acceptance)."""
+    scripts_dir = os.path.join(_REPO_ROOT, "scripts")
+    offenders = {}
+    for fname in sorted(os.listdir(scripts_dir)):
+        if not fname.endswith(".py"):
+            continue
+        lines = _date_today_call_lines(os.path.join(scripts_dir, fname))
+        if lines:
+            offenders[fname] = lines
+    assert offenders == {}, (
+        "script-layer code still derives a date from the HOST calendar; route it through "
+        f"common/market_clock instead: {offenders}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# L2.30 (residual) -- the MULTI-STRATEGY netted entrypoint carries the same marker
+# --------------------------------------------------------------------------- #
+def _multi_strategy_args(tmp_path, as_of=None):
+    """CLI for `scripts/run_live_multi_strategy.py` (the netted runner)."""
+    universe_file = _write_universe(tmp_path, ["600000.SH", "601857.SH", "BIL"])
+    cmd = [
+        "--strategies", "equal_weight:1.0",
+        "--universe-file", universe_file,
+        "--output-dir", str(tmp_path),
+        "--start-date", "2026-01-01",
+        "--data-provider", "synthetic",
+        "--portfolio-value", "100000",
+        "--no-cache",
+    ]
+    if as_of:
+        cmd.extend(["--as-of-date", as_of])
+    return cmd
+
+
+class _StopAfterPersist(Exception):
+    """Sentinel: stop `main()` at the archive step -- nothing after it is under test."""
+
+
+def _run_multi_strategy_to_archive(monkeypatch, tmp_path, capsys, as_of):
+    """Drive the real `main()` up to (and including) its `persist_run_metadata` call site.
+
+    Only the data/freshness boundaries are stubbed; the clock resolution, the banner, the
+    argument parsing and the archive call itself are the real code paths -- that is the
+    whole point, since the bug being guarded against was a MISSING keyword at that site.
+    """
+    from scripts import run_live_multi_strategy as rms
+
+    captured = {}
+
+    def _fake_persist(output_dir, clock_ctx, **kwargs):
+        captured["extra"] = kwargs.get("extra")
+        captured["as_of"] = clock_ctx.as_of_date
+        captured["gate"] = clock_ctx.window_gate
+        raise _StopAfterPersist
+
+    monkeypatch.setattr(rms, "load_live_universe", lambda *a, **k: ({}, 1))
+    monkeypatch.setattr(rms, "assert_fresh_universe", lambda *a, **k: {})
+    monkeypatch.setattr(rms, "persist_run_metadata", _fake_persist)
+    monkeypatch.setattr(
+        sys, "argv", ["run_live_multi_strategy.py"] + _multi_strategy_args(tmp_path, as_of)
+    )
+
+    with pytest.raises(_StopAfterPersist):
+        rms.main()
+    return captured, capsys.readouterr().out
+
+
+def test_multi_strategy_entry_marks_replay_run_mode(monkeypatch, tmp_path, capsys):
+    """A replay routed through the NETTED runner must announce itself AND archive the marker.
+
+    `run_live_multi_strategy.main()` resolves the clock via `resolve_live_clock_context`
+    exactly as Stage 2 does and declares its own `--as-of-date`, so a pinned past session
+    bypasses the run-window gate there too and still emits a full netted ticket. Until the
+    marker was threaded, that archive was indistinguishable from a same-day live run --
+    the precise failure mode `L2.30` exists to prevent.
+    """
+    _freeze(monkeypatch, _BEIJING_0959)  # a live-time run at this instant would be REFUSED
+    captured, out = _run_multi_strategy_to_archive(monkeypatch, tmp_path, capsys, "2026-10-20")
+
+    assert captured["gate"] == "not_applicable_replay"
+    assert "REPLAY MODE" in out
+    assert "盘中手工回放仍能出工单" in out  # the exact operational caveat, not a vague hint
+    assert captured["extra"]["run_mode"] == "replay"
+    assert captured["extra"]["stage"] == "multi_strategy_netted"
+    assert captured["extra"]["date"] == "2026-10-20"
+
+
+def test_multi_strategy_entry_default_run_is_live(monkeypatch, tmp_path, capsys):
+    """No `--as-of-date`: as-of is the clock's published session -> `run_mode=live`."""
+    _freeze(monkeypatch, _BEIJING_1530)  # 15:30 Beijing -> as_of 2026-10-23
+    captured, out = _run_multi_strategy_to_archive(monkeypatch, tmp_path, capsys, None)
+
+    assert "REPLAY MODE" not in out
+    assert captured["extra"]["run_mode"] == "live"
+    assert captured["extra"]["date"] == _AS_OF_PUBLISHED
+
+
+def test_multi_strategy_reuses_the_stage2_replay_predicate():
+    """Exactly ONE replay predicate: the netted runner imports it, never re-implements it.
+
+    A second copy would be free to drift (e.g. after a gate-label rename), which would
+    silently re-open the hole this task closed.
+    """
+    from scripts import run_live_multi_strategy as rms
+    from scripts import run_live_strategy as rls
+
+    assert rms.resolve_run_mode is rls.resolve_run_mode
+    assert rms.announce_run_mode is rls.announce_run_mode

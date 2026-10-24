@@ -16,6 +16,8 @@ across both pipeline and ML execution environments and to prevent architectural
 inversion and circular dependency bugs.
 """
 
+import math
+import warnings
 from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
@@ -35,7 +37,130 @@ __all__ = [
     "cyq_winner_ratio",
     "cyq_cost_concentration",
     "enrich_universe_with_structural_features",
+    "CURVATURE_KAPPA_BOUND_WINDOW5",
+    "DEFAULT_REACHABLE_MIN_CURVATURE",
+    "warn_unreachable_curvature_threshold",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Scale-free curvature (extremum_curvature) reachability constants -- Task C5.1
+# ---------------------------------------------------------------------------
+#
+# MATHEMATICAL FACT (why every `kappa >= 1.5` gate was dead):
+# `extremum_curvature` z-scores each window BEFORE fitting the quadratic, so on
+# a full window of k points the regressand y satisfies ||y||^2 == k exactly
+# (population std, ddof=0). Extracting the quadratic coefficient a is a
+# projection onto the tau^2 column residualised against [tau, 1]; for the
+# symmetric tau = [-2,-1,0,1,2] (k=5) that residual basis has squared norm
+#     R_5 = sum(tau^4) - (sum(tau^2))^2 / k = 34 - 100/5 = 14,
+# hence |a| <= sqrt(k / R_5) = sqrt(5/14) and, because
+# `kappa = 2a / (1 + b^2)^{3/2}` and (1 + b^2)^{3/2} >= 1,
+#     |kappa| <= 2 * sqrt(5/14) = 1.195228609...
+# on a FULL window=5 fit. The value `CURVATURE_KAPPA_BOUND_WINDOW5` below is
+# that analytic ceiling, not an empirical approximation.
+#
+# CONSEQUENCE (the prior bug this constant guards against): a `kappa >= 1.5`
+# entry gate is structurally unreachable -- not merely "rare" -- whenever the
+# window is full, so such a strategy can never open a position. Only the
+# partial warm-up fits (k=3 -> bound 4.2426, k=4 -> bound 2.0, i.e. the first
+# two bars after the min_periods-1 start of a series) can exceed 1.1952, and
+# those are untradeable warm-up points, NOT evidence the gate works. Empirical
+# maxima stay just under the ceiling (200k random windows -> 1.19472; the
+# complete {-1,0,1}^5 sign/level grid -> 1.16642); the analytic bound is the
+# supremum, so a 1.5 gate can never fire.
+CURVATURE_KAPPA_BOUND_WINDOW5: float = 2.0 * math.sqrt(5.0 / 14.0)
+
+# INTERIM REACHABILITY DEFAULT -- deliberately NOT an economically optimised
+# threshold. Its only job is to remove the unreachable 1.5 gate and restore
+# tradeability; the optimal cut still requires walkforward evidence and is a
+# separate task (do not silently treat 0.8 as validated alpha).
+# Reference points on the same z-scored scale:
+#   * symmetric 5-point V-bottom, e.g. prices [2, 1, 0, 1, 2] -> kappa ~= 1.1454
+#   * zero-mean random noise -> kappa centred on 0 (approx. mean 0, sd 0.49),
+#     so 0.8 acts as a ~1.6-sigma turning-point geometry gate rather than a
+#     no-op filter.
+DEFAULT_REACHABLE_MIN_CURVATURE: float = 0.8
+
+
+def _curvature_kappa_bound(k: int) -> float:
+    """Analytic |kappa| ceiling for a full-window quadratic fit on `k` points.
+
+    Generalises the k=5 derivation above: the residualised tau^2 basis has
+    squared norm R_k = sum(tau^4) - (sum(tau^2))^2 / k, the z-scored regressand
+    has squared norm k, so |a| <= sqrt(k / R_k) and |kappa| <= 2*sqrt(k / R_k).
+    k=5 reproduces CURVATURE_KAPPA_BOUND_WINDOW5; k=4 gives exactly 2.0 and
+    k=3 gives 4.2426 (the warm-up windows that made the old gate look alive).
+    """
+    if k < 2:
+        return float("inf")
+    tau = np.linspace(-(k - 1) / 2.0, (k - 1) / 2.0, k)
+    residual_norm = float(np.sum(tau ** 4) - np.sum(tau ** 2) ** 2 / k)
+    if residual_norm <= 1e-12:
+        return float("inf")
+    return 2.0 * math.sqrt(k / residual_norm)
+
+
+def warn_unreachable_curvature_threshold(
+    threshold: float,
+    *,
+    window: int = 5,
+    context: str = "",
+) -> bool:
+    """Warns when a curvature gate is at/above the analytic full-window bound.
+
+    Returns True if the threshold is structurally unreachable on a full window
+    of `window` points (and emits a `UserWarning`), False otherwise. Raising
+    this as an error would break existing configs; the point is to make a
+    future maintainer *see* the dead gate instead of silently reintroducing it.
+    The bound is exact only for complete windows -- partial warm-up fits can
+    exceed it, which is why historical 1.5 gates looked plausible in-sample.
+    """
+    bound = _curvature_kappa_bound(int(window))
+    if abs(float(threshold)) < bound:
+        return False
+    prefix = f"{context}: " if context else ""
+    warnings.warn(
+        f"{prefix}curvature threshold |{threshold}| >= the analytic maximum "
+        f"{bound:.7f} of extremum_curvature(window={window}) on a full window; "
+        "this gate is structurally unreachable and would never trigger in a "
+        "live/full-window fit. Use DEFAULT_REACHABLE_MIN_CURVATURE (0.8, interim "
+        "reachability default pending walkforward evidence) or another "
+        "reachable value.",
+        stacklevel=2,
+    )
+    return True
+
+
+def _as_1d_series(x, op_name: str) -> pd.Series:
+    """Normalises a Series-level operator's input to a 1-D pandas Series.
+
+    Task C5.3: `extremum_curvature`, `standardized_divergence` and
+    `fractal_dimension` used to disagree on accepted shape -- a single-column
+    DataFrame made `fractal_dimension` raise `ValueError: Data must be
+    1-dimensional` (its R/S estimator got an (n,1) array), while
+    `extremum_curvature` silently worked and `standardized_divergence`
+    broadcast into a DataFrame result. Callers pass both shapes across the
+    Track C strategies, so normalising once here is what keeps the three
+    operators interchangeable.
+
+    Contract: a Series is returned as-is (index/name preserved); a
+    single-column DataFrame is squeezed to its only column; a multi-column
+    DataFrame raises explicitly rather than silently picking one column.
+    """
+    if isinstance(x, pd.Series):
+        return x
+    if isinstance(x, pd.DataFrame):
+        n_cols = int(x.shape[1])
+        if n_cols == 1:
+            return x.iloc[:, 0]
+        raise ValueError(
+            f"{op_name} expects a Series or a single-column DataFrame; "
+            f"got a DataFrame with {n_cols} columns"
+        )
+    # Array-like fallback (list/ndarray); 2-D ndarrays still raise pandas'
+    # own "Data must be 1-dimensional", which is the correct behaviour.
+    return pd.Series(x)
 
 
 def compute_rolling_poc_series(
@@ -203,8 +328,9 @@ def extremum_curvature(
 
     Parameters
     ----------
-    price : pd.Series
-        Price series (e.g. Close).
+    price : pd.Series or pd.DataFrame
+        Price series (e.g. Close). A single-column DataFrame is accepted and
+        squeezed; a multi-column DataFrame raises ValueError (Task C5.3).
     window : int, default 5
         Rolling window length for local curvature estimation.
     min_periods : int, default 3
@@ -214,7 +340,10 @@ def extremum_curvature(
     -------
     pd.Series
         Series named 'extremum_curvature' with dimensionless curvature values.
+        On a full window=5 fit |kappa| <= 2*sqrt(5/14) ~= 1.1952 -- see
+        CURVATURE_KAPPA_BOUND_WINDOW5 for the algebraic justification.
     """
+    price = _as_1d_series(price, "extremum_curvature")
     n = len(price)
     out = np.full(n, np.nan, dtype=float)
     p_vals = price.to_numpy(dtype=float)
@@ -264,10 +393,11 @@ def standardized_divergence(
 
     Parameters
     ----------
-    price : pd.Series
-        Price series.
-    indicator : pd.Series
+    price : pd.Series or pd.DataFrame
+        Price series. A single-column DataFrame is accepted (Task C5.3).
+    indicator : pd.Series or pd.DataFrame
         Momentum indicator series (e.g. MACD, RSI, or volume momentum).
+        A single-column DataFrame is accepted.
     lag : int, default 5
         Return and difference lag.
     vol_lookback : int, default 20
@@ -276,8 +406,12 @@ def standardized_divergence(
     Returns
     -------
     pd.Series
-        Series named 'standardized_divergence'.
+        Series named 'standardized_divergence'. Always 1-D now: a DataFrame
+        input used to broadcast the arithmetic into a DataFrame result, which
+        disagreed with the other two Series-level operators (Task C5.3).
     """
+    price = _as_1d_series(price, "standardized_divergence")
+    indicator = _as_1d_series(indicator, "standardized_divergence")
     ret_k = price.pct_change(lag)
     delta_i = indicator.diff(lag)
     min_p = max(3, vol_lookback // 2)
@@ -353,8 +487,11 @@ def fractal_dimension(
 
     Parameters
     ----------
-    price : pd.Series
-        Price series.
+    price : pd.Series or pd.DataFrame
+        Price series. A single-column DataFrame is accepted and squeezed; a
+        multi-column DataFrame raises ValueError (Task C5.3). Before this
+        normalisation a 1-column frame reached the R/S estimator as an (n,1)
+        array and raised "Data must be 1-dimensional".
     window : int, default 60
         Rolling window length in bars.
     min_chunk_size : int, default 8
@@ -365,6 +502,7 @@ def fractal_dimension(
     pd.Series
         Series named 'fractal_dimension' clipped to [1.0, 2.0].
     """
+    price = _as_1d_series(price, "fractal_dimension")
     n = len(price)
     out = np.full(n, np.nan, dtype=float)
     log_ret = np.log(price.astype(float) / price.astype(float).shift(1))

@@ -867,41 +867,52 @@ def test_all_registered_strategies_produce_contract_compliant_sparse_weights():
 
 
 # --------------------------------------------------------------------------- #
-# 4. Documented Track C structural blockers (reported, NOT fixed here)
+# 4. Track C gate-reachability ledger
+#    C5.1/C5.2 changed the status of both entries below: the Wyckoff curvature gate
+#    was fixed in production (1.5 -> 0.8) and the Chan VP HVN gate was fixed in
+#    production, but this fixture still lacks a V-turn, so only the HVN test can be
+#    un-xfailed here. The surviving xfail is a FIXTURE limitation, documented inline.
 # --------------------------------------------------------------------------- #
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "C4.1 finding (Track C defect, unfixed by design -- test-only task): "
-        "extremum_curvature with window=5 bounds |kappa| <= 2*sqrt(5/14) ~= 1.1952 "
-        "whenever the window holds 5 valid points, so the `curv >= 1.5` entry gate in "
-        "WyckoffChanSpringStrategy (and the identical 1.5 gates in "
-        "chan_advanced_strategies.entry_mode spring_curvature_combined/"
-        "curvature_v_bottom, plus blend_base anchors 2 and 4) cannot fire beyond a "
-        "series' first 4 bars. Consequence: the strategy never enters."
+        "FIXTURE limitation, not a production defect (re-verified empirically after "
+        "Task C5.1 2026-10-23). The `_two_symbol_universe(400)` random-walk fixture has "
+        "no V-turn: `wyckoff_spring >= 1` only on 2 bars (2019-01-02, 2019-07-09) and "
+        "kappa < 0.8 on exactly those 2 bars (kappa ~= 0.0513 and ~= 0.2043), so this "
+        "test cannot exercise the curvature gate at all -- no threshold at or above 0.8 "
+        "can fire here. Curvature-gate reachability is instead proven by "
+        "test_wyckoff_chan_strategy.py::"
+        "test_wyckoff_chan_spring_reachable_curvature_gate_opens_position, where a "
+        "genuine Wyckoff Spring on make_spring_universe() carries kappa ~= 1.0101 and "
+        "provably opens a position at the new 0.8 default (and provably not at the "
+        "legacy unreachable 1.5). Do NOT remove this xfail -- or weaken/repoint the "
+        "assertion to the fixture's low-curvature springs -- until "
+        "`_two_symbol_universe` itself gains a genuine V-turn."
     ),
 )
 def test_wyckoff_curvature_entry_gate_is_reachable():
-    """Intent of C2.2: a spring confirmed by kappa >= 1.5 should open a position."""
+    """Intent of C2.2: a spring confirmed by the curvature gate should open a position.
+
+    (C2.2 stated the gate at the then-default 1.5; Task C5.1 lowered the default to
+    0.8 because 1.5 exceeds the analytic window-5 bound.) Still xfailed for a FIXTURE
+    reason (see the marker above): this random walk has no V-turn at all, so the gate
+    is unreachable on it regardless of which of those two thresholds is used.
+    """
     universe = _two_symbol_universe(400)
     weights = WyckoffChanSpringStrategy().generate_weights(universe)
     dense = weights.dropna(how="all").reindex(weights.index).ffill().fillna(0.0)
     assert (dense["SPY"] > 0.0).any(), "the spring + curvature gate never opened a position"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "C4.1 finding (Track C defect, unfixed by design -- test-only task): "
-        "ChanVolumeProfileHybridStrategy gates every entry on "
-        "`consolidation_density >= 0.45` measured against the *last confirmed* Chan "
-        "pivot band [ZD, ZG], which is forward-filled far behind a 60d rolling POC. "
-        "On 7 synthetic universes the band and the POC never overlap, so "
-        "hvn_instant/hvn_valid are identically False and the strategy never enters "
-        "(its 'sparse contract' unit test therefore only ever saw the initial "
-        "all-zero row)."
-    ),
-)
+# Task C5.2 retired this marker: the HVN gate was DEAD, not merely unreachable on
+# synthetic data -- `consolidation_density` was measured against `[ZD, ZG]` from the
+# already-confirmed Chan 中枢, which by construction lags a stroke/segment behind the
+# price, so it had exactly zero overlap with the same-window 60d POC and
+# hvn_instant/hvn_valid were identically False. Fixed by feeding both the density
+# inputs and the POC interval the same-window `VAL/VAH` of the rolling profile
+# (`[ZD, ZG]` still drive breakout/retest/stop levels). This test now guards against
+# the gate silently going dead again -- it must stay live (no xfail, no skip).
 def test_chan_vp_hvn_gate_is_reachable():
     universe = _two_symbol_universe(400)
     weights = ChanVolumeProfileHybridStrategy().generate_weights(universe)

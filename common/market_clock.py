@@ -62,8 +62,10 @@ construction on any host*, and giving the window gate something to compare again
 
 **Not in scope here** (§11 Phase 0): nothing in the repo calls this module yet. Cache
 freshness (`expected_last_session`), the CLI window gate and the Web archive keys are
-`L2.2`-`L2.5`. `common/market_holidays.py` models full-day closures only; half-days
-are a disclosed gap (see that module's docstring).
+`L2.2`-`L2.5`. `common/market_holidays.py` now models full-day closures **and** scheduled
+early closes (`L2.27`); the early close reaches the session-*geometry* accessors only
+(`MarketSpec.close_time_on` -> `session_close_time` / `last_expected_bar_ts`), not the
+`L2.1` as-of/session-state answers -- see `MarketSpec.close_time_on`'s docstring.
 """
 
 from __future__ import annotations
@@ -85,6 +87,7 @@ from common.market_holidays import (
     UnknownMarketError,
     calendar_status as _calendar_status,
     coverage_years,
+    early_close_time_or_none,
     holidays_for,
     is_covered,
     is_provisional,
@@ -165,6 +168,42 @@ class MarketSpec:
         """Final continuous-trading close of the day (drives as-of / completed session)."""
         return self.afternoon_close
 
+    def early_close_on(self, day: _dt.date) -> Optional[_dt.time]:
+        """Early close (market-local) on `day`, or `None` for a normal full session (`L2.27`).
+
+        The per-date table is owned by `common/market_holidays.py`
+        (`early_closes_for` / `early_close_time_or_none`); this method is the typed
+        access point so no consumer has to know which market keeps a half-day calendar.
+        It deliberately does **not** embed a second date map here: two calendars would
+        drift, and this repo has already paid for that class of bug.
+
+        Delegation goes through the *collapsing* accessor on purpose -- an uncovered
+        year reads as "full session" and logs nothing here, because the caller is the
+        `L2.26` coverage predicate and must not start raising (see that function's
+        docstring in `common/market_holidays.py`). The safe direction is preserved: a
+        real half-day in an unknown year is judged *short*, never *fresh*.
+        """
+        return early_close_time_or_none(self.market, day)
+
+    def close_time_on(self, day: _dt.date) -> _dt.time:
+        """Final close on `day`: the early close when one is recorded, else `close_time`.
+
+        **Scope (`L2.27`, disclosed):** only the session-*geometry* consumers use this --
+        `session_close_time(market, day)` and therefore `last_expected_bar_ts`, i.e. the
+        intraday freshness deadline. `MarketClock.session_state()`,
+        `last_completed_session()`, `as_of_trading_date()` and
+        `publication_ready()` still key off the full-session `close_time` (L2.1
+        semantics, intentionally untouched): on a 13:00 day they keep calling the market
+        "open" until 16:00 and hold as-of on the previous session until 16:15. That is
+        *late*, never *wrong/optimistic* -- and it is why an early-close day is only
+        judged by the freshness gate from 16:15 onward, by which time the shortened
+        deadline (12:55 for 5m bars) is what must be met. Shortening those four would
+        change every L2.1/live-gate answer and is a separate task, not a side effect of
+        an intraday-freshness fix.
+        """
+        early = self.early_close_on(day)
+        return self.close_time if early is None else early
+
     @property
     def has_lunch_break(self) -> bool:
         """True when the day is split into a morning and an afternoon continuous session.
@@ -230,15 +269,33 @@ def market_spec(market: str) -> MarketSpec:
     return _MARKET_SPECS[normalize_market(market)]
 
 
-def session_close_time(market: str) -> _dt.time:
+def session_close_time(market: str, session_date: Optional[_dt.date] = None) -> _dt.time:
     """Market-local final close of continuous trading (e.g. 15:00 China, 16:00 HK/US).
 
     Added for `L2.26` so the intraday cache gate never hard-codes "15:00"/"16:00" in
     `common/duckdb_cache.py`: this module stays the single owner of session geometry.
     Purely read-only -- it is a thin alias of `MarketSpec.close_time`, so the `L2.1`
     semantics (as-of / completed-session / run-window) are untouched.
+
+    `L2.27` -- **day-level early close.**  `session_date=None` returns the normal
+    full-session close, byte-for-byte the pre-`L2.27` answer (every existing caller, and
+    the `expected_last_session=None` fast path, keep calling it that way).  Passing a
+    date returns `MarketSpec.close_time_on(date)`: the recorded 13:00 US / 12:00 HK
+    half-day close when the static table knows one, else the same full-session close.
+
+    A `datetime` is rejected rather than accepted-and-missed: it is a `date` subclass that
+    never *equals* a `date`, so it would silently look up "normal session" (the same trap
+    `MarketClock.__post_init__` guards against for `holidays`).
     """
-    return market_spec(market).close_time
+    spec = market_spec(market)
+    if session_date is None:
+        return spec.close_time
+    if not isinstance(session_date, _dt.date) or isinstance(session_date, _dt.datetime):
+        raise TypeError(
+            f"session_date must be a plain datetime.date (not datetime), got "
+            f"{type(session_date).__name__}"
+        )
+    return spec.close_time_on(session_date)
 
 
 def last_expected_bar_ts(
@@ -262,13 +319,16 @@ def last_expected_bar_ts(
     14:55 deadline, but a 14:55/15:00 bar does. No `LUNCH_BREAK` state has to be consulted
     (and it could not be: the cache has no "now" for the session it is judging).
 
+    **Half-days / early closes (`L2.27`)** ARE modelled, as a per-date close from
+    `common/market_holidays.py`: on a US 13:00 day (day after Thanksgiving, July 3,
+    Christmas Eve) the deadline is 12:55 for 5m bars, on an HK 12:00 half-day 11:55, and
+    a full 16:00/16:00 day is untouched (`session_close_time(market)`). This is what stops
+    a correctly-synced early-close session from being judged "not covered" forever and
+    re-fetched upstream on every run. Known dates only: an uncovered year falls back to
+    the full-session close (conservative -- a short session then reads as short).
+
     Cross-midnight sessions are NOT modelled (no supported market has one); the deadline
     is always on `session_date` itself.
-
-    Half-days / early closes (US 13:00 after Thanksgiving, China/HK half sessions) are
-    also NOT modelled here -- `common/market_holidays.py` tracks full-day closures only.
-    An early-close session will therefore look "short" against this deadline; see
-    `docs/development_plan.md` (`L2.26` follow-up) rather than papering over it.
     """
     if not isinstance(session_date, _dt.date) or isinstance(session_date, _dt.datetime):
         raise TypeError(
@@ -281,7 +341,7 @@ def last_expected_bar_ts(
         )
     if bar_interval <= _dt.timedelta(0):
         raise ValueError(f"bar_interval must be positive, got {bar_interval!r}")
-    close_at = _dt.datetime.combine(session_date, session_close_time(market))
+    close_at = _dt.datetime.combine(session_date, session_close_time(market, session_date))
     return close_at - bar_interval
 
 

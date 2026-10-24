@@ -40,6 +40,30 @@ from common.financial_api import (
     is_index_symbol,
     normalize_thscode,
 )
+from common.market_clock import MARKET_CHINA, market_now
+
+
+def market_today(now: Optional[datetime.datetime] = None) -> datetime.date:
+    """The current **A-share market** calendar day -- never the host's `date.today()`.
+
+    (development_plan.md `L2.31`) `common/market_clock.py` owns the date; every consumer
+    here keys an artifact or an age on it:
+
+    * `{date}.parquet` filename (`main`) -- must be the market trading day, else a host on
+      UTC-7 starts a Beijing 08:00 session writing yesterday's file and the recorder
+      collides with the previous session's partitions (the `L2.4` archive-key class of
+      bug, one layer down);
+    * retention age (`cleanup_old_parquet_files`) -- the filename key and "today" must be
+      read on the SAME calendar, or a UTC-7 host keeps files one day longer than asked;
+    * the EastMoney intraday fallback window (`fetch_ohlcv(start=today, end=today)`) -- a
+      fetch window, so the market day is what the provider's sessions are keyed on.
+    """
+    return market_now(MARKET_CHINA, now=now).local_date()
+
+
+def market_today_str(now: Optional[datetime.datetime] = None) -> str:
+    """`YYYY-MM-DD` of the market day (the `{date}.parquet` key / fetch-window literal)."""
+    return market_today(now).strftime("%Y-%m-%d")
 
 
 def get_5m_bucket(ts: Union[pd.Timestamp, datetime.datetime, str]) -> Optional[pd.Timestamp]:
@@ -186,7 +210,7 @@ class FuyaoThrottledClient:
             else:
                 # Fallback to EastMoney for > 5 ETFs
                 em = EastMoneyDataProvider()
-                today_str = datetime.date.today().strftime("%Y-%m-%d")
+                today_str = market_today_str()
                 for e_sym in etfs:
                     try:
                         em_df = em.fetch_ohlcv(e_sym, start=today_str, end=today_str, interval="5m")
@@ -436,11 +460,21 @@ class LockFreeParquetWriter:
         return cleanup_old_parquet_files(self.output_dir, retention_days=retention_days)
 
 
-def cleanup_old_parquet_files(directory: str, retention_days: int = 90) -> List[str]:
-    """Deletes parquet files older than retention_days and temp files older than 1 day."""
+def cleanup_old_parquet_files(
+    directory: str,
+    retention_days: int = 90,
+    today: Optional[datetime.date] = None,
+) -> List[str]:
+    """Deletes parquet files older than retention_days and temp files older than 1 day.
+
+    `today` defaults to the MARKET day (`market_today`, `L2.31`): the file stems are
+    `{market trading day}.parquet`, so ageing them against the host's calendar day would
+    keep/drop a different file set on any host whose timezone is not the market's.
+    """
     deleted: List[str] = []
     now = time.time()
     one_day_sec = 86400.0
+    reference_day = today if today is not None else market_today()
 
     if not os.path.isdir(directory):
         return deleted
@@ -465,7 +499,7 @@ def cleanup_old_parquet_files(directory: str, retention_days: int = 90) -> List[
             stem = fname[:-8]
             try:
                 file_date = datetime.datetime.strptime(stem, "%Y-%m-%d").date()
-                age_days = (datetime.date.today() - file_date).days
+                age_days = (reference_day - file_date).days
                 if age_days > retention_days:
                     os.remove(fpath)
                     deleted.append(fpath)
@@ -578,7 +612,11 @@ def main():
     print(f"Starting intraday 5m recorder for {len(symbols)} symbols. Output dir: {args.output_dir}")
 
     iteration = 0
-    today_str = datetime.date.today().strftime("%Y-%m-%d")
+    # (L2.31) The `{date}.parquet` key is the MARKET day (owner: `common/market_clock`),
+    # not the host's calendar day. Resolved once per process, like before -- a recorder
+    # started before the market day rolls over keeps writing the day it was started for
+    # (pre-existing behaviour, deliberately unchanged here); `--once` runs are unaffected.
+    today_str = market_today_str()
 
     while True:
         iteration += 1

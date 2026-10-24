@@ -1113,6 +1113,16 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                     c_wr = df_u.loc[date, "cyq_winner_ratio"]
                                     if pd.notna(c_wr) and float(c_wr) < min_cyq_winner_ratio:
                                         # Wyckoff spring exemption: if spring >= 1.25 and curvature >= 1.5, allow pass
+                                        # PROTECTIVE NOTE (Task C5.1): the 1.5 curvature leg is
+                                        # DELIBERATELY left at 1.5 even though it is structurally
+                                        # unreachable -- z-scored window=5 fits obey
+                                        # |kappa| <= 2*sqrt(5/14) ~= 1.1952 (see
+                                        # common.structural_factors.CURVATURE_KAPPA_BOUND_WINDOW5).
+                                        # This is a fail-CLOSED union exemption: keeping it
+                                        # unreachable preserves current behaviour. Lowering it to
+                                        # 0.8 would ADD a brand-new exemption pass path with zero
+                                        # walkforward evidence -- do NOT "fix" it without that
+                                        # evidence.
                                         is_exempt = False
                                         if "wyckoff_spring" in cols and "extremum_curvature" in cols:
                                             w_sp = df_u.loc[date, "wyckoff_spring"]
@@ -1420,6 +1430,13 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                     if date in df_u.index and "wyckoff_spring" in df_u.columns and "extremum_curvature" in df_u.columns:
                                         w_sp = df_u.loc[date, "wyckoff_spring"]
                                         e_curv = df_u.loc[date, "extremum_curvature"]
+                                        # PROTECTIVE NOTE (Task C5.1): same unreachable window=5
+                                        # curvature bound as the cyq exemption above
+                                        # (|kappa| <= 2*sqrt(5/14) ~= 1.1952). The 1.5 leg is
+                                        # left at 1.5 on purpose: this is a fail-closed entry
+                                        # fast-track, so an unreachable leg merely preserves the
+                                        # existing gating. Make it reachable (e.g. 0.8) only with
+                                        # walkforward evidence that the extra entries are worth it.
                                         if pd.notna(w_sp) and pd.notna(e_curv) and float(w_sp) >= 1.25 and float(e_curv) >= 1.5:
                                             entry_signal_bars[s] = min_entry_bars  # Track C Anchor 4: Wyckoff Spring Day 1 fast-track entry bypass
                                 if entry_signal_bars[s] < min_entry_bars:

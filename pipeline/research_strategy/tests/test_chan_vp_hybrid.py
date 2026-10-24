@@ -145,6 +145,37 @@ def test_run_chan_vp_position_loop_mechanics():
     assert np.all(raw[12:] == 0.0)
 
 
+def test_chan_vp_hybrid_opens_position_on_synthetic_universe():
+    """Task C5.2 acceptance: the strategy must ACTUALLY trade.
+
+    Before the fix, `hvn_instant` tested the rolling POC against the already
+    confirmed (lagged) Chan pivot [ZD, ZG]; on this deterministic synthetic
+    universe the 60d POC had zero overlap with the stale band, so hvn_valid was
+    always False and the strategy never opened a position. HVN validation now
+    uses the same-window value area [VAL, VAH]. A test asserting merely "no
+    exception" would have passed the broken version, hence the explicit
+    position assertion below (no special-casing: this is the default params).
+    """
+    universe = make_test_universe(250)
+    strat = ChanVolumeProfileHybridStrategy()
+    weights = strat.generate_weights(universe)
+
+    assert "SPY" in weights.columns
+    spy_active = weights["SPY"].fillna(0.0)
+    assert (spy_active > 0.0).any(), (
+        "chan_vp_hybrid never opened a SPY position on the synthetic breakout "
+        "fixture -- the HVN gate is still rejecting everything"
+    )
+
+    # Sparse contract on the trading path: every rebalance row is fully
+    # populated, so exits/de-risks are explicit 0.0 rather than NaN.
+    per_row_nan = weights.isna().sum(axis=1)
+    rebalance_rows = weights[per_row_nan == 0]
+    assert len(rebalance_rows) > 1
+    assert (rebalance_rows.fillna(-1.0).values >= 0.0).all()
+    assert (rebalance_rows.sum(axis=1) <= 1.0 + 1e-9).all()
+
+
 def test_chan_vp_hvn_filter_rejection():
     # When density is below min_density, entry should be rejected
     n_days = 200

@@ -1193,7 +1193,7 @@
     "parameters": {
       "wyckoff_spring_max_penetration": 0.04,
       "wyckoff_spring_min_penetration": 0.005,
-      "wyckoff_spring_min_curvature": 1.5,
+      "wyckoff_spring_min_curvature": 0.8,
       "wyckoff_spring_min_rel_vol": 1.0,
       "wyckoff_spring_stop_buffer_pct": 0.005,
       "wyckoff_spring_max_holding_days": 30,

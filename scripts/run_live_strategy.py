@@ -95,6 +95,13 @@ from common.cli_utils import (
     shared_data_dir,
 )
 from common.financial_api import check_missing_trading_days, get_trading_days_calendar
+from common.market_clock import (
+    MARKET_CHINA,
+    MixedMarketUniverseError,
+    UnknownSymbolMarketError,
+    as_of_trading_date,
+    infer_market_from_symbols,
+)
 from common.position_lifecycle import (
     AssetLifecycleState,
     BlockingReason,
@@ -344,6 +351,99 @@ def resolve_min_holding_bars(
     return int(default)
 
 
+def resolve_run_mode(clock_ctx: Any) -> str:
+    """`replay` or `live` for this run -- the machine-readable marker (`L2.30`).
+
+    Semantics, and they are NOT invented here: `common/cli_utils.resolve_live_clock_context`
+    already decides this when it resolves the run-window gate. An explicit `--as-of-date`
+    pinned to a session EARLIER than the clock's latest published session is a deliberate
+    historical replay (`window_gate == "not_applicable_replay"`): the window gate is
+    skipped *by design* so 复盘/重放 works, but such a run still emits a full order ticket.
+    Without a marker that ticket is indistinguishable from a same-day real one, so it could
+    be archived under today's key or used in post-hoc attribution.
+
+    Every other shape is `live`:
+      * no `--as-of-date` (as-of = the clock's published session),
+      * `--as-of-date` == the clock's published session (an explicit same-day run),
+      * a future `--as-of-date`, which is rejected upstream by the clock (never reaches here).
+    Same-day and future-day behaviour is therefore unchanged bit-for-bit; only the marker
+    and its banner are new.
+    """
+    gate = str(getattr(clock_ctx, "window_gate", "") or "")
+    if gate == "not_applicable_replay":
+        return "replay"
+    # Defensive second spelling of the same predicate, so the marker cannot silently read
+    # "live" if the gate label is ever renamed: as-of strictly before the clock's session.
+    as_of = str(getattr(clock_ctx, "as_of_date", "") or "")
+    clock_as_of = str(getattr(clock_ctx, "clock_as_of", "") or "")
+    if (
+        str(getattr(clock_ctx, "as_of_source", "")) == "explicit"
+        and as_of
+        and clock_as_of
+        and as_of < clock_as_of
+    ):
+        return "replay"
+    return "live"
+
+
+def announce_run_mode(clock_ctx: Any, run_mode: str) -> None:
+    """Loud operator-facing banner when a replay ticket is about to be produced (`L2.30`).
+
+    A replay bypasses the run-window gate (by design). The banner exists so nobody mistakes
+    the resulting ticket for a same-day real instruction: intraday manual replay still
+    produces orders, and that is exactly the sentence the operator must see.
+    """
+    if run_mode != "replay":
+        return
+    print("\n" + "!" * 110)
+    print(
+        "[WARN] REPLAY MODE / 历史回放模式 (run_mode=replay): "
+        f"--as-of-date={clock_ctx.as_of_date} 早于市场时钟最近已收盘交易日 "
+        f"{clock_ctx.clock_as_of}。"
+    )
+    print(
+        "       运行窗口门禁按设计不适用于 replay（盘中手工回放仍能出工单），"
+        "因此本工单不是当前时点的实盘指令。"
+    )
+    print(
+        "       禁止把本工单当作当日真实工单归档，或用于事后归因/业绩归因；"
+        "summary.json 已写入 run_mode=replay 可机读标记。"
+    )
+    print("!" * 110 + "\n")
+
+
+def resolve_market_as_of_date(
+    symbols: Optional[List[str]] = None,
+    now: Optional[Any] = None,
+) -> date:
+    """The **market** as-of trading day, used whenever a caller passes no `as_of_date`.
+
+    (development_plan.md `L2.31`) This replaces a bare `date.today()` fallback. OWNER of
+    "what day is it in the market" is `common/market_clock.py` (`L2.1`/`L2.5`); a host-side
+    calendar day is a different day on any host whose timezone is not the market's -- e.g.
+    a UTC-7 host at 2026-10-23T00:30Z reads 10-22 while Shanghai is already mid 10-23, so
+    the old fallback silently aged every holding/cooldown verdict by one session. That is
+    the same root cause as the `L2.4` archive-key incident, one layer down (script layer).
+
+    Market selection: inferred from `symbols` via the clock's own
+    `infer_market_from_symbols`. When the list is empty, unrecognisable (`NEW_SYM`,
+    synthetic fixtures) or spans markets, the calendar cannot be picked from it, so we
+    fall back to `MARKET_CHINA` -- this script's operating market (every default universe
+    under `docs/universe/china/` is A-share) -- rather than raising: an exception here
+    would be swallowed by callers' `except Exception: default_bars` paths and would look
+    exactly like "no anchor at all", which is worse than a documented default.
+
+    `now` is an injection seam for tests/replays (tz-aware UTC); production passes None,
+    so the one wall-clock read stays inside `market_clock.market_now()`.
+    """
+    market: Optional[str] = None
+    try:
+        market = infer_market_from_symbols(list(symbols or []))
+    except (UnknownSymbolMarketError, MixedMarketUniverseError):
+        market = None
+    return as_of_trading_date(now=now, market=market or MARKET_CHINA)
+
+
 def resolve_holding_bars(
     current_holdings: Dict[str, Any],
     account_state: Optional[Dict[str, Any]] = None,
@@ -482,6 +582,7 @@ def resolve_exit_cooldown(
     output_dir: Optional[str] = None,
     as_of_date: Optional[str] = None,
     default_bars: int = 999,
+    now: Optional[Any] = None,
 ) -> Dict[str, int]:
     """Calculates elapsed trading days since the last full exit for each symbol.
 
@@ -539,7 +640,15 @@ def resolve_exit_cooldown(
     The companion reader resolve_holding_bars classifies by holdings/entry columns
     and is NOT affected by this heuristic.
     """
-    as_of_d = pd.Timestamp(as_of_date).date() if as_of_date else date.today()
+    as_of_d = (
+        pd.Timestamp(as_of_date).date()
+        if as_of_date
+        # (L2.31) No explicit valuation date -> ask the MARKET clock, never the host's
+        # `date.today()`. This date decides "how many bars held" and therefore every
+        # cooldown/tenure verdict, so a host-vs-market off-by-one silently shortens the
+        # re-entry cooldown. Owner: `common/market_clock.as_of_trading_date`.
+        else resolve_market_as_of_date(symbols, now=now)
+    )
     account_state = account_state or {}
     last_exit_dates: Dict[str, str] = {}
     if isinstance(account_state.get("last_exit_date"), dict):
@@ -900,7 +1009,11 @@ def parse_args(args: Optional[List[str]] = None):
             "Point-in-time valuation date (YYYY-MM-DD). Default: resolved from the market clock's "
             "as_of_trading_date (close + publication grace, in the market's own timezone) -- never the "
             "host's local date. An explicit value is still validated against the clock: it must be a "
-            "trading day of --market and may not be later than the latest published session."
+            "trading day of --market and may not be later than the latest published session. "
+            "WARN: passing a PAST trading day is a deliberate history replay -- the run-window gate is "
+            "skipped by design (盘中手工回放仍能出工单 / intraday manual replay still produces an order "
+            "ticket) and the run is marked run_mode=replay in summary.json; do not archive that ticket "
+            "as a same-day live one or use it for attribution."
         ),
     )
     parser.add_argument(
@@ -1289,6 +1402,12 @@ def main(cli_args: Optional[List[str]] = None):
     clock_ctx = resolve_live_clock_context(args, universe_symbols, stage="stage2")
     as_of_date = clock_ctx.as_of_date
     expected_last_session = clock_ctx.expected_last_session
+    # (L2.30) A pinned past session is a REPLAY: the run-window gate is skipped by design,
+    # so the run must announce itself and carry a machine-readable marker into summary.json.
+    # Every other shape (no --as-of-date, same-day, future-day) resolves to "live" and its
+    # behaviour is unchanged.
+    run_mode = resolve_run_mode(clock_ctx)
+    announce_run_mode(clock_ctx, run_mode)
     if getattr(args, "start_date", None):
         start_date = args.start_date
     else:
@@ -1488,7 +1607,7 @@ def main(cli_args: Optional[List[str]] = None):
         clock_ctx,
         freshness_summary=freshness_summary,
         probe_attempts=probe_attempts,
-        extra={"date": as_of_date, "stage": "stage2"},
+        extra={"date": as_of_date, "stage": "stage2", "run_mode": run_mode},
     )
 
     enable_intraday_5m = getattr(args, "enable_intraday_5m", False) or bool(

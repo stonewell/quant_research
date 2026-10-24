@@ -1741,8 +1741,14 @@ flag）；`fixtures/parity/` 下 **4 套合成归档**（`aligned_china_2026_10_
   > **更正（必须写清，不能只说"零残留"）**：任务简报写"生产代码 `date.today()` 零残留"。实测**估值路径零调用**，
   > 但**脚本层仍有 5 处调用**，全部与估值无关：`scripts/run_live_strategy.py:536`（`resolve_exit_cooldown` 里
   > `as_of_date` 为空时的兜底默认，主流程恒传参）、`scripts/record_intraday_5m.py:189/468/581`（录制文件名与
-  > 文件年龄）、`scripts/sync_china_5m_and_indices.py:542`（`--end` 的默认值）。这些保留是有意为之（人工运维
-  > 需要一个"今天"的默认值），但"零残留"这个说法**在字面上不成立**——引用时应写"**估值路径零残留**"。
+  > 文件年龄）、`scripts/sync_china_5m_and_indices.py:542`（`--end` 的默认值）。
+  >
+  > **再更正（2026-10-23 晚，"有意保留"的判断已被推翻）**：上面那段"这些保留是有意为之（人工运维需要一个
+  > '今天'的默认值）"**现在已不成立**。`L2.31` 把这 5 处**全部**改经 `common/market_clock`，逐一判定为
+  > **市场交易日**（不是宿主机日历日），因此"脚本层仍有 5 处"是历史记载，不是待办。CI 里真正兜住口径的是
+  > **AST/词法级**护栏 `pipeline/tests/test_live_market_clock_wiring.py::test_no_bare_date_today_call_left_in_scripts`
+  > （它不会被注释或文档字符串骗过）。当下正确的说法是"**脚本层零裸 `date.today()`（估值路径与运维路径皆是）**"，
+  > 而不只是"估值路径零残留"。详见 **§16.11**。
 - `L2.26` 日内新鲜度键改为"**日期 + 时段**"，时段来自 `market_clock`（`session_close_time` / `last_expected_bar_ts`）
   ⇒ 同一天不同时段的 bar 不再互相冒充。**披露**：半日市/早收未建模（`common/market_clock.py:65` 明写只建模
   整日休市），美东 13:00 早收日会被判"未覆盖"并被反复重取（由 `L2.27` 承接）。
@@ -1803,7 +1809,7 @@ flag）；`fixtures/parity/` 下 **4 套合成归档**（`aligned_china_2026_10_
 | :--- | :--- | :--- |
 | `B1.1` 账本重构（16.1） | **任何硬编码具体模板名**的研究结论、选型结论、报告排名 | `actual_w` 语义变了，近并列模板会换位（实例差 0.152%） |
 | `B2.4` ERS 抽样流（16.2.5） | 任何引用**固定 seed ERS 抽样**作为审计证据的地方 | `SeedSequence.spawn` 改变了同 seed 样本流，旧抽样**不可逐次复现** |
-| `L2.8` QFQ 数据（**数据尚未修复**） | 跨 `2024-01-02` / `2024-07-22` 的回测、以及含 2024H1 的 walkforward 折叠 | 生产缓存里的重基准仍在（§15：4 只致损 / 1 只修复 / 1 只有既有台阶），见 16.10 |
+| `L2.8` QFQ 数据（**数据尚未修复**）（→ 见 §16.14） | 跨 `2024-01-02` / `2024-07-22` 的回测、以及含 2024H1 的 walkforward 折叠 | 生产缓存里的重基准仍在（§15：4 只致损 / 1 只修复 / 1 只有既有台阶），见 16.10 |
 | `C4.1`（16.5） | 依赖 `WyckoffChanSpringStrategy` / `ChanVolumeProfileHybridStrategy` **出信号**的结论 | 两策略在合成宇宙**永不建仓**；有信号的结论只可能来自别的路径或误读 |
 
 补充一条**元级**义务：上述四类之间的结果**不得互相比较**（例如"模板 A 在新账本下跑出的 Sharpe"与"模板 B
@@ -1818,6 +1824,11 @@ flag）；`fixtures/parity/` 下 **4 套合成归档**（`aligned_china_2026_10_
    （写入口 `scripts/sync_china_5m_and_indices.py` 的窗口化重叠对齐仍在，**按约束本轮未改**）。
    **覆盖边界**：仅凭 `.bak.20261022-213155` 只能看见 5 个子块中的 **2** 个（§15.2）——任何"已全部看清"的
    说法都是错的。
+   > **（2026-10-23 晚更正，见 §16.12.2）**：该"覆盖边界"**已解除**。以 `data/cache.duckdb.bak` 为额外基线重跑
+   > 只读 census，**5 个子块全部可判定**（致损 4 / 已修复 1 / 无法判定 0，160 只全量口径）。因此"任何'已全部
+   > 看清'的说法都是错的"**只对 `.bak.20261022-213155` 单基线成立**，不再对全量成立。**上面那句"写入口仍在、
+   > 按约束本轮未改"同样已过时**——写入口保护早已在 `3a9fc11` 落地并由 `L2.28` 补齐验收（§16.12.1）。
+   > **不变的部分**：**数据修复本身一次都没执行**（四项落库前置条件仍未满足），所以 `L2.8` 仍未完成。（→ 见 §16.14）
 2. **`L2.22` 部分减仓是否重置冷却期 —— 待裁决**。`scripts/run_live_strategy.py:2594` 已有 `NOTE(L2.22)`
    （简报写 `:2581`，实测在 `:2594`——本轮文件有改动，行号已漂移），**行为未改**：当前"部分减仓同样锚定冷却"。
    改了会改变实盘再入场节奏，须先裁决再改。
@@ -1828,6 +1839,10 @@ flag）；`fixtures/parity/` 下 **4 套合成归档**（`aligned_china_2026_10_
    （不再忽略这两个文件），但**未提交**，因此任何"配置已入库"的说法都不成立。
 5. **半天市 / 早收未建模**（`common/market_clock.py:65`）；**显式传过去交易日 = replay 放行**（按设计，
    是运维重放工具，不是缺陷——但它意味着"as_of 是过去日期"不能作为"数据新鲜"的证据）。
+   > **（2026-10-23 晚更正）**：前半句**已过时** —— 半日市/早收已由 `L2.27` 建模（早收表在
+   > `common/market_holidays.py`，`session_close_time` / `last_expected_bar_ts` 按日收缩；但
+   > `session_state`/`as_of`/`publication_ready` **仍按全天收盘**，偏差方向偏保守）。后半句（replay 放行）**仍然
+   > 成立**，并已由 `L2.30` 加上可机读标记（`summary.json` 的 `run_mode=replay`）。详见 **§16.11**。
 
 **本节追加时的验证记录（2026-10-23，100% 离线）**
 
@@ -1838,4 +1853,454 @@ flag）；`fixtures/parity/` 下 **4 套合成归档**（`aligned_china_2026_10_
 | `pytest backtester/tests -q` | **79 passed** |
 | `pytest pipeline/research_strategy/tests -q` | **611 passed, 2 xfailed**（431.96s） |
 | `git diff -U0 docs/version.md \| grep '^-' \| grep -v '^---'` | **零行输出**（本节为纯追加，§1–§15 无删除） |
-| `grep -n '^## 1[0-9]\.' docs/version.md` | §10–§16 标题锚点齐全，§16 为文件末节 |
+| `grep -n '^## 1[0-9]\.' docs/version.md` | §10–§16 标题锚点齐全，§16 为**当时**的文件末节（本轮追加 §16.11 / §16.12 / §17 之后，末节是 §17） |
+
+### 16.11 市场时钟收口：半日市建模、replay 标记与脚本层 `date.today()`（`L2.27` / `L2.30` / `L2.31`）
+
+本节三条共享同一个回答者 `common/market_clock.py`：**"今天是哪天""今天几点收盘"只允许有一个回答者**。
+三条都是"接线"而非"新能力"——没有新增任何交易信号，回测数字与既有策略权重逐位不变。
+
+#### 16.11.1 `L2.27` 半日市/早收建模：早收表与休市表**必须分表**
+
+- **位置与分表理由**：早收表落在 `common/market_holidays.py`（`CHINA_EARLY_CLOSES` / `HK_EARLY_CLOSES` /
+  `US_EARLY_CLOSES`，经 `EARLY_CLOSES_BY_MARKET` 与 `early_closes_for` / `early_close_time_or_none` 访问）。
+  之所以**不能**并进休市表：早收日**仍然是交易日**，`is_trading_day()` 必须为 `True`、`0.5` 个交易日的 bar
+  必须照常落盘；把 13:00 早收写成 `holidays` 里的一个条目，会让同步脚本整天跳过、让新鲜度判定把"合法的半日"
+  读成"缺数据"。
+- **委托而非第三套日历**：`MarketSpec` 只加两个 typed 访问点 —— `early_close_on(day)` / `close_time_on(day)`，
+  内部一律委托上面那张表。`early_close_on` 的 docstring 明记"**刻意不在此处内嵌第二份日期哈希**：两张日历
+  一定会漂移，本仓库已经为这一类缺陷付过账"。未覆盖年份按**全天收盘**处理且不告警（调用方是 `L2.26` 的
+  覆盖谓词，不能开始抛错）；失败方向仍然是安全的：**未知年份的真实半日会被判"短"，不会被判"新鲜"**。
+- **收缩点只有两处**：`session_close_time(market, session_date)` 与由它派生的 `last_expected_bar_ts`。
+  美股 13:00 早收 → 5m 末根 bar **12:55**；港股半日市 12:00 → **11:55**（中国 A 股无半日市，表为空）。
+  `session_date=None` 与普通交易日**逐位不变**（`None` 冻结对拍表未动）。
+- **`common/duckdb_cache.py` 本次零改动**：日内覆盖判定经 `session_close_time` / `last_expected_bar_ts` 的
+  API 自动生效，缓存层没有新增任何日期知识（这正是 `L2.26` 立下的"缓存层不自造第二套时段规则"）。
+- **披露（刻意不收口的部分）**：`session_state` / `as_of_trading_date` / `last_completed_session` /
+  `publication_ready` **仍按全天收盘**（即 `L2.1` 语义不动）。后果：早收日 13:00–16:00 仍显示 `OPEN`、as-of
+  仍指向前一交易日。这个偏差方向是**偏保守、不偏乐观**（只可能"晚判"，不可能"早判为已收盘"），把它们一并
+  收口会改动每一个 `L2.1`/实盘门禁答案，属独立任务。
+- **披露（数据时效）**：**2026 / 2027 的早收日期是规则推导的 `PROVISIONAL`，未与 NYSE/Nasdaq、HKEX 官方公告
+  复核**（`PROVISIONAL_YEARS = {2026, 2027}`；2020–2025 依据公告钉住）。最坏失败方向是"**多取一次**"而非
+  "未覆盖被误判为已覆盖"。
+- **验证（本轮实跑，100% 离线）**：`common/tests/test_market_clock.py` **104 → 112**、
+  `common/tests/test_intraday_features.py` **36 → 43**（两文件合计 155）、`common/tests/test_duckdb_cache.py`
+  **72**（`None` 冻结对拍表未动）。
+- **变异验证（证明新用例有区分力，不是恒真断言）**：令 `session_close_time` **忽略日期参数**（恒按全天收盘）
+  → **7 条**用例失败；改回后复验全绿。
+
+#### 16.11.2 `L2.31` 脚本层 `date.today()` → 市场时钟：两处"反直觉但刻意"的裁决
+
+`L2.5` 只把 Web / 估值路径的日期键收敛到 `market_clock_date()`，脚本层还剩 **5 处**以宿主机日历日为准
+（`run_live_strategy.resolve_holding_bars` 的兜底、`sync_china_5m_and_indices` 的 `--end` 默认值、
+`record_intraday_5m` 的当日文件名 / 归档龄期 / 当日字符串）。本轮全部改经 `common/market_clock`，并逐处判定
+语义为**市场交易日**（不是宿主机日历日）。其中两处裁决**看起来像写错了，实际是刻意的**：
+
+1. **`--end` 默认值取市场"日历"日，而不是 `as_of_trading_date`**。理由：`--end` 是**取数上界**，不是估值日。
+   把取数上界锚到"最近已收盘交易日"，会让**午后运行的当日同步永远跳过当天**（当天还没收盘 ⇒ 永远不是
+   "已收盘交易日" ⇒ 永远不取今天）。脚本原有的 `end_date - timedelta(days=2)` 迟滞容差已足够吸收"今天尚未
+   发布"的一天，因此取更宽的日历日是对的。
+2. **市场推断失败时回落 `MARKET_CHINA`，而不是抛错**。`run_live_strategy.resolve_market_as_of_date` 的市场由
+   `infer_market_from_symbols` 推断；遇到 `UnknownSymbolMarketError` / `MixedMarketUniverseError` 时**不抛**。
+   理由：调用方是 `except Exception: default_bars` 的兜底路径，抛错会被**吞掉**，退化成"**完全没有锚点**"——
+   那比"带注释的显式默认值"更差。这里宁可有一个写明来源的默认，也不要一个静默的 `None`。
+
+- **口径陷阱（保留，勿当噪音删）**：验收命令是 `grep -rn --include=*.py 'date.today()' scripts/`。裸
+  `grep -rn 'date.today()' scripts/` 会命中 `.pyc` **二进制**并给出假阳性；不带 `--include` 的"零残留"结论
+  不可引用。现存 **6 处**命中全部是记录事故史的注释 / 文档字符串。
+- **真正的护栏是 AST/词法级**：`pipeline/tests/test_live_market_clock_wiring.py::test_no_bare_date_today_call_left_in_scripts`
+  扫描**源码语法树**，不会被注释或文档字符串骗过。这才是 CI 里兜住口径的那一条（`grep` 只能靠人执行）。
+- **TEST-ISOLATION CONTRACT（测试隔离约定，正文见该测试文件的同名段落）**：
+  - `TZ` 变更**只允许**发生在 `_host_timezone` 上下文管理器内（`finally` 恢复并重新 `tzset()`；**异常路径同样
+    恢复**），时钟冻结**只允许** `monkeypatch.setattr`；
+  - **禁止** module / session 级 fixture、裸 `os.environ["TZ"] = ...`、无 `addCleanup` 的
+    `unittest.mock.patch`；
+  - 理由是这类泄漏会**静默改写后续所有用例的"今天是哪天"**，正是本任务要消除的那类缺陷。约定由
+    `test_host_timezone_context_restores_even_on_exception`（在上下文内**主动抛错**后断言 `TZ` 与 UTC 偏移
+    均复原）机械兜住。
+
+#### 16.11.3 `L2.30` replay 的可机读标记：只落 `summary.json`，不落工单
+
+- **判定器**：`scripts/run_live_strategy.py::resolve_run_mode(clock_ctx)`。主判据**直接复用时钟自身**的
+  `window_gate == "not_applicable_replay"`（不另立一套"as_of 是不是过去日期"的规则），另加
+  `as_of_date < clock_as_of` 作为**防御性同义判据**——防止将来门禁标签改名后 replay 被静默读成 live。
+- **告警**：`announce_run_mode` 打 WARN 横幅，显式写出"运行窗口门禁**按设计**不适用于 replay（盘中手工回放
+  仍能出工单）"，并禁止把该工单当作当日真实工单归档或用于事后归因。`--as-of-date` 的帮助文本同步补齐。
+- **标记位置（刻意的取舍）**：`run_mode` 只写进 `summary.json` 的运行元数据。`live_trading_ticket.json/.csv`
+  是**纯订单行数组**、没有运行元数据信封，往行里塞字段会破坏**全部**既有读端。
+- **同入口闭环（同日完成）**：`scripts/run_live_multi_strategy.py` 与 Stage 2 使用**完全相同**的时钟解算路径
+  （`add_market_clock_cli_args(stage="stage2")` + 自声明 `--as-of-date` +
+  `resolve_live_clock_context(..., stage="stage2")`），因此 replay 在该入口**同样真实可达**。已**复用**
+  `resolve_run_mode` / `announce_run_mode`（全库唯一判定器，禁止二次实现），`extra` 增 `run_mode`，并以
+  **恒等断言** `rms.resolve_run_mode is rls.resolve_run_mode` 防止将来出现第二份实现。
+- **验证**：`test_replay_run_warns_and_marks_summary_run_mode`、`test_default_live_run_has_no_replay_marker`、
+  `test_explicit_same_day_as_of_is_live_not_replay`、`test_multi_strategy_entry_marks_replay_run_mode`、
+  `test_multi_strategy_entry_default_run_is_live`、`test_multi_strategy_reuses_the_stage2_replay_predicate`。
+  **双向变异验证**：删掉 `extra` 里的 `run_mode` → `KeyError`；删掉 `announce_run_mode` → 横幅断言失败。
+
+### 16.12 前复权写入口与更早历史补证（`L2.28` / `L2.29`）——**两处台账前提更正**
+
+这两条的价值主要在"**更正**"，而不是"新增"：台账上它们记的待办事项，一条**早已落地**、另一条的**前提本身
+不成立**。照实记录，避免后续读者把它当作未完成工作重做一遍。
+
+#### 16.12.1 `L2.28` 写入口保护：**早已在 `3a9fc11` 落地**，本轮补的是三场景验收
+
+- **事实更正**：`plan_history_write` / `assert_append_only` / `assert_no_stored_row_rewritten` 这套 insert-only
+  保护是 commit `3a9fc11 make qfq history writes insert-only` 的产物，**不是本轮新增**；`docs/development_plan.md`
+  该行此前记"待修"属**台账滞后**。本轮补齐的是台账要求的行为验收，不是代码。
+- **三场景验收**（`pipeline/tests/test_audit_qfq_alignment.py` L1538 / L1563 / L1585 / L1614，合成 provider +
+  `tmp_path`，无网络）：
+  1. **回补更早窗口**（insert-only）：只新增早于既有 `MAX(date)` 的行，既有行不动；
+  2. **同步更晚窗口**：正常追加仍然成功（不能把 insert-only 修成"只能插在末尾之前的洞"）；
+  3. **重叠窗口**：对**既有日期零写入**——以既有 bar 的 `sha256` 逐一不变为证；
+  4. 追加一条更严格的：**重叠窗口落在不同复权基准上时整体拒绝、零写入**。这正是 600362 / 600660 的失败形态。
+- **残留（必须写明）**：**生产数据修复仍未执行**。写入口封死只保证"不会再被改坏"，不等于"已经被修好"；
+  后者须与 `L2.8` 同批在停机独占窗口内落地。（→ 见 §16.14）
+
+#### 16.12.2 `L2.29` 更早历史补证：**旧快照从来没有缺失**，5 个子块全部可判定
+
+- **前提更正**：`L2.29` 原文假定"5 个子块中只有 2 个能被现有备份看见"。实测**不成立**：
+  `scripts/repair_qfq_alignment.py::_DEFAULT_BASELINES` 早已把 `data/cache.duckdb.bak`（2026-10-21 15:12，
+  sha256 前缀 `6aeb352a…`）列在**首位**。以
+  `--baseline .bak --additional-baseline .bak.20261022-213155 --census` 重跑，`per_baseline_blocks =
+  {bak: 5, bak.213155: 2}` ⇒ **5 个子块全部可判定**。
+- **三分类结果（160 只全量口径）**：**致损 4**（`600660` / `601225` / `601288` / `601398`）、**已修复 1**
+  （`600362`）、**无法判定 0**。
+  > **（干跑后补充，见 §16.13）**：`600362` 的「已修复」是**损坏分类**结论，不等于**基准已收敛**——它的
+  > 2024 年之前的前缀仍需 1,690 行 rebase。分类不变，引用时须带限定。
+- **`601288` 是"单次一致截断"，不是两处独立损坏**：它分两段因子（`2024-01-02 → 2025-12-31` ×`0.9802509854`；
+  `2026-01-05 → 2026-10-20` ×`0.9824966262`），两段落**同一公共水位** `0.9824966262 × reference`。若真有两段
+  独立损坏，公共水位不会如此整齐。
+- **裁决合法性**：参照行在 `.bak` / `.bak.20261022-213155` / 当前库**三处逐位一致（0 行差异）**，故用快照当
+  基线是合法的，不是"拿另一个可能被污染的对象当尺子"。
+- **生产库零副作用**：sha256 与 mtime **未变**，未产生 `.wal`，未写入 `data/`（纯只读）。
+- **因此**：`L2.8` 行内"**可见范围内 4 只有损**"的保守限定**退休**——全量 160 只中就是 4 只致损、1 只已修复、
+  0 只无法判定。但 **`L2.8` 本身仍保持未完成**：数据修复没做。（→ 见 §16.14）
+
+### 16.13 `L2.8` 数据修复前置：干跑与回滚点已验证（**未执行 `--apply`**）
+
+**结论先行**：干跑（dry-run）已跑完并通过安全核验，回滚点已建立；**`--apply` 没有执行，数据一行未改，
+`L2.8` 仍然未完成**。本节记录的是"人类按下按钮之前"必须看到的所有证据，以及两处**会改变决定**的发现。
+
+#### 16.13.1 命令与真实旗标（先纠正三处容易记错的约定）
+
+```bash
+./pipeline/.venv/bin/python scripts/repair_qfq_alignment.py \
+  --db data/cache.duckdb \
+  --baseline data/cache.duckdb.bak \
+  --additional-baseline data/cache.duckdb.bak.20261022-213155
+```
+
+- 真实旗标是 **`--baseline`（单值）** + **`--additional-baseline`（可重复）**。
+- **本工具没有 `--census`** —— `--census` 属于 `scripts/audit_qfq_alignment.py`；修复工具一旦给了 baseline 就会
+  **内部**跑 census。
+- **两个 `_DEFAULT_BASELINES` 不会自动生效**：不给 `--baseline` 时它报 `certified=False`、以 **1** 退出并提示
+  `UNVERIFIED`。也就是说"默认基线"只是常量清单，不是隐式行为。
+
+#### 16.13.2 计划：5 个 op / 3,847 行
+
+退出码 **1**（ACTIONABLE，即"干跑非空"——不是失败），`residual_damage = 0`，所有 op `volume_unchanged = true`：
+
+| Symbol | Op | Start | End | Rows | Factor | Seam before → after |
+| :--- | :--- | :--- | :--- | ---: | ---: | ---: |
+| `600362.SH` | **rebase** | 2017-01-18 | 2023-12-29 | 1,690 | 0.9966398754 | 0.3402 pp → 0.0000 pp |
+| `600660.SH` | restore | 2024-01-02 | 2024-07-19 | 132 | 1.0189393939 | 1.8587 pp → 0 |
+| `601225.SH` | restore | 2024-01-02 | 2026-10-20 | 675 | 1.0020990156 | 0.2142 pp → 0 |
+| `601288.SH` | restore | 2024-01-02 | 2026-10-20 | 675 | 1.0201468959 | 1.9858 pp → **0.2286 pp** |
+| `601398.SH` | restore | 2024-01-02 | 2026-10-20 | 675 | 1.0179264198 | 1.7624 pp → 0 |
+
+**范围口径**：**5 个 op / 3,847 行，覆盖 5 只标的**（4 只 census 致损 + 1 只"已修复但前缀仍在陈旧基准上"的
+`600362`）。把范围写成"4 只标的"会漏掉 `600362` 的 rebase（见 16.13.3）。
+
+#### 16.13.3 发现一：`600362` 是**部分修复**，不是"无需处理"
+
+- `600362` 的 **2024+ 区块**早已被搬到参照基准上，但 **2024 年之前的整段前缀（`2017-01-18 → 2023-12-29`）
+  仍在陈旧基准上**，在 `2024-01-02` 处留下 **0.3402 pp** 接缝。
+- 干跑独立核验：现库 600362 前缀与 `cache.duckdb.bak` **逐位相同**（`2023-12-29` 比值 = 1.0），按
+  `0.9966398754` 重基准后，**免基准（basis-free）边界收益率回到 +1.2318 pp**。
+- 因此 §16.12.2 的"已修复 1"作为**损坏分类**成立，作为"基线已收敛"**不成立**。
+- **这不是一个可以省略或视为 cosmetic 的动作**：它是 **1,690 行历史**的改写，必须由人显式批准。
+
+#### 16.13.4 发现二（陷阱）：`--symbol` 收窄会静默丢掉这 1,690 行
+
+把 `--symbol` 收窄到 census 判定的 4 只**致损**标的上：
+
+- 计划变成 **4 个 op**，`residual_damage = 0`，**以 0 退出**；
+- `--apply` 之后工具会报"干净"，**而 600362 的 0.3402 pp 接缝原地不动**。
+
+**结构性原因**：`residual_damage` 度量的是 census 的**致损清单**（按工具文档，且始终在**整个 provider 全集**上
+度量、绝不在收窄切片上度量）—— 但 `600362` 因已被 census 归入**「已修复」类**，**根本不在那份清单里**；于是
+收窄后它既不在计划里、也不在残差里。这是分类边界的必然结果，不是工具的随机缺陷；但后果一样：
+**一次"看起来成功"的收窄修复会留下半修的历史**。
+
+> **运维纪律（写给未来的人）**：**不要为省事收窄 `--symbol`**。默认（不收窄）范围才会把这个 op 摆到台面上。
+
+#### 16.13.5 发现三：`601288` 修完仍留 0.2286 pp 接缝（**不得写成"完全修复"**）
+
+- 残缝位置：`2025-12-31 → 2026-01-05`。
+- **根因不在修复本身**：在 `cache.duckdb.bak` 里，Fuyao 序列相对 `MarketDBDataProvider` 到 **2025-12-31** 为止偏
+  **+0.2291 pp**，从 **2026-01-05** 起为 **0.0 pp** —— **备份自己就带一个基准台阶**，逐字节还原必然把它一并复制
+  回来。
+- 定性：**既有的跨 provider 基准落差**（与按设计跳过的 `300394.SZ` 同类），**不是本轮引入的损坏**。
+- 处置：属**独立台账决定**——要么"接受并记账"（把它写进可信度声明，与 §16.10 第 3 条同一处理方式），要么
+  "引入第三参照源收口"。**本轮不做任何选择**。
+- **自洽性旁证（`1.0201468959` ≠ `1/0.9824966262` 不是错误）**：两段因子分别为 `1.020146895929`（2024–2025 行）
+  与 `1.017815199923`（2026 行），而 `1 / 0.9824966262 = 1.0178152`；窗口中位数
+  `1.0178152 × 1.002291 ≈ 1.020147`。这与 §16.12.2"单次一致截断到公共水位"的裁决**相互印证**，不是反证。
+  其余标的后复权因子同样自洽：`600660` `1/0.9814126394 = 1.0189393939`、`601225` `1/0.9979053810 = 1.0020990156`、
+  `601398` `1/0.9823892774 = 1.0179264198`。
+- **`300394.SZ` 被考虑但按设计不修**：跨 provider 窗口 `2020-02-24 → 2024-07-19` 的 **−0.1859 pp** 落差在
+  `cache.duckdb.bak` 里**同样存在**，即窗口内**没有独立参照可用**——`restore` 的前提是参照命名空间在窗口**外**
+  与目标处处一致（`assert_restore_is_reference_exact`），此处不成立，故它是既有基准落差而非被重写，按设计跳过。
+
+#### 16.13.6 生产安全性证据（干跑零副作用，本轮已独立复核）
+
+| 项 | 值 |
+| :--- | :--- |
+| 生产库 sha256 | `3cb3f4746204b5f1a2c5395c2947963837f5ab3a829633896fe4a281f222f744`（**前后完全一致**） |
+| 生产库 size / mtime | `323,235,840` / `2026-10-22 21:53:28.073942132 -0700`（**未变**） |
+| `.wal` / `.lock` | 均**不存在**（`lsof` / `fuser` 前后均无输出） |
+| `data/` 新增文件 | **恰好 1 个**：`data/cache.duckdb.bak.20261023-211859`，sha256 **与现库相同**，只读打开并完整性检查通过（`ohlcv_bars` 568,474 行、`PRAGMA database_size` 干净） |
+| 三个既有备份 | 重算哈希与原始值一致，**均未被触碰** |
+
+**备份方法及其理由（必须写明，否则"为什么敢 `cp`"就是一个漏洞）**：用 `cp --preserve=all`。DuckDB **没有在线
+字节级快照 API**（`EXPORT DATABASE` 是逻辑导出，字节不同；`CHECKPOINT` 会**写源库**）；在**无写入者、无 WAL** 的
+条件下，文件**就是**最后一次提交状态。同一个理由也是修复工具 `--apply` 自己用 `shutil.copy2` 的依据。
+
+#### 16.13.7 回滚点（人工在停机窗口内执行）
+
+```bash
+lsof data/cache.duckdb; fuser data/cache.duckdb     # must be empty
+ls data/cache.duckdb.wal                            # must NOT exist
+[ -e data/cache.duckdb.wal ] && mv data/cache.duckdb.wal data/cache.duckdb.wal.pre-rollback
+cp -p data/cache.duckdb.bak.20261023-211859 data/cache.duckdb
+sha256sum data/cache.duckdb   # must equal 3cb3f4746204b5f1a2c5395c2947963837f5ab3a829633896fe4a281f222f744
+```
+
+回滚点 = **字节级可逆**：还原后的库必须与上述 sha256 逐位相等；等号不成立即说明环境不是"无人写、无 WAL"
+的状态，此时应停下而不是继续。
+
+#### 16.13.8 人类还欠哪几件事（`--apply` 的准出清单）
+
+1. **停机独占窗口**：无写入者、无 WAL（回滚脚本前两行即为准入判定）。
+2. **第二复核人逐条签署 5 个 op** —— **尤其是那 1,690 行的 `600362` 历史改写**。这条不是"再确认一次"，
+   而是数据修复的授权要件：它改变的是 2017–2023 的整段历史价格。
+3. **对 `601288` 的 0.2286 pp 残缝给出明示决定**：接受并记账（写进可信度声明）**或** 另立任务收口。**不得沉默
+   通过**——沉默会让下一位读者把"0.2286 pp"读成 0。
+4. **`600362` 的 rebase 不能以"顺手"方式执行**：它是本批唯一会改写 2023 年及更早历史的 op。
+
+**本节状态：`L2.8` 仍为未完成；未执行 `--apply`；生产库与全部备份的字节均未变化。**
+*（以上为 2026-10-23 干跑时点的状态；`--apply` 已于同日执行，见 §16.14。本节保留原文作为门槛证据的留痕，`L2.8` 的当前状态以 §16.14 为准。）*
+
+### 16.14 `L2.8` QFQ 历史数据生产修复执行（2026-10-23）
+
+**背景**：`L2.28` 已封住写入口（窗口化重基准不再回写既有历史），因此本次只做**历史数据的存量修复**——
+`L2.8` 的取证结论与计划早已定稿（§14 / §16.13），欠的只是"按下按钮"。执行门槛为**停机独占窗口 + 异地备份 +
+回滚演练 + 第二复核人**，四项均已在窗口前完成，故于 2026-10-23 手工执行。
+
+#### 16.14.1 执行命令（与 §14 的 dry-run 配方同形，末尾多三个旗标）
+
+```bash
+./pipeline/.venv/bin/python scripts/repair_qfq_alignment.py \
+  --db data/cache.duckdb \
+  --baseline data/cache.duckdb.bak \
+  --additional-baseline data/cache.duckdb.bak.20261022-213155 \
+  --apply --i-know-this-is-production --backup-dir data
+```
+
+- 与 §16.13.1 的干跑配方**逐字相同**，只多了 `--apply --i-know-this-is-production --backup-dir data`。
+- **没有 `--symbol`**：范围是**整个 provider 全集**。这不是笔误，而是 §16.13.4 那条陷阱的正面执行——收窄
+  `--symbol` 会把 `600362` 的 1,690 行 rebase 静默丢掉，且 `--apply` 后仍以 0 退出报"干净"。**运维纪律：
+  不为省事收窄 `--symbol`。**
+
+#### 16.14.2 执行结果：5 个 op / 3,847 行
+
+```text
+applied 5 op(s) to data/cache.duckdb
+backup: data/cache.duckdb.bak.20261023-212614
+  600362.SH rebase 2017-01-18..2023-12-29 rows=1690
+  600660.SH restore 2024-01-02..2024-07-19 rows=132
+  601225.SH restore 2024-01-02..2026-10-20 rows=675
+  601288.SH restore 2024-01-02..2026-10-20 rows=675
+  601398.SH restore 2024-01-02..2026-10-20 rows=675
+```
+
+| Symbol | Kind | Start | End | Rows | Factor |
+| :--- | :--- | :--- | :--- | ---: | ---: |
+| `600362.SH` | **rebase** | 2017-01-18 | 2023-12-29 | 1,690 | **0.9966398754** |
+| `600660.SH` | restore | 2024-01-02 | 2024-07-19 | 132 | — |
+| `601225.SH` | restore | 2024-01-02 | 2026-10-20 | 675 | — |
+| `601288.SH` | restore | 2024-01-02 | 2026-10-20 | 675 | — |
+| `601398.SH` | restore | 2024-01-02 | 2026-10-20 | 675 | — |
+| **合计** | | | | **3,847** | |
+
+- **为什么 Factor 列只有 rebase 有值（口径必须说清）**：只有 `rebase` 是脚本**显式以该 factor 对整段历史重定标**；
+  `restore` 是**逐字节还原参照命名空间**，不施加缩放因子。`restore` op 的**等效乘数**（`1.0189393939` /
+  `1.0020990156` / `1.0201468959` / `1.0179264198`，由备份/参照比值反推）见 §16.13.2 与 §14.3，**不是**本表的
+  写入参数，混列会让读者误以为 restore 也做了乘法。
+- 1,690 + 132 + 675×3 = **3,847**，与 §16.13.2 干跑计划**逐项一致**：执行的就是被签署的那份计划，没有临场扩缩。
+
+#### 16.14.3 校验（指纹 / 回滚点 / 行数不变式 / 幂等复验 / 无遗留日志）
+
+| 校验项 | 命令 | 结果 |
+| :--- | :--- | :--- |
+| 执行前指纹 | `sha256sum data/cache.duckdb`（执行前，库已从 `data/cache.duckdb.bak.20261023-211859` 还原并核验） | `3cb3f4746204b5f1a2c5395c2947963837f5ab3a829633896fe4a281f222f744` |
+| 执行后指纹 | `sha256sum data/cache.duckdb` | `7bae30eb4a16b011ed79cef03bba29b1b103f33b1c312198665fc513688d3796` |
+| 指纹差异 | 两值比对 | **不同** ⇒ 写入确实发生（干跑阶段该值曾逐位未变，故"变"本身就是执行的证据） |
+| 回滚点 | `sha256sum data/cache.duckdb.bak.20261023-212614` | `3cb3f474…f744`，**恰等于执行前** ⇒ 是真正的**字节副本**，不是逻辑导出 |
+| 行数不变式 | `ohlcv_bars` 按 `provider, symbol` 分组比对全表 | 现库 **318** 组 / 备份 **318** 组，**`count diffs: 0`**（`no row-count change anywhere`） |
+| 5 只操作标的行数 | 同上，逐只 | `600362` / `600660` / `601225` / `601288` / `601398` 现库与执行前**均为 2,367 行** |
+| 幂等复验（干跑） | 同一命令**去掉** `--apply --i-know-this-is-production --backup-dir data` | `nothing to repair: the census found no damage block in any symbol of FuyaoDataProvider`，`exit: 0 (clean)`，**退出码 0**，`residual_damage = 0` |
+| 无遗留日志 | `ls -l data/cache.duckdb.wal data/cache.duckdb.lock` | 两者**均不存在**（`No such file or directory`，`ls` 退出码 2） |
+
+- **行数不变式为什么是这条修复的正确不变式**：本轮五个 op 只做"重定标 / 还原价格"，**不承担 append 职责**
+  （§14.5 已写明修复写入器拒绝 `start > MAX(date)`）。因此"全表行数逐 symbol 零差异"+"区间 `sum(volume)` 逐位
+  不变"（工具事务内自校验）合起来才把"只改了价格、没增删数据"钉死。只有 `sum(close*volume)` 允许按计划值改变。
+
+#### 16.14.4 披露一：`601288.SH` 残留 0.2286 pp 跨 provider 基准台阶（**既有，非本次缺陷**）
+
+- 残缝位置：**2025-12-31 → 2026-01-05**，幅度 **0.2286 pp**。
+- 根因**不在本次修复**：在 `data/cache.duckdb.bak` 里，Fuyao 序列相对 `MarketDBDataProvider` 到 2025-12-31 为止
+  偏 **+0.2291 pp**、从 2026-01-05 起为 **0.0 pp** —— **备份自身就带一个基准台阶**，逐字节还原必然把它一并带回。
+- 定性：**既有的跨 provider 基准落差**（与按设计跳过的 `300394.SZ` 同类，见 §16.13.5）；**census 不判为 damage**，
+  故它**不进入** `residual_damage`，也**不构成本次修复的失败项**。
+- 措辞纪律：**不得把 `601288` 写成"完全修复"**。处置仍是独立台账决定（接受并记账 / 引入第三参照源收口），
+  本轮不代为选择；沉默通过会让下一位读者把 "0.2286 pp" 读成 0。
+
+#### 16.14.5 披露二：`600362` 的 1,690 行整段重基准 ⇒ `2023-12-29` 之前**不可比特级复现**
+
+- `600362.SH` 的 **1,690 行**（`2017-01-18 → 2023-12-29`）被**整段**乘 **0.9966398754**。这是本批唯一改写
+  **2023 年及更早**历史的 op，也是 §16.13.8 第 2、4 条要求"第二复核人逐条签署、不得顺手执行"的那一项。
+- 后果（必须随结论一起引用）：**2023-12-29 之前**涉及 `600362` 的回测/研究数字，与 **2026-10-23 之前**的
+  同名结论**不再比特级可比**；凡跨越该区间或以该标的为样本的 Sharpe / 回撤 / walkforward 排名 / `strategy_dumps`
+  内缓存值**必须重跑**。报告时应显式标注"基准已变更"，而不是静默沿用旧数——旧数不是错，只是**另一把尺子**。
+- 同一句已写入 [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) 的
+  `L2.8` 行内注记（诚实披露二），两处口径一致。
+
+#### 16.14.6 收口
+
+**Track L 至此无未完成项**：`L2.1`–`L2.31` **全部完成**。剩下 20 项待办分别在 Track S(7)、Track W(5)、
+`P1.4`–`P1.7`(4)、`B4.2`/`B5.1`–`B5.3`(4)，与本轨无关。`docs/development_plan.md` §2.12 与 §2.13 的标题正文、
+以及 §二 开头的状态口径（**104 `[x]` / 20 `[ ]`**，`grep -c` 实测）均已同批更新。
+
+---
+
+## 17. Track C 死门修正与算子 API 一致性（`C5.1`–`C5.3`）(2026-10-23)
+
+本节是 §16.5（`C4.1` 的"部分 NO"）的直接后续：§16.5 证明两只新策略在合成宇宙**永不建仓**，本节修掉两处
+**结构性死门**并补一处算子 API 不一致。三处都不新增信号，改的是"门能不能开"与"API 能不能传表"。
+
+### 17.1 `C5.1` 曲率死门：`κ ≥ 1.5` 在 `window=5` 下**数学上不可达**
+
+- **数学事实**：`extremum_curvature` 先把窗口内价格 **Z-Score 化再拟合**，`window=5` 时 `|κ|` 有硬上界
+  `2√(5/14) ≈ 1.1952286`（`CURVATURE_KAPPA_BOUND_WINDOW5`）。本轮实测：**全符号网格 + ~54k 随机窗口**的最大值
+  **1.195**，与解析上界吻合。于是所有 `κ ≥ 1.5` 门禁**永不成立**。
+- **修正**：新增 `DEFAULT_REACHABLE_MIN_CURVATURE = 0.8` 与 `warn_unreachable_curvature_threshold()`
+  （阈值落在不可达区即 `UserWarning`，**不抛错**——它的职责是提醒，不是拦住回测）。三处门禁
+  （`WyckoffChanSpringStrategy`、`chan_advanced_strategies` 的 `curvature_v_bottom` 与
+  `spring_curvature_combined`）统一改用可达默认值，并在解析阈值时调用护栏；`config.py:900` 与
+  `strategies_config.json:1196` 的 `wyckoff_chan_spring` 预设同步 `1.5 → 0.8`。
+- **刻意不动的地方（fail-closed）**：`pipeline/research/blend/blend_base.py` 的两处
+  （`L1116` / `L1433` 附近，`wyckoff_spring >= 1.25 AND curvature >= 1.5` 的**并集豁免/快速通道**）**只加保护性
+  注释，值仍是 1.5**。原因：那是**并集豁免**，不可达即等价于"该豁免不生效"（保持现状、fail-closed）；把它降到
+  0.8 会**新增一条没有任何 walkforward 证据的开闸路径**。注释里写明"不要在没有证据的情况下'修'它"。
+- **行为证据**：`test_wyckoff_chan_spring_reachable_curvature_gate_opens_position` 证明默认 0.8 在 κ≈**1.0101**
+  处**建仓**，而旧的 1.5 在该 fixture 上**零建仓**并触发告警。
+- **附注（不可用作翻案）**：`k < 5` 的预热窗口（仅序列最前 1–2 根，`min_periods=3`）理论上可达更高值（实测
+  样点最大 4.24），但那是**不可交易的预热期信号**，不能据此宣称"旧门曾经有效"。
+
+### 17.2 `C5.2` `chan_vp_hybrid` 的 HVN 校验：用同窗 `VAL/VAH`，不用陈旧确认中枢
+
+- **根因**：`hvn_instant = (cd_s >= min_density) & (POC ∈ [ZD, ZG])`，而 `ZD/ZG` 来自**已确认**的缠论中枢
+  （按定义滞后一个笔/段），与**同一窗口**的 60d 滚动 POC **零重叠** ⇒ `hvn_valid` 恒 `False` ⇒ 永不建仓。
+- **修正**：`consolidation_density` 的 `zd/zg` 与 **POC 区间检验两处同步**改为同窗滚动 `VAL/VAH`。
+  **只改 POC 子句会让策略仍然永不建仓**——这是本轮最容易踩空的一步，故写成一行显式警告。
+- **如实披露的一点**：`POC ∈ [VAL, VAH]` 由 `compute_rolling_poc_series` 的**构造**保证恒真，因此**实际生效的门
+  是同窗价值区密度 `>= min_density`**。代码注释里照实写了这句，不假装 POC 子句在独立过滤。
+- **`ZD/ZG` 并未消失**：它们仍驱动**结构件**——突破 / 回踩 `ZG`、止损 `ZD`、`hvn_recent` 新鲜度。改的只是
+  那次"用陈旧中枢当密度尺子"的判定。
+- **行为证据**：`test_chan_vp_hybrid_opens_position_on_synthetic_universe`（默认参数、固定 fixture）下 SPY 出现
+  **9 个正权重调仓行、峰值 1.0**；台账门禁用例
+  `test_track_c_suite_regression.py::test_chan_vp_hvn_gate_is_reachable` 由 **strict-XFAIL 翻为通过**，
+  **xfail 标记已移除**，转为**防复发回归用例**（门若再次悄悄死掉，这条会立刻红）。
+- **依赖口径更正**：台账原记本行前置 `C5.1`，那是**证据性依赖，不是技术性依赖**——
+  `chan_vp_hybrid_strategy.py` **不 import** `extremum_curvature`，两个调用图**不相交**。不要把两条写成"先后因果"。
+
+### 17.3 `C5.3` 三个 Series 级算子的输入形状：统一"接受 Series 或单列 DataFrame，多列显式报错"
+
+- **症状**：`fractal_dimension(pd.DataFrame({"A": ...}))` 抛 `ValueError: Data must be 1-dimensional`
+  （内部以 `(n,1)` 数组进 R/S 估计），而同层 `extremum_curvature` 对同形 DataFrame **正常返回**。于是形成隐式
+  契约："有的算子能传表、有的不能"，调用方各自 `squeeze()`。
+- **修正**：新增私有 `_as_1d_series(x, op_name)`，`extremum_curvature` / `standardized_divergence` /
+  `fractal_dimension` 三算子入口统一走它：接受 `Series` 或**单列** `DataFrame`，多列时显式
+  `ValueError`（**消息含算子名与列数**，便于定位）。
+- **零破坏论证**：`standardized_divergence` 对 1-D 输入**恒返回 Series**；旧实现只在**传入 DataFrame 时**才广播
+  成 DataFrame，而既有调用方**全部传 Series**（因此返回类型不变）。
+- **验证**：`common/tests/test_structural_factors.py` **4 → 15 passed**（新增 3 算子 × 3 形状的参数化用例 +
+  指标单列用例）。
+
+### 17.4 版本双轴与 `--dump-strategies` 复核
+
+| 对象 | 旧 → 新 | 依据 |
+| :--- | :--- | :--- |
+| `WyckoffChanSpringStrategy` | `1.0.0` → **`1.1.0`** | `C5.1`：默认曲率门 `1.5 → 0.8`（参数默认值变更 = 策略语义变更） |
+| `ChanMeanReversionDivergenceStrategy` | `1.0.0` → **`1.1.0`** | `C5.1`：`curvature_v_bottom` / `spring_curvature_combined` 两处门禁同批改默认值 |
+| `ChanVolumeProfileHybridStrategy` | `1.0.0` → **`1.1.0`** | `C5.2`：HVN 校验基准由陈旧 `[ZD, ZG]` 改为同窗 `[VAL, VAH]`（信号判定逻辑变更） |
+| `BaseBlendAllocationStrategy.BASE_VERSION` | `1.5.0` → **`1.5.0`（不变）** | 见下 |
+| `AllocationTemplate` | 未改动 | 本批无涉及 |
+
+- **为什么 `BASE_VERSION` 不升（必须写明理由，不能只写"没升"）**：`blend_base.py` 本批的 diff **只有注释**
+  （两处 `PROTECTIVE NOTE`），**值仍是 1.5、门禁行为逐位不变**。`AGENTS.md` §7 要求升 `BASE_VERSION` 的场景
+  是"修改、扩展或新增特性 / 算子 / 风险叠加"；一条纯注释、零行为变化的改动**不构成**基座语义变更，强行升版会
+  让"基座变了"这个信号失真，并要求所有 blend dump / 实盘 `base_version` 重新归因。**这是一个判断，不是一个
+  漏洞**——若后续真把 1.5 降到 0.8（有 walkforward 证据时），那一次**必须**升 `BASE_VERSION` 并重导全部 dump。
+- **`--dump-strategies` 复核**：58 份 dump 同批重导（`pipeline/research_strategy/results/strategy_dumps/`，
+  58 个文件 mtime 一致）。其中 `strategy_version` 落在 `1.1.0` 的有 **4** 份，但**只有 3 份是本轮产物**：
+  `wyckoff_chan_spring_strategy.json`（`wyckoff_spring_min_curvature` 已为 `0.8`）、
+  `chan_mean_reversion_divergence_strategy.json`、`chan_vp_hybrid_strategy.json`；
+  `chan_risk_managed_blend_strategy.json` 同为 `1.1.0` 但**属既有**（`ChanRiskManagedBlendStrategy.version`
+  在 HEAD 已是 `1.1.0`，本轮未动），不得计入本轮的 3 个。
+- **一句必须说的披露**：`pipeline/research_strategy/results/` 被 `pipeline/.gitignore` 忽略，因此"仅 3 个文件
+  变化"**无法用 `git diff` 复核**，只能靠内容比对（`strategy_version` 与 `params` 键值）。引用时请写成
+  "按内容比对的 3 个"，不要写成"`git diff` 显示 3 个"。
+
+### 17.5 离线验证（本轮实跑，精确计数）
+
+| 套件 | 输出 |
+| :--- | :--- |
+| `pytest common/tests -q` | **695 passed, 1 skipped** |
+| `pytest pipeline/tests -q` | **219 passed** |
+| `pytest pipeline/research_strategy/tests -q` | **614 passed, 1 xfailed** |
+| `pytest pipeline/instrument_selection/tests -q` | **114 passed** |
+| `pytest pipeline/pattern_mining/tests -q` | **17 passed** |
+| `pytest pipeline/strategy_generator/tests -q` | **74 passed** |
+| `pytest pipeline/fundamental_screener/tests -q` | **38 passed** |
+| `pytest backtester/tests -q` | **79 passed** |
+| `pytest web/livetrading/tests -q` | **81 passed** |
+| **合计** | **1931 passed, 0 failed, 1 xfailed, 1 skipped**（~10m39s，**100% 离线**） |
+
+- **唯一那条 xfail 是刻意保留的**：`test_track_c_suite_regression.py::test_wyckoff_curvature_entry_gate_is_reachable`
+  （理由见 17.6 第 2 条）。`C5.2` 对应的 `test_chan_vp_hvn_gate_is_reachable` **已不再是 xfail**。
+- 单文件复核（本轮实跑）：`common/tests/test_market_clock.py` **112**、`common/tests/test_intraday_features.py`
+  **43**（两文件合计 **155**）、`common/tests/test_duckdb_cache.py` **72**。
+
+### 17.6 两条必须随结论一起引用的诚实披露
+
+1. **`0.8` 只是"过渡性可达默认值"，不是"经济最优阈值"**。它的唯一主张是：**移除一扇数学上打不开的死门、
+   恢复可交易性**。`0.8` 是不是好的入场门槛，**需要 walkforward 证据**，属独立任务。特别地：
+   **不得用 `0.8` 反证旧 `1.5` 门"曾经有效"**——它从来就不可能成立；也**不得**据此宣称"修好之后策略有效"。
+2. **`C4.1` 的"部分 NO"只闭合了一半**（引用 §16.5 时必须带上这句）：
+   - `chan_vp_hybrid` 侧**已闭合**：可建仓用例（SPY 9 个正权重调仓行）+ strict-XFAIL → 通过；
+   - `wyckoff_chan_spring` 侧**只证明"曲率门可达"**（κ≈1.0101 于专用 fixture 建仓）。其台账用例
+     `test_wyckoff_curvature_entry_gate_is_reachable` **仍保持 xfail**，原因是**fixture**而非生产缺陷：
+     它用的 `_two_symbol_universe(400)` 随机游走**根本没有 V 型拐点**（`spring >= 1` 只有 **2 根**，那两根的
+     κ 分别 ≈ **0.0513** / **0.2043**），换成任何阈值都不成立。**该 fixture 没有真正的 V 转向前，不得移除
+     xfail，也不得把断言改指向那两根低曲率弹簧。**
+
+**本节追加时的验证记录（2026-10-23 晚，100% 离线）**
+
+| 命令 | 输出 |
+| :--- | :--- |
+| 九套件合计（见 17.5） | **1931 passed, 0 failed, 1 xfailed, 1 skipped** |
+| `grep -rn --include=*.py 'date.today()' scripts/` | 非注释行**零命中**（6 处命中全为注释/文档字符串） |
+| `python -c "count dump strategy_version"` | 58 份 dump，`1.1.0` 4 份（3 份本轮 + 1 份既有），`1.0.0` 52 份，`1.0.1` 1 份，`1.2.1` 1 份 |

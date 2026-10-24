@@ -11,8 +11,11 @@ Quantitative Mechanics:
      to 20-day rolling lowest price before pivots form).
    - Detects causal Spring: previous bar undercuts support (penetration between min_penetration
      and max_penetration), current bar reclaims back above support on expanding volume.
-   - Requires scale-free turning point extremum curvature kappa >= min_curvature (default 1.5)
-     for high-conviction V-reversal geometry.
+   - Requires scale-free turning point extremum curvature kappa >= min_curvature, whose default
+     is now DEFAULT_REACHABLE_MIN_CURVATURE (0.8). The former 1.5 default was structurally
+     unreachable: on a full window=5 fit |kappa| <= 2*sqrt(5/14) ~= 1.1952 because the window
+     is z-scored before the quadratic is fitted (Task C5.1), so the strategy could never open a
+     position. 0.8 is an INTERIM reachability default, not a walkforward-optimised threshold.
 2. Stop-Loss & Two-Stage Profit Targets:
    - Protective stop-loss is anchored strictly at 0.5% below spring low (Low_{t-1}).
    - Target 1 (ZG): when price reaches pivot upper bound ZG, scale out 50% of position
@@ -31,7 +34,12 @@ from common.allocation_templates import (
     _fill_out_columns,
     _sparse_from_daily,
 )
-from common.structural_factors import extremum_curvature, wyckoff_spring
+from common.structural_factors import (
+    DEFAULT_REACHABLE_MIN_CURVATURE,
+    extremum_curvature,
+    warn_unreachable_curvature_threshold,
+    wyckoff_spring,
+)
 from .chan_advanced_strategies import (
     _extract_pivot_and_stroke_series,
     _get_risky_symbols_helper,
@@ -136,6 +144,11 @@ class WyckoffChanSpringStrategy(AllocationTemplate):
     profit taking.
     """
 
+    # Task C5.1: 1.0.0 -> 1.1.0 -- default min-curvature gate lowered from the
+    # structurally unreachable 1.5 to DEFAULT_REACHABLE_MIN_CURVATURE (0.8) and
+    # the dead-gate warning added at threshold-resolution time.
+    version: str = "1.1.0"
+
     def __init__(self, config: StrategyConfig = None):
         self.config = config or StrategyConfig()
         super().__init__(
@@ -153,7 +166,13 @@ class WyckoffChanSpringStrategy(AllocationTemplate):
         min_strokes = int(p.get("chan_vp_min_strokes", getattr(cfg, "chan_vp_min_strokes", 3)))
         max_penetration = float(p.get("wyckoff_spring_max_penetration", getattr(cfg, "wyckoff_spring_max_penetration", 0.04)))
         min_penetration = float(p.get("wyckoff_spring_min_penetration", getattr(cfg, "wyckoff_spring_min_penetration", 0.005)))
-        min_curvature = float(p.get("wyckoff_spring_min_curvature", getattr(cfg, "wyckoff_spring_min_curvature", 1.5)))
+        min_curvature = float(p.get("wyckoff_spring_min_curvature", getattr(cfg, "wyckoff_spring_min_curvature", DEFAULT_REACHABLE_MIN_CURVATURE)))
+        # Task C5.1: the analytic full-window ceiling for window=5 is ~1.1952, so a
+        # resolved threshold at/above it (e.g. a legacy 1.5 config override) is a dead
+        # gate. Warn rather than raise so old configs still run -- but visibly.
+        warn_unreachable_curvature_threshold(
+            min_curvature, window=5, context="wyckoff_chan_spring.wyckoff_spring_min_curvature"
+        )
         min_rel_vol = float(p.get("wyckoff_spring_min_rel_vol", getattr(cfg, "wyckoff_spring_min_rel_vol", 1.0)))
         stop_buffer_pct = float(p.get("wyckoff_spring_stop_buffer_pct", getattr(cfg, "wyckoff_spring_stop_buffer_pct", 0.005)))
         max_holding_days = int(p.get("wyckoff_spring_max_holding_days", getattr(cfg, "wyckoff_spring_max_holding_days", 30)))
@@ -229,10 +248,21 @@ class WyckoffChanSpringStrategy(AllocationTemplate):
         return _sparse_from_daily(daily)
 
     def explain_weights(self, params: dict = None) -> str:
+        cfg = self.config
+        p = params or {}
+        min_curvature = float(
+            p.get(
+                "wyckoff_spring_min_curvature",
+                getattr(cfg, "wyckoff_spring_min_curvature", DEFAULT_REACHABLE_MIN_CURVATURE),
+            )
+        )
         return (
             "Wyckoff-Chan Spring Strategy (威科夫因果弹簧与中枢反转): "
             "enters on causal support undercut and reclaim (Wyckoff Spring) confirmed by "
-            "scale-free extremum curvature kappa >= 1.5; stops out below spring low; "
+            f"scale-free extremum curvature kappa >= {min_curvature:g} "
+            "(Task C5.1: default 0.8 is an interim reachability value; the former 1.5 was "
+            "above the analytic window-5 ceiling of ~1.1952 and could never trigger); "
+            "stops out below spring low; "
             "scales out 50% at Zhongshu upper bound ZG and moves stop to breakeven; "
             "fully exits at Target 2 (ZG + 1.2*(ZG-ZD)) or max holding period."
         )

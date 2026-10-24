@@ -628,3 +628,180 @@ def test_last_expected_bar_ts_validates_its_inputs():
         last_expected_bar_ts(MARKET_CHINA, SESSION_DAY, _dt.timedelta(0))
     with pytest.raises(Exception):
         last_expected_bar_ts("atlantis", SESSION_DAY, FIVE_MIN)
+
+
+# --------------------------------------------------------------------------- #
+# L2.27: half-day / early-close (早收) modelling.
+#
+# `L2.26` made the intraday freshness deadline "session close minus one bar" and took the
+# close from this module. That turned the `L2.1` disclosure "half-days are not modelled"
+# into a live defect: a US 13:00 day (day after Thanksgiving, July 3, Christmas Eve) can
+# never satisfy a 15:55 deadline, so a *correctly* synced cache was judged uncovered and
+# re-fetched upstream forever. The clock now asks `common/market_holidays.py` for the
+# date's real close instead of assuming one close per market.
+#
+# Everything below is frozen literals -- no wall clock, no network, no real market data.
+# --------------------------------------------------------------------------- #
+US_EARLY = _dt.date(2026, 11, 27)    # day after Thanksgiving 2026-11-26 -> 13:00
+US_NORMAL = _dt.date(2026, 11, 25)   # Wednesday, full 16:00 session
+HK_EARLY = _dt.date(2026, 12, 24)    # Christmas Eve -> 12:00, no afternoon session
+
+
+def test_session_close_time_without_a_date_is_the_full_session():
+    """The no-date call keeps the `L2.26` signature AND answer (no caller has to change)."""
+    assert session_close_time(MARKET_CHINA) == _dt.time(15, 0)
+    assert session_close_time(MARKET_HK) == _dt.time(16, 0)
+    assert session_close_time(MARKET_US) == _dt.time(16, 0)
+    # A normal day spells the same thing with an explicit date -- that is the "unaffected"
+    # half of the L2.27 acceptance criteria.
+    assert session_close_time(MARKET_US, US_NORMAL) == _dt.time(16, 0)
+    assert session_close_time(MARKET_CHINA, SESSION_DAY) == _dt.time(15, 0)
+    assert session_close_time(MARKET_HK, _dt.date(2026, 10, 23)) == _dt.time(16, 0)
+
+
+def test_session_close_time_shrinks_on_an_early_close_day():
+    assert session_close_time(MARKET_US, US_EARLY) == _dt.time(13, 0)
+    assert session_close_time(MARKET_HK, HK_EARLY) == _dt.time(12, 0)
+    # China A-shares have no scheduled half-day at all: a shortened trading day there is a
+    # FULL closure (Spring Festival / 调休), which the holiday table already holds.
+    for year in range(mh.COVERAGE_START_YEAR, mh.COVERAGE_END_YEAR + 1):
+        assert mh.early_closes_for(MARKET_CHINA, year) == {}, (
+            f"china {year}: A-shares publish no half-day sessions; a short day is a closure"
+        )
+    assert session_close_time(MARKET_CHINA, _dt.date(2026, 2, 13)) == _dt.time(15, 0)
+    # ...and the market spec's day-level accessor agrees with the free function
+    # (one calendar, one answer -- no second opinion to drift).
+    assert market_spec(MARKET_US).close_time_on(US_EARLY) == _dt.time(13, 0)
+    assert market_spec(MARKET_US).early_close_on(US_EARLY) == _dt.time(13, 0)
+    assert market_spec(MARKET_HK).close_time_on(HK_EARLY) == _dt.time(12, 0)
+    for market in (MARKET_CHINA, MARKET_HK, MARKET_US):
+        spec = market_spec(market)
+        assert spec.early_close_on(US_NORMAL) is None, "a normal day has no early close"
+        assert spec.close_time_on(US_NORMAL) == spec.close_time
+
+
+def test_last_expected_bar_ts_uses_the_early_close():
+    """The deadline the `L2.26` gate actually compares against, on a 13:00 / 12:00 day."""
+    # US 13:00 early close: 12:55 for 5m bars, i.e. the final bar covers 12:55-13:00.
+    assert last_expected_bar_ts(MARKET_US, US_EARLY, FIVE_MIN) == _dt.datetime(
+        2026, 11, 27, 12, 55
+    )
+    # The tolerance is still the BAR LENGTH, not a constant (1h bar -> 12:00).
+    assert last_expected_bar_ts(MARKET_US, US_EARLY, HOUR) == _dt.datetime(2026, 11, 27, 12, 0)
+    # HK half-day: morning-only, so the last 5m bar opens 11:55.
+    assert last_expected_bar_ts(MARKET_HK, HK_EARLY, FIVE_MIN) == _dt.datetime(2026, 12, 24, 11, 55)
+    # Untouched either side of the early close (the classic off-by-one-day regression).
+    assert last_expected_bar_ts(MARKET_US, US_NORMAL, FIVE_MIN) == _dt.datetime(2026, 11, 25, 15, 55)
+    assert last_expected_bar_ts(MARKET_US, _dt.date(2026, 11, 30), FIVE_MIN) == _dt.datetime(
+        2026, 11, 30, 15, 55
+    )
+    # Still naive market-local, on the session day itself.
+    deadline = last_expected_bar_ts(MARKET_US, US_EARLY, FIVE_MIN)
+    assert deadline.tzinfo is None and deadline.date() == US_EARLY
+
+
+def test_early_close_does_not_leak_to_adjacent_days_or_the_weekend():
+    """Weekend / adjacent-session interaction: only the listed date is shortened."""
+    spec = market_spec(MARKET_US)
+    for day in (
+        _dt.date(2026, 11, 26),   # Thanksgiving itself: a full CLOSURE, not a half-day
+        _dt.date(2026, 11, 28),   # Saturday
+        _dt.date(2026, 11, 29),   # Sunday
+        _dt.date(2026, 11, 30),   # Monday, normal
+    ):
+        assert spec.close_time_on(day) == _dt.time(16, 0), f"{day} must stay a full session"
+    # An early-close date is still a TRADING day (which is exactly why it lives in its own
+    # table rather than inside `holidays_for`).
+    assert clock(MARKET_US, 2026, 11, 27, 19, 0).is_trading_day(US_EARLY) is True
+    assert clock(MARKET_US, 2026, 11, 26, 19, 0).is_trading_day(_dt.date(2026, 11, 26)) is False
+
+
+def test_early_close_lookup_is_tri_state_and_returns_a_copy():
+    """UNKNOWN stays distinguishable from "no early closes", per the module contract."""
+    assert mh.early_closes_for_or_none(MARKET_US, 2030) is None
+    with pytest.raises(mh.HolidayCalendarCoverageError):
+        mh.early_closes_for(MARKET_US, 2030)
+    with pytest.raises(mh.HolidayCalendarCoverageError):
+        mh.early_close_time(MARKET_US, _dt.date(2030, 1, 2))
+    # Covered, and genuinely no half-days -> `{}`, never `None`.
+    assert mh.early_closes_for_or_none(MARKET_CHINA, 2026) == {}
+    # The ONE documented collapse: the geometry accessor reads UNKNOWN as "full session",
+    # because it feeds a boolean coverage predicate that must not start raising (a raise
+    # would make `fetch_universe` drop the asset). Safe direction: a short session in an
+    # unknown year is judged SHORT (re-fetch), never fresh.
+    assert mh.early_close_time_or_none(MARKET_US, _dt.date(2030, 1, 2)) is None
+    assert session_close_time(MARKET_US, _dt.date(2030, 1, 2)) == _dt.time(16, 0)
+    # Returned maps are copies -- mutating one must not corrupt the process-wide table.
+    leaked = mh.early_closes_for(MARKET_US, 2026)
+    leaked[US_EARLY] = _dt.time(11, 0)
+    assert mh.early_close_time(MARKET_US, US_EARLY) == _dt.time(13, 0)
+    # A `datetime` is a `date` subclass that never equals a `date`: reject it instead of
+    # silently answering "full session" (same trap as `MarketClock.holidays` validation).
+    with pytest.raises(TypeError, match="plain datetime.date"):
+        session_close_time(MARKET_US, _dt.datetime(2026, 11, 27, 12, 0))
+
+
+def test_early_close_tables_are_trading_weekdays_inside_the_covered_years():
+    """Data invariant: a half-day on a closure/weekend would be silently inert."""
+    for market in (MARKET_CHINA, MARKET_HK, MARKET_US):
+        first, last = coverage_years(market)
+        assert (first, last) == (mh.COVERAGE_START_YEAR, mh.COVERAGE_END_YEAR)
+        spec = market_spec(market)
+        for year in range(first, last + 1):
+            table = mh.early_closes_for(market, year)   # raises if a year were missing
+            closures = mh.holidays_for(market, year)
+            for day, close in sorted(table.items()):
+                assert day.year == year, f"{market}: {day} filed under year {year}"
+                assert day.weekday() < 5, f"{market} {day}: early close on a weekend"
+                assert day not in closures, f"{market} {day}: is a full closure, not a half-day"
+                assert spec.morning_open < close < spec.close_time, (
+                    f"{market} {day}: early close {close} must be strictly inside "
+                    f"({spec.morning_open}, {spec.close_time})"
+                )
+
+
+def test_pinned_early_close_dates():
+    """Pin the transcribed data (a silent edit here changes live re-fetch behaviour)."""
+    assert mh.early_closes_for(MARKET_US, 2026) == {
+        _dt.date(2026, 11, 27): _dt.time(13, 0),
+        _dt.date(2026, 12, 24): _dt.time(13, 0),
+    }
+    # 2021-12-24 is the *observed Christmas closure*, not a half-day (a real trap: the
+    # 13:00 rule applies to Christmas Eve as a session, and that year it was not one).
+    assert mh.early_closes_for(MARKET_US, 2021) == {_dt.date(2021, 11, 26): _dt.time(13, 0)}
+    assert _dt.date(2021, 12, 24) in mh.holidays_for(MARKET_US, 2021)
+    # Same trap for July 3: 2020-07-03 is the observed Independence Day closure.
+    assert _dt.date(2020, 7, 3) in mh.holidays_for(MARKET_US, 2020)
+    assert mh.early_closes_for(MARKET_US, 2020) == {
+        _dt.date(2020, 11, 27): _dt.time(13, 0),
+        _dt.date(2020, 12, 24): _dt.time(13, 0),
+    }
+    assert mh.early_closes_for(MARKET_HK, 2026) == {
+        _dt.date(2026, 2, 16): _dt.time(12, 0),    # Lunar New Year's Eve
+        _dt.date(2026, 12, 24): _dt.time(12, 0),
+        _dt.date(2026, 12, 31): _dt.time(12, 0),
+    }
+    # 2023 has no half-day session at all (all three eves fall on a weekend).
+    assert mh.early_closes_for(MARKET_HK, 2023) == {}
+    assert mh.table_revision().endswith(".2"), "data edit without a TABLE_REVISION bump?"
+
+
+def test_l2_1_session_state_and_as_of_are_deliberately_not_shortened():
+    """DISCLOSED scope boundary (L2.27): only the session GEOMETRY shrinks, not L2.1.
+
+    `session_state` / `as_of_trading_date` keep the full-session rules, i.e. a 13:00 day is
+    still reported OPEN at 14:30 and as-of holds the previous session until close+grace.
+    That is *late*, never optimistic, and it is what keeps the fix safe: the shortened
+    deadline is only consulted from 16:15 onward, when the real close has long passed.
+    """
+    midday = clock(MARKET_US, 2026, 11, 27, 19, 30)   # 14:30 ET, after the 13:00 close
+    assert midday.session_state() is SessionState.OPEN
+    assert midday.as_of_trading_date() == US_NORMAL    # 11-26 is Thanksgiving
+
+    after_grace = clock(MARKET_US, 2026, 11, 27, 21, 20)   # 16:20 ET
+    assert after_grace.session_state() is SessionState.CLOSED
+    assert after_grace.as_of_trading_date() == US_EARLY
+    # ...and from that moment the freshness gate measures the SHORTENED deadline.
+    assert last_expected_bar_ts(
+        MARKET_US, after_grace.as_of_trading_date(), FIVE_MIN
+    ) == _dt.datetime(2026, 11, 27, 12, 55)

@@ -2033,3 +2033,256 @@ def test_l2_26_shared_core_stays_date_only_when_no_deadline_is_supplied():
     assert "last_expected_bar_ts" in deadline_src
     for literal in ("time(15", "time(16", "timedelta(hours=15", "timedelta(hours=16"):
         assert literal not in module_src, f"session close hard-coded in duckdb_cache.py: {literal}"
+
+
+# ---------------------------------------------------------------------------------------------
+# L2.27 -- half-day / early close (早收) on the intraday freshness gate.
+#
+# L2.26 anchored the deadline to `market_clock.last_expected_bar_ts` = close - one bar. That
+# was correct only if every session ends at the market's normal close, which is false three
+# times a year in the US (13:00) and on HK eves (12:00). The consequence was NOT a missed
+# re-fetch but the opposite: an early-close session that is fully and correctly synced
+# (09:35..13:00) still fails a 15:55 deadline, so every run declares the cache stale and
+# re-fetches upstream -- forever, since no amount of downloading can add 15:00 bars to a day
+# that ended at 13:00.
+#
+# `L2.27` fixes it in the clock, not here: `session_close_time(market, date)` consults the
+# static early-close table in `common/market_holidays.py`. `duckdb_cache.py` is unchanged, so
+# these tests are also the proof that the fix flows through the existing public API only.
+# ---------------------------------------------------------------------------------------------
+US_EARLY_CLOSE_DAY = "2026-11-27"    # day after Thanksgiving 2026-11-26 -> 13:00 close
+US_NORMAL_DAY = "2026-11-25"         # Wednesday, full 16:00 session
+HK_HALF_DAY = "2026-12-24"           # Christmas Eve -> 12:00, no afternoon session
+
+
+def _us_session_5m_frame(day: str, last_time: str) -> pd.DataFrame:
+    """Synthetic US continuous-session 5m bars for one day, ending at `last_time`.
+
+    US has no lunch break, so the shape is simply 09:35..`last_time` in 5-minute steps; the
+    last bar is the session close (`13:00` on an early close, `16:00` normally). All synthetic
+    and deterministic -- no provider, no network.
+    """
+    times = pd.date_range(f"{day} 09:35:00", f"{day} {last_time}:00", freq="5min")
+    n = len(times)
+    return pd.DataFrame(
+        {"Open": [100.0] * n, "High": [101.0] * n, "Low": [99.0] * n,
+         "Close": [100.5] * n, "Volume": [10.0] * n},
+        index=times,
+    )
+
+
+def _store_us_session(cache, symbol: str, day: str, last_time: str, provider="FuyaoDataProvider"):
+    cache.store_intraday_bars(
+        provider, symbol, _us_session_5m_frame(day, last_time), interval="5m",
+        sync_time=datetime.datetime.fromisoformat(f"{day} {last_time}:30"),
+    )
+    return provider
+
+
+def test_l2_27_us_early_close_session_reaching_1300_is_covered(caplog):
+    """ACCEPTANCE: an early-close day whose bars reach 13:00 is COVERED.
+
+    Under L2.26 this exact cache was reported stale (deadline 15:55) and re-fetched on every
+    run, which is the defect L2.27 closes.
+    """
+    provider, symbol = "FuyaoDataProvider", "AAPL"
+    now = pd.Timestamp(f"{US_EARLY_CLOSE_DAY} 16:30:00")
+
+    cache = DuckDBCache(db_path=":memory:")
+    _store_us_session(cache, symbol, US_EARLY_CLOSE_DAY, "13:00")
+
+    with caplog.at_level(logging.WARNING, logger="common.duckdb_cache"):
+        covered = cache.is_intraday_range_covered(
+            provider, symbol, interval="5m", start=US_EARLY_CLOSE_DAY, end=US_EARLY_CLOSE_DAY,
+            now=now, expected_last_session=datetime.date(2026, 11, 27),
+        )
+
+    assert covered is True, (
+        "a 13:00 early-close session that reached its own close must be covered; a 15:55 "
+        "deadline here means the early close is not modelled and the cache re-fetches forever"
+    )
+    assert not [r for r in caplog.records if r.name == "common.duckdb_cache"], (
+        "a covered session must not emit a staleness warning"
+    )
+
+    # The pre-L2.2 `None` fast path is untouched on an early-close day as well.
+    assert cache.is_intraday_range_covered(
+        provider, symbol, interval="5m", start=US_EARLY_CLOSE_DAY, end=US_EARLY_CLOSE_DAY,
+        now=now,
+    ) is True
+
+
+def test_l2_27_us_early_close_session_stopping_short_is_not_covered(caplog):
+    """ACCEPTANCE (no false positive): bars short of 13:00 are still NOT covered.
+
+    The discriminating boundary is `close - one bar` = 12:55 for 5m bars, exactly as it is
+    14:55 on a 15:00 day -- the early close shortens the session, it does not weaken the rule.
+    """
+    provider, symbol = "FuyaoDataProvider", "AAPL"
+    now = pd.Timestamp(f"{US_EARLY_CLOSE_DAY} 16:30:00")
+    expected = datetime.date(2026, 11, 27)
+
+    short = DuckDBCache(db_path=":memory:")
+    _store_us_session(short, symbol, US_EARLY_CLOSE_DAY, "13:00")
+    _truncate_intraday_session(short, provider, symbol, "5m", US_EARLY_CLOSE_DAY, "12:50")
+    with caplog.at_level(logging.WARNING, logger="common.duckdb_cache"):
+        assert short.is_intraday_range_covered(
+            provider, symbol, interval="5m", start=US_EARLY_CLOSE_DAY, end=US_EARLY_CLOSE_DAY,
+            now=now, expected_last_session=expected,
+        ) is False, "one bar short of a 13:00 early close must be uncovered"
+
+    messages = [r.getMessage() for r in caplog.records if r.name == "common.duckdb_cache"]
+    assert any(
+        "2026-11-27T12:50:00" in m and "2026-11-27T12:55:00" in m for m in messages
+    ), f"the warning must name the SHORTENED deadline (12:55), got: {messages}"
+
+    at_deadline = DuckDBCache(db_path=":memory:")
+    _store_us_session(at_deadline, symbol, US_EARLY_CLOSE_DAY, "13:00")
+    _truncate_intraday_session(at_deadline, provider, symbol, "5m", US_EARLY_CLOSE_DAY, "12:55")
+    assert at_deadline.is_intraday_range_covered(
+        provider, symbol, interval="5m", start=US_EARLY_CLOSE_DAY, end=US_EARLY_CLOSE_DAY,
+        now=now, expected_last_session=expected,
+    ) is True, "12:55 (close - one 5m bar) must satisfy the early-close deadline"
+
+
+def test_l2_27_normal_day_is_unaffected_by_the_early_close_table():
+    """ACCEPTANCE: a normal day keeps the 16:00 / 15:55 US deadline, both directions.
+
+    Same bars, one date apart: the 13:00 stop is stale on Wednesday and sufficient on the
+    early-close Friday. That pair is what distinguishes "date-aware close" from "the gate
+    got globally looser".
+    """
+    provider, symbol = "FuyaoDataProvider", "AAPL"
+    now = pd.Timestamp(f"{US_NORMAL_DAY} 16:30:00")
+    expected = datetime.date(2026, 11, 25)
+
+    truncated = DuckDBCache(db_path=":memory:")
+    _store_us_session(truncated, symbol, US_NORMAL_DAY, "16:00")
+    _truncate_intraday_session(truncated, provider, symbol, "5m", US_NORMAL_DAY, "13:00")
+    assert truncated.is_intraday_range_covered(
+        provider, symbol, interval="5m", start=US_NORMAL_DAY, end=US_NORMAL_DAY,
+        now=now, expected_last_session=expected,
+    ) is False, "a 13:00 stop on a NORMAL 16:00 day must stay uncovered"
+
+    full = DuckDBCache(db_path=":memory:")
+    _store_us_session(full, symbol, US_NORMAL_DAY, "16:00")
+    assert full.is_intraday_range_covered(
+        provider, symbol, interval="5m", start=US_NORMAL_DAY, end=US_NORMAL_DAY,
+        now=now, expected_last_session=expected,
+    ) is True, "a full 16:00 session must remain covered"
+
+
+def test_l2_27_early_close_and_the_following_weekend():
+    """Weekend interaction: a weekend `end` is satisfied by Friday's early close.
+
+    `2026-11-28/29` are Sat/Sun (no session, and no early close of their own), so the request
+    end must be tolerated by the weekend branch -- and Friday's shortened deadline still has
+    to be met. The truncated twin proves the tolerance is not blanket.
+    """
+    provider, symbol = "FuyaoDataProvider", "AAPL"
+    now = pd.Timestamp("2026-11-30 16:30:00")     # Monday, after the weekend
+    expected = datetime.date(2026, 11, 27)
+
+    cache = DuckDBCache(db_path=":memory:")
+    _store_us_session(cache, symbol, US_EARLY_CLOSE_DAY, "13:00")
+    assert cache.is_intraday_range_covered(
+        provider, symbol, interval="5m", start=US_EARLY_CLOSE_DAY, end="2026-11-29",
+        now=now, expected_last_session=expected,
+    ) is True
+
+    short = DuckDBCache(db_path=":memory:")
+    _store_us_session(short, symbol, US_EARLY_CLOSE_DAY, "13:00")
+    _truncate_intraday_session(short, provider, symbol, "5m", US_EARLY_CLOSE_DAY, "12:50")
+    assert short.is_intraday_range_covered(
+        provider, symbol, interval="5m", start=US_EARLY_CLOSE_DAY, end="2026-11-29",
+        now=now, expected_last_session=expected,
+    ) is False, "the weekend end must not excuse a Friday that stopped before its early close"
+
+
+def test_l2_27_none_path_is_bit_identical_on_an_early_close_day():
+    """The `expected_last_session=None` fast path must not even resolve a session time.
+
+    It is the frozen pre-L2.2 contract (`count(*) > 0`), so an early-close day answers exactly
+    as it did before L2.26/L2.27 -- even for a cache truncated to its first bar.
+    """
+    provider, symbol = "FuyaoDataProvider", "AAPL"
+    now = pd.Timestamp(f"{US_EARLY_CLOSE_DAY} 16:30:00")
+
+    cache = DuckDBCache(db_path=":memory:")
+    _store_us_session(cache, symbol, US_EARLY_CLOSE_DAY, "13:00")
+    _truncate_intraday_session(cache, provider, symbol, "5m", US_EARLY_CLOSE_DAY, "09:35")
+
+    assert cache.is_intraday_range_covered(
+        provider, symbol, interval="5m", start=US_EARLY_CLOSE_DAY, end=US_EARLY_CLOSE_DAY,
+        now=now,
+    ) is True, "legacy None path: one bar is still `count(*) > 0`"
+    assert cache.is_intraday_range_covered(
+        provider, symbol, interval="5m", start=US_EARLY_CLOSE_DAY, end=US_EARLY_CLOSE_DAY,
+        now=now, expected_last_session=datetime.date(2026, 11, 27),
+    ) is False
+
+
+def test_l2_27_hk_half_day_deadline_is_1155():
+    """HK half-days close at 12:00 (morning only), so the same 5m rule gives 11:55.
+
+    A China symbol is checked alongside to pin that the shrink is per-market AND per-date: a
+    15:00 A-share stop is fine for `600000.SH` and 4 hours short for an HK half-day.
+    """
+    provider = "FuyaoDataProvider"
+    now = pd.Timestamp(f"{HK_HALF_DAY} 16:30:00")
+    expected = datetime.date(2026, 12, 24)
+
+    cache = DuckDBCache(db_path=":memory:")
+    hk_times = pd.date_range(f"{HK_HALF_DAY} 09:35:00", f"{HK_HALF_DAY} 12:00:00", freq="5min")
+    n = len(hk_times)
+    cache.store_intraday_bars(
+        provider, "00700.HK",
+        pd.DataFrame({"Open": [100.0] * n, "High": [101.0] * n, "Low": [99.0] * n,
+                      "Close": [100.5] * n, "Volume": [10.0] * n}, index=hk_times),
+        interval="5m", sync_time=datetime.datetime(2026, 12, 24, 12, 5),
+    )
+    assert cache.is_intraday_range_covered(
+        provider, "00700.HK", interval="5m", start=HK_HALF_DAY, end=HK_HALF_DAY,
+        now=now, expected_last_session=expected,
+    ) is True, "an HK half-day session that ended at 12:00 must be covered"
+
+    short = DuckDBCache(db_path=":memory:")
+    short.store_intraday_bars(
+        provider, "00700.HK",
+        pd.DataFrame({"Open": [100.0] * n, "High": [101.0] * n, "Low": [99.0] * n,
+                      "Close": [100.5] * n, "Volume": [10.0] * n}, index=hk_times),
+        interval="5m", sync_time=datetime.datetime(2026, 12, 24, 12, 5),
+    )
+    _truncate_intraday_session(short, provider, "00700.HK", "5m", HK_HALF_DAY, "11:50")
+    assert short.is_intraday_range_covered(
+        provider, "00700.HK", interval="5m", start=HK_HALF_DAY, end=HK_HALF_DAY,
+        now=now, expected_last_session=expected,
+    ) is False, "11:50 is one bar short of an HK half-day's 11:55 deadline"
+
+
+def test_l2_27_deadline_geometry_still_comes_from_the_clock_only():
+    """Anti-drift: the early close is a CLOCK fact, so the cache layer learns nothing new."""
+    import inspect
+
+    import common.duckdb_cache as cache_mod
+    import common.market_clock as clock_mod
+
+    deadline_src = inspect.getsource(cache_mod._intraday_expected_session_deadline)
+    assert "last_expected_bar_ts" in deadline_src
+    for literal in ("time(", "timedelta(minutes", "timedelta(hours"):
+        assert literal not in deadline_src, (
+            f"session geometry re-derived in duckdb_cache.py: {literal!r}"
+        )
+
+    # One date->close lookup only: the clock delegates to `market_holidays` instead of
+    # keeping its own `{date: time}` map (two calendars would drift).
+    clock_src = inspect.getsource(clock_mod)
+    assert clock_src.count("def close_time_on(") == 1
+    assert clock_src.count("def session_close_time(") == 1
+    assert "return early_close_time_or_none(self.market, day)" in clock_src
+
+    import common.market_holidays as holidays_mod
+
+    holidays_src = inspect.getsource(holidays_mod)
+    assert "(11, 27, 13, 0)" in holidays_src, "US early-close data must live in market_holidays"
+    assert "(12, 24, 12, 0)" in holidays_src, "HK half-day data must live in market_holidays"

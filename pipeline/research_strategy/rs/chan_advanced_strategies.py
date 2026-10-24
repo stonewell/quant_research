@@ -51,8 +51,10 @@ from common.indicators import adx, macd, roc, sma
 from common.position_exits import run_stop_timeout_exit
 from common.scheduling import get_rebalance_dates as _get_rebalance_dates
 from common.structural_factors import (
+    DEFAULT_REACHABLE_MIN_CURVATURE,
     consolidation_density,
     extremum_curvature,
+    warn_unreachable_curvature_threshold,
     wyckoff_spring,
 )
 
@@ -975,6 +977,11 @@ class ChanMeanReversionDivergenceStrategy(AllocationTemplate):
     Incorporates strict risk controls: stop-loss, profit target, trailing stop, and max holding timeout.
     """
 
+    # Task C5.1: 1.0.0 -> 1.1.0 -- the curvature_v_bottom / spring_curvature_combined
+    # gates inherit the reachable default (0.8) instead of the structurally
+    # unreachable 1.5, with a dead-gate warning at threshold resolution.
+    version: str = "1.1.0"
+
     def __init__(self, config: StrategyConfig = None):
         self.config = config or StrategyConfig()
         super().__init__(name="chan_mean_reversion_divergence", param_grid={})
@@ -1045,7 +1052,13 @@ class ChanMeanReversionDivergenceStrategy(AllocationTemplate):
                 spring_score = wyckoff_spring(bars, support_series=support_s, max_penetration=max_pen, min_penetration=min_pen, volume_lookback=20)
                 entry_signal = (spring_score >= min_rel_vol).reindex(master_index).fillna(False)
             elif entry_mode == "curvature_v_bottom":
-                min_curv = float(p.get("wyckoff_spring_min_curvature", getattr(cfg, "wyckoff_spring_min_curvature", 1.5)))
+                min_curv = float(p.get("wyckoff_spring_min_curvature", getattr(cfg, "wyckoff_spring_min_curvature", DEFAULT_REACHABLE_MIN_CURVATURE)))
+                # Task C5.1: window=5 z-scored fits cannot exceed ~1.1952, so the legacy
+                # 1.5 default made this branch untradeable; warn if a config override
+                # reintroduces an unreachable gate.
+                warn_unreachable_curvature_threshold(
+                    min_curv, window=5, context="chan_mean_reversion_divergence.curvature_v_bottom"
+                )
                 curv = extremum_curvature(bars["Close"], window=5, min_periods=3)
                 entry_signal = (curv >= min_curv).reindex(master_index).fillna(False)
             elif entry_mode == "spring_curvature_combined":
@@ -1055,7 +1068,11 @@ class ChanMeanReversionDivergenceStrategy(AllocationTemplate):
                 max_pen = float(p.get("wyckoff_spring_max_penetration", getattr(cfg, "wyckoff_spring_max_penetration", 0.04)))
                 min_pen = float(p.get("wyckoff_spring_min_penetration", getattr(cfg, "wyckoff_spring_min_penetration", 0.005)))
                 min_rel_vol = float(p.get("wyckoff_spring_min_rel_vol", getattr(cfg, "wyckoff_spring_min_rel_vol", 1.0)))
-                min_curv = float(p.get("wyckoff_spring_min_curvature", getattr(cfg, "wyckoff_spring_min_curvature", 1.5)))
+                min_curv = float(p.get("wyckoff_spring_min_curvature", getattr(cfg, "wyckoff_spring_min_curvature", DEFAULT_REACHABLE_MIN_CURVATURE)))
+                # Task C5.1: same unreachable-bound guard as curvature_v_bottom above.
+                warn_unreachable_curvature_threshold(
+                    min_curv, window=5, context="chan_mean_reversion_divergence.spring_curvature_combined"
+                )
                 spring_score = wyckoff_spring(bars, support_series=support_s, max_penetration=max_pen, min_penetration=min_pen, volume_lookback=20)
                 curv = extremum_curvature(bars["Close"], window=5, min_periods=3)
                 spring_ok = (spring_score >= min_rel_vol).reindex(master_index).fillna(False)

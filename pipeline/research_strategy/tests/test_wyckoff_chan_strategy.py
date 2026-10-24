@@ -5,7 +5,8 @@ Verifies:
 1. Instantiation, factor tags, warmup_bars, explain_weights.
 2. Sparse weights contract (NaN on non-rebalance days, explicit 0.0 on exit).
 3. Integration with run_allocation_backtest.
-4. Crafted Wyckoff Spring + V-curvature (kappa >= 1.5) entry mechanics.
+4. Crafted Wyckoff Spring + reachable V-curvature entry mechanics (the old
+   kappa >= 1.5 gate was structurally unreachable; see Task C5.1).
 5. Two-stage profit scaling (50% scale-out at ZG, 100% exit at Target 2) and stop-loss at 0.995 * Low_{t-1}.
 """
 
@@ -24,6 +25,7 @@ import pandas as pd
 import pytest
 
 from common.allocation_backtester import run_allocation_backtest
+from common.structural_factors import CURVATURE_KAPPA_BOUND_WINDOW5, DEFAULT_REACHABLE_MIN_CURVATURE
 from common.testing import make_ohlcv_from_closes
 from research_strategy.rs.config import StrategyConfig
 from research_strategy.rs.wyckoff_chan_strategy import (
@@ -41,6 +43,32 @@ def make_test_universe(n_days: int = 250) -> dict:
     universe = {
         "SPY": make_ohlcv_from_closes(spy_close),
         "BIL": make_ohlcv_from_closes(bil_close),
+    }
+    for df in universe.values():
+        df.index = dates
+    return universe
+
+
+def make_spring_universe(n_days: int = 320, seed: int = 14) -> dict:
+    """Noisy low-amplitude oscillator that produces a genuine Wyckoff Spring.
+
+    Unlike `make_test_universe`, this fixture (a) carries a Volume column, so
+    `wyckoff_spring`'s relative-volume score is not pinned at 1 - 1e-8, and
+    (b) its pivots sit close enough to price for a <=4% undercut-reclaim. On
+    2022-03-23 the spring fires with kappa ~= 1.0101: reachable under the new
+    0.8 default, unreachable under the legacy 1.5. Deterministic (seed 14);
+    the RandomState call ORDER (normal closes, then lognormal volume) matters
+    for reproducibility.
+    """
+    dates = pd.bdate_range("2021-01-01", periods=n_days)
+    t = np.arange(n_days)
+    rs = np.random.RandomState(seed)
+    closes = 100.0 + 1.0 * np.sin(t / 3.0) + rs.normal(0.0, 0.5, n_days)
+    spy = make_ohlcv_from_closes(closes)
+    spy["Volume"] = 10000.0 * rs.lognormal(0.0, 0.7, n_days)
+    universe = {
+        "SPY": spy,
+        "BIL": make_ohlcv_from_closes(100.0 + 0.001 * t),
     }
     for df in universe.values():
         df.index = dates
@@ -88,6 +116,38 @@ def test_wyckoff_chan_spring_generate_weights_sparse_contract():
     row_sums = non_nan_rows.sum(axis=1)
     assert (row_sums <= 1.0 + 1e-9).all(), f"target weights must never exceed 1.0, max={row_sums.max()}"
     assert (non_nan_rows.values >= -1e-12).all(), "no negative target weights"
+
+
+def test_wyckoff_chan_spring_reachable_curvature_gate_opens_position():
+    """Task C5.1 acceptance: the curvature gate must be reachable end-to-end.
+
+    On `make_spring_universe` a genuine Wyckoff Spring fires on 2022-03-23 and
+    the curvature there is ~1.0101 -- above the new 0.8 default but below the
+    legacy 1.5 gate. So the strategy opens a position with the default params
+    and provably does NOT with the old unreachable 1.5, which isolates the
+    curvature threshold as the binding gate rather than the spring detector.
+    """
+    universe = make_spring_universe()
+
+    weights = WyckoffChanSpringStrategy().generate_weights(universe)
+    spy = weights["SPY"].fillna(0.0)
+    assert (spy > 0.0).any(), (
+        "wyckoff_chan_spring never opened a position with the reachable default; "
+        "the curvature gate may have regressed to an unreachable value"
+    )
+    assert pd.Timestamp("2022-03-23") in weights.index
+    assert spy.loc[pd.Timestamp("2022-03-23")] > 0.0
+
+    # The legacy 1.5 threshold must yield no entry at all (and warn loudly).
+    with pytest.warns(UserWarning, match="structurally unreachable"):
+        legacy = WyckoffChanSpringStrategy().generate_weights(
+            universe, params={"wyckoff_spring_min_curvature": 1.5}
+        )
+    assert not (legacy["SPY"].fillna(0.0) > 0.0).any(), (
+        "a 1.5 curvature gate is above the analytic window-5 bound "
+        f"({CURVATURE_KAPPA_BOUND_WINDOW5:.6f}) and cannot produce an entry"
+    )
+    assert DEFAULT_REACHABLE_MIN_CURVATURE == 0.8
 
 
 def test_wyckoff_chan_spring_backtester_integration():

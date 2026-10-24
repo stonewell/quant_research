@@ -1431,3 +1431,209 @@ def test_sync_write_gate_matches_the_repair_append_only_criterion():
     after_max = existing_max + datetime.timedelta(days=1)
     repair.assert_append_only(after_max, existing_max)  # both accept the ordinary tail
     sync.assert_append_only(after_max, existing_max, symbol=SYMBOL, provider=PROVIDER)
+
+
+# ---------------------------------------------------------------------------
+# L2.28 acceptance: three window shapes against a REAL DuckDBCache in tmp_path
+#
+# The unit-level writer contract lives in `test_sync_qfq_write_path.py`; what is pinned
+# HERE is the ledger's acceptance sentence, end to end and at rest on disk:
+#   (a) backfilling an EARLIER window inserts and changes nothing already stored;
+#   (b) syncing a LATER window appends normally;
+#   (c) an OVERLAPPING window writes ZERO rows over already-existing dates -- proven by
+#       the sha256 of the pre-existing bars being bit-identical after the attempted write.
+# The hash is the point: "count(symbol) did not go up" would still pass a silent
+# same-value rewrite, and a same-value rewrite is exactly the ULP-noise fingerprint
+# (`docs/version.md` §13.4) that must be impossible, not merely harmless.
+# ---------------------------------------------------------------------------
+
+import hashlib  # noqa: E402  (kept beside the hash assertions it serves)
+
+
+def _sha256_bars(cache, provider, symbol, interval="1d"):
+    """sha256 over the stored bars, read by raw SQL (independent of any helper under test)."""
+    intraday = interval != "1d"
+    table = "intraday_ohlcv_bars" if intraday else "ohlcv_bars"
+    ts_col = "ts" if intraday else "date"
+    where = f"provider = ? AND symbol = ?" + (" AND interval = ?" if intraday else "")
+    params = [provider, symbol] + ([interval] if intraday else [])
+    con = cache._get_connection(read_only=True)
+    try:
+        rows = con.execute(
+            f"SELECT {ts_col}, open, high, low, close, volume FROM {table} "
+            f"WHERE {where} ORDER BY {ts_col}",
+            params,
+        ).fetchall()
+    finally:
+        if not cache.is_memory:
+            con.close()
+    return _hash_rows(rows), len(rows)
+
+
+def _hash_rows(rows):
+    return hashlib.sha256("\n".join(repr(tuple(r)) for r in rows).encode("utf-8")).hexdigest()
+
+
+def _sync_db(tmp_path):
+    from common.duckdb_cache import DuckDBCache
+
+    return DuckDBCache(str(tmp_path / "write_gate_cache.duckdb"))
+
+
+def _master_frame(dates, start_price=20.0, step=0.31):
+    """One single-basis OHLCV series indexed by Timestamp; windows are SLICES of this.
+
+    Slicing (never regenerating) is what makes "an overlapping window on the same basis"
+    mean what it says: the shared sessions carry byte-identical closes.
+    """
+    rows = []
+    for i, _ in enumerate(dates):
+        price = start_price + i * step
+        rows.append(
+            {
+                "Open": price * 0.9987654321,
+                "High": price * 1.0065432109,
+                "Low": price * 0.9954321098,
+                "Close": price,
+                "Volume": 2_000_000.0 + 193.0 * i,
+            }
+        )
+    return pd.DataFrame(rows, index=pd.DatetimeIndex(pd.to_datetime(list(dates))))
+
+
+def _commit(cache, plan, provider=PROVIDER, symbol=SYMBOL):
+    if plan.is_empty:
+        return
+    cache.store_bars(
+        provider=provider,
+        symbol=symbol,
+        df=plan.df,
+        requested_start=plan.requested_start(plan.df.index.min().strftime("%Y-%m-%d")),
+        requested_end=plan.df.index.max().strftime("%Y-%m-%d"),
+        interval="1d",
+    )
+
+
+def _stored_rows(cache, before_date=None, min_date=None, provider=PROVIDER, symbol=SYMBOL):
+    sql = (
+        "SELECT date, open, high, low, close, volume FROM ohlcv_bars "
+        "WHERE provider = ? AND symbol = ?"
+    )
+    params = [provider, symbol]
+    if before_date is not None:
+        sql += " AND date < ?"
+        params.append(before_date)
+    if min_date is not None:
+        sql += " AND date >= ?"
+        params.append(min_date)
+    sql += " ORDER BY date"
+    con = cache._get_connection(read_only=True)
+    try:
+        return con.execute(sql, params).fetchall()
+    finally:
+        if not cache.is_memory:
+            con.close()
+
+
+def test_write_gate_scenario_a_earlier_backfill_is_insert_only(tmp_path):
+    """(a) Backfilling a window BEFORE everything stored inserts, and touches nothing held."""
+    from scripts import sync_china_5m_and_indices as sync
+
+    cache = _sync_db(tmp_path)
+    all_dates = _sessions(40)
+    master = _master_frame(all_dates)
+    _commit(cache, sync.plan_history_write(cache, PROVIDER, SYMBOL, master.iloc[20:40]))
+    before_hash, before_n = _sha256_bars(cache, PROVIDER, SYMBOL)
+    assert before_n == 20
+
+    plan = sync.plan_history_write(cache, PROVIDER, SYMBOL, master.iloc[:10])
+    assert plan.shape == sync.SHAPE_BACKFILL
+    assert plan.n_dropped_overlap == 0
+    assert set(plan.df.index) == set(master.index[:10])
+    # Nothing in the plan collides with a stored date -- the invariant that makes the
+    # windowed rescale structurally impossible.
+    assert not set(plan.df.index).intersection(master.index[20:40])
+
+    _commit(cache, plan)
+    after_hash, after_n = _sha256_bars(cache, PROVIDER, SYMBOL)
+    assert after_n == before_n + 10
+    assert _hash_rows(_stored_rows(cache, min_date=all_dates[20])) == before_hash
+
+
+def test_write_gate_scenario_b_later_window_appends_normally(tmp_path):
+    """(b) A pure tail sync still works: the gate must not freeze normal operation."""
+    from scripts import sync_china_5m_and_indices as sync
+
+    cache = _sync_db(tmp_path)
+    all_dates = _sessions(40)
+    master = _master_frame(all_dates)
+    _commit(cache, sync.plan_history_write(cache, PROVIDER, SYMBOL, master.iloc[:25]))
+    before_hash, before_n = _sha256_bars(cache, PROVIDER, SYMBOL)
+    assert before_n == 25
+
+    plan = sync.plan_history_write(cache, PROVIDER, SYMBOL, master.iloc[25:])
+    assert plan.shape == sync.SHAPE_APPEND
+    assert plan.n_dropped_overlap == 0
+    assert plan.df.index.min() > pd.Timestamp(all_dates[24])  # strict append-only
+
+    _commit(cache, plan)
+    after_hash, after_n = _sha256_bars(cache, PROVIDER, SYMBOL)
+    assert after_n == before_n + 15
+    assert _hash_rows(_stored_rows(cache, before_date=all_dates[25])) == before_hash
+
+
+def test_write_gate_scenario_c_overlapping_window_writes_nothing_old(tmp_path):
+    """(c) The acceptance core: an overlapping, IDENTICALLY-based window changes zero bytes.
+
+    The old code re-stored the whole fetched window (every stored date included), which is
+    how one window-local scalar could reach history. Now the already-stored prefix is
+    dropped from the plan and the pre-existing bars hash the same before and after.
+    """
+    from scripts import sync_china_5m_and_indices as sync
+
+    cache = _sync_db(tmp_path)
+    all_dates = _sessions(40)
+    master = _master_frame(all_dates)
+    _commit(cache, sync.plan_history_write(cache, PROVIDER, SYMBOL, master.iloc[:25]))
+    before_hash, before_n = _sha256_bars(cache, PROVIDER, SYMBOL)
+    assert before_n == 25
+
+    # Overlap = the last 5 stored sessions + 5 genuinely new ones, one continuous basis.
+    plan = sync.plan_history_write(cache, PROVIDER, SYMBOL, master.iloc[20:30])
+    assert plan.shape == sync.SHAPE_APPEND
+    assert plan.n_dropped_overlap == 5          # all five stored sessions were refused a rewrite
+    assert set(plan.df.index) == set(master.index[25:30])
+    assert not set(plan.df.index).intersection(master.index[:25])
+
+    _commit(cache, plan)
+    old_rows = _stored_rows(cache, before_date=all_dates[25])
+    assert _hash_rows(old_rows) == before_hash
+    assert len(old_rows) == before_n
+
+
+def test_write_gate_overlapping_window_on_a_new_basis_is_refused_with_zero_writes(tmp_path):
+    """The incident shape: overlap + a different basis => `QfqWriteRefused`, cache untouched."""
+    import warnings
+
+    from scripts import sync_china_5m_and_indices as sync
+
+    cache = _sync_db(tmp_path)
+    all_dates = _sessions(40)
+    master = _master_frame(all_dates)
+    _commit(cache, sync.plan_history_write(cache, PROVIDER, SYMBOL, master.iloc[:25]))
+    before_hash, before_n = _sha256_bars(cache, PROVIDER, SYMBOL)
+
+    # The exact 600660.SH factor, applied to a window that overlaps stored history.
+    rebased = master.iloc[20:30].copy()
+    for col in ("Open", "High", "Low", "Close"):
+        rebased[col] = rebased[col] * 0.9814126394
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(sync.QfqWriteRefused) as excinfo:
+            sync.plan_history_write(cache, PROVIDER, SYMBOL, rebased)
+    assert [w for w in caught if issubclass(w.category, sync.QfqRebaseWarning)]
+    assert SYMBOL in str(excinfo.value) and "REFUSED windowed re-basing" in str(excinfo.value)
+
+    after_hash, after_n = _sha256_bars(cache, PROVIDER, SYMBOL)
+    assert (after_hash, after_n) == (before_hash, before_n), "a refused write touched the cache"
