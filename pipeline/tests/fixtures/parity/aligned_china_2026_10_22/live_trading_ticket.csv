@@ -1,0 +1,6 @@
+symbol,name,action,price,current_weight,target_weight,delta_weight,current_shares,target_shares,delta_shares,shares,trade_value,holding_bars,reason,summary_reason,blocking_reason
+600519.SH,Kweichow Moutai,SELL,100.0,0.5,0.25,-0.25,5000,2500,-2500,2500,-250000.0,42,目标仓位下调,目标仓位下调至 25.0%,NONE
+000001.SZ,Ping An Bank,BUY,10.0,0.0,0.20137,0.20137,0,20100,20100,20100,201000.0,0,新进建仓,目标仓位增至 20.1% (整手截断),NONE
+600036.SH,China Merchants Bank,BUY,50.0,0.0,0.075,0.075,0,1500,1500,1500,75000.0,0,新进建仓,目标仓位增至 7.5%,NONE
+601398.SH,ICBC,HOLD,5.0,0.02,0.02,0.0,4000,4000,0,0,0.0,63,最优目标权重维持,最优目标权重维持,NONE
+000002.SZ,China Vanke,SELL,20.0,0.01,0.0,-0.01,500,0,-500,500,-10000.0,11,信号消失清仓,信号消失清仓,NONE

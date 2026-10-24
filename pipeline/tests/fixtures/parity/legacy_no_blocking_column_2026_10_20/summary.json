@@ -1,0 +1,7 @@
+{
+  "date": "2026-10-20",
+  "strategy_key": "chan_risk_managed_blend",
+  "universe_key": "china_core",
+  "portfolio_value": 1000000.0,
+  "data_provider": "synthetic"
+}

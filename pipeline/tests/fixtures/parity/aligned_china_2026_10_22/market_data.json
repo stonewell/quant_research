@@ -1,0 +1,7 @@
+{
+  "_comment": "Prior-book mark for the one held symbol with no ticket row (600000.SH). Ticket prices take precedence for every symbol that has a row; this file only supplements.",
+  "600000.SH": {
+    "2026-10-22": {"close": 20.0, "volume": 5000000},
+    "2026-10-21": {"close": 20.0, "volume": 5000000}
+  }
+}

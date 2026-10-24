@@ -1,0 +1,9 @@
+{
+  "as_of": "2026-10-23",
+  "market_state": "OPEN",
+  "breadth": 0.28,
+  "momentum_thrust": 0.41,
+  "circuit_breaker": "NONE",
+  "status": "PASS_WITH_WARNING",
+  "directive": "PROCEED_DEFENSIVE"
+}

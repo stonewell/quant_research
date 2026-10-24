@@ -1,0 +1,2 @@
+symbol,name,action,price,current_weight,target_weight,delta_weight,current_shares,target_shares,delta_shares,shares,trade_value,holding_bars,reason,summary_reason,blocking_reason
+600519.SH,Kweichow Moutai,SELL,100.0,0.2,0.155,-0.045,2000,1500,-500,500,-50000.0,42,目标仓位下调,目标仓位下调至 15.5%,NONE

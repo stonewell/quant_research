@@ -1,0 +1,5 @@
+symbol,name,action,price,current_weight,target_weight,delta_weight,current_shares,target_shares,delta_shares,shares,trade_value,holding_bars,reason,summary_reason,blocking_reason
+600519.SH,Kweichow Moutai,HOLD_FILTERED,100.0,0.2,0.2,0.0,2000,2000,0,0,0.0,43,持仓未满最小持有期,最优目标权重维持,TENURE_LOCKED
+000001.SZ,Ping An Bank,HOLD_FILTERED,10.0,0.0,0.15,0.15,0,0,0,0,0.0,0,离场冷却未解除,离场冷却未解除,COOLDOWN_BLOCKED
+600036.SH,China Merchants Bank,CANCEL_PENDING,50.0,0.0,0.0,0.0,0,0,0,0,0.0,0,待确认建仓信号消失,待确认建仓信号消失,NONE
+601857.SH,PetroChina,HOLD_FILTERED,8.0,0.016,0.005,-0.011,2000,2000,0,0,0.0,9,目标仓位低于最小建仓阈值,目标仓位低于最小建仓阈值,MIN_ENTRY_THRESHOLD
