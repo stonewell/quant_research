@@ -821,6 +821,20 @@ def enrich_universe_with_intraday_features(
     return enriched_universe
 
 
+def _intraday_5m_cache_candidates(cache_dir: Optional[str]) -> List[str]:
+    """Candidate `cache.duckdb` paths for the Step-1.5 5m fallback, in priority order.
+
+    Extracted so tests can point the fallback at a `tmp_path` cache instead of the
+    live `<repo>/data/cache.duckdb`; behaviour is identical to the previously
+    inline list (`cache_dir` first, then the two repo-relative defaults).
+    """
+    return [
+        os.path.join(cache_dir or "data", "cache.duckdb"),
+        os.path.join("data", "cache.duckdb"),
+        os.path.join("pipeline", "data", "cache.duckdb"),
+    ]
+
+
 def load_intraday_5m_universe(
     symbols: List[str],
     start: Optional[str] = None,
@@ -853,26 +867,80 @@ def load_intraday_5m_universe(
                 logger.debug("Provider fetch 5m failed for %s: %s", sym, exc)
 
         # Step 1.5: DuckDBCache fallback if provider returned empty or was not specified
+        #
+        # READ-ONLY intent (L2.13). This branch only ever queries intraday bars, so it
+        # MUST construct `DuckDBCache(..., read_only=True)`. Until 2026-10-23 it used the
+        # default writable constructor inside a blanket `except Exception`, and the
+        # L2.13 production-path guard (`common/duckdb_cache.py::refuse_production_cache_path`,
+        # which refuses a WRITABLE open of `<repo>/data/cache.duckdb` under pytest) turned
+        # exactly that combination into a silent degradation: the guard raised
+        # `ProductionCachePathError`, the blanket except swallowed it, and the caller was
+        # handed an empty 5m frame -- "no data" reported as a normal result. Read-only
+        # opens are explicitly allowed by the guard, so the fix is both the flag and the
+        # removal of the silent swallow: every failure path now logs a WARNING that says
+        # the 5m cache is unavailable and which symbol was skipped, and the symbol's
+        # entry stays an empty frame (the "unavailable" convention consumed by
+        # `enrich_universe_with_intraday_features` and by the live scripts' own WARN).
         if df_sym.empty:
             try:
-                from common.duckdb_cache import DuckDBCache
-                cand_db_paths = [
-                    os.path.join(cache_dir or "data", "cache.duckdb"),
-                    os.path.join("data", "cache.duckdb"),
-                    os.path.join("pipeline", "data", "cache.duckdb"),
-                ]
-                for db_p in cand_db_paths:
-                    if os.path.exists(db_p):
-                        duck_c = DuckDBCache(db_p)
+                from common.duckdb_cache import DuckDBCache, ProductionCachePathError
+            except ImportError as exc:  # duckdb not installed in this environment
+                DuckDBCache = None  # type: ignore[assignment,misc]
+                logger.warning(
+                    "5m 缓存不可用（DuckDBCache 导入失败），已跳过 %s 的 DuckDB 5m 回退: %s",
+                    sym,
+                    exc,
+                )
+
+            if DuckDBCache is not None:
+                for db_p in _intraday_5m_cache_candidates(cache_dir):
+                    if not os.path.exists(db_p):
+                        continue
+                    try:
+                        # `read_only=True`: never creates directories/tables, never writes,
+                        # and is deliberately NOT blocked by the L2.13 pytest guard.
+                        duck_c = DuckDBCache(db_p, read_only=True)
+                    except (ProductionCachePathError, RuntimeError, OSError) as exc:
+                        # ProductionCachePathError subclasses RuntimeError; OSError covers a
+                        # cache file that vanished between `exists()` and the open.
+                        logger.warning(
+                            "5m 缓存不可用（只读打开失败），已跳过 %s 的 DuckDB 5m 回退（%s）: %s",
+                            sym,
+                            db_p,
+                            exc,
+                        )
+                        continue
+
+                    try:
                         for p_name in ["BaoStockDataProvider", "EastMoneyDataProvider", "fuyao"]:
-                            df_cand = duck_c.query_intraday_bars(p_name, sym, interval="5m", start=start, end=end)
+                            df_cand = duck_c.query_intraday_bars(
+                                p_name, sym, interval="5m", start=start, end=end
+                            )
                             if not df_cand.empty:
                                 df_sym = df_cand
                                 break
-                    if not df_sym.empty:
-                        break
-            except Exception as exc:
-                logger.debug("DuckDBCache 5m fallback failed for %s: %s", sym, exc)
+                    except Exception as exc:  # noqa: BLE001 - logged, never silent
+                        # A readable-but-invalid cache (missing table / locked file) is
+                        # still "5m data unavailable", not an implicit empty result.
+                        logger.warning(
+                            "5m 缓存不可用（查询失败），已跳过 %s 的 DuckDB 5m 回退（%s）: %s",
+                            sym,
+                            db_p,
+                            exc,
+                        )
+                        df_sym = pd.DataFrame()
+                        continue
+
+                    if df_sym.empty:
+                        # Opened successfully but zero rows for every provider: report the
+                        # absence instead of letting an empty frame pass as normal data.
+                        logger.warning(
+                            "5m 缓存不可用：只读打开成功但 %s 在 %s 中 0 行 5m 数据，已跳过该标的的 DuckDB 回退",
+                            sym,
+                            db_p,
+                        )
+                        continue
+                    break
 
         # Step 2: Check local lock-free parquets
         if os.path.isdir(parquet_dir):
@@ -898,6 +966,11 @@ def load_intraday_5m_universe(
                 else:
                     df_sym = combined_p.sort_index()
 
+        if df_sym.empty:
+            # Explicit unavailability marker (no `enabled`/`Is_Partial_Bar` field exists at
+            # this layer -- empty frame is the convention) so a caller/log can distinguish
+            # "5m data unavailable" from a frame that merely failed to be requested.
+            df_sym.attrs["intraday_5m_available"] = False
         out[sym] = df_sym
 
     return out
