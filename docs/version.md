@@ -2364,6 +2364,32 @@ exit: 1
   **未**升 `BASE_VERSION`/`version`，**未**重跑 `--dump-strategies`（这是有意的，不是遗漏）。
 - **`L2.8` 仍未解除阻塞**：其重做须等本次提交后产生**新的 `data/cache.duckdb` 指纹/回滚点**。
 
+#### 16.15.12 组2 的 7.36% vs 11.76% 裁定：产物版本差异，非口径、非抄写（2026-10-23）
+
+- **裁定**：7.36% 与 11.76% 是**同一字段** `mean_cagr`（逐折年化收益率的算术平均）在两个**产物版本**上的取值——不是口径差异，也不是抄写错误。
+  现产物 `walkforward_summary.json` 字面含 `"mean_cagr": 0.11761648960014796`（= **11.7616%**）；对现产物做四种自然聚合得 **11.7616%**（算术均值）/ **9.0438%**（日历复利）/
+  **8.3546%**（63 bar 复利）/ **9.8094%**（台账链式），**无一等于 7.36%**，最近的也差 **1.0pp**。
+- **证据（不是同一批折）**：记录 B 的三折 Sharpe 为 `+2.24 / −0.95 / +0.03`，现产物为 `+2.3806 / −1.3439 / +0.2501`；记录 B 称第二折 **−13.3%**，现产物第二折 **+2.64%**。
+  且六个策略的组2 数字**全部**变动（`chan_risk_managed_blend` 37.27%→28.19%、`chan_crisis_shield_blend` 38.68%→35.53%），故排除"同时抄错"。
+- **成因（一次完整独立运行）**：结果树 birth time 为 `pipeline/results/blend_17_baseline/` **2026-10-20 15:35:22**、`1/generic_blend_strategy/` 15:42:19、
+  `2/generic_blend_strategy/` 15:49:01，**早于**提交 `253189e`（2026-10-20 **21:13:36**）。该提交把 `blend_enable_structural_regime` /
+  `blend_enable_cyq_quality_gate` 由 `false` 翻为 `true`（`blend_base.py` 与 `rs/config.py`）、`cdhb_max_assets_per_sector` 1→2，并为六个 blend 增设
+  `blend_enable_adaptive_stop_atr`、`blend_enable_low_beta_inertia`、`blend_max_assets_per_sector=2`；两批 `run.log` 现均确认这些开关为 `True` / `2`。
+  产物于 **2026-10-23 21:36:24–21:38:50** 被**就地覆盖**（per-file mtime）。
+- **QFQ 不是成因（纠正仓外审计）**：按 `provider='FuyaoDataProvider'` 过滤（表 PK 为 `(provider, symbol, date)`，不过滤会把跨 provider 的基准落差误读成数据编辑），
+  组2 全输入窗口（2024-10-26→2026-09-07）只有 **两处**单日对数收益差：`600362.SH` @2026-01-05 **+0.337%**、`601288.SH` @2026-01-05 **+0.229%**，
+  **均在 fold 1 内**；fold 2/3 输入**逐位相同**而 Sharpe 与收益双双改变 ⇒ 数据解释不了。仓外审计"该批是在修复后价格上算的"这一归因是**错的**，不得再引用。
+- **Sharpe `1.473` vs `1.5624`（`chan_four_state_shield_blend`，批次1）**：`1.5624` 可复现——15 折算术均值，`walkforward_summary.json` 含
+  `"mean_sharpe_ratio": 1.5623751093072464`，折 Sharpe 标准差 **2.3618**、胜折 **11/15**。`1.473` 用现产物**任何**聚合都复现不出（中位 0.7975；
+  截尾均值 1.4275 / 1.5020 / 1.5276；路径 Sharpe 2.0291；12 折窗口 1.5050–1.9311；13 折窗口 1.3192 / 1.9418），也不是别的策略的值。
+  折间离散度与胜折数**未变**而均值移动约 **0.09 个折标准差** ⇒ 这是**参数翻转**的指纹，不是数据重写或换池。
+  它来自 pre-`253189e` 的旧产物，其报告 CSV 已被覆盖，且 `pipeline/results/` 被 `pipeline/.gitignore` 忽略、git 无副本 ⇒ **不可恢复**（如实记为不可恢复，不写成"大概同一回事"）。
+- **出处缺口（整场幻影追查的根因）**：`batch_summary.json` 有 `task`/`description`/`ranking_rule`/`generated_at`/`elapsed_seconds`/`config`（strategies、universe、日期、
+  provider、`min_shares`、`baseline_symbol`、`strategy_params`、`config.seed`）/`n_jobs`/`output_dir`，**但没有 git sha、没有 `data/cache.duckdb` 的 sha256、没有
+  `strategy_dumps` 的哈希、没有 run 起止时间**。`config.seed` 显式为 `null` 且链路无 RNG，故同代码同数据重跑是**确定性**的、差异可完全归因于代码/配置而非随机。
+  **这就是两份审计相差 4.4pp 而双方各自都没错的原因**。已登记为 `L2.35`。
+- **措辞纪律**：今后引用该目录任何折级数字，必须注明「**2026-10-23 21:37/21:38 重跑、base v1.5.0**」；不得与 2026-10-20 15:49 之前的任何记录**跨版本比较**。
+
 ---
 
 ## 17. Track C 死门修正与算子 API 一致性（`C5.1`–`C5.3`）(2026-10-23)
