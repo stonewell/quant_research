@@ -278,5 +278,4 @@ python3 .agents/skills/walkforward-audit/scripts/run_audit.py --results-dir <TAR
     - `--universe-file PATH` / `--export-pruned-universe PATH`: Cleaned universe export.
     - `--results-dir PATH`: Target results directory to audit.
 - **Detailed Anomaly Reference**: [anomaly_patterns.md](./references/anomaly_patterns.md)
-- **Live Risk Management Guide**: [live_risk_rules.md](./references/live_risk_rules.md)
 
