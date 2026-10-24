@@ -658,7 +658,23 @@ class CachedDataProvider(BaseDataProvider):
         else:
             self.duckdb_cache = None
 
-    def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+    def fetch_ohlcv(
+        self,
+        symbol: str,
+        start: str,
+        end: str,
+        interval: str = "1d",
+        expected_last_session=None,
+    ) -> pd.DataFrame:
+        """Fetch bars, serving from DuckDB when `is_range_covered` says the range is on disk.
+
+        `expected_last_session` (L2.2) is forwarded to `is_range_covered` unchanged. It is
+        `None` for EVERY backtest/research caller (`backtester/*`, `pipeline/*`,
+        `common/order_netting.py`, `run_live_multi_strategy.py`) -- that is the guard which keeps
+        backtest results independent of the wall clock (design §11). Only live paths that already
+        know the trading session the cache must hold (via
+        `common/market_clock.py::expected_last_session`) may pass a date here.
+        """
         _validate_symbol_for_path(symbol)
         if self.is_synthetic or not self.cache_dir or self.duckdb_cache is None:
             return self.inner_provider.fetch_ohlcv(symbol, start, end, interval)
@@ -673,7 +689,14 @@ class CachedDataProvider(BaseDataProvider):
         # reach `end` (bar layer), and it is now the ONLY freshness gate: the CSV disk cache
         # this provider once kept (and its lenient 7-day-tolerance helper) is gone, so there
         # is no second lenient path left to keep in sync.
-        if self.duckdb_cache.is_range_covered(provider_name, symbol, start=start, end=end, interval=interval):
+        if self.duckdb_cache.is_range_covered(
+            provider_name,
+            symbol,
+            start=start,
+            end=end,
+            interval=interval,
+            expected_last_session=expected_last_session,
+        ):
             df = self.duckdb_cache.query_bars(provider_name, symbol, start=start, end=end, interval=interval)
             if not df.empty:
                 return df
@@ -712,7 +735,14 @@ class CachedDataProvider(BaseDataProvider):
         # 4. Return queried and properly resampled bars for requested range and interval
         return self.duckdb_cache.query_bars(provider_name, symbol, start=start, end=end, interval=interval)
 
-    def fetch_universe(self, symbols: List[str], start: str, end: str, interval: str = "1d") -> Dict[str, pd.DataFrame]:
+    def fetch_universe(
+        self,
+        symbols: List[str],
+        start: str,
+        end: str,
+        interval: str = "1d",
+        expected_last_session=None,
+    ) -> Dict[str, pd.DataFrame]:
         if self.is_synthetic or not self.cache_dir or self.duckdb_cache is None:
             return super().fetch_universe(symbols, start, end, interval)
 
@@ -722,10 +752,22 @@ class CachedDataProvider(BaseDataProvider):
         for symbol in symbols:
             try:
                 _validate_symbol_for_path(symbol)
-                if self.duckdb_cache.is_range_covered(provider_name, symbol, start=start, end=end, interval=interval):
+                # `expected_last_session` is threaded through BOTH the coverage probe and the
+                # re-fetch so a per-symbol decision cannot disagree with itself.
+                if self.duckdb_cache.is_range_covered(
+                    provider_name,
+                    symbol,
+                    start=start,
+                    end=end,
+                    interval=interval,
+                    expected_last_session=expected_last_session,
+                ):
                     covered_symbols.append(symbol)
                 else:
-                    self.fetch_ohlcv(symbol, start, end, interval=interval)
+                    self.fetch_ohlcv(
+                        symbol, start, end, interval=interval,
+                        expected_last_session=expected_last_session,
+                    )
                     covered_symbols.append(symbol)
             except Exception as exc:
                 warnings.warn(f"Skipping {symbol}: {exc}")
@@ -853,31 +895,63 @@ def get_data_provider(provider_name_or_instance: Union[str, BaseDataProvider, No
 
 def load_ohlcv(symbol: str, start: str, end: str, interval: str = "1d", use_cache: bool = True,
                cache_dir: str = None, provider: Union[str, BaseDataProvider, None] = None,
-               **kwargs) -> pd.DataFrame:
+               expected_last_session=None, **kwargs) -> pd.DataFrame:
     """Download (or load cached) OHLCV data for symbol between start and end.
     Maintains backward compatibility with original load_ohlcv function signature.
     Cached historical data in DuckDB never expires.
+
+    `expected_last_session` (`L2.3`) is forwarded to `DuckDBCache.is_range_covered` when a
+    `CachedDataProvider` is in play. LIVE callers MUST pass the session the cache has to
+    hold (`common.cli_utils.resolve_live_clock_context(...).expected_last_session`);
+    every backtest/research caller leaves it `None` (the bit-for-bit legacy path, design §11).
     """
     base_prov = get_data_provider(provider, **kwargs)
-    if use_cache and cache_dir:
+    cached = bool(use_cache and cache_dir)
+    if cached:
         prov = CachedDataProvider(base_prov, cache_dir)
     else:
         prov = base_prov
+    if cached:
+        return prov.fetch_ohlcv(
+            symbol, start, end, interval, expected_last_session=expected_last_session
+        )
+    if expected_last_session is not None and not is_synthetic_provider(base_prov):
+        warnings.warn(
+            f"load_ohlcv(expected_last_session={expected_last_session!r}) has no cache layer to "
+            "apply it to (use_cache/cache_dir is off): every bar comes straight from the provider. "
+            "The freshness gate (common/freshness.py) still runs at the call site."
+        )
     return prov.fetch_ohlcv(symbol, start, end, interval)
 
 
 def load_universe(symbols: list, start: str, end: str, interval: str = "1d", use_cache: bool = True,
                   cache_dir: str = None, provider: Union[str, BaseDataProvider, None] = None,
-                  **kwargs) -> dict:
+                  expected_last_session=None, **kwargs) -> dict:
     """Load OHLCV for each symbol; skips (with a warning) any that fail.
     Maintains backward compatibility with original load_universe function signature.
     Cached historical data in DuckDB never expires.
+
+    `expected_last_session` (`L2.3`) selects the cache's strict freshness contract: with a
+    session given, "covered" means the stored bars really reach that session (no 7-day
+    tolerance, no "already synced today" short-circuit). It is `None` for every
+    backtest/research caller and a real session for every live caller.
     """
     base_prov = get_data_provider(provider, **kwargs)
-    if use_cache and cache_dir:
+    cached = bool(use_cache and cache_dir)
+    if cached:
         prov = CachedDataProvider(base_prov, cache_dir)
     else:
         prov = base_prov
+    if cached:
+        return prov.fetch_universe(
+            symbols, start, end, interval, expected_last_session=expected_last_session
+        )
+    if expected_last_session is not None and not is_synthetic_provider(base_prov):
+        warnings.warn(
+            f"load_universe(expected_last_session={expected_last_session!r}) has no cache layer to "
+            "apply it to (use_cache/cache_dir is off): every bar comes straight from the provider. "
+            "The freshness gate (common/freshness.py) still runs at the call site."
+        )
     return prov.fetch_universe(symbols, start, end, interval)
 
 

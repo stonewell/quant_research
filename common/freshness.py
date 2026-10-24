@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import pandas as pd
 
@@ -191,3 +191,146 @@ def latest_close(
     print(f"[WARN] {msg} [--allow-stale-prices 已显式开启：降级为警告，请人工复核后再下单]")
     _LOGGER.warning("stale price allowed for %s: bar=%s expected=%s", sym, bar, expect_iso)
     return price
+
+
+# --------------------------------------------------------------------------- #
+# Universe-level freshness summary + hard assertion (L2.3, design §9)
+# --------------------------------------------------------------------------- #
+def build_freshness_summary(
+    universe: Dict[str, pd.DataFrame],
+    expected_session: Optional[str],
+    *,
+    expected_symbols: Optional[Iterable[str]] = None,
+    exclude: Iterable[str] = (),
+    stage: Optional[str] = None,
+    strict: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Per-symbol bar-date audit of a loaded universe (design §9 `freshness_summary`).
+
+    THE single implementation of "which symbols' bars are not the expected session".
+    Both live stages persist this block into `stage1_health_report.json` /
+    `summary.json`; do not compute a parallel version in a script (design §7: two
+    drifting checks are precisely the defect being removed).
+
+    Parameters
+    ----------
+    universe:
+        `symbol -> OHLCV frame`, already truncated to the as-of date by the caller
+        (`pipeline.live_signal.lsig.signal.as_of_universe`). A symbol whose frame is
+        missing is only reported as `missing` when `expected_symbols` is supplied --
+        "absent" and "stale" stay distinct conditions, but neither is allowed to
+        masquerade as fresh.
+    expected_session:
+        ISO date of the session every bar must belong to. `None` => `NOT_CHECKED`
+        (backtest/research path), never a silent PASS.
+    expected_symbols / exclude:
+        Symbols that must be present, minus ones that legitimately have no bar
+        (e.g. a cash proxy that is not in the traded universe).
+
+    Returns
+    -------
+    dict with `status` in {PASS, FAIL, NOT_CHECKED}, per-symbol `price_bar_dates`,
+    `stale` (bar < expected) and `missing_symbols` lists.
+    """
+    expected_iso = None
+    if expected_session is not None:
+        try:
+            expected_iso = pd.Timestamp(expected_session).date().isoformat()
+        except (TypeError, ValueError):
+            expected_iso = str(expected_session)
+
+    excluded = {str(s) for s in exclude}
+    bar_dates: Dict[str, Optional[str]] = {}
+    stale: List[Dict[str, str]] = []
+    for sym, df in (universe or {}).items():
+        if str(sym) in excluded:
+            continue
+        bar_dates[str(sym)] = last_bar_session(df)
+        if expected_iso is not None and is_stale_bar(df, expected_iso):
+            stale.append({"symbol": str(sym), "bar_session": last_bar_session(df)})
+
+    missing: List[str] = []
+    if expected_symbols is not None:
+        for sym in expected_symbols:
+            if str(sym) in excluded:
+                continue
+            if sym not in (universe or {}):
+                missing.append(str(sym))
+                bar_dates.setdefault(str(sym), None)
+
+    if expected_iso is None:
+        status = "NOT_CHECKED"
+    elif stale or missing:
+        status = "FAIL"
+    else:
+        status = "PASS"
+
+    return {
+        "stage": stage,
+        "expected_session": expected_iso,
+        "strict": (None if strict is None else bool(strict)),
+        "status": status,
+        "n_expected": len(bar_dates),
+        "n_fresh": len([s for s, d in bar_dates.items() if d == expected_iso]),
+        "n_stale": len(stale),
+        "n_missing": len(missing),
+        "stale": stale,
+        "missing_symbols": missing,
+        "price_bar_dates": bar_dates,
+    }
+
+
+def assert_fresh_universe(
+    universe: Dict[str, pd.DataFrame],
+    expected_session: Optional[str],
+    *,
+    strict: bool,
+    expected_symbols: Optional[Iterable[str]] = None,
+    exclude: Iterable[str] = (),
+    stage: Optional[str] = None,
+) -> Dict[str, Any]:
+    """`build_freshness_summary` + the hard assertion (design §8 `--strict-freshness`).
+
+    `strict=True` raises `StalePriceError` listing every offending symbol (the bar it
+    would have been valued at vs the session that was expected). `strict=False` is
+    the operator's explicit downgrade and only prints/logs the same list. Either way
+    the returned summary is what the caller persists, so a downgraded run still
+    carries its own evidence.
+    """
+    summary = build_freshness_summary(
+        universe,
+        expected_session,
+        expected_symbols=expected_symbols,
+        exclude=exclude,
+        stage=stage,
+        strict=strict,
+    )
+    if summary["status"] == "PASS" or summary["status"] == "NOT_CHECKED":
+        if summary["status"] == "PASS":
+            print(
+                f"[FRESHNESS PASS] as_of={summary['expected_session']} "
+                f"({summary['n_fresh']}/{summary['n_expected']} 标的的收盘 bar 属于该交易日)"
+            )
+        return summary
+
+    lines = [
+        f"标的 {row['symbol']}: 最新 bar = {row['bar_session']} (< as_of {summary['expected_session']})"
+        for row in summary["stale"]
+    ] + [
+        f"标的 {sym}: 完全没有可用的日线 frame (as_of {summary['expected_session']})"
+        for sym in summary["missing_symbols"]
+    ]
+    detail = "\n  - ".join(lines)
+    msg = (
+        f"[FRESHNESS FAIL] {stage or 'live'} 数据新鲜度断言失败: as_of="
+        f"{summary['expected_session']}，{len(summary['stale'])} 个标的的 bar 早于该交易日、"
+        f"{len(summary['missing_symbols'])} 个标的无行情。逐条:\n  - {detail}\n"
+        "陈旧收盘价会静默污染盯市 NAV、目标权重与下单股数（2026-10-22 事故：6 只标的价格停在 10-21）。"
+        "修复方式：重新同步这些标的至 as_of 的行情；若确属休市/数据源已知缺口的人工演练，"
+        "可显式 --no-strict-freshness（或 --allow-stale-prices）降级为警告。"
+    )
+    if strict:
+        raise StalePriceError(msg)
+    print(f"[WARN] {msg} [已显式降级为警告，请人工复核后再下单]")
+    _LOGGER.warning("freshness downgraded to warning: %s", summary["stale"])
+    return summary

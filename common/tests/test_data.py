@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import warnings
+import datetime
 from unittest.mock import MagicMock, patch
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -925,3 +926,92 @@ def test_cached_data_provider_fetch_financial_indicators(tmp_path):
     assert metrics2.roe == 0.25
     assert metrics2.report_year == 2023
 
+
+
+def test_cached_data_provider_threads_expected_last_session_into_the_coverage_gate(temp_csv_dir):
+    """L2.2 end-to-end: an expectation the cache cannot satisfy must force a re-fetch even when
+    the *requested* window looks complete.
+
+    Cache holds 2024-01-01..2024-01-02 and the caller asks for exactly that (`end == the last
+    cached bar`), which the legacy rule happily calls covered. Passing
+    `expected_last_session=2024-01-03` says "the pricing session is 01-03", so the provider must be
+    hit again -- this is the provider-level shape of the six stale symbols of 2026-10-22.
+    """
+    calls = {"n": 0}
+
+    class CountingProvider(BaseDataProvider):
+        def fetch_ohlcv(self, symbol, start, end, interval="1d"):
+            calls["n"] += 1
+            dates = pd.bdate_range(start, end)
+            n = len(dates)
+            return pd.DataFrame(
+                {"Open": [10.0] * n, "High": [12.0] * n, "Low": [9.0] * n,
+                 "Close": [11.0] * n, "Volume": [100.0] * n},
+                index=dates,
+            )
+
+    cached_provider = CachedDataProvider(CountingProvider(), cache_dir=temp_csv_dir)
+    cached_provider.duckdb_cache.store_bars(
+        "CountingProvider", "SPY", pd.DataFrame(
+            {"Open": [10.0] * 2, "High": [12.0] * 2, "Low": [9.0] * 2,
+             "Close": [11.0] * 2, "Volume": [100.0] * 2},
+            index=pd.bdate_range("2024-01-01", periods=2),
+        )
+    )
+
+    # Legacy/backtest shape: the requested end is on disk -> served from cache, no upstream call.
+    cached_provider.fetch_ohlcv("SPY", start="2024-01-01", end="2024-01-02")
+    assert calls["n"] == 0
+
+    # Live shape: the pricing session is 2024-01-03 -> not covered -> re-fetched (the returned
+    # frame still honours the requested window; the point is that the stale cache was NOT served).
+    df = cached_provider.fetch_ohlcv(
+        "SPY", start="2024-01-01", end="2024-01-02", expected_last_session=datetime.date(2024, 1, 3)
+    )
+    assert calls["n"] == 1
+    assert df.index[-1] == pd.Timestamp("2024-01-02")
+
+
+def test_backtest_and_research_paths_never_pass_an_expected_last_session(temp_csv_dir, monkeypatch):
+    """L2.2/L2.5 backtest guard: the wall clock must not be able to influence research results.
+
+    Every backtest/research entry point reads bars through `CachedDataProvider`
+    (`load_universe` -> `fetch_universe`, `load_ohlcv` -> `fetch_ohlcv`) and none of them knows a
+    trading session, so the freshness parameter must arrive as `None` on every single call. If a
+    future edit starts threading a real session in here, this smoke test goes red before any
+    backtest number can silently change.
+    """
+    from common.duckdb_cache import DuckDBCache
+
+    observed = []
+    original = DuckDBCache.is_range_covered
+
+    def spy(self, provider, symbol, start=None, end=None, now=None, interval="1d",
+            expected_last_session=None):
+        observed.append(expected_last_session)
+        return original(
+            self, provider, symbol, start=start, end=end, now=now, interval=interval,
+            expected_last_session=expected_last_session,
+        )
+
+    monkeypatch.setattr(DuckDBCache, "is_range_covered", spy)
+
+    class CountingProvider(BaseDataProvider):
+        def fetch_ohlcv(self, symbol, start, end, interval="1d"):
+            dates = pd.bdate_range(start, end)
+            n = len(dates)
+            return pd.DataFrame(
+                {"Open": [10.0] * n, "High": [12.0] * n, "Low": [9.0] * n,
+                 "Close": [11.0] * n, "Volume": [100.0] * n},
+                index=dates,
+            )
+
+    cached_provider = CachedDataProvider(CountingProvider(), cache_dir=temp_csv_dir)
+    # Backtest-shaped reads: explicit start/end, per-symbol and per-universe, daily and intraday.
+    cached_provider.fetch_ohlcv("SPY", start="2023-01-03", end="2023-01-31")
+    cached_provider.fetch_universe(["SPY", "QQQ"], start="2023-01-03", end="2023-01-31")
+    # Second pass now hits the warm cache (still the same parameter contract).
+    cached_provider.fetch_universe(["SPY", "QQQ"], start="2023-01-03", end="2023-01-31")
+
+    assert observed, "the coverage gate was never reached -- the guard would be vacuous"
+    assert set(observed) == {None}, f"a research path passed a session expectation: {observed}"
