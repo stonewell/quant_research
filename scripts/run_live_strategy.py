@@ -87,17 +87,24 @@ from common.data import get_data_provider
 from common.allocation_backtester import _get_hk_board_lot
 from common.cli_utils import (
     add_data_provider_cli_args,
+    add_market_clock_cli_args,
     build_data_kwargs,
-    load_universe_with_banner,
+    load_live_universe,
+    persist_run_metadata,
+    resolve_live_clock_context,
     shared_data_dir,
 )
 from common.financial_api import check_missing_trading_days, get_trading_days_calendar
 from common.position_lifecycle import (
     AssetLifecycleState,
+    BlockingReason,
     ExitType,
     LifecycleDecision,
     PositionLifecycleConfig,
     PositionState,
+    blocking_reason_label,
+    coerce_blocking_reason,
+    is_liquidation_event,
     step_position_lifecycle,
 )
 from common.strategy_spec import _STATIC_TEMPLATES, get_template, load_strategy_file
@@ -116,7 +123,13 @@ from pipeline.live_signal.lsig.signal import as_of_universe, latest_rebalance_ro
 # anywhere in this file; two drifting freshness checks is the same class of bug
 # the incident was. The re-export below keeps `scripts.run_live_strategy.StalePriceError`
 # working for callers/tests that already reference it here.
-from common.freshness import StalePriceError, is_stale_bar, last_bar_session, latest_close
+from common.freshness import (
+    StalePriceError,
+    assert_fresh_universe,
+    is_stale_bar,
+    last_bar_session,
+    latest_close,
+)
 
 
 try:
@@ -476,16 +489,55 @@ def resolve_exit_cooldown(
     check_missing_trading_days from common.financial_api to determine elapsed trading days
     in the open-closed interval (last_exit_date, as_of_date].
 
-    Archive-scan anchoring caveat (2026-10-22 review finding): when reconstructing
-    last_exit_date from historical live_trading_ticket.csv files, a row anchors an
-    exit if action == "SELL" OR target_weight == 0.0 -- with ONE deliberate
-    exception: CANCEL_PENDING rows never anchor, because they record a cancelled
-    PENDING_ENTRY for a symbol that was never held (its target went to 0.0 before
-    any position existed). The target_weight == 0.0 leg is retained on purpose for
-    every other action (e.g. HOLD_FILTERED); narrowing it to action == "SELL" is a
-    separate, undecided semantics question (development_plan.md L2.21). The
-    companion reader resolve_holding_bars classifies by holdings/entry columns and
-    is NOT affected by this heuristic.
+    Archive-scan anchoring caveat (narrowed 2026-10-23, development_plan.md L2.21):
+    when reconstructing last_exit_date from historical live_trading_ticket.csv
+    files, a row anchors an exit ONLY if action == "SELL".
+
+    (L2.24) The verdict is taken from `common.position_lifecycle.is_liquidation_event`
+    -- the single predicate for "did this row liquidate the position?" -- and NOT
+    from `target_weight`, and NOT from `blocking_reason`. Archived tickets written
+    before `L2.24` simply have no `blocking_reason` column; the read goes through
+    `coerce_blocking_reason` (missing -> `NONE`) so legacy archives keep working
+    unchanged instead of raising `KeyError`. A `blocking_reason` can only ever
+    explain why a row traded nothing; it can never promote a non-`SELL` row into
+    an anchor.
+
+    History / why the old `target_weight == 0.0` leg was removed: the 2026-10-22
+    hotfix already excluded CANCEL_PENDING (a cancelled PENDING_ENTRY for a symbol
+    that was never held), but kept `tgt_w == 0.0` as an anchor for every OTHER
+    action. That leg was phantoms-only -- `target_weight == 0.0` is written by
+    three code paths that never executed a single share:
+      1. minimum-entry / rebalance threshold filtering
+         (common/position_lifecycle.py:458 -> HOLD_FILTERED, tgt_w 0.0);
+      2. the PENDING_ENTRY confirmation window
+         (common/position_lifecycle.py:543 -> HOLD_FILTERED, tgt_w 0.0);
+      3. the market-closed freeze (common/position_lifecycle.py:200-209 ->
+         HOLD_FILTERED with target_weight = state.current_weight, which is 0.0
+         whenever the symbol is flat -- an ordinary "market shut" note became an
+         exit).
+    A forensic scan of the 25 archived tickets found 34 such phantom-anchoring
+    rows. Because the scan runs newest-first, a phantom anchor frequently sits
+    only ONE day before as_of -- enough to arm the 2-trading-day re-entry cooldown
+    (`--reentry-cooldown-bars` default 2), so the symbol got pinned to COOLDOWN ->
+    HOLD_FILTERED and flattened right before Phase 2 could buy it again. Every
+    real liquidation path in this script emits action == "SELL", so narrowing to
+    SELL loses no genuine anchor; CANCEL_PENDING needs no special case any more.
+
+    Deliberately unchanged:
+      - the account_state / prior_state `last_exit_date` path above never consults
+        the archive, so state-file-anchored cooldowns behave exactly as before;
+      - `default_bars` (999) still means "no known exit".
+    (L2.22, decided 2026-10-23) Partial de-risking is NOT an exit. Both anchor
+    paths enforce that now:
+      - the ticket-writing site uses `should_anchor_reentry_cooldown` -- a real
+        `SELL` AND a post-trade position of zero AND not a closed-session freeze;
+      - THIS archive scan additionally requires the archived row's post-fill
+        quantity to be zero (`_archived_shares_after`), because an archived partial
+        trim is a `SELL` row and the L2.21 SELL-only verdict would have re-armed
+        the cooldown on the next run, defeating the ticket-site fix.
+    Only a full liquidation restarts the exit clock.
+    The companion reader resolve_holding_bars classifies by holdings/entry columns
+    and is NOT affected by this heuristic.
     """
     as_of_d = pd.Timestamp(as_of_date).date() if as_of_date else date.today()
     account_state = account_state or {}
@@ -521,16 +573,46 @@ def resolve_exit_cooldown(
                             df = pd.read_csv(d_ticket)
                             row = df[df["symbol"] == sym]
                             if not row.empty:
-                                act = str(row.iloc[0].get("action", ""))
-                                tgt_w = float(row.iloc[0].get("target_weight", 0.0))
-                                # (2026-10-22 incident, review finding) CANCEL_PENDING is a RECORD row
-                                # for a symbol that was NEVER held -- its target went to 0.0 while still
-                                # in PENDING_ENTRY. Reading it as "full exit" would anchor a phantom
-                                # cooldown one day later than before this fix. Note this deliberately
-                                # keeps the pre-existing `tgt_w == 0.0` anchor for every other action
-                                # (e.g. HOLD_FILTERED): changing that is a separate, out-of-scope
-                                # semantics decision.
-                                if act == "SELL" or (tgt_w == 0.0 and act != "CANCEL_PENDING"):
+                                first = row.iloc[0]
+                                act = str(first.get("action", ""))
+                                # (L2.24) `blocking_reason` is read only for the
+                                # legacy-tolerance contract: pre-L2.24 archives have
+                                # no such column (`Series.get` -> None -> NONE), so
+                                # nothing may raise and nothing may change. The
+                                # anchoring verdict below comes from `action` (see
+                                # is_liquidation_event()) PLUS the L2.22 post-fill
+                                # share check -- never from `target_weight`.
+                                # (`target_weight` is intentionally not read any more -- see the
+                                # narrowing rationale below.)
+                                # (2026-10-23 narrowing, development_plan.md L2.21) ONLY a real
+                                # `SELL` anchors. The old `tgt_w == 0.0` leg (with CANCEL_PENDING
+                                # excluded by the 2026-10-22 hotfix) was pure phantom-anchor
+                                # machinery: HOLD_FILTERED + tgt_w 0.0 is emitted by the min-entry
+                                # threshold filter, by the PENDING_ENTRY confirmation window, and by
+                                # the market-closed freeze while flat -- none of which traded
+                                # anything. 34 such rows across the 25 archived tickets, often one
+                                # day before as_of, armed the 2-day cooldown and flattened the
+                                # symbol before Phase 2 buys. `act != "CANCEL_PENDING"` is now
+                                # redundant: a CANCEL_PENDING row is never `SELL`, so it cannot
+                                # shadow a genuine day-1 SELL anchor any more.
+                                # (L2.22, decided 2026-10-23) A `SELL` alone is NOT enough
+                                # to anchor from an ARCHIVE either: the ruling is "only a
+                                # position going to zero is an exit; a partial trim never
+                                # resets the cooldown". An archived partial trim carries
+                                # `action == "SELL"` with `target_shares > 0`, so the
+                                # SELL-only verdict below (L2.21) re-armed the cooldown on
+                                # the NEXT run and silently defeated the ticket-site fix.
+                                # The post-fill quantity recorded in the archive row
+                                # (`target_shares`) is the second, independent fact: the
+                                # position must be gone. Same predicate family as
+                                # `should_anchor_reentry_cooldown` (which adds the
+                                # `blocking_reason` leg; an ARCHIVED freeze row can never be
+                                # a SELL, so it needs no special case here).
+                                block_label = coerce_blocking_reason(first.get("blocking_reason"))
+                                if (
+                                    is_liquidation_event(act, block_label)
+                                    and _archived_shares_after(first) == 0
+                                ):
                                     last_exit_dates[sym] = d
                                     break
                         except Exception:
@@ -553,6 +635,82 @@ def resolve_exit_cooldown(
             exit_bars[sym] = default_bars
 
     return exit_bars
+
+
+def _archived_shares_after(row: Any) -> int:
+    """Post-fill held quantity recorded by an archived `live_trading_ticket.csv` row.
+
+    `docs/development_plan.md` **L2.22**. Returns the row's `target_shares`, i.e. the
+    quantity the account holds once that historical ticket's orders have filled --
+    the archive-side counterpart of the live runner's post-trade share count. Only
+    a zero here (a position that went to ZERO) may anchor a re-entry cooldown.
+
+    Legacy tolerance is deliberate and directional: a pre-column archive (no
+    `target_shares` key -- the column predates the archive heuristic, so this is a
+    tolerance path rather than a normal one) or an unparseable value returns 0,
+    i.e. it keeps the old "a `SELL` anchors" verdict. Refusing to anchor on a row
+    whose fill quantity cannot be read would silently DISABLE a genuine cooldown,
+    which is the riskier failure. Never invert this default.
+    """
+    try:
+        raw = row.get("target_shares")
+    except AttributeError:
+        return 0
+    if raw is None:
+        return 0
+    try:
+        if pd.isna(raw):
+            return 0
+    except (TypeError, ValueError):
+        pass
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return 0
+
+
+def should_anchor_reentry_cooldown(
+    action: Any,
+    blocking_reason: Any,
+    shares_before: int,
+    shares_after: int,
+) -> bool:
+    """Whether a ticket row may re-arm (anchor) an asset's re-entry cooldown.
+
+    `docs/development_plan.md` **L2.22**, decided 2026-10-23. The product ruling is
+    deliberately NOT "any de-risking anchors": **only a position actually going to
+    zero counts as an exit, and a partial trim never resets the cooldown clock.**
+
+    Three independent facts must all hold:
+
+    1. a real exit EXECUTED -- `common.position_lifecycle.is_liquidation_event`
+       (i.e. `action == "SELL"`). A gated / holding / record row is never an exit
+       no matter what weight it carries;
+    2. the position is GONE afterwards -- `shares_after == 0` on a position that was
+       non-empty before (`shares_before > 0`). This is SHARE arithmetic on the
+       post-trade book, the one honest "did we exit?" datum; a partial trim leaves
+       shares behind and therefore anchors nothing;
+    3. the row was EVALUATED at all -- `blocking_reason != MARKET_CLOSED_FREEZE`.
+       A closed-session row freezes the whole state machine and trades nothing; it
+       documents that nothing ran, not that we exited.
+
+    Why this is a named predicate rather than an inline condition: the previous
+    inline form (`cur_sh > 0 and (act == "SELL" or tgt_sh == 0)`) anchored on the
+    `SELL` leg for PARTIAL trims too, so a de-risking trim re-armed the cooldown and
+    pinned the asset out of Phase 2 for the next N sessions. It also still carried a
+    `tgt_sh == 0` inference -- exactly the zero-target liquidation inference that
+    `L2.21`/`L2.24`/`L2.25` removed everywhere else. NEVER re-derive an exit from
+    `target_weight == 0.0` (or a zero target SHARE count) alone: only the pair
+    (real `SELL`, zero shares after) is a liquidation.
+    """
+    if coerce_blocking_reason(blocking_reason) is BlockingReason.MARKET_CLOSED_FREEZE:
+        # Nothing was evaluated: the state machine is frozen, no order exists.
+        return False
+    if not is_liquidation_event(action, blocking_reason):
+        # Not a SELL -> not an exit (a blocking label can never promote a row).
+        return False
+    # Post-trade share truth: the position must be fully gone.
+    return shares_after == 0 and shares_before > 0
 
 
 _STATIC_NAME_ALIASES = {
@@ -738,7 +896,12 @@ def parse_args(args: Optional[List[str]] = None):
         "--as-of-date",
         type=str,
         default=None,
-        help="Point-in-time valuation date (YYYY-MM-DD, default: today)",
+        help=(
+            "Point-in-time valuation date (YYYY-MM-DD). Default: resolved from the market clock's "
+            "as_of_trading_date (close + publication grace, in the market's own timezone) -- never the "
+            "host's local date. An explicit value is still validated against the clock: it must be a "
+            "trading day of --market and may not be later than the latest published session."
+        ),
     )
     parser.add_argument(
         "--start-date",
@@ -852,20 +1015,30 @@ def parse_args(args: Optional[List[str]] = None):
     parser.add_argument(
         "--cutoff-time",
         default="14:15",
-        help="Intraday cutoff time for Stage 2 order generation (default: 14:15, 39 5m bars)",
+        help=(
+            "Intraday cutoff time for Stage 2 order generation, expressed in the MARKET's local wall "
+            "clock (not the host's; default: 14:15, 39 5m bars). Used only for 5m EXECUTION-price "
+            "guidance -- daily-bar valuation always uses the as-of session from the market clock."
+        ),
     )
     parser.add_argument(
         "--allow-stale-prices",
         action="store_true",
         help=(
-            "DANGEROUS EMERGENCY OVERRIDE. By default Stage 2 REFUSES to run (raises StalePriceError) "
-            "when any mark-to-market close is not the --as-of-date bar, because a stale close silently "
-            "corrupts NAV, weights and share quantities. With this flag the mismatch is downgraded to a "
-            "loud warning, the run continues, and every affected ticket row carries price_stale=true plus "
-            "a [陈旧价格] note in its reason. Intended only for non-trading-day dry runs / known provider gaps."
+            "DANGEROUS EMERGENCY OVERRIDE (equivalent to --no-strict-freshness). By default Stage 2 "
+            "REFUSES to run (raises StalePriceError) when any mark-to-market close is not the --as-of-date "
+            "bar, because a stale close silently corrupts NAV, weights and share quantities. With this flag "
+            "the mismatch is downgraded to a loud warning, the run continues, and every affected ticket row "
+            "carries price_stale=true plus a [陈旧价格] note in its reason. Intended only for non-trading-day "
+            "dry runs / known provider gaps."
         ),
     )
     add_data_provider_cli_args(parser, default_provider="synthetic")
+    # (L2.3) --market / --allow-intraday / --strict-market-clock / --strict-freshness /
+    # --publication-grace-minutes / --max-probe-attempts: the as-of + run-window gate
+    # flags from design §8. Declared through the shared helper so Stage 1, Stage 2 and
+    # the multi-strategy netting runner cannot drift apart.
+    add_market_clock_cli_args(parser, stage="stage2")
     parsed = parser.parse_args(args)
 
     # Reconcile guard_latency_bars with backward compatibility overrides
@@ -983,7 +1156,9 @@ def resolve_holdings_weights_and_shares(
     not just one number. Every price here is resolved through
     `common.freshness.latest_close()`, the single owner of the bar-date-vs-
     expected-session comparison, which raises `StalePriceError` on a mismatch
-    unless `allow_stale_prices=True` (operator's `--allow-stale-prices`).
+    unless `allow_stale_prices=True` -- the call site passes
+    `not clock_ctx.freshness_strict`, i.e. the single boolean that both
+    `--no-strict-freshness` and `--allow-stale-prices` fold into.
     """
     if not raw_holdings:
         return {}, {}, 0.0, portfolio_value
@@ -1102,7 +1277,18 @@ def apply_intraday_distribution_gate(
 
 def main(cli_args: Optional[List[str]] = None):
     args = parse_args(cli_args)
-    as_of_date = args.as_of_date or date.today().isoformat()
+
+    # (L2.3) as-of and the run-window gate come from `common/market_clock.py`, NOT
+    # from the host's `date.today()`. The universe is resolved first only because the
+    # authoritative market is inferred from its symbol suffixes; the gate then runs
+    # BEFORE any data load, so an out-of-window invocation costs nothing and cannot
+    # half-produce a ticket.
+    universe_symbols = resolve_universe_from_args(args)
+    if not universe_symbols:
+        raise ValueError(f"Could not resolve universe symbols from {args.universe_file}")
+    clock_ctx = resolve_live_clock_context(args, universe_symbols, stage="stage2")
+    as_of_date = clock_ctx.as_of_date
+    expected_last_session = clock_ctx.expected_last_session
     if getattr(args, "start_date", None):
         start_date = args.start_date
     else:
@@ -1256,7 +1442,6 @@ def main(cli_args: Optional[List[str]] = None):
     print("=" * 110)
 
     # 2. Load Universe (including any held symbols outside the universe list)
-    universe_symbols = resolve_universe_from_args(args)
     if not universe_symbols:
         raise ValueError(f"Could not resolve universe symbols from {args.universe_file}")
     symbol_names = load_symbol_names(args.universe_file)
@@ -1270,17 +1455,41 @@ def main(cli_args: Optional[List[str]] = None):
     symbols_to_load = sorted(list(set(universe_symbols).union(set(held_symbols))))
 
     cache_dir = args.cache_dir or shared_data_dir()
-    universe = load_universe_with_banner(
+    # (L2.3) `expected_last_session=as_of` is what turns the cache gate from "we synced
+    # today" into "this session's bar is on disk" (design §6/§7). The bounded re-probe
+    # lives in cli_utils.load_live_universe; freshness JUDGEMENT stays in
+    # common/freshness.py (assert_fresh_universe below).
+    universe, probe_attempts = load_live_universe(
+        args,
         symbols_to_load,
         start_date,
         as_of_date,
-        interval="1d",
+        clock_ctx=clock_ctx,
         use_cache=not args.no_cache,
         cache_dir=cache_dir,
         data_kwargs=build_data_kwargs(args),
         require_nonempty=True,
     )
     universe = as_of_universe(universe, as_of_date)
+    # (L2.3) Hard freshness assertion (design §8 --strict-freshness): a symbol whose
+    # latest bar is not the as-of session aborts the run before ANY price, weight or
+    # share count is computed. `exclude={cash_proxy}` keeps "no frame at all" (a
+    # legitimate cash-proxy fallback) out of the staleness verdict.
+    freshness_summary = assert_fresh_universe(
+        universe,
+        as_of_date,
+        strict=clock_ctx.freshness_strict,
+        expected_symbols=symbols_to_load,
+        exclude=(cash_proxy,),
+        stage="stage2",
+    )
+    persist_run_metadata(
+        args.output_dir,
+        clock_ctx,
+        freshness_summary=freshness_summary,
+        probe_attempts=probe_attempts,
+        extra={"date": as_of_date, "stage": "stage2"},
+    )
 
     enable_intraday_5m = getattr(args, "enable_intraday_5m", False) or bool(
         resolve_blend_param(params, "enable_intraday_5m", False, bool)
@@ -1446,7 +1655,11 @@ def main(cli_args: Optional[List[str]] = None):
             args.portfolio_value,
             cash_proxy,
             as_of_date=as_of_date,
-            allow_stale_prices=bool(getattr(args, "allow_stale_prices", False)),
+            # One switch, two spellings: `clock_ctx.freshness_strict` already folds
+            # `--no-strict-freshness` and `--allow-stale-prices` into one boolean, so the
+            # mark-to-market path cannot honour one flag while `assert_fresh_universe`
+            # honours the other.
+            allow_stale_prices=not clock_ctx.freshness_strict,
         )
         reference = pd.Series(reference_weights)
         reference_source = "User-Supplied Actual Live Brokerage Holdings"
@@ -1566,7 +1779,7 @@ def main(cli_args: Optional[List[str]] = None):
         price_stale = False
         price_bar_date: Optional[str] = None
         if sym in universe and not universe[sym].empty:
-            price = latest_close(universe, sym, as_of_date, strict=not getattr(args, "allow_stale_prices", False))
+            price = latest_close(universe, sym, as_of_date, strict=clock_ctx.freshness_strict)
             price_bar_date = last_bar_session(universe[sym])
             price_stale = is_stale_bar(universe[sym], as_of_date)
             if price_stale and sym not in stale_price_symbols:
@@ -1603,6 +1816,8 @@ def main(cli_args: Optional[List[str]] = None):
             decision_detail = {}
             held_age = 0
             is_tenure_locked = False
+            # Cash sweeping is not a gated equity decision.
+            blocking_reason = BlockingReason.NONE
         else:
             # Check volume breakout ratio and ATR
             cur_v = 0.0
@@ -1713,12 +1928,32 @@ def main(cli_args: Optional[List[str]] = None):
             reason = decision.reason
             fast_path_badge = None
             decision_detail = decision.detail_reason
+            # (L2.24) The lifecycle machine's own structured verdict. Every
+            # override below that changes `action` MUST also restate this, so a
+            # row can never claim one gate while having been decided by another.
+            blocking_reason = decision.blocking_reason
 
-            if cur_w == 0.0 and 0.0 < target_series[sym] < min_entry_thresh:
+            # (L2.23) NOT evaluated on a closed market: the script-level
+            # min-entry relabel below is a SIGNAL-filter story ("目标未达门槛"),
+            # which would read as "a signal was evaluated and rejected" on a day
+            # nothing was evaluated at all. The economics are identical either way
+            # (both write tgt_w = 0.0 for a flat symbol), so skipping it on a
+            # freeze day is a pure semantics fix.
+            is_market_closed_freeze = (
+                coerce_blocking_reason(decision.blocking_reason)
+                is BlockingReason.MARKET_CLOSED_FREEZE
+            )
+
+            if (
+                not is_market_closed_freeze
+                and cur_w == 0.0
+                and 0.0 < target_series[sym] < min_entry_thresh
+            ):
                 action = "HOLD_FILTERED"
                 tgt_w = 0.0
                 delta_w = 0.0
                 abs_delta = 0.0
+                blocking_reason = BlockingReason.MIN_ENTRY_THRESHOLD
                 reason = f"目标仓位未达最低建仓/调仓门槛 (目标 {target_series[sym]:.1%} < 门槛 {min_entry_thresh:.0%}，防微量试错损耗)"
 
             if decision.fast_path_triggered:
@@ -1727,7 +1962,11 @@ def main(cli_args: Optional[List[str]] = None):
                     reason = f"{reason} {fast_path_badge}"
 
             if action == "COOLDOWN_BLOCKED":
+                # `action` is widened to the shared HOLD_FILTERED label, but the
+                # reason stays distinguishable through `blocking_reason`
+                # (L2.24) -- that is the whole point of the enum.
                 action = "HOLD_FILTERED"
+                blocking_reason = BlockingReason.COOLDOWN_BLOCKED
 
             # (2026-10-22 incident, Fix 4a) Explicit allow-list, NOT an
             # implicit "everything that is not HOLD". CANCEL_PENDING must never
@@ -1776,6 +2015,9 @@ def main(cli_args: Optional[List[str]] = None):
                 tgt_w = cur_w
                 delta_w = 0.0
                 abs_delta = 0.0
+                # (L2.24) The SELL was vetoed by the tenure lock, not by inertia,
+                # not by a closed market.
+                blocking_reason = BlockingReason.TENURE_LOCKED
                 # Keep the persisted lifecycle weight consistent with the
                 # downgraded no-trade decision (no SELL order is emitted, so
                 # current_weight must remain the broker weight, not the
@@ -1863,6 +2105,9 @@ def main(cli_args: Optional[List[str]] = None):
                     abs_delta = 0.0
                     reason = "涨停封板无法买入 (LIMIT_UP_LOCKED)"
                     execution_warning = "LIMIT_UP_LOCKED"
+                    # (L2.24) A BUY that was vetoed at the exchange board, not at
+                    # the lifecycle machine.
+                    blocking_reason = BlockingReason.LIMIT_UP_LOCKED
                 else:
                     raw_buy_shares = trade_val / price
                     raw_shares = raw_buy_shares
@@ -1951,6 +2196,8 @@ def main(cli_args: Optional[List[str]] = None):
             tgt_w = 0.0
             delta_w = -cur_w
             abs_delta = abs(delta_w)
+            # (L2.24) A real liquidation is never labelled as blocked.
+            blocking_reason = BlockingReason.NONE
             if not reason or reason == "最优权重微调":
                 reason = "目标仓位不足单手或整手归零清仓"
         elif sym != cash_proxy and current_shares == 0 and target_shares == 0 and state.is_holding():
@@ -2021,6 +2268,20 @@ def main(cli_args: Optional[List[str]] = None):
         # Structured multi-dimensional detail reason
         detail_reason = {
             "summary_reason": summary_reason,
+            # (L2.24) Same verdict as the ticket column, repeated inside the audit
+            # block so a reader that only keeps `detail_reason` is not forced back
+            # to guessing from `target_weight`.
+            "blocking_reason": coerce_blocking_reason(blocking_reason).value,
+            # (L2.25) Explicit audit verdict for "did this row liquidate the
+            # position?". Derived by the single shared predicate
+            # (`common.position_lifecycle.is_liquidation_event`, i.e. `action ==
+            # "SELL"`), NOT by comparing `target_weight` with 0.0: at least three
+            # gates write a 0.0 target while trading absolutely nothing
+            # (min-entry filter / PENDING_ENTRY confirmation / market-closed
+            # freeze), and `CANCEL_PENDING` is a never-held record. Audit,
+            # attribution and UI consumers read this key (or the pair
+            # `action` + `blocking_reason`) instead of re-deriving it.
+            "is_liquidation": bool(is_liquidation_event(action, blocking_reason)),
             "dimension_signals": dim_signals,
             "lifecycle_state": state.to_dict() if sym != cash_proxy else {},
             "lifecycle_decision": decision_detail,
@@ -2098,6 +2359,14 @@ def main(cli_args: Optional[List[str]] = None):
             "chan_5m_state": chan_5m_state,
             "suggested_limit_price": suggested_limit_price,
             "passive_support_limit_price": passive_support_limit_price,
+            # (L2.24) Appended LAST on purpose: the CSV gains one TRAILING column
+            # and the JSON gains one key, so no existing column changes position
+            # or meaning and no schema version bump is needed (a reader that does
+            # not know this column ignores it; a pre-L2.24 archive simply lacks it
+            # and reads back as `NONE` via `coerce_blocking_reason`). This is the
+            # structured "why was nothing traded" verdict that replaces guessing
+            # intent from `target_weight == 0.0`.
+            "blocking_reason": coerce_blocking_reason(blocking_reason).value,
         })
 
     # Purchasing power constraint: total buys cannot exceed available cash + sales proceeds
@@ -2209,7 +2478,50 @@ def main(cli_args: Optional[List[str]] = None):
             print(f"  🟢 BUY  {sym_col} | 现价: {r['price']:>7.2f} | 仓位: {r['current_weight']:>5.1%} -> 目标: {r['target_weight']:>5.1%} ({r['delta_weight']:>+5.1%}) | 买入: {qty_str} 股 (~¥{r['trade_value']:>9,.2f}){suffix}")
 
     # Phase 3: only show positions the user actually holds (cur_w > 0) or that have a real target weight
-    actual_holds = holds[(holds["current_weight"] > 0) | (holds["target_weight"] > 0) | (holds["action"] == "HOLD_FILTERED")]
+    # (L2.23) EXCEPT the market-closed freeze rows, which are pulled out into
+    # their own block below: a frozen row means "not evaluated", so rendering it
+    # under "维持既有持仓/惰性过滤" as "⚪ HOLD 维持仓位" told the operator the
+    # opposite of what happened (and, for a flat symbol, printed a 0.0% "held"
+    # position). Splitting is done on the structured `blocking_reason` column
+    # (L2.24), never on `target_weight == 0.0`.
+    _blocking_col = (
+        order_df["blocking_reason"]
+        if "blocking_reason" in order_df.columns
+        else pd.Series(BlockingReason.NONE.value, index=order_df.index)
+    )
+    # NOTE (load-bearing): do NOT pre-coerce the whole column into a Series first.
+    # `BlockingReason` subclasses `str`, so `Series.map(coerce_blocking_reason)`
+    # returns a *plain-string* Series -- pandas drops the enum identity -- and a
+    # subsequent `is BlockingReason.X` comparison would then be silently False for
+    # every row (this exact refactor briefly made Phase 3a render nothing at all).
+    # Coercing element-by-element in a list comprehension keeps real members.
+    _blocking_values = [coerce_blocking_reason(v) for v in _blocking_col.tolist()]
+    _is_freeze_row = pd.Series(
+        [b is BlockingReason.MARKET_CLOSED_FREEZE for b in _blocking_values],
+        index=order_df.index,
+        dtype=bool,
+    )
+    frozen_holds = holds[holds.index.isin(_is_freeze_row[_is_freeze_row].index)]
+    active_holds = holds[~holds.index.isin(frozen_holds.index)]
+    # (L2.25) Which rows belong in Phase 3 is decided from the STRUCTURED verdict,
+    # never by asking whether `target_weight == 0.0` "means we exited". A gated
+    # row (blocking_reason != NONE) is always shown, even at a 0.0 target, because
+    # it is a real reason the operator requested; `target_weight > 0` remains ONLY
+    # an inclusion rule ("the model still wants this symbol"), never a liquidation
+    # verdict; and `action == "HOLD_FILTERED"` keeps pre-L2.24 rows (no
+    # blocking_reason column) visible, since for those the action is the only
+    # signal available.
+    _is_gated_row = pd.Series(
+        [b is not BlockingReason.NONE for b in _blocking_values],
+        index=order_df.index,
+        dtype=bool,
+    )
+    actual_holds = active_holds[
+        (active_holds["current_weight"] > 0)
+        | (active_holds["target_weight"] > 0)
+        | _is_gated_row.reindex(active_holds.index, fill_value=False)
+        | (active_holds["action"] == "HOLD_FILTERED")
+    ]
     print(f"\n[PHASE 3: POSITIONS HELD (第三阶段: 维持既有持仓/惰性过滤 < {min_trade_thresh:.0%})]")
     if actual_holds.empty:
         print("  今日无既有持仓需要维持。")
@@ -2220,7 +2532,41 @@ def main(cli_args: Optional[List[str]] = None):
             shares_info = f"({int(r['current_shares'])} 股)" if r['current_shares'] > 0 else ""
             h_bar = int(r.get("holding_bars", 0))
             tenure_str = f" [持仓{h_bar}日]" if h_bar > 0 else ""
-            print(f"  ⚪ HOLD {sym_col} | 维持仓位: {r['target_weight']:>5.1%} {shares_info:<10}{tenure_str} | 持仓市值: ~¥{r['target_weight']*args.portfolio_value:>9,.2f} | ({reason})")
+            gated = coerce_blocking_reason(r.get("blocking_reason"))
+            if gated is not BlockingReason.NONE:
+                # (L2.25) An EVALUATED-BUT-GATED row: a signal existed and a gate
+                # stopped it. It is NOT "维持仓位" (nothing was re-affirmed) and, for
+                # a flat symbol, it is emphatically not a "0.0% held position" --
+                # that wording was the display half of the phantom-exit bug class.
+                position_txt = (
+                    f"持仓不变: {r['current_weight']:>5.1%} -> 目标 {r['target_weight']:>5.1%}"
+                    if r['current_shares'] > 0
+                    else f"未持仓: 0.0% -> 目标 {r['target_weight']:>5.1%}"
+                )
+                print(
+                    f"  🟡 {blocking_reason_label(gated)} {sym_col} | {position_txt} {shares_info:<10}{tenure_str} | "
+                    f"无交易指令 | ({reason})"
+                )
+            else:
+                print(f"  ⚪ HOLD {sym_col} | 维持仓位: {r['target_weight']:>5.1%} {shares_info:<10}{tenure_str} | 持仓市值: ~¥{r['target_weight']*args.portfolio_value:>9,.2f} | ({reason})")
+
+    # (L2.23) Market-closed freeze rows get their OWN semantics: neither "held"
+    # nor "filtered". Nothing was evaluated -- no signal, no gate, no counter
+    # advanced -- so the operator must not read this as "the model decided to
+    # keep the position" (which is what "⚪ HOLD 维持仓位 0.0%" used to say for a
+    # flat symbol). The row is still emitted and archived: it is the evidence
+    # that the run happened on a non-trading day.
+    if not frozen_holds.empty:
+        print("\n[PHASE 3a: MARKET CLOSED — NOT EVALUATED (第三阶段附: 休市冻结，未评估任何信号 — 无交易指令)]")
+        for _, r in frozen_holds.iterrows():
+            sym_col = pad_east_asian(f"{r['symbol']} ({r['name']})", 24)
+            shares_info = f"({int(r['current_shares'])} 股)" if r['current_shares'] > 0 else ""
+            print(
+                f"  🕒 {blocking_reason_label(r.get('blocking_reason'))} {sym_col} | "
+                f"仓位保持不变: {r['target_weight']:>5.1%} {shares_info:<10}| "
+                f"持仓市值: ~¥{r['target_weight']*args.portfolio_value:>9,.2f} | "
+                f"(休市冻结，未评估任何信号；状态机/确认期/锁定期/冷却期计数器全部冻结，本行不含任何交易指令)"
+            )
 
     # (2026-10-22 incident, Fix 4) PENDING_ENTRY cancellations are printed in
     # their own block so an operator can see that a confirmation period was
@@ -2341,7 +2687,21 @@ def main(cli_args: Optional[List[str]] = None):
                 dual_zero_target_streak.pop(sym, None)
                 if sym in updated_lifecycle_states:
                     updated_lifecycle_states[sym]["exit_streak"] = 0
-            if cur_sh > 0 and (act == "SELL" or tgt_sh == 0):
+            # (L2.22, decided 2026-10-23) Cooldown anchoring is now "did a REAL real
+            # exit happen AND is the position actually gone?" -- delegated to
+            # `should_anchor_reentry_cooldown`. Consequences, all intentional:
+            #   - a PARTIAL trim (`act == "SELL"`, `tgt_sh > 0`) no longer anchors:
+            #     we still hold the name, so its exit clock must not restart
+            #     (previously the `act == "SELL"` leg re-armed the cooldown and
+            #     locked the still-held asset out of the next N sessions);
+            #   - a closed-session freeze row never anchors (nothing was evaluated);
+            #   - the old `tgt_sh == 0` zero-target leg is GONE: no exit may ever be
+            #     reverse-inferred from a zero target weight/share count. Only the
+            #     pair (action == "SELL", zero shares held afterwards) is an exit --
+            #     see `common/position_lifecycle.is_liquidation_event` (L2.24/L2.25).
+            if should_anchor_reentry_cooldown(
+                act, r.get("blocking_reason"), cur_sh, tgt_sh
+            ):
                 updated_last_exit_date[sym] = as_of_date
                 dual_entry_prices.pop(sym, None)
                 dual_holding_bars.pop(sym, None)

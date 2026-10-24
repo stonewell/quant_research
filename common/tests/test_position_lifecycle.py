@@ -16,10 +16,14 @@ import pytest
 from common.allocation_templates import apply_asset_inertia
 from common.position_lifecycle import (
     AssetLifecycleState,
+    BlockingReason,
     ExitType,
     LifecycleDecision,
     PositionLifecycleConfig,
     PositionState,
+    blocking_reason_label,
+    coerce_blocking_reason,
+    is_liquidation_event,
     step_position_lifecycle,
 )
 
@@ -879,3 +883,182 @@ def test_detail_reason_current_weight_is_pre_trade_broker_weight():
     assert state_hold.current_weight == pytest.approx(0.18)  # unchanged
 
 
+
+
+# ---------------------------------------------------------------------------
+# L2.23 -- market-closed freeze semantics must be explicit, not a "filter"
+# ---------------------------------------------------------------------------
+
+
+def test_market_closed_freeze_declares_nothing_was_evaluated():
+    """A freeze row must read as "not evaluated", never as "signal filtered".
+
+    Regression target (`docs/development_plan.md` L2.23): the old wording was
+    "非交易日/休市日，状态机与门禁计数器冻结维持", and the ticket rendered the row
+    as "⚪ HOLD 维持仓位 0.0%" for a flat symbol -- i.e. an ordinary "the market
+    was shut" note was indistinguishable from a deliberate decision to keep (or
+    flat) a position. It is also NOT a liquidation: `target_weight` is just the
+    carried-over current weight.
+    """
+    cfg = PositionLifecycleConfig(guard_latency_bars=2, min_holding_bars=2)
+    state = AssetLifecycleState(symbol="A", state=PositionState.FLAT, entry_streak=1)
+
+    d = step_position_lifecycle(
+        state, raw_target_weight=0.10, current_price=50.0, cfg=cfg, is_market_open=False
+    )
+
+    assert d.action == "HOLD_FILTERED"
+    assert d.blocking_reason is BlockingReason.MARKET_CLOSED_FREEZE
+    # Machine-readable + human-readable: both must say "nothing was evaluated".
+    assert d.detail_reason["signals_evaluated"] is False
+    assert d.detail_reason["is_market_open"] is False
+    assert d.detail_reason["blocking_reason"] == "MARKET_CLOSED_FREEZE"
+    assert "未评估任何信号" in d.reason
+    assert "未评估任何信号" in d.detail_reason["note"]
+    # The old "维持" wording is what made the row read as a hold decision.
+    assert "维持" not in d.reason
+    # Frozen: nothing advanced, and no trade is implied.
+    assert d.target_weight == 0.0
+    assert state.entry_streak == 1
+    assert state.state == PositionState.FLAT
+
+
+def test_market_closed_freeze_is_never_a_liquidation_event():
+    """A flat freeze row carries a 0.0 target but did NOT liquidate anything.
+
+    This is the phantom-anchor shape (`docs/version.md` §11) that `L2.21`
+    removed from the cooldown heuristic; `L2.24` makes it un-inferable by
+    construction.
+    """
+    assert is_liquidation_event("HOLD_FILTERED", BlockingReason.MARKET_CLOSED_FREEZE) is False
+    assert is_liquidation_event("HOLD_FILTERED", None) is False
+    assert is_liquidation_event("SELL", BlockingReason.NONE) is True
+
+
+# ---------------------------------------------------------------------------
+# L2.24 -- BlockingReason: one exact label per producer branch
+# ---------------------------------------------------------------------------
+
+
+def _branch_decision(case):
+    """Drive exactly ONE lifecycle branch and return its decision."""
+    cfg = PositionLifecycleConfig(
+        guard_latency_bars=2,
+        min_holding_bars=2,
+        normal_cooldown_bars=1,
+        stop_cooldown_bars=5,
+        inertia_threshold=0.05,
+    )
+    held = dict(state=PositionState.HELD_ACTIVE, held_bars=5, entry_price=10.0, peak_price=11.0,
+                current_weight=0.20)
+
+    if case == "market_closed_freeze":
+        state = AssetLifecycleState(symbol="A", state=PositionState.FLAT, entry_streak=1)
+        return step_position_lifecycle(state, raw_target_weight=0.10, current_price=50.0,
+                                       cfg=cfg, is_market_open=False)
+    if case == "cooldown_blocked":
+        state = AssetLifecycleState(symbol="A", state=PositionState.COOLDOWN, cooldown_remaining=3)
+        return step_position_lifecycle(state, raw_target_weight=0.20, current_price=50.0, cfg=cfg)
+    if case == "exit_confirming":
+        state = AssetLifecycleState(symbol="A", **held)
+        return step_position_lifecycle(state, raw_target_weight=0.0, current_price=10.5, cfg=cfg)
+    if case == "tenure_locked_full_exit":
+        state = AssetLifecycleState(symbol="A", state=PositionState.HELD_GESTATION, held_bars=0,
+                                    entry_price=10.0, peak_price=10.0, current_weight=0.20)
+        return step_position_lifecycle(state, raw_target_weight=0.0, current_price=10.0,
+                                       cfg=cfg, market="china")
+    if case == "tenure_locked_partial_trim":
+        state = AssetLifecycleState(symbol="A", state=PositionState.HELD_GESTATION, held_bars=0,
+                                    entry_price=10.0, peak_price=10.0, current_weight=0.20)
+        return step_position_lifecycle(state, raw_target_weight=0.10, current_price=10.0,
+                                       cfg=cfg, market="china")
+    if case == "min_entry_threshold":
+        state = AssetLifecycleState(symbol="A")  # FLAT
+        return step_position_lifecycle(state, raw_target_weight=0.02, current_price=10.0, cfg=cfg)
+    if case == "pending_entry_confirm":
+        state = AssetLifecycleState(symbol="A")  # FLAT
+        return step_position_lifecycle(state, raw_target_weight=0.20, current_price=10.0, cfg=cfg)
+    if case == "inertia":
+        state = AssetLifecycleState(symbol="A", **held)
+        return step_position_lifecycle(state, raw_target_weight=0.22, current_price=10.5, cfg=cfg)
+    if case == "none_buy":
+        cfg_instant = PositionLifecycleConfig(guard_latency_bars=1, min_holding_bars=1,
+                                             inertia_threshold=0.05)
+        state = AssetLifecycleState(symbol="A")  # FLAT
+        return step_position_lifecycle(state, raw_target_weight=0.20, current_price=10.0,
+                                       cfg=cfg_instant)
+    raise AssertionError(f"unknown branch case: {case}")
+
+
+@pytest.mark.parametrize(
+    "case, expected_action, expected_reason",
+    [
+        # 6 HOLD_FILTERED producers inside the state machine ...
+        ("market_closed_freeze", "HOLD_FILTERED", BlockingReason.MARKET_CLOSED_FREEZE),
+        ("exit_confirming", "HOLD_FILTERED", BlockingReason.EXIT_CONFIRMING),
+        ("tenure_locked_full_exit", "HOLD_FILTERED", BlockingReason.TENURE_LOCKED),
+        ("tenure_locked_partial_trim", "HOLD_FILTERED", BlockingReason.TENURE_LOCKED),
+        ("min_entry_threshold", "HOLD_FILTERED", BlockingReason.MIN_ENTRY_THRESHOLD),
+        ("pending_entry_confirm", "HOLD_FILTERED", BlockingReason.PENDING_ENTRY_CONFIRM),
+        # ... plus the two non-HOLD_FILTERED gates that share the enum.
+        ("cooldown_blocked", "COOLDOWN_BLOCKED", BlockingReason.COOLDOWN_BLOCKED),
+        ("inertia", "HOLD", BlockingReason.INERTIA),
+        # Control: a real order carries no block at all.
+        ("none_buy", "BUY", BlockingReason.NONE),
+    ],
+    ids=[
+        "market_closed_freeze",
+        "exit_confirming",
+        "tenure_locked_full_exit",
+        "tenure_locked_partial_trim",
+        "min_entry_threshold",
+        "pending_entry_confirm",
+        "cooldown_blocked",
+        "inertia",
+        "none_buy",
+    ],
+)
+def test_blocking_reason_is_exact_per_branch(case, expected_action, expected_reason):
+    """Every branch must emit its OWN label -- not merely "something non-NONE".
+
+    Distinguishing power: `HOLD_FILTERED` alone cannot tell "no signal was
+    evaluated" (freeze) from "the entry gate rejected a tiny target"
+    (min-entry) from "a risk gate vetoed a real order" (tenure lock / limit-up /
+    cooldown) -- that ambiguity is exactly what `L2.24` removes. Asserting the
+    exact enum (and not `!= NONE`) is what makes a copy-pasted wrong label fail.
+    """
+    d = _branch_decision(case)
+
+    assert d.action == expected_action
+    assert d.blocking_reason is expected_reason, f"{case}: got {d.blocking_reason}"
+    # ... and the label survives serialization verbatim (JSON-safe string value).
+    assert d.to_dict()["blocking_reason"] == expected_reason.value
+
+
+def test_blocking_reason_defaults_to_none_and_is_serialized():
+    """`LifecycleDecision` gains the field with a NONE default (no ctor churn)."""
+    bare = LifecycleDecision(action="HOLD", target_weight=0.0, reason="空仓维持")
+    assert bare.blocking_reason is BlockingReason.NONE
+    d = bare.to_dict()
+    assert d["blocking_reason"] == "NONE"
+    # Serialized as a plain string, never as "BlockingReason.NONE" -- the ticket
+    # CSV/JSON must carry the enum VALUE.
+    assert json.loads(json.dumps(d))["blocking_reason"] == "NONE"
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (None, BlockingReason.NONE),           # pre-L2.24 archive: column absent
+        ("", BlockingReason.NONE),             # CSV empty cell
+        ("nan", BlockingReason.NONE),          # CSV round-trip of a NaN column
+        ("NONE", BlockingReason.NONE),
+        ("TENURE_LOCKED", BlockingReason.TENURE_LOCKED),
+        (BlockingReason.MARKET_CLOSED_FREEZE, BlockingReason.MARKET_CLOSED_FREEZE),
+        ("SOMETHING_UNKNOWN", BlockingReason.NONE),  # fail open, never raise
+    ],
+)
+def test_coerce_blocking_reason_tolerates_legacy_and_garbage(raw, expected):
+    """Historical archives lack the column; readers must degrade to NONE, not raise."""
+    assert coerce_blocking_reason(raw) is expected
+    assert blocking_reason_label(raw)  # always renderable, never an empty label

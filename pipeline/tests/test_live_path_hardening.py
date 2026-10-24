@@ -73,12 +73,13 @@ def _live_args(
     as_of_date,
     extra=None,
     strategy="equal_weight",
+    out_dir=None,
 ):
     cmd = [
         "--strategy", strategy,
         "--universe-file", universe_file,
         "--account-state-file", state_file,
-        "--output-dir", str(tmp_path),
+        "--output-dir", str(out_dir if out_dir is not None else tmp_path),
         "--as-of-date", as_of_date,
         "--start-date", "2024-01-01",
         "--data-provider", "synthetic",
@@ -696,15 +697,21 @@ def test_execution_phase_ordering_sells_before_buys(tmp_path, patched_weights):
 
 
 # ---------------------------------------------------------------------------
-# resolve_exit_cooldown archive heuristic -- CANCEL_PENDING must never anchor
+# resolve_exit_cooldown archive heuristic -- ONLY `SELL` may anchor a cooldown
+# (2026-10-23 narrowing, development_plan.md L2.21; supersedes the 2026-10-22
+# CANCEL_PENDING-only hotfix)
 # ---------------------------------------------------------------------------
 
 
 def _write_archive_ticket(parent, day, rows):
     """Write `parent/<day>/live_trading_ticket.csv` with the given rows.
 
-    Mirrors the two columns `resolve_exit_cooldown` reads from an archived
-    ticket (`action`, `target_weight`), nothing more.
+    Mirrors the columns an archived ticket row carries (`action`,
+    `target_weight`, optional `current_shares` / `target_shares` / `reason` /
+    `blocking_reason`). Since L2.22 the anchor verdict reads `action` AND the
+    post-fill share count, so a fixture that means "a real liquidation" should
+    carry `target_shares: 0` and one that means "a trim" should carry the shares
+    still held; omitting the column entirely is the legacy-tolerance shape.
     """
     day_dir = parent / day
     day_dir.mkdir(parents=True, exist_ok=True)
@@ -742,20 +749,26 @@ def _resolve_with_calendar_recorder(monkeypatch, symbols, output_dir, as_of_date
 
 
 def test_cancel_pending_row_never_anchors_exit_cooldown(tmp_path, monkeypatch):
-    """REGRESSION: a CANCEL_PENDING record must not push the anchor one day later.
+    """REGRESSION: a CANCEL_PENDING record must never SHADOW a genuine day-1 `SELL`.
 
     2026-10-22 incident side effect (found in review): CANCEL_PENDING rows are
-    now ARCHIVED (previously such rows were dropped as NO_POSITION), and they
-    carry `target_weight == 0.0`. The archive heuristic used to read that as a
-    full exit, anchoring a cooldown for a symbol that was NEVER held -- and, being
-    the newest matching date, it SHADOWED the genuine day-1 exit anchor, moving
-    it one day forward and keeping the symbol in COOLDOWN an extra day.
+    ARCHIVED (previously such rows were dropped as NO_POSITION) and carry
+    `target_weight == 0.0`; the archive heuristic used to read that as a full exit
+    for a symbol that was NEVER held and, being the newest matching date, it
+    SHADOWED a genuine exit anchor, moving it one day forward.
 
-    Without the fix this resolves to day 2 (CANCEL_PENDING), so it cannot pass
-    vacuously: the assertion pins the older date that only a correct skip yields.
+    NOTE (2026-10-23, L2.21): the anchor condition is now `action == "SELL"` only,
+    so the old shape of this test -- a day-1 `HOLD_FILTERED` with `tgt_w == 0.0`
+    anchoring the cooldown -- is exactly the phantom anchor that got removed, and
+    such a fixture would (correctly) anchor nothing. The regression intent is kept
+    by anchoring day 1 with a REAL `SELL` instead: "cancel must not shadow a real
+    exit". This one passes before AND after the narrowing by design (it pins
+    CANCEL_PENDING transparency, not the phantom removal -- the phantom cases are
+    covered by the parametrized `test_non_sell_zero_target_rows_never_anchor_cooldown`
+    below, which DOES fail on the pre-narrowing implementation).
     """
     day1, day2, as_of = "2024-05-09", "2024-05-10", "2024-05-13"
-    _write_archive_ticket(tmp_path, day1, [{"symbol": "AAA", "action": "HOLD_FILTERED", "target_weight": 0.0}])
+    _write_archive_ticket(tmp_path, day1, [{"symbol": "AAA", "action": "SELL", "target_weight": 0.0}])
     _write_archive_ticket(tmp_path, day2, [{"symbol": "AAA", "action": "CANCEL_PENDING", "target_weight": 0.0}])
 
     exit_bars, seen = _resolve_with_calendar_recorder(
@@ -765,6 +778,64 @@ def test_cancel_pending_row_never_anchors_exit_cooldown(tmp_path, monkeypatch):
     assert seen, "the day-1 anchor must reach the calendar call (else the check is vacuous)"
     assert seen == [pd.Timestamp(day1).date()], f"resolved anchor must be day1, got {seen}"
     assert exit_bars["AAA"] == 0
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        # 1) min-entry-threshold filter -- `common/position_lifecycle.py:458`
+        #    returns HOLD_FILTERED with target_weight == 0.0 when the raw target
+        #    is below `min_entry_threshold`, i.e. the symbol was never bought.
+        "目标仓位未达最低建仓/调仓门槛 (目标 0.4% < 门槛 1%，防微量试错损耗)",
+        # 2) PENDING_ENTRY confirmation window -- `position_lifecycle.py:543`
+        #    holds 0% while the entry signal is still being confirmed.
+        "开仓/再入场信号进入确认期 (第 1/2 日待确认，防脉冲假突破)",
+        # 3) market-closed freeze while flat -- `position_lifecycle.py` freeze branch
+        #    writes `target_weight = state.current_weight`, which is 0.0 when flat.
+        #    (Text updated for L2.23: the freeze reason now says "未评估任何信号"
+        #    instead of "冻结维持" -- the label-independence point is unchanged.)
+        "非交易日/休市日：休市冻结，未评估任何信号(状态机、确认期、锁定期与冷却期计数器全部冻结，无任何交易指令)",
+    ],
+    ids=["min_entry_threshold", "pending_entry_confirm", "market_closed_flat"],
+)
+def test_non_sell_zero_target_rows_never_anchor_cooldown(tmp_path, monkeypatch, reason):
+    """A non-`SELL`, zero-target archive row must never anchor the re-entry cooldown.
+
+    HONEST SCOPE NOTE (L2.21) -- read this before counting the parametrization as
+    extra coverage. The three `reason` strings are produced by three genuinely
+    different upstream branches (min-entry threshold, PENDING_ENTRY confirmation,
+    market-closed freeze while flat), but they all reach `resolve_exit_cooldown`
+    as the SAME archived ticket shape -- `action == "HOLD_FILTERED"`,
+    `target_weight == 0.0` -- and the narrowed anchor condition
+    (`scripts/run_live_strategy.py:565`) reads `action` ONLY: never `reason`,
+    never `target_weight`. This is therefore ONE code path exercised three times.
+    The parametrization proves LABEL INDEPENDENCE (no `reason` text can
+    resurrect a phantom anchor), NOT three distinct mechanisms; it is one
+    regression guard, not three.
+
+    Pre-2026-10-23 the heuristic anchored on `tgt_w == 0.0`, so every case here
+    FAILED -- the symbol was pinned to COOLDOWN -> HOLD_FILTERED right before
+    Phase 2 would buy it. Today the `default_bars` fallback (999 = cooling down
+    is disabled) wins.
+    """
+    day1, as_of = "2024-05-09", "2024-05-13"
+    _write_archive_ticket(
+        tmp_path,
+        day1,
+        [{
+            "symbol": "AAA",
+            "action": "HOLD_FILTERED",
+            "target_weight": 0.0,
+            "reason": reason,
+        }],
+    )
+
+    exit_bars, seen = _resolve_with_calendar_recorder(
+        monkeypatch, ["AAA"], tmp_path / as_of, as_of, default_bars=999
+    )
+
+    assert seen == [], f"a non-SELL zero-target row must not anchor, got {seen} (reason={reason})"
+    assert exit_bars["AAA"] == 999
 
 
 def test_sell_row_still_anchors_at_newest_date(tmp_path, monkeypatch):
@@ -782,13 +853,745 @@ def test_sell_row_still_anchors_at_newest_date(tmp_path, monkeypatch):
 
 
 def test_cancel_pending_only_archive_leaves_symbol_unanchored(tmp_path, monkeypatch):
-    """A lone CANCEL_PENDING archive row anchors nothing -> `default_bars` fallback."""
-    day1, as_of = "2024-05-09", "2024-05-13"
+    """A lone CANCEL_PENDING archive row anchors nothing -> `default_bars` fallback.
+
+    Strengthened for L2.21 so it is not vacuous on the narrowed condition: the
+    same archive also holds an OLDER `SELL`, so "anchors nothing" can only mean
+    "the CANCEL_PENDING row was skipped", and the follow-up assertion pins that
+    the older `SELL` is the one that wins. (The lone-CANCEL_PENDING half is the
+    2026-10-22 hotfix guard -- it passed before this narrowing too, by design.)
+    """
+    day0, day1, as_of = "2024-05-08", "2024-05-09", "2024-05-13"
+    _write_archive_ticket(tmp_path, day0, [{"symbol": "AAA", "action": "SELL", "target_weight": 0.0}])
     _write_archive_ticket(tmp_path, day1, [{"symbol": "AAA", "action": "CANCEL_PENDING", "target_weight": 0.0}])
 
     exit_bars, seen = _resolve_with_calendar_recorder(
         monkeypatch, ["AAA"], tmp_path / as_of, as_of, default_bars=999
     )
 
-    assert seen == [], f"a never-held symbol must not produce an exit anchor, got {seen}"
+    assert seen == [pd.Timestamp(day0).date()], (
+        f"the CANCEL_PENDING row must be transparent and the older SELL must anchor, got {seen}"
+    )
+    assert exit_bars["AAA"] == 0
+
+    # And with NO `SELL` anywhere: nothing anchors at all.
+    only_cancel = tmp_path / "cancel_only"
+    _write_archive_ticket(only_cancel, day1, [{"symbol": "AAA", "action": "CANCEL_PENDING", "target_weight": 0.0}])
+
+    exit_bars2, seen2 = _resolve_with_calendar_recorder(
+        monkeypatch, ["AAA"], only_cancel / as_of, as_of, default_bars=999
+    )
+
+    assert seen2 == [], f"a never-held symbol must not produce an exit anchor, got {seen2}"
+    assert exit_bars2["AAA"] == 999
+
+
+# ---------------------------------------------------------------------------
+# L2.22 (decided 2026-10-23) -- only a FULL liquidation anchors the re-entry
+# cooldown; a partial trim, and a market-closed freeze, must never restart it.
+#
+# PRODUCT RULING (verbatim): "不锚定。只有持仓清零才算退出。部分减仓不重置冷却期。"
+# So the anchor needs three independent facts at once:
+#   (a) a real SELL executed            -- `is_liquidation_event`,
+#   (b) the position is GONE afterwards -- post-trade shares == 0 (share truth),
+#   (c) the row was EVALUATED           -- `blocking_reason != MARKET_CLOSED_FREEZE`.
+# `target_weight == 0.0` may NEVER be reverse-read as a liquidation again.
+# ---------------------------------------------------------------------------
+
+
+def _synthetic_close(symbol, as_of="2024-05-10"):
+    """Deterministic synthetic last close -- offline, no network."""
+    df = SyntheticDataProvider().fetch_ohlcv(symbol, "2024-01-01", as_of)
+    return float(df["Close"].iloc[-1])
+
+
+def _l222_weight(symbol, shares, nav=100000.0, as_of="2024-05-10"):
+    """Target weight that corresponds to holding exactly `shares` of `symbol`."""
+    return (shares * _synthetic_close(symbol, as_of)) / nav
+
+
+def _l222_run(
+    tmp_path,
+    patched_weights,
+    as_of,
+    weights,
+    held_shares,
+    state_file,
+    extra=None,
+    out_dir=None,
+):
+    """One offline live-runner invocation with a fixed brokerage holding."""
+    from scripts.run_live_strategy import main as live_main
+
+    universe_file = _write_universe(tmp_path, ["600000.SH", "601398.SH", "BIL"])
+    holdings_file = _write_json(
+        tmp_path, f"holdings_{as_of}.json", {"600000.SH": held_shares}
+    )
+    patched_weights(weights)
+    args = _live_args(
+        tmp_path,
+        universe_file,
+        state_file,
+        as_of,
+        extra=["--current-holdings-file", holdings_file] + list(extra or []),
+        out_dir=out_dir,
+    )
+    return live_main(args)
+
+
+def _l222_state(state_file):
+    with open(state_file) as f:
+        return json.load(f)
+
+
+def test_partial_trim_does_not_anchor_reentry_cooldown(tmp_path, patched_weights):
+    """L2.22 case 1: hold 1000 -> sell down to 600 (still held) => cooldown NOT reset.
+
+    Two anchor paths are checked, because a partial trim can leak into either:
+
+      1. the ticket-writing site (`last_exit_date` in `account_state.json`) --
+         MUST stay empty;
+      2. the ARCHIVE reconstruction on the next run (`resolve_exit_cooldown` scans
+         day-1's `live_trading_ticket.csv`, which holds `action == "SELL"` with
+         `target_shares == 600`). Under the pre-L2.22 reader that row anchored a
+         cooldown dated day 1 and the day-2 ticket reported
+         `bars_since_exit == 1`; the fix requires zero post-fill shares, so day 2
+         must fall back to the "no known exit" sentinel (999).
+
+    OLD IMPLEMENTATION: path 2 FAILED -- `bars_since_exit` was 1 (anchored on the
+    day-1 PARTIAL trim), i.e. the still-held asset's cooldown clock was restarted.
+    Path 1 could not fail on the old code because a partial trim carries
+    `target_shares > 0` and therefore never entered the zero-target anchor branch;
+    it is pinned here as the semantic guard the ruling actually asks for.
+    """
+    state_file = str(tmp_path / "account_state.json")
+    _write_json(tmp_path, "account_state.json", {"holding_bars": {"600000.SH": 10}})
+    day1, day2 = "2024-05-10", "2024-05-13"
+
+    w1 = _l222_weight("600000.SH", 600, as_of=day1)
+    order_df = _l222_run(
+        tmp_path,
+        patched_weights,
+        day1,
+        {"600000.SH": w1, "601398.SH": 0.0, "BIL": 1.0 - w1},
+        1000,
+        state_file,
+        extra=["--exit-confirm-bars", "1"],
+        out_dir=tmp_path / day1,
+    )
+
+    row = order_df[order_df["symbol"] == "600000.SH"].iloc[0]
+    assert row["action"] == "SELL", f"expected a real trim SELL, got {row['action']}"
+    assert int(row["current_shares"]) == 1000
+    # The position did NOT go to zero: this is a partial de-risking, not an exit.
+    assert int(row["delta_shares"]) == -400, f"expected -400 shares, got {row['delta_shares']}"
+    assert int(row["target_shares"]) == 600
+    assert float(row["target_weight"]) > 0.0
+
+    st = _l222_state(state_file)
+    assert st["last_exit_date"] == {}, (
+        "a partial trim must NOT anchor the re-entry cooldown "
+        f"(got {st['last_exit_date']})"
+    )
+    assert st["exit_bars_ago"] == {}, (
+        "no exit anchor => nothing to resolve bars-since-exit for "
+        f"(got {st['exit_bars_ago']})"
+    )
+    assert st["lifecycle_states"]["600000.SH"]["state"] != "COOLDOWN"
+
+    # The day-1 archive really does hold the ambiguous shape this test is about --
+    # otherwise the day-2 assertion below would be vacuous.
+    archived = pd.read_csv(tmp_path / day1 / "live_trading_ticket.csv")
+    arch_row = archived[archived["symbol"] == "600000.SH"].iloc[0]
+    assert arch_row["action"] == "SELL"
+    assert int(arch_row["target_shares"]) == 600
+
+    # --- day 2: the archived partial trim must NOT be reconstructed as an exit ---
+    w2 = _l222_weight("600000.SH", 600, as_of=day2)
+    day2_df = _l222_run(
+        tmp_path,
+        patched_weights,
+        day2,
+        {"600000.SH": w2, "601398.SH": 0.0, "BIL": 1.0 - w2},
+        600,
+        state_file,
+        extra=["--exit-confirm-bars", "1"],
+        out_dir=tmp_path / day2,
+    )
+    day2_row = day2_df[day2_df["symbol"] == "600000.SH"].iloc[0]
+    cooldown = day2_row["detail_reason"]["cooldown_status"]
+    assert int(cooldown["bars_since_exit"]) == 999, (
+        "the day-1 PARTIAL trim was reconstructed as an exit anchor: "
+        f"bars_since_exit={cooldown['bars_since_exit']}"
+    )
+    assert bool(cooldown["in_cooldown"]) is False
+    assert _l222_state(state_file)["last_exit_date"] == {}
+
+
+def test_archived_partial_trim_never_anchors_cooldown(tmp_path, monkeypatch):
+    """L2.22 (archive path): a `SELL` that still HOLDS shares must not anchor.
+
+    An archived partial de-risking row is indistinguishable from a liquidation by
+    `action` alone -- both are `SELL`. Only the recorded post-fill quantity
+    (`target_shares`) separates them, so the archive reader must require zero.
+    OLD IMPLEMENTATION: this anchored (the SELL-only verdict) -> `seen == [day1]`
+    and `exit_bars == 0` instead of the "no known exit" fallback.
+    """
+    day1, as_of = "2024-05-09", "2024-05-13"
+    _write_archive_ticket(
+        tmp_path,
+        day1,
+        [{
+            "symbol": "AAA",
+            "action": "SELL",
+            "current_shares": 1000,
+            "target_shares": 600,   # 400 shares still held -> a trim, not an exit
+            "target_weight": 0.28,
+            "blocking_reason": "NONE",
+        }],
+    )
+
+    exit_bars, seen = _resolve_with_calendar_recorder(
+        monkeypatch, ["AAA"], tmp_path / as_of, as_of, default_bars=999
+    )
+
+    assert seen == [], f"a partial trim must not anchor, got {seen}"
     assert exit_bars["AAA"] == 999
+
+
+def test_archived_partial_trim_never_shadows_an_older_full_exit(tmp_path, monkeypatch):
+    """L2.22 (archive path): a newer partial trim must not move the anchor forward.
+
+    The scan is newest-first, so a trim that "anchored" would hide the genuine
+    older liquidation and shorten the elapsed cooldown to one day.
+    """
+    day0, day1, as_of = "2024-05-08", "2024-05-09", "2024-05-13"
+    _write_archive_ticket(
+        tmp_path, day0,
+        [{"symbol": "AAA", "action": "SELL", "current_shares": 1000, "target_shares": 0,
+          "target_weight": 0.0}],
+    )
+    _write_archive_ticket(
+        tmp_path, day1,
+        [{"symbol": "AAA", "action": "SELL", "current_shares": 500, "target_shares": 300,
+          "target_weight": 0.14}],
+    )
+
+    exit_bars, seen = _resolve_with_calendar_recorder(
+        monkeypatch, ["AAA"], tmp_path / as_of, as_of, default_bars=999
+    )
+
+    assert seen == [pd.Timestamp(day0).date()], (
+        f"the FULL exit on {day0} must own the anchor, got {seen}"
+    )
+    assert exit_bars["AAA"] == 0
+
+
+def test_archived_sell_without_share_columns_keeps_legacy_anchor(tmp_path, monkeypatch):
+    """Legacy tolerance: an archive with no `target_shares` column still anchors.
+
+    The column predates the heuristic, so this is a broken/partial-file tolerance
+    path. Direction matters: an unverifiable row keeps the pre-L2.22 "SELL anchors"
+    verdict -- silently dropping a genuine exit anchor would DISABLE a real
+    cooldown, which is the riskier failure.
+    """
+    day0, as_of = "2024-05-08", "2024-05-13"
+    _write_archive_ticket(
+        tmp_path, day0,
+        [{"symbol": "AAA", "action": "SELL", "target_weight": 0.0}],
+    )
+
+    exit_bars, seen = _resolve_with_calendar_recorder(
+        monkeypatch, ["AAA"], tmp_path / as_of, as_of, default_bars=999
+    )
+
+    assert seen == [pd.Timestamp(day0).date()]
+    assert exit_bars["AAA"] == 0
+
+
+def test_full_liquidation_still_anchors_reentry_cooldown(tmp_path, patched_weights):
+    """L2.22 case 2 (NO REGRESSION): hold 1000 -> sell ALL => cooldown RESETS.
+
+    The ruling must not disable the cooldown's actual purpose. `SELL` + shares
+    after == 0 anchors exactly as before, so the anti-whipsaw brake still works.
+    """
+    state_file = str(tmp_path / "account_state.json")
+    _write_json(tmp_path, "account_state.json", {"holding_bars": {"600000.SH": 10}})
+
+    order_df = _l222_run(
+        tmp_path,
+        patched_weights,
+        "2024-05-10",
+        {"600000.SH": 0.0, "601398.SH": 0.0, "BIL": 1.0},
+        1000,
+        state_file,
+        extra=["--guard-latency-bars", "1"],
+    )
+
+    row = order_df[order_df["symbol"] == "600000.SH"].iloc[0]
+    assert row["action"] == "SELL"
+    assert int(row["current_shares"]) == 1000
+    assert int(row["target_shares"]) == 0  # the independent "position is gone" fact
+    assert row["blocking_reason"] == "NONE"
+
+    st = _l222_state(state_file)
+    assert st["last_exit_date"] == {"600000.SH": "2024-05-10"}
+    assert st["exit_bars_ago"] == {"600000.SH": 0}
+    assert st["lifecycle_states"]["600000.SH"]["state"] == "COOLDOWN"
+
+
+@pytest.mark.parametrize(
+    "action, blocking_reason, shares_before, shares_after",
+    [
+        # Held symbol on a closed session: the freeze branch carries the current
+        # weight, and for a flat symbol that is 0.0. NOT an exit.
+        ("HOLD_FILTERED", "MARKET_CLOSED_FREEZE", 500, 0),
+        # Flat symbol on a closed session -- nothing was evaluated at all.
+        ("HOLD_FILTERED", "MARKET_CLOSED_FREEZE", 0, 0),
+        # A gated row that happens to carry a zero target is not an exit either.
+        ("HOLD_FILTERED", "MIN_ENTRY_THRESHOLD", 0, 0),
+        ("HOLD_FILTERED", "EXIT_CONFIRMING", 500, 500),
+        ("CANCEL_PENDING", "NONE", 0, 0),
+    ],
+    ids=["freeze-held", "freeze-flat", "min-entry", "exit-confirming", "cancel-pending"],
+)
+def test_zero_target_rows_never_anchor_reentry_cooldown(
+    action, blocking_reason, shares_before, shares_after
+):
+    """L2.22 case 3: a freeze / gated / record row never anchors -- regardless of weight.
+
+    The `freeze-held` case is the one with teeth: `(HOLD_FILTERED,
+    MARKET_CLOSED_FREEZE, 500 shares -> 0)` satisfies the OLD inline anchor
+    (`cur_sh > 0 and (act == "SELL" or tgt_sh == 0)`) purely through its
+    `tgt_sh == 0` leg, i.e. it reverse-inferred "liquidated" from a zero target
+    share count for a session in which NOTHING ran. It must be False.
+    """
+    from scripts.run_live_strategy import should_anchor_reentry_cooldown
+
+    assert (
+        should_anchor_reentry_cooldown(action, blocking_reason, shares_before, shares_after)
+        is False
+    ), f"({action}, {blocking_reason}) must never anchor a re-entry cooldown"
+
+
+def test_market_closed_run_tickets_frozen_rows_without_anchoring_cooldown_l222(
+    tmp_path, patched_weights, capsys
+):
+    """L2.22 case 3 (end-to-end): a closed session anchors nothing, held or flat.
+
+    Same offline freeze fixture as L2.23's test, now with a HELD symbol too. The
+    held row carries `target_shares == current_shares` (the freeze branch trades
+    nothing), so the practical damage of the old code here was nil -- which is
+    exactly why the row-level parametrization above, not this end-to-end run, is
+    the one that fails on the old implementation. This still pins the contract at
+    the ticket/account-state level: not one closed-session row may write
+    `last_exit_date`.
+    """
+    from unittest.mock import patch
+
+    state_file = str(tmp_path / "account_state.json")
+    _write_json(tmp_path, "account_state.json", {"holding_bars": {"600000.SH": 10}})
+
+    from scripts.run_live_strategy import main as live_main
+
+    universe_file = _write_universe(tmp_path, ["600000.SH", "601398.SH", "BIL"])
+    holdings_file = _write_json(tmp_path, "holdings_freeze.json", {"600000.SH": 500})
+    patched_weights({"600000.SH": 0.10, "601398.SH": 0.004, "BIL": 0.896})
+    args = _live_args(
+        tmp_path,
+        universe_file,
+        state_file,
+        "2024-05-10",
+        extra=["--current-holdings-file", holdings_file, "--allow-stale-prices"],
+    )
+    with patch.object(SyntheticDataProvider, "fetch_ohlcv", _truncate_every_bar()):
+        order_df = live_main(args)
+    capsys.readouterr()
+
+    equity = order_df[order_df["symbol"] != "BIL"]
+    assert set(equity["blocking_reason"]) == {"MARKET_CLOSED_FREEZE"}
+    held_row = equity[equity["symbol"] == "600000.SH"].iloc[0]
+    assert int(held_row["current_shares"]) == 500
+    assert int(held_row["delta_shares"]) == 0  # frozen: no trade
+    assert int(held_row["target_shares"]) == 500
+
+    st = _l222_state(state_file)
+    assert st["last_exit_date"] == {}, (
+        f"a market-closed freeze must not anchor any exit (got {st['last_exit_date']})"
+    )
+    assert st["exit_bars_ago"] == {}
+
+
+def test_repeated_partial_trims_anchor_only_on_the_final_full_exit(tmp_path, patched_weights):
+    """L2.22 case 4: 1000 -> 800 -> 600 -> 0; ONLY the last trade anchors.
+
+    Cumulative de-risking must not sneak an anchor in through the smaller trims
+    either: the cooldown clock restarts on the day the position is finally gone,
+    not on the last day the book was merely smaller. Each run writes its own
+    date-named archive directory, so the following run reconstructs cooldowns from
+    the real archived tickets: every partial-trim day must report the "no known
+    exit" sentinel (`bars_since_exit == 999`), and only the final full exit may
+    stamp `last_exit_date`.
+
+    OLD IMPLEMENTATION: run 2 already reported `bars_since_exit == 1` (run 1's
+    partial `SELL` row was reconstructed as an exit), so the cooldown restarted
+    on the first trim.
+    """
+    state_file = str(tmp_path / "account_state.json")
+    _write_json(tmp_path, "account_state.json", {"holding_bars": {"600000.SH": 10}})
+
+    steps = [
+        # (as_of, held before, target shares held after, expect anchor?)
+        ("2024-05-10", 1000, 800, False),
+        ("2024-05-13", 800, 600, False),
+        ("2024-05-14", 600, 0, True),
+    ]
+    for as_of, held, target, anchors in steps:
+        weight = _l222_weight("600000.SH", target, as_of=as_of)
+        order_df = _l222_run(
+            tmp_path,
+            patched_weights,
+            as_of,
+            {"600000.SH": weight, "601398.SH": 0.0, "BIL": 1.0 - weight},
+            held,
+            state_file,
+            extra=["--exit-confirm-bars", "1"],
+            out_dir=tmp_path / as_of,
+        )
+        row = order_df[order_df["symbol"] == "600000.SH"].iloc[0]
+        assert row["action"] == "SELL", f"{as_of}: expected SELL, got {row['action']}"
+        assert int(row["current_shares"]) == held
+        assert int(row["target_shares"]) == target
+
+        # Pre-trade view: prior partial trims must not have been reconstructed as
+        # exits (999 == "no known exit"; the cooldown is therefore not running).
+        cooldown = row["detail_reason"]["cooldown_status"]
+        assert int(cooldown["bars_since_exit"]) == 999, (
+            f"{as_of}: an EARLIER partial trim anchored a cooldown, "
+            f"bars_since_exit={cooldown['bars_since_exit']}"
+        )
+        if not anchors:
+            # A trimmed-but-still-held asset must not be parked in COOLDOWN (the
+            # final run legitimately enters it, having just liquidated).
+            assert bool(cooldown["in_cooldown"]) is False
+
+        st = _l222_state(state_file)
+        if anchors:
+            assert st["last_exit_date"] == {"600000.SH": as_of}, (
+                f"{as_of}: the FINAL full exit must anchor, got {st['last_exit_date']}"
+            )
+            assert st["exit_bars_ago"] == {"600000.SH": 0}
+        else:
+            assert st["last_exit_date"] == {}, (
+                f"{as_of}: the partial trim {held}->{target} must NOT anchor, "
+                f"got {st['last_exit_date']}"
+            )
+            assert st["exit_bars_ago"] == {}, (
+                f"{as_of}: a partial trim must leave no bars-since-exit anchor"
+            )
+
+
+# ---------------------------------------------------------------------------
+# L2.23 / L2.24 -- market-closed freeze semantics + BlockingReason on the ticket
+# ---------------------------------------------------------------------------
+
+
+def _truncate_every_bar():
+    """Patch helper: make EVERY symbol's series stop one session early.
+
+    With no symbol holding an `as_of_date` bar, `has_market_bars` is False and the
+    runner's `is_market_open` resolves to False -- i.e. this reproduces the
+    non-trading-day path end-to-end (banner only, no early return). Prices are
+    therefore stale by construction, which is what `--allow-stale-prices` exists
+    for; the run must still produce a fully-formed ticket.
+    """
+    orig_fetch = SyntheticDataProvider.fetch_ohlcv
+
+    def mock_fetch(self, sym, start, end, interval="1d"):
+        df = orig_fetch(self, sym, start, end, interval)
+        if len(df) >= 2:
+            df = df.iloc[:-1]
+        return df
+
+    return mock_fetch
+
+
+def test_market_closed_run_tickets_frozen_rows_without_anchoring_cooldown(
+    tmp_path, patched_weights, capsys
+):
+    """L2.23 end-to-end: a closed session still archives the row -- as "not evaluated".
+
+    Four defects this pins (all real, all verified by reading the prior code):
+
+    1. the frozen row used to reach the archive at all (it does: the banner at
+       `:1401` does not `return`, and NO_POSITION reclassification does not
+       whitelist `HOLD_FILTERED`) -- so its WORDING is the only thing standing
+       between "market was shut" and "the model decided to keep/flat this";
+    2. the script-level min-entry relabel used to overwrite the freeze decision
+       on a closed day with a SIGNAL-filter story for any symbol whose target sat
+       below the threshold -- claiming a signal was evaluated when none was;
+    3. the freeze row must not anchor the re-entry cooldown;
+    4. Phase 3 must not render a flat frozen row as "⚪ HOLD ... 维持仓位 0.0%".
+    """
+    from unittest.mock import patch
+
+    from scripts.run_live_strategy import main as live_main
+
+    universe_file = _write_universe(tmp_path, ["600000.SH", "601857.SH", "BIL"])
+    holdings_file = _write_json(tmp_path, "holdings.json", {"600000.SH": 5000, "BIL": 50000})
+    state_file = str(tmp_path / "account_state.json")
+
+    # 601857.SH's target (0.4%) is deliberately BELOW the 5% min-entry threshold:
+    # on a closed day the freeze must still win the label (nothing was evaluated).
+    patched_weights({"600000.SH": 0.10, "601857.SH": 0.004, "BIL": 0.896})
+    args = _live_args(
+        tmp_path,
+        universe_file,
+        state_file,
+        _AS_OF_SECOND,
+        extra=["--current-holdings-file", holdings_file, "--allow-stale-prices"],
+    )
+
+    with patch.object(SyntheticDataProvider, "fetch_ohlcv", _truncate_every_bar()):
+        order_df = live_main(args)
+
+    out = capsys.readouterr().out
+    assert "MARKET CLOSED" in out  # the banner ran ...
+    # ... and did NOT abort the run: every equity row survived into the ticket
+    # (no NO_POSITION fold, no silent drop).
+    equity = order_df[order_df["symbol"] != "BIL"]
+    assert set(equity["symbol"]) == {"600000.SH", "601857.SH"}
+    assert set(equity["action"]) == {"HOLD_FILTERED"}
+    # (1)+(2): the exact label, for BOTH the held and the flat symbol.
+    assert set(equity["blocking_reason"]) == {"MARKET_CLOSED_FREEZE"}
+    flat_row = equity[equity["symbol"] == "601857.SH"].iloc[0]
+    assert "未达最低建仓" not in flat_row["reason"]
+    assert "未评估任何信号" in flat_row["reason"]
+    # Freeze = carry the current weight, never a trade.
+    held_row = equity[equity["symbol"] == "600000.SH"].iloc[0]
+    assert float(held_row["target_weight"]) == pytest.approx(float(held_row["current_weight"]))
+    assert int(held_row["delta_shares"]) == 0
+    assert int(flat_row["delta_shares"]) == 0
+
+    # (3) No cooldown anchor: nothing was sold, so `last_exit_date` stays empty and
+    # the resolved "bars since exit" stays at the "no known exit" fallback.
+    with open(state_file) as f:
+        st = json.load(f)
+    assert st["last_exit_date"] == {}
+    # `resolve_exit_cooldown` is only consulted for symbols that DO have an
+    # anchor, so an empty map here is the machine-readable proof that not a
+    # single closed-session row armed a 2-trading-day cooldown.
+    assert st["exit_bars_ago"] == {}
+
+    # (4) Display: the frozen rows get their own "not evaluated" block, and a flat
+    # frozen row is never printed as a maintained position.
+    assert "PHASE 3a" in out
+    assert "休市未评估" in out
+    frozen_lines = [ln for ln in out.splitlines() if "601857.SH" in ln and "休市未评估" in ln]
+    assert frozen_lines, "the flat frozen row must be printed with its own semantics"
+    assert all("维持" not in ln for ln in frozen_lines)
+    assert not any("⚪ HOLD" in ln and "601857.SH" in ln for ln in out.splitlines())
+
+    # Archive on disk carries the structured verdict (trailing CSV column + JSON key).
+    csv_df = pd.read_csv(tmp_path / "live_trading_ticket.csv")
+    assert "blocking_reason" in csv_df.columns
+    assert list(csv_df.columns)[-1] == "blocking_reason"
+    assert set(csv_df[csv_df["symbol"] != "BIL"]["blocking_reason"]) == {"MARKET_CLOSED_FREEZE"}
+    with open(tmp_path / "live_trading_ticket.json") as f:
+        records = json.load(f)
+    assert all("blocking_reason" in rec for rec in records)
+
+
+def test_open_day_ticket_carries_blocking_reason_per_branch(tmp_path, patched_weights):
+    """L2.24: an ordinary run labels each gated row with its own branch."""
+    row = None
+    order_df, _state_file, _u, _h = _run_pending_entry_day_one(tmp_path, patched_weights)
+    row = order_df[order_df["symbol"] == "601857.SH"].iloc[0]
+
+    # PENDING_ENTRY confirmation window (`position_lifecycle.py` branch), NOT a
+    # market freeze and NOT a min-entry filter.
+    assert row["action"] == "HOLD_FILTERED"
+    assert row["blocking_reason"] == "PENDING_ENTRY_CONFIRM"
+    # It is also mirrored inside the structured audit block, so a reader that only
+    # keeps `detail_reason` sees the same verdict.
+    assert row["detail_reason"]["blocking_reason"] == "PENDING_ENTRY_CONFIRM"
+
+    csv_df = pd.read_csv(tmp_path / "live_trading_ticket.csv")
+    assert list(csv_df.columns)[-1] == "blocking_reason"
+    csv_row = csv_df[csv_df["symbol"] == "601857.SH"].iloc[0]
+    assert csv_row["blocking_reason"] == "PENDING_ENTRY_CONFIRM"
+
+
+def test_pre_l2_24_archive_without_blocking_reason_column_still_anchors(tmp_path, monkeypatch):
+    """Legacy archive (no `blocking_reason` column) must read, and still anchor on SELL.
+
+    A reader that indexed `row["blocking_reason"]` would raise `KeyError` on a
+    pre-L2.24 ticket -- and because the scan site sits inside
+    `try/except Exception: pass`, the failure would be SILENT: the symbol would
+    simply lose its genuine anchor and the 2-day cooldown would not arm. This
+    fixture mixes both formats in one archive to prove the tolerant read.
+    """
+    day0, day1, as_of = "2024-05-08", "2024-05-09", "2024-05-13"
+    # Pre-L2.24 shape: 4 columns, no `blocking_reason`.
+    _write_archive_ticket(
+        tmp_path,
+        day0,
+        [{
+            "symbol": "AAA",
+            "action": "SELL",
+            "target_weight": 0.0,
+            "reason": "策略模型平仓信号持续 2 日确认生效",
+        }],
+    )
+    # New shape: the freeze note carries an explicit label and a 0.0 target.
+    _write_archive_ticket(
+        tmp_path,
+        day1,
+        [{
+            "symbol": "AAA",
+            "action": "HOLD_FILTERED",
+            "target_weight": 0.0,
+            "reason": "非交易日/休市日：休市冻结，未评估任何信号",
+            "blocking_reason": "MARKET_CLOSED_FREEZE",
+        }],
+    )
+
+    exit_bars, seen = _resolve_with_calendar_recorder(
+        monkeypatch, ["AAA"], tmp_path / as_of, as_of, default_bars=999
+    )
+
+    # The legacy SELL still anchors (proves the missing column did not abort the read) ...
+    assert seen == [pd.Timestamp(day0).date()], (
+        f"a pre-L2.24 archive row must still anchor on SELL, got {seen}"
+    )
+    assert exit_bars["AAA"] == 0
+    # ... and the explicit freeze label never promotes a HOLD_FILTERED row into an anchor.
+    newer = tmp_path / "freeze_only"
+    _write_archive_ticket(
+        newer,
+        day1,
+        [{
+            "symbol": "AAA",
+            "action": "HOLD_FILTERED",
+            "target_weight": 0.0,
+            "blocking_reason": "MARKET_CLOSED_FREEZE",
+        }],
+    )
+    exit_bars2, seen2 = _resolve_with_calendar_recorder(
+        monkeypatch, ["AAA"], newer / as_of, as_of, default_bars=999
+    )
+    assert seen2 == [], f"a market-closed freeze row must not anchor, got {seen2}"
+    assert exit_bars2["AAA"] == 999
+
+
+# ---------------------------------------------------------------------------
+# L2.25 -- consumers read `action` + `blocking_reason`, never `target_weight == 0`
+# ---------------------------------------------------------------------------
+
+
+def test_phase3_gated_row_renders_its_blocking_label_not_a_held_position(
+    tmp_path, patched_weights, capsys
+):
+    """A gated row must not be painted as "⚪ HOLD 维持仓位" (display half of the bug).
+
+    L2.23 removed the *frozen* rows from that wording. The other zero-target
+    family is identical in shape: a PENDING_ENTRY confirmation row writes
+    `target_weight = 0.0` having traded nothing, and a flat symbol then used to be
+    printed as "维持仓位: 0.0%" -- i.e. "we still hold 0%". Phase 3 now renders the
+    structured blocking label instead, and only claims "持仓不变" when shares are
+    actually held.
+    """
+    order_df, _state, _u, _h = _run_pending_entry_day_one(tmp_path, patched_weights)
+    out = capsys.readouterr().out
+
+    row = order_df[order_df["symbol"] == "601857.SH"].iloc[0]
+    assert row["action"] == "HOLD_FILTERED"
+    assert float(row["target_weight"]) == pytest.approx(0.0)
+    assert row["blocking_reason"] == "PENDING_ENTRY_CONFIRM"
+
+    lines = out.splitlines()
+    gated_lines = [ln for ln in lines if "601857.SH" in ln and "开仓信号确认中" in ln]
+    assert gated_lines, "the gated row must be printed with its structured blocking label"
+    for ln in gated_lines:
+        assert "⚪ HOLD" not in ln
+        assert "维持仓位" not in ln
+        # Flat symbol: the honest wording is 未持仓, not "held at 0.0%".
+        assert "未持仓" in ln
+        assert "无交易指令" in ln
+
+
+def test_detail_reason_is_liquidation_follows_action_not_target_weight(
+    tmp_path, patched_weights, capsys
+):
+    """Audit attribution: `is_liquidation` == (action == "SELL"), for every row family.
+
+    Pinned because the three families below all carry `target_weight == 0.0` yet
+    only one of them actually sells. An auditor reading the weight instead of the
+    verdict would count three liquidations where there is one (or, historically,
+    arm a re-entry cooldown for positions that were never held).
+    """
+    from scripts.run_live_strategy import main as live_main
+
+    # --- (a) gated, never traded: HOLD_FILTERED + target_weight 0.0 ------------
+    day_one, state_file, universe_file, holdings_file = _run_pending_entry_day_one(
+        tmp_path, patched_weights
+    )
+    capsys.readouterr()
+    gated = day_one[day_one["symbol"] == "601857.SH"].iloc[0]
+    assert float(gated["target_weight"]) == pytest.approx(0.0)
+    assert gated["detail_reason"]["is_liquidation"] is False
+    # JSON-safe Python bool (not a numpy.bool_ that would serialise as a string).
+    assert type(gated["detail_reason"]["is_liquidation"]) is bool
+
+    # --- (b) cancelled entry: CANCEL_PENDING + target_weight 0.0 --------------
+    patched_weights({"600000.SH": 0.0, "601857.SH": 0.0, "BIL": 1.0})
+    args = _live_args(
+        tmp_path,
+        universe_file,
+        state_file,
+        _AS_OF_SECOND,
+        extra=[
+            "--current-holdings-file", holdings_file,
+            "--entry-confirm-bars", "2",
+            "--exit-confirm-bars", "1",
+        ],
+    )
+    day_two = live_main(args)
+    capsys.readouterr()
+    cancelled = day_two[day_two["symbol"] == "601857.SH"].iloc[0]
+    assert cancelled["action"] == "CANCEL_PENDING"
+    assert float(cancelled["target_weight"]) == pytest.approx(0.0)
+    assert cancelled["detail_reason"]["is_liquidation"] is False
+
+    # --- (c) the ONE family that really sells --------------------------------
+    sell_dir = tmp_path / "sell_case"
+    sell_dir.mkdir()
+    sell_universe = _write_universe(sell_dir, ["600000.SH", "BIL"])
+    sell_holdings = _write_json(sell_dir, "holdings.json", {"600000.SH": 5000, "BIL": 50000})
+    sell_state = str(sell_dir / "account_state.json")
+    patched_weights({"600000.SH": 0.0, "BIL": 0.97})
+    order_df = live_main(
+        _live_args(
+            sell_dir,
+            sell_universe,
+            sell_state,
+            _AS_OF_SECOND,
+            extra=[
+                "--current-holdings-file", sell_holdings,
+                "--exit-confirm-bars", "1",
+            ],
+        )
+    )
+    capsys.readouterr()
+    sold = order_df[order_df["symbol"] == "600000.SH"].iloc[0]
+    assert sold["action"] == "SELL"
+    assert float(sold["target_weight"]) == pytest.approx(0.0)
+    assert sold["detail_reason"]["is_liquidation"] is True
+    # Same verdict on the persisted ticket. `detail_reason` is a dict inside a CSV
+    # cell, so pandas writes its repr (single quotes) -- parse it as a literal.
+    import ast as _ast
+
+    csv_df = pd.read_csv(sell_dir / "live_trading_ticket.csv")
+    detail = _ast.literal_eval(csv_df[csv_df["symbol"] == "600000.SH"].iloc[0]["detail_reason"])
+    assert detail["is_liquidation"] is True
+
