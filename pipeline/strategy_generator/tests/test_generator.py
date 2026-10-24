@@ -28,30 +28,104 @@ def _fake_result(name, score, factor_tags=()):
     return {"template": _FakeTemplate(name, list(factor_tags)), "params": {}, "res": {}, "score": score}
 
 
-def test_generator_finds_momentum_allocation():
-    # Construct a universe where asset A goes up, B goes down, C goes down
+# Momentum-family templates that are statistically indistinguishable on the
+# synthetic "A up / B down / C down" fixture below. `breadth_gated_momentum`
+# and `cross_sectional_momentum` both end up fully invested in A; on a straight
+# line they can only differ by real execution frictions.
+_MOMENTUM_FAMILY = ("cross_sectional_momentum", "breadth_gated_momentum", "dual_momentum")
+# "Near tie" = the top two candidates differ by less than this, i.e. the winner
+# slot is decided by execution frictions / grid rounding, not by signal.
+_NEAR_TIE_REL_TOL = 0.005  # 0.5%
+
+
+def _momentum_fixture():
     idx = pd.bdate_range("2020-01-01", periods=300)
-
-    closes_a = np.linspace(100, 200, 300)
-    closes_b = np.linspace(100, 50, 300)
-    closes_c = np.linspace(100, 50, 300)
-
-    universe = {
-        "A": make_df(closes_a, start="2020-01-01"),
-        "B": make_df(closes_b, start="2020-01-01"),
-        "C": make_df(closes_c, start="2020-01-01"),
+    return {
+        "A": make_df(np.linspace(100, 200, 300), start="2020-01-01"),
+        "B": make_df(np.linspace(100, 50, 300), start="2020-01-01"),
+        "C": make_df(np.linspace(100, 50, 300), start="2020-01-01"),
     }
+
+
+def _generate_with_pooled_scores(universe, gen, factor_report=None):
+    """Run the generator and also capture the per-template best-Sharpe pool.
+
+    `_search_allocation` only returns the WINNER, so the near-tie evidence is
+    taken by spying on `_apply_factor_tiebreak`, which receives the exact
+    `best_per_template` mapping (best Sharpe per distinct template, composites
+    included) that the winner is selected from. This observes the real search
+    instead of re-implementing the grid inside the test.
+    """
+    captured = {}
+    real_tiebreak = _apply_factor_tiebreak
+
+    def _spy(best_per_template, report, epsilon):
+        captured["pool"] = dict(best_per_template)
+        return real_tiebreak(best_per_template, report, epsilon)
+
+    with patch("stratgen.generator._apply_factor_tiebreak", side_effect=_spy):
+        spec = gen.generate(universe, factor_report=factor_report)
+
+    ranked = sorted(
+        ((name, r["score"]) for name, r in captured["pool"].items()),
+        key=lambda kv: kv[1],
+        reverse=True,
+    )
+    return spec, ranked
+
+
+def _assert_momentum_near_tie(spec, ranked):
+    """Winner must be momentum-family AND the runner-up must be within 0.5%."""
+    assert spec.template_name in _MOMENTUM_FAMILY, (
+        f"winner {spec.template_name!r} is not in the momentum family {_MOMENTUM_FAMILY}"
+    )
+    assert len(ranked) >= 2
+    top_name, top_score = ranked[0]
+    second_name, second_score = ranked[1]
+    assert top_name == spec.template_name
+    assert spec.universe_sharpe == pytest.approx(top_score)
+    assert second_name in _MOMENTUM_FAMILY, (
+        f"runner-up {second_name!r} is not momentum-family; the near tie is not "
+        "the same-family reordering this test documents"
+    )
+    rel_gap = abs(top_score - second_score) / abs(top_score)
+    assert rel_gap < _NEAR_TIE_REL_TOL, (
+        f"expected a same-family near tie, got {top_name}={top_score:.4f} vs "
+        f"{second_name}={second_score:.4f} (relative gap {rel_gap:.4%})"
+    )
+    return rel_gap
+
+
+def test_generator_finds_momentum_allocation():
+    """A momentum-family template must win; the two leaders are a near tie.
+
+    REWRITTEN for the B1.1 ledger fix. This test used to assert the hardcoded
+    winner `cross_sectional_momentum`. B1.1 made every template pay its real
+    fees and whole-share lot frictions out of a genuine cash ledger (previously
+    the reported book was force-overwritten with the target weights, so those
+    frictions were invisible), which reordered two templates that are otherwise
+    identical on this fixture:
+        old winner: cross_sectional_momentum  28.9253
+        new winner: breadth_gated_momentum    28.9700
+    i.e. a 0.152% gap -- a same-family near tie decided by execution frictions,
+    NOT by a change in signal. The assertions therefore pin the family, the
+    0.5%-within-near-tie FACT, and the universe-level sanity, instead of one
+    template name. NOTE for downstream research: any conclusion that hardcodes
+    a template name from this generator needs re-running/verification, since
+    near-tied members of a family can swap places under the honest ledger.
+    """
+    # Construct a universe where asset A goes up, B goes down, C goes down
+    universe = _momentum_fixture()
 
     # Very small random search to keep tests fast
     config = GeneratorConfig(n_random_search=10, seed=42)
     gen = StrategyGenerator(config)
 
-    spec = gen.generate(universe)
+    spec, ranked = _generate_with_pooled_scores(universe, gen)
 
-    # Given this universe, CrossSectionalMomentum should win easily
-    # because it will allocate 100% to A, which is a straight line up (infinite Sharpe)
-    # Equal weight would dilute the return with B and C.
-    assert spec.template_name == "cross_sectional_momentum"
+    # The winner is a momentum-family template because momentum puts everything
+    # into A (a straight line up); equal weight would dilute with B and C.
+    _assert_momentum_near_tie(spec, ranked)
     assert spec.universe_sharpe > 0
     assert spec.n_symbols == 3
     assert not spec.target_weights.empty
@@ -209,25 +283,38 @@ def test_factor_tiebreak_ignores_templates_with_no_computable_factor_score():
 
 
 def test_generator_factor_report_none_is_byte_for_byte_unchanged():
-    # Regression guard: omitting factor_report must reproduce the exact same
-    # winner as before this feature existed.
-    idx = pd.bdate_range("2020-01-01", periods=300)
-    closes_a = np.linspace(100, 200, 300)
-    closes_b = np.linspace(100, 50, 300)
-    closes_c = np.linspace(100, 50, 300)
-    universe = {
-        "A": make_df(closes_a, start="2020-01-01"),
-        "B": make_df(closes_b, start="2020-01-01"),
-        "C": make_df(closes_c, start="2020-01-01"),
-    }
+    """Omitting factor_report must change nothing about the selection.
+
+    REWRITTEN for the B1.1 ledger fix: this used to hardcode the winner
+    `cross_sectional_momentum`, which the honest ledger reordered (see
+    `test_generator_finds_momentum_allocation`: B1.1 charges every template
+    real fees + whole-share lot friction, and `breadth_gated_momentum` now
+    leads `cross_sectional_momentum` 28.9700 vs 28.9253, a 0.152% same-family
+    near tie). What this test is really about is invariance to a MISSING
+    factor_report, so it now pins:
+      * `generate(universe)` and `generate(universe, factor_report=None)`
+        pick the SAME template with the SAME Sharpe (bit-identical score);
+      * the winner is still a momentum-family template, and the top two are
+        still a <0.5% near tie (so a future silent reordering is visible);
+      * no factor context / no tiebreak fired, as before.
+    Downstream: any research conclusion that hardcodes the old template name
+    must be re-run against the honest-ledger engine.
+    """
+    universe = _momentum_fixture()
 
     config = GeneratorConfig(n_random_search=10, seed=42)
     gen = StrategyGenerator(config)
 
-    spec_without_report = gen.generate(universe)
-    spec_with_none_report = gen.generate(universe, factor_report=None)
+    spec_without_report, ranked_without = _generate_with_pooled_scores(universe, gen)
+    spec_with_none_report, ranked_with_none = _generate_with_pooled_scores(
+        universe, gen, factor_report=None
+    )
 
-    assert spec_without_report.template_name == spec_with_none_report.template_name == "cross_sectional_momentum"
+    assert spec_without_report.template_name == spec_with_none_report.template_name
+    assert spec_without_report.universe_sharpe == spec_with_none_report.universe_sharpe
+    assert ranked_without == ranked_with_none
+    # Winner is momentum-family, and the runner-up is within 0.5% of it.
+    _assert_momentum_near_tie(spec_without_report, ranked_without)
     assert not spec_without_report.factor_context
     assert spec_without_report.factor_tiebreak_used is False
 
