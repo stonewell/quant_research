@@ -1,6 +1,51 @@
 #!/usr/bin/env bash
-set -e
-set -x
+# ---------------------------------------------------------------------------
+# Blend strategy batch backtest -- THIN WRAPPER around
+# scripts/run_batch_backtest.py (`B2.3`).
+#
+# This used to be a `find ... | while read` loop launching `run_backtest.py`
+# once per dumped blend strategy: 55 interpreter cold starts plus 55 full
+# DuckDB re-queries of the same 50-symbol universe. The loop is gone; the batch
+# entry point loads the universe ONCE in a single process and fans the
+# strategies out to a process pool (fork/COW -- workers inherit the loaded
+# frames instead of re-reading the cache).
+#
+# Old usage -> new usage (unchanged for callers):
+#   ./backtest_blend_strategies.sh [UNIVERSE] [RESULTS] [START] [END] \
+#                                  [WEIGHTING_MODE] [ENABLE_ORTHOGONALIZATION] [EXTRA_PARAMS]
+#   ./backtest_blend_strategies.sh --universe X --results R --start S --end E \
+#                                  --weighting-mode M --enable-orthogonalization [true|false] \
+#                                  --extra-params '{"k": v}'
+#
+# Per-flag mapping:
+#   UNIVERSE / --universe        -> --universe-file
+#   RESULTS  / --results         -> --output-dir   (per-strategy artifacts still land in
+#                                   ${RESULTS}/<dump file stem>/, exactly as before)
+#   START/END                    -> --start / --end
+#   WEIGHTING_MODE               -> part of --strategy-params (blend_weighting_mode / weighting_mode)
+#   ENABLE_ORTHOGONALIZATION     -> part of --strategy-params (blend_enable_orthogonalization /
+#                                   enable_orthogonalization)
+#   EXTRA_PARAMS                 -> merged into --strategy-params
+#   (hardcoded fuyao)            -> --data-provider "${DATA_PROVIDER:-fuyao}"  (new override)
+#   (55 serial processes)        -> --n-jobs "${BATCH_N_JOBS}"  (unset = auto)
+#   (nothing)                    -> ${RESULTS}/batch_ranking.csv|batch_summary.json|batch_failed.csv
+#
+# Measured (2026-10-23, offline/synthetic, 6 blend dumps, 4 folds each, median
+# of 3): old serial loop 52.9s, --n-jobs 1 102.7s, --n-jobs 2 56.1s,
+# --n-jobs 6 26.0s, auto 26.8s. So AUTO (unset BATCH_N_JOBS) is the default and
+# `BATCH_N_JOBS` should not be set to 1 to "be safe": a strategy worker keeps its
+# folds serial (INNER_N_JOBS=1), so `-j 1` gives up BOTH pools. INNER_N_JOBS=auto
+# reproduces the old loop's fold fan-out (52.9s) if you ever have fewer
+# strategies than cores, but plain AUTO beats it.
+#
+# Steps 1-2 (dump the strategies, then bake the weighting mode / orthogonalization
+# / extra params into the dumped JSONs) are KEPT verbatim: they produce artifacts
+# other tooling reads, and they are data preparation, not the serial loop. The
+# same params are additionally passed through `--strategy-params`, which is how
+# `run_backtest.py` itself merges them (the old `--strategy-params "$STRAT_PARAMS"`
+# behavior).
+# ---------------------------------------------------------------------------
+set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
@@ -12,6 +57,13 @@ END="2026-01-01"
 WEIGHTING_MODE="${WEIGHTING_MODE:-"rolling_ic_ir"}"
 ENABLE_ORTHOGONALIZATION="${ENABLE_ORTHOGONALIZATION:-"true"}"
 EXTRA_PARAMS="${EXTRA_PARAMS:-"{}"}"
+# New (optional) knobs; defaults reproduce the old script's behavior.
+DATA_PROVIDER="${DATA_PROVIDER:-"fuyao"}"
+BATCH_N_JOBS="${BATCH_N_JOBS:-""}"          # empty = auto: min(cpu_count, n_strategies)
+INNER_N_JOBS="${INNER_N_JOBS:-"1"}"         # fold workers inside a strategy; 1 = never nest pools
+WINDOW_YEARS="${WINDOW_YEARS:-"0.25"}"
+STEP_YEARS="${STEP_YEARS:-"0.25"}"
+BASELINE_SYMBOL="${BASELINE_SYMBOL:-"000300.SH"}"   # empty string disables the benchmark
 
 # Parse named flags and/or positional arguments
 positional_args=()
@@ -22,7 +74,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --enable-orthogonalization|--enable_orthogonalization)
-            if [[ -n "$2" && "$2" != --* ]]; then
+            if [[ -n "${2:-}" && "$2" != --* ]]; then
                 ENABLE_ORTHOGONALIZATION="$2"
                 shift 2
             else
@@ -38,7 +90,7 @@ while [[ $# -gt 0 ]]; do
             UNIVERSE="$2"
             shift 2
             ;;
-        --results)
+        --results|--output-dir)
             RESULTS="$2"
             shift 2
             ;;
@@ -48,6 +100,18 @@ while [[ $# -gt 0 ]]; do
             ;;
         --end)
             END="$2"
+            shift 2
+            ;;
+        --data-provider)
+            DATA_PROVIDER="$2"
+            shift 2
+            ;;
+        --n-jobs|-j)
+            BATCH_N_JOBS="$2"
+            shift 2
+            ;;
+        --inner-n-jobs)
+            INNER_N_JOBS="$2"
             shift 2
             ;;
         *)
@@ -80,6 +144,9 @@ echo "End Date:                  ${END}"
 echo "Weighting Mode:            ${WEIGHTING_MODE}"
 echo "Enable Orthogonalization:  ${ORTHO_BOOL}"
 echo "Extra Params:              ${EXTRA_PARAMS}"
+echo "Data Provider:             ${DATA_PROVIDER}"
+echo "Batch Workers:             ${BATCH_N_JOBS:-"auto"}"
+echo "Inner (fold) Workers:      ${INNER_N_JOBS}"
 echo "=============================================="
 
 # Step 1: Dump baseline strategy definition files
@@ -134,24 +201,29 @@ base.update(extra)
 print(json.dumps(base))
 " "${WEIGHTING_MODE}" "${ORTHO_BOOL}" "${EXTRA_PARAMS}")
 
-# Step 3: Run walk-forward backtests across all blend strategies
-find research_strategy/results/strategy_dumps/ -type f -name "*blend*.json" -print0 | while IFS= read -r -d '' file; do
-    filename=$(basename "$file")
-    name_only="${filename%.*}"
-    echo "Running backtest for: $name_only"
+# Step 3: ONE batch invocation for every dumped blend strategy (was: one
+# `uv run python ../backtester/run_backtest.py` per file).
+BATCH_ARGS=(
+    ../scripts/run_batch_backtest.py
+    --strategies-glob "research_strategy/results/strategy_dumps/*blend*.json"
+    --strategy-params "${STRAT_PARAMS}"
+    --universe-file "${UNIVERSE}"
+    --start "${START}"
+    --end "${END}"
+    --window-years "${WINDOW_YEARS}"
+    --step-years "${STEP_YEARS}"
+    --data-provider "${DATA_PROVIDER}"
+    --min-shares 100
+    --china-trading
+    --output-dir "${RESULTS}"
+    --results-subdir stem
+    --inner-n-jobs "${INNER_N_JOBS}"
+)
+if [ -n "${BASELINE_SYMBOL}" ]; then
+    BATCH_ARGS+=(--baseline-symbol "${BASELINE_SYMBOL}")
+fi
+if [ -n "${BATCH_N_JOBS}" ]; then
+    BATCH_ARGS+=(--n-jobs "${BATCH_N_JOBS}")
+fi
 
-    uv run python ../backtester/run_backtest.py \
-       --strategy-file "$file" \
-       --strategy-params "${STRAT_PARAMS}" \
-       --mode walkforward \
-       --window-years 0.25 \
-       --step-years 0.25 \
-       --universe-file "${UNIVERSE}" \
-       --end ${END} \
-       --start ${START} \
-       --data-provider fuyao \
-       --min-shares=100 \
-       --results-dir "${RESULTS}/${name_only}" \
-       --china-trading \
-       --baseline-symbol 000300.SH
-done
+uv run python "${BATCH_ARGS[@]}"
