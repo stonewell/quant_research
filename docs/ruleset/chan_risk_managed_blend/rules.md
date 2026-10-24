@@ -48,15 +48,18 @@ $$\text{Drawdown} = \frac{\text{Current NAV} - \text{Peak NAV}}{\text{Peak NAV}}
 
 * **IF Drawdown < 10% (Normal Regime)**:
   * Proceed to Step 2 with full risk budget. Standard single-stock cap = **20%**.
-* **IF 10% <= Drawdown < 15% (Tier 1: Smooth Linear Damping)**:
+* **IF 10% <= Drawdown < 15% (Tier 1: Smooth Linear Damping) — code-executed (代码执行)**:
   * **Action**: scale every position by $\text{scale} = 1 - (\text{Drawdown} - 10\%)/10\%$ — **0% reduction at DD = 10%, exactly 50% at DD = 15%, 100% at DD = 20%** (the damping is continuous across the whole 10%–20% band, not a discrete halving). Released capital goes to the Cash Proxy (`BIL`).
   * The discrete "cut by 50% (× 0.5)" branch exists in code (`pipeline/research/blend/blend_base.py:1075-1081`) but is **not** the deployed configuration: all six blends set `smooth_drawdown: true`. Live applies the same continuous formula (`scripts/check_live_portfolio_health.py:380,384`).
-* **IF 15% <= Drawdown < 20% (Tier 2: Tactical Defense)**:
+* **IF 15% <= Drawdown < 20% (Tier 2: Tactical Defense) — human-executed (人工执行)**:
   * **Action**: Liquidate discretionary offensive positions.
   * Switch into defensive mode: Hold 70% in Cash Proxy, and up to 30% only in leading defensive assets.
-* **IF Drawdown >= 20% (Tier 3: Hard Stop / Emergency Halt)**:
+  * This wording is the health report's advisory instruction to the human (`scripts/check_live_portfolio_health.py:618-622`) — **the ticket generator does not perform the rotation**.
+* **IF Drawdown >= 20% (Tier 3: Hard Stop / Emergency Halt) — code-executed (代码执行, hard halt)**:
   * **Action**: **Liquidate 100% of all risk assets into Cash Proxy immediately**.
   * **Lockout**: **Do not buy for 21 consecutive trading days**. On Day 22, reset HWM to current NAV to allow fresh cycle re-entry.
+
+> **Note — the Tier-2 rotation instruction is not executed by the ticket generator.** The "rotate into a defensive sub-strategy" text the health report prints at Tier 2 is an advisory action string for the human (`scripts/check_live_portfolio_health.py:618-622`); `scripts/run_live_strategy.py` contains no `TIER_1` / `TIER_2` branch at all, so on a Tier-2 day the ticket only applies the portfolio-level scaling (`current_targets *= live_scale` at `scripts/run_live_strategy.py:1766`, where `live_scale` is read from `account_state` / the health report's `linear_equity_scale`, `scripts/check_live_portfolio_health.py:380`). The rotation must be carried out by the human per the health report; therefore **on a Tier-2 day the position structure printed on the ticket may still be the Tier-1 damped shape**.
 
 ---
 
@@ -117,9 +120,9 @@ This strategy carries **one inertia parameter** (`crb_min_weight_change = 0.05`)
 
 | Check | Item | Condition | Human Trader Action |
 | :--- | :--- | :--- | :--- |
-| **Risk** | **HWM Drawdown** | >= 20% | **STOP ALL TRADING**: Liquidate 100% to `BIL`. Freeze 21 days (HWM resets Day 22). |
-| **Risk** | **HWM Drawdown** | 15% - 20% | **DEFENSIVE SHIFT**: Route 100% to defensive mode (70% cash proxy buffer). |
-| **Risk** | **HWM Drawdown** | 10% - 15% | **DAMP RISK**: Scale all equity weights by $1 - (\text{DD}-10\%)/10\%$ (0% cut at 10%, 50% at 15%); sweep released capital to cash. |
+| **Risk** | **HWM Drawdown** — **code-executed (代码执行, hard halt)** | >= 20% | **STOP ALL TRADING**: Liquidate 100% to `BIL`. Freeze 21 days (HWM resets Day 22). |
+| **Risk** | **HWM Drawdown** — **human-executed (人工执行)** | 15% - 20% | **DEFENSIVE SHIFT**: Route 100% to defensive mode (70% cash proxy buffer). Advisory instruction only — the ticket generator does not perform it. |
+| **Risk** | **HWM Drawdown** — **code-executed (代码执行)** | 10% - 15% | **DAMP RISK**: Scale all equity weights by $1 - (\text{DD}-10\%)/10\%$ (0% cut at 10%, 50% at 15%); sweep released capital to cash. |
 | **Regime** | **Regime Gate** | Bullish | **NORMAL / EXPANDED**: Target full model exposure up to caps. |
 | **Regime** | **Regime Gate** | Bearish / Neutral | **CONSERVATIVE**: Keep single-stock cap at 20%; hold cash buffer. |
 | **Exit** | **Stop-Loss** | Loss >= 8% from entry | **EXIT IMMEDIATELY**: Sell 100% of position. |

@@ -106,16 +106,19 @@ $$\text{Drawdown} = \frac{\text{Current NAV} - \text{HWM}}{\text{HWM}}$$
 
 1. **Normal Band ($\text{Drawdown} > -10\%$)**:
    - Risk multiplier = $1.0$. Standard single-stock cap = **20%**.
-2. **Tier 1/2 Smooth Linear Damping ($-20\% < \text{Drawdown} \le -10\%$)**:
+2. **Tier 1/2 Smooth Linear Damping ($-20\% < \text{Drawdown} \le -10\%$) — code + human (代码 + 人工)**:
+   - **The damping factor itself is code-executed (代码执行)**. In the $15\%$–$20\%$ sub-band the health report *additionally* prints a rotation into a defensive sub-strategy (`scripts/check_live_portfolio_health.py:618-622`); that rotation is **human-executed (人工执行)** and the ticket generator does not perform it.
    - **Fast Recovery Channel**: If 10-day trailing return $R_{10d} > 0$ or breadth thrust $\ge 60\%$:
      - **Bypass damping**; maintain full allocation ($1.0$) to capture post-panic V-shaped recoveries.
    - **ELSE (Smooth Linear Damping)**:
      $$\text{scale}_{\text{DD}} = \max\left(0.0,\ 1.0 - \frac{|\text{Drawdown}| - 0.10}{0.20 - 0.10}\right)$$
      Scale all equity positions down progressively from **100% to 0%** (0% reduction at DD = 10%, exactly 50% at DD = 15%, 100% at DD = 20%), parking released capital into cash proxies. The discrete "× 0.5" branch exists in code (`pipeline/research/blend/blend_base.py:1075-1081`) but is **not** the deployed configuration: all six blends set `smooth_drawdown: true`; live applies the same continuous formula (`scripts/check_live_portfolio_health.py:380,384`).
    - **15-Day Auto-Heal**: If trapped in damping for **15 consecutive trading days**, reset HWM to current NAV to restore active alpha search.
-3. **Tier 3 Hard Stop ($\text{Drawdown} \le -20\%$)**:
+3. **Tier 3 Hard Stop ($\text{Drawdown} \le -20\%$) — code-executed (代码执行, hard halt)**:
    - **Full liquidation**: Sell 100% of risky assets into cash equivalents immediately.
    - **Trading freeze**: Lock out new entries for **21 consecutive trading days**. Reset HWM on day 22.
+
+> **Note — the Tier-2 rotation instruction is not executed by the ticket generator.** The "rotate into a defensive sub-strategy" text the health report prints at Tier 2 is an advisory action string for the human (`scripts/check_live_portfolio_health.py:618-622`); `scripts/run_live_strategy.py` contains no `TIER_1` / `TIER_2` branch at all, so on a Tier-2 day the ticket only applies the portfolio-level scaling (`current_targets *= live_scale` at `scripts/run_live_strategy.py:1766`, where `live_scale` is read from `account_state` / the health report's `linear_equity_scale`, `scripts/check_live_portfolio_health.py:380`). The rotation must be carried out by the human per the health report; therefore **on a Tier-2 day the position structure printed on the ticket may still be the Tier-1 damped shape**.
 
 ---
 
@@ -228,8 +231,8 @@ At 14:55 daily:
 
 | Dimension | Rule Check | Trigger Condition | Mandatory Trader Action |
 | :--- | :--- | :--- | :--- |
-| **Risk** | **Tier 3 Hard Stop** | Drawdown $\ge 20\%$ | **【Full Liquidation】**: Sell 100% equities into cash proxies; **21-day freeze**. Reset on day 22. |
-| **Risk** | **Tier 1/2 Damping** | $10\% \le \text{Drawdown} < 20\%$ | **【Linear Reduction】**: Scale positions by $\text{scale}_{\text{DD}} = 1 - (\lvert DD\rvert - 10\%)/10\%$ (0% cut at 10%, 50% at 15%, 100% at 20%). 15-day auto-heal. |
+| **Risk** | **Tier 3 Hard Stop** — **code-executed (代码执行, hard halt)** | Drawdown $\ge 20\%$ | **【Full Liquidation】**: Sell 100% equities into cash proxies; **21-day freeze**. Reset on day 22. |
+| **Risk** | **Tier 1/2 Damping** — **code + human (代码 + 人工)** | $10\% \le \text{Drawdown} < 20\%$ | **【Linear Reduction】**: Scale positions by $\text{scale}_{\text{DD}} = 1 - (\lvert DD\rvert - 10\%)/10\%$ (0% cut at 10%, 50% at 15%, 100% at 20%). 15-day auto-heal. The backend applies the scale; the Tier-2 rotation the health report prints is not executed by the ticket generator. |
 | **Risk** | **Recovery Channel**| 10d return $> 0$ or thrust $\ge 60\%$ | **【Bypass Damping】**: Immediately restore 100% normal allocation. |
 | **Risk** | **ATR Trailing Stop**| Price drops below 3.0 ATR line | **【Cut & Lock】**: Sell 100% of asset; **lock into 15-day trading freeze**. |
 | **Regime** | **Momentum Thrust** | Positive 10d count $\ge 5$ stocks | **【Deploy Idle Cash】**: Allocate to qualified momentum leaders, max 20% per stock. |

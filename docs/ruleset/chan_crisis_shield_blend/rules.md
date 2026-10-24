@@ -95,11 +95,14 @@ Human traders must execute the following 6-step checklist sequentially every tra
 $$\text{Drawdown} = \frac{\text{Current NAV} - \text{Peak NAV}}{\text{Peak NAV}}$$
 
 * **Normal Regime ($\text{Drawdown} < 10\%$)**: Full risk budget active. Single-stock position cap = 20% NAV.
-* **Tier 1 Smooth Damping ($10\% \le \text{Drawdown} < 15\%$)**: Linearly scale down target equity exposure:
+* **Tier 1 Smooth Damping ($10\% \le \text{Drawdown} < 15\%$) — code-executed (代码执行)**: Linearly scale down target equity exposure:
   $$\text{Scale} = \max\left(0.0,\ 1.0 - \frac{\text{Drawdown} - 0.10}{0.10}\right)$$
   i.e. **0% reduction at DD = 10%, exactly 50% at DD = 15%, 100% at DD = 20%** — the damping is continuous across the whole 10%–20% band, and live applies the identical formula (`scripts/check_live_portfolio_health.py:380,384`). The discrete "cut by 50% (× 0.5)" branch exists in code (`pipeline/research/blend/blend_base.py:1075-1081`) but is **not** the deployed configuration: all six blends set `smooth_drawdown: true`. Engage 15-day auto-healing cooldown tracker.
-* **Tier 2 Tactical Defense ($15\% \le \text{Drawdown} < 20\%$)**: Cap total equity exposure at 30%; allocate 70% to Cash Proxy.
-* **Tier 3 Emergency Halt ($\text{Drawdown} \ge 20\%$)**: Immediately liquidate 100% of all risky holdings into Cash Proxy. Enforce 15 trading days mandatory freeze.
+* **Tier 2 Tactical Defense ($15\% \le \text{Drawdown} < 20\%$) — human-executed (人工执行)**: Cap total equity exposure at 30%; allocate 70% to Cash Proxy.
+  - The 30%/70% split and the defensive rotation are the health report's advisory instruction to the human (`scripts/check_live_portfolio_health.py:618-622`) — **the ticket generator does not perform them**.
+* **Tier 3 Emergency Halt ($\text{Drawdown} \ge 20\%$) — code-executed (代码执行, hard halt)**: Immediately liquidate 100% of all risky holdings into Cash Proxy. Enforce 15 trading days mandatory freeze.
+
+> **Note — the Tier-2 rotation instruction is not executed by the ticket generator.** The "rotate into a defensive sub-strategy" text the health report prints at Tier 2 is an advisory action string for the human (`scripts/check_live_portfolio_health.py:618-622`); `scripts/run_live_strategy.py` contains no `TIER_1` / `TIER_2` branch at all, so on a Tier-2 day the ticket only applies the portfolio-level scaling (`current_targets *= live_scale` at `scripts/run_live_strategy.py:1766`, where `live_scale` is read from `account_state` / the health report's `linear_equity_scale`, `scripts/check_live_portfolio_health.py:380`). The rotation must be carried out by the human per the health report; therefore **on a Tier-2 day the position structure printed on the ticket may still be the Tier-1 damped shape**.
 
 ### Rule 2: Alpha#12 Reversal Execution Safeguard
 * **Entry Condition**: $\Delta \text{Close} < 0$ and $\Delta \text{Volume} > 0$, without breaking below the 3.0 ATR trailing channel.
@@ -135,8 +138,8 @@ This strategy carries **one inertia parameter** (`ccsb_min_weight_change = 0.05`
 
 | Phase | Metric / Trigger | Action / Order Instruction |
 | :--- | :--- | :--- |
-| **Stage 1: Halt** | $\text{Drawdown} \ge 20\%$ | 🔴 **Liquidate 100% of risk assets**; lock account for 15 days |
-| **Stage 1: Damping**| $10\% \le \text{Drawdown} < 15\%$ | 🟡 **Smooth linear equity scaling**; engage 15-day cooldown counter |
+| **Stage 1: Halt** — **code-executed (代码执行)** | $\text{Drawdown} \ge 20\%$ | 🔴 **Liquidate 100% of risk assets**; lock account for 15 days |
+| **Stage 1: Damping** — **code-executed (代码执行)** | $10\% \le \text{Drawdown} < 15\%$ | 🟡 **Smooth linear equity scaling**; engage 15-day cooldown counter |
 | **Stage 1: Bull** | $\text{Breadth} \ge 30\%$ or $\text{Thrust} \ge 60\%$ | 🟢 **Bull exposure active**; deploy cash into top momentum leaders |
 | **Stage 2: Sells** | Structural sell / ATR stop / target reduction | 🔴 **SELL FIRST** (14:20–14:35); execute at bid price to release cash |
 | **Stage 2: Buys** | Alpha#12 reversal or Three-Type buy, target $\ge 5\%$ (new position $\ge 3\%$) | 🟢 **BUY SECOND** (14:35–14:45); floor to 100-share integer lot |

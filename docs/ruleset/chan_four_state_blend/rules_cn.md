@@ -124,15 +124,18 @@ flowchart LR
 $$\text{Drawdown} = \frac{\text{Current NAV} - \text{Peak NAV (HWM)}}{\text{Peak NAV}}$$
 
 * **正常状态 ($\text{Drawdown} < 10\%$)**: 风险预算全额开放，单票仓位上限 20% NAV；
-* **一级平滑阻尼 ($10\% \le \text{Drawdown} < 15\%$)**:
+* **一级平滑阻尼 ($10\% \le \text{Drawdown} < 15\%$) — 代码执行 (code-executed)**:
   - 按 $\text{Scale} = \max\left(0.0,\ 1.0 - \dfrac{\text{DD} - 0.10}{0.10}\right)$ 同比例压缩股票仓位，即**回撤 10% 时不减、15% 时恰好减半、20% 时减至 0**——阻尼在整个 10%–20% 区间连续生效，实盘采用同一公式 (`scripts/check_live_portfolio_health.py:380,384`)；
   - 代码中存在"直接砍半 (乘 0.5)"的离散分支 (`pipeline/research/blend/blend_base.py:1075-1081`)，但**不是**当前部署配置：六个 blend 策略均设置 `smooth_drawdown: true`；
   - 启动 15 个交易日冷却期自动自愈计数器；
-* **二级战术防御 ($15\% \le \text{Drawdown} < 20\%$)**:
+* **二级战术防御 ($15\% \le \text{Drawdown} < 20\%$) — 人工执行 (human-executed)**:
   - 强制股票总仓位降至 30% 以下，70% 资金停泊于现金品；
-* **三级极端熔断 ($\text{Drawdown} \ge 20\%$)**:
+  - 该 30%/70% 拆分与防守轮动是健康报告打印给人工的 advisory 指令 (`scripts/check_live_portfolio_health.py:618-622`)，**工单生成器并不执行它**；
+* **三级极端熔断 ($\text{Drawdown} \ge 20\%$) — 代码执行 (code-executed, hard halt)**:
   - **无条件 100% 清仓**，全额切换为国债逆回购/货币 ETF；
   - **强制交易冷冻 15 个交易日**，冷却期满且市场动量反转后方可重启。
+
+> **注意 — Tier-2 的轮动指令不会被工单执行。** 健康报告在 Tier-2 打印的"轮动至防守子策略"只是给人工的 advisory 指令 (`scripts/check_live_portfolio_health.py:618-622`)；`scripts/run_live_strategy.py` 全文没有任何 `TIER_1` / `TIER_2` 分支，到 Tier-2 时工单只做组合层缩放（`current_targets *= live_scale`，`scripts/run_live_strategy.py:1766`；`live_scale` 取自 `account_state` / 健康报告的 `linear_equity_scale`，`scripts/check_live_portfolio_health.py:380`）。仓位轮动须人工按健康报告操作；因此**在 Tier-2 当日，工单产出的持仓结构可能仍停留在 Tier-1 的缩放形态**。
 
 ### 规则 2: 市场宽度与动量脉冲进攻机制
 
@@ -170,8 +173,8 @@ $$\Delta W = W_{\text{目标}} - W_{\text{当前}}$$
 
 | 触发环节 | 核心指标条件 | 交易员强制执行动作 |
 | :--- | :--- | :--- |
-| **阶段 1: 熔断** | $\text{Drawdown} \ge 20\%$ | 🔴 **全额清仓 (100% 现金)**，挂单卖出全部股票，冷冻 15 交易日 |
-| **阶段 1: 阻尼** | $10\% \le \text{Drawdown} < 15\%$ | 🟡 **仓位平滑线性压缩**，下调目标权重，多余资金转入现金 |
+| **阶段 1: 熔断** — **代码执行 (code-executed)** | $\text{Drawdown} \ge 20\%$ | 🔴 **全额清仓 (100% 现金)**，挂单卖出全部股票，冷冻 15 交易日 |
+| **阶段 1: 阻尼** — **代码执行 (code-executed)** | $10\% \le \text{Drawdown} < 15\%$ | 🟡 **仓位平滑线性压缩**，下调目标权重，多余资金转入现金 |
 | **阶段 2: 广度** | $\text{Breadth} \ge 30\%$ 或 $\text{Thrust} \ge 60\%$ | 🟢 **牛市进攻**，按模型积极配置高弹性三类买点龙头 |
 | **阶段 3: 卖出** | 触发结构卖点 / 跌破 ATR 止损 / 调仓减持 | 🔴 **优先卖出** (14:20~14:35)，挂对手盘最优 1 档即时成交 |
 | **阶段 4: 买入** | 目标加仓 $\ge 5\%$，或新仓目标 $\ge 5\%$ | 🟢 **后买入** (14:35~14:45)，向下取整至 100 股单手 |

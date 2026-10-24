@@ -59,13 +59,15 @@ flowchart LR
   - Targets up to **80%** total equity exposure (`cfsb_target_bull_exposure = 0.80`) when universe market breadth $\ge 30\%$ (percentage of stocks > SMA50) OR 10-day breadth thrust $\ge 60\%$ (stocks with positive 10-day return).
   - Unallocated cash during breadth thrusts is systematically dispersed across $\ge 5$ momentum leaders, preventing concentration.
 * **Multi-Tier Drawdown Circuit Breakers**:
-  - **Tier 1 (DD $\ge 10\%$)**: Smooth linear damping (`cfsb_smooth_drawdown = true`) continuously reduces equity exposure from 100% to 0% across 10%–20% drawdown.
-  - **Tier 2 (DD $\ge 15\%$)**: Rotate 100% of allocation into `ChanVaaCompoundStrategy` defensive mode (holds 70% cash buffer).
-  - **Tier 3 (DD $\ge 20\%$)**: Emergency halt — liquidate 100% of risky assets to Cash Proxy (`BIL` / `511880` / `GC001`) with a **21-day trading freeze**.
+  - **Tier 1 (DD $\ge 10\%$) — code-executed (代码执行)**: Smooth linear damping (`cfsb_smooth_drawdown = true`) continuously reduces equity exposure from 100% to 0% across 10%–20% drawdown.
+  - **Tier 2 (DD $\ge 15\%$) — human-executed (人工执行)**: Rotate 100% of allocation into `ChanVaaCompoundStrategy` defensive mode (holds 70% cash buffer). This wording is the health report's advisory instruction to the human (`scripts/check_live_portfolio_health.py:618-622`); **the ticket generator does not perform the rotation**.
+  - **Tier 3 (DD $\ge 20\%$) — code-executed (代码执行, hard halt)**: Emergency halt — liquidate 100% of risky assets to Cash Proxy (`BIL` / `511880` / `GC001`) with a **21-day trading freeze**.
   - **Fast Recovery Override**: Immediate de-escalation of circuit breakers if short-term NAV recovery > 0 OR breadth thrust $\ge 60\%$.
   - **Auto-Healing Cooldown**: Tier 1/2 resets HWM after 15 sustained bars (`cfsb_tier1_cooldown_bars = 15`); Tier 3 resets HWM after 21 sustained bars.
 * **Trade Inertia Gates (three separate live rules, not one 5% filter)**: See `rules.md` Rule 3 for the authoritative table. Summary — (a) **trim of a held asset**: $\lvert\Delta W\rvert \ge \max(5\%,\ 0.30 \times \text{current weight})$, so at the 20% single-stock cap a trim needs 6%; (b) **brand-new position**: target weight $\ge 5\%$ (`cfsb_entry_threshold = 0.05`), a sub-5% new line is refused with `HOLD_FILTERED`; (c) **full exit**: exempt from (a) and (b) but requires the exit signal to persist **2 consecutive evaluations** (`guard_latency_bars = 2`). Base parameter `cfsb_min_weight_change = 0.05`; relative ratio `cfsb_inertia_relative_ratio = 0.30`. Emergency liquidations (circuit breakers, $-8\%$ hard stops) bypass every gate outright — there is no residual 0.1% band. **The backtest is different**: it scales the threshold per asset to an adaptive **2.5% – 8%** band and exempts new positions from its 5% gate, so live holdings can legitimately be fewer names than the backtest for the same date.
 * **Execution Sequence**: **SELLS FIRST** (release cash and margin capacity) $\rightarrow$ **BUYS SECOND** (exact lot-rounded sizing).
+
+> **Note — the Tier-2 rotation instruction is not executed by the ticket generator.** The "rotate into a defensive sub-strategy" text the health report prints at Tier 2 is an advisory action string for the human (`scripts/check_live_portfolio_health.py:618-622`); `scripts/run_live_strategy.py` contains no `TIER_1` / `TIER_2` branch at all, so on a Tier-2 day the ticket only applies the portfolio-level scaling (`current_targets *= live_scale` at `scripts/run_live_strategy.py:1766`, where `live_scale` is read from `account_state` / the health report's `linear_equity_scale`, `scripts/check_live_portfolio_health.py:380`). The rotation must be carried out by the human per the health report; therefore **on a Tier-2 day the position structure printed on the ticket may still be the Tier-1 damped shape**.
 
 ---
 
@@ -102,9 +104,9 @@ flowchart TD
      ```
    - Check current portfolio NAV against the High-Water Mark (HWM).
    - Verify if any drawdown circuit breaker tier is triggered:
-     - $\text{Drawdown} \ge 20\%$: **🔴 NO-GO**: Emergency halt (liquidate all risk assets to cash, 21-day trading freeze).
-     - $15\% \le \text{Drawdown} < 20\%$: **🟠 CAUTION**: Tactical defense (shift 100% to VAA compound defensive mode).
-     - $10\% \le \text{Drawdown} < 15\%$: **🟡 CAUTION**: Smooth linear damping (exposure reduces continuously towards 0%).
+     - $\text{Drawdown} \ge 20\%$: **🔴 NO-GO** — **code-executed (代码执行)**: Emergency halt (liquidate all risk assets to cash, 21-day trading freeze).
+     - $15\% \le \text{Drawdown} < 20\%$: **🟠 CAUTION** — **human-executed (人工执行)**: Tactical defense (shift 100% to VAA compound defensive mode; advisory only — the ticket generator does not perform the shift).
+     - $10\% \le \text{Drawdown} < 15\%$: **🟡 CAUTION** — **code-executed (代码执行)**: Smooth linear damping (exposure reduces continuously towards 0%).
      - $\text{Drawdown} < 10\%$: **🟢 GO**: Normal risk budget.
    - Verify 50-day market breadth ($\ge 30\%$) and 10-day breadth thrust ($\ge 60\%$) to determine if bull cash deployment is active.
 
@@ -233,9 +235,9 @@ uv run python scripts/run_live_strategy.py \
 | **Breakout Invalidation Stop** | Close $< ZG \times (1 - 0.01)$ | Exceeds 1% tolerance band; exit position immediately. |
 | **Trailing Ratchet Stop** | Close $< ZG$ after upward stroke expansion | Exit position to lock in accrued segment gains. |
 | **Time Stop** | Position held for $\ge 90$ trading days without progress | Close position and release capital. |
-| **Tier 1 Circuit Breaker** | Portfolio DD $\ge 10\%$ from HWM | Smooth linear damping: scale exposure down towards 0%; sweep released equity to Cash Proxy. |
-| **Tier 2 Circuit Breaker** | Portfolio DD $\ge 15\%$ from HWM | Rotate 100% of portfolio into `ChanVaaCompoundStrategy` defensive mode (70% cash buffer). |
-| **Tier 3 Circuit Breaker** | Portfolio DD $\ge 20\%$ from HWM | **Emergency halt**: 100% Cash liquidation; 21-day trading freeze (reset HWM on Day 22). |
+| **Tier 1 Circuit Breaker** — **code-executed (代码执行)** | Portfolio DD $\ge 10\%$ from HWM | Smooth linear damping: scale exposure down towards 0%; sweep released equity to Cash Proxy. |
+| **Tier 2 Circuit Breaker** — **human-executed (人工执行)** | Portfolio DD $\ge 15\%$ from HWM | Rotate 100% of portfolio into `ChanVaaCompoundStrategy` defensive mode (70% cash buffer). Advisory instruction only — the ticket generator does not perform it. |
+| **Tier 3 Circuit Breaker** — **code-executed (代码执行, hard halt)** | Portfolio DD $\ge 20\%$ from HWM | **Emergency halt**: 100% Cash liquidation; 21-day trading freeze (reset HWM on Day 22). |
 | **Fast Recovery Override** | Short-term NAV recovery > 0 OR 10d Thrust $\ge 60\%$ | Immediate de-escalation of circuit breakers; resume regular model target exposure. |
 | **Friction / Inertia Threshold** | Held asset trim $\lvert\Delta W\rvert < \max(5\%,\ 30\% \times \text{weight})$; new position target $< 5\%$ | **HOLD**: Do not place orders to avoid commission and slippage drag. Live gates; the backtest uses an adaptive 2.5%–8% band instead. |
 | **Exit Confirmation** | Model target $= 0.0\%$ on a held asset | **Wait 2 evaluations**: only sell once the exit signal persists (`guard_latency_bars = 2`). |
