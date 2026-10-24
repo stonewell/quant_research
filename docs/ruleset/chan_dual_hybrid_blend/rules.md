@@ -13,7 +13,7 @@
 
 ## 1. Strategy Identity & Architecture Overview
 
-The **Chan Dual Hybrid Alpha Blend Strategy** is an institutional multi-strategy quantitative allocation engine. It blends structural central consolidation buy points (Chan Three-Type), Keller Vigilant Asset Allocation (Chan VAA Compound), and an expanded 4-factor orthogonal alpha sleeve (Alpha#53, Alpha#3, Alpha#41, Alpha#101), reinforced by **Dynamic Bull/Bear Regime Weighting**, a **Garman-Klass Volatility Engine**, **ATR Trailing Dynamic Stops**, and **Adaptive Asymmetric Friction Inertia Filtering**.
+The **Chan Dual Hybrid Alpha Blend Strategy** is an institutional multi-strategy quantitative allocation engine. It blends structural central consolidation buy points (Chan Three-Type), Keller Vigilant Asset Allocation (Chan VAA Compound), and an expanded 4-factor orthogonal alpha sleeve (Alpha#53, Alpha#3, Alpha#41, Alpha#101), reinforced by **Dynamic Bull/Bear Regime Weighting**, a **Garman-Klass Volatility Engine**, **ATR Trailing Dynamic Stops**, and **Adaptive Inertia Filtering** (asymmetric sell-bands exist in the backtest only — see Step 5).
 
 ```mermaid
 flowchart TD
@@ -29,7 +29,7 @@ flowchart TD
     
     RawBlend --> DDGate{"Portfolio Drawdown Gate\n(Peak NAV / HWM Check)"}
     DDGate -- "DD >= 20% (Tier 3 Hard Stop)" --> HardStop["Full Liquidation -> 100% Cash\nFreeze 21 Trading Days"]
-    DDGate -- "10% <= DD < 20% (Tier 1/2 Damping)" --> LinearDamp["Smooth Linear Damping (0.5x - 1.0x)\n15-Bar Auto-Heal & Momentum Recovery"]
+    DDGate -- "10% <= DD < 20% (Tier 1/2 Damping)" --> LinearDamp["Smooth Linear Damping (1.0x -> 0.0x)\n15-Bar Auto-Heal & Momentum Recovery"]
     DDGate -- "DD < 10% (Normal)" --> BreadthEngine{"Breadth & Thrust Check\n(Breadth >= 30% or Thrust >= 60%)"}
     
     BreadthEngine -- "Thrust Active & Idle Cash" --> AntiFragileThrust["【Anti-Fragile Pre-Emptive Thrust】\n1. Quality Gate: 10d ROC >= 1% & P >= SMA50\n2. Cooldown Lock: Exclude 15-day ATR stopped stocks\n3. Sector Throttle: Max 1 per sector (2 for leaders)\n4. Inverse-Vol Parity: Weight ∝ Score_i / GK_Vol_i"]
@@ -38,10 +38,10 @@ flowchart TD
     LinearDamp --> SizingCap
     
     SizingCap --> VolTarget{"Garman-Klass Volatility Targeting\n(Bull 24% | Chop 18% | Bear 12%)"}
-    VolTarget --> FrictionFilter{"Adaptive Asymmetric Inertia Filter\n(Sell Threshold: 0.5x to quickly free cash\nBuy Threshold: >= 4% to suppress churn\nEmergency Bypass: 0 Delay Execution)"}
+    VolTarget --> FrictionFilter{"Trade Inertia Gates (LIVE)\nHeld position: |Delta W| >= 5%\nNew position: target >= 3%\nExit: 2-bar confirmation\nEmergency: full bypass\n(Backtest instead: adaptive 2.5%-8%, sells at 0.60x)"}
     
     FrictionFilter -- "Rebalance Triggered or Emergency" --> ExecutionEngine["Order Execution Sequence:\n1. 14:25 Sells First -> 2. 14:35 Buys Second\n100-Share Lot Downward Rounding"]
-    FrictionFilter -- "Sub-threshold Noise" --> HoldPrior["Hold Prior Positions (Zero Friction)"]
+    FrictionFilter -- "Below gate" --> HoldPrior["Hold Prior Positions (Zero Friction)"]
     ExecutionEngine --> RepoSweep["14:55 Idle Cash Sweep to GC001 / R-001"]
 ```
 
@@ -84,14 +84,14 @@ flowchart LR
     T1["14:00 - 14:15\nStep 1: NAV Drawdown & Auto-Heal Check"] --> T2["14:15 - 14:25\nStep 2: Breadth, Sector Throttle & Thrust"]
     T2 --> T3["14:25 - 14:35\nStep 3: 【EXECUTE SELLS & STOPS FIRST】"]
     T3 --> T4["14:35 - 14:45\nStep 4: 【EXECUTE BUYS WITH FREED CASH】"]
-    T4 --> T5["14:45 - 14:50\nStep 5: Inertia Filtering & 100-Share Lots"]
+    T4 --> T5["14:45 - 14:50\nStep 5: Inertia Gates & 100-Share Lots"]
     T5 --> T6["14:55 - 15:00\nStep 6: GC001 Overnight Repo Sweep"]
 ```
 
 * **14:00 – 14:15**: Pull live portfolio valuation, calculate High-Water Mark (HWM) drawdown, check circuit breaker tiers, and review cooldown counters.
 * **14:15 – 14:25**: Measure percentage of stocks above 50d SMA (Breadth) and 10d positive return count (Thrust). Audit 15-day ATR cooldown locks and sector allocations to generate target weights.
 * **14:25 – 14:35**: **EXECUTE SELLS FIRST**. For assets triggering structural sells, 3.0 ATR dynamic trailing stops, or drawdown reductions, submit limit orders at bid to release purchasing power. Tag stopped assets with a 15-day cooldown lock.
-* **14:35 – 14:45**: **EXECUTE BUYS SECOND**. Utilizing verified freed cash and target weights, apply the asymmetric 4% inertia filter and 100-share downward lot rounding to place buy orders.
+* **14:35 – 14:45**: **EXECUTE BUYS SECOND**. Utilizing verified freed cash and target weights, apply the live inertia gates (held position $\ge 5\%$, brand-new position $\ge 3\%$ — see Step 5) and 100-share downward lot rounding to place buy orders.
 * **14:45 – 14:50**: Confirm execution fills, inspect pending orders, and log any partial executions.
 * **14:55 – 15:00**: **OVERNIGHT CASH SWEEP**. Direct 100% of remaining idle cash into `GC001` or `R-001` reverse repo for risk-free overnight yield enhancement.
 
@@ -110,8 +110,8 @@ $$\text{Drawdown} = \frac{\text{Current NAV} - \text{HWM}}{\text{HWM}}$$
    - **Fast Recovery Channel**: If 10-day trailing return $R_{10d} > 0$ or breadth thrust $\ge 60\%$:
      - **Bypass damping**; maintain full allocation ($1.0$) to capture post-panic V-shaped recoveries.
    - **ELSE (Smooth Linear Damping)**:
-     $$\text{scale}_{\text{DD}} = 1.0 - \left(\frac{|\text{Drawdown}| - 0.10}{0.20 - 0.10}\right) \times 0.50$$
-     Scale all equity positions down progressively (50%–100%), parking released capital into cash proxies.
+     $$\text{scale}_{\text{DD}} = \max\left(0.0,\ 1.0 - \frac{|\text{Drawdown}| - 0.10}{0.20 - 0.10}\right)$$
+     Scale all equity positions down progressively from **100% to 0%** (0% reduction at DD = 10%, exactly 50% at DD = 15%, 100% at DD = 20%), parking released capital into cash proxies. The discrete "× 0.5" branch exists in code (`pipeline/research/blend/blend_base.py:1075-1081`) but is **not** the deployed configuration: all six blends set `smooth_drawdown: true`; live applies the same continuous formula (`scripts/check_live_portfolio_health.py:380,384`).
    - **15-Day Auto-Heal**: If trapped in damping for **15 consecutive trading days**, reset HWM to current NAV to restore active alpha search.
 3. **Tier 3 Hard Stop ($\text{Drawdown} \le -20\%$)**:
    - **Full liquidation**: Sell 100% of risky assets into cash equivalents immediately.
@@ -159,13 +159,31 @@ Between **14:25 – 14:35**, evaluate positions. Liquidate immediately to **0.0%
 
 ---
 
-### Step 5: Adaptive Asymmetric Inertia & Round-Lot Rounding
+### Step 5: Trade Inertia Gates & Round-Lot Rounding
 
-1. **Asymmetric Inertia Threshold**:
-   - **Sells / De-risking**: Triggered when $|\Delta W_i| \ge 2.0\%$ (0.5x threshold) to free cash rapidly;
-   - **Buys / Re-weighting**: Blocked unless $|\Delta W_i| \ge 4.0\%$ to avoid stamp duty churn;
-   - **Emergency Exits**: Zero-delay bypass (100% immediate fill).
-2. **A-Share 100-Share Round-Lot Rule**:
+For every asset, compute the signed weight change at 14:00:
+$$\Delta W = W_{\text{target}} - W_{\text{current}}$$
+
+This strategy carries **one inertia parameter** (`cdhb_min_weight_change = 0.05`) and **a separate, looser entry gate** (`cdhb_entry_threshold = 0.03`). The "asymmetric 0.5x sell band" is a **backtest-only** feature of `blend_base.py` (and it is 0.60x there, not 0.5x) — **live sells do not get it**. Apply the **first** rule below that matches the asset's situation:
+
+| # | Situation | Live rule — what you actually do | Backtest rule — what the model did (different by design) |
+| :--- | :--- | :--- | :--- |
+| **1** | You **already hold** the asset — target **increased** (add) | Require $\lvert\Delta W\rvert \ge \mathbf{5\%}$. Below that, **do not trade**; the ticket prints `HOLD` with reason "调仓未超惰性阈值 (< 5%)". | Buy threshold = the per-asset adaptive value **2.5% – 8%** ($\mathrm{clip}(\tfrac{\sigma^{21d}_{\text{asset}}}{\sigma^{21d}_{\text{universe}}} \times 5\%,\ 2.5\%,\ 8\%)$), loosened further for fresh entries to $\min(\text{adaptive},\ 3\%)$. |
+| **2** | You **already hold** the asset — target **decreased** (trim / partial exit) | Require $\lvert\Delta W\rvert \ge \mathbf{5\%}$ — **the same 5% as an add**. There is no 2% or 2.5% "fast cash release" band in the live path. Below 5% the trim is refused (`HOLD`, "调仓未超惰性阈值 (< 5%)"). This is the one rule that runs **against** the backtest: the backtest trims **earlier**, the live runner trims **later**. | `asymmetric_sells` defaults **on** for this strategy, so the sell threshold is $0.60 \times$ the adaptive value, i.e. **1.5% – 4.8%** — deliberately more permissive than buys. |
+| **3** | You hold **nothing** in the asset (0% → new position) | Require **target weight $\ge \mathbf{3\%}$** (`cdhb_entry_threshold = 0.03`). Below 3%, **do not open**; the ticket prints `HOLD_FILTERED` with reason "目标仓位未达最低建仓/调仓门槛 (… 防微量试错损耗)". | The backtester's own 5% gate **does not apply to new positions** (assets not already held are exempt); the template-level filter gates entries at $\min(\text{adaptive},\ 3\%)$, i.e. **2.5% – 3%**. |
+| **4** | The model wants **0.0%** on an asset you hold (full exit) | Exempt from gates 1–3, but the exit must **persist 2 consecutive evaluation days** (`guard_latency_bars = 2`). Day 1 prints `PENDING_EXIT` / `HOLD_FILTERED` with reason "平仓信号进入确认期 (第 1/2 日待确认)". | Exits the same day the rebalance row carries 0.0% — no persistence requirement. |
+| **5** | ATR trailing stop, structural sell, or an account circuit breaker | **Sell 100% immediately** (Step 3). All inertia gates are bypassed outright — no residual "0.1% floor". Buys are never granted this bypass. | The per-symbol `asset_emergency_df` mask bypasses inertia for that asset and bar. |
+
+* **VERIFIED — the damping cut is itself gated, per asset, and is routinely refused.** The cut is applied **per asset**: every held name's weight is multiplied by the same `scale` factor, with the remainder swept into the cash proxy (`scripts/run_live_strategy.py:1766`; `pipeline/research/blend/blend_base.py:1069-1071`). Each name is therefore an **independent trim subject to its own threshold** — at DD = 15% the factor is 0.5, so a 6% position is cut to 3%, a 3pp change against the 5% gate, and is **refused that day**; the ticket shows `HOLD` with reason "调仓未超惰性阈值 (< 5%)". A 50% cut clears the gate only once the position is **≥ 10% of NAV**. This happens in **both paths**: live grants no risk-reduction exemption (the `is_stop` fast path only ever liquidates to 0.0 and only for stop-loss / `is_emergency_halt`, `common/position_lifecycle.py:363-420`; `is_emergency_halt` is Tier-3-only, `scripts/run_live_strategy.py:1927`), and the backtest's inertia filter swallows the same trim unless the asset-emergency bypass is on. Only the full-exit/stop paths in rules 4–5 liquidate regardless of size.
+* **The two paths also diverge in DD ∈ (17%, 20%)**: the backtest opens its bypass at `scale_dd < 0.30`, i.e. DD > 17% (`pipeline/research/blend/blend_base.py:1072` → `is_global_emergency`, `common/allocation_templates.py:233-251`), while live only force-liquidates at DD ≥ 20% (Tier 3). Between 17% and 20% the backtest applies the cut and live keeps blocking it.
+* **No override number is prescribed here.** On a Tier-1/2 day, reconcile the breaker tier against the reduction actually printed on the ticket before acting; whether to top a refused cut up manually is an account-owner policy decision, not a rule this manual can invent.
+
+* **No relative trim hurdle for this strategy**: no `inertia_relative_ratio` is configured, so the live trim gate never scales with the size of the position.
+* **No row-level gate in the backtest**: a rebalance row is emitted whenever *any* symbol's target moved, and it carries every symbol — per-symbol inertness within a live ticket has no backtest counterpart at row level.
+
+> ⚠️ **The live path and the backtest path differ by design, as currently implemented.** The direction of the asymmetry is *reversed*: the backtest frees cash by trimming at 1.5% – 4.8%, while the live runner requires the full 5% for every trim, and it refuses brand-new positions below 3% that the backtest would take. Consequently **live holdings may legitimately contain fewer names, and hold larger positions, than the backtest for the same date.** Do not reconcile the gap by inventing a 2% live sell band, waiving the entry gate, or forcing the backtest's name count.
+
+**A-Share 100-Share Round-Lot Rule** (applies after every gate above passes):
    $$\text{Shares}_i = \left\lfloor \frac{\text{NAV} \times W_{\text{Target}, i}}{P_{\text{Close}, i} \times 100} \right\rfloor \times 100$$
 
 ---
@@ -211,15 +229,17 @@ At 14:55 daily:
 | Dimension | Rule Check | Trigger Condition | Mandatory Trader Action |
 | :--- | :--- | :--- | :--- |
 | **Risk** | **Tier 3 Hard Stop** | Drawdown $\ge 20\%$ | **【Full Liquidation】**: Sell 100% equities into cash proxies; **21-day freeze**. Reset on day 22. |
-| **Risk** | **Tier 1/2 Damping** | $10\% \le \text{Drawdown} < 20\%$ | **【Linear Reduction】**: Scale positions by $\text{scale}_{\text{DD}}$ (50%–100%). 15-day auto-heal. |
+| **Risk** | **Tier 1/2 Damping** | $10\% \le \text{Drawdown} < 20\%$ | **【Linear Reduction】**: Scale positions by $\text{scale}_{\text{DD}} = 1 - (\lvert DD\rvert - 10\%)/10\%$ (0% cut at 10%, 50% at 15%, 100% at 20%). 15-day auto-heal. |
 | **Risk** | **Recovery Channel**| 10d return $> 0$ or thrust $\ge 60\%$ | **【Bypass Damping】**: Immediately restore 100% normal allocation. |
 | **Risk** | **ATR Trailing Stop**| Price drops below 3.0 ATR line | **【Cut & Lock】**: Sell 100% of asset; **lock into 15-day trading freeze**. |
 | **Regime** | **Momentum Thrust** | Positive 10d count $\ge 5$ stocks | **【Deploy Idle Cash】**: Allocate to qualified momentum leaders, max 20% per stock. |
 | **Quality**| **Trend Filter** | Price $< \text{SMA}_{50}$ or $R_{10d} < 1\%$ | **【Block Entry】**: Do not allocate capital; prevents falling knives. |
 | **Throttle**| **Sector Limit** | Sector already held | **【Sector Cap】**: Max 1 stock per sector (up to 2 for runaway leader sectors). |
-| **Execution**| **Asymmetric Sell**| De-risking $|\Delta W| \ge 2.0\%$ | **【Sell Immediately】**: Rapidly reclaim liquidity with minimal delay. |
-| **Execution**| **Inertia Buy Gate**| Increasing position $|\Delta W| < 4.0\%$ | **【Do Not Trade】**: Hold exact prior shares; eliminates stamp duty churn. |
-| **Execution**| **Emergency Bypass**| Stop loss or circuit breaker | **【Zero Delay】**: Bypass inertia filter completely; execute immediately. |
+| **Execution**| **Inertia (add gate)**| Held asset, add $\lvert\Delta W\rvert < 5\%$ | **【Do Not Trade】**: Hold exact prior shares. |
+| **Execution**| **Inertia (trim gate)**| Held asset, trim $\lvert\Delta W\rvert < 5\%$ | **【Do Not Trade】**: No 2% "fast cash" band exists live; hold exact prior shares. |
+| **Execution**| **Inertia (entry gate)**| New position target weight $< 3\%$ | **【Do Not Trade】**: Do not open a brand-new sub-3% line. |
+| **Execution**| **Exit Confirmation**| Model target $= 0.0\%$ on a held asset | **【Wait 2 Days】**: Sell only after the signal persists 2 consecutive evaluations. |
+| **Execution**| **Emergency Bypass**| Stop loss or circuit breaker | **【Zero Delay】**: Bypass all inertia gates completely; execute immediately. |
 | **Execution**| **Trade Order** | Portfolio rebalance | **【Sells First, Buys Second】**: 14:25 sells $\implies$ 14:35 buys. |
 | **Cash** | **Overnight Repo** | 14:55 unallocated cash | **【100% Sweep】**: Lend out via `GC001` or `R-001`. |
 

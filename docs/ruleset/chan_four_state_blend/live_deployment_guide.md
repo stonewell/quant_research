@@ -28,7 +28,7 @@ flowchart LR
         VT["Volatility Targeting<br/>σ=12% Barroso Scaling"]
         BT["Dynamic Cash & Thrust<br/>Max 80% Equity Exposure"]
         CAP["Strict Concentration<br/><b>Max 20% NAV / Stock</b>"]
-        TF["Turnover Friction Filter<br/><b>5% Inertia Threshold</b>"]
+        TF["Trade Inertia Gates<br/><b>Trim: max(5%, 30% of position)</b><br/><b>New entry: 5%</b><br/><b>Exit: 2-bar confirmation</b>"]
     end
 
     subgraph Execution["3. Order Routing"]
@@ -64,7 +64,7 @@ flowchart LR
   - **Tier 3 (DD $\ge 20\%$)**: Emergency halt — liquidate 100% of risky assets to Cash Proxy (`BIL` / `511880` / `GC001`) with a **21-day trading freeze**.
   - **Fast Recovery Override**: Immediate de-escalation of circuit breakers if short-term NAV recovery > 0 OR breadth thrust $\ge 60\%$.
   - **Auto-Healing Cooldown**: Tier 1/2 resets HWM after 15 sustained bars (`cfsb_tier1_cooldown_bars = 15`); Tier 3 resets HWM after 21 sustained bars.
-* **5% Turnover Friction Filter**: Ignores rebalance shifts $|\Delta W| < 5\%$ (`cfsb_min_weight_change = 0.05`) to prevent transaction cost erosion. Emergency sells for circuit breakers or $-8\%$ hard stops bypass the filter down to $0.1\%$ ($|\Delta W| \ge 0.001$).
+* **Trade Inertia Gates (three separate live rules, not one 5% filter)**: See `rules.md` Rule 3 for the authoritative table. Summary — (a) **trim of a held asset**: $\lvert\Delta W\rvert \ge \max(5\%,\ 0.30 \times \text{current weight})$, so at the 20% single-stock cap a trim needs 6%; (b) **brand-new position**: target weight $\ge 5\%$ (`cfsb_entry_threshold = 0.05`), a sub-5% new line is refused with `HOLD_FILTERED`; (c) **full exit**: exempt from (a) and (b) but requires the exit signal to persist **2 consecutive evaluations** (`guard_latency_bars = 2`). Base parameter `cfsb_min_weight_change = 0.05`; relative ratio `cfsb_inertia_relative_ratio = 0.30`. Emergency liquidations (circuit breakers, $-8\%$ hard stops) bypass every gate outright — there is no residual 0.1% band. **The backtest is different**: it scales the threshold per asset to an adaptive **2.5% – 8%** band and exempts new positions from its 5% gate, so live holdings can legitimately be fewer names than the backtest for the same date.
 * **Execution Sequence**: **SELLS FIRST** (release cash and margin capacity) $\rightarrow$ **BUYS SECOND** (exact lot-rounded sizing).
 
 ---
@@ -228,7 +228,7 @@ uv run python scripts/run_live_strategy.py \
 
 | Risk Scenario | Action Trigger | Operational Procedure |
 | :--- | :--- | :--- |
-| **Individual Stock Hard Stop** | Loss $\ge 8\%$ from entry price | **Market exit immediately**; bypass 5% inertia filter down to 0.1%. |
+| **Individual Stock Hard Stop** | Loss $\ge 8\%$ from entry price | **Market exit immediately**; every inertia gate is bypassed outright (no 0.1% floor applies). |
 | **Consolidation Stagnation** | Inside consolidation pivot $\ge 8$ bars without positive stroke momentum | Liquidate position down to 0.0% to eliminate capital drag (Lesson 16). |
 | **Breakout Invalidation Stop** | Close $< ZG \times (1 - 0.01)$ | Exceeds 1% tolerance band; exit position immediately. |
 | **Trailing Ratchet Stop** | Close $< ZG$ after upward stroke expansion | Exit position to lock in accrued segment gains. |
@@ -237,7 +237,8 @@ uv run python scripts/run_live_strategy.py \
 | **Tier 2 Circuit Breaker** | Portfolio DD $\ge 15\%$ from HWM | Rotate 100% of portfolio into `ChanVaaCompoundStrategy` defensive mode (70% cash buffer). |
 | **Tier 3 Circuit Breaker** | Portfolio DD $\ge 20\%$ from HWM | **Emergency halt**: 100% Cash liquidation; 21-day trading freeze (reset HWM on Day 22). |
 | **Fast Recovery Override** | Short-term NAV recovery > 0 OR 10d Thrust $\ge 60\%$ | Immediate de-escalation of circuit breakers; resume regular model target exposure. |
-| **Friction / Inertia Threshold** | Weight adjustment $|\Delta W| < 5\%$ | **HOLD**: Do not place orders to avoid commission and slippage drag. |
+| **Friction / Inertia Threshold** | Held asset trim $\lvert\Delta W\rvert < \max(5\%,\ 30\% \times \text{weight})$; new position target $< 5\%$ | **HOLD**: Do not place orders to avoid commission and slippage drag. Live gates; the backtest uses an adaptive 2.5%–8% band instead. |
+| **Exit Confirmation** | Model target $= 0.0\%$ on a held asset | **Wait 2 evaluations**: only sell once the exit signal persists (`guard_latency_bars = 2`). |
 
 ---
 

@@ -49,10 +49,10 @@ flowchart TD
     LinearDamp --> SizingCap
     
     SizingCap --> VolTarget{"Garman-Klass Volatility Targeting (12% Target Vol)"}
-    VolTarget --> FrictionFilter{"Adaptive Inertia Filter (|Delta W| >= 5%)"}
+    VolTarget --> FrictionFilter{"Trade Inertia Gates\n(held: |Delta W| >= 5%\nnew: target >= 3%\nexit: 2-bar confirmation\nbacktest: adaptive 2.5%-8%)"}
     
     FrictionFilter -- "Pass / Liquidation" --> ExecutionEngine["Order Execution Hierarchy:\n1. Phase 1: SELLS FIRST (free cash)\n2. Phase 2: BUYS SECOND (lot-rounded)\n3. Phase 3: POSITIONS HELD (inertia filtered)\n4. Phase 4: CASH SWEEP (overnight repo)"]
-    FrictionFilter -- "Delta W < 5%" --> HoldPrior["Maintain Existing Shares (Zero Trade Friction)"]
+    FrictionFilter -- "Below gate" --> HoldPrior["Maintain Existing Shares (Zero Trade Friction)"]
     ExecutionEngine --> RepoSweep["14:55 Idle Cash Sweep into GC001 / 511880"]
 ```
 
@@ -83,7 +83,7 @@ Human traders must execute the following 6-step checklist sequentially every tra
    Deploy freed cash into green `BUY` orders. Round share quantities down to board lot size (100 shares for A-shares). Skip positions displaying `⚠️ Below minimum board lot`.
    *Execution note for Alpha#12*: Place limit orders pegged to best bid/ask to avoid chasing volatility spikes.
 5. **14:45 – 14:50: Phase 3 — Verify Inertia Holds**
-   Confirm that all white `HOLD` positions (weight changes $< 5\%$) remain untouched.
+   Confirm that every white `HOLD` / `HOLD_FILTERED` position is left untouched — see Rule 3 for the three separate gates that produce such a row (they are **not** one 5% rule).
 6. **14:55 – 15:00: Phase 4 — Cash Proxy & Overnight Yield Sweep**
    Lend any remaining idle cash into Treasury repo (`GC001` / `R-001`) or currency ETFs (`511880.SH`).
 
@@ -96,8 +96,8 @@ $$\text{Drawdown} = \frac{\text{Current NAV} - \text{Peak NAV}}{\text{Peak NAV}}
 
 * **Normal Regime ($\text{Drawdown} < 10\%$)**: Full risk budget active. Single-stock position cap = 20% NAV.
 * **Tier 1 Smooth Damping ($10\% \le \text{Drawdown} < 15\%$)**: Linearly scale down target equity exposure:
-  $$\text{Scale} = \max\left(0.50, 1.0 - 5.0 \times (\text{Drawdown} - 0.10)\right)$$
-  Engage 15-day auto-healing cooldown tracker.
+  $$\text{Scale} = \max\left(0.0,\ 1.0 - \frac{\text{Drawdown} - 0.10}{0.10}\right)$$
+  i.e. **0% reduction at DD = 10%, exactly 50% at DD = 15%, 100% at DD = 20%** — the damping is continuous across the whole 10%–20% band, and live applies the identical formula (`scripts/check_live_portfolio_health.py:380,384`). The discrete "cut by 50% (× 0.5)" branch exists in code (`pipeline/research/blend/blend_base.py:1075-1081`) but is **not** the deployed configuration: all six blends set `smooth_drawdown: true`. Engage 15-day auto-healing cooldown tracker.
 * **Tier 2 Tactical Defense ($15\% \le \text{Drawdown} < 20\%$)**: Cap total equity exposure at 30%; allocate 70% to Cash Proxy.
 * **Tier 3 Emergency Halt ($\text{Drawdown} \ge 20\%$)**: Immediately liquidate 100% of all risky holdings into Cash Proxy. Enforce 15 trading days mandatory freeze.
 
@@ -106,11 +106,28 @@ $$\text{Drawdown} = \frac{\text{Current NAV} - \text{Peak NAV}}{\text{Peak NAV}}
 * **Position Ceiling**: Hard cap at 20% NAV per stock to prevent single-asset tail-risk traps.
 * **Order Style**: Limit orders strictly pegged to opposite-side bid/ask. No market orders.
 
-### Rule 3: 5% Adaptive Inertia Filter ($|\Delta W| \ge 5\%$)
-$$\Delta W = |W_{\text{target}} - W_{\text{current}}|$$
+### Rule 3: Trade Inertia — Three Live Rules (and a Different Backtest Rule Set)
 
-* **Standard Rebalance**: If $\Delta W < 5\%$, do NOT trade. Maintain existing position to eliminate unnecessary turnover friction.
-* **Complete Exit Override**: If target weight is $0.0\%$, liquidate all shares immediately without applying the 5% threshold.
+For every asset, compute the signed weight change at 14:00:
+$$\Delta W = W_{\text{target}} - W_{\text{current}}$$
+
+This strategy carries **one inertia parameter** (`ccsb_min_weight_change = 0.05`) **plus a separate, looser entry gate** (`ccsb_entry_threshold = 0.03`). Apply the **first** rule below that matches the asset's situation:
+
+| # | Situation | Live rule — what you actually do | Backtest rule — what the model did (different by design) |
+| :--- | :--- | :--- | :--- |
+| **1** | You **already hold** the asset and the target weight moved | Require $\lvert\Delta W\rvert \ge \mathbf{5\%}$. Below that, **do not trade**; the ticket prints `HOLD` with reason "调仓未超惰性阈值 (< 5%)". Re-evaluated every day. | Per-asset threshold is **adaptive, 2.5% – 8%**: $\mathrm{clip}\big(\tfrac{\sigma^{21d}_{\text{asset}}}{\sigma^{21d}_{\text{universe}}} \times 5\%,\ 2.5\%,\ 8\%\big)$. A second, backtester-level gate then applies the plain 5% — but **only to assets already held**. |
+| **2** | You hold **nothing** in the asset (0% → new position) | Require **target weight $\ge \mathbf{3\%}$** (`ccsb_entry_threshold = 0.03`), which is **looser** than rule 1. Below 3%, **do not open**; the ticket prints `HOLD_FILTERED` with reason "目标仓位未达最低建仓/调仓门槛 (… 防微量试错损耗)". A brand-new 2.9% line is refused. | The backtester's 5% gate **does not apply to new positions** (assets not already held are exempt); the template-level inertia filter gates entries only at $\min(\text{adaptive threshold},\ 3\%)$, i.e. **2.5% – 3%**. |
+| **3** | The model wants **0.0%** on an asset you hold (full exit) | The exit is **exempt** from the 5% threshold, but must **persist 2 consecutive evaluation days** (`guard_latency_bars = 2`) — relevant for the Alpha#12 reversal sleeve, whose entries are by nature one-day pulses. Day 1 prints `PENDING_EXIT` / `HOLD_FILTERED` with reason "平仓信号进入确认期 (第 1/2 日待确认)". | Exits the same day the rebalance row carries 0.0% — no persistence requirement. |
+| **4** | Hard stop, structural break, ATR trailing stop, or a **Tier-3** emergency halt | **Sell 100% immediately**. These are full liquidations, so all inertia gates and the 2-day exit confirmation are bypassed outright — the threshold is not consulted, so there is no residual "0.1% floor" to honour. Buys are never granted this bypass. | The per-symbol `asset_emergency_df` mask bypasses inertia for that asset and bar. |
+
+* **VERIFIED — the damping cut is itself gated, per asset, and is routinely refused.** The cut is applied **per asset**: every held name's weight is multiplied by the same `scale` factor, with the remainder swept into the cash proxy (`scripts/run_live_strategy.py:1766`; `pipeline/research/blend/blend_base.py:1069-1071`). Each name is therefore an **independent trim subject to its own threshold** — at DD = 15% the factor is 0.5, so a 6% position is cut to 3%, a 3pp change against the 5% gate, and is **refused that day**; the ticket shows `HOLD` with reason "调仓未超惰性阈值 (< 5%)". A 50% cut clears the gate only once the position is **≥ 10% of NAV**. This happens in **both paths**: live grants no risk-reduction exemption (the `is_stop` fast path only ever liquidates to 0.0 and only for stop-loss / `is_emergency_halt`, `common/position_lifecycle.py:363-420`; `is_emergency_halt` is Tier-3-only, `scripts/run_live_strategy.py:1927`), and the backtest's inertia filter swallows the same trim unless the asset-emergency bypass is on. Only the full-exit/stop paths in rule 3/4 liquidate regardless of size.
+* **The two paths also diverge in DD ∈ (17%, 20%)**: the backtest opens its bypass at `scale_dd < 0.30`, i.e. DD > 17% (`pipeline/research/blend/blend_base.py:1072` → `is_global_emergency`, `common/allocation_templates.py:233-251`), while live only force-liquidates at DD ≥ 20% (Tier 3). Between 17% and 20% the backtest applies the cut and live keeps blocking it.
+* **No override number is prescribed here.** On a Tier-1/2 day, reconcile the breaker tier against the reduction actually printed on the ticket before acting; whether to top a refused cut up manually is an account-owner policy decision, not a rule this manual can invent.
+
+* **No relative trim hurdle for this strategy**: no `inertia_relative_ratio` is configured, so the trim gate is the plain absolute 5% and never scales with the size of the position.
+* **No row-level gate in the backtest**: a rebalance row is emitted whenever *any* symbol's target moved, and it carries every symbol — per-symbol inertness within a live ticket has no backtest counterpart at row level.
+
+> ⚠️ **The live path and the backtest path differ by design, as currently implemented.** Rule 2 refuses brand-new positions below 3% that the backtest would take at 2.5% – 3%; rule 1 gates trims at a fixed 5% where the backtest uses an adaptive 2.5% – 8%; rule 3 delays every exit by two evaluations. Consequently **live holdings may legitimately contain fewer names than the backtest for the same date.** Do not reconcile the gap by waiving rule 2, by forcing the backtest's name count, or by pre-empting the exit confirmation.
 
 ---
 
@@ -122,9 +139,11 @@ $$\Delta W = |W_{\text{target}} - W_{\text{current}}|$$
 | **Stage 1: Damping**| $10\% \le \text{Drawdown} < 15\%$ | 🟡 **Smooth linear equity scaling**; engage 15-day cooldown counter |
 | **Stage 1: Bull** | $\text{Breadth} \ge 30\%$ or $\text{Thrust} \ge 60\%$ | 🟢 **Bull exposure active**; deploy cash into top momentum leaders |
 | **Stage 2: Sells** | Structural sell / ATR stop / target reduction | 🔴 **SELL FIRST** (14:20–14:35); execute at bid price to release cash |
-| **Stage 2: Buys** | Alpha#12 reversal or Three-Type buy $\ge 5\%$ | 🟢 **BUY SECOND** (14:35–14:45); floor to 100-share integer lot |
+| **Stage 2: Buys** | Alpha#12 reversal or Three-Type buy, target $\ge 5\%$ (new position $\ge 3\%$) | 🟢 **BUY SECOND** (14:35–14:45); floor to 100-share integer lot |
 | **Stage 2: Sub-lot** | Required shares $< 100$ | ⚪ **Skip order**; wait for larger allocation or keep prior shares |
-| **Stage 2: Inertia** | Target change $|\Delta W| < 5\%$ | ⚪ **HOLD position**; zero trading friction |
+| **Stage 2: Inertia (held)** | Held asset, target change $\lvert\Delta W\rvert < 5\%$ | ⚪ **HOLD**: no order; keep prior shares |
+| **Stage 2: Inertia (entry)** | New position target $< 3\%$ | ⚪ **HOLD_FILTERED**: do not open a brand-new sub-3% line |
+| **Stage 2: Exit** | Model target $= 0.0\%$ on a held asset | 🕒 **WAIT**: sell only after the signal persists 2 consecutive evaluations |
 | **Stage 2: Cash** | Idle cash after 14:55 | 💰 **Sweep into GC001 / R-001 repo**; earn overnight risk-free yield |
 
 ---
