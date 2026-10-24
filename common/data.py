@@ -18,7 +18,12 @@ import pandas as pd
 import yfinance as yf
 
 from .universe import _parse_module_specifier
-from .duckdb_cache import DuckDBCache, is_synthetic_provider, is_intraday_interval
+from .duckdb_cache import (
+    DuckDBCache,
+    HistoryRewriteRefused,
+    is_synthetic_provider,
+    is_intraday_interval,
+)
 
 
 @dataclass(frozen=True)
@@ -743,11 +748,38 @@ class CachedDataProvider(BaseDataProvider):
         interval: str = "1d",
         expected_last_session=None,
     ) -> Dict[str, pd.DataFrame]:
+        """Cache-backed multi-symbol fetch; a refused history rewrite is a HARD failure.
+
+        The per-symbol `try/except Exception` below is intentional: one broken symbol (bad
+        name, upstream outage, empty result) must not sink a whole universe, so those are
+        warned about and skipped -- that behaviour is unchanged.
+
+        `HistoryRewriteRefused` (L2.32, `common/duckdb_cache.py::store_bars`) must NOT take that
+        path. It does not mean "this symbol is unavailable"; it means the cache already holds
+        MATERIALLY DIFFERENT values for dates this fetch is about to overwrite -- a QFQ/basis
+        change, not a missing bar. Dropping such a symbol leaves the caller with a *smaller*
+        universe and downstream results that still look normal, which is the exact failure class
+        of the 2026-10-23 incident (a refetch `INSERT OR REPLACE`d 13,303 already-repaired rows)
+        wearing a different costume: "silent history rewrite" replaced by "silent symbol drop".
+        L2.32 review finding: because the refusal subclasses `RuntimeError` it landed in that
+        generic branch, so the only audit trail was a `warnings.warn` and a walk-forward batch
+        happily continued on a shrunken universe.
+
+        Therefore refusals are collected and re-raised as `RuntimeError` AFTER the loop, naming
+        every refused symbol and chaining the first refusal as `__cause__`. Fixing the basis is
+        a deliberate, auditable act (`scripts/repair_qfq_alignment.py`, or an explicitly declared
+        `store_bars(..., allow_history_rewrite=True, rewrite_reason=...)`), never a side effect
+        of a routine batch run that silently continued.
+        """
         if self.is_synthetic or not self.cache_dir or self.duckdb_cache is None:
             return super().fetch_universe(symbols, start, end, interval)
 
         provider_name = type(self.inner_provider).__name__
         covered_symbols = []
+        #: Refused-rewrite reports, kept apart from `covered_symbols` so they can hard-fail
+        #: instead of being skipped (see docstring).
+        refused: List[str] = []
+        refusal_cause: Optional[HistoryRewriteRefused] = None
 
         for symbol in symbols:
             try:
@@ -770,7 +802,30 @@ class CachedDataProvider(BaseDataProvider):
                     )
                     covered_symbols.append(symbol)
             except Exception as exc:
+                # ORDER MATTERS: `HistoryRewriteRefused` subclasses `RuntimeError` -> `Exception`,
+                # so without the isinstance test first it would be downgraded to a skipped symbol
+                # and the run would continue on a shrunken universe (L2.32 review finding).
+                if isinstance(exc, HistoryRewriteRefused):
+                    refused.append(f"{symbol}: {exc}")
+                    if refusal_cause is None:
+                        refusal_cause = exc
+                    continue
+                # Unchanged legacy behaviour: an unrelated provider/symbol failure only warns and
+                # skips that symbol -- do not turn ordinary upstream flakiness into a hard error.
                 warnings.warn(f"Skipping {symbol}: {exc}")
+
+        if refused:
+            raise RuntimeError(
+                f"fetch_universe aborted: {len(refused)} of {len(symbols)} symbol(s) were refused "
+                "by store_bars' history-rewrite gate, so returning the symbols that succeeded "
+                "would silently shrink the universe (2026-10-23 incident class). Refused -- "
+                + " | ".join(refused)
+                + ". Do not continue past this: either the stored history is correct and the "
+                "upstream basis changed (route the re-derivation through "
+                "scripts/repair_qfq_alignment.py), or the rewrite is genuinely intended and must "
+                "be declared explicitly via allow_history_rewrite=True + rewrite_reason before "
+                "re-running."
+            ) from refusal_cause
 
         return self.duckdb_cache.query_universe(
             provider_name,

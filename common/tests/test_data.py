@@ -31,6 +31,7 @@ from common.data import (
     load_universe,
     register_provider,
 )
+from common.duckdb_cache import HistoryRewriteRefused
 
 
 class CustomDummyProvider(BaseDataProvider):
@@ -287,6 +288,75 @@ def test_cached_data_provider_caches_through_fetch_universe(temp_csv_dir):
     uni2 = cached.fetch_universe(["SPY", "QQQ"], start="2020-01-01", end="2020-01-10")
     assert set(uni2.keys()) == {"SPY", "QQQ"}
     assert inner.calls == 2
+
+
+class _RescalableProvider(BaseDataProvider):
+    """Synthetic provider whose close basis and failure mode can be switched after warming.
+
+    Used to reach the real gate end-to-end: a cache warm at scale 1.0 followed by a fetch at
+    scale 1.02 is exactly the 2026-10-23 QFQ-basis-shift shape (a whole-span rescale), and
+    `fail_with` stands in for any ordinary upstream error.
+    """
+
+    def __init__(self):
+        self.close_scale = 1.0
+        self.fail_with = None
+
+    def fetch_ohlcv(self, symbol, start, end, interval="1d"):
+        if self.fail_with is not None:
+            raise self.fail_with
+        dates = pd.bdate_range(start, end)
+        n = len(dates)
+        return pd.DataFrame(
+            {
+                "Open": [10.0] * n,
+                "High": [12.0] * n,
+                "Low": [9.0] * n,
+                "Close": [11.0 * self.close_scale] * n,
+                "Volume": [100.0] * n,
+            },
+            index=dates,
+        )
+
+
+def test_fetch_universe_hard_fails_on_history_rewrite_refusal(temp_csv_dir):
+    """L2.32 review finding: a refused rewrite must ABORT the universe, never shrink it.
+
+    On 2026-10-23 a refetch silently rewrote 13,303 already-repaired rows. The gate now refuses
+    that, but `fetch_universe`'s `except Exception` caught the refusal and merely skipped the
+    symbol, so a walk-forward batch continued on a smaller universe and still looked normal --
+    "silent history rewrite" traded for "silent symbol drop". A refusal means the cache holds
+    DIFFERENT history, which must kill the run loudly and name the symbol.
+
+    The unrelated-failure half proves the legacy skip path is untouched: a plain `RuntimeError`
+    (the refusal's own base class, so this is a real dispatch test) still only warns and skips.
+    """
+    inner = _RescalableProvider()
+    cached = CachedDataProvider(inner, cache_dir=temp_csv_dir)
+
+    # (a) An unrelated provider failure: warned about and skipped, exactly as before.
+    inner.fail_with = RuntimeError("upstream 503")
+    with pytest.warns(UserWarning, match="Skipping QQQ"):
+        assert cached.fetch_universe(["QQQ"], start="2020-01-01", end="2020-01-10") == {}
+
+    # (b) Warm the cache for SPY on the original basis...
+    inner.fail_with = None
+    uni = cached.fetch_universe(["SPY"], start="2020-01-01", end="2020-01-10")
+    assert set(uni.keys()) == {"SPY"}
+
+    # ...then shift the provider's basis and ask for a WIDER end, so the coverage probe says
+    # "not covered" and the re-fetch collides with stored rows at 1.02x -> store_bars refuses.
+    inner.close_scale = 1.02
+    with pytest.raises(RuntimeError, match="fetch_universe aborted") as excinfo:
+        cached.fetch_universe(["SPY"], start="2020-01-01", end="2020-01-20")
+
+    message = str(excinfo.value)
+    assert "SPY" in message, "the hard failure must name the refused symbol"
+    assert "repair_qfq_alignment" in message, "and must name the audited route"
+    assert isinstance(excinfo.value.__cause__, HistoryRewriteRefused), (
+        "the refusal must be chained as __cause__ so the traceback still shows the gate's "
+        "own diagnosis (span, worst deviation, column)"
+    )
 
 
 def test_cached_data_provider_isolates_by_provider_class_name(temp_csv_dir):

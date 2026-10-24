@@ -19,6 +19,7 @@ import pytest
 
 from common.duckdb_cache import (
     DuckDBCache,
+    HistoryRewriteRefused,
     ProductionCachePathError,
     is_synthetic_provider,
     production_cache_guard_active,
@@ -1314,3 +1315,267 @@ def test_case10_none_path_matches_recorded_pre_l2_2_intraday_behaviour(symbol, s
         "FuyaoDataProvider", symbol, interval="5m", start=start, end=end, now=pd.Timestamp(now),
         expected_last_session=None,
     ) is expected
+
+
+# ---------------------------------------------------------------------------
+# L2.32: history-rewrite gate at the cache's single write chokepoint.
+#
+# `ohlcv_bars`' PK is (provider, symbol, date) and `store_bars` writes with a plain
+# `INSERT OR REPLACE`, i.e. an unconditional in-place overwrite. On 2026-10-23 a one-scalar-
+# per-symbol rescale from `common/financial_api.py` reached that statement through
+# `CachedDataProvider.fetch_ohlcv` and rewrote 13,303 stored rows over 2020-11-30..2023-12-29.
+# These tests pin the gate's exact contract: value-based (not date-based), rtol 1e-9, and a
+# declared opt-in for a genuine re-derivation.
+# ---------------------------------------------------------------------------
+
+
+def _gate_frame(periods: int = 5, start: str = "2020-01-01") -> pd.DataFrame:
+    """Distinct, non-degenerate synthetic OHLCV (a constant frame could hide a column mix-up)."""
+    dates = pd.bdate_range(start, periods=periods)
+    return pd.DataFrame(
+        {
+            "Open": [10.0 + i for i in range(periods)],
+            "High": [12.0 + i for i in range(periods)],
+            "Low": [9.0 + i for i in range(periods)],
+            "Close": [11.0 + i for i in range(periods)],
+            "Volume": [1000.0 + 10.0 * i for i in range(periods)],
+        },
+        index=dates,
+    )
+
+
+def test_store_bars_refuses_material_history_rewrite(disk_cache):
+    """A 2% close move on already-stored dates is a basis shift, not an append (2026-10-23).
+
+    Also proves the refusal writes NOTHING: the stored frame must be byte-identical after the
+    failed call, so a caught-and-continued caller cannot end up with a half-rewritten span.
+    """
+    df = _gate_frame()
+    disk_cache.store_bars("FuyaoDataProvider", "601225.SH", df)
+    before = disk_cache.query_bars("FuyaoDataProvider", "601225.SH")
+
+    rescaled = df.copy()
+    rescaled["Close"] = rescaled["Close"] * 1.02
+
+    with pytest.raises(HistoryRewriteRefused) as excinfo:
+        disk_cache.store_bars("FuyaoDataProvider", "601225.SH", rescaled)
+
+    message = str(excinfo.value)
+    assert "5 stored row(s)" in message  # every row of the frame collides and differs
+    assert "601225.SH" in message
+    assert "close" in message  # names the offending column
+    pd.testing.assert_frame_equal(
+        disk_cache.query_bars("FuyaoDataProvider", "601225.SH"), before, check_exact=True
+    )
+
+
+def test_store_bars_allows_idempotent_overlap(disk_cache):
+    """A refetch of the identical frame is a re-derivation of the same basis: allowed silently."""
+    df = _gate_frame()
+    disk_cache.store_bars("FuyaoDataProvider", "601225.SH", df)
+    before = disk_cache.query_bars("FuyaoDataProvider", "601225.SH")
+
+    disk_cache.store_bars("FuyaoDataProvider", "601225.SH", df)  # must not raise
+
+    pd.testing.assert_frame_equal(
+        disk_cache.query_bars("FuyaoDataProvider", "601225.SH"), before, check_exact=True
+    )
+
+
+def test_store_bars_allows_ulp_level_rewobble(disk_cache):
+    """A full re-derivation of the SAME basis wobbles by <=4e-16, ~7 orders below rtol=1e-9.
+
+    This is why the gate is tolerance-based: refusing any value change at all would make every
+    honest re-fetch of an overlapping window fail on double-rounding noise alone.
+    """
+    df = _gate_frame()
+    disk_cache.store_bars("FuyaoDataProvider", "601225.SH", df)
+
+    wobbled = df.copy()
+    wobbled["Close"] = wobbled["Close"] * (1 + 2e-16)
+    disk_cache.store_bars("FuyaoDataProvider", "601225.SH", wobbled)  # must not raise
+
+    stored = disk_cache.query_bars("FuyaoDataProvider", "601225.SH")
+    assert len(stored) == len(df)
+    assert np.allclose(stored["Close"], df["Close"] * (1 + 2e-16), rtol=0, atol=1e-12)
+
+
+def test_store_bars_allows_pure_append(disk_cache):
+    """New later dates only: no collision, no gate, row count grows -- the normal daily path."""
+    df = _gate_frame(periods=5)
+    disk_cache.store_bars("FuyaoDataProvider", "601225.SH", df)
+
+    tail = _gate_frame(periods=3, start="2020-01-08")
+    disk_cache.store_bars("FuyaoDataProvider", "601225.SH", tail)  # must not raise
+
+    stored = disk_cache.query_bars("FuyaoDataProvider", "601225.SH")
+    assert len(stored) == 8
+    assert stored.index.max() == tail.index.max()
+
+
+def test_store_bars_escape_hatch_allows_declared_rewrite(disk_cache, caplog):
+    """A genuine, declared re-derivation may rewrite -- and must leave a WARNING trace with the
+    caller's reason (the cache keeps no audit table, so the log is the only durable record)."""
+    df = _gate_frame()
+    disk_cache.store_bars("FuyaoDataProvider", "601225.SH", df)
+
+    rescaled = df.copy()
+    rescaled["Close"] = rescaled["Close"] * 1.02
+    with caplog.at_level(logging.WARNING, logger=duckdb_cache_module.__name__):
+        disk_cache.store_bars(
+            "FuyaoDataProvider",
+            "601225.SH",
+            rescaled,
+            allow_history_rewrite=True,
+            rewrite_reason="test: declared re-derivation",
+        )
+
+    stored = disk_cache.query_bars("FuyaoDataProvider", "601225.SH")
+    assert np.allclose(stored["Close"], rescaled["Close"], rtol=0, atol=1e-12)
+    assert any(
+        "HISTORY REWRITE" in rec.getMessage() and "test: declared re-derivation" in rec.getMessage()
+        for rec in caplog.records
+    ), "an allowed history rewrite must never be silent"
+
+
+def test_store_bars_escape_hatch_requires_a_reason(disk_cache):
+    """`allow_history_rewrite=True` without a non-blank reason is rejected before any SQL runs.
+
+    Why fail closed (L2.32 review item 4): the cache keeps no audit table, so the reason carried
+    into the WARNING is the ONLY durable record of a rewrite. A bare boolean reproduces exactly
+    the 2026-10-23 shape -- 13,303 rows overwritten with nothing recording who/why -- so the flag
+    without a reason must not reach the writer at all. `ValueError` (not
+    `HistoryRewriteRefused`) because this is a caller error, not a cache-history verdict.
+    """
+    df = _gate_frame()
+    disk_cache.store_bars("FuyaoDataProvider", "601225.SH", df)
+    before = disk_cache.query_bars("FuyaoDataProvider", "601225.SH")
+
+    rescaled = df.copy()
+    rescaled["Close"] = rescaled["Close"] * 1.02
+
+    for missing_reason in (None, "", "   \t\n "):
+        with pytest.raises(ValueError, match="requires a non-blank rewrite_reason"):
+            disk_cache.store_bars(
+                "FuyaoDataProvider",
+                "601225.SH",
+                rescaled,
+                allow_history_rewrite=True,
+                rewrite_reason=missing_reason,
+            )
+
+    pd.testing.assert_frame_equal(
+        disk_cache.query_bars("FuyaoDataProvider", "601225.SH"), before, check_exact=True
+    ), "the up-front guard must fire before anything is written"
+
+    # The hatch is still open WITH a reason (the guard must not close it accidentally).
+    disk_cache.store_bars(
+        "FuyaoDataProvider",
+        "601225.SH",
+        rescaled,
+        allow_history_rewrite=True,
+        rewrite_reason="test: declared re-derivation after the guard",
+    )
+    assert np.allclose(
+        disk_cache.query_bars("FuyaoDataProvider", "601225.SH")["Close"],
+        rescaled["Close"],
+        rtol=0,
+        atol=1e-12,
+    )
+
+
+def test_store_bars_refuses_volume_only_history_rewrite(disk_cache):
+    """A 1e-3 VOLUME-only change on stored dates is a rewrite too: the gate compares every column.
+
+    Why this case: the 2026-10-23 incident happened to leave `volume` untouched, so a gate that
+    only compared `close` would have looked correct while a volume-only (split/adjustment) rewrite
+    slipped through. Prices identical, one column moved 1e-3 -- refused, and nothing written.
+    """
+    df = _gate_frame()
+    disk_cache.store_bars("FuyaoDataProvider", "601225.SH", df)
+    before = disk_cache.query_bars("FuyaoDataProvider", "601225.SH")
+
+    volume_bumped = df.copy()
+    volume_bumped["Volume"] = volume_bumped["Volume"] * 1.001
+
+    with pytest.raises(HistoryRewriteRefused) as excinfo:
+        disk_cache.store_bars("FuyaoDataProvider", "601225.SH", volume_bumped)
+
+    message = str(excinfo.value)
+    assert "601225.SH" in message
+    assert "volume" in message, "the message must name the column that actually moved"
+    pd.testing.assert_frame_equal(
+        disk_cache.query_bars("FuyaoDataProvider", "601225.SH"), before, check_exact=True
+    )
+
+
+def test_store_bars_refuses_incoming_nan_and_schema_forbids_one_sided_null(disk_cache):
+    """An incoming NaN at a colliding date is a material difference; a stored NULL is impossible.
+
+    The NULL branch of the gate (`one side NULL` -> difference) is reachable only from the
+    INCOMING side: pandas NaN is handed to DuckDB through `register`, which converts it to SQL
+    NULL (verified here -- the refusal names the NaN column). A *stored* NULL cannot exist at all
+    because `ohlcv_bars` declares all five value columns NOT NULL (`_init_tables`), and
+    `store_bars` is the only writer, so the genuine one-sided "stored NULL vs value" case is
+    unreachable through the public API and is covered by the SQL construction only. The schema
+    assertion below keeps that claim honest: if a column ever becomes nullable, this test fails
+    and the real one-sided-NULL case must be written instead.
+    """
+    con = disk_cache._get_connection(read_only=True)
+    try:
+        info = con.execute("PRAGMA table_info('ohlcv_bars')").fetchall()
+    finally:
+        if not disk_cache.is_memory:
+            con.close()
+    not_null = {row[1]: bool(row[3]) for row in info}
+    for col in ("open", "high", "low", "close", "volume"):
+        assert not_null[col], (
+            f"ohlcv_bars.{col} must stay NOT NULL -- otherwise the gate needs a real "
+            f"stored-NULL-vs-value test, see this test's docstring"
+        )
+
+    df = _gate_frame()
+    disk_cache.store_bars("FuyaoDataProvider", "601225.SH", df)
+    before = disk_cache.query_bars("FuyaoDataProvider", "601225.SH")
+
+    with_nan = df.copy()
+    with_nan.iloc[2, with_nan.columns.get_loc("Close")] = float("nan")
+
+    with pytest.raises(HistoryRewriteRefused) as excinfo:
+        disk_cache.store_bars("FuyaoDataProvider", "601225.SH", with_nan)
+
+    message = str(excinfo.value)
+    assert "1 stored row(s)" in message  # only the NaN date differs
+    assert "close" in message
+    pd.testing.assert_frame_equal(
+        disk_cache.query_bars("FuyaoDataProvider", "601225.SH"), before, check_exact=True
+    )
+
+
+def test_store_bars_tolerance_boundaries(disk_cache):
+    """5e-10 relative passes, 2e-9 refuses. The EXACT 1e-9 boundary is deliberately NOT tested.
+
+    Why not 1e-9: `price * (1 + 1e-9)` is not representable exactly, so the relative deviation
+    the gate measures lands a few ULP either side of the threshold depending on the price and the
+    arithmetic -- a test pinned to it would be flaky by construction. These two probes sit
+    comfortably inside each regime (0.5x and 2x the tolerance) and are bit-stable.
+    """
+    df = _gate_frame()
+    disk_cache.store_bars("FuyaoDataProvider", "601225.SH", df)
+
+    below = df.copy()
+    below["Close"] = below["Close"] * (1 + 5e-10)
+    disk_cache.store_bars("FuyaoDataProvider", "601225.SH", below)  # must not raise
+    stored_below = disk_cache.query_bars("FuyaoDataProvider", "601225.SH")
+    assert np.allclose(stored_below["Close"], below["Close"], rtol=0, atol=1e-12)
+
+    above = df.copy()
+    above["Close"] = above["Close"] * (1 + 2e-9)
+    with pytest.raises(HistoryRewriteRefused) as excinfo:
+        disk_cache.store_bars("FuyaoDataProvider", "601225.SH", above)
+
+    assert "close" in str(excinfo.value)
+    # ...and the refused write left the *below*-tolerance state untouched.
+    pd.testing.assert_frame_equal(
+        disk_cache.query_bars("FuyaoDataProvider", "601225.SH"), stored_below, check_exact=True
+    )

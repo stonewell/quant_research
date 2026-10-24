@@ -38,6 +38,18 @@ logger = logging.getLogger(__name__)
 
 _REQUIRED_OHLCV_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 
+#: Relative tolerance of the `store_bars` history-rewrite gate (`HistoryRewriteRefused`).
+#: Chosen an order of magnitude above float ULP noise and far below any real re-basing:
+#:   * a full re-derivation of the SAME price basis rewrites every stored row with <= ~4e-16
+#:     relative wobble (double rounding on a handful of arithmetic ops), so 1e-9 lets an
+#:     idempotent re-fetch through silently -- which is what every legitimate incremental sync
+#:     produces, since its window starts in the past and therefore overlaps by construction;
+#:   * a genuine QFQ basis shift is a percent-level move (the 2026-10-23 incident's per-symbol
+#:     rescale factors were 0.9742-1.0127, i.e. 1e-2 relative), so it trips the gate.
+#: Absolute floor is 0.0 on purpose (`atol=0`): the columns are prices/volumes where "close to
+#: zero" is not a meaningful claim, and two genuinely-zero values compare exactly equal anyway.
+_HISTORY_REWRITE_RTOL = 1e-9
+
 #: Intraday interval -> bar length in minutes. This is the single source of both
 #: `_INTRADAY_INTERVALS` (what counts as intraday at all) and `_intraday_bar_interval`
 #: (how much tolerance the L2.26 session-reachability check allows), so the two can
@@ -201,6 +213,25 @@ _REPO_ROOT_MARKERS = ("AGENTS.md", ".git")
 
 class ProductionCachePathError(RuntimeError):
     """A pytest process tried to open the live market cache read-write."""
+
+
+class HistoryRewriteRefused(RuntimeError):
+    """store_bars refused to overwrite stored history with a materially different value.
+
+    Raised (before anything is written) when the incoming frame collides with rows already in
+    `ohlcv_bars` on `(provider, symbol, date)` AND at least one of those stored rows differs by
+    more than `_HISTORY_REWRITE_RTOL`. Deliberately independent of the sync script's
+    `QfqWriteRefused`: this module is shared infrastructure and must not import from `scripts/`.
+
+    2026-10-23 incident (motivating case): `CachedDataProvider.fetch_universe`
+    (`common/data.py:743-836`) saw a range as "not covered", re-fetched, and
+    `common/financial_api.py:802-808` applied ONE scalar per symbol
+    (`scale = rem_c / loc_c`, remote same-day close over local-MarketDB last close) to a whole
+    local block before handing it to `store_bars`. `store_bars`' plain `INSERT OR REPLACE`
+    (`ohlcv_bars` PK is `(provider, symbol, date)`, see `_init_tables`) then rewrote
+    2020-11-30..2023-12-29 in place -- 13,303 rows, `volume` untouched -- silently reverting four
+    symbols to values that had already been repaired away.
+    """
 
 
 def _truthy_env(name: str) -> bool:
@@ -1547,6 +1578,9 @@ class DuckDBCache:
         requested_end: Optional[str] = None,
         sync_time: Optional[datetime.datetime] = None,
         interval: str = "1d",
+        *,
+        allow_history_rewrite: bool = False,
+        rewrite_reason: Optional[str] = None,
     ) -> None:
         """Upserts daily OHLCV bars into ohlcv_bars and updates asset_sync_metadata.
 
@@ -1558,7 +1592,59 @@ class DuckDBCache:
         intact -- "we did not look earlier" is not "it is not there" (2026-10-22 downgrade
         incident) -- and a missing or contradicting metadata row is rebuilt/corrected from the
         bars instead of being taken at face value (L2.18), with a WARNING per repair.
+
+        HISTORY-REWRITE INVARIANT (L2.32): an incoming row whose `(provider, symbol, date)` is
+        already stored may only replace the stored row when its OHLCV agrees with the stored
+        values within `_HISTORY_REWRITE_RTOL` (rtol 1e-9, absolute floor 0.0). Any materially
+        different value raises `HistoryRewriteRefused` before a single row is written, unless the
+        caller declares the rewrite with `allow_history_rewrite=True` AND a non-blank
+        `rewrite_reason` (validated up front: flag-without-reason raises `ValueError` before any
+        work, because an unaudited rewrite is indistinguishable from the incident this gate
+        exists for). The OPT-IN IS STILL THE FLAG, never the reason -- `rewrite_reason` is only
+        consulted for the audit WARNING, and supplying it without the flag permits nothing.
+        `ohlcv_bars`' PK is `(provider, symbol, date)` and the write below is
+        `INSERT OR REPLACE`, i.e. an unconditional IN-PLACE OVERWRITE -- there was no date-collision
+        guard anywhere in the cache layer.
+
+        Why the gate is VALUE-based and not DATE-based: a pure "refuse any date collision" rule is
+        unusable, because every normal incremental sync overlaps by construction (its fetch window
+        starts in the past so it can see revisions at the seam). Refusing collisions outright would
+        reject every legitimate daily append. What distinguishes an append from a history rewrite
+        is not that a date repeats -- it is whether the repeated date's VALUES changed.
+
+        Why 1e-9: ULP-level float noise is ~2e-16, so a full re-derivation of the *same* basis
+        (which legitimately rewrites every overlapping row) must not trip the gate; a genuine QFQ
+        basis shift is percent-level (the 2026-10-23 incident's rescale ratios were 0.9742-1.0127).
+        1e-9 sits ~7 orders of magnitude above the noise floor and ~7 below any real re-basing.
+
+        The motivating incident (2026-10-23): `CachedDataProvider.fetch_universe`
+        (`common/data.py:743-836`) judged a range uncovered, re-fetched, and
+        `common/financial_api.py:802-808` multiplied the whole local block by ONE scalar per
+        symbol (`scale = rem_c / loc_c`). Because this method overwrote unconditionally, that
+        scalar reached 13,303 stored rows covering 2020-11-30..2023-12-29 (`volume` untouched)
+        and silently reverted four symbols to already-repaired-away damaged values. The sync
+        script's insert-only planner (commit `3a9fc11`) only protected that one writer; this gate
+        is the chokepoint every writer passes through.
+
+        `store_intraday_bars` is NOT gated here: it has its own R4 overlap-drift check (a
+        >1e-4 close drift triggers a declared purge + rewrite, a different policy).
         """
+        # FAIL-CLOSED on an unaudited rewrite (L2.32 review item): the escape hatch exists so a
+        # deliberate basis change can be RECORDED, not so a caller can flip a boolean and leave no
+        # trace. The cache keeps no audit table, so the reason in the WARNING below is the only
+        # durable record of who rewrote which span and why -- which is precisely what the
+        # 2026-10-23 incident lacked (13,303 rows rewritten, nothing logged). Checked before the
+        # intraday dispatch so the flag can never be silently accepted by a path that does not
+        # implement this policy (intraday has its own R4 drift gate).
+        if allow_history_rewrite and not str(rewrite_reason or "").strip():
+            raise ValueError(
+                "store_bars(allow_history_rewrite=True) requires a non-blank rewrite_reason: an "
+                "unaudited history rewrite is indistinguishable from the 2026-10-23 incident "
+                "(13,303 already-repaired rows silently overwritten). State why the declared "
+                "re-derivation is legitimate, or leave the flag off and route the fix through "
+                "scripts/repair_qfq_alignment.py."
+            )
+
         if is_intraday_interval(interval):
             return self.store_intraday_bars(
                 provider,
@@ -1600,8 +1686,169 @@ class DuckDBCache:
         })
 
         con = self._get_connection(read_only=False)
+        # Never ROLLBACK a transaction this call did not open: on the shared in-memory
+        # connection a caller could theoretically own one, and a failed `BEGIN` (nested
+        # transaction) must not destroy their work on the way out.
+        started_txn = False
         try:
             con.register("temp_bars_to_insert", records_df)
+            # ------------------------------------------------------------------------------
+            # ATOMICITY (L2.32 review item 2): the gate's SELECTs, the INSERT OR REPLACE and the
+            # `asset_sync_metadata` upsert run inside ONE explicit transaction (COMMIT at the end
+            # of this block, ROLLBACK in the handler below). DuckDB autocommits per statement, so
+            # before this the gate and the write were separate implicit transactions and a second
+            # writer could land rows in the gap -- the docstring's "same transaction" claim was an
+            # overstatement (the window was assessed benign because the check is value-level and
+            # self-consistent, but a caveat in a docstring is weaker than a transaction). It also
+            # makes partial failure impossible: previously a metadata-upsert error left the bars
+            # written and the metadata describing the old span.
+            # `register` stays OUTSIDE the transaction: it only publishes this call's frame as a
+            # view on this connection, holds no lock and writes nothing.
+            # ------------------------------------------------------------------------------
+            con.execute("BEGIN TRANSACTION")
+            started_txn = True
+            # ------------------------------------------------------------------------------
+            # HISTORY-REWRITE GATE (L2.32) -- runs before the INSERT OR REPLACE below, on the
+            # same connection, in the same transaction, with `temp_bars_to_insert` already
+            # populated so the comparison is a JOIN rather than a pandas round-trip (ohlcv_bars
+            # holds ~568k rows and this is the hot daily path).
+            #
+            # Why here: `INSERT OR REPLACE` with PK `(provider, symbol, date)` is an
+            # unconditional in-place overwrite. On 2026-10-23 a per-symbol rescale factor from
+            # `common/financial_api.py:802-808` (`scale = rem_c / loc_c`) reached this statement
+            # through `CachedDataProvider.fetch_ohlcv` and rewrote 13,303 stored rows
+            # (2020-11-30..2023-12-29) with `volume` untouched, reverting four symbols to
+            # already-repaired-away values. The sync script's insert-only planner (commit
+            # `3a9fc11`) only covered that one caller; this is the chokepoint every writer hits.
+            #
+            # Why VALUE-based, not DATE-based: incremental syncs overlap by construction, so
+            # "any collision is a rewrite" would refuse every legitimate daily append. A repeated
+            # date whose values did not change is an idempotent re-derivation.
+            #
+            # Why only-if-collisions: the pure append path (new tail dates, fresh symbol) must
+            # stay a single cheap COUNT; the two heavier queries below only run once a collision
+            # exists, and all three are pinned to this (provider, symbol) + the frame's date span
+            # so they ride `idx_ohlcv_lookup` instead of scanning the whole table.
+            # ------------------------------------------------------------------------------
+            n_collided = con.execute(
+                """
+                SELECT count(*)
+                FROM ohlcv_bars o
+                JOIN temp_bars_to_insert t
+                  ON o.provider = t.provider AND o.symbol = t.symbol AND o.date = t.date
+                WHERE o.provider = ? AND o.symbol = ? AND o.date BETWEEN ? AND ?
+                """,
+                [provider, symbol, frame_min_date, frame_max_date],
+            ).fetchone()[0]
+            if n_collided:
+                # Null-safe, tolerance-aware per-column difference. `o.<col>` is stored,
+                # `t.<col>` incoming: both NULL == equal, exactly one NULL == a difference (a
+                # vanished/added value is material), otherwise use rtol with a 0.0 absolute
+                # floor. The predicate is written as NOT(x <= tol) rather than x > tol so the
+                # one-NULL case cannot slip through by yielding SQL NULL instead of TRUE.
+                #
+                # NaN: `ohlcv_bars` declares all five value columns NOT NULL, and a pandas NaN
+                # arrives at DuckDB as SQL NULL through `register` (verified, L2.32 review item
+                # 3.2) -- so an incoming NaN at a colliding date takes the one-NULL branch and is
+                # refused as material. A native DuckDB NaN cannot reach either side of this
+                # comparison (stored values went through this same coercion), which is why the
+                # predicate does not special-case `isnan()`: DuckDB's total order makes
+                # `NaN <= NaN` TRUE, so a hypothetical NaN would compare EQUAL, not different.
+                diff_columns = ["open", "high", "low", "close", "volume"]
+                diff_predicate = " OR ".join(
+                    f"""(
+                        CASE
+                            WHEN o.{col} IS NULL AND t.{col} IS NULL THEN FALSE
+                            WHEN o.{col} IS NULL OR t.{col} IS NULL THEN TRUE
+                            ELSE NOT (
+                                abs(o.{col} - t.{col})
+                                <= {_HISTORY_REWRITE_RTOL!r}
+                                   * GREATEST(abs(o.{col}), abs(t.{col}))
+                            )
+                        END
+                    )"""
+                    for col in diff_columns
+                )
+                join_clause = (
+                    "FROM ohlcv_bars o JOIN temp_bars_to_insert t "
+                    "ON o.provider = t.provider AND o.symbol = t.symbol AND o.date = t.date "
+                    "WHERE o.provider = ? AND o.symbol = ? AND o.date BETWEEN ? AND ?"
+                )
+                gate_params = [provider, symbol, frame_min_date, frame_max_date]
+                n_diff, diff_min, diff_max = con.execute(
+                    f"""
+                    SELECT count(*), MIN(o.date), MAX(o.date)
+                    {join_clause} AND ({diff_predicate})
+                    """,
+                    gate_params,
+                ).fetchone()
+
+                if n_diff:
+                    # Worst deviation, as its own row: unpivot the 5 columns over only the
+                    # differing rows, then take the argmax. Gives the message the date/column
+                    # that a human needs to confirm "this is a basis shift, not noise".
+                    per_column = " UNION ALL ".join(
+                        f"""
+                        SELECT o.date AS d, '{col}' AS col,
+                               CASE
+                                   WHEN o.{col} IS NULL OR t.{col} IS NULL
+                                       THEN CAST('Infinity' AS DOUBLE)
+                                   ELSE abs(o.{col} - t.{col})
+                                        / NULLIF(
+                                              GREATEST(abs(o.{col}), abs(t.{col})), 0
+                                          )
+                               END AS dev
+                        {join_clause}
+                          AND CASE
+                                WHEN o.{col} IS NULL AND t.{col} IS NULL THEN FALSE
+                                WHEN o.{col} IS NULL OR t.{col} IS NULL THEN TRUE
+                                ELSE NOT (
+                                    abs(o.{col} - t.{col})
+                                    <= {_HISTORY_REWRITE_RTOL!r}
+                                       * GREATEST(abs(o.{col}), abs(t.{col}))
+                                )
+                              END
+                        """
+                        for col in diff_columns
+                    )
+                    worst_date, worst_col, worst_dev = con.execute(
+                        f"SELECT d, col, dev FROM ({per_column}) "
+                        "ORDER BY dev DESC NULLS LAST, d, col LIMIT 1",
+                        gate_params * len(diff_columns),
+                    ).fetchone()
+
+                    if not allow_history_rewrite:
+                        raise HistoryRewriteRefused(
+                            f"store_bars refused to rewrite {n_diff} stored row(s) for "
+                            f"{provider}/{symbol} over {diff_min}..{diff_max} "
+                            f"(worst rel dev {float(worst_dev):.1e} on {worst_col} at "
+                            f"{worst_date}); this is a QFQ basis change, not an append. "
+                            f"Route it through scripts/sync_china_5m_and_indices.py's "
+                            f"insert-only planner or scripts/repair_qfq_alignment.py, or pass "
+                            f"allow_history_rewrite=True with rewrite_reason=... for a declared, "
+                            f"audited re-derivation."
+                        )
+
+                    # Declared rewrite: allowed, but never silent -- the cache keeps no audit
+                    # table of its own, so the logger is the only durable trace of who rewrote
+                    # which span and why (mirrors the L2.18 self-heal WARNING convention above).
+                    # `rewrite_reason` is non-blank here by construction: the up-front guard
+                    # rejects the flag without a reason, so the old "<not supplied>" fallback was
+                    # removed rather than left as an unreachable branch.
+                    logger.warning(
+                        "store_bars HISTORY REWRITE allowed for (%s, %s): %s stored row(s) "
+                        "overwritten, %s..%s, worst rel dev %.1e on %s at %s. reason=%s",
+                        provider,
+                        symbol,
+                        n_diff,
+                        diff_min,
+                        diff_max,
+                        float(worst_dev),
+                        worst_col,
+                        worst_date,
+                        rewrite_reason,
+                    )
+
             con.execute("""
                 INSERT OR REPLACE INTO ohlcv_bars
                 SELECT provider, symbol, date, open, high, low, close, volume
@@ -1701,6 +1948,21 @@ class DuckDBCache:
                 bars_min_date,
                 bars_max_date,
             ])
+            con.execute("COMMIT")
+        except BaseException:
+            # Atomicity (L2.32 review item 2): the gate's SELECTs, the INSERT OR REPLACE and the
+            # metadata upsert are one transaction, so a failure anywhere (a refused rewrite, a
+            # NOT NULL violation on a NaN bar, a metadata error) leaves the cache EXACTLY as it
+            # was -- never bars written with stale metadata. `ROLLBACK` is best-effort and only
+            # fires for OUR transaction: if `BEGIN` itself failed (nested transaction) or DuckDB
+            # already aborted it, the original exception is the one worth propagating and the
+            # caller's state must be left alone. BaseException so Ctrl-C is also atomic.
+            if started_txn:
+                try:
+                    con.execute("ROLLBACK")
+                except Exception as rollback_exc:  # pragma: no cover - already-aborted txn
+                    logger.debug("store_bars ROLLBACK after failure was a no-op: %s", rollback_exc)
+            raise
         finally:
             if not self.is_memory:
                 con.close()
