@@ -100,6 +100,33 @@ Tests drive this script with `--data-provider synthetic --no-cache` only.
 `--data-provider` defaults to `synthetic` per `AGENTS.md`; the blend wrapper
 passes `fuyao` explicitly to preserve the old shell script's behavior.
 
+## Provenance (`L2.35`): what wrote these artifacts, on which code and which data
+
+`batch_summary.json` carries a `provenance` block, and the same object is written
+verbatim to a sibling `PROVENANCE.json` (so it can be checked without parsing a
+multi-megabyte summary). It records the FULL git HEAD plus a dirty flag and the
+dirty tracked paths, the sha256 of the price database the run read, an md5 per
+strategy dump actually consumed, and the run's start/end timestamps. Two named
+incidents are why this exists:
+
+* `pipeline/results/blend_17_baseline/{1,2}/` was regenerated **in place** on
+  2026-10-23 21:36-21:38 under a different strategy config than the 2026-10-20
+  15:35-15:49 run an audit had read. Two audits then disagreed by 4.4pp on the
+  same field (`mean_cagr`) and both were correct about their own inputs -- with
+  only `generated_at` in the summary there was no machine-checkable anchor tying
+  an artifact directory to the code+data that produced it.
+* One strategy's Sharpe was quoted as 1.473 in one record and 1.5624 in another
+  for the same nominal run; the 1.473 source is unrecoverable because
+  `pipeline/results/` is gitignored and the report CSV was overwritten.
+
+This is metadata only: it feeds no score, changes no ranking, and is collected
+once at the END of the run (the DB hash is a single streaming pass over the
+cache, ~323 MB today). It must NEVER be able to abort a batch: every probe fails
+independently to `null` and explains itself under `provenance["errors"]`, and a
+run whose every probe fails still writes its results and its summary.
+`verify_provenance(output_dir)` re-checks the cheap fields against the world as
+it is now and returns `(ok, mismatches)` instead of raising.
+
 ## Outputs (all under `--output-dir`, default `scripts/results/batch`)
 
 * `<output-dir>/batch_ranking.csv` -- the global ranking matrix, one row per
@@ -123,7 +150,12 @@ passes `fuyao` explicitly to preserve the old shell script's behavior.
   (header only) when nothing failed.
 * `<output-dir>/batch_summary.json` -- config, `ranking_rule`, `n_ok`/
   `n_failed`, every strategy's own `walkforward_summary.json` payload, the full
-  failed list with tracebacks, and the fold records.
+  failed list with tracebacks, the fold records, and the `provenance` block
+  (`provenance_file` names the standalone copy below).
+* `<output-dir>/PROVENANCE.json` -- the same `provenance` object, pretty-printed
+  with sorted keys, so an auditor can verify an artifact directory against the
+  current checkout/data without loading the summary. See the "Provenance"
+  section above.
 * `<output-dir>/<strategy stem>/` -- that strategy's untouched
   `run_backtest.py` artifacts (`walkforward_report.csv`,
   `walkforward_rebalances.csv`, `walkforward_summary.json`,
@@ -131,10 +163,14 @@ passes `fuyao` explicitly to preserve the old shell script's behavior.
 """
 
 import argparse
+import datetime as dt
 import glob
+import hashlib
 import json
 import os
+import platform
 import re
+import subprocess
 import sys
 import time
 import traceback
@@ -1026,6 +1062,364 @@ def _folds_frame(results) -> pd.DataFrame:
     return pd.DataFrame(frames, columns=FOLD_COLUMNS)
 
 
+# --------------------------------------------------------------------------- #
+# Provenance (`L2.35`): bind an artifact directory to the code + data + dumps
+# that produced it. See the module docstring's "Provenance" section for the two
+# incidents (the 2026-10-23 in-place regeneration of blend_17_baseline, and the
+# unrecoverable 1.473/1.5624 Sharpe pair) this exists to prevent.
+# --------------------------------------------------------------------------- #
+#: Bumped only when the SHAPE of the provenance object changes incompatibly, so a
+#: future reader can tell "this artifact predates field X" from "field X was null".
+PROVENANCE_SCHEMA_VERSION = 1
+#: Standalone copy, written next to `batch_summary.json` in the same directory.
+PROVENANCE_FILENAME = "PROVENANCE.json"
+#: Streaming read size for the DB hash. The cache is ~323 MB today; a 1 MiB chunk
+#: keeps peak RSS flat instead of materialising the whole file.
+_HASH_CHUNK_BYTES = 1024 * 1024
+#: `git` must never hang a finished batch. A `rev-parse`/`status` on a local repo
+#: is milliseconds; anything slower is a broken checkout, and the probe fails.
+_GIT_TIMEOUT_SECONDS = 30
+#: A dirty tree can list thousands of paths (e.g. a regenerated dumps directory);
+#: the first 50 plus the truncation flag are enough to reproduce the state.
+_MAX_DIRTY_PATHS = 50
+
+
+def _now_iso() -> str:
+    """Local wall-clock time as ISO 8601 WITH the UTC offset (`+08:00`).
+
+    Tz-naive `pd.Timestamp.now().isoformat()` (what `generated_at` uses) cannot be
+    ordered against a timestamp taken on another machine or in another zone --
+    which is exactly how a 15:35 run and a 21:36 in-place regeneration looked
+    interchangeable to `ls` in the blend_17_baseline incident.
+    """
+    return dt.datetime.now().astimezone().isoformat()
+
+
+def _sha256_file(path: str, chunk_bytes: int = _HASH_CHUNK_BYTES) -> str:
+    """Streaming sha256 of one file. Raises (OSError) if it cannot be read; every
+    caller here converts that into a recorded reason, never a crashed batch."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(chunk_bytes)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _md5_file(path: str, chunk_bytes: int = _HASH_CHUNK_BYTES) -> str:
+    """Streaming md5 of one strategy dump (the ticket asks for md5 there; it is a
+    cheap identity check on small JSON files, not a security primitive)."""
+    digest = hashlib.md5()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(chunk_bytes)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def resolve_cache_db_path(cache_dir: str = None) -> str:
+    """`--cache-dir` value -> the `.duckdb` FILE the run actually opens.
+
+    Mirrors `common.duckdb_cache.DuckDBCache.__init__`'s resolution verbatim
+    (directory, or any path not ending in `.duckdb`/`.db`, becomes
+    `<that>/cache.duckdb`). Deliberately NOT done by constructing a `DuckDBCache`:
+    that would CREATE the database (and trip its pytest production-path guard) just
+    to learn a filename, while this probe must stay a pure read.
+    """
+    if not cache_dir:
+        return None
+    abs_path = os.path.abspath(cache_dir)
+    if os.path.isdir(abs_path) or not (abs_path.endswith(".duckdb") or abs_path.endswith(".db")):
+        return os.path.join(abs_path, "cache.duckdb")
+    return abs_path
+
+
+def _run_git(git_args, cwd: str):
+    """One `git` invocation. Module-level so tests can monkeypatch it to raise
+    (proving a missing/broken git cannot abort a run) instead of touching PATH."""
+    return subprocess.run(
+        ["git", *git_args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=_GIT_TIMEOUT_SECONDS,
+    )
+
+
+def _git_failure_text(completed) -> str:
+    detail = ((completed.stderr or "").strip() or (completed.stdout or "").strip())[:300]
+    return f"git exited {completed.returncode}: {detail}" if detail else f"git exited {completed.returncode}"
+
+
+def _git_provenance(repo_root: str, errors: dict) -> tuple:
+    """(git_commit, git_dirty, git_dirty_paths, git_dirty_paths_truncated).
+
+    `--untracked-files=no`: untracked files (every `pipeline/results/` line, every
+    scratch file) are not code, so counting them would paint almost every run dirty
+    and destroy the signal. Each of the two probes fails independently.
+    """
+    commit = None
+    try:
+        completed = _run_git(["rev-parse", "HEAD"], repo_root)
+        if completed.returncode != 0:
+            errors["git_commit"] = _git_failure_text(completed)
+        else:
+            commit = (completed.stdout or "").strip() or None
+            if commit is None:
+                errors["git_commit"] = "git rev-parse HEAD produced no output"
+    except Exception as exc:  # noqa: BLE001 -- provenance must never abort the batch
+        errors["git_commit"] = f"{type(exc).__name__}: {exc}"
+
+    dirty, dirty_paths, truncated = None, [], False
+    try:
+        completed = _run_git(["status", "--porcelain", "--untracked-files=no"], repo_root)
+        if completed.returncode != 0:
+            errors["git_dirty"] = _git_failure_text(completed)
+        else:
+            lines = [line.rstrip() for line in (completed.stdout or "").splitlines() if line.strip()]
+            dirty = bool(lines)
+            # Porcelain format is XY<space>PATH (or "XY old -> new" for renames);
+            # keeping the raw tail preserves that distinction for a human reader.
+            dirty_paths = [line[3:] if len(line) > 3 else line for line in lines[:_MAX_DIRTY_PATHS]]
+            truncated = len(lines) > _MAX_DIRTY_PATHS
+    except Exception as exc:  # noqa: BLE001
+        errors["git_dirty"] = f"{type(exc).__name__}: {exc}"
+    return commit, dirty, dirty_paths, truncated
+
+
+def collect_provenance(
+    *,
+    strategy_paths=(),
+    db_path=None,
+    db_used=None,
+    seed=None,
+    run_started_at=None,
+    repo_root=None,
+) -> dict:
+    """Build the provenance object. NEVER raises, even if every probe fails.
+
+    Args:
+        strategy_paths: the exact dump files consumed, as the run resolved them
+            (`resolve_strategy_files` already returns absolute paths).
+        db_path: the resolved `.duckdb` FILE (`resolve_cache_db_path(cache_dir)`).
+        db_used: whether the run actually read that cache -- `--no-cache` and the
+            `synthetic` provider both bypass it, and a null `db_sha256` means
+            something different in each case. `False` skips hashing entirely (there
+            is no used DB to fingerprint); `None` (unknown) hashes if the file exists.
+        seed: `args.seed`, including its explicit `None` (the summary has always
+            recorded `config.seed: null`; provenance repeats it so a bare
+            `PROVENANCE.json` still says who ran with what).
+        run_started_at: captured near the TOP of `run_batch`, before the first fold.
+            Capturing it here (at write time) would make it a duplicate of
+            `generated_at` and prove nothing about the window the folds saw.
+        repo_root: the checkout the code ran from (default: this file's repo).
+
+    Every field that cannot be probed is `None` with a reason in `errors` keyed by
+    the FIELD name -- a silent null cannot be told apart from "probe failed" or
+    "genuinely empty", which is the whole class of ambiguity being fixed.
+    """
+    errors = {}
+    provenance = {
+        "schema_version": PROVENANCE_SCHEMA_VERSION,
+        "git_commit": None,
+        "git_dirty": None,
+        "git_dirty_paths": [],
+        "git_dirty_paths_truncated": False,
+        "db_path": None,
+        "db_used": None if db_used is None else bool(db_used),
+        "db_sha256": None,
+        "db_size_bytes": None,
+        "strategy_dumps": [],
+        "run_started_at": run_started_at,
+        "run_finished_at": None,
+        "seed": seed,
+        "host_platform": None,
+        "python_version": None,
+    }
+
+    commit, dirty, dirty_paths, truncated = _git_provenance(repo_root or _REPO_ROOT, errors)
+    provenance.update(
+        git_commit=commit,
+        git_dirty=dirty,
+        git_dirty_paths=dirty_paths,
+        git_dirty_paths_truncated=truncated,
+    )
+
+    # --- price database: one hash, at the END of the run, on the resolved path -- #
+    resolved_db = resolve_cache_db_path(db_path)
+    provenance["db_path"] = resolved_db
+    if resolved_db is None:
+        errors["db_path"] = "no cache directory was supplied (cache_dir could not be resolved)"
+    elif db_used is False:
+        # `--no-cache` and the `synthetic` provider both bypass the cache entirely,
+        # so there IS no "DB actually used" to fingerprint. Hashing the default
+        # `<repo>/data/cache.duckdb` anyway would (a) claim a DB the run never read
+        # and (b) put a ~323 MB read into every offline test. The resolved path is
+        # still reported (`db_used: false` disambiguates) so a reader can see WHERE
+        # the cache would have been.
+        errors["db_sha256"] = (
+            "cache not used by this run (--no-cache, or the synthetic provider bypasses it): "
+            "nothing was read from it"
+        )
+    else:
+        try:
+            if not os.path.exists(resolved_db):
+                # Legitimate (a cache never written) but it MUST say so: a bare null
+                # would read as "not collected".
+                errors["db_sha256"] = (
+                    f"{resolved_db} does not exist (the cache was never written)"
+                )
+            else:
+                provenance["db_size_bytes"] = int(os.path.getsize(resolved_db))
+                provenance["db_sha256"] = _sha256_file(resolved_db)
+        except Exception as exc:  # noqa: BLE001
+            errors["db_sha256"] = f"{type(exc).__name__}: {exc}"
+
+    # --- the strategy dumps actually consumed (md5 each, as the ticket specifies) #
+    for path in strategy_paths or ():
+        entry = {"path": path, "md5": None}
+        try:
+            entry["md5"] = _md5_file(path)
+        except FileNotFoundError:
+            # A dump resolved from a config/glob that is gone by write time (a
+            # concurrent `--dump-strategies` regeneration rewrote the directory).
+            # Recorded, not raised: the numbers already exist, the identity does not.
+            errors[f"strategy_dumps[{path}]"] = f"{path} does not exist (dump moved or never written)"
+        except Exception as exc:  # noqa: BLE001 -- a moved/undeclared dump is not fatal
+            errors[f"strategy_dumps[{path}]"] = f"{type(exc).__name__}: {exc}"
+        provenance["strategy_dumps"].append(entry)
+
+    if not run_started_at:
+        errors["run_started_at"] = "not captured by the caller (collect_provenance called outside run_batch)"
+
+    try:
+        provenance["host_platform"] = platform.platform()
+    except Exception as exc:  # noqa: BLE001
+        errors["host_platform"] = f"{type(exc).__name__}: {exc}"
+    try:
+        provenance["python_version"] = ".".join(sys.version.split()[0].split(".")[:3]) or None
+    except Exception as exc:  # noqa: BLE001
+        errors["python_version"] = f"{type(exc).__name__}: {exc}"
+
+    try:
+        provenance["run_finished_at"] = _now_iso()
+    except Exception as exc:  # noqa: BLE001
+        errors["run_finished_at"] = f"{type(exc).__name__}: {exc}"
+
+    # Attached LAST so `errors` reflects every probe above; it is part of the same
+    # object written to both places, so the summary and PROVENANCE.json cannot
+    # disagree about which probes failed.
+    provenance["errors"] = errors
+    return provenance
+
+
+def write_provenance_file(output_dir: str, provenance: dict):
+    """Persist `provenance` as `<output_dir>/PROVENANCE.json`; return its FILENAME.
+
+    The caller puts the same dict into `batch_summary.json["provenance"]`, so the
+    two copies are one serialisation of one object -- never a second computation
+    that could drift from the first. Returns `None` (with a reason appended to
+    `provenance["errors"]`) if the file cannot be written; the batch continues and
+    still writes its summary.
+    """
+    path = os.path.join(output_dir, PROVENANCE_FILENAME)
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(provenance, handle, indent=2, ensure_ascii=False, sort_keys=True)
+        return PROVENANCE_FILENAME
+    except Exception as exc:  # noqa: BLE001
+        provenance.setdefault("errors", {})["provenance_file"] = f"{type(exc).__name__}: {exc}"
+        return None
+
+
+def verify_provenance(output_dir: str, *, repo_root=None) -> tuple:
+    """`(ok, mismatches)` -- re-check a written `PROVENANCE.json` against reality.
+
+    Recomputes only the CHEAP fields, never the whole summary: `git_commit` (from
+    the current HEAD), `db_sha256` (one streaming pass over the cache) and each
+    dump's md5. That is the set that catches the two named incidents -- a result
+    directory regenerated from different code, different data, or different dumps.
+
+    A field recorded as `null` at write time (its probe already failed and said so
+    in `errors`) is NOT a mismatch: there is nothing to compare against. A field
+    recorded with a real value whose subject has since moved, been deleted, or been
+    edited IS a mismatch, reported with a `reason` -- never an exception, because
+    "I cannot verify this artifact" must be a verdict, not a crash.
+    """
+    path = os.path.join(output_dir, PROVENANCE_FILENAME)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            recorded = json.load(handle)
+    except Exception as exc:  # noqa: BLE001
+        return False, [{"field": PROVENANCE_FILENAME, "reason": f"{type(exc).__name__}: {exc}"}]
+    if not isinstance(recorded, dict):
+        return False, [{"field": PROVENANCE_FILENAME, "reason": "not a JSON object"}]
+
+    mismatches = []
+
+    def _add(field, reason, expected=None, actual=None):
+        mismatches.append({"field": field, "reason": reason, "expected": expected, "actual": actual})
+
+    # --- git HEAD ---------------------------------------------------------- #
+    expected_commit = recorded.get("git_commit")
+    if expected_commit:
+        try:
+            completed = _run_git(["rev-parse", "HEAD"], repo_root or _REPO_ROOT)
+            if completed.returncode != 0:
+                _add("git_commit", f"cannot verify: {_git_failure_text(completed)}", expected_commit)
+            else:
+                actual_commit = (completed.stdout or "").strip() or None
+                if actual_commit != expected_commit:
+                    _add("git_commit", "HEAD moved since this run", expected_commit, actual_commit)
+        except Exception as exc:  # noqa: BLE001
+            _add("git_commit", f"cannot verify: {type(exc).__name__}: {exc}", expected_commit)
+
+    # --- price database ---------------------------------------------------- #
+    expected_db = recorded.get("db_sha256")
+    if expected_db:
+        db_file = recorded.get("db_path")
+        if not db_file:
+            _add("db_sha256", "recorded sha256 but no db_path to check it against", expected_db)
+        elif not os.path.exists(db_file):
+            _add("db_sha256", f"{db_file} no longer exists", expected_db)
+        else:
+            try:
+                actual_db = _sha256_file(db_file)
+            except Exception as exc:  # noqa: BLE001
+                _add("db_sha256", f"cannot read {db_file}: {type(exc).__name__}: {exc}", expected_db)
+            else:
+                if actual_db != expected_db:
+                    _add("db_sha256", f"{db_file} bytes changed since this run", expected_db, actual_db)
+
+    # --- strategy dumps actually consumed ---------------------------------- #
+    for entry in recorded.get("strategy_dumps") or []:
+        if not isinstance(entry, dict):
+            _add("strategy_dumps", f"malformed entry: {entry!r}")
+            continue
+        dump_path, expected_md5 = entry.get("path"), entry.get("md5")
+        if not expected_md5:
+            continue  # already reported as unhashable at write time
+        field = f"strategy_dumps[{dump_path}]"
+        if not dump_path:
+            _add(field, "recorded md5 but no path", expected_md5)
+        elif not os.path.exists(dump_path):
+            _add(field, f"{dump_path} no longer exists (moved or deleted)", expected_md5)
+        else:
+            try:
+                actual_md5 = _md5_file(dump_path)
+            except Exception as exc:  # noqa: BLE001
+                _add(field, f"cannot read {dump_path}: {type(exc).__name__}: {exc}", expected_md5)
+            else:
+                if actual_md5 != expected_md5:
+                    _add(field, f"{dump_path} bytes changed since this run", expected_md5, actual_md5)
+
+    return (not mismatches), mismatches
+
+
 def _write_aggregates(output_dir, tasks, results, ranking, folds, args, meta) -> dict:
     os.makedirs(output_dir, exist_ok=True)
     ranking_path = os.path.join(output_dir, "batch_ranking.csv")
@@ -1089,6 +1483,39 @@ def _write_aggregates(output_dir, tasks, results, ranking, folds, args, meta) ->
             for outcome in results if outcome["status"] != "ok"
         },
     }
+
+    # --- provenance (`L2.35`), collected ONCE, appended as the LAST keys ------- #
+    # Append-only: every key above keeps its existing name, order and type, so the
+    # existing readers (and any audit that indexes `config`/`ranking`/`folds`)
+    # are untouched. Why it is here at all: an artifact directory used to be
+    # identifiable only by `generated_at`, which is how the 2026-10-23 in-place
+    # regeneration of blend_17_baseline looked identical to the 2026-10-20 run an
+    # audit had read (two audits, 4.4pp apart on `mean_cagr`, both right), and how
+    # one strategy's Sharpe could be quoted as both 1.473 and 1.5624 with the
+    # 1.473 source unrecoverable. This block is the machine-checkable anchor.
+    #
+    # `collect_provenance` already fails field-by-field internally; the try/except
+    # is the belt-and-braces guarantee that NO provenance bug can cost a run its
+    # results and its summary -- which would be a far worse failure than missing
+    # metadata. The DB is hashed here exactly once (never per fold/strategy).
+    try:
+        provenance = collect_provenance(
+            strategy_paths=[task["path"] for task in tasks],
+            db_path=meta.get("db_path"),
+            db_used=meta.get("db_used"),
+            seed=args.seed,
+            run_started_at=meta.get("run_started_at"),
+        )
+        provenance_file = write_provenance_file(output_dir, provenance)
+    except Exception as exc:  # noqa: BLE001
+        provenance = {
+            "schema_version": PROVENANCE_SCHEMA_VERSION,
+            "errors": {"collect_provenance": f"{type(exc).__name__}: {exc}"},
+        }
+        provenance_file = None
+    payload["provenance"] = provenance
+    payload["provenance_file"] = provenance_file
+
     summary_path = os.path.join(output_dir, "batch_summary.json")
     write_json_report(payload, summary_path)
     return {
@@ -1096,6 +1523,7 @@ def _write_aggregates(output_dir, tasks, results, ranking, folds, args, meta) ->
         "folds": folds_path,
         "failed": failed_path,
         "summary": summary_path,
+        "provenance": os.path.join(output_dir, provenance_file) if provenance_file else None,
     }
 
 
@@ -1130,6 +1558,12 @@ def run_batch(args) -> dict:
     """Run the whole batch. Returns the aggregate payload written to
     `batch_summary.json` (plus the written paths under `"paths"`)."""
     started = time.time()
+    # `run_started_at` is captured HERE, before any fold runs (`L2.35`): taking it
+    # at write time would make it a duplicate of `generated_at` and say nothing
+    # about the window the folds actually saw. That window is what distinguishes
+    # the 2026-10-20 15:35-15:49 blend_17_baseline run from its 2026-10-23
+    # 21:36-21:38 in-place regeneration.
+    run_started_at = _now_iso()
     if sum([bool(args.china_trading), bool(args.us_trading), bool(args.hk_trading)]) > 1:
         raise ValueError("Only one of --china-trading, --us-trading, --hk-trading may be enabled.")
 
@@ -1242,6 +1676,14 @@ def run_batch(args) -> dict:
         "load_start": load_start,
         "n_jobs": n_jobs,
         "elapsed_seconds": elapsed,
+        # `L2.35`: the DB file this run actually opened, resolved exactly like
+        # `DuckDBCache.__init__` does (`<cache_dir>/cache.duckdb`), plus whether the
+        # cache was consulted at all. `--no-cache` and the `synthetic` provider both
+        # bypass it, and a null `db_sha256` means something different in each case --
+        # so it is recorded rather than guessed at read time.
+        "db_path": resolve_cache_db_path(cache_dir),
+        "db_used": bool(not args.no_cache and str(args.data_provider).strip().lower() != "synthetic"),
+        "run_started_at": run_started_at,
     }
     paths = _write_aggregates(output_dir, tasks, results, ranking, folds, args, meta)
 
@@ -1255,6 +1697,8 @@ def run_batch(args) -> dict:
     print(f"Fold detail:    {paths['folds']}")
     print(f"Failed list:    {paths['failed']}")
     print(f"JSON summary:   {paths['summary']}")
+    if paths.get("provenance"):
+        print(f"Provenance:     {paths['provenance']}")
     return {
         "n_strategies": len(tasks), "n_ok": n_ok, "n_failed": len(results) - n_ok,
         "elapsed_seconds": elapsed, "paths": paths, "ranking": ranking,

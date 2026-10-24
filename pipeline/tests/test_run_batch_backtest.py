@@ -29,6 +29,7 @@ provider over those same synthetic frames, always with `--no-cache`, and never
 a real market provider.
 """
 
+import hashlib
 import json
 import os
 import subprocess
@@ -584,3 +585,221 @@ def test_ranking_matrix_sorts_by_sharpe_then_calmar_and_leaves_failures_unranked
     # The ranking matrix carries all three required metrics.
     for column in ("mean_sharpe_ratio", "mean_calmar_ratio", "mean_max_drawdown"):
         assert column in ranking.columns
+
+
+# --------------------------------------------------------------------------- #
+# 11. Provenance (`L2.35`): an artifact directory must be bindable to the code,
+#     the price DB and the strategy dumps that produced it.
+#
+#     Regression history (why these tests exist): `blend_17_baseline/{1,2}/` was
+#     regenerated IN PLACE on 2026-10-23 21:36-21:38 under a different strategy
+#     config than the 2026-10-20 15:35-15:49 run an audit had read, so two audits
+#     differed by 4.4pp on `mean_cagr` with both right about their own inputs; and
+#     one strategy's Sharpe was quoted as 1.473 in one record and 1.5624 in another
+#     for the same nominal run with the 1.473 source unrecoverable. `generated_at`
+#     alone is not an anchor: it says WHEN, not WHAT (code + data + dumps).
+# --------------------------------------------------------------------------- #
+def _fake_git(commit="a" * 40, porcelain=""):
+    """A `git` stand-in: same shape as `subprocess.CompletedProcess`, no subprocess."""
+    import types
+
+    def _run(git_args, cwd):
+        if git_args and git_args[0] == "rev-parse":
+            return types.SimpleNamespace(returncode=0, stdout=commit + "\n", stderr="")
+        return types.SimpleNamespace(returncode=0, stdout=porcelain, stderr="")
+
+    return _run
+
+
+def _write_fake_dump(directory, name, body="{}"):
+    path = os.path.join(str(directory), f"{name}.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(body)
+    return path
+
+
+def _write_aggregates_with_provenance(tmp_path, dumps, db_file, run_started_at="2026-10-20T15:35:00+08:00"):
+    """Drive the REAL writer (`_write_aggregates`) over fake tasks/results, so the
+    assertion is about the file layout a run actually produces, not a re-implementation."""
+    out = os.path.join(str(tmp_path), "out")
+    tasks = [
+        {"path": path, "name": os.path.splitext(os.path.basename(path))[0],
+         "results_dir": os.path.join(out, "subdir"), "template_name": "equal_weight"}
+        for path in dumps
+    ]
+    results = []
+    for task in tasks:
+        outcome = _fake_outcome(task["name"], sharpe=1.5624, calmar=0.9)
+        outcome["path"] = task["path"]
+        results.append(outcome)
+    ranking = batch._ranking_frame(tasks, results)
+    folds = batch._folds_frame(results)
+    args = batch.build_arg_parser().parse_args(
+        ["--strategies", dumps[0], "--universe", "SYM0", "--output-dir", out]
+    )
+    meta = {
+        "symbols": ["SYM0"], "load_start": START, "n_jobs": 1, "elapsed_seconds": 1.0,
+        "db_path": db_file, "db_used": True, "run_started_at": run_started_at,
+    }
+    batch._write_aggregates(out, tasks, results, ranking, folds, args, meta)
+    return out
+
+
+def _load_json(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def test_provenance_is_written_and_matches_the_standalone_copy(tmp_path, monkeypatch):
+    """`batch_summary.json["provenance"]` and `PROVENANCE.json` must be ONE object
+    serialised twice -- a second, independent computation would let them drift,
+    which is exactly the class of ambiguity being fixed. Also pins the append-only
+    rule: every pre-existing key keeps its name/order/type and the two new keys land
+    at the end."""
+    monkeypatch.setattr(batch, "_run_git", _fake_git(porcelain=" M scripts/run_batch_backtest.py\n"))
+    db_bytes = b"not-really-duckdb-but-stable" * 100
+    db_file = str(tmp_path / "data" / "cache.duckdb")
+    os.makedirs(os.path.dirname(db_file), exist_ok=True)
+    with open(db_file, "wb") as handle:
+        handle.write(db_bytes)
+    dumps = [_write_fake_dump(tmp_path, "blend_a", '{"a": 1}'),
+             _write_fake_dump(tmp_path, "blend_b", '{"b": 2}')]
+
+    out = _write_aggregates_with_provenance(tmp_path, dumps, db_file)
+    summary = _load_json(os.path.join(out, "batch_summary.json"))
+    provenance = summary["provenance"]
+
+    # --- one object, two files ------------------------------------------- #
+    assert summary["provenance_file"] == batch.PROVENANCE_FILENAME
+    standalone = os.path.join(out, summary["provenance_file"])
+    assert os.path.exists(standalone), "provenance_file must point at an existing file"
+    assert _load_json(standalone) == provenance
+
+    # --- append-only: the pre-existing shape is untouched ----------------- #
+    assert [key for key in summary][-2:] == ["provenance", "provenance_file"]
+    assert [key for key in summary][:5] == ["task", "description", "generated_at", "config", "ranking_rule"]
+    assert summary["task"] == "B2.3"
+    assert summary["config"]["seed"] is None, "config.seed must stay an explicit null"
+    assert summary["n_ok"] == len(dumps) and summary["n_failed"] == 0
+
+    # --- the fields the ticket names, with real values -------------------- #
+    assert set(provenance) == {
+        "schema_version", "git_commit", "git_dirty", "git_dirty_paths",
+        "git_dirty_paths_truncated", "db_path", "db_used", "db_sha256", "db_size_bytes",
+        "strategy_dumps", "run_started_at", "run_finished_at", "seed", "host_platform",
+        "python_version", "errors",
+    }
+    assert provenance["schema_version"] == batch.PROVENANCE_SCHEMA_VERSION
+    assert provenance["git_commit"] == "a" * 40
+    assert provenance["git_dirty"] is True
+    assert provenance["git_dirty_paths"] == ["scripts/run_batch_backtest.py"]
+    assert provenance["db_path"] == os.path.abspath(db_file)
+    assert provenance["db_used"] is True
+    assert provenance["db_sha256"] == hashlib.sha256(db_bytes).hexdigest()
+    assert provenance["db_size_bytes"] == len(db_bytes)
+    assert [entry["path"] for entry in provenance["strategy_dumps"]] == dumps
+    for entry, path in zip(provenance["strategy_dumps"], dumps):
+        assert entry["md5"] == hashlib.md5(_read_bytes(path)).hexdigest()
+    # Started is what `run_batch` captured BEFORE the first fold -- passed through
+    # verbatim, never overwritten with the write time (that would equal
+    # `generated_at` and prove nothing).
+    assert provenance["run_started_at"] == "2026-10-20T15:35:00+08:00"
+    assert provenance["run_finished_at"] > provenance["run_started_at"]
+    assert provenance["seed"] is None
+    assert provenance["python_version"].count(".") == 2
+    assert provenance["errors"] == {}
+
+
+def test_verify_provenance_detects_a_tampered_dump_and_a_tampered_db(tmp_path, monkeypatch):
+    """The ticket's acceptance case: after verifying clean, editing EITHER the dump
+    or the DB bytes must fail verification, and the mismatch list must NAME the
+    field (a bare `False` would leave an auditor guessing which input moved)."""
+    monkeypatch.setattr(batch, "_run_git", _fake_git())
+    db_file = str(tmp_path / "cache.duckdb")
+    with open(db_file, "wb") as handle:
+        handle.write(b"original-db")
+    dump = _write_fake_dump(tmp_path, "blend_a", '{"a": 1}')
+    out = _write_aggregates_with_provenance(tmp_path, [dump], db_file)
+
+    ok, mismatches = batch.verify_provenance(out)
+    assert ok is True, mismatches
+    assert mismatches == []
+
+    # (a) a dump's BYTES change -> its own field is named.
+    with open(dump, "a", encoding="utf-8") as handle:
+        handle.write(" ")
+    ok, mismatches = batch.verify_provenance(out)
+    assert ok is False
+    assert [m["field"] for m in mismatches] == [f"strategy_dumps[{dump}]"]
+    assert "bytes changed" in mismatches[0]["reason"]
+    assert mismatches[0]["expected"] != mismatches[0]["actual"]
+
+    # ...and a dump that MOVED (or was deleted) is a verdict with a reason, not a raise.
+    _write_fake_dump(tmp_path, "blend_a", '{"a": 1}')  # restore the bytes
+    os.remove(dump)
+    ok, mismatches = batch.verify_provenance(out)
+    assert ok is False
+    assert "no longer exists" in mismatches[0]["reason"]
+
+    # (b) the DB's bytes change -> `db_sha256` is named.
+    _write_fake_dump(tmp_path, "blend_a", '{"a": 1}')
+    with open(db_file, "wb") as handle:
+        handle.write(b"regenerated-db")
+    ok, mismatches = batch.verify_provenance(out)
+    assert ok is False
+    assert [m["field"] for m in mismatches] == ["db_sha256"]
+    assert "bytes changed" in mismatches[0]["reason"]
+
+    # ...and a MISSING DB likewise: "I cannot verify" is a mismatch with a reason.
+    os.remove(db_file)
+    ok, mismatches = batch.verify_provenance(out)
+    assert ok is False
+    assert [m["field"] for m in mismatches] == ["db_sha256"]
+    assert "no longer exists" in mismatches[0]["reason"]
+
+
+def test_verify_provenance_reports_a_missing_provenance_file_instead_of_raising(tmp_path):
+    ok, mismatches = batch.verify_provenance(os.path.join(str(tmp_path), "nope"))
+    assert ok is False
+    assert mismatches[0]["field"] == batch.PROVENANCE_FILENAME
+    assert "FileNotFoundError" in mismatches[0]["reason"]
+
+
+def test_collect_provenance_never_breaks_the_run_when_every_probe_fails(tmp_path, monkeypatch):
+    """No git, no DB, no dump: every field falls back to `null` with a REASON, the
+    object still serialises, and `batch_summary.json` still gets written. A batch
+    that ran 55 strategies must never lose its results to a metadata probe."""
+    def _exploding_git(git_args, cwd):
+        raise FileNotFoundError("git not found")
+
+    monkeypatch.setattr(batch, "_run_git", _exploding_git)
+    missing_db = str(tmp_path / "data" / "cache.duckdb")     # never created
+    missing_dump = str(tmp_path / "gone.json")               # never created
+
+    provenance = batch.collect_provenance(
+        strategy_paths=[missing_dump], db_path=missing_db, db_used=None,
+        seed=None, run_started_at="2026-10-20T15:35:00+08:00",
+    )
+    assert isinstance(provenance, dict)
+    assert provenance["git_commit"] is None and "git not found" in provenance["errors"]["git_commit"]
+    assert provenance["git_dirty"] is None and "git not found" in provenance["errors"]["git_dirty"]
+    assert provenance["db_path"] == os.path.abspath(missing_db)
+    assert provenance["db_sha256"] is None and "does not exist" in provenance["errors"]["db_sha256"]
+    assert provenance["db_size_bytes"] is None
+    assert provenance["strategy_dumps"] == [{"path": missing_dump, "md5": None}]
+    assert "does not exist" in provenance["errors"][f"strategy_dumps[{missing_dump}]"]
+    json.dumps(provenance)  # serialisable: no exception escapes, no exotic object
+
+    # A run that bypassed the cache (`--no-cache` / synthetic) must not fingerprint
+    # a DB it never read -- and must say why `db_sha256` is null.
+    bypassed = batch.collect_provenance(db_path=missing_db, db_used=False, run_started_at="2026-10-20T15:35:00+08:00")
+    assert bypassed["db_sha256"] is None and bypassed["db_used"] is False
+    assert "cache not used" in bypassed["errors"]["db_sha256"]
+
+    # The summary is still produced, with the failure reasons alongside it.
+    out = _write_aggregates_with_provenance(tmp_path, [_write_fake_dump(tmp_path, "blend_a")], missing_db)
+    summary = _load_json(os.path.join(out, "batch_summary.json"))
+    assert summary["provenance"]["git_commit"] is None
+    assert "git not found" in summary["provenance"]["errors"]["git_commit"]
+    assert summary["n_ok"] == 1
+    assert os.path.exists(os.path.join(out, summary["provenance_file"]))

@@ -1616,3 +1616,195 @@ def test_run_walkforward_dynamic_universe_with_late_listed_symbol():
     # Fold where LATE is trading should also run successfully
     assert np.isfinite(folds[-1]["sharpe_ratio"])
     assert folds[-1]["total_rebalances"] > 0
+
+
+# --- L2.34: the baseline arm's deliberate frictionless-trading overrides ---
+
+
+def _baseline_arm_args(**overrides):
+    """An args object shaped like `_run_baseline`'s `baseline_args`
+    (`backtester/run_backtest.py:950-959`): a market index bought as a
+    frictionless single instrument -- no board lots (`min_shares=0`), no venue
+    circuit breakers / T+1 / stamp duty (all three `*_trading` flags False) --
+    but still charged the caller's real commission and slippage
+    (`--commission-pct` / `--slippage-pct` are deliberately NOT overridden).
+    """
+    kwargs = dict(
+        initial_capital=100_000.0,
+        commission_pct=0.0005,
+        slippage_pct=0.0005,
+        min_shares=0,
+        min_weight_change=0.0,
+        china_trading=False,
+        us_trading=False,
+        hk_trading=False,
+        window_years=0.2,
+        step_years=0.2,
+    )
+    kwargs.update(overrides)
+    return MockArgs(**kwargs)
+
+
+def _single_symbol_baseline_universe(n_bars=120):
+    """A synthetic single-symbol universe -- the exact shape `_run_baseline`
+    hands the runner: `load_universe_with_banner([args.baseline_symbol], ...)`
+    (`run_backtest.py:932-937`), i.e. ONE column."""
+    rng = np.random.default_rng(7)
+    closes = 100.0 * np.exp(np.cumsum(rng.normal(0.0004, 0.01, n_bars)))
+    return {"IDX": make_df(closes, start="2020-01-01")}
+
+
+def _sorted_rebalance_report(report):
+    return report.sort_values(["date", "symbol"], kind="mergesort").reset_index(drop=True)
+
+
+def test_baseline_min_weight_change_override_is_inert_for_single_symbol_equal_weight():
+    """L2.34: `baseline_args.min_weight_change = 0.0` (`run_backtest.py:956`) is
+    INERT for the baseline's actual configuration, and this test pins that fact
+    so nobody has to re-derive it by hand.
+
+    The baseline universe is a single symbol, so `equal_weight` targets a
+    CONSTANT 1.0, and a fully invested single-asset book's drifted weight is
+    also 1.0 (`cur_w = held*price / (cash + held*price)` with cash residual
+    ~1e-11 from the fee), hence `delta_w ~ 0` at every rebalance. Both guards
+    that could consume the threshold -- the template layer's
+    `apply_asset_inertia`/`_sparse_from_daily` and the executor's
+    `if min_weight_change > 0.0 and prior_s != 0 and abs(delta_w) < ...`
+    (`common/allocation_backtester.py:1571`, `:2151`) -- therefore have nothing
+    to suppress. Setting it to 0.05 must change NOTHING, bit for bit.
+
+    Exactness (not `approx`) is the point: the claim being tested is "no change
+    at all", so a loose tolerance would be able to pass on a real difference.
+    """
+    universe = _single_symbol_baseline_universe()
+    template = get_template("equal_weight")
+    params = {"rebalance_freq_days": 10}
+
+    thresholds = (0.0, 0.05)
+
+    # --- standard mode ---
+    std = [
+        run_standard(universe, template, params,
+                     _baseline_arm_args(min_weight_change=thr))
+        for thr in thresholds
+    ]
+    pd.testing.assert_frame_equal(std[0]["equity_curve"], std[1]["equity_curve"])
+    pd.testing.assert_frame_equal(
+        _sorted_rebalance_report(std[0]["rebalance_report"]),
+        _sorted_rebalance_report(std[1]["rebalance_report"]),
+    )
+    for key in ("cagr", "sharpe_ratio", "total_turnover"):
+        assert std[0][key] == std[1][key], (key, std[0][key], std[1][key])
+
+    # Sanity: the fixture genuinely trades (the entry buy), so the equality
+    # above is not vacuous. With `min_shares=0` + a single all-in asset, every
+    # later scheduled rebalance is a ~0 delta and fills nothing.
+    assert not std[0]["rebalance_report"].empty
+    assert (std[0]["rebalance_report"]["symbol"] == "IDX").all()
+
+    # --- walk-forward mode ---
+    wf = [
+        run_walkforward(universe, template, params,
+                        _baseline_arm_args(min_weight_change=thr))
+        for thr in thresholds
+    ]
+    assert len(wf[0]) == len(wf[1]) >= 2, "fixture must produce at least two folds"
+    for fold_off, fold_on in zip(wf[0], wf[1]):
+        assert fold_off["start_date"] == fold_on["start_date"]
+        assert fold_off["end_date"] == fold_on["end_date"]
+        for key in ("cagr", "sharpe_ratio", "total_turnover", "total_rebalances"):
+            assert fold_off[key] == fold_on[key], (key, fold_off[key], fold_on[key])
+        pd.testing.assert_frame_equal(
+            _sorted_rebalance_report(fold_off["rebalance_report"]),
+            _sorted_rebalance_report(fold_on["rebalance_report"]),
+        )
+
+    # The two settings must also agree on the exact trade VALUES, not just the
+    # row count -- a report with identical dates but different notionals would
+    # mean the threshold did bite somewhere.
+    assert wf[0][0]["rebalance_report"]["trade_value"].tolist() == \
+        wf[1][0]["rebalance_report"]["trade_value"].tolist()
+    assert not wf[0][0]["rebalance_report"].empty
+
+
+@pytest.mark.parametrize("mode", ["standard", "walkforward"])
+def test_baseline_arm_forces_frictionless_trading_but_keeps_commission_and_slippage(
+        mode, tmp_path, monkeypatch):
+    """L2.34 guardrail: pin the FIVE deliberate overrides `_run_baseline` applies
+    to the baseline arm (`run_backtest.py:950-959`) so they cannot drift
+    silently, while also pinning what it must NOT touch.
+
+    The five (`min_shares=0`, `min_weight_change=0.0`, `china_trading=False`,
+    `us_trading=False`, `hk_trading=False`) exist so a market index quoted in
+    thousands of points is actually buyable: board lots / circuit breakers /
+    T+1 / stamp duty would otherwise block the trade or manufacture cash drag.
+    If someone later "aligns" `min_weight_change` to the main 0.05, this test
+    stays GREEN on purpose -- 0.0 is the intended, documented value (and
+    `test_baseline_min_weight_change_override_is_inert_for_single_symbol_equal_weight`
+    proves it is numerically inert here). But flipping `china_trading` back on,
+    restoring board lots, or zeroing commission/slippage for the baseline turns
+    it RED: those would change what "excess return vs. the index" means.
+
+    The runner is monkeypatched only to CAPTURE `baseline_args`; the real
+    universe load still runs (offline synthetic provider), and `_run_baseline`'s
+    own `copy.copy` is asserted not to leak into the main `args`.
+    """
+    captured = {}
+
+    def fake_runner(universe, template, params, args):
+        captured["args"] = args
+        captured["universe"] = universe
+        return []
+
+    monkeypatch.setattr(backtester.run_backtest, "run_standard", fake_runner)
+    monkeypatch.setattr(backtester.run_backtest, "run_walkforward", fake_runner)
+
+    class Args:
+        baseline_symbol = "SPY"
+        baseline_template = "equal_weight"
+        baseline_params = None
+        start = "2020-01-01"
+        end = "2024-12-31"
+        interval = "1d"
+        no_cache = True
+        initial_capital = 100_000.0
+        # The MAIN run's real settings -- deliberately NOT the baseline's.
+        min_shares = 100
+        min_weight_change = 0.02
+        china_trading = True
+        us_trading = False
+        hk_trading = False
+        commission_pct = 0.0005
+        slippage_pct = 0.0005
+
+    main_args = Args()
+    # Class bodies don't close over the enclosing function's locals, so the
+    # parametrized mode is attached afterwards.
+    main_args.mode = mode
+    _run_baseline(
+        main_args, cache_dir=str(tmp_path / "cache"),
+        data_kwargs={"provider": "divergent_calendar_test_provider"},
+    )
+
+    baseline_args = captured["args"]
+    assert baseline_args is not main_args, "baseline must run on a copy, not mutate the main args"
+
+    # 1. No discrete board lots.
+    assert baseline_args.min_shares == 0
+    # 2. No passive-drift suppression (documented as 0.0; inert for this universe).
+    assert baseline_args.min_weight_change == 0.0
+    # 3. No market-specific circuit breakers / T+1 / stamp duty.
+    assert baseline_args.china_trading is False
+    assert baseline_args.us_trading is False
+    assert baseline_args.hk_trading is False
+    # 4. Friction is NOT zeroed -- the baseline still pays for its fills.
+    assert baseline_args.commission_pct == main_args.commission_pct == 0.0005
+    assert baseline_args.slippage_pct == main_args.slippage_pct == 0.0005
+
+    # And the overrides never leaked back into the caller's namespace.
+    assert main_args.min_shares == 100
+    assert main_args.min_weight_change == 0.02
+    assert main_args.china_trading is True
+
+    # The captured universe is the single baseline symbol, trimmed to one column.
+    assert list(captured["universe"].keys()) == ["SPY"]
