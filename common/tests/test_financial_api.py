@@ -759,14 +759,16 @@ def test_baostock_fetch_financial_indicators(tmp_path):
     mock_bs.query_profit_data.assert_not_called()
 
 
-def test_baostock_fetch_financial_indicators_error_graceful():
+def test_baostock_fetch_financial_indicators_error_graceful(tmp_path):
     """Verify BaoStockDataProvider handles login failure or exceptions gracefully without raising."""
     from common.financial_api import BaoStockDataProvider
 
     mock_bs = MagicMock()
     mock_bs.login.return_value = MagicMock(error_code="-1", error_msg="connection refused")
 
-    provider = BaoStockDataProvider()
+    # Explicit cache_dir: the no-cache_dir fallback would open the production
+    # cache read-write, which `DuckDBCache`'s pytest guard (correctly) refuses.
+    provider = BaoStockDataProvider(cache_dir=str(tmp_path))
     provider._get_bs = MagicMock(return_value=mock_bs)
 
     metrics = provider.fetch_financial_indicators("600519.SH", as_of_date="2023-12-31")
