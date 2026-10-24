@@ -258,6 +258,10 @@ def test_run_ers_validation_all_random_draws_fail_emits_aggregate_warning():
 def test_run_ers_validation_partial_random_failure_no_aggregate_warning():
     # Normal case: only SOME random draws fail/are non-finite -- the
     # aggregate "empty pool" warning must NOT fire.
+    # `n_jobs=1` (B2.4): the pass/fail pattern here is driven by an
+    # in-process call counter, which worker processes would each start from
+    # zero -- pinning to serial keeps the scenario being tested sequential.
+    # Cross-process parity is covered in test_allocation_search_parallel.py.
     calls = {"n": 0}
 
     def score_fn(t, params):
@@ -273,6 +277,7 @@ def test_run_ers_validation_partial_random_failure_no_aggregate_warning():
         result = run_ers_validation(
             {"rebalance_freq_days": 21}, 5.0, {"total_rebalances": 10}, score_fn,
             n_random_search=10, ers_percentile_threshold=0.90, min_rebalances_for_trust=4, seed=0,
+            n_jobs=1,
         )
 
     assert result["ers_percentile"] == 1.0
@@ -318,3 +323,48 @@ def test_random_weights_sums_to_one_on_rebalance_dates():
     weights = random_weights(universe, rebalance_freq_days=5, rng=rng)
     rebal_rows = weights.dropna(how="all")
     np.testing.assert_allclose(rebal_rows.sum(axis=1), 1.0)
+
+
+def test_ers_draws_run_in_minimal_metrics_mode():
+    """B1.2 wiring: ERS scores its random draws with report frames suppressed.
+
+    `score_fn` here is exactly the shape both production callers use -- it
+    backtests the template through `run_allocation_backtest` -- and it records
+    whether each returned result carried a full trade report. Every draw must
+    be lightweight, while the candidate's own (pre-computed) score/result are
+    passed in and untouched. `minimal_metrics=False` restores full reports,
+    proving the switch is what makes the difference rather than some other
+    side effect.
+
+    `n_jobs=1` (B2.4): the observation is made through an in-process list
+    mutation, which worker processes would not share with the parent.
+    `test_ers_parallel_draws_still_run_in_minimal_metrics_mode` proves the
+    same property ACROSS the process boundary.
+    """
+    from common.allocation_backtester import run_allocation_backtest
+    from common.testing import make_ohlcv_from_closes
+
+    idx = pd.bdate_range("2020-01-01", periods=40)
+    universe = {"A": make_ohlcv_from_closes(np.linspace(100, 120, 40), start="2020-01-01")}
+    saw_report = []
+
+    def score_fn(template, params):
+        weights = template.generate_weights({"A": universe["A"]}, params)
+        res = run_allocation_backtest({"A": universe["A"]}, weights)
+        saw_report.append(not res["rebalance_report"].empty)
+        return res
+
+    run_ers_validation(
+        {"rebalance_freq_days": 5}, 1.0, {"total_rebalances": 10}, score_fn,
+        n_random_search=5, ers_percentile_threshold=0.90, min_rebalances_for_trust=4, seed=0,
+        n_jobs=1,
+    )
+    assert saw_report == [False] * 5, "every ERS draw must be a minimal-metrics run"
+
+    saw_report.clear()
+    run_ers_validation(
+        {"rebalance_freq_days": 5}, 1.0, {"total_rebalances": 10}, score_fn,
+        n_random_search=3, ers_percentile_threshold=0.90, min_rebalances_for_trust=4, seed=0,
+        minimal_metrics=False, n_jobs=1,
+    )
+    assert saw_report == [True] * 3, "the opt-out must restore full reports"
