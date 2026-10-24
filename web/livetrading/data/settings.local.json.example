@@ -1,0 +1,24 @@
+{
+  "_README": [
+    "EXAMPLE ONLY -- copy to settings.local.json (git-ignored) and replace every",
+    "/ABSOLUTE/PLACEHOLDER with a real, machine-specific path.",
+    "This file is NEVER loaded as-is: StorageManager only reads settings.local.json,",
+    "so the placeholders below cannot be used by accident.",
+    "Precedence: CLI/constructor argument > environment variable > this local",
+    "override > web/livetrading/data/settings.json template > dynamic default.",
+    "Empty or omitted keys fall through to the next layer.",
+    "Omit ALL path keys to keep the safe, repo-local defaults."
+  ],
+  "repo_root": "/ABSOLUTE/PLACEHOLDER/repo",
+  "strategy_dir": "/ABSOLUTE/PLACEHOLDER/repo/pipeline/research_strategy/results/strategy_dumps",
+  "universe_dir": "/ABSOLUTE/PLACEHOLDER/repo/docs/universe",
+  "data_dir": "/ABSOLUTE/PLACEHOLDER/portfolio/YYYYMM",
+  "archive_dir": "/ABSOLUTE/PLACEHOLDER/portfolio/YYYYMM/runs",
+  "cache_dir": "/ABSOLUTE/PLACEHOLDER/repo/data",
+  "stage1_script": "/ABSOLUTE/PLACEHOLDER/repo/scripts/check_live_portfolio_health.py",
+  "stage2_script": "/ABSOLUTE/PLACEHOLDER/repo/scripts/run_live_strategy.py",
+  "python_executable": "/ABSOLUTE/PLACEHOLDER/repo/pipeline/.venv/bin/python",
+  "default_data_provider": "marketdb",
+  "default_start_date": "2024-01-01",
+  "default_portfolio_value": 100000.0
+}

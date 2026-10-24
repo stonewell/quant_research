@@ -5,7 +5,6 @@ custom universe management, interactive holdings, daily archival, and responsive
 """
 
 import os
-from datetime import date
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Response
@@ -90,7 +89,9 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
             "settings": storage.get_settings(),
             "multi_strategy_presets": storage.get_multi_strategy_configs(),
             "data_providers": ["synthetic", "marketdb", "fuyao", "yfinance"],
-            "default_date": date.today().isoformat(),
+            # (L2.5) The archive date key is the market clock's published session,
+            # never the host's `date.today()` -- a Saturday "today" is not a session.
+            "default_date": storage.market_clock_date(),
             "default_portfolio_value": storage.default_portfolio_value,
             "default_strategy_key": getattr(storage, "default_strategy_key", "chan_four_state_blend"),
         }
@@ -280,9 +281,15 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
     @app.get("/api/deploy/multi/latest", summary="Get latest multi-strategy netting run result")
     async def get_latest_multi_netting_run(
         matrix_id: str = Query("tri_core_blend", description="Collaborative matrix identifier"),
-        date_str: Optional[str] = Query(None, alias="date", description="Valuation date (default: today)"),
+        date_str: Optional[str] = Query(
+            None, alias="date", description="Valuation date (default: market clock's latest published session)"
+        ),
     ) -> Dict[str, Any]:
-        val_date = date_str or date.today().isoformat()
+        # (L2.5) Same date-key source as the run that WROTE the directory
+        # (`execution_service` / `storage.get_multi_netting_run_dir`): the market
+        # clock. `date.today()` here used to point at a day the writer never used,
+        # so the lookup 404'd on weekends and whenever the host/clock dates split.
+        val_date = date_str or storage.market_clock_date()
         bundle = storage.get_multi_netting_run(val_date, matrix_id)
         if not bundle:
             raise HTTPException(status_code=404, detail=f"No netting run found for matrix '{matrix_id}' on {val_date}")
@@ -291,9 +298,11 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
     @app.get("/api/deploy/multi/latest/csv", summary="Download latest multi-strategy netted ticket CSV")
     async def download_latest_multi_netting_csv(
         matrix_id: str = Query("tri_core_blend", description="Collaborative matrix identifier"),
-        date_str: Optional[str] = Query(None, alias="date", description="Valuation date (default: today)"),
+        date_str: Optional[str] = Query(
+            None, alias="date", description="Valuation date (default: market clock's latest published session)"
+        ),
     ) -> Response:
-        val_date = date_str or date.today().isoformat()
+        val_date = date_str or storage.market_clock_date()
         bundle = storage.get_multi_netting_run(val_date, matrix_id)
         if not bundle:
             raise HTTPException(status_code=404, detail=f"No netting run found for matrix '{matrix_id}' on {val_date}")

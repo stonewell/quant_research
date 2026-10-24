@@ -1881,6 +1881,103 @@
         if (el.valNetTurnover) el.valNetTurnover.textContent = `¥${netTurnover.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
     }
 
+    // (L2.20 / L2.25) Structured "why did this row not trade" labels, mirrored
+    // verbatim from `common/position_lifecycle.py::BLOCKING_REASON_LABELS`.
+    // Kept as DATA (not inline strings) on purpose: the operator reads the
+    // console ticket (rendered from the Python map) and this table side by side,
+    // so wording drift between the two is itself a misleading display. A test
+    // asserts the two maps are identical.
+    const BLOCKING_REASON_LABELS = {
+        "MARKET_CLOSED_FREEZE": "休市未评估",
+        "MIN_ENTRY_THRESHOLD": "未达最低建仓门槛",
+        "PENDING_ENTRY_CONFIRM": "开仓信号确认中",
+        "EXIT_CONFIRMING": "平仓信号确认中",
+        "COOLDOWN_BLOCKED": "再入场冷却中",
+        "INERTIA": "未超惰性阈值",
+        "TENURE_LOCKED": "未满最低持仓周期",
+        "LIMIT_UP_LOCKED": "涨停封板",
+        "NONE": "无阻断",
+    };
+
+    /**
+     * Resolve the action badge for one ticket row (`docs/development_plan.md`
+     * L2.25, absorbing `L2.20`).
+     *
+     * Contract: the verdict comes from `action` + `blocking_reason` -- the
+     * structured pair written by `scripts/run_live_strategy.py` -- and NEVER
+     * from `target_weight === 0`, which is written by every gate that traded
+     * nothing (min-entry filter, PENDING_ENTRY confirmation window, market-closed
+     * freeze) as well as by `CANCEL_PENDING` (a never-held record). Inferring
+     * "already liquidated" from that 0.0 is the phantom-exit bug class.
+     *
+     * Four distinct states must stay distinguishable, because each one implies a
+     * different operator action (do nothing / wait for the open / release no
+     * order / execute):
+     *   - `维持`      : the model re-affirmed the current position (nothing to do);
+     *   - `休市未评估` : the market was shut, NO signal was evaluated;
+     *   - `已取消开仓` : a PENDING_ENTRY confirmation was aborted, no order exists;
+     *   - `已阻断`     : a real signal was evaluated and rejected by a named gate.
+     *
+     * `key` is the stable semantics tag (used for counting and by tests);
+     * `cls` / `text` are presentation only.
+     *
+     * CSS note: `badge-cancel` / `badge-freeze` are NEW class hooks with no rule
+     * yet in `static/css/style.css` (that file was outside this task's file
+     * ownership). Each new badge therefore also carries an existing class
+     * (`badge-sell` for the cancelled entry, `badge-hold` for the freeze) so it
+     * renders legibly today, while the distinct hook is available for a later
+     * stylesheet pass. Emoji + wording already make the three states
+     * distinguishable without any CSS change.
+     */
+    function resolveTicketActionBadge(row) {
+        const act = String((row && row.action) || "HOLD").trim().toUpperCase();
+        const blocking = String((row && row.blocking_reason) || "").trim().toUpperCase();
+
+        // A real liquidation is an `action`, never a weight comparison.
+        if (act === "SELL") {
+            return { key: "SELL", cls: "badge badge-sell", text: "🔴 SELL (卖出)" };
+        }
+        if (act === "BUY") {
+            return { key: "BUY", cls: "badge badge-buy", text: "🟢 BUY (买入)" };
+        }
+        // (L2.20) A cancelled PENDING_ENTRY holds nothing and traded nothing. It
+        // used to fall through to the generic "⚪ HOLD (维持)" badge -- literally
+        // the opposite of what happened.
+        if (act === "CANCEL_PENDING") {
+            return {
+                key: "CANCEL_PENDING",
+                cls: "badge badge-sell badge-cancel",
+                text: "⛔ 已取消开仓 (CANCEL_PENDING)",
+            };
+        }
+        // (L2.25) Closed market: nothing was evaluated at all. Neither "held" nor
+        // "filtered by a signal" -- a third state.
+        if (blocking === "MARKET_CLOSED_FREEZE") {
+            return {
+                key: "MARKET_CLOSED_FREEZE",
+                cls: "badge badge-hold badge-freeze",
+                text: "🕒 休市未评估 (NOT EVALUATED)",
+            };
+        }
+        // A real signal was evaluated and rejected by a named gate.
+        if (act === "HOLD_FILTERED" || (blocking !== "" && blocking !== "NONE")) {
+            const label = BLOCKING_REASON_LABELS[blocking] || "";
+            return {
+                key: "HOLD_FILTERED",
+                cls: "badge badge-hold-filtered",
+                text: label ? `🟡 HOLD (${label})` : "🟡 HOLD (锁仓/过滤)",
+            };
+        }
+        if (act.includes("CASH") || act.includes("SWEEP") || act.includes("RELEASE")) {
+            return {
+                key: "CASH",
+                cls: "badge badge-sweep",
+                text: act.includes("RELEASE") ? "💰 CASH RELEASE" : "💰 CASH SWEEP",
+            };
+        }
+        return { key: "HOLD", cls: "badge badge-hold", text: "⚪ HOLD (维持)" };
+    }
+
     function renderTradingTicket(ticketRows) {
         el.tbodyOrders.innerHTML = "";
         if (!ticketRows || ticketRows.length === 0) {
@@ -1897,33 +1994,24 @@
         ticketRows.forEach(r => {
             const tr = document.createElement("tr");
 
-            // Action Badge
+            // Action Badge -- single source of truth for the row verdict
+            // (L2.25). Counting only ever counts what will actually trade, and it
+            // keys off the same `verdict.key` that picks the badge, so the badge
+            // and the summary totals can never disagree.
             const tdAct = document.createElement("td");
             tdAct.setAttribute("data-label", "动作");
             tdAct.classList.add("col-action", "col-header-group");
             const badge = document.createElement("span");
-            badge.className = "badge";
-            const act = r.action || "HOLD";
-
-            if (act === "SELL") {
-                badge.classList.add("badge-sell");
-                badge.textContent = "🔴 SELL (卖出)";
+            const verdict = resolveTicketActionBadge(r);
+            badge.className = verdict.cls;
+            badge.setAttribute("data-action-state", verdict.key);
+            badge.textContent = verdict.text;
+            if (verdict.key === "SELL") {
                 sellsCount++;
                 totalSellVal += Math.abs(r.trade_value || 0);
-            } else if (act === "BUY") {
-                badge.classList.add("badge-buy");
-                badge.textContent = "🟢 BUY (买入)";
+            } else if (verdict.key === "BUY") {
                 buysCount++;
                 totalBuyVal += Math.abs(r.trade_value || 0);
-            } else if (act === "HOLD_FILTERED") {
-                badge.classList.add("badge-hold-filtered");
-                badge.textContent = "🟡 HOLD (锁仓/过滤)";
-            } else if (act.includes("CASH") || act.includes("SWEEP") || act.includes("RELEASE")) {
-                badge.classList.add("badge-sweep");
-                badge.textContent = act.includes("RELEASE") ? "💰 CASH RELEASE" : "💰 CASH SWEEP";
-            } else {
-                badge.classList.add("badge-hold");
-                badge.textContent = "⚪ HOLD (维持)";
             }
             tdAct.appendChild(badge);
 
@@ -1991,7 +2079,7 @@
             tdReason.className = "text-muted col-reason-group";
             tdReason.setAttribute("data-label", "调仓动因");
             tdReason.style.fontSize = "11px";
-            const reasonText = r.summary_reason || r.reason || (act === "SELL" ? "目标调降卖出" : (act === "BUY" ? "增配开仓买入" : "维持"));
+            const reasonText = r.summary_reason || r.reason || (verdict.key === "SELL" ? "目标调降卖出" : (verdict.key === "BUY" ? "增配开仓买入" : "维持"));
             tdReason.textContent = reasonText;
 
             const btnDetail = document.createElement("button");
@@ -2529,6 +2617,45 @@
             // Fast-Path Row (if present)
             if (fastPath) {
                 rHtml += `<tr><td><strong>非对称快通道 (Fast-Path Gating)</strong></td><td class="font-mono" style="color: #f87171;">⚡ ${fastPath}</td><td class="font-mono">0-Delay 闪电穿透 (守 A 股 T+1)</td><td><span class="badge badge-nogo">已激活快通道</span></td></tr>`;
+            }
+
+            // (L2.25) Ticket verdict row -- the honest "did this row trade, and if
+            // not, why" answer, read from `action` + `blocking_reason` (plus the
+            // pre-computed `detail_reason.is_liquidation`). Never derived from
+            // `target_weight === 0`: that 0.0 is also written by the min-entry
+            // filter, the PENDING_ENTRY confirmation window and the market-closed
+            // freeze, none of which traded a single share.
+            {
+                const vAct = String(ticket.action || "").toUpperCase();
+                const vBlocking = String(
+                    (dr && dr.blocking_reason) || ticket.blocking_reason || ""
+                ).toUpperCase();
+                const vLabel = BLOCKING_REASON_LABELS[vBlocking] || "";
+                const vSold = dr && dr.is_liquidation !== undefined
+                    ? dr.is_liquidation === true
+                    : vAct === "SELL";
+                let vVerdict;
+                let vBadge;
+                if (vSold) {
+                    vVerdict = "卖出指令已生成 (action=SELL)";
+                    vBadge = '<span class="badge badge-sell">卖出执行</span>';
+                } else if (vAct === "CANCEL_PENDING") {
+                    vVerdict = "待确认开仓已取消 (从未持仓)";
+                    vBadge = '<span class="badge badge-nogo">无交易指令</span>';
+                } else if (vBlocking === "MARKET_CLOSED_FREEZE") {
+                    vVerdict = "休市冻结，未评估任何信号";
+                    vBadge = '<span class="badge badge-hold">未评估</span>';
+                } else if (vLabel && vBlocking !== "NONE") {
+                    vVerdict = vLabel;
+                    vBadge = '<span class="badge badge-hold-filtered">已被门禁拦截</span>';
+                } else if (vAct === "BUY") {
+                    vVerdict = "买入指令已生成 (action=BUY)";
+                    vBadge = '<span class="badge badge-buy">买入执行</span>';
+                } else {
+                    vVerdict = "维持现状，无交易指令";
+                    vBadge = '<span class="badge badge-hold">维持</span>';
+                }
+                rHtml += `<tr><td><strong>工单判定 (action + blocking_reason)</strong></td><td class="font-mono">${vAct || "--"}${vLabel ? " / " + vLabel : ""}</td><td class="font-mono">已清仓与否只由 action=SELL 判定，禁止由 target_weight=0 推断</td><td>${vBadge}</td></tr>`;
             }
 
             // 1. Inertia Check

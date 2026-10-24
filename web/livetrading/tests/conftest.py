@@ -4,10 +4,12 @@ FORENSIC CONTEXT (test-harness hardening only -- no production behaviour change)
 -------------------------------------------------------------------------------
 ``StorageManager.cache_dir`` falls back to ``<repo_root>/data``
 (``web/livetrading/storage.py``), i.e. the REAL production directory that holds
-``cache.duckdb``.  Worse, ``StorageManager`` also reads ``settings.json`` from
-its resolved ``data_dir``, and the checked-in ``web/livetrading/data/settings.json``
-itself pins ``cache_dir=<repo_root>/data`` plus a live portfolio ``data_dir``
-outside the repo.
+``cache.duckdb``.  ``StorageManager`` also reads the committed settings TEMPLATE
+``web/livetrading/data/settings.json`` plus the untracked
+``web/livetrading/data/settings.local.json`` operator override.  (Before L2.16 the
+committed file itself pinned ``cache_dir=<repo_root>/data`` and a live portfolio
+``data_dir`` outside the repo; it is now placeholder-only, but an operator's local
+override can still pin production paths.)
 
 The pre-existing ``temp_workspace`` fixture isolated ``data_dir``/``archive_dir``
 but never overrode ``cache_dir``, and the default data provider chain is
@@ -20,9 +22,15 @@ unit test into a production-cache writer.
 The autouse fixture below removes that footgun structurally: for EVERY test in
 this package the storage/execution-service derived directories (``data_dir``,
 ``archive_dir``, ``cache_dir``) are re-pointed at the test's ``tmp_path`` through
-the environment-variable layer that ``StorageManager`` consults BEFORE
-``settings.json``.  Explicit constructor arguments still take precedence, so
+the environment-variable layer that ``StorageManager`` consults BEFORE the
+settings files.  Explicit constructor arguments still take precedence, so
 existing fixtures keep behaving exactly as before.
+
+``LIVETRADING_SETTINGS_DIR`` additionally redirects the settings directory itself
+(``web/livetrading/data`` by default) at ``tmp_path``.  Needed since L2.16 made
+``settings.local.json`` the write target of ``update_settings``: without it the
+``POST /api/settings`` API test would write an operator override into the real
+checkout.
 
 Any future test that needs the real provider chain still gets a throwaway cache
 directory instead of the production one, and the companion guard test
@@ -73,25 +81,32 @@ def hermetic_livetrading_dirs(tmp_path, monkeypatch):
     no longer reach ``<repo_root>/data/cache.duckdb``.
 
     The env-var layer is used because ``StorageManager`` resolves in the order
-    parameter > environment > ``settings.json`` > dynamic default, so this both
-    overrides the checked-in ``settings.json`` (which pins the production cache)
-    and leaves every explicit constructor argument in the suite untouched.
+    parameter > environment > ``settings.local.json`` > ``settings.json`` template
+    > dynamic default, so this both overrides any operator settings (the template
+    is placeholder-only as of L2.16) and leaves every explicit constructor
+    argument in the suite untouched.
     """
     cache_dir = tmp_path / "duckdb_cache"
     data_dir = tmp_path / "data"
     archive_dir = tmp_path / "runs"
-    for directory in (cache_dir, data_dir, archive_dir):
+    settings_dir = tmp_path / "settings"
+    for directory in (cache_dir, data_dir, archive_dir, settings_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
     monkeypatch.setenv("LIVETRADING_CACHE_DIR", str(cache_dir))
     monkeypatch.setenv("LIVETRADING_DATA_DIR", str(data_dir))
     monkeypatch.setenv("LIVETRADING_ARCHIVE_DIR", str(archive_dir))
+    # Redirect the settings TEMPLATE/local-override directory too, so
+    # `update_settings` (POST /api/settings) can never write a machine-specific
+    # settings.local.json into the real checkout.
+    monkeypatch.setenv("LIVETRADING_SETTINGS_DIR", str(settings_dir))
 
     # Fail fast on the spot if anything about the resolution chain drifts.
     for label, value in (
         ("cache_dir", cache_dir),
         ("data_dir", data_dir),
         ("archive_dir", archive_dir),
+        ("settings_dir", settings_dir),
     ):
         for forbidden in FORBIDDEN_DIRS:
             if is_inside(value, forbidden):
@@ -106,4 +121,5 @@ def hermetic_livetrading_dirs(tmp_path, monkeypatch):
         "cache_dir": str(cache_dir),
         "data_dir": str(data_dir),
         "archive_dir": str(archive_dir),
+        "settings_dir": str(settings_dir),
     }

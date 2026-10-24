@@ -1,1 +1,14 @@
-data/
+# Runtime state under data/ (account snapshots, holdings, runs/, caches) is NOT versioned.
+# NOTE: this must stay `data/*` and NOT `data/`. A directory-level ignore cannot be undone
+# by a later `!` re-include (git never descends into an excluded directory), so `data/`
+# would silently make the two committed settings files un-addable.
+data/*
+# The template + example ARE committed on purpose: they document the precedence chain
+# (CLI/env > settings.local.json > settings.json > dynamic default) and carry no
+# machine-specific paths. See storage.settings_dir_for() and L2.16.
+!data/settings.json
+!data/settings.local.json.example
+# Operator override -- may hold absolute deployment paths and is the write target of
+# POST /api/settings. Listed explicitly (after the negations) so no future `!data/*.json`
+# style rule can accidentally start tracking it.
+data/settings.local.json

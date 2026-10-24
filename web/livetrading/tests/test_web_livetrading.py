@@ -1,9 +1,11 @@
 """Unit tests for Live Trading Web Application: Storage, API, and Execution Service."""
 
+import json
 import os
 import shutil
 import sys
 import tempfile
+from pathlib import Path
 from typing import Dict
 
 import pytest
@@ -41,15 +43,16 @@ def temp_workspace():
     data_dir = os.path.join(temp_dir, "data")
     archive_dir = os.path.join(temp_dir, "runs")
     cache_dir = os.path.join(temp_dir, "duckdb_cache")
-    os.makedirs(data_dir, exist_ok=True)
-    os.makedirs(archive_dir, exist_ok=True)
-    os.makedirs(cache_dir, exist_ok=True)
+    settings_dir = os.path.join(temp_dir, "settings")
+    for d in (data_dir, archive_dir, cache_dir, settings_dir):
+        os.makedirs(d, exist_ok=True)
 
     storage = StorageManager(
         repo_root=_REPO_ROOT,
         data_dir=data_dir,
         archive_dir=archive_dir,
         cache_dir=cache_dir,
+        settings_dir=settings_dir,
     )
 
     yield storage, temp_dir
@@ -189,38 +192,61 @@ def test_execution_service_argv_never_targets_production_cache(temp_workspace, m
 # ---------------------------------------------------------------------------
 #: Env vars the conftest fixture uses to isolate the workspace; cleared in the
 #: tests that need to exercise the *un-isolated* resolution chain.
-_ISOLATION_ENV_VARS = ("LIVETRADING_CACHE_DIR", "LIVETRADING_DATA_DIR", "LIVETRADING_ARCHIVE_DIR")
+_ISOLATION_ENV_VARS = (
+    "LIVETRADING_CACHE_DIR",
+    "LIVETRADING_DATA_DIR",
+    "LIVETRADING_ARCHIVE_DIR",
+    "LIVETRADING_SETTINGS_DIR",
+)
 
 
-def _clear_isolation_env(monkeypatch):
-    """Undo the conftest isolation (and any opt-in) so the raw chain is exercised."""
+def _clear_isolation_env(monkeypatch, settings_dir=None):
+    """Undo the conftest isolation (and any opt-in) so the raw chain is exercised.
+
+    When `settings_dir` is given, the settings directory is re-pointed there instead of
+    being deleted: deleting it would fall back to the repository's
+    ``web/livetrading/data`` and pick up an operator's real ``settings.local.json``,
+    making these tests machine-dependent (and, on a deployment host, non-hermetic).
+    Pass ``None`` to exercise a *specific* repo_root's own settings directory.
+    """
     for name in _ISOLATION_ENV_VARS + ("LIVETRADING_ALLOW_PRODUCTION_PATHS",):
         monkeypatch.delenv(name, raising=False)
+    if settings_dir is not None:
+        os.makedirs(settings_dir, exist_ok=True)
+        monkeypatch.setenv("LIVETRADING_SETTINGS_DIR", str(settings_dir))
 
 
-def _live_portfolio_dir_from_checked_in_settings():
-    """The out-of-repo live portfolio directory pinned by the committed settings.json."""
-    import json
+def _live_portfolio_dir_from_local_override(settings_dir, live_dir):
+    """Write a synthetic operator override pinning `live_dir`; return its path.
 
-    settings_path = os.path.join(_PRODUCTION_WEB_DATA_DIR, "settings.json")
-    with open(settings_path, "r", encoding="utf-8") as f:
-        checked_in = json.load(f)
-    live_dir = checked_in.get("data_dir")
-    if not live_dir or _is_inside(live_dir, _REPO_ROOT):
-        return None
-    return live_dir
+    Replaces the pre-L2.16 helper that read the live portfolio directory straight out
+    of the committed settings file.  The committed file is now placeholder-only, so the
+    guard's second root can only be learned from the untracked local override -- which
+    is exactly what this helper exercises (without ever touching a real deployment).
+    """
+    os.makedirs(settings_dir, exist_ok=True)
+    with open(os.path.join(settings_dir, "settings.local.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "data_dir": str(live_dir),
+                "archive_dir": os.path.join(str(live_dir), "runs"),
+            },
+            f,
+        )
+    return str(live_dir)
 
 
 def test_pytest_guard_refuses_repo_data_cache_dir(monkeypatch, tmp_path):
     """GUARD: un-isolated resolution must not hand out ``<repo>/data`` under pytest.
 
-    ``data_dir`` is pinned to ``tmp_path`` on purpose so the checked-in
-    ``settings.json`` (which pins the live portfolio dir) is NOT loaded: this
-    isolates the single leg under test -- the dynamic default
-    ``<repo_root>/data`` for ``cache_dir`` -- and asserts the resolver refuses it
-    with an actionable message instead of silently returning the production path.
+    ``data_dir`` is pinned to ``tmp_path`` on purpose and the settings directory is
+    empty, so only the dynamic default ``<repo_root>/data`` for ``cache_dir`` is under
+    test: the resolver must refuse it with an actionable message instead of silently
+    returning the production path.  Note this root is HARDCODED in
+    ``production_path_roots`` -- it must keep holding even though the committed
+    ``settings.json`` no longer names any production directory.
     """
-    _clear_isolation_env(monkeypatch)
+    _clear_isolation_env(monkeypatch, tmp_path / "settings")
     monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_web_livetrading.py::test_x (call)")
     assert production_guard_active() is True
 
@@ -238,19 +264,19 @@ def test_pytest_guard_refuses_repo_data_cache_dir(monkeypatch, tmp_path):
     assert not _is_inside(tmp_path / "data", _PRODUCTION_CACHE_DIR)
 
 
-def test_pytest_guard_refuses_live_portfolio_dir_and_wins_before_makedirs(monkeypatch):
-    """GUARD: the checked-in ``settings.json`` live portfolio dir is refused too.
+def test_pytest_guard_refuses_live_portfolio_dir_and_wins_before_makedirs(monkeypatch, tmp_path):
+    """GUARD: a live portfolio dir pinned by the LOCAL override is refused too.
 
-    ``data_dir`` deliberately points at the checked-in ``web/livetrading/data`` so the
-    committed ``settings.json`` is loaded, whose ``archive_dir`` is
-    ``<live portfolio>/runs``.  That archive path must be rejected, and the rejection
-    must happen BEFORE ``os.makedirs`` -- a refused path may never be created on disk.
+    Before L2.16 this directory was read out of the committed ``settings.json``.  The
+    committed file is now placeholder-only, so the operator's untracked
+    ``settings.local.json`` is the only source of that second guarded root -- and that
+    is what this test exercises.  The rejection must happen BEFORE ``os.makedirs``: a
+    refused path may never be created on disk.
     """
-    live_dir = _live_portfolio_dir_from_checked_in_settings()
-    if not live_dir:
-        pytest.skip("checked-in settings.json pins no out-of-repo portfolio directory")
+    settings_dir = tmp_path / "settings"
+    live_dir = _live_portfolio_dir_from_local_override(settings_dir, tmp_path / "live_portfolio")
 
-    _clear_isolation_env(monkeypatch)
+    _clear_isolation_env(monkeypatch, settings_dir)  # re-asserts the same settings dir
     monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_web_livetrading.py::test_y (call)")
 
     created = []
@@ -263,13 +289,18 @@ def test_pytest_guard_refuses_live_portfolio_dir_and_wins_before_makedirs(monkey
     monkeypatch.setattr(os, "makedirs", spy_makedirs)
 
     with pytest.raises(ProductionPathError) as excinfo:
-        StorageManager(repo_root=_REPO_ROOT, data_dir=_PRODUCTION_WEB_DATA_DIR)
+        StorageManager(repo_root=_REPO_ROOT, data_dir=str(tmp_path / "portfolio_input"))
 
     msg = str(excinfo.value)
     assert "live portfolio directory" in msg, msg
     assert _canonical(live_dir) in msg, msg
+    # The leg that fired is the local override's `archive_dir` key (data_dir was
+    # passed explicitly, so the chain reaches the archive path next).
     assert "archive_dir=" in msg, msg
-    assert "settings.json" in msg, msg
+    assert "settings.local.json" in msg, msg
+    # The guarded root was learned without ever reading the committed template.
+    roots = production_path_roots(_REPO_ROOT)
+    assert any(_is_inside(live_dir, root) for _, root in roots)
 
     leaked = [p for p in created if _is_inside(p, live_dir)]
     assert not leaked, f"guard must fire before makedirs; created live dirs: {leaked}"
@@ -277,7 +308,7 @@ def test_pytest_guard_refuses_live_portfolio_dir_and_wins_before_makedirs(monkey
 
 def test_pytest_guard_opt_in_allows_production_cache(monkeypatch, tmp_path):
     """``LIVETRADING_ALLOW_PRODUCTION_PATHS=1`` must restore the legacy resolution."""
-    _clear_isolation_env(monkeypatch)
+    _clear_isolation_env(monkeypatch, tmp_path / "settings")
     monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_web_livetrading.py::test_z (call)")
     monkeypatch.setenv("LIVETRADING_ALLOW_PRODUCTION_PATHS", "1")
 
@@ -286,7 +317,7 @@ def test_pytest_guard_opt_in_allows_production_cache(monkeypatch, tmp_path):
     # Same construction that raised above now resolves exactly as production does...
     assert _canonical(storage.cache_dir) == _canonical(_PRODUCTION_CACHE_DIR)
     # ...without opening/creating anything (a path string is all we asked for).
-    assert not os.path.exists(os.path.join(str(tmp_path / "data"), "settings.json"))
+    assert not os.path.exists(os.path.join(str(tmp_path / "settings"), "settings.json"))
 
 
 def test_resolution_is_untouched_outside_pytest(monkeypatch, tmp_path):
@@ -295,7 +326,7 @@ def test_resolution_is_untouched_outside_pytest(monkeypatch, tmp_path):
     This is the production path: no marker, so the guard is never even consulted and
     ``cache_dir`` still falls back to ``<repo_root>/data`` exactly as before.
     """
-    _clear_isolation_env(monkeypatch)
+    _clear_isolation_env(monkeypatch, tmp_path / "settings")
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     assert production_guard_active() is False
 
@@ -307,7 +338,7 @@ def test_resolution_is_untouched_outside_pytest(monkeypatch, tmp_path):
 
 def test_pytest_guard_catches_path_aliasing_and_symlinks(monkeypatch, tmp_path):
     """``data/../data``, ``./data`` and a symlink to ``<repo>/data`` must all be caught."""
-    _clear_isolation_env(monkeypatch)
+    _clear_isolation_env(monkeypatch, tmp_path / "settings")
     monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_web_livetrading.py::test_alias (call)")
 
     # 1. Dot-dot aliasing through the environment-variable leg.
@@ -341,11 +372,191 @@ def test_pytest_guard_catches_path_aliasing_and_symlinks(monkeypatch, tmp_path):
     assert "data_dir=" in str(excinfo.value), str(excinfo.value)
 
 
+# ---------------------------------------------------------------------------
+# L2.16: the committed settings must be a placeholder template, and every default
+# must resolve UNDER the repository root instead of onto production state.
+# ---------------------------------------------------------------------------
+_SETTINGS_PATH_KEYS = (
+    "repo_root",
+    "strategy_dir",
+    "universe_dir",
+    "data_dir",
+    "archive_dir",
+    "cache_dir",
+    "stage1_script",
+    "stage2_script",
+    "python_executable",
+)
+#: Machine-specific path fragments that must never appear as an executable config.
+#: Built from parts so this test file itself does not contain the literal it hunts for.
+_MACHINE_PATH_FRAGMENTS = (("home", "stone"), ("Work", "stock"))
+
+
+def _machine_path_needles():
+    return [os.sep + os.sep.join(fragment) for fragment in _MACHINE_PATH_FRAGMENTS]
+
+
+def test_committed_settings_json_is_placeholder_only():
+    """L2.16: the committed template must leave every path key empty.
+
+    Empty (not "a harmless default") is deliberate: a placeholder that happens to be
+    an absolute path is exactly how production state got pinned in the first place.
+    """
+    template_path = Path(_PRODUCTION_WEB_DATA_DIR) / "settings.json"
+    assert template_path.is_file(), f"missing committed settings template: {template_path}"
+    data = json.loads(template_path.read_text(encoding="utf-8"))
+    assert isinstance(data, dict) and data, "template must be a non-empty JSON object"
+    for key in _SETTINGS_PATH_KEYS:
+        value = data.get(key, "")
+        assert value == "", (
+            f"committed settings template must leave '{key}' empty (got {value!r}); "
+            f"machine-specific paths belong in the untracked settings.local.json"
+        )
+        assert not os.path.isabs(str(value)), (key, value)
+
+
+def test_bare_storage_defaults_stay_under_repo_root(monkeypatch, tmp_path):
+    """L2.16 ACCEPTANCE: bare ``StorageManager(repo_root=tmp)`` resolves all under tmp.
+
+    This is the structural fix for the 2026-10-22 incident: with an EMPTY settings
+    directory there is no leg left that can hand out a path outside the repo.  The
+    pytest marker is removed because L2.12's net deliberately refuses ``<repo>/data``
+    under pytest; the property under test is the DEFAULT VALUE itself.
+    """
+    _clear_isolation_env(monkeypatch, settings_dir=None)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+    fake_repo = tmp_path / "fake_repo"
+    fake_settings_dir = fake_repo / "web" / "livetrading" / "data"
+    fake_settings_dir.mkdir(parents=True)
+    # Same placeholder template the repository ships, in a throwaway checkout.
+    shutil.copyfile(
+        Path(_PRODUCTION_WEB_DATA_DIR) / "settings.json",
+        fake_settings_dir / "settings.json",
+    )
+
+    storage = StorageManager(repo_root=str(fake_repo))
+
+    for attr in ("cache_dir", "data_dir", "archive_dir"):
+        resolved = getattr(storage, attr)
+        assert _is_inside(resolved, fake_repo), f"{attr}={resolved} escaped {fake_repo}"
+    assert _canonical(storage.data_dir) == _canonical(fake_settings_dir)
+    assert _canonical(storage.archive_dir) == _canonical(fake_settings_dir / "runs")
+    assert _canonical(storage.cache_dir) == _canonical(fake_repo / "data")
+
+
+def test_repo_default_resolution_stays_inside_checkout(monkeypatch, tmp_path):
+    """L2.16 ACCEPTANCE on the REAL checkout: defaults are repo-local, not production.
+
+    The settings directory is an empty temp dir so an operator's real
+    ``settings.local.json`` cannot influence the result; the template is therefore the
+    only file layer, and it contributes nothing.
+    """
+    _clear_isolation_env(monkeypatch, settings_dir=tmp_path / "settings")
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+    storage = StorageManager(repo_root=_REPO_ROOT)
+
+    for attr in ("cache_dir", "data_dir", "archive_dir"):
+        _assert_inside_repo(getattr(storage, attr), attr)
+    assert _canonical(storage.data_dir) == _canonical(_PRODUCTION_WEB_DATA_DIR)
+    assert _canonical(storage.cache_dir) == _canonical(_PRODUCTION_CACHE_DIR)
+
+
+def _assert_inside_repo(path, label):
+    assert _is_inside(path, _REPO_ROOT), f"{label}={path} escaped the repository root"
+
+
+def test_local_override_wins_over_template(monkeypatch, tmp_path):
+    """L2.16: ``settings.local.json`` overrides the template; template still falls back."""
+    _clear_isolation_env(monkeypatch, settings_dir=None)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+    fake_repo = tmp_path / "fake_repo"
+    settings_dir = fake_repo / "web" / "livetrading" / "data"
+    settings_dir.mkdir(parents=True)
+
+    template_cache = tmp_path / "template_cache"
+    local_cache = tmp_path / "local_cache"
+    local_data = tmp_path / "local_portfolio"
+    local_archive = tmp_path / "local_archive"
+
+    (settings_dir / "settings.json").write_text(
+        json.dumps({"cache_dir": str(template_cache)}), encoding="utf-8"
+    )
+    (settings_dir / "settings.local.json").write_text(
+        json.dumps(
+            {
+                "cache_dir": str(local_cache),
+                "data_dir": str(local_data),
+                "archive_dir": str(local_archive),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    overridden = StorageManager(repo_root=str(fake_repo))
+    assert _canonical(overridden.cache_dir) == _canonical(local_cache)
+    # `data_dir` is overridable from the local file precisely because the settings
+    # directory is resolved from repo_root rather than from data_dir (no chicken/egg).
+    assert _canonical(overridden.data_dir) == _canonical(local_data)
+    assert _canonical(overridden.archive_dir) == _canonical(local_archive)
+
+    # Removing the override falls back to the template, still without production paths.
+    (settings_dir / "settings.local.json").unlink()
+    fallback = StorageManager(repo_root=str(fake_repo))
+    assert _canonical(fallback.cache_dir) == _canonical(template_cache)
+    assert _canonical(fallback.data_dir) == _canonical(settings_dir)  # dynamic default
+
+
+def test_executable_web_config_carries_no_machine_specific_paths():
+    """L2.16 ACCEPTANCE: no executable config under ``web/`` names a personal path.
+
+    Scope notes:
+      * ``web/livetrading/data`` is runtime state (git-ignored snapshots, archive runs);
+        its two *configuration* files are checked explicitly below, the archived run
+        artifacts are historical records and out of scope.
+      * ``docs/`` retains ``file:///...`` provenance links and the L2.16/L2.17 audit
+        rows that quote the production paths -- historical disclosure, not executable
+        configuration, so it is not scanned here.
+    """
+    needles = _machine_path_needles()
+    assert needles, "needle list must not be empty"
+
+    web_root = Path(_WEB_DIR).parent  # <repo>/web
+    skip_dirs = {".venv", "__pycache__", ".pytest_cache", "node_modules"}
+    offenders = []
+    for path in web_root.rglob("*"):
+        if not path.is_file():
+            continue
+        if skip_dirs & set(path.parts):
+            continue
+        if "data" in path.parts and path.name not in (
+            "settings.json",
+            "settings.local.json",
+            "settings.local.json.example",
+        ):
+            # Archived runs / holdings snapshots are runtime state, not configuration.
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        for needle in needles:
+            if needle in text:
+                offenders.append((str(path.relative_to(web_root)), needle))
+
+    assert not offenders, (
+        "machine-specific absolute paths must live in the untracked "
+        f"settings.local.json / environment, never in the repository: {offenders}"
+    )
+
+
 def test_conftest_isolation_wins_before_the_pytest_guard(monkeypatch):
     """ORDERING: env vars are consulted before the guard, so the fixture still wins.
 
     ``PYTEST_CURRENT_TEST`` is genuinely set here (pytest sets it for every test) and
-    the autouse fixture has exported the three isolation variables.  A bare
+    the autouse fixture has exported the isolation variables.  A bare
     ``StorageManager`` therefore resolves to ``tmp_path`` and the guard never fires --
     which is exactly why the pre-existing hermeticity tests keep passing.
     """
@@ -364,13 +575,17 @@ def test_conftest_isolation_wins_before_the_pytest_guard(monkeypatch):
         assert _canonical(resolved) == _canonical(os.environ[env_name]), (attr, resolved)
         _assert_hermetic(resolved, f"bare StorageManager().{attr}")
 
-    # The second guarded root (the live portfolio pinned by the checked-in settings)
-    # is discoverable without ever resolving into it.
+    # The settings directory is isolated too, so `update_settings` can never write a
+    # machine-specific settings.local.json into the checkout.
+    assert _canonical(storage.settings_dir) == _canonical(os.environ["LIVETRADING_SETTINGS_DIR"])
+    assert not _is_inside(storage.settings_dir, _REPO_ROOT)
+
+    # The HARDCODED first guarded root (<repo>/data) is always present, independent of
+    # any settings file content -- this is the L2.16 decoupling requirement.
     roots = production_path_roots(_REPO_ROOT)
-    assert any(_is_inside(_PRODUCTION_CACHE_DIR, root) for _, root in roots)
-    live_dir = _live_portfolio_dir_from_checked_in_settings()
-    if live_dir:
-        assert any(_is_inside(live_dir, root) for _, root in roots)
+    assert any(
+        _canonical(root) == _canonical(_PRODUCTION_CACHE_DIR) for _, root in roots
+    ), roots
 
 
 def test_storage_manager_path_resolution(temp_workspace):
@@ -1325,6 +1540,79 @@ def test_quotes_endpoint_and_storage_quotes(temp_workspace):
     assert data_post["quotes"]["AAPL"]["price"] is not None
 
 
+def test_get_quotes_pins_the_expected_session_and_flags_a_stale_bar(temp_workspace, monkeypatch):
+    """(L2.3) The LIVE quote path must ask the cache for the *expected* session.
+
+    A display price computed from an older bar is tolerable, but it must be labelled
+    ``stale`` and carry the session it was supposed to be -- the 2026-10-22 defect in
+    display form was a 10-21 close looking like a 10-22 price with no marker at all.
+    """
+    import datetime as dt
+
+    import pandas as pd
+
+    import common.data as common_data
+
+    storage, _temp_dir = temp_workspace
+    calls = {}
+
+    def _fake_load_universe(symbols, start=None, end=None, interval="1d", **kwargs):
+        calls["symbols"] = list(symbols)
+        calls["expected_last_session"] = kwargs.get("expected_last_session")
+        idx = pd.DatetimeIndex(["2026-09-25"])
+        return {s: pd.DataFrame({"Close": [123.0]}, index=idx.copy()) for s in symbols}
+
+    monkeypatch.setattr(common_data, "load_universe", _fake_load_universe)
+
+    res = storage.get_quotes(["AAPL"], as_of_date="2026-09-29", data_provider="synthetic")
+    quote = res["quotes"]["AAPL"]
+
+    # The session was DEMANDED, not inferred from whatever happened to be on disk.
+    assert calls["expected_last_session"] == dt.date(2026, 9, 29)
+    assert quote["expected_session"] == "2026-09-29"
+    assert quote["date"] == "2026-09-25"
+    assert quote["stale"] is True
+
+
+def test_get_quotes_without_an_explicit_date_uses_the_market_clock(temp_workspace, monkeypatch):
+    """No `as_of_date` => the market clock's session, never the host's `date.today()`."""
+    import datetime as dt
+
+    import pandas as pd
+
+    import common.data as common_data
+    import common.market_clock as market_clock_module
+
+    storage, _temp_dir = temp_workspace
+    session = dt.date(2026, 9, 29)
+
+    real_expected = market_clock_module.expected_last_session
+
+    def _frozen(market="china", now=None, **kwargs):
+        return real_expected(
+            market,
+            now=dt.datetime(2026, 9, 30, 20, 0, tzinfo=dt.timezone.utc),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(market_clock_module, "expected_last_session", _frozen)
+
+    calls = {}
+
+    def _fake_load_universe(symbols, start=None, end=None, interval="1d", **kwargs):
+        calls["expected_last_session"] = kwargs.get("expected_last_session")
+        idx = pd.DatetimeIndex([session.isoformat()])
+        return {s: pd.DataFrame({"Close": [123.0]}, index=idx.copy()) for s in symbols}
+
+    monkeypatch.setattr(common_data, "load_universe", _fake_load_universe)
+
+    res = storage.get_quotes(["AAPL"], data_provider="synthetic")
+    assert res["as_of_date"] == session.isoformat()
+    assert calls["expected_last_session"] == session
+    assert res["quotes"]["AAPL"]["stale"] is False
+    assert res["quotes"]["AAPL"]["expected_session"] == session.isoformat()
+
+
 def test_previous_run_includes_prices(temp_workspace):
     """Test that /api/runs/previous returns prices mapping along with holdings and account state."""
     storage, temp_dir = temp_workspace
@@ -1789,3 +2077,295 @@ def test_execution_service_passes_guard_latency_bars(temp_workspace, monkeypatch
 
 
 
+
+
+def _freeze_market_clock(monkeypatch, session):
+    """Pin `common.market_clock.expected_last_session` to one fixed session.
+
+    The frozen date is deliberately NOT the host's `date.today()`: if any
+    archive-key resolver still falls back to the host calendar, the assertions
+    below fail instead of coincidentally matching.
+    """
+    import datetime as dt
+
+    import common.market_clock as market_clock_module
+
+    real_expected = market_clock_module.expected_last_session
+
+    def _frozen(market="china", now=None, **kwargs):
+        return real_expected(
+            market,
+            now=dt.datetime(2026, 9, 30, 20, 0, tzinfo=dt.timezone.utc),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(market_clock_module, "expected_last_session", _frozen)
+    assert session != dt.date.today(), "frozen session must differ from the host's today"
+    return _frozen
+
+
+def test_archive_date_key_has_exactly_one_source(temp_workspace, monkeypatch):
+    """L2.5: writer and reader resolve the SAME archive date key (never `date.today()`).
+
+    Covers the three places that used to drift apart independently --
+    `market_clock_date`, `get_run_dir`, and `get_multi_netting_run_dir` -- plus the
+    malformed/omitted fallbacks that used to substitute a host-local day.
+    """
+    import datetime as dt
+
+    storage, _temp_dir = temp_workspace
+    session = dt.date(2026, 9, 30)
+    _freeze_market_clock(monkeypatch, session)
+
+    key = storage.market_clock_date()
+    assert key == session.isoformat()
+
+    # 1. Single-run directory: the date component IS the clock key.
+    run_dir = storage.get_run_dir("strat_a", "univ_a", key)
+    assert os.path.basename(run_dir) == key
+
+    # 2. Multi-netting directory: same key, different layout.
+    multi_dir = storage.get_multi_netting_run_dir("test_matrix", key)
+    assert os.path.basename(os.path.dirname(multi_dir)) == key
+
+    # 3. An OMITTED date resolves to the SAME key instead of the host calendar...
+    assert storage.get_multi_netting_run_dir("test_matrix", None) == multi_dir
+    assert storage.get_multi_netting_run_dir("test_matrix", "") == multi_dir
+    # ...while a MALFORMED one is rejected outright (it is a path component, so
+    # substituting any day would hide the caller's bug, not fix it).
+    with pytest.raises(ValueError):
+        storage.get_multi_netting_run_dir("test_matrix", "not-a-date")
+
+
+def test_netting_latest_endpoints_default_to_the_market_clock(temp_workspace, monkeypatch):
+    """L2.5: `/api/deploy/multi/latest[/csv]` with no `date` reads the writer's key.
+
+    Both endpoints (and the JSON + CSV lookups behind them) used
+    `date.today().isoformat()`; on a weekend, or whenever the host calendar and the
+    last published session split, they 404'd on a run that existed.
+    """
+    import datetime as dt
+
+    storage, _temp_dir = temp_workspace
+    session = dt.date(2026, 9, 30)
+    _freeze_market_clock(monkeypatch, session)
+
+    run_dir = storage.get_multi_netting_run_dir("test_matrix", session.isoformat())
+    os.makedirs(run_dir, exist_ok=True)
+    storage._save_json(os.path.join(run_dir, "netted_trading_ticket.json"), [{"symbol": "600519.SH", "action": "BUY"}])
+    storage._save_json(os.path.join(run_dir, "friction_savings_report.json"), {})
+    storage._save_json(os.path.join(run_dir, "sub_ledgers.json"), {})
+    storage._save_json(os.path.join(run_dir, "summary.json"), {"matrix_id": "test_matrix", "date": session.isoformat()})
+    with open(os.path.join(run_dir, "netted_trading_ticket.csv"), "w", encoding="utf-8") as f:
+        f.write("symbol,action\n600519.SH,BUY\n")
+
+    client = TestClient(create_app(storage))
+
+    res = client.get("/api/deploy/multi/latest?matrix_id=test_matrix")
+    assert res.status_code == 200, res.text
+    assert res.json()["date"] == session.isoformat()
+
+    res_csv = client.get("/api/deploy/multi/latest/csv?matrix_id=test_matrix")
+    assert res_csv.status_code == 200, res_csv.text
+    disposition = res_csv.headers["content-disposition"]
+    assert session.isoformat() in disposition
+    assert dt.date.today().isoformat() not in disposition
+
+
+# ---------------------------------------------------------------------------
+# L2.20 / L2.25 -- ticket action badges: three distinct states, and the badge is
+# never derived from `target_weight == 0`.
+#
+# FORENSIC CONTEXT (why these tests are behavioural, not string greps): the
+# pre-L2.20 badge logic handled only BUY / SELL / HOLD_FILTERED / cash, and
+# everything else fell through to a single generic `⚪ HOLD (维持)` badge. That
+# made `CANCEL_PENDING` (an aborted PENDING_ENTRY: never held, no order) and a
+# market-closed freeze row (nothing evaluated at all) render IDENTICALLY to a
+# genuine "position maintained" row -- i.e. the two states an operator most needs
+# to tell apart were collapsed into the one that requires no action. Both of them
+# carry `target_weight == 0.0`, so a weight-based renderer cannot recover them.
+# ---------------------------------------------------------------------------
+
+
+def _app_js_source() -> str:
+    js_path = os.path.join(find_repo_root(), "web", "livetrading", "static", "js", "app.js")
+    with open(js_path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _js_brace_block(source: str, start: int) -> str:
+    """Return the balanced `{...}` block that begins at `start` (inclusive)."""
+    assert source[start] == "{", "expected a '{' at the start of a balanced block"
+    depth = 0
+    for idx in range(start, len(source)):
+        ch = source[idx]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start : idx + 1]
+    raise AssertionError("unbalanced braces while extracting a JS block from app.js")
+
+
+def _extract_js_function(source: str, name: str) -> str:
+    marker = f"function {name}("
+    idx = source.find(marker)
+    assert idx >= 0, f"`{name}` is missing from app.js"
+    brace = source.find("{", idx)
+    return f"function {name}(" + source[source.find("(", idx) + 1 : brace] + _js_brace_block(source, brace)
+
+
+def _extract_js_const_object(source: str, name: str) -> str:
+    idx = source.find(f"const {name} = ")
+    assert idx >= 0, f"`const {name}` is missing from app.js"
+    brace = source.find("{", idx)
+    return f"const {name} = " + _js_brace_block(source, brace) + ";"
+
+
+def _run_badge_resolver(rows):
+    """Execute the REAL `resolveTicketActionBadge` from app.js under node.
+
+    Returns the list of `{key, cls, text}` verdicts, or `None` when no JS runtime
+    exists -- in that case the caller falls back to a structural assertion that
+    still fails against the pre-L2.20 source (which contains neither label).
+    Running the shipped function (instead of asserting on substrings) is what
+    makes these tests able to distinguish "badge decided by action" from "badge
+    decided by anything else".
+    """
+    import subprocess
+
+    node = shutil.which("node") or shutil.which("nodejs")
+    if not node:
+        return None
+    src = _app_js_source()
+    script = "\n".join(
+        [
+            _extract_js_const_object(src, "BLOCKING_REASON_LABELS"),
+            _extract_js_function(src, "resolveTicketActionBadge"),
+            f"const rows = {json.dumps(rows)};",
+            "process.stdout.write(JSON.stringify(rows.map(resolveTicketActionBadge)));",
+        ]
+    )
+    proc = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, f"extracted app.js badge resolver failed under node: {proc.stderr}"
+    return json.loads(proc.stdout)
+
+
+def test_app_js_badge_distinguishes_hold_freeze_and_cancelled_entry():
+    """Three states, three DIFFERENT badges (fails against the pre-L2.20 source)."""
+    rows = [
+        {"action": "HOLD", "blocking_reason": "NONE", "target_weight": 0.10},
+        {"action": "HOLD_FILTERED", "blocking_reason": "MARKET_CLOSED_FREEZE", "target_weight": 0.0},
+        {"action": "CANCEL_PENDING", "blocking_reason": "NONE", "target_weight": 0.0},
+    ]
+    verdicts = _run_badge_resolver(rows)
+    if verdicts is None:  # no JS runtime on this box -- structural fallback
+        src = _app_js_source()
+        for literal in ("⚪ HOLD (维持)", "休市未评估", "已取消开仓"):
+            assert literal in src, f"missing badge label {literal!r} in app.js (L2.20/L2.25)"
+        return
+
+    hold, frozen, cancelled = verdicts
+
+    # 1. 维持 (the only state that needs no operator action).
+    assert hold["key"] == "HOLD"
+    assert "维持" in hold["text"]
+
+    # 2. 休市未评估 -- nothing was evaluated; must NOT read as "held" or "filtered".
+    assert frozen["key"] == "MARKET_CLOSED_FREEZE"
+    assert "休市未评估" in frozen["text"]
+    assert "维持" not in frozen["text"]
+    assert "badge-freeze" in frozen["cls"]
+
+    # 3. 已取消开仓 -- an aborted entry that never held anything (L2.20 proper).
+    assert cancelled["key"] == "CANCEL_PENDING"
+    assert "已取消开仓" in cancelled["text"]
+    assert "维持" not in cancelled["text"]
+    assert "badge-cancel" in cancelled["cls"]
+    assert cancelled["key"] != "SELL"  # never counted as a trade
+
+    # The three states are pairwise distinct -- in the old code states 2 and 3
+    # both rendered the generic "⚪ HOLD (维持)" string.
+    assert len({v["key"] for v in verdicts}) == 3
+    assert len({v["text"] for v in verdicts}) == 3
+    assert frozen["text"] != cancelled["text"]
+
+
+def test_app_js_badge_ignores_target_weight_entirely():
+    """Same action + blocking_reason => same badge, whatever `target_weight` says.
+
+    This is the structural guarantee: the badge cannot be a function of the
+    weight, because varying the weight alone changes nothing.
+    """
+    rows = [
+        {"action": "CANCEL_PENDING", "blocking_reason": "NONE", "target_weight": 0.0},
+        {"action": "CANCEL_PENDING", "blocking_reason": "NONE", "target_weight": 0.35},
+        {"action": "HOLD_FILTERED", "blocking_reason": "TENURE_LOCKED", "target_weight": 0.0},
+        {"action": "HOLD_FILTERED", "blocking_reason": "TENURE_LOCKED", "target_weight": 0.20},
+    ]
+    verdicts = _run_badge_resolver(rows)
+    if verdicts is None:
+        return  # covered by the structural fallback in the test above
+    assert verdicts[0] == verdicts[1]
+    assert verdicts[2] == verdicts[3]
+    assert "未满最低持仓周期" in verdicts[2]["text"]  # label mirrored from Python
+
+
+def test_app_js_blocking_reason_labels_mirror_python_enum():
+    """The web badge and the console ticket must not drift apart in wording.
+
+    `scripts/run_live_strategy.py` renders its labels from
+    `common.position_lifecycle.BLOCKING_REASON_LABELS`; the web badge carries a
+    JS copy (browsers cannot import Python). The operator reads both side by side,
+    so an exact-match assertion is the only honest way to keep them equal.
+    """
+    import re
+
+    from common.position_lifecycle import BLOCKING_REASON_LABELS
+
+    block = _extract_js_const_object(_app_js_source(), "BLOCKING_REASON_LABELS")
+    js_pairs = dict(re.findall(r'"([A-Z_]+)"\s*:\s*"([^"]*)"', block))
+    assert js_pairs == dict(BLOCKING_REASON_LABELS)
+
+
+def test_app_js_counts_only_executable_actions_in_the_ticket_summary():
+    """`sellsCount` / `buysCount` must key off the same verdict as the badge."""
+    src = _app_js_source()
+    expectations = {
+        "sellsCount++": 'verdict.key === "SELL"',
+        "totalSellVal +=": 'verdict.key === "SELL"',
+        "buysCount++": 'verdict.key === "BUY"',
+        "totalBuyVal +=": 'verdict.key === "BUY"',
+    }
+    for counter, guard in expectations.items():
+        idx = src.find(counter)
+        assert idx > 0, f"{counter} disappeared from app.js"
+        window = src[max(0, idx - 300) : idx]
+        assert guard in window, (
+            f"{counter} is no longer guarded by {guard} -- a CANCEL_PENDING / frozen "
+            "row must never be summed into the executable sell/buy totals"
+        )
+
+
+def test_app_js_badge_survives_legacy_archive_rows_without_blocking_reason():
+    """Pre-L2.24 archives have no `blocking_reason` column: badges must still work.
+
+    Disclosed limit: a legacy market-closed freeze row is indistinguishable from a
+    genuine gate rejection in the archive (both are `HOLD_FILTERED` with no label),
+    so it renders as "锁仓/过滤". Reclassifying it would require exactly the
+    `target_weight == 0` inference this task removes -- so it stays unresolved
+    rather than guessed.
+    """
+    rows = [
+        {"action": "CANCEL_PENDING", "target_weight": 0.0},
+        {"action": "HOLD_FILTERED", "target_weight": 0.0},
+        {"action": "HOLD", "target_weight": 0.0},
+    ]
+    verdicts = _run_badge_resolver(rows)
+    if verdicts is None:
+        return
+    assert [v["key"] for v in verdicts] == ["CANCEL_PENDING", "HOLD_FILTERED", "HOLD"]
+    assert "已取消开仓" in verdicts[0]["text"]
+    assert verdicts[1]["text"] == "🟡 HOLD (锁仓/过滤)"
+    assert verdicts[2]["text"] == "⚪ HOLD (维持)"

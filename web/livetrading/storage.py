@@ -1,14 +1,23 @@
 """Storage and configuration persistence layer for the Live Trading Web Application.
 
 Enforces zero hardcoded paths by prioritizing:
-  Explicit Override / CLI > Environment Variable > settings.json > Dynamically Discovered Relative Fallback.
+  Explicit Override / CLI > Environment Variable > settings.local.json (operator
+  override) > settings.json (committed TEMPLATE, placeholders only) > Dynamically
+  Discovered Relative Fallback (always under ``repo_root``).
+
+The committed ``web/livetrading/data/settings.json`` must NEVER carry machine-specific
+absolute paths: it is a template whose path keys are empty.  Real deployments supply
+their paths through environment variables or through the untracked
+``web/livetrading/data/settings.local.json``; that local file is also the write target
+of ``update_settings`` so the UI can never rewrite the template.  See ``L2.16`` in
+``docs/development_plan.md``.
 """
 
 import json
 import os
 import re
 import sys
-from datetime import date, timedelta
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
@@ -42,6 +51,16 @@ except ImportError:
             return n.lower() in ("custom", "universe", "none", "unknown", "nan", "") or (
                 symbol is not None and n == str(symbol).strip()
             )
+
+
+# (L2.3) The bar-date-vs-expected-session comparison has exactly one owner. The UI quote
+# path may not re-derive it (design §7), so it asks `common/freshness.py` and merely
+# reports the verdict alongside the price.
+try:
+    from common.freshness import is_stale_bar
+except ImportError:  # pragma: no cover - repo root not yet importable
+    sys.path.insert(0, find_repo_root())
+    from common.freshness import is_stale_bar
 
 
 def normalize_universe_key(key: Optional[str]) -> str:
@@ -144,6 +163,46 @@ def is_cash_symbol(sym: Optional[str]) -> bool:
     return s in _CASH_SYMBOLS or s.startswith("CASH")
 
 
+# --------------------------------------------------------------------------- #
+# (L2.4 / L2.5) Market clock: the ONE source of an archive date key
+# --------------------------------------------------------------------------- #
+# FORENSIC CONTEXT (why this lives here, not in each caller):
+#   `web/livetrading` used to key its daily archive on `date.today()` -- the HOST's
+#   calendar day.  On a Saturday that names a non-trading day, and during the session
+#   it names a bar that does not exist yet, so the Stage-1/Stage-2 run directory, the
+#   `summary.json` `date`, the quotes basis and the `/api/deploy/multi/latest` lookup
+#   could each be keyed by a different day.  `L2.3` moved the *decision* into
+#   `common/market_clock.expected_last_session`; `L2.4`/`L2.5` finish the job for the
+#   ARCHIVE KEY by routing every date-key resolution in this trio
+#   (`storage.py`, `server.py`, `execution_service.py`) through the two methods below.
+#   Never reintroduce `date.today()` as a fallback: a missing date is "ask the
+#   market clock", not "ask the host".
+_CLOCK_CASH_PROXIES = frozenset({"BIL", "CASH"})
+
+
+def is_clock_cash_proxy(symbol: Optional[str]) -> bool:
+    """Cash/liquidity proxy: priced at 1.0, no calendar, must not vote on the date key."""
+    s = str(symbol or "").strip().upper()
+    return s in _CLOCK_CASH_PROXIES or s.startswith("CASH")
+
+
+def read_universe_symbols(path: Optional[str]) -> List[str]:
+    """Symbols of a universe file (one per line, `#` comments allowed); `[]` if unreadable."""
+    if not path:
+        return []
+    symbols: List[str] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                token = line.split("#", 1)[0].strip()
+                if not token:
+                    continue
+                symbols.extend(tok.upper() for tok in token.replace(",", " ").split())
+    except OSError:
+        return []
+    return symbols
+
+
 def post_holdings_from_ticket(ticket: Any) -> Optional[Dict[str, int]]:
     """Derive assumed post-trade share holdings from a ticket's `target_shares` column.
 
@@ -244,22 +303,30 @@ def is_run_dir(path: Optional[str]) -> bool:
 # ---------------------------------------------------------------------------
 # FORENSIC CONTEXT (why this net exists -- it is not defensive paranoia):
 #   A bare `StorageManager(repo_root=<repo>)` resolves `cache_dir` to `<repo>/data`,
-#   the production directory holding the real `cache.duckdb`.  Worse, it loads the
-#   checked-in `web/livetrading/data/settings.json`, which pins `data_dir` /
-#   `archive_dir` to a LIVE portfolio directory OUTSIDE the repo.  So any unit test,
-#   ad-hoc script, or new feature that forgot to pass an explicit `cache_dir`
-#   silently wrote into the production market cache by default (observed in practice).
-#   `web/livetrading/tests/conftest.py` isolates the tests that live in that package
-#   through the env-var layer; this net closes the hole at the RESOLVER, so a scratch
-#   test in any other package, a doctest, or a future test module is covered too.
+#   the production directory holding the real `cache.duckdb`.  Historically it also
+#   loaded the committed `web/livetrading/data/settings.json`, which pinned
+#   `data_dir` / `archive_dir` to a LIVE portfolio directory OUTSIDE the repo, so any
+#   unit test, ad-hoc script, or new feature that forgot to pass an explicit
+#   `cache_dir` silently wrote into production state (observed in practice).
+#   `L2.16` removed that structural default: the committed settings file is now a
+#   placeholder-only template and every resolved default lands under `repo_root`.
+#   `web/livetrading/tests/conftest.py` isolates this package through the env-var
+#   layer; the net below closes the hole at the RESOLVER, so a scratch test in any
+#   other package, a doctest, or a future test module is covered too.
 #
 #   ZERO production behaviour change: everything below is gated on
 #   `PYTEST_CURRENT_TEST`, a variable only pytest sets.  When it is absent nothing is
 #   read, compared, logged, or raised -- resolution is exactly what it always was,
-#   with the same parameter > environment > settings.json > dynamic-default order.
-#   The guard inspects the FINAL resolved path (after `os.path.abspath`), so
-#   `./data`, `data/../data`, and symlinked aliases all collide with the real
-#   target instead of bypassing the check.
+#   with the same parameter > environment > local override > template > dynamic
+#   default order.  The guard inspects the FINAL resolved path (after
+#   `os.path.abspath`), so `./data`, `data/../data`, and symlinked aliases all collide
+#   with the real target instead of bypassing the check.
+#
+#   The refusal roots are HARDCODED in code (`<repo_root>/data`), deliberately NOT
+#   inferred from the committed settings template -- that template is placeholder-only
+#   after `L2.16`, so trusting its contents would silently disable the net.  The
+#   operator's untracked `settings.local.json` is still inspected, because that is
+#   where a real deployment records its live portfolio directory.
 #
 #   Escape hatch: `LIVETRADING_ALLOW_PRODUCTION_PATHS=1` for the rare test that
 #   genuinely must point at the real cache / live portfolio (deliberate read-only
@@ -276,10 +343,28 @@ _PATH_ENV_VARS = {
     "archive_dir": "LIVETRADING_ARCHIVE_DIR",
     "cache_dir": "LIVETRADING_CACHE_DIR",
 }
-#: The checked-in (committed) settings file, read only to learn which live
-#: directories the default resolution chain can reach.  Deliberately independent
-#: of the resolved `data_dir`, so the guard works before `data_dir` is trusted.
-_CHECKED_IN_SETTINGS_REL = os.path.join("web", "livetrading", "data", "settings.json")
+#: Where the settings files live.  Resolved against `repo_root` (NOT against the
+#: resolved `data_dir`), so that a local override can itself pin `data_dir`.
+_SETTINGS_DIR_ENV = "LIVETRADING_SETTINGS_DIR"
+_SETTINGS_DIR_REL = os.path.join("web", "livetrading", "data")
+#: The committed TEMPLATE: placeholder-only, never machine-specific (L2.16).
+_SETTINGS_TEMPLATE_NAME = "settings.json"
+#: The operator's untracked override (git-ignored via `web/livetrading/.gitignore`).
+_SETTINGS_LOCAL_NAME = "settings.local.json"
+
+
+def settings_dir_for(repo_root: str) -> str:
+    """Directory holding the settings template + local override for `repo_root`.
+
+    `LIVETRADING_SETTINGS_DIR` relocates it (tests use this to stay hermetic; an
+    operator can point it at an external deployment directory).  It is resolved from
+    `repo_root` rather than from `data_dir` on purpose: the local override must be
+    able to pin `data_dir` itself, which would be a chicken-and-egg otherwise.
+    """
+    override = os.environ.get(_SETTINGS_DIR_ENV)
+    if override and str(override).strip():
+        return os.path.abspath(override)
+    return os.path.join(os.path.abspath(repo_root), _SETTINGS_DIR_REL)
 
 
 class ProductionPathError(RuntimeError):
@@ -322,9 +407,13 @@ def production_path_roots(repo_root: str) -> List[Tuple[str, str]]:
 
     Two categories:
       1. `<repo_root>/data` -- the repo's production market cache (`cache.duckdb`).
-      2. Any absolute directory the checked-in `settings.json` pins OUTSIDE the repo
-         -- i.e. the live portfolio directory (and therefore its `<dir>/runs` archive,
-         which the containment check catches as a descendant).
+         HARDCODED here on purpose: after L2.16 the committed settings template is
+         placeholder-only, so deriving this root from file content would be a
+         self-disabling guard.
+      2. Any absolute directory the operator's untracked local override
+         (`settings.local.json`) pins OUTSIDE the repo -- i.e. the live portfolio
+         directory (and therefore its `<dir>/runs` archive, which the containment
+         check catches as a descendant).  The committed template is never consulted.
     In-repo pins are skipped: they are either covered by (1) or ordinary workspace
     directories (e.g. `docs/universe`), which tests are allowed to read.
     """
@@ -335,20 +424,21 @@ def production_path_roots(repo_root: str) -> List[Tuple[str, str]]:
         ),
     ]
 
-    settings_path = os.path.join(repo_root, _CHECKED_IN_SETTINGS_REL)
+    settings_dir = settings_dir_for(repo_root)
+    local_path = os.path.join(settings_dir, _SETTINGS_LOCAL_NAME)
     try:
-        with open(settings_path, "r", encoding="utf-8") as f:
-            checked_in = json.load(f)
+        with open(local_path, "r", encoding="utf-8") as f:
+            local_settings = json.load(f)
     except Exception:
-        checked_in = {}
-    if not isinstance(checked_in, dict):
+        local_settings = {}
+    if not isinstance(local_settings, dict):
         return roots
 
     # Collect the out-of-repo pins, merging keys that live under the same root
     # (`data_dir=/live` and `archive_dir=/live/runs` are one location).
     pinned: List[Tuple[str, List[str]]] = []
     for key in ("data_dir", "archive_dir", "cache_dir"):
-        value = checked_in.get(key)
+        value = local_settings.get(key)
         if not isinstance(value, str) or not value.strip() or not os.path.isabs(value):
             continue
         value_abs = os.path.abspath(value)
@@ -365,8 +455,8 @@ def production_path_roots(repo_root: str) -> List[Tuple[str, str]]:
 
     for known_root, keys in pinned:
         roots.append((
-            f"the live portfolio directory pinned by {_CHECKED_IN_SETTINGS_REL} "
-            f"(settings key(s) {', '.join(keys)})",
+            f"the live portfolio directory pinned by the operator's local override "
+            f"({local_path}, settings key(s) {', '.join(keys)})",
             known_root,
         ))
     return roots
@@ -429,6 +519,7 @@ class StorageManager:
         stage1_script: Optional[str] = None,
         stage2_script: Optional[str] = None,
         python_executable: Optional[str] = None,
+        settings_dir: Optional[str] = None,
     ):
         # 1. Resolve repo_root
         self.repo_root = (
@@ -451,10 +542,43 @@ class StorageManager:
             if _prod_guard_active:
                 refuse_production_path(kind, value, source, _prod_roots)
 
-        # 2. Base data_dir
+        # 2. Settings: committed TEMPLATE (placeholders only) + untracked LOCAL override.
+        #    Both live in `settings_dir`, which is resolved from repo_root (NOT from
+        #    data_dir) precisely so a local override can pin `data_dir` itself.
+        self.settings_dir = os.path.abspath(settings_dir) if settings_dir else settings_dir_for(self.repo_root)
+        self.settings_template_file = os.path.join(self.settings_dir, _SETTINGS_TEMPLATE_NAME)
+        self.settings_local_file = os.path.join(self.settings_dir, _SETTINGS_LOCAL_NAME)
+        template_settings = self._load_json(self.settings_template_file, default={})
+        local_settings = self._load_json(self.settings_local_file, default={})
+        if not isinstance(template_settings, dict):
+            template_settings = {}
+        if not isinstance(local_settings, dict):
+            local_settings = {}
+        #: Effective file-provided settings: LOCAL OVERRIDE WINS over the template.
+        saved_settings: Dict[str, Any] = {**template_settings, **local_settings}
+        #: Write target for `update_settings`.  NEVER the committed template -- the UI
+        #: must not be able to rewrite a tracked file with machine-specific paths.
+        self.settings_file = self.settings_local_file
+
+        def _file_setting(key: str) -> Tuple[str, Any]:
+            """(source-label, value) for a key, local override before template.
+
+            Matches `_first_defined`'s (label, value) pair order, so the pytest guard
+            can name the exact file/key that produced a refused path.
+            """
+            local_value = local_settings.get(key)
+            if local_value:
+                return f"settings.local.json key '{key}' ({self.settings_local_file})", local_value
+            template_value = template_settings.get(key)
+            if template_value:
+                return f"settings.json template key '{key}' ({self.settings_template_file})", template_value
+            return "", None
+
+        # 3. Base data_dir
         _data_dir_value, _data_dir_source = _first_defined(
             ("explicit data_dir argument", data_dir),
             ("LIVETRADING_DATA_DIR environment variable", os.environ.get("LIVETRADING_DATA_DIR")),
+            _file_setting("data_dir"),
             (
                 "dynamic default <repo_root>/web/livetrading/data",
                 os.path.join(self.repo_root, "web", "livetrading", "data"),
@@ -465,21 +589,18 @@ class StorageManager:
         _guard_pytest_path("data_dir", self.data_dir, _data_dir_source)
         os.makedirs(self.data_dir, exist_ok=True)
 
-        # 3. Load persistent settings from settings.json if present
-        self.settings_file = os.path.join(self.data_dir, "settings.json")
-        saved_settings = self._load_json(self.settings_file, default={})
-
-        # 4. Resolve remaining paths with hierarchy: Parameter > Env > Settings > Dynamic Default
+        # 4. Resolve remaining paths with hierarchy:
+        #    Parameter > Env > settings.local.json > settings.json template > Dynamic Default
         _archive_dir_value, _archive_dir_source = _first_defined(
             ("explicit archive_dir argument", archive_dir),
             ("LIVETRADING_ARCHIVE_DIR environment variable", os.environ.get("LIVETRADING_ARCHIVE_DIR")),
-            (f"settings.json key 'archive_dir' ({self.settings_file})", saved_settings.get("archive_dir")),
+            _file_setting("archive_dir"),
             ("dynamic default <data_dir>/runs", os.path.join(self.data_dir, "runs")),
         )
         self.archive_dir = os.path.abspath(_archive_dir_value)
-        # The daily run archive IS a production write target: the checked-in
-        # settings.json pins it to `<live portfolio>/runs`, and the dynamic default
-        # lands inside data_dir. Guarded for the same reason as cache_dir.
+        # The daily run archive IS a production write target: a deployment's local
+        # override pins it to `<live portfolio>/runs`, and the dynamic default lands
+        # inside data_dir. Guarded for the same reason as cache_dir.
         _guard_pytest_path("archive_dir", self.archive_dir, _archive_dir_source)
         os.makedirs(self.archive_dir, exist_ok=True)
 
@@ -500,7 +621,7 @@ class StorageManager:
         _cache_dir_value, _cache_dir_source = _first_defined(
             ("explicit cache_dir argument", cache_dir),
             ("LIVETRADING_CACHE_DIR environment variable", os.environ.get("LIVETRADING_CACHE_DIR")),
-            (f"settings.json key 'cache_dir' ({self.settings_file})", saved_settings.get("cache_dir")),
+            _file_setting("cache_dir"),
             ("dynamic default <repo_root>/data", os.path.join(self.repo_root, "data")),
         )
         self.cache_dir = os.path.abspath(_cache_dir_value)
@@ -597,6 +718,12 @@ class StorageManager:
         }
 
     def update_settings(self, new_settings: Dict[str, Any]) -> Dict[str, Any]:
+        """Persist operator-edited settings to the UNTRACKED local override file.
+
+        The write target is ``web/livetrading/data/settings.local.json`` (git-ignored),
+        NEVER the committed ``settings.json`` template -- so the UI can pin a
+        deployment's real paths without ever dirtying the repository (L2.16).
+        """
         current = self.get_settings()
         for k, v in new_settings.items():
             if v is not None and k in current:
@@ -1010,6 +1137,75 @@ class StorageManager:
             os.makedirs(daily_dir, exist_ok=True)
             self._save_json(os.path.join(daily_dir, "holdings.json"), holdings)
 
+    # --------------------------------------------------------------------------
+    # Market clock: single owner of the daily-archive date key (L2.4 / L2.5)
+    # --------------------------------------------------------------------------
+    def market_clock_markets(
+        self,
+        symbols: Optional[List[str]] = None,
+        universe_file: Optional[str] = None,
+        market: Optional[str] = None,
+    ) -> List[str]:
+        """Markets this book trades on, inferred from symbols (sorted, deduped).
+
+        `market` (an operator's explicit `--market`) wins outright: when given, only
+        that market votes.  Otherwise the symbols of `symbols` / `universe_file` vote,
+        cash proxies (`BIL`/`CASH*`) are skipped -- they have no calendar and a US
+        T-bill ETF in a China book would otherwise make it look cross-market -- and an
+        uninferrable ticker abstains rather than raising.  Empty result means "no
+        evidence"; the date resolver then falls back to China, the workspace default.
+        """
+        if market:
+            return [str(market).strip().lower()]
+
+        from common.market_clock import infer_market_from_symbol
+
+        candidates = list(symbols or [])
+        if not candidates:
+            candidates = read_universe_symbols(universe_file)
+
+        markets = set()
+        for sym in candidates:
+            if not sym or is_clock_cash_proxy(sym):
+                continue
+            try:
+                markets.add(infer_market_from_symbol(str(sym).strip().upper()))
+            except Exception:
+                # Index/odd ticker: no calendar evidence, simply does not vote.
+                continue
+        return sorted(markets)
+
+    def market_clock_date(
+        self,
+        symbols: Optional[List[str]] = None,
+        universe_file: Optional[str] = None,
+        market: Optional[str] = None,
+        now: Optional[datetime] = None,
+    ) -> str:
+        """ISO date of the market clock's latest PUBLISHED session for this book.
+
+        THE date-key resolver: the daily run directory, `summary.json`'s `date` /
+        `as_of`, `get_multi_netting_run_dir`'s fallback and the `/api/*/latest`
+        lookups all come from here, so they cannot disagree about which session a
+        run belongs to.  A cross-market book takes the EARLIEST market's session
+        (no symbol may be required to have published beyond its own close).
+
+        `date.today()` must never appear as a fallback anywhere in this layer: the
+        host's calendar day is a non-trading weekend on Saturdays and, intraday, a
+        bar that does not exist yet.
+        """
+        try:
+            from common.market_clock import expected_last_session
+        except ImportError:  # pragma: no cover - repo root not importable yet
+            if self.repo_root not in sys.path:
+                sys.path.insert(0, self.repo_root)
+            from common.market_clock import expected_last_session
+
+        markets = self.market_clock_markets(symbols, universe_file, market=market)
+        if not markets:
+            markets = ["china"]
+        return min(expected_last_session(m, now=now) for m in markets).isoformat()
+
     def get_quotes(
         self,
         symbols: List[str],
@@ -1018,10 +1214,43 @@ class StorageManager:
         strategy_key: Optional[str] = None,
         universe_key: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Fetch latest quotes and reference market prices for a list of ticker symbols."""
+        """Fetch latest quotes and reference market prices for a list of ticker symbols.
+
+        (L2.3) This is a LIVE price path, so it may not fall back to the cache's lenient
+        "we synced today" answer: the expected session is resolved and passed explicitly.
+        Without an explicit `as_of_date` the target date is the MARKET clock's latest
+        published session (never the host's `date.today()`), which is also what the cache
+        must actually hold. A cross-market symbol list uses the EARLIEST of the involved
+        markets' expected sessions, so no symbol is demanded to have published beyond its
+        own market's close.
+        """
         provider_name = data_provider or self.default_data_provider or "marketdb"
-        target_date = validate_date_str(as_of_date) or date.today().isoformat()
+
+        from common.market_clock import (
+            expected_last_session as _expected_last_session,
+            infer_market_from_symbol,
+        )
+
         clean_symbols = [str(s).strip().upper() for s in symbols if s and str(s).strip()]
+
+        # Cash proxies have no meaningful calendar (they are priced at 1.0 below) and
+        # BIL/CASH would otherwise make a single-market book look cross-market.
+        market_symbols = [s for s in clean_symbols if s not in ("BIL", "CASH") and not s.startswith("CASH")]
+        markets = set()
+        for sym in market_symbols:
+            try:
+                markets.add(infer_market_from_symbol(sym))
+            except Exception:
+                continue
+        clock_market = sorted(markets)[0] if markets else "china"
+        clock_expected = _expected_last_session(clock_market)
+        if len(markets) > 1:
+            clock_expected = min(_expected_last_session(m) for m in markets)
+
+        target_date = validate_date_str(as_of_date) or clock_expected.isoformat()
+        quote_expected_session = (
+            pd.Timestamp(target_date).date() if as_of_date else clock_expected
+        )
 
         quotes: Dict[str, Dict[str, Any]] = {}
         for sym in clean_symbols:
@@ -1072,6 +1301,7 @@ class StorageManager:
                 use_cache=True,
                 cache_dir=self.cache_dir,
                 provider=provider_name,
+                expected_last_session=quote_expected_session,
             )
         except Exception as exc:
             print(f"[get_quotes] Warning: failed to load from provider '{provider_name}': {exc}")
@@ -1087,6 +1317,10 @@ class StorageManager:
             if has_df:
                 last_price = float(df["Close"].iloc[-1])
                 last_date = df.index[-1].strftime("%Y-%m-%d") if hasattr(df.index[-1], "strftime") else str(df.index[-1])[:10]
+                # (L2.3) Same single freshness owner as the live ticket paths; a UI quote
+                # may still be shown for a stale bar, but it must SAY so rather than look
+                # like the current price (the 2026-10-22 defect, in display form).
+                price_is_stale = is_stale_bar(df, quote_expected_session.isoformat())
 
                 # If provider is synthetic but we have real executed ticket prices, NEVER overwrite with synthetic!
                 if has_ticket and provider_name == "synthetic":
@@ -1113,6 +1347,8 @@ class StorageManager:
                         "price": last_price,
                         "date": last_date,
                         "source": provider_name,
+                        "stale": price_is_stale,
+                        "expected_session": quote_expected_session.isoformat(),
                     }
             elif has_ticket:
                 quotes[sym] = {
@@ -1767,9 +2003,18 @@ class StorageManager:
         return configs
 
     def get_multi_netting_run_dir(self, matrix_id: str, date_str: str) -> str:
-        """Resolve archive directory path for a multi-strategy netting run."""
+        """Resolve archive directory path for a multi-strategy netting run.
+
+        (L2.5) The date component is an ARCHIVE KEY, so it has exactly one source:
+        the caller's explicit `as_of` when one was given, else the market clock
+        (`market_clock_date`) -- never the host's `date.today()`.  An *omitted*
+        date falls back to the clock; a *malformed* one is rejected by
+        `validate_date_str` (this string is a path component, so silently
+        substituting any other day would both hide the caller's bug and let an
+        unsanitized key reach the filesystem).
+        """
         clean_m = sanitize_key(matrix_id) or "matrix"
-        clean_d = validate_date_str(date_str) or date.today().isoformat()
+        clean_d = validate_date_str(date_str) or self.market_clock_date()
         return os.path.join(self.archive_dir, clean_d, f"multi_netted_{clean_m}")
 
     def get_multi_netting_run(self, date_str: str, matrix_id: str) -> Optional[Dict[str, Any]]:

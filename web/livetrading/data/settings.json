@@ -1,0 +1,28 @@
+{
+  "_README": [
+    "TEMPLATE ONLY -- every path key below is intentionally EMPTY and must stay that way.",
+    "This file is committed; it must never contain machine-specific absolute paths.",
+    "StorageManager resolves each path at runtime in this order:",
+    "  1. explicit constructor / CLI argument",
+    "  2. environment variable (LIVETRADING_DATA_DIR, LIVETRADING_ARCHIVE_DIR,",
+    "     LIVETRADING_CACHE_DIR, LIVETRADING_STRATEGY_DIR, LIVETRADING_UNIVERSE_DIR,",
+    "     LIVETRADING_STAGE1_SCRIPT, LIVETRADING_STAGE2_SCRIPT, LIVETRADING_PYTHON_BIN)",
+    "  3. web/livetrading/data/settings.local.json (untracked operator override; wins",
+    "     over this template, and is what POST /api/settings writes to)",
+    "  4. a dynamic default under the repository root",
+    "Copy settings.local.json.example to settings.local.json to pin a deployment.",
+    "See L2.16 in docs/development_plan.md."
+  ],
+  "repo_root": "",
+  "strategy_dir": "",
+  "universe_dir": "",
+  "data_dir": "",
+  "archive_dir": "",
+  "cache_dir": "",
+  "stage1_script": "",
+  "stage2_script": "",
+  "python_executable": "",
+  "default_data_provider": "marketdb",
+  "default_start_date": "2024-01-01",
+  "default_portfolio_value": 100000.0
+}
