@@ -3323,8 +3323,37 @@ exit: 1
 ##### 20.9.6 本轮复审新开的 3 项后续任务（**仅登记，未实施**）
 > 状态声明：本节三项均为独立复核（2026-10-24）发现的缺口，已在 [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) 以 `[ ]` 新开任务行登记，**本轮零代码、零闭环、零版本轴变动**；勿把它们读作已完成项，也不得据此认为「Track P / Track B 仍然 100%」。
 
-1. **`P1.9`（§2.8，Tier P3）静态模板名与配置键撞名导致 preflight 静默旁路**：`scripts/live_preflight.py` 的 `_STATIC_TEMPLATE_NAMES` 含 `dual_momentum`，而 `strategies_config.json` 的 58 个顶层键中**确实存在同名策略键** `dual_momentum`（实测为唯一撞名者）。`verify_live_strategy_dump_preflight` 在加载配置**之前**就以 `is_static_template(key)` 早退（`:202`），故以该键为名的 dump **永远进不到钉住值比对**。今日之所以无实害：`dual_momentum` 的 `parameters` 无 `blend_weighting_mode` 可钉，即使不早退也会走 `pinned_mode is None` 放行 —— 这是一条**等待被触发的**静默旁路。处置二选一：改「静态模板名 + 配置键」双向判定，或加撞名冲突断言。前置 `P1.8`。
+1. **`P1.9`（§2.8，Tier P3）静态模板名与配置键撞名导致 preflight 静默旁路**：`scripts/live_preflight.py` 的 `_STATIC_TEMPLATE_NAMES` 含 `dual_momentum`，而 `strategies_config.json` 的 58 个顶层键中**确实存在同名策略键** `dual_momentum`（实测为唯一撞名者）。`verify_live_strategy_dump_preflight` 在加载配置**之前**就以 `is_static_template(key)` 早退（`:202`），故以该键为名的 dump **永远进不到钉住值比对**。今日之所以无实害：`dual_momentum` 的 `parameters` 无 `blend_weighting_mode` 可钉，即使不早退也会走 `pinned_mode is None` 放行 —— 这是一条**等待被触发的**静默旁路。处置二选一：改「静态模板名 + 配置键」双向判定，或加撞名冲突断言。前置 `P1.8`。（已由 §20.10 落地闭环）
 2. **`P1.10`（§2.8，Tier P4）preflight 执行位置不一致**：`scripts/run_live_strategy.py` 把 preflight 放在 **`parse_args()`**（`:1006`，实际调用 `:1229`）内，使「解析命令行」带上磁盘 I/O 与 fail-fast 副作用；而 `check_live_portfolio_health.py`（`:1203`）与 `run_live_multi_strategy.py`（`:413`）都在 **`main()`** 内执行。须收口到 `main()`，且**保持「出票前失败」语义不变**（顺序仍须早于任何票据写出）。前置 `P1.8`。
 3. **`B6.4`（§2.10，Tier P5）`FastBacktestResult.__ior__` 缺口**：`res |= {...}` 走继承来的 `dict.__ior__`（C 层合并），**不经过**被重载的 `__setitem__`/`update`。实测（CPython 3.11.15）：`r |= {'cash_carry_report': 1}` 之后 `dict.__contains__(r, 'cash_carry_report')` 为 `True`、`dict.get(...)` 为 `1`，即未移植键**确实被写入**；而随后的 `r[...]` / `... in r` 仍抛 `NotImplementedError`，形成「写进去了但读不到」。**勿重复的误判**：`fromkeys()` 在 3.9/3.10/3.11/3.13/3.14 上均命中守卫而抛错，**不是**绕过路径。处置二选一：补 `__ior__`，或用测试 + 文档把该缺口立为正式契约（现状仅有 docstring 披露、**无测试守卫**）。前置 `B6.2`。
 
 **台账影响（已与 `docs/development_plan.md` §二 头部一致）**：现役 **76 → 79**（`[x]` 63 不变 / `[ ]` 13 → 16），两文件合计 **142 → 145**（`66 + 63 + 16`），子表 **`7/5/10/20/37 = 79`**；归档仍 **66**、未改写任何归档行。Track P 口径由 8/8 改为 **8/10**，Track B 由 19/19 改为 **19/20**，`Tier P4` 因 `P1.10` 不再声称「全部清零」。
+
+> 台账口径刷新（2026-10-24）：第 1 项（`P1.9`）已闭环，故现役为 **79 = 64 `[x]` + 15 `[ ]`**，两文件合计 **145 = 130 `[x]` + 15 `[ ]`**；第 2、3 项（`P1.10`、`B6.4`）仍为 `[ ]` 待办。明细见 [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) §二 头部。
+
+---
+
+#### 20.10 `P1.9` 静态模板名与配置键撞名导致的 preflight 旁路闭环 (2026-10-24)
+
+- **症状（结构性潜伏，不是新一轮事故）**：[`scripts/live_preflight.py`](file:///home/stone/Work/github/quant/scripts/live_preflight.py) 的 `_STATIC_TEMPLATE_NAMES`（13 个名字）含 `dual_momentum`，而 [`pipeline/research_strategy/strategies_config.json`](file:///home/stone/Work/github/quant/pipeline/research_strategy/strategies_config.json) 的顶层键中**确有同名策略键** `dual_momentum`（"Active Dual Momentum GTAA"；实测 58 个顶层键中它是与静态模板名撞名的**唯一**一个）。原实现里 `is_static_template()` 只是一次裸名字隶属判断，而 `verify_live_strategy_dump_preflight` 在**加载配置之前**就据此早退，三条实盘入口又各自复制了同一道裸名字门闩 —— 于是「以 `dual_momentum` 为键的研究 dump」**永远进不到钉住值比对**。今日之所以无实害：该配置条目的 `parameters` 只有 `rebalance_freq_days` / `top_k` / `cash_proxy`，**没有** `blend_weighting_mode` 可钉，即便不早退也会走 `pinned_mode is None` 放行。**它是一条等待被触发的静默旁路：哪天给它钉上权重模式，名字短路会让钉住值形同虚设，而 `P1.8` 的全绿测试看不到这件事。**
+- **选定规则（选项 C，所有者已批准）：配置成员关系优先，`research_strategy_spec` 是身份信号**。一个名字**仅当**同时满足下列两条才是**静态豁免**：
+  1. 它是 13 个静态模板名之一（`is_static_template()`，语义**一字未改** —— 13 个名字与 `momentum` / `hrp` / `inv_vol` / `ew` 四个别名保持原样，既有 `test_is_static_template` 原封不动继续钉住它）；**且**
+  2. 它**不是** `strategies_config.json` 的顶层键，**或**该 dump 根本不携带 `research_strategy_spec`。
+  理由：撞名时「配置成员关系」才是权威归属性信号；而 dump 是否带 `research_strategy_spec` 恰好把「真正的研究策略实例」与「手写的静态模板载荷」（`resolve_strategy_definition` 的 Case 4 产物，只有 `template_name`/`params`）区分开。反过来把 `dual_momentum` 从名字集合里删掉是**错的** —— 它是真实存在的静态模板名（`DualMomentumAllocation`），删名会弄坏该模板的合法放行路径。
+- **新增函数（均在 `scripts/live_preflight.py`）**：
+  1. `_DEFAULT_CONFIG_PATH` —— 仓库相对的标准配置路径常量，与验证器自己读的**同一个文件**（单一所有者，避免"测试问的键集"与"门禁用的键集"悄悄分家）。
+  2. `_config_strategy_keys(cfg_file=None) -> frozenset` —— 惰性读取并按**解析后的绝对路径**分别缓存 `json.load(...).keys()`；docstring 写明 P1.9 的缘由。按路径分槽而非单槽全局缓存，是为了让 `tmp_path` 合成配置与真实配置互不污染（否则门禁会变成依赖调用顺序的测试顺序敏感体）。
+  3. `is_static_template_exempt(name, config_keys, has_research_spec=False) -> bool` —— 实现上述规则，内部复用 `is_static_template()` 与**同一套** `strip().lower()` 归一化，使「名字判定」与「配置键判定」不可能对同一字符串给出不同结论。
+- **验证器改造（`verify_live_strategy_dump_preflight`）**：删掉**加载配置之前**的静态早退；在配置装载之后、不可识别 dump 的 raise 之后，用**已装载**的 `cfg_data` 的键集算出 `config_keys`（不再二次读盘），并算 `has_research_spec = bool(strategy_def.get("research_strategy_spec"))`，仅当 `is_static_template_exempt(key, …)` 或 `is_static_template_exempt(template_name, …)` 为真时返回 `PreflightVerdict(verified=True)`。其余分支（未注册 raise/响亮 warn、`params` 缺失 raise、双容器不符、override）**行为逐位不变**。
+- **三入口去门闩（豁免权收归验证器单一所有者）**：删除重复的 `is_static_template` 判定并去掉随之无用的 import ——
+  1. [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py)（`parse_args()` 内，原 ≈`:1227-1234`）；
+  2. [`scripts/run_live_multi_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_multi_strategy.py)（`main()` 内，原 ≈`:410-418`）；
+  3. [`scripts/check_live_portfolio_health.py`](file:///home/stone/Work/github/quant/scripts/check_live_portfolio_health.py)（`main()` 内，原 ≈`:1200-1210`）—— 该入口把返回判定写入 `weighting_mode_verified` / `weighting_mode_mismatch_overridden`；静态模板现由验证器返回 `verified=True`，与原先硬编码默认值**完全等价**（实测 `dual_momentum` 与 `equal_weight` 的 Stage 1 报告仍为 `weighting_mode='rolling_ic_ir'` / `verified=true` / `overridden=false`，且零 WARNING 输出）。
+- **新增离线测试 4 项（`common/tests/test_live_dump_preflight.py`，全部只合成 `tmp_path` 配置，不读 git-ignored dump、不改动被跟踪配置）**：
+  1. `test_colliding_static_name_with_pinned_mode_runs_preflight_and_catches_drift` —— 合成配置把 `dual_momentum` 钉在 `regime_ic_ir_hybrid`，带 `research_strategy_spec` 的 dump 报 `rolling_ic_ir` ⇒ **必须 raise**，消息含两个取值与两个文件。改前该调用在早退处直接返回 `verified=True`。
+  2. `test_colliding_static_name_healthy_pinned_value_passes_silently` —— 同上但取值一致 ⇒ `verified=True`、`mismatch_overridden=False`、stdout/stderr 皆空。
+  3. `test_genuine_static_dual_momentum_without_spec_still_exempt` —— 无 `research_strategy_spec` 的真静态 `dual_momentum` dump：对**真实**配置（该名字确为配置键）与对**不含该键**的合成配置都仍豁免、静默通过 ⇒ 真静态模板的合法放行路径未被误伤。
+  4. `test_no_static_name_is_exempt_when_shadowed_by_config_key` —— 结构性枚举：13 个名字 × 真实配置键，撞名者「带 spec 必须非豁免、不带 spec 必须豁免」，并把撞名集合**钉死为 `{"dual_momentum"}`**（未来新增撞名会立刻失败，而不是悄悄重开这条旁路）；同时断言按路径缓存不串味。
+  既有 `test_is_static_template`（13 名 + 4 别名）**一字未改、继续为绿**。
+- **验证（实测）**：目标文件 `30 passed`（26 → 30，+4）；`common/tests` **763 passed / 1 skipped**；`pipeline/tests` **337 passed**；全离线。行为保全对照（同一批真实产物，分别用 `ec590d2` 版与工作树版验证器跑）：6 个真实 blend dump **逐项判定一致**（均 `verified=True, overridden=False`）；由真实配置条目合成的 `dual_momentum` 研究 dump 两侧同为 `verified=True`（该条目无钉住值）；向合成配置注入 `regime_ic_ir_hybrid` 钉住后，漂移 `rolling_ic_ir` **改前静默 `verified=True` → 改后 raise**，取值一致时仍 `verified=True`。
+- **版本轴判定：`AGENTS.md` 第 7 条**未**触发 —— 本项只改运行时预检门禁与三处调用点，**未触及任何策略/模板类**（`pipeline/research/blend/*`、`pipeline/research_strategy/rs/*`、`common/allocation_templates.py` 均 0 改动），无信号计算、无参数默认值、无子策略组成变化，故**不升 `version` / `BASE_VERSION`，不重跑 `--dump-strategies`**；cfsb 的部署钉住值 `regime_ic_ir_hybrid` 原样未动。
