@@ -24,6 +24,7 @@
 | [`common/position_lifecycle.py`](file:///home/stone/Work/github/quant/common/position_lifecycle.py) | 统一持仓生命周期状态机 (UPLSM) 6 状态 FSM、非对称快通道（放量突破 0-delay 闪电建仓 / -8% 止损 0-delay 避险平仓）与两日门禁精简整合方案 | Track G | 已落地 |
 | [`common/allocation_backtester.py`](file:///home/stone/Work/github/quant/common/allocation_backtester.py) | 回测系统高并发、跨窗口指标记忆缓存与高拟真度执行引擎升级方案 (记账修复、多进程并行与微观结构拟真) | Track B | 实施中 |
 | [`docs/black_list.md`](file:///home/stone/Work/github/quant/docs/black_list.md) | 核心股票池剔除标的权威黑名单档案与失血归因 (SSOT) | 全局 / Live | 已落地 |
+| [`docs/backtest_research_impl.md`](file:///home/stone/Work/github/quant/docs/backtest_research_impl.md) | 回测研究文档设计精炼与回测产物自包含落盘：①[`backtester/run_backtest.py`](file:///home/stone/Work/github/quant/backtester/run_backtest.py) 在 `--results-dir` 内自动落盘生效策略 `strategy_dump.json`；②[`docs/backtest_research.md`](file:///home/stone/Work/github/quant/docs/backtest_research.md) 输出路径由 `/tmp/opencode/bt_*` 迁移至仓库内 `backtests_research/<ts>/`，并含 `pfx_of()` 消融前缀修复与消融臂可达性矩阵；③**产物入库留档规范**（`backtests_research/` 不加 `.gitignore` 排除、`INDEX.md` 交叉复核索引、体积纪律与提交信息规范） | Track B | 已落地 |
 
 > **轨道归档状态（2026-10-24）**：本表 4 列结构不变。关联任务轨道中 **Track T / Track C / Track F / Track L1（`L1.1`–`L1.5`）/ Track V / Track G**，以及 **`L2.1`–`L2.8`**（§2.11/§2.12）的全部任务行已闭环并原文移入 [`docs/development_plan_archive.md`](file:///home/stone/Work/github/quant/docs/development_plan_archive.md)；仍留在现役清单的是 **Track S、Track W、Track P、Track B** 与 **Track L（`L2.9`–`L2.50`）**。上表「状态」列保留归档时的原判，不回改。
 >

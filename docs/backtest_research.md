@@ -135,25 +135,60 @@
 
 ## 6. 可复制的命令
 
-### 6.1 变量与 universe 回退
+### 6.1 公共变量与环境准备
+
+所有实验命令统一输出至项目根目录下的 `$BT_ROOT="$REPO_ROOT/backtests_research/$RUN_TS"`（`RUN_TS="$(date +%Y%m%d_%H%M%S)"`），严禁使用外部临时目录，并在 `$BT_ROOT` 根部生成自包含的 20 股池快照文件 `$UNIV`。
+
+产物留档遵循**入库留档规范 (Committed Artifacts Policy)**（详见 [`docs/backtest_research_impl.md`](file:///home/stone/Work/github/quant/docs/backtest_research_impl.md) §4），每个叶子运行目录均自包含 `strategy_dump.json`（生效策略参数自审计核心）、`run_manifest.json`（环境与产物指纹清单）、`run.log`（完整执行日志），以及对应的回测 CSV/JSON 产物。
+
+目录拓扑结构如下：
+
+```mermaid
+flowchart TD
+    ROOT["<project_root>/backtests_research/<YYYYMMDD_HHMMSS>/"]
+    ROOT --> U["universe_20_stocks.txt\n(自包含 20 股池快照)"]
+    ROOT --> R1["01_r1_longwin/<strategy>/\n• strategy_dump.json\n• run_manifest.json\n• walkforward_summary.json\n• walkforward_report.csv\n• walkforward_weights.csv\n• walkforward_rebalances.csv\n• run.log"]
+    ROOT --> R2A["02_r2a_std/<strategy>/\n• strategy_dump.json\n• run_manifest.json\n• backtest_equity.csv\n• backtest_weights.csv\n• rebalance_report.csv\n• run.log"]
+    ROOT --> R2B["03_r2b_oos/<strategy>/\n• strategy_dump.json\n• run_manifest.json\n• walkforward_*.csv/json\n• run.log"]
+    ROOT --> CB["04_r1_std_cb_compare/<arm>/chan_four_state_blend/\n(baseline vs no_circuit)\n• strategy_dump.json\n• run_manifest.json\n• backtest_*.csv\n• run.log"]
+    ROOT --> ANAT["05_anatomy/<strategy>/\n• strategy_dump.json\n• run_manifest.json\n• backtest_*.csv & equity_curve.png\n• run.log"]
+    ROOT --> ABL["06_ablate/<arm>/<strategy>/\n(13 arms × 3 strategies = 39 folders)\n• strategy_dump.json\n• run_manifest.json\n• backtest_*.csv\n• run.log"]
+```
+
+初始化脚本与自包含 Universe 构建：
 
 ```bash
 cd /home/stone/Work/github/quant
-PY=pipeline/.venv/bin/python
-UNIV=/home/stone/Work/stock/simulate/202609/core_satellite_20_stocks.txt
-DUMPS=pipeline/research_strategy/results/strategy_dumps
-```
+REPO_ROOT="$(pwd)"
+PY="$REPO_ROOT/pipeline/.venv/bin/python"
+DUMPS="$REPO_ROOT/pipeline/research_strategy/results/strategy_dumps"
+RUN_TS="$(date +%Y%m%d_%H%M%S)"
+BT_ROOT="$REPO_ROOT/backtests_research/$RUN_TS"
+mkdir -p "$BT_ROOT"
 
-若 `$UNIV` 不存在（该路径在仓库之外，「202609」是 2026-09 的池快照），用下面这段重建这 20 只（顺序与归档 `batch_summary.json` 的 `config.universe` 一致；文件支持 `#` 注释行，`common/universe.py:177-180`）：
-
-```bash
-mkdir -p "$(dirname "$UNIV")"
-printf '%s\n' \
-  601872.SH 601728.SH 601288.SH 601225.SH 601919.SH \
-  600900.SH 601766.SH 000999.SZ 601857.SH 600941.SH \
-  600028.SH 601088.SH 601398.SH 600362.SH 000157.SZ \
-  300394.SZ 601899.SH 600584.SH 600660.SH 000938.SZ \
-  > "$UNIV"
+UNIV="$BT_ROOT/universe_20_stocks.txt"
+cat > "$UNIV" <<'EOF'
+601872.SH
+601728.SH
+601288.SH
+601225.SH
+601919.SH
+600900.SH
+601766.SH
+000999.SZ
+601857.SH
+600941.SH
+600028.SH
+601088.SH
+601398.SH
+600362.SH
+000157.SZ
+300394.SZ
+601899.SH
+600584.SH
+600660.SH
+000938.SZ
+EOF
 grep -vc '^#' "$UNIV"    # 应为 20
 ```
 
@@ -162,30 +197,38 @@ grep -vc '^#' "$UNIV"    # 应为 20
 ### 6.2 Round 1：长窗口（4 折）
 
 ```bash
+: "${BT_ROOT:?run §6.1 first}"    # 新 shell 里 BT_ROOT 为空 ⇒ 立即报错，不要写到 /01_r1_longwin
 for s in chan_four_state_blend chan_risk_managed_blend chan_crisis_shield_blend \
          chan_four_state_shield_blend chan_dual_hybrid_blend generic_blend; do
+  out_dir="$BT_ROOT/01_r1_longwin/$s"
+  mkdir -p "$out_dir"
   $PY backtester/run_backtest.py \
-    --strategy-file $DUMPS/${s}_strategy.json \
-    --universe-file $UNIV \
+    --strategy-file "$DUMPS/${s}_strategy.json" \
+    --universe-file "$UNIV" \
     --start 2022-01-04 --end 2024-12-31 \
     --mode walkforward --window-years 2.0 --step-years 0.25 \
     --data-provider fuyao --min-shares 100 --china-trading \
     --baseline-symbol 000300.SH \
-    --results-dir /tmp/opencode/bt_r1_longwin/$s --n-jobs 1
+    --results-dir "$out_dir" --n-jobs 1 \
+    2>&1 | tee "$out_dir/run.log"
 done
 ```
 
 ### 6.3 Round 2a：连续 standard（1,161 根）
 
 ```bash
+: "${BT_ROOT:?run §6.1 first}"
 for s in chan_four_state_blend chan_risk_managed_blend generic_blend; do
+  out_dir="$BT_ROOT/02_r2a_std/$s"
+  mkdir -p "$out_dir"
   $PY backtester/run_backtest.py \
-    --strategy-file $DUMPS/${s}_strategy.json \
-    --universe-file $UNIV \
+    --strategy-file "$DUMPS/${s}_strategy.json" \
+    --universe-file "$UNIV" \
     --start 2022-01-04 --end 2026-10-22 --mode standard \
     --data-provider fuyao --min-shares 100 --china-trading \
     --baseline-symbol 000300.SH \
-    --results-dir /tmp/opencode/bt_r2_std/$s --n-jobs 1
+    --results-dir "$out_dir" --n-jobs 1 \
+    2>&1 | tee "$out_dir/run.log"
 done
 ```
 
@@ -194,30 +237,46 @@ done
 ### 6.4 Round 2b：样本外（6 折）
 
 ```bash
+: "${BT_ROOT:?run §6.1 first}"
 for s in chan_four_state_blend chan_risk_managed_blend chan_crisis_shield_blend \
          chan_four_state_shield_blend chan_dual_hybrid_blend generic_blend; do
+  out_dir="$BT_ROOT/03_r2b_oos/$s"
+  mkdir -p "$out_dir"
   $PY backtester/run_backtest.py \
-    --strategy-file $DUMPS/${s}_strategy.json \
-    --universe-file $UNIV \
+    --strategy-file "$DUMPS/${s}_strategy.json" \
+    --universe-file "$UNIV" \
     --start 2025-01-02 --end 2026-10-22 \
     --mode walkforward --window-years 0.25 --step-years 0.25 \
     --data-provider fuyao --min-shares 100 --china-trading \
     --baseline-symbol 000300.SH \
-    --results-dir /tmp/opencode/bt_r2_oos/$s --n-jobs 1
+    --results-dir "$out_dir" --n-jobs 1 \
+    2>&1 | tee "$out_dir/run.log"
 done
 ```
 
-### 6.5 熔断对照臂（仅 `chan_four_state_blend`）
+### 6.5 Round 1 同区间 Standard 熔断对照（仅 `chan_four_state_blend`）
+
+为了在 `2022-01-04 → 2024-12-31` 区间内评估熔断模块的净效应，必须同时提供带熔断的基线臂（`baseline`）与关闭熔断的对照臂（`no_circuit`）成对运行，确保两者在完全同区间、同零息假设下可做逐日净值相减分析：
 
 ```bash
-$PY backtester/run_backtest.py \
-  --strategy-file $DUMPS/chan_four_state_blend_strategy.json \
-  --universe-file $UNIV \
-  --start 2022-01-04 --end 2024-12-31 --mode standard \
-  --data-provider fuyao --min-shares 100 --china-trading \
-  --baseline-symbol 000300.SH \
-  --strategy-params '{"cfsb_dd_reduce_thresh": 10.0, "cfsb_dd_defensive_thresh": 10.0, "cfsb_dd_stop_thresh": 10.0}' \
-  --results-dir /tmp/opencode/bt_r1_std_noCB --n-jobs 1
+: "${BT_ROOT:?run §6.1 first}"
+for arm in baseline no_circuit; do
+  extra='{}'
+  if [ "$arm" = "no_circuit" ]; then
+    extra='{"cfsb_dd_reduce_thresh": 10.0, "cfsb_dd_defensive_thresh": 10.0, "cfsb_dd_stop_thresh": 10.0}'
+  fi
+  out_dir="$BT_ROOT/04_r1_std_cb_compare/$arm/chan_four_state_blend"
+  mkdir -p "$out_dir"
+  $PY backtester/run_backtest.py \
+    --strategy-file "$DUMPS/chan_four_state_blend_strategy.json" \
+    --universe-file "$UNIV" \
+    --start 2022-01-04 --end 2024-12-31 --mode standard \
+    --data-provider fuyao --min-shares 100 --china-trading \
+    --baseline-symbol 000300.SH \
+    --strategy-params "$extra" \
+    --results-dir "$out_dir" --n-jobs 1 \
+    2>&1 | tee "$out_dir/run.log"
+done
 ```
 
 **单位注意（不写清楚会误读成 bug）**：三档阈值在 dump 里是**小数**（`0.1` / `0.15` / `0.2`），比较侧是 `dd_mag >= dd_stop_thresh` 这类小数比较（`pipeline/research/blend/blend_base.py:585-587` 解析、`:1001` / `:1071` / `:1087-1093` 比较）。因此 `10.0` 不是"10%"，而是一个**不可达哨兵**（1000% 回撤）——语义上等于"把三档熔断全部关掉"，正是想要的对照臂。
@@ -236,22 +295,21 @@ $PY backtester/run_backtest.py \
 - **不传 `--no-plots`**：保留内置图（`run_backtest.py:1323-1333`，`plotting.plot_equity_curve`，有 baseline 时叠加对比曲线）。注意**内置图只有净值曲线**——回撤与仓位图需要自己从 `backtest_equity.csv` / `backtest_weights.csv` 画，不要以为产物里有。
 
 ```bash
-cd /home/stone/Work/github/quant
-PY=pipeline/.venv/bin/python
-UNIV=/home/stone/Work/stock/simulate/202609/core_satellite_20_stocks.txt
-DUMPS=pipeline/research_strategy/results/strategy_dumps
-
+: "${BT_ROOT:?run §6.1 first}"
 for s in chan_four_state_blend chan_risk_managed_blend chan_crisis_shield_blend \
          chan_four_state_shield_blend chan_dual_hybrid_blend generic_blend; do
+  out_dir="$BT_ROOT/05_anatomy/$s"
+  mkdir -p "$out_dir"
   $PY backtester/run_backtest.py \
-    --strategy-file $DUMPS/${s}_strategy.json \
-    --universe-file $UNIV \
+    --strategy-file "$DUMPS/${s}_strategy.json" \
+    --universe-file "$UNIV" \
     --start 2022-01-04 --end 2026-10-22 --mode standard \
     --data-provider fuyao --min-shares 100 --china-trading \
     --baseline-symbol 000300.SH \
     --cash-sweep-rate 0.015 \
     --market-impact --max-volume-participation 0.05 \
-    --results-dir /tmp/opencode/bt_anatomy/$s --n-jobs 1
+    --results-dir "$out_dir" --n-jobs 1 \
+    2>&1 | tee "$out_dir/run.log"
 done
 ```
 
@@ -266,60 +324,130 @@ done
 所以归因的正确读法不是"哪一臂 Sharpe 最高"，而是**逐个关掉一个模块，看第一个显著分叉日**（口径见下一节「三个行为视角」的第 3 条）。
 
 ```bash
-cd /home/stone/Work/github/quant
-PY=pipeline/.venv/bin/python
-UNIV=/home/stone/Work/stock/simulate/202609/core_satellite_20_stocks.txt
-DUMPS=pipeline/research_strategy/results/strategy_dumps
+: "${BT_ROOT:?run §6.1 first}"
+pfx_of () {
+  case "$1" in
+    chan_four_state_blend)   echo "cfsb" ;;
+    chan_risk_managed_blend) echo "crb"  ;;
+    chan_dual_hybrid_blend)  echo "cdhb" ;;
+    *) echo "blend" ;;
+  esac
+}
 
 run_arm () {
-  local arm="$1"; local extra="$2"
+  local arm="$1"
   for s in chan_four_state_blend chan_risk_managed_blend chan_dual_hybrid_blend; do
+    local pfx; pfx="$(pfx_of "$s")"
+    local extra
+    case "$arm" in
+      baseline)        extra='{}' ;;
+      no_voltarget)    extra="{\"${pfx}_enable_vol_targeting\": false}" ;;
+      no_orthogon)     extra='{"blend_enable_orthogonalization": false}' ;;
+      no_structregime) extra='{"blend_enable_structural_regime": false}' ;;
+      no_cyq)          extra='{"blend_enable_cyq_quality_gate": false}' ;;
+      no_atrstop)      extra='{"blend_enable_adaptive_stop_atr": false}' ;;
+      no_lowbeta)      extra='{"blend_enable_low_beta_inertia": false}' ;;
+      no_sectorthrot)  extra="{\"${pfx}_max_assets_per_sector\": 20, \"blend_max_assets_per_sector\": 20, \"${pfx}_adaptive_sector_throttle\": false}" ;;
+      no_hysteresis)   extra='{"blend_enable_regime_hysteresis": false}' ;;
+      no_thrust)       extra="{\"${pfx}_dynamic_cash_deployment\": false}" ;;
+      no_inertia)      extra="{\"${pfx}_adaptive_inertia\": false, \"${pfx}_min_weight_change\": 0.0, \"${pfx}_min_holding_bars\": 0, \"${pfx}_entry_threshold\": 0.0}" ;;
+      bull_full)       extra="{\"${pfx}_target_bull_exposure\": 1.0}" ;;
+      no_circuit)      extra="{\"${pfx}_dd_reduce_thresh\": 10.0, \"${pfx}_dd_defensive_thresh\": 10.0, \"${pfx}_dd_stop_thresh\": 10.0}" ;;
+      *) echo "unknown arm: $arm" >&2; return 1 ;;
+    esac
+    local out_dir="$BT_ROOT/06_ablate/$arm/$s"
+    mkdir -p "$out_dir"
     $PY backtester/run_backtest.py \
-      --strategy-file $DUMPS/${s}_strategy.json \
-      --universe-file $UNIV \
+      --strategy-file "$DUMPS/${s}_strategy.json" \
+      --universe-file "$UNIV" \
       --start 2022-01-04 --end 2026-10-22 --mode standard \
       --data-provider fuyao --min-shares 100 --china-trading \
       --baseline-symbol 000300.SH \
       --cash-sweep-rate 0.015 \
       --strategy-params "$extra" \
-      --results-dir /tmp/opencode/bt_ablate/$arm/$s --n-jobs 1
+      --results-dir "$out_dir" --n-jobs 1 \
+      2>&1 | tee "$out_dir/run.log"
   done
 }
 
-run_arm baseline        '{}'
-run_arm no_voltarget    '{"cfsb_enable_vol_targeting": false}'
-run_arm no_orthogon     '{"blend_enable_orthogonalization": false}'
-run_arm no_structregime '{"blend_enable_structural_regime": false}'
-run_arm no_cyq          '{"blend_enable_cyq_quality_gate": false}'
-run_arm no_atrstop      '{"blend_enable_adaptive_stop_atr": false}'
-run_arm no_lowbeta      '{"blend_enable_low_beta_inertia": false}'
-run_arm no_sectorthrot  '{"blend_max_assets_per_sector": 20}'
-run_arm no_hysteresis   '{"blend_enable_regime_hysteresis": false}'
-run_arm no_thrust       '{"cfsb_dynamic_cash_deployment": false}'
-run_arm no_inertia      '{"cfsb_adaptive_inertia": false, "cfsb_min_weight_change": 0.0, "cfsb_entry_threshold": 0.0}'
-run_arm bull_full       '{"cfsb_target_bull_exposure": 1.0}'
-run_arm no_circuit      '{"cfsb_dd_reduce_thresh": 10.0, "cfsb_dd_defensive_thresh": 10.0, "cfsb_dd_stop_thresh": 10.0}'
+run_arm baseline
+run_arm no_voltarget
+run_arm no_orthogon
+run_arm no_structregime
+run_arm no_cyq
+run_arm no_atrstop
+run_arm no_lowbeta
+run_arm no_sectorthrot
+run_arm no_hysteresis
+run_arm no_thrust
+run_arm no_inertia
+run_arm bull_full
+run_arm no_circuit
 ```
 
-这 13 个键**全部**是 `chan_four_state_blend_strategy.json` 的现役字段（参数 dump 可逐字核对，方法见本节末：`blend_enable_adaptive_stop_atr` / `blend_enable_low_beta_inertia` / `blend_max_assets_per_sector`（现值 2）/ `blend_enable_regime_hysteresis` 均在其中）。注意 `no_sectorthrot` 用 `20`（= universe 规模）而不是 `0`——`0` 的语义是"一只都不许持"，不是"关掉"。
+### 13 臂 × 3 策略可达性矩阵 (Ablation Reachability Matrix)
+
+| 消融臂 (Arm) | 覆盖参数键与目标值 | `cfsb` (`regime_ic_ir_hybrid`) | `crb` (`rolling_ic_ir`) | `cdhb` (`rolling_ic_ir`) | 机制与生效符号（按符号引用，不引行号，理由见 §4.2） |
+| :--- | :--- | :---: | :---: | :---: | :--- |
+| `baseline` | `{}` | ✓ 完全可达 | ✓ 完全可达 | ✓ 完全可达 | 策略 dump 默认基线 |
+| `no_voltarget` | `{"${pfx}_enable_vol_targeting": false}` | ✓ 完全可达 | ✓ 完全可达 | ✓ 完全可达 | 关闭 Garman-Klass 波动率目标化：`blend_base.py` 中由 `resolve_param(p, "enable_vol_targeting", ...)` 解析出的 `enable_vol_targeting` 分支 |
+| `no_orthogon` | `{"blend_enable_orthogonalization": false}` | ✓ 完全可达 | ✓ 完全可达 | ✓ 完全可达 | 参数键 `blend_enable_orthogonalization` 经 `resolve_param` 的 `blend_{name}` 分支解出局部符号 `enable_orthogonalization`；实际生效段为「该开关为真且子策略数 > 1 时调用辅助函数 `_apply_lowdin_orthogonalization`」（Löwdin 对称正交化 $W^* = W(W^T W)^{-1/2}$）。注意：`blend_base.py` 源码里出现的标识符是 `enable_orthogonalization`，`blend_` 前缀只是 CLI / dump 的参数键形态 |
+| `no_structregime` | `{"blend_enable_structural_regime": false}` | ✓ 完全可达 | ✗ **结构性不可达** | ✗ **结构性不可达** | 消费符号 `enable_structural_regime`，其唯一实质消费点在 `_compute_adaptive_weights` 的 `weighting_mode in ("regime_adaptive", "regime_ic_ir_hybrid")` 分支内（另一处仅决定 `fractal_d_series` 是否预计算，结果同样只喂该分支）。`crb` / `cdhb` 默认 `rolling_ic_ir`，在 `if weighting_mode == "rolling_ic_ir":` 段落算完 IC-IR 权重即 `return`，结构性状态转移判定完全不执行 |
+| `no_cyq` | `{"blend_enable_cyq_quality_gate": false}` | ✓ 完全可达 | ✓ 完全可达 | ✓ 完全可达 | 参数键 `blend_enable_cyq_quality_gate` 经 `resolve_param` 解出的局部符号 `enable_cyq_quality_gate` 门控段：筹码分布获胜率否决（`min_cyq_winner_ratio`，默认 0.20）与伪突破过滤（Track C Anchor 2） |
+| `no_atrstop` | `{"blend_enable_adaptive_stop_atr": false}` | ✓ 完全可达 | ✓ 完全可达 | ✓ 完全可达 | 消费符号 `enable_adaptive_stop_atr`，实际作用仅一行：`eff_stop_mult = np.clip(stop_atr_mult * (med_vol / s_vol), 3.5, 7.5)`。关闭后 `eff_stop_mult` 恒为 `stop_atr_mult`（默认 4.5），**底层 ATR 追踪止损仍然存在** |
+| `no_lowbeta` | `{"blend_enable_low_beta_inertia": false}` | ✓ 完全可达 | ✓ 完全可达 | ✓ 完全可达 | 消费符号 `enable_low_beta_inertia`：关闭后低波动资产（`s_vol < 0.22`）不再被抬高 `eff_min_holding` 至至少 10 bar 的防御性惯性豁免 |
+| `no_sectorthrot` | `{"${pfx}_max_assets_per_sector": 20, "blend_max_assets_per_sector": 20, "${pfx}_adaptive_sector_throttle": false}` | ✓ 完全可达 | ✓ 完全可达 | ✓ 完全可达 | 两个符号：`max_assets_per_sector`（默认 2，定基线行业上限）与 `adaptive_sector_throttle`（默认关闭，仅 `cdhb` dump 设 `true`）。**真实机制：自适应节流只在某行业 ROC 进入前 20% 分位时把该行业上限「抬高」到至少 2（`allowed_sec_cap = max(allowed_sec_cap, 2)`），从不向下压缩**，且默认 `max_assets_per_sector=2` 下该抬高本身即空转（`max(2,2)=2`）。故本臂的真实意图是**把行业上限从 2 放开到 20**，并**顺带显式关闭** `"${pfx}_adaptive_sector_throttle"` 以消除「热行业抬高到 ≥2」这条与「放开到 20」语义冲突的残余逻辑（cap ≥ 2 时它本是空转，保留显式关闭仅为可读性） |
+| `no_hysteresis` | `{"blend_enable_regime_hysteresis": false}` | ✓ 完全可达 | ✗ **结构性不可达（且默认已为 False，该臂为 no-op / 假阴性）** | ✗ **结构性不可达（且默认已为 False，该臂为 no-op / 假阴性）** | 消费符号 `enable_regime_hysteresis`（**默认 `False`**；仅 `chan_four_state_blend` 的 dump 将其设为 `true`）：开启时动量冲刺走 0.62 / 0.58 施密特双阈值（`thrust_enter_thresh` / `thrust_exit_thresh`），关闭时退回单阈值 `thrust >= thrust_thresh`。该 `thrust_active` 会回流至 `_compute_adaptive_weights` 的线程化参数（仅制度分支可达时才真正参与选权），并经 `fast_recovery` / `dynamic_cash` 影响现金部署。`crb` / `cdhb` 的 dump **未**设该键 ⇒ 默认 `False`，基线本就走单阈值路径，故强制 `false` 后输出与 `baseline` 完全相同 |
+| `no_thrust` | `{"${pfx}_dynamic_cash_deployment": false}` | ✓ 完全可达 | ✓ 完全可达 | ✓ 完全可达 | 消费符号 `dynamic_cash`（由 `resolve_param(p, "dynamic_cash_deployment", ...)` 解析）：关闭 `bull_active` 下的目标暴露度抬升与 `preemptive_thrust` 抢占式现金部署（现金部署 / breadth thrust 段） |
+| `no_inertia` | `{"${pfx}_adaptive_inertia": false, "${pfx}_min_weight_change": 0.0, "${pfx}_min_holding_bars": 0, "${pfx}_entry_threshold": 0.0}` | ✓ 完全可达 | ✓ 完全可达 | ✓ 完全可达 | 必须**同时归零 `min_weight_change` 与 `min_holding_bars`**：`use_inertia = (min_weight_change > 0.0 or min_holding_bars > 0)`，而三份策略 dump 都钉了 `min_holding_bars: 2`，**只把 `min_weight_change` 归零无法让 `use_inertia` 变假**，`_step_asset_inertia` 的任期锁定（tenure lock，`if age < eff_min_holding … locked_incumbents.add(s)`）仍会压制卖出，臂将退化为假阴性。两键同时归零后 `use_inertia` 才为假、防抖阈值 `static_inertia_thresh` 也随之失效；`adaptive_inertia` 只影响 `inertia_thresh_df` 的自适应阈值构造，故一并关掉以消除残余分支。`_step_asset_inertia` 为内联调用、`apply_asset_inertia` 在本策略中仅为 import（本臂不改变这两处代码的存在性） |
+| `bull_full` | `{"${pfx}_target_bull_exposure": 1.0}` | ✓ 完全可达 | ✓ 完全可达 | ✓ 完全可达 | 将牛市仓位上限从 0.85 提升至 1.00 全仓（`dynamic_cash` 段内 `target_exp = min(target_bull_exposure, …)`） |
+| `no_circuit` | `{"${pfx}_dd_reduce_thresh": 10.0, "${pfx}_dd_defensive_thresh": 10.0, "${pfx}_dd_stop_thresh": 10.0}` | ✓ 完全可达 | ✓ 完全可达 | ✓ 完全可达 | 将回撤熔断降仓/防御/全停三档阈值同时抬到 10.0（`dd_mag` 为比例口径，10.0 即 1000%），等效彻底禁用熔断机制 |
+
+> [!WARNING]
+> **假阴性披露（消融矩阵最重要的一行）**：标 `✗` 的臂在该策略上输出将与 `baseline` **完全相同**，不得据此得出「该模块无效」的结论。这类臂只是绕过了代码路径、或本就与默认值相同，**不产生任何信息量**；引用它们与 `baseline` 的差值属于把「没跑」当成「跑出来是 0」。凡在报告中出现某臂与 `baseline` 指标逐位相同的行，必须先核 `strategy_dump.json` 确认覆盖键确实被消费，否则该行作废。
+
+- **`no_sectorthrot` 联动关闭自适应行业限流的真实原因**：`chan_dual_hybrid_blend` 在策略 dump 中显式设定了 `"cdhb_adaptive_sector_throttle": true`。在 `blend_base.py` 的行业配额分配段中，自适应节流的唯一动作是 `allowed_sec_cap = max(allowed_sec_cap, 2)` —— 即当某行业 21 日平均 ROC 不低于 `max(0.02, top_sec_thresh)`（行业 ROC 前 20% 分位）时，把该行业上限**抬高**到至少 2，**没有任何向下压缩分支**，也不存在把行业上限压到 1 只的路径。由于 `no_sectorthrot` 已把 `max_assets_per_sector` 放开到 20，「热行业抬高到 ≥2」这条逻辑与「放开到 20」的意图冲突且在该 cap 下必然空转，因此一并显式关闭，保持消融语义单一（只改一件事：行业上限）。
+
+- **`no_atrstop` 与 `no_cyq` 语义边界披露**：
+  1. `no_atrstop`（`{"blend_enable_adaptive_stop_atr": false}`）所消融的仅为**波动率环境自适应 ATR 倍数动态缩放**（`blend_base.py` 中 `enable_adaptive_stop_atr` 为真时的 `eff_stop_mult = np.clip(stop_atr_mult * (med_vol / s_vol), 3.5, 7.5)`），关闭后回退至固定 4.5x ATR 追踪止损，**并不是**彻底关闭底层 ATR 止损机制本身（彻底关闭需设置 `"${pfx}_stop_mode": "none"`）。该消融臂旨在评估「环境自适应波动倍数」相对于「固定 ATR 乘数」的边际贡献。
+  2. `no_cyq`（`{"blend_enable_cyq_quality_gate": false}`）所消融的为 Track C Anchor 2（`enable_cyq_quality_gate` 门控的 CYQ 获胜率与伪突破否决），而 Track C Anchor 3（筹码汇聚点加权 sizing，`enable_vp_confluence_sizing`）在默认配置下依然生效保持开启。另请注意 `enable_vp_confluence_sizing` 段内的筹码密集度硬编码阈值 `c_dens < 0.40`（`c_dens` 取自 `consolidation_density` 列）——该阈值不受任何消融臂覆盖。
+
+- **`no_inertia` 必须同时归零 `min_weight_change` 与 `min_holding_bars`**：
+  `use_inertia = (min_weight_change > 0.0 or min_holding_bars > 0)`，而三份策略 dump 均设置了 `min_holding_bars: 2`。若只将 `min_weight_change` 归零，`use_inertia` 仍为真，`_step_asset_inertia` 的任期锁定（tenure lock，`if age < eff_min_holding … locked_incumbents.add(s)`）仍会生效压制卖出。因此必须同时将两键归零，并设置 `"${pfx}_adaptive_inertia": false` 与 `"${pfx}_entry_threshold": 0.0`。
+
+这 13 个键在各策略配置中均有映射（通过 `pfx_of()` 动态前缀解析与 `resolve_param` 前缀链生效）。注意 `no_sectorthrot` 用 `20`（= universe 规模）而不是 `0`——`0` 的语义是"一只都不许持"，不是"关掉"。
 
 **规模与取舍**：13 臂 × 3 策略 ≈ **39 次单段回测，约 40–60 分钟**。只想先看形状就只跑 `chan_four_state_blend` 一列（13 次，约 15 分钟）——把 `run_arm` 里 `for s in ...` 收成 `for s in chan_four_state_blend`。
 
-> **必做校验（硬性）**：每次跑完，**先看参数 dump 再信结果**。`run_backtest.py` 的 `--strategy-params` 走 `params.update(...)`（`:1063-1073`），而最终取值要过 `resolve_param` 的**长前缀链**（`pipeline/research/blend/blend_base.py:214-232`：`cfsb_<name>` → 备用前缀 → `blend_<name>` → `<name>` → config 属性）。这条链在本仓库**发生过静默不匹配**（`AGENTS.md` 记录的 `wq_alpha_id` 裸名碰撞事故）。所以：确认 dump 里目标键**确实变成新值**，否则你可能把"覆盖没生效"读成"这个模块没作用"——两者的结论方向相反。
->
-> 落地做法（直跑时没有 harness 写 `run.log`，要自己落盘；第 2 行即 `Parameters: {...}`，与归档 `pipeline/results/blend_17_baseline/1/chan_four_state_blend_strategy/run.log` 同格式）：
+> **参数与清单校验纪律（硬性）**：每次跑完，**必须通过每个运行目录下的 `strategy_dump.json` 与 `run_manifest.json` 核验生效参数与指纹**。`run_backtest.py` 会将命令行覆盖写入 `cli_strategy_params_override` 并将最终合并生效参数固化在 `params`。这条前缀链在本仓库发生过静默不匹配事故（见 `AGENTS.md` 的 `wq_alpha_id` 裸名碰撞记录）。禁止依赖脆弱的 `sed -n '2p' run.log` 文本行猜测，统一采用结构化 `jq` 校验：
 >
 > ```bash
-> mkdir -p /tmp/opencode/bt_ablate/no_voltarget/chan_four_state_blend
-> $PY backtester/run_backtest.py ... 2>&1 | tee /tmp/opencode/bt_ablate/no_voltarget/chan_four_state_blend/run.log
-> sed -n '2p' /tmp/opencode/bt_ablate/no_voltarget/chan_four_state_blend/run.log   # 应含 'cfsb_enable_vol_targeting': False
+> : "${BT_ROOT:?run §6.1 first}"
+> # 1. 校验命令行覆盖与最终生效参数（以 no_voltarget 臂为例）
+> jq '{cli_override: .cli_strategy_params_override, effective: .params.cfsb_enable_vol_targeting}' \
+>   "$BT_ROOT/06_ablate/no_voltarget/chan_four_state_blend/strategy_dump.json"
+> # 预期输出：cli_override 含 {"cfsb_enable_vol_targeting": false}，effective 为 false
+>
+> # 2. 校验运行清单元数据与产物列表完整性
+> jq '{run_ts: .run_ts, group: .group, strategy: .strategy, artifacts_count: (.artifacts | length)}' \
+>   "$BT_ROOT/06_ablate/no_voltarget/chan_four_state_blend/run_manifest.json"
 > ```
 
 ---
 
-## 9. 从产物读出三个行为视角
+## 9. 从产物读出三个行为视角与入库留档
 
-standard 模式落盘的固定产物（`run_backtest.py:1267-1302`）：`backtest_equity.csv`、`backtest_weights.csv`、`rebalance_report.csv`、`baseline_equity.csv`。
+依入库留档规范（Committed Artifacts Policy，详见 [`docs/backtest_research_impl.md`](file:///home/stone/Work/github/quant/docs/backtest_research_impl.md) §4），所有运行产物均统一落盘在 `$BT_ROOT`（`backtests_research/<RUN_TS>/`）各实验组子目录中，并在 `backtests_research/INDEX.md` 追加追踪行。
+
+每个叶子运行目录的标准产物包含：
+- **自审计核心**：`strategy_dump.json`（全量生效策略定义，不可复现时唯一凭据）
+- **两阶段运行清单**：`run_manifest.json`（Git 提交哈希、数据缓存指纹、产物清单与指标）
+- **过程执行日志**：`run.log`（含数据截断、对齐、分位计算等过程告警）
+- **指标与序列数据**：
+  - standard 模式：`backtest_equity.csv`、`backtest_weights.csv`、`rebalance_report.csv`、`baseline_equity.csv`（若有）、`comparison_report.json`、`equity_curve.png`
+  - walkforward 模式：`walkforward_summary.json`、`walkforward_report.csv`、`walkforward_weights.csv`、`walkforward_rebalances.csv`
+
+从这些落盘产物中可萃取出三个核心行为视角：
 
 1. **敞口与现金**：`backtest_weights.csv` 逐日按行求和 = **毛敞口**，`1 − Σw` = **现金占比**。两条曲线叠看，即可区分"**策略主动降仓**"（信号层就不想持）与"**风控压仓**"（信号想要、被波动率目标 / 熔断 / 惯性门压住）——后者会在同一天出现"敞口跳降而权重结构不变"。这是 `L2.50` 要的可观测性缺口的**穷人版替代**。
 2. **换手与调仓节奏**：`rebalance_report.csv` 给出逐笔 `action` / `price` / `weight_change`。配合权重序列可算每只标的的**持有天数分布**与**买回间隔分布**——`L2.36` 的「恰为 6 个交易日」尖峰（1,026 对卖→买回配对中的 138 对，13.45%）就是这个视角发现的；其归因是 `asset_stop_cooldown_bars=5` + 1 根确认 bar，**加固**而非取代"2-bar 出场确认"的证伪（`docs/version.md` §16.15.15）。
@@ -342,8 +470,11 @@ standard 模式落盘的固定产物（`run_backtest.py:1267-1302`）：`backtes
 | Round 1 折数 | **4** | window/step 算错（`2.0y=504`、`0.25y=63`） |
 | Round 2b 折数 | **6** | 同上（`0.25y=63/63`） |
 | 2a 的 bar 数 | **1,161** | `--end` 没传或传错 |
-| 2a 产物 | `backtest_equity.csv` / `backtest_weights.csv` / `rebalance_report.csv` | `--mode` 传成 walkforward |
-| 归因臂参数 | dump 里目标键=新值 | `--strategy-params` 静默未生效 ⇒ 结论反向 |
+| 2a 产物完整性 | `strategy_dump.json` / `run_manifest.json` / `run.log` / `backtest_equity.csv` / `backtest_weights.csv` / `rebalance_report.csv` | `--mode` 传成 walkforward 或命令被中断 |
+| 归因臂参数生效 | `$out_dir/strategy_dump.json` 中目标前缀键=新值 | `--strategy-params` 静默未生效 ⇒ 结论反向 |
+| 产物留档一致性 | `find "$BT_ROOT" -name strategy_dump.json \| wc -l` == `find "$BT_ROOT" -name run.log \| wc -l` == `find "$BT_ROOT" -name run_manifest.json \| wc -l` | 某组命令漏了 `tee` 或落盘异常 |
+| 仓库不忽略校验 | `git check-ignore -v "$BT_ROOT/..."` 零输出 | 命中了既有 `.gitignore` 规则，违反 Committed Artifacts Policy |
+| 索引登记核准 | `backtests_research/INDEX.md` 追加对应行且字段与 `run_manifest.json` 一致 | 运行未完成或手工登记失真 |
 
 解读纪律：
 
@@ -357,10 +488,11 @@ standard 模式落盘的固定产物（`run_backtest.py:1267-1302`）：`backtes
 
 ## 12. 与计划书的关系（SSOT）
 
-任务台账、状态与优先级**只在** [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) 维护；**本文只承载测量设计与日历事实**，不登记任务、不改状态、不排优先级。
+任务台账、状态与优先级**只在** [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) 维护；**本文只承载测量设计与日历事实**，不登记任务、不改状态、不排优先级。回测产物留档与工程落盘规范详见 [`docs/backtest_research_impl.md`](file:///home/stone/Work/github/quant/docs/backtest_research_impl.md)。
 
 | 交叉引用 | 与本文的关系 |
 |---|---|
+| `docs/backtest_research_impl.md` | 本文回测工程落盘实现与入库留档规范（Committed Artifacts Policy）SSOT |
 | `L2.48` 生命周期状态机回测同源启用 | 决定本文三套命令的**语义边界**（当前=FSM 关；落地后默认 ON，须 `--no-position-lifecycle` 才能复现） |
 | `L2.50` 熔断可检验性 / 触发遥测 | §3 的负面结论与 §6.5 对照臂的服务对象；离线合成压力带是唯一可证伪通道 |
 | `L2.49` 换手率削减研究 | 「三个行为视角」第 2 条（持有天数 / 买回间隔）是它的测量入口 |
@@ -374,3 +506,9 @@ standard 模式落盘的固定产物（`run_backtest.py:1267-1302`）：`backtes
 - 2026-10-24 初版：两轮设计、日历与折网格实测、回撤可达性证伪、命令固化（两轮命令均未执行）。
 - 2026-10-24 追加：全景解剖轮（连续 standard + 现金计息 + 市场冲击）与逐模块归因轮（13 臂 ablation），并补充三个行为视角与不可观测边界。
 - 2026-10-24 结构整理：四个新增章节纳入连续编号（§7–§10），其后章节顺延为 §11/§12；未改任何内容。
+- 2026-10-25 架构与留档规整（依 docs/backtest_research_impl.md §2 与 §4）：
+  1. 输出路径全量收敛至仓库内 `$BT_ROOT="$REPO_ROOT/backtests_research/$RUN_TS"`，彻底移除 `/tmp/opencode` 与外部股池路径，构建自包含 `universe_20_stocks.txt`。
+  2. 确立回测产物入库留档规范（Committed Artifacts Policy），叶子目录统一落盘自审计核心 `strategy_dump.json`、两阶段 `run_manifest.json` 与 `run.log`，并在根目录维护 `backtests_research/INDEX.md` 索引。
+  3. 修复 §6.5 熔断对照臂，提供同区间 standard 下 `baseline` 与 `no_circuit` 成对运行，确保严格同区间逐日净值差分。
+  4. 重构 §8 消融实验：引入 `pfx_of()` 动态前缀映射（`cfsb` / `crb` / `cdhb`），修复 `no_sectorthrot` / `no_inertia` / `no_hysteresis` 参数覆盖与假阴性风险，引入 13 臂 × 3 策略可达性矩阵与语义边界披露，升级为基于 `jq` + `strategy_dump.json` 的参数校验。
+  5. 全文 6 组命令严格规整为每组 1 处 `tee .*run\.log`（合计恰为 6 处）。

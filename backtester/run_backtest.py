@@ -15,10 +15,14 @@ Example:
 
 import argparse
 import copy
+import datetime
+import hashlib
 import json
 import multiprocessing
 import os
 import random
+import re
+import subprocess
 import sys
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -31,10 +35,12 @@ import pandas as pd
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
+REPO_ROOT = _REPO_ROOT
 
 from common.allocation_backtester import REBALANCE_REPORT_COLUMNS, run_allocation_backtest
 from common.allocation_search import optimize_template
 from common.allocation_templates import ALLOCATION_TEMPLATES
+from common.duckdb_cache import is_synthetic_provider
 from common.cli_utils import (
     add_data_provider_cli_args,
     add_output_dir_override_args,
@@ -1042,6 +1048,241 @@ def _merge_baseline_folds(folds_df: pd.DataFrame, baseline_folds_df: pd.DataFram
     return merged, baseline_calendar_mismatch
 
 
+# --------------------------------------------------------------------------- #
+# Run Manifest & Effective Strategy Persistence (§1 backtest_research_impl.md)
+# --------------------------------------------------------------------------- #
+
+_NULL_METRICS: dict = {
+    "sharpe": None,
+    "cagr": None,
+    "max_drawdown": None,
+    "calmar": None,
+    "n_folds": None,
+    "deflated_sharpe": None,
+}
+
+
+def _git(args_list: list[str]) -> str | None:
+    try:
+        res = subprocess.run(
+            ["git", *args_list],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if res.returncode == 0:
+            return res.stdout.strip()
+        return None
+    except Exception:
+        return None
+
+
+def _sha256_file(path: str | None) -> str | None:
+    if not path or not os.path.isfile(path):
+        return None
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            while chunk := f.read(65536):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def _mtime_iso(path: str | None) -> str | None:
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        return datetime.datetime.fromtimestamp(
+            os.path.getmtime(path), tz=datetime.timezone.utc
+        ).isoformat()
+    except Exception:
+        return None
+
+
+def _run_ts_from_results_dir(results_dir: str) -> str | None:
+    if not results_dir:
+        return None
+    parts = [p for p in os.path.abspath(results_dir).split(os.sep) if p]
+    for p in reversed(parts):
+        if re.match(r"^\d{8}_\d{6}$", p):
+            return p
+    return None
+
+
+def _group_from_results_dir(results_dir: str) -> str:
+    if not results_dir:
+        print(f"WARNING: could not infer group from results_dir '{results_dir}'; setting group=\"\"")
+        return ""
+    norm_path = os.path.abspath(results_dir)
+    parts = [p for p in norm_path.split(os.sep) if p]
+    ts_idx = None
+    for i, p in enumerate(parts):
+        if re.match(r"^\d{8}_\d{6}$", p):
+            ts_idx = i
+            break
+    if ts_idx is not None and (len(parts) - 1 - ts_idx) >= 2:
+        return "/".join(parts[ts_idx + 1 : -1])
+    print(f"WARNING: could not infer group from results_dir '{results_dir}'; setting group=\"\"")
+    return ""
+
+
+def _artifact_sizes(results_dir: str) -> list[dict]:
+    if not os.path.exists(results_dir):
+        return []
+    artifacts = []
+    with os.scandir(results_dir) as it:
+        for entry in it:
+            # `run.log` is written by the shell `tee` after this process exits, so it is
+            # invisible here; `run_manifest.json` is this very manifest, and a file cannot
+            # truthfully report its own post-write size from a pre-write scan (Phase 1 vs
+            # Phase 2 sizes differ) -- listing it can only record a stale number. Both are
+            # therefore excluded by design, not by oversight
+            # (docs/backtest_research_impl.md §1 Phase-2 rules).
+            if entry.is_file() and entry.name not in ("run.log", "run_manifest.json"):
+                artifacts.append({"name": entry.name, "bytes": entry.stat().st_size})
+    artifacts.sort(key=lambda a: a["name"])
+    return artifacts
+
+
+def _extract_walkforward_metrics(summary: dict | None) -> dict:
+    if not isinstance(summary, dict):
+        return dict(_NULL_METRICS)
+    return {
+        "sharpe": summary.get("mean_sharpe_ratio"),
+        "cagr": summary.get("mean_cagr"),
+        "max_drawdown": summary.get("mean_max_drawdown"),
+        "calmar": summary.get("mean_calmar_ratio"),
+        "n_folds": summary.get("n_folds"),
+        "deflated_sharpe": summary.get("deflated_sharpe_ratio"),
+    }
+
+
+def _dump_effective_strategy_def(
+    strategy_def: dict,
+    params: dict,
+    research_strategy_spec: dict | None,
+    results_dir: str,
+    cli_overrides: dict | None = None,
+) -> str:
+    """Persist the effective strategy configuration (with CLI overrides / optimize
+    updates merged) into the current run's results_dir so every backtest output
+    folder is self-contained and auditable."""
+    dump_payload: dict = copy.deepcopy(strategy_def) if isinstance(strategy_def, dict) else {}
+    dump_payload["params"] = copy.deepcopy(params)
+    # Always emitted -- `{}` when no --strategy-params was passed -- so a reader can tell
+    # "no CLI override" apart from "field missing because an older build wrote this dump"
+    # without guessing (docs/backtest_research_impl.md §1).
+    dump_payload["cli_strategy_params_override"] = copy.deepcopy(cli_overrides) if cli_overrides is not None else {}
+    if research_strategy_spec is not None:
+        spec_copy = copy.deepcopy(research_strategy_spec)
+        if isinstance(spec_copy, dict) and isinstance(spec_copy.get("entry_data"), dict):
+            spec_copy["entry_data"]["parameters"] = copy.deepcopy(params)
+        # NOTE: only `research_strategy_spec` is written. An earlier version also emitted a
+        # duplicate `research_strategy` key that nothing ever read (`load_strategy_file`
+        # validates `research_strategy_spec` only -- common/strategy_spec.py) -- removed so the
+        # dump matches the documented schema in docs/backtest_research_impl.md §1 exactly.
+        dump_payload["research_strategy_spec"] = spec_copy
+    elif isinstance(dump_payload.get("research_strategy_spec"), dict):
+        if isinstance(dump_payload["research_strategy_spec"].get("entry_data"), dict):
+            dump_payload["research_strategy_spec"]["entry_data"]["parameters"] = copy.deepcopy(params)
+
+    dump_path = os.path.join(results_dir, "strategy_dump.json")
+    write_json_report(dump_payload, dump_path)
+    return dump_path
+
+
+def _dump_run_manifest(
+    results_dir: str,
+    *,
+    mode: str,
+    group: str,
+    strategy_name: str,
+    strategy_file: str,
+    strategy_dump_path: str,
+    db_path: str,
+    db_used: bool,
+    cli_overrides: dict | None = None,
+    metrics: dict | None = None,
+    artifacts: list[dict] | None = None,
+) -> str:
+    """Phase 1: persist the reproducibility fingerprint skeleton *before* the
+    backtest runs, so a mid-run crash still leaves an auditable run_manifest.json behind."""
+    if not results_dir:
+        raise ValueError("results_dir is required for _dump_run_manifest")
+    os.makedirs(results_dir, exist_ok=True)
+    db_size = os.path.getsize(db_path) if db_path and os.path.exists(db_path) else None
+    db_mtime = _mtime_iso(db_path)
+    overrides = copy.deepcopy(cli_overrides) if cli_overrides is not None else {}
+
+    manifest = {
+        "schema_version": 1,
+        "run_ts": _run_ts_from_results_dir(results_dir),
+        "git_commit": _git(["rev-parse", "HEAD"]),
+        "git_dirty": bool(_git(["status", "--porcelain"])),
+        # Phase 1 always says "running"; Phase 2 flips it to "completed" and stamps
+        # `completed_at_utc`, so a skeleton that was never finalized is visibly unfinished
+        # rather than looking like a complete run (docs/backtest_research_impl.md §1).
+        "status": "running",
+        "completed_at_utc": None,
+        "mode": mode,
+        "group": group,
+        "strategy": strategy_name,
+        "strategy_file": strategy_file,
+        "strategy_dump_sha256": _sha256_file(strategy_dump_path),
+        "db_path": db_path,
+        "db_size_bytes": db_size,
+        "db_mtime_iso": db_mtime,
+        # `db_path` / `db_size_bytes` / `db_mtime_iso` are the stat of the *configured*
+        # cache file; `db_used` is the separate, honest answer to "did this run actually
+        # touch it?". A synthetic provider never constructs `DuckDBCache`
+        # (`CachedDataProvider.__init__` skips it), and `--no-cache` disables it too, so
+        # without this flag a synthetic run would record the size of a production cache it
+        # never opened (docs/backtest_research_impl.md §1).
+        "db_used": db_used,
+        "cli_overrides": overrides,
+        "metrics": metrics if metrics is not None else dict(_NULL_METRICS),
+        # Phase 1 scans the directory: at this point it normally holds only
+        # strategy_dump.json, and listing it keeps "the skeleton already accounts for
+        # every file it can see" true right up to a mid-run crash (§1 Phase-1 NOTE).
+        "artifacts": artifacts if artifacts is not None else _artifact_sizes(results_dir),
+    }
+    manifest_path = os.path.join(results_dir, "run_manifest.json")
+    write_json_report(manifest, manifest_path)
+    return manifest_path
+
+
+def _finalize_run_manifest(
+    manifest_path: str,
+    *,
+    metrics: dict | None = None,
+    artifacts: list[dict] | None = None,
+) -> str:
+    """Phase 2: re-open the Phase-1 skeleton and fill in the post-run facts.
+
+    Deliberately NOT accepting `mode`: which metrics are legitimately fillable is decided
+    at the call site (standard must stay all-`null`, walkforward has
+    `walkforward_summary.json`), so a `mode` argument here would only ever be discarded --
+    a documented-but-ignored parameter is a future-bug magnet
+    (docs/backtest_research_impl.md §1). Every other Phase-1 field (`db_path`,
+    `db_size_bytes`, `db_mtime_iso`, `db_used`, fingerprints …) survives this call because
+    it is a read-modify-write of the same JSON object.
+    """
+    path = os.path.join(manifest_path, "run_manifest.json") if os.path.isdir(manifest_path) else manifest_path
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"run manifest skeleton missing: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    manifest["status"] = "completed"
+    manifest["completed_at_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    manifest["metrics"] = metrics if metrics is not None else dict(_NULL_METRICS)
+    manifest["artifacts"] = artifacts if artifacts is not None else []
+    write_json_report(manifest, path)
+    return path
+
+
 def main():
     args = build_arg_parser().parse_args()
     if sum([bool(args.china_trading), bool(args.us_trading), bool(args.hk_trading)]) > 1:
@@ -1060,6 +1301,7 @@ def main():
     fundamental_spec = strategy_def.get("fundamental_spec")
     bnn_spec = strategy_def.get("bnn_spec")
 
+    strat_overrides: dict | None = None
     if args.strategy_params:
         try:
             strat_overrides = json.loads(args.strategy_params)
@@ -1228,18 +1470,16 @@ def main():
 
         print(f"\n=== Optimize: {status} ===")
         if opt["trusted"]:
-            print(f"  Tuned params {params} -> {opt['best_params']} "
-                  f"(Sharpe {original_sharpe:.2f} -> {best_sharpe:.2f}, ERS percentile {opt['ers_percentile']:.2f})")
-            params = opt["best_params"]
-            # opt["best_result"] is score_fn(optimize_template_instance, best_params)'s
-            # result -- for standard mode that IS run_standard's own return
-            # value verbatim (_standard_score_fn's score_fn just returns it),
-            # and for walkforward mode its "folds" key IS run_walkforward's
-            # own return value verbatim (_walkforward_score_fn's score_fn
-            # passes it through unmodified) -- so re-running run_standard/
-            # run_walkforward below for these exact same (template, params)
-            # would just recompute an answer already in hand.
-            reused_result = opt["best_result"]
+            if opt["best_params"]:
+                params = opt["best_params"]
+                reused_result = opt["best_result"]
+                print(f"\nOptimization TRUSTED — switching to best_params: {params}")
+            else:
+                reused_result = original_result
+                print(
+                    "\nWARNING: --optimize produced an empty best_params "
+                    "(template param_grid is empty); keeping original params"
+                )
         else:
             print(f"  Tuning did NOT pass validation ({reason}) -- falling back to original params {params}.")
             # Same reuse argument as above, but for original_result (already
@@ -1247,6 +1487,41 @@ def main():
             # these exact original params).
             reused_result = original_result
         print(f"Saved optimize report to {optimize_report_path}")
+
+    candidate_db = os.path.join(cache_dir, "cache.duckdb")
+    db_path = candidate_db if os.path.exists(candidate_db) else os.path.join(DATA_DIR, "cache.duckdb")
+    # `db_path` is only the *configured* cache location (a `stat`, never an open). Whether
+    # this run actually read/wrote it is a separate fact, and the two must not be conflated:
+    # a synthetic provider never constructs `DuckDBCache` at all
+    # (`CachedDataProvider.__init__` -> `is_synthetic_provider`), and `--no-cache`
+    # (`use_cache=not args.no_cache` at every load call) disables it too. Without this flag
+    # a synthetic run would record a 300MB+ production `cache.duckdb` it never opened --
+    # a pure provenance lie (docs/backtest_research_impl.md §1).
+    db_used = (not is_synthetic_provider(args.data_provider)) and not args.no_cache
+
+    dump_path = _dump_effective_strategy_def(
+        strategy_def,
+        params,
+        research_strategy_spec,
+        results_dir,
+        cli_overrides=strat_overrides,
+    )
+    print(f"Effective strategy dump saved to {dump_path}")
+    manifest_path = _dump_run_manifest(
+        results_dir,
+        mode=args.mode,
+        group=_group_from_results_dir(results_dir),
+        strategy_name=strategy_name,
+        strategy_file=args.strategy_file,
+        strategy_dump_path=dump_path,
+        db_path=db_path,
+        db_used=db_used,
+        cli_overrides=strat_overrides,
+        metrics=None,          # standard/walkforward always start as six nulls (§1)
+        artifacts=None,        # Phase 1 -> scan the dir: only strategy_dump.json exists yet
+    )
+
+    wf_summary: dict | None = None
 
     if args.mode == "standard":
         print(f"\n=== Running Standard Backtest: {strategy_name} ===")
@@ -1433,6 +1708,7 @@ def main():
             "actual_last_fold_end": folds_df["end_date"].iloc[-1],
             "rolling_window_performance": folds_df.to_dict(orient="records"),
         }
+        wf_summary = summary
         shortfall_days = (pd.Timestamp(args.end) - pd.Timestamp(folds_df["end_date"].iloc[-1])).days
         # A fold needs a FULL window to fit (run_walkforward's `while start_idx + window_bars <=
         # n_bars`), so up to (step_bars - 1) trading days of already-loaded data are always left
@@ -1482,6 +1758,12 @@ def main():
         wf_weights_path = os.path.join(results_dir, "walkforward_weights.csv")
         wf_weights_df.to_csv(wf_weights_path, index=True, index_label="date")
         print(f"Saved walkforward actual weights to {wf_weights_path}")
+
+    _finalize_run_manifest(
+        manifest_path,
+        metrics=_extract_walkforward_metrics(wf_summary) if args.mode == "walkforward" else None,
+        artifacts=_artifact_sizes(results_dir),
+    )
 
 
 if __name__ == "__main__":

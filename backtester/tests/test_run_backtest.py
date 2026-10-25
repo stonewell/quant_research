@@ -1,3 +1,4 @@
+import datetime
 import json
 import os
 import sys
@@ -1894,4 +1895,492 @@ def test_walkforward_writes_walkforward_weights_csv(tmp_path, monkeypatch):
     assert "sharpe_ratio" in df_report.columns
     assert "cagr" in df_report.columns
     assert "total_rebalances" in df_report.columns
+
+
+# --- §3 backtest_research_impl.md: strategy dump & run manifest test suite ---
+
+
+def test_run_backtest_dumps_effective_strategy_json_in_results_dir(tmp_path, monkeypatch):
+    dump_source = os.path.join(
+        _PROJECT_ROOT,
+        "pipeline",
+        "research_strategy",
+        "results",
+        "strategy_dumps",
+        "chan_four_state_blend_strategy.json",
+    )
+    if os.path.exists(dump_source):
+        with open(dump_source, "r", encoding="utf-8") as f:
+            strategy_content = json.load(f)
+    else:
+        strategy_content = {
+            "template_name": "chan_four_state_blend",
+            "params": {"cfsb_target_vol": 0.12},
+            "research_strategy_spec": {
+                "strategy_key": "chan_four_state_blend",
+                "entry_data": {
+                    "name": "Chan Four-State Risk-Managed Blend Strategy",
+                    "type": "class",
+                    "class_name": "ChanFourStateBlendStrategy",
+                    "parameters": {"cfsb_target_vol": 0.12},
+                },
+            },
+        }
+
+    strategy_path = tmp_path / "strategy.json"
+    with open(strategy_path, "w", encoding="utf-8") as f:
+        json.dump(strategy_content, f)
+
+    with open(strategy_path, "rb") as f:
+        original_bytes = f.read()
+
+    results_dir = tmp_path / "results_dump"
+    cache_dir = tmp_path / "cache"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--strategy-params", '{"cfsb_target_vol": 0.99, "blend_max_assets_per_sector": 20}',
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+        "--data-provider", "synthetic",
+        "--universe", "SPY", "QQQ",
+        "--start", "2023-01-01",
+        "--end", "2023-06-30",
+        "--no-plots",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    main()
+
+    dump_path = results_dir / "strategy_dump.json"
+    assert dump_path.exists()
+
+    with open(dump_path, "r", encoding="utf-8") as f:
+        dump_data = json.load(f)
+
+    assert dump_data["params"]["cfsb_target_vol"] == 0.99
+    assert dump_data["research_strategy_spec"]["entry_data"]["parameters"]["cfsb_target_vol"] == 0.99
+    # `research_strategy` was a duplicate of `research_strategy_spec` that nothing read
+    # (`load_strategy_file` validates the `_spec` key only) -- it must not come back.
+    assert "research_strategy" not in dump_data
+    assert dump_data["cli_strategy_params_override"] == {
+        "cfsb_target_vol": 0.99,
+        "blend_max_assets_per_sector": 20,
+    }
+
+    # Original input strategy.json on disk was NOT mutated
+    with open(strategy_path, "rb") as f:
+        assert f.read() == original_bytes
+
+    # Assert dump can be loaded again as --strategy-file
+    loaded_dump = load_strategy_file(str(dump_path))
+    assert loaded_dump["params"]["cfsb_target_vol"] == 0.99
+
+
+def test_main_optimize_dumps_best_params(tmp_path, monkeypatch):
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(
+        strategy_path,
+        template_name="equal_weight",
+        params={"lookback": 10, "rebalance_freq_days": 21},
+    )
+    results_dir = tmp_path / "results_opt"
+    cache_dir = tmp_path / "cache"
+
+    best_params = {"lookback": 63, "top_k": 2, "rebalance_freq_days": 10}
+    from common.allocation_backtester import REBALANCE_REPORT_COLUMNS
+
+    dummy_opt_result = {
+        "trusted": True,
+        "best_params": best_params,
+        "best_result": {
+            "sharpe_ratio": 2.1,
+            "cagr": 0.25,
+            "max_drawdown": 0.05,
+            "calmar_ratio": 5.0,
+            "win_rate": 0.6,
+            "profit_factor": 1.5,
+            "total_rebalances": 8,
+            "total_turnover": 1.2,
+            "equity_curve": pd.DataFrame(
+                {"equity": [100.0, 105.0]},
+                index=pd.bdate_range("2023-01-01", periods=2),
+            ),
+            "actual_weights": pd.DataFrame(
+                {"SPY": [0.5, 0.5], "QQQ": [0.5, 0.5]},
+                index=pd.bdate_range("2023-01-01", periods=2),
+            ),
+            "rebalance_report": pd.DataFrame(columns=REBALANCE_REPORT_COLUMNS),
+        },
+        "ers_percentile": 0.98,
+        "ers_passed": True,
+        "n_trials": 12,
+        "ers": {"p_value": 0.01},
+    }
+
+    monkeypatch.setattr(
+        backtester.run_backtest,
+        "optimize_template",
+        lambda *args, **kwargs: dummy_opt_result,
+    )
+    monkeypatch.setattr(
+        backtester.run_backtest,
+        "optimize_allocation_params",
+        lambda *args, **kwargs: dummy_opt_result,
+        raising=False,
+    )
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "SPY", "QQQ",
+        "--data-provider", "synthetic",
+        "--mode", "standard",
+        "--start", "2023-01-01",
+        "--end", "2023-06-30",
+        "--optimize",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+        "--no-plots",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    main()
+
+    dump_path = results_dir / "strategy_dump.json"
+    assert dump_path.exists()
+    with open(dump_path, "r", encoding="utf-8") as f:
+        dump_data = json.load(f)
+
+    assert dump_data["params"] == best_params
+    assert dump_data["cli_strategy_params_override"] == {}
+
+    manifest_path = results_dir / "run_manifest.json"
+    assert manifest_path.exists()
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    # No `effective_params_subset` field exists in the manifest schema (§1) -- effective params
+    # live in strategy_dump.json, which the assertion above already pins to best_params.
+    assert "effective_params_subset" not in manifest
+
+
+def test_run_manifest_written_for_standard_and_walkforward(tmp_path, monkeypatch):
+    import hashlib
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(
+        strategy_path,
+        template_name="equal_weight",
+        params={"rebalance_freq_days": 21},
+    )
+
+    # 1. Standard mode
+    results_dir_std = tmp_path / "20261025_091500" / "06_ablate" / "baseline"
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # HERMETIC CACHE FINGERPRINT (the point of this fixture setup):
+    # `main()` records the *configured* cache file -- `<--cache-dir>/cache.duckdb` if that
+    # file exists, else `<DATA_DIR>/cache.duckdb` -- plus `db_used`, which says whether this
+    # run actually read/wrote it (False for a synthetic provider, which never constructs
+    # `DuckDBCache`). Under pytest the DuckDBCache writable-open
+    # guard (`common/duckdb_cache.py::refuse_production_cache_path`) forbids opening the
+    # production cache, AND a synthetic-provider run never constructs DuckDBCache at all
+    # (`CachedDataProvider.__init__` skips it when `is_synthetic_provider` is true), so nothing
+    # ever materializes a `cache.duckdb` under `--cache-dir`. Without a stand-in file the
+    # manifest would stat the REAL repo cache -- gitignored and absent on CI/fresh clones --
+    # which is both non-hermetic and a hard failure there.
+    # So: pre-create a genuine (empty) DuckDB database at `<--cache-dir>/cache.duckdb`. It is
+    # chosen as `db_path` by `main()`'s existence check, and it is never opened by this run
+    # (synthetic provider bypasses the cache), so an unreadable stand-in could not mask a bug --
+    # it is a real DuckDB file anyway. DATA_DIR is simultaneously pointed at an empty tmp dir so
+    # that if the stand-in is ever no longer picked up, the assertions below fail loudly instead
+    # of silently reading the developer's real cache.
+    import duckdb
+    stand_in_db = cache_dir / "cache.duckdb"
+    duckdb.connect(str(stand_in_db)).close()
+    monkeypatch.setattr(backtester.run_backtest, "DATA_DIR", str(tmp_path / "no_real_cache_here"))
+
+    argv_std = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "SPY", "QQQ",
+        "--data-provider", "synthetic",
+        "--mode", "standard",
+        "--start", "2023-01-01",
+        "--end", "2023-06-30",
+        "--results-dir", str(results_dir_std),
+        "--cache-dir", str(cache_dir),
+        "--no-plots",
+    ]
+    monkeypatch.setattr(sys, "argv", argv_std)
+    main()
+
+    manifest_std_path = results_dir_std / "run_manifest.json"
+    assert manifest_std_path.exists()
+    with open(manifest_std_path, "r", encoding="utf-8") as f:
+        man_std = json.load(f)
+
+    assert man_std["schema_version"] in (1, "1.0", "1")
+    assert man_std["status"] == "completed"
+    assert man_std["completed_at_utc"] is not None
+    assert man_std["run_ts"] == "20261025_091500"
+    assert man_std["group"] == "06_ablate"
+    assert man_std["mode"] == "standard"
+
+    with open(results_dir_std / "strategy_dump.json", "rb") as f:
+        expected_sha_std = hashlib.sha256(f.read()).hexdigest()
+    assert man_std["strategy_dump_sha256"] == expected_sha_std
+
+    # The recorded cache fingerprint must describe the stand-in cache actually used by this
+    # run (hermetic `tmp_path`), not the developer's real `data/cache.duckdb`.
+    assert man_std["db_path"] == str(cache_dir / "cache.duckdb")
+    db_size_std = man_std.get("db_size_bytes") if "db_size_bytes" in man_std else man_std.get("data_source", {}).get("db_size_bytes")
+    db_mtime_std = man_std.get("db_mtime_iso") if "db_mtime_iso" in man_std else man_std.get("data_source", {}).get("db_mtime_iso")
+    assert isinstance(db_size_std, int) and db_size_std > 0, db_size_std
+    assert db_size_std == os.path.getsize(cache_dir / "cache.duckdb")
+    assert isinstance(db_mtime_std, str) and db_mtime_std
+    # ISO-8601, e.g. "2026-10-25T09:15:00.123456"
+    assert datetime.datetime.fromisoformat(db_mtime_std) is not None
+
+    std_artifact_names = [a["name"] for a in man_std["artifacts"]]
+    assert "run.log" not in std_artifact_names
+    # The manifest must not list itself: a file cannot truthfully report its own post-write
+    # size from a pre-write scan, so it is excluded by contract (same design rationale as
+    # run.log -- see docs/backtest_research_impl.md §1 Phase-2 rules).
+    assert "run_manifest.json" not in std_artifact_names
+    assert "strategy_dump.json" in std_artifact_names
+    assert "backtest_equity.csv" in std_artifact_names
+    for a in man_std["artifacts"]:
+        assert a["bytes"] == os.path.getsize(results_dir_std / a["name"]), a["name"]
+
+    # `db_path` / `db_size_bytes` / `db_mtime_iso` describe the *configured* cache file;
+    # `db_used` says whether this run actually touched it. A synthetic run constructs no
+    # DuckDBCache at all, so the honest combination is "configured and non-null, but unused".
+    assert man_std["db_used"] is False
+
+    # Standard metrics must have all 6 keys with value None
+    assert man_std["metrics"] == {
+        "sharpe": None,
+        "cagr": None,
+        "max_drawdown": None,
+        "calmar": None,
+        "n_folds": None,
+        "deflated_sharpe": None,
+    }
+
+    # 2. Walkforward mode
+    results_dir_wf = tmp_path / "20261025_091500" / "06_ablate" / "wf_run"
+    argv_wf = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "SPY", "QQQ",
+        "--data-provider", "synthetic",
+        "--mode", "walkforward",
+        "--start", "2022-01-01",
+        "--end", "2024-06-30",
+        "--window-years", "1.0",
+        "--step-years", "0.5",
+        "--results-dir", str(results_dir_wf),
+        "--cache-dir", str(cache_dir),
+    ]
+    monkeypatch.setattr(sys, "argv", argv_wf)
+    main()
+
+    manifest_wf_path = results_dir_wf / "run_manifest.json"
+    assert manifest_wf_path.exists()
+    with open(manifest_wf_path, "r", encoding="utf-8") as f:
+        man_wf = json.load(f)
+
+    assert man_wf["schema_version"] in (1, "1.0", "1")
+    assert man_wf["status"] == "completed"
+    assert man_wf["completed_at_utc"] is not None
+    assert man_wf["run_ts"] == "20261025_091500"
+    assert man_wf["group"] == "06_ablate"
+    assert man_wf["mode"] == "walkforward"
+
+    with open(results_dir_wf / "strategy_dump.json", "rb") as f:
+        expected_sha_wf = hashlib.sha256(f.read()).hexdigest()
+    assert man_wf["strategy_dump_sha256"] == expected_sha_wf
+
+    wf_artifact_names = [a["name"] for a in man_wf["artifacts"]]
+    assert "run.log" not in wf_artifact_names
+    assert "run_manifest.json" not in wf_artifact_names
+    assert "strategy_dump.json" in wf_artifact_names
+    assert "walkforward_summary.json" in wf_artifact_names
+    for a in man_wf["artifacts"]:
+        assert a["bytes"] == os.path.getsize(results_dir_wf / a["name"]), a["name"]
+
+    # `db_used` survives Phase 2 (read-modify-write of the same manifest object).
+    assert man_wf["db_used"] is False
+
+    # Walkforward metrics: all 6 keys non-null and matching walkforward_summary.json
+    with open(results_dir_wf / "walkforward_summary.json", "r", encoding="utf-8") as f:
+        wf_summary = json.load(f)
+
+    for k in ("sharpe", "cagr", "max_drawdown", "calmar", "n_folds", "deflated_sharpe"):
+        assert man_wf["metrics"][k] is not None, f"metric {k} was unexpectedly None"
+
+    assert man_wf["metrics"]["sharpe"] == wf_summary["mean_sharpe_ratio"]
+    assert man_wf["metrics"]["cagr"] == wf_summary["mean_cagr"]
+    assert man_wf["metrics"]["max_drawdown"] == wf_summary["mean_max_drawdown"]
+    assert man_wf["metrics"]["calmar"] == wf_summary["mean_calmar_ratio"]
+    assert man_wf["metrics"]["n_folds"] == wf_summary["n_folds"]
+    assert man_wf["metrics"]["deflated_sharpe"] == wf_summary["deflated_sharpe_ratio"]
+
+
+def test_run_manifest_skeleton_survives_midrun_failure(tmp_path, monkeypatch):
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(
+        strategy_path,
+        template_name="equal_weight",
+        params={"rebalance_freq_days": 21},
+    )
+    results_dir = tmp_path / "20261025_091500" / "06_ablate" / "crash_test"
+    cache_dir = tmp_path / "cache"
+
+    def _crash_walkforward(*args, **kwargs):
+        raise RuntimeError("synthetic crash")
+
+    monkeypatch.setattr(backtester.run_backtest, "run_walkforward", _crash_walkforward)
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "SPY", "QQQ",
+        "--data-provider", "synthetic",
+        "--mode", "walkforward",
+        "--start", "2023-01-01",
+        "--end", "2023-06-30",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with pytest.raises(RuntimeError, match="synthetic crash"):
+        main()
+
+    # Skeleton files must survive on disk
+    dump_path = results_dir / "strategy_dump.json"
+    manifest_path = results_dir / "run_manifest.json"
+    assert dump_path.exists()
+    assert manifest_path.exists()
+
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    assert manifest["status"] == "running"
+    assert manifest["completed_at_utc"] is None
+    # Phase 1 lists the one artifact that already exists at skeleton time -- the effective
+    # strategy dump -- with its real byte count (run.log is never listed: shell `tee` writes
+    # it after this process exits; see docs/backtest_research_impl.md §1 Phase-2 rule 4).
+    assert [a["name"] for a in manifest["artifacts"]] == ["strategy_dump.json"]
+    assert manifest["artifacts"][0]["bytes"] == os.path.getsize(dump_path)
+    assert manifest["artifacts"][0]["bytes"] > 0
+    assert manifest["metrics"] == {
+        "sharpe": None,
+        "cagr": None,
+        "max_drawdown": None,
+        "calmar": None,
+        "n_folds": None,
+        "deflated_sharpe": None,
+    }
+    assert manifest["db_path"] is not None
+    assert manifest["db_used"] is False
+    assert manifest["cli_overrides"] == {}
+    assert manifest["strategy_dump_sha256"] is not None
+
+
+def test_main_optimize_empty_param_grid_keeps_original_params(tmp_path, monkeypatch, capsys):
+    from common.allocation_backtester import REBALANCE_REPORT_COLUMNS
+
+    strategy_path = tmp_path / "strategy.json"
+    original_params = {"cfsb_target_vol": 0.42}
+    _write_strategy_file(
+        strategy_path,
+        template_name="chan_four_state_blend",
+        params=original_params,
+        research_strategy_spec={
+            "strategy_key": "chan_four_state_blend",
+            "entry_data": {
+                "name": "Chan Four-State Risk-Managed Blend Strategy",
+                "type": "class",
+                "class_name": "ChanFourStateBlendStrategy",
+                "parameters": original_params,
+            },
+        },
+    )
+    results_dir = tmp_path / "results_empty_grid"
+    cache_dir = tmp_path / "cache"
+
+    dummy_opt_result = {
+        "trusted": True,
+        "best_params": {},
+        "best_result": {
+            "sharpe_ratio": 1.2,
+            "cagr": 0.15,
+            "total_rebalances": 5,
+            "total_turnover": 0.8,
+            "equity_curve": pd.DataFrame(
+                {"equity": [100.0, 105.0]},
+                index=pd.bdate_range("2023-01-01", periods=2),
+            ),
+            "actual_weights": pd.DataFrame(
+                {"SPY": [0.5, 0.5], "QQQ": [0.5, 0.5]},
+                index=pd.bdate_range("2023-01-01", periods=2),
+            ),
+            "rebalance_report": pd.DataFrame(columns=REBALANCE_REPORT_COLUMNS),
+        },
+        "ers_percentile": 0.95,
+        "ers_passed": True,
+        "n_trials": 1,
+        "ers": {"p_value": 0.01},
+    }
+
+    monkeypatch.setattr(
+        backtester.run_backtest,
+        "optimize_template",
+        lambda *args, **kwargs: dummy_opt_result,
+    )
+    monkeypatch.setattr(
+        backtester.run_backtest,
+        "optimize_allocation_params",
+        lambda *args, **kwargs: dummy_opt_result,
+        raising=False,
+    )
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "SPY", "QQQ",
+        "--data-provider", "synthetic",
+        "--mode", "standard",
+        "--start", "2023-01-01",
+        "--end", "2023-06-30",
+        "--optimize",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+        "--no-plots",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    main()
+
+    dump_path = results_dir / "strategy_dump.json"
+    assert dump_path.exists()
+    with open(dump_path, "r", encoding="utf-8") as f:
+        dump_data = json.load(f)
+
+    # Effective params must NOT be wiped to {}
+    assert dump_data["params"]["cfsb_target_vol"] == 0.42
+
+    # optimize_report.json must be written with best_params == {}
+    opt_report_path = results_dir / "optimize_report.json"
+    assert opt_report_path.exists()
+    with open(opt_report_path, "r", encoding="utf-8") as f:
+        opt_report = json.load(f)
+    assert opt_report["best_params"] == {}
+
+    captured = capsys.readouterr()
+    assert "WARNING: --optimize produced an empty best_params" in captured.out
+
+
 
