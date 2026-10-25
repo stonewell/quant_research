@@ -176,3 +176,120 @@ print(con.execute("""SELECT date, count(DISTINCT symbol) FROM ohlcv_bars
 ## 8. 只读声明
 
 本轮全部测量均以 `duckdb.connect(..., read_only=True)` 执行，未改动库文件：查询前 `size=324,022,272` / `mtime=2026-10-24 12:55:25.615392116 -0700` / `md5=ac7b5df94ad12481bd8d5e8bae54d6d0`，查询后**三项完全一致**；全程未出现 `data/cache.duckdb.wal`。
+
+---
+
+# 下半部分：代码行为 —— 同一份库在 walkforward 里被怎么读
+
+> **与上半部分的分工（不要混引）**：§1–§8 是**数据事实**——某一时刻这个库长什么样（md5 / 行数 / schema / 覆盖 / 质量），证据来自对 `data/cache.duckdb` 的只读 SQL，**随写入失效**。§9–§17 是**代码行为**——同一份库被 `backtester/run_backtest.py` 读进内存时发生的路径解析、并发、缺失处理与 fold 切分，证据是源码行号，**不随库内容变化**（只有改代码才会变）。两者唯一的接缝是 §15 那张"什么事件会让上半部分的 md5/行数失效"。
+> **复核方式**：下文每条都给了 `path:line`，并被要求与当前 HEAD 的源码逐字对照；**与任务书不一致的三条按代码为准披露并标注**（§11 的成交量单位归属、§13 ③ 的 `_align_universe` 是否真的被调用、§13 ⑦ 的"唯一一处 ffill"计数）。
+
+## 9. 缓存路径解析链
+
+`--cache-dir`（`common/cli_utils.py:85-86` 注册）→ `cache_dir = args.cache_dir or DATA_DIR`（`backtester/run_backtest.py:1050`）→ `DATA_DIR = shared_data_dir()`（`backtester/run_backtest.py:64`）→ `shared_data_dir()` 返回 `<repo>/data`（`common/cli_utils.py:108`，docstring 明说"this always resolves relative to this file's own location, one level up from `common/`"）→ `DuckDBCache` 把**目录或无后缀路径**改写成 `<dir>/cache.duckdb`（`common/duckdb_cache.py:775-778`）→ 最终落在 `<repo>/data/cache.duckdb`。
+
+- `read_only=True` **在构造时**就要求文件已存在，否则当场 `FileNotFoundError`（`common/duckdb_cache.py:784-791`，注释原文 "Fail at construction, not at the first query, when the file is absent."）。⇒ 路径写错不是"悄悄查空"，而是启动即失败。
+- 反过来 `read_only=False` 会 `makedirs`（`:792`）并建好全套表（`:798-808`）。⇒ **一次拼错路径的写模式打开会凭空造出一个只有 schema 的空库**，看起来"运行正常"、其实零 bar。
+- 回测/研究开的是**写模式**：`CachedDataProvider.__init__` 用 `DuckDBCache(db_path=self.cache_dir)`（`common/data.py:662`），没有 `read_only=True`。walkforward 因此既是读者也是**潜在写者**（见 §11、§14）。
+
+## 10. 连接与并发
+
+| 事实 | 位置 |
+|---|---|
+| 连接**每次调用新建、用完即关**（非池化） | `_get_connection` `common/duckdb_cache.py:810-828`；查询侧 `con = self._get_connection(read_only=True)` + `finally: … con.close()`：`query_bars` `:2053`/`:2057`、`query_universe` `:2178`/`:2182`、`query_intraday_bars` `:1995` |
+| 唯一并发保护 = **写锁重试**：5 次、仅当异常文本含 `"lock"`、指数退避 | `:819-827`（`for attempt in range(5)` / `if "lock" in str(exc).lower() and attempt < 4` / `time.sleep(0.05 * (2 ** attempt))`） |
+| **没有**跨进程锁、**没有** WAL 语义、**没有** fencing token | 全文对 `journal_mode` / `flock` / `fcntl` **零命中**（`grep -n` 实测），唯一同步原语就是上一条的 sleep-retry |
+
+⇒ 读与写之间**没有一致性快照**。walkforward 读库时若另一进程正在写，你可能读到"半更新"状态（一部分标的已落新 qfq 基准、一部分还是旧基准）；那 5 次重试只保证**写者不因锁而崩**，不保证**读者看到同一个版本**。所以：**运行 walkforward 期间不要启动下载器 / 同步脚本。**
+
+（并行 walkforward 本身不是风险：payload 合约注释原文 "no worker ever touches the OHLCV cache; so a parallel walk-forward puts exactly ONE reader on `common/duckdb_cache.py` no matter how many workers or folds there are"（`backtester/run_backtest.py:356-359`）——`--n-jobs N` 仍然只有 1 个读者。）
+
+## 11. 复权口径与成交量单位都不在 schema 里
+
+`_init_tables` 的 `ohlcv_bars` 只有 `provider, symbol, date, open, high, low, close, volume`（`common/duckdb_cache.py:829-842`）——**没有任何 `adjust` / `qfq` / `adj_factor` 列**。同一 `(provider, symbol, date)` 键下数值的口径，完全由**写它的那条路径**决定：
+
+| provider | 复权口径（写入侧的写法） | 位置 |
+|---|---|---|
+| `BaoStockDataProvider` | 构造默认 `adjustflag: str = "2"`（前复权） | `common/financial_api.py:1051` |
+| BaoStock **指数** | 强制 `req_adjustflag = "3"`（不复权），字段列表连 `adjustflag` 都不带 | `:1120-1121` |
+| `EastMoneyDataProvider` | `adjust="qfq"` → `fqt="1"` | `:1599-1604` |
+| `YFinanceDataProvider` | `auto_adjust=True` | `common/data.py:149` |
+| `MarketDBDataProvider` / `Fuyao` | `adjust="forward"` → 读本地 `v_daily_qfq` | `common/financial_api.py:285-304`、`:495-514` |
+
+⇒ **不能假设表内数值口径统一**：不复权的指数行与前复权的个股行在**同一张表**里。跨 provider 比较/拼接前必须逐列验——上半 §6 第 3 条的 2.58%（`600941.SH`）/ 29.44%（`300308.SZ`）台阶就是这条的直接后果。
+
+**成交量单位**：全库**唯一一处显式"手→股"换算在 EastMoney 路径**，注释原文 "Mandatory lots-to-shares volume scaling (f56 is in lots of 100 shares)"，代码 `vol = float(parts[5]) * 100.0`（`common/financial_api.py:1713-1714`）。**BaoStock 路径对 `volume` 不做任何缩放**（`:1240-1256` 只做 rename + `to_numeric`，全段无乘数），`duckdb_cache` 也不做（`store_bars` 里 `"volume": df_to_store["Volume"].astype(float).values`，`common/duckdb_cache.py:1685`；日内同，`:1447`）。⇒ **不要假设全库成交量同一单位**，`volume` 只在"同 provider 同序列"内部可比。
+
+> **与任务书的偏差**：任务书称换算发生在 BaoStock 路径，实测不成立——BaoStock 侧零缩放，换算在 EastMoney 侧。结论（单位不统一）仍成立，归属已按代码更正。
+
+## 12. 读路径不做补洞
+
+- 缓存层查询**不 forward-fill**；唯一一处 `dropna` 在重采样里：`resampled = df.resample(rule).agg(agg_spec).dropna(subset=["Open","High","Low","Close"])`（`common/duckdb_cache.py:160`），日内重采样同形（`common/data.py:610`）。而 `interval="1d"` 时 `_get_resample_rule` 返回 `None`（`common/duckdb_cache.py:90-110` 的 `"1d": None`）→ **日线路径连"补齐交易日"这一步都不存在**，库里缺哪根就少哪根。
+- provider 侧的坏行也是**丢**不是补：`_drop_invalid_ohlcv_rows` 做 `dropna(subset=[...])`，不可能 OHLC 的行被剔除并 `warnings.warn(f"Dropping {…} row(s) with impossible OHLC values for {label}: …")`（`common/data.py:619`、`:642`）。
+- 单标的读不到 → **空 DataFrame**（带 5 个列名），不是异常：`if res_df.empty: return pd.DataFrame(columns=_REQUIRED_OHLCV_COLUMNS)`（`common/duckdb_cache.py:2060-2061`）。
+- 批量读缺标的 → **`continue` 跳过**：`if sym not in grouped.groups: continue`（`:2193`；日内版 `:2122`）。上游 `fetch_universe` 对**单标的失败**是 `warnings.warn(f"Skipping {symbol}: {exc}")`（`common/data.py:815`）——不报错、不填充；**唯一硬失败**是 `HistoryRewriteRefused`，被收集后抛 `RuntimeError` 点名每个被拒 symbol（`common/data.py:818-838`，见 §14）。
+
+⇒ 缺口会一路传到最后，靠引擎侧两处 ffill 兜底（§13 ⑦）——**"读到少一根"在结果里的表现是"那一天平盘"，不是缺失标记。**
+
+## 13. walkforward 关键语义（最重要的一节）
+
+**① 回测会话被钉死为 `None`。** `_LEGAL_BACKTEST_SESSION = None`（`backtester/run_backtest.py:71`），任何非 None 值（含 `0` / `""` / `False`，用 `is not` 判定）都抛 `BacktestSessionLeakError`（`:82-105`）。原因注释原文：*"a backtest must never do so, otherwise its results become a function of the wall clock (today's date decides whether a bar is 'covered' -> a re-fetch -> potentially different data and different numbers for the same command)"*（`:85-88`）。调用点带标记：`:1126`（主 universe）、`:938`（baseline）。⇒ 回测**不因"今天几号"改判覆盖度**；同理它也**不会**替你补上缺失的尾巴。
+
+**② `_evaluate_walkforward_fold` 本身不加载数据。** 注释原文 *"Deliberately performs NO data loading: the universe is handed in already loaded."*（`:407-411`）。⇒ 全部 I/O 只发生在 `main()` 的**一次** `load_universe_with_banner`（`:1123-1126`），fold 内只有内存切片。
+
+**③ `_align_universe` 确实是内连接，但当前 walkforward 路径不调用它。** 函数本体：`common_index = common_index.intersection(df.index)`（`:236-238`），返回 `{symbol: df.loc[common_index] …}`（`:264`）—— 即"所有标的日期取交集，单个短历史标的会把整个回测区间压到它自己的长度"。两条告警的触发条件都是**差值 > 7 天**（`:242`、`:254`，即尾部差 3 天**完全不告警**），文案为 `"_align_universe: aligned date range ends {…}, {…} day(s) short of the latest date available anywhere in the universe ({…}). Symbol(s) with the shortest trading history are limiting the whole walk-forward range: {…}."`（`:246-252`）与 `"… starts {…}, {…} day(s) later than the earliest date available anywhere … Symbol(s) listed latest are trimming the start date for the whole universe: {…}."`（`:258-263`）。**但全仓除定义与测试外无任何调用点**（定义 `:228`；唯一调用方是 `backtester/tests/test_run_backtest.py:26/40-104`；其余两处 `common/allocation_templates.py:468`、`backtester/run_backtest.py:916` 只是散文引用）。⇒ 真实运行中**不会**发生"被短历史标的压短"，**也**不会打印这两条告警；真正决定日历的是 ④⑤。若你真看到这两条告警，说明调用链被改了，值得停下查。
+
+> **与任务书的偏差**：任务书把 `_align_universe` 当成 walkforward 的实际行为；实测它是**未接线的死代码**（仅测试覆盖），故本条按代码改写，并把"读告警"从检查清单里移除。
+
+**④ 真实日历 = 并集 + 20% 覆盖门槛。** `_resolve_master_calendar` 先取所有标的日期的**并集**（`:306`），再只保留"至少 `min_coverage` 比例的标的当天有数据"的日期（`min_assets = max(1, int(np.ceil(min_coverage * total_assets)))`，`:311`）。**请求起始日早于该门槛日时，起始日被前移 —— 结果已改变**，告警原文：`"Requested start date {start} precedes earliest date where at least 20% of universe assets ({min_assets}/{total_assets}) have trading data ({…}). Moving start date to {…}."`（`:326-333`）。调用点把 `min_coverage=0.20` 写死：`:744`（walkforward）、`:692`（standard）、`:1286`/`:1379`（baseline）。
+
+**⑤ fold 内静默丢弃无 bar 的标的。** `_slice_universe_for_range` 只保留"区间内至少有一根 bar"的标的，其余悄悄消失：docstring 原文 "Temporarily removes assets that have no bars for the given date range."（`:271-276`），全函数**无 `warn`**。⇒ 某 fold 少了几只不会上控制台；这些名在引擎里被 `reindex` 成 `NaN`（见 ⑦）。
+
+**⑥ 窗口守卫直接抛异常。** `if window_bars >= n_bars or window_bars > (n_bars - base_start_idx): raise ValueError("Window size is larger than the available data.")`（`:773-774`）——硬失败，不是 warn。换算 `int(round(window_years * 252))`（`:267-268`）。
+
+**⑦ fold 内唯一一处 ffill 是「首行播种」，不是补数据缺口。** 注释原文：*"Restrict to the eval window, but seed its first row with the carried-over (forward-filled) target as of the window's start -- otherwise a fold that starts between two buffer-period rebalances would open in all-cash instead of whatever the (now-warm) strategy actually held at that point."*（`:434-440`），代码 `eval_weights.iloc[0] = full_weights.ffill().reindex(index=eval_index, columns=eval_symbols).iloc[0]`（`:444`）。区别：它 ff 的是**仓位目标**（"新 fold 开场时我本来持有什么"），**不是价格**。价格侧由引擎兜底，语义完全不同：
+- `target_weights = sparse_weights.ffill().fillna(0.0)`（`common/allocation_backtester.py:950`）—— 稀疏权重合约的"持仓延续"；`is_rebalance` 在 ffill **之前**就算好（`:944-948`），否则"重算成同一权重"会被抹成"今天什么都没发生"。
+- `mark_arr = closes.ffill().fillna(0.0)`（`:1068`）—— 注释原文 *"Forward-filled so a missing bar marks at its last known close instead of poisoning equity with NaN"*，即**停牌/缺 bar 按最后收盘价平盘计价（收益 0）**。⇒ "库里有洞"在回测里表现为**一段 0 收益横盘**，既不是 NaN 也不是现金。
+
+（standard 模式有同形的播种，`:705-706`；所以"全路径唯一一处 ffill"**不成立**——walkforward 可执行到的 ffill 共 3 处，含义各不相同，见本条与上两点。）
+
+> **与任务书的偏差**：任务书称"全路径唯一一处 ffill"；实测 walkforward 路径上 ffill 出现 3 次（`:444`、`allocation_backtester.py:950`、`:1068`），仅第一处是播种。
+
+**⑧ 逐 fold fail-soft。** fold 内任何异常被 `except Exception as e:  # noqa: BLE001 -- pre-B2.2 fail-soft contract, per fold` 捕获并 `return _nan_fold_metrics(), str(e)`（`:489-490`）→ 指标全 NaN（`_nan_fold_metrics`，`:383-395`）；调用方按 fold 次序打印 `"Error in window {start} to {end}: {err}"`（`:826`）与 `"[Fold i/N] Done: NaN metrics"`（`:831`），**整轮继续**。而 `_walkforward_score_fn` 只对 `np.isfinite` 的 fold 取均值（`:855-860`）——**NaN fold 不参与均值、也不会拉低均值**。⇒ **"跑完"≠"跑对"**：10 个 fold 里坏 7 个，你看到的 Sharpe 是剩下 3 个的均值，覆盖区间、换手分母、回撤深度全都变了口径。**必须回看 `Error in window` 与 `NaN metrics` 的行数。**
+
+## 14. 两条写入路径的相反策略（决定快照何时失效）
+
+| | 日线 `store_bars` | 日内 `store_intraday_bars` |
+|---|---|---|
+| 历史行数值变了 | **拒绝**：`rtol=1e-9`、`atol=0`，抛 `HistoryRewriteRefused`（`common/duckdb_cache.py:51`、`:1821`），**一行不写** | **静默清除**：`abs(new_close - ref_close) / ref_close > 1e-4` 时 `DELETE` 该 `(provider, symbol, interval)` 的**全部** bar 与 metadata，再重写（`:1418`、`:1419-1438`） |
+| 逃生口 | 必须 `allow_history_rewrite=True` **且**非空 `rewrite_reason`；flag 无 reason → 写入前 `ValueError`（`:1639-1646`） | 无（不需要，它自己就放行） |
+| 比较范围 | 5 列全比：`open, high, low, close, volume`（`:1756`） | 只用最新一根的 `Close` 对 `latest_close_ref`（`:1415-1418`）—— 抽样一个点判定整段 |
+| 不变量声明 | docstring "HISTORY-REWRITE INVARIANT (L2.32)"（`:1596`） | docstring "R4 QFQ Split/Dividend Drift Detection"（`:1385`） |
+
+⇒ 日线侧"历史不能被偷偷改写"是**有门禁的**；日内侧"整段删掉重写"是**设计如此**。所以**日内表的 md5/行数比日线表更易变**：上半 §2 里 `intraday_ohlcv_bars` 的 2,460,576 行只在"没触发 R4 漂移"时才稳。
+
+## 15. 快照有效期（什么会让 §1–§5 的数字失效）
+
+| 事件 | 影响 | 代码路径 |
+|---|---|---|
+| 任何进程写入（含你自己并发的下载器/同步脚本） | md5、行数、mtime 变；可能读到跨版本混合 | §10；`store_bars` `common/duckdb_cache.py:1688`、`store_intraday_bars` `:1450` |
+| **qfq 重基**（分红/拆股；或 Fuyao 重取数时触发 `scale = rem_c / loc_c`） | 既有行 OHLC 整体等比缩放 ⇒ 上半 §6 的跨 provider 台阶、涨跌幅检查全部变 | `common/financial_api.py:802-808`；日线写入会被门禁**拒绝**（除非走 `scripts/repair_qfq_alignment.py` 或显式 opt-in） |
+| **日内 R4 漂移** | 该序列历史被整段删除后重写 ⇒ 行数可能**减少** | `common/duckdb_cache.py:1418-1438` |
+| `--no-cache` | **不改库**，但整轮回测绕开缓存直连 provider（`use_cache=not args.no_cache`，`backtester/run_backtest.py:1124`；`cached = bool(use_cache and cache_dir)`，`common/data.py:1029`）⇒ 结果与上半的快照**无对应关系** | 同上 |
+| 备份回滚（把 `cache.duckdb.bak*` 拷回 `cache.duckdb`） | 直接回到旧指纹；注意 6 个备份的**文件名与 mtime 并不同步**（上半 §1 表内两列明显错位） | 无代码路径，纯文件操作 |
+
+**唯一可靠的"没变"证据**：跑前跑后 `md5sum data/cache.duckdb` + `stat -c '%s %y'` 三项一致（与上半 §8 同口径）。
+
+## 16. 运行前检查清单（操作者）
+
+- [ ] ① **universe 里不要同时出现同一资产的裸代码与带后缀写法**（`000938` vs `000938.SZ`）。上半 §6 第 4 条实测：两者在 529 个重叠日上**逐位相同**、长度 529 vs 2,332 —— 同时纳入等于同一资产算两次权重，长度差还会挪动 ④ 的 20% 门槛日。
+- [ ] ② **显式给 `--start` / `--end`**。默认 `2015-01-01` / `2024-12-31`（`backtester/run_backtest.py:116-117`），与上半 §4"最近截面只剩 20 只"毫无关系；靠默认值跑出的区间没人复核过。
+- [ ] ③ **读 `_resolve_master_calendar` 那条前移告警**（`:326-333`）；反之 `_align_universe` 的两条告警**不该出现**（§13 ③），出现即说明调用链被改。
+- [ ] ④ **数一遍 `Error in window` 与 `NaN metrics`**（`:826`、`:831`）；NaN fold 不参与均值 ⇒ 报出的 Sharpe 可能只代表部分区间（§13 ⑧）。
+- [ ] ⑤ **跑前记下 `md5sum data/cache.duckdb`**（当前 `ac7b5df94ad12481bd8d5e8bae54d6d0`，上半 §1），跑后再记；不一致就别把两次结果混着比。
+- [ ] ⑥ **运行期间不要启动下载器 / 同步脚本**（§10：无跨进程锁、无 WAL、可能读到半更新状态）。
+
+## 17. git 忽略的边界
+
+`.gitignore` 只有两条与数据相关：**第 4 行** `**/data/*.csv`、**第 5 行** `**/data/*.duckdb*`；**目录本身没有任何规则**（`nl -ba .gitignore` 前 10 行无 `data/`）。实测：`git check-ignore -v data/cache.duckdb` → `.gitignore:5:**/data/*.duckdb*`；`data/` 下现有 7 个文件全被这两条覆盖，`git status --untracked-files=all data/` 为空，`git add -n data/` 无输出且退出码 0。
+⇒ **别 `git add data/`**：今天它什么都不会加（也不报错），但目录没有忽略规则 —— 哪天 `data/` 里出现一个非 `*.csv`/`*.duckdb*` 的文件（日志、txt、草稿脚本），一条 `git add data/` 就会把它静默拖进索引。加文件请按**具体路径**加。
