@@ -130,6 +130,11 @@ from pipeline.live_signal.lsig.signal import as_of_universe, latest_rebalance_ro
 # silently split "tickets written here, health check reads there", so neither file
 # may re-spell the path. See `scripts/live_paths.py` for the layout and its evidence.
 from scripts.live_paths import DEFAULT_STRATEGY_KEY, default_live_output_dir
+from scripts.live_preflight import (
+    LiveDumpPreflightError,
+    is_static_template,
+    verify_live_strategy_dump_preflight,
+)
 
 
 # (2026-10-22 incident, Fix 2) Freshness policy -- bar-date-vs-expected-session
@@ -1167,6 +1172,18 @@ def parse_args(args: Optional[List[str]] = None):
             "dry runs / known provider gaps."
         ),
     )
+    parser.add_argument(
+        "--allow-weighting-mode-override",
+        action="store_true",
+        help=(
+            "EXPLORATION ONLY -- bypasses two pre-flight refusals: (1) a strategy dump whose "
+            "blend_weighting_mode differs from strategies_config.json, and (2) a strategy key "
+            "that is not present in strategies_config.json at all (this path prints a loud "
+            "warning: the pinned mode was never verified). It does NOT bypass a malformed dump, "
+            "an unidentifiable dump, or a registered strategy whose blend_weighting_mode is "
+            "missing entirely. Do NOT archive the resulting run as a live ticket."
+        ),
+    )
     add_data_provider_cli_args(parser, default_provider="synthetic")
     # (L2.3) --market / --allow-intraday / --strict-market-clock / --strict-freshness /
     # --publication-grace-minutes / --max-probe-attempts: the as-of + run-window gate
@@ -1205,6 +1222,16 @@ def parse_args(args: Optional[List[str]] = None):
     parsed._strategy_key = strategy_key
     parsed._resolved_desc = resolved_desc
     parsed._template = template
+
+    # (P1.8) Pre-flight consistency check between dump and strategies_config.json
+    template_name = strategy_def.get("template_name", "")
+    if not is_static_template(template_name) and not is_static_template(strategy_key):
+        verify_live_strategy_dump_preflight(
+            strategy_def=strategy_def,
+            strategy_key=strategy_key,
+            strategy_file=parsed.strategy_file or resolved_desc,
+            allow_override=getattr(parsed, "allow_weighting_mode_override", False),
+        )
 
     # 2. Dynamically bind output directory to strategy key if not explicitly given.
     #    The path comes from `scripts.live_paths.default_live_output_dir` -- the same

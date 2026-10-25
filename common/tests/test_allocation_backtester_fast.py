@@ -15,6 +15,7 @@
 """
 
 import ast
+import copy
 import os
 import sys
 
@@ -628,4 +629,172 @@ def test_unported_production_keys_raise_not_implemented_error():
             res.get(key)
         with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
             _ = key in res
+
+
+# --------------------------------------------------------------------------- #
+# B6.2: Write-path and copy() guardrail tests
+# --------------------------------------------------------------------------- #
+def test_unported_production_keys_write_paths_raise():
+    """Every write and deletion path on `FastBacktestResult` must reject unported keys.
+
+    Task B6.2: __setitem__, setdefault, update, and pop must all raise
+    NotImplementedError when called with any key in UNPORTED_PRODUCTION_KEYS.
+    Also verifies that initialization with unported keys is rejected.
+    """
+    universe = _make_universe(n_days=20, n_sym=2, seed=1)
+    tw = _sparse_weights(universe, {0: {"S0": 0.5, "S1": 0.5}})
+    res = run_allocation_backtest_fast(universe, tw)
+    assert isinstance(res, FastBacktestResult)
+
+    for key in UNPORTED_PRODUCTION_KEYS:
+        # __setitem__
+        with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
+            res[key] = 123
+
+        # setdefault
+        with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
+            res.setdefault(key, 123)
+
+        # update via dict
+        with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
+            res.update({key: 123})
+
+        # update via list of pairs
+        with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
+            res.update([(key, 123)])
+
+        # update via kwargs
+        with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
+            res.update(**{key: 123})
+
+        # pop without default
+        with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
+            res.pop(key)
+
+        # pop with default
+        with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
+            res.pop(key, None)
+
+        # __init__ with dict
+        with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
+            FastBacktestResult({key: 123})
+
+        # __init__ with kwargs
+        with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
+            FastBacktestResult(**{key: 123})
+
+        # __init__ with pairs
+        with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
+            FastBacktestResult([(key, 123)])
+
+
+def test_update_atomicity_on_unported_keys():
+    """update() must be atomic: if ANY candidate key is unported, self is not mutated at all."""
+    universe = _make_universe(n_days=20, n_sym=2, seed=1)
+    tw = _sparse_weights(universe, {0: {"S0": 0.5, "S1": 0.5}})
+    res = run_allocation_backtest_fast(universe, tw)
+
+    # 1. Dict update with mixed keys
+    with pytest.raises(NotImplementedError, match="deferral_report"):
+        res.update({"valid_dict_key": 999, "deferral_report": []})
+    assert "valid_dict_key" not in res
+
+    # 2. Kwargs update with mixed keys
+    with pytest.raises(NotImplementedError, match="cash_carry_report"):
+        res.update(valid_kw_key=888, cash_carry_report=[])
+    assert "valid_kw_key" not in res
+
+    # 3. Iterable of pairs update with mixed keys
+    with pytest.raises(NotImplementedError, match="total_market_impact"):
+        res.update([("valid_pair_key", 777), ("total_market_impact", 0.0)])
+    assert "valid_pair_key" not in res
+
+    # 4. Generator update with mixed keys (ensuring generator replay / non-consumption)
+    gen = ((k, v) for k, v in [("valid_gen_key", 666), ("total_cash_interest", 0.0)])
+    with pytest.raises(NotImplementedError, match="total_cash_interest"):
+        res.update(gen)
+    assert "valid_gen_key" not in res
+
+    # Positive control: update with all valid keys succeeds
+    res.update({"valid_dict_key": 100}, valid_kw_key=200)
+    assert res["valid_dict_key"] == 100
+    assert res["valid_kw_key"] == 200
+
+    # Generator with all valid keys succeeds
+    valid_gen = ((k, v) for k, v in [("gen_k1", 300), ("gen_k2", 400)])
+    res.update(valid_gen)
+    assert res["gen_k1"] == 300
+    assert res["gen_k2"] == 400
+
+
+def test_copy_preserves_guard_and_type():
+    """`copy()` and `copy.copy()` return FastBacktestResult and preserve all guards."""
+    universe = _make_universe(n_days=20, n_sym=2, seed=1)
+    tw = _sparse_weights(universe, {0: {"S0": 0.5, "S1": 0.5}})
+    res = run_allocation_backtest_fast(universe, tw)
+
+    c1 = res.copy()
+    c2 = copy.copy(res)
+    c3 = copy.deepcopy(res)
+
+    for copy_obj in (c1, c2, c3):
+        assert isinstance(copy_obj, FastBacktestResult)
+        assert type(copy_obj) is FastBacktestResult
+
+        # Reads on unported keys still raise
+        for key in UNPORTED_PRODUCTION_KEYS:
+            with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
+                _ = copy_obj[key]
+            with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
+                copy_obj.get(key)
+            with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
+                _ = key in copy_obj
+
+            # Writes on unported keys still raise
+            with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
+                copy_obj[key] = 123
+            with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
+                copy_obj.setdefault(key, 123)
+            with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
+                copy_obj.update({key: 123})
+            with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
+                copy_obj.pop(key, None)
+
+    # Mutations on copies do not affect original
+    c1["isolated_test_key"] = 999
+    assert c1["isolated_test_key"] == 999
+    assert "isolated_test_key" not in res
+
+
+def test_allowed_keys_write_paths():
+    """Valid (non-unported) keys can be written, updated, defaulted, and popped normally."""
+    universe = _make_universe(n_days=20, n_sym=2, seed=1)
+    tw = _sparse_weights(universe, {0: {"S0": 0.5, "S1": 0.5}})
+    res = run_allocation_backtest_fast(universe, tw)
+
+    # __setitem__
+    res["custom_attr"] = 42.0
+    assert res["custom_attr"] == 42.0
+
+    # setdefault on existing
+    val1 = res.setdefault("custom_attr", 99.0)
+    assert val1 == 42.0
+
+    # setdefault on new
+    val2 = res.setdefault("new_default_attr", 123.0)
+    assert val2 == 123.0
+    assert res["new_default_attr"] == 123.0
+
+    # pop existing
+    popped = res.pop("custom_attr")
+    assert popped == 42.0
+    assert "custom_attr" not in res
+
+    # pop missing with default
+    popped_def = res.pop("custom_attr", "not_found")
+    assert popped_def == "not_found"
+
+    # pop missing without default
+    with pytest.raises(KeyError):
+        res.pop("custom_attr")
 

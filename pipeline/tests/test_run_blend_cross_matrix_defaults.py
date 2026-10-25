@@ -29,6 +29,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import subprocess
 import sys
 
 import pytest
@@ -175,3 +176,96 @@ def test_main_exits_cleanly_on_missing_universe(matrix_module, monkeypatch, tmp_
     stderr = capsys.readouterr().err
     assert str(missing) in stderr
     assert "Universe file not found" in stderr
+
+
+# --------------------------------------------------------------------------- #
+# 5. Task B6.1: Weighting mode & orthogonalization defaults and inheritance
+# --------------------------------------------------------------------------- #
+def test_argparse_weighting_mode_and_ortho_default_to_none(matrix_module, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["run_blend_cross_matrix.py"])
+    args = matrix_module.parse_args()
+    assert args.weighting_mode is None
+    assert args.enable_orthogonalization is None
+
+
+def test_default_matrix_dry_run_omits_weighting_mode_and_ortho_flags(matrix_module, monkeypatch, capsys):
+    monkeypatch.setattr(
+        sys, "argv", ["run_blend_cross_matrix.py", "--dry-run", "--matrix-runs", "0", "--max-rounds", "1"]
+    )
+    matrix_module.main()
+    captured = capsys.readouterr().out
+    assert "Weighting Mode:           <inherited from strategy dumps>" in captured
+    assert "Enable Orthogonalization: <inherited from strategy dumps>" in captured
+    assert "--weighting-mode" not in captured
+    assert "--enable-orthogonalization" not in captured
+
+
+def test_default_matrix_run_does_not_pass_weighting_mode_to_subprocess(matrix_module, monkeypatch):
+    recorded_cmds = []
+
+    def mock_run(cmd, **kwargs):
+        recorded_cmds.append(list(cmd))
+        class MockProc:
+            returncode = 0
+        return MockProc()
+
+    monkeypatch.setattr(matrix_module.subprocess, "run", mock_run)
+    monkeypatch.setattr(
+        sys, "argv", ["run_blend_cross_matrix.py", "--matrix-runs", "0", "--max-rounds", "1"]
+    )
+    matrix_module.main()
+
+    assert len(recorded_cmds) == 1
+    cmd = recorded_cmds[0]
+    assert "--weighting-mode" not in cmd
+    assert "--enable-orthogonalization" not in cmd
+    assert "scripts/backtest_blend_strategies.sh" in cmd[1]
+
+
+def test_explicit_weighting_mode_passed_to_subprocess(matrix_module, monkeypatch, capsys):
+    recorded_cmds = []
+
+    def mock_run(cmd, **kwargs):
+        recorded_cmds.append(list(cmd))
+        class MockProc:
+            returncode = 0
+        return MockProc()
+
+    monkeypatch.setattr(matrix_module.subprocess, "run", mock_run)
+    monkeypatch.setattr(
+        sys, "argv", [
+            "run_blend_cross_matrix.py",
+            "--matrix-runs", "0",
+            "--max-rounds", "1",
+            "--weighting-mode", "rolling_ic_ir",
+            "--enable-orthogonalization", "false",
+        ]
+    )
+    matrix_module.main()
+
+    captured = capsys.readouterr().out
+    assert "Weighting Mode:           rolling_ic_ir" in captured
+    assert "Enable Orthogonalization: false" in captured
+
+    assert len(recorded_cmds) == 1
+    cmd = recorded_cmds[0]
+    assert "--weighting-mode" in cmd
+    idx_wm = cmd.index("--weighting-mode")
+    assert cmd[idx_wm + 1] == "rolling_ic_ir"
+
+    assert "--enable-orthogonalization" in cmd
+    idx_ortho = cmd.index("--enable-orthogonalization")
+    assert cmd[idx_ortho + 1] == "false"
+
+
+def test_help_text_documents_none_default_and_inherit_policy(matrix_module, capsys, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["run_blend_cross_matrix.py", "--help"])
+    with pytest.raises(SystemExit) as excinfo:
+        matrix_module.parse_args()
+    assert excinfo.value.code == 0
+    help_out = capsys.readouterr().out
+    assert "--weighting-mode" in help_out
+    assert "--enable-orthogonalization" in help_out
+    assert "Default is None" in help_out
+    assert "inherits each strategy's pinned" in help_out
+

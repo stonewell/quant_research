@@ -81,6 +81,11 @@ from common.universe import (
 )
 from pipeline.live_signal.lsig.signal import as_of_universe, latest_rebalance_rows
 from scripts.live_paths import MULTI_STRATEGY_KEY, default_live_output_dir
+from scripts.live_preflight import (
+    LiveDumpPreflightError,
+    is_static_template,
+    verify_live_strategy_dump_preflight,
+)
 from scripts.run_live_strategy import (
     announce_run_mode,
     load_holdings,
@@ -256,6 +261,18 @@ def parse_args():
         default=None,
         help="Market data cache directory",
     )
+    parser.add_argument(
+        "--allow-weighting-mode-override",
+        action="store_true",
+        help=(
+            "EXPLORATION ONLY -- bypasses two pre-flight refusals: (1) a strategy dump whose "
+            "blend_weighting_mode differs from strategies_config.json, and (2) a strategy key "
+            "that is not present in strategies_config.json at all (this path prints a loud "
+            "warning: the pinned mode was never verified). It does NOT bypass a malformed dump, "
+            "an unidentifiable dump, or a registered strategy whose blend_weighting_mode is "
+            "missing entirely. Do NOT archive the resulting run as a live ticket."
+        ),
+    )
 
     add_data_provider_cli_args(parser)
     # (L2.3) as-of / market / run-window gate / strict freshness / probe retry limit.
@@ -389,6 +406,16 @@ def main():
         w_strat = s_spec["capital_weight"]
         strat_def, actual_key, resolved_desc, template = resolve_strategy_definition(s_key, None)
         params = strat_def.get("params", {})
+
+        # (P1.8) Pre-flight consistency check between dump and strategies_config.json
+        template_name = strat_def.get("template_name", "")
+        if not is_static_template(template_name) and not is_static_template(actual_key):
+            verify_live_strategy_dump_preflight(
+                strategy_def=strat_def,
+                strategy_key=actual_key,
+                strategy_file=resolved_desc,
+                allow_override=getattr(args, "allow_weighting_mode_override", False),
+            )
         strat_name = (
             strat_def.get("strategy_name")
             or strat_def.get("research_strategy_spec", {}).get("entry_data", {}).get("name")

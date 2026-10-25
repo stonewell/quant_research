@@ -12,6 +12,16 @@ Orchestrates the 6-cell cross-ablation matrix comparing:
 Across Round 1 (2022-01-01 to 2026-01-01) and Round 2 (2025-11-28 to 2026-10-01).
 Parses walkforward_summary.json across all strategies and generates comprehensive
 Markdown and CSV comparison tables.
+
+Strategy Configuration & Dump Override Policy:
+- Default `--weighting-mode` and `--enable-orthogonalization` are None: each blend
+  strategy inherits its pinned configuration directly from strategies_config.json /
+  strategy dumps (e.g. chan_four_state_blend keeps its pinned regime_ic_ir_hybrid
+  per AGENTS.md section 8, while other blends keep rolling_ic_ir), materializing 0
+  _strategy_dumps_override/ directories and 0 pinned-deviation warnings.
+- When explicitly passed on the CLI (e.g. `--weighting-mode regime_adaptive`), the
+  wrapper materializes a run-local override copy under results/.../_strategy_dumps_override/
+  and does NOT modify live strategy dumps.
 """
 
 import argparse
@@ -242,14 +252,26 @@ def parse_args():
     parser.add_argument(
         "--weighting-mode",
         type=str,
-        default="regime_ic_ir_hybrid",
-        help="Blend sub-strategy weighting mode (default: regime_ic_ir_hybrid)",
+        default=None,
+        help=(
+            "Blend sub-strategy weighting mode override. Default is None (inherits each "
+            "strategy's pinned mode from strategies_config.json / strategy dump, "
+            "materializing 0 _strategy_dumps_override/ copies and 0 pinned-deviation warnings). "
+            "When explicitly passed on CLI, materializes a run-local override copy and does "
+            "NOT modify live strategy dumps."
+        ),
     )
     parser.add_argument(
         "--enable-orthogonalization",
         type=str,
-        default="true",
-        help="Enable Löwdin symmetric orthogonalization (default: true)",
+        default=None,
+        help=(
+            "Enable Löwdin symmetric orthogonalization override ('true'/'false'). Default is None "
+            "(inherits each strategy's pinned setting from strategies_config.json / strategy dump, "
+            "materializing 0 _strategy_dumps_override/ copies and 0 pinned-deviation warnings). "
+            "When explicitly passed on CLI, materializes a run-local override copy and does "
+            "NOT modify live strategy dumps."
+        ),
     )
     return parser.parse_args()
 
@@ -393,8 +415,8 @@ def main():
     print("=" * 80)
     print("Blend Strategies Cross-Ablation Matrix Orchestrator")
     print(f"Universe:                 {args.universe} ({len(universe_symbols)} symbols)")
-    print(f"Weighting Mode:           {args.weighting_mode}")
-    print(f"Enable Orthogonalization: {args.enable_orthogonalization}")
+    print(f"Weighting Mode:           {args.weighting_mode if args.weighting_mode is not None else '<inherited from strategy dumps>'}")
+    print(f"Enable Orthogonalization: {args.enable_orthogonalization if args.enable_orthogonalization is not None else '<inherited from strategy dumps>'}")
     print(f"Start Run ID:             {args.start_run_id}")
     print(f"Max Rounds:               {args.max_rounds}")
     print(f"Dry Run:                  {args.dry_run}")
@@ -423,10 +445,12 @@ def main():
                 "--results", results_dir,
                 "--start", r_cfg["start"],
                 "--end", r_cfg["end"],
-                "--weighting-mode", args.weighting_mode,
-                "--enable-orthogonalization", args.enable_orthogonalization,
                 "--extra-params", extra_json,
             ]
+            if args.weighting_mode is not None:
+                cmd.extend(["--weighting-mode", args.weighting_mode])
+            if args.enable_orthogonalization is not None:
+                cmd.extend(["--enable-orthogonalization", args.enable_orthogonalization])
 
             cmd_str = " ".join(f"'{x}'" if " " in x or "{" in x else x for x in cmd)
             print(f"\n  [Round {round_num}] {r_cfg['name']}")

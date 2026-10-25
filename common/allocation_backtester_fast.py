@@ -681,15 +681,25 @@ UNPORTED_PRODUCTION_KEYS = frozenset({
 
 
 class FastBacktestResult(dict):
-    """Result dictionary from `run_allocation_backtest_fast` (task B5.3).
+    """Result dictionary from `run_allocation_backtest_fast` (tasks B5.3 & B6.2).
 
-    Guards against schema drift by raising NotImplementedError when accessing
-    unported production keys that exist in `run_allocation_backtest` but are not
-    supported by the fast array kernel. All THREE read paths are guarded --
-    `res[key]`, `res.get(key)` and `key in res` -- so `in` can never answer False
-    for a key `[]`/`.get()` refuse to answer at all (that disagreement was a real
-    hole in the first version of this guard).
+    Guards against schema drift by raising NotImplementedError when accessing,
+    writing, or copying unported production keys that exist in
+    `run_allocation_backtest` but are not supported by the fast array kernel.
+    The guarded paths are reads (`res[key]`, `res.get(key)`, `key in res`), writes
+    (`res[key] = val`, `res.setdefault(key, val)`, `res.update(...)`, `res.pop(key)`)
+    and shallow copies (`res.copy()`, `copy.copy(res)`) -- NOT every conceivable write.
+
+    Known residual bypass (out of B6.2's scope, disclosed rather than silently widened):
+    `res |= other` goes through `dict.__ior__`, which merges at the C level and therefore
+    skips `__setitem__`/`update`, so an unported key can still be injected that way.
+    (`FastBacktestResult.fromkeys(...)` was also suspected; measured on CPython 3.11/3.12 it
+    routes through `PyObject_SetItem` for dict subclasses and DOES raise -- not a bypass.)
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.update(*args, **kwargs)
 
     def __getitem__(self, key):
         if key in UNPORTED_PRODUCTION_KEYS:
@@ -721,6 +731,64 @@ class FastBacktestResult(dict):
                 f"use run_allocation_backtest for full production reports."
             )
         return dict.__contains__(self, key)
+
+    def __setitem__(self, key, value):
+        if key in UNPORTED_PRODUCTION_KEYS:
+            raise NotImplementedError(
+                f"run_allocation_backtest_fast does not port production key {key!r}; "
+                f"use run_allocation_backtest for full production reports."
+            )
+        super().__setitem__(key, value)
+
+    def setdefault(self, key, default=None):
+        if key in UNPORTED_PRODUCTION_KEYS:
+            raise NotImplementedError(
+                f"run_allocation_backtest_fast does not port production key {key!r}; "
+                f"use run_allocation_backtest for full production reports."
+            )
+        return super().setdefault(key, default)
+
+    def update(self, *args, **kwargs):
+        keys_to_check = set(kwargs.keys())
+        if args:
+            if len(args) > 1:
+                raise TypeError(f"update expected at most 1 argument, got {len(args)}")
+            other = args[0]
+            if hasattr(other, "keys"):
+                keys_to_check.update(other.keys())
+            else:
+                other_list = list(other)
+                for item in other_list:
+                    try:
+                        keys_to_check.add(item[0])
+                    except (IndexError, TypeError):
+                        try:
+                            k, _ = item
+                            keys_to_check.add(k)
+                        except Exception:
+                            pass
+                args = (other_list,)
+        for k in keys_to_check:
+            if k in UNPORTED_PRODUCTION_KEYS:
+                raise NotImplementedError(
+                    f"run_allocation_backtest_fast does not port production key {k!r}; "
+                    f"use run_allocation_backtest for full production reports."
+                )
+        super().update(*args, **kwargs)
+
+    def pop(self, key, *args):
+        if key in UNPORTED_PRODUCTION_KEYS:
+            raise NotImplementedError(
+                f"run_allocation_backtest_fast does not port production key {key!r}; "
+                f"use run_allocation_backtest for full production reports."
+            )
+        return super().pop(key, *args)
+
+    def copy(self):
+        return FastBacktestResult(super().copy())
+
+    def __copy__(self):
+        return self.copy()
 
 
 def run_allocation_backtest_fast(

@@ -74,6 +74,11 @@ from pipeline.live_signal.lsig.signal import as_of_universe
 # Stage 1 writes `stage1_health_report.json` / reads `account_state.json` there, and
 # Stage 2 reads/writes the same two files). See `scripts/live_paths.py`.
 from scripts.live_paths import DEFAULT_STRATEGY_KEY, default_live_output_dir
+from scripts.live_preflight import (
+    LiveDumpPreflightError,
+    is_static_template,
+    verify_live_strategy_dump_preflight,
+)
 
 def _resolve_path(p: Optional[str]) -> Optional[str]:
     """Resolve path relative to repo root if it does not exist relative to CWD."""
@@ -226,6 +231,18 @@ def parse_args(args: Optional[List[str]] = None):
             "when any universe symbol's latest bar predates the as-of session, because breadth/thrust/vol "
             "would then be computed on yesterday's closes. This downgrades that hard failure to a loud "
             "warning and records freshness_summary=FAIL in the report."
+        ),
+    )
+    parser.add_argument(
+        "--allow-weighting-mode-override",
+        action="store_true",
+        help=(
+            "EXPLORATION ONLY -- bypasses two pre-flight refusals: (1) a strategy dump whose "
+            "blend_weighting_mode differs from strategies_config.json, and (2) a strategy key "
+            "that is not present in strategies_config.json at all (this path prints a loud "
+            "warning: the pinned mode was never verified). It does NOT bypass a malformed dump, "
+            "an unidentifiable dump, or a registered strategy whose blend_weighting_mode is "
+            "missing entirely. Do NOT archive the resulting run as a live ticket."
         ),
     )
     add_data_provider_cli_args(parser, default_provider="synthetic")
@@ -733,7 +750,7 @@ def print_dashboard(
     print(f"Valuation As-Of Date : {as_of_date}")
     strat_disp = f"{strategy_info.get('strategy_name', 'N/A')} ({strategy_info.get('template_name', '')})"
     print(f"Strategy Deployment  : {strat_disp}")
-    print(f"Weighting & Ortho    : Mode={strategy_info.get('weighting_mode', 'rolling_ic_ir')} | Orthogonalization={strategy_info.get('orthogonalization', True)}")
+    print(f"Weighting & Ortho    : Mode={_weighting_mode_display(strategy_info)} | Orthogonalization={strategy_info.get('orthogonalization', True)}")
     print(f"Strategy Config      : {strategy_path}")
     print(f"Universe Source      : {universe_path} ({macro_info.get('tracked_symbols_count', 0)} assets)")
     print("-" * 110)
@@ -850,6 +867,32 @@ def coarse_directive(gate_code: Optional[str]) -> str:
     return "CAUTION"
 
 
+def _weighting_mode_display(strategy_info: Dict[str, Any]) -> str:
+    """Human-readable weighting mode for the console / Markdown report.
+
+    `stage1_health_report.json` carries three distinct states and the human surfaces must
+    not collapse them back into one (owner review 2026-10-24, Step 0):
+
+    * verified mode -> the mode itself;
+    * registered pin REJECTED + override -> the dump's real mode, explicitly flagged as
+      not the configured one (`weighting_mode_mismatch_overridden`), because printing a
+      bare `rolling_ic_ir` next to a successful run reads as "the pin approved this";
+    * unregistered + override -> `weighting_mode = None`, rendered as UNVERIFIED rather
+      than as a plausible default.
+
+    The `'rolling_ic_ir'` fallback survives only for legacy reports written before the
+    `weighting_mode_verified` flag existed.
+    """
+    mode = strategy_info.get("weighting_mode")
+    if strategy_info.get("weighting_mode_mismatch_overridden") is True:
+        return f"{mode} [UNVERIFIED: pinned-mode mismatch overridden]"
+    if mode is not None:
+        return str(mode)
+    if strategy_info.get("weighting_mode_verified") is False:
+        return "UNVERIFIED (unregistered strategy)"
+    return "rolling_ic_ir"
+
+
 def generate_reports(
     output_dir: str,
     as_of_date: str,
@@ -915,7 +958,7 @@ def generate_reports(
 > **Valuation Date**: `{as_of_date}`  
 > **Strategy**: **{strategy_info.get('strategy_name', 'N/A')}** (`{strategy_info.get('template_name', '')}`)  
 > **Strategy Version**: `{strat_ver_display}`  
-> **Weighting & Ortho**: `{strategy_info.get('weighting_mode', 'rolling_ic_ir')}` | Orthogonalized: `{strategy_info.get('orthogonalization', True)}`  
+> **Weighting & Ortho**: `{_weighting_mode_display(strategy_info)}` | Orthogonalized: `{strategy_info.get('orthogonalization', True)}`  
 > **Gate Directive**: **{gate_headline}**  
 > **Report Timestamp**: Generated during the market-local 13:55 – 14:20 inspection window  
 
@@ -1107,6 +1150,8 @@ def build_stage2_command(args: argparse.Namespace, enable_intraday_5m: bool = Fa
         cmd.extend(["--publication-grace-minutes", str(args.publication_grace_minutes)])
     if getattr(args, "max_probe_attempts", None) is not None:
         cmd.extend(["--max-probe-attempts", str(args.max_probe_attempts)])
+    if getattr(args, "allow_weighting_mode_override", False):
+        cmd.append("--allow-weighting-mode-override")
     return cmd
 
 
@@ -1140,13 +1185,58 @@ def main(cli_args: Optional[List[str]] = None):
     strat_ver = strategy_def.get("strategy_version", "1.0.0")
     base_ver = strategy_def.get("base_version")
     ver_info = strategy_def.get("version_info")
+    template_name = strategy_def.get("template_name", "")
+    strategy_key = (
+        strategy_def.get("research_strategy_spec", {}).get("strategy_key")
+        or template_name
+    )
+    # (P1.8 / owner decision A follow-up, extended 2026-10-24 Step 0)
+    # `verify_live_strategy_dump_preflight` distinguishes THREE outcomes; a bool could not:
+    #   * verified           -> real mode, `weighting_mode_verified = true`
+    #   * unregistered + override -> nothing was compared; write `weighting_mode = None`
+    #   * registered mismatch + override -> the dump's real mode is kept, but the pin
+    #     explicitly REJECTED it, so `verified` must be false and the override flagged.
+    # Every verified path keeps the previous behaviour byte-identical.
+    weighting_mode_verified = True
+    weighting_mode_mismatch_overridden = False
+    if not is_static_template(template_name) and not is_static_template(strategy_key):
+        _preflight = verify_live_strategy_dump_preflight(
+            strategy_def=strategy_def,
+            strategy_key=strategy_key,
+            strategy_file=args.strategy_file,
+            allow_override=getattr(args, "allow_weighting_mode_override", False),
+        )
+        weighting_mode_verified = _preflight.verified
+        weighting_mode_mismatch_overridden = _preflight.mismatch_overridden
+
+    # (P1.8) Strict resolution for blend strategies: blend_weighting_mode is mandatory
+    if not weighting_mode_verified and not weighting_mode_mismatch_overridden:
+        # Unregistered + override: record the absence of a verified value, not a guess.
+        weighting_mode = None
+    elif "blend" in template_name.lower() or "blend" in str(strategy_key).lower():
+        if "blend_weighting_mode" not in params and not getattr(args, "allow_weighting_mode_override", False):
+            raise LiveDumpPreflightError(
+                f"Blend strategy '{strategy_key}' in '{args.strategy_file}' is missing required "
+                f"'blend_weighting_mode' in params."
+            )
+        weighting_mode = params.get("blend_weighting_mode", "rolling_ic_ir")
+    else:
+        weighting_mode = params.get("blend_weighting_mode", "rolling_ic_ir")
+
     strategy_info = {
         "strategy_name": strat_name,
-        "template_name": strategy_def.get("template_name", ""),
+        "template_name": template_name,
         "strategy_version": str(strat_ver),
         "base_version": str(base_ver) if base_ver else None,
         "version_info": ver_info,
-        "weighting_mode": params.get("blend_weighting_mode", "rolling_ic_ir"),
+        "weighting_mode": weighting_mode,
+        # Honest provenance: False means "nothing in this run confirmed the mode above
+        # against the pinned configuration" -- either no config entry existed, or the pin
+        # disagreed and was overridden (see the next field for which).
+        "weighting_mode_verified": weighting_mode_verified,
+        # True only when a registered pin was REJECTED and the override let it through:
+        # `weighting_mode` is then the dump's real value, not the authorised one.
+        "weighting_mode_mismatch_overridden": weighting_mode_mismatch_overridden,
         "orthogonalization": params.get("blend_enable_orthogonalization", True),
     }
 

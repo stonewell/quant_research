@@ -57,6 +57,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -535,3 +536,77 @@ def test_repo_live_dumps_are_untouched_across_an_override_run(tmp_path, uv_shim)
         "the LIVE chan_four_state_blend dump (run_live_strategy.py's DEFAULT_STRATEGY_FILE) no "
         "longer carries its pinned regime mode"
     )
+
+
+# --------------------------------------------------------------------------- #
+# 8. Task B6.3: De-fragilize hardcoded line numbers & verify structural AST references
+# --------------------------------------------------------------------------- #
+def test_no_brittle_line_numbers_in_docstring_or_warning_text(helper):
+    """Docstring and warning formatter must reference structural symbols, not fragile line numbers."""
+    # 1. Module docstring check
+    doc = helper.__doc__ or ""
+    assert not re.search(r"blend_base\.py:\d+", doc), "found brittle blend_base.py:<line> in docstring"
+    assert not re.search(r":\d{3,}", doc), "found brittle :<line> number in docstring"
+    assert not re.search(r":\d+-\d+", doc), "found brittle :<start>-<end> line range in docstring"
+
+    # 2. Formatted warning text check
+    deviation = helper.PinnedDeviation(
+        strategy=_CFSB,
+        pinned_mode=_CFSB_PINNED,
+        requested_mode="rolling_ic_ir",
+    )
+    warning_text = helper.format_pinned_exception_warning(deviation, "/tmp/override")
+    assert not re.search(r"blend_base\.py:\d+", warning_text), "found brittle blend_base.py:<line> in warning"
+    assert not re.search(r":\d{3,}", warning_text), "found brittle :<line> number in warning"
+    assert not re.search(r":\d+-\d+", warning_text), "found brittle :<start>-<end> line range in warning"
+
+
+def test_warning_text_structural_symbols_exist_in_blend_base(helper):
+    """Every class, method, branch name and parameter in the warning must exist in blend_base.py AST."""
+    import ast
+
+    blend_base_path = os.path.join(
+        _REPO_ROOT, "pipeline", "research", "blend", "blend_base.py"
+    )
+    assert os.path.isfile(blend_base_path)
+
+    with open(blend_base_path, "r", encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename="blend_base.py")
+
+    # Verify BaseBlendAllocationStrategy class exists
+    classes = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)}
+    assert "BaseBlendAllocationStrategy" in classes
+    cls_node = classes["BaseBlendAllocationStrategy"]
+
+    # Verify _compute_adaptive_weights method exists in class
+    methods = {n.name: n for n in cls_node.body if isinstance(n, ast.FunctionDef)}
+    assert "_compute_adaptive_weights" in methods
+    fn_node = methods["_compute_adaptive_weights"]
+
+    # Verify bucket_renorm_max_delta is a parameter/identifier in _compute_adaptive_weights
+    fn_args = [a.arg for a in fn_node.args.args + fn_node.args.kwonlyargs]
+    assert "bucket_renorm_max_delta" in fn_args
+
+    # Verify weighting modes are string literals evaluated in _compute_adaptive_weights
+    strings = {
+        n.value for n in ast.walk(fn_node)
+        if isinstance(n, ast.Constant) and isinstance(n.value, str)
+    }
+    for mode in ("rolling_ic_ir", "regime_adaptive", "regime_ic_ir_hybrid"):
+        assert mode in strings, f"{mode!r} not found in _compute_adaptive_weights string literals"
+
+    # Verify the warning text references these exact symbols
+    deviation = helper.PinnedDeviation(
+        strategy=_CFSB,
+        pinned_mode=_CFSB_PINNED,
+        requested_mode="rolling_ic_ir",
+    )
+    warning_text = helper.format_pinned_exception_warning(deviation, "/tmp/override")
+    assert "BaseBlendAllocationStrategy" in warning_text
+    assert "_compute_adaptive_weights" in warning_text
+    assert "rolling_ic_ir" in warning_text
+    assert "regime_adaptive" in warning_text
+    assert "regime_ic_ir_hybrid" in warning_text
+    assert "bucket_renorm_max_delta" in warning_text
+    assert "thrust" in warning_text and "hysteresis" in warning_text
+

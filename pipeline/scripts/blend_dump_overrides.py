@@ -17,10 +17,12 @@ left behind is what a live order ticket is sized by. `chan_four_state_blend` is
 pinned to `blend_weighting_mode="regime_ic_ir_hybrid"`
 (`pipeline/research_strategy/strategies_config.json`, AGENTS.md section 8 -- the
 documented exception), so a plain wrapper run silently switched the DEPLOYED
-engine to `rolling_ic_ir`: `blend_base.py:445` then returns before the `regime_*`
-branch at `:465`, making the `bucket_renorm_max_delta` clamp (`:522-529`) and the
-thrust hysteresis inert. `check_live_portfolio_health.py:1144-1152` mislabelled
-the mode for the same reason, and the web station shells out to both.
+engine to `rolling_ic_ir`: `BaseBlendAllocationStrategy._compute_adaptive_weights`
+in `blend_base.py` then takes the `rolling_ic_ir` early-return branch before the
+`regime_adaptive` / `regime_ic_ir_hybrid` branch, making the
+`bucket_renorm_max_delta` clamp and the thrust hysteresis inert.
+`check_live_portfolio_health.py` mislabelled the mode for the same reason, and
+the web station shells out to both.
 
 The structural flaw is that ONE mode for all six blends cannot be correct: no
 single `WEIGHTING_MODE` value expresses a repo where one strategy pins a
@@ -193,8 +195,8 @@ def _parameter_containers(doc: Dict[str, Any]) -> Tuple[Dict[str, Any], ...]:
     """The two dicts a dump keeps in lockstep (`params` and the spec mirror).
 
     Both are always created when present-or-creatable, because a clean dump has
-    both and a consumer may read either (`run_live_strategy.py:1543`,
-    `check_live_portfolio_health.py:1144-1152`).
+    both and a consumer may read either (`run_live_strategy.py`,
+    `check_live_portfolio_health.py`).
     """
     containers = [doc.setdefault("params", {})]
     spec = doc.get("research_strategy_spec")
@@ -379,9 +381,10 @@ def format_pinned_exception_warning(deviation: PinnedDeviation, dest_dir: str) -
         f"  {deviation.requested_mode!r}.\n"
         "  The request is KEPT -- an ablation may legitimately explore another mode -- but the\n"
         "  deviation is REAL: with anything other than "
-        f"{PINNED_EXCEPTION_MODE!r}, blend_base.py:445\n"
-        "  takes the `rolling_ic_ir` branch and RETURNS before the regime_* branch at :465, so\n"
-        "  the bucket_renorm_max_delta clamp (:522-529) and the thrust hysteresis are INERT.\n"
+        f"{PINNED_EXCEPTION_MODE!r},\n"
+        "  BaseBlendAllocationStrategy._compute_adaptive_weights in blend_base.py takes the\n"
+        "  'rolling_ic_ir' early-return branch before the 'regime_adaptive' / 'regime_ic_ir_hybrid'\n"
+        "  branch, so the bucket_renorm_max_delta clamp and the thrust hysteresis are INERT.\n"
         f"  Scope of this override: ONLY the run-local copy {dest_dir}/{deviation.strategy}"
         f"{_STRATEGY_FILE_SUFFIX}\n"
         "  (plus this run's --strategy-params). The live dump, and therefore\n"
