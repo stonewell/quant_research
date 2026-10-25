@@ -3233,10 +3233,10 @@ exit: 1
   - 首尾各一行 `!!! WARNING: PINNED WEIGHTING-MODE EXCEPTION OVERRIDDEN !!!`；
   - 正文：`chan_four_state_blend is PINNED to blend_weighting_mode='regime_ic_ir_hybrid' … but this run explicitly requested 'rolling_ic_ir'. The request is KEPT -- an ablation may legitimately explore another mode -- but the deviation is REAL: with anything other than 'regime_ic_ir_hybrid', blend_base.py:445 takes the rolling_ic_ir branch and RETURNS before the regime_* branch at :465 …, so the bucket_renorm_max_delta clamp (:522-529) and the thrust hysteresis are INERT. Scope of this override: ONLY the run-local copy … (plus this run's --strategy-params). The live dump, and therefore scripts/run_live_strategy.py's DEFAULT_STRATEGY_FILE, is NOT modified.`
   - **设计取舍**：告警而**不中止**。研究消融本来就有权探索别的模式，禁止它会让人绕过机制；但**不允许静默**。
-  - **已知脆弱点（如实披露）**：这段告警把 `blend_base.py:445` / `:465` / `:522-529` 三个**行号硬编码在字符串里**，行号漂移后告警文案会指向错处。这是刻意用"文案必须点出确切死代码位置"换取可读性。**没有任何测试守卫这三个数字**（§20.6 的 ⑦ 号护栏守的是"盖戳会被检测到"，不是"行号仍正确"）——若日后 `blend_base.py` 结构大改，须人工同步这段字符串；这是本节留下的、已知且已声明的小额技术债，不要当成已解决。
+  - **已知脆弱点（2026-10-24 技术债已清偿）**：此前这段告警把 `blend_base.py:445` / `:465` / `:522-529` 三个行号硬编码在字符串里（详见前文留痕）。**该项技术债已通过原子任务 `B6.3` 彻底清偿**（采用 Option A+B 组合方案）：①**去行号（Option A）**：文案与模块 docstring 中全面废止脆弱行号，改为结构化符号与分支名表述（`BaseBlendAllocationStrategy._compute_adaptive_weights in blend_base.py takes the 'rolling_ic_ir' early-return branch before the 'regime_adaptive' / 'regime_ic_ir_hybrid' branch, so the bucket_renorm_max_delta clamp and the thrust hysteresis are INERT`）；②**加守卫（Option B）**：在 [`pipeline/tests/test_blend_dump_overrides.py`](file:///home/stone/Work/github/quant/pipeline/tests/test_blend_dump_overrides.py) 中新增 `test_no_brittle_line_numbers_in_docstring_or_warning_text`（正则断言文案 0 硬编码行号）与 `test_warning_text_structural_symbols_exist_in_blend_base`（Python AST 解析断言告警引用的所有类名、方法名、参数名和分支字符串字面量 100% 存在），使文案与代码结构强绑定，杜绝文案撒谎。
 - **实证（用投毒 `uv` 垫片记录 argv、不真跑）**：一次完整的 `--weighting-mode rolling_ic_ir` + `--no-orthogonalization` 运行后，6 个 blend dump 的 sha256 与运行前**完全相同**（`27f374c5…a8e7`）。记录的批跑 argv：默认运行 `--strategies-glob …/strategy_dumps/*blend*.json` 且**无** `--strategy-params`；覆盖运行时 `--strategies-glob …/_strategy_dumps_override/*blend*.json` + `--strategy-params {...}`。
 - **可复现性代价（明写，免得下一个人以为是坏掉）**：复现旧的 `rolling_ic_ir` 全量盖戳，现在**必须显式**传 `--weighting-mode rolling_ic_ir`。以前"跑一次批跑就顺手改坏实盘"是免费副作用，现在需要一条明确的命令行。
-- **披露：`run_blend_cross_matrix.py` 的连带影响**。[`pipeline/scripts/run_blend_cross_matrix.py`](file:///home/stone/Work/github/quant/pipeline/scripts/run_blend_cross_matrix.py)（**≈`:415-424`**）**总是**显式传 `--weighting-mode` / `--enable-orthogonalization`，因此每个 matrix round 现在会多生成一份覆盖副本，且当请求模式 ≠ cfsb 钉住值时**会打印上述警告**。这是**正确行为**（研究实验本来就在探索别的模式，就该被告知自己在覆盖例外），但会让输出更吵、磁盘占用增加。其 `--weighting-mode` 的默认值是否应该改成"不传"（即默认继承各策略配置），**值得其所有者另立任务复核**——本节不擅自改动，因为那会改变既有 matrix 实验的可比性。
+- **披露：`run_blend_cross_matrix.py` 的连带影响**。[`pipeline/scripts/run_blend_cross_matrix.py`](file:///home/stone/Work/github/quant/pipeline/scripts/run_blend_cross_matrix.py)（**≈`:415-424`**）**总是**显式传 `--weighting-mode` / `--enable-orthogonalization`，因此每个 matrix round 现在会多生成一份覆盖副本，且当请求模式 ≠ cfsb 钉住值时**会打印上述警告**。这是**正确行为**（研究实验本来就在探索别的模式，就该被告知自己在覆盖例外），但会让输出更吵、磁盘占用增加。其 `--weighting-mode` 的默认值是否应该改成"不传"（即默认继承各策略配置），**值得其所有者另立任务复核**——本节不擅自改动，因为那会改变既有 matrix 实验的可比性。**（2026-10-24 已由 `B6.1` 落地收口（commit 待提交）：原文「总是显式传」描述的是 `B6.1` 之前的实现 —— `--weighting-mode` 与 `--enable-orthogonalization` 两个 CLI 默认值已改为 `None`，默认路径不再向下游下传 ⇒ 零覆盖副本、零钉住例外告警；本段原文引用的 ≈`:415-424` 行号已随该次重构漂移，现行定义见 `run_blend_cross_matrix.py` 的 `parse_args`（`:253` / `:265`），下传分支见 `:451` / `:453`。详见 §20.9.2。）**
 
 #### 20.6 新增护栏（防止再犯）
 
@@ -3264,3 +3264,67 @@ exit: 1
 - **以上全部不涉及 `version` / `BASE_VERSION`**。理由（按 `AGENTS.md` 第 7 条，不升版必须写明实体理由，不能只写"没升"）：本节的改动全部落在**交付链**上——`strategies_config.json`（未改）、`pipeline/scripts/*.sh`（wrapper）、新增 `pipeline/scripts/blend_dump_overrides.py`、新增两份测试。**没有一行改动触及任何策略类的信号计算、参数默认值或子策略组成**；`blend_base.py` 与 `common/allocation_templates.py` 本节零改动。`base_version` 仍为 **1.6.0**，cfsb 的 `version` 仍为 **1.2.1**。
 - **因而不触发的四项联动义务**：①不递增任何 `version` / `BASE_VERSION`；②不改 `test_blend_strategy_versioning.py` / `test_strategy_versioning.py` 的断言；③`--dump-strategies` 的重跑**目的不是升版**，而是**把被外部脚本改坏的产物恢复成配置事实**（§20.4），恢复前后 58 个文件的 `strategy_version` / `base_version` 全部不变；④实盘票据的 `strategy_version` / `base_version` 不变。
 - **一句话总结本节的性质**：这不是一次策略变更，是一次**产物被外部脚本越权改写**的事故；修的也不是策略，是**谁有权写产物**。
+
+---
+
+#### 20.9 事故衍生四项任务闭环记录 (`P1.8`, `B6.1`, `B6.2`, `B6.3`) (2026-10-24)
+
+本节记录 2026-10-24 派生自实盘 dump 漂移事故的 4 项工程加固与防漂移任务的全部落地闭环：
+
+##### 20.9.1 `P1.8` 实盘票据生成前的 dump↔config 一致性体检与 strict 模式解析
+- **解决的痛点**：实盘三入口（`run_live_strategy.py`、`check_live_portfolio_health.py`、`run_live_multi_strategy.py`）直接加载 dump JSON 文件而从不回读 `strategies_config.json`，存在产物漂移引发静默换轨的严重漏洞。
+- **核心实现**：
+  1. 新增 [`scripts/live_preflight.py`](file:///home/stone/Work/github/quant/scripts/live_preflight.py)，提供 `verify_live_strategy_dump_preflight` 与 `LiveDumpPreflightError`。
+  2. 严格核验两处容器：`params.blend_weighting_mode` 与 `research_strategy_spec.entry_data.parameters.blend_weighting_mode` 必须**两者同时**等于 `strategies_config.json` 对应策略的钉住值，任意容器不符或缺失策略条目即 Fail-Fast。
+  3. 报错信息精准点名：**冲突取值、策略键名、Dump 文件路径与 Config 文件路径**四要素。
+  4. 显式放行开关：在三大入口统一引入 CLI 参数 `--allow-weighting-mode-override`，支持操作员显式探索非钉住模式；健康检查脚本支持在 Stage 1 自动拉起 Stage 2 时穿透下传该参数。
+  5. **放行范围（2026-10-24 所有者裁决 A，收口原先遗留的自定义文件逃生口问题）**：override **只**豁免两件事 —— ①钉住值不符；②策略键**不在** `strategies_config.json` 中（此前自定义 `--strategy-file` 走这条分支时**没有任何逃生口**，只能去改配置）。②的豁免**绝不静默**：每个未注册键每次运行打印**一次**响亮 stderr 警告，点名策略键、配置文件路径、`EXPLORATION / 探索` 性质，并明写「pinned 权重模式校验**未发生**」。override **不**豁免：dump JSON 不可读/非对象、无法识别的 dump（无 `strategy_key`/`template_name`）、已注册策略但 `params.blend_weighting_mode` 整体缺失（不存在"被覆盖的请求值"）。三大入口的 `--help` 同步改为同一措辞（"EXPLORATION ONLY … Do NOT archive the resulting run as a live ticket"）。因此：**未注册的自定义策略文件默认仍 fail-fast，只有显式加 override 才放行，且必定带警告。**
+  6. 静态模板豁免：自动识别静态资产配置模板名及其别名（`_STATIC_TEMPLATE_NAMES` 实际含 10 个模板名 `equal_weight` / `inverse_volatility` / `cross_sectional_momentum` / `hierarchical_risk_parity` / `dual_momentum` / `max_diversification` / `mean_reversion` / `minimum_variance` / `breadth_gated_momentum` / `momentum`，加 3 个别名 `hrp` / `inv_vol` / `ew`），不进行策略配置强校验。**据实更正**：`risk_parity` **不在**该集合中 —— 它只是 `HierarchicalRiskParityAllocation` 的因子归类标签（见 [`common/strategy_aspects.py`](file:///home/stone/Work/github/quant/common/strategy_aspects.py) 的 `"risk_parity"` 键），**不是** `common/allocation_templates.py` 里的模板名/别名，故不加入集合（加进去会把一个未注册的策略键静默放行）；HRP 的别名只有 `hrp`。
+  7. 严格模式读取：在 `check_live_portfolio_health.py` 中，针对 blend 策略强制要求存在 `blend_weighting_mode`，**已注册策略缺失该键即直接抛出 `LiveDumpPreflightError`（即使加了 `--allow-weighting-mode-override` 也不放行 —— 没有"被覆盖的请求值"）**，杜绝旧逻辑中静默 fallback 至 `"rolling_ic_ir"` 的隐性缺陷。**唯一例外（2026-10-24 裁决 A 的落地补记）**：未注册策略经 `--allow-weighting-mode-override` 放行时，报告不再伪造默认值，改写 `weighting_mode = null` 且 `weighting_mode_verified = false`（同时保留响亮 stderr 警告）；已注册路径的 `weighting_mode` 真值与 `weighting_mode_verified = true` 保持原样。**第三种状态（2026-10-24 所有者复审 Step 0 补记）**：已注册策略的 dump 与钉住值**不符**、却被 `--allow-weighting-mode-override` 放行时，`weighting_mode` **保留 dump 的真实取值**（不置空），但 `weighting_mode_verified = false` **且** `weighting_mode_mismatch_overridden = true`，并打印一次点名「dump 取值 vs 钉住取值」的 stderr 警告 —— 修掉了「钉住值明确否决了该模式，产物却标注 `verified: true`」这一自相矛盾。控制台与 Markdown 侧渲染为 `<mode> [UNVERIFIED: pinned-mode mismatch overridden]`，不再打印裸模式。据此三态为：健康已注册 → `真值` + `true`；未注册 + override → `null` + `false`（`mismatch_overridden=false`）；已注册不符 + override → `dump 真值` + `false` + `mismatch_overridden=true`；静态模板维持既有 `rolling_ic_ir` + `true` 旧口径（历史豁免，未在本轮改动）。
+
+##### 20.9.2 `B6.1` 跨消融矩阵脚本默认值复核与策略配置继承
+- **解决的痛点**：`run_blend_cross_matrix.py` 此前强制默认传入 `--weighting-mode regime_ic_ir_hybrid` 与 `--enable-orthogonalization true`，导致每一轮矩阵批跑均生成覆盖副本，并对另外 5 个钉在 `rolling_ic_ir` 的 blend 策略产生大量虚假告警噪声。
+- **采纳方案 (A) 策略配置继承落地**：
+  1. 在 [`pipeline/scripts/run_blend_cross_matrix.py`](file:///home/stone/Work/github/quant/pipeline/scripts/run_blend_cross_matrix.py) 中，将 `--weighting-mode` 与 `--enable-orthogonalization` 的 CLI 默认值重构为 `None`。
+  2. 默认路径下（取值为 `None`），不向下游包装脚本传递两参数，各 blend 策略**完全继承**其在配置/dump 中的钉住值（零多余副本、零虚假告警，cfsb 天然保持 `regime_ic_ir_hybrid`，其余 5 个 blend 天然保持 `rolling_ic_ir`）。
+  3. 仅在调用方显式传入具体参数时，才向下游下传并触发针对钉住例外的覆盖报告与告警。
+  4. 同步更新 `--help` 文档与运行时 Banner，明示 `<inherited from strategy dumps>` 语义；在 [`pipeline/tests/test_run_blend_cross_matrix_defaults.py`](file:///home/stone/Work/github/quant/pipeline/tests/test_run_blend_cross_matrix_defaults.py) 中补充 5 项单测断言全绿通过。
+
+##### 20.9.3 `B6.2` `FastBacktestResult` 全量写路径与 `copy()` 守卫补全
+- **解决的痛点**：`B5.3` 仅拦截了读路径，但 `FastBacktestResult` 继承自 `dict`，其写路径（`__setitem__`, `setdefault`, `update`, `pop`）仍可注入未移植指标键，且 `res.copy()` 会静默脱落守卫类型、退化为普通 `dict`。
+- **采纳方案 (A) 关闭已识别的绕行路径（残留 `|=` 见第 4 条，不声称"全路径"）**：
+  1. 在 [`common/allocation_backtester_fast.py`](file:///home/stone/Work/github/quant/common/allocation_backtester_fast.py) 中，`FastBacktestResult` 全量重载 `__init__`、`__setitem__`、`setdefault`、`pop`，只要涉及 `UNPORTED_PRODUCTION_KEYS`，一律显式抛出 `NotImplementedError`。
+  2. `update()` 方法实现**原子化预检查**：在做任何变更前预检所有键，只要包含任一未移植键，立即抛出 `NotImplementedError` 且**不产生任何部分写入**。
+  3. `copy()` 与 `__copy__()` 均显式返回 `FastBacktestResult(super().copy())`（**不是** `FastBacktestResult(self)` —— 先做 `dict` 的浅拷贝再包一次，避免 `__init__` 的 `update` 又走一遍守卫、也避免把自身当映射再迭代一次），确保浅拷贝后守卫类型与防御规则不脱落。
+  4. **已知残留绕过（B6.2 范围之外，未加固，勿读作"全路径守卫"）**：`res |= other`（`dict.__ior__` 走 C 层 `PyDict_Merge`，不经过被重载的 `__setitem__`/`update`）仍可把未移植键写进实例。`FastBacktestResult.fromkeys(...)` **经实测并不绕过**（CPython 对 dict 子类在 `dict_fromkeys_impl` 中走 `PyObject_SetItem`，实测 3.11.15 / 3.12 均抛 `NotImplementedError`），此前怀疑不成立，此处据实记录、不加守卫。
+  5. 在 [`common/tests/test_allocation_backtester_fast.py`](file:///home/stone/Work/github/quant/common/tests/test_allocation_backtester_fast.py) 中新增 4 项测试函数，断言写路径拦截、原子性预检、拷贝类型持久性与合法键正常读写全部通过。
+
+##### 20.9.4 `B6.3` 告警文本硬编码行号去脆化与 AST 结构符号守卫
+- **解决的痛点**：§20.5 已知脆弱点指出的告警文本硬编码 `blend_base.py:445`、`:465`、`:522-529` 等行号，容易在后续代码重构时产生文案漂移与文案撒谎。
+- **采纳方案 (A+B) 组合清偿技术债**：
+  1. **Option A（去硬编码行号）**：在 [`pipeline/scripts/blend_dump_overrides.py`](file:///home/stone/Work/github/quant/pipeline/scripts/blend_dump_overrides.py) 中，全面废除模块 docstring 与 `format_pinned_exception_warning()` 警告字符串中的具体行号，改为指向精准类与方法符号：`BaseBlendAllocationStrategy._compute_adaptive_weights in blend_base.py takes the 'rolling_ic_ir' early-return branch before the 'regime_adaptive' / 'regime_ic_ir_hybrid' branch, so the bucket_renorm_max_delta clamp and the thrust hysteresis are INERT`。
+  2. **Option B（加 AST 存在性守卫）**：在 [`pipeline/tests/test_blend_dump_overrides.py`](file:///home/stone/Work/github/quant/pipeline/tests/test_blend_dump_overrides.py) 中新增测试：
+     - `test_no_brittle_line_numbers_in_docstring_or_warning_text`：正则扫描断言文案与 docstring 中 0 处出现 `blend_base.py:\d+` 或 `:\d{3,}`。
+     - `test_warning_text_structural_symbols_exist_in_blend_base`：以 Python `ast.parse` 解析 `blend_base.py`，机械断言类 `BaseBlendAllocationStrategy`、方法 `_compute_adaptive_weights`、参数 `bucket_renorm_max_delta` 以及分支字符串字面量 `rolling_ic_ir`、`regime_adaptive`、`regime_ic_ir_hybrid` 100% 存在，并断言告警文案精准引用这些符号。
+  3. §20.5 声明的技术债彻底全额清偿。
+
+##### 20.9.5 测试验证与版本轴判定
+- **离线测试套件全绿**：
+  - `common/tests/test_live_dump_preflight.py`（**26 passed**；覆盖三态、override 逃生口（含未注册键与**已注册不符**两种响亮警告）、不可覆盖的三类硬失败、警告去重、三入口 CLI 串联与静默通过，以及 Stage 1 报告对未验证模式的**诚实落盘**（未注册 → `weighting_mode=null` + `weighting_mode_verified=false`；已注册不符 + override → dump 真值 + `verified=false` + `weighting_mode_mismatch_overridden=true`）与已注册健康路径的真值/`true`。全部 dump 夹具在 `tmp_path` **现场合成**，不读任何 git-ignored 产物 —— 修掉了此前"只在跑过 `--dump-strategies` 的机器上才绿"的干净克隆依赖）
+  - `common/tests/test_allocation_backtester_fast.py`（29 passed）
+  - `pipeline/tests/test_run_blend_cross_matrix_defaults.py`（14 passed）
+  - `pipeline/tests/test_blend_dump_overrides.py`（15 passed）
+  - 四套件共 **84 passed**，100% 离线通过，0 失败。
+- **版本轴判定（遵照 `AGENTS.md` §7）**：
+  - 本次 4 项任务全部分布在运行时预检门禁、批量回测调度器默认值、快速内核包装类守卫以及告警文案去脆化上；
+  - 零策略核心信号计算变动、零策略超参默认值变动、零底座算法变更（`blend_base.py` 与 `common/allocation_templates.py` 算法代码 0 变动）；
+  - 因此不触发版本升级，`BaseBlendAllocationStrategy.BASE_VERSION` 保持 **`1.6.0`**，具体策略版本（如 cfsb 的 **`1.2.1`**）保持不变。
+
+##### 20.9.6 本轮复审新开的 3 项后续任务（**仅登记，未实施**）
+> 状态声明：本节三项均为独立复核（2026-10-24）发现的缺口，已在 [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) 以 `[ ]` 新开任务行登记，**本轮零代码、零闭环、零版本轴变动**；勿把它们读作已完成项，也不得据此认为「Track P / Track B 仍然 100%」。
+
+1. **`P1.9`（§2.8，Tier P3）静态模板名与配置键撞名导致 preflight 静默旁路**：`scripts/live_preflight.py` 的 `_STATIC_TEMPLATE_NAMES` 含 `dual_momentum`，而 `strategies_config.json` 的 58 个顶层键中**确实存在同名策略键** `dual_momentum`（实测为唯一撞名者）。`verify_live_strategy_dump_preflight` 在加载配置**之前**就以 `is_static_template(key)` 早退（`:202`），故以该键为名的 dump **永远进不到钉住值比对**。今日之所以无实害：`dual_momentum` 的 `parameters` 无 `blend_weighting_mode` 可钉，即使不早退也会走 `pinned_mode is None` 放行 —— 这是一条**等待被触发的**静默旁路。处置二选一：改「静态模板名 + 配置键」双向判定，或加撞名冲突断言。前置 `P1.8`。
+2. **`P1.10`（§2.8，Tier P4）preflight 执行位置不一致**：`scripts/run_live_strategy.py` 把 preflight 放在 **`parse_args()`**（`:1006`，实际调用 `:1229`）内，使「解析命令行」带上磁盘 I/O 与 fail-fast 副作用；而 `check_live_portfolio_health.py`（`:1203`）与 `run_live_multi_strategy.py`（`:413`）都在 **`main()`** 内执行。须收口到 `main()`，且**保持「出票前失败」语义不变**（顺序仍须早于任何票据写出）。前置 `P1.8`。
+3. **`B6.4`（§2.10，Tier P5）`FastBacktestResult.__ior__` 缺口**：`res |= {...}` 走继承来的 `dict.__ior__`（C 层合并），**不经过**被重载的 `__setitem__`/`update`。实测（CPython 3.11.15）：`r |= {'cash_carry_report': 1}` 之后 `dict.__contains__(r, 'cash_carry_report')` 为 `True`、`dict.get(...)` 为 `1`，即未移植键**确实被写入**；而随后的 `r[...]` / `... in r` 仍抛 `NotImplementedError`，形成「写进去了但读不到」。**勿重复的误判**：`fromkeys()` 在 3.9/3.10/3.11/3.13/3.14 上均命中守卫而抛错，**不是**绕过路径。处置二选一：补 `__ior__`，或用测试 + 文档把该缺口立为正式契约（现状仅有 docstring 披露、**无测试守卫**）。前置 `B6.2`。
+
+**台账影响（已与 `docs/development_plan.md` §二 头部一致）**：现役 **76 → 79**（`[x]` 63 不变 / `[ ]` 13 → 16），两文件合计 **142 → 145**（`66 + 63 + 16`），子表 **`7/5/10/20/37 = 79`**；归档仍 **66**、未改写任何归档行。Track P 口径由 8/8 改为 **8/10**，Track B 由 19/19 改为 **19/20**，`Tier P4` 因 `P1.10` 不再声称「全部清零」。
