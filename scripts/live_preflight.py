@@ -25,8 +25,8 @@ prints a loud one-time stderr warning saying the pinned-mode check did NOT run. 
 a malformed/non-object dump, an unidentifiable dump (no key at all), or a registered strategy whose
 `params` carries no `blend_weighting_mode`.
 
-Static-template exemption (P1.9 / 2026-10-24)
---------------------------------------------
+Static-template exemption (P1.9 / 2026-10-24, second pass)
+--------------------------------------------------------
 Static basket allocation templates are not declared in `strategies_config.json`, so they have no
 pin to verify and are exempt. That exemption used to be a bare name-membership test
 (`is_static_template`) applied in THIS module and at all three live call sites -- but
@@ -34,10 +34,38 @@ pin to verify and are exempt. That exemption used to be a bare name-membership t
 template name and the top-level key of the "Active Dual Momentum GTAA" research entry. A research
 dump keyed `dual_momentum` therefore skipped the pinned-mode gate entirely -- harmless today (that
 entry pins no `blend_weighting_mode`) but a silent bypass waiting for a pin.
-`is_static_template_exempt` now owns the rule: a name is exempt iff it is a static template name
-AND (it is NOT a `strategies_config.json` key OR the dump carries no `research_strategy_spec`).
-Config membership wins, and the presence of `research_strategy_spec` is the identity signal that
-separates a genuine static template from a research strategy that merely shares the name.
+
+The first pass (option C) exempted a static name when the dump "carried no
+`research_strategy_spec`", tested with `bool(strategy_def.get("research_strategy_spec"))` and
+applied as `exempt(key) or exempt(template_name)`. That was too weak in four ways, all measured:
+a dump with the spec key DELETED, with `spec: {}`, or with a spec whose `strategy_key` was absent
+still looked spec-less; a non-dict spec raised `AttributeError` instead of a diagnosable refusal;
+and ANY static-looking `template_name` (e.g. `equal_weight`, `hrp`) shielded a spec-bearing
+research dump -- even though `common/strategy_spec.py::get_template` gives
+`research_strategy_spec` precedence over `template_name`, i.e. the RESEARCH engine ran while the
+gate certified the dump as a static template.
+
+The rule enforced now (second pass) is:
+
+1. `research_strategy_spec` is parsed and TYPE-CHECKED once, before anything dereferences it.
+   Key absent -> `spec = None`. Key present but not a JSON object -> `LiveDumpPreflightError`
+   (never a traceback, never overridable: a malformed spec is indistinguishable from a stripped
+   one, so treating it as "no spec" would re-open the exemption).
+2. SPEC PRESENCE DECIDES IDENTITY, and a spec-bearing dump is NEVER static-exempt. Its identity
+   is `spec["strategy_key"] or strategy_key or template_name`; `template_name` can no longer
+   shield it because the exemption is not consulted at all.
+3. A no-spec dump is exempt only when EVERY name it carries (`template_name`, `strategy_key`) is
+   a static template name AND is NOT a key of `strategies_config.json`. Config membership wins:
+   a no-spec dump whose name collides with a config key is CHECKED, not exempted -- the only safe
+   reading, since a stripped spec is indistinguishable from the genuine static template. Concretely
+   the genuine static `dual_momentum` template is UNREACHABLE through the live resolver anyway
+   (`resolve_strategy_definition` matches the config key first and synthesises a
+   `research_strategy_spec`), and if that entry were ever pinned, such a dump is now checked
+   rather than trusted.
+4. `is_static_template()` itself is untouched: the 13 names and the `momentum` / `hrp` / `inv_vol`
+   / `ew` aliases stay byte-identical (an existing test pins them). A CHECKED strategy that pins
+   no `blend_weighting_mode` still returns `verified=True` -- being checked is not the same as
+   being suspect.
 """
 
 import json
@@ -206,46 +234,57 @@ def _config_strategy_keys(cfg_file: Optional[str] = None) -> frozenset:
     return cached
 
 
-def is_static_template_exempt(
-    name: Optional[str],
-    config_keys: frozenset,
-    has_research_spec: bool = False,
-) -> bool:
-    """Return True if `name` may SKIP the pinned-weighting-mode pre-flight.
+def is_static_template_exempt(name: Optional[str], config_keys: frozenset) -> bool:
+    """Return True if this SINGLE name may skip the pinned-weighting-mode pre-flight.
 
-    (P1.9 / 2026-10-24, owner-selected rule option C) The rule is a conjunction:
+    (P1.9 second pass / 2026-10-24) The predicate is deliberately one name wide and has no
+    "has a research spec" argument: whether an exemption applies AT ALL is decided by spec
+    presence in `verify_live_strategy_dump_preflight` (a spec-bearing dump is never exempt),
+    so that conflation cannot creep back in here.
 
-    1. `name` must be a static basket template name (`is_static_template`, unchanged --
-       the 13 names plus the `momentum` / `hrp` / `inv_vol` / `ew` aliases stay exactly
-       as they were), AND
-    2. it must NOT be a top-level key of `strategies_config.json`, OR the dump must carry
-       no `research_strategy_spec` at all.
+    A name is exempt iff:
+    1. it is a static basket template name (`is_static_template` -- the 13 names plus the
+       `momentum` / `hrp` / `inv_vol` / `ew` aliases, unchanged), AND
+    2. it is NOT a top-level key of `strategies_config.json`.
 
-    Why config membership has to win: `dual_momentum` is a genuine static template AND a
-    real config key. A research dump for that key identifies itself via
-    `research_strategy_spec`; exempting it on the name alone left the pinned-mode gate
-    with a hole (silent today, fatal the day that entry pins a mode). The reverse case --
-    a config key with no `research_strategy_spec` in the dump -- is the hand-written
-    payload shape `resolve_strategy_definition` emits for a plain static template, so it
-    must keep skipping (no pin exists to verify).
+    Why config membership wins (#2): `dual_momentum` is simultaneously a genuine static
+    template name and a real config key. Exempting it on the name alone left the pinned-mode
+    gate with a hole -- first for spec-bearing dumps (P1.9 first pass), then for dumps whose
+    spec had been stripped/emptied (`{}`, deleted key, missing `strategy_key`). A stripped spec
+    is indistinguishable from the genuine static payload, so the safe reading is:
+    a colliding name is CHECKED. The genuine static `dual_momentum` template cannot reach the
+    live scripts anyway -- `resolve_strategy_definition` matches the config key first and
+    synthesises a `research_strategy_spec` -- and if that entry were ever given a
+    `blend_weighting_mode`, this predicate now refuses to trust it.
 
     Args:
-        name: Strategy key or `template_name` from the dump.
-        config_keys: Top-level keys of the configuration being consulted -- pass the set
-            of the already-loaded config when available, else `_config_strategy_keys()`.
-        has_research_spec: True when the dump carries a truthy `research_strategy_spec`.
+        name: A `template_name` or `strategy_key` from the dump.
+        config_keys: Top-level keys of the configuration being consulted.
 
     Returns:
-        True only for the "genuine static template, nothing to pin" case.
+        True only for "static template name that owns no config entry".
     """
     if not is_static_template(name):
         return False
     # Same normalisation as `is_static_template`, so the config lookup cannot disagree
     # with the name test (e.g. " Dual_Momentum ").
     canonical = name.strip().lower()  # type: ignore[union-attr]
-    if canonical not in config_keys:
-        return True
-    return not has_research_spec
+    return canonical not in config_keys
+
+
+def _nested_dict_get(container: Any, *keys: str) -> Any:
+    """Walk `keys` through nested dicts; return None at the first absent key or non-dict.
+
+    Used for dump-container reads (`params`, `research_strategy_spec.entry_data.parameters`)
+    so that a malformed nested container degrades to "key missing" (a diagnosable drift)
+    instead of raising `AttributeError` out of the pre-flight gate.
+    """
+    cur = container
+    for k in keys:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    return cur
 
 
 def verify_live_strategy_dump_preflight(
@@ -269,18 +308,19 @@ def verify_live_strategy_dump_preflight(
             IS registered but has no `params.blend_weighting_mode` at all.
 
     Raises:
-        LiveDumpPreflightError: If strategy key is missing in config (without the
-            override), if the dump is malformed/unidentifiable, or if
-            blend_weighting_mode does not match the pinned configuration.
+        LiveDumpPreflightError: If the dump is malformed (non-object dump, non-object
+            `research_strategy_spec`), unidentifiable, its key is missing from the config
+            (without the override), or `blend_weighting_mode` does not match the pinned
+            configuration. None of the first three are overridable.
 
     Returns:
         PreflightVerdict: `verified=True` when a pinned value was compared and agreed (or
-        there was no pin to compare, e.g. a static template / non-blend strategy). For the
-        two override paths `verified=False`, with `mismatch_overridden` telling them apart:
-        True for a registered pin that disagreed and was overridden (nothing authorised the
-        dump's mode), False for a key absent from `strategies_config.json` (nothing could
-        be compared at all). Callers that persist `weighting_mode` into a report must
-        publish these facts instead of implying the mode was verified.
+        there was no pin to compare, e.g. a genuine static template / non-blend strategy).
+        For the two override paths `verified=False`, with `mismatch_overridden` telling them
+        apart: True for a registered pin that disagreed and was overridden (nothing
+        authorised the dump's mode), False for a key absent from `strategies_config.json`
+        (nothing could be compared at all). Callers that persist `weighting_mode` into a
+        report must publish these facts instead of implying the mode was verified.
     """
     if not isinstance(strategy_def, dict):
         # An unreadable/malformed dump is never an "explore something else" situation --
@@ -293,12 +333,33 @@ def verify_live_strategy_dump_preflight(
             f"--allow-weighting-mode-override."
         )
 
-    key = (
-        strategy_key
-        or strategy_def.get("research_strategy_spec", {}).get("strategy_key")
-        or strategy_def.get("template_name")
-    )
+    # (P1.9 second pass / 2026-10-24) The spec container is parsed and TYPE-CHECKED exactly
+    # once, here, BEFORE anything dereferences it. Key absent -> no spec. Key present but not
+    # a JSON object -> a diagnosable refusal, NEVER a traceback and never overridable: an
+    # unreadable spec is indistinguishable from a stripped one, so treating it as "no spec"
+    # would let the very exemption this module exists to close reappear.
+    spec_raw = strategy_def.get("research_strategy_spec")
+    if "research_strategy_spec" in strategy_def and not isinstance(spec_raw, dict):
+        raise LiveDumpPreflightError(
+            f"Live strategy dump pre-flight check failed: 'research_strategy_spec' in dump "
+            f"'{strategy_file or strategy_def.get('strategy_file') or 'strategy.json'}' is "
+            f"{type(spec_raw).__name__}, not a JSON object. A malformed research_strategy_spec "
+            f"cannot be overridden by --allow-weighting-mode-override: it cannot be told apart "
+            f"from a stripped/empty spec, so accepting it as 'no spec' would silently exempt a "
+            f"research dump from the pinned-weighting-mode check."
+        )
+    spec = spec_raw if isinstance(spec_raw, dict) else None
+    spec_present = spec is not None
     template_name = strategy_def.get("template_name")
+
+    if spec_present:
+        # Spec presence decides IDENTITY and a spec-bearing dump is never static-exempt, so
+        # `template_name` cannot shield it (the first pass's `or` let `template_name:
+        # equal_weight` / `hrp` certify a research dump whose research engine actually ran --
+        # `common/strategy_spec.py::get_template` gives research_strategy_spec precedence).
+        key = spec.get("strategy_key") or strategy_key or template_name
+    else:
+        key = strategy_key or template_name
 
     # Determine dump file display name for diagnostic error messages
     if strategy_file and str(strategy_file).endswith(".json"):
@@ -330,18 +391,23 @@ def verify_live_strategy_dump_preflight(
             f"dump cannot be overridden by --allow-weighting-mode-override."
         )
 
-    # (P1.9 / 2026-10-24) Static-template exemption, evaluated AFTER the config load so the
-    # collision case can be decided honestly: a name must be a static template name AND
-    # either absent from the config keys or a dump with no `research_strategy_spec`.
-    # Pre-P1.9 this was a bare name test placed BEFORE the config load, so a research dump
-    # keyed `dual_momentum` (a real config key sharing the name) never reached the pin.
+    # (P1.9 second pass / 2026-10-24) Static-template exemption, decided AFTER the config
+    # load (config membership is one of its two inputs) and ONLY for spec-less dumps:
+    #
+    #   * spec present  -> NEVER exempt, whatever the names say (the research engine runs);
+    #   * spec absent   -> exempt only when EVERY name the dump carries is a static template
+    #                      name that owns no config key. Using `all()` (not `any()`) is the
+    #                      safe direction: a dump mixing a static-looking name with a
+    #                      config-key name is ambiguous, so it gets CHECKED.
+    #
     # The key set is reused from the config already in memory -- one read, one owner.
     config_keys = frozenset(cfg_data.keys()) if isinstance(cfg_data, dict) else frozenset()
-    has_research_spec = bool(strategy_def.get("research_strategy_spec"))
-    if is_static_template_exempt(key, config_keys, has_research_spec) or is_static_template_exempt(
-        template_name, config_keys, has_research_spec
-    ):
-        return PreflightVerdict(verified=True)
+    if not spec_present:
+        absent_spec_names = [n for n in (template_name, strategy_key) if n]
+        if absent_spec_names and all(
+            is_static_template_exempt(n, config_keys) for n in absent_spec_names
+        ):
+            return PreflightVerdict(verified=True)
 
     if key not in cfg_data:
         if not allow_override:
@@ -366,12 +432,15 @@ def verify_live_strategy_dump_preflight(
         # Strategy does not pin a blend_weighting_mode (e.g. non-blend research strategy)
         return PreflightVerdict(verified=True)
 
-    dump_mode = strategy_def.get("params", {}).get("blend_weighting_mode")
+    # (P1.9 second pass) Both containers are read from the ALREADY-VALIDATED spec and via a
+    # dict-safe walk: a malformed spec/entry_data must never surface as `AttributeError`
+    # (rule: the spec type is validated before anything dereferences it, including this
+    # comparison and including the case where a decisive `params` mismatch already exists).
+    dump_mode = _nested_dict_get(strategy_def.get("params"), "blend_weighting_mode")
     spec_mode = (
-        strategy_def.get("research_strategy_spec", {})
-        .get("entry_data", {})
-        .get("parameters", {})
-        .get("blend_weighting_mode")
+        _nested_dict_get(spec, "entry_data", "parameters", "blend_weighting_mode")
+        if spec_present
+        else None
     )
 
     # A registered strategy whose dump has NO `params.blend_weighting_mode` is not a

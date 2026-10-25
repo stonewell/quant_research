@@ -22,10 +22,13 @@ Validates:
 8. Static basket allocation templates (equal_weight, hrp, etc.) pass silently.
 9. Single-asset timing / non-blend strategies without pinned mode pass silently.
 10. End-to-end CLI integration in run_live_strategy.py, check_live_portfolio_health.py, and run_live_multi_strategy.py.
-11. (P1.9, 2026-10-24) The static-name COLLISION: `dual_momentum` is both a static template
-    name and a `strategies_config.json` key, so the old bare name test exempted a research dump
-    keyed `dual_momentum` from the pinned-mode gate. Config membership now wins
-    (`is_static_template_exempt`), while a dump with no `research_strategy_spec` still skips.
+11. (P1.9, 2026-10-24, two passes) The static-name COLLISION: `dual_momentum` is both a static
+    template name and a `strategies_config.json` key. The first pass closed only the spec-present
+    path; the second closes the four remaining shapes (stripped/empty spec, non-dict spec crash,
+    `template_name` shields, blank `template_name` + config-key `strategy_key`) and pins all 13
+    shapes as a parametrised probe. Spec presence now decides identity: a spec-bearing dump is
+    never static-exempt, and a no-spec dump is exempt only when every name it carries is a
+    static name that owns no config key.
 """
 
 import copy
@@ -413,13 +416,23 @@ def test_static_template_passes_silently(capsys):
 
 
 # ---------------------------------------------------------------------------
-# P1.9 (2026-10-24): closing the static-name COLLISION bypass.
+# P1.9 (2026-10-24, TWO passes): closing the static-name exemptions.
 #
 # `_STATIC_TEMPLATE_NAMES` and `strategies_config.json` share exactly one name:
-# `dual_momentum` (static template / "Active Dual Momentum GTAA" research entry). The old
-# exemption was a bare name test applied before the config was even loaded, so a research
-# dump keyed `dual_momentum` skipped the pinned-weighting-mode gate outright. Harmless
-# today (that entry pins nothing) -- a silent bypass the day it pins a mode.
+# `dual_momentum` (static template / "Active Dual Momentum GTAA" research entry). The original
+# bypass was a bare name test applied before the config was even loaded. The FIRST fix (spec
+# presence via `bool(...)` + `exempt(key) or exempt(template_name)`) closed only the
+# spec-bearing path and left four shapes open -- measured, and pinned below as a 13-shape probe:
+#
+#   * spec key DELETED / `spec: {}` / spec without `strategy_key` -> looked "spec-less" -> PASSED;
+#   * a non-dict spec -> `AttributeError` (crash, not a refusal);
+#   * a drifting research dump for a pinned key whose `template_name` was `equal_weight` /
+#     `hrp` / any other non-config static name -> PASSED, even though `common/strategy_spec.py::
+#     get_template` gives `research_strategy_spec` precedence (the research engine ran);
+#   * `template_name: ""` + `strategy_key: "dual_momentum"` + drift -> PASSED.
+#
+# The rule now: spec presence decides identity and a spec-bearing dump is NEVER static-exempt; a
+# no-spec dump is exempt only when EVERY name it carries is a static name that owns no config key.
 #
 # Nothing below reads a git-ignored dump or mutates the tracked config: every pinned config
 # is synthesised inside `tmp_path`.
@@ -443,6 +456,13 @@ def _write_collision_config(tmp_path, pinned_mode):
     return str(config_file)
 
 
+def _write_unpinned_config(tmp_path):
+    """Synthesise a config that declares NO static-template name at all."""
+    config_file = tmp_path / "strategies_config.json"
+    config_file.write_text(json.dumps({"some_other_strategy": {}}), encoding="utf-8")
+    return str(config_file)
+
+
 def _colliding_dual_momentum_dump(mode):
     """A RESEARCH dump for the config key `dual_momentum` (identifies itself via the spec)."""
     return {
@@ -457,6 +477,156 @@ def _colliding_dual_momentum_dump(mode):
             },
         },
     }
+
+
+def _without_spec(dump):
+    """The same dump with `research_strategy_spec` stripped -- the `spec` key fully deleted."""
+    return {k: v for k, v in dump.items() if k != "research_strategy_spec"}
+
+
+# (label, payload, strategy_key, config kind, expected error substrings)
+# Shapes 1-6, 9-12 of the probe all MUST raise; 7-8 are the silent-pass shapes below.
+_PROBE_RAISES = [
+    (
+        "1-full-spec-drift",
+        _colliding_dual_momentum_dump("rolling_ic_ir"),
+        None,
+        "pinned",
+        ("rolling_ic_ir", "regime_ic_ir_hybrid"),
+    ),
+    (
+        "2-spec-key-deleted-drift",
+        _without_spec(_colliding_dual_momentum_dump("rolling_ic_ir")),
+        None,
+        "pinned",
+        ("rolling_ic_ir", "regime_ic_ir_hybrid"),
+    ),
+    (
+        "3-empty-spec-dict-drift",
+        {**_colliding_dual_momentum_dump("rolling_ic_ir"), "research_strategy_spec": {}},
+        None,
+        "pinned",
+        ("rolling_ic_ir", "regime_ic_ir_hybrid"),
+    ),
+    (
+        "4-spec-with-only-strategy-key",
+        {
+            **_colliding_dual_momentum_dump("rolling_ic_ir"),
+            "research_strategy_spec": {"strategy_key": "dual_momentum"},
+        },
+        None,
+        "pinned",
+        ("rolling_ic_ir", "regime_ic_ir_hybrid"),
+    ),
+    (
+        "5-spec-with-empty-entry-data",
+        {
+            **_colliding_dual_momentum_dump("rolling_ic_ir"),
+            "research_strategy_spec": {"strategy_key": "dual_momentum", "entry_data": {}},
+        },
+        None,
+        "pinned",
+        ("rolling_ic_ir", "regime_ic_ir_hybrid"),
+    ),
+    (
+        "6a-spec-is-a-string",
+        {**_colliding_dual_momentum_dump("rolling_ic_ir"), "research_strategy_spec": "x"},
+        None,
+        "pinned",
+        ("research_strategy_spec", "cannot be overridden"),
+    ),
+    (
+        "6b-spec-is-a-list",
+        {**_colliding_dual_momentum_dump("rolling_ic_ir"), "research_strategy_spec": []},
+        None,
+        "pinned",
+        ("research_strategy_spec", "cannot be overridden"),
+    ),
+    (
+        "9-strategy-key-none-full-drift-spec",
+        _colliding_dual_momentum_dump("rolling_ic_ir"),
+        None,
+        "pinned",
+        ("rolling_ic_ir", "regime_ic_ir_hybrid"),
+    ),
+    (
+        "10-blank-template-name-plus-config-key",
+        _without_spec({**_colliding_dual_momentum_dump("rolling_ic_ir"), "template_name": ""}),
+        "dual_momentum",
+        "pinned",
+        ("rolling_ic_ir", "regime_ic_ir_hybrid"),
+    ),
+    (
+        "extra-equal-weight-template-name-shield",
+        {**_colliding_dual_momentum_dump("rolling_ic_ir"), "template_name": "equal_weight"},
+        "dual_momentum",
+        "pinned",
+        ("rolling_ic_ir", "regime_ic_ir_hybrid"),
+    ),
+    (
+        "extra-hrp-template-name-shield",
+        {**_colliding_dual_momentum_dump("rolling_ic_ir"), "template_name": "hrp"},
+        "dual_momentum",
+        "pinned",
+        ("rolling_ic_ir", "regime_ic_ir_hybrid"),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "payload,strategy_key,cfg_kind,expected",
+    [(p, k, c, e) for _label, p, k, c, e in _PROBE_RAISES],
+    ids=[label for label, *_rest in _PROBE_RAISES],
+)
+def test_probe_shapes_that_must_raise(tmp_path, payload, strategy_key, cfg_kind, expected):
+    """(P1.9 second pass) 11 shapes: a pinned drift must be refused, never exempted.
+
+    Every shape here PASSED `verified=True` (or crashed with `AttributeError`) before the
+    second pass. `pytest.raises(LiveDumpPreflightError)` also asserts the failure is a
+    diagnosable refusal rather than a traceback.
+    """
+    config_file = (
+        _write_collision_config(tmp_path, "regime_ic_ir_hybrid")
+        if cfg_kind == "pinned"
+        else _write_unpinned_config(tmp_path)
+    )
+    with pytest.raises(LiveDumpPreflightError) as exc_info:
+        verify_live_strategy_dump_preflight(
+            payload,
+            strategy_key=strategy_key,
+            strategy_file=str(tmp_path / "probe_strategy.json"),
+            config_path=config_file,
+        )
+    err_msg = str(exc_info.value)
+    for needle in expected:
+        assert needle in err_msg
+
+
+@pytest.mark.parametrize(
+    "payload,cfg_kind",
+    [
+        ({"template_name": "dual_momentum", "params": {}}, "unpinned"),
+        ({"template_name": "equal_weight", "params": {}}, "pinned"),
+    ],
+    ids=["7-genuine-static-dual-momentum-unpinned", "8-equal-weight-no-spec"],
+)
+def test_probe_shapes_that_must_pass_silently(tmp_path, capsys, payload, cfg_kind):
+    """(P1.9 second pass) 2 shapes: genuine static templates still pass with zero noise."""
+    config_file = (
+        _write_collision_config(tmp_path, "regime_ic_ir_hybrid")
+        if cfg_kind == "pinned"
+        else _write_unpinned_config(tmp_path)
+    )
+    verdict = verify_live_strategy_dump_preflight(
+        payload,
+        strategy_file=str(tmp_path / "static_strategy.json"),
+        config_path=config_file,
+    )
+    assert verdict.verified is True
+    assert verdict.mismatch_overridden is False
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
 
 
 def test_colliding_static_name_with_pinned_mode_runs_preflight_and_catches_drift(tmp_path):
@@ -501,27 +671,29 @@ def test_colliding_static_name_healthy_pinned_value_passes_silently(tmp_path, ca
     assert captured.err == ""
 
 
-def test_genuine_static_dual_momentum_without_spec_still_exempt(tmp_path, capsys):
-    """(P1.9) A GENUINE static `dual_momentum` dump (no spec) keeps skipping the gate.
+def test_genuine_static_dual_momentum_without_spec_still_passes(tmp_path, capsys):
+    """(P1.9 second pass) A spec-less static `dual_momentum` dump still passes -- but WHY differs.
 
-    Two shapes, both must stay exempt: (i) against the tracked config, where
-    `dual_momentum` IS a key but the dump carries no `research_strategy_spec`; (ii)
-    against a config that does not declare the name at all (the ordinary static case).
+    (i) Against the TRACKED config `dual_momentum` IS a config key, so the dump is now
+    CHECKED rather than exempt; it passes only because that entry pins no
+    `blend_weighting_mode` (the no-pin branch returns `verified=True`). This is the honest
+    reading the second pass enforces: a stripped spec is indistinguishable from the genuine
+    static payload, so a colliding name is checked, never trusted.
+    (ii) Against a config that does not declare the name at all (the ordinary static case) it
+    is genuinely exempt.
     """
     genuine = {"template_name": "dual_momentum", "params": {}}
 
-    # (i) tracked config: config membership alone must not break the genuine static path.
+    # (i) tracked config: checked (not exempt), but there is no pin to disagree with.
     verdict = verify_live_strategy_dump_preflight(genuine, strategy_key="dual_momentum")
     assert verdict.verified is True
     assert verdict.mismatch_overridden is False
 
-    # (ii) a config without the key at all -- the pre-existing behaviour.
-    other_config = tmp_path / "strategies_config.json"
-    other_config.write_text(json.dumps({"chan_four_state_blend": {}}), encoding="utf-8")
+    # (ii) a config without the key at all -> genuinely exempt, same observable result.
     verdict = verify_live_strategy_dump_preflight(
         genuine,
         strategy_key="dual_momentum",
-        config_path=str(other_config),
+        config_path=_write_unpinned_config(tmp_path),
     )
     assert verdict.verified is True
     assert verdict.mismatch_overridden is False
@@ -533,12 +705,13 @@ def test_genuine_static_dual_momentum_without_spec_still_exempt(tmp_path, capsys
 
 
 def test_no_static_name_is_exempt_when_shadowed_by_config_key(tmp_path):
-    """(P1.9) Structural: enumerate the 13 static names against the REAL config keys.
+    """(P1.9 second pass) Structural: enumerate the 13 static names against the REAL config.
 
-    Any name that is also a config key must be non-exempt WITH a `research_strategy_spec`
-    and exempt WITHOUT one. The collision set itself is pinned to exactly
-    `{"dual_momentum"}` so a future config/static-name collision cannot slip in unnoticed
-    (a new collision would silently re-open the bypass this task closed).
+    The invariant is now unconditional: a static name that owns a config key is NEVER exempt
+    (spec or no spec) -- the first pass let it be exempt when the spec looked absent, which is
+    exactly the stripped-spec hole. A static name with no config entry stays exempt. The
+    collision set itself is pinned to exactly `{"dual_momentum"}` so a future config/static
+    name collision cannot slip in unnoticed.
     """
     config_keys = live_preflight._config_strategy_keys()
     assert "dual_momentum" in config_keys  # sanity: the loader read the real file
@@ -548,23 +721,43 @@ def test_no_static_name_is_exempt_when_shadowed_by_config_key(tmp_path):
 
     for name in live_preflight._STATIC_TEMPLATE_NAMES:
         if name in config_keys:
-            assert is_static_template_exempt(name, config_keys, has_research_spec=True) is False
-            assert is_static_template_exempt(name, config_keys, has_research_spec=False) is True
+            # Config membership wins, unconditionally: never exempt, with or without a spec.
+            assert is_static_template_exempt(name, config_keys) is False
         else:
-            # No config entry -> nothing to pin, exempt both ways.
-            assert is_static_template_exempt(name, config_keys, has_research_spec=True) is True
-            assert is_static_template_exempt(name, config_keys, has_research_spec=False) is True
+            # No config entry -> nothing to pin, exempt.
+            assert is_static_template_exempt(name, config_keys) is True
 
     # The 4 aliases are NOT config keys, so they stay exempt; and a non-static name is never
     # exempt even when it owns a config entry.
     for alias in ("momentum", "hrp", "inv_vol", "ew"):
-        assert is_static_template_exempt(alias, config_keys, has_research_spec=True) is True
-    assert is_static_template_exempt("chan_four_state_blend", config_keys, has_research_spec=False) is False
+        assert is_static_template_exempt(alias, config_keys) is True
+    assert is_static_template_exempt("chan_four_state_blend", config_keys) is False
     assert is_static_template_exempt(None, config_keys) is False
+    # Normalisation must agree with `is_static_template` (same strip().lower()).
+    assert is_static_template_exempt(" Equal_Weight ", config_keys) is True
+    assert is_static_template_exempt(" DUAL_MOMENTUM ", config_keys) is False
+
+    # Spec presence is decided at the verifier, not in the predicate: a spec-bearing dump is
+    # checked even when every one of its names is a non-config static name.
+    pinned = _write_collision_config(tmp_path, "regime_ic_ir_hybrid")
+    shielded = {
+        "template_name": "equal_weight",
+        "params": {"blend_weighting_mode": "rolling_ic_ir"},
+        "research_strategy_spec": {
+            "strategy_key": "dual_momentum",
+            "entry_data": {"parameters": {"blend_weighting_mode": "rolling_ic_ir"}},
+        },
+    }
+    with pytest.raises(LiveDumpPreflightError):
+        verify_live_strategy_dump_preflight(
+            shielded,
+            strategy_file=str(tmp_path / "shielded_strategy.json"),
+            config_path=pinned,
+        )
 
     # The loader is lazy-cached PER RESOLVED PATH: a synthesised config's key set must not
     # leak into the real one (that would make the gate test-order dependent).
-    synth = tmp_path / "strategies_config.json"
+    synth = tmp_path / "other_config.json"
     synth.write_text(json.dumps({"only_here": {}}), encoding="utf-8")
     assert live_preflight._config_strategy_keys(str(synth)) == frozenset({"only_here"})
     assert "only_here" not in live_preflight._config_strategy_keys()
