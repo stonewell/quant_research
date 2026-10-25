@@ -131,7 +131,7 @@ RESULTS="results"
 # caller would silently re-home every default run.
 RESULTS_EXPLICIT=0
 START="2022-01-01"
-END="2026-01-01"
+END="2025-12-31"
 # --- NO INJECTION BY DEFAULT (2026-10-24 incident fix) ----------------------
 # These two used to default to `rolling_ic_ir` / `true`, which is what made Step 2
 # rewrite every live blend dump on every plain run. An EMPTY value now means "the

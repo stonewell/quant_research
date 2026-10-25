@@ -9,7 +9,7 @@ Orchestrates the 6-cell cross-ablation matrix comparing:
 - Run 4: Track T Full (All Track T = True)
 - Run 5: Synergy All (All Track C = True, All Track T = True)
 
-Across Round 1 (2022-01-01 to 2026-01-01) and Round 2 (2025-11-28 to 2026-10-01).
+Across Round 1 (2022-01-01 to 2025-12-31) and Round 2 (2025-11-28 to 2026-09-30).
 Parses walkforward_summary.json across all strategies and generates comprehensive
 Markdown and CSV comparison tables.
 
@@ -132,18 +132,24 @@ MATRIX_CONFIGS = [
     },
 ]
 
+# Round 1's end was extended from 2025-12-31 to 2025-12-31 by explicit operator
+# request on 2026-10-24. NOTE: until that change the `name` display string and the
+# module docstring both said "to 2026-01-01" while the `end` value was actually
+# "2025-12-31" -- i.e. the label had been wrong for some time. Both are now corrected
+# to match the value. Keep the label and the value in sync: `name` is what the matrix
+# summary and the console print, so a stale label is what an operator reads.
 ROUNDS_CONFIG = [
     {
         "round": 1,
-        "name": "Round 1 (2022-01-01 to 2026-01-01)",
+        "name": "Round 1 (2022-01-01 to 2025-12-31)",
         "start": "2022-01-01",
-        "end": "2026-01-01",
+        "end": "2025-12-31",
     },
     {
         "round": 2,
-        "name": "Round 2 (2025-11-28 to 2026-10-01)",
+        "name": "Round 2 (2025-11-28 to 2026-09-30)",
         "start": "2025-11-28",
-        "end": "2026-10-01",
+        "end": "2026-09-30",
     },
 ]
 
