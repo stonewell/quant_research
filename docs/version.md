@@ -2982,6 +2982,7 @@ exit: 1
 - **落地改动**：
   - 从 [`pipeline/research_strategy/rs/config.py:StrategyConfig`](file:///home/stone/Work/github/quant/pipeline/research_strategy/rs/config.py) 中彻底删除 `grid_symbol` 与 `ensemble_symbol`。
   - 同步更新 [`pipeline/research_strategy/tests/test_strategy.py`](file:///home/stone/Work/github/quant/pipeline/research_strategy/tests/test_strategy.py) 中的陈旧断言，消除静态分析器报出的死字段告警。
+- **版本轴判定：`AGENTS.md` 第 7 条未触发** —— 本项只删 `StrategyConfig` 上两个僵尸字段，未触及 `AllocationTemplate` 基类机制、9 个静态模板与任何策略类（`common/allocation_templates.py`、`pipeline/research/blend/*`、`pipeline/research_strategy/rs/*` 的策略/模板代码零改动），无信号计算、无参数默认值、无子策略组成变化，故**不升任何类的 `version`，也不动 `BASE_VERSION`**；版本记录里的 `BASE_VERSION 1.5.0 → 1.6.0` 属 `79284d7` 的 blend 引擎改动，与本次字段删除无关，不得记在 `P1.5` 账上。
 
 ---
 
