@@ -798,3 +798,112 @@ def test_allowed_keys_write_paths():
     with pytest.raises(KeyError):
         res.pop("custom_attr")
 
+
+# --------------------------------------------------------------------------- #
+# B6.4: `|=` / `|` guardrail tests (C-level PyDict_Merge bypass)
+# --------------------------------------------------------------------------- #
+def test_ior_with_unported_key_raises_and_is_atomic():
+    """`res |= {...}` must reject unported keys WITHOUT partially mutating self.
+
+    Task B6.4: inherited `dict.__ior__` merged via C-level `PyDict_Merge` and thus
+    skipped the Python-level `__setitem__`/`update` guards. Measured at HEAD
+    `e2ed0e5`: no exception, and `dict.__contains__(res, key)` answered True while
+    `res[key]` / `key in res` still raised -- a key "written but unreadable".
+
+    The atomicity assertion is the load-bearing half: `dict.__ior__` used to write
+    first and ask nothing, so a fix that merely raised *after* a partial merge would
+    still leave the poison key in the raw dict (invisible to the guarded readers).
+    """
+    universe = _make_universe(n_days=20, n_sym=2, seed=1)
+    tw = _sparse_weights(universe, {0: {"S0": 0.5, "S1": 0.5}})
+    res = run_allocation_backtest_fast(universe, tw)
+    assert isinstance(res, FastBacktestResult)
+    n_before = dict.__len__(res)
+
+    for key in UNPORTED_PRODUCTION_KEYS:
+        with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
+            res |= {key: 123}
+        # No C-level partial injection: probe the RAW storage, bypassing __contains__.
+        assert dict.__contains__(res, key) is False
+        assert dict.__len__(res) == n_before
+
+    # Mixed payloads must be rejected atomically too -- no valid key sneaks in first.
+    with pytest.raises(NotImplementedError, match="does not port production key"):
+        res |= {"ior_mixed_valid": 1, "deferral_report": []}
+    assert "ior_mixed_valid" not in res
+    assert dict.__contains__(res, "ior_mixed_valid") is False
+
+    # Positive control: a ported/unknown key goes through, and `|=` returns SELF.
+    # `out` (not `res`) is on the left so the augmented assignment rebinds `out` to
+    # __ior__'s return value -- `out is res` then proves the return was `self`, which
+    # is what keeps `res |= ...` from silently swapping in a plain dict.
+    out = res
+    out |= {"ior_valid_key": 42}
+    assert out is res
+    assert type(out) is FastBacktestResult
+    assert res["ior_valid_key"] == 42
+
+
+def test_or_with_unported_key_raises_and_valid_key_preserves_type():
+    """`res | {...}` must reject unported keys and keep the guard type on success.
+
+    Task B6.4: inherited `dict.__or__` returned a plain `dict`, silently dropping
+    the guard type -- the same "guard disappears when you copy it" failure mode
+    that B6.2 fixed for `copy()`. `__or__` therefore mirrors `dict.__or__`'s
+    operand contract (right operand must be a dict) but returns a guarded
+    `FastBacktestResult`.
+    """
+    universe = _make_universe(n_days=20, n_sym=2, seed=1)
+    tw = _sparse_weights(universe, {0: {"S0": 0.5, "S1": 0.5}})
+    res = run_allocation_backtest_fast(universe, tw)
+    assert isinstance(res, FastBacktestResult)
+    n_before = dict.__len__(res)
+
+    for key in UNPORTED_PRODUCTION_KEYS:
+        with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
+            res | {key: 123}
+    assert dict.__len__(res) == n_before
+
+    # Positive control: distinct guarded object, original untouched.
+    merged = res | {"or_valid_key": 99}
+    assert merged is not res
+    assert type(merged) is FastBacktestResult
+    assert merged["or_valid_key"] == 99
+    assert merged["execution_price"] == res["execution_price"]
+    assert "or_valid_key" not in res
+    assert dict.__contains__(res, "or_valid_key") is False
+    # The new copy is guarded exactly like the original.
+    for key in UNPORTED_PRODUCTION_KEYS:
+        with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
+            merged[key] = 1
+
+    # dict-only right operand contract: a pair list is NOT accepted (unlike
+    # `|=`/`update`, which also take arbitrary mappings/iterables of pairs).
+    with pytest.raises(TypeError):
+        res | [("k", 1)]
+
+
+def test_fromkeys_still_rejects_unported_keys():
+    """Pin the measured NON-bypass: `fromkeys()` hits the guard, it does not leak.
+
+    Task B6.4 explicitly rules out treating `fromkeys()` as a second hole: measured
+    on CPython 3.9-3.14, `dict.fromkeys` on a dict *subclass* routes through
+    `PyObject_SetItem`, so the overridden `__setitem__` fires. This test exists so a
+    future refactor (e.g. rewriting the class in C, or adding `__class_getitem__`
+    style magic) cannot silently turn it into one without going red.
+    """
+    for key in UNPORTED_PRODUCTION_KEYS:
+        with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
+            FastBacktestResult.fromkeys([key], None)
+        # Mixed key lists must fail too -- the guard is per-key, not all-or-nothing.
+        with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
+            FastBacktestResult.fromkeys(["equity_curve", key], None)
+
+    # Positive control: legit keys still yield the GUARDED type (not a plain dict),
+    # otherwise fromkeys itself would become a guard-dropping path.
+    made = FastBacktestResult.fromkeys(["equity_curve"], None)
+    assert type(made) is FastBacktestResult
+    assert made["equity_curve"] is None
+    for key in UNPORTED_PRODUCTION_KEYS:
+        with pytest.raises(NotImplementedError, match=f"does not port production key {key!r}"):
+            made[key] = 1

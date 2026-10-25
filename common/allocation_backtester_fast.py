@@ -681,20 +681,34 @@ UNPORTED_PRODUCTION_KEYS = frozenset({
 
 
 class FastBacktestResult(dict):
-    """Result dictionary from `run_allocation_backtest_fast` (tasks B5.3 & B6.2).
+    """Result dictionary from `run_allocation_backtest_fast` (tasks B5.3, B6.2 & B6.4).
 
     Guards against schema drift by raising NotImplementedError when accessing,
     writing, or copying unported production keys that exist in
     `run_allocation_backtest` but are not supported by the fast array kernel.
-    The guarded paths are reads (`res[key]`, `res.get(key)`, `key in res`), writes
-    (`res[key] = val`, `res.setdefault(key, val)`, `res.update(...)`, `res.pop(key)`)
-    and shallow copies (`res.copy()`, `copy.copy(res)`) -- NOT every conceivable write.
+    Every ordinary read on the instance (`res[key]`, `res.get(key)`, `key in res`)
+    and every ordinary write operator/method on the instance (`res[key] = val`,
+    `res.setdefault(...)`, `res.update(...)`, `res.pop(...)`, `res |= other`,
+    `res | other`-into-a-copy, `res.copy()`/`copy.copy(res)`) is guarded.
 
-    Known residual bypass (out of B6.2's scope, disclosed rather than silently widened):
-    `res |= other` goes through `dict.__ior__`, which merges at the C level and therefore
-    skips `__setitem__`/`update`, so an unported key can still be injected that way.
-    (`FastBacktestResult.fromkeys(...)` was also suspected; measured on CPython 3.11/3.12 it
-    routes through `PyObject_SetItem` for dict subclasses and DOES raise -- not a bypass.)
+    Documented RESIDUAL bypasses -- a `dict` subclass cannot intercept the builtin
+    `dict` C descriptors, so these still reach the underlying storage; this is
+    disclosure, NOT full closure:
+      * explicit unbound-dict calls -- `dict.update(res, ...)`,
+        `dict.__setitem__(res, ...)`, `dict.__ior__(res, ...)`,
+        `dict.setdefault(res, ...)`;
+      * `plain_dict | res`, which resolves on the LEFT operand (`dict.__or__`) and
+        yields a plain `dict`, i.e. the guard type is dropped -- `__ror__` is
+        deliberately not implemented for this reason (it would only cover the
+        plain-dict-left case whilst still leaking a plain result);
+      * the raw view after one of the above has already injected a key:
+        `repr(res)`, `iter(res)`, `dict.keys/items/values(res)` are dict-level
+        and do not consult the guards (the injection happens at the unbound
+        call, so this bullet is a visibility caveat, not a second hole).
+    (`FastBacktestResult.fromkeys(...)` was also suspected; measured on
+    CPython 3.9-3.14 it routes through `PyObject_SetItem` for dict subclasses and
+    DOES raise -- not a bypass -- and `test_fromkeys_still_rejects_unported_keys`
+    now pins that so a future refactor cannot silently introduce one.)
     """
 
     def __init__(self, *args, **kwargs):
@@ -789,6 +803,35 @@ class FastBacktestResult(dict):
 
     def __copy__(self):
         return self.copy()
+
+    def __ior__(self, other):
+        """Guarded in-place merge for ``res |= other`` (task B6.4).
+
+        ``dict.__ior__`` merges at the C level via ``PyDict_Merge`` and therefore
+        skips this subclass's ``__setitem__``/``update``, letting an unported key
+        be injected silently -- and, because ``__getitem__``/``__contains__`` stay
+        guarded, such a key is "written but unreadable". Route through the already
+        guarded ``update``, which pre-checks every incoming key atomically and
+        raises ``NotImplementedError`` before mutating anything. Must return
+        ``self``: the augmented-assignment statement rebinds ``res`` to the return
+        value.
+        """
+        self.update(other)
+        return self
+
+    def __or__(self, other):
+        """Guarded non-mutating merge for ``res | other`` (task B6.4).
+
+        ``dict.__or__`` returns a plain ``dict``, silently dropping the guard type.
+        Mirror ``dict.__or__``'s operand contract (the right operand must be a
+        dict, unlike ``|=``/``update`` which also accept arbitrary mappings), but
+        return a guarded ``FastBacktestResult`` instead of a plain dict.
+        """
+        if not isinstance(other, dict):
+            return NotImplemented
+        result = self.copy()
+        result.update(other)
+        return result
 
 
 def run_allocation_backtest_fast(
