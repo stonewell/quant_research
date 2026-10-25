@@ -3357,3 +3357,23 @@ exit: 1
   既有 `test_is_static_template`（13 名 + 4 别名）**一字未改、继续为绿**。
 - **验证（实测）**：目标文件 `30 passed`（26 → 30，+4）；`common/tests` **763 passed / 1 skipped**；`pipeline/tests` **337 passed**；全离线。行为保全对照（同一批真实产物，分别用 `ec590d2` 版与工作树版验证器跑）：6 个真实 blend dump **逐项判定一致**（均 `verified=True, overridden=False`）；由真实配置条目合成的 `dual_momentum` 研究 dump 两侧同为 `verified=True`（该条目无钉住值）；向合成配置注入 `regime_ic_ir_hybrid` 钉住后，漂移 `rolling_ic_ir` **改前静默 `verified=True` → 改后 raise**，取值一致时仍 `verified=True`。
 - **版本轴判定：`AGENTS.md` 第 7 条**未**触发 —— 本项只改运行时预检门禁与三处调用点，**未触及任何策略/模板类**（`pipeline/research/blend/*`、`pipeline/research_strategy/rs/*`、`common/allocation_templates.py` 均 0 改动），无信号计算、无参数默认值、无子策略组成变化，故**不升 `version` / `BASE_VERSION`，不重跑 `--dump-strategies`**；cfsb 的部署钉住值 `regime_ic_ir_hybrid` 原样未动。
+
+##### 20.10.1 更正（2026-10-24，第二轮：`P1.9` 第一次落地只封了「带 spec」这一条路径）
+
+> **诚实更正**：上面 §20.10 的「已闭环」结论**下得太早**。第一次落地（选项 C）只封住了「dump 携带一个**真值** `research_strategy_spec`」这一条路径，仍留下 4 类形状可以绕过门禁。第二轮用**实测探针**（13 个形状）逐条复现后重写规则，本节为该次更正的留痕；**不以任何方式改写上方 §20.10 的原文**，只在尾部追加。
+
+- **第一次落地的三处缺陷（均已实测复现，不是推演）**：
+  1. `has_research_spec = bool(strategy_def.get("research_strategy_spec"))` 把「**没有** spec」与「spec 被清空/删除」混为一谈：`research_strategy_spec` 键**整个删掉**、`spec: {}`、`{"strategy_key": ...}` 缺 `entry_data` 三种形状都被判成 `has_research_spec=False` ⇒ 撞名键重新获得豁免 ⇒ **静默 `verified=True`**；
+  2. 豁免是 `exempt(key, …) or exempt(template_name, …)`，于是**任意一个看着像静态模板的 `template_name` 都能当盾牌**：研究 dump 只要写上 `template_name: "equal_weight"` / `"hrp"` / `"momentum"` / … 就通过；而 [`common/strategy_spec.py`](file:///home/stone/Work/github/quant/common/strategy_spec.py) 的 `get_template` 明确让 `research_strategy_spec` **优先于** `template_name` —— 即**研究引擎真的在跑**，门禁却给它贴了「静态模板」的免检标签；
+  3. spec 是**非字典**（`"x"` / `[]`）时，在类型校验之前就被 `.get(...)` 解引用 ⇒ 抛出 `AttributeError`**崩溃**，而不是可诊断的 `LiveDumpPreflightError` 拒绝；`--allow-weighting-mode-override` 也救不了（它不是拒绝，是异常）。
+  另有一个纯名字形状：`template_name: ""` + `strategy_key: "dual_momentum"` + 漂移，第一次落地同样放行。
+- **第一次落地的可实测症状清单（改前 / 改后）**：形状 2（spec 键删除）、3（`spec: {}`）、6（非字典 spec → `AttributeError` 崩溃）、11（`template_name: equal_weight` 盾牌）、12（`template_name: hrp` 盾牌）在 `67c3ea3` 上分别「通过/通过/崩溃/通过/通过」，第二轮全部改为 **raise `LiveDumpPreflightError`**；形状 1 / 4 / 5 / 9 / 10 在 `67c3ea3` 上已正确 raise，第二轮保持 raise。
+- **第二轮实施的规则（现在是唯一生效口径，覆盖 §20.10 第 2、3 条的实现细节）**：
+  1. **spec 只解析一次、且先做类型校验**：`research_strategy_spec` 键缺失 ⇒ `spec = None`；键存在但**不是 JSON 对象** ⇒ `LiveDumpPreflightError`，消息点明「`research_strategy_spec` 畸形，无法被 `--allow-weighting-mode-override` 覆盖」——理由：畸形 spec 与「被剥离的 spec」不可区分，若当作「无 spec」处理，本节要封的豁免就会立刻复活。**绝不产生 traceback**。
+  2. **spec 的存在性决定身份，且带 spec 的 dump 永不静态豁免**：`spec_present = isinstance(spec, dict)`；`spec_present` 时身份取 `spec.get("strategy_key") or strategy_key or template_name`，**直接进配置核对**，根本不咨询豁免 —— `template_name` 从此不可能当盾牌（依据正是 `get_template` 的优先级）。
+  3. **无 spec 的 dump**：仅当它携带的**每一个**名字（`template_name`、`strategy_key`）都是静态模板名**且**都不是 `strategies_config.json` 的顶层键时才豁免。用 `all()` 而非 `any()` 是刻意偏保守的方向：静态名与配置键混着出现的 dump 语义有歧义，一律**送检**。由此推出一条必须写明的语义变化：**真静态 `dual_momentum` 模板在实盘解析器里本就不可达**（`resolve_strategy_definition` 先匹配配置键并合成 `research_strategy_spec`），万一该条目哪天被钉上权重模式，这类 dump 现在是**被核对**而不是被信任。
+  4. `is_static_template()` 与 13 名 + 4 别名**逐字节未改**；无钉住值分支仍返回 `verified=True`（「被核对」不等于「可疑」）。
+  5. `is_static_template_exempt(name, config_keys)` 的 `has_research_spec` 形参**删除** —— 「是否豁免」的决定权收归验证器，避免同一判断在两处各有一套口径。
+- **验证（实测，全离线）**：13 形状探针 → **0 处与预期不符**（11 条必 raise、形状 7/8 静默通过）；`common/tests/test_live_dump_preflight.py` **43 passed**（30 → 43，新增 11 条必 raise 的参数化用例 + 2 条静默通过用例，并把结构测试改写为新不变量：**带 spec 永不豁免 / 无 spec + 非配置键静态名才豁免 / 无 spec + 配置键名不豁免**，撞名集合仍钉死为 `{"dual_momentum"}`）；`common/tests` **776 passed / 1 skipped**；`pipeline/tests` **337 passed**。**58 个真实 dump 的只读对照**：改前改后均为 `verified=True, overridden=False` **×58，判定变化 = 0**（这 58 个 dump 全部携带字典型 spec，故现在都走配置核对；其中 6 个钉住值 dump 与配置**逐项相符**：cfsb `regime_ic_ir_hybrid`，其余 5 个 `rolling_ic_ir`）。Stage 1 静态路径实测仍为 `weighting_mode='rolling_ic_ir'` / `verified=true` / `overridden=false`、零 WARNING。
+- **版本轴判定**：同 §20.10 —— 仅改预检门禁与其测试，**零策略/模板类改动**（`git diff` 对 `pipeline/research/blend`、`pipeline/research_strategy/rs`、`common/allocation_templates.py` 为空），故**不升 `version` / `BASE_VERSION`，不重跑 `--dump-strategies`**；cfsb 的部署钉住值 `regime_ic_ir_hybrid` 原样未动。
+- **台账**：`P1.9` 早已是 `[x]`，本轮为同一任务的**第二轮补丁**，**不新增、不改写任何任务行**，故现役仍 **79 = 64 `[x]` + 15 `[ ]`**，两文件合计仍 **145 = 66 + 64 + 15**（归档 66 / 现役 64 / 待办 15）。
