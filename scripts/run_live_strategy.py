@@ -132,7 +132,6 @@ from pipeline.live_signal.lsig.signal import as_of_universe, latest_rebalance_ro
 from scripts.live_paths import DEFAULT_STRATEGY_KEY, default_live_output_dir
 from scripts.live_preflight import (
     LiveDumpPreflightError,
-    is_static_template,
     verify_live_strategy_dump_preflight,
 )
 
@@ -1223,15 +1222,17 @@ def parse_args(args: Optional[List[str]] = None):
     parsed._resolved_desc = resolved_desc
     parsed._template = template
 
-    # (P1.8) Pre-flight consistency check between dump and strategies_config.json
-    template_name = strategy_def.get("template_name", "")
-    if not is_static_template(template_name) and not is_static_template(strategy_key):
-        verify_live_strategy_dump_preflight(
-            strategy_def=strategy_def,
-            strategy_key=strategy_key,
-            strategy_file=parsed.strategy_file or resolved_desc,
-            allow_override=getattr(parsed, "allow_weighting_mode_override", False),
-        )
+    # (P1.8 / P1.9) Pre-flight consistency check between dump and strategies_config.json.
+    # The static-template exemption lives INSIDE the verifier (`is_static_template_exempt`).
+    # The name-only gate that used to sit here skipped `dual_momentum` -- a static template
+    # name that is ALSO a `strategies_config.json` key -- so a research dump keyed
+    # `dual_momentum` never had its pinned weighting mode checked (P1.9).
+    verify_live_strategy_dump_preflight(
+        strategy_def=strategy_def,
+        strategy_key=strategy_key,
+        strategy_file=parsed.strategy_file or resolved_desc,
+        allow_override=getattr(parsed, "allow_weighting_mode_override", False),
+    )
 
     # 2. Dynamically bind output directory to strategy key if not explicitly given.
     #    The path comes from `scripts.live_paths.default_live_output_dir` -- the same

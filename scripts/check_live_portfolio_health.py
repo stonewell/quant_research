@@ -76,7 +76,6 @@ from pipeline.live_signal.lsig.signal import as_of_universe
 from scripts.live_paths import DEFAULT_STRATEGY_KEY, default_live_output_dir
 from scripts.live_preflight import (
     LiveDumpPreflightError,
-    is_static_template,
     verify_live_strategy_dump_preflight,
 )
 
@@ -1197,17 +1196,19 @@ def main(cli_args: Optional[List[str]] = None):
     #   * registered mismatch + override -> the dump's real mode is kept, but the pin
     #     explicitly REJECTED it, so `verified` must be false and the override flagged.
     # Every verified path keeps the previous behaviour byte-identical.
+    # (P1.9) The static-template exemption is owned by the verifier (`is_static_template_exempt`)
+    # and returns `verified=True` for a genuine static template -- exactly the hardcoded
+    # default it replaced -- so the name-only gate that used to wrap this call is gone.
     weighting_mode_verified = True
     weighting_mode_mismatch_overridden = False
-    if not is_static_template(template_name) and not is_static_template(strategy_key):
-        _preflight = verify_live_strategy_dump_preflight(
-            strategy_def=strategy_def,
-            strategy_key=strategy_key,
-            strategy_file=args.strategy_file,
-            allow_override=getattr(args, "allow_weighting_mode_override", False),
-        )
-        weighting_mode_verified = _preflight.verified
-        weighting_mode_mismatch_overridden = _preflight.mismatch_overridden
+    _preflight = verify_live_strategy_dump_preflight(
+        strategy_def=strategy_def,
+        strategy_key=strategy_key,
+        strategy_file=args.strategy_file,
+        allow_override=getattr(args, "allow_weighting_mode_override", False),
+    )
+    weighting_mode_verified = _preflight.verified
+    weighting_mode_mismatch_overridden = _preflight.mismatch_overridden
 
     # (P1.8) Strict resolution for blend strategies: blend_weighting_mode is mandatory
     if not weighting_mode_verified and not weighting_mode_mismatch_overridden:

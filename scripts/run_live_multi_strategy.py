@@ -83,7 +83,6 @@ from pipeline.live_signal.lsig.signal import as_of_universe, latest_rebalance_ro
 from scripts.live_paths import MULTI_STRATEGY_KEY, default_live_output_dir
 from scripts.live_preflight import (
     LiveDumpPreflightError,
-    is_static_template,
     verify_live_strategy_dump_preflight,
 )
 from scripts.run_live_strategy import (
@@ -407,15 +406,15 @@ def main():
         strat_def, actual_key, resolved_desc, template = resolve_strategy_definition(s_key, None)
         params = strat_def.get("params", {})
 
-        # (P1.8) Pre-flight consistency check between dump and strategies_config.json
-        template_name = strat_def.get("template_name", "")
-        if not is_static_template(template_name) and not is_static_template(actual_key):
-            verify_live_strategy_dump_preflight(
-                strategy_def=strat_def,
-                strategy_key=actual_key,
-                strategy_file=resolved_desc,
-                allow_override=getattr(args, "allow_weighting_mode_override", False),
-            )
+        # (P1.8 / P1.9) Pre-flight consistency check between dump and strategies_config.json.
+        # The static-template exemption is owned by the verifier (`is_static_template_exempt`);
+        # gating on the bare name here would mis-exempt a research dump keyed `dual_momentum`.
+        verify_live_strategy_dump_preflight(
+            strategy_def=strat_def,
+            strategy_key=actual_key,
+            strategy_file=resolved_desc,
+            allow_override=getattr(args, "allow_weighting_mode_override", False),
+        )
         strat_name = (
             strat_def.get("strategy_name")
             or strat_def.get("research_strategy_spec", {}).get("entry_data", {}).get("name")

@@ -24,6 +24,20 @@ mismatch and (b) a strategy key that is absent from `strategies_config.json` -- 
 prints a loud one-time stderr warning saying the pinned-mode check did NOT run. It does NOT bypass
 a malformed/non-object dump, an unidentifiable dump (no key at all), or a registered strategy whose
 `params` carries no `blend_weighting_mode`.
+
+Static-template exemption (P1.9 / 2026-10-24)
+--------------------------------------------
+Static basket allocation templates are not declared in `strategies_config.json`, so they have no
+pin to verify and are exempt. That exemption used to be a bare name-membership test
+(`is_static_template`) applied in THIS module and at all three live call sites -- but
+`_STATIC_TEMPLATE_NAMES` shares one name with a real config key: `dual_momentum` is both a static
+template name and the top-level key of the "Active Dual Momentum GTAA" research entry. A research
+dump keyed `dual_momentum` therefore skipped the pinned-mode gate entirely -- harmless today (that
+entry pins no `blend_weighting_mode`) but a silent bypass waiting for a pin.
+`is_static_template_exempt` now owns the rule: a name is exempt iff it is a static template name
+AND (it is NOT a `strategies_config.json` key OR the dump carries no `research_strategy_spec`).
+Config membership wins, and the presence of `research_strategy_spec` is the identity signal that
+separates a genuine static template from a research strategy that merely shares the name.
 """
 
 import json
@@ -32,6 +46,13 @@ import sys
 from typing import Any, Dict, NamedTuple, Optional
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# The canonical pinned configuration. Same file the verifier reads when no
+# `config_path` override is supplied -- one owner, so a test that asks
+# "which keys exist?" cannot silently disagree with the gate.
+_DEFAULT_CONFIG_PATH = os.path.join(
+    _REPO_ROOT, "pipeline", "research_strategy", "strategies_config.json"
+)
 
 _STATIC_TEMPLATE_NAMES = {
     "equal_weight",
@@ -146,6 +167,87 @@ def is_static_template(name: Optional[str]) -> bool:
     return name.strip().lower() in _STATIC_TEMPLATE_NAMES
 
 
+# Lazy config-key cache, keyed by the RESOLVED absolute path. Why per path instead of a
+# single global: tests point the gate at synthesised `tmp_path` configs, and a
+# one-slot cache would hand a tmp config's keys to the next real-config call (or vice
+# versa) depending on call order -- a test-order-dependent gate. One read per distinct
+# file per process is all the gate needs.
+_CONFIG_KEYS_CACHE: Dict[str, frozenset] = {}
+
+
+def _config_strategy_keys(cfg_file: Optional[str] = None) -> frozenset:
+    """Return the set of top-level strategy keys declared in `strategies_config.json`.
+
+    (P1.9 / 2026-10-24) This is the "is this name a research strategy?" half of the
+    static-template exemption rule. The pre-P1.9 gate decided exemption from the bare
+    `_STATIC_TEMPLATE_NAMES` membership test, which made `dual_momentum` -- simultaneously
+    a static template name and a top-level key of the "Active Dual Momentum GTAA" entry --
+    exempt from the pinned-weighting-mode check even when the dump identified itself as a
+    research strategy. Config membership is the authoritative signal that a name is
+    owned by `strategies_config.json`, so the exemption has to consult this set.
+
+    Read lazily and cached per resolved path: the verifier prefers the key set from the
+    config it has ALREADY loaded, and only falls back here (structural/inspection use).
+
+    Args:
+        cfg_file: Optional path to the configuration file; defaults to the tracked
+            `pipeline/research_strategy/strategies_config.json`.
+
+    Returns:
+        frozenset of top-level keys (empty for a non-object / empty JSON document).
+    """
+    resolved = os.path.abspath(cfg_file or _DEFAULT_CONFIG_PATH)
+    cached = _CONFIG_KEYS_CACHE.get(resolved)
+    if cached is None:
+        with open(resolved, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        cached = frozenset(data.keys()) if isinstance(data, dict) else frozenset()
+        _CONFIG_KEYS_CACHE[resolved] = cached
+    return cached
+
+
+def is_static_template_exempt(
+    name: Optional[str],
+    config_keys: frozenset,
+    has_research_spec: bool = False,
+) -> bool:
+    """Return True if `name` may SKIP the pinned-weighting-mode pre-flight.
+
+    (P1.9 / 2026-10-24, owner-selected rule option C) The rule is a conjunction:
+
+    1. `name` must be a static basket template name (`is_static_template`, unchanged --
+       the 13 names plus the `momentum` / `hrp` / `inv_vol` / `ew` aliases stay exactly
+       as they were), AND
+    2. it must NOT be a top-level key of `strategies_config.json`, OR the dump must carry
+       no `research_strategy_spec` at all.
+
+    Why config membership has to win: `dual_momentum` is a genuine static template AND a
+    real config key. A research dump for that key identifies itself via
+    `research_strategy_spec`; exempting it on the name alone left the pinned-mode gate
+    with a hole (silent today, fatal the day that entry pins a mode). The reverse case --
+    a config key with no `research_strategy_spec` in the dump -- is the hand-written
+    payload shape `resolve_strategy_definition` emits for a plain static template, so it
+    must keep skipping (no pin exists to verify).
+
+    Args:
+        name: Strategy key or `template_name` from the dump.
+        config_keys: Top-level keys of the configuration being consulted -- pass the set
+            of the already-loaded config when available, else `_config_strategy_keys()`.
+        has_research_spec: True when the dump carries a truthy `research_strategy_spec`.
+
+    Returns:
+        True only for the "genuine static template, nothing to pin" case.
+    """
+    if not is_static_template(name):
+        return False
+    # Same normalisation as `is_static_template`, so the config lookup cannot disagree
+    # with the name test (e.g. " Dual_Momentum ").
+    canonical = name.strip().lower()  # type: ignore[union-attr]
+    if canonical not in config_keys:
+        return True
+    return not has_research_spec
+
+
 def verify_live_strategy_dump_preflight(
     strategy_def: Dict[str, Any],
     strategy_key: Optional[str] = None,
@@ -196,11 +298,7 @@ def verify_live_strategy_dump_preflight(
         or strategy_def.get("research_strategy_spec", {}).get("strategy_key")
         or strategy_def.get("template_name")
     )
-
-    # Static templates are not declared in strategies_config.json
     template_name = strategy_def.get("template_name")
-    if is_static_template(key) or is_static_template(template_name):
-        return PreflightVerdict(verified=True)
 
     # Determine dump file display name for diagnostic error messages
     if strategy_file and str(strategy_file).endswith(".json"):
@@ -212,9 +310,7 @@ def verify_live_strategy_dump_preflight(
     else:
         dump_file_display = "strategy.json"
 
-    cfg_file = config_path or os.path.join(
-        _REPO_ROOT, "pipeline", "research_strategy", "strategies_config.json"
-    )
+    cfg_file = config_path or _DEFAULT_CONFIG_PATH
     if not os.path.exists(cfg_file):
         raise LiveDumpPreflightError(
             f"Configuration file not found at: '{cfg_file}' while checking dump '{dump_file_display}'."
@@ -233,6 +329,19 @@ def verify_live_strategy_dump_preflight(
             f"'research_strategy_spec.strategy_key' and no 'template_name'. An unidentifiable "
             f"dump cannot be overridden by --allow-weighting-mode-override."
         )
+
+    # (P1.9 / 2026-10-24) Static-template exemption, evaluated AFTER the config load so the
+    # collision case can be decided honestly: a name must be a static template name AND
+    # either absent from the config keys or a dump with no `research_strategy_spec`.
+    # Pre-P1.9 this was a bare name test placed BEFORE the config load, so a research dump
+    # keyed `dual_momentum` (a real config key sharing the name) never reached the pin.
+    # The key set is reused from the config already in memory -- one read, one owner.
+    config_keys = frozenset(cfg_data.keys()) if isinstance(cfg_data, dict) else frozenset()
+    has_research_spec = bool(strategy_def.get("research_strategy_spec"))
+    if is_static_template_exempt(key, config_keys, has_research_spec) or is_static_template_exempt(
+        template_name, config_keys, has_research_spec
+    ):
+        return PreflightVerdict(verified=True)
 
     if key not in cfg_data:
         if not allow_override:
