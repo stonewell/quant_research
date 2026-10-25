@@ -159,6 +159,14 @@ OVERRIDE_DIRNAME="_strategy_dumps_override"
 BLEND_GLOB="*blend*.json"
 # New (optional) knobs; defaults reproduce the old script's behavior.
 DATA_PROVIDER="${DATA_PROVIDER:-"fuyao"}"
+# Cache plumbing, default BEHAVIOUR-PRESERVING: NO_CACHE=0 / CACHE_DIR empty mean
+# "forward nothing", so the batch keeps opening the shared production cache exactly
+# as before. (`set -u` is on -- hence the `${VAR:-...}` initialisation: an
+# env-provided value still wins, an unset one never explodes.) Without this, a run
+# that must not touch `data/cache.duckdb` (e.g. a walkforward whose store_bars
+# history-rewrite gate would refuse damaged bars) had no way to say so.
+NO_CACHE="${NO_CACHE:-"0"}"                 # 1 = pass --no-cache (bypass cache read+write)
+CACHE_DIR="${CACHE_DIR:-""}"                # non-empty = pass --cache-dir (isolated duckdb)
 BATCH_N_JOBS="${BATCH_N_JOBS:-""}"          # empty = auto: min(cpu_count, n_strategies)
 INNER_N_JOBS="${INNER_N_JOBS:-"1"}"         # fold workers inside a strategy; 1 = never nest pools
 WINDOW_YEARS="${WINDOW_YEARS:-"0.25"}"
@@ -176,7 +184,8 @@ Usage: $(basename "${BASH_SOURCE[0]}") [UNIVERSE] [RESULTS] [START] [END] [WEIGH
        [ENABLE_ORTHOGONALIZATION] [EXTRA_PARAMS]
        $(basename "${BASH_SOURCE[0]}") --universe X --results R --start S --end E \\
        [--weighting-mode M] [--enable-orthogonalization [true|false]] [--no-orthogonalization] \\
-       [--extra-params '{"k": v}'] [--data-provider P] [--n-jobs N] [--help]
+       [--extra-params '{"k": v}'] [--data-provider P] [--n-jobs N] \\
+       [--no-cache] [--cache-dir DIR] [--help]
 
 Thin wrapper around scripts/run_batch_backtest.py: dumps the strategies, then runs
 ONE batch backtest over every dumped *blend*.json (see the header comment for the
@@ -200,6 +209,14 @@ silently: --results pipeline/results/blend_16 (from the repo root) and
 Omitting --results keeps the historical default: <repo>/pipeline/results.
 --help/-h is honoured in ANY argument position.
 Set BLEND_BATCH_DRY_RUN=1 to resolve/validate the universe and stop before any work.
+
+Cache: the batch reads AND writes the shared production cache
+(<repo>/data/cache.duckdb) unless told otherwise. --no-cache bypasses the DuckDB
+cache entirely (no read, no write; every symbol is refetched from the provider:
+slow, but it cannot mutate the shared cache). --cache-dir DIR reads/writes
+<DIR>/cache.duckdb instead, leaving the production cache untouched. The two are
+mutually exclusive in spirit (--no-cache means "no cache at all") and only one is
+useful per run.
 
 Default universe: ${DEFAULT_UNIVERSE}
                   (${status})
@@ -274,6 +291,19 @@ while [[ $# -gt 0 ]]; do
             ;;
         --data-provider)
             DATA_PROVIDER="$2"
+            shift 2
+            ;;
+        # Cache control. `--no-cache` takes no value, so it is consumed with `shift 1`
+        # and can never leak into `positional_args` (which would otherwise be mapped
+        # onto UNIVERSE/RESULTS/START/... and silently corrupt the universe path).
+        --no-cache|--no_cache)
+            NO_CACHE="1"
+            shift 1
+            ;;
+        # `shift 2` for the same reason: a `--cache-dir /tmp/x` pair must consume BOTH
+        # tokens here, never leaving `/tmp/x` behind as a positional UNIVERSE.
+        --cache-dir|--cache_dir)
+            CACHE_DIR="$2"
             shift 2
             ;;
         --n-jobs|-j)
@@ -507,6 +537,15 @@ fi
 echo "Strategy Dumps:            ${DUMPS_DIR}"
 echo "Extra Params:              ${EXTRA_PARAMS}"
 echo "Data Provider:             ${DATA_PROVIDER}"
+# Reported unconditionally so "this run will write the shared production cache" is
+# visible before the multi-hour batch starts, not discovered afterwards. Mirrors the
+# run header that run_blend_cross_matrix.py prints.
+echo "Cache Bypass:              ${NO_CACHE}"
+if [[ -n "${CACHE_DIR}" ]]; then
+    echo "Cache Dir:                 ${CACHE_DIR}"
+else
+    echo "Cache Dir:                 (none - shared production cache data/cache.duckdb)"
+fi
 echo "Batch Workers:             ${BATCH_N_JOBS:-"auto"}"
 echo "Inner (fold) Workers:      ${INNER_N_JOBS}"
 echo "=============================================="
@@ -643,6 +682,15 @@ if [ -n "${BASELINE_SYMBOL}" ]; then
 fi
 if [ -n "${BATCH_N_JOBS}" ]; then
     BATCH_ARGS+=(--n-jobs "${BATCH_N_JOBS}")
+fi
+# Cache control is forwarded only when asked for, so the default BATCH_ARGS is
+# unchanged from before this flag existed (no cache arguments at all -> the batch
+# opens the shared production cache).
+if [[ "${NO_CACHE}" == "1" ]]; then
+    BATCH_ARGS+=(--no-cache)
+fi
+if [[ -n "${CACHE_DIR}" ]]; then
+    BATCH_ARGS+=(--cache-dir "${CACHE_DIR}")
 fi
 
 uv run python "${BATCH_ARGS[@]}"

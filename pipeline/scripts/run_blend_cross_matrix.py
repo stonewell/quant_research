@@ -273,6 +273,43 @@ def parse_args():
             "NOT modify live strategy dumps."
         ),
     )
+    # Cache/provider plumbing. Before this, the matrix entry point had NO way to
+    # control caching at all: a walkforward run wrote straight into the shared
+    # production `data/cache.duckdb` and then aborted when `store_bars`' history-
+    # rewrite gate refused damaged bars. `run_batch_backtest.py` and
+    # `backtester/run_backtest.py` both accept `--no-cache`/`--cache-dir`, and
+    # `backtest_blend_strategies.sh` accepts `--data-provider`, but none of it was
+    # reachable from here. Defaults are deliberately None/False so that not passing
+    # these produces a byte-identical child command to the pre-fix behaviour.
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help=(
+            "Pass --no-cache down to the batch backtester: bypass the DuckDB cache entirely "
+            "(no read, no write). Use when a run must not mutate the shared production cache. "
+            "Cost: every symbol is refetched from the provider on every round."
+        ),
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=str,
+        default=None,
+        help=(
+            "Pass --cache-dir down to the batch backtester: read/write an isolated cache "
+            "database under this directory instead of <repo>/data/cache.duckdb. Default is "
+            "None (inherit the production cache, i.e. today's behaviour)."
+        ),
+    )
+    parser.add_argument(
+        "--data-provider",
+        type=str,
+        default=None,
+        help=(
+            "Pass --data-provider down to the BATCH backtester. Default is None: do not "
+            "forward the flag, so backtest_blend_strategies.sh keeps its own default "
+            "(${DATA_PROVIDER:-fuyao})."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -377,6 +414,19 @@ def generate_matrix_summary_markdown(records: List[Dict[str, Any]], executed_run
 def main():
     args = parse_args()
 
+    # `--no-cache` bypasses the cache entirely, so a `--cache-dir` would have no
+    # effect; rejecting the combination is better than silently honouring one. Any
+    # nonzero code is enough (`sys.exit` below is this file's existing error style;
+    # a bare `return 2` from `main()` would exit 0 because `main()` is called
+    # without `sys.exit(main())`). Exit BEFORE any child command is built/printed.
+    if args.no_cache and args.cache_dir is not None:
+        print(
+            "Error: --no-cache and --cache-dir are mutually exclusive (--no-cache bypasses "
+            "the cache entirely, so a cache directory has no effect). Pick one.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     # Determine script and directory paths
     script_dir = os.path.dirname(os.path.abspath(__file__))
     pipeline_dir = os.path.abspath(os.path.join(script_dir, ".."))
@@ -420,6 +470,12 @@ def main():
     print(f"Start Run ID:             {args.start_run_id}")
     print(f"Max Rounds:               {args.max_rounds}")
     print(f"Dry Run:                  {args.dry_run}")
+    # Reported explicitly, including the "inherit" case, because the difference
+    # between "the shared production cache" and "a throwaway one" is exactly what
+    # an operator needs to see BEFORE a multi-hour run starts.
+    print(f"Cache Bypass:             {args.no_cache}")
+    print(f"Cache Dir:                {args.cache_dir if args.cache_dir is not None else '<production cache: data/cache.duckdb>'}")
+    print(f"Data Provider:            {args.data_provider if args.data_provider is not None else '<inherit from backtest_blend_strategies.sh: fuyao>'}")
     print(f"Total Cells to Run:       {len(executed_runs)}")
     for r in executed_runs:
         print(f"  - Run {r['id']}: {r['folder']} ({r['description']})")
@@ -451,6 +507,14 @@ def main():
                 cmd.extend(["--weighting-mode", args.weighting_mode])
             if args.enable_orthogonalization is not None:
                 cmd.extend(["--enable-orthogonalization", args.enable_orthogonalization])
+            # Appended AFTER the pre-existing conditionals so the default (none of the
+            # three set) yields exactly the same argument list as before this fix.
+            if args.no_cache:
+                cmd.append("--no-cache")
+            if args.cache_dir is not None:
+                cmd.extend(["--cache-dir", args.cache_dir])
+            if args.data_provider is not None:
+                cmd.extend(["--data-provider", args.data_provider])
 
             cmd_str = " ".join(f"'{x}'" if " " in x or "{" in x else x for x in cmd)
             print(f"\n  [Round {round_num}] {r_cfg['name']}")
