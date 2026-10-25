@@ -269,7 +269,7 @@ cp -p data/cache.duckdb.bak.20261024-200255 data/cache.duckdb
 
 **(i) 删除不缩小文件。** `size` 在 DELETE 前后都是 **324,022,272 字节**（= 310 MiB 十进；库内 `PRAGMA database_size` 前后都是 `309.0 MiB`）。DuckDB 的 `DELETE` 只在行组上做标记、不把空间还给操作系统；不 `VACUUM` / `EXPORT`（本次明确不做）文件就不会变小。任何"清理后应该省了 551 行的空间"的期待都是错的。
 
-**(ii) 删除不持久 —— 裸键会被重新写回。** `common/data.py:731` 的落库调用是 `self.duckdb_cache.store_bars(provider_name, symbol, …)`，用的是**调用方传入的原始 `symbol`**；`normalize_thscode()`（`common/financial_api.py:103`，裸 `000938` → `000938.SZ`）只在 provider 的**上游取数**里把代码规范化成 thscode 去查接口，**不会**改写 `data.py` 落库时用的键名（全仓 `common/data.py` 里对 `normalize_thscode` 零命中）。⇒ 任何调用方只要再传一次裸代码，`000938` / `601088` 就会被原样重建。**写入侧守卫（落库前强制规范化或显式拒绝裸键）本次没有实现**，本轮只清存量。要根治得改 `common/data.py` / `common/duckdb_cache.py` 的写入路径。
+**(ii) 删除不持久 —— 裸键会被重新写回。** `common/data.py:731` 的落库调用是 `self.duckdb_cache.store_bars(provider_name, symbol, …)`，用的是**调用方传入的原始 `symbol`**；`normalize_thscode()`（`common/financial_api.py:103`，裸 `000938` → `000938.SZ`）只在 provider 的**上游取数**里把代码规范化成 thscode 去查接口，**不会**改写 `data.py` 落库时用的键名（全仓 `common/data.py` 里对 `normalize_thscode` 零命中）。⇒ 任何调用方只要再传一次裸代码，`000938` / `601088` 就会被原样重建。**写入侧守卫（落库前强制规范化或显式拒绝裸键）本次没有实现**，本轮只清存量。要根治得改 `common/data.py` / `common/duckdb_cache.py` 的写入路径。该持久化修复现已登记为任务 **`L2.46`**（[`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) §2.13，Track L-A / Tier P1），**守卫尚未实现** —— 在本节与 §15 的口径下，裸键随时可能被下一次裸代码写入重建。
 
 ### 8bis.6 对普查工具的影响（旧报告里的 160 / 83 已是历史值）
 
