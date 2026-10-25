@@ -951,6 +951,13 @@ def test_strategy_without_pinned_mode_passes_silently(capsys):
 
 
 def test_run_live_strategy_cli_preflight_integration(tmp_path, healthy_chan_dump):
+    """(P1.10 / 2026-10-24) `parse_args()` is free of the preflight; `main()` still fails fast.
+
+    INVERTED from the P1.8 version, which asserted that `parse_args()` itself raised: the
+    pre-flight gate moved into `main()` so argument parsing no longer performs a disk-backed
+    validation with a fail-fast side effect. Both halves are asserted here on the SAME argv --
+    parsing must not raise, and `main()` must.
+    """
     strategy_def, _ = healthy_chan_dump
     bad_def = copy.deepcopy(strategy_def)
     bad_def["params"]["blend_weighting_mode"] = "rolling_ic_ir"
@@ -959,19 +966,118 @@ def test_run_live_strategy_cli_preflight_integration(tmp_path, healthy_chan_dump
     with open(strat_file, "w", encoding="utf-8") as f:
         json.dump(bad_def, f)
 
-    # 1. Parsing without override raises LiveDumpPreflightError
+    # 1. Parsing the drift dump no longer raises: the strategy definition is still resolved
+    #    (that binding is deliberate and unchanged), but the gate does not run here.
+    parsed = rls.parse_args(["--strategy-file", str(strat_file)])
+    assert parsed._strategy_def["params"]["blend_weighting_mode"] == "rolling_ic_ir"
+    assert parsed._strategy_key == "chan_four_state_blend"
+
+    # 2. `main()` with the same argv still fails fast, naming both values.
     with pytest.raises(LiveDumpPreflightError) as exc_info:
-        rls.parse_args(["--strategy-file", str(strat_file)])
+        rls.main(["--strategy-file", str(strat_file), "--data-provider", "synthetic"])
     assert "rolling_ic_ir" in str(exc_info.value)
     assert "regime_ic_ir_hybrid" in str(exc_info.value)
 
-    # 2. Parsing with --allow-weighting-mode-override succeeds
+    # 3. `--allow-weighting-mode-override` still parses and is still bound (semantics intact).
     parsed = rls.parse_args([
         "--strategy-file", str(strat_file),
         "--allow-weighting-mode-override",
     ])
     assert parsed.allow_weighting_mode_override is True
     assert parsed._strategy_def["params"]["blend_weighting_mode"] == "rolling_ic_ir"
+
+
+def test_main_fails_preflight_before_any_ticket_written(tmp_path, healthy_chan_dump):
+    """(P1.10) The gate runs BEFORE every write: no ticket artifact, no output directory.
+
+    A drifting `chan_four_state_blend` dump (synthesised here from the same shape as the
+    tracked config entry -- no git-ignored dump is read) must abort `main()` with the gate's
+    refusal, and the output directory must not even exist afterwards. This is the structural
+    half of "fail before ticket": the preflight call must stay above `os.makedirs(...)`.
+    """
+    strategy_def, _ = healthy_chan_dump
+    bad_def = copy.deepcopy(strategy_def)
+    bad_def["params"]["blend_weighting_mode"] = "rolling_ic_ir"
+
+    strat_file = tmp_path / "chan_four_state_blend_strategy.json"
+    strat_file.write_text(json.dumps(bad_def), encoding="utf-8")
+    out_dir = tmp_path / "out"
+
+    with pytest.raises(LiveDumpPreflightError) as exc_info:
+        rls.main([
+            "--strategy-file", str(strat_file),
+            "--output-dir", str(out_dir),
+            "--data-provider", "synthetic",
+        ])
+
+    err = str(exc_info.value)
+    assert "rolling_ic_ir" in err
+    assert "regime_ic_ir_hybrid" in err
+
+    # Nothing was written, and the run never even reached `os.makedirs`.
+    assert not out_dir.exists()
+    for name in (
+        "live_trading_ticket.csv",
+        "live_trading_ticket.json",
+        "post_holdings.json",
+        "account_state.json",
+    ):
+        assert not (out_dir / name).exists()
+
+
+def test_main_override_still_bypasses_same_drift(
+    tmp_path, healthy_chan_dump, monkeypatch, capsys
+):
+    """(P1.10) `--allow-weighting-mode-override` still reaches the verifier and gets past it.
+
+    Spy variant: the spy runs the REAL verifier (so this proves the gate actually passes, not
+    merely that the flag was parsed), records its kwargs, then aborts the run with a sentinel
+    before any data load -- keeping the test offline and fast without a broad `except`.
+    """
+    strategy_def, _ = healthy_chan_dump
+    bad_def = copy.deepcopy(strategy_def)
+    bad_def["params"]["blend_weighting_mode"] = "rolling_ic_ir"
+
+    strat_file = tmp_path / "chan_four_state_blend_strategy.json"
+    strat_file.write_text(json.dumps(bad_def), encoding="utf-8")
+    out_dir = tmp_path / "out"
+
+    real_verifier = rls.verify_live_strategy_dump_preflight
+    seen = []
+
+    class _StopAfterGate(Exception):
+        pass
+
+    def _spy(**kwargs):
+        verdict = real_verifier(**kwargs)  # the REAL gate must let this dump through
+        seen.append((kwargs, verdict))
+        raise _StopAfterGate
+
+    monkeypatch.setattr(live_preflight, "_WARNED_MISMATCH", set())
+    monkeypatch.setattr(rls, "verify_live_strategy_dump_preflight", _spy)
+
+    with pytest.raises(_StopAfterGate):
+        rls.main([
+            "--strategy-file", str(strat_file),
+            "--output-dir", str(out_dir),
+            "--data-provider", "synthetic",
+            "--allow-weighting-mode-override",
+        ])
+
+    assert len(seen) == 1
+    kwargs, verdict = seen[0]
+    assert kwargs["allow_override"] is True
+    assert kwargs["strategy_key"] == "chan_four_state_blend"
+    # The override path stays honest: not "verified", but explicitly mismatch-overridden.
+    assert verdict.verified is False
+    assert verdict.mismatch_overridden is True
+
+    err = capsys.readouterr().err
+    assert "WARNING: PINNED WEIGHTING MODE MISMATCH" in err
+    assert "rolling_ic_ir" in err and "regime_ic_ir_hybrid" in err
+
+    # The sentinel fired before any write, in both the plain and the override path.
+    assert not out_dir.exists()
 
 
 def test_check_live_portfolio_health_cli_preflight_integration(tmp_path, healthy_chan_dump):

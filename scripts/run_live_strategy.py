@@ -1222,18 +1222,6 @@ def parse_args(args: Optional[List[str]] = None):
     parsed._resolved_desc = resolved_desc
     parsed._template = template
 
-    # (P1.8 / P1.9) Pre-flight consistency check between dump and strategies_config.json.
-    # The static-template exemption lives INSIDE the verifier (`is_static_template_exempt`).
-    # The name-only gate that used to sit here skipped `dual_momentum` -- a static template
-    # name that is ALSO a `strategies_config.json` key -- so a research dump keyed
-    # `dual_momentum` never had its pinned weighting mode checked (P1.9).
-    verify_live_strategy_dump_preflight(
-        strategy_def=strategy_def,
-        strategy_key=strategy_key,
-        strategy_file=parsed.strategy_file or resolved_desc,
-        allow_override=getattr(parsed, "allow_weighting_mode_override", False),
-    )
-
     # 2. Dynamically bind output directory to strategy key if not explicitly given.
     #    The path comes from `scripts.live_paths.default_live_output_dir` -- the same
     #    resolver Stage 1 (`scripts/check_live_portfolio_health.py`) uses for its own
@@ -1445,6 +1433,24 @@ def apply_intraday_distribution_gate(
 
 def main(cli_args: Optional[List[str]] = None):
     args = parse_args(cli_args)
+
+    # (P1.10 / 2026-10-24) Pre-flight consistency check between the resolved strategy dump and
+    # strategies_config.json. MOVED here from `parse_args()` so argument parsing stays free of
+    # this side effect (Stage 1 and the multi-strategy runner already gate in `main()`), and it
+    # now runs exactly once, at the start of the run.
+    # INVARIANT: this must stay ABOVE every write in this function -- the run has to fail
+    # BEFORE any ticket artifact exists -- so do NOT move it below `os.makedirs(...)` or the
+    # ticket construction; a "fail-before-ticket" regression is what P1.10 exists to prevent.
+    # The exemption for genuine static templates lives INSIDE the verifier
+    # (`is_static_template_exempt`); there is deliberately no name-only gate here any more --
+    # the bare name test skipped `dual_momentum`, a static template name that is ALSO a
+    # `strategies_config.json` key (P1.9).
+    verify_live_strategy_dump_preflight(
+        strategy_def=args._strategy_def,
+        strategy_key=args._strategy_key,
+        strategy_file=args.strategy_file or args._resolved_desc,
+        allow_override=getattr(args, "allow_weighting_mode_override", False),
+    )
 
     # (L2.3) as-of and the run-window gate come from `common/market_clock.py`, NOT
     # from the host's `date.today()`. The universe is resolved first only because the
