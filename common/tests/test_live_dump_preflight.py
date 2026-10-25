@@ -22,13 +22,19 @@ Validates:
 8. Static basket allocation templates (equal_weight, hrp, etc.) pass silently.
 9. Single-asset timing / non-blend strategies without pinned mode pass silently.
 10. End-to-end CLI integration in run_live_strategy.py, check_live_portfolio_health.py, and run_live_multi_strategy.py.
-11. (P1.9, 2026-10-24, two passes) The static-name COLLISION: `dual_momentum` is both a static
-    template name and a `strategies_config.json` key. The first pass closed only the spec-present
-    path; the second closes the four remaining shapes (stripped/empty spec, non-dict spec crash,
-    `template_name` shields, blank `template_name` + config-key `strategy_key`) and pins all 13
-    shapes as a parametrised probe. Spec presence now decides identity: a spec-bearing dump is
-    never static-exempt, and a no-spec dump is exempt only when every name it carries is a
-    static name that owns no config key.
+11. (P1.9, 2026-10-24, two passes + audit follow-up) The static-name COLLISION:
+    `dual_momentum` is both a static template name and a `strategies_config.json` key. The
+    first pass closed only the spec-present path; the second closes the four remaining shapes
+    (stripped/empty spec, non-dict spec crash, `template_name` shields, blank `template_name`
+    + config-key `strategy_key`) and pins all 13 shapes as a parametrised probe. Spec presence
+    now decides identity: a spec-bearing dump is never static-exempt, and a no-spec dump is
+    exempt only when every name it carries is a static name that owns no config key.
+    (Audit follow-up, same day) shapes 3/4/5 now carry a NON-config static `template_name`
+    (`equal_weight`) so only the spec-presence rule can reject them -- previously the
+    config-membership rule alone rejected them and the spec branch was untested; shape 9 is
+    no longer a copy of shape 1 but isolates caller-vs-spec identity precedence; and
+    `test_config_key_normalisation_prevents_static_exemption` pins the
+    `str(k).strip().lower()` config-key normalisation from `e2ed0e5`.
 """
 
 import copy
@@ -463,6 +469,33 @@ def _write_unpinned_config(tmp_path):
     return str(config_file)
 
 
+def _write_identity_precedence_config(tmp_path):
+    """Two-key config for the caller-vs-spec identity precedence shape (probe shape 9).
+
+    `dual_momentum` is the key a CALLER would pass and is deliberately left UNPINNED, while
+    `chan_four_state_blend` (the key the dump's spec declares) IS pinned. If identity ever
+    fell back to the caller's key, shape 9 would hit the no-pin branch and return
+    `verified=True` silently; only spec-first identity reaches the pinned comparison.
+    """
+    config_file = tmp_path / "strategies_config.json"
+    config_file.write_text(
+        json.dumps(
+            {
+                "dual_momentum": {
+                    "name": "Synthetic Active Dual Momentum GTAA",
+                    "parameters": {"rebalance_freq_days": 21},
+                },
+                "chan_four_state_blend": {
+                    "name": "Synthetic pin for identity precedence",
+                    "parameters": {"blend_weighting_mode": "regime_ic_ir_hybrid"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return str(config_file)
+
+
 def _colliding_dual_momentum_dump(mode):
     """A RESEARCH dump for the config key `dual_momentum` (identifies itself via the spec)."""
     return {
@@ -484,8 +517,32 @@ def _without_spec(dump):
     return {k: v for k, v in dump.items() if k != "research_strategy_spec"}
 
 
+def _nonconfig_static_dump(mode, **extra):
+    """A dump whose visible names are all static templates that own NO config key.
+
+    (P1.9 audit follow-up, 2026-10-24) `template_name` is `equal_weight` -- a static
+    template name that is not a `strategies_config.json` key -- so the static-exemption
+    test WOULD exempt this dump if it were read as spec-less. Every shape built from this
+    base therefore proves the SPEC branch really runs: mutate the verifier so the
+    empty/partial spec counts as "no spec" and the shape flips from `LiveDumpPreflightError`
+    to a silent `verified=True`.
+
+    Before this fix, probe shapes 3/4/5 used `template_name == strategy_key ==
+    "dual_momentum"`, i.e. a config key, so the config-membership rule alone rejected them
+    and they never reached the "empty/partial spec is not the same as no spec" branch --
+    a claim no test could turn red.
+    """
+    return {
+        "template_name": "equal_weight",
+        "params": {"blend_weighting_mode": mode},
+        **extra,
+    }
+
+
 # (label, payload, strategy_key, config kind, expected error substrings)
 # Shapes 1-6, 9-12 of the probe all MUST raise; 7-8 are the silent-pass shapes below.
+# Shapes 3/4/5 carry a NON-config static `template_name` on purpose (see
+# `_nonconfig_static_dump`): only the spec-presence rule can reject them.
 _PROBE_RAISES = [
     (
         "1-full-spec-drift",
@@ -502,28 +559,37 @@ _PROBE_RAISES = [
         ("rolling_ic_ir", "regime_ic_ir_hybrid"),
     ),
     (
-        "3-empty-spec-dict-drift",
-        {**_colliding_dual_momentum_dump("rolling_ic_ir"), "research_strategy_spec": {}},
+        # A spec-bearing dump must NEVER be static-exempt, even when its only visible name
+        # is a non-config static template. Mutation that turns this red:
+        # `spec_present = spec is not None` -> `spec_present = bool(spec)` (the empty dict
+        # then counts as "no spec", the dump is exempted on `equal_weight`, silent pass).
+        "3-empty-spec-dict-non-config-name-drift",
+        _nonconfig_static_dump("rolling_ic_ir", research_strategy_spec={}),
+        None,
+        "pinned",
+        ("equal_weight", "is not defined in configuration file"),
+    ),
+    (
+        # Partial spec with no `entry_data`: identity still comes from the spec. Mutation
+        # that turns this red: `spec_present = spec is not None` ->
+        # `spec_present = spec is not None and "entry_data" in spec`.
+        "4-spec-with-only-strategy-key-non-config-name",
+        _nonconfig_static_dump(
+            "rolling_ic_ir", research_strategy_spec={"strategy_key": "dual_momentum"}
+        ),
         None,
         "pinned",
         ("rolling_ic_ir", "regime_ic_ir_hybrid"),
     ),
     (
-        "4-spec-with-only-strategy-key",
-        {
-            **_colliding_dual_momentum_dump("rolling_ic_ir"),
-            "research_strategy_spec": {"strategy_key": "dual_momentum"},
-        },
-        None,
-        "pinned",
-        ("rolling_ic_ir", "regime_ic_ir_hybrid"),
-    ),
-    (
-        "5-spec-with-empty-entry-data",
-        {
-            **_colliding_dual_momentum_dump("rolling_ic_ir"),
-            "research_strategy_spec": {"strategy_key": "dual_momentum", "entry_data": {}},
-        },
+        # Partial spec whose `entry_data` is present but EMPTY. Mutation that turns this
+        # red (a weaker presence test than shape 4's): `spec_present = spec is not None` ->
+        # `spec_present = bool(spec.get("entry_data"))`.
+        "5-spec-with-empty-entry-data-non-config-name",
+        _nonconfig_static_dump(
+            "rolling_ic_ir",
+            research_strategy_spec={"strategy_key": "dual_momentum", "entry_data": {}},
+        ),
         None,
         "pinned",
         ("rolling_ic_ir", "regime_ic_ir_hybrid"),
@@ -543,11 +609,31 @@ _PROBE_RAISES = [
         ("research_strategy_spec", "cannot be overridden"),
     ),
     (
-        "9-strategy-key-none-full-drift-spec",
-        _colliding_dual_momentum_dump("rolling_ic_ir"),
-        None,
-        "pinned",
-        ("rolling_ic_ir", "regime_ic_ir_hybrid"),
+        # (P1.9 audit follow-up) This shape used to be byte-for-byte identical to shape 1.
+        # Now it isolates CALLER-VS-SPEC identity precedence: the caller passes the
+        # (unpinned) `dual_momentum` key while the spec declares `chan_four_state_blend`
+        # (pinned). Mutation that turns this red: swap the fallback order to
+        # `key = strategy_key or spec.get("strategy_key") or template_name` -- the dump then
+        # resolves to the unpinned caller key, hits the no-pin branch and passes silently.
+        "9-caller-key-vs-spec-key-precedence",
+        {
+            "template_name": "equal_weight",
+            "strategy_key": "dual_momentum",
+            "params": {"blend_weighting_mode": "rolling_ic_ir"},
+            "research_strategy_spec": {
+                "strategy_key": "chan_four_state_blend",
+                "entry_data": {
+                    "parameters": {"blend_weighting_mode": "rolling_ic_ir"}
+                },
+            },
+        },
+        "dual_momentum",
+        "two_key",
+        (
+            "for strategy 'chan_four_state_blend'",
+            "rolling_ic_ir",
+            "regime_ic_ir_hybrid",
+        ),
     ),
     (
         "10-blank-template-name-plus-config-key",
@@ -588,6 +674,8 @@ def test_probe_shapes_that_must_raise(tmp_path, payload, strategy_key, cfg_kind,
     config_file = (
         _write_collision_config(tmp_path, "regime_ic_ir_hybrid")
         if cfg_kind == "pinned"
+        else _write_identity_precedence_config(tmp_path)
+        if cfg_kind == "two_key"
         else _write_unpinned_config(tmp_path)
     )
     with pytest.raises(LiveDumpPreflightError) as exc_info:
@@ -762,6 +850,93 @@ def test_no_static_name_is_exempt_when_shadowed_by_config_key(tmp_path):
     assert live_preflight._config_strategy_keys(str(synth)) == frozenset({"only_here"})
     assert "only_here" not in live_preflight._config_strategy_keys()
     assert live_preflight._config_strategy_keys() == config_keys
+
+
+def test_config_key_normalisation_prevents_static_exemption(tmp_path):
+    """(P1.9 audit follow-up, 2026-10-24) Mixed-case / padded config keys must not re-exempt.
+
+    Commit `e2ed0e5` normalised the config-key set with `str(k).strip().lower()`, but no test
+    pinned it: reverting the normalisation turned nothing red. This is that test.
+
+    Mutation that turns this red: `_normalise_config_keys` ->
+    `frozenset(str(k) for k in keys)`. Then (1) the loader returns the raw `"Dual_Momentum"`
+    instead of `"dual_momentum"`, and (2) the spec-less `dual_momentum` dump no longer
+    matches the config set, so the static exemption fires and the verifier returns
+    `verified=True` instead of raising -- i.e. the exact silent bypass P1.9 closed.
+    """
+    config_file = tmp_path / "mixed_case_config.json"
+    config_file.write_text(
+        json.dumps(
+            {"Dual_Momentum": {"parameters": {"blend_weighting_mode": "regime_ic_ir_hybrid"}}}
+        ),
+        encoding="utf-8",
+    )
+
+    # 1. The loader hands back the NORMALISED key, not the raw spelling.
+    keys = live_preflight._config_strategy_keys(str(config_file))
+    assert keys == frozenset({"dual_momentum"})
+
+    # 2. The verifier therefore refuses to exempt a `dual_momentum` dump against this config:
+    #    a config key is CHECKED, whatever case/whitespace it was written in. (The raise is
+    #    the unregistered/raw-lookup refusal, not a pin comparison -- the raw lookup is
+    #    deliberately case-sensitive; the point here is only "not exempt".)
+    spec_less = {
+        "template_name": "dual_momentum",
+        "params": {"blend_weighting_mode": "rolling_ic_ir"},
+    }
+    with pytest.raises(LiveDumpPreflightError) as exc_info:
+        verify_live_strategy_dump_preflight(
+            spec_less,
+            strategy_file=str(tmp_path / "dual_momentum_strategy.json"),
+            config_path=str(config_file),
+        )
+    assert "dual_momentum" in str(exc_info.value)
+
+    # 3. The predicate agrees with the loader for the raw spelling (config membership wins).
+    assert is_static_template_exempt("dual_momentum", keys) is False
+    assert is_static_template_exempt(" Dual_Momentum ", keys) is False
+
+
+def test_identity_key_is_stripped_before_config_lookup(tmp_path):
+    """(P1.9 audit follow-up, 2026-10-24) The identity key is stripped, like every other name.
+
+    Mutations that turn this red:
+    * delete the `if isinstance(key, str): key = key.strip()` block -> case 1 reverts to the
+      raw `'  custom_alpha  '` spelling and case 3 is refused as "not defined" instead of
+      being compared against the pin.
+    """
+    # 1. Padded non-static name: the message names the stripped key, not the padded spelling.
+    with pytest.raises(LiveDumpPreflightError) as exc_info:
+        verify_live_strategy_dump_preflight(
+            {"template_name": "  custom_alpha  ", "params": {}},
+            strategy_file="custom_strategy.json",
+        )
+    err = str(exc_info.value)
+    assert "'custom_alpha'" in err
+    assert "'  custom_alpha  '" not in err
+
+    # 2. All-whitespace name: "cannot identify" (nothing to look up), not "not defined".
+    with pytest.raises(LiveDumpPreflightError) as exc_info:
+        verify_live_strategy_dump_preflight(
+            {"template_name": "   ", "params": {}}, strategy_file="anonymous_strategy.json"
+        )
+    assert "cannot identify" in str(exc_info.value)
+
+    # 3. Padded CONFIG KEY: resolves to that entry and is still NOT static-exempt, so the
+    #    pinned value is really compared (drift raises with both values).
+    config_file = _write_collision_config(tmp_path, "regime_ic_ir_hybrid")
+    with pytest.raises(LiveDumpPreflightError) as exc_info:
+        verify_live_strategy_dump_preflight(
+            {
+                "template_name": "  dual_momentum  ",
+                "params": {"blend_weighting_mode": "rolling_ic_ir"},
+            },
+            strategy_file=str(tmp_path / "dual_momentum_strategy.json"),
+            config_path=config_file,
+        )
+    err = str(exc_info.value)
+    assert "rolling_ic_ir" in err
+    assert "regime_ic_ir_hybrid" in err
 
 
 def test_strategy_without_pinned_mode_passes_silently(capsys):

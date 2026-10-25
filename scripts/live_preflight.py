@@ -204,6 +204,28 @@ def is_static_template(name: Optional[str]) -> bool:
 _CONFIG_KEYS_CACHE: Dict[str, frozenset] = {}
 
 
+def _normalise_config_keys(keys: Any) -> frozenset:
+    """Canonicalise an iterable of config top-level keys: `str(k).strip().lower()`.
+
+    (P1.9 audit follow-up, 2026-10-24) One pure helper, two callers: the cached
+    `_config_strategy_keys` loader and the verifier's already-loaded `cfg_data`. Before
+    this, both built the same comprehension inline; a future edit to one side (or to the
+    other) would have silently split the collision test in two.
+
+    Deliberately NOT a cached accessor: the verifier must use the keys of the config it
+    has ALREADY loaded (`config_path` may point at a synthesised file), so it takes the
+    already-parsed `cfg_data` and normalises it here -- no extra read, and no chance of
+    the per-path cache leaking a different file's keys into a live check.
+
+    Args:
+        keys: Any iterable of raw key objects (dict keys, list of strings, ...).
+
+    Returns:
+        frozenset of NORMALISED keys.
+    """
+    return frozenset(str(k).strip().lower() for k in keys)
+
+
 def _config_strategy_keys(cfg_file: Optional[str] = None) -> frozenset:
     """Return the set of top-level strategy keys declared in `strategies_config.json`.
 
@@ -240,9 +262,7 @@ def _config_strategy_keys(cfg_file: Optional[str] = None) -> frozenset:
         with open(resolved, "r", encoding="utf-8") as f:
             data = json.load(f)
         cached = (
-            frozenset(str(k).strip().lower() for k in data.keys())
-            if isinstance(data, dict)
-            else frozenset()
+            _normalise_config_keys(data.keys()) if isinstance(data, dict) else frozenset()
         )
         _CONFIG_KEYS_CACHE[resolved] = cached
     return cached
@@ -376,6 +396,22 @@ def verify_live_strategy_dump_preflight(
     else:
         key = strategy_key or template_name
 
+    # (P1.9 audit follow-up, 2026-10-24) Strip the identity key, matching the normalisation
+    # the static-exemption test already applies to every name. Two behaviour deltas, both
+    # message/identity only and both invisible on real artifacts (every tracked dump name is
+    # already stripped/lowercase -- the 58-dump verdict distribution is unchanged):
+    #   1. a whitespace-padded name is now reported as `'X'`, not `'  X  '`; an all-whitespace
+    #      name becomes the honest "cannot identify" instead of "strategy key '   ' is not
+    #      defined";
+    #   2. a padded name that equals a REAL config key (`'  dual_momentum  '`) now resolves to
+    #      that entry instead of being refused as unknown -- which is the intended reading: the
+    #      exemption test already treated it as the colliding name, so it is CHECKED (not
+    #      exempt) and either compared against the pin or admitted by the no-pin branch.
+    # Only a str is stripped -- a non-str identity (e.g. a numeric spec key) keeps its old
+    # behaviour rather than raising.
+    if isinstance(key, str):
+        key = key.strip()
+
     # Determine dump file display name for diagnostic error messages
     if strategy_file and str(strategy_file).endswith(".json"):
         dump_file_display = str(strategy_file)
@@ -423,9 +459,7 @@ def verify_live_strategy_dump_preflight(
     # RAW key, because they ask "is this exact strategy registered?", not "does this name
     # collide with a static template name".
     config_keys = (
-        frozenset(str(k).strip().lower() for k in cfg_data.keys())
-        if isinstance(cfg_data, dict)
-        else frozenset()
+        _normalise_config_keys(cfg_data.keys()) if isinstance(cfg_data, dict) else frozenset()
     )
     if not spec_present:
         absent_spec_names = [n for n in (template_name, strategy_key) if n]

@@ -3335,6 +3335,9 @@ exit: 1
 
 #### 20.10 `P1.9` 静态模板名与配置键撞名导致的 preflight 旁路闭环 (2026-10-24)
 
+> [!IMPORTANT]
+> **本节是「第一轮落地」的留痕记录（first pass），不是现行契约。** 下文所述的规则（「不是配置顶层键**或**该 dump 不携带 `research_strategy_spec`」、三参数 `is_static_template_exempt(..., has_research_spec=False)`、以及「不带 spec 必须豁免」的那条测试）**已被下方 §20.10.1 的第二轮实现取代**，并进一步被最终的「spec 存在性优先」规则取代；本节末的「已闭环」只对**第一轮**成立。阅读与实现核对**必须**以 §20.10.1 与 `scripts/live_preflight.py` 的当前代码为准，**不得**把本节当作当前行为规格。原文按仓库留痕惯例保留、未作删改。
+
 - **症状（结构性潜伏，不是新一轮事故）**：[`scripts/live_preflight.py`](file:///home/stone/Work/github/quant/scripts/live_preflight.py) 的 `_STATIC_TEMPLATE_NAMES`（13 个名字）含 `dual_momentum`，而 [`pipeline/research_strategy/strategies_config.json`](file:///home/stone/Work/github/quant/pipeline/research_strategy/strategies_config.json) 的顶层键中**确有同名策略键** `dual_momentum`（"Active Dual Momentum GTAA"；实测 58 个顶层键中它是与静态模板名撞名的**唯一**一个）。原实现里 `is_static_template()` 只是一次裸名字隶属判断，而 `verify_live_strategy_dump_preflight` 在**加载配置之前**就据此早退，三条实盘入口又各自复制了同一道裸名字门闩 —— 于是「以 `dual_momentum` 为键的研究 dump」**永远进不到钉住值比对**。今日之所以无实害：该配置条目的 `parameters` 只有 `rebalance_freq_days` / `top_k` / `cash_proxy`，**没有** `blend_weighting_mode` 可钉，即便不早退也会走 `pinned_mode is None` 放行。**它是一条等待被触发的静默旁路：哪天给它钉上权重模式，名字短路会让钉住值形同虚设，而 `P1.8` 的全绿测试看不到这件事。**
 - **选定规则（选项 C，所有者已批准）：配置成员关系优先，`research_strategy_spec` 是身份信号**。一个名字**仅当**同时满足下列两条才是**静态豁免**：
   1. 它是 13 个静态模板名之一（`is_static_template()`，语义**一字未改** —— 集合共 13 项，其中末 4 项 `momentum` / `hrp` / `inv_vol` / `ew` 是别名而非 `AllocationTemplate.name` 取值，13 项全部保持原样，既有 `test_is_static_template` 原封不动继续钉住它）；**且**
@@ -3374,6 +3377,7 @@ exit: 1
   3. **无 spec 的 dump**：仅当它携带的**每一个**名字（`template_name`、`strategy_key`）都是静态模板名**且**都不是 `strategies_config.json` 的顶层键时才豁免。用 `all()` 而非 `any()` 是刻意偏保守的方向：静态名与配置键混着出现的 dump 语义有歧义，一律**送检**。由此推出一条必须写明的语义变化：**真静态 `dual_momentum` 模板在实盘解析器里本就不可达**（`resolve_strategy_definition` 先匹配配置键并合成 `research_strategy_spec`），万一该条目哪天被钉上权重模式，这类 dump 现在是**被核对**而不是被信任。
   4. `is_static_template()` 与 13 名 + 4 别名**逐字节未改**；无钉住值分支仍返回 `verified=True`（「被核对」不等于「可疑」）。
   5. `is_static_template_exempt(name, config_keys)` 的 `has_research_spec` 形参**删除** —— 「是否豁免」的决定权收归验证器，避免同一判断在两处各有一套口径。
+- **配置可读性前提（fail-closed，2026-10-24 审计补记）**：静态模板豁免现在要求配置文件**可读**（`config_path` 不存在即抛 `LiveDumpPreflightError`），而第一轮是在读配置**之前**就早退、坏路径下的静态 dump 仍会通过；这是**行为变化且方向为失败关闭**，但在受跟踪配置存在的前提下**不可观测**（58 个真实 dump 的判定不变）。
 - **验证（实测，全离线）**：13 形状探针 → **0 处与预期不符**（11 条必 raise、形状 7/8 静默通过）；`common/tests/test_live_dump_preflight.py` **43 passed**（30 → 43，新增 11 条必 raise 的参数化用例 + 2 条静默通过用例，并把结构测试改写为新不变量：**带 spec 永不豁免 / 无 spec + 非配置键静态名才豁免 / 无 spec + 配置键名不豁免**，撞名集合仍钉死为 `{"dual_momentum"}`）；`common/tests` **776 passed / 1 skipped**；`pipeline/tests` **337 passed**。**58 个真实 dump 的只读对照**：改前改后均为 `verified=True, overridden=False` **×58，判定变化 = 0**（这 58 个 dump 全部携带字典型 spec，故现在都走配置核对；其中 6 个钉住值 dump 与配置**逐项相符**：cfsb `regime_ic_ir_hybrid`，其余 5 个 `rolling_ic_ir`）。Stage 1 静态路径实测仍为 `weighting_mode='rolling_ic_ir'` / `verified=true` / `overridden=false`、零 WARNING。
 - **版本轴判定**：同 §20.10 —— 仅改预检门禁与其测试，**零策略/模板类改动**（`git diff` 对 `pipeline/research/blend`、`pipeline/research_strategy/rs`、`common/allocation_templates.py` 为空），故**不升 `version` / `BASE_VERSION`，不重跑 `--dump-strategies`**；cfsb 的部署钉住值 `regime_ic_ir_hybrid` 原样未动。
 - **台账**：`P1.9` 早已是 `[x]`，本轮为同一任务的**第二轮补丁**，**不新增、不改写任何任务行**，故现役仍 **79 = 64 `[x]` + 15 `[ ]`**，两文件合计仍 **145 = 66 + 64 + 15**（归档 66 / 现役 64 / 待办 15）。
