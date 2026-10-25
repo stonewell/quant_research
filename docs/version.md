@@ -3337,7 +3337,7 @@ exit: 1
 
 - **症状（结构性潜伏，不是新一轮事故）**：[`scripts/live_preflight.py`](file:///home/stone/Work/github/quant/scripts/live_preflight.py) 的 `_STATIC_TEMPLATE_NAMES`（13 个名字）含 `dual_momentum`，而 [`pipeline/research_strategy/strategies_config.json`](file:///home/stone/Work/github/quant/pipeline/research_strategy/strategies_config.json) 的顶层键中**确有同名策略键** `dual_momentum`（"Active Dual Momentum GTAA"；实测 58 个顶层键中它是与静态模板名撞名的**唯一**一个）。原实现里 `is_static_template()` 只是一次裸名字隶属判断，而 `verify_live_strategy_dump_preflight` 在**加载配置之前**就据此早退，三条实盘入口又各自复制了同一道裸名字门闩 —— 于是「以 `dual_momentum` 为键的研究 dump」**永远进不到钉住值比对**。今日之所以无实害：该配置条目的 `parameters` 只有 `rebalance_freq_days` / `top_k` / `cash_proxy`，**没有** `blend_weighting_mode` 可钉，即便不早退也会走 `pinned_mode is None` 放行。**它是一条等待被触发的静默旁路：哪天给它钉上权重模式，名字短路会让钉住值形同虚设，而 `P1.8` 的全绿测试看不到这件事。**
 - **选定规则（选项 C，所有者已批准）：配置成员关系优先，`research_strategy_spec` 是身份信号**。一个名字**仅当**同时满足下列两条才是**静态豁免**：
-  1. 它是 13 个静态模板名之一（`is_static_template()`，语义**一字未改** —— 13 个名字与 `momentum` / `hrp` / `inv_vol` / `ew` 四个别名保持原样，既有 `test_is_static_template` 原封不动继续钉住它）；**且**
+  1. 它是 13 个静态模板名之一（`is_static_template()`，语义**一字未改** —— 集合共 13 项，其中末 4 项 `momentum` / `hrp` / `inv_vol` / `ew` 是别名而非 `AllocationTemplate.name` 取值，13 项全部保持原样，既有 `test_is_static_template` 原封不动继续钉住它）；**且**
   2. 它**不是** `strategies_config.json` 的顶层键，**或**该 dump 根本不携带 `research_strategy_spec`。
   理由：撞名时「配置成员关系」才是权威归属性信号；而 dump 是否带 `research_strategy_spec` 恰好把「真正的研究策略实例」与「手写的静态模板载荷」（`resolve_strategy_definition` 的 Case 4 产物，只有 `template_name`/`params`）区分开。反过来把 `dual_momentum` 从名字集合里删掉是**错的** —— 它是真实存在的静态模板名（`DualMomentumAllocation`），删名会弄坏该模板的合法放行路径。
 - **新增函数（均在 `scripts/live_preflight.py`）**：

@@ -62,10 +62,11 @@ The rule enforced now (second pass) is:
    (`resolve_strategy_definition` matches the config key first and synthesises a
    `research_strategy_spec`), and if that entry were ever pinned, such a dump is now checked
    rather than trusted.
-4. `is_static_template()` itself is untouched: the 13 names and the `momentum` / `hrp` / `inv_vol`
-   / `ew` aliases stay byte-identical (an existing test pins them). A CHECKED strategy that pins
-   no `blend_weighting_mode` still returns `verified=True` -- being checked is not the same as
-   being suspect.
+4. `is_static_template()` itself is untouched: the set has 13 entries and the last four
+   (`momentum`, `hrp`, `inv_vol`, `ew`) are aliases rather than `AllocationTemplate.name`
+   values; all 13 stay byte-identical (an existing test pins them). A CHECKED strategy that
+   pins no `blend_weighting_mode` still returns `verified=True` -- being checked is not the
+   same as being suspect.
 """
 
 import json
@@ -217,19 +218,32 @@ def _config_strategy_keys(cfg_file: Optional[str] = None) -> frozenset:
     Read lazily and cached per resolved path: the verifier prefers the key set from the
     config it has ALREADY loaded, and only falls back here (structural/inspection use).
 
+    (P1.9 nit / 2026-10-24) The returned set is NORMALISED (`str(k).strip().lower()`), the
+    same normalisation `is_static_template()` applies to the name. A raw key set made the
+    collision test asymmetric: `is_static_template_exempt` canonicalises the name but the
+    set was raw, so a config key written `Dual_Momentum` (or padded with whitespace) missed
+    the membership test and silently flipped the colliding static name back to EXEMPT --
+    re-opening the very bypass this module exists to close. Normalising here means the two
+    halves of the test cannot disagree. No live impact today: every tracked key is already
+    lowercase, so the normalised and raw sets are identical on real artifacts.
+
     Args:
         cfg_file: Optional path to the configuration file; defaults to the tracked
             `pipeline/research_strategy/strategies_config.json`.
 
     Returns:
-        frozenset of top-level keys (empty for a non-object / empty JSON document).
+        frozenset of NORMALISED top-level keys (empty for a non-object / empty JSON document).
     """
     resolved = os.path.abspath(cfg_file or _DEFAULT_CONFIG_PATH)
     cached = _CONFIG_KEYS_CACHE.get(resolved)
     if cached is None:
         with open(resolved, "r", encoding="utf-8") as f:
             data = json.load(f)
-        cached = frozenset(data.keys()) if isinstance(data, dict) else frozenset()
+        cached = (
+            frozenset(str(k).strip().lower() for k in data.keys())
+            if isinstance(data, dict)
+            else frozenset()
+        )
         _CONFIG_KEYS_CACHE[resolved] = cached
     return cached
 
@@ -243,8 +257,9 @@ def is_static_template_exempt(name: Optional[str], config_keys: frozenset) -> bo
     so that conflation cannot creep back in here.
 
     A name is exempt iff:
-    1. it is a static basket template name (`is_static_template` -- the 13 names plus the
-       `momentum` / `hrp` / `inv_vol` / `ew` aliases, unchanged), AND
+    1. it is a static basket template name (`is_static_template` -- 13 entries, the last four
+       of which, `momentum` / `hrp` / `inv_vol` / `ew`, are aliases rather than
+       `AllocationTemplate.name` values; unchanged), AND
     2. it is NOT a top-level key of `strategies_config.json`.
 
     Why config membership wins (#2): `dual_momentum` is simultaneously a genuine static
@@ -400,8 +415,18 @@ def verify_live_strategy_dump_preflight(
     #                      safe direction: a dump mixing a static-looking name with a
     #                      config-key name is ambiguous, so it gets CHECKED.
     #
-    # The key set is reused from the config already in memory -- one read, one owner.
-    config_keys = frozenset(cfg_data.keys()) if isinstance(cfg_data, dict) else frozenset()
+    # The key set is reused from the config already in memory -- one read, one owner. It is
+    # NORMALISED exactly like the name test so the two halves of the collision test cannot
+    # disagree (`Dual_Momentum` / padded keys would otherwise look absent and re-exempt).
+    # NOTE: this normalised set is used ONLY for the static-name collision test. The
+    # registered-strategy lookups below (`key not in cfg_data` / `cfg_data[key]`) keep the
+    # RAW key, because they ask "is this exact strategy registered?", not "does this name
+    # collide with a static template name".
+    config_keys = (
+        frozenset(str(k).strip().lower() for k in cfg_data.keys())
+        if isinstance(cfg_data, dict)
+        else frozenset()
+    )
     if not spec_present:
         absent_spec_names = [n for n in (template_name, strategy_key) if n]
         if absent_spec_names and all(
