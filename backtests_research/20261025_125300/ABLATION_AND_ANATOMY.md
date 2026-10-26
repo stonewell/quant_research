@@ -28,6 +28,10 @@
 
 **无风险利率**：全流程未引入任何无风险利率来源，`risk_free` 取默认值 `0.0`（`sharpe_ratio`/`alpha_beta` 均为 `risk_free: float = 0.0`，`run_backtest.py` 调用时不传该参数）。本报告所有 Sharpe / Alpha 均按 **rf = 0** 计算。
 
+> [!CAUTION]
+> **口径陷阱（2026-10-25 补记）：`walkforward_summary.json` 逐折行里的 `baseline_*` 不是策略基线，禁止用它算 Δ。**
+> 臂目录内 `rolling_window_performance[*]` 带 `baseline_cagr` / `baseline_sharpe_ratio` / `baseline_max_drawdown` 三个字段；它们描述的是 **`000300.SH` 的 `equal_weight` 基准**（`comparison_report.json` 的 `baseline_symbol` / `baseline_template` 可证），因而**在同一折上所有策略、所有臂取值完全相同**（实测 39 个叶 × 18 折均一致，首折 `baseline_sharpe_ratio = −3.0299`），**不是**该策略 `08_ablate_wf/baseline/<strategy>/` 的 `mean_cagr`。两者偏差：**逐折最大 147–192pp**（cfsb −192.1pp / crb −162.3pp / cdhb −147.5pp，均出现在 `2023-01-17` 折），**折均值口径 19.6–24.1pp**。⇒ **本报告的 Δ 一律以 `08_ablate_wf/baseline/<strategy>/` 为基准计算，绝不使用臂目录内的 `baseline_*` 列。**另注意与本文件 §1.2 校验项里 `comparison_report.json` 的 `baseline_cagr` 区分开：后者在 standard 模式下确为同策略 equal-weight 基准，用法无误。
+
 ### 1.2 自算与产码的一致性校验（可证伪点）
 
 | 校验项 | 结果 |
@@ -104,6 +108,11 @@
 | no_circuit | 四态 | 188.98% | 24.76% | 1.615 | 10.70% | 2.31 | 462 | 62.44 | 13.52% | ≡ 0 | ≡ 0 | ≡ 0 | **0** |
 | no_circuit | 风险 | 224.71% | 27.83% | 1.789 | 9.54% | 2.92 | 480 | 62.55 | 13.03% | ≡ 0 | ≡ 0 | ≡ 0 | **0** |
 | no_circuit | 双重 | 116.44% | 17.47% | 1.258 | 11.80% | 1.48 | 503 | 70.30 | 13.98% | +0.004pp | +0.0003 | −0.008pp | 43（相对 2.6e-4）≈ |
+
+> [!WARNING]
+> **勘误（2026-10-25）：本表 `no_atrstop` 三行的归属主体是「自适应止损乘数」，不是「ATR 跟踪止损」。**
+>
+> 上表三行的**数字与 Δ 全部不变**（+2.52 / +0.98 / +1.01pp 等逐字保留），变的只是它们所测的对象：`no_atrstop` 臂的唯一 override 是 `{"blend_enable_adaptive_stop_atr": false}`，`*_stop_mode` 仍为 `"atr_trailing"`、`*_stop_atr_mult` 仍为 `4.5`，**止损本身从未被移除**（机制与三份产物证据见 §3.4 勘误与 §7.1 勘误）。因此三行只能读作「把自适应乘数固定为常数 4.5× 后的响应」，**不得**读作「关掉 ATR 止损后的响应」。本臂**非 ≡** 基线（§3.2 的 ✓/✓/✓）这一判定不受影响，仍然成立——固定乘数确实改变了止损价格。
 
 ### 2.1 换手口径的一个重要区分（否则会误读上表"次数"）
 
@@ -194,7 +203,7 @@
 | no_orthogon | `blend_enable_orthogonalization: true→false` | 同 | 同 | ✅ 有效 |
 | no_structregime | `blend_enable_structural_regime: true→false` | 同（**但代码路径不可达**） | 同（**不可达**） | ⚠️ 配置落地但机制不可达 |
 | no_cyq | `blend_enable_cyq_quality_gate: true→false` | 同 | 同 | ✅ 有效 |
-| no_atrstop | `blend_enable_adaptive_stop_atr: true→false` | 同 | 同 | ✅ 有效 |
+| no_atrstop | `blend_enable_adaptive_stop_atr: true→false` | 同 | 同 | ✅ 落地（**仅切换乘数**：`eff_stop_mult` 由自适应裁剪值退回常数 4.5，`stop_mode` 仍为 `atr_trailing`，止损未被移除——见下方勘误） |
 | no_lowbeta | `blend_enable_low_beta_inertia: true→false` | 同 | 同（**行为无变化**） | ✅ 落地 / cdhb 无效 |
 | no_sectorthrot | `blend_max_assets_per_sector: 2→20`、`cfsb_max_assets_per_sector: null→20`、`cfsb_adaptive_sector_throttle: null→false` | 同（`crb_*`） | `blend_max_assets_per_sector: 2→20`、`cdhb_max_assets_per_sector: 2→20`、`cdhb_adaptive_sector_throttle: true→false` | ⚠️ cfsb/crb 部分无效，见下 |
 | no_hysteresis | `blend_enable_regime_hysteresis: true→false` | `null→false`（**基线本就 False**） | `null→false`（**基线本就 False**） | ⚠️ crb/cdhb 无效 |
@@ -217,6 +226,19 @@ pipeline/research_strategy/rs/config.py:1350: UserWarning: StrategyConfig.from_d
 → **结论：`no_sectorthrot` 只能解释为"放开行业集中度上限（2→20）"这一个杠杆**；对 cdhb 才是"上限放开 + 自适应节流关闭"的复合杠杆。三者的 Δ 因此**不可横向比较**。
 
 （全库仅此 4 行 `UserWarning`，其余 35 个臂的 override 键均被 `StrategyConfig` 正常识别。）
+
+> [!WARNING]
+> **勘误（2026-10-25）：`no_atrstop` 的落地判定「✅ 有效」原被读作「止损被关掉」——它只关掉了自适应乘数。**
+>
+> **原文（保留原样）**：上表该行原写作「`no_atrstop` | `blend_enable_adaptive_stop_atr: true→false` | 同 | 同 | **✅ 有效**」——**override 字符串本身是对的**（本表从未写错这个键），错的是判定栏的语义：它被后续章节（§2 表、§7.1）当成了「ATR 止损已移除」的依据。
+>
+> **为什么错**：`enable_adaptive_stop_atr` 在 `pipeline/research/blend/blend_base.py` 全文件只出现两处——`:612`（`resolve_param` 读取）与 `:892`（`if enable_adaptive_stop_atr:` 分支）。止损块本身由 `:875` 的 `if stop_mode in ("atr_trailing", "fixed_pct")` 守卫、由 `:914` 的 `if curr_p < trailing_stop_p:` 触发，与这个开关无关。开关为 `False` 时唯一的差别是 `:891` 的 `eff_stop_mult = stop_atr_mult`（= 4.5）不再被 `clip(stop_atr_mult * (med_vol / s_vol), 3.5, 7.5)` 覆盖（`:892–896`），`:897` 的 `trailing_stop_p = max(asset_entry_price[s] * 0.92, peak_p - eff_stop_mult * cur_atr)` 照常计算。**该臂测的是「自适应乘数 → 常数 4.5×」。**
+>
+> **产物证据（6/6 叶：`06_ablate` 与 `08_ablate_wf` 各 3 策略）**：`run_manifest.json` → `cli_overrides` 只含 `{"blend_enable_adaptive_stop_atr": false}`；`strategy_dump.json` → `params` 中 `*_stop_mode` 仍为 `"atr_trailing"`、`*_stop_atr_mult` 仍为 `4.5`；`run.log` 第 2 行 `Parameters: {...}` 运行期参数同值（本表前提 `dump_vs_log_agree = True` 已核）。
+>
+> **臂定义并非新发现**：`docs/backtest_research.md` §8 的 `no_atrstop` 行与其后「语义边界披露」早已写明「关闭后回退至固定 4.5x ATR 追踪止损，**并不是**彻底关闭底层 ATR 止损机制本身（彻底关闭需设置 `"${pfx}_stop_mode": "none"`）」。本报告 §1.3 声明臂定义逐字取自该来源，**却在解释结果时没有回读自己引用的定义**——这是本次误标的直接原因。
+>
+> **反向证据与仍成立的部分**：真正的「止损关闭」臂是 `09_param_grid/atr/atr_none`（`cdhb_stop_mode = "none"`，18 折、`2022-01-04`→`2026-10-22`），cdhb 上 ΔCAGR **−0.1590pp**、ΔMaxDD **+0.2137pp（更差）**——止损拿掉后收益没升、回撤反而更深。仍然成立的是「把自适应乘数固定为 4.5× 后三策略 CAGR 全部上升」这一**描述性事实**。完整勘误见 §7.1。
 
 ### 3.5 `04_r1_std_cb_compare` 专项：一对完全重复的对照组
 
@@ -407,11 +429,36 @@ pipeline/research_strategy/rs/config.py:1350: UserWarning: StrategyConfig.from_d
 | **惯性/换手过滤（`no_inertia`）是真实且高价值的杠杆**：关闭后调仓次数 462→893 / 480→947 / 503→917（**+82%~+97%**），Σ换手 62→112 / 63→119 / 70→126（**+80%~92%**），CAGR 全部下降 −2.73pp / −3.70pp / −3.02pp，Sharpe 全部下降 −0.060 / −0.105 / −0.132。**三策略同向、换手侧证据与收益侧证据互相印证**（不是单一路径噪声能造出的），这是本批消融中唯一"双向一致"的结论。 | ✅✅ 最强 | **可信** |
 | **CYQ 质量门（`no_cyq`）主要是回撤保护器**：关闭后四态 MaxDD 10.70%→16.76%（**+6.06pp**）、风险 9.54%→13.29%（**+3.75pp**），而 CAGR 只 −0.45pp / −0.67pp。即"牺牲不到 0.7pp 收益换 3.8–6.1pp 回撤"。双重方向相反（+1.56pp CAGR、DD −0.48pp）。 | ✅ 四态/风险同向且幅度大 | **对四态、风险可信；不适用于双重** |
 | **行业集中度上限（`no_sectorthrot`）的净效果是压回撤**：放开 2→20 后风险 MaxDD +2.39pp、四态 +1.38pp，CAGR 几乎不动（−0.38pp / +0.11pp）。双重反向（DD −1.03pp）。注意该臂在 cfsb/crb 上**只测了上限、没测 throttle**（§3.4）。 | ✅ 两策略同向 | **方向可信，"上限换回撤"这一半** |
-| **ATR 跟踪止损（`no_atrstop`）在本窗口是净损耗**：关闭后三策略 CAGR **全部上升**（+2.52 / +0.98 / +1.01pp），MaxDD 两降一微升（−1.34 / −0.94 / +0.11pp），Σ换手几乎不变（62.4→63.3 等）。即止损既没换来更低回撤、也没降低摩擦，只是削掉了收益。**三策略同向，且与"止损=保险"的直觉相反**。 | ✅ 同向，幅度略超噪声但 Sharpe 增益仅 +0.03~+0.15 | **方向可信，量级需保留** |
+| **自适应止损乘数（`no_atrstop`）在本窗口被固定为常数 4.5× 后收益上升**：该臂 override 只有 `blend_enable_adaptive_stop_atr: false`，`stop_mode` 仍为 `atr_trailing`、`stop_atr_mult` 仍为 4.5（§3.4），所以它测的是「自适应乘数 → 常数 4.5×」，**不是**「止损 → 无止损」。三策略 CAGR 全部上升（+2.52 / +0.98 / +1.01pp），MaxDD 两降一微升（−1.34 / −0.94 / +0.11pp），Σ换手几乎不变（62.4→63.3 等）⇒ 只能读作「`med_vol/s_vol` 自适应缩放在本窗口没有体现出正贡献」。 | ✅ 三策略同向，幅度略超噪声但 Sharpe 增益仅 +0.03~+0.15 | **方向可信，但主体是「自适应乘数」**；原「ATR 跟踪止损是净损耗」的表述**作废**（见下方勘误） |
 | **波动率目标（`no_voltarget`）是净损耗**：关闭后三策略 CAGR +1.14~+1.51pp、Sharpe +0.015~+0.091，MaxDD 仅 +0.02~+0.92pp。三策略同向但**全部落在噪声下限内**（ΔSharpe ≤ 0.091 < 0.15）。 | ⚠️ 同向但幅度不足 | **只能判定"没有可测到的正贡献"，不能判定"应删除"** |
 | **牛市满仓（`bull_full`）用回撤换收益**：三策略 MaxDD **全部恶化** +3.61 / +2.80 / +1.77pp，CAGR 两升一降，Sharpe 两降一升。 | ✅ MaxDD 侧三策略同向且幅度 >3pp 的组合 | **"抬高回撤"可信；"抬高收益"不可信** |
 | **正交化（`no_orthogon`）符号不稳定**：风险 −3.73pp/−0.193、四态 +0.95pp/+0.098、双重 +1.64pp/+0.123。 | ❌ 反向矛盾 | **不可信，不得声称"正交化有效/无效"** |
 | **推力现金部署（`no_thrust`）符号不稳定**：风险 **−7.18pp**（本次最大单臂跌幅）、双重 +2.05pp/+0.369、四态 +0.14pp。 | ❌ 反向矛盾（幅度差 9.2pp） | **不可信。唯一稳健的次结论是"去掉它会大幅降低换手"（Σ换手 62.44→40.20 / 62.55→35.97 / 70.31→46.98，即 −33%~−42%）** |
+
+> [!WARNING]
+> **勘误（2026-10-25）：`no_atrstop` 臂从未关闭 ATR 跟踪止损，上一版「ATR 跟踪止损在本窗口是净损耗」的结论作废。**
+>
+> **原文（逐字保留，以便对照）**：
+>
+> > 「**ATR 跟踪止损（`no_atrstop`）在本窗口是净损耗**：关闭后三策略 CAGR **全部上升**（+2.52 / +0.98 / +1.01pp），MaxDD 两降一微升（−1.34 / −0.94 / +0.11pp），Σ换手几乎不变（62.4→63.3 等）。即止损既没换来更低回撤、也没降低摩擦，只是削掉了收益。**三策略同向，且与"止损=保险"的直觉相反**。」（原判定栏：「✅ 同向，幅度略超噪声但 Sharpe 增益仅 +0.03~+0.15」「**方向可信，量级需保留**」）
+>
+> **为什么错（机制层）**：该臂的唯一 override 是 `{"blend_enable_adaptive_stop_atr": false}`，**它从未触碰 `stop_mode`**。`enable_adaptive_stop_atr` 在 `pipeline/research/blend/blend_base.py` 全文件只出现两处：`:612`（`resolve_param` 读取）与 `:892`（`if enable_adaptive_stop_atr:` 分支）。止损块由 `:875` 的 `if stop_mode in ("atr_trailing", "fixed_pct")` 守卫、由 `:914` 的 `if curr_p < trailing_stop_p:` 触发；开关为 `False` 时唯一差别是 `:891` 的 `eff_stop_mult = stop_atr_mult`（4.5）不再被 `:892–896` 的 `np.clip(stop_atr_mult * (med_vol / s_vol), 3.5, 7.5)` 覆盖。⇒ **该臂测的是「自适应乘数 → 常数 4.5×」，不是「止损 → 无止损」。**
+>
+> **为什么错（流程层）**：`docs/backtest_research.md` §8 的 `no_atrstop` 行与其后「语义边界披露」早已写明——关闭后「回退至固定 4.5x ATR 追踪止损，**并不是**彻底关闭底层 ATR 止损机制本身（彻底关闭需设置 `"${pfx}_stop_mode": "none"`）」。本报告 §1.3 明言臂定义逐字取自该来源，却在解释结果时没有回读自己引用的定义。**这是一次「臂标签被当成语义」的误标，不是数字错误。**
+>
+> **三份产物证据（6/6 叶一致：`06_ablate` 与 `08_ablate_wf` × cfsb/crb/cdhb）**：
+> 1. `run_manifest.json` → `cli_overrides` 只含 `{"blend_enable_adaptive_stop_atr": false}`（无 `*_stop_mode` 键）；
+> 2. `strategy_dump.json` → `params` 中 `*_stop_mode` 仍为 `"atr_trailing"`、`*_stop_atr_mult` 仍为 `4.5`；
+> 3. `run.log` 第 2 行 `Parameters: {...}` 的运行期生效参数同值（§3.4 已核 39/39 叶 `dump_vs_log_agree = True`）。
+>
+> **反向证据（真正的「止损关闭」臂，18 折 walkforward）**：`09_param_grid/atr/atr_none`（`cdhb_stop_mode = "none"`，`2022-01-04`→`2026-10-22`，0.25y/0.25y，`--cash-sweep-rate 0.015`）对 cdhb 给出 **ΔCAGR −0.1590pp、ΔMaxDD +0.2137pp（更差）**（`backtests_research/20261025_125300/09_param_grid/atr/atr_none/chan_dual_hybrid_blend/walkforward_summary.json` 对 `08_ablate_wf/baseline/chan_dual_hybrid_blend/`；该臂 `run.log` 的生效参数为 `blend_enable_adaptive_stop_atr: True` + `cdhb_stop_mode: 'none'`，与 `no_atrstop` 正好互补）。即**把止损真正拿掉，收益并未上升、回撤反而更深**，与「止损是净拖累」方向相反。
+>
+> **仍然成立的（主体已更换，不得丢）**：
+> - 「把自适应乘数固定为 4.5× 后，三策略 CAGR 全部上升（+2.52 / +0.98 / +1.01pp）」这个**描述性事实**不变，可引用；主体必须写成「自适应乘数」。
+> - `no_atrstop` 与基线**非 ≡**（§3.2 的 ✓/✓/✓、§3.1 的相对差判定）仍然成立且自洽——固定乘数确实改变了 `trailing_stop_p`，从而改变止损价格与成交。
+> - 「**不得**移除 ATR 止损」这一禁令不但没被推翻，反而被 `atr_none` 加强（真实移除后 CAGR 侧不升、回撤侧更深）。
+>
+> **判废范围**：作废的只是**主体为「ATR 跟踪止损」的因果解释**与**其「方向可信」评级**；数字、序号、观测本身全部保留。下游若曾引用「6/6 格关掉止损 CAGR 升」（`06` standard × 3 + `08` walkforward × 3 共 6 格），该引用须一并改写为「关掉自适应乘数」。
 
 ### 7.2 哪些臂必须判定为无效（不得解释、不得引用）
 

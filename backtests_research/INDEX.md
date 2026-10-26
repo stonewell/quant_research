@@ -1,8 +1,8 @@
 # 回测研究运行索引 (Backtest Research Index)
 
-本文档由回测流程维护，记录每次正式回测运行（`backtests_research/<run_ts>/...`）的自审计元数据与复核索引。每一行对应一个叶子运行目录，取值以同目录下的 `run_manifest.json` 为单一事实来源（SSOT）。
+本文档由回测流程维护，记录每次正式回测运行（`backtests_research/<run_ts>/...`）的自审计元数据与复核索引。每一行对应一个叶子运行目录，取值以同目录下的 `run_manifest.json` 为单一事实来源（SSOT）。上表在册运行 + 「已登记但不再索引」一节的运行 = 磁盘实际叶子目录数；**索引不含不代表产物不存在**。
 
-| 时间戳目录 | 实验组 (01–08) | 策略 | 关键指标 CAGR / Sharpe / MaxDD | 本次运行的变更点或消融臂 | 对应 [docs/development_plan.md](file:///home/stone/Work/github/quant/docs/development_plan.md) 任务条目 |
+| 时间戳目录 | 实验组 (01–09) | 策略 | 关键指标 CAGR / Sharpe / MaxDD | 本次运行的变更点或消融臂 | 对应 [docs/development_plan.md](file:///home/stone/Work/github/quant/docs/development_plan.md) 任务条目 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | `20261025_125300` | `01_r1_longwin` | Chan Dual Hybrid Alpha Blend Strategy | CAGR: 25.31% / Sharpe: 1.66 / MaxDD: 8.84% | 长窗口基准 (4折 walkforward, 2.0y window / 0.25y step) | L2.48, L2.50 |
 | `20261025_125300` | `01_r1_longwin` | Chan Four-State Risk-Managed Blend Strategy | CAGR: 30.78% / Sharpe: 1.82 / MaxDD: 9.86% | 长窗口基准 (4折 walkforward, 2.0y window / 0.25y step) | L2.48, L2.50 |
@@ -10,23 +10,12 @@
 | `20261025_125300` | `01_r1_longwin` | Chan Risk-Managed Blend Strategy | CAGR: 31.39% / Sharpe: 1.86 / MaxDD: 9.29% | 长窗口基准 (4折 walkforward, 2.0y window / 0.25y step) | L2.48, L2.50 |
 | `20261025_125300` | `01_r1_longwin` | Chan Single Crisis Shield Blend Strategy | CAGR: 27.80% / Sharpe: 1.71 / MaxDD: 10.41% | 长窗口基准 (4折 walkforward, 2.0y window / 0.25y step) | L2.48, L2.50 |
 | `20261025_125300` | `01_r1_longwin` | Generic Multi-Strategy Blend (Adaptive) | CAGR: 13.87% / Sharpe: 0.96 / MaxDD: 14.83% | 长窗口基准 (4折 walkforward, 2.0y window / 0.25y step) | L2.48, L2.50 |
-| `20261025_125300` | `02_r2a_std` | Chan Four-State Risk-Managed Blend Strategy | CAGR: 23.91% / Sharpe: 1.57 / MaxDD: 10.90% | 连续基准 (1,161 bars 连续 standard, 2022-01-04→2026-10-22) | L2.47, L2.48 |
-| `20261025_125300` | `02_r2a_std` | Chan Risk-Managed Blend Strategy | CAGR: 28.03% / Sharpe: 1.82 / MaxDD: 9.80% | 连续基准 (1,161 bars 连续 standard, 2022-01-04→2026-10-22) | L2.47, L2.48 |
-| `20261025_125300` | `02_r2a_std` | Generic Multi-Strategy Blend (Adaptive) | CAGR: 10.26% / Sharpe: 0.74 / MaxDD: 14.60% | 连续基准 (1,161 bars 连续 standard, 2022-01-04→2026-10-22) | L2.47, L2.48 |
 | `20261025_125300` | `03_r2b_oos` | Chan Dual Hybrid Alpha Blend Strategy | CAGR: 26.15% / Sharpe: 2.57 / MaxDD: 4.00% | 样本外基准 (6折 walkforward, 0.25y window / 0.25y step) | L2.48, L2.50 |
 | `20261025_125300` | `03_r2b_oos` | Chan Four-State Risk-Managed Blend Strategy | CAGR: 23.79% / Sharpe: 1.81 / MaxDD: 4.47% | 样本外基准 (6折 walkforward, 0.25y window / 0.25y step) | L2.48, L2.50 |
 | `20261025_125300` | `03_r2b_oos` | Chan Four-State Shield Blend Strategy | CAGR: 15.73% / Sharpe: 1.56 / MaxDD: 4.74% | 样本外基准 (6折 walkforward, 0.25y window / 0.25y step) | L2.48, L2.50 |
 | `20261025_125300` | `03_r2b_oos` | Chan Risk-Managed Blend Strategy | CAGR: 34.96% / Sharpe: 2.30 / MaxDD: 4.40% | 样本外基准 (6折 walkforward, 0.25y window / 0.25y step) | L2.48, L2.50 |
 | `20261025_125300` | `03_r2b_oos` | Chan Single Crisis Shield Blend Strategy | CAGR: 21.83% / Sharpe: 1.94 / MaxDD: 4.28% | 样本外基准 (6折 walkforward, 0.25y window / 0.25y step) | L2.48, L2.50 |
 | `20261025_125300` | `03_r2b_oos` | Generic Multi-Strategy Blend (Adaptive) | CAGR: 0.16% / Sharpe: 0.24 / MaxDD: 6.04% | 样本外基准 (6折 walkforward, 0.25y window / 0.25y step) | L2.48, L2.50 |
-| `20261025_125300` | `04_r1_std_cb_compare/baseline` | Chan Four-State Risk-Managed Blend Strategy | CAGR: 23.95% / Sharpe: 1.50 / MaxDD: 10.90% | 熔断开启基准臂 (同区间 standard, 726 bars, 2022-01-04→2024-12-31) | L2.50 |
-| `20261025_125300` | `04_r1_std_cb_compare/no_circuit` | Chan Four-State Risk-Managed Blend Strategy | CAGR: 23.95% / Sharpe: 1.50 / MaxDD: 10.90% | 熔断关闭对照臂 (同区间 standard, 726 bars, 2022-01-04→2024-12-31, dd_thresh=10.0) | L2.50 |
-| `20261025_125300` | `05_anatomy` | Chan Dual Hybrid Alpha Blend Strategy | CAGR: 17.44% / Sharpe: 1.25 / MaxDD: 11.80% | 全景解剖 (连续 standard + 现金计息 1.5% + 市场冲击 5%) | L2.49, L2.50 |
-| `20261025_125300` | `05_anatomy` | Chan Four-State Risk-Managed Blend Strategy | CAGR: 24.60% / Sharpe: 1.61 / MaxDD: 10.80% | 全景解剖 (连续 standard + 现金计息 1.5% + 市场冲击 5%) | L2.49, L2.50 |
-| `20261025_125300` | `05_anatomy` | Chan Four-State Shield Blend Strategy | CAGR: 22.11% / Sharpe: 1.39 / MaxDD: 11.10% | 全景解剖 (连续 standard + 现金计息 1.5% + 市场冲击 5%) | L2.49, L2.50 |
-| `20261025_125300` | `05_anatomy` | Chan Risk-Managed Blend Strategy | CAGR: 27.80% / Sharpe: 1.79 / MaxDD: 9.70% | 全景解剖 (连续 standard + 现金计息 1.5% + 市场冲击 5%) | L2.49, L2.50 |
-| `20261025_125300` | `05_anatomy` | Chan Single Crisis Shield Blend Strategy | CAGR: 27.30% / Sharpe: 1.67 / MaxDD: 12.00% | 全景解剖 (连续 standard + 现金计息 1.5% + 市场冲击 5%) | L2.49, L2.50 |
-| `20261025_125300` | `05_anatomy` | Generic Multi-Strategy Blend (Adaptive) | CAGR: 10.42% / Sharpe: 0.76 / MaxDD: 14.50% | 全景解剖 (连续 standard + 现金计息 1.5% + 市场冲击 5%) | L2.49, L2.50 |
 | `20261025_125300` | `06_ablate/baseline` | Chan Dual Hybrid Alpha Blend Strategy | CAGR: 17.46% / Sharpe: 1.26 / MaxDD: 11.80% | 消融基线臂 (连续 standard + 现金计息 1.5%) | L2.49, L2.50 |
 | `20261025_125300` | `06_ablate/baseline` | Chan Four-State Risk-Managed Blend Strategy | CAGR: 24.76% / Sharpe: 1.62 / MaxDD: 10.70% | 消融基线臂 (连续 standard + 现金计息 1.5%) | L2.49, L2.50 |
 | `20261025_125300` | `06_ablate/baseline` | Chan Risk-Managed Blend Strategy | CAGR: 27.83% / Sharpe: 1.79 / MaxDD: 9.50% | 消融基线臂 (连续 standard + 现金计息 1.5%) | L2.49, L2.50 |
@@ -111,3 +100,37 @@
 | `20261025_125300` | `08_ablate_wf/no_voltarget` | Chan Dual Hybrid Alpha Blend Strategy | CAGR: 26.48% / Sharpe: 1.49 / MaxDD: 4.41% | 消融臂 walkforward 复核: 关闭 Garman-Klass 波动率目标 (enable_vol_targeting=false) | L2.49, L2.50 |
 | `20261025_125300` | `08_ablate_wf/no_voltarget` | Chan Four-State Risk-Managed Blend Strategy | CAGR: 30.57% / Sharpe: 1.39 / MaxDD: 4.93% | 消融臂 walkforward 复核: 关闭 Garman-Klass 波动率目标 (enable_vol_targeting=false) | L2.49, L2.50 |
 | `20261025_125300` | `08_ablate_wf/no_voltarget` | Chan Risk-Managed Blend Strategy | CAGR: 31.41% / Sharpe: 1.63 / MaxDD: 4.38% | 消融臂 walkforward 复核: 关闭 Garman-Klass 波动率目标 (enable_vol_targeting=false) | L2.49, L2.50 |
+| `20261025_125300` | `09_param_grid/atr/atr_6_0` | Chan Dual Hybrid Alpha Blend Strategy | CAGR: 24.62% / Sharpe: 1.41 / MaxDD: 4.38% | 参数网格 walkforward: cdhb_stop_atr_mult=6.0（18 折, 2022-01-04→2026-10-22, --cash-sweep-rate 0.015） | L2.49 |
+| `20261025_125300` | `09_param_grid/atr/atr_6_0` | Chan Four-State Risk-Managed Blend Strategy | CAGR: 30.45% / Sharpe: 1.48 / MaxDD: 4.52% | 参数网格 walkforward: cfsb_stop_atr_mult=6.0（18 折, 2022-01-04→2026-10-22, --cash-sweep-rate 0.015） | L2.49 |
+| `20261025_125300` | `09_param_grid/atr/atr_6_0` | Chan Risk-Managed Blend Strategy | CAGR: 27.37% / Sharpe: 1.47 / MaxDD: 4.42% | 参数网格 walkforward: crb_stop_atr_mult=6.0（18 折, 2022-01-04→2026-10-22, --cash-sweep-rate 0.015） | L2.49 |
+| `20261025_125300` | `09_param_grid/atr/atr_8_0` | Chan Dual Hybrid Alpha Blend Strategy | CAGR: 25.23% / Sharpe: 1.45 / MaxDD: 4.22% | 参数网格 walkforward: cdhb_stop_atr_mult=8.0（18 折, 2022-01-04→2026-10-22, --cash-sweep-rate 0.015） | L2.49 |
+| `20261025_125300` | `09_param_grid/atr/atr_8_0` | Chan Four-State Risk-Managed Blend Strategy | CAGR: 30.29% / Sharpe: 1.46 / MaxDD: 4.68% | 参数网格 walkforward: cfsb_stop_atr_mult=8.0（18 折, 2022-01-04→2026-10-22, --cash-sweep-rate 0.015） | L2.49 |
+| `20261025_125300` | `09_param_grid/atr/atr_8_0` | Chan Risk-Managed Blend Strategy | CAGR: 29.35% / Sharpe: 1.60 / MaxDD: 4.28% | 参数网格 walkforward: crb_stop_atr_mult=8.0（18 折, 2022-01-04→2026-10-22, --cash-sweep-rate 0.015） | L2.49 |
+| `20261025_125300` | `09_param_grid/atr/atr_none` | Chan Dual Hybrid Alpha Blend Strategy | CAGR: 25.47% / Sharpe: 1.42 / MaxDD: 4.43% | 参数网格 walkforward: cdhb_stop_mode=none（18 折, 2022-01-04→2026-10-22, --cash-sweep-rate 0.015） | L2.49 |
+| `20261025_125300` | `09_param_grid/atr/atr_none` | Chan Four-State Risk-Managed Blend Strategy | CAGR: 33.54% / Sharpe: 1.63 / MaxDD: 4.61% | 参数网格 walkforward: cfsb_stop_mode=none（18 折, 2022-01-04→2026-10-22, --cash-sweep-rate 0.015） | L2.49 |
+| `20261025_125300` | `09_param_grid/atr/atr_none` | Chan Risk-Managed Blend Strategy | CAGR: 29.85% / Sharpe: 1.65 / MaxDD: 4.37% | 参数网格 walkforward: crb_stop_mode=none（18 折, 2022-01-04→2026-10-22, --cash-sweep-rate 0.015） | L2.49 |
+| `20261025_125300` | `09_param_grid/inertia/inertia_008_4` | Chan Dual Hybrid Alpha Blend Strategy | CAGR: 30.57% / Sharpe: 1.52 / MaxDD: 4.33% | 参数网格 walkforward: cdhb_min_weight_change=0.08 + cdhb_min_holding_bars=4（18 折, 2022-01-04→2026-10-22, --cash-sweep-rate 0.015） | L2.49 |
+| `20261025_125300` | `09_param_grid/inertia/inertia_008_4` | Chan Four-State Risk-Managed Blend Strategy | CAGR: 33.33% / Sharpe: 1.64 / MaxDD: 5.20% | 参数网格 walkforward: cfsb_min_weight_change=0.08 + cfsb_min_holding_bars=4（18 折, 2022-01-04→2026-10-22, --cash-sweep-rate 0.015） | L2.49 |
+| `20261025_125300` | `09_param_grid/inertia/inertia_008_4` | Chan Risk-Managed Blend Strategy | CAGR: 31.73% / Sharpe: 1.54 / MaxDD: 4.92% | 参数网格 walkforward: crb_min_weight_change=0.08 + crb_min_holding_bars=4（18 折, 2022-01-04→2026-10-22, --cash-sweep-rate 0.015） | L2.49 |
+| `20261025_125300` | `09_param_grid/inertia/inertia_010_5` | Chan Dual Hybrid Alpha Blend Strategy | CAGR: 27.52% / Sharpe: 1.49 / MaxDD: 4.45% | 参数网格 walkforward: cdhb_min_weight_change=0.1 + cdhb_min_holding_bars=5（18 折, 2022-01-04→2026-10-22, --cash-sweep-rate 0.015） | L2.49 |
+| `20261025_125300` | `09_param_grid/inertia/inertia_010_5` | Chan Four-State Risk-Managed Blend Strategy | CAGR: 35.90% / Sharpe: 1.76 / MaxDD: 5.41% | 参数网格 walkforward: cfsb_min_weight_change=0.1 + cfsb_min_holding_bars=5（18 折, 2022-01-04→2026-10-22, --cash-sweep-rate 0.015） | L2.49 |
+| `20261025_125300` | `09_param_grid/inertia/inertia_010_5` | Chan Risk-Managed Blend Strategy | CAGR: 23.75% / Sharpe: 1.21 / MaxDD: 5.19% | 参数网格 walkforward: crb_min_weight_change=0.1 + crb_min_holding_bars=5（18 折, 2022-01-04→2026-10-22, --cash-sweep-rate 0.015） | L2.49 |
+| `20261025_125300` | `09_param_grid/inertia/inertia_015_10` | Chan Dual Hybrid Alpha Blend Strategy | CAGR: 22.18% / Sharpe: 1.40 / MaxDD: 4.51% | 参数网格 walkforward: cdhb_min_weight_change=0.15 + cdhb_min_holding_bars=10（18 折, 2022-01-04→2026-10-22, --cash-sweep-rate 0.015） | L2.49 |
+| `20261025_125300` | `09_param_grid/inertia/inertia_015_10` | Chan Four-State Risk-Managed Blend Strategy | CAGR: 28.88% / Sharpe: 1.44 / MaxDD: 5.28% | 参数网格 walkforward: cfsb_min_weight_change=0.15 + cfsb_min_holding_bars=10（18 折, 2022-01-04→2026-10-22, --cash-sweep-rate 0.015） | L2.49 |
+| `20261025_125300` | `09_param_grid/inertia/inertia_015_10` | Chan Risk-Managed Blend Strategy | CAGR: 22.07% / Sharpe: 1.42 / MaxDD: 4.86% | 参数网格 walkforward: crb_min_weight_change=0.15 + crb_min_holding_bars=10（18 折, 2022-01-04→2026-10-22, --cash-sweep-rate 0.015） | L2.49 |
+
+> [!NOTE] 边界待裁决
+> 下列两组的**去留尚未裁决**，因此暂时仍留在上表里。若日后判定它们同样不属于「值得重跑 / 需要复核」的对象，则按同一方式移入紧随其后的「已登记但不再索引的运行组」一节——叶子目录同样留在磁盘上不动，只是不再进入索引。
+> - `01_r1_longwin`（6 行）—— 4 折、折重叠 87.5%，其唯一用途是 `FORENSIC_AUDIT.md` §7.4 评级表的负面教材（「折重叠 + DSR 饱和」案例）。
+> - `06_ablate`（39 行）—— `ABLATION_AND_ANATOMY.md` 的 standard 口径 13 臂 ≡ 矩阵的唯一来源，且其 `no_atrstop` 臂正在被一份 2026-10-25 勘误引用。
+
+## 已登记但不再索引的运行组（存档保留于磁盘，未删除）
+
+> [!NOTE] 口径
+> 下列叶子运行**完整保留在磁盘上**，只是不再作为「值得重跑 / 需要复核」的对象列入上表。移出索引的理由逐组写明。上表在册 114 行（01–08 保留 96 + 09 新增 18）+ 本节 11 行 = 125 = 磁盘 `run_manifest.json` 实数（01–08 共 107 + 09 共 18）。**索引不含不代表产物不存在** —— 任何引用这些数字的既有文档仍可按原路径直接复核。
+
+| 组 | 叶子数 | 内容 | 不再索引的理由 |
+| :--- | ---: | :--- | :--- |
+| `02_r2a_std` | 3 | 连续 standard 口径基准（1161 bars） | 已被 `08_ablate_wf/baseline/` 完全覆盖——同策略、更长窗口、walkforward 口径 ⇒ 无独立重跑价值。 |
+| `04_r1_std_cb_compare` | 2 | 熔断开关 A/B 对照（726 bars） | 实测差异 219.91 RMB，即无可测效应 ⇒ 结论已定，重跑不产生新信息。 |
+| `05_anatomy` | 6 | 一次性全景解剖（含现金计息与冲击成本） | 全部结论已固化进 `ABLATION_AND_ANATOMY.md` ⇒ 属于一次性拆解，不是可重跑实验。 |
