@@ -17,6 +17,7 @@ Exit codes:
 import argparse
 import csv
 import json
+import math
 import os
 import statistics
 import sys
@@ -74,6 +75,55 @@ _REBALANCE_CSV_COLUMNS = (
     "fold", "rebalance_id", "date", "symbol", "action", "price", "prior_weight",
     "target_weight", "weight_change", "trade_value", "shares", "prior_shares",
     "target_shares", "commission", "slippage", "total_cost", "portfolio_equity",
+)
+
+
+# --------------------------------------------------------------------------- #
+# Turnover ceiling on the LETTER safety grade (added 2026-10-25)
+# --------------------------------------------------------------------------- #
+# A hard ceiling on TWO-SIDED annualised turnover: a run above it cannot be graded A. Only
+# the LETTER changes -- the numeric Overfit Risk Index and the ranking sort key are untouched
+# (see `audit_abnormal_and_overfit`), so historical Index values stay comparable.
+#
+# METRIC BASIS -- two-sided, NOT one-way. `total_turnover` in a fold of
+# `walkforward_summary.json`'s `rolling_window_performance` is `Σ|trade_value| / equity`,
+# i.e. the absolute traded notional summed over BOTH legs and divided by equity; a
+# buy+sell round trip therefore counts twice. Measured on `backtests_research/20261025_125300`
+# (18 auditable runs, per-fold annualised): min 9.74x/yr, median 14.59x/yr, mean 16.44x/yr,
+# max 31.81x/yr, with 17 of the 18 above the 10.0 ceiling. The single-point example
+# `03_r2b_oos/chan_dual_hybrid_blend` measures 15.09x/yr -- just above the median, NOT the
+# upper bound (the generic blends reach 27.06 / 28.83 / 31.81x/yr). At the 10.0-12.5bp one-way
+# cost this batch was run with, 15.09x/yr implies 1.51-1.89%/yr of friction -- which is exactly
+# the 1.4-1.9%/yr that `backtests_research/20261025_125300/FORENSIC_AUDIT.md` (section 6.4)
+# derives independently from the fee rows. Read as ONE-WAY, the same data would predict only
+# 0.76-0.95%/yr and could not reproduce the independently measured friction. The misreading
+# breaks harder at the top of the range: the 31.81x/yr maximum is 3.18-3.98%/yr two-sided,
+# but only 1.59-1.99%/yr read as one-way. So: never describe this metric as one-way.
+#
+# NORMALISATION -- per-fold annualise, then mean (see `turnover_annualised_from_folds`), NOT
+# `Σturnover / Σyears`. The alternative divides a sum of per-fold totals by the whole
+# calendar span, so it silently mixes fold length into the answer: on
+# `01_r1_longwin/chan_risk_managed_blend` it reports 36.70x/yr (Σ 104.99 / Σ 2.86 y) purely
+# because that run's folds span 756 days while `03_r2b_oos`'s span 97-112 days -- the raw
+# per-fold totals of the two batches (19-29 vs 2.5-5.9) differ by the ~8x fold-length ratio,
+# not by behaviour. Per-fold-then-mean reports the same run at 12.67x/yr.
+#
+# COMPARISON IS STRICT `>`: exactly 10.0 passes; 10.0001 is capped.
+#
+# PRE-REGISTRATION CONTEXT -- `docs/development_plan.md` L2.49 / L2.36 pre-register an
+# 8.0x/yr PASS line and a 10.0x/yr HARD CAP on a SINGLE-SIDED basis. Two-sided 10.0 ==
+# single-sided 5.0, so this ceiling is ~37.5% stricter than that pass line and 2x stricter
+# than that hard cap. The tightening is a DELIBERATE USER RULING on 2026-10-25
+# ("选的 C = 双边 10.0"), not an oversight; the plan rows are being amended separately.
+# Do not "reconcile" the two numbers by adopting the looser one.
+TURNOVER_CEILING_ANN = 10.0
+
+# One-line convention disclosure printed next to the turnover columns (never a new section).
+TURNOVER_CONVENTION_NOTE = (
+    "Turnover convention: two-sided Σ|trade_value|/equity, per-fold annualised on calendar "
+    "365.25 d/y then averaged over folds (NOT Σturnover/Σyears). Trading-day convention "
+    "(63 bars ≈ 0.25 y) differs by ≈3.5%; the 10.0 ceiling sits 2.7% above the lowest "
+    "observed 9.738×/yr, so it is a knife-edge — stated for the record."
 )
 
 
@@ -420,6 +470,69 @@ def run_summary(strategies):
     return strategies_sorted
 
 
+def turnover_annualised_from_folds(folds) -> tuple:
+    """Annualised TWO-SIDED turnover from `rolling_window_performance`, per fold then mean.
+
+    Returns `(ann_calendar, mean_raw_per_fold, measurable)`:
+
+    * `ann_calendar` -- mean over usable folds of `total_turnover / (days / 365.25)`;
+    * `mean_raw_per_fold` -- mean of the raw per-fold `total_turnover` values (undivided), so
+      the fold-length artefact below stays visible in the report;
+    * `measurable` -- `"n/N"`, usable folds over total folds.
+
+    Conventions, all load-bearing:
+
+    * `total_turnover` is TWO-SIDED (`Σ|trade_value| / equity`, both legs), never one-way.
+      See `TURNOVER_CEILING_ANN` for the cross-check against the independently measured
+      friction in `FORENSIC_AUDIT.md`.
+    * Annualisation is on a CALENDAR 365.25 d/y basis from each fold's own dates.
+    * Per-fold annualise THEN mean -- NOT `Σturnover / Σyears`. The latter mixes fold length
+      into the metric: on `01_r1_longwin/chan_risk_managed_blend` it reports 36.70x/yr, while
+      the correct per-fold figure is 12.67x/yr. The raw per-fold totals of the long-window
+      batch (19-29, 756-day folds) and of `03_r2b_oos` (2.5-5.9, 97-112-day folds) differ by
+      ~8x, which is exactly the fold-length ratio -- raw per-fold totals are not comparable
+      across fold lengths, and neither is a sum-over-span.
+
+    A fold is UNUSABLE (counted in `N`, excluded from both means) when `total_turnover` is
+    missing / non-numeric / non-finite, when the dates cannot be parsed, or when
+    `(end - start).days <= 0` (a degenerate zero-length fold has no annualisation).
+    All folds unusable => `(None, None, "0/N")`; the caller must treat that as "unknown", not
+    as `0.0`.
+    """
+    fold_list = folds if isinstance(folds, list) else []
+    total = len(fold_list)
+    raw_vals = []
+    ann_vals = []
+    for fold in fold_list:
+        if not isinstance(fold, dict):
+            continue
+        try:
+            raw = float(fold.get("total_turnover"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(raw):
+            continue
+        try:
+            start = datetime.strptime(str(fold.get("start_date", "")), "%Y-%m-%d")
+            end = datetime.strptime(str(fold.get("end_date", "")), "%Y-%m-%d")
+        except (TypeError, ValueError):
+            continue
+        days = (end - start).days
+        if days <= 0:
+            continue
+        raw_vals.append(raw)
+        ann_vals.append(raw / (days / 365.25))
+
+    if not ann_vals:
+        return None, None, f"0/{total}"
+    return statistics.mean(ann_vals), statistics.mean(raw_vals), f"{len(ann_vals)}/{total}"
+
+
+def _format_turnover_ann(value) -> str:
+    """Render an annualised turnover; `—` (never `0.00`) when it is unmeasurable."""
+    return "—" if value is None else f"{value:.2f}"
+
+
 def audit_strategy_trades(results_dir: Path, dir_name: str, summary_data: dict):
     path = (results_dir / dir_name / "walkforward_rebalances.csv") if dir_name else (results_dir / "walkforward_rebalances.csv")
     if not path.is_file():
@@ -571,6 +684,13 @@ def audit_strategy_trades(results_dir: Path, dir_name: str, summary_data: dict):
         fold_turnovers.append(tot_val / avg_eq if avg_eq > 0 else 0.0)
     avg_turnover = statistics.mean(fold_turnovers) if fold_turnovers else 0.0
 
+    # 5b. Two-sided calendar-annualised turnover, straight from the summary's own per-fold
+    # `total_turnover`. Deliberately a SECOND metric next to `avg_turnover` above: that one is
+    # a mean of per-fold `Σ|trade_value| / mean-equity` in fold units, so it is not comparable
+    # across fold lengths and is no basis for an annual ceiling. See
+    # `turnover_annualised_from_folds` and `TURNOVER_CEILING_ANN`.
+    turnover_ann, turnover_raw, turnover_folds = turnover_annualised_from_folds(fold_perf)
+
     # 6. Directional hit rate (look-ahead check)
     sym_trades = defaultdict(list)
     for t in trades:
@@ -610,6 +730,9 @@ def audit_strategy_trades(results_dir: Path, dir_name: str, summary_data: dict):
         "warmup_days_fold1": warmup_days,
         "max_equity_jump": max_jump,
         "avg_turnover": avg_turnover,
+        "turnover_ann": turnover_ann,
+        "turnover_raw": turnover_raw,
+        "turnover_folds": turnover_folds,
         "buy_hit_rate": buy_hit_rate,
     }
 
@@ -625,6 +748,9 @@ def run_ranking(strategies, results_dir: Path, top_n: int = 10):
         folds = s.get("rolling_window_performance", [])
         sharpe_std = s.get("fold_sharpe_std", 1.0)
         winning_folds = sum(1 for f in folds if (f.get("sharpe_ratio") or 0) > 0)
+        # Two-sided calendar-annualised turnover; available even with no rebalances.csv because
+        # it comes from the summary's own per-fold `total_turnover`.
+        t_ann, t_raw, t_folds = turnover_annualised_from_folds(folds)
 
         if not audit:
             results.append({
@@ -635,6 +761,9 @@ def run_ranking(strategies, results_dir: Path, top_n: int = 10):
                 "maxdd": s["mean_max_drawdown"],
                 "dsr": dsr,
                 "win": f"{winning_folds}/{len(folds)}",
+                "turnover_ann": t_ann,
+                "turnover_raw": t_raw,
+                "turnover_folds": t_folds,
                 "notes": "No rebalances.csv found",
             })
             continue
@@ -689,28 +818,57 @@ def run_ranking(strategies, results_dir: Path, top_n: int = 10):
             "avg_wsum": audit["avg_weight_sum"],
             "max_jump": audit["max_equity_jump"],
             "turnover": audit["avg_turnover"],
+            "turnover_ann": t_ann,
+            "turnover_raw": t_raw,
+            "turnover_folds": t_folds,
         })
 
     results.sort(key=lambda r: r["adj_sharpe"], reverse=True)
 
-    print("=" * 140)
-    print("ANOMALY-ADJUSTED STRATEGY RANKINGS (for live trading readiness)")
-    print("=" * 140)
-    print(f"{'Rank':>4} {'Strategy':<35} {'Raw':>7} {'Adj':>7} {'CAGR%':>7} {'MaxDD%':>7} {'DSR':>7} "
-          f"{'Win':>5} {'AllIn':>6} {'WSum':>5} {'Tover':>6} {'Jump%':>6}")
-    print("-" * 140)
+    # The 12 pre-existing columns are untouched (same order, same names, same widths); the
+    # three turnover columns are APPENDED after `Jump%` (last of the pre-existing block) so
+    # the table stays aligned:
+    # 4+35+7+7+7+7+7+5+6+5+6+6 (+11 spaces) = 113, plus 'Turnover/yr'(11) 'Turnover raw'(12)
+    # 'Folds'(5) and 3 spaces = 144.
+    header = (f"{'Rank':>4} {'Strategy':<35} {'Raw':>7} {'Adj':>7} {'CAGR%':>7} {'MaxDD%':>7} {'DSR':>7} "
+              f"{'Win':>5} {'AllIn':>6} {'WSum':>5} {'Tover':>6} {'Jump%':>6} "
+              f"{'Turnover/yr':>11} {'Turnover raw':>12} {'Folds':>5}")
 
+    table_rows = []
     for i, r in enumerate(results, 1):
         dsr_str = f"{r['dsr']:.3f}" if r.get("dsr", 0) > 1e-5 else "~0"
         allin = r.get("all_in", "-")
         wsum = f"{r.get('avg_wsum', 1.0):.2f}"
         tover = f"{r.get('turnover', 0.0):.1f}"
         jump = f"{r.get('max_jump', 0.0)*100:.0f}%"
-        print(f"{i:>4} {r['strategy']:<35} {r['raw_sharpe']:>7.3f} {r['adj_sharpe']:>7.3f} "
-              f"{r['cagr']*100:>7.2f} {r['maxdd']*100:>7.1f} {dsr_str:>7} "
-              f"{r['win']:>5} {allin:>6} {wsum:>5} {tover:>6} {jump:>6}")
+        t_ann = _format_turnover_ann(r.get("turnover_ann"))
+        raw_val = r.get("turnover_raw")
+        t_raw = "—" if raw_val is None else f"{raw_val:.3f}"
+        t_folds = r.get("turnover_folds", "0/0")
+        table_rows.append(
+            f"{i:>4} {r['strategy']:<35} {r['raw_sharpe']:>7.3f} {r['adj_sharpe']:>7.3f} "
+            f"{r['cagr']*100:>7.2f} {r['maxdd']*100:>7.1f} {dsr_str:>7} "
+            f"{r['win']:>5} {allin:>6} {wsum:>5} {tover:>6} {jump:>6} "
+            f"{t_ann:>11} {t_raw:>12} {t_folds:>5}"
+        )
 
-    print("=" * 140)
+    # A strategy name longer than the 35-char column overflows it (pre-existing behaviour --
+    # it must not be truncated, the name is the identity). Size the frame to the widest line
+    # so the box still encloses every row instead of being overrun by the new columns.
+    table_width = max([len(header), len("ANOMALY-ADJUSTED STRATEGY RANKINGS (for live trading readiness)")]
+                      + [len(ln) for ln in table_rows])
+
+    print("=" * table_width)
+    print("ANOMALY-ADJUSTED STRATEGY RANKINGS (for live trading readiness)")
+    print("=" * table_width)
+    print(header)
+    print("-" * table_width)
+    for ln in table_rows:
+        print(ln)
+
+    print("=" * table_width)
+    # One line, right under the table's own legend -- never a new section.
+    print(TURNOVER_CONVENTION_NOTE)
     return results
 
 
@@ -1265,7 +1423,9 @@ def audit_abnormal_and_overfit(
     7. Superstar Asset Fragility & Leave-One-Out (LOO) Sensitivity Test
     8. Turnover Friction Bleed (Transaction fees as % of gross/net PnL)
     9. Capital Efficiency vs Cash Flattery (Cash-normalized MaxDD)
-    10. Overfitting Risk Score (0-100) & Live-Trading Safety Grade (A / B / C / F)
+    10. Overfitting Risk Score (0-100) & Live-Trading Safety Grade (A / B / C / F) -- the
+        LETTER is additionally capped by `TURNOVER_CEILING_ANN` (two-sided annualised
+        turnover, 2026-10-25 ruling); the numeric score and the ranking are never moved.
     """
     if not ranked_results:
         print("No ranked strategies available for anomaly & overfit audit.", file=sys.stderr)
@@ -1525,10 +1685,37 @@ def audit_abnormal_and_overfit(
         else:
             grade_label = "Grade F (Rejected - Severe Overfit / Structural Dependency)"
 
+        # 10b. Turnover ceiling -- LETTER grade ONLY, applied AFTER the score-based grade above.
+        # The numeric `overfit_score` and the ranking sort key (`adj_sharpe`) are deliberately
+        # NOT touched: the index stays additive/unranked (0 stays 0) so historical Index values
+        # remain comparable across this change. Only a grade that would have been A is withheld.
+        # Unmeasurable turnover is NEVER scored as 0.0 -- "unknown" cannot earn an A, but it must
+        # not look like a clean pass either, so the reason is printed on its own line.
+        # `run_ranking` already computes this metric for every row (including rows with no
+        # rebalances.csv), so prefer that value and only fall back to the summary's folds when
+        # the caller passed a hand-built result dict.
+        if "turnover_ann" in r:
+            turnover_ann = r["turnover_ann"]
+        else:
+            turnover_ann = turnover_annualised_from_folds(folds_perf)[0]
+        turnover_cap_note = ""
+        if grade_label.startswith("Grade A"):
+            if turnover_ann is None:
+                grade_label = "Grade B (capped from A by turnover ceiling)"
+                turnover_cap_note = "turnover unmeasurable ⇒ A withheld"
+            elif turnover_ann > TURNOVER_CEILING_ANN:
+                grade_label = "Grade B (capped from A by turnover ceiling)"
+                turnover_cap_note = (
+                    f"two-sided annualised turnover {turnover_ann:.2f}×/yr > "
+                    f"{TURNOVER_CEILING_ANN:.1f} ceiling"
+                )
+
         # Console Output
         print(f"\n[{idx}] {strat_name}")
         print("-" * 140)
         print(f"  Safety Grade: {grade_label} | Overfit Risk Index: {overfit_score} / 100")
+        if turnover_cap_note:
+            print(f"  Grade ceiling applied: {turnover_cap_note}")
         if overfit_flags:
             print("  Overfitting & Fragility Alerts:")
             for flag in overfit_flags:
@@ -1571,10 +1758,16 @@ def audit_abnormal_and_overfit(
         print("  " + "-" * 136)
 
         # Build Markdown section
+        # The markdown must not present a ceiling-capped grade as a natural B.
+        turnover_md_line = (
+            f"- **Turnover Grade Ceiling**: applied — {turnover_cap_note}\n"
+            if turnover_cap_note
+            else ""
+        )
         md_block = f"""## {idx}. {strat_name}
 - **Safety Grade**: `{grade_label}`
 - **Overfit Risk Index**: `{overfit_score} / 100`
-
+{turnover_md_line}
 ### Quantitative Anomaly & Overfit Inspection Matrix
 
 | Inspection Dimension | Audited Metric | Safety Benchmark | Status | Forensic Diagnostic |
@@ -1616,6 +1809,24 @@ def audit_abnormal_and_overfit(
         print(f"\nSuccessfully exported forensic anomaly & overfit audit report to: {out_p.resolve()}")
 
     print("=" * 140)
+
+
+def _print_stage2_trade_line(audit: dict) -> None:
+    """One-line Stage-2 digest, shared so `--all` and `--audit` can never drift apart.
+
+    `Turnover:` is the legacy fold-unit ratio (`avg_turnover`); `Turnover/yr` and `Folds` are
+    the two-sided, calendar-annualised metric that drives the grade ceiling. `—` means the
+    metric is unmeasurable, never 0.0.
+    """
+    print(f"\n[{audit['strategy']}] Trades: {audit['total_trades']}, "
+          f"All-In Events: {audit['all_in_trades']}, "
+          f"Avg Weight Sum: {audit['avg_weight_sum']:.2f}, "
+          f"Fold 1 Warmup: +{audit['warmup_days_fold1']}d, "
+          f"Max Equity Jump: {audit['max_equity_jump']*100:.1f}%, "
+          f"Turnover: {audit['avg_turnover']:.1f}x, "
+          f"Turnover/yr: {_format_turnover_ann(audit.get('turnover_ann'))}, "
+          f"Folds: {audit.get('turnover_folds', '0/0')}, "
+          f"Buy Hit Rate: {audit['buy_hit_rate']*100:.1f}%")
 
 
 def main():
@@ -1689,13 +1900,7 @@ def main():
         for s in sorted_s:
             audit = audit_strategy_trades(results_dir, s["dir_name"], s)
             if audit:
-                print(f"\n[{audit['strategy']}] Trades: {audit['total_trades']}, "
-                      f"All-In Events: {audit['all_in_trades']}, "
-                      f"Avg Weight Sum: {audit['avg_weight_sum']:.2f}, "
-                      f"Fold 1 Warmup: +{audit['warmup_days_fold1']}d, "
-                      f"Max Equity Jump: {audit['max_equity_jump']*100:.1f}%, "
-                      f"Turnover: {audit['avg_turnover']:.1f}x, "
-                      f"Buy Hit Rate: {audit['buy_hit_rate']*100:.1f}%")
+                _print_stage2_trade_line(audit)
         print("\n")
         ranked = run_ranking(summaries, results_dir, top_n=args.top_n)
         deep_analyze_top_strategies(
@@ -1720,13 +1925,13 @@ def main():
             for s in sorted_s:
                 audit = audit_strategy_trades(results_dir, s["dir_name"], s)
                 if audit:
-                    print(f"\n[{audit['strategy']}] Trades: {audit['total_trades']}, "
-                        f"All-In Events: {audit['all_in_trades']}, "
-                        f"Avg Weight Sum: {audit['avg_weight_sum']:.2f}, "
-                        f"Fold 1 Warmup: +{audit['warmup_days_fold1']}d, "
-                        f"Max Equity Jump: {audit['max_equity_jump']*100:.1f}%, "
-                        f"Turnover: {audit['avg_turnover']:.1f}x, "
-                        f"Buy Hit Rate: {audit['buy_hit_rate']*100:.1f}%")
+                    _print_stage2_trade_line(audit)
+            # Bottom-of-output convention line for the plain `--audit` digest. When a ranking
+            # table is about to be printed it emits the same line, so never print it twice.
+            if not (
+                args.rank or args.deep_analyze or args.exclude_losers or args.abnormal_overfit
+            ):
+                print(TURNOVER_CONVENTION_NOTE)
         if args.rank or args.deep_analyze or args.exclude_losers or args.abnormal_overfit:
             ranked = run_ranking(summaries, results_dir, top_n=args.top_n)
 
