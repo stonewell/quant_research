@@ -612,8 +612,8 @@ run_arm no_circuit
 | 2a 产物完整性 | `strategy_dump.json` / `run_manifest.json` / `run.log` / `backtest_equity.csv` / `backtest_weights.csv` / `rebalance_report.csv` | `--mode` 传成 walkforward 或命令被中断 |
 | 归因臂参数生效 | `$out_dir/strategy_dump.json` 中目标前缀键=新值 | `--strategy-params` 静默未生效 ⇒ 结论反向 |
 | 产物留档一致性 | `find "$BT_ROOT" -name strategy_dump.json \| wc -l` == `find "$BT_ROOT" -name run.log \| wc -l` == `find "$BT_ROOT" -name run_manifest.json \| wc -l` | 某组命令漏了 `tee` 或落盘异常 |
-| 仓库不忽略校验 | `git check-ignore -v "$BT_ROOT/..."` 零输出 | 命中了既有 `.gitignore` 规则，违反 Committed Artifacts Policy |
-| 索引登记核准 | `backtests_research/INDEX.md` 追加对应行且字段与 `run_manifest.json` 一致 | 运行未完成或手工登记失真 |
+| 产物忽略校验 | `git check-ignore -v "$BT_ROOT/..."` **exit 0 且有输出**（命中 `.gitignore:/backtests_research/**`）；`git check-ignore -v backtests_research/INDEX.md` 则 exit 1 且零输出 | 产物**未被**忽略（会被 `git status` 拖脏）⇒ 违反 2026-10-25 反转后的 Committed Artifacts Policy（`docs/backtest_research_impl.md` §4.1）；INDEX.md 被忽略则说明白名单规则坏了 |
+| 索引登记核准 | `backtests_research/INDEX.md` 追加对应行且字段与 `run_manifest.json` 一致（索引行仍**必须**入库；逐份产物本身不再入库） | 运行未完成或手工登记失真 |
 
 解读纪律：
 
@@ -647,7 +647,7 @@ run_arm no_circuit
 - 2026-10-24 结构整理：四个新增章节纳入连续编号（§7–§10），其后章节顺延为 §11/§12；未改任何内容。
 - 2026-10-25 架构与留档规整（依 docs/backtest_research_impl.md §2 与 §4）：
   1. 输出路径全量收敛至仓库内 `$BT_ROOT="$REPO_ROOT/backtests_research/$RUN_TS"`，彻底移除 `/tmp/opencode` 与外部股池路径，构建自包含 `universe_20_stocks.txt`。
-  2. 确立回测产物入库留档规范（Committed Artifacts Policy），叶子目录统一落盘自审计核心 `strategy_dump.json`、两阶段 `run_manifest.json` 与 `run.log`，并在根目录维护 `backtests_research/INDEX.md` 索引。
+  2. 确立回测产物入库留档规范（Committed Artifacts Policy），叶子目录统一落盘自审计核心 `strategy_dump.json`、两阶段 `run_manifest.json` 与 `run.log`，并在根目录维护 `backtests_research/INDEX.md` 索引。**（同日反转：本条「产物一律入库」已被 commit `5500cc3` 推翻 —— 自 2026-10-25 起 `backtests_research/` 下运行产物由 `.gitignore` 的 `/backtests_research/**` 排除、不再入库，仅保留 INDEX.md / 人工报告 `.md` / 股池快照 / `_provenance/`；本条作为历史记录保留，现行口径见 `docs/backtest_research_impl.md` §4。）**
   3. 修复 §6.5 熔断对照臂，提供同区间 standard 下 `baseline` 与 `no_circuit` 成对运行，确保严格同区间逐日净值差分。
   4. 重构 §8 消融实验：引入 `pfx_of()` 动态前缀映射（`cfsb` / `crb` / `cdhb`），修复 `no_sectorthrot` / `no_inertia` / `no_hysteresis` 参数覆盖与假阴性风险，引入 13 臂 × 3 策略可达性矩阵与语义边界披露，升级为基于 `jq` + `strategy_dump.json` 的参数校验。
   5. 全文 6 组命令严格规整为每组 1 处 `tee .*run\.log`（合计恰为 6 处）。

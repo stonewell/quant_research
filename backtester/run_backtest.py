@@ -16,10 +16,13 @@ Example:
 import argparse
 import copy
 import datetime
+import enum
 import hashlib
+import io
 import json
 import multiprocessing
 import os
+import pathlib
 import random
 import re
 import subprocess
@@ -1194,6 +1197,97 @@ def _dump_effective_strategy_def(
     return dump_path
 
 
+_CLI_ARGS_MAX_SERIALIZED_BYTES = 4096
+
+
+def _json_safe_cli_value(value):
+    """Convert one parsed-argparse value into something `json` can serialise.
+
+    **Whitelist-free by design**: every current and future CLI flag must land in the
+    manifest automatically, so this converts by *type* (Path -> str, Enum -> `.value`,
+    nested list/dict -> recursive conversion, anything else -> `str()`) and never by a
+    hand-maintained list of flag names. A hand-written allowlist is exactly the drift this
+    field exists to prevent: add `--cash-sweep-rate` and forget the list, and the manifest
+    silently stops recording the one assumption that decides whether two runs are comparable.
+
+    Values that cannot be recorded *faithfully* are replaced by a `"<omitted:type>"` marker
+    instead of being guessed at: callables, open file handles (their `repr` contains a
+    memory address, i.e. it is volatile and not reproducible from the manifest), and any
+    value whose serialised form exceeds `_CLI_ARGS_MAX_SERIALIZED_BYTES` (a 4 KB cap keeps
+    a huge `--universe` from bloating every leaf manifest). Dropping such a value entirely
+    would be worse than marking it: a missing key is indistinguishable from an old manifest
+    (docs/backtest_research_impl.md §1 `cli_args`).
+    """
+    if callable(value):
+        return f"<omitted:{type(value).__name__}>"
+    if isinstance(value, enum.Enum):
+        return _json_safe_cli_value(value.value)
+    if isinstance(value, pathlib.PurePath):
+        return str(value)
+    if isinstance(value, bool) or value is None or isinstance(value, (int, float, str)):
+        candidate = value
+    elif isinstance(value, (list, tuple)):
+        candidate = [_json_safe_cli_value(item) for item in value]
+    elif isinstance(value, dict):
+        candidate = {
+            str(k): _json_safe_cli_value(v) for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))
+        }
+    elif isinstance(value, io.IOBase) or hasattr(value, "read") or hasattr(value, "write"):
+        return f"<omitted:{type(value).__name__}>"
+    else:
+        # Unknown (usually third-party) object: `str()` is the only honest generic
+        # rendering, and it is still better than a missing key. If it does not
+        # serialise we mark it rather than raising -- provenance must never crash a run.
+        candidate = str(value)
+    try:
+        serialized = json.dumps(candidate)
+    except (TypeError, ValueError):
+        return f"<omitted:{type(value).__name__}>"
+    if len(serialized) > _CLI_ARGS_MAX_SERIALIZED_BYTES:
+        return f"<omitted:{type(value).__name__}>"
+    return candidate
+
+
+def _coerce_strategy_params_for_manifest(raw):
+    """`--strategy-params` arrives as a JSON *string*; record the parsed object when it
+    parses, the raw string when it does not.
+
+    Never drop it and never raise: the whole point of `cli_args` is that a reader can
+    tell what assumptions a run was launched with (e.g. a 1.5% vs 0% cash yield), so a
+    malformed override must still be visible -- as the literal text the operator typed --
+    rather than vanishing from the manifest.
+    """
+    if not isinstance(raw, str):
+        return raw
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return raw
+
+
+def _cli_args_payload(args=None) -> dict:
+    """Structured CLI provenance for `run_manifest.json`: `{"argv": [...], "options": {...}}`.
+
+    `argv` is `sys.argv[1:]` verbatim (the fallback of record -- argument order, repeated
+    flags and quoting all survive it). `options` is derived mechanically from the parsed
+    namespace via `vars(args)`, sorted by key, so it cannot drift when a new flag is added
+    (see `_json_safe_cli_value`). Both are fully known before the backtest starts, which is
+    why this block is written in Phase 1 and merely preserved by Phase 2
+    (docs/backtest_research_impl.md §1).
+    """
+    payload: dict = {"argv": list(sys.argv[1:]), "options": {}}
+    if args is None:
+        return payload
+    namespace = vars(args)
+    for key in sorted(namespace):
+        value = namespace[key]
+        if key == "strategy_params":
+            payload["options"][key] = _coerce_strategy_params_for_manifest(value)
+            continue
+        payload["options"][key] = _json_safe_cli_value(value)
+    return payload
+
+
 def _dump_run_manifest(
     results_dir: str,
     *,
@@ -1205,6 +1299,7 @@ def _dump_run_manifest(
     db_path: str,
     db_used: bool,
     cli_overrides: dict | None = None,
+    cli_args: dict | None = None,
     metrics: dict | None = None,
     artifacts: list[dict] | None = None,
 ) -> str:
@@ -1243,6 +1338,13 @@ def _dump_run_manifest(
         # never opened (docs/backtest_research_impl.md §1).
         "db_used": db_used,
         "cli_overrides": overrides,
+        # Structured CLI provenance (`{"argv": [...], "options": {...}}`): without it a
+        # manifest can name the git SHA, the cache and every artifact but still cannot say
+        # with *which* flags the run was launched -- e.g. `--cash-sweep-rate 0.015` was
+        # echoed by no artifact at all, so a 1.5%-vs-0% cash-yield difference could only be
+        # asserted in prose. Fully known before the run, so Phase 1 writes it and Phase 2
+        # only preserves it (docs/backtest_research_impl.md §1 `cli_args`).
+        "cli_args": cli_args if cli_args is not None else _cli_args_payload(),
         "metrics": metrics if metrics is not None else dict(_NULL_METRICS),
         # Phase 1 scans the directory: at this point it normally holds only
         # strategy_dump.json, and listing it keeps "the skeleton already accounts for
@@ -1277,6 +1379,14 @@ def _finalize_run_manifest(
         manifest = json.load(f)
     manifest["status"] = "completed"
     manifest["completed_at_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    # `cli_args` is a Phase-1 fact (the flags are fully known before the run), so Phase 2
+    # keeps the Phase-1 value verbatim via the read-modify-write. The fallback branch below
+    # is only a safety net for a skeleton written before this field existed: it fills the
+    # `argv` fallback rather than leaving an older manifest with a missing key, which would
+    # be indistinguishable from "this run recorded no CLI provenance"
+    # (docs/backtest_research_impl.md §1).
+    if "cli_args" not in manifest:
+        manifest["cli_args"] = _cli_args_payload()
     manifest["metrics"] = metrics if metrics is not None else dict(_NULL_METRICS)
     manifest["artifacts"] = artifacts if artifacts is not None else []
     write_json_report(manifest, path)
@@ -1517,6 +1627,10 @@ def main():
         db_path=db_path,
         db_used=db_used,
         cli_overrides=strat_overrides,
+        # Derived from the *parsed* namespace, not re-parsed from sys.argv inside the
+        # helper: this is the single moment where what the CLI actually became (defaults
+        # applied, store_true resolved, type coercion done) is known.
+        cli_args=_cli_args_payload(args),
         metrics=None,          # standard/walkforward always start as six nulls (§1)
         artifacts=None,        # Phase 1 -> scan the dir: only strategy_dump.json exists yet
     )

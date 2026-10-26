@@ -2290,6 +2290,189 @@ def test_run_manifest_skeleton_survives_midrun_failure(tmp_path, monkeypatch):
     assert manifest["strategy_dump_sha256"] is not None
 
 
+def test_run_manifest_records_cli_args(tmp_path, monkeypatch):
+    """The manifest must record the CLI that produced the run (`cli_args.argv` +
+    `cli_args.options`), because `--cash-sweep-rate 0.015` was previously echoed by NO
+    artifact at all: a 1.5%-vs-0% cash-yield difference between two arms could only be
+    asserted in prose, never verified from disk.
+
+    Hermetic pattern copied from `test_run_manifest_written_for_standard_and_walkforward`:
+    stand-in DuckDB at `<--cache-dir>/cache.duckdb` + `DATA_DIR` pointed at an empty tmp dir,
+    synthetic provider, no network.
+    """
+    import duckdb
+
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(strategy_path, template_name="equal_weight", params={"rebalance_freq_days": 21})
+    results_dir = tmp_path / "20261025_091500" / "06_ablate" / "cli_args"
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    duckdb.connect(str(cache_dir / "cache.duckdb")).close()
+    monkeypatch.setattr(backtester.run_backtest, "DATA_DIR", str(tmp_path / "no_real_cache_here"))
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "SPY", "QQQ",
+        "--data-provider", "synthetic",
+        "--mode", "standard",
+        "--start", "2023-01-01",
+        "--end", "2023-06-30",
+        "--cash-sweep-rate", "0.015",
+        "--strategy-params", '{"cfsb_dd_reduce_thresh": 10.0}',
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+        "--no-plots",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    # Snapshot the Phase-1 skeleton *before* Phase 2 rewrites the same file, so the
+    # "both phases carry the same cli_args" assertion compares real on-disk artifacts
+    # rather than two in-memory readings of the final file.
+    snapshots = {}
+    real_finalize = backtester.run_backtest._finalize_run_manifest
+
+    def _spy_finalize(manifest_path, **kwargs):
+        path = (
+            os.path.join(manifest_path, "run_manifest.json")
+            if os.path.isdir(manifest_path)
+            else manifest_path
+        )
+        with open(path, "r", encoding="utf-8") as f:
+            snapshots["phase1"] = json.load(f)
+        return real_finalize(manifest_path, **kwargs)
+
+    monkeypatch.setattr(backtester.run_backtest, "_finalize_run_manifest", _spy_finalize)
+
+    main()
+
+    manifest_path = results_dir / "run_manifest.json"
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    cli_args = manifest["cli_args"]
+    options = cli_args["options"]
+
+    # 1. argv is the verbatim fallback of record.
+    assert cli_args["argv"] == argv[1:]
+
+    # 2. The exact gap this field closes: the cash-sweep assumption is now on disk, as a
+    #    JSON *number* (not the string "0.015" the operator typed on the command line).
+    assert options["cash_sweep_rate"] == 0.015
+    assert isinstance(options["cash_sweep_rate"], float)
+    assert not isinstance(options["cash_sweep_rate"], str)
+    assert json.dumps(options["cash_sweep_rate"]) == "0.015"
+
+    # 3. Types survive: numbers stay numbers, booleans stay booleans, nulls stay null.
+    assert options["mode"] == "standard" and isinstance(options["mode"], str)
+    assert options["window_years"] == 1.0 and isinstance(options["window_years"], float)
+    assert options["step_years"] == 0.5 and isinstance(options["step_years"], float)
+    assert options["data_provider"] == "synthetic"
+    assert options["start"] == "2023-01-01"
+    assert options["end"] == "2023-06-30"
+    assert options["min_shares"] == 1 and isinstance(options["min_shares"], int)
+    assert options["china_trading"] is False
+    assert options["baseline_symbol"] is None
+    assert options["universe"] == ["SPY", "QQQ"]
+
+    # 4. `--strategy-params` is a JSON string on the CLI and must round-trip as an OBJECT.
+    assert options["strategy_params"] == {"cfsb_dd_reduce_thresh": 10.0}
+
+    # Derivation is mechanical (sorted `vars(namespace)`), so keys cannot drift from flags.
+    assert list(options) == sorted(options)
+
+    # 5. Phase 1 and Phase 2 must record the identical block -- `cli_args` is known before
+    #    the run, so Phase 2 only preserves it (read-modify-write), never re-derives it.
+    assert snapshots["phase1"]["status"] == "running"
+    assert snapshots["phase1"]["cli_args"] == cli_args
+
+    # 6. `_artifact_sizes` exclusions are untouched by this addition.
+    artifact_names = [a["name"] for a in manifest["artifacts"]]
+    assert "run.log" not in artifact_names
+    assert "run_manifest.json" not in artifact_names
+
+
+def test_run_manifest_cli_args_defaults_and_malformed_strategy_params(tmp_path, monkeypatch):
+    """Two facts that must both hold, and that a "record only what was passed" design would
+    get wrong:
+
+    (a) an OMITTED flag is still recorded, with its real default (`None` = cash yield off) --
+        otherwise "0% cash yield" and "manifest from an older build" look identical;
+    (b) malformed `--strategy-params` never crashes the manifest writer and is stored as the
+        raw string. DISCLOSED: `main()` itself rejects malformed `--strategy-params` earlier
+        with `ValueError("Failed to parse --strategy-params JSON string: ...")` (a
+        pre-existing CLI guard, deliberately unchanged here), so (b) is exercised at the
+        manifest-writer level -- which is the level `cli_args` guarantees.
+    """
+    import argparse
+    import duckdb
+
+    from backtester.run_backtest import (
+        _cli_args_payload,
+        _dump_run_manifest,
+        _finalize_run_manifest,
+    )
+
+    # (a) real run, `--cash-sweep-rate` / `--borrow-fee-annual` omitted.
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(strategy_path, template_name="equal_weight", params={"rebalance_freq_days": 21})
+    results_dir = tmp_path / "20261025_091500" / "06_ablate" / "cli_args_defaults"
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    duckdb.connect(str(cache_dir / "cache.duckdb")).close()
+    monkeypatch.setattr(backtester.run_backtest, "DATA_DIR", str(tmp_path / "no_real_cache_here"))
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "SPY", "QQQ",
+        "--data-provider", "synthetic",
+        "--mode", "standard",
+        "--start", "2023-01-01",
+        "--end", "2023-06-30",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+        "--no-plots",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    main()
+
+    with open(results_dir / "run_manifest.json", "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    options = manifest["cli_args"]["options"]
+    assert "cash_sweep_rate" in options
+    assert options["cash_sweep_rate"] is None
+    assert "borrow_fee_annual" in options and options["borrow_fee_annual"] is None
+    assert options["strategy_params"] is None
+    assert manifest["status"] == "completed"
+
+    # (b) malformed JSON -> raw string, no exception, and it survives Phase 2.
+    malformed = "{cfsb_dd_reduce_thresh: not json"
+    ns = argparse.Namespace(strategy_params=malformed, cash_sweep_rate=0.015, mode="standard")
+    payload = _cli_args_payload(ns)
+    assert payload["options"]["strategy_params"] == malformed
+    assert payload["options"]["cash_sweep_rate"] == 0.015
+
+    bad_dir = str(tmp_path / "20261025_091500" / "06_ablate" / "malformed")
+    path = _dump_run_manifest(
+        bad_dir,
+        mode="standard",
+        group="06_ablate",
+        strategy_name="probe",
+        strategy_file=str(strategy_path),
+        strategy_dump_path=os.path.join(bad_dir, "missing_dump.json"),
+        db_path=str(cache_dir / "cache.duckdb"),
+        db_used=False,
+        cli_args=payload,
+    )
+    _finalize_run_manifest(path, metrics=None, artifacts=[])
+    with open(path, "r", encoding="utf-8") as f:
+        bad_manifest = json.load(f)
+    assert bad_manifest["cli_args"]["options"]["strategy_params"] == malformed
+    assert bad_manifest["status"] == "completed"
+
+
 def test_main_optimize_empty_param_grid_keeps_original_params(tmp_path, monkeypatch, capsys):
     from common.allocation_backtester import REBALANCE_REPORT_COLUMNS
 

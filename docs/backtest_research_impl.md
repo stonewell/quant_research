@@ -159,6 +159,7 @@ def _dump_run_manifest(
     db_path: str,
     db_used: bool,
     cli_overrides: dict | None = None,
+    cli_args: dict | None = None,
     metrics: dict | None = None,
     artifacts: list[dict] | None = None,
 ) -> str:
@@ -191,6 +192,9 @@ def _dump_run_manifest(
         # 从未打开过的几百 MB 生产缓存记成「本次使用的行情源」，那是纯粹的溯源撒谎。
         "db_used": db_used,
         "cli_overrides": copy.deepcopy(cli_overrides or {}),
+        # 结构化 CLI 溯源（{"argv": [...], "options": {...}}）：跑前即完全已知，
+        # 故 Phase 1 写入、Phase 2 仅经读回-覆写保留（不重算，避免两套口径）。
+        "cli_args": cli_args if cli_args is not None else _cli_args_payload(),
         # Phase 1 一律传 None ⇒ 落到 _NULL_METRICS（六键全 null）。standard 模式
         # 此后永久保持 null（无结构化来源，见下方设计约束 2）；walkforward 由 Phase 2 回填。
         "metrics": metrics if metrics is not None else dict(_NULL_METRICS),
@@ -204,7 +208,7 @@ def _dump_run_manifest(
 ```
 
 > [!IMPORTANT]
-> **Phase 1 骨架的价值（不是「多写一次文件」）**：即便回测在随后中途 OOM、数据加载抛错、或被 `Ctrl-C` 打断，`run_manifest.json` 里已经带着完整的**可复现指纹** —— `run_ts` / `git_commit` / `git_dirty` / `group` / `strategy` / `strategy_file` / `strategy_dump_sha256` / `db_path` + `db_size_bytes` + `db_mtime_iso` + `db_used` / `cli_overrides`。没有这一步，「这次跑到一半就挂了，用的是哪份行情缓存（以及它到底有没有被打开）、哪一版代码、哪一套参数」就只剩 `.bash_history` 可查。代价是 O(1) 的 `stat` 加一次几 KB 的 JSON 写。
+> **Phase 1 骨架的价值（不是「多写一次文件」）**：即便回测在随后中途 OOM、数据加载抛错、或被 `Ctrl-C` 打断，`run_manifest.json` 里已经带着完整的**可复现指纹** —— `run_ts` / `git_commit` / `git_dirty` / `group` / `strategy` / `strategy_file` / `strategy_dump_sha256` / `db_path` + `db_size_bytes` + `db_mtime_iso` + `db_used` / `cli_overrides` / `cli_args`（本次运行的完整命令行参数，见下方 `cli_args` 说明）。没有这一步，「这次跑到一半就挂了，用的是哪份行情缓存（以及它到底有没有被打开）、哪一版代码、哪一套参数」就只剩 `.bash_history` 可查。代价是 O(1) 的 `stat` 加一次几 KB 的 JSON 写。
 
 **Phase 2 — 跑后收尾的 helper 实现**：
 
@@ -287,6 +291,10 @@ def _finalize_run_manifest(
   "db_mtime_iso": "<ISO8601>",
   "db_used": false,
   "cli_overrides": {},
+  "cli_args": {
+    "argv": ["--strategy-file", "<...>", "--mode", "walkforward", "..."],
+    "options": {"mode": "walkforward", "cash_sweep_rate": 0.015, "china_trading": false, "...": "..."}
+  },
   "metrics": {"sharpe": null, "cagr": null, "max_drawdown": null, "calmar": null, "n_folds": null, "deflated_sharpe": null},
   "artifacts": [{"name": "strategy_dump.json", "bytes": 0}]
 }
@@ -300,7 +308,7 @@ def _finalize_run_manifest(
 > **`artifacts` 示例里没有 `run.log`，这是刻意的**（见 Phase 2 取值规则第 4 条）：`tee` 在本进程退出后才写日志，清单统计不到它。**同样没有 `run_manifest.json` 本身**（第 5 条）：清单不能从写前扫描里如实报出自己的写后大小，故按设计排除自身。Phase 1 骨架刚写完时该数组通常只有 `strategy_dump.json` 一项；Phase 2 收尾后应覆盖该目录内全部产物（standard：`backtest_equity.csv` / `backtest_weights.csv` / `rebalance_report.csv` / `equity_curve.png` / `comparison_report.json` …；walkforward：`walkforward_*.csv` / `walkforward_summary.json` …），唯独不含 `run.log` 与 `run_manifest.json` 这两项。
 
 > [!NOTE]
-> 上面伪代码里的 `_git` / `_sha256_file` / `_mtime_iso` / `_run_ts_from_results_dir` / `_group_from_results_dir` / `_artifact_sizes` / `_extract_walkforward_metrics` / `_NULL_METRICS` 都是本方案**要新增**的模块级私有辅助（分别是对 `subprocess.run(..., capture_output=True)`、`hashlib.sha256` 分块读取、`datetime.fromtimestamp(os.stat(...).st_mtime).isoformat()`、按 `^\d{8}_\d{6}$` 匹配路径段、取时间戳段与叶子目录之间的路径段并拼成 `group`（如 `06_ablate/baseline`，取不到则留空串并打印 WARNING）、`os.scandir` 逐项 `getsize` 且跳过 `run.log` 与 `run_manifest.json`、把 `walkforward_summary.json` 的 `mean_*` / `n_folds` / `deflated_sharpe_ratio` 改名映射为 manifest `metrics` 六键（缺键填 `None`）、以及六键全 `null` 的常量模板），**不是既存 API**，不要去找。
+> 上面伪代码里的 `_git` / `_sha256_file` / `_mtime_iso` / `_run_ts_from_results_dir` / `_group_from_results_dir` / `_artifact_sizes` / `_extract_walkforward_metrics` / `_NULL_METRICS` 都是本方案**要新增**的模块级私有辅助（分别是对 `subprocess.run(..., capture_output=True)`、`hashlib.sha256` 分块读取、`datetime.fromtimestamp(os.stat(...).st_mtime).isoformat()`、按 `^\d{8}_\d{6}$` 匹配路径段、取时间戳段与叶子目录之间的路径段并拼成 `group`（如 `06_ablate/baseline`，取不到则留空串并打印 WARNING）、`os.scandir` 逐项 `getsize` 且跳过 `run.log` 与 `run_manifest.json`、把 `walkforward_summary.json` 的 `mean_*` / `n_folds` / `deflated_sharpe_ratio` 改名映射为 manifest `metrics` 六键（缺键填 `None`）、以及六键全 `null` 的常量模板），**不是既存 API**，不要去找。`cli_args` 的派生另有 `_cli_args_payload(args)`（`sys.argv[1:]` + `sorted(vars(args))`）、`_json_safe_cli_value(value)`（无白名单 JSON 安全化与 4 KB 上限）与 `_coerce_strategy_params_for_manifest(raw)`（JSON 字符串 → 对象，解析失败保留原串）三个私有辅助。
 
 > [!NOTE]
 > **`db_path` 记的是「配置的缓存文件」，不是写死的路径，也不等于「本次运行实际读了它」**：`main()` 取 `--cache-dir`（缺省为 `DATA_DIR`）下的 `cache.duckdb`，**该文件存在就用它**，否则回落到 `DATA_DIR/cache.duckdb`（`DATA_DIR` = `common/cli_utils.shared_data_dir()` 解析出的 `<repo_root>/data`）。这是比硬编码更强的溯源：把 `--cache-dir` 指向临时副本的那些调试运行，manifest 会如实记成那份副本，而不是谎称读了生产缓存。**但 `db_path` + `db_size_bytes` + `db_mtime_iso` 三者只是对配置路径的一次 `stat`（从不开文件）**，因此合成 provider 运行（`CachedDataProvider.__init__` 在 `is_synthetic_provider` 为真时根本不构造 `DuckDBCache`）或带 `--no-cache` 的运行，会如实记录「配置指向哪个缓存」但**必须**把 `db_used` 写成 `false` —— 否则就会把一份几百 MB、本次从未打开过的生产缓存谎报成行情来源。`db_used` 的取值口径固定为：`not is_synthetic_provider(args.data_provider) and not args.no_cache`（`is_synthetic_provider` 来自 `common/duckdb_cache.py`，与数据层判断同源）。
@@ -311,6 +319,28 @@ def _finalize_run_manifest(
 
 > [!NOTE]
 > **`cli_strategy_params_override` / `cli_overrides` 都是「恒存在」字段，不是 Optional**：未传 `--strategy-params` 时写 `{}`（`strategy_dump.json` 与 `run_manifest.json` 同理）。**不要**改回「为 `None` 时省略该键」—— 省略会让读者无法区分「这次没传覆盖项」与「这份 JSON 是旧版本写的、根本没有这个字段」，而审计场景恰恰只关心这个区分。
+
+> [!IMPORTANT]
+> **`cli_args`：本次运行到底带哪些命令行参数（两阶段都写，且两阶段必须逐字节一致）**
+>
+> 引入理由（实测缺口）：`run_manifest.json` 原本记录了 `db_used` / `db_path` / git SHA / 产物 + sha256 等**环境**事实，却**不记录产生这次运行的命令行参数**。后果是 `--cash-sweep-rate 0.015` 这个现金计息假设**不出现在任何产物里**（manifest、`walkforward_summary.json`、`strategy_dump.json` 全都没有它），于是 `07_r3_oos_bear` 与 `03_r2b_oos` 的对比同时混入了「窗口不同」与「1.5% vs 0% 现金收益」两个变量，方向性偏误只能在散文里断言，无法从磁盘复核。任何后续结论都会继承这个缺口。
+>
+> 字段形状（**顶层**键，非嵌套进 `cli_overrides`）：
+>
+> ```json
+> "cli_args": {
+>   "argv": ["--strategy-file", "...", "--cash-sweep-rate", "0.015", "..."],
+>   "options": {"cash_sweep_rate": 0.015, "mode": "walkforward", "...": "..."}
+> }
+> ```
+>
+> 1. **`argv` = `sys.argv[1:]` 逐字列表**（不是拼接字符串）：它是**最终凭据（fallback of record）**——参数顺序、重复 flag、引号与 `nargs="+"` 的分隔方式都原样保留，`options` 若在某次重构里丢了信息，仍可从 `argv` 重建。
+> 2. **`options` 由已解析的 argparse namespace 机械派生，禁止手写白名单**：实现为 `for key in sorted(vars(args))`（`_cli_args_payload(args)`），因此**新增 flag 会自动出现**，不需要（也不允许）维护一份「要记录的 flag 名单」——那份名单一旦漏项，正是本字段要消灭的漂移。值经 `_json_safe_cli_value` 做**无白名单**的类型转换：`pathlib.Path` → `str`、`Enum` → `.value`、嵌套 `list`/`dict` 递归、其余未知类型 → `str()`。
+> 3. **类型必须保真**：数字记成 JSON number（`0.015`，而非 `"0.015"`）、布尔记成 `true/false`、未传记成 `null`。把值 `str()` 化到整个对象上会摧毁「是不是真的加了 `--cash-sweep-rate`」这一判断。
+> 4. **`strategy_params` 特例**：`--strategy-params` 在 CLI 上是 **JSON 字符串**，落盘时**能解析就存解析后的对象**（`{"cfsb_dd_reduce_thresh": 10.0}`），**解析不了就存原始字符串**——既不丢弃、也不抛异常。注意 `main()` 本身对畸形 `--strategy-params` 会在更早处 `raise ValueError`（既有守卫），因此这一特例保证的是「manifest 写入层绝不因该字段崩溃/丢字段」。
+> 5. **不得记录易变或过大值**：callable、打开的文件句柄（其 `repr` 含内存地址，不可复现）以及序列化后超过约 **4 KB** 的值，一律写成 `"<omitted:type>"`；**不允许**静默删键（缺键与「旧版本 manifest」无法区分）。
+> 6. **两阶段一致性**：`cli_args` 在回测开始前就完全已知，故 Phase 1 写入，Phase 2 只经「读回 → 覆写」保留（仅当骨架缺该键时才用 `argv` 兜底补齐）。因此**任何时候都不允许在 Phase 2 重新推导它**（那时 `sys.argv` / namespace 已不是唯一真相源，重算只会引入第二套口径，与 `db_used` 的处理相同）。
+> 7. **向后兼容**：纯新增键，既有字段的名字、顺序与语义均不变；`_artifact_sizes` 对 `run.log` / `run_manifest.json` 的排除也不受影响。`INDEX.md` 的取值纪律（§4.3）仍只读 `run_ts` / `group` / `strategy` / `metrics`。
 
 > [!WARNING]
 > **两条设计约束（必须落进实现，不得「顺手优化」掉）**：
@@ -617,9 +647,9 @@ pipeline/.venv/bin/pytest pipeline/tests/test_config_wiring.py -q
 
 ### 手动与文档核验 (Manual Verification)
 1. 核验 [`docs/backtest_research.md`](file:///home/stone/Work/github/quant/docs/backtest_research.md) 中所有 CLI 命令均已指向 `$BT_ROOT/<cmd_group>/...`（即 `<project_root>/backtests_research/<datetime>/...`），无任何残留 `/tmp/opencode/bt_*` 或外部路径（如 `/home/stone/Work/stock/...`）。
-2. 用 `--data-provider synthetic` 在临时冒烟目录（如 `SMOKE_DIR="$(mktemp -d)"`）试跑一次单命令，确认 `<results_dir>/strategy_dump.json` 与回测产物同目录落盘且合并参数无误。**披露**：合成数据冒烟产物不构成研究资产，**不入库**（跑完后执行 `rm -rf "$SMOKE_DIR"` 清理，这是 §4「产物一律入库」的唯一豁免口径）；真实研究运行仍按 §4 全量入库。
-3. `git check-ignore -v` 对产物路径**无任何输出**（即未被忽略），且至少覆盖三种深度不同的路径 —— `01_r1_longwin`（2 层）、`03_r2b_oos`（2 层）、`06_ablate/baseline`（3 层）各抽一个叶子 `strategy_dump.json`；任一路径有输出即失败。
-4. `git status --porcelain backtests_research | head` 能看到本次新增产物（预期形如 `?? backtests_research/<ts>/...`）；补充反向证据 `git status --porcelain --ignored backtests_research | head` **不得**出现 `!!` 前缀行（`!!` 即「已被忽略」，与 §4.1 直接冲突）。
+2. 用 `--data-provider synthetic` 在临时冒烟目录（如 `SMOKE_DIR="$(mktemp -d)"`）试跑一次单命令，确认 `<results_dir>/strategy_dump.json` 与回测产物同目录落盘且合并参数无误。**披露**：合成数据冒烟产物不构成研究资产，**不入库**（跑完后执行 `rm -rf "$SMOKE_DIR"` 清理）。注意这**不是**豁免口径而是**通则**：自 2026-10-25 反转后，`backtests_research/` 下的一切运行产物都不入库（`.gitignore` 的 `/backtests_research/**`），保留在磁盘、随时可复核；仍入库的只有 INDEX.md / 人工报告 `.md` / 股池快照 / `_provenance/`（§4.1）。
+3. `git check-ignore -v` 对产物路径**必须 exit 0 且打印命中的规则行**（形如 `.gitignore:/backtests_research/**`）—— **命中规则即通过**（自 2026-10-25 反转后产物一律被忽略，见 §4.1 第 1 条）；且至少覆盖三种深度不同的路径 —— `01_r1_longwin`（2 层）、`03_r2b_oos`（2 层）、`06_ablate/baseline`（3 层）各抽一个叶子产物（`strategy_dump.json` / `run_manifest.json` / `backtest_equity.csv` 任一）。反向证据（白名单）：对 `backtests_research/INDEX.md`、同批任一份人工报告 `.md`、任一个 `_provenance/` 文件执行同一命令，**必须 exit 1 且零输出**（未被忽略 ⇒ 仍在版本控制内）。任一方不符即失败；**尤其注意：若产物路径变成「零输出」，含义是 `/backtests_research/**` 那条忽略规则被误删 —— 正确处置是立刻恢复规则，而不是删掉规则去迁就断言。**
+4. `git status --porcelain backtests_research | head` **看不到**本次新增产物（产物已被忽略，这正是期望）；补充正向证据 `git status --porcelain --ignored backtests_research | head` 应能看到 `!!` 前缀行（`!!` 即「已被忽略」，与 §4.1 一致）。未忽略的 `git status --porcelain backtests_research` 输出中**只允许**出现 `backtests_research/INDEX.md`、人工报告 `.md`、股池快照 `universe_*.txt` / `pruned_universe.txt` 与 `_provenance/` 下的文件，形态为 `??`（本次新增）或 `M`（本次更新）。若某个运行产物以 `??` 出现，即为失败（忽略规则失效）。
 5. 每个运行子目录均含 `strategy_dump.json` 与 `run.log`：
    ```bash
    cd /home/stone/Work/github/quant
