@@ -1,0 +1,74 @@
+Loaded Strategy: Chan Risk-Managed Blend Strategy (chan_risk_managed_blend)
+Parameters: {'crb_composite_weight': 0.2, 'crb_three_type_weight': 0.45, 'crb_vaa_weight': 0.35, 'crb_third_strategy_type': 'composite', 'crb_max_single_position': 0.2, 'crb_min_weight_change': 0.05, 'crb_dd_reduce_thresh': 0.1, 'crb_dd_defensive_thresh': 0.15, 'crb_dd_stop_thresh': 0.2, 'crb_tier1_cooldown_bars': 15, 'crb_dynamic_cash_deployment': True, 'crb_breadth_lookback': 50, 'crb_breadth_bull_thresh': 0.3, 'crb_thrust_lookback': 10, 'crb_thrust_thresh': 0.6, 'crb_target_bull_exposure': 0.8, 'crb_bull_max_single_position': 0.2, 'crb_enable_vol_targeting': True, 'crb_target_vol': 0.12, 'crb_smooth_drawdown': True, 'crb_vol_model': 'garman_klass', 'crb_adaptive_inertia': True, 'crb_stop_mode': 'atr_trailing', 'crb_stop_atr_mult': 4.5, 'crb_entry_threshold': 0.03, 'crb_asset_stop_cooldown_bars': 5, 'crb_min_holding_bars': 2, 'crb_min_entry_bars': 2, 'crb_thrust_incumbent_bonus': 1.2, 'blend_weighting_mode': 'rolling_ic_ir', 'blend_enable_orthogonalization': True, 'blend_enable_structural_regime': True, 'blend_enable_cyq_quality_gate': True, 'blend_enable_adaptive_stop_atr': True, 'blend_enable_low_beta_inertia': True, 'blend_max_assets_per_sector': 2, 'cash_proxy': 'BIL'}
+Logic: Chan Risk-Managed Blend Strategy (chan_risk_managed_blend): walkforward-optimized ensemble blending chan_vaa_compound (35%), chan_three_type (45%), and chan_composite (20%) with hard position cap (20% max per stock), drawdown circuit breakers (smooth damping from 10%, defensive VAA at 15%, stop at 20% with fast recovery & 15d auto-heal), turnover filter (min trade change 5%), 2d entry confirmation gate, volatility targeting (12% target vol via garman_klass), stop mode (atr_trailing), and dynamic cash deployment in bull breadth (>=30% or 10d thrust).
+
+Loading 20 symbols ...
+Loaded 20/20 symbols (see warnings above for any skipped).
+Effective strategy dump saved to /home/stone/Work/github/quant/backtests_research/20261025_125300/07_r3_oos_bear/chan_risk_managed_blend/strategy_dump.json
+
+=== Running Walkforward Rolling Evaluation: Chan Risk-Managed Blend Strategy ===
+Window: 0.25 years, Step: 0.25 years
+[Fold 1/6] Evaluating 2021-06-01 to 2021-08-27...
+[Fold 2/6] Evaluating 2021-08-30 to 2021-12-03...
+[Fold 3/6] Evaluating 2021-12-06 to 2022-03-10...
+[Fold 4/6] Evaluating 2022-03-11 to 2022-06-15...
+[Fold 5/6] Evaluating 2022-06-16 to 2022-09-13...
+[Fold 6/6] Evaluating 2022-09-14 to 2022-12-16...
+  [Fold 1/6] Done: Sharpe=0.23, CAGR=2.3%, MaxDD=5.3%, Rebalances=30
+  [Fold 2/6] Done: Sharpe=1.84, CAGR=26.4%, MaxDD=3.6%, Rebalances=28
+  [Fold 3/6] Done: Sharpe=-0.81, CAGR=-11.6%, MaxDD=5.4%, Rebalances=34
+  [Fold 4/6] Done: Sharpe=-0.27, CAGR=-4.0%, MaxDD=6.6%, Rebalances=34
+  [Fold 5/6] Done: Sharpe=0.75, CAGR=12.2%, MaxDD=5.8%, Rebalances=34
+  [Fold 6/6] Done: Sharpe=-0.57, CAGR=-7.4%, MaxDD=3.7%, Rebalances=35
+
+=== Loading Baseline: 000300.SH (equal_weight) ===
+Loading 1 symbols ...
+Loaded 1/1 symbols (see warnings above for any skipped).
+[Fold 1/6] Evaluating 2021-06-01 to 2021-08-27...
+[Fold 2/6] Evaluating 2021-08-30 to 2021-12-03...
+[Fold 3/6] Evaluating 2021-12-06 to 2022-03-10...
+[Fold 4/6] Evaluating 2022-03-11 to 2022-06-15...
+[Fold 5/6] Evaluating 2022-06-16 to 2022-09-13...
+[Fold 6/6] Evaluating 2022-09-14 to 2022-12-16...
+  [Fold 1/6] Done: Sharpe=-2.08, CAGR=-34.6%, MaxDD=11.1%, Rebalances=13
+  [Fold 2/6] Done: Sharpe=0.65, CAGR=7.2%, MaxDD=4.1%, Rebalances=13
+  [Fold 3/6] Done: Sharpe=-2.98, CAGR=-39.8%, MaxDD=16.9%, Rebalances=13
+  [Fold 4/6] Done: Sharpe=0.03, CAGR=-2.5%, MaxDD=12.1%, Rebalances=13
+  [Fold 5/6] Done: Sharpe=-0.82, CAGR=-12.8%, MaxDD=10.7%, Rebalances=13
+  [Fold 6/6] Done: Sharpe=-0.43, CAGR=-10.3%, MaxDD=13.7%, Rebalances=13
+
+Rolling Windows Performance:
+start_date   end_date sharpe_ratio    cagr max_drawdown calmar_ratio win_rate profit_factor total_turnover  total_rebalances baseline_sharpe_ratio baseline_cagr baseline_max_drawdown baseline_calmar_ratio outperformance
+2021-06-01 2021-08-27         0.23   2.30%        5.29%         0.43   50.00%          1.04           3.10                30                 -2.08       -34.64%                11.05%                 -3.13         36.94%
+2021-08-30 2021-12-03         1.84  26.36%        3.57%         7.38   54.84%          1.34           3.12                28                  0.65         7.19%                 4.11%                  1.75         19.16%
+2021-12-06 2022-03-10        -0.81 -11.56%        5.40%        -2.14   43.55%          0.87           5.60                34                 -2.98       -39.84%                16.87%                 -2.36         28.28%
+2022-03-11 2022-06-15        -0.27  -3.99%        6.57%        -0.61   59.68%          0.96           6.42                34                  0.03        -2.48%                12.13%                 -0.20         -1.51%
+2022-06-16 2022-09-13         0.75  12.20%        5.76%         2.12   50.00%          1.13           4.39                34                 -0.82       -12.75%                10.69%                 -1.19         24.95%
+2022-09-14 2022-12-16        -0.57  -7.35%        3.67%        -2.00   43.55%          0.91           4.24                35                 -0.43       -10.31%                13.69%                 -0.75          2.96%
+
+=== Walkforward Summary: Chan Risk-Managed Blend Strategy ===
+Mean Sharpe Ratio: 0.20 | Mean CAGR: 2.99%
+Mean Max Drawdown: 5.0% | Mean Calmar Ratio: 0.86
+Deflated Sharpe Ratio: 0.000 (n_trials=6, fold Sharpe std=0.983)
+Mean Baseline Sharpe Ratio: -0.94 | Mean Baseline CAGR: -15.47%
+Mean Outperformance CAGR: 18.46%
+Saved walkforward summary to /home/stone/Work/github/quant/backtests_research/20261025_125300/07_r3_oos_bear/chan_risk_managed_blend/walkforward_summary.json
+Saved comparison report to /home/stone/Work/github/quant/backtests_research/20261025_125300/07_r3_oos_bear/chan_risk_managed_blend/comparison_report.json
+
+Saved walkforward report to /home/stone/Work/github/quant/backtests_research/20261025_125300/07_r3_oos_bear/chan_risk_managed_blend/walkforward_report.csv
+Saved walkforward rebalance report to /home/stone/Work/github/quant/backtests_research/20261025_125300/07_r3_oos_bear/chan_risk_managed_blend/walkforward_rebalances.csv
+Total Walkforward Rebalance Trades: 281
+
+Recent Walkforward Rebalance Trades:
+ fold  rebal_id       date    symbol action  price prior_w target_w delta_w trade_value   shares   cost
+    6        22 2022-11-25 300394.SZ   SELL  $9.06   10.0%     0.0%  -10.0%   $9,968.05 1,100.00 $14.95
+    6        22 2022-11-25 600028.SH    BUY  $3.71    7.5%    16.4%   +8.9%   $8,529.23 2,300.00  $8.53
+    6        23 2022-11-28 000938.SZ    BUY $18.72    9.5%    16.5%   +7.0%   $5,616.91   300.00  $5.62
+    6        24 2022-11-29 000999.SZ    BUY $30.41    0.0%    13.6%  +13.6%  $12,163.03   400.00 $12.16
+    6        25 2022-12-06 601225.SH   SELL $15.02   15.2%     0.0%  -15.2%  $15,024.14 1,000.00 $22.54
+    6        25 2022-12-06 000999.SZ   SELL $27.59   11.1%     0.0%  -11.1%  $11,035.13   400.00 $16.55
+    6        25 2022-12-06 000157.SZ    BUY  $4.93   11.5%    19.9%   +8.5%   $8,386.34 1,700.00  $8.39
+    6        26 2022-12-07 000157.SZ   SELL  $4.89   19.8%     0.0%  -19.8%  $19,566.20 4,000.00 $29.35
+    6        27 2022-12-08 601728.SH    BUY  $3.73    0.0%    12.6%  +12.6%  $12,303.60 3,300.00 $12.30
+    6        28 2022-12-14 601728.SH    BUY  $3.72   12.5%    20.0%   +7.5%   $7,067.65 1,900.00  $7.07
+Saved walkforward actual weights to /home/stone/Work/github/quant/backtests_research/20261025_125300/07_r3_oos_bear/chan_risk_managed_blend/walkforward_weights.csv

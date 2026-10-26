@@ -8,6 +8,10 @@ Automates the 3-stage quantitative evaluation process:
 
 Usage:
   python run_audit.py [--all] [--summary] [--audit] [--rank] [--top-n 10] [--results-dir PATH]
+
+Exit codes:
+  0 = clean run  |  1 = input/validation error  |  2 = missing third-party dependency
+  3 = completed, but at least one section ran on degraded inputs (numbers DISQUALIFIED)
 """
 
 import argparse
@@ -38,6 +42,133 @@ _PIPELINE_RESULTS_REFUSAL_HINT = (
     "<repo>/pipeline/results holds throwaway/experimental runs, not auditable walkforward output. "
     "Pass --results-dir explicitly (or run from the repo root) to select the intended directory."
 )
+
+
+# --------------------------------------------------------------------------- #
+# Startup preconditions: missing third-party deps are FATAL, never degradable
+# --------------------------------------------------------------------------- #
+# Every asset-level number Stages 4-6 print is marked to the *final close* of each fold,
+# which needs `common.cli_utils.load_universe_with_banner` -> `common.data` /
+# `common.duckdb_cache`, and those modules import pandas / numpy / yfinance / duckdb at
+# module scope. On an interpreter without them the import raises ImportError.
+#
+# Until 2026-10-25 that ImportError landed in a bare `except Exception:` inside
+# `audit_strategy_assets()` which set `universe = {}` and carried on in a degraded mode:
+# every still-open position was then valued at its LAST TRADE PRICE instead of the final
+# close. Measured on real output (backtests_research/20261025_125300, system python3 vs
+# pipeline/.venv/bin/python3) that under-counted per-ticker PnL by 10.7k-31.0k RMB per
+# run, flipped one strategy's net PnL from +28,697.00 to -2,259.06 RMB, made the universe
+# pruner wrongly exclude 10 assets, and surfaced the degenerate `999.0%` / `100.0%`
+# placeholders in the Superstar-Fragility / Friction-Bleed rows (131.8% / 22.8% instead of
+# the correct 69.8% / 8.7%).
+#
+# A diagnostic that silently degrades to wrong numbers is worse than one that crashes, so
+# the deps are verified once, up front, and a missing one is a hard `sys.exit(2)` naming
+# the interpreter that was actually used.
+_REQUIRED_THIRD_PARTY_DEPS = ("pandas", "numpy", "scipy", "yfinance", "duckdb")
+
+# Columns `walkforward_rebalances.csv` must carry for the audit to mean anything. Until
+# 2026-10-25 a missing column was read as 0.0 by `row.get(k, 0.0)`, i.e. a silently wrong
+# metric instead of an error; both CSV readers now check this tuple up front.
+_REBALANCE_CSV_COLUMNS = (
+    "fold", "rebalance_id", "date", "symbol", "action", "price", "prior_weight",
+    "target_weight", "weight_change", "trade_value", "shares", "prior_shares",
+    "target_shares", "commission", "slippage", "total_cost", "portfolio_equity",
+)
+
+
+def _venv_python_hint() -> str:
+    """The `pipeline/` venv interpreter as it is usually invoked (repo-relative)."""
+    rel = Path("Scripts/python.exe") if os.name == "nt" else Path("bin/python3")
+    return str(Path("pipeline/.venv") / rel)
+
+
+def _require_third_party_deps() -> None:
+    """Hard-fail (`sys.exit(2)`) when a dependency the audit genuinely needs is missing.
+
+    Called from `main()` before any input validation or audit phase runs, so a degraded
+    run cannot start at all. Deliberately intolerant -- see the block comment above for
+    the silent-degradation bug this replaces.
+    """
+    rel = Path("Scripts/python.exe") if os.name == "nt" else Path("bin/python3")
+    venv_python = _PIPELINE_PROJECT_DIR / ".venv" / rel
+    missing = []
+    for name in _REQUIRED_THIRD_PARTY_DEPS:
+        try:
+            __import__(name)
+        except Exception as exc:  # ImportError, but also a broken .so (OSError) -- both fatal
+            missing.append(f"{name} ({type(exc).__name__}: {exc})")
+    if not missing:
+        return
+    print(
+        "Error: this script requires "
+        + "/".join(_REQUIRED_THIRD_PARTY_DEPS)
+        + f"; current interpreter: {sys.executable} "
+        f"(python {sys.version_info.major}.{sys.version_info.minor}."
+        f"{sys.version_info.micro}). "
+        f"Re-run with {_venv_python_hint()}.",
+        file=sys.stderr,
+    )
+    for item in missing:
+        print(f"       missing: {item}", file=sys.stderr)
+    print(f"       venv interpreter: {venv_python}", file=sys.stderr)
+    sys.exit(2)
+
+
+# Data-quality degradation registry: `(strategy, reason)` pairs, printed as one end-of-run
+# banner by `_report_degradation_summary()`. A run that lands here still prints numbers,
+# but those numbers are explicitly disqualified instead of silently trusted.
+_DEGRADED_RUNS: list = []
+
+
+def _warn(message: str) -> None:
+    """Loud, non-fatal warning; always stderr, never swallowed."""
+    print(f"Warning: {message}", file=sys.stderr)
+
+
+def _flag_degraded(strategy: str, reason: str, *, disqualifying: bool = True) -> None:
+    """Report a degraded computation on BOTH streams (stdout survives a `2>/dev/null`).
+
+    `disqualifying=True` additionally records the section in `_DEGRADED_RUNS` so the run
+    ends with an unmissable summary: the numbers were produced from incomplete inputs and
+    must not be reported as findings.
+    """
+    where = f"[{strategy}] " if strategy else ""
+    label = "WARNING (numbers disqualified)" if disqualifying else "Warning (degraded metric)"
+    line = f"{label}: {where}{reason}"
+    print(line, file=sys.stderr)
+    # `flush=True` so this lands AFTER any buffered report text in a `2>&1` capture.
+    print(f"  \u26a0\ufe0f  {line}", flush=True)
+    if disqualifying:
+        _DEGRADED_RUNS.append((strategy or "<run>", reason))
+
+
+def _report_degradation_summary() -> None:
+    """End-of-run banner listing every section whose numbers are not trustworthy.
+
+    Exits with code **3** when anything was disqualified, so a degraded run can never be
+    mistaken for a clean one by a script (or a human skimming the tail). Exit-code contract:
+    0 = clean, 1 = input/validation error, 2 = missing third-party dependency,
+    3 = completed but the numbers are DISQUALIFIED.
+    """
+    if not _DEGRADED_RUNS:
+        return
+    print("\n" + "!" * 140, file=sys.stderr)
+    print(
+        f"DATA-QUALITY FAILURE: {len(_DEGRADED_RUNS)} audit section(s) ran on degraded inputs. "
+        "Their numbers are NOT trustworthy and must not be reported as findings:",
+        file=sys.stderr,
+    )
+    for strat, reason in _DEGRADED_RUNS:
+        print(f"  - {strat}: {reason}", file=sys.stderr)
+    print("!" * 140, file=sys.stderr)
+    exit_line = (
+        f"Exiting with code 3: {len(_DEGRADED_RUNS)} audit section(s) ran on degraded inputs."
+    )
+    print(exit_line, file=sys.stderr)
+    # Mirrored to stdout (flushed last) so the reason survives a `> report.txt 2>/dev/null`.
+    print(exit_line, flush=True)
+    sys.exit(3)
 
 
 class AuditInputError(FileNotFoundError):
@@ -126,8 +257,10 @@ def _lookup_canonical_name_by_key(key: str, search_dir: Path = None) -> str:
                         cfg = json.load(f)
                     if clean_key in cfg and "name" in cfg[clean_key]:
                         return str(cfg[clean_key]["name"])
-                except Exception:
-                    pass
+                except (OSError, ValueError, TypeError, KeyError) as exc:
+                    # Name cosmetics only, but a corrupt config must still be visible:
+                    # the old bare `except Exception: pass` hid it completely.
+                    _warn(f"could not read strategy name from {candidate_path}: {exc}")
 
         for dump_dir in [
             p / "pipeline/research_strategy/results/strategy_dumps",
@@ -145,8 +278,8 @@ def _lookup_canonical_name_by_key(key: str, search_dir: Path = None) -> str:
                     )
                     if name:
                         return str(name)
-                except Exception:
-                    pass
+                except (OSError, ValueError, TypeError, KeyError) as exc:
+                    _warn(f"could not read strategy name from {dump_file}: {exc}")
     return None
 
 
@@ -164,8 +297,8 @@ def _detect_strategy_name(results_dir: Path, strategy_name: str = None) -> str:
                 name = data.get("strategy_name") or data.get("strategy")
                 if name:
                     return str(name)
-            except Exception:
-                pass
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                _warn(f"could not read strategy name from {sum_file}: {exc}")
 
     # 2. Check if strategy.json exists in results_dir or its parent
     for candidate in [results_dir / "strategy.json", results_dir.parent / "strategy.json"]:
@@ -180,8 +313,8 @@ def _detect_strategy_name(results_dir: Path, strategy_name: str = None) -> str:
                 )
                 if name:
                     return str(name)
-            except Exception:
-                pass
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                _warn(f"could not read strategy name from {candidate}: {exc}")
 
     # 3. Look up key in strategies_config.json or strategy_dumps
     canonical = _lookup_canonical_name_by_key(results_dir.name, results_dir)
@@ -292,9 +425,23 @@ def audit_strategy_trades(results_dir: Path, dir_name: str, summary_data: dict):
     if not path.is_file():
         return None
 
+    label = dir_name or path.parent.name
+
     trades = []
+    parse_failures = 0
+    first_parse_error = None
     with open(path) as f:
         reader = csv.DictReader(f)
+        fields = reader.fieldnames or []
+        # Absent columns used to be read as 0.0 by `row.get(k, 0.0)` below, i.e. a silently
+        # wrong metric rather than an error. Report it explicitly.
+        missing_cols = [c for c in _REBALANCE_CSV_COLUMNS if c not in fields]
+        if missing_cols:
+            _flag_degraded(
+                label,
+                f"{path.name} is missing column(s) {missing_cols}; every missing numeric "
+                "field is read as 0.0, so the derived anomaly metrics are disqualified.",
+            )
         for row in reader:
             try:
                 row["fold"] = int(row["fold"])
@@ -304,8 +451,24 @@ def audit_strategy_trades(results_dir: Path, dir_name: str, summary_data: dict):
                            "commission", "slippage", "total_cost", "portfolio_equity"]:
                     row[k] = float(row.get(k, 0.0) or 0.0)
                 trades.append(row)
-            except Exception:
+            except Exception as exc:
+                # Still skip the row (one malformed line must not abort the whole audit),
+                # but never silently: the old bare `continue` could drop every row and turn
+                # the whole strategy into an apparently clean profile.
+                parse_failures += 1
+                if first_parse_error is None:
+                    first_parse_error = f"{type(exc).__name__}: {exc}"
                 continue
+
+    if parse_failures:
+        _flag_degraded(
+            label,
+            f"{parse_failures}/{parse_failures + len(trades)} row(s) of {path.name} failed to "
+            f"parse and were dropped (first error: {first_parse_error}); "
+            + ("ALL rows were dropped, so no trade-level anomaly metric exists at all."
+               if not trades else "the reported metrics exclude those rows."),
+            disqualifying=not trades,
+        )
 
     if not trades:
         return None
@@ -356,6 +519,15 @@ def audit_strategy_trades(results_dir: Path, dir_name: str, summary_data: dict):
                 underinvested_rebals += 1
 
     avg_weight_sum = statistics.mean(held_weight_sums) if held_weight_sums else 1.0
+    if not held_weight_sums:
+        # 1.0 = "fully invested". Fabricating that here used to hide a CSV with no usable
+        # rebalance events entirely (and silently zeroed the under-investment penalty).
+        _flag_degraded(
+            label,
+            "no usable rebalance events in walkforward_rebalances.csv, so the average "
+            "invested weight is unknown; 1.0 (fully invested) is substituted and the "
+            "under-investment / cash-drag metrics below are disqualified.",
+        )
 
     # 3. Warmup delay in Fold 1
     fold1_trades = [t for t in trades if t["fold"] == 1]
@@ -365,8 +537,18 @@ def audit_strategy_trades(results_dir: Path, dir_name: str, summary_data: dict):
             d_start = datetime.strptime(fold_perf[0].get("start_date", ""), "%Y-%m-%d")
             d_trade = datetime.strptime(min(t["date"] for t in fold1_trades), "%Y-%m-%d")
             warmup_days = (d_trade - d_start).days
-        except Exception:
+        except (KeyError, TypeError, ValueError) as exc:
+            # 0 days reads as "immediate trade execution" -- say out loud that it is unknown.
+            _warn(
+                f"[{label}] Fold-1 warmup delay could not be computed ({type(exc).__name__}: "
+                f"{exc}); reporting 0 days (= 'no warmup padding'), which is unverified."
+            )
             warmup_days = 0
+    elif fold1_trades and not fold_perf:
+        _warn(
+            f"[{label}] no rolling_window_performance in walkforward_summary.json; Fold-1 "
+            "warmup delay is unmeasurable and reported as 0 days (unverified)."
+        )
 
     # 4. Single-rebalance equity jumps
     fold_equities = defaultdict(dict)
@@ -402,6 +584,14 @@ def audit_strategy_trades(results_dir: Path, dir_name: str, summary_data: dict):
                 if slist[i+1]["price"] > slist[i]["price"]:
                     buys_up += 1
     buy_hit_rate = buys_up / tot_buys if tot_buys > 0 else 0.50
+    if tot_buys == 0:
+        # 0.50 is the "coin flip" prior, which grades CLEAN on the look-ahead check while
+        # every symbol has a single trade (no follow-up price to compare against).
+        _warn(
+            f"[{label}] no BUY has a follow-up trade of the same symbol, so the directional "
+            "hit rate is unmeasurable; 0.50 (coin-flip prior) is reported and the look-ahead "
+            "check is unverified."
+        )
 
     return {
         "dir_name": dir_name,
@@ -525,14 +715,25 @@ def run_ranking(strategies, results_dir: Path, top_n: int = 10):
 
 
 def audit_strategy_assets(results_dir: Path, dir_name: str = ""):
-    """Performs stateful asset-level trade analysis and PnL attribution from walkforward_rebalances.csv."""
+    """Performs stateful asset-level trade analysis and PnL attribution from walkforward_rebalances.csv.
+
+    Hard rules (added 2026-10-25 after the silent-degradation incident):
+    * a missing third-party dependency is FATAL (`sys.exit(2)`), never a `universe = {}`;
+    * an empty price universe while fold-end positions are open makes every net-PnL /
+      ROI / winner-loser number DISQUALIFIED and says so on both streams;
+    * any fold-end position valued at its last trade price instead of the final close is
+      counted and reported (that fallback was previously invisible).
+    """
     strat_dir = (results_dir / dir_name) if dir_name else Path(results_dir)
     path = strat_dir / "walkforward_rebalances.csv"
     if not path.is_file():
         return None
 
+    label = dir_name or strat_dir.name
+
     # Read fold end dates from walkforward_report.csv or walkforward_summary.json
     fold_ends = {}
+    fold_ends_errors = []
     report_csv = strat_dir / "walkforward_report.csv"
     summary_json = strat_dir / "walkforward_summary.json"
     if report_csv.is_file():
@@ -542,8 +743,10 @@ def audit_strategy_assets(results_dir: Path, dir_name: str = ""):
                 for idx, row in enumerate(r, 1):
                     if "end_date" in row and row["end_date"]:
                         fold_ends[idx] = row["end_date"].strip()
-        except Exception:
-            pass
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            # Was `except Exception: pass` -- a corrupt report silently made every fold-end
+            # valuation fall back to last-trade-price.
+            fold_ends_errors.append(f"walkforward_report.csv ({type(exc).__name__}: {exc})")
     if not fold_ends and summary_json.is_file():
         try:
             with open(summary_json) as f:
@@ -551,12 +754,27 @@ def audit_strategy_assets(results_dir: Path, dir_name: str = ""):
             for idx, rwp in enumerate(sdata.get("rolling_window_performance", []), 1):
                 if "end_date" in rwp and rwp["end_date"]:
                     fold_ends[idx] = rwp["end_date"].strip()
-        except Exception:
-            pass
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            fold_ends_errors.append(f"walkforward_summary.json ({type(exc).__name__}: {exc})")
+    if not fold_ends and fold_ends_errors:
+        _warn(
+            f"[{label}] could not read fold end dates ({'; '.join(fold_ends_errors)}); "
+            "fold-end positions will be valued at their last trade price, not the final close."
+        )
 
     trades = []
+    parse_failures = 0
+    first_parse_error = None
     with open(path) as f:
         reader = csv.DictReader(f)
+        fields = reader.fieldnames or []
+        missing_cols = [c for c in _REBALANCE_CSV_COLUMNS if c not in fields]
+        if missing_cols:
+            _flag_degraded(
+                label,
+                f"{path.name} is missing column(s) {missing_cols}; every missing numeric "
+                "field is read as 0.0, so the PnL attribution below is disqualified.",
+            )
         for row in reader:
             try:
                 row["fold"] = int(row["fold"])
@@ -566,14 +784,28 @@ def audit_strategy_assets(results_dir: Path, dir_name: str = ""):
                            "commission", "slippage", "total_cost", "portfolio_equity"]:
                     row[k] = float(row.get(k, 0.0) or 0.0)
                 trades.append(row)
-            except Exception:
+            except Exception as exc:
+                parse_failures += 1
+                if first_parse_error is None:
+                    first_parse_error = f"{type(exc).__name__}: {exc}"
                 continue
+
+    if parse_failures:
+        _flag_degraded(
+            label,
+            f"{parse_failures}/{parse_failures + len(trades)} row(s) of {path.name} failed to "
+            f"parse and were dropped (first error: {first_parse_error}); "
+            + ("ALL rows were dropped, so no PnL attribution exists at all."
+               if not trades else "the PnL attribution below excludes those rows."),
+            disqualifying=not trades,
+        )
 
     if not trades:
         return None
 
     # Load universe close prices for mark-to-market valuation at fold end
     universe = {}
+    universe_error = None
     symbols = sorted(list(set(t["symbol"] for t in trades)))
     if symbols:
         try:
@@ -582,22 +814,55 @@ def audit_strategy_assets(results_dir: Path, dir_name: str = ""):
                 if (parent_p / "common").is_dir() and str(parent_p) not in sys.path:
                     sys.path.insert(0, str(parent_p))
             from common.cli_utils import load_universe_with_banner
-            start_date = min(t["date"] for t in trades)
-            end_date_all = max(fold_ends.values()) if fold_ends else max(t["date"] for t in trades)
-            universe = load_universe_with_banner(
-                symbols, start_date, end_date_all, '1d',
-                data_kwargs={'provider': 'fuyao'},
-                require_nonempty=False,
-                loading_msg=""
+        except ImportError as exc:
+            # FATAL, never swallowed. This is the exact import that failed on a pandas-less
+            # interpreter and used to degrade every fold-end valuation to last-trade-price;
+            # `_require_third_party_deps()` should already have caught it before main() ran.
+            sys.stdout.flush()
+            print(
+                "Error: this script requires "
+                + "/".join(_REQUIRED_THIRD_PARTY_DEPS)
+                + " to value fold-end positions at the final close, but importing the "
+                f"universe loader failed ({type(exc).__name__}: {exc}); current interpreter: "
+                f"{sys.executable} (python {sys.version_info.major}."
+                f"{sys.version_info.minor}.{sys.version_info.micro}). "
+                f"Re-run with {_venv_python_hint()}.",
+                file=sys.stderr,
             )
-        except Exception:
-            universe = {}
+            sys.exit(2)
+        except Exception as exc:
+            universe_error = f"{type(exc).__name__}: {exc}"
+        else:
+            try:
+                start_date = min(t["date"] for t in trades)
+                end_date_all = max(fold_ends.values()) if fold_ends else max(t["date"] for t in trades)
+                universe = load_universe_with_banner(
+                    symbols, start_date, end_date_all, '1d',
+                    data_kwargs={'provider': 'fuyao'},
+                    require_nonempty=False,
+                    loading_msg=""
+                )
+            except Exception as exc:
+                universe = {}
+                universe_error = f"price load failed ({type(exc).__name__}: {exc})"
 
     folds = sorted(set(t["fold"] for t in trades))
     symbol_stats = defaultdict(lambda: {
         "buys": 0.0, "sells": 0.0, "costs": 0.0, "end_val": 0.0,
         "trades": 0, "buy_count": 0, "sell_count": 0, "folds_present": set(),
     })
+
+    # Fold-end valuation provenance counters. `_fallback_reasons` records WHY a position was
+    # priced at its last trade price, so the warning can name the actual cause.
+    positions_at_fold_end = 0
+    close_marks = 0
+    price_fallbacks = 0
+    fallback_reasons = []
+    first_mark_error = None
+
+    def _note_fallback(reason):
+        if reason not in fallback_reasons:
+            fallback_reasons.append(reason)
 
     for f_num in folds:
         ft = [t for t in trades if t["fold"] == f_num]
@@ -631,19 +896,94 @@ def audit_strategy_assets(results_dir: Path, dir_name: str = ""):
 
         end_date = fold_ends.get(f_num)
         for sym, (sh, pr) in held.items():
+            positions_at_fold_end += 1
+            marked_at_close = False
             if fold_ends and (sym in universe) and end_date:
                 try:
                     close_p = float(universe[sym].loc[:end_date, 'Close'].iloc[-1])
+                except (KeyError, IndexError, TypeError, ValueError) as exc:
+                    # Was a bare `except Exception:` that silently valued the position at
+                    # its last trade price. Keep the fallback (one bad bar must not abort
+                    # the audit) but count it and remember why.
+                    if first_mark_error is None:
+                        first_mark_error = f"{type(exc).__name__}: {exc}"
+                    _note_fallback(f"fold {f_num} {sym}: close lookup failed")
+                else:
                     symbol_stats[sym]["end_val"] += sh * close_p
-                except Exception:
-                    symbol_stats[sym]["end_val"] += sh * pr
-            else:
-                symbol_stats[sym]["end_val"] += sh * pr
+                    marked_at_close = True
+            if marked_at_close:
+                close_marks += 1
+                continue
+            if not universe:
+                _note_fallback("price universe is empty")
+            elif not fold_ends:
+                _note_fallback("fold end dates unavailable")
+            elif sym not in universe:
+                _note_fallback(f"{sym} absent from the loaded price universe")
+            elif end_date is None:
+                _note_fallback(f"fold {f_num} has no end_date")
+            symbol_stats[sym]["end_val"] += sh * pr
+            price_fallbacks += 1
+
+    # --- Valuation provenance gate (the 2026-10-25 incident) ---------------------------
+    # Silent `universe = {}` used to make EVERY fold-end position fall back to its last
+    # trade price, which looked like a normal report with slightly smaller PnL. These
+    # checks make that state impossible to miss.
+    if positions_at_fold_end == 0:
+        _flag_degraded(
+            label,
+            "parsed trades but no fold ends with an open position (target_shares <= 0 "
+            "everywhere), so end-of-period valuation is 0.0 and net PnL reduces to "
+            "realized sells - buys - costs; if the strategy was actually holding assets "
+            "this is a broken CSV, not a flat book.",
+            disqualifying=False,
+        )
+    if positions_at_fold_end and not universe:
+        _flag_degraded(
+            label,
+            f"loaded price universe is EMPTY while {positions_at_fold_end} fold-end "
+            f"position(s) over {len(symbols)} symbol(s) remain open"
+            + (f" [{universe_error}]" if universe_error else " (loader returned no data)")
+            + "; every one of them was valued at its LAST TRADE PRICE instead of the final "
+              "close, so the net PnL / ROI / win-loss / fragility numbers below are "
+              "DISQUALIFIED.",
+        )
+    elif universe_error:
+        _flag_degraded(
+            label,
+            f"price universe load failed [{universe_error}]; fold-end positions that could "
+            "not be marked to close were valued at their last trade price, so the PnL "
+            "attribution below is DISQUALIFIED.",
+        )
+    elif price_fallbacks:
+        _flag_degraded(
+            label,
+            f"{price_fallbacks}/{positions_at_fold_end} fold-end position valuation(s) fell "
+            f"back to the LAST TRADE PRICE instead of the final close ({'; '.join(fallback_reasons)}"
+            + (f"; first close-lookup error: {first_mark_error}" if first_mark_error else "")
+            + f"); only {close_marks} were marked to close, so those marks are approximate and "
+              "the affected PnL numbers are disqualified.",
+        )
+
+    if universe:
+        missing_price_syms = [s for s in symbols if s not in universe]
+        if missing_price_syms:
+            _warn(
+                f"[{label}] {len(missing_price_syms)}/{len(symbols)} traded symbol(s) have no "
+                f"price data ({', '.join(missing_price_syms[:10])}"
+                + (", ..." if len(missing_price_syms) > 10 else "")
+                + "); their fold-end positions are valued at the last trade price."
+            )
 
     assets = []
+    no_buy_symbols = 0
     for sym, st in symbol_stats.items():
         net_pnl = st["sells"] + st["end_val"] - st["buys"] - st["costs"]
         roi = (net_pnl / st["buys"] * 100.0) if st["buys"] > 0 else 0.0
+        if st["buys"] <= 0:
+            # Genuinely undefined (zero denominator), kept as 0.0 for layout stability, but
+            # a traded symbol with no recorded BUY means the CSV is missing rows.
+            no_buy_symbols += 1
         assets.append({
             "symbol": sym,
             "net_pnl": net_pnl,
@@ -657,6 +997,12 @@ def audit_strategy_assets(results_dir: Path, dir_name: str = ""):
             "folds": len(st["folds_present"]),
             "roi": roi,
         })
+
+    if no_buy_symbols:
+        _warn(
+            f"[{label}] {no_buy_symbols}/{len(symbol_stats)} traded symbol(s) record no BUY "
+            "value at all, so their ROI is not computable and is reported as 0.0%."
+        )
 
     assets.sort(key=lambda a: a["net_pnl"], reverse=True)
     winners = [a for a in assets if a["net_pnl"] > 0]
@@ -705,6 +1051,20 @@ def deep_analyze_top_strategies(
 
         asset_data = audit_strategy_assets(results_dir, dir_name)
         trade_audit = audit_strategy_trades(results_dir, dir_name, summary)
+
+        # Was silent: with no asset attribution this section still printed
+        # "Total Friction Cost: 0.00 RMB | Net PnL: 0.00 RMB" as if measured.
+        if not asset_data:
+            _warn(
+                f"[{strat_name}] no asset attribution available (missing or unparseable "
+                "walkforward_rebalances.csv); Friction Cost / Net PnL below print as 0.00 "
+                "RMB and are NOT measurements."
+            )
+        if not folds_perf:
+            _warn(
+                f"[{strat_name}] walkforward_summary.json carries no rolling_window_performance; "
+                "fold dynamics below are omitted and fold-derived metrics are unverified."
+            )
 
         # Behavioral & Fold Metrics
         cagrs = [(f.get("cagr") or 0.0) for f in folds_perf]
@@ -927,11 +1287,26 @@ def audit_abnormal_and_overfit(
         asset_data = audit_strategy_assets(results_dir, dir_name)
         trade_audit = audit_strategy_trades(results_dir, dir_name, summary)
 
+        # Was silent: with no asset attribution every asset-level row below degrades to
+        # 0.0 and can grade CLEAN. Say so before the matrix is printed.
+        if not asset_data:
+            _warn(
+                f"[{strat_name}] no asset attribution available (missing or unparseable "
+                "walkforward_rebalances.csv); the fragility / LOO / friction rows below are "
+                "computed from 0.0 and are NOT measurements."
+            )
+
         # 1. Look-ahead bias
+        # With no trade record every trade-derived row below silently collapses to its
+        # cleanest default (0.50 hit rate, 0.0% position, +0d warmup, 0.0% jump) and grades
+        # CLEAN. The numbers are kept for layout/threshold stability but labelled unverified.
+        no_trade_data = not trade_audit
         hit_rate = trade_audit.get("buy_hit_rate", 0.50) if trade_audit else 0.50
         hit_rate_pct = hit_rate * 100.0
         lookahead_status = "CLEAN" if hit_rate <= 0.65 else ("WARNING" if hit_rate <= 0.75 else "DATA LEAKAGE RISK")
         lookahead_diag = "Realistic trend hit rate; no forward leakage" if hit_rate <= 0.65 else ("Elevated timing hit rate" if hit_rate <= 0.75 else "Suspiciously high directional accuracy")
+        if no_trade_data:
+            lookahead_diag = "N/A: no trade record, so directional accuracy is unmeasured (CLEAN is a default, not a result)"
 
         # 2. All-in bets & concentration
         all_in_cnt = r.get("all_in", 0)
@@ -939,16 +1314,22 @@ def audit_abnormal_and_overfit(
         max_pos = max((abs(t["target_weight"]) for t in trades), default=0.0) * 100.0
         allin_status = "CLEAN" if (all_in_cnt == 0 and max_pos <= 25.0) else ("WARNING" if max_pos <= 50.0 else "HIGH CONCENTRATION")
         allin_diag = f"Strict position caps (Max pos: {max_pos:.1f}%)" if (all_in_cnt == 0 and max_pos <= 25.0) else f"{all_in_cnt} all-in trades; Max pos: {max_pos:.1f}%"
+        if no_trade_data:
+            allin_diag = "N/A: no trade record, so the maximum position size is unmeasured"
 
         # 3. Warmup padding
         warmup_days = trade_audit.get("warmup_days_fold1", 0) if trade_audit else 0
         warmup_status = "CLEAN" if warmup_days <= 30 else ("WARNING" if warmup_days <= 60 else "PADDED")
         warmup_diag = f"Immediate trade execution (+{warmup_days}d)" if warmup_days <= 30 else f"Delayed trading by +{warmup_days} days in Fold 1"
+        if no_trade_data:
+            warmup_diag = "N/A: no trade record, so the Fold-1 first-trade delay is unmeasured"
 
         # 4. Outlier equity jump
         max_jump = (r.get("max_jump", 0.0) or 0.0) * 100.0
         jump_status = "CLEAN" if max_jump <= 15.0 else ("MODERATE" if max_jump <= 30.0 else "OUTLIER DRIVEN")
         jump_diag = f"Equity curve grew incrementally (Max: {max_jump:.1f}%)" if max_jump <= 15.0 else f"Single rebalance jump of {max_jump:.1f}%"
+        if no_trade_data:
+            jump_diag = "N/A: no trade record, so the per-rebalance equity jump is unmeasured"
 
         # 5. DSR statistical edge
         dsr = r.get("dsr", 0.0) or 0.0
@@ -962,7 +1343,21 @@ def audit_abnormal_and_overfit(
         best_fold_idx = (cagrs.index(max(cagrs)) + 1) if cagrs else 1
         worst_fold_idx = (cagrs.index(min(cagrs)) + 1) if cagrs else 1
         fold_status = "CLEAN" if top_fold_share <= 40.0 else ("WARNING" if top_fold_share <= 60.0 else "HIGH REGIME RISK")
-        fold_diag = f"Evenly distributed across folds (Fold {best_fold_idx}: {top_fold_share:.1f}%)" if top_fold_share <= 40.0 else f"Fold {best_fold_idx} generated {top_fold_share:.1f}% of positive returns"
+        if pos_cagr_sum > 0:
+            fold_metric = f"{top_fold_share:.1f}% from Fold {best_fold_idx}"
+            fold_diag = f"Evenly distributed across folds (Fold {best_fold_idx}: {top_fold_share:.1f}%)" if top_fold_share <= 40.0 else f"Fold {best_fold_idx} generated {top_fold_share:.1f}% of positive returns"
+        else:
+            # No positive-CAGR fold => "share of positive CAGR" has no denominator. 0.0 used
+            # to print as a clean "0.0% from Fold 1", i.e. a fake pass on a dead strategy.
+            fold_metric = "N/A (no positive-CAGR fold)"
+            fold_diag = (
+                f"N/A: no fold had CAGR > 0 ({len(cagrs)} fold(s) evaluated), so the "
+                "concentration share is undefined; status below is unverified, not clean"
+            )
+            _warn(
+                f"[{strat_name}] Profit-concentration share is not computable: no fold has "
+                "CAGR > 0; reported as N/A instead of a fake 0.0%."
+            )
 
         # 7. Superstar asset fragility & Leave-One-Out (LOO) test
         total_net_pnl = asset_data.get("total_net_pnl", 0.0) if asset_data else 0.0
@@ -976,7 +1371,24 @@ def audit_abnormal_and_overfit(
 
         top3_share = (top3_pnl / total_net_pnl * 100.0) if total_net_pnl > 1e-4 else (999.0 if top3_pnl > 0 else 0.0)
         fragility_status = "ROBUST" if top3_share <= 60.0 else ("WARNING" if top3_share <= 100.0 else "HIGH FRAGILITY")
-        fragility_diag = f"Top 3 assets contributed {top3_share:.1f}% of net gain" if top3_share <= 100.0 else f"Top 3 contributed {top3_share:.1f}% (losers drained remaining gain)"
+        if total_net_pnl > 1e-4:
+            fragility_metric = f"{top3_share:.1f}% from Top 3"
+            fragility_diag = f"Top 3 assets contributed {top3_share:.1f}% of net gain" if top3_share <= 100.0 else f"Top 3 contributed {top3_share:.1f}% (losers drained remaining gain)"
+        else:
+            # The share is a fraction of net PnL; with net PnL <= 0 it is genuinely undefined.
+            # The numeric sentinel is KEPT so no threshold/score above changes, but the report
+            # must not present `999.0%` / `0.0%` as if it were a measured percentage.
+            fragility_metric = "N/A (net PnL <= 0)"
+            fragility_diag = (
+                f"N/A: net PnL {total_net_pnl:,.2f} RMB <= 0, so the top-3 gross gain "
+                f"({top3_pnl:,.2f} RMB) has no positive denominator (sentinel "
+                f"{top3_share:.1f} kept for the fragility / overfit thresholds only)"
+            )
+            _warn(
+                f"[{strat_name}] Superstar-Asset-Fragility share is not computable: net PnL "
+                f"{total_net_pnl:,.2f} RMB <= 0 (top-3 gross gain {top3_pnl:,.2f} RMB); "
+                f"reported as N/A, threshold sentinel {top3_share:.1f} kept internally."
+            )
 
         # LOO Calculations
         loo_results = []
@@ -1021,13 +1433,37 @@ def audit_abnormal_and_overfit(
         total_costs = asset_data.get("total_cost", 0.0) if asset_data else 0.0
         friction_net_drag = (total_costs / total_net_pnl * 100.0) if total_net_pnl > 1e-4 else (100.0 if total_costs > 0 else 0.0)
         friction_status = "MINIMAL" if friction_net_drag <= 15.0 else ("ELEVATED" if friction_net_drag <= 30.0 else "SEVERE BLEED")
-        friction_diag = f"Friction fees consumed {friction_net_drag:.1f}% of net profit ({total_costs:,.2f} RMB)"
+        if total_net_pnl > 1e-4:
+            friction_metric = f"{friction_net_drag:.1f}% Fee / Net PnL"
+            friction_diag = f"Friction fees consumed {friction_net_drag:.1f}% of net profit ({total_costs:,.2f} RMB)"
+        else:
+            # Fees as a % of a non-positive net PnL is undefined, not "100%": keep the
+            # numeric sentinel for the thresholds/score, print N/A with the raw fees.
+            friction_metric = "N/A (net PnL <= 0)"
+            friction_diag = (
+                f"N/A: net PnL {total_net_pnl:,.2f} RMB <= 0, so friction cannot be expressed "
+                f"as a share of net profit (raw fees {total_costs:,.2f} RMB; sentinel "
+                f"{friction_net_drag:.1f} kept for the overfit threshold only)"
+            )
+            _warn(
+                f"[{strat_name}] Friction-Bleed ratio is not computable: net PnL "
+                f"{total_net_pnl:,.2f} RMB <= 0 with {total_costs:,.2f} RMB of fees; reported "
+                f"as N/A, threshold sentinel {friction_net_drag:.1f} kept internally."
+            )
 
         # 9. Capital drag & Cash-normalized MaxDD
         active_wsum = r.get("avg_wsum", 1.0)
         idle_cash = max(0.0, 1.0 - active_wsum) * 100.0
         raw_maxdd = (r.get("maxdd", 0.0) or 0.0) * 100.0
         raw_cagr = (r.get("cagr", 0.0) or 0.0) * 100.0
+        if active_wsum < 0.10:
+            # The denominator is clamped to 0.10 to keep the normalisation finite; without a
+            # warning that clamp reads as a measured cash-normalised MaxDD.
+            _warn(
+                f"[{strat_name}] active weight sum is {active_wsum:.4f} (< 0.10); the "
+                "cash-normalised MaxDD/CAGR below use the 0.10 floor, so treat them as "
+                "approximate rather than measured."
+            )
         norm_maxdd = raw_maxdd / max(active_wsum, 0.10)
         norm_cagr = raw_cagr / max(active_wsum, 0.10)
         drag_status = "LOW" if idle_cash <= 25.0 else ("MODERATE" if idle_cash <= 50.0 else "HIGH CASH CUSHION")
@@ -1044,13 +1480,28 @@ def audit_abnormal_and_overfit(
             overfit_flags.append(f"Superstar Fragility: Omitting {winners[0]['symbol']} flips Net PnL to negative ({loo_results[1]['pnl']:,.2f} RMB)")
         elif top3_share > 80.0:
             overfit_score += 15
-            overfit_flags.append(f"High Winner Concentration: Top 3 generate {top3_share:.1f}% of net gain")
+            if total_net_pnl > 1e-4:
+                overfit_flags.append(f"High Winner Concentration: Top 3 generate {top3_share:.1f}% of net gain")
+            else:
+                # Same flag, same score contribution -- but never print the 999.0 sentinel as
+                # if it were a measured share of net gain.
+                overfit_flags.append(
+                    f"High Winner Concentration: top-3 gross gain {top3_pnl:,.2f} RMB on a "
+                    f"non-profitable book (net PnL {total_net_pnl:,.2f} RMB), so the share is N/A"
+                )
         if top_fold_share > 50.0 and len(cagrs) > 2:
             overfit_score += 15
             overfit_flags.append(f"One-Hit Wonder Fold: Best Fold {best_fold_idx} accounts for {top_fold_share:.1f}% of positive returns")
         if friction_net_drag > 25.0:
             overfit_score += 10
-            overfit_flags.append(f"Friction Bleed: Transaction friction consumes {friction_net_drag:.1f}% of net profits")
+            if total_net_pnl > 1e-4:
+                overfit_flags.append(f"Friction Bleed: Transaction friction consumes {friction_net_drag:.1f}% of net profits")
+            else:
+                # Sentinels keep the score identical; only the printed wording becomes honest.
+                overfit_flags.append(
+                    f"Friction Bleed: {total_costs:,.2f} RMB of fees against a non-profitable "
+                    f"book (net PnL {total_net_pnl:,.2f} RMB), so the fee ratio is N/A"
+                )
         if max_pos >= 80.0:
             overfit_score += 15
             overfit_flags.append(f"Extreme Concentration: Max single position reached {max_pos:.1f}%")
@@ -1089,15 +1540,20 @@ def audit_abnormal_and_overfit(
         print("  " + "-" * 136)
         print(f"  {'Inspection Dimension':<30} {'Audited Metric':<24} {'Safety Benchmark':<24} {'Status':<12} {'Forensic Diagnostic':<44}")
         print("  " + "-" * 136)
+
+        def _mv(text):
+            """Metric text; explicitly tagged when the whole trade record is missing."""
+            return f"{text} (unverified)" if no_trade_data else text
+
         matrix_rows = [
-            ("Look-Ahead Bias Check", f"{hit_rate_pct:.1f}% Hit Rate", "45.0% - 55.0%", lookahead_status, lookahead_diag),
-            ("Single-Stock Concentration", f"Max Pos: {max_pos:.1f}%", "< 25.0% (Cap: 20%)", allin_status, allin_diag),
-            ("Fold 1 Warmup Padding", f"+{warmup_days} Days", "< 60 Days", warmup_status, warmup_diag),
-            ("Outlier Equity Jumps", f"{max_jump:.1f}% Single Jump", "< 30.0%", jump_status, jump_diag),
+            ("Look-Ahead Bias Check", _mv(f"{hit_rate_pct:.1f}% Hit Rate"), "45.0% - 55.0%", lookahead_status, lookahead_diag),
+            ("Single-Stock Concentration", _mv(f"Max Pos: {max_pos:.1f}%"), "< 25.0% (Cap: 20%)", allin_status, allin_diag),
+            ("Fold 1 Warmup Padding", _mv(f"+{warmup_days} Days"), "< 60 Days", warmup_status, warmup_diag),
+            ("Outlier Equity Jumps", _mv(f"{max_jump:.1f}% Single Jump"), "< 30.0%", jump_status, jump_diag),
             ("Statistical Edge (DSR)", f"{dsr:.4f}", "> 0.0500", dsr_status, dsr_diag),
-            ("Profit Concentration Skew", f"{top_fold_share:.1f}% from Fold {best_fold_idx}", "< 40.0%", fold_status, fold_diag),
-            ("Superstar Asset Fragility", f"{top3_share:.1f}% from Top 3", "< 60.0%", fragility_status, fragility_diag),
-            ("Friction Bleed Ratio", f"{friction_net_drag:.1f}% Fee / Net PnL", "< 15.0%", friction_status, friction_diag),
+            ("Profit Concentration Skew", fold_metric, "< 40.0%", fold_status, fold_diag),
+            ("Superstar Asset Fragility", fragility_metric, "< 60.0%", fragility_status, fragility_diag),
+            ("Friction Bleed Ratio", friction_metric, "< 15.0%", friction_status, friction_diag),
             ("Capital Drag & Cash Flattery", f"{idle_cash:.1f}% Idle Cash", "< 25.0%", drag_status, drag_diag),
         ]
         for dim, met, bench, stat, diag in matrix_rows:
@@ -1180,6 +1636,11 @@ def main():
     parser.add_argument("--strategy", type=str, default=None, help="Analyze single strategy by name")
 
     args = parser.parse_args()
+
+    # Startup precondition, BEFORE any input validation or audit phase: a missing
+    # pandas/numpy/scipy/yfinance/duckdb used to degrade every fold-end valuation to
+    # last-trade-price via a swallowed ImportError. Crash loudly instead (exit 2).
+    _require_third_party_deps()
 
     # Validate explicitly supplied inputs BEFORE any analysis: a typo'd / wrong-cwd
     # --universe-file used to silently prune against the observed-symbol set instead.
@@ -1289,6 +1750,11 @@ def main():
                 top_n=args.deep_top_n,
                 export_report_path=args.export_overfit_report,
             )
+
+    # End-of-run honesty gate: name every section whose numbers were produced from
+    # degraded inputs, so a partially-broken audit can never be reported as clean.
+    # Exits 3 (not 0) when anything was disqualified; 1 = bad input, 2 = missing dep.
+    _report_degradation_summary()
 
 
 if __name__ == "__main__":

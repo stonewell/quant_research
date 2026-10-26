@@ -1109,7 +1109,7 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.ms_budget_smoothing_alpha must be between 0 and 1, got {self.ms_budget_smoothing_alpha}")
         if not (0.0 < self.ms_canary_breadth_thresh <= 1.0):
             raise ValueError(f"StrategyConfig.ms_canary_breadth_thresh must be between 0 and 1, got {self.ms_canary_breadth_thresh}")
-        if not (0.0 < self.crb_min_weight_change <= 1.0):
+        if not (0.0 <= self.crb_min_weight_change <= 1.0):
             raise ValueError(f"StrategyConfig.crb_min_weight_change must be between 0 and 1, got {self.crb_min_weight_change}")
         if not (0.0 < self.crb_target_bull_exposure <= 1.0):
             raise ValueError(f"StrategyConfig.crb_target_bull_exposure must be between 0 and 1, got {self.crb_target_bull_exposure}")
@@ -1123,7 +1123,7 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.crb_thrust_thresh must be between 0 and 1, got {self.crb_thrust_thresh}")
         if not (0.0 < self.crb_bull_max_single_position <= 1.0):
             raise ValueError(f"StrategyConfig.crb_bull_max_single_position must be between 0 and 1, got {self.crb_bull_max_single_position}")
-        if not (0.0 < self.cfsb_min_weight_change <= 1.0):
+        if not (0.0 <= self.cfsb_min_weight_change <= 1.0):
             raise ValueError(f"StrategyConfig.cfsb_min_weight_change must be between 0 and 1, got {self.cfsb_min_weight_change}")
         if not (0.0 < self.cfsb_target_bull_exposure <= 1.0):
             raise ValueError(f"StrategyConfig.cfsb_target_bull_exposure must be between 0 and 1, got {self.cfsb_target_bull_exposure}")

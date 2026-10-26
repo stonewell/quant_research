@@ -1,0 +1,14 @@
+arm                 dStdSh dStdCAGRpp     dWfSh dWfCAGRpp signflipSh
+baseline           +0.0000     +0.000   +0.0000     +0.000           
+no_voltarget       +0.0154     +1.385   +0.0927     +3.527           
+no_orthogon        -0.1935     -3.730   +0.2452     +1.034        YES
+no_structregime    +0.0000     +0.000   +0.0000     +0.000           
+no_cyq             -0.0894     -0.670   -0.0355     -0.968           
+no_atrstop         +0.0276     +0.980   +0.1245     +2.080           
+no_lowbeta         +0.0028     +0.105   +0.0267     +0.223           
+no_sectorthrot     +0.0162     +0.113   +0.0284     -0.199           
+no_hysteresis      +0.0000     +0.000   +0.0000     +0.000           
+no_thrust          -0.1270     -7.182   +0.1858     -1.070        YES
+no_inertia         -0.1054     -3.702   -0.1992     -0.337           
+bull_full          -0.2501     -2.520   -0.1816     +6.090           
+no_circuit         +0.0000     +0.000   +0.0014     +0.058           

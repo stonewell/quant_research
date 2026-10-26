@@ -1,0 +1,13 @@
+{
+  "strategy": "Chan Four-State Risk-Managed Blend Strategy",
+  "strategy_name": "Chan Four-State Risk-Managed Blend Strategy",
+  "baseline_symbol": "000300.SH",
+  "baseline_template": "equal_weight",
+  "baseline_params": {
+    "rebalance_freq_days": 5
+  },
+  "mean_baseline_sharpe_ratio": -0.47874170117753156,
+  "mean_baseline_cagr": -0.0799692689096693,
+  "mean_outperformance_cagr": 0.3877758371248595,
+  "baseline_calendar_mismatch": false
+}

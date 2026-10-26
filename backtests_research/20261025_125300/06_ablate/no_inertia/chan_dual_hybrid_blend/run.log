@@ -1,0 +1,46 @@
+Loaded Strategy: Chan Dual Hybrid Alpha Blend Strategy (chan_dual_hybrid_blend)
+Parameters: {'cdhb_three_type_weight': 0.45, 'cdhb_vaa_weight': 0.35, 'cdhb_alpha1_weight': 0.1, 'cdhb_alpha2_weight': 0.1, 'cdhb_alpha1_id': 53, 'cdhb_alpha2_id': 3, 'cdhb_alpha3_id': 41, 'cdhb_alpha4_id': 101, 'cdhb_alpha1_require_trend': False, 'cdhb_alpha2_require_trend': False, 'cdhb_expand_alpha_sleeve': True, 'cdhb_dynamic_regime_weights': True, 'cdhb_vol_model': 'garman_klass', 'cdhb_adaptive_inertia': False, 'cdhb_stop_mode': 'atr_trailing', 'cdhb_stop_atr_mult': 4.5, 'cdhb_max_single_position': 0.2, 'cdhb_min_weight_change': 0.0, 'cdhb_entry_threshold': 0.0, 'cdhb_dd_reduce_thresh': 0.1, 'cdhb_dd_defensive_thresh': 0.15, 'cdhb_dd_stop_thresh': 0.2, 'cdhb_tier1_cooldown_bars': 15, 'cdhb_dynamic_cash_deployment': True, 'cdhb_breadth_lookback': 50, 'cdhb_breadth_bull_thresh': 0.3, 'cdhb_thrust_lookback': 10, 'cdhb_thrust_thresh': 0.6, 'cdhb_target_bull_exposure': 0.8, 'cdhb_bull_max_single_position': 0.2, 'cdhb_preemptive_thrust_deployment': True, 'cdhb_min_thrust_assets': 5, 'cdhb_max_assets_per_sector': 2, 'cdhb_adaptive_sector_throttle': True, 'cdhb_thrust_min_roc': 0.01, 'cdhb_thrust_sizing_mode': 'vol_adjusted', 'cdhb_require_asset_trend': True, 'cdhb_require_rs_rank': True, 'cdhb_confluence_sizing': True, 'cdhb_elastic_drawdown_reset': True, 'cdhb_asset_stop_cooldown_bars': 5, 'cdhb_enable_vol_targeting': True, 'cdhb_target_vol': 0.18, 'cdhb_target_bull_vol': 0.24, 'cdhb_target_bear_vol': 0.12, 'cdhb_smooth_drawdown': True, 'cdhb_min_holding_bars': 0, 'cdhb_min_entry_bars': 2, 'cdhb_thrust_incumbent_bonus': 1.2, 'blend_weighting_mode': 'rolling_ic_ir', 'blend_enable_orthogonalization': True, 'blend_enable_structural_regime': True, 'blend_enable_cyq_quality_gate': True, 'blend_enable_adaptive_stop_atr': True, 'blend_enable_low_beta_inertia': True, 'blend_max_assets_per_sector': 2, 'cash_proxy': 'BIL'}
+Logic: Chan Dual Hybrid Alpha Blend Strategy (chan_dual_hybrid_blend): walkforward-champion institutional ensemble blending chan_vaa_compound (35%), chan_three_type (45%), and Alpha#53 (10%), Alpha#3 (10%), Alpha#41 (5%), Alpha#101 (5%) with hard position cap (20% max per stock), drawdown circuit breakers (smooth damping from 10%, defensive VAA at 15%, stop at 20% with fast recovery & 15d auto-heal), turnover filter (min trade change 5%), 2d entry confirmation gate, volatility targeting (18% target vol via Garman-Klass), and atr_trailing stop (4.5x ATR).
+
+Loading 20 symbols ...
+Loaded 20/20 symbols (see warnings above for any skipped).
+Effective strategy dump saved to /home/stone/Work/github/quant/backtests_research/20261025_125300/06_ablate/no_inertia/chan_dual_hybrid_blend/strategy_dump.json
+
+=== Running Standard Backtest: Chan Dual Hybrid Alpha Blend Strategy ===
+
+=== Strategy: Chan Dual Hybrid Alpha Blend Strategy ===
+Sharpe Ratio: 1.13 | CAGR: 14.44% | Max Drawdown: 9.7%
+Calmar Ratio: 1.49 | Win Rate: 52.4% | Profit Factor: 1.22
+Total Rebalances: 1016
+Total Turnover: 125.91
+
+Saved equity curve to /home/stone/Work/github/quant/backtests_research/20261025_125300/06_ablate/no_inertia/chan_dual_hybrid_blend/backtest_equity.csv
+Saved actual daily weights to /home/stone/Work/github/quant/backtests_research/20261025_125300/06_ablate/no_inertia/chan_dual_hybrid_blend/backtest_weights.csv
+Saved rebalance report to /home/stone/Work/github/quant/backtests_research/20261025_125300/06_ablate/no_inertia/chan_dual_hybrid_blend/rebalance_report.csv
+Total Rebalance Trades: 3756
+
+Recent Rebalance Trades:
+ rebal_id       date    symbol action  price prior_w target_w delta_w trade_value   shares   cost
+      915 2026-10-20 601728.SH    BUY  $6.88   18.1%    19.0%   +0.9%   $1,376.00   200.00  $1.38
+      916 2026-10-21 000999.SZ   SELL $25.54   16.1%     7.1%   -9.0%  $15,324.00   600.00 $22.99
+      916 2026-10-21 000157.SZ   SELL  $5.86    3.7%     1.1%   -2.6%   $4,688.00   800.00  $7.03
+      916 2026-10-21 600660.SH    BUY $51.28   10.8%    16.5%   +5.7%  $10,256.00   200.00 $10.26
+      916 2026-10-21 601728.SH    BUY  $6.62   18.5%    20.0%   +1.5%   $2,648.00   400.00  $2.65
+      917 2026-10-22 600660.SH   SELL $51.95   16.3%    10.5%   -5.8%  $10,390.00   200.00 $15.59
+      917 2026-10-22 601728.SH   SELL  $6.72   20.1%    15.1%   -4.9%   $9,408.00 1,400.00 $14.11
+      917 2026-10-22 600900.SH   SELL $29.82   20.3%    15.5%   -4.8%   $8,946.00   300.00 $13.42
+      917 2026-10-22 601857.SH   SELL $12.70    3.3%     0.0%   -3.3%   $6,350.00   500.00  $9.53
+      917 2026-10-22 600028.SH    BUY  $5.36    0.8%     2.5%   +1.7%   $3,216.00   600.00  $3.22
+
+=== Loading Baseline: 000300.SH (equal_weight) ===
+Loading 1 symbols ...
+Loaded 1/1 symbols (see warnings above for any skipped).
+
+=== Baseline Comparison: 000300.SH (equal_weight) ===
+Baseline Sharpe Ratio: -0.15 | Baseline CAGR: -4.03% | Baseline Max Drawdown: 35.8%
+Alpha (annualized): 15.95% | Beta: 0.38
+Tracking Error: 15.92% | Information Ratio: 1.11
+Outperformance CAGR: 18.47%
+Saved baseline equity curve to /home/stone/Work/github/quant/backtests_research/20261025_125300/06_ablate/no_inertia/chan_dual_hybrid_blend/baseline_equity.csv
+Saved comparison report to /home/stone/Work/github/quant/backtests_research/20261025_125300/06_ablate/no_inertia/chan_dual_hybrid_blend/comparison_report.json
+Saved equity curve chart to /home/stone/Work/github/quant/backtests_research/20261025_125300/06_ablate/no_inertia/chan_dual_hybrid_blend/equity_curve.png

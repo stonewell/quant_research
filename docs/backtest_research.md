@@ -126,10 +126,11 @@
 | 5 | 2026-01-16 | 2026-04-23 | 63 | −4.95% |
 | 6 | 2026-04-24 | 2026-07-27 | 63 | −4.53% |
 
-**两条必须写明的边界：**
+**三条必须写明的边界：**
 
 1. **`2026-07-28 → 2026-10-22` 共 57 根 bar 不在任何折内**（`435 - 6 × 63 = 57`）。**OOS 从未为这三个月打分**——它不是"表现好/坏"，它是**没有数字**。
 2. **满仓口径下 6 折也无一达到 0.10。** 同一代理改为 100% 满仓后逐折为 **−9.56% / −1.52% / −2.29% / −4.57% / −7.02% / −6.45%**，最大 −9.56%（折 1），全区间 −9.56%——仍全部 < 10%。⇒ 2b 同样**不能**用来验证熔断，只用来给"这 6 个季度赚没赚钱 / 回撤多深"打分。
+3. **2b 的窗口是单边上行，不含熊市。** 该区间基准 `000300.SH` 6 折均值 CAGR **+19.11%**、Sharpe **1.43**，4/6 折正收益 ⇒ 任何"MaxDD ≈ 4%"的表述在 2b 里**没有熊市样本支撑**。补熊市样本见 §6.6（`07_r3_oos_bear`，`2021-06-01 → 2022-12-30`），实测结果见 `backtests_research/20261025_125300/BEAR_WINDOW_OOS.md`。
 
 ---
 
@@ -153,6 +154,8 @@ flowchart TD
     ROOT --> CB["04_r1_std_cb_compare/<arm>/chan_four_state_blend/\n(baseline vs no_circuit)\n• strategy_dump.json\n• run_manifest.json\n• backtest_*.csv\n• run.log"]
     ROOT --> ANAT["05_anatomy/<strategy>/\n• strategy_dump.json\n• run_manifest.json\n• backtest_*.csv & equity_curve.png\n• run.log"]
     ROOT --> ABL["06_ablate/<arm>/<strategy>/\n(13 arms × 3 strategies = 39 folders)\n• strategy_dump.json\n• run_manifest.json\n• backtest_*.csv\n• run.log"]
+    ROOT --> ABLWF["08_ablate_wf/<arm>/<strategy>/\n(13 arms × 3 strategies, walkforward 0.25y/0.25y)\n• strategy_dump.json\n• run_manifest.json\n• walkforward_*.csv/json\n• run.log"]
+    ROOT --> R3B["07_r3_oos_bear/<strategy>/\n(6 策略 × 熊市窗口 6 折)\n• strategy_dump.json\n• run_manifest.json\n• walkforward_*.csv/json\n• run.log"]
 ```
 
 初始化脚本与自包含 Universe 构建：
@@ -281,6 +284,119 @@ done
 
 **单位注意（不写清楚会误读成 bug）**：三档阈值在 dump 里是**小数**（`0.1` / `0.15` / `0.2`），比较侧是 `dd_mag >= dd_stop_thresh` 这类小数比较（`pipeline/research/blend/blend_base.py:585-587` 解析、`:1001` / `:1071` / `:1087-1093` 比较）。因此 `10.0` 不是"10%"，而是一个**不可达哨兵**（1000% 回撤）——语义上等于"把三档熔断全部关掉"，正是想要的对照臂。
 
+### 6.6 Round 3：熊市样本外（`07_r3_oos_bear`）—— 补上 2b 缺失的下跌段
+
+`03_r2b_oos` 的 6 折只覆盖 `2025-01-02 → 2026-07-27`（单边上行，且 `2026-07-28 → 2026-10-22` 的 57 根 bar 从未打分）⇒ **"MaxDD ≈ 4%" 的每一条结论都不含熊市样本**。本组用**完全相同的折规则**（`--window-years 0.25 --step-years 0.25`，63 / 63，与 §6.4 一致，故折数、折内口径可比）重跑一段**含 2022 年两波下跌**的窗口。
+
+**本地缓存实测覆盖（`data/cache.duckdb`，provider `FuyaoDataProvider`，只读查询，不是假设）**：
+- 20 只股票池的**最早** bar = `2017-01-18`，**最新** bar = `2026-10-23`（基准 `000300.SH` 为 `2016-01-04 → 2026-10-22`）。
+- 窗口 `2021-06-01 → 2022-12-30` 内共有 **388 个交易日**；其中 18 只在窗口内全覆盖，`601728.SH`（IPO `2021-08-20`，331 根）与 `600941.SH`（IPO `2022-01-05`，241 根）仅有部分覆盖 ⇒ 折 1–3 的标的数少于 20，**这是 IPO 缺失，不是数据缺口**。
+- `388 / 63 = 6 折余 10 根`（最后 10 根 bar 不进入任何折，规则同 §5 的边界 1）。折边界（按 bar 计）：折 1 `2021-06-01→2021-08-27`、折 2 `2021-08-30→2021-12-03`、折 3 `2021-12-06→2022-03-10`、折 4 `2022-03-11→2022-06-15`、折 5 `2022-06-16→2022-09-13`、折 6 `2022-09-14→2022-12-16`。**2022 年 1–3 月的主跌段落在折 3**（该折基准 CAGR **−39.840%**、折内回撤 **16.866%**），4 月余波落在折 4，**9–10 月下跌落在折 5–6**（基准 −12.752% / −10.314%）——两波下跌都被覆盖。
+
+```bash
+: "${BT_ROOT:?run §6.1 first}"
+for s in chan_four_state_blend chan_risk_managed_blend chan_crisis_shield_blend \
+         chan_four_state_shield_blend chan_dual_hybrid_blend generic_blend; do
+  out_dir="$BT_ROOT/07_r3_oos_bear/$s"
+  mkdir -p "$out_dir"
+  $PY backtester/run_backtest.py \
+    --strategy-file "$DUMPS/${s}_strategy.json" \
+    --universe-file "$UNIV" \
+    --start 2021-06-01 --end 2022-12-30 \
+    --mode walkforward --window-years 0.25 --step-years 0.25 \
+    --data-provider fuyao --min-shares 100 --china-trading \
+    --baseline-symbol 000300.SH \
+    --cash-sweep-rate 0.015 \
+    --results-dir "$out_dir" --n-jobs 1 \
+    2>&1 | tee "$out_dir/run.log"
+done
+```
+
+> **口径披露（写进任何结论）**：本组带 `--cash-sweep-rate 0.015`（与 §7 解剖轮同口径），而 `03_r2b_oos` 是 **0% 现金收益**。⇒ 跨 `07` vs `03` 的差值**不是纯区间效应**，还混入了「闲置现金 1.5% 年化」这一项。方向上：熊市窗里策略普遍留现金，1.5% 计息会**抬高** 07 的数字，因此 **07 相对 03 的负向差值只会被低估、不会被高估**；反过来，若 07 的 MaxDD 仍显著更深，则该结论在 0% 现金口径下只会更强。**同时注意 07 的窗口与 03 完全不重叠，两者只能并排陈述，不得合并求均值（同 §11 解读纪律第 2 条）。**
+
+### 6.7 Round 4：消融的 walkforward 复核（`08_ablate_wf`）
+
+**为什么 standard 模式的消融不够用（结构性，不是精度问题）**：
+
+1. **§8 的 standard 消融只有一条连续净值**（1,161 根 bar 全程不重置）。它只能回答"在这一整段里拆掉某模块后净值怎么走"，**结构上无法**回答"该模块在多数季度折里是否稳定贡献"：连续模式下 2022 年某模块抵掉的亏损与 2024 年让掉的收益会在全期 Sharpe 里**互相抵消**，而折级指标把这两件事分开记在折 1–2 与折 5/9 上——这是"看得见 vs 可判定"的差别（同 §10 第三条：样本量没有变，变的只是分辨率）。
+2. **两种模式下的 `max_drawdown` 不是同一个量。** standard 是**全期单一回撤**；walkforward 是**折内回撤的 N 折均值**（每折净值重置）。对"按回撤档位触发"的模块（熔断三档、波动率目标、regime 迟滞）来说，**可达性本身会随模式改变**。实证：`chan_four_state_blend` 的 `no_circuit` 臂在 §8 的 standard 模式下与 `baseline` **逐点全等**（`max|Δ| = 0`，1,161 根全对齐），搬到 walkforward 后**不再全等**（442 个调仓日快照中 20 个有差异，全部落在折 4，最大相对差 0.1447%）。⇒ **standard 模式的"数值全等"只等于"连续路径上没触发"，不等于"该模块无效"。**
+3. **§8 的 39 臂里有 7 臂与 `baseline` 数值全等**（§8 假阴性披露），这些臂在 standard 模式下**信息量为零**，且它们与"真的被消费但确实无贡献"的臂在输出上不可区分。walkforward 复核提供的第二条独立诊断（逐折分叉 + 折级符号计数）能把这两类分开。
+
+```bash
+: "${BT_ROOT:?run §6.1 first}"
+pfx_of () {
+  case "$1" in
+    chan_four_state_blend)   echo "cfsb" ;;
+    chan_risk_managed_blend) echo "crb"  ;;
+    chan_dual_hybrid_blend)  echo "cdhb" ;;
+    *) echo "blend" ;;
+  esac
+}
+
+run_arm () {
+  local arm="$1"
+  for s in chan_four_state_blend chan_risk_managed_blend chan_dual_hybrid_blend; do
+    local pfx; pfx="$(pfx_of "$s")"
+    local extra
+    case "$arm" in
+      baseline)        extra='{}' ;;
+      no_voltarget)    extra="{\"${pfx}_enable_vol_targeting\": false}" ;;
+      no_orthogon)     extra='{"blend_enable_orthogonalization": false}' ;;
+      no_structregime) extra='{"blend_enable_structural_regime": false}' ;;
+      no_cyq)          extra='{"blend_enable_cyq_quality_gate": false}' ;;
+      no_atrstop)      extra='{"blend_enable_adaptive_stop_atr": false}' ;;
+      no_lowbeta)      extra='{"blend_enable_low_beta_inertia": false}' ;;
+      no_sectorthrot)  extra='{"blend_max_assets_per_sector": 20}'
+        if [ "$pfx" = "cdhb" ]; then
+          extra='{"blend_max_assets_per_sector": 20, "cdhb_max_assets_per_sector": 20, "cdhb_adaptive_sector_throttle": false}'
+        fi
+        ;;
+      no_hysteresis)   extra='{"blend_enable_regime_hysteresis": false}' ;;
+      no_thrust)       extra="{\"${pfx}_dynamic_cash_deployment\": false}" ;;
+      no_inertia)      extra="{\"${pfx}_adaptive_inertia\": false, \"${pfx}_min_weight_change\": 0.0, \"${pfx}_min_holding_bars\": 0, \"${pfx}_entry_threshold\": 0.0}" ;;
+      bull_full)       extra="{\"${pfx}_target_bull_exposure\": 1.0}" ;;
+      no_circuit)      extra="{\"${pfx}_dd_reduce_thresh\": 10.0, \"${pfx}_dd_defensive_thresh\": 10.0, \"${pfx}_dd_stop_thresh\": 10.0}" ;;
+      *) echo "unknown arm: $arm" >&2; return 1 ;;
+    esac
+    local out_dir="$BT_ROOT/08_ablate_wf/$arm/$s"
+    mkdir -p "$out_dir"
+    $PY backtester/run_backtest.py \
+      --strategy-file "$DUMPS/${s}_strategy.json" \
+      --universe-file "$UNIV" \
+      --start 2022-01-04 --end 2026-10-22 \
+      --mode walkforward --window-years 0.25 --step-years 0.25 \
+      --data-provider fuyao --min-shares 100 --china-trading \
+      --baseline-symbol 000300.SH \
+      --cash-sweep-rate 0.015 \
+      --strategy-params "$extra" \
+      --results-dir "$out_dir" --n-jobs 1 \
+      2>&1 | tee "$out_dir/run.log"
+  done
+}
+
+run_arm baseline
+run_arm no_voltarget
+run_arm no_orthogon
+run_arm no_structregime
+run_arm no_cyq
+run_arm no_atrstop
+run_arm no_lowbeta
+run_arm no_sectorthrot
+run_arm no_hysteresis
+run_arm no_thrust
+run_arm no_inertia
+run_arm bull_full
+run_arm no_circuit
+```
+
+**折网格实测（`chan_four_state_blend`，只读本地缓存）**：窗口 `2022-01-04 → 2026-10-22` 共 **1,161 根** bar（`ohlcv_bars` 表 `000300.SH` 区间计数）。`63 bar/折 × 18 折 = 1,134` 根进入评分，**尾部 27 根（`2026-09-08 → 2026-10-22`）不进入任何折**，规则同 §5 的边界情况。13 臂全部 `n_folds = 18`、`n_valid_folds = 18`、`actual_first_fold_start = 2022-01-04`、`actual_last_fold_end = 2026-09-07`。每臂产物含 `walkforward_summary.json` / `walkforward_report.csv` / `walkforward_weights.csv`（1,134 行 = 18 × 63 日度权重）/ `walkforward_rebalances.csv`，逐策略指标与 ≡ 检测见 `08_ablate_wf/<strategy>/_metrics.md`。
+
+> **口径披露一（窗口）**：本组窗口 `2022-01-04 → 2026-10-22` **与 §8 的 standard 消融窗口完全相同（同为 1,161 根 bar）**。⇒ 本文与 `06_ablate` 的任何差值**纯粹来自评估模式（折内重置 vs 连续净值）**，不含区间差异。反过来，本文数字**不得**与 `01_r1_longwin`（2022-01-04→2024-12-31）、`03_r2b_oos`（2025-01-02→2026-10-22）、`07_r3_oos_bear`（2021-06-01→2022-12-30）的折均值并列或合并（同 §11 解读纪律第 2 条）。
+>
+> **口径披露二（折规则）**：`--window-years 0.25 --step-years 0.25` **与 `03_r2b_oos` / `07_r3_oos_bear` 完全相同**（63 bar / 折）。⇒ 折的粒度与折内重置方式可比，这是本文的"首个分叉折 / 折内回撤"能与 `03` / `07` 同类量对齐讨论的**唯一前提**；但折**数量**不同（本文 18 折 vs `03` / `07` 各 6 折），**不得**据此说本组"样本更大、更可信"——区间不同即口径不同。
+>
+> **口径披露三（现金计息）**：本组带 `--cash-sweep-rate 0.015`（与 §8 消融轮、§7 解剖轮、§6.6 熊市轮同口径），而 `03_r2b_oos` 是 **0% 现金收益**。⇒ 任何**跨本文与 `03` 的绝对数字比较都混入了「闲置现金 1.5% 年化」这一项**，不是纯区间/纯模式效应。方向上：本策略各折普遍留现金，1.5% 计息**抬高**本文净值，故本文相对 `03` 的差值**只会被抬高、不会被压低**。
+
 ---
 
 ## 7. 全景解剖轮（Anatomy）—— 一条连续曲线看清钱怎么流
@@ -347,7 +463,18 @@ run_arm () {
       no_cyq)          extra='{"blend_enable_cyq_quality_gate": false}' ;;
       no_atrstop)      extra='{"blend_enable_adaptive_stop_atr": false}' ;;
       no_lowbeta)      extra='{"blend_enable_low_beta_inertia": false}' ;;
-      no_sectorthrot)  extra="{\"${pfx}_max_assets_per_sector\": 20, \"blend_max_assets_per_sector\": 20, \"${pfx}_adaptive_sector_throttle\": false}" ;;
+      no_sectorthrot)
+        # 前缀键必须真实存在：cfsb_/crb_ 的 max_assets_per_sector / adaptive_sector_throttle 根本不存在，
+        # 写出来会被 StrategyConfig.from_dict 静默丢弃（run.log 只留一行 UserWarning），该臂在三策略中的两个
+        # 上就退化为空操作。真实可用的只有全局 blend_max_assets_per_sector 与 cdhb 的两个前缀孪生键
+        # （已按 strategy_dumps/chan_dual_hybrid_blend_strategy.json 核验：cdhb_max_assets_per_sector=2、
+        # cdhb_adaptive_sector_throttle=true）。cdhb 必须同时覆盖前缀孪生键，否则 dump 里钉死的
+        # cdhb_max_assets_per_sector=2 在 resolve_param 第 1 优先级压过 blend_20，上限仍是 2。
+        extra='{"blend_max_assets_per_sector": 20}'
+        if [ "$pfx" = "cdhb" ]; then
+          extra='{"blend_max_assets_per_sector": 20, "cdhb_max_assets_per_sector": 20, "cdhb_adaptive_sector_throttle": false}'
+        fi
+        ;;
       no_hysteresis)   extra='{"blend_enable_regime_hysteresis": false}' ;;
       no_thrust)       extra="{\"${pfx}_dynamic_cash_deployment\": false}" ;;
       no_inertia)      extra="{\"${pfx}_adaptive_inertia\": false, \"${pfx}_min_weight_change\": 0.0, \"${pfx}_min_holding_bars\": 0, \"${pfx}_entry_threshold\": 0.0}" ;;
@@ -396,7 +523,7 @@ run_arm no_circuit
 | `no_cyq` | `{"blend_enable_cyq_quality_gate": false}` | ✓ 完全可达 | ✓ 完全可达 | ✓ 完全可达 | 参数键 `blend_enable_cyq_quality_gate` 经 `resolve_param` 解出的局部符号 `enable_cyq_quality_gate` 门控段：筹码分布获胜率否决（`min_cyq_winner_ratio`，默认 0.20）与伪突破过滤（Track C Anchor 2） |
 | `no_atrstop` | `{"blend_enable_adaptive_stop_atr": false}` | ✓ 完全可达 | ✓ 完全可达 | ✓ 完全可达 | 消费符号 `enable_adaptive_stop_atr`，实际作用仅一行：`eff_stop_mult = np.clip(stop_atr_mult * (med_vol / s_vol), 3.5, 7.5)`。关闭后 `eff_stop_mult` 恒为 `stop_atr_mult`（默认 4.5），**底层 ATR 追踪止损仍然存在** |
 | `no_lowbeta` | `{"blend_enable_low_beta_inertia": false}` | ✓ 完全可达 | ✓ 完全可达 | ✓ 完全可达 | 消费符号 `enable_low_beta_inertia`：关闭后低波动资产（`s_vol < 0.22`）不再被抬高 `eff_min_holding` 至至少 10 bar 的防御性惯性豁免 |
-| `no_sectorthrot` | `{"${pfx}_max_assets_per_sector": 20, "blend_max_assets_per_sector": 20, "${pfx}_adaptive_sector_throttle": false}` | ✓ 完全可达 | ✓ 完全可达 | ✓ 完全可达 | 两个符号：`max_assets_per_sector`（默认 2，定基线行业上限）与 `adaptive_sector_throttle`（默认关闭，仅 `cdhb` dump 设 `true`）。**真实机制：自适应节流只在某行业 ROC 进入前 20% 分位时把该行业上限「抬高」到至少 2（`allowed_sec_cap = max(allowed_sec_cap, 2)`），从不向下压缩**，且默认 `max_assets_per_sector=2` 下该抬高本身即空转（`max(2,2)=2`）。故本臂的真实意图是**把行业上限从 2 放开到 20**，并**顺带显式关闭** `"${pfx}_adaptive_sector_throttle"` 以消除「热行业抬高到 ≥2」这条与「放开到 20」语义冲突的残余逻辑（cap ≥ 2 时它本是空转，保留显式关闭仅为可读性） |
+| `no_sectorthrot` | 见下方「分策略覆盖键」：`cfsb`/`crb` 只有 `{"blend_max_assets_per_sector": 20}`；`cdhb` 为 `{"blend_max_assets_per_sector": 20, "cdhb_max_assets_per_sector": 20, "cdhb_adaptive_sector_throttle": false}` | ⚠ 仅全局行业上限（节流本就关着） | ⚠ 仅全局行业上限（节流本就关着） | ✓ 全局上限 + 唯一真实存在的节流前缀键 | 两个符号：`max_assets_per_sector`（默认 2，定基线行业上限）与 `adaptive_sector_throttle`（默认关闭，**仅 `cdhb` dump 设 `true`**）。**真实机制：自适应节流只在某行业 ROC 进入前 20% 分位时把该行业上限「抬高」到至少 2（`allowed_sec_cap = max(allowed_sec_cap, 2)`），从不向下压缩**。故本臂的真实意图是**把行业上限从 2 放开到 20**。**分策略可达性不同**：`cfsb`/`crb` 没有任何 `${pfx}_max_assets_per_sector` / `${pfx}_adaptive_sector_throttle` 键（`strategy_dumps` 中不存在），本臂在这两只上**只改全局行业上限**，节流参数保持默认 `false`；`cdhb` 是唯一有前缀孪生键（`cdhb_max_assets_per_sector` / `cdhb_adaptive_sector_throttle`）的策略 ⇒ 其行**额外显式关闭节流**。⚠ **三只策略的 `no_sectorthrot` 行互不可比**：只有 `cdhb` 行真正检验了节流开关，另两行只检验行业上限放宽，把它们当成「同一个消融臂的三次重复」是口径错误 |
 | `no_hysteresis` | `{"blend_enable_regime_hysteresis": false}` | ✓ 完全可达 | ✗ **结构性不可达（且默认已为 False，该臂为 no-op / 假阴性）** | ✗ **结构性不可达（且默认已为 False，该臂为 no-op / 假阴性）** | 消费符号 `enable_regime_hysteresis`（**默认 `False`**；仅 `chan_four_state_blend` 的 dump 将其设为 `true`）：开启时动量冲刺走 0.62 / 0.58 施密特双阈值（`thrust_enter_thresh` / `thrust_exit_thresh`），关闭时退回单阈值 `thrust >= thrust_thresh`。该 `thrust_active` 会回流至 `_compute_adaptive_weights` 的线程化参数（仅制度分支可达时才真正参与选权），并经 `fast_recovery` / `dynamic_cash` 影响现金部署。`crb` / `cdhb` 的 dump **未**设该键 ⇒ 默认 `False`，基线本就走单阈值路径，故强制 `false` 后输出与 `baseline` 完全相同 |
 | `no_thrust` | `{"${pfx}_dynamic_cash_deployment": false}` | ✓ 完全可达 | ✓ 完全可达 | ✓ 完全可达 | 消费符号 `dynamic_cash`（由 `resolve_param(p, "dynamic_cash_deployment", ...)` 解析）：关闭 `bull_active` 下的目标暴露度抬升与 `preemptive_thrust` 抢占式现金部署（现金部署 / breadth thrust 段） |
 | `no_inertia` | `{"${pfx}_adaptive_inertia": false, "${pfx}_min_weight_change": 0.0, "${pfx}_min_holding_bars": 0, "${pfx}_entry_threshold": 0.0}` | ✓ 完全可达 | ✓ 完全可达 | ✓ 完全可达 | 必须**同时归零 `min_weight_change` 与 `min_holding_bars`**：`use_inertia = (min_weight_change > 0.0 or min_holding_bars > 0)`，而三份策略 dump 都钉了 `min_holding_bars: 2`，**只把 `min_weight_change` 归零无法让 `use_inertia` 变假**，`_step_asset_inertia` 的任期锁定（tenure lock，`if age < eff_min_holding … locked_incumbents.add(s)`）仍会压制卖出，臂将退化为假阴性。两键同时归零后 `use_inertia` 才为假、防抖阈值 `static_inertia_thresh` 也随之失效；`adaptive_inertia` 只影响 `inertia_thresh_df` 的自适应阈值构造，故一并关掉以消除残余分支。`_step_asset_inertia` 为内联调用、`apply_asset_inertia` 在本策略中仅为 import（本臂不改变这两处代码的存在性） |
@@ -405,8 +532,11 @@ run_arm no_circuit
 
 > [!WARNING]
 > **假阴性披露（消融矩阵最重要的一行）**：标 `✗` 的臂在该策略上输出将与 `baseline` **完全相同**，不得据此得出「该模块无效」的结论。这类臂只是绕过了代码路径、或本就与默认值相同，**不产生任何信息量**；引用它们与 `baseline` 的差值属于把「没跑」当成「跑出来是 0」。凡在报告中出现某臂与 `baseline` 指标逐位相同的行，必须先核 `strategy_dump.json` 确认覆盖键确实被消费，否则该行作废。
+>
+> **`⚠` 的语义（仅 `no_sectorthrot` 使用）**：该臂**部分可达**——覆盖键确实生效，但**生效的键少于标注为该列设计的键**，且**各行之间不可横向对比**。详见下方分策略覆盖键说明。
 
-- **`no_sectorthrot` 联动关闭自适应行业限流的真实原因**：`chan_dual_hybrid_blend` 在策略 dump 中显式设定了 `"cdhb_adaptive_sector_throttle": true`。在 `blend_base.py` 的行业配额分配段中，自适应节流的唯一动作是 `allowed_sec_cap = max(allowed_sec_cap, 2)` —— 即当某行业 21 日平均 ROC 不低于 `max(0.02, top_sec_thresh)`（行业 ROC 前 20% 分位）时，把该行业上限**抬高**到至少 2，**没有任何向下压缩分支**，也不存在把行业上限压到 1 只的路径。由于 `no_sectorthrot` 已把 `max_assets_per_sector` 放开到 20，「热行业抬高到 ≥2」这条逻辑与「放开到 20」的意图冲突且在该 cap 下必然空转，因此一并显式关闭，保持消融语义单一（只改一件事：行业上限）。
+- **`no_sectorthrot` 是唯一一条「同一臂在不同策略上覆盖键不同」的臂（必须分策略看）**：`chan_dual_hybrid_blend` 在策略 dump 中显式设定了 `"cdhb_adaptive_sector_throttle": true` 与 `"cdhb_max_assets_per_sector": 2`；而 `cfsb` / `crb` 的 dump 里**既没有** `${pfx}_max_assets_per_sector`，**也没有** `${pfx}_adaptive_sector_throttle`。给不存在的键赋值不会报错，只会被 `StrategyConfig.from_dict` 静默丢弃（`run.log` 里仅一行 `UserWarning: ... ignoring unknown key(s)`），于是本臂在那两只策略上**只剩全局 `blend_max_assets_per_sector` 一个自由度**——而全局节流默认本就是 `False`，无所谓「关」。在 `blend_base.py` 的行业配额分配段中，自适应节流的唯一动作是 `allowed_sec_cap = max(allowed_sec_cap, 2)`：当某行业 21 日平均 ROC 不低于 `max(0.02, top_sec_thresh)`（行业 ROC 前 20% 分位）时，把该行业上限**抬高**到至少 2，**没有任何向下压缩分支**。在 cap=20 下它必然空转，故 `cdhb` 行显式关掉它只为消融语义单一（只改一件事：行业上限）。
+  - ⇒ **读法约束**：`cfsb` / `crb` 的 `no_sectorthrot` 行相对 `baseline` 的差值，测的是「行业上限 2 → 20」；`cdhb` 行测的是「上限 2 → 20 且节流关」。**三行不是同一实验的三次重复，禁止横向互比、禁止合并求均值。**
 
 - **`no_atrstop` 与 `no_cyq` 语义边界披露**：
   1. `no_atrstop`（`{"blend_enable_adaptive_stop_atr": false}`）所消融的仅为**波动率环境自适应 ATR 倍数动态缩放**（`blend_base.py` 中 `enable_adaptive_stop_atr` 为真时的 `eff_stop_mult = np.clip(stop_atr_mult * (med_vol / s_vol), 3.5, 7.5)`），关闭后回退至固定 4.5x ATR 追踪止损，**并不是**彻底关闭底层 ATR 止损机制本身（彻底关闭需设置 `"${pfx}_stop_mode": "none"`）。该消融臂旨在评估「环境自适应波动倍数」相对于「固定 ATR 乘数」的边际贡献。
@@ -415,7 +545,7 @@ run_arm no_circuit
 - **`no_inertia` 必须同时归零 `min_weight_change` 与 `min_holding_bars`**：
   `use_inertia = (min_weight_change > 0.0 or min_holding_bars > 0)`，而三份策略 dump 均设置了 `min_holding_bars: 2`。若只将 `min_weight_change` 归零，`use_inertia` 仍为真，`_step_asset_inertia` 的任期锁定（tenure lock，`if age < eff_min_holding … locked_incumbents.add(s)`）仍会生效压制卖出。因此必须同时将两键归零，并设置 `"${pfx}_adaptive_inertia": false` 与 `"${pfx}_entry_threshold": 0.0`。
 
-这 13 个键在各策略配置中均有映射（通过 `pfx_of()` 动态前缀解析与 `resolve_param` 前缀链生效）。注意 `no_sectorthrot` 用 `20`（= universe 规模）而不是 `0`——`0` 的语义是"一只都不许持"，不是"关掉"。
+这 13 个键在各策略配置中均有映射（通过 `pfx_of()` 动态前缀解析与 `resolve_param` 前缀链生效）——**唯一例外是 `no_sectorthrot`**：它按策略分叉覆盖键（见上一条），`cfsb` / `crb` 只用全局键，不存在的前缀键一律不写。注意 `no_sectorthrot` 用 `20`（= universe 规模）而不是 `0`——`0` 的语义是"一只都不许持"，不是"关掉"。
 
 **规模与取舍**：13 臂 × 3 策略 ≈ **39 次单段回测，约 40–60 分钟**。只想先看形状就只跑 `chan_four_state_blend` 一列（13 次，约 15 分钟）——把 `run_arm` 里 `for s in ...` 收成 `for s in chan_four_state_blend`。
 
@@ -431,6 +561,13 @@ run_arm no_circuit
 > # 2. 校验运行清单元数据与产物列表完整性
 > jq '{run_ts: .run_ts, group: .group, strategy: .strategy, artifacts_count: (.artifacts | length)}' \
 >   "$BT_ROOT/06_ablate/no_voltarget/chan_four_state_blend/run_manifest.json"
+>
+> # 3. 校验没有任何参数键被静默丢弃（前缀键写错时 StrategyConfig.from_dict 只发 UserWarning 就丢掉，
+> #    臂会变成空操作而不报错 —— 这是本仓库已发生过的静默失效形态）
+> for d in "$BT_ROOT"/06_ablate/*/*/; do
+>   n=$(grep -c "ignoring unknown key(s)" "$d/run.log")
+>   [ "$n" -eq 0 ] || echo "BROKEN ARM: $d -> $n warning(s)"
+> done   # 期望零输出；单目录版本：grep -c "ignoring unknown key(s)" "$out_dir/run.log"   # 必须打印 0
 > ```
 
 ---
@@ -469,6 +606,8 @@ run_arm no_circuit
 |---|---|---|
 | Round 1 折数 | **4** | window/step 算错（`2.0y=504`、`0.25y=63`） |
 | Round 2b 折数 | **6** | 同上（`0.25y=63/63`） |
+| Round 3（熊市 OOS）折数 | **6**（`388 / 63 = 6` 余 10，`actual_last_fold_end` 应为 `2022-12-16`） | window/step 算错，或 `--end` 落在缓存覆盖之外 |
+| 消融参数键真实存在 | `grep -c "ignoring unknown key(s)" "$out_dir/run.log"` == **0** | 前缀键写错（如 `cfsb_max_assets_per_sector`）被 `StrategyConfig.from_dict` 静默丢弃 ⇒ 该臂变空操作 |
 | 2a 的 bar 数 | **1,161** | `--end` 没传或传错 |
 | 2a 产物完整性 | `strategy_dump.json` / `run_manifest.json` / `run.log` / `backtest_equity.csv` / `backtest_weights.csv` / `rebalance_report.csv` | `--mode` 传成 walkforward 或命令被中断 |
 | 归因臂参数生效 | `$out_dir/strategy_dump.json` 中目标前缀键=新值 | `--strategy-params` 静默未生效 ⇒ 结论反向 |
@@ -512,3 +651,15 @@ run_arm no_circuit
   3. 修复 §6.5 熔断对照臂，提供同区间 standard 下 `baseline` 与 `no_circuit` 成对运行，确保严格同区间逐日净值差分。
   4. 重构 §8 消融实验：引入 `pfx_of()` 动态前缀映射（`cfsb` / `crb` / `cdhb`），修复 `no_sectorthrot` / `no_inertia` / `no_hysteresis` 参数覆盖与假阴性风险，引入 13 臂 × 3 策略可达性矩阵与语义边界披露，升级为基于 `jq` + `strategy_dump.json` 的参数校验。
   5. 全文 6 组命令严格规整为每组 1 处 `tee .*run\.log`（合计恰为 6 处）。
+- 2026-10-25 归因臂可达性修复 + 熊市 OOS 组新增：
+  1. 修复 §8 `no_sectorthrot` 臂的**静默失效**：原命令对 `cfsb` / `crb` 写入 `"${pfx}_max_assets_per_sector"` 与 `"${pfx}_adaptive_sector_throttle"`，这两个键**在 `strategy_dumps` 中不存在**，被 `StrategyConfig.from_dict` 静默丢弃（`run.log` 仅留 `UserWarning: ignoring unknown key(s)`）；改为按策略分叉——`cfsb` / `crb` 只给全局 `blend_max_assets_per_sector: 20`，`cdhb` 另加其**真实存在**的前缀孪生键 `cdhb_max_assets_per_sector: 20` / `cdhb_adaptive_sector_throttle: false`。
+  2. §8 可达性矩阵与释义段落同步改写：明确 `no_sectorthrot` 在 `cfsb` / `crb` 上**只改全局行业上限**（节流默认本就是 `false`），**三只策略的该行互不可比**，`cdhb` 行是唯一真正检验节流开关的一行。
+  3. §8 参数校验纪律新增第 3 条：`grep -c "ignoring unknown key(s)"` 必须为 0（§11 验收表同步新增该检查项）。
+  4. 新增 §6.6 `07_r3_oos_bear` 熊市样本外组（`2021-06-01 → 2022-12-30`，388 根 bar，`0.25y / 0.25y` ⇒ 6 折），填补 `03_r2b_oos` 只含单边上行、`"MaxDD ≈ 4%"` 无熊市样本的空白；同区间折边界与「2022 两波下跌分别落在折 4 / 折 6」的选择理由已实证写入，并披露 `--cash-sweep-rate 0.015` 与 2b 的 0% 现金口径差异。产物见 `backtests_research/20261025_125300/07_r3_oos_bear/` 与 `BEAR_WINDOW_OOS.md`。
+  5. 命令组由 **6 组增至 7 组**（新增 §6.6），故 `tee "$out_dir/run.log"` 由 6 处增至 **7 处**；§5「两条边界」扩为三条（补"2b 不含熊市"）；§11 验收表新增 Round 3 折数与"消融参数键真实存在"两行。
+- 2026-10-25 新增 §6.7 `08_ablate_wf`（消融的 walkforward 复核）：
+  1. 新增 §6.7 `Round 4：消融的 walkforward 复核`，论证 standard 模式消融的**结构性不足**（①连续净值把"某模块在多数折是否稳定贡献"平均掉；②两种模式的 `max_drawdown` 不是同一个量——standard 是全期单一回撤、walkforward 是折内回撤均值；③§8 的 39 臂中 7 臂与 `baseline` 数值全等，standard 下信息量为零），并给出 13 臂 × 3 策略的**可整体复制循环**（`run_arm` + `--mode walkforward --window-years 0.25 --step-years 0.25`，`--results-dir "$BT_ROOT/08_ablate_wf/$arm/$s"`），臂的 `extra` JSON 与 §8 逐字一致。
+  2. 折网格实测写入：窗口 `2022-01-04 → 2026-10-22` 共 **1,161 根** bar，`63 × 18 = 1,134` 根入折，**尾部 27 根（`2026-09-08 → 2026-10-22`）不入折**；13 臂 `n_folds = n_valid_folds = 18`、`actual_last_fold_end = 2026-09-07`。
+  3. 三条口径披露并列写入：窗口与 `06_ablate` 完全一致（差值纯为"评估模式"）；折规则与 `03` / `07` 一致（但折数 18 vs 6，不得据此称"样本更大"）；`--cash-sweep-rate 0.015` 与 `03` 的 0% 现金不同口径。
+  4. §6.1 目录拓扑新增 `ABLWF`（`08_ablate_wf/<arm>/<strategy>/`）节点；命令组由 **7 组增至 8 组**，`tee ... run.log` 的命令块计数同步由 7 处增至 **8 处**（全文匹配计数含变更记录引用时为 9）。
+  5. 实测发现并写入：`chan_four_state_blend` 的 `no_circuit` 臂在 standard 下与 `baseline` 逐点全等（`max|Δ| = 0`），在 walkforward 下不再全等（442 个调仓日快照中 20 个有差异，全部落在折 4，最大相对差 0.1447%）⇒ **"数值全等"≠"模块无效"**，这是"同一模块在两种评估模式下可达性不同"的实证。

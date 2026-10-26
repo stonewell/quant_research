@@ -120,12 +120,29 @@ This skill implements an institutional 6-phase quantitative audit process to eva
 > - If `<TARGET_DIR>` contains `walkforward_summary.json` directly (a single backtest run), audit that run dynamically using its embedded strategy name.
 > - If `<TARGET_DIR>` contains subdirectories, audit each strategy run within those subdirectories using its respective summary JSON.
 
+**Error Handling & Exit Codes** (authoritative source: `run_audit.py`'s module docstring and
+`_report_degradation_summary()`). The directory-selection bullets above only mention exit 1; the
+script's full contract is:
+
+| Exit code | Meaning |
+| ---: | :--- |
+| `0` | Clean run; every section's numbers are trustworthy. |
+| `1` | Input/argument error (e.g. `--results-dir` does not exist, invalid `--universe-file`). |
+| `2` | Missing third-party dependency (pandas / numpy / scipy / yfinance / duckdb); the script prints the current interpreter path and the `pipeline/.venv/bin/python3` to use instead. (`argparse` itself also returns `2` on a malformed command line, e.g. an unknown flag.) |
+| `3` | Run completed, but at least one section ran on degraded inputs (data contamination, e.g. an empty universe while positions are still open); those numbers **must not be quoted**. |
+
+Exit `2` almost always means the wrong interpreter was used: every `python3 ...` block in this file
+must be run with `pipeline/.venv/bin/python3` from the repository root, never the system `python3`,
+or the run dies at startup instead of degrading. Exit `3` still prints a full report, so a bare
+`set -e` wrapper aborts on a *usable-but-disqualified* run -- check the exit code, do not just check
+for non-zero.
+
 ### Step 1: Run Cross-Strategy Walkforward Summary
 
 Run the automated summary tool to aggregate performance strictly for the specified target directory:
 
 ```bash
-python3 pipeline/.agents/skills/walkforward-audit/scripts/run_audit.py --results-dir <TARGET_DIR> --summary
+pipeline/.venv/bin/python3 pipeline/.agents/skills/walkforward-audit/scripts/run_audit.py --results-dir <TARGET_DIR> --summary
 ```
 
 **Key Metrics to Examine**:
@@ -140,7 +157,7 @@ python3 pipeline/.agents/skills/walkforward-audit/scripts/run_audit.py --results
 Run the deep-dive audit tool against candidate strategies in the specified target directory:
 
 ```bash
-python3 pipeline/.agents/skills/walkforward-audit/scripts/run_audit.py --results-dir <TARGET_DIR> --audit --top-n 10
+pipeline/.venv/bin/python3 pipeline/.agents/skills/walkforward-audit/scripts/run_audit.py --results-dir <TARGET_DIR> --audit --top-n 10
 ```
 
 Refer to the [Anomaly Patterns Reference](./references/anomaly_patterns.md) for detailed diagnostics:
@@ -171,7 +188,7 @@ Refer to the [Anomaly Patterns Reference](./references/anomaly_patterns.md) for 
 Run the scoring engine to reorder candidates based on realistic live trading readiness:
 
 ```bash
-python3 pipeline/.agents/skills/walkforward-audit/scripts/run_audit.py --results-dir <TARGET_DIR> --rank --top-n 10
+pipeline/.venv/bin/python3 pipeline/.agents/skills/walkforward-audit/scripts/run_audit.py --results-dir <TARGET_DIR> --rank --top-n 10
 ```
 
 **Scoring Methodology**:
@@ -195,7 +212,7 @@ $$\text{Adj Sharpe} = \text{Raw Sharpe} - \text{Penalties} + \text{Bonuses}$$
 Run an in-depth diagnosis across the top-ranked strategies (defaults to top 3):
 
 ```bash
-python3 pipeline/.agents/skills/walkforward-audit/scripts/run_audit.py --results-dir <TARGET_DIR> --deep-analyze --deep-top-n 3
+pipeline/.venv/bin/python3 pipeline/.agents/skills/walkforward-audit/scripts/run_audit.py --results-dir <TARGET_DIR> --deep-analyze --deep-top-n 3
 ```
 
 **Key Behavioral Checks for Each Top Strategy**:
@@ -223,7 +240,7 @@ Consolidate asset PnL across the top evaluated strategies, identify chronic lose
 # A supplied-but-unresolvable path is a HARD ERROR (exit 1, "Error: universe file not
 # found at '<path>'"), never a silent swap to the observed-symbol set.
 # --export-pruned-universe is an OUTPUT path, so it need not exist beforehand.
-python3 pipeline/.agents/skills/walkforward-audit/scripts/run_audit.py --results-dir <TARGET_DIR> \
+pipeline/.venv/bin/python3 pipeline/.agents/skills/walkforward-audit/scripts/run_audit.py --results-dir <TARGET_DIR> \
   --deep-analyze \
   --exclude-losers \
   --universe-file docs/universe/china/core_satellite_22_stocks.txt \
@@ -256,11 +273,11 @@ Run the deep forensic anomaly and overfitting audit engine across candidate stra
 
 ```bash
 # Terminal output with inspection matrix & LOO table
-python3 pipeline/.agents/skills/walkforward-audit/scripts/run_audit.py --results-dir <TARGET_DIR> \
+pipeline/.venv/bin/python3 pipeline/.agents/skills/walkforward-audit/scripts/run_audit.py --results-dir <TARGET_DIR> \
   --abnormal-overfit --deep-top-n 3
 
 # Or export an audit report in GitHub-flavored Markdown
-python3 pipeline/.agents/skills/walkforward-audit/scripts/run_audit.py --results-dir <TARGET_DIR> \
+pipeline/.venv/bin/python3 pipeline/.agents/skills/walkforward-audit/scripts/run_audit.py --results-dir <TARGET_DIR> \
   --abnormal-overfit --deep-top-n 3 \
   --export-overfit-report docs/audit/forensic_overfit_report.md
 ```
@@ -304,7 +321,7 @@ python3 pipeline/.agents/skills/walkforward-audit/scripts/run_audit.py --results
 To execute the entire 6-phase audit (including loss drag exclusion and forensic overfit audit) in a single command:
 
 ```bash
-python3 pipeline/.agents/skills/walkforward-audit/scripts/run_audit.py --results-dir <TARGET_DIR> --all --deep-top-n 3
+pipeline/.venv/bin/python3 pipeline/.agents/skills/walkforward-audit/scripts/run_audit.py --results-dir <TARGET_DIR> --all --deep-top-n 3
 ```
 
 ---

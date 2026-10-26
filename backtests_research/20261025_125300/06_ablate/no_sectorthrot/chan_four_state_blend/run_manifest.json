@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "run_ts": "20261025_125300",
+  "git_commit": "8552c4b1e5b3ec5984ac90bad4a5bc75ed83b47d",
+  "git_dirty": true,
+  "status": "completed",
+  "completed_at_utc": "2026-10-25T20:36:04.711650+00:00",
+  "mode": "standard",
+  "group": "06_ablate/no_sectorthrot",
+  "strategy": "Chan Four-State Risk-Managed Blend Strategy",
+  "strategy_file": "/home/stone/Work/github/quant/pipeline/research_strategy/results/strategy_dumps/chan_four_state_blend_strategy.json",
+  "strategy_dump_sha256": "7c5f62c3eb34a28178b3f503f591c138fce0c6542482340f672ee31c9a3c2024",
+  "db_path": "/home/stone/Work/github/quant/data/cache.duckdb",
+  "db_size_bytes": 324022272,
+  "db_mtime_iso": "2026-10-25T20:08:50.702040+00:00",
+  "db_used": true,
+  "cli_overrides": {
+    "cfsb_max_assets_per_sector": 20,
+    "blend_max_assets_per_sector": 20,
+    "cfsb_adaptive_sector_throttle": false
+  },
+  "metrics": {
+    "sharpe": null,
+    "cagr": null,
+    "max_drawdown": null,
+    "calmar": null,
+    "n_folds": null,
+    "deflated_sharpe": null
+  },
+  "artifacts": [
+    {
+      "name": "backtest_equity.csv",
+      "bytes": 34229
+    },
+    {
+      "name": "backtest_weights.csv",
+      "bytes": 271130
+    },
+    {
+      "name": "baseline_equity.csv",
+      "bytes": 33493
+    },
+    {
+      "name": "comparison_report.json",
+      "bytes": 747
+    },
+    {
+      "name": "equity_curve.png",
+      "bytes": 87244
+    },
+    {
+      "name": "rebalance_report.csv",
+      "bytes": 144974
+    },
+    {
+      "name": "strategy_dump.json",
+      "bytes": 5852
+    }
+  ]
+}

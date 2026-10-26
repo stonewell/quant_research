@@ -1,0 +1,74 @@
+Loaded Strategy: Chan Single Crisis Shield Blend Strategy (chan_crisis_shield_blend)
+Parameters: {'ccsb_three_type_weight': 0.45, 'ccsb_vaa_weight': 0.35, 'ccsb_shield_weight': 0.2, 'ccsb_shield_alpha_id': 12, 'ccsb_shield_require_trend': False, 'ccsb_max_single_position': 0.2, 'ccsb_min_weight_change': 0.05, 'ccsb_dd_reduce_thresh': 0.1, 'ccsb_dd_defensive_thresh': 0.15, 'ccsb_dd_stop_thresh': 0.2, 'ccsb_tier1_cooldown_bars': 15, 'ccsb_dynamic_cash_deployment': True, 'ccsb_breadth_lookback': 50, 'ccsb_breadth_bull_thresh': 0.3, 'ccsb_thrust_lookback': 10, 'ccsb_thrust_thresh': 0.6, 'ccsb_target_bull_exposure': 0.8, 'ccsb_bull_max_single_position': 0.2, 'ccsb_enable_vol_targeting': True, 'ccsb_target_vol': 0.12, 'ccsb_smooth_drawdown': True, 'ccsb_vol_model': 'garman_klass', 'ccsb_adaptive_inertia': True, 'ccsb_stop_mode': 'atr_trailing', 'ccsb_stop_atr_mult': 4.5, 'ccsb_entry_threshold': 0.03, 'ccsb_asset_stop_cooldown_bars': 5, 'ccsb_min_holding_bars': 2, 'ccsb_min_entry_bars': 2, 'ccsb_thrust_incumbent_bonus': 1.2, 'blend_weighting_mode': 'rolling_ic_ir', 'blend_enable_orthogonalization': True, 'blend_enable_structural_regime': True, 'blend_enable_cyq_quality_gate': True, 'blend_enable_adaptive_stop_atr': True, 'blend_enable_low_beta_inertia': True, 'blend_max_assets_per_sector': 2, 'cash_proxy': 'BIL'}
+Logic: Chan Crisis Shield Blend Strategy (chan_crisis_shield_blend): institutional ensemble blending chan_vaa_compound (35%), chan_three_type (45%), and WorldQuant Alpha#12 Volume Shock Reversal (20%) with hard position cap (20% max per stock), drawdown circuit breakers (smooth damping from 10%, defensive VAA at 15%, stop at 20% with fast recovery & 15d auto-heal), turnover filter (min trade change 5%), 2d entry confirmation gate, volatility targeting (12% target vol via garman_klass), stop mode (atr_trailing), and dynamic cash deployment in bull breadth (>=30% or 10d thrust).
+
+Loading 20 symbols ...
+Loaded 20/20 symbols (see warnings above for any skipped).
+Effective strategy dump saved to /home/stone/Work/github/quant/backtests_research/20261025_125300/03_r2b_oos/chan_crisis_shield_blend/strategy_dump.json
+
+=== Running Walkforward Rolling Evaluation: Chan Single Crisis Shield Blend Strategy ===
+Window: 0.25 years, Step: 0.25 years
+[Fold 1/6] Evaluating 2025-01-02 to 2025-04-09...
+[Fold 2/6] Evaluating 2025-04-10 to 2025-07-11...
+[Fold 3/6] Evaluating 2025-07-14 to 2025-10-16...
+[Fold 4/6] Evaluating 2025-10-17 to 2026-01-15...
+[Fold 5/6] Evaluating 2026-01-16 to 2026-04-23...
+[Fold 6/6] Evaluating 2026-04-24 to 2026-07-27...
+  [Fold 1/6] Done: Sharpe=-0.52, CAGR=-7.6%, MaxDD=5.8%, Rebalances=26
+  [Fold 2/6] Done: Sharpe=3.79, CAGR=26.3%, MaxDD=2.0%, Rebalances=28
+  [Fold 3/6] Done: Sharpe=3.57, CAGR=59.8%, MaxDD=3.8%, Rebalances=26
+  [Fold 4/6] Done: Sharpe=2.28, CAGR=19.9%, MaxDD=3.4%, Rebalances=25
+  [Fold 5/6] Done: Sharpe=1.40, CAGR=20.9%, MaxDD=6.3%, Rebalances=34
+  [Fold 6/6] Done: Sharpe=1.10, CAGR=11.7%, MaxDD=4.5%, Rebalances=35
+
+=== Loading Baseline: 000300.SH (equal_weight) ===
+Loading 1 symbols ...
+Loaded 1/1 symbols (see warnings above for any skipped).
+[Fold 1/6] Evaluating 2025-01-02 to 2025-04-09...
+[Fold 2/6] Evaluating 2025-04-10 to 2025-07-11...
+[Fold 3/6] Evaluating 2025-07-14 to 2025-10-16...
+[Fold 4/6] Evaluating 2025-10-17 to 2026-01-15...
+[Fold 5/6] Evaluating 2026-01-16 to 2026-04-23...
+[Fold 6/6] Evaluating 2026-04-24 to 2026-07-27...
+  [Fold 1/6] Done: Sharpe=-0.63, CAGR=-12.5%, MaxDD=10.5%, Rebalances=13
+  [Fold 2/6] Done: Sharpe=3.64, CAGR=33.2%, MaxDD=2.7%, Rebalances=13
+  [Fold 3/6] Done: Sharpe=3.78, CAGR=71.9%, MaxDD=3.6%, Rebalances=13
+  [Fold 4/6] Done: Sharpe=1.58, CAGR=23.1%, MaxDD=6.3%, Rebalances=13
+  [Fold 5/6] Done: Sharpe=0.36, CAGR=4.4%, MaxDD=7.1%, Rebalances=13
+  [Fold 6/6] Done: Sharpe=-0.13, CAGR=-5.3%, MaxDD=10.5%, Rebalances=13
+
+Rolling Windows Performance:
+start_date   end_date sharpe_ratio   cagr max_drawdown calmar_ratio win_rate profit_factor total_turnover  total_rebalances baseline_sharpe_ratio baseline_cagr baseline_max_drawdown baseline_calmar_ratio outperformance
+2025-01-02 2025-04-09        -0.52 -7.58%        5.76%        -1.32   48.39%          0.90           2.51                26                 -0.63       -12.54%                10.49%                 -1.20          4.97%
+2025-04-10 2025-07-11         3.79 26.32%        1.96%        13.45   61.29%          1.82           2.91                28                  3.64        33.20%                 2.71%                 12.24         -6.88%
+2025-07-14 2025-10-16         3.57 59.76%        3.78%        15.81   59.68%          1.81           2.36                26                  3.78        71.85%                 3.62%                 19.86        -12.09%
+2025-10-17 2026-01-15         2.28 19.91%        3.43%         5.81   58.06%          1.44           2.39                25                  1.58        23.10%                 6.31%                  3.66         -3.19%
+2026-01-16 2026-04-23         1.40 20.88%        6.29%         3.32   53.23%          1.32           3.12                34                  0.36         4.40%                 7.07%                  0.62         16.48%
+2026-04-24 2026-07-27         1.10 11.67%        4.49%         2.60   54.84%          1.20           3.75                35                 -0.13        -5.34%                10.49%                 -0.51         17.01%
+
+=== Walkforward Summary: Chan Single Crisis Shield Blend Strategy ===
+Mean Sharpe Ratio: 1.94 | Mean CAGR: 21.83%
+Mean Max Drawdown: 4.3% | Mean Calmar Ratio: 6.61
+Deflated Sharpe Ratio: 0.201 (n_trials=6, fold Sharpe std=1.628)
+Mean Baseline Sharpe Ratio: 1.43 | Mean Baseline CAGR: 19.11%
+Mean Outperformance CAGR: 2.71%
+Saved walkforward summary to /home/stone/Work/github/quant/backtests_research/20261025_125300/03_r2b_oos/chan_crisis_shield_blend/walkforward_summary.json
+Saved comparison report to /home/stone/Work/github/quant/backtests_research/20261025_125300/03_r2b_oos/chan_crisis_shield_blend/comparison_report.json
+
+Saved walkforward report to /home/stone/Work/github/quant/backtests_research/20261025_125300/03_r2b_oos/chan_crisis_shield_blend/walkforward_report.csv
+Saved walkforward rebalance report to /home/stone/Work/github/quant/backtests_research/20261025_125300/03_r2b_oos/chan_crisis_shield_blend/walkforward_rebalances.csv
+Total Walkforward Rebalance Trades: 264
+
+Recent Walkforward Rebalance Trades:
+ fold  rebal_id       date    symbol action  price prior_w target_w delta_w trade_value   shares   cost
+    6        26 2026-07-16 600584.SH    BUY $83.15    8.4%    16.9%   +8.6%   $8,315.21   100.00  $8.32
+    6        27 2026-07-17 601919.SH   SELL $14.54   11.7%     0.0%  -11.7%  $11,632.00   800.00 $17.45
+    6        27 2026-07-17 000157.SZ    BUY  $7.00    7.7%    20.0%  +12.3%  $11,895.74 1,700.00 $11.90
+    6        27 2026-07-17 000938.SZ    BUY $35.13    0.0%     9.5%   +9.5%   $7,026.00   200.00  $7.03
+    6        28 2026-07-20 601288.SH    BUY  $6.61    0.0%    20.0%  +20.0%  $19,169.00 2,900.00 $19.17
+    6        28 2026-07-20 601857.SH    BUY $10.75    0.0%    13.4%  +13.4%  $12,902.81 1,200.00 $12.90
+    6        29 2026-07-22 601857.SH   SELL $10.66   12.5%     0.0%  -12.5%  $12,797.34 1,200.00 $19.20
+    6        29 2026-07-22 000938.SZ   SELL $44.90    8.8%     0.0%   -8.8%   $8,980.00   200.00 $13.47
+    6        29 2026-07-22 600941.SH    BUY $91.66    0.0%    19.4%  +19.4%  $18,332.86   200.00 $18.33
+    6        29 2026-07-22 600362.SH    BUY $43.05    0.0%    11.0%  +11.0%   $8,610.00   200.00  $8.61
+Saved walkforward actual weights to /home/stone/Work/github/quant/backtests_research/20261025_125300/03_r2b_oos/chan_crisis_shield_blend/walkforward_weights.csv

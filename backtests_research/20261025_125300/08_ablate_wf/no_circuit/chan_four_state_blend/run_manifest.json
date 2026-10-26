@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "run_ts": "20261025_125300",
+  "git_commit": "8552c4b1e5b3ec5984ac90bad4a5bc75ed83b47d",
+  "git_dirty": true,
+  "status": "completed",
+  "completed_at_utc": "2026-10-26T01:13:27.834177+00:00",
+  "mode": "walkforward",
+  "group": "08_ablate_wf/no_circuit",
+  "strategy": "Chan Four-State Risk-Managed Blend Strategy",
+  "strategy_file": "pipeline/research_strategy/results/strategy_dumps/chan_four_state_blend_strategy.json",
+  "strategy_dump_sha256": "7f4feb9fa60e749c530c888f084c909317e6b36dd529e80843febc2455e0e653",
+  "db_path": "/home/stone/Work/github/quant/data/cache.duckdb",
+  "db_size_bytes": 324022272,
+  "db_mtime_iso": "2026-10-26T00:11:51.336824+00:00",
+  "db_used": true,
+  "cli_overrides": {
+    "cfsb_dd_reduce_thresh": 10.0,
+    "cfsb_dd_defensive_thresh": 10.0,
+    "cfsb_dd_stop_thresh": 10.0
+  },
+  "metrics": {
+    "sharpe": 1.431836658652813,
+    "cagr": 0.3014372615629285,
+    "max_drawdown": 0.04694606369533324,
+    "calmar": 10.910479848320726,
+    "n_folds": 18,
+    "deflated_sharpe": 1.5531268697035488e-54
+  },
+  "artifacts": [
+    {
+      "name": "comparison_report.json",
+      "bytes": 447
+    },
+    {
+      "name": "strategy_dump.json",
+      "bytes": 5667
+    },
+    {
+      "name": "walkforward_rebalances.csv",
+      "bytes": 160854
+    },
+    {
+      "name": "walkforward_report.csv",
+      "bytes": 4831
+    },
+    {
+      "name": "walkforward_summary.json",
+      "bytes": 12071
+    },
+    {
+      "name": "walkforward_weights.csv",
+      "bytes": 254294
+    }
+  ]
+}

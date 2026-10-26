@@ -1,0 +1,21 @@
+{
+  "strategy": "Chan Single Crisis Shield Blend Strategy",
+  "strategy_name": "Chan Single Crisis Shield Blend Strategy",
+  "baseline_symbol": "000300.SH",
+  "baseline_template": "equal_weight",
+  "baseline_params": {
+    "rebalance_freq_days": 5
+  },
+  "baseline_sharpe_ratio": -0.14702804351217447,
+  "baseline_cagr": -0.04034320866051322,
+  "baseline_max_drawdown": 0.3575848363483309,
+  "baseline_calmar_ratio": -0.11282136309945216,
+  "strategy_sharpe_ratio": 1.6696188435651587,
+  "strategy_cagr": 0.2729612376209958,
+  "overlap_bars": 1161,
+  "alpha": 0.2783837765409966,
+  "beta": 0.5374318483176467,
+  "tracking_error": 0.15024144661187105,
+  "information_ratio": 1.9347601813427087,
+  "outperformance_cagr": 0.313304446281509
+}

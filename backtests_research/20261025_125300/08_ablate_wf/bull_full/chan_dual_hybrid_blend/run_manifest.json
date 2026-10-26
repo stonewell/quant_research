@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "run_ts": "20261025_125300",
+  "git_commit": "8552c4b1e5b3ec5984ac90bad4a5bc75ed83b47d",
+  "git_dirty": true,
+  "status": "completed",
+  "completed_at_utc": "2026-10-26T01:10:01.357022+00:00",
+  "mode": "walkforward",
+  "group": "08_ablate_wf/chan_dual_hybrid_blend",
+  "strategy": "Chan Dual Hybrid Alpha Blend Strategy",
+  "strategy_file": "pipeline/research_strategy/results/strategy_dumps/chan_dual_hybrid_blend_strategy.json",
+  "strategy_dump_sha256": "9ba1434021cfddc6940c6a03abee0698fd4082ebd14d84d441b4c2527c352be5",
+  "db_path": "/home/stone/Work/github/quant/data/cache.duckdb",
+  "db_size_bytes": 324022272,
+  "db_mtime_iso": "2026-10-26T00:11:51.336824+00:00",
+  "db_used": true,
+  "cli_overrides": {
+    "cdhb_target_bull_exposure": 1.0
+  },
+  "metrics": {
+    "sharpe": 1.1220502071677778,
+    "cagr": 0.25500931070741895,
+    "max_drawdown": 0.050905660567335254,
+    "calmar": 8.42883729239882,
+    "n_folds": 18,
+    "deflated_sharpe": 5.4010986023066894e-70
+  },
+  "artifacts": [
+    {
+      "name": "comparison_report.json",
+      "bytes": 435
+    },
+    {
+      "name": "strategy_dump.json",
+      "bytes": 7173
+    },
+    {
+      "name": "walkforward_rebalances.csv",
+      "bytes": 228979
+    },
+    {
+      "name": "walkforward_report.csv",
+      "bytes": 4838
+    },
+    {
+      "name": "walkforward_summary.json",
+      "bytes": 12067
+    },
+    {
+      "name": "walkforward_weights.csv",
+      "bytes": 292847
+    }
+  ]
+}

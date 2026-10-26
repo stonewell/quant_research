@@ -1,0 +1,48 @@
+arm                Sharpe     CAGR    MaxDD    Calmar  nF         DSRlast_fold_end   dCAGRpp   dSharpe  dMaxDDpp  aligned      maxdiff  ident
+baseline           1.5370   27.88%    4.15%    10.635  18   3.192e-41   2026-09-07      0.00    0.0000      0.00      467    0.000e+00    YES
+no_voltarget       1.6297   31.41%    4.38%    10.843  18   1.509e-33   2026-09-07      3.53    0.0927      0.22      433    7.788e+03     no
+no_orthogon        1.7821   28.91%    4.38%     8.893  18   1.377e-19   2026-09-07      1.03    0.2452      0.23      356    6.584e+03     no
+no_structregime    1.5370   27.88%    4.15%    10.635  18   3.192e-41   2026-09-07      0.00    0.0000      0.00      467    0.000e+00    YES
+no_cyq             1.5015   26.91%    4.78%    10.094  18   3.954e-45   2026-09-07     -0.97   -0.0355      0.62      349    6.709e+03     no
+no_atrstop         1.6615   29.96%    4.24%    11.558  18   2.993e-37   2026-09-07      2.08    0.1245      0.09      414    4.458e+03     no
+no_lowbeta         1.5637   28.10%    4.11%    10.838  18   3.353e-40   2026-09-07      0.22    0.0267     -0.04      464    7.629e+02     no
+no_sectorthrot     1.5653   27.68%    4.02%    10.660  18   2.374e-37   2026-09-07     -0.20    0.0284     -0.13      438    2.355e+03     no
+no_hysteresis      1.5370   27.88%    4.15%    10.635  18   3.192e-41   2026-09-07      0.00    0.0000      0.00      467    0.000e+00    YES
+no_thrust          1.7228   26.81%    3.84%     9.918  18   3.353e-20   2026-09-07     -1.07    0.1858     -0.31      330    6.644e+03     no
+no_inertia         1.3378   27.54%    4.67%    10.271  18   1.905e-68   2026-09-07     -0.34   -0.1992      0.52      415    7.354e+03     no
+bull_full          1.3554   33.97%    5.40%     9.653  18   1.398e-53   2026-09-07      6.09   -0.1816      1.25      385    9.591e+03     no
+no_circuit         1.5384   27.94%    4.15%    10.647  18   3.936e-41   2026-09-07      0.06    0.0014     -0.00      467    2.199e+02     no
+
+--- integrity (unknown-key warnings / Traceback / manifest) ---
+baseline         unknown_key_warn=0 traceback=0 status=completed mode=walkforward n_valid_folds=18
+no_voltarget     unknown_key_warn=0 traceback=0 status=completed mode=walkforward n_valid_folds=18
+no_orthogon      unknown_key_warn=0 traceback=0 status=completed mode=walkforward n_valid_folds=18
+no_structregime  unknown_key_warn=0 traceback=0 status=completed mode=walkforward n_valid_folds=18
+no_cyq           unknown_key_warn=0 traceback=0 status=completed mode=walkforward n_valid_folds=18
+no_atrstop       unknown_key_warn=0 traceback=0 status=completed mode=walkforward n_valid_folds=18
+no_lowbeta       unknown_key_warn=0 traceback=0 status=completed mode=walkforward n_valid_folds=18
+no_sectorthrot   unknown_key_warn=0 traceback=0 status=completed mode=walkforward n_valid_folds=18
+no_hysteresis    unknown_key_warn=0 traceback=0 status=completed mode=walkforward n_valid_folds=18
+no_thrust        unknown_key_warn=0 traceback=0 status=completed mode=walkforward n_valid_folds=18
+no_inertia       unknown_key_warn=0 traceback=0 status=completed mode=walkforward n_valid_folds=18
+bull_full        unknown_key_warn=0 traceback=0 status=completed mode=walkforward n_valid_folds=18
+no_circuit       unknown_key_warn=0 traceback=0 status=completed mode=walkforward n_valid_folds=18
+
+--- config landing ---
+no_voltarget     crb_enable_vol_targeting         intended=False    observed=False    default=True     LANDED=True
+no_orthogon      blend_enable_orthogonalization   intended=False    observed=False    default=True     LANDED=True
+no_structregime  blend_enable_structural_regime   intended=False    observed=False    default=True     LANDED=True
+no_cyq           blend_enable_cyq_quality_gate    intended=False    observed=False    default=True     LANDED=True
+no_atrstop       blend_enable_adaptive_stop_atr   intended=False    observed=False    default=True     LANDED=True
+no_lowbeta       blend_enable_low_beta_inertia    intended=False    observed=False    default=True     LANDED=True
+no_sectorthrot   blend_max_assets_per_sector      intended=20       observed=20       default=2        LANDED=True
+no_hysteresis    blend_enable_regime_hysteresis   intended=False    observed=False    default='<<not-in-dump>>' LANDED=True
+no_thrust        crb_dynamic_cash_deployment      intended=False    observed=False    default=True     LANDED=True
+no_inertia       crb_adaptive_inertia             intended=False    observed=False    default=True     LANDED=True
+no_inertia       crb_min_weight_change            intended=0.0      observed=0.0      default=0.05     LANDED=True
+no_inertia       crb_min_holding_bars             intended=0        observed=0        default=2        LANDED=True
+no_inertia       crb_entry_threshold              intended=0.0      observed=0.0      default=0.03     LANDED=True
+bull_full        crb_target_bull_exposure         intended=1.0      observed=1.0      default=0.8      LANDED=True
+no_circuit       crb_dd_reduce_thresh             intended=10.0     observed=10.0     default=0.1      LANDED=True
+no_circuit       crb_dd_defensive_thresh          intended=10.0     observed=10.0     default=0.15     LANDED=True
+no_circuit       crb_dd_stop_thresh               intended=10.0     observed=10.0     default=0.2      LANDED=True

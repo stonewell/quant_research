@@ -1,0 +1,74 @@
+Loaded Strategy: Chan Four-State Shield Blend Strategy (chan_four_state_shield_blend)
+Parameters: {'cfssb_three_type_weight': 0.35, 'cfssb_vaa_weight': 0.25, 'cfssb_four_state_weight': 0.2, 'cfssb_shield_weight': 0.2, 'cfssb_shield_alpha_id': 12, 'cfssb_shield_require_trend': False, 'cfssb_dynamic_regime_weights': True, 'cfssb_max_single_position': 0.2, 'cfssb_min_weight_change': 0.05, 'cfssb_dd_reduce_thresh': 0.1, 'cfssb_dd_defensive_thresh': 0.15, 'cfssb_dd_stop_thresh': 0.2, 'cfssb_tier1_cooldown_bars': 15, 'cfssb_dynamic_cash_deployment': True, 'cfssb_breadth_lookback': 50, 'cfssb_breadth_bull_thresh': 0.3, 'cfssb_thrust_lookback': 10, 'cfssb_thrust_thresh': 0.6, 'cfssb_target_bull_exposure': 0.8, 'cfssb_bull_max_single_position': 0.2, 'cfssb_enable_vol_targeting': True, 'cfssb_target_vol': 0.12, 'cfssb_smooth_drawdown': True, 'cfssb_vol_model': 'garman_klass', 'cfssb_stop_mode': 'atr_trailing', 'cfssb_stop_atr_mult': 4.5, 'cfssb_adaptive_inertia': True, 'cfssb_entry_threshold': 0.03, 'cfssb_asset_stop_cooldown_bars': 5, 'cfssb_min_holding_bars': 2, 'cfssb_min_entry_bars': 2, 'cfssb_thrust_incumbent_bonus': 1.2, 'blend_weighting_mode': 'rolling_ic_ir', 'blend_enable_orthogonalization': True, 'blend_enable_structural_regime': True, 'blend_enable_cyq_quality_gate': True, 'blend_enable_adaptive_stop_atr': True, 'blend_enable_low_beta_inertia': True, 'blend_max_assets_per_sector': 2, 'cash_proxy': 'BIL'}
+Logic: Chan Four-State Shield Blend Strategy (chan_four_state_shield_blend): institutional ensemble fusing chan_three_type (35%), chan_vaa_compound (25%), chan_four_state_execution (20%), and WorldQuant Alpha#12 Volume Shock Reversal (20%) with hard position cap (20% max per stock), drawdown circuit breakers (smooth damping from 10%, defensive VAA at 15%, stop at 20% with fast recovery & 15d auto-heal), turnover filter (min trade change 5%), 2d entry confirmation gate, volatility targeting (12% target vol via garman_klass), stop mode (atr_trailing), and dynamic cash deployment in bull breadth (>=30% or 10d thrust).
+
+Loading 20 symbols ...
+Loaded 20/20 symbols (see warnings above for any skipped).
+Effective strategy dump saved to /home/stone/Work/github/quant/backtests_research/20261025_125300/07_r3_oos_bear/chan_four_state_shield_blend/strategy_dump.json
+
+=== Running Walkforward Rolling Evaluation: Chan Four-State Shield Blend Strategy ===
+Window: 0.25 years, Step: 0.25 years
+[Fold 1/6] Evaluating 2021-06-01 to 2021-08-27...
+[Fold 2/6] Evaluating 2021-08-30 to 2021-12-03...
+[Fold 3/6] Evaluating 2021-12-06 to 2022-03-10...
+[Fold 4/6] Evaluating 2022-03-11 to 2022-06-15...
+[Fold 5/6] Evaluating 2022-06-16 to 2022-09-13...
+[Fold 6/6] Evaluating 2022-09-14 to 2022-12-16...
+  [Fold 1/6] Done: Sharpe=-0.11, CAGR=-1.7%, MaxDD=5.5%, Rebalances=33
+  [Fold 2/6] Done: Sharpe=1.93, CAGR=27.3%, MaxDD=4.2%, Rebalances=28
+  [Fold 3/6] Done: Sharpe=-0.30, CAGR=-5.2%, MaxDD=5.0%, Rebalances=35
+  [Fold 4/6] Done: Sharpe=1.20, CAGR=16.3%, MaxDD=5.8%, Rebalances=25
+  [Fold 5/6] Done: Sharpe=0.55, CAGR=7.3%, MaxDD=4.5%, Rebalances=33
+  [Fold 6/6] Done: Sharpe=-1.20, CAGR=-12.1%, MaxDD=3.3%, Rebalances=36
+
+=== Loading Baseline: 000300.SH (equal_weight) ===
+Loading 1 symbols ...
+Loaded 1/1 symbols (see warnings above for any skipped).
+[Fold 1/6] Evaluating 2021-06-01 to 2021-08-27...
+[Fold 2/6] Evaluating 2021-08-30 to 2021-12-03...
+[Fold 3/6] Evaluating 2021-12-06 to 2022-03-10...
+[Fold 4/6] Evaluating 2022-03-11 to 2022-06-15...
+[Fold 5/6] Evaluating 2022-06-16 to 2022-09-13...
+[Fold 6/6] Evaluating 2022-09-14 to 2022-12-16...
+  [Fold 1/6] Done: Sharpe=-2.08, CAGR=-34.6%, MaxDD=11.1%, Rebalances=13
+  [Fold 2/6] Done: Sharpe=0.65, CAGR=7.2%, MaxDD=4.1%, Rebalances=13
+  [Fold 3/6] Done: Sharpe=-2.98, CAGR=-39.8%, MaxDD=16.9%, Rebalances=13
+  [Fold 4/6] Done: Sharpe=0.03, CAGR=-2.5%, MaxDD=12.1%, Rebalances=13
+  [Fold 5/6] Done: Sharpe=-0.82, CAGR=-12.8%, MaxDD=10.7%, Rebalances=13
+  [Fold 6/6] Done: Sharpe=-0.43, CAGR=-10.3%, MaxDD=13.7%, Rebalances=13
+
+Rolling Windows Performance:
+start_date   end_date sharpe_ratio    cagr max_drawdown calmar_ratio win_rate profit_factor total_turnover  total_rebalances baseline_sharpe_ratio baseline_cagr baseline_max_drawdown baseline_calmar_ratio outperformance
+2021-06-01 2021-08-27        -0.11  -1.73%        5.46%        -0.32   50.00%          0.98           3.67                33                 -2.08       -34.64%                11.05%                 -3.13         32.91%
+2021-08-30 2021-12-03         1.93  27.33%        4.19%         6.53   54.84%          1.34           3.31                28                  0.65         7.19%                 4.11%                  1.75         20.14%
+2021-12-06 2022-03-10        -0.30  -5.23%        5.01%        -1.04   53.23%          0.95           4.45                35                 -2.98       -39.84%                16.87%                 -2.36         34.61%
+2022-03-11 2022-06-15         1.20  16.25%        5.77%         2.82   59.68%          1.21           4.14                25                  0.03        -2.48%                12.13%                 -0.20         18.73%
+2022-06-16 2022-09-13         0.55   7.27%        4.53%         1.61   46.77%          1.10           4.67                33                 -0.82       -12.75%                10.69%                 -1.19         20.02%
+2022-09-14 2022-12-16        -1.20 -12.10%        3.34%        -3.62   45.16%          0.82           3.91                36                 -0.43       -10.31%                13.69%                 -0.75         -1.79%
+
+=== Walkforward Summary: Chan Four-State Shield Blend Strategy ===
+Mean Sharpe Ratio: 0.34 | Mean CAGR: 5.30%
+Mean Max Drawdown: 4.7% | Mean Calmar Ratio: 1.00
+Deflated Sharpe Ratio: 0.000 (n_trials=6, fold Sharpe std=1.122)
+Mean Baseline Sharpe Ratio: -0.94 | Mean Baseline CAGR: -15.47%
+Mean Outperformance CAGR: 20.77%
+Saved walkforward summary to /home/stone/Work/github/quant/backtests_research/20261025_125300/07_r3_oos_bear/chan_four_state_shield_blend/walkforward_summary.json
+Saved comparison report to /home/stone/Work/github/quant/backtests_research/20261025_125300/07_r3_oos_bear/chan_four_state_shield_blend/comparison_report.json
+
+Saved walkforward report to /home/stone/Work/github/quant/backtests_research/20261025_125300/07_r3_oos_bear/chan_four_state_shield_blend/walkforward_report.csv
+Saved walkforward rebalance report to /home/stone/Work/github/quant/backtests_research/20261025_125300/07_r3_oos_bear/chan_four_state_shield_blend/walkforward_rebalances.csv
+Total Walkforward Rebalance Trades: 291
+
+Recent Walkforward Rebalance Trades:
+ fold  rebal_id       date    symbol action  price prior_w target_w delta_w trade_value   shares   cost
+    6        25 2022-12-06 601225.SH   SELL $15.02   10.7%     0.0%  -10.7%  $10,516.90   700.00 $15.78
+    6        25 2022-12-06 000999.SZ   SELL $27.59    8.5%     0.0%   -8.5%   $8,276.34   300.00 $12.41
+    6        26 2022-12-07 000157.SZ   SELL  $4.89    7.0%     0.0%   -7.0%   $6,848.17 1,400.00 $10.27
+    6        26 2022-12-07 000938.SZ    BUY $19.54   10.0%    20.0%  +10.0%   $7,817.41   400.00  $7.82
+    6        26 2022-12-07 600028.SH    BUY  $3.79   11.6%    20.0%   +8.4%   $7,961.00 2,100.00  $7.96
+    6        27 2022-12-09 600660.SH    BUY $33.26   10.2%    19.4%   +9.2%   $6,652.03   200.00  $6.65
+    6        28 2022-12-12 600028.SH   SELL  $3.70   19.5%    13.1%   -6.4%   $5,920.16 1,600.00  $8.88
+    6        28 2022-12-12 000938.SZ   SELL $19.85   18.4%    13.1%   -5.4%   $3,969.99   200.00  $5.95
+    6        29 2022-12-14 600028.SH    BUY  $3.68   13.3%    20.0%   +6.7%   $6,262.09 1,700.00  $6.26
+    6        29 2022-12-14 000938.SZ    BUY $19.70   14.3%    20.0%   +5.7%   $3,940.34   200.00  $3.94
+Saved walkforward actual weights to /home/stone/Work/github/quant/backtests_research/20261025_125300/07_r3_oos_bear/chan_four_state_shield_blend/walkforward_weights.csv

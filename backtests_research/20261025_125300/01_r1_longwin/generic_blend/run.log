@@ -1,0 +1,64 @@
+Loaded Strategy: Generic Multi-Strategy Blend (Adaptive) (generic_blend)
+Parameters: {'blend_weighting_mode': 'rolling_ic_ir', 'blend_adaptive_lookback_days': 60, 'blend_adaptive_min_tstat': 2.0, 'blend_adaptive_shrinkage': 0.2, 'blend_enable_orthogonalization': True, 'blend_sub_strategies': {'wq_alpha6': 0.25, 'wq_alpha41': 0.25, 'gtja_alpha16': 0.5}, 'blend_max_single_position': 0.2, 'blend_min_weight_change': 0.05, 'blend_entry_threshold': 0.03, 'blend_dd_reduce_thresh': 0.1, 'blend_dd_defensive_thresh': 0.15, 'blend_dd_stop_thresh': 0.2, 'blend_tier1_cooldown_bars': 15, 'blend_dynamic_cash_deployment': True, 'blend_breadth_lookback': 50, 'blend_breadth_bull_thresh': 0.3, 'blend_thrust_lookback': 10, 'blend_thrust_thresh': 0.6, 'blend_target_bull_exposure': 0.8, 'blend_enable_vol_targeting': True, 'blend_target_vol': 0.12, 'blend_smooth_drawdown': True, 'blend_vol_model': 'garman_klass', 'blend_adaptive_inertia': True, 'blend_stop_mode': 'atr_trailing', 'blend_stop_atr_mult': 4.5, 'blend_asset_stop_cooldown_bars': 5, 'blend_min_holding_bars': 2, 'blend_min_entry_bars': 2, 'blend_thrust_incumbent_bonus': 1.2, 'blend_enable_structural_regime': True, 'blend_enable_cyq_quality_gate': True, 'blend_enable_adaptive_stop_atr': True, 'blend_enable_low_beta_inertia': True, 'blend_max_assets_per_sector': 2, 'cash_proxy': 'BIL'}
+Logic: Generic Blend Strategy (generic_blend): multi-strategy ensemble blending wq_alpha6 (25%), wq_alpha41 (25%), gtja_alpha16 (50%) with institutional risk controls.
+
+Loading 20 symbols ...
+Loaded 20/20 symbols (see warnings above for any skipped).
+Effective strategy dump saved to /home/stone/Work/github/quant/backtests_research/20261025_125300/01_r1_longwin/generic_blend/strategy_dump.json
+
+=== Running Walkforward Rolling Evaluation: Generic Multi-Strategy Blend (Adaptive) ===
+Window: 2.0 years, Step: 0.25 years
+[Fold 1/4] Evaluating 2022-01-04 to 2024-01-29...
+[Fold 2/4] Evaluating 2022-04-12 to 2024-05-10...
+[Fold 3/4] Evaluating 2022-07-14 to 2024-08-08...
+[Fold 4/4] Evaluating 2022-10-19 to 2024-11-14...
+  [Fold 1/4] Done: Sharpe=1.11, CAGR=15.9%, MaxDD=13.5%, Rebalances=290
+  [Fold 2/4] Done: Sharpe=0.69, CAGR=9.0%, MaxDD=15.0%, Rebalances=315
+  [Fold 3/4] Done: Sharpe=0.84, CAGR=11.9%, MaxDD=17.3%, Rebalances=303
+  [Fold 4/4] Done: Sharpe=1.18, CAGR=18.7%, MaxDD=13.5%, Rebalances=280
+
+=== Loading Baseline: 000300.SH (equal_weight) ===
+Loading 1 symbols ...
+Loaded 1/1 symbols (see warnings above for any skipped).
+[Fold 1/4] Evaluating 2022-01-04 to 2024-01-29...
+[Fold 2/4] Evaluating 2022-04-12 to 2024-05-10...
+[Fold 3/4] Evaluating 2022-07-14 to 2024-08-08...
+[Fold 4/4] Evaluating 2022-10-19 to 2024-11-14...
+  [Fold 1/4] Done: Sharpe=-1.07, CAGR=-17.5%, MaxDD=34.5%, Rebalances=101
+  [Fold 2/4] Done: Sharpe=-0.33, CAGR=-6.1%, MaxDD=29.3%, Rebalances=101
+  [Fold 3/4] Done: Sharpe=-0.80, CAGR=-11.7%, MaxDD=26.4%, Rebalances=101
+  [Fold 4/4] Done: Sharpe=0.28, CAGR=3.3%, MaxDD=24.8%, Rebalances=101
+
+Rolling Windows Performance:
+start_date   end_date sharpe_ratio   cagr max_drawdown calmar_ratio win_rate profit_factor total_turnover  total_rebalances baseline_sharpe_ratio baseline_cagr baseline_max_drawdown baseline_calmar_ratio outperformance
+2022-01-04 2024-01-29         1.11 15.88%       13.50%         1.18   51.69%          1.22          68.66               290                 -1.07       -17.50%                34.55%                 -0.51         33.38%
+2022-04-12 2024-05-10         0.69  9.03%       14.95%         0.60   49.70%          1.13          65.29               315                 -0.33        -6.12%                29.28%                 -0.21         15.14%
+2022-07-14 2024-08-08         0.84 11.87%       17.31%         0.69   51.49%          1.16          65.80               303                 -0.80       -11.67%                26.43%                 -0.44         23.54%
+2022-10-19 2024-11-14         1.18 18.68%       13.54%         1.38   50.30%          1.23          63.84               280                  0.28         3.30%                24.80%                  0.13         15.38%
+
+=== Walkforward Summary: Generic Multi-Strategy Blend (Adaptive) ===
+Mean Sharpe Ratio: 0.96 | Mean CAGR: 13.87%
+Mean Max Drawdown: 14.8% | Mean Calmar Ratio: 0.96
+Deflated Sharpe Ratio: 1.000 (n_trials=4, fold Sharpe std=0.230)
+Mean Baseline Sharpe Ratio: -0.48 | Mean Baseline CAGR: -8.00%
+Mean Outperformance CAGR: 21.86%
+Saved walkforward summary to /home/stone/Work/github/quant/backtests_research/20261025_125300/01_r1_longwin/generic_blend/walkforward_summary.json
+Saved comparison report to /home/stone/Work/github/quant/backtests_research/20261025_125300/01_r1_longwin/generic_blend/comparison_report.json
+
+Saved walkforward report to /home/stone/Work/github/quant/backtests_research/20261025_125300/01_r1_longwin/generic_blend/walkforward_report.csv
+Saved walkforward rebalance report to /home/stone/Work/github/quant/backtests_research/20261025_125300/01_r1_longwin/generic_blend/walkforward_rebalances.csv
+Total Walkforward Rebalance Trades: 2211
+
+Recent Walkforward Rebalance Trades:
+ fold  rebal_id       date    symbol action  price prior_w target_w delta_w trade_value   shares   cost
+    4       261 2024-11-01 600362.SH    BUY $21.58    0.0%    13.4%  +13.4%  $17,261.75   800.00 $17.26
+    4       262 2024-11-07 600028.SH   SELL  $5.88   12.5%     0.0%  -12.5%  $18,213.56 3,100.00 $27.32
+    4       262 2024-11-07 600362.SH   SELL $22.07   12.2%     0.0%  -12.2%  $17,655.78   800.00 $26.48
+    4       262 2024-11-07 601899.SH    BUY $16.27    0.0%    17.6%  +17.6%  $24,402.41 1,500.00 $24.40
+    4       263 2024-11-08 601225.SH    BUY $21.77    0.0%     5.2%   +5.2%   $6,530.35   300.00  $6.53
+    4       264 2024-11-11 601225.SH    BUY $21.14    4.4%    17.6%  +13.2%  $16,910.54   800.00 $16.91
+    4       265 2024-11-12 601398.SH    BUY  $5.52    6.2%    20.0%  +13.8%  $19,327.83 3,500.00 $19.33
+    4       266 2024-11-14 601225.SH   SELL $21.08   16.3%     0.0%  -16.3%  $23,192.62 1,100.00 $34.79
+    4       266 2024-11-14 601899.SH   SELL $14.86   15.6%     0.0%  -15.6%  $22,289.15 1,500.00 $33.43
+    4       266 2024-11-14 601398.SH   SELL  $5.59   20.0%     9.2%  -10.8%  $15,083.99 2,700.00 $22.63
+Saved walkforward actual weights to /home/stone/Work/github/quant/backtests_research/20261025_125300/01_r1_longwin/generic_blend/walkforward_weights.csv

@@ -1,0 +1,21 @@
+{
+  "strategy": "Chan Dual Hybrid Alpha Blend Strategy",
+  "strategy_name": "Chan Dual Hybrid Alpha Blend Strategy",
+  "baseline_symbol": "000300.SH",
+  "baseline_template": "equal_weight",
+  "baseline_params": {
+    "rebalance_freq_days": 5
+  },
+  "baseline_sharpe_ratio": -0.14702804351217447,
+  "baseline_cagr": -0.04034320866051322,
+  "baseline_max_drawdown": 0.3575848363483309,
+  "baseline_calmar_ratio": -0.11282136309945216,
+  "strategy_sharpe_ratio": 1.3071047873801986,
+  "strategy_cagr": 0.19017254830849284,
+  "overlap_bars": 1161,
+  "alpha": 0.20514315043051312,
+  "beta": 0.4839964069662792,
+  "tracking_error": 0.15061569256775137,
+  "information_ratio": 1.4531097118512428,
+  "outperformance_cagr": 0.23051575696900606
+}

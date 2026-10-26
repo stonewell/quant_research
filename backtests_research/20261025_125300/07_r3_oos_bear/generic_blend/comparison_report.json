@@ -1,0 +1,13 @@
+{
+  "strategy": "Generic Multi-Strategy Blend (Adaptive)",
+  "strategy_name": "Generic Multi-Strategy Blend (Adaptive)",
+  "baseline_symbol": "000300.SH",
+  "baseline_template": "equal_weight",
+  "baseline_params": {
+    "rebalance_freq_days": 5
+  },
+  "mean_baseline_sharpe_ratio": -0.9384019885781072,
+  "mean_baseline_cagr": -0.1547232189184509,
+  "mean_outperformance_cagr": 0.32775493153712293,
+  "baseline_calendar_mismatch": false
+}

@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "run_ts": "20261025_125300",
+  "git_commit": "8552c4b1e5b3ec5984ac90bad4a5bc75ed83b47d",
+  "git_dirty": true,
+  "status": "completed",
+  "completed_at_utc": "2026-10-25T20:46:00.213531+00:00",
+  "mode": "standard",
+  "group": "06_ablate/no_hysteresis",
+  "strategy": "Chan Dual Hybrid Alpha Blend Strategy",
+  "strategy_file": "/home/stone/Work/github/quant/pipeline/research_strategy/results/strategy_dumps/chan_dual_hybrid_blend_strategy.json",
+  "strategy_dump_sha256": "d8e43e9710ae9f28121be83d5e9706a43414c62c18b82a7958bee53926358a9f",
+  "db_path": "/home/stone/Work/github/quant/data/cache.duckdb",
+  "db_size_bytes": 324022272,
+  "db_mtime_iso": "2026-10-25T20:08:50.702040+00:00",
+  "db_used": true,
+  "cli_overrides": {
+    "blend_enable_regime_hysteresis": false
+  },
+  "metrics": {
+    "sharpe": null,
+    "cagr": null,
+    "max_drawdown": null,
+    "calmar": null,
+    "n_folds": null,
+    "deflated_sharpe": null
+  },
+  "artifacts": [
+    {
+      "name": "backtest_equity.csv",
+      "bytes": 34274
+    },
+    {
+      "name": "backtest_weights.csv",
+      "bytes": 326288
+    },
+    {
+      "name": "baseline_equity.csv",
+      "bytes": 33493
+    },
+    {
+      "name": "comparison_report.json",
+      "bytes": 731
+    },
+    {
+      "name": "equity_curve.png",
+      "bytes": 96650
+    },
+    {
+      "name": "rebalance_report.csv",
+      "bytes": 180926
+    },
+    {
+      "name": "strategy_dump.json",
+      "bytes": 7274
+    }
+  ]
+}

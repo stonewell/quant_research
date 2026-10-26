@@ -262,6 +262,7 @@ def test_live_ticket_detail_reason_and_version_structure():
             "--output-dir", tmp_dir,
             "--account-state-file", out_account_state,
             "--lookback-days", "300",
+            "--no-strict-market-clock",
         ]
         # cwd=_PROJECT_ROOT pins the child's working directory instead of silently
         # inheriting pytest's, keeping the result independent of where we run from.

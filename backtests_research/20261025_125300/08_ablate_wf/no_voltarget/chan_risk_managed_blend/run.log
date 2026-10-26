@@ -1,0 +1,134 @@
+Loaded Strategy: Chan Risk-Managed Blend Strategy (chan_risk_managed_blend)
+Parameters: {'crb_composite_weight': 0.2, 'crb_three_type_weight': 0.45, 'crb_vaa_weight': 0.35, 'crb_third_strategy_type': 'composite', 'crb_max_single_position': 0.2, 'crb_min_weight_change': 0.05, 'crb_dd_reduce_thresh': 0.1, 'crb_dd_defensive_thresh': 0.15, 'crb_dd_stop_thresh': 0.2, 'crb_tier1_cooldown_bars': 15, 'crb_dynamic_cash_deployment': True, 'crb_breadth_lookback': 50, 'crb_breadth_bull_thresh': 0.3, 'crb_thrust_lookback': 10, 'crb_thrust_thresh': 0.6, 'crb_target_bull_exposure': 0.8, 'crb_bull_max_single_position': 0.2, 'crb_enable_vol_targeting': False, 'crb_target_vol': 0.12, 'crb_smooth_drawdown': True, 'crb_vol_model': 'garman_klass', 'crb_adaptive_inertia': True, 'crb_stop_mode': 'atr_trailing', 'crb_stop_atr_mult': 4.5, 'crb_entry_threshold': 0.03, 'crb_asset_stop_cooldown_bars': 5, 'crb_min_holding_bars': 2, 'crb_min_entry_bars': 2, 'crb_thrust_incumbent_bonus': 1.2, 'blend_weighting_mode': 'rolling_ic_ir', 'blend_enable_orthogonalization': True, 'blend_enable_structural_regime': True, 'blend_enable_cyq_quality_gate': True, 'blend_enable_adaptive_stop_atr': True, 'blend_enable_low_beta_inertia': True, 'blend_max_assets_per_sector': 2, 'cash_proxy': 'BIL'}
+Logic: Chan Risk-Managed Blend Strategy (chan_risk_managed_blend): walkforward-optimized ensemble blending chan_vaa_compound (35%), chan_three_type (45%), and chan_composite (20%) with hard position cap (20% max per stock), drawdown circuit breakers (smooth damping from 10%, defensive VAA at 15%, stop at 20% with fast recovery & 15d auto-heal), turnover filter (min trade change 5%), 2d entry confirmation gate, volatility targeting (12% target vol via garman_klass), stop mode (atr_trailing), and dynamic cash deployment in bull breadth (>=30% or 10d thrust).
+
+Loading 20 symbols ...
+Loaded 20/20 symbols (see warnings above for any skipped).
+Effective strategy dump saved to backtests_research/20261025_125300/08_ablate_wf/no_voltarget/chan_risk_managed_blend/strategy_dump.json
+
+=== Running Walkforward Rolling Evaluation: Chan Risk-Managed Blend Strategy ===
+Window: 0.25 years, Step: 0.25 years
+[Fold 1/18] Evaluating 2022-01-04 to 2022-04-11...
+[Fold 2/18] Evaluating 2022-04-12 to 2022-07-13...
+[Fold 3/18] Evaluating 2022-07-14 to 2022-10-18...
+[Fold 4/18] Evaluating 2022-10-19 to 2023-01-16...
+[Fold 5/18] Evaluating 2023-01-17 to 2023-04-21...
+[Fold 6/18] Evaluating 2023-04-24 to 2023-07-26...
+[Fold 7/18] Evaluating 2023-07-27 to 2023-10-31...
+[Fold 8/18] Evaluating 2023-11-01 to 2024-01-29...
+[Fold 9/18] Evaluating 2024-01-30 to 2024-05-10...
+[Fold 10/18] Evaluating 2024-05-13 to 2024-08-08...
+[Fold 11/18] Evaluating 2024-08-09 to 2024-11-14...
+[Fold 12/18] Evaluating 2024-11-15 to 2025-02-20...
+[Fold 13/18] Evaluating 2025-02-21 to 2025-05-26...
+[Fold 14/18] Evaluating 2025-05-27 to 2025-08-22...
+[Fold 15/18] Evaluating 2025-08-25 to 2025-11-27...
+[Fold 16/18] Evaluating 2025-11-28 to 2026-03-06...
+[Fold 17/18] Evaluating 2026-03-09 to 2026-06-09...
+[Fold 18/18] Evaluating 2026-06-10 to 2026-09-07...
+  [Fold 1/18] Done: Sharpe=-0.93, CAGR=-14.9%, MaxDD=8.6%, Rebalances=35
+  [Fold 2/18] Done: Sharpe=-1.54, CAGR=-22.5%, MaxDD=8.5%, Rebalances=32
+  [Fold 3/18] Done: Sharpe=1.63, CAGR=26.9%, MaxDD=5.1%, Rebalances=29
+  [Fold 4/18] Done: Sharpe=1.10, CAGR=12.4%, MaxDD=3.9%, Rebalances=31
+  [Fold 5/18] Done: Sharpe=4.48, CAGR=157.6%, MaxDD=3.2%, Rebalances=32
+  [Fold 6/18] Done: Sharpe=-0.04, CAGR=-1.5%, MaxDD=5.3%, Rebalances=36
+  [Fold 7/18] Done: Sharpe=-1.34, CAGR=-9.4%, MaxDD=4.3%, Rebalances=33
+  [Fold 8/18] Done: Sharpe=4.04, CAGR=41.0%, MaxDD=1.6%, Rebalances=25
+  [Fold 9/18] Done: Sharpe=5.29, CAGR=182.4%, MaxDD=3.3%, Rebalances=30
+  [Fold 10/18] Done: Sharpe=0.69, CAGR=7.9%, MaxDD=5.2%, Rebalances=32
+  [Fold 11/18] Done: Sharpe=2.24, CAGR=37.6%, MaxDD=3.9%, Rebalances=24
+  [Fold 12/18] Done: Sharpe=0.57, CAGR=6.1%, MaxDD=4.5%, Rebalances=24
+  [Fold 13/18] Done: Sharpe=-0.14, CAGR=-2.7%, MaxDD=6.0%, Rebalances=25
+  [Fold 14/18] Done: Sharpe=4.20, CAGR=43.2%, MaxDD=2.4%, Rebalances=27
+  [Fold 15/18] Done: Sharpe=4.05, CAGR=47.2%, MaxDD=2.7%, Rebalances=25
+  [Fold 16/18] Done: Sharpe=0.51, CAGR=4.3%, MaxDD=3.0%, Rebalances=34
+  [Fold 17/18] Done: Sharpe=3.15, CAGR=32.5%, MaxDD=3.2%, Rebalances=32
+  [Fold 18/18] Done: Sharpe=1.38, CAGR=17.2%, MaxDD=4.1%, Rebalances=31
+
+=== Loading Baseline: 000300.SH (equal_weight) ===
+Loading 1 symbols ...
+Loaded 1/1 symbols (see warnings above for any skipped).
+[Fold 1/18] Evaluating 2022-01-04 to 2022-04-11...
+[Fold 2/18] Evaluating 2022-04-12 to 2022-07-13...
+[Fold 3/18] Evaluating 2022-07-14 to 2022-10-18...
+[Fold 4/18] Evaluating 2022-10-19 to 2023-01-16...
+[Fold 5/18] Evaluating 2023-01-17 to 2023-04-21...
+[Fold 6/18] Evaluating 2023-04-24 to 2023-07-26...
+[Fold 7/18] Evaluating 2023-07-27 to 2023-10-31...
+[Fold 8/18] Evaluating 2023-11-01 to 2024-01-29...
+[Fold 9/18] Evaluating 2024-01-30 to 2024-05-10...
+[Fold 10/18] Evaluating 2024-05-13 to 2024-08-08...
+[Fold 11/18] Evaluating 2024-08-09 to 2024-11-14...
+[Fold 12/18] Evaluating 2024-11-15 to 2025-02-20...
+[Fold 13/18] Evaluating 2025-02-21 to 2025-05-26...
+[Fold 14/18] Evaluating 2025-05-27 to 2025-08-22...
+[Fold 15/18] Evaluating 2025-08-25 to 2025-11-27...
+[Fold 16/18] Evaluating 2025-11-28 to 2026-03-06...
+[Fold 17/18] Evaluating 2026-03-09 to 2026-06-09...
+[Fold 18/18] Evaluating 2026-06-10 to 2026-09-07...
+  [Fold 1/18] Done: Sharpe=-3.03, CAGR=-49.6%, MaxDD=19.0%, Rebalances=13
+  [Fold 2/18] Done: Sharpe=0.74, CAGR=14.1%, MaxDD=9.7%, Rebalances=13
+  [Fold 3/18] Done: Sharpe=-3.00, CAGR=-36.3%, MaxDD=13.9%, Rebalances=13
+  [Fold 4/18] Done: Sharpe=2.00, CAGR=45.5%, MaxDD=7.1%, Rebalances=13
+  [Fold 5/18] Done: Sharpe=-0.72, CAGR=-9.5%, MaxDD=6.2%, Rebalances=13
+  [Fold 6/18] Done: Sharpe=-0.50, CAGR=-7.3%, MaxDD=6.7%, Rebalances=13
+  [Fold 7/18] Done: Sharpe=-2.44, CAGR=-28.5%, MaxDD=13.6%, Rebalances=13
+  [Fold 8/18] Done: Sharpe=-2.23, CAGR=-27.3%, MaxDD=11.4%, Rebalances=13
+  [Fold 9/18] Done: Sharpe=3.34, CAGR=55.5%, MaxDD=3.5%, Rebalances=13
+  [Fold 10/18] Done: Sharpe=-3.32, CAGR=-32.0%, MaxDD=9.5%, Rebalances=13
+  [Fold 11/18] Done: Sharpe=2.46, CAGR=106.6%, MaxDD=11.0%, Rebalances=13
+  [Fold 12/18] Done: Sharpe=-0.19, CAGR=-3.7%, MaxDD=7.6%, Rebalances=13
+  [Fold 13/18] Done: Sharpe=-0.57, CAGR=-11.1%, MaxDD=10.5%, Rebalances=13
+  [Fold 14/18] Done: Sharpe=5.65, CAGR=73.5%, MaxDD=2.3%, Rebalances=13
+  [Fold 15/18] Done: Sharpe=0.33, CAGR=4.1%, MaxDD=6.3%, Rebalances=13
+  [Fold 16/18] Done: Sharpe=0.99, CAGR=11.5%, MaxDD=3.9%, Rebalances=13
+  [Fold 17/18] Done: Sharpe=0.97, CAGR=17.0%, MaxDD=6.1%, Rebalances=13
+  [Fold 18/18] Done: Sharpe=-0.53, CAGR=-14.2%, MaxDD=10.5%, Rebalances=13
+
+Rolling Windows Performance:
+start_date   end_date sharpe_ratio    cagr max_drawdown calmar_ratio win_rate profit_factor total_turnover  total_rebalances baseline_sharpe_ratio baseline_cagr baseline_max_drawdown baseline_calmar_ratio outperformance
+2022-01-04 2022-04-11        -0.93 -14.86%        8.60%        -1.73   50.00%          0.85           6.31                35                 -3.03       -49.58%                18.99%                 -2.61         34.72%
+2022-04-12 2022-07-13        -1.54 -22.50%        8.50%        -2.65   48.39%          0.78           7.10                32                  0.74        14.13%                 9.72%                  1.45        -36.63%
+2022-07-14 2022-10-18         1.63  26.91%        5.09%         5.29   54.84%          1.30           3.77                29                 -3.00       -36.34%                13.91%                 -2.61         63.25%
+2022-10-19 2023-01-16         1.10  12.35%        3.85%         3.21   51.61%          1.20           4.00                31                  2.00        45.51%                 7.09%                  6.42        -33.16%
+2023-01-17 2023-04-21         4.48 157.63%        3.22%        48.89   58.06%          2.06           4.65                32                 -0.72        -9.48%                 6.24%                 -1.52        167.10%
+2023-04-24 2023-07-26        -0.04  -1.53%        5.33%        -0.29   48.39%          0.99           3.84                36                 -0.50        -7.25%                 6.73%                 -1.08          5.72%
+2023-07-27 2023-10-31        -1.34  -9.41%        4.33%        -2.17   45.16%          0.80           3.34                33                 -2.44       -28.54%                13.59%                 -2.10         19.12%
+2023-11-01 2024-01-29         4.04  41.04%        1.55%        26.45   56.45%          1.91           2.23                25                 -2.23       -27.31%                11.39%                 -2.40         68.35%
+2024-01-30 2024-05-10         5.29 182.37%        3.30%        55.21   53.23%          2.89           4.40                30                  3.34        55.48%                 3.54%                 15.66        126.89%
+2024-05-13 2024-08-08         0.69   7.95%        5.22%         1.52   48.39%          1.12           4.21                32                 -3.32       -32.01%                 9.47%                 -3.38         39.96%
+2024-08-09 2024-11-14         2.24  37.60%        3.88%         9.68   51.61%          1.50           3.54                24                  2.46       106.59%                10.99%                  9.70        -68.99%
+2024-11-15 2025-02-20         0.57   6.08%        4.52%         1.35   56.45%          1.10           2.72                24                 -0.19        -3.74%                 7.60%                 -0.49          9.82%
+2025-02-21 2025-05-26        -0.14  -2.66%        5.95%        -0.45   56.45%          0.97           3.88                25                 -0.57       -11.07%                10.49%                 -1.06          8.41%
+2025-05-27 2025-08-22         4.20  43.21%        2.41%        17.95   61.29%          2.00           4.41                27                  5.65        73.52%                 2.34%                 31.44        -30.31%
+2025-08-25 2025-11-27         4.05  47.17%        2.74%        17.20   64.52%          1.88           2.33                25                  0.33         4.08%                 6.31%                  0.65         43.09%
+2025-11-28 2026-03-06         0.51   4.27%        2.97%         1.44   51.61%          1.09           3.49                34                  0.99        11.47%                 3.93%                  2.92         -7.19%
+2026-03-09 2026-06-09         3.15  32.54%        3.22%        10.11   58.06%          1.67           3.30                32                  0.97        17.02%                 6.09%                  2.79         15.52%
+2026-06-10 2026-09-07         1.38  17.19%        4.13%         4.16   51.61%          1.29           5.06                31                 -0.53       -14.17%                10.49%                 -1.35         31.36%
+
+=== Walkforward Summary: Chan Risk-Managed Blend Strategy ===
+Mean Sharpe Ratio: 1.63 | Mean CAGR: 31.41%
+Mean Max Drawdown: 4.4% | Mean Calmar Ratio: 10.84
+Deflated Sharpe Ratio: 0.000 (n_trials=18, fold Sharpe std=2.135)
+Mean Baseline Sharpe Ratio: -0.00 | Mean Baseline CAGR: 6.02%
+Mean Outperformance CAGR: 25.39%
+Saved walkforward summary to backtests_research/20261025_125300/08_ablate_wf/no_voltarget/chan_risk_managed_blend/walkforward_summary.json
+Saved comparison report to backtests_research/20261025_125300/08_ablate_wf/no_voltarget/chan_risk_managed_blend/comparison_report.json
+
+Saved walkforward report to backtests_research/20261025_125300/08_ablate_wf/no_voltarget/chan_risk_managed_blend/walkforward_report.csv
+Saved walkforward rebalance report to backtests_research/20261025_125300/08_ablate_wf/no_voltarget/chan_risk_managed_blend/walkforward_rebalances.csv
+Total Walkforward Rebalance Trades: 848
+
+Recent Walkforward Rebalance Trades:
+ fold  rebal_id       date    symbol action  price prior_w target_w delta_w trade_value   shares   cost
+   18        19 2026-07-22 600941.SH    BUY $91.66    0.0%    18.9%  +18.9%  $18,332.86   200.00 $18.33
+   18        19 2026-07-22 601088.SH    BUY $45.44    4.4%    20.0%  +15.6%  $13,632.00   300.00 $13.63
+   18        20 2026-08-03 000157.SZ   SELL  $7.54   19.6%     1.8%  -17.8%  $18,096.00 2,400.00 $27.14
+   18        21 2026-08-18 601088.SH   SELL $45.70   17.6%     5.9%  -11.7%   $9,140.00   200.00 $13.71
+   18        22 2026-08-19 600584.SH    BUY $77.69    0.0%     7.6%   +7.6%   $7,768.59   100.00  $7.77
+   18        23 2026-08-21 601088.SH    BUY $46.41    8.9%    15.8%   +6.9%   $4,641.00   100.00  $4.64
+   18        24 2026-09-01 601088.SH   SELL $48.30   13.6%     5.0%   -8.6%   $4,830.00   100.00  $7.25
+   18        25 2026-09-02 601088.SH   SELL $48.05    9.0%     0.0%   -9.0%   $9,610.00   200.00 $14.41
+   18        26 2026-09-03 000938.SZ    BUY $38.13    3.6%    14.5%  +10.9%  $11,439.00   300.00 $11.44
+   18        27 2026-09-04 600941.SH   SELL $97.71   18.8%     0.0%  -18.8%  $19,542.84   200.00 $29.31
+Saved walkforward actual weights to backtests_research/20261025_125300/08_ablate_wf/no_voltarget/chan_risk_managed_blend/walkforward_weights.csv

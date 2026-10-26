@@ -797,3 +797,29 @@ uv run --project pipeline pytest common/tests/test_allocation_backtester.py comm
 
 **不改的东西（先说不做，免得下一个人以为漏了）**：①§三 的 Mermaid 波次图**不加节点** —— 四项的前置全为已闭环任务（`P1.8`←`P1.7`、`B6.1`←`P1.6`、`B6.2`←`B5.3`、`B6.3` 无前置），不改变任何关键路径，沿用既有"追加行不在图中加节点"的约定；②**（2026-10-24 评审衍生，只登记不实施）** 同日独立复核另开三项 `[ ]` 待办，**故意不加入上方 4 行索引表**（该表形状固定，勿改）：`P1.9`（§2.8，Tier P3：静态模板名与配置键撞名导致 preflight 静默旁路）、`P1.10`（§2.8，Tier P4：preflight 执行位置收口到 `main()`）、`B6.4`（§2.10，Tier P5：`FastBacktestResult.__ior__` 缺口）—— 三者**均未开工**，前置分别为 `P1.8`/`P1.8`/`B6.2`；**（2026-10-24 补记：三项现已全部闭环 —— `P1.9` 见 [`docs/version.md`](file:///home/stone/Work/github/quant/docs/version.md) §20.10 / §20.10.1、`P1.10` 见 §20.11、`B6.4` 见 §20.12；故上文「均未开工」只描述登记当时。**评审衍生第 4 项（同日缓存普查衍生，`[ ]` 未开工）**：`L2.46`（§2.13，Track L-A / Tier P1：写入路径按调用方原始 `symbol` 落键导致的裸 A 股重复键守卫 —— 2026-10-24 已清存量 2 个键但不持久，方案「拒绝 vs 规范化」待裁决）—— 故 `P1.9`/`P1.10`/`B6.4` **三项已全部闭环**，但**现役评审衍生待办为 1 项（`L2.46`），不得再写「评审衍生待办已清零」**。）**；③不改任何策略/模板 `version` 或 `BASE_VERSION` —— **本节文字本身**为纯文档追加，但这**不等于**"本轮零 `.py` 改动"：所列**事故衍生四项**已落地代码（新增 `scripts/live_preflight.py`、改 `pipeline/scripts/*` 与 `common/allocation_backtester_fast.py`），其中 `common/allocation_backtester_fast.py` 的 `FastBacktestResult` **新增了行为**（`__init__` + `__setitem__` / `setdefault` / `update` / `pop` / `copy` / `__copy__` 写路径与拷贝守卫，属 `B6.2` 的功能改动，**不是**文档改动）；不升版的原因仅是这些不是策略信号/参数默认值/底座引擎逻辑（`AGENTS.md` 第 7 条的触发条件）；④`docs/version.md` §20.5 的"已知脆弱点"行同步标注技术债已偿还。
 
+---
+
+### 4.15 2026-10-25 全量六组回测研究套件执行与复核留档 (Full 6-Group Backtest Research Execution & Committed Artifacts Verification)
+
+依据 [`docs/backtest_research.md`](file:///home/stone/Work/github/quant/docs/backtest_research.md) 与 [`docs/backtest_research_impl.md`](file:///home/stone/Work/github/quant/docs/backtest_research_impl.md) 的测量设计与工程留档规范，全套 6 组实验已全量执行完毕，回测产物统一收敛落盘于仓库内 `backtests_research/20261025_125300/`，并完成自包含复核与索引入库：
+
+1. **执行规模与叶子运行目录（共 62 组，无遗漏）**：
+   - `01_r1_longwin`: 6 策略长窗口 (4 折 walkforward, 2.0y/0.25y)
+   - `02_r2a_std`: 3 策略连续基准 (1,161 根 bar standard, 2022-01-04 → 2026-10-22)
+   - `03_r2b_oos`: 6 策略样本外基准 (6 折 walkforward, 0.25y/0.25y)
+   - `04_r1_std_cb_compare`: 2 臂 (baseline 与 no_circuit) 同区间 standard 熔断对照 (730 bars)
+   - `05_anatomy`: 6 策略全景解剖 (1,161 bars standard + 1.5% 现金计息 + 5% 市场冲击)
+   - `06_ablate`: 13 臂 × 3 策略 = 39 组逐模块消融实验 (1,161 bars standard + 1.5% 现金计息)
+   - 叶子产物留档一致性核验：`find` 统计 `strategy_dump.json` (62)、`run_manifest.json` (62)、`run.log` (62) 严格相等。
+
+2. **产物留档与体积合规（Committed Artifacts Policy）**：
+   - 彻底清除所有非规范临时 summary 文件，保留自包含股池 `universe_20_stocks.txt`；
+   - `git check-ignore -v` 跨 6 组抽样核验全部通过（零输出，所有回测产物均受版本控制，未被 `.gitignore` 排除）；
+   - 整个批次 62 组运行产物总大小 43MB，任何单一运行目录均在 1–2MB 以内，远低于 50MB 裁剪阈值，符合入库体积纪律。
+
+3. **`backtests_research/INDEX.md` 索引登记与 1:1 对账**：
+   - 在 `backtests_research/INDEX.md` 登记全部 62 组运行的元数据与指标对账行，以各目录 `run_manifest.json` 为单一事实来源（SSOT）；
+   - 零 `<...>` 模板占位符，指标列与参数消融臂全部用真实数字与真实映射填充；
+   - 关联任务对齐：为 `L2.47`（同口径基准对照）、`L2.48`（FSM 同源启用前基准锚定）、`L2.49`（惯性与换手削减研究）、`L2.50`（熔断可达性与行为分解）提供基线事实依据。
+
+
