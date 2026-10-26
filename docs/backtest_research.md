@@ -140,7 +140,7 @@
 
 所有实验命令统一输出至项目根目录下的 `$BT_ROOT="$REPO_ROOT/backtests_research/$RUN_TS"`（`RUN_TS="$(date +%Y%m%d_%H%M%S)"`），严禁使用外部临时目录，并在 `$BT_ROOT` 根部生成自包含的 20 股池快照文件 `$UNIV`。
 
-产物留档遵循**入库留档规范 (Committed Artifacts Policy)**（详见 [`docs/backtest_research_impl.md`](file:///home/stone/Work/github/quant/docs/backtest_research_impl.md) §4），每个叶子运行目录均自包含 `strategy_dump.json`（生效策略参数自审计核心）、`run_manifest.json`（环境与产物指纹清单）、`run.log`（完整执行日志），以及对应的回测 CSV/JSON 产物。
+产物留档遵循**留档规范 (Committed Artifacts Policy)**（详见 [`docs/backtest_research_impl.md`](file:///home/stone/Work/github/quant/docs/backtest_research_impl.md) §4），每个叶子运行目录均自包含 `strategy_dump.json`（生效策略参数自审计核心）、`run_manifest.json`（环境与产物指纹清单）、`run.log`（完整执行日志），以及对应的回测 CSV/JSON 产物。**注意：自 2026-10-25 起这些运行产物不再提交入库** —— `.gitignore` 以 `/backtests_research/**` 排除该目录树（文件仍全量保留在磁盘上，可直接复查），入库的只有 `backtests_research/INDEX.md`、人工撰写报告 `.md`、股池快照（`universe_*.txt` / `pruned_universe.txt`）与 `_provenance/` 溯源脚本；上述叶子目录的自包含内容描述依然成立，只是它们留在磁盘而不进索引。
 
 目录拓扑结构如下：
 

@@ -15,7 +15,7 @@
    - **修复 §8 `no_sectorthrot` 自适应限流配置语义**：`cdhb` 显式开启了 `cdhb_adaptive_sector_throttle: true`，而该节流在 `max_assets_per_sector` 之上**只会向上抬高**热行业上限（`allowed_sec_cap = max(allowed_sec_cap, 2)`），从不向下压缩；消融时须联动覆盖 `"${pfx}_adaptive_sector_throttle": false`，以消除「热行业抬高到 ≥2」与「放开到 20」的语义冲突。
    - **补充 §8 消融臂 × 策略可达性矩阵与生效位点解析**：澄清 `no_structregime` 仅在 `regime_adaptive` / `regime_ic_ir_hybrid` 模式下可达（三策略中仅 `chan_four_state_blend` 可达；`crb` / `cdhb` 默认 `rolling_ic_ir`，在 `_compute_adaptive_weights` 的 `rolling_ic_ir` 分支提前返回，故结构性不可达）；`no_hysteresis` 的消费符号 `enable_regime_hysteresis` 默认 `False`，仅 `chan_four_state_blend` 的 dump 将其设为 `true`，因此该臂只对该策略真实生效，在 `crb` / `cdhb` 上输出恒等于 `baseline`（no-op / 假阴性）。提供完整的消融臂 × 策略可达性矩阵表，并显式披露「标 `✗` 的臂在该策略上输出与 `baseline` 完全相同，不得据此得出『该模块无效』的结论」。
    - **修复 §6.5 熔断对照臂缺少同区间基线及 §6.1 外部路径依赖**：将 20 股池快照自包含保存在 `$BT_ROOT/universe_20_stocks.txt`；将 §6.5 熔断对照臂补齐同区间基线对照并对齐 `2022-01-04 → 2026-10-22` 口径说明。
-5. **回测产物入库留档（Committed Artifacts Policy）**：回测产物根目录 `backtests_research/` **不使用 `.gitignore` 排除**，所有运行产物随仓库提交入库，便于后续交叉复核与回归对照 —— 产物是**长期留存的研究资产**，不是临时文件（规范与核验命令见 §4）。**经评审建议为 `backtests_research/` 补一条 `.gitignore` 排除条目，已由用户决策否决**：不新增任何忽略规则，产物一律入库。同时严禁将 `--cache-dir` 指向 `backtests_research/` 或外部 `/tmp/...`，默认保持读取 `<repo_root>/data/cache.duckdb` 以严格保证离线可复现性（见 §4.4）。
+5. **回测产物留档（Committed Artifacts Policy）**：回测产物根目录 `backtests_research/` 的**运行产物不入库** —— 自 2026-10-25 起由 `.gitignore` 的 `/backtests_research/**` 整体排除（文件仍全量保留在磁盘，可随时复核）；入库的仅 `INDEX.md`、人工报告 `.md`、股池快照与 `_provenance/` 溯源脚本（规范与核验命令见 §4）。同时严禁将 `--cache-dir` 指向 `backtests_research/` 或外部 `/tmp/...`，默认保持读取 `<repo_root>/data/cache.duckdb` 以严格保证离线可复现性（见 §4.4）。
 
 ---
 
@@ -489,24 +489,31 @@ def _finalize_run_manifest(
 ### 4. 回测产物入库留档规范 (Committed Artifacts Policy)
 
 > [!IMPORTANT]
-> **语义变更（先读这一条，再读下文任何命令）**：`backtests_research/` 下的产物是**长期留存的研究资产**，不是临时文件。原文档把全部输出写在 `/tmp/opencode/bt_*` 下，天然带有「跑完即弃」语义；迁移到仓库内之后，该语义必须同步翻转 —— 每次**真实研究运行**的产物都**随仓库提交入库**，供后续交叉复核、回归对照与审计追溯（`strategy_dump.json` 本身就是自审计核心，见 §1）。
+> **语义变更（先读这一条，再读下文任何命令）**：自 **2026-10-25** 起，`backtests_research/` 下的**运行产物不纳入版本控制** —— `.gitignore` 以 `/backtests_research/**` 整体排除该目录树，故重跑一次不再弄脏 `git status`。产物文件**仍全量保留在磁盘上**（当时用 `git rm --cached` 只把 900+ 个产物移出索引，未动工作区一个字节），随时可读、可复核。
 >
-> **经评审建议为 `backtests_research/` 增加一条 `.gitignore` 排除条目，已由用户决策否决**：本方案不新增任何忽略规则，产物一律入库。下文是该决策的可执行、可核验版本（含 `git check-ignore` 实证命令、逐产物必提交清单、`INDEX.md` 索引与体积/缓存纪律）。
+> **仍入库的内容（白名单）**：① `backtests_research/INDEX.md`（运行索引）；② `backtests_research/<run_ts>/` 下**人工撰写**的报告 `.md`（如 `FORENSIC_AUDIT.md`、`ABLATION_WALKFORWARD.md`、`PARAMETER_RECOMMENDATIONS.md`，以及 `08_ablate_wf/<strategy>/_metrics.md`）；③ 股池快照 `universe_*.txt` 与 `pruned_universe.txt`；④ `_provenance/` 下的溯源脚本与数据。即：留下的是**人的判断**（不可重建）与**复现前提**（跑在哪批股票、由哪段脚本生成），而不是可再生的体积。2026-10-25 实测白名单为 18 个文件。
+>
+> **反转理由（记录在案）**：前版规范要求全部产物随运行入库，一轮真实研究即产出 **934 个文件、74MB**；而这些产物可由 [`docs/backtest_research.md`](file:///home/stone/Work/github/quant/docs/backtest_research.md) §6–§8 的命令组完整重跑复现，入库只是把可再生体积永久钉进 git 历史（历史不可回收，删文件不缩小 `.git`）。故产物本体退出 git，只留人工报告与复现前提。
+>
+> 叶子运行目录**自包含**的性质不因本决策而改变：每个叶子目录仍各自落盘 `strategy_dump.json`（生效策略参数自审计核心）、`run_manifest.json`（环境与产物指纹清单）、`run.log`（完整执行日志）与对应 CSV/JSON 产物 —— 区别仅在于它们留在磁盘、不进索引。下文 §4.1 给出忽略规则的可核验实证，§4.2 描述叶子目录的落盘内容，§4.3 的 `INDEX.md` 索引仍**入库**并继续维护。
 
-#### 4.1 不忽略原则 (No-Ignore Principle)
+#### 4.1 版本化范围原则 (Versioned-Scope Principle)
 
-1. `backtests_research/` 及其全部子目录**不得**加入 `.gitignore`，也不得以 `.gitattributes` 的 `export-ignore`、归档分支等方式在提交时被剥离；任何「顺手排除一下」的改动都视为对本规范的破坏，须先经用户裁决。
-2. 必须确认 `.gitignore` 中**已有**的规则不会误伤这些产物。当前相关条目为 `**/data/*.csv`、`**/data/*.duckdb*`、`**/results/*.png`、`**/results/*.csv`、`**/results/*.json`、`**/results/strategy_dumps/` —— 它们只匹配名为 `data/` 或 `results/` 的目录段，而本方案的 `--results-dir` 指向 `backtests_research/<ts>/<group>/<strategy>/`，**路径中不含 `results/` 与 `data/` 段**，故不被匹配。
-3. 每次新增命令组后必须**实证**而非假定「没被忽略」（期望**零输出**）：
+1. `backtests_research/` 的**运行产物**由仓库根 `.gitignore` 末尾的 `/backtests_research/**` 排除，`.git/info/exclude` 与全局 exclude **不得**参与此事（规则必须随仓库分发，否则协作者克隆后立刻变脏）；反向地，也不得用 `.gitattributes` 的 `export-ignore` 等旁路手段替代该条目。
+2. **否定规则的顺序不可简化**：`/backtests_research/**` 之后必须紧跟 `!/backtests_research/**/` 把目录重新打开 —— git 不会进入一个已被排除的目录，目录不重开则后续所有文件级 `!` 白名单一律失效。此后依次是 `INDEX.md`、`**/*.md`、`*/universe_*.txt`、`*/pruned_universe.txt`、`**/_provenance/**` 五条白名单。
+3. 需要长期留存的新产物，正确做法是改写成人工报告 `.md` 或 `_provenance/` 脚本（二者被白名单覆盖），而不是 `git add -f` 把产物强塞回索引 —— 强行绕过会让规则在下次静默失效，这正是本规范要避免的失败模式。
+4. 每次新增命令组后必须**实证**（注意期望值与前版规范相反）：
 
    ```bash
    cd /home/stone/Work/github/quant
+   # 产物：期望 exit 0 且输出命中的规则行（.gitignore:/backtests_research/**）
    git check-ignore -v backtests_research/<ts>/06_ablate/baseline/chan_four_state_blend/strategy_dump.json
-   # 期望：无任何输出 ⇒ 该路径未被任何规则命中。
-   # 有输出 ⇒ 输出里会给出命中的 .gitignore 行号与匹配模式，先解决规则冲突，再继续后续命令组。
+   # 白名单：期望 exit 1 且无任何输出（未被忽略 ⇒ 该文件仍在版本控制内）
+   git check-ignore -v backtests_research/INDEX.md
    ```
 
-4. `git add -f` **不是**允许的手段：它只在当下把文件塞进索引，规则本身仍然踩在上面，下一次（或换一个人执行）就会静默漏提交。要的是「规则不匹配」，不是「这一次强行绕过」。
+> [!WARNING]
+> **本节的落地同时使 §4.2–§4.5 中「必提交 / 一律入库 / 提交信息须带时间戳目录」一类表述作废**（2026-10-25）：产物已不入库，故不存在「每产物必提交清单」，也不存在「产物与索引必须落在同一个提交里」。§4.2 的表与注**继续有效**，但只作为「叶子目录落盘内容与自包含性」的说明（`strategy_dump.json` / `run_manifest.json` / `run.log` 各自为何不可省），其中「是否必提交」一列请按「是否入库 = 否」阅读；§4.3 的 `INDEX.md` 索引、§4.4 的 `--cache-dir` 纪律（第 1 条与末尾告警）与体积量的估算法仍然完全有效。§4.5 的提交信息规范仅在其「terse、全小写、现在时」部分继续适用。
 
 #### 4.2 每次运行的必提交清单 (Per-Run Committed Set)
 

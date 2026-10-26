@@ -9,3 +9,15 @@ __pycache__/
 **/results/strategy_dumps/
 .pytest_cache/
 uv.lock
+
+# Backtest research run artifacts are NOT versioned (2026-10-25 decision):
+# the 934-file / 74MB artifact tree is reproducible from the command groups in
+# docs/backtest_research.md, so only human-written reports, the run index, the
+# universe snapshot and the provenance scripts stay in git. Files stay on disk.
+/backtests_research/**
+!/backtests_research/**/
+!/backtests_research/INDEX.md
+!/backtests_research/**/*.md
+!/backtests_research/*/universe_*.txt
+!/backtests_research/*/pruned_universe.txt
+!/backtests_research/**/_provenance/**
