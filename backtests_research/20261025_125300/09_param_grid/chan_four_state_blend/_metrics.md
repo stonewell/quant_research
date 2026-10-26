@@ -7,7 +7,11 @@
 - **驱动脚本**：`/tmp/opencode/grid_cfsb/run_cfsb_grid.sh`；总日志 `/tmp/opencode/grid_cfsb/driver.log`；抽取脚本 `/tmp/opencode/grid_cfsb/analyze.py` → `analysis.json`
 - **本文所有数字均直接读自各目录落盘产物**（`walkforward_summary.json` / `strategy_dump.json` / `run_manifest.json` / `run.log`），**不采用任何转述值**。基准臂全部数字同样从 `08_ablate_wf/baseline/chan_four_state_blend/walkforward_summary.json` 重读。
 
-> **与任务简报的一处数字出入（以落盘文件为准）**：简报里写的惯性臂再平衡笔数「442 → 839」在本策略的 walkforward 产物中**不存在**。本目录实测为 **535 → 970**（`08_ablate_wf` 的 `baseline` 与 `no_inertia` 的逐折 `total_rebalances` 求和）。本文一律采用文件值。
+> **两种调仓计数口径（两者都成立，不可互换、不可互证）**：任务简报的「442 → 839」与本文的「535 → 970」**测的不是同一个量**，均已从 `08_ablate_wf` 的 `baseline` / `no_inertia` 落盘产物重算确认为真。
+> - **口径一 · 调仓日计数**：`walkforward_rebalances.csv` 按 `(fold, date)` 去重后的调仓日数，baseline **442** → `no_inertia` **839**（×1.898）。
+> - **口径二 · 笔数求和**：`walkforward_summary.json` 的 `rolling_window_performance[*].total_rebalances` 在 18 折上求和，baseline **535** → `no_inertia` **970**（×1.813）。
+>
+> 该数与本文 `total_rebalances` 口径**不同**：`442 → 839` 是 `walkforward_rebalances.csv` 中**去重 `(fold, date)` 的调仓日计数**，`535 → 970` 是 18 折 `total_rebalances` 之**和**。**本文各表一律用口径二**（`total_rebalances` 18 折求和）以保持内部一致；引用时必须写清用的是哪一个。
 
 ---
 
