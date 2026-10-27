@@ -86,6 +86,8 @@ class RunHealthRequest(BaseModel):
     portfolio_value: float = 100000.0
     peak_nav: Optional[float] = None
     data_provider: Optional[str] = None
+    allow_intraday: bool = Field(True, description="Allow running during intraday/lunch sessions using latest published session")
+    refresh_data: bool = Field(True, description="Refresh market data before Stage 1 starts")
 
 
 class RunDeployRequest(BaseModel):
@@ -104,6 +106,7 @@ class RunDeployRequest(BaseModel):
     data_provider: Optional[str] = None
     lot_size: Optional[int] = None
     guard_latency_bars: int = Field(2, description="UPLSM entry confirmation latency guard bars (default 2)")
+    allow_intraday: bool = Field(True, description="Allow running during intraday/lunch sessions using latest published session")
 
 
 # Harmonized alias for Stage 2 live strategy request
@@ -158,4 +161,5 @@ class MultiStrategyDeployRequest(BaseModel):
     data_provider: Optional[str] = None
     min_holding_bars: int = 2
     inertia_threshold: float = 0.05
+    allow_intraday: bool = Field(True, description="Allow running during intraday/lunch sessions using latest published session")
 

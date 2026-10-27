@@ -555,6 +555,7 @@ def test_run_window_defaults_are_market_local():
 
 def test_allow_stale_prices_and_no_strict_freshness_are_one_switch(monkeypatch):
     """Both spellings feed a single boolean, so no site can honour one and ignore the other."""
+    _freeze(monkeypatch, _BEIJING_1530)
     clock = MarketClock(market="china", now=_BEIJING_1530)
     assert clock.as_of_trading_date() == dt.date(2026, 10, 23)
 
@@ -1061,3 +1062,210 @@ def test_multi_strategy_reuses_the_stage2_replay_predicate():
 
     assert rms.resolve_run_mode is rls.resolve_run_mode
     assert rms.announce_run_mode is rls.announce_run_mode
+
+
+def test_stage1_defaults_to_allow_intraday_and_supports_flags():
+    """Stage 1 defaults allow_intraday to True, Stage 2 defaults to False."""
+    import argparse
+    from common import cli_utils
+
+    p1 = argparse.ArgumentParser()
+    cli_utils.add_market_clock_cli_args(p1, stage="stage1")
+    parsed_s1 = p1.parse_args([])
+    assert parsed_s1.allow_intraday is True
+
+    parsed_s1_no = p1.parse_args(["--no-allow-intraday"])
+    assert parsed_s1_no.allow_intraday is False
+
+    p2 = argparse.ArgumentParser()
+    cli_utils.add_market_clock_cli_args(p2, stage="stage2")
+    parsed_s2 = p2.parse_args([])
+    assert parsed_s2.allow_intraday is False
+
+    parsed_s2_yes = p2.parse_args(["--allow-intraday"])
+    assert parsed_s2_yes.allow_intraday is True
+
+
+def test_stage1_refresh_data_cli_and_offline_skip(tmp_path):
+    """Stage 1 CLI supports --refresh-data and --no-refresh-data, and skips offline."""
+    from scripts.check_live_portfolio_health import parse_args as parse_stage1_args, refresh_stage1_data
+
+    res_default = parse_stage1_args(["--strategy-file", "dummy.json"])
+    assert res_default.refresh_data is True
+
+    res_no = parse_stage1_args(["--strategy-file", "dummy.json", "--no-refresh-data"])
+    assert res_no.refresh_data is False
+
+    # 100% offline rule check: synthetic or no_cache returns skipped immediately
+    skipped_syn = refresh_stage1_data(
+        symbols=["600000.SH"],
+        as_of_date="2026-10-26",
+        data_provider="synthetic",
+        cache_dir=str(tmp_path),
+        no_cache=False,
+    )
+    assert skipped_syn == {"status": "skipped", "reason": "synthetic_or_no_cache"}
+
+    skipped_nocache = refresh_stage1_data(
+        symbols=["600000.SH"],
+        as_of_date="2026-10-26",
+        data_provider="marketdb",
+        cache_dir=str(tmp_path),
+        no_cache=True,
+    )
+    assert skipped_nocache == {"status": "skipped", "reason": "synthetic_or_no_cache"}
+
+    skipped_csv = refresh_stage1_data(
+        symbols=["600000.SH"],
+        as_of_date="2026-10-26",
+        data_provider="csv",
+        cache_dir=str(tmp_path),
+        no_cache=False,
+    )
+    assert skipped_csv == {"status": "skipped", "reason": "synthetic_or_no_cache"}
+
+
+def test_stage1_incident_timestamp_lunch_break_gate_and_refresh_order(monkeypatch, tmp_path):
+    """Incident timestamp: 2026-10-27T11:37:32+08:00 (US Pacific 2026-10-26T20:37:32-07:00).
+
+    Verifies:
+    1. Session is lunch_break and market is china.
+    2. Stage 1 runs without raising RunWindowError (since allow_intraday defaults to True in Stage 1).
+    3. Resolves as_of_date == "2026-10-26" and sets run_window_gate == "intraday_allowed".
+    4. Calls refresh_stage1_data BEFORE load_live_universe.
+    """
+    import scripts.check_live_portfolio_health as health_mod
+
+    # Exact incident instant: 2026-10-27T11:37:32+08:00
+    # In UTC: 2026-10-27T03:37:32Z
+    # In US Pacific (PDT, UTC-7): 2026-10-26T20:37:32-07:00
+    incident_instant = dt.datetime(2026, 10, 27, 3, 37, 32, tzinfo=dt.timezone.utc)
+    _freeze(monkeypatch, incident_instant)
+
+    # Track execution order of refresh_stage1_data vs load_live_universe
+    call_order = []
+    orig_refresh = health_mod.refresh_stage1_data
+    orig_load = health_mod.load_live_universe
+
+    def spy_refresh(*args, **kwargs):
+        call_order.append("refresh_stage1_data")
+        return orig_refresh(*args, **kwargs)
+
+    def spy_load(*args, **kwargs):
+        call_order.append("load_live_universe")
+        return orig_load(*args, **kwargs)
+
+    monkeypatch.setattr(health_mod, "refresh_stage1_data", spy_refresh)
+    monkeypatch.setattr(health_mod, "load_live_universe", spy_load)
+
+    universe_file = _write_universe(tmp_path, ["600000.SH", "601857.SH", "BIL"])
+    out_dir = str(tmp_path / "reports")
+
+    # Run Stage 1 main - must NOT raise RunWindowError
+    res = health_mod.main(
+        [
+            "--universe-file", universe_file,
+            "--output-dir", out_dir,
+            "--start-date", "2026-01-01",
+            "--data-provider", "synthetic",
+            "--portfolio-value", "100000",
+            "--peak-nav", "100000",
+            "--no-save-state",
+        ]
+    )
+    assert res is not None
+
+    # Verify refresh_stage1_data was called BEFORE load_live_universe
+    assert call_order == ["refresh_stage1_data", "load_live_universe"]
+
+    # Verify report and summary JSON contents
+    report = json.loads((tmp_path / "reports" / "stage1_health_report.json").read_text(encoding="utf-8"))
+    assert report["as_of_date"] == "2026-10-26"
+    assert report["clock"]["market"] == "china"
+    assert report["clock"]["session"] == "lunch_break"
+    assert report["clock"]["run_window_gate"] == "intraday_allowed"
+    assert report["clock"]["as_of_trading_date"] == "2026-10-26"
+    assert report["clock"]["expected_last_session"] == "2026-10-26"
+    assert report["clock"]["local_now"] == "2026-10-27T11:37:32+08:00"
+
+    summary = json.loads((tmp_path / "reports" / "summary.json").read_text(encoding="utf-8"))
+    assert summary["stage"] == "stage1"
+    assert summary["clock"]["as_of_trading_date"] == "2026-10-26"
+    assert summary["clock"]["session"] == "lunch_break"
+    assert summary["clock"]["run_window_gate"] == "intraday_allowed"
+
+
+def test_refresh_stage1_data_invokes_sync_routines_when_marketdb(monkeypatch, tmp_path):
+    """refresh_stage1_data invokes sync routines with mocked sync functions when provider=marketdb and no_cache=False."""
+    from unittest.mock import MagicMock
+    import scripts.check_live_portfolio_health as health_mod
+    import scripts.sync_china_5m_and_indices as sync_mod
+
+    mock_cache = MagicMock()
+    mock_duckdb_cls = MagicMock(return_value=mock_cache)
+    monkeypatch.setattr("common.duckdb_cache.DuckDBCache", mock_duckdb_cls)
+
+    mock_sync_indices = MagicMock()
+    mock_patch_equity = MagicMock()
+    mock_sync_5m = MagicMock()
+
+    monkeypatch.setattr(sync_mod, "sync_indices_daily", mock_sync_indices)
+    monkeypatch.setattr(sync_mod, "patch_equity_daily_bars", mock_patch_equity)
+    monkeypatch.setattr(sync_mod, "sync_5m_intraday", mock_sync_5m)
+
+    symbols = ["600000.SH", "601857.SH", "BIL"]
+
+    # 1. With enable_intraday_5m=True: all 3 routines invoked
+    summary_5m = health_mod.refresh_stage1_data(
+        symbols=symbols,
+        as_of_date="2026-10-26",
+        data_provider="marketdb",
+        cache_dir=str(tmp_path),
+        market="china",
+        enable_intraday_5m=True,
+        no_cache=False,
+    )
+    assert summary_5m["status"] == "completed"
+    assert summary_5m["steps"]["sync_indices_daily"] == "ok"
+    assert summary_5m["steps"]["patch_equity_daily_bars"] == "ok"
+    assert summary_5m["steps"]["sync_5m_intraday"] == "ok"
+
+    mock_sync_indices.assert_called_once()
+    assert mock_sync_indices.call_args[0][0] == mock_cache
+    assert mock_sync_indices.call_args[0][1] == sync_mod.MAJOR_INDICES
+    assert mock_sync_indices.call_args[1]["end"] == "2026-10-26"
+
+    mock_patch_equity.assert_called_once()
+    assert mock_patch_equity.call_args[0][0] == mock_cache
+    assert mock_patch_equity.call_args[0][1] == ["600000.SH", "601857.SH"]  # BIL excluded
+    assert mock_patch_equity.call_args[1]["end"] == "2026-10-26"
+
+    mock_sync_5m.assert_called_once()
+    assert mock_sync_5m.call_args[0][0] == mock_cache
+    assert mock_sync_5m.call_args[0][1] == ["600000.SH", "601857.SH"]
+    assert mock_sync_5m.call_args[0][2] == sync_mod.MAJOR_INDICES
+    assert mock_sync_5m.call_args[1]["end"] == "2026-10-26"
+
+    # 2. With enable_intraday_5m=False: 5m routine not invoked
+    mock_sync_indices.reset_mock()
+    mock_patch_equity.reset_mock()
+    mock_sync_5m.reset_mock()
+
+    summary_no_5m = health_mod.refresh_stage1_data(
+        symbols=symbols,
+        as_of_date="2026-10-26",
+        data_provider="marketdb",
+        cache_dir=str(tmp_path),
+        market="china",
+        enable_intraday_5m=False,
+        no_cache=False,
+    )
+    assert summary_no_5m["status"] == "completed"
+    assert summary_no_5m["steps"]["sync_indices_daily"] == "ok"
+    assert summary_no_5m["steps"]["patch_equity_daily_bars"] == "ok"
+    assert "sync_5m_intraday" not in summary_no_5m["steps"]
+    mock_sync_indices.assert_called_once()
+    mock_patch_equity.assert_called_once()
+    mock_sync_5m.assert_not_called()
+
+

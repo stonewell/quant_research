@@ -1579,8 +1579,8 @@ class DuckDBCache:
         sync_time: Optional[datetime.datetime] = None,
         interval: str = "1d",
         *,
-        allow_history_rewrite: bool = False,
-        rewrite_reason: Optional[str] = None,
+        allow_history_rewrite: bool = True,
+        rewrite_reason: Optional[str] = "i do need to update data",
     ) -> None:
         """Upserts daily OHLCV bars into ohlcv_bars and updates asset_sync_metadata.
 

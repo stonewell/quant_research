@@ -218,6 +218,8 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
                 universe_key=payload.universe_key,
                 strategy_name=payload.strategy_name,
                 universe_name=payload.universe_name,
+                allow_intraday=payload.allow_intraday,
+                refresh_data=payload.refresh_data,
             )
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
@@ -240,6 +242,7 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
                 strategy_name=payload.strategy_name,
                 universe_name=payload.universe_name,
                 guard_latency_bars=payload.guard_latency_bars,
+                allow_intraday=payload.allow_intraday,
             )
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
@@ -274,6 +277,7 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
                 data_provider=payload.data_provider,
                 min_holding_bars=payload.min_holding_bars,
                 inertia_threshold=payload.inertia_threshold,
+                allow_intraday=payload.allow_intraday,
             )
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))

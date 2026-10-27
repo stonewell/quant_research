@@ -397,10 +397,12 @@ def add_market_clock_cli_args(parser: argparse.ArgumentParser, *, stage: str) ->
     )
     parser.add_argument(
         "--allow-intraday",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=(stage == "stage1"),
         help=(
             "Explicitly allow an INTRADAY run outside the default run window "
             f"({window[0].strftime('%H:%M')}-{window[1].strftime('%H:%M')} market-local for {stage}). "
+            "Stage 1 defaults to True (health check on latest published session); Stage 2 defaults to False. "
             "Without it, an OPEN/LUNCH_BREAK market outside that window refuses to generate orders: that is "
             "the 2026-10-22 failure (run at Beijing 10:05, valuation 10-22, six symbols' bars stuck at 10-21). "
             "As-of stays the last PUBLISHED session either way -- today's unfinished daily bar is never used."
@@ -534,7 +536,7 @@ def resolve_live_clock_context(
         expected_session = clock_as_of
         as_of_source = "market_clock"
 
-    allow_intraday = bool(getattr(args, "allow_intraday", False))
+    allow_intraday = bool(getattr(args, "allow_intraday", stage == "stage1"))
     strict_market_clock = bool(getattr(args, "strict_market_clock", True))
     window = market_run_window(market, stage)
     # A pinned as-of EARLIER than the clock's published session is a deliberate historical

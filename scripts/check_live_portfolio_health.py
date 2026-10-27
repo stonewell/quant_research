@@ -36,7 +36,7 @@ import json
 import os
 import sys
 from datetime import date, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -56,6 +56,7 @@ if _REPO_ROOT not in sys.path:
 
 from common.data import get_data_provider
 from common.cli_utils import (
+    CASH_PROXY_SYMBOLS,
     add_data_provider_cli_args,
     add_market_clock_cli_args,
     build_data_kwargs,
@@ -244,6 +245,16 @@ def parse_args(args: Optional[List[str]] = None):
             "missing entirely. Do NOT archive the resulting run as a live ticket."
         ),
     )
+    parser.add_argument(
+        "--refresh-data",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Pre-flight refresh/patch of market data cache (indices 1d, universe 1d, and 5m when "
+            "--enable-intraday-5m is active) up to as_of_date before Stage 1 starts work "
+            "(default: True; automatically skipped when --data-provider is 'synthetic' or --no-cache)."
+        ),
+    )
     add_data_provider_cli_args(parser, default_provider="synthetic")
     # (L2.3) as-of / market / run-window gate / strict freshness / probe retry limit.
     add_market_clock_cli_args(parser, stage="stage1")
@@ -278,6 +289,91 @@ def to_json_serializable(obj: Any) -> Any:
     if isinstance(obj, (list, tuple)):
         return [to_json_serializable(x) for x in obj]
     return obj
+
+
+def refresh_stage1_data(
+    symbols: Sequence[str],
+    as_of_date: str,
+    data_provider: str,
+    cache_dir: Optional[str],
+    market: str = "china",
+    enable_intraday_5m: bool = False,
+    no_cache: bool = False,
+) -> Dict[str, Any]:
+    """Pre-flight refresh/patch of market data cache up to as_of_date before Stage 1 starts.
+
+    100% Offline Rule: If no_cache is True or data_provider is in ('synthetic', 'csv'), immediately return
+    {"status": "skipped", "reason": "synthetic_or_no_cache"} without touching any network or external DB.
+    """
+    if no_cache or str(data_provider).strip().lower() in ("synthetic", "csv"):
+        return {"status": "skipped", "reason": "synthetic_or_no_cache"}
+
+    print(
+        f"[STAGE 1 DATA REFRESH] 正在执行前置行情数据刷新 "
+        f"(market={market}, as_of={as_of_date}, provider={data_provider})..."
+    )
+    eff_cache_dir = cache_dir or shared_data_dir()
+    summary: Dict[str, Any] = {
+        "status": "completed",
+        "market": market,
+        "as_of_date": as_of_date,
+        "cache_dir": eff_cache_dir,
+        "steps": {},
+    }
+
+    try:
+        from common.duckdb_cache import DuckDBCache
+        cache = DuckDBCache(eff_cache_dir)
+    except Exception as exc:
+        print(f"[STAGE 1 DATA REFRESH WARN] 无法打开 DuckDB 缓存 ({eff_cache_dir}): {exc}")
+        summary["status"] = "failed"
+        summary["error"] = str(exc)
+        return summary
+
+    if market == "china":
+        try:
+            from scripts.sync_china_5m_and_indices import (
+                MAJOR_INDICES,
+                sync_indices_daily,
+                patch_equity_daily_bars,
+                sync_5m_intraday,
+            )
+        except ImportError as exc:
+            print(f"[STAGE 1 DATA REFRESH WARN] 导入行情同步模块失败: {exc}")
+            summary["steps"]["import"] = f"failed: {exc}"
+            return summary
+
+        equity_syms = [s for s in symbols if str(s).strip().upper() not in CASH_PROXY_SYMBOLS]
+
+        # 1. Major indices daily bars
+        try:
+            start_1d = (pd.Timestamp(as_of_date) - timedelta(days=35)).strftime("%Y-%m-%d")
+            sync_indices_daily(cache, MAJOR_INDICES, start=start_1d, end=as_of_date)
+            summary["steps"]["sync_indices_daily"] = "ok"
+        except Exception as exc:
+            print(f"[STAGE 1 DATA REFRESH WARN] 大盘指数日线同步异常 (容错忽略): {exc}")
+            summary["steps"]["sync_indices_daily"] = f"warn: {exc}"
+
+        # 2. Patch equity daily bars
+        if equity_syms:
+            try:
+                patch_equity_daily_bars(cache, equity_syms, end=as_of_date)
+                summary["steps"]["patch_equity_daily_bars"] = "ok"
+            except Exception as exc:
+                print(f"[STAGE 1 DATA REFRESH WARN] 个股日线补充拉取异常 (容错忽略): {exc}")
+                summary["steps"]["patch_equity_daily_bars"] = f"warn: {exc}"
+
+        # 3. 5m intraday sync if enabled
+        if enable_intraday_5m:
+            try:
+                start_5m = (pd.Timestamp(as_of_date) - timedelta(days=10)).strftime("%Y-%m-%d")
+                sync_5m_intraday(cache, equity_syms, MAJOR_INDICES, start=start_5m, end=as_of_date)
+                summary["steps"]["sync_5m_intraday"] = "ok"
+            except Exception as exc:
+                print(f"[STAGE 1 DATA REFRESH WARN] 5分钟分时行情同步异常 (容错忽略): {exc}")
+                summary["steps"]["sync_5m_intraday"] = f"warn: {exc}"
+
+    return summary
 
 
 def load_account_state(state_file: str) -> Dict[str, Any]:
@@ -1240,6 +1336,21 @@ def main(cli_args: Optional[List[str]] = None):
         "weighting_mode_mismatch_overridden": weighting_mode_mismatch_overridden,
         "orthogonalization": params.get("blend_enable_orthogonalization", True),
     }
+
+    enable_intraday_5m = getattr(args, "enable_intraday_5m", False) or bool(
+        resolve_blend_param(params, "enable_intraday_5m", False, bool)
+    )
+
+    if getattr(args, "refresh_data", True):
+        refresh_stage1_data(
+            symbols=universe_symbols,
+            as_of_date=as_of_date,
+            data_provider=args.data_provider,
+            cache_dir=args.cache_dir or shared_data_dir(),
+            market=clock_ctx.market,
+            enable_intraday_5m=enable_intraday_5m,
+            no_cache=getattr(args, "no_cache", False),
+        )
 
     # 2. Load Universe Data
     if not universe_symbols:

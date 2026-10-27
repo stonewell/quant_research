@@ -2369,3 +2369,100 @@ def test_app_js_badge_survives_legacy_archive_rows_without_blocking_reason():
     assert "已取消开仓" in verdicts[0]["text"]
     assert verdicts[1]["text"] == "🟡 HOLD (锁仓/过滤)"
     assert verdicts[2]["text"] == "⚪ HOLD (维持)"
+
+
+def test_request_models_intraday_and_refresh_defaults():
+    """Verify RunHealthRequest, RunDeployRequest, and MultiStrategyDeployRequest defaults."""
+    from models import RunHealthRequest, RunDeployRequest, MultiStrategyDeployRequest
+
+    health_req = RunHealthRequest(strategy_file="dummy.json")
+    assert health_req.allow_intraday is True
+    assert health_req.refresh_data is True
+
+    deploy_req = RunDeployRequest(strategy_file="dummy.json")
+    assert deploy_req.allow_intraday is True
+
+    multi_req = MultiStrategyDeployRequest()
+    assert multi_req.allow_intraday is True
+
+
+def test_execution_service_intraday_and_refresh_flags(temp_workspace, monkeypatch):
+    """Verify execution_service appends --allow-intraday, --no-allow-intraday, --no-refresh-data."""
+    from execution_service import ExecutionService
+    import subprocess
+
+    storage, _ = temp_workspace
+    service = ExecutionService(storage)
+
+    captured_cmds = []
+
+    def mock_run(cmd, *args, **kwargs):
+        captured_cmds.append(list(cmd))
+        class MockProc:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return MockProc()
+
+    monkeypatch.setattr(subprocess, "run", mock_run)
+
+    # 1. Health check with default allow_intraday=True, refresh_data=True
+    service.run_health_check(
+        strategy_file="dummy.json",
+        universe_file="dummy.txt",
+        data_provider="synthetic",
+        allow_intraday=True,
+        refresh_data=True,
+    )
+    cmd1 = captured_cmds[-1]
+    assert "--allow-intraday" in cmd1
+    assert "--no-refresh-data" not in cmd1
+
+    # 2. Health check with allow_intraday=False, refresh_data=False
+    service.run_health_check(
+        strategy_file="dummy.json",
+        universe_file="dummy.txt",
+        data_provider="synthetic",
+        allow_intraday=False,
+        refresh_data=False,
+    )
+    cmd2 = captured_cmds[-1]
+    assert "--no-allow-intraday" in cmd2
+    assert "--no-refresh-data" in cmd2
+
+    # 3. Deploy check with allow_intraday=True and allow_intraday=False
+    service.run_live_deploy(
+        strategy_file="dummy.json",
+        universe_file="dummy.txt",
+        data_provider="synthetic",
+        allow_intraday=True,
+    )
+    cmd3 = captured_cmds[-1]
+    assert "--allow-intraday" in cmd3
+
+    service.run_live_deploy(
+        strategy_file="dummy.json",
+        universe_file="dummy.txt",
+        data_provider="synthetic",
+        allow_intraday=False,
+    )
+    cmd3_no = captured_cmds[-1]
+    assert "--no-allow-intraday" in cmd3_no
+
+    # 4. Multi-strategy deploy with allow_intraday=True and allow_intraday=False
+    service.run_multi_strategy_netted_deploy(
+        universe_file="dummy.txt",
+        data_provider="synthetic",
+        allow_intraday=True,
+    )
+    cmd4 = captured_cmds[-1]
+    assert "--allow-intraday" in cmd4
+
+    service.run_multi_strategy_netted_deploy(
+        universe_file="dummy.txt",
+        data_provider="synthetic",
+        allow_intraday=False,
+    )
+    cmd4_no = captured_cmds[-1]
+    assert "--no-allow-intraday" in cmd4_no
+

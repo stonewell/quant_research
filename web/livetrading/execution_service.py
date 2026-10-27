@@ -685,6 +685,8 @@ class ExecutionService:
         universe_key: Optional[str] = None,
         strategy_name: Optional[str] = None,
         universe_name: Optional[str] = None,
+        allow_intraday: bool = True,
+        refresh_data: bool = True,
     ) -> Dict[str, Any]:
         """Execute Stage 1 Health Check."""
         provider = data_provider or self.storage.default_data_provider or "marketdb"
@@ -757,6 +759,12 @@ class ExecutionService:
         if self.storage.cache_dir:
             cmd.extend(["--cache-dir", self.storage.cache_dir])
         cmd.append("--enable-intraday-5m")
+        if allow_intraday:
+            cmd.append("--allow-intraday")
+        else:
+            cmd.append("--no-allow-intraday")
+        if not refresh_data:
+            cmd.append("--no-refresh-data")
 
         print(f"[ExecutionService] Running Stage 1 Health Check: {' '.join(cmd)}")
         proc = subprocess.run(
@@ -894,6 +902,7 @@ class ExecutionService:
         strategy_name: Optional[str] = None,
         universe_name: Optional[str] = None,
         guard_latency_bars: int = 2,
+        allow_intraday: bool = True,
     ) -> Dict[str, Any]:
         """Execute Stage 2 Live Deployment."""
         provider = data_provider or self.storage.default_data_provider or "marketdb"
@@ -958,6 +967,10 @@ class ExecutionService:
         cmd.append("--enable-intraday-5m")
         if guard_latency_bars is not None:
             cmd.extend(["--guard-latency-bars", str(guard_latency_bars)])
+        if allow_intraday:
+            cmd.append("--allow-intraday")
+        else:
+            cmd.append("--no-allow-intraday")
 
         print(f"[ExecutionService] Running Stage 2 Live Deployment: {' '.join(cmd)}")
         proc = subprocess.run(
@@ -1093,6 +1106,7 @@ class ExecutionService:
         data_provider: Optional[str] = None,
         min_holding_bars: int = 2,
         inertia_threshold: float = 0.05,
+        allow_intraday: bool = True,
     ) -> Dict[str, Any]:
         """Execute Multi-Strategy Order Netting & Live Deployment."""
         provider = data_provider or self.storage.default_data_provider or "synthetic"
@@ -1161,6 +1175,10 @@ class ExecutionService:
         if self.storage.cache_dir:
             cmd.extend(["--cache-dir", self.storage.cache_dir])
         cmd.append("--enable-intraday-5m")
+        if allow_intraday:
+            cmd.append("--allow-intraday")
+        else:
+            cmd.append("--no-allow-intraday")
 
         print(f"[ExecutionService] Running Multi-Strategy Netting Deploy: {' '.join(cmd)}")
         proc = subprocess.run(
