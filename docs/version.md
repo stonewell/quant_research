@@ -3425,14 +3425,27 @@ exit: 1
 ### 21.1 事实与目标
 - **事实背景**：此前 `common/position_lifecycle.py` 的 UPLSM 状态机（开仓确认 `guard_latency_bars`、A股 T+1 锁仓 `min_holding_bars`、非对称冷却 `stop_cooldown_bars/normal_cooldown_bars`、硬止损与 ATR 吊灯止损快路径）仅在实盘执行（`scripts/run_live_strategy.py`）中驱动，回测引擎（`common/allocation_backtester.py` / `backtester/run_backtest.py`）完全旁路，导致实盘票据与回测换手/持仓周期口径失配。
 - **改动范围**：
-  1. `common/position_lifecycle.py`：新增 `resolve_position_lifecycle_config(params, args)` 与纯因果时序状态机驱动函数 `simulate_position_lifecycle(universe, target_weights, cfg, market, cash_proxy)`。严格遵循稀疏权重契约（Sparse Weights Contract）：仅在有真实买卖发生的活跃调仓日写出权重，平仓/已离场标的显式写入 `0.0`（彻底杜绝 `ffill()` 渗漏），非调仓日整行置全 `NaN`；支持 `cash_proxy` 自动停泊。支持中国 A 股 T+1 锁仓以及 -8% 硬止损/ATR 止损对锁仓的强制豁免快路径。
+  1. `common/position_lifecycle.py`：新增 `resolve_position_lifecycle_config(params, args)`（`:843`）与纯因果时序状态机驱动函数 `simulate_position_lifecycle(universe, target_weights, cfg, market, cash_proxy)`（`:1026`）。严格遵循稀疏权重契约（Sparse Weights Contract）：仅在有真实买卖发生的活跃调仓日写出权重，平仓/已离场标的显式写入 `0.0`（彻底杜绝 `ffill()` 渗漏），非调仓日整行置全 `NaN`；支持 `cash_proxy` 自动停泊。支持中国 A 股 T+1 锁仓以及 -8% 硬止损/ATR 止损对锁仓的强制豁免快路径。
+     - **resolver 默认值已与实盘对齐（评审修复 F1，2026-10-27）**：`PositionLifecycleConfig`（`:147`）的字段默认值与 `resolve_position_lifecycle_config` 的回落值现在**逐项等于** `scripts/run_live_strategy.py:1538-1573` 实际部署的那一组 —— `normal_cooldown_bars=2`、`inertia_relative_ratio=0.0`、`min_holding_bars=2`、`guard_latency_bars=2`、`stop_cooldown_bars=5`。修复前该四处与实盘**不一致**（`normal_cooldown_bars=1`、`inertia_relative_ratio=0.50`，dataclass 的 `min_holding_bars` 甚至写 `1`）：裸 `PositionLifecycleConfig()` 因此模拟的是**另一台更宽松**的状态机 —— 1 根锁仓、1 根再入冷却，且每一次「低于现权重一半」的减仓都被回测侧静默挡掉（实盘默认 `0.0` 等于**全策略关闭**该相对门，只有 `chan_four_state_blend` 通过 `cfsb_inertia_relative_ratio` 显式开启）。
+     - **支持实盘裸键别名（评审修复 F2）**：resolver 原先**只**读 `lifecycle_<field>`，而实盘读的是策略自己的拼写，故任何携带 `reentry_cooldown_bars` / `min_hold_bars` / `min_entry_bars` / `cfsb_inertia_relative_ratio` 的策略在回测里都会**静默回落到默认值**且无任何告警（回测与实盘各跑一台状态机，无人知晓）。现解析优先级为 `args.lifecycle_<field>` → `params["lifecycle_<field>"]` → 实盘裸键（CLI 命名空间）→ 实盘裸键（`params`）→ 实盘默认；**`lifecycle_` 前缀优先于裸键**，不存在「裸键覆盖显式前缀」的路径。别名映射：`reentry_cooldown_bars`→`normal_cooldown_bars`、`min_hold_bars`→`min_holding_bars`、`min_entry_bars`→`guard_latency_bars`、`cfsb_inertia_relative_ratio`→`inertia_relative_ratio`、`min_weight_change`→`inertia_threshold`、`stop_cooldown_bars`（裸）→`stop_cooldown_bars`。
+     - **复用实盘解析器，而非复制优先级**：别名解析直接 import 实盘 `scripts/run_live_strategy.py` 的 `resolve_blend_param` / `resolve_min_entry_bars` / `resolve_min_holding_bars` / `resolve_trade_inertia_threshold`（`common/position_lifecycle.py:803` 的 `_live_param_resolvers`；**惰性 import**，因为 `scripts/run_live_strategy.py` 在模块级 import 本模块，模块级反向 import 会成环）。因此 `_min_holding_bars` / `_min_hold_bars` 后缀兼容（`L2.39`）与 `cfsb_/crb_/ccsb_/cfssb_/cdhb_/blend_` 前缀扫描是**免费获得**的，实盘优先级将来再改，两个引擎同步改。
+     - **唯一保留差异（如实披露，不美化）**：`min_entry_threshold` 仍为 `None`，而实盘该字段是 `args.min_entry_threshold or params["entry_threshold"] or min_trade_thresh`（`scripts/run_live_strategy.py:1539`，即回落 `0.05`）。采纳该回落会对**所有未显式设置该字段**的回测静默收紧入场门（`0.0 < w < 0.05` 从此不再建仓），这是独立的行为决策、不属于「默认值对齐」，故本轮**明确不对齐**，由 `common/tests/test_position_lifecycle.py::test_resolve_position_lifecycle_config_matches_live_deployment_defaults` 把 `None` 钉住。需要该门时显式传 `lifecycle_min_entry_threshold`（或 CLI `--lifecycle-min-entry-threshold`）。
   2. `common/allocation_backtester.py`：`run_allocation_backtest` 增设 `enable_position_lifecycle: bool = False`（签名层保持默认 False 确保独立调用方兼容）及 `lifecycle_config`；稀疏权重对齐后调用 `simulate_position_lifecycle` 过滤稀疏矩阵，结果字典透明透传 `lifecycle_records` 与 `position_lifecycle_enabled`。
-  3. `backtester/run_backtest.py`：CLI 增加 `--enable-position-lifecycle`（默认 True）与 `--no-position-lifecycle` / `--disable-position-lifecycle`（dest="enable_position_lifecycle", action="store_false"）；`run_standard` 与 `_evaluate_walkforward_fold` 默认启用 UPLSM；基准运行（`_run_baseline`）显式强制 `enable_position_lifecycle=False`；provenance / `run_manifest.json` 自动记录开关。
-  4. `pipeline/run_pipeline.py`：新增 `--no-position-lifecycle` 并透传至 Step 5（backtester）。
-  5. `pipeline/parity_harness.py`：新增 `verify_lifecycle_step_parity` 对比单步仿真与实盘执行决策。
-  6. `backtester/tests/test_position_lifecycle_backtest.py`：新增 8 个专注测试用例覆盖逃生门比特级一致性、开仓确认过滤脉冲假信号、T+1 锁仓与止损豁免、稀疏权重 0.0 与全 NaN 契约、现金代理停泊及对拍校验。
-- **版本轴判定**：改动完全限于 `backtester/`、`common/position_lifecycle.py`、`common/allocation_backtester.py`、`pipeline/run_pipeline.py`、`pipeline/parity_harness.py`，未修改任何策略类或 `BaseBlendAllocationStrategy`，故不触发 `AGENTS.md` §7 版本递增，不重跑 `--dump-strategies`。
-- **验证结论**：`pytest common/tests/test_position_lifecycle.py`（41 passed）、`pytest common/tests/test_allocation_backtester.py`（28 passed）、`pytest backtester/tests/test_position_lifecycle_backtest.py`（8 passed）、`pytest pipeline/tests/test_parity_harness.py`（34 passed）共 111 个测试 100% 离线通过。
+     - **空 `lifecycle_records` 不再旁路仿真（评审修复 F4）**：只有**非空**记录才被直传（它是调用方已经仿真过的结果，重仿会二次过滤）；空 `list` 现在与 `None` 一样**落入仿真**。修复前 `lifecycle_records=[]` 走的是同一个直传分支，于是返回的是**未经状态机过滤的原始权重**，却仍报 `position_lifecycle_enabled=True` —— 一条声称建模了锁仓与冷却、实际什么都没做的运行。
+     - **`position_lifecycle_enabled` 反映「仿真真的跑过」**：该字段现在等于 `bool(enable_position_lifecycle and lifecycle_simulated)`，其中 `lifecycle_simulated` 仅在真跑了仿真、或收到了调用方非空记录时置真。开关被置位本身不再是「已启用」的证据。
+  3. `backtester/run_backtest.py`：CLI 增加 `--enable-position-lifecycle` 与 `--no-position-lifecycle` / `--disable-position-lifecycle`；`run_standard` 与 `_evaluate_walkforward_fold` 默认启用 UPLSM；基准运行（`_run_baseline`）显式强制 `enable_position_lifecycle=False`；provenance / `run_manifest.json` 自动记录开关。
+     - **恒真死开关已修（评审修复 F1）**：原实现是 `--enable-position-lifecycle` 的 `store_true` + `default=True` —— 无论操作者是否输入该旗标 `args` 都是 `True`，它能被关闭的**唯一**途径是另一个旗标；证据是 `run_manifest.json` 的 provenance 对「显式要求 ON」与「什么都没说」记录同一个值。现改为 `default=None`（= 未表态），由 `normalize_position_lifecycle_flag`（`backtester/run_backtest.py:121`）在**解析之后**归一化为 `True`，且归一化住在 `_PositionLifecycleArgumentParser.parse_args()` 里，使 `main()`、测试、`scripts/run_batch_backtest.py` 等每一个走 `parse_args()` 的调用点看到同一个已解析布尔，不会有人接过一个读作 OFF 的 `None`。
+     - **OFF 仅由反向旗标决定、且与参数顺序无关**：`--no-position-lifecycle` / `--disable-position-lifecycle` 改用**独立 dest** `no_position_lifecycle`（`action="store_true"`），有效值为「`--no-` 出现即 `False`，否则 `True`」。故 `--enable-position-lifecycle --no-position-lifecycle` 与 `--no-position-lifecycle --enable-position-lifecycle` **都**得到 OFF —— 旧写法若共用一个 dest，就会变成「最后一个旗标赢」，那是任何文档都没承诺过的语义。两条顺序均已由 `test_cli_flags_in_run_backtest_and_run_pipeline` 钉死。
+  4. `pipeline/run_pipeline.py`：新增 `--no-position-lifecycle`，并**同时**透传至 Step 1（`research_strategy` 的 `BACKTEST RESULTS` 块）与 Step 5（backtester）——只传 Step 5 会让 pipeline 打印的两个数字落在不同的执行纪律上（见第 9 条口径披露）。
+  5. `pipeline/parity_harness.py`：实际新增**两个**函数 —— `verify_lifecycle_step_parity`（`:1467`，单步：仿真一步 vs 调用方给的实盘决策）与 `verify_lifecycle_path_parity`（`:1617`，多日：`simulate_position_lifecycle` 批量路径 vs 逐 bar 顺序调用 `step_position_lifecycle` 的回放）。二者均改为**三值判定** `ALIGNED` / `DIVERGED` / `INCONCLUSIVE`（常量见 `:1462-1464`），`parity` 布尔仅在**真的比过且一致**时为 `True`；无实盘侧输入时返回 `INCONCLUSIVE`，不再像修复前那样对一次「没发生的比较」报 `parity=True`（自比对假阳性）。
+     - **边界（如实写明，不夸大为端到端对拍）**：`verify_lifecycle_path_parity` 的两侧**都是本进程本仓库**（批量仿真 vs 顺序回放），它证明的是「包装层 + 多日时序回放一致」，能抓状态未跨日持久化、现金腿丢失、日期覆盖不一致这类**包装/时序**缺陷；它**不是**与 `scripts/run_live_strategy.py` 的端到端对拍 —— 票据生成、整手取整、先卖后买排序、现金清算、券商侧全部不在其中。要作端到端主张，必须把实盘侧自己的决策记录通过 `live_decisions=`（`DataFrame` / `dict` 列表 / `{(date, symbol): record}` 映射，例如归档的实盘票据 CSV）喂进来；届时按 `(action, target_weight, blocking_reason)` 逐项交叉核对，`live_records_checked` 报告实际比了多少条。
+     - 同文件原先三处「the backtester has no lifecycle layer」的表述已随接线一并删除并改写为「本次重放把生命周期层**钉成 OFF**」：模块 docstring `:59`、`_row_explanation` `:1021`、`compare()` 的不可证清单 `:1253`。**钉 OFF 是刻意的对齐选择而非能力缺失** —— 归档账本本身就是实盘「已过生命周期」的账本，重放时再套一遍门禁等于把同一批门禁算两次；`run_replay` 因此在 `run_allocation_backtest(...)` 调用处显式写 `enable_position_lifecycle=False`。
+  6. `backtester/tests/test_position_lifecycle_backtest.py`：**16 个**专注测试用例（实测 collect = 16，非初版记录的 8）覆盖逃生门比特级一致性、开仓确认过滤脉冲假信号、T+1 锁仓与止损豁免、稀疏权重 `0.0` 与全 NaN 契约、现金代理停泊、CLI 顺序无关性、标准/walkforward 两路 `lifecycle_records` 落盘与「OFF 不落盘」、以及两个对拍函数的三值判定。
+  7. **决策日志落盘（评审修复 F3）**：`run_standard` 现在在 `--results-dir` 内落 `lifecycle_records.csv`，walkforward 落 `walkforward_lifecycle_records.csv`（每个 fold 前置 1-based `fold` 列）。列布局由 `LIFECYCLE_RECORD_COLUMNS`（`backtester/run_backtest.py:950`）单点定义、派生自 `LifecycleDecision.to_dict()` 加 `date`/`symbol`，嵌套的 `detail_reason` 以 JSON 编码而非丢弃（「这天为什么没成交」的证据正是这一层存在的理由）；空 fold 与全 HOLD 的 fold 输出同一个表头。**OFF 运行一个字节都不写**（层被关闭时没有决策可记，空文件与「跑了但没交易」不可区分）。既有 `backtest_equity.csv` / `backtest_weights.csv` / `rebalance_report.csv` / `walkforward_report.csv` / `walkforward_summary.json` 的列与取值**比特级不变**（`folds_clean` 在构建任何既有产物之前就把 `lifecycle_records` 剔除，`L2.37` 的约束照旧）。
+  8. **根因留痕：日期键格式不一致导致 `eval_records` 恒空（F4 暴露）**：`backtester/run_backtest.py` 原写 `set(eval_index.astype(str))`（得到 `'2021-12-06'`），而 `common/position_lifecycle.py` 给每条决策记 `rec["date"] = str(t)`（`t` 是 `Timestamp`，得到 `'2021-12-06 00:00:00'`），于是 `str(r["date"]) in eval_dates_set` **一条都命不中**、`eval_records` 恒为 `[]`。这原本被第 2 条的旧语义遮住（空 list 被当成「调用方给了记录」而直传未过滤权重）；F4 把「空 list」改正为「需要重仿」之后，同一批 fold 立刻开始对**已过滤、已预热**的权重做**二次仿真** —— 第二轮 `guard_latency_bars` 确认把 fold 的 day-0 种子行清零，`walkforward_lifecycle_records.csv` 永久为空。修法：抽 `_normalise_day_keys`（`:154`）与 `_lifecycle_records_in_window`（`:190`）把**两侧**统一到日粒度（`_normalise_day_keys` 同时兼容 `DatetimeIndex`、字符串/`date`/`datetime` 索引与普通 list，全部以 `YYYY-MM-DD` 开头），`run_standard` 与 `_evaluate_walkforward_fold` **两处调用点复用同一个函数**（绝不各写一份）。无 `date` 键的记录保留（fail-open：丢掉它会让调用方递一个空 list 进去，正好是这条 bug 本身）。回归由 `backtester/tests/test_run_backtest.py::test_walkforward_fold_weights_are_simulated_exactly_once` 钉死。
+  9. **口径披露（同一仓库内目前存在三种开关状态，必须说明）**：`_run_baseline` **恒 OFF**（合理：基准臂要的是不受策略风控影响的市场参照）；`pipeline/strategy_generator/stratgen/generator.py` 的候选搜索 **OFF**（`_portfolio_score` 显式传 `enable_position_lifecycle=False`，为的是保持不受约束的搜索景观、避免状态掩蔽造成的候选间不对称），而最终回测 **ON**（`backtester/run_backtest.py` 默认 ON）；`pipeline/research_strategy/run_research_strategy.py` 与 `pipeline/instrument_selection/selectorbot/strategy_fit.py` 本轮已改为 **ON**，并各带 `--no-position-lifecycle` / `enable_position_lifecycle=False` 逃生门。**由此产生一个必须明说的事实：搜索口径与最终呈现口径不同** —— strategy_generator 用于**排名**的分数是 OFF 纪律下的数字，**不是**任何操作者最终读到的绩效；后者一律是 ON 纪律。跨这两个口径比较数字（或把搜索分数当绩效引用）都是无效的。
+- **版本轴判定**：改动完全限于 `backtester/`、`common/position_lifecycle.py`、`common/allocation_backtester.py`、`pipeline/run_pipeline.py`、`pipeline/parity_harness.py`、`pipeline/research_strategy/run_research_strategy.py`、`pipeline/strategy_generator/stratgen/generator.py`、`pipeline/instrument_selection/selectorbot/strategy_fit.py`，未修改任何策略类或 `BaseBlendAllocationStrategy`（`git diff` 对 `pipeline/research/blend/*`、`pipeline/research_strategy/rs/*`、`common/allocation_templates.py` 为空），无信号计算 / 无参数默认值 / 无子策略组成变化，故不触发 `AGENTS.md` §7 版本递增，不重跑 `--dump-strategies`。
+- **验证结论（2026-10-27 评审修复后实跑，100% 离线）**：`backtester/tests/test_position_lifecycle_backtest.py` **16 passed**（初版记录 8）、`common/tests/test_position_lifecycle.py` **45 passed**（41 → 45）、`common/tests/test_allocation_backtester.py` **30 passed**（28 → 30）、`pipeline/tests/test_parity_harness.py` **35 passed**（34 → 35）、`backtester/tests/test_run_backtest.py` **71 passed**（含新增的「fold 权重只仿真一次」回归）。四条目标文件合计 **16 + 45 + 30 + 35 = 126** 个用例全绿。旧文本里的「共 111 个测试」是修复前那批文件的汇总口径，已被本行取代。
 
 ---
 
@@ -3447,10 +3460,11 @@ exit: 1
    - 生产环境中存在日线与 5m 分钟线的复权副本冗余（如 5m 曾同时以 BaoStock `adjustflag="2"` 与 EastMoney `adjust="qfq"` 存储 2 份完全重叠的 123 万行序列），磁盘开销膨胀两倍；且 `adjustflag` 混在数据维度中，无法从表内直接辨识单行数据真实复权属性。
 
 ### 22.2 核心改动与工程实现 (M3.6 & M3.8)
-1. **DuckDB 底座 Schema 扩展与幂等迁移 (M3.6)**：
-   - `ohlcv_bars` 日线表与 `intraday_ohlcv_bars` 5m 表统一扩展 `amount DOUBLE`（成交额，可为空，严格区分 0.0 与未采集 NULL，杜绝用 volume × close 污染）与 `adjustflag VARCHAR`。
-   - `asset_sync_metadata` 与 `intraday_sync_metadata` 元数据表同步增加 `adjustflag VARCHAR` 列。
-   - 新增专用复权因子表 `adjust_factors`：
+1. **DuckDB 底座 Schema 扩展与幂等迁移 (M3.6)**（**2026-10-27 评审修复后已按代码实况改正**）：
+   - **日线只加 `amount`，不是 "amount + adjustflag"**：`ohlcv_bars` 的实际 DDL（`common/duckdb_cache.py:1162-1172`）只有 `provider / symbol / date / open / high / low / close / volume / amount DOUBLE`，**没有 `adjustflag` 列**。日线的复权基是**表级（per provider+symbol）**的，存在 `asset_sync_metadata.adjustflag`；`_ensure_column` 也只给 `ohlcv_bars` 加 `amount`（`:1281`）。
+   - **行级 `adjustflag` 只存在于 5m**：`intraday_ohlcv_bars` 确有 `amount DOUBLE` 与行级 `adjustflag VARCHAR`（`:1186-1198`），`intraday_sync_metadata` 也有 `adjustflag`（`:1201-1211`）。但**读路径从不 SELECT 那一列**（派生只看表级元数据 + `adjust_factors`），所以「同一张表混多种复权基」在**任何一侧都不可表达** —— 日线由表级元数据天然单一，5m 的行级列是写侧留痕、不是读侧语义。旧文本把它写成「两表统一扩展 `adjustflag VARCHAR`」是把 5m 行级列误记到了日线表上。
+   - `amount DOUBLE` 可为空，严格区分 `0.0`（真零成交额）与 `NULL`（未采集），杜绝用 `volume × close` 污染成交额。
+   - 新增专用复权因子表 `adjust_factors`（**只有后向因子，没有 `factor_qfq` 列**）：
      ```sql
      CREATE TABLE IF NOT EXISTS adjust_factors (
          symbol VARCHAR NOT NULL,
@@ -3462,33 +3476,121 @@ exit: 1
      );
      CREATE INDEX IF NOT EXISTS idx_adjust_factors_lookup ON adjust_factors(symbol, date);
      ```
+     实际 DDL 只有 `(symbol, date, factor_hfq, source, last_sync_time)`。**`factor_qfq` 不存在于任何表**：`factor_qfq = factor_hfq[t] / factor_hfq[latest]` 是**读时推导量**（`_apply_factors_to_df` 的 `hfq_t / divisor`，`common/duckdb_cache.py:2687+`），落库既不必要也不该有（它随最新分红天天变，落库就重新引入「历史被改写」这条根因）。早期规划文本（`docs/development_plan.md` `M3.8` 第 2 条）写的 `adjust_factors(symbol, date, factor_qfq, factor_hfq, source)` 是**未实现的设计草案**，以本节为准。
    - 在 `DuckDBCache._apply_migrations` 中加入幂等 `_ensure_column`，保证既有生产数据库零停机平滑升级。
 2. **存储与计算维度彻底解耦：双轨不可变存储 (Dual-Track Raw Storage)**：
-   - 日线与 5 分钟线数据入库遵循**「只存 Raw 不可变数据」**原则（存储 `adjustflag='3'` 或 `none`）。
+   - 日线与 5 分钟线数据入库遵循**「只存 Raw 不可变数据」**原则。写入端落库的基标签是 `canonicalize_adjust_mode` 归一化后的受控词表 `raw` / `qfq` / `hfq`（`none` / `3` / `unadjusted` → `raw`，`2` / `forward` → `qfq`，`1` / `backward` → `hfq`），**另加未声明 sentinel `"unknown"`**（见第 7 条）。旧文本写「存储 `adjustflag='3'` 或 `none`」不准确 —— `"3"`/`"none"` 是**外部 provider 的原生拼写**，库里存的是归一化后的 `raw`。
    - 任何分红派息或拆细除权均不改变历史 raw 成交价，写入端不再发生历史价格被改写，**从数学上彻底根除 `HistoryRewriteRefused` 门禁冲突**。
 3. **读时内存向量化动态派生 QFQ/HFQ (In-Memory Vectorized Derivation)**：
-   - 在 `DuckDBCache`（`query_bars`、`query_intraday_bars`、`get_bars`、`query_universe`、`query_intraday_universe`）与 `common/data.py`（`CachedDataProvider.get_bars`）中植入动态复权逻辑：
+   - 在 `DuckDBCache`（`query_bars`、`query_intraday_bars`、`query_universe`、`query_intraday_universe`）与 `common/data.py`（`CachedDataProvider.get_bars`）中植入动态复权逻辑：
      - 当调用方请求 `adjust="qfq"` 或 `adjust="hfq"` 时，引擎自动从 `adjust_factors` 表检索对应标的的因子序列；
      - 采用 Pandas/NumPy 向量化对其应用因子缩放：价格列（`Open`, `High`, `Low`, `Close`）乘以对应复权因子；
      - 对 5m 等日内高频分时，将因子按交易日广播映射至各根 bar，实现盘中与跨日统一派生。
+   - **向量化实现（评审修复 F5，已落地）**：`_apply_factors_to_df` 现用 `np.searchsorted(event_days, bar_days, side="right") - 1` **一次性广播**出全序列的 as-of 因子（原实现是逐 bar 的 Python `bisect` 循环 —— 1.23M 根 5m bar 就是 123 万次迭代，且跑在热读路径上）。等价性由 `pipeline/tests/test_adjust_factor_derivation.py::test_apply_factors_vectorised_equivalence` 钉死（`side="right" - 1` 就是 `bisect_right(...) - 1`，`-1` 分支就是老的「早于首个因子日 → 1.0」分支，逐元素除法仍是同一 IEEE double 除法，只是广播）。
+   - **单一锚点（评审修复 F5）**：锚点统一为 `get_latest_factor_hfq(symbol)`（整张表的最新因子）。原 `_apply_factors_to_df` 还有个 `factors=` 形参，它把 QFQ 归一锚定在**传入帧的最后一行** `event_hfq[-1]`，与主路径的整表 anchor 不同 —— 同一个量两个 anchor，窗口化读与全区间读会不一致。该形参四个调用点全部传 `None`（死分支），故**直接删除**而非「统一」：现在只有一个 anchor。
+   - **如实披露（收益 vs 可复现性）**：qfq 锚定「全表最新因子」对**收益率序列没有影响** —— 整段序列被同一个乘性常数相除，比值、Sharpe、CAGR、权重解算全部不变。它影响的是 qfq 的**绝对价格**：一旦发生新分红，历史上每一根 qfq bar 的价格都会按新 anchor 重新标定。这是**可复现性风险**（同一条命令在不同日期跑出不同的 qfq 绝对价、不同的整手取整结果），**不是前视偏差**（anchor 取自 `date <= bar_date` 的 as-of 查找之外的「最新值」，且新因子只在除权后才存在于表中）。任何依赖 qfq **绝对价**的结论（整手/最小价位取整、报告里的价格展示、与外部 qfq 序列逐 bar 比价）都须记录取数日期或改用 `raw` + 因子自行派生。
 4. **量额不变性物理约束 (Volume & Amount Invariant Preservation)**：
    - 严格遵循真实成交物理量守恒定律：`Volume`（成交股数）与 `Amount`（成交金额）在复权派生过程中**绝对不参与因子乘除，保持原始真实成交量额不变**。
    - 彻底纠正了部分第三方数据源错误缩放 Volume 导致 VWAP 与筹码分布计算失真的缺陷。
-5. **因子自校准与 SDK 集成**：
-   - 在 `common/financial_api.py` 中实现 `calibrate_adjust_factors_from_closes(raw_close, qfq_close)`，支持利用 raw 与 qfq 收盘价比值自动反推出精确无偏的复权因子；
-   - `MarketDBDataProvider` 与 `BaoStockDataProvider` 提供 `fetch_adjust_factors` 接口，无缝支持稠密日频因子与事件因子的自动落库。
+5. **因子自校准与 SDK 集成**（**名称按代码实况改正**）：
+   - 在 `common/financial_api.py` 中实现 `calibrate_adjust_factors_from_closes(raw_close, qfq_close)`（`:286`），支持利用 raw 与 qfq 收盘价比值自动反推出精确无偏的复权因子；
+   - provider 侧接口是 **`MarketDBDataProvider.fetch_adjust_factors`（`:538`）** 与 **`BaoStockDataProvider.fetch_adjust_factors`（`:1493`）**，无缝支持稠密日频因子与事件因子的自动落库。**`common/financial_api.py::get_adjust_factors` 这个符号不存在**（早期文本有误）；缓存侧对应的是 `DuckDBCache.store_adjust_factors`（`common/duckdb_cache.py:2438`）/ `query_adjust_factors`（`:2517`）/ `get_latest_factor_hfq`（`:2504`）。
+6. **读路径列契约（评审修复 F6）**：`query_bars` / `query_intraday_bars` / `query_universe` / `query_intraday_universe` 均新增 `columns: Optional[Sequence[str]] = None`。**默认只返回 `_REQUIRED_OHLCV_COLUMNS`（`Open`/`High`/`Low`/`Close`/`Volume`），不含 `Amount`** —— 一条缓存读的返回形状不得因为**另一个标的**恰好有成交额而改变。`columns="all"` 才追加 `Amount`；显式列表则原样返回；请求了表里没有的列**抛 `ValueError`**（静默丢弃会让调用方以为自己拿到了那一列）。`load_universe(...)` 的默认值是 `columns="all"`（`common/data.py:1467`），因为 `run_allocation_backtest` 的 `execution_price="next_vwap"` 需要 `VWAP` 或 `Amount` + `Volume`；一旦缺列，该模式**响亮失败**，绝不退化为 open/close。
+7. **新增异常与 fail-closed 语义（评审修复 P1/P2）**：
+   - `UnknownAdjustBasisError`（读侧）：`asset_sync_metadata.adjustflag` / `intraday_sync_metadata.adjustflag` 为 SQL NULL（M3.6 迁移前的 legacy 行）**或** sentinel `"unknown"`（现代写入但未声明基）时，非因子中性标的的读一律拒绝，需显式 `allow_legacy_basis=True`（一次告警后放行）。
+   - `AdjustBasisTransitionRefused`（元数据 upsert 侧）：已存在的基为 NULL/sentinel 时，新的写入**不得**把基改成 `raw`/`qfq`/`hfq`（那等于给一整段含义不明的价格贴标签），需显式 `allow_basis_transition=True`（审计性逃生门）。
+   - `AdjustBasisRequiredError`（写侧）：非中性标的 `store_bars(..., adjustflag=None)` 被**拒绝**，需显式 `allow_undeclared_basis=True`（此时写入 sentinel `"unknown"`，此后每次读都 fail-closed，直到人工声明）。**省略不等于声明。**
+   - **provider 能力缺口不是错误、但必须不说谎**：既有 `fetch_raw_ohlcv` 又没有 `fetch_adjust_factors` 的 provider（`FuyaoDataProvider` / `EastMoneyDataProvider`）回退到它自己的 `fetch_ohlcv`（即 legacy 直连）并**每个 provider 告警一次**（`common/data.py:724` 的 `_warn_factor_capability_gap`）—— 不写 raw、不写因子、不做任何读时派生，请求别的基就响亮失败。修复前这条路径是 `MissingAdjustFactorsError` 被 `warnings.warn` + skip 吞掉，表现为**静默变小的 universe**。
+   - `fetch_universe` 对三类基口径异常（`MissingAdjustFactorsError` / `UnknownAdjustBasisError` / `AdjustBasisTransitionRefused`）**先全量收集再一次性抛错**（`common/data.py:1190+`），报错里点名每一个受影响的 symbol 并把首个失败链为 `__cause__`。22 只的 book 有 6 行坏料时，一次运行就给全整份修复清单，而不是六次各自停在下一个坏标的上。
+   - **运行时开关 `derive_mode`**：`CachedDataProvider(..., derive_mode="auto"|"direct")`。`"auto"`（默认）走「存 raw + 因子、读时派生」；`"direct"` 永不调 `fetch_raw_ohlcv`、永不写 `adjust_factors`，且**读侧也拒绝**服务派生基（对已存 raw 的标的返回错误而非静默换基）。取值在构造时即校验，拼错**不会**被当成 `auto`。
+8. **运维脚本两件（本节原未记载）**：
+   - `scripts/migrate_adjust_basis.py`（新增，**默认只读**）：无参数等同 `--dry-run`，列出所有「有 bar 行但基未声明（NULL 或 `"unknown"`）」的 `(provider, symbol[, interval])` 与行数；`--set-basis raw|qfq|hfq --provider P --symbol S` 只写**一行**元数据。两道守卫需 `--force` 才能越过：给**没有** `adjust_factors` 行的标的声明 `raw`（此后 `qfq`/`hfq` 读全部 fail-closed）、覆盖**已声明**的基（正确做法是重拉）。它**永不**改写/缩放/删除任何价格，**永不**从价格反推基，**永不**联网。
+   - `scripts/verify_adjust_factor_derivation.py`（M3.6 首轮已新增）：**手动**真实数据核对工具，逐 symbol 比对「缓存 raw × 派生因子」与 BaoStock 原生 `adjustflag="2"` 的 qfq bar，价格相对误差 `<= 1e-6`（`--tolerance` 可调）、`Volume` 严格相等，输出 JSON 报告；**必须联网**，按 `AGENTS.md` 的 100% 离线纪律**绝不在 pytest 中执行**。
+9. **`M3.7` 事实补记：5m 双写已消除**：`scripts/sync_china_5m_and_indices.py` 的 `sync_5m_intraday` 不再是「BaoStock 与 EastMoney 各写一份同一份 5m」，而是**每个 symbol 每轮只写一个 provider**（`target_prov`）—— BaoStock 为主，**仅当 BaoStock 返回空帧时才回退 EastMoney**，`store_intraday_bars(target_prov, ...)` 只写一次（随 `0fa81ab` 落地，提交内注释即 "no double-store"）。**如实更正**：写成「EastMoney 不再写库 / BaoStock 唯一写入」**过强** —— EastMoney 仍然是（a）BaoStock 无数据时的**回退写入方**、（b）**指数 5m** 的主写入方；本次去重去掉的是「同一 symbol 两份重叠副本」，不是把 EastMoney 从写路径移除。同脚本的结构性约束（脚本内不得直接写缓存）由 `common/tests/test_intraday_features.py::test_l2_15_script_performs_no_direct_cache_writes` 的 AST 守卫钉住；「只落一个命名空间」的期望由 `test_l2_15_5m_symbol_sync_does_not_assert_intraday_earliest_known` 隐式覆盖（断言 5m 元数据出现在 `BaoStockDataProvider` 命名空间；该用例本身并未断言 `EastMoneyDataProvider` 命名空间缺失）。同一脚本的**日线补丁路径**（`patch_equity_daily_bars` / `sync_indices_daily`）在本轮评审修复（F7）中改为构造 `EastMoneyDataProvider(adjust="none")` 与 `BaoStockDataProvider(adjustflag="3")`、走 `fetch_raw_ohlcv`，并在 `store_bars(...)` 处**显式声明 `adjustflag="raw"`**。修复前它用 qfq provider 抓数却不传 `adjustflag`，于是 QFQ 字节以「基不明」落在缓存里 —— 要么读时被 `UnknownAdjustBasisError` 拒，要么（F2 之前）在有人把它声明成 `raw` 后被因子**再乘一遍**。跨源 0.5% 抽样一致性校验与历史双份副本的破坏性清理**未落地**（见 §23.5 第 6 条）。
 
 ### 22.3 精度验收与离线测试覆盖
-1. **相对误差硬门禁对账**：
-   - 派生 QFQ 价格与权威数据源直接提供的 QFQ 价格逐 bar 比对，严格满足：
-     $$\max \left( \frac{|P_{\text{derived}} - P_{\text{direct}}|}{P_{\text{direct}}} \right) \le 10^{-6}$$
-   - `Volume` 比对严格满足 `Volume_derived == Volume_raw == Volume_direct`；`Amount` 保持无缩放。
-2. **测试套件 100% 离线通过**：
-   - `pipeline/tests/test_adjust_factor_derivation.py`（9 个专项测试全部通过）：覆盖因子数学反推恢复、日线/5m 精度硬门禁验证、成交量与金额不变性、缺失因子智能前向填充与边界资产（511880/000300 因子 1.0）测试；
-   - `common/tests/test_duckdb_cache.py`（83 个测试全部通过）：覆盖新旧 schema 兼容性、幂等迁移、复权派生集成与读写契约。
+1. **精度对账的真实地位（如实说明，勿再写成运行时门禁）**：
+   - $10^{-6}$ 相对误差 + 「≥3 只 × ≥60 个重叠交易日」的逐 bar 对账，**只存在于离线测试与手动脚本**：`pipeline/tests/test_adjust_factor_derivation.py` 的合成用例（已知除权日的日线与 5m 序列），以及 `scripts/verify_adjust_factor_derivation.py` 的手动真实数据核对。**运行时没有任何精度门禁** —— 一条真实数据跑批不会因为派生价与 provider 的 qfq 相差 3% 而停下。
+   - 替代保障是两条：**(a)** `derive_mode="auto"|"direct"` 运行时开关（`direct` 完全不派生、并在读侧拒绝派生基）；**(b)** 全部相关路径 **fail-closed** —— 缺因子抛 `MissingAdjustFactorsError`、基未声明抛 `UnknownAdjustBasisError`、未声明写入抛 `AdjustBasisRequiredError`、基变更抛 `AdjustBasisTransitionRefused`。宁可停，不给一个「看着对」的错价。
+   - 旧文本「未通过前保留直接取数兼容通道（严禁提前将派生路径设为默认）」与代码**不符**并已删除：派生路径 (`derive_mode="auto"`) **就是默认**；保留的直连通道是**显式**的 `derive_mode="direct"`，不是「派生尚未启用」的临时状态。
+   - `Volume` 比对严格满足 `Volume_derived == Volume_raw == Volume_direct`；`Amount` 保持无缩放（`test_req11_h_volume_amount_never_scaled`）。
+2. **测试套件 100% 离线通过（2026-10-27 评审修复后实跑）**：
+   - `pipeline/tests/test_adjust_factor_derivation.py` **23 passed**（初版记录 9）：覆盖因子数学反推恢复、日线/5m 精度对账、量额不变性、缺失因子 fail-closed、边界资产（511880/000300 因子 1.0）、`factor_qfq` 锚定整表最新因子、稀疏事件因子的 as-of 与前首个因子日、`np.searchsorted` 与逐 bar `bisect` 的位级等价、同一窗口/不同窗口单 anchor 一致、5m 与日线重叠日缩放因子相同、`derive_mode="direct"` 的两侧诚实性、以及 F3/P2 的能力缺口回退与 `fetch_universe` 基口径失败的**聚合抛错**。
+   - `common/tests/test_duckdb_cache.py` **100 passed**（初版记录 83）：覆盖新旧 schema 兼容性、幂等迁移、复权派生集成与读写契约以外，本轮新增 F1 legacy NULL 拒读与 `allow_legacy_basis` 放行、F2 基变更拒绝（日线 + 5m 两条）、F6 列契约（日线 + 5m）、F1 迁移脚本的 dry-run→声明两步与「绝不凭空造元数据行」、P1 未声明写入需 opt-in 且此后读 fail-closed、P1 sentinel→已声明受 `allow_basis_transition` 门禁、P1 CSV 迁移写 `qfq` 而非 sentinel、P2 迁移脚本两道 `--force` 守卫、F1 `query_universe` 的 legacy NULL 分支、以及 P2「`next_vwap` 经 `load_universe` 默认 `columns="all"` 仍可用」。
+   - `common/tests/test_intraday_features.py` **43 passed**（同批复核，本轮随 `adjustflag` 必填而统一在 fixture 里显式声明基）。
 
 ### 22.4 版本轴判定
-- 本项改动完全属于基础设施数据存储与查询派生层（`common/duckdb_cache.py`、`common/data.py`、`common/financial_api.py`），未修改任何策略类或 `BaseBlendAllocationStrategy` 的模型逻辑，不触碰策略信号与默认超参。
-- 依照 `AGENTS.md` 第 7 条规范，**不递增 `version` 或 `BASE_VERSION`，无需重新运行 `--dump-strategies`**。
+- 本项改动完全属于基础设施数据存储与查询派生层（`common/duckdb_cache.py`、`common/data.py`、`common/financial_api.py`）与运维脚本（`scripts/migrate_adjust_basis.py`、`scripts/verify_adjust_factor_derivation.py`、`scripts/sync_china_5m_and_indices.py`），未修改任何策略类或 `BaseBlendAllocationStrategy` 的模型逻辑，不触碰策略信号与默认超参。
+- 依照 `AGENTS.md` 第 7 条规范，**不递增 `version` 或 `BASE_VERSION`，无需重新运行 `--dump-strategies`**。2026-10-27 的评审修复（P1/P2 共十余项）同样**只**改了上述数据层与测试，`git diff` 对 `pipeline/research/blend`、`pipeline/research_strategy/rs`、`common/allocation_templates.py` 为空，故**仍不升版、仍不重跑 `--dump-strategies`**；`strategy_dumps/*.json` 与实盘票据的 `strategy_version` / `base_version` 均不受影响。
 
 
+---
+
+## 23. M3.8 与 L2.48 评审修复（P1/P2 收口，2026-10-27）
+
+> 本节是 2026-10-27 对 **`M3.6`/`M3.8`（双轨 raw 存储 + 读时复权派生）** 与 **`L2.48`（UPLSM 回测同源启用）** 第一轮落地的**评审修复**留痕。§21 / §22 已就地改准（保留原文历史说明，只在尾部追加「评审修复 Fx」条目），本节按评审清单把「问题 → 修法 → 验收 → 残余」串成一条可复核的链。**本节不重复 §21/§22 的逐条实现描述**，只记录修复项本身。
+
+### 23.1 范围与结论
+
+- **两个被评审对象**：`L2.48`（`common/position_lifecycle.py` + `common/allocation_backtester.py` + `backtester/run_backtest.py` + `pipeline/parity_harness.py` + 三个调用方）与 `M3.6`/`M3.8`（`common/duckdb_cache.py` + `common/data.py` + `common/financial_api.py` + 三个脚本）。
+- **结论**：评审提出的 P1/P2 项**全部落地**，8 个目标测试文件全绿（合计 **363 passed**，逐文件数字见 §23.4）。同时有 **5 项残余**如实留在 §23.5，其中 2 项是刻意的行为差异（不是缺陷）、2 项是口径差异（必须靠文档而不是代码消除）、1 项是可复现性风险（qfq 绝对价重标定）。
+- **版本轴**：**未 bump 任何 `version` / `BASE_VERSION`，未重跑 `--dump-strategies`**。理由：`git diff` 对 `pipeline/research/blend/*`、`pipeline/research_strategy/rs/*`、`common/allocation_templates.py` 为空 —— 无策略类、无模板类、无信号计算、无默认超参、无子策略 composition 变化，`AGENTS.md` §7 的两条升版触发条件都不成立（详见 §23.6）。
+
+### 23.2 `L2.48` 评审修复清单
+
+| # | 级别 | 问题（修复前实况） | 修法 | 钉住它的测试 |
+|---|---|---|---|---|
+| F1 | P1 | `--enable-position-lifecycle` 是 `store_true` + `default=True` 的**恒真死开关**；provenance 无法区分「显式要求 ON」与「没说」 | `default=None` + `normalize_position_lifecycle_flag`（`backtester/run_backtest.py:121`）在 `_PositionLifecycleArgumentParser.parse_args()` 内归一化为 `True`；反向旗标改用独立 dest `no_position_lifecycle`，`--no-` 恒胜且与顺序无关 | `test_cli_flags_in_run_backtest_and_run_pipeline` |
+| F1 | P1 | `PositionLifecycleConfig` 与 resolver 的默认值**不等于实盘**（`normal_cooldown_bars=1` vs 实盘 2、`inertia_relative_ratio=0.50` vs 实盘 0.0、dataclass `min_holding_bars=1` vs 实盘 2） | 五处默认值逐项对齐 `scripts/run_live_strategy.py:1538-1573` | `test_position_lifecycle_config_dataclass_defaults_are_the_live_ones`、`test_resolve_position_lifecycle_config_matches_live_deployment_defaults` |
+| F2 | P1 | resolver 只认 `lifecycle_<field>`，策略自带的实盘键（`reentry_cooldown_bars` / `min_hold_bars` / `min_entry_bars` / `cfsb_inertia_relative_ratio`）在回测里**静默回落默认值**，无告警 | 五级优先级 + 实盘裸键别名；别名解析直接 import 实盘四个 resolver（`_live_param_resolvers`，惰性 import 破环），不复制优先级 | `test_resolver_accepts_live_keys_as_aliases_of_the_lifecycle_prefix` |
+| F3 | P1 | `lifecycle_records`（逐 `(date, symbol)` 的 BUY/SELL/HOLD 与 `blocking_reason`）算出后**被所有产物写入器丢掉**：操作者能看到 `rebalance_report.csv` 里的 SELL，永远看不到前几日门禁为何拦住 | 新增 `LIFECYCLE_RECORD_COLUMNS` / `lifecycle_records_to_frame`（`backtester/run_backtest.py:950/965`），标准模式落 `lifecycle_records.csv`、walkforward 落 `walkforward_lifecycle_records.csv`（带 `fold` 列）；`folds_clean` 在构建任何既有产物前剔除该键 | `test_standard_writes_lifecycle_records_csv`、`test_walkforward_writes_lifecycle_records_csv`、`test_no_lifecycle_records_csv_when_layer_disabled`、`test_run_standard_warmup_window_keeps_lifecycle_records` |
+| F4 | P1 | `run_allocation_backtest` 把**空** `lifecycle_records` 也当「调用方已仿真」直传，返回原始未过滤权重却报 `position_lifecycle_enabled=True` | 只有**非空**才直传；空/`None` 落入仿真；字段改为 `enable_position_lifecycle and lifecycle_simulated` | `test_empty_lifecycle_records_runs_the_simulation_instead_of_bypassing_it`、`test_non_empty_lifecycle_records_are_passed_through_without_second_filtering` |
+| F4 | P1 | 日期键格式不一致（`'2021-12-06'` vs `'2021-12-06 00:00:00'`）使 `eval_records` **恒空**；F4 之后就暴露为「对已过滤权重二次仿真、fold day-0 被清零」 | `_normalise_day_keys`（`:154`）+ `_lifecycle_records_in_window`（`:190`），`run_standard` 与 `_evaluate_walkforward_fold` 两处复用同一函数 | `test_walkforward_fold_weights_are_simulated_exactly_once`（`backtester/tests/test_run_backtest.py`） |
+| F4 | P1 | `verify_lifecycle_step_parity` / `verify_lifecycle_path_parity` 在**没有实盘侧输入**时返回 `parity=True` —— 拿仿真与仿真自己比，假阳性 | 三值判定 `ALIGNED`/`DIVERGED`/`INCONCLUSIVE`；无 `live_decision` / `live_decisions` 即 `INCONCLUSIVE`、`parity=False`；新增 `replay_mismatches` 与 `live_records_checked` 两个独立通道 | `test_verify_lifecycle_step_parity_without_live_decision_is_inconclusive`、`test_lifecycle_path_parity_multi_day`、`test_parity_harness_verify_lifecycle_step_parity` |
+| F5 | P2 | `cash_proxy` 不在 `target_weights` 列里时**静默无事发生**（残留现金没有停泊，状态机却报已运行） | 每次调用告警一次（`RuntimeWarning`），并在 docstring 里披露「现金腿对状态机豁免、但对成本不豁免」 | `test_simulate_position_lifecycle_warns_once_when_cash_proxy_is_not_in_the_universe` |
+| F2 | P2 | `pipeline/parity_harness.py` 三处（`:59` / `:1021` / `:1253`）写「the backtester has no lifecycle layer」，接线后已失真 | 全部改写为「本次重放把生命周期层钉成 OFF（归档账本本就是实盘已过生命周期的账本，重套一遍等于算两次）」，并在 `run_replay` 的 `run_allocation_backtest(...)` 调用处**显式**写 `enable_position_lifecycle=False` | `test_gate_rows_are_listed_separately_and_never_aligned` |
+| F2 | P2 | `pipeline/run_pipeline.py` 只把 `--no-position-lifecycle` 传给 Step 5，Step 1（`research_strategy` 的 `BACKTEST RESULTS`）仍是 ON ⇒ 一条命令打印两个不同纪律的数字 | 反向旗标同时传给 Step 1 与 Step 5；`research_strategy` / `selectorbot/strategy_fit.py` 改为**显式** ON 并各带逃生门；`stratgen/generator.py` 的候选搜索**显式** OFF | `test_cli_flags_in_run_backtest_and_run_pipeline`（pipeline 侧旗标） |
+
+### 23.3 `M3.6`/`M3.8` 评审修复清单
+
+| # | 级别 | 问题（修复前实况） | 修法 | 钉住它的测试 |
+|---|---|---|---|---|
+| P1 | P1 | `store_bars(..., adjustflag=None)` 是**合法静默默认**：字节入库但基未声明，读侧无从判断，F1/F2 的危险被搬到「新写入的行」上 | 新增 `AdjustBasisRequiredError`：非中性标的省略基一律拒绝；`allow_undeclared_basis=True` 才写入 sentinel `"unknown"`，且读侧与 NULL **同等** fail-closed | `test_p1_undeclared_write_requires_opt_in_and_reads_fail_closed` |
+| P1 | P1 | 元数据 upsert 的 `COALESCE(excluded.adjustflag, existing.adjustflag)` 允许把「基不明」的行**贴标签**成 `raw`/`qfq`/`hfq` | 新增 `AdjustBasisTransitionRefused`：NULL/sentinel → 已声明必须显式 `allow_basis_transition=True`（审计性逃生门） | `test_p1_sentinel_to_declared_basis_is_gated`、`test_f2_basis_transition_refused_on_legacy_rows`、`test_f2_intraday_basis_transition_refused` |
+| P1 | P1 | 早期文档把 provider 侧的因子接口写成 `common/financial_api.py::get_adjust_factors` —— **该符号根本不存在** | 文档改为 `MarketDBDataProvider.fetch_adjust_factors`（`:538`）/ `BaoStockDataProvider.fetch_adjust_factors`（`:1493`）+ 缓存侧 `store_adjust_factors` / `query_adjust_factors` / `get_latest_factor_hfq` | `test_marketdb_fetch_adjust_factors_integration`、`test_req11_e_baostock_parsing_fake_twopage_real_field_names` |
+| P2 | P2 | 无 `adjust_factors` 行的标的被声明 `raw` 时无人拦；覆盖已声明基也无人拦 | `scripts/migrate_adjust_basis.py` 两道 `--force` 守卫 + 默认只读 dry-run + 绝不推价格/绝不联网 | `test_f1_migration_script_dry_run_then_declare`、`test_f1_migration_script_never_invents_a_metadata_row`、`test_p2_migration_declare_guards` |
+| P2 | P2 | `fetch_universe` 对基口径异常逐个 `warn` + 跳 symbol ⇒ **静默缩小的 universe** | 三类异常先收集、后聚合一次性抛 `RuntimeError`；能力缺口（有 `fetch_raw_ohlcv` 无 `fetch_adjust_factors`）改为回退 legacy 直连 + 每 provider 告警一次（不再 raise，因此不再被降级成跳过） | `test_f3_fetch_universe_does_not_swallow_basis_failures`、`test_p2_fetch_universe_basis_failure_aggregates_all_symbols`、`test_f3_provider_capability_gap_falls_back_to_native_basis` |
+| F5 | P2 | `_apply_factors_to_df` 逐 bar `bisect` 循环（1.23M 根 5m bar = 123 万次迭代，热读路径）；且 `factors=` 分支用另一个 anchor（`event_hfq[-1]`） | `np.searchsorted(side="right") - 1` 一次性广播；`factors=` 死分支**删除**（四个调用点全传 `None`）；anchor 单点为 `get_latest_factor_hfq` | `test_apply_factors_vectorised_equivalence`、`test_apply_factors_single_anchor_across_windows`、`test_5m_and_daily_overlap_scaling_factor_identical` |
+| F6 | P2 | 返回列形状**随磁盘上是否有 amount 而变**（同一调用两次跑出不同列集） | `columns=` 契约：默认仅 `_REQUIRED_OHLCV_COLUMNS`（无 `Amount`）、`"all"` 追加、显式列表原样、缺列抛 `ValueError`；`load_universe` 默认 `"all"`（`next_vwap` 依赖） | `test_f6_columns_contract_daily_and_intraday`、`test_p2_next_vwap_works_through_load_universe_default_columns` |
+| F1 | P2 | legacy NULL 行的读被当成「原样返回」（QFQ 字节可以答 `raw` 请求） | `UnknownAdjustBasisError` + `allow_legacy_basis=True`（一次告警）；因子中性标的豁免 | `test_f1_legacy_null_basis_refused_and_opt_in_warns`、`test_f1_factor_neutral_symbol_exempt_from_null_refusal`、`test_f1_query_universe_legacy_null_branch` |
+| F7 | P2 | `scripts/sync_china_5m_and_indices.py` 的日线补丁用 **qfq** provider 抓数却**不传** `adjustflag` ⇒ QFQ 字节以基不明入库 | 构造 `adjust="none"` / `adjustflag="3"` + 走 `fetch_raw_ohlcv`，`store_bars(...)` 显式 `adjustflag="raw"`（`sync_indices_daily` 与 `patch_equity_daily_bars` 两处） | 无独立单测（脚本级、需真实数据）；见 §23.5「未覆盖」 |
+| F7 | P2 | 5m 双源双写（EastMoney 与 BaoStock 各一份 1,230,288 行，`min/max ts` 全等）尚未从脚本里消除 | 随 `0fa81ab` 落地：改为**每 symbol 每轮只写一个 provider**（BaoStock 为主，仅当其返回空帧才回退 EastMoney）。**不是**「EastMoney 只读」—— 它仍是回退写入方与指数 5m 的主写入方 | `test_l2_15_script_performs_no_direct_cache_writes`（AST：脚本内无直接写库语句）、`test_l2_15_5m_symbol_sync_does_not_assert_intraday_earliest_known`（5m 元数据落在 BaoStock 命名空间） |
+
+### 23.4 验收命令与实测通过数（100% 离线）
+
+```bash
+pipeline/.venv/bin/python -m pytest backtester/tests/test_position_lifecycle_backtest.py -q   # 16 passed
+pipeline/.venv/bin/python -m pytest backtester/tests/test_run_backtest.py -q                  # 71 passed
+pipeline/.venv/bin/python -m pytest pipeline/tests/test_parity_harness.py -q                  # 35 passed
+pipeline/.venv/bin/python -m pytest common/tests/test_position_lifecycle.py -q                # 45 passed
+pipeline/.venv/bin/python -m pytest common/tests/test_allocation_backtester.py -q             # 30 passed
+pipeline/.venv/bin/python -m pytest pipeline/tests/test_adjust_factor_derivation.py -q        # 23 passed
+pipeline/.venv/bin/python -m pytest common/tests/test_duckdb_cache.py -q                      # 100 passed
+pipeline/.venv/bin/python -m pytest common/tests/test_intraday_features.py -q                 # 43 passed
+```
+
+合计 **16 + 71 + 35 + 45 + 30 + 23 + 100 + 43 = 363 passed**，0 failed、0 skipped，全程合成数据、无网络访问。
+
+### 23.5 残余与未闭合（如实披露，不美化）
+
+1. **`min_entry_threshold` 未与实盘对齐**：回测侧默认 `None`，实盘回落 `0.05`。刻意的行为差异（采纳它会对所有未设置该字段的回测静默收紧入场门），由 `test_resolve_position_lifecycle_config_matches_live_deployment_defaults` 把 `None` 钉住。**这不是 bug，但是一处「同名不同义」**，任何跨引擎比 `min_entry_threshold` 的讨论必须先确认两边的有效值。
+2. **搜索口径 OFF / 回测口径 ON 并存**：`stratgen/generator.py` 的候选排名是 OFF 纪律下的数字，最终呈现是 ON 纪律。两者**不可比较**，且 strategy_generator 打印的排名分**不是**绩效。文档已写死这一点，但代码里没有任何断言能阻止有人误用 —— 只能靠评审。
+3. **`derive_mode` 未接 CLI**：它只是 `CachedDataProvider(..., derive_mode=...)` 的构造参数，`common/data.py::load_universe` 没有暴露它，任何命令行跑批都只能拿到默认 `"auto"`。要跑 `"direct"` 目前只能写 Python。**这是一处真实的能力缺口**，不是文档遗漏。
+4. **`lifecycle_records` 只在 ON 时落盘**：OFF 运行不写任何决策日志。因此「OFF 那一次为什么没换仓」在产物层面**不可回答**（只能靠 `rebalance_report.csv` 的缺席反推）。这是刻意选择（空文件与「跑了但没交易」不可区分），但代价是 OFF 臂的可观测性为零。
+5. **qfq 绝对价随新分红重标定**：qfq 锚定全表最新因子，**收益序列不受影响**（乘性常数约去），但 qfq 的**绝对价格**会随每一次新分红重标定 ⇒ 同一条命令在不同日期跑出不同的整手取整结果与不同的价格展示。属**可复现性风险**，不是前视。凡引用 qfq 绝对价的结论须注明取数日期，或改用 `raw` + 因子自行派生。
+6. **未覆盖的验证（明确标为「未能核实」）**：`scripts/sync_china_5m_and_indices.py` 的日线补丁 raw 化（F7）与 `scripts/migrate_adjust_basis.py`、`scripts/verify_adjust_factor_derivation.py` 对**真实缓存/真实上游**的行为，本轮无离线测试覆盖（前者是脚本级编排、后两者需要真实 DuckDB 或联网）。它们的正确性目前只由代码 review 与（`migrate_adjust_basis.py` 的）`tmp_path` 合成用例支撑。
+
+### 23.6 版本轴与台账
+
+- **未 bump `version`，未 bump `BASE_VERSION`，未重跑 `--dump-strategies`**。判定依据（`AGENTS.md` §7）：`git diff --stat` 显示本轮改动集中在 `backtester/`、`common/{position_lifecycle,allocation_backtester,data,duckdb_cache,financial_api}.py`、`pipeline/parity_harness.py`、`pipeline/run_pipeline.py`、`pipeline/research_strategy/run_research_strategy.py`、`pipeline/strategy_generator/stratgen/generator.py`、`pipeline/instrument_selection/selectorbot/strategy_fit.py`、`scripts/*` 与各自的 `tests/`；对 `pipeline/research/blend/*`、`pipeline/research_strategy/rs/*`、`common/allocation_templates.py` **零改动**。无策略类逻辑、无信号计算、无参数默认值、无子策略 composition 变化 ⇒ §7 的两条升版条件均不成立。`strategy_dumps/*.json` 逐字节未动，实盘票据的 `strategy_version` / `base_version` 不受影响，`cfsb` 的部署钉住值 `regime_ic_ir_hybrid` 原样未动。
+- **台账**：`L2.48` 保持 `[x]`（本轮为同一任务的**评审修复**，不新增、不改写任务行）；`M3.6` / `M3.8` 保持 `[x]`（同上）；`M3.7` 由 `[ ]` 翻为 **`[x]`**（5m 单一权威源去重随 `0fa81ab` 落地 + 日线补丁 raw 化随本轮完成，闭环日 2026-10-27）。现役 **108 项 = 72 `[x]` + 36 `[ ]`**，两文件合计 **174 = 66（归档）+ 72 + 36 = 138 `[x]` + 36 `[ ]`**。逐表核算见 [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) §二 头部计数口径行。

@@ -581,8 +581,8 @@ run_arm no_circuit
 - **两阶段运行清单**：`run_manifest.json`（Git 提交哈希、数据缓存指纹、产物清单与指标）
 - **过程执行日志**：`run.log`（含数据截断、对齐、分位计算等过程告警）
 - **指标与序列数据**：
-  - standard 模式：`backtest_equity.csv`、`backtest_weights.csv`、`rebalance_report.csv`、`baseline_equity.csv`（若有）、`comparison_report.json`、`equity_curve.png`
-  - walkforward 模式：`walkforward_summary.json`、`walkforward_report.csv`、`walkforward_weights.csv`、`walkforward_rebalances.csv`
+  - standard 模式：`backtest_equity.csv`、`backtest_weights.csv`、`rebalance_report.csv`、`baseline_equity.csv`（若有）、`lifecycle_records.csv`（FSM 开启时）、`comparison_report.json`、`equity_curve.png`
+  - walkforward 模式：`walkforward_summary.json`、`walkforward_report.csv`、`walkforward_weights.csv`、`walkforward_rebalances.csv`、`walkforward_lifecycle_records.csv`（FSM 开启时；每 fold 前置 `fold` 列）
 
 从这些落盘产物中可萃取出三个核心行为视角：
 
@@ -620,7 +620,11 @@ run_arm no_circuit
 1. **Round 1 的 `max_drawdown` 若四折全 < 0.10，不得据此断言"熔断有效/无效"。** 只能说明**该 universe 该区间不可达**（§3 已用代理独立证伪）。要判熔断，走 `L2.50` 的离线合成压力带。
 2. **2b 与归档 15 折只能并排陈述，不得合并求均值。** 时间段不同（2025-01-02→2026-07-27 vs 2022-01-04→2025-11-27，仅 2025-01-02→2025-11-27 重叠），合并即口径污染。
 3. **差异小于噪声下限即判"不可判定"。** 门槛：折间收益相关 0.80–0.98、折均值 Sharpe t=2.13–2.65、策略间配对 t≤1.04（`docs/audit/blend_17_baseline_审计_20261024.md` §0.4、§4.2）。ablation 的"某臂 Sharpe +0.03"属于此类。
-4. **版本轴 / 语义边界**：本文全部命令组（含解剖 / 归因）当前跑的都是 **FSM（`common/position_lifecycle.py`）关闭**的语义——`backtester/` 与 `common/allocation_backtester.py` 对 `step_position_lifecycle` / `PositionLifecycleConfig` **零引用**（`docs/development_plan.md` `L2.48` 第 1 条已实测留痕）。`L2.48` 按"**默认 ON**"落地后，**同样的命令会给出不同数字**，届时必须加 `--no-position-lifecycle` 才能复现本文数字；**任何跨这条边界的比较都无效**。
+4. **版本轴 / 语义边界（2026-10-27 更新，原文已过期）**：本文全部命令组（含解剖 / 归因）记录的数字，是 **FSM（`common/position_lifecycle.py` 的 UPLSM）关闭**时的语义 —— 写作当时 `backtester/` 与 `common/allocation_backtester.py` 对 `step_position_lifecycle` / `PositionLifecycleConfig` **零引用**（`docs/development_plan.md` `L2.48` 第 1 条已实测留痕）。**该状态已结束**：`L2.48` 已按「默认 ON」落地（2026-10-27），`backtester/run_backtest.py` 的手臂现在是共享同一套状态机。因此：
+   - **同样的命令会给出不同的数字**（开仓确认延迟、T+1 锁仓、非对称冷却、-8% 硬止损 / ATR 吊灯止损快路径全部真实生效，换手与持仓周期会变）；
+   - **复现本文旧数字必须加 `--no-position-lifecycle`**（`--disable-position-lifecycle` 同义），该路径下既有标量与曲线**比特级不变**；
+   - **任何跨这条边界的比较都无效**（ON 臂与 OFF 臂之间、本文旧数字与新跑数字之间）。
+   - **同一仓库内当前并存三种开关口径，引用数字前必须先认清是哪一种**：①**搜索口径 OFF** —— `pipeline/strategy_generator/stratgen/generator.py` 的候选排名在 `enable_position_lifecycle=False` 下打分（保持不受约束的搜索景观，避免状态掩蔽造成候选间不对称），**这个分数不是绩效**；②**基线口径 OFF** —— `_run_baseline` 恒 `enable_position_lifecycle=False`（基准臂要的是不受策略风控影响的市场参照）；③**最终回测口径 ON** —— `backtester/run_backtest.py`、`pipeline/research_strategy/run_research_strategy.py` 与 `pipeline/instrument_selection/selectorbot/strategy_fit.py` 的默认值都是 ON，操作者读到的绩效一律出自这一口径。**跨口径比较（把搜索分当绩效、把基线臂当策略臂、把 OFF 旧数字当现值）都是无效的**；三者的逐条披露见 `docs/version.md` §21 第 9 条与 §23.2。
 5. **归因轮的 `no_circuit` 臂不能当"熔断无效"的证据。** 它把阈值推成不可达哨兵，测的是"熔断缺席时的行为"。按 `L2.50` 的 C 臂实测，A/B 差异 **100% 来自 dd ≥ 20% 的止损档**（防御桶切换 + `is_emergency` 门控），**与 `deleverage_scale` 缩放无关**——报告里必须把**止损档**与**缓降档**分列。
 
 ---
@@ -632,7 +636,7 @@ run_arm no_circuit
 | 交叉引用 | 与本文的关系 |
 |---|---|
 | `docs/backtest_research_impl.md` | 本文回测工程落盘实现与入库留档规范（Committed Artifacts Policy）SSOT |
-| `L2.48` 生命周期状态机回测同源启用 | 决定本文三套命令的**语义边界**（当前=FSM 关；落地后默认 ON，须 `--no-position-lifecycle` 才能复现） |
+| `L2.48` 生命周期状态机回测同源启用 | 决定本文三套命令的**语义边界**：本文数字是 **FSM 关**的语义；`L2.48` 已于 2026-10-27 落地为**默认 ON**，故**同样的命令现在给出不同数字**，复现本文旧数字须加 `--no-position-lifecycle`。同仓库并存三口径：**搜索 OFF / 基线 OFF / 最终回测 ON**（`docs/version.md` §21 第 9 条） |
 | `L2.50` 熔断可检验性 / 触发遥测 | §3 的负面结论与 §6.5 对照臂的服务对象；离线合成压力带是唯一可证伪通道 |
 | `L2.49` 换手率削减研究 | 「三个行为视角」第 2 条（持有天数 / 买回间隔）是它的测量入口 |
 | `L2.47` 基准臂同口径对照 | `--baseline-symbol 000300.SH` 的 `outperformance` **不是同口径超额**（基准臂刻意解除整手 / 涨跌停 / T+1 / 印花税，`run_backtest.py:952-961`），本文所有基准对比都受此限制 |
@@ -663,3 +667,7 @@ run_arm no_circuit
   3. 三条口径披露并列写入：窗口与 `06_ablate` 完全一致（差值纯为"评估模式"）；折规则与 `03` / `07` 一致（但折数 18 vs 6，不得据此称"样本更大"）；`--cash-sweep-rate 0.015` 与 `03` 的 0% 现金不同口径。
   4. §6.1 目录拓扑新增 `ABLWF`（`08_ablate_wf/<arm>/<strategy>/`）节点；命令组由 **7 组增至 8 组**，`tee ... run.log` 的命令块计数同步由 7 处增至 **8 处**（全文匹配计数含变更记录引用时为 9）。
   5. 实测发现并写入：`chan_four_state_blend` 的 `no_circuit` 臂在 standard 下与 `baseline` 逐点全等（`max|Δ| = 0`），在 walkforward 下不再全等（442 个调仓日快照中 20 个有差异，全部落在折 4，最大相对差 0.1447%）⇒ **"数值全等"≠"模块无效"**，这是"同一模块在两种评估模式下可达性不同"的实证。
+- 2026-10-27 语义边界更新（`L2.48` 落地为默认 ON）：
+  1. §9 产物清单补 `lifecycle_records.csv`（standard，FSM 开启时）与 `walkforward_lifecycle_records.csv`（walkforward，FSM 开启时，每 fold 前置 `fold` 列）；FSM 关闭的运行**不写**这两个文件。
+  2. §11 解读纪律第 4 条与 §12 交叉引用行改写：本文全部数字是 **FSM 关**的语义；`L2.48` 已默认 ON，**同样的命令会给出不同数字**，复现本文旧数字须加 `--no-position-lifecycle`（该路径标量与曲线比特级不变）；任何跨该边界的比较无效。
+  3. 同处补「**搜索口径 OFF / 基线口径 OFF / 最终回测口径 ON**」三口径说明与「跨口径比较无效」的告警（`docs/version.md` §21 第 9 条 / §23.2）。
