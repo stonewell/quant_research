@@ -11,6 +11,8 @@ Provides BaseDataProvider implementations:
 from __future__ import annotations
 
 import datetime
+import json
+import logging
 import os
 import re
 import sys
@@ -18,6 +20,7 @@ import threading
 import time
 import warnings
 from typing import Any, Dict, List, Optional, Tuple, Union
+from urllib.parse import urlsplit
 
 import numpy as np
 import pandas as pd
@@ -33,6 +36,198 @@ _INDEX_CODES = {
     "399001.SZ", "399005.SZ", "399006.SZ", "399300.SZ",
 }
 _BARE_SH_INDEX_CODES = {"000300", "000905", "000852", "000016", "000688"}
+
+_LOGGER = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------- #
+# HTTP body decode + JSON payload contract
+# --------------------------------------------------------------------------- #
+# WHY THIS EXISTS (real production incident, 2026-10-27, live Stage-1):
+# the pre-flight refresh was patching 601288.SH when the upstream answered with a
+# GBK/GB18030 *error page* instead of JSON. The body was decoded as strict utf-8 and
+# blew up with `UnicodeDecodeError: 'utf-8' codec can't decode byte 0xa1 in position
+# 2'. Two failure modes came out of that, both fixed here:
+#   1. a bare `resp.json()` / `resp.content.decode("utf-8")` has no fallback, so a
+#      Chinese error page can only ever raise;
+#   2. swallowing the resulting error (`except Exception: return empty DataFrame`)
+#      turns "the provider refused/errored" into "this symbol legitimately has no
+#      bars" -- the same silent-substitution class the 2026-10-22 stale-price
+#      incident came from. An unusable payload now raises `DataProviderPayloadError`
+#      with the URL host/path, status code, encoding actually used and the first 200
+#      characters of the body, so the caller can isolate the symbol AND say why.
+
+#: Characters of a rejected body kept in the exception message / `body_snippet`.
+PAYLOAD_SNIPPET_CHARS = 200
+
+#: Strict decoders tried in order. `gb18030` is a superset of GBK and covers the
+#: 0xA1 lead byte that broke the incident's body.
+BODY_DECODE_CHAIN: Tuple[str, ...] = ("utf-8", "gb18030")
+
+
+class DataProviderPayloadError(RuntimeError):
+    """We could not read a usable answer from an upstream provider.
+
+    Covers both shapes of the same 2026-10-27 failure:
+    - an HTTP body that is not decodable JSON (GBK/HTML error page, truncation), and
+    - a BaoStock protocol answer whose `error_code != "0"` (error page / desynchronised
+      socket / `send_msg` giving up), i.e. the transport layer itself failed.
+
+    Distinct from `ValueError('No price data returned ...')`: that one means the request
+    was understood and the answer was genuinely empty. This one means we could not even
+    read the answer, so the symbol must be reported as a *fetch failure*, never as
+    "no data".
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        url: Optional[str] = None,
+        status_code: Optional[int] = None,
+        encoding_used: Optional[str] = None,
+        body_snippet: Optional[str] = None,
+    ) -> None:
+        super().__init__(message)
+        self.url = url
+        self.status_code = status_code
+        self.encoding_used = encoding_used
+        self.body_snippet = body_snippet
+
+
+def _url_host_path(url: Any) -> str:
+    """`https://push2his.eastmoney.com/api/qt/stock/kline/get` (query string dropped)."""
+    try:
+        parts = urlsplit(str(url))
+    except Exception:  # pragma: no cover - urlsplit only raises on pathological input
+        return str(url)
+    if parts.netloc:
+        return f"{parts.scheme}://{parts.netloc}{parts.path}"
+    return str(url)
+
+
+def _decode_body(raw: Optional[bytes]) -> Tuple[str, str]:
+    """Decode a raw HTTP body. Returns `(text, encoding_used)`.
+
+    Fallback chain: `utf-8` (strict) -> `gb18030` (GBK superset) -> `utf-8` with
+    ``errors="replace"`` plus a `RuntimeWarning`. The last step is deliberately
+    lossy-but-loud instead of a crash: a caller that only wants the first 200
+    characters of an error page should still get them.
+    """
+    if raw is None:
+        return "", "utf-8"
+    if isinstance(raw, str):  # already-decoded body (some doubles expose .text only)
+        return raw, "str"
+    if not isinstance(raw, (bytes, bytearray, memoryview)):
+        raw = bytes(str(raw), encoding="utf-8", errors="replace")
+    payload = bytes(raw)
+    for encoding in BODY_DECODE_CHAIN:
+        try:
+            return payload.decode(encoding), encoding
+        except UnicodeDecodeError:
+            continue
+    text = payload.decode("utf-8", errors="replace")
+    warnings.warn(
+        f"HTTP body is neither utf-8 nor gb18030 decodable ({len(payload)} bytes); "
+        f"falling back to utf-8 with errors='replace'. First bytes: {payload[:32]!r}",
+        RuntimeWarning,
+    )
+    return text, "utf-8(errors=replace)"
+
+
+def _response_body_bytes(resp: Any) -> bytes:
+    """Raw bytes of a `requests.Response` (or a test double that only has `.text`)."""
+    raw = getattr(resp, "content", None)
+    if isinstance(raw, (bytes, bytearray, memoryview)):
+        return bytes(raw)
+    text = getattr(resp, "text", None)
+    if text is None:
+        return b""
+    return str(text).encode("utf-8", errors="replace")
+
+
+def summarize_fetch_error(exc: BaseException) -> str:
+    """One-line `TypeName: message` used in per-symbol fetch-error bookkeeping.
+
+    `DataProviderPayloadError` already carries the body snippet inside its message;
+    any other exception is rendered as-is. Both are truncated so a single poisoned
+    response cannot bloat `freshness_summary` / the run's `summary.json`.
+    """
+    text = f"{type(exc).__name__}: {exc}"
+    return text[:PAYLOAD_SNIPPET_CHARS * 2]
+
+
+def decode_json_body(
+    raw: Optional[bytes],
+    *,
+    url: Any = "",
+    status_code: Optional[int] = None,
+    context: str = "",
+) -> Any:
+    """`_decode_body` + `json.loads`, raising `DataProviderPayloadError` on non-JSON.
+
+    Parameters
+    ----------
+    raw:
+        Response body bytes (never a hard utf-8 assumption).
+    url / status_code:
+        Kept verbatim in the raised error so an operator can see *which* endpoint
+        answered with an error page.
+    context:
+        Free-form suffix (e.g. ``", symbol=601288.SH"``) appended to the message.
+    """
+    text, encoding_used = _decode_body(raw)
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError) as exc:
+        snippet = text[:PAYLOAD_SNIPPET_CHARS]
+        host_path = _url_host_path(url)
+        message = (
+            f"non-JSON payload from {host_path or '<unknown url>'} "
+            f"(status={status_code}, encoding_used={encoding_used}{context}): "
+            f"{type(exc).__name__}: {exc}; body[:{PAYLOAD_SNIPPET_CHARS}]={snippet!r}"
+        )
+        raise DataProviderPayloadError(
+            message,
+            url=str(url) if url else None,
+            status_code=status_code,
+            encoding_used=encoding_used,
+            body_snippet=snippet,
+        ) from exc
+
+
+def decode_response_json(
+    resp: Any,
+    *,
+    url: Any = "",
+    status_code: Optional[int] = None,
+    context: str = "",
+) -> Any:
+    """Parse a `requests.Response`-like object's JSON with the utf-8 -> gb18030 chain.
+
+    Real `requests` responses always expose `.content` as bytes, so the fallback chain
+    applies. A duck-typed double that only implements `.json()` (offline tests, exotic
+    clients) is handed back to that method unchanged -- that path cannot see the raw
+    bytes, so it keeps the caller's original behaviour.
+    """
+    raw = getattr(resp, "content", None)
+    if isinstance(raw, (bytes, bytearray, memoryview)):
+        return decode_json_body(
+            bytes(raw),
+            url=getattr(resp, "url", None) or url,
+            status_code=getattr(resp, "status_code", status_code),
+            context=context,
+        )
+    json_fn = getattr(resp, "json", None)
+    if callable(json_fn) and not isinstance(raw, (str, int, float, dict, list)):
+        return json_fn()
+    return decode_json_body(
+        _response_body_bytes(resp),
+        url=getattr(resp, "url", None) or url,
+        status_code=getattr(resp, "status_code", status_code),
+        context=context,
+    )
 
 
 def _resolve_financial_api_path() -> Optional[str]:
@@ -1392,6 +1587,11 @@ class BaoStockDataProvider(BaseDataProvider):
     - 180-day chunking for intraday intervals to avoid BaoStock's 10,000-row limit.
     - 17-digit time parsing (YYYYMMDDHHMMSSsss -> YYYY-MM-DD HH:MM:SS).
     - Warnings and empty DataFrame for BSE (.BJ) or index intraday queries (not supported by BaoStock).
+    - A socket `recv` timeout (`BAOSTOCK_SOCKET_TIMEOUT`, default 60s) and
+      `DataProviderPayloadError` when a chunked query fails at the protocol level
+      (`error_code != "0"`), instead of an unbounded hang / a silent empty frame.
+      See the 2026-10-27 Stage-1 incident notes in `_socket_timeout` and on the
+      `transport_errors` list below.
     """
 
     _lock = threading.Lock()
@@ -1417,6 +1617,16 @@ class BaoStockDataProvider(BaseDataProvider):
         self.adjustflag = str(adjustflag)
         self._keep_logged_in = bool(keep_logged_in)
         self._is_logged_in = False
+        #: Per-`recv` socket timeout (seconds) applied to baostock's module-level socket.
+        #: 2026-10-27: after the server answered with a GBK error page, `SocketUtil.send_msg`
+        #: swallowed the `UnicodeDecodeError` and the next `while True: recv()` never saw the
+        #: `<![CDATA[]]>` terminator again -- an unbounded hang that only ended with SIGINT
+        #: (subprocess rc=-2) and left the cache half-written. A per-recv timeout turns that
+        #: hang into an ordinary per-symbol failure that the sync loop can isolate.
+        try:
+            self._socket_timeout = float(os.environ.get("BAOSTOCK_SOCKET_TIMEOUT", "60"))
+        except (TypeError, ValueError):
+            self._socket_timeout = 60.0
         if cache is not None:
             self._duckdb_cache = cache
         elif cache_dir is not None:
@@ -1449,6 +1659,24 @@ class BaoStockDataProvider(BaseDataProvider):
             raise ImportError(
                 "baostock is required to use BaoStockDataProvider. Install it via 'pip install baostock'."
             ) from exc
+
+    def _apply_socket_timeout(self) -> None:
+        """Bound baostock's blocking `recv` (see `_socket_timeout`'s comment).
+
+        Best-effort and silent on failure: a missing/duck-typed `context.default_socket`
+        (offline test doubles, a provider that never logged in) is not an error.
+        """
+        try:
+            from baostock.common import context as _bs_context
+        except Exception:
+            return
+        sock = getattr(_bs_context, "default_socket", None)
+        if sock is None or not hasattr(sock, "settimeout"):
+            return
+        try:
+            sock.settimeout(self._socket_timeout)
+        except Exception:
+            pass
 
     def _fetch_ohlcv_internal(
         self, symbol: str, start: str, end: str, interval: str = "1d", adjustflag: Optional[str] = None
@@ -1506,6 +1734,12 @@ class BaoStockDataProvider(BaseDataProvider):
 
         bs_code = to_baostock_code(symbol)
         dfs = []
+        # 2026-10-27: a non-"0" `error_code` is a transport/protocol failure (the socket
+        # answered with an error page, a desynchronised stream, or `send_msg` gave up after
+        # swallowing a UnicodeDecodeError) -- it is NEVER "this symbol has no bars", which is
+        # `error_code == "0"` with zero rows. Collected here so a total failure can be raised
+        # as an identifiable fetch error instead of a silent empty DataFrame.
+        transport_errors: List[str] = []
 
         with self._lock:
             bs = self._get_bs()
@@ -1519,6 +1753,7 @@ class BaoStockDataProvider(BaseDataProvider):
                     )
                 if self._keep_logged_in:
                     self._is_logged_in = True
+                self._apply_socket_timeout()
             try:
                 for c_start, c_end in chunks:
                     rs = bs.query_history_k_data_plus(
@@ -1530,7 +1765,15 @@ class BaoStockDataProvider(BaseDataProvider):
                         adjustflag=req_adjustflag,
                     )
                     if hasattr(rs, "error_code") and rs.error_code != "0":
-                        warnings.warn(f"BaoStock query error: {getattr(rs, 'error_msg', '')}")
+                        msg = (
+                            f"BaoStock query error for {norm_sym} "
+                            f"(frequency={freq}, {c_start}->{c_end}): "
+                            f"code={getattr(rs, 'error_code', '?')} "
+                            f"msg={getattr(rs, 'error_msg', '')!r}"
+                        )
+                        warnings.warn(msg)
+                        _LOGGER.warning(msg)
+                        transport_errors.append(msg)
                         continue
 
                     chunk_df = None
@@ -1573,6 +1816,15 @@ class BaoStockDataProvider(BaseDataProvider):
                         pass
 
         if not dfs:
+            if transport_errors:
+                # Every chunk failed at the protocol level: report it as an unreadable
+                # answer (isolatable per symbol) rather than "no data".
+                raise DataProviderPayloadError(
+                    f"unusable BaoStock answer for {symbol} ({norm_sym}): "
+                    + " | ".join(transport_errors)[: PAYLOAD_SNIPPET_CHARS * 2],
+                    encoding_used=None,
+                    body_snippet=" | ".join(transport_errors)[:PAYLOAD_SNIPPET_CHARS],
+                )
             return pd.DataFrame(
                 columns=["Open", "High", "Low", "Close", "Volume"],
                 index=pd.DatetimeIndex([], name="Date"),
@@ -2148,13 +2400,20 @@ class EastMoneyDataProvider(BaseDataProvider):
                 index=pd.DatetimeIndex([], name="Date"),
             )
 
-        try:
-            data = resp.json()
-        except Exception:
-            return pd.DataFrame(
-                columns=["Open", "High", "Low", "Close", "Volume"],
-                index=pd.DatetimeIndex([], name="Date"),
-            )
+        # 2026-10-27: this used to be `resp.json()` inside a bare `except Exception: return
+        # empty DataFrame`. `resp.json()` decodes with the Content-Type's charset only; an
+        # HTML/GBK error page (Content-Type: text/html -> ISO-8859-1, or `application/json`
+        # with a GBK body -> strict utf-8) either raised or silently became "no data".
+        # `decode_response_json` decodes utf-8 -> gb18030 and, when the body still is not JSON,
+        # raises `DataProviderPayloadError` carrying url/status/encoding/body[:200]. The
+        # per-symbol isolation in `scripts/sync_china_5m_and_indices.py` is what keeps that
+        # from killing Stage 1, and what records it as a *fetch failure* rather than 0 bars.
+        data = decode_response_json(
+            resp,
+            url=url,
+            status_code=getattr(resp, "status_code", None),
+            context=f", symbol={symbol}",
+        )
 
         d = data.get("data") if isinstance(data, dict) else None
         klines = d.get("klines") if isinstance(d, dict) else None

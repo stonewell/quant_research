@@ -35,13 +35,14 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import logging
 import math
 import os
 import statistics
 import sys
 import time
 import warnings
-from typing import Any, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -55,8 +56,11 @@ from common.financial_api import (
     EastMoneyDataProvider,
     is_index_symbol,
     normalize_thscode,
+    summarize_fetch_error,
 )
 from common.market_clock import MARKET_CHINA, market_now
+
+_LOGGER = logging.getLogger(__name__)
 
 MAJOR_INDICES = [
     "000300.SH",  # CSI 300
@@ -382,6 +386,28 @@ def _fmt_ts(value: Any) -> str:
     if ts.hour or ts.minute or ts.second:
         return ts.strftime("%Y-%m-%d %H:%M")
     return ts.strftime("%Y-%m-%d")
+
+
+def _log_symbol_fetch_failure(interval: str, symbol: str, provider: str, exc: BaseException) -> None:
+    """Logs one isolatable per-symbol fetch failure (symbol + type + body[:200]).
+
+    2026-10-27: the daily patch loop used to swallow these with a bare
+    `except Exception: pass`, so a provider that answered with a GBK error page looked
+    exactly like "this symbol has no new bars". The warning is the operator's only trail
+    from `summary.json` back to the poisoned response.
+    """
+    body = getattr(exc, "body_snippet", None)
+    if not body:
+        body = str(exc)
+    _LOGGER.warning(
+        "market-data fetch failed: symbol=%s interval=%s provider=%s error=%s: %s; body[:200]=%r",
+        symbol,
+        interval,
+        provider,
+        type(exc).__name__,
+        str(exc)[:400],
+        str(body)[:200],
+    )
 
 
 def _close_series(frame: Any) -> pd.Series:
@@ -798,8 +824,16 @@ def sync_indices_daily(
     indices: List[str],
     start: str,
     end: str,
-) -> None:
-    """Syncs full daily bars for major indices into all 4 provider namespaces."""
+) -> Dict[str, str]:
+    """Syncs full daily bars for major indices into all 4 provider namespaces.
+
+    Returns
+    -------
+    Dict[str, str]
+        `symbol -> "<provider>: TypeName: message"` for every index whose fetches all
+        failed (a *fetch error*, not "the index has no bars"). Never raises for a single
+        index; the caller records this in Stage-1's `fetch_errors` / `freshness_summary`.
+    """
     print("\n" + "=" * 80)
     print(f"PART A.1: Syncing Major Indices Daily (1d) Bars [{start} -> {end}]")
     print("=" * 80)
@@ -808,25 +842,36 @@ def sync_indices_daily(
     em_prov = EastMoneyDataProvider(adjust="none")
 
     refusals = RefusalCollector("PART A.1 (major indices, 1d)")
+    fetch_errors: Dict[str, str] = {}
 
     try:
         for sym in indices:
             print(f"-> Syncing Index {sym} (1d)...", end=" ", flush=True)
+            attempts: List[Tuple[str, BaseException]] = []
             df_bs = pd.DataFrame()
             try:
                 df_bs = bs_prov.fetch_ohlcv(sym, start, end, interval="1d")
             except Exception as e:
+                attempts.append(("BaoStockDataProvider", e))
+                _log_symbol_fetch_failure("1d", sym, "BaoStockDataProvider", e)
                 print(f"[BaoStock failed: {e}]", end=" ", flush=True)
 
             df_em = pd.DataFrame()
             try:
                 df_em = em_prov.fetch_ohlcv(sym, start, end, interval="1d")
             except Exception as e:
-                pass
+                attempts.append(("EastMoneyDataProvider", e))
+                _log_symbol_fetch_failure("1d", sym, "EastMoneyDataProvider", e)
 
             dfs = [d for d in [df_bs, df_em] if not d.empty]
             if not dfs:
-                print("FAILED (no data from providers)")
+                if attempts:
+                    fetch_errors[sym] = "; ".join(
+                        f"{p}: {summarize_fetch_error(e)}" for p, e in attempts
+                    )
+                    print("FAILED (fetch error from every provider)")
+                else:
+                    print("FAILED (no data from providers)")
                 continue
 
             full_df = pd.concat(dfs)
@@ -894,14 +939,29 @@ def sync_indices_daily(
         bs_prov.logout()
 
     refusals.raise_if_any()
+    return fetch_errors
 
 
 def patch_equity_daily_bars(
     cache: DuckDBCache,
     stocks: List[str],
     end: str,
-) -> None:
-    """Patches lagging recent daily bars for the 22 stocks under Fuyao & MarketDB."""
+) -> Dict[str, str]:
+    """Patches lagging recent daily bars for the 22 stocks under Fuyao & MarketDB.
+
+    Per-symbol isolation (2026-10-27 Stage-1 incident): each fetch attempt is wrapped
+    individually, a failing symbol is logged (`_log_symbol_fetch_failure`) and skipped,
+    and the loop keeps going. A symbol whose providers ALL errored is returned in the
+    mapping below -- deliberately distinct from "fetched zero new bars", which stays a
+    plain `SKIPPED (no new bars)` and is not reported as a failure.
+
+    Returns
+    -------
+    Dict[str, str]
+        `symbol -> "<provider>: TypeName: message"` for every symbol that raised.
+        Empty dict on a fully clean run (the previous `None` return is implied by `{}`
+        for every existing caller).
+    """
     print("\n" + "=" * 80)
     print(f"PART A.2: Checking & Patching 22 Stocks Recent Daily Bars (-> {end})")
     print("=" * 80)
@@ -941,6 +1001,19 @@ def patch_equity_daily_bars(
 
     row_dict = {(r[0], r[1]): r[3] for r in all_rows}  # (symbol, provider) -> max_date
     refusals = RefusalCollector("PART A.2 (equity daily patch)")
+    #: symbol -> "Provider: TypeName: message" for symbols whose fetches ALL raised.
+    fetch_errors: Dict[str, str] = {}
+    #: `(symbol, provider, exception)` already warned about. The provider loop below runs
+    #: the same fetch twice (once per write namespace), so without this each failing symbol
+    #: would log its warning twice and look like two independent failures.
+    logged_failures: set = set()
+
+    def _log_once(_sym: str, _provider: str, _exc: BaseException) -> None:
+        key = (_sym, _provider, type(_exc).__name__, str(_exc)[:120])
+        if key in logged_failures:
+            return
+        logged_failures.add(key)
+        _log_symbol_fetch_failure("1d", _sym, _provider, _exc)
 
     try:
         for sym in stocks:
@@ -965,20 +1038,40 @@ def patch_equity_daily_bars(
                 # instance was constructed in raw mode, so the bytes stay raw.
                 fetch_bs = getattr(bs_prov, "fetch_raw_ohlcv", bs_prov.fetch_ohlcv)
                 new_df = pd.DataFrame()
+                attempts: List[Tuple[str, BaseException]] = []
                 try:
                     new_df = fetch_bs(sym, patch_start, end, interval="1d")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # Isolated per symbol ON PURPOSE: one poisoned response (e.g. a GBK
+                    # error page surfacing as DataProviderPayloadError) must not abort
+                    # the remaining 21 symbols nor the whole Stage-1 process.
+                    attempts.append(("BaoStockDataProvider", exc))
+                    _log_once(sym, "BaoStockDataProvider", exc)
                 if new_df.empty:
                     try:
                         time.sleep(0.15)
                         fetch_em = getattr(em_prov, "fetch_raw_ohlcv", em_prov.fetch_ohlcv)
                         new_df = fetch_em(sym, patch_start, end, interval="1d")
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        attempts.append(("EastMoneyDataProvider", exc))
+                        _log_once(sym, "EastMoneyDataProvider", exc)
 
                 if new_df.empty:
-                    print("SKIPPED (no new bars)")
+                    if attempts:
+                        # "Every provider raised" is a FETCH FAILURE, not "0 new bars".
+                        # Recorded/logged once per symbol: the provider loop above runs the
+                        # same fetch twice (once per write namespace), so repeating the
+                        # warning would only duplicate it.
+                        if sym not in fetch_errors:
+                            fetch_errors[sym] = "; ".join(
+                                f"{p}: {summarize_fetch_error(e)}" for p, e in attempts
+                            )
+                        print(
+                            f"FAILED (fetch error, {len(attempts)} provider(s) raised: "
+                            f"{type(attempts[-1][1]).__name__})"
+                        )
+                    else:
+                        print("SKIPPED (no new bars)")
                     continue
 
                 # ------------------------------------------------------------------------------
@@ -1055,6 +1148,7 @@ def patch_equity_daily_bars(
         bs_prov.logout()
 
     refusals.raise_if_any()
+    return fetch_errors
 
 
 def sync_5m_intraday(
@@ -1063,8 +1157,13 @@ def sync_5m_intraday(
     indices: List[str],
     start: str,
     end: str,
-) -> None:
-    """Syncs 5m intraday data sequentially with a single persistent BaoStock session."""
+) -> Dict[str, str]:
+    """Syncs 5m intraday data sequentially with a single persistent BaoStock session.
+
+    Per-symbol isolation as in `patch_equity_daily_bars`: a raised fetch error is logged
+    and the symbol recorded in the returned mapping (empty dict = clean run), never
+    aborting the loop.
+    """
     print("\n" + "=" * 80)
     print(f"PART B: Pulling & Caching 5m Intraday Bars [{start} -> {end}]")
     print("Mode: Strictly Sequential Single-Process (BaoStock session reuse)")
@@ -1082,6 +1181,7 @@ def sync_5m_intraday(
     em_prov = EastMoneyDataProvider(adjust="none")
 
     refusals = RefusalCollector("PART B (5m intraday)")
+    fetch_errors: Dict[str, str] = {}
     t_total = time.time()
 
     try:
@@ -1104,6 +1204,7 @@ def sync_5m_intraday(
             target_prov: Optional[str] = None
 
             # BaoStock authoritative writer (adjustflag "3", basis "raw")
+            attempts: List[Tuple[str, BaseException]] = []
             try:
                 fetch_bs = getattr(bs_prov, "fetch_raw_ohlcv", bs_prov.fetch_ohlcv)
                 df_bs = fetch_bs(sym, start, end, interval="5m")
@@ -1111,6 +1212,8 @@ def sync_5m_intraday(
                     full_df = df_bs
                     target_prov = "BaoStockDataProvider"
             except Exception as e:
+                attempts.append(("BaoStockDataProvider", e))
+                _log_symbol_fetch_failure("5m", sym, "BaoStockDataProvider", e)
                 print(f"[BaoStock error: {e}]", end=" ", flush=True)
 
             # EastMoney fallback only when BaoStock returns nothing (fqt "0", basis "raw")
@@ -1123,10 +1226,19 @@ def sync_5m_intraday(
                         full_df = df_em
                         target_prov = "EastMoneyDataProvider"
                 except Exception as e:
+                    attempts.append(("EastMoneyDataProvider", e))
+                    _log_symbol_fetch_failure("5m", sym, "EastMoneyDataProvider", e)
                     print(f"[EastMoney error: {e}]", end=" ", flush=True)
 
             if full_df.empty or target_prov is None:
-                print("FAILED (no data returned)")
+                if attempts:
+                    # Same distinction as the daily path: raised != "no data".
+                    fetch_errors[sym] = "; ".join(
+                        f"{p}: {summarize_fetch_error(e)}" for p, e in attempts
+                    )
+                    print("FAILED (fetch error from every provider)")
+                else:
+                    print("FAILED (no data returned)")
                 continue
 
             full_df = full_df[~full_df.index.duplicated(keep="last")].sort_index()
@@ -1229,9 +1341,14 @@ def sync_5m_intraday(
         except QfqWriteRefused:
             raise
         except Exception as e:
+            _log_symbol_fetch_failure("5m", idx_sym, "EastMoneyDataProvider", e)
+            fetch_errors[idx_sym] = (
+                f"EastMoneyDataProvider: {summarize_fetch_error(e)}"
+            )
             print(f"-> Index {idx_sym} (5m) skipped: {e}")
 
     refusals.raise_if_any()
+    return fetch_errors
 
 
 def print_verification_summary(cache: DuckDBCache, stocks: List[str], indices: List[str]) -> None:

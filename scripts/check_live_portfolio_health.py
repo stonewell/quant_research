@@ -345,10 +345,22 @@ def refresh_stage1_data(
 
         equity_syms = [s for s in symbols if str(s).strip().upper() not in CASH_PROXY_SYMBOLS]
 
+        # Per-symbol fetch failures (raised, i.e. NOT "0 new bars"). The sync functions
+        # isolate a failing symbol themselves and return `symbol -> "Provider: Type: msg"`;
+        # this block carries that forward into `fetch_errors` / `freshness_summary` so the
+        # persisted run says WHY a symbol is missing instead of only that it is missing
+        # (2026-10-27: a GBK error page on 601288.SH looked exactly like an empty symbol).
+        fetch_errors: Dict[str, str] = {}
+
+        def _absorb(produced: Any) -> None:
+            if isinstance(produced, dict):
+                for sym, reason in produced.items():
+                    fetch_errors.setdefault(str(sym), str(reason))
+
         # 1. Major indices daily bars
         try:
             start_1d = (pd.Timestamp(as_of_date) - timedelta(days=35)).strftime("%Y-%m-%d")
-            sync_indices_daily(cache, MAJOR_INDICES, start=start_1d, end=as_of_date)
+            _absorb(sync_indices_daily(cache, MAJOR_INDICES, start=start_1d, end=as_of_date))
             summary["steps"]["sync_indices_daily"] = "ok"
         except Exception as exc:
             print(f"[STAGE 1 DATA REFRESH WARN] 大盘指数日线同步异常 (容错忽略): {exc}")
@@ -357,7 +369,7 @@ def refresh_stage1_data(
         # 2. Patch equity daily bars
         if equity_syms:
             try:
-                patch_equity_daily_bars(cache, equity_syms, end=as_of_date)
+                _absorb(patch_equity_daily_bars(cache, equity_syms, end=as_of_date))
                 summary["steps"]["patch_equity_daily_bars"] = "ok"
             except Exception as exc:
                 print(f"[STAGE 1 DATA REFRESH WARN] 个股日线补充拉取异常 (容错忽略): {exc}")
@@ -367,11 +379,23 @@ def refresh_stage1_data(
         if enable_intraday_5m:
             try:
                 start_5m = (pd.Timestamp(as_of_date) - timedelta(days=10)).strftime("%Y-%m-%d")
-                sync_5m_intraday(cache, equity_syms, MAJOR_INDICES, start=start_5m, end=as_of_date)
+                _absorb(
+                    sync_5m_intraday(cache, equity_syms, MAJOR_INDICES, start=start_5m, end=as_of_date)
+                )
                 summary["steps"]["sync_5m_intraday"] = "ok"
             except Exception as exc:
                 print(f"[STAGE 1 DATA REFRESH WARN] 5分钟分时行情同步异常 (容错忽略): {exc}")
                 summary["steps"]["sync_5m_intraday"] = f"warn: {exc}"
+
+        if fetch_errors:
+            # Same key/shape as `freshness_summary["fetch_errors"]` so the two can be
+            # compared directly; also counted in `steps` for a one-glance summary.
+            summary["fetch_errors"] = fetch_errors
+            summary["steps"]["fetch_errors"] = len(fetch_errors)
+            print(
+                f"[STAGE 1 DATA REFRESH WARN] {len(fetch_errors)} 个标的抓取报错"
+                f"（不是「无数据」）: {', '.join(sorted(fetch_errors))}"
+            )
 
     return summary
 
@@ -1342,7 +1366,7 @@ def main(cli_args: Optional[List[str]] = None):
     )
 
     if getattr(args, "refresh_data", True):
-        refresh_stage1_data(
+        refresh_summary = refresh_stage1_data(
             symbols=universe_symbols,
             as_of_date=as_of_date,
             data_provider=args.data_provider,
@@ -1351,6 +1375,8 @@ def main(cli_args: Optional[List[str]] = None):
             enable_intraday_5m=enable_intraday_5m,
             no_cache=getattr(args, "no_cache", False),
         )
+    else:
+        refresh_summary = {}
 
     # 2. Load Universe Data
     if not universe_symbols:
@@ -1378,6 +1404,9 @@ def main(cli_args: Optional[List[str]] = None):
         expected_symbols=universe_symbols,
         exclude=(params.get("cash_proxy", "BIL"),),
         stage="stage1",
+        # Distinguishes "the fetch raised" from "the symbol genuinely has no bars",
+        # using the same `symbol -> "Provider: Type: msg"` mapping the refresh produced.
+        fetch_errors=(refresh_summary.get("fetch_errors") if isinstance(refresh_summary, dict) else None),
     )
 
     # 3. Load Account State & Evaluate Portfolio Drawdown

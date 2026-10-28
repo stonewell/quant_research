@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 import pandas as pd
 
@@ -204,6 +204,7 @@ def build_freshness_summary(
     exclude: Iterable[str] = (),
     stage: Optional[str] = None,
     strict: Optional[bool] = None,
+    fetch_errors: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
     """Per-symbol bar-date audit of a loaded universe (design §9 `freshness_summary`).
 
@@ -226,11 +227,20 @@ def build_freshness_summary(
     expected_symbols / exclude:
         Symbols that must be present, minus ones that legitimately have no bar
         (e.g. a cash proxy that is not in the traded universe).
+    fetch_errors:
+        Optional `symbol -> "Provider: TypeName: message"` map produced by the
+        Stage-1 refresh (`scripts/sync_china_5m_and_indices.py`). It does NOT change
+        `status` (a symbol with no usable frame is already `missing`, hence FAIL);
+        it only records WHY a symbol is missing. "Fetched zero bars" and "the fetch
+        raised" both land in `missing_symbols`, but only the latter also appears here
+        -- without it the two conditions are indistinguishable after the fact
+        (2026-10-27: a GBK error page from 601288.SH and a genuinely empty symbol
+        looked identical).
 
     Returns
     -------
     dict with `status` in {PASS, FAIL, NOT_CHECKED}, per-symbol `price_bar_dates`,
-    `stale` (bar < expected) and `missing_symbols` lists.
+    `stale` (bar < expected) and `missing_symbols` lists, plus `fetch_errors`.
     """
     expected_iso = None
     if expected_session is not None:
@@ -277,6 +287,8 @@ def build_freshness_summary(
         "stale": stale,
         "missing_symbols": missing,
         "price_bar_dates": bar_dates,
+        # Additive, never status-changing: see the `fetch_errors` docstring above.
+        "fetch_errors": {str(k): str(v) for k, v in dict(fetch_errors or {}).items()},
     }
 
 
@@ -288,6 +300,7 @@ def assert_fresh_universe(
     expected_symbols: Optional[Iterable[str]] = None,
     exclude: Iterable[str] = (),
     stage: Optional[str] = None,
+    fetch_errors: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
     """`build_freshness_summary` + the hard assertion (design §8 `--strict-freshness`).
 
@@ -296,6 +309,11 @@ def assert_fresh_universe(
     the operator's explicit downgrade and only prints/logs the same list. Either way
     the returned summary is what the caller persists, so a downgraded run still
     carries its own evidence.
+
+    `fetch_errors` (optional) annotates WHY a symbol is missing: see
+    `build_freshness_summary`. It never changes the verdict -- a missing frame is a
+    FAIL either way -- it only stops "the provider answered with an error page" from
+    being reported as "this symbol has no bars".
     """
     summary = build_freshness_summary(
         universe,
@@ -304,6 +322,7 @@ def assert_fresh_universe(
         exclude=exclude,
         stage=stage,
         strict=strict,
+        fetch_errors=fetch_errors,
     )
     if summary["status"] == "PASS" or summary["status"] == "NOT_CHECKED":
         if summary["status"] == "PASS":
@@ -313,11 +332,16 @@ def assert_fresh_universe(
             )
         return summary
 
+    errors = summary.get("fetch_errors") or {}
     lines = [
         f"标的 {row['symbol']}: 最新 bar = {row['bar_session']} (< as_of {summary['expected_session']})"
         for row in summary["stale"]
     ] + [
-        f"标的 {sym}: 完全没有可用的日线 frame (as_of {summary['expected_session']})"
+        (
+            f"标的 {sym}: 抓取报错（不是「无数据」）: {errors[sym]}"
+            if sym in errors
+            else f"标的 {sym}: 完全没有可用的日线 frame (as_of {summary['expected_session']})"
+        )
         for sym in summary["missing_symbols"]
     ]
     detail = "\n  - ".join(lines)
