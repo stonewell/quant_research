@@ -837,11 +837,23 @@ def run_allocation_backtest(
     sparse_weights = target_weights.reindex(columns=symbols).loc[common_idx]
 
     lifecycle_records_out: List[Dict[str, Any]] = []
+    lifecycle_simulated = False
     if enable_position_lifecycle:
         # DISCLOSURE: strategy_generator candidate search runs with position lifecycle OFF
         # to preserve an unconstrained search landscape; final backtests run with it ON.
-        if lifecycle_records is not None:
+        #
+        # (F4) A NON-EMPTY `lifecycle_records` is a caller-supplied, already
+        # simulated record list (e.g. `run_backtest.py` warming the FSM over a
+        # fold's pre-eval buffer) -- it may be passed straight through, because
+        # re-simulating would double-filter. An EMPTY list is NOT that: it used
+        # to take the same branch, so `lifecycle_records=[]` silently skipped
+        # the state machine and returned the RAW, unfiltered weights while still
+        # reporting `position_lifecycle_enabled=True` -- a run that claims to
+        # have modelled tenure locks and cooldowns but did not. Empty/None now
+        # falls through to the simulation.
+        if lifecycle_records is not None and len(lifecycle_records) > 0:
             lifecycle_records_out = list(lifecycle_records)
+            lifecycle_simulated = True
         else:
             from common.position_lifecycle import resolve_position_lifecycle_config, simulate_position_lifecycle
             cfg = lifecycle_config if lifecycle_config is not None else resolve_position_lifecycle_config()
@@ -855,6 +867,7 @@ def run_allocation_backtest(
                 market=market_type,
                 cash_proxy=resolved_cash_proxy,
             )
+            lifecycle_simulated = True
 
     # Suspension input (task B1.3). Only symbols that actually CARRY a Volume
     # column can be judged -- see the docstring's "DISCLOSED LIMIT OF THE
@@ -905,6 +918,16 @@ def run_allocation_backtest(
     if execution_price == "next_open":
         exec_price_arr = opens_arr
     elif execution_price == "next_vwap":
+        # DEPENDENCY (M3.6 review P2): this branch needs a per-bar VWAP, i.e. either the `VWAP`
+        # column or `Amount` + `Volume`. `DuckDBCache.query_bars` deliberately returns the
+        # required OHLCV columns only by default (`columns=None`), so `Amount` is present here
+        # ONLY because the loader asked for it: `load_universe` defaults to `columns="all"`
+        # (`common/data.py`), which is what every backtest goes through
+        # (`common/cli_utils.load_universe_with_banner` -> `load_universe`). A caller that builds
+        # `universe` some other way must carry `VWAP` or `Amount` itself, or this mode fails loud
+        # below -- it never degrades to the open/close. Do not "fix" a missing `Amount` here by
+        # widening the cache's default columns: the narrower default is what keeps a hit-path read
+        # from changing frame shape.
         vwap_cols, vwap_missing = {}, []
         for sym, df in universe.items():
             vol = pd.to_numeric(df["Volume"], errors="coerce") if "Volume" in df.columns else None
@@ -2537,5 +2560,10 @@ def run_allocation_backtest(
         "win_rate": win_rate,
         "profit_factor": profit_factor,
         "lifecycle_records": lifecycle_records_out,
-        "position_lifecycle_enabled": bool(enable_position_lifecycle),
+        # (F4) Reports whether the state machine ACTUALLY produced the weights
+        # above, not merely whether the flag was set: `enable_position_lifecycle`
+        # is only ever honest together with a simulation (or a caller-supplied
+        # non-empty record list from one), so this can never again claim
+        # "lifecycle enabled" over raw, unfiltered targets.
+        "position_lifecycle_enabled": bool(enable_position_lifecycle and lifecycle_simulated),
     }

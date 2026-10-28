@@ -24,6 +24,7 @@ from common.position_lifecycle import (
     blocking_reason_label,
     coerce_blocking_reason,
     is_liquidation_event,
+    resolve_position_lifecycle_config,
     step_position_lifecycle,
 )
 
@@ -1176,4 +1177,231 @@ def test_step_position_lifecycle_l2_40_portfolio_deleverage_bypasses_inertia_and
     # Delta is +0.02 < inertia_threshold 0.05 -> blocked by inertia
     assert d_buy.action == "HOLD"
     assert d_buy.blocking_reason == BlockingReason.INERTIA
+
+
+# --------------------------------------------------------------------------- #
+# (F1 / F2 / F3) Resolver defaults aligned with the LIVE deployment + live-key
+# aliases. Root cause: `resolve_position_lifecycle_config` used to default to
+# `normal_cooldown_bars=1` / `inertia_relative_ratio=0.50` (live deploys 2 / 0.0)
+# AND read only `lifecycle_<field>` keys, so a strategy whose params carry the
+# live spellings (`reentry_cooldown_bars`, `min_entry_bars`, `min_hold_bars`,
+# `cfsb_inertia_relative_ratio`, ...) silently backtested a DIFFERENT state
+# machine than the one actually traded.
+# --------------------------------------------------------------------------- #
+
+def _live_default_lifecycle_config():
+    """Mirror of `scripts/run_live_strategy.py:1538-1573` for a strategy that
+    carries no lifecycle params and a CLI with no lifecycle overrides.
+
+    Every value is computed through the LIVE runner's OWN resolvers (imported,
+    never re-spelled), so this mirror follows the deployed defaults if they move.
+    """
+    from scripts.run_live_strategy import (
+        resolve_blend_param,
+        resolve_min_entry_bars,
+        resolve_min_holding_bars,
+        resolve_trade_inertia_threshold,
+    )
+
+    params = {}
+    min_trade_thresh = resolve_trade_inertia_threshold(params, default=0.05)
+    min_entry_thresh = resolve_blend_param(params, "entry_threshold", None, float) or min_trade_thresh
+    guard_latency_bars = 2
+    if "guard_latency_bars" in params:
+        guard_latency_bars = int(params["guard_latency_bars"])
+    elif "min_entry_bars" in params or "cfsb_min_entry_bars" in params or "cfssb_min_entry_bars" in params:
+        guard_latency_bars = resolve_min_entry_bars(params, default=guard_latency_bars)
+    reentry_cooldown_bars = 2  # arg default of `--reentry-cooldown-bars`
+
+    return PositionLifecycleConfig(
+        guard_latency_bars=guard_latency_bars,
+        min_holding_bars=resolve_min_holding_bars(params, None, default=2),
+        normal_cooldown_bars=reentry_cooldown_bars,
+        stop_cooldown_bars=max(5, reentry_cooldown_bars),
+        inertia_threshold=min_trade_thresh,
+        inertia_relative_ratio=resolve_blend_param(params, "inertia_relative_ratio", 0.0, float),
+        min_entry_threshold=min_entry_thresh,
+        hard_stop_loss_pct=0.08,
+        atr_multiplier=4.5,
+        volume_surge_multiplier=1.5,
+        breadth_thrust_threshold=0.60,
+        enable_entry_fast_path=True,
+        enable_exit_fast_path=True,
+    )
+
+
+def test_resolve_position_lifecycle_config_matches_live_deployment_defaults():
+    """F1: the resolver's no-arg result equals the LIVE default path field by field."""
+    cfg = resolve_position_lifecycle_config()
+    live = _live_default_lifecycle_config()
+
+    # The four fields named explicitly in the ticket, first (readable failures).
+    assert cfg.normal_cooldown_bars == 2          # was 1
+    assert cfg.inertia_relative_ratio == 0.0      # was 0.50
+    assert cfg.min_holding_bars == 2
+    assert cfg.guard_latency_bars == 2
+
+    fields = [
+        "guard_latency_bars",
+        "min_holding_bars",
+        "normal_cooldown_bars",
+        "stop_cooldown_bars",
+        "inertia_threshold",
+        "inertia_relative_ratio",
+        "hard_stop_loss_pct",
+        "atr_multiplier",
+        "volume_surge_multiplier",
+        "breadth_thrust_threshold",
+        "enable_entry_fast_path",
+        "enable_exit_fast_path",
+    ]
+    for f in fields:
+        assert getattr(cfg, f) == getattr(live, f), f"{f}: resolver={getattr(cfg, f)!r} live={getattr(live, f)!r}"
+
+    # The ONE deliberate divergence, pinned so it can never drift silently: the
+    # live ticket derives `min_entry_threshold` from the inertia threshold (0.05),
+    # the resolver keeps `None`. Adopting 0.05 would TIGHTEN entry gating for
+    # every backtest that never set the field -- a behavioural change, not a
+    # default-alignment fix. See `resolve_position_lifecycle_config`'s docstring.
+    assert cfg.min_entry_threshold is None
+    assert live.min_entry_threshold == cfg.inertia_threshold == 0.05
+
+
+def test_position_lifecycle_config_dataclass_defaults_are_the_live_ones():
+    """F3: a bare `PositionLifecycleConfig()` must equal the deployed config too.
+
+    `min_holding_bars` was the odd one out: the dataclass default said 1 while
+    both resolvers said 2, so every caller that built a config by hand (tests,
+    parity harness) modelled a 1-bar tenure lock.
+    """
+    bare = PositionLifecycleConfig()
+    live = _live_default_lifecycle_config()
+    assert bare.min_holding_bars == 2
+    assert bare.normal_cooldown_bars == 2
+    assert bare.guard_latency_bars == 2
+    assert bare.stop_cooldown_bars == 5
+    assert bare.inertia_threshold == 0.05
+    assert bare.inertia_relative_ratio == 0.0
+    assert bare.hard_stop_loss_pct == 0.08
+    assert bare.atr_multiplier == 4.5
+    assert bare.volume_surge_multiplier == live.volume_surge_multiplier
+    assert bare.breadth_thrust_threshold == live.breadth_thrust_threshold
+    assert bare.enable_entry_fast_path is live.enable_entry_fast_path is True
+    assert bare.enable_exit_fast_path is live.enable_exit_fast_path is True
+
+
+def _Namespace(**kwargs):
+    """Tiny argparse.Namespace stand-in (keeps this module's import list unchanged)."""
+    import argparse
+    return argparse.Namespace(**kwargs)
+
+
+def test_resolver_accepts_live_keys_as_aliases_of_the_lifecycle_prefix():
+    """F2: a strategy carrying the live-runner spellings resolves identically.
+
+    `params={"reentry_cooldown_bars": 3}` and
+    `params={"lifecycle_normal_cooldown_bars": 3}` must be the SAME config --
+    that equivalence is the whole point: the backtest has to evaluate what the
+    live ticket would have executed.
+    """
+    via_alias = resolve_position_lifecycle_config(params={"reentry_cooldown_bars": 3})
+    via_prefix = resolve_position_lifecycle_config(params={"lifecycle_normal_cooldown_bars": 3})
+    assert via_alias.to_dict() == via_prefix.to_dict()
+    assert via_alias.normal_cooldown_bars == 3
+    # Live floor: the stop-loss cooling period is never SHORTER than the
+    # voluntary one (`max(5, reentry_cooldown_bars)`).
+    assert via_alias.stop_cooldown_bars == 5
+    assert resolve_position_lifecycle_config(
+        params={"reentry_cooldown_bars": 9}
+    ).stop_cooldown_bars == 9
+
+    # `lifecycle_*` WINS over the bare live key, whichever order they appear in.
+    both = resolve_position_lifecycle_config(
+        params={"reentry_cooldown_bars": 9, "lifecycle_normal_cooldown_bars": 3}
+    )
+    assert both.normal_cooldown_bars == 3
+
+    # ... and the CLI namespace wins over both (`run_backtest.py` exposes only
+    # the `--lifecycle-*` flags, so this is the documented highest priority).
+    args = _Namespace(lifecycle_normal_cooldown_bars=4)
+    top = resolve_position_lifecycle_config(
+        params={"reentry_cooldown_bars": 9, "lifecycle_normal_cooldown_bars": 3}, args=args
+    )
+    assert top.normal_cooldown_bars == 4
+
+    # min_holding_bars <- min_hold_bars, through the LIVE resolver (so the
+    # `_min_holding_bars` / `_min_hold_bars` suffix compat, L2.39, comes along).
+    assert resolve_position_lifecycle_config(params={"min_hold_bars": 4}).min_holding_bars == 4
+    assert resolve_position_lifecycle_config(params={"cfsb_min_hold_bars": 5}).min_holding_bars == 5
+    assert resolve_position_lifecycle_config(
+        params={"lifecycle_min_holding_bars": 3, "min_hold_bars": 9}
+    ).min_holding_bars == 3
+
+    # guard_latency_bars <- min_entry_bars (+ blend prefixes).
+    assert resolve_position_lifecycle_config(params={"min_entry_bars": 3}).guard_latency_bars == 3
+    assert resolve_position_lifecycle_config(params={"cfsb_min_entry_bars": 4}).guard_latency_bars == 4
+    assert resolve_position_lifecycle_config(
+        params={"lifecycle_guard_latency_bars": 1, "min_entry_bars": 3}
+    ).guard_latency_bars == 1
+
+    # inertia_threshold <- the min_weight_change family.
+    assert resolve_position_lifecycle_config(
+        params={"min_weight_change": 0.02}
+    ).inertia_threshold == pytest.approx(0.02)
+    assert resolve_position_lifecycle_config(
+        params={"cfsb_min_weight_change": 0.03}
+    ).inertia_threshold == pytest.approx(0.03)
+    assert resolve_position_lifecycle_config(
+        params={"lifecycle_inertia_threshold": 0.08, "min_weight_change": 0.02}
+    ).inertia_threshold == pytest.approx(0.08)
+
+    # inertia_relative_ratio <- cfsb_inertia_relative_ratio, ONLY when present.
+    assert resolve_position_lifecycle_config(
+        params={"cfsb_inertia_relative_ratio": 0.35}
+    ).inertia_relative_ratio == pytest.approx(0.35)
+    # A blend strategy that does NOT carry the key stays at the live 0.0 (never
+    # the old 0.50 default that quietly doubled the trim hurdle).
+    assert resolve_position_lifecycle_config(
+        params={"cfsb_vol_model": "garman_klass", "cfsb_rebalance_freq_days": 21}
+    ).inertia_relative_ratio == 0.0
+
+    # A bare `stop_cooldown_bars` is honoured (lifecycle_* still wins over it).
+    assert resolve_position_lifecycle_config(
+        params={"stop_cooldown_bars": 7}
+    ).stop_cooldown_bars == 7
+    assert resolve_position_lifecycle_config(
+        params={"stop_cooldown_bars": 7, "lifecycle_stop_cooldown_bars": 6}
+    ).stop_cooldown_bars == 6
+
+
+def test_simulate_position_lifecycle_warns_once_when_cash_proxy_is_not_in_the_universe():
+    """F5: a cash_proxy outside the universe is DISCLOSED, not silently inert.
+
+    The residual-cash sleeve can only be lifecycle-exempt-but-cost-bearing if it
+    is a real universe column; otherwise the appended all-NaN column carried the
+    residual into a symbol the caller's ledger never saw. The accounting is
+    deliberately unchanged here (see the docstring) -- only the silence is.
+    """
+    from common.position_lifecycle import simulate_position_lifecycle
+    from common.testing import make_ohlcv_from_closes as make_df
+
+    dates = pd.bdate_range("2020-01-01", periods=6)
+    universe = {"A": make_df([100.0] * 6, start="2020-01-01")}
+    weights = pd.DataFrame(np.nan, index=dates, columns=["A"])
+    weights.loc[dates[0], "A"] = 0.50
+
+    cfg = PositionLifecycleConfig(guard_latency_bars=1)
+
+    with pytest.warns(RuntimeWarning, match="cash_proxy='BIL' is not a column"):
+        simulate_position_lifecycle(universe, weights, cfg=cfg, cash_proxy="BIL")
+
+    # A proxy the universe actually carries is silent.
+    import warnings as _warnings
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("error")
+        universe_with_cash = dict(universe, BIL=make_df([1.0] * 6, start="2020-01-01"))
+        weights_with_cash = weights.copy()
+        weights_with_cash["BIL"] = np.nan
+        simulate_position_lifecycle(universe_with_cash, weights_with_cash, cfg=cfg, cash_proxy="BIL")
+
 

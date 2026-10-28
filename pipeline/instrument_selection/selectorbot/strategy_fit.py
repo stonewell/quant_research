@@ -413,12 +413,20 @@ def compute_strategy_simulation_fit(
     strategy_instance: Any,
     params: dict = None,
     cash_proxy: str = "BIL",
+    enable_position_lifecycle: bool = True,
 ) -> pd.DataFrame:
     """Computes Pillar B: empirical single-asset backtest simulation fit.
 
     Runs strategy simulation on each asset individually, extracting Sharpe ratio,
     CAGR, max drawdown, and rebalance counts. Penalizes instruments where the strategy
     never fires.
+
+    `enable_position_lifecycle=True` by explicit decision (F2): this pillar ranks
+    the SAME instruments the final `backtester` run will trade, so it must simulate
+    them under the same execution discipline (entry confirmation, tenure lock,
+    cooldowns) or the ranking silently optimizes for a book nobody will hold. The
+    kwarg is the escape hatch -- callers that need the old unconstrained numbers
+    pass `False`.
     """
     if not data or strategy_instance is None:
         return pd.DataFrame()
@@ -463,7 +471,11 @@ def compute_strategy_simulation_fit(
                 }
                 continue
 
-            backtest_res = run_allocation_backtest(mini_u, weights)
+            # Same kwarg default as `backtester/run_backtest.py`: OFF was an undeclared
+            # third convention (the engine's own default), not a decision.
+            backtest_res = run_allocation_backtest(
+                mini_u, weights, enable_position_lifecycle=enable_position_lifecycle
+            )
             rebal_count = int(backtest_res.get("total_rebalances", 0))
             turnover = float(backtest_res.get("total_turnover", 0.0))
             cagr_val = float(backtest_res.get("cagr", 0.0))

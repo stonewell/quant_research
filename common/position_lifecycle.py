@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import warnings
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -144,10 +145,20 @@ def is_liquidation_event(action: Any, blocking_reason: Any = None) -> bool:
 
 @dataclass
 class PositionLifecycleConfig:
-    """Configuration parameters for asset position lifecycles."""
+    """Configuration parameters for asset position lifecycles.
+
+    The DEFAULTS below are the ones `scripts/run_live_strategy.py:1555-1573`
+    actually deploys (`min_holding_bars=2`, `normal_cooldown_bars=2`,
+    `inertia_relative_ratio=0.0`, ...). They were once inconsistent here
+    (`min_holding_bars=1`, `normal_cooldown_bars=1`), which meant a bare
+    `PositionLifecycleConfig()` modelled a DIFFERENT, looser state machine than
+    the live ticket -- a 1-bar tenure lock and a 1-bar re-entry cooldown instead
+    of the deployed 2/2. `min_holding_bars` was the odd one out (the field
+    default said 1 while both resolvers said 2); F3 aligned it.
+    """
     guard_latency_bars: int = 2
-    min_holding_bars: int = 1
-    normal_cooldown_bars: int = 1
+    min_holding_bars: int = 2
+    normal_cooldown_bars: int = 2
     stop_cooldown_bars: int = 5
     inertia_threshold: float = 0.05
     # (2026-10-22 incident) Relative trim-side inertia ratio. When > 0.0, a
@@ -789,41 +800,203 @@ def step_position_lifecycle(
     raise ValueError(f"Unhandled position lifecycle state: {state.state}")
 
 
+def _live_param_resolvers() -> Tuple[Any, Any, Any, Any]:
+    """The LIVE runner's parameter resolvers, imported -- never re-implemented.
+
+    Root cause this helper exists for (F2): `resolve_position_lifecycle_config`
+    used to read ONLY `lifecycle_<field>` keys, while the live runner reads the
+    STRATEGY's own spellings (`guard_latency_bars`, `min_entry_bars`,
+    `reentry_cooldown_bars`, `min_hold_bars`, `cfsb_inertia_relative_ratio`, the
+    `min_weight_change` family, ...). A strategy carrying any of those therefore
+    resolved to the DEFAULTS in a backtest -- the backtest silently modelled a
+    different state machine than the one actually deployed, with no warning.
+
+    The alias resolution delegates to `scripts/run_live_strategy`'s own
+    functions (`resolve_blend_param`, `resolve_min_entry_bars`,
+    `resolve_min_holding_bars`, `resolve_trade_inertia_threshold`) instead of
+    copying their precedence rules, so the two engines cannot drift: e.g. the
+    `_min_holding_bars` / `_min_hold_bars` suffix compatibility (`L2.39`) and the
+    `cfsb_/crb_/ccsb_/cfssb_/cdhb_/blend_` prefix scan are picked up here for
+    free, and a future fix to the live precedence applies to both.
+
+    Imported LAZILY on purpose: `scripts.run_live_strategy` imports this module
+    at module scope (`PositionLifecycleConfig`, `step_position_lifecycle`,
+    `BlockingReason`, ...), so a module-level import here would be circular.
+    `scripts.run_live_strategy` also repairs `sys.path` (repo root + `pipeline/`)
+    on import, so the call works from any cwd.
+    """
+    from scripts.run_live_strategy import (
+        resolve_blend_param,
+        resolve_min_entry_bars,
+        resolve_min_holding_bars,
+        resolve_trade_inertia_threshold,
+    )
+
+    return (
+        resolve_blend_param,
+        resolve_min_entry_bars,
+        resolve_min_holding_bars,
+        resolve_trade_inertia_threshold,
+    )
+
+
 def resolve_position_lifecycle_config(
     params: Optional[Dict[str, Any]] = None,
     args: Any = None,
 ) -> PositionLifecycleConfig:
     """Resolves PositionLifecycleConfig by merging strategy parameters and CLI arguments.
 
-    Defaults:
+    Defaults (ALIGNED WITH THE LIVE DEPLOYMENT, `scripts/run_live_strategy.py:1538-1573`):
         guard_latency_bars: 2
         min_holding_bars: 2
-        normal_cooldown_bars: 1
+        normal_cooldown_bars: 2
         stop_cooldown_bars: 5
         inertia_threshold: 0.05
-        inertia_relative_ratio: 0.50
+        inertia_relative_ratio: 0.0
+        min_entry_threshold: None
         hard_stop_loss_pct: 0.08
         atr_multiplier: 4.5
+        volume_surge_multiplier: 1.5
+        breadth_thrust_threshold: 0.60
         enable_entry_fast_path: True
         enable_exit_fast_path: True
+
+    The two defaults that used to DISAGREE with live (and are fixed here, F1)
+    were `normal_cooldown_bars=1` (live: 2 -- `--reentry-cooldown-bars` default)
+    and `inertia_relative_ratio=0.50` (live: 0.0, i.e. DISABLED everywhere except
+    `chan_four_state_blend`, which opts in through
+    `cfsb_inertia_relative_ratio`). A 0.50 default silently halved every trim
+    below half the incumbent weight in the backtest only.
+
+    `min_entry_threshold` is the ONE field that deliberately stays `None` here
+    while the live ticket sets `0.05`: live derives it as
+    `args.min_entry_threshold or resolve_blend_param(params, "entry_threshold")
+    or <inertia threshold>` (line 1539), i.e. the raw entry gate inherits the
+    turnover-inertia threshold. Adopting that here would silently TIGHTEN entry
+    gating for every backtest that never set the field (0.0 < w < 0.05 would
+    stop entering), which is a separate behavioural decision, not a
+    default-alignment fix. Pass `min_entry_threshold` explicitly (params
+    `lifecycle_min_entry_threshold` / CLI `--lifecycle-min-entry-threshold`) to
+    opt in.
+
+    KEY RESOLUTION (F2) -- first hit wins, per field:
+      1. `args.lifecycle_<field>` (backtester CLI, `run_backtest.py:214-258`)
+      2. `params["lifecycle_<field>"]` (explicit, unambiguous)
+      3. live-runner ALIAS on the CLI namespace (`args.reentry_cooldown_bars`,
+         `args.guard_latency_bars`, `args.min_entry_bars`, ...)
+      4. the same alias in `params` (`reentry_cooldown_bars`,
+         `min_hold_bars`, `min_entry_bars`, `cfsb_inertia_relative_ratio`,
+         `min_weight_change`, ...)
+      5. the live default
+
+    Alias table (at least; the live resolvers cover far more spellings):
+        normal_cooldown_bars  <- reentry_cooldown_bars
+        stop_cooldown_bars    <- stop_cooldown_bars (bare) / max(5, normal)
+        min_holding_bars      <- min_hold_bars (+ *_min_holding_bars suffix)
+        guard_latency_bars    <- min_entry_bars (+ *_min_entry_bars suffix)
+        inertia_threshold     <- min_weight_change / *_min_weight_change
+        inertia_relative_ratio<- cfsb_inertia_relative_ratio (only when present)
     """
     p = params or {}
+    (
+        resolve_blend_param,
+        resolve_min_entry_bars,
+        resolve_min_holding_bars,
+        resolve_trade_inertia_threshold,
+    ) = _live_param_resolvers()
 
-    def _get(field_name: str, default: Any) -> Any:
+    def _get(field_name: str, default: Any, *aliases: str) -> Any:
         key = f"lifecycle_{field_name}"
         if args is not None:
-            if hasattr(args, key) and getattr(args, key) is not None:
-                return getattr(args, key)
-        if p and key in p and p[key] is not None:
-            return p[key]
+            val = getattr(args, key, None)
+            if val is not None:
+                return val
+        if p:
+            val = p.get(key)
+            if val is not None:
+                return val
+        if args is not None:
+            for alias in aliases:
+                val = getattr(args, alias, None)
+                if val is not None:
+                    return val
+        if p:
+            for alias in aliases:
+                val = p.get(alias)
+                if val is not None:
+                    return val
         return default
 
-    guard_latency_bars = int(_get("guard_latency_bars", 2))
-    min_holding_bars = int(_get("min_holding_bars", 2))
-    normal_cooldown_bars = int(_get("normal_cooldown_bars", 1))
-    stop_cooldown_bars = int(_get("stop_cooldown_bars", 5))
-    inertia_threshold = float(_get("inertia_threshold", 0.05))
-    inertia_relative_ratio = float(_get("inertia_relative_ratio", 0.50))
+    def _live_guard_latency_bars() -> int:
+        """`scripts/run_live_strategy.py:1541-1547`, verbatim.
+
+        NOTE the live chain is gated on three literal keys
+        (`min_entry_bars` / `cfsb_min_entry_bars` / `cfssb_min_entry_bars`)
+        before `resolve_min_entry_bars` (which itself scans any
+        `*_min_entry_bars` suffix) is invoked; the same three-key gate is kept
+        here so a params dict resolves to the SAME guard in both engines.
+        """
+        guard = 2
+        if args is not None and getattr(args, "guard_latency_bars", None) is not None:
+            guard = int(getattr(args, "guard_latency_bars"))
+        if args is not None and getattr(args, "min_entry_bars", None) is not None:
+            return resolve_min_entry_bars(p, args.min_entry_bars, default=guard)
+        if p.get("guard_latency_bars") is not None:
+            return max(1, int(p["guard_latency_bars"]))
+        if any(k in p for k in ("min_entry_bars", "cfsb_min_entry_bars", "cfssb_min_entry_bars")):
+            return resolve_min_entry_bars(p, None, default=guard)
+        return guard
+
+    guard_latency_bars = max(1, int(_get("guard_latency_bars", _live_guard_latency_bars())))
+    # `resolve_min_holding_bars` IS the live resolution (including the
+    # `min_hold_bars` / `*_min_hold_bars` suffix compatibility, L2.39), so no
+    # alias list is layered on top of it.
+    min_holding_bars = max(
+        0,
+        int(
+            _get(
+                "min_holding_bars",
+                resolve_min_holding_bars(
+                    p,
+                    None if args is None else getattr(args, "min_holding_bars", None),
+                    default=2,
+                ),
+            )
+        ),
+    )
+    normal_cooldown_bars = max(
+        0, int(_get("normal_cooldown_bars", 2, "reentry_cooldown_bars"))
+    )
+    # Live: `stop_cooldown_bars=max(5, reentry_cooldown_bars)` (line 1559) -- the
+    # stop-loss cooling period can never be shorter than the voluntary one.
+    # An explicit `lifecycle_stop_cooldown_bars` / bare `stop_cooldown_bars`
+    # still wins over that floor.
+    stop_cooldown_bars = max(
+        0,
+        int(
+            _get(
+                "stop_cooldown_bars",
+                max(5, normal_cooldown_bars),
+                "stop_cooldown_bars",
+            )
+        ),
+    )
+    # Live: `resolve_trade_inertia_threshold(params, default=0.05)` (line 1538),
+    # which owns the `min_weight_change` / `*_min_weight_change` /
+    # `*_min_weight_pct` spellings.
+    inertia_threshold = float(
+        _get("inertia_threshold", resolve_trade_inertia_threshold(p, default=0.05))
+    )
+    # Live: `resolve_blend_param(params, "inertia_relative_ratio", 0.0, float)`
+    # (line 1565) -- 0.0 unless the strategy explicitly carries the key under
+    # one of the blend prefixes (`cfsb_inertia_relative_ratio` for
+    # chan_four_state_blend) or bare.
+    inertia_relative_ratio = float(
+        _get(
+            "inertia_relative_ratio",
+            resolve_blend_param(p, "inertia_relative_ratio", 0.0, float),
+        )
+    )
     min_entry_thresh = _get("min_entry_threshold", None)
     min_entry_threshold = float(min_entry_thresh) if min_entry_thresh is not None else None
     hard_stop_loss_pct = float(_get("hard_stop_loss_pct", 0.08))
@@ -876,6 +1049,19 @@ def simulate_position_lifecycle(
     - If cash_proxy is provided, residual cash weight `max(0.0, 1.0 - sum(risky_w))`
       is assigned to cash_proxy on active rebalance days.
 
+    CASH-PROXY DISCLOSURE (F5, accounting geometry is deliberately unchanged):
+    the cash leg is EXCLUDED from `risky_symbols`, so it never enters the state
+    machine -- it has no PENDING_ENTRY confirmation, no tenure lock, no cooldown
+    and no stop-loss. It is therefore also not a "position" that can be
+    de-risked by this function. What it IS, is an ordinary symbol to the
+    backtester that consumes these weights: its rebalances still pay commission,
+    slippage and the stamp/levy legs exactly like a risky asset, and its
+    in-and-out turnover counts toward the reported turnover figure. In other
+    words the idle-cash sleeve is lifecycle-exempt but NOT cost-exempt.
+    Auto cash parking (the `max(0.0, 1.0 - sum(risky_w))` residual) only happens
+    when `cash_proxy` is a column of `target_weights`; a caller that passes a
+    proxy outside the universe gets a warning (see below) and no parking.
+
     Returns:
         (filtered_sparse_weights, lifecycle_records)
     """
@@ -887,6 +1073,22 @@ def simulate_position_lifecycle(
 
     # Identify symbols
     symbols = list(target_weights.columns)
+    if cash_proxy is not None and cash_proxy not in symbols:
+        # (F5) This used to be silent: the residual-cash parking below appended
+        # a brand-new all-NaN column, which a caller that indexes columns by
+        # POSITION (rather than by name) would either drop or misalign -- the
+        # weights would then look like an un-invested book while the state
+        # machine reported it had run. Warn ONCE per call instead of guessing:
+        # the proxy has to be a real member of the universe for the sleeve to
+        # be lifecycle-exempt *and* cost-bearing in the same ledger.
+        warnings.warn(
+            f"simulate_position_lifecycle: cash_proxy={cash_proxy!r} is not a column of "
+            "target_weights, so automatic cash parking into it is inert (the residual is "
+            "left to the caller's own cash handling). Pass the proxy as a universe/target "
+            "column to have the idle-cash sleeve lifecycle-exempt but cost-bearing.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     risky_symbols = [s for s in symbols if cash_proxy is None or s != cash_proxy]
 
     # Pre-extract price, volume, and ATR series

@@ -116,6 +116,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Apply US equity market trading rules (1-share lots, SEC Section 31 sell fee, T+0 margin trading).")
     p.add_argument("--hk-trading", action="store_true",
                    help="Apply Hong Kong equity market trading rules (board lot sizing, 0.1085%% dual-sided stamp duty/levies, T+0 trading).")
+    p.add_argument("--no-position-lifecycle", action="store_true",
+                   help="Escape hatch: run this project's backtest WITHOUT the Unified Position "
+                        "Lifecycle State Machine. The default is ON, matching backtester/run_backtest.py's "
+                        "own default, so the Sharpe/CAGR printed here is measured under the same "
+                        "execution constraints as the official backtest. Turn it off only to reproduce "
+                        "a pre-lifecycle number.")
     add_data_provider_cli_args(p, default_provider="synthetic", no_cache_help="Disable local DuckDB caching of fetched data")
     return p
 
@@ -472,6 +478,13 @@ def main():
             china_trading=cfg.china_trading,
             us_trading=cfg.us_trading,
             hk_trading=cfg.hk_trading,
+            # ON by explicit decision, not left to the engine's default: this call
+            # prints the "BACKTEST RESULTS" block an operator reads as THE strategy's
+            # performance, so it must be measured in the same execution discipline as
+            # `backtester/run_backtest.py` (same optional kwarg, same default ON). The
+            # `--no-position-lifecycle` escape hatch preserves the ability to reproduce
+            # a pre-lifecycle number.
+            enable_position_lifecycle=not args.no_position_lifecycle,
         )
 
         # `run_allocation_backtest` deliberately short-circuits to

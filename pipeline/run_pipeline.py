@@ -104,7 +104,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-plots", action="store_true",
         help="backtester/strategy_generator --no-plots passthrough -- skip equity-curve charts.")
     p.add_argument("--no-position-lifecycle", action="store_true",
-        help="backtester --no-position-lifecycle passthrough (step 5) -- disable Unified Position Lifecycle State Machine in backtest.")
+        help="Disable the Unified Position Lifecycle State Machine in BOTH backtesting steps -- "
+             "research_strategy (step 1) and backtester (step 5). Omit to keep the default-ON "
+             "execution discipline everywhere.")
     p.add_argument("--no-lifecycle-compare", action="store_true",
         help="backtester --no-lifecycle-compare passthrough (step 5) -- skip lifecycle A/B comparison arm.")
     p.add_argument("--dry-run", action="store_true",
@@ -197,9 +199,10 @@ def main():
 
     # DISCLOSURE: strategy_generator (Step 4) searches allocation templates with position
     # lifecycle OFF to maintain an unconstrained signal search space and avoid asymmetric
-    # state masking during candidate evaluation. The final backtest (Step 5) runs with
+    # state masking during candidate evaluation. Both real backtests -- Step 1 (research_strategy's
+    # per-strategy "BACKTEST RESULTS" block) and Step 5 (backtester's out-of-sample run) -- run with
     # position lifecycle ON by default to model real-world execution constraints (T+1 gestation,
-    # entry confirmation latency, and cooldowns).
+    # entry confirmation latency, and cooldowns), so the whole pipeline reports ONE discipline.
     step5_args = ["--strategy-file", STRATEGY_PATH, "--universe-file", BASKET_PATH,
                   "--mode", args.mode, "--data-provider", args.data_provider]
     if args.baseline_symbol:
@@ -209,6 +212,11 @@ def main():
     if args.no_plots:
         step5_args.append("--no-plots")
     if args.no_position_lifecycle:
+        # One off switch for the whole pipeline: step 1 (research_strategy) and step 5
+        # (backtester) are the two steps that actually backtest, so both must be told --
+        # otherwise `--no-position-lifecycle` would leave step 1's printed performance on
+        # the ON discipline and the two numbers would silently disagree.
+        step1_args.append("--no-position-lifecycle")
         step5_args.append("--no-position-lifecycle")
     if args.no_lifecycle_compare:
         step5_args.append("--no-lifecycle-compare")

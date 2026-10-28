@@ -245,7 +245,8 @@ def test_gate_rows_are_listed_separately_and_never_aligned():
     assert tenure.status == ph.STATUS_NON_REPLAYABLE
     assert tenure.blocking_reason == "TENURE_LOCKED"
 
-    # COOLDOWN_BLOCKED: the engine has no lifecycle layer -> it bought anyway.
+    # COOLDOWN_BLOCKED: this replay pins the lifecycle layer OFF (the archive is
+    # already the live post-lifecycle book), so it bought anyway.
     cool = _row(report, "000001.SZ")
     assert cool.status == ph.STATUS_DIVERGENT
     assert cool.tag == ph.TAG_GATE_NOT_MODELLED
@@ -789,9 +790,15 @@ def test_deep_copied_ticket_helper_does_not_share_state(tmp_path):
 
 
 def test_lifecycle_path_parity_multi_day():
+    """The sequential replay is a WRAPPER check, not a live-parity claim (F4).
+
+    Without `live_decisions` the helper must report INCONCLUSIVE; supplying the live
+    side turns it into a real comparison. The records fed below are the simulator's
+    own output used as a fixture -- they pin the comparison mechanics only.
+    """
     import numpy as np
     import pandas as pd
-    from common.position_lifecycle import PositionLifecycleConfig
+    from common.position_lifecycle import PositionLifecycleConfig, simulate_position_lifecycle
     from common.testing import make_ohlcv_from_closes as make_df
 
     dates = pd.bdate_range("2020-01-01", periods=15)
@@ -806,7 +813,17 @@ def test_lifecycle_path_parity_multi_day():
     weights.loc[dates[5], "B"] = 0.4
 
     cfg = PositionLifecycleConfig(guard_latency_bars=2, min_holding_bars=2)
+
     res = ph.verify_lifecycle_path_parity(universe, weights, cfg=cfg, market="china")
-    assert res["parity"] is True
-    assert len(res["mismatches"]) == 0
+    assert res["status"] == ph.LIFECYCLE_PARITY_INCONCLUSIVE
+    assert res["parity"] is False
+    assert res["replay_mismatches"] == []
     assert res["days_checked"] == 15
+
+    _, sim_records = simulate_position_lifecycle(universe, weights, cfg=cfg, market="china")
+    aligned = ph.verify_lifecycle_path_parity(
+        universe, weights, cfg=cfg, market="china", live_decisions=sim_records
+    )
+    assert aligned["status"] == ph.LIFECYCLE_PARITY_ALIGNED
+    assert aligned["parity"] is True
+    assert aligned["mismatches"] == []

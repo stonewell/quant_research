@@ -128,6 +128,13 @@ def _portfolio_score(universe: dict, template, params: dict, config: GeneratorCo
             china_trading=getattr(config, "china_trading", False),
             us_trading=getattr(config, "us_trading", False),
             hk_trading=getattr(config, "hk_trading", False),
+            # OFF by explicit decision (F2), matching `allocation_backtester.py`'s
+            # own default: candidate search ranks templates on an unconstrained
+            # signal landscape. The winner is NOT trusted on this number -- it is
+            # re-evaluated by `backtester` with the lifecycle layer ON, so the
+            # performance any operator reads from a strategy.json run is the
+            # ON-discipline figure, not this search score.
+            enable_position_lifecycle=False,
         )
         return result
     except Exception as exc:

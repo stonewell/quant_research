@@ -1163,5 +1163,100 @@ def test_pure_long_books_are_bit_identical_after_the_b3_5_fix(mode):
     assert (res["actual_weights"].to_numpy() >= 0).all()
 
 
+# --------------------------------------------------------------------------- #
+# (F4) `lifecycle_records` empty-list bypass. Root cause: the backtester tested
+# `lifecycle_records is not None`, so `lifecycle_records=[]` -- the shape every
+# caller gets from "no records were produced" -- skipped the state machine
+# entirely and returned the RAW, unfiltered weights while still reporting
+# `position_lifecycle_enabled=True`. A run that claims to model tenure locks,
+# entry confirmation and cooldowns, but modelled none of them.
+# --------------------------------------------------------------------------- #
+
+def _lifecycle_impulse_fixture():
+    """10 flat bars; a ONE-BAR impulse instructs 0.5/0.5 on day 0, flat on day 1.
+
+    The default lifecycle config (guard_latency_bars=2) must reject the day-0
+    entry (PENDING_ENTRY, streak 1/2) and then CANCEL_PENDING on day 1, so the
+    filtered book never trades at all, while the raw instruction is a two-leg
+    in-and-out.
+    """
+    dates = pd.bdate_range("2020-01-01", periods=10)
+    universe = {
+        "A": make_df([100.0] * 10, start="2020-01-01"),
+        "B": make_df([100.0] * 10, start="2020-01-01"),
+    }
+    weights = pd.DataFrame(np.nan, index=dates, columns=["A", "B"])
+    weights.loc[dates[0], "A"] = 0.5
+    weights.loc[dates[0], "B"] = 0.5
+    weights.loc[dates[1], "A"] = 0.0
+    weights.loc[dates[1], "B"] = 0.0
+    return dates, universe, weights
+
+
+def test_empty_lifecycle_records_runs_the_simulation_instead_of_bypassing_it():
+    """F4: `lifecycle_records=[]` must SIMULATE (and report it), not pass through."""
+    _dates, universe, weights = _lifecycle_impulse_fixture()
+
+    res_off = run_allocation_backtest(
+        universe, weights, initial_capital=100_000.0, enable_position_lifecycle=False,
+    )
+    res_empty = run_allocation_backtest(
+        universe, weights, initial_capital=100_000.0,
+        enable_position_lifecycle=True, lifecycle_records=[],
+    )
+    res_none = run_allocation_backtest(
+        universe, weights, initial_capital=100_000.0,
+        enable_position_lifecycle=True, lifecycle_records=None,
+    )
+
+    # The raw instruction really is a 2-rebalance in-and-out ...
+    assert res_off["total_rebalances"] == 2
+    # ... and the state machine filters BOTH legs, so nothing ever trades.
+    assert res_empty["total_rebalances"] == 0
+    assert (res_off["total_rebalances"] != res_empty["total_rebalances"])
+
+    # The empty list must have produced a real simulation (this is what proves
+    # the state machine ran rather than the weights being passed through).
+    assert res_empty["lifecycle_records"], "empty-list path produced no simulation records"
+    assert res_empty["position_lifecycle_enabled"] is True
+
+    # The book never left cash: equity stayed at the initial capital all 10 bars.
+    np.testing.assert_allclose(res_empty["equity_curve"]["equity"].to_numpy(), 100_000.0)
+
+    # `[]` is exactly `None` -- it must not short-circuit the simulation.
+    pd.testing.assert_frame_equal(res_empty["equity_curve"], res_none["equity_curve"])
+    assert res_empty["lifecycle_records"] == res_none["lifecycle_records"]
+    assert res_empty["position_lifecycle_enabled"] is res_none["position_lifecycle_enabled"] is True
+
+
+def test_non_empty_lifecycle_records_are_passed_through_without_second_filtering():
+    """F4: caller-supplied records mean "the FSM already ran upstream" -- do not re-run it.
+
+    `run_backtest.py::_run_fold_with_seed` warms the FSM over a fold's pre-eval
+    buffer and hands `run_allocation_backtest` the ALREADY filtered weights plus
+    the matching record list; simulating again would filter a filtered path
+    (double confirmation delay, double cooldowns).
+    """
+    _dates, universe, weights = _lifecycle_impulse_fixture()
+    records = [{"date": "2020-01-01", "symbol": "A", "action": "BUY", "target_weight": 0.5}]
+
+    res_pass = run_allocation_backtest(
+        universe, weights, initial_capital=100_000.0,
+        enable_position_lifecycle=True, lifecycle_records=records,
+    )
+    res_off = run_allocation_backtest(
+        universe, weights, initial_capital=100_000.0, enable_position_lifecycle=False,
+    )
+
+    # The records came back verbatim -- nothing was re-simulated or re-labelled.
+    assert res_pass["lifecycle_records"] == records
+    assert res_pass["position_lifecycle_enabled"] is True
+    # And the weights were NOT filtered a second time: byte-identical to the raw run.
+    assert res_pass["total_rebalances"] == res_off["total_rebalances"] == 2
+    pd.testing.assert_frame_equal(res_pass["equity_curve"], res_off["equity_curve"])
+    assert res_pass["total_turnover"] == pytest.approx(res_off["total_turnover"])
+
+
+
 
 

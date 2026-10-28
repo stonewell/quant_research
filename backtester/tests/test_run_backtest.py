@@ -360,6 +360,36 @@ def test_run_walkforward_warms_up_indicator_lookback_before_each_fold():
         assert fold["total_rebalances"] == 12
 
 
+def _assert_fold_log_covers_window(fold) -> list:
+    """Assert a fold carries one lifecycle record per (eval bar, symbol) -- and return it.
+
+    WHY THIS IS ASSERTED IN THE WALKFORWARD-WARMUP TESTS: `eval_records` used to be
+    filtered with `set(eval_index.astype(str))` (-> `'2021-12-06'`) against records
+    stamped `rec["date"] = str(Timestamp)` (-> `'2021-12-06 00:00:00'`), so the
+    filter matched NOTHING and every fold handed an EMPTY list to
+    `run_allocation_backtest`. Empty now means "no records supplied", so the engine
+    re-simulated the already-warmed weights and wiped the seeded day-0 row to 0.0.
+    An empty log here is that bug, not a quiet fold -- hence a hard assertion, not
+    a truthiness-forgiveness.
+    """
+    records = fold.get("lifecycle_records")
+    assert records, (
+        "fold lifecycle_records is EMPTY: the eval-window date filter dropped every "
+        "record (timestamped record stamp vs bare-day eval key), so the engine "
+        "re-simulated the already-filtered weights"
+    )
+    total_w = fold["actual_weights"].sum(axis=1)
+    n_symbols = len(fold["actual_weights"].columns)
+    assert len(records) == len(total_w) * n_symbols, (
+        f"expected one record per (bar, symbol) = {len(total_w)}x{n_symbols}, got {len(records)}"
+    )
+    eval_days = {str(d)[:10] for d in total_w.index}
+    assert {str(r.get("date"))[:10] for r in records} == eval_days, (
+        "fold records and the fold's own bars cover different days"
+    )
+    return records
+
+
 def test_run_walkforward_warms_up_indicator_lookback_with_lifecycle_on():
     """Lifecycle-ON variant: prebuffered warmup seeds positions without cold-start cash."""
     idx = pd.bdate_range("2020-01-01", periods=252 * 2)
@@ -381,7 +411,10 @@ def test_run_walkforward_warms_up_indicator_lookback_with_lifecycle_on():
     # Warmed folds have prebuffered state and execute scheduled rebalances
     for fold in folds[1:]:
         assert fold["total_rebalances"] >= 1
-    # Fold with full prebuffered history is actively invested from day 0
+        _assert_fold_log_covers_window(fold)
+    # Fold with full prebuffered history is actively invested from day 0. This is the
+    # assertion that catches the double-simulation bug directly: a re-simulated fold
+    # spends `guard_latency_bars` bars in PENDING_ENTRY_CONFIRM and opens at 0.0.
     w_df = folds[-1]["actual_weights"]
     total_w = w_df["A"] + w_df["B"]
     assert total_w.iloc[0] >= 0.95 and total_w.iloc[0] <= 1.05
@@ -434,6 +467,7 @@ def test_run_walkforward_fold1_uses_prebuffered_warmup_when_start_arg_provided_w
     total_w = w_df["A"] + w_df["B"]
     # Seeded from prebuffered warmup, fully invested at day 0
     assert total_w.iloc[0] >= 0.95 and total_w.iloc[0] <= 1.05
+    _assert_fold_log_covers_window(folds[0])
 
 
 
@@ -1982,6 +2016,9 @@ def test_walkforward_writes_walkforward_weights_csv_with_lifecycle_on(tmp_path, 
 
     # Fold 1 starts at day 0 without warmup; once confirmed (day 1+), fully invested
     # Fold 2+ has prebuffered warmup: day 0 is seeded, fully invested from day 0, no cold-start cash!
+    # This is exactly the shape a DOUBLE-simulated fold cannot produce: re-running the
+    # state machine over the already-filtered weights re-enters PENDING_ENTRY_CONFIRM and
+    # makes day 0 (and any later warm re-entry) read 0.0 again.
     for fold in unique_folds:
         fold_rows = df_weights[df_weights["fold"] == fold]
         assert len(fold_rows) > 0
@@ -1994,6 +2031,20 @@ def test_walkforward_writes_walkforward_weights_csv_with_lifecycle_on(tmp_path, 
             # Warmed folds have prebuffered state and are actively invested from day 0
             assert total_w.iloc[0] >= 0.45
 
+    # The roll-up lifecycle log must exist AND be populated: one record per
+    # (fold bar, symbol). It used to be a header-only file because `eval_records`
+    # never survived the eval-window date filter (see `_assert_fold_log_covers_window`).
+    lc_path = results_dir / "walkforward_lifecycle_records.csv"
+    assert lc_path.exists()
+    df_lc = pd.read_csv(lc_path)
+    assert len(df_lc) > 0, "walkforward_lifecycle_records.csv is empty -- eval_records filter regression"
+    assert len(df_lc) == 2 * len(df_weights), (
+        f"expected one record per (fold bar, symbol) = 2x{len(df_weights)}, got {len(df_lc)}"
+    )
+    assert set(df_lc["fold"].unique()) == set(unique_folds)
+    for fold in unique_folds:
+        assert len(df_lc[df_lc["fold"] == fold]) == 2 * len(df_weights[df_weights["fold"] == fold])
+
     # Also verify lifecycle_ab_comparison.csv was generated
     ab_path = results_dir / "lifecycle_ab_comparison.csv"
     assert ab_path.exists()
@@ -2002,6 +2053,125 @@ def test_walkforward_writes_walkforward_weights_csv_with_lifecycle_on(tmp_path, 
     assert "sharpe_on" in df_ab.columns
     assert "sharpe_off" in df_ab.columns
     assert "sharpe_sign_reversal" in df_ab.columns
+
+
+def test_walkforward_fold_weights_are_simulated_exactly_once(tmp_path, monkeypatch):
+    """ROOT-CAUSE REGRESSION: one lifecycle simulation per fold, not two.
+
+    The bug: `eval_records` was built by comparing two different date spellings --
+    `set(eval_index.astype(str))` -> `{'2021-12-06'}` against
+    `str(rec["date"])` -> `'2021-12-06 00:00:00'` -- so the filter always matched
+    NOTHING and every fold passed an EMPTY list to `run_allocation_backtest`.
+    Empty means "no records supplied" (F4), so the engine RE-SIMULATED the already
+    pre-buffer-warmed weights: a second `guard_latency_bars` confirmation pass that
+    cleared the seeded day-0 row to 0.0 and left `walkforward_lifecycle_records.csv`
+    header-only.
+
+    This test distinguishes "simulated once" from "simulated twice" positively, from
+    the engine's own inputs, instead of trusting the resulting numbers:
+      1. every lifecycle-ON fold must hand the engine a NON-EMPTY record list whose
+         day set is exactly the fold's own bar window;
+      2. replaying the state machine over the very weights the engine received must
+         CHANGE them (otherwise this fixture cannot tell 1x from 2x and the test
+         would be vacuous) -- and the fold's published weights must show the
+         SINGLE-simulation shape (invested on day 0), not the re-simulated one
+         (0.0 on day 0);
+      3. `walkforward_lifecycle_records.csv` must carry exactly one row per
+         (fold bar, symbol) -- the number the fold logs add up to.
+    """
+    from common.position_lifecycle import resolve_position_lifecycle_config, simulate_position_lifecycle
+
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(
+        strategy_path,
+        template_name="inverse_volatility",
+        params={"vol_lookback": 120, "rebalance_freq_days": 21},
+    )
+    results_dir = tmp_path / "results_once"
+    cache_dir = tmp_path / "cache_once"
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "AAPL", "MSFT",
+        "--data-provider", "synthetic",
+        "--mode", "walkforward",
+        "--window-years", "1.0",
+        "--step-years", "0.5",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+        "--enable-position-lifecycle",
+        # Serial on purpose: the spy below must observe the real fold calls.
+        "--n-jobs", "1",
+    ]
+
+    calls = []
+    real_run_allocation_backtest = backtester.run_backtest.run_allocation_backtest
+
+    def _spy(universe, weights, **kwargs):
+        calls.append({
+            "universe": universe,
+            "weights": weights.copy(),
+            "enable": kwargs.get("enable_position_lifecycle", False),
+            "records": kwargs.get("lifecycle_records"),
+        })
+        return real_run_allocation_backtest(universe, weights, **kwargs)
+
+    monkeypatch.setattr(backtester.run_backtest, "run_allocation_backtest", _spy)
+    monkeypatch.setattr(sys, "argv", argv)
+    main()
+
+    df_weights = pd.read_csv(results_dir / "walkforward_weights.csv")
+    n_folds = int(df_weights["fold"].max())
+    on_calls = [c for c in calls if c["enable"]]
+    assert len(on_calls) == n_folds, (
+        f"expected exactly one lifecycle-ON engine call per fold (no A/B arm), got "
+        f"{len(on_calls)} for {n_folds} folds"
+    )
+
+    # (1) Every fold's log survives the eval-window filter, and covers that window.
+    for c in on_calls:
+        records = c["records"]
+        assert records, (
+            "a fold handed an EMPTY lifecycle record list to the engine: the eval-window "
+            "date filter dropped every record, so the engine re-simulates the weights"
+        )
+        fold_days = {str(d)[:10] for d in c["weights"].index}
+        assert {str(r["date"])[:10] for r in records} == fold_days
+        assert len(records) == c["weights"].shape[0] * c["weights"].shape[1]
+
+    # (2) 1x vs 2x is distinguishable on THIS fixture, and the published weights are 1x.
+    probe = on_calls[-1]
+    half = probe["weights"].sum(axis=1)
+    cfg = resolve_position_lifecycle_config({"vol_lookback": 120, "rebalance_freq_days": 21})
+    re_simulated, _ = simulate_position_lifecycle(
+        universe=probe["universe"],
+        target_weights=probe["weights"],
+        cfg=cfg,
+        market="other",  # no --china/--us/--hk-trading in argv
+    )
+    re_sim_total = re_simulated.sum(axis=1).reindex(half.index)
+    assert not re_sim_total.empty
+    assert (re_sim_total - half).abs().max() > 0.05, (
+        "fixture cannot distinguish single from double simulation -- the assertion below "
+        "would be meaningless"
+    )
+
+    last_fold = df_weights[df_weights["fold"] == n_folds]
+    last_total = last_fold["AAPL"] + last_fold["MSFT"]
+    # Single simulation: the warmed fold opens invested. Double: it re-enters
+    # PENDING_ENTRY_CONFIRM and opens at (or near) 0.0.
+    assert half.iloc[0] >= 0.95
+    assert re_sim_total.iloc[0] < 0.05
+    assert last_total.iloc[0] >= 0.90, (
+        "the published fold opens flat -- that is the double-simulation signature "
+        "(seeded day-0 row wiped by a second entry-confirmation pass)"
+    )
+
+    # (3) The roll-up artifact carries exactly the fold logs' rows.
+    df_lc = pd.read_csv(results_dir / "walkforward_lifecycle_records.csv")
+    assert len(df_lc) > 0
+    assert len(df_lc) == 2 * len(df_weights)
+    assert len(df_lc) == sum(len(c["records"]) for c in on_calls)
 
 
 # --- §3 backtest_research_impl.md: strategy dump & run manifest test suite ---

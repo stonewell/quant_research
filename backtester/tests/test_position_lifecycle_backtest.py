@@ -83,14 +83,21 @@ def test_escape_hatch_disabled_is_bit_identical():
 
 
 def test_resolve_position_lifecycle_config_defaults_and_overrides():
-    """Verifies resolve_position_lifecycle_config default values and priority overrides."""
+    """Verifies resolve_position_lifecycle_config default values and priority overrides.
+
+    The defaults asserted here are the ones the live runner actually deploys
+    (`scripts/run_live_strategy.py`): `normal_cooldown_bars=2` and
+    `inertia_relative_ratio=0.0` since the resolver defaults were aligned with
+    them. A bare `PositionLifecycleConfig()` must model the SAME machine as a live
+    ticket, otherwise a backtest would be validating a looser state machine.
+    """
     cfg = resolve_position_lifecycle_config()
     assert cfg.guard_latency_bars == 2
     assert cfg.min_holding_bars == 2
-    assert cfg.normal_cooldown_bars == 1
+    assert cfg.normal_cooldown_bars == 2
     assert cfg.stop_cooldown_bars == 5
     assert cfg.inertia_threshold == 0.05
-    assert cfg.inertia_relative_ratio == 0.50
+    assert cfg.inertia_relative_ratio == 0.0
     assert cfg.hard_stop_loss_pct == 0.08
     assert cfg.atr_multiplier == 4.5
     assert cfg.enable_entry_fast_path is True
@@ -109,8 +116,12 @@ def test_resolve_position_lifecycle_config_defaults_and_overrides():
     assert cfg_p.inertia_threshold == 0.08
     assert cfg_p.inertia_relative_ratio == 0.60
 
-    # Bare/alias keys must be INERT (no collision with global/strategy params)
-    bare_params = {
+    # LIVE-RUNNER ALIASES now RESOLVE (they used to be inert, which meant a strategy
+    # carrying only `min_entry_bars` / `reentry_cooldown_bars` / `cfsb_min_holding_bars`
+    # silently backtested the DEFAULTS while the live ticket deployed its own values).
+    # The alias table is owned by `common/position_lifecycle.py`; asserted here at the
+    # resolution level so a precedence regression is caught from a consumer's side.
+    alias_params = {
         "min_weight_change": 0.0,
         "stop_loss_pct": 0.02,
         "hard_stop_loss": 0.03,
@@ -119,12 +130,22 @@ def test_resolve_position_lifecycle_config_defaults_and_overrides():
         "min_entry_bars": 7,
         "inertia_thresh": 0.20,
     }
-    cfg_bare = resolve_position_lifecycle_config(params=bare_params)
-    assert cfg_bare.guard_latency_bars == 2  # Not 7
-    assert cfg_bare.min_holding_bars == 2    # Not 9
-    assert cfg_bare.inertia_threshold == 0.05  # Not 0.0 or 0.20
-    assert cfg_bare.hard_stop_loss_pct == 0.08  # Not 0.02 or 0.03
-    assert cfg_bare.normal_cooldown_bars == 1  # Not 10
+    cfg_alias = resolve_position_lifecycle_config(params=alias_params)
+    assert cfg_alias.guard_latency_bars == 7          # <- min_entry_bars
+    assert cfg_alias.min_holding_bars == 9            # <- cfsb_min_holding_bars
+    assert cfg_alias.normal_cooldown_bars == 10       # <- reentry_cooldown_bars
+    assert cfg_alias.stop_cooldown_bars == 10         # <- max(5, normal_cooldown_bars)
+    # `inertia_thresh` is not a live spelling -> still inert.
+    assert cfg_alias.inertia_threshold == 0.0         # <- min_weight_change, not 0.20
+    # `stop_loss_pct` / `hard_stop_loss` are not in the live alias table for the hard
+    # stop -> the default stays.
+    assert cfg_alias.hard_stop_loss_pct == 0.08
+
+    # An explicit `lifecycle_*` key still beats any alias (precedence 1/2 over 4).
+    cfg_explicit_wins = resolve_position_lifecycle_config(
+        params={"lifecycle_guard_latency_bars": 3, "min_entry_bars": 11}
+    )
+    assert cfg_explicit_wins.guard_latency_bars == 3
 
 
 def test_lifecycle_entry_confirmation_filters_impulse():
@@ -312,10 +333,19 @@ def test_parity_harness_verify_lifecycle_step_parity():
 
 
 def test_cli_flags_in_run_backtest_and_run_pipeline():
-    """Verifies CLI argument wiring in backtester/run_backtest.py and pipeline/run_pipeline.py."""
+    """Verifies CLI argument wiring in backtester/run_backtest.py and pipeline/run_pipeline.py.
+
+    (F1) `--enable-position-lifecycle` used to be `store_true` + `default=True`: a dead
+    switch that was ALWAYS on and could never be switched off by its own flag. It now
+    parses to `None` when omitted and is normalized to `True`, with the negative flag on
+    its own dest so `--no-` wins regardless of argument order.
+    """
     parser_rb = rb.build_arg_parser()
     args_rb_default = parser_rb.parse_args(["--strategy-file", "dummy.json"])
     assert args_rb_default.enable_position_lifecycle is True
+
+    args_rb_explicit = parser_rb.parse_args(["--strategy-file", "dummy.json", "--enable-position-lifecycle"])
+    assert args_rb_explicit.enable_position_lifecycle is True
 
     args_rb_disabled = parser_rb.parse_args(["--strategy-file", "dummy.json", "--no-position-lifecycle"])
     assert args_rb_disabled.enable_position_lifecycle is False
@@ -323,12 +353,242 @@ def test_cli_flags_in_run_backtest_and_run_pipeline():
     args_rb_disabled_alias = parser_rb.parse_args(["--strategy-file", "dummy.json", "--disable-position-lifecycle"])
     assert args_rb_disabled_alias.enable_position_lifecycle is False
 
+    # Both flags at once: `--no-` wins in EITHER order (not "last flag wins").
+    both_no_last = parser_rb.parse_args([
+        "--strategy-file", "dummy.json", "--enable-position-lifecycle", "--no-position-lifecycle",
+    ])
+    assert both_no_last.enable_position_lifecycle is False
+    both_no_first = parser_rb.parse_args([
+        "--strategy-file", "dummy.json", "--no-position-lifecycle", "--enable-position-lifecycle",
+    ])
+    assert both_no_first.enable_position_lifecycle is False
+
     parser_rp = rp.build_arg_parser()
     args_rp_default = parser_rp.parse_args([])
     assert args_rp_default.no_position_lifecycle is False
 
     args_rp_disabled = parser_rp.parse_args(["--no-position-lifecycle"])
     assert args_rp_disabled.no_position_lifecycle is True
+
+
+def test_verify_lifecycle_step_parity_without_live_decision_is_inconclusive():
+    """(F4) No live side == nothing was compared, so the verdict is INCONCLUSIVE, not parity=True."""
+    cfg = PositionLifecycleConfig(guard_latency_bars=2)
+    state = AssetLifecycleState(symbol="600519", state=PositionState.FLAT)
+
+    res = verify_lifecycle_step_parity(
+        state=state,
+        raw_target_weight=0.20,
+        current_price=100.0,
+        cfg=cfg,
+        market="china",
+    )
+    assert res["status"] == "INCONCLUSIVE"
+    assert res["parity"] is False
+    assert res["mismatches"] == []
+    assert "INCONCLUSIVE" in res["note"]
+    # The simulated decision is still returned -- the caller needs it to build a
+    # live comparison (or to inspect the step).
+    assert res["decision"].action == "HOLD_FILTERED"
+
+
+def test_standard_writes_lifecycle_records_csv(tmp_path, monkeypatch):
+    """(F3) Standard mode persists the lifecycle decision log as its own artifact.
+
+    Row count is pinned to the engine's own `lifecycle_records` for the same run, and
+    the BUY/SELL subset is pinned to the number of actionable gate decisions -- so the
+    file is the log, not a placeholder.
+    """
+    import json
+
+    strategy_path = tmp_path / "strategy.json"
+    with open(strategy_path, "w") as f:
+        json.dump({"template_name": "equal_weight", "params": {"rebalance_freq_days": 5}}, f)
+    results_dir = tmp_path / "results_lc_records"
+    cache_dir = tmp_path / "cache_lc_records"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "AAPL", "MSFT",
+        "--data-provider", "synthetic",
+        "--mode", "standard",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+        "--no-plots",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    rb.main()
+
+    lc_path = results_dir / "lifecycle_records.csv"
+    assert lc_path.exists(), "lifecycle_records.csv must be written on a lifecycle-ON run"
+    df_lc = pd.read_csv(lc_path)
+    assert len(df_lc) > 0
+    assert list(df_lc.columns) == rb.LIFECYCLE_RECORD_COLUMNS
+    assert set(df_lc["action"]).issuperset({"HOLD"}) or len(df_lc) > 0
+    trades = int(df_lc["action"].isin(["BUY", "SELL"]).sum())
+    assert trades > 0, "the fixture must produce at least one lifecycle BUY/SELL decision"
+    # Every record must be attributable to a real (date, symbol).
+    assert df_lc["date"].notna().all() and df_lc["symbol"].notna().all()
+
+    # The pre-existing artifacts keep their exact schemas (L2.37): the new file is
+    # additive, nothing was renamed/inserted.
+    assert (results_dir / "backtest_equity.csv").exists()
+    weights_df = pd.read_csv(results_dir / "backtest_weights.csv", index_col=0)
+    assert list(weights_df.columns) == ["AAPL", "MSFT"]
+    rebal_df = pd.read_csv(results_dir / "rebalance_report.csv")
+    assert "date" in rebal_df.columns and "symbol" in rebal_df.columns
+
+
+def test_run_standard_warmup_window_keeps_lifecycle_records():
+    """The SAME date-format root cause existed on `run_standard`'s warmup path.
+
+    When `--start` cuts into the available history, `run_standard` filters the
+    simulator's records down to the eval window (`has_warmup` branch). It used to
+    compare `set(eval_index.astype(str))` -> `{'2020-06-25'}` against the
+    simulator's `str(Timestamp)` stamp `'2020-06-25 00:00:00'`, so the filter
+    matched nothing: the empty list then meant "no records supplied" and the
+    engine re-simulated the already-filtered weights (a second entry-confirmation
+    pass that clears the seeded first bar).
+    """
+    from types import SimpleNamespace
+
+    from common.strategy_spec import get_template
+
+    idx = pd.bdate_range("2020-01-01", periods=300)
+    rng = np.random.default_rng(7)
+    p_a = 100.0 * np.exp(np.cumsum(rng.normal(0.0004, 0.010, len(idx))))
+    p_b = 100.0 * np.exp(np.cumsum(rng.normal(0.0002, 0.012, len(idx))))
+    universe = {
+        "A": make_df(p_a, start="2020-01-01"),
+        "B": make_df(p_b, start="2020-01-01"),
+    }
+
+    template = get_template("inverse_volatility")
+    params = {"vol_lookback": 60, "rebalance_freq_days": 21}
+    # `start` inside the history -> `has_warmup` is True -> the filtered branch runs.
+    args = SimpleNamespace(
+        start=idx[120].strftime("%Y-%m-%d"),
+        end=None,
+        initial_capital=100_000.0,
+        commission_pct=0.0,
+        slippage_pct=0.0,
+        min_shares=1,
+        min_weight_change=0.0,
+        china_trading=False,
+        us_trading=False,
+        hk_trading=False,
+        execution_price="close",
+        market_impact=False,
+        market_impact_gamma=1.0,
+        max_volume_participation=None,
+        cash_sweep_rate=None,
+        borrow_fee_annual=None,
+        enable_position_lifecycle=True,
+    )
+
+    result = rb.run_standard(universe, template, params, args)
+    equity = result["equity_curve"]
+    records = result["lifecycle_records"]
+    assert len(equity) > 0
+    assert records, (
+        "run_standard dropped every lifecycle record at the eval-window filter -- the "
+        "engine then re-simulates the already-filtered weights"
+    )
+    # One record per (eval bar, symbol), spanning exactly the eval window.
+    assert len(records) == len(equity) * 2
+    assert {str(r["date"])[:10] for r in records} == {str(d)[:10] for d in equity.index}
+    # Single simulation: the seeded first bar stays invested (re-simulating would
+    # put it back into PENDING_ENTRY_CONFIRM and read 0.0).
+    assert result["actual_weights"].iloc[0].sum() >= 0.95
+
+
+def test_no_lifecycle_records_csv_when_layer_disabled(tmp_path, monkeypatch):
+    """(F3) With the layer OFF there is no decision log -- and no empty placeholder file.
+
+    The chosen contract is "no file at all": an empty CSV would be indistinguishable
+    from "the layer ran and never traded", which is exactly the ambiguity the
+    blocking_reason work exists to remove.
+    """
+    import json
+
+    strategy_path = tmp_path / "strategy.json"
+    with open(strategy_path, "w") as f:
+        json.dump({"template_name": "equal_weight", "params": {"rebalance_freq_days": 5}}, f)
+    results_dir = tmp_path / "results_lc_off"
+    cache_dir = tmp_path / "cache_lc_off"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "AAPL", "MSFT",
+        "--data-provider", "synthetic",
+        "--mode", "standard",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+        "--no-plots",
+        "--no-position-lifecycle",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    rb.main()
+
+    assert not (results_dir / "lifecycle_records.csv").exists()
+    assert (results_dir / "backtest_equity.csv").exists()
+
+    with open(results_dir / "run_manifest.json", "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    assert manifest["enable_position_lifecycle"] is False
+    assert manifest["position_lifecycle_config"] is None
+
+
+def test_walkforward_writes_lifecycle_records_csv(tmp_path, monkeypatch):
+    """(F3) Walkforward mode rolls the per-fold decision logs into one file with a `fold` column."""
+    import json
+
+    strategy_path = tmp_path / "strategy.json"
+    with open(strategy_path, "w") as f:
+        json.dump({"template_name": "equal_weight", "params": {"rebalance_freq_days": 5}}, f)
+    results_dir = tmp_path / "results_wf_lc"
+    cache_dir = tmp_path / "cache_wf_lc"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "AAPL", "MSFT",
+        "--data-provider", "synthetic",
+        "--mode", "walkforward",
+        "--start", "2021-01-01",
+        "--end", "2024-12-31",
+        "--window-years", "1.0",
+        "--step-years", "1.0",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+        "--no-plots",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    rb.main()
+
+    wf_lc_path = results_dir / "walkforward_lifecycle_records.csv"
+    assert wf_lc_path.exists()
+    df_wf = pd.read_csv(wf_lc_path)
+    assert list(df_wf.columns) == ["fold"] + rb.LIFECYCLE_RECORD_COLUMNS
+    assert len(df_wf) > 0
+    assert df_wf["fold"].nunique() >= 2, "the fixture must span more than one fold"
+    assert set(df_wf["fold"].unique()) == set(range(1, int(df_wf["fold"].max()) + 1))
+
+    # `walkforward_report.csv` must NOT have gained a list-valued lifecycle column.
+    wf_report = pd.read_csv(results_dir / "walkforward_report.csv")
+    assert "lifecycle_records" not in wf_report.columns
+    assert "fold" not in wf_report.columns
+    assert "sharpe_ratio" in wf_report.columns
+
+    # ...nor may the JSON summary's per-fold records carry them (L2.37: the new
+    # artifact is additive, the existing ones keep their exact fields).
+    with open(results_dir / "walkforward_summary.json", "r", encoding="utf-8") as f:
+        summary = json.load(f)
+    for fold_record in summary["rolling_window_performance"]:
+        assert "lifecycle_records" not in fold_record
+    assert "lifecycle_records" not in summary
 
 
 def test_backtest_with_lifecycle_enabled_end_to_end():
@@ -390,7 +650,18 @@ def test_simulate_position_lifecycle_missing_price_records_no_price():
 
 
 def test_verify_lifecycle_path_parity_multi_day():
-    """Requirement 5: Multi-day synthetic path through sequential live step vs simulate_position_lifecycle."""
+    """Multi-day path: the self-replay is NOT a parity claim anymore (F4).
+
+    `verify_lifecycle_path_parity` replays `step_position_lifecycle()` day by day and
+    cross-checks it against `simulate_position_lifecycle()`. Both sides are this
+    codebase, so:
+      * with no live side supplied it must report INCONCLUSIVE (pre-F4 it returned
+        `parity=True` for a comparison it had only performed against itself);
+      * with `live_decisions` supplied it reports ALIGNED / DIVERGED against THOSE
+        records.
+    The "live" records below are the simulator's own output replayed as a fixture --
+    they pin the COMPARISON MECHANICS, not a real live-vs-backtest agreement.
+    """
     dates = pd.bdate_range("2020-01-01", periods=20)
     rng = np.random.default_rng(123)
     p_a = 100.0 + np.cumsum(rng.normal(0.1, 1.0, len(dates)))
@@ -416,16 +687,48 @@ def test_verify_lifecycle_path_parity_multi_day():
         inertia_threshold=0.05,
     )
 
+    # 1. No live side -> INCONCLUSIVE, and the internal replay itself agrees.
     parity_res = verify_lifecycle_path_parity(
         universe=universe,
         target_weights=weights,
         cfg=cfg,
         market="china",
     )
-
-    assert parity_res["parity"] is True, f"Parity mismatches: {parity_res['mismatches']}"
-    assert len(parity_res["mismatches"]) == 0
+    assert parity_res["status"] == "INCONCLUSIVE"
+    assert parity_res["parity"] is False
+    assert parity_res["mismatches"] == []
+    assert parity_res["replay_mismatches"] == []
     assert parity_res["days_checked"] == len(dates)
+    assert "INCONCLUSIVE" in parity_res["note"]
+
+    # 2. A live side is supplied -> the verdict becomes a real comparison.
+    _, sim_records = simulate_position_lifecycle(universe, weights, cfg=cfg, market="china")
+    assert sim_records, "fixture requires the simulator to emit decision records"
+    aligned = verify_lifecycle_path_parity(
+        universe=universe,
+        target_weights=weights,
+        cfg=cfg,
+        market="china",
+        live_decisions=pd.DataFrame(sim_records),
+    )
+    assert aligned["status"] == "ALIGNED", aligned["mismatches"]
+    assert aligned["parity"] is True
+    assert aligned["live_records_checked"] == len(sim_records)
+
+    # 3. A divergent live row is caught (the verdict is not vacuously green).
+    divergent = pd.DataFrame(sim_records).copy()
+    flipped = 0 if divergent.loc[0, "action"] == "BUY" else "BUY"
+    divergent.loc[0, "action"] = flipped
+    diverged = verify_lifecycle_path_parity(
+        universe=universe,
+        target_weights=weights,
+        cfg=cfg,
+        market="china",
+        live_decisions=divergent,
+    )
+    assert diverged["status"] == "DIVERGED"
+    assert diverged["parity"] is False
+    assert any("Action mismatch" in m for m in diverged["mismatches"])
 
 
 def test_standard_lifecycle_ab_comparison_written(tmp_path, monkeypatch):

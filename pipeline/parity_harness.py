@@ -56,13 +56,21 @@ WHAT THE REPLAY MODEL IS (disclosed, and why it is honest)
    ``--cost-model engine`` turns the engine's real cost model back on, which
    then shows up as a weight divergence -- an honest signal about what costs
    would have done to the archived book.
-3. **No lifecycle layer.** The backtester has no Stage-2 position-lifecycle
-   machine, so any archived row whose non-trade was caused by a Stage-2 gate
-   (``COOLDOWN_BLOCKED``, ``TENURE_LOCKED``, ``MIN_ENTRY_THRESHOLD``,
-   ``MARKET_CLOSED_FREEZE``, ``PENDING_ENTRY_CONFIRM``, ``LIMIT_UP_LOCKED``,
-   ``CANCEL_PENDING``) can never be reproduced by the replay. Those rows are
-   listed separately and are never counted as "aligned", even when the share
-   count happens to match (see :data:`GATE_REASONS`).
+3. **Lifecycle layer pinned OFF in the replay.** This harness replays the
+   archived book with `enable_position_lifecycle=False` (declared explicitly at
+   the `run_allocation_backtest` call, see :func:`run_replay`). That is a
+   like-for-like choice, not a claim that the engine lacks the layer: the
+   archive's book is already the LIVE post-lifecycle book, so running the gates
+   again would double-apply them. The consequence is that any archived row whose
+   non-trade was caused by a Stage-2 gate (``COOLDOWN_BLOCKED``,
+   ``TENURE_LOCKED``, ``MIN_ENTRY_THRESHOLD``, ``MARKET_CLOSED_FREEZE``,
+   ``PENDING_ENTRY_CONFIRM``, ``LIMIT_UP_LOCKED``, ``CANCEL_PENDING``) cannot be
+   reproduced by THIS replay. Those rows are listed separately and are never
+   counted as "aligned", even when the share count happens to match (see
+   :data:`GATE_REASONS`). Gate-level parity is a different, narrower question --
+   see :func:`verify_lifecycle_step_parity` / :func:`verify_lifecycle_path_parity`,
+   which compare decision records rather than book weights, and which report
+   ``INCONCLUSIVE`` unless the caller supplies the LIVE side's decisions.
 
 WHAT THIS HARNESS CANNOT PROVE -- READ THIS BEFORE CITING A GREEN RUN
 =====================================================================
@@ -843,6 +851,14 @@ def run_replay(
         min_weight_change=0.0,
         **_MARKET_FLAGS[inputs.market],
         **_COST_MODELS[cost_model],
+        # Pinned OFF for a parity comparison (F2): the archived book IS the live
+        # post-lifecycle book, so replaying it through the lifecycle layer would
+        # apply the gates a SECOND time and the two sides would no longer be
+        # comparing the same sizing/rounding decision. Keeping this False is what
+        # makes `--cost-model none` a like-for-like share-count comparison; the
+        # gated rows it therefore cannot reproduce are reported as
+        # `gate_not_modelled`, never counted as aligned.
+        enable_position_lifecycle=False,
     )
     if result.get("equity_curve") is None or result["equity_curve"].empty:
         raise ParityConfigError(
@@ -1001,8 +1017,9 @@ class ParityReport:
 def _row_explanation(tag: Optional[str], gate: str) -> str:
     if tag == TAG_GATE_NOT_MODELLED:
         return (
-            f"archive gate {gate} suppressed the trade; the backtester has no position-lifecycle "
-            "layer, so it executed the row's target weight instead -- not reproducible by replay"
+            f"archive gate {gate} suppressed the trade; this replay runs with the position-lifecycle "
+            "layer pinned OFF (the archived book is already the post-lifecycle book, so the gates are "
+            "not re-applied), so it executed the row's target weight instead -- not reproducible here"
         )
     if tag == TAG_CANCEL_PENDING:
         return "CANCEL_PENDING is a never-held record: the archive traded nothing by design"
@@ -1233,8 +1250,9 @@ def compare(
             "market data and the strategy signal are identical on both sides, so neither is validated",
             "two flat sessions: the seed session opens the archived holdings at the ticket's own "
             "prices, so the replay measures sizing/rounding/accounting, not a return path",
-            "the backtester has no Stage-2 position-lifecycle layer; gated rows are listed separately"
-            " and never counted as aligned",
+            "this replay pins the position-lifecycle layer OFF (the archived book is already the live "
+            "post-lifecycle book, so re-applying the gates would double-count them); gated rows are "
+            "listed separately and never counted as aligned",
         ],
     }
 
@@ -1437,6 +1455,15 @@ def _json_default(value: Any) -> Any:
     return str(value)
 
 
+#: Verdict labels for the lifecycle parity helpers. They are deliberately three-valued:
+#: "we did not compare against a live decision" is a DIFFERENT claim from "we
+#: compared and it matched", and collapsing the two into `parity=True` is exactly
+#: the self-comparison bug F4 removed.
+LIFECYCLE_PARITY_ALIGNED = "ALIGNED"
+LIFECYCLE_PARITY_DIVERGED = "DIVERGED"
+LIFECYCLE_PARITY_INCONCLUSIVE = "INCONCLUSIVE"
+
+
 def verify_lifecycle_step_parity(
     state: Union[AssetLifecycleState, Dict[str, Any]],
     raw_target_weight: float,
@@ -1452,7 +1479,30 @@ def verify_lifecycle_step_parity(
     is_market_open: bool = True,
     is_portfolio_deleverage: bool = False,
 ) -> Dict[str, Any]:
-    """Compares a position lifecycle simulation step against a live execution decision.
+    """Compare ONE simulated lifecycle step against the LIVE side's decision record.
+
+    WHAT THIS PROVES
+    ----------------
+    That `step_position_lifecycle()` reproduces the (action, target_weight,
+    blocking_reason) triple a live run actually recorded for the same input state.
+    That is a decision-level check: it says the two implementations of the SAME step
+    agree, which is what catches a config drift, a resetted-streak bug, or an
+    `action` string that changed meaning.
+
+    WHAT THIS DOES **NOT** PROVE -- and why "parity" alone is never a green light
+    ------------------------------------------------------------------------------
+    * It is NOT an end-to-end comparison against `scripts/run_live_strategy.py`.
+      No ticket generation, no order routing, no lot rounding, no sells-before-buys
+      sequencing, no cash sweep. Those live in the live runner and are only covered
+      if the caller feeds this function the decisions that runner actually emitted.
+    * The state fed here is supplied by the caller; if the caller passes the
+      simulator's own output back in as `live_decision` it is comparing the engine
+      with itself and will always "pass". Nothing here can detect that.
+
+    Because of the above, the verdict is three-valued and OPT-IN:
+      * `live_decision` supplied      -> status "ALIGNED" / "DIVERGED" (+ `parity`);
+      * `live_decision` not supplied  -> status "INCONCLUSIVE", `parity` False.
+        Pre-F4 this returned `parity=True` on a comparison that never happened.
 
     Parameters:
         state: Initial asset lifecycle state (AssetLifecycleState or dict).
@@ -1460,12 +1510,16 @@ def verify_lifecycle_step_parity(
         current_price: Price used for evaluation.
         cfg: State machine configuration.
         market: Target exchange market ('china', 'us', 'hk').
-        live_decision: Optional decision from live run (LifecycleDecision or ticket dict).
+        live_decision: The LIVE decision to compare against -- a `LifecycleDecision`
+            or the dict form (a ticket row carrying `action`/`target_weight`/
+            `blocking_reason`). REQUIRED for a real verdict.
         ... additional market condition kwargs.
 
     Returns:
-        Dict containing 'parity' (bool), 'decision' (LifecycleDecision),
-        'state_after' (AssetLifecycleState), and 'mismatches' (list of str).
+        Dict containing 'status' (ALIGNED|DIVERGED|INCONCLUSIVE), 'parity' (bool,
+        False unless a live decision was compared and matched), 'decision'
+        (LifecycleDecision), 'state_after' (AssetLifecycleState), 'mismatches'
+        (list of str) and 'note' (why the verdict is what it is).
     """
     if isinstance(state, dict):
         st = AssetLifecycleState.from_dict(state)
@@ -1506,11 +1560,58 @@ def verify_lifecycle_step_parity(
             mismatches.append(f"Blocking reason mismatch: sim={decision.blocking_reason} vs live={live_br}")
 
     return {
-        "parity": len(mismatches) == 0,
+        "parity": live_decision is not None and len(mismatches) == 0,
+        "status": (
+            LIFECYCLE_PARITY_INCONCLUSIVE if live_decision is None
+            else (LIFECYCLE_PARITY_ALIGNED if not mismatches else LIFECYCLE_PARITY_DIVERGED)
+        ),
         "decision": decision,
         "state_after": st,
         "mismatches": mismatches,
+        "note": (
+            "no live_decision supplied: this is the simulator's own step, so there is nothing to "
+            "compare against -- INCONCLUSIVE, not a parity claim"
+            if live_decision is None else
+            "compared against the caller-supplied live decision record"
+        ),
     }
+
+
+def _index_live_lifecycle_decisions(live_decisions: Any) -> Dict[tuple, Dict[str, Any]]:
+    """Normalize the caller's live decision records into `{(date, symbol): record}`.
+
+    Accepts (all 100% offline, caller-supplied):
+      * a `pandas.DataFrame` with at least `date`/`symbol` columns (a live ticket
+        CSV or an archived lifecycle log),
+      * a list of dicts carrying `date`/`symbol`,
+      * an already-keyed mapping `{(date, symbol): record}`.
+
+    Rows without a usable `date`/`symbol` pair are dropped rather than guessed --
+    a silently mis-keyed comparison would report a false DIVERGED.
+    """
+    out: Dict[tuple, Dict[str, Any]] = {}
+    if live_decisions is None:
+        return out
+    if isinstance(live_decisions, pd.DataFrame):
+        items = live_decisions.to_dict(orient="records")
+    elif isinstance(live_decisions, Mapping):
+        for key, value in live_decisions.items():
+            if isinstance(key, tuple) and len(key) == 2:
+                rec = dict(value) if isinstance(value, Mapping) else {"action": value}
+                out[(str(key[0]), str(key[1]))] = rec
+        return out
+    else:
+        items = list(live_decisions)
+
+    for rec in items:
+        if not isinstance(rec, Mapping):
+            continue
+        date = rec.get("date")
+        symbol = rec.get("symbol")
+        if date is None or symbol is None:
+            continue
+        out[(str(date), str(symbol))] = dict(rec)
+    return out
 
 
 def verify_lifecycle_path_parity(
@@ -1519,11 +1620,36 @@ def verify_lifecycle_path_parity(
     cfg: PositionLifecycleConfig,
     market: str = "china",
     cash_proxy: Optional[str] = None,
+    live_decisions: Any = None,
 ) -> Dict[str, Any]:
-    """Replays a multi-day synthetic path through sequential live step_position_lifecycle
-    calls and compares against simulate_position_lifecycle (backtest simulation).
+    """Replay a multi-day path and compare the DECISION RECORDS, not the book.
 
-    Asserts identical per-day actions, blocking reasons, and weights (|Δw| < MAX_ABS_DELTA_W).
+    WHAT THIS ACTUALLY COMPARES (read before citing a green run)
+    -----------------------------------------------------------
+    `simulate_position_lifecycle()` (the backtest simulator) is compared against a
+    hand-rolled SEQUENTIAL replay of `step_position_lifecycle()` -- one call per
+    (date, symbol), carrying the state forward day by day. That catches wrapper /
+    temporal bugs: the simulator forgetting to persist state between bars, dropping
+    the cash proxy, re-deriving a different market, or emitting records for dates
+    the sequential path never visits. Its verdict (`replay_mismatches`) is a real
+    signal about the simulator.
+
+    It is NOT an end-to-end parity test against `scripts/run_live_strategy.py`.
+    Both sides of `replay_mismatches` are THIS process and this codebase; nothing
+    here exercises ticket generation, lot rounding, sells-before-buys ordering,
+    cash sweep, or the broker. To make an end-to-end claim, pass the live side's
+    own decision records as `live_decisions` (a DataFrame/list of dicts with
+    `date`/`symbol`, or a `{(date, symbol): record}` mapping -- e.g. an archived
+    live ticket CSV); the simulator's records are then cross-checked against them
+    on (action, target_weight, blocking_reason).
+
+    Verdict, three-valued:
+      * `live_decisions` supplied and everything matches -> "ALIGNED", parity True;
+      * any mismatch (either the internal replay or the live cross-check) ->
+        "DIVERGED", parity False;
+      * no `live_decisions` supplied -> "INCONCLUSIVE", parity False. Pre-F4 this
+        returned `parity=True` for a comparison the harness had only performed
+        against a copy of itself.
     """
     sim_weights, sim_records = simulate_position_lifecycle(
         universe=universe,
@@ -1562,8 +1688,12 @@ def verify_lifecycle_path_parity(
     raw_targets = target_weights.ffill().fillna(0.0)
 
     sim_rec_map = {(str(r["date"]), str(r["symbol"])): r for r in sim_records}
+    live_rec_map = _index_live_lifecycle_decisions(live_decisions)
 
-    mismatches: List[str] = []
+    # Simulator (batch) vs the per-bar sequential replay below. BOTH sides are
+    # this codebase: a mismatch here is a wrapper/statefulness bug, not a live
+    # divergence.
+    replay_mismatches: List[str] = []
 
     for t in target_weights.index:
         t_str = str(t)
@@ -1639,27 +1769,74 @@ def verify_lifecycle_path_parity(
 
             sim_rec = sim_rec_map.get((t_str, sym))
             if sim_rec is None:
-                mismatches.append(f"Missing sim record for date={t_str}, sym={sym}")
+                replay_mismatches.append(f"Missing sim record for date={t_str}, sym={sym}")
                 continue
 
             if sim_rec["action"] != live_dec.action:
-                mismatches.append(
+                replay_mismatches.append(
                     f"Action mismatch on {t_str} for {sym}: sim={sim_rec['action']} vs live={live_dec.action}"
                 )
             if abs(float(sim_rec["target_weight"]) - float(live_dec.target_weight)) > MAX_ABS_DELTA_W:
-                mismatches.append(
+                replay_mismatches.append(
                     f"Target weight mismatch on {t_str} for {sym}: sim={sim_rec['target_weight']} vs live={live_dec.target_weight}"
                 )
             if coerce_blocking_reason(sim_rec["blocking_reason"]) != coerce_blocking_reason(live_dec.blocking_reason):
-                mismatches.append(
+                replay_mismatches.append(
                     f"Blocking reason mismatch on {t_str} for {sym}: sim={sim_rec['blocking_reason']} vs live={live_dec.blocking_reason}"
                 )
 
+    # ---- The ONLY comparison that can produce an end-to-end claim: the
+    # simulator's records vs the caller-supplied LIVE decision records. Absent a
+    # live side this loop does not run at all and the verdict stays INCONCLUSIVE.
+    mismatches: List[str] = []
+    for (date_str, sym), live_rec in live_rec_map.items():
+        sim_rec = sim_rec_map.get((date_str, sym))
+        if sim_rec is None:
+            mismatches.append(
+                f"Live decision on {date_str} for {sym} has no simulator record to compare against"
+            )
+            continue
+        live_action = str(live_rec.get("action", ""))
+        if str(sim_rec["action"]) != live_action:
+            mismatches.append(
+                f"Action mismatch on {date_str} for {sym}: sim={sim_rec['action']} vs live={live_action}"
+            )
+        try:
+            live_tw = float(live_rec.get("target_weight", 0.0))
+        except (TypeError, ValueError):
+            live_tw = float("nan")
+        if not (abs(float(sim_rec["target_weight"]) - live_tw) <= MAX_ABS_DELTA_W):
+            mismatches.append(
+                f"Target weight mismatch on {date_str} for {sym}: "
+                f"sim={sim_rec['target_weight']} vs live={live_rec.get('target_weight')}"
+            )
+        if coerce_blocking_reason(sim_rec["blocking_reason"]) != coerce_blocking_reason(live_rec.get("blocking_reason")):
+            mismatches.append(
+                f"Blocking reason mismatch on {date_str} for {sym}: "
+                f"sim={sim_rec['blocking_reason']} vs live={live_rec.get('blocking_reason')}"
+            )
+
     return {
-        "parity": len(mismatches) == 0,
+        "parity": live_decisions is not None and not mismatches and not replay_mismatches,
+        "status": (
+            LIFECYCLE_PARITY_DIVERGED if (mismatches or replay_mismatches)
+            else (LIFECYCLE_PARITY_INCONCLUSIVE if live_decisions is None else LIFECYCLE_PARITY_ALIGNED)
+        ),
+        # Live cross-check mismatches (empty when no live side was supplied).
         "mismatches": mismatches,
+        # Simulator-vs-sequential-replay mismatches: a real bug signal about THIS
+        # process, never a statement about the live runner.
+        "replay_mismatches": replay_mismatches,
         "days_checked": len(target_weights.index),
         "records_checked": len(sim_records),
+        "live_records_checked": len(live_rec_map),
+        "note": (
+            "wrapper/sequential-replay check only (both sides are this codebase): INCONCLUSIVE, "
+            "not a live parity claim -- pass live_decisions from an archived live ticket to make "
+            "an end-to-end comparison"
+            if live_decisions is None else
+            "cross-checked against the caller-supplied live decision records"
+        ),
     }
 
 

@@ -118,8 +118,95 @@ def backtest_expected_last_session(value=_LEGAL_BACKTEST_SESSION):
     return _LEGAL_BACKTEST_SESSION
 
 
+def normalize_position_lifecycle_flag(args):
+    """Resolve the `--enable-position-lifecycle` / `--no-position-lifecycle` pair into one bool.
+
+    `--enable-position-lifecycle` parses to `True` or `None` (None = not typed),
+    `--no-position-lifecycle` parses to its own `no_position_lifecycle` flag.
+    The effective value is OFF only when the negative flag was supplied, so the
+    off switch is the single, order-independent way to disable the layer:
+    `--no-` beats `--enable-` no matter which came first on the command line.
+
+    Idempotent and tolerant of namespaces that carry neither attribute (the
+    tests' `MockArgs`, hand-built namespaces): those keep the documented ON
+    default, which is what the pre-F1 `default=True` switch silently enforced.
+    """
+    disabled = bool(getattr(args, "no_position_lifecycle", False))
+    requested = getattr(args, "enable_position_lifecycle", None)
+    args.enable_position_lifecycle = False if disabled else (True if requested is None else bool(requested))
+    return args
+
+
+class _PositionLifecycleArgumentParser(argparse.ArgumentParser):
+    """`argparse.ArgumentParser` that normalizes the lifecycle pair after parsing.
+
+    The normalization lives in the parser (rather than in `main()`) so EVERY
+    caller that goes through `build_arg_parser().parse_args(...)` -- `main`,
+    the tests, `scripts/run_batch_backtest.py` -- observes the same resolved
+    `args.enable_position_lifecycle` bool, and no call site can inherit a
+    `None` that reads as OFF by accident.
+    """
+
+    def parse_args(self, args=None, namespace=None):
+        return normalize_position_lifecycle_flag(super().parse_args(args, namespace))
+
+
+def _normalise_day_keys(values) -> set:
+    """Reduce a date-like container to a set of `YYYY-MM-DD` day keys.
+
+    WHY THIS EXISTS (regression, fixed after F4): the two sides of the
+    "which lifecycle records fall inside the eval window?" comparison were
+    formatted DIFFERENTLY. `common/position_lifecycle.py` stamps every decision
+    record with `rec["date"] = str(t)` where `t` is a `Timestamp`, i.e.
+    `'2021-12-06 00:00:00'`, while the eval index was stringified verbatim via
+    `set(eval_index.astype(str))` -> `{'2021-12-06'}`. `str(r["date"]) in
+    eval_dates_set` therefore matched NOTHING (except on an index that happened
+    to carry a time component), so `eval_records` was ALWAYS `[]`.
+
+    That emptiness was invisible while `run_allocation_backtest` treated "empty
+    list" as "caller supplied records" (it passed the raw, unfiltered weights
+    through). Once the F4 fix made empty-list mean "no records supplied", the
+    same folds started RE-SIMULATING already-filtered, pre-buffer-warmed weights
+    -- a second `guard_latency_bars` confirmation pass that silently cleared the
+    fold's seeded day-0 row to 0.0 and made `walkforward_lifecycle_records.csv`
+    permanently empty. Normalising BOTH sides to the day granularity (one
+    function, used by both call sites -- never two copies) removes the format
+    coupling entirely.
+
+    Robust to the three input shapes the callers actually pass: a
+    `pd.DatetimeIndex` (the normal case), an index of strings / `date` /
+    `datetime` objects (a template-built or CSV-round-tripped calendar), and a
+    plain list/ndarray of any of those. Every supported spelling starts with
+    `YYYY-MM-DD`, so the textual fallback below is exact to the day.
+    """
+    if values is None:
+        return set()
+    try:
+        return set(pd.DatetimeIndex(list(values)).strftime("%Y-%m-%d"))
+    except (TypeError, ValueError, OverflowError):
+        return {str(v)[:10] for v in values}
+
+
+def _lifecycle_records_in_window(records, eval_index) -> list:
+    """Filter a lifecycle decision log to the bars covered by `eval_index`.
+
+    Both sides are day-normalised through :func:`_normalise_day_keys`, so the
+    `'2021-12-06 00:00:00'` record stamp and the `'2021-12-06'` eval bar agree.
+    A record with no `date` key is kept (fail-open: dropping it would make the
+    caller hand an EMPTY list to `run_allocation_backtest`, which now means
+    "re-simulate" -- the exact double-filtering bug this fixes).
+    """
+    eval_dates_set = _normalise_day_keys(eval_index)
+    out = []
+    for rec in records or []:
+        stamp = rec.get("date")
+        if stamp is None or str(stamp)[:10] in eval_dates_set:
+            out.append(rec)
+    return out
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Standalone Basket Allocation Backtester")
+    p = _PositionLifecycleArgumentParser(description="Standalone Basket Allocation Backtester")
     p.add_argument("--strategy-file", required=True, help="Path to strategy.json file exported by strategy_generator")
     add_universe_cli_args(p)
     p.add_argument("--start", default="2015-01-01")
@@ -202,15 +289,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "FINANCING cost, not a fill: rebalance_report (commission/slippage/stamp/"
                         "impact) is unchanged by it. Default: unset = off (the pre-B3.4 engine "
                         "bit-for-bit), NOT the task table's 4.5%% -- pass 0.045 to enable it.")
+    # Tri-state pair, NOT a `store_true(default=True)` dead switch (F1): with
+    # `store_true` + `default=True` the flag was a constant -- `args.` was True
+    # whether or not the operator typed it, and only `--no-position-lifecycle`
+    # could ever move it. The evidence that it was dead: no code could tell
+    # "explicitly asked for ON" from "said nothing", so `run_manifest.json`'s
+    # provenance recorded the same value for both.
+    # Now: default is None ("the operator said nothing"), normalized to True
+    # right after parsing by `normalize_position_lifecycle_flag` (see
+    # `_PositionLifecycleArgumentParser`). The negative flag uses its OWN dest
+    # so `--no-` wins even when `--enable-` is passed after it -- an argparse
+    # shared-dest pair would let argument ORDER decide, which is not a
+    # documented contract anywhere.
     p.add_argument("--enable-position-lifecycle",
                    dest="enable_position_lifecycle",
                    action="store_true",
-                   default=True,
-                   help="Enable Unified Position Lifecycle State Machine (UPLSM) in backtest to model confirmation periods, T+1 tenure locks, cooldowns, and stop-loss exits (default: True).")
+                   default=None,
+                   help="Explicitly request the Unified Position Lifecycle State Machine (UPLSM) in "
+                        "the backtest: entry confirmation latency, T+1 tenure locks, cooldowns and "
+                        "stop-loss exits. Already the DEFAULT -- the flag exists only to make the "
+                        "choice explicit in run_manifest.json's cli_args; the only way to turn the "
+                        "layer off is --no-position-lifecycle / --disable-position-lifecycle.")
     p.add_argument("--no-position-lifecycle", "--disable-position-lifecycle",
-                   dest="enable_position_lifecycle",
-                   action="store_false",
-                   help="Disable Unified Position Lifecycle State Machine in backtest (reverts to unconstrained raw model targets).")
+                   dest="no_position_lifecycle",
+                   action="store_true",
+                   default=False,
+                   help="Disable the Unified Position Lifecycle State Machine in the backtest "
+                        "(reverts to unconstrained raw model targets). The ONLY off switch, and it "
+                        "wins even if --enable-position-lifecycle is also supplied.")
     p.add_argument("--lifecycle-guard-latency-bars",
                    type=int, default=None, dest="lifecycle_guard_latency_bars",
                    help="UPLSM entry confirmation latency bars (default: 2).")
@@ -219,7 +325,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="UPLSM minimum holding tenure bars before exit/trim (default: 2).")
     p.add_argument("--lifecycle-normal-cooldown-bars",
                    type=int, default=None, dest="lifecycle_normal_cooldown_bars",
-                   help="UPLSM cooldown bars after voluntary exit (default: 1).")
+                   help="UPLSM cooldown bars after voluntary exit (default: 2, the value the live runner deploys).")
     p.add_argument("--lifecycle-stop-cooldown-bars",
                    type=int, default=None, dest="lifecycle_stop_cooldown_bars",
                    help="UPLSM cooldown bars after stop-loss liquidation (default: 5).")
@@ -228,7 +334,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="UPLSM delta-weight inertia threshold to filter micro-rebalances (default: 0.05).")
     p.add_argument("--lifecycle-inertia-relative-ratio",
                    type=float, default=None, dest="lifecycle_inertia_relative_ratio",
-                   help="UPLSM proportional hurdle ratio on trim-side inertia (default: 0.50).")
+                   help="UPLSM proportional hurdle ratio on trim-side inertia (default: 0.0 = disabled, "
+                        "the value the live runner deploys).")
     p.add_argument("--lifecycle-min-entry-threshold",
                    type=float, default=None, dest="lifecycle_min_entry_threshold",
                    help="UPLSM minimum initial entry allocation weight threshold (default: None).")
@@ -538,8 +645,13 @@ def _evaluate_walkforward_fold(ctx: dict, spec: dict) -> tuple:
                         seed_row[resolved_cash_proxy] = max(0.0, 1.0 - risky_sum)
                     eval_weights.iloc[0] = seed_row
 
-                    eval_dates_set = set(eval_index.astype(str))
-                    eval_records = [r for r in all_records if str(r.get("date")) in eval_dates_set]
+                    # Both sides day-normalised, or the timestamped record stamp
+                    # (`'2021-12-06 00:00:00'`) never matches the eval bar key
+                    # (`'2021-12-06'`) -- see `_normalise_day_keys`. An empty result
+                    # here is NOT harmless: `run_allocation_backtest` reads it as
+                    # "no records supplied" and re-simulates the already-warmed
+                    # weights (double entry-confirmation, day-0 wiped to 0.0).
+                    eval_records = _lifecycle_records_in_window(all_records, eval_index)
                 else:
                     eval_weights = full_weights.reindex(index=eval_index, columns=eval_symbols)
                     eval_weights.iloc[0] = full_weights.ffill().reindex(index=eval_index, columns=eval_symbols).iloc[0]
@@ -590,6 +702,13 @@ def _evaluate_walkforward_fold(ctx: dict, spec: dict) -> tuple:
                         "total_rebalances": result["total_rebalances"],
                         "rebalance_report": result.get("rebalance_report", pd.DataFrame(columns=REBALANCE_REPORT_COLUMNS)),
                         "actual_weights": result.get("actual_weights", pd.DataFrame()),
+                        # (F3) The fold's raw lifecycle decision log, carried in the fold dict
+                        # exactly like `rebalance_report`/`actual_weights` so `main()` can
+                        # concatenate it into `walkforward_lifecycle_records.csv`. `folds_clean`
+                        # drops it before ANY pre-existing artifact is built, so
+                        # `walkforward_report.csv` / `walkforward_summary.json` keep their
+                        # exact columns and values (L2.37).
+                        "lifecycle_records": result.get("lifecycle_records") or [],
                     }
 
                     if enable_pl and getattr(args, "lifecycle_compare", False):
@@ -822,6 +941,60 @@ def _collect_walkforward_folds(ctx: dict, fold_specs: list, n_jobs: int) -> tupl
     return results, errors
 
 
+#: Flattened column layout for the `lifecycle_records.csv` /
+#: `walkforward_lifecycle_records.csv` artifacts (F3). Derived from
+#: `common.position_lifecycle.LifecycleDecision.to_dict()` -- the engine's own
+#: record schema -- plus the `date`/`symbol` keys the simulator stamps onto
+#: every record. Nobody downstream may re-derive these names: if the decision
+#: dataclass grows a field, add it here in the same commit.
+LIFECYCLE_RECORD_COLUMNS = [
+    "date",
+    "symbol",
+    "action",
+    "reason",
+    "target_weight",
+    "state_before",
+    "state_after",
+    "fast_path_triggered",
+    "cancelled_entry_streak",
+    "blocking_reason",
+    "detail_reason",
+]
+
+
+def lifecycle_records_to_frame(records, *, fold_index: int | None = None) -> pd.DataFrame:
+    """Serialize the position-lifecycle decision log into a flat, CSV-safe frame.
+
+    `detail_reason` is the one nested field (a dict of diagnosis keys such as
+    `current_price` / `blocking_reason` / `note`); it is JSON-encoded rather
+    than dropped, so the file keeps the "why was nothing traded" evidence the
+    lifecycle layer exists to produce. A stable `columns=` list is always
+    passed, so an all-`HOLD` fold and an empty fold produce the same header.
+
+    `fold_index` prepends a `fold` column for the walkforward roll-up.
+    """
+    columns = (["fold"] if fold_index is not None else []) + list(LIFECYCLE_RECORD_COLUMNS)
+    rows = []
+    for rec in records or []:
+        row = {"fold": fold_index} if fold_index is not None else {}
+        for col in LIFECYCLE_RECORD_COLUMNS:
+            if col == "detail_reason":
+                detail = rec.get(col)
+                row[col] = json.dumps(detail, ensure_ascii=False, default=str) if detail else ""
+            elif col == "date":
+                # The simulator stamps `str(Timestamp)` ("2024-08-27 00:00:00"); flatten
+                # to the same `YYYY-MM-DD` convention `rebalance_report.csv` uses so the
+                # two logs can be joined on their date column without parsing.
+                try:
+                    row[col] = str(pd.Timestamp(rec.get(col)).date())
+                except (TypeError, ValueError):
+                    row[col] = rec.get(col)
+            else:
+                row[col] = rec.get(col)
+        rows.append(row)
+    return pd.DataFrame(rows, columns=columns)
+
+
 def run_standard(universe: dict, template, params: dict, args) -> dict:
     master_calendar, effective_start = _resolve_master_calendar(
         universe, getattr(args, "start", None), getattr(args, "end", None), min_coverage=0.20
@@ -868,8 +1041,11 @@ def run_standard(universe: dict, template, params: dict, args) -> dict:
                 risky_sum = seed_row.drop(index=resolved_cash_proxy).sum()
                 seed_row[resolved_cash_proxy] = max(0.0, 1.0 - risky_sum)
             eval_weights.iloc[0] = seed_row
-            eval_dates_set = set(eval_index.astype(str))
-            eval_records = [r for r in all_records if str(r.get("date")) in eval_dates_set]
+            # Same day-normalised filter as the walkforward path (root cause of the
+            # "records never match the eval bar" bug) -- `astype(str)` on a
+            # Timestamp index yields `'2021-12-06'`, the record stamp is
+            # `'2021-12-06 00:00:00'`.
+            eval_records = _lifecycle_records_in_window(all_records, eval_index)
             target_weights = eval_weights
         else:
             target_weights = warmed_weights.reindex(index=eval_index, columns=eval_symbols)
@@ -1911,6 +2087,25 @@ def main():
             print("\nRecent Rebalance Trades:")
             print(format_rebalance_trades_preview(rebal_df))
 
+        # (F3) Position-lifecycle decision log. Until now `result["lifecycle_records"]`
+        # -- the UPLSM's per-(date, symbol) BUY/SELL/HOLD/gate verdict plus its
+        # structured `blocking_reason` -- was computed, carried out of the engine and
+        # then thrown away by every artifact writer, so an operator could see `SELL`
+        # in rebalance_report.csv but never WHY the gate had blocked the trade on the
+        # preceding days.
+        # Deliberately a NEW file: `backtest_equity.csv`, `backtest_weights.csv` and
+        # `rebalance_report.csv` above are untouched (L2.37 -- their content, columns
+        # and ordering stay bit-identical). OFF runs write nothing at all: with the
+        # layer disabled there are no decisions to log, and an empty file would be
+        # indistinguishable from "the layer ran and never traded".
+        if enable_pl:
+            lifecycle_records_path = os.path.join(results_dir, "lifecycle_records.csv")
+            lifecycle_records_to_frame(result.get("lifecycle_records")).to_csv(
+                lifecycle_records_path, index=False
+            )
+            print(f"Saved {len(result.get('lifecycle_records') or [])} lifecycle decision record(s) "
+                  f"to {lifecycle_records_path}")
+
         # Lifecycle A/B comparison arm
         if enable_pl and getattr(args, "lifecycle_compare", False):
             off_m = result.get("off_metrics", {})
@@ -2024,7 +2219,11 @@ def main():
         else:
             wf_weights_df = pd.DataFrame()
 
-        folds_clean = [{k: v for k, v in f.items() if k not in ("rebalance_report", "actual_weights", "off_metrics")} for f in folds]
+        folds_clean = [
+            {k: v for k, v in f.items()
+             if k not in ("rebalance_report", "actual_weights", "off_metrics", "lifecycle_records")}
+            for f in folds
+        ]
         folds_df = pd.DataFrame(folds_clean)
 
         baseline_params = None
@@ -2137,6 +2336,29 @@ def main():
         wf_weights_path = os.path.join(results_dir, "walkforward_weights.csv")
         wf_weights_df.to_csv(wf_weights_path, index=True, index_label="date")
         print(f"Saved walkforward actual weights to {wf_weights_path}")
+
+        # (F3) Per-fold lifecycle decision log, rolled up exactly like
+        # `walkforward_rebalances.csv` (one `fold` column prepended, 1-based fold
+        # numbering matching the summary table). Same contract as the standard
+        # mode: a NEW artifact only -- `walkforward_report.csv` /
+        # `walkforward_summary.json` / `walkforward_rebalances.csv` /
+        # `walkforward_weights.csv` keep their exact columns and values (L2.37),
+        # which is why `lifecycle_records` is stripped in `folds_clean` above.
+        if enable_pl:
+            wf_lifecycle_frames = []
+            for fold_idx, f in enumerate(folds, 1):
+                fold_records = f.get("lifecycle_records") or []
+                if fold_records:
+                    wf_lifecycle_frames.append(lifecycle_records_to_frame(fold_records, fold_index=fold_idx))
+            if wf_lifecycle_frames:
+                wf_lifecycle_df = pd.concat(wf_lifecycle_frames, ignore_index=True)
+            else:
+                # Header-only file: the layer ran but no fold produced a decision.
+                wf_lifecycle_df = lifecycle_records_to_frame([], fold_index=1)
+            wf_lifecycle_path = os.path.join(results_dir, "walkforward_lifecycle_records.csv")
+            wf_lifecycle_df.to_csv(wf_lifecycle_path, index=False)
+            print(f"Saved {len(wf_lifecycle_df)} walkforward lifecycle decision record(s) "
+                  f"to {wf_lifecycle_path}")
 
         if enable_pl and getattr(args, "lifecycle_compare", False):
             ab_rows = []

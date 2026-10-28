@@ -183,6 +183,11 @@ def run_ablation_experiment():
             initial_capital=100000.0,
             china_trading=True,
             min_shares=100,
+            # Ablation baseline pinned OFF (F2): every variant -- and the ERS/LOO
+            # re-measurements below -- must differ ONLY by the ablation factor, so
+            # the lifecycle layer is held at a fixed, declared setting instead of
+            # silently inheriting the engine's default.
+            enable_position_lifecycle=False,
         )
 
         sharpe = float(bt_res.get("sharpe_ratio", 0.0) or 0.0)
@@ -232,6 +237,10 @@ def run_ablation_experiment():
             initial_capital=100000.0,
             china_trading=True,
             min_shares=100,
+            # Same pinned-OFF baseline as the variant loop above (F2): a random
+            # portfolio scored under a different lifecycle setting would not be a
+            # like-for-like draw for the ERS percentile.
+            enable_position_lifecycle=False,
         )
         return res
 
@@ -257,7 +266,12 @@ def run_ablation_experiment():
     for drop_s in risky_syms:
         sub_univ = {s: df for s, df in enriched_universe.items() if s != drop_s}
         w_loo = strategy.generate_weights(sub_univ, params=winner_variant["params"])
-        bt_loo = run_allocation_backtest(sub_univ, w_loo, initial_capital=100000.0, china_trading=True, min_shares=100)
+        bt_loo = run_allocation_backtest(
+            sub_univ, w_loo, initial_capital=100000.0, china_trading=True, min_shares=100,
+            # Same pinned-OFF baseline as the variant loop (F2): the LOO delta must
+            # measure the dropped asset, not a lifecycle-setting difference.
+            enable_position_lifecycle=False,
+        )
         sr_loo = float(bt_loo.get("sharpe_ratio", 0.0) or 0.0)
         cagr_loo = float(bt_loo.get("cagr", 0.0) or 0.0)
         loo_results[drop_s] = {
