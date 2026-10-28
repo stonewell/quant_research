@@ -39,6 +39,7 @@ that the run directory really is keyed by the valuation session it writes into
 """
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -64,9 +65,27 @@ except ImportError:
             )
 
 try:
-    from .storage import StorageManager, parse_ticket_csv, post_holdings_from_ticket
+    from .storage import (
+        HoldingsInputMismatchError,
+        StorageManager,
+        diff_holdings_input_vs_prev_post,
+        format_holdings_input_mismatch,
+        is_cash_symbol,
+        parse_ticket_csv,
+        post_holdings_from_ticket,
+        strict_holdings_input_enabled,
+    )
 except (ImportError, ValueError):
-    from storage import StorageManager, parse_ticket_csv, post_holdings_from_ticket
+    from storage import (
+        HoldingsInputMismatchError,
+        StorageManager,
+        diff_holdings_input_vs_prev_post,
+        format_holdings_input_mismatch,
+        is_cash_symbol,
+        parse_ticket_csv,
+        post_holdings_from_ticket,
+        strict_holdings_input_enabled,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -886,6 +905,69 @@ class ExecutionService:
             **failure,
         }
 
+    # --------------------------------------------------------------------------
+    # Holdings-input reconciliation (no fill receipt exists -- this is advisory)
+    # --------------------------------------------------------------------------
+    def _check_holdings_input(
+        self,
+        current_holdings: Optional[Dict[str, Any]],
+        val_date: str,
+        strategy_key: Optional[str],
+        universe_key: Optional[str],
+    ) -> Dict[str, Any]:
+        """Compare the operator's INPUT book against the previous round's PLANNED book.
+
+        Returns the block embedded in the response as ``holdings_input_check`` and in
+        ``summary.json`` under the same key, so a stale-table deploy stays forensically
+        traceable after the fact. Cash proxies (BIL/CASH/...) are dropped from the INPUT
+        side only: `post_holdings_from_ticket` never records cash (cash is the implied NAV
+        residual), so leaving them in would flag every single deploy forever.
+
+        Strict mode (`LIVETRADING_STRICT_HOLDINGS_INPUT=1`) raises
+        `HoldingsInputMismatchError` BEFORE `save_holdings()` is called, so a refused
+        deploy writes no `holdings.json` -- the archive keeps the last operator-confirmed
+        book instead of recording a book we just said we do not believe.
+        """
+        shares_input = {
+            sym: value
+            for sym, value in (current_holdings or {}).items()
+            if not is_cash_symbol(sym)
+        }
+        prev_post, prev_run_dir = self.storage.get_previous_post_holdings(
+            date_str=val_date, strategy_key=strategy_key, universe_key=universe_key
+        )
+
+        if prev_post is None:
+            # No earlier plan to compare against (first ever run, or every earlier run
+            # lacked both post_holdings.json and a ticket with target_shares).
+            return {
+                "mismatched": {},
+                "n_mismatched": 0,
+                "n_symbols": len(shares_input),
+                "prev_post_available": False,
+                "prev_post_run_dir": None,
+                "strict": strict_holdings_input_enabled(),
+            }
+
+        check = diff_holdings_input_vs_prev_post(shares_input, prev_post)
+        check["prev_post_available"] = True
+        check["prev_post_run_dir"] = prev_run_dir
+        check["strict"] = strict_holdings_input_enabled()
+
+        if check["n_mismatched"]:
+            summary_line = format_holdings_input_mismatch(check)
+            logging.warning(
+                "[holdings-input-check] %s (prev planned book: %s)",
+                summary_line,
+                os.path.basename(os.path.normpath(prev_run_dir)) if prev_run_dir else "?",
+            )
+            if check["strict"]:
+                raise HoldingsInputMismatchError(
+                    "持仓输入与上一轮票面计划持仓不一致，已按严格模式"
+                    "（LIVETRADING_STRICT_HOLDINGS_INPUT=1）拒绝部署。" + summary_line
+                )
+        return check
+
     def run_live_deploy(
         self,
         strategy_file: str,
@@ -936,6 +1018,18 @@ class ExecutionService:
             effective_holdings = current_holdings
         else:
             effective_holdings = self.storage.get_holdings(date_str=val_date, strategy_key=strat_key, universe_key=univ_key)
+
+        # Advisory reconciliation of the INPUT book against the previous round's PLANNED
+        # post-trade book (see `diff_holdings_input_vs_prev_post`). This system has no
+        # broker fill receipt, so a mismatch means "the table may still be holding the
+        # pre-trade book" -- NOT "the trade failed". Default: warn + report; only
+        # `LIVETRADING_STRICT_HOLDINGS_INPUT=1` turns it into a refusal.
+        holdings_input_check = self._check_holdings_input(
+            effective_holdings,
+            val_date=val_date,
+            strategy_key=strat_key,
+            universe_key=univ_key,
+        )
 
         # Save holdings snapshot in run_dir and globally
         holdings_file = os.path.join(run_dir, "holdings.json")
@@ -989,6 +1083,10 @@ class ExecutionService:
         csv_file = os.path.join(run_dir, "live_trading_ticket.csv")
         ticket_json_file = os.path.join(run_dir, "live_trading_ticket.json")
         ticket_records = []
+        #: PLANNED post-ticket book ("if every row filled as instructed"), None = unknown.
+        #: Surfaced to the UI as `holdings_plan` so the holdings table can be refreshed
+        #: with what the book SHOULD be -- never presented as a fill receipt.
+        post_holdings: Optional[Dict[str, int]] = None
         try:
             if os.path.exists(ticket_json_file) and os.path.exists(csv_file):
                 if os.path.getmtime(csv_file) > os.path.getmtime(ticket_json_file):
@@ -1058,6 +1156,9 @@ class ExecutionService:
             "deploy_stdout": stdout,
             "deploy_stderr": stderr,
             "trades_count": len([r for r in ticket_records if r.get("action") in ("BUY", "SELL")]),
+            # Advisory (never blocking by default): the INPUT book vs the previous round's
+            # PLANNED post-ticket book, so a stale-table deploy stays reconstructable.
+            "holdings_input_check": holdings_input_check,
         })
         if failure:
             summary.update({k: failure[k] for k in ("error_kind", "error_headline", "error_hint", "error_detail")})
@@ -1090,6 +1191,12 @@ class ExecutionService:
             "trading_ticket": ticket_records,
             "account_state": state_data,
             "holdings": effective_holdings,
+            # Planned post-ticket book (from `target_shares`) -- what the holdings table should
+            # show after this deploy. `holdings` above is the PRE-trade input book.
+            "holdings_plan": post_holdings,
+            # Advisory reconciliation of the INPUT book vs the previous round's PLANNED
+            # post-ticket book. See `diff_holdings_input_vs_prev_post`.
+            "holdings_input_check": holdings_input_check,
             **failure,
         }
 
@@ -1268,6 +1375,10 @@ class ExecutionService:
             "sub_ledgers": ledgers_data,
             "summary": summary,
             "holdings": effective_holdings,
+            # No `post_holdings.json` is written for matrix runs (their directory is not part
+            # of the per-(strategy, universe) carry-forward chain), so the planned book is
+            # derived on the fly purely for the UI's holdings-table refresh.
+            "holdings_plan": post_holdings_from_ticket(ticket_records),
             **failure,
         }
 

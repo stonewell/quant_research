@@ -266,6 +266,146 @@ def post_holdings_from_ticket(ticket: Any) -> Optional[Dict[str, int]]:
     return holdings if saw_target else None
 
 
+# --------------------------------------------------------------------------- #
+# Holdings-input reconciliation (advisory; never assumes a fill)
+# --------------------------------------------------------------------------- #
+# FORENSIC CONTEXT (defect this exists to catch, 2026-10-27):
+#   There is NO broker fill-receipt channel in this system -- no `fill_price` /
+#   `filled_shares` / broker callback anywhere.  `save_holdings()` therefore persists
+#   whatever the operator's DOM table submits, and the front end used to keep that table
+#   untouched after a deploy, so the NEXT day's deploy re-submitted the PREVIOUS round's
+#   pre-trade holdings (proven: `10-27/holdings.json` was byte-identical to
+#   `10-22/post_holdings.json` while `10-26/post_holdings.json` held the real assumed
+#   book).  The strategy then reconciles against a book that is one round stale.
+#
+#   This check is ADVISORY BY DESIGN.  It compares the operator's INPUT against the
+#   previous round's POST-TICKET ASSUMED holdings (`post_holdings.json`, i.e. "what the
+#   book should look like IF every ticket row were filled exactly as instructed").  A
+#   mismatch is therefore not proof of an error -- partial fills, unexecuted rows and
+#   manual corrections all look identical here -- so it must never silently rewrite
+#   holdings.  The operator (or `LIVETRADING_STRICT_HOLDINGS_INPUT=1`, opt-in) decides.
+_STRICT_HOLDINGS_INPUT_ENV = "LIVETRADING_STRICT_HOLDINGS_INPUT"
+
+
+class HoldingsInputMismatchError(RuntimeError):
+    """Raised when strict mode is on and the holdings input disagrees with the prior plan.
+
+    Only reachable when `LIVETRADING_STRICT_HOLDINGS_INPUT` is truthy: default behaviour
+    is to deploy and merely WARN, because the system cannot distinguish "stale table"
+    from "operator corrected the book after a partial fill".
+    """
+
+
+def strict_holdings_input_enabled() -> bool:
+    """Opt-in hard gate: refuse to deploy when the input != prior round's planned book."""
+    return _truthy_env(_STRICT_HOLDINGS_INPUT_ENV)
+
+
+def _holding_share_value(raw: Any) -> float:
+    """Best-effort share count from a holdings payload value (int / float / str / row dict)."""
+    if isinstance(raw, dict):
+        raw = raw.get("shares", raw.get("share", raw.get("quantity")))
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if value != value or value in (float("inf"), float("-inf")):  # NaN / inf
+        return 0.0
+    return value
+
+
+def _holding_number(value: float) -> Any:
+    """Render a share number as int when integral, else float (keeps JSON tidy)."""
+    return int(value) if float(value).is_integer() else round(float(value), 6)
+
+
+def diff_holdings_input_vs_prev_post(current_holdings: dict, prev_post_holdings: dict) -> dict:
+    """Compare an operator's holdings INPUT against the previous round's PLANNED post book.
+
+    Pure function -- no filesystem, no fastapi, no logging -- so it is importable and
+    unit-testable offline (see `pipeline/tests/test_live_holdings_input_check.py`).
+
+    Contract:
+      * keys are the UNION of both sides, normalized `strip().upper()` (the DOM table and
+        `post_holdings_from_ticket` disagree on casing in practice; casing is not a
+        mismatch);
+      * a key missing on either side counts as 0, so it IS a mismatch when the other side
+        holds a positive quantity ("double-sided": an input symbol the plan never had and
+        a planned symbol the input dropped are both reported);
+      * a `None` / non-dict argument is treated as `{}` (no crash on a fresh checkout);
+      * both sides 0 / absent -> not a mismatch.
+
+    Returns `{"mismatched": {sym: {"input": n, "prev_post": m, "delta": n - m}},
+    "n_mismatched": int, "n_symbols": int}` where `n_symbols` is the union's size.
+
+    NOTE: this function deliberately does NOT filter cash proxies (BIL/CASH/...): it is a
+    generic dict differ. The caller filters them, because `post_holdings_from_ticket`
+    never records cash (cash is the implied NAV residual, not a share position).
+    """
+    def _normalize(payload: Any) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        if not isinstance(payload, dict):
+            return out
+        for key, value in payload.items():
+            sym = str(key or "").strip().upper()
+            if not sym:
+                continue
+            out[sym] = _holding_share_value(value)
+        return out
+
+    current = _normalize(current_holdings)
+    previous = _normalize(prev_post_holdings)
+    union = sorted(set(current) | set(previous))
+
+    mismatched: Dict[str, Dict[str, Any]] = {}
+    for sym in union:
+        have = current.get(sym, 0.0)
+        plan = previous.get(sym, 0.0)
+        if abs(have - plan) > 1e-9:
+            mismatched[sym] = {
+                "input": _holding_number(have),
+                "prev_post": _holding_number(plan),
+                "delta": _holding_number(have - plan),
+            }
+
+    return {
+        "mismatched": mismatched,
+        "n_mismatched": len(mismatched),
+        "n_symbols": len(union),
+    }
+
+
+def format_holdings_input_mismatch(check: Dict[str, Any], limit: int = 5) -> str:
+    """One readable line for `logging.warning` / the UI (first `limit` symbols, totals)."""
+    mismatched = (check or {}).get("mismatched") or {}
+    if not mismatched:
+        return ""
+
+    def _num(value: Any) -> str:
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        return f"{int(f):+d}" if f.is_integer() else f"{f:+g}"
+
+    items = list(mismatched.items())
+    shown = ", ".join(
+        f"{sym}: input={v.get('input')} prev_post={v.get('prev_post')} delta={_num(v.get('delta'))}"
+        for sym, v in items[:limit]
+    )
+    if len(items) > limit:
+        shown += f" ... (+{len(items) - limit} more)"
+    # Net drift shows whether the input is stale in one direction; gross |delta| is the
+    # share volume an operator would have to reconcile by hand.
+    net_delta = sum(float(v.get("delta") or 0) for v in mismatched.values())
+    abs_delta = sum(abs(float(v.get("delta") or 0)) for v in mismatched.values())
+    return (
+        f"holdings input differs from the previous round's PLANNED post-trade book on "
+        f"{len(items)}/{int((check or {}).get('n_symbols') or 0)} symbol(s); "
+        f"net delta {net_delta:+.0f} shares, gross |delta| {abs_delta:.0f} shares -- {shown}"
+    )
+
+
 def parse_ticket_csv(csv_path: str) -> List[Dict[str, Any]]:
     """Parse live_trading_ticket.csv into a structured list of ticket records if JSON is missing."""
     if not os.path.exists(csv_path):
@@ -1112,6 +1252,46 @@ class StorageManager:
             if st:
                 return st
         return None
+
+    def get_previous_post_holdings(
+        self,
+        date_str: Optional[str] = None,
+        strategy_key: Optional[str] = None,
+        universe_key: Optional[str] = None,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """PLANNED post-trade holdings of the most recent EARLIER run, plus its run dir.
+
+        "Planned" = what the book should look like IF every ticket row had been filled
+        exactly as instructed. Sources, tried per run dir (newest first):
+          1. `<run_dir>/post_holdings.json` -- written by `run_live_deploy` from the
+             ticket's `target_shares`; the authoritative planning record;
+          2. re-derived from `<run_dir>/live_trading_ticket.json|csv` when that file is
+             missing (older archives, CLI-produced runs).
+
+        Deliberately does NOT fall back to `holdings.json` / `current_holdings.json` the
+        way `extract_post_run_holdings` does: those hold the day's PRE-trade INPUT, i.e.
+        exactly the value this comparison exists to audit, so including them would make
+        the check agree with itself. Returns `(None, None)` when no earlier run carries
+        any plan -- the caller then reports "no reference" instead of a false mismatch.
+        """
+        for run in self._earlier_runs(date_str, strategy_key, universe_key):
+            run_dir = run.get("path")
+            if not run_dir or not os.path.isdir(run_dir):
+                continue
+            post_file = os.path.join(run_dir, "post_holdings.json")
+            if os.path.exists(post_file):
+                data = self._load_json(post_file, default=None)
+                if isinstance(data, dict):
+                    return data, run_dir
+            ticket = self._load_json(os.path.join(run_dir, "live_trading_ticket.json"), default=None)
+            if not ticket:
+                csv_path = os.path.join(run_dir, "live_trading_ticket.csv")
+                if os.path.exists(csv_path):
+                    ticket = parse_ticket_csv(csv_path)
+            target_holdings = post_holdings_from_ticket(ticket)
+            if target_holdings is not None:
+                return target_holdings, run_dir
+        return None, None
 
     def get_holdings(
         self,

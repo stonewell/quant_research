@@ -134,6 +134,9 @@
                     </div>
                 </div>
                 <div class="card-body">
+                    <!-- Provenance of the table below: after a deploy the table holds the
+                         TICKET'S PLANNED book, never realised fills (no broker fill feed). -->
+                    <div id="holdings-plan-notice" class="plan-notice" style="display: none;"></div>
                     <div class="holdings-summary-bar">
                         <div class="sum-item">
                             <span class="sum-label">股票持仓市值:</span>
@@ -294,6 +297,10 @@
                     <div class="ticket-status-bar" id="ticket-status-bar">
                         <span id="ticket-summary-text">尚未生成今日调仓指令。请点击上方「2. 净额调仓」按最新行情计算。</span>
                     </div>
+
+                    <!-- Deploy-time reconciliation of the INPUT book vs the previous round's
+                         planned book (`holdings_input_check`); hidden unless it disagrees. -->
+                    <div id="holdings-input-alert" class="input-alert" style="display: none;"></div>
 
                     <div class="table-container orders-table-container">
                         <table class="data-table" id="table-orders">

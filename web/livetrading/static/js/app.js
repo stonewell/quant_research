@@ -117,6 +117,8 @@
         btnAddHolding: document.getElementById("btn-add-holding"),
         btnSaveHoldings: document.getElementById("btn-save-holdings"),
         tbodyHoldings: document.getElementById("tbody-holdings"),
+        planNotice: document.getElementById("holdings-plan-notice"),
+        holdingsInputAlert: document.getElementById("holdings-input-alert"),
         valHoldingsEquity: document.getElementById("val-holdings-equity"),
         valHoldingsCash: document.getElementById("val-holdings-cash"),
         valHoldingsCashRatio: document.getElementById("val-holdings-cash-ratio"),
@@ -1131,7 +1133,119 @@
     // -------------------------------------------------------------------------
     // Holdings Interactive Manager
     // -------------------------------------------------------------------------
+    /**
+     * Label the holdings table as carrying the TICKET'S PLANNED book.
+     *
+     * WHY (defect fixed 2026-10-27): this app has NO broker fill-receipt channel --
+     * nothing ever reports `fill_price` / `filled_shares`. Before this change a page
+     * left open across days kept its pre-trade table after a deploy, so the NEXT day's
+     * deploy submitted the previous round's pre-trade holdings (10-27/holdings.json was
+     * byte-identical to 10-22/post_holdings.json). The table is now refreshed from the
+     * ticket's planned book -- and says so, because "planned" must never read as "filled".
+     */
+    function showHoldingsPlanNotice(meta = {}) {
+        if (!el.planNotice) return;
+        const datePart = meta.date ? `（基准日 ${meta.date}）` : "";
+        const strictPart = meta.fromPreviousRun ? "内容取自上一运行归档中的票后计划持仓" : "内容取自本次票面 target_shares";
+        el.planNotice.textContent = `⚠️ 以下为本次票面计划持仓${datePart}，请对照券商实际持仓核实/编辑后再提交下一轮。`
+            + `系统未收到任何成交回执，无法确认真实成交（${strictPart}）。`;
+        el.planNotice.style.display = "block";
+    }
+
+    function clearHoldingsPlanNotice() {
+        if (!el.planNotice) return;
+        el.planNotice.style.display = "none";
+        el.planNotice.textContent = "";
+    }
+
+    /**
+     * Show the deploy-time "input vs previous round's planned book" mismatch.
+     *
+     * Advisory text only: the backend cannot tell a stale table from a deliberate
+     * post-partial-fill correction, so this prompts a manual check instead of asking the
+     * user to trust a number the system has no receipt for.
+     */
+    function renderHoldingsInputAlert(check) {
+        if (!el.holdingsInputAlert) return;
+        const mismatched = (check && check.mismatched) ? check.mismatched : {};
+        const syms = Object.keys(mismatched);
+        if (syms.length === 0) {
+            el.holdingsInputAlert.style.display = "none";
+            el.holdingsInputAlert.textContent = "";
+            return;
+        }
+        const fmt = (v) => (typeof v === "number" ? (Number.isInteger(v) ? String(v) : v.toFixed(2)) : String(v));
+        const preview = syms.slice(0, 5).map(sym => {
+            const row = mismatched[sym] || {};
+            const delta = Number(row.delta) >= 0 ? `+${fmt(row.delta)}` : fmt(row.delta);
+            return `${sym} 输入 ${fmt(row.input)} / 上轮票面 ${fmt(row.prev_post)} (差 ${delta})`;
+        }).join("；");
+        const more = syms.length > 5 ? ` …等共 ${syms.length} 只` : "";
+        const strictNote = check.strict ? " 【严格模式已启用：下次不一致将直接拒绝部署】" : "";
+        el.holdingsInputAlert.textContent = `⚠️ 当前输入与上一轮票面计划持仓不一致`
+            + `（${check.n_mismatched}/${check.n_symbols} 只，可能未更新为成交后持仓）：${preview}${more}。`
+            + `请先按券商实际持仓核对（或直接编辑左侧表格）再生成工单。本提示仅为比对结果，不代表成交失败。${strictNote}`;
+        el.holdingsInputAlert.style.display = "block";
+    }
+
+    /**
+     * Re-render the holdings table from a deploy response.
+     *
+     * Source priority:
+     *   1. `data.holdings_plan` -- the PLANNED post-ticket book the backend derives from
+     *      the ticket's `target_shares` (`post_holdings_from_ticket`);
+     *   2. `GET /api/runs/previous` -- the previous run's post-ticket holdings (that
+     *      endpoint returns `extract_post_run_holdings`, i.e. also a planned book);
+     *   3. nothing: keep the table EXACTLY as-is and warn. Never clear it, and never fall
+     *      back to `data.holdings`, which is the PRE-trade book this deploy was computed
+     *      from -- re-rendering that would preserve the very staleness being fixed.
+     */
+    async function refreshHoldingsAfterDeploy(data, keys) {
+        let plan = (data && data.holdings_plan && typeof data.holdings_plan === "object") ? data.holdings_plan : null;
+        let fromPreviousRun = false;
+
+        if (!plan || Object.keys(plan).length === 0) {
+            try {
+                const qs = new URLSearchParams({
+                    date: (data && data.date) || state.currentDate || "",
+                    strategy: (keys && keys.stratKey) || "",
+                    universe: (keys && keys.univKey) || "",
+                });
+                const res = await fetch(`/api/runs/previous?${qs.toString()}`, { cache: "no-store" });
+                if (res.ok) {
+                    const prev = await res.json();
+                    if (prev && prev.holdings && typeof prev.holdings === "object" && Object.keys(prev.holdings).length > 0) {
+                        plan = prev.holdings;
+                        fromPreviousRun = true;
+                    }
+                }
+            } catch (err) {
+                console.warn("部署后读取 /api/runs/previous 持仓失败:", err);
+            }
+        }
+
+        if (!plan || Object.keys(plan).length === 0) {
+            console.warn("部署返回体无 holdings_plan，且 /api/runs/previous 也无持仓 —— 保持当前持仓表格不动。");
+            return;
+        }
+
+        state.holdings = plan;
+        renderHoldingsTable(state.holdings);
+        recalcHoldings();
+        fetchQuotesForCurrentHoldings();
+        showHoldingsPlanNotice({
+            date: (data && data.date) || state.currentDate,
+            fromPreviousRun,
+        });
+        logConsole(`[HOLDINGS] 已按${fromPreviousRun ? "上一运行归档的票后计划" : "本次票面计划"}刷新持仓表格`
+            + `（${Object.keys(plan).length} 项）—— 该表为计划持仓，非成交回执。`);
+    }
+
     function renderHoldingsTable(holdingsMap, priceMap = {}) {
+        // Any generic render means the table no longer necessarily holds the ticket's
+        // planned book (archive view / API reload / manual save), so the provenance banner
+        // is dropped here; `refreshHoldingsAfterDeploy` re-shows it right after rendering.
+        clearHoldingsPlanNotice();
         el.tbodyHoldings.innerHTML = "";
         const keys = Object.keys(holdingsMap).filter(k => k !== "BIL" && k !== "CASH");
 
@@ -1442,6 +1556,9 @@
             });
             const data = await res.json();
             logConsole(`[SUCCESS] 持仓配置已成功保存 (${Object.keys(holdings).length} 只持仓标的已持久化)`);
+            // The operator has now confirmed the REAL book: the "planned" label no longer
+            // describes this table, so drop it rather than leave a misleading banner.
+            clearHoldingsPlanNotice();
             setConsoleStatus("持仓已保存", false);
         } catch (err) {
             logConsole(`[ERROR] 保存持仓失败: ${err}`);
@@ -1574,6 +1691,11 @@
                 body: JSON.stringify(deployParams),
             });
             const data = await res.json();
+            if (!res.ok) {
+                // Strict holdings-input gate (LIVETRADING_STRICT_HOLDINGS_INPUT=1) refuses
+                // with HTTP 500 + `detail`; surface it instead of reading it as success.
+                throw new Error((data && (data.detail || data.message)) || `多策略部署失败 (HTTP ${res.status})`);
+            }
 
             if (data.stdout) logConsole(data.stdout);
             if (data.stderr) logConsole(`[STDERR]\n${data.stderr}`);
@@ -1596,6 +1718,11 @@
             if (data.account_state) {
                 state.accountState = data.account_state;
             }
+
+            // (defect 2026-10-27) The response's planned book drives a table refresh, so the
+            // next submission cannot silently reuse this round's pre-trade holdings.
+            renderHoldingsInputAlert(data.holdings_input_check);
+            await refreshHoldingsAfterDeploy(data, keys);
 
             saveSessionState();
             await updateScopedHistoryRuns();
@@ -1638,6 +1765,10 @@
                 body: JSON.stringify(deployParams),
             });
             const data = await res.json();
+            if (!res.ok) {
+                // Strict holdings-input gate refusal arrives as HTTP 500 + `detail`.
+                throw new Error((data && (data.detail || data.message)) || `实盘调仓失败 (HTTP ${res.status})`);
+            }
 
             if (data.stdout) logConsole(data.stdout);
             if (data.stderr) logConsole(`[STDERR]\n${data.stderr}`);
@@ -1656,6 +1787,11 @@
             if (data.account_state) {
                 state.accountState = data.account_state;
             }
+
+            // (defect 2026-10-27) Refresh the holdings table from the ticket's planned book
+            // so a long-lived page cannot re-submit this round's pre-trade holdings tomorrow.
+            renderHoldingsInputAlert(data.holdings_input_check);
+            await refreshHoldingsAfterDeploy(data, keys);
 
             saveSessionState();
             await updateScopedHistoryRuns();
@@ -1732,6 +1868,9 @@
                     body: JSON.stringify(multiDeployParams),
                 });
                 const dataDeploy = await resDeploy.json();
+                if (!resDeploy.ok) {
+                    throw new Error((dataDeploy && (dataDeploy.detail || dataDeploy.message)) || `Stage 2 多策略撮合失败 (HTTP ${resDeploy.status})`);
+                }
                 if (dataDeploy.stdout) logConsole(dataDeploy.stdout);
                 if (dataDeploy.stderr) logConsole(`[STDERR]\n${dataDeploy.stderr}`);
                 if (dataDeploy.status === "error") {
@@ -1750,6 +1889,8 @@
                 if (dataDeploy.account_state) {
                     state.accountState = dataDeploy.account_state;
                 }
+                renderHoldingsInputAlert(dataDeploy.holdings_input_check);
+                await refreshHoldingsAfterDeploy(dataDeploy, keys);
             } else {
                 if (el.loadingDetail) el.loadingDetail.textContent = "第 2/2 步: 正在执行 Stage 2 实盘调仓工单生成与买卖对账...";
                 const resDeploy = await fetch("/api/run-deploy", {
@@ -1758,6 +1899,9 @@
                     body: JSON.stringify(deployParams),
                 });
                 const dataDeploy = await resDeploy.json();
+                if (!resDeploy.ok) {
+                    throw new Error((dataDeploy && (dataDeploy.detail || dataDeploy.message)) || `Stage 2 失败 (HTTP ${resDeploy.status})`);
+                }
                 if (dataDeploy.stdout) logConsole(dataDeploy.stdout);
                 if (dataDeploy.stderr) logConsole(`[STDERR]\n${dataDeploy.stderr}`);
                 if (dataDeploy.status === "error") {
@@ -1770,6 +1914,8 @@
                 if (dataDeploy.account_state) {
                     state.accountState = dataDeploy.account_state;
                 }
+                renderHoldingsInputAlert(dataDeploy.holdings_input_check);
+                await refreshHoldingsAfterDeploy(dataDeploy, keys);
             }
 
             saveSessionState();

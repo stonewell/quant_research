@@ -137,6 +137,14 @@ class RunResponse(BaseModel):
     trading_ticket: Optional[List[Dict[str, Any]]] = None
     account_state: Optional[Dict[str, Any]] = None
     holdings: Optional[Dict[str, Any]] = None
+    #: PLANNED post-ticket book derived from the ticket's `target_shares`
+    #: (`post_holdings_from_ticket`). The UI refreshes the holdings table from this so a
+    #: page left open across days cannot re-submit the PRE-trade book (defect 2026-10-27).
+    #: MUST be declared here: FastAPI's `response_model` filters undeclared keys out.
+    holdings_plan: Optional[Dict[str, Any]] = None
+    #: Advisory reconciliation of the submitted input book vs the previous round's planned
+    #: post-ticket book (`storage.diff_holdings_input_vs_prev_post`). Never a fill receipt.
+    holdings_input_check: Optional[Dict[str, Any]] = None
 
 
 class SubStrategyConfigModel(BaseModel):
