@@ -243,6 +243,8 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
                 universe_name=payload.universe_name,
                 guard_latency_bars=payload.guard_latency_bars,
                 allow_intraday=payload.allow_intraday,
+                cash=payload.cash,
+                nav_override=payload.nav_override,
             )
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))

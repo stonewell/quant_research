@@ -819,6 +819,31 @@ input[type="date"]::-webkit-calendar-picker-indicator:hover {
     margin-bottom: 8px;
 }
 
+/* NAV provenance (`#nav-provenance`): a hard override must be impossible to miss --
+   the number in the NAV box is then NOT the engine's mark, and every downstream share
+   count / weight is sized off it. */
+.plan-notice.nav-override {
+    color: #8a1c1c;
+    background-color: rgba(239, 68, 68, 0.14);
+    border: 1px solid var(--accent-danger, #ef4444);
+    font-weight: 600;
+}
+
+.nav-cash-row {
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+}
+
+.chk-inline {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11.5px;
+    color: var(--text-secondary);
+    font-weight: 500;
+}
+
 .input-alert {
     font-size: 11.5px;
     line-height: 1.55;

@@ -99,6 +99,8 @@
         selectStrategy: document.getElementById("select-strategy"),
         inputDate: document.getElementById("input-as-of-date"),
         inputValue: document.getElementById("input-portfolio-value"),
+        inputCash: document.getElementById("input-cash"),
+        inputNavOverride: document.getElementById("input-nav-override"),
         inputPeakNav: document.getElementById("input-peak-nav"),
         selectProvider: document.getElementById("select-provider"),
         btnRunHealth: document.getElementById("btn-run-health"),
@@ -119,6 +121,7 @@
         tbodyHoldings: document.getElementById("tbody-holdings"),
         planNotice: document.getElementById("holdings-plan-notice"),
         holdingsInputAlert: document.getElementById("holdings-input-alert"),
+        navProvenance: document.getElementById("nav-provenance"),
         valHoldingsEquity: document.getElementById("val-holdings-equity"),
         valHoldingsCash: document.getElementById("val-holdings-cash"),
         valHoldingsCashRatio: document.getElementById("val-holdings-cash-ratio"),
@@ -535,6 +538,11 @@
         }
 
         const runProvider = bundle.summary?.data_provider || bundle.data_provider;
+        // Archived runs persist the mark's provenance in `summary.json`; show it when the
+        // operator loads that day, so a past override cannot be read as a computed NAV.
+        if (bundle.summary && bundle.summary.nav_source) {
+            renderNavProvenance(bundle.summary);
+        }
         if (runProvider && el.selectProvider) {
             el.selectProvider.value = runProvider;
             saveSessionState();
@@ -1189,6 +1197,89 @@
     }
 
     /**
+     * Show where the NAV used by this deploy came from.
+     *
+     * The share counts / weights in the ticket are sized off this number, so it must never
+     * be implicit:
+     *   - `computed`       engine mark (`shares x raw_close x factor_ratio`, dividend-inclusive);
+     *   - `override`       the operator pinned the NAV by hand -> RED banner, with the drift
+     *                      against the engine's own computation when it was available;
+     *   - `fallback_input` engine failed AND `LIVETRADING_ALLOW_NAV_FALLBACK=1` degraded to
+     *                      the form value -> also RED, and it means the mark was NOT verified.
+     * `cash_source` distinguishes an operator-entered cash balance from the BIL/511880
+     * fallback, because those two produce the same NAV number for different reasons.
+     */
+    function renderNavProvenance(data) {
+        if (!el.navProvenance) return;
+        if (!data || data.nav_source === undefined || data.nav_source === null) {
+            el.navProvenance.style.display = "none";
+            el.navProvenance.textContent = "";
+            el.navProvenance.classList.remove("nav-override");
+            return;
+        }
+        const source = String(data.nav_source);
+        const fmtMoney = (v) => (typeof v === "number" && isFinite(v)
+            ? `¥${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+            : "--");
+        const effective = (typeof data.nav_effective === "number") ? data.nav_effective : null;
+        const computed = (typeof data.nav_computed === "number") ? data.nav_computed : null;
+
+        const sourceLabel = {
+            computed: "引擎计算 (含息净值)",
+            override: "人工覆盖净值",
+            fallback_input: "回退表单值 (引擎估值失败)",
+            restated: "归档重述净值",
+        }[source] || source;
+        const cashLabel = {
+            explicit: "手工填写",
+            bil_fallback: "BIL/511880 市值",
+            missing: "无法确定",
+        }[data.cash_source] || (data.cash_source || "--");
+
+        const parts = [`本次部署净值来源：${sourceLabel}（nav_source=${source}）`];
+        parts.push(`生效净值 ${fmtMoney(effective)}`);
+        if (computed !== null) parts.push(`引擎计算值 ${fmtMoney(computed)}`);
+        parts.push(`现金 ${fmtMoney(data.cash)}（${cashLabel}）`);
+        // A missing position-open date means the mark is a LOWER BOUND (raw price, no
+        // dividends). Say it here too: `anchor_inflation_ratio` is then 1.0, which would
+        // otherwise read as "this name pays no dividend".
+        const anchorMissing = data.anchor_source === null || data.anchor_source === undefined;
+        if (anchorMissing) parts.push("无建仓日 → 按裸价下限估值（不含建仓以来股息）");
+
+        let text = "🧮 " + parts.join(" | ");
+
+        if (source === "override") {
+            let drift = "";
+            if (computed !== null && computed !== 0 && effective !== null) {
+                const diff = effective - computed;
+                drift = `；差异 ${diff >= 0 ? "+" : ""}${diff.toLocaleString(undefined, { maximumFractionDigits: 2 })}`
+                    + `（${(diff / computed * 100).toFixed(2)}%）`;
+            }
+            text = `⚠️ 本次为人工覆盖净值：未采用引擎计算结果，工单股数/权重均按人工值 ${fmtMoney(effective)} 计算`
+                + `${drift}。`;
+            el.navProvenance.classList.add("nav-override");
+        } else if (source === "fallback_input") {
+            text = "⚠️ 本次净值回退为表单值：引擎估值失败（详见下方警告），本工单未经含息净值校验。";
+            el.navProvenance.classList.add("nav-override");
+        } else {
+            el.navProvenance.classList.remove("nav-override");
+        }
+
+        const warnings = Array.isArray(data.nav_warnings) ? data.nav_warnings : [];
+        if (warnings.length > 0) {
+            const head = warnings.slice(0, 3).join("；");
+            const more = warnings.length > 3 ? ` …等 ${warnings.length} 条` : "";
+            text += `\n估值告警 ${warnings.length} 条：${head}${more}`;
+        }
+
+        el.navProvenance.textContent = text;
+        el.navProvenance.style.display = "block";
+        if (warnings.length > 0) {
+            logConsole(`[NAV] ${sourceLabel} | ${parts.slice(1).join(" | ")}\n${warnings.join("\n")}`);
+        }
+    }
+
+    /**
      * Re-render the holdings table from a deploy response.
      *
      * Source priority:
@@ -1371,6 +1462,22 @@
         return holdings;
     }
 
+    // Cash balance for the dividend-aware NAV engine. Blank means "let the engine value the
+    // parked-cash holding (BIL / 511880)" -- NOT zero, and NOT "infer from NAV - equity".
+    // Sending 0 would silently understate NAV, so an empty field must stay `null`.
+    function getCashInput() {
+        if (!el.inputCash) return null;
+        const raw = String(el.inputCash.value ?? "").trim();
+        if (raw === "") return null;
+        const val = parseFloat(raw);
+        if (isNaN(val) || val < 0) return null;
+        return val;
+    }
+
+    function getNavOverrideInput() {
+        return !!(el.inputNavOverride && el.inputNavOverride.checked);
+    }
+
     function recalcHoldings() {
         const nav = parseFloat(el.inputValue.value) || 100000.0;
         const rows = el.tbodyHoldings.querySelectorAll("tr");
@@ -1550,6 +1657,7 @@
                     holdings: holdings,
                     date: dateVal,
                     portfolio_value: nav,
+                    cash: getCashInput(),
                     strategy_key: keys.stratKey,
                     universe_key: keys.univKey,
                 }),
@@ -1598,6 +1706,11 @@
             universe_name: keys.univName,
             as_of_date: dateVal,
             portfolio_value: nav,
+            // Blank cash -> null -> backend uses the parked-cash holding's market value.
+            cash: getCashInput(),
+            // Human override: only when the operator ticks the box. Default false, i.e. the
+            // backend's dividend-aware mark decides `--portfolio-value`.
+            nav_override: getNavOverrideInput(),
             peak_nav: peakNav,
             data_provider: provider,
         };
@@ -1790,6 +1903,7 @@
 
             // (defect 2026-10-27) Refresh the holdings table from the ticket's planned book
             // so a long-lived page cannot re-submit this round's pre-trade holdings tomorrow.
+            renderNavProvenance(data);
             renderHoldingsInputAlert(data.holdings_input_check);
             await refreshHoldingsAfterDeploy(data, keys);
 
@@ -1914,6 +2028,7 @@
                 if (dataDeploy.account_state) {
                     state.accountState = dataDeploy.account_state;
                 }
+                renderNavProvenance(dataDeploy);
                 renderHoldingsInputAlert(dataDeploy.holdings_input_check);
                 await refreshHoldingsAfterDeploy(dataDeploy, keys);
             }
@@ -2042,6 +2157,7 @@
         "INERTIA": "未超惰性阈值",
         "TENURE_LOCKED": "未满最低持仓周期",
         "LIMIT_UP_LOCKED": "涨停封板",
+        "NO_PRICE": "价格缺失",
         "NONE": "无阻断",
     };
 

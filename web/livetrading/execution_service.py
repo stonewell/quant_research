@@ -87,6 +87,13 @@ except (ImportError, ValueError):
         strict_holdings_input_enabled,
     )
 
+try:
+    from .valuation import MissingCashError, StalePriceError, compute_nav
+except (ImportError, ValueError):
+    # The web app imports this module by bare name after putting `web/livetrading` on
+    # sys.path (`server.py` / `app.py`), so the package-relative form is not always valid.
+    from valuation import MissingCashError, StalePriceError, compute_nav
+
 
 # --------------------------------------------------------------------------- #
 # (C6) Actionable failure classification for the child runner's stderr
@@ -401,6 +408,219 @@ def reconcile_intraday_5m_observability(
     return block
 
 
+# --------------------------------------------------------------------------- #
+# Dividend-aware NAV valuation (web/livetrading/valuation.py) into Stage 2
+# --------------------------------------------------------------------------- #
+# WHY THIS BLOCK EXISTS
+# ---------------------
+# Stage 2 used to be handed `--portfolio-value <the operator's form field>` verbatim, i.e.
+# a NAV nobody had checked against the book.  `valuation.compute_nav` now marks the
+# submitted shares dividend-inclusively (`shares x raw_close x factor_ratio`) and THAT
+# number is what the child receives.  Three consequences are load-bearing:
+#
+#   1. `--portfolio-value` in the child's argv is no longer the form value.  The subprocess
+#      contract is unchanged (same flag), only its producer moved.
+#   2. A failure is a REFUSAL by default.  Silently falling back to the form value would
+#      reintroduce exactly the defect this engine removes (a NAV that ignores dividends /
+#      holds a stale price), so falling back needs an explicit `LIVETRADING_ALLOW_NAV_FALLBACK`
+#      opt-in that logs an ERROR and is recorded as `nav_source="fallback_input"`.
+#   3. `cache_uninitialized` and `stale_price` are DIFFERENT failures with different fixes.
+#      An empty/uninitialised cache (the operator deleted `data/cache.duckdb`) otherwise
+#      surfaces as "no price at all for X" -- which reads like a stale-market problem and
+#      sends the operator to look at the wrong thing.  `cache_structure_reason` probes the
+#      tables/row counts so the message names the actual cure (a Stage-1 data refresh).
+NAV_FALLBACK_ENV = "LIVETRADING_ALLOW_NAV_FALLBACK"
+
+#: Row-level mark, one entry per symbol.  NEVER folded into `summary.json` (which stays a
+#: top-level digest): a 20-symbol book would otherwise bloat every summary by 20 blocks.
+NAV_BREAKDOWN_FILENAME = "nav_breakdown.json"
+
+#: Machine-readable failure classes.  They are written into `nav_warnings` (prefixed as
+#: `reason=<class>: ...`) and into the refusal text, so the two failure families below can
+#: never be conflated by a reader or by a future log-grep.
+NAV_REASON_CACHE_UNINITIALIZED = "cache_uninitialized"
+NAV_REASON_STALE_PRICE = "stale_price"
+NAV_REASON_MISSING_CASH = "missing_cash"
+NAV_REASON_ADJUST_BASIS = "adjust_basis"
+NAV_REASON_INPUT = "input_error"
+NAV_REASON_OTHER = "valuation_error"
+
+#: (headline, operator hint) per failure class.  The cache class deliberately does NOT
+#: mention staleness: the cure is a data refresh, not "wait for the close".
+_NAV_REASON_TEXT: Dict[str, Tuple[str, str]] = {
+    NAV_REASON_CACHE_UNINITIALIZED: (
+        "缓存库为空或未初始化（不是行情过期）",
+        "请先执行 Stage-1 数据刷新，把 ohlcv_bars / adjust_factors 补齐后重跑："
+        "scripts/check_live_portfolio_health.py（其前置行情刷新）或 "
+        "scripts/sync_china_5m_and_indices.py；若 adjust_factors 表缺失，还需要因子写入/重建脚本。"
+        "本次确需按人工净值部署时，在表单勾选「人工覆盖净值」，"
+        f"或设置 {NAV_FALLBACK_ENV}=1 显式回退（会记录一条 ERROR 日志）。",
+    ),
+    NAV_REASON_STALE_PRICE: (
+        "行情陈旧或该标的缺当日 bar",
+        "先把行情缓存同步到本次估值日（或换用正确的 --data-provider）再重跑；"
+        f"确属数据源已知缺口的人工演练，可设置 {NAV_FALLBACK_ENV}=1 回退表单净值"
+        "（会记录一条 ERROR），或在表单勾选「人工覆盖净值」。",
+    ),
+    NAV_REASON_MISSING_CASH: (
+        "现金余额无法确定",
+        "在持仓表单填写「现金余额」（留空才回退 BIL / 511880 的市值）；"
+        "账户里没有任何停放现金标的时必须显式填写，否则 NAV 只是一个残差猜测。",
+    ),
+    NAV_REASON_ADJUST_BASIS: (
+        "缓存价格口径（basis）未声明或无法派生",
+        "运行 scripts/migrate_adjust_basis.py 为缓存声明价格口径后重跑；"
+        "按错误的口径估值是百分比级的价格错误，不能降级为警告。",
+    ),
+    NAV_REASON_INPUT: (
+        "持仓输入无法解析",
+        "检查持仓股数（必须是整数、非负）与现金金额（不得为负）；"
+        "表单里的权重列不会被当作股数。",
+    ),
+    NAV_REASON_OTHER: (
+        "净值估值失败",
+        "展开 STDERR / 服务端日志查看完整回溯后重试。",
+    ),
+}
+
+_NAV_TRUE_VALUES = frozenset({"1", "true", "yes", "on", "y", "t"})
+
+
+def _env_truthy(name: str) -> bool:
+    """Same truthy set as `storage._truthy_env`, so every `LIVETRADING_*` knob reads alike."""
+    return str(os.environ.get(name, "")).strip().lower() in _NAV_TRUE_VALUES
+
+
+def nav_fallback_allowed() -> bool:
+    """Opt-in degradation: on valuation failure, deploy anyway with the form-provided NAV.
+
+    Off by default.  When on, the failure is logged at ERROR level and the result is tagged
+    ``nav_source="fallback_input"`` so a later reader cannot mistake it for a computed mark.
+    """
+    return _env_truthy(NAV_FALLBACK_ENV)
+
+
+class NavValuationError(RuntimeError):
+    """Refusal to deploy because the book could not be marked honestly.
+
+    Subclasses ``RuntimeError`` because that is what `server.py` maps to HTTP 500 +
+    ``detail`` -- the same convention as ``storage.HoldingsInputMismatchError`` -- so the
+    operator receives the WHOLE refusal (class + cause + the command that fixes it)
+    instead of a bare ``Execution failed with code N``.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str,
+        detail: str = "",
+        nav_warnings: Optional[List[str]] = None,
+    ):
+        super().__init__(message)
+        self.reason = reason
+        self.detail = detail
+        self.nav_warnings = list(nav_warnings or [])
+
+
+def _shares_book(holdings: Optional[Mapping[str, Any]]) -> Dict[str, int]:
+    """``symbol -> integer shares`` for the valuation engine.
+
+    The web payload is polymorphic (JSON numbers, numeric strings, ``{shares: n}`` row
+    dicts, weight-only rows).  ``compute_nav`` accepts ONLY ints and raises on anything
+    else, so coercion happens here -- and weight-only rows (no share count) are dropped
+    rather than valued as if the weight were a share count.
+    """
+    book: Dict[str, int] = {}
+    for raw_symbol, raw_value in (holdings or {}).items():
+        symbol = str(raw_symbol or "").strip().upper()
+        if not symbol:
+            continue
+        if isinstance(raw_value, Mapping):
+            raw_value = raw_value.get("shares", raw_value.get("share", raw_value.get("quantity")))
+        try:
+            shares_f = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if shares_f != shares_f or shares_f in (float("inf"), float("-inf")):
+            continue
+        if shares_f == 0:
+            continue
+        book[symbol] = int(shares_f)
+    return book
+
+
+def open_live_valuation_cache(cache_dir: Optional[str]):
+    """Read-ONLY ``DuckDBCache`` over the live OHLCV cache directory.
+
+    PATH RESOLUTION -- deliberately not re-implemented here:
+      * the DIRECTORY is `StorageManager.cache_dir` (env ``LIVETRADING_CACHE_DIR`` >
+        ``web/livetrading/data/settings.local.json`` key ``cache_dir`` > dynamic default
+        ``<repo_root>/data``), i.e. the exact value already handed to the child as
+        ``--cache-dir`` (and the same default as `common/cli_utils.shared_data_dir`);
+      * the FILE NAME is resolved by `DuckDBCache.__init__` itself
+        (``common/duckdb_cache.py:1104-1108``: a directory becomes
+        ``<dir>/cache.duckdb``).  Nothing here hardcodes ``cache.duckdb``.
+
+    WHY READ-ONLY: a writable `DuckDBCache.__init__` CREATES the database and its tables
+    (`_init_tables`, ``duckdb_cache.py:1159``).  After the live cache was deleted, a
+    writable open would silently leave a fresh EMPTY cache behind and then report "no
+    price at all" for every holding -- an uninitialised cache masquerading as stale
+    prices, plus a brand-new file the operator never asked for.  Read-only raises
+    ``FileNotFoundError`` instead (``duckdb_cache.py:1116``), which
+    `ExecutionService._valuation_cache` classifies as ``cache_uninitialized``.
+    """
+    if not cache_dir:
+        raise FileNotFoundError("cache_dir is not configured")
+    from common.duckdb_cache import DuckDBCache
+
+    return DuckDBCache(db_path=str(cache_dir), read_only=True)
+
+
+def cache_structure_reason(cache: Any) -> Optional[str]:
+    """``None`` when the cache looks initialised, else a machine-readable reason.
+
+    ROW-COUNT PROBE, not exception sniffing: `query_bars`/`query_adjust_factors` return an
+    EMPTY frame for an unknown symbol on a healthy cache and raise a duckdb
+    ``CatalogException`` on a cache whose tables were never created, so the failure cannot
+    be told apart from "this symbol has no data" at that layer.  Counting rows in
+    ``ohlcv_bars`` / ``adjust_factors`` distinguishes the two:
+      * table missing  -> ``<table>_table_missing`` (the live cache predates the table, or
+                          is a brand-new empty database);
+      * table empty    -> ``<table>_empty`` (initialised schema, zero history).
+    Both mean "Stage-1 data refresh needed", never "stale price".
+
+    ``adjust_factors`` is required because the default ``dividend_mode="total_return"``
+    cannot be honoured without it: the engine would degrade to RAW marking (dividends
+    excluded) one symbol at a time, which is the very defect `valuation.py` exists to fix.
+
+    A duck-typed cache without ``_get_connection`` (fakes used by `test_portfolio_valuation`)
+    is treated as healthy -- there is nothing structural to probe.
+    """
+    get_con = getattr(cache, "_get_connection", None)
+    if get_con is None:
+        return None
+    # No public row-count API exists on DuckDBCache; this read-only handle is the same one
+    # its own query methods use, and it never writes.
+    con = get_con(read_only=True)
+    try:
+        for table in ("ohlcv_bars", "adjust_factors"):
+            try:
+                row = con.execute(f"SELECT count(*) FROM {table}").fetchone()
+            except Exception:
+                return f"{table}_table_missing"
+            count = int(row[0]) if row and row[0] is not None else 0
+            if count <= 0:
+                return f"{table}_empty"
+    finally:
+        try:
+            if not getattr(cache, "is_memory", False):
+                con.close()
+        except Exception:
+            pass
+    return None
+
+
 class ExecutionService:
     """Orchestrates health check and live deployment runs."""
 
@@ -689,6 +909,465 @@ class ExecutionService:
             paths.append(existing_pythonpath)
         env["PYTHONPATH"] = os.path.pathsep.join(paths)
         return env
+
+    # --------------------------------------------------------------------------
+    # (NAV) Dividend-aware valuation, delegated to `valuation.compute_nav`
+    # --------------------------------------------------------------------------
+    def _nav_refusal(
+        self,
+        reason: str,
+        detail: str,
+        *,
+        exc: Optional[BaseException] = None,
+        book: Optional[Mapping[str, Any]] = None,
+        as_of: Optional[str] = None,
+    ) -> NavValuationError:
+        """Build the operator-facing refusal for one failure class.
+
+        The class-specific headline/hint pair comes from `_NAV_REASON_TEXT`, so a missing
+        CACHE can never be reported with the stale-price wording (and vice versa).  The
+        machine-readable class also lands in `nav_warnings` as ``reason=<class>: ...``.
+        """
+        headline, hint = _NAV_REASON_TEXT.get(reason, _NAV_REASON_TEXT[NAV_REASON_OTHER])
+        message = f"实盘调仓已中止（净值估值失败）：{headline}。\n原因：{detail}\n处理建议：{hint}"
+        logging.error(
+            "[nav] 拒绝部署: reason=%s as_of=%s symbols=%s detail=%s",
+            reason,
+            as_of,
+            sorted(book or {}),
+            detail,
+            exc_info=exc if exc is not None else False,
+        )
+        return NavValuationError(
+            message,
+            reason=reason,
+            detail=detail,
+            nav_warnings=[f"reason={reason}: {detail}"],
+        )
+
+    def _valuation_cache(self, *, book=None, as_of=None):
+        """Read-only live cache handle; a missing file is `cache_uninitialized`, not stale."""
+        cache_dir = getattr(self.storage, "cache_dir", None)
+        try:
+            return open_live_valuation_cache(cache_dir)
+        except FileNotFoundError as exc:
+            raise self._nav_refusal(
+                NAV_REASON_CACHE_UNINITIALIZED,
+                f"cache_db_missing: {cache_dir} (<cache_dir>/cache.duckdb 不存在；"
+                f"DuckDBCache 以只读打开，因此不会自动建库)",
+                exc=exc,
+                book=book,
+                as_of=as_of,
+            ) from exc
+        except Exception as exc:
+            raise self._nav_refusal(
+                NAV_REASON_CACHE_UNINITIALIZED,
+                f"cache_open_failed: {cache_dir}: {type(exc).__name__}: {exc}",
+                exc=exc,
+                book=book,
+                as_of=as_of,
+            ) from exc
+
+    @staticmethod
+    def _classify_nav_exception(exc: BaseException) -> Tuple[str, str]:
+        """``(reason, detail)`` for any exception raised while marking the book.
+
+        Ordered most-specific first.  `StalePriceError` is a ``ValueError`` subclass, so it
+        must be tested before the generic ``ValueError`` branch -- otherwise a stale bar
+        would be reported as bad operator input.
+        """
+        detail = f"{type(exc).__name__}: {exc}"
+        if isinstance(exc, MissingCashError):
+            return NAV_REASON_MISSING_CASH, detail
+        if isinstance(exc, StalePriceError):
+            return NAV_REASON_STALE_PRICE, detail
+        text = str(exc)
+        if type(exc).__name__ == "UnknownAdjustBasisError" or "stored data has basis" in text:
+            return NAV_REASON_ADJUST_BASIS, detail
+        if "Catalog Error" in text or "does not exist" in text:
+            # A table vanished between the structural probe and the read (or the probe was
+            # skipped for a duck-typed cache): same cure, same class.
+            return NAV_REASON_CACHE_UNINITIALIZED, detail
+        if isinstance(exc, ValueError):
+            return NAV_REASON_INPUT, detail
+        return NAV_REASON_OTHER, detail
+
+    def _compute_nav_result(
+        self,
+        book: Mapping[str, int],
+        *,
+        as_of: str,
+        cash: Optional[float],
+        provider: str,
+        nav_override: Optional[float] = None,
+        anchors: Optional[Mapping[str, str]] = None,
+    ):
+        """``NavResult`` for ``book``; any failure becomes a classified `NavValuationError`."""
+        cache = self._valuation_cache(book=book, as_of=as_of)
+        try:
+            structure = cache_structure_reason(cache)
+        except Exception as exc:  # corrupt file / unreadable table: same cure as "empty"
+            raise self._nav_refusal(
+                NAV_REASON_CACHE_UNINITIALIZED,
+                f"cache_probe_failed: {type(exc).__name__}: {exc}",
+                exc=exc,
+                book=book,
+                as_of=as_of,
+            ) from exc
+        if structure:
+            raise self._nav_refusal(
+                NAV_REASON_CACHE_UNINITIALIZED,
+                f"cache_structure={structure} (ohlcv_bars/adjust_factors 缺失或零行)",
+                book=book,
+                as_of=as_of,
+            )
+        try:
+            return compute_nav(
+                dict(book),
+                as_of=as_of,
+                cache=cache,
+                cash=cash,
+                anchors=dict(anchors or {}),
+                nav_override=nav_override,
+                provider=provider,
+            )
+        except Exception as exc:
+            reason, detail = self._classify_nav_exception(exc)
+            raise self._nav_refusal(reason, detail, exc=exc, book=book, as_of=as_of) from exc
+
+    def _derive_anchors(
+        self,
+        book: Mapping[str, int],
+        *,
+        as_of: str,
+        strategy_key: Optional[str],
+        universe_key: Optional[str],
+        exclude_dir: Optional[str] = None,
+    ) -> Tuple[Dict[str, str], List[str]]:
+        """``(anchors, missing)`` -- first ARCHIVED session each held symbol was > 0.
+
+        WHY THIS EXISTS: the engine's total-return mark is
+        ``shares x raw_close x (factor_mark / factor_anchor)``, and ``factor_hfq`` is
+        monotone increasing, so the anchor MUST be the day the position was opened.
+        Without one the engine now degrades to raw (a lower bound, dividends excluded).
+        A lower bound under-sizes every order slightly, which is far safer than the
+        alternative, but it is still an avoidable error -- and this station already
+        archives every session's book, so the open date is recoverable.
+
+        Resolution is deliberately reuse-only (no new path logic): `StorageManager`
+        already owns the archive layout via `list_runs`, `_load_snapshot_holdings`
+        (that session's pre-trade `holdings.json`) and `extract_post_run_holdings`
+        (fallback for pre-`holdings.json` archives).  Scanned oldest -> newest, so the
+        first hit IS the open date; every symbol is resolved independently (a book
+        built over several rounds gets per-name anchors).
+
+        Best effort by design: an unreadable/empty archive yields ``({}, missing)`` and
+        the engine reports ``anchor_unavailable`` -- never a guessed date.
+        """
+        wanted = set(book)
+        if not wanted or not strategy_key or not universe_key:
+            return {}, sorted(wanted)
+        try:
+            runs = self.storage.list_runs(
+                strategy_key=strategy_key, universe_key=universe_key, require_both=True
+            )
+        except Exception as exc:  # corrupt archive must not block a valuation
+            logging.warning("[nav] 建仓日回溯失败（忽略，按裸价下限估值）：%s", exc)
+            return {}, sorted(wanted)
+
+        # Oldest first: the FIRST observation of a symbol is its open date.
+        ordered = sorted(
+            (r for r in runs if r.get("path") and r.get("date")),
+            key=lambda r: str(r.get("date")),
+        )
+        exclude = os.path.abspath(exclude_dir) if exclude_dir else None
+        anchors: Dict[str, str] = {}
+        for run in ordered:
+            run_path = str(run.get("path"))
+            if exclude and os.path.abspath(run_path) == exclude:
+                continue  # the run being written right now is not history
+            date_val = str(run.get("date"))
+            if date_val > as_of:
+                break  # archive is date-sorted; nothing later can be an open date
+            snapshot = self.storage._load_snapshot_holdings(run_path)
+            if snapshot is None:
+                snapshot = self.storage.extract_post_run_holdings(run_path)
+            if not snapshot:
+                continue
+            held = _shares_book(snapshot)
+            for symbol in wanted - set(anchors):
+                if held.get(symbol, 0) > 0:
+                    anchors[symbol] = date_val
+            if len(anchors) == len(wanted):
+                break
+        return anchors, sorted(wanted - set(anchors))
+
+    @staticmethod
+    def _nav_payload(
+        *,
+        nav: float,
+        nav_source: str,
+        nav_computed: Optional[float],
+        equity: Optional[float],
+        cash: Optional[float],
+        cash_source: Optional[str],
+        as_of: str,
+        per_symbol: Optional[Mapping[str, Any]] = None,
+        stale_symbols: Optional[List[str]] = None,
+        dividend_alarms: Optional[List[dict]] = None,
+        nav_warnings: Optional[List[str]] = None,
+        anchors: Optional[Mapping[str, str]] = None,
+        anchor_source: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """The single shape every NAV path returns, so three code paths cannot drift."""
+        return {
+            #: value handed to the child as `--portfolio-value`
+            "nav_effective": float(nav),
+            #: the ENGINE's own mark (`equity + cash`); on an override this is "Y" in the
+            #: diff log line, and on a fallback it is None (nothing could be computed)
+            "nav_computed": None if nav_computed is None else float(nav_computed),
+            "nav_source": nav_source,
+            "equity": None if equity is None else float(equity),
+            "cash": None if cash is None else float(cash),
+            "cash_source": cash_source,
+            "as_of": as_of,
+            #: ``symbol -> position-open date`` actually handed to the engine, and where
+            #: those dates came from: ``"run_archive"`` (derived from archived books) or
+            #: ``None`` when nothing could be derived (then those symbols are marked at
+            #: RAW -- a lower bound -- and say so via `anchor_unavailable`).
+            "anchors": dict(anchors or {}),
+            "anchor_source": anchor_source,
+            "per_symbol": dict(per_symbol or {}),
+            "stale_symbols": list(stale_symbols or []),
+            "dividend_alarms": list(dividend_alarms or []),
+            "nav_warnings": list(nav_warnings or []),
+        }
+
+    def _resolve_nav(
+        self,
+        holdings: Optional[Mapping[str, Any]],
+        *,
+        as_of: str,
+        cash: Optional[float],
+        portfolio_value: float,
+        nav_override: bool,
+        provider: str,
+        strategy_key: Optional[str] = None,
+        universe_key: Optional[str] = None,
+        exclude_dir: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Mark the book to market and decide what `--portfolio-value` will be.
+
+        Three paths, and only three:
+          * ``computed``       -- the engine's mark (the normal live path);
+          * ``override``       -- the operator explicitly pinned a NAV (`nav_override=True`);
+                                  the engine is still run for the diff line, but a failed
+                                  computation does NOT block the deploy the operator asked for;
+          * ``fallback_input`` -- the engine failed AND ``LIVETRADING_ALLOW_NAV_FALLBACK`` is
+                                  on: deploy with the form value, ERROR-logged.
+
+        Position-open dates are derived from the run archive (`_derive_anchors`) and fed to
+        the engine as ``anchors``.  Without them the engine marks at RAW -- a LOWER BOUND --
+        and says so; it must never substitute the start of the factor history, which would
+        capitalise pre-entry dividends into today's NAV (see `valuation.py`).
+
+        Without the opt-in a failure raises `NavValuationError` (abort, no child process).
+        """
+        book = _shares_book(holdings)
+        anchors, anchors_missing = self._derive_anchors(
+            book,
+            as_of=as_of,
+            strategy_key=strategy_key,
+            universe_key=universe_key,
+            exclude_dir=exclude_dir,
+        )
+        anchor_source = "run_archive" if anchors else None
+        if anchors_missing:
+            logging.warning(
+                "[nav] %d/%d 个标的找不到建仓日（%s），这些标的将按裸价下限估值（不含建仓以来股息）",
+                len(anchors_missing),
+                len(book),
+                ",".join(anchors_missing[:5]) + ("..." if len(anchors_missing) > 5 else ""),
+            )
+
+        if nav_override:
+            return self._resolve_nav_override(
+                book,
+                as_of=as_of,
+                cash=cash,
+                override_value=float(portfolio_value),
+                provider=provider,
+                anchors=anchors,
+                anchor_source=anchor_source,
+            )
+
+        try:
+            res = self._compute_nav_result(
+                book, as_of=as_of, cash=cash, provider=provider, anchors=anchors
+            )
+        except NavValuationError as exc:
+            if not nav_fallback_allowed():
+                raise
+            logging.error(
+                "[nav] 估值失败，按 %s=1 回退为人工入参净值 %.2f（reason=%s, as_of=%s）：%s",
+                NAV_FALLBACK_ENV,
+                float(portfolio_value),
+                exc.reason,
+                as_of,
+                exc.detail,
+            )
+            return self._nav_payload(
+                nav=float(portfolio_value),
+                nav_source="fallback_input",
+                nav_computed=None,
+                equity=None,
+                cash=float(cash) if cash is not None else None,
+                cash_source="explicit" if cash is not None else None,
+                as_of=as_of,
+                anchors=anchors,
+                anchor_source=anchor_source,
+                nav_warnings=list(exc.nav_warnings)
+                + [
+                    f"nav_fallback_applied: {NAV_FALLBACK_ENV}=1，估值失败后回退表单净值 "
+                    f"{float(portfolio_value):.2f}；本次 NAV 未经引擎校验"
+                ],
+            )
+
+        return self._nav_payload(
+            nav=res.nav,
+            nav_source=res.nav_source,
+            nav_computed=res.equity + res.cash,
+            equity=res.equity,
+            cash=res.cash,
+            cash_source=res.cash_source,
+            as_of=res.as_of,
+            anchors=anchors,
+            anchor_source=anchor_source,
+            per_symbol=res.per_symbol,
+            stale_symbols=res.stale_symbols,
+            dividend_alarms=res.dividend_alarms,
+            nav_warnings=res.warnings,
+        )
+
+    def _resolve_nav_override(
+        self,
+        book: Mapping[str, int],
+        *,
+        as_of: str,
+        cash: Optional[float],
+        override_value: float,
+        provider: str,
+        anchors: Optional[Mapping[str, str]] = None,
+        anchor_source: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Explicit human override: deploy with `override_value`, but say what was skipped.
+
+        The engine is still run so the operator learns how far the override drifted from the
+        computed mark (``本次使用了人工覆盖净值 X，计算值为 Y，差异 Z%``, at WARNING level).
+        An override exists precisely for the case where the engine CANNOT run (deleted
+        cache, suspended name), so a failed computation is logged rather than raised -- the
+        operator has already taken responsibility for the number by ticking the box.
+        """
+        computed = None
+        equity = None
+        cash_value = float(cash) if cash is not None else None
+        cash_source = "explicit" if cash is not None else None
+        warnings: List[str] = []
+        per_symbol: Mapping[str, Any] = {}
+        stale_symbols: List[str] = []
+        dividend_alarms: List[dict] = []
+
+        try:
+            res = self._compute_nav_result(
+                book,
+                as_of=as_of,
+                cash=cash,
+                provider=provider,
+                nav_override=override_value,
+                anchors=anchors,
+            )
+            computed = float(res.equity + res.cash)
+            equity = res.equity
+            cash_value = res.cash
+            cash_source = res.cash_source
+            per_symbol = res.per_symbol
+            stale_symbols = list(res.stale_symbols)
+            dividend_alarms = list(res.dividend_alarms)
+            warnings = list(res.warnings)
+        except NavValuationError as exc:
+            warnings = list(exc.nav_warnings)
+            logging.warning(
+                "[nav] 人工覆盖净值路径：引擎无法计算参考净值（reason=%s, as_of=%s）：%s；"
+                "本次直接使用人工值 %.2f，差异无法计算",
+                exc.reason,
+                as_of,
+                exc.detail,
+                override_value,
+            )
+            warnings.append(
+                f"nav_override_no_reference: 覆盖路径下引擎无法计算参考净值（reason={exc.reason}），"
+                f"人工值 {override_value:.2f} 的偏差不可量化"
+            )
+
+        if computed is not None:
+            diff = override_value - computed
+            diff_pct = (diff / computed * 100.0) if computed else None
+            pct_text = f"{diff_pct:+.2f}%" if diff_pct is not None else "n/a（计算值为 0）"
+            message = (
+                f"本次使用了人工覆盖净值 {override_value:,.2f}，计算值为 {computed:,.2f}，"
+                f"差异 {diff:+,.2f}（{pct_text}）"
+            )
+            logging.warning("[nav] %s", message)
+            warnings.append("nav_override: " + message)
+
+        return self._nav_payload(
+            nav=override_value,
+            nav_source="override",
+            nav_computed=computed,
+            equity=equity,
+            cash=cash_value,
+            cash_source=cash_source,
+            as_of=as_of,
+            anchors=anchors,
+            anchor_source=anchor_source,
+            per_symbol=per_symbol,
+            stale_symbols=stale_symbols,
+            dividend_alarms=dividend_alarms,
+            nav_warnings=warnings,
+        )
+
+    def _write_nav_breakdown(self, run_dir: str, nav_info: Mapping[str, Any]) -> str:
+        """Persist the per-symbol mark to its own file, never into `summary.json`.
+
+        A 20-symbol book would add ~20 blocks to every summary; the digest keeps scalars
+        plus a pointer (`nav_breakdown_file` / `nav_symbol_count`) to this file instead.
+        """
+        path = os.path.join(run_dir, NAV_BREAKDOWN_FILENAME)
+        payload = {
+            "as_of": nav_info.get("as_of"),
+            "nav_effective": nav_info.get("nav_effective"),
+            "nav_computed": nav_info.get("nav_computed"),
+            "nav_source": nav_info.get("nav_source"),
+            "equity": nav_info.get("equity"),
+            "cash": nav_info.get("cash"),
+            "cash_source": nav_info.get("cash_source"),
+            #: Position-open dates used for the total-return ratio, and their provenance.
+            #: ``None`` means every symbol inside `per_symbol` was marked at RAW (a lower
+            #: bound) -- see the `anchor_unavailable` entries in `nav_warnings`.
+            "anchor_source": nav_info.get("anchor_source"),
+            "anchors": dict(nav_info.get("anchors") or {}),
+            "raw_valuation_total": sum(
+                float(e.get("value_raw") or 0.0)
+                for e in (nav_info.get("per_symbol") or {}).values()
+                if isinstance(e, Mapping) and e.get("counted_as") == "equity"
+            ),
+            "stale_symbols": list(nav_info.get("stale_symbols") or []),
+            "dividend_alarms": list(nav_info.get("dividend_alarms") or []),
+            "nav_warnings": list(nav_info.get("nav_warnings") or []),
+            "per_symbol": dict(nav_info.get("per_symbol") or {}),
+        }
+        self.storage._save_json(path, payload)
+        return path
 
     def run_health_check(
         self,
@@ -985,8 +1664,17 @@ class ExecutionService:
         universe_name: Optional[str] = None,
         guard_latency_bars: int = 2,
         allow_intraday: bool = True,
+        cash: Optional[float] = None,
+        nav_override: bool = False,
     ) -> Dict[str, Any]:
-        """Execute Stage 2 Live Deployment."""
+        """Execute Stage 2 Live Deployment.
+
+        ``cash``/``nav_override`` feed the dividend-aware NAV engine (`valuation.compute_nav`):
+        ``cash=None`` means "use the parked-cash holding (BIL / 511880)", and
+        ``nav_override=True`` means the operator pinned ``portfolio_value`` by hand.
+        Both the archived summary and the child's ``--portfolio-value`` are derived from that
+        mark, never from the raw form value (see `_resolve_nav`).
+        """
         provider = data_provider or self.storage.default_data_provider or "marketdb"
         strat_key, univ_key, strat_name, univ_name = self.storage.resolve_keys(
             strategy_file=strategy_file,
@@ -1019,6 +1707,25 @@ class ExecutionService:
         else:
             effective_holdings = self.storage.get_holdings(date_str=val_date, strategy_key=strat_key, universe_key=univ_key)
 
+        # (NAV) Mark the book BEFORE any side effect or argv assembly.  Fails closed: a book
+        # that cannot be valued is a refusal by default (see `_resolve_nav`), so the run
+        # directory never gains a holdings.json for a deploy that will not happen.
+        nav_info = self._resolve_nav(
+            effective_holdings,
+            as_of=val_date,
+            cash=cash,
+            portfolio_value=portfolio_value,
+            nav_override=nav_override,
+            provider=provider,
+            strategy_key=strat_key,
+            universe_key=univ_key,
+            exclude_dir=run_dir,
+        )
+        #: The value the child receives (`--portfolio-value`).  For the computed path this is
+        #: the engine's dividend-inclusive mark -- deliberately NOT `portfolio_value`.
+        effective_portfolio_value = nav_info["nav_effective"]
+        self._write_nav_breakdown(run_dir, nav_info)
+
         # Advisory reconciliation of the INPUT book against the previous round's PLANNED
         # post-trade book (see `diff_holdings_input_vs_prev_post`). This system has no
         # broker fill receipt, so a mismatch means "the table may still be holding the
@@ -1040,7 +1747,7 @@ class ExecutionService:
             self.storage.stage2_script,
             "--strategy-file", strat_path,
             "--universe-file", univ_path,
-            "--portfolio-value", str(portfolio_value),
+            "--portfolio-value", str(effective_portfolio_value),
             "--current-holdings-file", holdings_file,
             "--output-dir", run_dir,
             "--account-state-file", account_state_file,
@@ -1148,7 +1855,27 @@ class ExecutionService:
             "universe_key": univ_key,
             "universe_name": univ_name,
             "universe_file": univ_path,
+            # `portfolio_value` stays the OPERATOR'S input (audit: what was asked for);
+            # `nav_effective` is what the child actually received on the command line.
             "portfolio_value": portfolio_value,
+            "nav_effective": nav_info["nav_effective"],
+            # (NAV) Dividend-aware mark. Scalars only -- the per-symbol detail lives in
+            # `<run_dir>/nav_breakdown.json` (`nav_breakdown_file` below) so a 20-symbol
+            # book cannot bloat the digest.
+            "nav_computed": nav_info["nav_computed"],
+            "nav_source": nav_info["nav_source"],
+            "nav_equity": nav_info["equity"],
+            "cash": nav_info["cash"],
+            "cash_source": nav_info["cash_source"],
+            "nav_stale_symbols": nav_info["stale_symbols"],
+            "nav_warnings": nav_info["nav_warnings"],
+            "nav_symbol_count": len(nav_info["per_symbol"]),
+            #: Where the position-open dates used for the total-return ratio came from.
+            #: ``"run_archive"`` = derived from archived books; ``None`` = no anchor was
+            #: available and those symbols were marked at RAW (a LOWER BOUND).
+            "anchor_source": nav_info["anchor_source"],
+            "anchor_count": len(nav_info["anchors"]),
+            "nav_breakdown_file": NAV_BREAKDOWN_FILENAME,
             "data_provider": provider,
             "as_of_source": as_of_source,
             "deploy_status": "SUCCESS" if success else "FAILED",
@@ -1191,6 +1918,16 @@ class ExecutionService:
             "trading_ticket": ticket_records,
             "account_state": state_data,
             "holdings": effective_holdings,
+            # (NAV) What the book was marked at, and where that number came from. The UI
+            # highlights `nav_source == "override"` and shows the cash provenance so a
+            # BIL-derived cash balance is never mistaken for an operator-entered one.
+            "nav_computed": nav_info["nav_computed"],
+            "nav_effective": nav_info["nav_effective"],
+            "nav_source": nav_info["nav_source"],
+            "cash": nav_info["cash"],
+            "cash_source": nav_info["cash_source"],
+            "nav_warnings": nav_info["nav_warnings"],
+            "anchor_source": nav_info["anchor_source"],
             # Planned post-ticket book (from `target_shares`) -- what the holdings table should
             # show after this deploy. `holdings` above is the PRE-trade input book.
             "holdings_plan": post_holdings,

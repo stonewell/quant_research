@@ -183,7 +183,14 @@ def test_all_three_commands_omit_as_of_date_by_default(service, monkeypatch):
     storage._save_json(strat_file, {"template_name": "dummy", "params": {}})
 
     svc.run_health_check(strategy_file=strat_file, custom_symbols=["600519.SH"], portfolio_value=100000.0)
-    svc.run_live_deploy(strategy_file=strat_file, custom_symbols=["600519.SH"], portfolio_value=100000.0)
+    # `nav_override=True`: this test pins the as-of-date plumbing, not the mark -- there is
+    # no valuation cache in this workspace, so the engine path would (correctly) refuse.
+    svc.run_live_deploy(
+        strategy_file=strat_file,
+        custom_symbols=["600519.SH"],
+        portfolio_value=100000.0,
+        nav_override=True,
+    )
     svc.run_multi_strategy_netted_deploy(
         strategies=[{"strategy_key": "chan_risk_managed_blend", "capital_weight": 1.0}],
         custom_symbols=["600519.SH"],
@@ -215,6 +222,8 @@ def test_explicit_replay_as_of_is_forwarded_verbatim(service, monkeypatch):
         custom_symbols=["600519.SH"],
         as_of_date="2024-05-10",
         portfolio_value=100000.0,
+        # Marks the as-of-date plumbing, not the NAV (no valuation cache here).
+        nav_override=True,
     )
 
     assert len(captured) == 1
@@ -355,7 +364,14 @@ def test_intraday_gate_refusal_is_actionable(service, monkeypatch):
     strat_file = os.path.join(temp_dir, "strat.json")
     storage._save_json(strat_file, {"template_name": "dummy", "params": {}})
 
-    res = svc.run_live_deploy(strategy_file=strat_file, custom_symbols=["600519.SH"], portfolio_value=100000.0)
+    # `nav_override=True`: the subject here is the CHILD's refusal text, not the mark --
+    # this workspace has no valuation cache, so the engine path would refuse first.
+    res = svc.run_live_deploy(
+        strategy_file=strat_file,
+        custom_symbols=["600519.SH"],
+        portfolio_value=100000.0,
+        nav_override=True,
+    )
 
     assert res["status"] == "error"
     assert res["error_kind"] == "run_window_gate"
@@ -386,7 +402,13 @@ def test_stale_price_refusal_names_the_staleness(service, monkeypatch):
     strat_file = os.path.join(temp_dir, "strat.json")
     storage._save_json(strat_file, {"template_name": "dummy", "params": {}})
 
-    res = svc.run_live_deploy(strategy_file=strat_file, custom_symbols=["600519.SH"], portfolio_value=100000.0)
+    # `nav_override=True`: pins the child's stale-price refusal plumbing, not the mark.
+    res = svc.run_live_deploy(
+        strategy_file=strat_file,
+        custom_symbols=["600519.SH"],
+        portfolio_value=100000.0,
+        nav_override=True,
+    )
 
     assert res["error_kind"] == "stale_prices"
     assert "陈旧" in res["message"]
@@ -435,8 +457,15 @@ def test_success_path_is_untouched(service, monkeypatch):
     strat_file = os.path.join(temp_dir, "strat.json")
     storage._save_json(strat_file, {"template_name": "dummy", "params": {}})
 
+    # `nav_override=True`: keeps `--portfolio-value` equal to the form field, which is what
+    # this test asserts. The computed-mark path is pinned by `pipeline/tests/
+    # test_live_nav_computed.py`; here the subject is the child-exit success contract.
     res = svc.run_live_deploy(
-        strategy_file=strat_file, custom_symbols=["600519.SH"], as_of_date="2024-05-10", portfolio_value=100000.0
+        strategy_file=strat_file,
+        custom_symbols=["600519.SH"],
+        as_of_date="2024-05-10",
+        portfolio_value=100000.0,
+        nav_override=True,
     )
 
     assert res["status"] == "success"

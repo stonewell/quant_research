@@ -45,6 +45,10 @@ class HoldingsUpdateModel(BaseModel):
     )
     date: Optional[str] = Field(None, description="Optional date (YYYY-MM-DD) for historical archival")
     portfolio_value: Optional[float] = Field(None, description="Total portfolio value for weight/share math")
+    #: Explicit cash balance for the dividend-aware NAV engine (`valuation.compute_nav`).
+    #: ``None`` (blank field) means "use the parked-cash holding's market value
+    #: (BIL / 511880)"; an empty book with neither is a `MissingCashError`, never a zero.
+    cash: Optional[float] = Field(None, description="Explicit cash balance; blank = use the BIL/511880 market value")
     strategy_key: Optional[str] = Field(None, description="Strategy identifier key")
     universe_key: Optional[str] = Field(None, description="Universe identifier key")
 
@@ -102,6 +106,12 @@ class RunDeployRequest(BaseModel):
     as_of_date: Optional[str] = None
     start_date: Optional[str] = None
     portfolio_value: float = 100000.0
+    #: Explicit cash balance for `valuation.compute_nav`. ``None`` -> the engine falls back
+    #: to the parked-cash holding (BIL / 511880) and reports ``cash_source="bil_fallback"``.
+    cash: Optional[float] = Field(None, description="现金余额；留空则用 BIL/511880 市值（cash_source=bil_fallback）")
+    #: Human override: keep ``portfolio_value`` as the NAV instead of the computed mark.
+    #: Logged at WARNING with the computed value and the drift; the UI highlights it.
+    nav_override: bool = Field(False, description="人工覆盖净值：以 portfolio_value 作为 NAV（会记录 WARNING 与偏差）")
     current_holdings: Optional[Dict[str, Any]] = None
     data_provider: Optional[str] = None
     lot_size: Optional[int] = None
@@ -137,6 +147,22 @@ class RunResponse(BaseModel):
     trading_ticket: Optional[List[Dict[str, Any]]] = None
     account_state: Optional[Dict[str, Any]] = None
     holdings: Optional[Dict[str, Any]] = None
+    #: (NAV) Dividend-aware mark from `valuation.compute_nav`, and where it came from.
+    #: ``nav_source``: ``"computed"`` (engine mark, the normal path), ``"override"``
+    #: (operator pinned `portfolio_value`) or ``"fallback_input"`` (engine failed and
+    #: `LIVETRADING_ALLOW_NAV_FALLBACK=1` degraded to the form value).
+    #: MUST be declared here: FastAPI's `response_model` filters undeclared keys out, so
+    #: the UI would silently lose the provenance badge otherwise.
+    nav_computed: Optional[float] = None
+    nav_effective: Optional[float] = None
+    nav_source: Optional[str] = None
+    cash: Optional[float] = None
+    cash_source: Optional[str] = None
+    nav_warnings: Optional[List[str]] = None
+    #: Provenance of the position-open dates behind the total-return ratio:
+    #: ``"run_archive"`` when derived from archived books, else ``None`` (those symbols
+    #: were marked at RAW -- a lower bound that excludes dividends since entry).
+    anchor_source: Optional[str] = None
     #: PLANNED post-ticket book derived from the ticket's `target_shares`
     #: (`post_holdings_from_ticket`). The UI refreshes the holdings table from this so a
     #: page left open across days cannot re-submit the PRE-trade book (defect 2026-10-27).

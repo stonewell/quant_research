@@ -170,6 +170,9 @@ def test_execution_service_argv_never_targets_production_cache(temp_workspace, m
         custom_symbols=["600519.SH"],
         as_of_date="2024-05-10",
         portfolio_value=100000.0,
+        # Subject is the hermetic `--cache-dir`, not the mark: this workspace's cache is
+        # empty, so the engine path would (correctly) refuse before spawning the child.
+        nav_override=True,
     )
 
     assert captured_cmds, "expected run_live_deploy to invoke run_live_strategy.py"
@@ -823,6 +826,10 @@ def test_execution_service_synthetic_runs(temp_workspace):
         portfolio_value=100000.0,
         current_holdings=initial_holdings,
         data_provider="synthetic",
+        # Synthetic bars are never written to the cache, so there is nothing for the
+        # dividend-aware engine to mark. This test pins the end-to-end synthetic plumbing
+        # (`--portfolio-value` -> ticket -> archive), not the mark.
+        nav_override=True,
     )
     assert deploy_res["status"] == "success"
     assert deploy_res["trading_ticket"] is not None
@@ -1970,6 +1977,9 @@ def test_same_day_rerun_idempotency(temp_workspace):
         portfolio_value=88000.0,
         current_holdings=initial_holdings,
         data_provider="synthetic",
+        # Synthetic mode: the cache holds no bars for the engine to mark. This test pins
+        # same-day re-run idempotency of the ticket, so the form NAV is the right anchor.
+        nav_override=True,
     )
     assert dep1["status"] == "success"
     ticket1 = dep1["trading_ticket"]
@@ -1992,6 +2002,8 @@ def test_same_day_rerun_idempotency(temp_workspace):
         portfolio_value=88000.0,
         current_holdings=run_bundle["holdings"],
         data_provider="synthetic",
+        # Same anchor as `dep1` -- an idempotency comparison must hold the NAV source fixed.
+        nav_override=True,
     )
     assert dep2["status"] == "success"
     ticket2 = dep2["trading_ticket"]
@@ -2064,6 +2076,8 @@ def test_execution_service_passes_guard_latency_bars(temp_workspace, monkeypatch
         as_of_date="2024-05-10",
         portfolio_value=100000.0,
         guard_latency_bars=4,
+        # Subject is the `--guard-latency-bars` flag; no valuation cache exists here.
+        nav_override=True,
     )
 
     assert len(captured_cmds) == 1
@@ -2436,6 +2450,8 @@ def test_execution_service_intraday_and_refresh_flags(temp_workspace, monkeypatc
         universe_file="dummy.txt",
         data_provider="synthetic",
         allow_intraday=True,
+        # Subject is the `--allow-intraday` flag; synthetic mode has no cache to mark.
+        nav_override=True,
     )
     cmd3 = captured_cmds[-1]
     assert "--allow-intraday" in cmd3
@@ -2445,6 +2461,7 @@ def test_execution_service_intraday_and_refresh_flags(temp_workspace, monkeypatc
         universe_file="dummy.txt",
         data_provider="synthetic",
         allow_intraday=False,
+        nav_override=True,
     )
     cmd3_no = captured_cmds[-1]
     assert "--no-allow-intraday" in cmd3_no

@@ -65,6 +65,13 @@
             <label for="input-portfolio-value">净值(NAV)</label>
             <input type="number" id="input-portfolio-value" class="form-input" value="100000" step="1000">
         </div>
+        <div class="control-item" id="ctrl-nav-override">
+            <label for="input-nav-override" title="勾选后：不采用含息净值引擎的计算结果，直接把上面的净值当作 NAV 提交（后端会记录 WARNING 并算出偏差）">人工覆盖</label>
+            <label class="chk-inline">
+                <input type="checkbox" id="input-nav-override">
+                <span>以本行净值部署</span>
+            </label>
+        </div>
         <div class="control-item" id="ctrl-peak-nav">
             <label for="input-peak-nav">高位(HWM)</label>
             <input type="number" id="input-peak-nav" class="form-input" placeholder="自动: 历史高位" step="1000">
@@ -137,6 +144,16 @@
                     <!-- Provenance of the table below: after a deploy the table holds the
                          TICKET'S PLANNED book, never realised fills (no broker fill feed). -->
                     <div id="holdings-plan-notice" class="plan-notice" style="display: none;"></div>
+                    <!-- Cash balance for the dividend-aware NAV engine. Blank is NOT zero:
+                         the engine then values the parked-cash holding (BIL / 511880) and
+                         reports cash_source="bil_fallback". -->
+                    <div class="form-group nav-cash-row">
+                        <label for="input-cash">现金余额 (Cash):</label>
+                        <input type="number" id="input-cash" class="form-input form-input-sm"
+                               step="0.01" min="0" placeholder="留空则用 BIL/511880 市值">
+                    </div>
+                    <!-- NAV provenance: computed / override / fallback, plus cash source. -->
+                    <div id="nav-provenance" class="plan-notice" style="display: none;"></div>
                     <div class="holdings-summary-bar">
                         <div class="sum-item">
                             <span class="sum-label">股票持仓市值:</span>
