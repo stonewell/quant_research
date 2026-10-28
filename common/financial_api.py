@@ -288,7 +288,16 @@ def calibrate_adjust_factors_from_closes(
     qfq_close: Union[pd.Series, pd.DataFrame],
     hfq_close: Optional[Union[pd.Series, pd.DataFrame]] = None,
 ) -> pd.DataFrame:
-    """Calibrates daily qfq and hfq adjustment factors from raw close and adjusted close series.
+    """UTILITY-ONLY helper: no production call site (see `fetch_adjust_factors` for the real sources).
+
+    Calibrates daily qfq and hfq adjustment factors from raw close and adjusted close series.
+
+    The factors every production path returns come from the `fetch_adjust_factors` implementations
+    (dense `calc_adjust_factor_daily` / BaoStock event rows / MarketDB's raw-vs-hfq construction).
+    Kept because its math is independently unit-tested and it stays the documented way to turn a
+    pair of GENUINE raw + adjusted close series into factors. Do not wire it into a data path that
+    has no genuine qfq close series: handing it the hfq close as both `qfq_close` and `hfq_close`
+    silently mislabels `factor_qfq` (exactly what MarketDB's old fallback did).
 
     Computes:
         factor_qfq = qfq_close / raw_close
@@ -545,6 +554,12 @@ class MarketDBDataProvider(BaseDataProvider):
 
         Reads from calc_adjust_factor_daily if present, or derives from v_daily / v_daily_qfq.
         For index symbols or cash ETFs (e.g. 511880.SH), returns factors = 1.0.
+
+        When `calc_adjust_factor_daily` is missing (or has no rows for the window) the last-resort
+        fallback reads raw `v_daily` and backward-adjusted `v_daily_hfq` closes and constructs the
+        factors itself: ``factor_hfq = hfq_close / raw_close``, and ``factor_qfq = factor_hfq /
+        factor_hfq[latest]`` (BaoStock's official `fore = back / back_last`). That fallback does
+        NOT use `calibrate_adjust_factors_from_closes`.
         """
         thscode = normalize_thscode(symbol)
         _validate_symbol_for_path(thscode)
@@ -614,36 +629,51 @@ class MarketDBDataProvider(BaseDataProvider):
             if self._con is None:
                 con.close()
 
-        # Fallback: derive via calibrate_adjust_factors_from_closes between v_daily and v_daily_hfq
+        # Fallback: derive the factors directly from the raw vs backward-adjusted closes of
+        # v_daily / v_daily_hfq. This path deliberately does NOT go through
+        # `calibrate_adjust_factors_from_closes`: there is no qfq view to read here, so the helper
+        # would have to be handed the hfq close as `qfq_close`, and its `factor_qfq` column would
+        # come out equal to the hfq factor, i.e. mislabelled. Per BaoStock's official definition
+        # `fore = back / back[latest]` -- and `_apply_factors_to_df` uses exactly that identity,
+        # `qfq_price = raw * factor_hfq[t] / factor_hfq[latest]` -- the honest qfq factor is simply
+        # the hfq factor rescaled by its own last value.
         try:
             raw_prov = MarketDBDataProvider(adjust="none", con=self._con, folder_path=getattr(self, "folder_path", None), db_path=getattr(self, "db_path", None) if getattr(self, "db_path", None) != ":memory:" else None)
             hfq_prov = MarketDBDataProvider(adjust="backward", con=self._con, folder_path=getattr(self, "folder_path", None), db_path=getattr(self, "db_path", None) if getattr(self, "db_path", None) != ":memory:" else None)
             raw_df = raw_prov.fetch_ohlcv(symbol, start=start or "2016-01-01", end=end or "2030-01-01", interval="1d")
             hfq_df = hfq_prov.fetch_ohlcv(symbol, start=start or "2016-01-01", end=end or "2030-01-01", interval="1d")
-            fac = calibrate_adjust_factors_from_closes(
-                raw_df["Close"], qfq_close=hfq_df["Close"], hfq_close=hfq_df["Close"]
+
+            raw_close = raw_df["Close"]
+            hfq_close = hfq_df["Close"]
+            common_idx = raw_close.index.intersection(hfq_close.index)
+            rc = raw_close.loc[common_idx].astype(float)
+            hc = hfq_close.loc[common_idx].astype(float)
+            # Same div-by-zero guard the retired calibration call applied: a zero raw close yields
+            # factor 1.0 instead of inf (numpy still evaluates both branches, so a non-finite raw
+            # close propagates as-is -- exactly the pre-existing behaviour, not a new policy).
+            factor_hfq = pd.Series(
+                np.where(rc.to_numpy() != 0, hc.to_numpy() / rc.to_numpy(), 1.0),
+                index=common_idx,
+                name="factor_hfq",
             )
-            # Passing the HFD close as `qfq_close` is what makes this fallback's `factor_qfq`
-            # column WRONG: it comes out equal to the hfq factor, i.e. mislabelled (there is no qfq
-            # view to read here, only raw vs hfq). Per BaoStock's official definition
-            # `fore = back / back[latest]` -- and `_apply_factors_to_df` uses exactly that identity,
-            # `qfq_price = raw * factor_hfq[t] / factor_hfq[latest]` -- so the honest qfq factor is
-            # simply the hfq factor rescaled by its own last value. `factor_hfq` itself is untouched
-            # (it is the quantity every consumer actually derives from).
-            if fac is not None and not fac.empty:
-                last_hfq = float(fac["factor_hfq"].iloc[-1])
-                if np.isfinite(last_hfq) and last_hfq > 0:
-                    fac = fac.copy()
-                    fac["factor_qfq"] = fac["factor_hfq"] / last_hfq
-                else:
-                    warnings.warn(
-                        f"MarketDB adjust-factor fallback for {symbol!r} produced a non-positive "
-                        f"terminal backward factor ({last_hfq!r}); labelling factor_qfq as 1.0. "
-                        f"factor_hfq is unaffected."
-                    )
-                    fac = fac.copy()
-                    fac["factor_qfq"] = 1.0
-            return fac
+            fac = pd.DataFrame({"factor_hfq": factor_hfq}, index=pd.to_datetime(common_idx))
+            fac.index.name = "date"
+            if fac.empty:
+                return pd.DataFrame(
+                    columns=["factor_qfq", "factor_hfq"], index=pd.DatetimeIndex([], name="date")
+                )
+
+            last_hfq = float(fac["factor_hfq"].iloc[-1])
+            if np.isfinite(last_hfq) and last_hfq > 0:
+                fac["factor_qfq"] = fac["factor_hfq"] / last_hfq
+            else:
+                warnings.warn(
+                    f"MarketDB adjust-factor fallback for {symbol!r} produced a non-positive "
+                    f"terminal backward factor ({last_hfq!r}); labelling factor_qfq as 1.0. "
+                    f"factor_hfq is unaffected."
+                )
+                fac["factor_qfq"] = 1.0
+            return fac[["factor_qfq", "factor_hfq"]]
         except Exception:
             return pd.DataFrame(columns=["factor_hfq"], index=pd.DatetimeIndex([], name="date"))
 

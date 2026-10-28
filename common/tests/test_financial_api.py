@@ -1217,3 +1217,97 @@ def test_marketdb_fallback_relabels_factor_qfq_but_keeps_factor_hfq():
     )
     np.testing.assert_allclose(factors["factor_qfq"].to_numpy(), [0.5, 0.5, 1.0, 1.0], rtol=1e-9)
     assert factors["factor_qfq"].iloc[-1] == pytest.approx(1.0, rel=1e-12)
+
+
+def _mem_marketdb_without_factor_table(dates, raw_close, hfq_close):
+    """In-memory market.duckdb with NO `calc_adjust_factor_daily` -> exercises the fallback.
+
+    Two physical tables so `v_daily` (raw) and `v_daily_hfq` (backward-adjusted) can hold
+    different closes without patching the provider class.
+    """
+    con = duckdb.connect(":memory:")
+    con.execute("""
+        CREATE TABLE raw_kline_daily (
+            thscode VARCHAR, date DATE, open DOUBLE, high DOUBLE, low DOUBLE,
+            close DOUBLE, volume DOUBLE
+        );
+        CREATE TABLE hfq_kline_daily (
+            thscode VARCHAR, date DATE, open DOUBLE, high DOUBLE, low DOUBLE,
+            close DOUBLE, volume DOUBLE
+        );
+        CREATE VIEW v_daily AS SELECT * FROM raw_kline_daily;
+        CREATE VIEW v_daily_hfq AS SELECT * FROM hfq_kline_daily;
+        CREATE VIEW v_daily_qfq AS SELECT * FROM hfq_kline_daily;
+    """)
+    for i, d in enumerate(dates):
+        for table, close in (("raw_kline_daily", raw_close), ("hfq_kline_daily", hfq_close)):
+            con.execute(
+                f"INSERT INTO {table} VALUES ('600519.SH', ?, ?, ?, ?, ?, 1000.0)",
+                [d.strftime("%Y-%m-%d"), float(close[i]), float(close[i]),
+                 float(close[i]), float(close[i])],
+            )
+    return con
+
+
+def test_marketdb_fallback_with_degenerate_raw_close_stays_finite_and_storable():
+    """C.4: a 0 / NaN raw close in the source must not leak inf/NaN factors or raise.
+
+    Upstream `_drop_invalid_ohlcv_rows` (called by `fetch_ohlcv`) already removes such bars, so the
+    fallback keeps its pre-existing shape: no exception, finite factors, storable as-is.
+    """
+    dates = pd.bdate_range("2024-01-01", periods=4)
+    raw_close = np.array([100.0, 0.0, np.nan, 52.0])
+    hfq_close = np.array([100.0, 0.0, np.nan, 104.0])
+    con = _mem_marketdb_without_factor_table(dates, raw_close, hfq_close)
+    provider = MarketDBDataProvider(con=con, adjust="none")
+    try:
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            factors = provider.fetch_adjust_factors(
+                "600519.SH", start="2024-01-01", end="2024-01-04"
+            )
+    finally:
+        con.close()
+
+    assert list(factors.columns) == ["factor_qfq", "factor_hfq"]
+    assert factors.index.name == "date"
+    # The two degenerate bars are gone; what is left is finite in BOTH columns.
+    assert len(factors) == 2
+    for col in ("factor_qfq", "factor_hfq"):
+        assert np.isfinite(factors[col].to_numpy()).all(), (col, factors[col].tolist())
+    np.testing.assert_allclose(factors["factor_hfq"].to_numpy(), [1.0, 2.0], rtol=1e-12)
+    np.testing.assert_allclose(factors["factor_qfq"].to_numpy(), [0.5, 1.0], rtol=1e-12)
+
+    # And the cache accepts the frame verbatim.
+    from common.duckdb_cache import DuckDBCache
+
+    cache = DuckDBCache(db_path=":memory:")
+    cache.store_adjust_factors("600519.SH", factors)
+    stored = cache.query_adjust_factors("600519.SH")
+    assert len(stored) == 2
+    assert np.isfinite(pd.to_numeric(stored["factor_hfq"], errors="coerce").to_numpy()).all()
+
+
+def test_marketdb_fallback_does_not_call_calibrate_helper(monkeypatch):
+    """C.5: the fallback constructs the factors itself -- the retired helper must never run."""
+    dates = pd.bdate_range("2024-01-01", periods=4)
+    raw_close = np.array([100.0, 101.0, 51.0, 52.0])
+    hfq_close = raw_close * np.array([1.0, 1.0, 2.0, 2.0])
+    con = _mem_marketdb_without_factor_table(dates, raw_close, hfq_close)
+
+    def _sentinel(*args, **kwargs):  # pragma: no cover - must not be reached
+        raise AssertionError(
+            "MarketDBDataProvider.fetch_adjust_factors must not call "
+            "calibrate_adjust_factors_from_closes"
+        )
+
+    monkeypatch.setattr(financial_api, "calibrate_adjust_factors_from_closes", _sentinel)
+    provider = MarketDBDataProvider(con=con, adjust="none")
+    try:
+        factors = provider.fetch_adjust_factors("600519.SH", start="2024-01-01", end="2024-01-04")
+    finally:
+        con.close()
+
+    assert not factors.empty
+    np.testing.assert_allclose(factors["factor_hfq"].to_numpy(), [1.0, 1.0, 2.0, 2.0], rtol=1e-12)
+    np.testing.assert_allclose(factors["factor_qfq"].to_numpy(), [0.5, 0.5, 1.0, 1.0], rtol=1e-12)
