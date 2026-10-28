@@ -66,6 +66,60 @@ _INTRADAY_BAR_MINUTES: Dict[str, int] = {
 _INTRADAY_INTERVALS = set(_INTRADAY_BAR_MINUTES)
 
 
+class MissingAdjustFactorsError(RuntimeError):
+    """Raised when raw bars are queried with qfq/hfq adjustment but no adjustment factors are found for a non-neutral symbol."""
+
+    def __init__(self, symbol: str, msg: Optional[str] = None):
+        self.symbol = symbol
+        super().__init__(
+            msg
+            or f"Missing adjustment factors for non-neutral symbol '{symbol}'. Cannot derive adjusted prices from raw bars."
+        )
+
+
+def canonicalize_adjust_mode(mode: Any) -> str:
+    """Canonicalize adjustment mode into one of: 'raw', 'qfq', 'hfq'.
+
+    Accepted mappings:
+      - raw: 'none', 'raw', '3', 'unadjusted'
+      - qfq: 'qfq', '2', 'forward', 'fore'
+      - hfq: 'hfq', '1', 'backward', 'back'
+    Raises ValueError for any other input (or None).
+    """
+    if mode is None:
+        raise ValueError("Adjustment mode cannot be None")
+    m = str(mode).strip().lower()
+    if m in ("none", "raw", "3", "unadjusted"):
+        return "raw"
+    if m in ("qfq", "2", "forward", "fore"):
+        return "qfq"
+    if m in ("hfq", "1", "backward", "back"):
+        return "hfq"
+    raise ValueError(f"Unknown or unsupported adjustment mode: {mode!r}")
+
+
+def is_factor_neutral_symbol(symbol: str) -> bool:
+    """Returns True for structurally factor-neutral symbols (indices, cash ETF 511880)."""
+    if not symbol:
+        return False
+    s = str(symbol).strip().upper()
+    if "511880" in s:
+        return True
+    if s.endswith(".TI"):
+        return True
+    try:
+        from common.financial_api import is_index_symbol
+
+        return is_index_symbol(s)
+    except Exception:
+        ticker, _, suffix = s.partition(".")
+        if suffix == "SZ" and ticker.startswith("399"):
+            return True
+        if suffix == "SH" and (ticker.startswith("000") or ticker.startswith("001")):
+            return True
+        return False
+
+
 def is_intraday_interval(interval: str) -> bool:
     """Returns True if the interval represents an intraday frequency."""
     if not interval or not isinstance(interval, str):
@@ -156,10 +210,14 @@ def resample_ohlcv(df: pd.DataFrame, interval: str) -> pd.DataFrame:
     }
     if "Volume" in df.columns:
         agg_spec["Volume"] = "sum"
+    if "Amount" in df.columns:
+        agg_spec["Amount"] = "sum"
 
     resampled = df.resample(rule).agg(agg_spec).dropna(subset=["Open", "High", "Low", "Close"])
     if "Volume" in resampled.columns:
         resampled["Volume"] = resampled["Volume"].fillna(0.0)
+    if "Amount" in resampled.columns:
+        resampled["Amount"] = resampled["Amount"].fillna(0.0)
 
     return resampled
 
@@ -838,6 +896,7 @@ class DuckDBCache:
                 low DOUBLE NOT NULL,
                 close DOUBLE NOT NULL,
                 volume DOUBLE NOT NULL,
+                amount DOUBLE,
                 PRIMARY KEY (provider, symbol, date)
             );
             CREATE TABLE IF NOT EXISTS asset_sync_metadata (
@@ -847,6 +906,7 @@ class DuckDBCache:
                 is_earliest_known BOOLEAN NOT NULL DEFAULT FALSE,
                 latest_available_date DATE NOT NULL,
                 last_sync_time TIMESTAMP NOT NULL,
+                adjustflag VARCHAR,
                 PRIMARY KEY (provider, symbol)
             );
             CREATE INDEX IF NOT EXISTS idx_ohlcv_lookup ON ohlcv_bars(provider, symbol, date);
@@ -861,6 +921,8 @@ class DuckDBCache:
                 low DOUBLE NOT NULL,
                 close DOUBLE NOT NULL,
                 volume DOUBLE NOT NULL,
+                amount DOUBLE,
+                adjustflag VARCHAR,
                 PRIMARY KEY (provider, symbol, interval, ts)
             );
 
@@ -873,10 +935,21 @@ class DuckDBCache:
                 latest_available_ts TIMESTAMP NOT NULL,
                 latest_close_ref DOUBLE,
                 last_sync_time TIMESTAMP NOT NULL,
+                adjustflag VARCHAR,
                 PRIMARY KEY (provider, symbol, interval)
             );
 
             CREATE INDEX IF NOT EXISTS idx_intraday_lookup ON intraday_ohlcv_bars(provider, symbol, interval, ts);
+
+            CREATE TABLE IF NOT EXISTS adjust_factors (
+                symbol VARCHAR NOT NULL,
+                date DATE NOT NULL,
+                factor_hfq DOUBLE NOT NULL,
+                source VARCHAR,
+                last_sync_time TIMESTAMP NOT NULL,
+                PRIMARY KEY (symbol, date)
+            );
+            CREATE INDEX IF NOT EXISTS idx_adjust_factors_lookup ON adjust_factors(symbol, date);
 
             CREATE TABLE IF NOT EXISTS stock_fundamentals_annual (
                 provider VARCHAR NOT NULL,
@@ -932,6 +1005,13 @@ class DuckDBCache:
             self._ensure_column(con, table, "last_probe_result", "VARCHAR")
             self._ensure_column(con, table, "last_probe_time", "TIMESTAMP")
 
+        # M3.6 schema migration: amount and adjustflag columns for raw storage and in-memory derivation
+        self._ensure_column(con, "ohlcv_bars", "amount", "DOUBLE")
+        self._ensure_column(con, "asset_sync_metadata", "adjustflag", "VARCHAR")
+        self._ensure_column(con, "intraday_ohlcv_bars", "amount", "DOUBLE")
+        self._ensure_column(con, "intraday_ohlcv_bars", "adjustflag", "VARCHAR")
+        self._ensure_column(con, "intraday_sync_metadata", "adjustflag", "VARCHAR")
+
     @staticmethod
     def _ensure_column(con, table: str, column: str, column_type: str) -> None:
         """Idempotent `ALTER TABLE ADD COLUMN` -- the L2.2 migration primitive.
@@ -952,7 +1032,7 @@ class DuckDBCache:
         con = self._get_connection(read_only=True)
         try:
             row = con.execute(
-                "SELECT earliest_available_date, is_earliest_known, latest_available_date, last_sync_time "
+                "SELECT earliest_available_date, is_earliest_known, latest_available_date, last_sync_time, adjustflag "
                 "FROM asset_sync_metadata WHERE provider = ? AND symbol = ?",
                 [provider, symbol],
             ).fetchone()
@@ -968,6 +1048,7 @@ class DuckDBCache:
             "is_earliest_known": bool(row[1]),
             "latest_available_date": row[2],
             "last_sync_time": row[3],
+            "adjustflag": row[4],
         }
 
     def get_intraday_metadata(self, provider: str, symbol: str, interval: str = "5m") -> Optional[dict]:
@@ -978,7 +1059,7 @@ class DuckDBCache:
         con = self._get_connection(read_only=True)
         try:
             row = con.execute(
-                "SELECT earliest_available_ts, is_earliest_known, latest_available_ts, latest_close_ref, last_sync_time "
+                "SELECT earliest_available_ts, is_earliest_known, latest_available_ts, latest_close_ref, last_sync_time, adjustflag "
                 "FROM intraday_sync_metadata WHERE provider = ? AND symbol = ? AND interval = ?",
                 [provider, symbol, interval],
             ).fetchone()
@@ -995,6 +1076,7 @@ class DuckDBCache:
             "latest_available_ts": pd.Timestamp(row[2]),
             "latest_close_ref": float(row[3]) if row[3] is not None else None,
             "last_sync_time": pd.Timestamp(row[4]) if row[4] is not None else None,
+            "adjustflag": row[5],
         }
 
     def is_intraday_range_covered(
@@ -1380,6 +1462,7 @@ class DuckDBCache:
         requested_start: Optional[str] = None,
         requested_end: Optional[str] = None,
         sync_time: Optional[datetime.datetime] = None,
+        adjustflag: Optional[str] = None,
     ) -> None:
         """Upserts intraday OHLCV bars into intraday_ohlcv_bars and updates intraday_sync_metadata.
         Enforces R4 QFQ Split/Dividend Drift detection and R13 End-Date expansion.
@@ -1402,6 +1485,12 @@ class DuckDBCache:
         for col in ["Open", "High", "Low", "Close"]:
             df_to_store[col] = df[col].astype(float)
         df_to_store["Volume"] = df["Volume"].astype(float) if "Volume" in df.columns else 0.0
+        if "Amount" in df.columns:
+            df_to_store["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
+        elif "amount" in df.columns:
+            df_to_store["Amount"] = pd.to_numeric(df["amount"], errors="coerce")
+        else:
+            df_to_store["Amount"] = None
         df_to_store = df_to_store.sort_index()
 
         min_ts = df_to_store.index.min()
@@ -1435,6 +1524,8 @@ class DuckDBCache:
 
         sync_ts = sync_time if sync_time is not None else datetime.datetime.now()
 
+        canon_adjust = canonicalize_adjust_mode(adjustflag) if adjustflag is not None else None
+
         records_df = pd.DataFrame({
             "provider": provider,
             "symbol": symbol,
@@ -1445,6 +1536,8 @@ class DuckDBCache:
             "low": df_to_store["Low"].values,
             "close": df_to_store["Close"].values,
             "volume": df_to_store["Volume"].values,
+            "amount": df_to_store["Amount"].values if ("Amount" in df_to_store.columns and df_to_store["Amount"].notna().any()) else None,
+            "adjustflag": canon_adjust,
         })
 
         con = self._get_connection(read_only=False)
@@ -1452,7 +1545,7 @@ class DuckDBCache:
             con.register("temp_intraday_bars_to_insert", records_df)
             con.execute("""
                 INSERT OR REPLACE INTO intraday_ohlcv_bars
-                SELECT provider, symbol, interval, ts, open, high, low, close, volume
+                SELECT provider, symbol, interval, ts, open, high, low, close, volume, amount, adjustflag
                 FROM temp_intraday_bars_to_insert
             """)
             # ------------------------------------------------------------------------------
@@ -1530,8 +1623,8 @@ class DuckDBCache:
             con.execute("""
                 INSERT INTO intraday_sync_metadata AS existing
                     (provider, symbol, interval, earliest_available_ts, is_earliest_known,
-                     latest_available_ts, latest_close_ref, last_sync_time)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     latest_available_ts, latest_close_ref, last_sync_time, adjustflag)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (provider, symbol, interval) DO UPDATE SET
                     earliest_available_ts = COALESCE(
                         CAST(? AS TIMESTAMP),
@@ -1551,7 +1644,8 @@ class DuckDBCache:
                     latest_close_ref = COALESCE(
                         CAST(? AS DOUBLE), existing.latest_close_ref
                     ),
-                    last_sync_time = excluded.last_sync_time
+                    last_sync_time = excluded.last_sync_time,
+                    adjustflag = COALESCE(excluded.adjustflag, existing.adjustflag)
             """, [
                 provider,
                 symbol,
@@ -1561,6 +1655,7 @@ class DuckDBCache:
                 reconciled.latest,
                 latest_close_ref,
                 sync_ts,
+                canon_adjust,
                 bars_min_ts,
                 bars_max_ts,
                 latest_close_ref,
@@ -1578,9 +1673,10 @@ class DuckDBCache:
         requested_end: Optional[str] = None,
         sync_time: Optional[datetime.datetime] = None,
         interval: str = "1d",
+        adjustflag: Optional[str] = None,
         *,
-        allow_history_rewrite: bool = True,
-        rewrite_reason: Optional[str] = "i do need to update data",
+        allow_history_rewrite: bool = False,
+        rewrite_reason: Optional[str] = None,
     ) -> None:
         """Upserts daily OHLCV bars into ohlcv_bars and updates asset_sync_metadata.
 
@@ -1645,6 +1741,8 @@ class DuckDBCache:
                 "scripts/repair_qfq_alignment.py."
             )
 
+        canon_adjust = canonicalize_adjust_mode(adjustflag) if adjustflag is not None else None
+
         if is_intraday_interval(interval):
             return self.store_intraday_bars(
                 provider,
@@ -1654,6 +1752,7 @@ class DuckDBCache:
                 requested_start=requested_start,
                 requested_end=requested_end,
                 sync_time=sync_time,
+                adjustflag=canon_adjust,
             )
 
         if is_synthetic_provider(provider) or df.empty:
@@ -1668,6 +1767,12 @@ class DuckDBCache:
         for col in ["Open", "High", "Low", "Close"]:
             df_to_store[col] = df[col]
         df_to_store["Volume"] = df["Volume"] if "Volume" in df.columns else 0.0
+        if "Amount" in df.columns:
+            df_to_store["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
+        elif "amount" in df.columns:
+            df_to_store["Amount"] = pd.to_numeric(df["amount"], errors="coerce")
+        else:
+            df_to_store["Amount"] = None
         frame_min_date = df_to_store.index.min().date()
         frame_max_date = df_to_store.index.max().date()
 
@@ -1683,6 +1788,7 @@ class DuckDBCache:
             "low": df_to_store["Low"].astype(float).values,
             "close": df_to_store["Close"].astype(float).values,
             "volume": df_to_store["Volume"].astype(float).values,
+            "amount": df_to_store["Amount"].values if ("Amount" in df_to_store.columns and df_to_store["Amount"].notna().any()) else None,
         })
 
         con = self._get_connection(read_only=False)
@@ -1851,7 +1957,7 @@ class DuckDBCache:
 
             con.execute("""
                 INSERT OR REPLACE INTO ohlcv_bars
-                SELECT provider, symbol, date, open, high, low, close, volume
+                SELECT provider, symbol, date, open, high, low, close, volume, amount
                 FROM temp_bars_to_insert
             """)
 
@@ -1919,8 +2025,8 @@ class DuckDBCache:
             con.execute("""
                 INSERT INTO asset_sync_metadata AS existing
                     (provider, symbol, earliest_available_date, is_earliest_known,
-                     latest_available_date, last_sync_time)
-                VALUES (?, ?, ?, ?, ?, ?)
+                     latest_available_date, last_sync_time, adjustflag)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (provider, symbol) DO UPDATE SET
                     earliest_available_date = COALESCE(
                         CAST(? AS DATE),
@@ -1937,7 +2043,8 @@ class DuckDBCache:
                             COALESCE(excluded.latest_available_date, existing.latest_available_date)
                         )
                     ),
-                    last_sync_time = excluded.last_sync_time
+                    last_sync_time = excluded.last_sync_time,
+                    adjustflag = COALESCE(excluded.adjustflag, existing.adjustflag)
             """, [
                 provider,
                 symbol,
@@ -1945,6 +2052,7 @@ class DuckDBCache:
                 reconciled.is_earliest_known,
                 reconciled.latest,
                 sync_ts,
+                canon_adjust,
                 bars_min_date,
                 bars_max_date,
             ])
@@ -1967,6 +2075,211 @@ class DuckDBCache:
             if not self.is_memory:
                 con.close()
 
+    def store_adjust_factors(
+        self,
+        symbol: str,
+        df: pd.DataFrame,
+        source: str = "baostock",
+        sync_time: Optional[datetime.datetime] = None,
+    ) -> None:
+        """Stores or updates daily backward adjustment factors in adjust_factors table."""
+        if df is None or df.empty:
+            return
+
+        fac_df = df.copy()
+        if "date" in fac_df.columns:
+            dates = pd.to_datetime(fac_df["date"]).dt.date
+        elif "Date" in fac_df.columns:
+            dates = pd.to_datetime(fac_df["Date"]).dt.date
+        else:
+            dates = pd.to_datetime(fac_df.index).date
+
+        # Resolve factor_hfq (backward factor)
+        hfq_col = None
+        for cand in [
+            "factor_hfq", "backward_factor", "back_adjust_factor",
+            "backAdjustFactor", "adjust_factor", "adjustFactor", "hfq"
+        ]:
+            if cand in fac_df.columns:
+                hfq_col = cand
+                break
+        if hfq_col:
+            hfq_vals = pd.to_numeric(fac_df[hfq_col], errors="coerce").fillna(1.0).values
+        else:
+            qfq_col = None
+            for cand in ["factor_qfq", "forward_factor", "fore_adjust_factor", "foreAdjustFactor", "qfq", "factor"]:
+                if cand in fac_df.columns:
+                    qfq_col = cand
+                    break
+            if qfq_col:
+                qfq_raw = pd.to_numeric(fac_df[qfq_col], errors="coerce").fillna(1.0).values
+                first_val = qfq_raw[0] if len(qfq_raw) > 0 and qfq_raw[0] != 0 else 1.0
+                hfq_vals = qfq_raw / first_val
+            else:
+                hfq_vals = np.ones(len(fac_df))
+
+        now_ts = sync_time if sync_time is not None else datetime.datetime.now()
+
+        records = pd.DataFrame({
+            "symbol": symbol,
+            "date": dates,
+            "factor_hfq": hfq_vals.astype(float),
+            "source": source,
+            "last_sync_time": now_ts,
+        })
+        records = records.drop_duplicates(subset=["date"], keep="last")
+
+        con = self._get_connection(read_only=False)
+        try:
+            con.register("temp_factors_to_insert", records)
+            con.execute("""
+                INSERT OR REPLACE INTO adjust_factors (symbol, date, factor_hfq, source, last_sync_time)
+                SELECT symbol, date, factor_hfq, source, last_sync_time
+                FROM temp_factors_to_insert
+            """)
+        finally:
+            if not self.is_memory:
+                con.close()
+
+    def get_latest_factor_hfq(self, symbol: str) -> Optional[float]:
+        """Returns the latest factor_hfq across the entire adjust_factors table for symbol."""
+        con = self._get_connection(read_only=True)
+        try:
+            row = con.execute(
+                "SELECT factor_hfq FROM adjust_factors WHERE symbol = ? ORDER BY date DESC LIMIT 1",
+                [symbol],
+            ).fetchone()
+        finally:
+            if not self.is_memory:
+                con.close()
+        return float(row[0]) if row and row[0] is not None else None
+
+    def query_adjust_factors(
+        self,
+        symbol: str,
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """Retrieves adjust factors for symbol up to end (not filtered by start)."""
+        clauses = ["symbol = ?"]
+        params: List[Any] = [symbol]
+
+        if end:
+            clauses.append("date <= ?")
+            params.append(pd.to_datetime(end).strftime("%Y-%m-%d"))
+
+        sql = (
+            f"SELECT date, factor_hfq, source, last_sync_time "
+            f"FROM adjust_factors WHERE {' AND '.join(clauses)} ORDER BY date"
+        )
+        con = self._get_connection(read_only=True)
+        try:
+            res_df = con.execute(sql, params).df()
+        finally:
+            if not self.is_memory:
+                con.close()
+
+        if res_df.empty:
+            return pd.DataFrame(columns=["factor_hfq"], index=pd.DatetimeIndex([], name="date"))
+
+        res_df["date"] = pd.to_datetime(res_df["date"])
+        res_df = res_df.set_index("date").sort_index()
+        res_df.index.name = "date"
+        return res_df
+
+    def _apply_factors_to_df(
+        self,
+        df: pd.DataFrame,
+        symbol: str,
+        adjust_mode: str = "qfq",
+        factors: Optional[pd.DataFrame] = None,
+    ) -> pd.DataFrame:
+        """Scales Open, High, Low, Close by factor_hfq or derived QFQ in memory.
+
+        Derivation rules:
+        - hfq price = raw * hfq[t] (as-of / backward lookup: latest factor with date <= bar date)
+        - qfq price = raw * hfq[t] / hfq[latest in whole table for symbol]
+        - Bars before the first factor date use 1.0.
+        - Volume and Amount are NEVER scaled!
+        """
+        if df.empty:
+            return df.copy()
+
+        mode = canonicalize_adjust_mode(adjust_mode)
+        if mode == "raw":
+            return df.copy()
+
+        if is_factor_neutral_symbol(symbol):
+            return df.copy()
+
+        out = df.copy()
+
+        if factors is not None and not factors.empty:
+            fac_df = factors.copy()
+            if not isinstance(fac_df.index, pd.DatetimeIndex):
+                if "date" in fac_df.columns:
+                    fac_df.index = pd.to_datetime(fac_df["date"])
+                elif "Date" in fac_df.columns:
+                    fac_df.index = pd.to_datetime(fac_df["Date"])
+                else:
+                    fac_df.index = pd.to_datetime(fac_df.index)
+            hfq_col = None
+            for c in ["factor_hfq", "backward_factor", "back_adjust_factor", "backAdjustFactor", "adjust_factor", "adjustFactor", "hfq"]:
+                if c in fac_df.columns:
+                    hfq_col = c
+                    break
+            if hfq_col:
+                event_hfq = fac_df[hfq_col].values.astype(float)
+            else:
+                qfq_col = None
+                for c in ["factor_qfq", "forward_factor", "fore_adjust_factor", "foreAdjustFactor", "qfq"]:
+                    if c in fac_df.columns:
+                        qfq_col = c
+                        break
+                if qfq_col:
+                    q_vals = fac_df[qfq_col].values.astype(float)
+                    first_q = q_vals[0] if len(q_vals) > 0 and q_vals[0] != 0 else 1.0
+                    event_hfq = q_vals / first_q
+                else:
+                    event_hfq = np.ones(len(fac_df))
+            event_dates = [pd.Timestamp(d).date() for d in fac_df.index]
+            hfq_latest = float(event_hfq[-1]) if len(event_hfq) > 0 else 1.0
+        else:
+            hfq_latest = self.get_latest_factor_hfq(symbol)
+            if hfq_latest is None:
+                raise MissingAdjustFactorsError(symbol)
+
+            max_bar_date = pd.Timestamp(df.index.max()).date().strftime("%Y-%m-%d")
+            fac_df = self.query_adjust_factors(symbol, end=max_bar_date)
+            if fac_df.empty:
+                raise MissingAdjustFactorsError(symbol)
+
+            event_dates = [pd.Timestamp(d).date() for d in fac_df.index]
+            event_hfq = fac_df["factor_hfq"].values.astype(float)
+
+        import bisect
+        bar_dates = [pd.Timestamp(ts).date() for ts in out.index]
+        applied_mults = np.ones(len(out), dtype=float)
+        divisor = hfq_latest if (hfq_latest is not None and hfq_latest > 0) else 1.0
+
+        for i, d in enumerate(bar_dates):
+            if d < event_dates[0]:
+                hfq_t = 1.0
+            else:
+                idx = bisect.bisect_right(event_dates, d) - 1
+                hfq_t = event_hfq[idx] if idx >= 0 else 1.0
+
+            if mode == "hfq":
+                applied_mults[i] = hfq_t
+            else:  # qfq
+                applied_mults[i] = hfq_t / divisor
+
+        for col in ["Open", "High", "Low", "Close"]:
+            if col in out.columns:
+                out[col] = out[col] * applied_mults
+
+        return out
+
     def query_intraday_bars(
         self,
         provider: str,
@@ -1974,6 +2287,7 @@ class DuckDBCache:
         interval: str = "5m",
         start: Optional[str] = None,
         end: Optional[str] = None,
+        adjustflag: str = "qfq",
     ) -> pd.DataFrame:
         """Retrieves intraday OHLCV bars for (provider, symbol, interval) across [start, end]."""
         clauses = ["provider = ?", "symbol = ?", "interval = ?"]
@@ -1988,7 +2302,7 @@ class DuckDBCache:
             params.append(end_dt.to_pydatetime())
 
         sql = (
-            f"SELECT ts, open, high, low, close, volume FROM intraday_ohlcv_bars "
+            f"SELECT ts, open, high, low, close, volume, amount FROM intraday_ohlcv_bars "
             f"WHERE {' AND '.join(clauses)} ORDER BY ts"
         )
 
@@ -2005,6 +2319,7 @@ class DuckDBCache:
         res_df["ts"] = pd.to_datetime(res_df["ts"])
         res_df = res_df.set_index("ts").sort_index()
         res_df.index.name = "Date"
+        has_amount = "amount" in res_df.columns and res_df["amount"].notna().any()
         res_df = res_df.rename(
             columns={
                 "open": "Open",
@@ -2012,10 +2327,33 @@ class DuckDBCache:
                 "low": "Low",
                 "close": "Close",
                 "volume": "Volume",
+                "amount": "Amount",
             }
-        )[_REQUIRED_OHLCV_COLUMNS].astype(float)
+        )
+        target_cols = _REQUIRED_OHLCV_COLUMNS + (["Amount"] if has_amount else [])
+        res_df = res_df[target_cols].astype(float)
+
+        req_mode = canonicalize_adjust_mode(adjustflag)
+        meta = self.get_intraday_metadata(provider, symbol, interval)
+        stored_basis = (
+            canonicalize_adjust_mode(meta["adjustflag"])
+            if (meta and meta.get("adjustflag") is not None)
+            else None
+        )
+
+        if stored_basis == "raw":
+            res_df = self._apply_factors_to_df(res_df, symbol, adjust_mode=req_mode)
+        elif stored_basis is None or stored_basis == req_mode:
+            pass
+        else:
+            raise ValueError(
+                f"Cannot derive '{req_mode}' adjustment for {symbol} ({provider}): "
+                f"stored data has basis '{stored_basis}'."
+            )
 
         return res_df
+
+    get_intraday_bars = query_intraday_bars
 
     def query_bars(
         self,
@@ -2024,6 +2362,7 @@ class DuckDBCache:
         start: Optional[str] = None,
         end: Optional[str] = None,
         interval: str = "1d",
+        adjust: str = "qfq",
     ) -> pd.DataFrame:
         """Retrieves OHLCV bars for (provider, symbol) across [start, end], resampled to interval."""
         if is_intraday_interval(interval):
@@ -2033,6 +2372,7 @@ class DuckDBCache:
                 interval=interval,
                 start=start,
                 end=end,
+                adjustflag=adjust,
             )
 
         clauses = ["provider = ?", "symbol = ?"]
@@ -2046,7 +2386,7 @@ class DuckDBCache:
             params.append(pd.to_datetime(end).strftime("%Y-%m-%d"))
 
         sql = (
-            f"SELECT date, open, high, low, close, volume FROM ohlcv_bars "
+            f"SELECT date, open, high, low, close, volume, amount FROM ohlcv_bars "
             f"WHERE {' AND '.join(clauses)} ORDER BY date"
         )
 
@@ -2062,6 +2402,7 @@ class DuckDBCache:
 
         res_df["date"] = pd.to_datetime(res_df["date"])
         res_df = res_df.set_index("date").sort_index()
+        has_amount = "amount" in res_df.columns and res_df["amount"].notna().any()
         res_df = res_df.rename(
             columns={
                 "open": "Open",
@@ -2069,10 +2410,33 @@ class DuckDBCache:
                 "low": "Low",
                 "close": "Close",
                 "volume": "Volume",
+                "amount": "Amount",
             }
-        )[_REQUIRED_OHLCV_COLUMNS].astype(float)
+        )
+        target_cols = _REQUIRED_OHLCV_COLUMNS + (["Amount"] if has_amount else [])
+        res_df = res_df[target_cols].astype(float)
+
+        req_mode = canonicalize_adjust_mode(adjust)
+        meta = self.get_asset_metadata(provider, symbol)
+        stored_basis = (
+            canonicalize_adjust_mode(meta["adjustflag"])
+            if (meta and meta.get("adjustflag") is not None)
+            else None
+        )
+
+        if stored_basis == "raw":
+            res_df = self._apply_factors_to_df(res_df, symbol, adjust_mode=req_mode)
+        elif stored_basis is None or stored_basis == req_mode:
+            pass
+        else:
+            raise ValueError(
+                f"Cannot derive '{req_mode}' adjustment for {symbol} ({provider}): "
+                f"stored data has basis '{stored_basis}'."
+            )
 
         return resample_ohlcv(res_df, interval)
+
+    get_bars = query_bars
 
     def query_intraday_universe(
         self,
@@ -2081,6 +2445,7 @@ class DuckDBCache:
         interval: str = "5m",
         start: Optional[str] = None,
         end: Optional[str] = None,
+        adjustflag: str = "qfq",
     ) -> Dict[str, pd.DataFrame]:
         """Batch-queries intraday OHLCV bars for multiple symbols in a single SQL query."""
         if not symbols:
@@ -2100,7 +2465,7 @@ class DuckDBCache:
             params.append(end_dt.to_pydatetime())
 
         sql = (
-            f"SELECT symbol, ts, open, high, low, close, volume FROM intraday_ohlcv_bars "
+            f"SELECT symbol, ts, open, high, low, close, volume, amount FROM intraday_ohlcv_bars "
             f"WHERE {' AND '.join(clauses)} ORDER BY symbol, ts"
         )
 
@@ -2118,12 +2483,16 @@ class DuckDBCache:
         full_df["ts"] = pd.to_datetime(full_df["ts"])
         grouped = full_df.groupby("symbol")
 
+        start_d = str(pd.to_datetime(start).date()) if start else None
+        end_d = str(pd.to_datetime(end).date()) if end else None
+
         for sym in unique_symbols:
             if sym not in grouped.groups:
                 continue
             group = grouped.get_group(sym)
             df = group.set_index("ts").sort_index()
             df.index.name = "Date"
+            has_amount = "amount" in df.columns and df["amount"].notna().any()
             df = df.rename(
                 columns={
                     "open": "Open",
@@ -2131,8 +2500,27 @@ class DuckDBCache:
                     "low": "Low",
                     "close": "Close",
                     "volume": "Volume",
+                    "amount": "Amount",
                 }
-            )[_REQUIRED_OHLCV_COLUMNS].astype(float)
+            )
+            target_cols = _REQUIRED_OHLCV_COLUMNS + (["Amount"] if has_amount else [])
+            df = df[target_cols].astype(float)
+            req_mode = canonicalize_adjust_mode(adjustflag)
+            meta = self.get_intraday_metadata(provider, sym, interval)
+            stored_basis = (
+                canonicalize_adjust_mode(meta["adjustflag"])
+                if (meta and meta.get("adjustflag") is not None)
+                else None
+            )
+            if stored_basis == "raw":
+                df = self._apply_factors_to_df(df, sym, adjust_mode=req_mode)
+            elif stored_basis is None or stored_basis == req_mode:
+                pass
+            else:
+                raise ValueError(
+                    f"Cannot derive '{req_mode}' adjustment for {sym} ({provider}): "
+                    f"stored data has basis '{stored_basis}'."
+                )
             result[sym] = df
 
         return result
@@ -2144,6 +2532,7 @@ class DuckDBCache:
         start: Optional[str] = None,
         end: Optional[str] = None,
         interval: str = "1d",
+        adjust: str = "qfq",
     ) -> Dict[str, pd.DataFrame]:
         """Batch-queries OHLCV bars for multiple symbols in a single SQL query."""
         if is_intraday_interval(interval):
@@ -2153,6 +2542,7 @@ class DuckDBCache:
                 interval=interval,
                 start=start,
                 end=end,
+                adjustflag=adjust,
             )
 
         if not symbols:
@@ -2171,7 +2561,7 @@ class DuckDBCache:
             params.append(pd.to_datetime(end).strftime("%Y-%m-%d"))
 
         sql = (
-            f"SELECT symbol, date, open, high, low, close, volume FROM ohlcv_bars "
+            f"SELECT symbol, date, open, high, low, close, volume, amount FROM ohlcv_bars "
             f"WHERE {' AND '.join(clauses)} ORDER BY symbol, date"
         )
 
@@ -2194,6 +2584,7 @@ class DuckDBCache:
                 continue
             group = grouped.get_group(sym)
             df = group.set_index("date").sort_index()
+            has_amount = "amount" in df.columns and df["amount"].notna().any()
             df = df.rename(
                 columns={
                     "open": "Open",
@@ -2201,8 +2592,27 @@ class DuckDBCache:
                     "low": "Low",
                     "close": "Close",
                     "volume": "Volume",
+                    "amount": "Amount",
                 }
-            )[_REQUIRED_OHLCV_COLUMNS].astype(float)
+            )
+            target_cols = _REQUIRED_OHLCV_COLUMNS + (["Amount"] if has_amount else [])
+            df = df[target_cols].astype(float)
+            req_mode = canonicalize_adjust_mode(adjust)
+            meta = self.get_asset_metadata(provider, sym)
+            stored_basis = (
+                canonicalize_adjust_mode(meta["adjustflag"])
+                if (meta and meta.get("adjustflag") is not None)
+                else None
+            )
+            if stored_basis == "raw":
+                df = self._apply_factors_to_df(df, sym, adjust_mode=req_mode)
+            elif stored_basis is None or stored_basis == req_mode:
+                pass
+            else:
+                raise ValueError(
+                    f"Cannot derive '{req_mode}' adjustment for {sym} ({provider}): "
+                    f"stored data has basis '{stored_basis}'."
+                )
             result[sym] = resample_ohlcv(df, interval)
 
         return result

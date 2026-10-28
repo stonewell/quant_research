@@ -1579,3 +1579,182 @@ def test_store_bars_tolerance_boundaries(disk_cache):
     pd.testing.assert_frame_equal(
         disk_cache.query_bars("FuyaoDataProvider", "601225.SH"), stored_below, check_exact=True
     )
+
+
+def test_m36_schema_and_migration(mem_cache):
+    """M3.6: Verifies schema migration and table structure for adjust_factors and amount/adjustflag."""
+    con = mem_cache._get_connection(read_only=True)
+    tables = [r[0] for r in con.execute("SHOW TABLES").fetchall()]
+    assert "adjust_factors" in tables
+    assert "ohlcv_bars" in tables
+    assert "intraday_ohlcv_bars" in tables
+
+    # Verify adjust_factors columns and PK
+    factors_info = con.execute("PRAGMA table_info('adjust_factors')").fetchall()
+    f_cols = {row[1]: {"type": row[2], "pk": row[5]} for row in factors_info}
+    assert f_cols["symbol"]["pk"] > 0
+    assert f_cols["date"]["pk"] > 0
+    assert "factor_hfq" in f_cols
+    assert "source" in f_cols
+    assert "last_sync_time" in f_cols
+
+    # Verify amount and adjustflag presence
+    bars_info = con.execute("PRAGMA table_info('ohlcv_bars')").fetchall()
+    bars_cols = {row[1] for row in bars_info}
+    assert "amount" in bars_cols
+
+    intra_info = con.execute("PRAGMA table_info('intraday_ohlcv_bars')").fetchall()
+    intra_cols = {row[1] for row in intra_info}
+    assert "amount" in intra_cols
+    assert "adjustflag" in intra_cols
+
+    meta_info = con.execute("PRAGMA table_info('asset_sync_metadata')").fetchall()
+    assert "adjustflag" in {row[1] for row in meta_info}
+
+    intraday_meta = con.execute("PRAGMA table_info('intraday_sync_metadata')").fetchall()
+    assert "adjustflag" in {row[1] for row in intraday_meta}
+
+    # Verify idempotency of migration
+    mem_cache._init_tables(con)
+
+
+def test_m36_amount_storage_and_unscaled(mem_cache):
+    """M3.6: Verifies amount column is stored when present, leaves NULL when absent, and is unscaled."""
+    dates = pd.bdate_range("2024-01-01", periods=3)
+    df_with_amt = pd.DataFrame({
+        "Open": [10.0, 11.0, 12.0],
+        "High": [10.5, 11.5, 12.5],
+        "Low": [9.5, 10.5, 11.5],
+        "Close": [10.0, 11.0, 12.0],
+        "Volume": [100.0, 200.0, 300.0],
+        "Amount": [1000.0, 2200.0, 3600.0],
+    }, index=dates)
+
+    mem_cache.store_bars("TestProv", "600000.SH", df_with_amt, adjustflag="raw")
+    res = mem_cache.query_bars("TestProv", "600000.SH", adjust="none")
+    assert "Amount" in res.columns
+    assert list(res["Amount"]) == [1000.0, 2200.0, 3600.0]
+
+    # Verify factor scaling scales OHLC but NEVER scales Volume or Amount
+    factor_dates = list(dates) + [dates[-1] + pd.Timedelta(days=1)]
+    factors_df = pd.DataFrame({
+        "factor_hfq": [1.0, 1.0, 1.0, 2.0],
+    }, index=factor_dates)
+    mem_cache.store_adjust_factors("600000.SH", factors_df)
+
+    res_qfq = mem_cache.query_bars("TestProv", "600000.SH", adjust="qfq")
+    assert list(res_qfq["Close"]) == [5.0, 5.5, 6.0]
+    assert list(res_qfq["Volume"]) == [100.0, 200.0, 300.0]  # unscaled!
+    assert list(res_qfq["Amount"]) == [1000.0, 2200.0, 3600.0]  # unscaled!
+
+
+def test_m38_adjust_factors_storage_and_derivation_daily(mem_cache):
+    """M3.8: Tests storing factors and dynamic in-memory derivation for daily bars."""
+    dates = pd.bdate_range("2024-01-01", periods=4)
+    raw_df = pd.DataFrame({
+        "Open": [100.0, 102.0, 52.0, 54.0],
+        "High": [105.0, 106.0, 55.0, 56.0],
+        "Low": [98.0, 100.0, 50.0, 52.0],
+        "Close": [101.0, 104.0, 53.0, 55.0],
+        "Volume": [10000.0, 12000.0, 25000.0, 24000.0],
+    }, index=dates)
+    mem_cache.store_bars("TestProv", "000001.SZ", raw_df, adjustflag="raw")
+
+    # Ex-dividend on 2024-01-03: 10-for-10 split -> historical prices halved under qfq
+    factors_df = pd.DataFrame({
+        "factor_qfq": [0.5, 0.5, 1.0, 1.0],
+        "factor_hfq": [1.0, 1.0, 2.0, 2.0],
+    }, index=dates)
+    mem_cache.store_adjust_factors("000001.SZ", factors_df)
+
+    # 1. adjust="none" returns raw bars
+    q_none = mem_cache.query_bars("TestProv", "000001.SZ", adjust="none")
+    assert q_none["Close"].iloc[0] == 101.0
+    assert q_none["Close"].iloc[2] == 53.0
+
+    # 2. adjust="qfq" scales by factor_qfq
+    q_qfq = mem_cache.query_bars("TestProv", "000001.SZ", adjust="qfq")
+    assert q_qfq["Close"].iloc[0] == 50.5
+    assert q_qfq["Close"].iloc[1] == 52.0
+    assert q_qfq["Close"].iloc[2] == 53.0
+    assert q_qfq["Close"].iloc[3] == 55.0
+
+    # 3. adjust="hfq" scales by factor_hfq
+    q_hfq = mem_cache.query_bars("TestProv", "000001.SZ", adjust="hfq")
+    assert q_hfq["Close"].iloc[0] == 101.0
+    assert q_hfq["Close"].iloc[1] == 104.0
+    assert q_hfq["Close"].iloc[2] == 106.0
+    assert q_hfq["Close"].iloc[3] == 110.0
+
+
+def test_m38_adjust_factors_storage_and_derivation_intraday_5m(mem_cache):
+    """M3.8: Tests 5m intraday bars dynamic scaling matched to daily adjustment factor."""
+    # Day 1: 2024-01-02 2 bars
+    # Day 2: 2024-01-03 2 bars (ex-dividend day)
+    ts_list = [
+        pd.Timestamp("2024-01-02 09:35:00"),
+        pd.Timestamp("2024-01-02 09:40:00"),
+        pd.Timestamp("2024-01-03 09:35:00"),
+        pd.Timestamp("2024-01-03 09:40:00"),
+    ]
+    df_5m = pd.DataFrame({
+        "Open": [100.0, 101.0, 50.0, 51.0],
+        "High": [102.0, 103.0, 52.0, 53.0],
+        "Low": [99.0, 100.0, 49.0, 50.0],
+        "Close": [101.0, 102.0, 51.0, 52.0],
+        "Volume": [1000.0, 1200.0, 2000.0, 2200.0],
+        "Amount": [101000.0, 122400.0, 102000.0, 114400.0],
+    }, index=ts_list)
+
+    mem_cache.store_intraday_bars("TestProv", "000002.SZ", df_5m, interval="5m", adjustflag="3")
+
+    factors = pd.DataFrame({
+        "factor_qfq": [0.5, 1.0],
+        "factor_hfq": [1.0, 2.0],
+    }, index=pd.to_datetime(["2024-01-02", "2024-01-03"]))
+    mem_cache.store_adjust_factors("000002.SZ", factors)
+
+    # Query with adjustflag="qfq"
+    derived_5m = mem_cache.query_intraday_bars("TestProv", "000002.SZ", interval="5m", adjustflag="qfq")
+    # Day 1 scaled by 0.5
+    assert derived_5m.loc[pd.Timestamp("2024-01-02 09:35:00"), "Close"] == 50.5
+    assert derived_5m.loc[pd.Timestamp("2024-01-02 09:40:00"), "Close"] == 51.0
+    # Day 2 scaled by 1.0
+    assert derived_5m.loc[pd.Timestamp("2024-01-03 09:35:00"), "Close"] == 51.0
+    assert derived_5m.loc[pd.Timestamp("2024-01-03 09:40:00"), "Close"] == 52.0
+
+    # Volume and Amount are completely untouched
+    assert list(derived_5m["Volume"]) == [1000.0, 1200.0, 2000.0, 2200.0]
+    assert list(derived_5m["Amount"]) == [101000.0, 122400.0, 102000.0, 114400.0]
+
+
+def test_m38_edge_assets_neutral_factor(mem_cache):
+    """M3.8: Tests that edge assets 511880.SH and 000300.SH have neutral factor 1.0."""
+    from common.financial_api import MarketDBDataProvider
+    import duckdb
+
+    con = duckdb.connect(":memory:")
+    con.execute("""
+        CREATE TABLE raw_kline_daily (
+            thscode VARCHAR, date DATE, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, volume DOUBLE
+        );
+        CREATE VIEW v_daily_qfq AS SELECT * FROM raw_kline_daily;
+        CREATE VIEW v_daily_hfq AS SELECT * FROM raw_kline_daily;
+        CREATE VIEW v_daily AS SELECT * FROM raw_kline_daily;
+    """)
+    for i in range(3):
+        d_str = f"2024-01-0{i+1}"
+        con.execute("INSERT INTO raw_kline_daily VALUES ('511880.SH', ?, 100.0, 100.1, 99.9, 100.0, 1000)", [d_str])
+        con.execute("INSERT INTO raw_kline_daily VALUES ('000300.SH', ?, 3500.0, 3550.0, 3480.0, 3520.0, 50000)", [d_str])
+
+    provider = MarketDBDataProvider(con=con)
+    f_cash = provider.fetch_adjust_factors("511880.SH", start="2024-01-01", end="2024-01-03")
+    assert not f_cash.empty
+    assert (f_cash["factor_qfq"] == 1.0).all()
+    assert (f_cash["factor_hfq"] == 1.0).all()
+
+    f_idx = provider.fetch_adjust_factors("000300.SH", start="2024-01-01", end="2024-01-03")
+    assert not f_idx.empty
+    assert (f_idx["factor_qfq"] == 1.0).all()
+    assert (f_idx["factor_hfq"] == 1.0).all()
+    con.close()

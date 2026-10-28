@@ -154,6 +154,18 @@ def is_index_symbol(symbol: str) -> bool:
     return False
 
 
+def is_factor_neutral_symbol(symbol: str) -> bool:
+    """Returns True for structurally factor-neutral symbols (indices, cash ETF 511880)."""
+    if not symbol:
+        return False
+    s = str(symbol).strip().upper()
+    if "511880" in s:
+        return True
+    if s.endswith(".TI"):
+        return True
+    return is_index_symbol(s)
+
+
 def to_baostock_code(symbol: str) -> str:
     """Converts a symbol to BaoStock format (e.g. '600519.SH' -> 'sh.600519', '000001.SZ' -> 'sz.000001')."""
     norm = normalize_thscode(symbol)
@@ -271,6 +283,59 @@ def _resolve_duckdb_path(folder_path: Optional[str] = None, db_path: Optional[st
     return None
 
 
+def calibrate_adjust_factors_from_closes(
+    raw_close: Union[pd.Series, pd.DataFrame],
+    qfq_close: Union[pd.Series, pd.DataFrame],
+    hfq_close: Optional[Union[pd.Series, pd.DataFrame]] = None,
+) -> pd.DataFrame:
+    """Calibrates daily qfq and hfq adjustment factors from raw close and adjusted close series.
+
+    Computes:
+        factor_qfq = qfq_close / raw_close
+        factor_hfq = hfq_close / raw_close (or derived from factor_qfq normalized by inception)
+
+    Returns DataFrame indexed by date with columns ['factor_qfq', 'factor_hfq'].
+    """
+    if isinstance(raw_close, pd.DataFrame):
+        rc = raw_close.iloc[:, 0]
+    else:
+        rc = raw_close
+    if isinstance(qfq_close, pd.DataFrame):
+        qc = qfq_close.iloc[:, 0]
+    else:
+        qc = qfq_close
+
+    common_idx = rc.index.intersection(qc.index)
+    if len(common_idx) == 0:
+        return pd.DataFrame(columns=["factor_qfq", "factor_hfq"], index=pd.DatetimeIndex([], name="date"))
+
+    rc_aligned = rc.loc[common_idx].astype(float)
+    qc_aligned = qc.loc[common_idx].astype(float)
+
+    # Avoid div by zero
+    factor_qfq = np.where(rc_aligned != 0, qc_aligned / rc_aligned, 1.0)
+    factor_qfq_s = pd.Series(factor_qfq, index=common_idx, name="factor_qfq")
+
+    if hfq_close is not None:
+        if isinstance(hfq_close, pd.DataFrame):
+            hc = hfq_close.iloc[:, 0]
+        else:
+            hc = hfq_close
+        hc_aligned = hc.loc[common_idx].astype(float)
+        factor_hfq = np.where(rc_aligned != 0, hc_aligned / rc_aligned, 1.0)
+        factor_hfq_s = pd.Series(factor_hfq, index=common_idx, name="factor_hfq")
+    else:
+        first_qfq = factor_qfq_s.iloc[0] if len(factor_qfq_s) > 0 and factor_qfq_s.iloc[0] != 0 else 1.0
+        factor_hfq_s = factor_qfq_s / first_qfq
+
+    df_res = pd.DataFrame({
+        "factor_qfq": factor_qfq_s,
+        "factor_hfq": factor_hfq_s,
+    }, index=pd.to_datetime(common_idx))
+    df_res.index.name = "date"
+    return df_res
+
+
 class MarketDBDataProvider(BaseDataProvider):
     """Market data provider reading from local DuckDB database (market.duckdb).
 
@@ -321,10 +386,13 @@ class MarketDBDataProvider(BaseDataProvider):
         import duckdb
         return duckdb.connect(self.db_path, read_only=True)
 
-    def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+    def _fetch_ohlcv_internal(
+        self, symbol: str, start: str, end: str, interval: str = "1d", view: Optional[str] = None
+    ) -> pd.DataFrame:
         if interval != "1d":
             raise ValueError(f"MarketDBDataProvider only supports interval='1d', got '{interval}'")
 
+        target_view = view or self.view
         thscode = normalize_thscode(symbol)
         _validate_symbol_for_path(thscode)
 
@@ -339,7 +407,7 @@ class MarketDBDataProvider(BaseDataProvider):
             params.append(pd.to_datetime(end).strftime("%Y-%m-%d"))
 
         sql = (
-            f"SELECT date, open, high, low, close, volume FROM {self.view} "
+            f"SELECT date, open, high, low, close, volume FROM {target_view} "
             f"WHERE {' AND '.join(clauses)} ORDER BY date"
         )
 
@@ -353,18 +421,26 @@ class MarketDBDataProvider(BaseDataProvider):
         if df.empty:
             if is_index_symbol(thscode):
                 try:
-                    fallback_df = BaoStockDataProvider().fetch_ohlcv(thscode, start, end, interval)
+                    bs_p = BaoStockDataProvider()
+                    if target_view == "v_daily" and hasattr(bs_p, "fetch_raw_ohlcv"):
+                        fallback_df = bs_p.fetch_raw_ohlcv(thscode, start, end, interval)
+                    else:
+                        fallback_df = bs_p.fetch_ohlcv(thscode, start, end, interval)
                     if not fallback_df.empty:
                         return fallback_df
                 except Exception:
                     pass
                 try:
-                    fallback_df = EastMoneyDataProvider().fetch_ohlcv(thscode, start, end, interval)
+                    em_p = EastMoneyDataProvider()
+                    if target_view == "v_daily" and hasattr(em_p, "fetch_raw_ohlcv"):
+                        fallback_df = em_p.fetch_raw_ohlcv(thscode, start, end, interval)
+                    else:
+                        fallback_df = em_p.fetch_ohlcv(thscode, start, end, interval)
                     if not fallback_df.empty:
                         return fallback_df
                 except Exception:
                     pass
-            raise ValueError(f"No data returned for {symbol} ({thscode}) between {start} and {end} in {self.view}")
+            raise ValueError(f"No data returned for {symbol} ({thscode}) between {start} and {end} in {target_view}")
 
         df["date"] = pd.to_datetime(df["date"])
         df = df.set_index("date").sort_index()
@@ -379,11 +455,16 @@ class MarketDBDataProvider(BaseDataProvider):
         )
         df = df[["Open", "High", "Low", "Close", "Volume"]].astype(float)
         df = _drop_invalid_ohlcv_rows(df, symbol)
-
         if df.empty:
             raise ValueError(f"All data rows for {symbol} between {start} and {end} were invalid OHLC")
-
         return df
+
+    def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+        return self._fetch_ohlcv_internal(symbol, start, end, interval=interval, view=self.view)
+
+    def fetch_raw_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+        """Fetch raw unadjusted OHLCV bars without mutating instance basis."""
+        return self._fetch_ohlcv_internal(symbol, start, end, interval=interval, view="v_daily")
 
     def fetch_universe(
         self, symbols: List[str], start: str, end: str, interval: str = "1d"
@@ -454,6 +535,95 @@ class MarketDBDataProvider(BaseDataProvider):
 
         return result
 
+    def fetch_adjust_factors(
+        self,
+        symbol: str,
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """Fetch daily adjustment factors for a symbol from MarketDB.
+
+        Reads from calc_adjust_factor_daily if present, or derives from v_daily / v_daily_qfq.
+        For index symbols or cash ETFs (e.g. 511880.SH), returns factors = 1.0.
+        """
+        thscode = normalize_thscode(symbol)
+        _validate_symbol_for_path(thscode)
+
+        # Index symbols and cash ETFs (511880) have no corporate actions -> factor 1.0
+        if is_index_symbol(thscode) or "511880" in thscode:
+            con = self._get_connection()
+            try:
+                clauses = ["thscode = ?"]
+                params: List[Any] = [thscode]
+                if start:
+                    clauses.append("date >= ?")
+                    params.append(pd.to_datetime(start).strftime("%Y-%m-%d"))
+                if end:
+                    clauses.append("date <= ?")
+                    params.append(pd.to_datetime(end).strftime("%Y-%m-%d"))
+                date_rows = con.execute(
+                    f"SELECT DISTINCT date FROM {self.view} WHERE {' AND '.join(clauses)} ORDER BY date",
+                    params,
+                ).fetchall()
+            except Exception:
+                date_rows = []
+            finally:
+                if self._con is None:
+                    con.close()
+
+            if date_rows:
+                dates = pd.to_datetime([r[0] for r in date_rows])
+            elif start and end:
+                dates = pd.bdate_range(start, end)
+            else:
+                dates = pd.DatetimeIndex([])
+
+            return pd.DataFrame({
+                "factor_qfq": np.ones(len(dates), dtype=float),
+                "factor_hfq": np.ones(len(dates), dtype=float),
+            }, index=pd.DatetimeIndex(dates, name="date"))
+
+        con = self._get_connection()
+        try:
+            tables = {r[0].lower() for r in con.execute("SHOW TABLES").fetchall()}
+            if "calc_adjust_factor_daily" in tables:
+                clauses = ["thscode = ?"]
+                params = [thscode]
+                if start:
+                    clauses.append("date >= ?")
+                    params.append(pd.to_datetime(start).strftime("%Y-%m-%d"))
+                if end:
+                    clauses.append("date <= ?")
+                    params.append(pd.to_datetime(end).strftime("%Y-%m-%d"))
+                cols_info = {r[1].lower() for r in con.execute("PRAGMA table_info('calc_adjust_factor_daily')").fetchall()}
+                qfq_col = "forward_factor" if "forward_factor" in cols_info else "factor_qfq"
+                hfq_col = "backward_factor" if "backward_factor" in cols_info else "factor_hfq"
+                sql = (
+                    f"SELECT date, {qfq_col} AS factor_qfq, {hfq_col} AS factor_hfq "
+                    f"FROM calc_adjust_factor_daily WHERE {' AND '.join(clauses)} ORDER BY date"
+                )
+                res_df = con.execute(sql, params).df()
+                if not res_df.empty:
+                    res_df["date"] = pd.to_datetime(res_df["date"])
+                    res_df = res_df.set_index("date").sort_index()
+                    res_df.index.name = "date"
+                    return res_df[["factor_qfq", "factor_hfq"]].astype(float)
+        except Exception:
+            pass
+        finally:
+            if self._con is None:
+                con.close()
+
+        # Fallback: derive via calibrate_adjust_factors_from_closes between v_daily and v_daily_hfq
+        try:
+            raw_prov = MarketDBDataProvider(adjust="none", con=self._con, folder_path=getattr(self, "folder_path", None), db_path=getattr(self, "db_path", None) if getattr(self, "db_path", None) != ":memory:" else None)
+            hfq_prov = MarketDBDataProvider(adjust="backward", con=self._con, folder_path=getattr(self, "folder_path", None), db_path=getattr(self, "db_path", None) if getattr(self, "db_path", None) != ":memory:" else None)
+            raw_df = raw_prov.fetch_ohlcv(symbol, start=start or "2016-01-01", end=end or "2030-01-01", interval="1d")
+            hfq_df = hfq_prov.fetch_ohlcv(symbol, start=start or "2016-01-01", end=end or "2030-01-01", interval="1d")
+            return calibrate_adjust_factors_from_closes(raw_df["Close"], qfq_close=hfq_df["Close"], hfq_close=hfq_df["Close"])
+        except Exception:
+            return pd.DataFrame(columns=["factor_hfq"], index=pd.DatetimeIndex([], name="date"))
+
     def fetch_metadata(self, symbol: str) -> dict:
         result = {
             "expense_ratio": float("nan"),
@@ -516,10 +686,14 @@ class FuyaoDataProvider(BaseDataProvider):
             except Exception:
                 self._local_provider = None
 
-    def _fetch_remote_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+    def _fetch_remote_ohlcv(
+        self, symbol: str, start: str, end: str, interval: str = "1d", adjust: Optional[str] = None
+    ) -> pd.DataFrame:
         """Fetches OHLCV directly from the Fuyao REST API via fuyao_client."""
         if interval != "1d":
             raise ValueError(f"FuyaoDataProvider only supports interval='1d', got '{interval}'")
+
+        eff_adjust = adjust or self.adjust
 
         thscode = normalize_thscode(symbol)
         _validate_symbol_for_path(thscode)
@@ -707,7 +881,7 @@ class FuyaoDataProvider(BaseDataProvider):
                             start_ms=start_ms,
                             end_ms=end_ms,
                             interval="1d",
-                            adjust=self.adjust,
+                            adjust=eff_adjust,
                         )
                     except Exception:
                         raise fund_exc
@@ -717,7 +891,7 @@ class FuyaoDataProvider(BaseDataProvider):
                 start_ms=start_ms,
                 end_ms=end_ms,
                 interval="1d",
-                adjust=self.adjust,
+                adjust=eff_adjust,
             )
 
         if not items:
@@ -749,10 +923,13 @@ class FuyaoDataProvider(BaseDataProvider):
 
         return df
 
-    def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+    def _fetch_ohlcv_internal(
+        self, symbol: str, start: str, end: str, interval: str = "1d", adjust: Optional[str] = None
+    ) -> pd.DataFrame:
         if interval != "1d":
             raise ValueError(f"FuyaoDataProvider only supports interval='1d', got '{interval}'")
 
+        eff_adjust = adjust or self.adjust
         thscode = normalize_thscode(symbol)
         _validate_symbol_for_path(thscode)
 
@@ -764,26 +941,38 @@ class FuyaoDataProvider(BaseDataProvider):
         local_df: Optional[pd.DataFrame] = None
         if self._local_provider is not None:
             try:
-                df = self._local_provider.fetch_ohlcv(thscode, start, end, interval)
+                if eff_adjust == "none" and hasattr(self._local_provider, "fetch_raw_ohlcv"):
+                    df = self._local_provider.fetch_raw_ohlcv(thscode, start, end, interval)
+                else:
+                    df = self._local_provider.fetch_ohlcv(thscode, start, end, interval)
                 if not df.empty:
                     local_df = df
             except Exception:
                 local_df = None
 
         if local_df is None:
-            final_df = self._fetch_remote_ohlcv(symbol, start, end, interval)
+            final_df = self._fetch_remote_ohlcv(symbol, start, end, interval, adjust=eff_adjust)
         else:
             is_index = is_index_symbol(thscode) or thscode.endswith(".TI")
             if is_index and start:
                 req_start_dt = pd.to_datetime(start).normalize()
                 if local_df.index[0] > req_start_dt:
                     try:
-                        pre_df = BaoStockDataProvider().fetch_ohlcv(
-                            thscode,
-                            req_start_dt.strftime("%Y-%m-%d"),
-                            local_df.index[0].strftime("%Y-%m-%d"),
-                            interval=interval,
-                        )
+                        bs_p = BaoStockDataProvider()
+                        if eff_adjust == "none" and hasattr(bs_p, "fetch_raw_ohlcv"):
+                            pre_df = bs_p.fetch_raw_ohlcv(
+                                thscode,
+                                req_start_dt.strftime("%Y-%m-%d"),
+                                local_df.index[0].strftime("%Y-%m-%d"),
+                                interval=interval,
+                            )
+                        else:
+                            pre_df = bs_p.fetch_ohlcv(
+                                thscode,
+                                req_start_dt.strftime("%Y-%m-%d"),
+                                local_df.index[0].strftime("%Y-%m-%d"),
+                                interval=interval,
+                            )
                         if not pre_df.empty:
                             local_df = pd.concat([pre_df[pre_df.index < local_df.index[0]], local_df])
                     except Exception:
@@ -797,7 +986,7 @@ class FuyaoDataProvider(BaseDataProvider):
                 # Local data ends before effective target end AND genuine trading days are missing; fetch incremental
                 try:
                     inc_start_str = local_max_date.strftime("%Y-%m-%d")
-                    remote_df = self._fetch_remote_ohlcv(symbol, inc_start_str, end, interval)
+                    remote_df = self._fetch_remote_ohlcv(symbol, inc_start_str, end, interval, adjust=eff_adjust)
                     if not remote_df.empty:
                         # Re-scale local data if a corporate action changed the forward-adjustment factor
                         if local_max_date in remote_df.index:
@@ -833,6 +1022,13 @@ class FuyaoDataProvider(BaseDataProvider):
                     )
 
         return final_df
+
+    def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+        return self._fetch_ohlcv_internal(symbol, start, end, interval=interval, adjust=self.adjust)
+
+    def fetch_raw_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+        """Fetch raw unadjusted OHLCV bars without mutating instance basis."""
+        return self._fetch_ohlcv_internal(symbol, start, end, interval=interval, adjust="none")
 
     def fetch_universe(
         self, symbols: List[str], start: str, end: str, interval: str = "1d"
@@ -1090,7 +1286,9 @@ class BaoStockDataProvider(BaseDataProvider):
                 "baostock is required to use BaoStockDataProvider. Install it via 'pip install baostock'."
             ) from exc
 
-    def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+    def _fetch_ohlcv_internal(
+        self, symbol: str, start: str, end: str, interval: str = "1d", adjustflag: Optional[str] = None
+    ) -> pd.DataFrame:
         if interval not in self._BAOSTOCK_FREQ_MAP:
             raise ValueError(
                 f"Unsupported interval '{interval}' for BaoStockDataProvider. "
@@ -1115,13 +1313,13 @@ class BaoStockDataProvider(BaseDataProvider):
         # Strict field list restriction & adjustflag
         if is_intraday:
             fields = "date,time,code,open,high,low,close,volume,amount,adjustflag"
-            req_adjustflag = self.adjustflag
+            req_adjustflag = adjustflag or self.adjustflag
         elif is_index:
             fields = "date,code,open,high,low,close,preclose,volume,amount,pctChg"
             req_adjustflag = "3"
         else:
             fields = "date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,pctChg,isST"
-            req_adjustflag = self.adjustflag
+            req_adjustflag = adjustflag or self.adjustflag
 
         start_dt = pd.to_datetime(start).date()
         end_dt = pd.to_datetime(end).date()
@@ -1265,6 +1463,13 @@ class BaoStockDataProvider(BaseDataProvider):
 
         return _drop_invalid_ohlcv_rows(df, symbol)
 
+    def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+        return self._fetch_ohlcv_internal(symbol, start, end, interval=interval, adjustflag=self.adjustflag)
+
+    def fetch_raw_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+        """Fetch raw unadjusted OHLCV bars without mutating instance basis."""
+        return self._fetch_ohlcv_internal(symbol, start, end, interval=interval, adjustflag="3")
+
     def fetch_universe(
         self, symbols: List[str], start: str, end: str, interval: str = "1d"
     ) -> Dict[str, pd.DataFrame]:
@@ -1284,6 +1489,101 @@ class BaoStockDataProvider(BaseDataProvider):
             if not was_logged_in:
                 self._keep_logged_in = False
                 self.logout()
+
+    def fetch_adjust_factors(
+        self,
+        symbol: str,
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """Fetch daily backward adjustment factor events from BaoStock.
+
+        Real BaoStock fields: code, dividOperateDate, foreAdjustFactor, backAdjustFactor, adjustFactor.
+        Index symbols and cash ETF 511880.SH return an empty DataFrame (factor-neutral).
+        Always queries full history ('1990-01-01' to end) and returns only event rows.
+        """
+        norm_sym = normalize_thscode(symbol)
+        if is_factor_neutral_symbol(norm_sym):
+            return pd.DataFrame(columns=["factor_hfq"], index=pd.DatetimeIndex([], name="date"))
+
+        effective_end = end if end else datetime.datetime.now().strftime("%Y-%m-%d")
+        bs_code = to_baostock_code(symbol)
+
+        with self._lock:
+            try:
+                bs = self._get_bs()
+            except Exception as exc:
+                warnings.warn(f"BaoStock import failed in fetch_adjust_factors: {exc}")
+                return pd.DataFrame(columns=["factor_hfq"], index=pd.DatetimeIndex([], name="date"))
+
+            if not self._keep_logged_in or not self._is_logged_in:
+                lg = bs.login()
+                if hasattr(lg, "error_code") and lg.error_code != "0":
+                    warnings.warn(f"BaoStock login failed: {getattr(lg, 'error_msg', 'unknown error')}")
+                    return pd.DataFrame(columns=["factor_hfq"], index=pd.DatetimeIndex([], name="date"))
+                if self._keep_logged_in:
+                    self._is_logged_in = True
+
+            try:
+                rs = bs.query_adjust_factor(code=bs_code, start_date="1990-01-01", end_date=effective_end)
+                if hasattr(rs, "error_code") and rs.error_code != "0":
+                    warnings.warn(f"BaoStock query_adjust_factor error: {getattr(rs, 'error_msg', '')}")
+                    return pd.DataFrame(columns=["factor_hfq"], index=pd.DatetimeIndex([], name="date"))
+
+                data_list = []
+                fields = (
+                    rs.fields
+                    if hasattr(rs, "fields") and rs.fields
+                    else ["code", "dividOperateDate", "foreAdjustFactor", "backAdjustFactor", "adjustFactor"]
+                )
+                if (
+                    hasattr(rs, "data")
+                    and isinstance(getattr(rs, "data", None), list)
+                    and hasattr(rs, "cur_row_num")
+                ):
+                    if rs.data:
+                        data_list.extend(rs.data)
+                        rs.cur_row_num = len(rs.data)
+                        while getattr(rs, "error_code", "0") == "0" and rs.next():
+                            if rs.data:
+                                data_list.extend(rs.data)
+                                rs.cur_row_num = len(rs.data)
+                            else:
+                                break
+                elif hasattr(rs, "next"):
+                    while getattr(rs, "error_code", "0") == "0" and rs.next():
+                        data_list.append(rs.get_row_data())
+
+                if not data_list:
+                    return pd.DataFrame(columns=["factor_hfq"], index=pd.DatetimeIndex([], name="date"))
+
+                df_raw = pd.DataFrame(data_list, columns=fields)
+                date_col = "dividOperateDate" if "dividOperateDate" in df_raw.columns else "date"
+                df_raw["date"] = pd.to_datetime(df_raw[date_col], errors="coerce")
+                df_raw = df_raw.dropna(subset=["date"]).sort_values("date")
+
+                hfq_col = None
+                for c in ["backAdjustFactor", "adjustFactor", "backward_factor", "back_adjust_factor", "factor_hfq"]:
+                    if c in df_raw.columns:
+                        hfq_col = c
+                        break
+
+                if hfq_col is None:
+                    return pd.DataFrame(columns=["factor_hfq"], index=pd.DatetimeIndex([], name="date"))
+
+                hfq_vals = pd.to_numeric(df_raw[hfq_col], errors="coerce").fillna(1.0)
+                events_df = pd.DataFrame(
+                    {"factor_hfq": hfq_vals.values.astype(float)},
+                    index=pd.DatetimeIndex(df_raw["date"], name="date"),
+                )
+                events_df = events_df[~events_df.index.duplicated(keep="last")].sort_index()
+                return events_df
+            finally:
+                if not self._keep_logged_in:
+                    try:
+                        bs.logout()
+                    except Exception:
+                        pass
 
     def fetch_financial_indicators(
         self, symbol: str, as_of_date: Optional[str] = None, lookback_years: int = 5
@@ -1616,7 +1916,9 @@ class EastMoneyDataProvider(BaseDataProvider):
         else:
             self.session = session
 
-    def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+    def _fetch_ohlcv_internal(
+        self, symbol: str, start: str, end: str, interval: str = "1d", fqt: Optional[str] = None
+    ) -> pd.DataFrame:
         if interval not in self._EASTMONEY_KLT_MAP:
             raise ValueError(
                 f"Unsupported interval '{interval}' for EastMoneyDataProvider. "
@@ -1636,10 +1938,11 @@ class EastMoneyDataProvider(BaseDataProvider):
         beg_str = start_dt.strftime("%Y%m%d")
         end_str = end_dt.strftime("%Y%m%d")
         url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+        req_fqt = fqt if fqt is not None else self.fqt
         params = {
             "secid": secid,
             "klt": klt,
-            "fqt": self.fqt,
+            "fqt": req_fqt,
             "lmt": "10000",
             "beg": beg_str,
             "end": end_str,
@@ -1750,6 +2053,13 @@ class EastMoneyDataProvider(BaseDataProvider):
             df = df.loc[(df.index.date >= start_dt) & (df.index.date <= end_dt)]
 
         return _drop_invalid_ohlcv_rows(df, symbol)
+
+    def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+        return self._fetch_ohlcv_internal(symbol, start, end, interval=interval, fqt=self.fqt)
+
+    def fetch_raw_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+        """Fetch raw unadjusted OHLCV bars without mutating instance basis."""
+        return self._fetch_ohlcv_internal(symbol, start, end, interval=interval, fqt="0")
 
 
 # Self-register into data provider registry once classes are fully defined

@@ -21,6 +21,9 @@ from .universe import _parse_module_specifier
 from .duckdb_cache import (
     DuckDBCache,
     HistoryRewriteRefused,
+    MissingAdjustFactorsError,
+    canonicalize_adjust_mode,
+    is_factor_neutral_symbol,
     is_synthetic_provider,
     is_intraday_interval,
 )
@@ -663,22 +666,18 @@ class CachedDataProvider(BaseDataProvider):
         else:
             self.duckdb_cache = None
 
-    def fetch_ohlcv(
+    def get_bars(
         self,
         symbol: str,
         start: str,
         end: str,
         interval: str = "1d",
+        adjust: str = "qfq",
         expected_last_session=None,
     ) -> pd.DataFrame:
-        """Fetch bars, serving from DuckDB when `is_range_covered` says the range is on disk.
+        """Fetch bars, serving from DuckDB when covered and deriving adjust dynamically.
 
-        `expected_last_session` (L2.2) is forwarded to `is_range_covered` unchanged. It is
-        `None` for EVERY backtest/research caller (`backtester/*`, `pipeline/*`,
-        `common/order_netting.py`, `run_live_multi_strategy.py`) -- that is the guard which keeps
-        backtest results independent of the wall clock (design §11). Only live paths that already
-        know the trading session the cache must hold (via
-        `common/market_clock.py::expected_last_session`) may pass a date here.
+        When caching raw bars, stores raw bars and factors, deriving requested adjust on read.
         """
         _validate_symbol_for_path(symbol)
         if self.is_synthetic or not self.cache_dir or self.duckdb_cache is None:
@@ -702,19 +701,61 @@ class CachedDataProvider(BaseDataProvider):
             interval=interval,
             expected_last_session=expected_last_session,
         ):
-            df = self.duckdb_cache.query_bars(provider_name, symbol, start=start, end=end, interval=interval)
+            df = self.duckdb_cache.query_bars(
+                provider_name, symbol, start=start, end=end, interval=interval, adjust=adjust
+            )
             if not df.empty:
                 return df
 
-        # 2. Re-query provider for missing range (fetch base daily bars or requested intraday bars)
-        if is_intraday_interval(interval):
-            df = self.inner_provider.fetch_ohlcv(symbol, start, end, interval=interval)
+        # 2. Re-query provider for missing range.
+        # Check if inner provider supports fetching raw unadjusted bars.
+        is_raw_inner = hasattr(self.inner_provider, "fetch_raw_ohlcv")
+        req_mode = canonicalize_adjust_mode(adjust)
+
+        if is_raw_inner:
+            stored_basis = "raw"
+            # If storing raw bars, fetch and store factors BEFORE storing bars.
+            # Factor fetch errors are fail-closed: do NOT swallow exceptions.
+            if not is_factor_neutral_symbol(symbol):
+                if hasattr(self.inner_provider, "fetch_adjust_factors"):
+                    factors = self.inner_provider.fetch_adjust_factors(symbol, start=start, end=end)
+                    if factors is None or factors.empty:
+                        raise MissingAdjustFactorsError(symbol)
+                    self.duckdb_cache.store_adjust_factors(symbol, factors, source=provider_name)
+                else:
+                    raise MissingAdjustFactorsError(symbol)
+
+            if is_intraday_interval(interval):
+                df = self.inner_provider.fetch_raw_ohlcv(symbol, start, end, interval=interval)
+            else:
+                try:
+                    df = self.inner_provider.fetch_raw_ohlcv(symbol, start, end, interval="1d")
+                except Exception:
+                    df = self.inner_provider.fetch_raw_ohlcv(symbol, start, end, interval=interval)
         else:
-            try:
-                df = self.inner_provider.fetch_ohlcv(symbol, start, end, interval="1d")
-            except Exception:
-                # Fall back to user's requested interval if inner_provider only supports that interval
+            # Inner provider does not have fetch_raw_ohlcv; fall back to legacy fetch_ohlcv
+            # and record the provider's native basis without deriving/storing adjustment factors.
+            native_basis = (
+                getattr(self.inner_provider, "adjustflag", None)
+                or getattr(self.inner_provider, "adjust", None)
+                or getattr(self.inner_provider, "fqt", None)
+                or None
+            )
+            if native_basis is not None:
+                try:
+                    stored_basis = canonicalize_adjust_mode(native_basis)
+                except ValueError:
+                    stored_basis = None
+            else:
+                stored_basis = None
+
+            if is_intraday_interval(interval):
                 df = self.inner_provider.fetch_ohlcv(symbol, start, end, interval=interval)
+            else:
+                try:
+                    df = self.inner_provider.fetch_ohlcv(symbol, start, end, interval="1d")
+                except Exception:
+                    df = self.inner_provider.fetch_ohlcv(symbol, start, end, interval=interval)
 
         if df.empty:
             raise ValueError(
@@ -727,7 +768,7 @@ class CachedDataProvider(BaseDataProvider):
                 f"Data for {symbol} between {start} and {end} had rows, but every one was dropped as invalid OHLC."
             )
 
-        # 3. Store into DuckDB cache (tracks earliest available date/ts)
+        # 3. Store into DuckDB cache (tracks earliest available date/ts and basis marker)
         self.duckdb_cache.store_bars(
             provider_name,
             symbol,
@@ -735,10 +776,59 @@ class CachedDataProvider(BaseDataProvider):
             requested_start=start,
             requested_end=end,
             interval=interval,
+            adjustflag=stored_basis,
         )
 
         # 4. Return queried and properly resampled bars for requested range and interval
-        return self.duckdb_cache.query_bars(provider_name, symbol, start=start, end=end, interval=interval)
+        return self.duckdb_cache.query_bars(
+            provider_name, symbol, start=start, end=end, interval=interval, adjust=adjust
+        )
+
+    def get_intraday_bars(
+        self,
+        symbol: str,
+        start: str,
+        end: str,
+        interval: str = "5m",
+        adjustflag: str = "qfq",
+        expected_last_session=None,
+    ) -> pd.DataFrame:
+        """Retrieves intraday OHLCV bars with dynamic adjustflag derivation."""
+        return self.get_bars(
+            symbol,
+            start=start,
+            end=end,
+            interval=interval,
+            adjust=adjustflag,
+            expected_last_session=expected_last_session,
+        )
+
+    def fetch_ohlcv(
+        self,
+        symbol: str,
+        start: str,
+        end: str,
+        interval: str = "1d",
+        expected_last_session=None,
+        adjust: str = "qfq",
+    ) -> pd.DataFrame:
+        """Fetch bars, serving from DuckDB when `is_range_covered` says the range is on disk.
+
+        `expected_last_session` (L2.2) is forwarded to `is_range_covered` unchanged. It is
+        `None` for EVERY backtest/research caller (`backtester/*`, `pipeline/*`,
+        `common/order_netting.py`, `run_live_multi_strategy.py`) -- that is the guard which keeps
+        backtest results independent of the wall clock (design §11). Only live paths that already
+        know the trading session the cache must hold (via
+        `common/market_clock.py::expected_last_session`) may pass a date here.
+        """
+        return self.get_bars(
+            symbol,
+            start=start,
+            end=end,
+            interval=interval,
+            adjust=adjust,
+            expected_last_session=expected_last_session,
+        )
 
     def fetch_universe(
         self,
@@ -747,6 +837,7 @@ class CachedDataProvider(BaseDataProvider):
         end: str,
         interval: str = "1d",
         expected_last_session=None,
+        adjust: str = "qfq",
     ) -> Dict[str, pd.DataFrame]:
         """Cache-backed multi-symbol fetch; a refused history rewrite is a HARD failure.
 
@@ -799,6 +890,7 @@ class CachedDataProvider(BaseDataProvider):
                     self.fetch_ohlcv(
                         symbol, start, end, interval=interval,
                         expected_last_session=expected_last_session,
+                        adjust=adjust,
                     )
                     covered_symbols.append(symbol)
             except Exception as exc:
@@ -833,6 +925,7 @@ class CachedDataProvider(BaseDataProvider):
             start=start,
             end=end,
             interval=interval,
+            adjust=adjust,
         )
 
     def rebase_corporate_action(

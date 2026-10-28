@@ -49,7 +49,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from common.duckdb_cache import DuckDBCache, is_intraday_interval
+from common.duckdb_cache import DuckDBCache, is_intraday_interval, is_factor_neutral_symbol
 from common.financial_api import (
     BaoStockDataProvider,
     EastMoneyDataProvider,
@@ -780,13 +780,15 @@ class RefusalCollector:
         detail = "; ".join(
             f"{exc.provider or '?'}/{exc.symbol or '?'}@{exc.date}" for exc in self.items
         )
+        valid_dates = [exc.date for exc in self.items if exc.date]
+        min_date = min(valid_dates) if valid_dates else None
         raise QfqWriteRefused(
             f"{self.label}: {len(self.items)} write(s) refused -- the cache still holds the "
             f"pre-sync values for these symbols (nothing was written for them). {detail}",
             symbol=",".join(sorted({exc.symbol for exc in self.items if exc.symbol})),
             provider=",".join(sorted({exc.provider for exc in self.items if exc.provider})),
             interval=",".join(sorted({exc.interval for exc in self.items if exc.interval})) or None,
-            date=min(exc.date for exc in self.items if exc.date),
+            date=min_date,
             violations=[v for exc in self.items for v in exc.violations],
         )
 
@@ -1051,8 +1053,8 @@ def sync_5m_intraday(
     if "511880.SH" not in all_targets:
         all_targets.append("511880.SH")
 
-    bs_prov = BaoStockDataProvider(adjustflag="2", keep_logged_in=True)
-    em_prov = EastMoneyDataProvider(adjust="qfq")
+    bs_prov = BaoStockDataProvider(adjustflag="3", keep_logged_in=True)
+    em_prov = EastMoneyDataProvider(adjust="none")
 
     refusals = RefusalCollector("PART B (5m intraday)")
     t_total = time.time()
@@ -1061,6 +1063,8 @@ def sync_5m_intraday(
         for idx, sym in enumerate(all_targets, 1):
             # Check cache hit
             meta = cache.get_intraday_metadata("BaoStockDataProvider", sym, "5m")
+            if not meta:
+                meta = cache.get_intraday_metadata("EastMoneyDataProvider", sym, "5m")
             if meta:
                 min_ts = meta["earliest_available_ts"]
                 max_ts = meta["latest_available_ts"]
@@ -1071,93 +1075,92 @@ def sync_5m_intraday(
             print(f"[{idx}/{len(all_targets)}] Fetching 5m for {sym}...", end=" ", flush=True)
             t0 = time.time()
 
-            dfs: List[pd.DataFrame] = []
+            full_df = pd.DataFrame()
+            target_prov: Optional[str] = None
+
+            # BaoStock authoritative writer (adjustflag "3", basis "raw")
             try:
-                df_bs = bs_prov.fetch_ohlcv(sym, start, end, interval="5m")
+                fetch_bs = getattr(bs_prov, "fetch_raw_ohlcv", bs_prov.fetch_ohlcv)
+                df_bs = fetch_bs(sym, start, end, interval="5m")
                 if not df_bs.empty:
-                    dfs.append(df_bs)
+                    full_df = df_bs
+                    target_prov = "BaoStockDataProvider"
             except Exception as e:
                 print(f"[BaoStock error: {e}]", end=" ", flush=True)
 
-            # Check if trailing recent bars from EastMoney are needed
-            try:
-                if dfs:
-                    last_dt = dfs[0].index.max()
-                    req_end_dt = pd.to_datetime(end)
-                    if (req_end_dt - last_dt).total_seconds() > 3600 * 24:
-                        time.sleep(0.2)
-                        em_start = (last_dt - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-                        df_em = em_prov.fetch_ohlcv(sym, em_start, end, interval="5m")
-                        if not df_em.empty:
-                            dfs.append(df_em[df_em.index > last_dt])
-                else:
+            # EastMoney fallback only when BaoStock returns nothing (fqt "0", basis "raw")
+            if full_df.empty:
+                try:
                     time.sleep(0.2)
-                    df_em = em_prov.fetch_ohlcv(sym, start, end, interval="5m")
+                    fetch_em = getattr(em_prov, "fetch_raw_ohlcv", em_prov.fetch_ohlcv)
+                    df_em = fetch_em(sym, start, end, interval="5m")
                     if not df_em.empty:
-                        dfs.append(df_em)
-            except Exception as e:
-                pass
+                        full_df = df_em
+                        target_prov = "EastMoneyDataProvider"
+                except Exception as e:
+                    print(f"[EastMoney error: {e}]", end=" ", flush=True)
 
-            if not dfs:
+            if full_df.empty or target_prov is None:
                 print("FAILED (no data returned)")
                 continue
 
-            full_df = pd.concat(dfs)
             full_df = full_df[~full_df.index.duplicated(keep="last")].sort_index()
 
-            # Store immediately into DuckDB cache.
-            #
-            # L2.15: the old code followed these two stores with
-            #     UPDATE intraday_sync_metadata SET is_earliest_known = TRUE
-            #            WHERE symbol = ? AND interval = '5m'
-            # whenever the frame happened to start at/before 2022-01-10, i.e. it turned a
-            # hard-coded guess about the upstream's history into a stored fact, and did so for
-            # EVERY provider row of that symbol (BaoStock and EastMoney get the same frame here,
-            # but a third namespace serving the symbol would have been marked True too without
-            # ever being synced). `store_intraday_bars` now owns the flag via the same
-            # `L2.6`/`L2.18` rule the daily table uses, on reviewable evidence only.
-            #
-            # OPERATIONAL CONSEQUENCE (deliberate): with the default `--start-5m 2022-01-01` the
-            # probe is not satisfied (the request does not start >7 days before the first bar), so
-            # these rows keep `is_earliest_known = FALSE`. `is_intraday_range_covered` still
-            # reports this script's own window as covered via its 7-day start tolerance, so no
-            # re-fetch loop is introduced; requests starting well before 2022 now correctly
-            # re-fetch instead of trusting an unverified claim.
-            provider_names = ["BaoStockDataProvider", "EastMoneyDataProvider"]
-            n_new = 0
-            for prov in provider_names:
-                # L2.28 write gate. This store is the one that used to reach furthest into
-                # stored history: the frame spans the whole `--start-5m` window, so every
-                # session since 2022 was upserted on each run. Two consequences are now
-                # structural instead of accidental:
-                #   * only rows the cache lacks are written (no history rewrite, no
-                #     "no-op rewrite" ULP noise), and
-                #   * if the incoming window disagrees with a stored close, the symbol is
-                #     refused by name + date BEFORE the write. That also disarms
-                #     `store_intraday_bars`' R4 drift branch (`DELETE` all bars for the
-                #     asset on a >1e-4 overlap drift): the gate refuses first, so a basis
-                #     change can no longer silently wipe and repopulate the history.
+            # M3.8: Fetch and store adjust factors for raw 5m bars
+            if hasattr(bs_prov, "fetch_adjust_factors"):
                 try:
-                    plan = plan_history_write(cache, prov, sym, full_df, interval="5m")
-                except QfqWriteRefused as exc:
-                    refusals.add(exc)
-                    continue
-                if plan.is_empty:
-                    continue
-                n_new = max(n_new, len(plan.df))
-                cache.store_intraday_bars(
-                    prov,
-                    sym,
-                    plan.df,
-                    interval="5m",
-                    requested_start=plan.requested_start(start),
-                    requested_end=end,
-                )
-                _report_cross_check(cache, prov, sym, interval="5m")
+                    factors_df = bs_prov.fetch_adjust_factors(sym, start, end)
+                    if factors_df is not None and not factors_df.empty:
+                        cache.store_adjust_factors(sym, factors_df, source="BaoStockDataProvider")
+                    elif not is_factor_neutral_symbol(sym):
+                        msg = f"Empty adjust factors for non-neutral symbol {sym}"
+                        print(f"[WARN {msg}]")
+                        refusals.add(
+                            QfqWriteRefused(
+                                msg,
+                                symbol=sym,
+                                provider=target_prov,
+                                interval="5m",
+                                date=market_now(MARKET_CHINA).date(),
+                            )
+                        )
+                except Exception as e:
+                    msg = f"Factor fetch failed for {sym}: {e}"
+                    print(f"[ERROR {msg}]")
+                    refusals.add(
+                        QfqWriteRefused(
+                            msg,
+                            symbol=sym,
+                            provider=target_prov,
+                            interval="5m",
+                            date=market_now(MARKET_CHINA).date(),
+                        )
+                    )
+
+            # Store immediately into DuckDB cache under target_prov ONLY (no double-store)
+            n_new = 0
+            try:
+                plan = plan_history_write(cache, target_prov, sym, full_df, interval="5m")
+            except QfqWriteRefused as exc:
+                refusals.add(exc)
+                continue
+            if plan.is_empty:
+                continue
+            n_new = len(plan.df)
+            cache.store_intraday_bars(
+                target_prov,
+                sym,
+                plan.df,
+                interval="5m",
+                requested_start=plan.requested_start(start),
+                requested_end=end,
+                adjustflag="raw",
+            )
+            _report_cross_check(cache, target_prov, sym, interval="5m")
 
             elapsed = time.time() - t0
             print(
-                f"STORED {len(full_df):,} fetched / {n_new:,} new bars "
+                f"STORED ({target_prov}) {len(full_df):,} fetched / {n_new:,} new bars "
                 f"({full_df.index.min().strftime('%Y-%m-%d %H:%M')} -> {full_df.index.max().strftime('%Y-%m-%d %H:%M')}) "
                 f"[{elapsed:.1f}s]"
             )
@@ -1172,7 +1175,7 @@ def sync_5m_intraday(
     for idx_sym in indices:
         try:
             time.sleep(0.2)
-            df_idx_5m = em_idx_prov.fetch_ohlcv(idx_sym, "2026-08-01", end, interval="5m")
+            df_idx_5m = em_idx_prov.fetch_raw_ohlcv(idx_sym, "2026-08-01", end, interval="5m")
             if not df_idx_5m.empty:
                 for prov in ("EastMoneyDataProvider", "FuyaoDataProvider"):
                     try:
@@ -1191,6 +1194,7 @@ def sync_5m_intraday(
                         interval="5m",
                         requested_start=plan.requested_start("2026-08-01"),
                         requested_end=end,
+                        adjustflag="raw",
                     )
                     _report_cross_check(cache, prov, idx_sym, interval="5m")
                 print(

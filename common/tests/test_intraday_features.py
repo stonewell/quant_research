@@ -1761,13 +1761,14 @@ def test_l2_15_5m_symbol_sync_does_not_assert_intraday_earliest_known(monkeypatc
 
     mod.sync_5m_intraday(cache, [symbol], [], start="2022-01-01", end="2022-01-31")
 
-    for prov in ("BaoStockDataProvider", "EastMoneyDataProvider"):
-        meta = cache.get_intraday_metadata(prov, symbol, "5m")
-        assert meta is not None, f"{prov} 5m row missing"
-        assert meta["earliest_available_ts"].date() == datetime.date(2022, 1, 4)
-        assert meta["is_earliest_known"] is False, (
-            f"{prov}: a hard-coded 'early 2022 means earliest' guess must not become a stored fact"
-        )
+    # M3.8: With BaoStock as authoritative writer and double-store removed,
+    # the bars are stored under BaoStockDataProvider only.
+    meta = cache.get_intraday_metadata("BaoStockDataProvider", symbol, "5m")
+    assert meta is not None, "BaoStockDataProvider 5m row missing"
+    assert meta["earliest_available_ts"].date() == datetime.date(2022, 1, 4)
+    assert meta["is_earliest_known"] is False, (
+        "a hard-coded 'early 2022 means earliest' guess must not become a stored fact"
+    )
 
 
 def test_l2_15_script_performs_no_direct_cache_writes():
