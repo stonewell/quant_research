@@ -620,7 +620,30 @@ class MarketDBDataProvider(BaseDataProvider):
             hfq_prov = MarketDBDataProvider(adjust="backward", con=self._con, folder_path=getattr(self, "folder_path", None), db_path=getattr(self, "db_path", None) if getattr(self, "db_path", None) != ":memory:" else None)
             raw_df = raw_prov.fetch_ohlcv(symbol, start=start or "2016-01-01", end=end or "2030-01-01", interval="1d")
             hfq_df = hfq_prov.fetch_ohlcv(symbol, start=start or "2016-01-01", end=end or "2030-01-01", interval="1d")
-            return calibrate_adjust_factors_from_closes(raw_df["Close"], qfq_close=hfq_df["Close"], hfq_close=hfq_df["Close"])
+            fac = calibrate_adjust_factors_from_closes(
+                raw_df["Close"], qfq_close=hfq_df["Close"], hfq_close=hfq_df["Close"]
+            )
+            # Passing the HFD close as `qfq_close` is what makes this fallback's `factor_qfq`
+            # column WRONG: it comes out equal to the hfq factor, i.e. mislabelled (there is no qfq
+            # view to read here, only raw vs hfq). Per BaoStock's official definition
+            # `fore = back / back[latest]` -- and `_apply_factors_to_df` uses exactly that identity,
+            # `qfq_price = raw * factor_hfq[t] / factor_hfq[latest]` -- so the honest qfq factor is
+            # simply the hfq factor rescaled by its own last value. `factor_hfq` itself is untouched
+            # (it is the quantity every consumer actually derives from).
+            if fac is not None and not fac.empty:
+                last_hfq = float(fac["factor_hfq"].iloc[-1])
+                if np.isfinite(last_hfq) and last_hfq > 0:
+                    fac = fac.copy()
+                    fac["factor_qfq"] = fac["factor_hfq"] / last_hfq
+                else:
+                    warnings.warn(
+                        f"MarketDB adjust-factor fallback for {symbol!r} produced a non-positive "
+                        f"terminal backward factor ({last_hfq!r}); labelling factor_qfq as 1.0. "
+                        f"factor_hfq is unaffected."
+                    )
+                    fac = fac.copy()
+                    fac["factor_qfq"] = 1.0
+            return fac
         except Exception:
             return pd.DataFrame(columns=["factor_hfq"], index=pd.DatetimeIndex([], name="date"))
 
@@ -647,6 +670,32 @@ class MarketDBDataProvider(BaseDataProvider):
             if self._con is None:
                 con.close()
         return result
+
+
+#: Providers already told "I have no local adjustment-factor table" (M3.8).
+#: Once per provider rather than per symbol -- the same precedent as
+#: `common/data.py::_FACTOR_CAPABILITY_GAP_WARNED`, which exists because a 22-symbol universe
+#: otherwise emits 22 copies of a single operational fact.
+_NO_LOCAL_FACTOR_TABLE_WARNED: set = set()
+
+
+def _warn_no_local_factor_table(symbol: str) -> None:
+    """Say once that `FuyaoDataProvider` has nowhere to read adjustment factors from."""
+    if "FuyaoDataProvider" in _NO_LOCAL_FACTOR_TABLE_WARNED:
+        return
+    _NO_LOCAL_FACTOR_TABLE_WARNED.add("FuyaoDataProvider")
+    warnings.warn(
+        f"FuyaoDataProvider has no local adjustment-factor table reachable (first seen for "
+        f"{symbol!r}): its only factor source is MarketDB's calc_adjust_factor_daily via "
+        f"`self._local_provider`, which is absent here (prefer_local=False, or no market.duckdb). "
+        f"`adjust_factor_source_available` is therefore False and the cache layer takes its legacy "
+        f"direct path -- the provider's own fetch_ohlcv, its native basis recorded, no raw bars, no "
+        f"factors, no read-time derivation, plus its own once-per-provider capability-gap warning. "
+        f"Calling this method directly returns an empty frame. Run with prefer_local=True (the "
+        f"default) or point db_path/MARKETDB_DB_PATH at a real market.duckdb to get factor-based "
+        f"derivation. No factor is invented from Fuyao's own raw x qfq closes: that inference is "
+        f"only defined up to a multiplicative constant."
+    )
 
 
 class FuyaoDataProvider(BaseDataProvider):
@@ -685,6 +734,17 @@ class FuyaoDataProvider(BaseDataProvider):
                 )
             except Exception:
                 self._local_provider = None
+
+        # M3.8 capability flag (`BaseDataProvider.adjust_factor_source_available`): Fuyao's ONLY
+        # adjustment-factor source is the local MarketDB factor table, so this is decided by whether
+        # that DB actually opened -- it is DYNAMIC, not a static class property. `derive_mode="auto"`
+        # in `CachedDataProvider` reads it: True keeps the raw+derive+fail-closed path, False takes
+        # the legacy direct path (native basis recorded, nothing derived, one warning) instead of
+        # turning every cache miss into `MissingAdjustFactorsError`.
+        self.adjust_factor_source_available = (
+            self._local_provider is not None
+            and hasattr(self._local_provider, "fetch_adjust_factors")
+        )
 
     def _fetch_remote_ohlcv(
         self, symbol: str, start: str, end: str, interval: str = "1d", adjust: Optional[str] = None
@@ -1029,6 +1089,80 @@ class FuyaoDataProvider(BaseDataProvider):
     def fetch_raw_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
         """Fetch raw unadjusted OHLCV bars without mutating instance basis."""
         return self._fetch_ohlcv_internal(symbol, start, end, interval=interval, adjust="none")
+
+    def fetch_adjust_factors(
+        self,
+        symbol: str,
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """Adjustment factors for `symbol`, delegated to the local MarketDB (M3.8).
+
+        Fuyao's REST surface has no factor endpoint, so there is nothing to compute here: the only
+        factor source this provider can reach is the `MarketDBDataProvider` that `__init__` builds
+        as `self._local_provider` (`prefer_local=True`, the default). That provider's
+        `fetch_adjust_factors` reads the dense `calc_adjust_factor_daily` table, and the returned
+        frame is passed through VERBATIM:
+
+          * columns `["factor_qfq", "factor_hfq"]` (dense, one row per trading day) -- kept as they
+            are, not compressed into BaoStock-style event rows and not trimmed to one column.
+            `DuckDBCache.store_adjust_factors` / `_apply_factors_to_df` resolve either granularity
+            with an as-of lookup, and `_apply_factors_to_df` consumes `factor_hfq` only
+            (`qfq_price = raw * factor_hfq[t] / factor_hfq[latest]`, i.e. exactly BaoStock's
+            `fore = back / back[latest]` identity), so the dense shape is the lossless one.
+          * index is a `DatetimeIndex` named `date`, ascending.
+          * `start`/`end` are forwarded unchanged: the read is local and cheap, and the caller's
+            window is respected. Note the qfq ANCHOR, however, is `DuckDBCache.get_latest_factor_hfq`
+            -- the latest row in the WHOLE `adjust_factors` table for the symbol, not the latest row
+            inside this window. A corporate action outside the delegated window therefore still
+            rescales a qfq read of it, by a constant (returns untouched). That single-anchor rule is
+            deliberate (`docs/version.md` §22.5 F5), not a delegation bug.
+
+        Factor-neutral symbols (indices, cash ETF 511880) return the same empty frame BaoStock's
+        implementation returns: `factor_hfq` column, empty `DatetimeIndex` named `date`.
+
+        DEGRADED MODE (no local factor table: `prefer_local=False`, or MarketDB unavailable): this
+        instance reports `adjust_factor_source_available = False` (set in `__init__`), so
+        `CachedDataProvider.get_bars` never calls this method at all -- it takes the documented
+        legacy direct path instead: the provider's own `fetch_ohlcv` (native basis), stored with
+        that basis, no raw bars, no factors, no read-time derivation, and one
+        `_warn_factor_capability_gap` warning per provider. That is a CAPABILITY GAP, not a data
+        failure, so it must not fail closed. A direct caller that ignores the flag still gets an
+        empty frame here, which must be read as "no factor source", never as "factor-neutral".
+        Inventing factors from Fuyao's own raw x qfq closes was considered and deliberately
+        rejected: the inference is only defined up to a multiplicative constant per window, it
+        cannot respect the `fore = back / back[latest]` invariance under new corporate actions, and
+        a wrong-but-plausible factor is worse than a loud, documented degradation. No network
+        exception is raised from here either way.
+        """
+        if is_factor_neutral_symbol(normalize_thscode(symbol)):
+            return pd.DataFrame(columns=["factor_hfq"], index=pd.DatetimeIndex([], name="date"))
+
+        local = getattr(self, "_local_provider", None)
+        if local is None or not hasattr(local, "fetch_adjust_factors"):
+            _warn_no_local_factor_table(symbol)
+            return pd.DataFrame(columns=["factor_hfq"], index=pd.DatetimeIndex([], name="date"))
+
+        try:
+            factors = local.fetch_adjust_factors(symbol, start=start, end=end)
+        except Exception as exc:
+            # Same style as the rest of this module: never let a data-source exception abort the
+            # caller's chain. The empty frame turns into `MissingAdjustFactorsError` upstream, so
+            # the failure stays visible where it matters instead of being silently swallowed.
+            warnings.warn(
+                f"FuyaoDataProvider: local MarketDB adjustment-factor read failed for {symbol!r}: "
+                f"{type(exc).__name__}: {exc}. Returning an empty factor table (fail-closed)."
+            )
+            return pd.DataFrame(columns=["factor_hfq"], index=pd.DatetimeIndex([], name="date"))
+
+        if factors is None or factors.empty:
+            # No rows for this symbol in the local table (not a factor-neutral symbol, not an
+            # exception): still fail-closed, and no extra warning -- `MissingAdjustFactorsError`
+            # names the symbol and the fix is the same (`scripts/migrate_adjust_basis.py` style
+            # data repair / re-sync), so a per-symbol warning would only add noise.
+            return pd.DataFrame(columns=["factor_hfq"], index=pd.DatetimeIndex([], name="date"))
+
+        return factors
 
     def fetch_universe(
         self, symbols: List[str], start: str, end: str, interval: str = "1d"

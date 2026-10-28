@@ -9,6 +9,7 @@ import os
 import shutil
 import sys
 import tempfile
+import warnings
 from unittest.mock import MagicMock, patch
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -27,12 +28,15 @@ from common.data import (
     load_universe,
 )
 from common.financial_api import (
+    EastMoneyDataProvider,
     FuyaoDataProvider,
     MarketDBDataProvider,
     _resolve_duckdb_path,
     is_etf_code,
     normalize_thscode,
 )
+from common.duckdb_cache import MissingAdjustFactorsError, canonicalize_adjust_mode
+import common.financial_api as financial_api
 
 
 def test_is_etf_code():
@@ -819,4 +823,397 @@ def test_calendar_check_missing_trading_days_and_skip_fetch():
 
     con.close()
 
+# ---------------------------------------------------------------------------------------------
+# M3.8 factor sourcing: `FuyaoDataProvider.fetch_adjust_factors` is a PURE DELEGATION to the local
+# MarketDB factor table, `EastMoneyDataProvider` deliberately has none.
+#
+# The synthetic series below uses exact arithmetic (no quote rounding) so the derivation-chain gate
+# can be `<= 1e-6`: two corporate actions (cash dividend -> 2-for-1 split) with a raw path that is
+# continuous across each ex-date, and the matching dense factor truth `F` = [1.00, 1.05, 2.10].
+# ---------------------------------------------------------------------------------------------
 
+
+def _synthetic_raw_qfq_and_factor_truth(periods: int = 48):
+    """Raw bars, native qfq bars and the dense `calc_adjust_factor_daily` truth behind them."""
+    dates = pd.DatetimeIndex(
+        pd.bdate_range("2020-01-02", periods=periods), name="date"
+    )
+    factor = np.concatenate([np.full(16, 1.00), np.full(16, 1.05), np.full(16, 2.10)])
+    raw_close = 20.0 + 0.05 * np.arange(periods, dtype=float)
+    raw_close[16:] = raw_close[16:] / 1.05
+    raw_close[32:] = raw_close[32:] / 2.00
+    qfq_close = raw_close * factor / factor[-1]  # 前复权 = raw x F_t / F_last
+
+    def _frame(close: np.ndarray) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "Open": close * 0.999,
+                "High": close * 1.010,
+                "Low": close * 0.990,
+                "Close": close,
+                "Volume": np.full(len(close), 1000.0),
+            },
+            index=dates.copy(),
+        )
+
+    factors = pd.DataFrame(
+        {"factor_qfq": factor / factor[-1], "factor_hfq": factor}, index=dates.copy()
+    )
+    factors.index.name = "date"
+    return dates, _frame(raw_close), _frame(qfq_close), factors
+
+
+def _slice_bars(frame: pd.DataFrame, start, end) -> pd.DataFrame:
+    out = frame
+    if start:
+        out = out[out.index >= pd.to_datetime(start)]
+    if end:
+        out = out[out.index <= pd.to_datetime(end)]
+    return out.copy()
+
+
+class _FakeLocalMarketDB:
+    """Stand-in for `FuyaoDataProvider._local_provider`, with call counting."""
+
+    def __init__(self, factors: pd.DataFrame, fail: bool = False):
+        self.factors = factors
+        self.fail = fail
+        self.calls = []
+
+    def fetch_adjust_factors(self, symbol, start=None, end=None):
+        self.calls.append((symbol, start, end))
+        if self.fail:
+            raise RuntimeError("market.duckdb went away")
+        return _slice_bars(self.factors, start, end)
+
+
+class _FuyaoStub(FuyaoDataProvider):
+    """Fuyao provider whose REST calls are a locally-served synthetic pair (no network)."""
+
+    def __init__(self, raw_df, qfq_df, local=None):
+        super().__init__(prefer_local=False)  # never reaches a real market.duckdb
+        self._raw_df = raw_df
+        self._qfq_df = qfq_df
+        self.basis_calls = []
+        if local is not None:
+            self._local_provider = local
+            # Mirror `FuyaoDataProvider.__init__`'s dynamic capability flag.
+            self.adjust_factor_source_available = hasattr(local, "fetch_adjust_factors")
+
+    def _fetch_ohlcv_internal(self, symbol, start, end, interval="1d", adjust=None):
+        self.basis_calls.append(canonicalize_adjust_mode(adjust))
+        src = self._qfq_df if canonicalize_adjust_mode(adjust) == "qfq" else self._raw_df
+        return _slice_bars(src, start, end)
+
+
+class _EastMoneyStub(EastMoneyDataProvider):
+    """EastMoney provider over the same synthetic pair, via the per-call `fqt` argument."""
+
+    def __init__(self, raw_df, qfq_df):
+        super().__init__()  # builds an offline requests.Session only
+        self._raw_df = raw_df
+        self._qfq_df = qfq_df
+
+    def _fetch_ohlcv_internal(self, symbol, start, end, interval="1d", fqt=None):
+        assert interval == "1d"
+        return _slice_bars(self._qfq_df if fqt == "1" else self._raw_df, start, end)
+
+
+def test_fuyao_fetch_adjust_factors_delegates_once_to_local_marketdb_without_upstream_calls():
+    dates, raw_df, qfq_df, factors = _synthetic_raw_qfq_and_factor_truth()
+    local = _FakeLocalMarketDB(factors)
+    stub = _FuyaoStub(raw_df, qfq_df, local=local)
+
+    out = stub.fetch_adjust_factors("600519.SH", start="2020-01-02", end="2020-03-10")
+
+    # Exactly one delegation, and NOT a single upstream bar request.
+    assert local.calls == [("600519.SH", "2020-01-02", "2020-03-10")]
+    assert stub.basis_calls == []
+    # Verbatim pass-through of MarketDB's DENSE two-column frame (not compressed into event rows).
+    pd.testing.assert_frame_equal(out, factors)
+    assert list(out.columns) == ["factor_qfq", "factor_hfq"]
+    assert out.index.name == "date"
+    assert len(out) == len(dates)
+
+
+def test_fuyao_fetch_adjust_factors_factor_neutral_symbols_return_empty_frame():
+    dates, raw_df, qfq_df, factors = _synthetic_raw_qfq_and_factor_truth()
+    local = _FakeLocalMarketDB(factors)
+    stub = _FuyaoStub(raw_df, qfq_df, local=local)
+
+    for symbol in ("000300.SH", "511880.SH", "886042.TI"):
+        out = stub.fetch_adjust_factors(symbol, start="2020-01-02", end="2020-03-10")
+        assert out.empty
+        assert list(out.columns) == ["factor_hfq"]
+        assert isinstance(out.index, pd.DatetimeIndex)
+        assert out.index.name == "date"
+
+    # Factor-neutral short-circuits before delegation and before any upstream request.
+    assert local.calls == []
+    assert stub.basis_calls == []
+
+
+def test_fuyao_without_local_factor_table_degrades_to_the_legacy_direct_path(tmp_path):
+    """C.1: no local factor table is a CAPABILITY GAP -> legacy direct path, not a hard failure."""
+    import common.data as data_module
+
+    dates, raw_df, qfq_df, _ = _synthetic_raw_qfq_and_factor_truth()
+    stub = _FuyaoStub(raw_df, qfq_df)  # prefer_local=False -> _local_provider is None
+    assert stub._local_provider is None
+    assert stub.adjust_factor_source_available is False
+
+    financial_api._NO_LOCAL_FACTOR_TABLE_WARNED.discard("FuyaoDataProvider")
+    data_module._FACTOR_CAPABILITY_GAP_WARNED.discard("_FuyaoStub")
+
+    cached = CachedDataProvider(_FuyaoStub(raw_df, qfq_df), cache_dir=str(tmp_path))
+    start, end = dates[0].strftime("%Y-%m-%d"), dates[-1].strftime("%Y-%m-%d")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        direct = cached.fetch_ohlcv("600519.SH", start=start, end=end, adjust="qfq")
+
+        # Direct calls still report the degraded state, once per provider ...
+        first = stub.fetch_adjust_factors("600519.SH", start=start, end=end)
+        second = stub.fetch_adjust_factors("000001.SZ", start=start, end=end)
+        # ... and a second cache MISS (another symbol) must NOT repeat the capability gap warning.
+        direct_again = cached.fetch_ohlcv("000001.SZ", start=start, end=end, adjust="qfq")
+
+    # The legacy path served the provider's OWN series: no MissingAdjustFactorsError, no rescaling.
+    assert not direct.empty
+    assert list(direct["Close"]) == list(qfq_df["Close"])
+    assert list(direct_again["Close"]) == list(qfq_df["Close"])
+    # Stored with the provider's native basis, and NO factor table was fabricated.
+    meta = cached.duckdb_cache.get_asset_metadata("_FuyaoStub", "600519.SH")
+    assert meta["adjustflag"] == "qfq"
+    assert cached.duckdb_cache.query_adjust_factors("600519.SH").empty
+
+    for frame in (first, second):
+        assert frame.empty
+        assert list(frame.columns) == ["factor_hfq"]
+        assert frame.index.name == "date"
+
+    messages = [str(w.message) for w in caught]
+    degraded = [m for m in messages if "has no local adjustment-factor table reachable" in m]
+    assert len(degraded) == 1, f"the degraded notice must fire once per provider: {messages}"
+    capability_gap = [m for m in messages if "cannot supply adjustment factors" in m]
+    assert len(capability_gap) == 1, f"the cache must warn once, not per miss: {messages}"
+    # No factor is invented: the upstream raw/qfq pair was never needed.
+    assert stub.basis_calls == []
+
+
+def test_fuyao_delegated_factors_reconcile_with_native_adjustments_through_cache(tmp_path):
+    """Dense delegated factors -> raw bars in DuckDB -> read-time qfq/hfq derivation gate."""
+    dates, raw_df, qfq_df, factors = _synthetic_raw_qfq_and_factor_truth()
+    stub = _FuyaoStub(raw_df, qfq_df, local=_FakeLocalMarketDB(factors))
+    cached = CachedDataProvider(stub, cache_dir=str(tmp_path))
+    start, end = dates[0].strftime("%Y-%m-%d"), dates[-1].strftime("%Y-%m-%d")
+
+    derived_qfq = cached.fetch_ohlcv("600519.SH", start=start, end=end, adjust="qfq")
+    derived_hfq = cached.fetch_ohlcv("600519.SH", start=start, end=end, adjust="hfq")
+
+    assert list(derived_qfq.index) == list(dates)
+    assert list(derived_hfq.index) == list(dates)
+
+    # 1. qfq: raw * factor_hfq[t] / factor_hfq[latest] must reproduce the provider's native qfq.
+    for col in ("Open", "High", "Low", "Close"):
+        rel = (derived_qfq[col] - qfq_df[col]).abs() / qfq_df[col].abs()
+        assert rel.max() <= 1e-6, f"qfq {col} max relative error {rel.max()}"
+    np.testing.assert_array_equal(
+        derived_qfq["Volume"].to_numpy(), raw_df["Volume"].to_numpy(),
+        err_msg="Volume must never be scaled by an adjustment factor",
+    )
+
+    # 2. hfq: raw * factor_hfq[t].
+    expected_hfq = raw_df.mul(factors["factor_hfq"], axis=0)
+    for col in ("Open", "High", "Low", "Close"):
+        rel = (derived_hfq[col] - expected_hfq[col]).abs() / expected_hfq[col].abs()
+        assert rel.max() <= 1e-6, f"hfq {col} max relative error {rel.max()}"
+    np.testing.assert_array_equal(
+        derived_hfq["Volume"].to_numpy(), raw_df["Volume"].to_numpy()
+    )
+
+    # 3. The factors really were persisted (so the derivation above was read-time, not pass-through).
+    stored = cached.duckdb_cache.query_adjust_factors("600519.SH")
+    assert not stored.empty
+    assert stored["factor_hfq"].iloc[-1] == pytest.approx(2.10, rel=1e-12)
+
+
+def test_fuyao_delegated_factor_read_failure_is_fail_closed(tmp_path):
+    dates, raw_df, qfq_df, factors = _synthetic_raw_qfq_and_factor_truth()
+    local = _FakeLocalMarketDB(factors, fail=True)
+    stub = _FuyaoStub(raw_df, qfq_df, local=local)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        out = stub.fetch_adjust_factors("600519.SH", start="2020-01-02", end="2020-03-10")
+        cached = CachedDataProvider(_FuyaoStub(raw_df, qfq_df, local=local), cache_dir=str(tmp_path))
+        with pytest.raises(MissingAdjustFactorsError):
+            cached.fetch_ohlcv(
+                "600519.SH",
+                start=dates[0].strftime("%Y-%m-%d"),
+                end=dates[-1].strftime("%Y-%m-%d"),
+            )
+
+    assert out.empty
+    assert list(out.columns) == ["factor_hfq"]
+    messages = [str(w.message) for w in caught]
+    assert any("local MarketDB adjustment-factor read failed" in m for m in messages), messages
+    assert stub.basis_calls == [], "a factor-read failure must not trigger an upstream fetch"
+    assert local.calls, "the delegation must actually have been attempted"
+
+
+def test_eastmoney_deliberately_has_no_adjust_factor_source(tmp_path):
+    """Documented trade-off: EastMoney keeps the legacy fallback rather than inventing factors."""
+    import common.data as data_module
+
+    assert not hasattr(EastMoneyDataProvider, "fetch_adjust_factors")
+
+    dates, raw_df, qfq_df, _ = _synthetic_raw_qfq_and_factor_truth()
+    stub = _EastMoneyStub(raw_df, qfq_df)
+    cached = CachedDataProvider(stub, cache_dir=str(tmp_path))
+    start, end = dates[0].strftime("%Y-%m-%d"), dates[-1].strftime("%Y-%m-%d")
+
+    data_module._FACTOR_CAPABILITY_GAP_WARNED.discard("EastMoneyDataProvider")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        df = cached.fetch_ohlcv("600519.SH", start=start, end=end, adjust="qfq")
+
+    messages = [str(w.message) for w in caught]
+    assert any("exposes fetch_raw_ohlcv but cannot supply adjustment factors" in m for m in messages), messages
+    # The legacy direct path stores the provider's own native basis and derives nothing.
+    assert list(df["Close"]) == list(qfq_df["Close"])
+    assert cached.duckdb_cache.query_adjust_factors("600519.SH").empty
+
+
+def test_fuyao_adjust_factor_source_flag_tracks_the_local_table(tmp_path):
+    """C.2: `adjust_factor_source_available` is DYNAMIC -- decided by whether MarketDB opened."""
+    dates, raw_df, qfq_df, factors = _synthetic_raw_qfq_and_factor_truth()
+
+    # (a) no market.duckdb in the folder -> no factor source, flag False.
+    empty_dir = tmp_path / "no_db"
+    empty_dir.mkdir()
+    no_source = FuyaoDataProvider(folder_path=str(empty_dir))
+    assert no_source._local_provider is None
+    assert no_source.adjust_factor_source_available is False
+
+    # (b) a db_path pointing at a non-existent file behaves the same way.
+    assert FuyaoDataProvider(db_path=str(tmp_path / "nope.duckdb")).adjust_factor_source_available is False
+
+    # (c) a real local market.duckdb -> factor source present, flag True, delegation active.
+    db_dir = tmp_path / "with_db"
+    db_dir.mkdir()
+    db_file = db_dir / "market.duckdb"
+    con = duckdb.connect(str(db_file))
+    con.execute("""
+        CREATE TABLE raw_kline_daily (
+            thscode VARCHAR, date DATE, open DOUBLE, high DOUBLE, low DOUBLE,
+            close DOUBLE, volume DOUBLE
+        );
+        CREATE VIEW v_daily AS SELECT * FROM raw_kline_daily;
+        CREATE VIEW v_daily_qfq AS SELECT * FROM raw_kline_daily;
+        CREATE VIEW v_daily_hfq AS SELECT * FROM raw_kline_daily;
+        CREATE TABLE calc_adjust_factor_daily (
+            thscode VARCHAR, date DATE, forward_factor DOUBLE, backward_factor DOUBLE
+        );
+    """)
+    for d, (qfq_f, hfq_f) in zip(dates, zip(factors["factor_qfq"], factors["factor_hfq"])):
+        con.execute(
+            "INSERT INTO calc_adjust_factor_daily VALUES ('600519.SH', ?, ?, ?)",
+            [d.strftime("%Y-%m-%d"), float(qfq_f), float(hfq_f)],
+        )
+    con.close()
+
+    # NB `adjust` must stay in MarketDB's own vocabulary (forward/backward/none): passing "qfq"
+    # makes `MarketDBDataProvider.__init__` raise, `_local_provider` stays None, and the flag
+    # correctly reads False (a pre-existing quirk of that constructor's validation).
+    with_source = FuyaoDataProvider(folder_path=str(db_dir))
+    assert with_source.adjust_factor_source_available is True
+    delegated = with_source.fetch_adjust_factors("600519.SH", start=dates[0].strftime("%Y-%m-%d"),
+                                                end=dates[-1].strftime("%Y-%m-%d"))
+    assert list(delegated.columns) == ["factor_qfq", "factor_hfq"]
+    assert len(delegated) == len(dates)
+    np.testing.assert_allclose(
+        delegated["factor_hfq"].to_numpy(), factors["factor_hfq"].to_numpy(), rtol=1e-12
+    )
+    np.testing.assert_allclose(
+        delegated["factor_qfq"].to_numpy(), factors["factor_qfq"].to_numpy(), rtol=1e-12
+    )
+
+    # And through the cache: raw stored + factors derived (the flag=True path).
+    cached = CachedDataProvider(with_source, cache_dir=str(tmp_path / "cache"))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        derived = cached.fetch_ohlcv(
+            "600519.SH", start=dates[0].strftime("%Y-%m-%d"), end=dates[-1].strftime("%Y-%m-%d"),
+            adjust="qfq",
+        )
+    messages = [str(w.message) for w in caught]
+    assert not any("cannot supply adjustment factors" in m for m in messages), messages
+    assert not derived.empty
+
+
+def test_marketdb_fallback_relabels_factor_qfq_but_keeps_factor_hfq():
+    """C.3: no `calc_adjust_factor_daily` -> derived `factor_qfq == factor_hfq / factor_hfq[-1]`."""
+    dates = pd.bdate_range("2024-01-01", periods=4)
+    raw_close = np.array([100.0, 101.0, 51.0, 52.0])
+    # Cumulative backward factor 1.0 for the first two bars, 2.0 after the (2-for-1) action.
+    hfq_close = raw_close * np.array([1.0, 1.0, 2.0, 2.0])
+
+    con = duckdb.connect(":memory:")
+    con.execute("""
+        CREATE TABLE raw_kline_daily (
+            thscode VARCHAR, date DATE, open DOUBLE, high DOUBLE, low DOUBLE,
+            close DOUBLE, volume DOUBLE
+        );
+        CREATE VIEW v_daily AS SELECT * FROM raw_kline_daily;
+        CREATE VIEW v_daily_hfq AS SELECT * FROM raw_kline_daily;
+        CREATE VIEW v_daily_qfq AS SELECT * FROM raw_kline_daily;
+    """)  # note: NO calc_adjust_factor_daily -> exercises the calibration fallback
+    for i, d in enumerate(dates):
+        con.execute(
+            "INSERT INTO raw_kline_daily VALUES ('600519.SH', ?, ?, ?, ?, ?, 1000.0)",
+            [d.strftime("%Y-%m-%d"), float(raw_close[i]), float(raw_close[i]),
+             float(raw_close[i]), float(raw_close[i])],
+        )
+    # v_daily is the raw view; make `adjust="backward"` return the hfq series by overriding the
+    # provider view selection rather than the SQL (one view can only hold one series).
+    provider = MarketDBDataProvider(con=con, adjust="none")
+    provider.view = "v_daily"
+    con.execute("UPDATE raw_kline_daily SET close = ? WHERE date = ?", [51.0, dates[2].strftime("%Y-%m-%d")])
+
+    import common.financial_api as fa
+
+    original = fa.MarketDBDataProvider
+
+    class _SplitViewProvider(original):
+        """`adjust="backward"` reads a different column set than `adjust="none"` here."""
+
+        def fetch_ohlcv(self, symbol, start, end, interval="1d"):
+            df = super().fetch_ohlcv(symbol, start, end, interval=interval)
+            if self.adjust == "backward":
+                mask = df.index >= pd.Timestamp(dates[2])
+                df = df.copy()
+                df.loc[mask, ["Open", "High", "Low", "Close"]] = (
+                    df.loc[mask, ["Open", "High", "Low", "Close"]] * 2.0
+                )
+            return df
+
+    try:
+        fa.MarketDBDataProvider = _SplitViewProvider
+        factors = provider.fetch_adjust_factors("600519.SH", start="2024-01-01", end="2024-01-04")
+    finally:
+        fa.MarketDBDataProvider = original
+    con.close()
+
+    assert list(factors.columns) == ["factor_qfq", "factor_hfq"]
+    expected_hfq = np.array([1.0, 1.0, 2.0, 2.0])
+    # factor_hfq is untouched by the relabelling fix.
+    np.testing.assert_allclose(factors["factor_hfq"].to_numpy(), expected_hfq, rtol=1e-9)
+    # factor_qfq now obeys fore = back / back_last (instead of repeating the hfq factor).
+    np.testing.assert_allclose(
+        factors["factor_qfq"].to_numpy() * factors["factor_hfq"].iloc[-1],
+        factors["factor_hfq"].to_numpy(),
+        rtol=1e-9,
+    )
+    np.testing.assert_allclose(factors["factor_qfq"].to_numpy(), [0.5, 0.5, 1.0, 1.0], rtol=1e-9)
+    assert factors["factor_qfq"].iloc[-1] == pytest.approx(1.0, rel=1e-12)

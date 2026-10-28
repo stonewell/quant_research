@@ -107,6 +107,24 @@ class BaseDataProvider(ABC):
     #: `scripts/migrate_adjust_basis.py --set-basis ... --force`.
     ASSUMED_NATIVE_BASIS_WHEN_UNKNOWN = "qfq"
 
+    #: Whether this provider, **right now**, actually has a usable adjustment-factor source --
+    #: i.e. whether calling `fetch_adjust_factors` can produce factors at all. This is a separate
+    #: question from "does the method exist": `FuyaoDataProvider` always *has* the method (it
+    #: delegates to MarketDB), but the factor table is only reachable when a local market.duckdb
+    #: opened, so the flag is DYNAMIC and recomputed in `__init__` there.
+    #:
+    #: `CachedDataProvider.get_bars` uses it to tell a CAPABILITY GAP (no factor source -> take the
+    #: legacy direct path, store the provider's native basis, derive nothing, warn once) apart from
+    #: a DATA FAILURE (source exists, returned nothing -> `MissingAdjustFactorsError`, fail-closed).
+    #: Default `True`: a provider that has `fetch_adjust_factors` at all is authoritative
+    #: (`MarketDBDataProvider` / `BaoStockDataProvider` read real factor tables / endpoints), so an
+    #: empty result from them stays a loud failure.
+    #:
+    #: Setting this False is a capability statement, never a way to hide an error: it must describe
+    #: "this instance has nowhere to read factors from", and the fallback it triggers is the same
+    #: documented one a provider without the method gets.
+    adjust_factor_source_available: bool = True
+
     @abstractmethod
     def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
         """Fetch OHLCV data for a single symbol. Must return DataFrame with DatetimeIndex
@@ -689,7 +707,8 @@ def _drop_invalid_ohlcv_rows(df: pd.DataFrame, symbol: str = None) -> pd.DataFra
     return df
 
 
-#: Providers already reported as "has `fetch_raw_ohlcv` but no `fetch_adjust_factors`".
+#: Providers already reported as "has `fetch_raw_ohlcv` but cannot supply adjustment factors"
+#: (either no `fetch_adjust_factors` at all, or `adjust_factor_source_available=False`).
 #: One warning per provider type, not per symbol: a 22-symbol universe would otherwise emit 22
 #: copies of the same operational fact.
 _FACTOR_CAPABILITY_GAP_WARNED: set = set()
@@ -724,23 +743,32 @@ def _provider_native_basis(provider: BaseDataProvider) -> Optional[str]:
 def _warn_factor_capability_gap(provider_name: str, symbol: str) -> None:
     """Explain the legacy fallback taken for a provider that cannot supply adjustment factors.
 
+    Two causes reach here, and the wording has to cover both:
+      * the provider has no `fetch_adjust_factors` method at all (e.g. `EastMoneyDataProvider`);
+      * the provider has the method but declares
+        `adjust_factor_source_available=False`, meaning its factor source is unreachable right now
+        -- `FuyaoDataProvider` does exactly that when no local market.duckdb could be opened.
+
     M3.6 review F3: this used to be a `MissingAdjustFactorsError` raised on every cache miss for
-    `FuyaoDataProvider` / `EastMoneyDataProvider` (they have `fetch_raw_ohlcv` but no
-    `fetch_adjust_factors`), which `fetch_universe`'s generic handler downgraded to
-    `warnings.warn` + skip -- i.e. a silently SMALLER universe, not a visible failure. The
-    fallback below is legitimate (their own `fetch_ohlcv` already applies their native basis), so
-    it is taken silently-except-once instead of raised.
+    providers with `fetch_raw_ohlcv` but no factor source, which `fetch_universe`'s generic handler
+    downgraded to `warnings.warn` + skip -- i.e. a silently SMALLER universe, not a visible
+    failure. The fallback below is legitimate (their own `fetch_ohlcv` already applies their native
+    basis), so it is taken silently-except-once instead of raised. The capability flag must NOT be
+    abused to swallow a genuine data failure: a provider that says it HAS a source but returns an
+    empty factor table still raises (`MissingAdjustFactorsError`).
     """
     if provider_name in _FACTOR_CAPABILITY_GAP_WARNED:
         return
     _FACTOR_CAPABILITY_GAP_WARNED.add(provider_name)
     warnings.warn(
-        f"{provider_name} exposes fetch_raw_ohlcv but no fetch_adjust_factors "
-        f"(first seen for {symbol!r}): falling back to its own fetch_ohlcv and recording the "
-        f"provider's native adjustment basis. No raw bars and no adjustment factors are stored, "
-        f"so NO read-time derivation happens for this provider -- the cached series keeps "
-        f"whatever basis the provider natively returns, and a request for another basis fails "
-        f"loudly instead of being silently rescaled."
+        f"{provider_name} exposes fetch_raw_ohlcv but cannot supply adjustment factors "
+        f"(first seen for {symbol!r}): either it has no fetch_adjust_factors() method, or it reports "
+        f"adjust_factor_source_available=False because its factor source is not reachable right now "
+        f"(FuyaoDataProvider does that when it has no local market.duckdb). Falling back to its own "
+        f"fetch_ohlcv and recording the provider's native adjustment basis. No raw bars and no "
+        f"adjustment factors are stored, so NO read-time derivation happens for this provider -- the "
+        f"cached series keeps whatever basis the provider natively returns, and a request for "
+        f"another basis fails loudly instead of being silently rescaled."
     )
 
 
@@ -905,14 +933,23 @@ class CachedDataProvider(BaseDataProvider):
         # Check if inner provider supports fetching raw unadjusted bars.
         #
         # M3.6 review F3: "has `fetch_raw_ohlcv`" is NOT the same capability as "can supply the
-        # factors that raw bars need to be re-based". `FuyaoDataProvider` and
-        # `EastMoneyDataProvider` have the former and not the latter, and the old code raised
-        # `MissingAdjustFactorsError` for them on EVERY miss -- an exception `fetch_universe`
-        # downgraded to a warn+skip, i.e. a silently SHRUNKEN universe. The capability gap is now
+        # factors that raw bars need to be re-based". A provider can lack the factor source in two
+        # ways -- no `fetch_adjust_factors` method at all (`EastMoneyDataProvider`), or the method
+        # exists but declares `adjust_factor_source_available=False` because its factor table is
+        # unreachable right now (`FuyaoDataProvider` without a local market.duckdb). The old code
+        # raised `MissingAdjustFactorsError` for both on EVERY miss -- an exception `fetch_universe`
+        # downgraded to a warn+skip, i.e. a silently SHRUNKEN universe (and, for Fuyao, it turned a
+        # working provider into a hard failure the moment it had no local DB). The capability gap is
         # handled where it belongs: fall back to the provider's own `fetch_ohlcv` (legacy direct
         # path), store the provider's native basis, write no raw bars and no factors, and say so
-        # once. A genuine upstream factor failure still raises (fail-closed).
+        # once. A genuine upstream factor failure from a provider that DOES have a source still
+        # raises (fail-closed) -- see `_EmptyFactorProviderL236`'s regression test.
         is_raw_inner = self.derive_mode == "auto" and hasattr(self.inner_provider, "fetch_raw_ohlcv")
+        # Capability, not introspection (M3.8): `adjust_factor_source_available` defaults to True, so
+        # providers that really do read a factor table keep the fail-closed behaviour above.
+        has_factor_source = hasattr(
+            self.inner_provider, "fetch_adjust_factors"
+        ) and bool(getattr(self.inner_provider, "adjust_factor_source_available", True))
         req_mode = canonicalize_adjust_mode(adjust)
 
         if is_raw_inner:
@@ -920,7 +957,7 @@ class CachedDataProvider(BaseDataProvider):
             # If storing raw bars, fetch and store factors BEFORE storing bars.
             # Factor fetch errors are fail-closed: do NOT swallow exceptions.
             if not is_factor_neutral_symbol(symbol):
-                if hasattr(self.inner_provider, "fetch_adjust_factors"):
+                if has_factor_source:
                     factors = self.inner_provider.fetch_adjust_factors(symbol, start=start, end=end)
                     if factors is None or factors.empty:
                         raise MissingAdjustFactorsError(symbol)
@@ -938,8 +975,9 @@ class CachedDataProvider(BaseDataProvider):
                 except Exception:
                     df = self.inner_provider.fetch_raw_ohlcv(symbol, start, end, interval=interval)
         else:
-            # Inner provider cannot be re-based from raw (no `fetch_raw_ohlcv`, no
-            # `fetch_adjust_factors`, or `derive_mode="direct"`): fall back to legacy `fetch_ohlcv`
+            # Inner provider cannot be re-based from raw (no `fetch_raw_ohlcv`, no usable
+            # `fetch_adjust_factors` source (`adjust_factor_source_available=False`), or
+            # `derive_mode="direct"`): fall back to legacy `fetch_ohlcv`
             # and record the provider's native basis without deriving/storing adjustment factors.
             #
             # M3.6 review P1: `store_bars` now REFUSES an omitted basis, so this path must always

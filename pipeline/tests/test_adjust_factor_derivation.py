@@ -705,7 +705,7 @@ def test_f3_provider_capability_gap_falls_back_to_native_basis(tmp_path):
     inner = _GapCapabilityProviderL236()
     cached = CachedDataProvider(inner, cache_dir=str(cache_file))
 
-    with pytest.warns(UserWarning, match="exposes fetch_raw_ohlcv but no fetch_adjust_factors"):
+    with pytest.warns(UserWarning, match="exposes fetch_raw_ohlcv but cannot supply adjustment factors"):
         bars = cached.get_bars("600000.SH", "2024-01-01", "2024-01-04", adjust="qfq")
 
     # Served from the provider's own (native QFQ) series, NOT rescaled by a missing factor.
