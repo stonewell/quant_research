@@ -650,6 +650,36 @@ def refuse_production_cache_path(db_path: Any, read_only: bool = False) -> None:
             )
 
 
+#: Suffix every concrete `DataProvider` class carries (`FuyaoDataProvider`,
+#: `MarketDBDataProvider`, `BaoStockDataProvider`, `EastMoneyDataProvider`).
+#:
+#: WHY IT MATTERS (2026-10-27 incident, real live-deployment blocker): every writer keys
+#: `ohlcv_bars` by `type(self.inner_provider).__name__` (`common/data.py`), i.e. the CLASS NAME
+#: `FuyaoDataProvider`; every reader on the live-station side speaks the SHORT provider name
+#: (`fuyao`, from `settings.local.json` > `default_data_provider`). `query_bars` builds
+#: `WHERE provider = ?` from that short name, gets zero rows, returns an EMPTY frame
+#: (see `query_bars`: empty results return before `_resolve_read_basis`), and `compute_nav`
+#: then reports the holding as "no price at all" -> classified `stale_price`, i.e. "行情陈旧" --
+#: a completely wrong diagnosis for a cache that holds 680 clean bars for the symbol.
+#: That mismatch sent an operator looking at market data instead of at a provider string.
+_PROVIDER_KEY_SUFFIX = "dataprovider"
+
+
+def canonicalize_provider_key(name: Any) -> str:
+    """Case-folded, `DataProvider`-suffix-stripped form used to COMPARE provider keys.
+
+    `fuyao`, `Fuyao` and `FuyaoDataProvider` all canonicalise to `fuyao`. This is a
+    comparison key ONLY -- never a value to read bars with, because the cache's primary key
+    is the exact stored string (`selected_provider` etc. stay untouched). Collapsing the
+    suffix is deliberately narrow: it must not turn `MarketDBDataProvider` into anything
+    that also matches `FuyaoDataProvider`.
+    """
+    key = str(name).strip().lower()
+    if key.endswith(_PROVIDER_KEY_SUFFIX) and len(key) > len(_PROVIDER_KEY_SUFFIX):
+        key = key[: -len(_PROVIDER_KEY_SUFFIX)]
+    return key
+
+
 def is_synthetic_provider(provider_name_or_instance: Any) -> bool:
     """Returns True if the provider is a synthetic Brownian motion data generator.
     Synthetic data is generated on-the-fly and must always bypass the cache DB.
@@ -2840,6 +2870,135 @@ class DuckDBCache:
         return res_df
 
     get_intraday_bars = query_intraday_bars
+
+    # ------------------------------------------------------------------
+    # provider-key reconciliation (read path only; see `_PROVIDER_KEY_SUFFIX`)
+    # ------------------------------------------------------------------
+    def distinct_provider_keys(self) -> List[str]:
+        """Every provider key this cache has ever been written with, bars first.
+
+        `ohlcv_bars` is authoritative for reads; `asset_sync_metadata` is unioned in because a
+        key that only exists there is still the cache telling us "this upstream name was used
+        here", which is exactly what a resolution warning should report. A missing table (a
+        pre-migration cache) is skipped rather than fatal -- resolution is a best-effort
+        diagnostic, never a reason to fail a read.
+        """
+        con = self._get_connection(read_only=True)
+        try:
+            rows: List[Any] = []
+            for table in ("ohlcv_bars", "asset_sync_metadata"):
+                try:
+                    rows.extend(con.execute(f"SELECT DISTINCT provider FROM {table}").fetchall())
+                except Exception:
+                    continue
+        finally:
+            if not self.is_memory:
+                con.close()
+
+        keys: List[str] = []
+        for row in rows:
+            key = row[0] if row else None
+            if key is not None and str(key) not in keys:
+                keys.append(str(key))
+        return keys
+
+    def resolve_provider_key(self, provider: str) -> str:
+        """Map a caller's provider name onto the key the cache actually stores.
+
+        The defect this closes: `common/data.py` writes bars keyed by
+        `type(inner_provider).__name__` (`FuyaoDataProvider`), while the live station passes the
+        short name (`fuyao`). A `query_bars` against the short name returns an EMPTY frame
+        instead of raising (`query_bars` returns before `_resolve_read_basis` when the result is
+        empty), so the mismatch surfaces as `StalePriceError: no price at all` -- a staleness
+        diagnosis for a fully populated cache.
+
+        Resolution rules, in order:
+          1. EXACT stored key -> returned unchanged (no rewrite, no warning beyond an
+             ambiguity note). A key literally spelled `fuyao` is the most specific evidence
+             available and always wins.
+          2. Else exactly ONE stored key whose `canonicalize_provider_key` form matches ->
+             that key is returned.
+          3. Else (zero matches, or >= 2 matches) -> the ORIGINAL value is returned unchanged.
+
+        `query_bars` is deliberately NOT taught to do this internally: a silent fallback inside
+        the read path would also launder a genuine typo (`fuyoa`) into a successful read, and a
+        multi-match cache has no defensible answer to guess. Callers opt in, and every step is
+        logged at WARNING as `requested -> resolved` so the reconciliation is visible in the
+        live log (L2.18: a repair is never silent).
+
+        Synthetic providers short-circuit: their bars are generated on the fly and never
+        cached (`is_synthetic_provider`), so there is no stored key to reconcile and a
+        "no match" warning would be noise on every synthetic run.
+        """
+        if provider is None:
+            return provider
+        requested = str(provider)
+        if is_synthetic_provider(requested):
+            return requested
+
+        known = self.distinct_provider_keys()
+
+        if requested in known:
+            collisions = [
+                k
+                for k in known
+                if canonicalize_provider_key(k) == canonicalize_provider_key(requested)
+            ]
+            if len(collisions) > 1:
+                # Two distinct upstreams can share a canonical form (`fuyao` and
+                # `FuyaoDataProvider` hold DIFFERENT bytes). The caller named one of them
+                # exactly, so no substitution happens -- but the operator must know the cache
+                # is storing both, because the two rows sets will diverge (e.g. one symbol
+                # present under one key and absent under the other).
+                logger.warning(
+                    "DuckDBCache.resolve_provider_key: %r is stored exactly, but %d provider "
+                    "keys share its canonical form %r (%s); using the EXACT key %r and NOT "
+                    "guessing between them",
+                    requested,
+                    len(collisions),
+                    canonicalize_provider_key(requested),
+                    ", ".join(sorted(collisions)),
+                    requested,
+                )
+            return requested
+
+        target = canonicalize_provider_key(requested)
+        matches = [k for k in known if canonicalize_provider_key(k) == target]
+
+        if len(matches) == 1:
+            resolved = matches[0]
+            logger.warning(
+                "DuckDBCache.resolve_provider_key: requested provider %r has no stored bars; "
+                "resolved to the only canonical match %r (requested -> resolved). The cache is "
+                "keyed by provider CLASS NAME (`common/data.py` stores "
+                "`type(inner_provider).__name__`), while the CLI / settings.local.json use the "
+                "short name.",
+                requested,
+                resolved,
+            )
+            return resolved
+
+        if not matches:
+            logger.warning(
+                "DuckDBCache.resolve_provider_key: requested provider %r matches NO stored key "
+                "(stored: %s); keeping it as-is -- the read will return an empty frame. A typo "
+                "is NOT silently repaired here.",
+                requested,
+                ", ".join(sorted(known)) or "<cache has no provider keys>",
+            )
+            return requested
+
+        logger.warning(
+            "DuckDBCache.resolve_provider_key: requested provider %r is AMBIGUOUS -- %d stored "
+            "keys share its canonical form %r (%s); keeping %r as-is rather than guessing. Pass "
+            "one of the stored keys exactly.",
+            requested,
+            len(matches),
+            target,
+            ", ".join(sorted(matches)),
+            requested,
+        )
+        return requested
 
     def query_bars(
         self,

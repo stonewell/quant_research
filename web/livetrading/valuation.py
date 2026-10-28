@@ -80,6 +80,11 @@ compatible), so tests inject fakes and this module imports nothing heavy::
     query_adjust_factors(symbol, start=None, end=as_of)
     get_latest_factor_hfq(symbol)
 
+plus, when present, the OPTIONAL ``resolve_provider_key(provider) -> provider`` contract, used
+once per valuation to reconcile the station's short provider name (``fuyao``) with the key the
+cache stored (``FuyaoDataProvider``) -- see :func:`_resolve_cache_provider`. A cache without it
+is used exactly as before.
+
 ``adjust="raw"`` is passed EXPLICITLY: the real ``DuckDBCache.query_bars``
 defaults to ``adjust="qfq"``, and a qfq price multiplied by a back factor would
 double-apply the adjustment.  A cache that cannot honour ``adjust=`` is not
@@ -215,6 +220,47 @@ def _factor_series(factors: Any) -> Optional[pd.Series]:
     if not isinstance(s.index, pd.DatetimeIndex):
         s.index = pd.DatetimeIndex(pd.to_datetime(s.index))
     return s.sort_index()
+
+
+def _resolve_cache_provider(
+    cache,
+    provider: str,
+    warnings_list: List[str],
+) -> str:
+    """Reconcile the caller's provider name with the key the cache actually stores.
+
+    WHY (2026-10-27, real live blocker): every cache writer keys `ohlcv_bars` by the provider
+    CLASS NAME (`FuyaoDataProvider` -- `common/data.py` stores
+    `type(inner_provider).__name__`), while this engine is handed the station's SHORT name
+    (`fuyao`, from `storage.default_data_provider` / `settings.local.json`). The read then
+    matches zero rows, `_fetch_bars` returns ``None``, and `compute_nav` reports
+    `StalePriceError: no price at all ... provider=fuyao` -- i.e. "行情陈旧" for a symbol whose
+    bars are all present. That is the worst kind of misdiagnosis: it points the operator at
+    the market instead of at a string.
+
+    The reconciliation itself lives on the cache (`DuckDBCache.resolve_provider_key`), not here:
+    exact key first, else a UNIQUE case-insensitive / `DataProvider`-suffix-insensitive match;
+    zero matches or an ambiguous multi-match leave the requested key untouched and warn.
+
+    Duck-typed caches (the fakes in `test_portfolio_valuation`, and any older cache) simply do
+    not expose the method -> nothing is resolved and nothing is claimed in `warnings`.
+    """
+    resolver = getattr(cache, "resolve_provider_key", None)
+    if resolver is None:
+        return provider
+    try:
+        resolved = resolver(provider)
+    except Exception as exc:  # a resolution probe must never be the thing that breaks a NAV
+        warnings_list.append(
+            f"provider_key_unresolved: could not reconcile provider={provider} against the "
+            f"cache ({type(exc).__name__}: {exc}); reading with the requested name"
+        )
+        return provider
+
+    resolved = provider if resolved is None else str(resolved)
+    if resolved != provider:
+        warnings_list.append(f"provider_key_resolved: {provider} -> {resolved}")
+    return resolved
 
 
 def _fetch_bars(
@@ -385,7 +431,10 @@ def compute_nav(
         Natural-day window scanned for factor steps (alarm only).
     provider:
         Provider key for ``query_bars`` (the wire-in caller supplies it; default
-        ``"marketdb"`` matches the station's default chain).
+        ``"marketdb"`` matches the station's default chain). It is reconciled ONCE against
+        the keys the cache actually stores (``fuyao`` -> ``FuyaoDataProvider``) and a
+        ``provider_key_resolved: <requested> -> <resolved>`` warning is recorded; each
+        ``per_symbol`` entry carries the key that was really read as ``provider_key``.
 
     Raises
     ------
@@ -424,6 +473,11 @@ def compute_nav(
     stale_symbols: List[str] = []
     dividend_alarms: List[dict] = []
     per_symbol: Dict[str, dict] = {}
+
+    # One reconciliation per valuation, BEFORE any read: every `_fetch_bars` /
+    # `query_adjust_factors` call below must use the key the cache actually stores, or the
+    # whole book reads as "no price at all" (see `_resolve_cache_provider`).
+    provider = _resolve_cache_provider(cache, provider, warnings_list)
 
     scan_start = as_of_ts - pd.Timedelta(days=scan_days + _SCAN_PAD_DAYS)
 
@@ -467,6 +521,9 @@ def compute_nav(
                 "mark_date": None,
                 "factor_anchor_hfq": None,
                 "counted_as": "equity",
+                #: The cache key the read actually used (post `_resolve_cache_provider`):
+                #: `fuyao` in, `FuyaoDataProvider` audited here.
+                "provider_key": provider,
             }
             continue
 
@@ -623,6 +680,9 @@ def compute_nav(
             "mark_date": mark_iso,
             "factor_anchor_hfq": factor_anchor,
             "counted_as": "equity",
+            #: The cache key the read actually used (post `_resolve_cache_provider`); see the
+            #: zero-price branch above.
+            "provider_key": provider,
         }
 
     # ---------------------------- cash resolution ----------------------------
