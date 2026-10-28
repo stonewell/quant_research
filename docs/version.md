@@ -3417,3 +3417,78 @@ exit: 1
 - **`AGENTS.md` 第 7 条判定：不触发** —— `FastBacktestResult` 的直接基类只有 `dict`，它**不是**策略/模板类，不承载 `version`，也不受 `BASE_VERSION` 管辖；`be0b7a2` 中 `version` / `BASE_VERSION` **零变动**，`KERNEL_VERSION` 保持 **`0.1.0`**（与 `B6.2` 同口径：本类不在版本双轴范围内）。故**未运行 `--dump-strategies`**，`strategy_dumps/*.json` 逐字节未动，实盘票据的 `strategy_version` / `base_version` 亦不受影响。
 - **测试（实测，全离线）**：[`common/tests/test_allocation_backtester_fast.py`](file:///home/stone/Work/github/quant/common/tests/test_allocation_backtester_fast.py) 新增 3 条 —— `test_ior_with_unported_key_raises_and_is_atomic`（逐键 `|=` 必抛 + **探针直查原始存储证明零写入** + 混装载荷整批拒绝 + 合法键通过且 `out is res`）、`test_or_with_unported_key_raises_and_valid_key_preserves_type`（逐键 `|` 必抛、原对象不变、新对象仍是守卫类型且同样拒写、`res | [("k", 1)]` 抛 `TypeError`）、`test_fromkeys_still_rejects_unported_keys`。该文件 **29 → 32 passed**；同批复核 [`common/tests/test_live_dump_preflight.py`](file:///home/stone/Work/github/quant/common/tests/test_live_dump_preflight.py) **47 passed**（不变）。
 - **台账**：`B6.4` 由 `[ ]` 翻为 `[x]`，现役 **79 = 66 `[x]` + 13 `[ ]`**，两文件合计 **145 = 132 `[x]` + 13 `[ ]`**；评审衍生 3 项（`P1.9` / `P1.10` / `B6.4`）**全部闭环**，Track P **10/10**、Track B **20/20**；`Tier P4` 维持清零，`Tier P5` 中的 Track B 项已闭环，仅余 Track S（7 项）/ Track W（5 项）孵化池。
+
+---
+
+## 21. L2.48: 生命周期状态机回测同源启用 (UPLSM Backtester Parity) (2026-10-27)
+
+### 21.1 事实与目标
+- **事实背景**：此前 `common/position_lifecycle.py` 的 UPLSM 状态机（开仓确认 `guard_latency_bars`、A股 T+1 锁仓 `min_holding_bars`、非对称冷却 `stop_cooldown_bars/normal_cooldown_bars`、硬止损与 ATR 吊灯止损快路径）仅在实盘执行（`scripts/run_live_strategy.py`）中驱动，回测引擎（`common/allocation_backtester.py` / `backtester/run_backtest.py`）完全旁路，导致实盘票据与回测换手/持仓周期口径失配。
+- **改动范围**：
+  1. `common/position_lifecycle.py`：新增 `resolve_position_lifecycle_config(params, args)` 与纯因果时序状态机驱动函数 `simulate_position_lifecycle(universe, target_weights, cfg, market, cash_proxy)`。严格遵循稀疏权重契约（Sparse Weights Contract）：仅在有真实买卖发生的活跃调仓日写出权重，平仓/已离场标的显式写入 `0.0`（彻底杜绝 `ffill()` 渗漏），非调仓日整行置全 `NaN`；支持 `cash_proxy` 自动停泊。支持中国 A 股 T+1 锁仓以及 -8% 硬止损/ATR 止损对锁仓的强制豁免快路径。
+  2. `common/allocation_backtester.py`：`run_allocation_backtest` 增设 `enable_position_lifecycle: bool = False`（签名层保持默认 False 确保独立调用方兼容）及 `lifecycle_config`；稀疏权重对齐后调用 `simulate_position_lifecycle` 过滤稀疏矩阵，结果字典透明透传 `lifecycle_records` 与 `position_lifecycle_enabled`。
+  3. `backtester/run_backtest.py`：CLI 增加 `--enable-position-lifecycle`（默认 True）与 `--no-position-lifecycle` / `--disable-position-lifecycle`（dest="enable_position_lifecycle", action="store_false"）；`run_standard` 与 `_evaluate_walkforward_fold` 默认启用 UPLSM；基准运行（`_run_baseline`）显式强制 `enable_position_lifecycle=False`；provenance / `run_manifest.json` 自动记录开关。
+  4. `pipeline/run_pipeline.py`：新增 `--no-position-lifecycle` 并透传至 Step 5（backtester）。
+  5. `pipeline/parity_harness.py`：新增 `verify_lifecycle_step_parity` 对比单步仿真与实盘执行决策。
+  6. `backtester/tests/test_position_lifecycle_backtest.py`：新增 8 个专注测试用例覆盖逃生门比特级一致性、开仓确认过滤脉冲假信号、T+1 锁仓与止损豁免、稀疏权重 0.0 与全 NaN 契约、现金代理停泊及对拍校验。
+- **版本轴判定**：改动完全限于 `backtester/`、`common/position_lifecycle.py`、`common/allocation_backtester.py`、`pipeline/run_pipeline.py`、`pipeline/parity_harness.py`，未修改任何策略类或 `BaseBlendAllocationStrategy`，故不触发 `AGENTS.md` §7 版本递增，不重跑 `--dump-strategies`。
+- **验证结论**：`pytest common/tests/test_position_lifecycle.py`（41 passed）、`pytest common/tests/test_allocation_backtester.py`（28 passed）、`pytest backtester/tests/test_position_lifecycle_backtest.py`（8 passed）、`pytest pipeline/tests/test_parity_harness.py`（34 passed）共 111 个测试 100% 离线通过。
+
+---
+
+## 22. M3.6 & M3.8: 双轨 raw 不可变存储与内存向量化复权派生 (Dual-Track Raw Storage & Dynamic Factor Derivation) (2026-10-27)
+
+### 22.1 事实背景与痛点根因
+1. **复权历史重写与写保护门禁冲突 (`HistoryRewriteRefused`)**：
+   - 此前 DuckDB 缓存直接预存前复权（`qfq` / `adjustflag="2"`）或后复权（`hfq` / `adjustflag="1"`）价格。
+   - 当上市公司发生分红派息、送转增股时，上游数据源的前复权因子全历史重算，导致历史已入库 bar 价格发生微小或阶跃漂移；`common/duckdb_cache.py` 的数据写保护门禁识别到存量与新抓取行价格不一致，即刻触发 `HistoryRewriteRefused` 阻断写入。
+   - 传统解法依赖人工运行 `scripts/repair_qfq_alignment.py` 或清空重拉，带来了繁重的运维成本与数据失真风险。
+2. **多源多口径冗余与物理存储膨胀**：
+   - 生产环境中存在日线与 5m 分钟线的复权副本冗余（如 5m 曾同时以 BaoStock `adjustflag="2"` 与 EastMoney `adjust="qfq"` 存储 2 份完全重叠的 123 万行序列），磁盘开销膨胀两倍；且 `adjustflag` 混在数据维度中，无法从表内直接辨识单行数据真实复权属性。
+
+### 22.2 核心改动与工程实现 (M3.6 & M3.8)
+1. **DuckDB 底座 Schema 扩展与幂等迁移 (M3.6)**：
+   - `ohlcv_bars` 日线表与 `intraday_ohlcv_bars` 5m 表统一扩展 `amount DOUBLE`（成交额，可为空，严格区分 0.0 与未采集 NULL，杜绝用 volume × close 污染）与 `adjustflag VARCHAR`。
+   - `asset_sync_metadata` 与 `intraday_sync_metadata` 元数据表同步增加 `adjustflag VARCHAR` 列。
+   - 新增专用复权因子表 `adjust_factors`：
+     ```sql
+     CREATE TABLE IF NOT EXISTS adjust_factors (
+         symbol VARCHAR NOT NULL,
+         date DATE NOT NULL,
+         factor_hfq DOUBLE NOT NULL,
+         source VARCHAR,
+         last_sync_time TIMESTAMP NOT NULL,
+         PRIMARY KEY (symbol, date)
+     );
+     CREATE INDEX IF NOT EXISTS idx_adjust_factors_lookup ON adjust_factors(symbol, date);
+     ```
+   - 在 `DuckDBCache._apply_migrations` 中加入幂等 `_ensure_column`，保证既有生产数据库零停机平滑升级。
+2. **存储与计算维度彻底解耦：双轨不可变存储 (Dual-Track Raw Storage)**：
+   - 日线与 5 分钟线数据入库遵循**「只存 Raw 不可变数据」**原则（存储 `adjustflag='3'` 或 `none`）。
+   - 任何分红派息或拆细除权均不改变历史 raw 成交价，写入端不再发生历史价格被改写，**从数学上彻底根除 `HistoryRewriteRefused` 门禁冲突**。
+3. **读时内存向量化动态派生 QFQ/HFQ (In-Memory Vectorized Derivation)**：
+   - 在 `DuckDBCache`（`query_bars`、`query_intraday_bars`、`get_bars`、`query_universe`、`query_intraday_universe`）与 `common/data.py`（`CachedDataProvider.get_bars`）中植入动态复权逻辑：
+     - 当调用方请求 `adjust="qfq"` 或 `adjust="hfq"` 时，引擎自动从 `adjust_factors` 表检索对应标的的因子序列；
+     - 采用 Pandas/NumPy 向量化对其应用因子缩放：价格列（`Open`, `High`, `Low`, `Close`）乘以对应复权因子；
+     - 对 5m 等日内高频分时，将因子按交易日广播映射至各根 bar，实现盘中与跨日统一派生。
+4. **量额不变性物理约束 (Volume & Amount Invariant Preservation)**：
+   - 严格遵循真实成交物理量守恒定律：`Volume`（成交股数）与 `Amount`（成交金额）在复权派生过程中**绝对不参与因子乘除，保持原始真实成交量额不变**。
+   - 彻底纠正了部分第三方数据源错误缩放 Volume 导致 VWAP 与筹码分布计算失真的缺陷。
+5. **因子自校准与 SDK 集成**：
+   - 在 `common/financial_api.py` 中实现 `calibrate_adjust_factors_from_closes(raw_close, qfq_close)`，支持利用 raw 与 qfq 收盘价比值自动反推出精确无偏的复权因子；
+   - `MarketDBDataProvider` 与 `BaoStockDataProvider` 提供 `fetch_adjust_factors` 接口，无缝支持稠密日频因子与事件因子的自动落库。
+
+### 22.3 精度验收与离线测试覆盖
+1. **相对误差硬门禁对账**：
+   - 派生 QFQ 价格与权威数据源直接提供的 QFQ 价格逐 bar 比对，严格满足：
+     $$\max \left( \frac{|P_{\text{derived}} - P_{\text{direct}}|}{P_{\text{direct}}} \right) \le 10^{-6}$$
+   - `Volume` 比对严格满足 `Volume_derived == Volume_raw == Volume_direct`；`Amount` 保持无缩放。
+2. **测试套件 100% 离线通过**：
+   - `pipeline/tests/test_adjust_factor_derivation.py`（9 个专项测试全部通过）：覆盖因子数学反推恢复、日线/5m 精度硬门禁验证、成交量与金额不变性、缺失因子智能前向填充与边界资产（511880/000300 因子 1.0）测试；
+   - `common/tests/test_duckdb_cache.py`（83 个测试全部通过）：覆盖新旧 schema 兼容性、幂等迁移、复权派生集成与读写契约。
+
+### 22.4 版本轴判定
+- 本项改动完全属于基础设施数据存储与查询派生层（`common/duckdb_cache.py`、`common/data.py`、`common/financial_api.py`），未修改任何策略类或 `BaseBlendAllocationStrategy` 的模型逻辑，不触碰策略信号与默认超参。
+- 依照 `AGENTS.md` 第 7 条规范，**不递增 `version` 或 `BASE_VERSION`，无需重新运行 `--dump-strategies`**。
+
+
