@@ -7,10 +7,11 @@ from dataclasses import dataclass
 import hashlib
 import importlib
 import importlib.util
+import logging
 import os
 import re
 import sys
-from typing import Dict, List, Optional, Type, Union
+from typing import Any, Dict, List, Optional, Sequence, Type, Union
 import warnings
 
 import numpy as np
@@ -19,14 +20,20 @@ import yfinance as yf
 
 from .universe import _parse_module_specifier
 from .duckdb_cache import (
+    AdjustBasisTransitionRefused,
     DuckDBCache,
     HistoryRewriteRefused,
     MissingAdjustFactorsError,
+    UnknownAdjustBasisError,
     canonicalize_adjust_mode,
     is_factor_neutral_symbol,
     is_synthetic_provider,
     is_intraday_interval,
+    parse_stored_basis,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -81,6 +88,25 @@ def _validate_symbol_for_path(symbol: str) -> None:
 class BaseDataProvider(ABC):
     """Abstract base class for all market data providers."""
 
+    #: The adjustment basis of the series `fetch_ohlcv` returns: `"raw"`, `"qfq"`, `"hfq"`, or
+    #: `None` when the provider cannot say. `CachedDataProvider` writes this label into the
+    #: cache's `adjustflag` metadata, and it is the only thing that decides whether a requested
+    #: qfq/hfq read is a pass-through or a derivation -- an unlabelled row cannot be either.
+    #:
+    #: Concrete providers override it when their own `fetch_ohlcv` applies (or does not apply) an
+    #: adjustment: `YFinanceDataProvider` downloads with `auto_adjust=True`, i.e. `qfq`.
+    native_adjust_basis: Optional[str] = None
+
+    #: Documented fallback for a provider that declares nothing. `CachedDataProvider`'s legacy
+    #: direct path (no `fetch_raw_ohlcv`, no `fetch_adjust_factors`) has to label what it stores,
+    #: and "no basis information at all" cannot be stored as an undeclared row any more (P1: such
+    #: a row fails closed on every read). `qfq` is the pre-M3.6 read default every consumer of this
+    #: cache already assumes, and it is FAIL-CLOSED for `raw`/`hfq` requests (a `ValueError`, never
+    #: a silent pass-through of possibly-wrong bytes). A provider whose series is not qfq must say
+    #: so -- either via `native_adjust_basis`, or by an operator declaration through
+    #: `scripts/migrate_adjust_basis.py --set-basis ... --force`.
+    ASSUMED_NATIVE_BASIS_WHEN_UNKNOWN = "qfq"
+
     @abstractmethod
     def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
         """Fetch OHLCV data for a single symbol. Must return DataFrame with DatetimeIndex
@@ -88,8 +114,15 @@ class BaseDataProvider(ABC):
         """
         pass
 
-    def fetch_universe(self, symbols: List[str], start: str, end: str, interval: str = "1d") -> Dict[str, pd.DataFrame]:
-        """Fetch OHLCV for each symbol in symbols list. Skips failing symbols with warnings."""
+    def fetch_universe(self, symbols: List[str], start: str, end: str, interval: str = "1d",
+                       columns: Optional[Any] = None) -> Dict[str, pd.DataFrame]:
+        """Fetch OHLCV for each symbol in symbols list. Skips failing symbols with warnings.
+
+        `columns` exists for interface parity with `CachedDataProvider.fetch_universe` (which
+        uses it to select the opt-in `Amount` column out of DuckDB). A raw provider has no column
+        projection layer -- its `fetch_ohlcv` returns whatever it returns -- so the argument is
+        accepted and ignored rather than raising, so that one caller can drive both.
+        """
         data = {}
         for symbol in symbols:
             try:
@@ -147,6 +180,10 @@ class BaseDataProvider(ABC):
 
 class YFinanceDataProvider(BaseDataProvider):
     """Data provider sourcing OHLCV and fund metadata from Yahoo Finance via yfinance."""
+
+    #: `yf.download(..., auto_adjust=True)` below applies both splits and dividends, i.e. the
+    #: series is back-adjusted: `qfq` in this codebase's vocabulary.
+    native_adjust_basis = "qfq"
 
     def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
         df = yf.download(symbol, start=start, end=end, interval=interval, auto_adjust=True, progress=False)
@@ -366,6 +403,11 @@ class YFinanceDataProvider(BaseDataProvider):
 
 class CSVFolderDataProvider(BaseDataProvider):
     """Data provider reading historical CSV files from a specified folder."""
+
+    #: The legacy CSV disk cache this reads was populated from `fetch_ohlcv` results, which every
+    #: consumer read with the default `adjust="qfq"`. Declaring it makes the label explicit and
+    #: keeps `raw`/`hfq` requests fail-closed rather than silently answered with qfq bytes.
+    native_adjust_basis = "qfq"
 
     def __init__(self, folder_path: str = "data"):
         self.folder_path = folder_path
@@ -647,6 +689,61 @@ def _drop_invalid_ohlcv_rows(df: pd.DataFrame, symbol: str = None) -> pd.DataFra
     return df
 
 
+#: Providers already reported as "has `fetch_raw_ohlcv` but no `fetch_adjust_factors`".
+#: One warning per provider type, not per symbol: a 22-symbol universe would otherwise emit 22
+#: copies of the same operational fact.
+_FACTOR_CAPABILITY_GAP_WARNED: set = set()
+
+#: Providers already reported as "declares no adjustment basis, so `qfq` was assumed".
+#: Same once-per-provider policy as `_FACTOR_CAPABILITY_GAP_WARNED`.
+_ASSUMED_BASIS_WARNED: set = set()
+
+
+def _provider_native_basis(provider: BaseDataProvider) -> Optional[str]:
+    """Best declared answer to "which adjustment basis does `fetch_ohlcv` return?".
+
+    Order: the explicit `native_adjust_basis` attribute, then the legacy per-provider knobs this
+    repo already used (`adjustflag` on BaoStock, `adjust` on EastMoney/Fuyao/MarketDB, `fqt` on
+    Tushare-style providers). Returns `None` when the provider declares nothing -- callers must
+    then decide (the legacy cache path assumes `qfq`, see
+    `BaseDataProvider.ASSUMED_NATIVE_BASIS_WHEN_UNKNOWN`; `rebase_corporate_action` does the same
+    and says so).
+    """
+    for attr in ("native_adjust_basis", "adjustflag", "adjust", "fqt"):
+        raw = getattr(provider, attr, None)
+        if raw is None:
+            continue
+        try:
+            return canonicalize_adjust_mode(raw)
+        except ValueError:
+            # An unrecognised knob value tells us nothing -- keep looking rather than guess.
+            continue
+    return None
+
+
+def _warn_factor_capability_gap(provider_name: str, symbol: str) -> None:
+    """Explain the legacy fallback taken for a provider that cannot supply adjustment factors.
+
+    M3.6 review F3: this used to be a `MissingAdjustFactorsError` raised on every cache miss for
+    `FuyaoDataProvider` / `EastMoneyDataProvider` (they have `fetch_raw_ohlcv` but no
+    `fetch_adjust_factors`), which `fetch_universe`'s generic handler downgraded to
+    `warnings.warn` + skip -- i.e. a silently SMALLER universe, not a visible failure. The
+    fallback below is legitimate (their own `fetch_ohlcv` already applies their native basis), so
+    it is taken silently-except-once instead of raised.
+    """
+    if provider_name in _FACTOR_CAPABILITY_GAP_WARNED:
+        return
+    _FACTOR_CAPABILITY_GAP_WARNED.add(provider_name)
+    warnings.warn(
+        f"{provider_name} exposes fetch_raw_ohlcv but no fetch_adjust_factors "
+        f"(first seen for {symbol!r}): falling back to its own fetch_ohlcv and recording the "
+        f"provider's native adjustment basis. No raw bars and no adjustment factors are stored, "
+        f"so NO read-time derivation happens for this provider -- the cached series keeps "
+        f"whatever basis the provider natively returns, and a request for another basis fails "
+        f"loudly instead of being silently rescaled."
+    )
+
+
 class CachedDataProvider(BaseDataProvider):
     """Wrapper provider that adds DuckDB disk caching around any inner BaseDataProvider.
 
@@ -657,7 +754,33 @@ class CachedDataProvider(BaseDataProvider):
     Synthetic data generators (SyntheticDataProvider) always bypass the cache.
     """
 
-    def __init__(self, inner_provider: BaseDataProvider, cache_dir: str):
+    def __init__(self, inner_provider: BaseDataProvider, cache_dir: str, derive_mode: str = "auto"):
+        """`derive_mode` (M3.6 review F4) is the runtime switch for in-cache derivation:
+
+          * `"auto"` (default) -- store raw bars + factors on a cache miss and derive the
+            requested `raw`/`qfq`/`hfq` on read. This is the normal path;
+          * `"direct"` -- never use `fetch_raw_ohlcv` and never write the `adjust_factors` table:
+            every miss falls through to the provider's own `fetch_ohlcv`, whose result is stored
+            with the provider's native basis. This is the emergency fallback for a suspected
+            factor-calibration defect: the cache keeps serving, but NOTHING is derived -- neither
+            on write nor on read. That second half used to be missing (the read path ignored
+            `derive_mode`, so a cache already holding raw bars + factors kept deriving and could
+            be rescaled by the suspected-wrong factor anyway); it is now enforced by
+            `_guard_direct_mode_derivation`, which raises `ValueError` for a `qfq`/`hfq` read of
+            stored raw bars instead of deriving them. Switching back to `"auto"` is safe only
+            after `AdjustBasisTransitionRefused` has been resolved for the affected symbols
+            (a `direct` write never stamps a basis onto already-stored undeclared rows).
+
+        The `derive_mode` is validated eagerly: a typo must not silently mean "auto".
+        """
+        mode = str(derive_mode if derive_mode is not None else "auto").strip().lower()
+        if mode not in ("auto", "direct"):
+            raise ValueError(
+                f"CachedDataProvider(derive_mode={derive_mode!r}) is not supported: expected "
+                f"'auto' (store raw + derive on read) or 'direct' (legacy pass-through, no factor "
+                f"derivation)."
+            )
+        self.derive_mode = mode
         self.inner_provider = inner_provider
         self.cache_dir = cache_dir
         self.is_synthetic = is_synthetic_provider(inner_provider)
@@ -665,6 +788,56 @@ class CachedDataProvider(BaseDataProvider):
             self.duckdb_cache = DuckDBCache(db_path=self.cache_dir)
         else:
             self.duckdb_cache = None
+
+    def _guard_direct_mode_derivation(
+        self, provider_name: str, symbol: str, interval: str, adjust: str
+    ) -> None:
+        """`derive_mode="direct"` must be honest on the READ path (M3.6 review P1/P2, item 2).
+
+        `direct` promises "nothing is derived in this cache". The first version only changed the
+        WRITE path (`is_raw_inner` was forced False), so a cache that already held raw bars plus
+        factors -- written while the provider was in `auto` -- kept deriving qfq/hfq on read. The
+        docstring's claim ("nothing new is derived, so no read can be rescaled by a wrong factor")
+        was therefore false for exactly the case it was written to cover, which is the whole point
+        of the emergency switch.
+
+        The guard refuses to serve a DERIVED series out of a stored `raw` row in `direct` mode:
+          * stored basis `raw` + requested `qfq`/`hfq` -> `ValueError` (the caller asked for
+            something this mode is telling it it cannot produce honestly);
+          * requested `raw`/`none` -> pass-through, always safe (no derivation was ever needed);
+          * stored basis declared `qfq`/`hfq` -> pass-through (already the requested series, and
+            `_resolve_read_basis` still refuses a declared-but-different basis);
+          * no declaration (`NULL` / sentinel) -> not this guard's business; `_resolve_read_basis`
+            keeps its own fail-closed `UnknownAdjustBasisError` / `allow_legacy_basis` contract;
+          * factor-neutral symbols -> exempt, `_apply_factors_to_df` is the identity for them.
+
+        Note `allow_legacy_basis` is deliberately NOT an escape hatch here: it exists for rows
+        whose basis was never recorded, and would return raw bytes to a qfq request -- i.e. the
+        silent wrong-basis read this blocker exists to prevent. Switch back to `derive_mode="auto"`
+        (after resolving whatever factor calibration triggered `direct`) to get adjusted series.
+        """
+        if self.derive_mode != "direct":
+            return
+        if is_factor_neutral_symbol(symbol):
+            return
+        req_mode = canonicalize_adjust_mode(adjust)
+        if req_mode not in ("qfq", "hfq"):
+            return
+        if is_intraday_interval(interval):
+            meta = self.duckdb_cache.get_intraday_metadata(provider_name, symbol, interval)
+        else:
+            meta = self.duckdb_cache.get_asset_metadata(provider_name, symbol)
+        stored_basis = parse_stored_basis(meta.get("adjustflag") if meta else None)
+        if stored_basis != "raw":
+            return
+        raise ValueError(
+            f"CachedDataProvider(derive_mode='direct') refuses to serve adjust='{req_mode}' for "
+            f"{symbol} ({provider_name}, interval={interval!r}): the cache holds RAW bars and "
+            f"direct mode has derivation switched off, so the only alternative would be to return "
+            f"unadjusted prices under an adjusted label (a percent-level error that looks like a "
+            f"valid series). Read it with `adjust='raw'`, or re-open the provider with "
+            f"derive_mode='auto' to derive the requested basis from the stored raw bars + factors."
+        )
 
     def get_bars(
         self,
@@ -674,10 +847,23 @@ class CachedDataProvider(BaseDataProvider):
         interval: str = "1d",
         adjust: str = "qfq",
         expected_last_session=None,
+        *,
+        columns: Optional[Union[str, Sequence[str]]] = None,
+        allow_legacy_basis: bool = False,
     ) -> pd.DataFrame:
         """Fetch bars, serving from DuckDB when covered and deriving adjust dynamically.
 
         When caching raw bars, stores raw bars and factors, deriving requested adjust on read.
+
+        `columns` / `allow_legacy_basis` are forwarded to `DuckDBCache.query_bars` unchanged, so
+        the cache's `columns=` contract (default: required OHLCV only, no `Amount`) and its
+        legacy-basis opt-in apply verbatim to every cached read here.
+
+        `derive_mode="direct"` (M3.6 review F4, corrected in the P1 pass) is enforced on the READ
+        path too: see `_guard_direct_mode_derivation`. Before the correction it only changed the
+        write path, so a cache that already held raw bars + factors kept deriving -- i.e. the
+        "no read can be rescaled by a wrong factor" claim was false for exactly the case it was
+        meant to cover.
         """
         _validate_symbol_for_path(symbol)
         if self.is_synthetic or not self.cache_dir or self.duckdb_cache is None:
@@ -701,15 +887,32 @@ class CachedDataProvider(BaseDataProvider):
             interval=interval,
             expected_last_session=expected_last_session,
         ):
+            self._guard_direct_mode_derivation(provider_name, symbol, interval, adjust)
             df = self.duckdb_cache.query_bars(
-                provider_name, symbol, start=start, end=end, interval=interval, adjust=adjust
+                provider_name,
+                symbol,
+                start=start,
+                end=end,
+                interval=interval,
+                adjust=adjust,
+                columns=columns,
+                allow_legacy_basis=allow_legacy_basis,
             )
             if not df.empty:
                 return df
 
         # 2. Re-query provider for missing range.
         # Check if inner provider supports fetching raw unadjusted bars.
-        is_raw_inner = hasattr(self.inner_provider, "fetch_raw_ohlcv")
+        #
+        # M3.6 review F3: "has `fetch_raw_ohlcv`" is NOT the same capability as "can supply the
+        # factors that raw bars need to be re-based". `FuyaoDataProvider` and
+        # `EastMoneyDataProvider` have the former and not the latter, and the old code raised
+        # `MissingAdjustFactorsError` for them on EVERY miss -- an exception `fetch_universe`
+        # downgraded to a warn+skip, i.e. a silently SHRUNKEN universe. The capability gap is now
+        # handled where it belongs: fall back to the provider's own `fetch_ohlcv` (legacy direct
+        # path), store the provider's native basis, write no raw bars and no factors, and say so
+        # once. A genuine upstream factor failure still raises (fail-closed).
+        is_raw_inner = self.derive_mode == "auto" and hasattr(self.inner_provider, "fetch_raw_ohlcv")
         req_mode = canonicalize_adjust_mode(adjust)
 
         if is_raw_inner:
@@ -723,8 +926,10 @@ class CachedDataProvider(BaseDataProvider):
                         raise MissingAdjustFactorsError(symbol)
                     self.duckdb_cache.store_adjust_factors(symbol, factors, source=provider_name)
                 else:
-                    raise MissingAdjustFactorsError(symbol)
+                    is_raw_inner = False
+                    _warn_factor_capability_gap(provider_name, symbol)
 
+        if is_raw_inner:
             if is_intraday_interval(interval):
                 df = self.inner_provider.fetch_raw_ohlcv(symbol, start, end, interval=interval)
             else:
@@ -733,21 +938,33 @@ class CachedDataProvider(BaseDataProvider):
                 except Exception:
                     df = self.inner_provider.fetch_raw_ohlcv(symbol, start, end, interval=interval)
         else:
-            # Inner provider does not have fetch_raw_ohlcv; fall back to legacy fetch_ohlcv
+            # Inner provider cannot be re-based from raw (no `fetch_raw_ohlcv`, no
+            # `fetch_adjust_factors`, or `derive_mode="direct"`): fall back to legacy `fetch_ohlcv`
             # and record the provider's native basis without deriving/storing adjustment factors.
-            native_basis = (
-                getattr(self.inner_provider, "adjustflag", None)
-                or getattr(self.inner_provider, "adjust", None)
-                or getattr(self.inner_provider, "fqt", None)
-                or None
-            )
-            if native_basis is not None:
-                try:
-                    stored_basis = canonicalize_adjust_mode(native_basis)
-                except ValueError:
-                    stored_basis = None
-            else:
-                stored_basis = None
+            #
+            # M3.6 review P1: `store_bars` now REFUSES an omitted basis, so this path must always
+            # declare one. `_provider_native_basis` answers for every provider that exposes a knob
+            # (`native_adjust_basis` / `adjustflag` / `adjust` / `fqt`); a provider that declares
+            # nothing gets the documented assumption (`ASSUMED_NATIVE_BASIS_WHEN_UNKNOWN`, `qfq`
+            # -- the pre-M3.6 read default), logged so it is not silent, and it stays FAIL-CLOSED
+            # for `raw`/`hfq` requests rather than answering them with possibly-wrong bytes.
+            native_basis = _provider_native_basis(self.inner_provider)
+            if native_basis is None:
+                native_basis = BaseDataProvider.ASSUMED_NATIVE_BASIS_WHEN_UNKNOWN
+                key = f"{provider_name}:assumed-basis"
+                if key not in _ASSUMED_BASIS_WARNED:
+                    _ASSUMED_BASIS_WARNED.add(key)
+                    logger.warning(
+                        "%s declares no adjustment basis (no native_adjust_basis/adjustflag/"
+                        "adjust/fqt) and supplies no raw bars+factors: caching its series as "
+                        "'%s'. Requests for another basis will fail closed. If the series is not "
+                        "%s, set `native_adjust_basis` on the provider or declare the truth with "
+                        "scripts/migrate_adjust_basis.py --set-basis ... --force.",
+                        provider_name,
+                        native_basis,
+                        native_basis,
+                    )
+            stored_basis = native_basis
 
             if is_intraday_interval(interval):
                 df = self.inner_provider.fetch_ohlcv(symbol, start, end, interval=interval)
@@ -779,9 +996,20 @@ class CachedDataProvider(BaseDataProvider):
             adjustflag=stored_basis,
         )
 
-        # 4. Return queried and properly resampled bars for requested range and interval
+        # 4. Return queried and properly resampled bars for requested range and interval.
+        # The direct-mode guard runs here too: the branch above may have re-fetched through
+        # `fetch_ohlcv`, but the symbol's metadata can still say `raw` (e.g. only part of the
+        # requested range was missing), and a derived read would then be dishonest.
+        self._guard_direct_mode_derivation(provider_name, symbol, interval, adjust)
         return self.duckdb_cache.query_bars(
-            provider_name, symbol, start=start, end=end, interval=interval, adjust=adjust
+            provider_name,
+            symbol,
+            start=start,
+            end=end,
+            interval=interval,
+            adjust=adjust,
+            columns=columns,
+            allow_legacy_basis=allow_legacy_basis,
         )
 
     def get_intraday_bars(
@@ -792,6 +1020,9 @@ class CachedDataProvider(BaseDataProvider):
         interval: str = "5m",
         adjustflag: str = "qfq",
         expected_last_session=None,
+        *,
+        columns: Optional[Union[str, Sequence[str]]] = None,
+        allow_legacy_basis: bool = False,
     ) -> pd.DataFrame:
         """Retrieves intraday OHLCV bars with dynamic adjustflag derivation."""
         return self.get_bars(
@@ -801,6 +1032,8 @@ class CachedDataProvider(BaseDataProvider):
             interval=interval,
             adjust=adjustflag,
             expected_last_session=expected_last_session,
+            columns=columns,
+            allow_legacy_basis=allow_legacy_basis,
         )
 
     def fetch_ohlcv(
@@ -811,6 +1044,9 @@ class CachedDataProvider(BaseDataProvider):
         interval: str = "1d",
         expected_last_session=None,
         adjust: str = "qfq",
+        *,
+        columns: Optional[Union[str, Sequence[str]]] = None,
+        allow_legacy_basis: bool = False,
     ) -> pd.DataFrame:
         """Fetch bars, serving from DuckDB when `is_range_covered` says the range is on disk.
 
@@ -828,6 +1064,8 @@ class CachedDataProvider(BaseDataProvider):
             interval=interval,
             adjust=adjust,
             expected_last_session=expected_last_session,
+            columns=columns,
+            allow_legacy_basis=allow_legacy_basis,
         )
 
     def fetch_universe(
@@ -838,6 +1076,9 @@ class CachedDataProvider(BaseDataProvider):
         interval: str = "1d",
         expected_last_session=None,
         adjust: str = "qfq",
+        *,
+        columns: Optional[Union[str, Sequence[str]]] = None,
+        allow_legacy_basis: bool = False,
     ) -> Dict[str, pd.DataFrame]:
         """Cache-backed multi-symbol fetch; a refused history rewrite is a HARD failure.
 
@@ -861,9 +1102,25 @@ class CachedDataProvider(BaseDataProvider):
         a deliberate, auditable act (`scripts/repair_qfq_alignment.py`, or an explicitly declared
         `store_bars(..., allow_history_rewrite=True, rewrite_reason=...)`), never a side effect
         of a routine batch run that silently continued.
+
+        M3.6 review F3/P2: the three OTHER basis-data exceptions are never warned-and-skipped,
+        and they are collected rather than raised on the first one --
+          * `MissingAdjustFactorsError` -- the provider cannot supply the factors its raw bars
+            need, so nothing about this symbol can be derived. Skipping it shrank the universe
+            silently (this is how `FuyaoDataProvider` / `EastMoneyDataProvider` used to disappear
+            from a run). The capability gap itself is now handled inside `get_bars` by falling
+            back to the legacy direct path, so what reaches here is a genuine upstream failure;
+          * `UnknownAdjustBasisError` -- stored bars whose basis was never recorded
+            (`scripts/migrate_adjust_basis.py`);
+          * `AdjustBasisTransitionRefused` -- a write tried to stamp a basis onto such rows.
+        All three mean "this cache cannot be trusted for this symbol", which is emphatically not
+        "this symbol is unavailable". Fail-closed, but AGGREGATED (M3.6 review P2): every affected
+        symbol is tried and reported in ONE `RuntimeError`, so a 22-symbol book with 6 bad rows
+        needs one run (and one fix list), not six sequential runs that each stop at the next bad
+        symbol. The first failure is chained as `__cause__`.
         """
         if self.is_synthetic or not self.cache_dir or self.duckdb_cache is None:
-            return super().fetch_universe(symbols, start, end, interval)
+            return super().fetch_universe(symbols, start, end, interval, columns=columns)
 
         provider_name = type(self.inner_provider).__name__
         covered_symbols = []
@@ -871,6 +1128,15 @@ class CachedDataProvider(BaseDataProvider):
         #: instead of being skipped (see docstring).
         refused: List[str] = []
         refusal_cause: Optional[HistoryRewriteRefused] = None
+        #: Basis-integrity failures: NEVER skipped (F3), but COLLECTED (P2) so one run reports the
+        #: whole fix list instead of just the first symbol.
+        basis_reports: List[str] = []
+        basis_cause: Optional[BaseException] = None
+        basis_failures = (
+            MissingAdjustFactorsError,
+            UnknownAdjustBasisError,
+            AdjustBasisTransitionRefused,
+        )
 
         for symbol in symbols:
             try:
@@ -893,6 +1159,15 @@ class CachedDataProvider(BaseDataProvider):
                         adjust=adjust,
                     )
                     covered_symbols.append(symbol)
+            except basis_failures as exc:
+                # ORDER MATTERS: checked BEFORE the generic branch. These used to be downgraded to
+                # a `warnings.warn` + skipped symbol, i.e. a smaller universe that downstream
+                # stages could not tell apart from a smaller list. Collect instead of raising on
+                # the first one (P2): the operator gets the full fix list from a single run.
+                basis_reports.append(f"{symbol}: {type(exc).__name__}: {exc}")
+                if basis_cause is None:
+                    basis_cause = exc
+                continue
             except Exception as exc:
                 # ORDER MATTERS: `HistoryRewriteRefused` subclasses `RuntimeError` -> `Exception`,
                 # so without the isinstance test first it would be downgraded to a skipped symbol
@@ -905,6 +1180,19 @@ class CachedDataProvider(BaseDataProvider):
                 # Unchanged legacy behaviour: an unrelated provider/symbol failure only warns and
                 # skips that symbol -- do not turn ordinary upstream flakiness into a hard error.
                 warnings.warn(f"Skipping {symbol}: {exc}")
+
+        if basis_reports:
+            raise RuntimeError(
+                f"fetch_universe aborted: {len(basis_reports)} of {len(symbols)} symbol(s) have "
+                "untrustworthy adjustment-basis state, so returning the symbols that succeeded "
+                "would silently shrink the universe (one run reports ALL of them, M3.6 review P2). "
+                "Failing -- " + " | ".join(basis_reports)
+                + ". Each one is either (a) a provider that cannot supply the factors its raw "
+                "bars need, (b) a cache row whose basis was never declared "
+                "(`python scripts/migrate_adjust_basis.py --dry-run` lists them; then "
+                "--set-basis raw|qfq|hfq), or (c) a write that tried to stamp a basis onto such "
+                "a row (declare the transition, or delete and re-fetch the symbol)."
+            ) from basis_cause
 
         if refused:
             raise RuntimeError(
@@ -919,6 +1207,13 @@ class CachedDataProvider(BaseDataProvider):
                 "re-running."
             ) from refusal_cause
 
+        # `derive_mode="direct"` honesty on the read path (item 2): a universe read must not
+        # derive qfq/hfq out of stored raw bars behind the caller's back. Checked for every
+        # covered symbol BEFORE the single `query_universe` call (which would raise the same
+        # error anyway, but only for the first symbol it happens to visit).
+        for symbol in covered_symbols:
+            self._guard_direct_mode_derivation(provider_name, symbol, interval, adjust)
+
         return self.duckdb_cache.query_universe(
             provider_name,
             covered_symbols,
@@ -926,6 +1221,8 @@ class CachedDataProvider(BaseDataProvider):
             end=end,
             interval=interval,
             adjust=adjust,
+            columns=columns,
+            allow_legacy_basis=allow_legacy_basis,
         )
 
     def rebase_corporate_action(
@@ -943,6 +1240,15 @@ class CachedDataProvider(BaseDataProvider):
         with `allow_history_rewrite=True` and an audit reason prefix.
         Routine `fetch_ohlcv` and `fetch_universe` strictly enforce `allow_history_rewrite=False`
         so unannounced historical overwrites fail loud.
+
+        M3.6 review P1: the rebase must DECLARE the basis of the bytes it writes. It fetches
+        through the inner provider's own `fetch_ohlcv`, so the truthful label is exactly that
+        provider's native basis (`_provider_native_basis`: `native_adjust_basis` / `adjustflag` /
+        `adjust` / `fqt`). A provider that declares nothing gets the documented assumption
+        `ASSUMED_NATIVE_BASIS_WHEN_UNKNOWN` (`qfq`, the pre-M3.6 read default) -- logged, and
+        still fail-closed for `raw`/`hfq` requests. `allow_undeclared_basis=True` is deliberately
+        NOT used here: this method exists to repair a known corporate action, so it always knows
+        enough to claim a basis, and an undeclared row would make its own return value unreadable.
         """
         if not reason or not isinstance(reason, str) or len(reason.strip()) < 10:
             raise ValueError(
@@ -974,6 +1280,20 @@ class CachedDataProvider(BaseDataProvider):
                 f"Data for {symbol} between {start} and {end} had rows, but every one was dropped as invalid OHLC."
             )
 
+        declared_basis = _provider_native_basis(self.inner_provider)
+        if declared_basis is None:
+            declared_basis = BaseDataProvider.ASSUMED_NATIVE_BASIS_WHEN_UNKNOWN
+            logger.warning(
+                "rebase_corporate_action(%s) for %s: %s declares no adjustment basis, so the "
+                "rebased bytes are recorded as '%s'. If the provider's series is not %s, correct "
+                "the label with scripts/migrate_adjust_basis.py --set-basis ... --force.",
+                symbol,
+                provider_name,
+                provider_name,
+                declared_basis,
+                declared_basis,
+            )
+
         self.duckdb_cache.store_bars(
             provider_name,
             symbol,
@@ -981,16 +1301,23 @@ class CachedDataProvider(BaseDataProvider):
             requested_start=start,
             requested_end=end,
             interval=interval,
+            adjustflag=declared_basis,
             allow_history_rewrite=True,
             rewrite_reason=f"[CORPORATE_ACTION_REBASE] {reason.strip()}",
         )
 
+        # Read back in the DECLARED basis, not in the default `qfq`: for a provider whose native
+        # series is `raw`, a `qfq` read would need factors that this path deliberately does not
+        # store (it never writes the `adjust_factors` table), so asking for qfq here would fail
+        # closed on a write that actually succeeded. Reading the basis we just declared is also
+        # what makes the returned frame equal to the bytes on disk.
         return self.duckdb_cache.query_bars(
             provider_name,
             symbol,
             start=start,
             end=end,
             interval=interval,
+            adjust=declared_basis,
         )
 
     def fetch_metadata(self, symbol: str) -> dict:
@@ -1139,7 +1466,8 @@ def load_ohlcv(symbol: str, start: str, end: str, interval: str = "1d", use_cach
 
 def load_universe(symbols: list, start: str, end: str, interval: str = "1d", use_cache: bool = True,
                   cache_dir: str = None, provider: Union[str, BaseDataProvider, None] = None,
-                  expected_last_session=None, **kwargs) -> dict:
+                  expected_last_session=None, columns: Optional[Union[str, Sequence[str]]] = "all",
+                  **kwargs) -> dict:
     """Load OHLCV for each symbol; skips (with a warning) any that fail.
     Maintains backward compatibility with original load_universe function signature.
     Cached historical data in DuckDB never expires.
@@ -1148,6 +1476,16 @@ def load_universe(symbols: list, start: str, end: str, interval: str = "1d", use
     session given, "covered" means the stored bars really reach that session (no 7-day
     tolerance, no "already synced today" short-circuit). It is `None` for every
     backtest/research caller and a real session for every live caller.
+
+    `columns` defaults to `"all"` (required OHLCV + `Amount`) -- NOT to the cache's own
+    `columns=None` default. Reason: this is the single loader every backtest goes through
+    (`common/cli_utils.load_universe_with_banner` -> here), and a universe frame is consumed
+    long after loading by code that cannot re-open the cache. `run_allocation_backtest`'s
+    `execution_price="next_vwap"` mode needs `VWAP`, or `Amount` + `Volume`, on EVERY symbol
+    (`common/allocation_backtester.py`, the `next_vwap` branch); with the narrower default that
+    mode became an unconditional `ValueError` for every cache-backed run. Requesting the extra
+    `Amount` here costs one nullable column and is all-NaN when the table has no money column,
+    which the price paths ignore. Pass `columns=None` for the strict OHLCV-only shape.
     """
     base_prov = get_data_provider(provider, **kwargs)
     cached = bool(use_cache and cache_dir)
@@ -1157,7 +1495,8 @@ def load_universe(symbols: list, start: str, end: str, interval: str = "1d", use
         prov = base_prov
     if cached:
         return prov.fetch_universe(
-            symbols, start, end, interval, expected_last_session=expected_last_session
+            symbols, start, end, interval, expected_last_session=expected_last_session,
+            columns=columns,
         )
     if expected_last_session is not None and not is_synthetic_provider(base_prov):
         warnings.warn(
@@ -1165,6 +1504,9 @@ def load_universe(symbols: list, start: str, end: str, interval: str = "1d", use
             "apply it to (use_cache/cache_dir is off): every bar comes straight from the provider. "
             "The freshness gate (common/freshness.py) still runs at the call site."
         )
+    # Raw providers have no column-projection layer (`BaseDataProvider.fetch_universe` accepts
+    # `columns` only for parity) and several of them override `fetch_universe` with the old
+    # 4-arg signature, so it is NOT forwarded on this branch.
     return prov.fetch_universe(symbols, start, end, interval)
 
 

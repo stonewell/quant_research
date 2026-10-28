@@ -26,6 +26,21 @@ from common.duckdb_cache import (
 )
 
 
+#: M3.6 review P1: `store_*_bars` now REFUSE an implicit adjustment basis. These fixtures seed
+#: synthetic 5m/daily frames for metadata-reconciliation and coverage tests, and every read here
+#: uses the historical default `qfq`, so the label is declared explicitly rather than omitted.
+#: Tests that care about the basis itself declare their own `adjustflag=` (see
+#: `_seed_daily_history`, which must be `raw`).
+def _store_bars(cache, provider, symbol, df, **kwargs):
+    kwargs.setdefault("adjustflag", "qfq")
+    return cache.store_bars(provider, symbol, df, **kwargs)
+
+
+def _store_intraday_bars(cache, provider, symbol, df, **kwargs):
+    kwargs.setdefault("adjustflag", "qfq")
+    return cache.store_intraday_bars(provider, symbol, df, **kwargs)
+
+
 def _generate_test_3day_5m_bars(start_date: str = "2026-10-14") -> pd.DataFrame:
     """Helper to generate exactly 3 days x 48 bars/day = 144 valid 5-minute bars."""
     days = pd.bdate_range(start_date, periods=3)
@@ -75,7 +90,7 @@ def test_duckdb_intraday_cache_dual_track_and_r4_r13(tmp_path):
     df_3days = _generate_test_3day_5m_bars("2026-10-14")
     assert len(df_3days) == 144
 
-    cache.store_bars("TestProvider", "AAPL", df_3days, interval="5m")
+    _store_bars(cache, "TestProvider", "AAPL", df_3days, interval="5m")
 
     # Verify coverage check
     assert cache.is_range_covered("TestProvider", "AAPL", start="2026-10-14", end="2026-10-16", interval="5m") is True
@@ -101,7 +116,7 @@ def test_duckdb_intraday_cache_dual_track_and_r4_r13(tmp_path):
 
     df_scaled = df_3days.copy()
     df_scaled[["Open", "High", "Low", "Close"]] *= 0.90
-    cache.store_intraday_bars("TestProvider", "AAPL", df_scaled, interval="5m")
+    _store_intraday_bars(cache, "TestProvider", "AAPL", df_scaled, interval="5m")
 
     meta_after = cache.get_intraday_metadata("TestProvider", "AAPL", "5m")
     assert meta_after is not None
@@ -1068,7 +1083,7 @@ def test_load_intraday_5m_universe_fallback_reads_cache_read_only_under_guard(tm
     # Seed the cache while the guard still considers tmp_path non-production.
     seed = DuckDBCache(str(db_file))
     bars = _generate_test_3day_5m_bars("2026-10-14")
-    seed.store_intraday_bars("BaoStockDataProvider", "AAA", bars, interval="5m")
+    _store_intraday_bars(seed, "BaoStockDataProvider", "AAA", bars, interval="5m")
 
     intraday_mod = _patch_5m_cache_candidates(monkeypatch, db_file)
 
@@ -1207,7 +1222,7 @@ def test_l2_7_intraday_metadata_cannot_claim_a_session_the_bars_do_not_reach():
     """
     cache = DuckDBCache(db_path=":memory:")
     provider, symbol = "FuyaoDataProvider", "600000.SH"
-    cache.store_intraday_bars(
+    _store_intraday_bars(cache, 
         provider, symbol, _intraday_5m_frame("2026-10-14", 3), interval="5m",
         sync_time=datetime.datetime(2026, 10, 16, 16, 0),
     )
@@ -1239,7 +1254,7 @@ def test_l2_7_intraday_expected_session_covered_when_ts_reaches_the_session():
     over-rejection loop that would re-fetch 5m data forever)."""
     cache = DuckDBCache(db_path=":memory:")
     provider, symbol = "FuyaoDataProvider", "600000.SH"
-    cache.store_intraday_bars(
+    _store_intraday_bars(cache, 
         provider, symbol, _intraday_5m_frame("2026-10-14", 3), interval="5m",
         sync_time=datetime.datetime(2026, 10, 16, 16, 0),
     )
@@ -1342,12 +1357,12 @@ def test_l2_14_intraday_later_window_does_not_downgrade_earliest_available_ts():
     """
     cache = _intraday_new_cache()
     provider, symbol = "BaoStockDataProvider", "600362.SH"
-    cache.store_intraday_bars(provider, symbol, _intraday_5m_frame("2022-01-04", 3), interval="5m")
+    _store_intraday_bars(cache, provider, symbol, _intraday_5m_frame("2022-01-04", 3), interval="5m")
     before = cache.get_intraday_metadata(provider, symbol, "5m")
     assert before["earliest_available_ts"].date() == datetime.date(2022, 1, 4)
     assert before["is_earliest_known"] is False
 
-    cache.store_intraday_bars(
+    _store_intraday_bars(cache, 
         provider, symbol, _intraday_5m_frame("2026-10-14", 3), interval="5m",
         requested_start="2026-10-14", requested_end="2026-10-16",
     )
@@ -1369,9 +1384,9 @@ def test_l2_14_requested_start_must_not_roll_the_earliest_boundary_forward():
     """
     cache = _intraday_new_cache()
     provider, symbol = "BaoStockDataProvider", "600036.SH"
-    cache.store_intraday_bars(provider, symbol, _intraday_5m_frame("2022-01-04", 3), interval="5m")
+    _store_intraday_bars(cache, provider, symbol, _intraday_5m_frame("2022-01-04", 3), interval="5m")
 
-    cache.store_intraday_bars(
+    _store_intraday_bars(cache, 
         provider, symbol, _intraday_5m_frame("2026-10-14", 3), interval="5m",
         requested_start="2020-01-01", requested_end="2026-10-16",
     )
@@ -1395,12 +1410,12 @@ def test_l2_14_metadata_row_missing_is_rebuilt_from_bars_not_from_the_window():
     """
     cache = _intraday_new_cache()
     provider, symbol = "BaoStockDataProvider", "601318.SH"
-    cache.store_intraday_bars(provider, symbol, _intraday_5m_frame("2022-01-04", 3), interval="5m")
-    cache.store_intraday_bars(provider, symbol, _intraday_5m_frame("2026-10-13", 4), interval="5m")
+    _store_intraday_bars(cache, provider, symbol, _intraday_5m_frame("2022-01-04", 3), interval="5m")
+    _store_intraday_bars(cache, provider, symbol, _intraday_5m_frame("2026-10-13", 4), interval="5m")
     _delete_intraday_metadata_row(cache, provider, symbol)
     assert cache.get_intraday_metadata(provider, symbol, "5m") is None
 
-    cache.store_intraday_bars(
+    _store_intraday_bars(cache, 
         provider, symbol, _intraday_5m_frame("2026-10-14", 1), interval="5m",
         requested_start="2026-10-14", requested_end="2026-10-14",
     )
@@ -1416,12 +1431,12 @@ def test_l2_14_earliest_later_than_the_oldest_stored_bar_is_restored_from_the_ba
     old `min(prior, frame)` merge (the lie survived forever); it is now clamped to `MIN(ts)`."""
     cache = _intraday_new_cache()
     provider, symbol = "BaoStockDataProvider", "601988.SH"
-    cache.store_intraday_bars(provider, symbol, _intraday_5m_frame("2022-01-04", 3), interval="5m")
+    _store_intraday_bars(cache, provider, symbol, _intraday_5m_frame("2022-01-04", 3), interval="5m")
     _force_intraday_metadata(
         cache, provider, symbol, earliest_available_ts=pd.Timestamp("2026-10-01 09:35:00")
     )
 
-    cache.store_intraday_bars(
+    _store_intraday_bars(cache, 
         provider, symbol, _intraday_5m_frame("2026-10-14", 2), interval="5m",
         requested_start="2026-10-14",
     )
@@ -1439,13 +1454,13 @@ def test_l2_14_is_earliest_known_is_sticky_true():
     """
     cache = _intraday_new_cache()
     provider, symbol = "BaoStockDataProvider", "600030.SH"
-    cache.store_intraday_bars(
+    _store_intraday_bars(cache, 
         provider, symbol, _intraday_5m_frame("2024-01-02", 3), interval="5m",
         requested_start="2020-01-01",
     )
     assert cache.get_intraday_metadata(provider, symbol, "5m")["is_earliest_known"] is True
 
-    cache.store_intraday_bars(
+    _store_intraday_bars(cache, 
         provider, symbol, _intraday_5m_frame("2026-10-14", 3), interval="5m",
         requested_start="2026-10-14",
     )
@@ -1487,12 +1502,12 @@ def test_l2_14_metadata_write_is_one_upsert_not_a_blind_replace():
     # must not disturb the stored probe bookkeeping.
     cache = _intraday_new_cache()
     provider, symbol = "BaoStockDataProvider", "600519.SH"
-    cache.store_intraday_bars(provider, symbol, _intraday_5m_frame("2026-10-14", 2), interval="5m")
+    _store_intraday_bars(cache, provider, symbol, _intraday_5m_frame("2026-10-14", 2), interval="5m")
     _force_intraday_metadata(
         cache, provider, symbol, probe_attempts=3, last_probe_result="exhausted"
     )
 
-    cache.store_intraday_bars(
+    _store_intraday_bars(cache, 
         provider, symbol, _intraday_5m_frame("2026-10-16", 1), interval="5m",
         requested_start="2026-10-16",
     )
@@ -1517,12 +1532,12 @@ def test_l2_14_intraday_metadata_upsert_is_idempotent():
     cache = _intraday_new_cache()
     provider, symbol = "BaoStockDataProvider", "601166.SH"
     frame = _intraday_5m_frame("2026-10-14", 3)
-    cache.store_intraday_bars(
+    _store_intraday_bars(cache, 
         provider, symbol, frame, interval="5m", requested_start="2026-10-14",
         sync_time=datetime.datetime(2026, 10, 16, 16, 0),
     )
     first = cache.get_intraday_metadata(provider, symbol, "5m")
-    cache.store_intraday_bars(
+    _store_intraday_bars(cache, 
         provider, symbol, frame, interval="5m", requested_start="2026-10-14",
         sync_time=datetime.datetime(2026, 10, 16, 17, 0),
     )
@@ -1610,6 +1625,15 @@ class _FakeSyncProvider:
         )
         return self.frame[mask].copy()
 
+    def fetch_raw_ohlcv(self, symbol, start, end, interval="1d"):
+        """F7: `patch_equity_daily_bars` now fetches RAW bars and labels them `adjustflag="raw"`.
+
+        Before the fix it called `fetch_ohlcv` on a natively-QFQ BaoStock provider and stored the
+        frame with no basis at all. A double that only implements `fetch_ohlcv` therefore no
+        longer describes the path under test -- and would silently look like "no new bars".
+        """
+        return self.fetch_ohlcv(symbol, start, end, interval=interval)
+
     def logout(self):
         pass
 
@@ -1630,7 +1654,16 @@ def _synthetic_daily_frame(start: str, end: str) -> pd.DataFrame:
 
 
 def _seed_daily_history(cache, provider: str, symbol: str, start: str, end: str) -> None:
-    cache.store_bars(provider, symbol, _synthetic_daily_frame(start, end), requested_start=start)
+    """Seeds a synthetic daily history, DECLARING its basis (`raw`).
+
+    The label matters since M3.6's F2 gate: `sync_indices_daily` / `patch_equity_daily_bars`
+    write `adjustflag="raw"`, and an undeclared seed (`adjustflag=None`) would make every later
+    legitimate write for the same symbol bounce off `AdjustBasisTransitionRefused`. The synthetic
+    frames are unadjusted, so `"raw"` is the truthful label.
+    """
+    cache.store_bars(
+        provider, symbol, _synthetic_daily_frame(start, end), requested_start=start, adjustflag="raw"
+    )
 
 
 def test_l2_15_single_symbol_index_sync_does_not_mark_other_namespaces_earliest_known(monkeypatch):
@@ -1714,7 +1747,10 @@ def test_l2_15_patch_branch_never_lets_a_front_truncated_window_move_the_boundar
         assert meta["latest_available_date"] == datetime.date(2026, 10, 26)
         assert meta["is_earliest_known"] is False
         # The qfq overlap alignment kept exactly one copy of the overlapping bars.
-        bar_count = len(cache.query_bars(prov, symbol))
+        # `adjust="raw"`: the seeded/patch bytes ARE raw and no factors are stored here, so the
+        # default `qfq` request would (correctly, since F1's fail-closed change) refuse to label
+        # them -- this assertion is about the ROW COUNT, not about prices.
+        bar_count = len(cache.query_bars(prov, symbol, adjust="raw"))
         assert bar_count == len(_synthetic_daily_frame("2016-01-04", "2026-10-26"))
 
 
@@ -1851,7 +1887,7 @@ def _truncate_intraday_session(cache, provider, symbol, interval, day: str, last
 
 
 def _stored_three_day_5m(cache, symbol, provider="FuyaoDataProvider"):
-    cache.store_intraday_bars(
+    _store_intraday_bars(cache, 
         provider, symbol, _intraday_5m_frame("2026-10-14", 3), interval="5m",
         sync_time=datetime.datetime(2026, 10, 16, 16, 0),
     )
@@ -1974,7 +2010,7 @@ def test_l2_26_close_time_comes_from_the_market_spec_not_a_literal():
 
     cache = DuckDBCache(db_path=":memory:")
     for symbol in ("600000.SH", "00700.HK", "AAPL"):
-        cache.store_intraday_bars(
+        _store_intraday_bars(cache, 
             provider, symbol, frame, interval="5m",
             sync_time=datetime.datetime(2026, 10, 16, 16, 0),
         )
@@ -1991,7 +2027,7 @@ def test_l2_26_close_time_comes_from_the_market_spec_not_a_literal():
     # A US session that really reaches 16:00 is covered (the rejection above is about the clock,
     # not a blanket tightening for non-China symbols).
     us_full = pd.date_range("2026-10-16 09:35:00", "2026-10-16 16:00:00", freq="5min")
-    cache.store_intraday_bars(
+    _store_intraday_bars(cache, 
         provider, "SPY",
         pd.DataFrame({"Open": [100.0] * len(us_full), "High": [101.0] * len(us_full),
                       "Low": [99.0] * len(us_full), "Close": [100.5] * len(us_full),
@@ -2073,7 +2109,7 @@ def _us_session_5m_frame(day: str, last_time: str) -> pd.DataFrame:
 
 
 def _store_us_session(cache, symbol: str, day: str, last_time: str, provider="FuyaoDataProvider"):
-    cache.store_intraday_bars(
+    _store_intraday_bars(cache, 
         provider, symbol, _us_session_5m_frame(day, last_time), interval="5m",
         sync_time=datetime.datetime.fromisoformat(f"{day} {last_time}:30"),
     )
@@ -2236,7 +2272,7 @@ def test_l2_27_hk_half_day_deadline_is_1155():
     cache = DuckDBCache(db_path=":memory:")
     hk_times = pd.date_range(f"{HK_HALF_DAY} 09:35:00", f"{HK_HALF_DAY} 12:00:00", freq="5min")
     n = len(hk_times)
-    cache.store_intraday_bars(
+    _store_intraday_bars(cache, 
         provider, "00700.HK",
         pd.DataFrame({"Open": [100.0] * n, "High": [101.0] * n, "Low": [99.0] * n,
                       "Close": [100.5] * n, "Volume": [10.0] * n}, index=hk_times),
@@ -2248,7 +2284,7 @@ def test_l2_27_hk_half_day_deadline_is_1155():
     ) is True, "an HK half-day session that ended at 12:00 must be covered"
 
     short = DuckDBCache(db_path=":memory:")
-    short.store_intraday_bars(
+    _store_intraday_bars(short, 
         provider, "00700.HK",
         pd.DataFrame({"Open": [100.0] * n, "High": [101.0] * n, "Low": [99.0] * n,
                       "Close": [100.5] * n, "Volume": [10.0] * n}, index=hk_times),

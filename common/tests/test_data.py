@@ -643,7 +643,9 @@ def test_cached_data_provider_refetches_when_cached_bars_stop_before_requested_e
         {"Open": [10.0] * 2, "High": [12.0] * 2, "Low": [9.0] * 2, "Close": [11.0] * 2, "Volume": [100.0] * 2},
         index=pd.bdate_range("2024-01-01", periods=2),
     )
-    cached_provider.duckdb_cache.store_bars("CountingProvider", "SPY", short_df)
+    cached_provider.duckdb_cache.store_bars(
+        "CountingProvider", "SPY", short_df, adjustflag="qfq"
+    )
 
     # Pre-fix this returned True (1-day gap <= 7-day tolerance + count(*) > 0) => stale served.
     assert cached_provider.duckdb_cache.is_range_covered(
@@ -674,7 +676,9 @@ def test_cached_data_provider_refetches_when_cache_falls_short_of_elapsed_end(te
         {"Open": [10.0] * 5, "High": [12.0] * 5, "Low": [9.0] * 5, "Close": [11.0] * 5, "Volume": [100.0] * 5},
         index=pd.bdate_range("2020-01-01", periods=5),
     )
-    cached_provider.duckdb_cache.store_bars("CountingProvider", "SPY", short_df)
+    cached_provider.duckdb_cache.store_bars(
+        "CountingProvider", "SPY", short_df, adjustflag="qfq"
+    )
 
     # 2024-01-01 has already elapsed; cache only has 2020-01-01 to 2020-01-07 -> re-fetches
     df = cached_provider.fetch_ohlcv("SPY", start="2020-01-01", end="2024-01-01")
@@ -705,7 +709,9 @@ def test_cached_data_provider_trusts_short_cache_when_end_still_in_the_future(te
         {"Open": [10.0] * len(short_dates), "High": [12.0] * len(short_dates), "Low": [9.0] * len(short_dates), "Close": [11.0] * len(short_dates), "Volume": [100.0] * len(short_dates)},
         index=short_dates,
     )
-    cached_provider.duckdb_cache.store_bars("CountingProvider", "SPY", short_df)
+    cached_provider.duckdb_cache.store_bars(
+        "CountingProvider", "SPY", short_df, adjustflag="qfq"
+    )
 
     # Querying far future end -> trusted as-is, 0 calls
     df = cached_provider.fetch_ohlcv("SPY", start=short_dates[0].strftime("%Y-%m-%d"), end=far_future_end)
@@ -1026,7 +1032,8 @@ def test_cached_data_provider_threads_expected_last_session_into_the_coverage_ga
             {"Open": [10.0] * 2, "High": [12.0] * 2, "Low": [9.0] * 2,
              "Close": [11.0] * 2, "Volume": [100.0] * 2},
             index=pd.bdate_range("2024-01-01", periods=2),
-        )
+        ),
+        adjustflag="qfq",
     )
 
     # Legacy/backtest shape: the requested end is on disk -> served from cache, no upstream call.
@@ -1250,7 +1257,7 @@ def test_rebase_corporate_action_cli_script(tmp_path, capsys):
         {"Open": 200.0, "High": 210.0, "Low": 190.0, "Close": 200.0, "Volume": 100},
         index=pd.bdate_range("2020-01-01", periods=5),
     )
-    cache.store_bars("DynamicSplitProvider", "SPLIT_TEST", old_df)
+    cache.store_bars("DynamicSplitProvider", "SPLIT_TEST", old_df, adjustflag="qfq")
 
     # 1. Test CLI Dry-Run
     dry_run_args = [

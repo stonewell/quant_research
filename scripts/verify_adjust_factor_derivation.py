@@ -143,7 +143,7 @@ def verify_symbol_derivation(
                 intraday_start,
                 end_date,
                 interval="5m",
-                adjust="qfq",
+                adjustflag="qfq",
             )
 
             common_idx_5m = derived_qfq_5m.index.intersection(direct_qfq_5m.index)

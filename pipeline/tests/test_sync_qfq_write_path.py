@@ -107,6 +107,9 @@ def production_cache_untouched():
 
 
 def _store(cache: DuckDBCache, df: pd.DataFrame, provider: str = PROVIDER, symbol: str = SYMBOL) -> None:
+    # M3.6 review P1: `store_bars` refuses an implicit basis now. These fixtures ARE qfq series
+    # (this whole module tests the qfq alignment/rewrite gate), so the label is declared rather
+    # than omitted; no assertion below depends on it being undeclared.
     cache.store_bars(
         provider=provider,
         symbol=symbol,
@@ -114,6 +117,7 @@ def _store(cache: DuckDBCache, df: pd.DataFrame, provider: str = PROVIDER, symbo
         requested_start=df.index.min().strftime("%Y-%m-%d"),
         requested_end=df.index.max().strftime("%Y-%m-%d"),
         interval="1d",
+        adjustflag="qfq",
     )
 
 
@@ -343,6 +347,7 @@ def test_plan_writes_only_rows_the_store_lacks(cache):
         requested_start=plan.requested_start("2023-12-20"),
         requested_end=continuous.index.max().strftime("%Y-%m-%d"),
         interval="1d",
+        adjustflag="qfq",
     )
     after = _stored(cache)
     assert len(after) == len(stored_before) + len(written)
@@ -379,6 +384,7 @@ def test_pre_history_block_is_inserted_without_touching_the_stored_span(cache):
         requested_start=plan.requested_start("2023-11-01"),
         requested_end="2023-11-14",
         interval="1d",
+        adjustflag="qfq",
     )
     after = _stored(cache)
     assert len(after) == len(before) + len(older)
@@ -404,6 +410,7 @@ def test_intraday_basis_change_is_refused_before_the_destructive_purge(cache):
         interval="5m",
         requested_start="2022-01-04",
         requested_end="2022-01-04",
+        adjustflag="qfq",
     )
     con = cache._get_connection(read_only=True)
     try:

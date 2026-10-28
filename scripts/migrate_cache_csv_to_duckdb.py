@@ -6,6 +6,10 @@ Key Features:
 - Automatically skips all synthetic data files (SyntheticDataProvider_*.csv).
 - Parses provider, symbol, interval, and date boundaries from filenames and file contents.
 - Bulk upserts bars into `ohlcv_bars` and populates `asset_sync_metadata`.
+- Records the migrated bars with `adjustflag="qfq"`: the legacy CSV disk cache was written by
+  `CachedDataProvider.get_bars`, whose read default (and only supported mode at the time) was
+  `qfq`. Declaring it keeps migrated symbols readable; re-label with
+  `scripts/migrate_adjust_basis.py --set-basis ... --force` if a particular file is actually raw.
 - Supports --dry-run (inspect without modifying database) and optional --remove-csvs.
 """
 
@@ -119,12 +123,22 @@ def migrate_csv_cache(
             migrated_files += 1
 
             if not dry_run and cache is not None:
+                # M3.6 review P1: `store_bars` REFUSES an omitted basis, and these bytes do have
+                # a known provenance: every legacy CSV in `<repo>/data` was written by the old
+                # CSV disk cache out of `CachedDataProvider.get_bars`, whose default request and
+                # only supported read mode was `adjust="qfq"`. So the honest label is `qfq` --
+                # declaring nothing (or the undeclared sentinel) would make every migrated symbol
+                # READ-FAIL until a human labelled it, which is the opposite of a migration.
+                # If one of these files is in fact raw/hfq, correct its label afterwards with
+                # `python scripts/migrate_adjust_basis.py --set-basis raw|hfq --provider ... \
+                #  --symbol ... --force`.
                 cache.store_bars(
                     provider=provider,
                     symbol=symbol,
                     df=df,
                     requested_start=req_start,
                     requested_end=req_end,
+                    adjustflag="qfq",
                 )
                 if remove_csvs:
                     files_to_remove.append(fpath)

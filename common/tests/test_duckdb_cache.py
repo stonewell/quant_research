@@ -7,6 +7,7 @@ import datetime
 import logging
 import os
 import sys
+import warnings
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO_ROOT not in sys.path:
@@ -18,9 +19,12 @@ import pandas as pd
 import pytest
 
 from common.duckdb_cache import (
+    AdjustBasisRequiredError,
+    AdjustBasisTransitionRefused,
     DuckDBCache,
     HistoryRewriteRefused,
     ProductionCachePathError,
+    UnknownAdjustBasisError,
     is_synthetic_provider,
     production_cache_guard_active,
     production_cache_roots,
@@ -29,6 +33,7 @@ from common.duckdb_cache import (
     is_intraday_interval,
     _get_resample_rule,
 )
+from common.data import BaseDataProvider
 from common.freshness import StalePriceError, latest_close
 import common.duckdb_cache as duckdb_cache_module
 
@@ -37,6 +42,23 @@ import common.duckdb_cache as duckdb_cache_module
 def mem_cache():
     """In-memory DuckDBCache instance for fast offline testing."""
     return DuckDBCache(db_path=":memory:")
+
+
+#: M3.6 review P1: `store_bars` / `store_intraday_bars` now REFUSE an implicit adjustment basis
+#: (`AdjustBasisRequiredError`), because an unlabelled row cannot be read back honestly -- see
+#: `common/duckdb_cache.py::AdjustBasisRequiredError`. The fixtures below seed synthetic OHLCV
+#: whose basis is irrelevant to what they assert (dates, metadata reconciliation, rewrite gates,
+#: range coverage), and every read in this module uses the historical default `adjust="qfq"`.
+#: These two helpers therefore declare that default explicitly instead of leaving the label out.
+#: Tests that assert on BASIS SEMANTICS still call `store_bars(..., adjustflag=...)` directly.
+def _store_bars(cache, provider, symbol, df, **kwargs):
+    kwargs.setdefault("adjustflag", "qfq")
+    return cache.store_bars(provider, symbol, df, **kwargs)
+
+
+def _store_intraday_bars(cache, provider, symbol, df, **kwargs):
+    kwargs.setdefault("adjustflag", "qfq")
+    return cache.store_intraday_bars(provider, symbol, df, **kwargs)
 
 
 def _make_sample_ohlcv(start: str, periods: int = 10, base_price: float = 100.0) -> pd.DataFrame:
@@ -77,7 +99,7 @@ def test_schema_and_primary_keys(mem_cache):
 def test_store_and_query_exact_and_sub_range(mem_cache):
     """Verifies storing bars and querying exact range and arbitrary sub-ranges."""
     df = _make_sample_ohlcv("2020-01-01", periods=10)
-    mem_cache.store_bars("TestProvider", "AAPL", df)
+    _store_bars(mem_cache, "TestProvider", "AAPL", df)
 
     # Exact range query
     retrieved = mem_cache.query_bars("TestProvider", "AAPL", start="2020-01-01", end="2020-01-14")
@@ -97,8 +119,8 @@ def test_multi_provider_isolation(mem_cache):
     df_yf = _make_sample_ohlcv("2020-01-01", periods=5, base_price=100.0)
     df_fuyao = _make_sample_ohlcv("2020-01-01", periods=5, base_price=200.0)
 
-    mem_cache.store_bars("YFinanceProvider", "SPY", df_yf)
-    mem_cache.store_bars("FuyaoProvider", "SPY", df_fuyao)
+    _store_bars(mem_cache, "YFinanceProvider", "SPY", df_yf)
+    _store_bars(mem_cache, "FuyaoProvider", "SPY", df_fuyao)
 
     q_yf = mem_cache.query_bars("YFinanceProvider", "SPY")
     q_fuyao = mem_cache.query_bars("FuyaoProvider", "SPY")
@@ -117,7 +139,7 @@ def test_earliest_available_date_avoids_requery(mem_cache):
     # Asset only has data starting from 2015-06-01
     df = _make_sample_ohlcv("2015-06-01", periods=10)
     # Requested start was 2000-01-01 (far earlier than 2015-06-01)
-    mem_cache.store_bars("YFinanceProvider", "NEW_IPO", df, requested_start="2000-01-01")
+    _store_bars(mem_cache, "YFinanceProvider", "NEW_IPO", df, requested_start="2000-01-01")
 
     meta = mem_cache.get_asset_metadata("YFinanceProvider", "NEW_IPO")
     assert meta is not None
@@ -139,7 +161,7 @@ def test_synthetic_data_skips_cache(mem_cache):
 
     df = _make_sample_ohlcv("2020-01-01", periods=5)
     # Storing synthetic data is a no-op
-    mem_cache.store_bars("SyntheticDataProvider", "SPY", df)
+    _store_bars(mem_cache, "SyntheticDataProvider", "SPY", df)
 
     meta = mem_cache.get_asset_metadata("SyntheticDataProvider", "SPY")
     assert meta is None
@@ -153,7 +175,7 @@ def test_resample_ohlcv_any_interval(mem_cache):
     """Verifies that daily bars stored in DuckDB can serve weekly (1wk) and monthly (1mo) intervals."""
     # 20 business days (~4 full weeks)
     df = _make_sample_ohlcv("2020-01-01", periods=20, base_price=100.0)
-    mem_cache.store_bars("TestProvider", "QQQ", df)
+    _store_bars(mem_cache, "TestProvider", "QQQ", df)
 
     # 1. Daily query
     daily = mem_cache.query_bars("TestProvider", "QQQ", interval="1d")
@@ -178,8 +200,8 @@ def test_batch_query_universe(mem_cache):
     df_a = _make_sample_ohlcv("2020-01-01", periods=5, base_price=50.0)
     df_b = _make_sample_ohlcv("2020-01-01", periods=5, base_price=150.0)
 
-    mem_cache.store_bars("BatchProvider", "SYM_A", df_a)
-    mem_cache.store_bars("BatchProvider", "SYM_B", df_b)
+    _store_bars(mem_cache, "BatchProvider", "SYM_A", df_a)
+    _store_bars(mem_cache, "BatchProvider", "SYM_B", df_b)
 
     uni = mem_cache.query_universe("BatchProvider", ["SYM_A", "SYM_B", "NON_EXISTENT"])
     assert "SYM_A" in uni
@@ -196,7 +218,7 @@ def test_file_based_cache_persistence(tmp_path):
     db_file = tmp_path / "test_cache.duckdb"
     cache1 = DuckDBCache(db_path=str(db_file))
     df = _make_sample_ohlcv("2020-01-01", periods=5)
-    cache1.store_bars("DiskProvider", "MSFT", df)
+    _store_bars(cache1, "DiskProvider", "MSFT", df)
 
     # Re-open with a new instance
     cache2 = DuckDBCache(db_path=str(db_file))
@@ -218,7 +240,7 @@ def test_is_range_covered_checks_last_sync_time_for_latest_data(mem_cache):
     yesterday_sync = datetime.datetime(2024, 1, 2, 16, 0)
     today_time = pd.Timestamp("2024-01-03 10:00:00")
 
-    mem_cache.store_bars("TestProvider", "AAPL", df, sync_time=yesterday_sync)
+    _store_bars(mem_cache, "TestProvider", "AAPL", df, sync_time=yesterday_sync)
 
     # 1. On today (2024-01-03), last sync was yesterday (2024-01-02), so cache is NOT covered
     assert mem_cache.is_range_covered("TestProvider", "AAPL", start="2024-01-01", end=None, now=today_time) is False
@@ -228,13 +250,13 @@ def test_is_range_covered_checks_last_sync_time_for_latest_data(mem_cache):
     #    2024-01-02, i.e. the sync ran before upstream published today's bar -> must re-fetch.
     #    (This is exactly the 2026-10-22 incident: fresh metadata, bars one day short.)
     today_sync = datetime.datetime(2024, 1, 3, 15, 30)
-    mem_cache.store_bars("TestProvider", "AAPL", df, sync_time=today_sync)
+    _store_bars(mem_cache, "TestProvider", "AAPL", df, sync_time=today_sync)
     assert mem_cache.is_range_covered("TestProvider", "AAPL", start="2024-01-01", end=None, now=today_time) is False
     assert mem_cache.is_range_covered("TestProvider", "AAPL", start="2024-01-01", end="2024-01-03", now=today_time) is False
 
     # 3. Once a bar for 2024-01-03 actually lands, the same-day fast path applies again
     df_with_today = _make_sample_ohlcv("2024-01-01", periods=3)  # 2024-01-01 .. 2024-01-03
-    mem_cache.store_bars("TestProvider", "AAPL", df_with_today, sync_time=today_sync)
+    _store_bars(mem_cache, "TestProvider", "AAPL", df_with_today, sync_time=today_sync)
     assert mem_cache.is_range_covered("TestProvider", "AAPL", start="2024-01-01", end=None, now=today_time) is True
     assert mem_cache.is_range_covered("TestProvider", "AAPL", start="2024-01-01", end="2024-01-03", now=today_time) is True
 
@@ -266,7 +288,7 @@ def test_is_range_covered_false_when_metadata_claims_end_but_bars_stop_one_day_s
     ~0.70%, limit prices below the true market). The bar layer must reject it.
     """
     df = _make_sample_ohlcv("2026-10-19", periods=3)  # 10-19, 10-20, 10-21 (no 10-22 bar)
-    mem_cache.store_bars("IncidentProvider", "SPY", df, sync_time=datetime.datetime(2026, 10, 22, 10, 0))
+    _store_bars(mem_cache, "IncidentProvider", "SPY", df, sync_time=datetime.datetime(2026, 10, 22, 10, 0))
     _force_sync_metadata(
         mem_cache, "IncidentProvider", "SPY",
         latest_available_date=datetime.date(2026, 10, 22),
@@ -285,7 +307,7 @@ def test_is_range_covered_false_when_metadata_claims_end_but_bars_stop_one_day_s
 def test_is_range_covered_true_when_bars_reach_requested_end(mem_cache):
     """The same metadata state is covered once the bar for `req_end` actually exists."""
     df = _make_sample_ohlcv("2026-10-19", periods=4)  # includes the 2026-10-22 bar
-    mem_cache.store_bars("IncidentProvider", "SPY", df, sync_time=datetime.datetime(2026, 10, 22, 16, 0))
+    _store_bars(mem_cache, "IncidentProvider", "SPY", df, sync_time=datetime.datetime(2026, 10, 22, 16, 0))
 
     now = pd.Timestamp("2026-10-22 16:05:00")
     assert mem_cache.is_range_covered("IncidentProvider", "SPY", start="2026-10-19", end="2026-10-22", now=now) is True
@@ -295,7 +317,7 @@ def test_is_range_covered_true_when_bars_reach_requested_end(mem_cache):
 def test_is_range_covered_false_when_no_bars_stored(mem_cache):
     """Fresh metadata with an empty `ohlcv_bars` table must never report coverage."""
     df = _make_sample_ohlcv("2026-10-19", periods=4)
-    mem_cache.store_bars("IncidentProvider", "SPY", df, sync_time=datetime.datetime(2026, 10, 22, 16, 0))
+    _store_bars(mem_cache, "IncidentProvider", "SPY", df, sync_time=datetime.datetime(2026, 10, 22, 16, 0))
 
     con = mem_cache._get_connection(read_only=False)
     try:
@@ -313,7 +335,7 @@ def test_is_range_covered_true_on_weekend_when_bars_reach_friday(mem_cache):
     through Friday 2026-10-23 must count as covered (no exchange session on the Saturday).
     """
     df = _make_sample_ohlcv("2026-10-19", periods=5)  # Mon 10-19 .. Fri 10-23
-    mem_cache.store_bars("IncidentProvider", "SPY", df, sync_time=datetime.datetime(2026, 10, 24, 9, 0))
+    _store_bars(mem_cache, "IncidentProvider", "SPY", df, sync_time=datetime.datetime(2026, 10, 24, 9, 0))
 
     saturday = pd.Timestamp("2026-10-24 09:00:00")
     assert saturday.weekday() == 5
@@ -322,7 +344,7 @@ def test_is_range_covered_true_on_weekend_when_bars_reach_friday(mem_cache):
 
     # ...but a weekday request that is short is still uncovered, even inside the 7-day tolerance
     short_df = _make_sample_ohlcv("2026-10-19", periods=4)  # Mon 10-19 .. Thu 10-22
-    mem_cache.store_bars("IncidentProvider", "SHORT", short_df, sync_time=datetime.datetime(2026, 10, 24, 9, 0))
+    _store_bars(mem_cache, "IncidentProvider", "SHORT", short_df, sync_time=datetime.datetime(2026, 10, 24, 9, 0))
     assert mem_cache.is_range_covered("IncidentProvider", "SHORT", start="2026-10-19", end="2026-10-23", now=saturday) is False
 
 
@@ -333,13 +355,13 @@ def test_is_range_covered_is_per_symbol_not_per_provider(mem_cache):
     full_df = _make_sample_ohlcv("2026-10-19", periods=4)    # reaches 2026-10-22
     now = pd.Timestamp("2026-10-22 16:00:00")
 
-    mem_cache.store_bars("IncidentProvider", "SHORT", short_df, sync_time=datetime.datetime(2026, 10, 22, 10, 0))
+    _store_bars(mem_cache, "IncidentProvider", "SHORT", short_df, sync_time=datetime.datetime(2026, 10, 22, 10, 0))
     _force_sync_metadata(
         mem_cache, "IncidentProvider", "SHORT",
         latest_available_date=datetime.date(2026, 10, 22),
         sync_time=datetime.datetime(2026, 10, 22, 10, 0),
     )
-    mem_cache.store_bars("IncidentProvider", "FULL", full_df, sync_time=datetime.datetime(2026, 10, 22, 16, 0))
+    _store_bars(mem_cache, "IncidentProvider", "FULL", full_df, sync_time=datetime.datetime(2026, 10, 22, 16, 0))
 
     assert mem_cache.is_range_covered("IncidentProvider", "SHORT", start="2026-10-19", end="2026-10-22", now=now) is False
     assert mem_cache.is_range_covered("IncidentProvider", "FULL", start="2026-10-19", end="2026-10-22", now=now) is True
@@ -352,7 +374,7 @@ def test_is_range_covered_future_end_not_judged_by_bar_layer(mem_cache):
     """
     now = pd.Timestamp("2026-10-22 16:05:00")
     df = _make_sample_ohlcv("2026-10-19", periods=4)
-    mem_cache.store_bars("IncidentProvider", "SPY", df, sync_time=datetime.datetime(2026, 10, 22, 16, 0))
+    _store_bars(mem_cache, "IncidentProvider", "SPY", df, sync_time=datetime.datetime(2026, 10, 22, 16, 0))
 
     far_future_end = (now + pd.Timedelta(days=3650)).strftime("%Y-%m-%d")
     assert mem_cache.is_range_covered("IncidentProvider", "SPY", start="2026-10-19", end=far_future_end, now=now) is True
@@ -394,13 +416,13 @@ def test_store_bars_later_window_does_not_downgrade_earliest_available_date(mem_
     about 2017 and must not overwrite that knowledge.
     """
     provider, symbol = "FuyaoDataProvider", "600362.SH"
-    mem_cache.store_bars(provider, symbol, _make_daily_ohlcv("2017-01-18", "2017-02-28"))
+    _store_bars(mem_cache, provider, symbol, _make_daily_ohlcv("2017-01-18", "2017-02-28"))
     before = mem_cache.get_asset_metadata(provider, symbol)
     assert before["earliest_available_date"] == datetime.date(2017, 1, 18)
     assert before["is_earliest_known"] is False
 
     # The incident: a sync that starts at 2024-01-02 (requested_start == first returned bar)
-    mem_cache.store_bars(
+    _store_bars(mem_cache, 
         provider, symbol, _make_daily_ohlcv("2024-01-02", "2024-02-29"), requested_start="2024-01-02"
     )
 
@@ -417,12 +439,12 @@ def test_store_bars_is_earliest_known_is_sticky_true(mem_cache):
     """2026-10-22 REGRESSION (601728.SH): once `is_earliest_known` is True it must stay True even
     when a later sync writes a row that says False (only a human may reset it explicitly)."""
     provider, symbol = "FuyaoDataProvider", "601728.SH"
-    mem_cache.store_bars(
+    _store_bars(mem_cache, 
         provider, symbol, _make_daily_ohlcv("2024-01-02", "2024-01-31"), requested_start="2000-01-01"
     )
     assert mem_cache.get_asset_metadata(provider, symbol)["is_earliest_known"] is True
 
-    mem_cache.store_bars(provider, symbol, _make_daily_ohlcv("2024-02-01", "2024-02-29"), requested_start="2024-02-01")
+    _store_bars(mem_cache, provider, symbol, _make_daily_ohlcv("2024-02-01", "2024-02-29"), requested_start="2024-02-01")
     assert mem_cache.get_asset_metadata(provider, symbol)["is_earliest_known"] is True
 
 
@@ -430,10 +452,10 @@ def test_store_bars_stale_latest_window_does_not_roll_back_latest_available_date
     """A stale/regressed fetch (ending 2026-10-21 after 2026-10-22 was already recorded) must not
     move `latest_available_date` backwards -- MAX(existing, incoming), never greatest-latest-wins."""
     provider, symbol = "FuyaoDataProvider", "600900.SH"
-    mem_cache.store_bars(provider, symbol, _make_daily_ohlcv("2026-10-01", "2026-10-22"))
+    _store_bars(mem_cache, provider, symbol, _make_daily_ohlcv("2026-10-01", "2026-10-22"))
     assert mem_cache.get_asset_metadata(provider, symbol)["latest_available_date"] == datetime.date(2026, 10, 22)
 
-    mem_cache.store_bars(provider, symbol, _make_daily_ohlcv("2026-10-01", "2026-10-21"))
+    _store_bars(mem_cache, provider, symbol, _make_daily_ohlcv("2026-10-01", "2026-10-21"))
     assert mem_cache.get_asset_metadata(provider, symbol)["latest_available_date"] == datetime.date(2026, 10, 22)
 
 
@@ -441,10 +463,10 @@ def test_store_bars_earliest_can_still_improve_when_sync_reaches_further_back(me
     """MIN semantics must not freeze the field: a sync that genuinely reaches back to 2017 still
     moves an existing 2024 earliest date earlier."""
     provider, symbol = "FuyaoDataProvider", "600584.SH"
-    mem_cache.store_bars(provider, symbol, _make_daily_ohlcv("2024-01-02", "2024-01-31"))
+    _store_bars(mem_cache, provider, symbol, _make_daily_ohlcv("2024-01-02", "2024-01-31"))
     assert mem_cache.get_asset_metadata(provider, symbol)["earliest_available_date"] == datetime.date(2024, 1, 2)
 
-    mem_cache.store_bars(provider, symbol, _make_daily_ohlcv("2017-01-18", "2017-01-31"))
+    _store_bars(mem_cache, provider, symbol, _make_daily_ohlcv("2017-01-18", "2017-01-31"))
     assert mem_cache.get_asset_metadata(provider, symbol)["earliest_available_date"] == datetime.date(2017, 1, 18)
 
 
@@ -452,7 +474,7 @@ def test_store_bars_first_insert_records_incoming_values_verbatim(mem_cache):
     """With no existing row, the incoming window is recorded as-is (no MIN/MAX partner to compare
     against), including the `requested_start` earliest-known inference."""
     provider, symbol = "FuyaoDataProvider", "600660.SH"
-    mem_cache.store_bars(
+    _store_bars(mem_cache, 
         provider, symbol, _make_daily_ohlcv("2021-08-20", "2021-09-30"), requested_start="2021-08-20"
     )
 
@@ -467,10 +489,10 @@ def test_store_bars_metadata_upsert_is_idempotent(mem_cache):
     freely-overwritable `last_sync_time` may move)."""
     provider, symbol = "FuyaoDataProvider", "601872.SH"
     df = _make_daily_ohlcv("2020-11-30", "2021-02-26")
-    mem_cache.store_bars(provider, symbol, df, requested_start="2020-11-30", sync_time=datetime.datetime(2026, 10, 22, 19, 0))
+    _store_bars(mem_cache, provider, symbol, df, requested_start="2020-11-30", sync_time=datetime.datetime(2026, 10, 22, 19, 0))
     first = mem_cache.get_asset_metadata(provider, symbol)
 
-    mem_cache.store_bars(provider, symbol, df, requested_start="2020-11-30", sync_time=datetime.datetime(2026, 10, 22, 21, 34, 31))
+    _store_bars(mem_cache, provider, symbol, df, requested_start="2020-11-30", sync_time=datetime.datetime(2026, 10, 22, 21, 34, 31))
     second = mem_cache.get_asset_metadata(provider, symbol)
 
     assert second["earliest_available_date"] == first["earliest_available_date"]
@@ -659,7 +681,7 @@ def test_read_only_open_of_production_cache_is_allowed(tmp_path, monkeypatch):
     # tmp_path, never the real cache. Writability is then revoked for the assertion.
     monkeypatch.setenv(_ALLOW_ENV, "1")
     seed = DuckDBCache(db_path=str(db_file))
-    seed.store_bars("CacheGuardProvider", "AAPL", _make_sample_ohlcv("2020-01-01", periods=5))
+    _store_bars(seed, "CacheGuardProvider", "AAPL", _make_sample_ohlcv("2020-01-01", periods=5))
     monkeypatch.delenv(_ALLOW_ENV, raising=False)
 
     ro = DuckDBCache(db_path=str(db_file), read_only=True)
@@ -683,7 +705,7 @@ def test_escape_hatch_allows_writable_production_path(tmp_path, monkeypatch):
     monkeypatch.setenv(_ALLOW_ENV, "1")
 
     cache = DuckDBCache(db_path=str(db_file))
-    cache.store_bars("CacheGuardProvider", "AAPL", _make_sample_ohlcv("2020-01-01", periods=3))
+    _store_bars(cache, "CacheGuardProvider", "AAPL", _make_sample_ohlcv("2020-01-01", periods=3))
     assert db_file.exists()
     assert len(cache.query_bars("CacheGuardProvider", "AAPL")) == 3
 
@@ -701,7 +723,7 @@ def test_non_pytest_process_writable_open_behaviour_unchanged(tmp_path, monkeypa
     assert cache.db_path == str(db_file)
     assert cache.is_memory is False
     assert cache.read_only is False
-    cache.store_bars("CacheGuardProvider", "AAPL", _make_sample_ohlcv("2020-01-01", periods=4))
+    _store_bars(cache, "CacheGuardProvider", "AAPL", _make_sample_ohlcv("2020-01-01", periods=4))
     assert len(cache.query_bars("CacheGuardProvider", "AAPL")) == 4
 
     # Reopening the same file (the pre-existing persistence path) still works.
@@ -761,14 +783,14 @@ def test_missing_metadata_row_is_rebuilt_from_bar_facts_not_request_window(disk_
     """L2.18: after the row is deleted, the next sync must rebuild it from `ohlcv_bars`
     MIN/MAX -- NOT from the (much narrower) window that sync happened to request."""
     provider, symbol = "FuyaoDataProvider", "600362.SH"
-    disk_cache.store_bars(provider, symbol, _make_daily_ohlcv("2017-01-18", "2024-02-29"))
+    _store_bars(disk_cache, provider, symbol, _make_daily_ohlcv("2017-01-18", "2024-02-29"))
     assert disk_cache.get_asset_metadata(provider, symbol)["latest_available_date"] == datetime.date(2024, 2, 29)
 
     _delete_metadata_row(disk_cache, provider, symbol)
     assert disk_cache.get_asset_metadata(provider, symbol) is None  # the "exclusion" attempt
 
     # A single narrow-window sync (one month in the middle of the history) re-creates the row.
-    disk_cache.store_bars(
+    _store_bars(disk_cache, 
         provider,
         symbol,
         _make_daily_ohlcv("2021-03-01", "2021-03-31"),
@@ -795,7 +817,7 @@ def test_metadata_latest_newer_than_bars_is_clamped_to_bar_fact(disk_cache):
     stale-mark shape) is clamped DOWN to the bar fact -- not overwritten by the request window,
     and not preserved by `L2.6`'s monotone GREATEST (which only refuses to move backwards)."""
     provider, symbol = "IncidentProvider", "SPY"
-    disk_cache.store_bars(
+    _store_bars(disk_cache, 
         provider, symbol, _make_daily_ohlcv("2026-10-19", "2026-10-22"),
         sync_time=datetime.datetime(2026, 10, 22, 16, 0),
     )
@@ -803,7 +825,7 @@ def test_metadata_latest_newer_than_bars_is_clamped_to_bar_fact(disk_cache):
     assert disk_cache.get_asset_metadata(provider, symbol)["latest_available_date"] == datetime.date(2026, 10, 30)
 
     # A later sync whose own window ends *before* the newest stored bar.
-    disk_cache.store_bars(
+    _store_bars(disk_cache, 
         provider, symbol, _make_daily_ohlcv("2026-10-19", "2026-10-21"),
         requested_start="2026-10-19", requested_end="2026-10-21",
         sync_time=datetime.datetime(2026, 10, 23, 9, 0),
@@ -820,10 +842,10 @@ def test_metadata_earliest_older_than_bars_is_clamped_to_bar_fact(disk_cache):
     """L2.18: a row claiming history older than any stored bar is clamped to `MIN(date)`. It must
     not keep claiming a range the cache cannot serve, and must not adopt the request window."""
     provider, symbol = "FuyaoDataProvider", "600900.SH"
-    disk_cache.store_bars(provider, symbol, _make_daily_ohlcv("2017-01-18", "2017-02-28"))
+    _store_bars(disk_cache, provider, symbol, _make_daily_ohlcv("2017-01-18", "2017-02-28"))
     _force_metadata(disk_cache, provider, symbol, earliest_available_date=datetime.date(2010, 1, 1))
 
-    disk_cache.store_bars(
+    _store_bars(disk_cache, 
         provider, symbol, _make_daily_ohlcv("2024-01-02", "2024-01-31"), requested_start="2024-01-02"
     )
 
@@ -844,10 +866,10 @@ def test_metadata_earliest_later_than_bars_is_restored_from_bar_fact(disk_cache)
     on disk -- and whose triggering window did not supply that older bar -- is repaired from the
     bar table, and the repair is not a request-window write."""
     provider, symbol = "FuyaoDataProvider", "600584.SH"
-    disk_cache.store_bars(provider, symbol, _make_daily_ohlcv("2020-11-30", "2021-02-26"))
+    _store_bars(disk_cache, provider, symbol, _make_daily_ohlcv("2020-11-30", "2021-02-26"))
     _force_metadata(disk_cache, provider, symbol, earliest_available_date=datetime.date(2024, 1, 2))
 
-    disk_cache.store_bars(
+    _store_bars(disk_cache, 
         provider, symbol, _make_daily_ohlcv("2024-01-02", "2024-01-31"), requested_start="2024-01-02"
     )
 
@@ -862,11 +884,11 @@ def test_bar_fact_reconciliation_keeps_both_monotone_directions(disk_cache):
     (c) a stale/regressed fetch cannot roll `latest_available_date` backwards.
     """
     provider, symbol = "FuyaoDataProvider", "601988.SH"
-    disk_cache.store_bars(provider, symbol, _make_daily_ohlcv("2017-01-18", "2017-02-28"))
+    _store_bars(disk_cache, provider, symbol, _make_daily_ohlcv("2017-01-18", "2017-02-28"))
 
     # (a) row deleted, then a much later window syncs: the span must be the bar facts again
     _delete_metadata_row(disk_cache, provider, symbol)
-    disk_cache.store_bars(
+    _store_bars(disk_cache, 
         provider, symbol, _make_daily_ohlcv("2024-01-02", "2024-02-29"), requested_start="2024-01-02"
     )
     meta = disk_cache.get_asset_metadata(provider, symbol)
@@ -874,22 +896,22 @@ def test_bar_fact_reconciliation_keeps_both_monotone_directions(disk_cache):
     assert meta["latest_available_date"] == datetime.date(2024, 2, 29)
 
     # (b) an earlier backfill still moves the earliest boundary earlier
-    disk_cache.store_bars(provider, symbol, _make_daily_ohlcv("2015-01-05", "2015-01-30"))
+    _store_bars(disk_cache, provider, symbol, _make_daily_ohlcv("2015-01-05", "2015-01-30"))
     assert disk_cache.get_asset_metadata(provider, symbol)["earliest_available_date"] == datetime.date(2015, 1, 5)
 
     # (c) a stale fetch ending before the newest stored bar cannot roll latest backwards
-    disk_cache.store_bars(provider, symbol, _make_daily_ohlcv("2024-02-01", "2024-02-15"))
+    _store_bars(disk_cache, provider, symbol, _make_daily_ohlcv("2024-02-01", "2024-02-15"))
     assert disk_cache.get_asset_metadata(provider, symbol)["latest_available_date"] == datetime.date(2024, 2, 29)
 
 
 def test_metadata_self_heal_logs_a_warning(disk_cache, caplog):
     """L2.18: a repair must never be silent -- one WARNING per repaired contradiction."""
     provider, symbol = "FuyaoDataProvider", "600362.SH"
-    disk_cache.store_bars(provider, symbol, _make_daily_ohlcv("2017-01-18", "2024-02-29"))
+    _store_bars(disk_cache, provider, symbol, _make_daily_ohlcv("2017-01-18", "2024-02-29"))
     _delete_metadata_row(disk_cache, provider, symbol)
 
     with caplog.at_level(logging.WARNING, logger="common.duckdb_cache"):
-        disk_cache.store_bars(
+        _store_bars(disk_cache, 
             provider, symbol, _make_daily_ohlcv("2021-03-01", "2021-03-31"), requested_start="2021-03-01"
         )
 
@@ -904,9 +926,9 @@ def test_normal_sync_emits_no_self_heal_warning(disk_cache, caplog):
     """The healing path must be free of log noise: a plain two-window sync repairs nothing."""
     provider, symbol = "FuyaoDataProvider", "600030.SH"
     with caplog.at_level(logging.WARNING, logger="common.duckdb_cache"):
-        disk_cache.store_bars(provider, symbol, _make_daily_ohlcv("2024-01-02", "2024-01-31"))
-        disk_cache.store_bars(provider, symbol, _make_daily_ohlcv("2024-02-01", "2024-02-29"))
-        disk_cache.store_bars(
+        _store_bars(disk_cache, provider, symbol, _make_daily_ohlcv("2024-01-02", "2024-01-31"))
+        _store_bars(disk_cache, provider, symbol, _make_daily_ohlcv("2024-02-01", "2024-02-29"))
+        _store_bars(disk_cache, 
             provider, symbol, _make_daily_ohlcv("2024-01-02", "2024-01-31"), requested_start="2024-01-02"
         )
 
@@ -917,7 +939,7 @@ def test_is_range_covered_rejects_front_hole_before_the_next_sync(disk_cache):
     """L2.18 read-path guard: until `store_bars` repairs a lying start boundary, the freshness
     gate must not report a front hole as covered (same rule as the 2026-10-22 end-side fix)."""
     provider, symbol = "FuyaoDataProvider", "601398.SH"
-    disk_cache.store_bars(provider, symbol, _make_daily_ohlcv("2020-01-02", "2020-01-31"))
+    _store_bars(disk_cache, provider, symbol, _make_daily_ohlcv("2020-01-02", "2020-01-31"))
     _force_metadata(disk_cache, provider, symbol, earliest_available_date=datetime.date(2015, 1, 1))
 
     # Metadata "covers" 2016 -> but the oldest bar is 2020-01-02, so the range is a front hole.
@@ -1025,7 +1047,7 @@ def test_l2_2_schema_migration_is_idempotent_and_upgrades_an_old_db_in_place(tmp
     assert columns.count("expected_last_session") == 1, "the migration must not add a column twice"
 
     # The migrated cache is immediately usable by the new contract (and the old one).
-    reopened.store_bars("FuyaoDataProvider", "600362.SH", _make_daily_ohlcv("2018-01-02", "2026-10-21"))
+    _store_bars(reopened, "FuyaoDataProvider", "600362.SH", _make_daily_ohlcv("2018-01-02", "2026-10-21"))
     assert reopened.is_range_covered(
         "FuyaoDataProvider", "600362.SH",
         start="2018-01-02", end="2026-10-21", now=pd.Timestamp("2026-10-22 16:30:00"),
@@ -1048,12 +1070,12 @@ def test_case9_expected_last_session_catches_the_six_stale_symbols(disk_cache):
     """
     provider = "FuyaoDataProvider"
     for symbol in _STALE_SIX:
-        disk_cache.store_bars(
+        _store_bars(disk_cache, 
             provider, symbol, _make_daily_ohlcv("2026-10-19", "2026-10-21"),
             sync_time=datetime.datetime(2026, 10, 22, 10, 0),
         )
     for symbol in _FRESH_FOURTEEN:
-        disk_cache.store_bars(
+        _store_bars(disk_cache, 
             provider, symbol, _make_daily_ohlcv("2026-10-19", "2026-10-22"),
             sync_time=datetime.datetime(2026, 10, 22, 16, 0),
         )
@@ -1106,7 +1128,7 @@ def test_expected_last_session_abolishes_the_legacy_tolerance_and_sync_short_cir
     priced -- which is the only question the live path is asking.
     """
     provider = "IncidentProvider"
-    mem_cache.store_bars(
+    _store_bars(mem_cache, 
         provider, "SPY", _make_daily_ohlcv("2026-10-19", "2026-10-21"),
         sync_time=datetime.datetime(2026, 10, 22, 10, 0),
     )
@@ -1139,7 +1161,7 @@ def test_expected_last_session_accepts_a_weekend_padded_request_end(mem_cache):
     """A Saturday `end` with a Friday expectation stays covered (no pointless weekend refetch):
     the expectation is judged as a session, the request end still uses the Friday tolerance."""
     provider = "IncidentProvider"
-    mem_cache.store_bars(
+    _store_bars(mem_cache, 
         provider, "SPY", _make_daily_ohlcv("2026-10-19", "2026-10-23"),
         sync_time=datetime.datetime(2026, 10, 24, 9, 0),
     )
@@ -1158,7 +1180,7 @@ def test_expected_last_session_accepts_a_weekend_padded_request_end(mem_cache):
 def test_expected_last_session_rejects_an_unparseable_expectation(mem_cache):
     """An unparseable expectation is a caller bug and must fail loudly -- degrading to the
     never-raise legacy path would reintroduce exactly the silent staleness this gate removes."""
-    mem_cache.store_bars("IncidentProvider", "SPY", _make_daily_ohlcv("2026-10-19", "2026-10-22"))
+    _store_bars(mem_cache, "IncidentProvider", "SPY", _make_daily_ohlcv("2026-10-19", "2026-10-22"))
     with pytest.raises(ValueError, match="expected_last_session"):
         mem_cache.is_range_covered(
             "IncidentProvider", "SPY", start="2026-10-19", end="2026-10-22",
@@ -1219,32 +1241,32 @@ _CASE10_INTRADAY = [
 
 def _build_case10_daily_states(cache):
     provider = "FuyaoDataProvider"
-    cache.store_bars(provider, "FRESH", _make_daily_ohlcv("2026-10-19", "2026-10-22"),
+    _store_bars(cache, provider, "FRESH", _make_daily_ohlcv("2026-10-19", "2026-10-22"),
                      sync_time=datetime.datetime(2026, 10, 22, 16, 0))
-    cache.store_bars(provider, "STALE1", _make_daily_ohlcv("2026-10-19", "2026-10-21"),
+    _store_bars(cache, provider, "STALE1", _make_daily_ohlcv("2026-10-19", "2026-10-21"),
                      sync_time=datetime.datetime(2026, 10, 22, 10, 0))
     _force_metadata(cache, provider, "STALE1", latest_available_date=datetime.date(2026, 10, 22),
                     last_sync_time=datetime.datetime(2026, 10, 22, 10, 0))
-    cache.store_bars(provider, "PAST3", _make_daily_ohlcv("2026-10-12", "2026-10-16"),
+    _store_bars(cache, provider, "PAST3", _make_daily_ohlcv("2026-10-12", "2026-10-16"),
                      sync_time=datetime.datetime(2026, 10, 16, 16, 0))
-    cache.store_bars(provider, "PAST9", _make_daily_ohlcv("2026-10-01", "2026-10-05"),
+    _store_bars(cache, provider, "PAST9", _make_daily_ohlcv("2026-10-01", "2026-10-05"),
                      sync_time=datetime.datetime(2026, 10, 5, 16, 0))
-    cache.store_bars(provider, "WEEKEND", _make_daily_ohlcv("2026-10-19", "2026-10-23"),
+    _store_bars(cache, provider, "WEEKEND", _make_daily_ohlcv("2026-10-19", "2026-10-23"),
                      sync_time=datetime.datetime(2026, 10, 24, 9, 0))
-    cache.store_bars(provider, "FUTURE", _make_daily_ohlcv("2026-10-19", "2026-10-22"),
+    _store_bars(cache, provider, "FUTURE", _make_daily_ohlcv("2026-10-19", "2026-10-22"),
                      sync_time=datetime.datetime(2026, 10, 22, 16, 0))
-    cache.store_bars(provider, "HOLE", _make_daily_ohlcv("2020-01-02", "2020-01-31"))
+    _store_bars(cache, provider, "HOLE", _make_daily_ohlcv("2020-01-02", "2020-01-31"))
     _force_metadata(cache, provider, "HOLE", earliest_available_date=datetime.date(2015, 1, 1))
-    cache.store_bars(provider, "NOBARS", _make_daily_ohlcv("2026-10-19", "2026-10-22"))
+    _store_bars(cache, provider, "NOBARS", _make_daily_ohlcv("2026-10-19", "2026-10-22"))
     con = cache._get_connection(read_only=False)
     try:
         con.execute("DELETE FROM ohlcv_bars WHERE provider = ? AND symbol = ?", [provider, "NOBARS"])
     finally:
         if not cache.is_memory:
             con.close()
-    cache.store_bars(provider, "IPO", _make_daily_ohlcv("2015-06-01", "2015-06-12"),
+    _store_bars(cache, provider, "IPO", _make_daily_ohlcv("2015-06-01", "2015-06-12"),
                      requested_start="2000-01-01")
-    cache.store_bars(provider, "WEEKSHORT", _make_daily_ohlcv("2026-10-19", "2026-10-22"),
+    _store_bars(cache, provider, "WEEKSHORT", _make_daily_ohlcv("2026-10-19", "2026-10-22"),
                      sync_time=datetime.datetime(2026, 10, 24, 9, 0))
 
 
@@ -1277,9 +1299,9 @@ def _case10_intraday_bars(start_day: str, days: int) -> pd.DataFrame:
 
 def _build_case10_intraday_states(cache):
     provider = "FuyaoDataProvider"
-    cache.store_intraday_bars(provider, "5M_FULL", _case10_intraday_bars("2026-10-14", 3),
+    _store_intraday_bars(cache, provider, "5M_FULL", _case10_intraday_bars("2026-10-14", 3),
                               interval="5m", sync_time=datetime.datetime(2026, 10, 16, 16, 0))
-    cache.store_intraday_bars(provider, "5M_LIE", _case10_intraday_bars("2026-10-14", 2),
+    _store_intraday_bars(cache, provider, "5M_LIE", _case10_intraday_bars("2026-10-14", 2),
                               interval="5m", sync_time=datetime.datetime(2026, 10, 16, 16, 0))
     con = cache._get_connection(read_only=False)
     try:
@@ -1293,7 +1315,7 @@ def _build_case10_intraday_states(cache):
     finally:
         if not cache.is_memory:
             con.close()
-    cache.store_intraday_bars(provider, "5M_NOMETA", _case10_intraday_bars("2026-10-14", 3),
+    _store_intraday_bars(cache, provider, "5M_NOMETA", _case10_intraday_bars("2026-10-14", 3),
                               interval="5m")
     con = cache._get_connection(read_only=False)
     try:
@@ -1351,14 +1373,14 @@ def test_store_bars_refuses_material_history_rewrite(disk_cache):
     failed call, so a caught-and-continued caller cannot end up with a half-rewritten span.
     """
     df = _gate_frame()
-    disk_cache.store_bars("FuyaoDataProvider", "601225.SH", df)
+    _store_bars(disk_cache, "FuyaoDataProvider", "601225.SH", df)
     before = disk_cache.query_bars("FuyaoDataProvider", "601225.SH")
 
     rescaled = df.copy()
     rescaled["Close"] = rescaled["Close"] * 1.02
 
     with pytest.raises(HistoryRewriteRefused) as excinfo:
-        disk_cache.store_bars("FuyaoDataProvider", "601225.SH", rescaled)
+        _store_bars(disk_cache, "FuyaoDataProvider", "601225.SH", rescaled)
 
     message = str(excinfo.value)
     assert "5 stored row(s)" in message  # every row of the frame collides and differs
@@ -1372,10 +1394,10 @@ def test_store_bars_refuses_material_history_rewrite(disk_cache):
 def test_store_bars_allows_idempotent_overlap(disk_cache):
     """A refetch of the identical frame is a re-derivation of the same basis: allowed silently."""
     df = _gate_frame()
-    disk_cache.store_bars("FuyaoDataProvider", "601225.SH", df)
+    _store_bars(disk_cache, "FuyaoDataProvider", "601225.SH", df)
     before = disk_cache.query_bars("FuyaoDataProvider", "601225.SH")
 
-    disk_cache.store_bars("FuyaoDataProvider", "601225.SH", df)  # must not raise
+    _store_bars(disk_cache, "FuyaoDataProvider", "601225.SH", df)  # must not raise
 
     pd.testing.assert_frame_equal(
         disk_cache.query_bars("FuyaoDataProvider", "601225.SH"), before, check_exact=True
@@ -1389,11 +1411,11 @@ def test_store_bars_allows_ulp_level_rewobble(disk_cache):
     honest re-fetch of an overlapping window fail on double-rounding noise alone.
     """
     df = _gate_frame()
-    disk_cache.store_bars("FuyaoDataProvider", "601225.SH", df)
+    _store_bars(disk_cache, "FuyaoDataProvider", "601225.SH", df)
 
     wobbled = df.copy()
     wobbled["Close"] = wobbled["Close"] * (1 + 2e-16)
-    disk_cache.store_bars("FuyaoDataProvider", "601225.SH", wobbled)  # must not raise
+    _store_bars(disk_cache, "FuyaoDataProvider", "601225.SH", wobbled)  # must not raise
 
     stored = disk_cache.query_bars("FuyaoDataProvider", "601225.SH")
     assert len(stored) == len(df)
@@ -1403,10 +1425,10 @@ def test_store_bars_allows_ulp_level_rewobble(disk_cache):
 def test_store_bars_allows_pure_append(disk_cache):
     """New later dates only: no collision, no gate, row count grows -- the normal daily path."""
     df = _gate_frame(periods=5)
-    disk_cache.store_bars("FuyaoDataProvider", "601225.SH", df)
+    _store_bars(disk_cache, "FuyaoDataProvider", "601225.SH", df)
 
     tail = _gate_frame(periods=3, start="2020-01-08")
-    disk_cache.store_bars("FuyaoDataProvider", "601225.SH", tail)  # must not raise
+    _store_bars(disk_cache, "FuyaoDataProvider", "601225.SH", tail)  # must not raise
 
     stored = disk_cache.query_bars("FuyaoDataProvider", "601225.SH")
     assert len(stored) == 8
@@ -1417,12 +1439,12 @@ def test_store_bars_escape_hatch_allows_declared_rewrite(disk_cache, caplog):
     """A genuine, declared re-derivation may rewrite -- and must leave a WARNING trace with the
     caller's reason (the cache keeps no audit table, so the log is the only durable record)."""
     df = _gate_frame()
-    disk_cache.store_bars("FuyaoDataProvider", "601225.SH", df)
+    _store_bars(disk_cache, "FuyaoDataProvider", "601225.SH", df)
 
     rescaled = df.copy()
     rescaled["Close"] = rescaled["Close"] * 1.02
     with caplog.at_level(logging.WARNING, logger=duckdb_cache_module.__name__):
-        disk_cache.store_bars(
+        _store_bars(disk_cache, 
             "FuyaoDataProvider",
             "601225.SH",
             rescaled,
@@ -1448,7 +1470,7 @@ def test_store_bars_escape_hatch_requires_a_reason(disk_cache):
     `HistoryRewriteRefused`) because this is a caller error, not a cache-history verdict.
     """
     df = _gate_frame()
-    disk_cache.store_bars("FuyaoDataProvider", "601225.SH", df)
+    _store_bars(disk_cache, "FuyaoDataProvider", "601225.SH", df)
     before = disk_cache.query_bars("FuyaoDataProvider", "601225.SH")
 
     rescaled = df.copy()
@@ -1456,7 +1478,7 @@ def test_store_bars_escape_hatch_requires_a_reason(disk_cache):
 
     for missing_reason in (None, "", "   \t\n "):
         with pytest.raises(ValueError, match="requires a non-blank rewrite_reason"):
-            disk_cache.store_bars(
+            _store_bars(disk_cache, 
                 "FuyaoDataProvider",
                 "601225.SH",
                 rescaled,
@@ -1469,7 +1491,7 @@ def test_store_bars_escape_hatch_requires_a_reason(disk_cache):
     ), "the up-front guard must fire before anything is written"
 
     # The hatch is still open WITH a reason (the guard must not close it accidentally).
-    disk_cache.store_bars(
+    _store_bars(disk_cache, 
         "FuyaoDataProvider",
         "601225.SH",
         rescaled,
@@ -1492,14 +1514,14 @@ def test_store_bars_refuses_volume_only_history_rewrite(disk_cache):
     slipped through. Prices identical, one column moved 1e-3 -- refused, and nothing written.
     """
     df = _gate_frame()
-    disk_cache.store_bars("FuyaoDataProvider", "601225.SH", df)
+    _store_bars(disk_cache, "FuyaoDataProvider", "601225.SH", df)
     before = disk_cache.query_bars("FuyaoDataProvider", "601225.SH")
 
     volume_bumped = df.copy()
     volume_bumped["Volume"] = volume_bumped["Volume"] * 1.001
 
     with pytest.raises(HistoryRewriteRefused) as excinfo:
-        disk_cache.store_bars("FuyaoDataProvider", "601225.SH", volume_bumped)
+        _store_bars(disk_cache, "FuyaoDataProvider", "601225.SH", volume_bumped)
 
     message = str(excinfo.value)
     assert "601225.SH" in message
@@ -1535,14 +1557,14 @@ def test_store_bars_refuses_incoming_nan_and_schema_forbids_one_sided_null(disk_
         )
 
     df = _gate_frame()
-    disk_cache.store_bars("FuyaoDataProvider", "601225.SH", df)
+    _store_bars(disk_cache, "FuyaoDataProvider", "601225.SH", df)
     before = disk_cache.query_bars("FuyaoDataProvider", "601225.SH")
 
     with_nan = df.copy()
     with_nan.iloc[2, with_nan.columns.get_loc("Close")] = float("nan")
 
     with pytest.raises(HistoryRewriteRefused) as excinfo:
-        disk_cache.store_bars("FuyaoDataProvider", "601225.SH", with_nan)
+        _store_bars(disk_cache, "FuyaoDataProvider", "601225.SH", with_nan)
 
     message = str(excinfo.value)
     assert "1 stored row(s)" in message  # only the NaN date differs
@@ -1561,18 +1583,18 @@ def test_store_bars_tolerance_boundaries(disk_cache):
     comfortably inside each regime (0.5x and 2x the tolerance) and are bit-stable.
     """
     df = _gate_frame()
-    disk_cache.store_bars("FuyaoDataProvider", "601225.SH", df)
+    _store_bars(disk_cache, "FuyaoDataProvider", "601225.SH", df)
 
     below = df.copy()
     below["Close"] = below["Close"] * (1 + 5e-10)
-    disk_cache.store_bars("FuyaoDataProvider", "601225.SH", below)  # must not raise
+    _store_bars(disk_cache, "FuyaoDataProvider", "601225.SH", below)  # must not raise
     stored_below = disk_cache.query_bars("FuyaoDataProvider", "601225.SH")
     assert np.allclose(stored_below["Close"], below["Close"], rtol=0, atol=1e-12)
 
     above = df.copy()
     above["Close"] = above["Close"] * (1 + 2e-9)
     with pytest.raises(HistoryRewriteRefused) as excinfo:
-        disk_cache.store_bars("FuyaoDataProvider", "601225.SH", above)
+        _store_bars(disk_cache, "FuyaoDataProvider", "601225.SH", above)
 
     assert "close" in str(excinfo.value)
     # ...and the refused write left the *below*-tolerance state untouched.
@@ -1631,9 +1653,13 @@ def test_m36_amount_storage_and_unscaled(mem_cache):
     }, index=dates)
 
     mem_cache.store_bars("TestProv", "600000.SH", df_with_amt, adjustflag="raw")
-    res = mem_cache.query_bars("TestProv", "600000.SH", adjust="none")
+    # M3.6 `columns=` contract: `Amount` is opt-in now, so ask for it explicitly.
+    res = mem_cache.query_bars("TestProv", "600000.SH", adjust="none", columns="all")
     assert "Amount" in res.columns
     assert list(res["Amount"]) == [1000.0, 2200.0, 3600.0]
+
+    # ...and it is absent by default.
+    assert "Amount" not in mem_cache.query_bars("TestProv", "600000.SH", adjust="none").columns
 
     # Verify factor scaling scales OHLC but NEVER scales Volume or Amount
     factor_dates = list(dates) + [dates[-1] + pd.Timedelta(days=1)]
@@ -1642,7 +1668,7 @@ def test_m36_amount_storage_and_unscaled(mem_cache):
     }, index=factor_dates)
     mem_cache.store_adjust_factors("600000.SH", factors_df)
 
-    res_qfq = mem_cache.query_bars("TestProv", "600000.SH", adjust="qfq")
+    res_qfq = mem_cache.query_bars("TestProv", "600000.SH", adjust="qfq", columns="all")
     assert list(res_qfq["Close"]) == [5.0, 5.5, 6.0]
     assert list(res_qfq["Volume"]) == [100.0, 200.0, 300.0]  # unscaled!
     assert list(res_qfq["Amount"]) == [1000.0, 2200.0, 3600.0]  # unscaled!
@@ -1714,8 +1740,10 @@ def test_m38_adjust_factors_storage_and_derivation_intraday_5m(mem_cache):
     }, index=pd.to_datetime(["2024-01-02", "2024-01-03"]))
     mem_cache.store_adjust_factors("000002.SZ", factors)
 
-    # Query with adjustflag="qfq"
-    derived_5m = mem_cache.query_intraday_bars("TestProv", "000002.SZ", interval="5m", adjustflag="qfq")
+    # Query with adjustflag="qfq" (M3.6 `columns=` contract: `Amount` is opt-in)
+    derived_5m = mem_cache.query_intraday_bars(
+        "TestProv", "000002.SZ", interval="5m", adjustflag="qfq", columns="all"
+    )
     # Day 1 scaled by 0.5
     assert derived_5m.loc[pd.Timestamp("2024-01-02 09:35:00"), "Close"] == 50.5
     assert derived_5m.loc[pd.Timestamp("2024-01-02 09:40:00"), "Close"] == 51.0
@@ -1758,3 +1786,823 @@ def test_m38_edge_assets_neutral_factor(mem_cache):
     assert (f_idx["factor_qfq"] == 1.0).all()
     assert (f_idx["factor_hfq"] == 1.0).all()
     con.close()
+
+
+# =============================================================================
+# M3.6 review F1 / F2 / F6: undeclared-basis refusal, transition gate,
+# and the `columns=` contract.
+# =============================================================================
+
+
+def _force_legacy_null_basis(cache, provider: str, symbol: str, interval=None) -> None:
+    """Simulates a pre-M3.6 row: the metadata column exists but was never backfilled.
+
+    SQL NULL (not the `"unknown"` sentinel) is the state `UnknownAdjustBasisError` refuses --
+    `store_bars(..., adjustflag=None)` deliberately writes the sentinel instead, so the only way
+    to reach the legacy state in a test is to stamp NULL directly.
+    """
+    if interval:
+        table = "intraday_sync_metadata"
+        where = "provider = ? AND symbol = ? AND interval = ?"
+        params = [provider, symbol, interval]
+    else:
+        table = "asset_sync_metadata"
+        where = "provider = ? AND symbol = ?"
+        params = [provider, symbol]
+    con = cache._get_connection(read_only=False)
+    con.execute(f"UPDATE {table} SET adjustflag = NULL WHERE {where}", params)
+    row = con.execute(f"SELECT adjustflag FROM {table} WHERE {where}", params).fetchone()
+    assert row is not None, "test setup: metadata row missing"
+    assert row[0] is None, "test setup: basis was not actually nulled"
+
+
+def test_f1_legacy_null_basis_refused_and_opt_in_warns(mem_cache):
+    """DISCRIMINATING (F1): a pre-M3.6 row (basis NULL) must FAIL CLOSED, not pass through.
+
+    Before F1 the read answered `stored_basis is None -> return as-is`, so a QFQ cache served
+    QFQ bytes to a `raw` request with no warning (the 2026-10-23 incident shape). The only
+    sanctioned escapes are `allow_legacy_basis=True` (warned, explicit) or a human declaration
+    via `scripts/migrate_adjust_basis.py`.
+    """
+    dates = pd.bdate_range("2024-01-01", periods=3)
+    df = pd.DataFrame(
+        {
+            "Open": [100.0, 101.0, 102.0],
+            "High": [101.0, 102.0, 103.0],
+            "Low": [99.0, 100.0, 101.0],
+            "Close": [100.5, 101.5, 102.5],
+            "Volume": [1000.0, 1100.0, 1200.0],
+        },
+        index=dates,
+    )
+    mem_cache.store_bars("F1LegacyProv", "600519.F1", df, adjustflag="raw")
+    _force_legacy_null_basis(mem_cache, "F1LegacyProv", "600519.F1")
+
+    # Both a deriving request and a "just give me raw" request must refuse.
+    with pytest.raises(UnknownAdjustBasisError) as excinfo:
+        mem_cache.query_bars("F1LegacyProv", "600519.F1", adjust="raw")
+    assert "600519.F1" in str(excinfo.value)
+    assert "migrate_adjust_basis.py" in str(excinfo.value)
+    assert "asset_sync_metadata" in str(excinfo.value)
+
+    with pytest.raises(UnknownAdjustBasisError):
+        mem_cache.query_bars("F1LegacyProv", "600519.F1", adjust="qfq")
+
+    # The 5m read path goes through the same three-state resolution.
+    mem_cache.store_intraday_bars(
+        "F1LegacyProv",
+        "600519.F1",
+        pd.DataFrame(
+            {
+                "Open": [10.0, 10.1],
+                "High": [10.2, 10.3],
+                "Low": [9.9, 10.0],
+                "Close": [10.1, 10.2],
+                "Volume": [100.0, 110.0],
+            },
+            index=pd.to_datetime(["2024-01-02 09:35:00", "2024-01-02 09:40:00"]),
+        ),
+        interval="5m",
+        adjustflag="raw",
+    )
+    _force_legacy_null_basis(mem_cache, "F1LegacyProv", "600519.F1", interval="5m")
+    with pytest.raises(UnknownAdjustBasisError):
+        mem_cache.query_intraday_bars(
+            "F1LegacyProv", "600519.F1", interval="5m", adjustflag="qfq"
+        )
+
+    # The explicit opt-in returns the stored series UNCHANGED and says so out loud (once).
+    with pytest.warns(UserWarning, match="allow_legacy_basis pass-through"):
+        legacy = mem_cache.query_bars(
+            "F1LegacyProv", "600519.F1", adjust="qfq", allow_legacy_basis=True
+        )
+    np.testing.assert_array_equal(legacy["Close"].values, df["Close"].values)
+
+    # Warn-once: the second explicit opt-in is silent (a universe read must not spam).
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        mem_cache.query_bars(
+            "F1LegacyProv", "600519.F1", adjust="qfq", allow_legacy_basis=True
+        )
+    assert [w for w in caught if "allow_legacy_basis" in str(w.message)] == []
+
+
+def test_f1_factor_neutral_symbol_exempt_from_null_refusal(mem_cache):
+    """F1 exemption: indices / 511880 are factor-neutral, so an unknown basis changes no price."""
+    dates = pd.bdate_range("2024-01-01", periods=2)
+    df = pd.DataFrame(
+        {
+            "Open": [3500.0, 3510.0],
+            "High": [3550.0, 3560.0],
+            "Low": [3480.0, 3490.0],
+            "Close": [3520.0, 3530.0],
+            "Volume": [50000.0, 51000.0],
+        },
+        index=dates,
+    )
+    mem_cache.store_bars("F1NeutralProv", "000300.SH", df, adjustflag="raw")
+    _force_legacy_null_basis(mem_cache, "F1NeutralProv", "000300.SH")
+
+    out = mem_cache.query_bars("F1NeutralProv", "000300.SH", adjust="qfq")
+    np.testing.assert_array_equal(out["Close"].values, df["Close"].values)
+
+
+def test_f2_basis_transition_refused_on_legacy_rows(mem_cache):
+    """DISCRIMINATING (F2): a write must not stamp a basis onto pre-M3.6 (NULL) rows.
+
+    `COALESCE(excluded.adjustflag, existing.adjustflag)` used to let the next raw sync relabel
+    legacy QFQ bytes as `raw`, after which every read multiplied them by the factor again
+    (double adjustment). The label is a claim about bytes already on disk.
+    """
+    dates = pd.bdate_range("2024-01-01", periods=3)
+    df = pd.DataFrame(
+        {
+            "Open": [100.0, 101.0, 102.0],
+            "High": [101.0, 102.0, 103.0],
+            "Low": [99.0, 100.0, 101.0],
+            "Close": [100.5, 101.5, 102.5],
+            "Volume": [1000.0, 1100.0, 1200.0],
+        },
+        index=dates,
+    )
+    mem_cache.store_bars("F2Prov", "600519.F2", df, adjustflag="raw")
+    _force_legacy_null_basis(mem_cache, "F2Prov", "600519.F2")
+
+    # An UNDECLARED write is not a claim, so it is allowed -- WITH the explicit opt-in required
+    # since P1 (`adjustflag=None` alone now raises `AdjustBasisRequiredError`) -- and it must NOT
+    # launder the NULL into the `"unknown"` sentinel (that would erase the legacy-migration
+    # signal; the upsert's COALESCE keeps the pre-existing NULL).
+    mem_cache.store_bars(
+        "F2Prov", "600519.F2", df, adjustflag=None, allow_undeclared_basis=True
+    )
+    meta = mem_cache.get_asset_metadata("F2Prov", "600519.F2")
+    assert meta["adjustflag"] is None
+
+    # A DECLARED write is refused, and the refusal is atomic (metadata untouched).
+    with pytest.raises(AdjustBasisTransitionRefused) as excinfo:
+        mem_cache.store_bars("F2Prov", "600519.F2", df, adjustflag="raw")
+    assert "adjustflag is NULL" in str(excinfo.value)
+    assert "allow_basis_transition=True" in str(excinfo.value)
+    assert mem_cache.get_asset_metadata("F2Prov", "600519.F2")["adjustflag"] is None
+
+    # Audited escape hatch: an explicit, deliberate declaration goes through.
+    mem_cache.store_bars("F2Prov", "600519.F2", df, adjustflag="raw", allow_basis_transition=True)
+    assert mem_cache.get_asset_metadata("F2Prov", "600519.F2")["adjustflag"] == "raw"
+
+    # Once declared, ordinary appends are no longer gated.
+    mem_cache.store_bars(
+        "F2Prov",
+        "600519.F2",
+        df.iloc[[2]].rename(index=lambda t: t + pd.Timedelta(days=1)),
+        adjustflag="raw",
+    )
+
+
+def test_f2_intraday_basis_transition_refused(mem_cache):
+    """F2 covers `intraday_sync_metadata` too (same COALESCE bug, same consequence)."""
+    ts = pd.to_datetime(["2024-01-02 09:35:00", "2024-01-02 09:40:00"])
+    df = pd.DataFrame(
+        {
+            "Open": [10.0, 10.1],
+            "High": [10.2, 10.3],
+            "Low": [9.9, 10.0],
+            "Close": [10.1, 10.2],
+            "Volume": [100.0, 110.0],
+        },
+        index=ts,
+    )
+    mem_cache.store_intraday_bars("F2IntradayProv", "600519.F2I", df, interval="5m", adjustflag="raw")
+    _force_legacy_null_basis(mem_cache, "F2IntradayProv", "600519.F2I", interval="5m")
+
+    with pytest.raises(AdjustBasisTransitionRefused):
+        mem_cache.store_intraday_bars(
+            "F2IntradayProv", "600519.F2I", df, interval="5m", adjustflag="qfq"
+        )
+    assert mem_cache.get_intraday_metadata("F2IntradayProv", "600519.F2I", "5m")["adjustflag"] is None
+
+    mem_cache.store_intraday_bars(
+        "F2IntradayProv",
+        "600519.F2I",
+        df,
+        interval="5m",
+        adjustflag="qfq",
+        allow_basis_transition=True,
+    )
+    assert (
+        mem_cache.get_intraday_metadata("F2IntradayProv", "600519.F2I", "5m")["adjustflag"] == "qfq"
+    )
+
+
+def test_f6_columns_contract_daily_and_intraday(mem_cache):
+    """DISCRIMINATING (F6): the output shape must not depend on whether `amount` is on disk."""
+    dates = pd.bdate_range("2024-01-01", periods=3)
+    df = pd.DataFrame(
+        {
+            "Open": [100.0, 101.0, 102.0],
+            "High": [101.0, 102.0, 103.0],
+            "Low": [99.0, 100.0, 101.0],
+            "Close": [100.5, 101.5, 102.5],
+            "Volume": [1000.0, 1100.0, 1200.0],
+            "Amount": [100000.0, 110000.0, 120000.0],
+        },
+        index=dates,
+    )
+    mem_cache.store_bars("F6Prov", "600519.F6", df, adjustflag="raw")
+
+    default_cols = ["Open", "High", "Low", "Close", "Volume"]
+    # Default: exactly the required OHLCV columns, no `Amount`, even though it IS on disk.
+    assert list(mem_cache.query_bars("F6Prov", "600519.F6", adjust="raw").columns) == default_cols
+    # "all" adds it back.
+    assert list(mem_cache.query_bars("F6Prov", "600519.F6", adjust="raw", columns="all").columns) == (
+        default_cols + ["Amount"]
+    )
+    # An explicit sequence returns EXACTLY that, in that order.
+    explicit = mem_cache.query_bars(
+        "F6Prov", "600519.F6", adjust="raw", columns=["Close", "Amount"]
+    )
+    assert list(explicit.columns) == ["Close", "Amount"]
+    np.testing.assert_array_equal(explicit["Amount"].values, df["Amount"].values)
+    # A single-name string is accepted too.
+    assert list(mem_cache.query_bars("F6Prov", "600519.F6", adjust="raw", columns="Volume").columns) == [
+        "Volume"
+    ]
+    # An unavailable column fails loudly instead of silently returning something else.
+    with pytest.raises(ValueError, match="not available"):
+        mem_cache.query_bars("F6Prov", "600519.F6", adjust="raw", columns=["NoSuchColumn"])
+
+    # Empty result keeps the requested shape (no schema flip on an empty range).
+    empty = mem_cache.query_bars(
+        "F6Prov", "600519.F6", start="2030-01-01", end="2030-01-02", adjust="raw"
+    )
+    assert list(empty.columns) == default_cols and empty.empty
+    empty_all = mem_cache.query_bars(
+        "F6Prov", "600519.F6", start="2030-01-01", end="2030-01-02", adjust="raw", columns="all"
+    )
+    assert list(empty_all.columns) == default_cols + ["Amount"] and empty_all.empty
+
+    # Intraday twin: same contract, and `Amount` really is opt-in there as well.
+    ts = pd.to_datetime(["2024-01-02 09:35:00", "2024-01-02 09:40:00"])
+    df_5m = pd.DataFrame(
+        {
+            "Open": [10.0, 10.1],
+            "High": [10.2, 10.3],
+            "Low": [9.9, 10.0],
+            "Close": [10.1, 10.2],
+            "Volume": [100.0, 110.0],
+            "Amount": [1010.0, 1111.0],
+        },
+        index=ts,
+    )
+    mem_cache.store_intraday_bars("F6Prov", "600519.F6", df_5m, interval="5m", adjustflag="raw")
+    assert (
+        list(
+            mem_cache.query_intraday_bars(
+                "F6Prov", "600519.F6", interval="5m", adjustflag="raw"
+            ).columns
+        )
+        == default_cols
+    )
+    intraday_all = mem_cache.query_intraday_bars(
+        "F6Prov", "600519.F6", interval="5m", adjustflag="raw", columns="all"
+    )
+    assert list(intraday_all.columns) == default_cols + ["Amount"]
+    np.testing.assert_array_equal(intraday_all["Amount"].values, df_5m["Amount"].values)
+
+
+def test_f1_migration_script_dry_run_then_declare(tmp_path, capsys):
+    """DISCRIMINATING (F1): the migration tool is read-only by default and rewrites no price.
+
+    `--dry-run` must list the offending (provider, symbol) and change nothing; `--set-basis`
+    must make the symbol readable again WITHOUT touching a single OHLCV value.
+    """
+    from scripts import migrate_adjust_basis
+
+    db_path = tmp_path / "migrate.duckdb"
+    cache = DuckDBCache(db_path=str(db_path))
+    dates = pd.bdate_range("2024-01-01", periods=3)
+    df = pd.DataFrame(
+        {
+            "Open": [100.0, 101.0, 102.0],
+            "High": [101.0, 102.0, 103.0],
+            "Low": [99.0, 100.0, 101.0],
+            "Close": [100.5, 101.5, 102.5],
+            "Volume": [1000.0, 1100.0, 1200.0],
+        },
+        index=dates,
+    )
+    cache.store_bars("MigrateProv", "600519.MIG", df, adjustflag="raw")
+    _force_legacy_null_basis(cache, "MigrateProv", "600519.MIG")
+    # Adjustment factors must already be on disk for a `raw` declaration to be legal (item-5
+    # guard: `raw` + no factors makes every qfq/hfq read fail closed, so it needs --force).
+    cache.store_adjust_factors(
+        "600519.MIG",
+        pd.DataFrame({"factor_hfq": [1.0, 1.0, 1.0]}, index=dates),
+        source="MigrateProv",
+    )
+
+    # 1. Default invocation == dry run: lists the entry, writes nothing.
+    assert migrate_adjust_basis.main(["--db", str(db_path)]) == 0
+    out = capsys.readouterr().out
+    assert "600519.MIG" in out
+    assert "legacy_null" in out
+    assert "READ-ONLY" in out
+    assert cache.get_asset_metadata("MigrateProv", "600519.MIG")["adjustflag"] is None
+    with pytest.raises(UnknownAdjustBasisError):
+        cache.query_bars("MigrateProv", "600519.MIG", adjust="raw")
+
+    # 2. Declare: the only write this tool performs is the metadata label.
+    assert (
+        migrate_adjust_basis.main(
+            [
+                "--db",
+                str(db_path),
+                "--set-basis",
+                "raw",
+                "--provider",
+                "MigrateProv",
+                "--symbol",
+                "600519.MIG",
+            ]
+        )
+        == 0
+    )
+    declared_out = capsys.readouterr().out
+    assert "No prices changed" in declared_out
+    assert cache.get_asset_metadata("MigrateProv", "600519.MIG")["adjustflag"] == "raw"
+
+    # 3. Prices are byte-identical, and the read no longer refuses.
+    out_df = cache.query_bars("MigrateProv", "600519.MIG", adjust="raw")
+    np.testing.assert_array_equal(out_df["Close"].values, df["Close"].values)
+    np.testing.assert_array_equal(out_df["Volume"].values, df["Volume"].values)
+
+    # 4. A re-scan finds nothing left to migrate.
+    assert migrate_adjust_basis.main(["--db", str(db_path), "--dry-run"]) == 0
+    assert "Nothing to migrate" in capsys.readouterr().out
+
+
+def test_f1_migration_script_never_invents_a_metadata_row(tmp_path):
+    """The tool only LABELS an existing row; a missing row is the sync's job, not the audit's."""
+    from scripts import migrate_adjust_basis
+
+    db_path = tmp_path / "missing.duckdb"
+    cache = DuckDBCache(db_path=str(db_path))
+    cache.store_bars(
+        "MigrateProv",
+        "600519.NOROW",
+        _make_sample_ohlcv("2024-01-01", periods=2),
+        adjustflag="raw",
+    )
+    con = cache._get_connection(read_only=False)
+    try:
+        con.execute(
+            "DELETE FROM asset_sync_metadata WHERE provider = 'MigrateProv' "
+            "AND symbol = '600519.NOROW'"
+        )
+    finally:
+        con.close()
+
+    with pytest.raises(KeyError, match="only LABELS an existing row"):
+        migrate_adjust_basis.main(
+            [
+                "--db",
+                str(db_path),
+                "--set-basis",
+                "raw",
+                "--provider",
+                "MigrateProv",
+                "--symbol",
+                "600519.NOROW",
+            ]
+        )
+
+
+# ---------------------------------------------------------------------------
+# M3.6 second review pass (P1 sentinel write gate, P2 migration guards,
+# universe-read branch, `next_vwap` under the `columns` default)
+# ---------------------------------------------------------------------------
+
+
+def test_p1_undeclared_write_requires_opt_in_and_reads_fail_closed(mem_cache):
+    """DISCRIMINATING (P1): `adjustflag=None` is not a silent default any more.
+
+    The first revision recorded the `"unknown"` sentinel and then READ IT BACK SILENTLY -- no
+    `allow_legacy_basis`, no transition gate -- so `rebase_corporate_action` and the CSV migration
+    produced rows where `adjust="raw"` returned possibly-QFQ bytes and `adjust="qfq"` returned
+    possibly-raw bytes. That is the F1/F2 hazard moved onto fresh rows. The write is now
+    fail-closed unless the caller says out loud that it cannot state the basis, and an undeclared
+    row is then read exactly like a pre-M3.6 NULL row.
+    """
+    dates = pd.bdate_range("2024-01-01", periods=3)
+    df = pd.DataFrame(
+        {
+            "Open": [100.0, 101.0, 102.0],
+            "High": [101.0, 102.0, 103.0],
+            "Low": [99.0, 100.0, 101.0],
+            "Close": [100.5, 101.5, 102.5],
+            "Volume": [1000.0, 1100.0, 1200.0],
+        },
+        index=dates,
+    )
+
+    # 1. No declaration -> the write refuses, and nothing reaches the cache.
+    with pytest.raises(AdjustBasisRequiredError) as excinfo:
+        mem_cache.store_bars("P1SentinelProv", "600519.P1S", df)
+    assert "adjustflag" in str(excinfo.value)
+    assert "allow_undeclared_basis=True" in str(excinfo.value)
+    assert mem_cache.get_asset_metadata("P1SentinelProv", "600519.P1S") is None
+
+    # The intraday writer shares the gate.
+    with pytest.raises(AdjustBasisRequiredError):
+        mem_cache.store_intraday_bars(
+            "P1SentinelProv",
+            "600519.P1S",
+            pd.DataFrame(
+                {
+                    "Open": [10.0, 10.1],
+                    "High": [10.2, 10.3],
+                    "Low": [9.9, 10.0],
+                    "Close": [10.1, 10.2],
+                    "Volume": [100.0, 110.0],
+                },
+                index=pd.to_datetime(["2024-01-02 09:35:00", "2024-01-02 09:40:00"]),
+            ),
+            interval="5m",
+        )
+
+    # 2. Factor-neutral symbols stay exempt: the label cannot change a single returned price.
+    mem_cache.store_bars("P1SentinelProv", "000300.SH", df)
+    assert mem_cache.get_asset_metadata("P1SentinelProv", "000300.SH")["adjustflag"] == "unknown"
+    assert len(mem_cache.query_bars("P1SentinelProv", "000300.SH", adjust="qfq")) == 3
+
+    # 3. Explicit opt-in records the sentinel, NOT SQL NULL (NULL stays reserved for pre-M3.6).
+    mem_cache.store_bars(
+        "P1SentinelProv", "600519.P1S", df, adjustflag=None, allow_undeclared_basis=True
+    )
+    assert mem_cache.get_asset_metadata("P1SentinelProv", "600519.P1S")["adjustflag"] == "unknown"
+
+    # 4. Both un-declared states are one state for the reader: refused without the opt-in...
+    for mode in ("qfq", "hfq", "raw", "none"):
+        with pytest.raises(UnknownAdjustBasisError):
+            mem_cache.query_bars("P1SentinelProv", "600519.P1S", adjust=mode)
+    # ...and the SAME opt-in as a legacy NULL row when it is given, unchanged + warned (once).
+    with pytest.warns(UserWarning, match="allow_legacy_basis pass-through") as caught:
+        out = mem_cache.query_bars(
+            "P1SentinelProv", "600519.P1S", adjust="qfq", allow_legacy_basis=True
+        )
+    assert "undeclared-basis sentinel" in str(caught[0].message)
+    np.testing.assert_array_equal(out["Close"].values, df["Close"].values)
+    with warnings.catch_warnings(record=True) as later:
+        warnings.simplefilter("always")
+        mem_cache.query_bars(
+            "P1SentinelProv", "600519.P1S", adjust="qfq", allow_legacy_basis=True
+        )
+    assert [w for w in later if "allow_legacy_basis" in str(w.message)] == []
+
+
+def test_p1_sentinel_to_declared_basis_is_gated(mem_cache):
+    """DISCRIMINATING (P1/F2): the sentinel is now a REFUSED state, so it must also be gated.
+
+    The first revision exempted the sentinel from `_guard_basis_transition` on the argument that
+    such a row was readable pass-through anyway. Once the read refuses it, a later label becomes
+    exactly as unrecoverable as on a NULL row, so both are gated and both take the audited
+    `allow_basis_transition=True` escape hatch.
+    """
+    dates = pd.bdate_range("2024-01-01", periods=3)
+    df = pd.DataFrame(
+        {
+            "Open": [100.0, 101.0, 102.0],
+            "High": [101.0, 102.0, 103.0],
+            "Low": [99.0, 100.0, 101.0],
+            "Close": [100.5, 101.5, 102.5],
+            "Volume": [1000.0, 1100.0, 1200.0],
+        },
+        index=dates,
+    )
+    mem_cache.store_bars(
+        "P1SentinelProv", "600519.P1T", df, adjustflag=None, allow_undeclared_basis=True
+    )
+    assert mem_cache.get_asset_metadata("P1SentinelProv", "600519.P1T")["adjustflag"] == "unknown"
+
+    with pytest.raises(AdjustBasisTransitionRefused) as excinfo:
+        mem_cache.store_bars("P1SentinelProv", "600519.P1T", df, adjustflag="qfq")
+    assert "allow_basis_transition=True" in str(excinfo.value)
+    # Atomic: the label is still undeclared.
+    assert mem_cache.get_asset_metadata("P1SentinelProv", "600519.P1T")["adjustflag"] == "unknown"
+
+    mem_cache.store_bars(
+        "P1SentinelProv", "600519.P1T", df, adjustflag="qfq", allow_basis_transition=True
+    )
+    assert mem_cache.get_asset_metadata("P1SentinelProv", "600519.P1T")["adjustflag"] == "qfq"
+    # Declared -> readable with no opt-in at all.
+    assert len(mem_cache.query_bars("P1SentinelProv", "600519.P1T", adjust="qfq")) == 3
+
+    # Intraday twin: same sentinel, same gate, same escape hatch.
+    frame_5m = pd.DataFrame(
+        {
+            "Open": [10.0, 10.1],
+            "High": [10.2, 10.3],
+            "Low": [9.9, 10.0],
+            "Close": [10.1, 10.2],
+            "Volume": [100.0, 110.0],
+        },
+        index=pd.to_datetime(["2024-01-02 09:35:00", "2024-01-02 09:40:00"]),
+    )
+    mem_cache.store_intraday_bars(
+        "P1SentinelProv",
+        "600519.P1TI",
+        frame_5m,
+        interval="5m",
+        adjustflag=None,
+        allow_undeclared_basis=True,
+    )
+    with pytest.raises(AdjustBasisTransitionRefused):
+        mem_cache.store_intraday_bars(
+            "P1SentinelProv", "600519.P1TI", frame_5m, interval="5m", adjustflag="qfq"
+        )
+    mem_cache.store_intraday_bars(
+        "P1SentinelProv",
+        "600519.P1TI",
+        frame_5m,
+        interval="5m",
+        adjustflag="qfq",
+        allow_basis_transition=True,
+    )
+    assert (
+        mem_cache.get_intraday_metadata("P1SentinelProv", "600519.P1TI", "5m")["adjustflag"]
+        == "qfq"
+    )
+
+
+class _BasisSilentProvider(BaseDataProvider):
+    """Provider that declares no basis at all (the legacy `fetch_ohlcv`-only shape)."""
+
+    __name__ = "BasisSilentProvider"
+
+    def fetch_ohlcv(self, symbol, start, end, interval="1d"):
+        dates = pd.bdate_range(start, end)
+        n = len(dates)
+        return pd.DataFrame(
+            {
+                "Open": [400.0] * n,
+                "High": [405.0] * n,
+                "Low": [395.0] * n,
+                "Close": [400.0] * n,
+                "Volume": [1000.0] * n,
+            },
+            index=dates,
+        )
+
+
+class _RawNativeProvider(_BasisSilentProvider):
+    """Provider whose own series IS unadjusted (`native_adjust_basis="raw"`)."""
+
+    __name__ = "RawNativeProvider"
+    native_adjust_basis = "raw"
+
+
+def test_p1_rebase_corporate_action_declares_a_real_basis(tmp_path):
+    """P1 production path 1: `rebase_corporate_action` must LABEL what it writes.
+
+    It fetches through the inner provider's own `fetch_ohlcv`, so the truthful label is that
+    provider's native basis; a provider that declares nothing gets the documented `qfq` default
+    (the pre-M3.6 read default), logged. Nothing is left undeclared -- an undeclared rewrite would
+    make the method's own return value unreadable.
+    """
+    import logging
+
+    from common.data import CachedDataProvider
+
+    # (a) Silent provider -> documented qfq assumption, and the label is a DECLARATION.
+    silent = CachedDataProvider(_BasisSilentProvider(), cache_dir=str(tmp_path / "silent.duckdb"))
+    silent.rebase_corporate_action(
+        "600519.REB", start="2024-01-01", end="2024-01-05", reason="4-for-1 split rebase"
+    )
+    meta = silent.duckdb_cache.get_asset_metadata("_BasisSilentProvider", "600519.REB")
+    assert meta["adjustflag"] == "qfq", "P1: the rebase left the basis undeclared"
+    # A declared basis is fail-closed for another one instead of silently serving these bytes.
+    with pytest.raises(ValueError, match="stored data has basis 'qfq'"):
+        silent.duckdb_cache.query_bars("_BasisSilentProvider", "600519.REB", adjust="raw")
+
+    # (b) A provider that says "raw" is stored as raw (never laundered into qfq).
+    raw = CachedDataProvider(_RawNativeProvider(), cache_dir=str(tmp_path / "raw.duckdb"))
+    out = raw.rebase_corporate_action(
+        "600519.REB", start="2024-01-01", end="2024-01-05", reason="4-for-1 split rebase"
+    )
+    assert (
+        raw.duckdb_cache.get_asset_metadata("_RawNativeProvider", "600519.REB")["adjustflag"]
+        == "raw"
+    )
+    # ...and the method returns the declared series (a qfq read would need factors it never
+    # stores, so returning qfq here would fail on a write that had already succeeded).
+    np.testing.assert_array_equal(out["Close"].values, [400.0] * len(out))
+    assert raw.duckdb_cache.query_adjust_factors("600519.REB").empty
+
+
+def test_p1_csv_migration_declares_qfq_not_sentinel(tmp_path):
+    """P1 production path 2: `migrate_cache_csv_to_duckdb` declares the legacy cache's basis."""
+    from scripts.migrate_cache_csv_to_duckdb import migrate_csv_cache
+
+    data_dir = tmp_path / "csv_data"
+    data_dir.mkdir()
+    dates = pd.bdate_range("2020-01-01", periods=5)
+    pd.DataFrame(
+        {
+            "Open": [100.0] * 5,
+            "High": [105.0] * 5,
+            "Low": [95.0] * 5,
+            "Close": [102.0] * 5,
+            "Volume": [1000.0] * 5,
+        },
+        index=dates,
+    ).to_csv(data_dir / "YFinanceDataProvider_AAPL_1d_2020-01-01_2020-01-07.csv")
+
+    db_file = tmp_path / "migrated.duckdb"
+    migrate_csv_cache(data_dir=str(data_dir), db_path=str(db_file))
+
+    cache = DuckDBCache(db_path=str(db_file))
+    meta = cache.get_asset_metadata("YFinanceDataProvider", "AAPL")
+    assert meta["adjustflag"] == "qfq", "P1: the CSV migration left the basis undeclared"
+    # Readable without any legacy opt-in, and fail-closed for a basis it is not.
+    assert len(cache.query_bars("YFinanceDataProvider", "AAPL", adjust="qfq")) == 5
+    with pytest.raises(ValueError, match="stored data has basis 'qfq'"):
+        cache.query_bars("YFinanceDataProvider", "AAPL", adjust="hfq")
+
+
+def test_p2_migration_declare_guards(tmp_path, capsys):
+    """P2 (item 5): the declaration tool refuses both claims that reinterpret stored prices.
+
+    a) `--set-basis raw` with no `adjust_factors` rows for the symbol -> every qfq/hfq read of it
+       would fail closed, which is a legitimate final state but almost always a migration mistake;
+    b) overwriting an ALREADY-DECLARED basis -> silently changes the meaning of the history.
+    Both need `--force`, and `--force` prints what it just bypassed. A dry run stays read-only.
+    """
+    from scripts import migrate_adjust_basis
+
+    db_path = tmp_path / "guards.duckdb"
+    cache = DuckDBCache(db_path=str(db_path))
+    symbol = "600519.GRD"
+    cache.store_bars(
+        "GuardProv", symbol, _make_sample_ohlcv("2024-01-01", periods=3), adjustflag="qfq"
+    )
+
+    def _declare(basis, *extra):
+        return migrate_adjust_basis.main(
+            ["--db", str(db_path), "--set-basis", basis, "--provider", "GuardProv",
+             "--symbol", symbol, *extra]
+        )
+
+    # (a) raw without factors -> refused, metadata untouched.
+    with pytest.raises(RuntimeError, match="--force"):
+        _declare("raw")
+    assert cache.get_asset_metadata("GuardProv", symbol)["adjustflag"] == "qfq"
+
+    # (b) overwriting the declared basis -> refused, metadata untouched.
+    with pytest.raises(RuntimeError, match="ALREADY-DECLARED basis"):
+        _declare("hfq")
+    assert cache.get_asset_metadata("GuardProv", symbol)["adjustflag"] == "qfq"
+
+    # Re-declaring the SAME value is an idempotent no-op, not a "flip" that demands --force.
+    assert _declare("qfq") == 0
+    assert cache.get_asset_metadata("GuardProv", symbol)["adjustflag"] == "qfq"
+
+    # (c) --force bypasses, says so loudly, and actually writes.
+    assert _declare("raw", "--force") == 0
+    out = capsys.readouterr().out
+    assert "WARNING: --force" in out
+    assert "FAIL CLOSED" in out
+    assert cache.get_asset_metadata("GuardProv", symbol)["adjustflag"] == "raw"
+
+    # (d) dry run is still read-only: no metadata write, no price change.
+    before = cache.get_asset_metadata("GuardProv", symbol)["adjustflag"]
+    assert migrate_adjust_basis.main(["--db", str(db_path), "--dry-run"]) == 0
+    assert cache.get_asset_metadata("GuardProv", symbol)["adjustflag"] == before
+
+
+def test_f1_query_universe_legacy_null_branch(mem_cache):
+    """F1 coverage extension: the UNIVERSE readers hit the same three-state resolution."""
+    dates = pd.bdate_range("2024-01-01", periods=2)
+    df = pd.DataFrame(
+        {
+            "Open": [100.0, 101.0],
+            "High": [101.0, 102.0],
+            "Low": [99.0, 100.0],
+            "Close": [100.5, 101.5],
+            "Volume": [1000.0, 1100.0],
+        },
+        index=dates,
+    )
+    mem_cache.store_bars("F1UniProv", "600519.U1", df, adjustflag="qfq")
+    mem_cache.store_bars("F1UniProv", "600519.U2", df, adjustflag="qfq")
+    _force_legacy_null_basis(mem_cache, "F1UniProv", "600519.U2")
+
+    # Daily: one legacy-null symbol in the batch fails the whole read (no silent smaller frame).
+    with pytest.raises(UnknownAdjustBasisError) as excinfo:
+        mem_cache.query_universe("F1UniProv", ["600519.U1", "600519.U2"], adjust="qfq")
+    assert "600519.U2" in str(excinfo.value)
+    uni = mem_cache.query_universe(
+        "F1UniProv", ["600519.U1", "600519.U2"], adjust="qfq", allow_legacy_basis=True
+    )
+    assert set(uni) == {"600519.U1", "600519.U2"}
+    np.testing.assert_array_equal(uni["600519.U2"]["Close"].values, df["Close"].values)
+
+    # Intraday twin.
+    frame_5m = pd.DataFrame(
+        {
+            "Open": [10.0, 10.1],
+            "High": [10.2, 10.3],
+            "Low": [9.9, 10.0],
+            "Close": [10.1, 10.2],
+            "Volume": [100.0, 110.0],
+        },
+        index=pd.to_datetime(["2024-01-02 09:35:00", "2024-01-02 09:40:00"]),
+    )
+    for sym in ("600519.U1", "600519.U2"):
+        mem_cache.store_intraday_bars(
+            "F1UniProv", sym, frame_5m, interval="5m", adjustflag="qfq"
+        )
+    _force_legacy_null_basis(mem_cache, "F1UniProv", "600519.U2", interval="5m")
+    with pytest.raises(UnknownAdjustBasisError):
+        mem_cache.query_intraday_universe(
+            "F1UniProv", ["600519.U1", "600519.U2"], interval="5m", adjustflag="qfq"
+        )
+    uni_5m = mem_cache.query_intraday_universe(
+        "F1UniProv",
+        ["600519.U1", "600519.U2"],
+        interval="5m",
+        adjustflag="qfq",
+        allow_legacy_basis=True,
+    )
+    assert set(uni_5m) == {"600519.U1", "600519.U2"}
+
+
+class _AmountEmittingProvider(BaseDataProvider):
+    """Legacy-shaped provider (`fetch_ohlcv` only) that also reports turnover."""
+
+    __name__ = "AmountEmittingProvider"
+    native_adjust_basis = "qfq"
+
+    def fetch_ohlcv(self, symbol, start, end, interval="1d"):
+        dates = pd.bdate_range(start, end)
+        n = len(dates)
+        close = [10.0 + 0.1 * i for i in range(n)]
+        volume = [1000.0] * n
+        return pd.DataFrame(
+            {
+                "Open": close,
+                "High": [c + 0.2 for c in close],
+                "Low": [c - 0.2 for c in close],
+                "Close": close,
+                "Volume": volume,
+                "Amount": [c * v for c, v in zip(close, volume)],
+            },
+            index=dates,
+        )
+
+
+def test_p2_next_vwap_works_through_load_universe_default_columns(tmp_path):
+    """P2 (item 3) POSITIVE CONTROL: `next_vwap` must survive the narrower cache default.
+
+    `query_bars` returns required OHLCV only by default (no `Amount`), so `execution_price=
+    "next_vwap"` -- which needs `VWAP` or `Amount`+`Volume` on every symbol -- became an
+    unconditional `ValueError` for every cache-backed backtest. The dependency is satisfied by
+    `load_universe` requesting `columns="all"`; this test drives the real loader, then the real
+    engine, and checks the fill price is actually the turnover / volume VWAP.
+    """
+    from common.allocation_backtester import run_allocation_backtest
+    from common.data import load_universe
+
+    universe = load_universe(
+        ["600000.SH"],
+        "2024-01-01",
+        "2024-01-10",
+        use_cache=True,
+        cache_dir=str(tmp_path / "vwap.duckdb"),
+        provider=_AmountEmittingProvider(),
+    )
+    loaded = universe["600000.SH"]
+    assert "Amount" in loaded.columns, "load_universe dropped the VWAP ingredient"
+
+    idx = loaded.index
+    target_weights = pd.DataFrame(np.nan, index=idx, columns=["600000.SH"])
+    target_weights.iloc[0] = [1.0]
+
+    res = run_allocation_backtest(universe, target_weights, execution_price="next_vwap")
+    reb = res["rebalance_report"]
+    assert len(reb) == 1
+    expected = loaded.loc[idx[1], "Amount"] / loaded.loc[idx[1], "Volume"]
+    np.testing.assert_allclose(float(reb.iloc[0]["price"]), expected, rtol=1e-9)
+
+    # Control: the strict OHLCV-only shape is still available on demand and still fails loud
+    # (so the fix is the loader asking for `Amount`, not the engine inventing a price).
+    strict = load_universe(
+        ["600000.SH"],
+        "2024-01-01",
+        "2024-01-10",
+        use_cache=True,
+        cache_dir=str(tmp_path / "vwap.duckdb"),
+        provider=_AmountEmittingProvider(),
+        columns=None,
+    )
+    assert "Amount" not in strict["600000.SH"].columns
+    with pytest.raises(ValueError, match="next_vwap"):
+        run_allocation_backtest(strict, target_weights, execution_price="next_vwap")

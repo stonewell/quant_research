@@ -38,6 +38,31 @@ logger = logging.getLogger(__name__)
 
 _REQUIRED_OHLCV_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 
+#: Opt-in token for `query_bars(columns=...)` / `query_intraday_bars(columns=...)` (and the
+#: `query_*_universe` twins) meaning "every column the table can serve", including `Amount`.
+_COLUMNS_ALL = "all"
+
+#: Sentinel written into `asset_sync_metadata.adjustflag` / `intraday_sync_metadata.adjustflag`
+#: when a writer stored bars WITHOUT declaring a basis (`store_bars(adjustflag=None)`).
+#:
+#: Why a sentinel exists at all (M3.6 review F1/F2): SQL NULL in that column has exactly one
+#: meaning -- a LEGACY row, i.e. one that predates the `_ensure_column` migration, written when
+#: the cache recorded no basis at all. That state is read-refused (`UnknownAdjustBasisError`)
+#: precisely because it is the state in which a QFQ series can be served to a `raw` request. A
+#: modern write that declines to label its bytes is a DIFFERENT fact ("the caller had no basis to
+#: declare"), and it must stay distinguishable: collapsing it into NULL would either launder
+#: legacy rows into "declared-unknown" -- destroying the migration signal `--dry-run` reports --
+#: or hard-fail every caller that never had a basis to declare in the first place.
+#:
+#: So the sentinel is stored for undeclared writes, is NEVER forward-filled onto a legacy NULL
+#: row (see the `CASE` in both metadata upserts), and -- since the P1 second pass -- reads
+#: EXACTLY like a legacy NULL row: refused without `allow_legacy_basis=True`. It is the same fact
+#: for the reader ("nobody stated what these bytes are"), and treating it as a silent pass-through
+#: would have re-opened the F1 hazard on freshly written rows. `AdjustBasisTransitionRefused`
+#: likewise gates both states: it is still an undeclared basis, so it may not later be stamped
+#: with a real one.
+_UNDECLARED_BASIS = "unknown"
+
 #: Relative tolerance of the `store_bars` history-rewrite gate (`HistoryRewriteRefused`).
 #: Chosen an order of magnitude above float ULP noise and far below any real re-basing:
 #:   * a full re-derivation of the SAME price basis rewrites every stored row with <= ~4e-16
@@ -77,6 +102,144 @@ class MissingAdjustFactorsError(RuntimeError):
         )
 
 
+class UnknownAdjustBasisError(RuntimeError):
+    """The stored bars' adjustment basis was never recorded, so no read can be served honestly.
+
+    Legacy state (M3.6 review F1): `asset_sync_metadata.adjustflag` /
+    `intraday_sync_metadata.adjustflag` were added by `_ensure_column`, which -- by design --
+    only adds the column and backfills nothing. Every row that existed before that migration
+    therefore carries SQL NULL, i.e. "this cache holds bytes whose price basis nobody ever
+    recorded". The old read path treated NULL as `stored_basis is None -> return as-is`:
+
+      * a cache holding **QFQ** bars answered `adjust="qfq"` by returning them unscaled -- which
+        *looks* right and silently breaks the moment the request window and the factor anchor
+        differ (QFQ is normalised at the LATEST factor, so a window ending earlier must still be
+        rescaled by `hfq[t]/hfq[latest]`);
+      * the same cache answered `adjust="raw"` by returning QFQ bytes labelled raw -- a
+        percent-level price error with no warning anywhere (the 2026-10-23 incident class).
+
+    Neither can be fixed by inference (the prices alone do not say which basis they are in), so
+    the read now FAILS CLOSED and points at the only correct remedy: a human declares the basis
+    once (`scripts/migrate_adjust_basis.py --set-basis ...`). `allow_legacy_basis=True` is the
+    explicit, warned opt-in for a caller that has independently verified the stored basis.
+
+    Factor-neutral symbols (indices, 511880.SH) are exempt: `_apply_factors_to_df` is the
+    identity for them, so an unknown basis cannot change a single price.
+    """
+
+    def __init__(
+        self,
+        provider: str,
+        symbol: str,
+        requested_mode: str,
+        interval: str = "1d",
+        meta_table: str = "asset_sync_metadata",
+    ):
+        self.provider = provider
+        self.symbol = symbol
+        self.requested_mode = requested_mode
+        self.interval = interval
+        super().__init__(
+            f"Unknown adjustment basis for {symbol!r} ({provider}, interval={interval!r}): "
+            f"{meta_table}.adjustflag is NULL, so the cached bars cannot be labelled "
+            f"'{requested_mode}' (and no derivation can be applied to them).\n"
+            f"  Remedy (once, offline, no price rewriting): "
+            f"`python scripts/migrate_adjust_basis.py --dry-run` lists every such "
+            f"(provider, symbol); then declare the basis you verified with "
+            f"`python scripts/migrate_adjust_basis.py --set-basis {{raw|qfq|hfq}} "
+            f"--provider {provider} --symbol {symbol}`.\n"
+            f"  If you have already verified out-of-band that the stored bars are exactly the "
+            f"'{requested_mode}' series, re-run the read with `allow_legacy_basis=True` to get "
+            f"the legacy pass-through (no derivation, no scaling)."
+        )
+
+
+class AdjustBasisTransitionRefused(RuntimeError):
+    """A write tried to stamp a basis onto already-stored bars whose basis was never declared.
+
+    M3.6 review F2: the metadata upsert is `COALESCE(excluded.adjustflag, existing.adjustflag)`
+    in both `store_bars` and `store_intraday_bars`, so a NULL (or explicitly undeclared) existing
+    basis was silently "upgraded" to whatever the next writer happened to pass -- e.g. legacy QFQ
+    rows (metadata NULL) flipped to `"raw"` by the next raw sync, after which every read
+    multiplied those already-QFQ prices by the factor again (double adjustment), and
+    `store_bars`' own history-rewrite gate saw nothing because it compares prices, not labels.
+
+    The label is a claim about the bytes already on disk, and only a human can make it
+    truthfully. Declared rewrites are still possible (`allow_basis_transition=True`, logged as a
+    WARNING), and `scripts/migrate_adjust_basis.py --set-basis` exists for the ordinary case.
+    """
+
+    def __init__(
+        self,
+        provider: str,
+        symbol: str,
+        incoming_basis: str,
+        existing_basis: Optional[str],
+        meta_table: str = "asset_sync_metadata",
+        interval: str = "1d",
+        n_rows: Optional[int] = None,
+    ):
+        self.provider = provider
+        self.symbol = symbol
+        self.incoming_basis = incoming_basis
+        self.existing_basis = existing_basis
+        existing_label = "NULL" if existing_basis is None else repr(existing_basis)
+        super().__init__(
+            f"Refusing to declare basis '{incoming_basis}' for {symbol!r} ({provider}, "
+            f"interval={interval!r}): {meta_table}.adjustflag is {existing_label} while "
+            f"{'an existing' if n_rows is None else n_rows} row(s) of this symbol are already "
+            f"stored. Stamping a label onto bytes whose basis was never recorded is how legacy "
+            f"QFQ rows get re-multiplied by the factor (double adjustment).\n"
+            f"  Remedy: declare the true basis once, offline, with "
+            f"`python scripts/migrate_adjust_basis.py --set-basis {{raw|qfq|hfq}} "
+            f"--provider {provider} --symbol {symbol}` (it rewrites NO prices), or delete and "
+            f"re-fetch the symbol. `allow_basis_transition=True` is the audited escape hatch for "
+            f"a write that genuinely replaces every stored row."
+        )
+
+
+class AdjustBasisRequiredError(RuntimeError):
+    """A write tried to store bars without saying which adjustment basis they are in.
+
+    M3.6 review P1 (second pass): the previous revision let `store_bars(..., adjustflag=None)`
+    record the `_UNDECLARED_BASIS` sentinel and then *read it back silently* -- no
+    `allow_legacy_basis`, no `AdjustBasisTransitionRefused`. That moved the F1/F2 hazard onto
+    freshly-written rows instead of closing it: `rebase_corporate_action` and
+    `scripts/migrate_cache_csv_to_duckdb.py` produced rows where `adjust="raw"` returned
+    possibly-QFQ bytes and `adjust="qfq"` returned possibly-raw bytes, with nothing said.
+
+    The basis is a claim about the bytes being written, and only the writer can make it. So the
+    write is now FAIL-CLOSED for every non-factor-neutral symbol:
+
+      * declare it -- `adjustflag="raw"` / `"qfq"` / `"hfq"`;
+      * or, if the caller genuinely cannot say (an opaque provider or a legacy CSV dump), say so
+        out loud with `allow_undeclared_basis=True`. That records the sentinel, and every read of
+        that symbol then requires `allow_legacy_basis=True` (or a declaration via
+        `scripts/migrate_adjust_basis.py`), i.e. the same fail-closed treatment as a pre-M3.6
+        NULL row.
+
+    Factor-neutral symbols (indices, 511880) are exempt: `_apply_factors_to_df` is the identity
+    for them, so their label cannot change a single returned price.
+    """
+
+    def __init__(self, provider: str, symbol: str, interval: str = "1d", store: str = "store_bars"):
+        self.provider = provider
+        self.symbol = symbol
+        self.interval = interval
+        super().__init__(
+            f"{store}({provider}, {symbol!r}, interval={interval!r}) was called without "
+            f"`adjustflag`: the cache cannot record bytes whose adjustment basis nobody states. "
+            f"Declare it -- `adjustflag=\"raw\"` (unadjusted), `\"qfq\"` or `\"hfq\"` -- because "
+            f"the label is a claim about the prices being written and a later reader cannot "
+            f"recover it from the numbers alone (a corporate action and a basis shift are "
+            f"indistinguishable).\n"
+            f"  If the caller genuinely cannot know (opaque provider, legacy CSV dump), pass "
+            f"`allow_undeclared_basis=True`: the row is then recorded as undeclared and every "
+            f"read of it fails closed (`UnknownAdjustBasisError`) until a human declares the "
+            f"truth with `python scripts/migrate_adjust_basis.py --set-basis ...`."
+        )
+
+
 def canonicalize_adjust_mode(mode: Any) -> str:
     """Canonicalize adjustment mode into one of: 'raw', 'qfq', 'hfq'.
 
@@ -96,6 +259,93 @@ def canonicalize_adjust_mode(mode: Any) -> str:
     if m in ("hfq", "1", "backward", "back"):
         return "hfq"
     raise ValueError(f"Unknown or unsupported adjustment mode: {mode!r}")
+
+
+def parse_stored_basis(raw: Any) -> Optional[str]:
+    """Maps a stored metadata `adjustflag` value to a canonical basis, or `None`.
+
+    Three states, deliberately kept apart (see `_UNDECLARED_BASIS`):
+      * `None` (SQL NULL) -> legacy row, basis never recorded: NOT the same as "raw";
+      * `'unknown'` -> a modern write that declined to declare a basis;
+      * `raw` / `qfq` / `hfq` -> a declared basis.
+
+    Both of the first two return `None` here (no derivation is possible for either), and the
+    READ path refuses BOTH (P1 second pass) -- `is_legacy_basis_unknown` only picks the wording
+    of the `allow_legacy_basis` warning / the `UnknownAdjustBasisError` origin, because a
+    sentinel row hides its basis just as effectively as a pre-M3.6 NULL row.
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip().lower()
+    if text == _UNDECLARED_BASIS:
+        return None
+    return canonicalize_adjust_mode(text)
+
+
+def is_legacy_basis_unknown(raw: Any) -> bool:
+    """True when the stored metadata basis is SQL NULL (pre-M3.6 row), False otherwise.
+
+    `'unknown'` is False on purpose: that row's writer did run the M3.6 path and said out loud
+    that no basis was declared, so it is not part of the legacy-migration population.
+    """
+    return raw is None
+
+
+def _day_keys(index: Any) -> np.ndarray:
+    """Day-granularity keys for the as-of factor lookup (`datetime.date` semantics).
+
+    The pre-vectorisation implementation compared `pd.Timestamp(ts).date()` objects, i.e. it
+    dropped the intraday time-of-day and any tz info. `normalize()` + `tz_localize(None)` does
+    exactly that on the wall clock, so a 5m bar at 09:35 and its daily bar collide on the same
+    key -- which is what makes the 5m and daily factor scaling agree (pinned by
+    `test_5m_and_daily_overlap_scaling_factor_identical`).
+    """
+    idx = pd.DatetimeIndex(index)
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    return idx.normalize().values.astype("datetime64[ns]")
+
+
+def _resolve_requested_columns(columns: Any) -> Optional[List[str]]:
+    """Normalises the `columns=` argument of the bar queries.
+
+    `None` -> `None`, meaning "the required OHLCV columns only" -- `Amount` is NOT included, per
+    the M3.6 rule that a newer column must be explicitly requested (a cache read must not change
+    shape because a *different* symbol happened to have an amount on disk).
+    `"all"` (case-insensitive) -> required OHLCV + `Amount`.
+    A sequence (or a single column name) -> exactly that, validated by the caller.
+    """
+    if columns is None:
+        return None
+    if isinstance(columns, str):
+        if columns.strip().lower() == _COLUMNS_ALL:
+            return list(_REQUIRED_OHLCV_COLUMNS) + ["Amount"]
+        return [columns]
+    return [str(c) for c in columns]
+
+
+def _select_output_columns(df: pd.DataFrame, requested: Optional[List[str]], *, context: str) -> pd.DataFrame:
+    """Applies the `columns=` contract to an already-loaded, renamed frame.
+
+    Raises `ValueError` for a name the table cannot serve -- silently dropping it would make a
+    caller believe it asked for a column it never got.
+    """
+    if requested is None:
+        target = list(_REQUIRED_OHLCV_COLUMNS)
+    else:
+        target = requested
+    missing = [c for c in target if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"{context}: requested column(s) {missing} are not available; this table can serve "
+            f"{[c for c in _REQUIRED_OHLCV_COLUMNS + ['Amount'] if c in df.columns]}."
+        )
+    return df[list(target)].astype(float)
+
+
+#: Legacy-basis pass-through warnings, keyed by (provider, symbol, interval). Warn ONCE per key:
+#: a universe read would otherwise emit one warning per symbol per call and drown the log.
+_LEGACY_BASIS_WARNED: set = set()
 
 
 def is_factor_neutral_symbol(symbol: str) -> bool:
@@ -118,6 +368,28 @@ def is_factor_neutral_symbol(symbol: str) -> bool:
         if suffix == "SH" and (ticker.startswith("000") or ticker.startswith("001")):
             return True
         return False
+
+
+def _resolve_write_basis(
+    provider: str,
+    symbol: str,
+    interval: str,
+    canon_adjust: Optional[str],
+    *,
+    allow_undeclared_basis: bool,
+    store: str,
+) -> str:
+    """M3.6 review P1 write-side gate: the value to persist into the metadata `adjustflag`.
+
+    Returns the declared basis, or the `_UNDECLARED_BASIS` sentinel when the caller explicitly
+    opted into `allow_undeclared_basis=True` (or the symbol is factor-neutral). Raises
+    `AdjustBasisRequiredError` otherwise -- an omission is not a declaration.
+    """
+    if canon_adjust is not None:
+        return canon_adjust
+    if allow_undeclared_basis or is_factor_neutral_symbol(symbol):
+        return _UNDECLARED_BASIS
+    raise AdjustBasisRequiredError(provider, symbol, interval, store)
 
 
 def is_intraday_interval(interval: str) -> bool:
@@ -1463,6 +1735,9 @@ class DuckDBCache:
         requested_end: Optional[str] = None,
         sync_time: Optional[datetime.datetime] = None,
         adjustflag: Optional[str] = None,
+        *,
+        allow_basis_transition: bool = False,
+        allow_undeclared_basis: bool = False,
     ) -> None:
         """Upserts intraday OHLCV bars into intraday_ohlcv_bars and updates intraday_sync_metadata.
         Enforces R4 QFQ Split/Dividend Drift detection and R13 End-Date expansion.
@@ -1473,6 +1748,16 @@ class DuckDBCache:
         reportable as bar facts: a later window cannot downgrade the earliest boundary, a
         front-truncated window cannot roll it forward, `is_earliest_known` is sticky True, and the
         request window never overrides what the bars say. See the long comment at the write site.
+
+        M3.6 review F2: like `store_bars`, an already-stored symbol whose basis was never declared
+        (metadata NULL, or the `_UNDECLARED_BASIS` sentinel) refuses to be stamped with a real
+        basis (`AdjustBasisTransitionRefused`) unless the caller declares the transition with
+        `allow_basis_transition=True`. An undeclared write (`adjustflag=None`) is recorded as the
+        sentinel, and never launders an existing legacy NULL into it.
+
+        M3.6 review P1: `adjustflag=None` is no longer a legal silent default -- omitting it on a
+        non-neutral symbol raises `AdjustBasisRequiredError`. `allow_undeclared_basis=True` is the
+        explicit opt-in, and it makes the row fail-closed on every read until declared.
         """
         if is_synthetic_provider(provider) or df.empty:
             return
@@ -1492,6 +1777,23 @@ class DuckDBCache:
         else:
             df_to_store["Amount"] = None
         df_to_store = df_to_store.sort_index()
+
+        # P1 write-side gate: an omission is not a declaration. See `_resolve_write_basis` and
+        # `AdjustBasisRequiredError`. See `_UNDECLARED_BASIS`: an explicitly undeclared write is
+        # recorded as the sentinel, so SQL NULL stays reserved for pre-M3.6 rows.
+        #
+        # Resolved HERE, before the R4 drift check below, because that check can DELETE every
+        # existing bar + metadata row for this symbol. Validating the write after a destructive
+        # purge would leave the symbol wiped and nothing written when the basis was simply omitted.
+        canon_adjust = canonicalize_adjust_mode(adjustflag) if adjustflag is not None else None
+        stored_basis = _resolve_write_basis(
+            provider,
+            symbol,
+            interval,
+            canon_adjust,
+            allow_undeclared_basis=allow_undeclared_basis,
+            store="store_intraday_bars",
+        )
 
         min_ts = df_to_store.index.min()
         max_ts = df_to_store.index.max()
@@ -1524,8 +1826,6 @@ class DuckDBCache:
 
         sync_ts = sync_time if sync_time is not None else datetime.datetime.now()
 
-        canon_adjust = canonicalize_adjust_mode(adjustflag) if adjustflag is not None else None
-
         records_df = pd.DataFrame({
             "provider": provider,
             "symbol": symbol,
@@ -1537,11 +1837,24 @@ class DuckDBCache:
             "close": df_to_store["Close"].values,
             "volume": df_to_store["Volume"].values,
             "amount": df_to_store["Amount"].values if ("Amount" in df_to_store.columns and df_to_store["Amount"].notna().any()) else None,
-            "adjustflag": canon_adjust,
+            "adjustflag": stored_basis,
         })
 
         con = self._get_connection(read_only=False)
         try:
+            # BASIS-TRANSITION GATE (M3.6 review F2): runs before the INSERT so the population it
+            # inspects is the pre-existing one. The R4 purge above, when it fired, already deleted
+            # both the bars and the row -- a genuinely empty symbol is not a transition.
+            self._guard_basis_transition(
+                con,
+                provider,
+                symbol,
+                stored_basis,
+                meta_table="intraday_sync_metadata",
+                bars_table="intraday_ohlcv_bars",
+                interval=interval,
+                allow_basis_transition=allow_basis_transition,
+            )
             con.register("temp_intraday_bars_to_insert", records_df)
             con.execute("""
                 INSERT OR REPLACE INTO intraday_ohlcv_bars
@@ -1620,7 +1933,7 @@ class DuckDBCache:
             # merge at all. Verified empirically: the two forms behave identically on the probe
             # columns, which is why the `L2.14` regression tests pin the directional merge
             # behaviourally and the statement shape statically.
-            con.execute("""
+            con.execute(f"""
                 INSERT INTO intraday_sync_metadata AS existing
                     (provider, symbol, interval, earliest_available_ts, is_earliest_known,
                      latest_available_ts, latest_close_ref, last_sync_time, adjustflag)
@@ -1645,7 +1958,12 @@ class DuckDBCache:
                         CAST(? AS DOUBLE), existing.latest_close_ref
                     ),
                     last_sync_time = excluded.last_sync_time,
-                    adjustflag = COALESCE(excluded.adjustflag, existing.adjustflag)
+                    adjustflag = CASE
+                        WHEN existing.adjustflag IS NULL
+                             AND excluded.adjustflag = '{_UNDECLARED_BASIS}'
+                            THEN NULL
+                        ELSE COALESCE(excluded.adjustflag, existing.adjustflag)
+                    END
             """, [
                 provider,
                 symbol,
@@ -1655,7 +1973,7 @@ class DuckDBCache:
                 reconciled.latest,
                 latest_close_ref,
                 sync_ts,
-                canon_adjust,
+                stored_basis,
                 bars_min_ts,
                 bars_max_ts,
                 latest_close_ref,
@@ -1677,6 +1995,8 @@ class DuckDBCache:
         *,
         allow_history_rewrite: bool = False,
         rewrite_reason: Optional[str] = None,
+        allow_basis_transition: bool = False,
+        allow_undeclared_basis: bool = False,
     ) -> None:
         """Upserts daily OHLCV bars into ohlcv_bars and updates asset_sync_metadata.
 
@@ -1753,10 +2073,25 @@ class DuckDBCache:
                 requested_end=requested_end,
                 sync_time=sync_time,
                 adjustflag=canon_adjust,
+                allow_basis_transition=allow_basis_transition,
+                allow_undeclared_basis=allow_undeclared_basis,
             )
 
         if is_synthetic_provider(provider) or df.empty:
             return
+
+        # P1 write-side gate: an omission is not a declaration. See `_resolve_write_basis` and
+        # `AdjustBasisRequiredError`. When explicitly opted into, the undeclared write records the
+        # `_UNDECLARED_BASIS` sentinel rather than SQL NULL: NULL on this column is RESERVED for
+        # pre-M3.6 rows, and laundering a modern write into it would erase that migration signal.
+        stored_basis = _resolve_write_basis(
+            provider,
+            symbol,
+            interval,
+            canon_adjust,
+            allow_undeclared_basis=allow_undeclared_basis,
+            store="store_bars",
+        )
 
         # Ensure required price columns; default Volume to 0.0 if omitted
         for col in ["Open", "High", "Low", "Close"]:
@@ -1813,6 +2148,26 @@ class DuckDBCache:
             # ------------------------------------------------------------------------------
             con.execute("BEGIN TRANSACTION")
             started_txn = True
+            # ------------------------------------------------------------------------------
+            # BASIS-TRANSITION GATE (M3.6 review F2) -- before the bar INSERT, so the row count it
+            # reads is the PRE-EXISTING one.
+            #
+            # `adjustflag = COALESCE(excluded.adjustflag, existing.adjustflag)` used to let a writer
+            # stamp a label onto already-stored rows whose basis was never recorded: legacy QFQ
+            # rows (metadata NULL) became `"raw"` after one raw sync, and every later read then
+            # multiplied already-QFQ prices by the factor again. The history-rewrite gate below
+            # cannot see this -- it compares prices only, and the *next* write of the same window
+            # is price-identical. So the label claim gets its own gate.
+            # ------------------------------------------------------------------------------
+            self._guard_basis_transition(
+                con,
+                provider,
+                symbol,
+                stored_basis,
+                meta_table="asset_sync_metadata",
+                bars_table="ohlcv_bars",
+                allow_basis_transition=allow_basis_transition,
+            )
             # ------------------------------------------------------------------------------
             # HISTORY-REWRITE GATE (L2.32) -- runs before the INSERT OR REPLACE below, on the
             # same connection, in the same transaction, with `temp_bars_to_insert` already
@@ -2022,7 +2377,7 @@ class DuckDBCache:
                     "asset_sync_metadata self-heal for (%s, %s): %s", provider, symbol, repair
                 )
 
-            con.execute("""
+            con.execute(f"""
                 INSERT INTO asset_sync_metadata AS existing
                     (provider, symbol, earliest_available_date, is_earliest_known,
                      latest_available_date, last_sync_time, adjustflag)
@@ -2044,7 +2399,12 @@ class DuckDBCache:
                         )
                     ),
                     last_sync_time = excluded.last_sync_time,
-                    adjustflag = COALESCE(excluded.adjustflag, existing.adjustflag)
+                    adjustflag = CASE
+                        WHEN existing.adjustflag IS NULL
+                             AND excluded.adjustflag = '{_UNDECLARED_BASIS}'
+                            THEN NULL
+                        ELSE COALESCE(excluded.adjustflag, existing.adjustflag)
+                    END
             """, [
                 provider,
                 symbol,
@@ -2052,7 +2412,7 @@ class DuckDBCache:
                 reconciled.is_earliest_known,
                 reconciled.latest,
                 sync_ts,
-                canon_adjust,
+                stored_basis,
                 bars_min_date,
                 bars_max_date,
             ])
@@ -2187,12 +2547,148 @@ class DuckDBCache:
         res_df.index.name = "date"
         return res_df
 
+    def _resolve_read_basis(
+        self,
+        provider: str,
+        symbol: str,
+        req_mode: str,
+        *,
+        interval: Optional[str] = None,
+        allow_legacy_basis: bool = False,
+    ) -> Optional[str]:
+        """Three-state basis resolution shared by all four bar-read entry points.
+
+        Returns the declared stored basis (`raw`/`qfq`/`hfq`), or `None` for the legacy
+        pass-through (only reachable with `allow_legacy_basis=True`, or for a factor-neutral
+        symbol). Raises:
+          * `UnknownAdjustBasisError` -- stored basis is SQL NULL (pre-M3.6 row) and the caller
+            did not opt into the legacy pass-through (M3.6 review F1). NOT downgraded to a warning
+            and NOT silently widened to a smaller universe: a wrong-basis read is a percent-level
+            price error, not a missing symbol;
+          * `ValueError` -- stored basis is declared but different from the request and cannot be
+            derived (e.g. stored `qfq`, asked `raw`).
+
+        Factor-neutral symbols never raise: `_apply_factors_to_df` is the identity for them, so
+        their basis cannot change a single returned price.
+        """
+        if interval is not None and is_intraday_interval(interval):
+            meta = self.get_intraday_metadata(provider, symbol, interval)
+            meta_table = "intraday_sync_metadata"
+        else:
+            meta = self.get_asset_metadata(provider, symbol)
+            meta_table = "asset_sync_metadata"
+
+        raw_basis = meta.get("adjustflag") if meta else None
+        stored_basis = parse_stored_basis(raw_basis)
+
+        if stored_basis is None:
+            if is_factor_neutral_symbol(symbol):
+                return None
+            # P1: SQL NULL (pre-M3.6) and the `_UNDECLARED_BASIS` sentinel are ONE state for the
+            # reader -- "nobody ever stated what these bytes are". Both fail closed; the only
+            # difference is the audit trail (`is_legacy_basis_unknown` picks the wording), because
+            # before the P1 fix the sentinel was silently readable and became a fresh bypass for
+            # exactly the hazard F1 exists to stop.
+            key = (provider, symbol, interval or "1d")
+            if not allow_legacy_basis:
+                raise UnknownAdjustBasisError(
+                    provider, symbol, req_mode, interval or "1d", meta_table
+                )
+            if key not in _LEGACY_BASIS_WARNED:
+                _LEGACY_BASIS_WARNED.add(key)
+                origin = (
+                    "carries NO recorded adjustment basis (pre-M3.6 row: the metadata column was "
+                    "added by an in-place migration that backfilled nothing)"
+                    if is_legacy_basis_unknown(raw_basis)
+                    else "was stored with the undeclared-basis sentinel "
+                    "(a writer that could not or would not state its basis)"
+                )
+                warnings.warn(
+                    f"allow_legacy_basis pass-through for {symbol} ({provider}, "
+                    f"interval={interval or '1d'}): the cached bars {origin}, so the "
+                    f"'{req_mode}' request is answered with the stored values UNCHANGED (no "
+                    f"factor derivation, no rescaling). This is only correct if the stored series "
+                    f"already is '{req_mode}'. Declare the basis with "
+                    f"scripts/migrate_adjust_basis.py to make this permanent."
+                )
+            return None
+
+        if stored_basis != "raw" and stored_basis != req_mode:
+            raise ValueError(
+                f"Cannot derive '{req_mode}' adjustment for {symbol} ({provider}): "
+                f"stored data has basis '{stored_basis}'."
+            )
+        return stored_basis
+
+    def _guard_basis_transition(
+        self,
+        con,
+        provider: str,
+        symbol: str,
+        incoming_basis: Optional[str],
+        *,
+        meta_table: str,
+        bars_table: str,
+        interval: Optional[str] = None,
+        allow_basis_transition: bool = False,
+    ) -> None:
+        """Refuses undeclared -> declared basis flips on an already-populated symbol (F2/P1).
+
+        Must run BEFORE the bar INSERT so the row count it reads is the *pre-existing* one.
+        Silent in these cases:
+          * `allow_basis_transition=True` (audited escape hatch; the caller logs it);
+          * the incoming write declares nothing (`None` / `_UNDECLARED_BASIS`) -- nothing is
+            being claimed, and the upsert's `CASE` keeps an existing undeclared marker intact;
+          * no metadata row, or a row that already carries a declared basis;
+          * factor-neutral symbols -- no derivation is ever applied to them, so the label is
+            cosmetic and refusing here would only block index/ETF syncs;
+          * zero stored bars -- there is nothing whose basis could be mislabelled.
+
+        SCOPE (P1 revision): BOTH undeclared states are gated -- SQL NULL (pre-M3.6) and the
+        `_UNDECLARED_BASIS` sentinel. The previous revision gated only NULL, on the argument that
+        a sentinel row was readable pass-through anyway; that argument died with the P1 fix, which
+        made the sentinel fail closed on read. Both are now "the reader is refused", so both are
+        states in which a wrong label is unrecoverable -- the 2026-10-23 incident shape exactly.
+        """
+        if allow_basis_transition or incoming_basis is None or incoming_basis == _UNDECLARED_BASIS:
+            return
+        if is_factor_neutral_symbol(symbol):
+            return
+
+        extra = " AND interval = ?" if interval is not None else ""
+        params: List[Any] = [provider, symbol] + ([interval] if interval is not None else [])
+        row = con.execute(
+            f"SELECT adjustflag FROM {meta_table} WHERE provider = ? AND symbol = ?{extra}",
+            params,
+        ).fetchone()
+        if row is None:
+            return
+        existing = row[0]
+        if parse_stored_basis(existing) is not None:
+            # A declared basis is already recorded; only the two undeclared states are gated.
+            return
+
+        has_rows = con.execute(
+            f"SELECT 1 FROM {bars_table} WHERE provider = ? AND symbol = ?{extra} LIMIT 1",
+            params,
+        ).fetchone()
+        if has_rows is None:
+            return
+
+        raise AdjustBasisTransitionRefused(
+            provider,
+            symbol,
+            incoming_basis,
+            None,
+            meta_table,
+            interval or "1d",
+        )
+
     def _apply_factors_to_df(
         self,
         df: pd.DataFrame,
         symbol: str,
         adjust_mode: str = "qfq",
-        factors: Optional[pd.DataFrame] = None,
     ) -> pd.DataFrame:
         """Scales Open, High, Low, Close by factor_hfq or derived QFQ in memory.
 
@@ -2201,6 +2697,22 @@ class DuckDBCache:
         - qfq price = raw * hfq[t] / hfq[latest in whole table for symbol]
         - Bars before the first factor date use 1.0.
         - Volume and Amount are NEVER scaled!
+
+        The as-of lookup is a single `np.searchsorted` over DAY-normalised dates
+        (M3.6 review F5): the previous implementation did a Python loop with `bisect` per bar,
+        i.e. one million iterations on a 1.23M-bar 5m series, on the hot read path. The
+        replacement is bit-for-bit equivalent -- `searchsorted(side="right") - 1` is exactly
+        `bisect.bisect_right(...) - 1`, the `-1` case is exactly the old
+        `d < event_dates[0] -> 1.0` branch, and the per-element division is the same IEEE double
+        division, just broadcast -- and pinned by
+        `pipeline/tests/test_adjust_factor_derivation.py::test_apply_factors_vectorised_equivalence`.
+
+        The former `factors=` parameter is gone (M3.6 review F5): all four call sites passed
+        `None`, and its branch anchored QFQ normalisation on `event_hfq[-1]` (the last row of the
+        passed frame) while the main path anchors on `get_latest_factor_hfq` (the whole table).
+        Two different anchors for the same quantity is precisely the kind of drift that makes a
+        windowed read disagree with a full-range read, so the dead branch was removed rather than
+        "unified" -- there is now exactly one anchor.
         """
         if df.empty:
             return df.copy()
@@ -2214,65 +2726,28 @@ class DuckDBCache:
 
         out = df.copy()
 
-        if factors is not None and not factors.empty:
-            fac_df = factors.copy()
-            if not isinstance(fac_df.index, pd.DatetimeIndex):
-                if "date" in fac_df.columns:
-                    fac_df.index = pd.to_datetime(fac_df["date"])
-                elif "Date" in fac_df.columns:
-                    fac_df.index = pd.to_datetime(fac_df["Date"])
-                else:
-                    fac_df.index = pd.to_datetime(fac_df.index)
-            hfq_col = None
-            for c in ["factor_hfq", "backward_factor", "back_adjust_factor", "backAdjustFactor", "adjust_factor", "adjustFactor", "hfq"]:
-                if c in fac_df.columns:
-                    hfq_col = c
-                    break
-            if hfq_col:
-                event_hfq = fac_df[hfq_col].values.astype(float)
-            else:
-                qfq_col = None
-                for c in ["factor_qfq", "forward_factor", "fore_adjust_factor", "foreAdjustFactor", "qfq"]:
-                    if c in fac_df.columns:
-                        qfq_col = c
-                        break
-                if qfq_col:
-                    q_vals = fac_df[qfq_col].values.astype(float)
-                    first_q = q_vals[0] if len(q_vals) > 0 and q_vals[0] != 0 else 1.0
-                    event_hfq = q_vals / first_q
-                else:
-                    event_hfq = np.ones(len(fac_df))
-            event_dates = [pd.Timestamp(d).date() for d in fac_df.index]
-            hfq_latest = float(event_hfq[-1]) if len(event_hfq) > 0 else 1.0
-        else:
-            hfq_latest = self.get_latest_factor_hfq(symbol)
-            if hfq_latest is None:
-                raise MissingAdjustFactorsError(symbol)
+        hfq_latest = self.get_latest_factor_hfq(symbol)
+        if hfq_latest is None:
+            raise MissingAdjustFactorsError(symbol)
 
-            max_bar_date = pd.Timestamp(df.index.max()).date().strftime("%Y-%m-%d")
-            fac_df = self.query_adjust_factors(symbol, end=max_bar_date)
-            if fac_df.empty:
-                raise MissingAdjustFactorsError(symbol)
+        max_bar_date = pd.Timestamp(df.index.max()).date().strftime("%Y-%m-%d")
+        fac_df = self.query_adjust_factors(symbol, end=max_bar_date)
+        if fac_df.empty:
+            raise MissingAdjustFactorsError(symbol)
 
-            event_dates = [pd.Timestamp(d).date() for d in fac_df.index]
-            event_hfq = fac_df["factor_hfq"].values.astype(float)
+        event_hfq = fac_df["factor_hfq"].values.astype(float)
+        event_days = _day_keys(fac_df.index)
+        bar_days = _day_keys(out.index)
 
-        import bisect
-        bar_dates = [pd.Timestamp(ts).date() for ts in out.index]
-        applied_mults = np.ones(len(out), dtype=float)
+        # as-of join, vectorised: index of the last event day <= bar day (-1 when none).
+        pos = np.searchsorted(event_days, bar_days, side="right") - 1
+        hfq_t = np.where(pos >= 0, event_hfq[np.clip(pos, 0, None)], 1.0)
+
         divisor = hfq_latest if (hfq_latest is not None and hfq_latest > 0) else 1.0
-
-        for i, d in enumerate(bar_dates):
-            if d < event_dates[0]:
-                hfq_t = 1.0
-            else:
-                idx = bisect.bisect_right(event_dates, d) - 1
-                hfq_t = event_hfq[idx] if idx >= 0 else 1.0
-
-            if mode == "hfq":
-                applied_mults[i] = hfq_t
-            else:  # qfq
-                applied_mults[i] = hfq_t / divisor
+        if mode == "hfq":
+            applied_mults = hfq_t
+        else:  # qfq
+            applied_mults = hfq_t / divisor
 
         for col in ["Open", "High", "Low", "Close"]:
             if col in out.columns:
@@ -2288,8 +2763,22 @@ class DuckDBCache:
         start: Optional[str] = None,
         end: Optional[str] = None,
         adjustflag: str = "qfq",
+        *,
+        allow_legacy_basis: bool = False,
+        columns: Optional[Any] = None,
     ) -> pd.DataFrame:
-        """Retrieves intraday OHLCV bars for (provider, symbol, interval) across [start, end]."""
+        """Retrieves intraday OHLCV bars for (provider, symbol, interval) across [start, end].
+
+        `columns=` follows the M3.6 contract: `None` (default) returns exactly
+        `_REQUIRED_OHLCV_COLUMNS` and NOT `Amount`; `"all"` adds `Amount`; an explicit sequence
+        returns exactly those columns (an unavailable name raises `ValueError`). The old
+        behaviour -- shape silently changing with whether `amount` happened to be non-NULL on
+        disk -- is what that rule exists to stop.
+
+        `allow_legacy_basis=True` is the warned opt-in for pre-M3.6 rows whose basis was never
+        recorded; without it (and for a non-neutral symbol) the read raises
+        `UnknownAdjustBasisError` instead of returning possibly-mislabelled prices.
+        """
         clauses = ["provider = ?", "symbol = ?", "interval = ?"]
         params: List[Any] = [provider, symbol, interval]
 
@@ -2306,6 +2795,8 @@ class DuckDBCache:
             f"WHERE {' AND '.join(clauses)} ORDER BY ts"
         )
 
+        requested_cols = _resolve_requested_columns(columns)
+
         con = self._get_connection(read_only=True)
         try:
             res_df = con.execute(sql, params).df()
@@ -2314,12 +2805,13 @@ class DuckDBCache:
                 con.close()
 
         if res_df.empty:
-            return pd.DataFrame(columns=_REQUIRED_OHLCV_COLUMNS)
+            return pd.DataFrame(
+                columns=requested_cols if requested_cols is not None else list(_REQUIRED_OHLCV_COLUMNS)
+            )
 
         res_df["ts"] = pd.to_datetime(res_df["ts"])
         res_df = res_df.set_index("ts").sort_index()
         res_df.index.name = "Date"
-        has_amount = "amount" in res_df.columns and res_df["amount"].notna().any()
         res_df = res_df.rename(
             columns={
                 "open": "Open",
@@ -2330,26 +2822,20 @@ class DuckDBCache:
                 "amount": "Amount",
             }
         )
-        target_cols = _REQUIRED_OHLCV_COLUMNS + (["Amount"] if has_amount else [])
-        res_df = res_df[target_cols].astype(float)
-
-        req_mode = canonicalize_adjust_mode(adjustflag)
-        meta = self.get_intraday_metadata(provider, symbol, interval)
-        stored_basis = (
-            canonicalize_adjust_mode(meta["adjustflag"])
-            if (meta and meta.get("adjustflag") is not None)
-            else None
+        res_df = _select_output_columns(
+            res_df, requested_cols, context=f"query_intraday_bars({provider}, {symbol}, {interval})"
         )
 
+        req_mode = canonicalize_adjust_mode(adjustflag)
+        stored_basis = self._resolve_read_basis(
+            provider,
+            symbol,
+            req_mode,
+            interval=interval,
+            allow_legacy_basis=allow_legacy_basis,
+        )
         if stored_basis == "raw":
             res_df = self._apply_factors_to_df(res_df, symbol, adjust_mode=req_mode)
-        elif stored_basis is None or stored_basis == req_mode:
-            pass
-        else:
-            raise ValueError(
-                f"Cannot derive '{req_mode}' adjustment for {symbol} ({provider}): "
-                f"stored data has basis '{stored_basis}'."
-            )
 
         return res_df
 
@@ -2363,8 +2849,14 @@ class DuckDBCache:
         end: Optional[str] = None,
         interval: str = "1d",
         adjust: str = "qfq",
+        *,
+        allow_legacy_basis: bool = False,
+        columns: Optional[Any] = None,
     ) -> pd.DataFrame:
-        """Retrieves OHLCV bars for (provider, symbol) across [start, end], resampled to interval."""
+        """Retrieves OHLCV bars for (provider, symbol) across [start, end], resampled to interval.
+
+        See `query_intraday_bars` for the `columns=` and `allow_legacy_basis=` contracts.
+        """
         if is_intraday_interval(interval):
             return self.query_intraday_bars(
                 provider,
@@ -2373,6 +2865,8 @@ class DuckDBCache:
                 start=start,
                 end=end,
                 adjustflag=adjust,
+                allow_legacy_basis=allow_legacy_basis,
+                columns=columns,
             )
 
         clauses = ["provider = ?", "symbol = ?"]
@@ -2390,6 +2884,8 @@ class DuckDBCache:
             f"WHERE {' AND '.join(clauses)} ORDER BY date"
         )
 
+        requested_cols = _resolve_requested_columns(columns)
+
         con = self._get_connection(read_only=True)
         try:
             res_df = con.execute(sql, params).df()
@@ -2398,11 +2894,12 @@ class DuckDBCache:
                 con.close()
 
         if res_df.empty:
-            return pd.DataFrame(columns=_REQUIRED_OHLCV_COLUMNS)
+            return pd.DataFrame(
+                columns=requested_cols if requested_cols is not None else list(_REQUIRED_OHLCV_COLUMNS)
+            )
 
         res_df["date"] = pd.to_datetime(res_df["date"])
         res_df = res_df.set_index("date").sort_index()
-        has_amount = "amount" in res_df.columns and res_df["amount"].notna().any()
         res_df = res_df.rename(
             columns={
                 "open": "Open",
@@ -2413,26 +2910,19 @@ class DuckDBCache:
                 "amount": "Amount",
             }
         )
-        target_cols = _REQUIRED_OHLCV_COLUMNS + (["Amount"] if has_amount else [])
-        res_df = res_df[target_cols].astype(float)
-
-        req_mode = canonicalize_adjust_mode(adjust)
-        meta = self.get_asset_metadata(provider, symbol)
-        stored_basis = (
-            canonicalize_adjust_mode(meta["adjustflag"])
-            if (meta and meta.get("adjustflag") is not None)
-            else None
+        res_df = _select_output_columns(
+            res_df, requested_cols, context=f"query_bars({provider}, {symbol})"
         )
 
+        req_mode = canonicalize_adjust_mode(adjust)
+        stored_basis = self._resolve_read_basis(
+            provider,
+            symbol,
+            req_mode,
+            allow_legacy_basis=allow_legacy_basis,
+        )
         if stored_basis == "raw":
             res_df = self._apply_factors_to_df(res_df, symbol, adjust_mode=req_mode)
-        elif stored_basis is None or stored_basis == req_mode:
-            pass
-        else:
-            raise ValueError(
-                f"Cannot derive '{req_mode}' adjustment for {symbol} ({provider}): "
-                f"stored data has basis '{stored_basis}'."
-            )
 
         return resample_ohlcv(res_df, interval)
 
@@ -2446,8 +2936,16 @@ class DuckDBCache:
         start: Optional[str] = None,
         end: Optional[str] = None,
         adjustflag: str = "qfq",
+        *,
+        allow_legacy_basis: bool = False,
+        columns: Optional[Any] = None,
     ) -> Dict[str, pd.DataFrame]:
-        """Batch-queries intraday OHLCV bars for multiple symbols in a single SQL query."""
+        """Batch-queries intraday OHLCV bars for multiple symbols in a single SQL query.
+
+        Same `columns=` / `allow_legacy_basis=` contracts as `query_intraday_bars`; the callers
+        that wrap a batch read (`CachedDataProvider.fetch_universe`) must NOT swallow the
+        exceptions below -- a shrunken universe is the failure mode this cache exists to refuse.
+        """
         if not symbols:
             return {}
 
@@ -2469,6 +2967,8 @@ class DuckDBCache:
             f"WHERE {' AND '.join(clauses)} ORDER BY symbol, ts"
         )
 
+        requested_cols = _resolve_requested_columns(columns)
+
         con = self._get_connection(read_only=True)
         try:
             full_df = con.execute(sql, params).df()
@@ -2483,8 +2983,7 @@ class DuckDBCache:
         full_df["ts"] = pd.to_datetime(full_df["ts"])
         grouped = full_df.groupby("symbol")
 
-        start_d = str(pd.to_datetime(start).date()) if start else None
-        end_d = str(pd.to_datetime(end).date()) if end else None
+        req_mode = canonicalize_adjust_mode(adjustflag)
 
         for sym in unique_symbols:
             if sym not in grouped.groups:
@@ -2492,7 +2991,6 @@ class DuckDBCache:
             group = grouped.get_group(sym)
             df = group.set_index("ts").sort_index()
             df.index.name = "Date"
-            has_amount = "amount" in df.columns and df["amount"].notna().any()
             df = df.rename(
                 columns={
                     "open": "Open",
@@ -2503,24 +3001,18 @@ class DuckDBCache:
                     "amount": "Amount",
                 }
             )
-            target_cols = _REQUIRED_OHLCV_COLUMNS + (["Amount"] if has_amount else [])
-            df = df[target_cols].astype(float)
-            req_mode = canonicalize_adjust_mode(adjustflag)
-            meta = self.get_intraday_metadata(provider, sym, interval)
-            stored_basis = (
-                canonicalize_adjust_mode(meta["adjustflag"])
-                if (meta and meta.get("adjustflag") is not None)
-                else None
+            df = _select_output_columns(
+                df, requested_cols, context=f"query_intraday_universe({provider}, {sym}, {interval})"
+            )
+            stored_basis = self._resolve_read_basis(
+                provider,
+                sym,
+                req_mode,
+                interval=interval,
+                allow_legacy_basis=allow_legacy_basis,
             )
             if stored_basis == "raw":
                 df = self._apply_factors_to_df(df, sym, adjust_mode=req_mode)
-            elif stored_basis is None or stored_basis == req_mode:
-                pass
-            else:
-                raise ValueError(
-                    f"Cannot derive '{req_mode}' adjustment for {sym} ({provider}): "
-                    f"stored data has basis '{stored_basis}'."
-                )
             result[sym] = df
 
         return result
@@ -2533,8 +3025,14 @@ class DuckDBCache:
         end: Optional[str] = None,
         interval: str = "1d",
         adjust: str = "qfq",
+        *,
+        allow_legacy_basis: bool = False,
+        columns: Optional[Any] = None,
     ) -> Dict[str, pd.DataFrame]:
-        """Batch-queries OHLCV bars for multiple symbols in a single SQL query."""
+        """Batch-queries OHLCV bars for multiple symbols in a single SQL query.
+
+        Same `columns=` / `allow_legacy_basis=` contracts as `query_bars`.
+        """
         if is_intraday_interval(interval):
             return self.query_intraday_universe(
                 provider,
@@ -2543,6 +3041,8 @@ class DuckDBCache:
                 start=start,
                 end=end,
                 adjustflag=adjust,
+                allow_legacy_basis=allow_legacy_basis,
+                columns=columns,
             )
 
         if not symbols:
@@ -2565,6 +3065,8 @@ class DuckDBCache:
             f"WHERE {' AND '.join(clauses)} ORDER BY symbol, date"
         )
 
+        requested_cols = _resolve_requested_columns(columns)
+
         con = self._get_connection(read_only=True)
         try:
             full_df = con.execute(sql, params).df()
@@ -2579,12 +3081,13 @@ class DuckDBCache:
         full_df["date"] = pd.to_datetime(full_df["date"])
         grouped = full_df.groupby("symbol")
 
+        req_mode = canonicalize_adjust_mode(adjust)
+
         for sym in unique_symbols:
             if sym not in grouped.groups:
                 continue
             group = grouped.get_group(sym)
             df = group.set_index("date").sort_index()
-            has_amount = "amount" in df.columns and df["amount"].notna().any()
             df = df.rename(
                 columns={
                     "open": "Open",
@@ -2595,24 +3098,17 @@ class DuckDBCache:
                     "amount": "Amount",
                 }
             )
-            target_cols = _REQUIRED_OHLCV_COLUMNS + (["Amount"] if has_amount else [])
-            df = df[target_cols].astype(float)
-            req_mode = canonicalize_adjust_mode(adjust)
-            meta = self.get_asset_metadata(provider, sym)
-            stored_basis = (
-                canonicalize_adjust_mode(meta["adjustflag"])
-                if (meta and meta.get("adjustflag") is not None)
-                else None
+            df = _select_output_columns(
+                df, requested_cols, context=f"query_universe({provider}, {sym})"
+            )
+            stored_basis = self._resolve_read_basis(
+                provider,
+                sym,
+                req_mode,
+                allow_legacy_basis=allow_legacy_basis,
             )
             if stored_basis == "raw":
                 df = self._apply_factors_to_df(df, sym, adjust_mode=req_mode)
-            elif stored_basis is None or stored_basis == req_mode:
-                pass
-            else:
-                raise ValueError(
-                    f"Cannot derive '{req_mode}' adjustment for {sym} ({provider}): "
-                    f"stored data has basis '{stored_basis}'."
-                )
             result[sym] = resample_ohlcv(df, interval)
 
         return result

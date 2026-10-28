@@ -878,6 +878,11 @@ def sync_indices_daily(
                     requested_start=plan.requested_start(start),
                     requested_end=end,
                     interval="1d",
+                    # Explicit basis (M3.6 review F7): this section fetches with
+                    # `adjust="none"`, so the bytes ARE raw and the metadata must say so. Without
+                    # the label the row is "undeclared", and a later sync that declared a basis
+                    # would be refused (or, before F2, silently flip every read's basis).
+                    adjustflag="raw",
                 )
                 _report_cross_check(cache, prov, sym, interval="1d")
 
@@ -901,8 +906,17 @@ def patch_equity_daily_bars(
     print(f"PART A.2: Checking & Patching 22 Stocks Recent Daily Bars (-> {end})")
     print("=" * 80)
 
-    em_prov = EastMoneyDataProvider(adjust="qfq")
-    bs_prov = BaoStockDataProvider(adjustflag="2", keep_logged_in=True)
+    # M3.6 review F7: BOTH providers must be asked for RAW bars here.
+    #
+    # Before: `bs_prov = BaoStockDataProvider(adjustflag="2")` (native QFQ) and
+    # `em_prov = EastMoneyDataProvider(adjust="qfq")`, then `store_bars(...)` was called with NO
+    # `adjustflag` -- so QFQ bytes landed in the cache with an unidentifiable basis. Every such
+    # row is either refused at read time (`UnknownAdjustBasisError`) or, before F2, silently
+    # re-multiplied by the factor once someone declared it "raw". The patch path only ever
+    # INSERTS bars the cache lacks (`plan_history_write`), so raw is both the honest label and
+    # the only basis the read-time derivation can work from.
+    em_prov = EastMoneyDataProvider(adjust="none")
+    bs_prov = BaoStockDataProvider(adjustflag="3", keep_logged_in=True)
 
     target_end_date = pd.to_datetime(end).date()
 
@@ -942,16 +956,24 @@ def patch_equity_daily_bars(
                 )
                 print(f"-> Patching {sym} [{prov}] from {patch_start}...", end=" ", flush=True)
 
-                # Fetch recent bars: try BaoStock first then EastMoney
+                # Fetch recent RAW bars: try BaoStock first then EastMoney. `fetch_raw_ohlcv`
+                # (not `fetch_ohlcv`) is what makes the `adjustflag="raw"` label below true --
+                # the providers are constructed unadjusted anyway, but asking for raw explicitly
+                # means the label cannot drift if someone edits the constructor above (F7).
+                # `getattr` fallback mirrors the 5m path's `fetch_bs` idiom: a provider double (or
+                # an older provider) that only implements `fetch_ohlcv` is still called, and the
+                # instance was constructed in raw mode, so the bytes stay raw.
+                fetch_bs = getattr(bs_prov, "fetch_raw_ohlcv", bs_prov.fetch_ohlcv)
                 new_df = pd.DataFrame()
                 try:
-                    new_df = bs_prov.fetch_ohlcv(sym, patch_start, end, interval="1d")
+                    new_df = fetch_bs(sym, patch_start, end, interval="1d")
                 except Exception:
                     pass
                 if new_df.empty:
                     try:
                         time.sleep(0.15)
-                        new_df = em_prov.fetch_ohlcv(sym, patch_start, end, interval="1d")
+                        fetch_em = getattr(em_prov, "fetch_raw_ohlcv", em_prov.fetch_ohlcv)
+                        new_df = fetch_em(sym, patch_start, end, interval="1d")
                     except Exception:
                         pass
 
@@ -1023,6 +1045,9 @@ def patch_equity_daily_bars(
                     requested_start=plan.requested_start(patch_start),
                     requested_end=end,
                     interval="1d",
+                    # F7: the frame came from `fetch_raw_ohlcv` above, so declare it. Leaving
+                    # this off is what produced unidentifiable-basis rows in the first place.
+                    adjustflag="raw",
                 )
                 _report_cross_check(cache, prov, sym, interval="1d")
                 print(f"PATCHED +{len(plan.df)} bars (max: {plan.df.index.max().strftime('%Y-%m-%d')})")

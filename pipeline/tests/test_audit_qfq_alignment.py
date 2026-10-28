@@ -1504,6 +1504,8 @@ def _master_frame(dates, start_price=20.0, step=0.31):
 def _commit(cache, plan, provider=PROVIDER, symbol=SYMBOL):
     if plan.is_empty:
         return
+    # The plans committed here are qfq series by construction (this module audits qfq alignment);
+    # `store_bars` refuses an implicit basis since M3.6 P1, so declare what these bytes are.
     cache.store_bars(
         provider=provider,
         symbol=symbol,
@@ -1511,6 +1513,7 @@ def _commit(cache, plan, provider=PROVIDER, symbol=SYMBOL):
         requested_start=plan.requested_start(plan.df.index.min().strftime("%Y-%m-%d")),
         requested_end=plan.df.index.max().strftime("%Y-%m-%d"),
         interval="1d",
+        adjustflag="qfq",
     )
 
 
