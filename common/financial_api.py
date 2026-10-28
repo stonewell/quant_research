@@ -94,6 +94,133 @@ class DataProviderPayloadError(RuntimeError):
         self.body_snippet = body_snippet
 
 
+class DataProviderSessionError(DataProviderPayloadError):
+    """A transport failure that session healing could not repair.
+
+    Raised only after `BaoStockDataProvider` has actually tried to rebuild the socket
+    (bounded by `BAOSTOCK_MAX_RELOGINS`) and the same request still failed at the
+    transmission layer. It is deliberately a *subclass* of `DataProviderPayloadError`:
+    every existing caller already isolates that type per symbol and reports it as a
+    fetch failure (never as "no data"), so healing adds a capability without changing
+    the classification downstream. The message additionally names the relogin budget
+    actually consumed, the triggering `error_code`/msg and the symbol.
+    """
+
+
+# --------------------------------------------------------------------------- #
+# BaoStock session self-healing (2026-10-27, follow-up to the rc=-2 hang)
+# --------------------------------------------------------------------------- #
+# WHY THIS EXISTS: `BaoStockDataProvider._apply_socket_timeout` only turns the
+# unbounded `recv` into an observable failure -- it cannot repair the session. Once
+# the server answers with a GBK/GB18030 error page, `baostock.util.socketutil.send_msg`
+# swallows the `UnicodeDecodeError`, `while True: recv` never sees the
+# `<![CDATA[]]>` terminator again, and `context.default_socket` keeps pointing at that
+# desynchronised stream. Because `keep_logged_in=True` never calls `login()` again,
+# one bad answer poisons every later query in the process. The provider therefore
+# tracks "the session is dirty" and rebuilds it (logout -> close -> login) on the next
+# request.
+#
+# Relogin is safe *because* this workspace downloads BaoStock strictly serially
+# (see the BaoStock sequential-only rule in AGENTS.md): one process, one thread,
+# `BaoStockDataProvider._lock`, no concurrent sessions that a fresh login could evict.
+
+#: Process-wide relogin counter, deliberately NOT reset on success. A server that
+#: breaks every Nth query would otherwise never exhaust a per-request budget and the
+#: process would relogin forever -- exactly the unbounded loop this guard exists to
+#: prevent. Shared across provider instances because the poisoned socket lives in
+#: `baostock.common.context`, which is itself process-global.
+_BAOSTOCK_RELOGIN_STATE: Dict[str, int] = {"count": 0}
+
+#: Conservative default for `BAOSTOCK_MAX_RELOGINS`. Each relogin costs a TCP
+#: handshake + a login round-trip and BaoStock throttles by IP, so 3 is enough to ride
+#: out a transient blip during a ~400-symbol sync while still failing loudly (instead
+#: of hanging or hammering) when the service is genuinely down.
+_DEFAULT_MAX_RELOGINS = 3
+
+#: `baostock/common/contants.py:155-162` -- the socket/connection family, and the ONLY
+#: error codes that mean "the transport broke". Everything else is the request's fault
+#: (`BSERR_PARAM_ERR` 10004006, `BSERR_DATE_ERR` 10004010, `BSERR_CODE_INVALIED`
+#: 10004011, ...) or a legitimately empty answer (`error_code == "0"` with zero rows),
+#: and must never trigger a relogin.
+_BAOSTOCK_TRANSPORT_ERROR_CODES = frozenset(
+    {
+        "10002001",  # BSERR_SOCKET_ERR              网络错误
+        "10002002",  # BSERR_CONNECT_FAIL            网络连接失败
+        "10002003",  # BSERR_CONNECT_TIMEOUT         网络连接超时
+        "10002004",  # BSERR_RECVCONNECTION_CLOSED   网络接收时连接断开
+        "10002005",  # BSERR_SENDSOCK_FAIL           网络发送失败
+        "10002006",  # BSERR_SENDSOCK_TIMEOUT        网络发送超时
+        "10002007",  # BSERR_RECVSOCK_FAIL           网络接收错误  <- the 2026-10-27 incident
+        "10002008",  # BSERR_RECVSOCK_TIMEOUT        网络接收超时
+    }
+)
+
+#: `send_msg` swallows the real exception and only `print`s it, so classification often
+#: has to fall back on text. These are the strings the library itself emits for the
+#: socket family (`socketutil.py:44/54/92-95`, `history.py:108`, `loginout.py:79/202`)
+#: plus CPython's transport-level wording.
+_BAOSTOCK_TRANSPORT_MSG_HINTS: Tuple[str, ...] = (
+    "接收数据异常",
+    "网络接收错误",
+    "网络接收超时",
+    "网络连接失败",
+    "网络连接超时",
+    "网络发送失败",
+    "网络发送超时",
+    "接收时连接断开",
+    "timed out",
+    "timeout",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "connection closed",
+    "broken pipe",
+    "recv",
+    "socket",
+)
+
+
+def _is_transport_failure(error_code: Any, msg: Any) -> bool:
+    """Classify one BaoStock failure as transport/session (repairable) vs business.
+
+    The single source of truth for "should we rebuild the socket?". A business error
+    (bad parameter, unsupported code, empty answer) must never trigger a relogin: it
+    would waste a login round-trip and add load to a server that answered correctly.
+    """
+    code = str(error_code if error_code is not None else "").strip()
+    if code in _BAOSTOCK_TRANSPORT_ERROR_CODES:
+        return True
+    text = str(msg if msg is not None else "").strip().lower()
+    if not text:
+        return False
+    return any(hint.lower() in text for hint in _BAOSTOCK_TRANSPORT_MSG_HINTS)
+
+
+def _parse_max_relogins(raw: Any) -> int:
+    """`BAOSTOCK_MAX_RELOGINS` -> positive int, else the conservative default + warning.
+
+    `0`/negative would disable the guard entirely and a malformed value is equally
+    unusable, so both degrade to `_DEFAULT_MAX_RELOGINS` loudly instead of silently
+    permitting an unbounded relogin loop.
+    """
+    if raw is None or str(raw).strip() == "":
+        return _DEFAULT_MAX_RELOGINS
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        warnings.warn(
+            f"Invalid BAOSTOCK_MAX_RELOGINS={raw!r}; falling back to {_DEFAULT_MAX_RELOGINS}."
+        )
+        return _DEFAULT_MAX_RELOGINS
+    if value <= 0:
+        warnings.warn(
+            f"BAOSTOCK_MAX_RELOGINS={value} must be positive; falling back to "
+            f"{_DEFAULT_MAX_RELOGINS} (an unbounded relogin loop is worse than failing)."
+        )
+        return _DEFAULT_MAX_RELOGINS
+    return value
+
+
 def _url_host_path(url: Any) -> str:
     """`https://push2his.eastmoney.com/api/qt/stock/kline/get` (query string dropped)."""
     try:
@@ -1592,6 +1719,13 @@ class BaoStockDataProvider(BaseDataProvider):
       (`error_code != "0"`), instead of an unbounded hang / a silent empty frame.
       See the 2026-10-27 Stage-1 incident notes in `_socket_timeout` and on the
       `transport_errors` list below.
+    - Session self-healing: a *transport* failure (socket family `error_code`, a
+      `TimeoutError`/`OSError`, or a "接收数据异常" message) marks the session dirty and
+      rebuilds it (`logout` -> close -> `login`) on the next request or immediately,
+      retrying the same request once. Bounded by `BAOSTOCK_MAX_RELOGINS` (default 3,
+      process-wide); past that a `DataProviderSessionError` is raised instead of
+      reloginning forever. Business errors (bad parameter, real "no data") never
+      relogin. See the module-level "BaoStock session self-healing" note.
     """
 
     _lock = threading.Lock()
@@ -1627,12 +1761,53 @@ class BaoStockDataProvider(BaseDataProvider):
             self._socket_timeout = float(os.environ.get("BAOSTOCK_SOCKET_TIMEOUT", "60"))
         except (TypeError, ValueError):
             self._socket_timeout = 60.0
+        #: Per-process relogin budget (`BAOSTOCK_MAX_RELOGINS`, default 3 -- see
+        #: `_DEFAULT_MAX_RELOGINS` for why it is that conservative).
+        self._max_relogins = _parse_max_relogins(os.environ.get("BAOSTOCK_MAX_RELOGINS"))
+        #: True once a transport failure has been observed on the current socket. Read by
+        #: `_ensure_session` at every request entry, cleared only by a successful login.
+        self._session_dirty = False
+        #: Last `(error_code, error_msg)` that dirtied the session -- kept so an
+        #: entry-time heal (which has no query of its own) can still name the trigger.
+        self._last_transport_failure: Optional[Tuple[str, str]] = None
+        # -- cache wiring ---------------------------------------------------
+        # 2026-10-27 (residual sibling of the L2.13 production-path guard in
+        # `common/duckdb_cache.py::refuse_production_cache_path`): the previous final
+        # branch was
+        #     self._duckdb_cache = DuckDBCache(db_path="data") if os.path.exists("data") else None
+        # i.e. an *implicit*, CWD-RELATIVE, READ-WRITE open of `<cwd>/data`. Three problems:
+        #   1. it resurrected a deliberately deleted production cache: any bare
+        #      `BaoStockDataProvider()` (this module itself builds one at five call sites,
+        #      e.g. `MarketDBDataProvider`'s index fallback) recreated `<cwd>/data/cache.duckdb`;
+        #   2. the target file depended on the process CWD, so two processes started from
+        #      different directories wrote two different "caches" with no warning at all;
+        #   3. it contradicted the "no cache requested" intent -- this provider's only cache
+        #      use is `query_fundamentals`/`store_fundamentals`, both strictly optional.
+        # Rule now: never open a cache that was not explicitly requested, and never open one
+        # at a relative path (whose meaning is CWD-dependent). An explicit ABSOLUTE
+        # `cache_dir` keeps the historical read-write open: existing callers/tests pass a
+        # temp dir precisely so fundamentals get persisted and re-read (see
+        # `common/tests/test_financial_api.py::test_baostock_fetch_financial_indicators`),
+        # so forcing `read_only=True` there would silently disable that write path.
         if cache is not None:
             self._duckdb_cache = cache
         elif cache_dir is not None:
-            self._duckdb_cache = DuckDBCache(db_path=cache_dir)
+            cache_dir_str = os.fspath(cache_dir)
+            if os.path.isabs(cache_dir_str):
+                self._duckdb_cache = DuckDBCache(db_path=cache_dir_str)
+            else:
+                warnings.warn(
+                    f"BaoStockDataProvider: ignoring relative cache_dir={cache_dir_str!r}. "
+                    f"A CWD-relative cache path would create/overwrite a database whose "
+                    f"location depends on where the process was started (this is how a "
+                    f"deleted production cache used to be recreated as <cwd>/data). "
+                    f"Pass an absolute path, or `cache=DuckDBCache(db_path=':memory:')` "
+                    f"for scratch state. Continuing WITHOUT a fundamentals cache."
+                )
+                self._duckdb_cache = None
         else:
-            self._duckdb_cache = DuckDBCache(db_path="data") if os.path.exists("data") else None
+            # No cache was requested: stay cache-free instead of probing/creating `<cwd>/data`.
+            self._duckdb_cache = None
 
     def logout(self) -> None:
         """Explicitly log out of BaoStock if keep_logged_in was used."""
@@ -1677,6 +1852,142 @@ class BaoStockDataProvider(BaseDataProvider):
             sock.settimeout(self._socket_timeout)
         except Exception:
             pass
+
+    # -- session self-healing ------------------------------------------------
+    # See the module-level "BaoStock session self-healing" note: a transport failure
+    # leaves baostock's process-global socket desynchronised, and `keep_logged_in=True`
+    # never logs in again on its own, so the provider has to rebuild it explicitly.
+
+    def _close_stale_socket(self) -> None:
+        """Tear down baostock's module-global socket so the next `login()` starts clean.
+
+        `baostock.login.loginout.logout` sends its message first and only closes
+        `context.default_socket` *after* a successful `send_msg` (`loginout.py:195-227`);
+        on a desynchronised stream `send_msg` returns `None` and `logout` returns early at
+        line 200-203, so the poisoned socket would stay open *and still referenced*.
+        Closing it here also keeps the relogin fast: `send_msg` then short-circuits on
+        `default_socket is None` instead of burning a full `recv` timeout.
+        """
+        try:
+            from baostock.common import context as _bs_context
+        except Exception:
+            return
+        sock = getattr(_bs_context, "default_socket", None)
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        try:
+            _bs_context.default_socket = None
+        except Exception:
+            pass
+
+    def _login(self, bs) -> bool:
+        """One `baostock.login()` + `_apply_socket_timeout()`. False on a login failure."""
+        lg = bs.login()
+        if hasattr(lg, "error_code") and lg.error_code != "0":
+            warnings.warn(f"BaoStock login failed: {getattr(lg, 'error_msg', 'unknown error')}")
+            return False
+        if self._keep_logged_in:
+            self._is_logged_in = True
+        self._session_dirty = False
+        self._apply_socket_timeout()
+        return True
+
+    def _ensure_session(self, bs, symbol: Optional[str] = None) -> bool:
+        """Request-entry guard: heal a dirty session, otherwise log in when needed.
+
+        Returns False only when a *fresh* login itself is refused (unchanged behaviour:
+        the caller degrades to an empty/failed result). A session already known to be
+        broken is re-established here (bounded by `BAOSTOCK_MAX_RELOGINS`) so that a
+        single poisoned answer does not poison every later symbol; when that heal is
+        refused it raises rather than returning a silent empty frame.
+        """
+        if self._session_dirty:
+            # Checked BEFORE the "log in when needed" branch on purpose: after a refused
+            # relogin `_is_logged_in` is False, and taking that branch would retry the
+            # login once per symbol *outside* the budget -- an unbounded login loop.
+            last = self._last_transport_failure
+            trigger = "session marked dirty by an earlier transport failure"
+            if last:
+                trigger = f"{trigger} code={last[0]} msg={last[1]}"
+            if not self._recover_session(bs, symbol=symbol, trigger=trigger):
+                last_code, last_msg = last or (None, None)
+                raise DataProviderSessionError(
+                    self._session_failure_message(
+                        symbol,
+                        trigger,
+                        state="relogin refused by the server",
+                        code=last_code,
+                        msg=last_msg,
+                    ),
+                    body_snippet=str(trigger or "")[:PAYLOAD_SNIPPET_CHARS],
+                )
+            return True
+        if not self._keep_logged_in or not self._is_logged_in:
+            return self._login(bs)
+        return True
+
+    def _recover_session(self, bs, symbol: Optional[str] = None, trigger: str = "") -> bool:
+        """`logout` -> close socket -> `login` -> re-apply timeout (bounded, process-wide).
+
+        Raises `DataProviderSessionError` once the budget is spent: a persistently broken
+        service must fail loudly, never relogin in a loop.
+        """
+        if _BAOSTOCK_RELOGIN_STATE["count"] >= self._max_relogins:
+            last_code, last_msg = self._last_transport_failure or (None, None)
+            raise DataProviderSessionError(
+                self._session_failure_message(
+                    symbol,
+                    trigger,
+                    state="budget exhausted, refusing to relogin again",
+                    code=last_code,
+                    msg=last_msg,
+                ),
+                body_snippet=str(trigger or "")[:PAYLOAD_SNIPPET_CHARS],
+            )
+        _BAOSTOCK_RELOGIN_STATE["count"] += 1
+        _LOGGER.warning(
+            "BaoStock relogin %d/%d (symbol=%s): %s",
+            _BAOSTOCK_RELOGIN_STATE["count"],
+            self._max_relogins,
+            symbol or "<unknown>",
+            str(trigger or "")[:PAYLOAD_SNIPPET_CHARS],
+        )
+        # Order matters: close first so a dead stream cannot stall `logout()` for a full
+        # `recv` timeout, and so no half-open fd survives the new login.
+        self._close_stale_socket()
+        try:
+            bs.logout()
+        except Exception:
+            pass
+        self._is_logged_in = False
+        self._session_dirty = False
+        return self._login(bs)
+
+    def _session_failure_message(
+        self,
+        symbol: Optional[str],
+        trigger: str,
+        *,
+        state: str,
+        code: Any = None,
+        msg: Any = None,
+    ) -> str:
+        """Message that keeps the legacy `unusable BaoStock answer for <symbol>` prefix
+        (downstream parsers and tests rely on it) while adding the session facts."""
+        if symbol:
+            norm_sym = normalize_thscode(symbol)
+            prefix = f"unusable BaoStock answer for {symbol} ({norm_sym}): "
+        else:
+            prefix = "unusable BaoStock session: "
+        return (
+            f"{prefix}{str(trigger or '')[: PAYLOAD_SNIPPET_CHARS * 2]}"
+            f" | session: relogins={_BAOSTOCK_RELOGIN_STATE['count']}/{self._max_relogins} ({state})"
+            f", last_error_code={code if code is not None else '?'}"
+            f", last_error_msg={str(msg if msg is not None else '')[:PAYLOAD_SNIPPET_CHARS]!r}"
+        )
 
     def _fetch_ohlcv_internal(
         self, symbol: str, start: str, end: str, interval: str = "1d", adjustflag: Optional[str] = None
@@ -1733,7 +2044,6 @@ class BaoStockDataProvider(BaseDataProvider):
             chunks = [(start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"))]
 
         bs_code = to_baostock_code(symbol)
-        dfs = []
         # 2026-10-27: a non-"0" `error_code` is a transport/protocol failure (the socket
         # answered with an error page, a desynchronised stream, or `send_msg` gave up after
         # swallowing a UnicodeDecodeError) -- it is NEVER "this symbol has no bars", which is
@@ -1743,71 +2053,114 @@ class BaoStockDataProvider(BaseDataProvider):
 
         with self._lock:
             bs = self._get_bs()
-            if not self._keep_logged_in or not self._is_logged_in:
-                lg = bs.login()
-                if hasattr(lg, "error_code") and lg.error_code != "0":
-                    warnings.warn(f"BaoStock login failed: {getattr(lg, 'error_msg', 'unknown error')}")
-                    return pd.DataFrame(
-                        columns=["Open", "High", "Low", "Close", "Volume"],
-                        index=pd.DatetimeIndex([], name="Date"),
-                    )
-                if self._keep_logged_in:
-                    self._is_logged_in = True
-                self._apply_socket_timeout()
+            if not self._ensure_session(bs, symbol=norm_sym):
+                return pd.DataFrame(
+                    columns=["Open", "High", "Low", "Close", "Volume"],
+                    index=pd.DatetimeIndex([], name="Date"),
+                )
+            #: `(error_code, error_msg)` of a transport failure, if this request hit one.
+            failure: Optional[Tuple[str, str]] = None
+            #: Whether the current request has already consumed its single heal-retry.
+            request_retried = False
             try:
-                for c_start, c_end in chunks:
-                    rs = bs.query_history_k_data_plus(
-                        bs_code,
-                        fields,
-                        start_date=c_start,
-                        end_date=c_end,
-                        frequency=freq,
-                        adjustflag=req_adjustflag,
-                    )
-                    if hasattr(rs, "error_code") and rs.error_code != "0":
+                while True:
+                    dfs = []
+                    transport_errors = []
+                    failure = None
+                    try:
+                        for c_start, c_end in chunks:
+                            rs = bs.query_history_k_data_plus(
+                                bs_code,
+                                fields,
+                                start_date=c_start,
+                                end_date=c_end,
+                                frequency=freq,
+                                adjustflag=req_adjustflag,
+                            )
+                            if hasattr(rs, "error_code") and rs.error_code != "0":
+                                rs_code = getattr(rs, "error_code", "?")
+                                rs_msg = getattr(rs, "error_msg", "")
+                                msg = (
+                                    f"BaoStock query error for {norm_sym} "
+                                    f"(frequency={freq}, {c_start}->{c_end}): "
+                                    f"code={rs_code} "
+                                    f"msg={rs_msg!r}"
+                                )
+                                warnings.warn(msg)
+                                _LOGGER.warning(msg)
+                                transport_errors.append(msg)
+                                if _is_transport_failure(rs_code, rs_msg):
+                                    failure = (str(rs_code), str(rs_msg))
+                                    break
+                                continue
+
+                            chunk_df = None
+                            if (
+                                hasattr(rs, "data")
+                                and isinstance(getattr(rs, "data", None), list)
+                                and hasattr(rs, "cur_row_num")
+                            ):
+                                # Real BaoStock ResultData: extract page-by-page by advancing cur_row_num = len(rs.data)
+                                # (Avoids baostock's broken Pandas-1.x df.append in rs.get_data() and avoids row-by-row overhead)
+                                data_list = []
+                                if rs.data:
+                                    data_list.extend(rs.data)
+                                    rs.cur_row_num = len(rs.data)
+                                    while getattr(rs, "error_code", "0") == "0" and rs.next():
+                                        if rs.data:
+                                            data_list.extend(rs.data)
+                                            rs.cur_row_num = len(rs.data)
+                                        else:
+                                            break
+                                if data_list:
+                                    col_names = rs.fields if (hasattr(rs, "fields") and rs.fields) else fields.split(",")
+                                    chunk_df = pd.DataFrame(data_list, columns=col_names)
+                            elif hasattr(rs, "get_data"):
+                                chunk_df = rs.get_data()
+                            elif hasattr(rs, "next"):
+                                data_list = []
+                                while getattr(rs, "error_code", "0") == "0" and rs.next():
+                                    data_list.append(rs.get_row_data())
+                                if data_list:
+                                    chunk_df = pd.DataFrame(data_list, columns=fields.split(","))
+
+                            if chunk_df is not None and not chunk_df.empty:
+                                dfs.append(chunk_df)
+                    except OSError as exc:
+                        # A real socket error escaping `socketutil.send_msg` / paging
+                        # (`socket.timeout` is `TimeoutError` is `OSError` in py3.10+).
                         msg = (
-                            f"BaoStock query error for {norm_sym} "
-                            f"(frequency={freq}, {c_start}->{c_end}): "
-                            f"code={getattr(rs, 'error_code', '?')} "
-                            f"msg={getattr(rs, 'error_msg', '')!r}"
+                            f"BaoStock transport error for {norm_sym} "
+                            f"(frequency={freq}): {type(exc).__name__}: {exc}"
                         )
                         warnings.warn(msg)
                         _LOGGER.warning(msg)
                         transport_errors.append(msg)
-                        continue
+                        failure = (type(exc).__name__, str(exc))
 
-                    chunk_df = None
-                    if (
-                        hasattr(rs, "data")
-                        and isinstance(getattr(rs, "data", None), list)
-                        and hasattr(rs, "cur_row_num")
+                    # Heal at most once per request: mark the session dirty, rebuild it
+                    # (bounded by BAOSTOCK_MAX_RELOGINS) and re-run every chunk, so a
+                    # symbol that was mid-flight when the stream desynchronised is
+                    # rescued instead of abandoned -- but the request can never loop.
+                    if failure is not None:
+                        # Sticky even when the retry already happened: the next request must
+                        # re-establish the session instead of querying a stream we cannot
+                        # trust (and must fail fast once the budget is gone).
+                        self._session_dirty = True
+                        self._last_transport_failure = failure
+                    if failure is None or request_retried:
+                        break
+                    request_retried = True
+                    if not self._recover_session(
+                        bs,
+                        symbol=norm_sym,
+                        trigger=f"code={failure[0]} msg={failure[1]}",
                     ):
-                        # Real BaoStock ResultData: extract page-by-page by advancing cur_row_num = len(rs.data)
-                        # (Avoids baostock's broken Pandas-1.x df.append in rs.get_data() and avoids row-by-row overhead)
-                        data_list = []
-                        if rs.data:
-                            data_list.extend(rs.data)
-                            rs.cur_row_num = len(rs.data)
-                            while getattr(rs, "error_code", "0") == "0" and rs.next():
-                                if rs.data:
-                                    data_list.extend(rs.data)
-                                    rs.cur_row_num = len(rs.data)
-                                else:
-                                    break
-                        if data_list:
-                            col_names = rs.fields if (hasattr(rs, "fields") and rs.fields) else fields.split(",")
-                            chunk_df = pd.DataFrame(data_list, columns=col_names)
-                    elif hasattr(rs, "get_data"):
-                        chunk_df = rs.get_data()
-                    elif hasattr(rs, "next"):
-                        data_list = []
-                        while getattr(rs, "error_code", "0") == "0" and rs.next():
-                            data_list.append(rs.get_row_data())
-                        if data_list:
-                            chunk_df = pd.DataFrame(data_list, columns=fields.split(","))
-
-                    if chunk_df is not None and not chunk_df.empty:
-                        dfs.append(chunk_df)
+                        # Relogin refused: keep the dirty flag so the next request retries
+                        # healing (or fails fast once the budget is gone) rather than
+                        # talking to a socket we know is broken.
+                        self._session_dirty = True
+                        break
             finally:
                 if not self._keep_logged_in:
                     try:
@@ -1816,6 +2169,21 @@ class BaoStockDataProvider(BaseDataProvider):
                         pass
 
         if not dfs:
+            if failure is not None:
+                # Transport failure that survived a heal-retry: name the session state
+                # explicitly instead of pretending the symbol has no data.
+                budget_spent = _BAOSTOCK_RELOGIN_STATE["count"] >= self._max_relogins
+                raise DataProviderSessionError(
+                    self._session_failure_message(
+                        symbol,
+                        " | ".join(transport_errors),
+                        state="retry failed" + (", budget exhausted" if budget_spent else ""),
+                        code=failure[0],
+                        msg=failure[1],
+                    ),
+                    encoding_used=None,
+                    body_snippet=" | ".join(transport_errors)[:PAYLOAD_SNIPPET_CHARS],
+                )
             if transport_errors:
                 # Every chunk failed at the protocol level: report it as an unreadable
                 # answer (isolatable per symbol) rather than "no data".
@@ -1932,16 +2300,32 @@ class BaoStockDataProvider(BaseDataProvider):
                 warnings.warn(f"BaoStock import failed in fetch_adjust_factors: {exc}")
                 return pd.DataFrame(columns=["factor_hfq"], index=pd.DatetimeIndex([], name="date"))
 
-            if not self._keep_logged_in or not self._is_logged_in:
-                lg = bs.login()
-                if hasattr(lg, "error_code") and lg.error_code != "0":
-                    warnings.warn(f"BaoStock login failed: {getattr(lg, 'error_msg', 'unknown error')}")
-                    return pd.DataFrame(columns=["factor_hfq"], index=pd.DatetimeIndex([], name="date"))
-                if self._keep_logged_in:
-                    self._is_logged_in = True
+            if not self._ensure_session(bs, symbol=norm_sym):
+                return pd.DataFrame(columns=["factor_hfq"], index=pd.DatetimeIndex([], name="date"))
 
             try:
                 rs = bs.query_adjust_factor(code=bs_code, start_date="1990-01-01", end_date=effective_end)
+                if (
+                    hasattr(rs, "error_code")
+                    and rs.error_code != "0"
+                    and _is_transport_failure(rs.error_code, getattr(rs, "error_msg", ""))
+                ):
+                    # Same heal-once rule as the K-line path: rebuild the socket and ask
+                    # again, so one desynchronised page does not cost a symbol its factors.
+                    self._session_dirty = True
+                    self._last_transport_failure = (
+                        str(getattr(rs, "error_code", "?")),
+                        str(getattr(rs, "error_msg", "")),
+                    )
+                    if self._recover_session(
+                        bs,
+                        symbol=norm_sym,
+                        trigger=f"code={getattr(rs, 'error_code', '?')} "
+                        f"msg={getattr(rs, 'error_msg', '')}",
+                    ):
+                        rs = bs.query_adjust_factor(
+                            code=bs_code, start_date="1990-01-01", end_date=effective_end
+                        )
                 if hasattr(rs, "error_code") and rs.error_code != "0":
                     warnings.warn(f"BaoStock query_adjust_factor error: {getattr(rs, 'error_msg', '')}")
                     return pd.DataFrame(columns=["factor_hfq"], index=pd.DatetimeIndex([], name="date"))
@@ -2050,13 +2434,8 @@ class BaoStockDataProvider(BaseDataProvider):
                 warnings.warn(f"BaoStock import failed: {exc}")
                 return base_metrics
 
-            if not self._keep_logged_in or not self._is_logged_in:
-                lg = bs.login()
-                if hasattr(lg, "error_code") and lg.error_code != "0":
-                    warnings.warn(f"BaoStock login failed: {getattr(lg, 'error_msg', 'unknown error')}")
-                    return base_metrics
-                if self._keep_logged_in:
-                    self._is_logged_in = True
+            if not self._ensure_session(bs, symbol=symbol):
+                return base_metrics
 
             try:
                 # Safe row extraction avoiding Pandas 2.x broken rs.get_data()
