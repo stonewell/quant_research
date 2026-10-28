@@ -2,9 +2,8 @@
 
 FORENSIC CONTEXT (what this suite guards)
 -----------------------------------------
-The live archive under
-``web/livetrading/data/runs/chan_four_state_blend/custom_astock_202609_20_new``
-contains three runs whose NAV book was silently wrong:
+The live archive (``web/livetrading/data/runs/chan_four_state_blend/custom_astock_202609_20_new``,
+git-ignored runtime state) had three runs whose NAV book was silently wrong:
 
 * ``10-27/holdings.json`` was byte-identical to ``10-22/post_holdings.json``
   (md5 ``3517d8b523c17c50fbc1c7e7aa432e44``) while ``10-26/post_holdings.json``
@@ -19,9 +18,29 @@ contains three runs whose NAV book was silently wrong:
 
 This file pins ONLY the pure decision layer of the repair script (share
 correction / weights / inertia / row restatement / CSV + ticket shape / .orig
-idempotency). It never touches the real ``data/`` tree, never opens
-``market.duckdb`` and never goes online: every fixture is built in ``tmp_path``
-and the NAV path is exercised through a duck-typed fake reader.
+idempotency). Every fixture is built in ``tmp_path`` and the NAV path is
+exercised through a duck-typed fake reader.
+
+WHICH PART OF THE ARCHIVE MAY BE READ (and which part may NOT)
+---------------------------------------------------------------
+The one and only thing this suite reads out of the live archive is
+``repair_manifest.json`` -- the ledger the repair script writes once and then
+leaves alone (``_write_manifest`` skips the write entirely when the content is
+unchanged apart from the timestamp).
+
+``summary.json`` / ``nav_breakdown.json`` inside the same run directories are
+**rewritten by every real live-trading re-run**: a single ``<date>/`` directory
+is reused round after round and its fields are MERGED rather than replaced (on
+2026-10-27 the file ended up carrying the operator's form value back in
+``portfolio_value`` while ``nav_computed`` still held the restated 198,882.17 --
+``timestamp``/``health_stdout``/``deploy_stdout`` from three different rounds
+coexisting). Asserting their *current* content therefore makes this suite flip
+red/green depending on whether the operator happened to run the station today.
+The contract is instead pinned by the ``tmp_path`` cases
+(``test_patch_summary_satisfies_the_nav_field_contract`` /
+``test_compute_run_nav_output_is_a_superset_of_the_production_schema``), and the
+archive side asserts only the frozen ledger. The guard
+``test_no_test_reads_the_live_runtime_data_dir`` keeps it that way.
 
 WHY IT LIVES IN ``pipeline/tests/``
 -----------------------------------
@@ -34,6 +53,7 @@ which this venv does not have. Run it on its own::
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 from pathlib import Path
@@ -616,37 +636,17 @@ def test_compute_run_nav_output_is_a_superset_of_the_production_schema():
         assert extra in breakdown
 
 
-ARCHIVE_RUNS = (
-    REPO_ROOT
-    / "web/livetrading/data/runs/chan_four_state_blend/custom_astock_202609_20_new"
-)
-
-
-def test_archived_nav_breakdowns_are_a_superset_of_the_production_schema():
-    """真实产出物（若本机存在归档）也必须满足同一套 canonical 契约。"""
-    if not ARCHIVE_RUNS.is_dir():
-        pytest.skip("归档 run 目录不存在（干净 checkout）")
-    for run in ("2026-10-22", "2026-10-26", "2026-10-27"):
-        path = ARCHIVE_RUNS / run / "nav_breakdown.json"
-        if not path.is_file():
-            pytest.skip(f"{path} 尚未生成")
-        breakdown = json.loads(path.read_text("utf-8"))
-        _assert_breakdown_schema(breakdown)
-        # 生产端 raw_valuation_total 的求和在读侧复现一次
-        expected_raw = sum(
-            float(e.get("value_raw") or 0.0)
-            for e in breakdown["per_symbol"].values()
-            if e.get("counted_as") == "equity"
-        )
-        assert breakdown["raw_valuation_total"] == pytest.approx(expected_raw, abs=0.01), run
-        assert breakdown["nav_effective"] == breakdown["nav_computed"], run
-        assert isinstance(breakdown["nav_warnings"], list), run
-        assert isinstance(breakdown["anchors"], dict) and breakdown["anchors"], run
-
-
 # ---------------------------------------------------------------------------
 # 9) summary.json field contract  (defect 3)
 # ---------------------------------------------------------------------------
+#: 归档侧唯一允许读取的运行时文件：修复脚本写死的台账。
+#: 它不会被实盘重跑改写（见 ``_write_manifest``：内容没变就不重写）。
+ARCHIVE_MANIFEST = (
+    REPO_ROOT
+    / "web/livetrading/data/runs/chan_four_state_blend/custom_astock_202609_20_new/repair_manifest.json"
+)
+
+
 def test_patch_summary_satisfies_the_nav_field_contract():
     after = rep.patch_summary(
         {"portfolio_value": 197351.17},
@@ -663,30 +663,124 @@ def test_patch_summary_satisfies_the_nav_field_contract():
     )
 
 
-def test_archived_summaries_satisfy_the_nav_field_contract():
-    if not ARCHIVE_RUNS.is_dir():
-        pytest.skip("归档 run 目录不存在（干净 checkout）")
-    for run in ("2026-10-22", "2026-10-26", "2026-10-27"):
-        path = ARCHIVE_RUNS / run / "summary.json"
-        if not path.is_file():
-            pytest.skip(f"{path} 尚未生成")
-        summary = json.loads(path.read_text("utf-8"))
-        assert summary["nav_source"] == "restated", run
-        # 历史事实：三份的 nav_effective 都是当轮子进程实收的 197,351.17
-        assert summary["nav_effective"] == pytest.approx(197351.17), run
-        assert summary["portfolio_value_original"] == pytest.approx(197351.17), run
-        assert summary["nav_computed"] == pytest.approx(summary["portfolio_value"]), run
-        assert summary["nav_restatement"]["before"] == pytest.approx(197351.17), run
-        assert summary["nav_restatement"]["after"] == pytest.approx(summary["portfolio_value"])
-        assert summary["nav_restatement"]["delta"] == pytest.approx(
-            summary["portfolio_value"] - summary["portfolio_value_original"]
-        ), run
-        if run == "2026-10-22":
-            assert summary["portfolio_value"] == pytest.approx(197351.17), run
+def _manifest_after(entry):
+    """把台账 ``field_changes`` 的 after 值还原成"修复当时写下的那几行"。"""
+    return {
+        change["field"]: change["after"]
+        for change in entry.get("field_changes") or []
+        if change.get("after") != "<absent>"
+    }
+
+
+def _assert_manifest_nav_contract(manifest):
+    """台账里每条 ``summary.json`` 记录都必须满足 NAV 字段契约；返回校验的 run 数。
+
+    只读台账，**不读** ``summary.json`` 的当前值 —— 后者被实盘重跑改写。
+    """
+    checked = 0
+    for entry in manifest.get("files") or []:
+        path = str(entry.get("path") or "")
+        if not path.endswith("/summary.json"):
+            continue
+        run = path.rsplit("/", 2)[-2]
+        after = _manifest_after(entry)
+        assert after.get("nav_source") == "restated", run
+        original = after["portfolio_value_original"]
+        computed = after["nav_computed"]
+        rest = after["nav_restatement"]
+        # nav_effective 是当轮子进程实收值（历史事实），不能被重算值覆盖
+        assert after["nav_effective"] == pytest.approx(original), run
+        assert rest["before"] == pytest.approx(original), run
+        assert rest["after"] == pytest.approx(computed), run
+        assert rest["delta"] == pytest.approx(rest["after"] - rest["before"], abs=0.01), run
+        if rest["delta"] != 0:
+            # 重述确实改了值：台账必须记下 before -> after，且两者不同
+            assert after["portfolio_value"] == pytest.approx(computed), run
+            assert rest["after"] != rest["before"], run
+            assert after["portfolio_value"] != after["portfolio_value_original"], run
         else:
-            assert summary["portfolio_value"] != summary["portfolio_value_original"], run
+            # 无需重述时 patch_summary 不产生 portfolio_value 的改写字
+            assert "portfolio_value" not in after, run
         # canonical UI 字段（app.js::renderNavProvenance 读这两个）
-        assert "cash" in summary and "nav_warnings" in summary
+        assert "cash" in after and "nav_warnings" in after, run
+        checked += 1
+    assert checked, "台账里没有任何 summary.json 记录，契约等于没被守住"
+    return checked
+
+
+def test_repair_manifest_records_summary_nav_restatements_that_satisfy_the_contract():
+    """归档侧唯一一条断言：守"修复当时的记录"，不守"现在归档里躺着什么"。"""
+    if not ARCHIVE_MANIFEST.is_file():
+        pytest.skip("修复台账不存在（干净 checkout / 该仓库从未执行过修复）")
+    manifest = json.loads(ARCHIVE_MANIFEST.read_text("utf-8"))
+
+    assert _assert_manifest_nav_contract(manifest) >= 3
+
+    # nav_breakdown 的 canonical 键集由 tmp_path 用例
+    # ``test_compute_run_nav_output_is_a_superset_of_the_production_schema`` 守；
+    # 归档侧只确认台账把这批产出登记在案，不读它们的内容（每次实盘都会重写）。
+    generated = {
+        str(entry.get("path")).rsplit("/", 2)[-2]
+        for entry in manifest.get("files") or []
+        if str(entry.get("path") or "").endswith("/nav_breakdown.json")
+    }
+    assert set(manifest.get("runs_processed") or []) == generated
+
+
+def test_nav_contract_survives_a_live_rerun_rewriting_the_archive(tmp_path):
+    """实证：重跑实盘把 ``summary.json`` 写回表单值后，契约断言仍然绿。
+
+    这里造的是"重跑之后"的归档形状（字段合并而非替换，与 2026-10-27 那次覆盖一致：
+    ``portfolio_value`` 被写回 197,351.17，``nav_computed`` 还是 198,882.17），台账仍是
+    修复当时的记录。旧用例断言 ``nav_computed == portfolio_value``，读的正是这份会被
+    改写的值，所以它红不红取决于操作者今天跑没跑实盘。
+    """
+    run_dir = tmp_path / "runs" / "2026-10-27"
+    run_dir.mkdir(parents=True)
+    _write_json(
+        run_dir / "summary.json",
+        {
+            "date": "2026-10-27",
+            "portfolio_value": 197351.17,          # 重跑写回的操作员表单值
+            "portfolio_value_original": 197351.17,
+            "nav_effective": 197351.17,
+            "nav_computed": 198882.17,             # 历史重述值，没人清掉
+            "nav_source": "restated",
+        },
+    )
+    manifest = {
+        "files": [
+            {
+                "path": "runs/2026-10-27/summary.json",
+                "action": "patch",
+                "field_changes": [
+                    {"field": "cash", "before": "<absent>", "after": 98698.17},
+                    {"field": "nav_computed", "before": "<absent>", "after": 198882.17},
+                    {"field": "nav_effective", "before": "<absent>", "after": 197351.17},
+                    {
+                        "field": "nav_restatement",
+                        "before": "<absent>",
+                        "after": {"before": 197351.17, "after": 198882.17,
+                                  "delta": 1531.0, "reason": "…"},
+                    },
+                    {"field": "nav_source", "before": "<absent>", "after": "restated"},
+                    {"field": "nav_warnings", "before": "<absent>", "after": ["w"]},
+                    {"field": "portfolio_value", "before": 197351.17, "after": 198882.17},
+                    {"field": "portfolio_value_original", "before": "<absent>", "after": 197351.17},
+                ],
+            }
+        ]
+    }
+    _write_json(tmp_path / "runs" / "repair_manifest.json", manifest)
+
+    rewritten = json.loads((run_dir / "summary.json").read_text("utf-8"))
+    # 这就是旧用例一定红的状态：同一份文件里两个 NAV 口径互相矛盾
+    assert rewritten["nav_computed"] != rewritten["portfolio_value"]
+
+    # 台账断言不受影响 —— 重跑改的是 summary.json，不是修复记录
+    assert _assert_manifest_nav_contract(json.loads(
+        (tmp_path / "runs" / "repair_manifest.json").read_text("utf-8")
+    )) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -788,3 +882,106 @@ def test_ex_dividend_check_reports_db_unavailable_instead_of_faking_an_empty_res
     )
     assert check["errors"], "库不可用时必须显式报错，不能假装查到了 0 个事件"
     assert check["per_symbol"]["000999.SZ"]["event_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 11) 防回归守卫：测试禁止读取实盘运行时数据目录
+# ---------------------------------------------------------------------------
+#: 禁止读取的目录名。用 ``+`` 拼出来，避免守卫自己（以及它自己的报错文本）在源码扫描时
+#: 命中自己 —— ``"livetrading" "/data"`` 这种隐式拼接会被合并成一个常量，不要那样写。
+_LIVE_RUNTIME_DATA = "livetrading" + "/data"
+
+#: 唯一被允许的例外：修复脚本写死的台账（实盘重跑不会改写它）。
+_ALLOWED_RUNTIME_READ = "repair_manifest.json"
+
+#: ``pipeline/tests`` 自身（``__init__.py`` 不存在，用例都是平铺/子目录的 ``test_*.py``）。
+_TESTS_DIR = Path(__file__).resolve().parent
+
+
+def _docstring_ids(tree):
+    """模块/类/函数的 docstring 常量 id —— 历史取证叙述不算读取。"""
+    ids = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = node.body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                ids.add(id(body[0].value))
+    return ids
+
+
+#: 可能承载"路径表达式"的节点类型。
+_PATH_EXPR_TYPES = (
+    ast.Constant, ast.BinOp, ast.Call, ast.JoinedStr, ast.Tuple, ast.List, ast.Attribute,
+)
+
+
+def _runtime_data_read_sites(path: Path):
+    """找出该文件里把路径硬编码到实盘运行时目录的"读取点"。
+
+    逐个字面量看不出来 ``REPO_ROOT / "web" / "livetrading" / "data"`` 或
+    ``os.path.join(ROOT, "web", "livetrading", "data")``，所以对每个路径表达式收集其
+    子树里的字符串常量（按源码顺序）用 ``/`` 拼起来再匹配 —— 两种写法都会还原成同一个
+    目录名。外层表达式会重复命中同一个点，故按 ``(行号, 拼好的串)`` 去重。
+    """
+    tree = ast.parse(path.read_text("utf-8"), filename=str(path))
+    docstrings = _docstring_ids(tree)
+    by_line = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, _PATH_EXPR_TYPES):
+            continue
+        consts = sorted(
+            (
+                n for n in ast.walk(node)
+                if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                and id(n) not in docstrings
+            ),
+            key=lambda n: (n.lineno, n.col_offset),
+        )
+        if not consts:
+            continue
+        joined = "/".join(c.value for c in consts)
+        if _LIVE_RUNTIME_DATA in joined:
+            # 嵌套表达式会重复命中同一个点：每行只留最完整的那条
+            line = consts[0].lineno
+            by_line[line] = max(by_line.get(line, ""), joined, key=len)
+    return sorted(by_line.items())
+
+
+def test_no_test_reads_the_live_runtime_data_dir():
+    """``pipeline/tests`` 里不许有句子去读实盘运行时目录的内容。
+
+    为什么禁止：该目录被 ``web/livetrading/.gitignore:5`` 的 ``data/*`` 忽略，是操作者
+    每次实盘都会改写的运行时状态（``runs/<date>/summary.json`` 等同一个 ``<date>/``
+    目录被多轮复用、字段是**合并**而非替换）。断言其内容会让测试随实盘重跑而红/绿 ——
+    2026-10-27 那次重跑就把 ``summary.json`` 的 ``portfolio_value`` 写回了操作员表单值，
+    直接让 ``test_archived_summaries_satisfy_the_nav_field_contract`` 变红。
+
+    允许的替代做法：``tmp_path`` 造输入、读 ``docs/``、读源码、读修复台账
+    （``repair_manifest.json`` 是修复时写死的记录，重跑不改它）。
+    """
+    violations, allowed = [], []
+    for path in sorted(_TESTS_DIR.rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        rel = path.relative_to(_TESTS_DIR).as_posix()
+        for line, joined in _runtime_data_read_sites(path):
+            site = f"{rel}:{line} -> {joined}"
+            (allowed if _ALLOWED_RUNTIME_READ in joined else violations).append(site)
+
+    assert not violations, (
+        "测试不得硬编码读取实盘运行时目录 " + _LIVE_RUNTIME_DATA + " 下的内容：\n  "
+        + "\n  ".join(violations)
+        + "\n该目录被 web/livetrading/.gitignore:5 的 data/* 忽略，是操作者每次实盘都会改写的"
+        "运行时状态；断言其内容会让测试随实盘重跑而红/绿（重跑改写归档 = 测试翻红）。"
+        "改用 tmp_path 造输入，或只读修复时写死的 repair_manifest.json。"
+    )
+    # 例外只有一处且必须指向台账；新增任何一处都要先评审（这里会立刻报出来）
+    assert len(allowed) <= 1, (
+        "运行时目录读取白名单扩大了，请评审：\n  " + "\n  ".join(allowed)
+    )
+    assert all(_ALLOWED_RUNTIME_READ in site for site in allowed)
