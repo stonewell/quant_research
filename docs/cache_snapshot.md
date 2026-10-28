@@ -49,6 +49,8 @@ WHERE table_name='<t>' ORDER BY ordinal_position;
 
 布局说明：**长表（窄表）**，一行一根 bar，`provider` 是主维度而非列名后缀 —— 同一 `symbol` 在不同 provider 下是**独立序列**（见 §6）。`asset_sync_metadata` 的 **318 行恰好等于** `ohlcv_bars` 的 `(provider,symbol)` 组数，即元数据一序列一行、无孤行无缺行（§3 实测）。
 
+（2026-10-27 复核更正：本列清单为 M3.6 迁移前快照；当前已增 `amount`/`adjustflag` 列与新增 `adjust_factors` 表，见 §11 括注与 `docs/version.md` §22.2 第 1 条）
+
 ## 3. 覆盖
 
 ```sql
@@ -314,21 +316,23 @@ cp -p data/cache.duckdb.bak.20261024-200255 data/cache.duckdb
 
 （并行 walkforward 本身不是风险：payload 合约注释原文 "no worker ever touches the OHLCV cache; so a parallel walk-forward puts exactly ONE reader on `common/duckdb_cache.py` no matter how many workers or folds there are"（`backtester/run_backtest.py:356-359`）——`--n-jobs N` 仍然只有 1 个读者。）
 
-## 11. 复权口径与成交量单位都不在 schema 里
+## 11. 复权口径与成交量单位都不在 schema 里（2026-10-27 复核更正：标题结论已失效 —— `amount`/`adjustflag` 列与 `adjust_factors` 因子表均已入 schema，详见本节正文括注与 `docs/version.md` §22.2 第 1 条）
 
-`_init_tables` 的 `ohlcv_bars` 只有 `provider, symbol, date, open, high, low, close, volume`（`common/duckdb_cache.py:829-842`）——**没有任何 `adjust` / `qfq` / `adj_factor` 列**。同一 `(provider, symbol, date)` 键下数值的口径，完全由**写它的那条路径**决定：
+`_init_tables` 的 `ohlcv_bars` 只有 `provider, symbol, date, open, high, low, close, volume`（`common/duckdb_cache.py:1162-1173`）——**没有任何 `adjust` / `qfq` / `adj_factor` 列**。同一 `(provider, symbol, date)` 键下数值的口径，完全由**写它的那条路径**决定（2026-10-27 复核更正：M3.6/M3.8 后 schema 已变 —— `ohlcv_bars` 增 `amount DOUBLE`（`common/duckdb_cache.py:1171`）；复权基落在 `asset_sync_metadata.adjustflag`（`:1181`）、`intraday_ohlcv_bars.adjustflag`（`:1197`）、`intraday_sync_metadata.adjustflag`（`:1210`），另新增 `adjust_factors` 因子表（`:1216-1224`）。本节标题与「无 adjust 列」结论针对 M3.8 之前旧 schema，权威口径见 `docs/version.md` §22.2 第 1 条）：
 
 | provider | 复权口径（写入侧的写法） | 位置 |
 |---|---|---|
-| `BaoStockDataProvider` | 构造默认 `adjustflag: str = "2"`（前复权） | `common/financial_api.py:1051` |
-| BaoStock **指数** | 强制 `req_adjustflag = "3"`（不复权），字段列表连 `adjustflag` 都不带 | `:1120-1121` |
-| `EastMoneyDataProvider` | `adjust="qfq"` → `fqt="1"` | `:1599-1604` |
-| `YFinanceDataProvider` | `auto_adjust=True` | `common/data.py:149` |
-| `MarketDBDataProvider` / `Fuyao` | `adjust="forward"` → 读本地 `v_daily_qfq` | `common/financial_api.py:285-304`、`:495-514` |
+| `BaoStockDataProvider` | 构造默认 `adjustflag: str = "2"`（前复权） | `common/financial_api.py:1411` |
+| BaoStock **指数** | 强制 `req_adjustflag = "3"`（不复权），字段列表连 `adjustflag` 都不带 | `:1482` / `:1483` |
+| `EastMoneyDataProvider` | `adjust="qfq"` → `fqt="1"` | `:2068`（`__init__` `:2060`） |
+| `YFinanceDataProvider` | `auto_adjust=True` | `common/data.py:207` |
+| `MarketDBDataProvider` / `Fuyao` | `adjust="forward"` → 读本地 `v_daily_qfq` | `common/financial_api.py` `__init__` `:355-390`（view `:374-378`）、`fetch_universe` `:478-545` |
+
+（2026-10-27 复核更正：此表描述 M3.8 之前「直连写入原生复权价」的行为。当前默认 `derive_mode="auto"`，写侧统一为「`fetch_raw_ohlcv` 取 raw + `fetch_adjust_factors` 取因子 + `store_bars(adjustflag="raw")`」；`adjust`/`adjustflag`/`fqt` 仅用于 legacy 直连回退。MarketDB 新增 `fetch_adjust_factors` 直读 `calc_adjust_factor_daily.backward_factor`，Fuyao 纯委托本地 MarketDB，EastMoney 不实现该方法。权威口径见 `docs/version.md` §22.2 第 5 条）
 
 ⇒ **不能假设表内数值口径统一**：不复权的指数行与前复权的个股行在**同一张表**里。跨 provider 比较/拼接前必须逐列验——上半 §6 第 3 条的 2.58%（`600941.SH`）/ 29.44%（`300308.SZ`）台阶就是这条的直接后果。
 
-**成交量单位**：全库**唯一一处显式"手→股"换算在 EastMoney 路径**，注释原文 "Mandatory lots-to-shares volume scaling (f56 is in lots of 100 shares)"，代码 `vol = float(parts[5]) * 100.0`（`common/financial_api.py:1713-1714`）。**BaoStock 路径对 `volume` 不做任何缩放**（`:1240-1256` 只做 rename + `to_numeric`，全段无乘数），`duckdb_cache` 也不做（`store_bars` 里 `"volume": df_to_store["Volume"].astype(float).values`，`common/duckdb_cache.py:1685`；日内同，`:1447`）。⇒ **不要假设全库成交量同一单位**，`volume` 只在"同 provider 同序列"内部可比。
+**成交量单位**：全库**唯一一处显式"手→股"换算在 EastMoney 路径**，注释原文 "Mandatory lots-to-shares volume scaling (f56 is in lots of 100 shares)"，代码 `vol = float(parts[5]) * 100.0`（`common/financial_api.py:2180-2181`）。**BaoStock 路径对 `volume` 不做任何缩放**（`:1610` 只做 rename + `to_numeric`，全段无乘数），`duckdb_cache` 也不做（`store_bars` 里 `"volume": df_to_store["Volume"].astype(float).values`，`common/duckdb_cache.py:1985`；日内同，`:1728`）。⇒ **不要假设全库成交量同一单位**，`volume` 只在"同 provider 同序列"内部可比。
 
 > **与任务书的偏差**：任务书称换算发生在 BaoStock 路径，实测不成立——BaoStock 侧零缩放，换算在 EastMoney 侧。结论（单位不统一）仍成立，归属已按代码更正。
 
@@ -371,10 +375,10 @@ cp -p data/cache.duckdb.bak.20261024-200255 data/cache.duckdb
 
 | | 日线 `store_bars` | 日内 `store_intraday_bars` |
 |---|---|---|
-| 历史行数值变了 | **拒绝**：`rtol=1e-9`、`atol=0`，抛 `HistoryRewriteRefused`（`common/duckdb_cache.py:51`、`:1821`），**一行不写** | **静默清除**：`abs(new_close - ref_close) / ref_close > 1e-4` 时 `DELETE` 该 `(provider, symbol, interval)` 的**全部** bar 与 metadata，再重写（`:1418`、`:1419-1438`） |
-| 逃生口 | 必须 `allow_history_rewrite=True` **且**非空 `rewrite_reason`；flag 无 reason → 写入前 `ValueError`（`:1639-1646`） | 无（不需要，它自己就放行） |
-| 比较范围 | 5 列全比：`open, high, low, close, volume`（`:1756`） | 只用最新一根的 `Close` 对 `latest_close_ref`（`:1415-1418`）—— 抽样一个点判定整段 |
-| 不变量声明 | docstring "HISTORY-REWRITE INVARIANT (L2.32)"（`:1596`） | docstring "R4 QFQ Split/Dividend Drift Detection"（`:1385`） |
+| 历史行数值变了 | **拒绝**：`rtol=1e-9`、`atol=0`，抛 `HistoryRewriteRefused`（`common/duckdb_cache.py:548`、`:2282`），**一行不写** | **静默清除**：`abs(new_close - ref_close) / ref_close > 1e-4` 时 `DELETE` 该 `(provider, symbol, interval)` 的**全部** bar 与 metadata，再重写（`:1801-1818`、`:1817-1823`） |
+| 逃生口 | 必须 `allow_history_rewrite=True` **且**非空 `rewrite_reason`；flag 无 reason → 写入前 `ValueError`（`:2055-2057`） | 无（不需要，它自己就放行） |
+| 比较范围 | 5 列全比：`open, high, low, close, volume`（`:2218`/`:2226`/`:2268`） | 只用最新一根的 `Close` 对 `latest_close_ref`（`:1801-1818`）—— 抽样一个点判定整段 |
+| 不变量声明 | docstring "HISTORY-REWRITE INVARIANT (L2.32)"（`:2012`） | docstring "R4 QFQ Split/Dividend Drift Detection"（`:1743`） |
 
 ⇒ 日线侧"历史不能被偷偷改写"是**有门禁的**；日内侧"整段删掉重写"是**设计如此**。所以**日内表的 md5/行数比日线表更易变**：上半 §2 里 `intraday_ohlcv_bars` 的 2,460,576 行只在"没触发 R4 漂移"时才稳。
 
@@ -382,10 +386,10 @@ cp -p data/cache.duckdb.bak.20261024-200255 data/cache.duckdb
 
 | 事件 | 影响 | 代码路径 |
 |---|---|---|
-| 任何进程写入（含你自己并发的下载器/同步脚本） | md5、行数、mtime 变；可能读到跨版本混合 | §10；`store_bars` `common/duckdb_cache.py:1688`、`store_intraday_bars` `:1450` |
-| **qfq 重基**（分红/拆股；或 Fuyao 重取数时触发 `scale = rem_c / loc_c`） | 既有行 OHLC 整体等比缩放 ⇒ 上半 §6 的跨 provider 台阶、涨跌幅检查全部变 | `common/financial_api.py:802-808`；日线写入会被门禁**拒绝**（除非走 `scripts/repair_qfq_alignment.py` 或显式 opt-in） |
-| **日内 R4 漂移** | 该序列历史被整段删除后重写 ⇒ 行数可能**减少** | `common/duckdb_cache.py:1418-1438` |
-| `--no-cache` | **不改库**，但整轮回测绕开缓存直连 provider（`use_cache=not args.no_cache`，`backtester/run_backtest.py:1124`；`cached = bool(use_cache and cache_dir)`，`common/data.py:1029`）⇒ 结果与上半的快照**无对应关系** | 同上 |
+| 任何进程写入（含你自己并发的下载器/同步脚本） | md5、行数、mtime 变；可能读到跨版本混合 | §10；`store_bars` `common/duckdb_cache.py:1985`、`store_intraday_bars` `:1728` |
+| **qfq 重基**（分红/拆股；或 Fuyao 重取数时触发 `scale = rem_c / loc_c`） | 既有行 OHLC 整体等比缩放 ⇒ 上半 §6 的跨 provider 台阶、涨跌幅检查全部变 | `common/financial_api.py:802-808`；日线写入会被门禁**拒绝**（除非走 `scripts/repair_qfq_alignment.py` 或显式 opt-in）（2026-10-27 复核更正：M3.8 后 qfq 不再重写既有已入库 OHLC —— 存储只存 raw，读时 `factor_qfq = factor_hfq[t]/factor_hfq[最新]` 派生，「既有行整体等比缩放」这一失效机制已被根除。Fuyao 的 `scale = rem_c/loc_c` 仍存在（现 `:1083-1086` / `:1233-1236`），但只对齐取数帧、不写库。权威口径见 `docs/version.md` §22.2） |
+| **日内 R4 漂移** | 该序列历史被整段删除后重写 ⇒ 行数可能**减少** | `common/duckdb_cache.py:1801-1818` |
+| `--no-cache` | **不改库**，但整轮回测绕开缓存直连 provider（`use_cache=not args.no_cache`，`backtester/run_backtest.py:1330`（另见 `:1885`）；`cached = bool(use_cache and cache_dir)`，`common/data.py:1487`（另见 `:1529`））⇒ 结果与上半的快照**无对应关系** | 同上 |
 | 备份回滚（把 `cache.duckdb.bak*` 拷回 `cache.duckdb`） | 直接回到旧指纹；注意 6 个备份的**文件名与 mtime 并不同步**（上半 §1 表内两列明显错位） | 无代码路径，纯文件操作 |
 
 **唯一可靠的"没变"证据**：跑前跑后 `md5sum data/cache.duckdb` + `stat -c '%s %y'` 三项一致（与上半 §8 同口径）。

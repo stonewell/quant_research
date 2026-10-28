@@ -259,7 +259,7 @@ ALTER TABLE asset_sync_metadata ADD COLUMN last_probe_result VARCHAR;   -- 'fres
 ALTER TABLE asset_sync_metadata ADD COLUMN last_probe_time TIMESTAMP;
 ```
 
-`intraday_sync_metadata` 增同四列。**无需数据迁移**：既有 `latest_available_date` / `last_sync_time` 由新判定重新解释。
+`intraday_sync_metadata` 增同四列。**无需数据迁移**：既有 `latest_available_date` / `last_sync_time` 由新判定重新解释。（2026-10-27 复核补充：`asset_sync_metadata`/`intraday_sync_metadata` 另经 M3.6 迁移新增 `adjustflag VARCHAR`，见 `common/duckdb_cache.py:1282,1285`）
 
 **`last_sync_time` 口径。** 当前四处写裸 `datetime.datetime.now()`（`:627, 721, 996, 1148`），从今往后一律写 **tz-aware UTC**。历史行无法追溯修正，必须视为语义不明，因此：**任何逻辑都不得依赖 `last_sync_time` 的绝对数值，只依赖 `latest_available_date`。**
 
@@ -425,7 +425,7 @@ def assert_run_window(clock, stage, window, *, allow_intraday=False, strict=True
 
 ## 13. 与在途修复的关系（避免两套判断）
 
-`scripts/run_live_strategy.py:1436` 处有一份并行落地的临时修复（bar 日期 ≠ `as_of_date` ⇒ 抛错，`--allow-stale-prices` 可降级）。校对结果：该修复已落地，锚点由 `:1436` 下移至约 `:1550`，实现为 `latest_close(universe, sym, as_of_date, strict=not getattr(args, "allow_stale_prices", False))`，边界模块为 `common/freshness.py`。
+`scripts/run_live_strategy.py:1436` 处有一份并行落地的临时修复（bar 日期 ≠ `as_of_date` ⇒ 抛错，`--allow-stale-prices` 可降级）。校对结果：该修复已落地，锚点由 `:1436` 下移至约 `:1550`，实现为 `latest_close(universe, sym, as_of_date, strict=not getattr(args, "allow_stale_prices", False))`，边界模块为 `common/freshness.py`。（2026-10-27 复核更正：锚点已再移至 `scripts/run_live_strategy.py:1989`；现由 `common/freshness.py` 的 `latest_close`(`:1989`) + `last_bar_session`(`:1990`) + `is_stale_bar`(`:1991`) 三调用组成，`strict` 取 `clock_ctx.freshness_strict`（由 `--strict-freshness` AND NOT `--allow-stale-prices` 合成，见 `common/cli_utils.py:566-567`））（行号漂移见本文件 `:462` 的免责声明）
 
 **约束：该修复必须写在 §7 的 `common/freshness.py::latest_close` 边界上**，于是 L2.3 只是"函数体替换（已在模块内）+ 调用点一个 token 变化"：`expected_session=as_of_date` → `expected_session=as_of_trading_date(...)`，**不得新增第二套检查**。若另起一套判断，就退化成 §7 的"两个漂移的检查"，把本次事故的失败类型原样重造。
 

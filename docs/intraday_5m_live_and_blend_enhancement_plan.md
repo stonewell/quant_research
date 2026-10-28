@@ -13,7 +13,7 @@
 在保持本仓库核心铁律——**日频稀疏目标权重契约（Daily Sparse Weights Contract: 非调仓日严格为 `NaN`，清仓/去风险日显式写入 `0.0`）**与**100% 向后兼容现有日线回测**的前提下，本方案将 5分钟数据构建为一套**无前视偏差（Strictly Causal Point-in-Time）的微观结构与多周期共振增强层**，解决当前纯日线体系中的五大核心痛点：
 
 1. **数据源与 DuckDB 缓存层升级（[`common/financial_api.py`](file:///home/stone/Work/github/quant/common/financial_api.py), [`common/duckdb_cache.py`](file:///home/stone/Work/github/quant/common/duckdb_cache.py), [`common/data.py`](file:///home/stone/Work/github/quant/common/data.py), `scripts/record_intraday_5m.py`）**：修复现有缓存层将 `"1m"`/`"5m"` 误映射为月末 `"ME"` 或传入日线重采样、以及抹除日内时间戳的缺陷；构建**“三层混合 5分钟数据底座”**：
-   - **第一层（$T-1$ 深度历史底座）**：新增免费免 Token 的 **`BaoStockDataProvider`（`"baostock"`）**，提供 1999 年至今沪深 A股及 2026 年起场内 ETF 的前复权 `5m` 历史并持久化至 `DuckDBCache`（`intraday_ohlcv_bars` 表）；
+   - **第一层（$T-1$ 深度历史底座）**：新增免费免 Token 的 **`BaoStockDataProvider`（`"baostock"`）**，提供 1999 年至今沪深 A股及 2026 年起场内 ETF 的前复权 `5m` 历史（2026-10-27 复核更正：实盘采集以 `adjustflag="3"`（不复权 raw）入库并写 `adjustflag="raw"`；前复权在**读时**由 `factor_qfq = factor_hfq[t]/factor_hfq[最新]` 派生，不落库、不做历史重写。原设计的「前复权 5m 直接入库」未落地。另：曾计划的 ratio-of-closes 自校准已整条删除，`calibrate_adjust_factors_from_closes` 现为无生产调用点的工具函数，勿再引用为派生来源）并持久化至 `DuckDBCache`（`intraday_ohlcv_bars` 表）；
    - **第二层（Day-$T$ 盘中随开随拉与全品种覆盖）**：新增 **`EastMoneyDataProvider`（`"eastmoney"`，直连 `push2his.eastmoney.com`）**，提供 A股、ETF、宽基指数（`000300.SH`）及北交所（`*.BJ`）最近 30~60 交易日及**当日盘中实时（`09:35..14:15`）**的 `5m` K 线，内置 `O-C-H-L` 字段顺序矫正与 **`Volume = f56 * 100`（手 $\to$ 股）量纲对齐**；
    - **第三层（Day-$T$ 本地实时快照无锁落盘守护）**：新增 `scripts/record_intraday_5m.py`，基于本地已认证的 [`fuyao_client.prices_snapshot`](file:///home/stone/Work/third-party/Financial-API/python/toolkit/fuyao/scripts/fuyao_client.py#L410-L450) / [`index_prices_snapshot`](file:///home/stone/Work/third-party/Financial-API/python/toolkit/fuyao/scripts/fuyao_client.py#L740-L750) / [`fund_market_snapshot`](file:///home/stone/Work/third-party/Financial-API/python/toolkit/fuyao/scripts/fuyao_client.py#L881-L886) 批量实时快照差分合成 5m K 线与 Tick 级精确 `VWAP`，以**无锁原子 Parquet（`data/intraday_5m/{YYYY-MM-DD}.parquet`）**落盘（规避 DuckDB 单写进程锁冲突），并在冷启动或断网空洞时自动调用 `EastMoneyDataProvider` 回补；
    - 同时扩展 [`SyntheticDataProvider`](file:///home/stone/Work/github/quant/common/data.py#L213-L249) 支持与日线 `(Open, High, Low, Close, Volume)` 严格对齐的极值锁定布朗桥（Extremal-Pinned Brownian Bridge）合成 5m K线。
@@ -29,7 +29,7 @@
 ```mermaid
 flowchart TD
     subgraph DATA["1. 三层混合 5分钟与日频数据底座 (common/data.py & common/duckdb_cache.py)"]
-        P0["Layer 1: BaoStockDataProvider ('baostock')\n(免费T-1深度历史底座: 沪深A股/ETF 前复权 5m, 盘后20:00入库)"]
+        P0["Layer 1: BaoStockDataProvider ('baostock')\n(免费T-1深度历史底座: 沪深A股/ETF 前复权 5m（2026-10-27 复核更正：实盘以不复权 `adjustflag=#quot;3#quot;` raw 入库，前复权读时派生）, 盘后20:00入库)"]
         P1["Layer 2: EastMoneyDataProvider ('eastmoney')\n(Day-T盘中实时+近30日5m: A股/ETF/指数/北交所全覆盖, O-C-H-L & 手->股矫正)"]
         P2["Layer 3: 本地实时落盘守护 (scripts/record_intraday_5m.py)\n(Fuyao 批量快照差分合成 -> 无锁 Parquet data/intraday_5m/*.parquet + 东财补洞)"]
         P3["SyntheticDataProvider\n(极值锁定 Brownian Bridge 48根/日 5m 生成器)"]
@@ -249,7 +249,7 @@ flowchart TD
 1. **新增分钟级周期识别函数 `is_intraday_interval(interval: str) -> bool` 并修复 `_INTERVAL_RULES` / `_get_resample_rule`**：
    - 从 [`_INTERVAL_RULES`](file:///home/stone/Work/github/quant/common/duckdb_cache.py#L27-L45) 中移除错误的 `"1m": "ME"`（月线仅保留 `"1mo"`, `"mo"`, `"m"`, `"monthly"`）；
    - 定义 `_INTRADAY_INTERVALS = {"1m", "5m", "15m", "30m", "60m", "1h"}`；
-   - 在 [`_get_resample_rule(interval: str)`](file:///home/stone/Work/github/quant/common/duckdb_cache.py#L48-L57) 中，当 `is_intraday_interval(interval)` 为 `True` 时直接返回 `None`；且仅对 `"1mo"`, `"mo"`, `"m"`, `"monthly"` 返回 `"ME"`，防止 `"5m"` 因 `.endswith("m")` 被误判为月末 `"ME"`。
+   - 在 [`_get_resample_rule(interval: str)`](file:///home/stone/Work/github/quant/common/duckdb_cache.py#L48-L57) 中，当 `is_intraday_interval(interval)` 为 `True` 时直接返回 `None`；且仅对 `"1mo"`, `"mo"`, `"m"`, `"monthly"` 返回 `"ME"`，防止 `"5m"` 因 `.endswith("m")` 被误判为月末 `"ME"`。（2026-10-27 复核：修复实体现为 `common/duckdb_cache.py:395` `is_intraday_interval`，`_init_tables` 现位于 `:1159`）
 2. **在 [`DuckDBCache._init_tables`](file:///home/stone/Work/github/quant/common/duckdb_cache.py#L151-L176) 中新增 `intraday_ohlcv_bars` 与 `intraday_sync_metadata` 表（含复权漂移校验锚点 `latest_close_ref`，评审修订 R4）**：
    ```sql
    CREATE TABLE IF NOT EXISTS intraday_ohlcv_bars (
@@ -277,6 +277,9 @@ flowchart TD
    );
    CREATE INDEX IF NOT EXISTS idx_intraday_lookup ON intraday_ohlcv_bars(provider, symbol, interval, ts);
    ```
+
+   （2026-10-27 复核补充：现表另含 `amount DOUBLE`、`adjustflag VARCHAR`；两 sync-metadata 表经 `_ensure_column` 增 L2.2 四列 `expected_last_session`/`probe_attempts`/`last_probe_result`/`last_probe_time`，见 `common/duckdb_cache.py:1274-1278`）
+
 3. **扩展 `DuckDBCache` 的 `is_range_covered`、`store_bars`、`query_bars` 与 `query_universe` 方法（含 `TIMESTAMP` 边界修复 R13 与除权缓存失效 R4）**：
    - 在 `store_bars` 中增加可选参数 `interval: str = "1d"`（或自动检测 `is_intraday_interval(interval)`）：当 `is_intraday_interval(interval)` 为 `True` 时，写入 `intraday_ohlcv_bars` 与 `intraday_sync_metadata`（记录最新一根 5m 收盘价 `latest_close_ref`），完整保留 `pd.DatetimeIndex` 的分钟级时间戳 `ts`；
    - **日期型 `end` 参数的 `TIMESTAMP` 日末扩展（评审修订 R13，关键防坑点）**：现有 `query_bars` 将 `end="2026-10-16"` 格式化为 `"2026-10-16"`（在 `TIMESTAMP` 列上等价于 `2026-10-16 00:00:00`），若直接执行 `ts <= ?` 会**把 `end` 当天 `09:35..15:00` 的全部 48 根 5m K 线漏掉**！因此在 `query_bars`、`query_universe` 与 `is_range_covered` 中，凡传入不含时分秒（`00:00:00`）的日期型 `end`，必须将查询上界扩展为当天日末 `end_dt.normalize() + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)`（即 `23:59:59.999999`）或使用 `CAST(ts AS DATE) <= ?`；
@@ -313,7 +316,7 @@ flowchart TD
    - **周期与字段映射**：
      - `_BAOSTOCK_FREQ_MAP = {"5m": "5", "15m": "15", "30m": "30", "60m": "60", "1h": "60", "1d": "d", "1wk": "w", "1mo": "m"}`；
      - **分钟线专属字段约束（关键防坑点）**：BaoStock 分钟线仅支持 `"date,time,code,open,high,low,close,volume,amount,adjustflag"`，**严禁**传入日线专属的 `preclose,turn,pctChg,peTTM,isST`（否则 API 直接报错 `error_code != '0'`）；
-     - **复权标志映射**：默认采用前复权 `adjustflag="2"`（后复权为 `"1"`，不复权为 `"3"`，注意与常见接口的编号相反）。
+     - **复权标志映射**：默认采用前复权 `adjustflag="2"`（后复权为 `"1"`，不复权为 `"3"`，注意与常见接口的编号相反）。（2026-10-27 复核更正：编号语义无误，但实盘 `sync_china_5m_and_indices.py:1081` 实际以 `adjustflag="3"`（不复权 raw）采集入库，前复权读时派生，非默认 `"2"`）
 2. **17位毫秒级时间戳解析与全字符串数值清洗**：
    - BaoStock 分钟线返回的 `time` 字段为 **17位紧凑字符串 `YYYYMMDDHHMMSSsss`**（例如 `"20261016093500000"` 代表 `2026-10-16 09:35:00`），且所有数值列均为 `str` 类型（停牌或缺失时可能为 `""`）：
    ```python

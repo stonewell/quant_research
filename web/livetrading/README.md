@@ -3,7 +3,7 @@
 # Live Trading Deployment Web Station (实盘量化交易与风控部署平台)
 
 An institutional-grade, responsive live trading dashboard and execution workstation deployed under `web/livetrading`.
-Features complete Stage 1 Health Gate inspection, Stage 2 live order generation (SELLS FIRST -> BUYS SECOND -> CASH SWEEP), custom universe management, interactive holdings editing, and daily historical snapshot archives.
+Features complete Stage 1 Health Gate inspection, Stage 2 live order generation (SELLS FIRST -> BUYS SECOND -> POSITIONS HELD -> CASH SWEEP), custom universe management, interactive holdings editing, and daily historical snapshot archives.
 
 ---
 
@@ -27,7 +27,7 @@ Features complete Stage 1 Health Gate inspection, Stage 2 live order generation 
    - Outputs visual directive badges: `🟢 GO`, `🟡 CAUTION`, `🔴 NO-GO`.
 5. **Stage 2: Live Trading Ticket Generation**:
    - Translates target weights vs. current holdings into concrete trading orders.
-   - Enforces execution hierarchy: **Phase 1: SELLS FIRST** (release purchasing power) $\rightarrow$ **Phase 2: BUYS SECOND** (exact lot-rounded entries) $\rightarrow$ **Phase 3: CASH SWEEP**.
+   - Enforces execution hierarchy: **Phase 1: SELLS FIRST** (release purchasing power) $\rightarrow$ **Phase 2: BUYS SECOND** (exact lot-rounded entries) $\rightarrow$ **Phase 3: POSITIONS HELD** (inertia-filtered holds) $\rightarrow$ **Phase 4: CASH SWEEP** (idle cash into `BIL`/`511880`/`GC001`).
    - Applies the 5% inertia turnover filter, single-stock caps, and market-specific lot sizing (100 for A-shares, 1 for US, board lots for HK).
    - One-click CSV ticket export for broker execution.
 6. **Immutable Daily Snapshot Archive & Historical Date Browser**:

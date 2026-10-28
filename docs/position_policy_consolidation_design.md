@@ -14,7 +14,7 @@
 
 | 实现 | 权重决策拥有者 | 状态拥有者 | 状态内容 | 时钟 | 关键默认值 |
 |---|---|---|---|---|---|
-| `position_lifecycle.py` | `step_position_lifecycle` → `LifecycleDecision`（每-symbol，`:271-761`） | `AssetLifecycleState`（`:163-226`） | 6 态 `PositionState`（`:20-27`）+ `held_bars/entry_streak/exit_streak/cooldown_remaining/entry_price/peak_price/current_weight/broker_weight/last_exit_type` | bar（每次调用递减；休市冻结 `:312-337`） | `guard_latency=2`, `min_holding=1`, `normal_cooldown=1`, `stop_cooldown=5`, `inertia=0.05`, `inertia_relative_ratio=0.0`, `hard_stop=0.08`, `atr_mult=4.5`, `vol_surge=1.5`, `breadth=0.60`（`:139-160`） |
+| `position_lifecycle.py` | `step_position_lifecycle` → `LifecycleDecision`（每-symbol，`:271-761`） | `AssetLifecycleState`（`:163-226`） | 6 态 `PositionState`（`:20-27`）+ `held_bars/entry_streak/exit_streak/cooldown_remaining/entry_price/peak_price/current_weight/broker_weight/last_exit_type` | bar（每次调用递减；休市冻结 `:312-337`） | `guard_latency=2`, `min_holding_bars=2`, `normal_cooldown_bars=2`, `stop_cooldown=5`, `inertia=0.05`, `inertia_relative_ratio=0.0`, `hard_stop=0.08`, `atr_mult=4.5`, `vol_surge=1.5`, `breadth=0.60`（`:139-160`）（2026-10-27 复核更正：`PositionLifecycleConfig` 现为 `min_holding_bars=2`、`normal_cooldown_bars=2`，与实盘 `--reentry-cooldown-bars=2` 已一致）（2026-10-27 复核更正：现行为 `PositionState` `:25`、`AssetLifecycleState` `:186-248`、`step_position_lifecycle` `:293-800`；`scripts/run_live_strategy.py:1558-1559` 与 `:1565` 经实测仍准确，不必改） |
 | `blend_base.py`（日循环） | `generate_weights` 内部 per-asset stop/cooldown/entry-confirm/expansion/inertia（`:874-964,1412-1559`） | 裸字典 `asset_cooldown_until/asset_entry_price/asset_peak_price/entry_signal_bars/expansion_signal_bars/holding_age/last_buy_bar`（`:832-850`） | 无 FSM，靠计数 + 绝对位置 `t` | `master_index` 位置 t（交易日 bar） | `min_weight_change=0.05`（`:580`）, `entry_threshold=min_weight_change`（`:581`）, `min_holding=2`（`:582`）, `min_entry_bars=guard_latency=2`（`:583`）, `asset_stop_cooldown=5`（`:606`）, `normal_cooldown=reentry_cooldown=1`（`:607`）, **`stop_cooldown_bars=21`（组合回撤自愈，`:589`）**, `asymmetric_sells=(prefix=="cdhb")`（`:609`）, `stop_atr_mult=4.5`（`:605`） |
 | `allocation_templates.py` | `_step_asset_inertia`（每-symbol 冻结，`:217-311`）+ `apply_asset_inertia`（`:314-398`） | `holding_age/last_buy_bar` 字典（`:369-370`） | 无 FSM，年龄 + 最近买入 bar | row index t（bar） | `min_weight_change=0.02`（`:316`）, `asymmetric_sell_ratio=0.60`（`:322/231/407`）, `entry_threshold=None`（`:320`）, `min_holding_bars=0`（`:321`） |
 | `run_live_strategy.py` | 复用 `step_position_lifecycle`（`:2117-2130`），前置 resolver 定阈值 | 冷启动重建 `AssetLifecycleState`（`:2058-2101`） | 同上 FSM + `last_exit_date` | **交易日**（`check_missing_trading_days`，`:762-763`） | `resolve_trade_inertia_threshold` 默认 `0.05`（`:303-320`）；`min_entry_bars/min_holding_bars` 默认 2（`:323-344,347+`）；`--reentry-cooldown-bars=2`（`:1070-1075`）；`normal=2, stop=max(5,2)=5`（`:1558-1559`）；`inertia_relative_ratio` 默认 `0.0`（`:1565`） |
@@ -23,7 +23,7 @@
 
 | 概念 | 冲突点 | 后果 |
 |---|---|---|
-| **cooldown 同名三义** | `normal_cooldown_bars`：FSM=1（`:143`）vs 实盘 `--reentry-cooldown-bars`=2（`:1558`）vs blend=1（`:607`）；单位：bar（FSM 递减 `:340-341`）vs 交易日（`:762-763`）vs 绝对位置 `asset_cooldown_until=t+N`（`:956,1575-1577`） | 再入场节奏在回测/实盘各差 1 根 |
+| **cooldown 同名三义** | `normal_cooldown_bars`：FSM=1（`:143`）vs 实盘 `--reentry-cooldown-bars`=2（`:1558`）vs blend=1（`:607`）；单位：bar（FSM 递减 `:340-341`）vs 交易日（`:762-763`）vs 绝对位置 `asset_cooldown_until=t+N`（`:956,1575-1577`） | 再入场节奏在回测/实盘各差 1 根（2026-10-27 复核更正：FSM 已对齐为 2（`common/position_lifecycle.py:161`），此条「各差 1 根」的冲突**已消除**；现存语义差仅剩 blend 默认 `normal_cooldown_bars=1`（`pipeline/research/blend/blend_base.py:607`）与 bar/交易日/绝对位置三种单位差异） |
 | **`stop_cooldown_bars` 撞名** | FSM 的 5 = 个股止损后再入场冷却（`:144,390`）；blend 的 21 = **组合回撤自愈**冷却（`:589,1004`），per-asset 另名 `asset_stop_cooldown_bars=5`（`:606,956`） | 同键跨引擎同值异义，极易误改 |
 | **inertia 阈值三套默认** | FSM=0.05（`:145`）；blend `min_weight_change=0.05`（`:580`）；templates=`0.02`（`:316`）；`resolve_trade_inertia_threshold` 优先 `min_weight_change` 再 `inertia_threshold`（`:313-316`） | 同一策略换引擎阈值即变 |
 | **"门槛"与"确认期"混排** | `min_entry_bars`（确认期）与 `entry_threshold`（建仓门槛）在 resolver 里并排解析（`:1539,1542-1547`） | 语义被稀释，调参易错 |
@@ -84,7 +84,7 @@
 
 ## 6. 内核放哪
 
-**新建 `common/position_policy.py`，不扩 `position_lifecycle.py`。** 理由：`position_lifecycle` 的 docstring 宣称跨 backtest + live（`:1-7`），但代码自述"backtester 不用它"（`:725-728`），事实上已是 live 专用门面；硬扩只会把 6 态 FSM 的 live 语义污染成"所有策略都必须有 PENDING_EXIT"。
+**新建 `common/position_policy.py`，不扩 `position_lifecycle.py`。** 理由：`position_lifecycle` 的 docstring 宣称跨 backtest + live（`:1-7`），但代码自述"backtester 不用它"（`:725-728`），事实上已是 live 专用门面；硬扩只会把 6 态 FSM 的 live 语义污染成"所有策略都必须有 PENDING_EXIT"。（2026-10-27 复核更正：L2.48 已让 `backtester/run_backtest.py` 经 `simulate_position_lifecycle`（`common/position_lifecycle.py:1026`）复用此模块，「backtester 不用它」前提已部分过时；字面「`step_position_lifecycle` 不被 backtester 直接调用」仍为真）
 
 处置：`position_lifecycle.py` 保留为 **live adapter** —— `step_position_lifecycle` 改为薄封装调用 `AssetPolicy`，`PositionState` / `Decision` / `BlockingReason` 枚举迁到 `position_policy.py`，旧 import 处转发，ticket builder 与现有单测继续消费同一类型。
 
