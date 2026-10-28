@@ -14,12 +14,15 @@ of ``update_settings`` so the UI can never rewrite the template.  See ``L2.16`` 
 """
 
 import json
+import logging
 import os
 import re
 import sys
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 
 def find_repo_root() -> str:
@@ -1503,6 +1506,13 @@ class StorageManager:
         loaded_universe: Dict[str, Any] = {}
         try:
             from common.data import load_universe
+            # (2026-10-27) READ-ONLY cache. This is a display path: "open the page, fetch a
+            # quote" must never create/repair the production DuckDB cache. Before this flag,
+            # a deleted `<repo>/data/cache.duckdb` came back to life -- with exactly the
+            # requested 4 holdings and the 35-day window below -- the moment someone opened
+            # the UI. With `cache_read_only=True` a missing/stale cache is a missing QUOTE:
+            # `DuckDBCache(read_only=True)` raises `FileNotFoundError` here and the handler
+            # below degrades to "no price for this batch" instead of rebuilding the file.
             loaded_universe = load_universe(
                 needed_symbols,
                 start=start_date,
@@ -1512,9 +1522,22 @@ class StorageManager:
                 cache_dir=self.cache_dir,
                 provider=provider_name,
                 expected_last_session=quote_expected_session,
+                cache_read_only=True,
             )
         except Exception as exc:
+            # Deliberately keep the console line (operators tail this) AND log it, with the
+            # cache_dir and exception type, because "the cache is gone" is the single most
+            # likely cause and it must be diagnosable from the log without tracing.
             print(f"[get_quotes] Warning: failed to load from provider '{provider_name}': {exc}")
+            logger.warning(
+                "[get_quotes] failed to load %d symbol(s) from provider '%s' (cache_dir=%s, "
+                "cache_read_only=True): %s: %s",
+                len(needed_symbols),
+                provider_name,
+                getattr(self, "cache_dir", None),
+                type(exc).__name__,
+                exc,
+            )
 
         for sym in needed_symbols:
             stock_name = get_stock_name(sym, sym)

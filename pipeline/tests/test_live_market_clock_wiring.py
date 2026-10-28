@@ -1216,6 +1216,11 @@ def test_refresh_stage1_data_invokes_sync_routines_when_marketdb(monkeypatch, tm
     symbols = ["600000.SH", "601857.SH", "BIL"]
 
     # 1. With enable_intraday_5m=True: all 3 routines invoked
+    #
+    # (2026-10-27) `allow_create_cache=True` is now required here: this test exercises the
+    # creation path (the DuckDB layer itself is mocked, so no file is ever produced) and the
+    # new default REFUSES a missing cache -- Stage-1 refreshes, it does not rebuild. The
+    # refusal path has its own regression tests in `test_cache_write_gates.py`.
     summary_5m = health_mod.refresh_stage1_data(
         symbols=symbols,
         as_of_date="2026-10-26",
@@ -1224,6 +1229,7 @@ def test_refresh_stage1_data_invokes_sync_routines_when_marketdb(monkeypatch, tm
         market="china",
         enable_intraday_5m=True,
         no_cache=False,
+        allow_create_cache=True,
     )
     assert summary_5m["status"] == "completed"
     assert summary_5m["steps"]["sync_indices_daily"] == "ok"
@@ -1259,6 +1265,9 @@ def test_refresh_stage1_data_invokes_sync_routines_when_marketdb(monkeypatch, tm
         market="china",
         enable_intraday_5m=False,
         no_cache=False,
+        # (2026-10-27) still a missing-cache call: the mocked DuckDB layer never creates the
+        # file, so the default gate would refuse the second half of this test too.
+        allow_create_cache=True,
     )
     assert summary_no_5m["status"] == "completed"
     assert summary_no_5m["steps"]["sync_indices_daily"] == "ok"

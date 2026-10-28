@@ -782,7 +782,14 @@ class CachedDataProvider(BaseDataProvider):
     Synthetic data generators (SyntheticDataProvider) always bypass the cache.
     """
 
-    def __init__(self, inner_provider: BaseDataProvider, cache_dir: str, derive_mode: str = "auto"):
+    def __init__(
+        self,
+        inner_provider: BaseDataProvider,
+        cache_dir: str,
+        derive_mode: str = "auto",
+        *,
+        cache_read_only: bool = False,
+    ):
         """`derive_mode` (M3.6 review F4) is the runtime switch for in-cache derivation:
 
           * `"auto"` (default) -- store raw bars + factors on a cache miss and derive the
@@ -800,6 +807,20 @@ class CachedDataProvider(BaseDataProvider):
             (a `direct` write never stamps a basis onto already-stored undeclared rows).
 
         The `derive_mode` is validated eagerly: a typo must not silently mean "auto".
+
+        `cache_read_only=True` (2026-10-27) opens the DuckDB cache with
+        `DuckDBCache(db_path=..., read_only=True)`: the file must ALREADY EXIST (a missing
+        cache raises `FileNotFoundError` at construction -- deliberately NOT downgraded into
+        "create an empty one"), nothing is created, migrated or written, and a cache miss is
+        served straight from the inner provider instead of being stored. This is the switch
+        for read-only/display paths (e.g. the live web UI's quote panel), which must never
+        resurrect a production cache an operator deleted on purpose.
+
+        Read-only mode therefore skips EVERY write this class performs -- the full list is
+        `store_adjust_factors`, `store_bars` (both in `get_bars` and in
+        `rebase_corporate_action`) and `store_fundamentals` (in
+        `fetch_financial_indicators`). `rebase_corporate_action` is an administrative
+        mutation and refuses outright in read-only mode rather than pretending to rebase.
         """
         mode = str(derive_mode if derive_mode is not None else "auto").strip().lower()
         if mode not in ("auto", "direct"):
@@ -811,9 +832,14 @@ class CachedDataProvider(BaseDataProvider):
         self.derive_mode = mode
         self.inner_provider = inner_provider
         self.cache_dir = cache_dir
+        self.cache_read_only = bool(cache_read_only)
         self.is_synthetic = is_synthetic_provider(inner_provider)
         if not self.is_synthetic and self.cache_dir:
-            self.duckdb_cache = DuckDBCache(db_path=self.cache_dir)
+            # `read_only=True` propagates to `DuckDBCache`, whose constructor raises
+            # `FileNotFoundError` when the file is absent (see the docstring) and whose
+            # `_get_connection(read_only=False)` refuses every write connection. That is the
+            # contract this flag promises: a read-only provider can never create the file.
+            self.duckdb_cache = DuckDBCache(db_path=self.cache_dir, read_only=self.cache_read_only)
         else:
             self.duckdb_cache = None
 
@@ -928,6 +954,15 @@ class CachedDataProvider(BaseDataProvider):
             )
             if not df.empty:
                 return df
+
+        # 1b. READ-ONLY MODE (2026-10-27): a cache miss is served by the inner provider and
+        # NEVER stored. Everything below this line writes (`store_adjust_factors`,
+        # `store_bars`) and then reads the result back out of the cache, which a read-only
+        # connection cannot do. Falling through to the provider's own `fetch_ohlcv` is exactly
+        # the `use_cache=False` contract, so a display path gets a live quote without being
+        # able to create/repair the cache file.
+        if self.cache_read_only:
+            return self.inner_provider.fetch_ohlcv(symbol, start, end, interval)
 
         # 2. Re-query provider for missing range.
         # Check if inner provider supports fetching raw unadjusted bars.
@@ -1106,6 +1141,76 @@ class CachedDataProvider(BaseDataProvider):
             allow_legacy_basis=allow_legacy_basis,
         )
 
+    def _fetch_universe_read_only(
+        self,
+        symbols: List[str],
+        start: str,
+        end: str,
+        interval: str,
+        expected_last_session,
+        adjust: str,
+        *,
+        columns: Optional[Union[str, Sequence[str]]] = None,
+        allow_legacy_basis: bool = False,
+    ) -> Dict[str, pd.DataFrame]:
+        """Read-only variant of `fetch_universe`: cache for what it holds, provider for the rest.
+
+        Deliberately NOT a write path in any branch. Symbols the cache covers are read in one
+        `query_universe` call (same basis honesty / `columns` contract as the writable path);
+        the rest come from the inner provider's own `fetch_ohlcv`, i.e. the bytes a
+        `use_cache=False` caller would get. Nothing is stored, no metadata is upserted, and a
+        read-only cache therefore cannot be turned into a writable one by accident.
+
+        Per-symbol provider failures keep the legacy "warn and skip" semantics of the writable
+        loop -- one bad symbol must not sink a display universe. The hard-fail collection in
+        the writable path (refused history rewrites, untrustworthy basis) is unreachable here
+        because nothing is written; a cache that *cannot* serve an honest basis still raises
+        out of `query_universe` / `_guard_direct_mode_derivation`, unchanged.
+        """
+        provider_name = type(self.inner_provider).__name__
+        covered_symbols: List[str] = []
+        fetched: Dict[str, pd.DataFrame] = {}
+
+        for symbol in symbols:
+            try:
+                _validate_symbol_for_path(symbol)
+                if self.duckdb_cache.is_range_covered(
+                    provider_name,
+                    symbol,
+                    start=start,
+                    end=end,
+                    interval=interval,
+                    expected_last_session=expected_last_session,
+                ):
+                    covered_symbols.append(symbol)
+                else:
+                    fetched[symbol] = self.inner_provider.fetch_ohlcv(
+                        symbol, start, end, interval
+                    )
+            except Exception as exc:
+                warnings.warn(f"Skipping {symbol}: {exc}")
+
+        for symbol in covered_symbols:
+            self._guard_direct_mode_derivation(provider_name, symbol, interval, adjust)
+
+        result: Dict[str, pd.DataFrame] = {}
+        if covered_symbols:
+            result.update(
+                self.duckdb_cache.query_universe(
+                    provider_name,
+                    covered_symbols,
+                    start=start,
+                    end=end,
+                    interval=interval,
+                    adjust=adjust,
+                    columns=columns,
+                    allow_legacy_basis=allow_legacy_basis,
+                )
+            )
+        # Provider-served symbols never enter the cache, so they cannot shadow a cache read.
+        result.update(fetched)
+        return result
+
     def fetch_universe(
         self,
         symbols: List[str],
@@ -1161,6 +1266,20 @@ class CachedDataProvider(BaseDataProvider):
             return super().fetch_universe(symbols, start, end, interval, columns=columns)
 
         provider_name = type(self.inner_provider).__name__
+
+        # 0. READ-ONLY MODE (2026-10-27): read what the cache already holds, ask the provider
+        # for everything else, and write NOTHING. The write-capable loop below calls
+        # `fetch_ohlcv` (which stores) and then `query_universe` for every symbol it "covered",
+        # so on a read-only connection it would either store or return a symbol it never read
+        # back. Refused-rewrite / basis-integrity hard failures cannot occur here (no write),
+        # so they are simply not reachable; unrelated per-symbol failures keep the legacy
+        # "warn and skip" behaviour.
+        if self.cache_read_only:
+            return self._fetch_universe_read_only(
+                symbols, start, end, interval, expected_last_session, adjust,
+                columns=columns, allow_legacy_basis=allow_legacy_basis,
+            )
+
         covered_symbols = []
         #: Refused-rewrite reports, kept apart from `covered_symbols` so they can hard-fail
         #: instead of being skipped (see docstring).
@@ -1297,6 +1416,16 @@ class CachedDataProvider(BaseDataProvider):
             raise RuntimeError(
                 f"Cannot rebase corporate action for {symbol}: DuckDB cache is not enabled or provider is synthetic."
             )
+        if self.cache_read_only:
+            # This method's entire contract is a declared history rewrite; a read-only cache
+            # cannot honour it. Refuse loudly instead of returning freshly fetched bytes that
+            # were never stored (which would look like a successful rebase).
+            raise RuntimeError(
+                f"Cannot rebase corporate action for {symbol}: this CachedDataProvider was "
+                f"opened with cache_read_only=True ({self.cache_dir}), so no history rewrite "
+                f"can be written. Re-open it without cache_read_only to perform an "
+                f"administrative rebase."
+            )
 
         provider_name = type(self.inner_provider).__name__
         if is_intraday_interval(interval):
@@ -1373,7 +1502,14 @@ class CachedDataProvider(BaseDataProvider):
             if cached is not None:
                 return cached
             metrics = self.inner_provider.fetch_financial_indicators(symbol, as_of_date=as_of_date, lookback_years=lookback_years)
-            if metrics is not None and not np.isnan(metrics.roe) and not np.isnan(metrics.net_profit):
+            # Read-only mode: return the provider's answer WITHOUT writing `fundamentals`
+            # (the 4th and last write this class performs).
+            if (
+                not self.cache_read_only
+                and metrics is not None
+                and not np.isnan(metrics.roe)
+                and not np.isnan(metrics.net_profit)
+            ):
                 self.duckdb_cache.store_fundamentals(provider_name, metrics)
             return metrics
         return self.inner_provider.fetch_financial_indicators(symbol, as_of_date=as_of_date, lookback_years=lookback_years)
@@ -1505,6 +1641,7 @@ def load_ohlcv(symbol: str, start: str, end: str, interval: str = "1d", use_cach
 def load_universe(symbols: list, start: str, end: str, interval: str = "1d", use_cache: bool = True,
                   cache_dir: str = None, provider: Union[str, BaseDataProvider, None] = None,
                   expected_last_session=None, columns: Optional[Union[str, Sequence[str]]] = "all",
+                  cache_read_only: bool = False,
                   **kwargs) -> dict:
     """Load OHLCV for each symbol; skips (with a warning) any that fail.
     Maintains backward compatibility with original load_universe function signature.
@@ -1524,11 +1661,17 @@ def load_universe(symbols: list, start: str, end: str, interval: str = "1d", use
     mode became an unconditional `ValueError` for every cache-backed run. Requesting the extra
     `Amount` here costs one nullable column and is all-NaN when the table has no money column,
     which the price paths ignore. Pass `columns=None` for the strict OHLCV-only shape.
+
+    `cache_read_only` (2026-10-27) is forwarded to `CachedDataProvider`: it opens the DuckDB cache
+    with `read_only=True`, so a MISSING cache raises `FileNotFoundError` instead of being
+    created. Display/read-only callers (the live web UI's quote panel) use it so that "the
+    operator deleted cache.duckdb" stays a fact rather than being repaired behind their back.
+    Default `False` keeps every existing caller bit-for-bit unchanged.
     """
     base_prov = get_data_provider(provider, **kwargs)
     cached = bool(use_cache and cache_dir)
     if cached:
-        prov = CachedDataProvider(base_prov, cache_dir)
+        prov = CachedDataProvider(base_prov, cache_dir, cache_read_only=cache_read_only)
     else:
         prov = base_prov
     if cached:

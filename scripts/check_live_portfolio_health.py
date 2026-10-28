@@ -255,6 +255,16 @@ def parse_args(args: Optional[List[str]] = None):
             "(default: True; automatically skipped when --data-provider is 'synthetic' or --no-cache)."
         ),
     )
+    parser.add_argument(
+        "--allow-create-cache",
+        action="store_true",
+        default=False,
+        help=(
+            "仅在你确实要重建缓存库时使用: 默认情况下，缓存库（<cache-dir>/cache.duckdb）缺失会被"
+            "直接拒绝 (status=refused, 退出码非 0)，因为 Stage-1 的职责是刷新行情，而不是重建缓存。"
+            "缓存被误删时应先恢复备份；确需从零重建再显式加本开关。"
+        ),
+    )
     add_data_provider_cli_args(parser, default_provider="synthetic")
     # (L2.3) as-of / market / run-window gate / strict freshness / probe retry limit.
     add_market_clock_cli_args(parser, stage="stage1")
@@ -299,11 +309,24 @@ def refresh_stage1_data(
     market: str = "china",
     enable_intraday_5m: bool = False,
     no_cache: bool = False,
+    allow_create_cache: bool = False,
 ) -> Dict[str, Any]:
     """Pre-flight refresh/patch of market data cache up to as_of_date before Stage 1 starts.
 
     100% Offline Rule: If no_cache is True or data_provider is in ('synthetic', 'csv'), immediately return
     {"status": "skipped", "reason": "synthetic_or_no_cache"} without touching any network or external DB.
+
+    `allow_create_cache=False` (the default, 2026-10-27) makes a MISSING cache file a REFUSAL:
+    this function's job is to REFRESH the cache, not to rebuild it. `DuckDBCache(eff_cache_dir)`
+    is a writable open that `makedirs` + `_init_tables`s, so before the gate existed a deleted
+    `data/cache.duckdb` was silently recreated (empty) by the very first Stage-1 run -- and then
+    Stage 2 traded against it. Refusing returns
+    `{"status": "refused", "reason": "cache_missing_needs_allow_create", ...}`; `main()` treats
+    that as fatal (it cannot continue without market data) unless `--allow-create-cache` was
+    passed, which is the deliberate "yes, I really am rebuilding from scratch" switch.
+
+    `summary["cache_created"]` is True only when this call actually had to create the file
+    (`False` when it already existed, and `False` when the run refused -- nothing was created).
     """
     if no_cache or str(data_provider).strip().lower() in ("synthetic", "csv"):
         return {"status": "skipped", "reason": "synthetic_or_no_cache"}
@@ -313,13 +336,42 @@ def refresh_stage1_data(
         f"(market={market}, as_of={as_of_date}, provider={data_provider})..."
     )
     eff_cache_dir = cache_dir or shared_data_dir()
+
+    # Resolve the FINAL database file the same way `DuckDBCache.__init__` does, so the gate
+    # below judges the exact path that is about to be opened (a `--cache-dir` may itself be
+    # the `.duckdb` file rather than a directory).
+    cache_is_file = eff_cache_dir.endswith(".duckdb") or eff_cache_dir.endswith(".db")
+    if os.path.isdir(eff_cache_dir) or not cache_is_file:
+        db_file = os.path.join(eff_cache_dir, "cache.duckdb")
+    else:
+        db_file = eff_cache_dir
+    existed = os.path.exists(db_file)
+
     summary: Dict[str, Any] = {
         "status": "completed",
         "market": market,
         "as_of_date": as_of_date,
         "cache_dir": eff_cache_dir,
+        "cache_file": db_file,
         "steps": {},
     }
+
+    if not existed and not allow_create_cache:
+        # REFUSED. No `DuckDBCache(...)` call happens on this branch, so the missing file is
+        # NOT recreated as a side effect of the refusal itself.
+        summary["status"] = "refused"
+        summary["reason"] = "cache_missing_needs_allow_create"
+        summary["cache_created"] = False
+        print(
+            f"[STAGE 1 DATA REFRESH REFUSED] 缓存库不存在: {db_file}\n"
+            f"  （可能被删除或从未创建。）Stage-1 的职责是刷新缓存，不是重建缓存，因此这里拒绝继续。\n"
+            f"  - 确需从零重建缓存库，请显式加 `--allow-create-cache` 后重跑；\n"
+            f"  - 否则请先恢复备份（例如 data/cache.backup-*.duckdb → data/cache.duckdb）再运行。\n"
+            f"  本次未创建任何文件。"
+        )
+        return summary
+
+    summary["cache_created"] = not existed
 
     try:
         from common.duckdb_cache import DuckDBCache
@@ -1025,6 +1077,7 @@ def generate_reports(
     intraday_5m_info: Optional[Dict[str, Any]] = None,
     clock_ctx: Any = None,
     freshness_summary: Optional[Dict[str, Any]] = None,
+    refresh_summary: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str]:
     """Generate and write structured JSON and Markdown summary reports."""
     os.makedirs(output_dir, exist_ok=True)
@@ -1038,6 +1091,16 @@ def generate_reports(
         # cross-referencing the console log.
         "clock": (clock_ctx.stamp_fields() if clock_ctx is not None else None),
         "freshness_summary": freshness_summary,
+        # (2026-10-27) The pre-flight data-refresh outcome, including
+        # `cache_created` (True only when THIS run had to create a missing
+        # cache.duckdb, i.e. only with --allow-create-cache). Persisted so a
+        # human reading stage1_health_report.json can tell "the cache was
+        # already there and got refreshed" from "this run built it from
+        # nothing", which is otherwise invisible post-hoc.
+        "data_refresh": refresh_summary,
+        "cache_created": (
+            refresh_summary.get("cache_created") if isinstance(refresh_summary, dict) else None
+        ),
         "strategy_info": strategy_info,
         "strategy_version": strategy_info.get("strategy_version", "1.0.0"),
         "base_version": strategy_info.get("base_version"),
@@ -1374,9 +1437,26 @@ def main(cli_args: Optional[List[str]] = None):
             market=clock_ctx.market,
             enable_intraday_5m=enable_intraday_5m,
             no_cache=getattr(args, "no_cache", False),
+            allow_create_cache=getattr(args, "allow_create_cache", False),
         )
     else:
         refresh_summary = {}
+
+    # 1b. (2026-10-27) A REFUSED refresh is FATAL, not a warning. Without the cache the very
+    # next step (`load_live_universe` -> `load_universe` -> writable `CachedDataProvider`) would
+    # happily CREATE the empty DuckDB file this run just refused to create, i.e. the operator's
+    # deliberate deletion would be undone one line later. Exit non-zero with the operator-facing
+    # remedy (restore a backup, or re-run with --allow-create-cache).
+    if isinstance(refresh_summary, dict) and refresh_summary.get("status") == "refused":
+        print(
+            f"\n[STAGE 1 ABORT] 缓存库缺失，已拒绝继续: "
+            f"{refresh_summary.get('cache_file', '(unknown)')}\n"
+            f"  Stage-1 无法在没有行情缓存的情况下计算 breadth/thrust/drawdown，"
+            f"且继续执行会重新创建一个空缓存库。\n"
+            f"  - 先恢复备份（例如 data/cache.backup-*.duckdb → data/cache.duckdb）后重跑；\n"
+            f"  - 确需从零重建缓存库，请加 `--allow-create-cache` 后重跑。"
+        )
+        sys.exit(2)
 
     # 2. Load Universe Data
     if not universe_symbols:
@@ -1766,6 +1846,7 @@ def main(cli_args: Optional[List[str]] = None):
         intraday_5m_info=intraday_5m_info,
         clock_ctx=clock_ctx,
         freshness_summary=freshness_summary,
+        refresh_summary=refresh_summary,
     )
     # (L2.3, design §9) `summary.json` is the shared per-run archive key/value store the
     # web layer merges into; the clock + freshness blocks land there too.
