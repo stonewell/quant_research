@@ -8,10 +8,14 @@ across both backtesting and live execution engines.
 
 from __future__ import annotations
 
+import copy
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import numpy as np
+import pandas as pd
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -70,6 +74,8 @@ class BlockingReason(str, Enum):
     INERTIA = "INERTIA"
     TENURE_LOCKED = "TENURE_LOCKED"
     LIMIT_UP_LOCKED = "LIMIT_UP_LOCKED"
+    # Missing / non-positive price on evaluation bar.
+    NO_PRICE = "NO_PRICE"
     # No blocking gate fired.
     NONE = "NONE"
 
@@ -85,6 +91,7 @@ BLOCKING_REASON_LABELS: Dict[str, str] = {
     BlockingReason.INERTIA.value: "未超惰性阈值",
     BlockingReason.TENURE_LOCKED.value: "未满最低持仓周期",
     BlockingReason.LIMIT_UP_LOCKED.value: "涨停封板",
+    BlockingReason.NO_PRICE.value: "价格缺失",
     BlockingReason.NONE.value: "无阻断",
 }
 
@@ -158,6 +165,10 @@ class PositionLifecycleConfig:
     breadth_thrust_threshold: float = 0.60
     enable_entry_fast_path: bool = True
     enable_exit_fast_path: bool = True
+
+    def to_dict(self) -> Dict[str, Any]:
+        from dataclasses import asdict
+        return asdict(self)
 
 
 @dataclass
@@ -334,6 +345,23 @@ def step_position_lifecycle(
             state_after=state.state,
             fast_path_triggered=None,
             blocking_reason=BlockingReason.MARKET_CLOSED_FREEZE,
+        )
+
+    # 0.1 Valid Price Check
+    if not (np.isfinite(current_price) and current_price > 0.0):
+        return LifecycleDecision(
+            action="HOLD_FILTERED",
+            target_weight=float(state.current_weight),
+            reason="缺失有效价格：跳过评估，保持当前持仓权重与状态",
+            detail_reason={
+                "current_price": current_price,
+                "blocking_reason": BlockingReason.NO_PRICE.value,
+                "note": "缺失有效价格 (NO_PRICE): 状态与当前持仓权重保持不变",
+            },
+            state_before=state_before,
+            state_after=state.state,
+            fast_path_triggered=None,
+            blocking_reason=BlockingReason.NO_PRICE,
         )
 
     # 1. Cooldown management
@@ -759,3 +787,275 @@ def step_position_lifecycle(
             )
 
     raise ValueError(f"Unhandled position lifecycle state: {state.state}")
+
+
+def resolve_position_lifecycle_config(
+    params: Optional[Dict[str, Any]] = None,
+    args: Any = None,
+) -> PositionLifecycleConfig:
+    """Resolves PositionLifecycleConfig by merging strategy parameters and CLI arguments.
+
+    Defaults:
+        guard_latency_bars: 2
+        min_holding_bars: 2
+        normal_cooldown_bars: 1
+        stop_cooldown_bars: 5
+        inertia_threshold: 0.05
+        inertia_relative_ratio: 0.50
+        hard_stop_loss_pct: 0.08
+        atr_multiplier: 4.5
+        enable_entry_fast_path: True
+        enable_exit_fast_path: True
+    """
+    p = params or {}
+
+    def _get(field_name: str, default: Any) -> Any:
+        key = f"lifecycle_{field_name}"
+        if args is not None:
+            if hasattr(args, key) and getattr(args, key) is not None:
+                return getattr(args, key)
+        if p and key in p and p[key] is not None:
+            return p[key]
+        return default
+
+    guard_latency_bars = int(_get("guard_latency_bars", 2))
+    min_holding_bars = int(_get("min_holding_bars", 2))
+    normal_cooldown_bars = int(_get("normal_cooldown_bars", 1))
+    stop_cooldown_bars = int(_get("stop_cooldown_bars", 5))
+    inertia_threshold = float(_get("inertia_threshold", 0.05))
+    inertia_relative_ratio = float(_get("inertia_relative_ratio", 0.50))
+    min_entry_thresh = _get("min_entry_threshold", None)
+    min_entry_threshold = float(min_entry_thresh) if min_entry_thresh is not None else None
+    hard_stop_loss_pct = float(_get("hard_stop_loss_pct", 0.08))
+    atr_multiplier = float(_get("atr_multiplier", 4.5))
+    volume_surge_multiplier = float(_get("volume_surge_multiplier", 1.5))
+    breadth_thrust_threshold = float(_get("breadth_thrust_threshold", 0.60))
+    enable_entry_fast_path = bool(_get("enable_entry_fast_path", True))
+    enable_exit_fast_path = bool(_get("enable_exit_fast_path", True))
+
+    return PositionLifecycleConfig(
+        guard_latency_bars=guard_latency_bars,
+        min_holding_bars=min_holding_bars,
+        normal_cooldown_bars=normal_cooldown_bars,
+        stop_cooldown_bars=stop_cooldown_bars,
+        inertia_threshold=inertia_threshold,
+        inertia_relative_ratio=inertia_relative_ratio,
+        min_entry_threshold=min_entry_threshold,
+        hard_stop_loss_pct=hard_stop_loss_pct,
+        atr_multiplier=atr_multiplier,
+        volume_surge_multiplier=volume_surge_multiplier,
+        breadth_thrust_threshold=breadth_thrust_threshold,
+        enable_entry_fast_path=enable_entry_fast_path,
+        enable_exit_fast_path=enable_exit_fast_path,
+    )
+
+
+def simulate_position_lifecycle(
+    universe: Dict[str, pd.DataFrame],
+    target_weights: pd.DataFrame,
+    cfg: Optional[PositionLifecycleConfig] = None,
+    market: str = "china",
+    cash_proxy: Optional[str] = None,
+    initial_states: Optional[Dict[str, Union[AssetLifecycleState, Dict[str, Any]]]] = None,
+    current_volumes: Optional[pd.DataFrame] = None,
+    ma20_volumes: Optional[pd.DataFrame] = None,
+    market_breadths: Optional[pd.Series] = None,
+    atrs: Optional[pd.DataFrame] = None,
+) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+    """Pure causal simulation of position lifecycle state machine across time.
+
+    Enforces entry latency confirmation, T+1 tenure locks, asymmetric cooldowns,
+    and trailing / hard stop-loss risk exits.
+
+    Adheres strictly to the SPARSE WEIGHTS CONTRACT:
+    - On active rebalance days (where at least one asset triggers BUY or SELL):
+      target weights are written for all active assets. Closed/exited assets are
+      explicitly written as 0.0 (never left as NaN, preventing backtester ffill leaks).
+    - If NO asset triggers a trade on date t (all HOLD/HOLD_FILTERED/COOLDOWN_BLOCKED):
+      the entire row is left as all-NaN so the backtester does not rebalance.
+    - If cash_proxy is provided, residual cash weight `max(0.0, 1.0 - sum(risky_w))`
+      is assigned to cash_proxy on active rebalance days.
+
+    Returns:
+        (filtered_sparse_weights, lifecycle_records)
+    """
+    if cfg is None:
+        cfg = resolve_position_lifecycle_config()
+
+    if target_weights.empty:
+        return target_weights.copy(), []
+
+    # Identify symbols
+    symbols = list(target_weights.columns)
+    risky_symbols = [s for s in symbols if cash_proxy is None or s != cash_proxy]
+
+    # Pre-extract price, volume, and ATR series
+    closes: Dict[str, pd.Series] = {}
+    vols: Dict[str, pd.Series] = {}
+    ma20_v: Dict[str, pd.Series] = {}
+    atr_map: Dict[str, pd.Series] = {}
+
+    for sym in risky_symbols:
+        df = universe.get(sym)
+        if df is not None and not df.empty:
+            if "Close" in df.columns:
+                closes[sym] = pd.to_numeric(df["Close"], errors="coerce")
+            if current_volumes is not None and sym in current_volumes.columns:
+                vols[sym] = current_volumes[sym]
+            elif "Volume" in df.columns:
+                vols[sym] = pd.to_numeric(df["Volume"], errors="coerce")
+            if ma20_volumes is not None and sym in ma20_volumes.columns:
+                ma20_v[sym] = ma20_volumes[sym]
+            elif sym in vols:
+                ma20_v[sym] = vols[sym].rolling(20, min_periods=1).mean()
+            if atrs is not None and sym in atrs.columns:
+                atr_map[sym] = atrs[sym]
+            elif "High" in df.columns and "Low" in df.columns and "Close" in df.columns:
+                try:
+                    from common.indicators import atr
+                    atr_map[sym] = atr(df, 14)
+                except Exception:
+                    pass
+
+    # Initialize states
+    states: Dict[str, AssetLifecycleState] = {}
+    if initial_states:
+        for sym, st in initial_states.items():
+            if isinstance(st, AssetLifecycleState):
+                states[sym] = AssetLifecycleState.from_dict(st.to_dict())
+            elif isinstance(st, dict):
+                states[sym] = AssetLifecycleState.from_dict(st)
+    for sym in risky_symbols:
+        if sym not in states:
+            states[sym] = AssetLifecycleState(symbol=sym)
+
+    # Raw model targets carried forward (ffill) across dates
+    raw_targets = target_weights.ffill().fillna(0.0)
+
+    # Initialize output sparse weights with NaNs
+    filtered_weights = pd.DataFrame(
+        np.nan,
+        index=target_weights.index,
+        columns=target_weights.columns,
+        dtype=float,
+    )
+    if cash_proxy is not None and cash_proxy not in filtered_weights.columns:
+        filtered_weights[cash_proxy] = np.nan
+
+    lifecycle_records: List[Dict[str, Any]] = []
+
+    for t in target_weights.index:
+        decisions: Dict[str, LifecycleDecision] = {}
+        for sym in risky_symbols:
+            st = states[sym]
+            tgt_w = float(raw_targets.loc[t, sym]) if (t in raw_targets.index and sym in raw_targets.columns) else 0.0
+
+            # Resolve price
+            p_series = closes.get(sym)
+            if p_series is not None and t in p_series.index:
+                p_val = p_series.loc[t]
+                if isinstance(p_val, pd.Series):
+                    p_val = p_val.iloc[-1]
+                price = float(p_val) if pd.notna(p_val) and p_val > 0 else 0.0
+            else:
+                price = 0.0
+            if not (np.isfinite(price) and price > 0.0):
+                dec = LifecycleDecision(
+                    action="HOLD_FILTERED",
+                    target_weight=float(st.current_weight),
+                    reason="缺失有效价格：跳过评估，保持当前持仓权重与状态",
+                    detail_reason={
+                        "current_price": price,
+                        "blocking_reason": BlockingReason.NO_PRICE.value,
+                        "note": "缺失有效价格 (NO_PRICE): 状态与当前持仓权重保持不变",
+                    },
+                    state_before=st.state,
+                    state_after=st.state,
+                    fast_path_triggered=None,
+                    blocking_reason=BlockingReason.NO_PRICE,
+                )
+                decisions[sym] = dec
+                rec = dec.to_dict()
+                rec["date"] = str(t)
+                rec["symbol"] = sym
+                lifecycle_records.append(rec)
+                continue
+
+            cur_v = None
+            if sym in vols and t in vols[sym].index:
+                v_val = vols[sym].loc[t]
+                if isinstance(v_val, pd.Series):
+                    v_val = v_val.iloc[-1]
+                cur_v = float(v_val) if pd.notna(v_val) and v_val > 0 else None
+
+            ma_v = None
+            if sym in ma20_v and t in ma20_v[sym].index:
+                mv_val = ma20_v[sym].loc[t]
+                if isinstance(mv_val, pd.Series):
+                    mv_val = mv_val.iloc[-1]
+                ma_v = float(mv_val) if pd.notna(mv_val) and mv_val > 0 else None
+
+            sym_atr = None
+            if sym in atr_map and t in atr_map[sym].index:
+                atr_val = atr_map[sym].loc[t]
+                if isinstance(atr_val, pd.Series):
+                    atr_val = atr_val.iloc[-1]
+                sym_atr = float(atr_val) if pd.notna(atr_val) and atr_val > 0 else None
+
+            breadth_val = None
+            if market_breadths is not None and t in market_breadths.index:
+                b_val = market_breadths.loc[t]
+                if isinstance(b_val, pd.Series):
+                    b_val = b_val.iloc[-1]
+                breadth_val = float(b_val) if pd.notna(b_val) else None
+
+            # Resolve market per asset
+            asset_market = market
+            if market == "auto":
+                if sym.endswith(".SH") or sym.endswith(".SZ") or (sym.isdigit() and len(sym) == 6):
+                    asset_market = "china"
+                elif sym.endswith(".HK") or (sym.isdigit() and len(sym) in (4, 5)):
+                    asset_market = "hk"
+                else:
+                    asset_market = "us"
+
+            dec = step_position_lifecycle(
+                state=st,
+                raw_target_weight=tgt_w,
+                current_price=price,
+                cfg=cfg,
+                market=asset_market,
+                current_volume=cur_v,
+                ma20_volume=ma_v,
+                market_breadth=breadth_val,
+                atr=sym_atr,
+            )
+            decisions[sym] = dec
+
+            rec = dec.to_dict()
+            rec["date"] = str(t)
+            rec["symbol"] = sym
+            lifecycle_records.append(rec)
+
+        # Check if any asset triggered an actionable trade (BUY or SELL)
+        any_trade = any(d.action in ("BUY", "SELL") for d in decisions.values())
+
+        if any_trade:
+            # Active rebalance day: write target weights for all active assets
+            sum_risky = 0.0
+            for sym in risky_symbols:
+                st = states[sym]
+                if st.is_holding():
+                    w = float(st.current_weight)
+                else:
+                    # Closed / flat assets MUST write explicit 0.0
+                    w = 0.0
+                filtered_weights.loc[t, sym] = w
+                sum_risky += w
+
+            # If cash proxy is provided, assign residual cash
+            if cash_proxy is not None:
+                cash_w = max(0.0, 1.0 - sum_risky)
+                filtered_weights.loc[t, cash_proxy] = cash_w
+
+    return filtered_weights, lifecycle_records

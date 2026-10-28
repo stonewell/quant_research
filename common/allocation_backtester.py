@@ -11,7 +11,7 @@ import contextvars
 import logging
 import re
 import unicodedata
-from typing import Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -372,6 +372,9 @@ def run_allocation_backtest(
     cash_yield_annual: Optional[float] = None,
     borrow_fee_annual: Optional[float] = None,
     cash_proxy_symbols: Optional[Iterable[str]] = None,
+    enable_position_lifecycle: bool = False,
+    lifecycle_config: Optional[Any] = None,
+    lifecycle_records: Optional[List[Dict[str, Any]]] = None,
 ) -> dict:
     """
     Simulates portfolio equity curve given daily target weights.
@@ -832,6 +835,26 @@ def run_allocation_backtest(
     highs = highs.loc[common_idx]
     lows = lows.loc[common_idx]
     sparse_weights = target_weights.reindex(columns=symbols).loc[common_idx]
+
+    lifecycle_records_out: List[Dict[str, Any]] = []
+    if enable_position_lifecycle:
+        # DISCLOSURE: strategy_generator candidate search runs with position lifecycle OFF
+        # to preserve an unconstrained search landscape; final backtests run with it ON.
+        if lifecycle_records is not None:
+            lifecycle_records_out = list(lifecycle_records)
+        else:
+            from common.position_lifecycle import resolve_position_lifecycle_config, simulate_position_lifecycle
+            cfg = lifecycle_config if lifecycle_config is not None else resolve_position_lifecycle_config()
+            market_type = "china" if china_trading else ("us" if us_trading else ("hk" if hk_trading else "other"))
+            _proxy_syms = CASH_PROXY_SYMBOLS if cash_proxy_symbols is None else cash_proxy_symbols
+            resolved_cash_proxy = next((s for s in symbols if str(s).upper() in _proxy_syms), None)
+            sparse_weights, lifecycle_records_out = simulate_position_lifecycle(
+                universe=universe,
+                target_weights=sparse_weights,
+                cfg=cfg,
+                market=market_type,
+                cash_proxy=resolved_cash_proxy,
+            )
 
     # Suspension input (task B1.3). Only symbols that actually CARRY a Volume
     # column can be judged -- see the docstring's "DISCLOSED LIMIT OF THE
@@ -2513,4 +2536,6 @@ def run_allocation_backtest(
         "calmar_ratio": calmar,
         "win_rate": win_rate,
         "profit_factor": profit_factor,
+        "lifecycle_records": lifecycle_records_out,
+        "position_lifecycle_enabled": bool(enable_position_lifecycle),
     }

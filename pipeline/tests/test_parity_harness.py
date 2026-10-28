@@ -786,3 +786,27 @@ def test_deep_copied_ticket_helper_does_not_share_state(tmp_path):
     assert {k: v.raw for k, v in ph.load_archive(run_dir, env={}).ticket.items()} == reference
     # and `re` is imported for the source scan in another test module's spirit
     assert re.search(r"parity", pathlib.Path(ph.__file__).name)
+
+
+def test_lifecycle_path_parity_multi_day():
+    import numpy as np
+    import pandas as pd
+    from common.position_lifecycle import PositionLifecycleConfig
+    from common.testing import make_ohlcv_from_closes as make_df
+
+    dates = pd.bdate_range("2020-01-01", periods=15)
+    universe = {
+        "A": make_df([100.0 + i for i in range(15)], start="2020-01-01"),
+        "B": make_df([50.0 - 0.5 * i for i in range(15)], start="2020-01-01"),
+    }
+    weights = pd.DataFrame(np.nan, index=dates, columns=["A", "B"])
+    weights.loc[dates[0], "A"] = 0.5
+    weights.loc[dates[0], "B"] = 0.5
+    weights.loc[dates[5], "A"] = 0.6
+    weights.loc[dates[5], "B"] = 0.4
+
+    cfg = PositionLifecycleConfig(guard_latency_bars=2, min_holding_bars=2)
+    res = ph.verify_lifecycle_path_parity(universe, weights, cfg=cfg, market="china")
+    assert res["parity"] is True
+    assert len(res["mismatches"]) == 0
+    assert res["days_checked"] == 15

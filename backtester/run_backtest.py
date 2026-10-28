@@ -202,6 +202,63 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "FINANCING cost, not a fill: rebalance_report (commission/slippage/stamp/"
                         "impact) is unchanged by it. Default: unset = off (the pre-B3.4 engine "
                         "bit-for-bit), NOT the task table's 4.5%% -- pass 0.045 to enable it.")
+    p.add_argument("--enable-position-lifecycle",
+                   dest="enable_position_lifecycle",
+                   action="store_true",
+                   default=True,
+                   help="Enable Unified Position Lifecycle State Machine (UPLSM) in backtest to model confirmation periods, T+1 tenure locks, cooldowns, and stop-loss exits (default: True).")
+    p.add_argument("--no-position-lifecycle", "--disable-position-lifecycle",
+                   dest="enable_position_lifecycle",
+                   action="store_false",
+                   help="Disable Unified Position Lifecycle State Machine in backtest (reverts to unconstrained raw model targets).")
+    p.add_argument("--lifecycle-guard-latency-bars",
+                   type=int, default=None, dest="lifecycle_guard_latency_bars",
+                   help="UPLSM entry confirmation latency bars (default: 2).")
+    p.add_argument("--lifecycle-min-holding-bars",
+                   type=int, default=None, dest="lifecycle_min_holding_bars",
+                   help="UPLSM minimum holding tenure bars before exit/trim (default: 2).")
+    p.add_argument("--lifecycle-normal-cooldown-bars",
+                   type=int, default=None, dest="lifecycle_normal_cooldown_bars",
+                   help="UPLSM cooldown bars after voluntary exit (default: 1).")
+    p.add_argument("--lifecycle-stop-cooldown-bars",
+                   type=int, default=None, dest="lifecycle_stop_cooldown_bars",
+                   help="UPLSM cooldown bars after stop-loss liquidation (default: 5).")
+    p.add_argument("--lifecycle-inertia-threshold",
+                   type=float, default=None, dest="lifecycle_inertia_threshold",
+                   help="UPLSM delta-weight inertia threshold to filter micro-rebalances (default: 0.05).")
+    p.add_argument("--lifecycle-inertia-relative-ratio",
+                   type=float, default=None, dest="lifecycle_inertia_relative_ratio",
+                   help="UPLSM proportional hurdle ratio on trim-side inertia (default: 0.50).")
+    p.add_argument("--lifecycle-min-entry-threshold",
+                   type=float, default=None, dest="lifecycle_min_entry_threshold",
+                   help="UPLSM minimum initial entry allocation weight threshold (default: None).")
+    p.add_argument("--lifecycle-hard-stop-loss-pct",
+                   type=float, default=None, dest="lifecycle_hard_stop_loss_pct",
+                   help="UPLSM hard stop-loss drawdown threshold from entry price (default: 0.08).")
+    p.add_argument("--lifecycle-atr-multiplier",
+                   type=float, default=None, dest="lifecycle_atr_multiplier",
+                   help="UPLSM ATR trailing stop multiplier (default: 4.5).")
+    p.add_argument("--lifecycle-volume-surge-multiplier",
+                   type=float, default=None, dest="lifecycle_volume_surge_multiplier",
+                   help="UPLSM volume breakout multiplier for entry fast path (default: 1.5).")
+    p.add_argument("--lifecycle-breadth-thrust-threshold",
+                   type=float, default=None, dest="lifecycle_breadth_thrust_threshold",
+                   help="UPLSM market breadth thrust threshold for entry fast path (default: 0.60).")
+    p.add_argument("--lifecycle-enable-entry-fast-path",
+                   dest="lifecycle_enable_entry_fast_path", action="store_true", default=None,
+                   help="Enable UPLSM volume/breadth entry fast path.")
+    p.add_argument("--no-lifecycle-entry-fast-path",
+                   dest="lifecycle_enable_entry_fast_path", action="store_false",
+                   help="Disable UPLSM entry fast path.")
+    p.add_argument("--lifecycle-enable-exit-fast-path",
+                   dest="lifecycle_enable_exit_fast_path", action="store_true", default=None,
+                   help="Enable UPLSM emergency deleverage exit fast path.")
+    p.add_argument("--no-lifecycle-exit-fast-path",
+                   dest="lifecycle_enable_exit_fast_path", action="store_false",
+                   help="Disable UPLSM exit fast path.")
+    p.add_argument("--no-lifecycle-compare",
+                   dest="lifecycle_compare", action="store_false", default=True,
+                   help="Skip lifecycle A/B comparison arm (lifecycle_ab_comparison.csv).")
     p.add_argument("--china-trading", action="store_true",
                    help="Apply China A-share trading rules (price limit up/down blocks, T+1 settlement, 100-share minimum round lots, 5 bps sell stamp duty).")
     p.add_argument("--us-trading", action="store_true",
@@ -449,8 +506,44 @@ def _evaluate_walkforward_fold(ctx: dict, spec: dict) -> tuple:
                 # whatever the (now-warm) strategy actually held at that point.
                 eval_universe = _slice_universe_for_range(universe, eval_index)
                 eval_symbols = list(eval_universe.keys())
-                eval_weights = full_weights.reindex(index=eval_index, columns=eval_symbols)
-                eval_weights.iloc[0] = full_weights.ffill().reindex(index=eval_index, columns=eval_symbols).iloc[0]
+
+                from common.position_lifecycle import resolve_position_lifecycle_config, simulate_position_lifecycle
+                from common.allocation_backtester import CASH_PROXY_SYMBOLS
+
+                enable_pl = getattr(args, "enable_position_lifecycle", True)
+                pl_cfg = resolve_position_lifecycle_config(params, args) if enable_pl else None
+
+                _proxy_syms = CASH_PROXY_SYMBOLS if getattr(args, "cash_proxy_symbols", None) is None else args.cash_proxy_symbols
+                resolved_cash_proxy = next((s for s in eval_symbols if str(s).upper() in _proxy_syms), None)
+                market_type = "china" if getattr(args, "china_trading", False) else ("us" if getattr(args, "us_trading", False) else ("hk" if getattr(args, "hk_trading", False) else "other"))
+
+                if enable_pl:
+                    # Warm the FSM causally over the fold's pre-eval warmup buffer
+                    warmed_weights, all_records = simulate_position_lifecycle(
+                        universe=buffered_universe,
+                        target_weights=full_weights,
+                        cfg=pl_cfg,
+                        market=market_type,
+                        cash_proxy=resolved_cash_proxy,
+                    )
+                    eval_weights = warmed_weights.reindex(index=eval_index, columns=eval_symbols)
+                    seed_row = (
+                        warmed_weights.ffill()
+                        .reindex(index=eval_index, columns=eval_symbols)
+                        .iloc[0]
+                        .fillna(0.0)
+                    )
+                    if resolved_cash_proxy is not None and resolved_cash_proxy in seed_row.index:
+                        risky_sum = seed_row.drop(index=resolved_cash_proxy).sum()
+                        seed_row[resolved_cash_proxy] = max(0.0, 1.0 - risky_sum)
+                    eval_weights.iloc[0] = seed_row
+
+                    eval_dates_set = set(eval_index.astype(str))
+                    eval_records = [r for r in all_records if str(r.get("date")) in eval_dates_set]
+                else:
+                    eval_weights = full_weights.reindex(index=eval_index, columns=eval_symbols)
+                    eval_weights.iloc[0] = full_weights.ffill().reindex(index=eval_index, columns=eval_symbols).iloc[0]
+                    eval_records = None
 
                 result = run_allocation_backtest(
                     eval_universe, eval_weights,
@@ -476,6 +569,9 @@ def _evaluate_walkforward_fold(ctx: dict, spec: dict) -> tuple:
                     # exactly like the standard run (and like every pre-B3.3 fold).
                     cash_yield_annual=getattr(args, "cash_sweep_rate", None),
                     borrow_fee_annual=getattr(args, "borrow_fee_annual", None),
+                    enable_position_lifecycle=enable_pl,
+                    lifecycle_config=pl_cfg,
+                    lifecycle_records=eval_records,
                 )
                 if result["equity_curve"].empty:
                     fold_metrics = _nan_fold_metrics()
@@ -495,6 +591,36 @@ def _evaluate_walkforward_fold(ctx: dict, spec: dict) -> tuple:
                         "rebalance_report": result.get("rebalance_report", pd.DataFrame(columns=REBALANCE_REPORT_COLUMNS)),
                         "actual_weights": result.get("actual_weights", pd.DataFrame()),
                     }
+
+                    if enable_pl and getattr(args, "lifecycle_compare", False):
+                        eval_weights_off = full_weights.reindex(index=eval_index, columns=eval_symbols)
+                        eval_weights_off.iloc[0] = full_weights.ffill().reindex(index=eval_index, columns=eval_symbols).iloc[0]
+                        result_off = run_allocation_backtest(
+                            eval_universe, eval_weights_off,
+                            initial_capital=args.initial_capital,
+                            commission_pct=args.commission_pct,
+                            slippage_pct=args.slippage_pct,
+                            min_shares=getattr(args, "min_shares", 1),
+                            min_weight_change=getattr(args, "min_weight_change", 0.0),
+                            china_trading=getattr(args, "china_trading", False),
+                            us_trading=getattr(args, "us_trading", False),
+                            hk_trading=getattr(args, "hk_trading", False),
+                            execution_price=getattr(args, "execution_price", "close"),
+                            market_impact=getattr(args, "market_impact", False),
+                            impact_gamma=getattr(args, "market_impact_gamma", 1.0),
+                            max_volume_participation=getattr(args, "max_volume_participation", None),
+                            cash_yield_annual=getattr(args, "cash_sweep_rate", None),
+                            borrow_fee_annual=getattr(args, "borrow_fee_annual", None),
+                            enable_position_lifecycle=False,
+                        )
+                        if not result_off["equity_curve"].empty:
+                            fold_metrics["off_metrics"] = {
+                                "sharpe_ratio": result_off["sharpe_ratio"],
+                                "cagr": result_off["cagr"],
+                                "max_drawdown": result_off["max_drawdown"],
+                                "total_turnover": result_off["total_turnover"],
+                                "total_rebalances": result_off["total_rebalances"],
+                            }
     except Exception as e:  # noqa: BLE001 -- pre-B2.2 fail-soft contract, per fold
         return _nan_fold_metrics(), str(e)
 
@@ -703,19 +829,59 @@ def run_standard(universe: dict, template, params: dict, args) -> dict:
     if master_calendar.empty:
         raise ValueError("Universe contains no valid trading dates.")
 
-    target_weights = template.generate_weights(universe, params)
-    if target_weights.empty:
+    raw_target_weights = template.generate_weights(universe, params)
+    if raw_target_weights.empty:
         raise ValueError("Template generated empty weights.")
 
     eval_index = master_calendar[master_calendar >= effective_start]
     eval_universe = _slice_universe_for_range(universe, eval_index)
     eval_symbols = list(eval_universe.keys())
-    if len(eval_index) > 0 and len(eval_index) < len(target_weights):
-        eval_weights = target_weights.reindex(index=eval_index, columns=eval_symbols)
-        eval_weights.iloc[0] = target_weights.ffill().reindex(index=eval_index, columns=eval_symbols).iloc[0]
-        target_weights = eval_weights
+
+    from common.position_lifecycle import resolve_position_lifecycle_config, simulate_position_lifecycle
+    from common.allocation_backtester import CASH_PROXY_SYMBOLS
+
+    enable_pl = getattr(args, "enable_position_lifecycle", True)
+    pl_cfg = resolve_position_lifecycle_config(params, args) if enable_pl else None
+
+    _proxy_syms = CASH_PROXY_SYMBOLS if getattr(args, "cash_proxy_symbols", None) is None else args.cash_proxy_symbols
+    resolved_cash_proxy = next((s for s in eval_symbols if str(s).upper() in _proxy_syms), None)
+    market_type = "china" if getattr(args, "china_trading", False) else ("us" if getattr(args, "us_trading", False) else ("hk" if getattr(args, "hk_trading", False) else "other"))
+
+    has_warmup = len(eval_index) > 0 and len(eval_index) < len(raw_target_weights)
+    if enable_pl:
+        warmed_weights, all_records = simulate_position_lifecycle(
+            universe=universe,
+            target_weights=raw_target_weights,
+            cfg=pl_cfg,
+            market=market_type,
+            cash_proxy=resolved_cash_proxy,
+        )
+        if has_warmup:
+            eval_weights = warmed_weights.reindex(index=eval_index, columns=eval_symbols)
+            seed_row = (
+                warmed_weights.ffill()
+                .reindex(index=eval_index, columns=eval_symbols)
+                .iloc[0]
+                .fillna(0.0)
+            )
+            if resolved_cash_proxy is not None and resolved_cash_proxy in seed_row.index:
+                risky_sum = seed_row.drop(index=resolved_cash_proxy).sum()
+                seed_row[resolved_cash_proxy] = max(0.0, 1.0 - risky_sum)
+            eval_weights.iloc[0] = seed_row
+            eval_dates_set = set(eval_index.astype(str))
+            eval_records = [r for r in all_records if str(r.get("date")) in eval_dates_set]
+            target_weights = eval_weights
+        else:
+            target_weights = warmed_weights.reindex(index=eval_index, columns=eval_symbols)
+            eval_records = all_records
     else:
-        target_weights = target_weights.reindex(index=eval_index, columns=eval_symbols)
+        if has_warmup:
+            eval_weights = raw_target_weights.reindex(index=eval_index, columns=eval_symbols)
+            eval_weights.iloc[0] = raw_target_weights.ffill().reindex(index=eval_index, columns=eval_symbols).iloc[0]
+            target_weights = eval_weights
+        else:
+            target_weights = raw_target_weights.reindex(index=eval_index, columns=eval_symbols)
+        eval_records = None
 
     result = run_allocation_backtest(
         eval_universe, target_weights,
@@ -736,10 +902,47 @@ def run_standard(universe: dict, template, params: dict, args) -> dict:
         # (B3.3 / B3.4) both default to None = off == the pre-B3.3 engine.
         cash_yield_annual=getattr(args, "cash_sweep_rate", None),
         borrow_fee_annual=getattr(args, "borrow_fee_annual", None),
+        enable_position_lifecycle=enable_pl,
+        lifecycle_config=pl_cfg,
+        lifecycle_records=eval_records,
     )
 
     if result["equity_curve"].empty:
         raise ValueError("Backtest produced empty equity curve.")
+
+    if enable_pl and getattr(args, "lifecycle_compare", False):
+        if has_warmup:
+            target_weights_off = raw_target_weights.reindex(index=eval_index, columns=eval_symbols)
+            target_weights_off.iloc[0] = raw_target_weights.ffill().reindex(index=eval_index, columns=eval_symbols).iloc[0]
+        else:
+            target_weights_off = raw_target_weights.reindex(index=eval_index, columns=eval_symbols)
+
+        result_off = run_allocation_backtest(
+            eval_universe, target_weights_off,
+            initial_capital=args.initial_capital,
+            commission_pct=args.commission_pct,
+            slippage_pct=args.slippage_pct,
+            min_shares=getattr(args, "min_shares", 1),
+            min_weight_change=getattr(args, "min_weight_change", 0.0),
+            china_trading=getattr(args, "china_trading", False),
+            us_trading=getattr(args, "us_trading", False),
+            hk_trading=getattr(args, "hk_trading", False),
+            execution_price=getattr(args, "execution_price", "close"),
+            market_impact=getattr(args, "market_impact", False),
+            impact_gamma=getattr(args, "market_impact_gamma", 1.0),
+            max_volume_participation=getattr(args, "max_volume_participation", None),
+            cash_yield_annual=getattr(args, "cash_sweep_rate", None),
+            borrow_fee_annual=getattr(args, "borrow_fee_annual", None),
+            enable_position_lifecycle=False,
+        )
+        if not result_off["equity_curve"].empty:
+            result["off_metrics"] = {
+                "sharpe_ratio": result_off["sharpe_ratio"],
+                "cagr": result_off["cagr"],
+                "max_drawdown": result_off["max_drawdown"],
+                "total_turnover": result_off["total_turnover"],
+                "total_rebalances": result_off["total_rebalances"],
+            }
 
     # result already carries sharpe_ratio/cagr/max_drawdown/calmar_ratio/
     # win_rate/profit_factor from run_allocation_backtest -- report those
@@ -790,6 +993,12 @@ def run_walkforward(universe: dict, template, params: dict, args) -> list:
     # indicator warmup; the eval window itself (start_idx:end_idx) is
     # unchanged.
     warmup_bars = template.warmup_bars(params)
+    enable_pl = getattr(args, "enable_position_lifecycle", True)
+    if enable_pl:
+        from common.position_lifecycle import resolve_position_lifecycle_config
+        pl_cfg = resolve_position_lifecycle_config(params, args)
+        freq = int(params.get("rebalance_freq_days", 21)) if params else 21
+        warmup_bars = max(warmup_bars, 0) + max(freq * 2, 42) + pl_cfg.guard_latency_bars + 5
 
     # (B2.2) Enumerate the fold grid up front. Fold boundaries are pure
     # bar-position arithmetic over `master_calendar` -- identical whether the
@@ -968,6 +1177,7 @@ def _run_baseline(args, cache_dir, data_kwargs, aligned_index=None):
     baseline_args.china_trading = False
     baseline_args.us_trading = False
     baseline_args.hk_trading = False
+    baseline_args.enable_position_lifecycle = False
 
     if args.mode == "standard":
         baseline_out = run_standard(baseline_universe, baseline_template, baseline_params, baseline_args)
@@ -1302,6 +1512,8 @@ def _dump_run_manifest(
     cli_args: dict | None = None,
     metrics: dict | None = None,
     artifacts: list[dict] | None = None,
+    enable_position_lifecycle: bool = True,
+    position_lifecycle_config: dict | None = None,
 ) -> str:
     """Phase 1: persist the reproducibility fingerprint skeleton *before* the
     backtest runs, so a mid-run crash still leaves an auditable run_manifest.json behind."""
@@ -1338,6 +1550,8 @@ def _dump_run_manifest(
         # never opened (docs/backtest_research_impl.md §1).
         "db_used": db_used,
         "cli_overrides": overrides,
+        "enable_position_lifecycle": bool(enable_position_lifecycle),
+        "position_lifecycle_config": position_lifecycle_config,
         # Structured CLI provenance (`{"argv": [...], "options": {...}}`): without it a
         # manifest can name the git SHA, the cache and every artifact but still cannot say
         # with *which* flags the run was launched -- e.g. `--cash-sweep-rate 0.015` was
@@ -1361,6 +1575,8 @@ def _finalize_run_manifest(
     *,
     metrics: dict | None = None,
     artifacts: list[dict] | None = None,
+    enable_position_lifecycle: bool | None = None,
+    position_lifecycle_config: dict | None = None,
 ) -> str:
     """Phase 2: re-open the Phase-1 skeleton and fill in the post-run facts.
 
@@ -1387,9 +1603,26 @@ def _finalize_run_manifest(
     # (docs/backtest_research_impl.md §1).
     if "cli_args" not in manifest:
         manifest["cli_args"] = _cli_args_payload()
+    if enable_position_lifecycle is not None and "enable_position_lifecycle" not in manifest:
+        manifest["enable_position_lifecycle"] = bool(enable_position_lifecycle)
+    if position_lifecycle_config is not None and "position_lifecycle_config" not in manifest:
+        manifest["position_lifecycle_config"] = position_lifecycle_config
     manifest["metrics"] = metrics if metrics is not None else dict(_NULL_METRICS)
     manifest["artifacts"] = artifacts if artifacts is not None else []
     write_json_report(manifest, path)
+
+    res_dir = os.path.dirname(path)
+    prov_path = os.path.join(res_dir, "PROVENANCE.json")
+    if os.path.exists(prov_path):
+        try:
+            with open(prov_path, "r", encoding="utf-8") as pf:
+                prov = json.load(pf)
+            prov["enable_position_lifecycle"] = manifest.get("enable_position_lifecycle")
+            prov["position_lifecycle_config"] = manifest.get("position_lifecycle_config")
+            write_json_report(prov, prov_path)
+        except Exception:
+            pass
+
     return path
 
 
@@ -1617,6 +1850,12 @@ def main():
         cli_overrides=strat_overrides,
     )
     print(f"Effective strategy dump saved to {dump_path}")
+
+    from common.position_lifecycle import resolve_position_lifecycle_config
+    enable_pl = getattr(args, "enable_position_lifecycle", True)
+    pl_cfg = resolve_position_lifecycle_config(params, args) if enable_pl else None
+    pl_cfg_dict = pl_cfg.to_dict() if pl_cfg is not None else None
+
     manifest_path = _dump_run_manifest(
         results_dir,
         mode=args.mode,
@@ -1633,6 +1872,8 @@ def main():
         cli_args=_cli_args_payload(args),
         metrics=None,          # standard/walkforward always start as six nulls (§1)
         artifacts=None,        # Phase 1 -> scan the dir: only strategy_dump.json exists yet
+        enable_position_lifecycle=enable_pl,
+        position_lifecycle_config=pl_cfg_dict,
     )
 
     wf_summary: dict | None = None
@@ -1669,6 +1910,30 @@ def main():
         if not rebal_df.empty:
             print("\nRecent Rebalance Trades:")
             print(format_rebalance_trades_preview(rebal_df))
+
+        # Lifecycle A/B comparison arm
+        if enable_pl and getattr(args, "lifecycle_compare", False):
+            off_m = result.get("off_metrics", {})
+            sr_on = float(result.get("sharpe_ratio", 0.0) or 0.0)
+            sr_off = float(off_m.get("sharpe_ratio", 0.0) or 0.0)
+            sign_reversal = bool((sr_on > 0 and sr_off < 0) or (sr_on < 0 and sr_off > 0))
+            ab_df = pd.DataFrame([{
+                "mode": "standard",
+                "sharpe_on": sr_on,
+                "cagr_on": float(result.get("cagr", 0.0) or 0.0),
+                "max_drawdown_on": float(result.get("max_drawdown", 0.0) or 0.0),
+                "turnover_on": float(result.get("total_turnover", 0.0) or 0.0),
+                "rebalances_on": int(result.get("total_rebalances", 0) or 0),
+                "sharpe_off": sr_off,
+                "cagr_off": float(off_m.get("cagr", 0.0) or 0.0),
+                "max_drawdown_off": float(off_m.get("max_drawdown", 0.0) or 0.0),
+                "turnover_off": float(off_m.get("total_turnover", 0.0) or 0.0),
+                "rebalances_off": int(off_m.get("total_rebalances", 0) or 0),
+                "sharpe_sign_reversal": sign_reversal,
+            }])
+            ab_path = os.path.join(results_dir, "lifecycle_ab_comparison.csv")
+            ab_df.to_csv(ab_path, index=False)
+            print(f"Saved lifecycle A/B comparison to {ab_path}")
 
         baseline_result = None
         if args.baseline_symbol:
@@ -1759,7 +2024,7 @@ def main():
         else:
             wf_weights_df = pd.DataFrame()
 
-        folds_clean = [{k: v for k, v in f.items() if k not in ("rebalance_report", "actual_weights")} for f in folds]
+        folds_clean = [{k: v for k, v in f.items() if k not in ("rebalance_report", "actual_weights", "off_metrics")} for f in folds]
         folds_df = pd.DataFrame(folds_clean)
 
         baseline_params = None
@@ -1873,10 +2138,41 @@ def main():
         wf_weights_df.to_csv(wf_weights_path, index=True, index_label="date")
         print(f"Saved walkforward actual weights to {wf_weights_path}")
 
+        if enable_pl and getattr(args, "lifecycle_compare", False):
+            ab_rows = []
+            for fold_idx, f in enumerate(folds, 1):
+                f_off = f.get("off_metrics", {})
+                sr_on = float(f.get("sharpe_ratio", 0.0) or 0.0)
+                sr_off = float(f_off.get("sharpe_ratio", 0.0) or 0.0)
+                sign_reversal = bool((sr_on > 0 and sr_off < 0) or (sr_on < 0 and sr_off > 0))
+                ab_rows.append({
+                    "fold": fold_idx,
+                    "start_date": f.get("start_date"),
+                    "end_date": f.get("end_date"),
+                    "sharpe_on": sr_on,
+                    "cagr_on": float(f.get("cagr", 0.0) or 0.0),
+                    "max_drawdown_on": float(f.get("max_drawdown", 0.0) or 0.0),
+                    "turnover_on": float(f.get("total_turnover", 0.0) or 0.0),
+                    "rebalances_on": int(f.get("total_rebalances", 0) or 0),
+                    "sharpe_off": sr_off,
+                    "cagr_off": float(f_off.get("cagr", 0.0) or 0.0),
+                    "max_drawdown_off": float(f_off.get("max_drawdown", 0.0) or 0.0),
+                    "turnover_off": float(f_off.get("total_turnover", 0.0) or 0.0),
+                    "rebalances_off": int(f_off.get("total_rebalances", 0) or 0),
+                    "sharpe_sign_reversal": sign_reversal,
+                })
+            if ab_rows:
+                ab_df = pd.DataFrame(ab_rows)
+                ab_path = os.path.join(results_dir, "lifecycle_ab_comparison.csv")
+                ab_df.to_csv(ab_path, index=False)
+                print(f"Saved lifecycle A/B comparison to {ab_path}")
+
     _finalize_run_manifest(
         manifest_path,
         metrics=_extract_walkforward_metrics(wf_summary) if args.mode == "walkforward" else None,
         artifacts=_artifact_sizes(results_dir),
+        enable_position_lifecycle=enable_pl,
+        position_lifecycle_config=pl_cfg_dict,
     )
 
 

@@ -103,6 +103,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Apply Hong Kong equity market trading rules (board lot sizing, 0.1085%% dual-sided stamp duty/levies, T+0 trading).")
     p.add_argument("--no-plots", action="store_true",
         help="backtester/strategy_generator --no-plots passthrough -- skip equity-curve charts.")
+    p.add_argument("--no-position-lifecycle", action="store_true",
+        help="backtester --no-position-lifecycle passthrough (step 5) -- disable Unified Position Lifecycle State Machine in backtest.")
+    p.add_argument("--no-lifecycle-compare", action="store_true",
+        help="backtester --no-lifecycle-compare passthrough (step 5) -- skip lifecycle A/B comparison arm.")
     p.add_argument("--dry-run", action="store_true",
         help=f"Print the {N_STEPS} resolved commands without executing anything.")
     return p
@@ -191,6 +195,11 @@ def main():
     if args.no_plots:
         step4_args.append("--no-plots")
 
+    # DISCLOSURE: strategy_generator (Step 4) searches allocation templates with position
+    # lifecycle OFF to maintain an unconstrained signal search space and avoid asymmetric
+    # state masking during candidate evaluation. The final backtest (Step 5) runs with
+    # position lifecycle ON by default to model real-world execution constraints (T+1 gestation,
+    # entry confirmation latency, and cooldowns).
     step5_args = ["--strategy-file", STRATEGY_PATH, "--universe-file", BASKET_PATH,
                   "--mode", args.mode, "--data-provider", args.data_provider]
     if args.baseline_symbol:
@@ -199,6 +208,10 @@ def main():
             step5_args += ["--baseline-template", args.baseline_template]
     if args.no_plots:
         step5_args.append("--no-plots")
+    if args.no_position_lifecycle:
+        step5_args.append("--no-position-lifecycle")
+    if args.no_lifecycle_compare:
+        step5_args.append("--no-lifecycle-compare")
     if args.optimize:
         step5_args.append("--optimize")
         if args.n_random_search is not None:

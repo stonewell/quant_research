@@ -343,7 +343,7 @@ def test_run_walkforward_warms_up_indicator_lookback_before_each_fold():
 
     template = get_template("inverse_volatility")
     params = {"vol_lookback": 120, "rebalance_freq_days": 21}
-    args = MockArgs(window_years=1.0, step_years=0.5)
+    args = MockArgs(window_years=1.0, step_years=0.5, enable_position_lifecycle=False)
 
     folds = run_walkforward(universe, template, params, args)
 
@@ -358,6 +358,33 @@ def test_run_walkforward_warms_up_indicator_lookback_before_each_fold():
     # of only the ones after its own in-window warmup period.
     for fold in folds[1:]:
         assert fold["total_rebalances"] == 12
+
+
+def test_run_walkforward_warms_up_indicator_lookback_with_lifecycle_on():
+    """Lifecycle-ON variant: prebuffered warmup seeds positions without cold-start cash."""
+    idx = pd.bdate_range("2020-01-01", periods=252 * 2)
+    rng = np.random.default_rng(0)
+    closes_a = 100 + np.cumsum(rng.normal(0.05, 1.0, len(idx)))
+    closes_b = 100 + np.cumsum(rng.normal(0.05, 1.0, len(idx)))
+    universe = {
+        "A": make_df(closes_a, start="2020-01-01"),
+        "B": make_df(closes_b, start="2020-01-01"),
+    }
+
+    template = get_template("inverse_volatility")
+    params = {"vol_lookback": 120, "rebalance_freq_days": 21}
+    args = MockArgs(window_years=1.0, step_years=0.5, enable_position_lifecycle=True)
+
+    folds = run_walkforward(universe, template, params, args)
+    assert folds[0]["total_rebalances"] < 12
+
+    # Warmed folds have prebuffered state and execute scheduled rebalances
+    for fold in folds[1:]:
+        assert fold["total_rebalances"] >= 1
+    # Fold with full prebuffered history is actively invested from day 0
+    w_df = folds[-1]["actual_weights"]
+    total_w = w_df["A"] + w_df["B"]
+    assert total_w.iloc[0] >= 0.95 and total_w.iloc[0] <= 1.05
 
 
 def test_run_walkforward_fold1_uses_prebuffered_warmup_when_start_arg_provided():
@@ -376,13 +403,37 @@ def test_run_walkforward_fold1_uses_prebuffered_warmup_when_start_arg_provided()
     template = get_template("inverse_volatility")
     params = {"vol_lookback": 120, "rebalance_freq_days": 21}
     start_date = idx[130].strftime("%Y-%m-%d")
-    args = MockArgs(window_years=0.5, step_years=0.5, start=start_date)
+    args = MockArgs(window_years=0.5, step_years=0.5, start=start_date, enable_position_lifecycle=False)
 
     folds = run_walkforward(universe, template, params, args)
     # Fold 1's start date matches the requested args.start
     assert folds[0]["start_date"] == start_date
     # And Fold 1 gets the full ~126/21 = 6 rebalances without warmup delay
     assert folds[0]["total_rebalances"] == 6
+
+
+def test_run_walkforward_fold1_uses_prebuffered_warmup_when_start_arg_provided_with_lifecycle_on():
+    """Lifecycle-ON variant: prebuffered warmup allows Fold 1 to start immediately invested."""
+    idx = pd.bdate_range("2020-01-01", periods=252 * 2)
+    rng = np.random.default_rng(0)
+    closes_a = 100 + np.cumsum(rng.normal(0.05, 1.0, len(idx)))
+    closes_b = 100 + np.cumsum(rng.normal(0.05, 1.0, len(idx)))
+    universe = {
+        "A": make_df(closes_a, start="2020-01-01"),
+        "B": make_df(closes_b, start="2020-01-01"),
+    }
+
+    template = get_template("inverse_volatility")
+    params = {"vol_lookback": 120, "rebalance_freq_days": 21}
+    start_date = idx[130].strftime("%Y-%m-%d")
+    args = MockArgs(window_years=0.5, step_years=0.5, start=start_date, enable_position_lifecycle=True)
+
+    folds = run_walkforward(universe, template, params, args)
+    assert folds[0]["start_date"] == start_date
+    w_df = folds[0]["actual_weights"]
+    total_w = w_df["A"] + w_df["B"]
+    # Seeded from prebuffered warmup, fully invested at day 0
+    assert total_w.iloc[0] >= 0.95 and total_w.iloc[0] <= 1.05
 
 
 
@@ -1264,6 +1315,7 @@ def test_main_optimize_success_scenario_tunes_and_uses_best_params(tmp_path, mon
         "--results-dir", str(results_dir),
         "--cache-dir", str(cache_dir),
         "--no-plots",
+        "--no-position-lifecycle",
     ]
     monkeypatch.setattr(sys, "argv", argv)
 
@@ -1323,6 +1375,7 @@ def test_main_optimize_failure_falls_back_to_original_params(tmp_path, monkeypat
         "--results-dir", str(results_dir),
         "--cache-dir", str(cache_dir),
         "--no-plots",
+        "--no-position-lifecycle",
     ]
     monkeypatch.setattr(sys, "argv", argv)
 
@@ -1526,6 +1579,7 @@ def test_main_optimize_research_strategy_spec_empty_param_grid(tmp_path, monkeyp
         "--results-dir", str(results_dir),
         "--cache-dir", str(cache_dir),
         "--no-plots",
+        "--no-position-lifecycle",
     ]
     monkeypatch.setattr(sys, "argv", argv)
 
@@ -1859,6 +1913,7 @@ def test_walkforward_writes_walkforward_weights_csv(tmp_path, monkeypatch):
         "--step-years", "0.25",
         "--results-dir", str(results_dir),
         "--cache-dir", str(cache_dir),
+        "--no-position-lifecycle",
     ]
     monkeypatch.setattr(sys, "argv", argv)
     main()
@@ -1895,6 +1950,58 @@ def test_walkforward_writes_walkforward_weights_csv(tmp_path, monkeypatch):
     assert "sharpe_ratio" in df_report.columns
     assert "cagr" in df_report.columns
     assert "total_rebalances" in df_report.columns
+
+
+def test_walkforward_writes_walkforward_weights_csv_with_lifecycle_on(tmp_path, monkeypatch):
+    """Lifecycle-ON variant: prebuffered warmup seeds positions; warmed folds stay fully invested."""
+    strategy_path = tmp_path / "strategy.json"
+    _write_strategy_file(strategy_path, template_name="equal_weight", params={"rebalance_freq_days": 21})
+    results_dir = tmp_path / "results_wf_pl"
+    cache_dir = tmp_path / "cache_wf_pl"
+
+    argv = [
+        "run_backtest.py",
+        "--strategy-file", str(strategy_path),
+        "--universe", "AAPL", "MSFT",
+        "--data-provider", "synthetic",
+        "--mode", "walkforward",
+        "--window-years", "0.5",
+        "--step-years", "0.25",
+        "--results-dir", str(results_dir),
+        "--cache-dir", str(cache_dir),
+        "--enable-position-lifecycle",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    main()
+
+    weights_path = results_dir / "walkforward_weights.csv"
+    assert weights_path.exists()
+    df_weights = pd.read_csv(weights_path)
+    unique_folds = list(df_weights["fold"].unique())
+    assert len(unique_folds) >= 2
+
+    # Fold 1 starts at day 0 without warmup; once confirmed (day 1+), fully invested
+    # Fold 2+ has prebuffered warmup: day 0 is seeded, fully invested from day 0, no cold-start cash!
+    for fold in unique_folds:
+        fold_rows = df_weights[df_weights["fold"] == fold]
+        assert len(fold_rows) > 0
+        total_w = fold_rows["AAPL"] + fold_rows["MSFT"]
+        assert (total_w >= 0.0).all() and (total_w <= 1.05).all()
+        if fold == 1:
+            assert total_w.iloc[0] == 0.0
+            assert (total_w.iloc[1:] > 0.0).all()
+        else:
+            # Warmed folds have prebuffered state and are actively invested from day 0
+            assert total_w.iloc[0] >= 0.45
+
+    # Also verify lifecycle_ab_comparison.csv was generated
+    ab_path = results_dir / "lifecycle_ab_comparison.csv"
+    assert ab_path.exists()
+    df_ab = pd.read_csv(ab_path)
+    assert len(df_ab) == len(unique_folds)
+    assert "sharpe_on" in df_ab.columns
+    assert "sharpe_off" in df_ab.columns
+    assert "sharpe_sign_reversal" in df_ab.columns
 
 
 # --- §3 backtest_research_impl.md: strategy dump & run manifest test suite ---
@@ -2042,6 +2149,7 @@ def test_main_optimize_dumps_best_params(tmp_path, monkeypatch):
         "--results-dir", str(results_dir),
         "--cache-dir", str(cache_dir),
         "--no-plots",
+        "--no-position-lifecycle",
     ]
     monkeypatch.setattr(sys, "argv", argv)
     main()
@@ -2111,6 +2219,7 @@ def test_run_manifest_written_for_standard_and_walkforward(tmp_path, monkeypatch
         "--results-dir", str(results_dir_std),
         "--cache-dir", str(cache_dir),
         "--no-plots",
+        "--no-position-lifecycle",
     ]
     monkeypatch.setattr(sys, "argv", argv_std)
     main()
@@ -2323,6 +2432,7 @@ def test_run_manifest_records_cli_args(tmp_path, monkeypatch):
         "--results-dir", str(results_dir),
         "--cache-dir", str(cache_dir),
         "--no-plots",
+        "--no-position-lifecycle",
     ]
     monkeypatch.setattr(sys, "argv", argv)
 
@@ -2433,6 +2543,7 @@ def test_run_manifest_cli_args_defaults_and_malformed_strategy_params(tmp_path, 
         "--results-dir", str(results_dir),
         "--cache-dir", str(cache_dir),
         "--no-plots",
+        "--no-position-lifecycle",
     ]
     monkeypatch.setattr(sys, "argv", argv)
     main()
@@ -2543,6 +2654,7 @@ def test_main_optimize_empty_param_grid_keeps_original_params(tmp_path, monkeypa
         "--results-dir", str(results_dir),
         "--cache-dir", str(cache_dir),
         "--no-plots",
+        "--no-position-lifecycle",
     ]
     monkeypatch.setattr(sys, "argv", argv)
     main()

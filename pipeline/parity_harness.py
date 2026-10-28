@@ -127,7 +127,7 @@ import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 # Same sys.path bootstrap the sibling pipeline tests use: `common/` and
 # `backtester/` live at the repository root and have no venv of their own.
@@ -138,7 +138,15 @@ if _REPO_ROOT not in sys.path:
 import pandas as pd  # noqa: E402
 
 from common.allocation_backtester import CASH_PROXY_SYMBOLS, run_allocation_backtest  # noqa: E402
-from common.position_lifecycle import coerce_blocking_reason  # noqa: E402
+from common.position_lifecycle import (  # noqa: E402
+    AssetLifecycleState,
+    BlockingReason,
+    LifecycleDecision,
+    PositionLifecycleConfig,
+    coerce_blocking_reason,
+    simulate_position_lifecycle,
+    step_position_lifecycle,
+)
 
 # --------------------------------------------------------------------------- #
 # Acceptance line -- constants, NOT CLI flags (see module docstring).
@@ -1427,6 +1435,232 @@ def _json_default(value: Any) -> Any:
     if hasattr(value, "item"):
         return value.item()
     return str(value)
+
+
+def verify_lifecycle_step_parity(
+    state: Union[AssetLifecycleState, Dict[str, Any]],
+    raw_target_weight: float,
+    current_price: float,
+    cfg: PositionLifecycleConfig,
+    market: str = "china",
+    live_decision: Optional[Union[LifecycleDecision, Dict[str, Any]]] = None,
+    current_volume: Optional[float] = None,
+    ma20_volume: Optional[float] = None,
+    market_breadth: Optional[float] = None,
+    atr: Optional[float] = None,
+    is_emergency_halt: bool = False,
+    is_market_open: bool = True,
+    is_portfolio_deleverage: bool = False,
+) -> Dict[str, Any]:
+    """Compares a position lifecycle simulation step against a live execution decision.
+
+    Parameters:
+        state: Initial asset lifecycle state (AssetLifecycleState or dict).
+        raw_target_weight: Strategy target weight.
+        current_price: Price used for evaluation.
+        cfg: State machine configuration.
+        market: Target exchange market ('china', 'us', 'hk').
+        live_decision: Optional decision from live run (LifecycleDecision or ticket dict).
+        ... additional market condition kwargs.
+
+    Returns:
+        Dict containing 'parity' (bool), 'decision' (LifecycleDecision),
+        'state_after' (AssetLifecycleState), and 'mismatches' (list of str).
+    """
+    if isinstance(state, dict):
+        st = AssetLifecycleState.from_dict(state)
+    else:
+        st = AssetLifecycleState.from_dict(state.to_dict())
+
+    decision = step_position_lifecycle(
+        state=st,
+        raw_target_weight=raw_target_weight,
+        current_price=current_price,
+        cfg=cfg,
+        market=market,
+        current_volume=current_volume,
+        ma20_volume=ma20_volume,
+        market_breadth=market_breadth,
+        atr=atr,
+        is_emergency_halt=is_emergency_halt,
+        is_market_open=is_market_open,
+        is_portfolio_deleverage=is_portfolio_deleverage,
+    )
+
+    mismatches: List[str] = []
+    if live_decision is not None:
+        if isinstance(live_decision, dict):
+            live_action = str(live_decision.get("action", ""))
+            live_tw = float(live_decision.get("target_weight", 0.0))
+            live_br = coerce_blocking_reason(live_decision.get("blocking_reason"))
+        else:
+            live_action = str(live_decision.action)
+            live_tw = float(live_decision.target_weight)
+            live_br = coerce_blocking_reason(live_decision.blocking_reason)
+
+        if decision.action != live_action:
+            mismatches.append(f"Action mismatch: sim={decision.action} vs live={live_action}")
+        if abs(decision.target_weight - live_tw) > MAX_ABS_DELTA_W:
+            mismatches.append(f"Target weight mismatch: sim={decision.target_weight} vs live={live_tw}")
+        if coerce_blocking_reason(decision.blocking_reason) != live_br:
+            mismatches.append(f"Blocking reason mismatch: sim={decision.blocking_reason} vs live={live_br}")
+
+    return {
+        "parity": len(mismatches) == 0,
+        "decision": decision,
+        "state_after": st,
+        "mismatches": mismatches,
+    }
+
+
+def verify_lifecycle_path_parity(
+    universe: Dict[str, pd.DataFrame],
+    target_weights: pd.DataFrame,
+    cfg: PositionLifecycleConfig,
+    market: str = "china",
+    cash_proxy: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Replays a multi-day synthetic path through sequential live step_position_lifecycle
+    calls and compares against simulate_position_lifecycle (backtest simulation).
+
+    Asserts identical per-day actions, blocking reasons, and weights (|Δw| < MAX_ABS_DELTA_W).
+    """
+    sim_weights, sim_records = simulate_position_lifecycle(
+        universe=universe,
+        target_weights=target_weights,
+        cfg=cfg,
+        market=market,
+        cash_proxy=cash_proxy,
+    )
+
+    symbols = list(target_weights.columns)
+    risky_symbols = [s for s in symbols if cash_proxy is None or s != cash_proxy]
+
+    closes: Dict[str, pd.Series] = {}
+    vols: Dict[str, pd.Series] = {}
+    ma20_v: Dict[str, pd.Series] = {}
+    atr_map: Dict[str, pd.Series] = {}
+
+    for sym in risky_symbols:
+        df = universe.get(sym)
+        if df is not None and not df.empty:
+            if "Close" in df.columns:
+                closes[sym] = pd.to_numeric(df["Close"], errors="coerce")
+            if "Volume" in df.columns:
+                vols[sym] = pd.to_numeric(df["Volume"], errors="coerce")
+                ma20_v[sym] = vols[sym].rolling(20, min_periods=1).mean()
+            if "High" in df.columns and "Low" in df.columns and "Close" in df.columns:
+                try:
+                    from common.indicators import atr
+                    atr_map[sym] = atr(df, 14)
+                except Exception:
+                    pass
+
+    live_states: Dict[str, AssetLifecycleState] = {
+        sym: AssetLifecycleState(symbol=sym) for sym in risky_symbols
+    }
+    raw_targets = target_weights.ffill().fillna(0.0)
+
+    sim_rec_map = {(str(r["date"]), str(r["symbol"])): r for r in sim_records}
+
+    mismatches: List[str] = []
+
+    for t in target_weights.index:
+        t_str = str(t)
+        for sym in risky_symbols:
+            st = live_states[sym]
+            tgt_w = float(raw_targets.loc[t, sym]) if (t in raw_targets.index and sym in raw_targets.columns) else 0.0
+
+            p_series = closes.get(sym)
+            if p_series is not None and t in p_series.index:
+                p_val = p_series.loc[t]
+                if isinstance(p_val, pd.Series):
+                    p_val = p_val.iloc[-1]
+                price = float(p_val) if pd.notna(p_val) and p_val > 0 else 0.0
+            else:
+                price = 0.0
+
+            cur_v = None
+            if sym in vols and t in vols[sym].index:
+                v_val = vols[sym].loc[t]
+                if isinstance(v_val, pd.Series):
+                    v_val = v_val.iloc[-1]
+                cur_v = float(v_val) if pd.notna(v_val) and v_val > 0 else None
+
+            ma_v = None
+            if sym in ma20_v and t in ma20_v[sym].index:
+                mv_val = ma20_v[sym].loc[t]
+                if isinstance(mv_val, pd.Series):
+                    mv_val = mv_val.iloc[-1]
+                ma_v = float(mv_val) if pd.notna(mv_val) and mv_val > 0 else None
+
+            sym_atr = None
+            if sym in atr_map and t in atr_map[sym].index:
+                atr_val = atr_map[sym].loc[t]
+                if isinstance(atr_val, pd.Series):
+                    atr_val = atr_val.iloc[-1]
+                sym_atr = float(atr_val) if pd.notna(atr_val) and atr_val > 0 else None
+
+            asset_market = market
+            if market == "auto":
+                if sym.endswith(".SH") or sym.endswith(".SZ") or (sym.isdigit() and len(sym) == 6):
+                    asset_market = "china"
+                elif sym.endswith(".HK") or (sym.isdigit() and len(sym) in (4, 5)):
+                    asset_market = "hk"
+                else:
+                    asset_market = "us"
+
+            if not (math.isfinite(price) and price > 0.0):
+                live_dec = LifecycleDecision(
+                    action="HOLD_FILTERED",
+                    target_weight=float(st.current_weight),
+                    reason="缺失有效价格：跳过评估，保持当前持仓权重与状态",
+                    detail_reason={
+                        "current_price": price,
+                        "blocking_reason": BlockingReason.NO_PRICE.value,
+                        "note": "缺失有效价格 (NO_PRICE): 状态与当前持仓权重保持不变",
+                    },
+                    state_before=st.state,
+                    state_after=st.state,
+                    fast_path_triggered=None,
+                    blocking_reason=BlockingReason.NO_PRICE,
+                )
+            else:
+                live_dec = step_position_lifecycle(
+                    state=st,
+                    raw_target_weight=tgt_w,
+                    current_price=price,
+                    cfg=cfg,
+                    market=asset_market,
+                    current_volume=cur_v,
+                    ma20_volume=ma_v,
+                    atr=sym_atr,
+                )
+
+            sim_rec = sim_rec_map.get((t_str, sym))
+            if sim_rec is None:
+                mismatches.append(f"Missing sim record for date={t_str}, sym={sym}")
+                continue
+
+            if sim_rec["action"] != live_dec.action:
+                mismatches.append(
+                    f"Action mismatch on {t_str} for {sym}: sim={sim_rec['action']} vs live={live_dec.action}"
+                )
+            if abs(float(sim_rec["target_weight"]) - float(live_dec.target_weight)) > MAX_ABS_DELTA_W:
+                mismatches.append(
+                    f"Target weight mismatch on {t_str} for {sym}: sim={sim_rec['target_weight']} vs live={live_dec.target_weight}"
+                )
+            if coerce_blocking_reason(sim_rec["blocking_reason"]) != coerce_blocking_reason(live_dec.blocking_reason):
+                mismatches.append(
+                    f"Blocking reason mismatch on {t_str} for {sym}: sim={sim_rec['blocking_reason']} vs live={live_dec.blocking_reason}"
+                )
+
+    return {
+        "parity": len(mismatches) == 0,
+        "mismatches": mismatches,
+        "days_checked": len(target_weights.index),
+        "records_checked": len(sim_records),
+    }
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised through `main()`
