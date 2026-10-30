@@ -10,6 +10,7 @@
 > 3. **Strict adherence to the repository's two non-negotiable invariants**:
 >    - **Daily Sparse Weights Contract**: `generate_weights` returns a DataFrame with `NaN` on non-rebalance days, real target allocations on rebalance days, and **explicit `0.0` for any liquidated or de-risked symbol** (never left as `NaN`, which would cause `ffill().fillna(0.0)` in the backtester to silently carry forward stale positions);
 >    - **Default-Off Flags & 100% Backward Compatibility**: All newly introduced parameters in `StrategyConfig` default strictly to `False`, guaranteeing zero divergence or regression across existing 55+ strategies and historical `blend_6..13` benchmarks.
+>      - **(2026-10-29 correction, task `C6.3`) The "strictly `False`" claim above is VOID as of this date and is retained only as 2026-10-17 drafting history**: `blend_enable_structural_regime` and `blend_enable_cyq_quality_gate` (anchors 1/2) were **solidified to the production default `True`** in `BaseBlendAllocationStrategy` `BASE_VERSION 1.4.0` (2026-10-21 — see the `v1.4.0` entry in [`docs/version.md`](file:///home/stone/Work/github/quant/docs/version.md)); all other new flags still default to `False`. **The authoritative default values are stated exactly once**, in the §6.2 code block (pinned line-by-line to `pipeline/research_strategy/rs/config.py:932-937`); no other place in this document restates them.
 
 ---
 
@@ -329,7 +330,7 @@ def cyq_chip_distribution(
 1. **`ChanTrendThirdBuyStrategy` (`chan_trend_third_buy`)**:
    Add `chan_b3_enable_vp_filter: bool = False`. When True, applies `consolidation_density >= 0.40` to pre-breakout pivots.
 2. **`ChanMeanReversionDivergenceStrategy` (`chan_mrd_entry_mode`)**:
-   Extend `chan_mrd_entry_mode: str = "classic"` to support `"wyckoff_spring"`, `"curvature_v_bottom"`, and `"spring_curvature_combined"`.
+   Extend `chan_mrd_entry_mode` — **code default is `"raw_b1"`** (single authoritative statement: §6.2 code block, pinned to `pipeline/research_strategy/rs/config.py:322`; shipped config agrees, `strategies_config.json:234`) — to support `"wyckoff_spring"`, `"curvature_v_bottom"`, and `"spring_curvature_combined"`. **(2026-10-29 correction, task `C6.3`) The earlier draft wrote `chan_mrd_entry_mode: str = "classic"`; that value is void as a default.** `"classic"` has never been the default — it is merely a **synonym alias of `"raw_b1"`** (`chan_advanced_strategies.py:1034`: `if entry_mode in ("raw_b1", "classic")` takes the same branch, producing bit-identical entry signals).
 3. **`RegimeFactorCompoundStrategy` (`regime_enable_fractal_curvature`)**:
    Add `regime_enable_fractal_curvature: bool = False` (M6 constraint), incorporating `fractal_dimension` and `extremum_curvature` into regime identification when enabled.
 
@@ -450,6 +451,8 @@ flowchart TD
 
 All parameters default to `False` / baseline values for 100% backward compatibility:
 
+**(2026-10-29 correction, task `C6.3`) That blanket "default `False`" no longer holds and is void**: `BASE_VERSION 1.4.0` (2026-10-21) solidified anchors 1/2 to the production default `True`; anchors 3/4/5 still default to `False`, and `chan_mrd_entry_mode` is a string mode (default `"raw_b1"`), not a boolean flag. **The code block below is the only authoritative default list in this document for the `C6.3` items** (MRD entry mode + the 6 anchor parameters) and is aligned line-by-line with `config.py:322` / `:932-937`:
+
 ```python
     # ==========================================================================
     # Multi-Theory Quantitative Synthesis & Structural Factor Parameters
@@ -462,19 +465,26 @@ All parameters default to `False` / baseline values for 100% backward compatibil
     wyckoff_spring_max_penetration: float = 0.04        # Maximum allowed spring penetration (4%, M4 constraint)
     wyckoff_spring_min_curvature: float = 1.5           # Minimum dimensionless quadratic curvature (1.5, M1 constraint)
 
-    # 2. Backward-Compatible Single Strategy Switches (Default False)
+    # 2. Backward-Compatible Single Strategy Switches (two booleans default False; chan_mrd_entry_mode is a string mode, default "raw_b1")
     chan_b3_enable_vp_filter: bool = False              # ChanTrendThirdBuy VP consolidation density validation
-    chan_mrd_entry_mode: str = "classic"                # ChanMeanReversionDivergence entry mode: "classic", "wyckoff_spring", "curvature_v_bottom"
+    chan_mrd_entry_mode: str = "raw_b1"                 # <- 2026-10-29 correction (C6.3): authoritative default = "raw_b1" at config.py:322
+                                                        #    earlier draft's "classic" is void; "classic" is only a synonym alias of "raw_b1"
+                                                        #    (same branch at chan_advanced_strategies.py:1034, bit-identical signals)
+                                                        #    valid values: "raw_b1"(="classic"), "zero_axis", "failed_retest", "combined",
+                                                        #                  "wyckoff_spring", "curvature_v_bottom", "spring_curvature_combined"
     regime_enable_fractal_curvature: bool = False       # RegimeFactorCompound fractal/curvature macro expansion (M6 constraint)
 
-    # 3. Modular Blend Base Allocation Parameters (Default False)
-    blend_enable_structural_regime: bool = False        # Anchor 1: Macro state machine fractal dimension D_t
-    blend_enable_cyq_quality_gate: bool = False         # Anchor 2: CYQ winner ratio & hollow pivot quality gate
+    # 3. Modular Blend Base Allocation Parameters (anchor 1/2 default True -- BASE_VERSION 1.4.0 production pin; anchors 3/4/5 default False)
+    blend_enable_structural_regime: bool = True         # Anchor 1: Macro state machine fractal dimension D_t (default True; draft's False corrected 2026-10-29)
+    blend_enable_cyq_quality_gate: bool = True          # Anchor 2: CYQ winner ratio & hollow pivot quality gate (default True; draft's False corrected 2026-10-29)
     blend_min_cyq_winner_ratio: float = 0.20            # Anchor 2: Minimum CYQ winner ratio threshold (0.20)
     blend_enable_vp_confluence_sizing: bool = False     # Anchor 3: VAH breakout & single-peak thrust confluence
     blend_enable_spring_fast_entry: bool = False        # Anchor 4: Wyckoff Spring Day 1 fast-track entry
     blend_enable_structural_chandelier_stop: bool = False # Anchor 5: Structural ZG/VAL chandelier stop & NPOC exit
 ```
+
+> [!IMPORTANT]
+> **Verified against the live code (2026-10-29, task `C6.3`)**: all 7 `C6.3` items above (`chan_mrd_entry_mode` + the 6 anchor parameters) match the deployed code exactly — `chan_mrd_entry_mode="raw_b1"` (`rs/config.py:322`, mirrored in `strategies_config.json:234`), `blend_enable_structural_regime=True` / `blend_enable_cyq_quality_gate=True` / `blend_min_cyq_winner_ratio=0.20` / anchors 3/4/5 `False` (`rs/config.py:932-937`), pinned by `pipeline/research_strategy/tests/test_blend_track_c.py:50-56`. **One further stale value in this block is NOT part of `C6.3` and was deliberately left untouched**: `wyckoff_spring_min_curvature` is shown as `1.5` but the live default is `0.8` (reachability fix, archived task `C5.1`) — do not cite this block for that threshold.
 
 > [!NOTE]
 > **Centralized Implementation Roadmap & Atomic Task Tracking**: The 9 Multi-Theory atomic tasks (`C1.1`–`C4.1`) and the merged 28-task 5-tier master priority queue have been centralized into the repository's Single Source of Truth [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md). Please refer to that document for task tracking, dependencies, and wave scheduling.
@@ -522,6 +532,8 @@ uv run --project pipeline python scripts/run_live_strategy.py \
 ### 7.2 Phase 6 Walkforward Ablation, DSR & ERS Audit Gates
 
 Before any default flag is flipped to `True` for live deployment, the configuration must pass the following audit gates:
+
+**(2026-10-29 correction, task `C6.3`) Note the tense**: anchors 1/2 (`blend_enable_structural_regime`, `blend_enable_cyq_quality_gate`) have **already** been flipped to the production default `True` under `BASE_VERSION 1.4.0`; anchors 3/4/5 still default to `False`. Variants 1 and 2 below therefore *stack onto an already-on switch* rather than switching it on for the first time — read them as an on/off ablation of a live default, not as a first activation.
 
 1. **Walkforward Step-by-Step Ablation Study**:
    Across the 2019–2026 walkforward folds (spanning bull, bear, and chop regimes), evaluate incremental variants:

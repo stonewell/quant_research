@@ -320,6 +320,14 @@ class StrategyConfig:
     chan_mrd_macd_slow: int = 26
     chan_mrd_macd_signal: int = 9
     chan_mrd_entry_mode: str = "raw_b1"   # "raw_b1", "classic", "zero_axis", "failed_retest", "combined", "wyckoff_spring", "curvature_v_bottom", "spring_curvature_combined"
+    # NOTE (C6.3, 2026-10-29): the default is "raw_b1", NOT "classic" -- two
+    # docs (docs/缠论与筹码分布及多流派量化融合实施方案.md §6.2 / §4.3 and
+    # docs/development_plan_archive.md C2.3) carried the wrong value and were
+    # corrected. "classic" is merely a synonym alias of "raw_b1":
+    # ChanMeanReversionDivergenceStrategy does
+    # `if entry_mode in ("raw_b1", "classic")`, so the two produce bit-identical
+    # entries (asserted by test_chan_mrd_entry_modes_and_backward_compatibility).
+    # Valid values are validated in __post_init__ (valid_mrd_modes).
     chan_mrd_confirm_window_bars: int = 20
     chan_mrd_require_trend_filter: bool = True
     chan_mrd_trend_ma_period: int = 200
@@ -901,17 +909,32 @@ class StrategyConfig:
     wyckoff_spring_max_holding_days: int = 30
     wyckoff_spring_position_size_pct: float = 1.0
 
-    # Backward-compatible single-strategy enhancement flags (default False)
+    # Backward-compatible single-strategy enhancement flags (default False).
+    # NOTE (C6.3): chan_mrd_entry_mode, declared with the MRD block above, is
+    # NOT in this group and does NOT default to False -- it is a string mode
+    # defaulting to "raw_b1".
     chan_b3_enable_vp_filter: bool = False
     regime_enable_fractal_curvature: bool = False
 
-    # Modular Blend base enhancement flags (default True for production)
-    blend_enable_structural_regime: bool = True
-    blend_enable_cyq_quality_gate: bool = True
-    blend_min_cyq_winner_ratio: float = 0.20
-    blend_enable_vp_confluence_sizing: bool = False
-    blend_enable_spring_fast_entry: bool = False
-    blend_enable_structural_chandelier_stop: bool = False
+    # Modular Blend base enhancement flags -- Track C anchors 1-5.
+    # Per-anchor defaults are NOT uniform, so do not summarise this block as
+    # "all new parameters default False" (two plan docs did, out of date until
+    # the 2026-10-29 C6.3 doc correction):
+    #   anchors 1/2 (blend_enable_structural_regime / blend_enable_cyq_quality_gate)
+    #     -> True, solidified for production in BaseBlendAllocationStrategy
+    #     BASE_VERSION 1.4.0 (2026-10-21, see docs/version.md), pinned by
+    #     test_blend_track_c.py::test_track_c_param_resolution. Reverting these
+    #     to False would silently disable the fractal state-machine budget routing
+    #     and anchor 2's CYQ winner-ratio veto in all six blend strategies.
+    #   anchors 3/4/5 (vp_confluence_sizing / spring_fast_entry /
+    #     structural_chandelier_stop) -> False, still opt-in.
+    # blend_min_cyq_winner_ratio is anchor 2's threshold and stays at 0.20.
+    blend_enable_structural_regime: bool = True          # anchor 1
+    blend_enable_cyq_quality_gate: bool = True           # anchor 2
+    blend_min_cyq_winner_ratio: float = 0.20             # anchor 2 threshold
+    blend_enable_vp_confluence_sizing: bool = False      # anchor 3
+    blend_enable_spring_fast_entry: bool = False         # anchor 4
+    blend_enable_structural_chandelier_stop: bool = False  # anchor 5
 
     # Modular Blend base enhancement aliases (unprefixed versions for convenience)
     enable_structural_regime: Optional[bool] = None
