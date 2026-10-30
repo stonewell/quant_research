@@ -44,8 +44,9 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
 import pandas as pd
 
@@ -71,6 +72,7 @@ try:
         diff_holdings_input_vs_prev_post,
         format_holdings_input_mismatch,
         is_cash_symbol,
+        is_instance_dir_name,
         parse_ticket_csv,
         post_holdings_from_ticket,
         strict_holdings_input_enabled,
@@ -82,6 +84,7 @@ except (ImportError, ValueError):
         diff_holdings_input_vs_prev_post,
         format_holdings_input_mismatch,
         is_cash_symbol,
+        is_instance_dir_name,
         parse_ticket_csv,
         post_holdings_from_ticket,
         strict_holdings_input_enabled,
@@ -486,6 +489,99 @@ _NAV_REASON_TEXT: Dict[str, Tuple[str, str]] = {
 _NAV_TRUE_VALUES = frozenset({"1", "true", "yes", "on", "y", "t"})
 
 
+# --------------------------------------------------------------------------- #
+# (L2.62) Same-day run instances: `summary.json` must not accumulate across rounds
+# --------------------------------------------------------------------------- #
+#: Cross-round summary inheritance whitelist -- INTENTIONALLY EMPTY.
+#:
+#: Forensic origin: `2026-10-27/summary.json` simultaneously carried
+#: `deploy_status="SUCCESS"` AND `error_detail="KeyboardInterrupt"`, with a
+#: `deploy_stdout` (UTC 03:06) older than the `health_stdout` (UTC 04:31). Two rounds had
+#: merged into one file, so "did the 04:31 run deploy?" had no single answer. Every field
+#: named in that audit -- `deploy_status` / `deploy_stdout` / `health_stdout` / `nav_*` /
+#: `trades_count` / `error_*` -- must therefore NEVER survive into another round's summary.
+#:
+#: The layout fix (one directory per round) makes inheritance structurally impossible for
+#: a genuinely new instance. `de_merge_run_summary` below is the second line of defence for
+#: the one case where a directory IS reused (same-second idempotent allocation, or
+#: `LIVETRADING_RUN_INSTANCE_SPLIT=0`). If inheritance is ever needed, add the field here
+#: AND record `inherited_from` + `inherited_fields` in the summary.
+SUMMARY_INHERITANCE_WHITELIST: Tuple[str, ...] = ()
+
+
+def de_merge_run_summary(
+    pre_summary: Optional[Mapping[str, Any]],
+    post_summary: Optional[Mapping[str, Any]],
+    owned_keys: Optional[Any],
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Drop fields that leaked in from a PREVIOUS round's `summary.json`.
+
+    ``pre_summary`` is what the directory contained BEFORE this round started, so any key
+    in it that this round did not re-derive (``owned_keys``) and that is absent from
+    :data:`SUMMARY_INHERITANCE_WHITELIST` is a cross-round leftover.  Returns
+    ``(cleaned_summary, dropped_keys)``; pure, so it is unit-testable offline.
+
+    A genuinely new instance directory has an empty ``pre_summary``, making this a no-op --
+    exactly the "starts from an empty dict" contract, enforced rather than assumed.
+    """
+    post: Dict[str, Any] = dict(post_summary or {})
+    pre = dict(pre_summary or {})
+    if not pre:
+        return post, []
+    owned = set(owned_keys or ())
+    dropped: List[str] = []
+    for key in list(post):
+        if key in owned or key in SUMMARY_INHERITANCE_WHITELIST:
+            continue
+        if key in pre:
+            dropped.append(key)
+            post.pop(key)
+    return post, sorted(dropped)
+
+
+#: (L2.62) Stage-1's gate artifact, and the fields inside it a Stage-2 ticket obeys.
+#:
+#: A Stage-2 round that has to inherit a report from an EARLIER instance of the same
+#: session records `inherited_fields` = this tuple minus what the report lacks. It is
+#: derived from the report file that was ACTUALLY handed to the child -- never copied out
+#: of a previous round's `summary.json`, which is exactly the merge the de-merge defends
+#: against.
+STAGE1_HEALTH_REPORT_FILENAME = "stage1_health_report.json"
+STAGE1_GATE_FIELDS: Tuple[str, ...] = (
+    "directive",
+    "gate_code",
+    "linear_equity_scale",
+    "intraday_buy_scale",
+    "circuit_breaker_tier",
+    "freeze_remaining_bars",
+    "market_macro",
+    "breadth",
+    "thrust",
+    "thrust_active",
+    "breadth_thrust_10d",
+    "portfolio_health",
+)
+#: (L2.62) Summary keys proving a directory's round really RAN Stage 1. Used to decide
+#: whether a missing gate report is a hard precondition failure (Stage 1 ran, its report
+#: is unreachable -> refuse) or merely "Stage 1 was never invoked for this session"
+#: (pre-L2.62 behaviour, warned about rather than silently upgraded to a new default).
+STAGE1_EVIDENCE_SUMMARY_KEYS: Tuple[str, ...] = (
+    "health_status",
+    "health_returncode",
+    "health_report_source",
+)
+
+
+class Stage1HealthReportMissingError(RuntimeError):
+    """Refusal to deploy because this session's Stage-1 gate report cannot be found.
+
+    Subclasses ``RuntimeError`` for the same reason as ``NavValuationError``: ``server.py``
+    maps it to HTTP 500 with the whole message as ``detail``, so the operator reads the
+    refusal plus the one command that fixes it instead of receiving a ticket that was
+    produced with the macro gate / circuit breaker silently switched off.
+    """
+
+
 def _env_truthy(name: str) -> bool:
     """Same truthy set as `storage._truthy_env`, so every `LIVETRADING_*` knob reads alike."""
     return str(os.environ.get(name, "")).strip().lower() in _NAV_TRUE_VALUES
@@ -624,8 +720,264 @@ def cache_structure_reason(cache: Any) -> Optional[str]:
 class ExecutionService:
     """Orchestrates health check and live deployment runs."""
 
+    #: (L2.62) How long a Stage-2 request may reuse the directory of an immediately
+    #: preceding Stage-2 request for the same `(strategy, universe, date)`.  A
+    #: double-click must not fragment the archive into two instances of one round.
+    PENDING_STAGE2_REUSE_SECONDS = 1.0
+
     def __init__(self, storage: StorageManager):
         self.storage = storage
+        #: (L2.62) `(strategy, universe, date) -> (run_dir, owned_keys)` allocated by Stage 1
+        #: and not yet consumed by Stage 2.  Both stages of one deploy MUST share one
+        #: directory: Stage 2 receives `--health-report-file` from it and is the only writer
+        #: of the ticket.  `owned_keys` is the set of summary fields THIS round's Stage 1
+        #: wrote -- Stage 2 must re-own them, otherwise the de-merge would delete the health
+        #: half of the very round it is completing.
+        #:
+        #: **LIMITATION -- in-process only.** This is a plain dict, so the hand-off exists
+        #: only inside ONE Python process: a web restart between Stage 1 and Stage 2 (or a
+        #: deploy served by a different uvicorn worker) finds no entry.  Stage 2 must never
+        #: treat that as "no macro gate needed" -- `_resolve_stage2_health_gate` then
+        #: re-discovers the newest `stage1_health_report.json` of the same session on disk,
+        #: hands it to the child, and records `health_report_source` / `inherited_from` /
+        #: `inherited_fields` in the new round's summary.  If the session shows Stage-1
+        #: evidence (see `STAGE1_EVIDENCE_SUMMARY_KEYS`) but no report is reachable, the
+        #: deploy is REFUSED (`Stage1HealthReportMissingError`) rather than run ungated.
+        self._pending_stage1: Dict[Tuple[str, str, str], Tuple[str, FrozenSet[str]]] = {}
+        #: `(strategy, universe, date) -> (monotonic_ts, run_dir, inherited_owned_keys)` of the
+        #: last Stage-2 dir, consulted only when no Stage-1 allocation is pending (a
+        #: Stage-2-only deploy or a double-click).
+        #:
+        #: **LIMITATION -- in-process only**, exactly like `_pending_stage1`: after a
+        #: restart a double-click is deduped only by the second-level
+        #: `storage.allocate_run_instance_dir` idempotency (one archive entry per second),
+        #: never by this window.  Losing the window costs an extra instance dir, never a
+        #: gate: the health report is re-resolved from disk (see `_resolve_stage2_health_gate`).
+        self._pending_stage2: Dict[Tuple[str, str, str], Tuple[float, str, FrozenSet[str]]] = {}
+
+    # -- (L2.62) same-day run instances: allocation + hand-off -- #
+    @staticmethod
+    def _instance_key(strategy_key: Optional[str], universe_key: Optional[str], val_date: str) -> Tuple[str, str, str]:
+        return (str(strategy_key or ""), str(universe_key or ""), str(val_date or ""))
+
+    def _allocate_stage1_run_dir(self, base_dir: str, key: Tuple[str, str, str]) -> str:
+        """Stage 1 owns the allocation; Stage 2 reuses it. Returns the run dir to use.
+
+        The flat (first-of-session) directory is handed off too, not just instances: both
+        stages of ONE deploy must write into the SAME directory, otherwise Stage 2's
+        `--health-report-file` would point at a Stage-1 report that lives somewhere else
+        and the session would be split across two directories by accident.
+        """
+        run_dir = self.storage.allocate_run_instance_dir(base_dir)
+        if len(self._pending_stage1) >= 64:
+            self._pending_stage1.pop(next(iter(self._pending_stage1)), None)
+        self._pending_stage1[key] = (run_dir, frozenset())
+        return run_dir
+
+    def _record_stage1_owned_keys(
+        self, key: Tuple[str, str, str], run_dir: str, owned_keys: Any
+    ) -> None:
+        """Publish the fields Stage 1 wrote for THIS round, for Stage 2 to re-own."""
+        pending = self._pending_stage1.get(key)
+        if pending and pending[0] == run_dir:
+            self._pending_stage1[key] = (run_dir, frozenset(owned_keys or ()))
+
+    def _resolve_stage2_run_dir(
+        self, base_dir: str, key: Tuple[str, str, str]
+    ) -> Tuple[str, FrozenSet[str], str]:
+        """`(run directory, Stage-1-owned keys, hand-off source)` for this Stage-2 round.
+
+        The third element says WHERE the directory came from, which decides how the
+        Stage-1 gate report is resolved:
+
+        * ``"stage1"``     -- this process still holds the Stage-1 allocation: the report
+                              belongs to this very round (same directory, same round);
+        * ``"stage2_reuse"`` -- the double-click window (`PENDING_STAGE2_REUSE_SECONDS`);
+        * ``"new"``        -- neither is known, i.e. a Stage-2-only deploy, a RESTART, or a
+                              request served by another uvicorn worker.  This is the case
+                              that must not silently deploy without a macro gate; see
+                              `_resolve_stage2_health_gate`.
+        """
+        pending = self._pending_stage1.pop(key, None)
+        if pending and os.path.isdir(pending[0]):
+            run_dir, inherited = pending
+            self._remember_stage2_dir(key, run_dir, inherited)
+            return run_dir, inherited, "stage1"
+        previous = self._pending_stage2.get(key)
+        if previous and (time.monotonic() - previous[0]) <= self.PENDING_STAGE2_REUSE_SECONDS:
+            if os.path.isdir(previous[1]):
+                return previous[1], previous[2], "stage2_reuse"
+        run_dir = self.storage.allocate_run_instance_dir(base_dir)
+        self._remember_stage2_dir(key, run_dir, frozenset())
+        return run_dir, frozenset(), "new"
+
+    def _remember_stage2_dir(
+        self, key: Tuple[str, str, str], run_dir: str, inherited: FrozenSet[str]
+    ) -> None:
+        if len(self._pending_stage2) >= 64:
+            self._pending_stage2.pop(next(iter(self._pending_stage2)), None)
+        self._pending_stage2[key] = (time.monotonic(), run_dir, inherited)
+
+    # -- (L2.62) Stage-1 gate report: restart / multi-worker tolerant resolution -- #
+    def _read_health_report(self, path: str) -> Optional[Dict[str, Any]]:
+        """Top-level dict of a gate report, or `None` when it is absent/unreadable."""
+        report = self.storage._load_json(path, default=None)
+        return report if isinstance(report, dict) else None
+
+    def _health_gate_summary_fields(
+        self,
+        report_file: Optional[str],
+        report: Optional[Dict[str, Any]],
+        source_dir: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Summary provenance for the gate report THIS round used.
+
+        Everything here is derived from the report file that was actually handed to the
+        child (or from its absence) -- never from a previous round's `summary.json`, so
+        re-owning these keys cannot resurrect another round's health/nav/deploy fields.
+        `inherited_*` is only populated when the report came from a DIFFERENT directory
+        than this round's own.
+        """
+        fields: Dict[str, Any] = {
+            "health_gate_applied": bool(report_file),
+            "health_report_file": report_file,
+            "health_gate_code": (report or {}).get("gate_code"),
+            "health_gate_directive": (report or {}).get("directive"),
+        }
+        if source_dir is not None:
+            fields["health_report_source"] = os.path.basename(os.path.normpath(source_dir))
+            try:
+                fields["inherited_from"] = os.path.relpath(source_dir, self.storage.archive_dir)
+            except ValueError:  # different drive on Windows -- keep the absolute path
+                fields["inherited_from"] = source_dir
+            fields["inherited_fields"] = sorted(f for f in STAGE1_GATE_FIELDS if f in (report or {}))
+        return fields
+
+    def _find_inheritable_stage1_report(
+        self, base_dir: str, run_dir: str
+    ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+        """`(run dir, report)` of the newest USABLE Stage-1 report of this session.
+
+        Same ordering rule as every other L2.62 reader -- lexicographic instance names,
+        newest first, never mtime -- so a gate report restored from a backup cannot be
+        mistaken for a newer one.  `run_dir` itself is skipped: the caller already knows it
+        has no report (otherwise it would not be searching).
+        """
+        own = os.path.normpath(run_dir)
+        candidates: List[str] = []
+        latest = self.storage.resolve_latest_instance_dir(base_dir)
+        if latest:
+            candidates.append(latest)
+        candidates.extend(reversed(self.storage.list_instances_for_date(base_dir)))
+        seen = set()
+        for candidate in candidates:
+            norm = os.path.normpath(candidate)
+            if norm in seen or norm == own:
+                continue
+            seen.add(norm)
+            report_file = os.path.join(norm, STAGE1_HEALTH_REPORT_FILENAME)
+            if not os.path.exists(report_file):
+                continue
+            report = self._read_health_report(report_file)
+            if report is None:
+                logging.warning(
+                    "[L2.62] 忽略不可读的 Stage-1 门禁报告（继续向前回溯）: %s", report_file
+                )
+                continue
+            return norm, report
+        return None, None
+
+    def _stage1_evidence_dirs(self, base_dir: str) -> List[str]:
+        """Run dirs of this session whose `summary.json` proves their round ran Stage 1.
+
+        This is the boundary between "a macro gate existed and is now unreachable" (a hard
+        refusal -- the regression this method exists for) and "Stage 1 was never invoked
+        for this session at all" (the pre-L2.62 behaviour, kept but warned about).
+        """
+        evidence: List[str] = []
+        for candidate in self.storage.list_instances_for_date(base_dir):
+            summary = self.storage._load_json(
+                os.path.join(candidate, "summary.json"), default=None
+            )
+            if isinstance(summary, dict) and any(k in summary for k in STAGE1_EVIDENCE_SUMMARY_KEYS):
+                evidence.append(candidate)
+        return evidence
+
+    def _resolve_stage2_health_gate(
+        self, base_dir: str, run_dir: str, handoff: str
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
+        """`(path to hand the child as --health-report-file, summary provenance)`.
+
+        An IN-PROCESS Stage-1 hand-off whose own child wrote no report keeps the historic
+        behaviour (no flag, loud warning): nothing older can be more authoritative than
+        the Stage-1 round that just ran, so inheriting there would be misattribution.
+
+        Everywhere else the report is re-resolved from the filesystem, which is what makes
+        the Stage 1 -> Stage 2 hand-off survive a restart or a request landing on another
+        uvicorn worker:
+
+        1. this round's own directory (a reused instance dir may already hold one);
+        2. `resolve_latest_instance_dir(base_dir)`, then `list_instances_for_date` newest
+           -> oldest, for a directory containing `stage1_health_report.json`;
+        3. `handoff == "new"` (restart / another uvicorn worker / Stage-2-only) and nothing
+           was found while the session shows Stage-1 evidence -> raise
+           `Stage1HealthReportMissingError`.  Deploying here would hand the engine a ticket
+           with the macro gate / circuit breaker silently switched off, which is exactly
+           the L2.62 regression;
+        4. nothing found and no Stage-1 evidence -> keep the pre-L2.62 semantics (flag
+           omitted) but make it explicit in both the log and the summary
+           (`health_gate_applied=False`), never a silent default.
+
+        Step 3 is deliberately scoped to `"new"`: a `"stage2_reuse"` round is the same
+        in-process round as the one that just ran (a double-click), so there is no new
+        gate decision to refuse -- it logs and proceeds exactly like its predecessor.
+        """
+        own_report = os.path.join(run_dir, STAGE1_HEALTH_REPORT_FILENAME)
+        if os.path.exists(own_report):
+            report = self._read_health_report(own_report)
+            if report is not None:
+                return own_report, self._health_gate_summary_fields(own_report, report)
+
+        if handoff == "stage1":
+            logging.warning(
+                "[L2.62] Stage-1 本轮目录缺少可用门禁报告（%s）；按既有语义不带 --health-report-file 部署，"
+                "本轮 summary 记录 health_gate_applied=False。若需门禁生效，请重跑 Stage 1 健康检查。",
+                own_report,
+            )
+            return None, self._health_gate_summary_fields(None, None)
+
+        source_dir, report = self._find_inheritable_stage1_report(base_dir, run_dir)
+        if source_dir is not None and report is not None:
+            report_file = os.path.join(source_dir, STAGE1_HEALTH_REPORT_FILENAME)
+            logging.warning(
+                "[L2.62] 未找到本进程内的 Stage-1 交接（进程重启 / 多 worker / 仅跑 Stage 2），"
+                "已回溯并继承同一会话的门禁报告: %s（%s）",
+                report_file,
+                handoff,
+            )
+            return report_file, self._health_gate_summary_fields(report_file, report, source_dir)
+
+        evidence = self._stage1_evidence_dirs(base_dir) if handoff == "new" else []
+        if evidence:
+            raise Stage1HealthReportMissingError(
+                "[L2.62] 拒绝部署：本次会话（%s）已有 Stage-1 健康检查记录（%s），但目录中没有可用的 "
+                "stage1_health_report.json，且本进程没有 Stage-1 -> Stage-2 交接（进程重启 / 多 worker）。"
+                "继续部署会让宏观门禁与熔断指令被静默跳过。"
+                "处理：重新执行一次 Stage 1 健康检查（/api/run-health）后再部署；"
+                "或确认该会话的门禁报告未被删除/移出归档目录。"
+                % (
+                    os.path.basename(os.path.normpath(base_dir)) or base_dir,
+                    ", ".join(os.path.basename(os.path.normpath(p)) or p for p in evidence[-3:]),
+                )
+            )
+
+        logging.warning(
+            "[L2.62] 本次会话没有任何 Stage-1 门禁报告（%s），按既有语义（L2.62 之前同为不带 "
+            "--health-report-file）部署；本轮 summary 记录 health_gate_applied=False。"
+            "需要宏观门禁/熔断生效时，请先执行 Stage 1 健康检查。",
+            os.path.basename(os.path.normpath(run_dir)) or run_dir,
+        )
+        return None, self._health_gate_summary_fields(None, None)
 
     # -- (C6) valuation-date resolution: market clock, never `date.today()` -- #
     def _locate_universe_file(self, universe_file: Optional[str]) -> Optional[str]:
@@ -1087,8 +1439,16 @@ class ExecutionService:
             if exclude and os.path.abspath(run_path) == exclude:
                 continue  # the run being written right now is not history
             date_val = str(run.get("date"))
-            if date_val > as_of:
-                break  # archive is date-sorted; nothing later can be an open date
+            if date_val >= as_of:
+                # `>=`, not `>` (L2.62): same-day runs are now *sibling instance dirs*
+                # (`<date>/<HHMMSS>/`), not the single flat dir.  A symbol first seen in
+                # one of them may well have been opened during today's own session, so
+                # today's date is NOT a usable anchor date -- anchoring to it would make
+                # the total-return ratio identically 1.0 while *claiming* `total_return`
+                # in `dividend_basis`, i.e. silently reporting a raw valuation as if it
+                # were dividend-inclusive.  Excluding the whole day keeps that case on
+                # the honest `anchor_unavailable` -> raw path (a lower bound).
+                break
             snapshot = self.storage._load_snapshot_holdings(run_path)
             if snapshot is None:
                 snapshot = self.storage.extract_post_run_holdings(run_path)
@@ -1403,11 +1763,21 @@ class ExecutionService:
         val_date = as_of_date or self._market_clock_val_date(universe_file, custom_symbols)
         explicit_as_of = as_of_date or None
         as_of_source = "explicit" if explicit_as_of else "market_clock"
-        run_dir = self.storage.get_run_dir(strat_key, univ_key, val_date, prefer_existing=True)
+        base_dir = self.storage.get_run_dir(strat_key, univ_key, val_date, prefer_existing=True)
         # (L2.4) The archive KEY is the valuation session; asserting it here keeps
         # run_dir and summary.json['date'] from ever drifting apart.
+        self._assert_archive_keyed_by(base_dir, val_date)
+        # (L2.62) The FIRST run of a session keeps the flat directory; every later run gets
+        # its own `<date>/<HHMMSS>/`. Stage 2 reuses whatever this stage allocated.
+        pending_key = self._instance_key(strat_key, univ_key, val_date)
+        run_dir = self._allocate_stage1_run_dir(base_dir, pending_key)
         self._assert_archive_keyed_by(run_dir, val_date)
         os.makedirs(run_dir, exist_ok=True)
+        # (L2.62) What this directory held BEFORE this round writes anything: empty for a
+        # freshly allocated instance, so `de_merge_run_summary` cannot let an earlier
+        # round's `health_*` / `error_*` / `deploy_*` fields survive into this one.
+        summary_file = os.path.join(run_dir, "summary.json")
+        pre_summary = self.storage._load_json(summary_file, default={}) or {}
 
         strat_path = self._resolve_strategy(strategy_file)
         univ_path = self._resolve_universe(universe_file, custom_symbols, run_dir)
@@ -1426,10 +1796,20 @@ class ExecutionService:
                 pass
         else:
             try:
-                state_data = self.storage._carry_forward_account_state(val_date, strat_key, univ_key)
+                # (L2.62) A fresh instance dir starts empty; seed it with the newest state
+                # at-or-before this session -- which on a rerun is THIS session's earlier
+                # instance (what the flat layout used to have in the same file), and on a
+                # first run is the previous session's state, exactly as before.
+                state_data = self.storage.latest_account_state_at_or_before(
+                    val_date, strat_key, univ_key
+                )
                 if not state_data:
                     state_data = self.storage.get_account_state(date_str=val_date, strategy_key=strat_key, universe_key=univ_key)
                 if state_data:
+                    if state_data.get("as_of_date") == val_date and "prior_state" not in state_data:
+                        carried = self.storage._carry_forward_account_state(val_date, strat_key, univ_key)
+                        if carried:
+                            state_data = {**state_data, "prior_state": carried}
                     self.storage._save_json(account_state_file, state_data)
             except Exception:
                 pass
@@ -1478,7 +1858,7 @@ class ExecutionService:
         success = proc.returncode == 0
 
         # Load reports
-        health_rep_file = os.path.join(run_dir, "stage1_health_report.json")
+        health_rep_file = os.path.join(run_dir, STAGE1_HEALTH_REPORT_FILENAME)
         health_data = self.storage._load_json(health_rep_file, default=None)
         # (L2.4, §9/§12-11) A 0-row 5m frame must not survive as "enabled". Reconcile
         # from THIS stage's stdout marker (most specific) or Stage 1's structured
@@ -1518,7 +1898,13 @@ class ExecutionService:
 
         # Update global account state
         if state_data:
-            self.storage.save_account_state(state_data, date_str=val_date, strategy_key=strat_key, universe_key=univ_key)
+            self.storage.save_account_state(
+                state_data,
+                date_str=val_date,
+                strategy_key=strat_key,
+                universe_key=univ_key,
+                run_dir=run_dir,
+            )
 
         # (C6) A gate refusal (`RunWindowError` / as-of `ValueError` / `StalePriceError`)
         # reaches us as a child traceback in `stderr`. Classify it so the UI shows the
@@ -1528,9 +1914,8 @@ class ExecutionService:
         ) if not success else {}
 
         # Write summary.json
-        summary_file = os.path.join(run_dir, "summary.json")
         summary = self.storage._load_json(summary_file, default={})
-        summary.update({
+        round_fields = {
             # (L2.4, §9) tz-aware UTC anchor; the market-local anchor lives in `clock`.
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "date": val_date,
@@ -1551,9 +1936,13 @@ class ExecutionService:
             "health_returncode": proc.returncode,
             "health_stdout": stdout,
             "health_stderr": stderr,
-        })
+        }
+        summary.update(round_fields)
+        owned_keys = set(round_fields)
         if failure:
-            summary.update({k: failure[k] for k in ("error_kind", "error_headline", "error_hint", "error_detail")})
+            failure_fields = {k: failure[k] for k in ("error_kind", "error_headline", "error_hint", "error_detail")}
+            summary.update(failure_fields)
+            owned_keys |= set(failure_fields)
         clock_block = self._merge_observability(
             summary,
             valuation_date=val_date,
@@ -1563,7 +1952,20 @@ class ExecutionService:
             stage="stage1",
         )
         self._apply_intraday_observability(summary, intraday_obs)
+        owned_keys |= {"clock", "freshness_summary", "observability", "intraday_5m"}
+        # (L2.62) De-merge: only this round's own fields survive; the inheritance whitelist
+        # is empty, so nothing from an earlier same-day round can leak through.
+        summary, dropped_fields = de_merge_run_summary(pre_summary, summary, owned_keys)
+        if dropped_fields:
+            logging.warning(
+                "[summary-de-merge] %s: dropped cross-round fields %s (L2.62 继承白名单为空)",
+                run_dir,
+                dropped_fields,
+            )
         self.storage._save_json(summary_file, summary)
+        # Hand THIS round's field set to Stage 2 (same directory, same round): without it
+        # the de-merge there would delete the health half of the summary it completes.
+        self._record_stage1_owned_keys(pending_key, run_dir, owned_keys)
 
         return {
             "status": "success" if success else "error",
@@ -1593,6 +1995,7 @@ class ExecutionService:
         val_date: str,
         strategy_key: Optional[str],
         universe_key: Optional[str],
+        matrix_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Compare the operator's INPUT book against the previous round's PLANNED book.
 
@@ -1601,6 +2004,13 @@ class ExecutionService:
         traceable after the fact. Cash proxies (BIL/CASH/...) are dropped from the INPUT
         side only: `post_holdings_from_ticket` never records cash (cash is the implied NAV
         residual), so leaving them in would flag every single deploy forever.
+
+        ``matrix_id`` switches the REFERENCE to the previous multi-strategy netting run
+        (`get_previous_multi_netting_post_holdings`): matrix runs live in
+        `<archive>/<date>/multi_netted_<matrix>` and are deliberately not part of the
+        `(strategy, universe)` carry-forward chain, so the per-strategy walk would report
+        "no reference" on every matrix deploy and the advisory check would be inert on
+        exactly the path that produced the 2026-10-27 stale-book incident.
 
         Strict mode (`LIVETRADING_STRICT_HOLDINGS_INPUT=1`) raises
         `HoldingsInputMismatchError` BEFORE `save_holdings()` is called, so a refused
@@ -1612,9 +2022,14 @@ class ExecutionService:
             for sym, value in (current_holdings or {}).items()
             if not is_cash_symbol(sym)
         }
-        prev_post, prev_run_dir = self.storage.get_previous_post_holdings(
-            date_str=val_date, strategy_key=strategy_key, universe_key=universe_key
-        )
+        if matrix_id:
+            prev_post, prev_run_dir = self.storage.get_previous_multi_netting_post_holdings(
+                date_str=val_date, matrix_id=matrix_id
+            )
+        else:
+            prev_post, prev_run_dir = self.storage.get_previous_post_holdings(
+                date_str=val_date, strategy_key=strategy_key, universe_key=universe_key
+            )
 
         if prev_post is None:
             # No earlier plan to compare against (first ever run, or every earlier run
@@ -1691,15 +2106,51 @@ class ExecutionService:
         val_date = as_of_date or self._market_clock_val_date(universe_file, custom_symbols)
         explicit_as_of = as_of_date or None
         as_of_source = "explicit" if explicit_as_of else "market_clock"
-        run_dir = self.storage.get_run_dir(strat_key, univ_key, val_date, prefer_existing=True)
+        base_dir = self.storage.get_run_dir(strat_key, univ_key, val_date, prefer_existing=True)
         # (L2.4) Archive key == valuation session (never the host's `date.today()`).
+        self._assert_archive_keyed_by(base_dir, val_date)
+        # (L2.62) Reuse the directory Stage 1 allocated for THIS round (both stages of one
+        # deploy share it); otherwise allocate our own, deduping a double-click within
+        # `PENDING_STAGE2_REUSE_SECONDS`.
+        pending_key = self._instance_key(strat_key, univ_key, val_date)
+        run_dir, inherited_owned, handoff = self._resolve_stage2_run_dir(base_dir, pending_key)
         self._assert_archive_keyed_by(run_dir, val_date)
         os.makedirs(run_dir, exist_ok=True)
+        summary_file = os.path.join(run_dir, "summary.json")
+        pre_summary = self.storage._load_json(summary_file, default={}) or {}
 
         strat_path = self._resolve_strategy(strategy_file)
+        # (L2.62) The in-process Stage-1 hand-off is the fast path; a restart / another
+        # uvicorn worker has no entry, so the gate report is re-resolved from this
+        # session's archive instead of being silently dropped (see the method's docstring).
+        # `health_rep_file` may therefore point at an EARLIER instance's report, and the
+        # summary records which one (`health_report_source` / `inherited_from`).  Resolved
+        # BEFORE any further write so a refused (ungated) round leaves no half-written dir.
+        health_rep_file, health_gate_fields = self._resolve_stage2_health_gate(
+            base_dir, run_dir, handoff
+        )
+        #: This round's own copy of the gate report. It is where the post-run 5m
+        #: normalization writes when the report was INHERITED, so a Stage-2-only round can
+        #: never mutate a previous instance's archive (de-merge applies to files too).
+        health_rep_local_file = os.path.join(run_dir, STAGE1_HEALTH_REPORT_FILENAME)
+
         univ_path = self._resolve_universe(universe_file, custom_symbols, run_dir)
         account_state_file = os.path.join(run_dir, "account_state.json")
-        health_rep_file = os.path.join(run_dir, "stage1_health_report.json")
+
+        # (L2.62) A fresh instance dir starts WITHOUT `account_state.json`; Stage 2 reads
+        # forward-only state (lifecycle / entry-price / streak) from it, so seed it from the
+        # newest run at-or-before this session -- on a rerun that is THIS session's earlier
+        # instance (what the flat layout kept in the same file, and the reason the
+        # carry-forward chain must not be allowed to break).
+        if not os.path.exists(account_state_file):
+            try:
+                seed_state = self.storage.latest_account_state_at_or_before(
+                    val_date, strat_key, univ_key
+                )
+                if seed_state:
+                    self.storage._save_json(account_state_file, seed_state)
+            except Exception as exc:  # a missing baseline must not block the deploy
+                logging.warning("[L2.62] account_state 预置失败（忽略）: %s", exc)
 
         # Resolve holdings
         if current_holdings is not None:
@@ -1738,9 +2189,17 @@ class ExecutionService:
             universe_key=univ_key,
         )
 
-        # Save holdings snapshot in run_dir and globally
+        # Save holdings snapshot in run_dir and globally. (L2.62) `run_dir` pins the archive
+        # write to THIS round's instance directory -- "latest" would resolve the session's
+        # base dir and break the carry-forward chain.
         holdings_file = os.path.join(run_dir, "holdings.json")
-        self.storage.save_holdings(effective_holdings, date_str=val_date, strategy_key=strat_key, universe_key=univ_key)
+        self.storage.save_holdings(
+            effective_holdings,
+            date_str=val_date,
+            strategy_key=strat_key,
+            universe_key=univ_key,
+            run_dir=run_dir,
+        )
 
         cmd = [
             self.storage.python_executable,
@@ -1759,7 +2218,7 @@ class ExecutionService:
         start_d = start_date or getattr(self.storage, "default_start_date", None)
         if start_d:
             cmd.extend(["--start-date", start_d])
-        if os.path.exists(health_rep_file):
+        if health_rep_file and os.path.exists(health_rep_file):
             cmd.extend(["--health-report-file", health_rep_file])
         if lot_size is not None and lot_size > 0:
             cmd.extend(["--lot-size", str(lot_size)])
@@ -1819,7 +2278,9 @@ class ExecutionService:
             print(f"[ExecutionService] Error loading or converting ticket: {e}")
 
         state_data = self.storage._load_json(account_state_file, default=None)
-        health_data = self.storage._load_json(health_rep_file, default=None)
+        # (L2.62) `health_rep_file` is `None` only when this session has no gate report at
+        # all (a Stage-2-only deploy); `_read_health_report` owns the unreadable case.
+        health_data = self._read_health_report(health_rep_file) if health_rep_file else None
         # (L2.4, §9/§12-11) Stage 2 fetches its own 5m series, so THIS stage's stdout
         # marker is consulted first; the report is normalized in place when zero rows.
         intraday_obs = reconcile_intraday_5m_observability(
@@ -1827,10 +2288,20 @@ class ExecutionService:
         )
         if isinstance(health_data, dict) and health_data:
             health_data["intraday_5m"] = intraday_obs
-            self.storage._save_json(health_rep_file, health_data)
+            # (L2.62) Always write THIS round's own copy. When the report was inherited
+            # from an earlier instance, `health_rep_file` points at THAT archive, and
+            # writing there would mutate a previous round's directory -- the file-level
+            # form of the cross-round merge the de-merge prevents.
+            self.storage._save_json(health_rep_local_file, health_data)
 
         if state_data:
-            self.storage.save_account_state(state_data, date_str=val_date, strategy_key=strat_key, universe_key=univ_key)
+            self.storage.save_account_state(
+                state_data,
+                date_str=val_date,
+                strategy_key=strat_key,
+                universe_key=univ_key,
+                run_dir=run_dir,
+            )
 
         # (C6) Classify a gate/staleness refusal out of the child's traceback so the UI
         # can say why (and what to do) instead of only `code N`; `stderr` stays raw.
@@ -1839,9 +2310,8 @@ class ExecutionService:
         ) if not success else {}
 
         # Update summary.json
-        summary_file = os.path.join(run_dir, "summary.json")
         summary = self.storage._load_json(summary_file, default={})
-        summary.update({
+        round_fields = {
             # (L2.4, §9) tz-aware UTC anchor; market-local/session live in `clock`.
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "date": val_date,
@@ -1878,6 +2348,12 @@ class ExecutionService:
             "nav_breakdown_file": NAV_BREAKDOWN_FILENAME,
             "data_provider": provider,
             "as_of_source": as_of_source,
+            # (L2.62) Which Stage-1 gate report this ticket obeyed -- derived from the
+            # report file actually passed to the child, so a restart-inherited gate is
+            # auditable (`health_report_source` / `inherited_from` / `inherited_fields`)
+            # and a deploy that ran WITHOUT a gate says so (`health_gate_applied=False`)
+            # instead of looking identical to a gated one.
+            **health_gate_fields,
             "deploy_status": "SUCCESS" if success else "FAILED",
             "deploy_returncode": proc.returncode,
             "deploy_stdout": stdout,
@@ -1886,9 +2362,13 @@ class ExecutionService:
             # Advisory (never blocking by default): the INPUT book vs the previous round's
             # PLANNED post-ticket book, so a stale-table deploy stays reconstructable.
             "holdings_input_check": holdings_input_check,
-        })
+        }
+        summary.update(round_fields)
+        owned_keys = set(round_fields)
         if failure:
-            summary.update({k: failure[k] for k in ("error_kind", "error_headline", "error_hint", "error_detail")})
+            failure_fields = {k: failure[k] for k in ("error_kind", "error_headline", "error_hint", "error_detail")}
+            summary.update(failure_fields)
+            owned_keys |= set(failure_fields)
         clock_block = self._merge_observability(
             summary,
             valuation_date=val_date,
@@ -1898,6 +2378,20 @@ class ExecutionService:
             stage="stage2",
         )
         self._apply_intraday_observability(summary, intraday_obs)
+        owned_keys |= {"clock", "freshness_summary", "observability", "intraday_5m"}
+        # (L2.62) De-merge: a same-day instance's summary holds THIS round's fields only.
+        # `inherited_owned` are the fields this round's OWN Stage 1 wrote into this same
+        # directory -- re-owned here so the summary keeps both halves of one round, while
+        # anything from an EARLIER round is still dropped.
+        summary, dropped_fields = de_merge_run_summary(
+            pre_summary, summary, owned_keys | set(inherited_owned)
+        )
+        if dropped_fields:
+            logging.warning(
+                "[summary-de-merge] %s: dropped cross-round fields %s (L2.62 继承白名单为空)",
+                run_dir,
+                dropped_fields,
+            )
         self.storage._save_json(summary_file, summary)
 
         return {
@@ -1996,6 +2490,22 @@ class ExecutionService:
             effective_holdings = self.storage.get_holdings(date_str=val_date)
 
         holdings_file = os.path.join(run_dir, "holdings.json")
+
+        # Advisory reconciliation of the INPUT book against the previous MATRIX round's
+        # PLANNED post-trade book (L2.53 closure). Matrix runs do not call
+        # `save_holdings`/`get_previous_post_holdings` (their directory is not part of the
+        # per-(strategy, universe) carry-forward chain), so without this call the stale-book
+        # check was inert on the netted path -- the very path the 2026-10-27 incident ran.
+        # Same contract as Stage 2: warn + report by default, refuse only when
+        # `LIVETRADING_STRICT_HOLDINGS_INPUT=1`. Raised BEFORE `holdings.json` is written.
+        holdings_input_check = self._check_holdings_input(
+            effective_holdings,
+            val_date=val_date,
+            strategy_key=None,
+            universe_key=None,
+            matrix_id=matrix_id,
+        )
+
         self.storage._save_json(holdings_file, effective_holdings or {"BIL": portfolio_value})
 
         cmd = [
@@ -2082,6 +2592,10 @@ class ExecutionService:
             "friction_savings": savings_data,
             "strategies": strat_args,
             "trades_count": len([r for r in ticket_records if r.get("action") in ("BUY", "SELL")]),
+            # Advisory (never blocking by default): the INPUT book vs the previous MATRIX
+            # round's planned post-ticket book, so a stale-table netted deploy stays
+            # reconstructable from the archive.
+            "holdings_input_check": holdings_input_check,
         })
         if failure:
             summary.update({k: failure[k] for k in ("error_kind", "error_headline", "error_hint", "error_detail")})
@@ -2116,6 +2630,9 @@ class ExecutionService:
             # of the per-(strategy, universe) carry-forward chain), so the planned book is
             # derived on the fly purely for the UI's holdings-table refresh.
             "holdings_plan": post_holdings_from_ticket(ticket_records),
+            # Advisory reconciliation of the INPUT book vs the previous MATRIX round's
+            # PLANNED post-ticket book (`get_previous_multi_netting_post_holdings`).
+            "holdings_input_check": holdings_input_check,
             **failure,
         }
 

@@ -985,3 +985,93 @@ def test_no_test_reads_the_live_runtime_data_dir():
         "运行时目录读取白名单扩大了，请评审：\n  " + "\n  ".join(allowed)
     )
     assert all(_ALLOWED_RUNTIME_READ in site for site in allowed)
+
+
+# ---------------------------------------------------------------------------
+# 2.62) 同日实例子目录（`<date>/<HHMMSS>/`）只报告、不修复、不报缺失
+# ---------------------------------------------------------------------------
+def test_instance_subdirs_lists_only_six_digit_directories(tmp_path):
+    """实例目录的识别口径与 `storage.is_instance_dir_name` 完全一致（6 位数字）。"""
+    run_dir = tmp_path / "2026-10-27"
+    for name in ("091500", "123000"):
+        (run_dir / name).mkdir(parents=True)
+    (run_dir / "2026-10-26").mkdir()   # 目录但不是实例名
+    (run_dir / "091500.json").write_text("{}", encoding="utf-8")  # 文件不是目录
+    (run_dir / "not_a_stamp").mkdir()
+
+    assert rep.instance_subdirs(run_dir) == ["091500", "123000"]
+
+
+def test_instance_subdirs_is_empty_for_a_legacy_flat_run(tmp_path):
+    run_dir = tmp_path / "2026-10-22"
+    run_dir.mkdir()
+    _write_json(run_dir / "summary.json", {"date": "2026-10-22"})
+
+    assert rep.instance_subdirs(run_dir) == []
+
+
+class _NullReader(FakeReader):
+    """`MarketDbReader` 的替身：没有 market.duckdb 时的行为（`factor_series` 返回 None）。"""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _StopAfterNote(Exception):
+    """哨兵：NOTE 之后立刻打断，避免为一条"打印了什么"的用例复制整套修复夹具。"""
+
+
+def test_main_reports_instance_subdirs_before_any_repair_work(
+    tmp_path, monkeypatch, capsys
+):
+    """L2.62⑨：`main()` 必须打印 `[NOTE] ... 跳过子目录`，且**不**当作缺失目录报错。
+
+    为什么需要这条：实例目录落在同一日期目录后，操作者对"今天"执行修复会以为连带修好了
+    每一轮；跳过是刻意的（本脚本只修扁平目录），但必须说出来。用哨兵在 NOTE 之后立即打断，
+    是为了把断言限定在"打印了 / 且没有因实例目录提前 `return 2`"——不去复制整套修复夹具
+    （那属于 `run_one` 的用例）。删除 NOTE 块、或对实例目录改成 `[ERROR]` 早退，本条即红。
+    """
+    root = tmp_path / "runs"
+    run_dirs = make_runs(root)
+    (root / "2026-10-27" / "091500").mkdir()
+
+    monkeypatch.setattr(rep, "resolve_market_db", lambda _v: None)
+    monkeypatch.setattr(rep, "MarketDbReader", lambda _db: _NullReader())
+
+    def _stop(*_a, **_k):
+        raise _StopAfterNote()
+
+    monkeypatch.setattr(rep, "anchor_cash_from_origin", _stop)
+
+    with pytest.raises(_StopAfterNote):
+        rep.main(["--runs-root", str(root), "--runs", *sorted(run_dirs), "--dry-run"])
+
+    out = capsys.readouterr().out
+    assert "[NOTE]" in out
+    assert "091500" in out
+    assert "跳过子目录" in out
+
+
+def test_main_is_silent_about_instances_when_the_run_is_legacy_flat(
+    tmp_path, monkeypatch, capsys
+):
+    """扁平目录（L2.62 之前的全部归档）不得因为这条新提示多出一行噪声。"""
+    root = tmp_path / "runs"
+    run_dirs = make_runs(root)
+
+    monkeypatch.setattr(rep, "resolve_market_db", lambda _v: None)
+    monkeypatch.setattr(rep, "MarketDbReader", lambda _db: _NullReader())
+
+    def _stop(*_a, **_k):
+        raise _StopAfterNote()
+
+    monkeypatch.setattr(rep, "anchor_cash_from_origin", _stop)
+
+    with pytest.raises(_StopAfterNote):
+        rep.main(["--runs-root", str(root), "--runs", *sorted(run_dirs), "--dry-run"])
+
+    out = capsys.readouterr().out
+    assert "[NOTE]" not in out

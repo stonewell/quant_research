@@ -632,7 +632,11 @@
         }
 
         try {
-            const res = await fetch(`/api/runs?strategy=${encodeURIComponent(keys.stratKey)}&universe=${encodeURIComponent(keys.univKey)}&require_both=true`, { cache: "no-store" });
+            // (L2.62) `latest_only=true`: a session may own several instance dirs
+            // (`<date>/`, `<date>/090000/`, ...). The history dropdown picks a DATE, so it
+            // must see one entry per date -- otherwise a same-day rerun would duplicate the
+            // option (same `value`) and silently hide which round is being restored.
+            const res = await fetch(`/api/runs?strategy=${encodeURIComponent(keys.stratKey)}&universe=${encodeURIComponent(keys.univKey)}&require_both=true&latest_only=true`, { cache: "no-store" });
             const runs = await res.json();
             state.historyRuns = runs || [];
 
@@ -650,7 +654,10 @@
                 runs.forEach(r => {
                     const opt = document.createElement("option");
                     opt.value = r.date;
-                    opt.textContent = `${r.date} | ${r.directive} (${r.trade_count} 笔交易) | ${r.tier}`;
+                    // (L2.62) `instance` is empty for a session's flat/first run and
+                    // `HHMMSS` for later same-day rounds; show it only when present.
+                    const round = r.instance ? ` @${r.instance}` : "";
+                    opt.textContent = `${r.date}${round} | ${r.directive} (${r.trade_count} 笔交易) | ${r.tier}`;
                     el.selectHistoryDate.appendChild(opt);
                 });
                 el.selectHistoryDate.disabled = false;

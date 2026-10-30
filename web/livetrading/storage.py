@@ -678,6 +678,185 @@ def _first_defined(*candidates: Tuple[str, Any]) -> Tuple[Any, str]:
     return None, ""
 
 
+# --------------------------------------------------------------------------- #
+# (L2.62) Same-day run INSTANCES: `<date>/` for the first run, `<date>/<HHMMSS>/` after
+# --------------------------------------------------------------------------- #
+# FORENSIC CONTEXT (why this exists -- 2026-10-27 archive):
+#   A dated run directory used to be reused verbatim for every run of that session, and
+#   both stages MERGE their fields into one `summary.json`.  The real
+#   `2026-10-27/summary.json` therefore ended up holding `deploy_status="SUCCESS"` next
+#   to `error_detail="KeyboardInterrupt"`, with `deploy_stdout` (UTC 03:06) older than
+#   `health_stdout` (UTC 04:31): two different runs, one file, no way to tell which
+#   field came from which round.  Forensics on "did the 04:31 run deploy?" is then
+#   answered by a mixture, not by a record.
+#
+#   Layout rule (deliberately asymmetric, for backward compatibility):
+#     * the FIRST run of a session still writes the flat `<archive>/<strategy>/<universe>/<date>/`
+#       -- byte-identical to every archive written before 2026-10-29;
+#     * every LATER run of the same session writes `<date>/<HHMMSS>/`, and starts its
+#       `summary.json` from an EMPTY dict (no cross-run inheritance at all).
+#   Existing flat directories are NEVER migrated or renamed: readers must support both.
+#
+#   Selection is LEXICOGRAPHIC, never mtime: an archive copied/restored from a backup can
+#   have arbitrary mtimes, and a `HHMMSS` name is already a total order within a day.
+_INSTANCE_DIR_RE = re.compile(r"^\d{6}$")
+_RUN_INSTANCE_SPLIT_ENV = "LIVETRADING_RUN_INSTANCE_SPLIT"
+#: In-process same-second idempotency: candidate dir -> dir.  Bounded (the oldest keys are
+#: dropped) because this is a long-lived web process, not a single-shot script.
+#:
+#: Scope is deliberately the INSTANCE branch only (`<date>/<HHMMSS>`), see
+#: `allocate_run_instance_dir`: the flat first-of-session directory is an ALREADY-WRITTEN
+#: round, so re-entering it in the same second would merge two rounds into one archive
+#: entry -- the exact failure L2.62 removed -- rather than dedupe a double-click.
+_PENDING_INSTANCE_DIRS: Dict[str, str] = {}
+_PENDING_INSTANCE_LIMIT = 256
+
+
+def is_instance_dir_name(name: Optional[str]) -> bool:
+    """True for an `HHMMSS` instance directory name (exactly six digits)."""
+    return bool(name) and bool(_INSTANCE_DIR_RE.match(str(name)))
+
+
+def run_instance_split_enabled(split: Optional[bool] = None) -> bool:
+    """Whether same-day reruns get their own instance dir (default ON).
+
+    `LIVETRADING_RUN_INSTANCE_SPLIT=0` is the documented grey-release escape hatch: every
+    allocation collapses back to the flat `<date>/` directory, i.e. the pre-L2.62
+    behaviour, without touching any archive or caller.
+    """
+    if split is not None:
+        return bool(split)
+    raw = os.environ.get(_RUN_INSTANCE_SPLIT_ENV)
+    if raw is None or str(raw).strip() == "":
+        return True
+    return _truthy_env(_RUN_INSTANCE_SPLIT_ENV)
+
+
+def list_instances_for_date(date_dir: Optional[str]) -> List[str]:
+    """Run dirs of ONE dated directory, OLD -> NEW (flat layout first, then instances).
+
+    The flat `<date>/` directory is included when it is itself a run dir, because it is
+    the chronological FIRST instance of that session (see the layout rule above).  A
+    directory that only CONTAINERS instances (`is_run_dir` false) is not included, so a
+    reader can never mistake a bare container for a run.  Never consults mtime.
+    """
+    if not date_dir or not os.path.isdir(date_dir):
+        return []
+    try:
+        names = os.listdir(date_dir)
+    except OSError:
+        return []
+    instances = sorted(
+        name
+        for name in names
+        if is_instance_dir_name(name) and os.path.isdir(os.path.join(date_dir, name))
+    )
+    out: List[str] = []
+    if is_run_dir(date_dir):
+        out.append(date_dir)
+    out.extend(os.path.join(date_dir, name) for name in instances)
+    return out
+
+
+def resolve_latest_instance_dir(date_dir: Optional[str]) -> Optional[str]:
+    """Newest run dir of a dated directory: max `^\\d{6}$` subdir, else the flat dir.
+
+    Lexicographic order ONLY -- mtime is never read (a restored archive would otherwise
+    reorder the chain).  Returns `date_dir` unchanged when the directory does not exist or
+    carries no instance subdirectory, which is exactly the pre-L2.62 flat layout.
+    """
+    if not date_dir or not os.path.isdir(date_dir):
+        return date_dir
+    try:
+        names = os.listdir(date_dir)
+    except OSError:
+        return date_dir
+    instances = sorted(
+        name
+        for name in names
+        if is_instance_dir_name(name) and os.path.isdir(os.path.join(date_dir, name))
+    )
+    if not instances:
+        return date_dir
+    return os.path.join(date_dir, instances[-1])
+
+
+def _advance_hhmmss(stamp: str, seconds: int = 1) -> str:
+    """Increment an `HHMMSS` token's seconds field, keeping it six digits.
+
+    The spec says "collision -> increment the suffix"; the suffix here IS the seconds
+    field, deliberately: a non-numeric suffix (`091500_1`) would no longer match
+    `^\\d{6}$` and would therefore be INVISIBLE to `resolve_latest_instance_dir` -- the
+    newest run would silently stop being the one readers pick.  Wraps at midnight.
+    """
+    try:
+        total = int(stamp[:2]) * 3600 + int(stamp[2:4]) * 60 + int(stamp[4:6])
+    except (TypeError, ValueError):
+        total = 0
+    total = (total + seconds) % 86400
+    return f"{total // 3600:02d}{(total % 3600) // 60:02d}{total % 60:02d}"
+
+
+def allocate_run_instance_dir(
+    base_dir: str,
+    *,
+    now: Optional[datetime] = None,
+    split: Optional[bool] = None,
+) -> str:
+    """Return the directory THIS run should write to, creating it atomically.
+
+    * split disabled (`split=False` / `LIVETRADING_RUN_INSTANCE_SPLIT=0`) -> `base_dir`;
+    * `base_dir` absent  -> create it and return it (the session's FIRST run stays flat);
+    * otherwise          -> `base_dir/<HHMMSS>`, created with `os.makedirs(exist_ok=False)`
+      so two processes can never pick the same directory.  A collision (already-existing
+      stamp, e.g. another process in the same second, or a pre-seeded archive) advances
+      the stamp by one second and retries.
+
+    Same-second idempotency is IN-PROCESS and applies to the INSTANCE branch ONLY: two
+    calls for the same `base_dir` within the same second return the same
+    `base_dir/<HHMMSS>` (`_PENDING_INSTANCE_DIRS`), so a double-click cannot fragment one
+    round into two archive entries.  Across seconds it always allocates a new instance --
+    that is the whole point of L2.62.  It is also NOT restart-tolerant: a new process
+    re-reads the disk, where the stamp already exists, and advances it by a second.
+
+    The FIRST-of-session (flat) branch is deliberately NOT idempotent: its second call
+    sees `base_dir` already present and allocates `<HHMMSS>`.  Reusing the flat directory
+    in the same second would mean writing a SECOND round into an already-written round's
+    directory (`summary.json` + ticket + health report all present) -- i.e. exactly the
+    cross-round merge L2.62 exists to prevent, which is a worse outcome than an extra
+    instance.  Callers that must not be re-entered at all (Stage 2 double-click)
+    additionally use `ExecutionService._pending_stage2`.
+    """
+    base = os.path.abspath(str(base_dir))
+    if not run_instance_split_enabled(split):
+        os.makedirs(base, exist_ok=True)
+        return base
+    if not os.path.isdir(base):
+        os.makedirs(base, exist_ok=True)
+        return base
+
+    stamp = (now or datetime.now()).strftime("%H%M%S")
+    attempts = 0
+    while attempts < 120:
+        attempts += 1
+        candidate = os.path.join(base, stamp)
+        cached = _PENDING_INSTANCE_DIRS.get(candidate)
+        if cached:
+            return cached
+        try:
+            os.makedirs(candidate, exist_ok=False)
+        except FileExistsError:
+            stamp = _advance_hhmmss(stamp)
+            continue
+        if len(_PENDING_INSTANCE_DIRS) >= _PENDING_INSTANCE_LIMIT:
+            _PENDING_INSTANCE_DIRS.pop(next(iter(_PENDING_INSTANCE_DIRS)), None)
+        _PENDING_INSTANCE_DIRS[candidate] = candidate
+        return candidate
+    raise RuntimeError(
+        f"Could not allocate a run instance directory under {base} (120 HHMMSS collisions)"
+    )
+
+
 class StorageManager:
     """Manages paths, settings, custom universes, holdings, account states, and daily archives."""
 
@@ -1256,6 +1435,41 @@ class StorageManager:
                 return st
         return None
 
+    def _planned_book_from_run_dir(
+        self,
+        run_dir: Optional[str],
+        ticket_names: Tuple[str, ...] = ("live_trading_ticket",),
+    ) -> Optional[Dict[str, Any]]:
+        """PLANNED post-trade book recorded in one run directory, or None.
+
+        Sources, in order: `<run_dir>/post_holdings.json` (the authoritative planning
+        record written by the deploy path), then the ticket itself re-derived through
+        `post_holdings_from_ticket` (`<name>.json`, else `<name>.csv`).  `ticket_names`
+        exists because a multi-strategy matrix run writes `netted_trading_ticket.*`
+        instead of `live_trading_ticket.*`.
+
+        NEVER falls back to `holdings.json` / `current_holdings.json`: those hold the
+        day's PRE-trade INPUT, i.e. exactly the value the holdings-input comparison
+        exists to audit -- using them would make the check agree with itself.
+        """
+        if not run_dir or not os.path.isdir(run_dir):
+            return None
+        post_file = os.path.join(run_dir, "post_holdings.json")
+        if os.path.exists(post_file):
+            data = self._load_json(post_file, default=None)
+            if isinstance(data, dict):
+                return data
+        for name in ticket_names:
+            ticket = self._load_json(os.path.join(run_dir, f"{name}.json"), default=None)
+            if not ticket:
+                csv_path = os.path.join(run_dir, f"{name}.csv")
+                if os.path.exists(csv_path):
+                    ticket = parse_ticket_csv(csv_path)
+            plan = post_holdings_from_ticket(ticket)
+            if plan is not None:
+                return plan
+        return None
+
     def get_previous_post_holdings(
         self,
         date_str: Optional[str] = None,
@@ -1278,22 +1492,46 @@ class StorageManager:
         any plan -- the caller then reports "no reference" instead of a false mismatch.
         """
         for run in self._earlier_runs(date_str, strategy_key, universe_key):
-            run_dir = run.get("path")
-            if not run_dir or not os.path.isdir(run_dir):
+            plan = self._planned_book_from_run_dir(run.get("path"))
+            if plan is not None:
+                return plan, run.get("path")
+        return None, None
+
+    def get_previous_multi_netting_post_holdings(
+        self,
+        date_str: Optional[str] = None,
+        matrix_id: Optional[str] = None,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """PLANNED post-trade book of the most recent EARLIER matrix netting run.
+
+        Matrix runs live at `<archive_dir>/<date>/multi_netted_<matrix>`, i.e. they are
+        NOT part of the per-`(strategy, universe)` carry-forward chain that
+        `get_previous_post_holdings` walks -- so the holdings-input reconciliation for
+        `run_multi_strategy_netted_deploy` needs its own reference.  Same contract as
+        `get_previous_post_holdings`: strictly EARLIER date, plan only (post_holdings.json,
+        else re-derived from `netted_trading_ticket.json|csv`), never `holdings.json`,
+        `(None, None)` when no earlier matrix run carries a plan.
+
+        Directory names are ISO dates, so a reverse lexicographic walk IS
+        newest-first; mtime is never consulted (a restored/copied archive would
+        otherwise reorder the chain).
+        """
+        target_date = validate_date_str(date_str)
+        clean_m = sanitize_key(matrix_id)
+        if not target_date or not clean_m or not os.path.isdir(self.archive_dir):
+            return None, None
+        suffix = f"multi_netted_{clean_m}"
+        try:
+            entries = sorted(os.listdir(self.archive_dir), reverse=True)
+        except OSError:
+            return None, None
+        for entry in entries:
+            if not _DATE_RE.match(entry) or entry >= target_date:
                 continue
-            post_file = os.path.join(run_dir, "post_holdings.json")
-            if os.path.exists(post_file):
-                data = self._load_json(post_file, default=None)
-                if isinstance(data, dict):
-                    return data, run_dir
-            ticket = self._load_json(os.path.join(run_dir, "live_trading_ticket.json"), default=None)
-            if not ticket:
-                csv_path = os.path.join(run_dir, "live_trading_ticket.csv")
-                if os.path.exists(csv_path):
-                    ticket = parse_ticket_csv(csv_path)
-            target_holdings = post_holdings_from_ticket(ticket)
-            if target_holdings is not None:
-                return target_holdings, run_dir
+            run_dir = os.path.join(self.archive_dir, entry, suffix)
+            plan = self._planned_book_from_run_dir(run_dir, ("netted_trading_ticket",))
+            if plan is not None:
+                return plan, run_dir
         return None, None
 
     def get_holdings(
@@ -1313,11 +1551,23 @@ class StorageManager:
           2. Post-trade holdings carried forward from the most recent EARLIER run.
           3. Legacy flat archive snapshot, then the global current_holdings.json.
         With no date: post-trade holdings of the latest run for (strategy, universe).
+
+        (L2.62) A session can now own several instance dirs.  Step 1 prefers the NEWEST
+        instance's snapshot and then walks the session's earlier instances newest-first
+        before falling back to earlier DAYS: a same-day rerun that submits no explicit
+        book must be reconciled against the book that same session actually started from,
+        not against yesterday's.  Only `holdings.json` / `current_holdings.json`
+        (snapshots) are consulted on that walk -- never a planned book.
         """
         date_str = validate_date_str(date_str)
         if date_str:
-            run_dir = self.find_existing_run_dir(strategy_key, universe_key, date_str)
-            snap = self._load_snapshot_holdings(run_dir)
+            base_dir = self.find_existing_run_base_dir(strategy_key, universe_key, date_str)
+            snap = self._load_snapshot_holdings(self.resolve_latest_instance_dir(base_dir))
+            if snap is None and base_dir:
+                for instance_dir in reversed(list_instances_for_date(base_dir)):
+                    snap = self._load_snapshot_holdings(instance_dir)
+                    if snap is not None:
+                        break
             if snap is not None:
                 return snap
 
@@ -1342,11 +1592,20 @@ class StorageManager:
         date_str: Optional[str] = None,
         strategy_key: Optional[str] = None,
         universe_key: Optional[str] = None,
+        run_dir: Optional[str] = None,
     ) -> None:
+        """Persist the operator's holdings input (global + the day's archive snapshot).
+
+        `run_dir` (L2.62) pins the write to THIS round's instance directory.  Callers in
+        the deploy path must always pass it: `get_run_dir(prefer_existing=True)` resolves
+        the session's BASE directory, and the `_carry_forward_*` readers additionally
+        refuse same-day runs, so relying on "latest" would write today's book into a
+        directory that no reader walks forward to -- i.e. it would break the chain.
+        """
         date_str = validate_date_str(date_str)
         self._save_json(self.current_holdings_file, holdings)
         if date_str:
-            daily_dir = self.get_run_dir(strategy_key, universe_key, date_str, prefer_existing=True)
+            daily_dir = run_dir or self.get_run_dir(strategy_key, universe_key, date_str, prefer_existing=True)
             os.makedirs(daily_dir, exist_ok=True)
             self._save_json(os.path.join(daily_dir, "holdings.json"), holdings)
 
@@ -1613,12 +1872,20 @@ class StorageManager:
     ) -> Dict[str, Any]:
         date_str = validate_date_str(date_str)
         if date_str:
-            # 1. Exact run dir for date_str
-            run_dir = self.find_existing_run_dir(strategy_key, universe_key, date_str)
-            if run_dir:
-                d = self._load_json(os.path.join(run_dir, "account_state.json"))
+            # 1. Exact run dir for date_str. (L2.62) Same walk as `get_holdings`: the
+            # session's NEWEST instance first, then its earlier instances newest-first --
+            # a same-day rerun's baseline is the state that session already carries, not
+            # yesterday's. Only `account_state.json` is read on that walk.
+            base_dir = self.find_existing_run_base_dir(strategy_key, universe_key, date_str)
+            d = None
+            for instance_dir in reversed(list_instances_for_date(base_dir)):
+                d = self._load_json(os.path.join(instance_dir, "account_state.json"))
                 if d:
-                    return d
+                    break
+            if not d and base_dir:
+                d = self._load_json(os.path.join(base_dir, "account_state.json"))
+            if d:
+                return d
 
             # 2. Carry forward from the most recent earlier run that has an account state
             if strategy_key and universe_key:
@@ -1657,13 +1924,49 @@ class StorageManager:
         date_str: Optional[str] = None,
         strategy_key: Optional[str] = None,
         universe_key: Optional[str] = None,
+        run_dir: Optional[str] = None,
     ) -> None:
+        """Persist account state (global + the day's archive copy).
+
+        `run_dir` (L2.62) pins the archive write to THIS round's instance directory; the
+        deploy path must pass it for the same reason `save_holdings` documents.
+        """
         date_str = validate_date_str(date_str)
         self._save_json(self.account_state_file, state)
         if date_str:
-            daily_dir = self.get_run_dir(strategy_key, universe_key, date_str, prefer_existing=True)
+            daily_dir = run_dir or self.get_run_dir(strategy_key, universe_key, date_str, prefer_existing=True)
             os.makedirs(daily_dir, exist_ok=True)
             self._save_json(os.path.join(daily_dir, "account_state.json"), state)
+
+    def latest_account_state_at_or_before(
+        self,
+        date_str: Optional[str],
+        strategy_key: Optional[str] = None,
+        universe_key: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Account state of the newest run at-or-before `date_str` (same-day instances included).
+
+        (L2.62) Stage 2 reads forward-only state (`lifecycle_states`, `entry_prices`,
+        `entry_signal_streak`, `zero_target_streak`, `last_exit_date`, `holding_bars`)
+        from `--account-state-file`.  A fresh instance dir starts empty, so without this
+        seed a same-day rerun would run WITHOUT the session's lifecycle/streak state --
+        silently changing the ticket and breaking the carry-forward chain.  In the old
+        flat layout the file simply existed in the (reused) run dir, which is exactly what
+        this resolves to on a first-of-day deploy (the same day's Stage-1 state).
+        """
+        target = validate_date_str(date_str)
+        if not target or not strategy_key or not universe_key:
+            return None
+        for run in self.list_runs(strategy_key=strategy_key, universe_key=universe_key, require_both=True):
+            if str(run.get("date") or "") > target:
+                continue
+            path = run.get("path")
+            if not path:
+                continue
+            state = self._load_json(os.path.join(path, "account_state.json"))
+            if state:
+                return state
+        return None
 
     # --------------------------------------------------------------------------
     # Daily Archive Runs Management (Keyed by Strategy and Universe)
@@ -1676,17 +1979,50 @@ class StorageManager:
             raise ValueError(f"Refusing archive path outside archive_dir: {path}")
         return path
 
-    def find_existing_run_dir(
+    def allocate_run_instance_dir(
+        self,
+        base_dir: Optional[str] = None,
+        *,
+        strategy_key: Optional[str] = None,
+        universe_key: Optional[str] = None,
+        date_str: Optional[str] = None,
+        now: Optional[datetime] = None,
+        split: Optional[bool] = None,
+    ) -> str:
+        """This round's run directory (creating it), see `storage.allocate_run_instance_dir`.
+
+        (L2.62) Storage-manager entry point so callers (and tests) have ONE seam: the module
+        function stays pure-ish and `ExecutionService` never has to know the layout rule.
+        Either pass `base_dir` explicitly or let it be derived from the archive keys.
+        """
+        base = base_dir or self.get_run_dir(
+            strategy_key, universe_key, date_str, prefer_existing=True
+        )
+        return allocate_run_instance_dir(base, now=now, split=split)
+
+    @staticmethod
+    def list_instances_for_date(date_dir: Optional[str]) -> List[str]:
+        """Run dirs of one dated dir, OLD -> NEW (flat first, then `HHMMSS`), see module fn."""
+        return list_instances_for_date(date_dir)
+
+    @staticmethod
+    def resolve_latest_instance_dir(date_dir: Optional[str]) -> Optional[str]:
+        """Newest run dir of one dated dir (max `HHMMSS`, else flat), see module fn."""
+        return resolve_latest_instance_dir(date_dir)
+
+    def find_existing_run_base_dir(
         self,
         strategy_key: Optional[str] = None,
         universe_key: Optional[str] = None,
         date_str: Optional[str] = None,
     ) -> Optional[str]:
-        """Find an existing run directory on disk, taking into account universe key variants and case insensitivity.
+        """Find the dated run DIRECTORY (never an `HHMMSS` instance) for a session.
 
-        Search order is deterministic (exact path, then naming variants, then sorted directory
-        listings preferring exact case-insensitive matches) so the same keys always resolve to the
-        same folder regardless of filesystem listdir order.
+        (L2.62) One session can own several instance dirs (`<date>/`, `<date>/090000/`,
+        `<date>/130000/`).  This returns the dated directory itself; readers that need
+        "the run for this session" use `resolve_latest_instance_dir` on top of it
+        (`find_existing_run_dir` does that), while readers that need the whole session
+        (holdings/account-state snapshot walks) use `list_instances_for_date`.
         """
         strategy_key = sanitize_key(strategy_key)
         universe_key = sanitize_key(universe_key)
@@ -1696,7 +2032,12 @@ class StorageManager:
             if not os.path.exists(p):
                 return False
             if date_str:
-                return is_run_dir(p)
+                # (L2.62) A dated dir is also a hit when it only CONTAINERS instance dirs
+                # (`<date>/091500/`): the flat directory is merely the first instance, so a
+                # session whose flat files were pruned must still be discoverable. An EMPTY
+                # date dir stays invalid (see `test_empty_date_dir_is_not_treated_as_valid_
+                # run_and_falls_back_to_previous`) -- there is nothing to read in it.
+                return is_run_dir(p) or bool(list_instances_for_date(p))
             return os.path.isdir(p)
 
         def _join(*parts: str) -> str:
@@ -1737,6 +2078,24 @@ class StorageManager:
                         return cand_entry
 
         return None
+
+    def find_existing_run_dir(
+        self,
+        strategy_key: Optional[str] = None,
+        universe_key: Optional[str] = None,
+        date_str: Optional[str] = None,
+    ) -> Optional[str]:
+        """Find the run dir for a session, resolving same-day instances to the NEWEST.
+
+        (L2.62) Pre-L2.62 archives have no instance subdirs, so this is a no-op there
+        (`resolve_latest_instance_dir` returns the flat dir unchanged).  For a split
+        session it returns `<date>/<HHMMSS>/`, so `/api/runs/{s}/{u}/{date}`,
+        `/api/holdings`, `/api/account-state`, `get_run_csv` and `get_quotes` all read the
+        round that actually ran last instead of a stale first round.
+        """
+        return resolve_latest_instance_dir(
+            self.find_existing_run_base_dir(strategy_key, universe_key, date_str)
+        )
 
     def get_run_dir(
         self,
@@ -1833,8 +2192,18 @@ class StorageManager:
         strategy_key: Optional[str] = None,
         universe_key: Optional[str] = None,
         require_both: bool = False,
+        latest_only: bool = False,
     ) -> List[Dict[str, Any]]:
-        """List archived runs, optionally filtered strictly by strategy and universe."""
+        """List archived runs, optionally filtered strictly by strategy and universe.
+
+        (L2.62) A session may now own several instance dirs (`<date>/`, `<date>/090000/`,
+        `<date>/130000/`).  EACH is its own entry with an `instance` field (`"090000"`, or
+        `""` for the flat/first layout), sorted `date desc, instance desc` -- lexicographic,
+        never mtime.  `latest_only=True` collapses that back to one entry per
+        `(date, strategy, universe)` (the newest), which is what the UI's history dropdown
+        asks for; the default still returns every instance, so nothing is hidden from the
+        API.
+        """
         if require_both and (not strategy_key or not universe_key):
             return []
 
@@ -1874,6 +2243,11 @@ class StorageManager:
                 date_val = summary_rep.get("date")
                 if not date_val:
                     if base_name.startswith("multi_netted_"):
+                        date_val = os.path.basename(os.path.dirname(root))
+                    elif is_instance_dir_name(base_name):
+                        # (L2.62) `<date>/<HHMMSS>/` -- the date is the PARENT, never the
+                        # stamp (otherwise a summary-less instance would be listed as a run
+                        # dated "091500" and sort before every real session).
                         date_val = os.path.basename(os.path.dirname(root))
                     else:
                         date_val = base_name
@@ -1940,8 +2314,14 @@ class StorageManager:
                 tier = health_rep.get("circuit_breaker_tier") or health_rep.get("portfolio_health", {}).get("tier", "NORMAL")
                 trade_count = len([x for x in ticket_rep if isinstance(x, dict) and x.get("action") in ("BUY", "SELL")])
 
+                # (L2.62) `HHMMSS` instance dir name, "" for the flat/first-of-day layout.
+                # Read from the DIRECTORY name (not the summary) so a run whose summary was
+                # partially written still sorts correctly.
+                instance_val = base_name if is_instance_dir_name(base_name) else ""
+
                 runs.append({
                     "date": date_val,
+                    "instance": instance_val,
                     "path": root,
                     "strategy_key": r_strat_key or "",
                     "strategy_name": r_strat_name,
@@ -1957,8 +2337,22 @@ class StorageManager:
                     "universe": summary_rep.get("universe_file", ""),
                 })
 
-        # Sort by date descending, then timestamp descending
-        runs.sort(key=lambda x: (x.get("date", ""), x.get("timestamp", "")), reverse=True)
+        # Sort by date descending, then instance descending (L2.62). `timestamp` stays the
+        # third key so same-date/same-instance ties (legacy duplicates) keep the old order.
+        runs.sort(
+            key=lambda x: (x.get("date", ""), x.get("instance", ""), x.get("timestamp", "")),
+            reverse=True,
+        )
+        if latest_only:
+            seen = set()
+            deduped: List[Dict[str, Any]] = []
+            for run in runs:
+                key = (run.get("date", ""), run.get("strategy_key", ""), run.get("universe_key", ""))
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(run)
+            runs = deduped
         return runs
 
     def get_latest_run(
@@ -2073,6 +2467,18 @@ class StorageManager:
         if not holdings_data:
             holdings_data = self._load_json(os.path.join(run_dir, "current_holdings.json"))
         if not holdings_data and strat_k and univ_k:
+            # (L2.62) The session's own earlier instances come BEFORE yesterday's book: a
+            # rerun's pre-trade baseline is what this session started with, not what the
+            # previous session ended with.  Snapshots only (`holdings.json` /
+            # `current_holdings.json`) -- never a planned book.
+            for instance_dir in reversed(
+                list_instances_for_date(self.find_existing_run_base_dir(strat_k, univ_k, date_str))
+            ):
+                snap = self._load_snapshot_holdings(instance_dir)
+                if snap is not None:
+                    holdings_data = snap
+                    break
+        if not holdings_data and strat_k and univ_k:
             holdings_data = self._carry_forward_holdings(date_str, strat_k, univ_k)
         if not holdings_data:
             holdings_data = self.get_holdings(date_str, strat_k, univ_k)
@@ -2080,6 +2486,16 @@ class StorageManager:
         post_holdings_data = self.extract_post_run_holdings(run_dir)
 
         account_state = self._load_json(os.path.join(run_dir, "account_state.json"))
+        if not account_state and strat_k and univ_k:
+            # (L2.62) Same rule as holdings: fall back to this session's earlier instances
+            # before yesterday's state (the flat layout used to hold it in one file).
+            for instance_dir in reversed(
+                list_instances_for_date(self.find_existing_run_base_dir(strat_k, univ_k, date_str))
+            ):
+                carried_state = self._load_json(os.path.join(instance_dir, "account_state.json"))
+                if carried_state:
+                    account_state = carried_state
+                    break
         if not account_state and strat_k and univ_k:
             account_state = self._carry_forward_account_state(date_str, strat_k, univ_k)
 
@@ -2112,6 +2528,10 @@ class StorageManager:
         return {
             "date": date_str,
             "path": run_dir,
+            # (L2.62) Which same-day instance this bundle came from: "HHMMSS", or None for
+            # the flat/first-of-day layout and for pre-L2.62 archives. The API surfaces it
+            # so "which rerun is this?" is answerable without inspecting `path`.
+            "instance": os.path.basename(run_dir) if is_instance_dir_name(os.path.basename(run_dir)) else None,
             "strategy_key": strat_k,
             "strategy_name": strat_n,
             "universe_key": univ_k,

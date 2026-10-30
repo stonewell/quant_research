@@ -78,6 +78,7 @@ import hashlib
 import io
 import json
 import math
+import re
 import shutil
 import sys
 from datetime import date, datetime, timezone
@@ -121,6 +122,20 @@ ASSUMED_UNFILLED_RUNS: Tuple[str, ...] = ("2026-10-27",)
 
 #: 因子表滞后时允许的最大天数（超过则在 nav_warnings 里点名）。
 FACTOR_LAG_TOLERANCE_DAYS = 5
+
+#: (L2.62) 同日重跑的实例子目录名（`<date>/<HHMMSS>/`）。
+_INSTANCE_DIR_RE = re.compile(r"^\d{6}$")
+
+
+def instance_subdirs(run_dir: Path) -> List[str]:
+    """同日实例子目录名（升序），见 `main()` 里的 `[NOTE]`。
+
+    (L2.62) 本脚本只修**扁平** run 目录，实例目录不在修复范围内；抽成函数是为了让
+    "会被跳过"这件事本身可被离线断言，而不是埋在 `main()` 里只能靠人工观察。
+    """
+    return sorted(
+        p.name for p in Path(run_dir).iterdir() if p.is_dir() and _INSTANCE_DIR_RE.match(p.name)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1887,6 +1902,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not run_dirs[r].is_dir():
             print(f"[ERROR] run 目录不存在: {run_dirs[r]}", file=sys.stderr)
             return 2
+
+    # (L2.62) A same-day rerun now writes `<date>/<HHMMSS>/` instead of reusing the flat
+    # `<date>/` directory. This script repairs ONE flat run at a time and never merges
+    # instances, so those subdirectories are deliberately OUT OF SCOPE -- but they must be
+    # reported, not silently ignored: an operator who expected a repair to cover "today"
+    # would otherwise believe the instance rounds were repaired too.
+    for r in sorted(run_labels):
+        subdirs = instance_subdirs(run_dirs[r])
+        if subdirs:
+            print(
+                f"[NOTE] {run_dirs[r]} 下存在同日实例子目录 {subdirs}（L2.62）—— 跳过子目录，"
+                "仅修复扁平目录；如需逐轮修复请对每个实例目录单独执行",
+                file=sys.stdout,
+            )
 
     market_db = resolve_market_db(args.market_db)
     fallback_anchor = min(CASH_ANCHOR_RUN, *run_labels)

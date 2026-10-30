@@ -336,8 +336,20 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
         strategy: Optional[str] = Query(None, description="Optional strategy key filter"),
         universe: Optional[str] = Query(None, description="Optional universe key filter"),
         require_both: bool = Query(False, description="Strict mode: require both strategy and universe"),
+        latest_only: bool = Query(
+            False,
+            description=(
+                "Collapse a session's instance dirs (L2.62) to the newest one per "
+                "(date, strategy, universe). Default returns every instance."
+            ),
+        ),
     ) -> List[Dict[str, Any]]:
-        return storage.list_runs(strategy_key=strategy, universe_key=universe, require_both=require_both)
+        return storage.list_runs(
+            strategy_key=strategy,
+            universe_key=universe,
+            require_both=require_both,
+            latest_only=latest_only,
+        )
 
     @app.get("/api/runs/latest", summary="Get latest run for a specific strategy and universe")
     async def get_latest_run(

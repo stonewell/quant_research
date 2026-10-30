@@ -346,3 +346,300 @@ def test_previous_post_holdings_none_on_a_first_run(temp_storage, tmp_path):
     assert temp_storage.get_previous_post_holdings(
         date_str="2026-10-27", strategy_key="strat_x", universe_key="univ_y"
     ) == (None, None)
+
+
+# ---------------------------------------------------------------------------
+# 5. The multi-strategy matrix chain: WHICH archive is the reference there
+# ---------------------------------------------------------------------------
+# `run_multi_strategy_netted_deploy` writes `<archive>/<date>/multi_netted_<matrix>`,
+# which is deliberately NOT part of the per-(strategy, universe) carry-forward chain
+# that `get_previous_post_holdings` walks.  Before this was addressed, the netted path
+# returned `holdings_plan` only and did NO comparison at all -- i.e. the advisory check
+# was inert on exactly the deployment mode that produced the 2026-10-27 stale book.
+
+
+def _make_matrix_run(archive_dir, date_str, matrix_id, ticket=None, post=None, holdings=None):
+    run_dir = os.path.join(archive_dir, date_str, f"multi_netted_{matrix_id}")
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump({"date": date_str, "matrix_id": matrix_id}, f)
+    if ticket is not None:
+        with open(os.path.join(run_dir, "netted_trading_ticket.json"), "w", encoding="utf-8") as f:
+            json.dump(ticket, f)
+    if post is not None:
+        with open(os.path.join(run_dir, "post_holdings.json"), "w", encoding="utf-8") as f:
+            json.dump(post, f)
+    if holdings is not None:
+        with open(os.path.join(run_dir, "holdings.json"), "w", encoding="utf-8") as f:
+            json.dump(holdings, f)
+    return run_dir
+
+
+def test_matrix_previous_book_is_derived_from_the_netted_ticket(temp_storage, tmp_path):
+    archive = str(tmp_path / "archive")
+    run_dir = _make_matrix_run(
+        archive,
+        "2026-10-26",
+        "tri_core_blend",
+        ticket=[
+            {"symbol": "600900.SH", "action": "BUY", "target_shares": 1200},
+            {"symbol": "000999.SZ", "action": "BUY", "target_shares": 600},
+            {"symbol": "BIL", "action": "SWEEP_CASH", "target_shares": 0},
+        ],
+    )
+    plan, where = temp_storage.get_previous_multi_netting_post_holdings(
+        date_str="2026-10-27", matrix_id="tri_core_blend"
+    )
+    assert plan == {"600900.SH": 1200, "000999.SZ": 600}
+    assert where == run_dir
+
+
+def test_matrix_previous_book_prefers_post_holdings_file(temp_storage, tmp_path):
+    archive = str(tmp_path / "archive")
+    _make_matrix_run(
+        archive,
+        "2026-10-24",
+        "tri_core_blend",
+        ticket=[{"symbol": "600900.SH", "action": "BUY", "target_shares": 1}],
+        post={"600900.SH": 999},
+    )
+    plan, _ = temp_storage.get_previous_multi_netting_post_holdings(
+        date_str="2026-10-27", matrix_id="tri_core_blend"
+    )
+    assert plan == {"600900.SH": 999}
+
+
+def test_matrix_previous_book_reads_the_csv_when_json_is_missing(temp_storage, tmp_path):
+    archive = str(tmp_path / "archive")
+    run_dir = os.path.join(archive, "2026-10-24", "multi_netted_tri_core_blend")
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, "netted_trading_ticket.csv"), "w", encoding="utf-8") as f:
+        f.write("symbol,name,action,price,target_shares,delta_shares\n")
+        f.write("600660.SH,X,BUY,10.0,400,400\n")
+    plan, _ = temp_storage.get_previous_multi_netting_post_holdings(
+        date_str="2026-10-27", matrix_id="tri_core_blend"
+    )
+    assert plan == {"600660.SH": 400}
+
+
+def test_matrix_previous_book_ignores_the_same_day_and_other_matrices(temp_storage, tmp_path):
+    archive = str(tmp_path / "archive")
+    _make_matrix_run(archive, "2026-10-27", "tri_core_blend", post={"600900.SH": 1})
+    _make_matrix_run(archive, "2026-10-27", "dual_core_shield", post={"600900.SH": 2})
+    _make_matrix_run(archive, "2026-10-26", "tri_core_blend", post={"600900.SH": 1200})
+    plan, where = temp_storage.get_previous_multi_netting_post_holdings(
+        date_str="2026-10-27", matrix_id="tri_core_blend"
+    )
+    assert plan == {"600900.SH": 1200}
+    assert where.endswith(os.path.join("2026-10-26", "multi_netted_tri_core_blend"))
+
+
+def test_matrix_previous_book_never_uses_holdings_json(temp_storage, tmp_path):
+    """`holdings.json` is the PRE-trade INPUT -- using it would hide the defect."""
+    archive = str(tmp_path / "archive")
+    _make_matrix_run(archive, "2026-10-26", "tri_core_blend", holdings={"600900.SH": 999})
+    assert temp_storage.get_previous_multi_netting_post_holdings(
+        date_str="2026-10-27", matrix_id="tri_core_blend"
+    ) == (None, None)
+
+
+def test_matrix_previous_book_none_on_first_run(temp_storage):
+    assert temp_storage.get_previous_multi_netting_post_holdings(
+        date_str="2026-10-27", matrix_id="tri_core_blend"
+    ) == (None, None)
+
+
+def test_matrix_previous_book_requires_a_valid_date(temp_storage, tmp_path):
+    _make_matrix_run(str(tmp_path / "archive"), "2026-10-26", "tri_core_blend", post={"600900.SH": 1})
+    with pytest.raises(ValueError):
+        temp_storage.get_previous_multi_netting_post_holdings(date_str="2026-10-2x", matrix_id="tri_core_blend")
+
+
+# ---------------------------------------------------------------------------
+# 6. `_check_holdings_input` -- the stale-input detection path itself
+# ---------------------------------------------------------------------------
+# Loaded the way `server.py` loads it (bare `storage` on sys.path) so the
+# `HoldingsInputMismatchError` class identity matches the one `execution_service` raises.
+
+
+_WEB_DIR = os.path.join(_REPO_ROOT, "web", "livetrading")
+if _WEB_DIR not in sys.path:
+    sys.path.insert(0, _WEB_DIR)
+
+
+@pytest.fixture
+def live_modules():
+    import importlib.util
+
+    # Bare-name import: this is the module `execution_service` will `from storage import ...`.
+    import storage as bare_storage
+
+    path = os.path.join(_WEB_DIR, "execution_service.py")
+    spec = importlib.util.spec_from_file_location(
+        "web_livetrading_execution_service_holdings_input", path
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return bare_storage, module
+
+
+@pytest.fixture
+def service_workspace(tmp_path, live_modules):
+    bare_storage, es = live_modules
+    data_dir = tmp_path / "data"
+    archive_dir = tmp_path / "archive"
+    cache_dir = tmp_path / "cache"
+    settings_dir = tmp_path / "settings"
+    for d in (data_dir, archive_dir, cache_dir, settings_dir):
+        d.mkdir()
+    manager = bare_storage.StorageManager(
+        repo_root=_REPO_ROOT,
+        data_dir=str(data_dir),
+        archive_dir=str(archive_dir),
+        cache_dir=str(cache_dir),
+        settings_dir=str(settings_dir),
+    )
+    return es.ExecutionService(manager), manager, str(archive_dir), bare_storage
+
+
+#: The incident's shape: the 10-27 input book was byte-identical to `10-22/post_holdings.json`
+#: while `10-26/post_holdings.json` already described a different book.
+_STALE_INPUT = {"600900.SH": 800, "600660.SH": 400, "000999.SZ": 600}
+_PREV_PLANNED = {"600900.SH": 1200, "600660.SH": 900, "000999.SZ": 900}
+
+
+def test_stale_input_is_flagged_against_the_previous_planned_book(service_workspace, monkeypatch):
+    monkeypatch.delenv("LIVETRADING_STRICT_HOLDINGS_INPUT", raising=False)
+    service, manager, archive, _bare_storage = service_workspace
+    prev_dir = _make_matrix_run(archive, "2026-10-26", "tri_core_blend", post=_PREV_PLANNED)
+
+    check = service._check_holdings_input(
+        _STALE_INPUT, val_date="2026-10-27", strategy_key=None, universe_key=None,
+        matrix_id="tri_core_blend",
+    )
+    assert check["prev_post_available"] is True
+    assert check["prev_post_run_dir"] == prev_dir
+    assert check["strict"] is False
+    assert check["n_mismatched"] == 3
+    assert check["mismatched"]["600900.SH"] == {"input": 800, "prev_post": 1200, "delta": -400}
+    assert check["mismatched"]["600660.SH"]["delta"] == -500
+    assert check["mismatched"]["000999.SZ"]["delta"] == -300
+
+
+def test_up_to_date_input_passes_the_matrix_check(service_workspace, monkeypatch):
+    monkeypatch.delenv("LIVETRADING_STRICT_HOLDINGS_INPUT", raising=False)
+    service, _manager, archive, _bare_storage = service_workspace
+    _make_matrix_run(archive, "2026-10-26", "tri_core_blend", post=_PREV_PLANNED)
+    check = service._check_holdings_input(
+        dict(_PREV_PLANNED), val_date="2026-10-27", strategy_key=None, universe_key=None,
+        matrix_id="tri_core_blend",
+    )
+    assert check["prev_post_available"] is True
+    assert check["n_mismatched"] == 0
+
+
+def test_matrix_check_reports_no_reference_on_the_first_run(service_workspace, monkeypatch):
+    monkeypatch.delenv("LIVETRADING_STRICT_HOLDINGS_INPUT", raising=False)
+    service, _manager, _archive, _bare_storage = service_workspace
+    check = service._check_holdings_input(
+        _STALE_INPUT, val_date="2026-10-27", strategy_key=None, universe_key=None,
+        matrix_id="tri_core_blend",
+    )
+    assert check["prev_post_available"] is False
+    assert check["n_mismatched"] == 0
+    assert check["n_symbols"] == 3
+
+
+def test_cash_proxies_are_dropped_from_the_input_side(service_workspace, monkeypatch):
+    monkeypatch.delenv("LIVETRADING_STRICT_HOLDINGS_INPUT", raising=False)
+    service, _manager, archive, _bare_storage = service_workspace
+    _make_matrix_run(archive, "2026-10-26", "tri_core_blend", post={"600900.SH": 1200})
+    check = service._check_holdings_input(
+        {"600900.SH": 1200, "BIL": 43227}, val_date="2026-10-27",
+        strategy_key=None, universe_key=None, matrix_id="tri_core_blend",
+    )
+    assert check["n_mismatched"] == 0
+    assert "BIL" not in check["mismatched"]
+
+
+def test_strict_mode_refuses_the_matrix_deploy_before_writing_holdings(
+    service_workspace, monkeypatch
+):
+    """Strict mode must ABORT -- not merely report -- and must leave no `holdings.json`."""
+    import subprocess
+
+    monkeypatch.setenv("LIVETRADING_STRICT_HOLDINGS_INPUT", "1")
+    service, manager, archive, bare_storage = service_workspace
+    _make_matrix_run(archive, "2026-10-26", "tri_core_blend", post=_PREV_PLANNED)
+
+    called = []
+
+    def _fail_if_called(cmd, *a, **kw):  # pragma: no cover - must never run
+        called.append(cmd)
+        raise AssertionError("subprocess must not be launched when strict mode refuses")
+
+    monkeypatch.setattr(subprocess, "run", _fail_if_called)
+
+    with pytest.raises(bare_storage.HoldingsInputMismatchError):
+        service.run_multi_strategy_netted_deploy(
+            matrix_id="tri_core_blend",
+            custom_symbols=["600900.SH"],
+            as_of_date="2026-10-27",
+            current_holdings=_STALE_INPUT,
+            data_provider="synthetic",
+        )
+
+    assert called == []
+    run_dir = manager.get_multi_netting_run_dir("tri_core_blend", "2026-10-27")
+    assert not os.path.exists(os.path.join(run_dir, "holdings.json"))
+
+
+def test_matrix_deploy_records_the_check_in_response_and_summary(
+    service_workspace, monkeypatch
+):
+    """The check must reach both the API response and `summary.json` (forensics)."""
+    import subprocess
+
+    monkeypatch.delenv("LIVETRADING_STRICT_HOLDINGS_INPUT", raising=False)
+    service, manager, archive, _bare_storage = service_workspace
+    _make_matrix_run(archive, "2026-10-26", "tri_core_blend", post=_PREV_PLANNED)
+
+    def _fake_run(cmd, *a, **kw):
+        out_dir = cmd[cmd.index("--output-dir") + 1]
+        with open(os.path.join(out_dir, "netted_trading_ticket.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                [
+                    {"symbol": "600900.SH", "action": "BUY", "target_shares": 1200},
+                    {"symbol": "BIL", "action": "SWEEP_CASH", "target_shares": 0},
+                ],
+                f,
+            )
+
+        class _Proc:
+            returncode = 0
+            stdout = "ok"
+            stderr = ""
+
+        return _Proc()
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    result = service.run_multi_strategy_netted_deploy(
+        matrix_id="tri_core_blend",
+        custom_symbols=["600900.SH"],
+        as_of_date="2026-10-27",
+        current_holdings=_STALE_INPUT,
+        data_provider="synthetic",
+    )
+
+    assert result["status"] == "success"
+    check = result["holdings_input_check"]
+    assert check["prev_post_available"] is True
+    assert check["n_mismatched"] == 3
+    assert result["holdings_plan"] == {"600900.SH": 1200}
+
+    run_dir = manager.get_multi_netting_run_dir("tri_core_blend", "2026-10-27")
+    with open(os.path.join(run_dir, "summary.json"), encoding="utf-8") as f:
+        summary = json.load(f)
+    assert summary["holdings_input_check"]["n_mismatched"] == 3
+    assert summary["holdings_input_check"]["prev_post_available"] is True
