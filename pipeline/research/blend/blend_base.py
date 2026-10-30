@@ -156,7 +156,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
     and adaptive turnover filters so any blend strategy can inherit them cleanly.
     """
 
-    BASE_VERSION: str = "1.6.0"
+    BASE_VERSION: str = "1.7.0"
     version: str = "1.0.0"
 
     def __init__(
@@ -176,7 +176,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             self.config = config
         self.param_prefix = param_prefix
         self.alt_param_prefixes = alt_param_prefixes or []
-        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "1.6.0")
+        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "1.7.0")
         strat_version: str = version or getattr(self.__class__, "version", "1.0.0")
         tags = factor_tags or [
             "regime_trend_strength",
@@ -270,6 +270,65 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                 return param_type(val) if param_type is not None else val
 
         return default
+
+    # -- Task C6.2: the two DISTINCT "confluence" sizing switches ----------------
+    #
+    # There are two unrelated switches whose names both contain "confluence":
+    #
+    #   * LEGACY_CONFLUENCE_SIZING_KEY (`confluence_sizing`, blend-prefixed
+    #     `blend_confluence_sizing`, cdhb-prefixed `cdhb_confluence_sizing`)
+    #     -> the long-standing `c_mult` confluence/resonance sizing block that
+    #        multiplies the pre-emptive thrust score by 0.6 / 1.1 / 1.6. Default
+    #        True for the `cdhb` prefix; `chan_dual_hybrid_blend` pins it True in
+    #        strategies_config.json.
+    #   * TRACK_C_ANCHOR3_CONFLUENCE_SIZING_KEY (`enable_vp_confluence_sizing`,
+    #     blend-prefixed `blend_enable_vp_confluence_sizing`) -> Track C Anchor 3,
+    #     the VP/VAH + Wyckoff effort-result *modifier* that nudges `conf_count`
+    #     and applies a 0.6 damping. Default False and absent from every blend
+    #     block in strategies_config.json, i.e. Anchor 3 is OFF everywhere today.
+    #
+    # They are NOT synonyms and neither implies the other. Anchor 3 is a modifier
+    # of the legacy block, so its code is nested inside `if legacy_confluence_sizing:`
+    # -- that nesting is a documented precondition, not a shared switch. Auditing
+    # Track C activation by grepping for the substring "confluence" is therefore
+    # WRONG; use `confluence_sizing_gates()` below.
+    LEGACY_CONFLUENCE_SIZING_KEY: str = "confluence_sizing"
+    TRACK_C_ANCHOR3_CONFLUENCE_SIZING_KEY: str = "enable_vp_confluence_sizing"
+
+    def confluence_sizing_gates(self, params: Optional[dict] = None) -> Dict[str, bool]:
+        """Resolve the two independent confluence switches, each from ITS OWN key.
+
+        Returns
+        -------
+        dict with two keys:
+          * ``legacy_confluence_sizing`` -- the legacy `c_mult` confluence/resonance
+            sizing (``confluence_sizing`` / ``<prefix>_confluence_sizing``).
+          * ``anchor3_vp_confluence_sizing`` -- Track C Anchor 3
+            (``enable_vp_confluence_sizing`` / ``<prefix>_enable_vp_confluence_sizing``).
+
+        This is the single authoritative attribution point: `generate_weights`
+        reads both flags from here, and the audit/regression tests assert against
+        it, so `cdhb_confluence_sizing=true` can never again be read as
+        "Anchor 3 is enabled".
+
+        NOTE (deliberate): the two key strings are passed to `resolve_param` as
+        LITERALS, not through the class constants above. The workspace's config-wiring
+        analyzer (`pipeline/tests/test_config_wiring.py`) proves a `StrategyConfig` field
+        is wired by matching a literal string at `resolve_param`'s name argument, so a
+        constant would make all three of `cdhb_confluence_sizing`,
+        `blend_enable_vp_confluence_sizing` and `enable_vp_confluence_sizing` look like
+        zombies. `test_c62_anchor3_is_nested_in_legacy_block_and_keys_stay_distinct`
+        pins the constants to these literals so the two cannot drift apart.
+        """
+        p = params or {}
+        return {
+            "legacy_confluence_sizing": self.resolve_param(
+                p, "confluence_sizing", (self.param_prefix == "cdhb"), bool
+            ),
+            "anchor3_vp_confluence_sizing": self.resolve_param(
+                p, "enable_vp_confluence_sizing", False, bool
+            ),
+        }
 
     def get_sub_strategies(
         self, universe: Dict[str, pd.DataFrame], params: Optional[dict] = None
@@ -618,7 +677,13 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         thrust_sizing_mode = self.resolve_param(p, "thrust_sizing_mode", "vol_adjusted", str)
         require_asset_trend = self.resolve_param(p, "require_asset_trend", (self.param_prefix == "cdhb"), bool)
         require_rs_rank = self.resolve_param(p, "require_rs_rank", (self.param_prefix == "cdhb"), bool)
-        confluence_sizing = self.resolve_param(p, "confluence_sizing", (self.param_prefix == "cdhb"), bool)
+        # Task C6.2 (attribution): this is the LEGACY `c_mult` confluence/resonance
+        # sizing, NOT Track C Anchor 3. Both confluence switches are resolved together
+        # through `confluence_sizing_gates()` so their keys can never be swapped again
+        # -- see the docstring there. `cdhb_confluence_sizing: true` in
+        # strategies_config.json means "legacy resonance sizing ON", never "Anchor 3 ON".
+        _confluence_gates = self.confluence_sizing_gates(p)
+        legacy_confluence_sizing = _confluence_gates["legacy_confluence_sizing"]
         elastic_dd_reset = self.resolve_param(p, "elastic_drawdown_reset", (self.param_prefix == "cdhb"), bool)
 
         # Blend Base adaptive and weighting mode configuration
@@ -648,7 +713,15 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         enable_structural_regime = self.resolve_param(p, "enable_structural_regime", True, bool)
         enable_cyq_quality_gate = self.resolve_param(p, "enable_cyq_quality_gate", True, bool)
         min_cyq_winner_ratio = self.resolve_param(p, "min_cyq_winner_ratio", 0.20, float)
-        enable_vp_confluence_sizing = self.resolve_param(p, "enable_vp_confluence_sizing", False, bool)
+        # Task C6.1: Anchor 2's consolidation-density veto threshold. This MUST come
+        # from the shared `chan_vp_min_consolidation_density` field (StrategyConfig
+        # default 0.45, also 0.45 in strategies_config.json) -- the same field the
+        # `chan_vp_hybrid` path already honours. Before this fix the veto was a bare
+        # `0.40` float literal, so the configured value was inert on this path and the
+        # live threshold silently disagreed with the declared one.
+        min_consolidation_density = self.resolve_param(p, "chan_vp_min_consolidation_density", 0.45, float)
+        # Task C6.2: Anchor 3's own switch (NOT the legacy `c_mult` sizing above).
+        enable_vp_confluence_sizing = _confluence_gates["anchor3_vp_confluence_sizing"]
         enable_spring_fast_entry = self.resolve_param(p, "enable_spring_fast_entry", False, bool)
         enable_structural_chandelier_stop = self.resolve_param(p, "enable_structural_chandelier_stop", False, bool)
 
@@ -1153,7 +1226,13 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
 
                                 if float(raw_w[s]) > 0.01 and "consolidation_density" in cols:
                                     c_dens = df_u.loc[date, "consolidation_density"]
-                                    if pd.notna(c_dens) and float(c_dens) < 0.40:
+                                    # Task C6.1: threshold comes from
+                                    # `chan_vp_min_consolidation_density` (default 0.45),
+                                    # never a float literal. A bare `0.40` here made the
+                                    # configured value inert on this, the only blend-side
+                                    # veto consumer, and silently disagreed with the
+                                    # declared 0.45.
+                                    if pd.notna(c_dens) and float(c_dens) < min_consolidation_density:
                                         raw_w[s] = 0.0
 
             # Dynamic cash deployment & pre-emptive thrust cash deployment
@@ -1199,7 +1278,11 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                         continue
 
                                     c_mult = 1.0
-                                    if confluence_sizing:
+                                    # Task C6.2: this is the LEGACY `c_mult` confluence/
+                                    # resonance sizing gate (`confluence_sizing`, i.e. the
+                                    # `cdhb_confluence_sizing` key). It is NOT Track C
+                                    # Anchor 3 -- see `confluence_sizing_gates()`.
+                                    if legacy_confluence_sizing:
                                         conf_count = 1
                                         for sname, s_df in sub_daily.items():
                                             if s in s_df.columns and float(s_df.loc[date, s]) > 0.01:
@@ -1218,6 +1301,26 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                                     damping_5m = 0.5
 
                                         # Track C Anchor 3: VP Confluence & Wyckoff Effort-Result Sizing
+                                        #
+                                        # ATTRIBUTION (Task C6.2): Anchor 3's own switch is
+                                        # `enable_vp_confluence_sizing` (blend key
+                                        # `blend_enable_vp_confluence_sizing`, default False,
+                                        # absent from every blend block in
+                                        # strategies_config.json => OFF in all 6 blends).
+                                        # The two keys above are NOT synonyms and neither
+                                        # implies the other.
+                                        #
+                                        # STRUCTURAL PRECONDITION (documented, not a bug):
+                                        # Anchor 3 only *modifies* the legacy `c_mult` score
+                                        # computed in the enclosing `if
+                                        # legacy_confluence_sizing:` block (it bumps
+                                        # `conf_count` / applies `damping_vp`), so its code is
+                                        # nested inside that block by construction. Turning on
+                                        # `enable_vp_confluence_sizing` alone therefore has NO
+                                        # effect -- the legacy block must also be on. Do not
+                                        # infer Anchor 3 activation from the string
+                                        # "confluence" anywhere; use
+                                        # `confluence_sizing_gates()`.
                                         damping_vp = 1.0
                                         if enable_vp_confluence_sizing and s in universe and not universe[s].empty:
                                             df_u = universe[s]

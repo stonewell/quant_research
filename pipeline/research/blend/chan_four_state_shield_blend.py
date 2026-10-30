@@ -29,7 +29,7 @@ class ChanFourStateShieldBlendStrategy(BaseBlendAllocationStrategy):
     4. ChanVaaCompoundStrategy (25%): Keller VAA crash canary defensive anchor
     """
 
-    version: str = "1.0.0"
+    version: str = "1.0.1"
 
     def __init__(self, config: Optional[StrategyConfig] = None, version: Optional[str] = None):
         cfg = config or StrategyConfig()

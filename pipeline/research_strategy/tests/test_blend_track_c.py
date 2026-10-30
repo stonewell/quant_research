@@ -28,6 +28,7 @@ import pytest
 import warnings
 from typing import Dict
 
+from common.allocation_templates import AllocationTemplate
 from common.testing import make_ohlcv_from_closes
 from pipeline.research.blend import (
     BaseBlendAllocationStrategy,
@@ -666,3 +667,380 @@ def test_incident_2026_10_22_end_to_end_replay():
     # The three replayed incumbents alone are 51.6% of NAV - over half the book was at
     # risk of being liquidated/reduced by the three defects replayed above.
     assert sum(p[2] for p in positions) == pytest.approx(0.5160, abs=1e-9)
+
+
+# =====================================================================================
+# `C6.1` -- Anchor 2 consolidation-density veto must read
+#            `chan_vp_min_consolidation_density` (no hardcoded 0.40 literal)
+# =====================================================================================
+
+_DENSITY_VETO_SYMBOL = "600584.SH"          # the candidate whose density is under test
+_DENSITY_CONTROL_SYMBOL = "002371.SZ"       # control: density well above every threshold
+
+
+class _ConstantWeightStub(AllocationTemplate):
+    """Sub-strategy stub with CONSTANT equal targets.
+
+    Everything that can move `_DENSITY_VETO_SYMBOL`'s target weight therefore comes
+    from the blend engine's own gates -- in particular the Anchor 2 quality gate under
+    test. Without this isolation the sub-strategy's own stock selection would mask the
+    veto (the first draft of this fixture did exactly that and the assertion was
+    vacuous: `601857.SH` was 0.0 at every density).
+    """
+
+    def generate_weights(self, universe, params=None):
+        idx = universe["BIL"].index
+        df = pd.DataFrame({s: 0.0 for s in universe}, index=idx)
+        for sym in (_DENSITY_VETO_SYMBOL, _DENSITY_CONTROL_SYMBOL):
+            if sym in df.columns:
+                df[sym] = 0.5
+        return df
+
+
+class _QualityGateStubBlend(BaseBlendAllocationStrategy):
+    """Minimal blend shell: one constant-weight sub-strategy at weight 1.0."""
+
+    name = "quality_gate_stub_blend"
+
+    def get_sub_strategies(self, universe, params=None):
+        return {"mock": _ConstantWeightStub("mock", {})}
+
+    def get_sub_strategy_weights(self, params=None):
+        return {"mock": 1.0}
+
+
+def _density_fixture(veto_density: float):
+    """Two candidates + cash. `_CONTROL` density 0.50 is above every threshold used."""
+    dates = pd.bdate_range("2020-01-01", periods=60)
+    df_veto = _build_synthetic_bar_df(dates, 10.0, daily_ret=0.002)
+    df_veto["Volume"] = 1000.0
+    df_veto["cyq_winner_ratio"] = 0.50          # above min_cyq_winner_ratio -> only density can veto
+    df_veto["consolidation_density"] = veto_density
+
+    df_ctrl = _build_synthetic_bar_df(dates, 20.0, daily_ret=0.002)
+    df_ctrl["Volume"] = 1000.0
+    df_ctrl["cyq_winner_ratio"] = 0.50
+    df_ctrl["consolidation_density"] = 0.50
+
+    df_cash = _build_synthetic_bar_df(dates, 100.0, daily_ret=0.0001)
+    df_cash["Volume"] = 1000.0
+
+    return {
+        _DENSITY_VETO_SYMBOL: df_veto,
+        _DENSITY_CONTROL_SYMBOL: df_ctrl,
+        "BIL": df_cash,
+    }
+
+
+def _gate_weights(veto_density: float, config=None, **overrides):
+    """Run the stub blend once and return forward-filled weights (last row = decision)."""
+    params = {
+        "cash_proxy": "BIL",
+        "enable_cyq_quality_gate": True,
+        "min_cyq_winner_ratio": 0.20,
+        # Off so the pre-emptive thrust path cannot re-add a symbol the gate just vetoed
+        # (it scores candidates from ROC and would silently bypass the veto).
+        "preemptive_thrust_deployment": False,
+    }
+    params.update(overrides)
+    strat = _QualityGateStubBlend(config=config)
+    w = strat.generate_weights(_density_fixture(veto_density), params=params)
+    return w.ffill().fillna(0.0)
+
+
+def test_c61_density_veto_moves_with_the_configured_threshold():
+    """`C6.1` regression: the Anchor 2 density veto threshold is the CONFIGURED value.
+
+    The fixture density 0.42 sits strictly BETWEEN the old hardcoded literal (0.40)
+    and the configured default (0.45):
+
+      * old behaviour (`< 0.40`)  -> 0.42 > 0.40  -> ADMITTED (~0.2 weight);
+      * required behaviour (`< 0.45`) -> 0.42 < 0.45 -> VETOED (explicit 0.0).
+
+    So this test is red on the pre-fix code, and it also pins that the veto follows the
+    parameter in BOTH directions rather than merely hardcoding 0.45 instead.
+    """
+    dens = 0.42
+
+    w_default = _gate_weights(dens)
+    assert float(w_default.iloc[-1][_DENSITY_VETO_SYMBOL]) == pytest.approx(0.0), (
+        "configured default 0.45 must veto a 0.42-density candidate "
+        "(a bare 0.40 literal admits it -- that is the C6.1 defect)"
+    )
+    # Control leg: same fixture, same call -- proves the veto is symbol-specific and
+    # that a 0.0 above is not just "nothing was bought at all".
+    assert float(w_default.iloc[-1][_DENSITY_CONTROL_SYMBOL]) > 0.0
+
+    # Loosening the configured threshold below the candidate density admits it again.
+    w_loose = _gate_weights(dens, chan_vp_min_consolidation_density=0.30)
+    assert float(w_loose.iloc[-1][_DENSITY_VETO_SYMBOL]) > 0.0, (
+        "with chan_vp_min_consolidation_density=0.30 the 0.42 density must PASS; "
+        "a parameter-inert veto keeps it at 0.0"
+    )
+
+    # Tightening it above the candidate density vetoes it again -- parameter-driven
+    # in BOTH directions, so "replaced 0.40 with a different literal" cannot pass.
+    w_tight = _gate_weights(dens, chan_vp_min_consolidation_density=0.60)
+    assert float(w_tight.iloc[-1][_DENSITY_VETO_SYMBOL]) == pytest.approx(0.0)
+
+    # A candidate above the configured default still passes: not a blanket veto.
+    w_above = _gate_weights(0.46)
+    assert float(w_above.iloc[-1][_DENSITY_VETO_SYMBOL]) > 0.0
+
+
+def test_c61_density_threshold_resolves_from_strategy_config():
+    """`C6.1`: the same threshold is honoured when set on `StrategyConfig` (not params)."""
+    assert StrategyConfig().chan_vp_min_consolidation_density == pytest.approx(0.45)
+
+    strat = _QualityGateStubBlend()
+    assert float(strat.resolve_param({}, "chan_vp_min_consolidation_density", None)) == pytest.approx(0.45), (
+        "the veto threshold must resolve to the single source of truth "
+        "(StrategyConfig.chan_vp_min_consolidation_density), default 0.45"
+    )
+
+    dens = 0.42
+    cfg_loose = StrategyConfig.from_dict({"chan_vp_min_consolidation_density": 0.30})
+    w_cfg_loose = _gate_weights(dens, config=cfg_loose)
+    assert float(w_cfg_loose.iloc[-1][_DENSITY_VETO_SYMBOL]) > 0.0
+
+    cfg_tight = StrategyConfig.from_dict({"chan_vp_min_consolidation_density": 0.60})
+    w_cfg_tight = _gate_weights(dens, config=cfg_tight)
+    assert float(w_cfg_tight.iloc[-1][_DENSITY_VETO_SYMBOL]) == pytest.approx(0.0)
+
+
+def _blend_base_source() -> str:
+    path = os.path.join(_PROJECT_ROOT, "research", "blend", "blend_base.py")
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def test_c61_density_veto_has_no_float_literal_threshold():
+    """`C6.1` source guard (AST): the density veto compares against a NAME, not a float.
+
+    Also asserts the `chan_vp_min_consolidation_density` field is actually resolved in
+    `blend_base.py`, so a revert to `float(c_dens) < 0.40` fails twice.
+    """
+    import ast
+
+    tree = ast.parse(_blend_base_source())
+
+    density_compares = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare) or len(node.ops) != 1:
+            continue
+        left = node.left
+        if not (isinstance(left, ast.Call) and isinstance(left.func, ast.Name) and left.func.id == "float"):
+            continue
+        if not left.args:
+            continue
+        arg = left.args[0]
+        arg_names = {n.id for n in ast.walk(arg) if isinstance(n, ast.Name)}
+        if "c_dens" not in arg_names:
+            continue
+        density_compares.append(node)
+
+    assert density_compares, (
+        "could not locate the consolidation-density veto comparison in blend_base.py "
+        "(expected `float(c_dens) < <threshold>`); update this guard if it was renamed"
+    )
+    for node in density_compares:
+        assert isinstance(node.ops[0], ast.Lt)
+        rhs = node.comparators[0]
+        assert not isinstance(rhs, ast.Constant) or not isinstance(rhs.value, (int, float)), (
+            f"line {node.lineno}: the consolidation-density veto is compared against the "
+            f"float literal {getattr(rhs, 'value', rhs)!r} -- it must read the configured "
+            f"`chan_vp_min_consolidation_density` instead"
+        )
+        assert isinstance(rhs, ast.Name), (
+            f"line {node.lineno}: the veto threshold must be a resolved parameter name"
+        )
+
+    resolved_fields = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            continue
+        if node.func.attr != "resolve_param" or not node.args:
+            continue
+        name_arg = node.args[1] if len(node.args) > 1 else None
+        if isinstance(name_arg, ast.Constant) and isinstance(name_arg.value, str):
+            resolved_fields.add(name_arg.value)
+    assert "chan_vp_min_consolidation_density" in resolved_fields, (
+        "blend_base.py no longer resolves `chan_vp_min_consolidation_density` -- the "
+        "Anchor 2 veto would go back to an arbitrary hardcoded threshold"
+    )
+
+
+# =====================================================================================
+# `C6.2` -- `cdhb_confluence_sizing` is the LEGACY resonance sizing, NOT Anchor 3
+# =====================================================================================
+
+
+def _pinned_blend_params(blend_key: str) -> dict:
+    path = os.path.join(_PROJECT_ROOT, "research_strategy", "strategies_config.json")
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)[blend_key]["parameters"]
+
+
+def test_c62_confluence_attribution_under_pinned_cdhb_config():
+    """`C6.2` attribution: under `chan_dual_hybrid_blend`'s pinned config, the LEGACY
+    resonance sizing is ON and Track C Anchor 3 is OFF -- each decided by its OWN key.
+    """
+    from pipeline.research.blend import ChanDualHybridBlendStrategy
+
+    params = _pinned_blend_params("chan_dual_hybrid_blend")
+    strat = ChanDualHybridBlendStrategy()
+
+    # The pinned key exists and is literally `cdhb_confluence_sizing: true`.
+    assert params.get("cdhb_confluence_sizing") is True
+    # ... and it is the ONLY key in the block whose name mentions "confluence".
+    assert [k for k in params if "confluence" in k] == ["cdhb_confluence_sizing"]
+
+    gates = strat.confluence_sizing_gates(params)
+    assert gates["legacy_confluence_sizing"] is True, "legacy `c_mult` resonance sizing must be ON"
+    assert gates["anchor3_vp_confluence_sizing"] is False, (
+        "Track C Anchor 3 must be OFF: its key `blend_enable_vp_confluence_sizing` is "
+        "absent from every blend block in strategies_config.json"
+    )
+
+    # Each flag is decided by its own key -- cross-referencing is exactly the C6.2 bug.
+    assert strat.resolve_param(params, "confluence_sizing", False, bool) is True
+    assert strat.resolve_param(params, "enable_vp_confluence_sizing", True, bool) is False
+
+    # Flipping ONE key never moves the other, in either direction.
+    p_anchor_on = dict(params)
+    p_anchor_on["cdhb_enable_vp_confluence_sizing"] = True
+    assert strat.resolve_param(p_anchor_on, "enable_vp_confluence_sizing", False, bool) is True
+    assert strat.resolve_param(p_anchor_on, "confluence_sizing", False, bool) is True
+
+    p_legacy_off = dict(params)
+    p_legacy_off["cdhb_confluence_sizing"] = False
+    assert strat.resolve_param(p_legacy_off, "confluence_sizing", True, bool) is False
+    assert strat.resolve_param(p_legacy_off, "enable_vp_confluence_sizing", True, bool) is False
+
+    # AUDIT-CALIBRE GUARD: a substring audit ("does any key mention confluence?") says
+    # "Track C confluence sizing is enabled" on this block, while the key-based audit
+    # says Anchor 3 is OFF. The two DISAGREE, which is precisely why any check that
+    # infers Anchor 3 from a "confluence" substring match is wrong and must fail.
+    assert any("confluence" in k for k in params)
+    assert gates["anchor3_vp_confluence_sizing"] is False
+
+
+def test_c62_anchor3_consumes_its_own_sizing_key():
+    """`C6.2` behavioural proof: Anchor 3 changes the target weights via ITS OWN key.
+
+    Fixture: 601857.SH prints a VAH breakout with single-peak concentration >= 0.85,
+    which is exactly Anchor 3's `conf_count += 1` leg. With the legacy resonance block
+    on, turning Anchor 3 on lifts 601857.SH's confluence multiplier above the other
+    candidate's and the pre-emptive thrust book flips to it.
+    """
+    dates = pd.date_range("2024-01-01", periods=60, freq="B")
+
+    def _fixture():
+        df_a = _build_synthetic_bar_df(dates, 10.0, daily_ret=0.003)
+        df_b = _build_synthetic_bar_df(dates, 20.0, daily_ret=0.003)
+        df_b["wyckoff_effort_result"] = 0.20
+        df_b["High"] = df_b["Close"] * 1.05
+        df_b["Low"] = df_b["Close"] * 0.99
+        df_c = _build_synthetic_bar_df(dates, 30.0, daily_ret=0.003)
+        df_c["VAH"] = df_c["Close"] * 0.98
+        df_c["cyq_cost_concentration"] = 0.90
+        cash = _build_synthetic_bar_df(dates, 100.0, daily_ret=0.0001)
+        return {"600584.SH": df_a, "002371.SZ": df_b, "601857.SH": df_c, "BIL": cash}
+
+    def _run(legacy_on: bool, anchor3_on: bool):
+        params = {
+            "cash_proxy": "BIL",
+            "confluence_sizing": legacy_on,
+            "blend_enable_vp_confluence_sizing": anchor3_on,
+            "preemptive_thrust_deployment": True,
+            "min_thrust_assets": 1,
+        }
+        w = GenericBlendStrategy().generate_weights(_fixture(), params=params)
+        return w.ffill().fillna(0.0)
+
+    w_anchor3_off = _run(legacy_on=True, anchor3_on=False)
+    w_anchor3_on = _run(legacy_on=True, anchor3_on=True)
+
+    assert float(w_anchor3_off.iloc[-1]["601857.SH"]) == pytest.approx(0.0)
+    assert float(w_anchor3_on.iloc[-1]["601857.SH"]) > 0.0, (
+        "Anchor 3's VAH+concentration leg must lift 601857.SH into the book when "
+        "`enable_vp_confluence_sizing` is on -- if it does not, Anchor 3 is not "
+        "consuming its own key"
+    )
+
+    # Documented structural precondition (not the defect): Anchor 3 is a *modifier* of
+    # the legacy resonance block, so with the legacy block off it has no effect. This
+    # assertion is intentionally fail-loud: decoupling the two is a behaviour change
+    # that must be made consciously (and versioned), not by accident.
+    w_legacy_off_anchor3_on = _run(legacy_on=False, anchor3_on=True)
+    w_legacy_off_anchor3_off = _run(legacy_on=False, anchor3_on=False)
+    pd.testing.assert_frame_equal(w_legacy_off_anchor3_on, w_legacy_off_anchor3_off)
+
+
+def test_c62_anchor3_is_nested_in_legacy_block_and_keys_stay_distinct():
+    """`C6.2` source guard (AST): the two switches stay separate, and Anchor 3's gate
+    stays documented as a nested modifier of the legacy block.
+
+    Guards two regressions:
+      1. the Anchor 3 gate drifting out of the legacy block (making the documented
+         precondition a lie, i.e. a silent wiring change); and
+      2. a third "confluence" resolve_param key appearing (which is how the two keys
+         got conflated in the first place).
+    """
+    import ast
+
+    tree = ast.parse(_blend_base_source())
+
+    legacy_gate = None
+    anchor3_gate = None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        names = {n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)}
+        if names == {"legacy_confluence_sizing"}:
+            legacy_gate = node
+        # The Anchor 3 gate is `if enable_vp_confluence_sizing and ...:` (an AND, unlike
+        # the OR-ed feature-enrichment trigger that also mentions the switch).
+        if (
+            "enable_vp_confluence_sizing" in names
+            and isinstance(node.test, ast.BoolOp)
+            and isinstance(node.test.op, ast.And)
+        ):
+            assert anchor3_gate is None, "expected exactly one Anchor 3 gate in blend_base.py"
+            anchor3_gate = node
+
+    assert legacy_gate is not None, "legacy `c_mult` confluence sizing gate not found"
+    assert anchor3_gate is not None, "Track C Anchor 3 gate not found"
+
+    nested = any(n is anchor3_gate for n in ast.walk(legacy_gate))
+    assert nested, (
+        "Track C Anchor 3's gate must stay nested inside the legacy confluence block it "
+        "modifies; moving it out silently changes when Anchor 3 can fire"
+    )
+
+    confluence_keys = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            continue
+        if node.func.attr != "resolve_param" or len(node.args) < 2:
+            continue
+        name_arg = node.args[1]
+        if isinstance(name_arg, ast.Constant) and isinstance(name_arg.value, str):
+            if "confluence" in name_arg.value:
+                confluence_keys.add(name_arg.value)
+    # Both switches resolve through EXACTLY these two literal keys. A third
+    # "confluence" key is how the legacy sizing and Anchor 3 got conflated; a
+    # non-literal (constant/attribute) name argument would also silently drop the
+    # config-wiring analyzer's proof that these fields are consumed.
+    assert confluence_keys == {"confluence_sizing", "enable_vp_confluence_sizing"}, (
+        f"expected exactly two distinct literal confluence resolve_param keys, got "
+        f"{sorted(confluence_keys)}"
+    )
+
+    # And the documented constants must stay pinned to those two literals.
+    assert BaseBlendAllocationStrategy.LEGACY_CONFLUENCE_SIZING_KEY == "confluence_sizing"
+    assert BaseBlendAllocationStrategy.TRACK_C_ANCHOR3_CONFLUENCE_SIZING_KEY == "enable_vp_confluence_sizing"
+    assert (
+        BaseBlendAllocationStrategy.LEGACY_CONFLUENCE_SIZING_KEY
+        != BaseBlendAllocationStrategy.TRACK_C_ANCHOR3_CONFLUENCE_SIZING_KEY
+    )

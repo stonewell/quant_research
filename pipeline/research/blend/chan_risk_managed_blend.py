@@ -24,7 +24,7 @@ class ChanRiskManagedBlendStrategy(BaseBlendAllocationStrategy):
     volatility targeting, ATR trailing stops, and turnover controls.
     """
 
-    version: str = "1.1.0"
+    version: str = "1.1.1"
 
     def __init__(self, config: Optional[StrategyConfig] = None, version: Optional[str] = None):
         cfg = config or StrategyConfig()

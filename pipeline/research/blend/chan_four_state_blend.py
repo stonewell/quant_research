@@ -39,7 +39,7 @@ class ChanFourStateBlendStrategy(BaseBlendAllocationStrategy):
     #       strategies_config.json (the mode the 2026-10-22 live run executed
     #       under; the first round's re-dump had silently reverted it to
     #       `rolling_ic_ir`, which made Fix 3/4 inert). See docs/version.md §8.
-    version: str = "1.2.1"
+    version: str = "1.2.2"
 
     def __init__(self, config: Optional[StrategyConfig] = None, version: Optional[str] = None):
         cfg = config or StrategyConfig()

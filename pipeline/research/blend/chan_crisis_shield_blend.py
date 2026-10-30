@@ -25,7 +25,7 @@ class ChanCrisisShieldBlendStrategy(BaseBlendAllocationStrategy):
     WorldQuant Alpha#12 (Volume Shock Reversal).
     """
 
-    version: str = "1.0.1"
+    version: str = "1.0.2"
 
     def __init__(self, config: Optional[StrategyConfig] = None, version: Optional[str] = None):
         cfg = config or StrategyConfig()

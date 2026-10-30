@@ -3616,3 +3616,119 @@ pipeline/.venv/bin/python -m pytest common/tests/test_intraday_features.py -q   
 
 - **未 bump `version`，未 bump `BASE_VERSION`，未重跑 `--dump-strategies`**。判定依据（`AGENTS.md` §7）：`git diff --stat` 显示本轮改动集中在 `backtester/`、`common/{position_lifecycle,allocation_backtester,data,duckdb_cache,financial_api}.py`、`pipeline/parity_harness.py`、`pipeline/run_pipeline.py`、`pipeline/research_strategy/run_research_strategy.py`、`pipeline/strategy_generator/stratgen/generator.py`、`pipeline/instrument_selection/selectorbot/strategy_fit.py`、`scripts/*` 与各自的 `tests/`；对 `pipeline/research/blend/*`、`pipeline/research_strategy/rs/*`、`common/allocation_templates.py` **零改动**。无策略类逻辑、无信号计算、无参数默认值、无子策略 composition 变化 ⇒ §7 的两条升版条件均不成立。`strategy_dumps/*.json` 逐字节未动，实盘票据的 `strategy_version` / `base_version` 不受影响，`cfsb` 的部署钉住值 `regime_ic_ir_hybrid` 原样未动。
 - **台账**：`L2.48` 保持 `[x]`（本轮为同一任务的**评审修复**，不新增、不改写任务行）；`M3.6` / `M3.8` 保持 `[x]`（同上）；`M3.7` 由 `[ ]` 翻为 **`[x]`**（5m 单一权威源去重随 `0fa81ab` 落地 + 日线补丁 raw 化随本轮完成，闭环日 2026-10-27）。现役 **108 项 = 72 `[x]` + 36 `[ ]`**，两文件合计 **174 = 66（归档）+ 72 + 36 = 138 `[x]` + 36 `[ ]`**。逐表核算见 [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) §二 头部计数口径行。
+
+---
+
+## 24. `C6.1` 锚点 2 密度否决阈值参数化 & `C6.2` 锚点 3 归属消歧（2026-10-29）
+
+> 本节记录 [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) §2.14 的 `C6.1`（Tier P2）与 `C6.2`（Tier P4）两个字段/归属缺陷的落地。两条同处 `pipeline/research/blend/blend_base.py`，一次改完；`C6.1` 是**入场判据修正**（会改变回测/实盘入场决策），`C6.2` 是**纯归属消歧**（零行为变化）。
+
+### 24.1 事实与根因（改前实况，逐条复核）
+
+| 任务 | 根因（改前行号） | 影响 |
+| :--- | :--- | :--- |
+| `C6.1` | `blend_base.py:1156` 锚点 2 密度否决写作 `if pd.notna(c_dens) and float(c_dens) < 0.40:` —— 纯浮点字面量、无参数、无 `resolve_param` 前缀化解析 | `chan_vp_min_consolidation_density`（`config.py:892` 默认 `0.45`、`strategies_config.json:1178` 亦 `0.45`）在该路径**完全失效**：把配置改成 `0.30`/`0.60`，否决行为一字不变。生效阈值 `0.40` 与"文档默认 0.45 / 随附配置 0.45"三方不一致。锚点 2 门（`enable_cyq_quality_gate`，6 个 blend 全部显式 `true`）不在任何 `weighting_mode` 分支内，故 **6/6 在产**，即改前在产的就是 `0.40` |
+| `C6.2` | `blend_base.py:621` 的 `confluence_sizing`（默认 `param_prefix == "cdhb"`，`strategies_config.json:557` 显式 `true`）驱动的是 `:1201-1248` **既有** `c_mult` 共振定仓块；Track C 锚点 3 是另一个开关 `enable_vp_confluence_sizing`（`:651`，默认 `False`，6 个 blend 块中全部缺失），其门在 `:1222` 且**嵌在** `if confluence_sizing:` 内部 | 按 "confluence" 字样 grep 审计 Track C 启用面的人会把 `cdhb_confluence_sizing=true` 误读为"锚点 3 已上线"。事实是：既有共振定仓 **ON**、锚点 3 **OFF**（6/6），而字串口径看不出来 |
+
+**必须一并写明的更正（防夸大）**：`chan_vp_min_consolidation_density` **不是全域僵尸字段** —— `chan_vp_hybrid_strategy.py:183` 经 `p.get(...)` 真实消费；失效的**仅** blend 锚点 2 这一处。`chan_advanced_strategies.py:900` 的 `getattr(..., 0.40)` 回落默认是同一习惯的另一处来源，本轮**未动**（不属 `C6.1` 判据，且不在本任务授权文件内）。
+
+### 24.2 核心改动
+
+**`C6.1`（判据修正）**
+
+- 新增解析：`min_consolidation_density = self.resolve_param(p, "chan_vp_min_consolidation_density", 0.45, float)`（Track C 参数块）。走既有 `resolve_param` 九级优先级：`p["<prefix>_chan_vp_min_consolidation_density"]` → `p["blend_..."]` → `p["chan_vp_min_consolidation_density"]` → `StrategyConfig.chan_vp_min_consolidation_density`（默认 `0.45`）。**单一真相源已切到既有配置字段**，未新增字段、未改任何默认值（`0.45` 保持）。
+- 否决判据 `float(c_dens) < 0.40` → `float(c_dens) < min_consolidation_density`。全仓 `blend_base.py` 内已无 `float(c_dens) < <数值>` 形式（`grep -n "c_dens"` 仅剩判据与赋值）。
+
+**`C6.2`（归属消歧，零行为变化）**
+
+- 局部变量 `confluence_sizing` → `legacy_confluence_sizing`，其在 `c_mult` 块的门同步改名；两处均加显式注释说明"此为既有共振定仓、**非**锚点 3"。
+- 新增类常量 `LEGACY_CONFLUENCE_SIZING_KEY = "confluence_sizing"` / `TRACK_C_ANCHOR3_CONFLUENCE_SIZING_KEY = "enable_vp_confluence_sizing"`（文档与审计口径）。
+- 新增 `BaseBlendAllocationStrategy.confluence_sizing_gates(params) -> {"legacy_confluence_sizing", "anchor3_vp_confluence_sizing"}`：**唯一权威归属点**，`generate_weights` 的两个开关都从这里取，使两把键无法再被互换。
+- 锚点 3 代码块保留在 `if legacy_confluence_sizing:` 之内，并在块首写明这是**文档化的前置条件**（锚点 3 是既有块的**修饰器**，只 bump `conf_count` / 施加 `damping_vp`），不是同一个开关；单独打开 `enable_vp_confluence_sizing` 不产生任何效果。
+- **为什么不"拆开"嵌套**：拆开会让锚点 3 在既有块关闭时仍可触发，属行为变更，而 `C6.2` 明确"不承诺任何行为改变"；收益为零（锚点 3 的贡献只有 `conf_count`/`damping` 两个量，脱离既有块的 `c_mult` 无处落地）。
+
+### 24.3 版本双轴演进（`AGENTS.md` §7 闭环）
+
+| 构件 / 策略 | 旧版本 | 新版本 | 升级依据 |
+| :--- | :---: | :---: | :--- |
+| `BaseBlendAllocationStrategy.BASE_VERSION` | `1.6.0` | **`1.7.0`** | `C6.1` 修正底座侧入场判据（密度否决阈值由字面量 `0.40` 改为配置字段）；`C6.2` 新增 `confluence_sizing_gates()`（向后兼容新增，无契约破坏）⇒ 次版本号 |
+| `ChanFourStateBlendStrategy` | `1.2.1` | **`1.2.2`** | 继承底座新判据，密度否决门槛 `0.40 → 0.45`（6/6 在产 blend 之一） |
+| `ChanRiskManagedBlendStrategy` | `1.1.0` | **`1.1.1`** | 同上 |
+| `ChanCrisisShieldBlendStrategy` | `1.0.1` | **`1.0.2`** | 同上 |
+| `ChanFourStateShieldBlendStrategy` | `1.0.0` | **`1.0.1`** | 同上 |
+| `ChanDualHybridBlendStrategy` | `1.0.0` | **`1.0.1`** | 同上（另：`C6.2` 归属消歧落在此策略的钉住键上，行为不变） |
+| `GenericBlendStrategy` | `1.0.0` | **`1.0.1`** | 同上 |
+| `common/allocation_templates.py`（9 个静态模板） | 未改动 | **未改动** | 本轮零涉及；`AllocationTemplate` 无 `BASE_VERSION`，9 个静态模板 `version` 全部不动 |
+
+- **与 §18.5 的先例差异（必须写明）**：`§18.5`（`BASE_VERSION 1.5.0 → 1.6.0`）只升底座、子类 `version` 不动，理由是"子类自身逻辑无改动"。本轮**额外**升了 6 个子类 `version`，理由是：`C6.1` 改的虽是底座代码，但改变的是**子类实际生效的入场判据**（同一份代码在 6 个 blend 上都跑），按 `AGENTS.md` §7"策略类逻辑/信号计算/参数默认值变更"的实质口径计一次。判据一致性优先于版本号守恒；若评审认为应回到 §18.5 口径，只需回退 6 个子类号并同步两处版本断言。
+- **版本断言同步位置**：`pipeline/research_strategy/tests/test_blend_strategy_versioning.py`（`BASE_VERSION`/`base_version`/`version_string`/6 个子类期望版本/`get_version_info()`）与 `common/tests/test_strategy_versioning.py::test_blend_strategies_versioning`（同上）。`common/tests/test_strategy_versioning.py` 中静态模板相关断言**未改**。
+
+### 24.4 `--dump-strategies` 复核
+
+- 已完整执行 `pipeline/.venv/bin/python pipeline/research_strategy/run_research_strategy.py --dump-strategies`，`pipeline/research_strategy/results/strategy_dumps/` 下全量 dump 重导。
+- 6 份 blend dump 的取值（内容比对，`results/` 被 `pipeline/.gitignore` 忽略，**不能用 `git diff` 复核**，只能按内容读）：
+
+| dump 文件 | `strategy_version` | `base_version` | `version_info.composite_version` |
+| :--- | :---: | :---: | :--- |
+| `chan_four_state_blend_strategy.json` | `1.2.2` | `1.7.0` | `1.2.2 [base: 1.7.0]` |
+| `chan_risk_managed_blend_strategy.json` | `1.1.1` | `1.7.0` | `1.1.1 [base: 1.7.0]` |
+| `chan_crisis_shield_blend_strategy.json` | `1.0.2` | `1.7.0` | `1.0.2 [base: 1.7.0]` |
+| `chan_four_state_shield_blend_strategy.json` | `1.0.1` | `1.7.0` | `1.0.1 [base: 1.7.0]` |
+| `chan_dual_hybrid_blend_strategy.json` | `1.0.1` | `1.7.0` | `1.0.1 [base: 1.7.0]` |
+| `generic_blend_strategy.json` | `1.0.1` | `1.7.0` | `1.0.1 [base: 1.7.0]` |
+
+- **§8 事故复查（必做）**：本轮 dump **未**把 `chan_four_state_blend` 的 `blend_weighting_mode` 归一化成 `rolling_ic_ir` —— dump 内与 `strategies_config.json` 内该键**均为 `regime_ic_ir_hybrid`**，`test_cfsb_deployed_regime_mode_and_inertia_ratio_config` 通过。
+- 实盘票据：`run_live_strategy.py` 的 `strategy_version` / `base_version` 由策略实例的 `version` / `base_version` 直读，故自动携带 `1.2.2 [base: 1.7.0]` 等新值（**本轮未实跑实盘票据生成**，属未核实项，见 §24.7）。
+
+### 24.5 新增回归测试（全部 100% 离线、`SyntheticDataProvider`/`make_ohlcv_from_closes`，零网络）
+
+新增 6 个用例，落在 `pipeline/research_strategy/tests/test_blend_track_c.py`（该文件是本轮授权的测试归属文件）：
+
+| 用例 | 钉住什么 | 变异后是否转红 |
+| :--- | :--- | :---: |
+| `test_c61_density_veto_moves_with_the_configured_threshold` | 密度 `0.42`（落在旧字面量 `0.40` 与新默认 `0.45` **之间**）：默认 → 显式 `0.0`；参数改 `0.30` → 非零；改 `0.60` → 回到 `0.0`；密度 `0.46` → 非零（非一刀切） | 是（3 红） |
+| `test_c61_density_threshold_resolves_from_strategy_config` | 同一门槛经 `StrategyConfig`（而非 runtime params）生效；`resolve_param({}, ...)` 解析到 `0.45` | 是（3 红） |
+| `test_c61_density_veto_has_no_float_literal_threshold` | AST 源码守卫：`float(c_dens)` 的比较右值必须是**名字**、不得是浮点字面量；且文件内确有对 `chan_vp_min_consolidation_density` 的 `resolve_param` 解析 | 是（3 红） |
+| `test_c62_confluence_attribution_under_pinned_cdhb_config` | `chan_dual_hybrid_blend` 钉住参数下：既有共振定仓 `True`、锚点 3 `False`，**各由自己的键判定**；改一个键不影响另一个（双向）；并显式记录"字样命中"与"键名真相"**互相矛盾**（字样口径必错） | 是（3 红） |
+| `test_c62_anchor3_consumes_its_own_sizing_key` | 行为差异：既有块 ON 时，`601857.SH`（VAH 突破 + 单峰集中度 `≥0.85`）在锚点 3 OFF 时 `0.0`、ON 时 `>0`；另钉住"既有块 OFF 时锚点 3 无效果"这一**文档化前置条件**（比较两帧**完全相等**） | 是（2 红） |
+| `test_c62_anchor3_is_nested_in_legacy_block_and_keys_stay_distinct` | AST 结构守卫：锚点 3 的门必须**嵌在** `if legacy_confluence_sizing:` 内；`resolve_param` 的 "confluence" 键字面量集合**恰为两个**；两个类常量钉在这两个字面量上 | 是（2 红） |
+
+- **变异测试证据（三次，均以 `cp` 备份 + `sha256` 逐字节还原，还原后 sha256 一致）**：
+  1. 把判据还原成 `float(c_dens) < 0.40` → `test_blend_track_c.py` **3 failed / 13 passed**（三个 `c61` 用例全红）；
+  2. 把锚点 3 的解析键换回 `confluence_sizing`（复现原误接线）→ **3 failed / 13 passed**（三个 `c62` 用例全红）；
+  3. 把既有块门放宽成 `if legacy_confluence_sizing or enable_vp_confluence_sizing:`（"拆嵌套"式解耦）→ **2 failed / 14 passed**（`anchor3_consumes_its_own_sizing_key` + 结构守卫红）。
+  - 附加：把判据改成**硬编码 `0.45`**（值对但参数无关）同样 **3 failed** —— 证明本轮不是"换个字面量"。
+
+### 24.6 行为影响量化（`C6.1` 真实改变回测输出；`C6.2` 零变化）
+
+- **`C6.1` 会改变输出，必须明示**：密度否决门槛 `0.40 → 0.45` 会否掉更多新建仓。A/B 设计 = **同一份新代码**，仅用参数复刻改前有效阈值（`chan_vp_min_consolidation_density: 0.40` vs 留空走配置默认 `0.45`），故 A/B 差异**就是**本轮 fix 的净影响。
+- **fold**：合成、100% 离线。8 只虚构 A 股（`600001.SH`…`600008.SH`，`np.random.default_rng(20261029)`，日 drift `±0.0004`、日 vol `0.010–0.017`）+ `BIL` 现金腿，420 个交易日（`2022-01-03` 起）；策略 = `ChanFourStateBlendStrategy`，参数 = `strategies_config.json["chan_four_state_blend"]["parameters"]` 原样钉住；执行 = `common.allocation_backtester.run_allocation_backtest(initial_capital=1e6, china_trading=True)`。该合成 universe 的 `consolidation_density` 落在 `[0.40, 0.45)` 区间内的格子 = **123 / 3360**。
+
+| 口径 | 重平仓次数 | Sharpe | CAGR | MaxDD |
+| :--- | :---: | :---: | :---: | :---: |
+| 改前有效阈值（复刻 `0.40`） | 69 | **0.3372** | **1.8176%** | **10.0932%** |
+| 改后（配置默认 `0.45`） | 64 | **0.2332** | **1.2052%** | **10.5669%** |
+| 差值 | −5 | **−0.1040** | **−0.6124pp** | **+0.4737pp** |
+
+- 逐日 ffill 权重差分：**85 个 `(date, symbol)` 格子、41 / 420 个交易日**不同；其中 `BIL` 41 天（被否掉的建仓留在现金）、`600004.SH` 24 天、`600002.SH` 12 天、`600006.SH` 4 天、`600008.SH` 3 天、`600001.SH` 1 天，单格最大 `|Δw| = 0.20`（= 单票上限）。
+- **正确解读（不可夸大、也不可隐瞒）**：这组数字只证明"fix 确实改变了入场决策、量级可测"，**不是**对 fix 好坏的证据 —— 合成 fold 无任何经济含义，`0.3372 → 0.2332` **不得**被引用为"修复导致策略变差"。fix 的正当性来自 §24.1 的配置失真，不来自这组收益差。且方向已明：门槛收紧 ⇒ 否决量上升 ⇒ 现金腿变重。
+- **`C6.2` 零变化证据**：改前/改后分别运行同一组 `confluence_sizing × enable_vp_confluence_sizing` 四象限探针（`GenericBlendStrategy` + 固定合成 universe），两次输出**逐值一致**（含锚点 3 生效后 `601857.SH` 取得 0.2 的那一象限），故 `C6.2` 未改任何交易行为。
+
+### 24.7 残余与未闭合（如实披露）
+
+1. **`pipeline/tests/test_config_wiring.py` 未改动（授权边界）**：`C6.1` 行原本建议把 AST 源码守卫放进该文件，但本轮文件归属不含它，守卫改落在 `pipeline/research_strategy/tests/test_blend_track_c.py`。该文件的 `test_every_config_field_has_a_business_read_site` 已复跑通过（12 passed）—— 注意 `confluence_sizing_gates()` **故意**用字面量而非类常量传 `resolve_param`，否则该分析器会判定 `cdhb_confluence_sizing` / `enable_vp_confluence_sizing` / `blend_enable_vp_confluence_sizing` 三个字段为僵尸（实测会 FAIL：`3 config field(s) ... never read`）。
+2. **实盘票据未实跑核实**：`run_live_strategy.py` 生成票据的 `strategy_version` / `base_version` 本轮**未实际执行**（需真实券源/持仓），只核到"直读策略实例属性"这一静态事实。`pipeline/tests/test_repair_live_run_snapshots.py:271` 的存档 fixture 里仍是 `"base_version": "1.6.0"` —— 那是**历史归档运行**的快照夹具，按"不删历史"原则**未改**，不参与版本断言。
+3. **`chan_advanced_strategies.py:900` 的 `getattr(..., 0.40)` 回落未动**：它与 `chan_vp_hybrid_strategy.py:183` 的 `0.45` 回落仍不一致。本条只修 blend 锚点 2，`chan_advanced` 侧不在授权范围，登记为**已知不一致**（同一字段两处不同回落默认）。
+4. **`C6.2` 的嵌套未拆**：审计口径已消歧，但"锚点 3 必须依赖既有共振块"这一结构约束仍在。若将来要拆，属行为变更，需另立任务 + 升版 + walkforward 证据。
+5. **`docs/development_plan.md` 未改**：本轮不修改计划文件（SSOT 行由协调者落地，`C6.1`/`C6.2` 的 `[ ]` → `[x]` 收口文本已在交付说明中给出）。
+
+### 24.8 离线验证（本轮实跑，精确计数）
+
+| 套件 | 改前 | 改后 |
+| :--- | :--- | :--- |
+| `pytest pipeline/research_strategy/tests -q --import-mode=importlib` | 616 passed, 1 xfailed | **622 passed, 1 xfailed** |
+| `pytest common/tests -q --import-mode=importlib` | 818 passed, 1 skipped | **818 passed, 1 skipped** |
+| `pytest pipeline/tests -q --import-mode=importlib` | 519 passed | **519 passed**（首次复跑因 `confluence_sizing_gates` 用类常量传 `resolve_param` 触发 1 红，改为字面量后转绿） |
+| `pytest backtester/tests -q --import-mode=importlib` | 123 passed | **123 passed** |
+
+合计 **2082 passed, 1 xfailed, 1 skipped, 0 failed**（`622 + 818 + 519 + 123`），全程合成数据、零网络。
