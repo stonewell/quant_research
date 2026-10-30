@@ -1,0 +1,1116 @@
+{
+  "generated_by": "backtests_research/20261025_125300/l2_49_scope/lever_ceilings.py",
+  "ann_cal_mean_all": 16.62896565572823,
+  "n_rows": 5426,
+  "n_folds": 108,
+  "per_strategy_buckets": [
+    {
+      "strategy": "chan_crisis_shield_blend",
+      "bucket": "1_init_entry",
+      "n": 167,
+      "notional": 990860.7049262167,
+      "share": 0.17687594637024862,
+      "x_per_yr": 2.096101435720097,
+      "ann_x": 11.850686759478286
+    },
+    {
+      "strategy": "chan_crisis_shield_blend",
+      "bucket": "2_reentry",
+      "n": 85,
+      "notional": 659845.1610681915,
+      "share": 0.11778722956871747,
+      "x_per_yr": 1.3958595618856293,
+      "ann_x": 11.850686759478286
+    },
+    {
+      "strategy": "chan_crisis_shield_blend",
+      "bucket": "3_fresh_entry",
+      "n": 129,
+      "notional": 987544.12271474,
+      "share": 0.17628391197585475,
+      "x_per_yr": 2.0890854215612973,
+      "ann_x": 11.850686759478286
+    },
+    {
+      "strategy": "chan_crisis_shield_blend",
+      "bucket": "4_exit",
+      "n": 184,
+      "notional": 1498820.281679493,
+      "share": 0.2675504785314134,
+      "x_per_yr": 3.1706569134243003,
+      "ann_x": 11.850686759478286
+    },
+    {
+      "strategy": "chan_crisis_shield_blend",
+      "bucket": "5_trim",
+      "n": 96,
+      "notional": 657777.4649853022,
+      "share": 0.11741813056252129,
+      "x_per_yr": 1.3914854851799636,
+      "ann_x": 11.850686759478286
+    },
+    {
+      "strategy": "chan_crisis_shield_blend",
+      "bucket": "6_add",
+      "n": 113,
+      "notional": 807161.612194892,
+      "share": 0.1440843029912445,
+      "x_per_yr": 1.7074979417069989,
+      "ann_x": 11.850686759478286
+    },
+    {
+      "strategy": "chan_dual_hybrid_blend",
+      "bucket": "1_init_entry",
+      "n": 155,
+      "notional": 895767.2859344273,
+      "share": 0.12133644651899704,
+      "x_per_yr": 1.9139590386601764,
+      "ann_x": 15.773982950460951
+    },
+    {
+      "strategy": "chan_dual_hybrid_blend",
+      "bucket": "2_reentry",
+      "n": 92,
+      "notional": 729169.8648722543,
+      "share": 0.09876993913663999,
+      "x_per_yr": 1.557995335959425,
+      "ann_x": 15.773982950460951
+    },
+    {
+      "strategy": "chan_dual_hybrid_blend",
+      "bucket": "3_fresh_entry",
+      "n": 146,
+      "notional": 1159389.9181855517,
+      "share": 0.15704553516468053,
+      "x_per_yr": 2.4772335941336863,
+      "ann_x": 15.773982950460951
+    },
+    {
+      "strategy": "chan_dual_hybrid_blend",
+      "bucket": "4_exit",
+      "n": 200,
+      "notional": 1511550.5204776027,
+      "share": 0.20474756308762834,
+      "x_per_yr": 3.229684569292677,
+      "ann_x": 15.773982950460951
+    },
+    {
+      "strategy": "chan_dual_hybrid_blend",
+      "bucket": "5_trim",
+      "n": 198,
+      "notional": 1563162.9754937226,
+      "share": 0.21173874482211738,
+      "x_per_yr": 3.3399633507760815,
+      "ann_x": 15.773982950460951
+    },
+    {
+      "strategy": "chan_dual_hybrid_blend",
+      "bucket": "6_add",
+      "n": 192,
+      "notional": 1523467.425281413,
+      "share": 0.2063617712699367,
+      "x_per_yr": 3.255147061638904,
+      "ann_x": 15.773982950460951
+    },
+    {
+      "strategy": "chan_four_state_blend",
+      "bucket": "1_init_entry",
+      "n": 143,
+      "notional": 1113933.6873793597,
+      "share": 0.1605155802429828,
+      "x_per_yr": 2.3849524953343257,
+      "ann_x": 14.858074784541596
+    },
+    {
+      "strategy": "chan_four_state_blend",
+      "bucket": "2_reentry",
+      "n": 85,
+      "notional": 815372.406248728,
+      "share": 0.11749350646809135,
+      "x_per_yr": 1.745727305800923,
+      "ann_x": 14.858074784541596
+    },
+    {
+      "strategy": "chan_four_state_blend",
+      "bucket": "3_fresh_entry",
+      "n": 125,
+      "notional": 1262403.3164939436,
+      "share": 0.18190975202878656,
+      "x_per_yr": 2.702828699681128,
+      "ann_x": 14.858074784541596
+    },
+    {
+      "strategy": "chan_four_state_blend",
+      "bucket": "4_exit",
+      "n": 204,
+      "notional": 2001276.1915797573,
+      "share": 0.2883798315442199,
+      "x_per_yr": 4.284769103437528,
+      "ann_x": 14.858074784541596
+    },
+    {
+      "strategy": "chan_four_state_blend",
+      "bucket": "5_trim",
+      "n": 122,
+      "notional": 853573.4511376786,
+      "share": 0.12299819939165663,
+      "x_per_yr": 1.8275164449251928,
+      "ann_x": 14.858074784541596
+    },
+    {
+      "strategy": "chan_four_state_blend",
+      "bucket": "6_add",
+      "n": 117,
+      "notional": 893164.0923725206,
+      "share": 0.12870313032426267,
+      "x_per_yr": 1.912280735362498,
+      "ann_x": 14.858074784541596
+    },
+    {
+      "strategy": "chan_four_state_shield_blend",
+      "bucket": "1_init_entry",
+      "n": 169,
+      "notional": 958762.3287104872,
+      "share": 0.16713391197709465,
+      "x_per_yr": 2.0328040036809667,
+      "ann_x": 12.16272616151986
+    },
+    {
+      "strategy": "chan_four_state_shield_blend",
+      "bucket": "2_reentry",
+      "n": 75,
+      "notional": 603108.9730219367,
+      "share": 0.10513550542314057,
+      "x_per_yr": 1.278734362314645,
+      "ann_x": 12.16272616151986
+    },
+    {
+      "strategy": "chan_four_state_shield_blend",
+      "bucket": "3_fresh_entry",
+      "n": 124,
+      "notional": 908648.2986190707,
+      "share": 0.15839790552033128,
+      "x_per_yr": 1.9265503494020844,
+      "ann_x": 12.16272616151986
+    },
+    {
+      "strategy": "chan_four_state_shield_blend",
+      "bucket": "4_exit",
+      "n": 175,
+      "notional": 1451307.835040105,
+      "share": 0.25299570987473186,
+      "x_per_yr": 3.0771175392456893,
+      "ann_x": 12.16272616151986
+    },
+    {
+      "strategy": "chan_four_state_shield_blend",
+      "bucket": "5_trim",
+      "n": 105,
+      "notional": 760490.8807894122,
+      "share": 0.13257072386249513,
+      "x_per_yr": 1.6124214113739948,
+      "ann_x": 12.16272616151986
+    },
+    {
+      "strategy": "chan_four_state_shield_blend",
+      "bucket": "6_add",
+      "n": 139,
+      "notional": 1054173.5625101516,
+      "share": 0.18376624334220648,
+      "x_per_yr": 2.2350984955024797,
+      "ann_x": 12.16272616151986
+    },
+    {
+      "strategy": "chan_risk_managed_blend",
+      "bucket": "1_init_entry",
+      "n": 153,
+      "notional": 1125111.1751443977,
+      "share": 0.15995914579302165,
+      "x_per_yr": 2.4084273548446893,
+      "ann_x": 15.056515480278083
+    },
+    {
+      "strategy": "chan_risk_managed_blend",
+      "bucket": "2_reentry",
+      "n": 103,
+      "notional": 928300.9529925842,
+      "share": 0.13197827091219175,
+      "x_per_yr": 1.9871328790497498,
+      "ann_x": 15.056515480278083
+    },
+    {
+      "strategy": "chan_risk_managed_blend",
+      "bucket": "3_fresh_entry",
+      "n": 133,
+      "notional": 1151712.705721696,
+      "share": 0.16374113481058294,
+      "x_per_yr": 2.4653709310338425,
+      "ann_x": 15.056515480278083
+    },
+    {
+      "strategy": "chan_risk_managed_blend",
+      "bucket": "4_exit",
+      "n": 230,
+      "notional": 2226550.2296468024,
+      "share": 0.31655278222069855,
+      "x_per_yr": 4.766181865831045,
+      "ann_x": 15.056515480278083
+    },
+    {
+      "strategy": "chan_risk_managed_blend",
+      "bucket": "5_trim",
+      "n": 94,
+      "notional": 661496.1173645832,
+      "share": 0.09404613181044894,
+      "x_per_yr": 1.4160070394642974,
+      "ann_x": 15.056515480278083
+    },
+    {
+      "strategy": "chan_risk_managed_blend",
+      "bucket": "6_add",
+      "n": 126,
+      "notional": 940569.6506809478,
+      "share": 0.13372253445305612,
+      "x_per_yr": 2.013395410054459,
+      "ann_x": 15.056515480278083
+    },
+    {
+      "strategy": "generic_blend",
+      "bucket": "1_init_entry",
+      "n": 103,
+      "notional": 907725.2284297129,
+      "share": 0.0643021171607847,
+      "x_per_yr": 1.9336809082694209,
+      "ann_x": 30.071807798090603
+    },
+    {
+      "strategy": "generic_blend",
+      "bucket": "2_reentry",
+      "n": 182,
+      "notional": 2331533.877109562,
+      "share": 0.16516293679486121,
+      "x_per_yr": 4.966748090663253,
+      "ann_x": 30.071807798090603
+    },
+    {
+      "strategy": "generic_blend",
+      "bucket": "3_fresh_entry",
+      "n": 176,
+      "notional": 2048544.5051497798,
+      "share": 0.14511632447089426,
+      "x_per_yr": 4.363910217854084,
+      "ann_x": 30.071807798090603
+    },
+    {
+      "strategy": "generic_blend",
+      "bucket": "4_exit",
+      "n": 334,
+      "notional": 4579645.638371505,
+      "share": 0.3244163554899404,
+      "x_per_yr": 9.755786288850523,
+      "ann_x": 30.071807798090603
+    },
+    {
+      "strategy": "generic_blend",
+      "bucket": "5_trim",
+      "n": 205,
+      "notional": 1844313.5335245095,
+      "share": 0.13064885848669208,
+      "x_per_yr": 3.9288473614517425,
+      "ann_x": 30.071807798090603
+    },
+    {
+      "strategy": "generic_blend",
+      "bucket": "6_add",
+      "n": 247,
+      "notional": 2404805.512670045,
+      "share": 0.17035340759682738,
+      "x_per_yr": 5.122834931001581,
+      "ann_x": 30.071807798090603
+    }
+  ],
+  "drift_magnitude": {
+    "n_resize_rows": 1754,
+    "resize_notional_share_of_total": 0.29830902784824487,
+    "median_abs_drift_w": 0.006158878415370049,
+    "mean_abs_drift_w": 0.009592114753445654,
+    "p90_abs_drift_w": 0.021507648381533753,
+    "median_abs_signal_w": 0.0783926822342117,
+    "mean_abs_signal_w": 0.08542265524604296,
+    "median_abs_delta_w": 0.07676977730551665,
+    "median_abs_drift_over_signal": 0.07376093606651589,
+    "notional_share_of_resize_with_drift_gt": {
+      "0.005": 0.5675707774351884,
+      "0.01": 0.3199840212404634,
+      "0.02": 0.11840842264080947,
+      "0.03": 0.05090535949419882,
+      "0.05": 0.010786410533539324
+    },
+    "drift_component_share_of_total": 0.031917964732356065,
+    "drift_component_x_per_yr": 0.5307627393350939,
+    "signal_component_share_of_resize": 0.9032933023713628,
+    "obs_note": "|drift_w| = |T_prev - prior_weight|; a size-gated drift band can only remove turnover that BOTH exceeds the band AND is drift (not signal)."
+  },
+  "delta_w_histogram": [
+    {
+      "bucket": "1_init_entry",
+      "dwbin": "[0.0, 0.01)",
+      "n": 7,
+      "notional": 3130.6083520827437,
+      "share_of_total": 6.687756248384886e-05,
+      "x_per_yr": 0.0011121046896827415
+    },
+    {
+      "bucket": "1_init_entry",
+      "dwbin": "[0.01, 0.02)",
+      "n": 22,
+      "notional": 28095.303896264806,
+      "share_of_total": 0.0006001854050428057,
+      "x_per_yr": 0.009980462487526152
+    },
+    {
+      "bucket": "1_init_entry",
+      "dwbin": "[0.02, 0.03)",
+      "n": 28,
+      "notional": 55853.47797865512,
+      "share_of_total": 0.0011931688807297531,
+      "x_per_yr": 0.019841164339138757
+    },
+    {
+      "bucket": "1_init_entry",
+      "dwbin": "[0.03, 0.05)",
+      "n": 199,
+      "notional": 668459.8113471051,
+      "share_of_total": 0.014279960242093631,
+      "x_per_yr": 0.23746096843093958
+    },
+    {
+      "bucket": "1_init_entry",
+      "dwbin": "[0.05, 0.08)",
+      "n": 322,
+      "notional": 1816123.7585042284,
+      "share_of_total": 0.03879690989036203,
+      "x_per_yr": 0.6451524821152131
+    },
+    {
+      "bucket": "1_init_entry",
+      "dwbin": "[0.08, 0.1)",
+      "n": 107,
+      "notional": 851419.1946188598,
+      "share_of_total": 0.018188426652024116,
+      "x_per_yr": 0.30245472212824104
+    },
+    {
+      "bucket": "1_init_entry",
+      "dwbin": "[0.1, 0.15)",
+      "n": 145,
+      "notional": 1555540.6188865902,
+      "share_of_total": 0.033230207434456906,
+      "x_per_yr": 0.5525839781603088
+    },
+    {
+      "bucket": "1_init_entry",
+      "dwbin": "[0.15, 0.25)",
+      "n": 60,
+      "notional": 1013537.6369408155,
+      "share_of_total": 0.021651678849942062,
+      "x_per_yr": 0.36004502398454385
+    },
+    {
+      "bucket": "2_reentry",
+      "dwbin": "[0.03, 0.05)",
+      "n": 69,
+      "notional": 241606.21607384976,
+      "share_of_total": 0.005161308280933798,
+      "x_per_yr": 0.08582721814227383
+    },
+    {
+      "bucket": "2_reentry",
+      "dwbin": "[0.05, 0.08)",
+      "n": 181,
+      "notional": 1034020.2868568336,
+      "share_of_total": 0.022089239076433495,
+      "x_per_yr": 0.3673211979631826
+    },
+    {
+      "bucket": "2_reentry",
+      "dwbin": "[0.08, 0.1)",
+      "n": 97,
+      "notional": 791194.1050493548,
+      "share_of_total": 0.016901869300287545,
+      "x_per_yr": 0.2810606041120889
+    },
+    {
+      "bucket": "2_reentry",
+      "dwbin": "[0.1, 0.15)",
+      "n": 113,
+      "notional": 1285418.8288678154,
+      "share_of_total": 0.02745973573741077,
+      "x_per_yr": 0.4566270024927768
+    },
+    {
+      "bucket": "2_reentry",
+      "dwbin": "[0.15, 0.25)",
+      "n": 162,
+      "notional": 2715091.798465403,
+      "share_of_total": 0.05800109786344054,
+      "x_per_yr": 0.9644982643656848
+    },
+    {
+      "bucket": "3_fresh_entry",
+      "dwbin": "[0.01, 0.02)",
+      "n": 2,
+      "notional": 4040.279673121343,
+      "share_of_total": 8.6310399099151e-05,
+      "x_per_yr": 0.0014352526623519787
+    },
+    {
+      "bucket": "3_fresh_entry",
+      "dwbin": "[0.02, 0.03)",
+      "n": 4,
+      "notional": 10608.42048256295,
+      "share_of_total": 0.00022662218453660925,
+      "x_per_yr": 0.0037684925234853805
+    },
+    {
+      "bucket": "3_fresh_entry",
+      "dwbin": "[0.03, 0.05)",
+      "n": 116,
+      "notional": 404094.9479107825,
+      "share_of_total": 0.00863247078170343,
+      "x_per_yr": 0.14354906015302374
+    },
+    {
+      "bucket": "3_fresh_entry",
+      "dwbin": "[0.05, 0.08)",
+      "n": 241,
+      "notional": 1413237.9141961962,
+      "share_of_total": 0.030190268561802614,
+      "x_per_yr": 0.5020329390514273
+    },
+    {
+      "bucket": "3_fresh_entry",
+      "dwbin": "[0.08, 0.1)",
+      "n": 137,
+      "notional": 1100684.810232337,
+      "share_of_total": 0.02351335871264898,
+      "x_per_yr": 0.391002834483458
+    },
+    {
+      "bucket": "3_fresh_entry",
+      "dwbin": "[0.1, 0.15)",
+      "n": 185,
+      "notional": 2054920.6095252514,
+      "share_of_total": 0.04389820316279584,
+      "x_per_yr": 0.7299817127423124
+    },
+    {
+      "bucket": "3_fresh_entry",
+      "dwbin": "[0.15, 0.25)",
+      "n": 148,
+      "notional": 2530655.88486453,
+      "share_of_total": 0.05406108910191594,
+      "x_per_yr": 0.8989799939870239
+    },
+    {
+      "bucket": "4_exit",
+      "dwbin": "[0.0, 0.01)",
+      "n": 1,
+      "notional": 585.68116678843,
+      "share_of_total": 1.2511602992896979e-05,
+      "x_per_yr": 0.00020805501646699038
+    },
+    {
+      "bucket": "4_exit",
+      "dwbin": "[0.01, 0.02)",
+      "n": 3,
+      "notional": 5193.2518611329415,
+      "share_of_total": 0.00011094074594358683,
+      "x_per_yr": 0.0018448298541167763
+    },
+    {
+      "bucket": "4_exit",
+      "dwbin": "[0.02, 0.03)",
+      "n": 24,
+      "notional": 64324.89156593341,
+      "share_of_total": 0.0013741392953562953,
+      "x_per_yr": 0.022850515148666425
+    },
+    {
+      "bucket": "4_exit",
+      "dwbin": "[0.03, 0.05)",
+      "n": 155,
+      "notional": 649686.4362443227,
+      "share_of_total": 0.013878914366893756,
+      "x_per_yr": 0.23079199034586936
+    },
+    {
+      "bucket": "4_exit",
+      "dwbin": "[0.05, 0.08)",
+      "n": 403,
+      "notional": 2651829.623474413,
+      "share_of_total": 0.05664966083107928,
+      "x_per_yr": 0.9420252643686701
+    },
+    {
+      "bucket": "4_exit",
+      "dwbin": "[0.08, 0.1)",
+      "n": 198,
+      "notional": 1812473.035107825,
+      "share_of_total": 0.03871892137995261,
+      "x_per_yr": 0.6438556138540734
+    },
+    {
+      "bucket": "4_exit",
+      "dwbin": "[0.1, 0.15)",
+      "n": 297,
+      "notional": 3684515.5802511475,
+      "share_of_total": 0.07871039530608394,
+      "x_per_yr": 1.3088724602936623
+    },
+    {
+      "bucket": "4_exit",
+      "dwbin": "[0.15, 0.25)",
+      "n": 246,
+      "notional": 4400542.197123703,
+      "share_of_total": 0.09400650054330895,
+      "x_per_yr": 1.5632308689498817
+    },
+    {
+      "bucket": "5_trim",
+      "dwbin": "[0.05, 0.08)",
+      "n": 477,
+      "notional": 2715326.979589189,
+      "share_of_total": 0.05800612191580742,
+      "x_per_yr": 0.9645818091599462
+    },
+    {
+      "bucket": "5_trim",
+      "dwbin": "[0.08, 0.1)",
+      "n": 146,
+      "notional": 1222020.2232783479,
+      "share_of_total": 0.026105384208936204,
+      "x_per_yr": 0.4341055374399902
+    },
+    {
+      "bucket": "5_trim",
+      "dwbin": "[0.1, 0.15)",
+      "n": 158,
+      "notional": 1765788.5520205088,
+      "share_of_total": 0.03772162498143599,
+      "x_per_yr": 0.6272716062945591
+    },
+    {
+      "bucket": "5_trim",
+      "dwbin": "[0.15, 0.25)",
+      "n": 39,
+      "notional": 637678.6684071625,
+      "share_of_total": 0.01362239865061549,
+      "x_per_yr": 0.22652639930972357
+    },
+    {
+      "bucket": "6_add",
+      "dwbin": "[0.05, 0.08)",
+      "n": 463,
+      "notional": 2658172.6296011014,
+      "share_of_total": 0.0567851631810589,
+      "x_per_yr": 0.9442785282927516
+    },
+    {
+      "bucket": "6_add",
+      "dwbin": "[0.08, 0.1)",
+      "n": 200,
+      "notional": 1622702.8054246998,
+      "share_of_total": 0.03466495839069393,
+      "x_per_yr": 0.5764424025360975
+    },
+    {
+      "bucket": "6_add",
+      "dwbin": "[0.1, 0.15)",
+      "n": 211,
+      "notional": 2376067.8194959546,
+      "share_of_total": 0.050758704441098756,
+      "x_per_yr": 0.8440647528802911
+    },
+    {
+      "bucket": "6_add",
+      "dwbin": "[0.15, 0.25)",
+      "n": 60,
+      "notional": 966398.6011882143,
+      "share_of_total": 0.020644672078598197,
+      "x_per_yr": 0.34329954296878096
+    }
+  ],
+  "band_widening_reach": [
+    {
+      "th": 0.05,
+      "n": 630,
+      "share_of_total": 0.045623409747809554,
+      "x_per_yr": 0.7586701137935417,
+      "share_of_total_sells": 0.03670533101054575,
+      "share_of_total_buys": 0.05205268521497156
+    },
+    {
+      "th": 0.06,
+      "n": 1453,
+      "share_of_total": 0.13358086046990367,
+      "x_per_yr": 2.221311541016653,
+      "share_of_total_sells": 0.13402634618583928,
+      "share_of_total_buys": 0.1332596982029158
+    },
+    {
+      "th": 0.08,
+      "n": 2717,
+      "share_of_total": 0.3081407732043533,
+      "x_per_yr": 5.124062334744733,
+      "share_of_total_sells": 0.3104006981463563,
+      "share_of_total_buys": 0.306511534394593
+    },
+    {
+      "th": 0.1,
+      "n": 3602,
+      "share_of_total": 0.4662336918488967,
+      "x_per_yr": 7.752984049298682,
+      "share_of_total_sells": 0.4651431079264392,
+      "share_of_total_buys": 0.46701992223148325
+    },
+    {
+      "th": 0.15,
+      "n": 4711,
+      "share_of_total": 0.7380125629121789,
+      "x_per_yr": 12.272385562162592,
+      "share_of_total_sells": 0.7430785401872444,
+      "share_of_total_buys": 0.7343603678182195
+    }
+  ],
+  "asymmetric_sell_wiring": {
+    "note": "blend_base.py:609 -> asymmetric_sells defaults to True ONLY for the 'cdhb' prefix; sell band = thresh_t * asymmetric_sell_ratio (0.60). For the other five strategies the lever is not connected at all.",
+    "per_strategy_trim_share": {
+      "chan_crisis_shield_blend": {
+        "trim_share_of_strategy": 0.11741813056252129,
+        "trim_x_per_yr": 1.3914854851799636,
+        "trim_share_absdw_lt_0.03": 0.0,
+        "trim_share_absdw_lt_0.05": 0.0,
+        "trim_share_absdw_lt_0.08": 0.06551851607715128,
+        "trim_share_absdw_lt_0.1": 0.09506113061946199
+      },
+      "chan_dual_hybrid_blend": {
+        "trim_share_of_strategy": 0.21173874482211738,
+        "trim_x_per_yr": 3.3399633507760815,
+        "trim_share_absdw_lt_0.03": 0.0,
+        "trim_share_absdw_lt_0.05": 0.0,
+        "trim_share_absdw_lt_0.08": 0.09541972668946369,
+        "trim_share_absdw_lt_0.1": 0.13133227645805726
+      },
+      "chan_four_state_blend": {
+        "trim_share_of_strategy": 0.12299819939165663,
+        "trim_x_per_yr": 1.8275164449251928,
+        "trim_share_absdw_lt_0.03": 0.0,
+        "trim_share_absdw_lt_0.05": 0.0,
+        "trim_share_absdw_lt_0.08": 0.06940264567143631,
+        "trim_share_absdw_lt_0.1": 0.08945094605091933
+      },
+      "chan_four_state_shield_blend": {
+        "trim_share_of_strategy": 0.13257072386249513,
+        "trim_x_per_yr": 1.6124214113739948,
+        "trim_share_absdw_lt_0.03": 0.0,
+        "trim_share_absdw_lt_0.05": 0.0,
+        "trim_share_absdw_lt_0.08": 0.06118411510190969,
+        "trim_share_absdw_lt_0.1": 0.08900985475526588
+      },
+      "chan_risk_managed_blend": {
+        "trim_share_of_strategy": 0.09404613181044894,
+        "trim_x_per_yr": 1.4160070394642974,
+        "trim_share_absdw_lt_0.03": 0.0,
+        "trim_share_absdw_lt_0.05": 0.0,
+        "trim_share_absdw_lt_0.08": 0.05119596966503408,
+        "trim_share_absdw_lt_0.1": 0.07224287153579807
+      },
+      "generic_blend": {
+        "trim_share_of_strategy": 0.13064885848669208,
+        "trim_x_per_yr": 3.9288473614517425,
+        "trim_share_absdw_lt_0.03": 0.0,
+        "trim_share_absdw_lt_0.05": 0.0,
+        "trim_share_absdw_lt_0.08": 0.03195806713094768,
+        "trim_share_absdw_lt_0.1": 0.056369616089915635
+      }
+    }
+  },
+  "portfolio_level_band": {
+    "n_rebalance_dates": 2877,
+    "median_abs_net_signal_w": 0.096689400821968,
+    "p90_abs_net_signal_w": 0.28413999178941945,
+    "median_gross_signal_w": 0.1261922312471673,
+    "median_net_over_gross": 1.0,
+    "share_of_notional_on_dates_with_abs_net_lt": {
+      "0.01": 0.0253847074090664,
+      "0.02": 0.046604493229240665,
+      "0.05": 0.12356776660229127,
+      "0.1": 0.3229214694254105
+    },
+    "obs_note": "A ~fully-invested book has sum(target) pinned at the exposure target, so the NET book-level weight change is small by construction while the GROSS per-asset change is 10-50x larger. A portfolio-level band therefore either never triggers or suppresses every rebalance date wholesale -- it cannot separate churn from repositioning."
+  },
+  "coarse_grain_ceiling": {
+    "method": "merge k consecutive rebalance events per (fold,symbol); retained notional = |sum of the merged signal_w| / sum|signal_w|. FIRST-ORDER estimate: it assumes the skipped trade is re-placed exactly at the next event and that the held weight at the merged event equals the realized one. It is an upper bound on the saving (real coarse-graining also changes holdings).",
+    "estimates": [
+      {
+        "merge_k": 2,
+        "retained_share_of_signal": 0.43518295599265305,
+        "x_per_yr_after": 7.236642429160117
+      },
+      {
+        "merge_k": 3,
+        "retained_share_of_signal": 0.336357281310143,
+        "x_per_yr_after": 5.593273678960486
+      }
+    ]
+  },
+  "ablation_turnover": [
+    {
+      "arm": "no_thrust",
+      "ann_x": 10.04273904115701,
+      "n_folds": 54,
+      "n_rebal": 21.22222222222222
+    },
+    {
+      "arm": "no_orthogon",
+      "ann_x": 14.078286830273605,
+      "n_folds": 54,
+      "n_rebal": 24.814814814814813
+    },
+    {
+      "arm": "no_cyq",
+      "ann_x": 14.177787905413687,
+      "n_folds": 54,
+      "n_rebal": 26.185185185185187
+    },
+    {
+      "arm": "no_sectorthrot",
+      "ann_x": 15.002685283090933,
+      "n_folds": 54,
+      "n_rebal": 25.814814814814813
+    },
+    {
+      "arm": "no_atrstop",
+      "ann_x": 15.09927505398582,
+      "n_folds": 54,
+      "n_rebal": 26.48148148148148
+    },
+    {
+      "arm": "no_structregime",
+      "ann_x": 15.179859213907367,
+      "n_folds": 54,
+      "n_rebal": 26.203703703703702
+    },
+    {
+      "arm": "no_lowbeta",
+      "ann_x": 15.233050438366238,
+      "n_folds": 54,
+      "n_rebal": 26.09259259259259
+    },
+    {
+      "arm": "no_circuit",
+      "ann_x": 15.234293490215196,
+      "n_folds": 54,
+      "n_rebal": 26.11111111111111
+    },
+    {
+      "arm": "baseline",
+      "ann_x": 15.234573831123154,
+      "n_folds": 54,
+      "n_rebal": 26.09259259259259
+    },
+    {
+      "arm": "no_hysteresis",
+      "ann_x": 15.33901657407177,
+      "n_folds": 54,
+      "n_rebal": 26.38888888888889
+    },
+    {
+      "arm": "no_voltarget",
+      "ann_x": 15.75888244254693,
+      "n_folds": 54,
+      "n_rebal": 26.22222222222222
+    },
+    {
+      "arm": "bull_full",
+      "ann_x": 19.004378974982707,
+      "n_folds": 54,
+      "n_rebal": 29.074074074074073
+    },
+    {
+      "arm": "no_inertia",
+      "ann_x": 24.442608161811535,
+      "n_folds": 54,
+      "n_rebal": 47.2962962962963
+    }
+  ],
+  "fills_per_date": {
+    "n_dates": 2877,
+    "share_dates_with_1_fill": 0.5526590198123045,
+    "share_dates_with_le_2_fills": 0.8227320125130344,
+    "mean_fills": 1.8859923531456377,
+    "median_fills": 1.0,
+    "p90_fills": 3.0,
+    "obs_note": "the book does NOT rebalance as one block: the median rebalance date carries a single fill, so there is no 'all names nudge together' event for a portfolio-level band to suppress."
+  },
+  "zero_fill_instructions": {
+    "note": "`total_rebalances` = is_rebalance.sum() (allocation_backtester.py:2554) = the number of INSTRUCTIONS (rows of the sparse weight frame); a fill only happens when at least one |delta_w| clears min_shares/lot size. An instruction with no fill trades nothing, so it contributes 0 to turnover and 0 to friction. Reported separately because L2.49 item 6 requires it; it must never be added to or subtracted from a friction number.",
+    "by_strategy": [
+      {
+        "strategy": "chan_crisis_shield_blend",
+        "batch": "1",
+        "instructions": 409,
+        "fill_dates": 351,
+        "zero_fill": 58
+      },
+      {
+        "strategy": "chan_dual_hybrid_blend",
+        "batch": "1",
+        "instructions": 519,
+        "fill_dates": 418,
+        "zero_fill": 101
+      },
+      {
+        "strategy": "chan_four_state_blend",
+        "batch": "1",
+        "instructions": 434,
+        "fill_dates": 365,
+        "zero_fill": 69
+      },
+      {
+        "strategy": "chan_four_state_shield_blend",
+        "batch": "1",
+        "instructions": 426,
+        "fill_dates": 352,
+        "zero_fill": 74
+      },
+      {
+        "strategy": "chan_risk_managed_blend",
+        "batch": "1",
+        "instructions": 452,
+        "fill_dates": 386,
+        "zero_fill": 66
+      },
+      {
+        "strategy": "generic_blend",
+        "batch": "1",
+        "instructions": 565,
+        "fill_dates": 520,
+        "zero_fill": 45
+      },
+      {
+        "strategy": "chan_crisis_shield_blend",
+        "batch": "2",
+        "instructions": 90,
+        "fill_dates": 77,
+        "zero_fill": 13
+      },
+      {
+        "strategy": "chan_dual_hybrid_blend",
+        "batch": "2",
+        "instructions": 109,
+        "fill_dates": 81,
+        "zero_fill": 28
+      },
+      {
+        "strategy": "chan_four_state_blend",
+        "batch": "2",
+        "instructions": 97,
+        "fill_dates": 79,
+        "zero_fill": 18
+      },
+      {
+        "strategy": "chan_four_state_shield_blend",
+        "batch": "2",
+        "instructions": 92,
+        "fill_dates": 71,
+        "zero_fill": 21
+      },
+      {
+        "strategy": "chan_risk_managed_blend",
+        "batch": "2",
+        "instructions": 101,
+        "fill_dates": 84,
+        "zero_fill": 17
+      },
+      {
+        "strategy": "generic_blend",
+        "batch": "2",
+        "instructions": 104,
+        "fill_dates": 93,
+        "zero_fill": 11
+      }
+    ],
+    "total_instructions": 3398,
+    "total_fill_dates": 2877,
+    "total_zero_fill": 521,
+    "zero_fill_share": 0.15332548557975278
+  },
+  "churn_reversal": {
+    "method": "total-variation excess per (fold,symbol) target-weight path: reversal = sum|s_k| - |sum s_k|; share = reversal / sum|s_k|.",
+    "all_events": {
+      "gross_w": 505.53069350723405,
+      "net_w": 82.14817809431521,
+      "reversal_share": 0.8375011069567437,
+      "reversal_x_per_yr": 13.926777144218066
+    },
+    "resize_only": {
+      "gross_w": 149.83133730155942,
+      "net_w": 52.399561161975704,
+      "reversal_share": 0.6502763566975763,
+      "reversal_x_per_yr": 10.813423202256077
+    },
+    "obs_note": "`resize_only` is the ceiling for a cost-aware / smoothed target layer that leaves entries and exits untouched: it is the part of held-name re-estimation that cancels itself out. `all_events` additionally contains the stop-out -> re-entry round trips, which belong to L2.52 and are closed."
+  },
+  "cross_check_scope": {
+    "01_r1_longwin": {
+      "total_ann_x": 15.38871383999915,
+      "shares": {
+        "1_init_entry": 0.018518824695668956,
+        "2_reentry": 0.2593761082389138,
+        "3_fresh_entry": 0.049898679201969796,
+        "4_exit": 0.31889878454791626,
+        "5_trim": 0.16916370450481025,
+        "6_add": 0.18414389881072094
+      },
+      "x_per_yr": {
+        "1_init_entry": 0.28498089389475895,
+        "2_reentry": 3.991464706621291,
+        "3_fresh_entry": 0.7678764952330304,
+        "4_exit": 4.907442139331426,
+        "5_trim": 2.6032118407387,
+        "6_add": 2.8337377641799444
+      },
+      "n_rows": 8456,
+      "median_fold_cal_days": 756.5
+    },
+    "03_r2b_oos": {
+      "total_ann_x": 14.934242555915201,
+      "shares": {
+        "1_init_entry": 0.15508196474860164,
+        "2_reentry": 0.1132212335665293,
+        "3_fresh_entry": 0.17091277615015132,
+        "4_exit": 0.2591008726084296,
+        "5_trim": 0.14099810380135053,
+        "6_add": 0.16068504912493767
+      },
+      "x_per_yr": {
+        "1_init_entry": 2.3160316776035077,
+        "2_reentry": 1.6908733645624765,
+        "3_fresh_entry": 2.5524528549311984,
+        "4_exit": 3.869475277983573,
+        "5_trim": 2.105699882093478,
+        "6_add": 2.3997094987409686
+      },
+      "n_rows": 1713,
+      "median_fold_cal_days": 94.0
+    },
+    "07_r3_oos_bear": {
+      "total_ann_x": 18.991437904996122,
+      "shares": {
+        "1_init_entry": 0.12722049285733608,
+        "2_reentry": 0.1338459348485639,
+        "3_fresh_entry": 0.1371398110601241,
+        "4_exit": 0.28396592108138274,
+        "5_trim": 0.14174739323840668,
+        "6_add": 0.17608044691418642
+      },
+      "x_per_yr": {
+        "1_init_entry": 2.4161000903431007,
+        "2_reentry": 2.541926760512658,
+        "3_fresh_entry": 2.604482206051247,
+        "4_exit": 5.392921157352109,
+        "5_trim": 2.6919868168822676,
+        "6_add": 3.3440208738547375
+      },
+      "n_rows": 1853,
+      "median_fold_cal_days": 93.5
+    },
+    "08_ablate_wf/baseline": {
+      "total_ann_x": 15.23457383112315,
+      "shares": {
+        "1_init_entry": 0.1644432520161877,
+        "2_reentry": 0.11179790222810576,
+        "3_fresh_entry": 0.17131452047917714,
+        "4_exit": 0.26861238257738124,
+        "5_trim": 0.13299637228346922,
+        "6_add": 0.15083557041567894
+      },
+      "x_per_yr": {
+        "1_init_entry": 2.5052228638706024,
+        "2_reentry": 1.7031933956587646,
+        "3_fresh_entry": 2.609903710583483,
+        "4_exit": 4.092195174329012,
+        "5_trim": 2.0261430528240525,
+        "6_add": 2.2979156338572357
+      },
+      "n_rows": 2619,
+      "median_fold_cal_days": 94.0
+    }
+  },
+  "param_grid_turnover": {
+    "note": "MEASURED annualized two-sided turnover (trade_value / per-row portfolio_equity, per-fold calendar-day annualization) of the arms `09_param_grid` already ran. The inertia_* arms ARE the per-asset band lever; their reach is a measurement, not an estimate. Baseline for the relative column = 08_ablate_wf/baseline (same 18 x 63-bar geometry).",
+    "baseline_by_strategy": {
+      "chan_dual_hybrid_blend": 15.76797153469336,
+      "chan_four_state_blend": 14.833119570862372,
+      "chan_risk_managed_blend": 15.102630387813726
+    },
+    "rows": [
+      {
+        "grid": "atr",
+        "arm": "atr_6_0",
+        "x_chan_dual_hybrid_blend": 14.613780974815777,
+        "x_chan_four_state_blend": 14.510397051725867,
+        "x_chan_risk_managed_blend": 14.969733486910624,
+        "mean_x": 14.69797050448409,
+        "mean_rel_vs_baseline": -0.03458496384197329
+      },
+      {
+        "grid": "atr",
+        "arm": "atr_8_0",
+        "x_chan_dual_hybrid_blend": 14.68126248352726,
+        "x_chan_four_state_blend": 14.491089120788969,
+        "x_chan_risk_managed_blend": 14.511209584287595,
+        "mean_x": 14.561187062867939,
+        "mean_rel_vs_baseline": -0.04371248141385401
+      },
+      {
+        "grid": "atr",
+        "arm": "atr_none",
+        "x_chan_dual_hybrid_blend": 12.947110642553547,
+        "x_chan_four_state_blend": 13.89339072761258,
+        "x_chan_risk_managed_blend": 14.02192891125903,
+        "mean_x": 13.620810093808386,
+        "mean_rel_vs_baseline": -0.10460291184644022
+      },
+      {
+        "grid": "inertia",
+        "arm": "inertia_008_4",
+        "x_chan_dual_hybrid_blend": 10.47555911031072,
+        "x_chan_four_state_blend": 10.626838345627522,
+        "x_chan_risk_managed_blend": 10.11427226074353,
+        "mean_x": 10.405556572227256,
+        "mean_rel_vs_baseline": -0.31650470439849454
+      },
+      {
+        "grid": "inertia",
+        "arm": "inertia_010_5",
+        "x_chan_dual_hybrid_blend": 8.90444175694015,
+        "x_chan_four_state_blend": 7.609254840346501,
+        "x_chan_risk_managed_blend": 8.888985768728183,
+        "mean_x": 8.46756078867161,
+        "mean_rel_vs_baseline": -0.4445733658512334
+      },
+      {
+        "grid": "inertia",
+        "arm": "inertia_015_10",
+        "x_chan_dual_hybrid_blend": 7.152352099370556,
+        "x_chan_four_state_blend": 7.044764554669261,
+        "x_chan_risk_managed_blend": 6.934033322616584,
+        "mean_x": 7.043716658885468,
+        "mean_rel_vs_baseline": -0.537445889687373
+      }
+    ]
+  }
+}

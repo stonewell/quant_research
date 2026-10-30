@@ -1,0 +1,4 @@
+# 单个 > 500 KB 的派生产物：不入库，但已由 `../README.md` §3 记录 sha256 + 字节数，
+# 且可由 `_provenance/decompose_turnover.py` 一条命令再生（裁定书 §14 第 1 步）。
+# 保留本文件是为了让 `git status` 干净，并明确"排除是有意的、不是漏提交"。
+b17_rows_classified.csv

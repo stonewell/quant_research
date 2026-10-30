@@ -1,0 +1,36 @@
+{
+  "n_folds": 108,
+  "n_folds_per_strategy": {
+    "chan_crisis_shield_blend": 18,
+    "chan_dual_hybrid_blend": 18,
+    "chan_four_state_blend": 18,
+    "chan_four_state_shield_blend": 18,
+    "chan_risk_managed_blend": 18,
+    "generic_blend": 18
+  },
+  "friction_bp_yr_mean_over_folds": 201.15349087511441,
+  "friction_bp_yr_median": 180.64547884534926,
+  "friction_bp_yr_by_strategy": {
+    "chan_crisis_shield_blend": 141.26200370710887,
+    "chan_dual_hybrid_blend": 190.64271154607673,
+    "chan_four_state_blend": 179.18885576284617,
+    "chan_four_state_shield_blend": 145.20901974807254,
+    "chan_risk_managed_blend": 181.45260401718235,
+    "generic_blend": 369.16575046939994
+  },
+  "cost_rate_bp_by_strategy": {
+    "chan_crisis_shield_blend": 11.84324829704543,
+    "chan_dual_hybrid_blend": 12.037560435560946,
+    "chan_four_state_blend": 12.013745198803194,
+    "chan_four_state_shield_blend": 11.8453160793754,
+    "chan_risk_managed_blend": 12.00471163281775,
+    "generic_blend": 12.271850000766769
+  },
+  "cost_rate_bp_all": 12.094587569142032,
+  "engine_turnover_ann_mean_over_folds": 16.62896565572823,
+  "rows_turnover_ann_mean_over_folds": 16.631514284171597,
+  "rows_over_engine_ratio": 1.000202605353418,
+  "conv_one_sided_x_cost_rate": 100.56024065373022,
+  "conv_two_sided_x_cost_rate": 201.12048130746044,
+  "measured_equals_two_sided": true
+}
