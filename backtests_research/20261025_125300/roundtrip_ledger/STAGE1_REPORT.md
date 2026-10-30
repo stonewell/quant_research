@@ -423,3 +423,9 @@ pipeline/.venv/bin/python -m pytest backtester/tests/test_roundtrip_ledger.py -q
 * **`L2.51`**：评级口径的双边年化换手上限 **10.0×/年** 与本轮无直接关系；本轮**未测任何换手**，
   也不对 `TURNOVER_CEILING_ANN` 提出任何修改。
 * **§4.18 第 3 项（用户裁决）**：冷却延长轴**已禁**；本轮**不提案**，只把它记为不可用项以固定边界。
+
+---
+
+**复现**：本报告所用脚本、`out/` 与 `out_all/` 的摘要与切片、数据库 sha256、未入库逐行台账的
+指纹与重生成命令，均见同目录 [`_provenance/README.md`](file:///home/stone/Work/github/quant/backtests_research/20261025_125300/roundtrip_ledger/_provenance/README.md)。
+

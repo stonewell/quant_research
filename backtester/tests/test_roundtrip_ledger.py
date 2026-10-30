@@ -5,11 +5,18 @@
 ④「阶段二落地后 `test_blend_strategy_versioning.py` 的 `version` 断言同步」**不在本文件**：
 阶段二受用户裁决门控，本轮**零代码改动**，故没有可同步的版本断言。
 
-被测算的实现是 `backtests_research/20261025_125300/roundtrip_ledger/roundtrip_ledger.py`
+被测算的实现是 `backtests_research/20261025_125300/roundtrip_ledger/_provenance/roundtrip_ledger.py`
 里的纯 pandas 函数（`pair_round_trips` / `summarise` / `grade`）。该目录名以数字开头、
 且不是 Python 包，故按**文件路径**加载，不走 `import`——与仓库里
 `backtester/tests/test_run_backtest.py` 的 `sys.path` 注入约定分开处理，避免给
 `backtests_research/` 引入包语义。
+
+**归档与守卫（2026-10-29）**：`/backtests_research/**` 被 `.gitignore` 整体忽略，本脚本原先
+不在版本库里 ⇒ 新 clone 上此文件只能 self-skip、取证不可复核。现脚本已移入白名单目录
+`_provenance/`（`.gitignore:23` `!/backtests_research/**/_provenance/**`）并入库，故本文件
+在**全新 clone 上必须运行而不是跳过**。`pytest.skip` 守卫降级为**防御性兜底**，且只在环境
+显式设置 `L252_ALLOW_LEDGER_SKIP=1` 时才会生效（默认下缺文件是**收集期报错**，不是静默跳过）；
+另有 `test_committed_ledger_script_exists` 直接断言脚本已入库，双重保证守卫盖不住「文件丢了」。
 """
 
 import importlib.util
@@ -21,13 +28,26 @@ import pytest
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _MODULE_PATH = os.path.join(
-    _PROJECT_ROOT, "backtests_research", "20261025_125300", "roundtrip_ledger", "roundtrip_ledger.py"
+    _PROJECT_ROOT,
+    "backtests_research",
+    "20261025_125300",
+    "roundtrip_ledger",
+    "_provenance",
+    "roundtrip_ledger.py",
 )
 
 
 def _load_ledger():
-    if not os.path.exists(_MODULE_PATH):
-        pytest.skip(f"ledger module missing: {_MODULE_PATH}")
+    if not os.path.isfile(_MODULE_PATH):
+        # 防御性兜底：只有在环境显式声明「本 checkout 不带 backtests_research/ 归档」时才允许跳过。
+        # 默认必须**报错**——否则 `_provenance/` 里那份已入库的脚本一旦丢失，整份取证会被
+        # 一个静默 skip 掩盖（这正是本次把脚本移进 `_provenance/` 要修的病因）。
+        if os.environ.get("L252_ALLOW_LEDGER_SKIP") == "1":
+            pytest.skip(
+                f"ledger module missing (L252_ALLOW_LEDGER_SKIP=1): {_MODULE_PATH}",
+                allow_module_level=True,
+            )
+        raise FileNotFoundError(f"committed ledger script missing: {_MODULE_PATH}")
     spec = importlib.util.spec_from_file_location("l252_roundtrip_ledger", _MODULE_PATH)
     mod = importlib.util.module_from_spec(spec)
     sys.modules.setdefault("l252_roundtrip_ledger", mod)
@@ -36,6 +56,14 @@ def _load_ledger():
 
 
 RL = _load_ledger()
+
+
+def test_committed_ledger_script_exists():
+    """取证脚本本身**必须入库**（`_provenance/`）——这一条与 `_load_ledger` 的 skip 守卫互补：
+    守卫只保护「环境不支持」，这一条钉住「文件存在」，缺任一都不允许静默通过。"""
+    assert os.path.isfile(_MODULE_PATH), f"committed ledger script missing: {_MODULE_PATH}"
+    # 同时钉住被加载的确实是这份入库文件，而不是别处的同名副本
+    assert os.path.samefile(RL.__file__, _MODULE_PATH)
 
 
 def _row(fold, rid, date, symbol, price, prior_w, target_w, value=1000.0, cost=10.0):

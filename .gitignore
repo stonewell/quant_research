@@ -21,3 +21,8 @@ uv.lock
 !/backtests_research/*/universe_*.txt
 !/backtests_research/*/pruned_universe.txt
 !/backtests_research/**/_provenance/**
+# re-assert: never version bytecode, even under whitelisted _provenance/
+# (line 23 above re-includes `_provenance/**`, and git keeps the LAST matching
+#  pattern -- without this block a `_provenance/**/__pycache__/*.pyc` is trackable)
+__pycache__/
+*.pyc

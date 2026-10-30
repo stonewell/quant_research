@@ -1,0 +1,1773 @@
+{
+  "provenance": {
+    "scope": "all",
+    "n_csv": 75,
+    "runs": [
+      "01_r1_longwin",
+      "03_r2b_oos",
+      "07_r3_oos_bear",
+      "08_ablate_wf/baseline",
+      "08_ablate_wf/bull_full",
+      "08_ablate_wf/no_atrstop",
+      "08_ablate_wf/no_circuit",
+      "08_ablate_wf/no_cyq",
+      "08_ablate_wf/no_hysteresis",
+      "08_ablate_wf/no_inertia",
+      "08_ablate_wf/no_lowbeta",
+      "08_ablate_wf/no_orthogon",
+      "08_ablate_wf/no_sectorthrot",
+      "08_ablate_wf/no_structregime",
+      "08_ablate_wf/no_thrust",
+      "08_ablate_wf/no_voltarget",
+      "09_param_grid/atr/atr_6_0",
+      "09_param_grid/atr/atr_8_0",
+      "09_param_grid/atr/atr_none",
+      "09_param_grid/inertia/inertia_008_4",
+      "09_param_grid/inertia/inertia_010_5",
+      "09_param_grid/inertia/inertia_015_10"
+    ],
+    "strategies": [
+      "chan_crisis_shield_blend",
+      "chan_dual_hybrid_blend",
+      "chan_four_state_blend",
+      "chan_four_state_shield_blend",
+      "chan_risk_managed_blend",
+      "generic_blend"
+    ],
+    "n_rows": 63955,
+    "folds": 1122,
+    "db": {
+      "path": "data/cache.duckdb",
+      "mode": "raw_factor",
+      "sha256": "97dfcda13e5a4a5af282d92bf424c4550d153d66b5f80830569b8b4f2b0edf74",
+      "size_bytes": 7876608,
+      "n_symbols": 20,
+      "n_rows": 21365,
+      "coverage": {
+        "000157.SZ": [
+          "2024-01-02",
+          "2026-10-27",
+          680
+        ],
+        "000938.SZ": [
+          "2024-01-02",
+          "2026-10-27",
+          680
+        ],
+        "000999.SZ": [
+          "2024-01-02",
+          "2026-10-27",
+          680
+        ],
+        "300394.SZ": [
+          "2024-01-02",
+          "2026-10-27",
+          680
+        ],
+        "600028.SH": [
+          "2024-01-02",
+          "2026-10-27",
+          680
+        ],
+        "600362.SH": [
+          "2024-01-02",
+          "2026-10-27",
+          680
+        ],
+        "600584.SH": [
+          "2024-01-02",
+          "2026-10-27",
+          675
+        ],
+        "600660.SH": [
+          "2024-01-02",
+          "2026-10-27",
+          680
+        ],
+        "600900.SH": [
+          "2024-01-02",
+          "2026-10-27",
+          680
+        ],
+        "600941.SH": [
+          "2024-01-02",
+          "2026-10-27",
+          680
+        ],
+        "601088.SH": [
+          "2024-01-02",
+          "2026-10-27",
+          670
+        ],
+        "601225.SH": [
+          "2016-01-04",
+          "2026-10-27",
+          2625
+        ],
+        "601288.SH": [
+          "2016-01-04",
+          "2026-10-27",
+          2625
+        ],
+        "601398.SH": [
+          "2024-01-02",
+          "2026-10-27",
+          680
+        ],
+        "601728.SH": [
+          "2024-01-02",
+          "2026-10-27",
+          680
+        ],
+        "601766.SH": [
+          "2024-01-02",
+          "2026-10-27",
+          680
+        ],
+        "601857.SH": [
+          "2024-01-02",
+          "2026-10-27",
+          680
+        ],
+        "601872.SH": [
+          "2016-01-04",
+          "2026-10-27",
+          2625
+        ],
+        "601899.SH": [
+          "2024-01-02",
+          "2026-10-27",
+          680
+        ],
+        "601919.SH": [
+          "2016-01-04",
+          "2026-10-27",
+          2625
+        ]
+      }
+    },
+    "aux_db": {
+      "path": "data/cache.backup-20261027-pre-m38raw.duckdb",
+      "mode": "preadj",
+      "sha256": "b9eaf7e1a1ee17f5a7c068a9bc5af40a229019399c38cbd4df29adf55f4e720e",
+      "size_bytes": 322973696,
+      "n_rows": 42376,
+      "coverage": {
+        "000157.SZ": [
+          "2017-01-18",
+          "2026-10-26",
+          2369
+        ],
+        "000938.SZ": [
+          "2017-01-18",
+          "2026-10-26",
+          2334
+        ],
+        "000999.SZ": [
+          "2020-04-29",
+          "2026-10-26",
+          1572
+        ],
+        "300394.SZ": [
+          "2017-01-25",
+          "2026-10-26",
+          2359
+        ],
+        "600028.SH": [
+          "2017-01-18",
+          "2026-10-26",
+          2369
+        ],
+        "600362.SH": [
+          "2017-01-18",
+          "2026-10-26",
+          2369
+        ],
+        "600584.SH": [
+          "2020-04-29",
+          "2026-10-26",
+          1567
+        ],
+        "600660.SH": [
+          "2017-01-18",
+          "2026-10-26",
+          2369
+        ],
+        "600900.SH": [
+          "2017-01-18",
+          "2026-10-26",
+          2358
+        ],
+        "600941.SH": [
+          "2022-01-05",
+          "2026-10-26",
+          1162
+        ],
+        "601088.SH": [
+          "2017-01-18",
+          "2026-10-26",
+          2295
+        ],
+        "601225.SH": [
+          "2017-01-18",
+          "2026-10-26",
+          2369
+        ],
+        "601288.SH": [
+          "2017-01-18",
+          "2026-10-26",
+          2369
+        ],
+        "601398.SH": [
+          "2017-01-18",
+          "2026-10-26",
+          2369
+        ],
+        "601728.SH": [
+          "2021-08-20",
+          "2026-10-26",
+          1252
+        ],
+        "601766.SH": [
+          "2020-04-29",
+          "2026-10-26",
+          1572
+        ],
+        "601857.SH": [
+          "2017-01-18",
+          "2026-10-26",
+          2369
+        ],
+        "601872.SH": [
+          "2017-01-18",
+          "2026-10-26",
+          2269
+        ],
+        "601899.SH": [
+          "2017-01-18",
+          "2026-10-26",
+          2365
+        ],
+        "601919.SH": [
+          "2017-01-18",
+          "2026-10-26",
+          2319
+        ]
+      }
+    },
+    "generated_by": "backtests_research/20261025_125300/roundtrip_ledger/roundtrip_ledger.py"
+  },
+  "prereg": {
+    "H2_POS_SHARE_MIN": 0.5,
+    "H2_WEIGHTED_GAP_MIN": 0.0,
+    "H2_MEDIAN_BARS_MAX": 6,
+    "H1_NEG_SHARE_MIN": 0.5
+  },
+  "n_exit_events": 14289,
+  "n_unpaired": 6750,
+  "n_pairs_pooled": 7539,
+  "n_pairs_dedup": 2106,
+  "pooled": {
+    "n_pairs": 7539,
+    "n_exits": 14289,
+    "reentry_rate": 0.5276086500104976,
+    "pos_share": 0.6543308131051864,
+    "neg_share": 0.3385064332139541,
+    "zero_share": 0.00716275368085953,
+    "gap_mean": 0.03254097658576412,
+    "gap_median": 0.021551724137931272,
+    "gap_std": 0.09171377165529708,
+    "gap_weighted_mean": 0.03203971937500177,
+    "gap_t_pooled": 30.80724768320088,
+    "cal_days_median": 19.0,
+    "cal_days_mean": 33.17124287040721,
+    "roundtrip_cost_bp_median": 24.890109890109898,
+    "roundtrip_cost_bp_mean": 27.1184933078523,
+    "exit_value_sum": 73963876.8818725,
+    "bars_elapsed_n": 7539,
+    "bars_elapsed_median": 12.0,
+    "bars_elapsed_mean": 21.97890966971747,
+    "bars_elapsed_p25": 6.0,
+    "bars_elapsed_p75": 25.0,
+    "bars_elapsed_share_le_6": 0.30375381350311714,
+    "bars_elapsed_share_le_3": 0.04549675023212628
+  },
+  "dedup": {
+    "n_pairs": 2106,
+    "n_exits": 14289,
+    "reentry_rate": null,
+    "pos_share": 0.620607787274454,
+    "neg_share": 0.3684710351377018,
+    "zero_share": 0.010921177587844255,
+    "gap_mean": 0.030316368877898566,
+    "gap_median": 0.01658071353943924,
+    "gap_std": 0.09845457595147886,
+    "gap_weighted_mean": 0.029986172276752765,
+    "gap_t_pooled": 14.130920731330805,
+    "cal_days_median": 25.0,
+    "cal_days_mean": 42.20180436847104,
+    "roundtrip_cost_bp_median": 24.137233965745672,
+    "roundtrip_cost_bp_mean": 27.24801364452439,
+    "exit_value_sum": 24440450.713553324,
+    "bars_elapsed_n": 2106,
+    "bars_elapsed_median": 16.0,
+    "bars_elapsed_mean": 28.021367521367523,
+    "bars_elapsed_p25": 7.0,
+    "bars_elapsed_p75": 35.0,
+    "bars_elapsed_share_le_6": 0.24548907882241217,
+    "bars_elapsed_share_le_3": 0.05365622032288699,
+    "reentry_rate_note": "去重口径无分母，再入率见 pooled"
+  },
+  "price_calibration": {
+    "n_checked": 39084,
+    "share_exact_1e_9": 0.658351243475591,
+    "max_dev": 0.018939393939394256,
+    "symbols_with_dev_gt_1e_9": {
+      "600660.SH": {
+        "n": 1325,
+        "max_dev": 0.018939393939394256
+      },
+      "601225.SH": {
+        "n": 3303,
+        "max_dev": 0.0019632339339319405
+      },
+      "601288.SH": {
+        "n": 4484,
+        "max_dev": 0.003079494878265643
+      },
+      "601872.SH": {
+        "n": 3835,
+        "max_dev": 0.0008675754147164927
+      },
+      "601919.SH": {
+        "n": 3640,
+        "max_dev": 0.00016167204426942305
+      }
+    }
+  },
+  "gap_calibration": {
+    "path_vs_csv_gap_n": 4080,
+    "path_vs_csv_gap_median_absdiff": 1.1102230246251565e-16,
+    "path_vs_csv_gap_share_lt_1e_4": 0.9924019607843138,
+    "path_vs_csv_gap_share_lt_1e_2": 1.0,
+    "auxpath_vs_csv_gap_n": 7539,
+    "auxpath_vs_csv_gap_median_absdiff": 0.0,
+    "auxpath_vs_csv_gap_share_lt_1e_4": 0.990449661758854,
+    "auxpath_vs_csv_gap_share_lt_1e_2": 0.9927046027324579
+  },
+  "turnover": [
+    {
+      "run": "01_r1_longwin",
+      "strategy": "chan_crisis_shield_blend",
+      "n_legs": 1105,
+      "n_roundtrip_legs": 636,
+      "leg_share": 0.5755656108597285,
+      "total_cost": 13303.49820109419,
+      "roundtrip_cost": 8085.266763045827,
+      "cost_share": 0.6077549409057558
+    },
+    {
+      "run": "01_r1_longwin",
+      "strategy": "chan_dual_hybrid_blend",
+      "n_legs": 1531,
+      "n_roundtrip_legs": 652,
+      "leg_share": 0.42586544741998694,
+      "total_cost": 17366.125353233845,
+      "roundtrip_cost": 7207.539995945255,
+      "cost_share": 0.4150344333776848
+    },
+    {
+      "run": "01_r1_longwin",
+      "strategy": "chan_four_state_blend",
+      "n_legs": 1128,
+      "n_roundtrip_legs": 578,
+      "leg_share": 0.5124113475177305,
+      "total_cost": 15730.532963840844,
+      "roundtrip_cost": 8804.925732035614,
+      "cost_share": 0.5597347370413418
+    },
+    {
+      "run": "01_r1_longwin",
+      "strategy": "chan_four_state_shield_blend",
+      "n_legs": 1229,
+      "n_roundtrip_legs": 642,
+      "leg_share": 0.5223759153783564,
+      "total_cost": 15097.287318094028,
+      "roundtrip_cost": 8276.197530880334,
+      "cost_share": 0.5481910330315666
+    },
+    {
+      "run": "01_r1_longwin",
+      "strategy": "chan_risk_managed_blend",
+      "n_legs": 1252,
+      "n_roundtrip_legs": 650,
+      "leg_share": 0.5191693290734825,
+      "total_cost": 16513.52812044872,
+      "roundtrip_cost": 9412.059145533827,
+      "cost_share": 0.5699605242975827
+    },
+    {
+      "run": "01_r1_longwin",
+      "strategy": "generic_blend",
+      "n_legs": 2211,
+      "n_roundtrip_legs": 1210,
+      "leg_share": 0.5472636815920398,
+      "total_cost": 37625.73703593793,
+      "roundtrip_cost": 24206.117758483873,
+      "cost_share": 0.6433393646312786
+    },
+    {
+      "run": "03_r2b_oos",
+      "strategy": "chan_crisis_shield_blend",
+      "n_legs": 264,
+      "n_roundtrip_legs": 52,
+      "leg_share": 0.19696969696969696,
+      "total_cost": 2062.855099765172,
+      "roundtrip_cost": 442.5891141458776,
+      "cost_share": 0.21455172212350754
+    },
+    {
+      "run": "03_r2b_oos",
+      "strategy": "chan_dual_hybrid_blend",
+      "n_legs": 302,
+      "n_roundtrip_legs": 48,
+      "leg_share": 0.15894039735099338,
+      "total_cost": 2892.5927219742816,
+      "roundtrip_cost": 405.76889672153976,
+      "cost_share": 0.14027861359085156
+    },
+    {
+      "run": "03_r2b_oos",
+      "strategy": "chan_four_state_blend",
+      "n_legs": 260,
+      "n_roundtrip_legs": 54,
+      "leg_share": 0.2076923076923077,
+      "total_cost": 2573.2010723649373,
+      "roundtrip_cost": 638.5878718760922,
+      "cost_share": 0.2481686638227571
+    },
+    {
+      "run": "03_r2b_oos",
+      "strategy": "chan_four_state_shield_blend",
+      "n_legs": 248,
+      "n_roundtrip_legs": 46,
+      "leg_share": 0.18548387096774194,
+      "total_cost": 1806.9916113408071,
+      "roundtrip_cost": 369.5470583811375,
+      "cost_share": 0.2045095594588453
+    },
+    {
+      "run": "03_r2b_oos",
+      "strategy": "chan_risk_managed_blend",
+      "n_legs": 264,
+      "n_roundtrip_legs": 56,
+      "leg_share": 0.21212121212121213,
+      "total_cost": 2493.451063159975,
+      "roundtrip_cost": 610.6338418707368,
+      "cost_share": 0.2448950576542996
+    },
+    {
+      "run": "03_r2b_oos",
+      "strategy": "generic_blend",
+      "n_legs": 375,
+      "n_roundtrip_legs": 120,
+      "leg_share": 0.32,
+      "total_cost": 5119.06197297144,
+      "roundtrip_cost": 1919.429718136357,
+      "cost_share": 0.374957312154241
+    },
+    {
+      "run": "07_r3_oos_bear",
+      "strategy": "chan_crisis_shield_blend",
+      "n_legs": 275,
+      "n_roundtrip_legs": 58,
+      "leg_share": 0.2109090909090909,
+      "total_cost": 2784.2074394294596,
+      "roundtrip_cost": 708.2413552534447,
+      "cost_share": 0.2543780844858951
+    },
+    {
+      "run": "07_r3_oos_bear",
+      "strategy": "chan_dual_hybrid_blend",
+      "n_legs": 330,
+      "n_roundtrip_legs": 64,
+      "leg_share": 0.19393939393939394,
+      "total_cost": 3247.352890648166,
+      "roundtrip_cost": 678.6097564979544,
+      "cost_share": 0.20897320967248037
+    },
+    {
+      "run": "07_r3_oos_bear",
+      "strategy": "chan_four_state_blend",
+      "n_legs": 280,
+      "n_roundtrip_legs": 68,
+      "leg_share": 0.24285714285714285,
+      "total_cost": 3370.3387459243286,
+      "roundtrip_cost": 1051.7342880595531,
+      "cost_share": 0.3120559585683756
+    },
+    {
+      "run": "07_r3_oos_bear",
+      "strategy": "chan_four_state_shield_blend",
+      "n_legs": 291,
+      "n_roundtrip_legs": 50,
+      "leg_share": 0.1718213058419244,
+      "total_cost": 2910.731201819333,
+      "roundtrip_cost": 629.295852971832,
+      "cost_share": 0.21619854577382305
+    },
+    {
+      "run": "07_r3_oos_bear",
+      "strategy": "chan_risk_managed_blend",
+      "n_legs": 281,
+      "n_roundtrip_legs": 74,
+      "leg_share": 0.26334519572953735,
+      "total_cost": 3234.182511694514,
+      "roundtrip_cost": 1055.8010194999613,
+      "cost_share": 0.3264506612358083
+    },
+    {
+      "run": "07_r3_oos_bear",
+      "strategy": "generic_blend",
+      "n_legs": 396,
+      "n_roundtrip_legs": 110,
+      "leg_share": 0.2777777777777778,
+      "total_cost": 5383.7542773817895,
+      "roundtrip_cost": 1919.9109528399288,
+      "cost_share": 0.3566119205896622
+    },
+    {
+      "run": "08_ablate_wf/baseline",
+      "strategy": "chan_dual_hybrid_blend",
+      "n_legs": 980,
+      "n_roundtrip_legs": 184,
+      "leg_share": 0.18775510204081633,
+      "total_cost": 8922.138729788827,
+      "roundtrip_cost": 1781.991709164319,
+      "cost_share": 0.19972696716928273
+    },
+    {
+      "run": "08_ablate_wf/baseline",
+      "strategy": "chan_four_state_blend",
+      "n_legs": 795,
+      "n_roundtrip_legs": 174,
+      "leg_share": 0.2188679245283019,
+      "total_cost": 8355.646343781456,
+      "roundtrip_cost": 2032.193981588831,
+      "cost_share": 0.24321206259540362
+    },
+    {
+      "run": "08_ablate_wf/baseline",
+      "strategy": "chan_risk_managed_blend",
+      "n_legs": 844,
+      "n_roundtrip_legs": 208,
+      "leg_share": 0.24644549763033174,
+      "total_cost": 8500.77885084195,
+      "roundtrip_cost": 2341.409749315738,
+      "cost_share": 0.2754347325579274
+    },
+    {
+      "run": "08_ablate_wf/bull_full",
+      "strategy": "chan_dual_hybrid_blend",
+      "n_legs": 1112,
+      "n_roundtrip_legs": 198,
+      "leg_share": 0.17805755395683454,
+      "total_cost": 10644.036999741962,
+      "roundtrip_cost": 1987.6221839265077,
+      "cost_share": 0.18673574546712798
+    },
+    {
+      "run": "08_ablate_wf/bull_full",
+      "strategy": "chan_four_state_blend",
+      "n_legs": 941,
+      "n_roundtrip_legs": 208,
+      "leg_share": 0.22104144527098832,
+      "total_cost": 10652.26452790392,
+      "roundtrip_cost": 2826.9783703745134,
+      "cost_share": 0.2653875486258495
+    },
+    {
+      "run": "08_ablate_wf/bull_full",
+      "strategy": "chan_risk_managed_blend",
+      "n_legs": 1010,
+      "n_roundtrip_legs": 228,
+      "leg_share": 0.22574257425742575,
+      "total_cost": 10984.758677350059,
+      "roundtrip_cost": 2857.213239459782,
+      "cost_share": 0.2601070559111318
+    },
+    {
+      "run": "08_ablate_wf/no_atrstop",
+      "strategy": "chan_dual_hybrid_blend",
+      "n_legs": 972,
+      "n_roundtrip_legs": 174,
+      "leg_share": 0.17901234567901234,
+      "total_cost": 8617.909720886593,
+      "roundtrip_cost": 1615.4427687330171,
+      "cost_share": 0.1874518092035459
+    },
+    {
+      "run": "08_ablate_wf/no_atrstop",
+      "strategy": "chan_four_state_blend",
+      "n_legs": 800,
+      "n_roundtrip_legs": 178,
+      "leg_share": 0.2225,
+      "total_cost": 8353.022915509071,
+      "roundtrip_cost": 2084.2829071586802,
+      "cost_share": 0.24952438515268394
+    },
+    {
+      "run": "08_ablate_wf/no_atrstop",
+      "strategy": "chan_risk_managed_blend",
+      "n_legs": 856,
+      "n_roundtrip_legs": 204,
+      "leg_share": 0.2383177570093458,
+      "total_cost": 8592.61410710655,
+      "roundtrip_cost": 2351.0066920385398,
+      "cost_share": 0.273607852364059
+    },
+    {
+      "run": "08_ablate_wf/no_circuit",
+      "strategy": "chan_dual_hybrid_blend",
+      "n_legs": 980,
+      "n_roundtrip_legs": 184,
+      "leg_share": 0.18775510204081633,
+      "total_cost": 8922.138729788827,
+      "roundtrip_cost": 1781.991709164319,
+      "cost_share": 0.19972696716928273
+    },
+    {
+      "run": "08_ablate_wf/no_circuit",
+      "strategy": "chan_four_state_blend",
+      "n_legs": 795,
+      "n_roundtrip_legs": 174,
+      "leg_share": 0.2188679245283019,
+      "total_cost": 8352.501379480153,
+      "roundtrip_cost": 2029.4157370627615,
+      "cost_share": 0.24297101489243567
+    },
+    {
+      "run": "08_ablate_wf/no_circuit",
+      "strategy": "chan_risk_managed_blend",
+      "n_legs": 845,
+      "n_roundtrip_legs": 208,
+      "leg_share": 0.24615384615384617,
+      "total_cost": 8502.981627417523,
+      "roundtrip_cost": 2342.16219936327,
+      "cost_share": 0.2754518711190745
+    },
+    {
+      "run": "08_ablate_wf/no_cyq",
+      "strategy": "chan_dual_hybrid_blend",
+      "n_legs": 925,
+      "n_roundtrip_legs": 180,
+      "leg_share": 0.1945945945945946,
+      "total_cost": 7887.538942981703,
+      "roundtrip_cost": 1606.1759421597749,
+      "cost_share": 0.20363461325144303
+    },
+    {
+      "run": "08_ablate_wf/no_cyq",
+      "strategy": "chan_four_state_blend",
+      "n_legs": 823,
+      "n_roundtrip_legs": 208,
+      "leg_share": 0.25273390036452004,
+      "total_cost": 8063.550286092363,
+      "roundtrip_cost": 2257.0868234102486,
+      "cost_share": 0.2799122896651574
+    },
+    {
+      "run": "08_ablate_wf/no_cyq",
+      "strategy": "chan_risk_managed_blend",
+      "n_legs": 871,
+      "n_roundtrip_legs": 252,
+      "leg_share": 0.2893226176808266,
+      "total_cost": 7942.0641597456,
+      "roundtrip_cost": 2476.883360420246,
+      "cost_share": 0.3118689688978269
+    },
+    {
+      "run": "08_ablate_wf/no_hysteresis",
+      "strategy": "chan_dual_hybrid_blend",
+      "n_legs": 980,
+      "n_roundtrip_legs": 184,
+      "leg_share": 0.18775510204081633,
+      "total_cost": 8922.138729788827,
+      "roundtrip_cost": 1781.991709164319,
+      "cost_share": 0.19972696716928273
+    },
+    {
+      "run": "08_ablate_wf/no_hysteresis",
+      "strategy": "chan_four_state_blend",
+      "n_legs": 819,
+      "n_roundtrip_legs": 180,
+      "leg_share": 0.21978021978021978,
+      "total_cost": 8541.451446130293,
+      "roundtrip_cost": 2106.5441729827544,
+      "cost_share": 0.24662601974247886
+    },
+    {
+      "run": "08_ablate_wf/no_hysteresis",
+      "strategy": "chan_risk_managed_blend",
+      "n_legs": 844,
+      "n_roundtrip_legs": 208,
+      "leg_share": 0.24644549763033174,
+      "total_cost": 8500.77885084195,
+      "roundtrip_cost": 2341.409749315738,
+      "cost_share": 0.2754347325579274
+    },
+    {
+      "run": "08_ablate_wf/no_inertia",
+      "strategy": "chan_dual_hybrid_blend",
+      "n_legs": 3303,
+      "n_roundtrip_legs": 352,
+      "leg_share": 0.10656978504389948,
+      "total_cost": 14467.475303158422,
+      "roundtrip_cost": 2663.310268553865,
+      "cost_share": 0.18408949818441597
+    },
+    {
+      "run": "08_ablate_wf/no_inertia",
+      "strategy": "chan_four_state_blend",
+      "n_legs": 2785,
+      "n_roundtrip_legs": 352,
+      "leg_share": 0.12639138240574507,
+      "total_cost": 13603.544780576263,
+      "roundtrip_cost": 3323.7061418410094,
+      "cost_share": 0.24432647486019546
+    },
+    {
+      "run": "08_ablate_wf/no_inertia",
+      "strategy": "chan_risk_managed_blend",
+      "n_legs": 2866,
+      "n_roundtrip_legs": 338,
+      "leg_share": 0.11793440334961619,
+      "total_cost": 13847.586498691217,
+      "roundtrip_cost": 3353.2327856329116,
+      "cost_share": 0.24215286800698715
+    },
+    {
+      "run": "08_ablate_wf/no_lowbeta",
+      "strategy": "chan_dual_hybrid_blend",
+      "n_legs": 981,
+      "n_roundtrip_legs": 180,
+      "leg_share": 0.1834862385321101,
+      "total_cost": 8900.627314686026,
+      "roundtrip_cost": 1705.94981279924,
+      "cost_share": 0.19166624469091348
+    },
+    {
+      "run": "08_ablate_wf/no_lowbeta",
+      "strategy": "chan_four_state_blend",
+      "n_legs": 798,
+      "n_roundtrip_legs": 176,
+      "leg_share": 0.22055137844611528,
+      "total_cost": 8388.077545065797,
+      "roundtrip_cost": 2051.7807983811217,
+      "cost_share": 0.2446067990380062
+    },
+    {
+      "run": "08_ablate_wf/no_lowbeta",
+      "strategy": "chan_risk_managed_blend",
+      "n_legs": 841,
+      "n_roundtrip_legs": 206,
+      "leg_share": 0.24494649227110582,
+      "total_cost": 8491.5603482468,
+      "roundtrip_cost": 2334.8538231471825,
+      "cost_share": 0.27496169459942016
+    },
+    {
+      "run": "08_ablate_wf/no_orthogon",
+      "strategy": "chan_dual_hybrid_blend",
+      "n_legs": 912,
+      "n_roundtrip_legs": 152,
+      "leg_share": 0.16666666666666666,
+      "total_cost": 8152.531168950516,
+      "roundtrip_cost": 1401.1105212928203,
+      "cost_share": 0.17186202570179032
+    },
+    {
+      "run": "08_ablate_wf/no_orthogon",
+      "strategy": "chan_four_state_blend",
+      "n_legs": 779,
+      "n_roundtrip_legs": 166,
+      "leg_share": 0.21309370988446727,
+      "total_cost": 8037.719134759779,
+      "roundtrip_cost": 1940.3797992557709,
+      "cost_share": 0.2414092563727984
+    },
+    {
+      "run": "08_ablate_wf/no_orthogon",
+      "strategy": "chan_risk_managed_blend",
+      "n_legs": 766,
+      "n_roundtrip_legs": 174,
+      "leg_share": 0.22715404699738903,
+      "total_cost": 7541.435476336714,
+      "roundtrip_cost": 2011.0239818442485,
+      "cost_share": 0.26666328819683977
+    },
+    {
+      "run": "08_ablate_wf/no_sectorthrot",
+      "strategy": "chan_dual_hybrid_blend",
+      "n_legs": 959,
+      "n_roundtrip_legs": 174,
+      "leg_share": 0.18143899895724713,
+      "total_cost": 8739.678286964489,
+      "roundtrip_cost": 1610.0557423670884,
+      "cost_share": 0.1842236853006979
+    },
+    {
+      "run": "08_ablate_wf/no_sectorthrot",
+      "strategy": "chan_four_state_blend",
+      "n_legs": 796,
+      "n_roundtrip_legs": 180,
+      "leg_share": 0.22613065326633167,
+      "total_cost": 8401.238050257962,
+      "roundtrip_cost": 2107.0675020776257,
+      "cost_share": 0.25080440400244675
+    },
+    {
+      "run": "08_ablate_wf/no_sectorthrot",
+      "strategy": "chan_risk_managed_blend",
+      "n_legs": 830,
+      "n_roundtrip_legs": 198,
+      "leg_share": 0.2385542168674699,
+      "total_cost": 8233.749667016342,
+      "roundtrip_cost": 2156.0633511991928,
+      "cost_share": 0.2618568013837229
+    },
+    {
+      "run": "08_ablate_wf/no_structregime",
+      "strategy": "chan_dual_hybrid_blend",
+      "n_legs": 980,
+      "n_roundtrip_legs": 184,
+      "leg_share": 0.18775510204081633,
+      "total_cost": 8922.138729788827,
+      "roundtrip_cost": 1781.991709164319,
+      "cost_share": 0.19972696716928273
+    },
+    {
+      "run": "08_ablate_wf/no_structregime",
+      "strategy": "chan_four_state_blend",
+      "n_legs": 811,
+      "n_roundtrip_legs": 178,
+      "leg_share": 0.21948212083847102,
+      "total_cost": 8281.85827670377,
+      "roundtrip_cost": 2065.421377073395,
+      "cost_share": 0.24939105549333854
+    },
+    {
+      "run": "08_ablate_wf/no_structregime",
+      "strategy": "chan_risk_managed_blend",
+      "n_legs": 844,
+      "n_roundtrip_legs": 208,
+      "leg_share": 0.24644549763033174,
+      "total_cost": 8500.77885084195,
+      "roundtrip_cost": 2341.409749315738,
+      "cost_share": 0.2754347325579274
+    },
+    {
+      "run": "08_ablate_wf/no_thrust",
+      "strategy": "chan_dual_hybrid_blend",
+      "n_legs": 717,
+      "n_roundtrip_legs": 118,
+      "leg_share": 0.16457461645746166,
+      "total_cost": 5796.504181808148,
+      "roundtrip_cost": 974.3757865917913,
+      "cost_share": 0.1680971420066925
+    },
+    {
+      "run": "08_ablate_wf/no_thrust",
+      "strategy": "chan_four_state_blend",
+      "n_legs": 628,
+      "n_roundtrip_legs": 140,
+      "leg_share": 0.2229299363057325,
+      "total_cost": 5786.26368903042,
+      "roundtrip_cost": 1322.9969559627784,
+      "cost_share": 0.22864442878241303
+    },
+    {
+      "run": "08_ablate_wf/no_thrust",
+      "strategy": "chan_risk_managed_blend",
+      "n_legs": 623,
+      "n_roundtrip_legs": 156,
+      "leg_share": 0.2504012841091493,
+      "total_cost": 5352.151088095217,
+      "roundtrip_cost": 1362.7708260638453,
+      "cost_share": 0.25462114272055114
+    },
+    {
+      "run": "08_ablate_wf/no_voltarget",
+      "strategy": "chan_dual_hybrid_blend",
+      "n_legs": 996,
+      "n_roundtrip_legs": 190,
+      "leg_share": 0.19076305220883535,
+      "total_cost": 9142.822116960935,
+      "roundtrip_cost": 1853.543831639888,
+      "cost_share": 0.20273213324377834
+    },
+    {
+      "run": "08_ablate_wf/no_voltarget",
+      "strategy": "chan_four_state_blend",
+      "n_legs": 791,
+      "n_roundtrip_legs": 188,
+      "leg_share": 0.23767383059418457,
+      "total_cost": 8648.390531663295,
+      "roundtrip_cost": 2244.647901640199,
+      "cost_share": 0.25954515969441294
+    },
+    {
+      "run": "08_ablate_wf/no_voltarget",
+      "strategy": "chan_risk_managed_blend",
+      "n_legs": 848,
+      "n_roundtrip_legs": 218,
+      "leg_share": 0.25707547169811323,
+      "total_cost": 8934.628955892782,
+      "roundtrip_cost": 2554.061668257148,
+      "cost_share": 0.285860966455986
+    },
+    {
+      "run": "09_param_grid/atr/atr_6_0",
+      "strategy": "chan_dual_hybrid_blend",
+      "n_legs": 930,
+      "n_roundtrip_legs": 152,
+      "leg_share": 0.16344086021505377,
+      "total_cost": 8240.704082651728,
+      "roundtrip_cost": 1425.0279940227408,
+      "cost_share": 0.17292551458348077
+    },
+    {
+      "run": "09_param_grid/atr/atr_6_0",
+      "strategy": "chan_four_state_blend",
+      "n_legs": 770,
+      "n_roundtrip_legs": 162,
+      "leg_share": 0.21038961038961038,
+      "total_cost": 8162.978263001636,
+      "roundtrip_cost": 1896.818952482795,
+      "cost_share": 0.232368492401854
+    },
+    {
+      "run": "09_param_grid/atr/atr_6_0",
+      "strategy": "chan_risk_managed_blend",
+      "n_legs": 840,
+      "n_roundtrip_legs": 192,
+      "leg_share": 0.22857142857142856,
+      "total_cost": 8426.42443787454,
+      "roundtrip_cost": 2142.1860518989342,
+      "cost_share": 0.254222424670466
+    },
+    {
+      "run": "09_param_grid/atr/atr_8_0",
+      "strategy": "chan_dual_hybrid_blend",
+      "n_legs": 919,
+      "n_roundtrip_legs": 142,
+      "leg_share": 0.15451577801958652,
+      "total_cost": 8276.305318551564,
+      "roundtrip_cost": 1342.2716098056333,
+      "cost_share": 0.1621824664680863
+    },
+    {
+      "run": "09_param_grid/atr/atr_8_0",
+      "strategy": "chan_four_state_blend",
+      "n_legs": 774,
+      "n_roundtrip_legs": 156,
+      "leg_share": 0.20155038759689922,
+      "total_cost": 8183.673267299422,
+      "roundtrip_cost": 1825.570787717944,
+      "cost_share": 0.22307474016742787
+    },
+    {
+      "run": "09_param_grid/atr/atr_8_0",
+      "strategy": "chan_risk_managed_blend",
+      "n_legs": 819,
+      "n_roundtrip_legs": 174,
+      "leg_share": 0.21245421245421245,
+      "total_cost": 8177.103143810427,
+      "roundtrip_cost": 1943.503449223947,
+      "cost_share": 0.23767627912276754
+    },
+    {
+      "run": "09_param_grid/atr/atr_none",
+      "strategy": "chan_dual_hybrid_blend",
+      "n_legs": 826,
+      "n_roundtrip_legs": 90,
+      "leg_share": 0.1089588377723971,
+      "total_cost": 7276.546510998771,
+      "roundtrip_cost": 849.133843532325,
+      "cost_share": 0.11669462185788652
+    },
+    {
+      "run": "09_param_grid/atr/atr_none",
+      "strategy": "chan_four_state_blend",
+      "n_legs": 763,
+      "n_roundtrip_legs": 130,
+      "leg_share": 0.17038007863695936,
+      "total_cost": 7855.333204025744,
+      "roundtrip_cost": 1528.7545036077406,
+      "cost_share": 0.19461357830426293
+    },
+    {
+      "run": "09_param_grid/atr/atr_none",
+      "strategy": "chan_risk_managed_blend",
+      "n_legs": 792,
+      "n_roundtrip_legs": 146,
+      "leg_share": 0.18434343434343434,
+      "total_cost": 7896.873558390262,
+      "roundtrip_cost": 1656.3310206203014,
+      "cost_share": 0.20974516159759005
+    },
+    {
+      "run": "09_param_grid/inertia/inertia_008_4",
+      "strategy": "chan_dual_hybrid_blend",
+      "n_legs": 632,
+      "n_roundtrip_legs": 112,
+      "leg_share": 0.17721518987341772,
+      "total_cost": 5792.656744668243,
+      "roundtrip_cost": 1168.9002219673782,
+      "cost_share": 0.20179000301429453
+    },
+    {
+      "run": "09_param_grid/inertia/inertia_008_4",
+      "strategy": "chan_four_state_blend",
+      "n_legs": 533,
+      "n_roundtrip_legs": 94,
+      "leg_share": 0.17636022514071295,
+      "total_cost": 5876.619445243694,
+      "roundtrip_cost": 1190.663987714797,
+      "cost_share": 0.20261036107731528
+    },
+    {
+      "run": "09_param_grid/inertia/inertia_008_4",
+      "strategy": "chan_risk_managed_blend",
+      "n_legs": 559,
+      "n_roundtrip_legs": 110,
+      "leg_share": 0.1967799642218247,
+      "total_cost": 5576.231611392816,
+      "roundtrip_cost": 1301.6774141596807,
+      "cost_share": 0.23343316864748218
+    },
+    {
+      "run": "09_param_grid/inertia/inertia_010_5",
+      "strategy": "chan_dual_hybrid_blend",
+      "n_legs": 544,
+      "n_roundtrip_legs": 90,
+      "leg_share": 0.16544117647058823,
+      "total_cost": 4865.428293636375,
+      "roundtrip_cost": 1000.8883368132078,
+      "cost_share": 0.20571433312917112
+    },
+    {
+      "run": "09_param_grid/inertia/inertia_010_5",
+      "strategy": "chan_four_state_blend",
+      "n_legs": 417,
+      "n_roundtrip_legs": 58,
+      "leg_share": 0.13908872901678657,
+      "total_cost": 4086.2691576117445,
+      "roundtrip_cost": 827.8272244705053,
+      "cost_share": 0.20258754197051868
+    },
+    {
+      "run": "09_param_grid/inertia/inertia_010_5",
+      "strategy": "chan_risk_managed_blend",
+      "n_legs": 484,
+      "n_roundtrip_legs": 94,
+      "leg_share": 0.19421487603305784,
+      "total_cost": 4789.693869946748,
+      "roundtrip_cost": 1220.1119839049863,
+      "cost_share": 0.2547369449978129
+    },
+    {
+      "run": "09_param_grid/inertia/inertia_015_10",
+      "strategy": "chan_dual_hybrid_blend",
+      "n_legs": 477,
+      "n_roundtrip_legs": 104,
+      "leg_share": 0.2180293501048218,
+      "total_cost": 3838.872638748142,
+      "roundtrip_cost": 1123.5069258466465,
+      "cost_share": 0.29266585051725563
+    },
+    {
+      "run": "09_param_grid/inertia/inertia_015_10",
+      "strategy": "chan_four_state_blend",
+      "n_legs": 393,
+      "n_roundtrip_legs": 66,
+      "leg_share": 0.16793893129770993,
+      "total_cost": 3718.4154951874525,
+      "roundtrip_cost": 875.369032880078,
+      "cost_share": 0.23541452912215474
+    },
+    {
+      "run": "09_param_grid/inertia/inertia_015_10",
+      "strategy": "chan_risk_managed_blend",
+      "n_legs": 415,
+      "n_roundtrip_legs": 76,
+      "leg_share": 0.18313253012048192,
+      "total_cost": 3657.6337887940917,
+      "roundtrip_cost": 938.8387276527511,
+      "cost_share": 0.2566792581939382
+    }
+  ],
+  "cost_attribution": {
+    "total_cost_all_legs": 613642.2674536305,
+    "roundtrip_cost": 182441.19605940543,
+    "roundtrip_cost_share": 0.2973087183457282,
+    "cooldown_timed_cost": 54033.80756302821,
+    "cooldown_timed_cost_share": 0.08805424663337952,
+    "gap_money_all_pairs": 2369781.859182376,
+    "gap_money_cooldown_timed": 644479.0892254923,
+    "gap_money_long": 1725302.7699568835,
+    "n_pairs_cooldown_timed_pooled": 2290,
+    "note": "全部为**池化（未去重）**口径；与 turnover 表一致，按 run+strategy 的流量计。"
+  },
+  "frequency": [
+    {
+      "run": "01_r1_longwin",
+      "n_strategies": 6,
+      "n_folds": 4,
+      "dedup_multiplicity": 2.12,
+      "calendar_years": 2.86,
+      "n_pairs_pooled": 2184,
+      "n_pairs_dedup": 1029,
+      "pairs_per_year_per_strategy": 59.9,
+      "rows_per_year_per_strategy": 493.0,
+      "n_rows": 8456
+    },
+    {
+      "run": "03_r2b_oos",
+      "n_strategies": 6,
+      "n_folds": 6,
+      "dedup_multiplicity": 1.45,
+      "calendar_years": 1.56,
+      "n_pairs_pooled": 188,
+      "n_pairs_dedup": 130,
+      "pairs_per_year_per_strategy": 13.9,
+      "rows_per_year_per_strategy": 183.0,
+      "n_rows": 1713
+    },
+    {
+      "run": "07_r3_oos_bear",
+      "n_strategies": 6,
+      "n_folds": 6,
+      "dedup_multiplicity": 1.62,
+      "calendar_years": 1.54,
+      "n_pairs_pooled": 212,
+      "n_pairs_dedup": 131,
+      "pairs_per_year_per_strategy": 14.2,
+      "rows_per_year_per_strategy": 201.0,
+      "n_rows": 1853
+    },
+    {
+      "run": "08_ablate_wf/baseline",
+      "n_strategies": 3,
+      "n_folds": 18,
+      "dedup_multiplicity": 1.35,
+      "calendar_years": 4.67,
+      "n_pairs_pooled": 283,
+      "n_pairs_dedup": 209,
+      "pairs_per_year_per_strategy": 14.9,
+      "rows_per_year_per_strategy": 187.0,
+      "n_rows": 2619
+    },
+    {
+      "run": "08_ablate_wf/bull_full",
+      "n_strategies": 3,
+      "n_folds": 18,
+      "dedup_multiplicity": 1.33,
+      "calendar_years": 4.67,
+      "n_pairs_pooled": 317,
+      "n_pairs_dedup": 239,
+      "pairs_per_year_per_strategy": 17.1,
+      "rows_per_year_per_strategy": 219.0,
+      "n_rows": 3063
+    },
+    {
+      "run": "08_ablate_wf/no_atrstop",
+      "n_strategies": 3,
+      "n_folds": 18,
+      "dedup_multiplicity": 1.34,
+      "calendar_years": 4.67,
+      "n_pairs_pooled": 278,
+      "n_pairs_dedup": 207,
+      "pairs_per_year_per_strategy": 14.8,
+      "rows_per_year_per_strategy": 187.0,
+      "n_rows": 2628
+    },
+    {
+      "run": "08_ablate_wf/no_circuit",
+      "n_strategies": 3,
+      "n_folds": 18,
+      "dedup_multiplicity": 1.35,
+      "calendar_years": 4.67,
+      "n_pairs_pooled": 283,
+      "n_pairs_dedup": 209,
+      "pairs_per_year_per_strategy": 14.9,
+      "rows_per_year_per_strategy": 187.0,
+      "n_rows": 2620
+    },
+    {
+      "run": "08_ablate_wf/no_cyq",
+      "n_strategies": 3,
+      "n_folds": 18,
+      "dedup_multiplicity": 1.27,
+      "calendar_years": 4.67,
+      "n_pairs_pooled": 320,
+      "n_pairs_dedup": 251,
+      "pairs_per_year_per_strategy": 17.9,
+      "rows_per_year_per_strategy": 187.0,
+      "n_rows": 2619
+    },
+    {
+      "run": "08_ablate_wf/no_hysteresis",
+      "n_strategies": 3,
+      "n_folds": 18,
+      "dedup_multiplicity": 1.36,
+      "calendar_years": 4.67,
+      "n_pairs_pooled": 286,
+      "n_pairs_dedup": 210,
+      "pairs_per_year_per_strategy": 15.0,
+      "rows_per_year_per_strategy": 189.0,
+      "n_rows": 2643
+    },
+    {
+      "run": "08_ablate_wf/no_inertia",
+      "n_strategies": 3,
+      "n_folds": 18,
+      "dedup_multiplicity": 1.37,
+      "calendar_years": 4.67,
+      "n_pairs_pooled": 521,
+      "n_pairs_dedup": 380,
+      "pairs_per_year_per_strategy": 27.2,
+      "rows_per_year_per_strategy": 640.0,
+      "n_rows": 8954
+    },
+    {
+      "run": "08_ablate_wf/no_lowbeta",
+      "n_strategies": 3,
+      "n_folds": 18,
+      "dedup_multiplicity": 1.35,
+      "calendar_years": 4.67,
+      "n_pairs_pooled": 281,
+      "n_pairs_dedup": 208,
+      "pairs_per_year_per_strategy": 14.8,
+      "rows_per_year_per_strategy": 187.0,
+      "n_rows": 2620
+    },
+    {
+      "run": "08_ablate_wf/no_orthogon",
+      "n_strategies": 3,
+      "n_folds": 18,
+      "dedup_multiplicity": 1.34,
+      "calendar_years": 4.67,
+      "n_pairs_pooled": 246,
+      "n_pairs_dedup": 183,
+      "pairs_per_year_per_strategy": 13.1,
+      "rows_per_year_per_strategy": 175.0,
+      "n_rows": 2457
+    },
+    {
+      "run": "08_ablate_wf/no_sectorthrot",
+      "n_strategies": 3,
+      "n_folds": 18,
+      "dedup_multiplicity": 1.32,
+      "calendar_years": 4.67,
+      "n_pairs_pooled": 276,
+      "n_pairs_dedup": 209,
+      "pairs_per_year_per_strategy": 14.9,
+      "rows_per_year_per_strategy": 184.0,
+      "n_rows": 2585
+    },
+    {
+      "run": "08_ablate_wf/no_structregime",
+      "n_strategies": 3,
+      "n_folds": 18,
+      "dedup_multiplicity": 1.34,
+      "calendar_years": 4.67,
+      "n_pairs_pooled": 285,
+      "n_pairs_dedup": 212,
+      "pairs_per_year_per_strategy": 15.1,
+      "rows_per_year_per_strategy": 188.0,
+      "n_rows": 2635
+    },
+    {
+      "run": "08_ablate_wf/no_thrust",
+      "n_strategies": 3,
+      "n_folds": 18,
+      "dedup_multiplicity": 1.43,
+      "calendar_years": 4.67,
+      "n_pairs_pooled": 207,
+      "n_pairs_dedup": 145,
+      "pairs_per_year_per_strategy": 10.3,
+      "rows_per_year_per_strategy": 140.0,
+      "n_rows": 1968
+    },
+    {
+      "run": "08_ablate_wf/no_voltarget",
+      "n_strategies": 3,
+      "n_folds": 18,
+      "dedup_multiplicity": 1.41,
+      "calendar_years": 4.67,
+      "n_pairs_pooled": 298,
+      "n_pairs_dedup": 212,
+      "pairs_per_year_per_strategy": 15.1,
+      "rows_per_year_per_strategy": 188.0,
+      "n_rows": 2635
+    },
+    {
+      "run": "09_param_grid/atr/atr_6_0",
+      "n_strategies": 3,
+      "n_folds": 18,
+      "dedup_multiplicity": 1.33,
+      "calendar_years": 4.67,
+      "n_pairs_pooled": 253,
+      "n_pairs_dedup": 190,
+      "pairs_per_year_per_strategy": 13.6,
+      "rows_per_year_per_strategy": 181.0,
+      "n_rows": 2540
+    },
+    {
+      "run": "09_param_grid/atr/atr_8_0",
+      "n_strategies": 3,
+      "n_folds": 18,
+      "dedup_multiplicity": 1.33,
+      "calendar_years": 4.67,
+      "n_pairs_pooled": 236,
+      "n_pairs_dedup": 177,
+      "pairs_per_year_per_strategy": 12.6,
+      "rows_per_year_per_strategy": 179.0,
+      "n_rows": 2512
+    },
+    {
+      "run": "09_param_grid/atr/atr_none",
+      "n_strategies": 3,
+      "n_folds": 18,
+      "dedup_multiplicity": 1.37,
+      "calendar_years": 4.67,
+      "n_pairs_pooled": 183,
+      "n_pairs_dedup": 134,
+      "pairs_per_year_per_strategy": 9.6,
+      "rows_per_year_per_strategy": 170.0,
+      "n_rows": 2381
+    },
+    {
+      "run": "09_param_grid/inertia/inertia_008_4",
+      "n_strategies": 3,
+      "n_folds": 18,
+      "dedup_multiplicity": 1.16,
+      "calendar_years": 4.67,
+      "n_pairs_pooled": 158,
+      "n_pairs_dedup": 136,
+      "pairs_per_year_per_strategy": 9.7,
+      "rows_per_year_per_strategy": 123.0,
+      "n_rows": 1724
+    },
+    {
+      "run": "09_param_grid/inertia/inertia_010_5",
+      "n_strategies": 3,
+      "n_folds": 18,
+      "dedup_multiplicity": 1.2,
+      "calendar_years": 4.67,
+      "n_pairs_pooled": 121,
+      "n_pairs_dedup": 101,
+      "pairs_per_year_per_strategy": 7.2,
+      "rows_per_year_per_strategy": 103.0,
+      "n_rows": 1445
+    },
+    {
+      "run": "09_param_grid/inertia/inertia_015_10",
+      "n_strategies": 3,
+      "n_folds": 18,
+      "dedup_multiplicity": 1.13,
+      "calendar_years": 4.67,
+      "n_pairs_pooled": 123,
+      "n_pairs_dedup": 109,
+      "pairs_per_year_per_strategy": 7.8,
+      "rows_per_year_per_strategy": 92.0,
+      "n_rows": 1285
+    }
+  ],
+  "path_status_counts": {
+    "uncovered": 6750,
+    "covered_primary": 4080,
+    "covered_via_aux": 3459
+  },
+  "dedup_excess": {
+    "n": 2106,
+    "excess_mean": -0.003984347837206232,
+    "excess_median": -0.002175881204250325,
+    "excess_weighted_mean": -0.004710756278404982,
+    "excess_pos_share": 0.48480531813865146,
+    "excess_t_pooled": -1.8675569226435407,
+    "mkt_proxy_mean": 0.034300716715104804
+  },
+  "posthoc_not_preregistered": {
+    "cooldown_timed": {
+      "n_pairs": 517,
+      "n_exits": 517,
+      "reentry_rate": 1.0,
+      "pos_share": 0.6595744680851063,
+      "neg_share": 0.32688588007736946,
+      "zero_share": 0.013539651837524178,
+      "gap_mean": 0.01979110435778904,
+      "gap_median": 0.014084507042253502,
+      "gap_std": 0.04913758817315656,
+      "gap_weighted_mean": 0.018370197587987695,
+      "gap_t_pooled": 9.15801739786551,
+      "cal_days_median": 8.0,
+      "cal_days_mean": 7.336557059961315,
+      "roundtrip_cost_bp_median": 24.365556723069673,
+      "roundtrip_cost_bp_mean": 25.814102352267334,
+      "exit_value_sum": 5596544.549994915,
+      "bars_elapsed_n": 517,
+      "bars_elapsed_median": 6.0,
+      "bars_elapsed_mean": 4.938104448742747,
+      "bars_elapsed_p25": 4.0,
+      "bars_elapsed_p75": 6.0,
+      "bars_elapsed_share_le_6": 1.0,
+      "bars_elapsed_share_le_3": 0.218568665377176,
+      "verdict": "H2_dominant",
+      "checks": {
+        "H2_pos_share": {
+          "value": 0.6595744680851063,
+          "threshold": "> 0.5",
+          "hit": true
+        },
+        "H2_weighted_gap_ge_0": {
+          "value": 0.018370197587987695,
+          "threshold": ">= 0.0",
+          "hit": true
+        },
+        "H2_median_bars_short": {
+          "value": 6.0,
+          "threshold": "<= 6",
+          "hit": true
+        },
+        "H1_neg_share": {
+          "value": 0.32688588007736946,
+          "threshold": "> 0.5",
+          "hit": false
+        },
+        "_h2_all_three": true
+      }
+    },
+    "stop_like": {
+      "n_pairs": 601,
+      "n_exits": 601,
+      "reentry_rate": 1.0,
+      "pos_share": 0.7088186356073212,
+      "neg_share": 0.28452579034941766,
+      "zero_share": 0.0066555740432612314,
+      "gap_mean": 0.04192487574638543,
+      "gap_median": 0.032786885245901676,
+      "gap_std": 0.08946956158067618,
+      "gap_weighted_mean": 0.04339604521156451,
+      "gap_t_pooled": 11.487716543873047,
+      "cal_days_median": 16.0,
+      "cal_days_mean": 33.948419301164726,
+      "roundtrip_cost_bp_median": 24.380041484212953,
+      "roundtrip_cost_bp_mean": 26.786824265056527,
+      "exit_value_sum": 5701257.254748391,
+      "bars_elapsed_n": 601,
+      "bars_elapsed_median": 11.0,
+      "bars_elapsed_mean": 22.469217970049918,
+      "bars_elapsed_p25": 6.0,
+      "bars_elapsed_p75": 24.0,
+      "bars_elapsed_share_le_6": 0.33610648918469216,
+      "bars_elapsed_share_le_3": 0.056572379367720464,
+      "verdict": "mixed",
+      "checks": {
+        "H2_pos_share": {
+          "value": 0.7088186356073212,
+          "threshold": "> 0.5",
+          "hit": true
+        },
+        "H2_weighted_gap_ge_0": {
+          "value": 0.04339604521156451,
+          "threshold": ">= 0.0",
+          "hit": true
+        },
+        "H2_median_bars_short": {
+          "value": 11.0,
+          "threshold": "<= 6",
+          "hit": false
+        },
+        "H1_neg_share": {
+          "value": 0.28452579034941766,
+          "threshold": "> 0.5",
+          "hit": false
+        },
+        "_h2_all_three": false
+      }
+    },
+    "cooldown_and_deep": {
+      "n_pairs": 202,
+      "n_exits": 202,
+      "reentry_rate": 1.0,
+      "pos_share": 0.6881188118811881,
+      "neg_share": 0.30198019801980197,
+      "zero_share": 0.009900990099009901,
+      "gap_mean": 0.029352622411572674,
+      "gap_median": 0.02467138466444685,
+      "gap_std": 0.053660713566985485,
+      "gap_weighted_mean": 0.0289528826557844,
+      "gap_t_pooled": 7.774386885385375,
+      "cal_days_median": 8.0,
+      "cal_days_mean": 7.7772277227722775,
+      "roundtrip_cost_bp_median": 24.221985217605145,
+      "roundtrip_cost_bp_mean": 24.952104289343616,
+      "exit_value_sum": 1808752.8303349982,
+      "bars_elapsed_n": 202,
+      "bars_elapsed_median": 6.0,
+      "bars_elapsed_mean": 5.108910891089109,
+      "bars_elapsed_p25": 5.0,
+      "bars_elapsed_p75": 6.0,
+      "bars_elapsed_share_le_6": 1.0,
+      "bars_elapsed_share_le_3": 0.16831683168316833,
+      "verdict": "H2_dominant",
+      "checks": {
+        "H2_pos_share": {
+          "value": 0.6881188118811881,
+          "threshold": "> 0.5",
+          "hit": true
+        },
+        "H2_weighted_gap_ge_0": {
+          "value": 0.0289528826557844,
+          "threshold": ">= 0.0",
+          "hit": true
+        },
+        "H2_median_bars_short": {
+          "value": 6.0,
+          "threshold": "<= 6",
+          "hit": true
+        },
+        "H1_neg_share": {
+          "value": 0.30198019801980197,
+          "threshold": "> 0.5",
+          "hit": false
+        },
+        "_h2_all_three": true
+      }
+    },
+    "long_gap_gt_6": {
+      "n_pairs": 1589,
+      "n_exits": 1589,
+      "reentry_rate": 1.0,
+      "pos_share": 0.6079295154185022,
+      "neg_share": 0.382001258653241,
+      "zero_share": 0.010069225928256766,
+      "gap_mean": 0.0337408885486957,
+      "gap_median": 0.018891687657430545,
+      "gap_std": 0.10962097507101917,
+      "gap_weighted_mean": 0.03343605784044795,
+      "gap_t_pooled": 12.26944175100968,
+      "cal_days_median": 36.0,
+      "cal_days_mean": 53.545626179987416,
+      "roundtrip_cost_bp_median": 23.991085714285717,
+      "roundtrip_cost_bp_mean": 27.714553693672844,
+      "exit_value_sum": 18843906.16355841,
+      "bars_elapsed_n": 1589,
+      "bars_elapsed_median": 24.0,
+      "bars_elapsed_mean": 35.53178099433606,
+      "bars_elapsed_p25": 12.0,
+      "bars_elapsed_p75": 42.0,
+      "bars_elapsed_share_le_6": 0.0,
+      "bars_elapsed_share_le_3": 0.0,
+      "verdict": "mixed",
+      "checks": {
+        "H2_pos_share": {
+          "value": 0.6079295154185022,
+          "threshold": "> 0.5",
+          "hit": true
+        },
+        "H2_weighted_gap_ge_0": {
+          "value": 0.03343605784044795,
+          "threshold": ">= 0.0",
+          "hit": true
+        },
+        "H2_median_bars_short": {
+          "value": 24.0,
+          "threshold": "<= 6",
+          "hit": false
+        },
+        "H1_neg_share": {
+          "value": 0.382001258653241,
+          "threshold": "> 0.5",
+          "hit": false
+        },
+        "_h2_all_three": false
+      }
+    }
+  },
+  "posthoc_excess_by_slice": {
+    "cooldown_timed": {
+      "n": 517,
+      "excess_mean": 0.009177266697142972,
+      "excess_median": 0.006158222253187365,
+      "excess_weighted_mean": 0.008007891457750065,
+      "excess_pos_share": 0.5899419729206963,
+      "excess_t_pooled": 4.806300608482009,
+      "mkt_proxy_mean": 0.010613837660646068
+    },
+    "long_gap_gt_6": {
+      "n": 1589,
+      "excess_mean": -0.008266635259647097,
+      "excess_median": -0.006367406694854515,
+      "excess_weighted_mean": -0.008488130144166276,
+      "excess_pos_share": 0.4505978602894902,
+      "excess_t_pooled": -3.0057389201578704,
+      "mkt_proxy_mean": 0.04200752380834279
+    }
+  },
+  "verdict_dedup": {
+    "verdict": "mixed",
+    "checks": {
+      "H2_pos_share": {
+        "value": 0.620607787274454,
+        "threshold": "> 0.5",
+        "hit": true
+      },
+      "H2_weighted_gap_ge_0": {
+        "value": 0.029986172276752765,
+        "threshold": ">= 0.0",
+        "hit": true
+      },
+      "H2_median_bars_short": {
+        "value": 16.0,
+        "threshold": "<= 6",
+        "hit": false
+      },
+      "H1_neg_share": {
+        "value": 0.3684710351377018,
+        "threshold": "> 0.5",
+        "hit": false
+      },
+      "_h2_all_three": false
+    }
+  },
+  "verdict_pooled": {
+    "verdict": "mixed",
+    "checks": {
+      "H2_pos_share": {
+        "value": 0.6543308131051864,
+        "threshold": "> 0.5",
+        "hit": true
+      },
+      "H2_weighted_gap_ge_0": {
+        "value": 0.03203971937500177,
+        "threshold": ">= 0.0",
+        "hit": true
+      },
+      "H2_median_bars_short": {
+        "value": 12.0,
+        "threshold": "<= 6",
+        "hit": false
+      },
+      "H1_neg_share": {
+        "value": 0.3385064332139541,
+        "threshold": "> 0.5",
+        "hit": false
+      },
+      "_h2_all_three": false
+    }
+  },
+  "bars_histogram": {
+    "2": 67,
+    "3": 275,
+    "4": 131,
+    "5": 329,
+    "6": 1487,
+    "7": 266,
+    "8": 356,
+    "9": 395,
+    "10": 204,
+    "11": 239,
+    "12": 187,
+    "13": 226,
+    "14": 58,
+    "15": 190,
+    "16": 150,
+    "17": 56,
+    "18": 120,
+    "19": 167,
+    "20": 156,
+    "21": 119,
+    "22": 156,
+    "23": 96,
+    "24": 113,
+    "25": 137,
+    "26": 104,
+    "27": 45,
+    "28": 147,
+    "29": 44,
+    "30": 41,
+    "31": 36,
+    "32": 33,
+    "33": 16,
+    "34": 52,
+    "35": 57,
+    "36": 49,
+    "37": 47,
+    "38": 22,
+    "39": 22,
+    "40": 20,
+    "41": 64,
+    "42": 61,
+    "43": 11,
+    "44": 56,
+    "45": 49,
+    "46": 42,
+    "47": 27,
+    "48": 57,
+    "49": 19,
+    "50": 6,
+    "51": 18,
+    "52": 28,
+    "53": 18,
+    "54": 45,
+    "55": 35,
+    "56": 18,
+    "57": 35,
+    "58": 30,
+    "59": 14,
+    "60": 7,
+    "61": 24,
+    "62": 8,
+    "63": 8,
+    "64": 19,
+    "65": 16,
+    "66": 6,
+    "68": 8,
+    "70": 14,
+    "71": 10,
+    "72": 8,
+    "74": 17,
+    "75": 15,
+    "76": 6,
+    "80": 7,
+    "82": 19,
+    "83": 6,
+    "84": 5,
+    "85": 6,
+    "86": 5,
+    "87": 6,
+    "90": 5,
+    "94": 8,
+    "96": 11,
+    "101": 9,
+    "105": 6,
+    "106": 5,
+    "112": 5,
+    "113": 5,
+    "117": 9,
+    "118": 12,
+    "129": 9,
+    "132": 10,
+    "139": 17,
+    "140": 5,
+    "150": 8,
+    "151": 12,
+    "156": 5,
+    "160": 6,
+    "166": 11,
+    "212": 6
+  }
+}
