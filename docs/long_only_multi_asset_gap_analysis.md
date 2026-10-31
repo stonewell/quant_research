@@ -50,7 +50,8 @@
 - **配置键**：`lifecycle_price_reentry_pct=0.02`、`lifecycle_two_day_rule=false`、`lifecycle_break_vol_shrink_pct=0.60`。
 - **NaN vs 0.0（关键）**：所有冷却/止损/破位卖出必须在调仓行写**显式 `0.0`**。`position_lifecycle` 内部已返回 `target_weight=0.0`，但一旦接线时写成 NaN，列级 ffill 会保留陈旧持仓——正是 AGENTS.md 记录过两次的同类 bug。
 - **验证**：`pipeline/parity_harness.py` 逐 bar 比对 shares 与 weights；合成"假破位反弹""缩量回踩""T+1 隔日再入场"三类场景。
-- **版本义务**：改 `common/` 无需 bump BASE_VERSION；若顺带改 `blend_base` 则必须 `1.6.0→1.7.0` 并同步两份 versioning 测试与 `docs/version.md`。
+- **版本义务**：改 `common/` 无需 bump BASE_VERSION；若顺带改 `blend_base` 则必须 `1.7.0→1.8.0` 并同步两份 versioning 测试与 `docs/version.md`。
+  - **（2026-10-31 与 `docs/development_plan.md` 口径同步）**：本节原文写作 `1.6.0→1.7.0`，该值已过期——`BASE_VERSION` 现为 **`1.7.0`**（`C6.1` 已于 2026-10-29 完成 `1.6.0→1.7.0`），故下一次改 `blend_base` 的升级义务是 **`1.7.0 → 1.8.0`**，与 `M1.1`/`M4.2` 的登记口径一致；两份测试断言（`common/tests/test_strategy_versioning.py:181`、`pipeline/research_strategy/tests/test_blend_strategy_versioning.py:42`）当前均钉在 `"1.7.0"`。
 
 > **2026-10-26 收敛升级**：本节的「统一冷却状态机」已扩展为 [`docs/position_policy_consolidation_design.md`](file:///home/stone/Work/github/quant/docs/position_policy_consolidation_design.md) 的四阶段内核收敛（`development_plan.md` §2.16 `M4.1`–`M4.4`）；`M1.1` 的验收并入 `M4.2`，本节的价格再入场、两日法则与显式 `0.0` 规则作为 `AssetPolicy` 的 policy chain 条目保留。
 

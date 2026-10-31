@@ -1029,8 +1029,10 @@ bar 事实 (ohlcv_bars 的 MIN(date)/MAX(date))
 ### 12.6 与同批/后续条目的关系（诚实披露）
 
 - **`L2.6`（已完成）**：本节保留其 `LEAST`/`GREATEST`/`is_earliest_known` 粘滞语义，仅在**边界被 bar 表证伪**的两个方向上把 bar 事实置于优先（`COALESCE(first-arg)`），`L2.6` 的四条回归用例逐条通过。**潜在张力**：`L2.6` 的原始表述是"earliest 只可前移"，本节新增"earliest 比任何 bar 都早时夹到 `bars_min`"，即**存在一个会让 earliest 后移的窄口**。其依据是本次要求"边界与 bar 事实不一致时按 bar 事实校正"，且该窄口只在**元数据声称的历史已不在 bar 表里**时触发（元数据与被描述数据矛盾），与 `L2.6` 禁止的"用请求窗口下调"不是同一件事。
-- **`L2.7` / `L2.14`（待办）**：日内侧（`is_intraday_range_covered` / `store_intraday_bars`）**本次未动**——仍是"只信元数据 + `INSERT OR REPLACE` 盲写"。`L2.18` 的自愈只覆盖日线；日内侧接入真实 5m 源前，必须按 `L2.7`+`L2.14` 同批把本节的三条原则（bar 事实优先、后端空洞/前端空洞双向校验、自愈留痕）移植过去，避免出现第三套漂移判定。移植时**不要**直接复用 `store_bars` 的 SQL：日内表还多 `interval` 维度与 `latest_close_ref`（R4 漂移检测会主动 purge 全表，属合法例外）。
-- **`L2.15`（待办）**：`scripts/sync_china_5m_and_indices.py` 仍会无条件 `UPDATE asset_sync_metadata SET is_earliest_known = TRUE`。该脚本绕过 `store_bars` 直接改元数据，本节的自愈**不会**纠正 `is_earliest_known`（按 `L2.6`，它只由 `OR` 粘滞、或人类显式 UPDATE 复位）。`L2.15` 落地时该 UPDATE 应改为"提供上游证据"，否则"是否已知最早"仍可被无关同步置真。
+- **`L2.7` / `L2.14`（已闭环，本段为 2026-10-23 时的状态快照）**：日内侧（`is_intraday_range_covered` / `store_intraday_bars`）**本次未动**——当时仍是"只信元数据 + `INSERT OR REPLACE` 盲写"。`L2.18` 的自愈只覆盖日线；日内侧接入真实 5m 源前，必须按 `L2.7`+`L2.14` 同批把本节的三条原则（bar 事实优先、后端空洞/前端空洞双向校验、自愈留痕）移植过去，避免出现第三套漂移判定。移植时**不要**直接复用 `store_bars` 的 SQL：日内表还多 `interval` 维度与 `latest_close_ref`（R4 漂移检测会主动 purge 全表，属合法例外）。
+  - **（2026-10-31 与 [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) 口径同步）**：`L2.7` 与 `L2.14` 均已落地（`L2.7` 见 [`docs/development_plan_archive.md`](file:///home/stone/Work/github/quant/docs/development_plan_archive.md) §2.12 的 `L2.7` 行 `[x]`；`L2.14` 见 `docs/development_plan.md` §2.13 的 `L2.14` 行 `[x]`），日内侧不再"只信元数据 + `INSERT OR REPLACE` 盲写"——`store_intraday_bars` 与日线路径共用 `_reconcile_sync_metadata_with_bars` 的方向性 upsert（`ON CONFLICT DO UPDATE`，配合 `LEAST`/`GREATEST`/`is_earliest_known` 粘滞），上文"本次未动"只对 2026-10-23 那一刻成立。
+- **`L2.15`（已闭环，本段为 2026-10-23 时的状态快照）**：`scripts/sync_china_5m_and_indices.py` 仍会无条件 `UPDATE asset_sync_metadata SET is_earliest_known = TRUE`。该脚本绕过 `store_bars` 直接改元数据，本节的自愈**不会**纠正 `is_earliest_known`（按 `L2.6`，它只由 `OR` 粘滞、或人类显式 UPDATE 复位）。`L2.15` 落地时该 UPDATE 应改为"提供上游证据"，否则"是否已知最早"仍可被无关同步置真。
+  - **（2026-10-31 与 [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) 口径同步）**：`L2.15` 已于 2026-10-23 落地（`docs/development_plan.md` §2.13 的 `L2.15` 行 `[x]`）——两处无条件 `is_earliest_known = TRUE` 均已删除（脚本 docstring 现明确记录"old unconditional … is gone"，见 `scripts/sync_china_5m_and_indices.py:10`、`:123`、`:883`），改为按 bar 事实给出上游证据；PATCH 路径对传入帧做前截断（保留帧首根），脚本侧零直接元数据写入。上文"仍会无条件 UPDATE"只对 2026-10-23 之前成立。
 - **`L2.8`/`L2.16`/`L2.19`**：与本节无接口冲突；`L2.19` 若涉及缓存路径同样须遵守 §12.5 自查表。
 
 ---
@@ -2334,6 +2336,7 @@ exit: 1
   不可比特级复现）两条披露**仍然有效**：残缝还在、`600362` 的 rebase 也存活。它们不因本次证伪而撤销。
 - `§16.14.6` 的"**Track L 至此无未完成项**"**同样失效**：`L2.8` 已重开，并新增 `L2.32`。台账口径现为
   **125 项 / 103 `[x]` / 22 `[ ]`**（`grep -c` 实测）。
+- **（2026-10-31 注记 · 现值指针）**：上一条的 **125 项 / 103 `[x]` / 22 `[ ]`** 是 **2026-10-23 当刻的 Track L 台账快照**，按"不删旧文、不回改留痕"惯例**保留原数字**、不回改。**现值一律以 [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) §二 的「计数口径」行（`:102`）与「状态口径」行为准**——2026-10-31 口径为：现役 **123 项 = 87 `[x]` + 36 `[ ]`**，已归档 66 项（全 `[x]`），两文件合计 **189 = 153 `[x]` + 36 `[ ]`**。
 
 #### 16.15.8 池出处补记：`blend_17_baseline` 的宇宙来自仓外文件（2026-10-23 用户提供）
 

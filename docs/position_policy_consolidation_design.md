@@ -118,7 +118,8 @@
 
 ## 11. 版本义务
 
-- 改 `pipeline/research/blend/blend_base.py` → `BASE_VERSION 1.6.0 → 1.7.0`（向后兼容），同步 `common/tests/test_strategy_versioning.py:181` 与 `pipeline/research_strategy/tests/test_blend_strategy_versioning.py:42`。
+- 改 `pipeline/research/blend/blend_base.py` → `BASE_VERSION 1.7.0 → 1.8.0`（向后兼容），同步 `common/tests/test_strategy_versioning.py:181` 与 `pipeline/research_strategy/tests/test_blend_strategy_versioning.py:42`。
+  - **（2026-10-31 与 `docs/development_plan.md` 口径同步）**：本节原文写作 `1.6.0 → 1.7.0`，该值已过期——`1.6.0 → 1.7.0` 已由 `C6.1`（2026-10-29）消耗，现役 `BASE_VERSION` 为 **`1.7.0`**（两份 versioning 测试均断言 `"1.7.0"`），故下一次升级为 **`1.7.0 → 1.8.0`**。同步义务本身不变：两份 versioning 测试 + `--dump-strategies` + `docs/version.md` 中文 changelog。
 - 改 `common/allocation_templates.py` → `AllocationTemplate` 无 file-level `BASE_VERSION`（**不要发明**），只 bump 被改类的 per-class `version`。
 - 改具体策略逻辑 → bump 该类 `version`。
 - 统一执行：`uv run python pipeline/research_strategy/run_research_strategy.py --dump-strategies` 重建 dumps；`docs/version.md` 追加中文 changelog；`docs/development_plan.md` 更新状态。
