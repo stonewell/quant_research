@@ -2692,3 +2692,185 @@ def test_real_archive_three_legacy_dates_are_reachable(temp_storage):
 
     # Every echoed key is inside the selection's alias class, whichever file exists.
     assert all(keys_match(_P2_UNIV_SELECTION, r["universe_key"]) for r in runs)
+
+
+# ---------------------------------------------------------------------------
+# 14. (P3) A scoped read must not be handed an unrelated legacy flat round
+#
+# FORENSIC CONTEXT.  `get_run` ended with an unconditional last resort:
+#
+#     legacy = os.path.join(self.archive_dir, date_str)
+#     if is_run_dir(legacy):
+#         run_dir = legacy
+#
+# It was written for the legacy flat layout (`<archive>/<date>/`, the archive's
+# pre-`<strategy>/<universe>/` shape) and the UNKEYED route, which legitimately
+# addresses a date without a scope.  But it ran for SCOPED reads too, so any
+# strategy/universe pair asking for a date that only exists as a flat round was
+# handed that round -- somebody else's ticket, echoed back with the REQUEST's
+# `strategy_key` / `universe_key` (`chosen.get("strategy_key") or strategy_key`
+# in the bundle).  Measured on the real archive before the fix:
+#
+#   get_run("2026-09-29", "chan_four_state_blend", "custom_astock_202609_20_new")
+#       -> path <archive>/2026-09-29, strategy_key "chan_four_state_blend"
+#          (the round is the accelerating_dual_momentum one)
+#   get_run("2026-09-29", "chan_four_state_blend", "china_20_etf")
+#       -> the same foreign round; `get_run_csv` leaked it identically.
+#
+# So a wrong selection produced another strategy's data, mislabelled, which is
+# worse than an empty view.  The fallback is now UNSCOPED-ONLY, and nothing
+# legitimate is lost by that: a scoped request whose keys match a legacy round is
+# already answered by the `list_runs` search that precedes the fallback -- that
+# search applies the same recorded/derived-key rule (`resolve_keys` +
+# `keys_match`) the listing uses, so the history row for 2026-09-29 stays openable
+# through the keyed route while `chan_four_state_blend/...` gets its 404.
+# ---------------------------------------------------------------------------
+
+_P3_DATE = "2026-09-29"
+_P3_OTHER_STRAT = "accelerating_dual_momentum"
+_P3_OTHER_UNIV = "2026_09_29_resolved_universe"
+
+
+def _seed_legacy_flat_round(root, date_str, summary_extra):
+    """One legacy flat round: `<root>/<date>/` with a summary and a Stage-2 ticket.
+
+    Writes BOTH ticket files: `get_run` reads the JSON, `get_run_csv` the CSV, and the
+    leak this section pins happened on both routes.
+    """
+    dated = os.path.join(root, date_str)
+    os.makedirs(dated, exist_ok=True)
+    with open(os.path.join(dated, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump({"date": date_str, **summary_extra}, f)
+    with open(os.path.join(dated, "live_trading_ticket.json"), "w", encoding="utf-8") as f:
+        json.dump([{"action": "BUY", "symbol": "AAA", "shares": 1}], f)
+    with open(os.path.join(dated, "live_trading_ticket.csv"), "w", encoding="utf-8") as f:
+        f.write("action,symbol,shares\nBUY,AAA,1\n")
+    return dated
+
+
+def test_scoped_get_run_does_not_return_a_foreign_legacy_round(temp_storage):
+    """A scoped miss is a miss -- never `<archive>/<date>`'s unrelated round.
+
+    Shaped like the real archive: the only run on the date is a legacy flat round
+    belonging to `accelerating_dual_momentum`.  A read scoped to a different pair must
+    return nothing (the route then 404s), not that round relabelled with the request's
+    keys.  Both directions of the leak are pinned: a custom-universe pair and a preset
+    pair, on `get_run` and on `get_run_csv` (the CSV route had the same fallback).
+
+    re-break: restore the unconditional fallback (`if is_run_dir(legacy): run_dir =
+    legacy` without the `not strategy_key and not universe_key` guard, storage.py:3059 /
+    3235) -- the flat round comes back echoed as `strategy_key='chan_four_state_blend'`
+    (verified red).
+    """
+    flat = _seed_legacy_flat_round(
+        temp_storage.archive_dir,
+        _P3_DATE,
+        {"strategy_key": _P3_OTHER_STRAT, "universe_key": _P3_OTHER_UNIV},
+    )
+
+    for strat, univ in (
+        (_P2_STRAT, _P2_UNIV_SELECTION),  # custom universe
+        (_P2_STRAT, "china_20_etf"),  # preset universe
+    ):
+        bundle = temp_storage.get_run(_P3_DATE, strategy_key=strat, universe_key=univ)
+        assert bundle is None, f"scoped miss handed the {_P3_OTHER_STRAT} round"
+        assert (bundle or {}).get("path") != flat
+        assert temp_storage.get_run_csv(_P3_DATE, strategy_key=strat, universe_key=univ) is None
+
+
+def test_unscoped_get_run_still_returns_the_legacy_round(temp_storage):
+    """The legacy round stays viewable without a scope -- the fallback's real job.
+
+    The unkeyed route (`GET /api/runs/{date_str}`, server.py:451) and pre-`<strategy>/
+    <universe>/` browsing address a date with no keys at all; that path must be
+    byte-identical to before the guard.  `None` and `""` both mean "unscoped" here,
+    matching `find_existing_run_base_dir`'s own test (storage.py:2651-2656).
+
+    re-break: refuse flat rounds to UNSCOPED reads too (an early `return None` when no
+    scope was claimed and the resolved dir sits directly under the archive root), on top
+    of the same refusal in `find_existing_run_base_dir` -- both reads return None
+    (verified red).  That is deliberately the whole family: a keyless date read reaches
+    the flat round by THREE independent paths (`find_existing_run_base_dir`'s unscoped
+    branch 2651-2656, the `list_runs` search, and `get_run`'s own fallback), so deleting
+    the fallback alone -- the exact change this pass made scoped-only -- cannot break
+    this test, which is itself the proof that the fallback was never load-bearing for
+    the unkeyed route.
+    """
+    flat = _seed_legacy_flat_round(
+        temp_storage.archive_dir,
+        _P3_DATE,
+        {"strategy_key": _P3_OTHER_STRAT, "universe_key": _P3_OTHER_UNIV},
+    )
+
+    for strat, univ in ((None, None), ("", "")):
+        bundle = temp_storage.get_run(_P3_DATE, strategy_key=strat, universe_key=univ)
+        assert bundle is not None, f"unscoped read lost the legacy round for ({strat!r}, {univ!r})"
+        assert os.path.normpath(bundle["path"]) == os.path.normpath(flat)
+        assert temp_storage.get_run_csv(_P3_DATE, strategy_key=strat, universe_key=univ) is not None
+
+
+def test_scoped_get_run_returns_a_legacy_round_whose_summary_matches(temp_storage):
+    """The guard is a MATCH test, not a blanket ban on scoped legacy reads.
+
+    A flat round whose summary records the requested keys IS that scope, so it must be
+    returned -- and by `keys_match`, not raw equality, which is why the request also
+    works with the directory-style alias `astock_202609_20_custom` for the custom key.
+
+    re-break: refuse scoped legacy reads outright -- `if not run_dir and (strategy_key
+    or universe_key): return None` before the `list_runs` search.  That is the
+    over-correction this test guards against (the key rule lives in the search, not in
+    the fallback); it goes red here and in the derived-key test while the
+    foreign-round test stays green (verified red).
+    """
+    flat = _seed_legacy_flat_round(
+        temp_storage.archive_dir,
+        _P3_DATE,
+        {"strategy_key": _P2_STRAT, "universe_key": _P2_UNIV_SELECTION},
+    )
+
+    for univ in (_P2_UNIV_SELECTION, _P2_UNIV_DIR):  # alias spellings of one key
+        bundle = temp_storage.get_run(_P3_DATE, strategy_key=_P2_STRAT, universe_key=univ)
+        assert bundle is not None, f"matching legacy round refused for universe {univ!r}"
+        assert os.path.normpath(bundle["path"]) == os.path.normpath(flat)
+        assert temp_storage.get_run_csv(_P3_DATE, strategy_key=_P2_STRAT, universe_key=univ)
+
+
+def test_scoped_get_run_matches_a_keyless_legacy_round_by_its_derived_keys(temp_storage):
+    """The real 2026-09-29 shape: no keys recorded, only `strategy_file`/`universe_file`.
+
+    That round's summary predates key recording, but `list_runs` still shows it under
+    `accelerating_dual_momentum` / `2026_09_29_resolved_universe` (the `resolve_keys`
+    legacy branch) -- and the UI opens history rows through the SCOPED route only.  A
+    strict "recorded keys or nothing" guard would make a listed round unopenable, so the
+    guard asks the same `resolve_keys` owner for the round's keys.  A foreign pair is
+    still refused.
+
+    re-break: same over-correction as the previous test -- `if not run_dir and
+    (strategy_key or universe_key): return None` before the `list_runs` search, i.e.
+    refusing every scoped legacy read instead of asking `resolve_keys` what the round
+    is (verified red).  The derivation itself has ONE owner (`list_runs`'s legacy
+    branch); this test pins that the keyed route reaches it.
+    """
+    flat = _seed_legacy_flat_round(
+        temp_storage.archive_dir,
+        _P3_DATE,
+        {
+            "strategy_file": f"/legacy/{_P3_OTHER_STRAT}_strategy.json",
+            "universe_file": f"/legacy/{_P3_DATE}/resolved_universe.txt",
+        },
+    )
+
+    bundle = temp_storage.get_run(
+        _P3_DATE, strategy_key=_P3_OTHER_STRAT, universe_key=_P3_OTHER_UNIV
+    )
+    assert bundle is not None, "a listed legacy round became unopenable through the keyed route"
+    assert os.path.normpath(bundle["path"]) == os.path.normpath(flat)
+    assert temp_storage.get_run_csv(
+        _P3_DATE, strategy_key=_P3_OTHER_STRAT, universe_key=_P3_OTHER_UNIV
+    )
+
+    # Still not a free pass: a different scope gets nothing.
+    assert (
+        temp_storage.get_run(_P3_DATE, strategy_key=_P2_STRAT, universe_key=_P2_UNIV_SELECTION)
+        is None
+    )

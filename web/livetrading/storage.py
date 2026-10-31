@@ -3047,9 +3047,19 @@ class StorageManager:
             if matching:
                 run_dir = matching[0]["path"]
             else:
-                legacy = os.path.join(self.archive_dir, date_str)
-                if is_run_dir(legacy):
-                    run_dir = legacy
+                # (P3) `<archive>/<date>` is the LEGACY FLAT layout: addressable only
+                # WITHOUT a scope (the unkeyed route, legacy browsing).  It used to be
+                # the unconditional last resort, so a scoped MISS -- any date that only
+                # exists as a flat round -- was handed that round and echoed it under the
+                # caller's keys, i.e. another strategy's ticket, mislabelled.  A scoped
+                # request whose keys DO match a legacy round never needed this branch:
+                # the `list_runs` search just above applies the same recorded/derived-key
+                # rule (`keys_match`), so refusing a scoped fallback here loses no
+                # legitimate read and a scoped miss is a miss (the route's own 404).
+                if not strategy_key and not universe_key:
+                    legacy = os.path.join(self.archive_dir, date_str)
+                    if is_run_dir(legacy):
+                        run_dir = legacy
 
         if not run_dir or not is_run_dir(run_dir):
             return None
@@ -3219,9 +3229,13 @@ class StorageManager:
             if matching:
                 run_dir = matching[0]["path"]
             else:
-                legacy = os.path.join(self.archive_dir, date_str)
-                if is_run_dir(legacy):
-                    run_dir = legacy
+                # (P3) Same rule as `get_run`: the CSV route is scoped by the same keys,
+                # leaked the identical foreign round, and its matching case is likewise
+                # served by the `list_runs` search above.
+                if not strategy_key and not universe_key:
+                    legacy = os.path.join(self.archive_dir, date_str)
+                    if is_run_dir(legacy):
+                        run_dir = legacy
 
         if not run_dir or not is_run_dir(run_dir):
             return None
