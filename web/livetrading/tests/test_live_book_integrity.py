@@ -3713,21 +3713,55 @@ def test_every_deploy_payload_sends_the_confirmed_empty_book():
     path added without the disjunct would change neither of the other asserts until it
     was actually exercised, so the site count is pinned at exactly 4.
 
-    Static source assertion only (see the section header) -- it cannot prove the browser
-    flow, which is why sections 7/8 pin the server behaviour hermetically.
+    This is a STATIC SOURCE ASSERTION, not a behavioural test (see the section header):
+    nothing here executes `app.js` -- there is no JS runtime in this suite -- so it
+    cannot prove what a browser actually sends.  It pins the SHAPE and LOCATION of every
+    `current_holdings:` occurrence in the file: the full `emptyBookConfirmed === true`
+    token (not merely the substring, so a softened `|| emptyBookConfirmed` is red), the
+    `state.holdingsEdited` disjunct, and the site count.  The whole-source audit below
+    makes that count un-evadable -- an inline fifth payload, a trailing comment carrying
+    the token, or a block-comment continuation line all fail with the offending line
+    number rather than silently escaping (or inflating) the count.  It still cannot prove
+    the browser sends what the source describes; sections 7/8 pin the server behaviour
+    hermetically instead.
 
-    re-break: revert ONE site to `state.holdingsEdited ? holdings : null` -- the
-    `emptyBookConfirmed` assert fires for that line (verified red, then restored
-    byte-identically); delete a payload site -- the count assert fires.
+    re-break (gates): revert ONE site to `state.holdingsEdited ? holdings : null` -- the
+    `emptyBookConfirmed === true` assert fires for that line (verified red, then restored
+    byte-identically); soften ONE site to `|| emptyBookConfirmed)` -- the same assert
+    fires, because the whole token is required; delete a payload site -- the count assert
+    fires.
+    re-break (audit): add a temporary inline fifth payload such as
+    `const _tmp = { current_holdings: {} };` in a function body -- the whole-source audit
+    fires naming that exact file and line (verified red, then restored byte-identically);
+    move the token into a `/* ... */` continuation instead -- the audit fires for the same
+    reason.
     """
     with open(_APP_JS_PATH, encoding="utf-8") as f:
         source = f.read()
 
-    # Property-definition lines only: the comment lines that MENTION
-    # `current_holdings: null` start with `//`, so an lstrip is enough to tell them apart.
+    # Whole-source audit, run BEFORE the site count so the count cannot be evaded.  Every
+    # occurrence of the token must be EITHER a property-definition line (`current_holdings:`
+    # at the start of the lstrip'ed line, i.e. one of the four deploy payloads) OR a `//`
+    # comment line (the six docs mentions).  Anything else -- the token inside an inline
+    # object literal or a call argument, a trailing comment carrying it, or a block-comment
+    # continuation line -- would either hide a real fifth deploy path from the line-start
+    # filter or inflate the count with a non-payload, so it fails loudly instead.
+    for lineno, line in enumerate(source.splitlines(), start=1):
+        if "current_holdings:" not in line:
+            continue
+        stripped = line.lstrip()
+        if stripped.startswith("current_holdings:") or stripped.startswith("//"):
+            continue
+        assert False, (
+            "a `current_holdings:` occurrence is neither a deploy-payload property line nor "
+            "a `//` comment, so a deploy payload can no longer hide from (or inflate) the "
+            f"site count -- keep it as a line-start property or a `//` comment: "
+            f"{_APP_JS_PATH}:{lineno}: {stripped}"
+        )
+
     payload_sites = [
-        line.strip()
-        for line in source.splitlines()
+        (lineno, line.strip())
+        for lineno, line in enumerate(source.splitlines(), start=1)
         if line.lstrip().startswith("current_holdings:")
     ]
 
@@ -3735,12 +3769,13 @@ def test_every_deploy_payload_sends_the_confirmed_empty_book():
         "expected exactly 4 deploy payloads carrying `current_holdings:`, found "
         f"{len(payload_sites)}: {payload_sites}"
     )
-    for line in payload_sites:
+    for _lineno, line in payload_sites:
         assert "state.holdingsEdited" in line, (
             "a deploy payload no longer gates on the operator having edited the table: "
             f"{line}"
         )
-        assert "emptyBookConfirmed" in line, (
-            "a deploy payload drops the confirmed-empty-book case, so a first deploy of a "
-            f"seedless (strategy, universe) pair cannot send its all-cash book: {line}"
+        assert "emptyBookConfirmed === true" in line, (
+            "a deploy payload drops (or softens) the confirmed-empty-book case -- the full "
+            "`emptyBookConfirmed === true` token is required, so a first deploy of a "
+            f"seedless (strategy, universe) pair can send its all-cash book: {line}"
         )
