@@ -204,6 +204,139 @@ def test_read_source_prefers_orig_so_repairs_are_idempotent(tmp_path):
     assert obj == pristine  # 第二遍运行从同一份原件出发 -> 输出恒定
 
 
+def test_orig_backup_is_atomic_so_a_dead_copy_never_lands_under_the_final_name(
+    tmp_path, monkeypatch
+):
+    """回归：``shutil.copyfile(path, op)`` 中途被杀会在最终名下留半截 ``.orig``。
+
+    半截 ``.orig`` + "永不覆盖已有 .orig" = 原件永久丢失（活文件此时已被原子写
+    覆写）。改成"同目录 tmp + replace"后，最终名要么不存在，要么是完整的原件。
+    """
+    path = tmp_path / "summary.json"
+    original = json.dumps({"portfolio_value": 197351.17}, indent=2).encode("utf-8")
+    path.write_bytes(original)
+    backup = rep.orig_path(path)
+
+    real_write_bytes = Path.write_bytes
+
+    def crashing_write_bytes(self, data):
+        real_write_bytes(self, data[:7])
+        raise OSError("simulated crash mid-copy")
+
+    monkeypatch.setattr(Path, "write_bytes", crashing_write_bytes)
+    with pytest.raises(OSError):
+        rep.ensure_orig_backup(path)
+    monkeypatch.undo()
+
+    # 最终名下绝不能出现半截备份
+    assert not backup.exists()
+    assert (tmp_path / "summary.json.orig.tmp-repair").exists()
+
+    # 残留的 tmp 不会妨碍真正的备份：完整原件入位，tmp 被 replace 掉
+    info = rep.ensure_orig_backup(path)
+    assert info["created"] is True and info["verified"] is True
+    assert backup.read_bytes() == original
+    assert not (tmp_path / "summary.json.orig.tmp-repair").exists()
+
+
+def test_existing_orig_is_cross_checked_against_manifest_md5_before(
+    tmp_path, monkeypatch, capsys
+):
+    """回归：旧的"复跑校验"是 ``md5(.orig)`` 与 ``.orig`` 自己的记录比 —— trivially true。
+
+    真正的复核对象是 **manifest 记录的 ``md5_before``**（改写前的原件）。不一致时
+    必须大声告警并把 ``verified`` 置 False（验收断言随之失败），但**不删不覆盖**
+    备份本身（删了就真的没有原件了）。
+    """
+    monkeypatch.setattr(rep, "_MANIFEST_MD5_BEFORE", {})
+    path = tmp_path / "summary.json"
+    original = json.dumps({"portfolio_value": 197351.17}, indent=2).encode("utf-8")
+    path.write_bytes(original)
+    backup = rep.orig_path(path)
+    backup.write_bytes(original)
+    # 跑过一次修复后，活文件已是重述后的内容
+    path.write_bytes(b'{"portfolio_value": 198882.17}')
+
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir()
+    manifest = runs_root / "repair_manifest.json"
+
+    # 1) 台账记录的原件 md5 与盘上 .orig 不符（= 截断副本 / 被外部改过）
+    manifest.write_text(
+        json.dumps({"script_version": "1.2.0",
+                    "files": [{"path": str(path), "md5_before": "0" * 32}]}),
+        encoding="utf-8",
+    )
+    assert rep.register_manifest_md5_before(runs_root) == 1
+    info = rep.ensure_orig_backup(path)
+    assert info["created"] is False
+    assert info["verified"] is False
+    assert info["expected_md5"] == "0" * 32
+    assert "warning" in info
+    err = capsys.readouterr().err
+    assert "[WARNING]" in err and "md5_before" in err
+    assert backup.read_bytes() == original  # 保留原样，绝不删改
+
+    # 2) 台账一致 -> verified，且不刷警告
+    manifest.write_text(
+        json.dumps({"script_version": "1.2.0",
+                    "files": [{"path": str(path),
+                               "md5_before": rep.md5_bytes(original)}]}),
+        encoding="utf-8",
+    )
+    assert rep.register_manifest_md5_before(runs_root) == 1
+    info2 = rep.ensure_orig_backup(path)
+    assert info2["verified"] is True
+    assert info2["verified_against"] == "manifest:md5_before"
+    assert backup.read_bytes() == original
+    assert capsys.readouterr().err == ""
+
+    # 3) 台账里没有这条文件 -> 不假装校验过（verified_against=None）
+    monkeypatch.setattr(rep, "_MANIFEST_MD5_BEFORE", {})
+    info3 = rep.ensure_orig_backup(path)
+    assert info3["verified"] is True
+    assert info3["verified_against"] is None
+
+
+def test_preflight_reports_truncated_orig_and_leftover_tmp(tmp_path, monkeypatch, capsys):
+    """预检必须在**任何读取之前**就把半截 .orig 点名（否则第一个症状是 JSONDecodeError）。"""
+    monkeypatch.setattr(rep, "_MANIFEST_MD5_BEFORE", {})
+    runs_root = tmp_path / "runs"
+    run_dir = runs_root / "2026-10-27"
+    run_dir.mkdir(parents=True)
+    good = run_dir / "summary.json"
+    bad = run_dir / "post_holdings.json"
+    good.write_bytes(b'{"ok": 1}')
+    bad.write_bytes(b'{"ok": 2}')
+    rep.orig_path(good).write_bytes(good.read_bytes())
+    rep.orig_path(bad).write_bytes(b'{"ok"')  # 半截副本
+    (run_dir / "account_state.json.orig.tmp-repair").write_bytes(b"partial")
+
+    (runs_root / "repair_manifest.json").write_text(
+        json.dumps(
+            {
+                "script_version": "1.2.0",
+                "files": [
+                    {"path": str(good), "md5_before": rep.md5_bytes(good.read_bytes())},
+                    {"path": str(bad), "md5_before": rep.md5_bytes(b'{"ok": 2}')},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    rep.register_manifest_md5_before(runs_root)
+
+    findings = rep.preflight_existing_orig_backups(runs_root)
+    by_orig = {Path(f["orig"]).name: f for f in findings}
+    assert by_orig["summary.json.orig"]["matches"] is True
+    assert by_orig["post_holdings.json.orig"]["matches"] is False
+    captured = capsys.readouterr()
+    assert "[WARNING]" in captured.err and "post_holdings.json.orig" in captured.err
+    assert "*.tmp-repair" not in captured.err  # 提示的是具体文件名
+    assert "account_state.json.orig.tmp-repair" in captured.err
+    assert "不一致 1 个" in captured.out
+
+
 # ---------------------------------------------------------------------------
 # 3) weights / inertia (the arithmetic that produced the duplicate SELL)
 # ---------------------------------------------------------------------------

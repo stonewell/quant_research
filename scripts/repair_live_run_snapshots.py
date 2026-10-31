@@ -63,11 +63,63 @@ WHY THIS SCRIPT EXISTS (因果链，务必按顺序读)
 结果完全一致；``.orig`` 已存在则永不覆盖。``10-27`` 的原始票面与两个
 ``post_holdings.json`` 原件永不被写入。
 
+``.orig`` 的两条自保护栏（1.2.0 内修，见 ``ensure_orig_backup``）：
+1. **原子落盘**：写同目录 ``<原名>.orig.tmp-repair`` 再 ``replace``，中途被杀不会
+   在最终名下留下半截备份（旧 ``shutil.copyfile`` 会）。
+2. **复跑交叉复核**：``.orig`` 已存在时，其 md5 必须等于盘上 manifest 记录的
+   ``md5_before``（进程启动时登记，见 ``register_manifest_md5_before``）；不一致
+   只大声告警 + 记 ``verified=False``（验收断言随之失败），绝不删改备份本身。
+
+1.2.0 增量（2026-10-30）：10-29 实例的定点修复
+=============================================
+5. **1.1.0 只修了 10-27 的票前账本，没修票后账本。** 10-27 的票面把
+   600584.SH / 600362.SH 以 ``HOLD_FILTERED / COOLDOWN_BLOCKED``（冷却剩 1 日）
+   带了出来，``target_shares=100``；``web/livetrading/storage.py::
+   post_holdings_from_ticket`` 只在 ``target_shares > 0`` 时保留键，于是 10-27 的
+   票后态把两只**已经在 10-26 成交卖出**（操作员已确认）的标的原样写回磁盘。
+   1.1.0 把正确账本另存为 ``post_holdings.recomputed.json`` 却刻意不动原件 ——
+   断点就在这里。
+
+6. **10-29 的输入按"上一轮票后态"取数，于是幽灵仓被第三次复活。**
+   ``2026-10-29/holdings.json``、``2026-10-29/215823/holdings.json`` 与
+   ``2026-10-27/post_holdings.json`` 逐字节相同（6 只）。10-29 的
+   ``holdings_input_check`` 用同一份错误基准自证清白（``n_mismatched: 0``），
+   于是 600584/600362 各 100 股被 ``nav_breakdown.json`` 计价 5,187 + 3,356 = 8,543，
+   而现金侧（操作员手工输入 99,071.46，``cash_source: explicit``）**已经包含**
+   这两只 10-26 的卖出回款 —— 同一笔资产在权益与现金两侧各计一次，NAV 虚增 8,543。
+
+7. **10-29 另有一笔真实成交没进账本：601919.SH 买入 2,400 股 @16.67 = 40,008。**
+   票面 ``BUY / trade_value 40,008``，而账本与 NAV 仍是票前口径。
+
+修复范围（只动这 5 个文件，其余一律不碰）
+----------------------------------------
+* ``2026-10-27/post_holdings.json`` <- 已审计的 4 只账本（覆写前先断言与
+  ``post_holdings.recomputed.json`` 逐字节一致）
+* ``2026-10-29/215823/post_holdings.json``（5 只：去掉两只幽灵仓 + 601919 建仓）
+* ``2026-10-29/215823/nav_breakdown.json``（equity 140,872.00 / cash 59,063.46 /
+  ``nav_computed`` 199,935.46；``nav_effective`` 保留 208,478.46 作历史事实）
+* ``2026-10-29/215823/summary.json``（``portfolio_value`` 199,935.46、
+  ``portfolio_value_original`` 208,478.46、``nav_source`` = restated、``nav_restatement``）
+* ``2026-10-29/215823/account_state.json``（清 ``entry_prices`` / ``lifecycle_states``
+  的幽灵键、``current_nav`` = 199,935.46、``nav_history_10d`` 去重）
+
+估值数学仍然**只**走 ``web/livetrading/valuation.py::compute_nav``（经
+``compute_run_nav``），价格取快照里已记录的单元格（601919 的 16.67 就是票面成交价），
+因子取 ``market.duckdb`` 只读序列 —— 不重写任何公式。
+
+刻意**不改**的缺陷证据见 manifest 的 ``historical_evidence_left_uncorrected``：
+``2026-10-29/holdings.json``、``2026-10-29/215823/holdings.json``、
+``2026-10-29/215823/live_trading_ticket.*``、``2026-10-27/live_trading_ticket.*``、
+``2026-10-27/holdings.json.orig`` 等一律保持原样 —— 它们是"幽灵仓怎么复活的"唯一
+证据链，**后来者不得以"修复"为名改写**。
+
 用法
 ====
     python scripts/repair_live_run_snapshots.py --help
     python scripts/repair_live_run_snapshots.py --dry-run
     python scripts/repair_live_run_snapshots.py
+    # 只跑 1.2.0 的 10-29 定点修复，不重跑 10-22/10-26/10-27 的通用重述 pass：
+    python scripts/repair_live_run_snapshots.py --skip-legacy-runs
 """
 
 from __future__ import annotations
@@ -79,7 +131,6 @@ import io
 import json
 import math
 import re
-import shutil
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -89,7 +140,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.2.0"
 
 DEFAULT_RUNS_ROOT = (
     REPO_ROOT / "web" / "livetrading" / "data" / "runs" / "chan_four_state_blend"
@@ -176,11 +227,125 @@ def read_source_json(path: Path) -> Tuple[Any, str]:
     return json.loads(raw.decode("utf-8")), kind
 
 
-def ensure_orig_backup(path: Path, *, dry_run: bool = False) -> Dict[str, Any]:
+#: 盘上 manifest 里记录的"改写前 md5"索引：``Path.resolve()`` -> ``md5_before``。
+#: ``ensure_orig_backup`` 在发现 ``.orig`` 已存在时用它复核。
+#:
+#: WHY（旧实现的缺陷）：旧代码把 ``.orig`` 的 md5 与"``.orig`` 自己的记录"相比
+#: （``info["md5"] = md5_file(op)`` 然后无条件 ``verified = True``），trivially true
+#: —— 等于什么都没验。而 ``shutil.copyfile`` 直接写最终名，进程若在复制中途被杀，
+#: 最终名下会留下**半截** ``.orig``，"永不覆盖已有 .orig"的规则又让它永久生效，
+#: 真正的原件从此再也取不回来（此时活文件已按原子写被覆写过了）。
+_MANIFEST_MD5_BEFORE: Dict[str, str] = {}
+
+
+def register_manifest_md5_before(runs_root: Path) -> int:
+    """登记盘上 manifest（根 + 冻结副本）里记录的 ``md5_before``，返回登记条数。
+
+    必须在**任何写盘之前**调用：本索引的语义是"改写前的原件 md5"，一旦本轮覆写了
+    ``repair_manifest.json``，上一版的记录就只剩冻结副本里那部分了。
+
+    刻意**不**写进 manifest 的 ``log``：条数首跑为 0、复跑为正，写进去会让"第二遍
+    运行与第一遍逐字节相同（仅 ``generated_at_utc`` 不同）"这条幂等契约失效。校验
+    结果只经 stderr 与 ``ensure_orig_backup`` 的返回值暴露。
+    """
+    runs_root = Path(runs_root)
+    count = 0
+    for name in ("repair_manifest.json", "repair_manifest.v1.1.0.json"):
+        path = runs_root / name
+        if not path.exists():
+            continue
+        try:
+            doc = json.loads(path.read_bytes().decode("utf-8"))
+        except Exception as exc:  # pragma: no cover - 坏 manifest 不该阻断修复
+            print(f"[WARN] 无法解析 {path}: {exc}", file=sys.stderr)
+            continue
+        for entry in doc.get("files") or []:
+            if not isinstance(entry, Mapping):
+                continue
+            recorded = entry.get("path")
+            md5_before = entry.get("md5_before")
+            if not recorded or not md5_before:
+                continue
+            key = _resolve_recorded_path(str(recorded), runs_root).resolve()
+            _MANIFEST_MD5_BEFORE[key] = str(md5_before)
+            count += 1
+    return count
+
+
+def recorded_md5_before(path: Path) -> Optional[str]:
+    """``path`` 在盘上 manifest 里记录的"改写前 md5"（无记录时 ``None``）。"""
+    return _MANIFEST_MD5_BEFORE.get(Path(path).resolve())
+
+
+def preflight_existing_orig_backups(runs_root: Path) -> List[Dict[str, Any]]:
+    """只读预检：已存在的 ``.orig`` 是否仍等于 manifest 记录的 ``md5_before``。
+
+    WHY 要在读/写之前一次性跑一遍：``read_source_bytes`` 一旦读到半截 ``.orig``
+    就抛 ``JSONDecodeError``（那也算"没静默接受"，但报错点离病因很远），而
+    ``ensure_orig_backup`` 要等这个文件被重述时才轮到。先把"哪个备份坏了、台账
+    记的 md5 是多少"点名，症状与病因才绑在一起。
+
+    只**告警**不改判：红线仍是 manifest 的验收断言（``md5(.orig) 必须等于
+    md5_before``），本函数负责让它在写盘/解析失败之前就可见。返回值只打印、不落盘
+    —— 落盘会让"首跑 0 条 / 复跑 N 条"破坏复跑字节一致的幂等契约。
+    """
+    runs_root = Path(runs_root)
+    findings: List[Dict[str, Any]] = []
+    for op in sorted(runs_root.rglob("*.orig")):
+        live = op.with_name(op.name[: -len(".orig")])
+        recorded = recorded_md5_before(live)
+        if recorded is None:
+            continue  # 台账没记过这个文件：无从证伪，也不假装验过
+        now = md5_file(op)
+        record = {
+            "orig": _rel(op),
+            "md5_now": now,
+            "md5_recorded_before": recorded,
+            "matches": now == recorded,
+            "size": op.stat().st_size,
+        }
+        findings.append(record)
+        if not record["matches"]:
+            print(
+                "[WARNING] 已有 .orig 与 manifest 记录的改写前 md5 不一致 -> "
+                f"{_rel(op)} md5={now} != md5_before={recorded}；"
+                "该备份可能是半截副本（或原件被绕过本脚本改写过）。"
+                "本脚本按「永不覆盖」规则不删不修，但它读到的「原件」已不可信",
+                file=sys.stderr,
+            )
+    for tmp in sorted(runs_root.rglob("*.tmp-repair")):
+        print(
+            f"[WARNING] 残留临时文件 {_rel(tmp)}：上一次写盘在 replace 之前中断过；"
+            "下次写入同一目标时会被覆盖，不参与任何读取",
+            file=sys.stderr,
+        )
+    bad = [f for f in findings if not f["matches"]]
+    if findings:
+        print(
+            f"[preflight] 已存在 .orig 备份 {len(findings)} 个，md5 与 manifest "
+            f"md5_before 一致 {len(findings) - len(bad)} 个，不一致 {len(bad)} 个"
+        )
+    return findings
+
+
+def ensure_orig_backup(
+    path: Path,
+    *,
+    dry_run: bool = False,
+    expected_md5: Optional[str] = None,
+) -> Dict[str, Any]:
     """为 ``path`` 建一份逐字节相同的 ``<原名>.orig``，并校验 md5。
 
     硬性约束：``.orig`` 一旦存在就**绝不覆盖** —— 它是唯一能完整还原原件的副本，
     第二次运行时的"当前文件"已经是修正后的内容，覆盖会永久毁掉原始证据。
+
+    两条防"假备份"的护栏：
+    1. **原子落盘**：先写同目录 ``<原名>.orig.tmp-repair`` 再 ``replace``，进程在
+       复制中途被杀也不会在最终名下留下半截文件（``shutil.copyfile`` 会）。
+    2. **复跑交叉复核**：``.orig`` 已存在时，拿它的 md5 与**盘上 manifest 记录的
+       ``md5_before``**（或显式传入的 ``expected_md5``）比对 —— 与自身记录比是
+       trivially true 的，验不出截断。不一致时只**大声告警**、不删不覆盖（删掉就
+       真的没有原件了），并把 ``verified`` 置 False 让验收断言失败。
 
     Returns:
         dict(original=str, backup=str, md5=..., created=bool, verified=bool)
@@ -197,10 +362,35 @@ def ensure_orig_backup(path: Path, *, dry_run: bool = False) -> Dict[str, Any]:
     if op.exists():
         info["md5"] = md5_file(op)
         info["created"] = False
-        # 校验 .orig 与其自身 md5 记录一致（trivially true），真正的"与原件一致"
-        # 校验发生在第一次创建时；此处只回报已存在的备份 md5。
-        info["verified"] = True
+        expected = expected_md5 if expected_md5 is not None else recorded_md5_before(path)
+        if expected is None:
+            # 没有可对照的记录（全新树 / manifest 尚未覆盖该文件）：无从证伪，
+            # 但也不假装校验过 —— 记成 None 说明"没比过"，而不是"比过了没问题"。
+            info["verified"] = True
+            info["verified_against"] = None
+            info["note"] = (
+                "backup already exists, left untouched (idempotent rerun); "
+                "manifest 里没有该文件的 md5_before，无法交叉复核"
+            )
+            return info
+        info["expected_md5"] = expected
+        info["verified"] = info["md5"] == expected
+        info["verified_against"] = "caller" if expected_md5 is not None else "manifest:md5_before"
         info["note"] = "backup already exists, left untouched (idempotent rerun)"
+        if not info["verified"]:
+            info["warning"] = (
+                f"已有 .orig 的 md5 与 manifest 记录的改写前 md5 不一致: {_rel(op)} "
+                f"md5={info['md5']} != md5_before={expected}；该备份可能是截断的副本，"
+                "或原件被绕过本脚本改写过。按「永不覆盖」规则保留原样、不删不改，"
+                "请人工从别的副本恢复 true original 后再继续"
+            )
+            print(
+                "[WARNING] .orig 备份与 manifest 记录的改写前 md5 不一致 -> "
+                f"{_rel(op)} md5={info['md5']} != md5_before={expected}；"
+                "该 .orig 可能是半截副本（真正的原件可能已丢失）。本脚本按"
+                "「永不覆盖」规则保留它，不删除、不修正，验收断言会因此失败",
+                file=sys.stderr,
+            )
         return info
 
     live_md5 = md5_file(path)
@@ -208,15 +398,19 @@ def ensure_orig_backup(path: Path, *, dry_run: bool = False) -> Dict[str, Any]:
         info["md5"] = live_md5
         info["created"] = False
         info["verified"] = True
+        info["verified_against"] = "live:md5"
         info["note"] = "dry-run: backup NOT written"
         return info
 
-    shutil.copyfile(path, op)
+    # 原子落盘（同目录 tmp + replace）：直接写最终名时，一次中止的复制会留下
+    # 半截 .orig，而"永不覆盖"会让它永久生效。
+    write_bytes_atomic(op, path.read_bytes())
     backup_md5 = md5_file(op)
     info["md5"] = backup_md5
     info["original_md5"] = live_md5
     info["created"] = True
     info["verified"] = backup_md5 == live_md5
+    info["verified_against"] = "live:md5"
     if not info["verified"]:
         raise RuntimeError(
             f"备份校验失败: {op} md5={backup_md5} != 原件 {path} md5={live_md5}"
@@ -1036,6 +1230,7 @@ def compute_run_nav(
     cash_source: str,
     fallback_anchor: str,
     ex_div_map: Optional[Mapping[str, Sequence[str]]] = None,
+    anchor_overrides: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """调用 ``web/livetrading/valuation.py::compute_nav`` 得到一个 run 的含息 NAV。
 
@@ -1044,6 +1239,13 @@ def compute_run_nav(
 
     ``ex_div_map``：``symbol -> [as_of 之后的除权日]``。用来把"因子表滞后"这条
     warning 从"推测"变成"已复核"：只有真的没有除权事件时才允许说比值精确等于 1.0。
+
+    ``anchor_overrides``：``symbol -> {anchor_date, anchor_source, reason}``。
+    给定后该标的**跳过** ``resolve_anchor`` 的推断，直接用档案里已经写死的锚点。
+    这不是作弊，而是"把生产写入器当轮真正用过的锚点原样传回去"：1.1.0 的
+    ``resolve_anchor`` 是"用 entry_prices 反查行情库"的**推断**，而 10-29 实例的
+    锚点已经作为事实记录在原档 ``nav_breakdown.json:anchors`` 里，再推断一次只会
+    引入行情库覆盖范围带来的不确定性（库只到 10-22）。
     """
     from web.livetrading.valuation import compute_nav
 
@@ -1058,13 +1260,26 @@ def compute_run_nav(
         series = reader.factor_series(sym)
         if series is not None and len(series):
             factors[sym] = series
-        ev = resolve_anchor(
-            sym,
-            entry_prices.get(sym),
-            reader,
-            as_of=max(as_of_all),
-            fallback=fallback_anchor,
-        )
+        ov = (anchor_overrides or {}).get(sym)
+        if ov:
+            # 档案里已经写死的锚点（见 docstring）：不再推断。
+            ev = {
+                "symbol": sym,
+                "entry_price": entry_prices.get(sym),
+                "anchor_source": ov.get("anchor_source", "archive_override"),
+                "anchor_date": ov["anchor_date"],
+                "candidates": [],
+                "ambiguous": False,
+                "reason": ov.get("reason"),
+            }
+        else:
+            ev = resolve_anchor(
+                sym,
+                entry_prices.get(sym),
+                reader,
+                as_of=max(as_of_all),
+                fallback=fallback_anchor,
+            )
         anchor_evidence[sym] = ev
         anchors[sym] = ev["anchor_date"]
 
@@ -1833,6 +2048,1407 @@ def _summary_field_changes(before: Mapping[str, Any], after: Mapping[str, Any]) 
 
 
 # ---------------------------------------------------------------------------
+# 1.2.0 增量：2026-10-29 实例子目录（<date>/<HHMMSS>/）的定点修复
+# ---------------------------------------------------------------------------
+# WHY（接上模块 docstring 第 5..7 条，这里是落地细节）：
+#
+# * 10-27 的票后态 ``post_holdings.json`` 是唯一的断点：它带着两只 10-26 已成交
+#   卖出的标的。1.1.0 只另存了 ``post_holdings.recomputed.json``，原件没动，于是
+#   10-29 链式取数又把它们搬进了输入。**必须覆写这两份票后态**，否则下一次 run
+#   还会复活第三次。
+# * 10-29/215823 是同日重跑写出的实例子目录（L2.62），1.1.0 明确"只修扁平目录"，
+#   所以它的 4 份快照从未被重述过。本节补上，但**仍然不碰**顶层
+#   ``2026-10-29/summary.json`` / ``account_state.json`` / ``holdings.json`` /
+#   ``stage1_health_report.*``（那是当天的扁平记录，属于历史证据）。
+# * 幽灵仓代号在 ``nav_breakdown.json`` 里**必须是彻底消失**：该文件是估值口径的
+#   唯一真源，任何"已移除但保留一行 0 股"的写法都会被下游当成持仓重新捡起来。
+#   移除明细写在 manifest 与本目录的 ``reconciliation_zh.md`` 里，不写在被重述的
+#   估值文件里。
+INSTANCE_RUN_LABEL = "2026-10-29"
+INSTANCE_SUBDIR = "215823"
+
+#: 10-26 已成交卖出（操作员确认）、但被 10-27 票后态复活的标的。
+PHANTOM_SYMBOLS: Tuple[str, ...] = ("600584.SH", "600362.SH")
+PHANTOM_SHARES = 100
+
+#: 10-29 成交的新建仓（操作员确认：2,400 股 @16.67 = 40,008）。
+INSTANCE_NEW_SYMBOL = "601919.SH"
+INSTANCE_NEW_SHARES = 2400
+INSTANCE_NEW_PRICE = 16.67
+
+#: 10-29 票前账本（去掉幽灵仓后必须与之逐项相等）。
+INSTANCE_EXPECTED_PRE_FILL_BOOK: Dict[str, int] = {
+    "600900.SH": 800,
+    "600660.SH": 400,
+    "000999.SZ": 600,
+    "601728.SH": 5800,
+}
+
+#: 10-29 票后账本 = 建仓后的 5 只（键序与对账文档 §7 一致）。
+INSTANCE_EXPECTED_BOOK: Dict[str, int] = {
+    "601728.SH": 5800,
+    "601919.SH": 2400,
+    "000999.SZ": 600,
+    "600660.SH": 400,
+    "600900.SH": 800,
+}
+
+#: 10-27 票后态应有的 4 只账本（= ``10-27/post_holdings.recomputed.json`` 的内容）。
+PREV_POST_EXPECTED_BOOK: Dict[str, int] = {
+    "600900.SH": 800,
+    "600660.SH": 400,
+    "000999.SZ": 600,
+    "601728.SH": 5800,
+}
+
+INSTANCE_HISTORICAL_NAV = 208478.46   # 当轮子进程实收值（含 8,543 幽灵市值）
+INSTANCE_NAV_BEFORE_FILL = 197351.17  # 操作员表单输入值（= account_state 冻结的 NAV）
+INSTANCE_CASH_BEFORE_FILL = 99071.46  # 操作员手工输入（cash_source: explicit，票前余额）
+INSTANCE_EXPECTED_EQUITY = 140872.00
+INSTANCE_EXPECTED_CASH = 59063.46
+INSTANCE_EXPECTED_NAV = 199935.46
+INSTANCE_RESTATEMENT_DELTA = -8543.00
+INSTANCE_RESTATEMENT_REASON = (
+    "移除已离场幻影持仓 600584.SH/600362.SH（合计 8,543）；601919 建仓为现金→权益转移"
+)
+
+#: 金额容差（分）。
+MONEY_TOL = 0.005
+#: 权重容差（百分点）。
+WEIGHT_TOL_PT = 0.01
+
+#: 重述后 NAV 下各腿应有的权重（百分点），对账文档 §5.2。
+INSTANCE_EXPECTED_WEIGHTS_PCT: Dict[str, float] = {
+    "601728.SH": 20.28,
+    "601919.SH": 20.01,
+    "600900.SH": 12.00,
+    "600660.SH": 10.70,
+    "000999.SZ": 7.48,
+    "CASH": 29.54,
+}
+
+#: ``account_state`` 里**允许**继续出现幽灵仓代号的路径前缀。
+#:
+#: 这三处不是持仓，而是"它 10-26 到底走没走"的成交/冷却事实：
+#: ``last_exit_date`` 若被删掉，状态机会认为这两只从未离场，冷却期也不再拦截，
+#: 下一次 run 可以立刻重新买入 —— "清理污染"会变成制造新缺陷。因此它们**保留**，
+#: 并在 manifest 的 ``historical_evidence_left_uncorrected`` 里逐条点名。
+INSTANCE_ALLOWED_PHANTOM_PREFIXES: Tuple[str, ...] = (
+    "last_exit_date.",
+    "exit_bars_ago.",
+    "holding_bars.",
+    "prior_state.last_exit_date.",
+    "prior_state.exit_bars_ago.",
+    "prior_state.holding_bars.",
+)
+
+
+def _clip_for_manifest(value: Any, *, limit: int = 200) -> Any:
+    """把超长字符串压成"前缀 + 长度 + md5"，避免 manifest 变成日志转储。"""
+    if isinstance(value, str) and len(value) > limit:
+        raw = value.encode("utf-8")
+        return {
+            "_truncated": value[:limit],
+            "_len": len(value),
+            "_md5": md5_bytes(raw),
+        }
+    return value
+
+
+def _json_field_diff(
+    before: Any,
+    after: Any,
+    prefix: str = "",
+) -> List[Dict[str, Any]]:
+    """逐字段 before → after（点号路径），供 manifest 的 field_changes 使用。"""
+    out: List[Dict[str, Any]] = []
+    if isinstance(before, dict) and isinstance(after, dict):
+        keys = list(before.keys()) + [k for k in after.keys() if k not in before]
+        for key in keys:
+            path = f"{prefix}{key}"
+            if key not in after:
+                out.append(
+                    {"field": path, "before": _clip_for_manifest(before[key]), "after": "<absent>"}
+                )
+            elif key not in before:
+                out.append(
+                    {"field": path, "before": "<absent>", "after": _clip_for_manifest(after[key])}
+                )
+            else:
+                out.extend(_json_field_diff(before[key], after[key], path + "."))
+        return out
+    if before != after:
+        out.append(
+            {
+                "field": prefix.rstrip(".") or "<root>",
+                "before": _clip_for_manifest(before),
+                "after": _clip_for_manifest(after),
+            }
+        )
+    return out
+
+
+def restate_nav_history(
+    history: Sequence[float],
+    restated_nav: float,
+) -> Tuple[List[float], Dict[str, Any]]:
+    """把被"冻结 NAV"污染的 ``nav_history_10d`` 收敛成"一次观测一条"。
+
+    WHY 去重而不是补数：``web/livetrading`` 的写入器**只在值变化时才 append**
+    （``web/livetrading/tests/test_web_livetrading.py`` 里
+    ``# nav_history_10d MUST NOT duplicate 88000.0!`` 就是这条不变量的回归测试），
+    所以出现相邻重复值 = 同一笔冻结值被反复抄写，不是"两天净值真的相同"。
+    去掉重复后序列退化为 4 条（< 10），``scripts/check_live_portfolio_health.py``
+    的"10 日快速恢复"闸门因 ``len(nav_hist) >= 10`` 不成立而**自动关闭** —— 这是
+    诚实的后果：我们没有 10 个真实日度观测，就不该让那条闸门假装有。
+
+    Returns:
+        (new_history, evidence)
+    """
+    raw = [round(float(v), 2) for v in history]
+    deduped: List[float] = []
+    for value in raw:
+        if not deduped or abs(deduped[-1] - value) > 1e-9:
+            deduped.append(value)
+    appended = False
+    if not deduped or abs(deduped[-1] - round(float(restated_nav), 2)) > 1e-9:
+        deduped.append(round(float(restated_nav), 2))
+        appended = True
+    evidence = {
+        "before": raw,
+        "after": deduped,
+        "dropped_consecutive_duplicates": len(raw) - (len(deduped) - (1 if appended else 0)),
+        "restated_nav_appended": appended,
+        "rule": (
+            "相邻重复值视为同一笔冻结 NAV 的重复抄写（写入器只在值变化时 append），"
+            "去重后追加本次重述的真实 NAV，序列按观测顺序单调、末位 = 重述后 NAV"
+        ),
+        "consequence": (
+            f"去重后长度 {len(deduped)} < 10，scripts/check_live_portfolio_health.py 的"
+            "10 日快速恢复闸门（len(nav_hist) >= 10）自然不成立 —— 不伪造观测"
+        ),
+    }
+    return deduped, evidence
+
+
+def _write_restated_file(
+    path: Path,
+    data: bytes,
+    *,
+    dry_run: bool,
+    action: str,
+    field_changes: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """写一个**被重述的生产文件**（不是本脚本产出），并强制留 ``.orig``。
+
+    与 ``_write_or_skip`` 的区别：``_write_or_skip`` 靠 ``BACKUP_SUFFIXES`` 决定
+    要不要备份、并对 ``generated=True`` 的文件跳过备份；本节要改的
+    ``nav_breakdown.json`` / ``post_holdings.json`` 属于"生产写入器产出的原件被
+    重述"，必须逐字节留底，所以这里无条件走 ``ensure_orig_backup``。
+
+    ``.orig`` 已存在则永不覆盖（幂等）；``md5_before`` 一律取 ``.orig`` 的 md5，
+    因此第二遍运行时"改写前"是恒定的，输出也就恒定。
+    """
+    path = Path(path)
+    existed = path.exists()
+    after_md5 = md5_bytes(data)
+    live_before = md5_file(path) if existed else None
+    backup = ensure_orig_backup(path, dry_run=dry_run) if existed else None
+    before_md5 = (backup or {}).get("md5") or live_before
+    entry: Dict[str, Any] = {
+        "path": _rel(path),
+        "action": action,
+        "existed_before": existed,
+        "md5_before": before_md5,
+        "md5_live_before": live_before,
+        "md5_after": after_md5,
+        "changed": before_md5 != after_md5,
+        "field_changes": field_changes or [],
+    }
+    if backup:
+        entry["orig_backup"] = backup
+        entry["orig_backup_present"] = orig_path(path).exists()
+    # 幂等性要求：manifest 里**不能**留"这次跑做了什么"的瞬时字段
+    # （written / note / md5_live_before 首跑与复跑不同）。落盘时由
+    # ``_persistable_file_entry`` 剥掉；这里补一个稳定字段作为替代：
+    # "跑完之后盘上内容是否等于 md5_after"，首跑（写完）与复跑（本来就是）都为 True。
+    if dry_run:
+        entry["written"] = False
+        entry["note"] = "dry-run"
+        entry["content_matches_after"] = bool(existed and live_before == after_md5)
+        return entry
+    if existed and live_before == after_md5:
+        entry["written"] = False
+        entry["note"] = "content already identical; file left untouched (idempotent)"
+        entry["content_matches_after"] = True
+        return entry
+    write_bytes_atomic(path, data)
+    entry["written"] = True
+    entry["content_matches_after"] = md5_file(path) == after_md5
+    return entry
+
+
+_EPHEMERAL_FILE_KEYS = ("md5_live_before", "written", "note")
+_ORIG_BACKUP_KEYS = ("original", "backup", "md5", "verified")
+
+
+def _persistable_file_entry(entry: Mapping[str, Any]) -> Dict[str, Any]:
+    """剥掉只在"这一次运行"里有意义的字段，保证 manifest 首跑/复跑字节一致。
+
+    两处会随运行次数变化、但对读者无信息量的内容：
+    * 条目级 ``written`` / ``note`` / ``md5_live_before`` —— 首跑是"原件"，复跑是
+      "已修好的内容"；
+    * ``orig_backup.created`` / ``note`` / ``original_md5`` —— 首跑新建 .orig，复跑
+      命中已有 .orig。``original_md5`` 与条目级 ``md5_before`` 是同一个值，不丢信息。
+    """
+    out = {k: v for k, v in entry.items() if k not in _EPHEMERAL_FILE_KEYS}
+    ob = out.get("orig_backup")
+    if isinstance(ob, Mapping):
+        out["orig_backup"] = {k: ob.get(k) for k in _ORIG_BACKUP_KEYS if k in ob}
+    return out
+
+
+def _load_previous_manifest(
+    runs_root: Path,
+    *,
+    dry_run: bool,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """取上一版 manifest，并把根 ``repair_manifest.json`` **复制**一份冻结副本。
+
+    幂等的关键：读的永远是 ``repair_manifest.v1.1.0.json``（冻结副本），不是根
+    ``repair_manifest.json``（它会被本版覆写）。否则第二遍运行会把"上一版"读成
+    自己，manifest 会像滚雪球一样层层嵌套。
+
+    Returns:
+        (previous_manifest_dict, info) ；``info`` 为空 dict 表示没有可继承的历史。
+    """
+    runs_root = Path(runs_root)
+    frozen_path = runs_root / "repair_manifest.v1.1.0.json"
+    live_path = runs_root / "repair_manifest.json"
+
+    if frozen_path.exists():
+        raw = frozen_path.read_bytes()
+        return json.loads(raw.decode("utf-8")), {
+            "path": _rel(frozen_path),
+            "md5": md5_bytes(raw),
+            "created_by_this_run": False,
+            "note": "冻结副本已存在，保持不动（幂等）",
+        }
+
+    if not live_path.exists():
+        return {}, {}
+
+    raw = live_path.read_bytes()
+    previous = json.loads(raw.decode("utf-8"))
+    info: Dict[str, Any] = {
+        "path": _rel(frozen_path),
+        "source_path": _rel(live_path),
+        "md5": md5_bytes(raw),
+        "source_script_version": previous.get("script_version"),
+        "created_by_this_run": False,
+    }
+    if previous.get("script_version") == SCRIPT_VERSION:
+        # 根 manifest 已经是本版（没有历史可继承）：不备份、不当历史用。
+        info["note"] = "根 manifest 已是本版，无可继承的历史"
+        return {}, info
+    if dry_run:
+        info["note"] = "dry-run: 冻结副本 NOT written"
+        return previous, info
+    write_bytes_atomic(frozen_path, raw)
+    info["created_by_this_run"] = True
+    info["note"] = "已把上一版根 repair_manifest.json 逐字节冻结为 repair_manifest.v1.1.0.json"
+    return previous, info
+
+
+def _stable_manifest_history(
+    info: Mapping[str, Any],
+    previous: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """把 ``_load_previous_manifest`` 的运行期 info 压成与运行次数无关的稳定块。
+
+    ``info`` 里有 ``created_by_this_run`` / ``source_path`` / ``note`` 这类描述"本次
+    干了什么"的字段：首跑刚冻结副本，复跑命中已有副本。它们对读者没有额外信息
+    （``md5`` 已证明冻结内容），却会让 manifest 首跑/复跑字节不同，所以不落盘。
+    """
+    if not info:
+        return None
+    return {
+        "frozen_path": info.get("path"),
+        "md5": info.get("md5"),
+        "superseded_script": previous.get("script"),
+        "superseded_script_version": previous.get("script_version"),
+        "note": (
+            "上一版根 repair_manifest.json 已逐字节冻结为 repair_manifest.v1.1.0.json；"
+            "本版 manifest 的 files 是「1.1.0 记录 + 1.2.0 记录」的超集"
+        ),
+    }
+
+
+def _resolve_recorded_path(recorded: str, runs_root: Path) -> Path:
+    """把 manifest 里记录的路径解析成**当前这棵归档树**里的真实路径。
+
+    归档树可能被整体拷到别处（记录里写的是 ``web/livetrading/data/runs/...``），
+    所以先按原样找，找不到就按"从最短尾部开始拼到当前 runs_root 下"重定位。
+    """
+    path = Path(recorded)
+    candidate = path if path.is_absolute() else (REPO_ROOT / path)
+    if candidate.exists():
+        return candidate
+    parts = list(path.parts)
+    for i in range(len(parts) - 1, 0, -1):
+        relocated = Path(runs_root).joinpath(*parts[i:])
+        if relocated.exists():
+            return relocated
+    return candidate
+
+
+def _merge_manifest_files(
+    previous: Mapping[str, Any],
+    new_entries: Sequence[Dict[str, Any]],
+    runs_root: Path,
+) -> List[Dict[str, Any]]:
+    """v1.2.0 是**超集**：先放上一版逐条记录（附"现在盘上 md5 是否仍等于当时的
+    ``md5_after``"），再放本次新增/重算的条目。
+
+    上一版条目一条都不删 —— 它们是 1.1.0 那次改写的唯一账本。若盘上内容已经不等于
+    当时的 ``md5_after``（说明 1.1.0 之后又有人/进程改过），只标注不修正。
+    """
+    out: List[Dict[str, Any]] = []
+    seen: Dict[str, int] = {}
+
+    for entry in previous.get("files") or []:
+        item = dict(entry)
+        item["recorded_in"] = previous.get("script_version") or "1.1.0"
+        resolved = _resolve_recorded_path(str(item.get("path")), runs_root)
+        on_disk = md5_file(resolved) if resolved.exists() else None
+        item["md5_on_disk"] = on_disk
+        item["matches_recorded_md5_after"] = (
+            None if on_disk is None else on_disk == item.get("md5_after")
+        )
+        if item["matches_recorded_md5_after"] is False:
+            item["divergence_note"] = (
+                "盘上内容已不等于上一版记录的 md5_after：1.1.0 之后该文件又被改写过。"
+                "本版**不**把它重投影回 1.1.0 的形态（那会覆盖掉后来那次真实运行的记录），"
+                "仅记录分歧。上一版记录的 md5 见本条目 md5_before/md5_after。"
+            )
+        seen[str(item.get("path"))] = len(out)
+        out.append(item)
+
+    for entry in new_entries:
+        item = dict(entry)
+        item["recorded_in"] = SCRIPT_VERSION
+        key = str(item.get("path"))
+        if key in seen:
+            out[seen[key]] = item
+        else:
+            seen[key] = len(out)
+            out.append(item)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# (a) 10-27 票后态：覆写为已审计的 4 只账本（逐字节等于 recomputed 文件）
+# ---------------------------------------------------------------------------
+def repair_2026_10_27_post_holdings(
+    runs_root: Path,
+    *,
+    dry_run: bool,
+    log: List[str],
+) -> Dict[str, Any]:
+    """把 ``2026-10-27/post_holdings.json`` 覆写成 ``post_holdings.recomputed.json``。
+
+    因果：10-27 的票前账本被 1.1.0 修正成 4 只，但**票后态仍写着 6 只**。票后态才是
+    下一轮 run 的输入，所以它是幽灵仓复活的唯一入口。1.1.0 出于"原件即证据"的
+    克制没有覆写，只另存 ``post_holdings.recomputed.json``；本版在**保留 .orig**
+    的前提下补上这一刀。
+
+    硬约束：
+    * 覆写前断言"新内容"与 ``post_holdings.recomputed.json`` **逐字节相同**；
+    * 覆写前断言"旧内容 = 新内容 + 两只幽灵仓各 100 股"（证明改动只有这一处）；
+    * ``post_holdings.recomputed.json`` 一个字节都不碰。
+    """
+    run_dir = Path(runs_root) / "2026-10-27"
+    target = run_dir / "post_holdings.json"
+    recomputed_path = run_dir / "post_holdings.recomputed.json"
+    if not target.exists() or not recomputed_path.exists():
+        raise RuntimeError(
+            f"10-27 票后态修复缺少必要文件: {_rel(target)} / {_rel(recomputed_path)}"
+        )
+
+    recomputed_raw = recomputed_path.read_bytes()
+    recomputed_book = json.loads(recomputed_raw.decode("utf-8"))
+    if not isinstance(recomputed_book, dict):
+        raise RuntimeError(f"{_rel(recomputed_path)} 不是对象，拒绝按字节拷贝")
+    # 重新序列化必须与原文件逐字节一致，否则"逐字节拷贝"就不再是"拷贝已审计账本"。
+    if json_bytes(recomputed_book) != recomputed_raw:
+        raise RuntimeError(
+            f"{_rel(recomputed_path)} 不是本仓库 canonical 的 json 写法"
+            "（indent=2 / 无尾随换行），拒绝以其字节为依据覆写原件"
+        )
+    if recomputed_book != PREV_POST_EXPECTED_BOOK:
+        raise RuntimeError(
+            f"{_rel(recomputed_path)} 内容 {recomputed_book} 与预期的 4 只账本 "
+            f"{PREV_POST_EXPECTED_BOOK} 不一致，拒绝覆写"
+        )
+
+    before_raw, _source_kind = read_source_bytes(target)
+    before_book = json.loads(before_raw.decode("utf-8"))
+    stripped = {k: v for k, v in before_book.items() if k not in PHANTOM_SYMBOLS}
+    phantom_seen = {k: v for k, v in before_book.items() if k in PHANTOM_SYMBOLS}
+    if stripped != recomputed_book:
+        raise RuntimeError(
+            "10-27/post_holdings.json 去掉幽灵仓后并不等于 recomputed 账本："
+            f"{stripped} != {recomputed_book}；说明改动不止'删两只幽灵仓'，拒绝动手"
+        )
+    if phantom_seen != {s: PHANTOM_SHARES for s in PHANTOM_SYMBOLS}:
+        raise RuntimeError(
+            f"10-27/post_holdings.json 的幽灵仓股数不是 {PHANTOM_SHARES}: {phantom_seen}"
+        )
+
+    entry = _write_restated_file(
+        target,
+        recomputed_raw,
+        dry_run=dry_run,
+        action=(
+            "overwrite with audited book (= post_holdings.recomputed.json, byte-identical); "
+            "orig kept as .orig"
+        ),
+        field_changes=_json_field_diff(before_book, recomputed_book),
+    )
+
+    if not dry_run:
+        written = target.read_bytes()
+        if written != recomputed_raw:
+            raise RuntimeError(
+                f"覆写后 {_rel(target)} 与 {_rel(recomputed_path)} 不再逐字节相同"
+                f"（md5 {md5_bytes(written)} != {md5_bytes(recomputed_raw)}）"
+            )
+    entry["byte_parity"] = {
+        "with": _rel(recomputed_path),
+        "md5": md5_bytes(recomputed_raw),
+        "verified": (md5_file(target) == md5_bytes(recomputed_raw)) if not dry_run else "pending (dry-run)",
+    }
+    entry["phantom_removal"] = {sym: PHANTOM_SHARES for sym in PHANTOM_SYMBOLS}
+    # 不写 ``source_kind``：首跑读 live（.orig 尚未建立），复跑读 .orig —— 两者逐字节
+    # 相同（= 本条 md5_before），记"当次读的是谁"会让 manifest 首跑/复跑不一致。
+    entry["before_image_source"] = (
+        "首跑读盘上 live 文件，随即逐字节冻结为 post_holdings.json.orig；"
+        "复跑读 .orig。两者 md5 相同（见 md5_before / orig_backup.md5）"
+    )
+    log.append(
+        "2026-10-27/post_holdings.json: "
+        + ("[dry-run] 将覆写为 " if dry_run else "已覆写为 ")
+        + f"{md5_bytes(recomputed_raw)}（与 post_holdings.recomputed.json 逐字节相同）"
+    )
+    return entry
+
+
+# ---------------------------------------------------------------------------
+# (b)~(e) 10-29/215823 实例：票后态 / nav_breakdown / summary / account_state
+# ---------------------------------------------------------------------------
+def _instance_dir(runs_root: Path) -> Path:
+    return Path(runs_root) / INSTANCE_RUN_LABEL / INSTANCE_SUBDIR
+
+
+def _instance_book_from_ticket(ticket: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
+    """票后账本 = 票面 ``target_shares > 0`` 的标的（生产写入器同口径）。
+
+    再按 ``INSTANCE_EXPECTED_BOOK`` 的键序重排：``post_holdings_from_ticket`` 保留的是
+    票面行序，这里锚定成对账文档里的顺序，避免"同一份账本两种键序"制造 diff 噪声。
+    """
+    book: Dict[str, int] = {}
+    for row in ticket:
+        sym = str(row.get("symbol", "")).strip().upper()
+        if not sym or sym == CASH_PROXY or sym in PHANTOM_SYMBOLS:
+            continue
+        target_shares = int(row.get("target_shares") or 0)
+        if target_shares > 0:
+            book[sym] = target_shares
+    return {sym: book[sym] for sym in INSTANCE_EXPECTED_BOOK if sym in book}
+
+
+def patch_instance_summary(
+    summary: Mapping[str, Any],
+    *,
+    nav: float,
+    nav_before: float,
+    equity: float,
+    cash: float,
+    symbol_count: int,
+    anchor_count: int,
+    warnings: Sequence[str],
+) -> Dict[str, Any]:
+    """10-29 实例 ``summary.json`` 的重述（字段语义沿用 1.1.0 的约定）。
+
+    | 字段 | 值 | 为什么 |
+    | --- | --- | --- |
+    | ``portfolio_value`` | 199,935.46 | 对账后的真实 NAV（用户要求改成正口径） |
+    | ``portfolio_value_original`` | 208,478.46 | 当轮子进程实际收到并用于定权的 NAV |
+    | ``nav_effective`` | **208,478.46** | 历史事实：那一轮实收的就是它，不改写成没发生过的事 |
+    | ``nav_computed`` | 199,935.46 | 按去幽灵仓 + 建仓后的账本应为多少 |
+    | ``nav_source`` | ``"restated"`` | 归档重述，区别于线上 computed/override/fallback_input |
+    | ``nav_restatement`` | before/after/delta/reason | 让差异一眼可见 |
+
+    ``deploy_stdout`` / ``deploy_stderr`` / ``health_stdout`` / ``health_stderr`` 是当轮
+    子进程的原始日志（里面仍印着 208,478.46 口径），**一个字节都不改**。
+    """
+    out = dict(summary)
+    before = round(float(nav_before), 2)
+    after = round(float(nav), 2)
+    out["portfolio_value"] = after
+    out["portfolio_value_original"] = before
+    out["nav_effective"] = before            # 历史事实
+    out["nav_computed"] = after
+    out["nav_equity"] = round(float(equity), 2)
+    out["cash"] = round(float(cash), 2)
+    out["nav_source"] = "restated"
+    out["nav_restatement"] = {
+        "before": before,
+        "after": after,
+        "delta": round(after - before, 2),
+        "reason": INSTANCE_RESTATEMENT_REASON,
+    }
+    out["nav_symbol_count"] = int(symbol_count)
+    out["anchor_count"] = int(anchor_count)
+    out["nav_warnings"] = list(warnings)
+    return out
+
+
+def repair_2026_10_29_instance(
+    runs_root: Path,
+    *,
+    reader: MarketDbReader,
+    dry_run: bool,
+    log: List[str],
+) -> Dict[str, Any]:
+    """重述 ``2026-10-29/215823`` 的四份快照（票后态 / nav_breakdown / summary /
+    account_state），票面与持仓输入**只读不写**。
+
+    一切数字要么来自快照里已经记录的单元格，要么是操作员确认的成交事实；估值数学
+    100% 走 ``compute_run_nav`` -> ``valuation.compute_nav``。
+    """
+    if not reader.available:
+        raise RuntimeError(
+            "10-29 实例重述需要只读行情库提供后复权因子（用于证明 anchor_inflation_ratio"
+            " 恒为 1.0）；库不可用会静默退化成 raw 计价并丢掉 factor_hfq 证据，拒绝执行"
+        )
+
+    inst = _instance_dir(runs_root)
+    if not inst.is_dir():
+        raise RuntimeError(f"实例子目录不存在: {_rel(inst)}")
+
+    p_post = inst / "post_holdings.json"
+    p_nb = inst / "nav_breakdown.json"
+    p_sum = inst / "summary.json"
+    p_state = inst / "account_state.json"
+    p_holdings = inst / "holdings.json"
+    p_ticket = inst / "live_trading_ticket.json"
+
+    ticket = load_run_ticket(inst)
+    old_post, _post_src = read_source_json(p_post)
+    old_nb, _nb_src = read_source_json(p_nb)
+    old_sum, _sum_src = read_source_json(p_sum)
+    old_state, _state_src = read_source_json(p_state)
+    inst_holdings, _holdings_src = read_source_json(p_holdings)
+
+    # ---- (0) 输入账本必须正好是"4 只正确 + 2 只幽灵" -----------------------
+    pre_fill = {str(k): int(v) for k, v in inst_holdings.items()}
+    for sym in PHANTOM_SYMBOLS:
+        got = pre_fill.pop(sym, None)
+        if got != PHANTOM_SHARES:
+            raise RuntimeError(
+                f"{_rel(p_holdings)} 里 {sym} 的股数是 {got}，预期 {PHANTOM_SHARES}；"
+                "输入账本与对账结论不符，拒绝在错误前提上重述"
+            )
+    if pre_fill != INSTANCE_EXPECTED_PRE_FILL_BOOK:
+        raise RuntimeError(
+            f"{_rel(p_holdings)} 去掉幽灵仓后是 {pre_fill}，预期 "
+            f"{INSTANCE_EXPECTED_PRE_FILL_BOOK}；拒绝在错误前提上重述"
+        )
+
+    # ---- (b) 票后账本 -------------------------------------------------------
+    book = _instance_book_from_ticket(ticket)
+    if book != INSTANCE_EXPECTED_BOOK:
+        raise RuntimeError(f"票后账本推导结果 {book} 与预期 {INSTANCE_EXPECTED_BOOK} 不一致")
+    old_post_int = {str(k): int(v) for k, v in old_post.items()}
+    if {k: v for k, v in old_post_int.items() if k not in PHANTOM_SYMBOLS} != book:
+        raise RuntimeError(
+            f"{_rel(p_post)} 去掉幽灵仓后与票面推导的账本不一致：{old_post_int} vs {book}"
+        )
+    if {k: v for k, v in old_post_int.items() if k in PHANTOM_SYMBOLS} != {
+        s: PHANTOM_SHARES for s in PHANTOM_SYMBOLS
+    }:
+        raise RuntimeError(f"{_rel(p_post)} 的幽灵仓股数不是 {PHANTOM_SHARES}")
+
+    # ---- (c) nav_breakdown --------------------------------------------------
+    prices = prices_from_ticket(ticket, INSTANCE_RUN_LABEL)
+    missing_prices = [s for s in book if s not in prices]
+    if missing_prices:
+        raise RuntimeError(f"票面缺少价格单元格: {missing_prices}")
+    new_price_bar, new_price = prices[INSTANCE_NEW_SYMBOL]
+    if abs(float(new_price) - INSTANCE_NEW_PRICE) > 1e-9:
+        raise RuntimeError(
+            f"票面 {INSTANCE_NEW_SYMBOL} 的价格是 {new_price}，与操作员确认的成交价 "
+            f"{INSTANCE_NEW_PRICE} 不一致"
+        )
+    if str(old_nb.get("cash_source")) != "explicit":
+        raise RuntimeError(
+            f"{_rel(p_nb)} 的 cash_source 是 {old_nb.get('cash_source')!r}，"
+            "本重述只处理操作员手工输入现金（explicit）的情形"
+        )
+    cash_before = float(old_nb.get("cash") or 0.0)
+    if abs(cash_before - INSTANCE_CASH_BEFORE_FILL) > MONEY_TOL:
+        raise RuntimeError(
+            f"{_rel(p_nb)} 的票前现金是 {cash_before:.2f}，预期 {INSTANCE_CASH_BEFORE_FILL:.2f}"
+        )
+    fill_cost = round(INSTANCE_NEW_SHARES * INSTANCE_NEW_PRICE, 2)
+    cash_after = round(cash_before - fill_cost, 2)
+    if abs(cash_after - INSTANCE_EXPECTED_CASH) > MONEY_TOL:
+        raise RuntimeError(f"建仓后现金 {cash_after:.2f} != 预期 {INSTANCE_EXPECTED_CASH:.2f}")
+
+    archived_anchors = dict(old_nb.get("anchors") or {})
+    # as_of 之后仍有除权事件的标的：先查只读库，再算 NAV（供 factor_lag 警告判断
+    # "滞后是否真的有害"）。查询失败/库不可用已在函数入口拦过。
+    ex_div_map: Dict[str, List[str]] = {}
+    for ev in reader.ex_dividend_events_after(INSTANCE_RUN_LABEL):
+        ex_div_map.setdefault(str(ev["symbol"]), []).append(str(ev["ex_date"]))
+    anchor_overrides: Dict[str, Dict[str, Any]] = {}
+    for sym in book:
+        if sym == INSTANCE_NEW_SYMBOL:
+            anchor_overrides[sym] = {
+                "anchor_date": INSTANCE_RUN_LABEL,
+                "anchor_source": "position_open_date_from_fill",
+                "reason": (
+                    f"{INSTANCE_NEW_SYMBOL} 的建仓日就是本 run 的 as_of（操作员确认 "
+                    f"2026-10-29 买入 {INSTANCE_NEW_SHARES} 股 @{INSTANCE_NEW_PRICE:.2f} 已成交），"
+                    "锚点取建仓日使 factor 比值恒为 1.0，既不重复计息也不遗漏当日股息"
+                ),
+            }
+            continue
+        archived = archived_anchors.get(sym)
+        if not archived:
+            raise RuntimeError(f"原档 anchors 缺 {sym}，无法沿用生产口径的建仓锚点")
+        anchor_overrides[sym] = {
+            "anchor_date": str(archived),
+            "anchor_source": "archive_anchors",
+            "reason": (
+                f"沿用 {INSTANCE_RUN_LABEL}/{INSTANCE_SUBDIR}/nav_breakdown.json 原档 "
+                f"anchors[{sym!r}]={archived}（生产写入器 run_archive 口径），不重新推断"
+            ),
+        }
+
+    entry_prices = {
+        str(k): float(v)
+        for k, v in (old_state.get("entry_prices") or {}).items()
+        if str(k) not in PHANTOM_SYMBOLS
+    }
+
+    nb = compute_run_nav(
+        run_label=INSTANCE_RUN_LABEL,
+        holdings=book,
+        prices=prices,
+        reader=reader,
+        entry_prices=entry_prices,
+        cash=cash_after,
+        cash_source="explicit",
+        fallback_anchor=INSTANCE_RUN_LABEL,
+        # 真跑一次只读 SQL，让"因子表滞后 7 天不产生误差"这句话有依据（否则
+        # compute_run_nav 只能凭"没查到事件"断言，那是没查过，不是查过了）。
+        ex_div_map=ex_div_map,
+        anchor_overrides=anchor_overrides,
+    )
+
+    # 逐票交叉校验：被保留的标的，重算值必须与原档**逐分相等**（否则说明这不是
+    # "去掉两行幽灵仓"的重述，而是一次重新估值 —— 那是另一件事，必须停下来问人）。
+    old_per = dict(old_nb.get("per_symbol") or {})
+    for sym, row in nb["per_symbol"].items():
+        if sym not in old_per:
+            if abs(float(row["value"]) - fill_cost) > MONEY_TOL:
+                raise RuntimeError(
+                    f"{sym} 的建仓市值 {row['value']:.2f} != 成交额 {fill_cost:.2f}"
+                )
+            row["provider_key"] = "FuyaoDataProvider"
+            row["provider_key_source"] = (
+                f"run 级 data_provider={old_sum.get('data_provider')!r}（summary.json），"
+                f"与同档其他标的同一取数键；价格单元格来自 live_trading_ticket.json"
+                f"（price_bar_date={new_price_bar}）"
+            )
+            continue
+        if abs(float(row["value"]) - float(old_per[sym]["value"])) > MONEY_TOL:
+            raise RuntimeError(
+                f"{sym} 重算市值 {row['value']:.2f} 与原档 {old_per[sym]['value']:.2f} 不一致；"
+                "重述只允许改变'哪些标的在账上'，不允许改变同一标的的估值"
+            )
+        archived_key = old_per[sym].get("provider_key")
+        if archived_key:
+            row["provider_key"] = archived_key
+            row["provider_key_source"] = (
+                "原档 nav_breakdown.json 的 provider_key（生产写入器读 fuyao/FuyaoDataProvider）"
+            )
+
+    for key in PHANTOM_SYMBOLS:
+        if key in nb["per_symbol"] or key in nb["anchors"]:
+            raise RuntimeError(f"重述后的 nav_breakdown 仍含 {key}（必须彻底移除）")
+
+    if abs(float(nb["equity"]) - INSTANCE_EXPECTED_EQUITY) > MONEY_TOL:
+        raise RuntimeError(f"权益 {nb['equity']:.2f} != 预期 {INSTANCE_EXPECTED_EQUITY:.2f}")
+    if abs(float(nb["nav_effective"]) - INSTANCE_EXPECTED_NAV) > MONEY_TOL:
+        raise RuntimeError(f"NAV {nb['nav_effective']:.2f} != 预期 {INSTANCE_EXPECTED_NAV:.2f}")
+
+    # ---- 归档字段：nav_effective 保留历史事实，nav_computed 写重述值 ---------
+    archived_warnings = [w for w in (old_nb.get("nav_warnings") or [])]
+    fresh_warnings = [w for w in nb["nav_warnings"] if w not in archived_warnings]
+    extras: List[str] = [
+        f"price_basis: {INSTANCE_NEW_SYMBOL} 按 {INSTANCE_RUN_LABEL} 票面成交价 "
+        f"{INSTANCE_NEW_PRICE:.2f} 计价（{INSTANCE_NEW_SHARES} × {INSTANCE_NEW_PRICE:.2f} = "
+        f"{fill_cost:,.2f}），价格单元格来自 live_trading_ticket.json"
+        f"（price_bar_date={new_price_bar}），未从行情库重取",
+        "restated: nav_effective 保留 208,478.46（当轮子进程实收值，历史事实）；"
+        "nav_computed=199,935.46 为去重后的真实 NAV；权益腿与现金腿之间不再重复计价",
+        "cash_basis: 现金由操作员手工输入 99,071.46（票前余额，已含 10-26 卖出回款）"
+        f"减去本次建仓成本 {fill_cost:,.2f}",
+    ]
+    dividend_alarms = list(nb.get("dividend_alarms") or [])
+    if not dividend_alarms and old_nb.get("dividend_alarms"):
+        dividend_alarms = list(old_nb["dividend_alarms"])
+        extras.append(
+            "dividend_alarms_preserved: 原档记录 000999.SZ ex_date=2026-10-16 的除权告警，"
+            "本次重算的股息扫描窗口未复现该台阶；原样保留原档记录，不清空"
+        )
+
+    nb_out = dict(nb)
+    nb_out["nav_effective"] = round(INSTANCE_HISTORICAL_NAV, 2)
+    nb_out["nav_computed"] = round(INSTANCE_EXPECTED_NAV, 2)
+    nb_out["nav_source"] = old_nb.get("nav_source", "computed")
+    nb_out["archive_nav_source"] = "restated"
+    nb_out["dividend_alarms"] = dividend_alarms
+    nb_out["nav_warnings"] = archived_warnings + fresh_warnings + extras
+    nb_out["instance"] = INSTANCE_SUBDIR
+    nb_out["holdings_source"] = (
+        f"{INSTANCE_RUN_LABEL}/{INSTANCE_SUBDIR}/live_trading_ticket.json: "
+        "target_shares > 0（已离场标的按 10-26 成交结论剔除）"
+    )
+    nb_out["cash_derivation"] = {
+        "rule": (
+            "现金 = 该轮票前现金（操作员手工输入，cash_source=explicit）"
+            f" − {INSTANCE_NEW_SYMBOL} 建仓成本 {INSTANCE_NEW_SHARES} × {INSTANCE_NEW_PRICE:.2f}"
+        ),
+        "cash_before_fill": round(cash_before, 2),
+        "fill_cost": fill_cost,
+        "result": cash_after,
+    }
+    nb_out["prior_archive_equity"] = round(float(old_nb.get("equity") or 0.0), 2)
+    nb_out["price_cache"] = (
+        "价量来自 SnapshotPriceCache（以 live_trading_ticket.json 的 price_bar_date/price "
+        "单元格注入），未从行情库重新取价；行情库只用于后复权因子与除权事件，"
+        "因此 valuation 的 price_source 记作 snapshot，而不是 realtime"
+    )
+
+    # ---- (d) summary --------------------------------------------------------
+    warnings_sum = list(old_sum.get("nav_warnings") or [])
+    warnings_sum += [
+        "restatement: 权益腿移除已离场标的的幻影市值 8,543.00（现金腿早已包含其卖出回款），"
+        "NAV 由 208,478.46 收敛到 199,935.46",
+        "restatement: 601919.SH 建仓 2,400 股 @16.67 = 40,008.00 记为权益，同时从现金扣减，"
+        "总资产不变（现金→权益转移）",
+        "nav_effective 保留 208,478.46 为当轮子进程实收值（历史事实）；nav_computed=199,935.46 "
+        "为对账后真实 NAV；portfolio_value 已改为后者",
+        "deploy_stdout / deploy_stderr / health_stdout / health_stderr 为当轮原始日志"
+        "（仍印有 208,478.46 口径与当轮股数），是运行记录，不做改写",
+        "account_state.current_nav 同步改为 199,935.46（原先冻结在 197,351.17）",
+    ]
+    new_sum = patch_instance_summary(
+        old_sum,
+        nav=INSTANCE_EXPECTED_NAV,
+        nav_before=INSTANCE_HISTORICAL_NAV,
+        equity=INSTANCE_EXPECTED_EQUITY,
+        cash=INSTANCE_EXPECTED_CASH,
+        symbol_count=len(nb_out["per_symbol"]),
+        anchor_count=len(nb_out["anchors"]),
+        warnings=warnings_sum,
+    )
+    new_sum["portfolio_value_form_input"] = float(old_sum.get("portfolio_value"))
+    for key in ("deploy_stdout", "deploy_stderr", "health_stdout", "health_stderr"):
+        if key in old_sum and new_sum.get(key) != old_sum.get(key):
+            raise RuntimeError(f"summary 的原始日志字段 {key} 被改动，这是不允许的")
+
+    # ---- (e) account_state --------------------------------------------------
+    import copy as _copy
+
+    new_state = _copy.deepcopy(old_state)
+    removed: List[Dict[str, Any]] = []
+    prior = new_state.get("prior_state") or {}
+    blocks: Tuple[Tuple[str, Any], ...] = (
+        ("entry_prices", new_state.get("entry_prices")),
+        ("lifecycle_states", new_state.get("lifecycle_states")),
+        ("prior_state.entry_prices", prior.get("entry_prices") if isinstance(prior, dict) else None),
+        ("prior_state.lifecycle_states", prior.get("lifecycle_states") if isinstance(prior, dict) else None),
+    )
+    for label, block in blocks:
+        if not isinstance(block, dict):
+            raise RuntimeError(f"account_state.{label} 不是对象，无法按约定清理")
+        for sym in PHANTOM_SYMBOLS:
+            if sym in block:
+                removed.append({"path": f"{label}.{sym}", "value": block.pop(sym)})
+    if not removed:
+        raise RuntimeError("account_state 里没有可清理的幽灵键：输入可能已被清理过或路径不对")
+
+    if abs(float(new_state.get("entry_prices", {}).get(INSTANCE_NEW_SYMBOL, 0.0)) - INSTANCE_NEW_PRICE) > 1e-9:
+        raise RuntimeError(
+            f"account_state.entry_prices[{INSTANCE_NEW_SYMBOL!r}] 应为 {INSTANCE_NEW_PRICE}"
+        )
+    lifecycle_new = (new_state.get("lifecycle_states") or {}).get(INSTANCE_NEW_SYMBOL) or {}
+    if str(lifecycle_new.get("state")) != "HELD_GESTATION":
+        raise RuntimeError(
+            f"account_state.lifecycle_states[{INSTANCE_NEW_SYMBOL!r}].state 应为 HELD_GESTATION，"
+            f"实际 {lifecycle_new.get('state')!r}"
+        )
+
+    nav_hist, hist_evidence = restate_nav_history(
+        new_state.get("nav_history_10d") or [], INSTANCE_EXPECTED_NAV
+    )
+    peak_nav = float(new_state.get("peak_nav") or 0.0)
+    if peak_nav <= 0:
+        raise RuntimeError("account_state.peak_nav 非正，无法重算回撤")
+    drawdown_before = new_state.get("drawdown_pct")
+    new_state["current_nav"] = round(INSTANCE_EXPECTED_NAV, 2)
+    new_state["nav_history_10d"] = nav_hist
+    new_state["drawdown_pct"] = round((INSTANCE_EXPECTED_NAV - peak_nav) / peak_nav, 12)
+
+    state_diff = _json_field_diff(old_state, new_state)
+    state_diff.append(
+        {
+            "field": "nav_history_10d.restatement",
+            "before": {
+                "dropped_consecutive_duplicates": hist_evidence["dropped_consecutive_duplicates"],
+                "restated_nav_appended": hist_evidence["restated_nav_appended"],
+            },
+            "after": {
+                "rule": hist_evidence["rule"],
+                "consequence": hist_evidence["consequence"],
+            },
+        }
+    )
+    state_diff.append(
+        {
+            "field": "drawdown_pct.derivation",
+            "before": drawdown_before,
+            "after": {
+                "formula": "(current_nav − peak_nav) / peak_nav",
+                "current_nav": round(INSTANCE_EXPECTED_NAV, 2),
+                "peak_nav": round(peak_nav, 2),
+                "note": (
+                    "current_nav 重述后该派生字段必须同步，否则同一文件里 current_nav 与 "
+                    "drawdown_pct 互相矛盾；tier / linear_equity_scale 仍是 NORMAL / 1.0"
+                    "（回撤 −1.53% 未触及任何档位阈值），故不动"
+                ),
+            },
+        }
+    )
+
+    # ---- 写盘 --------------------------------------------------------------
+    files: List[Dict[str, Any]] = []
+    files.append(
+        _write_restated_file(
+            p_post,
+            json_bytes(book),
+            dry_run=dry_run,
+            action="drop phantom lots revived from 2026-10-27/post_holdings.json",
+            field_changes=_json_field_diff(old_post, book),
+        )
+    )
+    files.append(
+        _write_restated_file(
+            p_nb,
+            json_bytes(nb_out),
+            dry_run=dry_run,
+            action="restate (phantom lots removed, 601919 entry added), original kept as .orig",
+            field_changes=_json_field_diff(old_nb, nb_out),
+        )
+    )
+    files.append(
+        _write_restated_file(
+            p_sum,
+            json_bytes(new_sum),
+            dry_run=dry_run,
+            action="patch (portfolio_value / nav_source / nav_restatement), run logs verbatim",
+            field_changes=_json_field_diff(old_sum, new_sum),
+        )
+    )
+    files.append(
+        _write_restated_file(
+            p_state,
+            json_bytes(new_state),
+            dry_run=dry_run,
+            action="restate (phantom keys removed, current_nav + nav_history_10d corrected)",
+            field_changes=state_diff,
+        )
+    )
+
+    log.append(
+        f"{INSTANCE_RUN_LABEL}/{INSTANCE_SUBDIR}: "
+        + ("[dry-run] " if dry_run else "")
+        + f"equity={INSTANCE_EXPECTED_EQUITY:,.2f} cash={INSTANCE_EXPECTED_CASH:,.2f} "
+        f"nav_computed={INSTANCE_EXPECTED_NAV:,.2f} (nav_effective 保留 "
+        f"{INSTANCE_HISTORICAL_NAV:,.2f})"
+    )
+
+    return {
+        "files": files,
+        "payloads": {
+            "post_holdings": book,
+            "nav_breakdown": nb_out,
+            "summary": new_sum,
+            "account_state": new_state,
+            "post_holdings_before": old_post_int,
+            "nav_breakdown_before": old_nb,
+            "summary_before": old_sum,
+            "account_state_before": old_state,
+        },
+        "info": {
+            "instance_dir": _rel(inst),
+            # 不记"当次读的是 live 还是 .orig"：首跑读 live（.orig 尚未建立），复跑读
+            # .orig，两者逐字节相同（md5 见 files[].md5_before）。记当次来源会让 manifest
+            # 首跑/复跑不一致，而它对读者没有任何额外信息。
+            "sources": {
+                "kind": "live_on_first_apply_then_orig",
+                "note": (
+                    "首跑改写前读盘上 live 文件并立即逐字节冻结为 <name>.json.orig；"
+                    "复跑读 .orig。两种来源的 md5 都等于 files[].md5_before"
+                ),
+                "holdings_readonly": "live（只读输入，不重述、不备份）",
+            },
+            "phantom_removed": {sym: PHANTOM_SHARES for sym in PHANTOM_SYMBOLS},
+            "phantom_values_removed": {
+                sym: round(float(old_per[sym]["value"]), 2)
+                for sym in PHANTOM_SYMBOLS
+                if sym in old_per
+            },
+            "account_state_removed": removed,
+            "nav_history_restatement": hist_evidence,
+            "drawdown_before": drawdown_before,
+            "drawdown_after": new_state["drawdown_pct"],
+            "cash_derivation": nb_out["cash_derivation"],
+            "equity_before": round(float(old_nb.get("equity") or 0.0), 2),
+            "equity_after": INSTANCE_EXPECTED_EQUITY,
+            "nav_before": INSTANCE_HISTORICAL_NAV,
+            "nav_after": INSTANCE_EXPECTED_NAV,
+            "nav_identity": (
+                f"{INSTANCE_EXPECTED_EQUITY:,.2f} + {INSTANCE_EXPECTED_CASH:,.2f} = "
+                f"{INSTANCE_EXPECTED_NAV:,.2f}"
+            ),
+            "ticket_untouched": _rel(p_ticket),
+            "holdings_input_untouched": _rel(p_holdings),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# 验收断言（写进 manifest，并在 stdout 打印）
+# ---------------------------------------------------------------------------
+def _phantom_hits(obj: Any, prefix: str = "", out: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    """递归找出 JSON 里所有出现幽灵仓代号的路径（键与字符串值都扫）。"""
+    hits = out if out is not None else []
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            path = f"{prefix}{key}"
+            if key in PHANTOM_SYMBOLS:
+                hits.append({"path": path, "as": "key", "value": value})
+            _phantom_hits(value, path + ".", hits)
+    elif isinstance(obj, list):
+        for index, value in enumerate(obj):
+            _phantom_hits(value, f"{prefix}{index}.", hits)
+    elif isinstance(obj, str) and any(sym in obj for sym in PHANTOM_SYMBOLS):
+        hits.append({"path": prefix.rstrip("."), "as": "string", "value": _clip_for_manifest(obj)})
+    return hits
+
+
+def _acceptance_check(
+    name: str,
+    expected: Any,
+    actual: Any,
+    *,
+    tolerance: Optional[float] = None,
+    note: str = "",
+) -> Dict[str, Any]:
+    if tolerance is not None and isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
+        passed = abs(float(actual) - float(expected)) <= float(tolerance)
+    else:
+        passed = expected == actual
+    entry = {
+        "name": name,
+        "expected": expected,
+        "actual": actual,
+        "pass": bool(passed),
+    }
+    if tolerance is not None:
+        entry["tolerance"] = tolerance
+    if note:
+        entry["note"] = note
+    return entry
+
+
+def verify_repair_acceptance(
+    runs_root: Path,
+    *,
+    files: Sequence[Mapping[str, Any]],
+    payloads: Mapping[str, Any],
+    dry_run: bool,
+) -> Dict[str, Any]:
+    """从**重写后的 JSON**（非 dry-run 时直接回读磁盘）逐条断言验收口径。"""
+    runs_root = Path(runs_root)
+    inst = _instance_dir(runs_root)
+    p_inst_post = inst / "post_holdings.json"
+    p_nb = inst / "nav_breakdown.json"
+    p_sum = inst / "summary.json"
+    p_state = inst / "account_state.json"
+    p_prev_post = runs_root / "2026-10-27" / "post_holdings.json"
+
+    def effective(path: Path, payload_key: str) -> Any:
+        if dry_run:
+            return payloads.get(payload_key)
+        return json.loads(Path(path).read_text("utf-8"))
+
+    nb = effective(p_nb, "nav_breakdown") or {}
+    summary = effective(p_sum, "summary") or {}
+    state = effective(p_state, "account_state") or {}
+    inst_post = effective(p_inst_post, "post_holdings") or {}
+    prev_post = (
+        payloads.get("post_holdings_10_27")
+        if dry_run
+        else json.loads(p_prev_post.read_text("utf-8"))
+    ) or {}
+
+    checks: List[Dict[str, Any]] = []
+    equity = float(nb.get("equity") or 0.0)
+    cash = float(nb.get("cash") or 0.0)
+    nav = round(equity + cash, 2)
+    checks.append(
+        _acceptance_check("nav_breakdown.equity", INSTANCE_EXPECTED_EQUITY, equity, tolerance=MONEY_TOL)
+    )
+    checks.append(
+        _acceptance_check("nav_breakdown.cash", INSTANCE_EXPECTED_CASH, cash, tolerance=MONEY_TOL)
+    )
+    checks.append(
+        _acceptance_check(
+            "nav_breakdown.equity + cash",
+            INSTANCE_EXPECTED_NAV,
+            nav,
+            tolerance=MONEY_TOL,
+            note="NAV 必须是两条腿之和，不是任何单一字段的抄写",
+        )
+    )
+    checks.append(
+        _acceptance_check(
+            "nav_breakdown.nav_computed", INSTANCE_EXPECTED_NAV, float(nb.get("nav_computed") or 0.0),
+            tolerance=MONEY_TOL,
+        )
+    )
+    checks.append(
+        _acceptance_check(
+            "nav_breakdown.nav_effective (历史事实，不得改写)",
+            INSTANCE_HISTORICAL_NAV,
+            float(nb.get("nav_effective") or 0.0),
+            tolerance=MONEY_TOL,
+        )
+    )
+
+    # 权重（百分点）
+    per = nb.get("per_symbol") or {}
+    weights: Dict[str, float] = {}
+    if nav > 0:
+        for sym, row in per.items():
+            weights[str(sym)] = round(float(row.get("value") or 0.0) / nav * 100.0, 2)
+        weights["CASH"] = round(cash / nav * 100.0, 2)
+    for leg, expected_pct in INSTANCE_EXPECTED_WEIGHTS_PCT.items():
+        checks.append(
+            _acceptance_check(
+                f"weight.{leg}",
+                expected_pct,
+                weights.get(leg),
+                tolerance=WEIGHT_TOL_PT,
+                note="占重述后 NAV 的百分比（百分点）",
+            )
+        )
+
+    # 幽灵仓：nav_breakdown 必须彻底不含
+    nb_hits = _phantom_hits(nb)
+    checks.append(
+        _acceptance_check(
+            "nav_breakdown 不含已离场标的（键/值/字符串）", [], nb_hits,
+            note="估值口径的真源里出现即会被下游重新当成持仓捡起来",
+        )
+    )
+
+    # 幽灵仓：account_state 的"持仓类"位置必须不含；成交/冷却事实允许保留
+    state_hits = _phantom_hits(state)
+    illegal = [
+        h for h in state_hits
+        if not any(str(h["path"]).startswith(p) for p in INSTANCE_ALLOWED_PHANTOM_PREFIXES)
+    ]
+    retained = [
+        h for h in state_hits
+        if any(str(h["path"]).startswith(p) for p in INSTANCE_ALLOWED_PHANTOM_PREFIXES)
+    ]
+    checks.append(
+        _acceptance_check(
+            "account_state 的持仓类字段不含已离场标的（entry_prices / lifecycle_states）",
+            [], illegal,
+            note=(
+                "last_exit_date / exit_bars_ago / holding_bars 属成交与冷却事实，刻意保留："
+                "删掉会让状态机认为这两只从未离场，冷却期不再拦截"
+            ),
+        )
+    )
+
+    # 幽灵仓：两份票后态
+    checks.append(
+        _acceptance_check(
+            "2026-10-27/post_holdings.json 不含已离场标的", sorted(PREV_POST_EXPECTED_BOOK),
+            sorted(prev_post), note="账本必须逐项等于已审计的 4 只",
+        )
+    )
+    checks.append(
+        _acceptance_check(
+            f"{INSTANCE_RUN_LABEL}/{INSTANCE_SUBDIR}/post_holdings.json 不含已离场标的",
+            sorted(INSTANCE_EXPECTED_BOOK), sorted(inst_post),
+            note="账本必须逐项等于建仓后的 5 只",
+        )
+    )
+
+    # summary 口径
+    checks.append(
+        _acceptance_check(
+            "summary.portfolio_value", INSTANCE_EXPECTED_NAV,
+            float(summary.get("portfolio_value") or 0.0), tolerance=MONEY_TOL,
+        )
+    )
+    checks.append(
+        _acceptance_check(
+            "summary.portfolio_value_original", INSTANCE_HISTORICAL_NAV,
+            float(summary.get("portfolio_value_original") or 0.0), tolerance=MONEY_TOL,
+        )
+    )
+    checks.append(_acceptance_check("summary.nav_source", "restated", summary.get("nav_source")))
+    restatement = summary.get("nav_restatement") or {}
+    checks.append(
+        _acceptance_check(
+            "summary.nav_restatement.delta", INSTANCE_RESTATEMENT_DELTA,
+            float(restatement.get("delta") or 0.0), tolerance=MONEY_TOL,
+        )
+    )
+    checks.append(
+        _acceptance_check(
+            "summary.nav_restatement.reason", INSTANCE_RESTATEMENT_REASON,
+            restatement.get("reason"),
+        )
+    )
+
+    # 当轮原始日志字段必须逐字节未变
+    before_summary = payloads.get("summary_before") or {}
+    logs_intact = {
+        key: (summary.get(key) == before_summary.get(key))
+        for key in ("deploy_stdout", "deploy_stderr", "health_stdout", "health_stderr")
+        if key in before_summary
+    }
+    checks.append(
+        _acceptance_check(
+            "summary 原始日志字段逐字节未变", {k: True for k in logs_intact}, logs_intact,
+            note="deploy/health 的 stdout/stderr 属于运行记录，改写等于伪造",
+        )
+    )
+
+    # account_state 口径
+    checks.append(
+        _acceptance_check(
+            "account_state.current_nav", INSTANCE_EXPECTED_NAV,
+            float(state.get("current_nav") or 0.0), tolerance=MONEY_TOL,
+        )
+    )
+    hist = state.get("nav_history_10d") or []
+    checks.append(
+        _acceptance_check(
+            "account_state.nav_history_10d 末位", INSTANCE_EXPECTED_NAV,
+            float(hist[-1]) if hist else None, tolerance=MONEY_TOL,
+        )
+    )
+    checks.append(
+        _acceptance_check(
+            "account_state.nav_history_10d 无相邻重复",
+            True,
+            all(abs(hist[i] - hist[i - 1]) > 1e-9 for i in range(1, len(hist))),
+        )
+    )
+
+    # 每个被重述的文件都必须有 md5 校验过的 .orig
+    orig_records: List[Dict[str, Any]] = []
+    for entry in files:
+        backup = (entry or {}).get("orig_backup")
+        if not backup:
+            continue
+        record = {
+            "path": entry.get("path"),
+            "orig": backup.get("backup"),
+            "md5_recorded_before": entry.get("md5_before"),
+            "orig_verified_by_writer": backup.get("verified"),
+            "orig_present": None,
+            "md5_now": None,
+            "md5_matches_recorded_before": None,
+        }
+        if not dry_run:
+            op = _resolve_recorded_path(str(backup.get("backup")), runs_root)
+            record["orig_present"] = op.exists()
+            if op.exists():
+                record["md5_now"] = md5_file(op)
+                record["md5_matches_recorded_before"] = (
+                    record["md5_now"] == entry.get("md5_before")
+                )
+        else:
+            # dry-run 也做只读校验：已存在的 .orig 必须仍与记录一致（幂等复跑场景）。
+            op = _resolve_recorded_path(str(backup.get("backup")), runs_root)
+            record["orig_present"] = op.exists()
+            if op.exists():
+                record["md5_now"] = md5_file(op)
+                record["md5_matches_recorded_before"] = (
+                    record["md5_now"] == entry.get("md5_before")
+                )
+            else:
+                record["note"] = "dry-run: .orig 尚未写出（实跑时按 md5 校验后创建）"
+        orig_records.append(record)
+
+    bad_orig = [
+        r["path"]
+        for r in orig_records
+        if r.get("orig_present") is not True
+        or r.get("md5_matches_recorded_before") is not True
+    ]
+    if dry_run:
+        # dry-run 不建 .orig：只断言"已存在的都还对得上"，缺的逐条列出待建。
+        bad_existing = [
+            r["path"] for r in orig_records
+            if r.get("orig_present") is True and r.get("md5_matches_recorded_before") is not True
+        ]
+        pending = [r["path"] for r in orig_records if r.get("orig_present") is not True]
+        checks.append(
+            _acceptance_check(
+                "已存在的 .orig 备份 md5 与记录一致",
+                [],
+                bad_existing,
+                note=(
+                    "dry-run 不写文件，故不要求 .orig 已存在；以下 "
+                    f"{len(pending)} 个将在实跑时创建并校验: {pending}"
+                ),
+            )
+        )
+    else:
+        checks.append(
+            _acceptance_check(
+                "每个被重述文件都有 md5 已校验的 .orig 备份",
+                [],
+                bad_orig,
+                note="md5(.orig) 必须逐条等于 manifest 记录的 md5_before（即改写前的原件）",
+            )
+        )
+
+    return {
+        "dry_run": bool(dry_run),
+        "checks": checks,
+        "all_pass": all(c["pass"] is True for c in checks),
+        "failed": [c["name"] for c in checks if c["pass"] is not True],
+        "weights_pct": weights,
+        "phantom_scan": {
+            "nav_breakdown_hits": nb_hits,
+            "account_state_illegal_hits": illegal,
+            "account_state_intentionally_retained": retained,
+        },
+        "orig_backups": orig_records,
+        "books": {
+            "2026-10-27/post_holdings.json": prev_post,
+            f"{INSTANCE_RUN_LABEL}/{INSTANCE_SUBDIR}/post_holdings.json": inst_post,
+        },
+    }
+
+
+def _print_diff_summary(
+    files: Sequence[Mapping[str, Any]],
+    *,
+    dry_run: bool = False,
+    limit: int = 40,
+) -> None:
+    """打印本次运行的逐文件改写摘要（dry-run 与实跑同一份代码路径）。
+
+    每条：相对路径 / md5 前 → 后 / 是否变化 / 叶子字段改动条数与明细（截断到
+    ``limit`` 条）。这是操作员在按回车之前唯一需要读的东西，所以刻意做成
+    "先 md5 后字段"：md5 说明字节层面动没动，字段说明语义层面动了什么。
+    """
+    print("")
+    print("=" * 78)
+    print("本次改写摘要（diff summary）：md5 前 → 后 + 字段级改动")
+    print("=" * 78)
+    if not files:
+        print("(无文件改动)")
+        print("=" * 78)
+        return
+    for entry in files:
+        path = str(entry.get("path"))
+        before = entry.get("md5_before")
+        after = entry.get("md5_after")
+        if entry.get("md5_before") is None:
+            flag = "new file"
+        elif entry.get("changed"):
+            flag = "CHANGED vs .orig"
+        else:
+            flag = "same as .orig"
+        if dry_run:
+            wtag = "would write" if entry.get("changed") else "no-op"
+        elif entry.get("written"):
+            wtag = "written"
+        else:
+            wtag = "already up to date (idempotent)"
+        print(f"* {path}")
+        print(f"    md5 {before} -> {after}   [{flag}, {wtag}]  action={entry.get('action')}")
+        changes = entry.get("field_changes") or []
+        if changes:
+            print(f"    字段改动 {len(changes)} 条:")
+            for ch in changes[:limit]:
+                old = ch.get("before")
+                new = ch.get("after")
+                label = ch.get("field") or ch.get("symbol") or "<root>"
+                print(f"      - {label}: {_short(old)} -> {_short(new)}")
+            if len(changes) > limit:
+                print(f"      ... 其余 {len(changes) - limit} 条见 repair_manifest.json")
+    print("=" * 78)
+
+
+def _short(value: Any, width: int = 120) -> str:
+    """把字段值压成一行便于贴进终端/报告（不是序列化，只为可读）。"""
+    text = json.dumps(value, ensure_ascii=False, default=str)
+    return text if len(text) <= width else text[: width - 3] + "..."
+
+
+def _print_acceptance(acceptance: Mapping[str, Any]) -> None:
+    print("")
+    print("=" * 78)
+    print("验收断言（acceptance）" + ("  [dry-run]" if acceptance.get("dry_run") else ""))
+    print("=" * 78)
+    for check in acceptance.get("checks") or []:
+        flag = "PASS" if check.get("pass") is True else "FAIL"
+        print(f"[{flag}] {check['name']}: expected={check['expected']!r} actual={check['actual']!r}")
+    weights = acceptance.get("weights_pct") or {}
+    if weights:
+        print("-- 权重（占重述后 NAV，%）: " + ", ".join(f"{k}={v:.2f}" for k, v in weights.items()))
+    scan = acceptance.get("phantom_scan") or {}
+    if scan.get("account_state_intentionally_retained"):
+        print("-- account_state 刻意保留的成交/冷却事实（非持仓）:")
+        for hit in scan["account_state_intentionally_retained"]:
+            print(f"   {hit['path']} = {hit['value']!r}")
+    print(f"-- 全部通过: {acceptance.get('all_pass')}")
+    if acceptance.get("failed"):
+        print(f"-- 未通过项: {acceptance['failed']}")
+    print("=" * 78)
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
@@ -1846,7 +3462,9 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "产出: nav_breakdown.json / summary.json(补字段) / "
             "2026-10-27/holdings.json(修正股数) / live_trading_ticket.recomputed.{json,csv} / "
-            "post_holdings.recomputed.json / repair_manifest.json"
+            "post_holdings.recomputed.json / repair_manifest.json；"
+            "1.2.0 另修 2026-10-27/post_holdings.json 与 2026-10-29/215823/* 四份快照"
+            "（repair_manifest.v1.1.0.json 冻结上一版清单）"
         ),
     )
     p.add_argument(
@@ -1885,6 +3503,21 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="只计算并打印，不写任何文件（也不建 .orig）",
     )
+    p.add_argument(
+        "--skip-legacy-runs",
+        action="store_true",
+        help=(
+            "跳过 1.1.0 的通用重述 pass（10-22/10-26/10-27 的 nav_breakdown / summary / "
+            "票面 recomputed）。默认**不跳过**（保持 1.1.0 的全部行为）。"
+            "当归档树里 10-27/summary.json 已在 1.1.0 之后被更晚的一次 stage1 重跑改写时，"
+            "重跑旧 pass 会把它重新投影回旧形态（把更晚的真实运行记录抹掉），此时应加本开关。"
+        ),
+    )
+    p.add_argument(
+        "--no-repair-2026-10-29",
+        action="store_true",
+        help="跳过 1.2.0 新增的 10-27 票后态 + 2026-10-29/215823 实例定点修复",
+    )
     return p
 
 
@@ -1896,8 +3529,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"[ERROR] runs-root 不存在: {runs_root}", file=sys.stderr)
         return 2
 
-    run_labels = list(args.runs)
-    run_dirs = {r: runs_root / r for r in run_labels}
+    # ``--skip-legacy-runs`` 只让 1.1.0 的通用 pass 拿到"空的 run 列表"，从而一次
+    # for 都不进；它下面的全部代码路径（anchor 推导 / 票面重算 / 复核项）因此**逐字
+    # 保持不变**，默认行为与 1.1.0 完全一致。
+    legacy_ran = not args.skip_legacy_runs
+    run_labels = list(args.runs) if legacy_ran else []
+    # ``run_dirs`` 始终覆盖全部 ``--runs``：锚点现金推导（anchor_cash_from_origin）与
+    # 现金滚动都按"目录名 -> 路径"查表，与"这次是否重跑通用 pass"无关。
+    run_dirs = {r: runs_root / r for r in list(args.runs)}
     for r in run_labels:
         if not run_dirs[r].is_dir():
             print(f"[ERROR] run 目录不存在: {run_dirs[r]}", file=sys.stderr)
@@ -1922,6 +3561,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     log: List[str] = []
     manifest_files: List[Dict[str, Any]] = []
+    if not legacy_ran:
+        log.append(
+            "[legacy] --skip-legacy-runs：跳过 10-22/10-26/10-27 的通用重述 pass；"
+            "1.1.0 那次的逐文件记录由 repair_manifest.v1.1.0.json 冻结继承，本版不重跑"
+        )
+
+    # 必须在任何写盘之前登记：``repair_manifest.json`` 一旦被本轮覆写，上一版记录
+    # 的"改写前 md5"就不完整了（见 ``_MANIFEST_MD5_BEFORE`` 的 docstring）。
+    # 刻意不进 ``log``：条数首跑为 0、复跑为正，写进 manifest 会破坏复跑逐字节一致的幂等契约。
+    register_manifest_md5_before(runs_root)
+    # 只读预检（同样只打印、不落盘）：让"已有 .orig 是半截副本"在**任何读取之前**
+    # 就大声可见 —— 否则第一个症状是某处 JSONDecodeError，病因被埋起来。
+    preflight_existing_orig_backups(runs_root)
+
+    previous_manifest, manifest_history_info = _load_previous_manifest(
+        runs_root, dry_run=args.dry_run
+    )
+    if manifest_history_info.get("path"):
+        log.append(f"previous manifest: {manifest_history_info['path']} ({manifest_history_info.get('md5')})")
 
     with MarketDbReader(market_db) as reader:
         if market_db:
@@ -2058,6 +3716,81 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 }
             )
 
+        # ------------------------------------------------------------------
+        # 1.2.0：10-27 票后态 + 2026-10-29/215823 实例定点修复
+        # ------------------------------------------------------------------
+        instance_payloads: Dict[str, Any] = {}
+        instance_info: Dict[str, Any] = {}
+        prev_post_entry: Dict[str, Any] = {}
+        if args.no_repair_2026_10_29:
+            log.append("[1.2.0] --no-repair-2026-10-29：跳过 10-27 票后态与 10-29 实例修复")
+        else:
+            inst_result = repair_2026_10_29_instance(
+                runs_root, reader=reader, dry_run=args.dry_run, log=log
+            )
+            instance_payloads.update(inst_result["payloads"])
+            instance_info = inst_result["info"]
+            manifest_files.extend(inst_result["files"])
+
+            prev_post_entry = repair_2026_10_27_post_holdings(
+                runs_root, dry_run=args.dry_run, log=log
+            )
+            manifest_files.append(prev_post_entry)
+            # dry-run 时磁盘上还是旧账本，验收要拿"将会写进去"的内容来断言。
+            source = (
+                runs_root / "2026-10-27" / "post_holdings.recomputed.json"
+                if args.dry_run
+                else runs_root / "2026-10-27" / "post_holdings.json"
+            )
+            instance_payloads["post_holdings_10_27"] = json.loads(source.read_text("utf-8"))
+
+        acceptance = (
+            verify_repair_acceptance(
+                runs_root,
+                files=manifest_files,
+                payloads=instance_payloads,
+                dry_run=args.dry_run,
+            )
+            if instance_payloads
+            else {
+                "dry_run": bool(args.dry_run),
+                "checks": [],
+                "all_pass": None,
+                "note": "--no-repair-2026-10-29：未执行 1.2.0 定点修复，无验收断言",
+            }
+        )
+        if acceptance.get("all_pass") is False:
+            raise RuntimeError(
+                "验收断言未通过，拒绝写 manifest: " + ", ".join(acceptance.get("failed") or [])
+            )
+
+        carried: Dict[str, Any] = {}
+        if previous_manifest and not legacy_ran:
+            for key in (
+                "anchor_policy",
+                "cash_evidence",
+                "ex_dividend_check",
+                "ex_dividend_intersection_by_run",
+                "ticket_row_changes",
+                "nav_summary",
+                "runs_skipped",
+                "runs_skipped_reason",
+                "reviews",
+            ):
+                if key in previous_manifest:
+                    carried[key] = previous_manifest[key]
+            carried["assumptions_v1_1_0"] = previous_manifest.get("assumptions")
+            carried["_note"] = (
+                "以下内容原样继承自 repair_manifest.v1.1.0.json：本次没有重跑 10-22/10-26/10-27 "
+                "的通用 pass（--skip-legacy-runs），因此这些区块的权威来源仍是 1.1.0 那次运行。"
+                "本版新增的定点修复见 instance_repair_2026_10_29 与 files[recorded_in='1.2.0']。"
+            )
+
+        merged_files = _merge_manifest_files(
+            previous_manifest,
+            [_persistable_file_entry(e) for e in manifest_files],
+            runs_root,
+        )
         manifest = {
             "script": "scripts/repair_live_run_snapshots.py",
             "script_version": SCRIPT_VERSION,
@@ -2065,6 +3798,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "dry_run": bool(args.dry_run),
             "runs_root": _rel(runs_root),
             "runs_processed": sorted(run_labels),
+            "legacy_run_pass": {
+                "executed": bool(legacy_ran),
+                "runs": sorted(run_labels),
+                "reason_if_skipped": (
+                    None
+                    if legacy_ran
+                    else (
+                        "--skip-legacy-runs：这段归档树里 2026-10-27/summary.json 已在 1.1.0 "
+                        "之后被更晚的一次 stage1 重跑改写（盘上 md5 已不等于 1.1.0 记录的 "
+                        "md5_after）。重跑旧 pass 会按 .orig 把该文件重新投影回旧形态，等于抹掉"
+                        "那次更晚的真实运行记录，故本次只做 1.2.0 的定点修复。"
+                    )
+                ),
+            },
+            "manifest_history": {
+                # 只写"冻结了什么"，不写"这次是不是刚冻结的"（created_by_this_run /
+                # source_path / note 这类瞬时信息会让首跑与复跑的 manifest 不一致）。
+                "supersedes": _stable_manifest_history(manifest_history_info, previous_manifest),
+                "previous_script_version": previous_manifest.get("script_version"),
+                "previous_files_recorded": len(previous_manifest.get("files") or []),
+            },
+            "carried_forward_from_v1_1_0": carried,
             "runs_skipped": ["2026-10-23", "2026-10-25"],
             "runs_skipped_reason": (
                 "10-23 / 10-25 两轮 run 的 as_of_date 仍是 2026-10-22（重复 run，"
@@ -2114,6 +3869,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "区别于线上 computed/override/fallback_input）；nav_restatement 记录 "
                     "before/after/delta/reason"
                 ),
+                "instance_restatement_2026_10_29": (
+                    "10-29/215823 的重述口径：(1) 权益腿 = 原档 per_symbol 里仍真实持有的标的"
+                    "（估值单元格原样保留，逐票断言重算值与原档逐分相等）+ 601919.SH 建仓"
+                    " 2,400 × 16.67 = 40,008.00；(2) 现金腿 = 原档 cash 99,071.46 − 40,008.00 "
+                    "= 59,063.46（cash_source 仍是 explicit，操作员手工输入）；(3) "
+                    "nav_effective 保留 208,478.46 作历史事实，nav_computed = 权益 + 现金 ="
+                    " 199,935.46；(4) 锚点沿用原档 anchors，601919 以建仓日（= as_of）为锚点，"
+                    "使 factor 比值恒为 1.0。估值数学只走 compute_nav，不写第二套公式。"
+                ),
+                "phantom_lot_removal_rule": (
+                    "已计入现金侧的卖出回款所对应的标的，绝不允许再出现在权益侧的账面或"
+                    "account_state 的 entry_prices / lifecycle_states 里 —— 否则同一笔资产被"
+                    "两条腿各计一次。account_state 的 last_exit_date / exit_bars_ago / "
+                    "holding_bars 是**成交与冷却事实**，不是持仓，必须保留：删掉会让状态机"
+                    "认为这两只从未离场，冷却期也就不再拦截"
+                ),
+                "nav_history_rule": (
+                    "account_state.nav_history_10d 的相邻重复值视为同一笔冻结 NAV 的重复抄写"
+                    "（web/livetrading 的写入器只在值变化时 append），重述时去重并追加真实 "
+                    "NAV，不补数、不插值"
+                ),
             },
             "data_sources": [
                 {
@@ -2147,37 +3923,69 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 },
             },
             "cash_source": "bil_fallback",
+            "cash_sources_by_run": {
+                "2026-10-22 / 2026-10-26 / 2026-10-27": "bil_fallback（BIL 权重推导，与 NAV 差额互校）",
+                f"{INSTANCE_RUN_LABEL}/{INSTANCE_SUBDIR}": (
+                    "explicit（操作员手工输入 99,071.46；票前余额，已含 10-26 卖出回款，"
+                    "再减 601919 建仓成本 40,008.00 = 59,063.46）"
+                ),
+            },
             "cash_evidence": anchor_evidence,
             "assumptions": [
-                "假设 10-27 三笔卖单**未成交**：它们是 10-26 已成交减仓的重复下单"
-                "（同一批标的、同一批股数），若已成交则 10-27 的持仓与现金都要另行改写",
-                "假设 10-26 五笔卖单按票面价、整手成交（500/300/500/100/100 股），"
-                "卖出所得 52,482.00 计入 10-27 期初现金；未计手续费与滑点",
+                "**OPERATOR-CONFIRMED（2026-10-30）**：10-26 五笔卖单（500/300/500/100/100 股，"
+                "含 600584.SH@56.72、600362.SH@35.96）已按票面价成交，回款合计 52,482.00 —— "
+                "这不再是假设，是操作员确认的成交事实；未计手续费与滑点",
+                "**操作员未回执**：10-27 三笔重复卖单（600900/600660/000999，合计 43,227）"
+                "是否成交仍无券商流水；现金差只有 373.29（占 NAV 0.19%），可反证基本未成交，"
+                "本脚本仍按**未成交**处理。若日后拿到回执证明已成交，10-27 的持仓与现金都要另行改写",
+                "**OPERATOR-CONFIRMED（2026-10-30）**：601919.SH 于 2026-10-29 买入 2,400 股 "
+                "@16.67 = 40,008.00 已成交（票面 BUY 行同值）；10-29 现金 99,071.46 为操作员"
+                "手工输入的**票前**可用余额（cash_source: explicit）",
+                "10-29 的持仓估值沿用当轮 nav_breakdown.json 已记录的收盘价单元格"
+                "（由生产写入器从 fuyao 取数），本脚本只做去重与补一行建仓，不重取行情；"
+                "601919 的 16.67 既是成交价也是当轮票面 mark 价（price_bar_date=2026-10-29）",
                 "假设 10-22 那一轮的持仓输入正确、且 197,351.17 是当时的真实账户总值，"
                 "因此其现金 46,216.17 是唯一可当作真实余额的读数"
                 "（BIL 权重推导与 NAV 差额两条路径互相校验一致）",
                 "BIL 是美股 ETF、A 股库无其因子；且票面 BIL 行 target_shares 恒为 0，"
                 "现金不以 BIL 份额存在，故按票面现金流推导而非按 BIL 市值",
-                "未重算模型目标权重/熔断/regime 权重/状态机；票面 recomputed 文件已显式标注",
+                "未重算模型目标权重/熔断/regime 权重/状态机；票面 recomputed 文件与 10-29 的"
+                "重述文件均已显式标注",
                 "未计交易费用、印花税、过户费与滑点",
+                "10-29 实例的 account_state.drawdown_pct 由重述后的 current_nav 与未变的 "
+                "peak_nav 按同一公式重算；tier / linear_equity_scale 未动（−1.53% 未触及任何"
+                "档位阈值）",
             ],
             # ---- 缺陷 4：真跑一次只读 SQL，把原始查询/原始输出/逐票判定交出去 ----
-            "ex_dividend_check": ex_dividend_check(
-                reader,
-                symbols=sorted(
-                    {
-                        s
-                        for r in results
-                        for s in (r["breakdown"].get("per_symbol") or {}).keys()
-                    }
-                    | {s for r in results for s in (r["breakdown"].get("holdings") or {})}
-                ),
-                anchors_by_symbol=_anchors_by_symbol(results),
+            "ex_dividend_check": (
+                ex_dividend_check(
+                    reader,
+                    symbols=sorted(
+                        {
+                            s
+                            for r in results
+                            for s in (r["breakdown"].get("per_symbol") or {}).keys()
+                        }
+                        | {s for r in results for s in (r["breakdown"].get("holdings") or {})}
+                    ),
+                    anchors_by_symbol=_anchors_by_symbol(results),
+                )
+                if results
+                else {
+                    "since": EX_DIVIDEND_CHECK_SINCE,
+                    "read_only": True,
+                    "db": market_db,
+                    "skipped": (
+                        "本次未重跑 10-22/10-26/10-27 的通用 pass，没有需要复核的持仓；"
+                        "1.1.0 那次运行的原始 SQL 与逐票判定见 "
+                        "carried_forward_from_v1_1_0.ex_dividend_check"
+                    ),
+                }
             ),
             "ex_dividend_intersection_by_run": {
                 r["run"]: r["breakdown"].get("ex_dividend_intersection", []) for r in results
             },
-            "files": manifest_files,
+            "files": merged_files,
             "reviews": review,
             "ticket_row_changes": ticket_changes,
             "nav_summary": {
@@ -2200,6 +4008,106 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 for r in results
             },
             "log": log,
+            # ------------------------------------------------------------------
+            # 1.2.0 新增区块
+            # ------------------------------------------------------------------
+            "instance_repair_2026_10_29": instance_info or {"note": "未执行（--no-repair-2026-10-29）"},
+            "historical_evidence_left_uncorrected": [
+                {
+                    "path": f"{INSTANCE_RUN_LABEL}/holdings.json",
+                    "what": "10-29 顶层输入账本，仍写着两只已离场标的各 100 股",
+                    "why_kept": (
+                        "它**就是**幽灵仓第三次复活的输入原件（与 2026-10-27/post_holdings.json "
+                        "逐字节相同）。改写它等于销毁'账本滞后如何传导'的第一手证据。"
+                    ),
+                    "must_not_fix_later": True,
+                },
+                {
+                    "path": f"{INSTANCE_RUN_LABEL}/{INSTANCE_SUBDIR}/holdings.json",
+                    "what": "同一输入的实例目录副本（6 只）",
+                    "why_kept": "同上；本版只改该实例的票后态与三份重述文件，票前输入保持原样",
+                    "must_not_fix_later": True,
+                },
+                {
+                    "path": f"{INSTANCE_RUN_LABEL}/{INSTANCE_SUBDIR}/live_trading_ticket.json",
+                    "what": "当轮票面：对两只已离场标的输出 HOLD（current_shares=100）+ 601919 BUY",
+                    "why_kept": (
+                        "票面是模型/状态机当轮的输出记录，附随 .csv 同源。改写票面等于伪造"
+                        "策略输出；重述只能发生在票后态与估值侧"
+                    ),
+                    "must_not_fix_later": True,
+                },
+                {
+                    "path": f"{INSTANCE_RUN_LABEL}/{INSTANCE_SUBDIR}/live_trading_ticket.csv",
+                    "what": "同上（CSV 形态）",
+                    "why_kept": "同上",
+                    "must_not_fix_later": True,
+                },
+                {
+                    "path": "2026-10-27/post_holdings.json.orig",
+                    "what": "10-27 票后态的原件（6 只，含两只幽灵仓）",
+                    "why_kept": (
+                        "本版覆写 post_holdings.json 时留的逐字节备份，是'断点在哪'的核心证据；"
+                        ".orig 一旦存在就永不覆盖"
+                    ),
+                    "must_not_fix_later": True,
+                },
+                {
+                    "path": "2026-10-27/holdings.json",
+                    "what": "1.1.0 的'通用 pass'按滞后的 10-22 票后态写出的 4 只账本",
+                    "why_kept": "它不是运行日志，而是 1.1.0 的重述结论；已在 .orig 里保留原件",
+                    "must_not_fix_later": True,
+                },
+                {
+                    "path": "2026-10-27/live_trading_ticket.json",
+                    "what": "重复下单的原始票面（三笔 SELL 合计 43,227，无成交回执）",
+                    "why_kept": "重复下单是本轮缺陷的起因之一，原件不得改写",
+                    "must_not_fix_later": True,
+                },
+                {
+                    "path": "2026-10-27/live_trading_ticket.recomputed.json / .csv",
+                    "what": "1.1.0 的旁路重算票面",
+                    "why_kept": "旁路证据，本版不重跑也不覆盖",
+                    "must_not_fix_later": True,
+                },
+                {
+                    "path": f"{INSTANCE_RUN_LABEL}/summary.json",
+                    "what": "10-29 顶层（stage1 扁平）summary，与实例目录分叉",
+                    "why_kept": (
+                        "顶层只跑了 stage1，account_state 仍是 10-27 旧态（COOLDOWN / "
+                        "PENDING_ENTRY）；它属于当天的扁平记录，不在本次重述范围内"
+                    ),
+                    "must_not_fix_later": True,
+                },
+                {
+                    "path": f"{INSTANCE_RUN_LABEL}/account_state.json",
+                    "what": "顶层旧态 account_state（10-27 的 COOLDOWN / PENDING_ENTRY）",
+                    "why_kept": "同上；'顶层与实例目录分叉'本身是待规范的缺陷证据",
+                    "must_not_fix_later": True,
+                },
+                {
+                    "path": (
+                        f"{INSTANCE_RUN_LABEL}/stage1_health_report.json / .md 与 "
+                        f"{INSTANCE_RUN_LABEL}/{INSTANCE_SUBDIR}/stage1_health_report.json / .md"
+                    ),
+                    "what": "当轮宏观门禁报告（GO），其输入是含幽灵仓的账本",
+                    "why_kept": "门禁是在污染账本上跑的，这是'门禁为何没拦住'的证据",
+                    "must_not_fix_later": True,
+                },
+                {
+                    "path": f"{INSTANCE_RUN_LABEL}/{INSTANCE_SUBDIR}/account_state.json (保留字段)",
+                    "what": (
+                        "last_exit_date / exit_bars_ago / holding_bars 里仍有两只已离场标的的"
+                        " 2026-10-26 离场记录"
+                    ),
+                    "why_kept": (
+                        "它们是**成交与冷却事实**，不是持仓。删掉会让状态机认为这两只从未离场，"
+                        "冷却期不再拦截，下一轮可以立刻重新买入 —— 那是制造新缺陷"
+                    ),
+                    "must_not_fix_later": True,
+                },
+            ],
+            "acceptance": acceptance,
         }
 
         manifest_path = runs_root / "repair_manifest.json"
@@ -2207,7 +4115,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     for line in log:
         print(line)
-    return 0
+    _print_diff_summary(manifest_files, dry_run=bool(args.dry_run))
+    if acceptance.get("checks"):
+        _print_acceptance(acceptance)
+    return 0 if acceptance.get("all_pass") is not False else 1
 
 
 def _anchors_by_symbol(results: Sequence[Mapping[str, Any]]) -> Dict[str, Optional[str]]:
