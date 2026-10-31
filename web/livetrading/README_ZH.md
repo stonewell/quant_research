@@ -18,7 +18,8 @@
 3. **交互式持仓与现金管理 (Interactive Holdings & Cash Management)**：
    - 增删改现有持仓（支持股数或目标权重）。
    - 实时计算组合总资产净值 (NAV)、闲置资金与现金占比。
-   - 持仓账本**仅**持久化于运行归档中（见第 6 项）：部署时以上一次运行的 `post_holdings.json` 为种子，或使用操作者为本交易日录入的 `holdings.json`；不再存在任何全局持仓文件。
+   - 持仓账本**仅**持久化于运行归档中（取簿优先级见第 6 项）；不再存在任何全局持仓文件。
+   - **手工保存同时记录"这是人确认过的账本"。** `POST /api/holdings`（未钉住运行目录的保存）会在逐字节相同的 `holdings.json` 旁写入 `operator_holdings.json`：`{"saved_at", "source": "operator_manual_correction", "holdings"}`。它是**部分成交**的唯一记录（本系统不接收任何券商成交回执），因此在**展示**与**种子**两条路径上都压过该轮的计划账本。部署路径始终钉住自己的运行目录，故永不写这个文件。
 4. **一阶：组合健康度与宏观门禁 (Stage 1: Portfolio Health & Macro Gate)**：
    - 计算自历史最高净值 (HWM) 的峰谷回撤。
    - 评估熔断层级（正常、一阶阻尼、二阶防守、三阶暂停冷冻）及自愈冷却计数，全面兼容混合策略参数前缀 (`cfsb_`, `crb_`, `ccsb_`, `cdhb_`, `blend_`)。
@@ -33,13 +34,16 @@
 6. **不可变每日快照归档与历史日期浏览 (Daily Snapshot Archive & Browser)**：
    - 每个交易日生成完整快照包并存储于 `<archive_dir>/<strategy>/<universe>/<date>/`（同一交易日多轮运行时另加 `<date>/<HHMMSS>/` 实例目录）：
      - `holdings.json`：当日组合持仓。
+     - `operator_holdings.json`：**仅**当操作者为该会话手工保存过账本时存在（见第 3 项）；人工确认的账本，形如 `{"saved_at", "source", "holdings"}`。
      - `account_state.json`：当日账户净值、历史高点、回撤、熔断层级及冷却计数。
      - `stage1_health_report.json`：当日健康度门禁评估报告。
      - `live_trading_ticket.json` 与 `live_trading_ticket.csv`：当日生成的交易指令清单。
      - `post_holdings.json`：该轮交易单假设成交后的计划持仓账本。
      - `summary.json`：运行参数、执行耗时与日志输出。
-   - **持仓与账户状态只持久化于此**：部署时以上一次运行的 `post_holdings.json` 作为持仓种子（或使用操作者为本次会话录入的 `holdings.json`）；两者皆无时拒绝生成交易单——以空账本定量会把已经卖出的仓位重新买回来。
+   - **持仓与账户状态只持久化于此**：当请求未携带显式账本（正常 UI 流程发送 `current_holdings: null`）时，部署按以下顺序取种子：本会话的操作者手工修正（`operator_holdings.json`）→ 该轮计划盘后账本（`post_holdings.json`）→ 从未跑完二阶的会话目录中的快照（`holdings.json` / `current_holdings.json`）→ 上一轮的计划账本；全部皆无时拒绝生成交易单——以空账本定量会把已经卖出的仓位重新买回来。
    - **提交的空账本被拒绝，而非被当作"全现金"。** 形如 `{}`、全为零或每一行都没有可用股数的持仓簿会被拒绝（`EmptyBookConfirmationRequiredError`），因为引擎会为每个当前持仓标的生成卖出工单——等价于一次整仓清仓。真正意图是全现金的账户应每次请求中显式传 `confirm_empty_book: true`（Web UI 会先弹窗向操作员确认）；该轮归档时以 `holdings_seed_source = "operator_confirmed_empty_book"` 落盘，以便审计时与操作者手动录入的持仓清单（`operator_input`）区分开来。该门禁刻意不设环境变量开关（不同于 `LIVETRADING_STRICT_SEED_BOOK`），因为"表格还没填"绝不是合法的"全部现金"指令。
+   - **提交的账本与同日计划完全一致时被拒绝，除非调用方明确声明已核实。** `edited: true`（`POST /api/run-deploy` 与 `POST /api/deploy/multi` 均接受）表示提交的账本已**对照券商实际成交**核实，绝不推断。未标记时，若提交的**非空**账本等于该日已完成的计划账本，会在任何副作用之前抛 `UnconfirmedPlanAsInputError`——因为 UI 会把计划账本画进表格，原样回传会使每个目标都等于当前持仓，生成**零张订单**却被归档为成功。该门禁对尚无计划的日期（全新会话）永不生效，且与 `confirm_empty_book` **相互独立**：后者授权空账本（整仓清仓），前者授权计划形态的非空账本；二者互不授权。Web UI 在操作者实际编辑过表格之前发送 `current_holdings: null`（保留键）并省略 `edited`。
+   - **状态标签（面向审计的封闭取值域）。** `bundle["holdings_source"]`（UI 展示口径）恰为以下之一：`operator_manual_correction` → `post_trade_book` → `snapshot` → `pre_trade_fallback`（按优先级排序；最后一项表示"存在二阶产物但计划不可解析"，即回落展示原始盘前快照并**打标签**）。`summary.json["holdings_seed_source"]`（部署定量口径）恰为以下之一：`operator_input`、`operator_confirmed_empty_book`、`operator_manual_correction`、`operator_snapshot`、`previous_post_holdings`、`legacy_get_holdings_fallback`、`none`。
    - Web 端 `data/` 目录**只存放配置**（`settings.json`、`settings.local.json`、`custom_universes.json`、`multi_strategy_configs.json`），绝不保存持仓或账户状态。
    - 随时切换查看任意历史日期的持仓、账户状态与交易指令。
 7. **全路径零硬编码 (Zero Hardcoded Paths)**：

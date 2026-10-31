@@ -124,7 +124,7 @@
    - `common/intraday_features.py`：`load_intraday_5m_universe` 新增 DuckDBCache 自动 fallback 查询机制，当数据源返回空或未指定时无缝回退读取本地 DuckDB 缓存（`data/cache.duckdb`）。
    - `scripts/check_live_portfolio_health.py`：支持 `--enable-intraday-5m` 与策略参数 `enable_intraday_5m` 双通道激活，并在自动串联 Stage 2 时穿透转发 `--enable-intraday-5m`。
    - `scripts/run_live_strategy.py`：支持 `--enable-intraday-5m` 与策略参数双通道激活，交割单原生计算日内 VWAP 偏离度、主动可成交限价与被动支撑限价，激活跌停封死双向冻结与防透支机制。
-   - `web/livetrading/execution_service.py`：Stage 1、Stage 2 与多策略净额化部署默认附带 `--enable-intraday-5m`，使 Web 实盘工作站开箱即用 5m 微观结构共振。
+   - `web/livetrading/execution_service.py`：Stage 1 与 Stage 2 单策略部署默认附带 `--enable-intraday-5m`，使 Web 实盘工作站开箱即用 5m 微观结构共振。**（2026-10-30 就地更正）** 上文"多策略净额化部署默认附带"一句**已不成立**：`scripts/run_live_multi_strategy.py` 的 argparse 从未定义该参数，带上即 `error: unrecognized arguments`（exit 2、零成交），故矩阵路径自 `891df17` 起**不再附带**该 flag，只跑日线信号。详见 **§25.9.12.6**。
 
 ---
 
@@ -3993,3 +3993,76 @@ LIVETRADING_STRICT_SEED_BOOK=0        # 0 / false / no / off 同样生效
 - **补记 8 — 测试与实跑（复核后，100% 离线 / 合成 / `tmp_path`）**：新增 2 条（`test_live_book_integrity.py` 第 10 节，`:2099` 与 `:2144`）：⑥**多策略净额目录**（`netted_trading_ticket.json` 带 `target_shares` + 幽灵 `holdings.json`，无 `post_holdings.json`、无 `live_trading_ticket.*`）⇒ `holdings` 为计划簿、`holdings_source == "post_trade_book"`、`pre_trade_holdings` 为盘前簿；⑦**最新实例无簿 + 更早实例跑完 Stage 2** ⇒ `get_run` 与 `get_holdings` 返回**同一本**计划簿（`holdings_source` 仍为 `snapshot`）。两条均实测"反向改坏即转红"：⑥把票据名改回只传 `("live_trading_ticket",)` → `holdings_source` 退化为 `pre_trade_fallback`；⑦把 `get_run` 的实例回退改回 `_load_snapshot_holdings` → `get_run` 重回幽灵簿、与 `get_holdings` 分叉。计数：`test_live_book_integrity.py` → **83 passed**（81 + 2）；`test_web_livetrading.py` + `test_run_instances.py`（`--import-mode=importlib`）→ **90 passed, 1 failed**；`web/livetrading/tests` 整目录 → **220 passed, 1 failed**。唯一红仍是**既有** `test_executable_web_config_carries_no_machine_specific_paths`（未跟踪的 `web/livetrading/data/settings.local.json`；已用 HEAD 版测试文件单独复现同一红，证明与本轮改动无关）。
 - **补记 9 — 归档零写入复核**：两份 `2026-10-29/holdings.json`（平层 + `215823/`）仍为 `md5 f0770c672577fc0442c2ac0760959061`；`find <该归档目录> -newer web/livetrading/storage.py -type f` **无任何输出**。
 - **补记 10 — 规则 7（版本轴）仍未触发**：本次修订只落在 Web 存储读路径（`storage.py`）、测试与文档，`BASE_VERSION` 与各 per-class `version` 一律未动，**无需** `--dump-strategies` 重跑。
+
+#### 25.9.12（2026-10-30 补记）实盘 Web 层：宇宙键、符号解析、归档键稳定性与"计划≠持仓"分离
+
+本条记录同日七个提交（`d3cbb46` → `1250719`，`web/livetrading/` 的存储读路径、部署请求模型、执行服务与前端部署载荷），全部为**缺陷收口**，无任何策略/模板/回测语义改动。每个小节按「缺陷（`file:line`）→ 为何有操作含义 → 改了什么 → 刻意未改 → 钉住它的测试 → 实测数字」书写；数字一律取自真实 `git show`/`git log` 与对只读归档/宇宙文件的实测，未实测者不写。
+
+##### 25.9.12.1 `d3cbb46` 宇宙键改由唯一实现推导（`storage.py:227`）
+
+- **缺陷**：同一条"从宇宙文件路径推导 `universe_key`"的规则被写了两遍 —— `resolve_keys` 用硬编码父目录集合 `("universe", "docs", ".")`，`discover_universes` 用 `basename(self.universe_dir)`。二者**只在** `universe_dir = <repo>/docs/universe` 时等价，属**潜伏**分叉：把 `universe_dir` 指到任何别的目录（按部署命名的文件夹、符号链接树），下拉框会给出 `<folder>_<stem>` 前缀键，而部署写入与归档读取用的是裸 `<stem>` 键 ⇒ **操作员可以选中一个永远匹配不到任何一轮的宇宙**。
+- **改动**：新增模块级 `universe_key_from_path(path, universe_dir)`（`storage.py:227`）作为唯一 owner，`resolve_keys`（`:1633`）与 `discover_universes`（`:1729`）都改为调用它。归一化逐字节沿用旧实现（`[^a-zA-Z0-9_\u4e00-\u9fa5]+ -> "_"` → `strip("_")` → `lower()`）；父目录等于 `basename(universe_dir)`（即文件直接位于宇宙根目录）时取裸 stem，完全无父目录（`"foo.txt"`、`universe_dir=""`）时也取裸 stem —— 这与旧写法经尾部下划线剥离后的结果一致。
+- **刻意未改**：**匹配规则**（`normalize_universe_key` / `get_universe_key_variants` / `keys_match`）一行未动。旧后缀式别名类（目录名 `astock_202609_20_custom`，15 轮）仍可经这三个函数命中对手拼写 —— 本提交只统一**推导**，不改**匹配**。
+- **验证（无操作变化）**：改造前后对全部 **31 个可选宇宙**（`docs/universe` 下实测 **29 个 `.txt` preset** + `custom_universes.json` 的 2 个自定义）各导出一份两键对照 dump，`diff` 为空；每个归档 `(strategy, universe)` 的日期计数未变。
+- **测试**：`test_live_book_integrity.py` 第 11 节 3 条 —— `test_universe_key_from_path_matches_discover_for_every_preset`、`test_resolve_keys_and_discover_agree_for_docs_level_file`、`test_legacy_suffix_dir_still_resolves`。
+
+##### 25.9.12.2 `461910c` 下拉框报告宇宙的真实符号（`storage.py:1720`）
+
+- **缺陷**：`discover_universes` 每行只取**第一个**空白 token（`s.replace(",", " ").split()[0].upper()`），而真正被 `--universe <file>` 加载的 `FileUniverseProvider.get_symbols`（`common/universe.py`）取每行的**每一个** token。实测四个单行 preset 因此把 20/29/47/31 只标的显示成 **1** 只：`china/20_etf.txt`（20）、`china/global_etf.txt`（29）、`47_stock_without_ai_outliers.txt`（47）、`31_stock_without_losers.txt`（31）。
+- **这是展示/报告缺陷，不是运行缺陷**：运行始终使用完整集合（`--universe` 直接交给 provider）。且 UI 对 preset 只发 `universe_file`，**从不**把 textarea 内容当 `custom_symbols` 提交（`app.js` 仅当所选 option 的 `dataset.type === "custom"` 时才发），`_resolve_universe` 亦优先解析 `universe_file` —— 修列表所以**不可能移动任何一股**，它只纠正操作员据以判断的标签、可编辑符号框与 `[N只标的]` 计数。
+- **改动**：符号列表改由**同一个 parser** 提供（`symbols = FileUniverseProvider(full_path).get_symbols()`，`storage.py:1720`），不写第二份解析；`common/` 整体不可导入时用一个**故意不自实现解析**的占位类抛错，使该宇宙仍被列出但符号列表为空（可见的未知优于安静的错）。新增 3 条测试：与 provider 逐 preset 对照（`count == len(symbols)`）、单行 20 个 ticker 的计数、以及表头行为。
+- **宇宙文件数据缺陷（刻意不修，如实披露）**：`docs/universe/china/50只A股高流动性优质股票精选/50_stock.txt` 首行是 CSV 表头 `证券代码`，而 `FileUniverseProvider` 只跳空行与 `#` 行，故 **runner 一直把表头当作一个"标号"加载**（实测该文件 provider 返回 **51** 条，首条即 `证券代码`），下拉框现在如实报告这一点。修它等于改下一轮**宇宙定义**（删除该行会改变加载集合），是独立决策，本轮**不做**。`test_header_row_in_50_stock_is_reported_by_both_paths` 把当前行为**钉死**（含 `symbols[0] == "证券代码"` 与"只在前端侧跳过表头即转红"的反向验证说明），使它不能静默漂移。
+
+##### 25.9.12.3 `c4fa052` summary 缺失的轮次归属其宇宙（`storage.py:188` / `:3036`）
+
+- **一处事实更正（必须先说）**：早前"这些日期在选择下不可见"的判断是**错的**。`list_runs` 用 `keys_match` 过滤，`astock_202609_20_custom` 与 `custom_astock_202609_20` 始终互相匹配 —— 那个探针比的是**回显字符串**，而不是去问列表。真实缺陷是**回显的键不稳定**。
+- **真缺陷**：一个物理宇宙目录回显的键取决于 `summary.json` 是否存在。实测 `chan_four_state_blend/astock_202609_20_custom` 下共 **15 个日期**：其中 **3 个**（`2026-09-27/28/29`）无 `summary.json`，回显目录名 `astock_202609_20_custom`；**12 个**有 summary 的日期回显记录值 `custom_astock_202609_20`。同一目录、同一选择，出现两种字符串口径 —— 任何把 `run["universe_key"]` 当字符串比较的消费者会把一轮会话读成两轮。
+- **改动**：新增 `selection_spelling_for_universe_dir(dir_name)`（`storage.py:188`），把 summary 缺失时的目录名后备**改拼**为选择侧拼写（`X_custom` → `custom_X`），且只在 `keys_match` 确认两者同属一个别名类之后才改 —— 因此该动作**不可能**改变一轮归哪个选择；非 `_custom` 结尾或不同类的名字原样返回。`list_runs` 的 summary-less 分支（`:3036`）调用它。**刻意不**经 `custom_universes.json` 规范化：归档必须能在没有配置文件时可读。
+- **副作用（如实记录）**：该别名类的 per-key 计数由 **3 + 12** 合并为 **15**。实测侧证：真实归档上列出 **30 行**、顺序完全一致、3 个回显键被更正；`latest_only` 对两种拼写各返回**同样的 15 轮、同一顺序**。
+- **刻意未改**：列表过滤逻辑一行未加 —— 别名机制本就在（原 `:2934`/`:2939`），本提交只是让**回显**与之对齐。
+- **测试**：第 13 节 3 条 —— summary-less 日期归属其选择、同一日期的键不依赖 summary 是否存在、真实归档三个旧日期仍可达（其中一条以"退回裸键比较即转红"反向验证）。
+
+##### 25.9.12.4 `52b18ac` 受限读取不再回落到无关旧轮（`storage.py:3193` / `:3373`）
+
+- **缺陷**：`get_run` 与 `get_run_csv` 末尾都有一条**无条件**的 legacy 平层回落 `<archive>/<date>`。后果实测：`chan_four_state_blend/china_20_etf/2026-09-29` 被交给 `accelerating_dual_momentum` 的同日平层轮，并**按请求方自己的键回显** —— 错误的选择拿到的是**另一个策略的票据**，而不是一次 miss。
+- **改动**：回落只在**无范围**读取（`strategy_key` 与 `universe_key` 皆空）时生效，即未加键的 `/api/runs/{date}` 与 legacy 浏览路径。受限读取若其键**确实**匹配某个旧轮，前置的 `list_runs` 搜索已按同一"记录键/推导键"规则（`keys_match`）服务它，故没有丢失任何合法读取；受限 miss 表现为该路由**既有**的 404。
+- **刻意未改**：**没有新增任何键匹配代码** —— 列表已经拥有这条规则，再写一份就是第二个 owner（同一规则两处实现正是 25.9.12.1 的缺陷成因）。
+- **实测**：两组外来键在 bundle 与 CSV 两条路由上均 404；`accelerating_dual_momentum/2026_09_29_resolved_universe` 与**未加键**的 `/api/runs/2026-09-29` 仍返回该轮及其**自身**键。2026-09-29 轮仍可查看。
+- **测试**：第 14 节 4 条 —— 受限读取不返回外来旧轮、无范围读取仍返回旧轮、键匹配的旧轮经受限读取仍可达、无键旧轮按推导键匹配。
+
+##### 25.9.12.5 `d531dae` 多策略净额轮记录宇宙键（`models.py:227-228`、`server.py:287-290`、`execution_service.py:3010-3015/:3277-3278`、`app.js:1860-1861`）
+
+- **缺陷**：矩阵部署请求 `MultiStrategyDeployRequest` 有 `universe_file` / `custom_symbols` 却**没有** `universe_key`，于是 `run_multi_strategy_netted_deploy` 写出的矩阵 `summary.json` 也没有。矩阵轮的目录是 `<archive>/<date>/multi_netted_<matrix>`，**没有自己的宇宙目录**，`list_runs` 只能给它贴字面量 `multi_matrix` —— 一个没有选择拥有的键。实测真实归档：两个矩阵轮（`2026-10-13` / `2026-10-15`，`multi_netted_tri_core_blend`）只回应 `list_runs(universe_key="multi_matrix")`，按真实选择（`custom_astock_202609_20` / `china_20_etf`）查询返回 **0**。（对这两份 summary 的实测：`deploy_status` 均为 `SUCCESS`、`trades_count` 分别 **6** 与 **8**、`universe_key` 均为 `null`。）
+- **改动**：请求模型、`/api/deploy/multi` 路由、服务签名（**追加在末尾**，既有位置调用者语义不变）与前端调用都携带 `universe_key` / `universe_name`；服务把它们**逐字**写进矩阵 summary（取自请求，绝不在此推导）。`list_runs` **无需改动**：其矩阵分支本就优先读 `summary["universe_key"]`，并保留 `multi_matrix` 回落。
+- **必须强调的边界**：这两个字段是**检索元数据 only**。宇宙解析仍来自 `universe_file`（优先）与 `custom_symbols`（`_resolve_universe` 顺序未变），因此传入它们**不可能**改变子进程加载哪个宇宙文件或哪套符号 —— 由 `test_multi_deploy_summary_records_universe_key` 断言。它们**永不**成为输入通道。
+- **向后兼容**：老客户端两字段都不发 ⇒ summary 记 `None`，`list_runs` 走 `multi_matrix` 回落，两个**已归档**轮的行为与今天完全一致。
+- **测试**：第 15 节 4 条 —— summary 记录键且解析不变、矩阵轮可按其记录的宇宙列出、无键矩阵轮仍列 `multi_matrix`、请求模型接受这两个字段。
+
+##### 25.9.12.6 `891df17` 不再传脚本不接受的参数（`execution_service.py:3199` 起）
+
+- **缺陷**：矩阵部署**总是**给子进程 argv 追加 `--enable-intraday-5m`，而 `scripts/run_live_multi_strategy.py` 的 argparse **从未定义**该参数（任何分支的任何提交都没有；本轮实测 `grep` 该脚本零命中）。子进程因此在 argparse 阶段就死掉，一根 bar 都没读到：exit **2**、`error: unrecognized arguments: --enable-intraday-5m`、`deploy_status: FAILED`、`trades_count: 0`。
+- **时间线（此前的说法已更正）**：该 flag 由 `c8559e6`（2026-10-20）引入，而那次提交只把它加给**匹配器服务**（实测其 stat 含 `execution_service.py`、`run_live_strategy.py`、`check_live_portfolio_health.py`、`common/intraday_features.py`、`common/financial_api.py`，**不含** `run_live_multi_strategy.py`）。故真实归档里两个矩阵轮（`2026-10-13`、`2026-10-15`，SUCCESS、6 / 8 笔成交）**早于**该提交，正因如此才成功；**自 2026-10-20 起该路径立即失败，之后没有产出任何一轮**。
+- **改动**：移除该 flag（`execution_service.py:3199` 起的说明注释处），矩阵路径**只跑日线信号**。策略层通道**未动**：策略 dump `params` 里的 `enable_intraday_5m` 仍原样进入 `generate_weights`，`blend_base` 在 5m 列缺失时降级到日线。
+- **诚实可观测**：矩阵 summary 的 `observability.intraday_5m` 现在自己讲真话 —— `requested=false / enabled=false / source="none"`（`reconcile_intraday_5m_observability` 的 `else` 臂；矩阵路径在 `:3254` 以 `health_report=None` 调用）。
+- **测试**：第 16 节 2 条 **argv 契约测试** —— 把服务发出的**每一个** flag 与目标脚本 argparse 实际定义的参数**双向**比对，再做一次真实的 `parse_args`；parser 通过观测 `ArgumentParser.__init__` 捕获，**不改任何 `scripts/*` 文件**。单策略路径获得同样断言（reporting-only 守卫）且为干净。此类"服务发了一个脚本不认的参数"的缺陷因此无法再复发。
+- **刻意未做**：给净额 runner 接真正的 5 分钟能力是**独立特性**（要移植 `load_intraday_5m_universe` + `enrich_universe_with_intraday_features` 并重新发出开关），不是本次修复的副作用；已登记为未实现项（见 `docs/development_plan.md`）。
+
+##### 25.9.12.7 `1250719` 操作者自己的簿与它派生自的计划分离（`storage.py:299-305`、`execution_service.py:815/838/2393/2425`、`models.py:139/247`、`app.js:22`）
+
+- **背景（为什么这不是"输入校验小瑕疵"）**：全系统**没有**券商成交回执。一轮的 PLAN 说的是"若每一行都按指令全额成交，簿会是什么"；只有**人**能说实际成交了什么。二者混为一谈就会出两类事故：计划被当作事实绘制（部分成交被隐藏），或计划被当作持仓回灌（票据零张订单却被归档为成功）。
+- **ITEM 2a — 手工修正落成独立 sidecar**：`save_holdings`（`storage.py:2284`）只在 `run_dir is None`（即 `/api/holdings` 的**真实手工保存**）时，在**同目录**写 `operator_holdings.json`（`{"saved_at","source","holdings"}`，`:2317-2330`），而 `holdings.json` 保持**逐字节不变**（其他读取者依赖它）。新增 `holdings_source` 取值 `operator_manual_correction`（常量 `:299`/`:305`）。该 sidecar 同时赢得**展示**（`_display_book_for_run_dir` 的 rank 1，`:1925`）与**种子**（`resolve_seed_holdings` 的 rank 0，`:2254`），于是部分成交不再被"假定全成的计划"盖住。部署路径永远 pin `run_dir`，因此**永不写**该 sidecar —— 把自动盘前种子盖章成"人的断言"正是 2026-10-29 幽灵簿的复活路径。
+- **ITEM 1b — `edited` 闸**：`RunDeployRequest` / `MultiStrategyDeployRequest` 新增 `edited: bool = False`（`models.py:139` / `:247`，"已对照券商实际成交核实"、**永不推断**）。两条部署路径在 VALIDATION 块内、**任何副作用之前**，对"非空且与本日已完成计划同形"的未编辑簿抛 `UnconfirmedPlanAsInputError`（`:838` 定义、`:2425` 判定、两处调用点分别在单策略与矩阵路径）。判定用 `_shares_book` 归一化（`100` / `100.0` / `"100"` 同值；权重簿强制转换为空 ⇒ 不可能冒充计划）。引用书只取**本日**已完成轮的计划（`_same_day_planned_book`，`:2393`，单策略先看最新实例再看平层、矩阵直接看矩阵目录），**新日期没有计划 ⇒ `None` ⇒ 永不被闸**。
+- **两闸正交**：`confirm_empty_book` 授权**空簿**（整仓清仓），`edited` 授权**计划形非空簿**；互不授权，且空簿永远归空簿闸（`_refuse_unconfirmed_plan_input` 里"提交簿归一化后为空即早退"一行就是这条独立性）。
+- **前端**：`app.js` 记录 `state.holdingsEdited`（`:22`）—— 每次 `renderHoldingsTable` 清空（`:1366`，表格重新以归档/计划为准）、`input`/`change`（`:993-994`）与行删除（`:1459`）置真；四条部署路径在未编辑时发 `current_holdings: null`（**键保留**）且不带 `edited`，编辑过才发 `edited: true`（`:1867/:1872`、`:1962/:1964`、`:2041/:2043`、`:2084/:2089`）。故正常操作流程是**静默降级到归档种子**，服务端拒绝只是 API/批量客户端的兜底。
+- **两张优先级表（现状，必须分开读）**：
+  - **展示**（`_display_book_for_run_dir`，`storage.py:1869` 起）：① 手工修正 `operator_manual_correction` → ② 计划盘后簿 `post_trade_book`（有 Stage-2 产物）→ ③ 快照 `snapshot`（无 Stage-2 产物）→ ④ `pre_trade_fallback`（有 Stage-2 产物但计划不可解析，回落原始快照并**打标签**，绝不返回 `{}`）。③ 与 ④ 互斥（由"目录是否带 Stage-2 产物"二分），不是并列的第四档。
+  - **部署输入**（`resolve_seed_holdings` 及其调用方 `run_live_deploy` / `run_live_multi_strategy_netted_deploy`）：① 显式提交的操作者簿（计划形时须 `edited=true` 才过闸）→ ② 本会话手工修正 `operator_manual_correction` → ③ 本会话归档簿 `operator_snapshot`（该会话目录未跑完 Stage 2 时的快照，或跑完时的计划盘后簿）→ ④ 上一轮计划 `previous_post_holdings` → ⑤ legacy 回落 → ⑥ 拒绝（`LiveSeedBookMissingError` 族）。
+  - **区分两者的规则**：**展示陈述"曾经是什么"，输入永不把计划当作持仓相信。** 两个函数刻意各自独立（`resolve_seed_holdings` **不**委托 `_display_book_for_run_dir`），因此展示口径的改动不可能静默移动下单定量；二者各自通过 `_operator_correction_for_run_dir` 读同一份 sidecar。
+- **测试**：第 17 节 8 条 —— 手工修正赢得展示、手工修正作为部署种子、重复保存后仍生效、未编辑计划形簿被拒、`edited` 后接受、空簿闸与 `edited` 闸相互独立、种子标签不派生自展示 helper、新日期不被闸；另有 `test_web_livetrading.py` 2 条旧契约**改点**（手工修正压过计划；同轮幂等用例显式传 `edited=True` 以断言 `initial_holdings` 才是真实簿）。
+- **如实披露的覆盖缺口**：① `app.js` 这半边**没有任何单测**（仅静态核对）；② 矩阵/净额轮**没有手工修正通道**（手工放进 `operator_holdings.json` 会被遵从，但没有写入路由）；③ **新增但从未键入的空行不会把表标为 `edited`**（只有 `input`/`change`/行删除会置真），这种行在部署时会被丢弃。
+
+**收口声明（§25.9.12）**
+
+- **版本轴（`AGENTS.md` 规则 7）未触发**：七个提交只落在 `web/livetrading/storage.py`、`execution_service.py`、`models.py`、`server.py`、`static/js/app.js` 与其测试、文档；未触碰任何 `AllocationTemplate` / 静态模板 / `BaseBlendAllocationStrategy` / 策略类，`BASE_VERSION` 与各 per-class `version` 一律未动，**不欠** `--dump-strategies` 重跑。
+- **归档零写入**：全程未修改 `/home/stone/Work/stock/simulate/**` 任何文件；本文整理时重新实测两份 `2026-10-29/holdings.json`（平层 + `215823/`）仍为 `md5 f0770c672577fc0442c2ac0760959061`。
+- **已知既有红测（沿用既有披露，本轮未重跑）**：`web/livetrading/tests` 的 `test_executable_web_config_carries_no_machine_specific_paths` 仍为唯一红，由未跟踪的 `web/livetrading/data/settings.local.json` 固定机器路径引起，与本批无关（同 §25.9.10 / §25.9.11）。本批的 pytest 实跑由独立的验证轮负责；本节只记录**新增用例数**（第 11–17 节共 27 条 + 2 条旧契约改点），不记录未经本环节实测的 passed 计数。
