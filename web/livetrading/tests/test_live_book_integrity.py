@@ -2941,8 +2941,20 @@ def test_multi_deploy_summary_records_universe_key(temp_storage, monkeypatch):
     child is told to load must still be the one materialised from `custom_symbols`
     (`resolved_universe.txt`), unchanged by the label.
 
+    (P4b) End-to-end proof of the argv fix as well: the argv handed to the faked child must
+    be accepted by the REAL `run_live_multi_strategy.py` parser (a fake child cannot notice
+    a flag argparse would reject -- the explicit `parse_args` below is what catches it), the
+    round must not be recorded `FAILED` when that child succeeds, and the intraday block must
+    say truthfully that the matrix path requested no 5m features.
+
     re-break: drop `universe_key`/`universe_name` from the matrix summary dict in
     `run_multi_strategy_netted_deploy` -- both summary asserts fail (verified red).
+    re-break (P4b, argv): re-add `cmd.append("--enable-intraday-5m")` to the matrix argv --
+    the `parse_args` call below raises `SystemExit` naming the flag (verified red).
+    re-break (P4b, status): make `deploy_status` unconditionally `"FAILED"` -- the status
+    assert fails (verified red).
+    re-break (P4b, honesty): set `block["requested"] = True` in `_apply_intraday_observability`
+    -- the intraday assert fails on a claim the matrix path cannot honour (verified red).
     """
     calls = []
 
@@ -2976,6 +2988,19 @@ def test_multi_deploy_summary_records_universe_key(temp_storage, monkeypatch):
     assert os.path.normpath(univ_arg) == os.path.normpath(os.path.join(run_dir, "resolved_universe.txt"))
     with open(univ_arg, encoding="utf-8") as f:
         assert "600519.SH" in f.read()
+
+    # (P4b) The argv is a real contract with the child's own argparse: a faked child would
+    # happily "succeed" on a flag the real script rejects, so parse it for real here.
+    parser = _script_parser("scripts.run_live_multi_strategy")
+    parser.parse_args(calls[0][2:])  # raises SystemExit if any flag is unknown
+    # ... and a child that exits 0 must not be recorded as a failed round.
+    assert summary["deploy_status"] != "FAILED", summary.get("deploy_stderr")
+    assert summary["deploy_returncode"] == 0
+    # The matrix runner has no 5m capability at all, so the summary must not claim one.
+    intraday = summary["observability"]["intraday_5m"]
+    assert intraday["requested"] is False
+    assert intraday["enabled"] is False
+    assert intraday["source"] == "none"
 
 
 def test_matrix_round_is_listable_under_its_recorded_universe(temp_storage):
@@ -3041,3 +3066,175 @@ def test_multi_deploy_request_accepts_universe_key():
     old_style = MultiStrategyDeployRequest(matrix_id=_P4_MATRIX)
     assert old_style.universe_key is None
     assert old_style.universe_name is None
+
+
+# ---------------------------------------------------------------------------
+# 16. (P4b) argv CONTRACT: every flag the service emits must exist in the script
+#
+# FORENSIC CONTEXT (measured, not remembered).  `c8559e6` (2026-10-20) added
+# `cmd.append("--enable-intraday-5m")` to the MATRIX argv in
+# `ExecutionService.run_multi_strategy_netted_deploy` and nothing else; the same commit
+# never touched `scripts/run_live_multi_strategy.py`, and no commit on any branch has
+# ever defined that flag there (`git log --all -S'enable_intraday_5m' --
+# scripts/run_live_multi_strategy.py` -> empty).  The consequence, reproduced live:
+# exit code 2 in ~0.83 s, `error: unrecognized arguments: --enable-intraday-5m`,
+# `deploy_status: FAILED`, `trades_count: 0` -- the runner died before reading a bar.
+# The two matrix rounds in the real archive (`2026-10-13`, `2026-10-15`) are SUCCESS
+# WITH 6 and 8 trades precisely because they predate `c8559e6`.
+#
+# The class of defect is "the service invents a flag the child's argparse does not
+# have", and nothing but the child's own parser can answer it.  These two tests
+# therefore compare the argv the SERVICE builds against the parser the SCRIPT builds,
+# in both directions.
+# ---------------------------------------------------------------------------
+
+#: One faked child that records its argv and exits 0 -- the subject is the argv, never
+#: the runner's output parsing (that is `test_multi_deploy_summary_records_universe_key`).
+def _capture_argv(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(_execution_service.subprocess, "run", fake_run)
+    return calls
+
+
+def _script_parser(module_name):
+    """The script's REAL `argparse.ArgumentParser`, captured without editing the script.
+
+    Neither runner exposes a `build_parser()`: each constructs its parser inside
+    `parse_args()` and returns `parser.parse_args()` from it.  Two ways to get at the
+    parser from a test exist -- refactor the entrypoint (a `scripts/*` behaviour-adjacent
+    edit, and `--help` would have to stay byte-equivalent) or observe the constructor.
+    This observes it: `ArgumentParser.__init__` is spied for exactly one `parse_args()`
+    call, and that call still runs to completion, so a module that normalises its
+    Namespace afterwards (as `run_live_strategy.parse_args()` does with
+    `min_entry_bars` / `min_entry_confirmation`) behaves exactly as in production.
+    `sys.argv` is reduced to the program name so the capture depends on nothing but the
+    module itself.
+
+    `_actions` is private argparse API, used here deliberately: it is the only way to
+    enumerate option strings without parsing a sentinel argv, and a rename would fail the
+    test loudly rather than silently pass it.
+    """
+    import argparse
+    import importlib
+
+    module = importlib.import_module(module_name)
+    saved_argv = sys.argv
+    captured = []
+    orig_init = argparse.ArgumentParser.__init__
+
+    def spy_init(self, *a, **kw):
+        orig_init(self, *a, **kw)
+        captured.append(self)
+
+    argparse.ArgumentParser.__init__ = spy_init
+    sys.argv = ["<argv-contract-capture>"]
+    try:
+        module.parse_args()
+    finally:
+        argparse.ArgumentParser.__init__ = orig_init
+        sys.argv = saved_argv
+    assert captured, f"{module_name} constructed no ArgumentParser in parse_args()"
+    return captured[-1]
+
+
+def _accepted_options(parser):
+    return {s for action in parser._actions for s in action.option_strings}
+
+
+def _required_options(parser):
+    """Options argparse itself insists on (`required=True`). Everything else is defaulted."""
+    return [a.option_strings[0] for a in parser._actions if getattr(a, "required", False)]
+
+
+def _emitted_options(argv):
+    """The option strings in a service-built argv.
+
+    A leading dash is a sufficient discriminator for these two builders: every path they
+    pass is absolute, every numeric value is non-negative, and the only values with a dash
+    are none.  (If that ever changes, this returns a "flag" the contract test would wrongly
+    report -- so the test would fail loudly, never pass silently.)
+    """
+    return sorted({t for t in argv if t.startswith("-")})
+
+
+def _assert_argv_contract(parser, argv, script_name):
+    """Symmetric difference: nothing invented, nothing required-but-missing."""
+    accepted = _accepted_options(parser)
+    emitted = _emitted_options(argv)
+    unknown = [f for f in emitted if f not in accepted]
+    assert not unknown, (
+        f"{script_name} would reject {unknown}: the service emits flags its argparse "
+        f"does not define. This is the 2026-10-20 `--enable-intraday-5m` defect."
+    )
+    missing = [f for f in _required_options(parser) if f not in emitted]
+    assert not missing, (
+        f"{script_name} requires {missing} but the service never passes them."
+    )
+    # The strongest form: hand the whole argv to the real parser. A faked subprocess
+    # cannot notice a flag argparse would reject; this can.
+    parser.parse_args(argv[2:])
+
+
+def test_multi_deploy_argv_is_accepted_by_the_script_parser(temp_storage, monkeypatch):
+    """The matrix deploy's argv is a contract with `run_live_multi_strategy.py`.
+
+    Every flag the service emits must be one the script defines; an operator who runs the
+    printed command by hand must not meet a different argparse than the service does.
+
+    re-break: re-add `cmd.append("--enable-intraday-5m")` to the matrix argv in
+    `run_multi_strategy_netted_deploy` -- this test fails naming `--enable-intraday-5m`
+    (verified red), while the single-path test below stays green: they are different
+    scripts, which is exactly why both exist.
+    """
+    calls = _capture_argv(monkeypatch)
+    service = ExecutionService(temp_storage)
+    service.run_multi_strategy_netted_deploy(
+        matrix_id=_P4_MATRIX,
+        strategies=[{"strategy_key": "chan_four_state_shield_blend", "capital_weight": 1.0}],
+        custom_symbols=["600519.SH", "000001.SZ"],
+        as_of_date=_P4_DATE,
+        portfolio_value=100_000.0,
+        current_holdings={"600519.SH": 100},
+        data_provider="synthetic",
+    )
+    assert len(calls) == 1
+    _assert_argv_contract(
+        _script_parser("scripts.run_live_multi_strategy"), calls[0], "run_live_multi_strategy.py"
+    )
+
+
+def test_single_deploy_argv_is_accepted_by_the_script_parser(temp_storage, monkeypatch):
+    """REPORTING ONLY: the single-strategy argv is currently clean -- keep it visible.
+
+    The symmetric difference for `run_live_deploy` -> `run_live_strategy.py` is empty today
+    (that script really does define `--enable-intraday-5m`, `--guard-latency-bars`, ...),
+    so this is a plain green assertion, not an `xfail`.  If the single path ever grows the
+    same defect, this test names the flag -- and fixing order generation is a separate
+    decision, deliberately not taken here.
+
+    re-break: append a flag the script does not define (e.g. `cmd.append("--not-a-flag")`)
+    to the Stage-2 argv -- this test fails naming it (verified red).
+    """
+    calls = _capture_argv(monkeypatch)
+    strat_file = os.path.join(temp_storage.data_dir, "p4b_single_contract_strat.json")
+    os.makedirs(temp_storage.data_dir, exist_ok=True)
+    temp_storage._save_json(strat_file, {"template_name": "dummy", "params": {}})
+
+    service = ExecutionService(temp_storage)
+    service.run_live_deploy(
+        strategy_file=strat_file,
+        custom_symbols=["600519.SH"],
+        portfolio_value=100_000.0,
+        current_holdings={"600519.SH": 100},
+        data_provider="synthetic",
+        nav_override=True,
+    )
+    assert len(calls) == 1
+    _assert_argv_contract(
+        _script_parser("scripts.run_live_strategy"), calls[0], "run_live_strategy.py"
+    )

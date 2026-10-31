@@ -3013,7 +3013,24 @@ class ExecutionService:
             cmd.extend(["--start-date", start_d])
         if self.storage.cache_dir:
             cmd.extend(["--cache-dir", self.storage.cache_dir])
-        cmd.append("--enable-intraday-5m")
+        # (P4b) NO `--enable-intraday-5m` here.  `c8559e6` (2026-10-20) added the flag to
+        # THIS argv only; `scripts/run_live_multi_strategy.py` never defined it (no commit
+        # on any branch ever has), so every matrix round since that date died in argparse
+        # with `error: unrecognized arguments: --enable-intraday-5m` (exit 2, ~0.8 s,
+        # `deploy_status: FAILED`, `trades_count: 0`) before the runner read a single bar.
+        # The multi runner loads DAILY bars only (`load_live_universe(..., interval="1d")`,
+        # never overridden) and contains no 5m code path at all -- there is no 5m
+        # capability to switch on, and no other flag name to use.  The strategy-level
+        # channel still works untouched: `enable_intraday_5m` inside a strategy dump's
+        # `params` reaches `generate_weights` verbatim, and `blend_base` guards on the
+        # presence of the 5m COLUMNS, so it degrades to the daily signal instead of
+        # crashing.  The matrix path therefore runs on the daily signal only, which is
+        # what the summary's `observability.intraday_5m` now honestly reports
+        # (`requested=False`, `source="none"`).  This is option (b) of the P4b audit:
+        # stop passing a flag the script cannot accept; wiring real 5m support into the
+        # netting runner (the `load_intraday_5m_universe` +
+        # `enrich_universe_with_intraday_features` block that `run_live_strategy.py:1984`
+        # runs) is a separate, deliberate feature -- not a side effect of this fix.
         if allow_intraday:
             cmd.append("--allow-intraday")
         else:
