@@ -2664,10 +2664,18 @@ def test_a_dates_key_does_not_depend_on_summary_presence(temp_storage):
 def test_real_archive_three_legacy_dates_are_reachable(temp_storage):
     """The three summary-less real rounds: listed, and under the selection that owns them.
 
-    Read-only against the production archive (skipped when it is not mounted).  The
-    `StorageManager` is built against `temp_storage`'s dirs and the archive is then
-    re-pointed by ATTRIBUTE, so not even `makedirs(exist_ok=True)` runs against the
-    real tree.
+    Read-only against a production archive SUPPLIED BY the environment variable
+    `LIVETRADING_VERIFY_ARCHIVE`; there is deliberately no machine-specific default.
+    The probe skips when the variable is unset (or names a non-directory), so CI and
+    clean checkouts are unaffected.  The `StorageManager` is built against
+    `temp_storage`'s dirs and the archive is then re-pointed by ATTRIBUTE, so not even
+    `makedirs(exist_ok=True)` runs against the real tree.
+
+    COVERAGE TRADE-OFF, stated honestly: the probe no longer auto-detects a local
+    archive, so it only runs when a human sets the variable.  The fallback is that the
+    same three claims (the three dates are listed, all 15 rounds are reachable, every
+    echoed key is in the selection's alias class) are also pinned hermetically by the
+    section-13 tests against a synthetic archive, which run everywhere.
 
     Records the resolution of the conflicting claims in section 13's header: the
     probe's "invisible" reading was an artefact of comparing the echoed key string;
@@ -2680,9 +2688,11 @@ def test_real_archive_three_legacy_dates_are_reachable(temp_storage):
     NOT re-break this test once the fallback re-spells into the selection spelling --
     it re-breaks test 1's reverse direction instead, which is why both are pinned.
     """
-    archive = "/home/stone/Work/stock/simulate/202609/runs"
-    if not os.path.isdir(archive):
-        pytest.skip(f"no production archive at {archive}")
+    archive = os.environ.get("LIVETRADING_VERIFY_ARCHIVE", "").strip()
+    if not archive or not os.path.isdir(archive):
+        pytest.skip(
+            "set LIVETRADING_VERIFY_ARCHIVE to the live run archive to run this probe"
+        )
 
     temp_storage.archive_dir = archive  # attribute only: nothing is created on disk
     runs = temp_storage.list_runs(
@@ -3660,3 +3670,77 @@ def test_new_date_is_not_gated_by_edited(temp_storage, tmp_path, monkeypatch):
         default={},
     ) or {}
     assert matrix_summary["holdings_seed_source"] == EXPLICIT_BOOK_SOURCE
+
+
+# ---------------------------------------------------------------------------
+# 18. (2026-10-30) The deploy payloads send the CONFIRMED EMPTY BOOK
+#
+# FORENSIC CONTEXT.  Section 7's `confirmEmptyBookIfNeeded` lets the operator confirm
+# "the account really is all cash", and the route forwards `confirm_empty_book` (section
+# 8).  But the payload expression was `state.holdingsEdited ? holdings : null`, so a
+# confirmed-empty table still submitted `null` -- and the backend's `null` path resolves
+# a SEED from the archive, which raises `LiveSeedBookMissingError` on a (strategy,
+# universe) pair that has never deployed.  The first-ever deploy of a new pair was thus
+# unreachable from the UI: confirming the dialog still failed, unless the operator
+# invented a holding row.  `confirm_empty_book` only authorises an explicitly submitted
+# EMPTY book, so the confirmed case must send `{}`.
+#
+# The rule the four sites now encode:
+#   * untouched NON-EMPTY table -> `null`  (archive seeds the engine, not the plan);
+#   * emptied AND confirmed     -> `{}`    (`confirm_empty_book` authorises all-cash);
+#   * actually edited           -> the table, and `edited: true` (untouched by this fix:
+#     a confirmed-empty deploy is NOT marked edited -- the two gates stay independent).
+#
+# HONEST SCOPE: this is a STATIC SOURCE ASSERTION, not a behavioural test.  The
+# repository has no JS test framework (and adding one is out of scope), so nothing here
+# executes the browser flow -- it pins the SHAPE of the expression and the number of
+# deploy paths, nothing more.  The behaviour itself is pinned server-side by sections 7
+# and 8; this guard exists so a future edit cannot silently drop the disjunct, or add a
+# fifth deploy path that forgets it, without a red test.
+# ---------------------------------------------------------------------------
+
+#: The UI source the four deploy payloads live in; ownership is app.js's.
+_APP_JS_PATH = os.path.join(_WEB_DIR, "static", "js", "app.js")
+
+
+def test_every_deploy_payload_sends_the_confirmed_empty_book():
+    """Every `current_holdings:` payload site carries BOTH gates, and there are four of them.
+
+    `state.holdingsEdited` alone is the pre-fix shape that broke the first deploy of a
+    seedless pair; `emptyBookConfirmed === true` alone would submit a non-empty table
+    whenever the operator merely left the plan untouched -- the guards are a disjunct,
+    not a replacement.  The count assertion is the anti-regression half: a new deploy
+    path added without the disjunct would change neither of the other asserts until it
+    was actually exercised, so the site count is pinned at exactly 4.
+
+    Static source assertion only (see the section header) -- it cannot prove the browser
+    flow, which is why sections 7/8 pin the server behaviour hermetically.
+
+    re-break: revert ONE site to `state.holdingsEdited ? holdings : null` -- the
+    `emptyBookConfirmed` assert fires for that line (verified red, then restored
+    byte-identically); delete a payload site -- the count assert fires.
+    """
+    with open(_APP_JS_PATH, encoding="utf-8") as f:
+        source = f.read()
+
+    # Property-definition lines only: the comment lines that MENTION
+    # `current_holdings: null` start with `//`, so an lstrip is enough to tell them apart.
+    payload_sites = [
+        line.strip()
+        for line in source.splitlines()
+        if line.lstrip().startswith("current_holdings:")
+    ]
+
+    assert len(payload_sites) == 4, (
+        "expected exactly 4 deploy payloads carrying `current_holdings:`, found "
+        f"{len(payload_sites)}: {payload_sites}"
+    )
+    for line in payload_sites:
+        assert "state.holdingsEdited" in line, (
+            "a deploy payload no longer gates on the operator having edited the table: "
+            f"{line}"
+        )
+        assert "emptyBookConfirmed" in line, (
+            "a deploy payload drops the confirmed-empty-book case, so a first deploy of a "
+            f"seedless (strategy, universe) pair cannot send its all-cash book: {line}"
+        )

@@ -1861,10 +1861,16 @@
             universe_name: keys.univName,
             as_of_date: baseParams.as_of_date,
             portfolio_value: baseParams.portfolio_value,
-            // (ITEM 1, 2026-10-30) Same rule as the single path: an UNEDITED table is just
-            // the bundle's book painted back, so submit `null` (key kept) and let the
-            // backend seed from the archive -- `operator_holdings.json` first, then the plan.
-            current_holdings: state.holdingsEdited ? holdings : null,
+            // (ITEM 1, 2026-10-30) Same rule as the single path, plus the all-cash case:
+            //  * an untouched NON-EMPTY table is just the bundle's book painted back, so
+            //    submit `null` (key kept) and let the backend seed from the archive --
+            //    `operator_holdings.json` first, then the plan;
+            //  * a table the operator EMPTIED and CONFIRMED submits `{}` so the server's
+            //    `confirm_empty_book` can authorise the all-cash deploy (a `null` here would
+            //    make the backend resolve a seed instead, i.e. refuse on a seedless pair);
+            //  * only an actually edited table is marked `edited` (below), never a
+            //    confirmed-empty one.
+            current_holdings: (state.holdingsEdited || emptyBookConfirmed === true) ? holdings : null,
             data_provider: baseParams.data_provider,
             min_holding_bars: 2,
             inertia_threshold: 0.05,
@@ -1953,13 +1959,17 @@
             // (ITEM 1, 2026-10-30) An UNEDITED table is the archive's own book painted back
             // into the form (see `renderHoldingsTable`), so sending it would hand the backend
             // its own plan as holdings -- every target equals the current position and the
-            // ticket is ZERO orders, archived as a success. Send `null` (the KEY stays
+            // ticket is ZERO orders, archived as a success. Submit `null` (the KEY stays
             // present) and let the backend's archive seed decide: `operator_holdings.json`
             // (a human's partial-fill correction) first, then the round's plan, then the
-            // snapshot. Only a table the operator actually touched is submitted, and then it
-            // carries `edited: true` so the server-side refusal
-            // (`UnconfirmedPlanAsInputError`) stays out of the way.
-            current_holdings: state.holdingsEdited ? holdings : null,
+            // snapshot. The one exception is a table the operator EMPTIED and CONFIRMED:
+            // that submits `{}` (still not `edited`) so `confirm_empty_book` can authorise
+            // the all-cash deploy -- `null` there would ask the backend to resolve a seed
+            // instead, which refuses on a pair with no seed book. Only a table the operator
+            // actually touched is submitted as an edit, and then it carries `edited: true`
+            // so the server-side refusal (`UnconfirmedPlanAsInputError`) stays out of the
+            // way.
+            current_holdings: (state.holdingsEdited || emptyBookConfirmed === true) ? holdings : null,
         };
         if (state.holdingsEdited) deployParams.edited = true;
         if (emptyBookConfirmed === true) deployParams.confirm_empty_book = true;
@@ -2036,9 +2046,12 @@
         }
         const deployParams = {
             ...baseParams,
-            // (ITEM 1, 2026-10-30) Same rule as `runLiveDeploy`: an untouched table is the
-            // archive's book, so submit `null` (key kept) and let the archive seed it.
-            current_holdings: state.holdingsEdited ? holdings : null,
+            // (ITEM 1, 2026-10-30) Same rule as `runLiveDeploy`: an untouched NON-EMPTY
+            // table is the archive's book, so submit `null` (key kept) and let the archive
+            // seed it; a table the operator emptied AND confirmed submits `{}` so
+            // `confirm_empty_book` can authorise the all-cash deploy; only an actually
+            // edited table is marked `edited`.
+            current_holdings: (state.holdingsEdited || emptyBookConfirmed === true) ? holdings : null,
         };
         if (state.holdingsEdited) deployParams.edited = true;
         if (emptyBookConfirmed === true) deployParams.confirm_empty_book = true;
@@ -2079,9 +2092,12 @@
                     as_of_date: baseParams.as_of_date,
                     portfolio_value: baseParams.portfolio_value,
                     // (ITEM 1, 2026-10-30) Same rule as the standalone multi deploy: an
-                    // untouched table is the archive's book, so submit `null` (key kept) and
-                    // let `operator_holdings.json` / the netted plan seed the engine.
-                    current_holdings: state.holdingsEdited ? holdings : null,
+                    // untouched NON-EMPTY table is the archive's book, so submit `null`
+                    // (key kept) and let `operator_holdings.json` / the netted plan seed the
+                    // engine; a table the operator emptied AND confirmed submits `{}` so
+                    // `confirm_empty_book` can authorise the all-cash deploy; only an
+                    // actually edited table is marked `edited`.
+                    current_holdings: (state.holdingsEdited || emptyBookConfirmed === true) ? holdings : null,
                     data_provider: baseParams.data_provider,
                     min_holding_bars: 2,
                     inertia_threshold: 0.05,
