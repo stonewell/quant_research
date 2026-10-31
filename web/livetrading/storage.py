@@ -40,11 +40,19 @@ def find_repo_root() -> str:
 
 
 try:
-    from common.universe import get_stock_name, is_placeholder_stock_name
+    from common.universe import (
+        FileUniverseProvider,
+        get_stock_name,
+        is_placeholder_stock_name,
+    )
 except ImportError:
     try:
         sys.path.insert(0, find_repo_root())
-        from common.universe import get_stock_name, is_placeholder_stock_name
+        from common.universe import (
+            FileUniverseProvider,
+            get_stock_name,
+            is_placeholder_stock_name,
+        )
     except Exception:
         def get_stock_name(sym: str, default: Optional[str] = None) -> str:
             return default if default is not None else sym
@@ -54,6 +62,25 @@ except ImportError:
             return n.lower() in ("custom", "universe", "none", "unknown", "nan", "") or (
                 symbol is not None and n == str(symbol).strip()
             )
+
+        class FileUniverseProvider:  # type: ignore[no-redef]
+            """Placeholder for a deployment where `common/` is not importable at all.
+
+            Deliberately NOT a local re-implementation of the text parsing: a copy
+            would drift from `common/universe.py` and the dropdown would once again
+            describe a universe the runner does not load. `discover_universes`
+            catches the failure and lists the universe with an EMPTY symbol list --
+            visibly unknown instead of quietly wrong.
+            """
+
+            def __init__(self, file_path: str):
+                self.file_path = file_path
+
+            def get_symbols(self, **_kwargs) -> List[str]:
+                raise RuntimeError(
+                    "common.universe.FileUniverseProvider is unavailable; "
+                    "cannot read universe symbols"
+                )
 
 
 # (L2.3) The bar-date-vs-expected-session comparison has exactly one owner. The UI quote
@@ -1618,15 +1645,19 @@ class StorageManager:
                     if f.endswith(".txt"):
                         full_path = os.path.join(root, f)
                         rel_path = os.path.relpath(full_path, self.repo_root)
-                        # Count symbols
-                        symbols = []
+                        # Symbols: ask the RUNNER's own parser, never a local re-spelling.
+                        # This block used to take `s.replace(",", " ").split()[0].upper()`
+                        # -- the FIRST token of each line -- while
+                        # `FileUniverseProvider.get_symbols` (common/universe.py), i.e.
+                        # what `--universe <file>` actually loads, takes EVERY token of
+                        # every line. Result: `china/20_etf.txt` advertised 1 symbol and
+                        # ran 20 (also global_etf 1/29, 47_stock 1/47, 31_stock 1/31), so
+                        # the dropdown label, the editable symbol box and the count all
+                        # described a universe the run would not use. One fact, one owner:
+                        # a file that cannot be read (or resolves to nothing) keeps the
+                        # universe listed with an empty symbol list, as it did before.
                         try:
-                            with open(full_path, "r", encoding="utf-8") as ufile:
-                                for line in ufile:
-                                    s = line.strip()
-                                    if s and not s.startswith("#"):
-                                        sym = s.replace(",", " ").split()[0].upper()
-                                        symbols.append(sym)
+                            symbols = FileUniverseProvider(full_path).get_symbols()
                         except Exception:
                             symbols = []
                         # Derive friendly label and universe_key. (P0) The key comes

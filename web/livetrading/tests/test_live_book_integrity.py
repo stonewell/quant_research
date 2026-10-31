@@ -2404,3 +2404,126 @@ def test_legacy_suffix_dir_still_resolves(temp_storage):
     )
     assert bundle is not None
     assert bundle["universe_key"] == "custom_astock_202609_20"
+
+
+# ---------------------------------------------------------------------------
+# 12. (P1) The dropdown must report the symbols the RUNNER will load
+#
+# `discover_universes` used to build each preset's symbol list from the FIRST
+# whitespace token of each line (`s.replace(",", " ").split()[0].upper()`), while
+# the runner -- `FileUniverseProvider.get_symbols` in `common/universe.py`, what
+# `--universe <file>` actually loads -- takes EVERY token of every line.  So the
+# dropdown label "[N只标的]", the editable symbol box and the count the operator
+# judges the selection by were describing a universe the run would not use:
+# `china/20_etf.txt` advertised 1 symbol and ran 20, `china/global_etf.txt` 1 vs 29,
+# `47_stock_without_ai_outliers.txt` 1 vs 47, `31_stock_without_losers.txt` 1 vs 31.
+#
+# The fix is not a better copy of the parser: `FileUniverseProvider` is imported and
+# asked, so the list has ONE owner.  These tests are what keep it that way -- they
+# compare the dropdown against the provider itself for every shipped preset, so a
+# future local re-spelling cannot pass by agreeing with a fixture.
+#
+# For PRESETS the textarea is display-only: `static/js/app.js` sends
+# `custom_symbols: null` unless the selected option's `dataset.type === "custom"`
+# (`getExecutionParams`, ~line 1729), and `execution_service._resolve_universe`
+# prefers a located `universe_file` anyway.  Fixing the list therefore cannot move a
+# share -- it corrects what the operator is shown.
+# ---------------------------------------------------------------------------
+
+
+def _runner_symbols(path):
+    """The list the RUNNER builds, straight from `common/universe.py`.
+
+    Test-only import of the real parser (never a re-statement of it), so these
+    assertions measure the UI against the thing that actually trades.
+    """
+    from common.universe import FileUniverseProvider  # noqa: E402  (repo root on sys.path above)
+
+    return FileUniverseProvider(path).get_symbols()
+
+
+def test_discovered_symbols_match_file_universe_provider_for_every_preset(tmp_path):
+    """Every preset's advertised symbol list IS the runner's symbol list.
+
+    One rule, one owner: `discover_universes` asks `FileUniverseProvider`, and this
+    test asks it too, so the two can only agree.  `count` must remain
+    `len(symbols)` for the "[N只标的]" label.
+
+    re-break: restore the first-token read in `discover_universes`
+    (`s.replace(",", " ").split()[0].upper()` per line) -- the four single-line
+    presets fail: `china/20_etf.txt` reports 1 symbol where the provider returns 20,
+    plus `china/global_etf.txt` (29), `47_stock_without_ai_outliers.txt` (47) and
+    `31_stock_without_losers.txt` (31) (verified red).
+    """
+    docs_universe = os.path.join(_REPO_ROOT, "docs", "universe")
+    if not os.path.isdir(docs_universe):
+        pytest.skip(f"no preset universe tree at {docs_universe} (CI layout?)")
+
+    storage = _storage_with_universe(tmp_path, docs_universe)
+    presets = [u for u in storage.discover_universes() if u.get("type") == "preset"]
+    assert presets, "docs/universe must expose at least one preset"
+
+    for entry in presets:
+        assert entry["symbols"] == _runner_symbols(entry["path"]), (
+            f"{os.path.relpath(entry['path'], docs_universe)}: the dropdown would "
+            f"describe {len(entry['symbols'])} symbols, the runner loads "
+            f"{len(_runner_symbols(entry['path']))}"
+        )
+        assert entry["count"] == len(entry["symbols"])
+
+
+def test_preset_symbol_count_is_not_one_when_the_file_has_many(tmp_path):
+    """The exact incident, shrunk: twenty tickers on ONE line are twenty symbols.
+
+    Deliberately not a preset from `docs/`: the regression is about the parsing
+    rule, and this file makes the expected count its own documentation.  The line
+    is space-separated and mixes a comma to exercise the provider's separator set.
+
+    re-break: same first-token mutation in `discover_universes` -- the count
+    collapses to 1 and the list to `["600000.SH"]` (verified red).
+    """
+    symbols = [f"60{i:04d}.SH" for i in range(20)]
+    line = " ".join(symbols[:10]) + ", " + " ".join(symbols[10:])
+    universe_root = tmp_path / "pool"
+    universe_root.mkdir()
+    (universe_root / "twenty_on_one_line.txt").write_text(line + "\n", encoding="utf-8")
+
+    storage = _storage_with_universe(tmp_path, universe_root)
+    entry = next(
+        u for u in storage.discover_universes() if u.get("filename") == "twenty_on_one_line.txt"
+    )
+
+    assert entry["count"] == 20
+    assert entry["symbols"] == symbols
+
+
+def test_header_row_in_50_stock_is_reported_by_both_paths(tmp_path):
+    """`50_stock.txt` carries a CSV header row, and BOTH paths report it -- by design.
+
+    `证券代码` is not a ticker; it is the first line of the FILE.  This is a
+    universe-file DATA defect, not a parser defect: `FileUniverseProvider` has no
+    header rule (it skips only blank and `#` lines), so the run itself has always
+    loaded the header as a "symbol", and the dropdown now tells the truth about
+    that.  Fixing it means editing `docs/universe/china/50只A股高流动性优质股票精选/
+    50_stock.txt` (delete the header line) -- a data change this pass must NOT make,
+    because it would change what the next run loads.
+
+    re-break: add header-skipping to ONLY the UI side (e.g. drop a first line equal
+    to `证券代码` inside `discover_universes`) -- the dropdown then loses one entry
+    the runner keeps, so UI and runner diverge again and this test fails (verified
+    red).  Do not "fix" it in the shared parser either: that WOULD change run output.
+    """
+    rel = os.path.join("china", "50只A股高流动性优质股票精选", "50_stock.txt")
+    path = os.path.join(_REPO_ROOT, "docs", "universe", rel)
+    if not os.path.exists(path):
+        pytest.skip(f"no {rel} in this layout")
+
+    storage = _storage_with_universe(tmp_path, os.path.join(_REPO_ROOT, "docs", "universe"))
+    entry = next(u for u in storage.discover_universes() if u.get("path") == path)
+    runner = _runner_symbols(path)
+
+    assert entry["symbols"] == runner
+    assert entry["count"] == len(runner)
+    # The data defect, recorded verbatim and in position: the header is symbol #1.
+    assert entry["symbols"][0] == "证券代码"
+    assert runner[0] == "证券代码"
