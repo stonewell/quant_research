@@ -185,16 +185,21 @@ def test_all_three_commands_omit_as_of_date_by_default(service, monkeypatch):
     svc.run_health_check(strategy_file=strat_file, custom_symbols=["600519.SH"], portfolio_value=100000.0)
     # `nav_override=True`: this test pins the as-of-date plumbing, not the mark -- there is
     # no valuation cache in this workspace, so the engine path would (correctly) refuse.
+    # `current_holdings`: the subject is the argv date, not the seed book -- since
+    # 2026-10-30 an IMPLICIT seed on a fresh archive is a refusal, so the book is explicit.
     svc.run_live_deploy(
         strategy_file=strat_file,
         custom_symbols=["600519.SH"],
         portfolio_value=100000.0,
+        current_holdings={"600519.SH": 100},
         nav_override=True,
     )
     svc.run_multi_strategy_netted_deploy(
         strategies=[{"strategy_key": "chan_risk_managed_blend", "capital_weight": 1.0}],
         custom_symbols=["600519.SH"],
         portfolio_value=100000.0,
+        # Same reason as the Stage-2 call above (the netted path refuses an unknown seed too).
+        current_holdings={"600519.SH": 100},
     )
 
     assert len(captured) == 3, captured
@@ -222,6 +227,9 @@ def test_explicit_replay_as_of_is_forwarded_verbatim(service, monkeypatch):
         custom_symbols=["600519.SH"],
         as_of_date="2024-05-10",
         portfolio_value=100000.0,
+        # Subject is the as-of-date plumbing, not the seed book: an implicit seed on this
+        # fresh archive is now (correctly) a refusal, so hand the book in explicitly.
+        current_holdings={"600519.SH": 100},
         # Marks the as-of-date plumbing, not the NAV (no valuation cache here).
         nav_override=True,
     )
@@ -370,6 +378,9 @@ def test_intraday_gate_refusal_is_actionable(service, monkeypatch):
         strategy_file=strat_file,
         custom_symbols=["600519.SH"],
         portfolio_value=100000.0,
+        # Explicit book: an implicit seed is a refusal on this fresh archive, and the
+        # subject is the child's refusal classification.
+        current_holdings={"600519.SH": 100},
         nav_override=True,
     )
 
@@ -407,6 +418,9 @@ def test_stale_price_refusal_names_the_staleness(service, monkeypatch):
         strategy_file=strat_file,
         custom_symbols=["600519.SH"],
         portfolio_value=100000.0,
+        # Explicit book (implicit seeding is a refusal on a fresh archive); the subject is
+        # the stale-price refusal text.
+        current_holdings={"600519.SH": 100},
         nav_override=True,
     )
 
@@ -465,6 +479,9 @@ def test_success_path_is_untouched(service, monkeypatch):
         custom_symbols=["600519.SH"],
         as_of_date="2024-05-10",
         portfolio_value=100000.0,
+        # Explicit book: the success-path contract is the subject, not seed resolution
+        # (which would refuse an unknown book on this fresh archive).
+        current_holdings={"600519.SH": 100},
         nav_override=True,
     )
 

@@ -1451,6 +1451,35 @@
         recalcHoldings();
     }
 
+    // -- (fix 1, 2026-10-30) an EMPTY book is never "confirmed all-cash" by accident -----
+    // `getHoldingsFromTable()` returns `{}` for a table with no positive row (a page whose
+    // table never rendered, an operator who cleared it, a first-ever deploy).  The server
+    // cannot tell that apart from "the account really is all in cash", and an empty book
+    // makes the engine emit a SELL for every symbol -- a full liquidation (same class of
+    // failure as the 2026-10-30 wrong-book incident).  So the operator has to say it out
+    // loud, per submit, and only then do we forward `confirm_empty_book: true`.
+    //   returns null  -> book is not empty, nothing to confirm (request stays byte-identical)
+    //   returns true  -> operator accepted "treat the account as fully in cash"
+    //   returns false -> operator cancelled: the caller MUST abort and send nothing
+    function confirmEmptyBookIfNeeded(holdings) {
+        if (holdings && Object.keys(holdings).length > 0) return null;
+        return window.confirm(
+            "持仓表是空的。\n\n" +
+            "空持仓簿会被理解为「整个账户已全部转为现金」，" +
+            "本次部署将对当前持有的每一个标的生成卖出工单（等同于整仓清仓）。\n\n" +
+            "・如果确实要全部空仓，选「确定」继续（会向前端/服务端显式确认 confirm_empty_book）；\n" +
+            "・如果只是还没录入真实持仓，选「取消」，先在持仓表里填写持股与现金再部署。"
+        );
+    }
+
+    // Explicit abort banner for the cancelled case: nothing was submitted, nothing was
+    // archived, and no ticket exists -- say so instead of leaving a silent no-op.
+    function abortEmptyBookDeploy(label) {
+        const msg = `已取消${label}：持仓表为空且未确认「全部空仓」，未生成任何工单。`;
+        logConsole(`[ABORT] ${msg}`);
+        showToast(`已取消：空持仓表需要确认才会按「全部空仓」部署`, "error");
+    }
+
     function getHoldingsFromTable() {
         const rows = el.tbodyHoldings.querySelectorAll("tr");
         const holdings = {};
@@ -1783,6 +1812,13 @@
         const baseParams = getExecutionParams();
         const keys = getActiveKeys();
         const holdings = getHoldingsFromTable();
+        // (fix 1) An empty table means a full liquidation of the matrix book; refuse to
+        // submit it unless the operator explicitly confirmed an all-cash account.
+        const emptyBookConfirmed = confirmEmptyBookIfNeeded(holdings);
+        if (emptyBookConfirmed === false) {
+            abortEmptyBookDeploy("多策略净额调仓");
+            return;
+        }
         const matrixId = (el.selectMultiMatrix && el.selectMultiMatrix.value) || state.selectedMatrixId || "tri_core_blend";
 
         const currentCfg = (state.multiConfigs || []).find(c => c.matrix_id === matrixId);
@@ -1800,6 +1836,7 @@
             min_holding_bars: 2,
             inertia_threshold: 0.05,
         };
+        if (emptyBookConfirmed === true) deployParams.confirm_empty_book = true;
 
         setRunningIndicator(true, "正在执行多策略虚拟账本划分、目标权重聚合、内部对冲与净额化撮合...", activeBtn);
         logConsole(`\n[Stage 2 - Multi-Strategy Netting] 启动多策略撮合净额化调仓...\n矩阵: ${keys.stratName} (${matrixId})\n标的池: ${keys.univName}\n持仓数: ${Object.keys(holdings).length} | 数据源: ${deployParams.data_provider}`);
@@ -1870,10 +1907,18 @@
         const baseParams = getExecutionParams();
         const keys = getActiveKeys();
         const holdings = getHoldingsFromTable();
+        // (fix 1) `{}` would be sized as a full liquidation by the engine; the operator must
+        // explicitly accept that before we forward `confirm_empty_book: true`.
+        const emptyBookConfirmed = confirmEmptyBookIfNeeded(holdings);
+        if (emptyBookConfirmed === false) {
+            abortEmptyBookDeploy("实盘调仓");
+            return;
+        }
         const deployParams = {
             ...baseParams,
             current_holdings: holdings,
         };
+        if (emptyBookConfirmed === true) deployParams.confirm_empty_book = true;
 
         setRunningIndicator(true, "正在计算标的目标权重、惯性过滤、持仓对账与买卖工单...", activeBtn);
         logConsole(`\n[Stage 2] 启动实盘调仓工单生成...\n策略: ${keys.stratName}\n标的池: ${keys.univName}\n持仓数: ${Object.keys(holdings).length} | 数据源: ${deployParams.data_provider}`);
@@ -1938,10 +1983,18 @@
         const baseParams = getExecutionParams();
         const keys = getActiveKeys();
         const holdings = getHoldingsFromTable();
+        // (fix 1) Confirm BEFORE Stage 1 runs: an unconfirmed empty book must abort the whole
+        // workflow (no Stage-1 round archived for a deploy that will never be allowed).
+        const emptyBookConfirmed = confirmEmptyBookIfNeeded(holdings);
+        if (emptyBookConfirmed === false) {
+            abortEmptyBookDeploy("全流程执行");
+            return;
+        }
         const deployParams = {
             ...baseParams,
             current_holdings: holdings,
         };
+        if (emptyBookConfirmed === true) deployParams.confirm_empty_book = true;
 
         setRunningIndicator(true, "正在依次执行 Stage 1 健康门禁 与 Stage 2 调仓工单生成...", activeBtn);
         logConsole(`\n[WORKFLOW] 启动全流程执行 (Stage 1 + Stage 2)...\n模式: ${state.mode === "multi" ? "多策略净额协同" : "单策略独立"}\n标的池: ${keys.univName}`);
@@ -1983,6 +2036,7 @@
                     min_holding_bars: 2,
                     inertia_threshold: 0.05,
                 };
+                if (emptyBookConfirmed === true) multiDeployParams.confirm_empty_book = true;
                 const resDeploy = await fetch("/api/deploy/multi", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },

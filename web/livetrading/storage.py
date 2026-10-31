@@ -299,6 +299,58 @@ class HoldingsInputMismatchError(RuntimeError):
     """
 
 
+class LiveSeedBookMissingError(RuntimeError):
+    """No previous book and no operator-entered book -> refuse, never size from zero.
+
+    (2026-10-30) The deploy path used to fall back to the web `data/` dir's global
+    `current_holdings.json`, so "the operator has not entered today's book yet" silently
+    resolved to whatever that file last held.  Sizing a Stage-2 ticket from an EMPTY book
+    turns every target weight into a fresh BUY -- it would re-buy lots the archive says
+    were already sold.  There is therefore no legal "assume zero": the caller must obtain
+    a real seed (previous run's `post_holdings.json`, or a same-session operator
+    `holdings.json`) or stop.  Raised by the deploy path when
+    `resolve_seed_holdings()` returns `(None, "none")`.
+    """
+
+
+# --------------------------------------------------------------------------- #
+# Single source of truth for the trading book (2026-10-30 incident)
+# --------------------------------------------------------------------------- #
+# FORENSIC CONTEXT (defect this exists to make impossible):
+#   Until 2026-10-30 the book existed in THREE persisted places at once -- the web
+#   `data/current_holdings.json` (global), `data/account_state.json` (global), and the
+#   per-run archive copies under `<archive>/<strategy>/<universe>/<date>[/<HHMMSS>]/`.
+#   The globals were written by `save_holdings` / `save_account_state` /
+#   `save_daily_run` on EVERY save, but read back through a different resolution order
+#   than the archive, so a global copy that lagged the archive (a failed/partial run,
+#   a restored archive, or a manual edit) could win the read and RESURRECT lots that
+#   had already been sold -- the strategy then saw them as held, skipped the sell, and
+#   carried a phantom position forward.
+#   DECISION: the archive is the ONLY store.  The global files are never read and never
+#   written again; if an old copy is still on disk it is IGNORED (warned about once at
+#   startup, see `_warn_legacy_state_files`) and should be quarantined to a non-`.json`
+#   path so no `*.json` scan can pick it up.
+#: Legacy global state filenames under `data_dir`. Read NEVER, written NEVER (2026-10-30).
+_LEGACY_STATE_FILENAMES = ("current_holdings.json", "account_state.json")
+
+#: Account state served when the archive carries none (fresh book). This literal used to
+#: be inlined as the `default=` of a read of the global `account_state.json`; it is the
+#: engine's own "no history yet" baseline, not persisted state.
+_DEFAULT_ACCOUNT_STATE: Dict[str, Any] = {
+    "as_of_date": None,
+    "current_nav": 100000.0,
+    "peak_nav": 100000.0,
+    "circuit_breaker_tier": "NORMAL",
+    "circuit_breaker_label": "🟢 NORMAL",
+    "linear_equity_scale": 1.0,
+    "tier1_consecutive_bars": 0,
+    "tier3_consecutive_bars": 0,
+    "freeze_remaining_bars": 0,
+    "nav_history_10d": [],
+    "holdings": {},
+}
+
+
 def strict_holdings_input_enabled() -> bool:
     """Opt-in hard gate: refuse to deploy when the input != prior round's planned book."""
     return _truthy_env(_STRICT_HOLDINGS_INPUT_ENV)
@@ -1233,9 +1285,36 @@ class StorageManager:
         self.default_start_date = saved_settings.get("default_start_date") or "2024-01-01"
 
         # Files in data_dir
+        # (2026-10-30) `current_holdings.json` / `account_state.json` are GONE as writable
+        # attributes on purpose: the web `data/` dir holds CONFIGURATION only. Holdings and
+        # account state live exclusively in the run archive -- three duplicate copies of
+        # the book let already-sold lots resurrect. See `_LEGACY_STATE_FILENAMES`.
         self.custom_universes_file = os.path.join(self.data_dir, "custom_universes.json")
-        self.current_holdings_file = os.path.join(self.data_dir, "current_holdings.json")
-        self.account_state_file = os.path.join(self.data_dir, "account_state.json")
+
+        # A pre-fix checkout may still carry the legacy global state files. Nothing reads
+        # or writes them any more; name them once so an operator knows to quarantine them.
+        self._warn_legacy_state_files()
+
+    def _warn_legacy_state_files(self) -> None:
+        """WARN (once, at construction) about left-over global state files. Never reads them.
+
+        (2026-10-30) These files are no longer part of the book. They are not deleted
+        automatically -- they may be the only record of a manual correction -- but their
+        mere existence is a trap for an operator who expects edits there to matter, so
+        every startup names them and points at the quarantine convention. Contents are
+        deliberately NOT loaded: reading them is exactly the defect being removed.
+        """
+        for name in _LEGACY_STATE_FILENAMES:
+            path = os.path.join(self.data_dir, name)
+            if os.path.exists(path):
+                logger.warning(
+                    "Legacy live-trading state file %s is IGNORED (never read, never "
+                    "written): holdings/account state live only in the run archive "
+                    "(<archive>/<strategy>/<universe>/<date>[/<HHMMSS>]/). Rename it to a "
+                    "non-.json path, e.g. %s, so no *.json scan can pick it up.",
+                    path,
+                    os.path.join(self.data_dir, "_quarantine", name + ".quarantined-<date>"),
+                )
 
     def _load_json(self, path: str, default: Any = None) -> Any:
         if os.path.exists(path):
@@ -1752,7 +1831,9 @@ class StorageManager:
              is hidden by the strategy's assumed fills, and re-running Stage 2 on D reconciles
              against targets as if they were already filled (zero / wrong orders).
           2. Post-trade holdings carried forward from the most recent EARLIER run.
-          3. Legacy flat archive snapshot, then the global current_holdings.json.
+          3. Legacy flat archive snapshot.  (The global `data/current_holdings.json` fallback
+             was removed on 2026-10-30 -- the archive is the only store; see
+             `_LEGACY_STATE_FILENAMES`.)
         With no date: post-trade holdings of the latest run for (strategy, universe).
 
         (L2.62) A session can now own several instance dirs.  Step 1 prefers the NEWEST
@@ -1787,7 +1868,115 @@ class StorageManager:
             if latest is not None:
                 return latest
 
-        return self._load_json(self.current_holdings_file, default={})
+        # (2026-10-30) NO global `data/current_holdings.json` fallback: that third copy of
+        # the book is gone. An unresolved date now means "no book known for this date",
+        # which callers must treat as unknown (empty here, for the UI's read path) rather
+        # than as a durable position list. `resolve_seed_holdings` is the deploy-path
+        # entry point and can distinguish "unknown" (None) from "confirmed all-cash" ({}).
+        return {}
+
+    def resolve_seed_holdings(
+        self,
+        date_str: Optional[str] = None,
+        strategy_key: Optional[str] = None,
+        universe_key: Optional[str] = None,
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        """The book a Stage-2 deploy may SEED from, plus where it came from.
+
+        Returns `(book, source)` with `source` one of:
+          * `"operator_snapshot"` -- a same-session book INSIDE the run archive: either an
+            operator/manual snapshot (`holdings.json` / `current_holdings.json`) in a dir
+            that never ran Stage 2, or -- when that dir DID run Stage 2 -- its PLANNED post
+            book (`post_holdings.json`, else re-derived from the ticket), because a
+            completed round's `holdings.json` is merely that round's stale PRE-trade input;
+          * `"previous_post_holdings"` -- the PLANNED post-trade book of the most recent
+            earlier run for `(strategy, universe)` (`post_holdings.json`, else re-derived
+            from that run's ticket);
+          * `"none"` -- no book at all.
+
+        CRITICAL CONTRACT -- `None` is NOT `{}`:
+          * `(None, "none")` means "we do not know the book". A deploy must REFUSE
+            (`LiveSeedBookMissingError`), never size from zero: an empty book makes every
+            target weight look like a fresh BUY, which re-buys lots that were sold.
+          * `({}, "previous_post_holdings")` means "CONFIRMED all-cash" (every ticket row
+            of the previous round liquidated, or the previous round planned a flat book).
+            That is a legitimate seed and must be honoured as zero positions.
+
+        Why this method exists instead of callers chaining readers themselves
+        (2026-10-30): the global `data/current_holdings.json` used to sit at the end of the
+        chain and silently turned "no seed available" into "last-saved book", i.e. a third
+        copy of the book that disagreed with the archive. It is gone -- `get_holdings`
+        returns `{}` for an unresolved date, so a caller that only needs a display value
+        can still use it, while the DEPLOY path must call this and respect `None`.
+
+        Resolution (reuses the D8-hardened archive helpers -- no archive walk is
+        re-implemented here):
+          1. If `date_str` resolves to an existing run base dir, walk that SESSION's
+             candidate dirs NEWEST instance first (`list_instances_for_date` reversed, which
+             ends on the flat dir -- the session's chronological FIRST instance).  Inside
+             each candidate (see the PRECEDENCE note below):
+               a. its PLANNED post book (`_planned_book_from_run_dir`: `post_holdings.json`,
+                  else the ticket) wins, because that is the only record of what the round
+                  actually intended to hold;
+               b. a dir that carries NO Stage-2 artifact may contribute its snapshot
+                  (`holdings.json` / `current_holdings.json`) as `"operator_snapshot"`;
+               c. a dir that carries a Stage-2 artifact but no resolvable planned book is
+                  SKIPPED -- its `holdings.json` is that round's pre-trade input, never the
+                  operator's current book.
+          2. Otherwise carry forward the previous run's PLANNED book via
+             `get_previous_post_holdings` (strictly earlier dates, never `holdings.json`).
+          3. Otherwise `(None, "none")`.
+
+        PRECEDENCE (2026-10-30 defect, this method's reason for the a/b/c order above):
+        `holdings.json` has TWO writers with different meanings -- `save_holdings` (the
+        operator's hand-entered book, which is exactly what `"operator_snapshot"` claims)
+        and `save_daily_run` (the Stage-2 deploy persisting its own PRE-trade seed before
+        launching the child).  So in a dir that already completed Stage 2 the file is a
+        stale pre-trade snapshot and the authoritative book is the SAME dir's
+        `post_holdings.json`.  Real evidence: the live archive's
+        `chan_four_state_blend/custom_astock_202609_20_new/2026-10-29/215823/` contains a
+        ghost `holdings.json` (`600584.SH:100`, `600362.SH:100` -- lots the same round's
+        `post_holdings.json` had already dropped, deliberately preserved as defect
+        evidence).  A same-day rerun with no explicit book resolved that ghost as
+        `"operator_snapshot"`, the D5 phantom-reference check only WARNed, and the deploy
+        sized orders from a book claiming already-sold lots were held -- that is exactly
+        the 2026-10-30 incident recurring.  Hence: a Stage-2 artifact in the dir
+        (`has_stage2_artifact`: `post_holdings.json` / ticket) makes that dir's
+        `holdings.json` unusable as `"operator_snapshot"`.
+        """
+        date_str = validate_date_str(date_str)
+
+        if date_str:
+            base_dir = self.find_existing_run_base_dir(strategy_key, universe_key, date_str)
+            if base_dir:
+                candidates = list(reversed(list_instances_for_date(base_dir)))
+                # `list_instances_for_date` omits the flat dir when it only CONTAINERS
+                # instances; `base_dir` is still the place a Stage-2 pre-trade input lands,
+                # so try it last (same "flat dir is the first instance" rule as `get_holdings`).
+                if base_dir not in candidates:
+                    candidates.append(base_dir)
+                for run_dir in candidates:
+                    # PRECEDENCE (see the docstring): the planned post book beats the same
+                    # dir's `holdings.json`, which in a completed Stage-2 round is only the
+                    # pre-trade seed `save_daily_run` wrote (`{}` here is a CONFIRMED plan).
+                    plan = self._planned_book_from_run_dir(run_dir)
+                    if plan is not None:
+                        return plan, "operator_snapshot"
+                    # Stage 2 ran here but left no resolvable plan: `holdings.json` is that
+                    # round's PRE-trade input, so it must never be returned as the current
+                    # book.  Skip the dir rather than trust it.
+                    if has_stage2_artifact(run_dir):
+                        continue
+                    snap = self._load_snapshot_holdings(run_dir)
+                    if snap is not None:
+                        return snap, "operator_snapshot"
+
+        if strategy_key and universe_key:
+            plan, _run_dir = self.get_previous_post_holdings(date_str, strategy_key, universe_key)
+            if plan is not None:  # `{}` is a CONFIRMED all-cash plan, not "unknown"
+                return plan, "previous_post_holdings"
+
+        return None, "none"
 
     def save_holdings(
         self,
@@ -1797,16 +1986,19 @@ class StorageManager:
         universe_key: Optional[str] = None,
         run_dir: Optional[str] = None,
     ) -> None:
-        """Persist the operator's holdings input (global + the day's archive snapshot).
+        """Persist the operator's holdings input into the day's archive snapshot.
 
         `run_dir` (L2.62) pins the write to THIS round's instance directory.  Callers in
         the deploy path must always pass it: `get_run_dir(prefer_existing=True)` resolves
         the session's BASE directory, and the `_carry_forward_*` readers additionally
         refuse same-day runs, so relying on "latest" would write today's book into a
         directory that no reader walks forward to -- i.e. it would break the chain.
+
+        (2026-10-30) The archive snapshot is the ONLY write. The global
+        `data/current_holdings.json` write is deleted: three duplicate copies of the book
+        let an already-sold lot resurrect whenever the global lagged the archive.
         """
         date_str = validate_date_str(date_str)
-        self._save_json(self.current_holdings_file, holdings)
         if date_str:
             daily_dir = run_dir or self.get_run_dir(strategy_key, universe_key, date_str, prefer_existing=True)
             os.makedirs(daily_dir, exist_ok=True)
@@ -2104,22 +2296,11 @@ class StorageManager:
             if latest:
                 return latest
 
-        return self._load_json(
-            self.account_state_file,
-            default={
-                "as_of_date": None,
-                "current_nav": 100000.0,
-                "peak_nav": 100000.0,
-                "circuit_breaker_tier": "NORMAL",
-                "circuit_breaker_label": "🟢 NORMAL",
-                "linear_equity_scale": 1.0,
-                "tier1_consecutive_bars": 0,
-                "tier3_consecutive_bars": 0,
-                "freeze_remaining_bars": 0,
-                "nav_history_10d": [],
-                "holdings": {},
-            },
-        )
+        # (2026-10-30) No global `data/account_state.json` read: the archive is the only
+        # store. A fresh book gets the engine's own baseline literal (documented in
+        # `_DEFAULT_ACCOUNT_STATE` -- note it also zeroes NAV history, so it cannot be
+        # confused with a carried-forward state either).
+        return dict(_DEFAULT_ACCOUNT_STATE)
 
     def save_account_state(
         self,
@@ -2129,13 +2310,15 @@ class StorageManager:
         universe_key: Optional[str] = None,
         run_dir: Optional[str] = None,
     ) -> None:
-        """Persist account state (global + the day's archive copy).
+        """Persist account state into the day's archive copy (the ONLY copy).
 
         `run_dir` (L2.62) pins the archive write to THIS round's instance directory; the
         deploy path must pass it for the same reason `save_holdings` documents.
+
+        (2026-10-30) The global `data/account_state.json` write is deleted: the archive is
+        the single source of truth for the book, and a second persisted copy could disagree.
         """
         date_str = validate_date_str(date_str)
-        self._save_json(self.account_state_file, state)
         if date_str:
             daily_dir = run_dir or self.get_run_dir(strategy_key, universe_key, date_str, prefer_existing=True)
             os.makedirs(daily_dir, exist_ok=True)
@@ -2409,13 +2592,12 @@ class StorageManager:
         if summary:
             self._save_json(os.path.join(run_dir, "summary.json"), summary)
         if holdings is not None:
+            # (2026-10-30) Archive ONLY -- the "also update global" copy is deleted; two
+            # persisted books let a sold lot resurrect when the global lagged the archive.
             self._save_json(os.path.join(run_dir, "holdings.json"), holdings)
-            # also update global
-            self._save_json(self.current_holdings_file, holdings)
         if account_state is not None:
+            # (2026-10-30) Archive ONLY, same reasoning as `holdings` above.
             self._save_json(os.path.join(run_dir, "account_state.json"), account_state)
-            # also update global
-            self._save_json(self.account_state_file, account_state)
 
         return run_dir
 

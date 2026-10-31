@@ -113,6 +113,19 @@ class RunDeployRequest(BaseModel):
     #: Logged at WARNING with the computed value and the drift; the UI highlights it.
     nav_override: bool = Field(False, description="人工覆盖净值：以 portfolio_value 作为 NAV（会记录 WARNING 与偏差）")
     current_holdings: Optional[Dict[str, Any]] = None
+    #: (fix 1) The ONLY way to deploy an EMPTY book.  `{}` cannot be told apart from "the
+    #: holdings table was never filled in", and an empty book makes the engine size a full
+    #: liquidation (a SELL for every held symbol) -- so the service REFUSES it
+    #: (`execution_service.EmptyBookConfirmationRequiredError`) unless this is `True`.
+    #: The UI sets it only after the operator accepts the "treat the account as fully in
+    #: cash" dialog; API/batch clients that genuinely want an all-cash book pass it too.
+    confirm_empty_book: bool = Field(
+        False,
+        description=(
+            "确认为“全部空仓”持仓簿：仅当持仓表为空且确实要按全现金部署时置 true"
+            "（否则空簿会被拒绝，因为空簿会生成整仓卖出工单）"
+        ),
+    )
     data_provider: Optional[str] = None
     lot_size: Optional[int] = None
     guard_latency_bars: int = Field(2, description="UPLSM entry confirmation latency guard bars (default 2)")
@@ -192,6 +205,16 @@ class MultiStrategyDeployRequest(BaseModel):
     start_date: Optional[str] = None
     portfolio_value: float = 100000.0
     current_holdings: Optional[Dict[str, Any]] = None
+    #: (fix 1) Same contract as `RunDeployRequest.confirm_empty_book`: an empty/all-zero
+    #: matrix book would be turned into `{"BIL": portfolio_value}` and liquidate every
+    #: existing position, so it is refused unless the caller confirms an all-cash account.
+    confirm_empty_book: bool = Field(
+        False,
+        description=(
+            "确认为“全部空仓”矩阵持仓簿：仅当持仓表为空且确实要按全现金部署时置 true"
+            "（否则空簿会被拒绝，因为空簿会生成整仓卖出工单）"
+        ),
+    )
     data_provider: Optional[str] = None
     min_holding_bars: int = 2
     inertia_threshold: float = 0.05

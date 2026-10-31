@@ -894,3 +894,144 @@ def test_api_keyed_run_reads_the_newest_instance_and_says_which(temp_workspace):
 
     assert body["instance"] == "123000"
     assert body["holdings"] == {"BBB": 200}
+
+
+# --------------------------------------------------------------------------- #
+# 7. Seed precedence: a completed Stage-2 round's planned post book must beat
+#    its own stale pre-trade `holdings.json` (the 2026-10-30 incident)
+#
+# `holdings.json` has TWO writers: `save_holdings` (the operator's hand-entered
+# book, which is what `operator_snapshot` claims) and `save_daily_run` (the
+# Stage-2 deploy persisting its own PRE-trade seed before launching the child).
+# In a dir that already ran Stage 2 the file is therefore stale, and the same
+# dir's `post_holdings.json` is the authoritative book.  Real evidence: the live
+# archive's `.../2026-10-29/215823/` holds a ghost `holdings.json`
+# (`600584.SH:100`, `600362.SH:100`) beside the corrected `post_holdings.json`.
+# --------------------------------------------------------------------------- #
+def test_completed_stage2_round_seeds_from_its_post_book_not_the_ghost_snapshot(
+    temp_workspace,
+):
+    """(2026-10-30 incident) A ghost pre-trade `holdings.json` must never win.
+
+    re-break: restore the plain `_load_snapshot_holdings`-first walk in
+    `resolve_seed_holdings` -- the ghost book claiming already-sold lots would seed the
+    rerun again as `operator_snapshot`.
+    """
+    storage, _ = temp_workspace
+    run_dir = _make_run(
+        storage,
+        "s1",
+        "u1",
+        "2026-10-29",
+        holdings={"600584.SH": 100, "600362.SH": 100},
+        instance="215823",
+    )
+    planned = {
+        "600900.SH": 800,
+        "600660.SH": 400,
+        "000999.SZ": 600,
+        "601728.SH": 5800,
+        "600519.SH": 100,
+    }
+    _write_json(os.path.join(run_dir, "post_holdings.json"), planned)
+
+    seed, source = storage.resolve_seed_holdings("2026-10-29", "s1", "u1")
+
+    assert seed == planned, "the planned post book, not the ghost pre-trade input"
+    assert source == "operator_snapshot"
+
+
+def test_snapshot_only_round_without_stage2_artifacts_stays_the_operator_book(
+    temp_workspace,
+):
+    """The legitimate case: a hand-entered book in a dir that never ran Stage 2.
+
+    re-break: skip every candidate that lacks a Stage-2 artifact (or treat any
+    `holdings.json` as stale) in `resolve_seed_holdings` -- the operator's own book would
+    become unreachable and the deploy would refuse (`LiveSeedBookMissingError`).
+    """
+    storage, _ = temp_workspace
+    _make_run(storage, "s1", "u1", "2026-10-30", holdings={"BBB.SH": 250})
+
+    seed, source = storage.resolve_seed_holdings("2026-10-30", "s1", "u1")
+
+    assert seed == {"BBB.SH": 250}
+    assert source == "operator_snapshot"
+
+
+def test_stage2_artifact_without_a_planned_book_never_returns_the_stale_snapshot(
+    temp_workspace,
+):
+    """Stage 2 ran here (ticket), yet no plan is recoverable: skip its `holdings.json`.
+
+    The ticket below carries NO `target_shares`, so `post_holdings_from_ticket` cannot
+    derive a plan.  Returning the pre-trade `holdings.json` here is exactly the ghost-book
+    failure, so the method must fall through to `(None, "none")` instead.
+    re-break: let a Stage-2-artifact dir fall through to `_load_snapshot_holdings`
+    (instead of `continue`) in `resolve_seed_holdings`.
+    """
+    storage, _ = temp_workspace
+    run_dir = _make_run(storage, "s1", "u1", "2026-10-30", holdings={"600584.SH": 100})
+    _write_json(
+        os.path.join(run_dir, "live_trading_ticket.json"),
+        [{"symbol": "600584.SH", "action": "HOLD"}],
+    )
+
+    seed, source = storage.resolve_seed_holdings("2026-10-30", "s1", "u1")
+
+    assert seed is None, "an unresolvable plan must not degrade to the stale snapshot"
+    assert source == "none"
+
+
+def test_newest_instance_post_book_beats_the_flat_dir_snapshot(temp_workspace):
+    """Within one session the newest instance's planned book is the current book.
+
+    re-break: walk the flat dir first (i.e. stop `reversed(...)`-ing
+    `list_instances_for_date`, or append `base_dir` first instead of last) in
+    `resolve_seed_holdings`.
+    """
+    storage, _ = temp_workspace
+    _make_run(storage, "s1", "u1", "2026-10-30", holdings={"FLAT.SH": 1})
+    newest = _make_run(storage, "s1", "u1", "2026-10-30", instance="215823")
+    _write_json(os.path.join(newest, "post_holdings.json"), {"NEW.SH": 2})
+
+    seed, source = storage.resolve_seed_holdings("2026-10-30", "s1", "u1")
+
+    assert seed == {"NEW.SH": 2}
+    assert source == "operator_snapshot"
+
+
+def test_empty_archive_still_resolves_to_unknown(temp_workspace):
+    """No archive book at all -> `(None, "none")`, i.e. UNKNOWN (the deploy must refuse).
+
+    re-break: make `resolve_seed_holdings` end with `return {}, "none"` (or
+    `self.get_holdings(...)`) -- an unknown book would look like a confirmed flat one and
+    every target would be sized as a fresh BUY.
+    """
+    storage, _ = temp_workspace
+
+    seed, source = storage.resolve_seed_holdings("2026-10-30", "s1", "u1")
+
+    assert seed is None
+    assert source == "none"
+
+
+def test_confirmed_all_cash_post_book_in_the_candidate_dir_is_not_unknown(
+    temp_workspace,
+):
+    """`{}` in the candidate dir's `post_holdings.json` is CONFIRMED all-cash, not unknown.
+
+    re-break: change the `if plan is not None:` guard to `if plan:` (or fall through on a
+    falsy plan) in `resolve_seed_holdings` -- a fully-liquidated round would become
+    `(None, "none")` and the next deploy would wrongly refuse.
+    """
+    storage, _ = temp_workspace
+    run_dir = _make_run(storage, "s1", "u1", "2026-10-30", instance="215823")
+    _write_json(os.path.join(run_dir, "post_holdings.json"), {})
+
+    seed, source = storage.resolve_seed_holdings("2026-10-30", "s1", "u1")
+
+    assert seed == {}
+    assert seed is not None, "an empty planned book is a CONFIRMED flat book"
+    assert source == "operator_snapshot"
+

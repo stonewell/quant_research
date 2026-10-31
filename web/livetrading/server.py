@@ -235,6 +235,13 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
                 start_date=payload.start_date,
                 portfolio_value=payload.portfolio_value,
                 current_holdings=payload.current_holdings,
+                # `confirm_empty_book` MUST be forwarded explicitly: this call is an
+                # explicit keyword list, so a model field that is not re-listed here is
+                # accepted by pydantic and then SILENTLY DROPPED (the service keeps its
+                # `False` default).  That made the confirmed-all-cash escape hatch
+                # unreachable over HTTP: a client submitting `confirm_empty_book: true`
+                # was still refused by `EmptyBookConfirmationRequiredError`.
+                confirm_empty_book=payload.confirm_empty_book,
                 data_provider=payload.data_provider,
                 lot_size=payload.lot_size,
                 strategy_key=payload.strategy_key,
@@ -276,6 +283,10 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
                 start_date=payload.start_date,
                 portfolio_value=payload.portfolio_value,
                 current_holdings=payload.current_holdings,
+                # Same silent-drop hazard as `/api/run-deploy` above: the netted path
+                # refuses an unconfirmed empty matrix book, so without this line an
+                # operator-confirmed all-cash deploy could never get past the route.
+                confirm_empty_book=payload.confirm_empty_book,
                 data_provider=payload.data_provider,
                 min_holding_bars=payload.min_holding_bars,
                 inertia_threshold=payload.inertia_threshold,

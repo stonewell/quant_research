@@ -170,6 +170,9 @@ def test_execution_service_argv_never_targets_production_cache(temp_workspace, m
         custom_symbols=["600519.SH"],
         as_of_date="2024-05-10",
         portfolio_value=100000.0,
+        # Explicit book: the subject is the hermetic `--cache-dir`, and since 2026-10-30 an
+        # implicit seed on an empty archive is a refusal (LiveSeedBookMissingError).
+        current_holdings={"600519.SH": 100},
         # Subject is the hermetic `--cache-dir`, not the mark: this workspace's cache is
         # empty, so the engine path would (correctly) refuse before spawning the child.
         nav_override=True,
@@ -631,31 +634,55 @@ def test_custom_universe_management(temp_workspace):
 
 
 def test_holdings_and_account_state_daily_snapshot(temp_workspace):
+    """The run archive is the ONLY book store (2026-10-30 refactor).
+
+    This test used to assert a GLOBAL round-trip: ``save_holdings(h)`` ->
+    ``get_holdings() == h``, i.e. the duplicate ``data/current_holdings.json`` copy whose
+    lag vs. the archive let already-sold lots resurrect.  That copy is gone, so the
+    invariants that remain are the archive ones: a dated save is readable back through its
+    own ``(date, strategy, universe)`` keys, and an argument-less read (the old "global"
+    read) resolves to NOTHING rather than to a stale global file.
+    """
     storage, _ = temp_workspace
 
-    # 1. Global holdings
-    test_holdings = {"601872.SH": 1000, "300394.SZ": 500}
-    storage.save_holdings(test_holdings)
-    loaded_global = storage.get_holdings()
-    assert loaded_global == test_holdings
+    # 1. Dated archive snapshot: readable back through its own keys.
+    holdings = {"601872.SH": 1000, "300394.SZ": 500}
+    storage.save_holdings(
+        holdings, date_str="2026-09-19", strategy_key="s1", universe_key="u1"
+    )
+    assert (
+        storage.get_holdings(
+            date_str="2026-09-19", strategy_key="s1", universe_key="u1"
+        )
+        == holdings
+    )
 
-    # 2. Historical holdings snapshot for 2026-09-20
-    hist_holdings = {"601872.SH": 800, "601728.SH": 2000}
-    storage.save_holdings(hist_holdings, date_str="2026-09-20")
+    # 2. No argument-less "global" book: the archive keys are required now.
+    assert storage.get_holdings() == {}
 
-    assert storage.get_holdings(date_str="2026-09-20") == hist_holdings
-    # Global holdings must remain updated
-    assert storage.get_holdings() == hist_holdings
-
-    # 3. Account state snapshot
+    # 3. Account state: same shape -- dated archive read-back, no global copy.
     state_day1 = {"as_of_date": "2026-09-20", "current_nav": 105000.0, "peak_nav": 105000.0}
-    storage.save_account_state(state_day1, date_str="2026-09-20")
+    storage.save_account_state(
+        state_day1, date_str="2026-09-20", strategy_key="s1", universe_key="u1"
+    )
 
     state_day2 = {"as_of_date": "2026-09-21", "current_nav": 102000.0, "peak_nav": 105000.0}
-    storage.save_account_state(state_day2, date_str="2026-09-21")
+    storage.save_account_state(
+        state_day2, date_str="2026-09-21", strategy_key="s1", universe_key="u1"
+    )
 
-    assert storage.get_account_state(date_str="2026-09-20")["current_nav"] == 105000.0
-    assert storage.get_account_state(date_str="2026-09-21")["current_nav"] == 102000.0
+    assert (
+        storage.get_account_state(
+            date_str="2026-09-20", strategy_key="s1", universe_key="u1"
+        )["current_nav"]
+        == 105000.0
+    )
+    assert (
+        storage.get_account_state(
+            date_str="2026-09-21", strategy_key="s1", universe_key="u1"
+        )["current_nav"]
+        == 102000.0
+    )
 
 
 def test_daily_run_archival_and_listing(temp_workspace):
@@ -1926,8 +1953,31 @@ def test_same_day_rerun_idempotency(temp_workspace):
         "nav_history_10d": [100000.0] * 5,
         "holding_bars": {"601872.SH": 3},
     }
-    storage.save_account_state(prior_state, date_str="2024-05-09", strategy_key="chan_four_state_blend", universe_key="custom")
-    storage._save_json(storage.account_state_file, prior_state)
+    # (2026-10-30) `storage.account_state_file` is GONE: the global `data/account_state.json`
+    # copy is no longer part of the book, so the prior session's state must be written into
+    # ITS RUN DIRECTORY (the archive is the only store now) -- under the SAME
+    # (strategy, universe) keys this deploy resolves.  The removed global file used to paper
+    # over a key mismatch; it was also the duplicate copy that let sold lots resurrect.
+    prior_strat_key, prior_univ_key, _pn, _pu = storage.resolve_keys(
+        strategy_file=strategy_file, custom_symbols=custom_symbols
+    )
+    storage.save_account_state(
+        prior_state,
+        date_str="2024-05-09",
+        strategy_key=prior_strat_key,
+        universe_key=prior_univ_key,
+    )
+    prior_run_dir = storage.get_run_dir(prior_strat_key, prior_univ_key, "2024-05-09")
+    # `summary.json` is what makes the directory a listed RUN (an `account_state.json`
+    # alone is not in `list_runs`' artifact set), i.e. a real prior session.
+    storage._save_json(
+        os.path.join(prior_run_dir, "summary.json"),
+        {
+            "date": "2024-05-09",
+            "strategy_key": prior_strat_key,
+            "universe_key": prior_univ_key,
+        },
+    )
 
     # -------------------------------------------------------------
     # 1. Stage 1 Health Check - Run 1 (Drawdown triggers Tier 1)
@@ -2076,6 +2126,9 @@ def test_execution_service_passes_guard_latency_bars(temp_workspace, monkeypatch
         as_of_date="2024-05-10",
         portfolio_value=100000.0,
         guard_latency_bars=4,
+        # Explicit book: `--guard-latency-bars` is the subject; an implicit seed is a
+        # refusal on this empty archive since 2026-10-30.
+        current_holdings={"600519.SH": 100},
         # Subject is the `--guard-latency-bars` flag; no valuation cache exists here.
         nav_override=True,
     )
@@ -2450,6 +2503,9 @@ def test_execution_service_intraday_and_refresh_flags(temp_workspace, monkeypatc
         universe_file="dummy.txt",
         data_provider="synthetic",
         allow_intraday=True,
+        # Explicit book: `--allow-intraday` is the subject; an implicit seed is a refusal
+        # on this empty archive since 2026-10-30.
+        current_holdings={"600519.SH": 100},
         # Subject is the `--allow-intraday` flag; synthetic mode has no cache to mark.
         nav_override=True,
     )
@@ -2461,6 +2517,7 @@ def test_execution_service_intraday_and_refresh_flags(temp_workspace, monkeypatc
         universe_file="dummy.txt",
         data_provider="synthetic",
         allow_intraday=False,
+        current_holdings={"600519.SH": 100},
         nav_override=True,
     )
     cmd3_no = captured_cmds[-1]
@@ -2471,6 +2528,8 @@ def test_execution_service_intraday_and_refresh_flags(temp_workspace, monkeypatc
         universe_file="dummy.txt",
         data_provider="synthetic",
         allow_intraday=True,
+        # Same rule on the netted path: an unknown seed is a refusal, not a flat book.
+        current_holdings={"600519.SH": 100},
     )
     cmd4 = captured_cmds[-1]
     assert "--allow-intraday" in cmd4
@@ -2479,6 +2538,7 @@ def test_execution_service_intraday_and_refresh_flags(temp_workspace, monkeypatc
         universe_file="dummy.txt",
         data_provider="synthetic",
         allow_intraday=False,
+        current_holdings={"600519.SH": 100},
     )
     cmd4_no = captured_cmds[-1]
     assert "--no-allow-intraday" in cmd4_no

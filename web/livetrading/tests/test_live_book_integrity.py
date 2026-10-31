@@ -47,10 +47,20 @@ can witness:
   purchasing-power rescale -- both single-line orderings that no pure-function
   test can pin (the comments there name the exact one-line change that re-breaks
   each assertion).
+
+Section 6 adds the 2026-10-30 **seed-book** family: the web ``data/`` directory is
+configuration only (``current_holdings.json`` / ``account_state.json`` are never
+read and never written again), the run archive is the single store, and a deploy
+whose seed book cannot be resolved from that archive REFUSES
+(``LiveSeedBookMissingError``) before it writes a ``holdings.json`` or launches a
+child process.  The incident it prevents: the global copy lagged the archive, so
+``600584.SH`` / ``600362.SH`` came back as held after the model had exited them.
 """
 
 import json
+import logging
 import os
+import subprocess
 import sys
 
 import pytest
@@ -62,10 +72,20 @@ for _p in (_WEB_DIR, _REPO_ROOT):
         sys.path.insert(0, _p)
 
 from storage import (  # noqa: E402  (bare import: same module identity as server.py)
+    _DEFAULT_ACCOUNT_STATE,
+    LiveSeedBookMissingError,
     StorageManager,
     has_stage2_artifact,
     instance_subdirs,
     prefer_instance_state_enabled,
+)
+
+from execution_service import (  # noqa: E402
+    CONFIRMED_EMPTY_BOOK_SOURCE,
+    EXPLICIT_BOOK_SOURCE,
+    EmptyBookConfirmationRequiredError,
+    ExecutionService,
+    book_is_empty,
 )
 
 from scripts.run_live_strategy import (  # noqa: E402
@@ -859,3 +879,1063 @@ def test_row_loop_captures_target_before_lifecycle_and_caps_after_rescale(
     assert stale[rewritten_symbol]["detail_reason"]["stale_input_lot"][
         "model_target_weight"
     ] == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# 6. (2026-10-30) Seed book: archive-only store, strict resolution, no global copy
+# ---------------------------------------------------------------------------
+# FORENSIC CONTEXT (the defect this whole section pins):
+#   The book used to be persisted THREE times -- the web `data/current_holdings.json`,
+#   the web `data/account_state.json`, and the per-run archive copies.  The globals were
+#   read through a different resolution order than the archive, so a copy that lagged
+#   (failed/partial run, restored archive, manual edit) could WIN the read and resurrect
+#   lots that had already been sold: 2026-10-30, `600584.SH` / `600362.SH` came back as
+#   held (a 100-share lot each) after the model had fully exited them, and the deploy
+#   path sized the next ticket from them.
+#   The fix is threefold and each half is pinned below:
+#     1. the legacy globals are IGNORED (warned about once, never read, never written);
+#     2. the DEPLOY path resolves its seed from the archive only and treats
+#        `(None, "none")` as a REFUSAL (never as "assume flat");
+#     3. `{}` from a real archive source stays a CONFIRMED all-cash book.
+_LEGACY_GHOST_BOOK = {"600584.SH": 100, "600362.SH": 100}
+
+
+def _storage_over(tmp_path):
+    """A `StorageManager` over `tmp_path`'s (already created) sub-directories."""
+    return StorageManager(
+        repo_root=_REPO_ROOT,
+        data_dir=str(tmp_path / "data"),
+        archive_dir=str(tmp_path / "archive"),
+        cache_dir=str(tmp_path / "cache"),
+        settings_dir=str(tmp_path / "settings"),
+    )
+
+
+def _make_dirs(tmp_path, names=("data", "archive", "cache", "settings")):
+    for name in names:
+        (tmp_path / name).mkdir(parents=True, exist_ok=True)
+
+
+def test_legacy_global_current_holdings_is_ignored_and_named(tmp_path, caplog):
+    """A pre-fix `data/current_holdings.json` must never become a position list.
+
+    The warning is emitted ONCE at construction (`_warn_legacy_state_files`) and names
+    the exact file, so an operator can quarantine it instead of editing a file that is
+    no longer read.
+    re-break: restore the `_load_json(os.path.join(self.data_dir, "current_holdings.json"),
+    default={})` fallback at the end of `StorageManager.get_holdings`.
+    """
+    _make_dirs(tmp_path)
+    legacy = tmp_path / "data" / "current_holdings.json"
+    legacy.write_text(json.dumps(_LEGACY_GHOST_BOOK), encoding="utf-8")
+
+    caplog.set_level(logging.WARNING)
+    storage = _storage_over(tmp_path)
+    # Every read shape the UI / deploy path could use: never the ghost lots.
+    assert storage.get_holdings() == {}
+    assert storage.get_holdings(date_str="2026-10-30") == {}
+    assert (
+        storage.get_holdings(
+            date_str="2026-10-30", strategy_key=_STRATEGY, universe_key=_UNIVERSE
+        )
+        == {}
+    )
+    assert (
+        storage.get_holdings(strategy_key=_STRATEGY, universe_key=_UNIVERSE) == {}
+    )
+
+    named = [
+        rec.getMessage()
+        for rec in caplog.records
+        if "current_holdings.json" in rec.getMessage()
+    ]
+    assert named, "the legacy global file must be named in a WARNING at startup"
+    assert any(str(legacy) in message for message in named), named
+
+
+def test_legacy_global_account_state_is_ignored(tmp_path, caplog):
+    """A pre-fix `data/account_state.json` must never supply the NAV baseline.
+
+    A stale global here is worse than a stale book: `current_nav` / `peak_nav` drive the
+    circuit-breaker tier, so resurrecting 999999 would mask every drawdown.
+    re-break: restore the `_load_json(self.account_state_file, default=dict(...))`
+    fallback at the end of `StorageManager.get_account_state`.
+    """
+    _make_dirs(tmp_path)
+    legacy = tmp_path / "data" / "account_state.json"
+    legacy.write_text(
+        json.dumps({"as_of_date": "2026-10-30", "current_nav": 999999.0}),
+        encoding="utf-8",
+    )
+
+    caplog.set_level(logging.WARNING)
+    storage = _storage_over(tmp_path)
+
+    state = storage.get_account_state()
+    assert state == dict(_DEFAULT_ACCOUNT_STATE)
+    assert state["current_nav"] == 100000.0
+    assert state["current_nav"] != 999999.0
+    assert (
+        storage.get_account_state(date_str="2026-10-30") == dict(_DEFAULT_ACCOUNT_STATE)
+    )
+    assert (
+        storage.get_account_state(
+            date_str="2026-10-30", strategy_key=_STRATEGY, universe_key=_UNIVERSE
+        )
+        == dict(_DEFAULT_ACCOUNT_STATE)
+    )
+
+    named = [
+        rec.getMessage()
+        for rec in caplog.records
+        if "account_state.json" in rec.getMessage()
+    ]
+    assert named, "the legacy global file must be named in a WARNING at startup"
+    assert any(str(legacy) in message for message in named), named
+
+
+def test_data_dir_is_never_written_by_any_save_path(temp_storage):
+    """LOAD-BEARING invariant of the refactor: the web `data/` dir is config only.
+
+    `save_holdings` / `save_account_state` / `save_daily_run` must write the run archive
+    and nothing else.  A re-appearing global copy is the exact mechanism that let the
+    2026-10-30 phantom lots resurrect, so this asserts the ABSENCE of the files, not just
+    the presence of the archive copies.
+    re-break: restore any `self._save_json(os.path.join(self.data_dir,
+    "current_holdings.json"|"account_state.json"), ...)` write in `save_holdings`,
+    `save_account_state` or `save_daily_run`.
+    """
+    data_dir = temp_storage.data_dir
+    global_holdings = os.path.join(data_dir, "current_holdings.json")
+    global_state = os.path.join(data_dir, "account_state.json")
+    holdings = {"600584.SH": 100}
+    state = {"as_of_date": "2026-09-25", "current_nav": 101000.0}
+
+    temp_storage.save_holdings(
+        holdings, date_str="2026-09-25", strategy_key=_STRATEGY, universe_key=_UNIVERSE
+    )
+    temp_storage.save_account_state(
+        state, date_str="2026-09-25", strategy_key=_STRATEGY, universe_key=_UNIVERSE
+    )
+    run_dir = temp_storage.save_daily_run(
+        date_str="2026-09-25",
+        summary={"date": "2026-09-25"},
+        holdings=holdings,
+        account_state=state,
+        strategy_key=_STRATEGY,
+        universe_key=_UNIVERSE,
+    )
+
+    assert not os.path.exists(global_holdings), global_holdings
+    assert not os.path.exists(global_state), global_state
+    # ... while the run-dir copies (the ONLY store) really are there.
+    assert os.path.isfile(os.path.join(run_dir, "holdings.json"))
+    assert os.path.isfile(os.path.join(run_dir, "account_state.json"))
+    # And the archive is readable back through its own keys.
+    assert (
+        temp_storage.get_holdings(
+            date_str="2026-09-25", strategy_key=_STRATEGY, universe_key=_UNIVERSE
+        )
+        == holdings
+    )
+    assert (
+        temp_storage.get_account_state(
+            date_str="2026-09-25", strategy_key=_STRATEGY, universe_key=_UNIVERSE
+        )["current_nav"]
+        == 101000.0
+    )
+
+
+# -- `resolve_seed_holdings`: the deploy path's single seed resolver ----------------
+
+
+def _seed_run_date(
+    storage,
+    date_str,
+    *,
+    post_holdings=None,
+    holdings=None,
+    instance=None,
+    account_state=None,
+):
+    """Write one archived run dir (`summary.json` makes it a listed run)."""
+    target = os.path.join(storage.archive_dir, _STRATEGY, _UNIVERSE, date_str)
+    if instance:
+        target = os.path.join(target, instance)
+    os.makedirs(target, exist_ok=True)
+    _write_json(
+        os.path.join(target, "summary.json"),
+        {"date": date_str, "strategy_key": _STRATEGY, "universe_key": _UNIVERSE},
+    )
+    if post_holdings is not None:
+        _write_json(os.path.join(target, "post_holdings.json"), post_holdings)
+    if holdings is not None:
+        _write_json(os.path.join(target, "holdings.json"), holdings)
+    if account_state is not None:
+        _write_json(os.path.join(target, "account_state.json"), account_state)
+    return target
+
+
+def _write_json(path, payload):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+
+
+def test_resolve_seed_holdings_reports_unknown_on_an_empty_archive(temp_storage):
+    """No archive book -> `(None, "none")`, i.e. UNKNOWN (the deploy must refuse).
+
+    re-break: make `resolve_seed_holdings` end with `return {}, "none"` (or
+    `return self.get_holdings(...), "none"`) -- an unknown book would then look like a
+    confirmed flat one and the deploy would size every target as a fresh BUY.
+    """
+    seed, source = temp_storage.resolve_seed_holdings(
+        "2026-10-30", _STRATEGY, _UNIVERSE
+    )
+    assert seed is None
+    assert source == "none"
+
+
+def test_resolve_seed_holdings_carries_the_previous_planned_post_book(temp_storage):
+    """The last round's PLANNED `post_holdings.json` is the normal implicit seed.
+
+    re-break: drop the `get_previous_post_holdings` leg from `resolve_seed_holdings`
+    (a same-day rerun of an untouched session would then resolve to `"none"`).
+    """
+    _seed_run_date(temp_storage, "2026-10-29", post_holdings={"AAA.SH": 100})
+    seed, source = temp_storage.resolve_seed_holdings(
+        "2026-10-30", _STRATEGY, _UNIVERSE
+    )
+    assert seed == {"AAA.SH": 100}
+    assert source == "previous_post_holdings"
+
+
+def test_resolve_seed_holdings_distinguishes_confirmed_cash_from_unknown(temp_storage):
+    """`{}` from a real source is CONFIRMED all-cash and must not be read as unknown.
+
+    The previous round planned/liquidated a flat book; honouring it is what lets a
+    fully-liquidated session deploy again.  `None` is what makes the deploy refuse.
+    re-break: change the `if plan is not None:` guard in `resolve_seed_holdings` to
+    `if plan:` -- a confirmed all-cash round would become `(None, "none")` and the next
+    deploy would refuse (or, worse, be "fixed" by an empty-book workaround).
+    """
+    _seed_run_date(temp_storage, "2026-10-29", post_holdings={})
+    seed, source = temp_storage.resolve_seed_holdings(
+        "2026-10-30", _STRATEGY, _UNIVERSE
+    )
+    assert seed == {}
+    assert seed is not None, "an empty planned book is a CONFIRMED flat book"
+    assert source == "previous_post_holdings"
+
+
+def test_operator_snapshot_wins_over_the_previous_post_book(temp_storage):
+    """A same-session explicit snapshot beats yesterday's assumed fills.
+
+    This is the "operator corrected the book" case: re-running Stage 2 must reconcile
+    against what the operator says is held NOW, not against the previous round's plan.
+    re-break: put the `get_previous_post_holdings` leg BEFORE the same-session snapshot
+    walk in `resolve_seed_holdings`.
+    """
+    _seed_run_date(temp_storage, "2026-10-29", post_holdings={"AAA.SH": 100})
+    _seed_run_date(temp_storage, "2026-10-30", holdings={"BBB.SH": 250})
+
+    seed, source = temp_storage.resolve_seed_holdings(
+        "2026-10-30", _STRATEGY, _UNIVERSE
+    )
+    assert seed == {"BBB.SH": 250}
+    assert source == "operator_snapshot"
+
+
+def test_newest_instance_snapshot_beats_the_flat_dir_snapshot(temp_storage):
+    """Within one session the NEWEST `HHMMSS` instance's snapshot is the current book.
+
+    (L2.62) The flat `<date>/` directory is the session's FIRST instance, so walking it
+    last is what keeps a morning snapshot from shadowing the afternoon correction.
+    re-break: stop `reversed(...)`-ing `list_instances_for_date` (or append `base_dir`
+    first instead of last) in `resolve_seed_holdings`.
+    """
+    _seed_run_date(temp_storage, "2026-10-30", holdings={"FLAT.SH": 1})
+    _seed_run_date(
+        temp_storage, "2026-10-30", instance="090000", holdings={"NINE.SH": 9}
+    )
+    _seed_run_date(
+        temp_storage, "2026-10-30", instance="130000", holdings={"THIRTEEN.SH": 13}
+    )
+
+    seed, source = temp_storage.resolve_seed_holdings(
+        "2026-10-30", _STRATEGY, _UNIVERSE
+    )
+    assert seed == {"THIRTEEN.SH": 13}
+    assert source == "operator_snapshot"
+
+
+# -- deploy path: refuse before any write / launch, and label the seed source ------
+
+
+def _dummy_strategy_file(tmp_path, name="seed_strat.json"):
+    path = tmp_path / name
+    path.write_text(
+        json.dumps({"template_name": "dummy", "params": {}}), encoding="utf-8"
+    )
+    return str(path)
+
+
+def _patch_deploy_subprocess(monkeypatch):
+    """Capture the child's argv and NEVER launch anything (offline by construction)."""
+    calls = []
+
+    def _run(cmd, *args, **kwargs):
+        calls.append(list(cmd))
+
+        class _Proc:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return _Proc()
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    return calls
+
+
+def _archived_summary(storage, argv):
+    """`summary.json` of the run dir this deploy actually passed to the child."""
+    run_dir = argv[argv.index("--output-dir") + 1]
+    path = os.path.join(run_dir, "summary.json")
+    assert os.path.isfile(path), path
+    return storage._load_json(path, default={}) or {}
+
+
+def test_deploy_refuses_an_unknown_seed_before_any_write_or_launch(
+    temp_storage, tmp_path, monkeypatch
+):
+    """`(None, "none")` is a REFUSAL, and the refusal is ordered BEFORE every side effect.
+
+    A `holdings.json` written before the refusal would be read as that round's PRE-trade
+    input by the next run; a launched child would size orders from an empty book.  So the
+    ordering itself is the invariant: no book file, no NAV breakdown, no subprocess.
+    re-break: in `run_live_deploy`, move the implicit-seed resolution AFTER
+    `save_holdings` / `_write_nav_breakdown`, or fall back to
+    `self.storage.get_holdings(...)` instead of raising.
+    """
+    monkeypatch.delenv("LIVETRADING_STRICT_SEED_BOOK", raising=False)
+    calls = _patch_deploy_subprocess(monkeypatch)
+    service = ExecutionService(temp_storage)
+
+    with pytest.raises(LiveSeedBookMissingError):
+        service.run_live_deploy(
+            strategy_file=_dummy_strategy_file(tmp_path),
+            custom_symbols=["600519.SH"],
+            as_of_date="2026-10-30",
+            portfolio_value=100000.0,
+            strategy_key=_STRATEGY,
+            universe_key=_UNIVERSE,
+            nav_override=True,
+            data_provider="synthetic",
+        )
+
+    assert calls == [], "a refused deploy must never launch the child process"
+
+    base_dir = temp_storage.get_run_dir(
+        _STRATEGY, _UNIVERSE, "2026-10-30", prefer_existing=True
+    )
+    # (fix 2) The run dir is NO LONGER allocated before the refusal: a refused round must
+    # not leave an empty instance directory behind for the next reader to interpret.
+    assert not os.path.exists(base_dir), "a refused deploy must not create the run dir"
+    forbidden = []
+    for root, _dirs, files in os.walk(temp_storage.archive_dir):
+        forbidden.extend(
+            os.path.join(root, name)
+            for name in files
+            if name in ("holdings.json", "nav_breakdown.json")
+        )
+    assert forbidden == [], forbidden
+
+
+def test_deploy_opt_out_falls_back_and_labels_the_seed(
+    temp_storage, tmp_path, monkeypatch, caplog
+):
+    """`LIVETRADING_STRICT_SEED_BOOK=0` is the documented, LOUD opt-out.
+
+    It restores the pre-2026-10-30 `get_holdings()` resolution, logs a WARNING, and the
+    archived summary labels the round `legacy_get_holdings_fallback` so a degraded deploy
+    can never be mistaken for a strict one.  This is the ONLY place in the suite that
+    exercises the knob: the strict path is asserted above, so the guard stays visible.
+    re-break: hard-code `holdings_seed_source = seed_source` (or return early) so the
+    opt-out branch never records `legacy_get_holdings_fallback`, or drop the WARNING.
+    """
+    monkeypatch.setenv("LIVETRADING_STRICT_SEED_BOOK", "0")
+    calls = _patch_deploy_subprocess(monkeypatch)
+    caplog.set_level(logging.WARNING)
+    service = ExecutionService(temp_storage)
+
+    res = service.run_live_deploy(
+        strategy_file=_dummy_strategy_file(tmp_path),
+        custom_symbols=["600519.SH"],
+        as_of_date="2026-10-30",
+        portfolio_value=100000.0,
+        strategy_key=_STRATEGY,
+        universe_key=_UNIVERSE,
+        nav_override=True,
+        data_provider="synthetic",
+    )
+
+    assert res["status"] == "success"
+    assert len(calls) == 1
+    assert "LIVETRADING_STRICT_SEED_BOOK=0" in caplog.text
+    assert "legacy_get_holdings_fallback" in caplog.text
+    summary = _archived_summary(temp_storage, calls[0])
+    assert summary["holdings_seed_source"] == "legacy_get_holdings_fallback"
+
+
+def test_deploy_summary_labels_an_explicit_book_as_operator_input(
+    temp_storage, tmp_path, monkeypatch
+):
+    """An explicit (form) book is `operator_input` -- the normal, unguarded arm.
+
+    re-break: drop `holdings_seed_source` from `run_live_deploy`'s `round_fields` (the
+    archive would no longer say which store sized the ticket).
+    """
+    monkeypatch.delenv("LIVETRADING_STRICT_SEED_BOOK", raising=False)
+    calls = _patch_deploy_subprocess(monkeypatch)
+    service = ExecutionService(temp_storage)
+
+    service.run_live_deploy(
+        strategy_file=_dummy_strategy_file(tmp_path),
+        custom_symbols=["600519.SH"],
+        as_of_date="2026-10-29",
+        portfolio_value=100000.0,
+        current_holdings={"600519.SH": 100},
+        strategy_key=_STRATEGY,
+        universe_key=_UNIVERSE,
+        nav_override=True,
+        data_provider="synthetic",
+    )
+
+    summary = _archived_summary(temp_storage, calls[0])
+    assert summary["holdings_seed_source"] == "operator_input"
+    # The explicit arm must not have been re-labelled by the seed resolver.
+    assert summary["holdings_seed_source"] != "previous_post_holdings"
+
+
+def test_deploy_summary_labels_the_previous_post_book_source(
+    temp_storage, tmp_path, monkeypatch
+):
+    """An implicit seed from the archive records `previous_post_holdings`.
+
+    This is the carry-forward path the 2026-10-30 incident ran through, so the archive
+    must say so -- an auditor can tell a strict-sourced deploy from a degraded one.
+    re-break: assign `holdings_seed_source = "legacy_get_holdings_fallback"` on the
+    implicit arm regardless of `resolve_seed_holdings`' returned source.
+    """
+    monkeypatch.delenv("LIVETRADING_STRICT_SEED_BOOK", raising=False)
+    calls = _patch_deploy_subprocess(monkeypatch)
+    service = ExecutionService(temp_storage)
+    _seed_run_date(temp_storage, "2026-10-28", post_holdings={"600519.SH": 100})
+
+    service.run_live_deploy(
+        strategy_file=_dummy_strategy_file(tmp_path),
+        custom_symbols=["600519.SH"],
+        as_of_date="2026-10-29",
+        portfolio_value=100000.0,
+        strategy_key=_STRATEGY,
+        universe_key=_UNIVERSE,
+        nav_override=True,
+        data_provider="synthetic",
+    )
+
+    summary = _archived_summary(temp_storage, calls[0])
+    assert summary["holdings_seed_source"] == "previous_post_holdings"
+
+
+# ---------------------------------------------------------------------------
+# 7. (fix 1) An empty table is never indistinguishable from "confirmed all-cash";
+#    (fix 2) a refused deploy leaves no artifacts and consumes no Stage-1 hand-off
+# ---------------------------------------------------------------------------
+# FORENSIC CONTEXT (both fixes):
+#   `static/js/app.js::getHoldingsFromTable()` returns `{}` for a holdings table with no
+#   positive row -- a page whose table never rendered, an operator who cleared it, or an
+#   untouched first deploy.  The explicit-book arm accepted that `{}` as a legitimate book,
+#   and an empty book makes the engine treat every target weight as a fresh position: it
+#   emits a SELL for every held symbol, i.e. a FULL LIQUIDATION.  That is the same failure
+#   class as the 2026-10-30 duplicate-book incident (a wrong book produced real orders),
+#   only "wrong" means "nothing" here.
+#   The second half is ordering: the refusal used to be decided AFTER
+#   `_resolve_stage2_run_dir` -- which POPS the Stage-1 hand-off and CREATES the instance
+#   dir -- so a refused deploy left a half-built archive entry and ate the hand-off.
+
+
+def _archive_tree(root):
+    """Sorted `(relpath, sorted(entry names))` snapshot of an archive directory tree."""
+    snapshot = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel = os.path.relpath(dirpath, root)
+        snapshot.append((rel, tuple(sorted(dirnames)), tuple(sorted(filenames))))
+    return sorted(snapshot)
+
+
+def _stage1_handoff_dir(storage, date_str):
+    """Create + return this session's Stage-1 dir with a real gate artifact (no summary).
+
+    `stage1_health_report.json` alone makes `storage.is_run_dir()` true, so
+    `resolve_seed_holdings` really walks the session -- and it carries NONE of the
+    `STAGE1_EVIDENCE_SUMMARY_KEYS`, so the refusal under test cannot be confused with the
+    (later, different) `Stage1HealthReportMissingError` gate.
+    """
+    base = storage.get_run_dir(_STRATEGY, _UNIVERSE, date_str, prefer_existing=False)
+    os.makedirs(base, exist_ok=True)
+    _write_json(
+        os.path.join(base, "stage1_health_report.json"),
+        {"gate_code": "PASS", "directive": "NORMAL"},
+    )
+    return base
+
+
+def _deploy_kwargs(tmp_path, *, date_str="2026-10-30", **extra):
+    kwargs = dict(
+        strategy_file=_dummy_strategy_file(tmp_path),
+        custom_symbols=["600519.SH"],
+        as_of_date=date_str,
+        portfolio_value=100000.0,
+        strategy_key=_STRATEGY,
+        universe_key=_UNIVERSE,
+        nav_override=True,
+        data_provider="synthetic",
+    )
+    kwargs.update(extra)
+    return kwargs
+
+
+def test_unconfirmed_empty_book_is_refused(temp_storage, tmp_path, monkeypatch):
+    """`{}` + no confirmation => refusal naming the `confirm_empty_book` escape hatch.
+
+    re-break: delete the `if not confirm_empty_book: raise` branch of
+    `resolve_explicit_book_source` -- the empty explicit book would be accepted as a
+    legitimate book and the engine would size a full liquidation from it.
+    """
+    monkeypatch.delenv("LIVETRADING_STRICT_SEED_BOOK", raising=False)
+    calls = _patch_deploy_subprocess(monkeypatch)
+    service = ExecutionService(temp_storage)
+
+    with pytest.raises(EmptyBookConfirmationRequiredError) as excinfo:
+        service.run_live_deploy(**_deploy_kwargs(tmp_path, current_holdings={}))
+
+    message = str(excinfo.value)
+    # The refusal must name the field, or an API client cannot get past it.
+    assert "confirm_empty_book" in message
+    assert "全部空仓" in message
+    # A sibling of the seed-book refusal, so existing handlers keep working.
+    assert isinstance(excinfo.value, LiveSeedBookMissingError)
+    assert calls == [], "a refused deploy must never launch the child process"
+
+
+def test_confirmed_empty_book_deploys_and_is_labelled(
+    temp_storage, tmp_path, monkeypatch, caplog
+):
+    """`{}` + `confirm_empty_book=True` deploys, and the archive says it was confirmed.
+
+    re-break: return `EXPLICIT_BOOK_SOURCE` unconditionally from
+    `resolve_explicit_book_source` (a deliberately-confirmed all-cash round would be
+    indistinguishable from an operator-entered position list in `summary.json`).
+    """
+    monkeypatch.delenv("LIVETRADING_STRICT_SEED_BOOK", raising=False)
+    calls = _patch_deploy_subprocess(monkeypatch)
+    caplog.set_level(logging.WARNING)
+    service = ExecutionService(temp_storage)
+
+    res = service.run_live_deploy(
+        **_deploy_kwargs(tmp_path, current_holdings={}, confirm_empty_book=True)
+    )
+
+    assert res["status"] == "success"
+    assert res["holdings"] == {}
+    assert len(calls) == 1
+    summary = _archived_summary(temp_storage, calls[0])
+    assert summary["holdings_seed_source"] == CONFIRMED_EMPTY_BOOK_SOURCE
+    assert summary["holdings_seed_source"] != EXPLICIT_BOOK_SOURCE
+    # ... and it is never quiet about it: the whole-liquidation intent is logged loudly.
+    assert "[empty-book]" in caplog.text
+
+
+def test_all_zero_book_is_treated_as_empty(temp_storage, tmp_path, monkeypatch):
+    """A table that still lists symbols at 0 shares is `{}`, not a position list.
+
+    re-break: make `book_is_empty` `return len(holdings) == 0` -- an all-zero table would
+    then be accepted as a real book and liquidate every position without confirmation.
+    """
+    monkeypatch.delenv("LIVETRADING_STRICT_SEED_BOOK", raising=False)
+    calls = _patch_deploy_subprocess(monkeypatch)
+    service = ExecutionService(temp_storage)
+
+    with pytest.raises(EmptyBookConfirmationRequiredError) as excinfo:
+        service.run_live_deploy(
+            **_deploy_kwargs(tmp_path, current_holdings={"600900.SH": 0})
+        )
+    assert "confirm_empty_book" in str(excinfo.value)
+    assert calls == []
+
+    # The predicate itself, including the "unknown is never zero" rule.
+    assert book_is_empty({}) is True
+    assert book_is_empty(None) is True
+    assert book_is_empty({"600900.SH": 0}) is True
+    assert book_is_empty({"600900.SH": 0, "600519.SH": "0"}) is True
+    assert book_is_empty({"600900.SH": {"shares": 0}}) is True
+    assert book_is_empty({"600900.SH": 100}) is False
+    assert book_is_empty({"600900.SH": {"shares": 100}}) is False
+    assert book_is_empty({"600900.SH": "abc"}) is False
+
+
+@pytest.mark.parametrize("refusal", ["unknown_seed", "empty_book"])
+@pytest.mark.parametrize("stage1_pending", [True, False])
+def test_refused_deploy_leaves_the_archive_and_handoff_untouched(
+    temp_storage, tmp_path, monkeypatch, refusal, stage1_pending
+):
+    """INVARIANT: a refusal is decided BEFORE the run dir exists and BEFORE the hand-off pop.
+
+    Both refusal kinds x both hand-off states, because they fail differently:
+
+    * `stage1_pending=True` -- the old code POPPED the Stage-1 entry (and swallowed it) even
+      though no ticket was ever produced, so the next deploy lost the gate hand-off;
+    * `stage1_pending=False` -- the old code CREATED the round's instance dir, i.e. an
+      archive entry for a deploy that never happened.
+
+    re-break: move the seed resolution (or the empty-book confirmation) back BELOW
+    `_resolve_stage2_run_dir` / `os.makedirs(run_dir)` in `run_live_deploy`.
+    """
+    monkeypatch.delenv("LIVETRADING_STRICT_SEED_BOOK", raising=False)
+    calls = _patch_deploy_subprocess(monkeypatch)
+    service = ExecutionService(temp_storage)
+    val_date = "2026-10-30"
+
+    if stage1_pending:
+        handoff_dir = _stage1_handoff_dir(temp_storage, val_date)
+        service._pending_stage1[service._instance_key(_STRATEGY, _UNIVERSE, val_date)] = (
+            handoff_dir,
+            frozenset(),
+        )
+
+    tree_before = _archive_tree(temp_storage.archive_dir)
+    pending_before = dict(service._pending_stage1)
+
+    extra = {"current_holdings": {}} if refusal == "empty_book" else {}
+    expected = (
+        EmptyBookConfirmationRequiredError
+        if refusal == "empty_book"
+        else LiveSeedBookMissingError
+    )
+    with pytest.raises(expected):
+        service.run_live_deploy(**_deploy_kwargs(tmp_path, **extra))
+
+    # 1. no child process
+    assert calls == [], "a refused deploy must never launch the child process"
+    # 2. the archive is byte-unchanged: no new run dir, no account_state.json,
+    #    no holdings.json / nav_breakdown.json / summary.json
+    assert _archive_tree(temp_storage.archive_dir) == tree_before
+    written = [
+        name
+        for _root, _dirs, files in os.walk(temp_storage.archive_dir)
+        for name in files
+    ]
+    for forbidden in ("summary.json", "account_state.json", "holdings.json", "nav_breakdown.json"):
+        assert forbidden not in written, forbidden
+    # 3. the Stage-1 hand-off entry was neither popped nor rewritten
+    assert service._pending_stage1 == pending_before
+
+
+def test_explicit_non_empty_book_needs_no_confirmation(temp_storage, tmp_path, monkeypatch):
+    """The normal path is untouched: no dialog, no flag, `operator_input`, same book file.
+
+    re-break: apply the empty-book gate to every book (a real deploy would be refused), or
+    label this arm `CONFIRMED_EMPTY_BOOK_SOURCE` (the archive would misdescribe the round).
+    """
+    monkeypatch.delenv("LIVETRADING_STRICT_SEED_BOOK", raising=False)
+    calls = _patch_deploy_subprocess(monkeypatch)
+    service = ExecutionService(temp_storage)
+
+    res = service.run_live_deploy(
+        **_deploy_kwargs(tmp_path, current_holdings={"600519.SH": 100})
+    )
+
+    assert res["status"] == "success"
+    assert len(calls) == 1
+    summary = _archived_summary(temp_storage, calls[0])
+    assert summary["holdings_seed_source"] == EXPLICIT_BOOK_SOURCE == "operator_input"
+    # The book the child was handed is exactly what the operator submitted.
+    holdings_file = calls[0][calls[0].index("--current-holdings-file") + 1]
+    assert temp_storage._load_json(holdings_file, default=None) == {"600519.SH": 100}
+
+
+
+# ---------------------------------------------------------------------------
+# 8. (2026-10-30) The ROUTE layer must forward `confirm_empty_book` (HTTP half)
+# ---------------------------------------------------------------------------
+# FORENSIC CONTEXT (fix 1, the silent-kwargs-drop half):
+#   `RunDeployRequest.confirm_empty_book` and `MultiStrategyDeployRequest.confirm_empty_book`
+#   are declared on the pydantic models, and
+#   `ExecutionService.run_live_deploy` / `run_multi_strategy_netted_deploy` both accept and
+#   honour them.  But BOTH routes call the service through an EXPLICIT keyword list, and
+#   pydantic does not splat the rest of the payload onto that call: a model field that is
+#   not re-listed at the call site is accepted, validated, and then SILENTLY DISCARDED,
+#   with the service falling back to its `False` default.
+#   Consequence: the escape hatch was unreachable over HTTP and from the UI -- a client
+#   that legitimately submitted an intentional all-cash book (`confirm_empty_book: true`)
+#   was still refused by `EmptyBookConfirmationRequiredError`.  The REFUSAL half worked
+#   perfectly; only the "I really mean it" half was dead.
+#   These tests drive the REAL routes over `TestClient` with `subprocess.run` captured
+#   (`_patch_deploy_subprocess`), so no child process is ever launched and every write
+#   lands in the hermetic `temp_storage` / `tmp_path` workspace.
+
+
+def _route_client_and_app(storage):
+    """The suite's existing route harness: real `create_app` + `TestClient`.
+
+    Imported locally on purpose -- this section is APPENDED to a module whose top-of-file
+    imports and fixtures are pinned by the tests above it, so no existing line is touched.
+    """
+    from fastapi.testclient import TestClient
+    from server import create_app
+
+    app = create_app(storage)
+    return TestClient(app), app
+
+
+def _record_service_kwargs(monkeypatch, app, method_name):
+    """Record what the route hands the service, then run the real method.
+
+    The route closes over the `ExecutionService` INSTANCE (`create_app` builds it), so an
+    instance-level attribute is what the route's `execution_service.<method>(...)` lookup
+    resolves -- `app.state.execution_service` is the same object.  This is what makes the
+    "was the field forwarded at all?" question observable: a dropped field is simply ABSENT
+    from the recorded kwargs (it does not arrive as `False`).
+    """
+    seen = []
+    real = getattr(app.state.execution_service, method_name)
+
+    def _spy(**kwargs):
+        seen.append(dict(kwargs))
+        return real(**kwargs)
+
+    monkeypatch.setattr(app.state.execution_service, method_name, _spy)
+    return seen
+
+
+def _run_deploy_route_payload(tmp_path, **extra):
+    payload = {
+        "strategy_file": _dummy_strategy_file(tmp_path),
+        "custom_symbols": ["600519.SH"],
+        "as_of_date": "2026-10-30",
+        "portfolio_value": 100000.0,
+        "strategy_key": _STRATEGY,
+        "universe_key": _UNIVERSE,
+        "nav_override": True,
+        "data_provider": "synthetic",
+        # The empty holdings table, exactly as the UI submits it.
+        "current_holdings": {},
+    }
+    payload.update(extra)
+    return payload
+
+
+def _multi_deploy_route_payload(**extra):
+    payload = {
+        "matrix_id": "tri_core_blend",
+        "custom_symbols": ["600519.SH"],
+        "as_of_date": "2026-10-30",
+        "portfolio_value": 100000.0,
+        "data_provider": "synthetic",
+        "current_holdings": {},
+    }
+    payload.update(extra)
+    return payload
+
+
+def test_run_deploy_route_refuses_an_empty_book_without_confirmation(
+    temp_storage, tmp_path, monkeypatch
+):
+    """`POST /api/run-deploy` with `{}` and no flag => the 500 refusal, no child launched.
+
+    Also pins that the route FORWARDS the field (as the model's `False` default): a dropped
+    kwarg is absent from the recorded call, not present-as-False.
+    re-break: remove `confirm_empty_book=payload.confirm_empty_book,` from the
+    `/api/run-deploy` call in `server.py` (`seen[0]["confirm_empty_book"]` then raises
+    KeyError; the paired confirmed-book test below turns the refusal into a 500).
+    """
+    monkeypatch.delenv("LIVETRADING_STRICT_SEED_BOOK", raising=False)
+    calls = _patch_deploy_subprocess(monkeypatch)
+    client, app = _route_client_and_app(temp_storage)
+    seen = _record_service_kwargs(monkeypatch, app, "run_live_deploy")
+
+    res = client.post("/api/run-deploy", json=_run_deploy_route_payload(tmp_path))
+
+    assert res.status_code == 500
+    detail = res.json()["detail"]
+    # The documented refusal shape: the exception text names the escape hatch.
+    assert "confirm_empty_book" in detail
+    assert "全部空仓" in detail
+    # The flag reached the service (defaulted by the model, never dropped).
+    assert seen, "the route must call the service"
+    assert seen[0]["confirm_empty_book"] is False
+    assert seen[0]["current_holdings"] == {}
+    assert calls == [], "a refused deploy must never launch the child process"
+
+
+def test_run_deploy_route_forwards_a_confirmed_empty_book(
+    temp_storage, tmp_path, monkeypatch
+):
+    """`{}` + `confirm_empty_book: true` over HTTP => it DEPLOYS as a confirmed all-cash book.
+
+    This is the end-to-end reachability proof for the escape hatch: with the field dropped
+    by the route the very same request returns 500 instead of 200.
+    re-break: remove `confirm_empty_book=payload.confirm_empty_book,` from the
+    `/api/run-deploy` call in `server.py` (the service then sees its `False` default and
+    refuses, so `res.status_code` becomes 500 and no summary is written).
+    """
+    monkeypatch.delenv("LIVETRADING_STRICT_SEED_BOOK", raising=False)
+    calls = _patch_deploy_subprocess(monkeypatch)
+    client, app = _route_client_and_app(temp_storage)
+    seen = _record_service_kwargs(monkeypatch, app, "run_live_deploy")
+
+    res = client.post(
+        "/api/run-deploy",
+        json=_run_deploy_route_payload(tmp_path, confirm_empty_book=True),
+    )
+
+    assert res.status_code == 200, res.text
+    assert res.json()["status"] == "success"
+    assert seen and seen[0]["confirm_empty_book"] is True
+    assert len(calls) == 1, "the confirmed deploy must launch exactly one child"
+    summary = _archived_summary(temp_storage, calls[0])
+    assert summary["holdings_seed_source"] == CONFIRMED_EMPTY_BOOK_SOURCE
+    # The child really was handed the empty book, not a stale/ghost one.
+    holdings_file = calls[0][calls[0].index("--current-holdings-file") + 1]
+    assert temp_storage._load_json(holdings_file, default=None) == {}
+
+
+def test_multi_deploy_route_refuses_an_empty_matrix_book_without_confirmation(
+    temp_storage, monkeypatch
+):
+    """`POST /api/deploy/multi` with `{}` and no flag => the 500 refusal, no child launched.
+
+    re-break: remove `confirm_empty_book=payload.confirm_empty_book,` from the
+    `/api/deploy/multi` call in `server.py` (`seen[0]["confirm_empty_book"]` then raises
+    KeyError; the paired confirmed-matrix test below turns the refusal into a 500).
+    """
+    monkeypatch.delenv("LIVETRADING_STRICT_SEED_BOOK", raising=False)
+    calls = _patch_deploy_subprocess(monkeypatch)
+    client, app = _route_client_and_app(temp_storage)
+    seen = _record_service_kwargs(monkeypatch, app, "run_multi_strategy_netted_deploy")
+
+    res = client.post("/api/deploy/multi", json=_multi_deploy_route_payload())
+
+    assert res.status_code == 500
+    detail = res.json()["detail"]
+    assert "confirm_empty_book" in detail
+    assert "全部空仓" in detail
+    assert seen, "the route must call the service"
+    assert seen[0]["confirm_empty_book"] is False
+    assert seen[0]["current_holdings"] == {}
+    assert calls == [], "a refused netted deploy must never launch the child process"
+
+
+def test_multi_deploy_route_forwards_a_confirmed_empty_matrix_book(
+    temp_storage, monkeypatch
+):
+    """`{}` + `confirm_empty_book: true` over HTTP => the netted deploy runs all-cash.
+
+    The matrix archive's `summary.json` must carry `operator_confirmed_empty_book`, which is
+    the only record of "this netted round started from a deliberately empty book".
+    re-break: remove `confirm_empty_book=payload.confirm_empty_book,` from the
+    `/api/deploy/multi` call in `server.py` (the service sees `False`, refuses, and the
+    response is a 500 with no summary to read).
+    """
+    monkeypatch.delenv("LIVETRADING_STRICT_SEED_BOOK", raising=False)
+    calls = _patch_deploy_subprocess(monkeypatch)
+    client, app = _route_client_and_app(temp_storage)
+    seen = _record_service_kwargs(monkeypatch, app, "run_multi_strategy_netted_deploy")
+
+    res = client.post(
+        "/api/deploy/multi",
+        json=_multi_deploy_route_payload(confirm_empty_book=True),
+    )
+
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    assert seen and seen[0]["confirm_empty_book"] is True
+    assert body["summary"]["holdings_seed_source"] == CONFIRMED_EMPTY_BOOK_SOURCE
+    assert len(calls) == 1, "the confirmed netted deploy must launch exactly one child"
+    # The empty matrix book is represented as the cash proxy, never as positions.
+    holdings_file = calls[0][calls[0].index("--current-holdings-file") + 1]
+    assert temp_storage._load_json(holdings_file, default=None) == {
+        "BIL": 100000.0
+    }
+
+
+# ---------------------------------------------------------------------------
+# 9. (2026-10-30 review, MINOR) An all-unparsable book IS an empty engine book
+# ---------------------------------------------------------------------------
+# FORENSIC CONTEXT (the hole this section closes):
+#   `book_is_empty` deliberately judges emptiness per VALUE -- "unknown is never zero" -- so
+#   `{"600900.SH": "abc"}` reads as "not empty".  The explicit-book arm then labelled it
+#   `operator_input` and never asked for confirmation.  But the engine does not size from the
+#   raw payload: `_shares_book` DROPS every row it cannot parse, so that same book becomes
+#   `{}` downstream and the child sizes a FULL LIQUIDATION (a SELL for every held symbol) with
+#   no `operator_confirmed_empty_book` label and no refusal -- exactly the failure the
+#   empty-book gate exists to prevent.  The gate therefore has to judge emptiness by what the
+#   ENGINE will size from, not only by per-value provability.
+#   The 2026-10-30 `600584.SH` / `600362.SH` incident is why this class is live-money risk: a
+#   book that does not describe the account produced real orders on symbols already exited.
+#   NON-REGRESSION PINNED BELOW: a fractional WEIGHT-mode book (`{"600900.SH": 0.05}`, the
+#   `is_weight_mode` arm of `scripts/run_live_strategy.py`) coerces to `{"600900.SH": 0}` --
+#   a NON-empty dict -- and must stay an accepted `operator_input`.  That is why the gate tests
+#   DICT emptiness of `_shares_book(...)`, never `book_is_empty(_shares_book(...))`.
+
+_UNPARSABLE_BOOK = {"600900.SH": "abc"}
+
+
+def test_all_unparsable_book_is_gated_like_an_empty_one(
+    temp_storage, tmp_path, monkeypatch
+):
+    """`{"600900.SH": "abc"}` collapses to `{}` in the engine => same gate as `{}`.
+
+    The module must refuse BEFORE any side effect: an accepted booking here would hand the
+    child an empty book and the ticket would sell every held symbol.
+    re-break: drop the `and _shares_book(holdings)` conjunct from
+    `resolve_explicit_book_source` -- the unparsable book returns `operator_input`, the gate is
+    never consulted, and the engine sizes a full liquidation from `{}`.
+    """
+    monkeypatch.delenv("LIVETRADING_STRICT_SEED_BOOK", raising=False)
+    calls = _patch_deploy_subprocess(monkeypatch)
+    service = ExecutionService(temp_storage)
+
+    with pytest.raises(EmptyBookConfirmationRequiredError) as excinfo:
+        service.run_live_deploy(
+            **_deploy_kwargs(tmp_path, current_holdings=dict(_UNPARSABLE_BOOK))
+        )
+
+    # The refusal is the ordinary empty-book one, naming the escape hatch.
+    assert "confirm_empty_book" in str(excinfo.value)
+    assert isinstance(excinfo.value, LiveSeedBookMissingError)
+    assert calls == [], "a refused deploy must never launch the child process"
+    # ... and it left no book file behind: on this path the run dir is not even allocated.
+    written = [
+        name
+        for _root, _dirs, files in os.walk(temp_storage.archive_dir)
+        for name in files
+    ]
+    assert "holdings.json" not in written, written
+
+
+def test_confirmed_all_unparsable_book_is_labelled_as_confirmed_empty(
+    temp_storage, tmp_path, monkeypatch, caplog
+):
+    """The same book + `confirm_empty_book=True` deploys as CONFIRMED all-cash, never `operator_input`.
+
+    Only the LABEL changes with the confirmation: an archived `operator_input` would tell an
+    auditor the round was sized from a real position list, which this book never was.
+    re-break: make `resolve_explicit_book_source` return `EXPLICIT_BOOK_SOURCE` for an
+    engine-empty book (i.e. keep the pre-fix `if not book_is_empty(holdings)` early return) --
+    the archived summary would then say `operator_input` for a full liquidation.
+    """
+    monkeypatch.delenv("LIVETRADING_STRICT_SEED_BOOK", raising=False)
+    calls = _patch_deploy_subprocess(monkeypatch)
+    caplog.set_level(logging.WARNING)
+    service = ExecutionService(temp_storage)
+
+    res = service.run_live_deploy(
+        **_deploy_kwargs(
+            tmp_path, current_holdings=dict(_UNPARSABLE_BOOK), confirm_empty_book=True
+        )
+    )
+
+    assert res["status"] == "success"
+    assert len(calls) == 1
+    summary = _archived_summary(temp_storage, calls[0])
+    assert summary["holdings_seed_source"] == CONFIRMED_EMPTY_BOOK_SOURCE
+    assert summary["holdings_seed_source"] != EXPLICIT_BOOK_SOURCE
+    # A confirmed all-cash round is never quiet about the liquidation it implies.
+    assert "[empty-book]" in caplog.text
+
+
+def test_mixed_book_with_one_unparsable_row_is_still_operator_input(
+    temp_storage, tmp_path, monkeypatch
+):
+    """One garbage row does NOT make the book empty: the engine still holds `601728.SH`.
+
+    This is the anti-over-refusal half.  `_shares_book` drops only the row it cannot parse, so
+    the child sizes a real position -- there is no full liquidation to gate.
+    re-break: test `book_is_empty(holdings)` alone (pre-fix) is fine here, but gating on
+    `len(_shares_book(holdings)) != len(holdings)` -- or on any "all rows must parse" rule --
+    would refuse a legitimate book that merely carries one stale/typo'd row.
+    """
+    monkeypatch.delenv("LIVETRADING_STRICT_SEED_BOOK", raising=False)
+    calls = _patch_deploy_subprocess(monkeypatch)
+    service = ExecutionService(temp_storage)
+    book = {"600900.SH": "abc", "601728.SH": 5800}
+
+    res = service.run_live_deploy(**_deploy_kwargs(tmp_path, current_holdings=book))
+
+    assert res["status"] == "success"
+    assert len(calls) == 1
+    summary = _archived_summary(temp_storage, calls[0])
+    assert summary["holdings_seed_source"] == EXPLICIT_BOOK_SOURCE == "operator_input"
+    # The child really was handed the untouched payload (the engine drops the bad row itself).
+    holdings_file = calls[0][calls[0].index("--current-holdings-file") + 1]
+    assert temp_storage._load_json(holdings_file, default=None) == book
+
+
+def test_fractional_weight_book_is_not_mistaken_for_an_empty_one(
+    temp_storage, tmp_path, monkeypatch
+):
+    """WEIGHT MODE NON-REGRESSION: `{"600900.SH": 0.05}` is a real book, never a liquidation.
+
+    `is_weight_mode` (`scripts/run_live_strategy.py`) accepts fractional weights, and
+    `_shares_book` coerces `0.05 -> 0` shares -- a NON-empty dict holding a zero-share row the
+    child re-derives from the weight.  Judging emptiness by `book_is_empty(_shares_book(...))`
+    would call that "empty" and refuse (or confirm-gate) a perfectly legitimate weight book.
+    re-break: change the gate to `if not book_is_empty(holdings) and not
+    book_is_empty(_shares_book(holdings)):` -- this book then raises
+    `EmptyBookConfirmationRequiredError` even though it is an ordinary weight-mode payload.
+    """
+    from execution_service import _shares_book
+
+    monkeypatch.delenv("LIVETRADING_STRICT_SEED_BOOK", raising=False)
+    calls = _patch_deploy_subprocess(monkeypatch)
+    service = ExecutionService(temp_storage)
+    book = {"600900.SH": 0.05}
+
+    # The coercion that makes this arm delicate: a NON-empty dict of ZERO shares.
+    assert _shares_book(book) == {"600900.SH": 0}
+
+    res = service.run_live_deploy(**_deploy_kwargs(tmp_path, current_holdings=book))
+
+    assert res["status"] == "success"
+    assert len(calls) == 1
+    summary = _archived_summary(temp_storage, calls[0])
+    assert summary["holdings_seed_source"] == EXPLICIT_BOOK_SOURCE == "operator_input"
+    holdings_file = calls[0][calls[0].index("--current-holdings-file") + 1]
+    assert temp_storage._load_json(holdings_file, default=None) == book
+
+
+@pytest.mark.parametrize(
+    "holdings, expected",
+    [
+        ({}, True),
+        (None, True),
+        ({"600900.SH": 0}, True),
+        ({"600900.SH": "0"}, True),
+        ({"600900.SH": None}, True),
+        ({"600900.SH": {"shares": 0}}, True),
+        ({"600900.SH": 100}, False),
+        ({"600900.SH": "abc"}, False),  # unknown is never zero -- the gate adds the engine test
+    ],
+)
+def test_book_is_empty_semantics_are_unchanged(holdings, expected):
+    """The `book_is_empty` predicate itself is NOT redefined by the engine-book gate.
+
+    It must keep meaning "no PROVABLE position", so a future refactor cannot fold the engine's
+    row-dropping into it (which would make an unparsable row read as "all cash").
+    re-break: redefine `book_is_empty` as `not _shares_book(holdings)` (unparsable => empty) or
+    as `len(holdings) == 0` (all-zero table => a real book).
+    """
+    assert book_is_empty(holdings) is expected

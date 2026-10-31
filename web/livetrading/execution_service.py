@@ -69,6 +69,7 @@ try:
     from .storage import (
         PHANTOM_REFERENCE_ENTRY,
         HoldingsInputMismatchError,
+        LiveSeedBookMissingError,
         StorageManager,
         diff_holdings_input_vs_prev_post,
         diff_reference_book_vs_lifecycle,
@@ -85,6 +86,7 @@ except (ImportError, ValueError):
     from storage import (
         PHANTOM_REFERENCE_ENTRY,
         HoldingsInputMismatchError,
+        LiveSeedBookMissingError,
         StorageManager,
         diff_holdings_input_vs_prev_post,
         diff_reference_book_vs_lifecycle,
@@ -723,6 +725,228 @@ def cache_structure_reason(cache: Any) -> Optional[str]:
         except Exception:
             pass
     return None
+
+
+# --------------------------------------------------------------------------- #
+# (2026-10-30) Strict seed book: a live deploy may never size from an empty book
+# --------------------------------------------------------------------------- #
+# FORENSIC CONTEXT (defect this knob defaults ON to prevent):
+#   Until 2026-10-30 both deploy paths ended their holdings resolution with a read of the
+#   web `data/current_holdings.json` GLOBAL copy (via `get_holdings()`'s last fallback).
+#   That file was the third copy of the book next to the per-run archive, so whenever it
+#   lagged the archive it RESURRECTED lots the archive said had already been sold --
+#   the 2026-10-30 incident where 600584.SH / 600362.SH came back from a duplicate copy
+#   after being fully exited.  `storage.resolve_seed_holdings()` deletes that fallback and
+#   makes the two states distinguishable -- `(None, "none")` = "we do not know the book",
+#   `({}, "previous_post_holdings")` = "CONFIRMED all-cash".  A deploy that sizes from an
+#   UNKNOWN book treats every target weight as a fresh BUY, i.e. it re-buys the lots the
+#   archive says were sold, which is why "unknown" must be a REFUSAL, not a zero.
+#
+#   This is the same contract shape as `storage.strict_holdings_input_enabled()`, but its
+#   DEFAULT IS INVERTED (ON): the failure it guards is unrecoverable (real orders against a
+#   phantom book), whereas the input-vs-plan reconciliation can legitimately disagree after
+#   a partial fill.  `LIVETRADING_STRICT_SEED_BOOK=0` restores the pre-2026-10-30
+#   `get_holdings()` fallback and logs a WARNING on EVERY deploy that uses it, so a
+#   degraded run can never look like a strict one in the archive.
+STRICT_SEED_BOOK_ENV = "LIVETRADING_STRICT_SEED_BOOK"
+
+
+def strict_seed_book_enabled() -> bool:
+    """Default-ON gate: refuse a deploy whose seed book cannot be resolved from the archive.
+
+    Parsed exactly like `storage.prefer_instance_state_enabled()` -- the repo's other
+    default-ON `LIVETRADING_*` knob: an absent or blank value means ENABLED, and anything
+    else is read through `_env_truthy` (the same truthy set as `storage._truthy_env`), so
+    `0` / `false` / `no` / `off` (or any unlisted spelling) is the explicit opt-out.
+    """
+    raw = os.environ.get(STRICT_SEED_BOOK_ENV)
+    if raw is None or str(raw).strip() == "":
+        return True
+    return _env_truthy(STRICT_SEED_BOOK_ENV)
+
+
+def _seed_book_missing_message(
+    date_str: Optional[str],
+    strategy_key: Optional[str],
+    universe_key: Optional[str],
+) -> str:
+    """Actionable Chinese + English refusal text for an unresolvable seed book."""
+    scope = f"date={date_str!r} strategy={strategy_key!r} universe={universe_key!r}"
+    return (
+        "无法解析种子持仓（holdings seed book）：归档里既没有本轮会话的持仓快照，"
+        "也没有上一轮的计划收盘（post）持仓，因此拒绝部署。"
+        f"范围/scope: {scope}。"
+        " 空簿不是“全部空仓”——引擎会把每个目标权重都当成新的买入，"
+        "从而重新买入归档已记录卖出的头寸（2026-10-30 事件：600584.SH / 600362.SH "
+        "因重复簿副本复活）。"
+        " 处理办法/Next steps: (1) 在持仓表单里显式填写当前持股与现金后重新部署（前端每次都会显式提交）；"
+        "(2) 或先补跑漏掉的上一轮部署/确认其 live_trading_ticket / post_holdings 已归档；"
+        "(3) 核对 --as-of-date / strategy / universe 是否指向了正确的归档链；"
+        f"(4) 仅在完全知情时设置 {STRICT_SEED_BOOK_ENV}=0 回到旧的 get_holdings() 回退（会记录 WARNING）。"
+        " Refusing to deploy: an unknown book must never be treated as an empty one."
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (fix 1) An EMPTY explicit book is NOT "confirmed all-cash"
+# --------------------------------------------------------------------------- #
+# FORENSIC CONTEXT (the failure class this closes):
+#   `static/js/app.js::getHoldingsFromTable()` returns `{}` for a holdings table with no
+#   positive row -- a page whose table never rendered, an operator who cleared it, or a
+#   first-ever deploy where nobody typed the real book.  The explicit-book arm of both
+#   deploy paths used to accept that `{}` as a legitimate book, and an empty book makes the
+#   engine treat every target weight as a fresh position: it is the SAME failure class as
+#   the 2026-10-30 duplicate-book incident (a wrong book produced real orders), except that
+#   "wrong" here means "nothing" and the orders are SELLs for every symbol -- a full
+#   liquidation -- instead of re-buys.
+#   DECISION: an empty explicit book is a REFUSAL unless the caller states, per request,
+#   that an all-cash account is what they mean (`confirm_empty_book=True`).  There is
+#   deliberately NO env kill-switch (unlike `LIVETRADING_STRICT_SEED_BOOK`): there is no
+#   legitimate "silently treat an unfilled form as cash" case, and a process-wide knob would
+#   make every future deploy in that process a liquidation candidate.  Batch jobs / API
+#   clients that genuinely want an all-cash book pass the same per-request field.
+EMPTY_BOOK_CONFIRM_FIELD = "confirm_empty_book"
+
+#: Seed-source labels for the explicit-book arm.  The confirmed-empty value is a SEPARATE
+#: label on purpose: `summary.json['holdings_seed_source']` must let an auditor see that the
+#: round was sized from a deliberately-confirmed all-cash book rather than from an
+#: operator-entered position list.
+EXPLICIT_BOOK_SOURCE = "operator_input"
+CONFIRMED_EMPTY_BOOK_SOURCE = "operator_confirmed_empty_book"
+
+
+class EmptyBookConfirmationRequiredError(LiveSeedBookMissingError):
+    """Refusal: the submitted book is empty and nobody confirmed that it is intentional.
+
+    Subclasses :class:`storage.LiveSeedBookMissingError` because the two refusals share one
+    meaning -- "this deploy has no usable seed book" -- so an existing ``except
+    LiveSeedBookMissingError`` handler (and the HTTP 500 + ``detail`` mapping in
+    `server.py`) keeps working while tests and logs can name the exact cause.
+
+    The message (see `_empty_book_unconfirmed_message`) names the two cures: enter the real
+    holdings, or pass ``confirm_empty_book=true`` for an intentional all-cash book.
+    """
+
+
+def _holding_value_is_zero(raw: Any) -> bool:
+    """Per-row test: only a PROVABLY zero/blank row counts as "no position".
+
+    The payload is polymorphic (JSON numbers, numeric strings, ``{shares: n}`` row dicts),
+    so this mirrors `_shares_book`'s coercion.  An UNPARSABLE row returns False -- unknown
+    is never zero, the same rule the seed resolution follows.
+    """
+    if isinstance(raw, Mapping):
+        raw = raw.get("shares", raw.get("share", raw.get("quantity")))
+    if raw is None:
+        return True
+    if isinstance(raw, str) and not raw.strip():
+        return True
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return False
+    if value != value or value in (float("inf"), float("-inf")):
+        return False
+    return value == 0.0
+
+
+def book_is_empty(holdings: Optional[Mapping[str, Any]]) -> bool:
+    """True when a book carries NO net position: ``{}``, all-zero, or all-blank rows.
+
+    Decided on VALUES, never on ``len()``: a holdings table that still lists deleted
+    symbols at 0 shares is exactly as empty as ``{}``, and the engine would size the same
+    full liquidation from either shape.  A non-mapping / unparsable cell is NOT an empty
+    book (that would let a malformed payload read as "all cash").
+    """
+    if holdings is None:
+        return True
+    if not isinstance(holdings, Mapping):
+        return False
+    for raw in holdings.values():
+        if not _holding_value_is_zero(raw):
+            return False
+    return True
+
+
+def _empty_book_unconfirmed_message(
+    date_str: Optional[str],
+    strategy_key: Optional[str],
+    universe_key: Optional[str],
+    matrix_id: Optional[str] = None,
+) -> str:
+    """Actionable Chinese + English refusal text for an unconfirmed empty book."""
+    scope = f"date={date_str!r} strategy={strategy_key!r} universe={universe_key!r}"
+    if matrix_id:
+        scope += f" matrix_id={matrix_id!r}"
+    return (
+        "提交的持仓簿无法得到任何持仓（{}、每个标的的股数都是 0，或股数无法解析/不是数字），"
+        "已拒绝部署："
+        "空簿与“持仓表还没填”无法区分，而引擎会把每个目标权重都当成一笔新的仓位调整，"
+        "对现有持仓逐个生成卖出工单——等价于一次整仓清仓。"
+        f"范围/scope: {scope}。"
+        " 处理办法/Next steps: (1) 在持仓表单里填写真实的持股与现金后重新提交；"
+        "(2) 若账户确实已全部转为现金、本次就是要按“全部空仓”部署，"
+        f"请在请求体里显式传 {EMPTY_BOOK_CONFIRM_FIELD}=true"
+        "（前端会先弹窗向操作员确认；API / 批量客户端同样必须显式传这个字段）——"
+        "只有显式确认的空簿才会被当作 CONFIRMED all-cash 记入归档。"
+        " An empty book ({} / all shares at zero / no parsable share count) is never assumed: "
+        f"pass `{EMPTY_BOOK_CONFIRM_FIELD}=true` to deploy an intentional all-cash account."
+    )
+
+
+def resolve_explicit_book_source(
+    holdings: Optional[Mapping[str, Any]],
+    confirm_empty_book: bool,
+    *,
+    date_str: Optional[str] = None,
+    strategy_key: Optional[str] = None,
+    universe_key: Optional[str] = None,
+    matrix_id: Optional[str] = None,
+) -> str:
+    """Seed-source label for a CALLER-SUPPLIED book; refuses an unconfirmed empty one.
+
+    Returns :data:`EXPLICIT_BOOK_SOURCE` for a real book and
+    :data:`CONFIRMED_EMPTY_BOOK_SOURCE` when the caller explicitly confirmed that an empty
+    book means "the whole account is in cash".  An empty/all-zero book WITHOUT that
+    confirmation raises :class:`EmptyBookConfirmationRequiredError`.
+
+    ONLY the caller-supplied arm goes through here.  An empty book resolved from the run
+    archive (`storage.resolve_seed_holdings` -> `({}, "previous_post_holdings")`) is
+    confirmed by the archive itself and must stay honourable -- that is how a fully
+    liquidated session deploys again.
+    """
+    # The engine sizes from `_shares_book`, which DROPS unparsable/None/zero rows.  A book
+    # whose every row is dropped is indistinguishable from {} downstream -- it becomes a
+    # full liquidation -- so it must satisfy the same confirmation gate as an empty book.
+    #
+    # Dict emptiness, NOT `book_is_empty(_shares_book(...))`: a legitimate WEIGHT-mode book
+    # (`{"600900.SH": 0.05}`, see `scripts/run_live_strategy.py`'s `is_weight_mode`) coerces
+    # to `{"600900.SH": 0}` -- a NON-empty dict holding a zero-share row that the child then
+    # re-derives from the weight.  `book_is_empty` would call that "empty" and refuse a real
+    # weight book, which is why the test here is `bool(_shares_book(...))`.
+    if not book_is_empty(holdings) and _shares_book(holdings):
+        return EXPLICIT_BOOK_SOURCE
+
+    scope = f"date={date_str!r} strategy={strategy_key!r} universe={universe_key!r}"
+    if matrix_id:
+        scope += f" matrix_id={matrix_id!r}"
+
+    if not confirm_empty_book:
+        raise EmptyBookConfirmationRequiredError(
+            _empty_book_unconfirmed_message(
+                date_str, strategy_key, universe_key, matrix_id=matrix_id
+            )
+        )
+
+    # Confirmed on purpose: allowed, but never quietly.  This round sizes the book as
+    # "everything in cash", i.e. the ticket will ask to sell every currently-held symbol.
+    logging.warning(
+        "[empty-book] 调用方显式确认了“全部空仓”持仓簿（%s=true, %s）：本轮部署按全现金计价，"
+        "会对此前持有的每个标的生成卖出工单（整仓清仓）。若这不是本意，请立即终止该轮。",
+        EMPTY_BOOK_CONFIRM_FIELD,
+        scope,
+    )
+    return CONFIRMED_EMPTY_BOOK_SOURCE
 
 
 class ExecutionService:
@@ -2142,6 +2366,7 @@ class ExecutionService:
         max_single_position: Optional[float] = None,
         enforce_mv_cap: bool = False,
         liquidate_stale_input_lots: bool = False,
+        confirm_empty_book: bool = False,
     ) -> Dict[str, Any]:
         """Execute Stage 2 Live Deployment.
 
@@ -2159,6 +2384,18 @@ class ExecutionService:
         order-changing part is ``enforce_mv_cap=True`` (CLI `--enforce-mv-cap`).  The
         child-side env kill-switches (`LIVETRADING_DISABLE_MV_CAP=1`,
         `LIVETRADING_DISABLE_STALE_LOT_LIQUIDATION=1`) win over these flags.
+
+        ``confirm_empty_book`` (fix 1, default ``False``) is the ONLY way an EMPTY explicit
+        book may be deployed: without it an empty/all-zero ``current_holdings`` is refused
+        with :class:`EmptyBookConfirmationRequiredError` (a ``LiveSeedBookMissingError``),
+        because an empty book is indistinguishable from "the table was never filled in" and
+        would size a full liquidation.  There is intentionally no env override.
+
+        REFUSAL ORDERING (fix 2): the seed book, the empty-book confirmation and the opt-in
+        strict-input gate are all decided BEFORE `_resolve_stage2_run_dir` allocates this
+        round's directory (which also CONSUMES the Stage-1 hand-off).  A refused deploy
+        therefore leaves no `summary.json` / `account_state.json` / `holdings.json` /
+        `nav_breakdown.json` behind, keeps the hand-off pending and launches no child.
         """
         provider = data_provider or self.storage.default_data_provider or "marketdb"
         strat_key, univ_key, strat_name, univ_name = self.storage.resolve_keys(
@@ -2179,6 +2416,90 @@ class ExecutionService:
         base_dir = self.storage.get_run_dir(strat_key, univ_key, val_date, prefer_existing=True)
         # (L2.4) Archive key == valuation session (never the host's `date.today()`).
         self._assert_archive_keyed_by(base_dir, val_date)
+
+        strat_path = self._resolve_strategy(strategy_file)
+
+        # ------------------------ VALIDATION / REFUSALS ONLY ------------------------
+        # (fix 2) Nothing in this block may touch the archive.  `_resolve_stage2_run_dir`
+        # POPS the Stage-1 hand-off and CREATES this round's instance dir, and the
+        # `account_state.json` seed / `resolved_universe.txt` / `nav_breakdown.json` writes
+        # below all target that dir -- so a refusal decided AFTER them would leave a
+        # half-built archive entry AND eat the Stage-1 -> Stage-2 hand-off for a deploy that
+        # never happened.  INVARIANT: a refused deploy (unknown seed, unconfirmed empty
+        # book, or the opt-in strict-input gate) leaves the archive byte-unchanged, keeps
+        # the hand-off pending and launches no child.
+        # --------------------------------------------------------------------------
+        # Resolve holdings
+        if current_holdings is not None:
+            effective_holdings = current_holdings
+            # (fix 1) The UI always submits the book explicitly, so this arm is the normal
+            # path -- and it is also how an EMPTY holdings table arrives, as `{}`.  Refuses
+            # an unconfirmed empty/all-zero book (`EmptyBookConfirmationRequiredError`) and
+            # returns the label that records WHICH explicit book this was.
+            holdings_seed_source = resolve_explicit_book_source(
+                effective_holdings,
+                confirm_empty_book,
+                date_str=val_date,
+                strategy_key=strat_key,
+                universe_key=univ_key,
+            )
+        else:
+            # (2026-10-30) STRICT seed resolution -- see `strict_seed_book_enabled`.
+            # The book must come from the run archive (`operator_snapshot` = this
+            # session's own pre-trade snapshot, `previous_post_holdings` = the last
+            # round's PLANNED post-ticket book).  `(None, "none")` means "unknown" and is
+            # a REFUSAL: sizing from an empty book turns every target weight into a fresh
+            # BUY and re-buys lots the archive says were sold (2026-10-30 / 600584.SH /
+            # 600362.SH resurrecting through a duplicate `data/current_holdings.json`).
+            # `{}` with a real source is a CONFIRMED all-cash book and is honoured.
+            # Raised HERE -- before the run dir is allocated, before `_resolve_nav`, before
+            # `save_holdings`, before argv assembly and before the child starts -- so a
+            # refused deploy leaves the archive byte-unchanged (no instance dir, no
+            # `account_state.json`, no `holdings.json`, no `nav_breakdown.json`, no
+            # `summary.json`), keeps the Stage-1 hand-off pending and launches no subprocess
+            # (same shape as the `HoldingsInputMismatchError` strict-input refusal below).
+            seed, seed_source = self.storage.resolve_seed_holdings(val_date, strat_key, univ_key)
+            if seed is None:
+                if strict_seed_book_enabled():
+                    raise LiveSeedBookMissingError(
+                        _seed_book_missing_message(val_date, strat_key, univ_key)
+                    )
+                logging.warning(
+                    "[seed-book] %s=0 已显式关闭严格种子持仓校验：%s 的归档里没有种子持仓"
+                    "（快照 / 上一轮计划簿均缺失），回退到旧的 get_holdings() 解析。"
+                    " 本次部署的 holdings_seed_source 记为 legacy_get_holdings_fallback。",
+                    STRICT_SEED_BOOK_ENV,
+                    f"date={val_date} strategy={strat_key} universe={univ_key}",
+                )
+                seed = self.storage.get_holdings(
+                    date_str=val_date, strategy_key=strat_key, universe_key=univ_key
+                )
+                seed_source = "legacy_get_holdings_fallback"
+                if not seed:
+                    # Even in the opt-out mode an EMPTY book is never allowed to look like
+                    # a resolution: name it, so the run's summary + log carry the warning.
+                    logging.warning(
+                        "[seed-book] 回退解析返回空簿：本次部署将按“全部空仓”计价。"
+                        " 若持仓表其实有仓位，请立即终止该轮并显式提交持仓。"
+                    )
+            effective_holdings = seed
+            holdings_seed_source = seed_source
+
+        # Advisory reconciliation of the INPUT book against the previous round's PLANNED
+        # post-trade book (see `diff_holdings_input_vs_prev_post`). This system has no
+        # broker fill receipt, so a mismatch means "the table may still be holding the
+        # pre-trade book" -- NOT "the trade failed". Default: warn + report; only
+        # `LIVETRADING_STRICT_HOLDINGS_INPUT=1` turns it into a refusal -- which is why it
+        # stays INSIDE this validation block, ahead of the run-dir allocation: a refused
+        # round must not leave a `nav_breakdown.json` behind either.
+        holdings_input_check = self._check_holdings_input(
+            effective_holdings,
+            val_date=val_date,
+            strategy_key=strat_key,
+            universe_key=univ_key,
+        )
+
+        # ------------------------ SIDE EFFECTS START HERE ------------------------
         # (L2.62) Reuse the directory Stage 1 allocated for THIS round (both stages of one
         # deploy share it); otherwise allocate our own, deduping a double-click within
         # `PENDING_STAGE2_REUSE_SECONDS`.
@@ -2189,7 +2510,6 @@ class ExecutionService:
         summary_file = os.path.join(run_dir, "summary.json")
         pre_summary = self.storage._load_json(summary_file, default={}) or {}
 
-        strat_path = self._resolve_strategy(strategy_file)
         # (L2.62) The in-process Stage-1 hand-off is the fast path; a restart / another
         # uvicorn worker has no entry, so the gate report is re-resolved from this
         # session's archive instead of being silently dropped (see the method's docstring).
@@ -2222,15 +2542,9 @@ class ExecutionService:
             except Exception as exc:  # a missing baseline must not block the deploy
                 logging.warning("[L2.62] account_state 预置失败（忽略）: %s", exc)
 
-        # Resolve holdings
-        if current_holdings is not None:
-            effective_holdings = current_holdings
-        else:
-            effective_holdings = self.storage.get_holdings(date_str=val_date, strategy_key=strat_key, universe_key=univ_key)
-
-        # (NAV) Mark the book BEFORE any side effect or argv assembly.  Fails closed: a book
-        # that cannot be valued is a refusal by default (see `_resolve_nav`), so the run
-        # directory never gains a holdings.json for a deploy that will not happen.
+        # (NAV) Mark the book BEFORE any further side effect or argv assembly.  Fails
+        # closed: a book that cannot be valued is a refusal by default (see `_resolve_nav`),
+        # so the run directory never gains a holdings.json for a deploy that will not happen.
         nav_info = self._resolve_nav(
             effective_holdings,
             as_of=val_date,
@@ -2246,18 +2560,6 @@ class ExecutionService:
         #: the engine's dividend-inclusive mark -- deliberately NOT `portfolio_value`.
         effective_portfolio_value = nav_info["nav_effective"]
         self._write_nav_breakdown(run_dir, nav_info)
-
-        # Advisory reconciliation of the INPUT book against the previous round's PLANNED
-        # post-trade book (see `diff_holdings_input_vs_prev_post`). This system has no
-        # broker fill receipt, so a mismatch means "the table may still be holding the
-        # pre-trade book" -- NOT "the trade failed". Default: warn + report; only
-        # `LIVETRADING_STRICT_HOLDINGS_INPUT=1` turns it into a refusal.
-        holdings_input_check = self._check_holdings_input(
-            effective_holdings,
-            val_date=val_date,
-            strategy_key=strat_key,
-            universe_key=univ_key,
-        )
 
         # Save holdings snapshot in run_dir and globally. (L2.62) `run_dir` pins the archive
         # write to THIS round's instance directory -- "latest" would resolve the session's
@@ -2440,6 +2742,16 @@ class ExecutionService:
             "deploy_stdout": stdout,
             "deploy_stderr": stderr,
             "trades_count": len([r for r in ticket_records if r.get("action") in ("BUY", "SELL")]),
+            # (2026-10-30) Which store produced the seed book this ticket was sized from:
+            # `operator_input` (the form's explicit book), `operator_confirmed_empty_book`
+            # (the form was EMPTY and the operator explicitly confirmed an all-cash account
+            # -- fix 1: an audit can see the full-liquidation round was intentional),
+            # `operator_snapshot` (this session's archived pre-trade snapshot),
+            # `previous_post_holdings` (the last round's planned post-ticket book) or, only
+            # under the explicit `LIVETRADING_STRICT_SEED_BOOK=0` opt-out,
+            # `legacy_get_holdings_fallback`.  An auditor can therefore tell a
+            # strict-sourced deploy from a degraded one without reading the server log.
+            "holdings_seed_source": holdings_seed_source,
             # Advisory (never blocking by default): the INPUT book vs the previous round's
             # PLANNED post-ticket book, so a stale-table deploy stays reconstructable.
             "holdings_input_check": holdings_input_check,
@@ -2526,8 +2838,15 @@ class ExecutionService:
         min_holding_bars: int = 2,
         inertia_threshold: float = 0.05,
         allow_intraday: bool = True,
+        confirm_empty_book: bool = False,
     ) -> Dict[str, Any]:
-        """Execute Multi-Strategy Order Netting & Live Deployment."""
+        """Execute Multi-Strategy Order Netting & Live Deployment.
+
+        ``confirm_empty_book`` (fix 1) mirrors `run_live_deploy`: an empty/all-zero explicit
+        book is refused unless the caller confirms an intentional all-cash account, because
+        the netting path sizes the same full liquidation from it (see
+        `resolve_explicit_book_source`).
+        """
         provider = data_provider or self.storage.default_data_provider or "synthetic"
         # (C6) Same rule as Stage 1/2: the run directory is named after the market
         # clock's published session unless the operator pinned one.
@@ -2538,6 +2857,98 @@ class ExecutionService:
         # (L2.4/L2.5) Same archive-key invariant as Stage 1/2; the matrix run dir is
         # `<archive>/<as_of>/multi_netted_<matrix>`.
         self._assert_archive_keyed_by(run_dir, val_date)
+
+        # ------------------------ VALIDATION / REFUSALS ONLY ------------------------
+        # (fix 2) Same invariant as Stage 2: everything that can REFUSE is decided BEFORE
+        # `os.makedirs(run_dir)` / `resolved_universe.txt` / `holdings.json`, so a refused
+        # netted deploy leaves the archive (and the matrix plan chain) untouched.
+        # --------------------------------------------------------------------------
+        # Resolve holdings
+        if current_holdings is not None:
+            effective_holdings = current_holdings
+            # (fix 1) `{}` from an empty holdings table is a REFUSAL unless confirmed --
+            # the same hazard as Stage 2, and on this path it becomes `{"BIL": ...}` and a
+            # full liquidation / reallocation of the matrix book.
+            holdings_seed_source = resolve_explicit_book_source(
+                effective_holdings,
+                confirm_empty_book,
+                date_str=val_date,
+                matrix_id=matrix_id,
+            )
+        else:
+            # (2026-10-30) STRICT seed resolution -- see `strict_seed_book_enabled`.
+            # FAILURE MODE PREVENTED HERE: this used to be `get_holdings(date_str=val_date)`
+            # with NO keys, whose only remaining source was the global
+            # `data/current_holdings.json`.  Once that duplicate copy is gone the call
+            # returns `{}` -- which lines up with `... or {"BIL": portfolio_value}` below,
+            # i.e. a live matrix deploy would silently go from the real book to "all cash"
+            # and the child would act on it as a FULL LIQUIDATION / reallocation.  An empty
+            # seed must never be produced by accident.
+            #
+            # This path has no single `(strategy, universe)` key: a matrix run's directory
+            # is `<archive>/<date>/multi_netted_<matrix>` and is deliberately outside the
+            # per-`(strategy, universe)` carry-forward chain.  So the matrix equivalent of
+            # `previous_post_holdings` is `get_previous_multi_netting_post_holdings()`
+            # (the same reference `_check_holdings_input(matrix_id=...)` uses), tried
+            # FIRST because it is unambiguously this matrix's own planned book and is
+            # strictly EARLIER than `val_date`.  The keyless `resolve_seed_holdings()` is
+            # the secondary archive-first attempt (it can only add the flat
+            # `<archive>/<date>` operator-snapshot tier, i.e. a same-day explicitly saved
+            # book -- the pre-refactor precedence).  Both are archive reads; neither can
+            # invent an empty book out of "nothing found" -- that is `(None, "none")`.
+            seed: Optional[Dict[str, Any]] = None
+            seed_source = "none"
+            prev_plan, _prev_plan_dir = self.storage.get_previous_multi_netting_post_holdings(
+                date_str=val_date, matrix_id=matrix_id
+            )
+            if prev_plan is not None:  # `{}` is a CONFIRMED all-cash matrix plan
+                seed, seed_source = prev_plan, "previous_multi_netting_post_holdings"
+            else:
+                seed, seed_source = self.storage.resolve_seed_holdings(val_date)
+            if seed is None:
+                if strict_seed_book_enabled():
+                    raise LiveSeedBookMissingError(
+                        _seed_book_missing_message(val_date, None, None)
+                        + f" matrix_id={matrix_id!r}（多策略矩阵路径没有单一 strategy/universe 键，"
+                        "已尝试 get_previous_multi_netting_post_holdings 与归档快照）。"
+                    )
+                logging.warning(
+                    "[seed-book] %s=0 已显式关闭严格种子持仓校验：matrix=%s date=%s 的归档里"
+                    "没有种子持仓（上一轮矩阵计划簿与同日快照均缺失），回退到旧的"
+                    " get_holdings() 解析。 本次部署的 holdings_seed_source 记为"
+                    " legacy_get_holdings_fallback。",
+                    STRICT_SEED_BOOK_ENV,
+                    matrix_id,
+                    val_date,
+                )
+                seed = self.storage.get_holdings(date_str=val_date)
+                seed_source = "legacy_get_holdings_fallback"
+                if not seed:
+                    logging.warning(
+                        "[seed-book] 回退解析返回空簿：本次矩阵部署将按“全部空仓”计价并下发"
+                        "（这会对现有仓位产生整仓清仓/再配置指令）。若持仓表其实有仓位，"
+                        "请立即终止该轮并显式提交持仓。"
+                    )
+            effective_holdings = seed
+            holdings_seed_source = seed_source
+
+        # Advisory reconciliation of the INPUT book against the previous MATRIX round's
+        # PLANNED post-trade book (L2.53 closure). Matrix runs do not call
+        # `save_holdings`/`get_previous_post_holdings` (their directory is not part of the
+        # per-(strategy, universe) carry-forward chain), so without this call the stale-book
+        # check was inert on the netted path -- the very path the 2026-10-27 incident ran.
+        # Same contract as Stage 2: warn + report by default, refuse only when
+        # `LIVETRADING_STRICT_HOLDINGS_INPUT=1`. Kept INSIDE the validation block (fix 2) so
+        # the refusal cannot leave a `holdings.json` / `resolved_universe.txt` behind.
+        holdings_input_check = self._check_holdings_input(
+            effective_holdings,
+            val_date=val_date,
+            strategy_key=None,
+            universe_key=None,
+            matrix_id=matrix_id,
+        )
+
+        # ------------------------ SIDE EFFECTS START HERE ------------------------
         os.makedirs(run_dir, exist_ok=True)
 
         univ_path = self._resolve_universe(universe_file, custom_symbols, run_dir)
@@ -2564,29 +2975,14 @@ class ExecutionService:
                     "chan_four_state_shield_blend:0.25",
                 ]
 
-        # Resolve holdings
-        if current_holdings is not None:
-            effective_holdings = current_holdings
-        else:
-            effective_holdings = self.storage.get_holdings(date_str=val_date)
-
         holdings_file = os.path.join(run_dir, "holdings.json")
 
-        # Advisory reconciliation of the INPUT book against the previous MATRIX round's
-        # PLANNED post-trade book (L2.53 closure). Matrix runs do not call
-        # `save_holdings`/`get_previous_post_holdings` (their directory is not part of the
-        # per-(strategy, universe) carry-forward chain), so without this call the stale-book
-        # check was inert on the netted path -- the very path the 2026-10-27 incident ran.
-        # Same contract as Stage 2: warn + report by default, refuse only when
-        # `LIVETRADING_STRICT_HOLDINGS_INPUT=1`. Raised BEFORE `holdings.json` is written.
-        holdings_input_check = self._check_holdings_input(
-            effective_holdings,
-            val_date=val_date,
-            strategy_key=None,
-            universe_key=None,
-            matrix_id=matrix_id,
-        )
-
+        # (2026-10-30) `effective_holdings` can no longer be an ACCIDENTAL `{}`: the
+        # strict seed resolution above raises on `(None, "none")` and a caller-supplied
+        # empty book now needs `confirm_empty_book=True` (fix 1), so an empty dict here
+        # means "CONFIRMED all-cash" (every row of the previous matrix plan liquidated) and
+        # the cash proxy is the correct representation of that.  Kept byte-identical to the
+        # pre-refactor expression on purpose -- this is not where the emptying hazard was.
         self.storage._save_json(holdings_file, effective_holdings or {"BIL": portfolio_value})
 
         cmd = [
@@ -2673,6 +3069,13 @@ class ExecutionService:
             "friction_savings": savings_data,
             "strategies": strat_args,
             "trades_count": len([r for r in ticket_records if r.get("action") in ("BUY", "SELL")]),
+            # (2026-10-30) Which archive store produced the seed book this netted ticket was
+            # sized from (`operator_input` / `operator_confirmed_empty_book` (fix 1: an
+            # explicitly confirmed all-cash matrix book) / `previous_multi_netting_post_holdings`
+            # / `operator_snapshot` / `legacy_get_holdings_fallback`). Matrix runs are outside
+            # the per-(strategy, universe) chain, so without this field "which book did the
+            # netting start from?" is unanswerable from the archive alone.
+            "holdings_seed_source": holdings_seed_source,
             # Advisory (never blocking by default): the INPUT book vs the previous MATRIX
             # round's planned post-ticket book, so a stale-table netted deploy stays
             # reconstructable from the archive.
