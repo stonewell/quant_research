@@ -18,7 +18,7 @@ Features complete Stage 1 Health Gate inspection, Stage 2 live order generation 
 3. **Interactive Holdings & Cash Management**:
    - Add, edit, or remove held positions (shares or target weights).
    - Real-time auto-calculation of total equity valuation, remaining idle cash, and cash allocation percentage.
-   - Persistent storage across sessions (`current_holdings.json`).
+   - The book is persisted **only** inside the run archive (see item 6); it is seeded from the previous run's `post_holdings.json`, or from an operator-entered `holdings.json` for the current session. There is no global holdings file any more.
 4. **Stage 1: Portfolio Health & Macro Gate**:
    - Evaluates peak-to-trough drawdown from High-Water Mark (HWM).
    - Evaluates Circuit Breaker Tiers (Normal, Tier 1 Damping, Tier 2 Defensive, Tier 3 Halt) and auto-healing cooldowns across all blend variants (`cfsb_`, `crb_`, `ccsb_`, `cdhb_`, `blend_`).
@@ -31,12 +31,16 @@ Features complete Stage 1 Health Gate inspection, Stage 2 live order generation 
    - Applies the 5% inertia turnover filter, single-stock caps, and market-specific lot sizing (100 for A-shares, 1 for US, board lots for HK).
    - One-click CSV ticket export for broker execution.
 6. **Immutable Daily Snapshot Archive & Historical Date Browser**:
-   - For every trading day, saves a complete snapshot bundle under `<archive_dir>/<date>/`:
+   - For every trading day, saves a complete snapshot bundle under `<archive_dir>/<strategy>/<universe>/<date>/` (plus `<date>/<HHMMSS>/` when a session runs more than one round):
      - `holdings.json`: Portfolio positions on that date.
      - `account_state.json`: Account NAV, peak NAV, drawdown, tier, and cooldown counters on that date.
      - `stage1_health_report.json`: Health gate metrics on that date.
      - `live_trading_ticket.json` & `live_trading_ticket.csv`: Orders generated on that date.
+     - `post_holdings.json`: The planned post-trade book assumed by that round's ticket.
      - `summary.json`: Execution parameters, timing, and stdout logs.
+   - **Holdings and account state are persisted ONLY here.** A deploy seeds the book from the previous run's `post_holdings.json` (falling back to an operator-entered `holdings.json` for the current session) and refuses to size a ticket when neither exists — sizing from an empty book would re-buy lots that were already sold.
+   - **An empty submitted book is refused, not assumed to be "all cash".** A book that is `{}`, all-zero, or whose every row has no usable share count is rejected (`EmptyBookConfirmationRequiredError`), because the engine would size a SELL for every currently-held symbol — a full liquidation. An intentional all-cash account is expressed per request with `confirm_empty_book: true` (the web UI shows a confirmation dialog first); the round is then archived with `holdings_seed_source = "operator_confirmed_empty_book"`, so an auditor can tell it apart from an operator-entered position list (`operator_input`). There is deliberately no environment kill-switch for this gate (unlike `LIVETRADING_STRICT_SEED_BOOK`), because "the form was not filled in" is never a legitimate all-cash instruction.
+   - The web `data/` directory holds **configuration only** (`settings.json`, `settings.local.json`, `custom_universes.json`, `multi_strategy_configs.json`); it never stores holdings or account state.
    - Select any historical date to inspect that day's holdings, account state, and trading directives!
 7. **Zero Hardcoded Paths**:
    - All directory locations (repo root, strategy directory, universe directory, data directory, archive directory, cache directory, and scripts) are completely configurable via CLI arguments, environment variables, `settings.json`, and the in-app Settings modal.

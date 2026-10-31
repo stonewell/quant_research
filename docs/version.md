@@ -3824,3 +3824,146 @@ LIVETRADING_PREFER_INSTANCE_STATE=0
 
 2. **`docs/development_plan.md` §4.25「可预测性契约」措辞过强（已改写）**：原文"任何未显式加开关的调用，票据与本轮改动前**逐值一致**"不成立 —— D6 检出残留整手会往 `reason` 追加告警文本、D7 触发上限会往 `reason` / `summary_reason` 追加 `MV_CAP` 标注并写 `detail_reason.mv_cap`、D8 默认开启且会改变状态解析顺序（正是它要修的那类场景）。已改写为代码真正执行的契约：**订单方向与成交量默认不变；检测与标注永远可观测；任何改变下单数量的行为都必须显式开关**，并单独点名 D8 是默认开启的"读数修正"例外。§25.2 的逐缺陷默认行为表未变（它本来就准确）。
 
+### 25.9 补记（2026-10-30 收口，D9）：废除 `data/current_holdings.json` 全局影子簿，实盘种子持仓改为「归档唯一 + 严格解析」
+
+> **归属**：与 §25.1–§25.8 同属"幽灵账本"事件族，但作用面不同 —— D5–D8 修的是**归档链上的读数**（参考簿交叉校验 / 残仓清出 / 交付市值上限 / 平层种子遍历），本小节修的是**归档之外的第三个副本本身**。这条路径对 D5–D8 **完全不可见**：D5 的参照物、D6 的输入、D8 的遍历对象都可以是正确的，而最终用于定量下单的那本簿仍来自全局文件。
+
+#### 25.9.1 事件与根因：同一本账曾有三个独立副本
+
+2026-10-29 的实盘归档里，`600584.SH` / `600362.SH` 各 100 股仍留在账上。按归档重述记录的成交假设，这两只**已于 2026-10-26 按票面价减仓成交**（`L2.57` 第 7 条：10-26 五笔按票面价整手成交；10-27 三笔卖单系 10-26 已成交减仓的**重复下单、未成交**）。它们能回到账上，是因为同一本账存在三个**各自独立、可互相偏离**的持久副本：
+
+| # | 副本 | 位置 | 处置状态 |
+| :--- | :--- | :--- | :--- |
+| 1 | 归档 `post_holdings.json` 链 | `<archive>/<strategy>/<universe>/<date>[/<HHMMSS>]/post_holdings.json` | 上一轮已修复（`L2.53`/`L2.57`/D5–D8） |
+| 2 | `2026-10-29/holdings.json` 与 `2026-10-29/215823/holdings.json` | 同上 | **故意保留的缺陷证据**，永不"修好"（见 §25.9.9 第 4 条） |
+| 3 | 全局影子簿 | `web/livetrading/data/current_holdings.json` + `data/account_state.json` | **本小节废除**（隔离，不删除） |
+
+第 3 号副本的恶性在三点：
+
+1. **与日期无关**：没有 `date` 键，任何一次保存都覆盖它、任何一次读取都把它当"当前持仓"，于是 10-29 的界面、10-29 的部署、乃至 10-22 的回看，看到的是同一个"当前"。
+2. **与归档并行写入**：`save_holdings` / `save_account_state` / `save_daily_run` 每次保存都写它，但**读回时的解析顺序与归档不同**（`storage.py:319-332` 的事故注记原文），故一次失败/半途的运行、一次归档恢复、一次手工编辑都能让它滞后于归档。
+3. **无人对账**：D5 的参考簿×生命周期交叉校验、D6 的残仓清出、`holdings_input_check` 的输入对账，全部只比较"输入 vs 归档"，没有任何一处检查"归档说卖了、全局文件还留着"。
+
+#### 25.9.2 改动一：Web 数据目录退化为「仅配置」（`web/livetrading/storage.py`）
+
+- **删除两个可写属性** `StorageManager.current_holdings_file` / `.account_state_file`（`storage.py:1288-1291` 的注记取代了原定义）。Web `data/` 目录此后只存配置：`settings.json`、`settings.local.json`、`custom_universes.json`、`multi_strategy_configs.json`。
+- **`get_holdings` 不再回退全局文件**：原链路末端的 `data/current_holdings.json` 读取删除，未解析日期一律返回 `{}`（`storage.py:1871-1876`），仅供 UI 显示路径使用；部署路径必须改用下面的 `resolve_seed_holdings`。
+- **`get_account_state` 回退到模块常量** `_DEFAULT_ACCOUNT_STATE`（`storage.py:339-351` 定义、`:2262-2266` 返回 `dict(_DEFAULT_ACCOUNT_STATE)`）——**返回拷贝**，调用方拿去改不会污染该字面量。该常量是引擎自己的"尚无历史"基线（同时把 `nav_history_10d` 归零），因此不会与"结转态"混淆。
+- **三处写全局的分支删除**：`save_holdings`（`:1944-1969`）、`save_account_state`（`:2268-2288`）、`save_daily_run`（`:2512-2563`）现在**只写归档**。
+- **残留文件只警告、永不读取**：构造时调用 `_warn_legacy_state_files()`（`:1296`、`:1298-1317`），对 `_LEGACY_STATE_FILENAMES = ("current_holdings.json", "account_state.json")`（`:334`）逐个打 WARNING，并点名隔离约定 `data/_quarantine/<name>.quarantined-<date>`。**不自动删除**：残留件可能是一次手工更正留下的唯一记录，但"改它以为会生效"正是要消除的陷阱。
+- **实际隔离（移动，未删除，md5 保留）**：
+
+  | 隔离后路径 | 字节 | md5 |
+  | :--- | ---: | :--- |
+  | `web/livetrading/data/_quarantine/current_holdings.json.quarantined-20261030` | 105 | `7eb0856e8146d928e6cdbc933cfeabc9` |
+  | `web/livetrading/data/_quarantine/account_state.json.quarantined-20261030` | 18,035 | `c15dbd3e99b593ec86490b62fcac2a66` |
+
+  `data/` 下现存的 `*.json` 只剩配置文件四份，`_quarantine/*` 因改名而不再进入任何 `*.json` 扫描。
+
+#### 25.9.3 改动二：`resolve_seed_holdings` 成为部署种子的唯一入口
+
+新增 `StorageManager.resolve_seed_holdings(date_str, strategy_key, universe_key) -> (book, source)`（`storage.py:1878-1979`），`source ∈ {"operator_snapshot", "previous_post_holdings", "none"}`：
+
+1. `date_str` 能解析到 run base dir 时，遍历该**会话**的实例目录（`list_instances_for_date` 反序、平层目录最后补入），**最新实例优先**；每个候选目录内部再按 25.9.8.1 的优先级取簿（计划盘后簿 → 无 Stage-2 产物的快照 → 有产物但无计划簿则跳过），命中即 `"operator_snapshot"`。同日重跑必须与"这一轮实际计划的簿"对账，而不是与昨天的、更不是与该目录部署前的陈旧输入对账。复用 D8 hardened 的归档辅助函数，不另写一套 walk。
+2. 否则用 `get_previous_post_holdings(date_str, strategy_key, universe_key)` 结转**上一轮的计划盘后簿**（严格早于 `date_str`，只认 `post_holdings.json` 或由其票据 `target_shares` 反推，**绝不** `holdings.json`）；命中即 `("previous_post_holdings")`。
+3. 都没有 → `(None, "none")`。
+
+**关键契约 —— `None` 不等于 `{}`**（`storage.py:1894-1900`）：
+
+- `(None, "none")` = **不知道这本簿**。部署必须**拒绝**（`LiveSeedBookMissingError`），绝不能按零计价 —— 空簿会让每个目标权重都像一次新建仓，从而重新买入归档记录已卖出的头寸。
+- `({}, "previous_post_holdings")` = **已确认全空仓**（上一轮票据每一行都已清出，或上一轮计划就是平簿）。这是合法种子，必须当作零持仓兑现。
+
+之所以把它做成一个方法而不是让调用方各自拼链路：旧的"各自拼"正是全局文件能悄悄坐进链条末端的原因（`resolve_seed_holdings` 的 docstring 明写了这一动机）。
+
+#### 25.9.4 改动三：任何实盘路径都不得从空簿定量（`web/livetrading/execution_service.py`）
+
+新增异常 `storage.LiveSeedBookMissingError(RuntimeError)`（`storage.py:302-313`），并在 `execution_service.py:72` 导入（`:89` 的 except 回退导入中亦已列出）。
+
+- **Stage-2 单策略路径**（`run_live_deploy`，`:2287-2330`）：`current_holdings is not None` → 走显式簿分支，标 `operator_input`（UI 每次都显式提交，这是正常路径）；否则严格解析种子，`seed is None` 且严格门开启时**抛异常**。抛点刻意排在所有副作用之前：`_resolve_nav`（`:2335`）、`_write_nav_breakdown`（`:2349`）、`save_holdings`（`:2367`）、argv 组装与子进程启动全部在其后 —— 因此被拒的部署**不写 `holdings.json`、不写 `nav_breakdown.json`、不启动子进程**，与既有 `HoldingsInputMismatchError` strict 拒绝同形。
+- **多策略矩阵净额路径（真正的雷）**（`:2676-2735`）：旧代码在这一支调用的是**无键**的 `get_holdings(date_str=val_date)`，其唯一剩余来源就是全局 `data/current_holdings.json`；全局文件删除后该调用返回 `{}`，而下游表达式是 `effective_holdings or {"BIL": portfolio_value}` —— 一次真实的矩阵部署会在**无人察觉的情况下从真实持仓变成"全部现金"，即整仓清仓/再配置**。现改为：先 `get_previous_multi_netting_post_holdings(date_str, matrix_id)`（矩阵运行在 `<archive>/<date>/multi_netted_<matrix>`，不属于逐 `(strategy, universe)` 结转链，故必须有自家参照），得到即 `previous_multi_netting_post_holdings`；否则退到无键 `resolve_seed_holdings(val_date)`（只能补上平层目录的同日显式快照这一档）；两路都拿不到 → 拒绝。写盘点在 `:2760`，仍在拒绝之后。
+- **`or {"BIL": portfolio_value}` 表达式逐字节保留**（`:2752-2759`）：此时 `{}` 已只可能是"已确认全空仓"，故该表达式是正确的现金代理，而不是隐藏的清仓开关 —— 注释里明确写了"这里不是致空的那一处"。
+
+#### 25.9.5 改动四：可观测性 —— `holdings_seed_source`
+
+两条部署 summary 都记录种子来源（单策略 `:2544-2551`；矩阵 `:2845-2850`），取值 `operator_input` / `operator_snapshot` / `previous_post_holdings` / `previous_multi_netting_post_holdings` / `legacy_get_holdings_fallback`。作用：**不读服务器日志**也能从归档判断这一轮票据是按哪一本簿定量的，从而区分"严格解析"与"降级回退"。
+
+#### 25.9.6 开关与灰度逃生门
+
+```bash
+# 默认 ON（缺席 / 空串即 ON）。显式关闭后才允许回退到改前的 get_holdings() 解析：
+LIVETRADING_STRICT_SEED_BOOK=0        # 0 / false / no / off 同样生效
+```
+
+- **解析形状与 `prefer_instance_state_enabled()` 一致**（`execution_service.py:754-765`）：`raw is None` 或 `strip()==""` → 开启；否则走 `_env_truthy`（真值集 `{"1","true","yes","on","y","t"}`，与 `storage._truthy_env` 同一套，`storage.py:701`）。
+- **关闭后的行为**：每次部署都打 WARNING，并把 `holdings_seed_source` 标为 `legacy_get_holdings_fallback`，因此降级的一轮**在归档里无法伪装成严格轮**；若回退解析仍返回空簿，再加一条"本次将按全部空仓计价"的大声告警。
+- **默认值与 `LIVETRADING_STRICT_HOLDINGS_INPUT` 相反（后者默认 OFF），理由必须写清**：`STRICT_HOLDINGS_INPUT` 校验的是"输入 vs 上一轮计划"，部分成交之后两者**合法地**可以不一致，强制它会误杀正常部署；而 `STRICT_SEED_BOOK` 守的是"种子簿根本读不到"——那不是偏好，是**缺输入**，且改前对它的默认答案是"静默按零"，后果是不可恢复的（真实下单打在幻影簿上）。所以一个 opt-in、一个 opt-out。
+
+#### 25.9.7 版本轴（`AGENTS.md` 规则 7）未触发
+
+本轮**未修改**任何 `AllocationTemplate` / 任一静态模板 / `BaseBlendAllocationStrategy` / 任何策略类的信号、参数默认值或子策略组合，改动全部落在 Web 执行层与归档读取层：
+
+- `BASE_VERSION` **未变**（基础引擎升级义务不适用；`pipeline/research/blend/blend_base.py` 未被触碰）；
+- 各策略/模板的 per-class `version` **未变**；
+- 无需重跑 `uv run python pipeline/research_strategy/run_research_strategy.py --dump-strategies`；
+- `run_live_strategy.py` 票据里的 `strategy_version` / `base_version` 因此仍为既有值。
+
+#### 25.9.8 验证（100% 离线；静态核对 + 隔离物证，种子契约已由 12 条行为用例钉住）
+
+| 口径 | 证据 |
+| :--- | :--- |
+| 全局属性/写入点确实消失 | `git diff -U0 web/livetrading/storage.py` 中 `-` 侧恰有 **8 行**涉及这两个名字：**2 处属性定义**（`self.current_holdings_file` / `self.account_state_file`）+ **6 处读写点**（`get_holdings` 的 `_load_json(current_holdings_file)`、`save_holdings` 的写、`save_account_state` 的读与写、`save_daily_run` 的两处写） |
+| 只读残留告警、不读取内容 | `_warn_legacy_state_files`（`storage.py:1298-1317`）只调 `os.path.exists`，全文无 `_load_json` 调用 |
+| `None` vs `{}` 未被混同 | `storage.py:1976` 的 `if plan is not None:  # {} 是确认空仓` 与 `execution_service.py:2706` 的 `if prev_plan is not None` |
+| 拒绝早于一切副作用 | 抛点在 `execution_service.py:2308` / `:2712`；`_resolve_nav` `:2335`、`save_holdings` `:2367`、矩阵写盘 `:2760`、`subprocess.run` 更后 |
+| 隔离物证 | §25.9.2 两个 md5；`data/` 下已无 `current_holdings.json` / `account_state.json` |
+| 前端仍显式提交簿 | `static/js/app.js:1454-1470`（`getHoldingsFromTable` 定义）→ `:1872`（部署取簿）→ `:1875`（`current_holdings: holdings`） |
+
+**验证护栏现状（2026-10-30 更正 —— 本小节初稿"无自动化回归护栏 / 仅余注释级命中，无行为断言"的表述已过时）**：本轮新增代码只有 4 个文件（`storage.py`、`execution_service.py`、`README.md`、`README_ZH.md`；不含文档），但种子解析契约**其后已由并行工作流落地为 12 条行为断言**，全部位于 `web/livetrading/tests/test_live_book_integrity.py` 第 6 节（`:884-1350`）。它们不是"适配"，也不再是注释级命中：
+
+| # | 用例 | 钉住的契约 |
+| :--- | :--- | :--- |
+| 1 | `test_legacy_global_current_holdings_is_ignored_and_named` | 旧全局 `current_holdings.json` 被忽略且告警点名 |
+| 2 | `test_legacy_global_account_state_is_ignored` | 旧全局 `account_state.json` 同样只警告、不读取 |
+| 3 | `test_data_dir_is_never_written_by_any_save_path` | **`data/` 目录不变式**：任何 `save_*` 路径都不写数据目录 |
+| 4 | `test_resolve_seed_holdings_reports_unknown_on_an_empty_archive` | `None` 不等于 `{}`（空归档 → `(None, "none")`） |
+| 5 | `test_resolve_seed_holdings_carries_the_previous_planned_post_book` | `previous_post_holdings` 结转腿存在 |
+| 6 | `test_resolve_seed_holdings_distinguishes_confirmed_cash_from_unknown` | `{}` = 已确认全空仓，不得读成未知 |
+| 7 | `test_operator_snapshot_wins_over_the_previous_post_book` | 同日显式簿优先于上一轮计划簿 |
+| 8 | `test_newest_instance_snapshot_beats_the_flat_dir_snapshot` | 会话内最新实例优先（反序遍历） |
+| 9 | `test_deploy_refuses_an_unknown_seed_before_any_write_or_launch` | `LiveSeedBookMissingError` 抛点早于任何写盘/启动 |
+| 10 | `test_deploy_opt_out_falls_back_and_labels_the_seed` | `strict_seed_book_enabled()` 默认 ON、`=0` 关闭路径与降级标签 |
+| 11 | `test_deploy_summary_labels_an_explicit_book_as_operator_input` | `holdings_seed_source` 的显式簿取值 |
+| 12 | `test_deploy_summary_labels_the_previous_post_book_source` | `holdings_seed_source` 的结转取值 |
+
+所以准确定位是：**单策略种子契约**（`None`/`{}`、开关默认值、拒绝时序、`holdings_seed_source` 标签）与**`data/` 目录不变式** **均已行为钉住**。**唯一仍未行为断言覆盖**的是**矩阵/净额部署**的取簿顺序（`previous_multi_netting_post_holdings` → 无键 `resolve_seed_holdings` → 拒绝）及其写盘时序 —— 该路径今天仍只由代码结构、§25.9.4 的论证与 §25.9.5 的 summary 取值支撑。
+
+本小节及其中所有 `file:line` 均以落笔时的文件为准；测试侧若继续被并行改写而移动行号或补齐用例，以**代码与最终测试集**为准，并应在 §25.9 追加补记，而不是回改上面的静态证据。
+
+#### 25.9.8.1（2026-10-30 补记）`resolve_seed_holdings` 的 Stage-2 产物优先级修复
+
+- **改了什么**（`storage.py:1958-1972`，只改 `resolve_seed_holdings` 的候选遍历体）：在每个候选 run dir 内 —— (a) 先用 `_planned_book_from_run_dir` 取该目录的**计划盘后簿**（`post_holdings.json`，否则由其票据反推），命中即 `"operator_snapshot"`；(b) 该目录**无** Stage-2 产物（`has_stage2_artifact` 为假）时，才允许把 `holdings.json` / `current_holdings.json` 当 `"operator_snapshot"`；(c) 有 Stage-2 产物却取不到计划簿时**跳过**该目录的 `holdings.json`，继续往前遍历。二元返回签名与 `source` 三元枚举**均未改变**，故 `execution_service.py` 零改动。
+- **为什么**：`holdings.json` 有两个写入者、语义不同 —— `save_holdings` 写"操作者手输的簿"（正是 `operator_snapshot` 想表达的东西），而 `save_daily_run` 在启动子进程**之前**写 Stage-2 自己的**盘前**种子。于是在一轮已跑完 Stage 2 的目录里，`holdings.json` 只是一份过期的盘前快照，权威账本是同目录的 `post_holdings.json`；旧代码在候选遍历里**先**读快照，恰好把这个过期值当成了操作者当前的簿。
+- **它防止的事故（真实物证）**：`chan_four_state_blend/custom_astock_202609_20_new/2026-10-29/215823/` 同时存在幽灵 `holdings.json`（`600584.SH:100`、`600362.SH:100`，同轮 `post_holdings.json` 已剔除这两笔，作为缺陷证据**故意保留**）与已修正的 `post_holdings.json`。同日重跑在无显式簿时，旧代码把幽灵簿标成 `operator_snapshot`：`seed is None` 为假故不触发 `LiveSeedBookMissingError`，D5 幻影参照检查只告警，部署便按一本"声称已卖出头寸仍持有"的簿定量 —— 即 **2026-10-30 事故的复现**。
+- **回归护栏（已实测，非注释）**：`web/livetrading/tests/test_run_instances.py` 第 7 节新增 6 条：①幽灵 `holdings.json` + 修正 `post_holdings.json` 时取后者；②仅有 `holdings.json` 且无 Stage-2 产物时仍作 `operator_snapshot`（防"过度收紧"回归）；③有产物但取不到计划簿时**不得**返回陈旧快照（实测落到 `(None, "none")`）；④最新实例计划簿胜过平层快照；⑤空归档仍为 `(None, "none")`；⑥`{}` 计划簿仍为 `({}, ...)` 且 `is not None`。其中第 ①、③ 条在临时恢复"快照优先"旧顺序时确实转红（本轮实测 `2 failed`）。
+
+#### 25.9.9 未闭合项（如实披露，不美化）
+
+1. **`static/js/app.js` 的 `getHoldingsFromTable()` 仍会对空表格发 `{}`**（`:1454-1470`，空表格 → `{}`；`:1872` 取簿、`:1875` 直接作为 `current_holdings` 提交）。`{}` 与"已确认全空仓"在服务端不可区分，会以 `operator_input` 进入显式簿分支 → 整仓清仓。这是**显式簿那条臂**上的问题，本轮刻意保持该臂逐字节不变；现有缓冲是 advisory 的 `holdings_input_check`（会把上一轮每个持仓都报为 mismatch）与 `LIVETRADING_STRICT_HOLDINGS_INPUT=1` 的拒绝。**未修。**
+2. **「被拒的部署留下实例目录残渣」现仅剩「Stage-1 健康报告缺失」一臂**：空簿拒绝（`EmptyBookConfirmationRequiredError`，`resolve_explicit_book_source` 的 `:927` 门控，调用点 `:2439`）与种簿未知拒绝（`LiveSeedBookMissingError`，`:2464`）都已判定于 VALIDATION 块（`:2422-2500`）之内、副作用区（`:2502` 起）之前，`_resolve_stage2_run_dir`（`:2507`，建实例目录 + 消费 Stage-1 交接）与 `os.makedirs`（`:2509`）都尚未执行——**两臂均零残留**（不建目录、不写预置 `account_state.json`、无 `holdings.json`/`nav_breakdown.json`/`summary.json`、交接不消耗、无子进程）；种簿未知这一臂另有 `test_deploy_refuses_an_unknown_seed_before_any_write_or_launch` 断言 `not os.path.exists(base_dir)` 钉住。仍有残留的只剩 **`Stage1HealthReportMissingError`**：它由 `_resolve_stage2_health_gate`（`:2519`）在该目录已创建之后判定，故仍会留下一个（空的）实例目录——**既有、未修、本改动未关闭**。
+3. **`models.py` 的 `RunResponse` 未暴露 `holdings_seed_source`**（`models.py:135-173` 无该字段，且 FastAPI `response_model` 会把未声明键过滤掉）→ 今天它只存在于 summary，**UI 看不到**。若要在界面上显示"本轮种子来自哪本簿"，需先加字段。
+4. **两份 `2026-10-29/holdings.json` 是故意保留的缺陷证据**（平层与 `215823/` 实例目录各一份，与 `2026-10-27/post_holdings.json` 逐字节相同的形态，见 §25.1）。它们是 D8 判别器的取证对象，**不得**在后续任何"清理"中被删除或覆写；`L2.57` 记录的账本重述范围为 10-22 / 10-26 / 10-27 三轮，**不含** 10-29 的这两份。自 2026-10-30 起，`215823/` 这类"已有 Stage-2 产物"的目录里这份幽灵簿不会再被 `resolve_seed_holdings` 当作 `operator_snapshot` 返回（见 §25.9.8.1），但证据文件本身原样保留。
+5. **`LIVETRADING_STRICT_SEED_BOOK=0` 的逃生门本身会复现原缺陷**：关闭后若 `get_holdings()` 仍解析不到簿，代码只能"按全部空仓计价"并告警。这是刻意的"知情降级"通道，不是可依赖的运维模式。
+
+#### 25.9.10（2026-10-30 补记）空簿门改以「引擎实际定量口径」判定：全不可解析簿不再绕过确认
+
+- **缺陷（本轮独立对抗式复核发现的 MINOR 级、但后果为整仓清仓的漏洞）**：`book_is_empty`（`execution_service.py:853-868`）按**逐值可证伪性**判空 —— `_holding_value_is_zero`（`:831-850`）对不可解析值刻意返回 `False`（"unknown is never zero"），因此 `{"600900.SH": "abc"}`、`{"600900.SH": {"shares": "abc"}}` 这类**全垃圾簿**被判为"非空"，`resolve_explicit_book_source` 随之返回 `operator_input`、**不要求任何确认**。然而引擎并不从原始载荷定股数：`_shares_book`（`:632-656`）会**丢弃**每一行 `float()` 失败 / `None` / 空串 / 0 的行，于是同一本簿在下游塌缩成 `{}`，子进程按空簿定量 ⇒ **对每个持有标的逐笔卖出（整仓清仓）**，且归档里既没有 `operator_confirmed_empty_book` 标签、也没有任何拒绝。这正是空簿门存在的理由被绕开。
+- **为什么按"引擎口径"而不是"补一个解析失败即拒绝"**：不可解析行本身不是新问题（混合簿里一行手误不应该拦下整轮部署，见下条非回归用例），真正的危险是**整本簿被引擎丢空**。因此门只增加一个合取项：**`_shares_book` 至少产出一行**。
+- **修复（`execution_service.py:917-927`，仅 `resolve_explicit_book_source` 一处）**：早退条件由 `if not book_is_empty(holdings):` 改为 `if not book_is_empty(holdings) and _shares_book(holdings):`；其余分支（未确认 → `EmptyBookConfirmationRequiredError`；已确认 → WARNING + `CONFIRMED_EMPTY_BOOK_SOURCE`）**逐字节未动**。`_holding_value_is_zero` / `book_is_empty` / `_shares_book` **三个函数一律未改**，也没有新增任何 env 开关。
+- **显式非回归（权重模式簿仍被接受）**：`scripts/run_live_strategy.py` 的 `is_weight_mode` 允许小数权重簿，`{"600900.SH": 0.05}` 经 `_shares_book` 变成 `{"600900.SH": 0}` —— **非空 dict、但股数为 0** 的行由子进程按权重重新推导。因此门判定的是 `_shares_book(...)` 的 **dict 是否为空**，**绝不可**写成 `book_is_empty(_shares_book(...))`：后者会把 `0` 判成空、把一本合法的权重簿当成清仓并拒绝。该形态由 `test_fractional_weight_book_is_not_mistaken_for_an_empty_one` 钉住。
+- **为什么这一类缺陷按"真金白银风险"处理**：2026-10-30 的 `600584.SH` / `600362.SH` 事故证明过同一件事 —— **票据是按一本"并不描述账户"的簿算出来的，就会在已被清出的标的上产生真实订单**。全垃圾簿是把同一后果的触发条件从"簿不对"缩小到"簿几乎为空"，但输出同样是真实卖出，故不按"输入校验小瑕疵"处理。
+- **验证（100% 离线 / 合成，单目录运行）**：`web/livetrading/tests/test_live_book_integrity.py` 第 9 节（`:1774-1941`）新增 5 个用例（4 条行为 + 1 条 8 组参数化）：①全不可解析簿 → `EmptyBookConfirmationRequiredError`、不启动子进程、不留下 `holdings.json`；②同簿 + `confirm_empty_book=True` → 接受且 summary 记 `operator_confirmed_empty_book`（**不是** `operator_input`）；③混合簿（一行垃圾 + 一行真实 `5800` 股）仍为 `operator_input`、不需确认（防过度拒绝）；④小数权重簿 `{"600900.SH": 0.05}` 仍为 `operator_input`；⑤`book_is_empty` 对既有形态（`{}` / `0` / `"0"` / `None` / `{"shares": 0}` → True，`100` → False）语义不变。
+- **实跑计数**：`test_live_book_integrity.py` → **76 passed**；`test_run_instances.py + test_web_livetrading.py + test_execution_valuation_date.py`（`--import-mode=importlib`）→ **104 passed, 1 failed**（唯一红为既有 `test_executable_web_config_carries_no_machine_specific_paths`，由未跟踪的 `web/livetrading/data/settings.local.json` 固定了机器路径，与本轮无关）；`web/livetrading/tests` 整目录 → **213 passed, 1 failed**（同一既有红）。
+- **版本轴（`AGENTS.md` 规则 7）未触发**：改动仅落在 Web 执行层（`execution_service.py` 的一个纯函数）与其测试，未触碰任何 `AllocationTemplate` / 静态模板 / `BaseBlendAllocationStrategy` / 策略类，`BASE_VERSION` 与各 per-class `version` 一律未动，无需 `--dump-strategies` 重跑。
+- **文案一处扩过、判空一处保留（如实披露）**：① 拒绝文案 `_empty_book_unconfirmed_message`（`:871-895`）**已改**，同一轮改早退条件时把提示扩写为**点名三种被拒形态** —— 空簿 `{}`、每个标的的股数都是 0、股数无法解析/不是数字 —— 并提示传确认字段名 `confirm_empty_book=true` 才能部署全部空仓的账户（否则整仓清仓）；② `book_is_empty` 的"unknown is never zero"语义**保留**，故单独调用它的地方（含 `test_all_zero_book_is_treated_as_empty`）行为逐字节不变；"引擎口径"只是门内新增的一个合取项，不构成第二个判空定义。
+
+
