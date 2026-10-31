@@ -409,6 +409,144 @@ def format_holdings_input_mismatch(check: Dict[str, Any], limit: int = 5) -> str
     )
 
 
+# ---------------------------------------------------------------------------
+# Reference-book lifecycle cross-check (D5, 2026-10-29 incident)
+# ---------------------------------------------------------------------------
+# FORENSIC CONTEXT (the bug class, not a style preference):
+#   `diff_holdings_input_vs_prev_post` compares the operator's INPUT book against the
+#   previous round's PLANNED post-trade book.  On 2026-10-29 that comparison reported
+#   `n_mismatched: 0` -- a clean pass -- while the input book carried 600584.SH and
+#   600362.SH, two names the model had ALREADY exited.  The reason is structural: those
+#   phantom 100-share lots had been written into the PLANNED book itself (they survived
+#   every round because the inertia filter never emitted the sell), so the reference and
+#   the input agreed with each other and the differ could not see anything wrong.
+#
+#   The independent witness is `account_state.json`'s lifecycle machine: if the previous
+#   round's `post_holdings.json` claims a positive quantity for a symbol whose lifecycle
+#   state is FLAT / COOLDOWN / PENDING_ENTRY, the REFERENCE is the thing that is wrong
+#   and "no mismatch" must never be reported as a clean pass.
+#
+#   Invariant (asserted by `pipeline/tests/test_live_holdings_input_check.py`):
+#     prev_post[sym] > 0  AND  lifecycle(sym) not a holding state
+#       => sym IS flagged as a phantom reference entry.
+#   Advisory by default (warn + a structured block in `summary.json`); strict mode reuses
+#   `LIVETRADING_STRICT_HOLDINGS_INPUT=1`, which must refuse the deploy.
+PHANTOM_REFERENCE_ENTRY = "PHANTOM_REFERENCE_ENTRY"
+
+#: The states in which a positive broker quantity is EXPECTED.  Mirrors
+#: `common.position_lifecycle.AssetLifecycleState.is_holding` (kept as plain strings
+#: because this module must stay importable without the strategy stack).
+_HOLDING_LIFECYCLE_STATES = frozenset({"HELD_GESTATION", "HELD_ACTIVE", "PENDING_EXIT"})
+
+
+def extract_lifecycle_states(account_state: Any) -> Dict[str, str]:
+    """`{SYMBOL: STATE}` from an `account_state.json` payload.  Pure, no I/O.
+
+    Stage 2 persists the machine under the top-level key `lifecycle_states`; the archived
+    `prior_state` block holds the pre-round copy of the same structure.  Both are read
+    (top-level wins) because a partially-repaired archive may carry only one of them.
+
+    A symbol that is absent from the map is NOT returned as FLAT -- "no recorded state"
+    is not evidence of an exit, and treating it as such would flag every legacy archive
+    that predates the lifecycle machine.  Callers get only real, recorded states.
+    """
+    out: Dict[str, str] = {}
+    if not isinstance(account_state, dict):
+        return out
+    candidates = [account_state.get("lifecycle_states")]
+    prior = account_state.get("prior_state")
+    if isinstance(prior, dict):
+        candidates.append(prior.get("lifecycle_states"))
+    for block in candidates:
+        if not isinstance(block, dict):
+            continue
+        for sym, raw in block.items():
+            key = str(sym or "").strip().upper()
+            if not key or key in out:
+                continue
+            state = raw.get("state") if isinstance(raw, dict) else raw
+            if state is None:
+                continue
+            out[key] = str(state).strip().upper()
+    return out
+
+
+def diff_reference_book_vs_lifecycle(
+    prev_post_holdings: Any,
+    lifecycle_states: Any,
+    warn_code: str = PHANTOM_REFERENCE_ENTRY,
+) -> Dict[str, Any]:
+    """Flag reference-book entries whose lifecycle state says the asset is NOT held.
+
+    Pure function (no filesystem / logging / fastapi) so the D5 invariant is unit-testable
+    offline.  `prev_post[sym] > 0` combined with a recorded non-holding lifecycle state
+    means the reference book itself is stale -- exactly the 2026-10-29 shape where the
+    phantom lot had entered the planned book and `n_mismatched` stayed 0.
+
+    Returns::
+
+        {"phantom_reference": {sym: {"prev_post": n, "lifecycle_state": "FLAT"}},
+         "n_phantom_reference": int,
+         "phantom_reference_warning_code": warn_code,
+         "reference_symbols_without_lifecycle": [sym, ...]}
+
+    Symbols with no recorded lifecycle state are listed (audit only) and never flagged.
+    """
+    reference: Dict[str, float] = {}
+    if isinstance(prev_post_holdings, dict):
+        for key, value in prev_post_holdings.items():
+            sym = str(key or "").strip().upper()
+            if not sym:
+                continue
+            reference[sym] = _holding_share_value(value)
+
+    states = {
+        str(k or "").strip().upper(): str(v or "").strip().upper()
+        for k, v in (lifecycle_states or {}).items()
+    } if isinstance(lifecycle_states, dict) else {}
+
+    phantom: Dict[str, Dict[str, Any]] = {}
+    unknown: List[str] = []
+    for sym, qty in reference.items():
+        if qty <= 0:
+            continue
+        state = states.get(sym)
+        if not state:
+            unknown.append(sym)
+            continue
+        if state not in _HOLDING_LIFECYCLE_STATES:
+            phantom[sym] = {
+                "prev_post": _holding_number(qty),
+                "lifecycle_state": state,
+            }
+
+    return {
+        "phantom_reference": phantom,
+        "n_phantom_reference": len(phantom),
+        "phantom_reference_warning_code": warn_code,
+        "reference_symbols_without_lifecycle": sorted(unknown),
+    }
+
+
+def format_phantom_reference_entries(check: Dict[str, Any], limit: int = 5) -> str:
+    """One readable line for the phantom-reference block ("" when there is nothing)."""
+    phantom = (check or {}).get("phantom_reference") or {}
+    if not phantom:
+        return ""
+    items = list(phantom.items())
+    shown = ", ".join(
+        f"{sym}: prev_post={v.get('prev_post')} lifecycle={v.get('lifecycle_state')}"
+        for sym, v in items[:limit]
+    )
+    if len(items) > limit:
+        shown += f" ... (+{len(items) - limit} more)"
+    return (
+        f"{PHANTOM_REFERENCE_ENTRY}: the previous round's PLANNED book still carries "
+        f"{len(items)} symbol(s) the lifecycle machine says are NOT held; the reference "
+        f"itself is stale, so 'n_mismatched == 0' must not be read as a clean pass -- {shown}"
+    )
+
+
 def parse_ticket_csv(csv_path: str) -> List[Dict[str, Any]]:
     """Parse live_trading_ticket.csv into a structured list of ticket records if JSON is missing."""
     if not os.path.exists(csv_path):
@@ -701,6 +839,9 @@ def _first_defined(*candidates: Tuple[str, Any]) -> Tuple[Any, str]:
 #   have arbitrary mtimes, and a `HHMMSS` name is already a total order within a day.
 _INSTANCE_DIR_RE = re.compile(r"^\d{6}$")
 _RUN_INSTANCE_SPLIT_ENV = "LIVETRADING_RUN_INSTANCE_SPLIT"
+#: D8 (2026-10-29): prefer a real `<date>/<HHMMSS>/` instance's state over a flat
+#: Stage-1-only seed.  Default ON; `=0` restores the pre-fix listing/resolution.
+_PREFER_INSTANCE_STATE_ENV = "LIVETRADING_PREFER_INSTANCE_STATE"
 #: In-process same-second idempotency: candidate dir -> dir.  Bounded (the oldest keys are
 #: dropped) because this is a long-lived web process, not a single-shot script.
 #:
@@ -732,6 +873,20 @@ def run_instance_split_enabled(split: Optional[bool] = None) -> bool:
     return _truthy_env(_RUN_INSTANCE_SPLIT_ENV)
 
 
+def prefer_instance_state_enabled() -> bool:
+    """Whether instance-state resolution outranks a flat Stage-1-only seed (default ON).
+
+    D8 (2026-10-29 incident).  `LIVETRADING_PREFER_INSTANCE_STATE=0` is the documented
+    grey-release escape hatch: it restores the pre-fix behaviour (a flat `<date>/` that
+    merely holds Stage 1's `summary.json` is listed as a run alongside `<date>/<HHMMSS>/`)
+    without touching the archive or any caller.
+    """
+    raw = os.environ.get(_PREFER_INSTANCE_STATE_ENV)
+    if raw is None or str(raw).strip() == "":
+        return True
+    return _truthy_env(_PREFER_INSTANCE_STATE_ENV)
+
+
 def list_instances_for_date(date_dir: Optional[str]) -> List[str]:
     """Run dirs of ONE dated directory, OLD -> NEW (flat layout first, then instances).
 
@@ -756,6 +911,54 @@ def list_instances_for_date(date_dir: Optional[str]) -> List[str]:
         out.append(date_dir)
     out.extend(os.path.join(date_dir, name) for name in instances)
     return out
+
+
+def has_stage2_artifact(path: Optional[str]) -> bool:
+    """True when a run dir carries a Stage-2 order artifact (evidence Stage 2 ran).
+
+    D8 (2026-10-29 incident): the flat `<date>/` directory is the session's FIRST
+    instance, so `summary.json`/`account_state.json` alone cannot tell "a Stage-2 round
+    that happens to have no ticket" apart from "a Stage-1 health-gate seed that never
+    deployed".  Only a ticket / planned-post book proves Stage 2 actually ran there, and
+    that is the discriminator used to keep a Stage-1-only seed from shadowing the real
+    instance's state.
+
+    `holdings.json` is deliberately NOT in this list: Stage 2 writes the PRE-trade input
+    book into the run dir BEFORE launching the child, so it exists during the deploy
+    window and proves nothing about a completed round (this is the same reasoning that
+    keeps `get_previous_post_holdings` from using it as a reference).
+    """
+    if not path:
+        return False
+    try:
+        files = set(os.listdir(path))
+    except OSError:
+        return False
+    return bool(
+        files
+        & {
+            "live_trading_ticket.json",
+            "live_trading_ticket.csv",
+            "netted_trading_ticket.json",
+            "netted_trading_ticket.csv",
+            "post_holdings.json",
+        }
+    )
+
+
+def instance_subdirs(date_dir: Optional[str]) -> List[str]:
+    """Only the `HHMMSS` subdirectories of a dated directory (never the flat dir)."""
+    if not date_dir or not os.path.isdir(date_dir):
+        return []
+    try:
+        names = os.listdir(date_dir)
+    except OSError:
+        return []
+    return sorted(
+        name
+        for name in names
+        if is_instance_dir_name(name) and os.path.isdir(os.path.join(date_dir, name))
+    )
 
 
 def resolve_latest_instance_dir(date_dir: Optional[str]) -> Optional[str]:
@@ -1953,16 +2156,45 @@ class StorageManager:
         silently changing the ticket and breaking the carry-forward chain.  In the old
         flat layout the file simply existed in the (reused) run dir, which is exactly what
         this resolves to on a first-of-day deploy (the same day's Stage-1 state).
+
+        D8 (2026-10-29 incident): per DATE, walk the session's instances newest-first
+        (`list_instances_for_date`, exactly the walk `get_account_state` uses) instead of
+        trusting `list_runs`' row order.  A flat Stage-1-only seed sorts AFTER
+        `<date>/<HHMMSS>/` on paper, but it is a different `os.walk` row with its own
+        (possibly stale) `account_state.json`; resolving the whole date through one
+        ordered instance walk means the seed can only ever be the LAST resort, never the
+        winner.  Legacy flat-only archives are untouched (the walk returns just the flat
+        dir when there are no instance subdirs).
         """
         target = validate_date_str(date_str)
         if not target or not strategy_key or not universe_key:
             return None
+        prefer_instance = prefer_instance_state_enabled()
+        visited_dates: set = set()
         for run in self.list_runs(strategy_key=strategy_key, universe_key=universe_key, require_both=True):
-            if str(run.get("date") or "") > target:
+            run_date = str(run.get("date") or "")
+            if run_date > target:
                 continue
             path = run.get("path")
             if not path:
                 continue
+            if not prefer_instance:
+                state = self._load_json(os.path.join(path, "account_state.json"))
+                if state:
+                    return state
+                continue
+            # One ordered walk per DATE: newest instance first, the flat dir last.
+            key = run_date or path
+            if key in visited_dates:
+                continue
+            visited_dates.add(key)
+            base_dir = os.path.dirname(path) if is_instance_dir_name(os.path.basename(path)) else path
+            for instance_dir in reversed(list_instances_for_date(base_dir) or [path]):
+                state = self._load_json(os.path.join(instance_dir, "account_state.json"))
+                if state:
+                    return state
+            # `base_dir` may be a bare container (`is_run_dir` false) for a matrix-run
+            # subdirectory: read that run dir itself rather than giving up on the date.
             state = self._load_json(os.path.join(path, "account_state.json"))
             if state:
                 return state
@@ -2203,6 +2435,17 @@ class StorageManager:
         `(date, strategy, universe)` (the newest), which is what the UI's history dropdown
         asks for; the default still returns every instance, so nothing is hidden from the
         API.
+
+        D8 (2026-10-29 incident): a flat `<date>/` directory that holds ONLY Stage 1's
+        `summary.json` / `account_state.json` is a SEED, not a round -- and it used to be
+        listed alongside `<date>/<HHMMSS>/`, so its stale pre-deploy `account_state.json`
+        could win the "newest state at-or-before" walk.  It is therefore skipped when the
+        dated directory ALSO owns instance subdirs and carries no Stage-2 artifact
+        (`has_stage2_artifact`, the discriminator: a real first-of-session round keeps its
+        ticket there).  Two layouts must keep working unchanged: the legacy flat-only
+        archive (no instance subdirs -> no skip) and the `PENDING_STAGE2_REUSE_SECONDS`
+        Stage-1 -> Stage-2 hand-off (also no instance subdirs at that moment -> no skip).
+        `LIVETRADING_PREFER_INSTANCE_STATE=0` restores the old listing verbatim.
         """
         if require_both and (not strategy_key or not universe_key):
             return []
@@ -2210,6 +2453,7 @@ class StorageManager:
         if not os.path.exists(self.archive_dir):
             return []
 
+        prefer_instance = prefer_instance_state_enabled()
         runs = []
         custom_universes = self.list_custom_universes()
         # Walk archive_dir to discover run directories (both 3-level and legacy 1-level)
@@ -2222,6 +2466,15 @@ class StorageManager:
                 or "live_trading_ticket.csv" in files
                 or "netted_trading_ticket.csv" in files
             ):
+                # (D8) Stage-1-only flat seed shadowing its own session's real instance.
+                stage1_only_seed = bool(
+                    prefer_instance
+                    and not is_instance_dir_name(os.path.basename(root))
+                    and not has_stage2_artifact(root)
+                    and instance_subdirs(root)
+                )
+                if stage1_only_seed:
+                    continue
                 health_path = os.path.join(root, "stage1_health_report.json")
                 ticket_path = os.path.join(root, "live_trading_ticket.json")
                 if not os.path.exists(ticket_path):

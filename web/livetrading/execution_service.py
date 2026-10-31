@@ -67,10 +67,14 @@ except ImportError:
 
 try:
     from .storage import (
+        PHANTOM_REFERENCE_ENTRY,
         HoldingsInputMismatchError,
         StorageManager,
         diff_holdings_input_vs_prev_post,
+        diff_reference_book_vs_lifecycle,
+        extract_lifecycle_states,
         format_holdings_input_mismatch,
+        format_phantom_reference_entries,
         is_cash_symbol,
         is_instance_dir_name,
         parse_ticket_csv,
@@ -79,10 +83,14 @@ try:
     )
 except (ImportError, ValueError):
     from storage import (
+        PHANTOM_REFERENCE_ENTRY,
         HoldingsInputMismatchError,
         StorageManager,
         diff_holdings_input_vs_prev_post,
+        diff_reference_book_vs_lifecycle,
+        extract_lifecycle_states,
         format_holdings_input_mismatch,
+        format_phantom_reference_entries,
         is_cash_symbol,
         is_instance_dir_name,
         parse_ticket_csv,
@@ -2016,6 +2024,17 @@ class ExecutionService:
         `HoldingsInputMismatchError` BEFORE `save_holdings()` is called, so a refused
         deploy writes no `holdings.json` -- the archive keeps the last operator-confirmed
         book instead of recording a book we just said we do not believe.
+
+        D5 (2026-10-29 incident): the differ above cannot see a defect that sits in the
+        REFERENCE itself.  That day's report said `n_mismatched: 0` -- a clean pass --
+        while the input carried 600584.SH and 600362.SH, two names the model had already
+        exited, because those phantom 100-share lots had been written into the planned book
+        by earlier rounds.  The independent witness is the previous run's
+        `account_state.json` lifecycle machine: `prev_post[sym] > 0` for a symbol whose
+        recorded state is FLAT / COOLDOWN / PENDING_ENTRY means the reference is stale.
+        Those symbols are flagged as `PHANTOM_REFERENCE_ENTRY` (advisory) and `clean_pass`
+        becomes False, so "no mismatch" can never again be reported as a clean pass.  Under
+        strict mode a flagged reference refuses the deploy, same as a mismatch.
         """
         shares_input = {
             sym: value
@@ -2041,12 +2060,51 @@ class ExecutionService:
                 "prev_post_available": False,
                 "prev_post_run_dir": None,
                 "strict": strict_holdings_input_enabled(),
+                "phantom_reference": {},
+                "n_phantom_reference": 0,
+                "phantom_reference_warning_code": PHANTOM_REFERENCE_ENTRY,
+                "reference_symbols_without_lifecycle": [],
+                "prev_post_lifecycle_available": False,
+                "clean_pass": True,
             }
 
         check = diff_holdings_input_vs_prev_post(shares_input, prev_post)
         check["prev_post_available"] = True
         check["prev_post_run_dir"] = prev_run_dir
         check["strict"] = strict_holdings_input_enabled()
+
+        # (D5) Cross-check the REFERENCE book against the previous run's lifecycle state.
+        # `None` prev_run_dir (a legacy reference we could not attribute to a directory)
+        # yields an empty lifecycle map -> nothing flagged, which is the correct
+        # "no evidence" answer rather than a guessed one.
+        prev_state: Dict[str, Any] = {}
+        if prev_run_dir:
+            try:
+                prev_state = self.storage._load_json(
+                    os.path.join(prev_run_dir, "account_state.json"), default={}
+                ) or {}
+            except Exception as exc:  # a broken baseline must not block the deploy
+                logging.warning("[holdings-input-check] 上一轮 account_state 读取失败（忽略）: %s", exc)
+                prev_state = {}
+        prev_lifecycle = extract_lifecycle_states(prev_state)
+        check.update(diff_reference_book_vs_lifecycle(prev_post, prev_lifecycle))
+        check["prev_post_lifecycle_available"] = bool(prev_lifecycle)
+        #: "Nothing to see here" needs BOTH halves: no diff AND no phantom reference.
+        check["clean_pass"] = not (check["n_mismatched"] or check["n_phantom_reference"])
+
+        if check["n_phantom_reference"]:
+            phantom_line = format_phantom_reference_entries(check)
+            logging.warning(
+                "[holdings-input-check] %s (prev planned book: %s)",
+                phantom_line,
+                os.path.basename(os.path.normpath(prev_run_dir)) if prev_run_dir else "?",
+            )
+            if check["strict"]:
+                raise HoldingsInputMismatchError(
+                    "上一轮票面计划持仓本身已失效（生命周期状态显示标的不在持仓中），"
+                    "已按严格模式（LIVETRADING_STRICT_HOLDINGS_INPUT=1）拒绝部署。"
+                    + phantom_line
+                )
 
         if check["n_mismatched"]:
             summary_line = format_holdings_input_mismatch(check)
@@ -2081,6 +2139,9 @@ class ExecutionService:
         allow_intraday: bool = True,
         cash: Optional[float] = None,
         nav_override: bool = False,
+        max_single_position: Optional[float] = None,
+        enforce_mv_cap: bool = False,
+        liquidate_stale_input_lots: bool = False,
     ) -> Dict[str, Any]:
         """Execute Stage 2 Live Deployment.
 
@@ -2089,6 +2150,15 @@ class ExecutionService:
         ``nav_override=True`` means the operator pinned ``portfolio_value`` by hand.
         Both the archived summary and the child's ``--portfolio-value`` are derived from that
         mark, never from the raw form value (see `_resolve_nav`).
+
+        ``max_single_position`` / ``enforce_mv_cap`` / ``liquidate_stale_input_lots`` are the
+        D6/D7 delivery-time guards (2026-10-29 incident).  All three default to the
+        no-order-change behaviour: `None`/`False` means the flags are NOT passed to the
+        child at all, so the next live run cannot change unless somebody asks.  Passing
+        ``max_single_position=0.20`` only sets the CAP the child annotates against; the
+        order-changing part is ``enforce_mv_cap=True`` (CLI `--enforce-mv-cap`).  The
+        child-side env kill-switches (`LIVETRADING_DISABLE_MV_CAP=1`,
+        `LIVETRADING_DISABLE_STALE_LOT_LIQUIDATION=1`) win over these flags.
         """
         provider = data_provider or self.storage.default_data_provider or "marketdb"
         strat_key, univ_key, strat_name, univ_name = self.storage.resolve_keys(
@@ -2231,6 +2301,17 @@ class ExecutionService:
             cmd.append("--allow-intraday")
         else:
             cmd.append("--no-allow-intraday")
+        # (D7, 2026-10-29 incident) Delivery-time market-value cap. The child clamps ONLY
+        # when `--enforce-mv-cap` is present; the cap VALUE alone is warn-only, so passing
+        # it here cannot change an order by itself.
+        if max_single_position is not None and max_single_position > 0:
+            cmd.extend(["--max-single-position", str(max_single_position)])
+        if enforce_mv_cap:
+            cmd.append("--enforce-mv-cap")
+        # (D6, 2026-10-29 incident) Residual-lot liquidation is opt-in: without this flag
+        # the child only annotates + warns on a stale input lot.
+        if liquidate_stale_input_lots:
+            cmd.append("--liquidate-stale-input-lots")
 
         print(f"[ExecutionService] Running Stage 2 Live Deployment: {' '.join(cmd)}")
         proc = subprocess.run(

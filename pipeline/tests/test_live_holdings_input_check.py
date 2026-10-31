@@ -358,7 +358,8 @@ def test_previous_post_holdings_none_on_a_first_run(temp_storage, tmp_path):
 # was inert on exactly the deployment mode that produced the 2026-10-27 stale book.
 
 
-def _make_matrix_run(archive_dir, date_str, matrix_id, ticket=None, post=None, holdings=None):
+def _make_matrix_run(archive_dir, date_str, matrix_id, ticket=None, post=None, holdings=None,
+                     account_state=None):
     run_dir = os.path.join(archive_dir, date_str, f"multi_netted_{matrix_id}")
     os.makedirs(run_dir, exist_ok=True)
     with open(os.path.join(run_dir, "summary.json"), "w", encoding="utf-8") as f:
@@ -372,6 +373,9 @@ def _make_matrix_run(archive_dir, date_str, matrix_id, ticket=None, post=None, h
     if holdings is not None:
         with open(os.path.join(run_dir, "holdings.json"), "w", encoding="utf-8") as f:
             json.dump(holdings, f)
+    if account_state is not None:
+        with open(os.path.join(run_dir, "account_state.json"), "w", encoding="utf-8") as f:
+            json.dump(account_state, f)
     return run_dir
 
 
@@ -643,3 +647,294 @@ def test_matrix_deploy_records_the_check_in_response_and_summary(
         summary = json.load(f)
     assert summary["holdings_input_check"]["n_mismatched"] == 3
     assert summary["holdings_input_check"]["prev_post_available"] is True
+
+
+# ---------------------------------------------------------------------------
+# 7. D5 -- the REFERENCE book's own lifecycle cross-check (2026-10-29 incident)
+# ---------------------------------------------------------------------------
+# FORENSIC CONTEXT (why section 6 was not enough)
+# ----------------------------------------------
+# On 2026-10-29 the check above reported `n_mismatched: 0` -- a clean pass -- on a book
+# that still carried 600584.SH and 600362.SH, two names the operator had already SOLD on
+# 10-26.  The differ cannot see it because the defect is in the REFERENCE: those phantom
+# 100-share lots had been written into the PLANNED book by earlier rounds (the ticket
+# carried them as `HOLD_FILTERED / COOLDOWN_BLOCKED` with `target_shares=100`), so the
+# reference and the input agreed with each other.
+#
+# The independent witness is `account_state.json`'s lifecycle machine.  The invariant
+# asserted here is the whole point of D5:
+#
+#     prev_post[sym] > 0  AND  lifecycle(sym) not a holding state
+#       => sym IS flagged as a phantom reference entry
+#       => "n_mismatched == 0" is NOT reported as a clean pass
+#
+# The 2026-10-29 archive proves the shape: `2026-10-29/holdings.json` (and
+# `2026-10-29/215823/holdings.json`) were byte-identical to `2026-10-27/post_holdings.json`,
+# six symbols including both ghosts, while the lifecycle machine had them at FLAT.
+
+#: The incident's book: 4 genuinely held names + the 2 phantom residuals.
+_INCIDENT_BOOK = {
+    "600900.SH": 800,
+    "600660.SH": 400,
+    "000999.SZ": 600,
+    "601728.SH": 5800,
+    "600584.SH": 100,
+    "600362.SH": 100,
+}
+
+_INCIDENT_LIFECYCLE = {
+    "600900.SH": {"symbol": "600900.SH", "state": "HELD_ACTIVE", "held_bars": 6},
+    "600660.SH": {"symbol": "600660.SH", "state": "HELD_ACTIVE", "held_bars": 6},
+    "000999.SZ": {"symbol": "000999.SZ", "state": "HELD_GESTATION", "held_bars": 1},
+    "601728.SH": {"symbol": "601728.SH", "state": "PENDING_EXIT", "held_bars": 9},
+    # Sold on 10-26; the residual lot survived in the input/planned book.
+    "600584.SH": {"symbol": "600584.SH", "state": "FLAT", "held_bars": 0},
+    "600362.SH": {"symbol": "600362.SH", "state": "COOLDOWN", "held_bars": 0},
+}
+
+
+def test_phantom_reference_entry_is_flagged_when_lifecycle_says_flat(
+    service_workspace, monkeypatch
+):
+    """The 10-29 shape: the input EQUALS the planned book, so the differ sees nothing."""
+    monkeypatch.delenv("LIVETRADING_STRICT_HOLDINGS_INPUT", raising=False)
+    service, _manager, archive, _bare_storage = service_workspace
+    _make_matrix_run(
+        archive,
+        "2026-10-26",
+        "tri_core_blend",
+        post=_INCIDENT_BOOK,
+        account_state={"lifecycle_states": _INCIDENT_LIFECYCLE},
+    )
+
+    check = service._check_holdings_input(
+        dict(_INCIDENT_BOOK),
+        val_date="2026-10-29",
+        strategy_key=None,
+        universe_key=None,
+        matrix_id="tri_core_blend",
+    )
+
+    # The differ itself is unchanged: identical books, no mismatch...
+    assert check["n_mismatched"] == 0
+    # ...and that must NOT be reported as a clean pass.
+    assert check["clean_pass"] is False
+    assert check["prev_post_lifecycle_available"] is True
+    assert check["phantom_reference_warning_code"] == storage.PHANTOM_REFERENCE_ENTRY
+    assert check["n_phantom_reference"] == 2
+    assert set(check["phantom_reference"]) == {"600584.SH", "600362.SH"}
+    assert check["phantom_reference"]["600584.SH"] == {
+        "prev_post": 100,
+        "lifecycle_state": "FLAT",
+    }
+    assert check["phantom_reference"]["600362.SH"]["lifecycle_state"] == "COOLDOWN"
+
+
+def test_clean_pass_requires_no_mismatch_and_no_phantom_reference(
+    service_workspace, monkeypatch
+):
+    """A genuinely consistent round still reports a clean pass."""
+    monkeypatch.delenv("LIVETRADING_STRICT_HOLDINGS_INPUT", raising=False)
+    service, _manager, archive, _bare_storage = service_workspace
+    clean_book = {"600900.SH": 800, "000999.SZ": 600}
+    _make_matrix_run(
+        archive,
+        "2026-10-26",
+        "tri_core_blend",
+        post=clean_book,
+        account_state={
+            "lifecycle_states": {
+                "600900.SH": {"symbol": "600900.SH", "state": "HELD_ACTIVE"},
+                "000999.SZ": {"symbol": "000999.SZ", "state": "HELD_GESTATION"},
+            }
+        },
+    )
+    check = service._check_holdings_input(
+        dict(clean_book), val_date="2026-10-29", strategy_key=None, universe_key=None,
+        matrix_id="tri_core_blend",
+    )
+    assert check["n_mismatched"] == 0
+    assert check["n_phantom_reference"] == 0
+    assert check["clean_pass"] is True
+
+
+@pytest.mark.parametrize("state", ["HELD_GESTATION", "HELD_ACTIVE", "PENDING_EXIT"])
+def test_holding_lifecycle_states_are_never_flagged(service_workspace, monkeypatch, state):
+    monkeypatch.delenv("LIVETRADING_STRICT_HOLDINGS_INPUT", raising=False)
+    service, _manager, archive, _bare_storage = service_workspace
+    book = {"600900.SH": 800}
+    _make_matrix_run(
+        archive,
+        "2026-10-26",
+        "tri_core_blend",
+        post=book,
+        account_state={"lifecycle_states": {"600900.SH": {"symbol": "600900.SH", "state": state}}},
+    )
+    check = service._check_holdings_input(
+        dict(book), val_date="2026-10-29", strategy_key=None, universe_key=None,
+        matrix_id="tri_core_blend",
+    )
+    assert check["n_phantom_reference"] == 0
+    assert check["clean_pass"] is True
+
+
+@pytest.mark.parametrize("state", ["FLAT", "COOLDOWN", "PENDING_ENTRY"])
+def test_non_holding_lifecycle_states_are_flagged(state):
+    """The pure invariant, independent of any archive layout."""
+    out = storage.diff_reference_book_vs_lifecycle(
+        {"600584.SH": 100, "600900.SH": 800},
+        {"600584.SH": state, "600900.SH": "HELD_ACTIVE"},
+    )
+    assert out["n_phantom_reference"] == 1
+    assert out["phantom_reference"] == {"600584.SH": {"prev_post": 100, "lifecycle_state": state}}
+    assert out["reference_symbols_without_lifecycle"] == []
+
+
+def test_reference_symbol_without_a_lifecycle_entry_is_audited_not_flagged():
+    """No recorded state is not evidence of an exit (legacy archives predate the machine).
+
+    The symbol is surfaced in `reference_symbols_without_lifecycle` so the gap is visible,
+    but it must not flip a deploy into "phantom reference" on its own.
+    """
+    out = storage.diff_reference_book_vs_lifecycle(
+        {"600900.SH": 800, "601728.SH": 5800}, {"600900.SH": "HELD_ACTIVE"}
+    )
+    assert out["n_phantom_reference"] == 0
+    assert out["reference_symbols_without_lifecycle"] == ["601728.SH"]
+
+
+def test_zero_and_cash_entries_are_not_phantom_candidates():
+    out = storage.diff_reference_book_vs_lifecycle(
+        {"600900.SH": 0, "600584.SH": 100, "BIL": 0}, {"600900.SH": "FLAT", "600584.SH": "FLAT"}
+    )
+    assert list(out["phantom_reference"]) == ["600584.SH"]
+
+
+def test_lifecycle_reader_accepts_the_prior_state_block_and_lowercase():
+    states = storage.extract_lifecycle_states(
+        {"prior_state": {"lifecycle_states": {" 600584.sh ": {"state": "flat"}}}}
+    )
+    assert states == {"600584.SH": "FLAT"}
+
+
+def test_previous_run_without_lifecycle_states_keeps_the_old_behaviour(
+    service_workspace, monkeypatch
+):
+    """A pre-lifecycle (`1.x`) archive: nothing recorded -> nothing flagged."""
+    monkeypatch.delenv("LIVETRADING_STRICT_HOLDINGS_INPUT", raising=False)
+    service, _manager, archive, _bare_storage = service_workspace
+    _make_matrix_run(archive, "2026-10-26", "tri_core_blend", post=_INCIDENT_BOOK)
+    check = service._check_holdings_input(
+        dict(_INCIDENT_BOOK), val_date="2026-10-29", strategy_key=None, universe_key=None,
+        matrix_id="tri_core_blend",
+    )
+    assert check["prev_post_lifecycle_available"] is False
+    assert check["n_phantom_reference"] == 0
+    assert check["clean_pass"] is True
+
+
+def test_phantom_reference_is_also_checked_on_the_per_strategy_chain(
+    service_workspace, monkeypatch
+):
+    """Non-matrix deploys go through `get_previous_post_holdings` -- same cross-check."""
+    monkeypatch.delenv("LIVETRADING_STRICT_HOLDINGS_INPUT", raising=False)
+    service, _manager, archive, _bare_storage = service_workspace
+    run_dir = os.path.join(archive, "strat_x", "univ_y", "2026-10-26")
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump({"date": "2026-10-26", "strategy_key": "strat_x", "universe_key": "univ_y"}, f)
+    with open(os.path.join(run_dir, "post_holdings.json"), "w", encoding="utf-8") as f:
+        json.dump(_INCIDENT_BOOK, f)
+    with open(os.path.join(run_dir, "account_state.json"), "w", encoding="utf-8") as f:
+        json.dump({"lifecycle_states": _INCIDENT_LIFECYCLE}, f)
+
+    check = service._check_holdings_input(
+        dict(_INCIDENT_BOOK), val_date="2026-10-29", strategy_key="strat_x", universe_key="univ_y"
+    )
+    assert check["prev_post_run_dir"] == run_dir
+    assert check["n_mismatched"] == 0
+    assert check["n_phantom_reference"] == 2
+    assert check["clean_pass"] is False
+
+
+def test_strict_mode_refuses_a_phantom_reference(service_workspace, monkeypatch):
+    """Strict mode must ABORT on a stale REFERENCE, not merely report it."""
+    import subprocess
+
+    monkeypatch.setenv("LIVETRADING_STRICT_HOLDINGS_INPUT", "1")
+    service, manager, archive, bare_storage = service_workspace
+    _make_matrix_run(
+        archive,
+        "2026-10-26",
+        "tri_core_blend",
+        post=_INCIDENT_BOOK,
+        account_state={"lifecycle_states": _INCIDENT_LIFECYCLE},
+    )
+
+    called = []
+
+    def _fail_if_called(cmd, *a, **kw):  # pragma: no cover - must never run
+        called.append(cmd)
+        raise AssertionError("subprocess must not be launched when strict mode refuses")
+
+    monkeypatch.setattr(subprocess, "run", _fail_if_called)
+
+    with pytest.raises(bare_storage.HoldingsInputMismatchError):
+        service.run_multi_strategy_netted_deploy(
+            matrix_id="tri_core_blend",
+            custom_symbols=["600900.SH"],
+            as_of_date="2026-10-29",
+            current_holdings=dict(_INCIDENT_BOOK),
+            data_provider="synthetic",
+        )
+    assert called == []
+    run_dir = manager.get_multi_netting_run_dir("tri_core_blend", "2026-10-29")
+    assert not os.path.exists(os.path.join(run_dir, "holdings.json"))
+
+
+def test_phantom_reference_lands_in_the_summary(service_workspace, monkeypatch):
+    """Forensics: `summary.json` must carry the phantom block even in warn-only mode."""
+    import subprocess
+
+    monkeypatch.delenv("LIVETRADING_STRICT_HOLDINGS_INPUT", raising=False)
+    service, manager, archive, _bare_storage = service_workspace
+    _make_matrix_run(
+        archive,
+        "2026-10-26",
+        "tri_core_blend",
+        post=_INCIDENT_BOOK,
+        account_state={"lifecycle_states": _INCIDENT_LIFECYCLE},
+    )
+
+    def _fake_run(cmd, *a, **kw):
+        out_dir = cmd[cmd.index("--output-dir") + 1]
+        with open(os.path.join(out_dir, "netted_trading_ticket.json"), "w", encoding="utf-8") as f:
+            json.dump([{"symbol": "600900.SH", "action": "BUY", "target_shares": 800}], f)
+
+        class _Proc:
+            returncode = 0
+            stdout = "ok"
+            stderr = ""
+
+        return _Proc()
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    result = service.run_multi_strategy_netted_deploy(
+        matrix_id="tri_core_blend",
+        custom_symbols=["600900.SH"],
+        as_of_date="2026-10-29",
+        current_holdings=dict(_INCIDENT_BOOK),
+        data_provider="synthetic",
+    )
+
+    assert result["status"] == "success"
+    assert result["holdings_input_check"]["n_phantom_reference"] == 2
+    assert result["holdings_input_check"]["clean_pass"] is False
+
+    run_dir = manager.get_multi_netting_run_dir("tri_core_blend", "2026-10-29")
+    with open(os.path.join(run_dir, "summary.json"), encoding="utf-8") as f:
+        summary = json.load(f)
+    assert summary["holdings_input_check"]["n_phantom_reference"] == 2
+    assert set(summary["holdings_input_check"]["phantom_reference"]) == {"600584.SH", "600362.SH"}
+    assert summary["holdings_input_check"]["clean_pass"] is False
