@@ -1080,6 +1080,44 @@ def parse_args(args: Optional[List[str]] = None):
         help="Minimum target weight threshold for fresh entry (default: inherits trade inertia threshold, e.g. 0.05 / 5%%)",
     )
     parser.add_argument(
+        "--liquidate-stale-input-lots",
+        action="store_true",
+        help=(
+            "(D6, 2026-10-29 incident) ENABLE the residual-lot liquidation order. When the model "
+            "target for a symbol is 0 and its lifecycle state is NOT a holding state "
+            "(FLAT/COOLDOWN/PENDING_ENTRY) while the operator's input book still carries shares, "
+            "the row is a STALE INPUT LOT (600584.SH / 600362.SH kept 100-share residuals after "
+            "being sold out of the model, and the inertia filter -- |drift| 2.49%% < 5%% -- emitted "
+            "HOLD shares:0 forever, so the lot could never be cleared). DEFAULT OFF = warn-only: "
+            "the row is annotated + a loud warning is printed, but NO order is emitted, so this "
+            "flag cannot change the next live run unless somebody asks. "
+            "Kill-switch: LIVETRADING_DISABLE_STALE_LOT_LIQUIDATION=1 disables even when set."
+        ),
+    )
+    parser.add_argument(
+        "--max-single-position",
+        type=float,
+        default=0.20,
+        help=(
+            "(D7, 2026-10-29 incident) Maximum DELIVERED market-value weight per symbol "
+            "(target_shares * price / portfolio_value), default 0.20. The model clamps its raw "
+            "weight, but lot rounding can push the delivered value over the cap (observed 20.28%% "
+            "and 20.01%%). This value alone is WARN-ONLY: rows over the cap are annotated with "
+            "MV_CAP and nothing is changed. Pair it with --enforce-mv-cap to clamp to whole lots. "
+            "Kill-switch: LIVETRADING_DISABLE_MV_CAP=1."
+        ),
+    )
+    parser.add_argument(
+        "--enforce-mv-cap",
+        action="store_true",
+        help=(
+            "(D7) ENABLE the clamp: after lot rounding, a row whose delivered market-value weight "
+            "exceeds --max-single-position is reduced to whole lots at or below the cap "
+            "(delta_shares / trade_value / target_weight recomputed, reason annotated MV_CAP). "
+            "DEFAULT OFF = warn-only, so this cannot change an order unless explicitly asked."
+        ),
+    )
+    parser.add_argument(
         "--volume-breakout-mult",
         type=float,
         default=1.5,
@@ -1429,6 +1467,275 @@ def apply_intraday_distribution_gate(
             scaled_target[s] = cur_w + delta_w * intraday_buy_scale
 
     return scaled_target
+
+
+# --------------------------------------------------------------------------- #
+# (D6/D7, 2026-10-29 live incident) Delivery-time guards on the generated ticket
+# --------------------------------------------------------------------------- #
+# FORENSIC CONTEXT (why these live here, not in the strategy/backtest layer):
+#   Both defects are about what the ORDER TICKET actually delivers, i.e. they are
+#   invisible to the model and to `blend_base.py`:
+#
+#   D6 -- RESIDUAL LOTS.  600584.SH and 600362.SH were sold out of the model, but the
+#   operator's input book kept 100-share residuals.  The lifecycle machine was already
+#   FLAT, and the inertia filter compares |target - current| against 5%: a 2.49%-weight
+#   residual is below it EVERY day, so the row was emitted as `HOLD` with `shares: 0`
+#   forever.  A position the model no longer wants could never be liquidated -- a
+#   phantom holding that every downstream reader (NAV, reconciliations, the holdings
+#   table) then treated as real.
+#
+#   D7 -- DELIVERED MARKET-VALUE CAP.  The 20% single-name cap was enforced on the
+#   model's RAW weight (`blend_base.py`), but lot rounding happens AFTER that, so the
+#   delivered `target_shares * price / portfolio_value` reached 20.28% and 20.01% -- a
+#   silent cap breach that no strategy-side check can see.
+#
+#   PREDICTABILITY RULE FOR BOTH: detection + annotation is unconditional (the condition
+#   can never be silent), but the ORDER-changing half is opt-in and OFF by default, and
+#   an env kill-switch overrides even that.  Nothing here can change the next live run
+#   unless the operator passes the flag.
+STALE_LOT_LIQUIDATION_BADGE = "STALE_LOT_LIQUIDATION"
+MV_CAP_BADGE = "MV_CAP"
+_DISABLE_STALE_LOT_ENV = "LIVETRADING_DISABLE_STALE_LOT_LIQUIDATION"
+_DISABLE_MV_CAP_ENV = "LIVETRADING_DISABLE_MV_CAP"
+#: Reason prefix for an emitted residual-lot sell (kept verbatim: operators grep it).
+STALE_LOT_REASON = "残仓强制清出（已离场标的仍有持股）"
+#: Default single-name delivery cap (mirrors the 20% model-side cap).
+DEFAULT_MAX_SINGLE_POSITION = 0.20
+
+
+def _env_truthy(name: str) -> bool:
+    """True for the repo's usual truthy spellings (`1/true/yes/on/y/t`)."""
+    return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on", "y", "t"}
+
+
+def stale_lot_liquidation_enabled(requested: Optional[bool] = None) -> bool:
+    """Whether a detected stale input lot may produce a SELL (default OFF).
+
+    Two independent gates must both say yes:
+      * `--liquidate-stale-input-lots` (the operator's explicit request), and
+      * `LIVETRADING_DISABLE_STALE_LOT_LIQUIDATION` NOT set (the kill-switch wins).
+    """
+    if _env_truthy(_DISABLE_STALE_LOT_ENV):
+        return False
+    return bool(requested)
+
+
+def mv_cap_enforcement_enabled(requested: Optional[bool] = None) -> bool:
+    """Whether the delivered market-value cap may clamp an order (default OFF).
+
+    Same two-gate shape as `stale_lot_liquidation_enabled`:
+    `--enforce-mv-cap` AND not `LIVETRADING_DISABLE_MV_CAP=1`.
+    """
+    if _env_truthy(_DISABLE_MV_CAP_ENV):
+        return False
+    return bool(requested)
+
+
+def assess_stale_input_lot(
+    *,
+    current_shares: float,
+    model_target: float,
+    is_holding: bool,
+    lifecycle_action: str,
+    enforce: bool = False,
+    price: float = 0.0,
+) -> Dict[str, Any]:
+    """Classify one row as a stale input lot and decide what (if anything) to do.
+
+    INVARIANT (D6): ``current_shares > 0 ∧ model_target == 0 ∧ not is_holding``
+    => ``detected`` is True.  Note `model_target` is the RAW strategy target captured
+    before the lifecycle machine runs: on the inertia path the machine rewrites the
+    target to `state.current_weight` (the residual's own weight), which is precisely why
+    the pre-lifecycle value is the only honest witness of "the model wants none of this".
+
+    SCOPE INVARIANT (review finding 1, required): this helper may ONLY be asked about
+    rows the lifecycle did NOT already decide to liquidate.  The phantom-lot shape is
+    always *"state FLAT/COOLDOWN + a HOLD row"* -- it is never a lifecycle-emitted
+    SELL.  The risk-exit paths in ``common/position_lifecycle.py`` (hard stop / ATR
+    trailing stop / Tier-3 emergency halt / normal exit confirmation) all set
+    ``state = COOLDOWN`` *before* returning the ``SELL``, so after the call
+    ``state.is_holding()`` is False and ``current_shares > 0`` -- shape-identical to a
+    residual lot.  Feeding such a row in here used to append the stale-lot sentence
+    ("惰性阈值会永久挡住清出，未启用 --liquidate-stale-input-lots 故本行不下单") to a row that
+    *does* place an order, and under ``--liquidate-stale-input-lots`` it prefixed the
+    exit reason with `STALE_LOT_REASON`, so anyone grepping the badge to reconcile
+    residual-lot cleanups also matched stop-loss / circuit-breaker exits and real risk
+    events became unsearchable.  ``lifecycle_action`` is therefore REQUIRED and a
+    liquidation event is rejected loudly instead of being silently mislabelled.
+
+    Returns a dict that is BOTH the audit annotation and (when enforced) the order
+    instruction, so the caller cannot annotate one thing and trade another::
+
+        {"detected": bool, "enforced": bool, "badge": "STALE_LOT_LIQUIDATION",
+         "shares": int, "model_target": float,
+         "action": "SELL"|None, "target_shares": int|None, "delta_shares": int|None,
+         "trade_value": float|None, "reason": str|None}
+
+    Detection alone never changes an order: `enforced` is False and `action` is None.
+    """
+    if is_liquidation_event(lifecycle_action):
+        raise ValueError(
+            "assess_stale_input_lot() must never be applied to a row the lifecycle already "
+            f"decided to liquidate (lifecycle_action={lifecycle_action!r}). A lifecycle SELL "
+            "is a real risk event (stop-loss / trailing stop / circuit breaker / confirmed "
+            "exit) and must keep its own reason verbatim; the phantom-lot shape is always a "
+            "HOLD row in a non-holding state. Gate the call site with "
+            "common.position_lifecycle.is_liquidation_event() first."
+        )
+    shares = int(round(float(current_shares or 0.0)))
+    target = float(model_target or 0.0)
+    detected = bool(shares > 0 and not is_holding and target <= 1e-6)
+    enforced = bool(detected and enforce)
+    if not detected:
+        return {
+            "detected": False,
+            "enforced": False,
+            "badge": STALE_LOT_LIQUIDATION_BADGE,
+            "shares": max(0, shares),
+            "model_target": target,
+            "action": None,
+            "target_shares": None,
+            "delta_shares": None,
+            "trade_value": None,
+            "reason": None,
+        }
+    px = float(price or 0.0)
+    if enforced:
+        reason = (
+            f"{STALE_LOT_REASON} [{STALE_LOT_LIQUIDATION_BADGE}: 卖出 {shares} 股"
+            f"（模型目标 0，生命周期非持仓）]"
+        )
+    else:
+        reason = (
+            f"[残仓告警 {STALE_LOT_LIQUIDATION_BADGE}: 输入账本仍有 {shares} 股，"
+            f"而模型目标为 0 且生命周期非持仓；惰性阈值会永久挡住清出，"
+            f"未启用 --liquidate-stale-input-lots 故本行不下单]"
+        )
+    return {
+        "detected": True,
+        "enforced": enforced,
+        "badge": STALE_LOT_LIQUIDATION_BADGE,
+        "shares": shares,
+        "model_target": target,
+        "action": "SELL" if enforced else None,
+        "target_shares": 0 if enforced else None,
+        "delta_shares": -shares if enforced else None,
+        "trade_value": (-shares * px) if enforced else None,
+        "reason": reason,
+    }
+
+
+def market_value_weight(quantity: float, price: float, portfolio_value: float) -> float:
+    """`quantity * price / portfolio_value`, 0.0 when either denominator is unusable."""
+    try:
+        q = float(quantity or 0.0)
+        p = float(price or 0.0)
+        pv = float(portfolio_value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if pv <= 0 or p <= 0:
+        return 0.0
+    return (q * p) / pv
+
+
+def apply_market_value_cap(
+    row: Dict[str, Any],
+    *,
+    portfolio_value: float,
+    max_weight: float = DEFAULT_MAX_SINGLE_POSITION,
+    lot_size: int = 100,
+    enforce: bool = False,
+    tolerance: float = 1e-6,
+) -> Dict[str, Any]:
+    """Flag (and, when enforced, clamp) one ticket row against the DELIVERED MV cap.
+
+    D7 (2026-10-29 incident): `blend_base.py` clamps the model's raw weight, and lot
+    rounding afterwards pushes the delivered `target_shares * price / portfolio_value`
+    over the cap (observed 20.28% / 20.01%).  This is the only place that sees the
+    post-rounding quantity, so the check must live here.
+
+    Behaviour:
+      * ALWAYS (warn-only mode included): compute `mv_weight`, store it in
+        `detail_reason["mv_cap"]`, and append a `MV_CAP` badge to `reason` /
+        `summary_reason` when the cap is breached -- a breach can never be silent;
+      * ONLY with `enforce=True`: for a row that still BUYS (`delta_shares > 0`), reduce
+        the delta to whole lots so the delivered weight is at or below the cap, then
+        recompute `target_shares` / `trade_value` / `target_weight` / `delta_weight`.
+        A row that is already above the cap without trading (a HOLD of legacy drift) is
+        annotated but never sold down here -- this guard is not an exit rule.
+
+    Disclosed limitation: clamping to WHOLE lots means the post-clamp weight is usually
+    slightly BELOW the cap, not exactly at it (e.g. 20.28% -> 17.75% for a 100-share lot
+    at 25.35).  Trading a fractional lot to hit 20.00% exactly is not possible.
+
+    The row is mutated in place AND returned (callers use the return value).
+    """
+    price = float(row.get("price") or 0.0)
+    pv = float(portfolio_value or 0.0)
+    cap = float(max_weight or 0.0)
+    if price <= 0 or pv <= 0 or cap <= 0:
+        return row
+
+    target_shares = float(row.get("target_shares") or 0)
+    current_shares = float(row.get("current_shares") or 0)
+    delta_shares = float(row.get("delta_shares") or 0)
+    mv_before = market_value_weight(target_shares, price, pv)
+    breached = bool(mv_before > cap + tolerance)
+    block: Dict[str, Any] = {
+        "market_value_weight": round(mv_before, 6),
+        "cap": cap,
+        "breached": breached,
+        "enforced": False,
+        "clamped": False,
+    }
+    detail = row.get("detail_reason")
+    if isinstance(detail, dict):
+        detail["mv_cap"] = block
+
+    if not breached:
+        return row
+
+    clamped = False
+    if enforce and delta_shares > 0:
+        lot = max(1, int(lot_size or 1))
+        # Whole-lot ceiling for the TOTAL target quantity at the cap.
+        cap_shares = np.floor((cap * pv) / price / lot) * lot
+        allowed_delta = np.floor((cap_shares - current_shares) / lot) * lot
+        new_delta = int(max(0, allowed_delta))
+        if new_delta < int(delta_shares):
+            row["delta_shares"] = new_delta
+            row["shares"] = abs(new_delta)
+            row["target_shares"] = int(round(current_shares + new_delta))
+            row["trade_value"] = new_delta * price
+            row["trade_value_rmb"] = row["trade_value"]
+            row["target_weight"] = market_value_weight(row["target_shares"], price, pv)
+            row["delta_weight"] = row["target_weight"] - float(row.get("current_weight") or 0.0)
+            clamped = True
+            block["pre_clamp_market_value_weight"] = round(mv_before, 6)
+            block["post_clamp_market_value_weight"] = round(row["target_weight"], 6)
+            block["clamped_delta_shares"] = new_delta
+            if isinstance(detail, dict):
+                if isinstance(detail.get("lot_rounding"), dict):
+                    detail["lot_rounding"]["shares"] = new_delta
+                if isinstance(detail.get("inertia_check"), dict):
+                    detail["inertia_check"]["delta_weight"] = round(row["delta_weight"], 4)
+
+    block["clamped"] = clamped
+    block["enforced"] = bool(enforce)
+    if clamped:
+        _cap_tail = f"，已按整手回收至 {block['post_clamp_market_value_weight']:.2%}"
+    elif enforce:
+        _cap_tail = "，本行无买入增量可回收（非加仓），仅标注"
+    else:
+        _cap_tail = "，未启用 --enforce-mv-cap 故不改单"
+    badge_note = (
+        f"[市值权重超限 {MV_CAP_BADGE}: 交付市值权重 {mv_before:.2%} > 上限 {cap:.2%}{_cap_tail}]"
+    )
+    for key in ("reason", "summary_reason"):
+        text = str(row.get(key) or "")
+        if MV_CAP_BADGE not in text:
+            row[key] = f"{text} {badge_note}".strip()
+    return row
 
 
 def main(cli_args: Optional[List[str]] = None):
@@ -2015,6 +2322,8 @@ def main(cli_args: Optional[List[str]] = None):
         is_circuit_halt = ((circuit_tier == "TIER_3_HALT" or freeze_rem > 0) and not is_recovering)
         bars_since_exit = exit_cooldown.get(sym, account_state.get("exit_bars_ago", {}).get(sym, 999))
         reentry_cooldown_bars = getattr(args, "reentry_cooldown_bars", 2)
+        #: (D6) Stale-input-lot verdict for THIS row (None for the cash leg / a clean row).
+        stale_input_lot: Optional[Dict[str, Any]] = None
 
         if sym == cash_proxy:
             action = "SWEEP_CASH" if delta_w > 0 else "RELEASE_CASH"
@@ -2113,6 +2422,19 @@ def main(cli_args: Optional[List[str]] = None):
                 state.peak_price = 0.0
                 state.entry_streak = 0
                 state.exit_streak = 0
+
+            # (D6, 2026-10-29 incident) The MIRROR of the reconciliation above, and the
+            # one that was missing: the lifecycle machine says the asset is gone (FLAT)
+            # while the broker/input book still shows a positive weight.  That is exactly
+            # the 600584.SH / 600362.SH residual lot, and it used to pass in silence --
+            # the row then looked like a legitimate `HOLD` and no reconciliation, NAV or
+            # ticket reader had a reason to complain.  Warn loudly, unconditionally.
+            if cur_w > 1e-6 and state.state == PositionState.FLAT:
+                print(
+                    f"[WARN/账户不一致] {sym}: 生命周期状态=FLAT 但券商权重仍为正 "
+                    f"(broker_weight={cur_w:.4%}, current_shares={current_shares}); "
+                    f"疑似离场后残仓，请核对账本。"
+                )
 
             decision = step_position_lifecycle(
                 state=state,
@@ -2241,6 +2563,74 @@ def main(cli_args: Optional[List[str]] = None):
                 reason = f"{lock_reason} | 原信号: {reason}" if reason and reason != lock_reason else lock_reason
 
             updated_lifecycle_states[sym] = state.to_dict()
+
+            # (D6, 2026-10-29 incident) STALE-INPUT-LOT guard.  600584.SH / 600362.SH were
+            # sold out of the model but kept 100-share residuals in the operator's input
+            # book.  The lifecycle machine was already FLAT, and the inertia filter compares
+            # the target against the residual's OWN weight (2.49% < 5%), so the row was
+            # emitted as `HOLD` with `shares: 0` every single day and the lot could never be
+            # liquidated: a position the model no longer wants, permanently stuck in the
+            # book.  Detection + annotation is unconditional; the SELL itself needs
+            # `--liquidate-stale-input-lots` (and survives the
+            # `LIVETRADING_DISABLE_STALE_LOT_LIQUIDATION=1` kill-switch), so the default
+            # behaviour cannot change a single order.
+            #
+            # `raw_tgt_w` (the pre-lifecycle model target) is the witness, NOT `tgt_w`: on
+            # the inertia path the lifecycle machine rewrote `tgt_w` to `state.current_weight`,
+            # which is the residual's own weight and therefore hides the fact that the model
+            # asked for zero.
+            #
+            # (2026-10-29 review, finding 1) SCOPE GATE: only rows the lifecycle did NOT
+            # already decide to liquidate may be assessed. The risk-exit paths in
+            # `common/position_lifecycle.py` (hard stop / ATR trailing stop / Tier-3
+            # emergency halt / confirmed normal exit) all move the state to COOLDOWN
+            # BEFORE returning the SELL, i.e. `state.is_holding()` is False and
+            # `current_shares > 0` after the call -- shape-identical to a residual lot.
+            # Without this gate the guard appended "本行不下单" to a row that DOES place an
+            # order, and under `--liquidate-stale-input-lots` it rewrote the exit reason to
+            # `STALE_LOT_REASON | 原信号: <stop-loss/circuit-breaker>`, so grepping the
+            # badge for residual-lot cleanups also matched real risk events.
+            # Both the machine's own verdict (`decision.action`) and the effective row
+            # action are consulted: any later gate (tenure lock) that downgrades a SELL
+            # cannot resurrect the annotation either.
+            lifecycle_liquidates = is_liquidation_event(
+                decision.action
+            ) or is_liquidation_event(action)
+            if not lifecycle_liquidates:
+                stale_input_lot = assess_stale_input_lot(
+                    current_shares=current_shares,
+                    model_target=raw_tgt_w,
+                    is_holding=state.is_holding(),
+                    lifecycle_action=action,
+                    enforce=stale_lot_liquidation_enabled(
+                        getattr(args, "liquidate_stale_input_lots", False)
+                    ),
+                    price=price,
+                )
+            if stale_input_lot and stale_input_lot["detected"]:
+                mode = "已启用强制清出" if stale_input_lot["enforced"] else "告警模式（未启用 --liquidate-stale-input-lots，本行不下单）"
+                print(
+                    f"[WARN/残仓] {sym}: 模型目标为 0 且生命周期状态={state.state.value}，"
+                    f"但输入账本仍有 {current_shares} 股残仓；惰性阈值不会清出它。{mode}"
+                )
+                if stale_input_lot["enforced"]:
+                    # A real liquidation is never labelled as blocked (L2.24): the row's
+                    # structured verdict must be NONE, exactly like the lot-rounding
+                    # liquidation path below.
+                    action = "SELL"
+                    tgt_w = 0.0
+                    delta_w = -cur_w
+                    abs_delta = abs(delta_w)
+                    reason = (
+                        f"{stale_input_lot['reason']} | 原信号: {reason}"
+                        if reason and reason != stale_input_lot["reason"]
+                        else stale_input_lot["reason"]
+                    )
+                    blocking_reason = BlockingReason.NONE
+                else:
+                    # Warn-only: keep the row exactly as the gates decided it, but make the
+                    # condition impossible to miss in the printed/CSV ticket.
+                    reason = f"{reason} {stale_input_lot['reason']}".strip() if reason else stale_input_lot["reason"]
 
         # Determine board price limits and 5m microstructure indicators (R10 & R11)
         sym_name = symbol_names.get(sym, sym)
@@ -2534,6 +2924,18 @@ def main(cli_args: Optional[List[str]] = None):
         if fast_path_badge:
             detail_reason["fast_path_badge"] = fast_path_badge
             detail_reason["fast_path_triggered"] = decision.fast_path_triggered
+        # (D6, 2026-10-29 incident) The structured half of the residual-lot annotation: a
+        # reader that only keeps `detail_reason` (audit tooling, the UI's row inspector)
+        # must still be able to tell "warned but not enforced" from "sold it".
+        if stale_input_lot and stale_input_lot.get("detected"):
+            detail_reason["stale_input_lot"] = {
+                "detected": True,
+                "enforced": bool(stale_input_lot.get("enforced")),
+                "shares": stale_input_lot.get("shares"),
+                "model_target_weight": round(float(stale_input_lot.get("model_target") or 0.0), 6),
+                "lifecycle_state": state.state.value if sym != cash_proxy else None,
+                "badge": STALE_LOT_LIQUIDATION_BADGE,
+            }
 
         sym_name = symbol_names.get(sym, sym)
         if is_placeholder_stock_name(sym_name, sym):
@@ -2614,6 +3016,36 @@ def main(cli_args: Optional[List[str]] = None):
                         r["detail_reason"]["lot_rounding"]["target_shares_raw"] = round(scaled_val / r["price"], 2)
                     if "inertia_check" in r["detail_reason"]:
                         r["detail_reason"]["inertia_check"]["delta_weight"] = round(r["delta_weight"], 4)
+
+    # (D7, 2026-10-29 incident) DELIVERED market-value cap, evaluated AFTER lot rounding
+    # (including the purchasing-power rescale above, which re-rounds every BUY).  The
+    # model's 20% clamp in `blend_base.py` works on the RAW weight, so the quantity that
+    # actually reaches the ticket could still deliver 20.28% / 20.01% of NAV.  Warn-only
+    # by default: every breach is annotated (MV_CAP) and printed, but an order is only
+    # changed under `--enforce-mv-cap` (and never when
+    # `LIVETRADING_DISABLE_MV_CAP=1`).  `--max-single-position` is the cap value.
+    mv_cap = float(getattr(args, "max_single_position", DEFAULT_MAX_SINGLE_POSITION) or DEFAULT_MAX_SINGLE_POSITION)
+    mv_cap_enforced = mv_cap_enforcement_enabled(getattr(args, "enforce_mv_cap", False))
+    for r in rows:
+        if r["symbol"] == cash_proxy:
+            continue
+        apply_market_value_cap(
+            r,
+            portfolio_value=args.portfolio_value,
+            max_weight=mv_cap,
+            lot_size=resolve_lot_size(r["symbol"], args.lot_size),
+            enforce=mv_cap_enforced,
+        )
+        _mv_block = (r.get("detail_reason") or {}).get("mv_cap") or {}
+        if _mv_block.get("breached"):
+            if _mv_block.get("clamped"):
+                _tail = f"，已按整手回收至 {_mv_block.get('post_clamp_market_value_weight'):.2%}"
+            else:
+                _tail = "，未启用 --enforce-mv-cap 故不改单"
+            print(
+                f"[WARN/市值上限] {r['symbol']}: 交付市值权重 "
+                f"{_mv_block.get('market_value_weight'):.2%} > 上限 {mv_cap:.2%}{_tail}"
+            )
 
     order_df = pd.DataFrame(rows)
 
