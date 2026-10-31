@@ -242,6 +242,11 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
                 # unreachable over HTTP: a client submitting `confirm_empty_book: true`
                 # was still refused by `EmptyBookConfirmationRequiredError`.
                 confirm_empty_book=payload.confirm_empty_book,
+                # Same silent-drop hazard (ITEM 1, 2026-10-30): `edited` is the ONLY way a
+                # client can state that a non-empty book identical to this date's plan was
+                # verified, so dropping it here would make `UnconfirmedPlanAsInputError`
+                # unavoidable over HTTP.
+                edited=payload.edited,
                 data_provider=payload.data_provider,
                 lot_size=payload.lot_size,
                 strategy_key=payload.strategy_key,
@@ -291,6 +296,9 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
                 # refuses an unconfirmed empty matrix book, so without this line an
                 # operator-confirmed all-cash deploy could never get past the route.
                 confirm_empty_book=payload.confirm_empty_book,
+                # (ITEM 1) ... and the same for `edited`: without it the unedited-plan gate
+                # would be unavoidable over HTTP.
+                edited=payload.edited,
                 data_provider=payload.data_provider,
                 min_holding_bars=payload.min_holding_bars,
                 inertia_threshold=payload.inertia_threshold,

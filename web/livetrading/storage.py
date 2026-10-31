@@ -283,6 +283,27 @@ def universe_key_from_path(path: Optional[str], universe_dir: Optional[str]) -> 
 _SAFE_KEY_RE = re.compile(r"[^A-Za-z0-9_\-\u4e00-\u9fa5]+")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+#: (2026-10-30, ITEM 2) Sidecar written NEXT TO `holdings.json` by a MANUAL save, recording
+#: that a HUMAN asserted this book (`save_holdings`'s only non-deploy caller, `/api/holdings`).
+#: Why a separate file instead of a flag inside `holdings.json`: `holdings.json` has TWO
+#: writers with different meanings -- the operator's hand-entered book AND the Stage-2 deploy
+#: persisting its own PRE-trade seed (`run_live_deploy` -> `save_holdings(run_dir=...)`).  A
+#: completed round's `holdings.json` therefore proves nothing about what is held (that is the
+#: 2026-10-29 ghost-lot defect), so "a human said so" needs its own file.  A manual save is
+#: the ONLY record of a PARTIAL FILL (the system has no broker fill receipt), so this sidecar
+#: deliberately OUTRANKS the round's planned post book in both the display and the seed.
+#:
+#: INVARIANT: a deploy-path `save_holdings` call always pins `run_dir`, and MUST NOT write
+#: this file -- marking an automated pre-trade seed as "a human asserted this" would restore
+#: exactly the ghost book the display rule exists to hide.
+OPERATOR_HOLDINGS_FILENAME = "operator_holdings.json"
+
+#: Source label for a book that came from `OPERATOR_HOLDINGS_FILENAME`.  Legal values of
+#: `bundle["holdings_source"]` are now exactly `{operator_manual_correction, post_trade_book,
+#: pre_trade_fallback, snapshot}`; `resolve_seed_holdings` adds it to its own legal set too
+#: (`operator_snapshot` / `previous_post_holdings` / `none`).
+OPERATOR_MANUAL_CORRECTION_SOURCE = "operator_manual_correction"
+
 # Ticket/cash names that never denote a real share position. BIL is included deliberately: the
 # Stage 2 runner (`resolve_holdings_weights_and_shares` in scripts/run_live_strategy.py)
 # treats BIL/CASH/<cash_proxy> as the IMPLIED cash residual (NAV - equity value), never as a
@@ -1789,20 +1810,87 @@ class StorageManager:
                 return data
         return None
 
+    def _operator_correction_from_dir(
+        self, run_dir: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """The book a HUMAN asserted in `run_dir/operator_holdings.json`, or None.
+
+        `save_holdings` writes that sidecar on a MANUAL save only (see
+        `OPERATOR_HOLDINGS_FILENAME`), so its presence is the one signal that "a person
+        checked this against broker fills" -- never a deploy-path seed write.  Returns the
+        inner `holdings` mapping, NOT the envelope, so callers get a book in the same shape
+        as `holdings.json` / `post_holdings.json`.
+        """
+        if not run_dir or not os.path.isdir(run_dir):
+            return None
+        data = self._load_json(
+            os.path.join(run_dir, OPERATOR_HOLDINGS_FILENAME), default=None
+        )
+        if not isinstance(data, dict):
+            return None
+        holdings = data.get("holdings")
+        return holdings if isinstance(holdings, dict) else None
+
+    def _operator_correction_for_run_dir(
+        self, run_dir: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """The session's operator correction: `run_dir` itself, then instance dirs newest-first.
+
+        `save_holdings` with no `run_dir` (a manual save from `/api/holdings`) lands in the
+        session's FLAT `<date>/` directory, while the UI/`get_run` usually asks about the
+        newest `<date>/<HHMMSS>/` instance -- so the walk has to cover the whole session, not
+        just the dir handed in.  When `run_dir` IS an instance dir, its parent `<date>/` is
+        the base of that session; when it is the flat dir, the parent is the date dir itself.
+        """
+        if not run_dir:
+            return None
+        book = self._operator_correction_from_dir(run_dir)
+        if book is not None:
+            return book
+
+        base_dir = (
+            os.path.dirname(os.path.abspath(run_dir))
+            if is_instance_dir_name(os.path.basename(run_dir))
+            else run_dir
+        )
+        if not base_dir or not os.path.isdir(base_dir):
+            return None
+        candidates = list(reversed(list_instances_for_date(base_dir)))
+        if base_dir not in candidates:
+            candidates.append(base_dir)
+        for candidate in candidates:
+            if os.path.abspath(candidate) == os.path.abspath(run_dir):
+                continue
+            book = self._operator_correction_from_dir(candidate)
+            if book is not None:
+                return book
+        return None
+
     def _display_book_for_run_dir(
         self, run_dir: Optional[str]
     ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         """The book a run dir should DISPLAY, plus a label saying which kind of book it is.
 
-        THE RULE (one rule, one place): when a run dir carries a Stage-2 artifact
-        (`has_stage2_artifact`: a ticket or `post_holdings.json`), its displayed book is
-        that dir's PLANNED POST book (`_planned_book_from_run_dir`: `post_holdings.json`,
-        else re-derived from the ticket's `target_shares` -- for EITHER ticket family,
-        `live_trading_ticket.*` or `netted_trading_ticket.*`) -- NEVER its `holdings.json`.
-        Only a dir that never ran Stage 2 shows its snapshot, because there the snapshot
-        is genuinely the operator's book (`save_holdings`).
+        THE RULE (one rule, one place), in rank order:
+          1. an operator's own MANUAL correction for this session
+             (`operator_holdings.json`, see `_operator_correction_for_run_dir`);
+          2. else, when the run dir carries a Stage-2 artifact (`has_stage2_artifact`: a
+             ticket or `post_holdings.json`), its PLANNED POST book
+             (`_planned_book_from_run_dir`: `post_holdings.json`, else re-derived from the
+             ticket's `target_shares` -- for EITHER ticket family,
+             `live_trading_ticket.*` or `netted_trading_ticket.*`) -- NEVER its
+             `holdings.json`;
+          3. else a dir that never ran Stage 2 shows its snapshot, because there the
+             snapshot is genuinely the operator's book (`save_holdings`).
+        A Stage-2 dir whose plan cannot be resolved (an old ticket carrying only
+        `current_shares`) is the caller-visible `pre_trade_fallback` arm below.
 
-        Why (2026-10-29 evidence, deliberately preserved): the live archive's
+        Why rank 1 (2026-10-30, ITEM 2): a same-day manual save is the ONLY record of a
+        PARTIAL FILL -- the system has no broker fill receipt.  The plan assumes every row
+        filled exactly as instructed, so displaying it would hide the difference between
+        what was ordered and what actually filled.  The operator's assertion wins.
+        Why the plan outranks `holdings.json` (2026-10-29 evidence, deliberately preserved):
+        the live archive's
         `chan_four_state_blend/custom_astock_202609_20_new/2026-10-29/holdings.json` and
         `.../2026-10-29/215823/holdings.json` are the round's PRE-trade input and still
         claim `600584.SH: 100` + `600362.SH: 100` -- lots that were sold and filled on
@@ -1814,10 +1902,14 @@ class StorageManager:
         what is held -- the same reasoning that keeps `resolve_seed_holdings` and
         `get_previous_post_holdings` off it.
 
-        DISPLAY ONLY.  This helper is never consulted by `resolve_seed_holdings`, so seed
-        resolution (and therefore order sizing) is byte-for-byte unchanged.
+        DISPLAY vs SEED are separate functions on purpose: `resolve_seed_holdings` does NOT
+        delegate here (it has its own precedence and its own label vocabulary), so a display
+        change cannot silently move order sizing.  Both DO read the operator sidecar, each
+        through `_operator_correction_for_run_dir`.
 
         Returns `(book, source)` with `source` one of EXACTLY:
+          * `"operator_manual_correction"` -- a human asserted this book for the session
+            (`operator_holdings.json`);
           * `"post_trade_book"` -- Stage-2 artifact present and its plan resolved;
           * `"pre_trade_fallback"` -- Stage-2 artifact present but NO resolvable plan
             (e.g. an old ticket carrying only `current_shares`).  The raw snapshot is
@@ -1828,6 +1920,9 @@ class StorageManager:
         """
         if not run_dir:
             return None, None
+        correction = self._operator_correction_for_run_dir(run_dir)
+        if correction is not None:
+            return correction, OPERATOR_MANUAL_CORRECTION_SOURCE
         if has_stage2_artifact(run_dir):
             # (25.9.11b) BOTH ticket file names: a single-strategy round writes
             # `live_trading_ticket.*`, a multi-strategy netted round writes
@@ -2074,6 +2169,9 @@ class StorageManager:
         """The book a Stage-2 deploy may SEED from, plus where it came from.
 
         Returns `(book, source)` with `source` one of:
+          * `"operator_manual_correction"` -- a HUMAN asserted this session's book
+            (`operator_holdings.json`, written by `save_holdings` on a manual save only).
+            Read BEFORE the plan because the plan is what a partial fill corrects;
           * `"operator_snapshot"` -- a same-session book INSIDE the run archive: either an
             operator/manual snapshot (`holdings.json` / `current_holdings.json`) in a dir
             that never ran Stage 2, or -- when that dir DID run Stage 2 -- its PLANNED post
@@ -2101,6 +2199,14 @@ class StorageManager:
 
         Resolution (reuses the D8-hardened archive helpers -- no archive walk is
         re-implemented here):
+          0. (2026-10-30, ITEM 2) If this session carries an OPERATOR CORRECTION
+             (`operator_holdings.json`, written by a manual save), it seeds the deploy
+             (`"operator_manual_correction"`).  It is consulted FIRST among the archive
+             sources because the round's plan is precisely what a partial fill corrects:
+             a deploy that re-seeded from the plan would size "held == target" and emit no
+             order at all.  (The caller's own explicit book still wins outright -- that arm
+             is decided in `run_live_deploy`, which never calls this function when
+             `current_holdings` is not `None`.)
           1. If `date_str` resolves to an existing run base dir, walk that SESSION's
              candidate dirs NEWEST instance first (`list_instances_for_date` reversed, which
              ends on the flat dir -- the session's chronological FIRST instance).  Inside
@@ -2139,6 +2245,13 @@ class StorageManager:
         if date_str:
             base_dir = self.find_existing_run_base_dir(strategy_key, universe_key, date_str)
             if base_dir:
+                # (2026-10-30, ITEM 2) An operator's own correction for THIS session first:
+                # a same-day manual save is the only record of a PARTIAL FILL, and the
+                # round's plan is exactly what it corrects.  Seeding from the plan instead
+                # makes the next deploy see "held == target" and emit zero orders.
+                correction = self._operator_correction_for_run_dir(base_dir)
+                if correction is not None:
+                    return correction, OPERATOR_MANUAL_CORRECTION_SOURCE
                 candidates = list(reversed(list_instances_for_date(base_dir)))
                 # `list_instances_for_date` omits the flat dir when it only CONTAINERS
                 # instances; `base_dir` is still the place a Stage-2 pre-trade input lands,
@@ -2187,12 +2300,33 @@ class StorageManager:
         (2026-10-30) The archive snapshot is the ONLY write. The global
         `data/current_holdings.json` write is deleted: three duplicate copies of the book
         let an already-sold lot resurrect whenever the global lagged the archive.
+
+        (2026-10-30, ITEM 2) A MANUAL save (no `run_dir`) ALSO writes the
+        `operator_holdings.json` sidecar next to the byte-identical `holdings.json`, which is
+        the only file that means "a human asserted this book against broker fills".  The
+        deploy path always passes `run_dir` (`run_live_deploy` pins THIS round's instance
+        dir) and therefore NEVER writes it: marking an automated pre-trade seed as a human
+        assertion would display/size that seed as the true book -- the 2026-10-29 ghost-lot
+        defect all over again.  `run_dir=None` is exactly "an operator typed this in".
         """
         date_str = validate_date_str(date_str)
         if date_str:
             daily_dir = run_dir or self.get_run_dir(strategy_key, universe_key, date_str, prefer_existing=True)
             os.makedirs(daily_dir, exist_ok=True)
             self._save_json(os.path.join(daily_dir, "holdings.json"), holdings)
+            if run_dir is None:
+                # Sidecar: same dir, same book, plus WHO/WHEN.  `holdings.json` stays
+                # byte-identical (other readers depend on it); this file only ADDS the
+                # "a human reviewed this" fact.  Rewritten on every manual save, so a
+                # later correction (a fuller fill) supersedes the earlier one.
+                self._save_json(
+                    os.path.join(daily_dir, OPERATOR_HOLDINGS_FILENAME),
+                    {
+                        "saved_at": datetime.now().astimezone().isoformat(),
+                        "source": OPERATOR_MANUAL_CORRECTION_SOURCE,
+                        "holdings": holdings,
+                    },
+                )
 
     # --------------------------------------------------------------------------
     # Market clock: single owner of the daily-archive date key (L2.4 / L2.5)
@@ -3186,12 +3320,16 @@ class StorageManager:
             "sub_ledgers": sub_ledgers,
             "summary": summary_data,
             "holdings": holdings_data or {},
-            # (25.9.11) Which kind of book `holdings` is: "post_trade_book" (a completed
-            # Stage-2 round's plan), "pre_trade_fallback" (Stage-2 artifact but no resolvable
-            # plan, so the raw pre-trade snapshot is shown, LABELLED), or "snapshot" (a dir
-            # that never ran Stage 2).  Display-only; see `_display_book_for_run_dir`.  When
-            # the dir carries no book at all the label describes that dir's rule ("snapshot")
-            # while the legacy chain below fills `holdings` from earlier instances/days.
+            # (25.9.11) Which kind of book `holdings` is, one of EXACTLY four labels:
+            # "operator_manual_correction" (2026-10-30: a human asserted this session's book
+            # via `operator_holdings.json` -- the only record of a partial fill),
+            # "post_trade_book" (a completed Stage-2 round's plan), "pre_trade_fallback"
+            # (Stage-2 artifact but no resolvable plan, so the raw pre-trade snapshot is
+            # shown, LABELLED), or "snapshot" (a dir that never ran Stage 2).  Display-only;
+            # see `_display_book_for_run_dir`.  When the dir carries no book at all the label
+            # describes that dir's rule ("snapshot") while the legacy chain below fills
+            # `holdings` from earlier instances/days.
+
             "holdings_source": holdings_source,
             "post_holdings": post_holdings_data or {},
             "prices": prices_map,

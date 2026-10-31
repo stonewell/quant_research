@@ -807,6 +807,13 @@ def _seed_book_missing_message(
 #   clients that genuinely want an all-cash book pass the same per-request field.
 EMPTY_BOOK_CONFIRM_FIELD = "confirm_empty_book"
 
+#: (ITEM 1, 2026-10-30) The field an API/batch caller sets to say "this submitted book is
+#: real, I checked it against broker fills".  Deliberately separate from
+#: `EMPTY_BOOK_CONFIRM_FIELD`: that one licenses an EMPTY book (a full liquidation), this one
+#: licenses a NON-empty book that happens to be identical to the same date's recorded plan.
+#: Folding them together would make either gesture silently authorize the other.
+EDITED_INPUT_FIELD = "edited"
+
 #: Seed-source labels for the explicit-book arm.  The confirmed-empty value is a SEPARATE
 #: label on purpose: `summary.json['holdings_seed_source']` must let an auditor see that the
 #: round was sized from a deliberately-confirmed all-cash book rather than from an
@@ -826,6 +833,45 @@ class EmptyBookConfirmationRequiredError(LiveSeedBookMissingError):
     The message (see `_empty_book_unconfirmed_message`) names the two cures: enter the real
     holdings, or pass ``confirm_empty_book=true`` for an intentional all-cash book.
     """
+
+
+class UnconfirmedPlanAsInputError(LiveSeedBookMissingError):
+    """Refusal: the submitted book IS this same date's plan, and nobody says it was verified.
+
+    (ITEM 1, 2026-10-30) FORENSIC CONTEXT -- the failure this closes: the UI paints the
+    round's PLANNED post book into the holdings table (`bundle["holdings"]` /
+    `holdings_plan`), and `getHoldingsFromTable()` submits whatever the table holds.  Re-
+    submitting an UNEDITED table for a date that already completed therefore hands the engine
+    the plan as if it were holdings: every target equals the current position, so the ticket
+    is zero orders -- successful-looking, archived, and completely inert.  Nothing in the
+    response said "you gave me my own plan back".
+
+    Subclasses :class:`storage.LiveSeedBookMissingError` for the same reason
+    `EmptyBookConfirmationRequiredError` does: one meaning, one existing handler.  The two
+    gates are INDEPENDENT -- an empty book never needs ``edited`` (it is governed by
+    `confirm_empty_book`), and a plan-shaped non-empty book never needs
+    ``confirm_empty_book`` (it is governed by ``edited``).
+    """
+
+
+def _plan_as_input_unconfirmed_message(
+    date_str: Optional[str],
+    strategy_key: Optional[str],
+    universe_key: Optional[str],
+    matrix_id: Optional[str] = None,
+) -> str:
+    """Bilingual refusal text for an unedited book identical to the same date's plan."""
+    scope = f"date={date_str!r} strategy={strategy_key!r} universe={universe_key!r}"
+    if matrix_id:
+        scope += f" matrix_id={matrix_id!r}"
+    return (
+        "提交的持仓与上一轮票面计划完全一致，且未标记为已编辑核实；已拒绝部署。"
+        "请对照券商实际成交核实/编辑持仓表后重新提交，或显式确认该计划即为真实持仓"
+        f"（{EDITED_INPUT_FIELD}=true）。"
+        "An unedited book identical to the previous round's plan is never assumed to be "
+        f"actual holdings: pass {EDITED_INPUT_FIELD}=true to confirm, or edit the table."
+        f" 范围/scope: {scope}。"
+    )
 
 
 def _holding_value_is_zero(raw: Any) -> bool:
@@ -2344,6 +2390,97 @@ class ExecutionService:
                 )
         return check
 
+    def _same_day_planned_book(
+        self, run_dir: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """PLANNED book of this date's ALREADY-COMPLETED round, or None (a new date).
+
+        (ITEM 1, 2026-10-30) The reference the unedited-input gate compares against.  It is
+        deliberately the SAME resolution the display and the seed use
+        (`StorageManager._planned_book_from_run_dir`: `post_holdings.json`, else the ticket's
+        `target_shares`, for either ticket family) applied to THIS date's dir -- never to an
+        earlier date (`get_previous_post_holdings`), because the hazard is "the table still
+        shows this date's plan".
+
+        `run_dir` may be the session's base dir (single-strategy: the newest instance holds
+        the plan a rerun would overwrite) or a matrix dir (`<archive>/<date>/multi_netted_*`,
+        which has no instance subdirs).  A date with no completed round yields `None`, which
+        is what keeps a FIRST-EVER deploy on a new date unaffected by the gate.
+        """
+        if not run_dir or not os.path.isdir(run_dir):
+            return None
+        candidates: List[str] = [self.storage.resolve_latest_instance_dir(run_dir) or run_dir, run_dir]
+        seen = set()
+        for candidate in candidates:
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            plan = self.storage._planned_book_from_run_dir(
+                candidate, ("live_trading_ticket", "netted_trading_ticket")
+            )
+            if plan is not None:
+                return plan
+        return None
+
+    def _refuse_unconfirmed_plan_input(
+        self,
+        submitted: Optional[Mapping[str, Any]],
+        *,
+        edited: bool,
+        planned: Optional[Mapping[str, Any]],
+        date_str: Optional[str],
+        strategy_key: Optional[str] = None,
+        universe_key: Optional[str] = None,
+        matrix_id: Optional[str] = None,
+    ) -> None:
+        """REFUSE a book that IS this date's plan unless the caller says it was verified.
+
+        (ITEM 1, 2026-10-30) The zero-order trap: the UI's table is painted from the plan, so
+        an untouched table re-submits the plan as `current_holdings`; the engine then sizes
+        "held == target" and emits NO order -- archived as a success.  `edited=True` is the
+        caller's explicit statement that a human compared the book with broker fills.
+
+        ORTHOGONAL to the empty-book gate (`resolve_explicit_book_source`), and placed AFTER
+        it on purpose: an EMPTY book is that gate's business and is never classified here
+        (an engine-empty book normalises to no positions, so it can never equal a non-empty
+        plan).  A plan-shaped NON-empty book is never rescued by `confirm_empty_book`.
+
+        Raises :class:`UnconfirmedPlanAsInputError` (a `LiveSeedBookMissingError`) BEFORE any
+        side effect, so a refused round leaves no run dir, no `holdings.json`, no
+        `nav_breakdown.json`, no `summary.json` and no launched child.
+        """
+        if edited or planned is None:
+            return
+        submitted_shares = {
+            sym: shares
+            for sym, shares in _shares_book(submitted).items()
+            if not is_cash_symbol(sym)
+        }
+        # An EMPTY submitted book belongs to the empty-book gate, never to this one: this is
+        # the independence the two gates promise, expressed in one line.
+        if not submitted_shares:
+            return
+        planned_shares = {
+            sym: shares
+            for sym, shares in _shares_book(planned).items()
+            if not is_cash_symbol(sym)
+        }
+        # `_shares_book` normalises `100` / `100.0` / `"100"` to the same int, which is
+        # exactly the tolerance this comparison needs; a weight-mode book coerces to nothing
+        # and therefore cannot masquerade as a plan.
+        if submitted_shares != planned_shares:
+            return
+        logging.warning(
+            "[plan-as-input] 提交的持仓与同日票面计划完全一致且未标记 %s=true，已拒绝部署: %s",
+            EDITED_INPUT_FIELD,
+            f"date={date_str} strategy={strategy_key} universe={universe_key} matrix_id={matrix_id}",
+        )
+        raise UnconfirmedPlanAsInputError(
+            _plan_as_input_unconfirmed_message(
+                date_str, strategy_key, universe_key, matrix_id=matrix_id
+            )
+        )
+
     def run_live_deploy(
         self,
         strategy_file: str,
@@ -2367,6 +2504,10 @@ class ExecutionService:
         enforce_mv_cap: bool = False,
         liquidate_stale_input_lots: bool = False,
         confirm_empty_book: bool = False,
+        #: (ITEM 1, 2026-10-30) Appended LAST so every existing positional caller keeps its
+        #: meaning.  "The operator asserts the submitted holdings were reviewed against
+        #: broker fills" -- never inferred; see `_refuse_unconfirmed_plan_input`.
+        edited: bool = False,
     ) -> Dict[str, Any]:
         """Execute Stage 2 Live Deployment.
 
@@ -2391,11 +2532,19 @@ class ExecutionService:
         because an empty book is indistinguishable from "the table was never filled in" and
         would size a full liquidation.  There is intentionally no env override.
 
-        REFUSAL ORDERING (fix 2): the seed book, the empty-book confirmation and the opt-in
-        strict-input gate are all decided BEFORE `_resolve_stage2_run_dir` allocates this
-        round's directory (which also CONSUMES the Stage-1 hand-off).  A refused deploy
-        therefore leaves no `summary.json` / `account_state.json` / `holdings.json` /
-        `nav_breakdown.json` behind, keeps the hand-off pending and launches no child.
+        ``edited`` (ITEM 1, default ``False``) is the ONLY way a NON-empty explicit book that
+        is identical to this date's already-completed plan may be deployed: without it such a
+        book is refused with :class:`UnconfirmedPlanAsInputError` (also a
+        ``LiveSeedBookMissingError``), because the plan re-submitted as holdings sizes "held
+        == target" -- zero orders, silently.  The two gates are INDEPENDENT (see
+        `_refuse_unconfirmed_plan_input`).
+
+        REFUSAL ORDERING (fix 2): the seed book, the empty-book confirmation, the
+        unedited-plan gate and the opt-in strict-input gate are all decided BEFORE
+        `_resolve_stage2_run_dir` allocates this round's directory (which also CONSUMES the
+        Stage-1 hand-off).  A refused deploy therefore leaves no `summary.json` /
+        `account_state.json` / `holdings.json` / `nav_breakdown.json` behind, keeps the
+        hand-off pending and launches no child.
         """
         provider = data_provider or self.storage.default_data_provider or "marketdb"
         strat_key, univ_key, strat_name, univ_name = self.storage.resolve_keys(
@@ -2439,6 +2588,19 @@ class ExecutionService:
             holdings_seed_source = resolve_explicit_book_source(
                 effective_holdings,
                 confirm_empty_book,
+                date_str=val_date,
+                strategy_key=strat_key,
+                universe_key=univ_key,
+            )
+            # (ITEM 1, 2026-10-30) A NON-empty book that is byte-for-byte this date's plan is
+            # the table re-submitted untouched (`app.js` paints the plan into it): the engine
+            # would size "held == target" and emit ZERO orders, silently.  Refused unless the
+            # caller states `edited=true`.  Ordered AFTER the empty-book gate (that one owns
+            # the empty case; this one never looks at it) and BEFORE every side effect.
+            self._refuse_unconfirmed_plan_input(
+                effective_holdings,
+                edited=edited,
+                planned=self._same_day_planned_book(base_dir),
                 date_str=val_date,
                 strategy_key=strat_key,
                 universe_key=univ_key,
@@ -2847,6 +3009,11 @@ class ExecutionService:
         #: the signature so every existing positional caller keeps its meaning.
         universe_key: Optional[str] = None,
         universe_name: Optional[str] = None,
+        #: (ITEM 1, 2026-10-30) Same contract as `run_live_deploy`'s `edited`, appended at
+        #: the end of the signature so every existing positional caller keeps its meaning.
+        #: A matrix book identical to THIS date's already-completed netted plan is refused
+        #: with `UnconfirmedPlanAsInputError` unless this is `True`.
+        edited: bool = False,
     ) -> Dict[str, Any]:
         """Execute Multi-Strategy Order Netting & Live Deployment.
 
@@ -2854,6 +3021,11 @@ class ExecutionService:
         book is refused unless the caller confirms an intentional all-cash account, because
         the netting path sizes the same full liquidation from it (see
         `resolve_explicit_book_source`).
+
+        ``edited`` (ITEM 1) mirrors `run_live_deploy` too: a NON-empty book identical to this
+        date's netted plan is refused with `UnconfirmedPlanAsInputError` unless the caller
+        states the book was reviewed against broker fills.  Independent of
+        `confirm_empty_book` -- neither implies the other.
         """
         provider = data_provider or self.storage.default_data_provider or "synthetic"
         # (C6) Same rule as Stage 1/2: the run directory is named after the market
@@ -2880,6 +3052,17 @@ class ExecutionService:
             holdings_seed_source = resolve_explicit_book_source(
                 effective_holdings,
                 confirm_empty_book,
+                date_str=val_date,
+                matrix_id=matrix_id,
+            )
+            # (ITEM 1, 2026-10-30) Same gate as the single path, on the MATRIX plan: the
+            # netted ticket's book is what the UI paints, so re-submitting it untouched makes
+            # the netting a no-op ("held == target") instead of a reallocation.  Refused
+            # unless the caller states `edited=true`; independent of `confirm_empty_book`.
+            self._refuse_unconfirmed_plan_input(
+                effective_holdings,
+                edited=edited,
+                planned=self._same_day_planned_book(run_dir),
                 date_str=val_date,
                 matrix_id=matrix_id,
             )

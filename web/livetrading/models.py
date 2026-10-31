@@ -126,7 +126,25 @@ class RunDeployRequest(BaseModel):
             "（否则空簿会被拒绝，因为空簿会生成整仓卖出工单）"
         ),
     )
+    #: (ITEM 1, 2026-10-30) the operator asserts the submitted holdings were reviewed against
+    #: broker fills; never inferred.
+    #:
+    #: An UNEDITED book that is byte-identical to this same date's plan is never assumed to
+    #: be actual holdings: `ExecutionService` refuses it with
+    #: `UnconfirmedPlanAsInputError` unless this is `True`.  Rationale: the UI paints the
+    #: round's planned post book into the table, so re-submitting the table unchanged asks
+    #: the engine to size "held == target" -- which is zero orders, silently.  This gate is
+    #: INDEPENDENT of `confirm_empty_book` (that one governs an EMPTY book, this one a
+    #: plan-shaped non-empty book); neither implies the other.
+    edited: bool = Field(
+        False,
+        description=(
+            "已对照券商实际成交核实/编辑过提交的持仓簿（edited=true）；"
+            "未标记且持仓与同日票面计划完全一致时会被拒绝"
+        ),
+    )
     data_provider: Optional[str] = None
+
     lot_size: Optional[int] = None
     guard_latency_bars: int = Field(2, description="UPLSM entry confirmation latency guard bars (default 2)")
     allow_intraday: bool = Field(True, description="Allow running during intraday/lunch sessions using latest published session")
@@ -220,6 +238,17 @@ class MultiStrategyDeployRequest(BaseModel):
         description=(
             "确认为“全部空仓”矩阵持仓簿：仅当持仓表为空且确实要按全现金部署时置 true"
             "（否则空簿会被拒绝，因为空簿会生成整仓卖出工单）"
+        ),
+    )
+    #: (ITEM 1, 2026-10-30) Same contract as `RunDeployRequest.edited`: the operator asserts
+    #: the submitted holdings were reviewed against broker fills; never inferred.  A matrix
+    #: book identical to this date's already-completed netted plan is refused with
+    #: `UnconfirmedPlanAsInputError` unless this is `True`.
+    edited: bool = Field(
+        False,
+        description=(
+            "已对照券商实际成交核实/编辑过提交的矩阵持仓簿（edited=true）；"
+            "未标记且持仓与同日净额化票面计划完全一致时会被拒绝"
         ),
     )
     data_provider: Optional[str] = None

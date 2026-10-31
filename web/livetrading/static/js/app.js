@@ -13,6 +13,13 @@
         selectedMatrixId: "tri_core_blend",
         currentDate: new Date().toISOString().split("T")[0],
         holdings: {},
+        // (ITEM 1, 2026-10-30) Did a HUMAN actually touch the holdings table since it was last
+        // painted from a bundle?  `renderHoldingsTable` clears it (the table then mirrors the
+        // ARCHIVE/plan verbatim); the delegated `input`/`change` handler on `tbody-holdings`
+        // sets it.  When it is false the deploy paths send `current_holdings: null` so the
+        // backend seeds from the archive instead of being handed back its own plan -- which
+        // would size "held == target" and emit ZERO orders, silently.
+        holdingsEdited: false,
         accountState: {},
         activeTicket: [],
         activeHealth: null,
@@ -978,6 +985,14 @@
         // Holdings
         el.btnAddHolding.addEventListener("click", () => addHoldingRow("", 0, null));
         el.btnSaveHoldings.addEventListener("click", () => saveHoldings());
+        // (ITEM 1, 2026-10-30) Track operator AUTHORSHIP of the holdings table.  Anything the
+        // operator types/changes here marks the book as edited; a render from a bundle clears
+        // the flag again (see `renderHoldingsTable`).  Delegated on the <tbody> so the flag
+        // survives row add/delete without touching each row's listeners.
+        if (el.tbodyHoldings) {
+            el.tbodyHoldings.addEventListener("input", () => { state.holdingsEdited = true; });
+            el.tbodyHoldings.addEventListener("change", () => { state.holdingsEdited = true; });
+        }
         el.inputValue.addEventListener("input", () => {
             recalcHoldings();
             updateMobileParamSummary();
@@ -1344,6 +1359,11 @@
         // planned book (archive view / API reload / manual save), so the provenance banner
         // is dropped here; `refreshHoldingsAfterDeploy` re-shows it right after rendering.
         clearHoldingsPlanNotice();
+        // (ITEM 1, 2026-10-30) A render REPLACES the operator's text with the archive's book,
+        // so whatever they had typed is gone: the table is authoritative-from-the-bundle
+        // again, which is exactly what "not edited" means.  Every deploy path therefore sends
+        // `current_holdings: null` until the operator touches the table.
+        state.holdingsEdited = false;
         el.tbodyHoldings.innerHTML = "";
         const keys = Object.keys(holdingsMap).filter(k => k !== "BIL" && k !== "CASH");
 
@@ -1433,6 +1453,10 @@
         btnDel.setAttribute("aria-label", "删除此行持仓");
         btnDel.addEventListener("click", () => {
             tr.remove();
+            // (ITEM 1, 2026-10-30) Deleting a row is a human edit of the book even though it
+            // fires no `input`/`change` event: without this the operator's removal would be
+            // discarded (the deploy would send `current_holdings: null`) rather than asserted.
+            state.holdingsEdited = true;
             recalcHoldings();
             if (el.tbodyHoldings.querySelectorAll("tr").length === 0) {
                 addHoldingRow("", 0, null, null);
@@ -1837,11 +1861,15 @@
             universe_name: keys.univName,
             as_of_date: baseParams.as_of_date,
             portfolio_value: baseParams.portfolio_value,
-            current_holdings: holdings,
+            // (ITEM 1, 2026-10-30) Same rule as the single path: an UNEDITED table is just
+            // the bundle's book painted back, so submit `null` (key kept) and let the
+            // backend seed from the archive -- `operator_holdings.json` first, then the plan.
+            current_holdings: state.holdingsEdited ? holdings : null,
             data_provider: baseParams.data_provider,
             min_holding_bars: 2,
             inertia_threshold: 0.05,
         };
+        if (state.holdingsEdited) deployParams.edited = true;
         if (emptyBookConfirmed === true) deployParams.confirm_empty_book = true;
 
         setRunningIndicator(true, "正在执行多策略虚拟账本划分、目标权重聚合、内部对冲与净额化撮合...", activeBtn);
@@ -1922,8 +1950,18 @@
         }
         const deployParams = {
             ...baseParams,
-            current_holdings: holdings,
+            // (ITEM 1, 2026-10-30) An UNEDITED table is the archive's own book painted back
+            // into the form (see `renderHoldingsTable`), so sending it would hand the backend
+            // its own plan as holdings -- every target equals the current position and the
+            // ticket is ZERO orders, archived as a success. Send `null` (the KEY stays
+            // present) and let the backend's archive seed decide: `operator_holdings.json`
+            // (a human's partial-fill correction) first, then the round's plan, then the
+            // snapshot. Only a table the operator actually touched is submitted, and then it
+            // carries `edited: true` so the server-side refusal
+            // (`UnconfirmedPlanAsInputError`) stays out of the way.
+            current_holdings: state.holdingsEdited ? holdings : null,
         };
+        if (state.holdingsEdited) deployParams.edited = true;
         if (emptyBookConfirmed === true) deployParams.confirm_empty_book = true;
 
         setRunningIndicator(true, "正在计算标的目标权重、惯性过滤、持仓对账与买卖工单...", activeBtn);
@@ -1998,8 +2036,11 @@
         }
         const deployParams = {
             ...baseParams,
-            current_holdings: holdings,
+            // (ITEM 1, 2026-10-30) Same rule as `runLiveDeploy`: an untouched table is the
+            // archive's book, so submit `null` (key kept) and let the archive seed it.
+            current_holdings: state.holdingsEdited ? holdings : null,
         };
+        if (state.holdingsEdited) deployParams.edited = true;
         if (emptyBookConfirmed === true) deployParams.confirm_empty_book = true;
 
         setRunningIndicator(true, "正在依次执行 Stage 1 健康门禁 与 Stage 2 调仓工单生成...", activeBtn);
@@ -2037,11 +2078,15 @@
                     custom_symbols: baseParams.custom_symbols,
                     as_of_date: baseParams.as_of_date,
                     portfolio_value: baseParams.portfolio_value,
-                    current_holdings: holdings,
+                    // (ITEM 1, 2026-10-30) Same rule as the standalone multi deploy: an
+                    // untouched table is the archive's book, so submit `null` (key kept) and
+                    // let `operator_holdings.json` / the netted plan seed the engine.
+                    current_holdings: state.holdingsEdited ? holdings : null,
                     data_provider: baseParams.data_provider,
                     min_holding_bars: 2,
                     inertia_threshold: 0.05,
                 };
+                if (state.holdingsEdited) multiDeployParams.edited = true;
                 if (emptyBookConfirmed === true) multiDeployParams.confirm_empty_book = true;
                 const resDeploy = await fetch("/api/deploy/multi", {
                     method: "POST",

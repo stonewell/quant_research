@@ -1704,17 +1704,20 @@ def test_app_js_holdings_value_and_provider_logic():
 
 
 def test_manual_same_day_holdings_override_ticket_fills(temp_workspace):
-    """A completed Stage-2 round DISPLAYS its planned post book; the hand-saved correction is kept as evidence.
+    """A hand-saved same-day correction WINS the display; the round's plan stays visible.
 
-    (25.9.11) This used to assert the opposite -- `get_holdings` returned the manually saved
-    snapshot, so `GET /api/holdings` painted whatever was hand-saved last even for a round
-    whose authoritative book is `post_holdings.json` (and the 2026-10-29 ghost lots
-    `600584.SH` / `600362.SH` came back on screen the same way).  A Stage-2 artifact in the
-    dir now makes the plan the DISPLAYED book; the operator's snapshot is not lost -- it is
-    published as `get_run(...)["pre_trade_holdings"]`.  Seeding already ignored the snapshot
-    in such a dir since `resolve_seed_holdings` (2026-10-30, §25.9.8.1).
-    re-break: revert the `get_holdings` step-1 change back to `_load_snapshot_holdings(...)`
-    -- it returns `{"AAPL": 30}` again and hides the plan.
+    (ITEM 2, 2026-10-30) This used to assert the opposite -- the plan won and the hand-saved
+    book was only published as `pre_trade_holdings`.  That made a PARTIAL FILL invisible: the
+    manual save is the ONLY record of what actually filled (the system has no broker fill
+    receipt), while the plan is what would have been held IF every row had filled exactly as
+    instructed.  So a manual save now writes `operator_holdings.json` next to `holdings.json`
+    and that sidecar outranks the plan in BOTH the display and the seed.
+    The 25.9.11 ghost-lot reasoning is untouched: `holdings.json` in a Stage-2 dir is still
+    never trusted (it is the round's PRE-trade input), which is exactly why the human's
+    assertion needs its OWN file rather than a flag inside `holdings.json`.
+    re-break: remove the rank-1 `_operator_correction_for_run_dir` lookup from
+    `_display_book_for_run_dir` -- `holdings_source` becomes `post_trade_book` and
+    `holdings` the plan (`{"AAPL": 50, "MSFT": 20}`) again, hiding the partial fill.
     """
     storage, _ = temp_workspace
     strat_k = "test_strat"
@@ -1728,17 +1731,22 @@ def test_manual_same_day_holdings_override_ticket_fills(temp_workspace):
 
     # 2. User manually corrects actual fill: only 30 AAPL filled, 0 MSFT
     storage.save_holdings({"AAPL": 30}, date_str=date_str, strategy_key=strat_k, universe_key=univ_k)
+    assert os.path.isfile(
+        os.path.join(run_dir, "operator_holdings.json")
+    ), "a manual save must leave the 'a human asserted this' sidecar behind"
 
-    # 3. get_holdings for same date MUST return the round's PLANNED POST book for display
+    # 3. get_holdings for the same date MUST return the operator's correction for display
     loaded = storage.get_holdings(date_str, strategy_key=strat_k, universe_key=univ_k)
-    assert loaded == {"AAPL": 50, "MSFT": 20}
+    assert loaded == {"AAPL": 30}
 
-    # 4. ...and the hand-saved correction stays VISIBLE rather than hidden.
+    # 4. ...and the round's PLANNED book stays visible, so the difference is auditable.
     bundle = storage.get_run(date_str, strategy_key=strat_k, universe_key=univ_k)
     assert bundle is not None
-    assert bundle["holdings_source"] == "post_trade_book"
-    assert bundle["holdings"] == {"AAPL": 50, "MSFT": 20}
-    assert bundle["pre_trade_holdings"] == {"AAPL": 30}
+    assert bundle["holdings_source"] == "operator_manual_correction"
+    assert bundle["holdings"] == {"AAPL": 30}
+    assert bundle["post_holdings"] == {"AAPL": 50, "MSFT": 20}
+    # `holdings.json` is byte-identical to the correction here, so it is not duplicated.
+    assert "pre_trade_holdings" not in bundle
 
 
 def test_path_traversal_sanitization(temp_workspace):
@@ -2088,6 +2096,13 @@ def test_same_day_rerun_idempotency(temp_workspace):
         # displayed post book (re-submitting a post book would make the rerun a no-op and
         # destroy the idempotency comparison this test exists for).
         current_holdings=initial_holdings,
+        # (ITEM 1, 2026-10-30) `edited=True` because this caller is deliberately asserting
+        # that `initial_holdings` is the REAL book -- with the synthetic strategy the round's
+        # planned post book happens to equal it, so an unasserted re-submission is exactly
+        # the "you gave me my own plan back" case the server now refuses
+        # (`UnconfirmedPlanAsInputError`).  The escape hatch is what keeps the idempotency
+        # comparison below able to run at all; it changes no order sizing.
+        edited=True,
         data_provider="synthetic",
         # Same anchor as `dep1` -- an idempotency comparison must hold the NAV source fixed.
         nav_override=True,

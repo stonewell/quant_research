@@ -75,6 +75,8 @@ for _p in (_WEB_DIR, _REPO_ROOT):
 from storage import (  # noqa: E402  (bare import: same module identity as server.py)
     _DEFAULT_ACCOUNT_STATE,
     LiveSeedBookMissingError,
+    OPERATOR_HOLDINGS_FILENAME,
+    OPERATOR_MANUAL_CORRECTION_SOURCE,
     StorageManager,
     has_stage2_artifact,
     instance_subdirs,
@@ -88,6 +90,7 @@ from execution_service import (  # noqa: E402
     EXPLICIT_BOOK_SOURCE,
     EmptyBookConfirmationRequiredError,
     ExecutionService,
+    UnconfirmedPlanAsInputError,
     book_is_empty,
 )
 
@@ -3238,3 +3241,422 @@ def test_single_deploy_argv_is_accepted_by_the_script_parser(temp_storage, monke
     _assert_argv_contract(
         _script_parser("scripts.run_live_strategy"), calls[0], "run_live_strategy.py"
     )
+
+
+# ---------------------------------------------------------------------------
+# 17. (2026-10-30, ITEM 2) A same-day MANUAL correction is the only record of a
+#     PARTIAL FILL -- and (ITEM 1) an UNEDITED book identical to the same date's
+#     plan is never assumed to be actual holdings.
+#
+# FORENSIC CONTEXT (both items are one defect from two sides):
+#   Nothing in this system receives a broker fill receipt.  The round's PLAN
+#   (`post_holdings.json`, or the ticket's `target_shares`) asserts what the book WOULD be
+#   if every row filled exactly as instructed; the operator's manual save is the only
+#   statement about what ACTUALLY filled.  `app.js` paints the plan into the editable
+#   holdings table and `getHoldingsFromTable()` submits it back as `current_holdings`, so:
+#     * a PARTIAL FILL was invisible -- the plan was displayed as if it were the book
+#       (ITEM 2), and
+#     * re-deploying an UNEDITED table for a completed date handed the engine its own plan
+#       as holdings: every target equals the current position -> ZERO orders, archived as a
+#       success (ITEM 1).
+#   The two fixes stay deliberately narrow:
+#     * `save_holdings` (MANUAL save only -- the deploy path always pins `run_dir`) writes
+#       `operator_holdings.json` beside the byte-identical `holdings.json`; that sidecar is
+#       the only file that means "a human asserted this", and it OUTRANKS the plan in both
+#       `_display_book_for_run_dir` (rank 1: `operator_manual_correction`) and
+#       `resolve_seed_holdings`.  `holdings.json` itself is still never trusted in a Stage-2
+#       dir (the 2026-10-29 ghost-lot rule), which is exactly why the assertion needs its
+#       own file.
+#     * `run_live_deploy` / `run_multi_strategy_netted_deploy` REFUSE a non-empty book that
+#       equals this same date's plan unless the caller passes `edited=true`
+#       (`UnconfirmedPlanAsInputError`), decided in the VALIDATION block so a refusal leaves
+#       no run dir, no book file and no launched child behind.
+#   INDEPENDENCE: `confirm_empty_book` governs an EMPTY book (a full liquidation), `edited`
+#   governs a plan-shaped NON-empty one.  Neither gesture authorizes the other -- pinned by
+#   test 6 below.
+# ---------------------------------------------------------------------------
+
+#: What actually filled on the incident-shaped session: `601919.SH` was ordered at 2400 and
+#: filled at 1200 -- the plan is `_CORRECTED_BOOK`, the operator's book is this one.
+_PARTIAL_FILL_BOOK = {
+    "601728.SH": 5800,
+    "601919.SH": 1200,  # PARTIAL: the plan says 2400
+    "000999.SZ": 600,
+    "600660.SH": 400,
+    "600900.SH": 800,
+}
+
+
+def _write_operator_correction(dir_path, book, saved_at="2026-10-30T15:30:00+08:00"):
+    """Write the `operator_holdings.json` sidecar exactly as `save_holdings` shapes it."""
+    _write_json(
+        os.path.join(dir_path, OPERATOR_HOLDINGS_FILENAME),
+        {
+            "saved_at": saved_at,
+            "source": OPERATOR_MANUAL_CORRECTION_SOURCE,
+            "holdings": book,
+        },
+    )
+
+
+def test_manual_correction_outranks_plan_for_display(temp_storage):
+    """The operator's manual save IS the displayed book, even over a completed round's plan.
+
+    The plan assumes every row filled as instructed; the manual save records what actually
+    did.  Hiding it behind the plan made a partial fill unreportable (ITEM 2).  The plan is
+    NOT deleted -- it stays reachable as `post_holdings`, and the raw pre-trade snapshot as
+    `pre_trade_holdings`, so the difference remains auditable.
+
+    re-break: drop the rank-1 `_operator_correction_for_run_dir` lookup from
+    `_display_book_for_run_dir` -- `holdings_source` becomes `post_trade_book` and the plan
+    (`_CORRECTED_BOOK`) is displayed again (verified red).
+    """
+    # The completed round lives in the session's newest instance (its plan + ghost snapshot);
+    # the manual save lands in the session's FLAT `<date>/` dir, exactly as
+    # `save_holdings(run_dir=None)` writes it.  The display must bridge the two.
+    instance = _seed_run_date(
+        temp_storage,
+        "2026-10-30",
+        instance="215823",
+        holdings=dict(_GHOST_BOOK),
+        post_holdings=dict(_CORRECTED_BOOK),
+    )
+    flat_dir = os.path.join(temp_storage.archive_dir, _STRATEGY, _UNIVERSE, "2026-10-30")
+    _write_operator_correction(flat_dir, dict(_PARTIAL_FILL_BOOK))
+
+    bundle = temp_storage.get_run(
+        "2026-10-30", strategy_key=_STRATEGY, universe_key=_UNIVERSE
+    )
+    assert bundle is not None
+    assert bundle["path"] == instance
+    assert bundle["holdings"] == _PARTIAL_FILL_BOOK
+    assert bundle["holdings_source"] == "operator_manual_correction"
+    # Nothing is hidden: the plan and the raw submitted book stay published.
+    assert bundle["post_holdings"] == _CORRECTED_BOOK
+    assert bundle["pre_trade_holdings"] == _GHOST_BOOK
+
+    # `/api/holdings` reads through the same rule.
+    book = temp_storage.get_holdings(
+        "2026-10-30", strategy_key=_STRATEGY, universe_key=_UNIVERSE
+    )
+    assert book == _PARTIAL_FILL_BOOK
+    assert book == bundle["holdings"], "the two outlets must not disagree"
+
+
+def test_manual_correction_seeds_deploy(temp_storage):
+    """The deploy seed is the operator's correction too, ahead of the previous round's plan.
+
+    A same-day rerun that seeded from the plan would size "held == target" for the partially
+    filled row and emit no order for it -- the partial fill would never be completed.
+
+    re-break: drop the `_operator_correction_for_run_dir` leg from `resolve_seed_holdings` --
+    the seed falls through to `previous_post_holdings` (`{"AAA.SH": 100}`), verified red.
+    """
+    _seed_run_date(temp_storage, "2026-10-29", post_holdings={"AAA.SH": 100})
+    # A listed run dir for the target date with NO book of its own: the sidecar is the only
+    # statement about this session, so it must be what the seed resolves.
+    same_day = _seed_run_date(temp_storage, "2026-10-30")
+    _write_operator_correction(same_day, {"BBB.SH": 250})
+
+    seed, source = temp_storage.resolve_seed_holdings(
+        "2026-10-30", _STRATEGY, _UNIVERSE
+    )
+    assert seed == {"BBB.SH": 250}
+    assert source == OPERATOR_MANUAL_CORRECTION_SOURCE == "operator_manual_correction"
+
+
+def test_manual_correction_survives_repeated_saves(temp_storage):
+    """A second manual save SUPERSEDES the sidecar (newer book, newer `saved_at`).
+
+    The operator often corrects twice in one session (a partial fill, then the rest), so the
+    sidecar must be rewritten rather than appended to or frozen at the first assertion.
+
+    re-break: make the sidecar write append-only (a list) or skip it when the file already
+    exists -- the second save's book never reaches the sidecar and this test reads
+    `{"AAA.SH": 100}` (verified red).
+    """
+    date_str = "2026-10-30"
+    temp_storage.save_holdings(
+        {"AAA.SH": 100}, date_str=date_str, strategy_key=_STRATEGY, universe_key=_UNIVERSE
+    )
+    base_dir = temp_storage.get_run_dir(
+        _STRATEGY, _UNIVERSE, date_str, prefer_existing=True
+    )
+    sidecar = os.path.join(base_dir, OPERATOR_HOLDINGS_FILENAME)
+    first = temp_storage._load_json(sidecar, default={}) or {}
+    assert first["holdings"] == {"AAA.SH": 100}
+    assert first["source"] == OPERATOR_MANUAL_CORRECTION_SOURCE
+    assert first["saved_at"]
+
+    temp_storage.save_holdings(
+        {"AAA.SH": 40}, date_str=date_str, strategy_key=_STRATEGY, universe_key=_UNIVERSE
+    )
+    second = temp_storage._load_json(sidecar, default={}) or {}
+    assert second["holdings"] == {"AAA.SH": 40}, "the newer assertion must win"
+    assert second["saved_at"] > first["saved_at"], "the sidecar carries the newer timestamp"
+    # `holdings.json` stays byte-compatible with every other reader.
+    assert temp_storage._load_json(
+        os.path.join(base_dir, "holdings.json"), default=None
+    ) == {"AAA.SH": 40}
+    # Seed + display follow the newest correction.
+    assert temp_storage.resolve_seed_holdings(date_str, _STRATEGY, _UNIVERSE) == (
+        {"AAA.SH": 40},
+        OPERATOR_MANUAL_CORRECTION_SOURCE,
+    )
+
+    # INVARIANT: the DEPLOY path (`run_dir` pinned) never writes the sidecar -- an automated
+    # pre-trade seed is not a human assertion, and marking it one would resurrect the
+    # 2026-10-29 ghost book on every completed round.  (This half is why the write is gated
+    # on `run_dir is None`.)
+    deploy_dir = os.path.join(base_dir, "090000")
+    os.makedirs(deploy_dir, exist_ok=True)
+    temp_storage.save_holdings(
+        {"AAA.SH": 40},
+        date_str=date_str,
+        strategy_key=_STRATEGY,
+        universe_key=_UNIVERSE,
+        run_dir=deploy_dir,
+    )
+    assert os.path.isfile(os.path.join(deploy_dir, "holdings.json"))
+    assert not os.path.exists(os.path.join(deploy_dir, OPERATOR_HOLDINGS_FILENAME)), (
+        "a deploy-path save must never claim a human asserted the book"
+    )
+
+
+def test_unedited_plan_as_input_is_refused(temp_storage, tmp_path, monkeypatch):
+    """An UNEDITED book identical to the same date's plan is REFUSED, with zero residue.
+
+    re-break: change the `edited: bool = False` default of `run_live_deploy` to `True`
+    (or drop the gate) -- the round is accepted as `operator_input` and the ticket is zero
+    orders, which is precisely the silent no-op this test exists to catch (verified red).
+    """
+    monkeypatch.delenv("LIVETRADING_STRICT_SEED_BOOK", raising=False)
+    calls = _patch_deploy_subprocess(monkeypatch)
+    service = ExecutionService(temp_storage)
+    val_date = "2026-10-30"
+    # This date already completed a round whose plan is exactly the book the UI would paint.
+    base_dir = _seed_run_date(
+        temp_storage, val_date, post_holdings={"600519.SH": 100}
+    )
+
+    tree_before = _archive_tree(temp_storage.archive_dir)
+
+    with pytest.raises(UnconfirmedPlanAsInputError) as excinfo:
+        service.run_live_deploy(
+            **_deploy_kwargs(
+                tmp_path, date_str=val_date, current_holdings={"600519.SH": 100}
+            )
+        )
+
+    message = str(excinfo.value)
+    assert "edited" in message, "the refusal must name the escape hatch"
+    assert "An unedited book identical to the previous round's plan" in message
+    # Same handler family as every other seed refusal.
+    assert isinstance(excinfo.value, LiveSeedBookMissingError)
+    assert calls == [], "a refused deploy must never launch the child process"
+
+    # ZERO RESIDUE: no new instance dir, no book file, no NAV breakdown, no summary rewrite.
+    assert _archive_tree(temp_storage.archive_dir) == tree_before
+    assert [
+        name
+        for name in os.listdir(base_dir)
+        if name.isdigit() and len(name) == 6
+    ] == [], "the refusal must not allocate an instance directory"
+    assert not os.path.exists(os.path.join(base_dir, "holdings.json"))
+    assert not os.path.exists(os.path.join(base_dir, "nav_breakdown.json"))
+
+    # NEGATIVE CONTROL -- the gate must NOT fire for a NEW date: no completed round exists
+    # there, so there is no plan for an unedited book to be identical to.  Same book, same
+    # `edited=False`, only the date differs -> accepted.
+    new_date = "2026-11-02"
+    res = service.run_live_deploy(
+        **_deploy_kwargs(
+            tmp_path, date_str=new_date, current_holdings={"600519.SH": 100}
+        )
+    )
+    assert res["status"] == "success"
+    assert len(calls) == 1, "the new-date deploy must launch exactly one child"
+    assert (
+        _archived_summary(temp_storage, calls[0])["holdings_seed_source"]
+        == EXPLICIT_BOOK_SOURCE
+    )
+
+
+def test_edited_plan_as_input_is_accepted(temp_storage, tmp_path, monkeypatch):
+    """`edited=True` + the same plan-shaped book is ACCEPTED and labelled `operator_input`.
+
+    This is the escape hatch the refusal message names: the operator checked the book against
+    broker fills and states that the plan IS the real book (e.g. everything filled).
+
+    re-break: ignore the `edited` argument in `_refuse_unconfirmed_plan_input` (or hard-code
+    `edited=False`) -- the same call is refused (verified red).
+    """
+    monkeypatch.delenv("LIVETRADING_STRICT_SEED_BOOK", raising=False)
+    calls = _patch_deploy_subprocess(monkeypatch)
+    service = ExecutionService(temp_storage)
+    val_date = "2026-10-30"
+    _seed_run_date(temp_storage, val_date, post_holdings={"600519.SH": 100})
+
+    res = service.run_live_deploy(
+        **_deploy_kwargs(
+            tmp_path,
+            date_str=val_date,
+            current_holdings={"600519.SH": 100},
+            edited=True,
+        )
+    )
+
+    assert res["status"] == "success"
+    assert len(calls) == 1
+    summary = _archived_summary(temp_storage, calls[0])
+    assert summary["holdings_seed_source"] == EXPLICIT_BOOK_SOURCE == "operator_input"
+    holdings_file = calls[0][calls[0].index("--current-holdings-file") + 1]
+    assert temp_storage._load_json(holdings_file, default=None) == {"600519.SH": 100}
+
+
+def test_empty_book_and_edited_gates_are_independent(temp_storage, tmp_path, monkeypatch):
+    """Two gates, two cases: an EMPTY book needs `confirm_empty_book`, a PLAN-shaped one
+    needs `edited`.  Neither gesture substitutes for the other.
+
+    * plan-shaped book + `confirm_empty_book=True` + `edited=False` -> REFUSED (the empty
+      gate is not a "trust my book" flag);
+    * empty book + `confirm_empty_book=True` + `edited=False` on a NEW date -> ACCEPTED
+      (an empty book is never classified by the plan gate, and a date with no completed run
+      has no plan to equal).
+
+    re-break: fold the two gates into one -- pass `edited=edited or confirm_empty_book` at the
+    `_refuse_unconfirmed_plan_input` call site in `run_live_deploy` (i.e. let the empty-book
+    confirmation double as "trust my book"), which ACCEPTS the plan-shaped book (verified red:
+    `DID NOT RAISE UnconfirmedPlanAsInputError`), or refuse an empty book without `edited`,
+    which turns the confirmed all-cash deploy back into a 500.
+    """
+    monkeypatch.delenv("LIVETRADING_STRICT_SEED_BOOK", raising=False)
+    calls = _patch_deploy_subprocess(monkeypatch)
+    service = ExecutionService(temp_storage)
+    plan_date = "2026-10-30"
+    _seed_run_date(temp_storage, plan_date, post_holdings={"600519.SH": 100})
+
+    # (a) A plan-shaped book is NOT rescued by confirming an empty book.
+    with pytest.raises(UnconfirmedPlanAsInputError):
+        service.run_live_deploy(
+            **_deploy_kwargs(
+                tmp_path,
+                date_str=plan_date,
+                current_holdings={"600519.SH": 100},
+                confirm_empty_book=True,
+            )
+        )
+    assert calls == []
+
+    # (b) An EMPTY book (confirmed) on a date with no completed round needs no `edited`.
+    empty_date = "2026-10-31"
+    res = service.run_live_deploy(
+        **_deploy_kwargs(
+            tmp_path,
+            date_str=empty_date,
+            current_holdings={},
+            confirm_empty_book=True,
+        )
+    )
+    assert res["status"] == "success"
+    assert res["holdings"] == {}
+    assert len(calls) == 1
+    summary = _archived_summary(temp_storage, calls[0])
+    assert summary["holdings_seed_source"] == CONFIRMED_EMPTY_BOOK_SOURCE
+
+
+def test_seed_label_is_not_derived_from_the_display_helper(temp_storage):
+    """The seed path keeps its OWN label vocabulary -- `post_trade_book` is display-only.
+
+    `resolve_seed_holdings` and `_display_book_for_run_dir` are deliberately separate
+    functions; both read the operator sidecar, but a plan resolved for SEEDING is
+    `operator_snapshot` / `previous_post_holdings`, never `post_trade_book`.  Unifying them
+    would make a display-relabelling change silently move order sizing.
+
+    re-break: make `resolve_seed_holdings` return `_display_book_for_run_dir(...)`'s
+    `(book, source)` -- `source` becomes `post_trade_book` (verified red).
+    """
+    _seed_run_date(
+        temp_storage,
+        "2026-10-30",
+        holdings=dict(_GHOST_BOOK),
+        post_holdings=dict(_CORRECTED_BOOK),
+    )
+
+    seed, source = temp_storage.resolve_seed_holdings(
+        "2026-10-30", _STRATEGY, _UNIVERSE
+    )
+    assert seed == _CORRECTED_BOOK
+    assert source == "operator_snapshot"
+
+    # A LATER date with no session book of its own still comes from the plan chain.
+    _seed_run_date(temp_storage, "2026-10-31")
+    seed, source = temp_storage.resolve_seed_holdings(
+        "2026-10-31", _STRATEGY, _UNIVERSE
+    )
+    assert seed == _CORRECTED_BOOK
+    assert source == "previous_post_holdings"
+    assert source != "post_trade_book"
+
+
+def test_new_date_is_not_gated_by_edited(temp_storage, tmp_path, monkeypatch):
+    """The unedited-plan gate is scoped to a session that ALREADY has a plan for THAT date.
+
+    The gate's whole premise is "the book you submitted is this date's recorded plan", so a
+    date with no completed round has no reference to compare against and must never be
+    gated: the ordinary first deploy of a session is unedited by construction (the operator
+    has nothing older to review it against yet).  Applying the check to every
+    `edited=False` deploy -- or letting it borrow an EARLIER date's plan as the reference --
+    would refuse the normal live flow outright.
+
+    Both deploy paths are covered: `run_live_deploy` and the matrix
+    `run_multi_strategy_netted_deploy` share this validation shape, and neither may invent a
+    plan for a date that has none.
+
+    re-break: drop the `planned is None` early return in `_refuse_unconfirmed_plan_input`
+    so the check "applies whenever `edited=False`" (with no reference it would compare the
+    book against itself) -- assertion (a) is refused (verified red).  Falling back to an
+    earlier date's plan instead reddens assertion (b).
+    """
+    monkeypatch.delenv("LIVETRADING_STRICT_SEED_BOOK", raising=False)
+    calls = _patch_deploy_subprocess(monkeypatch)
+    service = ExecutionService(temp_storage)
+    book = {"600519.SH": 100}
+
+    # (a) No run at all for that (strategy, universe, date) -> accepted with `edited=False`.
+    res = service.run_live_deploy(
+        **_deploy_kwargs(tmp_path, date_str="2026-11-02", current_holdings=dict(book))
+    )
+    assert res["status"] == "success"
+    assert _archived_summary(temp_storage, calls[-1])["holdings_seed_source"] == EXPLICIT_BOOK_SOURCE
+
+    # (b) A PRIOR date whose plan happens to EQUAL the submitted book, and the target date
+    # still has no round of its own.  A gate that reached backwards for a reference would
+    # refuse this; it must not -- "identical to YESTERDAY's plan" is not the hazard, only
+    # "identical to THIS date's plan" is.
+    _seed_run_date(temp_storage, "2026-11-03", post_holdings=dict(book))
+    res = service.run_live_deploy(
+        **_deploy_kwargs(tmp_path, date_str="2026-11-04", current_holdings=dict(book))
+    )
+    assert res["status"] == "success"
+    assert _archived_summary(temp_storage, calls[-1])["holdings_seed_source"] == EXPLICIT_BOOK_SOURCE
+
+    # (c) The matrix path shares the validation and must behave identically on a new date.
+    matrix_res = service.run_multi_strategy_netted_deploy(
+        matrix_id="tri_core_blend",
+        strategies=[{"strategy_key": "chan_four_state_shield_blend", "capital_weight": 1.0}],
+        custom_symbols=["600519.SH"],
+        as_of_date="2026-11-05",
+        portfolio_value=100_000.0,
+        current_holdings=dict(book),
+        data_provider="synthetic",
+        allow_intraday=False,
+    )
+    assert matrix_res["status"] == "success"
+    matrix_summary = temp_storage._load_json(
+        os.path.join(
+            temp_storage.archive_dir, "2026-11-05", "multi_netted_tri_core_blend", "summary.json"
+        ),
+        default={},
+    ) or {}
+    assert matrix_summary["holdings_seed_source"] == EXPLICIT_BOOK_SOURCE
