@@ -867,7 +867,17 @@ def test_execution_service_synthetic_runs(temp_workspace):
     assert archived_run is not None
     assert archived_run["health_report"] is not None
     assert len(archived_run["trading_ticket"]) > 0
-    assert archived_run["holdings"] == initial_holdings
+    # (25.9.11) DISPLAY contract: a completed Stage-2 round shows its POST book, not the
+    # pre-trade input (`holdings.json`) it was seeded with. The submitted book stays
+    # reachable as `pre_trade_holdings` -- published only when it DIFFERS from the
+    # displayed book (this synthetic round's plan happens to equal the seed, so it is
+    # deliberately not duplicated).
+    assert archived_run["holdings_source"] == "post_trade_book"
+    assert archived_run["holdings"] == archived_run["post_holdings"]
+    if archived_run["holdings"] == initial_holdings:
+        assert "pre_trade_holdings" not in archived_run
+    else:
+        assert archived_run["pre_trade_holdings"] == initial_holdings
     assert archived_run["has_csv"] is True
 
 
@@ -1694,7 +1704,18 @@ def test_app_js_holdings_value_and_provider_logic():
 
 
 def test_manual_same_day_holdings_override_ticket_fills(temp_workspace):
-    """Verify manual same-day holdings save overrides assumed ticket fills."""
+    """A completed Stage-2 round DISPLAYS its planned post book; the hand-saved correction is kept as evidence.
+
+    (25.9.11) This used to assert the opposite -- `get_holdings` returned the manually saved
+    snapshot, so `GET /api/holdings` painted whatever was hand-saved last even for a round
+    whose authoritative book is `post_holdings.json` (and the 2026-10-29 ghost lots
+    `600584.SH` / `600362.SH` came back on screen the same way).  A Stage-2 artifact in the
+    dir now makes the plan the DISPLAYED book; the operator's snapshot is not lost -- it is
+    published as `get_run(...)["pre_trade_holdings"]`.  Seeding already ignored the snapshot
+    in such a dir since `resolve_seed_holdings` (2026-10-30, §25.9.8.1).
+    re-break: revert the `get_holdings` step-1 change back to `_load_snapshot_holdings(...)`
+    -- it returns `{"AAPL": 30}` again and hides the plan.
+    """
     storage, _ = temp_workspace
     strat_k = "test_strat"
     univ_k = "test_univ"
@@ -1708,9 +1729,16 @@ def test_manual_same_day_holdings_override_ticket_fills(temp_workspace):
     # 2. User manually corrects actual fill: only 30 AAPL filled, 0 MSFT
     storage.save_holdings({"AAPL": 30}, date_str=date_str, strategy_key=strat_k, universe_key=univ_k)
 
-    # 3. get_holdings for same date MUST return user's explicit snapshot {"AAPL": 30}
+    # 3. get_holdings for same date MUST return the round's PLANNED POST book for display
     loaded = storage.get_holdings(date_str, strategy_key=strat_k, universe_key=univ_k)
-    assert loaded == {"AAPL": 30}
+    assert loaded == {"AAPL": 50, "MSFT": 20}
+
+    # 4. ...and the hand-saved correction stays VISIBLE rather than hidden.
+    bundle = storage.get_run(date_str, strategy_key=strat_k, universe_key=univ_k)
+    assert bundle is not None
+    assert bundle["holdings_source"] == "post_trade_book"
+    assert bundle["holdings"] == {"AAPL": 50, "MSFT": 20}
+    assert bundle["pre_trade_holdings"] == {"AAPL": 30}
 
 
 def test_path_traversal_sanitization(temp_workspace):
@@ -2035,11 +2063,17 @@ def test_same_day_rerun_idempotency(temp_workspace):
     ticket1 = dep1["trading_ticket"]
     assert ticket1 is not None and len(ticket1) > 0
 
-    # Verify storage.get_run returns pre-trade holdings for UI reconciliation
+    # Verify storage.get_run reports the POST book for display, and keeps the submitted
+    # pre-trade book separate (25.9.11 display contract). `pre_trade_holdings` is only
+    # published when it differs from the display, so this no-op round correctly omits it.
     run_bundle = storage.get_run(val_date)
     assert run_bundle is not None
-    assert run_bundle["holdings"] == initial_holdings
-    assert "post_holdings" in run_bundle
+    assert run_bundle["holdings_source"] == "post_trade_book"
+    assert run_bundle["holdings"] == run_bundle["post_holdings"]
+    if run_bundle["holdings"] == initial_holdings:
+        assert "pre_trade_holdings" not in run_bundle
+    else:
+        assert run_bundle["pre_trade_holdings"] == initial_holdings
     assert isinstance(run_bundle["post_holdings"], dict)
 
     # -------------------------------------------------------------
@@ -2050,7 +2084,10 @@ def test_same_day_rerun_idempotency(temp_workspace):
         custom_symbols=custom_symbols,
         as_of_date=val_date,
         portfolio_value=88000.0,
-        current_holdings=run_bundle["holdings"],
+        # The SAME pre-trade book as `dep1`, i.e. what was actually submitted -- NOT the
+        # displayed post book (re-submitting a post book would make the rerun a no-op and
+        # destroy the idempotency comparison this test exists for).
+        current_holdings=initial_holdings,
         data_provider="synthetic",
         # Same anchor as `dep1` -- an idempotency comparison must hold the NAV source fixed.
         nav_override=True,

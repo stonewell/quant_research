@@ -1939,3 +1939,243 @@ def test_book_is_empty_semantics_are_unchanged(holdings, expected):
     as `len(holdings) == 0` (all-zero table => a real book).
     """
     assert book_is_empty(holdings) is expected
+
+
+# ---------------------------------------------------------------------------
+# 10. DISPLAY book (25.9.11): a completed Stage-2 round shows its POST book
+#
+# The web UI painted a historical date's PRE-trade INPUT (`holdings.json`) instead
+# of the round's post book, so `2026-10-29` displayed the ghost `600584.SH: 100` /
+# `600362.SH: 100` lots that were sold and filled on 2026-10-26 -- although the same
+# dir's `post_holdings.json` already held the corrected 5-symbol book.
+#
+# One rule, one place: `StorageManager._display_book_for_run_dir`.  A dir that
+# carries a Stage-2 artifact (`has_stage2_artifact`) DISPLAYS its planned post book
+# and exposes the raw submitted book separately as `pre_trade_holdings`; a dir with
+# no Stage-2 artifact still displays its operator snapshot (unchanged).  DISPLAY
+# ONLY -- `resolve_seed_holdings` never calls the helper (pinned by test 5 below).
+# ---------------------------------------------------------------------------
+
+#: The real `2026-10-29/215823/holdings.json` shape (ghost lots deliberately preserved).
+_GHOST_BOOK = {
+    "600900.SH": 800,
+    "600660.SH": 400,
+    "000999.SZ": 600,
+    "600584.SH": 100,  # sold + filled 2026-10-26; still in the PRE-trade input
+    "600362.SH": 100,  # same
+    "601728.SH": 5800,
+}
+#: The same dir's corrected `post_holdings.json` (5 symbols, ghost lots gone).
+_CORRECTED_BOOK = {
+    "601728.SH": 5800,
+    "601919.SH": 2400,
+    "000999.SZ": 600,
+    "600660.SH": 400,
+    "600900.SH": 800,
+}
+
+
+def test_get_run_displays_the_post_book_and_keeps_the_ghost_as_pre_trade(temp_storage):
+    """`get_run()["holdings"]` is the 5-symbol POST book; the ghost survives as `pre_trade_holdings`.
+
+    re-break: revert `get_run` to read `holdings.json` directly into `bundle["holdings"]`
+    (the pre-25.9.11 code) -- the UI then paints `600584.SH` / `600362.SH` again.
+    """
+    _seed_run_date(
+        temp_storage,
+        "2026-10-29",
+        holdings=dict(_GHOST_BOOK),
+        post_holdings=dict(_CORRECTED_BOOK),
+    )
+
+    bundle = temp_storage.get_run(
+        "2026-10-29", strategy_key=_STRATEGY, universe_key=_UNIVERSE
+    )
+
+    assert bundle is not None
+    assert bundle["holdings"] == _CORRECTED_BOOK, "the displayed book must be the plan"
+    assert "600584.SH" not in bundle["holdings"]
+    assert "600362.SH" not in bundle["holdings"]
+    assert bundle["holdings_source"] == "post_trade_book"
+    # The evidence is NOT hidden: the raw submitted book is reachable under its own key.
+    assert bundle["pre_trade_holdings"] == _GHOST_BOOK
+    # `post_holdings` is byte-for-byte unchanged from before this fix.
+    assert bundle["post_holdings"] == _CORRECTED_BOOK
+
+
+def test_get_holdings_does_not_return_the_ghost_book_for_a_completed_round(temp_storage):
+    """`get_holdings()` (the `/api/holdings` outlet) also returns the post book, not the ghost.
+
+    re-break: revert the `get_holdings` step-1 change back to
+    `_load_snapshot_holdings(...)` -- `GET /api/holdings` then serves the ghost book.
+    """
+    _seed_run_date(
+        temp_storage,
+        "2026-10-29",
+        holdings=dict(_GHOST_BOOK),
+        post_holdings=dict(_CORRECTED_BOOK),
+    )
+
+    book = temp_storage.get_holdings(
+        "2026-10-29", strategy_key=_STRATEGY, universe_key=_UNIVERSE
+    )
+
+    assert book == _CORRECTED_BOOK
+    assert "600584.SH" not in book
+    assert "600362.SH" not in book
+
+
+def test_stage2_dir_without_a_resolvable_plan_labelled_falls_back_to_the_snapshot(temp_storage):
+    """Artifact but NO plan: show the raw snapshot LABELLED, never an empty book.
+
+    An old ticket carrying only `current_shares` (no `target_shares`) and no
+    `post_holdings.json` has no resolvable plan.  Blanking the display to `{}` would be
+    worse than showing a book explicitly labelled as the pre-trade one.
+    re-break: return `{}` / `None` from the helper's `pre_trade_fallback` arm instead of
+    falling back to `_load_snapshot_holdings(run_dir)`.
+    """
+    target = _seed_run_date(temp_storage, "2026-10-29", holdings=dict(_GHOST_BOOK))
+    # A Stage-2 artifact with no `target_shares` -> `post_holdings_from_ticket` returns None.
+    _write_json(
+        os.path.join(target, "live_trading_ticket.json"),
+        [{"symbol": "600584.SH", "action": "SELL", "current_shares": 100}],
+    )
+
+    bundle = temp_storage.get_run(
+        "2026-10-29", strategy_key=_STRATEGY, universe_key=_UNIVERSE
+    )
+
+    assert bundle is not None
+    assert bundle["holdings"] == _GHOST_BOOK, "must not silently blank the display"
+    assert bundle["holdings"] != {}
+    assert bundle["holdings_source"] == "pre_trade_fallback"
+    # Identical to the displayed book -> deliberately NOT duplicated under its own key.
+    assert "pre_trade_holdings" not in bundle
+
+
+def test_dir_without_a_stage2_artifact_displays_its_operator_snapshot(temp_storage):
+    """An operator-only snapshot dir is untouched: `holdings` is the snapshot, source `snapshot`.
+
+    re-break: apply the post-book rule unconditionally (drop the `has_stage2_artifact`
+    guard) -- an operator snapshot would then be mislabelled / overridden.
+    """
+    _seed_run_date(temp_storage, "2026-10-29", holdings={"AAA.SH": 300})
+
+    bundle = temp_storage.get_run(
+        "2026-10-29", strategy_key=_STRATEGY, universe_key=_UNIVERSE
+    )
+
+    assert bundle is not None
+    assert bundle["holdings"] == {"AAA.SH": 300}
+    assert bundle["holdings_source"] == "snapshot"
+    assert "pre_trade_holdings" not in bundle
+
+
+def test_display_book_rule_does_not_change_seed_resolution(temp_storage):
+    """Seed-path neutrality: `resolve_seed_holdings` ignores the display helper.
+
+    For the case-1 dir it still returns the POST book with source `operator_snapshot`
+    (its own precedence, reached independently of `_display_book_for_run_dir`), so order
+    sizing cannot move because of a display fix.
+    re-break: make `_display_book_for_run_dir` feed `resolve_seed_holdings` -- e.g. have the
+    seed's plan leg return the helper's label -- `source` becomes `"post_trade_book"` and the
+    deploy-path contract drifts (verified red).
+    """
+    _seed_run_date(
+        temp_storage,
+        "2026-10-29",
+        holdings=dict(_GHOST_BOOK),
+        post_holdings=dict(_CORRECTED_BOOK),
+    )
+
+    seed, source = temp_storage.resolve_seed_holdings(
+        "2026-10-29", _STRATEGY, _UNIVERSE
+    )
+
+    assert seed == _CORRECTED_BOOK
+    assert source == "operator_snapshot"
+
+
+def test_multi_netted_dir_displays_its_netted_plan_not_the_ghost_snapshot(temp_storage):
+    """A MULTI-STRATEGY netted dir obeys the same display rule (25.9.11b).
+
+    `get_run` reaches those dirs through `get_multi_netting_run_dir` (a matrix id is
+    passed as `strategy_key`).  Such a dir writes `netted_trading_ticket.json` and a
+    pre-trade `holdings.json`, and has NO `post_holdings.json` and NO
+    `live_trading_ticket.*` -- so a helper that only tried the single-strategy ticket
+    name would find "artifact present, plan unresolvable" and display the PRE-trade
+    seed: exactly the ghost-class defect this whole section removes.
+
+    re-break: pass only `("live_trading_ticket",)` to `_planned_book_from_run_dir` inside
+    `_display_book_for_run_dir` -- `holdings_source` becomes `pre_trade_fallback` and
+    `holdings` is the ghost snapshot again (verified red).
+    """
+    matrix_id = "m1"
+    netted_dir = temp_storage.get_multi_netting_run_dir(matrix_id, "2026-10-29")
+    os.makedirs(netted_dir, exist_ok=True)
+    _write_json(
+        os.path.join(netted_dir, "netted_trading_ticket.json"),
+        [
+            {"symbol": "601728.SH", "action": "BUY", "target_shares": 5800},
+            {"symbol": "601919.SH", "action": "BUY", "target_shares": 2400},
+            {"symbol": "600900.SH", "action": "HOLD", "target_shares": 800},
+        ],
+    )
+    # Pre-trade seed carrying a lot the model already exited.
+    _write_json(
+        os.path.join(netted_dir, "holdings.json"),
+        {"601728.SH": 5800, "600584.SH": 100},
+    )
+
+    bundle = temp_storage.get_run("2026-10-29", strategy_key=matrix_id)
+
+    assert bundle is not None
+    assert bundle["holdings_source"] == "post_trade_book"
+    assert bundle["holdings"] == {
+        "601728.SH": 5800,
+        "601919.SH": 2400,
+        "600900.SH": 800,
+    }
+    assert "600584.SH" not in bundle["holdings"]
+    # Still not hidden: the submitted seed is reachable under its own key.
+    assert bundle["pre_trade_holdings"] == {"601728.SH": 5800, "600584.SH": 100}
+
+
+def test_get_run_and_get_holdings_agree_on_the_instance_walk(temp_storage):
+    """One instance walk, both outlets (25.9.11c).
+
+    The newest instance carries NO book; an EARLIER instance of the same session
+    completed Stage 2 and also holds the pre-trade seed.  `/api/runs/...` used to read
+    only `holdings.json` on that walk, so it painted the ghost while `/api/holdings`
+    (already on the shared helper) painted the plan -- the two screens disagreed about
+    the same session.
+
+    re-break: put `self._load_snapshot_holdings(instance_dir)` back into `get_run`'s
+    instance walk -- `bundle["holdings"]` becomes `_GHOST_BOOK` again while
+    `get_holdings` keeps returning `_CORRECTED_BOOK` (verified red).
+    """
+    _seed_run_date(
+        temp_storage,
+        "2026-10-29",
+        holdings=dict(_GHOST_BOOK),
+        post_holdings=dict(_CORRECTED_BOOK),
+    )
+    # Newest instance of the same session: a later round that carries no book at all.
+    _seed_run_date(temp_storage, "2026-10-29", instance="120000")
+
+    bundle = temp_storage.get_run(
+        "2026-10-29", strategy_key=_STRATEGY, universe_key=_UNIVERSE
+    )
+    book = temp_storage.get_holdings(
+        "2026-10-29", strategy_key=_STRATEGY, universe_key=_UNIVERSE
+    )
+
+    assert bundle is not None
+    assert bundle["holdings"] == _CORRECTED_BOOK
+    assert "600584.SH" not in bundle["holdings"]
+    assert book == _CORRECTED_BOOK
+    assert bundle["holdings"] == book, "the two outlets must not disagree"
+    # `holdings_source` still describes the PRIMARY (newest) dir's rule, which here has
+    # no book at all -- documented: it can read `snapshot` while the VALUE was carried
+    # forward from an earlier instance.
+    assert bundle["holdings_source"] == "snapshot"

@@ -1663,6 +1663,61 @@ class StorageManager:
                 return data
         return None
 
+    def _display_book_for_run_dir(
+        self, run_dir: Optional[str]
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """The book a run dir should DISPLAY, plus a label saying which kind of book it is.
+
+        THE RULE (one rule, one place): when a run dir carries a Stage-2 artifact
+        (`has_stage2_artifact`: a ticket or `post_holdings.json`), its displayed book is
+        that dir's PLANNED POST book (`_planned_book_from_run_dir`: `post_holdings.json`,
+        else re-derived from the ticket's `target_shares` -- for EITHER ticket family,
+        `live_trading_ticket.*` or `netted_trading_ticket.*`) -- NEVER its `holdings.json`.
+        Only a dir that never ran Stage 2 shows its snapshot, because there the snapshot
+        is genuinely the operator's book (`save_holdings`).
+
+        Why (2026-10-29 evidence, deliberately preserved): the live archive's
+        `chan_four_state_blend/custom_astock_202609_20_new/2026-10-29/holdings.json` and
+        `.../2026-10-29/215823/holdings.json` are the round's PRE-trade input and still
+        claim `600584.SH: 100` + `600362.SH: 100` -- lots that were sold and filled on
+        2026-10-26.  `215823/post_holdings.json` holds the corrected 5-symbol book.  The
+        UI used to paint the ghost `holdings.json` (a display-only bug: `get_run` fed
+        `bundle["holdings"]` and `app.js` rendered it), so the sold lots reappeared on
+        screen for a historical date.  `save_daily_run` writes that pre-trade seed before
+        launching the child, so a completed round's `holdings.json` proves nothing about
+        what is held -- the same reasoning that keeps `resolve_seed_holdings` and
+        `get_previous_post_holdings` off it.
+
+        DISPLAY ONLY.  This helper is never consulted by `resolve_seed_holdings`, so seed
+        resolution (and therefore order sizing) is byte-for-byte unchanged.
+
+        Returns `(book, source)` with `source` one of EXACTLY:
+          * `"post_trade_book"` -- Stage-2 artifact present and its plan resolved;
+          * `"pre_trade_fallback"` -- Stage-2 artifact present but NO resolvable plan
+            (e.g. an old ticket carrying only `current_shares`).  The raw snapshot is
+            returned rather than `{}`: blinking a display to "all cash" is worse than
+            showing a labelled pre-trade book, and the label lets the consumer say so;
+          * `"snapshot"` -- no Stage-2 artifact at all; the snapshot IS the book.
+        `(None, <source>)` means the dir carries no book of that kind at all.
+        """
+        if not run_dir:
+            return None, None
+        if has_stage2_artifact(run_dir):
+            # (25.9.11b) BOTH ticket file names: a single-strategy round writes
+            # `live_trading_ticket.*`, a multi-strategy netted round writes
+            # `netted_trading_ticket.*` (see `get_multi_netting_run_dir`, which is how
+            # `get_run` reaches a `multi_netted_<matrix>` dir).  With only the
+            # single-strategy name, a netted dir has a Stage-2 artifact but no resolvable
+            # plan, so it landed in the `pre_trade_fallback` arm and the display was the
+            # PRE-trade seed -- the very ghost-class defect this helper removes.
+            plan = self._planned_book_from_run_dir(
+                run_dir, ("live_trading_ticket", "netted_trading_ticket")
+            )
+            if plan is not None:
+                return plan, "post_trade_book"
+            return self._load_snapshot_holdings(run_dir), "pre_trade_fallback"
+        return self._load_snapshot_holdings(run_dir), "snapshot"
+
     def _earlier_runs(
         self,
         date_str: Optional[str],
@@ -1825,11 +1880,14 @@ class StorageManager:
         """Holdings at the START of date_str (i.e. the input to that day's Stage 2 run).
 
         Resolution order:
-          1. An explicit snapshot for that exact date (holdings.json / current_holdings.json) --
-             whether saved by the user or written by Stage 2 as its pre-trade input. This MUST win
-             over the same day's post_holdings.json: otherwise a manual correction saved on date D
-             is hidden by the strategy's assumed fills, and re-running Stage 2 on D reconciles
-             against targets as if they were already filled (zero / wrong orders).
+          1. The book this run dir should DISPLAY (`_display_book_for_run_dir`, 25.9.11):
+             a dir that carries a Stage-2 artifact yields its PLANNED POST book
+             (`post_holdings.json`, else the ticket's `target_shares`); only a dir that
+             never ran Stage 2 shows `holdings.json` / `current_holdings.json` directly.
+             (Before 2026-10-30 this step returned the snapshot unconditionally, so
+             `GET /api/holdings` served the 2026-10-29 ghost lots `600584.SH` /
+             `600362.SH` for a completed round. The raw submitted book is still
+             reachable via `get_run(...)["pre_trade_holdings"]`.)
           2. Post-trade holdings carried forward from the most recent EARLIER run.
           3. Legacy flat archive snapshot.  (The global `data/current_holdings.json` fallback
              was removed on 2026-10-30 -- the archive is the only store; see
@@ -1837,19 +1895,25 @@ class StorageManager:
         With no date: post-trade holdings of the latest run for (strategy, universe).
 
         (L2.62) A session can now own several instance dirs.  Step 1 prefers the NEWEST
-        instance's snapshot and then walks the session's earlier instances newest-first
+        instance's book and then walks the session's earlier instances newest-first
         before falling back to earlier DAYS: a same-day rerun that submits no explicit
         book must be reconciled against the book that same session actually started from,
-        not against yesterday's.  Only `holdings.json` / `current_holdings.json`
-        (snapshots) are consulted on that walk -- never a planned book.
+        not against yesterday's.
         """
         date_str = validate_date_str(date_str)
         if date_str:
             base_dir = self.find_existing_run_base_dir(strategy_key, universe_key, date_str)
-            snap = self._load_snapshot_holdings(self.resolve_latest_instance_dir(base_dir))
+            # (25.9.11) DISPLAY rule, same helper as `get_run`: a dir that completed Stage 2
+            # must hand back its PLANNED POST book, not its stale pre-trade `holdings.json`.
+            # Without this, `GET /api/holdings` kept returning the 2026-10-29 ghost lots
+            # (`600584.SH` / `600362.SH`) for a completed round.  The value is IDENTICAL for
+            # every dir without a Stage-2 artifact (`"snapshot"` arm of the helper).
+            snap, _source = self._display_book_for_run_dir(
+                self.resolve_latest_instance_dir(base_dir)
+            )
             if snap is None and base_dir:
                 for instance_dir in reversed(list_instances_for_date(base_dir)):
-                    snap = self._load_snapshot_holdings(instance_dir)
+                    snap, _source = self._display_book_for_run_dir(instance_dir)
                     if snap is not None:
                         break
             if snap is not None:
@@ -2894,28 +2958,33 @@ class StorageManager:
         strat_n = summary_data.get("strategy_name", "")
         univ_n = summary_data.get("universe_name", "")
 
-        # Holdings extraction: pre-trade snapshot first (holdings.json / current_holdings.json),
-        # then carry forward from earlier runs (< date_str).
-        # We must NOT fall back to extract_post_run_holdings for bundle["holdings"],
-        # because bundle["holdings"] is used as the pre-trade baseline in the UI!
-        holdings_data = self._load_json(os.path.join(run_dir, "holdings.json"))
-        if not holdings_data:
-            holdings_data = self._load_json(os.path.join(run_dir, "current_holdings.json"))
-        if not holdings_data and strat_k and univ_k:
+        # (25.9.11) DISPLAY book, NOT the raw `holdings.json` any more.  The old code read
+        # `holdings.json` directly here, so a historical date painted the round's PRE-trade
+        # INPUT: `2026-10-29` showed the ghost `600584.SH: 100` / `600362.SH: 100` lots that
+        # were sold and filled on 2026-10-26, even though the same dir already carried the
+        # corrected 5-symbol `post_holdings.json` (deliberately preserved evidence -- see
+        # `_display_book_for_run_dir`).  `holdings_source` tells the consumer which kind of
+        # book this is; the raw submitted book stays reachable as `pre_trade_holdings`.
+        holdings_data, holdings_source = self._display_book_for_run_dir(run_dir)
+        if holdings_data is None and strat_k and univ_k:
             # (L2.62) The session's own earlier instances come BEFORE yesterday's book: a
-            # rerun's pre-trade baseline is what this session started with, not what the
-            # previous session ended with.  Snapshots only (`holdings.json` /
-            # `current_holdings.json`) -- never a planned book.
+            # rerun's baseline is what this session started with, not what the previous
+            # session ended with.
+            # (25.9.11c) The walk uses the SAME `_display_book_for_run_dir` rule as
+            # `get_holdings`/`_earlier_runs`: reading only `holdings.json` /
+            # `current_holdings.json` here made `/api/runs/...` paint the ghost PRE-trade
+            # book while `/api/holdings` painted the plan for the identical dir.  Value
+            # only -- `holdings_source` keeps describing the PRIMARY dir's rule.
             for instance_dir in reversed(
                 list_instances_for_date(self.find_existing_run_base_dir(strat_k, univ_k, date_str))
             ):
-                snap = self._load_snapshot_holdings(instance_dir)
+                snap, _instance_source = self._display_book_for_run_dir(instance_dir)
                 if snap is not None:
                     holdings_data = snap
                     break
-        if not holdings_data and strat_k and univ_k:
+        if holdings_data is None and strat_k and univ_k:
             holdings_data = self._carry_forward_holdings(date_str, strat_k, univ_k)
-        if not holdings_data:
+        if holdings_data is None:
             holdings_data = self.get_holdings(date_str, strat_k, univ_k)
 
         post_holdings_data = self.extract_post_run_holdings(run_dir)
@@ -2960,7 +3029,7 @@ class StorageManager:
         friction_savings = self._load_json(os.path.join(run_dir, "friction_savings_report.json"))
         sub_ledgers = self._load_json(os.path.join(run_dir, "sub_ledgers.json"))
 
-        return {
+        bundle: Dict[str, Any] = {
             "date": date_str,
             "path": run_dir,
             # (L2.62) Which same-day instance this bundle came from: "HHMMSS", or None for
@@ -2977,11 +3046,29 @@ class StorageManager:
             "sub_ledgers": sub_ledgers,
             "summary": summary_data,
             "holdings": holdings_data or {},
+            # (25.9.11) Which kind of book `holdings` is: "post_trade_book" (a completed
+            # Stage-2 round's plan), "pre_trade_fallback" (Stage-2 artifact but no resolvable
+            # plan, so the raw pre-trade snapshot is shown, LABELLED), or "snapshot" (a dir
+            # that never ran Stage 2).  Display-only; see `_display_book_for_run_dir`.  When
+            # the dir carries no book at all the label describes that dir's rule ("snapshot")
+            # while the legacy chain below fills `holdings` from earlier instances/days.
+            "holdings_source": holdings_source,
             "post_holdings": post_holdings_data or {},
             "prices": prices_map,
             "account_state": account_state,
             "has_csv": os.path.exists(os.path.join(run_dir, "live_trading_ticket.csv")) or os.path.exists(os.path.join(run_dir, "netted_trading_ticket.csv")),
         }
+
+        # (25.9.11) Keep the raw submitted PRE-trade book reachable so the defect evidence
+        # stays VISIBLE rather than hidden behind the corrected display: for
+        # `2026-10-29/215823` this is the ghost 6-symbol book (`600584.SH: 100`,
+        # `600362.SH: 100`) while `holdings` is the corrected 5-symbol plan.  Published only
+        # when it actually differs from the displayed book -- otherwise it is noise.
+        raw_snapshot = self._load_snapshot_holdings(run_dir)
+        if raw_snapshot is not None and raw_snapshot != bundle["holdings"]:
+            bundle["pre_trade_holdings"] = raw_snapshot
+
+        return bundle
 
     def get_run_csv(
         self,
