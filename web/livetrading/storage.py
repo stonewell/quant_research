@@ -185,6 +185,45 @@ def get_universe_key_variants(universe_key: Optional[str]) -> List[str]:
     return variants
 
 
+def selection_spelling_for_universe_dir(dir_name: Optional[str]) -> str:
+    """Report a physical universe DIRECTORY name in the selection spelling that owns it.
+
+    WHY THIS EXISTS (P2): a round's archive path is
+    ``<archive>/<strategy>/<universe dir>/<date>/``.  ``list_runs`` prefers the
+    ``universe_key`` recorded in ``summary.json`` and falls back to the DIRECTORY
+    name when that file is missing.  On the real archive both spellings occur: the
+    directory is ``astock_202609_20_custom`` while every ``summary.json`` inside it
+    records ``custom_astock_202609_20``.  So three summary-less rounds
+    (``2026-09-27/28/29``) echoed ``astock_202609_20_custom`` and their twelve
+    siblings echoed ``custom_astock_202609_20`` -- the reported key of ONE physical
+    directory depended on whether a sidecar file happened to be written.
+
+    Reachability was never the problem: the listing filter compares with
+    :func:`keys_match`, which normalises both spellings to the same class, so both
+    answered to either selection.  The defect was the ECHOED key, i.e. any consumer
+    that compares ``run["universe_key"]`` as a string sees two sessions where there
+    is one.
+
+    So the fallback is re-spelled into the prefix form (``X_custom`` ->
+    ``custom_X``) -- the convention every writer in this repo uses -- but only after
+    :func:`keys_match` confirms the two names are in the same alias class.  The move
+    is therefore INSIDE ``normalize_universe_key``'s equivalence class and cannot
+    change which selection a round answers to; a name that is not in that class (or
+    one that does not end in ``_custom``) is returned unchanged.
+
+    Deliberately NOT canonicalised through ``custom_universes.json``: the archive
+    must be readable without a configuration file, and a registry-driven spelling
+    would make the listing depend on data outside the archive it is listing.
+    """
+    if not dir_name:
+        return dir_name or ""
+    name = str(dir_name)
+    if not name.lower().endswith("_custom"):
+        return name
+    candidate = "custom_" + name[: -len("_custom")]
+    return candidate if keys_match(candidate, name) else name
+
+
 def universe_key_from_path(path: Optional[str], universe_dir: Optional[str]) -> str:
     """Derive a universe key from a universe FILE PATH -- the single implementation.
 
@@ -2856,7 +2895,11 @@ class StorageManager:
                     if not r_strat_key:
                         r_strat_key = rel_parts[0]
                     if not r_univ_key:
-                        r_univ_key = rel_parts[1]
+                        # P2: a summary-less round is keyed by its DIRECTORY name.
+                        # Report that name in the selection spelling its siblings use,
+                        # so one physical directory cannot echo two different keys
+                        # depending on whether `summary.json` exists.
+                        r_univ_key = selection_spelling_for_universe_dir(rel_parts[1])
                 elif not base_name.startswith("multi_netted_"):
                     # Legacy flat runs
                     strat_file = summary_rep.get("strategy_file") or ""

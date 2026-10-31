@@ -77,6 +77,7 @@ from storage import (  # noqa: E402  (bare import: same module identity as serve
     StorageManager,
     has_stage2_artifact,
     instance_subdirs,
+    keys_match,
     prefer_instance_state_enabled,
     universe_key_from_path,
 )
@@ -2527,3 +2528,167 @@ def test_header_row_in_50_stock_is_reported_by_both_paths(tmp_path):
     # The data defect, recorded verbatim and in position: the header is symbol #1.
     assert entry["symbols"][0] == "证券代码"
     assert runner[0] == "证券代码"
+
+
+# ---------------------------------------------------------------------------
+# 13. (P2) A round's reported universe key must not depend on `summary.json`
+#
+# FORENSIC CONTEXT.  `<ARCH>/chan_four_state_blend/astock_202609_20_custom` holds 15
+# dated rounds.  Three of them (`2026-09-27`, `2026-09-28`, `2026-09-29`) carry no
+# `summary.json`; the other twelve record `universe_key = "custom_astock_202609_20"`.
+# Two claims were made about the three:
+#
+#   (i)  "they are invisible to every selection" -- a probe assertion.  FALSE, and
+#        the data says so: `list_runs(strategy=chan_four_state_blend,
+#        universe=custom_astock_202609_20)` returns all 15.  The probe compared the
+#        ECHOED `run["universe_key"]` string to the selection instead of asking the
+#        listing; `keys_match` (storage.py:2932-2941) normalises `custom_X` and
+#        `X_custom` to the same key, so the summary-less three always answered.
+#   (ii) a sibling test (`test_legacy_suffix_dir_still_resolves`) says a summary-less
+#        sibling IS reachable through the alias layer.  TRUE -- and it is the whole
+#        truth: reachability never depended on the summary.
+#
+# What WAS real: the three reported `astock_202609_20_custom` while their twelve
+# siblings reported `custom_astock_202609_20`.  One physical directory, two keys,
+# decided by whether a file happens to exist -- so any consumer that compares the
+# echoed key as a string sees two sessions where there is one.  `list_runs` now
+# reports the summary-less round under the SELECTION spelling (see
+# `selection_spelling_for_universe_dir`), which is a move inside one alias class and
+# therefore cannot change which selection a round answers to.
+# ---------------------------------------------------------------------------
+
+_P2_STRAT = "chan_four_state_blend"
+_P2_UNIV_DIR = "astock_202609_20_custom"
+_P2_UNIV_SELECTION = "custom_astock_202609_20"
+
+
+def _seed_round(root, date_str, *, summary_universe_key=None):
+    """One dated round dir; a summary only when `summary_universe_key` is given."""
+    dated = os.path.join(root, _P2_STRAT, _P2_UNIV_DIR, date_str)
+    os.makedirs(dated, exist_ok=True)
+    with open(os.path.join(dated, "live_trading_ticket.json"), "w", encoding="utf-8") as f:
+        json.dump([], f)
+    if summary_universe_key is not None:
+        with open(os.path.join(dated, "summary.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "date": date_str,
+                    "strategy_key": _P2_STRAT,
+                    "universe_key": summary_universe_key,
+                },
+                f,
+            )
+    return dated
+
+
+def test_dates_without_summary_are_listed_under_the_selection_that_owns_them(temp_storage):
+    """A summary-less round answers to the universe selection, in BOTH spellings.
+
+    The shape is the real archive's: one physical universe directory whose dates
+    disagree about whether they have a `summary.json`.  Both directions are checked,
+    because they are bridged by different halves of the alias layer: the twelve
+    summary-keyed dates only answer to the DIRECTORY spelling through
+    `normalize_universe_key`, and a round keyed by the directory name only answers to
+    the SELECTION spelling through it too.
+
+    re-break: compare raw keys in the listing filter (`r_univ_key == universe_key`
+    instead of `keys_match(...)`, storage.py:2934/2939) -- the summary-less date
+    disappears from the selection spelling AND the summary-keyed date disappears from
+    the directory spelling (verified red).  Removing the dir-name fallback instead
+    drops the summary-less date at the `require_both` guard (2930), also red.
+    """
+    _seed_round(temp_storage.archive_dir, "2026-10-20", summary_universe_key=_P2_UNIV_SELECTION)
+    _seed_round(temp_storage.archive_dir, "2026-10-19")
+
+    def dates_for(universe_key):
+        runs = temp_storage.list_runs(
+            strategy_key=_P2_STRAT, universe_key=universe_key, require_both=True
+        )
+        return sorted(r["date"] for r in runs)
+
+    assert dates_for(_P2_UNIV_SELECTION) == ["2026-10-19", "2026-10-20"]
+    # Reverse direction: the physical DIRECTORY spelling must find both as well.
+    assert dates_for(_P2_UNIV_DIR) == ["2026-10-19", "2026-10-20"]
+
+    # `latest_only` must not collapse two different dates into one, now that both
+    # report the same key: the dedupe key includes the date.
+    latest = temp_storage.list_runs(
+        strategy_key=_P2_STRAT,
+        universe_key=_P2_UNIV_SELECTION,
+        require_both=True,
+        latest_only=True,
+    )
+    assert sorted(r["date"] for r in latest) == ["2026-10-19", "2026-10-20"]
+
+
+def test_a_dates_key_does_not_depend_on_summary_presence(temp_storage):
+    """Flipping `summary.json` in and out of one date dir must not move its key.
+
+    This is the defect stated as an invariant: the same physical directory, the same
+    date, the same round -- only the presence of a sidecar file changes.  The key the
+    listing reports may not follow it, because "which universe is this round under"
+    is a property of the archive layout, not of whether a writer got as far as
+    emitting `summary.json`.
+
+    re-break: revert `selection_spelling_for_universe_dir` to return the directory
+    name unchanged (`X_custom` instead of `custom_X`) -- the summary-less pass
+    reports `astock_202609_20_custom` and this assert fires (verified red).
+    Deleting the dir-name fallback (storage.py:2897-2902) is the harsher mutation and
+    also red: the round reports `""` and, with `require_both`, is dropped entirely.
+    """
+    dated = _seed_round(temp_storage.archive_dir, "2026-10-19")
+
+    def key_for():
+        runs = temp_storage.list_runs(strategy_key=_P2_STRAT)
+        return {r["date"]: r["universe_key"] for r in runs}["2026-10-19"]
+
+    without_summary = key_for()
+    with open(os.path.join(dated, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "date": "2026-10-19",
+                "strategy_key": _P2_STRAT,
+                "universe_key": _P2_UNIV_SELECTION,
+            },
+            f,
+        )
+    with_summary = key_for()
+
+    assert without_summary == with_summary == _P2_UNIV_SELECTION
+
+
+def test_real_archive_three_legacy_dates_are_reachable(temp_storage):
+    """The three summary-less real rounds: listed, and under the selection that owns them.
+
+    Read-only against the production archive (skipped when it is not mounted).  The
+    `StorageManager` is built against `temp_storage`'s dirs and the archive is then
+    re-pointed by ATTRIBUTE, so not even `makedirs(exist_ok=True)` runs against the
+    real tree.
+
+    Records the resolution of the conflicting claims in section 13's header: the
+    probe's "invisible" reading was an artefact of comparing the echoed key string;
+    the sibling test's reading -- reachable through the alias layer -- is what the
+    data supports.
+
+    re-break: delete the dir-name fallback in `list_runs` -- the three summary-less
+    rounds report `""` and `require_both` drops them, so `2026-09-27 is invisible to
+    its own selection` (verified red).  Note that raw `==` in the listing filter does
+    NOT re-break this test once the fallback re-spells into the selection spelling --
+    it re-breaks test 1's reverse direction instead, which is why both are pinned.
+    """
+    archive = "/home/stone/Work/stock/simulate/202609/runs"
+    if not os.path.isdir(archive):
+        pytest.skip(f"no production archive at {archive}")
+
+    temp_storage.archive_dir = archive  # attribute only: nothing is created on disk
+    runs = temp_storage.list_runs(
+        strategy_key=_P2_STRAT, universe_key=_P2_UNIV_SELECTION, require_both=True
+    )
+    dates = sorted(r["date"] for r in runs)
+
+    for expected in ("2026-09-27", "2026-09-28", "2026-09-29"):
+        assert expected in dates, f"{expected} is invisible to its own selection"
+    assert len(dates) == 15, f"the session has 15 rounds, the listing returned {len(dates)}"
+
+    # Every echoed key is inside the selection's alias class, whichever file exists.
+    assert all(keys_match(_P2_UNIV_SELECTION, r["universe_key"]) for r in runs)
