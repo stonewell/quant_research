@@ -158,6 +158,61 @@ def get_universe_key_variants(universe_key: Optional[str]) -> List[str]:
     return variants
 
 
+def universe_key_from_path(path: Optional[str], universe_dir: Optional[str]) -> str:
+    """Derive a universe key from a universe FILE PATH -- the single implementation.
+
+    WHY THIS EXISTS (P0 dedup, behaviour-preserving): the same rule used to be
+    spelled twice, in ``StorageManager.resolve_keys`` and in
+    ``StorageManager.discover_universes``.  They agreed only because both
+    hardcoded the root's name in a different way:
+
+    * ``resolve_keys`` tested the IMMEDIATE PARENT against the literal set
+      ``("universe", "docs", ".")``;
+    * ``discover_universes`` tested it against ``basename(self.universe_dir)``.
+
+    With the shipped ``universe_dir=<repo>/docs/universe`` those are the same
+    predicate, and a probe over every preset under ``docs/universe/**`` plus both
+    ``custom_universes.json`` entries found zero divergence.  The divergence was
+    LATENT: configure ``universe_dir`` to any other directory (a per-deployment
+    folder, a symlinked tree) and the UI would advertise
+    ``<folder>_<stem>``-prefixed keys from one path while the deploy wrote -- and
+    every archive lookup read -- the bare-stem key from the other.  A universe
+    the operator can select but no run can ever match.
+
+    So the rule is stated once, here, and both call sites ask it:
+
+        ``<folder>_<stem>``   unless ``<folder>`` IS the universe root's own
+                              directory name (the file sits directly in
+                              ``universe_dir``) -> bare ``<stem>``.
+
+    The root test is ``folder == basename(universe_dir)`` -- NOT the historical
+    hardcoded set -- because the root's name is a property of the configured
+    directory, not of this checkout.  A path with no parent at all
+    (``"foo.txt"``, ``"./foo.txt"``, ``universe_dir=""``) also yields the bare
+    stem: that is what BOTH old spellings produced once the trailing-underscore
+    strip ran (``"_foo"`` -> ``"foo"``), so keeping it preserves today's output.
+
+    Normalisation is byte-for-byte the existing one:
+    ``[^a-zA-Z0-9_\\u4e00-\\u9fa5]+ -> "_"``, ``strip("_")``, ``lower()``.
+    An empty/``None`` path yields ``""``.
+
+    Separators: ``os.path`` only (``ntpath`` on Windows), never hand-rolled
+    splitting -- the same call the two original implementations made.
+    """
+    if not path:
+        return ""
+    norm_path = os.fspath(path)
+    folder = os.path.basename(os.path.dirname(norm_path))
+    stem = os.path.splitext(os.path.basename(norm_path))[0]
+    # `abspath` only to drop a trailing separator (``basename("a/b/") == ""``);
+    # it does not change the basename of any real directory name.
+    root_folder = os.path.basename(os.path.abspath(universe_dir)) if universe_dir else ""
+    if not folder or folder == os.curdir or (root_folder and folder == root_folder):
+        raw_key = stem
+    else:
+        raw_key = f"{folder}_{stem}"
+    return re.sub(r"[^a-zA-Z0-9_\u4e00-\u9fa5]+", "_", raw_key).strip("_").lower()
+
 
 _SAFE_KEY_RE = re.compile(r"[^A-Za-z0-9_\-\u4e00-\u9fa5]+")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -1483,12 +1538,12 @@ class StorageManager:
         elif universe_file and universe_file != "__CUSTOM__":
             clean_u = os.path.basename(universe_file)
             folder = os.path.basename(os.path.dirname(universe_file))
-            stem = os.path.splitext(clean_u)[0]
-            if folder and folder not in ("universe", "docs", "."):
-                raw_key = f"{folder}_{stem}"
-            else:
-                raw_key = stem
-            derived_key = re.sub(r"[^a-zA-Z0-9_\u4e00-\u9fa5]+", "_", raw_key).strip("_").lower()
+            # (P0) One owner for the path -> key rule: `universe_key_from_path`.
+            # This used to re-derive it with the hardcoded ("universe", "docs", ".")
+            # parent test, while `discover_universes` tested the configured
+            # `universe_dir`'s basename -- two spellings that diverge the moment
+            # `universe_dir` is not `docs/universe` (see the helper's docstring).
+            derived_key = universe_key_from_path(universe_file, self.universe_dir)
             univ_key = universe_key or derived_key
             univ_name = f"{folder}/{clean_u}" if folder and folder not in ("universe", "docs", ".") else clean_u
         else:
@@ -1574,12 +1629,13 @@ class StorageManager:
                                         symbols.append(sym)
                         except Exception:
                             symbols = []
-                        # Derive friendly label and universe_key
+                        # Derive friendly label and universe_key. (P0) The key comes
+                        # from `universe_key_from_path`, the same owner `resolve_keys`
+                        # uses -- `name` stays local because it is a display label
+                        # built from `f`, not from the normalised stem.
                         folder = os.path.basename(os.path.dirname(full_path))
                         name = f"{folder}/{f}" if folder != os.path.basename(self.universe_dir) else f
-                        stem = os.path.splitext(f)[0]
-                        raw_key = f"{folder}_{stem}" if folder != os.path.basename(self.universe_dir) else stem
-                        universe_key = re.sub(r"[^a-zA-Z0-9_\u4e00-\u9fa5]+", "_", raw_key).strip("_").lower()
+                        universe_key = universe_key_from_path(full_path, self.universe_dir)
                         universes.append({
                             "type": "preset",
                             "name": name,

@@ -78,6 +78,7 @@ from storage import (  # noqa: E402  (bare import: same module identity as serve
     has_stage2_artifact,
     instance_subdirs,
     prefer_instance_state_enabled,
+    universe_key_from_path,
 )
 
 from execution_service import (  # noqa: E402
@@ -2179,3 +2180,227 @@ def test_get_run_and_get_holdings_agree_on_the_instance_walk(temp_storage):
     # no book at all -- documented: it can read `snapshot` while the VALUE was carried
     # forward from an earlier instance.
     assert bundle["holdings_source"] == "snapshot"
+
+
+# ---------------------------------------------------------------------------
+# 11. (P0) ONE owner for the path -> universe_key rule
+#
+# `resolve_keys` (what a deploy WRITES under) and `discover_universes` (what the UI
+# LETS THE OPERATOR PICK) each derived that key with their own spelling of the same
+# rule.  They agreed only because both baked in the root's name -- one as the literal
+# set ("universe", "docs", "."), the other as `basename(self.universe_dir)`.  A probe
+# over all 29 presets under `docs/universe/**` plus both `custom_universes.json`
+# entries found ZERO divergence with the shipped layout; the split is LATENT and
+# appears as soon as `universe_dir` points anywhere else (a per-deployment folder, a
+# renamed tree), where the UI would advertise `<folder>_<stem>` while every archive
+# write and lookup used the bare `<stem>`.  One universe, two keys, no run able to
+# match.  `universe_key_from_path` is now the single implementation and both sites
+# call it, so the divergence cannot be reintroduced by editing one side only.
+#
+# The refactor is pinned two ways: the shipped presets must keep the exact key they
+# had (the first test -- a no-op proof, not a new rule), and a file sitting directly in
+# a root whose name is NOT "universe" must collapse to the bare stem on both paths
+# (the second).  Neither test can be satisfied by the old pair of spellings.
+# ---------------------------------------------------------------------------
+
+
+def _storage_with_universe(tmp_path, universe_dir):
+    """A `tmp_path` StorageManager whose UNIVERSE root is the caller's choice.
+
+    Every writable directory stays inside ``tmp_path`` (the package ``conftest``
+    would do this anyway; passing them explicitly keeps the intent local).
+    """
+    for name in ("data", "archive", "cache", "settings"):
+        (tmp_path / name).mkdir(exist_ok=True)
+    return StorageManager(
+        repo_root=_REPO_ROOT,
+        data_dir=str(tmp_path / "data"),
+        archive_dir=str(tmp_path / "archive"),
+        cache_dir=str(tmp_path / "cache"),
+        settings_dir=str(tmp_path / "settings"),
+        universe_dir=str(universe_dir),
+    )
+
+
+def _preset_files(universe_dir):
+    """Every ``.txt`` under ``universe_dir``, in `os.walk` order -- exactly what
+    ``discover_universes`` walks (symlinks to FILES included, symlinked dirs not)."""
+    return sorted(
+        os.path.join(root, f)
+        for root, _dirs, files in os.walk(universe_dir)
+        for f in files
+        if f.endswith(".txt")
+    )
+
+
+#: Three shipped presets whose key is pinned to its exact historical value, one per
+#: shaping rule the derivation applies (all values observed BEFORE the P0 refactor):
+#: a plain ASCII folder prefix, a CJK folder whose `A股` lowercases and whose `(...)`
+#: collapses to `_`, and a SYMLINKED file (the link and the file it points at are two
+#: distinct universes -- `china/core_satellite_22_stocks.txt` vs the CJK-folder copy).
+_ANCHORED_PRESET_KEYS = {
+    "china/20_etf.txt": "china_20_etf",
+    "china/50只A股高流动性优质股票精选/11_stocks.txt": "50只a股高流动性优质股票精选_11_stocks",
+    "china/core_satellite_22_stocks.txt": "china_core_satellite_22_stocks",
+}
+
+
+def test_universe_key_from_path_matches_discover_for_every_preset(tmp_path):
+    """Every shipped preset keeps the key the UI has always shown it under.
+
+    This is the NO-OP half of the P0 dedup: `resolve_keys` and
+    `discover_universes` used to disagree structurally, so routing both through
+    `universe_key_from_path` is only safe if not one of the 29 real files moved.
+    The probe that motivated the pass found 0 mismatches; this test keeps it that
+    way permanently, on the real tree, read-only.  Two assertions per file: the
+    two code paths agree (a one-sided edit cannot slip through), and the anchored
+    samples still produce their historical spelling (the keys are unchanged).
+
+    re-break: make `discover_universes` derive the key WITHOUT the folder prefix
+    (`universe_key = os.path.splitext(f)[0]` -- dropping the helper call on that
+    side) -- every one of the 29 nested presets mismatches (verified red: the loop
+    stops on the first, `china/14_etf_top3_pruned.txt` reporting
+    `14_etf_top3_pruned` where `china_14_etf_top3_pruned` is expected).  Stemming
+    the helper from the bare FILENAME instead of `splitext(...)[0]` trips the
+    anchored sample below (`china_20_etf_txt`, verified red).  NOTE: reintroducing
+    the historical hardcoded `("universe", "docs", ".")` parent set into the helper
+    is measurably INERT on these 29 files -- none sits in the universe root, their
+    parents are `china` / `hongkong` / `us` / `<CJK dir names>` -- so that half of
+    the predicate is pinned by the root-level test below, not here.
+    """
+    docs_universe = os.path.join(_REPO_ROOT, "docs", "universe")
+    if not os.path.isdir(docs_universe):
+        pytest.skip(f"no preset universe tree at {docs_universe} (CI layout?)")
+
+    storage = _storage_with_universe(tmp_path, docs_universe)
+    discovered = {
+        u["path"]: u["universe_key"] for u in storage.discover_universes() if u.get("path")
+    }
+    presets = _preset_files(docs_universe)
+    assert presets, "docs/universe must expose at least one preset for this to mean anything"
+    assert all(p in discovered for p in presets), "discover_universes skipped a file it walks"
+
+    for path in presets:
+        rel = os.path.relpath(path, docs_universe)
+        assert universe_key_from_path(path, docs_universe) == discovered[path], (
+            f"resolved key diverges from the advertised one for {rel}"
+        )
+        if rel in _ANCHORED_PRESET_KEYS:
+            assert discovered[path] == _ANCHORED_PRESET_KEYS[rel], (
+                f"the key for {rel} moved; every archived round under it would be orphaned"
+            )
+
+
+def test_resolve_keys_and_discover_agree_for_docs_level_file(tmp_path):
+    """A file DIRECTLY in the universe root collapses to the bare stem -- both paths.
+
+    The root is deliberately named ``pool``, not ``universe``/``docs``: that is
+    the whole point of the P0 pass.  The historical pair of predicates agreed
+    here only because the shipped root happens to be called ``docs/universe``.
+    A nested file of the SAME name must still be disambiguated by its folder, so
+    the assertion cannot be satisfied by "always use the bare stem" either.
+
+    re-break: replace the `universe_key_from_path` call in `resolve_keys` with the
+    naive `f"{parent}_{stem}"` -- it returns `pool_flat_pool` while
+    `discover_universes` (still on the helper) shows `flat_pool`, so the
+    bare-stem expectation fails (verified red).  Putting the hardcoded
+    `("universe", "docs", ".")` set back into the helper fails the same two
+    assertions for the same reason (verified red).
+    """
+    universe_root = tmp_path / "pool"
+    (universe_root / "nested").mkdir(parents=True)
+    for path in (universe_root / "flat_pool.txt", universe_root / "nested" / "flat_pool.txt"):
+        path.write_text("600000.SH\n601398.SH\n", encoding="utf-8")
+
+    storage = _storage_with_universe(tmp_path, universe_root)
+    discovered = {
+        u["path"]: u["universe_key"] for u in storage.discover_universes() if u.get("path")
+    }
+    root_file = str(universe_root / "flat_pool.txt")
+    nested_file = str(universe_root / "nested" / "flat_pool.txt")
+
+    # Root-level: the folder IS the universe root, so it is not a prefix.
+    assert universe_key_from_path(root_file, str(universe_root)) == "flat_pool"
+    assert storage.resolve_keys("", universe_file=root_file)[1] == "flat_pool"
+    assert discovered[root_file] == "flat_pool"
+
+    # One level down: the folder is a real group name and stays a prefix.
+    assert universe_key_from_path(nested_file, str(universe_root)) == "nested_flat_pool"
+    assert storage.resolve_keys("", universe_file=nested_file)[1] == "nested_flat_pool"
+    assert discovered[nested_file] == "nested_flat_pool"
+
+
+def test_legacy_suffix_dir_still_resolves(temp_storage):
+    """The legacy `<name>_custom` DIRECTORY convention still answers to `custom_<name>`.
+
+    15 archived rounds live under `chan_four_state_blend/astock_202609_20_custom/`
+    (a suffix-style directory name) while every UI selection asks for
+    `custom_astock_202609_20` (prefix style).  Nothing in the P0 dedup may narrow
+    that bridge: it is reached only through `get_universe_key_variants` /
+    `keys_match` / `find_existing_run_base_dir`, all untouched by the refactor --
+    this test is the guard that keeps them untouched.
+
+    The two rounds are deliberately shaped differently, because they are bridged
+    by different halves of the alias:
+
+    * `2026-10-20` has a `summary.json` recording the PREFIX key, like every real
+      round in that directory, so the listing matches verbatim and only PATH
+      resolution needs the alias;
+    * `2026-10-19` predates that and has no summary at all, so its key is derived
+      from the DIRECTORY name (`astock_202609_20_custom`) and only
+      `normalize_universe_key`'s `_custom` arm can match it.
+
+    re-break: drop the `k.endswith("_custom")` arm from `normalize_universe_key`
+    -- the summary-less `2026-10-19` round disappears from the selection's listing
+    (and the `2026-10-20` one is merely rescued by its summary; verified red:
+    listing becomes `["2026-10-20"]`).  Dropping the `_custom` suffix arm from
+    `get_universe_key_variants` alone is measurably INERT here (the normalisation
+    still bridges it -- verified) but it is what makes
+    `find_existing_run_base_dir` work at all: remove it TOGETHER with the
+    normalisation arm and that lookup returns `None` (verified red).
+    """
+    legacy_dir = os.path.join(
+        temp_storage.archive_dir, "chan_four_state_blend", "astock_202609_20_custom"
+    )
+
+    # A real round: summary carries the prefix-style selection key.
+    dated = os.path.join(legacy_dir, "2026-10-20")
+    os.makedirs(dated)
+    with open(os.path.join(dated, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "date": "2026-10-20",
+                "strategy_key": "chan_four_state_blend",
+                "universe_key": "custom_astock_202609_20",
+            },
+            f,
+        )
+    with open(os.path.join(dated, "live_trading_ticket.json"), "w", encoding="utf-8") as f:
+        json.dump([], f)
+
+    # An older round with no summary: its key comes from the directory name.
+    older = os.path.join(legacy_dir, "2026-10-19")
+    os.makedirs(older)
+    with open(os.path.join(older, "live_trading_ticket.json"), "w", encoding="utf-8") as f:
+        json.dump([], f)
+
+    runs = temp_storage.list_runs(
+        strategy_key="chan_four_state_blend",
+        universe_key="custom_astock_202609_20",
+        require_both=True,
+    )
+    assert sorted(r["date"] for r in runs) == ["2026-10-19", "2026-10-20"]
+
+    assert (
+        temp_storage.find_existing_run_base_dir(
+            "chan_four_state_blend", "custom_astock_202609_20", "2026-10-20"
+        )
+        == dated
+    )
+    bundle = temp_storage.get_run(
+        "2026-10-20",
+        strategy_key="chan_four_state_blend",
+        universe_key="custom_astock_202609_20",
+    )
+    assert bundle is not None
+    assert bundle["universe_key"] == "custom_astock_202609_20"
