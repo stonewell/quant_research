@@ -2839,6 +2839,14 @@ class ExecutionService:
         inertia_threshold: float = 0.05,
         allow_intraday: bool = True,
         confirm_empty_book: bool = False,
+        #: (P4) Retrieval metadata ONLY: recorded in the matrix summary so `list_runs` can
+        #: report this round under the selection it ran under instead of the literal
+        #: `multi_matrix`.  Deliberately NOT fed to `_resolve_universe` -- that keeps
+        #: resolving from `universe_file` / `custom_symbols`, so passing these can never
+        #: change which universe (or symbol set) the child loads.  Appended at the end of
+        #: the signature so every existing positional caller keeps its meaning.
+        universe_key: Optional[str] = None,
+        universe_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Execute Multi-Strategy Order Netting & Live Deployment.
 
@@ -3059,6 +3067,15 @@ class ExecutionService:
             "as_of": val_date,
             "matrix_id": matrix_id,
             "universe_file": univ_path,
+            # (P4) The selection this matrix round ran under, as the REQUEST stated it --
+            # taken verbatim, never derived or looked up here.  A matrix run's directory
+            # (`<archive>/<date>/multi_netted_<matrix>`) has no strategy/universe path of
+            # its own, so without these fields `list_runs` can only label the round
+            # `multi_matrix` and NO selection can ever match it.  `None` (not a
+            # placeholder) when the caller is an old client that sends neither; `list_runs`
+            # keeps its `multi_matrix` fallback for those rounds.
+            "universe_key": universe_key,
+            "universe_name": universe_name,
             "portfolio_value": portfolio_value,
             "data_provider": provider,
             "as_of_source": as_of_source,

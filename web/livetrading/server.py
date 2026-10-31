@@ -279,6 +279,10 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
                 strategies=strat_list,
                 universe_file=payload.universe_file,
                 custom_symbols=payload.custom_symbols,
+                # (P4) Retrieval metadata recorded in the matrix summary; the universe the
+                # child actually loads still comes from `universe_file`/`custom_symbols`.
+                universe_key=payload.universe_key,
+                universe_name=payload.universe_name,
                 as_of_date=payload.as_of_date,
                 start_date=payload.start_date,
                 portfolio_value=payload.portfolio_value,

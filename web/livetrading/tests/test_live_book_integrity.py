@@ -62,6 +62,7 @@ import logging
 import os
 import subprocess
 import sys
+import types
 
 import pytest
 
@@ -2874,3 +2875,169 @@ def test_scoped_get_run_matches_a_keyless_legacy_round_by_its_derived_keys(temp_
         temp_storage.get_run(_P3_DATE, strategy_key=_P2_STRAT, universe_key=_P2_UNIV_SELECTION)
         is None
     )
+
+
+# ---------------------------------------------------------------------------
+# 15. (P4) A multi-strategy (matrix) round must record the universe it ran on
+#
+# FORENSIC CONTEXT.  `MultiStrategyDeployRequest` had `universe_file` and
+# `custom_symbols` but no `universe_key`, and `run_multi_strategy_netted_deploy`
+# therefore wrote a matrix `summary.json` without one.  A matrix run's directory is
+# `<archive>/<date>/multi_netted_<matrix>`, i.e. it has no universe directory of its
+# own, so `list_runs` could only label such a round with the literal `multi_matrix`
+# -- a key NO selection has.  Measured on the real archive: both matrix rounds
+# (`2026-10-13` / `2026-10-15` multi_netted_tri_core_blend) answered
+# `list_runs(universe_key="multi_matrix")` and nothing else; asking for the real
+# selection (`custom_astock_202609_20`, `china_20_etf`) returned 0.
+#
+# The fix carries the selection as METADATA: the request model and the UI now send
+# `universe_key`/`universe_name`, the service records them verbatim, and `list_runs`
+# prefers a recorded key while keeping `multi_matrix` for rounds already archived
+# without one.  Universe RESOLUTION is untouched: `_resolve_universe` still takes
+# `universe_file` (1) then `custom_symbols` (2), so these fields can never change
+# which universe file or symbol set a deploy loads -- test 1 asserts exactly that.
+# ---------------------------------------------------------------------------
+
+import execution_service as _execution_service  # noqa: E402  (module seam for monkeypatch)
+from models import MultiStrategyDeployRequest  # noqa: E402
+
+_P4_DATE = "2026-10-20"
+_P4_MATRIX = "tri_core_blend"
+_P4_UNIV_KEY = "custom_astock_202609_20_new"
+_P4_UNIV_NAME = "★ astock_202609_20 (Custom)"
+
+
+def _matrix_dir(storage, date_str, matrix_id=_P4_MATRIX):
+    return os.path.join(storage.archive_dir, date_str, f"multi_netted_{matrix_id}")
+
+
+def _seed_matrix_round(storage, date_str, summary_extra=None, matrix_id=_P4_MATRIX):
+    """One matrix round: `<archive>/<date>/multi_netted_<matrix>/summary.json`."""
+    d = _matrix_dir(storage, date_str, matrix_id)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "date": date_str,
+                "matrix_id": matrix_id,
+                "deploy_status": "SUCCESS",
+                **(summary_extra or {}),
+            },
+            f,
+        )
+    return d
+
+
+def test_multi_deploy_summary_records_universe_key(temp_storage, monkeypatch):
+    """The matrix deploy WRITES the selection into its summary -- and loads the same universe.
+
+    Drives the real `run_multi_strategy_netted_deploy` (validation, universe resolution,
+    run-dir allocation, argv assembly, summary merge) with only the child process faked,
+    because the subject is what the service persists, not what the child computes.  This
+    is the first test to exercise the matrix deploy path end-to-end: every existing
+    matrix test stops at the captured argv or at the model.
+
+    The second half is the safety property: `universe_key` is metadata.  The universe the
+    child is told to load must still be the one materialised from `custom_symbols`
+    (`resolved_universe.txt`), unchanged by the label.
+
+    re-break: drop `universe_key`/`universe_name` from the matrix summary dict in
+    `run_multi_strategy_netted_deploy` -- both summary asserts fail (verified red).
+    """
+    calls = []
+
+    def fake_run(cmd, **kwargs):  # the child is the only thing faked
+        calls.append(cmd)
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(_execution_service.subprocess, "run", fake_run)
+
+    service = ExecutionService(temp_storage)
+    service.run_multi_strategy_netted_deploy(
+        matrix_id=_P4_MATRIX,
+        strategies=[{"strategy_key": "chan_four_state_shield_blend", "capital_weight": 1.0}],
+        custom_symbols=["600519.SH", "000001.SZ"],
+        as_of_date=_P4_DATE,
+        portfolio_value=100_000.0,
+        current_holdings={"600519.SH": 100},
+        data_provider="synthetic",
+        universe_key=_P4_UNIV_KEY,
+        universe_name=_P4_UNIV_NAME,
+    )
+
+    run_dir = _matrix_dir(temp_storage, _P4_DATE)
+    with open(os.path.join(run_dir, "summary.json"), encoding="utf-8") as f:
+        summary = json.load(f)
+    assert summary["universe_key"] == _P4_UNIV_KEY
+    assert summary["universe_name"] == _P4_UNIV_NAME
+    # Metadata only: the child still loads the file materialised from `custom_symbols`.
+    assert len(calls) == 1
+    univ_arg = calls[0][calls[0].index("--universe-file") + 1]
+    assert os.path.normpath(univ_arg) == os.path.normpath(os.path.join(run_dir, "resolved_universe.txt"))
+    with open(univ_arg, encoding="utf-8") as f:
+        assert "600519.SH" in f.read()
+
+
+def test_matrix_round_is_listable_under_its_recorded_universe(temp_storage):
+    """A matrix round answers the selection it records, not only `multi_matrix`.
+
+    This is the defect's user-visible half: before the field existed, no selection could
+    match a matrix round at all (the real archive's two rounds only answer
+    `multi_matrix`).  The echoed key must be the recorded one.
+
+    re-break: in `list_runs`, stop preferring `summary_rep.get("universe_key")` and always
+    assign `multi_matrix` to a `multi_netted_*` dir -- the listing comes back empty and
+    the echoed key is `multi_matrix` (verified red).
+    """
+    _seed_matrix_round(
+        temp_storage,
+        "2026-10-13",
+        {"universe_key": _P4_UNIV_KEY, "universe_name": _P4_UNIV_NAME},
+    )
+
+    runs = temp_storage.list_runs(
+        strategy_key=_P4_MATRIX, universe_key=_P4_UNIV_KEY, require_both=True
+    )
+    assert [r["date"] for r in runs] == ["2026-10-13"]
+    assert runs[0]["universe_key"] == _P4_UNIV_KEY
+    assert runs[0]["universe_name"] == _P4_UNIV_NAME
+
+
+def test_matrix_round_without_a_recorded_key_still_lists_as_multi_matrix(temp_storage):
+    """Backward compatibility: rounds archived before the field keep working verbatim.
+
+    The two real rounds (`2026-10-13`, `2026-10-15`) have no `universe_key`, and an old
+    client sends none, so the literal `multi_matrix` must remain the fallback -- it is how
+    those rounds are addressed today.
+
+    re-break: replace the `multi_matrix` fallback with `None`/`""` -- the round is listed
+    with an empty universe key and disappears from `multi_matrix` (verified red).
+    """
+    _seed_matrix_round(temp_storage, "2026-10-15")  # old-style: no universe fields
+
+    runs = temp_storage.list_runs(
+        strategy_key=_P4_MATRIX, universe_key="multi_matrix", require_both=True
+    )
+    assert [r["date"] for r in runs] == ["2026-10-15"]
+    assert runs[0]["universe_key"] == "multi_matrix"
+
+
+def test_multi_deploy_request_accepts_universe_key():
+    """The request model carries the fields and stays optional for old clients.
+
+    A payload without them must validate exactly as before (`None`, not `""`), otherwise
+    every existing API client and the archived-round path regress together.
+
+    re-break: make `universe_key` required on `MultiStrategyDeployRequest` -- the
+    field-less payload raises `ValidationError` (verified red).
+    """
+    req = MultiStrategyDeployRequest(
+        matrix_id=_P4_MATRIX, universe_key=_P4_UNIV_KEY, universe_name=_P4_UNIV_NAME
+    )
+    assert req.universe_key == _P4_UNIV_KEY
+    assert req.universe_name == _P4_UNIV_NAME
+    assert req.model_dump()["universe_key"] == _P4_UNIV_KEY
+
+    old_style = MultiStrategyDeployRequest(matrix_id=_P4_MATRIX)
+    assert old_style.universe_key is None
+    assert old_style.universe_name is None

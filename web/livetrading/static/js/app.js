@@ -1829,6 +1829,12 @@
             strategies: subStrategies,
             universe_file: baseParams.universe_file,
             custom_symbols: baseParams.custom_symbols,
+            // (P4) The selection this matrix round is run under, so the archive can report
+            // it under that universe instead of the literal `multi_matrix`. Same source as
+            // the single-path deploy (`getActiveKeys`); `keys` is already in scope above
+            // and `universe_file`/`custom_symbols` keep determining what is loaded.
+            universe_key: keys.univKey,
+            universe_name: keys.univName,
             as_of_date: baseParams.as_of_date,
             portfolio_value: baseParams.portfolio_value,
             current_holdings: holdings,

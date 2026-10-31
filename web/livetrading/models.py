@@ -201,6 +201,13 @@ class MultiStrategyDeployRequest(BaseModel):
     strategies: Optional[List[SubStrategyConfigModel]] = None
     universe_file: Optional[str] = None
     custom_symbols: Optional[List[str]] = None
+    #: (P4) The selection this matrix round is run UNDER, recorded in the matrix
+    #: `summary.json` so `list_runs` can report the round under its real universe instead
+    #: of the literal `multi_matrix` (which no selection can match).  RETRIEVAL METADATA
+    #: ONLY: it is never an input channel into universe resolution -- `_resolve_universe`
+    #: keeps taking `universe_file` / `custom_symbols`, in that order.
+    universe_key: Optional[str] = None
+    universe_name: Optional[str] = None
     as_of_date: Optional[str] = None
     start_date: Optional[str] = None
     portfolio_value: float = 100000.0
