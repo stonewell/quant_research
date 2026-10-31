@@ -109,6 +109,19 @@ DEFAULT_OUTPUT_DIR = default_live_output_dir(DEFAULT_STRATEGY_KEY)
 #: this literal at either end.
 STAGE1_HEALTH_REPORT_JSON = "stage1_health_report.json"
 
+#: Bars required before the 10-day NAV recovery leg of the fast-recovery override
+#: is considered MEASURED. Below this the leg is `INSUFFICIENT_HISTORY` (return
+#: `None`), never a fabricated 0.00%. One owner: `inspect_portfolio_drawdown`
+#: gates on it, the dashboard/Markdown renderers quote it, and
+#: `append_nav_history_point` caps the persisted series at exactly this length.
+NAV_10D_RECOVERY_WINDOW = 10
+
+#: Status values for the 10-day NAV recovery leg. `INSUFFICIENT_HISTORY` means
+#: "not measured" -- it is NOT a flat 0.00% observation, and it never switches
+#: the override ON (see `inspect_portfolio_drawdown`).
+NAV_10D_STATUS_OK = "OK"
+NAV_10D_STATUS_INSUFFICIENT_HISTORY = "INSUFFICIENT_HISTORY"
+
 
 def _fmt_metric(value: Any, spec: str, na: str = "N/A") -> str:
     """Format a possibly-None metric for the dashboard, rendering N/A when unmeasured.
@@ -479,6 +492,49 @@ def save_account_state(state_file: str, state: Dict[str, Any]) -> None:
         json.dump(serializable, f, indent=2, ensure_ascii=False, default=str)
 
 
+def append_nav_history_point(
+    nav_history: Sequence[float],
+    effective_nav: float,
+) -> Tuple[List[float], bool]:
+    """Append one NAV point to the rolling 10-day recovery series.
+
+    Returns `(new_history, is_frozen_duplicate)`.
+
+    (2026-10-30 incident) Two hardening rules live here, both driven by the same
+    real failure: an archived `account_state.json` carried FIVE identical
+    `nav_history_10d` values (197,351.17) because the operator form's
+    `portfolio_value` was frozen, and the recovery gate then "measured" a flat
+    series. An archive repair collapsed it to 4 real entries.
+
+    * The point appended is the caller's EFFECTIVE NAV -- the number the tier
+      math actually acted on (`dd_info["current_nav"]`) -- never a raw form
+      value that might differ from it.
+    * A point identical to the previous one is still appended (chronology must
+      not be rewritten / de-duplicated -- a genuinely flat NAV overnight is
+      legitimate), but it is REPORTED via the returned flag so the caller can
+      warn that the series looks frozen. Silence is what let a frozen form value
+      masquerade as a flat NAV history.
+
+    The list is capped at `NAV_10D_RECOVERY_WINDOW` by dropping the OLDEST
+    entries, so ordering stays strictly chronological.
+    """
+    history = [h for h in (nav_history or [])]
+    new_nav = float(effective_nav)
+
+    is_frozen_duplicate = False
+    if history:
+        try:
+            prev_nav = float(history[-1])
+        except (TypeError, ValueError):
+            prev_nav = None
+        is_frozen_duplicate = prev_nav is not None and prev_nav == new_nav
+
+    history.append(new_nav)
+    if len(history) > NAV_10D_RECOVERY_WINDOW:
+        history = history[-NAV_10D_RECOVERY_WINDOW:]
+    return history, is_frozen_duplicate
+
+
 def resolve_blend_param(
     params: Dict[str, Any],
     name: str,
@@ -573,9 +629,51 @@ def inspect_portfolio_drawdown(
             effective_peak = current_nav
 
     # Fast-Recovery Override (NAV 10-day momentum > 0)
-    nav_hist = state.get("nav_history_10d", [])
-    r_10d = (current_nav / nav_hist[0] - 1.0) if len(nav_hist) >= 10 and nav_hist[0] > 0 else 0.0
-    fast_recovery_nav = r_10d > 0.0
+    #
+    # (2026-10-30 incident) A series shorter than the window is NOT a measured
+    # 0.00% return. This legacy expression fell through to `r_10d = 0.0` whenever
+    # the archive held fewer than `NAV_10D_RECOVERY_WINDOW` entries, so a run
+    # whose history had been repaired down to 4 real points still printed
+    # "10-Day NAV Recovery +0.00% / ⚪ None" -- an unmeasured metric dressed up as
+    # a measurement, the exact anti-pattern the 5m intraday gate fixed with
+    # `SKIPPED`/`UNKNOWN` ("SKIPPED never means PASS").
+    #
+    # Now the return is `None` + `nav_10d_status = INSUFFICIENT_HISTORY`, and the
+    # override stays strictly OFF: an override may only ever be switched ON by a
+    # POSITIVE MEASURED recovery, never by missing data. The tier /
+    # circuit-breaker / linear-scale math below is untouched -- `r_10d` only ever
+    # fed `fast_recovery_nav`.
+    nav_hist = state.get("nav_history_10d", []) or []
+    nav_hist_len = len(nav_hist)
+    base_nav: Optional[float] = None
+    if nav_hist_len >= NAV_10D_RECOVERY_WINDOW:
+        try:
+            base_nav = float(nav_hist[0])
+        except (TypeError, ValueError):
+            base_nav = None
+
+    if base_nav is not None and base_nav > 0.0:
+        r_10d: Optional[float] = current_nav / base_nav - 1.0
+        nav_10d_status = NAV_10D_STATUS_OK
+        nav_10d_unavailable_reason = None
+    else:
+        # Short history, or a non-positive / unparseable base (a corrupt series is
+        # equally unmeasurable). Either way: no number, and no override.
+        r_10d = None
+        nav_10d_status = NAV_10D_STATUS_INSUFFICIENT_HISTORY
+        if nav_hist_len < NAV_10D_RECOVERY_WINDOW:
+            nav_10d_unavailable_reason = (
+                f"nav_history_10d 仅有 {nav_hist_len}/{NAV_10D_RECOVERY_WINDOW} 个交易日记录，"
+                "不足以测量 10 日 NAV 恢复幅度"
+            )
+        else:
+            nav_10d_unavailable_reason = (
+                f"nav_history_10d 起点 NAV 非正数或不可解析 ({nav_hist[0]!r})，10 日恢复幅度不可测"
+            )
+    # CONSERVATIVE BY CONSTRUCTION: `None` (unmeasured) can never compare > 0.0,
+    # so `fast_recovery_nav` is False here. Never flip an override ON from
+    # missing data.
+    fast_recovery_nav = bool(r_10d is not None and r_10d > 0.0)
 
     # Classify Tier Status
     if dd_mag >= dd_stop_thresh or freeze_remaining > 0:
@@ -611,6 +709,13 @@ def inspect_portfolio_drawdown(
         "auto_healed": auto_healed,
         "heal_reason": heal_reason,
         "nav_10d_return": r_10d,
+        # (2026-10-30) Additive schema fields: `OK` means the return above is a
+        # real measurement; `INSUFFICIENT_HISTORY` means it is `None` (JSON null)
+        # and the fast-recovery override is UNAVAILABLE -- not "not triggered".
+        "nav_10d_status": nav_10d_status,
+        "nav_10d_history_len": nav_hist_len,
+        "nav_10d_required_len": NAV_10D_RECOVERY_WINDOW,
+        "nav_10d_unavailable_reason": nav_10d_unavailable_reason,
         "fast_recovery_nav": fast_recovery_nav,
     }
 
@@ -892,6 +997,23 @@ def resolve_gate_directive(
                 actions.append("Standard unscaled allocation (40%–60% equity, balance in Cash Proxy).")
                 actions.append("Standard 20% single-stock cap strictly applied.")
 
+    # (2026-10-30 incident) An override that could NOT be evaluated must say so
+    # out loud, in the same disclosure tone as the 5m `SKIPPED` / `UNKNOWN` lines
+    # above. Silence would read as "10-day recovery was measured and did not
+    # trigger", which is what the pre-fix 0.00% fallback effectively claimed.
+    # Appending an action never changes `code` / `headline`: the tier and
+    # circuit-breaker verdicts are unchanged, only their disclosure is.
+    if dd_info.get("nav_10d_status") == NAV_10D_STATUS_INSUFFICIENT_HISTORY:
+        _nav_unavail_reason = dd_info.get("nav_10d_unavailable_reason") or (
+            f"nav_history_10d 仅有 {dd_info.get('nav_10d_history_len', 0)}"
+            f"/{NAV_10D_RECOVERY_WINDOW} 个交易日记录，数据不足"
+        )
+        actions.append(
+            "⚠️ Fast-Recovery NAV override UNAVAILABLE — 10 日 NAV 恢复幅度未测得"
+            f"（{_nav_unavail_reason}）。该覆盖既未通过也未触发；"
+            "缺失数据不会被当作「未触发」，更不会被当作 PASS，也不会放宽任何熔断层级。"
+        )
+
     if vol_info["vol_elevated"]:
         actions.append(
             f"Volatility Alert: 21d realized vol ({vol_info['realized_vol_21d']:.1%}) > target ({vol_info['target_vol']:.1%}); "
@@ -940,7 +1062,15 @@ def print_dashboard(
         print(f"  Tier 3 Trading Freeze : {dd_info['freeze_remaining_bars']} bars remaining lockout (Counter: {dd_info['tier3_counter']}/{dd_info['tier3_max']})")
     if dd_info["auto_healed"]:
         print(f"  ✨ AUTO-HEAL RESET     : {dd_info['heal_reason']}")
-    if dd_info["fast_recovery_nav"]:
+    if dd_info.get("nav_10d_status") == NAV_10D_STATUS_INSUFFICIENT_HISTORY:
+        # (2026-10-30) Unmeasured -> say UNMEASURED. Printing "not positive" here
+        # would claim a measurement the run never had.
+        print(
+            f"  ⚠️ FAST-RECOVERY NAV   : UNAVAILABLE — 10 日 NAV 恢复幅度未测得"
+            f"（{dd_info.get('nav_10d_history_len', 0)}/{NAV_10D_RECOVERY_WINDOW} 个交易日, 数据不足）"
+            "，覆盖保持关闭（未测得 ≠ 未触发）"
+        )
+    elif dd_info["fast_recovery_nav"]:
         print(f"  🚀 FAST-RECOVERY NAV   : 10-day NAV recovery is positive ({dd_info['nav_10d_return']:>+.2%})")
 
     # 2. Market Breadth & Thrust
@@ -1134,6 +1264,31 @@ def generate_reports(
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(serializable_report, f, indent=2, ensure_ascii=False, default=str)
 
+    # (2026-10-30 incident) The 10-day NAV recovery leg gets the same honesty
+    # treatment as the 5m intraday gate: an unmeasured return renders as
+    # `N/A (n/10 个交易日, 数据不足)` + an explicit "override unavailable" verdict,
+    # never as `+0.00%` / "⚪ None" (which reads as a measured flat series).
+    _nav10d_insufficient = (
+        dd_info.get("nav_10d_status") == NAV_10D_STATUS_INSUFFICIENT_HISTORY
+    )
+    if _nav10d_insufficient:
+        _nav10d_value = (
+            f"N/A ({dd_info.get('nav_10d_history_len', 0)}/{NAV_10D_RECOVERY_WINDOW} 个交易日, 数据不足)"
+        )
+        _nav10d_verdict = "⚪ N/A (override unavailable)"
+    else:
+        _nav10d_value = _fmt_metric(dd_info.get("nav_10d_return"), "+.2%")
+        _nav10d_verdict = "🚀 Active" if dd_info.get("fast_recovery_nav") else "⚪ None"
+
+    _nav10d_disclosure = (
+        "> **10-Day NAV Recovery UNAVAILABLE — 未测得（不是「未触发」）。**\n"
+        f"> {dd_info.get('nav_10d_unavailable_reason') or 'nav_history_10d 数据不足'}。\n"
+        "> 快速恢复覆盖（Fast-Recovery Override）因此保持关闭：未测得数据不会被当作 PASS，"
+        "也不会放宽任何熔断层级或缩放系数。\n\n"
+        if _nav10d_insufficient
+        else ""
+    )
+
     strat_ver_display = f"v{strategy_info.get('strategy_version', '1.0.0')}" + (f" [base: v{strategy_info.get('base_version')}]" if strategy_info.get('base_version') else "")
     md_content = f"""# Stage 1 Live Pre-Trade Health & Macro Audit Report
 
@@ -1156,9 +1311,9 @@ def generate_reports(
 | **Linear Equity Scale** | `{dd_info['linear_equity_scale']:.1%}` | Smooth linear damping | Continuous exposure factor |
 | **Tier 1 Cooldown Counter** | `{dd_info['tier1_counter']} / {dd_info['tier1_max']}` | 15 Bars | {"Auto-Heal Imminent" if dd_info['tier1_counter'] >= 10 else "Monitoring"} |
 | **Tier 3 Cooldown & Freeze** | `{dd_info['freeze_remaining_bars']} bars left` | 21 Bars lockout | {"Active Lockout" if dd_info['freeze_remaining_bars'] > 0 else "Clear"} |
-| **10-Day NAV Recovery** | `{dd_info['nav_10d_return']:+.2%}` | > 0.0% | {"🚀 Active" if dd_info['fast_recovery_nav'] else "⚪ None"} |
+| **10-Day NAV Recovery** | `{_nav10d_value}` | > 0.0% | {_nav10d_verdict} |
 
----
+{_nav10d_disclosure}---
 
 ## 2. Universe Market Breadth & Momentum Thrust
 
@@ -1795,10 +1950,23 @@ def main(cli_args: Optional[List[str]] = None):
 
     # 6. Update Account State
     if not args.no_save_state:
-        nav_hist = list(baseline_state.get("nav_history_10d", []))
-        nav_hist.append(args.portfolio_value)
-        if len(nav_hist) > 10:
-            nav_hist.pop(0)
+        # (2026-10-30 incident) Persist the EFFECTIVE NAV the tier math just used
+        # (`dd_info["current_nav"]`) rather than the raw operator form value
+        # (`args.portfolio_value`), so the series the fast-recovery gate reads
+        # back is by construction the same number the circuit breaker acted on.
+        # A repeated point is kept (flat NAV is legitimate) but warned about --
+        # see `append_nav_history_point`.
+        nav_hist, nav_frozen = append_nav_history_point(
+            baseline_state.get("nav_history_10d", []) or [],
+            dd_info["current_nav"],
+        )
+        if nav_frozen:
+            print(
+                "[WARN] nav_history_10d 出现重复点: 本次 effective NAV "
+                f"{float(dd_info['current_nav']):,.2f} 与上一交易日完全相同。"
+                "该点已写入（真实盘整亦可能如此），但请确认 Stage 2 表单/账户的 portfolio_value "
+                "并非冻结值：冻结值会让 10 日 NAV 恢复门禁看起来像一条平坦序列。"
+            )
 
         updated_state = dict(state)
         updated_state.update({

@@ -406,3 +406,347 @@ def test_resolve_holdings_weights_and_shares_legacy_weights():
     assert shares["STOCK_B"] == 1000
 
 
+# ---------------------------------------------------------------------------
+# 10-Day NAV recovery honesty gate (2026-10-30 incident)
+#
+# A live run archive's `account_state.json` carried FIVE identical
+# `nav_history_10d` values (197,351.17) because the operator form's
+# `portfolio_value` was frozen; an archive repair then collapsed it to 4 REAL
+# entries. The pre-fix gate did `r_10d = ... if len(nav_hist) >= 10 else 0.0`,
+# so those 4 entries rendered as `10-Day NAV Recovery +0.00% / ⚪ None` -- an
+# unmeasured metric printed as a measurement. The 5m intraday gate already
+# established the house style: `SKIPPED` / `UNKNOWN` never means PASS.
+#
+# Contract now: `nav_10d_return is None` + `nav_10d_status == "INSUFFICIENT_HISTORY"`
+# + `fast_recovery_nav is False` (never turn an override ON from missing data),
+# with tier / circuit-breaker / linear-scale outputs untouched.
+# ---------------------------------------------------------------------------
+
+_NAV_DD_PARAMS = {
+    "cfsb_dd_reduce_thresh": 0.10,
+    "cfsb_dd_defensive_thresh": 0.15,
+    "cfsb_dd_stop_thresh": 0.20,
+}
+
+
+def _nav_history(n: int, *, start_nav: float = 100000.0, step: float = 0.0) -> list:
+    return [start_nav + step * i for i in range(n)]
+
+
+def test_nav_10d_insufficient_history_is_not_a_measured_zero():
+    """4 real entries must be reported as UNMEASURED, never as a flat 0.00%.
+
+    DISCRIMINATING: the pre-fix implementation returned `nav_10d_return == 0.0`
+    for this exact input, so both the `is None` and the status assertions fail
+    against it.
+    """
+    state = {"nav_history_10d": _nav_history(4)}
+    res = inspect_portfolio_drawdown(
+        current_nav=197351.17, peak_nav=197351.17, state=state, params=_NAV_DD_PARAMS
+    )
+
+    assert res["nav_10d_status"] == "INSUFFICIENT_HISTORY"
+    assert res["nav_10d_return"] is None, "unmeasured history must not be a 0.00% 'measurement'"
+    assert res["nav_10d_history_len"] == 4
+    assert res["nav_10d_required_len"] == 10
+    assert "4/10" in (res["nav_10d_unavailable_reason"] or "")
+    # Conservative: missing data can never switch the override ON.
+    assert res["fast_recovery_nav"] is False
+
+
+def test_nav_10d_empty_history_also_insufficient():
+    """No history at all is the same unmeasured state (not a 0.00% flat series)."""
+    res = inspect_portfolio_drawdown(
+        current_nav=100000.0, peak_nav=100000.0, state={}, params=_NAV_DD_PARAMS
+    )
+    assert res["nav_10d_status"] == "INSUFFICIENT_HISTORY"
+    assert res["nav_10d_return"] is None
+    assert res["nav_10d_history_len"] == 0
+    assert res["fast_recovery_nav"] is False
+
+
+def test_nav_10d_full_history_behaviour_unchanged():
+    """A full 10-entry window keeps the pre-existing measurement semantics."""
+    # Positive recovery -> measured return AND override ON.
+    res_up = inspect_portfolio_drawdown(
+        current_nav=105000.0,
+        peak_nav=105000.0,
+        state={"nav_history_10d": _nav_history(10, start_nav=100000.0)},
+        params=_NAV_DD_PARAMS,
+    )
+    assert res_up["nav_10d_status"] == "OK"
+    assert res_up["nav_10d_return"] == pytest.approx(0.05)
+    assert res_up["nav_10d_history_len"] == 10
+    assert res_up["nav_10d_unavailable_reason"] is None
+    assert res_up["fast_recovery_nav"] is True
+
+    # Negative recovery -> measured (not None), override OFF.
+    res_down = inspect_portfolio_drawdown(
+        current_nav=95000.0,
+        peak_nav=100000.0,
+        state={"nav_history_10d": _nav_history(10, start_nav=100000.0)},
+        params=_NAV_DD_PARAMS,
+    )
+    assert res_down["nav_10d_status"] == "OK"
+    assert res_down["nav_10d_return"] == pytest.approx(-0.05)
+    assert res_down["fast_recovery_nav"] is False
+
+
+def test_nav_10d_status_never_changes_tier_or_linear_scale():
+    """Tier / circuit-breaker / linear-scale outputs must be history-length invariant.
+
+    Same NAV, same HWM, only the history length differs: the verdict the operator
+    acts on must be identical. Only the *disclosure* of the recovery leg differs.
+    """
+    short = inspect_portfolio_drawdown(
+        current_nav=88000.0,
+        peak_nav=100000.0,
+        state={"nav_history_10d": _nav_history(4, start_nav=90000.0)},
+        params=_NAV_DD_PARAMS,
+    )
+    full = inspect_portfolio_drawdown(
+        current_nav=88000.0,
+        peak_nav=100000.0,
+        state={"nav_history_10d": _nav_history(10, start_nav=90000.0)},
+        params=_NAV_DD_PARAMS,
+    )
+
+    assert short["nav_10d_status"] == "INSUFFICIENT_HISTORY"
+    assert full["nav_10d_status"] == "OK"
+    for key in (
+        "tier",
+        "tier_label",
+        "drawdown_pct",
+        "drawdown_mag",
+        "linear_equity_scale",
+        "peak_nav",
+        "tier1_counter",
+        "tier3_counter",
+        "freeze_remaining_bars",
+        "auto_healed",
+    ):
+        assert short[key] == full[key], key
+    assert short["tier"] == "TIER_1_DAMPING"
+    assert short["linear_equity_scale"] == pytest.approx(0.80)
+
+
+def test_gate_directive_warns_fast_recovery_override_unavailable():
+    """The actions section must say UNAVAILABLE -- not "not triggered".
+
+    Also pins the conservative direction: TIER_3_HALT with unmeasured history
+    stays NO_GO_EMERGENCY (the override may not be granted from missing data).
+    """
+    dd_info = inspect_portfolio_drawdown(
+        current_nav=78000.0,
+        peak_nav=100000.0,
+        state={"nav_history_10d": _nav_history(4)},
+        params=_NAV_DD_PARAMS,
+    )
+    macro = {
+        "thrust_active": False,
+        "thrust": 0.50,
+        "thrust_thresh": 0.60,
+        "breadth_active": False,
+        "breadth": 0.20,
+        "breadth_thresh": 0.30,
+        "target_exposure": 0.80,
+    }
+    vol = {
+        "realized_vol_21d": 0.05,
+        "target_vol": 0.12,
+        "vol_scaling_factor": 1.0,
+        "vol_elevated": False,
+    }
+
+    code, _headline, actions = resolve_gate_directive(dd_info, macro, vol)
+
+    assert code == "NO_GO_EMERGENCY", "an unmeasured override must not release the halt"
+    assert dd_info["tier"] == "TIER_3_HALT"
+    assert dd_info["linear_equity_scale"] == pytest.approx(0.0)
+    warning = [a for a in actions if "Fast-Recovery NAV override UNAVAILABLE" in a]
+    assert warning, actions
+    assert "4/10" in warning[0]
+    assert "PASS" in warning[0]
+
+    # Counter-check: a measured full window emits no such warning (behaviour of
+    # the OK path is untouched).
+    dd_full = inspect_portfolio_drawdown(
+        current_nav=78000.0,
+        peak_nav=100000.0,
+        state={"nav_history_10d": _nav_history(10)},
+        params=_NAV_DD_PARAMS,
+    )
+    _code, _headline, actions_full = resolve_gate_directive(dd_full, macro, vol)
+    assert not [a for a in actions_full if "Fast-Recovery NAV override UNAVAILABLE" in a]
+
+
+def test_report_renders_na_when_nav_history_insufficient(tmp_path):
+    """Markdown metric row must print `N/A (4/10 个交易日, 数据不足)`, not `+0.00%`."""
+    import json
+
+    dd_info = inspect_portfolio_drawdown(
+        current_nav=197351.17,
+        peak_nav=197351.17,
+        state={"nav_history_10d": _nav_history(4)},
+        params=_NAV_DD_PARAMS,
+    )
+    macro = {
+        "breadth": 0.55,
+        "breadth_active": True,
+        "breadth_thresh": 0.30,
+        "thrust": 0.62,
+        "thrust_active": True,
+        "thrust_thresh": 0.60,
+        "target_exposure": 0.80,
+        "leaders": [],
+    }
+    vol = {
+        "realized_vol_21d": 0.11,
+        "target_vol": 0.12,
+        "vol_scaling_factor": 1.0,
+        "vol_elevated": False,
+    }
+    _code, _headline, actions = resolve_gate_directive(dd_info, macro, vol)
+
+    json_path, md_path = _mod.generate_reports(
+        output_dir=str(tmp_path),
+        as_of_date="2026-10-30",
+        strategy_info={"strategy_name": "unit_test", "template_name": "equal_weight"},
+        dd_info=dd_info,
+        macro_info=macro,
+        vol_info=vol,
+        gate_code="GO",
+        gate_headline="GO",
+        actions=actions,
+    )
+
+    with open(md_path, "r", encoding="utf-8") as f:
+        md = f.read()
+    assert "N/A (4/10 个交易日, 数据不足)" in md
+    assert "UNAVAILABLE" in md
+    nav_row = [ln for ln in md.splitlines() if ln.startswith("| **10-Day NAV Recovery**")]
+    assert len(nav_row) == 1, nav_row
+    assert "N/A" in nav_row[0]
+    assert "+0.00%" not in nav_row[0]
+    # The warning must ALSO be in the actions section, not only the metric table.
+    assert "Fast-Recovery NAV override UNAVAILABLE" in md
+
+    with open(json_path, "r", encoding="utf-8") as f:
+        report = json.load(f)
+    assert report["portfolio_health"]["nav_10d_status"] == "INSUFFICIENT_HISTORY"
+    assert report["portfolio_health"]["nav_10d_return"] is None
+    assert report["portfolio_health"]["fast_recovery_nav"] is False
+    assert any("Fast-Recovery NAV override UNAVAILABLE" in a for a in report["trader_actions"])
+
+
+def test_report_renders_measured_value_when_nav_history_full(tmp_path):
+    """A measured window keeps rendering the real number (no regression)."""
+    dd_info = inspect_portfolio_drawdown(
+        current_nav=105000.0,
+        peak_nav=105000.0,
+        state={"nav_history_10d": _nav_history(10, start_nav=100000.0)},
+        params=_NAV_DD_PARAMS,
+    )
+    macro = {
+        "breadth": 0.55,
+        "breadth_active": True,
+        "breadth_thresh": 0.30,
+        "thrust": 0.62,
+        "thrust_active": True,
+        "thrust_thresh": 0.60,
+        "target_exposure": 0.80,
+        "leaders": [],
+    }
+    vol = {
+        "realized_vol_21d": 0.11,
+        "target_vol": 0.12,
+        "vol_scaling_factor": 1.0,
+        "vol_elevated": False,
+    }
+    _code, _headline, actions = resolve_gate_directive(dd_info, macro, vol)
+    _json_path, md_path = _mod.generate_reports(
+        output_dir=str(tmp_path),
+        as_of_date="2026-10-30",
+        strategy_info={"strategy_name": "unit_test", "template_name": "equal_weight"},
+        dd_info=dd_info,
+        macro_info=macro,
+        vol_info=vol,
+        gate_code="GO",
+        gate_headline="GO",
+        actions=actions,
+    )
+    with open(md_path, "r", encoding="utf-8") as f:
+        md = f.read()
+    nav_row = [ln for ln in md.splitlines() if "10-Day NAV Recovery" in ln]
+    assert len(nav_row) == 1
+    assert "+5.00%" in nav_row[0]
+    assert "🚀 Active" in nav_row[0]
+    assert "UNAVAILABLE" not in md
+
+
+def test_append_nav_history_point_flags_frozen_series_and_caps_at_ten():
+    """A duplicate point is appended AND flagged; the list stays ordered and <= 10.
+
+    DISCRIMINATING for the root cause: the archived frozen series
+    (5 x 197,351.17) was written silently. It must now raise a flag on every
+    consecutive duplicate, so no frozen form value can masquerade as a flat NAV
+    history again.
+    """
+    append = _mod.append_nav_history_point
+
+    # Consecutive duplicate -> appended, flagged True.
+    hist, frozen = append([197351.17] * 4, 197351.17)
+    assert frozen is True
+    assert hist == [197351.17] * 5
+    hist, frozen = append(hist, 197351.17)
+    assert frozen is True
+    assert hist == [197351.17] * 6
+
+    # A genuinely new value -> appended, not flagged.
+    hist, frozen = append(hist, 198000.0)
+    assert frozen is False
+    assert hist[-1] == 198000.0
+
+    # Cap at 10, oldest first (chronological order preserved).
+    long_hist, frozen = append(list(range(1, 11)), 11.0)
+    assert frozen is False
+    assert long_hist == list(range(2, 12))
+    assert len(long_hist) == _mod.NAV_10D_RECOVERY_WINDOW
+
+    # Empty history is not a "frozen series".
+    hist, frozen = append([], 100000.0)
+    assert frozen is False
+    assert hist == [100000.0]
+
+    # The window constant is the single owner of the cap.
+    assert _mod.NAV_10D_RECOVERY_WINDOW == 10
+
+
+def test_main_wires_effective_nav_into_nav_history_not_form_value():
+    """The state-update call site must persist `dd_info["current_nav"]` (effective NAV).
+
+    Exercises the wiring without a data provider: the append call in `main` is
+    the ONLY writer of `nav_history_10d`, and it must be fed the NAV the tier
+    math acted on -- not the raw operator form value, which is what froze and
+    produced the repeated 197,351.17 archive.
+    """
+    import inspect as _inspect
+
+    src = _inspect.getsource(_mod.main)
+    start = src.index("append_nav_history_point(")
+    depth = 0
+    end = len(src)
+    for i in range(start, len(src)):
+        if src[i] == "(":
+            depth += 1
+        elif src[i] == ")":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    call_site = src[start:end]
+
+    assert 'dd_info["current_nav"]' in call_site, call_site
+    assert "args.portfolio_value" not in call_site, call_site
+
+

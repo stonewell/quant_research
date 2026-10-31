@@ -3735,3 +3735,92 @@ pipeline/.venv/bin/python -m pytest common/tests/test_intraday_features.py -q   
 | `pytest backtester/tests -q --import-mode=importlib` | 123 passed | **123 passed** |
 
 合计 **2082 passed, 1 xfailed, 1 skipped, 0 failed**（`622 + 818 + 519 + 123`），全程合成数据、零网络。
+
+## 25. 2026-10-30 实盘"幽灵账本"完整性修复 D5–D8（执行层 / 归档读取层，无版本轴变动）
+
+### 25.1 事件与定性
+
+2026-10-29 的实盘归档里出现了一本"模型已经不想要、票据却永久保留"的账：
+
+- `2026-10-27` 票据把 `600584.SH` / `600362.SH` 记为 `HOLD_FILTERED` / `COOLDOWN_BLOCKED`、`target_shares=100`；到 `2026-10-29` 二者在生命周期机里已是 `FLAT`，但操作者输入账本仍各留 100 股残仓。`|目标 − 当前|` 约 **2.49% NAV < 5% 惰性阈值**，于是每轮都重发 `HOLD`、`shares: 0` —— 一个模型不要的仓位**永远无法被清出**（**D6**）。
+- 模型侧 20% 单票上限在 `blend_base.py` 施加于**原始权重**，整手取整发生在**之后**，故**交付**的 `target_shares × price / portfolio_value` 达到 **20.28% / 20.01%**（**D7**）。
+- `2026-10-29/holdings.json`（以及 `2026-10-29/215823/holdings.json`）与 `2026-10-27/post_holdings.json` **逐字节相同**：平层 `<date>/` 只是一个 Stage-1 种子（`summary.json` + 部署前 `account_state.json`），而它在 `os.walk` 里是独立一行、可与 `<date>/<HHMMSS>/` 并列，"最近状态"遍历因此可能取到**部署前**的账本（**D8**）。
+
+### 25.2 改动模块与逐项行为变更
+
+| 缺陷 | 文件 | 行为变更 | 默认行为 |
+| :--- | :--- | :--- | :--- |
+| D5 | `web/livetrading/storage.py`、`web/livetrading/execution_service.py` | 上一轮 `post_holdings` 的正持仓若在上一轮 `account_state.json` 的 `lifecycle_states` 中为非持仓态（`FLAT`/`COOLDOWN`/`PENDING_ENTRY`），列为 `phantom_reference`；存在此类项时 `clean_pass` 恒为 False | advisory（新 warning 码，不阻断）；strict 复用 `LIVETRADING_STRICT_HOLDINGS_INPUT` |
+| D6 | `scripts/run_live_strategy.py` | `current_shares>0 ∧ 模型原始目标==0 ∧ not is_holding()` → `STALE_LOT_LIQUIDATION` 标注 + 大声告警 | **仅告警不下单**；`--liquidate-stale-input-lots` 才出 SELL 全清 |
+| D7 | `scripts/run_live_strategy.py` | 整手取整**之后**按交付市值权重计量，超 `--max-single-position` 标 `MV_CAP` | **仅计量标注**；`--enforce-mv-cap` 才按整手回收买入增量 |
+| D8 | `web/livetrading/storage.py` | 无 Stage-2 产物且带实例子目录的平层种子在 `list_runs` 中跳过；`latest_account_state_at_or_before` 改为逐日"新实例 → 平层"有序遍历 | 默认开启；`LIVETRADING_PREFER_INSTANCE_STATE=0` 恢复改前行为 |
+
+### 25.3 关键不变式与实现要点
+
+1. **D6 的证人是"生命周期改写前的原始目标"**：惰性路径会把目标改写为 `state.current_weight`（即残仓自身权重），改写后的值永远无法证明"模型要 0"，故判定必须发生在此之前。
+2. **D7 只能按整手回收**：`cap_shares = floor(0.20 × pv / price / 100) × 100`，800 股（20.28%）→ 700 股（17.745%）。**结果是略低于上限而非等于上限**（不能交易碎股）—— 已知限制，不是新缺陷。**只回收买入增量，不砸已有超配持仓**：本守卫不是退出规则。
+3. **D8 的判别器必须是 Stage-2 产物**：`live_trading_ticket.{json,csv}` / `netted_trading_ticket.{json,csv}` / `post_holdings.json`。**故意排除 `holdings.json`** —— Stage 2 在启动子进程**之前**就把交割前输入账本写进运行目录，它在部署窗口内存在，无法证明一轮已跑完。
+4. **两条既有布局零变化**：纯平层旧归档（无实例子目录）与 `PENDING_STAGE2_REUSE_SECONDS` 交接窗口（此刻尚无实例子目录）都不进入跳过分支。
+5. **D5 对"无 lifecycle 记录"的标的不判 flag，只入审计**（`reference_symbols_without_lifecycle`），否则 lifecycle 机制之前的历史归档会成片误报。
+
+### 25.4 开关与灰度逃生门（精确命令）
+
+```bash
+# D6：启用残仓强制清出（默认关）。kill-switch 一票否决。
+uv run python scripts/run_live_strategy.py --strategy <name> --data-provider synthetic \
+    --liquidate-stale-input-lots
+LIVETRADING_DISABLE_STALE_LOT_LIQUIDATION=1   # 即便传了上面那个 flag 也不改单
+
+# D7：启用交付市值上限的整手回收（默认只计量）。
+uv run python scripts/run_live_strategy.py --strategy <name> --data-provider synthetic \
+    --max-single-position 0.20 --enforce-mv-cap
+LIVETRADING_DISABLE_MV_CAP=1                  # 即便传了 --enforce-mv-cap 也不改单
+
+# D7 的 Web 部署路径：run_live_deploy(..., max_single_position=0.20, enforce_mv_cap=True)
+
+# D8：关闭实例状态优先（逐字恢复改前行为）
+LIVETRADING_PREFER_INSTANCE_STATE=0
+```
+
+### 25.5 版本轴（规则 7）未触发
+
+本轮**未修改**任何策略类、任何分配模板类、以及 `BaseBlendAllocationStrategy`，因此：
+
+- `BASE_VERSION` **未变**（规则 7 的基础引擎升级义务不适用）；
+- 各策略/模板的 `version` **未变**（无信号、无参数默认值、无子策略组合变更）；
+- 无需重跑 `uv run python pipeline/research_strategy/run_research_strategy.py --dump-strategies`；
+- `run_live_strategy.py` 票据中的 `strategy_version` / `base_version` 因此仍为既有值。
+
+### 25.6 离线验证（本轮实跑，精确计数）
+
+| 套件 | 结果 |
+| :--- | :--- |
+| `web/livetrading/.venv/bin/python -m pytest web/livetrading/tests -q` | **168 passed, 1 failed** |
+| 其中新增 `web/livetrading/tests/test_live_book_integrity.py` | **37 passed** |
+| `pipeline/.venv/bin/python -m pytest pipeline/tests -q` | **518 passed, 1 skipped** |
+| `pipeline/tests/test_live_holdings_input_check.py`（含新增 12 例 D5 用例） | **57 passed** |
+| `pipeline/tests/test_live_holdings_input_check.py + test_no_weight_zero_liquidation_inference.py` | **67 passed** |
+
+- 那 1 个红为**既有失败**、与本轮无关：`test_executable_web_config_carries_no_machine_specific_paths` 命中的是操作者**未跟踪**的 `web/livetrading/data/settings.local.json`（`/home/stone`、`/Work/stock`）。已用 `git stash` 移除本轮三个文件的改动后复跑，**仍然红**，证据充分。
+- 那 1 个 skip 也是**既有**：`pipeline/tests/test_repair_live_run_snapshots.py:714` 依赖尚未生成的修复台账。
+- 全程合成数据、零网络；`scripts/run_live_strategy.py` 的 D6/D7 逻辑通过模块级纯函数直接验证（不启动任何实盘子进程）。
+
+### 25.7 未闭合项（如实披露）
+
+1. `scripts/repair_live_run_snapshots.py`（v1.2.0 的归档修复）由**另一工作流**负责，本轮未触碰。
+2. 真实券源/真实持仓下的票据未实跑核对（本轮零网络），以上全部为离线合成证据。
+3. D7 的整手回收必然略低于上限；若未来要求"恰好 20.00%"，需要碎股撮合能力，属券商侧能力而非本仓库可解。
+4. D8 的灰度门只影响**列表与状态解析顺序**，不改写任何归档内容；历史上已被错误解析生成的票据不会被追溯修改。
+
+### 25.8 补记（2026-10-30 评审收口）：`repair_live_run_snapshots.py` 的 `.orig` 备份原子化与复跑交叉校验
+
+评审发现两个仅影响**证据链可靠性**（不影响任何既有数字、也不改归档内容）的 NIT，本小节逐条留痕。
+
+1. **`.orig` 备份非原子 + 复跑校验 trivially true（已修）**：旧 `ensure_orig_backup` 用 `shutil.copyfile(path, op)` 直接写最终名，进程若在复制中途被杀，最终名下会留下**半截** `.orig`；而"已有 `.orig` 永不覆盖"的规则又让这半截永久生效，此时活文件早已被原子写覆写，真正的原件永久丢失。同时复跑分支把 `md5(.orig)` 与"`md5(.orig)` 自己的记录"比较（`info["md5"] = md5_file(op)` 后无条件 `verified = True`），等于什么都没验。
+   - **修法**：①改走 `write_bytes_atomic(op, ...)`（同目录 `<原名>.orig.tmp-repair` + `os.replace`），最终名下永远只有完整副本；②`.orig` 已存在时，把它的 md5 与**盘上 manifest 记录的 `md5_before`** 交叉比对（进程启动时由新增的 `register_manifest_md5_before()` 从 `repair_manifest.json` + `repair_manifest.v1.1.0.json` 登记，必须在任何写盘之前执行），不一致则 stderr 打 `[WARNING]`、`orig_backup.verified = False`（验收断言随之失败），**但不删不改**备份本身。
+   - **幂等性不受影响**：登记条数刻意**不**进 manifest 的 `log`（首跑 0 / 复跑正，写进去会让复跑字节不一致）；`verified_against` / `expected_md5` / `warning` 等新键由既有的 `_persistable_file_entry` 白名单（`_ORIG_BACKUP_KEYS`）剥掉。第二遍完整运行仍与第一遍**逐字节相同（仅 `generated_at_utc` 不同）**。`SCRIPT_VERSION` **保持 1.2.0 未变** —— 升版会让 `_load_previous_manifest` 把盘上 v1.2.0 根 manifest 当成"上一版"继承，从而改变复跑产物。
+   - **已修归档只读核验（5/5 通过，零写入）**：`/home/stone/Work/stock/simulate/202609/runs/chan_four_state_blend/custom_astock_202609_20_new` 下 5 个被重述文件的 `.orig` 实测 md5 与 `repair_manifest.json` 的 `md5_before` **逐条相等**，即现有备份无一是截断副本：`2026-10-27/post_holdings.json.orig` = `f0770c672577fc0442c2ac0760959061`、`2026-10-29/215823/post_holdings.json.orig` = `5105e5bab7ed4a514ec71ecd35bbec50`、同目录 `nav_breakdown.json.orig` = `a13b2dd8d6512fb69f590ec1f8fe59e0`、`summary.json.orig` = `3e3329a173660d7870c727d490a21ba3`、`account_state.json.orig` = `1f98a6e6c9f9172b3e2148f0be65e932`。
+   - **测试**：`pipeline/tests/test_repair_live_run_snapshots.py` 新增 2 例 —— `test_orig_backup_is_atomic_so_a_dead_copy_never_lands_under_the_final_name`（模拟复制中途崩溃：最终名不存在、残留 tmp 不影响后续成功备份）、`test_existing_orig_is_cross_checked_against_manifest_md5_before`（台账不符 → `verified=False` + stderr `[WARNING]` + 备份原样保留；台账相符 → `verified=True` 且零告警；台账无该条 → `verified_against=None` 不假装校验过）。实跑 `pipeline/.venv/bin/python -m pytest pipeline/tests/test_repair_live_run_snapshots.py -q --import-mode=importlib` → **34 passed, 1 skipped**（该 skip 为既有：缺修复台账）。
+
+2. **`docs/development_plan.md` §4.25「可预测性契约」措辞过强（已改写）**：原文"任何未显式加开关的调用，票据与本轮改动前**逐值一致**"不成立 —— D6 检出残留整手会往 `reason` 追加告警文本、D7 触发上限会往 `reason` / `summary_reason` 追加 `MV_CAP` 标注并写 `detail_reason.mv_cap`、D8 默认开启且会改变状态解析顺序（正是它要修的那类场景）。已改写为代码真正执行的契约：**订单方向与成交量默认不变；检测与标注永远可观测；任何改变下单数量的行为都必须显式开关**，并单独点名 D8 是默认开启的"读数修正"例外。§25.2 的逐缺陷默认行为表未变（它本来就准确）。
+
