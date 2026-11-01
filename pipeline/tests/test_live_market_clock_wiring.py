@@ -798,10 +798,11 @@ def test_host_timezone_context_restores_even_on_exception():
     """
     before_env = os.environ.get("TZ")
     before_offset = dt.datetime.now().astimezone().utcoffset()
+    expected_la_offset = dt.datetime.now(ZoneInfo("America/Los_Angeles")).utcoffset()
 
     with pytest.raises(RuntimeError):
         with _host_timezone("America/Los_Angeles"):
-            assert dt.datetime.now().astimezone().utcoffset() == dt.timedelta(hours=-7)
+            assert dt.datetime.now().astimezone().utcoffset() == expected_la_offset
             raise RuntimeError("boom")
 
     assert os.environ.get("TZ") == before_env
