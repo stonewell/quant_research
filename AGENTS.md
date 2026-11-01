@@ -33,6 +33,7 @@ cd pipeline && uv sync                             # pipeline/'s shared env (res
                                                     # instrument_selection, pattern_mining,
                                                     # strategy_generator, fundamental_screener)
 cd ml/bnn_forecaster && uv sync                    # bnn_forecaster's own isolated env
+cd web/livetrading && uv sync                      # web/livetrading's own isolated env (fastapi, pydantic)
 
 # from inside pipeline/ (or via pipeline/.venv/Scripts/python.exe from anywhere):
 uv run python <project>/run_*.py --help            # every pipeline project's CLI
@@ -55,7 +56,9 @@ available in the current shell.
 - Each project has its own `tests/` directory (`common/tests`, `pipeline/research_strategy/tests`,
   `pipeline/instrument_selection/tests`, `pipeline/pattern_mining/tests`,
   `pipeline/strategy_generator/tests`, `pipeline/fundamental_screener/tests`, `pipeline/tests`,
-  `backtester/tests`, `ml/bnn_forecaster/tests`). None has an `__init__.py`, and several projects
+  `backtester/tests`, `ml/bnn_forecaster/tests`, `web/livetrading/tests`). Note: `web/livetrading`
+  is a third isolated `uv` environment (`web/livetrading/.venv`); its tests must run with its own
+  interpreter, not `pipeline/.venv` (missing `fastapi`/`pydantic`). None has an `__init__.py`, and several projects
   share identically-named test files (`test_allocation_templates.py`, `test_indicators.py`, ...), so
   a bare `pytest` from the repo root -- or `pytest` given more than one of these directories at
   once -- fails with `import file mismatch`. Two ways around this:

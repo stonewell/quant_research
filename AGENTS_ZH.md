@@ -26,6 +26,7 @@ cd pipeline && uv sync                             # pipeline/ 的共享环境 (
                                                     # instrument_selection, pattern_mining,
                                                     # strategy_generator, fundamental_screener)
 cd ml/bnn_forecaster && uv sync                    # bnn_forecaster 独立的隔离环境
+cd web/livetrading && uv sync                      # web/livetrading 独立的隔离环境 (fastapi, pydantic)
 
 # 从 pipeline/ 内部运行（或在任何位置通过 pipeline/.venv/Scripts/python.exe 运行）：
 uv run python <project>/run_*.py --help            # 每个 pipeline 项目的 CLI
@@ -41,7 +42,7 @@ uv run python run_pipeline.py --data-provider synthetic --universe SPY QQQ ...
 ## 测试策略 -- 在运行或编写测试前必读
 
 - **绝不在测试或示例命令中使用真实市场数据或网络访问。** 每个测试套件均通过 `SyntheticDataProvider`/`common/testing.py` 的合成 OHLCV 生成器 100% 离线运行。编写的任何 CLI 示例默认使用 `--data-provider synthetic`；仅当用户明确要求时才使用 `yfinance` 真实数据运行。
-- 每个项目拥有独立的 `tests/` 目录（`common/tests`, `pipeline/research_strategy/tests`, `pipeline/instrument_selection/tests`, `pipeline/pattern_mining/tests`, `pipeline/strategy_generator/tests`, `pipeline/fundamental_screener/tests`, `pipeline/tests`, `backtester/tests`, `ml/bnn_forecaster/tests`）。这些目录均没有 `__init__.py`，且多个项目包含同名测试文件（`test_allocation_templates.py`, `test_indicators.py` ...），因此从仓库根目录直接运行裸 `pytest`（或同时传入多个目录）会因同名文件导致 `import file mismatch` 错误。两种解决方式：
+- 每个项目拥有独立的 `tests/` 目录（`common/tests`, `pipeline/research_strategy/tests`, `pipeline/instrument_selection/tests`, `pipeline/pattern_mining/tests`, `pipeline/strategy_generator/tests`, `pipeline/fundamental_screener/tests`, `pipeline/tests`, `backtester/tests`, `ml/bnn_forecaster/tests`, `web/livetrading/tests`）。注意：`web/livetrading` 是第三个独立的 `uv` 环境（`web/livetrading/.venv`）；其测试必须使用自身的解释器运行，不可使用 `pipeline/.venv`（缺少 `fastapi`/`pydantic`）。这些目录均没有 `__init__.py`，且多个项目包含同名测试文件（`test_allocation_templates.py`, `test_indicators.py` ...），因此从仓库根目录直接运行裸 `pytest`（或同时传入多个目录）会因同名文件导致 `import file mismatch` 错误。两种解决方式：
   - 一次运行一个目录（各项目 README 所示）：`pytest common/tests -q`。
   - 或传入 `--import-mode=importlib` 在单个调用中同时运行多个/所有目录：`pytest common/tests pipeline/strategy_generator/tests backtester ... -q --import-mode=importlib`。
 
