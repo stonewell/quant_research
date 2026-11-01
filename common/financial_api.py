@@ -27,7 +27,7 @@ import pandas as pd
 import requests
 
 from .data import BaseDataProvider, FundamentalMetrics, _drop_invalid_ohlcv_rows, _validate_symbol_for_path
-from .duckdb_cache import DuckDBCache, is_intraday_interval
+from .duckdb_cache import DuckDBCache, canonicalize_adjust_mode, is_intraday_interval
 
 # Standard A-share / Fuyao ticker normalization regexes
 _CODE_WITH_SUFFIX_RE = re.compile(r"^([0-9]{6})\.(SH|SZ|BJ|TI|OF|SS)$", re.IGNORECASE)
@@ -38,6 +38,47 @@ _INDEX_CODES = {
 _BARE_SH_INDEX_CODES = {"000300", "000905", "000852", "000016", "000688"}
 
 _LOGGER = logging.getLogger(__name__)
+
+_CANONICAL_BASES = ("raw", "qfq", "hfq")
+_LEGACY_BY_CANONICAL = {"raw": "none", "qfq": "forward", "hfq": "backward"}
+_EASTMONEY_FQT_BY_CANONICAL = {"raw": "0", "qfq": "1", "hfq": "2"}
+#: BaoStock's wire digits: "1"=hfq (backward), "2"=qfq (forward), "3"=raw.
+_BAOSTOCK_FLAG_BY_CANONICAL = {"raw": "3", "qfq": "2", "hfq": "1"}
+_ADJUST_TOKEN_BY_CANONICAL = {
+    "none": "raw", "raw": "raw", "qfq": "qfq", "forward": "qfq", "hfq": "hfq", "backward": "hfq",
+    # BaoStock protocol digits -- kept in the shared alias table so `_normalize_adjust_basis`
+    # can accept them where the per-provider `allowed` set opts in. Every other provider's
+    # `allowed` tuple omits them, so EastMoney/MarketDB/Fuyao still reject "1"/"2"/"3".
+    "1": "hfq", "2": "qfq", "3": "raw",
+}
+
+
+def _normalize_adjust_basis(value, *, provider_name, param_name="adjust", allowed):
+    """Resolve a provider's ``adjust`` argument to a canonical basis.
+
+    ``allowed`` is the provider's closed set of accepted tokens. Anything else
+    raises ``ValueError`` -- M3.9 removes the historical ``else -> raw`` fallbacks,
+    where a typo silently asked for unadjusted bars and the caller never learned.
+    Aliases are resolved through the explicit ``_ADJUST_TOKEN_BY_CANONICAL`` dict;
+    ``canonicalize_adjust_mode`` is reused so the vocabulary stays single-sourced
+    with ``DuckDBCache``.
+
+    Raises:
+        ValueError: not a non-empty string, or not in ``allowed``.
+    """
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError(
+            f"{provider_name}: invalid {param_name}={value!r}; expected one of {allowed}."
+        )
+    token = value.lower()
+    if token not in allowed:
+        raise ValueError(
+            f"{provider_name}: unsupported {param_name}={value!r}; expected one of {allowed}."
+        )
+    basis = _ADJUST_TOKEN_BY_CANONICAL[token]
+    canonicalize_adjust_mode(basis)  # fail-closed cross-check against the cache vocabulary
+    return basis
+
 
 # --------------------------------------------------------------------------- #
 # HTTP body decode + JSON payload contract
@@ -689,9 +730,12 @@ class MarketDBDataProvider(BaseDataProvider):
                 "Run 'uv add duckdb' or 'pip install duckdb'."
             ) from exc
 
-        self.adjust = adjust.lower()
-        if self.adjust not in ("forward", "backward", "none"):
-            raise ValueError(f"adjust must be 'forward', 'backward', or 'none'; got '{adjust}'")
+        self.native_adjust_basis = _normalize_adjust_basis(
+            adjust,
+            provider_name="MarketDBDataProvider",
+            allowed=("none", "qfq", "hfq", "forward", "backward"),
+        )
+        self.adjust = _LEGACY_BY_CANONICAL[self.native_adjust_basis]
 
         self.view = {
             "forward": "v_daily_qfq",
@@ -758,6 +802,9 @@ class MarketDBDataProvider(BaseDataProvider):
                     else:
                         fallback_df = bs_p.fetch_ohlcv(thscode, start, end, interval)
                     if not fallback_df.empty:
+                        fallback_df.attrs["adjust_basis"] = (
+                            "raw" if target_view == "v_daily" else self.native_adjust_basis
+                        )
                         return fallback_df
                 except Exception:
                     pass
@@ -768,6 +815,9 @@ class MarketDBDataProvider(BaseDataProvider):
                     else:
                         fallback_df = em_p.fetch_ohlcv(thscode, start, end, interval)
                     if not fallback_df.empty:
+                        fallback_df.attrs["adjust_basis"] = (
+                            "raw" if target_view == "v_daily" else self.native_adjust_basis
+                        )
                         return fallback_df
                 except Exception:
                     pass
@@ -788,6 +838,7 @@ class MarketDBDataProvider(BaseDataProvider):
         df = _drop_invalid_ohlcv_rows(df, symbol)
         if df.empty:
             raise ValueError(f"All data rows for {symbol} between {start} and {end} were invalid OHLC")
+        df.attrs["adjust_basis"] = "raw" if target_view == "v_daily" else self.native_adjust_basis
         return df
 
     def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
@@ -795,7 +846,9 @@ class MarketDBDataProvider(BaseDataProvider):
 
     def fetch_raw_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
         """Fetch raw unadjusted OHLCV bars without mutating instance basis."""
-        return self._fetch_ohlcv_internal(symbol, start, end, interval=interval, view="v_daily")
+        out = self._fetch_ohlcv_internal(symbol, start, end, interval=interval, view="v_daily")
+        out.attrs["adjust_basis"] = "raw"
+        return out
 
     def fetch_universe(
         self, symbols: List[str], start: str, end: str, interval: str = "1d"
@@ -862,6 +915,7 @@ class MarketDBDataProvider(BaseDataProvider):
             if df.empty:
                 warnings.warn(f"Skipping {orig_sym}: all rows dropped as invalid OHLC")
                 continue
+            df.attrs["adjust_basis"] = self.native_adjust_basis
             result[orig_sym] = df
 
         return result
@@ -1069,7 +1123,16 @@ class FuyaoDataProvider(BaseDataProvider):
         db_path: Optional[str] = None,
     ):
         _bootstrap_financial_api()
-        self.adjust = adjust.lower()
+        # M3.9: normalise BEFORE touching the local DB, so an illegal basis raises here instead
+        # of being swallowed by the `except Exception` around `MarketDBDataProvider(...)` below
+        # (which would silently downgrade a typo into "no local database").
+        self.native_adjust_basis = _normalize_adjust_basis(
+            adjust,
+            provider_name="FuyaoDataProvider",
+            allowed=("none", "qfq", "hfq", "forward", "backward"),
+        )
+        # `self.adjust` keeps the legacy spelling the Fuyao client expects: none/forward/backward.
+        self.adjust = _LEGACY_BY_CANONICAL[self.native_adjust_basis]
         self.prefer_local = prefer_local
         self.api_key = api_key
 
@@ -1084,6 +1147,10 @@ class FuyaoDataProvider(BaseDataProvider):
                     db_path=db_path,
                     adjust=adjust,
                 )
+            except ValueError:
+                # Never downgrade a bad `adjust` into "no local DB": it was already validated
+                # above, so a ValueError here is a real contract violation and must surface.
+                raise
             except Exception:
                 self._local_provider = None
 
@@ -1105,7 +1172,17 @@ class FuyaoDataProvider(BaseDataProvider):
         if interval != "1d":
             raise ValueError(f"FuyaoDataProvider only supports interval='1d', got '{interval}'")
 
-        eff_adjust = adjust or self.adjust
+        # M3.9: an explicit `adjust=` is validated, never coerced with `or`. `adjust=""` used to
+        # silently fall back to the instance basis; it now raises, so a caller cannot ask for
+        # "unadjusted" with an empty string and get forward-adjusted bars back.
+        if adjust is None:
+            eff_basis = self.native_adjust_basis
+        else:
+            eff_basis = _normalize_adjust_basis(
+                adjust, provider_name="FuyaoDataProvider",
+                allowed=("none", "qfq", "hfq", "forward", "backward"),
+            )
+        eff_adjust = _LEGACY_BY_CANONICAL[eff_basis]
 
         thscode = normalize_thscode(symbol)
         _validate_symbol_for_path(thscode)
@@ -1140,6 +1217,16 @@ class FuyaoDataProvider(BaseDataProvider):
                 ) from exc
 
         if is_index:
+            # Fuyao's index endpoint (/api/a-share-index/prices/historical) has NO adjustment
+            # parameter: whatever basis the caller asked for, the bars are unadjusted. Indices
+            # have no corporate actions, so this is lossless -- but say it out loud instead of
+            # silently labelling raw index bars as qfq/hfq.
+            if eff_basis != "raw":
+                _LOGGER.warning(
+                    "FuyaoDataProvider: %s is an index and cannot honour adjust=%r "
+                    "(basis %r); returning unadjusted (raw) bars.",
+                    thscode, eff_adjust, eff_basis,
+                )
             # Fuyao API index historical prices (/api/a-share-index/prices/historical) only retain
             # ~5 years of rolling history. Passing a start timestamp older than ~5 years causes
             # the upstream API to return empty items ([]). Clamp start_ms to 5 years ago if needed.
@@ -1179,15 +1266,18 @@ class FuyaoDataProvider(BaseDataProvider):
                 except Exception:
                     df = pd.DataFrame()
 
-            # If Fuyao returned empty or failed, fall back to BaoStock and then EastMoney
+            # If Fuyao returned empty or failed, fall back to BaoStock and then EastMoney.
+            # Both fallbacks are pinned to `raw`: the index path above is unadjusted, and a
+            # bare `BaoStockDataProvider()` would default to qfq ("2") -- i.e. a mixed basis
+            # stitched into one index frame with no way for the caller to tell.
             if df.empty:
                 try:
-                    df = BaoStockDataProvider().fetch_ohlcv(thscode, start, end, interval)
+                    df = BaoStockDataProvider(adjustflag="3").fetch_ohlcv(thscode, start, end, interval)
                 except Exception:
                     df = pd.DataFrame()
                 if df.empty:
                     try:
-                        df = EastMoneyDataProvider().fetch_ohlcv(thscode, start, end, interval)
+                        df = EastMoneyDataProvider(adjust="none").fetch_ohlcv(thscode, start, end, interval)
                     except Exception:
                         df = pd.DataFrame()
 
@@ -1196,7 +1286,7 @@ class FuyaoDataProvider(BaseDataProvider):
                 req_start_date = pd.to_datetime(start).date()
                 if req_start_date < df.index.min().date():
                     try:
-                        pre_df = BaoStockDataProvider().fetch_ohlcv(
+                        pre_df = BaoStockDataProvider(adjustflag="3").fetch_ohlcv(
                             thscode,
                             req_start_date.strftime("%Y-%m-%d"),
                             df.index.min().strftime("%Y-%m-%d"),
@@ -1212,14 +1302,14 @@ class FuyaoDataProvider(BaseDataProvider):
                 req_end_date = pd.to_datetime(end).date()
                 if req_end_date > df.index.max().date():
                     try:
-                        post_df = EastMoneyDataProvider().fetch_ohlcv(
+                        post_df = EastMoneyDataProvider(adjust="none").fetch_ohlcv(
                             thscode,
                             df.index.max().strftime("%Y-%m-%d"),
                             req_end_date.strftime("%Y-%m-%d"),
                             interval=interval,
                         )
                         if post_df.empty:
-                            post_df = BaoStockDataProvider().fetch_ohlcv(
+                            post_df = BaoStockDataProvider(adjustflag="3").fetch_ohlcv(
                                 thscode,
                                 df.index.max().strftime("%Y-%m-%d"),
                                 req_end_date.strftime("%Y-%m-%d"),
@@ -1238,6 +1328,9 @@ class FuyaoDataProvider(BaseDataProvider):
                     df = df[df.index <= pd.to_datetime(end)]
                 df = _drop_invalid_ohlcv_rows(df, symbol)
                 if not df.empty:
+                    # Indices are always served raw (see the warning above); declare it so
+                    # `CachedDataProvider` can tell this frame apart from a qfq/hfq request.
+                    df.attrs["adjust_basis"] = "raw"
                     return df
 
             raise ValueError(
@@ -1245,6 +1338,15 @@ class FuyaoDataProvider(BaseDataProvider):
                 "(Fuyao API index history is limited to the last ~5 years)"
             )
         elif is_etf:
+            # `fund_market_historical` has no adjustment parameter at all: ETF/fund history comes
+            # back unadjusted. Same disclosure rule as the index branch -- warn, then declare the
+            # served basis as `raw` further down, instead of mislabelling it as qfq/hfq.
+            if eff_basis != "raw":
+                _LOGGER.warning(
+                    "FuyaoDataProvider: %s is an ETF/fund and cannot honour adjust=%r "
+                    "(basis %r); returning unadjusted (raw) bars.",
+                    thscode, eff_adjust, eff_basis,
+                )
             # Fuyao API fund historical prices (/api/fund/market/historical) only retain ~5 years
             # of rolling history, and requires that end_ms <= _five_year_limit_ms(start_ms).
             # Passing a start timestamp older than ~5 years causes the upstream API to return empty
@@ -1286,14 +1388,16 @@ class FuyaoDataProvider(BaseDataProvider):
                     items = res.get("item", []) if isinstance(res, dict) else res
                 except Exception as fund_exc:
                     # If fund_market_historical fails (e.g. symbol is actually an equity with 15/16/51 prefix),
-                    # fall back to general prices_historical
+                    # fall back to general prices_historical. Pinned to `none`: this branch is
+                    # declared unadjusted (see the warning above), so a qfq/hfq fallback here would
+                    # silently mix two bases inside one "raw" frame.
                     try:
                         items = fuyao_client.prices_historical(
                             thscode=thscode,
                             start_ms=start_ms,
                             end_ms=end_ms,
                             interval="1d",
-                            adjust=eff_adjust,
+                            adjust="none",
                         )
                     except Exception:
                         raise fund_exc
@@ -1333,6 +1437,9 @@ class FuyaoDataProvider(BaseDataProvider):
         if df.empty:
             raise ValueError(f"All data rows for {symbol} between {start} and {end} were dropped as invalid OHLC")
 
+        # Declare what was actually served: equities honour `eff_basis`, while the ETF/fund
+        # branch above is unadjusted by construction (its own warning says so).
+        df.attrs["adjust_basis"] = "raw" if is_etf else eff_basis
         return df
 
     def _fetch_ohlcv_internal(
@@ -1341,7 +1448,15 @@ class FuyaoDataProvider(BaseDataProvider):
         if interval != "1d":
             raise ValueError(f"FuyaoDataProvider only supports interval='1d', got '{interval}'")
 
-        eff_adjust = adjust or self.adjust
+        # M3.9: same rule as `_fetch_remote_ohlcv` -- validate, never `or`-coerce.
+        if adjust is None:
+            eff_basis = self.native_adjust_basis
+        else:
+            eff_basis = _normalize_adjust_basis(
+                adjust, provider_name="FuyaoDataProvider",
+                allowed=("none", "qfq", "hfq", "forward", "backward"),
+            )
+        eff_adjust = _LEGACY_BY_CANONICAL[eff_basis]
         thscode = normalize_thscode(symbol)
         _validate_symbol_for_path(thscode)
 
@@ -1370,7 +1485,15 @@ class FuyaoDataProvider(BaseDataProvider):
                 req_start_dt = pd.to_datetime(start).normalize()
                 if local_df.index[0] > req_start_dt:
                     try:
-                        bs_p = BaoStockDataProvider()
+                        if eff_basis != "raw":
+                            _LOGGER.warning(
+                                "FuyaoDataProvider: %s is an index and cannot honour adjust=%r "
+                                "(basis %r); the pre-history stitch below is unadjusted (raw).",
+                                thscode, eff_adjust, eff_basis,
+                            )
+                        # Explicit raw: indices have no adjustment, and a bare constructor would
+                        # default to qfq and mix bases into the stitched frame.
+                        bs_p = BaoStockDataProvider(adjustflag="3")
                         if eff_adjust == "none" and hasattr(bs_p, "fetch_raw_ohlcv"):
                             pre_df = bs_p.fetch_raw_ohlcv(
                                 thscode,
@@ -1748,7 +1871,15 @@ class BaoStockDataProvider(BaseDataProvider):
         cache: Optional[DuckDBCache] = None,
         **kwargs,
     ):
-        self.adjustflag = str(adjustflag)
+        self.native_adjust_basis = _normalize_adjust_basis(
+            str(adjustflag) if isinstance(adjustflag, (int, str)) else adjustflag,
+            provider_name="BaoStockDataProvider",
+            param_name="adjustflag",
+            allowed=("1", "2", "3", "none", "qfq", "hfq", "forward", "backward"),
+        )
+        # `self.adjustflag` MUST stay a BaoStock protocol digit ("1"/"2"/"3") -- it is passed
+        # straight to `query_history_k_data_plus` and asserted by the intraday tests.
+        self.adjustflag = _BAOSTOCK_FLAG_BY_CANONICAL[self.native_adjust_basis]
         self._keep_logged_in = bool(keep_logged_in)
         self._is_logged_in = False
         #: Per-`recv` socket timeout (seconds) applied to baostock's module-level socket.
@@ -2002,6 +2133,22 @@ class BaoStockDataProvider(BaseDataProvider):
         is_intraday = is_intraday_interval(interval)
         is_index = is_index_symbol(norm_sym)
 
+        # M3.9: re-validate a caller-supplied flag. `fetch_ohlcv`/`fetch_raw_ohlcv` pass an
+        # already-normalised protocol digit, but a direct `_fetch_ohlcv_internal(adjustflag=...)`
+        # call must not be able to smuggle a bogus token past the constructor guard (the old
+        # `adjustflag or self.adjustflag` accepted any truthy string and sent it upstream).
+        requested_basis = (
+            self.native_adjust_basis
+            if adjustflag is None
+            else _normalize_adjust_basis(
+                str(adjustflag) if isinstance(adjustflag, (int, str)) else adjustflag,
+                provider_name="BaoStockDataProvider",
+                param_name="adjustflag",
+                allowed=("1", "2", "3", "none", "qfq", "hfq", "forward", "backward"),
+            )
+        )
+        requested_flag = _BAOSTOCK_FLAG_BY_CANONICAL[requested_basis]
+
         # BaoStock does not support intraday K-lines for BSE stocks (.BJ) or broad-market indices
         if is_intraday and (norm_sym.endswith(".BJ") or is_index):
             warnings.warn(
@@ -2016,13 +2163,21 @@ class BaoStockDataProvider(BaseDataProvider):
         # Strict field list restriction & adjustflag
         if is_intraday:
             fields = "date,time,code,open,high,low,close,volume,amount,adjustflag"
-            req_adjustflag = adjustflag or self.adjustflag
+            req_adjustflag = requested_flag
         elif is_index:
+            # BaoStock's index query has no adjustment field at all: indices are always served
+            # raw ("3"). Do not raise -- but never let a qfq/hfq request pass silently either.
             fields = "date,code,open,high,low,close,preclose,volume,amount,pctChg"
             req_adjustflag = "3"
+            if requested_flag != "3":
+                _LOGGER.warning(
+                    "BaoStockDataProvider: %s is an index and cannot honour adjustflag=%r "
+                    "(basis %r); indices are force-fetched as raw (adjustflag='3').",
+                    norm_sym, requested_flag, requested_basis,
+                )
         else:
             fields = "date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,pctChg,isST"
-            req_adjustflag = adjustflag or self.adjustflag
+            req_adjustflag = requested_flag
 
         start_dt = pd.to_datetime(start).date()
         end_dt = pd.to_datetime(end).date()
@@ -2245,7 +2400,14 @@ class BaoStockDataProvider(BaseDataProvider):
         else:
             df = df.loc[(df.index.date >= start_dt) & (df.index.date <= end_dt)]
 
-        return _drop_invalid_ohlcv_rows(df, symbol)
+        out = _drop_invalid_ohlcv_rows(df, symbol)
+        if is_index:
+            # Indices were force-fetched as raw ("3"), and their field list has no `adjustflag`
+            # column at all -- stamp it (adding it when absent) so the frame cannot be mistaken
+            # for a qfq/hfq series by downstream basis detection.
+            out["adjustflag"] = "3"
+            out.attrs["adjust_basis"] = "raw"
+        return out
 
     def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
         return self._fetch_ohlcv_internal(symbol, start, end, interval=interval, adjustflag=self.adjustflag)
@@ -2695,8 +2857,13 @@ class EastMoneyDataProvider(BaseDataProvider):
         min_interval_sec: float = 0.15,
         **kwargs,
     ):
-        self.adjust = adjust
-        self.fqt = "1" if adjust == "qfq" else ("2" if adjust == "hfq" else "0")
+        self.native_adjust_basis = _normalize_adjust_basis(
+            adjust, provider_name="EastMoneyDataProvider", allowed=("none", "qfq", "hfq")
+        )
+        # Keep the constructor's own vocabulary so `adjust=p.adjust` round-trips:
+        # "raw" is not an accepted token here (M3.9 normalises raw -> "none").
+        self.adjust = "none" if self.native_adjust_basis == "raw" else self.native_adjust_basis
+        self.fqt = _EASTMONEY_FQT_BY_CANONICAL[self.native_adjust_basis]
         self.min_interval_sec = min_interval_sec
         self._last_request_time = 0.0
         if session is None:

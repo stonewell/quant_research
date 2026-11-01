@@ -341,6 +341,7 @@ flowchart TD
 2. **协议参数、`O-C-H-L` 顺序矫正与“手 $\to$ 股” 100 倍量纲自适应校验（防呆核心，评审澄清 §9.3）**：
    - 请求端点：`GET https://push2his.eastmoney.com/api/qt/stock/kline/get`
    - 参数映射：`klt` 映射 `{"1m": "1", "5m": "5", "15m": "15", "30m": "30", "60m": "60", "1h": "60", "1d": "101", "1wk": "102", "1mo": "103"}`（同时支持 `"60m"` 与 `"1h"` 别名）；复权标志 `fqt` 映射 `{"forward": "1", "backward": "2", "none": "0"}`；`fields1="f1,f2,f3,f4,f5,f6"`，`fields2="f51,f52,f53,f54,f55,f56,f57,f58"`。
+     **（2026-10-31 更正：原文 `{forward,backward,none}` 为误记；东财 `fqt` 实为 `0=raw / 1=qfq / 2=hfq`，与 `common/financial_api.py` 的映射一致。原句保留以留痕。）**
    - **字段重排与成交量量纲硬断言校准（区分个股/ETF 与宽基指数）**：
      东财返回的每条 K 线字符串格式为 `"f51(时间),f52(Open),f53(Close),f54(High),f55(Low),f56(Volume手),f57(Amount元),f58(振幅)"`：
      ```python

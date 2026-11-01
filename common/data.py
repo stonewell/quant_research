@@ -718,19 +718,48 @@ _FACTOR_CAPABILITY_GAP_WARNED: set = set()
 _ASSUMED_BASIS_WARNED: set = set()
 
 
-def _provider_native_basis(provider: BaseDataProvider) -> Optional[str]:
+def _provider_native_basis(
+    provider: BaseDataProvider, df: Optional[pd.DataFrame] = None
+) -> Optional[str]:
     """Best declared answer to "which adjustment basis does `fetch_ohlcv` return?".
 
-    Order: the explicit `native_adjust_basis` attribute, then the legacy per-provider knobs this
-    repo already used (`adjustflag` on BaoStock, `adjust` on EastMoney/Fuyao/MarketDB, `fqt` on
-    Tushare-style providers). Returns `None` when the provider declares nothing -- callers must
-    then decide (the legacy cache path assumes `qfq`, see
+    The frame's own declaration wins (M3.9). A provider can legitimately return `raw` bars for an
+    asset class that cannot be adjusted at all (Fuyao ETF/index, BaoStock index) even though its
+    provider-level knob still says `qfq`; those return paths stamp
+    `df.attrs["adjust_basis"] = "raw"`. Recording the provider-level basis for such a frame would
+    write a FALSE label -- exactly the label that basis derivation and the fail-closed
+    `UnknownAdjustBasisError` read both rely on -- so `df` (optional, and last, to keep the old
+    single-argument signature working) is consulted before the knobs.
+
+    Otherwise, order: the explicit `native_adjust_basis` attribute, then the legacy per-provider
+    knobs this repo already used (`adjustflag` on BaoStock, `adjust` on EastMoney/Fuyao/MarketDB,
+    `fqt` on Tushare-style providers). Returns `None` when the provider declares nothing -- callers
+    must then decide (the legacy cache path assumes `qfq`, see
     `BaseDataProvider.ASSUMED_NATIVE_BASIS_WHEN_UNKNOWN`; `rebase_corporate_action` does the same
     and says so).
     """
+    if df is not None:
+        frame_basis = df.attrs.get("adjust_basis")
+        if frame_basis is not None:
+            try:
+                return canonicalize_adjust_mode(frame_basis)
+            except ValueError:
+                # An alias we do not recognise: fall through to the provider knobs rather than guess.
+                pass
+    # `fqt` is an EastMoney field with the OPPOSITE digit convention to BaoStock's
+    # `adjustflag` -- `fqt` is "0"=raw / "1"=qfq / "2"=hfq, while `adjustflag` is
+    # "1"=hfq / "2"=qfq / "3"=raw. Routing `fqt` through `canonicalize_adjust_mode`
+    # therefore INVERTED the basis for any provider that only declared `fqt` (M3.9).
+    _FQT_TO_CANONICAL = {"0": "raw", "1": "qfq", "2": "hfq"}
     for attr in ("native_adjust_basis", "adjustflag", "adjust", "fqt"):
         raw = getattr(provider, attr, None)
         if raw is None:
+            continue
+        if attr == "fqt":
+            mapped = _FQT_TO_CANONICAL.get(str(raw))
+            if mapped is not None:
+                return mapped
+            # Not one of EastMoney's documented codes: tells us nothing, keep looking.
             continue
         try:
             return canonicalize_adjust_mode(raw)
@@ -1021,7 +1050,19 @@ class CachedDataProvider(BaseDataProvider):
             # nothing gets the documented assumption (`ASSUMED_NATIVE_BASIS_WHEN_UNKNOWN`, `qfq`
             # -- the pre-M3.6 read default), logged so it is not silent, and it stays FAIL-CLOSED
             # for `raw`/`hfq` requests rather than answering them with possibly-wrong bytes.
-            native_basis = _provider_native_basis(self.inner_provider)
+            if is_intraday_interval(interval):
+                df = self.inner_provider.fetch_ohlcv(symbol, start, end, interval=interval)
+            else:
+                try:
+                    df = self.inner_provider.fetch_ohlcv(symbol, start, end, interval="1d")
+                except Exception:
+                    df = self.inner_provider.fetch_ohlcv(symbol, start, end, interval=interval)
+
+            # M3.9: the basis is resolved AFTER the fetch and with the frame in hand, so a
+            # degraded frame (e.g. a Fuyao ETF/index or BaoStock index that can only be returned
+            # raw) declares its own `df.attrs["adjust_basis"] = "raw"` instead of inheriting the
+            # provider-level `qfq` knob and being cached under a false label.
+            native_basis = _provider_native_basis(self.inner_provider, df)
             if native_basis is None:
                 native_basis = BaseDataProvider.ASSUMED_NATIVE_BASIS_WHEN_UNKNOWN
                 key = f"{provider_name}:assumed-basis"
@@ -1038,14 +1079,6 @@ class CachedDataProvider(BaseDataProvider):
                         native_basis,
                     )
             stored_basis = native_basis
-
-            if is_intraday_interval(interval):
-                df = self.inner_provider.fetch_ohlcv(symbol, start, end, interval=interval)
-            else:
-                try:
-                    df = self.inner_provider.fetch_ohlcv(symbol, start, end, interval="1d")
-                except Exception:
-                    df = self.inner_provider.fetch_ohlcv(symbol, start, end, interval=interval)
 
         if df.empty:
             raise ValueError(
@@ -1401,7 +1434,9 @@ class CachedDataProvider(BaseDataProvider):
         M3.6 review P1: the rebase must DECLARE the basis of the bytes it writes. It fetches
         through the inner provider's own `fetch_ohlcv`, so the truthful label is exactly that
         provider's native basis (`_provider_native_basis`: `native_adjust_basis` / `adjustflag` /
-        `adjust` / `fqt`). A provider that declares nothing gets the documented assumption
+        `adjust` / `fqt`, overridden by the frame's own `df.attrs["adjust_basis"]` when the
+        returned asset class can only be `raw` -- M3.9). A provider that declares nothing gets the
+        documented assumption
         `ASSUMED_NATIVE_BASIS_WHEN_UNKNOWN` (`qfq`, the pre-M3.6 read default) -- logged, and
         still fail-closed for `raw`/`hfq` requests. `allow_undeclared_basis=True` is deliberately
         NOT used here: this method exists to repair a known corporate action, so it always knows
@@ -1447,7 +1482,9 @@ class CachedDataProvider(BaseDataProvider):
                 f"Data for {symbol} between {start} and {end} had rows, but every one was dropped as invalid OHLC."
             )
 
-        declared_basis = _provider_native_basis(self.inner_provider)
+        # M3.9: pass the frame so a rebased series that came back `raw` (asset class cannot be
+        # adjusted) is labelled `raw` instead of inheriting the provider-level knob.
+        declared_basis = _provider_native_basis(self.inner_provider, df)
         if declared_basis is None:
             declared_basis = BaseDataProvider.ASSUMED_NATIVE_BASIS_WHEN_UNKNOWN
             logger.warning(

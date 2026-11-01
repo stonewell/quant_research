@@ -1297,3 +1297,23 @@ def test_rebase_corporate_action_cli_script(tmp_path, capsys):
     updated_bars = cache.query_bars("DynamicSplitProvider", "SPLIT_TEST")
     assert (updated_bars["Close"] == 50.0).all()
 
+def test_provider_native_basis_fqt_uses_eastmoney_digits():
+    """M3.9: `fqt` must be read with EastMoney's digits, not BaoStock's.
+
+    `fqt` is "0"=raw / "1"=qfq / "2"=hfq, while BaoStock's `adjustflag` is
+    "1"=hfq / "2"=qfq / "3"=raw. Both used to share one resolver, which inverted
+    the basis for any provider declaring only `fqt` -- a silent qfq/hfq swap. This
+    pins the per-field convention so the two can never be conflated again.
+    """
+    from common.data import _provider_native_basis
+
+    class _FqtOnlyProvider:
+        def __init__(self, fqt):
+            self.fqt = fqt
+
+    assert _provider_native_basis(_FqtOnlyProvider("0")) == "raw"
+    assert _provider_native_basis(_FqtOnlyProvider("1")) == "qfq"
+    assert _provider_native_basis(_FqtOnlyProvider("2")) == "hfq"
+    # An undocumented code must not be guessed.
+    assert _provider_native_basis(_FqtOnlyProvider("9")) is None
+
