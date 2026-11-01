@@ -1151,6 +1151,29 @@ def patch_equity_daily_bars(
     return fetch_errors
 
 
+def _persist_intraday_probe(
+    cache: DuckDBCache,
+    symbol: str,
+    result: Dict[str, Any],
+    *,
+    interval: str = "5m",
+) -> None:
+    """Persists BaoStock intraday probe verdict into intraday_sync_metadata."""
+    try:
+        attempts = result.get("attempts")
+        last_result = result.get("last_result", "unknown")
+        if attempts is not None:
+            cache.record_intraday_probe(
+                "BaoStockDataProvider",
+                symbol,
+                int(attempts),
+                str(last_result),
+                interval=interval,
+            )
+    except Exception as exc:
+        _LOGGER.warning("Failed to persist intraday probe verdict for %s: %s", symbol, exc)
+
+
 def sync_5m_intraday(
     cache: DuckDBCache,
     stocks: List[str],
@@ -1177,7 +1200,14 @@ def sync_5m_intraday(
     if "511880.SH" not in all_targets:
         all_targets.append("511880.SH")
 
-    bs_prov = BaoStockDataProvider(adjustflag="3", keep_logged_in=True)
+    def _on_intraday_probe(symbol: str, result: Dict[str, Any]) -> None:
+        _persist_intraday_probe(cache, symbol, result, interval="5m")
+
+    bs_prov = BaoStockDataProvider(
+        adjustflag="3",
+        keep_logged_in=True,
+        probe_observer=_on_intraday_probe,
+    )
     em_prov = EastMoneyDataProvider(adjust="none")
 
     refusals = RefusalCollector("PART B (5m intraday)")

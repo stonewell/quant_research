@@ -1353,18 +1353,31 @@ class DuckDBCache:
             "adjustflag": row[4],
         }
 
-    def get_intraday_metadata(self, provider: str, symbol: str, interval: str = "5m") -> Optional[dict]:
+    def get_intraday_metadata(
+        self,
+        provider: str,
+        symbol: str,
+        interval: str = "5m",
+        include_probe: bool = False,
+    ) -> Optional[dict]:
         """Returns synchronization metadata for (provider, symbol, interval), or None if not found."""
         if is_synthetic_provider(provider):
             return None
 
         con = self._get_connection(read_only=True)
         try:
-            row = con.execute(
-                "SELECT earliest_available_ts, is_earliest_known, latest_available_ts, latest_close_ref, last_sync_time, adjustflag "
-                "FROM intraday_sync_metadata WHERE provider = ? AND symbol = ? AND interval = ?",
-                [provider, symbol, interval],
-            ).fetchone()
+            if include_probe:
+                row = con.execute(
+                    "SELECT earliest_available_ts, is_earliest_known, latest_available_ts, latest_close_ref, last_sync_time, adjustflag, probe_attempts, last_probe_result "
+                    "FROM intraday_sync_metadata WHERE provider = ? AND symbol = ? AND interval = ?",
+                    [provider, symbol, interval],
+                ).fetchone()
+            else:
+                row = con.execute(
+                    "SELECT earliest_available_ts, is_earliest_known, latest_available_ts, latest_close_ref, last_sync_time, adjustflag "
+                    "FROM intraday_sync_metadata WHERE provider = ? AND symbol = ? AND interval = ?",
+                    [provider, symbol, interval],
+                ).fetchone()
         finally:
             if not self.is_memory:
                 con.close()
@@ -1372,7 +1385,7 @@ class DuckDBCache:
         if not row:
             return None
 
-        return {
+        res = {
             "earliest_available_ts": pd.Timestamp(row[0]),
             "is_earliest_known": bool(row[1]),
             "latest_available_ts": pd.Timestamp(row[2]),
@@ -1380,6 +1393,47 @@ class DuckDBCache:
             "last_sync_time": pd.Timestamp(row[4]) if row[4] is not None else None,
             "adjustflag": row[5],
         }
+        if include_probe:
+            res["probe_attempts"] = int(row[6]) if row[6] is not None else None
+            res["last_probe_result"] = row[7]
+        return res
+
+    def record_intraday_probe(
+        self,
+        provider: str,
+        symbol: str,
+        attempts: int,
+        last_result: str,
+        interval: str = "5m",
+    ) -> None:
+        """Records intraday probe verdict into intraday_sync_metadata.
+
+        Updates `probe_attempts` and `last_probe_result` for an existing (provider, symbol, interval)
+        row. If no metadata row exists for the given key, logs a warning and does not write or
+        fabricate any timestamps. Never touches `intraday_ohlcv_bars`.
+        """
+        if is_synthetic_provider(provider):
+            return
+
+        con = self._get_connection(read_only=False)
+        try:
+            updated = con.execute(
+                "UPDATE intraday_sync_metadata SET probe_attempts = ?, last_probe_result = ? "
+                "WHERE provider = ? AND symbol = ? AND interval = ? "
+                "RETURNING 1",
+                [int(attempts), str(last_result) if last_result is not None else None, provider, symbol, interval],
+            ).fetchall()
+            if not updated:
+                logger.warning(
+                    "record_intraday_probe: no existing intraday_sync_metadata row for (%s, %s, %s); "
+                    "probe verdict not persisted",
+                    provider,
+                    symbol,
+                    interval,
+                )
+        finally:
+            if not self.is_memory:
+                con.close()
 
     def is_intraday_range_covered(
         self,
