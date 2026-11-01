@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -519,12 +520,20 @@ def test_executable_web_config_carries_no_machine_specific_paths():
     """L2.16 ACCEPTANCE: no executable config under ``web/`` names a personal path.
 
     Scope notes:
+      * Only **tracked** files are scanned.  Untracked, git-ignored runtime state is
+        explicitly out of scope because the contract is "machine paths live in the
+        untracked ``settings.local.json`` / environment, never in the repository" --
+        the operator's local overlay is *supposed* to name their own directories.
       * ``web/livetrading/data`` is runtime state (git-ignored snapshots, archive runs);
         its two *configuration* files are checked explicitly below, the archived run
         artifacts are historical records and out of scope.
       * ``docs/`` retains ``file:///...`` provenance links and the L2.16/L2.17 audit
         rows that quote the production paths -- historical disclosure, not executable
         configuration, so it is not scanned here.
+
+    Skips (with an explicit reason) only when ``git`` cannot enumerate the tracked
+    files -- a missing binary or a non-checkout -- since the tracked set is the whole
+    scope of this assertion.
     """
     needles = _machine_path_needles()
     assert needles, "needle list must not be empty"
@@ -532,9 +541,34 @@ def test_executable_web_config_carries_no_machine_specific_paths():
     web_root = Path(_WEB_DIR).parent  # <repo>/web
     skip_dirs = {".venv", "__pycache__", ".pytest_cache", "node_modules"}
     offenders = []
-    for path in web_root.rglob("*"):
+
+    # Tracked-only, deliberately.  An earlier version walked ``web_root.rglob("*")``
+    # and therefore tripped on the developer's own untracked
+    # ``web/livetrading/data/settings.local.json`` (it holds their real
+    # ``/home/...``/``/Work/...`` overrides -- exactly where this test's own failure
+    # message says such paths belong).  That made the acceptance test red on every
+    # contributor's machine while the committed tree was clean.
+    try:
+        tracked_out = subprocess.run(
+            ["git", "ls-files", "-z", "--", "."],
+            cwd=str(web_root),
+            capture_output=True,
+        )
+    except OSError as exc:  # git binary genuinely unavailable
+        pytest.skip(f"git is required to enumerate tracked files under web/: {exc}")
+    if tracked_out.returncode != 0:
+        pytest.skip(
+            "git is required to enumerate tracked files under web/: "
+            f"{tracked_out.stderr.decode('utf-8', 'replace').strip()}"
+        )
+    tracked = [
+        entry for entry in tracked_out.stdout.decode("utf-8").split("\0") if entry
+    ]
+
+    for rel_path in tracked:
+        path = web_root / rel_path
         if not path.is_file():
-            continue
+            continue  # tracked-but-deleted in the working tree
         if skip_dirs & set(path.parts):
             continue
         if "data" in path.parts and path.name not in (
