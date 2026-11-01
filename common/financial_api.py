@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 import warnings
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlsplit
 
 import numpy as np
@@ -1849,6 +1849,15 @@ class BaoStockDataProvider(BaseDataProvider):
       process-wide); past that a `DataProviderSessionError` is raised instead of
       reloginning forever. Business errors (bad parameter, real "no data") never
       relogin. See the module-level "BaoStock session self-healing" note.
+    - Silent under-return detection (M3.10): two *silent* defects of the BaoStock path
+      are now asserted instead of swallowed. (a) A dead `keep_logged_in=True` session
+      answers `error_code="0"` with **zero rows** for every query -- no exception, no
+      warning; during the 2026-10 5m calibration that cost three symbols until a second
+      probe pass noticed. (b) A page-boundary truncation cut `002371.SZ`
+      `2026-04-08..2026-10-03` at *exactly 4000 rows*; re-querying the same range returned
+      the full series, so any `rows > 0` style check was blind to it. Both are guarded
+      here (zero-row liveness probe + per-trading-day completeness), gated on the exchange
+      calendar and inert (byte-identical) when `query_trade_dates` is unavailable.
     """
 
     _lock = threading.Lock()
@@ -1863,12 +1872,27 @@ class BaoStockDataProvider(BaseDataProvider):
         "1mo": "m",
     }
 
+    #: Bars BaoStock serves per *closed* A-share session, per intraday frequency digit.
+    #: 5m: 09:35..11:30 (24) + 13:05..15:00 (24). Used by the M3.10 completeness assertion
+    #: -- "total row count" is explicitly NOT a substitute (a whole missing day and a
+    #: short day look identical in aggregate).
+    _BAOSTOCK_BARS_PER_DAY = {"5": 48, "15": 16, "30": 8, "60": 4}
+    #: Reference symbol for the dead-session liveness probe: the SSE Composite daily
+    #: series exists for every historical session, so "0 rows for `sh.000001` daily"
+    #: cannot mean "no data" -- it means the session is dead.
+    _PROBE_REFERENCE_SYMBOL = "000001.SH"
+    #: Caps for the two unbounded-in-principle telemetry caches (a full-universe sync
+    #: walks thousands of symbols; neither dict may grow for the life of the process).
+    _MAX_PROBE_STATS = 512
+    _MAX_TRADE_DAY_CACHE = 256
+
     def __init__(
         self,
         adjustflag: str = "2",
         keep_logged_in: bool = False,
         cache_dir: Optional[str] = None,
         cache: Optional[DuckDBCache] = None,
+        probe_observer: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         **kwargs,
     ):
         self.native_adjust_basis = _normalize_adjust_basis(
@@ -1901,6 +1925,20 @@ class BaoStockDataProvider(BaseDataProvider):
         #: Last `(error_code, error_msg)` that dirtied the session -- kept so an
         #: entry-time heal (which has no query of its own) can still name the trigger.
         self._last_transport_failure: Optional[Tuple[str, str]] = None
+        # -- M3.10 silent under-return telemetry -----------------------------
+        #: Optional `callable(symbol, result_dict)`, invoked once per guarded fetch that
+        #: produced a verdict. This is the *visibility* channel for the documented
+        #: `intraday_sync_metadata.probe_attempts` / `last_probe_result` columns: those
+        #: tables are owned by `common/duckdb_cache.py`, which this task must not touch,
+        #: so the provider exposes the same facts as a return-adjacent structure and lets
+        #: the caller (a sync script, a test) persist them.
+        self._probe_observer = probe_observer if callable(probe_observer) else None
+        #: symbol -> last probe verdict (bounded, see `_MAX_PROBE_STATS`).
+        self._probe_stats: Dict[str, Dict[str, Any]] = {}
+        self._last_probe_result: Optional[Dict[str, Any]] = None
+        #: (start, end) -> trading days, or `None` when the calendar could not be verified.
+        #: Cached because the intraday chunk loop asks once per 179-day shard.
+        self._trade_day_cache: Dict[Tuple[str, str], Optional[frozenset]] = {}
         # -- cache wiring ---------------------------------------------------
         # 2026-10-27 (residual sibling of the L2.13 production-path guard in
         # `common/duckdb_cache.py::refuse_production_cache_path`): the previous final
@@ -2120,6 +2158,480 @@ class BaoStockDataProvider(BaseDataProvider):
             f", last_error_msg={str(msg if msg is not None else '')[:PAYLOAD_SNIPPET_CHARS]!r}"
         )
 
+    # -- silent under-return guards (M3.10) ---------------------------------------
+    # Two defects returned *fewer* rows than the exchange session implies while every check
+    # this provider already had stayed green (`error_code == "0"`, `rows > 0`, no exception,
+    # no warning):
+    #   (a) a dead `keep_logged_in=True` session answered 0 rows to *every* query;
+    #   (b) a page-boundary truncation cut 002371.SZ 2026-04-08..2026-10-03 at exactly
+    #       4000 rows -- re-querying returned the full series.
+    # Everything below is CALENDAR-GATED on `query_trade_dates`: without a verifiable
+    # exchange calendar we cannot claim a day "should" exist, so the historical behaviour
+    # (empty frame for an empty answer) is preserved byte-identically for clients/doubles
+    # that do not expose the calendar API.
+
+    def _result_rows_to_df(self, rs, fields: str) -> Optional[pd.DataFrame]:
+        """Extract one `query_history_k_data_plus` answer into a raw string DataFrame.
+
+        Shared by the main chunk loop, the per-day repair and the liveness probe so all
+        three read a `ResultData` exactly the same way. Deliberately page-by-page:
+        baostock's own `rs.get_data()` calls the Pandas-1.x `df.append` (an
+        `AttributeError` under Pandas 2.x) *after* `next()` already overwrote page 1, and
+        the `while rs.next()` shape loops forever (`cur_row_num` never advances) unless
+        `cur_row_num = len(rs.data)` is set after every page -- the documented OOM.
+        """
+        chunk_df = None
+        if (
+            hasattr(rs, "data")
+            and isinstance(getattr(rs, "data", None), list)
+            and hasattr(rs, "cur_row_num")
+        ):
+            data_list = []
+            if rs.data:
+                data_list.extend(rs.data)
+                rs.cur_row_num = len(rs.data)
+                while getattr(rs, "error_code", "0") == "0" and rs.next():
+                    if rs.data:
+                        data_list.extend(rs.data)
+                        rs.cur_row_num = len(rs.data)
+                    else:
+                        break
+            if data_list:
+                col_names = rs.fields if (hasattr(rs, "fields") and rs.fields) else fields.split(",")
+                chunk_df = pd.DataFrame(data_list, columns=col_names)
+        elif hasattr(rs, "get_data"):
+            chunk_df = rs.get_data()
+        elif hasattr(rs, "next"):
+            data_list = []
+            while getattr(rs, "error_code", "0") == "0" and rs.next():
+                data_list.append(rs.get_row_data())
+            if data_list:
+                chunk_df = pd.DataFrame(data_list, columns=fields.split(","))
+        return chunk_df
+
+    @staticmethod
+    def _calendar_available(bs) -> bool:
+        """Whether this client can answer `query_trade_dates` (the guard's only oracle)."""
+        return callable(getattr(bs, "query_trade_dates", None))
+
+    def _trading_days(self, bs, start_dt, end_dt) -> Optional[frozenset]:
+        """Exchange trading dates in `[start_dt, end_dt]`, or `None` when unverifiable.
+
+        `None` (never an empty set) is the "we do not know" answer: an error, an unreadable
+        shape, or an *empty* calendar answer for a non-empty range -- the last one is itself
+        a symptom of the dead session, so it must not be read as "no trading days".
+        """
+        key = (start_dt.isoformat(), end_dt.isoformat())
+        if key in self._trade_day_cache:
+            return self._trade_day_cache[key]
+        days: Optional[frozenset] = None
+        try:
+            rs = bs.query_trade_dates(start_date=key[0], end_date=key[1])
+            if not (hasattr(rs, "error_code") and getattr(rs, "error_code") == "0"):
+                days = None
+            else:
+                frame = self._result_rows_to_df(rs, "calendar_date,is_trading_day")
+                if frame is not None and not frame.empty:
+                    date_col = (
+                        "calendar_date" if "calendar_date" in frame.columns else frame.columns[0]
+                    )
+                    parsed = pd.to_datetime(
+                        frame[date_col].astype(str).str.strip(), format="%Y-%m-%d", errors="coerce"
+                    )
+                    keep = parsed.notna()
+                    if "is_trading_day" in frame.columns:
+                        keep = keep & (
+                            frame["is_trading_day"].astype(str).str.strip() == "1"
+                        )
+                    picked = parsed[keep]
+                    days = frozenset(picked.dt.date.tolist())
+        except Exception as exc:  # a calendar hiccup must never cost us the data
+            _LOGGER.warning(
+                "BaoStock trade-calendar query failed (%s->%s): %s: %s",
+                key[0], key[1], type(exc).__name__, exc,
+            )
+            days = None
+        if len(self._trade_day_cache) >= self._MAX_TRADE_DAY_CACHE:
+            self._trade_day_cache.clear()
+        self._trade_day_cache[key] = days
+        return days
+
+    def _expected_closed_sessions(self, bs, start_dt, end_dt) -> Optional[frozenset]:
+        """Trading days in the range whose session has already closed.
+
+        Today is excluded on purpose: a "fetch up to now" request legitimately ends with a
+        partial session, and counting it would turn every live run into a false truncation.
+        """
+        if not self._calendar_available(bs):
+            return None
+        today = datetime.date.today()
+        last_closed = min(end_dt, today - datetime.timedelta(days=1))
+        if start_dt > last_closed:
+            return frozenset()
+        return self._trading_days(bs, start_dt, last_closed)
+
+    def _should_have_bars(self, bs, start_dt, end_dt) -> bool:
+        """Whether the range is expected to contain at least one closed session.
+
+        When the calendar API exists but its answer is unreadable/empty, fall back to a
+        *weekday* proxy for this suspicion test only. A dead session blinds the calendar
+        too, so refusing to guess here would make the guard miss the exact defect it was
+        built for; the reference probe (`_reference_liveness`) is what converts suspicion
+        into a verdict, so a wrong proxy costs one query, never a spurious relogin.
+        """
+        if not self._calendar_available(bs):
+            return False
+        sessions = self._expected_closed_sessions(bs, start_dt, end_dt)
+        if sessions is not None:
+            return bool(sessions)
+        return any(d.weekday() < 5 for d in pd.date_range(start_dt, end_dt, freq="D").date)
+
+    def _reference_liveness(self, bs, start_dt, end_dt) -> str:
+        """``"alive"`` / ``"dead"`` / ``"unknown_no_probe_window"`` / ``"unknown_probe_unreadable"``.
+
+        The SSE Composite daily series exists for every historical session, so "0 rows for
+        `sh.000001` daily" cannot mean "no data". Asking it is what lets the provider tell a
+        dead session apart from a symbol that genuinely has no bars in the range
+        (pre-listing, delisted, suspended for the whole window) -- reloginning on every
+        legitimate empty answer would burn the PROCESS-WIDE `BAOSTOCK_MAX_RELOGINS` budget
+        and then raise for every later symbol.
+
+        INVARIANT (2026-11-01 review, latent false positive): ``"dead"`` requires that the
+        *probe window itself* contains at least one closed trading session. The probe only
+        looks back `10` calendar days from `end_dt`, while `_should_have_bars` scans the
+        whole requested range, so a range whose closed sessions all sit >10 calendar days
+        before `end_dt` (e.g. `end_dt` inside an >=11-day market closure, or just after one)
+        would otherwise get a *guaranteed* zero-row answer from a perfectly healthy session
+        -- one false relogin, and the process-wide relogin budget is gone for the rest of
+        the run. An *unverifiable* calendar answer (`None`) deliberately keeps the stronger
+        behaviour: in the real incident the dead session blinds `query_trade_dates` too, so
+        demanding a verified calendar here would make the guard miss the exact defect it was
+        built for. Only a *verified* empty probe window downgrades the verdict.
+        """
+        probe_start = max(start_dt, end_dt - datetime.timedelta(days=10))
+        probe_sessions = self._expected_closed_sessions(bs, probe_start, end_dt)
+        if probe_sessions is not None and not probe_sessions:
+            # The probe window cannot show anything: a 0-row answer proves nothing, so skip
+            # the query entirely (the calendar lookup is cached) and report "unknown".
+            return "unknown_no_probe_window"
+        try:
+            rs = bs.query_history_k_data_plus(
+                to_baostock_code(self._PROBE_REFERENCE_SYMBOL),
+                "date,close",
+                start_date=probe_start.isoformat(),
+                end_date=end_dt.isoformat(),
+                frequency="d",
+                adjustflag="3",
+            )
+        except Exception as exc:
+            _LOGGER.warning(
+                "BaoStock liveness probe failed (%s): %s: %s",
+                self._PROBE_REFERENCE_SYMBOL, type(exc).__name__, exc,
+            )
+            return "unknown_probe_unreadable"
+        if hasattr(rs, "error_code") and getattr(rs, "error_code") != "0":
+            return "unknown_probe_unreadable"
+        frame = self._result_rows_to_df(rs, "date,close")
+        if frame is None:
+            # A *successful* answer with zero rows extracts to `None` (the extractor only
+            # builds a frame when at least one row exists), so for a real ResultData this is
+            # conclusive emptiness -- exactly the dead-session shape. Anything that does not
+            # even expose a row list is unreadable, not empty.
+            if isinstance(getattr(rs, "data", None), list):
+                return "dead"
+            return "unknown_probe_unreadable"
+        return "alive" if len(frame) > 0 else "dead"
+
+    def _zero_row_verdict(self, bs, start_dt, end_dt) -> str:
+        """Classify an `error_code="0"` + 0-row answer.
+
+        ``"dead"`` / ``"alive"`` / ``"unknown_no_calendar"`` / ``"unknown_no_probe_window"``
+        / ``"unknown_probe_unreadable"``. Only ``"dead"`` is allowed to spend the relogin
+        budget; every other answer keeps the historical empty-frame behaviour.
+        """
+        if not self._should_have_bars(bs, start_dt, end_dt):
+            # No verifiable reason to expect a bar here (no calendar API, or a range whose
+            # every day is a weekend). Stay inert -- the pre-M3.10 behaviour.
+            return "unknown_no_calendar"
+        return self._reference_liveness(bs, start_dt, end_dt)
+
+    def _expected_bars(self, bs, start_dt, end_dt, freq: str) -> Optional[int]:
+        """Bars a *complete* answer must carry, or `None` when the calendar is unavailable."""
+        bar_target = self._BAOSTOCK_BARS_PER_DAY.get(freq)
+        if bar_target is None:
+            return None
+        sessions = self._expected_closed_sessions(bs, start_dt, end_dt)
+        if sessions is None:
+            return None
+        return len(sessions) * bar_target
+
+    @staticmethod
+    def _bars_by_session(dfs) -> Dict[datetime.date, int]:
+        """Raw-row count per session date, across the collected (still unparsed) frames."""
+        counts: Dict[datetime.date, int] = {}
+        for frame in dfs:
+            if frame is None or getattr(frame, "empty", True):
+                continue
+            if "date" in frame.columns:
+                stamps = pd.to_datetime(
+                    frame["date"].astype(str).str.strip().str[:10],
+                    format="%Y-%m-%d",
+                    errors="coerce",
+                )
+            elif "time" in frame.columns:
+                stamps = pd.to_datetime(
+                    frame["time"].astype(str).str.strip().str[:8],
+                    format="%Y%m%d",
+                    errors="coerce",
+                )
+            else:
+                continue
+            stamps = stamps[stamps.notna()]
+            for day, n in stamps.dt.date.value_counts().items():
+                counts[day] = counts.get(day, 0) + int(n)
+        return counts
+
+    @staticmethod
+    def _accounted_bars(have: Dict[datetime.date, int], sessions, bar_target: int) -> int:
+        """Bars this answer actually accounts for, capped at the per-session target.
+
+        Raw `len()` over the collected frames would double-count a repaired day (the 16
+        truncated bars plus the refetched 48), which would make a successful repair look
+        like a surplus; the honest number is "how much of the expected grid is covered".
+        """
+        return int(sum(min(have.get(day, 0), bar_target) for day in sessions))
+
+    def _query_day_rows(
+        self, bs, *, bs_code, fields, freq, req_adjustflag, day
+    ) -> Optional[pd.DataFrame]:
+        """Re-query exactly one session (`start == end == day`)."""
+        try:
+            rs = bs.query_history_k_data_plus(
+                bs_code,
+                fields,
+                start_date=day.isoformat(),
+                end_date=day.isoformat(),
+                frequency=freq,
+                adjustflag=req_adjustflag,
+            )
+        except Exception as exc:
+            warnings.warn(
+                f"BaoStock per-day refetch failed for {bs_code} {day.isoformat()}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return None
+        if hasattr(rs, "error_code") and getattr(rs, "error_code") != "0":
+            warnings.warn(
+                f"BaoStock per-day refetch error for {bs_code} {day.isoformat()}: "
+                f"code={getattr(rs, 'error_code', '?')} msg={getattr(rs, 'error_msg', '')!r}"
+            )
+            return None
+        return self._result_rows_to_df(rs, fields)
+
+    def _daily_bar_profile(self, bs, *, bs_code, days, req_adjustflag) -> Dict[datetime.date, tuple]:
+        """One daily query covering `days` -> `date: (open, high, low, close, volume)`.
+
+        Used only to classify a *short* 5m day: a suspension (停牌) legitimately has no
+        5m bars and must never be reported as a missing day, so the daily bar -- `volume`
+        NaN/0, or a frozen O=H=L=C -- is the discriminator, confirmed against the calendar
+        that produced the expected-session set.
+        """
+        if not days:
+            return {}
+        lo, hi = min(days), max(days)
+        try:
+            rs = bs.query_history_k_data_plus(
+                bs_code,
+                "date,open,high,low,close,volume",
+                start_date=lo.isoformat(),
+                end_date=hi.isoformat(),
+                frequency="d",
+                adjustflag=req_adjustflag,
+            )
+        except Exception as exc:
+            warnings.warn(
+                f"BaoStock suspension probe failed for {bs_code}: {type(exc).__name__}: {exc}"
+            )
+            return {}
+        if hasattr(rs, "error_code") and getattr(rs, "error_code") != "0":
+            return {}
+        frame = self._result_rows_to_df(rs, "date,open,high,low,close,volume")
+        if frame is None or frame.empty or "date" not in frame.columns:
+            return {}
+        profile: Dict[datetime.date, tuple] = {}
+        stamps = pd.to_datetime(
+            frame["date"].astype(str).str.strip(), format="%Y-%m-%d", errors="coerce"
+        )
+        for idx, stamp in stamps.items():
+            if pd.isna(stamp):
+                continue
+            row = frame.loc[idx]
+            profile[stamp.date()] = tuple(
+                pd.to_numeric(row.get(col), errors="coerce")
+                for col in ("open", "high", "low", "close", "volume")
+            )
+        return profile
+
+    def _repair_intraday_underreturn(
+        self, bs, *, bs_code, fields, freq, req_adjustflag, dfs, start_dt, end_dt, probe
+    ) -> None:
+        """Assert per-trading-day completeness; refetch short days one by one.
+
+        `rows == trading_days * 48` is the only shape check that catches a page-boundary
+        truncation: the 002371.SZ defect cut at exactly 4000 rows (= 83 full days + 16
+        bars), so the *aggregate* count still looked plausible and any `rows > 0` test was
+        blind. Whole missing days are caught here too because the expected count comes from
+        the exchange calendar, never from the returned frame itself -- explicitly not
+        "total row count" as a proxy for per-day validation.
+        """
+        bar_target = self._BAOSTOCK_BARS_PER_DAY.get(freq)
+        if bar_target is None:
+            return
+        sessions = self._expected_closed_sessions(bs, start_dt, end_dt)
+        probe["attempts"] = int(probe.get("attempts", 0)) + 1
+        if sessions is None:
+            # No verifiable calendar: nothing to assert. Disclosed by the probe verdict so a
+            # caller can tell "verified complete" apart from "could not verify".
+            probe["last_result"] = "completeness_unverified_no_calendar"
+            return
+        expected_bars = len(sessions) * bar_target
+        probe["expected_bars"] = expected_bars
+        if not sessions:
+            probe["last_result"] = "ok"
+            return
+        have = self._bars_by_session(dfs)
+        short = sorted(day for day in sessions if have.get(day, 0) < bar_target)
+        probe["returned_bars"] = self._accounted_bars(have, sessions, bar_target)
+        if not short:
+            probe["last_result"] = "ok"
+            return
+
+        probe["truncated"] = True
+        msg = (
+            f"BaoStock under-return for {bs_code} ({freq}m, {start_dt}->{end_dt}): "
+            f"{probe['returned_bars']} rows vs {expected_bars} expected "
+            f"({len(sessions)} trading days x {bar_target}); short days: "
+            f"{[d.isoformat() for d in short[:5]]}{'...' if len(short) > 5 else ''}. "
+            "Refetching those days one by one."
+        )
+        warnings.warn(msg)
+        _LOGGER.warning(msg)
+
+        refetched = 0
+        for day in short:
+            day_rows = self._query_day_rows(
+                bs,
+                bs_code=bs_code,
+                fields=fields,
+                freq=freq,
+                req_adjustflag=req_adjustflag,
+                day=day,
+            )
+            if day_rows is not None and not day_rows.empty:
+                dfs.append(day_rows)
+                refetched += 1
+        probe["refetched_days"] = len(short)
+        probe["repaired_days"] = refetched
+
+        have = self._bars_by_session(dfs)
+        probe["returned_bars"] = self._accounted_bars(have, sessions, bar_target)
+        remaining = [day for day in sessions if have.get(day, 0) < bar_target]
+        if not remaining:
+            probe["last_result"] = "repaired"
+            return
+
+        profile = self._daily_bar_profile(
+            bs, bs_code=bs_code, days=remaining, req_adjustflag=req_adjustflag
+        )
+        suspended: List[datetime.date] = []
+        missing: List[datetime.date] = []
+        unverified: List[datetime.date] = []
+        for day in remaining:
+            row = profile.get(day)
+            if row is None:
+                # BaoStock OMITS the whole daily row for some suspended sessions, so an
+                # absent row is neither evidence of trading nor evidence of a suspension:
+                # folding it into `missing` (the pre-review behaviour) misdirects diagnosis
+                # towards a download gap when the exchange was simply closed for the stock.
+                # Its own bucket, disclosed -- no raise, no data change.
+                unverified.append(day)
+                continue
+            o, h, low, c, vol = row
+            frozen = (
+                all(pd.notna(x) for x in (o, h, low, c)) and o == h == low == c
+            )
+            is_suspended = bool(pd.isna(vol) or float(vol) <= 0.0 or frozen)
+            (suspended if is_suspended else missing).append(day)
+
+        probe["suspended_days"] = len(suspended)
+        probe["missing_days"] = [d.isoformat() for d in missing]
+        probe["unverified_days"] = [d.isoformat() for d in unverified]
+        if suspended:
+            _LOGGER.info(
+                "BaoStock: %s has %d suspended session(s) in %s->%s (no bars expected): %s",
+                bs_code, len(suspended), start_dt, end_dt,
+                [d.isoformat() for d in suspended[:5]],
+            )
+        if missing:
+            probe["last_result"] = "missing"
+            warn_msg = (
+                f"BaoStock still short after per-day refetch for {bs_code} "
+                f"({freq}m): {len(missing)} trading day(s) without the expected "
+                f"{bar_target} bars and no suspension evidence: "
+                f"{[d.isoformat() for d in missing[:5]]}"
+            )
+            warnings.warn(warn_msg)
+            _LOGGER.warning(warn_msg)
+        if unverified:
+            unverified_msg = (
+                f"BaoStock has no daily bar at all for {bs_code} ({freq}m) on "
+                f"{len(unverified)} short trading day(s) "
+                f"{[d.isoformat() for d in unverified[:5]]}: suspension vs missing is "
+                "unverifiable from the daily series (BaoStock omits suspended sessions), "
+                "counted as 'unverified_days', not as 'missing_days'."
+            )
+            warnings.warn(unverified_msg)
+            _LOGGER.warning(unverified_msg)
+            if not missing:
+                probe["last_result"] = "unverified_no_daily_row"
+        if not missing and not unverified:
+            probe["last_result"] = "suspended"
+
+    def _record_probe(self, symbol: str, probe: Dict[str, Any]) -> None:
+        """Publish this request's guard verdict (no-op when no guard was evaluated).
+
+        Stand-in for the documented `intraday_sync_metadata.probe_attempts` /
+        `last_probe_result` columns: that table belongs to `common/duckdb_cache.py`, which
+        is out of scope here, so the provider exposes the same facts through
+        `probe_attempts` / `last_probe_result` / the `probe_observer` callback and lets the
+        caller persist them. Failures of the sink itself are logged, never raised -- a
+        telemetry hook must not break a download.
+        """
+        if int(probe.get("attempts", 0)) <= 0:
+            return
+        result = dict(probe)
+        result["symbol"] = symbol
+        result.setdefault("last_result", "unknown")
+        if symbol not in self._probe_stats and len(self._probe_stats) >= self._MAX_PROBE_STATS:
+            self._probe_stats.pop(next(iter(self._probe_stats)))
+        self._probe_stats[symbol] = result
+        self._last_probe_result = result
+        if self._probe_observer is not None:
+            try:
+                self._probe_observer(symbol, dict(result))
+            except Exception as exc:
+                _LOGGER.warning("BaoStock probe observer failed for %s: %s", symbol, exc)
+
+    @property
+    def probe_attempts(self) -> Dict[str, int]:
+        """symbol -> number of guard evaluations recorded for it (bounded cache)."""
+        return {sym: int(st.get("attempts", 0)) for sym, st in self._probe_stats.items()}
+
+    @property
+    def last_probe_result(self) -> Optional[Dict[str, Any]]:
+        """Most recent guard verdict (`None` until a guard actually evaluated something)."""
+        return self._last_probe_result
+
     def _fetch_ohlcv_internal(
         self, symbol: str, start: str, end: str, interval: str = "1d", adjustflag: Optional[str] = None
     ) -> pd.DataFrame:
@@ -2206,6 +2718,26 @@ class BaoStockDataProvider(BaseDataProvider):
         # as an identifiable fetch error instead of a silent empty DataFrame.
         transport_errors: List[str] = []
 
+        # M3.10 telemetry for this request. Published through `_record_probe` even when the
+        # request ends in an exception, so a caller can always tell *what* was verified and
+        # what degraded (relogin / per-day refetch / suspension classification). Counters
+        # accumulate over the request's single heal-retry: they describe the whole attempt
+        # history, while `last_result` describes the final pass.
+        probe: Dict[str, Any] = {
+            "attempts": 0,
+            "relogins": 0,
+            "truncated": False,
+            "truncated_chunks": 0,
+            "refetched_days": 0,
+            "repaired_days": 0,
+            "suspended_days": 0,
+            "missing_days": [],
+            "unverified_days": [],
+            "expected_bars": None,
+            "returned_bars": None,
+            "last_result": "unknown",
+        }
+
         with self._lock:
             bs = self._get_bs()
             if not self._ensure_session(bs, symbol=norm_sym):
@@ -2249,38 +2781,82 @@ class BaoStockDataProvider(BaseDataProvider):
                                     break
                                 continue
 
-                            chunk_df = None
-                            if (
-                                hasattr(rs, "data")
-                                and isinstance(getattr(rs, "data", None), list)
-                                and hasattr(rs, "cur_row_num")
-                            ):
-                                # Real BaoStock ResultData: extract page-by-page by advancing cur_row_num = len(rs.data)
-                                # (Avoids baostock's broken Pandas-1.x df.append in rs.get_data() and avoids row-by-row overhead)
-                                data_list = []
-                                if rs.data:
-                                    data_list.extend(rs.data)
-                                    rs.cur_row_num = len(rs.data)
-                                    while getattr(rs, "error_code", "0") == "0" and rs.next():
-                                        if rs.data:
-                                            data_list.extend(rs.data)
-                                            rs.cur_row_num = len(rs.data)
-                                        else:
-                                            break
-                                if data_list:
-                                    col_names = rs.fields if (hasattr(rs, "fields") and rs.fields) else fields.split(",")
-                                    chunk_df = pd.DataFrame(data_list, columns=col_names)
-                            elif hasattr(rs, "get_data"):
-                                chunk_df = rs.get_data()
-                            elif hasattr(rs, "next"):
-                                data_list = []
-                                while getattr(rs, "error_code", "0") == "0" and rs.next():
-                                    data_list.append(rs.get_row_data())
-                                if data_list:
-                                    chunk_df = pd.DataFrame(data_list, columns=fields.split(","))
+                            chunk_df = self._result_rows_to_df(rs, fields)
 
                             if chunk_df is not None and not chunk_df.empty:
                                 dfs.append(chunk_df)
+
+                            # M3.10: per-shard truncation *detection*. The 002371.SZ defect
+                            # stopped at exactly 4000 rows, i.e. the shard answered "success"
+                            # with a plausible-looking count, so only the calendar's
+                            # `trading_days x 48` can say it was short.
+                            if is_intraday:
+                                shard_expected = self._expected_bars(
+                                    bs,
+                                    datetime.date.fromisoformat(c_start),
+                                    datetime.date.fromisoformat(c_end),
+                                    freq,
+                                )
+                                if shard_expected is not None:
+                                    probe["attempts"] = int(probe["attempts"]) + 1
+                                    shard_rows = 0 if chunk_df is None else len(chunk_df)
+                                    if shard_rows < shard_expected:
+                                        probe["truncated"] = True
+                                        probe["truncated_chunks"] = int(probe["truncated_chunks"]) + 1
+                                        _LOGGER.warning(
+                                            "BaoStock shard under-return for %s (%sm, "
+                                            "%s->%s): %d rows vs %d expected.",
+                                            norm_sym, freq, c_start, c_end,
+                                            shard_rows, shard_expected,
+                                        )
+
+                        # M3.10 (a): an `error_code="0"` + 0-row answer is the dead-session
+                        # signature -- it is NOT "this symbol has no bars". Classify it before
+                        # anything gets returned/cached; "dead" reuses the existing single
+                        # heal-retry, and a second empty answer after the relogin raises
+                        # instead of handing back a silent empty frame.
+                        if failure is None and not dfs and not transport_errors:
+                            verdict = self._zero_row_verdict(bs, start_dt, end_dt)
+                            probe["attempts"] = int(probe["attempts"]) + 1
+                            if verdict == "dead":
+                                dead_msg = (
+                                    f"BaoStock zero-row answer for {norm_sym} "
+                                    f"(frequency={freq}, {start_dt}->{end_dt}) with "
+                                    f"error_code=0 while the reference series "
+                                    f"{self._PROBE_REFERENCE_SYMBOL} was also empty: "
+                                    "suspect dead session"
+                                )
+                                warnings.warn(dead_msg)
+                                _LOGGER.warning(dead_msg)
+                                transport_errors.append(dead_msg)
+                                failure = ("0", "zero rows from every query (dead session)")
+                                probe["last_result"] = "dead_session"
+                            elif verdict == "alive":
+                                probe["last_result"] = "empty_verified_alive"
+                                warnings.warn(
+                                    f"BaoStock returned no bars for {norm_sym} "
+                                    f"({freq}, {start_dt}->{end_dt}); the session is alive "
+                                    f"({self._PROBE_REFERENCE_SYMBOL} answered), so this is "
+                                    "a genuine empty range (not a dead session)."
+                                )
+                            else:
+                                # "unknown_*": inconclusive, so keep the legacy behaviour
+                                # (empty frame) instead of spending the relogin budget.
+                                probe["last_result"] = verdict
+
+                        # M3.10 (b)+(c): per-trading-day completeness for intraday shards.
+                        if failure is None and dfs and is_intraday:
+                            self._repair_intraday_underreturn(
+                                bs,
+                                bs_code=bs_code,
+                                fields=fields,
+                                freq=freq,
+                                req_adjustflag=req_adjustflag,
+                                dfs=dfs,
+                                start_dt=start_dt,
+                                end_dt=end_dt,
+                                probe=probe,
+                            )
                     except OSError as exc:
                         # A real socket error escaping `socketutil.send_msg` / paging
                         # (`socket.timeout` is `TimeoutError` is `OSError` in py3.10+).
@@ -2306,6 +2882,7 @@ class BaoStockDataProvider(BaseDataProvider):
                     if failure is None or request_retried:
                         break
                     request_retried = True
+                    probe["relogins"] = int(probe["relogins"]) + 1
                     if not self._recover_session(
                         bs,
                         symbol=norm_sym,
@@ -2322,6 +2899,10 @@ class BaoStockDataProvider(BaseDataProvider):
                         bs.logout()
                     except Exception:
                         pass
+
+        # M3.10: publish the verdict whether the request succeeded or is about to raise, so a
+        # caller can always see whether completeness was actually verified.
+        self._record_probe(symbol, probe)
 
         if not dfs:
             if failure is not None:
