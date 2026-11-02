@@ -25,7 +25,7 @@
 │  - ChanCrisisShieldBlendStrategy: v1.0.1 [base: v1.6.0]                                │
 │  - ChanDualHybridBlendStrategy:  v1.0.0 [base: v1.6.0]                                 │
 │  - GenericBlendStrategy:         v1.0.0 [base: v1.6.0]                                 │
-│  - 9 大静态配置模板 (EqualWeight, RiskParity ...): v1.0.0                             │
+│  - 9 大静态配置模板 (EqualWeight, RiskParity ...): v1.0.0 (csmom: v1.1.0)              │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -253,7 +253,7 @@
 | :--- | :--- | :---: | :--- | :--- |
 | `EqualWeightAllocation` | `equal_weight` | **`1.0.0`** | `["baseline"]` | 1/N 等权重分散基准配置 |
 | `InverseVolatilityAllocation` | `inverse_vol` | **`1.0.0`** | `["volatility_targeting"]` | 资产历史波动率倒数加权，平抑极端高波标的冲击 |
-| `CrossSectionalMomentumAllocation` | `csmom` | **`1.0.0`** | `["relative_momentum"]` | 截面相对动量选拔，重仓动量排名前分位数强势标的 |
+| `CrossSectionalMomentumAllocation` | `csmom` | **`1.1.0`** | `["relative_momentum"]` | 截面相对动量选拔，重仓动量排名前分位数强势标的（M1.2 支持不对称 rank-band 与 ΔScore 门禁） |
 | `HierarchicalRiskParityAllocation` | `hrp` | **`1.0.0`** | `["risk_parity"]` | Marcos Lopez de Prado 层次风险平价算法，避免逆协方差矩阵病态奇异 |
 | `DualMomentumAllocation` | `dual_momentum` | **`1.0.0`** | `["absolute_momentum", "relative_momentum"]` | Gary Antonacci 绝对动量门禁 + 截面相对动量选股 |
 | `MaxDiversificationAllocation` | `max_div` | **`1.0.0`** | `["risk_parity"]` | Choueifaty 分散化比率（Diversification Ratio）最大化凸优化 |
@@ -4080,3 +4080,64 @@ LIVETRADING_STRICT_SEED_BOOK=0        # 0 / false / no / off 同样生效
 - **版本轴（`AGENTS.md` 规则 7）未触发**：七个提交只落在 `web/livetrading/storage.py`、`execution_service.py`、`models.py`、`server.py`、`static/js/app.js` 与其测试、文档；未触碰任何 `AllocationTemplate` / 静态模板 / `BaseBlendAllocationStrategy` / 策略类，`BASE_VERSION` 与各 per-class `version` 一律未动，**不欠** `--dump-strategies` 重跑。
 - **归档零写入**：全程未修改 `/home/stone/Work/stock/simulate/**` 任何文件；本文整理时重新实测两份 `2026-10-29/holdings.json`（平层 + `215823/`）仍为 `md5 f0770c672577fc0442c2ac0760959061`。
 - **已知既有红测（沿用既有披露，本轮未重跑）**：`web/livetrading/tests` 的 `test_executable_web_config_carries_no_machine_specific_paths` 仍为唯一红，由未跟踪的 `web/livetrading/data/settings.local.json` 固定机器路径引起，与本批无关（同 §25.9.10 / §25.9.11）。本批的 pytest 实跑由独立的验证轮负责；本节只记录**新增用例数**（第 11–17 节共 27 条 + 2 条旧契约改点），不记录未经本环节实测的 passed 计数。
+
+---
+
+## 26. M1.2: 截面动量非对称 Rank-Band 选拔与 ΔScore 显著性门禁 (2026-11-01)
+
+### 26.1 背景与目标
+- **任务目标**：完成 `M1.2` 截面相对动量资产配置的不对称 rank-band 选拔与成对 ΔScore 显著性门禁，抑制动量资产在排名临界值附近因微小得分扰动产生的过度换手与交易摩擦（turnover friction bleed）。
+- **学术与工程原理**：基于 Garleanu & Pedersen (2013) 动态换手惩罚与机构迟滞调仓（hysteresis band）思想，设置买入带（`buy_band_pct=0.10`）与更宽松的卖出带（`sell_band_pct=0.30`）。标的仅在跌破卖出带时才触发调出候选；且新晋标的与调出标的成对替换时必须跨过统计显著性门槛（`delta_score_sigma=0.35 * sigma`），未达显著优势时成对否决（同时阻止调出与买入），使组合保持惯性稳定。
+
+### 26.2 核心改动与模块设计
+1. **独立核心引擎 (`common/selection_band.py`)**：
+   - 新增 `RankBandSelection`（`version = "1.0.0"`）及顶层快捷函数 `apply`。
+   - `_validate_bands`：前置参数防御，验证 `0 < buy_band_pct < sell_band_pct <= 1.0` 且 `delta_score_sigma >= 0.0`，反转区间严格抛出 `ValueError`。
+   - `compute_percentile_ranks`：按得分降序计算 0-based 百分位排名 $r_i = i / n$，对并列得分以标的代码字母序进行确定性破平（tie-break）。
+   - **成对 ΔScore 门禁与状态演进**：
+     - 买入候选：`rank <= buy_band_pct` 且未持有。
+     - 留存标的：`rank <= sell_band_pct` 且已持有。
+     - 调出候选：`rank > sell_band_pct` 且已持有。
+     - 成对置换：新旧标的按得分优势配对，若 $S_{new} - S_{held} \le \text{delta\_score\_sigma} \times \sigma_S$，则该对置换被否决（新标的不买入，旧标的保留在持仓中）；仅显著胜出时才放行置换。
+   - **权重重归一化与稀疏契约**：
+     - 最终持仓标的采用等权重重归一化（$w_i = 1 / n_{held}$）。
+     - 调出标的在调仓日显式写入 `0.0`（严格遵守 NaN vs 0.0 契约，防止回测器全局前向填充保留旧持仓）。
+     - 若调仓日的持仓标的与权重与上一调仓日完全相同，通过 `_sparse_from_daily` 将全行置为 `NaN` 省略，模板内部绝不进行 forward-fill。
+
+2. **Aspect 组装注册 (`common/strategy_aspects.py`)**：
+   - 新增选股算子 `_select_rank_band`，支持 `CompositeAllocationTemplate` 自由拼装。
+   - 在 `SELECTION_ASPECTS` 注册 `"rank_band"`，暴露 `mom_lookback`、`buy_band_pct`、`sell_band_pct`、`delta_score_sigma` 参数网格，因子标签标记为 `["relative_momentum"]`。
+
+3. **静态配置模板集成 (`common/allocation_templates.py`)**：
+   - `CrossSectionalMomentumAllocation` 新增可选参数 `enable_rank_band: bool = False` 及带参数默认值。
+   - 默认保持关闭（`enable_rank_band=False`），确保不破坏原有行为与参数网格；在关闭状态下与原 Top-N 路径保持 100% 字节级一致。
+   - 模板类升级版本号至 `version = "1.1.0"`。
+
+### 26.3 版本轴演进说明
+- **`CrossSectionalMomentumAllocation`**：`version = "1.0.0" -> "1.1.0"`（`AGENTS.md` 规则 7 静态模板类版本升级）。
+- **`RankBandSelection`**：新增独立选股算子类，初始版本 `version = "1.0.0"`。
+- **底座说明**：`common/allocation_templates.py` 严格无全局 `BASE_VERSION`（仅 `BaseBlendAllocationStrategy` 包含 `BASE_VERSION`）。
+- **复合模板说明**：`CompositeAllocationTemplate` 自身架构未变，保持原版本不变；`ATOMIC_TEMPLATE_ASPECTS` 保持映射至 `momentum_topn__equal_weight`，确保原子等价测试不变。
+- **配置 Dump 说明**：9 大静态配置模板非 `StrategyConfig` / blend 结构，无需执行 `--dump-strategies`。
+
+### 26.4 离线测试验证（100% 离线、0 网络依赖）
+- `common/tests/test_selection_band.py`（新增 11 条测试全绿）：
+  1. `test_band_validation`：参数边界与反转异常。
+  2. `test_percentile_ranks_deterministic_tie_break`：分位数与字母序破平。
+  3. `test_initial_allocation_entry_band`：首次建仓门槛。
+  4. `test_retention_in_sell_band`：卖出带内留存。
+  5. `test_exit_when_rank_exceeds_sell_band_nan_vs_zero_contract`：跌出卖出带写 0.0 守卫。
+  6. `test_delta_score_gate_veto`：ΔScore 门禁否决置换。
+  7. `test_delta_score_gate_approval`：ΔScore 门禁放行置换。
+  8. `test_sparse_weights_row_omission`：无变动调仓日全行省略。
+  9. `test_cross_sectional_momentum_flag_off_byte_identity`：默认开关关闭时与原路径字节级一致。**注意**：仅比较同一实例的两次调用（省略 vs. 显式 `False`）不足以证明这一点 —— 若开关被代码完全忽略，两次调用会走**同一分支**而仍然相等（构建期用「强制 `use_rank_band = True`」的变异实测确认了该盲区），故本测试同时钉住 top-N 契约本身：非空调仓行恰好 `top_n` 个正权重、每个为 `1/top_n`、且整行为稠密（落选者为 `0.0`、绝不为 `NaN`）——这正是 rank-band 分支刻意不具备的形状。
+  10. `test_cross_sectional_momentum_flag_on_runs_rank_band`：开关开启时执行非对称带逻辑。钉住非对称带特有行为（调仓行正权重数量不等于 top_n 与迟滞留存），并通过变异测试（强制 `use_rank_band = False` 报 RED，恢复后 GREEN）证明其能有效防御分支删除。
+  11. `test_held_nan_score_retained_and_unheld_nan_ineligible`：停牌导致收益/得分缺失（NaN）时的鲁棒留存与披露收敛（DISCLOSED NARROWING）。已持仓标的得分变为 NaN 时保持留存（不参与置换配对与门禁计算，计入有效持仓并等权分配），新标的得分为 NaN 时不得建仓；避免因 A 股临时停牌引发无谓误清仓。
+- `common/tests/test_strategy_aspects.py`：新增 `test_rank_band_aspect_registration_and_composition`，验证 aspect 注册与复合模板重构一致性。
+- `common/tests/test_strategy_versioning.py`：拆分断言，校验 8 大模板为 `1.0.0`，`CrossSectionalMomentumAllocation` 为 `1.1.0`。
+- 回归测试结果：
+  - `cd pipeline && uv run pytest ../common/tests/test_selection_band.py -q` -> 11 passed
+  - `uv run pytest ../common/tests/test_strategy_aspects.py ../common/tests/test_strategy_versioning.py -q --import-mode=importlib` -> 21 passed
+  - `uv run pytest ../common/tests -q --import-mode=importlib` -> 945 passed, 1 skipped
+  - `uv run pytest ../pipeline/tests -q --import-mode=importlib` -> 536 passed, 1 skipped
+  - `uv run pytest ../pipeline/strategy_generator/tests -q --import-mode=importlib` -> 74 passed
