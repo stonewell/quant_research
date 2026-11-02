@@ -222,6 +222,36 @@ def _select_breadth_gated_topn(universe, params, master_index, rebalance_dates) 
     return SelectionResult(eligible=eligible, invested_fraction=invested_fraction)
 
 
+def _select_rank_band(universe, params, master_index, rebalance_dates) -> SelectionResult:
+    from common.selection_band import RankBandSelection
+
+    symbols = list(universe.keys())
+    if not symbols or len(rebalance_dates) == 0:
+        return SelectionResult(
+            eligible=pd.DataFrame(False, index=rebalance_dates, columns=symbols),
+            invested_fraction=pd.Series(1.0, index=rebalance_dates, dtype=float),
+        )
+    moms = pd.DataFrame(index=master_index, columns=symbols, dtype=float)
+    for sym, df in universe.items():
+        if not df.empty and "Close" in df.columns:
+            moms[sym] = roc(df["Close"], period=params["mom_lookback"]).reindex(master_index)
+    moms_rebal = moms.loc[rebalance_dates]
+
+    buy_band_pct = params.get("buy_band_pct", 0.10)
+    sell_band_pct = params.get("sell_band_pct", 0.30)
+    delta_score_sigma = params.get("delta_score_sigma", 0.35)
+
+    weights = RankBandSelection.apply(
+        moms_rebal,
+        buy_band_pct=buy_band_pct,
+        sell_band_pct=sell_band_pct,
+        delta_score_sigma=delta_score_sigma,
+    )
+    dense_held = weights.ffill().fillna(0.0) > 0.0
+    eligible = dense_held.reindex(index=rebalance_dates, columns=symbols).fillna(False).astype(bool)
+    return SelectionResult(eligible=eligible, invested_fraction=pd.Series(1.0, index=rebalance_dates, dtype=float))
+
+
 SELECTION_ASPECTS: Dict[str, SelectionAspect] = {
     "all_symbols": SelectionAspect(
         key="all_symbols", param_grid={}, factor_tags=[],
@@ -273,6 +303,23 @@ SELECTION_ASPECTS: Dict[str, SelectionAspect] = {
             f"the top {int(params['top_n_fraction'] * 100)}% of the basket by "
             f"{params['mom_lookback']}-day momentum, with total exposure scaled by market breadth "
             f"(protection_factor={params['protection_factor']})"
+        ),
+    ),
+    "rank_band": SelectionAspect(
+        key="rank_band",
+        param_grid={
+            "mom_lookback": [63, 126],
+            "buy_band_pct": [0.10, 0.20],
+            "sell_band_pct": [0.30, 0.40],
+            "delta_score_sigma": [0.35],
+        },
+        factor_tags=["relative_momentum"],
+        select_fn=_select_rank_band,
+        warmup_fn=lambda params: params["mom_lookback"],
+        describe_fn=lambda params: (
+            f"asymmetric rank-band selection (buy top {int(params.get('buy_band_pct', 0.10) * 100)}%, "
+            f"sell below {int(params.get('sell_band_pct', 0.30) * 100)}%, "
+            f"delta_sigma={params.get('delta_score_sigma', 0.35)}) on {params['mom_lookback']}-day momentum"
         ),
     ),
 }

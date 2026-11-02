@@ -184,3 +184,51 @@ def test_build_composite_candidates_needs_at_least_two_decomposable_templates():
         },
     }
     assert build_composite_candidates(fake_best, top_k=4) == []
+
+
+def test_rank_band_aspect_registration_and_composition():
+    from common.strategy_spec import get_template
+
+    assert "rank_band" in SELECTION_ASPECTS
+    aspect = SELECTION_ASPECTS["rank_band"]
+    assert aspect.key == "rank_band"
+    assert aspect.factor_tags == ["relative_momentum"]
+    assert aspect.param_grid == {
+        "mom_lookback": [63, 126],
+        "buy_band_pct": [0.10, 0.20],
+        "sell_band_pct": [0.30, 0.40],
+        "delta_score_sigma": [0.35],
+    }
+    assert aspect.warmup_bars({"mom_lookback": 63}) == 63
+
+    universe = _make_universe(n=5, periods=200, seed=42)
+    composite = CompositeAllocationTemplate(
+        selection=aspect,
+        weighting=WEIGHTING_ASPECTS["equal_weight"],
+    )
+    params = {
+        "mom_lookback": 63,
+        "buy_band_pct": 0.20,
+        "sell_band_pct": 0.40,
+        "delta_score_sigma": 0.35,
+        "rebalance_freq_days": 21,
+    }
+    weights = composite.generate_weights(universe, params)
+    rebal_rows = weights.dropna(how="all")
+    assert not rebal_rows.empty
+
+    reconstructed = get_template(
+        "rank_band__equal_weight",
+        composite_spec={
+            "track": "allocation",
+            "selection_key": "rank_band",
+            "weighting_key": "equal_weight",
+        },
+        params=params,
+    )
+    assert isinstance(reconstructed, CompositeAllocationTemplate)
+    assert reconstructed.selection.key == "rank_band"
+    assert reconstructed.weighting.key == "equal_weight"
+    rec_weights = reconstructed.generate_weights(universe, params)
+    pd.testing.assert_frame_equal(weights, rec_weights)
+

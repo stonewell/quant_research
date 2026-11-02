@@ -642,7 +642,11 @@ class CrossSectionalMomentumAllocation(AllocationTemplate):
         "rebalance_freq_days": [21, 63]  # Monthly, Quarterly
     })
     factor_tags: list = field(default_factory=lambda: ["relative_momentum"])
-    version: str = "1.0.0"
+    enable_rank_band: bool = False
+    buy_band_pct: float = 0.10
+    sell_band_pct: float = 0.30
+    delta_score_sigma: float = 0.35
+    version: str = "1.1.0"
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict) -> pd.DataFrame:
         symbols = list(universe.keys())
@@ -661,6 +665,25 @@ class CrossSectionalMomentumAllocation(AllocationTemplate):
                 moms[sym] = roc(df["Close"], period=params["mom_lookback"]).reindex(master_index)
 
         moms_rebal = moms.loc[rebalance_dates]
+
+        use_rank_band = bool(params.get("enable_rank_band", getattr(self, "enable_rank_band", False)))
+        if use_rank_band:
+            from common.selection_band import RankBandSelection
+
+            buy_band_pct = float(params.get("buy_band_pct", getattr(self, "buy_band_pct", 0.10)))
+            sell_band_pct = float(params.get("sell_band_pct", getattr(self, "sell_band_pct", 0.30)))
+            delta_score_sigma = float(
+                params.get("delta_score_sigma", getattr(self, "delta_score_sigma", 0.35))
+            )
+            weights_rebal = RankBandSelection.apply(
+                moms_rebal,
+                buy_band_pct=buy_band_pct,
+                sell_band_pct=sell_band_pct,
+                delta_score_sigma=delta_score_sigma,
+            )
+            weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
+            weights_df.loc[rebalance_dates] = weights_rebal
+            return weights_df
 
         n_symbols = len(symbols)
         top_n = max(1, int(n_symbols * params["top_n_fraction"]))
@@ -681,6 +704,17 @@ class CrossSectionalMomentumAllocation(AllocationTemplate):
         return weights_df
 
     def explain_weights(self, params: dict) -> str:
+        use_rank_band = bool(params.get("enable_rank_band", getattr(self, "enable_rank_band", False)))
+        if use_rank_band:
+            buy_pct = int(params.get("buy_band_pct", getattr(self, "buy_band_pct", 0.10)) * 100)
+            sell_pct = int(params.get("sell_band_pct", getattr(self, "sell_band_pct", 0.30)) * 100)
+            sigma = params.get("delta_score_sigma", getattr(self, "delta_score_sigma", 0.35))
+            return (
+                f"Cross-Sectional Momentum (Rank-Band): Rebalances every {params['rebalance_freq_days']} trading days. "
+                f"Reasoning: Capital flows to momentum leaders with turnover friction damping. "
+                f"New entries enter within top {buy_pct}%, held names exit only when falling beyond top {sell_pct}%, "
+                f"and replacements require a score gap of at least {sigma:.2f} sigma."
+            )
         frac_pct = int(params['top_n_fraction'] * 100)
         return (
             f"Cross-Sectional Momentum: Rebalances every {params['rebalance_freq_days']} trading days. "

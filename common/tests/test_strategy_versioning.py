@@ -105,11 +105,10 @@ def test_allocation_template_base_versioning():
 
 
 def test_nine_static_templates_versioning():
-    """Verify all 9 static allocation templates define version='1.0.0'."""
-    static_classes = [
+    """Verify static allocation templates versioning (CrossSectionalMomentumAllocation is 1.1.0, others 1.0.0)."""
+    static_classes_v100 = [
         EqualWeightAllocation,
         InverseVolatilityAllocation,
-        CrossSectionalMomentumAllocation,
         HierarchicalRiskParityAllocation,
         DualMomentumAllocation,
         MaxDiversificationAllocation,
@@ -117,12 +116,17 @@ def test_nine_static_templates_versioning():
         MinimumVarianceAllocation,
         BreadthGatedMomentumAllocation,
     ]
-    for cls in static_classes:
+    for cls in static_classes_v100:
         inst = cls()
         assert inst.version == "1.0.0", f"{cls.__name__} version should be '1.0.0'"
         assert inst.version_string == "v1.0.0"
         v_info = inst.get_version_info()
         assert v_info["version"] == "1.0.0"
+
+    cs_mom = CrossSectionalMomentumAllocation()
+    assert cs_mom.version == "1.1.0"
+    assert cs_mom.version_string == "v1.1.0"
+    assert cs_mom.get_version_info()["version"] == "1.1.0"
 
 
 def test_composite_templates_versioning():
