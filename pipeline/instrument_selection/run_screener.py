@@ -47,6 +47,7 @@ from selectorbot import (
     volatility,
 )
 from common.reporting import utc_timestamp, write_json_report
+from common.sector_metadata import load_sector_map
 from common.universe import add_universe_cli_args, resolve_universe_from_args
 from selectorbot.config import SelectionConfig
 from selectorbot.data import fetch_fund_metadata
@@ -89,6 +90,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="skip single-asset empirical backtest simulation fit pass (use factor profile fit only).")
     p.add_argument("--strategy-weight", type=float, default=0.40,
                    help="weight of strategy_fit_score in overall_selection_score when a strategy is specified (default 0.40).")
+    p.add_argument("--sector-map-path", default=d.sector_map_path,
+                   help="path to offline sector map JSON file (Task M2.1)")
+    p.add_argument("--enable-sector-neutral", action="store_true", default=d.enable_sector_neutral,
+                   help="enable cross-sectional sector-neutralized selection scores")
     add_data_provider_cli_args(p, default_provider="synthetic")   # offline-safe bare invocation (AGENTS.md)
     p.add_argument("--no-plots", action="store_true")
     return p
@@ -133,6 +138,7 @@ def main():
         universe=resolved_universe, benchmark=args.benchmark, start=args.start, end=args.end, interval=args.interval,
         min_avg_dollar_volume=args.min_avg_dollar_volume, min_history_years=args.min_history_years,
         max_cluster_correlation=args.max_cluster_correlation, fetch_fund_metadata=args.fetch_fund_metadata,
+        sector_map_path=args.sector_map_path, enable_sector_neutral=args.enable_sector_neutral,
     )
     universe = list(dict.fromkeys(config.universe + [config.benchmark]))  # ensure benchmark is included, no dupes
 
@@ -232,10 +238,13 @@ def main():
         metrics["expense_ratio"] = pd.to_numeric(meta_df["expense_ratio"], errors="coerce")
         metrics["total_assets"] = pd.to_numeric(meta_df["total_assets"], errors="coerce")
 
+    sector_map = load_sector_map(config.sector_map_path)
     scored = scoring.score_universe(
         metrics,
         min_history_years_for_full_credit=config.min_history_years_for_full_credit,
         strategy_weight=args.strategy_weight if target_strategy is not None else None,
+        sector_map=sector_map,
+        enable_sector_neutral=config.enable_sector_neutral,
     )
 
     pd.set_option("display.width", 160)

@@ -2,7 +2,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from selectorbot.scoring import score_universe
+from selectorbot.config import SelectionConfig
+from selectorbot.scoring import SECTOR_NEUTRAL_MIN_GROUP_SIZE, score_universe
+from common.sector_metadata import sector_neutral_demean
 
 
 def make_metrics(**overrides):
@@ -128,3 +130,386 @@ def test_overall_score_weighted_average_matches_manual_calculation_when_all_pres
     row = scored.loc["TRENDY"]
     expected = sum(row[col] * w for col, w in weights.items()) / sum(weights.values())
     assert row["overall_selection_score"] == pytest.approx(expected)
+
+
+def test_sector_neutral_flag_off_bit_identity():
+    # Test 1: Flag-off bit-identity via independently pinned expectation (~1e-12 tol).
+    # Verifies both default and explicit enable_sector_neutral=False match the exact
+    # unneutralized weighted average calculation across all symbols.
+    # Real weights verified from DEFAULT_WEIGHTS: candlestick_score=0.03, momentum_score=0.10.
+    # Fixture provides non-NaN candlestick/momentum edges for >= 1 row so they are not renormalized out.
+    metrics = make_metrics(
+        expense_ratio=[0.001, 0.02, 0.005],
+        total_assets=[1e11, 1e8, 5e9],
+        candlestick_edge=[0.05, 0.02, np.nan],
+        candlestick_significant=[True, False, False],
+        momentum_edge=[0.10, -0.05, np.nan],
+        momentum_significant=[True, True, False],
+    )
+    scored_default = score_universe(metrics)
+    scored_explicit_off = score_universe(metrics, enable_sector_neutral=False)
+
+    weights = {
+        "liquidity_score": 0.30,
+        "vol_adequacy_score": 0.20,
+        "predictability_score": 0.07,
+        "momentum_score": 0.10,
+        "candlestick_score": 0.03,
+        "diversification_score": 0.15,
+        "history_adequacy_score": 0.10,
+        "etf_expense_score": 0.025,
+        "etf_aum_score": 0.025,
+    }
+    for sym in metrics.index:
+        row = scored_default.loc[sym]
+        present_w = {k: weights[k] for k in weights if pd.notna(row.get(k, np.nan))}
+        expected_score = sum(row[k] * w for k, w in present_w.items()) / sum(present_w.values())
+
+        # Bit-identity check with tol 1e-12:
+        np.testing.assert_allclose(row["overall_selection_score"], expected_score, atol=1e-12, rtol=1e-12)
+        np.testing.assert_allclose(
+            scored_explicit_off.loc[sym, "overall_selection_score"],
+            expected_score,
+            atol=1e-12,
+            rtol=1e-12,
+        )
+
+
+def test_sector_neutral_flag_on_equalizes_sector_means_to_global_mean():
+    # Test 2: Flag-on demeaning with known sector bias.
+    # S1, S2, S3 in 'technology' have high metric values,
+    # S4, S5, S6 in 'utilities' have lower metric values.
+    # Raw fixture is genuinely biased (sector means differ by > 30).
+    #
+    # HONEST INVARIANT PLACEMENT: "each qualifying sector's mean equals the global
+    # mean" is a property of the DEMEAN (`sector_neutral_demean`), so it is asserted
+    # below on the PRE-clip demeaned values. The downstream `np.clip(..., 0, 100)` in
+    # `score_universe` is a boundary policy that CAN perturb this invariant at the
+    # extremes (see test_sector_neutral_clip_perturbs_but_does_not_defeat_demean).
+    # Asserting the invariant on the returned (already clipped) column would pass only
+    # by accident of this fixture never clipping -- and would silently hide clip bias.
+    df = pd.DataFrame({
+        "avg_dollar_volume": [1e9, 8e8, 9e8, 1e6, 2e6, 1.5e6],
+        "median_spread_pct": [0.01, 0.02, 0.015, 0.5, 0.4, 0.45],
+        "realized_vol_annualized_pct": [20.0, 22.0, 21.0, 20.0, 22.0, 21.0],
+        "pct_days_trending_adx": [60.0, 65.0, 62.0, 20.0, 25.0, 22.0],
+        "hurst": [0.75, 0.70, 0.72, 0.50, 0.52, 0.51],
+        "hurst_significant": [True, True, True, False, False, False],
+        "hurst_p_value": [0.01, 0.01, 0.01, 0.8, 0.9, 0.85],
+        "avg_correlation_to_universe": [0.3, 0.4, 0.35, 0.7, 0.75, 0.72],
+        "history_years": [10.0, 8.0, 9.0, 3.0, 2.0, 2.5],
+        "sector": ["technology", "technology", "technology", "utilities", "utilities", "utilities"],
+    }, index=["S1", "S2", "S3", "S4", "S5", "S6"])
+
+    # Unneutralized scores have strong sector bias:
+    raw_scored = score_universe(df.copy(), enable_sector_neutral=False)
+    raw_tech_mean = raw_scored.loc[["S1", "S2", "S3"], "overall_selection_score"].mean()
+    raw_util_mean = raw_scored.loc[["S4", "S5", "S6"], "overall_selection_score"].mean()
+    assert abs(raw_tech_mean - raw_util_mean) > 30.0
+    assert abs(raw_tech_mean) > 10.0
+    assert abs(raw_util_mean) > 10.0
+
+    # Pre-clip demean, computed explicitly so the invariant is testable on its own terms:
+    raw_scores = raw_scored["overall_selection_score"]
+    pre_clip = sector_neutral_demean(
+        raw_scores,
+        sector=df["sector"],
+        fallback="auto",
+        min_group_size=SECTOR_NEUTRAL_MIN_GROUP_SIZE,
+    )
+    pre_clip_global_mean = pre_clip.mean()
+    assert abs(pre_clip.loc[["S1", "S2", "S3"]].mean() - pre_clip_global_mean) < 1e-9
+    assert abs(pre_clip.loc[["S4", "S5", "S6"]].mean() - pre_clip_global_mean) < 1e-9
+
+    # This fixture stays inside [0, 100], so the clip is a pure no-op here and the
+    # returned column must equal clip(pre_clip) exactly, elementwise:
+    assert (pre_clip >= 0.0).all() and (pre_clip <= 100.0).all()
+    neut_scored = score_universe(df.copy(), enable_sector_neutral=True)
+    np.testing.assert_allclose(
+        neut_scored["overall_selection_score"],
+        np.clip(pre_clip, 0.0, 100.0),
+        atol=1e-12,
+    )
+
+
+def test_sector_neutral_clip_perturbs_but_does_not_defeat_demean():
+    # Known, ACCEPTED limitation, documented instead of hidden: the sector-mean
+    # invariant belongs to the demean; `np.clip(..., 0, 100)` is a downstream
+    # boundary policy that CAN perturb it at the extremes.
+    # This fixture is deliberately built so the clip actually bites: T3 is worst on
+    # nearly every metric (score ~3) inside an otherwise strong 'tech' sector, so the
+    # demeaned value lands at ~ -4 and is clipped to 0.
+    df = pd.DataFrame({
+        "avg_dollar_volume": [1e9, 8e8, 1e5, 5e7, 4e7, 2e7, 1e7],
+        "median_spread_pct": [0.01, 0.02, 0.9, 0.1, 0.12, 0.2, 0.3],
+        "realized_vol_annualized_pct": [25.0, 22.0, 70.0, 20.0, 30.0, 40.0, 15.0],
+        "pct_days_trending_adx": [60.0, 55.0, 20.0, 50.0, 45.0, 40.0, 35.0],
+        "hurst": [0.90, 0.80, 0.50, 0.70, 0.65, 0.60, 0.55],
+        "hurst_significant": [True, True, False, True, True, True, False],
+        "hurst_p_value": [0.01, 0.01, 0.9, 0.02, 0.03, 0.04, 0.5],
+        "avg_correlation_to_universe": [0.1, 0.2, 0.95, 0.4, 0.5, 0.6, 0.7],
+        "history_years": [10.0, 9.0, 0.0, 5.0, 4.0, 3.0, 2.0],
+        "sector": ["tech", "tech", "tech", "util", "util", "energy", "energy"],
+    }, index=["T1", "T2", "T3", "U1", "U2", "E1", "E2"])
+
+    raw_scored = score_universe(df.copy(), enable_sector_neutral=False)
+    raw_scores = raw_scored["overall_selection_score"]
+    pre_clip = sector_neutral_demean(
+        raw_scores,
+        sector=df["sector"],
+        fallback="auto",
+        min_group_size=SECTOR_NEUTRAL_MIN_GROUP_SIZE,
+    )
+
+    # 1. The clip genuinely bites in this fixture (this is the branch that would
+    #    silently disappear if clipping were disabled or the fixture were weakened):
+    assert (pre_clip < 0.0).any() or (pre_clip > 100.0).any()
+    assert float(pre_clip.min()) < 0.0
+
+    # 2. Despite the clip, the pre-clip values still satisfy the sector-mean
+    #    invariant exactly -- neutralization is NOT defeated, the boundary merely
+    #    truncates the extreme:
+    pre_clip_global_mean = pre_clip.mean()
+    assert abs(pre_clip.loc[["T1", "T2", "T3"]].mean() - pre_clip_global_mean) < 1e-9
+    assert abs(pre_clip.loc[["U1", "U2"]].mean() - pre_clip_global_mean) < 1e-9
+    assert abs(pre_clip.loc[["E1", "E2"]].mean() - pre_clip_global_mean) < 1e-9
+
+    # 3. Production output is exactly the clipped pre-clip demean, i.e. the only
+    #    difference from the invariant-holding series is the [0, 100] boundary:
+    neut_scored = score_universe(df.copy(), enable_sector_neutral=True)
+    returned = neut_scored["overall_selection_score"]
+    np.testing.assert_allclose(returned, np.clip(pre_clip, 0.0, 100.0), atol=1e-12)
+    assert (returned >= 0.0).all() and (returned <= 100.0).all()
+
+    # 4. ...and the documented consequence: AFTER clipping, the sector mean no longer
+    #    matches the global mean (the perturbation the invariant assertion above must
+    #    not be pointed at):
+    post_tech_mean = returned.loc[["T1", "T2", "T3"]].mean()
+    post_global_mean = returned.mean()
+    assert post_tech_mean > post_global_mean
+    assert abs(post_tech_mean - post_global_mean) > 1e-6
+
+
+def test_sector_neutral_single_group_identity():
+    # 5b: Single-group identity -- universe where every symbol resolves to same sector
+    # must come out essentially unchanged from raw score (group_mean == global_mean),
+    # and emits single-group UserWarning.
+    df = pd.DataFrame({
+        "avg_dollar_volume": [1e9, 5e8, 1e7],
+        "median_spread_pct": [0.01, 0.03, 0.1],
+        "realized_vol_annualized_pct": [20.0, 25.0, 30.0],
+        "pct_days_trending_adx": [60.0, 40.0, 20.0],
+        "hurst": [0.7, 0.6, 0.5],
+        "hurst_significant": [True, True, False],
+        "hurst_p_value": [0.01, 0.02, 0.5],
+        "avg_correlation_to_universe": [0.3, 0.5, 0.7],
+        "history_years": [10.0, 5.0, 2.0],
+        "sector": ["technology", "technology", "technology"],
+    }, index=["A", "B", "C"])
+
+    raw_scored = score_universe(df.copy(), enable_sector_neutral=False)
+    with pytest.warns(UserWarning, match=r"all 3 symbols resolved to the single sector group 'technology'") as warn_records:
+        neut_scored = score_universe(df.copy(), enable_sector_neutral=True)
+    assert len(warn_records) == 1
+    np.testing.assert_allclose(
+        neut_scored["overall_selection_score"],
+        raw_scored["overall_selection_score"],
+        atol=1e-12,
+    )
+
+
+def test_sector_neutral_scale_preservation():
+    # 5c: Scale preservation -- after neutralization on biased multi-sector fixture:
+    # 1. max - min > 20
+    # 2. all values within [0, 100]
+    # 3. column preserves raw score ordering within each sector
+    df = pd.DataFrame({
+        "avg_dollar_volume": [1e9, 8e8, 9e8, 1e6, 2e6, 1.5e6],
+        "median_spread_pct": [0.01, 0.02, 0.015, 0.5, 0.4, 0.45],
+        "realized_vol_annualized_pct": [20.0, 22.0, 21.0, 20.0, 22.0, 21.0],
+        "pct_days_trending_adx": [60.0, 65.0, 62.0, 20.0, 25.0, 22.0],
+        "hurst": [0.75, 0.70, 0.72, 0.50, 0.52, 0.51],
+        "hurst_significant": [True, True, True, False, False, False],
+        "hurst_p_value": [0.01, 0.01, 0.01, 0.8, 0.9, 0.85],
+        "avg_correlation_to_universe": [0.3, 0.4, 0.35, 0.7, 0.75, 0.72],
+        "history_years": [10.0, 8.0, 9.0, 3.0, 2.0, 2.5],
+        "sector": ["technology", "technology", "technology", "utilities", "utilities", "utilities"],
+    }, index=["S1", "S2", "S3", "S4", "S5", "S6"])
+
+    raw_scored = score_universe(df.copy(), enable_sector_neutral=False)
+    neut_scored = score_universe(df.copy(), enable_sector_neutral=True)
+    scores = neut_scored["overall_selection_score"]
+
+    assert scores.max() - scores.min() > 20.0
+    assert (scores >= 0.0).all() and (scores <= 100.0).all()
+
+    # Preserves ranking within each sector
+    tech_syms = ["S1", "S2", "S3"]
+    util_syms = ["S4", "S5", "S6"]
+    assert (
+        np.sign(np.diff(scores.loc[tech_syms]))
+        == np.sign(np.diff(raw_scored.loc[tech_syms, "overall_selection_score"]))
+    ).all()
+    assert (
+        np.sign(np.diff(scores.loc[util_syms]))
+        == np.sign(np.diff(raw_scored.loc[util_syms, "overall_selection_score"]))
+    ).all()
+
+
+def test_sector_neutral_noop_warning_on_all_singletons():
+    # 5d: No-op warning -- fixture where no group qualifies (all singleton sectors)
+    # warns UserWarning and scores equal raw scores exactly.
+    df = pd.DataFrame({
+        "avg_dollar_volume": [1e9, 1e7, 5e7],
+        "median_spread_pct": [0.01, 0.1, 0.05],
+        "realized_vol_annualized_pct": [15.0, 35.0, 25.0],
+        "pct_days_trending_adx": [70.0, 20.0, 45.0],
+        "hurst": [0.75, 0.30, 0.55],
+        "hurst_significant": [True, True, False],
+        "hurst_p_value": [0.01, 0.01, 0.5],
+        "avg_correlation_to_universe": [0.8, 0.2, 0.5],
+        "history_years": [10.0, 2.0, 5.0],
+        "sector": ["sec_a", "sec_b", "sec_c"],
+    }, index=["T1", "T2", "T3"])
+
+    raw_scored = score_universe(df.copy(), enable_sector_neutral=False)
+    with pytest.warns(UserWarning, match="no sector group had enough members") as warn_records:
+        neut_scored = score_universe(df.copy(), enable_sector_neutral=True)
+
+    assert len(warn_records) == 1
+    np.testing.assert_allclose(
+        neut_scored["overall_selection_score"],
+        raw_scored["overall_selection_score"],
+        atol=1e-12,
+    )
+
+
+def test_sector_neutral_preserves_row_count_and_index_order_when_absent_from_map():
+    # Test 3: No symbol dropped; row count, index order and index name identical
+    # even when symbols are absent from map or integer-indexed.
+    metrics = make_metrics()
+    metrics.index.name = "ticker_id"
+    partial_map = {"UNKNOWN_SYM": "energy"}
+
+    with pytest.warns(UserWarning, match=r"all 3 symbols resolved to the single sector group 'other'"):
+        scored = score_universe(metrics, sector_map=partial_map, enable_sector_neutral=True)
+
+    assert len(scored) == len(metrics)
+    assert list(scored.index) == list(metrics.index)
+    assert scored.index.name == metrics.index.name
+
+    # Also verify with integer index
+    metrics_int = make_metrics().reset_index(drop=True)
+    metrics_int.index.name = "row_num"
+    with pytest.warns(UserWarning, match=r"all 3 symbols resolved to the single sector group 'other'"):
+        scored_int = score_universe(metrics_int, sector_map=partial_map, enable_sector_neutral=True)
+    assert len(scored_int) == len(metrics_int)
+    assert list(scored_int.index) == list(metrics_int.index)
+    assert scored_int.index.name == metrics_int.index.name
+
+
+def test_sector_neutral_degenerate_sectors_leave_raw_untouched_without_nan_or_exception():
+    # Degenerate sector contract for demeaning:
+    # Groups with < min_group_size (SOLO) or zero spread (EQ1, EQ2) leave raw scores untouched.
+    # Qualifying multi-group members are demeaned so multi_mean == raw_global_mean.
+    # No NaN anywhere, no exception.
+    df = pd.DataFrame({
+        "avg_dollar_volume": [1e8, 2e8, 3e8, 5e7, 1e7, 1e7],
+        "median_spread_pct": [0.05, 0.04, 0.03, 0.10, 0.20, 0.20],
+        "realized_vol_annualized_pct": [20.0, 22.0, 24.0, 25.0, 30.0, 30.0],
+        "pct_days_trending_adx": [50.0, 55.0, 60.0, 40.0, 30.0, 30.0],
+        "hurst": [0.6, 0.65, 0.7, 0.5, 0.5, 0.5],
+        "hurst_significant": [True, True, True, False, False, False],
+        "hurst_p_value": [0.01, 0.01, 0.01, 0.5, 0.5, 0.5],
+        "avg_correlation_to_universe": [0.4, 0.5, 0.6, 0.3, 0.5, 0.5],
+        "history_years": [5.0, 6.0, 7.0, 4.0, 2.0, 2.0],
+        "sector": ["multi", "multi", "multi", "solo", "allequal", "allequal"],
+    }, index=["M1", "M2", "M3", "SOLO", "EQ1", "EQ2"])
+
+    raw_scored = score_universe(df.copy(), enable_sector_neutral=False)
+    scored = score_universe(df.copy(), enable_sector_neutral=True)
+
+    # Degenerate sectors (single member or zero variance) leave raw values untouched:
+    np.testing.assert_allclose(
+        scored.loc["SOLO", "overall_selection_score"],
+        raw_scored.loc["SOLO", "overall_selection_score"],
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        scored.loc[["EQ1", "EQ2"], "overall_selection_score"],
+        raw_scored.loc[["EQ1", "EQ2"], "overall_selection_score"],
+        atol=1e-12,
+    )
+
+    # No NaN anywhere in the neutralized score column
+    assert not scored["overall_selection_score"].isna().any()
+
+    # Non-degenerate sector normalizes: its group mean matches raw global mean (atol 1e-9)
+    raw_global_mean = raw_scored["overall_selection_score"].mean()
+    multi_mean = scored.loc[["M1", "M2", "M3"], "overall_selection_score"].mean()
+    assert abs(multi_mean - raw_global_mean) < 1e-9
+
+
+def test_sector_neutral_config_defaults_and_offline():
+    # Test 5: Confirm config defaults keep old behaviour (flag OFF, path None),
+    # and no network/data providers are touched.
+    cfg = SelectionConfig()
+    assert cfg.enable_sector_neutral is False
+    assert cfg.sector_map_path is None
+
+
+def test_sector_neutral_noop_warning_on_single_group():
+    # 5e: Single-group no-op warning -- universe whose symbols all resolve to one group
+    # emits distinct single-group warning containing group name and symbol count,
+    # and scores equal raw scores exactly.
+    df = pd.DataFrame({
+        "avg_dollar_volume": [1e9, 5e8, 1e7, 2e7],
+        "median_spread_pct": [0.01, 0.03, 0.05, 0.08],
+        "realized_vol_annualized_pct": [20.0, 25.0, 22.0, 30.0],
+        "pct_days_trending_adx": [60.0, 40.0, 50.0, 20.0],
+        "hurst": [0.7, 0.6, 0.65, 0.5],
+        "hurst_significant": [True, True, True, False],
+        "hurst_p_value": [0.01, 0.02, 0.01, 0.5],
+        "avg_correlation_to_universe": [0.3, 0.5, 0.4, 0.7],
+        "history_years": [10.0, 5.0, 6.0, 2.0],
+    }, index=["SPY", "QQQ", "GLD", "IWM"])
+
+    raw_scored = score_universe(df.copy(), enable_sector_neutral=False)
+    with pytest.warns(UserWarning, match=r"all 4 symbols resolved to the single sector group 'other'") as warn_records:
+        neut_scored = score_universe(df.copy(), enable_sector_neutral=True)
+
+    assert len(warn_records) == 1
+    msg = str(warn_records[0].message)
+    assert "'other'" in msg
+    assert "all 4 symbols" in msg
+    assert "there is no between-sector structure to remove" in msg
+
+    np.testing.assert_allclose(
+        neut_scored["overall_selection_score"],
+        raw_scored["overall_selection_score"],
+        atol=1e-12,
+    )
+
+
+def test_sector_neutral_normal_multisector_emits_no_warning():
+    # 5f: Normal multi-sector fixture with multiple qualifying groups emits NO warning.
+    import warnings
+
+    df = pd.DataFrame({
+        "avg_dollar_volume": [1e9, 8e8, 9e8, 1e6, 2e6, 1.5e6],
+        "median_spread_pct": [0.01, 0.02, 0.015, 0.5, 0.4, 0.45],
+        "realized_vol_annualized_pct": [20.0, 22.0, 21.0, 20.0, 22.0, 21.0],
+        "pct_days_trending_adx": [60.0, 65.0, 62.0, 20.0, 25.0, 22.0],
+        "hurst": [0.75, 0.70, 0.72, 0.50, 0.52, 0.51],
+        "hurst_significant": [True, True, True, False, False, False],
+        "hurst_p_value": [0.01, 0.01, 0.01, 0.8, 0.9, 0.85],
+        "avg_correlation_to_universe": [0.3, 0.4, 0.35, 0.7, 0.75, 0.72],
+        "history_years": [10.0, 8.0, 9.0, 3.0, 2.0, 2.5],
+        "sector": ["technology", "technology", "technology", "utilities", "utilities", "utilities"],
+    }, index=["S1", "S2", "S3", "S4", "S5", "S6"])
+
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        scored = score_universe(df.copy(), enable_sector_neutral=True)
+
+    assert len(recorded) == 0, f"Expected no warnings, but caught: {[str(w.message) for w in recorded]}"

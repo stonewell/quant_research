@@ -22,8 +22,13 @@ this produces as a documented, transparent starting shortlist -- not a
 validated predictive model.
 """
 
+from typing import Optional
+import warnings
+
 import numpy as np
 import pandas as pd
+
+from common.sector_metadata import resolve_sector, sector_neutral_demean
 
 # Three components now answer the SAME strategy-agnostic question -- "does this
 # series show genuine, statistically significant exploitable structure at
@@ -65,6 +70,16 @@ STRATEGY_FIT_DEFAULT_WEIGHTS = {
 }
 
 
+# Minimum number of valid members a sector group needs before cross-sectional
+# demeaning is applied to it. Single source of truth: this value is used BOTH by
+# the `sector_neutral_demean` call AND by the no-op warning block that recomputes
+# how many groups qualified. Keeping it in one place stops the two from silently
+# desynchronizing (e.g. the warning claiming "no group qualified" while the demean
+# actually neutralized). Deliberately a module constant -- NOT a config field and
+# NOT a CLI flag: M2.1 adds no new tunables.
+SECTOR_NEUTRAL_MIN_GROUP_SIZE = 2
+
+
 def _pct_rank(series: pd.Series) -> pd.Series:
     # na_option="keep" (pandas' default) excludes NaN entries from both the
     # ranking AND the denominator -- a NaN row gets a NaN rank, and every
@@ -100,7 +115,9 @@ def _weighted_average(df: pd.DataFrame, weights: dict) -> pd.Series:
 
 def score_universe(metrics: pd.DataFrame, weights: dict = None,
                    min_history_years_for_full_credit: float = 4.0,
-                   strategy_weight: float = None) -> pd.DataFrame:
+                   strategy_weight: float = None,
+                   sector_map: Optional[dict] = None,
+                   enable_sector_neutral: bool = False) -> pd.DataFrame:
     df = metrics.copy()
     if weights is None:
         if "strategy_fit_score" in df.columns:
@@ -204,4 +221,86 @@ def score_universe(metrics: pd.DataFrame, weights: dict = None,
         df.loc[df["total_assets"].isna(), "etf_aum_score"] = np.nan
 
     df["overall_selection_score"] = _weighted_average(df, weights)
+
+    if enable_sector_neutral:
+        # Sector resolution priority:
+        # 1. Existing 'sector' column on df if present
+        # 2. sector_map passed as dict, mapped over df's symbols/index
+        # 3. Pure fallback resolution via resolve_sector
+        sym_list = df["symbol"].astype(str).tolist() if "symbol" in df.columns else [str(x) for x in df.index]
+        if "sector" in df.columns:
+            sec_col = df["sector"]
+            sec_list = [
+                str(sec_col.iloc[i]) if pd.notna(sec_col.iloc[i]) and str(sec_col.iloc[i]).strip() != ""
+                else resolve_sector(sym_list[i], sector_map, fallback="auto")
+                for i in range(len(df))
+            ]
+        elif sector_map is not None:
+            sec_list = [resolve_sector(s, sector_map, fallback="auto") for s in sym_list]
+        else:
+            sec_list = [resolve_sector(s, None, fallback="auto") for s in sym_list]
+
+        sec_series = pd.Series(sec_list, index=df.index)
+
+        # Cross-sectional sector demeaning (Task M2.1 integration layer rework):
+        # Replaces sector_neutral_zscore to preserve 0-100 score magnitude.
+        # Verified defects of z-score:
+        # 1. overall_selection_score is a 0-100 score (weighted average of pct_rank * 100 components).
+        #    Overwriting with z-score silently changes scale.
+        # 2. selectorbot/selection.py:210: norm_score divides by 100 if 100.0 in scores or max > 1,
+        #    causing negative z-scores to corrupt DR + score_weight * norm_score in select_max_diversification_ratio.
+        # 3. selectorbot/selection.py:121-141: select_diversified_greedy combines score + diversity_weight * distance
+        #    (distance is 0-2 scale); a 0-100 score dominates distance, but a z-score does not, altering basket selection.
+        raw_scores = df["overall_selection_score"].copy()
+        df["overall_selection_score"] = sector_neutral_demean(
+            raw_scores,
+            sector=sec_series,
+            fallback="auto",
+            min_group_size=SECTOR_NEUTRAL_MIN_GROUP_SIZE,
+        )
+
+        # np.clip to [0, 100]:
+        # sector_neutral_demean deliberately avoids clipping in the core module.
+        # While demeaning preserves native scale, group shifts (raw - group_mean + global_mean)
+        # can push extreme assets slightly outside the documented 0-100 range.
+        # All downstream selection algorithms assume [0, 100]. Clipping only bites the few
+        # extreme boundaries and strictly preserves native magnitude and ranking without re-standardizing.
+        df["overall_selection_score"] = np.clip(df["overall_selection_score"], 0.0, 100.0)
+
+        # Emit warning if neutralization was a degenerate NO-OP:
+        # 1. sec_series.nunique() == 1: all symbols resolved to a single sector group.
+        #    Cross-sectional demeaning has no between-sector structure to remove.
+        # 2. qualifying_groups == 0: multiple sector groups exist, but none has >=
+        #    SECTOR_NEUTRAL_MIN_GROUP_SIZE members and non-zero spread (e.g. all singletons or zero variance).
+        # In both degenerate cases, scores remain unchanged and sector exposure was NOT removed.
+        # Deterministic order: single-group first, then qualifying_groups == 0, emitting exactly one warning.
+        qualifying_groups = 0
+        for _, group_syms in sec_series.groupby(sec_series).groups.items():
+            sub_vals = raw_scores.loc[group_syms].dropna()
+            if len(sub_vals) >= SECTOR_NEUTRAL_MIN_GROUP_SIZE:
+                spread = float(sub_vals.max()) - float(sub_vals.min())
+                if not np.isclose(spread, 0.0):
+                    qualifying_groups += 1
+
+        if sec_series.nunique() == 1:
+            single_group = str(sec_series.iloc[0])
+            n_symbols = len(sec_series)
+            warnings.warn(
+                f"Sector neutralization was requested, but all {n_symbols} symbols resolved to the "
+                f"single sector group '{single_group}', so there is no between-sector structure to remove. "
+                "Scores are unchanged and sector exposure was NOT adjusted. This usually means the sector "
+                "map does not cover this universe (pass --sector-map-path, or note that symbols outside "
+                "the map fall back to 'other').",
+                UserWarning,
+                stacklevel=2,
+            )
+        elif qualifying_groups == 0:
+            warnings.warn(
+                "Sector neutralization was requested, but no sector group had enough members "
+                f"(>= {SECTOR_NEUTRAL_MIN_GROUP_SIZE}) or variance to neutralize. Scores are unchanged and sector "
+                "exposure was NOT removed.",
+                UserWarning,
+                stacklevel=2,
+            )
+
     return df

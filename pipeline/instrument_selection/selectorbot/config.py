@@ -9,7 +9,7 @@ defaults you should tune.
 """
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 
 DEFAULT_UNIVERSE = [
@@ -28,6 +28,12 @@ class SelectionConfig:
     start: str = "2015-01-01"
     end: str = "2024-12-31"
     interval: str = "1d"
+
+    # --- sector neutrality / cross-sectional neutralization (Task M2.1) ---
+    # sector_dev_budget is deliberately omitted here: that is a portfolio-weighting/QP
+    # concept owned exclusively by Task M1.3 and has no consumer at the screening layer.
+    sector_map_path: Optional[str] = None
+    enable_sector_neutral: bool = False
 
     # --- liquidity ---
     # No single verified numeric $-volume cutoff survived research (liquidity

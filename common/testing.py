@@ -105,3 +105,28 @@ def make_ar1_ohlcv(phi: float, n: int, seed: int, scale: float = 0.01, start: st
     low = close * (1 - np.abs(rng.normal(0.003, 0.001, n)))
     open_ = close * (1 + rng.normal(0, 0.001, n))
     return pd.DataFrame({"Open": open_, "High": high, "Low": low, "Close": close}, index=idx)
+
+
+def assign_synthetic_sectors(
+    symbols,
+    *,
+    n_sectors: int = 4,
+    seed: int = 0,
+) -> dict[str, str]:
+    """Deterministically assigns synthetic sector labels to every input symbol.
+
+    Guarantees:
+    - Every symbol in `symbols` is assigned a sector (no filtering or dropping,
+      including inactive or delisted tickers). Note: duplicate symbols in `symbols`
+      are naturally deduplicated by the returned dictionary mapping.
+    - Fully deterministic assignment across runs with the same `seed`.
+    - Distributes symbols across up to `n_sectors` buckets (sec_0, sec_1, ...,
+      sec_{n_sectors-1}); random sampling does not guarantee every bucket is non-empty.
+    """
+    sym_list = list(symbols)
+    if not sym_list:
+        return {}
+    n_sectors = max(1, int(n_sectors))
+    rng = np.random.default_rng(seed)
+    sector_indices = rng.integers(0, n_sectors, size=len(sym_list))
+    return {sym: f"sec_{idx}" for sym, idx in zip(sym_list, sector_indices)}
