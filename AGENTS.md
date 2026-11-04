@@ -178,11 +178,6 @@ available in the current shell.
    - Run ERS validation (`common/allocation_search.py`) exactly **once per search**, exclusively on the already-chosen winning strategy. Never run ERS once per candidate template.
 5. **Universe Asset Removal & Blacklist Documentation (SSOT in `docs/black_list.md`)**:
    - Anytime an agent suggests or executes removing a stock, ETF, or asset from any universe/portfolio (whether due to high unit price, structural loss, negative Alpha, fraud/ST risk, cyclical price wars, or friction bleed), the agent must record the asset symbol, name, removal date, removal trigger/category, and detailed quantitative/fundamental rationale in `docs/black_list.md` (in Chinese) for future reference and persistent memory.
-6. **Model Selection & Reasoning Tier Priority**:
-   - When choosing heavy reasoning / Pro models for architecture, research, deep audits, or derivations:
-     - **Priority 1: Claude** (Claude 3.7 Sonnet / Claude 3.5 Sonnet) first whenever credit/quota is available.
-     - **Priority 2: Gemini Pro** (Gemini 2.5 Pro / Gemini 1.5 Pro) if Claude credit is exhausted or unavailable.
-     - **Priority 3: Fall back to Flash** (Gemini Flash / Flash-Medium) only if Pro quota/budget is strictly exhausted.
 7. **Strategy Modification & Semantic Version Upgrade (Dual-Axis Decoupling)**:
    - Every quantitative strategy and allocation template must strictly track its semantic version. Note the **exact** attribute layout -- do not "normalize" it:
      - `BASE_VERSION` exists on **exactly one class**: `BaseBlendAllocationStrategy` (`pipeline/research/blend/blend_base.py`).
