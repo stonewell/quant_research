@@ -1,0 +1,385 @@
+"""Offline regression suite for the LV1 Stage-1 gate-NAV source
+(`scripts/check_live_portfolio_health.py`).
+
+FROZEN CONTRACT UNDER TEST (mirrored verbatim from the module-level block that sits
+above `NAV_BREAKDOWN_FILENAME` in the script -- read that block, not this docstring,
+as the owner):
+
+(a) SOURCE OF TRUTH. The drawdown / circuit-breaker / tier math in
+    `inspect_portfolio_drawdown` is fed the MARKED-TO-MARKET (MTM) NAV read from
+    `nav_breakdown.json::nav_effective`. The operator form value
+    (`--portfolio-value`) is NOT the gate NAV.
+(b) DISAGREEMENT. When MTM and the form value differ, `tier`, `drawdown_pct` and
+    `tier1_consecutive_bars` are recomputed FROM MTM; the form value survives only as
+    an input-sanity cross-check that is persisted and rendered.
+(c) MISSING MTM. An absent/unreadable/non-positive `nav_effective` is an EXPLICIT
+    degradation (`nav_source = "form_fallback_refused"`,
+    `nav_gate_status = "DEGRADED_NAV_UNAVAILABLE"`, `tier_status = "UNKNOWN"`,
+    `nav_deviation_pct`/`nav_deviation_exceeded` left `None`), loudly warned and
+    rendered as UNKNOWN. Missing != inside-threshold, and missing is never reported as
+    "breaker not triggered".
+INVALIDATION CONDITION: void if the valuation layer stops writing `nav_effective`
+    beside `account_state.json`, or if the form value re-enters the gate arithmetic.
+
+100% OFFLINE: every fixture below is a hand-written `nav_breakdown.json` /
+synthetic state dict under `tmp_path`. No network, no market data, and **no** read of
+any archived `account_state.json` / production `nav_breakdown.json` under `data/runs/`.
+
+Reverse-mutation notice: each test below was verified to go RED when its criterion is
+deleted (details recorded in the LV1 execution record): flipping the gate back to
+`current_nav=args.portfolio_value`, coercing a `None` deviation to `0.0`/`False`, and
+dropping the UNKNOWN relabel each fail a specific assertion here.
+"""
+
+import importlib.util
+import json
+import os
+import sys
+import types
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+import pytest
+
+
+def _load_script(module_name, relative_path):
+    """Loads a standalone script (not an importable package module) via importlib."""
+    path = os.path.join(_REPO_ROOT, relative_path)
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_mod = _load_script("check_live_portfolio_health", os.path.join("scripts", "check_live_portfolio_health.py"))
+
+# The archived two-day facts (10-30 / 11-02) that LV1 is written against. Reproduced
+# as literals here so the suite never touches `data/runs/**`.
+FORM_NAV_FROZEN = 199935.46   # summary.json::portfolio_value, identical on both days
+PEAK_NAV = 203049.96          # account_state.json::peak_nav (L4)
+MTM_NAV_1030 = 191630.06      # nav_breakdown.json::nav_effective (L3, 2026-10-30)
+MTM_NAV_1102 = 192096.06      # nav_breakdown.json::nav_effective (L3, 2026-11-02)
+RECORDED_DD = -0.015338589576673667  # what the form value produced (L15)
+
+
+def _write_breakdown(tmp_path, payload, name="nav_breakdown.json"):
+    path = tmp_path / name
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return str(path)
+
+
+def _args(breakdown_file, form_nav=FORM_NAV_FROZEN):
+    return types.SimpleNamespace(portfolio_value=form_nav, nav_breakdown_file=breakdown_file)
+
+
+def _flat_state():
+    """Zeroed counters + empty 10d history.
+
+    The counters MUST be zero: `inspect_portfolio_drawdown` auto-heals (resets HWM and
+    `current_dd` to 0) once a tier counter reaches its cooldown, which would mask the
+    very assertion under test.
+    """
+    return {
+        "as_of_date": None,
+        "peak_nav": None,
+        "tier1_consecutive_bars": 0,
+        "tier3_consecutive_bars": 0,
+        "freeze_remaining_bars": 0,
+        "nav_history_10d": [],
+    }
+
+
+def _dd_for(nav, as_of_date="2026-11-02"):
+    return _mod.inspect_portfolio_drawdown(
+        current_nav=nav,
+        peak_nav=PEAK_NAV,
+        state=_flat_state(),
+        params={},
+        as_of_date=as_of_date,
+    )
+
+
+_MACRO_INFO = {
+    "breadth": 0.40,
+    "thrust": 0.45,
+    "breadth_active": True,
+    "thrust_active": False,
+    "target_exposure": 0.50,
+    "breadth_thresh": 0.30,
+    "thrust_thresh": 0.60,
+    "leaders": [],
+    "tracked_symbols_count": 3,
+}
+
+_VOL_INFO = {
+    "realized_vol_21d": 0.18,
+    "target_vol": 0.20,
+    "vol_scaling_factor": 1.0,
+    "vol_elevated": False,
+}
+
+_STRATEGY_INFO = {"strategy_name": "unit-test", "template_name": "unit-test", "strategy_version": "0.0.0"}
+
+
+def _render(out_dir, dd_info):
+    """Write the real Stage-1 reports and return (report_dict, markdown_text)."""
+    _mod.generate_reports(
+        output_dir=str(out_dir),
+        as_of_date="2026-11-02",
+        strategy_info=_STRATEGY_INFO,
+        dd_info=dd_info,
+        macro_info=_MACRO_INFO,
+        vol_info=_VOL_INFO,
+        gate_code="GO",
+        gate_headline="🟢 GO",
+        actions=[],
+    )
+    with open(os.path.join(str(out_dir), _mod.STAGE1_HEALTH_REPORT_JSON), encoding="utf-8") as f:
+        report = json.load(f)
+    with open(os.path.join(str(out_dir), "stage1_health_report.md"), encoding="utf-8") as f:
+        md = f.read()
+    return report, md
+
+
+# ---------------------------------------------------------------------------
+# Case 1 -- DEVIATION STATE: MTM != form value -> tiers/counters recomputed from MTM
+# ---------------------------------------------------------------------------
+
+
+def test_case1_deviation_state_gates_on_mtm_and_persists_deviation(tmp_path, capsys):
+    breakdown = _write_breakdown(
+        tmp_path, {"as_of": "2026-11-02", "nav_effective": MTM_NAV_1030, "cash": 47800.06}
+    )
+
+    resolution = _mod.resolve_gate_nav_context(_args(breakdown))
+    captured = capsys.readouterr()
+    # The deviation must be LOUD, not a log-only footnote.
+    assert "[WARN] (LV1)" in captured.out
+
+    assert resolution["nav_source"] == _mod.NAV_SOURCE_MTM
+    assert resolution["nav_mtm"] == pytest.approx(MTM_NAV_1030)
+    assert resolution["nav_form"] == pytest.approx(FORM_NAV_FROZEN)
+    assert resolution["nav_gate_nav"] == pytest.approx(MTM_NAV_1030)
+    # signed deviation measured against the form value: the form OVERSTATES NAV here
+    assert resolution["nav_deviation_pct"] == pytest.approx((MTM_NAV_1030 - FORM_NAV_FROZEN) / FORM_NAV_FROZEN)
+    assert resolution["nav_deviation_exceeded"] is True
+
+    dd_info = _mod.attach_nav_provenance(_dd_for(resolution["nav_gate_nav"]), resolution)
+
+    # (b) the drawdown is the MTM one, not the recorded form-value one.
+    assert dd_info["drawdown_pct"] == pytest.approx(MTM_NAV_1030 / PEAK_NAV - 1.0)
+    assert dd_info["drawdown_pct"] == pytest.approx(-0.056241823440891126)
+    assert dd_info["drawdown_pct"] != pytest.approx(RECORDED_DD)
+    assert dd_info["current_nav"] == pytest.approx(MTM_NAV_1030)
+    assert dd_info["tier_status"] == "EVALUATED"
+    assert dd_info["nav_breaker_evaluated"] is True
+    # -5.62% is still below the (unchanged, frozen) Tier-1 10% threshold.
+    assert dd_info["tier"] == "NORMAL"
+    assert dd_info["tier1_max"] == 15
+
+    # The tier-1 COUNTER must be driven by MTM as well: at the same peak, a form value
+    # of 199935.46 never crosses 10%, while a 10.37% MTM drawdown advances the counter.
+    assert _dd_for(FORM_NAV_FROZEN)["tier1_counter"] == 0
+    deep = _mod.attach_nav_provenance(
+        _dd_for(182000.0),
+        _mod.resolve_gate_nav({"nav_effective": 182000.0}, FORM_NAV_FROZEN),
+    )
+    assert deep["drawdown_pct"] == pytest.approx(182000.0 / PEAK_NAV - 1.0)
+    assert deep["tier1_counter"] == 1
+    assert deep["tier"] == "TIER_1_DAMPING"
+
+    report, md = _render(tmp_path / "out", dd_info)
+    health = report["portfolio_health"]
+    # (3) structured deviation fields in the report JSON, alongside the gate numbers.
+    assert health["nav_source"] == "mtm"
+    assert health["nav_mtm"] == pytest.approx(MTM_NAV_1030)
+    assert health["nav_form"] == pytest.approx(FORM_NAV_FROZEN)
+    assert health["nav_deviation_pct"] == pytest.approx((MTM_NAV_1030 - FORM_NAV_FROZEN) / FORM_NAV_FROZEN)
+    assert health["nav_deviation_exceeded"] is True
+    assert health["drawdown_pct"] == pytest.approx(-0.056241823440891126)
+
+    # (3) the Markdown NAV row must show the MTM number AND the deviation -- a log line
+    # alone would not satisfy this.
+    assert "Gate NAV Source (LV1)" in md
+    assert "191,630.06" in md
+    assert "-4.15%" in md
+    assert "NAV SOURCE DEVIATION" in md
+    assert "199,935.46" in md
+
+
+# ---------------------------------------------------------------------------
+# Case 2 -- EQUAL STATE: MTM == form -> bit-identical gate output (added fields only)
+# ---------------------------------------------------------------------------
+
+
+def test_case2_equal_state_is_bit_identical_apart_from_added_fields(tmp_path, capsys):
+    breakdown = _write_breakdown(tmp_path, {"as_of": "2026-11-02", "nav_effective": FORM_NAV_FROZEN})
+
+    resolution = _mod.resolve_gate_nav_context(_args(breakdown))
+    captured = capsys.readouterr()
+    # No deviation warning and no degradation warning on a clean, agreeing run.
+    assert "[WARN] (LV1)" not in captured.out
+    assert resolution["nav_source"] == _mod.NAV_SOURCE_MTM
+    assert resolution["nav_deviation_pct"] == pytest.approx(0.0)
+    assert resolution["nav_deviation_exceeded"] is False
+
+    gate_dd = _mod.attach_nav_provenance(_dd_for(resolution["nav_gate_nav"]), resolution)
+    # The pre-LV1 code path, reproduced verbatim: gate NAV == form value.
+    legacy_dd = _dd_for(FORM_NAV_FROZEN)
+
+    added = {
+        "nav_source",
+        "nav_mtm",
+        "nav_form",
+        "nav_deviation_pct",
+        "nav_deviation_exceeded",
+        "nav_deviation_threshold_pct",
+        "nav_breakdown_status",
+        "nav_breakdown_as_of",
+        "nav_gate_status",
+        "nav_degradation_reason",
+        "tier_status",
+        "nav_breaker_evaluated",
+    }
+    assert set(gate_dd) - set(legacy_dd) == added
+    # BIT-IDENTICAL on every pre-existing key: no threshold, scale, counter or label moved.
+    for key in legacy_dd:
+        assert gate_dd[key] == legacy_dd[key], f"{key} changed on an equal-NAV run"
+
+    report, md = _render(tmp_path / "out", gate_dd)
+    assert report["portfolio_health"]["drawdown_pct"] == pytest.approx(RECORDED_DD)
+    assert report["portfolio_health"]["tier"] == "NORMAL"
+    assert "199,935.46" in md
+    # No deviation banner when the two agree.
+    assert "NAV SOURCE DEVIATION" not in md
+    assert "GATE NAV DEGRADED" not in md
+
+
+# ---------------------------------------------------------------------------
+# Case 3 -- MTM MISSING: explicit degradation, no silent form fallback, not "not triggered"
+# ---------------------------------------------------------------------------
+
+
+def test_case3_missing_mtm_degrades_explicitly_and_never_claims_not_triggered(tmp_path, capsys):
+    missing_path = str(tmp_path / "nav_breakdown.json")  # deliberately never written
+
+    resolution = _mod.resolve_gate_nav_context(_args(missing_path))
+    captured = capsys.readouterr()
+    assert "[WARN] (LV1)" in captured.out  # loud
+    assert "UNKNOWN" in captured.out       # ... and truthful
+
+    assert resolution["nav_source"] == _mod.NAV_SOURCE_FORM_FALLBACK_REFUSED
+    assert resolution["nav_gate_status"] == _mod.NAV_GATE_STATUS_DEGRADED
+    assert resolution["nav_breakdown_status"] == _mod.NAV_BREAKDOWN_STATUS_FILE_MISSING
+    # The gate NAV itself is NOT silently the form value.
+    assert resolution["nav_gate_nav"] is None
+    assert resolution["nav_mtm"] is None
+    assert resolution["nav_deviation_pct"] is None
+    assert resolution["nav_deviation_exceeded"] is None
+    assert resolution["nav_degradation_reason"]
+
+    dd_info = _mod.attach_nav_provenance(_dd_for(resolution["nav_gate_nav_used"]), resolution)
+    assert dd_info["tier_status"] == "UNKNOWN"
+    assert dd_info["nav_breaker_evaluated"] is False
+    assert "UNKNOWN" in dd_info["tier_label"]
+    assert "Full Risk Budget" not in dd_info["tier_label"]
+
+    report, md = _render(tmp_path / "out", dd_info)
+    health = report["portfolio_health"]
+    assert health["nav_gate_status"] == "DEGRADED_NAV_UNAVAILABLE"
+    assert health["nav_source"] == "form_fallback_refused"
+    assert health["tier_status"] == "UNKNOWN"
+    assert health["nav_mtm"] is None
+    assert health["nav_deviation_exceeded"] is None
+
+    assert "GATE NAV DEGRADED" in md
+    # Must not be presented as a clean, passing breaker state.
+    assert "🟢 NORMAL (Full Risk Budget)" not in md
+    assert "UNKNOWN" in md
+    # The NAV cell itself must stop claiming to be a tracked NAV.
+    assert "UNVERIFIED (表单占位值，不是盯市净值)" in md
+
+
+def test_case3b_empty_or_invalid_nav_effective_is_also_degraded(tmp_path, capsys):
+    """A present-but-unusable `nav_effective` degrades exactly like a missing file."""
+    for payload, expected in (
+        ({"as_of": "2026-11-02"}, _mod.NAV_BREAKDOWN_STATUS_EFFECTIVE_MISSING),
+        ({"nav_effective": None}, _mod.NAV_BREAKDOWN_STATUS_EFFECTIVE_MISSING),
+        ({"nav_effective": "not-a-number"}, _mod.NAV_BREAKDOWN_STATUS_EFFECTIVE_INVALID),
+        ({"nav_effective": 0.0}, _mod.NAV_BREAKDOWN_STATUS_EFFECTIVE_INVALID),
+        ({"nav_effective": -5.0}, _mod.NAV_BREAKDOWN_STATUS_EFFECTIVE_INVALID),
+    ):
+        path = _write_breakdown(tmp_path, payload)
+        resolution = _mod.resolve_gate_nav_context(_args(path))
+        assert resolution["nav_breakdown_status"] == expected, payload
+        assert resolution["nav_gate_nav"] is None, payload
+        assert resolution["nav_source"] == _mod.NAV_SOURCE_FORM_FALLBACK_REFUSED, payload
+    capsys.readouterr()
+
+
+# ---------------------------------------------------------------------------
+# Case 4 -- MISSING != INSIDE THRESHOLD: `None` must never be coerced to 0.0 / False
+# ---------------------------------------------------------------------------
+
+
+def test_case4_missing_deviation_is_distinguishable_from_inside_threshold(tmp_path):
+    missing = _mod.resolve_gate_nav(None, FORM_NAV_FROZEN, breakdown_status=_mod.NAV_BREAKDOWN_STATUS_FILE_MISSING)
+    equal = _mod.resolve_gate_nav({"nav_effective": FORM_NAV_FROZEN}, FORM_NAV_FROZEN)
+    within = _mod.resolve_gate_nav({"nav_effective": FORM_NAV_FROZEN * 1.005}, FORM_NAV_FROZEN)
+
+    # measured-but-inside-threshold == False; not-measured == None. Never the same value.
+    assert equal["nav_deviation_exceeded"] is False
+    assert within["nav_deviation_exceeded"] is False
+    assert missing["nav_deviation_exceeded"] is None
+    assert missing["nav_deviation_exceeded"] is not False
+    assert missing["nav_deviation_exceeded"] != within["nav_deviation_exceeded"]
+
+    # ... and the percentage is absent, not a fabricated flat 0.00%.
+    assert equal["nav_deviation_pct"] == pytest.approx(0.0)
+    assert missing["nav_deviation_pct"] is None
+    assert missing["nav_deviation_pct"] != 0.0
+
+    # The distinction survives the JSON round-trip consumers actually read.
+    res_missing = _mod.resolve_gate_nav_context(_args(str(tmp_path / "absent.json")))
+    report_missing, md_missing = _render(
+        tmp_path / "out_missing",
+        _mod.attach_nav_provenance(_dd_for(res_missing["nav_gate_nav_used"]), res_missing),
+    )
+    assert report_missing["portfolio_health"]["nav_deviation_exceeded"] is None
+    assert report_missing["portfolio_health"]["nav_deviation_pct"] is None
+    assert "not measurable" not in md_missing or "UNKNOWN" in md_missing
+
+    res_equal = _mod.resolve_gate_nav_context(
+        _args(_write_breakdown(tmp_path, {"nav_effective": FORM_NAV_FROZEN}, name="eq.json"))
+    )
+    report_equal, _ = _render(
+        tmp_path / "out_equal",
+        _mod.attach_nav_provenance(_dd_for(res_equal["nav_gate_nav"]), res_equal),
+    )
+    assert report_equal["portfolio_health"]["nav_deviation_exceeded"] is False
+    assert report_equal["portfolio_health"]["nav_deviation_pct"] == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# Wiring guard -- the gate must be fed the resolved NAV, never `args.portfolio_value`
+# ---------------------------------------------------------------------------
+
+
+def test_gate_call_site_uses_resolved_nav_not_the_form_value():
+    """Source-level guard: reverting the wiring must fail loudly.
+
+    `inspect_portfolio_drawdown(current_nav=args.portfolio_value, ...)` is precisely
+    the LV1 defect (the form value used as the NAV), so its absence is asserted
+    literally rather than inferred from behaviour.
+    """
+    path = os.path.join(_REPO_ROOT, "scripts", "check_live_portfolio_health.py")
+    with open(path, encoding="utf-8") as f:
+        source = f.read()
+
+    assert "current_nav=args.portfolio_value" not in source
+    assert "current_nav=gate_nav" in source
+    assert "resolve_gate_nav_context(args)" in source
+    # Stage 2's argv still speaks the operator's form value -- unchanged by LV1.
+    assert 'str(args.portfolio_value)' in source
