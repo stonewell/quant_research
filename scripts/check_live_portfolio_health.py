@@ -122,6 +122,70 @@ NAV_10D_RECOVERY_WINDOW = 10
 NAV_10D_STATUS_OK = "OK"
 NAV_10D_STATUS_INSUFFICIENT_HISTORY = "INSUFFICIENT_HISTORY"
 
+#: ---------------------------------------------------------------------------
+#: (LV1, 2026-11-03) FROZEN CONTRACT -- the Stage-1 gate NAV source.
+#:
+#: Written down BEFORE the code, per the LV1 acceptance criteria
+#: (`docs/development_plan.md`, LV1 item 1). Do not amend silently.
+#:
+#: (a) SOURCE OF TRUTH. `inspect_portfolio_drawdown`'s drawdown / circuit-breaker /
+#:     tier math is fed the MARKED-TO-MARKET (MTM) NAV, read from
+#:     `nav_breakdown.json::nav_effective`, whose sole producer is the valuation
+#:     layer (`web/livetrading/execution_service.py::_write_nav_breakdown`).
+#:     The operator form value (`--portfolio-value`) is NOT the gate NAV any more.
+#:     Fact base (two archived runs, 10-30 and 11-02): `summary.json.portfolio_value`
+#:     was frozen at 199935.46 on BOTH days while `nav_effective` moved
+#:     191630.06 -> 192096.06 -> drawdown was recorded as -1.53% while the true MTM
+#:     drawdown against the 203049.96 peak was -5.62% / -5.39% (understated by
+#:     4.09 / 3.86 percentage points), and `tier1_consecutive_bars` stayed pinned at
+#:     0 because the counter ran on the understated number.
+#:
+#: (b) DISAGREEMENT. When MTM and the form value disagree, `tier`,
+#:     `drawdown_pct` and `tier1_consecutive_bars` are recomputed FROM MTM. The form
+#:     value survives ONLY as an input-sanity cross-check: it is persisted
+#:     (`nav_form`), diffed (`nav_deviation_pct` / `nav_deviation_exceeded`) and
+#:     rendered in both the Markdown row and the JSON report. It never re-enters the
+#:     gate arithmetic.
+#:
+#: (c) MISSING MTM. An absent / unreadable / non-positive `nav_effective` is an
+#:     EXPLICIT DEGRADATION, never a silent fallback: `nav_source` becomes
+#:     `form_fallback_refused`, `nav_gate_status` becomes `DEGRADED_NAV_UNAVAILABLE`,
+#:     `tier_status` becomes `UNKNOWN`, `nav_deviation_pct` /
+#:     `nav_deviation_exceeded` stay `None` (NOT `False` -- "not measurable" must
+#:     stay distinguishable from "inside threshold"), a loud `[WARN]` is printed, and
+#:     the Markdown row renders UNKNOWN. The breaker is then NEVER reported as
+#:     "not triggered" (missing != not-triggered; same rule as the 10-day NAV
+#:     recovery leg and §2.19 D11 item 4).
+#:
+#: INVALIDATION CONDITION: this contract is void the moment either (i) the valuation
+#:     layer stops writing `nav_effective` beside `account_state.json`, or (ii) any
+#:     code path feeds the form value back in as the gate NAV. On either event the
+#:     LV1 row in `docs/development_plan.md` must be reopened before code moves.
+#: ---------------------------------------------------------------------------
+NAV_BREAKDOWN_FILENAME = "nav_breakdown.json"  # written by the valuation layer; Stage 1 reads it
+NAV_BREAKDOWN_EFFECTIVE_KEY = "nav_effective"
+
+#: FROZEN deviation threshold (LV1 item 3): |MTM - form| / |form| above this ratio is
+#: an explicit, persisted, rendered deviation event -- never a log line only.
+NAV_DEVIATION_WARN_PCT = 0.01
+
+#: Why the MTM NAV was (or was not) available. `OK` is the only value that lets
+#: `resolve_gate_nav` return an MTM NAV.
+NAV_BREAKDOWN_STATUS_OK = "OK"
+NAV_BREAKDOWN_STATUS_FILE_MISSING = "FILE_MISSING"
+NAV_BREAKDOWN_STATUS_UNREADABLE = "UNREADABLE"
+NAV_BREAKDOWN_STATUS_EFFECTIVE_MISSING = "NAV_EFFECTIVE_MISSING"
+NAV_BREAKDOWN_STATUS_EFFECTIVE_INVALID = "NAV_EFFECTIVE_INVALID"
+
+#: Which NAV the gate used. `mtm` == measured; `form_fallback_refused` == degraded.
+NAV_SOURCE_MTM = "mtm"
+NAV_SOURCE_FORM_FALLBACK_REFUSED = "form_fallback_refused"
+
+#: Gate verdict availability. `DEGRADED_NAV_UNAVAILABLE` means the tier below is an
+#: UNEVALUATED placeholder, not a passing verdict.
+NAV_GATE_STATUS_EVALUATED = "EVALUATED"
+NAV_GATE_STATUS_DEGRADED = "DEGRADED_NAV_UNAVAILABLE"
+
 
 def _fmt_metric(value: Any, spec: str, na: str = "N/A") -> str:
     """Format a possibly-None metric for the dashboard, rendering N/A when unmeasured.
@@ -159,6 +223,16 @@ def parse_args(args: Optional[List[str]] = None):
         "--account-state-file",
         default=None,
         help="Path to persistent account state JSON file (default: account_state.json in --output-dir)",
+    )
+    parser.add_argument(
+        "--nav-breakdown-file",
+        default=None,
+        help=(
+            "(LV1) Path to the marked-to-market valuation snapshot the GATE NAV is read from "
+            "(default: nav_breakdown.json in --output-dir, i.e. the file the web valuation layer "
+            "writes next to account_state.json). This file -- not --portfolio-value -- supplies "
+            "the drawdown / circuit-breaker NAV."
+        ),
     )
     parser.add_argument(
         "--strategy-file",
@@ -289,6 +363,14 @@ def parse_args(args: Optional[List[str]] = None):
         parsed.account_state_file = os.path.join(parsed.output_dir, "account_state.json")
     else:
         parsed.account_state_file = _resolve_path(parsed.account_state_file)
+    # (LV1) Default the MTM valuation snapshot beside the state file -- same run
+    # directory the web layer launches Stage 1 with (`--output-dir run_dir`), so no
+    # new flag is required in the deployed path; `--nav-breakdown-file` only exists
+    # for ad-hoc / test runs.
+    if parsed.nav_breakdown_file is None:
+        parsed.nav_breakdown_file = os.path.join(parsed.output_dir, NAV_BREAKDOWN_FILENAME)
+    else:
+        parsed.nav_breakdown_file = _resolve_path(parsed.nav_breakdown_file)
     parsed.strategy_file = _resolve_path(parsed.strategy_file)
     parsed.universe_file = _resolve_path(parsed.universe_file)
     if parsed.cache_dir:
@@ -312,6 +394,203 @@ def to_json_serializable(obj: Any) -> Any:
     if isinstance(obj, (list, tuple)):
         return [to_json_serializable(x) for x in obj]
     return obj
+
+
+def load_nav_breakdown(path: Optional[str]) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Read `nav_breakdown.json` (written by the valuation layer). I/O only.
+
+    Returns `(payload_or_None, status)`. Every failure path returns a *status code*
+    instead of raising or substituting a number, so `resolve_gate_nav` can turn it
+    into an explicit degradation rather than a silent fallback.
+    """
+    if not path or not os.path.exists(path):
+        return None, NAV_BREAKDOWN_STATUS_FILE_MISSING
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, ValueError):
+        return None, NAV_BREAKDOWN_STATUS_UNREADABLE
+    if not isinstance(payload, dict):
+        return None, NAV_BREAKDOWN_STATUS_UNREADABLE
+    return payload, NAV_BREAKDOWN_STATUS_OK
+
+
+def resolve_gate_nav(
+    nav_breakdown: Optional[Dict[str, Any]],
+    form_nav: Optional[float],
+    breakdown_status: str = NAV_BREAKDOWN_STATUS_OK,
+    deviation_threshold: float = NAV_DEVIATION_WARN_PCT,
+) -> Dict[str, Any]:
+    """PURE resolver for the Stage-1 gate NAV (LV1). No I/O, no globals mutated.
+
+    Chosen deliberately as a new helper rather than an existing one: a grep of
+    `common/`, `scripts/` and `web/livetrading/` finds `nav_effective` PRODUCERS
+    (`web/livetrading/execution_service.py::_write_nav_breakdown`) and archival
+    consumers (`scripts/repair_live_run_snapshots.py`), but no shared resolver for
+    "which NAV should the gate use" -- Stage 1 had zero reads of
+    `nav_breakdown.json` before this change. Inventing a second reader elsewhere
+    would have split the ownership of the decision, so the decision lives here, next
+    to its only consumer.
+
+    Contract (frozen -- see the `LV1` block above `NAV_BREAKDOWN_FILENAME`):
+      * MTM available  -> `nav_source = "mtm"`, `gate_nav` = MTM, deviation fields
+        measured (`nav_deviation_exceeded` is a real bool).
+      * MTM missing    -> `nav_source = "form_fallback_refused"`,
+        `nav_gate_status = "DEGRADED_NAV_UNAVAILABLE"`, `gate_nav = None`, and the
+        deviation fields are `None` (NOT `False`) so "not measurable" can never be
+        read as "inside threshold".
+
+    Deviation is signed and measured against the form value:
+    `(mtm - form) / |form|`. A negative value means the form overstates NAV -- the
+    exact direction of the 10-30 / 11-02 incident.
+    """
+    form_val: Optional[float]
+    try:
+        form_val = float(form_nav) if form_nav is not None else None
+    except (TypeError, ValueError):
+        form_val = None
+
+    status = breakdown_status or NAV_BREAKDOWN_STATUS_OK
+    mtm: Optional[float] = None
+    if status == NAV_BREAKDOWN_STATUS_OK:
+        raw = nav_breakdown.get(NAV_BREAKDOWN_EFFECTIVE_KEY) if isinstance(nav_breakdown, dict) else None
+        if raw is None:
+            status = NAV_BREAKDOWN_STATUS_EFFECTIVE_MISSING
+        else:
+            try:
+                candidate = float(raw)
+            except (TypeError, ValueError):
+                status = NAV_BREAKDOWN_STATUS_EFFECTIVE_INVALID
+            else:
+                # A non-finite / non-positive MTM is not a usable NAV: `0.0` would
+                # make the drawdown math divide by a fake zero, and `NaN` would
+                # poison every downstream comparison into False ("not triggered").
+                if not np.isfinite(candidate) or candidate <= 0.0:
+                    status = NAV_BREAKDOWN_STATUS_EFFECTIVE_INVALID
+                else:
+                    mtm = candidate
+
+    as_of = nav_breakdown.get("as_of") if isinstance(nav_breakdown, dict) else None
+    if not isinstance(as_of, str):
+        as_of = None
+
+    if mtm is None:
+        return {
+            "nav_source": NAV_SOURCE_FORM_FALLBACK_REFUSED,
+            "nav_mtm": None,
+            "nav_form": form_val,
+            "nav_deviation_pct": None,
+            "nav_deviation_exceeded": None,
+            "nav_deviation_threshold_pct": float(deviation_threshold),
+            "nav_breakdown_status": status,
+            "nav_breakdown_as_of": as_of,
+            "nav_gate_status": NAV_GATE_STATUS_DEGRADED,
+            "nav_gate_nav": None,
+            "nav_degradation_reason": (
+                f"nav_breakdown.json 未提供可用的 {NAV_BREAKDOWN_EFFECTIVE_KEY} "
+                f"(status={status})：门禁净值不可判定，表单值 {form_val} 仅作占位显示，"
+                "不构成盯市净值，熔断状态按 UNKNOWN 处理（缺失 ≠ 未触发）"
+            ),
+        }
+
+    deviation_pct: Optional[float] = None
+    if form_val is not None and abs(form_val) > 0.0:
+        deviation_pct = (mtm - form_val) / abs(form_val)
+    return {
+        "nav_source": NAV_SOURCE_MTM,
+        "nav_mtm": mtm,
+        "nav_form": form_val,
+        "nav_deviation_pct": deviation_pct,
+        # `None` (unmeasurable) is preserved, never coerced to `False`.
+        "nav_deviation_exceeded": (
+            None if deviation_pct is None else bool(abs(deviation_pct) > float(deviation_threshold))
+        ),
+        "nav_deviation_threshold_pct": float(deviation_threshold),
+        "nav_breakdown_status": status,
+        "nav_breakdown_as_of": as_of,
+        "nav_gate_status": NAV_GATE_STATUS_EVALUATED,
+        "nav_gate_nav": mtm,
+        "nav_degradation_reason": None,
+    }
+
+
+def resolve_gate_nav_context(args) -> Dict[str, Any]:
+    """Read `nav_breakdown.json` and resolve the gate NAV for one Stage-1 run (LV1).
+
+    The ONLY I/O in the LV1 path, and it is isolated here so the decision itself
+    (`resolve_gate_nav`) stays a pure function. Emits the two loud warnings the
+    frozen contract requires: deviation above threshold, and MTM unavailable.
+
+    On a degraded run `nav_gate_nav` stays `None` -- the caller must decide what to
+    display, and `attach_nav_provenance` will relabel the verdict UNKNOWN. The form
+    value is exposed separately as `nav_gate_nav_used` so the substitution is
+    explicit in the returned dict (and thus in the report) rather than implicit.
+    """
+    payload, status = load_nav_breakdown(getattr(args, "nav_breakdown_file", None))
+    resolution = resolve_gate_nav(
+        payload,
+        getattr(args, "portfolio_value", None),
+        breakdown_status=status,
+    )
+    if resolution["nav_gate_nav"] is None:
+        # LOUD, not silent.
+        print(
+            "[WARN] (LV1) 门禁净值降级: 取不到盯市净值 "
+            f"({resolution['nav_degradation_reason']})。"
+            "本次回撤/熔断判定为 UNKNOWN，**不是**「未触发」；"
+            "请恢复 nav_breakdown.json 后重跑，勿用表单值替代盯市净值。"
+        )
+        try:
+            resolution["nav_gate_nav_used"] = float(resolution["nav_form"])
+        except (TypeError, ValueError):
+            resolution["nav_gate_nav_used"] = None
+    elif resolution["nav_deviation_exceeded"]:
+        print(
+            "[WARN] (LV1) 表单值与盯市净值偏离超阈值: "
+            f"MTM {resolution['nav_mtm']:,.2f} vs 表单 {resolution['nav_form']:,.2f}"
+            f"（偏离 {resolution['nav_deviation_pct']:+.2%}，阈值 "
+            f"{resolution['nav_deviation_threshold_pct']:.2%}）。"
+            "回撤/层级已按 MTM 重算，表单值仅留痕。"
+        )
+    return resolution
+
+
+def attach_nav_provenance(dd_info: Dict[str, Any], nav_resolution: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge the LV1 NAV-source provenance into `dd_info` (the dict that gets published).
+
+    `dd_info` lands verbatim in `stage1_health_report.json::portfolio_health` and its
+    numeric fields are copied into `account_state.json`, so the provenance has to
+    travel with it -- a log line alone would be invisible to every consumer.
+
+    On a degraded run the tier ENUM is deliberately left untouched (Stage 2 compares
+    `circuit_breaker_tier == "TIER_3_HALT"`, and inventing a new enum value there would
+    silently change order behaviour), but `tier_status` becomes `UNKNOWN` and the
+    human label stops claiming a passing verdict: missing NAV must never be readable
+    as "breaker not triggered".
+    """
+    for key in (
+        "nav_source",
+        "nav_mtm",
+        "nav_form",
+        "nav_deviation_pct",
+        "nav_deviation_exceeded",
+        "nav_deviation_threshold_pct",
+        "nav_breakdown_status",
+        "nav_breakdown_as_of",
+        "nav_gate_status",
+        "nav_degradation_reason",
+    ):
+        dd_info[key] = nav_resolution.get(key)
+    if nav_resolution.get("nav_gate_nav") is None:
+        dd_info["tier_status"] = "UNKNOWN"
+        dd_info["tier_label"] = (
+            "⚪ UNKNOWN (NAV DEGRADED — 盯市净值不可用，熔断层级未判定；缺失 ≠ 未触发)"
+        )
+        dd_info["nav_breaker_evaluated"] = False
+    else:
+        dd_info["tier_status"] = "EVALUATED"
+        dd_info["nav_breaker_evaluated"] = True
+    return dd_info
 
 
 def refresh_stage1_data(
@@ -1051,6 +1330,20 @@ def print_dashboard(
     # 1. Portfolio Health
     print("[1. PORTFOLIO HEALTH & DRAWDOWN CIRCUIT BREAKERS]")
     print(f"  Current Portfolio NAV : {dd_info['current_nav']:>12,.2f}")
+    # (LV1) The gate NAV's provenance, right beside the number it produced. On a
+    # degraded run the tier line below already reads UNKNOWN; this line says WHY.
+    if dd_info.get("nav_source") == NAV_SOURCE_MTM:
+        print(
+            f"  NAV Source            : mtm ({NAV_BREAKDOWN_EFFECTIVE_KEY})"
+            f" | form cross-check {_fmt_metric(dd_info.get('nav_form'), ',.2f')}"
+            f" | dev {_fmt_metric(dd_info.get('nav_deviation_pct'), '+.2%')}"
+            f"{' ⚠️ ABOVE THRESHOLD' if dd_info.get('nav_deviation_exceeded') else ''}"
+        )
+    else:
+        print(
+            "  NAV Source            : ⚠️ DEGRADED — 盯市净值不可用，熔断状态 UNKNOWN"
+            f" (status={dd_info.get('nav_breakdown_status')})，缺失 ≠ 未触发"
+        )
     print(f"  High-Water Mark (HWM) : {dd_info['peak_nav']:>12,.2f}")
     print(f"  Peak-to-Trough DD     : {dd_info['drawdown_pct']:>11.2%}")
     print(f"  Circuit Breaker Tier  : {dd_info['tier_label']}")
@@ -1289,6 +1582,41 @@ def generate_reports(
         else ""
     )
 
+    # (LV1) NAV provenance, rendered in the report -- not only logged. See the frozen
+    # contract block above `NAV_BREAKDOWN_FILENAME`.
+    _nav_threshold_display = _fmt_metric(dd_info.get("nav_deviation_threshold_pct"), ".2%")
+    _nav_deviation_display = _fmt_metric(dd_info.get("nav_deviation_pct"), "+.2%")
+    _nav_breakdown_status = dd_info.get("nav_breakdown_status")
+    if dd_info.get("nav_source") == NAV_SOURCE_MTM:
+        _nav_source_value = f"`{dd_info.get('nav_mtm'):,.2f}` (盯市 nav_effective)"
+        _nav_form_display = _fmt_metric(dd_info.get("nav_form"), ",.2f")
+        if dd_info.get("nav_deviation_exceeded"):
+            _nav_source_status = f"⚠️ 偏离超阈值 (> {_nav_threshold_display})"
+            _nav_disclosure = (
+                "> **NAV SOURCE DEVIATION — 表单值与盯市净值不一致（LV1）。**\n"
+                f"> 盯市净值 `nav_effective = {dd_info.get('nav_mtm'):,.2f}`，"
+                f"操作员表单值 `--portfolio-value = {_nav_form_display}`，"
+                f"偏离 `{_nav_deviation_display}`（冻结阈值 `{_nav_threshold_display}`）。\n"
+                "> 回撤 `drawdown_pct`、熔断层级 `tier` 与 `tier1_consecutive_bars` 均按**盯市净值**重算；"
+                "表单值仅作输入合理性校验并在此留痕，不参与门禁运算。\n\n"
+            )
+        else:
+            _nav_source_status = f"Form cross-check only (≤ {_nav_threshold_display})"
+            _nav_disclosure = ""
+    else:
+        _nav_source_value = f"N/A — 盯市净值不可用 (`{_nav_breakdown_status}`)"
+        _nav_form_display = (
+            f"{_fmt_metric(dd_info.get('nav_form'), ',.2f')} (未经验证的表单占位值，不是净值)"
+        )
+        _nav_source_status = "⚪ UNKNOWN (NAV degraded; 缺失 ≠ 未触发)"
+        _nav_disclosure = (
+            "> **GATE NAV DEGRADED — 盯市净值不可用（LV1）。**\n"
+            f"> {dd_info.get('nav_degradation_reason') or 'nav_breakdown.json 缺少 nav_effective'}。\n"
+            "> 因此本次**没有**可判定的回撤 / 熔断层级：`tier_status = UNKNOWN`。"
+            "未测得**不等于**「未触发」，不得据此放宽任何层级或缩放系数；"
+            "表内数字只是表单值的占位显示，请恢复 `nav_breakdown.json` 后重跑。\n\n"
+        )
+
     strat_ver_display = f"v{strategy_info.get('strategy_version', '1.0.0')}" + (f" [base: v{strategy_info.get('base_version')}]" if strategy_info.get('base_version') else "")
     md_content = f"""# Stage 1 Live Pre-Trade Health & Macro Audit Report
 
@@ -1299,13 +1627,14 @@ def generate_reports(
 > **Gate Directive**: **{gate_headline}**  
 > **Report Timestamp**: Generated during the market-local 13:55 – 14:20 inspection window  
 
----
+{_nav_disclosure}---
 
 ## 1. Portfolio Health & Drawdown Circuit Breakers
 
 | Metric | Current Value | Threshold / Target | Status |
 | :--- | :--- | :--- | :--- |
-| **Current Portfolio NAV** | `{dd_info['current_nav']:,.2f}` | — | Tracking |
+| **Current Portfolio NAV** | `{dd_info['current_nav']:,.2f}` | — | {"Tracking" if dd_info.get('nav_source') == NAV_SOURCE_MTM else "⚠️ UNVERIFIED (表单占位值，不是盯市净值)"} |
+| **Gate NAV Source (LV1)** | {_nav_source_value} | Form cross-check `{_nav_form_display}` · dev `{_nav_deviation_display}` (frozen Δ ≤ {_nav_threshold_display}) | {_nav_source_status} |
 | **High-Water Mark (HWM)** | `{dd_info['peak_nav']:,.2f}` | — | All-Time Peak |
 | **Peak-to-Trough Drawdown** | `{dd_info['drawdown_pct']:.2%}` | Tier 1: -10% / Tier 2: -15% / Tier 3: -20% | **{dd_info['tier_label']}** |
 | **Linear Equity Scale** | `{dd_info['linear_equity_scale']:.1%}` | Smooth linear damping | Continuous exposure factor |
@@ -1671,13 +2000,29 @@ def main(cli_args: Optional[List[str]] = None):
         prior_state_to_preserve = copy.deepcopy(state)
         prior_state_to_preserve.pop("prior_state", None)
 
+    # (LV1, 2026-11-03) GATE NAV SOURCE. The drawdown / circuit-breaker math below is
+    # fed the MARKED-TO-MARKET NAV, not the operator form value. See the frozen
+    # contract block above `NAV_BREAKDOWN_FILENAME` for the full rule set; in short:
+    # MTM wins, the form value is only an input-sanity cross-check, and a missing MTM
+    # is an explicit degradation (never a silent fallback, never "not triggered").
+    nav_resolution = resolve_gate_nav_context(args)
+    gate_nav = nav_resolution["nav_gate_nav"]
+    if gate_nav is None:
+        # Degradation branch: the form value is used purely as a DISPLAY PLACEHOLDER so
+        # the report keeps its shape. `attach_nav_provenance` relabels the verdict
+        # UNKNOWN, so this can never read as a measured NAV.
+        gate_nav = nav_resolution["nav_gate_nav_used"]
+
     dd_info = inspect_portfolio_drawdown(
-        current_nav=args.portfolio_value,
+        current_nav=gate_nav,
         peak_nav=args.peak_nav,
         state=baseline_state,
         params=params,
         as_of_date=as_of_date,
     )
+    # Attach the NAV-source provenance to the SAME dict that lands in the report JSON
+    # (`"portfolio_health": dd_info`) and in `account_state.json`.
+    attach_nav_provenance(dd_info, nav_resolution)
 
     # 4. Evaluate Universe Breadth, Thrust & Volatility (and optional 5m Intraday Enrichment)
     enable_intraday_5m = getattr(args, "enable_intraday_5m", False) or bool(
@@ -1983,6 +2328,17 @@ def main(cli_args: Optional[List[str]] = None):
             "intraday_buy_scale": intraday_5m_info.get("intraday_buy_scale", 1.0) if intraday_5m_info else 1.0,
             "nav_history_10d": nav_hist,
             "prior_state": prior_state_to_preserve,
+            # (LV1) NAV-source provenance, persisted with the same numbers the gate
+            # acted on: MTM vs form value, the signed deviation and whether it crossed
+            # the frozen threshold. A `None` here means "not measurable" (degraded),
+            # which must stay distinguishable from `False` ("inside threshold").
+            "nav_source": dd_info.get("nav_source"),
+            "nav_mtm": dd_info.get("nav_mtm"),
+            "nav_form": dd_info.get("nav_form"),
+            "nav_deviation_pct": dd_info.get("nav_deviation_pct"),
+            "nav_deviation_exceeded": dd_info.get("nav_deviation_exceeded"),
+            "nav_gate_status": dd_info.get("nav_gate_status"),
+            "tier_status": dd_info.get("tier_status"),
         })
         save_account_state(args.account_state_file, updated_state)
 
