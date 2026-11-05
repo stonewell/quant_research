@@ -24,8 +24,12 @@ from scripts.run_live_strategy import (
     load_symbol_names,
     parse_args,
     apply_intraday_distribution_gate,
+    ALLOW_DEGRADED_GATE_ENV,
+    LiveGateDegradedError,
+    main,
 )
 from scripts.live_paths import DEFAULT_STRATEGY_KEY, default_live_output_dir
+from common.live_execution_timing import ticket_order_rows
 
 
 def test_pad_east_asian():
@@ -441,8 +445,10 @@ def test_exit_confirmation_streak_protection_and_hard_stop(tmp_path, monkeypatch
     with patch.object(EqualWeightAllocation, "generate_weights", mock_gen):
         main()
 
+    # (LV2) the ticket is a versioned envelope now; `ticket_order_rows` also accepts the
+    # pre-LV2 bare list, which is what every archived run still holds.
     with open(tmp_path / "live_trading_ticket.json", "r", encoding="utf-8") as f:
-        tickets_d1 = json.load(f)
+        tickets_d1 = ticket_order_rows(json.load(f))
 
     icbc_d1 = next(t for t in tickets_d1 if t["symbol"] == "601398.SH")
     assert icbc_d1["action"] == "HOLD_FILTERED"
@@ -460,8 +466,10 @@ def test_exit_confirmation_streak_protection_and_hard_stop(tmp_path, monkeypatch
     with patch.object(EqualWeightAllocation, "generate_weights", mock_gen):
         main()
 
+    # (LV2) the ticket is a versioned envelope now; `ticket_order_rows` also accepts the
+    # pre-LV2 bare list, which is what every archived run still holds.
     with open(tmp_path / "live_trading_ticket.json", "r", encoding="utf-8") as f:
-        tickets_d2 = json.load(f)
+        tickets_d2 = ticket_order_rows(json.load(f))
 
     icbc_d2 = next(t for t in tickets_d2 if t["symbol"] == "601398.SH")
     assert icbc_d2["action"] == "SELL"
@@ -487,8 +495,10 @@ def test_exit_confirmation_streak_protection_and_hard_stop(tmp_path, monkeypatch
     with patch.object(EqualWeightAllocation, "generate_weights", mock_gen):
         main()
 
+    # (LV2) the ticket is a versioned envelope now; `ticket_order_rows` also accepts the
+    # pre-LV2 bare list, which is what every archived run still holds.
     with open(tmp_path / "live_trading_ticket.json", "r", encoding="utf-8") as f:
-        tickets_stop = json.load(f)
+        tickets_stop = ticket_order_rows(json.load(f))
 
     icbc_stop = next(t for t in tickets_stop if t["symbol"] == "601398.SH")
     assert icbc_stop["action"] == "SELL"
@@ -626,8 +636,10 @@ def test_lot_rounding_zero_shares_liquidation_to_cooldown(tmp_path, monkeypatch)
     with patch.object(EqualWeightAllocation, "generate_weights", mock_gen):
         main()
 
+    # (LV2) the ticket is a versioned envelope now; `ticket_order_rows` also accepts the
+    # pre-LV2 bare list, which is what every archived run still holds.
     with open(tmp_path / "live_trading_ticket.json", "r", encoding="utf-8") as f:
-        tickets = json.load(f)
+        tickets = ticket_order_rows(json.load(f))
 
     r_601088 = next(t for t in tickets if t["symbol"] == "601088.SH")
     assert r_601088["action"] == "SELL"
@@ -649,6 +661,106 @@ def test_lot_rounding_zero_shares_liquidation_to_cooldown(tmp_path, monkeypatch)
     assert "601088.SH" not in st.get("zero_target_streak", {})
     assert st["last_exit_date"]["601088.SH"] == "2024-05-10"
     assert st["exit_bars_ago"]["601088.SH"] == 0
+
+
+def _degraded_gate_cmd_args(tmp_path, out_dir, account_state, monkeypatch):
+    """Minimal real argv whose account_state carries a DEGRADED gate verdict.
+
+    `main()` loads `--account-state-file` and `--health-report-file` before any order math,
+    which is where the fail-closed check lives -- so the fixture only has to make the run
+    reach that point (a one-symbol synthetic universe does it offline).
+    """
+    univ_file = str(tmp_path / "univ_degraded.txt")
+    with open(univ_file, "w", encoding="utf-8") as f:
+        f.write("600000.SH\n")
+
+    holdings_file = str(tmp_path / "holdings_degraded.json")
+    with open(holdings_file, "w", encoding="utf-8") as f:
+        json.dump({"600000.SH": 1000}, f)
+
+    state_file = str(out_dir / "account_state.json")
+    state = {
+        "as_of_date": "2024-05-10",
+        "holding_bars": {"600000.SH": 5},
+        "zero_target_streak": {},
+        "nav_source": "form_fallback_refused",
+        "nav_mtm": None,
+    }
+    state.update(account_state)
+    with open(state_file, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+
+    return [
+        "run_live_strategy.py",
+        "--strategy", "equal_weight",
+        "--universe-file", univ_file,
+        "--current-holdings-file", holdings_file,
+        "--account-state-file", state_file,
+        "--output-dir", str(out_dir),
+        "--as-of-date", "2024-05-10",
+        "--start-date", "2024-01-01",
+        "--data-provider", "synthetic",
+        "--portfolio-value", "100000",
+    ]
+
+
+def test_degraded_gate_refuses_to_issue_a_ticket(tmp_path, monkeypatch):
+    """(LV11 item 6/7) An UNKNOWN breaker is NOT a passing breaker: refuse, write no ticket.
+
+    Two archived vintages are pinned here because BOTH must refuse:
+
+    * `circuit_breaker_tier="UNKNOWN"` -- what Stage 1 persists since LV11;
+    * `circuit_breaker_tier="NORMAL"` + `tier_status="UNKNOWN"` -- every archive written
+      BEFORE LV11, which is exactly the "report says UNKNOWN, JSON says NORMAL" state that
+      let a degraded run order anyway. A fix that only reads the tier enum would leave the
+      whole existing archive silent, so the check must consult the status fields too.
+    """
+    monkeypatch.delenv(ALLOW_DEGRADED_GATE_ENV, raising=False)
+    for state in (
+        {"circuit_breaker_tier": "UNKNOWN", "tier_status": "UNKNOWN"},
+        {"circuit_breaker_tier": "NORMAL", "tier_status": "UNKNOWN"},
+        {"circuit_breaker_tier": "NORMAL", "nav_gate_status": "DEGRADED_NAV_UNAVAILABLE"},
+    ):
+        out_dir = tmp_path / ("run_" + str(abs(hash(tuple(sorted(state.items()))))))
+        out_dir.mkdir()
+        cmd_args = _degraded_gate_cmd_args(tmp_path, out_dir, state, monkeypatch)
+        monkeypatch.setattr(sys, "argv", cmd_args)
+
+        with pytest.raises(LiveGateDegradedError) as excinfo:
+            main()
+
+        assert "缺失 ≠ 未触发" in str(excinfo.value)
+        # No order artifacts at all -- not even an empty ticket a downstream UI might read
+        # as "nothing to do today".
+        assert not os.path.exists(os.path.join(str(out_dir), "live_trading_ticket.json"))
+        assert not os.path.exists(os.path.join(str(out_dir), "live_trading_ticket.csv"))
+
+
+def test_acknowledged_degraded_gate_proceeds_and_records_the_acknowledgement(tmp_path, monkeypatch):
+    """The ONE documented escape (bootstrap): explicit operator acknowledgement, on the record.
+
+    Stage 2 takes the ack from `LIVETRADING_ALLOW_DEGRADED_GATE`; the web layer sets it only
+    when the operator checked "人工覆盖净值". Proceeding must be AUDITABLE -- the archive keeps
+    the tier as UNKNOWN and marks the acknowledgement, so it can never be mistaken later for
+    "the breaker was evaluated and did not trigger".
+    """
+    monkeypatch.setenv(ALLOW_DEGRADED_GATE_ENV, "1")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    cmd_args = _degraded_gate_cmd_args(
+        tmp_path, out_dir, {"circuit_breaker_tier": "UNKNOWN", "tier_status": "UNKNOWN"}, monkeypatch
+    )
+    monkeypatch.setattr(sys, "argv", cmd_args)
+
+    main()
+
+    with open(out_dir / "summary.json", "r", encoding="utf-8") as f:
+        summary = json.load(f)
+    assert summary["gate_degraded_acknowledged"] is True
+    assert summary["gate_degraded_ack_env"] == ALLOW_DEGRADED_GATE_ENV
+    # Still no false verdict: the acknowledgement does not launder UNKNOWN into NORMAL.
+    assert summary.get("run_mode")
+    assert os.path.exists(out_dir / "live_trading_ticket.json")
 
 
 def test_buy_resets_zero_target_streak_and_exit_streak(tmp_path, monkeypatch):

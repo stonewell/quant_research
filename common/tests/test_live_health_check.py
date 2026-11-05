@@ -725,14 +725,20 @@ def test_append_nav_history_point_flags_frozen_series_and_caps_at_ten():
 def test_main_wires_effective_nav_into_nav_history_not_form_value():
     """The state-update call site must persist `dd_info["current_nav"]` (effective NAV).
 
-    Exercises the wiring without a data provider: the append call in `main` is
-    the ONLY writer of `nav_history_10d`, and it must be fed the NAV the tier
-    math acted on -- not the raw operator form value, which is what froze and
+    Exercises the wiring without a data provider: the append call in
+    `build_account_state_update` is the ONLY writer of `nav_history_10d`, and it must be fed
+    the NAV the tier math acted on -- not the raw operator form value, which is what froze and
     produced the repeated 197,351.17 archive.
+
+    (LV11) The writer moved OUT of `main` into `build_account_state_update` when the degraded
+    path had to skip the append entirely (a form placeholder in the 10-day recovery series is
+    a number nobody valued). It is a pure function now, so this assertion follows it there --
+    and additionally pins that `main` actually calls it, so the extraction cannot orphan the
+    real writer while this test happily inspects a function nobody uses.
     """
     import inspect as _inspect
 
-    src = _inspect.getsource(_mod.main)
+    src = _inspect.getsource(_mod.build_account_state_update)
     start = src.index("append_nav_history_point(")
     depth = 0
     end = len(src)
@@ -748,5 +754,9 @@ def test_main_wires_effective_nav_into_nav_history_not_form_value():
 
     assert 'dd_info["current_nav"]' in call_site, call_site
     assert "args.portfolio_value" not in call_site, call_site
+
+    # The extracted writer must still be the one `main` uses.
+    main_src = _inspect.getsource(_mod.main)
+    assert "build_account_state_update(" in main_src
 
 

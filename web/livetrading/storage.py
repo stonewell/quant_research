@@ -92,6 +92,16 @@ except ImportError:  # pragma: no cover - repo root not yet importable
     sys.path.insert(0, find_repo_root())
     from common.freshness import is_stale_bar
 
+# (LV2) One owner of the ticket-payload shape. `live_trading_ticket.json` became a versioned
+# envelope (`{"ticket_schema": ..., "orders": [...]}`) carrying `execution_session` /
+# `price_reference`; every archived run still holds the pre-LV2 bare list. Readers MUST go
+# through `ticket_order_rows` so neither shape reads as "no ticket".
+try:
+    from common.live_execution_timing import ticket_order_rows, replace_ticket_orders
+except ImportError:  # pragma: no cover - repo root not yet importable
+    sys.path.insert(0, find_repo_root())
+    from common.live_execution_timing import ticket_order_rows, replace_ticket_orders
+
 
 # Directory the multi-strategy netting CLI (`scripts/run_live_multi_strategy.py`)
 # writes its netted ticket / sub-ledgers into when the operator does not pass
@@ -387,11 +397,15 @@ def post_holdings_from_ticket(ticket: Any) -> Optional[Dict[str, int]]:
     which is how the Stage 2 runner tags its configured cash_proxy such as 511880.SH) are skipped
     because cash is the implied residual, not a share position.
     """
-    if not ticket or not isinstance(ticket, list):
+    # (LV2) `ticket_order_rows` normalizes BOTH shapes -- the pre-LV2 bare list (what every
+    # archived run still holds) and the versioned envelope. A bare `isinstance(ticket, list)`
+    # test here would report "no ticket" for every run written after LV2.
+    rows = ticket_order_rows(ticket)
+    if not rows:
         return None
     holdings: Dict[str, int] = {}
     saw_target = False
-    for r in ticket:
+    for r in rows:
         if not isinstance(r, dict):
             continue
         sym = str(r.get("symbol", "")).strip().upper()
@@ -2903,13 +2917,20 @@ class StorageManager:
         if health_data is not None:
             self._save_json(os.path.join(run_dir, "stage1_health_report.json"), health_data)
         if ticket_data is not None:
-            if isinstance(ticket_data, list):
-                for r in ticket_data:
-                    if isinstance(r, dict):
-                        name_val = str(r.get("name", "")).strip()
-                        if not name_val or name_val.lower() in ("custom", "universe", "none", "unknown") or name_val == r.get("symbol"):
-                            r["name"] = get_stock_name(r.get("symbol", ""), r.get("symbol", ""))
-            self._save_json(os.path.join(run_dir, "live_trading_ticket.json"), ticket_data)
+            # (LV2) Normalize the names on the ROWS, then write back through
+            # `replace_ticket_orders` so a caller handing us an LV2 envelope keeps its
+            # `execution_session` / `price_reference` instead of having them silently
+            # stripped by a bare-list re-serialization.
+            ticket_rows = ticket_order_rows(ticket_data)
+            for r in ticket_rows:
+                if isinstance(r, dict):
+                    name_val = str(r.get("name", "")).strip()
+                    if not name_val or name_val.lower() in ("custom", "universe", "none", "unknown") or name_val == r.get("symbol"):
+                        r["name"] = get_stock_name(r.get("symbol", ""), r.get("symbol", ""))
+            self._save_json(
+                os.path.join(run_dir, "live_trading_ticket.json"),
+                replace_ticket_orders(ticket_data, ticket_rows),
+            )
         if csv_content is not None:
             with open(os.path.join(run_dir, "live_trading_ticket.csv"), "w", encoding="utf-8") as f:
                 f.write(csv_content)
@@ -3220,8 +3241,32 @@ class StorageManager:
         elif os.path.exists(csv_path):
             ticket = parse_ticket_csv(csv_path)
 
-        if ticket and isinstance(ticket, list):
-            for r in ticket:
+        # (LV2) `live_trading_ticket.json` is now a versioned ENVELOPE
+        # (`{"ticket_schema": ..., "execution_session": ..., "orders": [...]}`) while every
+        # archived run still holds a bare list. Normalize through `ticket_order_rows` at this
+        # API boundary so the bundle keeps publishing the `trading_ticket` LIST the front end
+        # consumes, and surface the timing separately instead of letting it masquerade as an
+        # order row (or letting the whole ticket read as absent).
+        ticket_rows = ticket_order_rows(ticket)
+        ticket_timing: Optional[Dict[str, Any]] = None
+        if isinstance(ticket, dict):
+            ticket_timing = {
+                k: ticket.get(k)
+                for k in (
+                    "ticket_schema",
+                    "execution_session",
+                    "price_reference",
+                    "as_of",
+                    "execution_date",
+                    "run_mode",
+                    "window_gate",
+                    "provenance",
+                    "overnight_gap_hint",
+                )
+            }
+
+        if ticket_rows:
+            for r in ticket_rows:
                 if isinstance(r, dict):
                     name_val = str(r.get("name", "")).strip()
                     if is_placeholder_stock_name(name_val, r.get("symbol")):
@@ -3290,8 +3335,8 @@ class StorageManager:
             strat_n = strat_k.replace("_", " ").title()
 
         prices_map: Dict[str, float] = {}
-        if ticket and isinstance(ticket, list):
-            for r in ticket:
+        if ticket_rows:
+            for r in ticket_rows:
                 if isinstance(r, dict) and r.get("symbol") and r.get("price") is not None:
                     try:
                         p_val = float(r["price"])
@@ -3315,7 +3360,8 @@ class StorageManager:
             "universe_key": univ_k,
             "universe_name": univ_n,
             "health_report": self._load_json(os.path.join(run_dir, "stage1_health_report.json")),
-            "trading_ticket": ticket,
+            # (LV2) ROWS, always a list -- the envelope's timing lives in the key below.
+            "trading_ticket": ticket_rows,
             "friction_savings": friction_savings,
             "sub_ledgers": sub_ledgers,
             "summary": summary_data,
@@ -3345,6 +3391,12 @@ class StorageManager:
         raw_snapshot = self._load_snapshot_holdings(run_dir)
         if raw_snapshot is not None and raw_snapshot != bundle["holdings"]:
             bundle["pre_trade_holdings"] = raw_snapshot
+
+        # (LV2) Which session these order rows execute in / which price the `price` column
+        # references. Published only when the run's ticket actually carries it: a pre-LV2 or
+        # CSV-only archive must read as "not recorded" rather than as a guessed default.
+        if ticket_timing is not None:
+            bundle["trading_ticket_timing"] = ticket_timing
 
         return bundle
 

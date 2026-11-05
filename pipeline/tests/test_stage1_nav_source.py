@@ -272,7 +272,13 @@ def test_case3_missing_mtm_degrades_explicitly_and_never_claims_not_triggered(tm
 
     assert resolution["nav_source"] == _mod.NAV_SOURCE_FORM_FALLBACK_REFUSED
     assert resolution["nav_gate_status"] == _mod.NAV_GATE_STATUS_DEGRADED
-    assert resolution["nav_breakdown_status"] == _mod.NAV_BREAKDOWN_STATUS_FILE_MISSING
+    # (LV11) An absent snapshot in an otherwise EMPTY run dir is a TIMING GAP, not a loss:
+    # the two used to collapse into `FILE_MISSING`, which made "not staged yet" and "should
+    # be there but isn't" indistinguishable in the archive.
+    assert (
+        resolution["nav_breakdown_status"]
+        == _mod.NAV_BREAKDOWN_STATUS_SNAPSHOT_NOT_YET_WRITTEN
+    )
     # The gate NAV itself is NOT silently the form value.
     assert resolution["nav_gate_nav"] is None
     assert resolution["nav_mtm"] is None
@@ -383,3 +389,154 @@ def test_gate_call_site_uses_resolved_nav_not_the_form_value():
     assert "resolve_gate_nav_context(args)" in source
     # Stage 2's argv still speaks the operator's form value -- unchanged by LV1.
     assert 'str(args.portfolio_value)' in source
+
+
+# ---------------------------------------------------------------------------
+# LV11 -- the two absences are different facts, and a pinned snapshot fails closed
+# ---------------------------------------------------------------------------
+
+
+def test_lv11_absent_snapshot_splits_timing_gap_from_true_loss(tmp_path, capsys):
+    """`SNAPSHOT_NOT_YET_WRITTEN` (timing gap) must not read like `SNAPSHOT_MISSING`.
+
+    Both used to collapse into `FILE_MISSING`, so an auditor could not tell "Stage 1 ran
+    before anything was marked to market" from "this run dir already had a snapshot and it
+    is gone". Reverse-mutation: return `NAV_BREAKDOWN_STATUS_FILE_MISSING` for every absent
+    file again -> both asserts below go red.
+    """
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    gap_status = _mod.resolve_gate_nav_context(_args(str(empty_dir / "nav_breakdown.json")))[
+        "nav_breakdown_status"
+    ]
+    assert gap_status == _mod.NAV_BREAKDOWN_STATUS_SNAPSHOT_NOT_YET_WRITTEN
+
+    # A run dir that ALREADY carries a round artifact proves a valuation round happened, so
+    # an absent snapshot there is a LOSS, not a deferral.
+    used_dir = tmp_path / "used"
+    used_dir.mkdir()
+    (used_dir / "summary.json").write_text("{}", encoding="utf-8")
+    loss_status = _mod.resolve_gate_nav_context(_args(str(used_dir / "nav_breakdown.json")))[
+        "nav_breakdown_status"
+    ]
+    assert loss_status == _mod.NAV_BREAKDOWN_STATUS_SNAPSHOT_MISSING
+    assert gap_status != loss_status
+
+    out = capsys.readouterr().out
+    assert "SNAPSHOT_NOT_YET_WRITTEN" in out
+    assert "SNAPSHOT_MISSING" in out
+
+
+def test_lv11_explicitly_pinned_snapshot_must_exist(tmp_path):
+    """`--nav-breakdown-file` pointing at nothing RAISES -- it does not degrade and continue.
+
+    Reverse-mutation: drop the `explicit` branch in `load_nav_breakdown` -> no exception and
+    the acceptance criterion "指向不存在或不可解析的快照 => 抛错" is silently gone.
+    """
+    missing = str(tmp_path / "pinned.json")
+    args = _args(missing)
+    # `parse_args` is the ONLY place that records "the operator pinned this path"; the LV1
+    # test fixtures deliberately do not set it (so their degraded-path behaviour is intact).
+    args.nav_breakdown_file_explicit = True
+    with pytest.raises(_mod.NavSnapshotError):
+        _mod.resolve_gate_nav_context(args)
+
+    # Unparsable JSON under a pinned path is the same refusal, not a degraded report.
+    broken = tmp_path / "broken.json"
+    broken.write_text("{not json", encoding="utf-8")
+    args_broken = _args(str(broken))
+    args_broken.nav_breakdown_file_explicit = True
+    with pytest.raises(_mod.NavSnapshotError):
+        _mod.resolve_gate_nav_context(args_broken)
+
+    # ... and a readable pinned snapshot still resolves normally (no over-refusal).
+    good = _write_breakdown(tmp_path, {"nav_effective": MTM_NAV_1102}, name="good.json")
+    args_good = _args(good)
+    args_good.nav_breakdown_file_explicit = True
+    assert _mod.resolve_gate_nav_context(args_good)["nav_gate_nav"] == pytest.approx(MTM_NAV_1102)
+
+
+def test_lv11_parse_args_records_whether_the_snapshot_path_was_pinned(tmp_path):
+    """The explicit/default distinction must survive `parse_args` itself (deployed path)."""
+    parsed_default = _mod.parse_args(
+        ["--output-dir", str(tmp_path), "--data-provider", "synthetic"]
+    )
+    assert parsed_default.nav_breakdown_file_explicit is False
+    assert parsed_default.nav_breakdown_file == str(
+        os.path.join(str(tmp_path), _mod.NAV_BREAKDOWN_FILENAME)
+    )
+
+    pinned = str(tmp_path / "pinned.json")
+    parsed_pinned = _mod.parse_args(
+        ["--output-dir", str(tmp_path), "--data-provider", "synthetic", "--nav-breakdown-file", pinned]
+    )
+    assert parsed_pinned.nav_breakdown_file_explicit is True
+    assert parsed_pinned.nav_breakdown_file == pinned
+
+
+# ---------------------------------------------------------------------------
+# LV11 item 6 -- the degraded state must fail closed in the MACHINE-READABLE layer
+# ---------------------------------------------------------------------------
+
+
+def test_lv11_degraded_run_persists_unknown_tier_and_leaves_nav_series_alone(tmp_path, capsys):
+    """Two specific lies, both asserted against (2026-11-03 post-commit audit).
+
+    1. `circuit_breaker_tier` used to be persisted as the placeholder's "NORMAL" while the
+       report said UNKNOWN -- Stage 2 reads only that enum, so "archive says NORMAL" would
+       have authorised orders on an unevaluated gate.
+    2. `nav_history_10d` used to be fed the FORM PLACEHOLDER, polluting the 10-day recovery
+       metric. A degraded run must leave the series untouched.
+
+    Reverse-mutation: drop either branch condition in `build_account_state_update` and one of
+    the asserts below goes red.
+    """
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    resolution = _mod.resolve_gate_nav_context(_args(str(empty_dir / "nav_breakdown.json")))
+    degraded_dd = _mod.attach_nav_provenance(
+        _dd_for(resolution["nav_gate_nav_used"]), resolution
+    )
+    assert degraded_dd["nav_gate_status"] == _mod.NAV_GATE_STATUS_DEGRADED
+
+    baseline = {
+        "nav_history_10d": [100000.0, 101000.0],
+        "current_nav": 101000.0,
+        "peak_nav": 105000.0,
+        "circuit_breaker_tier": "NORMAL",
+    }
+    updated = _mod.build_account_state_update(
+        dict(baseline),
+        baseline,
+        degraded_dd,
+        as_of_date="2026-11-02",
+        gate_code="GO",
+        prior_state={"as_of_date": "2026-10-30"},
+    )
+    # 1. never a passing-looking tier
+    assert updated["circuit_breaker_tier"] == "UNKNOWN"
+    assert updated["circuit_breaker_tier"] != "NORMAL"
+    assert updated["tier_status"] == "UNKNOWN"
+    assert updated["nav_gate_status"] == _mod.NAV_GATE_STATUS_DEGRADED
+    assert updated["nav_degraded_as_of"] == "2026-11-02"
+    # 2. the 10-day series is NOT extended with a placeholder
+    assert updated["nav_history_10d"] == [100000.0, 101000.0]
+    # ... and the HWM chain is not overwritten with the form value either
+    assert updated["current_nav"] == 101000.0
+    assert updated["peak_nav"] == 105000.0
+    assert "LV11" in capsys.readouterr().out
+
+    # MEASURED run: byte-identical to pre-LV11 behaviour -- append the effective NAV and
+    # persist the tier the math actually produced.
+    good = _write_breakdown(tmp_path, {"nav_effective": MTM_NAV_1102}, name="good.json")
+    resolution_ok = _mod.resolve_gate_nav_context(_args(good))
+    ok_dd = _mod.attach_nav_provenance(_dd_for(resolution_ok["nav_gate_nav"]), resolution_ok)
+    updated_ok = _mod.build_account_state_update(
+        dict(baseline), baseline, ok_dd, as_of_date="2026-11-02", gate_code="GO"
+    )
+    assert updated_ok["circuit_breaker_tier"] == ok_dd["tier"] == "NORMAL"
+    assert updated_ok["current_nav"] == pytest.approx(MTM_NAV_1102)
+    assert len(updated_ok["nav_history_10d"]) == 3
+    assert updated_ok["nav_history_10d"][-1] == pytest.approx(MTM_NAV_1102)
+    assert updated_ok["tier_status"] == "EVALUATED"
+    assert "nav_degraded_as_of" not in updated_ok

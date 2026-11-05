@@ -107,6 +107,16 @@ except (ImportError, ValueError):
     # sys.path (`server.py` / `app.py`), so the package-relative form is not always valid.
     from valuation import MissingCashError, StalePriceError, compute_nav
 
+# (LV2) The ticket envelope shape has one owner. Readers must use `ticket_order_rows`,
+# writers `replace_ticket_orders`: every archived ticket is still a pre-LV2 bare list, and a
+# reader that pattern-matches on `isinstance(payload, list)` sees "no ticket" for every run
+# written after LV2.
+try:
+    from common.live_execution_timing import replace_ticket_orders, ticket_order_rows
+except ImportError:  # pragma: no cover - repo root not importable
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+    from common.live_execution_timing import replace_ticket_orders, ticket_order_rows
+
 
 # --------------------------------------------------------------------------- #
 # (C6) Actionable failure classification for the child runner's stderr
@@ -443,6 +453,17 @@ def reconcile_intraday_5m_observability(
 #      sends the operator to look at the wrong thing.  `cache_structure_reason` probes the
 #      tables/row counts so the message names the actual cure (a Stage-1 data refresh).
 NAV_FALLBACK_ENV = "LIVETRADING_ALLOW_NAV_FALLBACK"
+
+#: (LV11) The operator's acknowledgement that Stage 1's circuit breaker could NOT be evaluated
+#: and Stage 2 may proceed anyway. This is the SAME contract as
+#: `scripts/run_live_strategy.py::ALLOW_DEGRADED_GATE_ENV` -- the web layer is the only thing
+#: that ever SETS it (never the operator's shell, never a default), and it sets it for exactly
+#: one run, the one whose operator asserted "人工覆盖净值" (`nav_override=True`).
+#:
+#: The two spellings are pinned equal by
+#: `pipeline/tests/test_stage1_nav_prestaging.py::test_the_gate_ack_env_has_one_spelling`, so a
+#: rename on either side fails a test instead of silently disconnecting the escape hatch.
+ALLOW_DEGRADED_GATE_ENV = "LIVETRADING_ALLOW_DEGRADED_GATE"
 
 #: Row-level mark, one entry per symbol.  NEVER folded into `summary.json` (which stays a
 #: top-level digest): a 20-symbol book would otherwise bloat every summary by 20 blocks.
@@ -1530,7 +1551,7 @@ class ExecutionService:
             return candidate_repo
         return strategy_file
 
-    def _get_subprocess_env(self) -> Dict[str, str]:
+    def _get_subprocess_env(self, extra: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
         env = dict(os.environ)
         # Ensure repo root is on PYTHONPATH for common/ and pipeline/ imports
         existing_pythonpath = env.get("PYTHONPATH", "")
@@ -1538,6 +1559,8 @@ class ExecutionService:
         if existing_pythonpath:
             paths.append(existing_pythonpath)
         env["PYTHONPATH"] = os.path.pathsep.join(paths)
+        if extra:
+            env.update({str(k): str(v) for k, v in extra.items()})
         return env
 
     # --------------------------------------------------------------------------
@@ -1780,6 +1803,66 @@ class ExecutionService:
             "dividend_alarms": list(dividend_alarms or []),
             "nav_warnings": list(nav_warnings or []),
         }
+
+    def _archived_cash_for(
+        self,
+        date_str: Optional[str],
+        strategy_key: Optional[str],
+        universe_key: Optional[str],
+        exclude_dir: Optional[str] = None,
+    ) -> Tuple[Optional[float], Optional[str]]:
+        """`(cash, summary_path)` from the most recent archived round at-or-before `date_str`.
+
+        WHY THIS EXISTS (LV11). `resolve_seed_holdings` returns SHARE counts only -- cash is
+        the implied NAV residual, so it is deliberately NOT a holding
+        (`post_holdings_from_ticket` skips BIL/CASH/`*_CASH` rows).  The engine refuses to
+        mark a book whose cash it cannot resolve (`MissingCashError`, fail-closed), which
+        would make pre-staging fail on every ordinary equity-only book and leave the gate
+        degraded exactly as before.
+
+        The previous round's `summary.json::cash` (with `cash_source`) IS the residual that
+        the seed book was sized against -- the same number Stage 2 had in hand when it wrote
+        that plan -- so it is the ONE defensible estimate available before the operator's
+        form is consulted.  It is used only when the archived round actually MEASURED cash
+        (`cash_source` in explicit / bil_fallback); a `missing` 0.0 is never recycled  -- that
+        would turn "unknown" into a measured zero, the exact inversion this task forbids.
+
+        Returns `(None, None)` when nothing usable is archived, which leaves the engine's own
+        parked-cash fallback (or its refusal) in charge.
+        """
+        if not strategy_key or not universe_key:
+            return None, None
+        try:
+            runs = self.storage.list_runs(
+                strategy_key=strategy_key, universe_key=universe_key, require_both=True
+            )
+        except Exception:  # pragma: no cover - archive walk is best-effort here
+            return None, None
+        excluded = os.path.abspath(exclude_dir) if exclude_dir else None
+        for run in runs:
+            run_path = run.get("path") or ""
+            if not run_path or not os.path.isdir(run_path):
+                continue
+            if excluded and os.path.abspath(run_path) == excluded:
+                continue
+            run_date = str(run.get("date") or "")
+            if date_str and run_date and run_date > str(date_str):
+                continue
+            summary_path = os.path.join(run_path, "summary.json")
+            if not os.path.exists(summary_path):
+                continue
+            summary = self.storage._load_json(summary_path, default={}) or {}
+            if str(summary.get("cash_source") or "") not in ("explicit", "bil_fallback"):
+                continue
+            raw_cash = summary.get("cash")
+            try:
+                cash = float(raw_cash)
+            except (TypeError, ValueError):
+                continue
+            if cash != cash or cash in (float("inf"), float("-inf")):  # NaN / inf
+                continue
+            return cash, summary_path
+        return None, None
 
     def _resolve_nav(
         self,
@@ -2092,6 +2175,71 @@ class ExecutionService:
             except Exception:
                 pass
 
+        # (LV11) PRE-STAGE the valuation snapshot BEFORE the gate child is launched.
+        #
+        # WHY HERE. `nav_breakdown.json`'s only producer used to be Stage 2, so the FIRST
+        # round of every session ran Stage 1 with no snapshot at all: the gate could not
+        # mark the book, degraded to `SNAPSHOT_NOT_YET_WRITTEN`, and Stage 2 was then handed
+        # a `tier_status="UNKNOWN"` report.  Staging it here makes both stages of one round
+        # share ONE valuation snapshot, written before anyone asks the breaker for a verdict.
+        #
+        # BEST-EFFORT, DELIBERATELY. Stage 1 has no operator holdings input, so the book can
+        # only come from the archive (`resolve_seed_holdings`) -- and a book that cannot be
+        # resolved or marked must NOT turn the health check into a hard failure.  When the
+        # snapshot cannot be staged we simply do NOT pin a path: Stage 1 then reads its
+        # default location, classifies the absence honestly (`SNAPSHOT_NOT_YET_WRITTEN` vs
+        # `SNAPSHOT_MISSING`) and persists `circuit_breaker_tier="UNKNOWN"`, which makes
+        # Stage 2 refuse to issue a ticket (fail closed) instead of guessing a NAV.
+        staged_nav_path: Optional[str] = None
+        try:
+            seed_book, seed_source = self.storage.resolve_seed_holdings(
+                val_date, strat_key, univ_key
+            )
+            if seed_book:
+                # Cash is NOT a holding (it is the NAV residual), so the seed book alone
+                # cannot be marked. Prefer the previous round's measured residual; a book
+                # that carries a parked-cash position still works with `cash=None` via the
+                # engine's own `bil_fallback`, and when neither is available the engine
+                # fails closed and this block degrades loudly instead of guessing.
+                staged_cash, cash_origin = self._archived_cash_for(
+                    val_date, strat_key, univ_key, exclude_dir=run_dir
+                )
+                staged_nav = self._resolve_nav(
+                    seed_book,
+                    as_of=val_date,
+                    cash=staged_cash,
+                    portfolio_value=portfolio_value,
+                    nav_override=False,
+                    provider=provider,
+                    strategy_key=strat_key,
+                    universe_key=univ_key,
+                    exclude_dir=run_dir,
+                )
+                if cash_origin:
+                    staged_nav["nav_warnings"] = list(staged_nav.get("nav_warnings") or []) + [
+                        f"cash_from_archive: cash={staged_nav.get('cash')} 取自上一轮 "
+                        f"summary.json ({cash_origin})——持仓本身不含现金，这是唯一可用的已测量残差"
+                    ]
+                staged_nav_path = self._write_nav_breakdown(run_dir, staged_nav)
+                print(
+                    f"[ExecutionService] (LV11) 估值快照已预置: {staged_nav_path} "
+                    f"(seed_source={seed_source}, nav_effective={staged_nav.get('nav_effective')}, "
+                    f"cash_source={staged_nav.get('cash_source')}"
+                    f"{', cash_from_archive=' + cash_origin if cash_origin else ''})"
+                )
+            else:
+                print(
+                    "[ExecutionService] (LV11) 归档里没有可用的种子持仓 "
+                    f"(seed_source={seed_source})，本次不预置估值快照；"
+                    "Stage 1 将记为 SNAPSHOT_NOT_YET_WRITTEN 并把熔断档位落 UNKNOWN，"
+                    "Stage 2 会据此拒绝出票（缺失 ≠ 未触发）。"
+                )
+        except Exception as exc:  # best-effort by design -- see the comment above
+            logging.warning(
+                "[LV11] 估值快照预置失败（不阻断 Stage 1，门禁将显式降级）: %s", exc
+            )
+            staged_nav_path = None
+
         cmd = [
             self.storage.python_executable,
             self.storage.stage1_script,
@@ -2102,6 +2250,11 @@ class ExecutionService:
             "--account-state-file", account_state_file,
             "--data-provider", provider,
         ]
+        if staged_nav_path:
+            # Pinned on purpose: `--nav-breakdown-file` tells Stage 1 "the gate NAV comes
+            # from THIS file", so an unreadable one is a hard refusal (`NavSnapshotError`)
+            # rather than a silent degradation. We only pin a file we just wrote.
+            cmd.extend(["--nav-breakdown-file", staged_nav_path])
         # (C6) `--as-of-date` is passed ONLY for an explicitly requested session: a
         # live run must let `common/cli_utils.py` resolve it from the market clock
         # (`date.today()` here used to force a non-existent intraday / weekend bar).
@@ -2778,10 +2931,18 @@ class ExecutionService:
             cmd.append("--liquidate-stale-input-lots")
 
         print(f"[ExecutionService] Running Stage 2 Live Deployment: {' '.join(cmd)}")
+        # (LV11) An explicit "人工覆盖净值" IS the operator's assertion that the book could not
+        # be engine-marked, so it is also the one documented acknowledgement that lets Stage 2
+        # proceed while Stage 1's breaker verdict is UNKNOWN (the bootstrap case: a brand-new
+        # account has no archive for Stage 1 to mark). The child records it in `summary.json`
+        # (`gate_degraded_acknowledged`); without this the child REFUSES to issue a ticket.
+        stage2_env_extra: Dict[str, str] = {}
+        if nav_override:
+            stage2_env_extra[ALLOW_DEGRADED_GATE_ENV] = "1"
         proc = subprocess.run(
             cmd,
             cwd=self.storage.repo_root,
-            env=self._get_subprocess_env(),
+            env=self._get_subprocess_env(stage2_env_extra),
             capture_output=True,
             text=True,
         )
@@ -2799,19 +2960,27 @@ class ExecutionService:
         #: with what the book SHOULD be -- never presented as a fill receipt.
         post_holdings: Optional[Dict[str, int]] = None
         try:
-            if os.path.exists(ticket_json_file) and os.path.exists(csv_file):
-                if os.path.getmtime(csv_file) > os.path.getmtime(ticket_json_file):
-                    ticket_records = parse_ticket_csv(csv_file)
-                    self.storage._save_json(ticket_json_file, ticket_records)
-                else:
-                    ticket_records = self.storage._load_json(ticket_json_file, default=[])
-            elif os.path.exists(ticket_json_file):
-                ticket_records = self.storage._load_json(ticket_json_file, default=[])
-            elif os.path.exists(csv_file):
-                ticket_records = parse_ticket_csv(csv_file)
-                self.storage._save_json(ticket_json_file, ticket_records)
+            # (LV2) The ticket may be the pre-LV2 bare list OR the versioned envelope
+            # (`{"ticket_schema": ..., "execution_session": ..., "orders": [...]}`), and the
+            # JSON and the CSV are written by the same child. Normalize through
+            # `ticket_order_rows`/`replace_ticket_orders` so (a) an envelope never reaches
+            # `ticket_records` as a dict-of-str, and (b) re-serializing from the CSV does not
+            # strip the timing block out of this round's archive.
+            ticket_payload: Any = []
+            if os.path.exists(ticket_json_file):
+                ticket_payload = self.storage._load_json(ticket_json_file, default=[])
+            if os.path.exists(csv_file):
+                csv_newer = (not os.path.exists(ticket_json_file)) or (
+                    os.path.getmtime(csv_file) > os.path.getmtime(ticket_json_file)
+                )
+                if csv_newer:
+                    ticket_payload = replace_ticket_orders(
+                        ticket_payload, parse_ticket_csv(csv_file)
+                    )
+                    self.storage._save_json(ticket_json_file, ticket_payload)
+            ticket_records = ticket_order_rows(ticket_payload)
 
-            if ticket_records and isinstance(ticket_records, list):
+            if ticket_records:
                 for r in ticket_records:
                     if isinstance(r, dict) and is_placeholder_stock_name(r.get("name"), r.get("symbol")):
                         r["name"] = get_stock_name(r.get("symbol"), r.get("symbol"))

@@ -67,6 +67,10 @@ from common.cli_utils import (
 )
 from common.freshness import assert_fresh_universe
 from common.indicators import sma
+from common.live_execution_timing import (
+    merge_timing_into_summary,
+    resolve_execution_timing,
+)
 from common.strategy_spec import load_strategy_file
 from common.universe import resolve_universe_from_args
 from pipeline.live_signal.lsig.signal import as_of_universe
@@ -172,10 +176,35 @@ NAV_DEVIATION_WARN_PCT = 0.01
 #: Why the MTM NAV was (or was not) available. `OK` is the only value that lets
 #: `resolve_gate_nav` return an MTM NAV.
 NAV_BREAKDOWN_STATUS_OK = "OK"
+#: (LV11) `FILE_MISSING` is kept for the "no path supplied at all" case only. An ABSENT file
+#: at a path the caller did supply is no longer collapsed into it: "not staged yet" and
+#: "should be there but isn't" are different operational facts and used to be
+#: indistinguishable here, which is exactly why every fresh run directory looked like a
+#: permanent degradation.
 NAV_BREAKDOWN_STATUS_FILE_MISSING = "FILE_MISSING"
+#: The valuation layer has not written this run's snapshot yet (a TIMING gap -- Stage 1 was
+#: launched before the book was marked). Normal for a first run of a session before LV11's
+#: pre-staging; never evidence that the snapshot was lost.
+NAV_BREAKDOWN_STATUS_SNAPSHOT_NOT_YET_WRITTEN = "SNAPSHOT_NOT_YET_WRITTEN"
+#: This run directory already carries evidence of a completed valuation round
+#: (`summary.json` / `holdings.json` / a Stage-1 report), yet the snapshot is absent => the
+#: snapshot was lost, not deferred. Operationally different from the line above.
+NAV_BREAKDOWN_STATUS_SNAPSHOT_MISSING = "SNAPSHOT_MISSING"
 NAV_BREAKDOWN_STATUS_UNREADABLE = "UNREADABLE"
 NAV_BREAKDOWN_STATUS_EFFECTIVE_MISSING = "NAV_EFFECTIVE_MISSING"
 NAV_BREAKDOWN_STATUS_EFFECTIVE_INVALID = "NAV_EFFECTIVE_INVALID"
+
+#: Files whose presence proves this run directory already ran a round. Used ONLY to split
+#: `SNAPSHOT_NOT_YET_WRITTEN` from `SNAPSHOT_MISSING`; `account_state.json` is deliberately
+#: excluded because the web layer seeds it BEFORE launching Stage 1 (so it would make every
+#: first run look like a lost snapshot).
+_RUN_DIR_ROUND_MARKERS = (
+    "summary.json",
+    "holdings.json",
+    "post_holdings.json",
+    "live_trading_ticket.json",
+    "stage1_health_report.json",
+)
 
 #: Which NAV the gate used. `mtm` == measured; `form_fallback_refused` == degraded.
 NAV_SOURCE_MTM = "mtm"
@@ -367,6 +396,10 @@ def parse_args(args: Optional[List[str]] = None):
     # directory the web layer launches Stage 1 with (`--output-dir run_dir`), so no
     # new flag is required in the deployed path; `--nav-breakdown-file` only exists
     # for ad-hoc / test runs.
+    # (LV11) Remember whether the operator PINNED the snapshot path before defaulting it.
+    # A pinned path must exist (fails closed); the defaulted path may legitimately be absent
+    # on a run that has not been valued yet, and is reported as `SNAPSHOT_NOT_YET_WRITTEN`.
+    parsed.nav_breakdown_file_explicit = parsed.nav_breakdown_file is not None
     if parsed.nav_breakdown_file is None:
         parsed.nav_breakdown_file = os.path.join(parsed.output_dir, NAV_BREAKDOWN_FILENAME)
     else:
@@ -396,21 +429,77 @@ def to_json_serializable(obj: Any) -> Any:
     return obj
 
 
-def load_nav_breakdown(path: Optional[str]) -> Tuple[Optional[Dict[str, Any]], str]:
+class NavSnapshotError(RuntimeError):
+    """(LV11) An explicitly pinned valuation snapshot is missing or unparsable.
+
+    Deliberately NOT degraded-and-continue: `--nav-breakdown-file` means "the gate NAV comes
+    from THIS file", so a run that cannot read it must abort instead of publishing a report
+    whose breaker verdict is an unevaluated placeholder. (Distinct from the *default* path:
+    when nobody pinned a file, an absent snapshot is a documented timing gap -- see
+    `NAV_BREAKDOWN_STATUS_SNAPSHOT_NOT_YET_WRITTEN`.)
+    """
+
+
+def _snapshot_absence_status(path: str) -> str:
+    """Split an absent snapshot into "not staged yet" vs "lost" (LV11).
+
+    A run directory that already holds a round artifact has demonstrably been valued at some
+    point, so an absent snapshot there is a LOSS; an otherwise-empty directory is simply a
+    Stage 1 that ran before anything was marked to market.
+    """
+    try:
+        run_dir = os.path.dirname(os.path.abspath(path))
+    except Exception:
+        return NAV_BREAKDOWN_STATUS_SNAPSHOT_MISSING
+    if not os.path.isdir(run_dir):
+        return NAV_BREAKDOWN_STATUS_SNAPSHOT_NOT_YET_WRITTEN
+    for marker in _RUN_DIR_ROUND_MARKERS:
+        if os.path.exists(os.path.join(run_dir, marker)):
+            return NAV_BREAKDOWN_STATUS_SNAPSHOT_MISSING
+    return NAV_BREAKDOWN_STATUS_SNAPSHOT_NOT_YET_WRITTEN
+
+
+def load_nav_breakdown(
+    path: Optional[str], *, explicit: bool = False
+) -> Tuple[Optional[Dict[str, Any]], str]:
     """Read `nav_breakdown.json` (written by the valuation layer). I/O only.
 
     Returns `(payload_or_None, status)`. Every failure path returns a *status code*
     instead of raising or substituting a number, so `resolve_gate_nav` can turn it
     into an explicit degradation rather than a silent fallback.
+
+    (LV11) Two behaviours changed:
+
+    * an ABSENT file is classified as `SNAPSHOT_NOT_YET_WRITTEN` (timing gap) or
+      `SNAPSHOT_MISSING` (the run dir proves a round already happened) instead of both
+      collapsing into `FILE_MISSING`;
+    * `explicit=True` (the operator pinned `--nav-breakdown-file`) turns a missing or
+      unparsable snapshot into `NavSnapshotError` -- fail closed, no degraded report.
     """
-    if not path or not os.path.exists(path):
+    if not path:
         return None, NAV_BREAKDOWN_STATUS_FILE_MISSING
+    if not os.path.exists(path):
+        if explicit:
+            raise NavSnapshotError(
+                f"(LV11) --nav-breakdown-file={path} 不存在：显式指定的估值快照必须可读，"
+                "拒绝降级后继续（缺失 ≠ 未触发）。"
+            )
+        return None, _snapshot_absence_status(path)
     try:
         with open(path, "r", encoding="utf-8") as f:
             payload = json.load(f)
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
+        if explicit:
+            raise NavSnapshotError(
+                f"(LV11) --nav-breakdown-file={path} 无法解析: {exc}；显式指定的估值快照"
+                "必须可读，拒绝降级后继续。"
+            ) from exc
         return None, NAV_BREAKDOWN_STATUS_UNREADABLE
     if not isinstance(payload, dict):
+        if explicit:
+            raise NavSnapshotError(
+                f"(LV11) --nav-breakdown-file={path} 顶层不是 JSON 对象；拒绝降级后继续。"
+            )
         return None, NAV_BREAKDOWN_STATUS_UNREADABLE
     return payload, NAV_BREAKDOWN_STATUS_OK
 
@@ -526,7 +615,10 @@ def resolve_gate_nav_context(args) -> Dict[str, Any]:
     value is exposed separately as `nav_gate_nav_used` so the substitution is
     explicit in the returned dict (and thus in the report) rather than implicit.
     """
-    payload, status = load_nav_breakdown(getattr(args, "nav_breakdown_file", None))
+    payload, status = load_nav_breakdown(
+        getattr(args, "nav_breakdown_file", None),
+        explicit=bool(getattr(args, "nav_breakdown_file_explicit", False)),
+    )
     resolution = resolve_gate_nav(
         payload,
         getattr(args, "portfolio_value", None),
@@ -540,6 +632,20 @@ def resolve_gate_nav_context(args) -> Dict[str, Any]:
             "本次回撤/熔断判定为 UNKNOWN，**不是**「未触发」；"
             "请恢复 nav_breakdown.json 后重跑，勿用表单值替代盯市净值。"
         )
+        # (LV11) Say WHICH kind of absence this is. A timing gap is recoverable by staging
+        # the snapshot (the web layer now does that before launching Stage 1); a lost
+        # snapshot means this run directory already had one and it disappeared.
+        if status == NAV_BREAKDOWN_STATUS_SNAPSHOT_NOT_YET_WRITTEN:
+            print(
+                "[WARN] (LV11) 分类: SNAPSHOT_NOT_YET_WRITTEN —— 本次运行目录尚无估值快照，"
+                "属**时序缺口**（Stage 1 早于估值写盘启动）。web 层启动器应在拉起 Stage 1 前"
+                "预置快照；直接命令行调用需先产出快照。"
+            )
+        elif status == NAV_BREAKDOWN_STATUS_SNAPSHOT_MISSING:
+            print(
+                "[WARN] (LV11) 分类: SNAPSHOT_MISSING —— 该运行目录已存在本轮产物，估值快照"
+                "却缺失，属**真缺失**（未被删除/未写成功），不要当成「还没写」。"
+            )
         try:
             resolution["nav_gate_nav_used"] = float(resolution["nav_form"])
         except (TypeError, ValueError):
@@ -591,6 +697,110 @@ def attach_nav_provenance(dd_info: Dict[str, Any], nav_resolution: Dict[str, Any
         dd_info["tier_status"] = "EVALUATED"
         dd_info["nav_breaker_evaluated"] = True
     return dd_info
+
+
+def build_account_state_update(
+    state: Dict[str, Any],
+    baseline_state: Dict[str, Any],
+    dd_info: Dict[str, Any],
+    *,
+    as_of_date: str,
+    gate_code: str,
+    intraday_5m_info: Optional[Dict[str, Any]] = None,
+    prior_state: Any = None,
+) -> Dict[str, Any]:
+    """The `account_state.json` delta one Stage-1 run persists (LV11 item 6).
+
+    Extracted from `main()` ON PURPOSE. The 2026-11-03 post-commit audit found that the
+    fail-closed behaviour of this block was guarded only by a source-string grep, because the
+    block sat inline in `main()` and every offline test bypassed `main()`. As a pure function
+    it is directly testable -- and the two lies it used to tell are both asserted against:
+
+    * **degraded run** (`nav_gate_status == DEGRADED_NAV_UNAVAILABLE`): persists
+      `circuit_breaker_tier="UNKNOWN"` instead of the placeholder's "NORMAL". Stage 2 compares
+      that enum (`scripts/run_live_strategy.py`), so a passing-looking value here would let
+      "report UNKNOWN / archive NORMAL / orders still issued" hold simultaneously.
+      It also leaves `nav_history_10d` UNTOUCHED: appending the form placeholder would poison
+      the 10-day recovery metric with a number nobody valued. `current_nav` / `peak_nav` /
+      `drawdown_pct` / counters / scale are likewise NOT overwritten, because writing the
+      placeholder back pushes a form value into the HWM chain (the LV1 / LV7 defect).
+    * **measured run**: byte-identical to the pre-LV11 behaviour (append the effective NAV,
+      persist the tier the math actually produced).
+    """
+    updated_state = dict(state)
+    nav_degraded = dd_info.get("nav_gate_status") == NAV_GATE_STATUS_DEGRADED
+    buy_scale = intraday_5m_info.get("intraday_buy_scale", 1.0) if intraday_5m_info else 1.0
+
+    if nav_degraded:
+        print(
+            "[WARN] (LV11) 门禁净值降级：本次**不**写入 nav_history_10d、**不**覆盖 "
+            "current_nav/peak_nav/drawdown_pct，且 circuit_breaker_tier 落 `UNKNOWN`。"
+            "Stage 2 将拒绝出票（缺失 ≠ 未触发）。"
+        )
+        updated_state.update(
+            {
+                "as_of_date": as_of_date,
+                "circuit_breaker_tier": "UNKNOWN",
+                "gate_code": gate_code,
+                # The intraday hint comes from 5m bars, not from NAV, so it stays; the
+                # drawdown-derived scale does not, because there is no measured drawdown.
+                "intraday_buy_scale": buy_scale,
+                "nav_history_10d": list(baseline_state.get("nav_history_10d", []) or []),
+                "prior_state": prior_state,
+                "nav_degraded_as_of": as_of_date,
+            }
+        )
+    else:
+        # (2026-10-30 incident) Persist the EFFECTIVE NAV the tier math just used
+        # (`dd_info["current_nav"]`) rather than the raw operator form value
+        # (`args.portfolio_value`), so the series the fast-recovery gate reads back is by
+        # construction the same number the circuit breaker acted on. A repeated point is kept
+        # (flat NAV is legitimate) but warned about -- see `append_nav_history_point`.
+        nav_hist, nav_frozen = append_nav_history_point(
+            baseline_state.get("nav_history_10d", []) or [],
+            dd_info["current_nav"],
+        )
+        if nav_frozen:
+            print(
+                "[WARN] nav_history_10d 出现重复点: 本次 effective NAV "
+                f"{float(dd_info['current_nav']):,.2f} 与上一交易日完全相同。"
+                "该点已写入（真实盘整亦可能如此），但请确认 Stage 2 表单/账户的 portfolio_value "
+                "并非冻结值：冻结值会让 10 日 NAV 恢复门禁看起来像一条平坦序列。"
+            )
+        updated_state.update(
+            {
+                "as_of_date": as_of_date,
+                "current_nav": dd_info["current_nav"],
+                "peak_nav": dd_info["peak_nav"],
+                "drawdown_pct": dd_info["drawdown_pct"],
+                "circuit_breaker_tier": dd_info["tier"],
+                "linear_equity_scale": dd_info["linear_equity_scale"],
+                "tier1_consecutive_bars": dd_info["tier1_counter"],
+                "tier3_consecutive_bars": dd_info["tier3_counter"],
+                "freeze_remaining_bars": dd_info["freeze_remaining_bars"],
+                "gate_code": gate_code,
+                "intraday_buy_scale": buy_scale,
+                "nav_history_10d": nav_hist,
+                "prior_state": prior_state,
+            }
+        )
+
+    # (LV1) NAV-source provenance, persisted in BOTH branches so the archive says WHY: on a
+    # degraded run this records `nav_source="form_fallback_refused"`,
+    # `nav_gate_status="DEGRADED_NAV_UNAVAILABLE"`, `tier_status="UNKNOWN"` and deviation
+    # `None` -- the degradation itself, never a passing verdict.
+    updated_state.update(
+        {
+            "nav_source": dd_info.get("nav_source"),
+            "nav_mtm": dd_info.get("nav_mtm"),
+            "nav_form": dd_info.get("nav_form"),
+            "nav_deviation_pct": dd_info.get("nav_deviation_pct"),
+            "nav_deviation_exceeded": dd_info.get("nav_deviation_exceeded"),
+            "nav_gate_status": dd_info.get("nav_gate_status"),
+            "tier_status": dd_info.get("tier_status"),
+        }
+    )
+    return updated_state
 
 
 def refresh_stage1_data(
@@ -1314,10 +1524,18 @@ def print_dashboard(
     gate_headline: str,
     actions: List[str],
     intraday_5m_info: Optional[Dict[str, Any]] = None,
+    timing: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Print an executive-level pre-trade terminal dashboard."""
     print("=" * 110)
-    print("STAGE 1 PRE-TRADE GATE: PORTFOLIO HEALTH & MACRO REGIME INSPECTION (13:55 – 14:20 market-local)")
+    # (LV2) The header used to CLAIM the 13:55 – 14:20 inspection window unconditionally --
+    # including on the two archived runs that were executed pre-open (02:02 / 05:53
+    # market-local). It is now generated from the run's ACTUAL provenance, and the window
+    # string appears only when the run really was inside it.
+    print("STAGE 1 PRE-TRADE GATE: PORTFOLIO HEALTH & MACRO REGIME INSPECTION")
+    if isinstance(timing, dict) and timing.get("header_text"):
+        print(f"[EXECUTION TIMING] {timing['header_text']}")
+        print(f"[EXECUTION TIMING] {timing.get('overnight_gap_hint', '')}")
     print("=" * 110)
     print(f"Valuation As-Of Date : {as_of_date}")
     strat_disp = f"{strategy_info.get('strategy_name', 'N/A')} ({strategy_info.get('template_name', '')})"
@@ -1414,7 +1632,15 @@ def print_dashboard(
     print("-" * 110)
     print(f"FINAL PRE-TRADE DIRECTIVE : {gate_headline}")
     print("-" * 110)
-    print("MANDATORY HUMAN TRADER ACTIONS FOR STAGE 2 (14:15 – 14:50):")
+    # (LV2) Only a run genuinely INSIDE the design window may name a clock window. This line
+    # used to print "(14:15 – 14:50)" unconditionally -- including on the two archived PRE-OPEN
+    # rounds that motivated LV2, i.e. it told an operator to "act between 14:15 and 14:50" on a
+    # report produced at 02:02 market-local. Outside the window the actions still apply; only
+    # the clock promise is withdrawn (the real timing lives in the report header).
+    if timing and timing.get("in_window"):
+        print("MANDATORY HUMAN TRADER ACTIONS FOR STAGE 2 (14:15 – 14:50):")
+    else:
+        print("MANDATORY HUMAN TRADER ACTIONS FOR STAGE 2 (窗口外 / 回放运行 — 实际时点见表头 Execution Timing):")
     for i, act in enumerate(actions, start=1):
         print(f"  {i}. {act}")
     print("=" * 110)
@@ -1501,11 +1727,26 @@ def generate_reports(
     clock_ctx: Any = None,
     freshness_summary: Optional[Dict[str, Any]] = None,
     refresh_summary: Optional[Dict[str, Any]] = None,
+    timing: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str]:
     """Generate and write structured JSON and Markdown summary reports."""
     os.makedirs(output_dir, exist_ok=True)
     json_path = os.path.join(output_dir, STAGE1_HEALTH_REPORT_JSON)
     md_path = os.path.join(output_dir, "stage1_health_report.md")
+
+    # (LV2) Provenance text for the header. With no resolved clock we say NOTHING about a
+    # window: the pre-LV2 code hard-coded "Generated during the market-local 13:55 – 14:20
+    # inspection window" and that sentence was false on both archived runs.
+    if isinstance(timing, dict) and timing.get("header_text"):
+        _timing_header = str(timing["header_text"])
+        _timing_gap_hint = str(timing.get("overnight_gap_hint") or "")
+        _timing_session = str(timing.get("execution_session") or "")
+        _timing_price_ref = str(timing.get("price_reference") or "")
+    else:
+        _timing_header = "Generated without a resolved market-clock context (no window claim)"
+        _timing_gap_hint = ""
+        _timing_session = ""
+        _timing_price_ref = ""
 
     report_dict = {
         "as_of_date": as_of_date,
@@ -1513,6 +1754,9 @@ def generate_reports(
         # every report can answer "which instant, which session, which bars?" without
         # cross-referencing the console log.
         "clock": (clock_ctx.stamp_fields() if clock_ctx is not None else None),
+        # (LV2) The execution-timing block, so a reader never has to infer "which session do
+        # these prices fill in" from the ordinal position of the report in the archive.
+        "execution_timing": (dict(timing) if isinstance(timing, dict) else None),
         "freshness_summary": freshness_summary,
         # (2026-10-27) The pre-flight data-refresh outcome, including
         # `cache_created` (True only when THIS run had to create a missing
@@ -1625,7 +1869,9 @@ def generate_reports(
 > **Strategy Version**: `{strat_ver_display}`  
 > **Weighting & Ortho**: `{_weighting_mode_display(strategy_info)}` | Orthogonalized: `{strategy_info.get('orthogonalization', True)}`  
 > **Gate Directive**: **{gate_headline}**  
-> **Report Timestamp**: Generated during the market-local 13:55 – 14:20 inspection window  
+> **Report Timestamp**: {_timing_header}  
+> **Execution Timing**: `execution_session={_timing_session or 'N/A'}` · `price_reference={_timing_price_ref or 'N/A'}`  
+> **Overnight Gap (ATT)**: {_timing_gap_hint or 'n/a'}  
 
 {_nav_disclosure}---
 
@@ -1833,6 +2079,12 @@ def main(cli_args: Optional[List[str]] = None):
         raise ValueError(f"Could not resolve universe symbols from {args.universe_file}")
     clock_ctx = resolve_live_clock_context(args, universe_symbols, stage="stage1")
     as_of_date = clock_ctx.as_of_date
+    # (LV2) Resolve the execution-timing block ONCE per run from the same clock context the
+    # gate used, so the dashboard, the Markdown header, the JSON report and `summary.json`
+    # cannot disagree about when this run happened. Values are frozen (`as_of+1` /
+    # `next_open`) per the 2026-11-03 user ruling -- see `common/live_execution_timing.py`.
+    timing = resolve_execution_timing(clock_ctx, as_of=as_of_date, run_mode="live")
+    print(f"[EXECUTION TIMING] {timing['header_text']}")
     if getattr(args, "start_date", None):
         start_date = args.start_date
     else:
@@ -2295,51 +2547,19 @@ def main(cli_args: Optional[List[str]] = None):
 
     # 6. Update Account State
     if not args.no_save_state:
-        # (2026-10-30 incident) Persist the EFFECTIVE NAV the tier math just used
-        # (`dd_info["current_nav"]`) rather than the raw operator form value
-        # (`args.portfolio_value`), so the series the fast-recovery gate reads
-        # back is by construction the same number the circuit breaker acted on.
-        # A repeated point is kept (flat NAV is legitimate) but warned about --
-        # see `append_nav_history_point`.
-        nav_hist, nav_frozen = append_nav_history_point(
-            baseline_state.get("nav_history_10d", []) or [],
-            dd_info["current_nav"],
+        # (LV11 item 6, 2026-11-03 post-commit audit) Fail closed in the machine-readable
+        # layer: the decision itself lives in `build_account_state_update`, which is a pure,
+        # directly-tested function precisely because this block used to sit inline here and
+        # every offline test bypassed `main()` (see its docstring for the two lies it fixed).
+        updated_state = build_account_state_update(
+            state,
+            baseline_state,
+            dd_info,
+            as_of_date=as_of_date,
+            gate_code=gate_code,
+            intraday_5m_info=intraday_5m_info,
+            prior_state=prior_state_to_preserve,
         )
-        if nav_frozen:
-            print(
-                "[WARN] nav_history_10d 出现重复点: 本次 effective NAV "
-                f"{float(dd_info['current_nav']):,.2f} 与上一交易日完全相同。"
-                "该点已写入（真实盘整亦可能如此），但请确认 Stage 2 表单/账户的 portfolio_value "
-                "并非冻结值：冻结值会让 10 日 NAV 恢复门禁看起来像一条平坦序列。"
-            )
-
-        updated_state = dict(state)
-        updated_state.update({
-            "as_of_date": as_of_date,
-            "current_nav": dd_info["current_nav"],
-            "peak_nav": dd_info["peak_nav"],
-            "drawdown_pct": dd_info["drawdown_pct"],
-            "circuit_breaker_tier": dd_info["tier"],
-            "linear_equity_scale": dd_info["linear_equity_scale"],
-            "tier1_consecutive_bars": dd_info["tier1_counter"],
-            "tier3_consecutive_bars": dd_info["tier3_counter"],
-            "freeze_remaining_bars": dd_info["freeze_remaining_bars"],
-            "gate_code": gate_code,
-            "intraday_buy_scale": intraday_5m_info.get("intraday_buy_scale", 1.0) if intraday_5m_info else 1.0,
-            "nav_history_10d": nav_hist,
-            "prior_state": prior_state_to_preserve,
-            # (LV1) NAV-source provenance, persisted with the same numbers the gate
-            # acted on: MTM vs form value, the signed deviation and whether it crossed
-            # the frozen threshold. A `None` here means "not measurable" (degraded),
-            # which must stay distinguishable from `False` ("inside threshold").
-            "nav_source": dd_info.get("nav_source"),
-            "nav_mtm": dd_info.get("nav_mtm"),
-            "nav_form": dd_info.get("nav_form"),
-            "nav_deviation_pct": dd_info.get("nav_deviation_pct"),
-            "nav_deviation_exceeded": dd_info.get("nav_deviation_exceeded"),
-            "nav_gate_status": dd_info.get("nav_gate_status"),
-            "tier_status": dd_info.get("tier_status"),
-        })
         save_account_state(args.account_state_file, updated_state)
 
     # 7. Print Dashboard & Export Reports
@@ -2355,6 +2575,7 @@ def main(cli_args: Optional[List[str]] = None):
         gate_headline=gate_headline,
         actions=actions,
         intraday_5m_info=intraday_5m_info,
+        timing=timing,
     )
 
     json_rep, md_rep = generate_reports(
@@ -2371,6 +2592,7 @@ def main(cli_args: Optional[List[str]] = None):
         clock_ctx=clock_ctx,
         freshness_summary=freshness_summary,
         refresh_summary=refresh_summary,
+        timing=timing,
     )
     # (L2.3, design §9) `summary.json` is the shared per-run archive key/value store the
     # web layer merges into; the clock + freshness blocks land there too.
@@ -2379,7 +2601,7 @@ def main(cli_args: Optional[List[str]] = None):
         clock_ctx,
         freshness_summary=freshness_summary,
         probe_attempts=probe_attempts,
-        extra={"date": as_of_date, "stage": "stage1", "gate_code": gate_code},
+        extra={"date": as_of_date, "stage": "stage1", "gate_code": gate_code, **merge_timing_into_summary(timing)},
     )
     print(f"\n[SUCCESS] Reports exported:")
     print(f"  Markdown: {md_rep}")

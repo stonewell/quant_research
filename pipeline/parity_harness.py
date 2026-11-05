@@ -146,6 +146,10 @@ if _REPO_ROOT not in sys.path:
 import pandas as pd  # noqa: E402
 
 from common.allocation_backtester import CASH_PROXY_SYMBOLS, run_allocation_backtest  # noqa: E402
+# (LV2) The ticket-payload shape has ONE owner: `live_trading_ticket.json` is a versioned
+# envelope since 2026-11-03 while every older archive is a bare list, and a reader that
+# pattern-matches on `isinstance(payload, list)` silently sees "no ticket" for one of them.
+from common.live_execution_timing import ticket_order_rows  # noqa: E402
 from common.position_lifecycle import (  # noqa: E402
     AssetLifecycleState,
     BlockingReason,
@@ -530,7 +534,13 @@ def load_archive(
     raw_rows, has_br_column = parse_ticket_csv(run_dir / "live_trading_ticket.csv")
     if not raw_rows:
         json_rows = _load_json(run_dir / "live_trading_ticket.json", default=None)
-        if isinstance(json_rows, list) and json_rows:
+        # (LV2) `live_trading_ticket.json` is a versioned ENVELOPE
+        # (`{"ticket_schema", "execution_session", "price_reference", "orders"}`) since
+        # 2026-11-03 while every older archive holds a bare list. Accept BOTH via the one
+        # owner of that shape -- an `isinstance(payload, list)` test here reads "no ticket"
+        # for every run written after LV2.
+        json_rows = ticket_order_rows(json_rows)
+        if json_rows:
             raw_rows = [r for r in json_rows if isinstance(r, dict)]
             has_br_column = any("blocking_reason" in r for r in raw_rows)
             notes.append("ticket read from live_trading_ticket.json (no CSV)")

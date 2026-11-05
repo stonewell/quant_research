@@ -8,6 +8,7 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Dict
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -28,6 +29,34 @@ from storage import (
     production_guard_active,
     production_path_roots,
 )
+
+
+def _staged_nav_payload(as_of: str, nav: float) -> Dict[str, object]:
+    """A `_write_nav_breakdown`-shaped valuation snapshot for the synthetic e2e tests.
+
+    (LV11) Stage 1 now PRE-STAGES `nav_breakdown.json` before launching the gate child, and
+    Stage 2 refuses to issue a ticket when the gate reports the breaker as `UNKNOWN`
+    (missing != not triggered). Synthetic bars only exist inside the child processes, so the
+    web layer's own mark cannot run here; these tests pin the SNAPSHOT shape instead and let
+    every other step (write path, `--nav-breakdown-file`, gate math, ticket) stay production
+    code. With `nav == portfolio_value` the run is a MEASURED gate with zero deviation, i.e.
+    the pre-LV11 behaviour these tests were written against.
+    """
+    return {
+        "as_of": as_of,
+        "nav_effective": float(nav),
+        "nav_computed": float(nav),
+        "nav_source": "computed",
+        "equity": float(nav),
+        "cash": 0.0,
+        "cash_source": "explicit",
+        "anchor_source": None,
+        "anchors": {},
+        "stale_symbols": [],
+        "dividend_alarms": [],
+        "nav_warnings": [],
+        "per_symbol": {},
+    }
 
 
 @pytest.fixture
@@ -855,13 +884,24 @@ def test_execution_service_synthetic_runs(temp_workspace):
     val_date = "2024-05-10"
 
     # 1. Stage 1 Health Check
-    health_res = service.run_health_check(
-        strategy_file=strategy_file,
-        custom_symbols=custom_symbols,
-        as_of_date=val_date,
-        portfolio_value=100000.0,
-        data_provider="synthetic",
-    )
+    #
+    # (LV11) See `_staged_nav_payload`: the gate must MEASURE (snapshot pre-staged) or Stage 2
+    # refuses to issue a ticket. The two patched seams are only "which book to mark" and "what
+    # the mark is" -- the write path, `--nav-breakdown-file`, gate math and ticket stay real.
+    with patch.object(
+        service.storage,
+        "resolve_seed_holdings",
+        return_value=({"601872.SH": 1000}, "operator_snapshot"),
+    ), patch.object(
+        service, "_resolve_nav", return_value=_staged_nav_payload(val_date, 100000.0)
+    ):
+        health_res = service.run_health_check(
+            strategy_file=strategy_file,
+            custom_symbols=custom_symbols,
+            as_of_date=val_date,
+            portfolio_value=100000.0,
+            data_provider="synthetic",
+        )
     assert health_res["status"] == "success"
     assert health_res["health_report"] is not None
     assert "directive" in health_res["health_report"]
@@ -2052,14 +2092,24 @@ def test_same_day_rerun_idempotency(temp_workspace):
     # -------------------------------------------------------------
     # 1. Stage 1 Health Check - Run 1 (Drawdown triggers Tier 1)
     # -------------------------------------------------------------
-    res1 = service.run_health_check(
-        strategy_file=strategy_file,
-        custom_symbols=custom_symbols,
-        as_of_date=val_date,
-        portfolio_value=88000.0,
-        peak_nav=100000.0,
-        data_provider="synthetic",
-    )
+    # (LV11) The gate must MEASURE: without a pre-staged snapshot Stage 1 fails closed
+    # (`tier_status="UNKNOWN"`, no counter advance), which is the *degraded* path this
+    # idempotency test is not about. See `_staged_nav_payload`.
+    with patch.object(
+        service.storage,
+        "resolve_seed_holdings",
+        return_value=({"601872.SH": 1000}, "operator_snapshot"),
+    ), patch.object(
+        service, "_resolve_nav", return_value=_staged_nav_payload(val_date, 88000.0)
+    ):
+        res1 = service.run_health_check(
+            strategy_file=strategy_file,
+            custom_symbols=custom_symbols,
+            as_of_date=val_date,
+            portfolio_value=88000.0,
+            peak_nav=100000.0,
+            data_provider="synthetic",
+        )
     assert res1["status"] == "success"
     st1 = res1["account_state"]
     assert st1["tier1_consecutive_bars"] == 1
@@ -2069,14 +2119,21 @@ def test_same_day_rerun_idempotency(temp_workspace):
     # -------------------------------------------------------------
     # 2. Stage 1 Health Check - Run 2 (Same day re-run must be idempotent!)
     # -------------------------------------------------------------
-    res2 = service.run_health_check(
-        strategy_file=strategy_file,
-        custom_symbols=custom_symbols,
-        as_of_date=val_date,
-        portfolio_value=88000.0,
-        peak_nav=100000.0,
-        data_provider="synthetic",
-    )
+    with patch.object(
+        service.storage,
+        "resolve_seed_holdings",
+        return_value=({"601872.SH": 1000}, "operator_snapshot"),
+    ), patch.object(
+        service, "_resolve_nav", return_value=_staged_nav_payload(val_date, 88000.0)
+    ):
+        res2 = service.run_health_check(
+            strategy_file=strategy_file,
+            custom_symbols=custom_symbols,
+            as_of_date=val_date,
+            portfolio_value=88000.0,
+            peak_nav=100000.0,
+            data_provider="synthetic",
+        )
     assert res2["status"] == "success"
     st2 = res2["account_state"]
     # tier1_consecutive_bars MUST remain 1, NOT increment to 2!

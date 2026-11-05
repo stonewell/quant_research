@@ -27,6 +27,7 @@ for _sub in ("pipeline", "ml"):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from common.live_execution_timing import ticket_order_rows
 from common.allocation_templates import (
     AllocationTemplate,
     EqualWeightAllocation,
@@ -275,8 +276,15 @@ def test_live_ticket_detail_reason_and_version_structure():
 
         assert os.path.exists(out_ticket_json), "live_trading_ticket.json was not created"
         with open(out_ticket_json, "r", encoding="utf-8") as f:
-            tickets = json.load(f)
+            payload = json.load(f)
 
+        # (LV2) `live_trading_ticket.json` is a versioned envelope
+        # (`{"ticket_schema", "execution_session", "price_reference", "orders"}`); the order
+        # rows live under `orders`. `ticket_order_rows` also accepts the pre-LV2 bare list.
+        assert isinstance(payload, dict) and payload["ticket_schema"]
+        assert payload["execution_session"] == "as_of+1"
+        assert payload["price_reference"] == "next_open"
+        tickets = ticket_order_rows(payload)
         assert isinstance(tickets, list)
         assert len(tickets) > 0
 

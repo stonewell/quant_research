@@ -95,6 +95,12 @@ from common.cli_utils import (
     shared_data_dir,
 )
 from common.financial_api import check_missing_trading_days, get_trading_days_calendar
+from common.live_execution_timing import (
+    build_ticket_payload,
+    merge_timing_into_summary,
+    resolve_execution_timing,
+    write_execution_timing,
+)
 from common.market_clock import (
     MARKET_CHINA,
     MixedMarketUniverseError,
@@ -134,6 +140,50 @@ from scripts.live_preflight import (
     LiveDumpPreflightError,
     verify_live_strategy_dump_preflight,
 )
+
+
+class LiveGateDegradedError(RuntimeError):
+    """(LV11 item 6) Stage 1's gate NAV was unavailable, so NO ticket may be produced.
+
+    The circuit breaker is what authorises risk on this account, and it needs a marked-to-market
+    NAV. When Stage 1 could not measure one it records `tier_status="UNKNOWN"` /
+    `nav_gate_status="DEGRADED_NAV_UNAVAILABLE"` (and, since LV11, persists
+    `circuit_breaker_tier="UNKNOWN"` rather than the placeholder's "NORMAL"). Until now Stage 2
+    read ONLY `circuit_breaker_tier` and would have carried on ordering: "report UNKNOWN /
+    archive NORMAL / orders issued" could all be true at once.
+
+    Missing is NOT "not triggered" (same rule as the 10-day NAV recovery leg and §2.19 D11
+    item 4), so this refuses instead of assuming the breaker passed. The operator's remedy is
+    to restore/stage `nav_breakdown.json` and re-run Stage 1 -- never to widen the gate.
+    """
+
+
+#: (LV11) The ONE documented way to proceed on a degraded gate: an explicit operator
+#: acknowledgement, never a default and never inferred.
+#:
+#: WHY IT HAS TO EXIST. Stage 1 takes no holdings/cash input, so on the very first round of a
+#: brand-new account there is nothing in the archive to mark (`resolve_seed_holdings` ->
+#: `("none")`) and the gate legitimately cannot be evaluated. Without an escape that state
+#: would be a bootstrap deadlock: no gate -> refuse to order -> the archive never gains the
+#: snapshot the next gate would need. The web layer sets this variable ONLY for the run whose
+#: operator checked "人工覆盖净值" (`nav_override=True`, i.e. "I assert the NAV by hand")
+#: -- the same assertion that already authorises an unmarkable book in `_resolve_nav`.
+#:
+#: It does NOT make the degradation invisible: the archive still carries
+#: `circuit_breaker_tier="UNKNOWN"` / `tier_status="UNKNOWN"`, and this run additionally
+#: records `gate_degraded_acknowledged=True` in `summary.json`, so "orders were issued on an
+#: unevaluated breaker, knowingly" is machine-readable rather than silent.
+ALLOW_DEGRADED_GATE_ENV = "LIVETRADING_ALLOW_DEGRADED_GATE"
+
+
+def degraded_gate_acknowledged() -> bool:
+    """True only when the operator explicitly acknowledged an unevaluated breaker."""
+    return str(os.environ.get(ALLOW_DEGRADED_GATE_ENV, "")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 # (2026-10-22 incident, Fix 2) Freshness policy -- bar-date-vs-expected-session
@@ -1776,6 +1826,13 @@ def main(cli_args: Optional[List[str]] = None):
     # behaviour is unchanged.
     run_mode = resolve_run_mode(clock_ctx)
     announce_run_mode(clock_ctx, run_mode)
+    # (LV2) Resolve the execution-timing block from the SAME clock context the window gate
+    # used. The two enums are frozen (`as_of+1` / `next_open`, 2026-11-03 user ruling): an
+    # in-window intraday run still values on the last CLOSED session, so it is never a
+    # same-session execution. What varies is only the header provenance / gap hint.
+    timing = resolve_execution_timing(clock_ctx, as_of=clock_ctx.as_of_date, run_mode=run_mode)
+    print(f"[EXECUTION TIMING] {timing['header_text']}")
+    print(f"[EXECUTION TIMING] {timing['overnight_gap_hint']}")
     if getattr(args, "start_date", None):
         start_date = args.start_date
     else:
@@ -1975,7 +2032,20 @@ def main(cli_args: Optional[List[str]] = None):
         clock_ctx,
         freshness_summary=freshness_summary,
         probe_attempts=probe_attempts,
-        extra={"date": as_of_date, "stage": "stage2", "run_mode": run_mode},
+        extra={
+            "date": as_of_date,
+            "stage": "stage2",
+            "run_mode": run_mode,
+            **merge_timing_into_summary(timing),
+            # (LV11) Only present when the operator explicitly acknowledged an unevaluated
+            # breaker; recorded here so the permission is auditable next to the ticket rather
+            # than living only in the server's console scrollback.
+            **(
+                {"gate_degraded_acknowledged": True, "gate_degraded_ack_env": ALLOW_DEGRADED_GATE_ENV}
+                if degraded_gate_acknowledged()
+                else {}
+            ),
+        },
     )
 
     enable_intraday_5m = getattr(args, "enable_intraday_5m", False) or bool(
@@ -2116,6 +2186,48 @@ def main(cli_args: Optional[List[str]] = None):
 
     # Check circuit breaker from account_state or health_report
     circuit_tier = account_state.get("circuit_breaker_tier") or health_report.get("circuit_breaker_tier")
+    # (LV11 item 6) FAIL CLOSED on a degraded gate NAV, BEFORE any order math below.
+    # `circuit_tier` alone cannot express this: the Stage-1 report/JSON carries the
+    # degradation in `tier_status` / `nav_gate_status`, and pre-LV11 the persisted
+    # `circuit_breaker_tier` was the *placeholder's* "NORMAL" even while the report said
+    # UNKNOWN. Both spellings are checked here so a run against EITHER vintage of archive
+    # refuses: an unevaluated breaker is not a passing breaker, and "missing != not
+    # triggered" is the rule the 10-day NAV recovery leg already follows.
+    _tier_status = account_state.get("tier_status") or health_report.get("tier_status")
+    _nav_gate_status = account_state.get("nav_gate_status") or health_report.get("nav_gate_status")
+    if (
+        str(_tier_status or "").upper() == "UNKNOWN"
+        or str(_nav_gate_status or "").upper() == "DEGRADED_NAV_UNAVAILABLE"
+        or str(circuit_tier or "").upper() == "UNKNOWN"
+    ):
+        _degraded_detail = (
+            f"tier_status={_tier_status!r} nav_gate_status={_nav_gate_status!r} "
+            f"circuit_breaker_tier={circuit_tier!r} "
+            f"nav_source={account_state.get('nav_source') or health_report.get('nav_source')!r} "
+            f"nav_mtm={account_state.get('nav_mtm') or health_report.get('nav_mtm')!r}"
+        )
+        if not degraded_gate_acknowledged():
+            raise LiveGateDegradedError(
+                "\n" + "!" * 110
+                + "\n[REFUSED / 拒绝出票] Stage 1 门禁净值不可用：本次回撤/熔断判定为 UNKNOWN，"
+                "\n**不是**「未触发」。缺失 ≠ 未触发 —— 在未取得盯市净值前不得生成任何工单。"
+                f"\n  {_degraded_detail}"
+                "\n处置: 恢复/预置 nav_breakdown.json 后重跑 Stage 1（web 启动器会在拉起 Stage 1 前"
+                "预置估值快照），切勿放宽门禁或用表单值替代盯市净值。"
+                "\n唯一例外: 操作员已人工裁定净值（表单勾选「人工覆盖净值」）时，"
+                f"{ALLOW_DEGRADED_GATE_ENV}=1 会记录该次知情承担并继续。"
+                + "\n" + "!" * 110
+            )
+        # Acknowledged: proceed, but NEVER quietly -- the archive records the acknowledgement
+        # (`gate_degraded_acknowledged` in `summary.json`) on top of Stage 1's own
+        # `circuit_breaker_tier="UNKNOWN"`, so an auditor can see the breaker was unevaluated.
+        print("\n" + "!" * 110)
+        print(
+            "[WARN] (LV11) 操作员已显式确认在**门禁净值不可用**的前提下继续出票 "
+            f"({ALLOW_DEGRADED_GATE_ENV}=1)。熔断档位仍为 UNKNOWN —— 这不是「已评估且未触发」。"
+        )
+        print(f"       {_degraded_detail}")
+        print("!" * 110 + "\n")
     freeze_rem = int(account_state.get("freeze_remaining_bars", health_report.get("freeze_remaining_bars", 0)))
     gate_code = account_state.get("gate_code") or health_report.get("gate_code")
     is_recovering = (gate_code == "CAUTION_RECOVERING" or circuit_tier == "CAUTION_RECOVERING")
@@ -3379,9 +3491,19 @@ def main(cli_args: Optional[List[str]] = None):
     out_csv = os.path.join(args.output_dir, "live_trading_ticket.csv")
     order_df.to_csv(out_csv, index=False)
     out_json = os.path.join(args.output_dir, "live_trading_ticket.json")
+    # (LV2) The ticket is written as the versioned ENVELOPE carrying `execution_session` /
+    # `price_reference` next to the order rows. Built OUTSIDE the try/except on purpose: a
+    # timing block that is missing or out of domain must ABORT generation (no defaulting),
+    # whereas an I/O failure stays the pre-existing warning. Readers must use
+    # `common.live_execution_timing.ticket_order_rows` -- every archived ticket is still a
+    # bare list, and a reader that assumes one shape silently sees "no ticket" for the other.
+    ticket_payload = build_ticket_payload(order_df.to_dict(orient="records"), timing)
     try:
         with open(out_json, "w", encoding="utf-8") as f:
-            json.dump(order_df.to_dict(orient="records"), f, indent=2, ensure_ascii=False)
+            json.dump(ticket_payload, f, indent=2, ensure_ascii=False)
+        # Beside the ticket and merged into summary.json, so a consumer that only knows the
+        # pre-LV2 list shape still has a machine-readable place to read the timing from.
+        write_execution_timing(args.output_dir, timing)
     except Exception as e:
         print(f"[WARN] Failed to write live_trading_ticket.json: {e}")
     print("\n" + "=" * 110)

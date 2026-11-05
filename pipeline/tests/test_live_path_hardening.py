@@ -41,6 +41,7 @@ import pandas as pd
 import pytest
 
 from common.data import SyntheticDataProvider
+from common.live_execution_timing import ticket_order_rows
 from common.freshness import StalePriceError, is_stale_bar, last_bar_session, latest_close
 
 
@@ -1398,7 +1399,10 @@ def test_market_closed_run_tickets_frozen_rows_without_anchoring_cooldown(
     assert list(csv_df.columns)[-1] == "blocking_reason"
     assert set(csv_df[csv_df["symbol"] != "BIL"]["blocking_reason"]) == {"MARKET_CLOSED_FREEZE"}
     with open(tmp_path / "live_trading_ticket.json") as f:
-        records = json.load(f)
+        # (LV2) the ticket is a versioned envelope; `ticket_order_rows` also accepts the
+        # pre-LV2 bare list, which is what every older archive holds.
+        records = ticket_order_rows(json.load(f))
+    assert records
     assert all("blocking_reason" in rec for rec in records)
 
 

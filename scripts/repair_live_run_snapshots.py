@@ -140,6 +140,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+# (LV2) One owner of the ticket-payload shape; see `load_run_ticket`.
+from common.live_execution_timing import ticket_order_rows  # noqa: E402
+
 SCRIPT_VERSION = "1.2.0"
 
 DEFAULT_RUNS_ROOT = (
@@ -1206,8 +1209,9 @@ def cash_at_run_start(
         if not tpath.exists():
             continue
         raw, _ = read_source_bytes(tpath)
-        ticket = json.loads(raw.decode("utf-8"))
-        if not isinstance(ticket, list):
+        # (LV2) envelope OR bare list -- see `load_run_ticket`.
+        ticket = list(ticket_order_rows(json.loads(raw.decode("utf-8"))))
+        if not ticket:
             continue
         proceeds = sell_proceeds(ticket)
         steps.append({"from_run": other, "sell_proceeds": round(proceeds, 2),
@@ -1650,7 +1654,12 @@ def ticket_to_csv(rows: Sequence[Mapping[str, Any]]) -> bytes:
 def load_run_ticket(run_dir: Path) -> List[Dict[str, Any]]:
     raw, _ = read_source_bytes(run_dir / "live_trading_ticket.json")
     data = json.loads(raw.decode("utf-8"))
-    return data if isinstance(data, list) else []
+    # (LV2) `live_trading_ticket.json` became a versioned ENVELOPE
+    # (`{"ticket_schema", "execution_session", "price_reference", "orders"}`) on 2026-11-03;
+    # every archive repaired so far is a bare list. `ticket_order_rows` accepts BOTH -- a bare
+    # `isinstance(data, list)` test would read "no ticket" (and therefore "no prices, no
+    # proceeds") for every run written after LV2, silently, in a repair tool.
+    return list(ticket_order_rows(data))
 
 
 def prices_from_ticket(ticket: Sequence[Mapping[str, Any]], run_label: str) -> Dict[str, Tuple[str, float]]:

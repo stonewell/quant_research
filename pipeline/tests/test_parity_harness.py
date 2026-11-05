@@ -290,6 +290,42 @@ def test_legacy_archive_without_blocking_reason_column():
     assert all(r.status != ph.STATUS_ALIGNED for r in report.rows)
 
 
+def test_ticket_json_fallback_reads_both_the_envelope_and_the_bare_list(tmp_path):
+    """(LV2) The no-CSV fallback must read the ticket ENVELOPE, not only a bare list.
+
+    `live_trading_ticket.json` is `{"ticket_schema", "execution_session",
+    "price_reference", "orders"}` since 2026-11-03, while every older archive is a bare
+    list. An `isinstance(payload, list)` guard here would silently turn a perfectly good
+    post-LV2 archive into "no ticket rows -- nothing to compare".
+    """
+    run = _copy(tmp_path, ALIGNED)
+    csv_rows, _ = _read_csv(run / "live_trading_ticket.csv")
+    (run / "live_trading_ticket.csv").unlink()
+
+    # (a) the pre-LV2 shape still works ...
+    (run / "live_trading_ticket.json").write_text(
+        json.dumps(csv_rows, ensure_ascii=False), encoding="utf-8"
+    )
+    legacy = ph.load_archive(run, env={})
+    assert any("ticket read from live_trading_ticket.json" in n for n in legacy.notes)
+    assert set(legacy.ticket) == {r["symbol"].strip().upper() for r in csv_rows}
+
+    # (b) ... and so does the LV2 envelope, with the same rows.
+    envelope = {
+        "ticket_schema": "live_trading_ticket/v2",
+        "execution_session": "as_of+1",
+        "price_reference": "next_open",
+        "as_of": "2026-10-22",
+        "execution_date": "2026-10-23",
+        "orders": csv_rows,
+    }
+    (run / "live_trading_ticket.json").write_text(
+        json.dumps(envelope, ensure_ascii=False), encoding="utf-8"
+    )
+    enveloped = ph.load_archive(run, env={})
+    assert set(enveloped.ticket) == set(legacy.ticket)
+
+
 # --------------------------------------------------------------------------- #
 # 4. the systematic live-vs-engine divergence this harness found
 # --------------------------------------------------------------------------- #
