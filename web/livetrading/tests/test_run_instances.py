@@ -16,7 +16,9 @@ that session gets ``<date>/<HHMMSS>/``. This file pins:
 
 1. **allocation** -- first-run-flat, later-run-instance, same-second idempotency,
    collision handling that keeps the name matchable, and the grey-release switch;
-2. **selection** -- newest instance picked LEXICOGRAPHICALLY (never by mtime);
+2. **selection** -- newest instance picked by its OWN declared write time (``summary.json``
+   ``timestamp``), with the ``HHMMSS`` name as the fallback/tiebreak and NEVER mtime -- the
+   name carries no date, so a later-day re-run against the same date can sort LOWEST;
 3. **readers** -- ``get_run`` / ``get_holdings`` / ``get_account_state`` walk a
    session's instances newest-first, and legacy flat archives are unaffected;
 4. **de-merge** -- a round's summary cannot inherit another round's fields;
@@ -37,6 +39,7 @@ otherwise land in the same second and -- by design -- share one directory.
 import datetime as dt
 import json
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
@@ -232,10 +235,15 @@ def test_grey_release_switch_collapses_back_to_the_flat_directory(tmp_path, monk
 
 
 # --------------------------------------------------------------------------- #
-# 2. Selection: newest instance, lexicographic, mtime never consulted
+# 2. Selection: newest instance by declared write time, `HHMMSS` fallback, never mtime
 # --------------------------------------------------------------------------- #
 def test_resolve_latest_instance_dir_picks_the_max_stamp_and_ignores_mtime(tmp_path):
-    """A restored/copied archive can carry arbitrary mtimes; the name is the total order."""
+    """Summary-less instances fall back to the name; the name is then the total order.
+
+    ``2026-10-29`` predates per-run ``timestamp``-primary resolution (the instances here
+    deliberately carry NO ``summary.json``), so the documented fallback applies: the
+    lexicographically largest ``HHMMSS`` wins -- and still never mtime.
+    """
     base = tmp_path / "2026-10-29"
     os.makedirs(str(base))
     _write_json(str(base / "summary.json"), {"date": "2026-10-29"})
@@ -278,6 +286,236 @@ def test_flat_only_archive_resolves_to_itself(tmp_path):
 
     assert list_instances_for_date(str(base)) == []
     assert resolve_latest_instance_dir(str(base)) == str(base)
+
+
+def _make_1103_rerun_tree(date_dir):
+    """The real 2026-11-03 archive shape: a later-day re-run with the SMALLER name.
+
+    ``205541/`` is the complete SUCCESSFUL round, but it was written on 2026-11-04; the
+    ``210229/`` round is the earlier aborted-at-the-Stage-1-clock-gate attempt (summary
+    only, no ticket, no ``nav_breakdown.json``).  ``"210229" > "205541"``, so name-only
+    ordering served the empty aborted round and hid the real deploy.
+    """
+    os.makedirs(str(date_dir / "205541"))
+    os.makedirs(str(date_dir / "210229"))
+    _write_json(
+        str(date_dir / "205541" / "summary.json"),
+        {
+            "timestamp": "2026-11-04T04:58:18.344872+00:00",
+            "deploy_status": "SUCCESS",
+            "trades_count": 1,
+        },
+    )
+    _write_json(
+        str(date_dir / "210229" / "summary.json"),
+        {"timestamp": "2026-11-03T05:02:29.594930+00:00", "deploy_status": "FAILED"},
+    )
+    return date_dir
+
+
+def test_resolve_latest_instance_dir_prefers_the_newer_summary_timestamp(tmp_path):
+    """REGRESSION (2026-11-03 archive): the newest attempt has the LEXICOGRAPHICALLY LOWEST name.
+
+    The instance directory name is a bare ``HHMMSS`` with no date, so a re-execution on a
+    later day against the same ``as_of`` date lands on a smaller name.  Resolution must
+    order on ``summary.json``'s ``timestamp``, else the UI shows the empty aborted instance
+    and hides the successful deploy.
+
+    The ``210229`` directory AND its ``summary.json`` are also given mtimes far in the
+    future, which proves mtime is still never consulted: a restored archive carries
+    arbitrary mtimes.
+    """
+    base = _make_1103_rerun_tree(tmp_path / "2026-11-03")
+    far_future = 2_000_000_000
+    os.utime(str(base / "210229"), (far_future, far_future))
+    os.utime(str(base / "210229" / "summary.json"), (far_future, far_future))
+
+    assert resolve_latest_instance_dir(str(base)) == str(base / "205541")
+
+
+def test_resolve_latest_instance_dir_falls_back_to_the_stamp_without_a_summary(tmp_path):
+    """Legacy/summary-less instances keep the old name order (no timestamp to order on)."""
+    base = tmp_path / "2026-10-29"
+    os.makedirs(str(base / "091500"))
+    os.makedirs(str(base / "123000"))
+    os.utime(str(base / "091500"), (2_000_000_000, 2_000_000_000))
+
+    assert resolve_latest_instance_dir(str(base)) == str(base / "123000")
+
+
+def test_resolve_latest_instance_dir_falls_back_when_the_summary_is_unparseable(tmp_path):
+    """A corrupt/half-written ``summary.json`` must degrade to the ``HHMMSS`` key, not raise.
+
+    None of these three instances yields a usable timestamp (truncated JSON, no file at
+    all, non-string value), so the fallback -- lexicographic name, the legacy rule --
+    decides and the newest name wins.
+    """
+    base = tmp_path / "2026-11-03"
+    for stamp in ("091500", "205541", "210229"):
+        os.makedirs(str(base / stamp))
+    with open(str(base / "091500" / "summary.json"), "w", encoding="utf-8") as fh:
+        fh.write('{"timestamp": ["not", "a", "string"]}')
+    with open(str(base / "210229" / "summary.json"), "w", encoding="utf-8") as fh:
+        fh.write("{ this is not json")
+    # 205541 deliberately has no summary.json at all.
+
+    assert resolve_latest_instance_dir(str(base)) == str(base / "210229")
+
+
+def test_list_runs_latest_only_keeps_the_newest_attempt_of_each_date(temp_workspace):
+    """The history dropdown must not dedupe by ``HHMMSS`` either -- same helper, same answer."""
+    storage, _ = temp_workspace
+    _make_run(
+        storage, "s1", "u1", "2026-11-03",
+        instance="210229",
+        summary={
+            "timestamp": "2026-11-03T05:02:29.594930+00:00",
+            "deploy_status": "FAILED",
+        },
+    )
+    _make_run(
+        storage, "s1", "u1", "2026-11-03",
+        instance="205541",
+        summary={
+            "timestamp": "2026-11-04T04:58:18.344872+00:00",
+            "deploy_status": "SUCCESS",
+        },
+    )
+
+    everything = storage.list_runs(strategy_key="s1", universe_key="u1", require_both=True)
+    assert [r["instance"] for r in everything] == ["205541", "210229"]
+
+    latest = storage.list_runs(
+        strategy_key="s1", universe_key="u1", require_both=True, latest_only=True
+    )
+    assert len(latest) == 1, "exactly one entry per date"
+    assert latest[0]["instance"] == "205541"
+    assert latest[0]["date"] == "2026-11-03"
+
+
+# --------------------------------------------------------------------------- #
+# 2b. `list_instances_for_date` owns the order every "newest-first" walk inherits
+# --------------------------------------------------------------------------- #
+def _make_1103_asymmetric_tree(date_dir):
+    """11-03 shape, but ONLY the newer (smaller-named) instance carries a book/state.
+
+    Mirrors the real archive: ``210229/`` aborted at the Stage-1 clock gate and wrote nothing
+    but ``summary.json``; ``205541/`` is the round that actually holds the book and the
+    account state.
+    """
+    _make_1103_rerun_tree(date_dir)
+    _write_json(str(date_dir / "205541" / "holdings.json"), {"600584.SH": 300})
+    _write_json(
+        str(date_dir / "205541" / "account_state.json"),
+        {"cash": 12345.75, "lifecycle_states": {"600584.SH": "HELD"}},
+    )
+    return date_dir
+
+
+def _archive_tree(storage, date="2026-11-03"):
+    return _make_1103_asymmetric_tree(
+        pathlib.Path(storage.archive_dir) / "s1" / "u1" / date
+    )
+
+
+def test_list_instances_for_date_orders_instances_by_write_time_not_name(tmp_path):
+    """The shared order is write-time ascending: the LATER round is LAST, despite its name.
+
+    Every consumer below walks this list ``reversed(...)`` to mean "newest first", so this
+    single list is what decides which instance they read.
+    """
+    base = _make_1103_rerun_tree(tmp_path / "2026-11-03")
+
+    ordered = list_instances_for_date(str(base))
+
+    assert ordered == [str(base / "210229"), str(base / "205541")], "ascending write time"
+    assert ordered != [str(base / "205541"), str(base / "210229")], "not name order"
+
+
+def test_holdings_and_account_state_come_from_the_newest_WRITTEN_instance(temp_workspace):
+    """`get_holdings` / `get_account_state` must not read the empty aborted instance.
+
+    Only ``205541`` owns ``holdings.json`` / ``account_state.json``.  Under name order the
+    ``reversed(...)`` walk tried ``210229`` first, found nothing there, and (before the
+    D8-style walks existed) could resolve an EMPTY book/state -- i.e. the display path saw
+    the aborted round instead of the real one.
+    """
+    storage, _ = temp_workspace
+    _archive_tree(storage)
+
+    book = storage.get_holdings("2026-11-03", strategy_key="s1", universe_key="u1")
+    state = storage.get_account_state("2026-11-03", strategy_key="s1", universe_key="u1")
+
+    assert book == {"600584.SH": 300}, "the book of 205541, never the empty aborted round"
+    assert state["cash"] == 12345.75
+    assert state["lifecycle_states"] == {"600584.SH": "HELD"}
+
+
+def test_resolve_seed_holdings_seeds_from_the_newest_WRITTEN_instance(temp_workspace):
+    """LIVE-TRADING CONSEQUENCE: the seed book decides the next deploy's orders.
+
+    A name-ordered seed walks ``210229`` (the aborted round, no book, no Stage-2 artifact)
+    first -- and because a dir WITHOUT a Stage-2 artifact may legitimately contribute its
+    snapshot, an archive that actually held a snapshot there would seed the next deploy off
+    the wrong round; here it would simply miss the only real book and fall through to a
+    previous day (or ``None``, which refuses the deploy).  Either way a name-ordered walk
+    cannot see ``205541`` first, so the seed must come from the write-time ordering.
+    """
+    storage, _ = temp_workspace
+    _archive_tree(storage)
+
+    book, source = storage.resolve_seed_holdings(
+        "2026-11-03", strategy_key="s1", universe_key="u1"
+    )
+
+    assert book == {"600584.SH": 300}
+    assert source == "operator_snapshot"
+
+
+def test_a_name_ordered_walk_would_seed_from_the_aborted_rounds_empty_record(temp_workspace):
+    """FALSIFIABLE twin of the two tests above: give the aborted round an EMPTY record.
+
+    The strict archive shape has nothing but ``summary.json`` in ``210229/``, and a walk
+    simply skips it.  The dangerous variant is an aborted round that DID leave a record --
+    ``holdings.json == {}`` (a "confirmed all-cash" book) and a zeroed
+    ``account_state.json``.  Under name order the newest-first walk hits ``210229`` first,
+    and ``{}`` is ``not None``: the display book goes empty and `resolve_seed_holdings`
+    returns ``({}, "operator_snapshot")`` -- a CONFIRMED all-cash seed, i.e. the next live
+    deploy would re-buy every lot the real round already holds.  Write-time ordering must
+    reach ``205541`` first and return its book.
+    """
+    storage, _ = temp_workspace
+    base = _archive_tree(storage)
+    _write_json(str(base / "210229" / "holdings.json"), {})
+    _write_json(
+        str(base / "210229" / "account_state.json"),
+        {"cash": 0.0, "lifecycle_states": {}},
+    )
+
+    # Direct check on the ordering every consumer inherits.
+    assert list_instances_for_date(str(base))[-1] == str(base / "205541")
+
+    # The deploy path (`resolve_seed_holdings`) and the display paths must all agree.
+    book, source = storage.resolve_seed_holdings(
+        "2026-11-03", strategy_key="s1", universe_key="u1"
+    )
+    assert book == {"600584.SH": 300}, "never the aborted round's empty book"
+    assert source == "operator_snapshot"
+    assert storage.get_holdings("2026-11-03", "s1", "u1") == {"600584.SH": 300}
+    assert storage.get_account_state("2026-11-03", "s1", "u1")["cash"] == 12345.75
+
+
+def test_list_instances_for_date_keeps_name_order_without_any_summary(tmp_path):
+    """Legacy archives (no per-instance ``summary.json``) keep the pure ``HHMMSS`` order."""
+    base = tmp_path / "2026-10-29"
+    for stamp in ("091500", "123000", "210229"):
+        os.makedirs(str(base / stamp))
+
+    assert list_instances_for_date(str(base)) == [
+        str(base / "091500"),
+        str(base / "123000"),
+        str(base / "210229"),
+    ]
 
 
 # --------------------------------------------------------------------------- #

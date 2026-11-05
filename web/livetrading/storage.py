@@ -1043,8 +1043,12 @@ def _first_defined(*candidates: Tuple[str, Any]) -> Tuple[Any, str]:
 #       `summary.json` from an EMPTY dict (no cross-run inheritance at all).
 #   Existing flat directories are NEVER migrated or renamed: readers must support both.
 #
-#   Selection is LEXICOGRAPHIC, never mtime: an archive copied/restored from a backup can
-#   have arbitrary mtimes, and a `HHMMSS` name is already a total order within a day.
+#   Selection is by the instance's OWN declared write time, never mtime: `_instance_sort_key`
+#   orders on `summary.json`'s `timestamp` first (the `HHMMSS` name carries no DATE, so a
+#   later-day re-execution against the same `as_of` date can be lexicographically smaller
+#   than the round it supersedes), falling back to the `HHMMSS` name for a summary-less
+#   instance and using it as the deterministic tiebreak.  Never mtime: an archive
+#   copied/restored from a backup can have arbitrary mtimes.
 _INSTANCE_DIR_RE = re.compile(r"^\d{6}$")
 _RUN_INSTANCE_SPLIT_ENV = "LIVETRADING_RUN_INSTANCE_SPLIT"
 #: D8 (2026-10-29): prefer a real `<date>/<HHMMSS>/` instance's state over a flat
@@ -1102,6 +1106,20 @@ def list_instances_for_date(date_dir: Optional[str]) -> List[str]:
     the chronological FIRST instance of that session (see the layout rule above).  A
     directory that only CONTAINERS instances (`is_run_dir` false) is not included, so a
     reader can never mistake a bare container for a run.  Never consults mtime.
+
+    (2026-11-04) The `HHMMSS` instances are ordered by `_instance_sort_key` -- the same
+    helper as `resolve_latest_instance_dir` / `list_runs`: `summary.json`'s `timestamp`
+    first, the directory name as fallback and tiebreak.  The name alone is NOT a
+    chronological order: it carries no date, so a later-day re-execution against the same
+    `as_of` date gets a lexicographically SMALLER name (real case: `205541/` written
+    2026-11-04 supersedes `210229/` written 2026-11-03, yet sorts below it).  Every
+    consumer of this function walks it `reversed(...)`, i.e. "newest first", so before this
+    change a name-ordered walk handed them the empty aborted instance first.
+
+    The flat dir deliberately stays UNCONDITIONALLY first (i.e. last after `reversed`),
+    not key-ordered: that ordering is a contract of the layout rule ("the flat dir IS the
+    session's first run"), and it is what keeps a D8 Stage-1-only seed in the LAST-resort
+    position even if its `summary.json` carries a later timestamp than a real instance.
     """
     if not date_dir or not os.path.isdir(date_dir):
         return []
@@ -1109,11 +1127,12 @@ def list_instances_for_date(date_dir: Optional[str]) -> List[str]:
         names = os.listdir(date_dir)
     except OSError:
         return []
-    instances = sorted(
+    instances = [
         name
         for name in names
         if is_instance_dir_name(name) and os.path.isdir(os.path.join(date_dir, name))
-    )
+    ]
+    instances.sort(key=lambda name: _instance_sort_key(os.path.join(date_dir, name)))
     out: List[str] = []
     if is_run_dir(date_dir):
         out.append(date_dir)
@@ -1169,27 +1188,74 @@ def instance_subdirs(date_dir: Optional[str]) -> List[str]:
     )
 
 
-def resolve_latest_instance_dir(date_dir: Optional[str]) -> Optional[str]:
-    """Newest run dir of a dated directory: max `^\\d{6}$` subdir, else the flat dir.
+def _read_instance_timestamp(run_dir: Optional[str]) -> str:
+    """`summary.json`'s `timestamp` for one run dir, or `""` when it cannot be read.
 
-    Lexicographic order ONLY -- mtime is never read (a restored archive would otherwise
-    reorder the chain).  Returns `date_dir` unchanged when the directory does not exist or
-    carries no instance subdirectory, which is exactly the pre-L2.62 flat layout.
+    Defensive by contract: a missing/unreadable/malformed summary, a non-dict payload, or a
+    non-string `timestamp` all degrade to `""`, so a listing/render path can never blow up
+    on a half-written archive entry.  The value is an ISO-8601 UTC string, which is why a
+    plain string comparison is chronological.
+    """
+    if not run_dir:
+        return ""
+    try:
+        with open(os.path.join(str(run_dir), "summary.json"), "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    stamp = payload.get("timestamp")
+    return stamp.strip() if isinstance(stamp, str) else ""
+
+
+def _instance_sort_key(run_dir: Optional[str]) -> Tuple[str, str, str]:
+    """Ordering key for one run dir: declared write time first, `HHMMSS` name second.
+
+    Shape `(timestamp, hhmmss, basename)`:
+
+    1. **`timestamp`** -- the instance's own `summary.json` `timestamp` (ISO-8601 UTC, so
+       lexicographic == chronological).  This is the PRIMARY key because the directory
+       name carries no date: a later-day re-execution against the same `as_of` date gets a
+       lexicographically SMALLER `HHMMSS` than the earlier round it supersedes (real case:
+       `205541/` written 2026-11-04 vs `210229/` written 2026-11-03), so name-only ordering
+       served the empty aborted round and hid the real deploy.
+    2. **`hhmmss`** -- the directory basename when it matches `^\\d{6}$`, else `""`.  This
+       is the FALLBACK for a summary-less/legacy instance (which gets `timestamp == ""` and
+       therefore ranks below any instance that declares a time), and the deterministic
+       tiebreak between instances that share one timestamp.
+    3. **`basename`** -- raw directory name, so the key stays a total order even for names
+       that are not `HHMMSS` stamps.
+
+    mtime is NEVER consulted (a restored archive has arbitrary mtimes).  The two call
+    sites -- `resolve_latest_instance_dir` and `StorageManager.list_runs` -- both go
+    through this helper so their "latest" can never drift apart.
+    """
+    path = str(run_dir or "")
+    name = os.path.basename(os.path.normpath(path)) if path else ""
+    stamp = name if is_instance_dir_name(name) else ""
+    return (_read_instance_timestamp(path), stamp, name)
+
+
+def resolve_latest_instance_dir(date_dir: Optional[str]) -> Optional[str]:
+    """Newest run dir of a dated directory: max instance subdir, else the flat dir.
+
+    "Newest" is the instance's own `summary.json` `timestamp`, with the `HHMMSS` directory
+    name as the fallback for a summary-less (legacy/partially-written) instance and as the
+    tiebreak -- see `_instance_sort_key`.  mtime is never read (a restored archive would
+    otherwise reorder the chain).  Returns `date_dir` unchanged when the directory does not
+    exist or carries no instance subdirectory, which is exactly the pre-L2.62 flat layout.
     """
     if not date_dir or not os.path.isdir(date_dir):
         return date_dir
-    try:
-        names = os.listdir(date_dir)
-    except OSError:
-        return date_dir
-    instances = sorted(
-        name
-        for name in names
-        if is_instance_dir_name(name) and os.path.isdir(os.path.join(date_dir, name))
-    )
+    instances = instance_subdirs(date_dir)
     if not instances:
         return date_dir
-    return os.path.join(date_dir, instances[-1])
+    newest = max(
+        instances,
+        key=lambda name: _instance_sort_key(os.path.join(date_dir, name)),
+    )
+    return os.path.join(date_dir, newest)
 
 
 def _advance_hhmmss(stamp: str, seconds: int = 1) -> str:
@@ -2957,11 +3023,13 @@ class StorageManager:
 
         (L2.62) A session may now own several instance dirs (`<date>/`, `<date>/090000/`,
         `<date>/130000/`).  EACH is its own entry with an `instance` field (`"090000"`, or
-        `""` for the flat/first layout), sorted `date desc, instance desc` -- lexicographic,
-        never mtime.  `latest_only=True` collapses that back to one entry per
-        `(date, strategy, universe)` (the newest), which is what the UI's history dropdown
-        asks for; the default still returns every instance, so nothing is hidden from the
-        API.
+        `""` for the flat/first layout), sorted `date desc, write-time desc` -- the
+        instance's own `summary.json` `timestamp` first, `HHMMSS` name as the fallback and
+        tiebreak (`_instance_sort_key`), never mtime.  `latest_only=True` collapses that
+        back to one entry per `(date, strategy, universe)` (the newest attempt of that
+        order -- deliberately NOT "the newest SUCCESS", so a failing latest round stays
+        visible as failed), which is what the UI's history dropdown asks for; the default
+        still returns every instance, so nothing is hidden from the API.
 
         D8 (2026-10-29 incident): a flat `<date>/` directory that holds ONLY Stage 1's
         `summary.json` / `account_state.json` is a SEED, not a round -- and it used to be
@@ -3121,10 +3189,16 @@ class StorageManager:
                     "universe": summary_rep.get("universe_file", ""),
                 })
 
-        # Sort by date descending, then instance descending (L2.62). `timestamp` stays the
-        # third key so same-date/same-instance ties (legacy duplicates) keep the old order.
+        # (2026-11-04) Order by the run's OWN declared write time, not by its `HHMMSS`
+        # name: the name has no DATE component, so a later-day re-execution against the
+        # same `as_of` date can be lexicographically SMALLER (`205541/` written
+        # 2026-11-04 vs the superseded `210229/` written 2026-11-03) -- name-first
+        # ordering displayed the empty aborted round and hid the real deploy.
+        # Same helper as `resolve_latest_instance_dir` so the two "latest" answers cannot
+        # drift: `(date, timestamp, instance, basename)` descending; `latest_only` keeps
+        # the FIRST entry of that order.
         runs.sort(
-            key=lambda x: (x.get("date", ""), x.get("instance", ""), x.get("timestamp", "")),
+            key=lambda x: (x.get("date", ""),) + _instance_sort_key(x.get("path", "")),
             reverse=True,
         )
         if latest_only:
