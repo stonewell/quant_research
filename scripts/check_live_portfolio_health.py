@@ -1393,14 +1393,119 @@ def evaluate_realized_volatility(
     }
 
 
+# ---------------------------------------------------------------------------
+# DELIVERED SINGLE-STOCK CAP -- MEASURED & DISCLOSED, CLAMPED ONLY ON DEMAND.
+#
+# (2026-11-04 post-run audit) The 20% single-name ceiling is applied to the
+# DELIVERED quantity by Stage 2 (`apply_market_value_cap` in
+# `scripts/run_live_strategy.py`): that function ALWAYS measures
+# `target_shares * price / portfolio_value` per leg and records the verdict in
+# `detail_reason["mv_cap"]` = {market_value_weight, cap, breached, enforced,
+# clamped}; it clamps a BUY leg ONLY when `--enforce-mv-cap` is passed AND the
+# `LIVETRADING_DISABLE_MV_CAP` kill-switch is unset.
+#
+# The archived `as_of = 2026-11-04` run delivered 601919.SH at 21.5077% of NAV
+# with `breached: true, enforced: false, clamped: false` -- correctly disclosed in
+# the ticket -- while THIS report asserted "Enforced across all regimes" and
+# "Strictly maintain 20% single-stock ceiling across all assets." Both sentences
+# were false in that configuration; two absolute claims cannot co-exist with a
+# disclosed, unenforced breach.
+#
+# The clamp itself stays OFF by design (a registered, user-adjudicated decision:
+# `LV3` in docs/development_plan.md §2.21) -- only the WORDING changes. The text is
+# DERIVED from the same predicate and cap constant Stage 2 applies
+# (`mv_cap_enforcement_enabled`, `DEFAULT_MAX_SINGLE_POSITION`), never restated by
+# hand, so switching the Stage-2 flag on flips the report to its enforcing form by
+# itself and the prose cannot drift from behaviour again. Nothing here feeds the
+# gate: no NAV, breadth, thrust, drawdown, `breached`/`enforced`/`clamped` value is
+# computed, read or altered by this block -- it is pure string formatting.
+# ---------------------------------------------------------------------------
+SINGLE_STOCK_CAP_ENFORCE_FLAG = "--enforce-mv-cap"
+SINGLE_STOCK_CAP_KILL_SWITCH_ENV = "LIVETRADING_DISABLE_MV_CAP"
+
+
+def single_stock_cap_state(enforce_requested: bool = False) -> Dict[str, Any]:
+    """Read the delivered-cap enforcement state from the module that APPLIES it.
+
+    SSOT by import: the cap value and the effective `enforced` verdict (flag AND
+    kill-switch, resolved by Stage 2's own `mv_cap_enforcement_enabled`) come from
+    `scripts/run_live_strategy.py`. Re-spelling either here is exactly how the
+    report claimed blanket enforcement while the flag was off.
+
+    `enforce_requested` mirrors Stage 2's `--enforce-mv-cap`; Stage 1 defaults to
+    False because it never clamps anything itself (it runs BEFORE any ticket
+    exists), so `enforced=True` can only arrive via an explicit opt-in that the
+    caller (or the operator, once Stage 1 grows the flag) supplies.
+    """
+    from scripts import run_live_strategy as _stage2
+
+    cap = float(getattr(_stage2, "DEFAULT_MAX_SINGLE_POSITION", 0.20))
+    requested = bool(enforce_requested)
+    enforced = bool(_stage2.mv_cap_enforcement_enabled(requested))
+    return {
+        "cap": cap,
+        "enforce_requested": requested,
+        "enforced": enforced,
+        # Requested but refused => the env kill-switch outranked the flag. Distinguishing
+        # this from "flag never passed" keeps the disclosure accurate in both cases.
+        "overridden_by_kill_switch": bool(requested and not enforced),
+        "enforce_flag": SINGLE_STOCK_CAP_ENFORCE_FLAG,
+        "kill_switch_env": SINGLE_STOCK_CAP_KILL_SWITCH_ENV,
+    }
+
+
+def single_stock_cap_status_text(state: Dict[str, Any]) -> str:
+    """One-line status cell for the report table, derived from `state` only."""
+    cap_pct = f"{float(state.get('cap', 0.20)):.1%}"
+    flag = state.get("enforce_flag", SINGLE_STOCK_CAP_ENFORCE_FLAG)
+    kill_env = state.get("kill_switch_env", SINGLE_STOCK_CAP_KILL_SWITCH_ENV)
+    if state.get("enforced"):
+        return f"🔒 Enforced — a BUY leg above {cap_pct} is clamped to whole lots (`{flag}` on)"
+    if state.get("overridden_by_kill_switch"):
+        return (
+            f"⚠️ Measured & disclosed, **NOT clamped** — `{flag}` was requested but "
+            f"`{kill_env}` overrides it"
+        )
+    return (
+        f"⚠️ Measured & disclosed, **NOT clamped** — `{flag}` off (kill-switch `{kill_env}`); "
+        f"per-leg weight + `breached`/`enforced`/`clamped` land in the Stage-2 ticket "
+        f"as `detail_reason.mv_cap`"
+    )
+
+
+def single_stock_cap_action_text(state: Dict[str, Any]) -> str:
+    """Operator action for the ceiling, derived from `state` only (no absolutes)."""
+    cap_pct = f"{float(state.get('cap', 0.20)):.0%}"
+    flag = state.get("enforce_flag", SINGLE_STOCK_CAP_ENFORCE_FLAG)
+    kill_env = state.get("kill_switch_env", SINGLE_STOCK_CAP_KILL_SWITCH_ENV)
+    if state.get("enforced"):
+        return (
+            f"Honor the {cap_pct} single-stock ceiling; Stage 2 clamps any BUY leg whose "
+            f"delivered market-value weight exceeds it."
+        )
+    if state.get("overridden_by_kill_switch"):
+        return (
+            f"{cap_pct} single-stock ceiling is MEASURED but NOT clamped: `{flag}` was requested "
+            f"but `{kill_env}` overrides it — keep every position at or below {cap_pct} by hand."
+        )
+    return (
+        f"{cap_pct} single-stock ceiling is MEASURED but NOT clamped (`{flag}` off): keep every "
+        f"position at or below {cap_pct} by hand — Stage 2 only flags a breach as `MV_CAP` in "
+        f"the ticket."
+    )
+
+
 def resolve_gate_directive(
     dd_info: Dict[str, Any],
     macro_info: Dict[str, Any],
     vol_info: Dict[str, Any],
     intraday_5m_info: Optional[Dict[str, Any]] = None,
+    single_stock_cap: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str, List[str]]:
     """Synthesize health checks into an actionable trading gate directive."""
     actions = []
+    # Derived, not asserted: see the SINGLE_STOCK_CAP_* block above.
+    cap_state = single_stock_cap if isinstance(single_stock_cap, dict) else single_stock_cap_state()
     tier = dd_info["tier"]
     fast_rec = dd_info["fast_recovery_nav"] or macro_info["thrust_active"]
     freeze = dd_info["freeze_remaining_bars"]
@@ -1476,7 +1581,7 @@ def resolve_gate_directive(
                 headline = "🟢 GO: RAPID REBOUND / BREADTH THRUST MODE ACTIVE"
                 actions.append(f"10-Day Momentum Thrust Active ({macro_info['thrust']:.1%} >= {macro_info['thrust_thresh']:.0%}).")
                 actions.append(f"Bull exposure scaled up to {macro_info['target_exposure']:.0%}, dispersed across >= 5 leaders.")
-                actions.append("Strictly maintain 20% single-stock ceiling across all assets.")
+                actions.append(single_stock_cap_action_text(cap_state))
             elif macro_info["breadth_active"]:
                 headline = "🟢 GO: STEADY BULL BREADTH REGIME"
                 actions.append(f"50-Day Market Breadth Active ({macro_info['breadth']:.1%} >= {macro_info['breadth_thresh']:.0%}).")
@@ -1484,7 +1589,7 @@ def resolve_gate_directive(
             else:
                 headline = "🟢 GO: CONSERVATIVE / SELECTIVE MARKET REGIME"
                 actions.append("Standard unscaled allocation (40%–60% equity, balance in Cash Proxy).")
-                actions.append("Standard 20% single-stock cap strictly applied.")
+                actions.append(single_stock_cap_action_text(cap_state))
 
     # (2026-10-30 incident) An override that could NOT be evaluated must say so
     # out loud, in the same disclosure tone as the 5m `SKIPPED` / `UNKNOWN` lines
@@ -1525,6 +1630,7 @@ def print_dashboard(
     actions: List[str],
     intraday_5m_info: Optional[Dict[str, Any]] = None,
     timing: Optional[Dict[str, Any]] = None,
+    single_stock_cap: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Print an executive-level pre-trade terminal dashboard."""
     print("=" * 110)
@@ -1590,7 +1696,12 @@ def print_dashboard(
     t_status = "🚀 Thrust Active" if macro_info["thrust_active"] else "⚪ Inactive"
     print(f"  50-Day Market Breadth : {macro_info['breadth']:>6.1%} (Threshold: {macro_info['breadth_thresh']:>5.1%}) | {b_status}")
     print(f"  10-Day Momentum Thrust: {macro_info['thrust']:>6.1%} (Threshold: {macro_info['thrust_thresh']:>5.1%}) | {t_status}")
-    print(f"  Target Total Equity   : {macro_info['target_exposure']:>6.1%} (Max Single-Stock Cap: 20.0%) [Stage-1 advisory, ignored by Stage-2 orders]")
+    # (2026-11-04 audit) The ceiling is named together with its ACTUAL enforcement state
+    # (`single_stock_cap_state()` -> Stage 2's predicate), never as a bare absolute.
+    _cap_state = single_stock_cap if isinstance(single_stock_cap, dict) else single_stock_cap_state()
+    _cap_pct = f"{float(_cap_state.get('cap', 0.20)):.1%}"
+    _cap_word = "enforced" if _cap_state.get("enforced") else "measured, NOT clamped"
+    print(f"  Target Total Equity   : {macro_info['target_exposure']:>6.1%} (Max Single-Stock Cap: {_cap_pct} — {_cap_word}) [Stage-1 advisory, ignored by Stage-2 orders]")
 
     if macro_info.get("leaders"):
         print("  Top Momentum Leaders  : " + ", ".join([f"{x['symbol']} ({x['roc_10d']:>+.1%})" for x in macro_info["leaders"]]))
@@ -1728,6 +1839,7 @@ def generate_reports(
     freshness_summary: Optional[Dict[str, Any]] = None,
     refresh_summary: Optional[Dict[str, Any]] = None,
     timing: Optional[Dict[str, Any]] = None,
+    single_stock_cap: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str]:
     """Generate and write structured JSON and Markdown summary reports."""
     os.makedirs(output_dir, exist_ok=True)
@@ -1862,6 +1974,12 @@ def generate_reports(
         )
 
     strat_ver_display = f"v{strategy_info.get('strategy_version', '1.0.0')}" + (f" [base: v{strategy_info.get('base_version')}]" if strategy_info.get('base_version') else "")
+    # (2026-11-04 audit) Derived from Stage 2's own enforcement predicate -- see the
+    # SINGLE_STOCK_CAP_* block. This row used to read "Enforced across all regimes"
+    # unconditionally, which contradicted the same run's disclosed 21.5077% breach.
+    _cap_state = single_stock_cap if isinstance(single_stock_cap, dict) else single_stock_cap_state()
+    _cap_display = f"{float(_cap_state.get('cap', 0.20)):.1%}"
+    _cap_status_cell = single_stock_cap_status_text(_cap_state)
     md_content = f"""# Stage 1 Live Pre-Trade Health & Macro Audit Report
 
 > **Valuation Date**: `{as_of_date}`  
@@ -1897,7 +2015,7 @@ def generate_reports(
 | **50-Day Market Breadth** | `{macro_info['breadth']:.1%}` | `30.0%` | {"🟢 Bullish Breadth" if macro_info['breadth_active'] else "⚪ Conservative"} |
 | **10-Day Momentum Thrust** | `{macro_info['thrust']:.1%}` | `60.0%` | {"🚀 Rapid Rebound Thrust" if macro_info['thrust_active'] else "⚪ Standard"} |
 | **Target Equity Exposure** | `{macro_info['target_exposure']:.0%}` | Standard: 50% / Bull: Up to 80% | {"Bullish Expansion" if macro_info['target_exposure'] > 0.50 else "Standard Exposure"} (Stage-1 advisory; Stage-2 model weights govern orders) |
-| **Single-Stock Cap** | `20.0%` | Fixed hard limit | Enforced across all regimes |
+| **Single-Stock Cap** | `{_cap_display}` | Delivered market-value cap (measured per leg in Stage 2) | {_cap_status_cell} |
 
 ### Top Momentum Leaders (10-Day ROC)
 """
@@ -2543,7 +2661,16 @@ def main(cli_args: Optional[List[str]] = None):
     vol_info = evaluate_realized_volatility(universe, params)
 
     # 5. Synthesize Gate Directive
-    gate_code, gate_headline, actions = resolve_gate_directive(dd_info, macro_info, vol_info, intraday_5m_info)
+    # (2026-11-04 audit) The single-stock cap state is resolved ONCE from Stage 2's own
+    # enforcement predicate and shared by the actions list, the dashboard and the report
+    # table, so all three cannot disagree. It feeds TEXT ONLY: nothing below reads it into
+    # a gate, NAV, breadth, thrust, drawdown or `breached`/`enforced`/`clamped` value.
+    # `getattr(args, "enforce_mv_cap", False)` mirrors Stage 2's flag name; Stage-1's parser
+    # does not define it today, hence the derived default (False = warn-only).
+    single_stock_cap = single_stock_cap_state(getattr(args, "enforce_mv_cap", False))
+    gate_code, gate_headline, actions = resolve_gate_directive(
+        dd_info, macro_info, vol_info, intraday_5m_info, single_stock_cap=single_stock_cap
+    )
 
     # 6. Update Account State
     if not args.no_save_state:
@@ -2576,6 +2703,7 @@ def main(cli_args: Optional[List[str]] = None):
         actions=actions,
         intraday_5m_info=intraday_5m_info,
         timing=timing,
+        single_stock_cap=single_stock_cap,
     )
 
     json_rep, md_rep = generate_reports(
@@ -2593,6 +2721,7 @@ def main(cli_args: Optional[List[str]] = None):
         freshness_summary=freshness_summary,
         refresh_summary=refresh_summary,
         timing=timing,
+        single_stock_cap=single_stock_cap,
     )
     # (L2.3, design §9) `summary.json` is the shared per-run archive key/value store the
     # web layer merges into; the clock + freshness blocks land there too.

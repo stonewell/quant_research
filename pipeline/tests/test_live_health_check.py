@@ -315,3 +315,250 @@ def test_resolve_gate_directive_fast_recovery_downgrades_tier3_to_tier2_defensiv
     assert dd_info_3["tier"] == "TIER_3_HALT"
     assert dd_info_3["linear_equity_scale"] == pytest.approx(0.0)
 
+
+# ---------------------------------------------------------------------------
+# 6. 2026-11-04 post-run audit: the 20% single-stock cap disclosure
+#
+# The archived `as_of = 2026-11-04` run delivered 601919.SH at 21.5077% of NAV with
+# `breached: true, enforced: false, clamped: false` in the Stage-2 ticket, and the
+# SAME run's Stage-1 report asserted both "Enforced across all regimes" (table) and
+# "Strictly maintain 20% single-stock ceiling across all assets." (actions). Those
+# sentences are now DERIVED from Stage 2's own enforcement predicate, so:
+#   * enforcement OFF  -> the report may not claim enforcement anywhere;
+#   * enforcement ON   -> the report must say so (no stale "not clamped" text);
+#   * the kill-switch case must name the override instead of the flag.
+# Nothing here exercises the clamp itself -- the clamp's behaviour is pinned by
+# web/livetrading/tests/test_live_book_integrity.py, and this suite must not change it.
+# ---------------------------------------------------------------------------
+
+_STAGE2 = _load_script("run_live_strategy", os.path.join("scripts", "run_live_strategy.py"))
+
+_FORBIDDEN_OLD_CLAIMS = (
+    "Enforced across all regimes",
+    "Strictly maintain 20% single-stock ceiling",
+    "single-stock cap strictly applied",
+)
+
+
+def _dd_info_for_report():
+    return {
+        "current_nav": 100000.0,
+        "peak_nav": 105000.0,
+        "drawdown_pct": -0.0476,
+        "tier": "NORMAL",
+        "tier_label": "Normal",
+        "linear_equity_scale": 1.0,
+        "tier1_counter": 0,
+        "tier1_max": 15,
+        "tier3_counter": 0,
+        "freeze_remaining_bars": 0,
+        "nav_10d_return": 0.012,
+        "fast_recovery_nav": False,
+    }
+
+
+def _macro_info_for_report(thrust_active=True):
+    return {
+        "breadth": 0.55,
+        "breadth_active": True,
+        "thrust": 0.62,
+        "thrust_active": thrust_active,
+        "thrust_thresh": 0.60,
+        "breadth_thresh": 0.30,
+        "target_exposure": 0.80,
+        "leaders": [],
+    }
+
+
+def _vol_info_for_report():
+    return {
+        "realized_vol_21d": 0.11,
+        "target_vol": 0.12,
+        "vol_scaling_factor": 1.0,
+        "vol_elevated": False,
+    }
+
+
+def _render_report(tmp_path, *, cap_state, thrust_active=True):
+    """Drives `resolve_gate_directive` + `generate_reports` exactly as `main()` does."""
+    import json
+
+    dd_info = _dd_info_for_report()
+    macro_info = _macro_info_for_report(thrust_active=thrust_active)
+    vol_info = _vol_info_for_report()
+    gate_code, gate_headline, actions = _mod.resolve_gate_directive(
+        dd_info, macro_info, vol_info, None, single_stock_cap=cap_state
+    )
+    json_path, md_path = _mod.generate_reports(
+        output_dir=str(tmp_path),
+        as_of_date="2026-11-04",
+        strategy_info={"strategy_name": "unit_test", "template_name": "equal_weight"},
+        dd_info=dd_info,
+        macro_info=macro_info,
+        vol_info=vol_info,
+        gate_code=gate_code,
+        gate_headline=gate_headline,
+        actions=actions,
+        single_stock_cap=cap_state,
+    )
+    with open(md_path, "r", encoding="utf-8") as f:
+        md = f.read()
+    with open(json_path, "r", encoding="utf-8") as f:
+        report = json.load(f)
+    return md, report, actions
+
+
+def test_cap_wording_is_derived_from_stage2_predicate_and_constant():
+    """The cap value and the `enforced` verdict come from Stage 2, not from prose.
+
+    DISCRIMINATING: re-spelling either literal in the health script (the original
+    defect) or changing `mv_cap_enforcement_enabled`'s semantics turns this red.
+    """
+    state = _mod.single_stock_cap_state()
+
+    assert state["cap"] == pytest.approx(_STAGE2.DEFAULT_MAX_SINGLE_POSITION)
+    assert _STAGE2.DEFAULT_MAX_SINGLE_POSITION == pytest.approx(0.20)
+    assert state["enforce_flag"] == "--enforce-mv-cap"
+    assert state["kill_switch_env"] == "LIVETRADING_DISABLE_MV_CAP"
+    # Stage 1 never clamps, so its default is the warn-only reading -- but it is the
+    # PREDICATE's reading, not a literal in the report generator.
+    assert state["enforced"] is _STAGE2.mv_cap_enforcement_enabled(False) is False
+    assert state["enforced"] is _STAGE2.mv_cap_enforcement_enabled(None) is False
+
+
+def test_enforcement_off_report_makes_no_enforcement_claim(tmp_path, monkeypatch):
+    """Enforcement off (the deployed configuration): disclose, never promise.
+
+    This is the exact 2026-11-04 contradiction -- a report that disclosed an
+    unenforced 21.5077% breach while also claiming blanket enforcement.
+    """
+    monkeypatch.delenv("LIVETRADING_DISABLE_MV_CAP", raising=False)
+    cap_state = _mod.single_stock_cap_state(False)
+    assert cap_state["enforced"] is False
+
+    md, report, actions = _render_report(tmp_path, cap_state=cap_state)
+
+    for claim in _FORBIDDEN_OLD_CLAIMS:
+        assert claim not in md, f"stale absolute cap claim survived in markdown: {claim!r}"
+        assert claim not in " ".join(actions), f"stale absolute cap claim survived in actions: {claim!r}"
+        assert claim not in " ".join(report["trader_actions"]), claim
+
+    # The positive disclosure: measured and disclosed, explicitly NOT clamped, and the
+    # config that disables the clamp is named.
+    assert "**Single-Stock Cap**" in md
+    assert "NOT clamped" in md
+    assert "--enforce-mv-cap" in md
+    assert "LIVETRADING_DISABLE_MV_CAP" in md
+    assert "Measured & disclosed" in md
+    assert "detail_reason.mv_cap" in md
+
+    # JSON carries the same derived action string (one `actions` list feeds both files).
+    json_cap_actions = [a for a in report["trader_actions"] if "single-stock ceiling" in a]
+    assert json_cap_actions, report["trader_actions"]
+    assert "NOT clamped" in json_cap_actions[0]
+    assert "--enforce-mv-cap" in json_cap_actions[0]
+    # ... and the JSON must not contain the Markdown table's claim either.
+    assert "across all regimes" not in " ".join(report["trader_actions"])
+
+
+def test_enforcement_on_report_switches_to_enforcing_form(tmp_path, monkeypatch):
+    """Companion case: if the clamp is ever switched on, the report says so.
+
+    Both halves matter -- a report frozen on "not clamped" would be the same bug
+    mirrored. The flip is driven by `mv_cap_enforcement_enabled`, i.e. by the thing
+    that actually decides whether orders are clamped.
+    """
+    monkeypatch.delenv("LIVETRADING_DISABLE_MV_CAP", raising=False)
+    cap_state = _mod.single_stock_cap_state(True)
+    assert cap_state["enforced"] is True
+    assert cap_state["overridden_by_kill_switch"] is False
+
+    md, report, _actions = _render_report(tmp_path, cap_state=cap_state)
+
+    assert "Enforced" in md
+    assert "NOT clamped" not in md
+    assert "clamps any BUY leg" in md
+    assert not any("NOT clamped" in a for a in report["trader_actions"])
+
+
+def test_kill_switch_override_is_named_not_misreported(tmp_path, monkeypatch):
+    """Flag passed but kill-switch set: still not clamped, and the reason is named.
+
+    The naive fix would print the "flag is off" reason while the operator passed it,
+    which is the same class of lie in a smaller font.
+    """
+    monkeypatch.setenv("LIVETRADING_DISABLE_MV_CAP", "1")
+    cap_state = _mod.single_stock_cap_state(True)
+
+    assert cap_state["enforced"] is False
+    assert cap_state["overridden_by_kill_switch"] is True
+
+    md, _report, _actions = _render_report(tmp_path, cap_state=cap_state)
+
+    assert "NOT clamped" in md
+    assert "overrides it" in md
+    assert "LIVETRADING_DISABLE_MV_CAP" in md
+    assert "Enforced across all regimes" not in md
+
+
+def test_conservative_regime_uses_the_same_derived_cap_action():
+    """The third action site (conservative/selective branch) must not keep a stale claim.
+
+    The audit quoted only the thrust branch's "Strictly maintain ..." line; the
+    conservative branch carried its own absolute ("Standard 20% single-stock cap
+    strictly applied."), so a half-fix would have left the same lie reachable from a
+    different regime. (The breadth-only branch in between never mentioned the cap at
+    all -- it made no claim, so it stays byte-identical.)
+    """
+    cap_state = _mod.single_stock_cap_state(False)
+    dd_info = _dd_info_for_report()
+    vol_info = _vol_info_for_report()
+
+    conservative_macro = _macro_info_for_report(thrust_active=False)
+    conservative_macro["breadth_active"] = False
+    _code, _headline, actions = _mod.resolve_gate_directive(
+        dd_info, conservative_macro, vol_info, None,
+        single_stock_cap=cap_state,
+    )
+    joined = " ".join(actions)
+    for claim in _FORBIDDEN_OLD_CLAIMS:
+        assert claim not in joined, claim
+    assert "NOT clamped" in joined
+    assert "--enforce-mv-cap" in joined
+    assert "Standard unscaled allocation" in joined  # the branch really was exercised
+
+    # Both cap-bearing branches emit the identical derived sentence: one source of truth.
+    _code2, _hl2, thrust_actions = _mod.resolve_gate_directive(
+        _dd_info_for_report(), _macro_info_for_report(thrust_active=True), vol_info, None,
+        single_stock_cap=cap_state,
+    )
+    cap_actions = [a for a in thrust_actions if "single-stock ceiling" in a]
+    assert cap_actions and cap_actions[0] in joined
+
+
+def test_gate_decision_and_numbers_are_untouched_by_the_cap_state():
+    """Zero-behaviour-change guard: the cap state must not move a gate or a number.
+
+    The disclosure rewrite is formatting only -- feeding an enforcing state must leave
+    the gate code, headline and every numeric action text byte-identical.
+    """
+    off = _mod.single_stock_cap_state(False)
+    on = _mod.single_stock_cap_state(True)  # kill-switch unset in this process
+    if on["enforced"] is not True:  # pragma: no cover - env-dependent, documented
+        pytest.skip("LIVETRADING_DISABLE_MV_CAP is set in this environment")
+
+    for thrust in (True, False):
+        code_off, head_off, actions_off = _mod.resolve_gate_directive(
+            _dd_info_for_report(), _macro_info_for_report(thrust), _vol_info_for_report(), None,
+            single_stock_cap=off,
+        )
+        code_on, head_on, actions_on = _mod.resolve_gate_directive(
+            _dd_info_for_report(), _macro_info_for_report(thrust), _vol_info_for_report(), None,
+            single_stock_cap=on,
+        )
+        assert (code_off, head_off) == (code_on, head_on)
+        # Only the cap sentence may differ; the gate and every number stay put.
+        cap_mask_off = [a for a in actions_off if "single-stock" not in a.lower()]
+        cap_mask_on = [a for a in actions_on if "single-stock" not in a.lower()]
+        assert cap_mask_off == cap_mask_on
+
