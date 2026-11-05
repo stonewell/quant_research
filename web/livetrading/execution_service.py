@@ -46,7 +46,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -125,7 +125,10 @@ except ImportError:  # pragma: no cover - repo root not importable
 #:
 #: The markers are the literal strings `common/cli_utils.py` (run-window gate /
 #: as-of gate) and `common/freshness.py` (stale price) put in the exception message,
-#: i.e. the last line of the child's traceback. They are matched as plain
+#: i.e. the last line of the child's traceback -- plus, since the LV11 family, the
+#: class name and status vocabulary of `scripts/run_live_strategy.py`'s
+#: `LiveGateDegradedError`, whose cause is fully determined but which used to be
+#: archived as ``error_kind="unknown"``. They are matched as plain
 #: substrings (never parsed as data) so a reworded message degrades to
 #: ``error_kind="unknown"`` -- still showing the raw traceback -- instead of
 #: mislabelling the failure.
@@ -137,6 +140,26 @@ _FAILURE_RULES: Tuple[Tuple[str, Tuple[str, ...], str, str], ...] = (
         "等到市场本地收盘后的运行窗口再跑（A 股 14:10 之后，收盘后门禁不再适用）；"
         "确需盘中放行，请确认后在被调脚本上显式加 --allow-intraday（或 --no-strict-market-clock "
         "降级为警告）——盘中工单只能使用上一已收盘交易日的价格。",
+    ),
+    (
+        # (2026-11-04) `LiveGateDegradedError` is raised by Stage 2 BEFORE any order math
+        # precisely when Stage 1 could not measure the gate NAV. Its cause is fully
+        # determined, so archiving it under the generic "未识别出已知的门禁 / 行情原因"
+        # headline hid a known, actionable refusal. Matched on the CLASS name first; the
+        # status vocabulary (`DEGRADED_NAV_UNAVAILABLE` / `form_fallback_refused`) is the
+        # same refusal when it arrives quoted inside another message.
+        "gate_nav_unavailable",
+        (
+            "LiveGateDegradedError",
+            "DEGRADED_NAV_UNAVAILABLE",
+            "门禁净值不可用",
+            "form_fallback_refused",
+        ),
+        "门禁净值不可用：Stage 1 未能取得盯市净值，熔断 / 回撤判定为 UNKNOWN，拒绝出票",
+        "先恢复或预置本轮 nav_breakdown.json 再重跑 Stage 1（web 启动器会在拉起 Stage 1 前"
+        "预置估值快照），随后重跑 Stage 2。确属新账户首次建仓、门禁确实无法评估时，只能由"
+        "操作员勾选「人工覆盖净值」留痕放行（LIVETRADING_ALLOW_DEGRADED_GATE=1）——"
+        "不得用表单值或上一轮快照替代盯市净值（缺失 ≠ 未触发）。",
     ),
     (
         "stale_prices",
@@ -704,6 +727,122 @@ def open_live_valuation_cache(cache_dir: Optional[str]):
     return DuckDBCache(db_path=str(cache_dir), read_only=True)
 
 
+def refresh_held_book_daily_bars(
+    cache_dir: Optional[str],
+    symbols: Sequence[str],
+    *,
+    as_of: str,
+    market: str = "china",
+    data_provider: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Patch the HELD BOOK's daily bars up to ``as_of`` (LV11b, 2026-11-04).
+
+    WHY THIS EXISTS -- THE 2026-11-04 TWO-RUN DEFECT
+    -----------------------------------------------
+    The LV11 preset is the FIRST thing in a round to read the cache, but the only data
+    refresh lived in the Stage-1 CHILD, which starts later.  On the first run of every new
+    ``as_of`` date the cache therefore still ended at the PREVIOUS session: `compute_nav`
+    fail-fasted (`StalePriceError: ... last stored bar is <as_of - 1>`), no snapshot was
+    written, the gate degraded (`SNAPSHOT_NOT_YET_WRITTEN` -> `DEGRADED_NAV_UNAVAILABLE`)
+    and Stage 2 refused with `LiveGateDegradedError`.  The run 4 minutes later -- the
+    child's refresh having landed in between -- succeeded.  "First run of a new session
+    always fails, second always succeeds" was structural, not market data.
+
+    WHAT IT IS, AND IS NOT
+    ----------------------
+    * It calls the SAME primitive the child uses (`scripts.sync_china_5m_and_indices.
+      patch_equity_daily_bars`) on the HELD-BOOK symbols only -- the exact set the preset
+      is about to mark.  No bar-patching is re-implemented here.
+    * It is ADDITIVE, never a replacement: the child keeps its own UNIVERSE-WIDE refresh
+      (symbols this book does not hold still feed the gate's breadth / index inputs), so
+      `--no-refresh-data` is deliberately NOT passed to it.
+    * It does NOT remove the stale check.  A symbol that genuinely has no ``as_of`` bar
+      even after this call (suspended / delisted / provider gap) still makes `compute_nav`
+      raise, still skips the pin, and still degrades the gate.  This function exists to
+      delete the SPURIOUS stale read, never to launder a real one.
+
+    SKIPS (each returns a machine-readable ``reason``; nothing is guessed)
+    ---------------------------------------------------------------------
+    ``empty_book`` / ``synthetic_or_no_cache`` (the repo's 100% offline rule, same test as
+    the child's `refresh_stage1_data`) / ``market_not_patched`` (the primitive above is
+    China-only, exactly as in the child) / ``cache_dir_unconfigured`` / ``cache_missing``.
+
+    ``cache_missing`` NEVER CREATES THE FILE.  A writable `DuckDBCache.__init__` would
+    `makedirs` + `_init_tables`, i.e. leave a brand-new EMPTY cache behind -- the same
+    hazard `open_live_valuation_cache`'s read-only open and the child's
+    `allow_create_cache=False` refusal exist to prevent.  The gate therefore IS a read-only
+    open of that same owner (`open_live_valuation_cache`), which both proves the file exists
+    and resolves its path (`DuckDBCache.__init__`'s "directory -> <dir>/cache.duckdb" rule)
+    before any writable handle is constructed -- no second copy of the resolution rule.
+
+    Returns ``{"status": "completed"|"skipped", "reason", "symbols", "cache_file",
+    "fetch_errors"}``; ``fetch_errors`` is the primitive's own per-symbol
+    ``"<provider>: Type: msg"`` map (an empty dict on a clean run), carried through so the
+    caller can say WHY a symbol stayed stale instead of only that it did.
+    """
+    syms = sorted({str(s).strip().upper() for s in (symbols or []) if str(s or "").strip()})
+    summary: Dict[str, Any] = {
+        "status": "skipped",
+        "reason": None,
+        "symbols": syms,
+        "cache_file": None,
+        "fetch_errors": {},
+    }
+    if not syms:
+        summary["reason"] = "empty_book"
+        return summary
+    if str(data_provider or "").strip().lower() in ("synthetic", "csv"):
+        # Same short-circuit as the child: synthetic/csv bars are generated on read and
+        # are never cached, so there is nothing to patch (and nothing to reach a network for).
+        summary["reason"] = "synthetic_or_no_cache"
+        return summary
+    if str(market or "").strip().lower() != "china":
+        # `patch_equity_daily_bars` speaks BaoStock/EastMoney only; the child gates its
+        # refresh on `market == "china"` for the same reason.
+        summary["reason"] = f"market_not_patched:{market}"
+        return summary
+    if not cache_dir:
+        summary["reason"] = "cache_dir_unconfigured"
+        return summary
+
+    # EXISTENCE GATE + PATH RESOLUTION -- ONE OWNER, NOT A THIRD COPY.
+    # `open_live_valuation_cache` is this layer's single "cache_dir -> live cache handle"
+    # entry point, and it deliberately delegates the FILE NAME to `DuckDBCache.__init__`
+    # (`common/duckdb_cache.py`: a directory becomes `<dir>/cache.duckdb`, a `.duckdb`/`.db`
+    # path is itself). Re-deriving `endswith(".duckdb") or os.path.isdir(...)` here -- as the
+    # child's `refresh_stage1_data` does for its own REFUSAL contract, and
+    # `scripts/run_batch_backtest.py` for its own -- would add a third, silently-drifting
+    # copy of that rule. The read-only open both proves the file EXISTS (a writable
+    # `DuckDBCache.__init__` would `makedirs` + `_init_tables` and leave an EMPTY cache
+    # behind -- the hazard `allow_create_cache=False`/read-only exist to prevent) and yields
+    # the already-resolved path, which is what the writable handle below is opened on.
+    # `FileNotFoundError` is the documented "not initialised" signal; anything else
+    # propagates and is handled as a refresh failure by the caller (log + preset continues).
+    try:
+        probe = open_live_valuation_cache(str(cache_dir))
+    except FileNotFoundError:
+        summary["reason"] = "cache_missing"
+        return summary
+
+    db_file = str(probe.db_path)
+    summary["cache_file"] = db_file
+
+    from common.duckdb_cache import DuckDBCache
+
+    try:
+        from scripts.sync_china_5m_and_indices import patch_equity_daily_bars
+    except ImportError as exc:  # pragma: no cover - repo root not importable
+        summary["reason"] = f"import_failed:{type(exc).__name__}"
+        summary["error"] = str(exc)
+        return summary
+
+    cache = DuckDBCache(db_path=db_file)
+    fetch_errors = patch_equity_daily_bars(cache, syms, end=as_of) or {}
+    summary["status"] = "completed"
+    summary["fetch_errors"] = dict(fetch_errors)
+    return summary
+
+
 def cache_structure_reason(cache: Any) -> Optional[str]:
     """``None`` when the cache looks initialised, else a machine-readable reason.
 
@@ -1157,10 +1296,12 @@ class ExecutionService:
     ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
         """`(run dir, report)` of the newest USABLE Stage-1 report of this session.
 
-        Same ordering rule as every other L2.62 reader -- lexicographic instance names,
-        newest first, never mtime -- so a gate report restored from a backup cannot be
-        mistaken for a newer one.  `run_dir` itself is skipped: the caller already knows it
-        has no report (otherwise it would not be searching).
+        Same ordering rule as every other L2.62 reader -- `summary.json`'s `timestamp`
+        first, the `HHMMSS` directory name as fallback/tiebreak (`_instance_sort_key`, the
+        single owner of the rule), newest first, never mtime -- so a gate report restored
+        from a backup cannot be mistaken for a newer one, and a later-day re-run whose name
+        sorts LOWEST still counts as the newest.  `run_dir` itself is skipped: the caller
+        already knows it has no report (otherwise it would not be searching).
         """
         own = os.path.normpath(run_dir)
         candidates: List[str] = []
@@ -1597,6 +1738,78 @@ class ExecutionService:
             detail=detail,
             nav_warnings=[f"reason={reason}: {detail}"],
         )
+
+    def _refresh_held_book_daily_bars(
+        self,
+        book: Mapping[str, Any],
+        *,
+        as_of: str,
+        provider: str,
+        refresh_data: bool = True,
+    ) -> Dict[str, Any]:
+        """(LV11b) Bring the HELD BOOK's daily bars up to ``as_of`` before the preset marks it.
+
+        THE SEAM THIS FILLS.  The preset is the first cache reader of a round; the child's
+        refresh ran minutes later.  On the first run of every new ``as_of`` date the mark
+        therefore fail-fasted on the PREVIOUS session's bar, the gate degraded and Stage 2
+        refused -- while the next run, whose cache the child had since patched, succeeded.
+        This call closes that race on the HELD BOOK only (see
+        `refresh_held_book_daily_bars` for the primitive, the skip rules and the honesty
+        contract).
+
+        It is deliberately NOT a fallback: a symbol that still has no ``as_of`` bar after
+        this call makes `compute_nav` raise exactly as before, so "the refresh ran" can
+        never be mistaken for "the book is markable" (缺失 ≠ 未触发).  It also never
+        substitutes the form NAV or a previous round's snapshot -- Test C in
+        `pipeline/tests/test_stage1_nav_prestaging.py` fails if that is ever added.
+
+        ``refresh_data=False`` is honoured: the operator's "do not touch the network"
+        switch travels to the child as ``--no-refresh-data``, and a pre-refresh that went
+        to the network anyway would silently override it.  The preset then fails closed on
+        whatever the cache holds -- the honest answer to "you told me not to refresh".
+        """
+        symbols = [sym for sym in _shares_book(book) if not is_cash_symbol(sym)]
+        if not symbols:
+            print(
+                "[ExecutionService] (LV11) 持仓日线预刷新跳过: reason=no_equity_in_book "
+                "（账本里只有现金/流动性代理，无需行情）"
+            )
+            return {"status": "skipped", "reason": "no_equity_in_book", "symbols": []}
+        if not refresh_data:
+            print(
+                "[ExecutionService] (LV11) 持仓日线预刷新跳过: reason=refresh_data_disabled "
+                "（操作员已关闭行情刷新；预置将按缓存现状估值，缺 as_of bar 时按陈旧价格失败关闭）"
+            )
+            return {"status": "skipped", "reason": "refresh_data_disabled", "symbols": symbols}
+
+        # The refresh primitive is China-only (BaoStock/EastMoney) -- the same gate the
+        # child's `refresh_stage1_data` applies.  The market comes from the ONE owner of
+        # market inference (`StorageManager.market_clock_markets`), never re-derived here.
+        markets_fn = getattr(self.storage, "market_clock_markets", None)
+        markets = list(markets_fn(symbols=symbols) or []) if callable(markets_fn) else []
+        market = markets[0] if markets else "china"
+
+        summary = refresh_held_book_daily_bars(
+            getattr(self.storage, "cache_dir", None),
+            symbols,
+            as_of=as_of,
+            market=market,
+            data_provider=provider,
+        )
+        if summary.get("status") == "completed":
+            fetch_errors = summary.get("fetch_errors") or {}
+            print(
+                f"[ExecutionService] (LV11) 持仓日线预刷新完成: as_of={as_of} "
+                f"symbols={symbols} fetch_errors={sorted(fetch_errors) or 'none'} "
+                f"(仅账本内标的；Stage 1 仍会做全 universe 刷新)"
+            )
+        else:
+            print(
+                f"[ExecutionService] (LV11) 持仓日线预刷新未执行: "
+                f"reason={summary.get('reason')} symbols={symbols} "
+                f"(继续预置估值快照；若缓存缺 as_of bar 将按陈旧价格失败关闭)"
+            )
+        return summary
 
     def _valuation_cache(self, *, book=None, as_of=None):
         """Read-only live cache handle; a missing file is `cache_uninitialized`, not stale."""
@@ -2196,6 +2409,50 @@ class ExecutionService:
                 val_date, strat_key, univ_key
             )
             if seed_book:
+                # (LV11b, 2026-11-04) REFRESH THE HELD BOOK'S BARS *BEFORE* THE MARK.
+                #
+                # THE DEFECT THIS CLOSES. This preset used to be the first reader of the
+                # cache in a round, while the actual data refresh ran in the Stage-1 CHILD
+                # minutes later. On the FIRST run of every new `as_of` date the cache
+                # therefore still ended at the PREVIOUS session: `compute_nav` fail-fasted
+                # (`StalePriceError: ... last stored bar is <as_of-1>`), no snapshot was
+                # written, the gate degraded (`SNAPSHOT_NOT_YET_WRITTEN` ->
+                # `DEGRADED_NAV_UNAVAILABLE`) and Stage 2 refused with
+                # `LiveGateDegradedError`. The next run -- the child's refresh having
+                # landed in between -- succeeded. Reproduced 2026-11-04: `203129/` FAILED,
+                # `203553/` SUCCESS on identical inputs.
+                #
+                # The preset cannot simply be moved after the child (Stage 1 READS the
+                # snapshot), so the held book's bars are patched here with the SAME
+                # primitive the child uses, for `val_date`.
+                #
+                # ADDITIVE ONLY: `--no-refresh-data` is NOT passed to the child. It keeps
+                # its own UNIVERSE-WIDE refresh (symbols this book does not hold still feed
+                # the gate's breadth / index inputs); this is the held-book subset brought
+                # forward in time, nothing more.
+                #
+                # HONESTY, UNCHANGED: this deletes only the SPURIOUS stale read. A symbol
+                # that genuinely has no `val_date` bar after the refresh (suspended,
+                # delisted, provider gap) still makes `compute_nav` raise, still leaves the
+                # snapshot unwritten and unpinned, and still degrades the gate -- so
+                # "缺失 ≠ 未触发" holds. This is NOT a "fall back to the form value /
+                # previous round's snapshot" change and must never become one.
+                #
+                # FAILURE IS NON-FATAL BY CONSTRUCTION: a refresh failure must not abort
+                # `run_health_check`. It is logged loudly and the preset proceeds -- on an
+                # unrefreshed cache, i.e. exactly the old (honest) fail-closed path.
+                try:
+                    self._refresh_held_book_daily_bars(
+                        seed_book,
+                        as_of=val_date,
+                        provider=provider,
+                        refresh_data=refresh_data,
+                    )
+                except Exception as exc:
+                    logging.error(
+                        "[LV11] 持仓日线预刷新失败（不阻断 Stage 1；继续预置估值快照，"
+                        "若缓存仍缺 as_of bar 将按陈旧价格失败关闭）: %s", exc
+                    )
                 # Cash is NOT a holding (it is the NAV residual), so the seed book alone
                 # cannot be marked. Prefer the previous round's measured residual; a book
                 # that carries a parked-cash position still works with `cash=None` via the
