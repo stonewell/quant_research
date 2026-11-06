@@ -108,14 +108,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "indicator findings are turned into candidate PatternBasedAllocationTemplate "
                         "instances (up to --pattern-max-templates), which compete through the same "
                         "grid-search + Equivalent Random Search validation as every static template. Omit "
-                        "to search only the 9 static templates (plus any --research-strategy templates).")
+                        "to search only the static templates (plus any --research-strategy templates).")
     p.add_argument("--pattern-max-templates", type=int, default=5,
                    help="Cap on how many significant mined patterns (from --pattern-report) become "
                         "candidate templates (default 5).")
     p.add_argument("--research-strategy", nargs="+", default=None, metavar="STRATEGY_KEY",
                    help="Include one or more research_strategy strategies (by their strategies_config.json key, "
                         "e.g. 'baa_keller', 'adaptive_grid' -- see research_strategy/README.md for the full list) "
-                        "as additional candidate templates, alongside the 9 static allocation templates and any "
+                        "as additional candidate templates, alongside the static allocation templates and any "
                         "--pattern-report findings. Each is instantiated exactly as research_strategy's own CLI "
                         "would build it (including any strategies_config.json parameter overrides).")
     p.add_argument("--no-plots", action="store_true",

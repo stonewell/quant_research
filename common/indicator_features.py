@@ -11,7 +11,7 @@ trades on". This is a shared module specifically so `common/`
 (project-agnostic) and `pipeline/pattern_mining/` (the mining orchestrator) both
 import one definition rather than keeping two that could diverge.
 
-Never used by any of the 9 static `AllocationTemplate` classes -- those use
+Never used by any of the static `AllocationTemplate` classes -- those use
 a small, fixed primitive set directly (see
 `pipeline/strategy_generator/stratgen/indicators.py`'s own docstring on why that set
 is deliberately restricted, per Allen & Karjalainen 1999). This module's

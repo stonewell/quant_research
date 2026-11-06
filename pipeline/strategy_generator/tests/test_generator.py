@@ -201,7 +201,7 @@ def test_generator_ers_check_works():
     }
 
     # Aspect composition disabled: this test is about the ERS check's own
-    # false-positive rate over the 9 static templates, not about whether
+    # false-positive rate over the static templates, not about whether
     # composition adds candidates -- see test_generator_composite_*.
     config = GeneratorConfig(
         n_random_search=100, ers_percentile_threshold=0.99, seed=123, enable_aspect_composition=False,
@@ -438,7 +438,7 @@ def test_n_trials_counts_configured_random_search_attempts_not_survivors():
     # random trials actually run/attempted), not the number that survived.
     universe = _small_universe()
     # Aspect composition disabled: this test is about counting grid +
-    # random trials over the 9 static templates, not composite candidates.
+    # random trials over the static templates, not composite candidates.
     config = GeneratorConfig(n_random_search=10, seed=1, enable_aspect_composition=False)
 
     call_count = {"random": 0}

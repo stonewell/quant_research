@@ -164,7 +164,7 @@ uv run python pattern_mining/run_pattern_mining.py \
 
 See `pipeline/pattern_mining/README.md` for the full CLI argument reference, the significance-test
 methodology, and its disclosed hindsight/multiple-comparisons caveats. Skip this step entirely to
-have `strategy_generator` search only its 9 static allocation templates (plus any
+have `strategy_generator` search only its static allocation templates (plus any
 `--research-strategy` templates).
 
 ---

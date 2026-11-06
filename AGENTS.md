@@ -70,7 +70,7 @@ available in the current shell.
 
 - Every strategy/allocation template is an `AllocationTemplate` subclass (`common/allocation_templates.py`)
   implementing `generate_weights(universe, params) -> DataFrame`, `explain_weights(params) -> str`,
-  and `warmup_bars(params) -> int`. Two families implement this interface: the 9 static, zero-arg
+  and `warmup_bars(params) -> int`. Two families implement this interface: the static, zero-arg
   templates in `common/allocation_templates.py`, and the 53 richer, `StrategyConfig`-driven
   templates (basket presets, single-asset timing strategies, Chan structural models, macro factor
   compounders, multi-strategy alpha books, WorldQuant formulaic alpha models, and modular blend
@@ -106,7 +106,7 @@ available in the current shell.
   `pipeline/research_strategy/rs/timing_aspects.py` for single-asset timing templates): `strategy_generator`
   no longer just picks the single best whole template. It decomposes several templates into
   reusable pieces -- *selection* (which symbols/how much to invest) + *weighting* (how to size
-  across them) for the 9 static templates; *entry signal* + *exit/risk/sizing* for 4 of the 18
+  across them) for the static templates; *entry signal* + *exit/risk/sizing* for 4 of the 18
   timing templates -- and searches hybrid pairings across DIFFERENT source templates too (e.g.
   momentum's stock-picking + inverse-volatility's sizing), on by default via
   `GeneratorConfig.enable_aspect_composition` / CLI `--no-compose-aspects`. A winning hybrid embeds a
@@ -156,7 +156,7 @@ available in the current shell.
   - **Stage 2 (Order Ticket Generation)** via `scripts/run_live_strategy.py`: Enforces execution hierarchy: Phase 1: SELLS FIRST
     (releases purchasing power) $\rightarrow$ Phase 2: BUYS SECOND (lot-rounded entries) $\rightarrow$ Phase 3:
     POSITIONS HELD (inertia filtering) $\rightarrow$ Phase 4: CASH SWEEP (idle cash into `BIL`/`511880`/`GC001`).
-    Supports all 55+ research strategies, 9 static templates, and custom strategy files via `--strategy`.
+    Supports all 55+ research strategies, the static allocation templates, and custom strategy files via `--strategy`.
   - `web/livetrading` provides an interactive web UI with real-time portfolio management, daily immutable
     snapshot archiving (`data/runs/<date>/`), and custom universe editing. Regional core-satellite
     pools reside in `docs/universe/` (China A-Shares, US equities, Hong Kong stocks).
@@ -181,7 +181,7 @@ available in the current shell.
 7. **Strategy Modification & Semantic Version Upgrade (Dual-Axis Decoupling)**:
    - Every quantitative strategy and allocation template must strictly track its semantic version. Note the **exact** attribute layout -- do not "normalize" it:
      - `BASE_VERSION` exists on **exactly one class**: `BaseBlendAllocationStrategy` (`pipeline/research/blend/blend_base.py`).
-     - `common/allocation_templates.py` (`AllocationTemplate` and the 9 static templates) has **no file-level `BASE_VERSION`, and never had one** (verified: `grep -n BASE_VERSION common/allocation_templates.py` -> no match; `git log -S BASE_VERSION -- common/allocation_templates.py` -> empty). Do not go hunting for it, and do not invent one "for symmetry".
+     - `common/allocation_templates.py` (`AllocationTemplate` and the static templates) has **no file-level `BASE_VERSION`, and never had one** (verified: `grep -n BASE_VERSION common/allocation_templates.py` -> no match; `git log -S BASE_VERSION -- common/allocation_templates.py` -> empty). Do not go hunting for it, and do not invent one "for symmetry".
      - Every strategy/template class carries its own per-class `version`.
    - **Mandatory version upgrade on modification**:
      - **Base Engine Upgrade (`BASE_VERSION`)**: Anytime an agent modifies, extends, or adds features/operators/risk overlays to `BaseBlendAllocationStrategy` (`pipeline/research/blend/blend_base.py`), the agent **must increment `BASE_VERSION`** (e.g. `1.0.0` -> `1.1.0` for backward-compatible additions, `1.1.0` -> `2.0.0` for breaking contract changes).

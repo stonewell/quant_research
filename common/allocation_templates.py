@@ -1749,7 +1749,7 @@ class PatternBasedAllocationTemplate(AllocationTemplate):
     """A trading signal built from ONE indicator pattern discovered by the
     `pattern_mining` stage's (`pipeline/pattern_mining/pmine/pattern_mining.py`)
     turning-point pattern mining -- deliberately NOT in `ALLOCATION_TEMPLATES`
-    above, unlike the 9 static templates. Those are universe-agnostic formulas,
+    above, unlike the static templates. Those are universe-agnostic formulas,
     zero-arg constructible, searched for every basket; this template's own
     threshold comes from mining a SPECIFIC basket's aggregate-portfolio
     turning-point history first, so it can't be a static class -- it's

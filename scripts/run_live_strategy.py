@@ -3,7 +3,7 @@
 
 Supports all strategies in the quantitative workspace:
   - 55+ research strategies (Chan blend models, Chan structural timing, Turtle, Bollinger, WorldQuant, etc.)
-  - 9 static allocation templates (equal_weight, hierarchical_risk_parity, momentum, etc.)
+  - static allocation templates (equal_weight, hierarchical_risk_parity, momentum, sleeve_allocator, etc.)
   - Composite aspect hybrids and mined pattern models
   - Custom strategy configuration JSON files
 

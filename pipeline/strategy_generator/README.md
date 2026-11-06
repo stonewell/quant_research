@@ -110,7 +110,7 @@ uv run python strategy_generator/run_strategygen.py --universe SPY QQQ TLT GLD \
 ## Optional: including `research_strategy` strategies as candidates (`--research-strategy`)
 
 `--research-strategy KEY [KEY ...]` includes one or more of `research_strategy`'s 53 strategy
-implementations as additional candidate templates, alongside the 9 static allocation templates and
+implementations as additional candidate templates, alongside the static allocation templates and
 any `--pattern-report` findings. Each `KEY` is one of `research_strategy/strategies_config.json`'s
 short keys (e.g. `baa_keller`, `adaptive_grid`, `rsi_mean_reversion`, `multi_strategy_alpha_book` — see `research_strategy/README.md`
 for the full list of 53); run
@@ -133,7 +133,7 @@ uv run python strategy_generator/run_strategygen.py --universe SPY QQQ TLT GLD -
 
 ## Optional: aspect composition — hybrid templates across DIFFERENT sources (`--no-compose-aspects`)
 
-**ON by default.** Each of the 9 static templates fuses two orthogonal decisions into one
+**ON by default.** Each decomposable static template fuses two orthogonal decisions into one
 `generate_weights` — SELECTION (which symbols are eligible) + WEIGHTING (how the invested fraction
 splits across them) for basket templates; ENTRY SIGNAL + EXIT/RISK/SIZING for the 4 decomposable
 single-asset timing templates (`RSIMeanReversionStrategy`, `SwingTrendPullbackStrategy`,
@@ -150,7 +150,7 @@ to be trusted.
 A winning hybrid's `results/strategy.json` carries a `composite_spec` block (see "Data Shapes &
 Schemas" below) so `backtester` can reconstruct the exact `CompositeAllocationTemplate`/
 `CompositeTimingTemplate` instance. Pass `--no-compose-aspects` to disable this and restrict the
-search to only the templates explicitly named/loaded (the 9 static templates, plus any
+search to only the templates explicitly named/loaded (the static templates, plus any
 `--pattern-report`/`--research-strategy` candidates) — useful for a faster run, or to reproduce
 this project's pre-aspect-composition search behavior exactly.
 
@@ -227,7 +227,7 @@ strategy_generator/
     regime.py           Hurst-based regime classification -- still present, unit-tested, but
                         DISCONNECTED from generator.py (see "Known, disclosed gaps" above)
     indicators.py       Re-exports from ../../common/indicators.py: the small, restricted set for the
-                        9 static templates, PLUS the broader popular-indicators menu the (now
+                        static templates, PLUS the broader popular-indicators menu the (now
                         separate) pattern_mining stage mines against (see indicators.py's own
                         docstring for why that's a disclosed exception, not a contradiction, of
                         the "restricted set" rule)
@@ -356,7 +356,7 @@ feature menu** shapes documented in `../../common/README.md` (§1–6) — see t
 
 | Field | Type | Notes |
 |---|---|---|
-| `template_name` | str | One of the 9 static template names, `pattern_<feature>_<lookback>_<peak\|trough>` for a mined winner, or `<selection_key>__<weighting_key>` / `<entry_key>__<exit_key>` for an aspect-composed hybrid winner (see `composite_spec` below) |
+| `template_name` | str | One of the static template names, `pattern_<feature>_<lookback>_<peak\|trough>` for a mined winner, or `<selection_key>__<weighting_key>` / `<entry_key>__<exit_key>` for an aspect-composed hybrid winner (see `composite_spec` below) |
 | `params` | dict | The winning grid-search combination (keys depend on `template_name` — see each template's `param_grid` in `../../common/allocation_templates.py`) |
 | `explanation` | str | `explain_weights()`'s full text |
 | `sharpe_ratio`, `cagr`, `max_drawdown`, `calmar_ratio`, `win_rate` | float | From the shared backtest result dict |
