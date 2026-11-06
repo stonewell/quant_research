@@ -23,7 +23,11 @@ per-namespace look-back start). Pinned here:
 3. differing per-namespace `max_date`s -> the fetch's `start` is the EARLIER of the two
    per-namespace starts (the widest window), not the later one;
 4. both providers raising -> `fetch_errors[symbol]` is populated, nothing crashes, and
-   neither namespace is written.
+   neither namespace is written;
+5. differing per-namespace `max_date`s where the LATER namespace's stored basis disagrees
+   inside the widened prefix -> the per-namespace window slice keeps that namespace's
+   input identical to what its own (pre-merge) fetch would have returned, so its tail
+   appends instead of the merged window tripping `QfqWriteRefused`.
 
 100% offline: `BaoStockDataProvider` / `EastMoneyDataProvider` are replaced by provider
 doubles that return prepared frames (or raise), the cache is an in-memory DuckDB, and no
@@ -32,6 +36,7 @@ price series is real.
 
 import os
 import sys
+import warnings
 
 import pandas as pd
 import pytest
@@ -318,3 +323,62 @@ def test_total_fetch_failure_is_reported_and_writes_nothing(cache, monkeypatch):
             check_freq=False,
         )
         assert cache.get_asset_metadata(prov, SYMBOL) == meta_before[prov]
+
+
+# ---------------------------------------------------------------------------
+# 5. Differing max_dates + a disagreeing stored close in the widened prefix
+# ---------------------------------------------------------------------------
+
+
+def test_per_namespace_window_is_sliced_back_to_its_own_fetch(cache, monkeypatch):
+    """The merged window must not leak one namespace's days into the other's verification.
+
+    Fuyao lags from 2026-10-21 (own start 2026-10-16), MarketDB from 2026-10-23 (own start
+    2026-10-18), so the single merged fetch starts at 2026-10-16. MarketDB's stored close on
+    2026-10-16 disagrees with the incoming value: that session is INSIDE the widened prefix
+    but OUTSIDE the window MarketDB's own pre-merge fetch would have asked for.
+
+    Without the per-namespace slice, `plan_history_write` sees the disagreement and refuses
+    the whole MarketDB write (`QfqWriteRefused`, this test's pre-fix failure). With it,
+    MarketDB's input starts at 2026-10-18 exactly as before, so its tail appends and the
+    disagreeing stored row is left alone -- the same bytes the pre-merge code produced.
+    """
+    fuyao_seed = _up_to("2026-10-21")  # own start: 2026-10-16 (the merged start)
+    mdb_seed = _up_to("2026-10-23")  # own start: 2026-10-18
+    _assert_lags("2026-10-21")
+    _assert_lags("2026-10-23")
+
+    # The disagreement sits at 2026-10-16, i.e. only inside the prefix the merge introduced.
+    prefix_day = pd.Timestamp("2026-10-16")
+    disagreeing_close = float(CONTINUOUS.loc[prefix_day, "Close"]) * 0.98
+    mdb_seed.loc[prefix_day, ["Open", "High", "Low", "Close"]] *= 0.98
+    assert float(mdb_seed.loc[prefix_day, "Close"]) == pytest.approx(disagreeing_close)
+
+    _store(cache, fuyao_seed, FUYAO)
+    _store(cache, mdb_seed, MDB)
+
+    fake = _CountingProvider(_refetch())
+    _install(monkeypatch, fake, fake)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        fetch_errors = sync.patch_equity_daily_bars(cache, [SYMBOL], end=END)
+
+    assert fetch_errors == {}
+    # One fetch, still spanning the widest window (the earlier namespace's start).
+    assert fake.starts == ["2026-10-16"]
+    # Nothing was refused: no QfqRebaseWarning escaped the write gate.
+    assert [w for w in caught if issubclass(w.category, sync.QfqRebaseWarning)] == []
+
+    mdb_after = _stored(cache, MDB)
+    # MarketDB's tail appended normally...
+    assert mdb_after.index.max() == pd.Timestamp(END)
+    assert pd.Timestamp(END) in mdb_after.index
+    # ...and its disagreeing stored prefix row was NOT rewritten by the slice path.
+    assert float(mdb_after.loc[prefix_day, "close"]) == pytest.approx(disagreeing_close)
+
+    fuyao_after = _stored(cache, FUYAO)
+    assert fuyao_after.index.max() == pd.Timestamp(END)
+    assert float(fuyao_after.loc[prefix_day, "close"]) == pytest.approx(
+        float(CONTINUOUS.loc[prefix_day, "Close"])
+    )

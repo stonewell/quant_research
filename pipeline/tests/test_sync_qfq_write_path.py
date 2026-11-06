@@ -475,9 +475,14 @@ def test_patch_equity_daily_bars_refuses_instead_of_rescaling(cache, monkeypatch
     _store(cache, history)
     before = _stored(cache)
 
-    # The re-fetch starts 5 days before MAX (the real look-back shape) and comes back on a
-    # different qfq basis -- the 600660.SH incident factor. Volume untouched, as in the incident.
-    refetch_dates = pd.bdate_range("2017-02-07", "2017-03-10")
+    # The re-fetch starts at the real look-back anchor -- `patch_start` in
+    # `patch_equity_daily_bars`, i.e. `max_date - timedelta(days=5)` (CALENDAR days, so
+    # 2017-02-14 -> 2017-02-09) -- and comes back on a different qfq basis: the 600660.SH
+    # incident factor. Volume untouched, as in the incident. This start used to be
+    # `2017-02-07` (5 *business* days), which only worked because `_FakeProvider` ignores
+    # `start`: the incoming window then held two sessions the code never requested, so
+    # `exc.date` was pinning the double's over-delivery rather than the refusal gate.
+    refetch_dates = pd.bdate_range("2017-02-09", "2017-03-10")
     refetched = continuous.loc[continuous.index.isin(refetch_dates)].copy()
     for col in ("Open", "High", "Low", "Close"):
         refetched[col] = refetched[col] * INCIDENT_FACTOR
@@ -492,10 +497,10 @@ def test_patch_equity_daily_bars_refuses_instead_of_rescaling(cache, monkeypatch
 
     exc = excinfo.value
     assert exc.symbol == SYMBOL and exc.provider == PROVIDER
-    assert exc.date == datetime.date(2017, 2, 7)  # first overlapping session that disagrees
+    assert exc.date == datetime.date(2017, 2, 9)  # first requested session that disagrees
     out = capsys.readouterr().out
     assert "[REFUSED]" in out
-    assert SYMBOL in out and "2017-02-07" in out
+    assert SYMBOL in out and "2017-02-09" in out
 
     # The stored series is byte-identical: no rescale, no tail seam, no partial write.
     pd.testing.assert_frame_equal(_stored(cache), before, check_exact=True)
@@ -507,7 +512,9 @@ def test_patch_equity_daily_bars_appends_an_aligned_tail(cache, monkeypatch):
     history = continuous.loc[continuous.index <= "2017-02-14"]
     _store(cache, history)
 
-    refetch_dates = pd.bdate_range("2017-02-07", "2017-03-10")
+    # Same look-back anchor as the refusal test above (`patch_start` = `max_date - 5` CALENDAR
+    # days = 2017-02-09); both cases must describe the window the code actually requests.
+    refetch_dates = pd.bdate_range("2017-02-09", "2017-03-10")
     refetched = continuous.loc[continuous.index.isin(refetch_dates)].copy()
 
     fake = _FakeProvider(refetched)

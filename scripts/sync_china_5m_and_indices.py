@@ -1144,11 +1144,48 @@ def patch_equity_daily_bars(
             # close. Re-baselining is `scripts/repair_qfq_alignment.py`'s job.
             #
             # One `new_df` now feeds every lagging namespace, so the loop below is the write
-            # tail only. `plan_history_write` copies its input, so sharing the frame is safe.
+            # tail only. `plan_history_write` copies its input, so sharing the frame is safe --
+            # but each namespace is first sliced back to the window IT would have fetched
+            # before the merge (see below).
             # ------------------------------------------------------------------------------
             for prov in lagging:
+                # Per-namespace window slice (2026-11-05 follow-up). The single merged fetch
+                # above is issued with the EARLIEST lagging namespace's start, so a namespace
+                # whose own `max_date` is later would otherwise be handed days it never used to
+                # fetch: extra overlap rows to verify, extra holes to "fill", and -- if a stored
+                # close in that prefix disagrees -- a `QfqWriteRefused` where the pre-merge code
+                # simply appended. Bounding the frame to this namespace's own `max_date - 5d`
+                # reproduces byte-identical input to that code path for every namespace.
+                #
+                # This is NOT the removed L2.28 alignment: nothing is rescaled, only the window
+                # is bounded. And it is deliberately NOT a `> max_date` tail trim: the 5-day
+                # overlap is exactly the input `plan_history_write` needs to verify the stored
+                # basis against the incoming closes and refuse a re-base, so dropping it would
+                # let a basis drift through silently.
+                #
+                # DISCLOSED LIMIT: if a provider over-delivers rows before the requested
+                # `start`, the pre-merge path carried them into `plan_history_write`; this slice
+                # drops them. Equivalence is therefore exact for providers that honour `start`
+                # (BaoStock passes `start_date`, EastMoney computes `beg`) and only laxer for a
+                # double that ignores it -- not a claim of equivalence for over-delivery.
+                prov_max_date = row_dict.get((sym, prov))
+                if prov_max_date is None:
+                    # First-ever sync for this namespace: a full window is legitimate, and
+                    # there is no stored basis to verify, so the whole frame is the input.
+                    prov_df = new_df
+                else:
+                    own_start = pd.Timestamp(prov_max_date - datetime.timedelta(days=5))
+                    prov_df = new_df.loc[pd.to_datetime(new_df.index) >= own_start]
+                if prov_df.empty:
+                    # The merged response held nothing inside THIS namespace's own window (e.g.
+                    # a truncated reply that only covered the other namespace's earlier prefix).
+                    # The pre-merge code fetched per namespace and reported exactly this as
+                    # "no new bars"; keep that, and keep an empty frame out of
+                    # `plan_history_write`, which refuses one with a `ValueError`.
+                    print("SKIPPED (no new bars)")
+                    continue
                 try:
-                    plan = plan_history_write(cache, prov, sym, new_df, interval="1d")
+                    plan = plan_history_write(cache, prov, sym, prov_df, interval="1d")
                 except QfqWriteRefused as exc:
                     refusals.add(exc)
                     continue
