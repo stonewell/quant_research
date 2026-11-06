@@ -952,13 +952,20 @@ def patch_equity_daily_bars(
     stocks: List[str],
     end: str,
 ) -> Dict[str, str]:
-    """Patches lagging recent daily bars for the 22 stocks under Fuyao & MarketDB.
+    """Patches lagging recent daily bars for the 22 stocks in the Fuyao & MarketDB namespaces.
+
+    One fetch per symbol (2026-11-05): the fetched frame is written to every write namespace
+    that is actually lagging, and a namespace that is already fresh is never written to. The
+    fetch used to run inside the namespace loop, i.e. twice for a symbol stale in both -- same
+    bytes, two requests. The response now spans the widest window any lagging namespace needs
+    (the earliest per-namespace look-back start), because a single fetch feeds all of them.
 
     Per-symbol isolation (2026-10-27 Stage-1 incident): each fetch attempt is wrapped
     individually, a failing symbol is logged (`_log_symbol_fetch_failure`) and skipped,
     and the loop keeps going. A symbol whose providers ALL errored is returned in the
     mapping below -- deliberately distinct from "fetched zero new bars", which stays a
-    plain `SKIPPED (no new bars)` and is not reported as a failure.
+    plain `SKIPPED (no new bars)` and is not reported as a failure. A failure is therefore
+    reported once per symbol even though it blocks every lagging namespace it would feed.
 
     Returns
     -------
@@ -1015,9 +1022,12 @@ def patch_equity_daily_bars(
     #: `return fetch_errors`. Nothing here is re-raised into that shape: each refusal is
     #: attributed to its symbol/provider and the loop moves on (schema doc §4.3/§6).
     null_volume_refusals: List[NullVolumeRefused] = []
-    #: `(symbol, provider, exception)` already warned about. The provider loop below runs
-    #: the same fetch twice (once per write namespace), so without this each failing symbol
-    #: would log its warning twice and look like two independent failures.
+    #: `(symbol, provider, exception)` already warned about. This exists because the fetch used
+    #: to sit inside the provider loop and therefore ran twice per symbol (once per write
+    #: namespace): without it each failing symbol logged its warning twice and looked like two
+    #: independent failures. The fetch is now made once per symbol, so nothing in the normal
+    #: path repeats a warning -- the set is kept as the guard that keeps a duplicate entry in
+    #: `stocks` (or a future retry) from double-reporting, not because the doubling still exists.
     logged_failures: set = set()
 
     def _log_once(_sym: str, _provider: str, _exc: BaseException) -> None:
@@ -1029,89 +1039,114 @@ def patch_equity_daily_bars(
 
     try:
         for sym in stocks:
-            for prov in ["FuyaoDataProvider", "MarketDBDataProvider"]:
+            # One fetch per symbol, written to EVERY namespace that is actually lagging (option
+            # C, 2026-11-05). The fetch used to live inside the namespace loop below, so a symbol
+            # stale in both write namespaces was requested -- and returned -- twice, each
+            # response feeding one namespace: same bytes, double the network cost. A namespace
+            # that is already fresh is still never written to, because it never enters `lagging`
+            # and therefore never reaches the write tail at all.
+            lagging: List[str] = []
+            for prov in ("FuyaoDataProvider", "MarketDBDataProvider"):
                 max_date = row_dict.get((sym, prov))
                 if max_date is not None and max_date >= target_end_date - datetime.timedelta(days=2):
                     continue  # Already up to date
+                lagging.append(prov)
+            if not lagging:
+                continue  # Every namespace fresh -- identical to the old "all skipped" case.
 
-                patch_start = (
-                    (max_date - datetime.timedelta(days=5)).strftime("%Y-%m-%d")
-                    if max_date
-                    else "2016-01-01"
-                )
-                print(f"-> Patching {sym} [{prov}] from {patch_start}...", end=" ", flush=True)
+            # One response feeds all lagging namespaces, so the fetch must cover the WIDEST
+            # window any of them needs: the EARLIEST of the per-namespace look-back starts
+            # (`max_date - 5d`, or `"2016-01-01"` for a namespace with no stored history).
+            # `%Y-%m-%d` sorts chronologically, so `min` is the earliest date. Before this
+            # change each namespace fetched only its own -- possibly narrower -- window.
+            patch_start = min(
+                (row_dict[(sym, prov)] - datetime.timedelta(days=5)).strftime("%Y-%m-%d")
+                if row_dict.get((sym, prov))
+                else "2016-01-01"
+                for prov in lagging
+            )
+            print(
+                f"-> Patching {sym} [{' + '.join(lagging)}] from {patch_start}...",
+                end=" ",
+                flush=True,
+            )
 
-                # Fetch recent RAW bars: try BaoStock first then EastMoney. `fetch_raw_ohlcv`
-                # (not `fetch_ohlcv`) is what makes the `adjustflag="raw"` label below true --
-                # the providers are constructed unadjusted anyway, but asking for raw explicitly
-                # means the label cannot drift if someone edits the constructor above (F7).
-                # `getattr` fallback mirrors the 5m path's `fetch_bs` idiom: a provider double (or
-                # an older provider) that only implements `fetch_ohlcv` is still called, and the
-                # instance was constructed in raw mode, so the bytes stay raw.
-                fetch_bs = getattr(bs_prov, "fetch_raw_ohlcv", bs_prov.fetch_ohlcv)
-                new_df = pd.DataFrame()
-                attempts: List[Tuple[str, BaseException]] = []
+            # Fetch recent RAW bars: try BaoStock first then EastMoney. `fetch_raw_ohlcv`
+            # (not `fetch_ohlcv`) is what makes the `adjustflag="raw"` label below true --
+            # the providers are constructed unadjusted anyway, but asking for raw explicitly
+            # means the label cannot drift if someone edits the constructor above (F7).
+            # `getattr` fallback mirrors the 5m path's `fetch_bs` idiom: a provider double (or
+            # an older provider) that only implements `fetch_ohlcv` is still called, and the
+            # instance was constructed in raw mode, so the bytes stay raw.
+            fetch_bs = getattr(bs_prov, "fetch_raw_ohlcv", bs_prov.fetch_ohlcv)
+            new_df = pd.DataFrame()
+            attempts: List[Tuple[str, BaseException]] = []
+            try:
+                new_df = fetch_bs(sym, patch_start, end, interval="1d")
+            except Exception as exc:
+                # Isolated per symbol ON PURPOSE: one poisoned response (e.g. a GBK
+                # error page surfacing as DataProviderPayloadError) must not abort
+                # the remaining 21 symbols nor the whole Stage-1 process.
+                attempts.append(("BaoStockDataProvider", exc))
+                _log_once(sym, "BaoStockDataProvider", exc)
+            if new_df.empty:
                 try:
-                    new_df = fetch_bs(sym, patch_start, end, interval="1d")
+                    time.sleep(0.15)
+                    fetch_em = getattr(em_prov, "fetch_raw_ohlcv", em_prov.fetch_ohlcv)
+                    new_df = fetch_em(sym, patch_start, end, interval="1d")
                 except Exception as exc:
-                    # Isolated per symbol ON PURPOSE: one poisoned response (e.g. a GBK
-                    # error page surfacing as DataProviderPayloadError) must not abort
-                    # the remaining 21 symbols nor the whole Stage-1 process.
-                    attempts.append(("BaoStockDataProvider", exc))
-                    _log_once(sym, "BaoStockDataProvider", exc)
-                if new_df.empty:
-                    try:
-                        time.sleep(0.15)
-                        fetch_em = getattr(em_prov, "fetch_raw_ohlcv", em_prov.fetch_ohlcv)
-                        new_df = fetch_em(sym, patch_start, end, interval="1d")
-                    except Exception as exc:
-                        attempts.append(("EastMoneyDataProvider", exc))
-                        _log_once(sym, "EastMoneyDataProvider", exc)
+                    attempts.append(("EastMoneyDataProvider", exc))
+                    _log_once(sym, "EastMoneyDataProvider", exc)
 
-                if new_df.empty:
-                    if attempts:
-                        # "Every provider raised" is a FETCH FAILURE, not "0 new bars".
-                        # Recorded/logged once per symbol: the provider loop above runs the
-                        # same fetch twice (once per write namespace), so repeating the
-                        # warning would only duplicate it.
-                        if sym not in fetch_errors:
-                            fetch_errors[sym] = "; ".join(
-                                f"{p}: {summarize_fetch_error(e)}" for p, e in attempts
-                            )
-                        print(
-                            f"FAILED (fetch error, {len(attempts)} provider(s) raised: "
-                            f"{type(attempts[-1][1]).__name__})"
+            if new_df.empty:
+                if attempts:
+                    # "Every provider raised" is a FETCH FAILURE, not "0 new bars".
+                    # Recorded once per symbol: there is now exactly one fetch per symbol, so
+                    # `sym not in fetch_errors` is a defensive guard rather than the
+                    # de-duplication it used to be (the fetch ran once per write namespace and
+                    # repeating the warning would have duplicated it).
+                    if sym not in fetch_errors:
+                        fetch_errors[sym] = "; ".join(
+                            f"{p}: {summarize_fetch_error(e)}" for p, e in attempts
                         )
-                    else:
-                        print("SKIPPED (no new bars)")
-                    continue
+                    print(
+                        f"FAILED (fetch error, {len(attempts)} provider(s) raised: "
+                        f"{type(attempts[-1][1]).__name__})"
+                    )
+                else:
+                    print("SKIPPED (no new bars)")
+                continue
 
-                # ------------------------------------------------------------------------------
-                # L2.28: the windowed "overlap-day alignment" that used to live here is GONE.
-                #
-                # It was:
-                #     if max_date is not None and pd.Timestamp(max_date) in new_df.index:
-                #         loc_c = close_map[(sym, prov, max_date)]          # ONE stored close
-                #         if abs(new_c - loc_c) / loc_c > 1e-4:
-                #             new_df[["Open","High","Low","Close"]] *= loc_c / new_c
-                #     new_df = new_df[new_df.index.date > max_date]
-                #
-                # That single scalar is a *local basis difference*, not a corporate action
-                # (docs/version.md §13.8: 600362.SH's factor was the reciprocal of the local
-                # Fuyao/MarketDB ratio to 1 ULP; 600660.SH's could not be attributed to any
-                # upstream difference at all). Multiplying by it turns a contaminated
-                # reference into a "fix", and the only thing that kept the multiply off
-                # stored rows was the ordering of the `> max_date` trim -- one line, not a
-                # contract (the 2026-10-22 writer that did reach stored history produced
-                # exactly this fingerprint: single constant, `volume` untouched, window lower
-                # bound == fetch start, §15.3).
-                #
-                # A real qfq re-baseline rescales the whole history before the ex-date (an
-                # open interval towards the past); this path cannot know that, so it does not
-                # rescale at all. It only INSERTS rows the cache lacks, and refuses the symbol
-                # (naming it and the date) when the incoming window disagrees with a stored
-                # close. Re-baselining is `scripts/repair_qfq_alignment.py`'s job.
-                # ------------------------------------------------------------------------------
+            # ------------------------------------------------------------------------------
+            # L2.28: the windowed "overlap-day alignment" that used to live here is GONE.
+            #
+            # It was:
+            #     if max_date is not None and pd.Timestamp(max_date) in new_df.index:
+            #         loc_c = close_map[(sym, prov, max_date)]          # ONE stored close
+            #         if abs(new_c - loc_c) / loc_c > 1e-4:
+            #             new_df[["Open","High","Low","Close"]] *= loc_c / new_c
+            #     new_df = new_df[new_df.index.date > max_date]
+            #
+            # That single scalar is a *local basis difference*, not a corporate action
+            # (docs/version.md §13.8: 600362.SH's factor was the reciprocal of the local
+            # Fuyao/MarketDB ratio to 1 ULP; 600660.SH's could not be attributed to any
+            # upstream difference at all). Multiplying by it turns a contaminated
+            # reference into a "fix", and the only thing that kept the multiply off
+            # stored rows was the ordering of the `> max_date` trim -- one line, not a
+            # contract (the 2026-10-22 writer that did reach stored history produced
+            # exactly this fingerprint: single constant, `volume` untouched, window lower
+            # bound == fetch start, §15.3).
+            #
+            # A real qfq re-baseline rescales the whole history before the ex-date (an
+            # open interval towards the past); this path cannot know that, so it does not
+            # rescale at all. It only INSERTS rows the cache lacks, and refuses the symbol
+            # (naming it and the date) when the incoming window disagrees with a stored
+            # close. Re-baselining is `scripts/repair_qfq_alignment.py`'s job.
+            #
+            # One `new_df` now feeds every lagging namespace, so the loop below is the write
+            # tail only. `plan_history_write` copies its input, so sharing the frame is safe.
+            # ------------------------------------------------------------------------------
+            for prov in lagging:
                 try:
                     plan = plan_history_write(cache, prov, sym, new_df, interval="1d")
                 except QfqWriteRefused as exc:
@@ -1143,6 +1178,10 @@ def patch_equity_daily_bars(
                 # (first-ever sync, no stored bars) may pass the real request start. The
                 # metadata boundaries themselves remain the bar facts -- `store_bars`
                 # cross-checks `ohlcv_bars`' MIN/MAX and never the window.
+                # `patch_start` is now the common (earliest) start of every lagging namespace,
+                # so this fallback is only reachable for a namespace with no stored bars at all
+                # -- whose own start would be `"2016-01-01"`, the earliest string this path can
+                # produce -- i.e. the two coincide unless stored history predates 2016-01-06.
                 # LV5 per-symbol isolation: `NullVolumeRefused` only. A null-volume row means this
                 # symbol's fetched window contains a cell the source never filled; the rest of the
                 # window WAS written (the cache refuses per row, not per batch), so the loop must
