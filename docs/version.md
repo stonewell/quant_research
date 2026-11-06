@@ -4141,3 +4141,57 @@ LIVETRADING_STRICT_SEED_BOOK=0        # 0 / false / no / off 同样生效
   - `uv run pytest ../common/tests -q --import-mode=importlib` -> 945 passed, 1 skipped
   - `uv run pytest ../pipeline/tests -q --import-mode=importlib` -> 536 passed, 1 skipped
   - `uv run pytest ../pipeline/strategy_generator/tests -q --import-mode=importlib` -> 74 passed
+
+---
+
+## 27. M1.3: 换手惩罚 Long-Only QP（最小方差配置模板扩展，2026-11-05）
+
+### 27.1 背景与目标
+- **任务目标**：在既有 `MinimumVarianceAllocation` 静态模板上增加**可选（opt-in）**的换手惩罚 Long-Only 二次规划：在 Markowitz 方差最小化目标上叠加对「相对上一期目标权重变化」的 L1 惩罚，抑制调仓摩擦（turnover friction bleed），并附加单票上限、行业暴露变动预算与最小成交换手剪枝（prune）。
+- **学术依据**：Garleanu & Pedersen (2013, *Journal of Finance*, "Dynamic Trading with Predictable Returns and Transaction Costs")——比例型交易成本在一阶近似下等价于对权重变化施加 L1 惩罚；方差项沿用 Markowitz (1952) 的无预期收益（λ=0）形式（预期收益估计不可靠，故不引入）。
+- **目标函数**：
+  `min_w  wᵀΣw + γ·Σ_i sqrt((w_i − w0_i)² + 1e-6)`
+  约束：`0 ≤ w_i ≤ opt_single_cap`、`Σw ≤ 1`（残余 `1 − Σw` 为现金，不作为符号资产），以及在提供行业映射时逐行业 `|Σ_g w − Σ_g w0| ≤ opt_sector_dev`。
+  L1 使用 `sqrt(d²+1e-6)` 平滑（伪 Huber），保证 SLSQP 可微；平滑对换手标量的误差上界为 1e-3。
+
+### 27.2 核心改动
+1. **新增模块级助手 `_turnover_penalized_weights`（`common/allocation_templates.py`）**：
+   - SLSQP 求解，`options={"ftol": 1e-12, "maxiter": 500}`。**实测发现**：SLSQP 默认 `ftol=1e-6` 在日频协方差（量级 1e-5）上会出现「一次迭代即判定收敛、直接返回等权初值」的早停缺陷（`_min_variance_weights` 至今保留该行为，**未修改**，以保证默认路径逐位一致）。新助手仅收紧 ftol，不改变数学问题本身。
+   - **回退阶梯（绝不抛异常）**：① 平滑 L1 + 行业约束；② 引入辅助变量 `t_i ≥ |w_i − w0_i|` 的精确 L1 重试；③ 去掉行业约束重试；④ `_min_variance_weights(cov)` 旧路径（再按 cap 裁剪/向下归一）；⑤ 等权 `1/n` 并按 cap 裁剪。
+   - **γ=0 精确退化**：直接 `return _min_variance_weights(cov)`（沿用旧路径的 `Σw == 1` 等式形式与 `[0,1]` 边界），`rtol=1e-9` 逐位一致。
+2. **新增助手 `_sector_groups`**：复用 `common/sector_metadata.resolve_sector`（M2.1 SSOT 解析器，`fallback='auto'`）把列索引按行业分组；已披露近似——非 A 股代码全部落入 `'other'` 单一桶，此时行业预算退化为「总暴露变动预算」。
+3. **`MinimumVarianceAllocation` 新增 5 个可选参数（均**不进入** `param_grid`，搜索空间不变）**：
+   `opt_turnover_penalty=0.0`（γ，默认关闭）、`opt_single_cap=0.20`、`opt_sector_dev=0.03`、`opt_prune=0.005`、`opt_sector_map=None`（显式行业映射，测试与生产注入用）。
+4. **默认关闭守卫（逐位一致）**：`generate_weights` 首行读取 `opt_turnover_penalty`，`> 0.0` 才转入新方法 `_generate_weights_turnover_penalized`；否则执行 M1.3 之前的原有代码路径（代码未改动），输出与 HEAD 版本逐位相同（用 `git show HEAD:` 旧实现对照 + 硬编码快照双重锁定）。
+5. **`w0` 重建（无状态模板）**：`generate_weights` 无内部状态，故在调仓循环内用「本次运行上一调仓日的已解目标」重建 `w0`：仍有效标的取上一期解、新生效标的取 `0.0`（自现金建仓 = 全额换手）、首次调仓为全零向量；已持有但当期无效的标的在该行**显式写 `0.0`**（其退出在目标函数中是常数项，不进入求解向量，因无效标的无协方差定义）。
+6. **已披露例外（自现金起点）**：`w0 ≡ 0` 时平滑 L1 退化为 `γ·Σw` 的「按比例入场成本」，在允许现金残余（`Σw ≤ 1`）时，只要 `γ` 大于组合方差量级（日频约 1e-4），平凡的全现金解就占优——首次调仓会 100% 现金且此后永不建仓。因「无既有持仓即无换手可罚」，首次调仓改为普通最小方差解（再按 cap 裁剪）。**遗留风险**：`Σw ≤ 1` 且无最低投资约束时，目标函数对「降低总暴露」存在系统性偏好，实测在 `opt_sector_dev=0.03` + 多行业映射下总暴露每期可衰减约 3%/行业（2 行业约 6%/期）；设 `opt_sector_dev=0.0` 可把各行业暴露完全锁死（总暴露不变，仅行业内构成调整）。是否改用 `Σw == 1` 或加最低投资下限，待协调者决策。
+7. **稀疏权重契约**：非调仓日保持 `NaN`，模板内部绝不 `ffill()`；调仓行先用 `weights_rebal.loc[date, :] = 0.0` 再覆盖有效标的，被排除标的为**显式 `0.0`**（避免回测器列向 ffill 保留陈旧持仓）。
+8. **Prune**：`|w_i − w0_i| < opt_prune` 的权重精确回写为 `w0_i`，随后重新裁剪至 `[0, cap]`、必要时向下归一。
+
+### 27.3 版本轴演进说明
+- **`MinimumVarianceAllocation`**：`version = "1.0.0" -> "1.1.0"`（向后兼容的可选参数扩展，默认关闭，输出不变）。
+- **底座说明**：`common/allocation_templates.py` 依旧**无**文件级 `BASE_VERSION`（该属性仅存在于 `BaseBlendAllocationStrategy`），本次未新增也未修改任何底座版本。
+- **配置 Dump 说明**：`strategy_dumps/` 只序列化 `StrategyConfig` 驱动的 research/blend 策略（字段 `strategy_version` / `base_version` / `version_info`），**不序列化 9 个静态配置模板**。已执行 `research_strategy/run_research_strategy.py --dump-strategies`：`results/strategy_dumps/` 无任何文件变动（`git status` 干净），且无任何 dump 文件包含 `minimum_variance` / `MinimumVarianceAllocation`。因此静态模板版本号**不会**出现在 dump 中（对账时勿以 dump 为空判断版本未升级）。
+
+### 27.4 离线测试验证（100% 离线、0 网络依赖）
+- 新增 `common/tests/test_turnover_penalized_qp.py`（14 条，全绿）：
+  1. `test_turnover_penalty_shifts_weights_toward_prior_target`：手算 2×2 程序，γ=0 解为 (0.8261, 0.1739)、`w0=(1,0)`、γ=0.02 → `w_A` 向 `w0` 移动且不等于 1。
+  2. `test_single_cap_invariant_on_every_rebalance_row`：每个调仓行 `max(w) ≤ cap + 1e-6`。
+  3. `test_long_only_and_cash_budget`：`w ≥ 0`、`Σw ≤ 1 + 1e-6`。
+  4. `test_sector_deviation_budget_is_enforced`：带行业映射时逐行业 `|Δ暴露| ≤ 0.03 + 1e-6`；同时断言无映射（单桶）时同一指标 > 0.03，证明约束真实生效而非空转。
+  5. `test_nan_vs_explicit_zero_on_rebalance_rows`：晚上市标的在早期调仓行为显式 `0.0`（非 NaN）、该行其余单元格稠密；非调仓日全为 `NaN`（无 ffill）。
+  6. `test_prune_snaps_sub_threshold_trades_to_prior_weight`：`prune=0` 时存在 `0 < |Δw| < 0.02` 的位移，`prune=0.02` 后该权重与上期**精确相等**，且整行并非上期的复制。
+  7. `test_solver_failure_degrades_without_raising`：monkeypatch `scipy.optimize.minimize` 返回 `success=False` → 不抛异常，回退至 `min(1/n, cap)` 有效向量。
+  8. `test_disabled_penalty_helper_reduces_to_legacy_min_variance` / `test_disabled_penalty_generate_weights_is_bit_identical` / `test_opt_params_are_not_in_the_search_grid`：γ=0 助手 ≈ `_min_variance_weights`（`rtol=1e-9`）；`generate_weights` 默认/显式 0.0 与预 M1.3 硬编码快照逐位相等；其余新参数在关闭态完全惰性；4 个新参数不在 `param_grid`。
+  9. `test_single_symbol_universe_unchanged` / `test_all_nan_window_returns_empty_frames_without_raising`：单标的与全 NaN 窗口均无新异常（前者默认路径仍为 1.0，惩罚路径按 cap 给 0.6 + 0.4 现金）。
+- **非空转（变异）验证**：逐条临时改写实现并复跑，确认变红后复原：
+  - 移除 γ=0 早退（改走通用求解）→ 用例 8 变红。
+  - 移除 `opt_turnover_penalty` 首行守卫（默认也走新路径）→ 用例 8、9 变红。
+  - 忽略惩罚（助手恒返回 `_min_variance_weights`）→ 用例 1、2、4、6 变红。
+  - 调仓行不写显式 `0.0`（保留 NaN）→ 用例 5 变红。
+  - 求解失败时改为抛 `RuntimeError`（去掉退化策略）→ 用例 7 变红。
+- **回归结果**：
+  - `pipeline/.venv/bin/python -m pytest common/tests/test_turnover_penalized_qp.py -q --import-mode=importlib` -> 14 passed
+  - `pipeline/.venv/bin/python -m pytest common/tests/test_allocation_templates.py common/tests/test_strategy_versioning.py -q --import-mode=importlib` -> 16 passed
+  - `pipeline/.venv/bin/python -m pytest common/tests -q --import-mode=importlib` -> **1273 passed, 1 skipped**（改动前基线 1259 passed, 1 skipped，增量恰为本次新增 14 条）
+  - `pipeline/.venv/bin/python -m pytest pipeline/strategy_generator/tests -q --import-mode=importlib` -> 74 passed

@@ -202,6 +202,236 @@ def _min_variance_weights(cov: np.ndarray) -> np.ndarray:
     return w / total if total > 0 else x0
 
 
+def _sector_groups(symbols: List[str], sector_map: Optional[dict] = None) -> List[np.ndarray]:
+    """Groups integer column indices of `symbols` by resolved sector label, for
+    `_turnover_penalized_weights`'s per-sector turnover-budget constraints. Uses
+    `common.sector_metadata.resolve_sector` (the shared SSOT resolver, M2.1) with
+    its 'auto' fallback: genuine A-share codes fall back to a ticker-prefix
+    pseudo-class, everything else lands in a single 'other' bucket.
+
+    HONEST CAVEAT: 'other' is a catch-all bucket, not an economic sector, so for
+    universes whose symbols are not in the supplied `sector_map` this collapses
+    into ONE group and the per-sector budget degenerates into a total-turnover
+    budget. That is a disclosed approximation, not a bug -- supplying an explicit
+    `opt_sector_map` param is what makes the constraint sector-meaningful.
+    """
+    from common.sector_metadata import resolve_sector
+
+    buckets: dict = {}
+    for i, sym in enumerate(symbols):
+        try:
+            label = resolve_sector(sym, sector_map or None, fallback="auto")
+        except Exception:
+            # Degrade, never throw: an unparsable ticker joins the catch-all
+            # bucket so the constraint stays well-defined.
+            label = "other"
+        buckets.setdefault(label, []).append(i)
+    return [np.asarray(idx, dtype=int) for idx in buckets.values()]
+
+
+def _turnover_penalized_weights(
+    cov: np.ndarray,
+    w0: np.ndarray,
+    turnover_penalty: float = 0.0,
+    single_cap: float = 0.20,
+    sector_groups: Optional[List[np.ndarray]] = None,
+    sector_dev: float = 0.03,
+) -> np.ndarray:
+    """Turnover-penalized long-only minimum-variance weights (M1.3).
+
+    Objective (mean-return term deliberately ABSENT, i.e. lambda = 0 -- see
+    `_min_variance_weights` for why a reliable expected-return estimate is the
+    unsolved half of Markowitz 1952):
+
+        min_w  w' S w  +  gamma * sum_i sqrt((w_i - w0_i)^2 + 1e-6)
+        s.t.   0 <= w_i <= single_cap
+               sum_i w_i <= 1              (residual 1 - sum w is CASH, not a symbol)
+               |sum_{i in g} w_i - sum_{i in g} w0_i| <= sector_dev   for each group g
+
+    The L1 turnover term is smoothed as `sqrt(d^2 + 1e-6)` (a standard
+    pseudo-Huber smoothing of |d|) so the objective stays differentiable for
+    SLSQP; the smoothing error is bounded by 1e-3 in the turnover *scalar*.
+    Grounding for the penalty itself: Garleanu & Pedersen (2013, Journal of
+    Finance, "Dynamic Trading with Predictable Returns and Transaction
+    Costs") -- a proportional trading cost is, to first order, an L1 penalty
+    on the weight change.
+
+    DISCLOSED SOLVER TUNING: `options={"ftol": 1e-12, "maxiter": 500}`. SLSQP's
+    default ftol=1e-6 stops after ONE iteration on well-conditioned but
+    small-magnitude covariances (daily variances ~1e-5), returning the
+    equal-weight start point -- a real premature-convergence quirk that
+    `_min_variance_weights` still exhibits and that is deliberately NOT fixed
+    there (its output must stay bit-identical). Tightening ftol only removes
+    that numerical artifact; it does not change the mathematical problem.
+
+    `gamma == 0` must reduce EXACTLY to `_min_variance_weights` (same sum-to-one
+    EQUALITY form, bounds [0, 1] -- the old path's form, not `<= 1`), so it
+    delegates verbatim rather than re-deriving the same program differently.
+
+    FAILURE POLICY -- degrade, never raise (mirrors `_min_variance_weights`'s
+    `return x0` and the backtester's `-inf`-Sharpe degradation convention). The
+    ladder always returns a valid long-only vector:
+      1. SLSQP on the smoothed L1 objective with sector constraints;
+      2. retry once with auxiliary variables t_i >= |w_i - w0_i| for the EXACT L1;
+      3. drop the sector constraints and retry the smoothed objective;
+      4. `_min_variance_weights(cov)` (the legacy path), then cap/renormalize;
+      5. equal weight 1/n clipped to the cap.
+
+    Returns a vector of length `len(w0)` with `0 <= w <= single_cap` and
+    `sum(w) <= 1 + 1e-12`.
+    """
+    from scipy.optimize import minimize
+
+    cov = np.asarray(cov, dtype=float)
+    n = cov.shape[0]
+    w0 = np.asarray(w0, dtype=float).reshape(-1)
+
+    # --- gamma == 0: exact legacy reduction (do not "unify" these paths;
+    # the acceptance bar is bit-identity with the pre-M1.3 output).
+    if turnover_penalty is None or float(turnover_penalty) <= 0.0:
+        return _min_variance_weights(cov)
+
+    gamma = float(turnover_penalty)
+    if len(w0) != n:
+        # Defensive: a mismatched prior vector cannot express a turnover cost,
+        # so treat it as "coming from cash" rather than raising.
+        w0 = np.zeros(n)
+
+    cap = 1.0 if single_cap is None else float(single_cap)
+    cap = float(np.clip(cap if np.isfinite(cap) else 1.0, 0.0, 1.0))
+    dev = float(sector_dev) if sector_dev is not None else 0.0
+    dev = dev if np.isfinite(dev) and dev >= 0.0 else 0.0
+
+    groups: List[np.ndarray] = []
+    if sector_groups:
+        for g in sector_groups:
+            idx = np.asarray(g, dtype=int).reshape(-1)
+            idx = idx[(idx >= 0) & (idx < n)]
+            if idx.size:
+                groups.append(idx)
+
+    def _try_solve(fun, x_start, bnds, cons) -> Optional[np.ndarray]:
+        """One SLSQP attempt; ANY exception or non-convergence returns None so
+        the caller's ladder can degrade. This is the only place `minimize` is
+        called, so a solver that raises (bad covariance, NaN bounds) cannot
+        escape as a template-level exception."""
+        try:
+            res = minimize(
+                fun, x_start, method="SLSQP", bounds=bnds, constraints=cons, options=opts
+            )
+        except Exception:
+            return None
+        if not getattr(res, "success", False):
+            return None
+        x = np.asarray(getattr(res, "x", None), dtype=float).reshape(-1)
+        if x.shape[0] != np.asarray(x_start).reshape(-1).shape[0] or not np.all(np.isfinite(x)):
+            return None
+        return x
+
+    def _finalize(w) -> np.ndarray:
+        """Project any solver output onto the feasible long-only box + cash
+        budget. Never raises; a non-finite/garbage vector degrades to the
+        equal-weight rung."""
+        arr = np.asarray(w, dtype=float).reshape(-1)
+        if arr.shape[0] != n or not np.all(np.isfinite(arr)):
+            return _equal_weight_rung()
+        arr = np.clip(arr, 0.0, cap)
+        total = float(arr.sum())
+        if total > 1.0:
+            arr = arr / total
+        return arr
+
+    def _equal_weight_rung() -> np.ndarray:
+        base = min(1.0 / n, cap) if n > 0 else 0.0
+        return np.full(n, base, dtype=float)
+
+    def _smooth_l1(w) -> float:
+        d = w - w0
+        return float(np.sum(np.sqrt(d * d + 1e-6)))
+
+    def _objective_smoothed(w) -> float:
+        return float(w @ cov @ w) + gamma * _smooth_l1(w)
+
+    def _build_constraints(with_sector: bool) -> list:
+        cons = [{"type": "ineq", "fun": lambda w: 1.0 - np.sum(w)}]
+        if with_sector:
+            for idx in groups:
+                prior = float(w0[idx].sum())
+                cons.append({
+                    "type": "ineq",
+                    "fun": lambda w, idx=idx, prior=prior: dev - (float(w[idx].sum()) - prior),
+                })
+                cons.append({
+                    "type": "ineq",
+                    "fun": lambda w, idx=idx, prior=prior: dev + (float(w[idx].sum()) - prior),
+                })
+        return cons
+
+    # Start point: the previous target, capped; a from-cash start (all-zero w0)
+    # has no sensible direction, so equal weight is the neutral warm start.
+    x0 = np.clip(w0, 0.0, cap)
+    if x0.sum() > 1.0:
+        x0 = x0 / x0.sum()
+    if x0.sum() <= 1e-12:
+        x0 = _equal_weight_rung()
+
+    bounds = [(0.0, cap)] * n
+    opts = {"ftol": 1e-12, "maxiter": 500}
+
+    # --- Rung 1: smoothed L1 + sector constraints.
+    sol = _try_solve(_objective_smoothed, x0, bounds, _build_constraints(True))
+    if sol is not None and float(np.sum(sol)) <= 1.0 + 1e-6:
+        return _finalize(sol)
+
+    # --- Rung 2: exact L1 via auxiliary variables t_i >= |w_i - w0_i|.
+    def _exact_objective(z) -> float:
+        w = z[:n]
+        return float(w @ cov @ w) + gamma * float(np.sum(np.clip(z[n:], 0.0, None)))
+
+    def _exact_constraints(with_sector: bool) -> list:
+        cons = []
+        for i in range(n):
+            cons.append({"type": "ineq", "fun": lambda z, i=i: z[n + i] - (z[i] - w0[i])})
+            cons.append({"type": "ineq", "fun": lambda z, i=i: z[n + i] - (w0[i] - z[i])})
+        cons.append({"type": "ineq", "fun": lambda z: 1.0 - float(np.sum(z[:n]))})
+        if with_sector:
+            for idx in groups:
+                prior = float(w0[idx].sum())
+                cons.append({
+                    "type": "ineq",
+                    "fun": lambda z, idx=idx, prior=prior: dev - (float(np.sum(z[:n][idx])) - prior),
+                })
+                cons.append({
+                    "type": "ineq",
+                    "fun": lambda z, idx=idx, prior=prior: dev + (float(np.sum(z[:n][idx])) - prior),
+                })
+        return cons
+
+    z0 = np.concatenate([x0, np.abs(x0 - w0)])
+    zbounds = [(0.0, cap)] * n + [(0.0, 1.0)] * n
+    sol = _try_solve(_exact_objective, z0, zbounds, _exact_constraints(True))
+    if sol is not None and float(np.sum(sol[:n])) <= 1.0 + 1e-6:
+        return _finalize(sol[:n])
+
+    # --- Rung 3: drop the sector constraints (a near-infeasible sector budget
+    # is the most likely reason rungs 1-2 both failed).
+    if groups:
+        sol = _try_solve(_objective_smoothed, x0, bounds, _build_constraints(False))
+        if sol is not None and float(np.sum(sol)) <= 1.0 + 1e-6:
+            return _finalize(sol)
+
+    # --- Rung 4: the legacy long-only minimum-variance solution.
+    try:
+        legacy = _min_variance_weights(cov)
+        if np.all(np.isfinite(legacy)) and float(np.sum(np.abs(legacy))) > 0:
+            return _finalize(legacy)
+    except Exception:
+        pass
+
+    # --- Rung 5: equal weight, clipped to the cap.
+    return _equal_weight_rung()
+
+
 def _fill_out_columns(daily: pd.DataFrame, symbols: list) -> pd.DataFrame:
     """Ensures `daily` has exactly `symbols` as its columns, in that order --
     any symbol not already present gets an explicit 0.0 column (never NaN,
@@ -1000,9 +1230,34 @@ class MinimumVarianceAllocation(AllocationTemplate):
         "rebalance_freq_days": [21, 63],
     })
     factor_tags: list = field(default_factory=lambda: ["correlation_diversification"])
-    version: str = "1.0.0"
+    version: str = "1.1.0"
+
+    # --- M1.3: opt-in turnover-penalized long-only QP. ---------------------
+    # These four knobs are DELIBERATELY absent from `param_grid`: the
+    # strategy_generator grid search must not vary them, so the default search
+    # space (and every existing backtest) is unchanged. They are read from
+    # `params` (falling back to these class defaults) only when
+    # `opt_turnover_penalty > 0`, i.e. when a caller explicitly opts in.
+    # `opt_turnover_penalty = 0.0` means "off" -- `generate_weights` then runs
+    # the pre-M1.3 code path verbatim (bit-identical output).
+    opt_turnover_penalty: float = 0.0   # gamma: L1 penalty on (w - w0)
+    opt_single_cap: float = 0.20        # per-symbol weight cap
+    opt_sector_dev: float = 0.03        # per-sector |delta exposure| budget
+    opt_prune: float = 0.005            # round |w_i - w0_i| below this to w0_i
+    opt_sector_map: Optional[dict] = None  # explicit symbol -> sector labels
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict) -> pd.DataFrame:
+        # --- M1.3 opt-in guard. MUST stay first: with the penalty at its
+        # default 0.0 this method must return exactly what it returned before
+        # M1.3 (verified to the last digit by
+        # common/tests/test_turnover_penalized_qp.py), so the new logic lives
+        # entirely in a separate method that this branch never reaches.
+        turnover_penalty = float(
+            params.get("opt_turnover_penalty", getattr(self, "opt_turnover_penalty", 0.0))
+        )
+        if turnover_penalty > 0.0:
+            return self._generate_weights_turnover_penalized(universe, params, turnover_penalty)
+
         symbols = list(universe.keys())
         if not symbols:
             return pd.DataFrame()
@@ -1047,8 +1302,125 @@ class MinimumVarianceAllocation(AllocationTemplate):
         weights_df.loc[rebalance_dates] = weights_rebal
         return weights_df
 
+    def _generate_weights_turnover_penalized(
+        self, universe: Dict[str, pd.DataFrame], params: dict, turnover_penalty: float
+    ) -> pd.DataFrame:
+        """M1.3 opt-in path: minimum-variance weights with an L1 penalty on the
+        change from the PREVIOUS target (`opt_turnover_penalty`), a per-symbol
+        cap, an optional per-sector turnover budget, and a prune dead-zone.
+
+        WHERE `w0` COMES FROM (the one design point a reader will question):
+        `generate_weights(universe, params)` is STATELESS -- it recomputes the
+        whole weight frame from prices on every call, so there is no stored
+        "current holdings" object to read. `w0` is therefore reconstructed
+        INSIDE the rebalance loop from this run's own previous solved target:
+          - symbol still valid  -> its previous solved weight;
+          - symbol newly valid  -> 0.0 (a from-cash entry is full turnover);
+          - first rebalance     -> the all-zero vector (everything from cash).
+        A symbol that was held but is no longer valid over the lookback is
+        pinned to an explicit 0.0 in that row. Its exit contributes exactly
+        `|0 - w0|` to the L1 term -- a CONSTANT with respect to the free
+        variables, so it cannot change the argmin and is not passed into the
+        solver's objective (including it in the solver's vector would require
+        a covariance entry for a symbol with no returns). It is still fully
+        counted in the sparse row as an explicit exit, which is what the
+        backtester charges turnover on.
+        """
+        symbols = list(universe.keys())
+        if not symbols:
+            return pd.DataFrame()
+
+        master_index = _get_master_index(universe)
+        if len(master_index) == 0:
+            return pd.DataFrame()
+        rebalance_dates = _get_rebalance_dates(master_index, params["rebalance_freq_days"])
+
+        returns_df = pd.DataFrame(index=master_index, columns=symbols)
+        for sym, df in universe.items():
+            if not df.empty:
+                returns_df[sym] = df["Close"].pct_change().reindex(master_index)
+
+        single_cap = float(params.get("opt_single_cap", getattr(self, "opt_single_cap", 0.20)))
+        sector_dev = float(params.get("opt_sector_dev", getattr(self, "opt_sector_dev", 0.03)))
+        prune = float(params.get("opt_prune", getattr(self, "opt_prune", 0.005)))
+        sector_map = params.get("opt_sector_map", getattr(self, "opt_sector_map", None)) or {}
+
+        lookback = params["cov_lookback"]
+        weights_rebal = pd.DataFrame(index=rebalance_dates, columns=symbols, data=np.nan)
+        # symbol -> last SOLVED target weight (only symbols valid at that date).
+        prev_target: Dict[str, float] = {}
+
+        for date in rebalance_dates:
+            loc = master_index.get_loc(date)
+            if loc < lookback:
+                continue
+            sub_ret = returns_df.iloc[loc - lookback:loc]
+
+            # Same full-history guard as the default path -- a late-listed
+            # symbol would otherwise get a zero-filled (falsely "risk-free")
+            # variance in the optimizer.
+            valid_symbols = [s for s in symbols if sub_ret[s].notna().all()]
+            if not valid_symbols:
+                continue
+
+            cov = sub_ret[valid_symbols].cov().to_numpy()
+            cov = denoise_covariance(cov, n_obs=len(sub_ret))
+            # w0 for symbols that are no longer valid is pinned at 0 by
+            # construction (they are not in `valid_symbols` and are written as
+            # explicit 0.0 below), so only the valid subset enters the solve.
+            w0 = np.array([prev_target.get(s, 0.0) for s in valid_symbols], dtype=float)
+
+            groups = None
+            if sector_dev >= 0.0:
+                groups = _sector_groups(valid_symbols, sector_map)
+
+            if not np.any(w0 > 0.0):
+                # DISCLOSED EXCEPTION (from-cash start, first live rebalance).
+                # With w0 = 0 the smoothed L1 term degenerates into a
+                # proportional ENTRY cost gamma * sum(w). Because the program
+                # also allows a CASH residual (sum(w) <= 1), the trivial
+                # all-cash portfolio then beats every invested portfolio
+                # whenever gamma > w'Sw (~1e-4 for daily covariances) -- i.e.
+                # the strategy would park 100% in cash on its first rebalance
+                # and never recover, since w0 would stay 0 forever. There is
+                # no prior POSITION here, so there is no turnover to penalize:
+                # the first solve is the plain minimum-variance portfolio.
+                w = _min_variance_weights(cov)
+                w = np.clip(w, 0.0, None)
+                if single_cap is not None:
+                    w = np.minimum(w, float(single_cap))
+                if float(w.sum()) > 1.0:
+                    w = w / float(w.sum())
+            else:
+                w = _turnover_penalized_weights(
+                    cov, w0, turnover_penalty, single_cap, groups, sector_dev
+                )
+
+            # Prune dead-zone: a weight move smaller than `prune` is not worth
+            # the friction, so snap it back to the previous target exactly.
+            if prune > 0.0:
+                w = np.where(np.abs(w - w0) < prune, w0, w)
+                w = np.clip(w, 0.0, None)
+                if single_cap is not None:
+                    w = np.minimum(w, float(single_cap))
+                total = float(w.sum())
+                if total > 1.0:
+                    w = w / total
+
+            # Explicit 0.0 for every excluded symbol -- NOT NaN. A NaN cell
+            # inside a rebalance row is carried forward by the backtester's
+            # column-wise ffill(), silently keeping a stale position (the
+            # exact bug class documented in AGENTS.md).
+            weights_rebal.loc[date, :] = 0.0
+            weights_rebal.loc[date, valid_symbols] = w
+            prev_target = {s: float(val) for s, val in zip(valid_symbols, w)}
+
+        weights_df = pd.DataFrame(index=master_index, columns=symbols, data=np.nan)
+        weights_df.loc[rebalance_dates] = weights_rebal
+        return weights_df
+
     def explain_weights(self, params: dict) -> str:
-        return (
+        base = (
             f"Minimum Variance: Rebalances every {params['rebalance_freq_days']} trading days. "
             f"Reasoning: Solves a constrained quadratic program for the long-only portfolio of minimum "
             f"variance over the trailing {params['cov_lookback']} days (Markowitz 1952), subject to "
@@ -1057,6 +1429,17 @@ class MinimumVarianceAllocation(AllocationTemplate):
             f"stable when the covariance matrix is poorly conditioned (falls back to equal-weight on "
             f"non-convergence)."
         )
+        penalty = float(params.get("opt_turnover_penalty", getattr(self, "opt_turnover_penalty", 0.0)))
+        if penalty > 0.0:
+            cap = params.get("opt_single_cap", getattr(self, "opt_single_cap", 0.20))
+            dev = params.get("opt_sector_dev", getattr(self, "opt_sector_dev", 0.03))
+            base += (
+                f" Turnover-penalized mode: objective adds {penalty:g} * L1(w - w_prev) "
+                f"(Garleanu & Pedersen 2013 proportional trading costs), each weight capped at "
+                f"{float(cap):.0%}, each sector's exposure change budgeted at {float(dev):.2%}, "
+                f"and cash holds any residual (sum(w) <= 1)."
+            )
+        return base
 
     def warmup_bars(self, params: dict) -> int:
         return params["cov_lookback"]

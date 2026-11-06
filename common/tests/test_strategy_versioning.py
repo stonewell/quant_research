@@ -106,7 +106,8 @@ def test_allocation_template_base_versioning():
 
 
 def test_nine_static_templates_versioning():
-    """Verify static allocation templates versioning (CrossSectionalMomentumAllocation is 1.1.0, others 1.0.0)."""
+    """Verify static allocation templates versioning (CrossSectionalMomentumAllocation is 1.1.0,
+    MinimumVarianceAllocation is 1.1.0, others 1.0.0)."""
     static_classes_v100 = [
         EqualWeightAllocation,
         InverseVolatilityAllocation,
@@ -114,7 +115,6 @@ def test_nine_static_templates_versioning():
         DualMomentumAllocation,
         MaxDiversificationAllocation,
         MeanReversionAllocation,
-        MinimumVarianceAllocation,
         BreadthGatedMomentumAllocation,
     ]
     for cls in static_classes_v100:
@@ -128,6 +128,13 @@ def test_nine_static_templates_versioning():
     assert cs_mom.version == "1.1.0"
     assert cs_mom.version_string == "v1.1.0"
     assert cs_mom.get_version_info()["version"] == "1.1.0"
+
+    # M1.3: opt-in turnover-penalized long-only QP added (backward-compatible
+    # additive params, default-off) -> version bumped 1.0.0 -> 1.1.0.
+    min_var = MinimumVarianceAllocation()
+    assert min_var.version == "1.1.0"
+    assert min_var.version_string == "v1.1.0"
+    assert min_var.get_version_info()["version"] == "1.1.0"
 
 
 def test_composite_templates_versioning():
