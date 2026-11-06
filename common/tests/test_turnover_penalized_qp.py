@@ -4,9 +4,18 @@
 100% offline: every price series comes from `common.testing`'s synthetic
 generators. No network, no real market data.
 
-The feature is OPT-IN via `params["opt_turnover_penalty"] > 0`; its four knobs
-are deliberately absent from `param_grid`, so the default search space is
-unchanged and the default code path must stay bit-identical to pre-M1.3.
+The feature is OPT-IN via `params["opt_turnover_penalty"] > 0`; its knobs
+(including `opt_cash_allowance`) are deliberately absent from `param_grid`, so
+the default search space is unchanged and the default code path must stay
+bit-identical to pre-M1.3.
+
+The budget constraint is the BOX `1 - opt_cash_allowance <= sum(w) <= 1`
+(default fully invested). It is not `sum(w) <= 1` with free cash slack: that
+program collapses, because a free cash residual leaves the budget multiplier
+inactive (`nu = 0`), making the variance term drive total exposure toward zero
+while the L1 term resists with only a fixed force `gamma` -- a fixed point that
+is independent of `w0` and decays every rebalance. See
+`test_no_exposure_decay_across_rebalances` for the regression pin.
 """
 
 import numpy as np
@@ -101,16 +110,22 @@ def test_turnover_penalty_shifts_weights_toward_prior_target():
 # ---------------------------------------------------------------------------
 def test_single_cap_invariant_on_every_rebalance_row():
     tpl = MinimumVarianceAllocation()
+    # cap=0.30 with n=4 is feasible (n*cap = 1.2 >= 1) AND binding: the
+    # unconstrained min-variance weight on AAA is ~0.38, so the cap genuinely
+    # bites here (a non-vacuous check). A cap below 1/n would be infeasible
+    # under the fully invested budget and is covered separately by
+    # `test_cap_infeasibility_degrades_without_raising`.
     params = {
         **BASE_PARAMS,
         "opt_turnover_penalty": 1e-8,
-        "opt_single_cap": 0.10,
+        "opt_single_cap": 0.30,
         "opt_sector_dev": 0.03,
         "opt_prune": 0.0,
     }
     rows = _rebalance_rows(tpl.generate_weights(_four_asset_universe(), params))
     assert len(rows) >= 2
-    assert np.nanmax(rows.to_numpy()) <= 0.10 + 1e-6
+    assert np.nanmax(rows.to_numpy()) <= 0.30 + 1e-6
+    np.testing.assert_allclose(rows.sum(axis=1).to_numpy(), 1.0, rtol=0.0, atol=1e-6)
 
 
 def test_long_only_and_cash_budget():
@@ -126,22 +141,146 @@ def test_long_only_and_cash_budget():
     arr = rows.to_numpy()
     assert np.all(np.isfinite(arr))
     assert np.nanmin(arr) >= 0.0
-    # Cash residual, i.e. sum(w) <= 1 rather than == 1.
-    assert np.nanmax(arr.sum(axis=1)) <= 1.0 + 1e-6
+    # Total-exposure BOX, not free cash slack: the default allowance of 0 pins
+    # sum(w) to 1 (fully invested) within solver tolerance.
+    sums = arr.sum(axis=1)
+    assert np.nanmax(sums) <= 1.0 + 1e-6
+    assert np.nanmin(sums) >= 1.0 - 1e-6
 
 
-def test_first_rebalance_from_cash_is_invested_not_all_cash():
-    """DISCLOSED EXCEPTION under test: from a cash start (w0 = 0) the smoothed
-    L1 term degenerates into a proportional ENTRY cost, and the trivial
-    all-cash portfolio would beat every invested one. The first rebalance must
-    therefore be the plain minimum-variance target, not all-cash."""
+# ---------------------------------------------------------------------------
+# 3b. REGRESSION PIN for the free-cash-slack defect (commit 392ab95).
+# ---------------------------------------------------------------------------
+def test_no_exposure_decay_across_rebalances():
+    """With `sum(w) <= 1` (free cash slack) the program has `nu = 0`, so
+    `2 S w + gamma * sign(w - w0) = 0`, i.e. `w ~= -(gamma/2) S^-1 sign(w - w0)`:
+    the variance term drives exposure to zero and the fixed point is
+    independent of `w0`. Measured exposure decayed 1.00 -> 0.94 -> 0.88 -> 0.82
+    on this very universe. With the box `1 <= sum(w) <= 1` it must stay at 1.0
+    on EVERY rebalance."""
     tpl = MinimumVarianceAllocation()
-    params = {**BASE_PARAMS, "opt_turnover_penalty": 1e-8, "opt_single_cap": 1.0,
-              "opt_sector_dev": 0.03, "opt_prune": 0.0}
+    params = {
+        "cov_lookback": 60,
+        "rebalance_freq_days": 21,
+        "opt_turnover_penalty": 1e-8,
+        "opt_single_cap": 1.0,
+        "opt_cash_allowance": 0.0,
+        "opt_sector_dev": 0.03,
+        "opt_prune": 0.0,
+    }
     rows = _rebalance_rows(tpl.generate_weights(_four_asset_universe(), params))
-    first = rows.iloc[0]
-    assert first.sum() > 0.9, f"first rebalance parked {1 - first.sum():.1%} in cash"
-    assert first.sum() <= 1.0 + 1e-6
+    assert len(rows) >= 5, f"need at least 5 rebalances, got {len(rows)}"
+    sums = rows.sum(axis=1).to_numpy()[:5]
+    np.testing.assert_allclose(sums, 1.0, rtol=0.0, atol=1e-6)
+    # Non-vacuity: the composition still MOVES between rebalances, so this is
+    # not a frozen all-in-one-asset book.
+    first_five = rows.iloc[:5]
+    assert (first_five.max() - first_five.min()).max() > 1e-3
+
+
+def test_cash_allowance_is_respected():
+    """`opt_cash_allowance` widens the box downward but never above 1. This
+    objective has no expected-return term, so variance always falls when
+    exposure falls: the optimizer ALWAYS wants cash, and the allowance is what
+    bounds how much it can take (without it the book decays to zero -- the
+    defect pinned above)."""
+    tpl = MinimumVarianceAllocation()
+    universe = _vol_switch_universe()
+    params = {
+        **BASE_PARAMS,
+        "opt_turnover_penalty": 1e-8,
+        "opt_single_cap": 1.0,
+        "opt_sector_dev": 0.03,
+        "opt_prune": 0.0,
+    }
+    full = _rebalance_rows(tpl.generate_weights(universe, {**params, "opt_cash_allowance": 0.0}))
+    allowance = _rebalance_rows(
+        tpl.generate_weights(universe, {**params, "opt_cash_allowance": 0.05})
+    )
+
+    np.testing.assert_allclose(full.sum(axis=1).to_numpy(), 1.0, rtol=0.0, atol=1e-6)
+    sums = allowance.sum(axis=1).to_numpy()
+    assert np.all(sums >= 0.95 - 1e-6), f"exposure fell through the allowance floor: {sums}"
+    assert np.all(sums <= 1.0 + 1e-6), f"exposure exceeded the fully invested budget: {sums}"
+    # Strictly smaller exposure: the cash window is actually used, and it is
+    # the allowance -- not the decay -- that sets the floor.
+    assert np.all(sums < 1.0 - 1e-3)
+
+
+def test_cap_infeasibility_degrades_without_raising():
+    """`cap=0.20` with `n=4` cannot fund a fully invested book
+    (`n*cap = 0.8 < 1`). Documented degrade: relax the cap to `max(cap, 1/n)`,
+    warn, and never raise."""
+    tpl = MinimumVarianceAllocation()
+    params = {
+        "cov_lookback": 60,
+        "rebalance_freq_days": 21,
+        "opt_turnover_penalty": 1e-8,
+        "opt_single_cap": 0.20,
+        "opt_sector_dev": 0.03,
+        "opt_prune": 0.0,
+    }
+    with pytest.warns(RuntimeWarning, match="infeasible"):
+        rows = _rebalance_rows(tpl.generate_weights(_four_asset_universe(), params))
+
+    assert len(rows) >= 2
+    arr = rows.to_numpy()
+    np.testing.assert_allclose(arr.sum(axis=1), 1.0, rtol=0.0, atol=1e-6)
+    assert np.nanmax(arr) <= max(0.20, 0.25) + 1e-6
+    note = tpl.explain_weights(params)
+    assert "documented degrade" in note
+    assert "25.00%" in note
+
+
+# ---------------------------------------------------------------------------
+# 3c. The first-rebalance special case is GONE (and provably unnecessary).
+# ---------------------------------------------------------------------------
+def test_first_rebalance_equals_min_variance_under_penalty():
+    """With `w0 == 0` and `sum(w) == 1`, `||w - w0||_1 = sum(w) = 1` is
+    CONSTANT over the feasible set, so the penalty cannot change the argmin:
+    the first rebalance reduces to plain min-variance automatically. The old
+    special case (a hand-written min-variance branch) has been deleted."""
+    cov = np.array([[0.01, 0.002], [0.002, 0.04]])
+    ref = _min_variance_weights(cov)
+    assert not np.allclose(ref, 0.5), "reference must not be the 1/N degenerate solution"
+
+    for gamma in (1e-6, 1e-3):
+        w = _turnover_penalized_weights(
+            cov, np.zeros(2), turnover_penalty=gamma, single_cap=1.0,
+            sector_groups=None, sector_dev=0.03, cash_allowance=0.0,
+        )
+        np.testing.assert_allclose(w, ref, rtol=0.0, atol=1e-6)
+        assert abs(w.sum() - 1.0) <= 1e-6
+
+    # End to end: the template's first rebalance is the penalty solve on the
+    # first window (and is fully invested), i.e. the deleted branch is not
+    # reached. NON-VACUITY: the legacy `_min_variance_weights` call on this
+    # window early-stops at equal weight (its documented ftol quirk), so a
+    # resurrected special case would fail the equality below.
+    tpl = MinimumVarianceAllocation()
+    universe = _four_asset_universe()
+    params = {
+        "cov_lookback": 60,
+        "rebalance_freq_days": 21,
+        "opt_turnover_penalty": 1e-8,
+        "opt_single_cap": 1.0,
+        "opt_sector_dev": 0.03,
+        "opt_prune": 0.0,
+    }
+    rows = _rebalance_rows(tpl.generate_weights(universe, params))
+
+    master = universe["AAA"].index
+    returns = pd.DataFrame({s: df["Close"].pct_change().reindex(master) for s, df in universe.items()})
+    from common.covariance import denoise_covariance
+
+    first_date = rows.index[0]
+    loc = master.get_loc(first_date)
+    sub_ret = returns.iloc[loc - 60:loc]
+    cov_first = denoise_covariance(sub_ret.cov().to_numpy(), n_obs=len(sub_ret))
+    expected = _turnover_penalized_weights(
+        cov_first, np.zeros(4), 1e-8, 1.0, None, 0.03, 0.0
+    )
+    np.testing.assert_allclose(rows.iloc[0].to_numpy(), expected, rtol=0.0, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -355,8 +494,16 @@ def test_disabled_penalty_generate_weights_is_bit_identical():
 def test_opt_params_are_not_in_the_search_grid():
     grid = MinimumVarianceAllocation().param_grid
     assert set(grid) == {"cov_lookback", "rebalance_freq_days"}
-    for key in ("opt_turnover_penalty", "opt_single_cap", "opt_sector_dev", "opt_prune"):
+    for key in (
+        "opt_turnover_penalty",
+        "opt_single_cap",
+        "opt_cash_allowance",
+        "opt_sector_dev",
+        "opt_prune",
+    ):
         assert key not in grid
+    # The new cash-allowance knob defaults to fully invested.
+    assert MinimumVarianceAllocation().opt_cash_allowance == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -376,9 +523,10 @@ def test_single_symbol_universe_unchanged():
             universe, {**base, "opt_turnover_penalty": 1e-3, "opt_single_cap": 0.6}
         )
     )
-    # No exception, still a valid single-asset vector capped at 0.6 (cash
-    # residual 0.4 -- the cap is a deliberate, documented consequence).
-    assert np.allclose(penalized["AAA"].to_numpy(), 0.6)
+    # The cap 0.6 is infeasible for n=1 under the fully invested budget
+    # (1*0.6 < 1), so the documented degrade relaxes it to 1.0: a single-asset
+    # book is 100% that asset, no cash residual.
+    assert np.allclose(penalized["AAA"].to_numpy(), 1.0)
 
 
 def test_all_nan_window_returns_empty_frames_without_raising():
