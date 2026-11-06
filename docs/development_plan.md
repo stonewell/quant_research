@@ -2175,3 +2175,38 @@ uv run pytest common/tests/test_intraday_bar_contract.py common/tests/test_intra
 #### 4.48.5 计数（纯追加）
 
 无新增任务行、无状态位变动：现役仍 **151 = 105 `[x]` + 46 `[ ]`**；两文件合计 **217 = 171 `[x]` + 46 `[ ]`**；`§2.21` 仍 **19 项 = 7 `[x]` + 12 `[ ]`**；归档 8 张子表仍 **66 项全 `[x]`**。`LV19` 状态仍为 `[ ]`（**未实现**，仅其「开工前置测量」已定案）。
+
+### 4.49 单次抓取重构（C）与其窗口切片落地留痕（2026-11-06，零计数变更）
+
+§4.47.6 提到「C 方案，2026-11-06 起实施」。本节只记录它**已实施**与其**不修 `LV19`** 的边界，不改任何状态位。
+
+#### 4.49.1 两个提交
+
+| 提交 | 内容 | 等价性条件 |
+| :-- | :-- | :-- |
+| `0da95f8` | `patch_equity_daily_bars` 的 fetch 由「每命名空间一次」提为「每标的一次」；`lagging` 由**未改动**的新鲜度判据构造；`patch_start` 取各滞后命名空间起点的 `min()`（ISO 串按字典序即按时间序） | 只滞后的命名空间进入写尾部；已新鲜者一行不写 |
+| `014b883` | 单帧在进入 `plan_history_write` 前按命名空间切回 `max_date - 5 日`（`max_date is None` ⇒ 整帧；空切片 ⇒ `SKIPPED (no new bars)`） | 让每个命名空间看到与 pre-C **逐字节相同**的入参 |
+
+#### 4.49.2 为什么切片不是「裁尾巴」
+
+5 日回看正是 `plan_history_write` 比对存量收盘、发现复权基准漂移（并拒写）的唯一输入。裁成 `> max_date` 会把它丢掉，让基准漂移**静默通过**——比拒写更糟。切片保留回看、只把窗口边界收回该命名空间自己的起点，因此「只插入、只拒写、绝不重写」的契约不变。
+
+#### 4.49.3 一处已披露的限度（不得读成全面等价）
+
+对**超发**（返回早于请求 `start` 的行）的 provider，pre-C 会把那些多出的行带进 `plan_history_write`，切片会丢掉它们 ⇒ 等价性对遵守 `start` 的 provider（BaoStock 传 `start_date`、EastMoney 计算 `beg`）**精确成立**，对忽略 `start` 的测试替身则**更宽松**。本仓两个真实 provider 均遵守 `start`；但这属代码披露，不是实测（离线策略下无联网证据）。
+
+#### 4.49.4 一个被核过的疑点：`requested_start` 是否随合并起点漂移
+
+`sync_china_5m_and_indices.py:650-658` 的 `requested_start()` 在**有历史**时返回 plan 帧自身的首个 bar，`patch_start` 仅在「无历史或空帧」时作 fallback；而「无历史」的命名空间自己就贡献 `"2016-01-01"`（`min()` 的下界），故合并值与它自己的起点必然相同。⇒ `requested_start` 不随合并起点漂移，`is_earliest_known` 的推断输入不变。
+
+#### 4.49.5 实测计数（本次为权威值）
+
+`pipeline/tests` **628 passed, 1 skipped**（C 之前 623+1；`0da95f8` +4、`014b883` +1）；`common/tests` **1341 passed, 1 skipped**（无差值）。反向证据两条：移除切片 ⇒ 新用例转红（`REFUSED windowed re-basing ... 2026-10-16 ... stored close 51.1658 vs incoming 52.21`）；把 `plan_history_write` 的拒写改为 `pass` ⇒ 既有 `test_patch_equity_daily_bars_refuses_instead_of_rescaling` 转红（`DID NOT RAISE QfqWriteRefused`），证明该用例的日期修订未掏空门禁断言。
+
+#### 4.49.6 对既有测试的一处修订及其理由
+
+`test_sync_qfq_write_path.py` 两个用例的 `refetch_dates` 起点由 `2017-02-07` 改为 `2017-02-09`，`exc.date` / 输出断言同步。理由：`patch_start` 是 `max_date - 5 个日历日`（`02-14 → 02-09`），而 `02-07` 是 5 个**业务**日，且 `_FakeProvider` 忽略 `start` —— 故旧断言实际钉的是**替身超发**，不是拒写门禁。不变式断言（`pytest.warns` / `pytest.raises` / `assert_frame_equal(..., check_exact=True)` / `INCIDENT_FACTOR` / `history`）**逐字节未动**。
+
+#### 4.49.7 计数（纯追加）
+
+无新增任务行、无状态位变动：现役仍 **151 = 105 `[x]` + 46 `[ ]`**；两文件合计 **217 = 171 `[x]` + 46 `[ ]`**；`§2.21` 仍 **19 项 = 7 `[x]` + 12 `[ ]`**。`LV19` 仍为 `[ ]` —— C 与切片**不修本条**（11-05 那次 Fuyao 本就因 2 日容忍被判新鲜而跳过，落库结果不变），二者不得互相充当验收证据。
