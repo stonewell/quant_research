@@ -1842,7 +1842,7 @@ uv run pytest common/tests/test_intraday_bar_contract.py common/tests/test_intra
 | 编号 | 报告提议 | 判定 | 证据 |
 | :-- | :-- | :-- | :-- |
 | `F1` | 量价秩相关 `-Corr(Rank(VWAP₅), Rank(Vol₅))` | **已覆盖** | WQ Alpha #48/#53：[`alpha101_factors.py`](file:///home/stone/Work/github/quant/pipeline/research_strategy/rs/alpha101_factors.py) `:481-482`、`:694-695`（`cs_rank(ts_corr(cs_rank(volume), cs_rank(vwap), 5))`），算子见 [`alpha101_operators.py`](file:///home/stone/Work/github/quant/common/alpha101_operators.py) `:121-139` |
-| `F2` | Amihud 非流动性 + `SMA5/SMA20` 冲击比 | **缺失** | 全库无 `|ret| / (volume·close)` 形态 |
+| `F2` | Amihud 非流动性 + `SMA5/SMA20` 冲击比 | **缺失** | 全库无 `abs(ret) / (volume·close)` 形态 |
 | `F3` | 尾盘成交量占比（14:30–15:00） | **缺失（实盘恒不可用）** | [`intraday_features.py`](file:///home/stone/Work/github/quant/common/intraday_features.py) 有 `Afternoon_Ret_5m`、`UpVol_Ratio_5m`，无尾盘量占比 |
 | `F4` | 特质动量（20 日残差求和） | **刻意跳过：已有等价物** | [`residual_momentum_strategy.py`](file:///home/stone/Work/github/quant/pipeline/research_strategy/rs/residual_momentum_strategy.py) 已直接以特质动量定价；再写 20 日横截面版本属薄副本 |
 | `F5` | 低特质波动（IVOL） | **已覆盖但惰性** | [`daily_factors.py`](file:///home/stone/Work/github/quant/common/daily_factors.py) `:192` `ivol_residual` |
