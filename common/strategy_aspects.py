@@ -1,6 +1,6 @@
 """Selection x weighting aspect composition for basket allocation templates.
 
-The 9 static templates in `common/allocation_templates.py` each fuse two
+The static basket templates in `common/allocation_templates.py` each fuse two
 orthogonal decisions into one `generate_weights` method:
 
 - SELECTION: which symbols are eligible at a rebalance date, and what
@@ -14,14 +14,14 @@ orthogonal decisions into one `generate_weights` method:
 
 This module reimplements each side as a standalone, independently
 composable `SelectionAspect`/`WeightingAspect`, built from the exact same
-shared primitives the 9 template classes already import
+shared primitives the template classes already import
 (`common.indicators`, `common.allocation_templates`'s private weighting
 helpers, `common.covariance`, `common.scheduling`) -- so a
 `CompositeAllocationTemplate` can pair, say, momentum's stock-picking with
 inverse-volatility's position sizing, a combination that doesn't exist as
 any single template today.
 
-Deliberately NOT a refactor of the 9 existing classes (zero regression risk
+Deliberately NOT a refactor of the existing classes (zero regression risk
 to already-tested code): this is new, parallel logic. `dual_momentum_topn`
 below is a disclosed simplification of `DualMomentumAllocation`'s own
 selection step -- it drops a failed absolute-momentum top-N slot instead of
@@ -511,10 +511,15 @@ WEIGHTING_ASPECTS: Dict[str, WeightingAspect] = {
 }
 
 
-# Maps each of the 9 static ALLOCATION_TEMPLATES' own `.name` to the
+# Maps each decomposable static ALLOCATION_TEMPLATES' own `.name` to the
 # (selection_key, weighting_key) pair that reproduces its logic -- used by
 # `build_composite_candidates` to know which templates are decomposable and
 # to avoid rebuilding a composite that's identical to one already searched.
+# Deliberately count-free and NOT auto-derived from the registry: only templates
+# that genuinely fuse ONE selection aspect with ONE weighting aspect belong here.
+# `sleeve_allocator` is absent on purpose -- it is a two-sleeve core-satellite
+# budget split, not a selection x weighting pairing, so `build_composite_candidates`
+# (which filters on `name in ATOMIC_TEMPLATE_ASPECTS`) skips it naturally.
 ATOMIC_TEMPLATE_ASPECTS = {
     "equal_weight": ("all_symbols", "equal_weight"),
     "inverse_volatility": ("all_symbols", "inverse_vol"),
@@ -595,7 +600,7 @@ class CompositeAllocationTemplate(AllocationTemplate):
         return (
             f"Composite Strategy ({self.name}): rebalances every {params['rebalance_freq_days']} trading days. "
             f"Selects {self.selection.describe(params)}, then allocates via {self.weighting.describe(params)}. "
-            f"This pairing is NOT one of this workspace's 9 static allocation templates -- it was assembled by "
+            f"This pairing is NOT one of this workspace's static allocation templates -- it was assembled by "
             f"strategy_generator's aspect-composition search from two different templates' own logic."
         )
 

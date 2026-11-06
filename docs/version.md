@@ -4179,7 +4179,7 @@ LIVETRADING_STRICT_SEED_BOOK=0        # 0 / false / no / off 同样生效
 ### 27.3 版本轴演进说明
 - **`MinimumVarianceAllocation`**：`version = "1.0.0" -> "1.1.0"`（向后兼容的可选参数扩展，默认关闭，输出不变）。**2026-11-05 同日修订不升版本号**：1.1.0 尚未提交发布（unpushed/unreleased），本次预算约束修正属于同一未发布版本的同日修订，故保持 `1.1.0`（不升 1.2.0）。
 - **底座说明**：`common/allocation_templates.py` 依旧**无**文件级 `BASE_VERSION`（该属性仅存在于 `BaseBlendAllocationStrategy`），本次未新增也未修改任何底座版本。
-- **配置 Dump 说明**：`strategy_dumps/` 只序列化 `StrategyConfig` 驱动的 research/blend 策略（字段 `strategy_version` / `base_version` / `version_info`），**不序列化 9 个静态配置模板**。已执行 `research_strategy/run_research_strategy.py --dump-strategies`：`results/strategy_dumps/` 无任何文件变动（`git status` 干净），且无任何 dump 文件包含 `minimum_variance` / `MinimumVarianceAllocation`。因此静态模板版本号**不会**出现在 dump 中（对账时勿以 dump 为空判断版本未升级）。
+- **配置 Dump 说明**：`strategy_dumps/` 只序列化 `StrategyConfig` 驱动的 research/blend 策略（字段 `strategy_version` / `base_version` / `version_info`），**不序列化任何静态配置模板**（静态模板数量随 `SleeveAllocator` 追加而变，故此处不写死数量）。已执行 `research_strategy/run_research_strategy.py --dump-strategies`：`results/strategy_dumps/` 无任何文件变动（`git status` 干净），且无任何 dump 文件包含 `minimum_variance` / `MinimumVarianceAllocation`。因此静态模板版本号**不会**出现在 dump 中（对账时勿以 dump 为空判断版本未升级）。
 
 ### 27.4 离线测试验证（100% 离线、0 网络依赖）
 - `common/tests/test_turnover_penalized_qp.py`（**18 条，全绿**；同日三轮修订累计新增 4 条、改写 3 条——`test_first_rebalance_equals_min_variance_under_penalty` 替换旧的首次调仓特例用例、`test_cap_infeasibility_*` 改名并按「cap 硬上限、现金吸收差额」重写期望、`test_single_symbol_universe_unchanged` 的单标的期望随硬 cap 变更）：

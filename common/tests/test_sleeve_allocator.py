@@ -11,10 +11,13 @@ Covers the acceptance contract:
    symbols, never forward-filled),
 6. sleeve migration between rebalance dates (explicit numbers on both sides),
 7. `inverse_vol` within-sleeve sizing vs. the `equal` default,
-8. version, 9. registry membership.
+8. version, 9. registry membership, 10. import-order registration regression
+   (fresh-interpreter probe in both import orders).
 """
 
+import json
 import os
+import subprocess
 import sys
 
 import numpy as np
@@ -312,6 +315,68 @@ def test_sleeve_allocator_is_registered_as_the_tenth_static_template():
     # Zero-arg constructible, per the registry's contract.
     assert SleeveAllocator().name == "sleeve_allocator"
     assert SleeveAllocator().factor_tags
+
+
+# Runs in a FRESH interpreter so each import order is exercised from a genuinely
+# empty `sys.modules` -- the in-process suite above cannot do that, because the
+# first import already bound both modules.
+_IMPORT_ORDER_PROBE = r"""
+import json
+import sys
+
+order = sys.argv[1]
+if order == "registry_first":
+    from common.allocation_templates import ALLOCATION_TEMPLATES
+    from common.sleeve_allocator import SleeveAllocator
+else:
+    from common.sleeve_allocator import SleeveAllocator
+    from common.allocation_templates import ALLOCATION_TEMPLATES
+
+print(json.dumps({
+    "sleeve_is_registered": SleeveAllocator in ALLOCATION_TEMPLATES,
+    "sleeve_hits": sum(1 for cls in ALLOCATION_TEMPLATES if cls is SleeveAllocator),
+    "total": len(ALLOCATION_TEMPLATES),
+    "names": [cls.name for cls in ALLOCATION_TEMPLATES],
+}))
+"""
+
+
+def test_registry_registers_sleeve_exactly_once_under_both_import_orders():
+    """`common/sleeve_allocator.py` imports the base class from
+    `common/allocation_templates.py`, which appends `SleeveAllocator` to
+    `ALLOCATION_TEMPLATES` behind a `try/except ImportError` at its own bottom.
+    That is a real circular-import hazard: the append is a no-op in one order and
+    the allocator self-registers in the other. Only if BOTH branches are guarded
+    correctly does the registry end up with the same single entry either way, so
+    each order is probed in a fresh subprocess (a separate interpreter, not just a
+    `sys.modules` cleanup, since partially-initialized modules would otherwise leak).
+    """
+    failures = []
+    for order in ("registry_first", "allocator_first"):
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(
+            [_PROJECT_ROOT] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
+        )
+        res = subprocess.run(
+            [sys.executable, "-c", _IMPORT_ORDER_PROBE, order],
+            capture_output=True,
+            text=True,
+            cwd=_PROJECT_ROOT,
+            env=env,
+        )
+        assert res.returncode == 0, f"import order {order!r} failed: {res.stderr}"
+        payload = json.loads(res.stdout.strip().splitlines()[-1])
+
+        assert payload["sleeve_is_registered"], f"{order}: SleeveAllocator missing from registry"
+        assert payload["sleeve_hits"] == 1, f"{order}: registered {payload['sleeve_hits']}x"
+        assert payload["total"] == 10, f"{order}: registry has {payload['total']} entries"
+        names = payload["names"]
+        duplicates = sorted({n for n in names if names.count(n) > 1})
+        assert not duplicates, f"{order}: duplicate template names {duplicates}"
+        assert len(names) == payload["total"], f"{order}: name/total mismatch"
+
+        failures.append((order, payload["total"], payload["sleeve_hits"]))
+    assert failures == [("registry_first", 10, 1), ("allocator_first", 10, 1)]
 
 
 def test_explanation_and_param_grid_are_complete():

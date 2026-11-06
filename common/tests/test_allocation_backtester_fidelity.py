@@ -14,7 +14,8 @@ Validates the full quantitative fidelity of common/allocation_backtester.py:
    - minimal_metrics=True scalar parity with full report mode.
 2. Walkforward multiprocessing parity:
    - run_walkforward with jobs=2 vs jobs=1 bit-for-bit parity across all folds.
-3. All 9 static allocation templates:
+3. Every static allocation template in `ALLOCATION_TEMPLATES` (count-free on purpose --
+   this suite used to say "9" and silently rotted when `SleeveAllocator` was appended):
    - Sparse weights contract compliance (no template-level forward filling).
    - Rebalance weight sum <= 1.0 constraint.
    - Exact equity accounting identity (equity[t] == cash[t] + holdings[t]), asserted by
@@ -395,10 +396,11 @@ def test_walkforward_multiprocessing_parity():
 
 
 # --------------------------------------------------------------------------- #
-# 3. All 9 Static Templates Fidelity & Accounting Identity Tests
+# 3. Static Templates Fidelity & Accounting Identity Tests
 # --------------------------------------------------------------------------- #
-def test_all_nine_static_templates_fidelity_and_accounting_identity():
-    """Verify all 9 static AllocationTemplates satisfy sparse weights contract and ledger identity."""
+def test_all_static_templates_fidelity_and_accounting_identity():
+    """Verify every registered static AllocationTemplate (whatever the current count
+    happens to be) satisfies the sparse weights contract and the ledger identity."""
     rng = np.random.default_rng(5)
     universe = {}
     for i in range(3):

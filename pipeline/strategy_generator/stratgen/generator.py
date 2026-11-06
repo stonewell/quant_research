@@ -213,7 +213,7 @@ def _search_allocation(universe: dict, cfg: GeneratorConfig, factor_report: dict
     `extra_templates`, if supplied, is a list of ALREADY-INSTANTIATED
     AllocationTemplate objects (e.g. PatternBasedAllocationTemplate
     instances built by pattern_mining/pmine/pattern_mining.py from a
-    universe-specific mined pattern) folded into the SAME candidate pool as the 9 static,
+    universe-specific mined pattern) folded into the SAME candidate pool as the static,
     zero-arg-constructible classes in ALLOCATION_TEMPLATES -- they compete
     through the identical grid-search + ERS + factor-tiebreak pipeline below,
     with no special-casing. Omitting it (default None/[]) is exactly
@@ -327,7 +327,7 @@ class StrategyGenerator:
         --factor-report flag) -- omit it (default) for today's unchanged
         behavior. `extra_templates` is an optional list of pre-instantiated
         AllocationTemplate objects (e.g. from pattern_mining/pmine/pattern_mining.py) to
-        fold into the search alongside the 9 static templates -- omit it
+        fold into the search alongside the static templates -- omit it
         (default) for today's unchanged behavior. See _search_allocation's
         docstring for exactly how/when either can influence the winner."""
         cfg = self.config
