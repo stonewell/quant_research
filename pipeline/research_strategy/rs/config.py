@@ -804,6 +804,20 @@ class StrategyConfig:
     blend_thrust_exit_thresh: float = 0.58
     blend_bucket_renorm_max_delta: Optional[float] = None
 
+    # M4.2 opt-in: delegate the blend inertia step to the position-policy kernel
+    # (`common/position_policy.py::PortfolioSequencer`). Default `False`, so the
+    # pre-M4.2 `_step_asset_inertia` path stays the default. The M4.2 call site in
+    # `pipeline/research/blend/blend_base.py::generate_weights` reads `params`
+    # FIRST, then this attribute as the fallback.
+    # The name is PREFIXED (`blend_`) deliberately, and the call site never routes
+    # it through `BaseBlendAllocationStrategy.resolve_param`: that helper's last
+    # precedence step is a bare-name `getattr(cfg, name)`, so a bare name here
+    # (`use_policy_kernel`) would silently leak this GLOBAL `StrategyConfig` field
+    # into every blend strategy -- the exact shape of the 2026-10-21 incident, when
+    # a bare `wq_alpha_id` fell through and swapped a deployed sub-strategy class
+    # (`ChanFourStateExecutionStrategy` -> `WorldQuantAlphaStrategy(#101)`).
+    blend_use_policy_kernel: bool = False
+
     # Blend Base Template aliases (unprefixed versions for convenience)
     weighting_mode: Optional[str] = None
     enable_orthogonalization: Optional[bool] = None

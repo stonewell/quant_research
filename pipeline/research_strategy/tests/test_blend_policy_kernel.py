@@ -286,7 +286,10 @@ def test_flag_resolution_order_and_prefixed_key_only():
 
     # (a) the StrategyConfig attribute is the second source
     cfg = StrategyConfig()
-    cfg.blend_use_policy_kernel = True  # ad-hoc: `StrategyConfig` has no such field YET
+    # Post-construction assignment: pins PRECEDENCE only; that the field actually
+    # exists (constructor route) is covered by
+    # `test_strategy_config_field_alone_selects_kernel_path`.
+    cfg.blend_use_policy_kernel = True
     cfg_attr_kernel = _run(universe, None, cfg=cfg)
     _assert_frames_identical(cfg_attr_kernel, kernel, "config-attribute-driven kernel path")
 
@@ -309,6 +312,73 @@ def test_flag_resolution_order_and_prefixed_key_only():
 # ---------------------------------------------------------------------------
 # 5. documented deployed exception (read-only check of the SSOT config)
 # ---------------------------------------------------------------------------
+
+
+def test_strategy_config_field_alone_selects_kernel_path(monkeypatch):
+    """`StrategyConfig(blend_use_policy_kernel=True)` -- the CONSTRUCTOR route.
+
+    Distinct from `test_flag_resolution_order_and_prefixed_key_only` above, which
+    reached the config source by *assigning an ad-hoc attribute after construction*:
+    that works even when the dataclass has no such field, so it could not prove the
+    field exists. The M4.2 author flagged the config route as untestable for exactly
+    that reason. Constructing with the keyword now raises `TypeError` if the field is
+    removed, and the spies below prove the attribute is not decorative -- params here
+    carry NO flag, so only `getattr(cfg, "blend_use_policy_kernel", False)` at
+    `blend_base.generate_weights` can select the branch.
+
+    Behavioural, not output-based: the two paths are bit-identical by construction
+    (`test_enabled_kernel_matches_legacy_committed_weights_exactly`), so no frame
+    comparison can tell them apart.
+    """
+    import pipeline.research.blend.blend_base as blend_base
+
+    calls = {"legacy": 0, "kernel": 0}
+    original_step = blend_base._step_asset_inertia
+    original_sequence = PortfolioSequencer.sequence
+
+    def spy_step(**kwargs):
+        calls["legacy"] += 1
+        return original_step(**kwargs)
+
+    def spy_sequence(self, *args, **kwargs):
+        calls["kernel"] += 1
+        return original_sequence(self, *args, **kwargs)
+
+    monkeypatch.setattr(blend_base, "_step_asset_inertia", spy_step)
+    monkeypatch.setattr(PortfolioSequencer, "sequence", spy_sequence)
+
+    universe = _make_universe(160)
+
+    # (a) the dataclass default is False and the default config takes the legacy path.
+    default_cfg = StrategyConfig()
+    assert default_cfg.blend_use_policy_kernel is False, (
+        "StrategyConfig.blend_use_policy_kernel must default to False -- flipping it "
+        "makes the position-policy kernel the default path for every blend strategy"
+    )
+    off = _run(universe, None, cfg=default_cfg)
+    assert len(off.dropna(how="all")) > 0, "no rebalance rows -- the spy would be vacuous"
+    assert calls["legacy"] > 0, (
+        "with the DEFAULT StrategyConfig, `_step_asset_inertia` was never called "
+        f"(kernel calls={calls['kernel']}): the pre-M4.2 inertia path is no longer the default"
+    )
+    assert calls["kernel"] == 0, (
+        f"the DEFAULT config called `PortfolioSequencer.sequence` {calls['kernel']} times "
+        "without opting in via `blend_use_policy_kernel`"
+    )
+
+    # (b) constructor keyword alone (params carry no flag) -> kernel path, legacy bypassed.
+    calls["legacy"] = 0
+    calls["kernel"] = 0
+    on = _run(universe, None, cfg=StrategyConfig(blend_use_policy_kernel=True))
+    assert len(on.dropna(how="all")) > 0, "no rebalance rows -- the spy would be vacuous"
+    assert calls["kernel"] > 0, (
+        "`StrategyConfig(blend_use_policy_kernel=True)` did not select the kernel path "
+        f"(legacy calls={calls['legacy']}): the StrategyConfig attribute is not wired"
+    )
+    assert calls["legacy"] == 0, (
+        f"`_step_asset_inertia` still ran {calls['legacy']} times with the config field "
+        "set to True -- the flag did not actually bypass the legacy step"
+    )
 
 
 def test_chan_four_state_blend_still_pinned_to_regime_ic_ir_hybrid():
