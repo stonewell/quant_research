@@ -22,125 +22,36 @@ import pandas as pd
 _LOGGER = logging.getLogger(__name__)
 
 
-class PositionState(str, Enum):
-    """Lifecycle states for a portfolio asset."""
-    FLAT = "FLAT"
-    PENDING_ENTRY = "PENDING_ENTRY"
-    HELD_GESTATION = "HELD_GESTATION"
-    HELD_ACTIVE = "HELD_ACTIVE"
-    PENDING_EXIT = "PENDING_EXIT"
-    COOLDOWN = "COOLDOWN"
-
-
-class ExitType(str, Enum):
-    """Categorization of liquidation triggers."""
-    NORMAL = "NORMAL"
-    HARD_STOP = "HARD_STOP"
-    TRAILING_STOP = "TRAILING_STOP"
-    CIRCUIT_BREAKER = "CIRCUIT_BREAKER"
-
-
-class BlockingReason(str, Enum):
-    """Structured "why was no trade emitted" label -- `docs/development_plan.md` L2.24.
-
-    Root cause this enum exists for (disclosed): `HOLD_FILTERED` was reused by
-    SIX branches of `step_position_lifecycle` plus FOUR producer sites in
-    `scripts/run_live_strategy.py`, so `action` alone could not distinguish
-    "a signal was evaluated and rejected" from "nothing was evaluated at all"
-    (market-closed freeze) or from "the order was blocked by a risk gate"
-    (tenure lock / limit-up lock / cooldown). Downstream consumers then had no
-    honest way to ask "did this row liquidate the position?" other than
-    inferring it from `target_weight == 0.0` -- an inference that is WRONG for
-    every branch below except a real `SELL` (see `docs/version.md` §11 and the
-    `L2.21` phantom-anchor post-mortem: 34 never-traded rows across 25 archived
-    tickets were read as liquidations).
-
-    Contract:
-      - `NONE` means "no blocking gate fired"; it is the default for BUY / SELL
-        / plain HOLD / SWEEP_CASH / RELEASE_CASH / CANCEL_PENDING rows.
-      - A non-`NONE` value is *only* ever an explanation of why a row traded
-        nothing. It can never promote a non-`SELL` row into a liquidation.
-      - Persisted/archived rows may predate this field; readers MUST go through
-        `coerce_blocking_reason()` (missing -> `NONE`) and MUST NOT derive
-        "liquidated or not" from `target_weight` (see `is_liquidation_event`).
-    """
-
-    # Nothing was evaluated: not a signal filter, not a risk veto.
-    MARKET_CLOSED_FREEZE = "MARKET_CLOSED_FREEZE"
-    # A real signal was evaluated and rejected by a gate.
-    MIN_ENTRY_THRESHOLD = "MIN_ENTRY_THRESHOLD"
-    PENDING_ENTRY_CONFIRM = "PENDING_ENTRY_CONFIRM"
-    EXIT_CONFIRMING = "EXIT_CONFIRMING"
-    COOLDOWN_BLOCKED = "COOLDOWN_BLOCKED"
-    INERTIA = "INERTIA"
-    TENURE_LOCKED = "TENURE_LOCKED"
-    LIMIT_UP_LOCKED = "LIMIT_UP_LOCKED"
-    # Missing / non-positive price on evaluation bar.
-    NO_PRICE = "NO_PRICE"
-    # No blocking gate fired.
-    NONE = "NONE"
-
-
-# Chinese display labels. Kept next to the enum so the live ticket, the Phase 3
-# console rendering and any future web badge cannot drift apart in wording.
-BLOCKING_REASON_LABELS: Dict[str, str] = {
-    BlockingReason.MARKET_CLOSED_FREEZE.value: "休市未评估",
-    BlockingReason.MIN_ENTRY_THRESHOLD.value: "未达最低建仓门槛",
-    BlockingReason.PENDING_ENTRY_CONFIRM.value: "开仓信号确认中",
-    BlockingReason.EXIT_CONFIRMING.value: "平仓信号确认中",
-    BlockingReason.COOLDOWN_BLOCKED.value: "再入场冷却中",
-    BlockingReason.INERTIA.value: "未超惰性阈值",
-    BlockingReason.TENURE_LOCKED.value: "未满最低持仓周期",
-    BlockingReason.LIMIT_UP_LOCKED.value: "涨停封板",
-    BlockingReason.NO_PRICE.value: "价格缺失",
-    BlockingReason.NONE.value: "无阻断",
-}
-
-
-def coerce_blocking_reason(value: Any) -> BlockingReason:
-    """Legacy-tolerant reader for a persisted `blocking_reason`.
-
-    Archived `live_trading_ticket.csv` files written before `L2.24` have no such
-    column at all (`pandas.Series.get` -> None), older JSON rows have no such
-    key, and a CSV round-trip yields the literal string. All three must read as
-    `NONE` -- never raise, never be mistaken for a gate that actually fired.
-    Anything unrecognised is also `NONE` (fail open: an unknown label may not
-    claim a block, and it certainly may not claim a liquidation).
-    """
-    if isinstance(value, BlockingReason):
-        return value
-    if value is None:
-        return BlockingReason.NONE
-    text = str(value).strip().upper()
-    if text in ("", "NAN", "NONE", "NULL"):
-        return BlockingReason.NONE
-    try:
-        return BlockingReason(text)
-    except ValueError:
-        return BlockingReason.NONE
-
-
-def blocking_reason_label(value: Any) -> str:
-    """Chinese display label for a `blocking_reason` (legacy values tolerated)."""
-    return BLOCKING_REASON_LABELS.get(coerce_blocking_reason(value).value, "无阻断")
-
-
-def is_liquidation_event(action: Any, blocking_reason: Any = None) -> bool:
-    """Whether a ticket row represents an ACTUAL liquidation (`docs/development_plan.md` L2.24).
-
-    The single predicate every consumer must use instead of inferring "did we
-    exit?" from `target_weight == 0.0`. That inference is the phantom-anchor bug
-    class (`docs/version.md` §11): `MIN_ENTRY_THRESHOLD`, `PENDING_ENTRY_CONFIRM`
-    and `MARKET_CLOSED_FREEZE` all write a 0.0 target while having traded
-    nothing, and `CANCEL_PENDING` is a never-held record.
-
-    `blocking_reason` is accepted for signature stability / caller honesty but is
-    deliberately NOT part of the verdict: only `action == "SELL"` can mean "the
-    position was liquidated". A blocking label can never promote a non-`SELL`
-    row, and a `SELL` is never demoted by a stale/contradictory label (every
-    `SELL` path in `position_lifecycle` and in the live runner emits `NONE`).
-    """
-    return str(action or "").strip().upper() == "SELL"
+# ---------------------------------------------------------------------------
+# M4.1 (type migration, no behaviour): these seven names now live in
+# `common/position_policy.py` -- the single policy kernel of
+# `docs/position_policy_consolidation_design.md` §4-§6. They are RE-EXPORTED
+# here (a one-way dependency: `position_lifecycle` -> `position_policy`;
+# `position_policy` must never import this module, which is why the kernel owns
+# no live-runner code) so that EVERY existing import site keeps working
+# unchanged:
+#
+#   * `common/tests/test_position_lifecycle.py`, `backtester/`, `pipeline/`
+#     (`parity_harness.py`, `test_blend_track_c.py`),
+#   * `scripts/run_live_strategy.py` (imports `BlockingReason`,
+#     `coerce_blocking_reason`, `is_liquidation_event`, ...),
+#   * `web/livetrading/` (`BLOCKING_REASON_LABELS`),
+#
+# all of which do `from common.position_lifecycle import ...` and must keep
+# working without an edit. Re-exporting (instead of keeping a duplicate copy of
+# each definition) is what makes the type single-source: a `BlockingReason` built
+# by this module, by the kernel, or by a re-exported import is the SAME enum
+# member, so `is` / `==` / dict lookups cannot diverge.
+# ---------------------------------------------------------------------------
+from common.position_policy import (  # noqa: E402  (re-export, not a new use)
+    BLOCKING_REASON_LABELS,
+    BlockingReason,
+    ExitType,
+    PositionState,
+    blocking_reason_label,
+    coerce_blocking_reason,
+    is_liquidation_event,
+)
 
 
 @dataclass
