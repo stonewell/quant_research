@@ -468,6 +468,7 @@ flowchart TD
 | **`LV16`** | `[ ]` | `nav_degraded_as_of` 只在降级分支写入，恢复后从不清除（`Tier P3`，2026-11-04 登记，序位待用户裁定） | [`scripts/check_live_portfolio_health.py`](file:///home/stone/Work/github/quant/scripts/check_live_portfolio_health.py)<br>`:750`（`"nav_degraded_as_of": as_of_date` **无条件**写在降级分支；成功分支无任何清除动作）<br>归档侧：`2026-11-04/203553/account_state.json` **`:698`** 对照 **`:704-705`** —— `nav_gate_status: EVALUATED` / `tier_status: EVALUATED` 却仍带 `nav_degraded_as_of: "2026-11-04"` | 1. **现象**：一次 `nav_gate_status: EVALUATED` / `tier_status: EVALUATED` 的运行为何仍带 `nav_degraded_as_of: "2026-11-04"`，读者**无法区分**「今日降级」与「曾降级、已恢复」。<br>2. **交付（二选一，须写明所选与理由）**：(a) 在 breaker **真正评估成功**的那条分支上**清除**该字段；(b) 拆成语义独立的两字段 —— `nav_last_degraded_as_of`（历史）+ `nav_degraded_today`（当日）。<br>3. **验收（反向改坏即转红）**：用例覆盖「降级一次后恢复」，恢复后该字段**不再呈现为当日降级**；删掉清除 / 拆分判据即转红。<br>4. **不做范围**：不改降级判定条件本身（归 `LV1` / `LV11`）、不改熔断阈值、不改任何已归档 `account_state.json`、不碰版本轴。 | 扩展 `pipeline/tests/test_stage1_nav_source.py`（降级 → 恢复 → 字段不再呈现当日降级；全离线） | S | 无（降级判定与失败关闭归 `LV1` / `LV11`，本条**只做字段语义**；**序位待用户裁定**）<br>**（2026-11-05 用户裁定）**：序位 **4/5**，裁决顺序 `LV15` → `LV14` → `LV18` → `LV16` → `LV17`，见 §4.42。 |
 | **`LV17`** | `[ ]` | 文档记载的相位顺序与实际输出顺序不一致（CASH SWEEP 实为**第三**相位）（`Tier P3`，2026-11-04 登记，序位待用户裁定） | [`AGENTS.md`](file:///home/stone/Work/github/quant/AGENTS.md) `:156-158`（把 CASH SWEEP 记为**第四**相位、在 HOLD 之后）<br>[`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py) `:3186-3192`（`sort_priority`：`SWEEP`/`RELEASE` 排 **3**、其余含 HOLD 排 **4**）<br>归档观测 `2026-11-04/203553/deploy_stdout` 第 **42 / 45 / 49 / 58** 行（现金腿先于持仓块输出） | 1. **现象**：`AGENTS.md` 记 CASH SWEEP 为第四相位（HOLD 之后），实现却把 `SWEEP`/`RELEASE` 排 3、HOLD 排 4 ⇒ 现金腿**先于**持仓块输出。<br>2. **交付（二选一，须在行内写明选了哪一边及理由）**：改排序键（让输出与文档一致）**或**改文档（让文档与输出一致）。<br>3. **验收**：文档与实现二者**对齐**；且「**钱不受影响**」这一点被**显式确认** —— 仅输出顺序，不影响下单集合（断言排序前后订单集合与金额 bit-identical）。<br>4. **不做范围**：不改「Phase 1 SELLS 先于 Phase 2 BUYS」的执行层级、不改任何下单集合 / 定量 / 整手取整、不改票据 schema、不碰版本轴。若裁决选「改文档」，落点在 [`AGENTS.md`](file:///home/stone/Work/github/quant/AGENTS.md) `:156-158`，须另批改动（本次登记**不**实施）。 | 扩展 `common/tests/test_live_strategy.py`（输出顺序与文档一致 + 排序前后订单集合 bit-identical；全离线） | S | 无（**序位待用户裁定**）<br>若选「改文档」则与 `AGENTS.md` 的相位描述同批，不与任何 `LV` 行冲突<br>**（2026-11-05 用户裁定）**：序位 **5/5**；**选「改文档」** —— 以 [`AGENTS.md`](file:///home/stone/Work/github/quant/AGENTS.md) `:156-158` 对齐实现（CASH SWEEP 实为**第三**相位、先于持仓块），**不改** `sort_priority` 排序键；验收须显式确认排序前后订单集合与金额 **bit-identical**，且本项须与 `AGENTS.md` 的相位描述同批改动。见 §4.42。 |
 | **`LV18`** | `[ ]` | `vol_scaling_factor 0.42x` 被展示为已施行的风险动作，实际完全惰性（`Tier P3`，2026-11-04 登记，序位待用户裁定） | [`scripts/check_live_portfolio_health.py`](file:///home/stone/Work/github/quant/scripts/check_live_portfolio_health.py)<br>写入 `:1390`；三处打印 `:1509` / `:1603` / `:1916`<br>[`web/livetrading/execution_service.py`](file:///home/stone/Work/github/quant/web/livetrading/execution_service.py) `:2578`（仅 `setdefault` 进 `health_data`，**无下游消费者**）<br>归档侧：`2026-11-04/203553/stage1_health_report.json` **`:232` / `:299`**、`stage1_health_report.md` **`:53-55` / `:84`**（`0.4161909794421544`）；同次 `linear_equity_scale` = **1.0**（印证未被缩放）<br>对照：相邻 `target_exposure` 明标 `[Stage-1 advisory, ignored by Stage-2 orders]`（`check_live_portfolio_health.py:1593`），该因子**无**同类告示 | 1. **现象**：`0.4161909794421544` 被算出、三处打印并回写进报告，但**没有任何下游消费者**用它缩放权重或股数 —— 真按 0.42× 执行，`600362` 应约为 **100** 股而非 **300** 股。<br>2. **交付（二选一，须写明所选）**：(a) 让它**真的**参与 Stage-2 定仓（属策略行为变更，须走版本轴与 [`docs/version.md`](file:///home/stone/Work/github/quant/docs/version.md)）；(b) 保持惰性但把输出与报告**改标 advisory**（照抄 `target_exposure` 的措辞）。**默认倾向 (b)**。<br>3. **验收（反向改坏即转红）**：①选 (b) ⇒ 三处输出与两份报告均带 advisory 字样，且下单量与接入前 **bit-identical**；②选 (a) ⇒ 必须有交易层面的差分证据与版本轴留痕，**不得**只改文案就宣称已生效；③**无论选哪边都不得静默保留现状** —— 「展示成已施行、实际惰性」这一形状必须被一条用例钉死。<br>4. **不做范围**：不改 Barroso 波动率目标的**计算**本身；不改 `target_exposure` 既有 advisory 措辞；不改熔断 / 门禁阈值；选 (b) 时**零版本轴变动**，选 (a) 时按 [`AGENTS.md`](file:///home/stone/Work/github/quant/AGENTS.md) §7 升 `version` / `BASE_VERSION` 并补记 `docs/version.md`。 | 新增 `pipeline/tests/test_vol_scaling_labeling.py`（advisory 措辞覆盖三处输出与报告字段 / 下单量 bit-identical；全离线） | S | 无（**序位待用户裁定**）<br>若裁决选 (a) 则须先定版本轴，见交付第 2 条<br>**（2026-11-05 用户裁定）**：序位 **3/5**；**选 (b)** —— 保持惰性，三处输出（`check_live_portfolio_health.py:1509/1603/1916`）与两份报告改标 **advisory**（照抄 `target_exposure` 的 `[Stage-1 advisory, ignored by Stage-2 orders]` 措辞），下单量与接入前 **bit-identical**，**零版本轴**。选 (a) 已明确不做。见 §4.42。 |
+| **`LV19`** | `[ ]` | 持仓预刷新与估值取数的**新鲜度契约不一致**（补数容忍 2 日、估值要求当日），且 `last_sync_time` 落**裸本地时间**（`Tier P1`，2026-11-06 登记，序位待用户裁定；本案已致 2026-11-05 Stage-1 净值降级、首轮无法出票） | [`scripts/sync_china_5m_and_indices.py`](file:///home/stone/Work/github/quant/scripts/sync_china_5m_and_indices.py)<br>补数判据 `:1034`（`max_date >= target_end_date - timedelta(days=2)`）<br>命名空间循环 `:1032`；fetch 落在循环内 `:1051-1069`<br>[`common/freshness.py`](file:///home/stone/Work/github/quant/common/freshness.py) `:121`（估值要求 bar **恰在** `as_of`，零容忍）<br>[`common/duckdb_cache.py`](file:///home/stone/Work/github/quant/common/duckdb_cache.py)<br>`sync_ts = datetime.datetime.now()`（`:1967` / `:2324`，**裸本地时间**、无时区）<br>[`web/livetrading/execution_service.py`](file:///home/stone/Work/github/quant/web/livetrading/execution_service.py)<br>预刷新入口 `:730`；`data_provider` 仅用于 synthetic 短路 `:794`；实际调用 `:840`<br>归档侧 `2026-11-05/`：`stage1_health_report.json` `:78-79`（`cache_file` = `data/cache.duckdb`）、`:82`（`patch_equity_daily_bars: ok`）、`summary.json` `:93`（`health_stdout` 含 `PART A.2`）<br>实测量（`asset_sync_metadata`，7 只持仓）：`MarketDBDataProvider` 写入 `2026-11-05 20:20:10–13`（−0800）、`FuyaoDataProvider` 写入 `20:23:28–35`（−0800）；库 mtime `2026-11-05 20:23:36 −0800`；运行时钟 `2026-11-06T12:20:14+08:00` | 1. **契约统一（本条主体）**：持仓预刷新对**估值真正读取的那个命名空间**不得使用 2 日容忍 —— 要么把判据收紧到 `max_date >= target_end_date`，要么让预刷新的写入命名空间与 `compute_nav` 的读取命名空间**由同一配置项派生**（今天是硬编码的双写，而调用方传入的 `data_provider` 只用于 synthetic 短路）。全 universe 刷新在周末／假日仍需容忍，**不得一刀切删**。<br>2. **时区口径**：`last_sync_time` 必须落 UTC（或读取侧显式归一），并在报告中同时给出转换后的市场时间。理由：本轮运维把 `20:23` 读成「前一晚」而实际是同一次运行的**第 3 分钟** —— raw 数值与市场时钟相差 **16 小时**，任何事后审计都会读错。<br>3. **预刷新须逐命名空间留痕**：今天的 `fetch_errors=none` 只表达「该标的最终补到了」，**不表达**「估值要读的那个命名空间是否被跳过」。须输出机器可读的 `per_namespace: {provider → skipped／patched／failed}`。<br>4. **未决测量必须先做**：归档 `health_stdout` 含 `PART A.2`，但 `Patching <sym> [FuyaoDataProvider]` **零命中**，而 Fuyao 元数据确在 `20:23:28–35` 被写 7 次 ⇒ 写入者**不在两个归档进程之内**，或归档 stdout 不完整。开工前须先定案，判据：其余 13 只非持仓标的的 `last_sync_time` 是否落在同一批。<br>5. **与四个既有行的关系（不重复其内容，仅登记本轮复现）**：三套净值并存（`nav_effective` 198810.57 ／ `current_nav`(mtm) 208830.78 ／ `nav_form` 200076.78）归 `LV10`；`nav_degraded_as_of` 残留归 `LV16`；`nav_history_10d` 仅 7 点且含重复对归 `LV7`；`Barroso 0.35x` 惰性却叙述为已施行归 `LV18`。本条**不**改写上述四行。<br>6. **解除一个误读（必须留痕）**：本轮曾疑「`tier_status=UNKNOWN` 下仍出票」，**已证伪** —— `202418/` 是同一 `as_of` 的 Stage-2 复跑（`12:24:37`），其时 `tier_status` / `nav_gate_status` 均为 `EVALUATED`、`circuit_breaker_tier` 为 `NORMAL`，`run_live_strategy.py:2198-2202` 的拒绝条件**一个都不满足** ⇒ 既未绕过、也无需绕过。**不得**把本次事故记成「降级门禁下下单」。 | 新增 `pipeline/tests/test_patched_namespace_freshness.py`（①只差一个交易日必补 ②周末／假日不误补 ③逐命名空间留痕字段三态精确 ④删掉任一条判据即转红；全离线合成 cache，**禁止**读 `data/runs/**` 与生产缓存） | M | 无（可独立先行）<br>**边界（必须与 C 方案分清）**：把 fetch 提到命名空间循环外（C 方案，2026-11-06 起实施）**不修本条** —— 它只减少抓取次数与单标的超时风险，落库结果不变（11-05 那次 Fuyao 本就判为新鲜而被跳过）。二者**不得**互相充当验收证据。 |
 
 ### 2.22 接线任务登记（`W1`，2026-11-05 由用户裁定立项，1 项待办）
 
@@ -2083,3 +2084,46 @@ uv run pytest common/tests/test_intraday_bar_contract.py common/tests/test_intra
 - 是否有任何部署路径从 `results/`（gitignore 目录）之外拷贝 dump 未确认。
 - `pipeline/scripts/blend_dump_overrides.py` **刻意未运行**——它属 2026-10-24 记录的漂移路径。
 - 阶段二仍未开始：`common/allocation_templates.py` 的 `apply_asset_inertia`/`_step_asset_inertia` 委托、模板侧守卫用例的相应更新、以及**默认翻转**（须等价性证据先合入）。`M4.2` 行状态因此保持 `[ ]`。
+
+---
+
+### 4.47 `LV19` 登记：新鲜度契约不一致、裸本地时间戳与 2026-11-05 归档复核（2026-11-06，纯登记）
+
+本节**只登记**，**零代码、零版本轴、零测试计数变动**。新增 `LV19` 一行（`[ ]`），不改任何既有状态位。
+
+#### 4.47.1 为什么单列一行，而不是并入 `LV13`
+
+`LV13`（`[x]`）修的是**时序**：估值快照预置早于子进程行情刷新，其修复让预刷新前移到 Stage-1 子进程之前。本案是**另一个**缺口：预刷新确实跑了，但它的**补数判据**（`max_date >= target_end_date − 2 日`）与估值侧的**读取判据**（bar 恰在 `as_of`，零容忍）不是同一个契约。两者都能让 `compute_nav` 抛 `StalePriceError`，但改一处不能覆盖另一处，按「只追加、不复用」惯例新立一行。
+
+#### 4.47.2 实测事实（含一处时区订正）
+
+`data/cache.duckdb` 的 `asset_sync_metadata` 实测（7 只持仓，`000157.SZ` 等）：
+
+| 观测 | 值 | 折算 UTC |
+| :-- | :-- | :-- |
+| `MarketDBDataProvider` 写入 | `2026-11-05 20:20:10–13`（−0800） | `04:20:10–13` |
+| `FuyaoDataProvider` 写入 | `2026-11-05 20:23:28–35`（−0800） | `04:23:28–35` |
+| 库文件 mtime | `2026-11-05 20:23:36 −0800` | `04:23:36` |
+| 运行时钟 `local_now` | `2026-11-06T12:20:14+08:00` | `04:20:14` |
+
+**订正记录**：`last_sync_time` 由 `datetime.datetime.now()` 写入（`duckdb_cache.py:1967` / `:2324`），是**无时区的机器本地时间**，而本机时区为 **−0800**、流水线其余部分按市场时区 **+08** 推理。故 raw 数值 `20:20` 与市场时钟 `12:20` 实际上只差 **4 秒**，而按字面读会误判为「前一晚」，**偏差 16 小时**。本节先前的口头分析即因此错读一次，登记在此以免重犯。
+
+#### 4.47.3 与四个既有行的关系（不重复其内容）
+
+本轮归档复核（`2026-11-05/` 与 `202418/`）复现的四项，均已有归属，`LV19` **不改写**它们：三套净值并存 ⇒ `LV10`；`nav_degraded_as_of` 残留 ⇒ `LV16`；`nav_history_10d` 仅 7 点且含重复对 ⇒ `LV7`；`Barroso 0.35x` 惰性却叙述为已施行 ⇒ `LV18`（选 (b) 尚未落地）。
+
+#### 4.47.4 一条已证伪的怀疑（须留痕，防止后人引用错版本）
+
+复核过程中曾疑「`tier_status = UNKNOWN` 的降级门禁下仍生成了下单票据」。**已证伪**：顶层 `summary.json` 为 `stage1`（`12:20:14`，`SNAPSHOT_NOT_YET_WRITTEN`、`tier_status = UNKNOWN`），`202418/` 为同一 `as_of` 的 **Stage-2 复跑**（`12:24:37`），其时 `nav_effective = 198810.57`（`nav_source = computed`）、`tier_status` / `nav_gate_status` 均为 `EVALUATED`、`circuit_breaker_tier = NORMAL`；`run_live_strategy.py:2198-2202` 的三个拒绝条件**一个都不满足**。票据本身也非危险形状：9 行中仅 2 行非零（`SELL 000999.SZ` 500 股 @25.9 计 12950，`SWEEP_CASH BIL` +12950 为回款归集），**0 笔 BUY**。⇒ 不是「绕过门禁」，是门禁**已恢复**之后出的票。
+
+#### 4.47.5 仍未闭合的测量（不得读成已查清）
+
+归档 `summary.json:93` 的 `health_stdout` **含** `PART A.2`，但全归档检索 `Patching <sym> [FuyaoDataProvider]` **零命中**；而 `asset_sync_metadata` 显示 Fuyao 在 `04:23:28–35` 被写入 7 次。二者不能同时成立 —— 要么写入者不在两个归档进程之内（手工或计划任务），要么归档 stdout 不完整。`LV19` 交付第 4 条把「定案」列为开工前置，**在本轮不宣称已解决**。
+
+#### 4.47.6 与 C 方案的分界（防张冠李戴）
+
+把 fetch 提到命名空间循环外（C 方案，已另批实施）**不修本条**：它只把「每标的抓两次」降为一次，减少超时与网络成本，**落库结果不变**。11-05 那次 Fuyao 本就因 2 日容忍被判为新鲜而跳过，C 不会让它被补。任一方都不得拿另一方的验收当证据。
+
+#### 4.47.7 计数（2026-11-06，本条为现行权威值）
+
+新增 `LV19` 一行（`[ ]`），故现役由 **150 = 105 `[x]` + 45 `[ ]`** 变为 **151 = 105 `[x]` + 46 `[ ]`**；两文件合计由 **216 = 171 `[x]` + 45 `[ ]`** 变为 **217 = 171 `[x]` + 46 `[ ]`**；归档 8 张子表仍 **66 项全 `[x]`** 不变。`§2.21` 由 **18 项 = 7 `[x]` + 11 `[ ]`** 变为 **19 项 = 7 `[x]` + 12 `[ ]`**。`§2.22` 仍 **1 项 = 0 `[x]` + 1 `[ ]`**、`§2.23` 仍 **1 项 = 0 `[x]` + 1 `[ ]`**。§4.43–§4.46 各计数为各自时点值，按「只追加、不回改」原样保留。
