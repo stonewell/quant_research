@@ -3,7 +3,14 @@ import pandas as pd
 import pytest
 
 from selectorbot.config import SelectionConfig
-from selectorbot.scoring import SECTOR_NEUTRAL_MIN_GROUP_SIZE, score_universe
+from selectorbot.scoring import (
+    DAILY_FACTOR_RAW_COLUMNS,
+    DAILY_FACTOR_SCORE_COLUMNS,
+    DAILY_FACTOR_WEIGHTS,
+    DEFAULT_WEIGHTS,
+    SECTOR_NEUTRAL_MIN_GROUP_SIZE,
+    score_universe,
+)
 from common.sector_metadata import sector_neutral_demean
 
 
@@ -513,3 +520,160 @@ def test_sector_neutral_normal_multisector_emits_no_warning():
         scored = score_universe(df.copy(), enable_sector_neutral=True)
 
     assert len(recorded) == 0, f"Expected no warnings, but caught: {[str(w.message) for w in recorded]}"
+
+
+# ---------------------------------------------------------------------------
+# Task M3.1: opt-in daily-factor supplement (VWAP slope / IVOL / 1M-1W)
+# ---------------------------------------------------------------------------
+# Frozen default-output column contract, captured from the pre-M3.1 code path.
+# If the flag's default ever flips, or the guard stops short-circuiting, this
+# list changes and every prior universe-selection result becomes irreproducible.
+_EXPECTED_DEFAULT_COLUMNS = [
+    "avg_dollar_volume", "median_spread_pct", "realized_vol_annualized_pct",
+    "pct_days_trending_adx", "hurst", "hurst_significant", "hurst_p_value",
+    "avg_correlation_to_universe", "history_years",
+    "liquidity_score", "vol_adequacy_score", "predictability_score",
+    "candlestick_score", "momentum_score", "diversification_score",
+    "history_adequacy_score", "overall_selection_score",
+]
+
+# Exact pre-M3.1 values for `make_metrics()` (captured from the committed
+# pre-change module): a column-order check alone would let a numeric regression
+# through, so the default path's headline numbers are pinned here too.
+_EXPECTED_DEFAULT_OVERALL = {
+    "TRENDY": 64.43089430894308,
+    "MEANREVY": 26.829268292682926,
+    "NEUTRAL": 54.0650406504065,
+}
+
+
+def _daily_frames(trends, n=120, seed=4):
+    """Synthetic OHLCV frames per symbol, trending at `trends[symbol]` per day."""
+    rng = np.random.default_rng(seed)
+    idx = pd.date_range("2020-01-01", periods=n, freq="B")
+    frames = {}
+    for symbol, drift in trends.items():
+        rets = drift + rng.normal(0.0, 0.004, n)
+        close = 100.0 * np.cumprod(1.0 + rets)
+        volume = 1e6 * (1.0 + 0.2 * np.sin(np.arange(n) / 5.0))
+        frames[symbol] = pd.DataFrame({
+            "Open": close, "High": close * 1.005, "Low": close * 0.995,
+            "Close": close, "Volume": volume,
+        }, index=idx)
+    return frames
+
+
+def test_daily_factors_default_off_is_bit_identical_to_pre_m31_output():
+    metrics = make_metrics()
+    implicit_off = score_universe(metrics)
+    explicit_off = score_universe(metrics, use_daily_factors=False)
+
+    # Same columns, same order -- the frozen pre-M3.1 structure.
+    assert list(implicit_off.columns) == _EXPECTED_DEFAULT_COLUMNS
+    assert list(explicit_off.columns) == _EXPECTED_DEFAULT_COLUMNS
+    pd.testing.assert_frame_equal(implicit_off, explicit_off, atol=0.0, rtol=0.0)
+    # ...and the same numbers, not just the same shape.
+    for symbol, expected in _EXPECTED_DEFAULT_OVERALL.items():
+        assert implicit_off.loc[symbol, "overall_selection_score"] == pytest.approx(expected, rel=0, abs=1e-12)
+    # And the input frame was not mutated with stray factor columns.
+    assert list(metrics.columns) == [
+        "avg_dollar_volume", "median_spread_pct", "realized_vol_annualized_pct",
+        "pct_days_trending_adx", "hurst", "hurst_significant", "hurst_p_value",
+        "avg_correlation_to_universe", "history_years",
+    ]
+
+
+def test_daily_factors_opt_in_adds_exactly_the_new_columns():
+    metrics = make_metrics()
+    # Caller-merged raw factor values (the second supported source).
+    metrics["vwap_slope"] = [0.004, -0.003, 0.0005]
+    metrics["ivol_residual"] = [0.10, 0.35, 0.22]
+    metrics["momentum_1m_1w"] = [0.06, -0.04, 0.01]
+
+    off = score_universe(metrics.drop(columns=list(DAILY_FACTOR_RAW_COLUMNS)))
+    on = score_universe(metrics, use_daily_factors=True)
+
+    new_columns = set(DAILY_FACTOR_RAW_COLUMNS) | set(DAILY_FACTOR_SCORE_COLUMNS)
+    assert set(on.columns) - set(off.columns) == new_columns
+    # Every pre-existing column is untouched, including the overall score.
+    shared = [c for c in off.columns]
+    pd.testing.assert_frame_equal(on[shared], off[shared], atol=0.0, rtol=0.0)
+
+    # Direction sanity: the rising-VWAP symbol gets the top slope score and the
+    # high-IVOL symbol the LOWEST ivol score (less diversifiable risk is better).
+    assert on["vwap_slope_score"].idxmax() == "TRENDY"
+    assert on["ivol_residual_score"].idxmin() == "MEANREVY"
+    assert on["momentum_1m_1w_score"].idxmax() == "TRENDY"
+
+
+def test_daily_factors_opt_in_from_daily_data_panel():
+    metrics = make_metrics()
+    daily_data = _daily_frames({"TRENDY": 0.002, "MEANREVY": -0.002, "NEUTRAL": 0.0})
+
+    scored = score_universe(metrics, use_daily_factors=True, daily_data=daily_data)
+
+    assert scored.loc["TRENDY", "vwap_slope"] > 0 > scored.loc["MEANREVY", "vwap_slope"]
+    assert scored.loc["TRENDY", "momentum_1m_1w"] > scored.loc["NEUTRAL", "momentum_1m_1w"]
+    assert scored.loc["MEANREVY", "momentum_1m_1w"] < 0
+    # IVOL is vs. the panel's equal-weight mean, so it can only be >= 0.
+    assert (scored["ivol_residual"] >= 0).all()
+
+
+def test_daily_factors_only_enter_the_score_when_the_caller_supplies_weights():
+    metrics = make_metrics()
+    daily_data = _daily_frames({"TRENDY": 0.002, "MEANREVY": -0.002, "NEUTRAL": 0.0})
+
+    off = score_universe(metrics)
+    without = score_universe(metrics, use_daily_factors=True, daily_data=daily_data)
+    with_weights = score_universe(
+        metrics,
+        use_daily_factors=True,
+        daily_data=daily_data,
+        weights={**DEFAULT_WEIGHTS, **DAILY_FACTOR_WEIGHTS},
+    )
+
+    # Merely enabling the flag must NOT move the overall score: DEFAULT_WEIGHTS is
+    # never silently extended, so the factors are attached but not weighted.
+    pd.testing.assert_series_equal(without["overall_selection_score"],
+                                   off["overall_selection_score"])
+    # With the explicit budget they do participate ...
+    assert not without["overall_selection_score"].equals(with_weights["overall_selection_score"])
+    # ... while every pre-existing component column is still byte-for-byte equal.
+    factor_columns = set(DAILY_FACTOR_SCORE_COLUMNS) | set(DAILY_FACTOR_RAW_COLUMNS)
+    for column in without.columns:
+        if column in factor_columns or column == "overall_selection_score":
+            continue
+        pd.testing.assert_series_equal(without[column], with_weights[column])
+
+
+def test_daily_factors_requires_a_source_when_enabled():
+    with pytest.raises(ValueError, match="use_daily_factors=True needs a factor source"):
+        score_universe(make_metrics(), use_daily_factors=True)
+
+
+def test_daily_factors_partial_source_columns_are_rejected():
+    metrics = make_metrics()
+    metrics["vwap_slope"] = [0.004, -0.003, 0.0005]
+    with pytest.raises(ValueError, match="partial daily-factor columns"):
+        score_universe(metrics, use_daily_factors=True)
+
+
+def test_daily_factors_symbol_missing_from_daily_data_stays_nan():
+    metrics = make_metrics()
+    daily_data = _daily_frames({"TRENDY": 0.002, "MEANREVY": -0.002})  # NEUTRAL absent
+
+    scored = score_universe(metrics, use_daily_factors=True, daily_data=daily_data)
+
+    assert np.isnan(scored.loc["NEUTRAL", "vwap_slope"])
+    assert np.isnan(scored.loc["NEUTRAL", "momentum_1m_1w"])
+    # NaN must stay NaN in the score too (excluded from ranking, never 0.0).
+    assert np.isnan(scored.loc["NEUTRAL", "vwap_slope_score"])
+    assert np.isnan(scored.loc["NEUTRAL", "ivol_residual_score"])
+    assert scored.loc["TRENDY", "vwap_slope_score"] == pytest.approx(100.0)
+
+
+def test_daily_factors_invalid_daily_data_frame_is_rejected():
+    metrics = make_metrics()
+    bad = {"TRENDY": pd.DataFrame({"Close": [1.0, 2.0]})}  # no Volume column
+    with pytest.raises(ValueError, match="missing column"):
+        score_universe(metrics, use_daily_factors=True, daily_data=bad)

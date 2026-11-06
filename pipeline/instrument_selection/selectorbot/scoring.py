@@ -20,6 +20,13 @@ individual stocks) for which they don't apply.
 No single verified scoring formula survived research, so treat the ranking
 this produces as a documented, transparent starting shortlist -- not a
 validated predictive model.
+
+Task M3.1 adds a purely OPT-IN supplement: `use_daily_factors=True` attaches
+three daily factors from `common.daily_factors` (VWAP slope, residual IVOL,
+1M-1W momentum) plus their 0-100 rank scores as EXTRA columns. It does not
+enter `overall_selection_score` unless the caller passes `DAILY_FACTOR_WEIGHTS`
+in `weights`, so the default (off) path and every existing weight keep their
+exact meaning.
 """
 
 from typing import Optional
@@ -28,6 +35,7 @@ import warnings
 import numpy as np
 import pandas as pd
 
+import common.daily_factors as daily_factors
 from common.sector_metadata import resolve_sector, sector_neutral_demean
 
 # Three components now answer the SAME strategy-agnostic question -- "does this
@@ -80,6 +88,99 @@ STRATEGY_FIT_DEFAULT_WEIGHTS = {
 SECTOR_NEUTRAL_MIN_GROUP_SIZE = 2
 
 
+# --- Task M3.1: opt-in daily-factor supplement. ---------------------------
+# These three factors (VWAP slope, residual/idiosyncratic vol, 1M-1W momentum)
+# come from `common.daily_factors` and are attached to the scored frame as
+# ADDITIONAL columns. Nothing above consumes them unless `score_universe` is
+# called with `use_daily_factors=True`; with the default False the function
+# returns bit-identical output to the pre-M3.1 code path.
+DAILY_FACTOR_RAW_COLUMNS = ("vwap_slope", "ivol_residual", "momentum_1m_1w")
+DAILY_FACTOR_SCORE_COLUMNS = tuple(f"{c}_score" for c in DAILY_FACTOR_RAW_COLUMNS)
+# Suggested weight budget for a caller that WANTS the new factors in the overall
+# score. Deliberately NOT merged into DEFAULT_WEIGHTS /
+# STRATEGY_FIT_DEFAULT_WEIGHTS: folding new components into those averages would
+# silently dilute every existing component's effective share, which is exactly
+# the "don't reweight existing factors" line M3.1 must not cross. A caller opts
+# in by passing `weights={**DEFAULT_WEIGHTS, **DAILY_FACTOR_WEIGHTS}`.
+DAILY_FACTOR_WEIGHTS = {
+    "vwap_slope_score": 0.05,
+    "ivol_residual_score": 0.05,
+    "momentum_1m_1w_score": 0.05,
+}
+
+
+def _latest_daily_factor_values(daily_data, vwap_lookback, ivol_lookback, mom_skip):
+    """Latest-bar value of each M3.1 factor, one row per symbol.
+
+    `daily_data` is the screener's own shape: `{symbol: OHLCV DataFrame}` with
+    `Close`/`Volume` columns. Only the LAST bar is kept because `score_universe`
+    is a cross-sectional scorer -- one row per symbol, one factor value per row.
+    """
+    if not daily_data:
+        raise ValueError(
+            "use_daily_factors=True needs a factor source: either pass "
+            "daily_data={symbol: OHLCV DataFrame with 'Close'/'Volume'} or supply "
+            f"pre-computed {list(DAILY_FACTOR_RAW_COLUMNS)} columns on `metrics`."
+        )
+    close_cols, volume_cols = {}, {}
+    for symbol, frame in daily_data.items():
+        missing = [c for c in ("Close", "Volume") if c not in getattr(frame, "columns", [])]
+        if missing:
+            raise ValueError(
+                f"daily_data[{symbol!r}] is missing column(s) {missing}; expected a daily "
+                f"OHLCV frame, got columns {list(getattr(frame, 'columns', []))}"
+            )
+        close_cols[str(symbol)] = frame["Close"].astype(float)
+        volume_cols[str(symbol)] = frame["Volume"].astype(float)
+    # Union of dates, so a symbol with a shorter history simply has NaN at the
+    # earliest bars -- the factors' own warmup/NaN rule then handles it.
+    close = pd.DataFrame(close_cols).sort_index()
+    volume = pd.DataFrame(volume_cols).reindex(index=close.index)
+    return pd.DataFrame({
+        "vwap_slope": daily_factors.vwap_slope(close, volume, vwap_lookback).iloc[-1],
+        "ivol_residual": daily_factors.ivol_residual(close, ivol_lookback).iloc[-1],
+        "momentum_1m_1w": daily_factors.momentum_1m_1w(close, mom_skip).iloc[-1],
+    })
+
+
+def _augment_with_daily_factors(df, daily_data, vwap_lookback, ivol_lookback, mom_skip):
+    """ADD the M3.1 factor values and their 0-100 rank scores to `df`.
+
+    ADDITIVE ONLY: every pre-existing column (including `overall_selection_score`)
+    is left exactly as it was. The new score columns join the input but not the
+    weights, so the overall ranking only changes if the caller explicitly passes
+    `DAILY_FACTOR_WEIGHTS` in `weights` -- see the constant's comment.
+
+    Directions, stated once: a steeper (positive) VWAP slope and stronger 1M-1W
+    momentum rank HIGHER; residual/idiosyncratic volatility ranks LOWER-better
+    (less uncompensated diversifiable risk per Ang-Hodrick-Xing-Zhang 2006).
+    """
+    present = [c for c in DAILY_FACTOR_RAW_COLUMNS if c in df.columns]
+    if len(present) == len(DAILY_FACTOR_RAW_COLUMNS):
+        values = df[list(DAILY_FACTOR_RAW_COLUMNS)].copy()
+    elif present:
+        raise ValueError(
+            f"partial daily-factor columns on `metrics`: got {present}, need all of "
+            f"{list(DAILY_FACTOR_RAW_COLUMNS)} (or none, and pass daily_data instead)"
+        )
+    else:
+        values = _latest_daily_factor_values(daily_data, vwap_lookback, ivol_lookback, mom_skip)
+        # `metrics` is indexed by symbol; align on the string form and leave an
+        # unknown symbol NaN (excluded from the ranking) rather than 0.0 (which
+        # would rank mid-pack -- the same reasoning as the factors' own NaN rule).
+        values = values.reindex([str(s) for s in df.index])
+        values.index = df.index
+
+    df["vwap_slope"] = values["vwap_slope"].to_numpy(dtype=float)
+    df["ivol_residual"] = values["ivol_residual"].to_numpy(dtype=float)
+    df["momentum_1m_1w"] = values["momentum_1m_1w"].to_numpy(dtype=float)
+
+    df["vwap_slope_score"] = _pct_rank(df["vwap_slope"]) * 100
+    df["ivol_residual_score"] = (1.0 - _pct_rank(df["ivol_residual"])) * 100
+    df["momentum_1m_1w_score"] = _pct_rank(df["momentum_1m_1w"]) * 100
+    return df
+
+
 def _pct_rank(series: pd.Series) -> pd.Series:
     # na_option="keep" (pandas' default) excludes NaN entries from both the
     # ranking AND the denominator -- a NaN row gets a NaN rank, and every
@@ -117,8 +218,29 @@ def score_universe(metrics: pd.DataFrame, weights: dict = None,
                    min_history_years_for_full_credit: float = 4.0,
                    strategy_weight: float = None,
                    sector_map: Optional[dict] = None,
-                   enable_sector_neutral: bool = False) -> pd.DataFrame:
+                   enable_sector_neutral: bool = False,
+                   use_daily_factors: bool = False,
+                   factor_vwap_lookback: int = 20,
+                   factor_ivol_lookback: int = 63,
+                   factor_mom_1m_1w_skip: int = 5,
+                   daily_data: Optional[dict] = None) -> pd.DataFrame:
     df = metrics.copy()
+
+    # --- Task M3.1 opt-in guard. MUST stay first ---------------------------
+    # `use_daily_factors` defaults to False and, when False, this branch is never
+    # entered, so the function returns exactly what it returned before M3.1
+    # (bit-identical, same columns, same order -- pinned by
+    # pipeline/instrument_selection/tests/test_scoring.py). Turning it on by
+    # default would silently change EVERY universe selection and make all prior
+    # research irreproducible, so it must stay an explicit caller decision.
+    if use_daily_factors:
+        df = _augment_with_daily_factors(
+            df,
+            daily_data,
+            factor_vwap_lookback,
+            factor_ivol_lookback,
+            factor_mom_1m_1w_skip,
+        )
     if weights is None:
         if "strategy_fit_score" in df.columns:
             weights = dict(STRATEGY_FIT_DEFAULT_WEIGHTS)
