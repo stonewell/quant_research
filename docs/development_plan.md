@@ -1882,3 +1882,83 @@ uv run pytest common/tests/test_intraday_bar_contract.py common/tests/test_intra
 - `blend_base.py` 的行号因并发编辑可能漂移，本节引用该文件**只给函数名与标志名，不给行号**。
 
 本节为**审计记录，不是任务清单**；开工须由用户另行裁定，并在 §2.x 新增任务行。
+
+### 4.44 第二份研究报告覆盖审计：《持续稳健的中短期量化 Alpha 深度挖掘与增强指南》（2026-11-05，零状态变更、不立项）
+
+本审计对象为 [`docs/持续稳健的中短期量化Alpha深度挖掘与增强指南.md`](file:///home/stone/Work/github/quant/docs/持续稳健的中短期量化Alpha深度挖掘与增强指南.md)（224 行、7 节、16 项提议）。它与 §4.43 的对象**不是同一份文档的扩充**：§4.43 审的是日频因子与因子评估工程，本节审的是**日内微观结构、筹码分布、产业链图、执行端非线性成本**。两条口径一致：**按数学查、不按名字查**；任何「名字像但对象不同」的实现不得算作已覆盖，也**不得**用来顶替缺失项。
+
+本节不改任何 `[x]` / `[ ]`、不新增任务行、不动计数（仍 `149 = 105 [x] + 44 [ ]`）。候选只登记，开工需用户另行裁定。
+
+#### 4.44.1 覆盖矩阵（16 项）
+
+| 编号 | 文档提议 | 判定 | 证据或理由 |
+| :-- | :-- | :-- | :-- |
+| `二.1` | VPIN 动态知情交易概率 | **缺失（严格不可建，近似可建）** | 严格口径需逐笔或盘口买卖方向成交量，该 feed 不存在；近似口径可复用 5m 的 BVC 买卖拆分解 `w_plus`（[`intraday_features.py`](file:///home/stone/Work/github/quant/common/intraday_features.py) `:306`）按**累积成交量**分桶 |
+| `二.2` | 日内多时段博弈比率 | **缺失，可建** | 5m bar 齐全；现仅有全天真 VWAP（`intraday_features.py:263`），无按时段切分的 VWAP；时段切分惯例已有 `_compute_volume_seasonality_scales`（`:190`） |
+| `二.3` | OFI 订单流不平衡 | **代理已覆盖，真值不可建** | [`gtja191_factors.py`](file:///home/stone/Work/github/quant/pipeline/research_strategy/rs/gtja191_factors.py) `:89` `cont_ks_ofi_proxy` 与 `:279` 是**K 线内位置 × 成交量**的代理，不是订单簿 OFI；真值需买卖一档队列深度，该 feed 不存在 |
+| `三.1` | 换手率加权筹码沉淀 | **已覆盖** | [`structural_factors.py`](file:///home/stone/Work/github/quant/common/structural_factors.py) `:599` `cyq_chip_distribution` 逐字实现质量守恒递归 `chips_t = chips_{t-1}(1-τ_t) + τ_t·K_t(p)`（`:612`），含三角核与 5m 核 |
+| `三.2` | 浮盈盘锁定度 | **已覆盖** | `cyq_winner_ratio`（`structural_factors.py:799`），内部 `:785` 为收盘价下方筹码积分，即文档的 `ProfitRatio` |
+| `三.3` | 筹码密集度与阻力峰 | **已覆盖** | `cyq_cost_concentration`（`:805`，P5–P95 堆积面积）+ `compute_rolling_poc_series`（`:166`，POC/VAL/VAH 主峰） |
+| `四.1` | 突破弹性 × 换手过滤 | **部分覆盖，可扩展** | `wyckoff_effort_result`（`structural_factors.py:426`）已是「价格变化 ÷ 量能变化」的弹性形式；缺 `Kurtosis(R_intraday)` 乘子与换手激增门限。`metrics.py:199` 的峰度是 DSR 输入，不是 5m 收益四阶矩 |
+| `四.2` | PEAD × 融资拥挤惩罚 | **缺失，数据源不存在** | 需分析师预期（SUE）与融资融券余额，两者均无 feed；`§4.43` 的 `F8` 已定无基本面管道 |
+| `五.1` | 供应链邻接矩阵 | **缺失，数据源不存在** | 需采购依赖或主业重合链接；全库无 `supply_chain` / `adjacency` / `laplacian` |
+| `五.2` | 图拉普拉斯滞后扩散 | **缺失，数据源不存在** | 依赖 `五.1` 的邻接矩阵，图数据不存在；`sector_metadata.py` 只有 `symbol→sector` 分组，构不出有意义的邻接 |
+| `六.1` | 宏观/流动性 Regime | **已覆盖（作为闸门）** | [`check_live_portfolio_health.py`](file:///home/stone/Work/github/quant/scripts/check_live_portfolio_health.py) `:1212-1299` `evaluate_market_breadth_and_thrust` 产出 `breadth_active`（收盘价高于 SMA50 的占比 ≥ 30%）与 `thrust_active`（ROC10 > 0 占比 ≥ 60%），经 `:1510-1590` 落七种 gate code 与四级断路。**但它是 Stage-1 闸门，不是参与打分的日频因子** |
+| `六.2` | Löwdin 对称正交化 | **已覆盖** | `blend_base.py` 的 `_apply_lowdin_orthogonalization`（行号漂移），`blend_enable_orthogonalization` 默认 `True` |
+| `六.3` | LightGBM + 遗传规划符号演化 | **刻意跳过：依赖需批准** | 全库无 `lightgbm` / `genetic` / `symbolic`；`pipeline/pyproject.toml` 仅 pandas、numpy、scipy、duckdb、pyarrow 等。`ml/bnn_forecaster` 是独立环境，不可借用 |
+| `七.1` | 非线性冲击（权重变化的 1.5 次幂） | **部分覆盖** | 现役成本是**线性**（佣金 5bp + 滑点 5bp，[`allocation_backtester.py`](file:///home/stone/Work/github/quant/common/allocation_backtester.py) `:353-354`）；可选 `market_impact` 是 Almgren-Chriss **平方根**（按股数/ADV20，默认关，`:1315`）；`opt_turnover_penalty` 是 **L1** 且默认 `0.0`（`allocation_templates.py:1347`）。按权重幂律的冲击项确实没有，但三者**都不是**它的等价物 |
+| `七.2` | 交易死区 Buffer | **已覆盖** | [`selection_band.py`](file:///home/stone/Work/github/quant/common/selection_band.py) `RankBandSelection(buy_band_pct=0.10, sell_band_pct=0.30, delta_score_sigma=0.35)`（`:110`），配对交换须超过 `delta_score_sigma × σ`；微小调仓过滤另有 `inertia_threshold=0.05`（[`position_policy.py`](file:///home/stone/Work/github/quant/common/position_policy.py) `:435`）与实盘 `resolve_trade_inertia_threshold`（[`run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py) `:353-370`） |
+| `七.3` | 半衰期与拥挤度监控 | **半衰期已覆盖，拥挤度无数据源** | 半衰期 [`factor_analyzer.py`](file:///home/stone/Work/github/quant/common/factor_analyzer.py) `:115`、Rank IC `:60`、分层 `:239`；Jaccard 拥挤度需公募重仓与融资融券标的池，均无 feed |
+
+#### 4.44.2 三方结论冲突的裁定
+
+本轮由「读代码盘点」与「方案分析」两路独立进行，有三处彼此矛盾。**冲突一律按更保守的一方记录**，并写明裁定依据：
+
+1. **`二.1` VPIN**：一路判「数据源不存在」，另一路把「5m BVC 分桶近似」列为候选。裁定：**两者都对，但描述的是不同对象** —— 严格 VPIN 需逐笔买卖方向，不可建；近似口径只需 5m 的 `w_plus` 与累积成交量分桶，可建。台账按「严格不可建、近似可建（REUSE/EXTEND）」记，**不得**把近似值称为 VPIN 真值。
+2. **`二.3` OFI**：一路判「已覆盖」。裁定：**改判为「代理已覆盖、真值不可建」**。`cont_ks_ofi_proxy` 用 K 线内位置乘成交量，与文档定义的买卖一档队列变化无对应关系；把代理当已覆盖会永久掩盖这个缺口。
+3. **`六.1` Regime**：一路判「已覆盖但惰性」，且自认这是最未经证实的一行。裁定：**已覆盖**，依据是另一路给出的实测函数与 gate code（`:1212-1299`、`:1510-1590`）。但必须写明其形态是 **Stage-1 闸门**，不是进入 `overall_selection_score` 的日频因子 —— 这与 `§4.41` 记录的「构件存在但未接线」是同一类问题，不重复立项。
+
+#### 4.44.3 「名字像但对象不同」清单（防重复建设）
+
+以下七组已实测确认**不可互相顶替**，后续任何人想「用现成的凑一下」都必须先反驳此表：
+
+1. `cont_ks_ofi_proxy`（K 线位置代理）**不是**订单簿 OFI；
+2. `metrics.py` 的偏度/峰度（DSR 输入）**不是**横截面偏态信号，也**不是** 5m 日内收益四阶矩；
+3. `RV_5m` / `RS_Up_5m` / `RS_Down_5m`（日内已实现方差分解）**不是**日频下行半方差；
+4. `UpVol_Ratio_5m`（日频单一比例）**不是** VPIN（等量桶上的不平衡序列）；
+5. `opt_turnover_penalty` 的 L1 **不是**权重变化的 1.5 次幂；
+6. `market_impact` 的 Almgren-Chriss 平方根（按股数/ADV）**不是**按权重变化的幂律冲击；
+7. `cyq_chip_distribution` 的 `decay_mode="turnover"` 在缺换手率时回退 `clip(0.02·V/SMA60(V), 0.002, 0.50)`（`structural_factors.py:657-665`），**不是**真实换手率 —— 仓库无自由流通股本数据。
+
+#### 4.44.4 候选（未立项，开工需用户裁定）
+
+| 候选 | 目标位置 | 版本轴 | 重复性核查 | 前置裁定 |
+| :-- | :-- | :-- | :-- | :-- |
+| **`B1`** `intraday_shape_factor(df_5m, open_end="10:00", late_start="14:30")`，公式为（尾盘 VWAP − 开盘 VWAP）÷（当日最高 − 最低） | `common/intraday_features.py` 新增纯函数 | **ZERO-AXIS** | 无匹配：现仅有全天真 VWAP（`:263`）与 `Afternoon_Ret_5m`（价，非时段 VWAP 差）；时段切分惯例可 `REUSE` `:190` | 须接入 `enrich_universe_with_intraday_features`（`:696`）并进 `DAILY_FACTOR_RAW_COLUMNS`，否则永不进筛选；**实盘 14:15 截断时尾盘段不存在，取值恒 `NaN`** |
+| **`B2`** 突破弹性 = `wyckoff_effort_result` × 5m 收益峰度 | `common/structural_factors.py` **REUSE/EXTEND** `:426`，不新建函数 | **ZERO-AXIS** | 部分重复：弹性比值已在 `wyckoff_effort_result`；缺的只是峰度乘子与换手激增门限 | 须裁定是否进 `enrich_universe_with_structural_features`（`:811`）；并接受 5m 峰度仅历史可用 |
+| **`B3`** `volume_bucket_vpin_5m(df_5m, n_buckets=50)` | `common/intraday_features.py` 新增纯函数，**REUSE** `w_plus`（`:306`） | **ZERO-AXIS** | 部分重复：BVC 买卖拆分已有，缺的是**按累积成交量分桶**后的不平衡序列 | 须裁定该近似值是否与 `UpVol_Ratio_5m` 并存；**实盘恒 `NaN`**；命名不得含 `vpin` 之外的真值暗示 |
+| **`V1`** `opt_turnover_penalty` 增加幂次 `p=1.5` | `common/allocation_templates.py` `MinimumVarianceAllocation` | **VERSIONED**（须 bump 该类 `version`，并追加 `docs/version.md`） | 部分重复：L1 惩罚已存在，改幂次是参数化而非新构件 | **不推荐**：1.5 次幂非凸，需 CCP 迭代而非单一 QP；且会牵动全部已存回测的位级一致性。仅登记 |
+
+**三条 `ZERO-AXIS` 候选的共同风险（必须写进实施 brief）**：三者都要求「按累积成交量或按时段切片」，若误用**时间桶**（`resample`）代替成交量桶，数值形态完全正常而含义已错——这是本类因子最典型的「看起来对」的失败。守卫必须是显式的 `cumsum` 分桶，并有「全买/全卖 → 0、交替买卖 → 非 0」的用例反向钉死。
+
+#### 4.44.5 数据源缺口（不是代码问题，不得用代理冒充）
+
+| 缺失 feed | 被卡住的提议 |
+| :-- | :-- |
+| Level-2 盘口 / 逐笔成交方向 | `二.3` OFI 真值；`二.1` 严格 VPIN |
+| 分析师预期 / SUE | `四.2` PEAD |
+| 融资融券余额 | `四.2` 拥挤度惩罚 |
+| 公募基金重仓 / 融资标的池 | `七.3` Jaccard 拥挤度 |
+| 供应链采购与主业重合链接 | `五.1`、`五.2` 全节 |
+| 自由流通股本 | 真实换手率（现为回退代理） |
+| LightGBM / 遗传规划依赖 | `六.3`（需用户批准） |
+
+#### 4.44.6 未验证
+
+- `cyq_chip_distribution` 是否被任一**生产路径**消费（还是仅测试与被策略类间接调用）未确认，需读 `enrich_universe_with_structural_features` 的调用链。
+- `四.1` 的「换手激增门限」是否已有独立实现未逐条读 `common/daily_factors.py`。
+- 公募重仓数据管道是否存在未查（只确认无融资数据）。
+- `blend_base.py` regime 机制只按**标志名**记录（`regime_ic_ir_hybrid`、`enable_structural_regime`、`blend_enable_regime_hysteresis`），未给行号 —— 该文件行号随并发编辑漂移。
+- `ml/bnn_forecaster` 的实际依赖以 `pyproject.toml` 为准，未验证其是否能承担树模型任务。
+
+本节为**审计记录，不是任务清单**；开工须由用户另行裁定，并在 `§2.x` 新增任务行。
