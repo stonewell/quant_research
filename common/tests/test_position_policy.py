@@ -18,9 +18,14 @@ Two rules this file refuses to bend:
     and demands identical index, identical columns, identical NaN positions and
     identical values (including identical real `0.0` cells).
 
-The M4.1 kernel is DEAD CODE: `test_kernel_has_no_callers_in_templates_or_blend_base`
-statically guards that `common/allocation_templates.py` and
-`pipeline/research/blend/blend_base.py` do not import it.
+The M4.1 kernel shipped as DEAD CODE. M4.2 phase 1 flips exactly ONE call site:
+`pipeline/research/blend/blend_base.py`'s inertia step now delegates to
+`PortfolioSequencer.sequence` behind the default-OFF `blend_use_policy_kernel`
+flag. `test_kernel_callers_are_guarded_by_opt_in_flag` statically pins the
+remaining invariants: `common/allocation_templates.py` is still kernel-free
+(phase 2 owns that flip), and the blend call site keeps BOTH the opt-in flag and
+the legacy `_step_asset_inertia` call, so neither the default-off guarantee nor
+the default code path can be deleted unnoticed.
 
 Disclosed finding recorded here rather than hidden (see
 `test_reapplying_kernel_to_its_own_output`): re-applying the inertia filter to
@@ -858,25 +863,57 @@ def test_reapplying_kernel_to_its_own_output(seed):
 
 
 # ---------------------------------------------------------------------------
-# D. "No callers" guard -- this phase must stay dead code
+# D. Caller guard -- exactly one opt-in call site
 # ---------------------------------------------------------------------------
 
 
-def test_kernel_has_no_callers_in_templates_or_blend_base():
-    """M4.1 ships the kernel as DEAD CODE: neither hot module may import it."""
+def test_kernel_callers_are_guarded_by_opt_in_flag():
+    """M4.2 phase 1: the ONLY kernel caller is blend_base, and only behind a flag.
+
+    History: M4.1 shipped the kernel as dead code and this guard asserted that
+    BOTH `common/allocation_templates.py` and `pipeline/research/blend/blend_base.py`
+    were import-free. Phase 1 of M4.2 deliberately flips the blend inertia step
+    (`blend_use_policy_kernel`, default `False`), so the guard is narrowed rather
+    than dropped:
+
+      * `common/allocation_templates.py` -- still MUST NOT import the kernel
+        (phase 2 owns that flip and must update this guard in its own commit);
+      * `pipeline/research/blend/blend_base.py` -- MAY import it, but the file
+        must keep (a) the opt-in flag with a `False` fallback and (b) the legacy
+        `_step_asset_inertia(` call. Losing either one would mean the default
+        path stopped being the pre-M4.2 code.
+    """
     import re
 
     import_line = re.compile(r"^\s*(?:from\s+\S+\s+import\b|import\b)")
+
+    # (a) the templates module stays kernel-free
+    templates_path = os.path.join(_PROJECT_ROOT, "common/allocation_templates.py")
+    assert os.path.isfile(templates_path), "expected guard target to exist"
     offenders = []
-    for relative in ("common/allocation_templates.py", "pipeline/research/blend/blend_base.py"):
-        path = os.path.join(_PROJECT_ROOT, relative)
-        assert os.path.isfile(path), f"expected guard target to exist: {relative}"
-        with open(path, encoding="utf-8") as handle:
-            for number, line in enumerate(handle, start=1):
-                if "position_policy" not in line:
-                    continue
-                if import_line.match(line):
-                    offenders.append(f"{relative}:{number}: {line.strip()}")
+    with open(templates_path, encoding="utf-8") as handle:
+        for number, line in enumerate(handle, start=1):
+            if "position_policy" not in line:
+                continue
+            if import_line.match(line):
+                offenders.append(f"common/allocation_templates.py:{number}: {line.strip()}")
     assert not offenders, (
-        "M4.1 requires zero callers; these modules import the kernel: " + "; ".join(offenders)
+        "common/allocation_templates.py must stay kernel-free until phase 2: " + "; ".join(offenders)
+    )
+
+    # (b) the blend call site keeps both the opt-in flag and the legacy path
+    blend_path = os.path.join(_PROJECT_ROOT, "pipeline/research/blend/blend_base.py")
+    assert os.path.isfile(blend_path), "expected guard target to exist"
+    with open(blend_path, encoding="utf-8") as handle:
+        blend_src = handle.read()
+    assert "position_policy" in blend_src, "blend_base no longer imports the kernel"
+    assert 'p.get("blend_use_policy_kernel")' in blend_src, (
+        "blend_base lost the params lookup for the opt-in flag"
+    )
+    assert 'getattr(cfg, "blend_use_policy_kernel", False)' in blend_src, (
+        "the opt-in flag must fall back to False (default OFF) via its PREFIXED key"
+    )
+    assert "_step_asset_inertia(" in blend_src, (
+        "blend_base lost the legacy `_step_asset_inertia` call -- the default-off "
+        "path would no longer be the pre-M4.2 code"
     )

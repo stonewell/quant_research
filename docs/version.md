@@ -4246,3 +4246,46 @@ LIVETRADING_STRICT_SEED_BOOK=0        # 0 / false / no / off 同样生效
   - `pipeline/.venv/bin/python -m pytest common/tests -q --import-mode=importlib` -> **1289 passed, 1 skipped**（基线 1277 passed, 1 skipped；增量恰为新增 12 条）。
   - `pipeline/.venv/bin/python -m pytest pipeline/strategy_generator/tests -q --import-mode=importlib` -> **74 passed**（与基线一致）。
   - `pipeline/.venv/bin/python -m pytest common/tests/test_live_dump_preflight.py -q --import-mode=importlib` -> **47 passed**（与基线一致；注意该文件位于 `common/tests/`，不在 `pipeline/tests/`）。
+
+## 29. M4.2 阶段一：blend 惰性步进委托给仓位策略内核（`blend_use_policy_kernel`，默认关闭，2026-11-05）
+
+### 29.1 版本轴
+| 对象 | 旧版本 | 新版本 | 说明 |
+| --- | --- | --- | --- |
+| `BaseBlendAllocationStrategy.BASE_VERSION` | `1.7.0` | **`1.8.0`** | 向后兼容新增：默认关闭的内核委托开关，既有回测输出逐位不变 |
+| `common/allocation_templates.py` 文件级 `BASE_VERSION` | 不存在 | 不存在 | 该文件**从未**有文件级 `BASE_VERSION`，本阶段亦未改动该文件（阶段二所有权） |
+| 各 blend 子类 `version` | 不变 | 不变 | 未改动任何子策略类的信号/风险逻辑与参数默认值，故只升底座 `BASE_VERSION` |
+
+### 29.2 变更语义（`pipeline/research/blend/blend_base.py`）
+- **新增开关 `blend_use_policy_kernel`，默认 `False`**。用途：把 `generate_weights` 每日循环里的单 bar 惰性步进从 `common/allocation_templates.py::_step_asset_inertia` 改为委托 `common/position_policy.py::PortfolioSequencer.sequence`（其内部逐标的调用 `AssetPolicy.inertia_step`）。阶段二将以**同一开关**处理 `apply_asset_inertia` 的调用点，因此**沿用本阶段同一个未发布的 `1.8.0`，不再二次升版**。
+- **解析顺序：`params` 优先，其次 `StrategyConfig` 属性**；两处**都只用带前缀的键 `blend_use_policy_kernel`**，并且**有意不走** `resolve_param`——该函数的最后一级回退是裸名 `getattr(cfg, name)`，2026-10-21 的 `wq_alpha_id` 事故正是裸名泄漏了全局 `StrategyConfig` 字段并静默替换了子策略类。`StrategyConfig` 当前**没有**该字段（本阶段文件所有权不含 `rs/config.py`），故配置侧目前由 `getattr(cfg, "blend_use_policy_kernel", False)` 兜底为 `False`；后续接入只需在 `StrategyConfig` 增加同名带前缀字段即可，无需改动本文件。
+- **关闭时逐字节同旧**：守卫紧贴在惰性步进之前，`else` 分支（原 `_step_asset_inertia` 调用）一行未动、未重排、未抽公共 helper；开关关闭时内核对象根本不构造。
+- **开启时**：`sequence(ideal_w=raw_w, current_w=desired_weights.iloc[t-1], ctx=PolicyContext(bar_index=t), ...)` 逐 bar 调用（该接口是**逐 bar** 而非面板级：入参为当 bar 的理想/当前权重行，返回当 bar 的提交权重行）。`holding_age` / `last_buy_bar` 仍由调用方持有并原地更新，与参考实现一致。
+- `PositionPolicyConfig` 只设 `_step_asset_inertia` 实际读取的四个字段（`min_holding_bars` / `asymmetric_sells` / `asymmetric_sell_ratio` / `entry_threshold`），其中 `asymmetric_sell_ratio` 硬编码为 **`0.60`**（原调用点从未传该参数，其默认值即 0.60）——把它做成可配属于另一个行为变更，不得借等价开关夹带。
+- **单元格级契约**：`sequence` 返回的是**稠密**的提交行，被策略排除/清仓的标的写**显式 `0.0`**（不是 `NaN`）；稀疏化仍由方法末尾既有的 `_sparse_from_daily` 完成，方法内部**绝不** `ffill()` 自己的输出。**请求 vs 提交**：内核内部逐标的的 `Decision` 只是**请求**（`BUY` 的 `target_weight` 尚未被释放现金封顶），唯一权威是 `sequence` 返回的 `Series`；本次接线只把该 `Series` 写入 `desired_weights`，从不把 `Decision` 或其 `target_weight` 当提交值使用。
+- **在役 blend 零行为改变**：默认关闭，`strategies_config.json` 未写入该键、未改动，本阶段**未执行** `--dump-strategies`；六个 blend 策略（含文档化例外 `chan_four_state_blend` 仍为 `regime_ic_ir_hybrid`）的 `generate_weights` 输出与改动前逐位相同（见 29.3 用例 1）。
+
+### 29.3 离线测试与验证（100% 离线、0 网络依赖）
+新增 `pipeline/research_strategy/tests/test_blend_policy_kernel.py`（8 条，全部合成数据）：
+1. `test_disabled_path_is_bit_identical_to_pre_change_module`：自**钉定 git blob**（`c51dd2a:pipeline/research/blend/blend_base.py`，即改动前最后一个提交）动态载入父模块，构造仅 `generate_weights` 来自父模块的 `GenericBlendStrategy` 等价子类；开关缺省、显式 `False` 两路与父实现比较 `max_abs_diff == 0.0`、`NaN` 掩码逐格相同、列序相同。**为何钉 blob 而非 `HEAD:`**：本提交落地后 `HEAD:` 即新文件，比较会退化为"自己比自己"而永远通过；同时断言载入的父源码**不含** `blend_use_policy_kernel`，否则跳过而非假通过。
+2. `test_enabled_kernel_matches_legacy_committed_weights_exactly`：开关 `True` 与旧路径**容差 `0.0`** 完全一致（两条路径是同一套浮点算术，故精确一致可达，未放宽容差掩盖结构性差异）。
+   - `test_enabled_kernel_matches_legacy_with_asymmetric_sells_and_tenure_lock`（新增）：同一等价性在 `asymmetric_sells=True` + `min_holding_bars=5`（卖出带宽取 60%、母仓/加仓期限锁这两条分支，默认夹具不会进入）下重证 `max_abs_diff == 0.0`，并断言这两个参数确实改变了输出帧——否则该比较为空转。
+3. `test_kernel_path_preserves_sparse_nan_and_explicit_zero_contract`：非调仓行整行 `NaN` 且存在；`frame.ffill() != frame`（模板未自填充）；调仓行风险列无 `NaN`；逐个"上期为持仓、当期为 0"的退出事件断言该格为**显式 `0.0`**（夹具内 28 个退出事件，非空转）。
+4. `test_flag_resolution_order_and_prefixed_key_only`：`params` 优先于 `StrategyConfig` 属性；裸名 `use_policy_kernel`（params 侧与配置属性侧各一次）**必须被忽略**——即 2026-10-21 型穿透的回归钉。
+5. `test_chan_four_state_blend_still_pinned_to_regime_ic_ir_hybrid`：只读 `strategies_config.json`，断言该键仍为 `regime_ic_ir_hybrid`，且本阶段未把新开关写入部署配置。
+6. `test_base_version_bumped_for_the_opt_in_flag`：`BASE_VERSION == "1.8.0"` 且实例 `version_string` 携带 `base: v1.8.0`。
+7. `test_sequencer_returns_committed_row_with_explicit_zero_on_exit`：内核契约钉——提交行稠密、退出为显式 `0.0`、权重和为 1。
+
+**非空转（变异）验证**（逐条临时改坏实现、复跑确认变红后复原，复原后 8 passed）：
+- 旧路径尾部乘 `0.999`（模拟"关闭态被改动"）-> 用例 1 变红：`NaN footprint changed (…) -- a NaN and an explicit 0.0 are NOT interchangeable under the sparse contract`。
+- 内核分支尾部乘 `1.001`（模拟"开启态与旧路径不等价"）-> 用例 2 变红：`kernel path vs legacy path: NaN footprint changed (0 vs 668 NaN cells)`。
+- 最终投影把 `0.0` 一律改写成 `NaN`（模拟"退出写成 NaN"）-> 用例 3 变红：`rebalance rows contain NaN for a risky symbol -- the backtester would carry the previous weight instead: {'601225.SH': 13, '601857.SH': 20, '601872.SH': 21}`。
+
+**回归结果**（实测）：
+- `pipeline/.venv/bin/python -m pytest pipeline/research_strategy/tests/test_blend_policy_kernel.py -q --import-mode=importlib` -> **8 passed**
+- `pipeline/.venv/bin/python -m pytest pipeline/research_strategy/tests/test_blend_strategy_versioning.py common/tests/test_strategy_versioning.py -q --import-mode=importlib` -> **10 passed**（两文件的 `BASE_VERSION` 期望值同步升至 `1.8.0`）
+- `pipeline/.venv/bin/python -m pytest pipeline/research_strategy/tests -q --import-mode=importlib` -> **630 passed, 1 xfailed**（基线 622 passed + 1 xfailed；增量恰为新增 8 条）
+- `pipeline/.venv/bin/python -m pytest common/tests -q --import-mode=importlib` -> **1341 passed, 1 skipped**（与基线逐项相等）
+
+### 29.4 必要的守卫测试同步（所有权外文件，已披露）
+M4.1 的静态守卫 `common/tests/test_position_policy.py::test_kernel_has_no_callers_in_templates_or_blend_base` 断言 `common/allocation_templates.py` **与** `pipeline/research/blend/blend_base.py` 都不得 import 内核。本阶段按设计翻转了后者的调用点，该断言必然变红，故改名为 `test_kernel_callers_are_guarded_by_opt_in_flag` 并收窄为：(a) `allocation_templates.py` 仍不得 import 内核（阶段二翻转时须再次更新本守卫）；(b) `blend_base.py` 允许 import，但必须同时保留 `p.get("blend_use_policy_kernel")`、`getattr(cfg, "blend_use_policy_kernel", False)` 与旧 `_step_asset_inertia(` 调用，防止有人删掉关闭态路径或默认值。测试计数不变（`common/tests` 仍为 1341 passed, 1 skipped）。
