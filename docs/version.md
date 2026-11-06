@@ -4174,7 +4174,7 @@ LIVETRADING_STRICT_SEED_BOOK=0        # 0 / false / no / off 同样生效
 5. **`w0` 重建（无状态模板）**：`generate_weights` 无内部状态，故在调仓循环内用「本次运行上一调仓日的已解目标」重建 `w0`：仍有效标的取上一期解、新生效标的取 `0.0`（自现金建仓 = 全额换手）、首次调仓为全零向量；已持有但当期无效的标的在该行**显式写 `0.0`**（其退出在目标函数中是常数项，不进入求解向量，因无效标的无协方差定义）。
 6. **自现金起点（特例已删除）**：初版因 `w0 ≡ 0` 时平滑 L1 退化为 `γ·Σw` 的「按比例入场成本」、在 `Σw ≤ 1` 下全现金解占优，而把首次调仓硬编码为普通最小方差解。修正后该特例**已删除**，理由是可证的：`w0 ≡ 0` 且 `Σw == 1` 时 `‖w − w0‖₁ = Σw = 1` 在整个可行集上为常数，惩罚项无法改变 argmin，首次调仓自动等于最小方差解（见 27.1 与 `test_first_rebalance_equals_min_variance_under_penalty`）。同理，自现金起点且总预算闭合时，逐行业预算 `|Σ_g w − 0| ≤ dev` 会把总投资上限压到 `n_groups · dev`，与预算下界直接矛盾，故该次求解不施加行业约束（该次无历史行业暴露可「偏离」，约束本身为空转）。
 7. **稀疏权重契约**：非调仓日保持 `NaN`，模板内部绝不 `ffill()`；调仓行先用 `weights_rebal.loc[date, :] = 0.0` 再覆盖有效标的，被排除标的为**显式 `0.0`**（避免回测器列向 ffill 保留陈旧持仓）。
-8. **Prune**：`|w_i − w0_i| < opt_prune` 的权重精确回写为 `w0_i`，随后重新裁剪至 `[0, effective_cap]`；裁剪后若总暴露偏离预算箱（或高于 1、或低于下界），只按**未剪枝标的**的 cap 余量/可用额度回调，保证被剪枝标的与上期**精确相等**（否则预算回填会静默抹掉剪枝效果）。
+8. **Prune**：`|w_i − w0_i| < opt_prune` 的权重精确回写为 `w0_i`，随后按**唯一硬上限** `opt_single_cap` 逐字裁剪至 `[0, opt_single_cap]`——**不存在** `effective_cap`，上限永不放松（原同日初版的 `effective_cap` 已彻底删除，见 27.1「上限可行性」）；裁剪后再按预算箱 `1 − opt_cash_allowance ≤ Σw ≤ 1` 回调暴露，`n · opt_single_cap < 1` 时该箱退化为等式 `Σw == n · opt_single_cap`，差额以现金持有。回调**只作用于未剪枝标的**的 cap 余量/可用额度，保证被剪枝标的与上期**精确相等**（否则预算回填会静默抹掉剪枝效果）。
 
 ### 27.3 版本轴演进说明
 - **`MinimumVarianceAllocation`**：`version = "1.0.0" -> "1.1.0"`（向后兼容的可选参数扩展，默认关闭，输出不变）。**2026-11-05 同日修订不升版本号**：1.1.0 尚未提交发布（unpushed/unreleased），本次预算约束修正属于同一未发布版本的同日修订，故保持 `1.1.0`（不升 1.2.0）。
@@ -4182,30 +4182,33 @@ LIVETRADING_STRICT_SEED_BOOK=0        # 0 / false / no / off 同样生效
 - **配置 Dump 说明**：`strategy_dumps/` 只序列化 `StrategyConfig` 驱动的 research/blend 策略（字段 `strategy_version` / `base_version` / `version_info`），**不序列化 9 个静态配置模板**。已执行 `research_strategy/run_research_strategy.py --dump-strategies`：`results/strategy_dumps/` 无任何文件变动（`git status` 干净），且无任何 dump 文件包含 `minimum_variance` / `MinimumVarianceAllocation`。因此静态模板版本号**不会**出现在 dump 中（对账时勿以 dump 为空判断版本未升级）。
 
 ### 27.4 离线测试验证（100% 离线、0 网络依赖）
-- `common/tests/test_turnover_penalized_qp.py`（**17 条，全绿**；同日修订新增 3 条、改写 2 条）：
+- `common/tests/test_turnover_penalized_qp.py`（**18 条，全绿**；同日三轮修订累计新增 4 条、改写 3 条——`test_first_rebalance_equals_min_variance_under_penalty` 替换旧的首次调仓特例用例、`test_cap_infeasibility_*` 改名并按「cap 硬上限、现金吸收差额」重写期望、`test_single_symbol_universe_unchanged` 的单标的期望随硬 cap 变更）：
   1. `test_turnover_penalty_shifts_weights_toward_prior_target`：手算 2x2 程序，gamma=0 解为 (0.8261, 0.1739)、`w0=(1,0)`、gamma=0.02 -> `w_A` 向 `w0` 移动且不等于 1。
   2. `test_single_cap_invariant_on_every_rebalance_row`：cap=0.30（n=4 可行且真实绑定）-> 每行 `max(w) <= 0.30 + 1e-6` 且 `sum(w) == 1 +- 1e-6`。
   3. `test_long_only_and_cash_budget`：`w >= 0`、`1 - 1e-6 <= sum(w) <= 1 + 1e-6`（预算箱两侧都断言）。
   4. `test_no_exposure_decay_across_rebalances`（**回归钉，新增**）：固定 4 标的合成池、gamma=1e-8、`opt_cash_allowance=0` 连续 5 次调仓，`sum(w) == 1.0 +- 1e-6` 每一期；并断言构成仍在变动（非冻结解）。对 commit `392ab95` 的实现实测**变红**：后 4 期总暴露 `0.8789 / 0.8489 / 0.8189 / 0.7889`（配合首期 1.0 即 `1.00 -> 0.97 -> 0.94 -> 0.91 -> 0.88`），`Max absolute difference 0.2111`。
   5. `test_cash_allowance_is_respected`（新增）：`opt_cash_allowance=0.05` -> 每行 `0.95 - 1e-6 <= sum(w) <= 1 + 1e-6`，且 `sum(w) < 1 - 1e-3`（现金窗口确实被使用而不越界）；对照 `allowance=0` 的行恒为 1.0。
-  6. `test_cap_infeasibility_degrades_without_raising`（新增）：n=4、`single_cap=0.20` -> 不抛异常、`sum(w) == 1 +- 1e-6`、`max(w) <= max(0.20, 0.25) + 1e-6`、`RuntimeWarning` 触发且 `explain_weights` 含「documented degrade」与「25.00%」。
-  7. `test_first_rebalance_equals_min_variance_under_penalty`（**改写，替换原首次调仓特例用例**）：`w0` 恒为 0、gamma in {1e-6, 1e-3} -> 与 `_min_variance_weights` 在 `1e-6` 内一致（常数 L1 论证）；端到端再断言首调仓 == 同窗口 `_turnover_penalized_weights` 解（旧特例会走 `_min_variance_weights` 的 ftol 早停等权解，故可判红）。
-  8. `test_sector_deviation_budget_is_enforced`：带行业映射时逐行业 `|delta 暴露| <= 0.03 + 1e-6`；同时断言无映射（单桶）时同一指标 > 0.03，证明约束真实生效而非空转（预算闭合后总暴露恒定，该「非空转」判据变为行业内构成迁移，仍成立）。
-  9. `test_sector_groups_are_built_from_resolve_sector`：行业分组与显式映射覆盖。
-  10. `test_nan_vs_explicit_zero_on_rebalance_rows`：晚上市标的在早期调仓行为显式 `0.0`（非 NaN）、该行其余单元格稠密；非调仓日全为 `NaN`（无 ffill）。
-  11. `test_prune_snaps_sub_threshold_trades_to_prior_weight`：`prune=0` 时存在 `0 < |delta w| < 0.02` 的位移，`prune=0.02` 后该权重与上期**精确相等**（预算回填只作用于未剪枝标的），且整行并非上期的复制。
-  12. `test_solver_failure_degrades_without_raising`：monkeypatch `scipy.optimize.minimize` 返回 `success=False` -> 不抛异常，回退至 `min(1/n, cap)` 有效向量。
-  13. `test_disabled_penalty_helper_reduces_to_legacy_min_variance` / `test_disabled_penalty_generate_weights_is_bit_identical` / `test_opt_params_are_not_in_the_search_grid`：gamma=0 助手约等于 `_min_variance_weights`（`rtol=1e-9`，修正后由构造保证）；`generate_weights` 默认/显式 0.0 与预 M1.3 硬编码快照逐位相等；其余新参数在关闭态完全惰性；6 个新参数（含 `opt_cash_allowance`）不在 `param_grid` 且默认 `opt_cash_allowance == 0.0`。
-  14. `test_single_symbol_universe_unchanged` / `test_all_nan_window_returns_empty_frames_without_raising`：单标的与全 NaN 窗口均无新异常（前者默认路径仍为 1.0；惩罚路径因 `cap=0.6` 对 n=1 不可行而退化到 1.0 满仓 + 警告）。
+  6. `test_cap_infeasibility_holds_cap_and_parks_residual_in_cash`（**改写并改名**，原名 `test_cap_infeasibility_degrades_without_raising`）：n=4、`single_cap=0.20`（`n · cap = 0.8 < 1`）-> 不抛异常，`sum(w) == 0.80 +- 1e-6`（差额 `0.2` 为**现金**），`max(w) <= 0.20 + 1e-9`（上限**从不被突破**，与「放松上限」相反），`RuntimeWarning` 匹配 `constrained by the position cap`，`explain_weights` 含「budget constrained by the position cap」与「never relaxed」，且**不含**旧的「documented degrade」/「relaxed to」。
+  7. `test_feasible_cap_still_fully_invested_and_no_budget_note`（**新增**）：n=10、cap=0.20（`n · cap = 2.0 >= 1`，cap 可满仓）-> 正常路径不受影响：`sum(w) == 1 +- 1e-6`、`max(w) <= 0.20 + 1e-9`，且 `explain_weights` **不含**「budget constrained by the position cap」。
+  8. `test_first_rebalance_equals_min_variance_under_penalty`（**改写，替换原首次调仓特例用例**）：`w0` 恒为 0、gamma in {1e-6, 1e-3} -> 与 `_min_variance_weights` 在 `1e-6` 内一致（常数 L1 论证）；端到端再断言首调仓 == 同窗口 `_turnover_penalized_weights` 解（旧特例会走 `_min_variance_weights` 的 ftol 早停等权解，故可判红）。
+  9. `test_sector_deviation_budget_is_enforced`：带行业映射时逐行业 `|delta 暴露| <= 0.03 + 1e-6`；同时断言无映射（单桶）时同一指标 > 0.03，证明约束真实生效而非空转（预算闭合后总暴露恒定，该「非空转」判据变为行业内构成迁移，仍成立）。
+  10. `test_sector_groups_are_built_from_resolve_sector`：行业分组与显式映射覆盖。
+  11. `test_nan_vs_explicit_zero_on_rebalance_rows`：晚上市标的在早期调仓行为显式 `0.0`（非 NaN）、该行其余单元格稠密；非调仓日全为 `NaN`（无 ffill）。
+  12. `test_prune_snaps_sub_threshold_trades_to_prior_weight`：`prune=0` 时存在 `0 < |delta w| < 0.02` 的位移，`prune=0.02` 后该权重与上期**精确相等**（预算回填只作用于未剪枝标的），且整行并非上期的复制。
+  13. `test_solver_failure_degrades_without_raising`：monkeypatch `scipy.optimize.minimize` 返回 `success=False` -> 不抛异常，回退至 `min(1/n, cap)` 有效向量。
+  14. `test_disabled_penalty_helper_reduces_to_legacy_min_variance` / `test_disabled_penalty_generate_weights_is_bit_identical` / `test_opt_params_are_not_in_the_search_grid`：gamma=0 助手约等于 `_min_variance_weights`（`rtol=1e-9`，修正后由构造保证）；`generate_weights` 默认/显式 0.0 与预 M1.3 硬编码快照逐位相等；其余新参数在关闭态完全惰性；6 个新参数（含 `opt_cash_allowance`）不在 `param_grid` 且默认 `opt_cash_allowance == 0.0`。
+  15. `test_single_symbol_universe_unchanged` / `test_all_nan_window_returns_empty_frames_without_raising`：单标的与全 NaN 窗口均无新异常。默认路径仍为 `1.0`；**惩罚路径 `cap=0.6` 对 n=1 不可行（`1 · 0.6 < 1`）时预算让位、上限不动**——`w == [0.6]`、`sum(w) == 0.6`，其余 `0.4` 为现金，绝不退化成 `1.0` 满仓。
 - **非空转（变异）验证**：逐条临时改写实现并复跑，确认变红后复原：
-  - 移除 gamma=0 早退（改走通用求解）-> 用例 13 变红。
-  - 移除 `opt_turnover_penalty` 首行守卫（默认也走新路径）-> 用例 13、14 变红。
-  - 忽略惩罚（助手恒返回 `_min_variance_weights`）-> 用例 1、2、8、11 变红。
-  - 调仓行不写显式 `0.0`（保留 NaN）-> 用例 10 变红。
-  - 求解失败时改为抛 `RuntimeError`（去掉退化策略）-> 用例 12 变红。
-  - **预算约束回退为 `sum(w) <= 1` 并恢复首次调仓特例（即 `392ab95` 原实现）-> 8 条变红**，含用例 3、4、5、6、7（总暴露收缩、无现金额度、cap 退化、首调仓等价性）。
+  - 移除 gamma=0 早退（改走通用求解）-> 用例 14 变红。
+  - 移除 `opt_turnover_penalty` 首行守卫（默认也走新路径）-> 用例 14、15 变红。
+  - 忽略惩罚（助手恒返回 `_min_variance_weights`）-> 用例 1、2、9、12 变红。
+  - 调仓行不写显式 `0.0`（保留 NaN）-> 用例 11 变红。
+  - 求解失败时改为抛 `RuntimeError`（去掉退化策略）-> 用例 13 变红。
+  - **预算约束回退为 `sum(w) <= 1` 并恢复首次调仓特例（即 `392ab95` 原实现）-> 8 条变红**，含用例 3、4、5、6、8（总暴露收缩、无现金额度、cap 不可行时不留现金残差、首调仓等价性）。
 - **回归结果**（同日修订后实测）：
-  - `pipeline/.venv/bin/python -m pytest common/tests/test_turnover_penalized_qp.py -q --import-mode=importlib` -> **17 passed**（修订前 14 passed）
+  - `pipeline/.venv/bin/python -m pytest common/tests/test_turnover_penalized_qp.py -q --import-mode=importlib` -> **18 passed**（修订前 14 passed）
   - `pipeline/.venv/bin/python -m pytest common/tests/test_allocation_templates.py common/tests/test_strategy_versioning.py -q --import-mode=importlib` -> 16 passed
-  - `pipeline/.venv/bin/python -m pytest common/tests -q --import-mode=importlib` -> **1276 passed, 1 skipped**（改动前基线 1273 passed, 1 skipped，增量恰为本次新增 3 条）
+  - `pipeline/.venv/bin/python -m pytest common/tests -q --import-mode=importlib` -> **1277 passed, 1 skipped**（改动前基线 1273 passed, 1 skipped，增量恰为本次新增 4 条）
+  - `pipeline/.venv/bin/python -m pytest pipeline/tests -q --import-mode=importlib` -> **610 passed, 1 skipped**
+  - `pipeline/.venv/bin/python -m pytest common/tests pipeline/tests -q --import-mode=importlib`（合并跑，`--import-mode=importlib` 规避同名测试文件 `import file mismatch`）-> **1887 passed, 2 skipped**，与两半之和（1277 + 610 通过、1 + 1 跳过）逐项相等，无跨目录串扰
   - `pipeline/.venv/bin/python -m pytest pipeline/strategy_generator/tests -q --import-mode=importlib` -> 74 passed
