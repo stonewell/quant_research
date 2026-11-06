@@ -310,7 +310,7 @@ flowchart TD
 | 任务编号 | 状态 | 任务名称 | 涉及核心文件与符号 | 核心交付内容与验收标准 (含 bit-identical 门禁与 NaN/0.0 契约) | 配套离线单测 | 规模 | 前置依赖 |
 | :--- | :---: | :--- | :--- | :--- | :--- | :---: | :--- |
 | **`M4.1`** | `[x]` | 抽取统一策略内核（纯新增、死代码、零调用方） | [`common/position_policy.py`](file:///home/stone/Work/github/quant/common/position_policy.py)（新）`AssetPolicy`/`PortfolioSequencer`/`SparseProjector`/`PositionPolicyConfig`/`Decision`<br>[`common/position_lifecycle.py`](file:///home/stone/Work/github/quant/common/position_lifecycle.py)（仅类型迁移） | 1. `AssetPolicy.step(state, raw_target_weight, ctx, cfg) -> Decision` 纯函数，无墙钟/IO/随机；<br>2. `PortfolioSequencer.sequence(decisions, cash, caps) -> weights` 承担 sells-first、买力=freed cash、残差→`cash_proxy`、权重上限；<br>3. `SparseProjector` 唯一写回规则：`HOLD/HOLD_FILTERED` 且 target 未变→缺行(NaN)，`action=="SELL"` 且 target==0.0→**显式 `0.0`**，`CANCEL_PENDING`/`COOLDOWN_BLOCKED`→缺行（**不得**写 0.0）；<br>4. policy chain 固定顺序：休市冻结→止损/emergency（豁免 tenure 与 inertia）→cooldown gate→建仓门槛→入场确认 streak→平仓确认 streak→inertia→tenure lock；<br>5. 三条不变式：long-only 且组合 `sum<=1`、`Decision` 无 NaN 且非 SELL 不得提升为平仓、同输入幂等且 `held_bars` 非降/`cooldown_remaining` 非增；<br>6. 本阶段**不接任何调用方**，`_step_asset_inertia` 逐行等价单测通过即止。<br>✅ **已落地闭环（2026-11-05）**：新增 `common/position_policy.py`（`AssetPolicy`/`PortfolioSequencer`/`SparseProjector`/`PositionPolicyConfig`/`Decision`/`AssetState`/`PolicyContext`）；`common/position_lifecycle.py` 仅做类型迁移 —— `PositionState`/`ExitType`/`BlockingReason`/`BLOCKING_REASON_LABELS`/`coerce_blocking_reason`/`blocking_reason_label`/`is_liquidation_event` 七个符号迁入内核并由旧模块单向 re-export（方向固定为 `position_lifecycle → position_policy`），16 处既有 import 全数无需改动、枚举对象同一性经实测保持；新增 `common/tests/test_position_policy.py`（275 条，含 240 个随机 seed 对 `apply_asset_inertia` 逐 cell 断言 NaN 掩码与实值）；零调用方（静态扫描确认 `allocation_templates.py` 与 `blend_base.py` 均未 import 内核）。详见 §4.31。 | [`common/tests/test_position_policy.py`](file:///home/stone/Work/github/quant/common/tests/test_position_policy.py)（新） | L | 无 |
-| **`M4.2`** | `[ ]` | 回测适配：blend 日循环与 `apply_asset_inertia` 委托内核（默认关） | [`pipeline/research/blend/blend_base.py`](file:///home/stone/Work/github/quant/pipeline/research/blend/blend_base.py)<br>`generate_weights`/`use_inertia`/`_apply_portfolio_deleverage`/`_sparse_from_daily`<br>[`common/allocation_templates.py`](file:///home/stone/Work/github/quant/common/allocation_templates.py)<br>`apply_asset_inertia`/`_step_asset_inertia` | 1. 新 flag `blend_use_policy_kernel=False`，默认走旧路径；<br>2. `blend_base.generate_weights` 日循环与 `_sparse_from_daily` 改调内核；`apply_asset_inertia` 保留签名、内部委托；<br>3. 差分 harness：`np.random.default_rng(seed)` 扫 0..N，断言全 seed 下 `generate_weights` 逐 cell 的 NaN 位置、0.0 位置与数值完全一致（**禁止**把 `NaN==0.0` 当相等）；<br>4. golden runs：`equal_weight` 静态模板、`chan_four_state_blend` 的 `no_inertia`/`baseline` 两档；<br>5. 默认翻转是**独立提交**，仅在前述证明合入后执行；<br>6. 版本义务：改 `blend_base.py` 必须 `BASE_VERSION 1.7.0→1.8.0`（现行基线已是 `1.7.0` —— [`common/tests/test_strategy_versioning.py:181`](file:///home/stone/Work/github/quant/common/tests/test_strategy_versioning.py)、[`pipeline/research_strategy/tests/test_blend_strategy_versioning.py:42`](file:///home/stone/Work/github/quant/pipeline/research_strategy/tests/test_blend_strategy_versioning.py) 均断言 `== "1.7.0"`；原文 `1.6.0→1.7.0` 为 2026-10-26 登记时点的陈旧口径）并同步 [`common/tests/test_strategy_versioning.py`](file:///home/stone/Work/github/quant/common/tests/test_strategy_versioning.py)、[`pipeline/research_strategy/tests/test_blend_strategy_versioning.py`](file:///home/stone/Work/github/quant/pipeline/research_strategy/tests/test_blend_strategy_versioning.py)、`--dump-strategies`、[`docs/version.md`](file:///home/stone/Work/github/quant/docs/version.md)；改 `allocation_templates.py` 只 bump 被改类的 per-class `version`（该文件无 file-level `BASE_VERSION`，不要发明）。 | [`pipeline/tests/test_policy_parity.py`](file:///home/stone/Work/github/quant/pipeline/tests/test_policy_parity.py)（新）+ [`common/tests/test_allocation_templates.py`](file:///home/stone/Work/github/quant/common/tests/test_allocation_templates.py)（扩展） | L | `M4.1` |
+| **`M4.2`** | `[ ]` | 回测适配：blend 日循环与 `apply_asset_inertia` 委托内核（默认关） | [`pipeline/research/blend/blend_base.py`](file:///home/stone/Work/github/quant/pipeline/research/blend/blend_base.py)<br>`generate_weights`/`use_inertia`/`_apply_portfolio_deleverage`/`_sparse_from_daily`<br>[`common/allocation_templates.py`](file:///home/stone/Work/github/quant/common/allocation_templates.py)<br>`apply_asset_inertia`/`_step_asset_inertia` | 1. 新 flag `blend_use_policy_kernel=False`，默认走旧路径；<br>2. `blend_base.generate_weights` 日循环与 `_sparse_from_daily` 改调内核；`apply_asset_inertia` 保留签名、内部委托；<br>3. 差分 harness：`np.random.default_rng(seed)` 扫 0..N，断言全 seed 下 `generate_weights` 逐 cell 的 NaN 位置、0.0 位置与数值完全一致（**禁止**把 `NaN==0.0` 当相等）；<br>4. golden runs：`equal_weight` 静态模板、`chan_four_state_blend` 的 `no_inertia`/`baseline` 两档；<br>5. 默认翻转是**独立提交**，仅在前述证明合入后执行；<br>6. 版本义务：改 `blend_base.py` 必须 `BASE_VERSION 1.7.0→1.8.0`（现行基线已是 `1.7.0` —— [`common/tests/test_strategy_versioning.py:181`](file:///home/stone/Work/github/quant/common/tests/test_strategy_versioning.py)、[`pipeline/research_strategy/tests/test_blend_strategy_versioning.py:42`](file:///home/stone/Work/github/quant/pipeline/research_strategy/tests/test_blend_strategy_versioning.py) 均断言 `== "1.7.0"`；原文 `1.6.0→1.7.0` 为 2026-10-26 登记时点的陈旧口径）并同步 [`common/tests/test_strategy_versioning.py`](file:///home/stone/Work/github/quant/common/tests/test_strategy_versioning.py)、[`pipeline/research_strategy/tests/test_blend_strategy_versioning.py`](file:///home/stone/Work/github/quant/pipeline/research_strategy/tests/test_blend_strategy_versioning.py)、`--dump-strategies`、[`docs/version.md`](file:///home/stone/Work/github/quant/docs/version.md)；改 `allocation_templates.py` 只 bump 被改类的 per-class `version`（该文件无 file-level `BASE_VERSION`，不要发明）。 | [`pipeline/tests/test_policy_parity.py`](file:///home/stone/Work/github/quant/pipeline/tests/test_policy_parity.py)（新）+ [`common/tests/test_allocation_templates.py`](file:///home/stone/Work/github/quant/common/tests/test_allocation_templates.py)（扩展） | L | `M4.1`<br>**（2026-11-05 进度注记）**：**阶段一已合并**（`ba83f17`），`blend_base.py` 日循环已按默认关的 `blend_use_policy_kernel` 委托 `PortfolioSequencer.sequence`；`BASE_VERSION` 已为 `1.8.0`。**行状态仍保持 `[ ]`**：`apply_asset_inertia` 的委托落在 `common/allocation_templates.py:648`（阶段二，未开始），且默认翻转、`--dump-strategies` 之外的收尾仍未做。详见 §4.46。 |
 | **`M4.3`** | `[ ]` | 实盘适配：`run_live_strategy` 接入内核，`position_lifecycle` 降级为 adapter | [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py)（`step_position_lifecycle` 调用点 `:2117-2130` 之前）<br>[`common/position_lifecycle.py`](file:///home/stone/Work/github/quant/common/position_lifecycle.py)<br>[`pipeline/parity_harness.py`](file:///home/stone/Work/github/quant/pipeline/parity_harness.py) | 1. 新 flag `live_use_policy_kernel=False`；<br>2. `step_position_lifecycle` 改为薄封装调用 `AssetPolicy`，枚举从 `position_policy.py` 转发，ticket builder 消费同一 `Decision`；<br>3. 冷启动规则：`entry_streak/exit_streak/expansion_streak=0` 且标 `cold_start=True`，状态只落 `{FLAT, HELD_ACTIVE, COOLDOWN}`，禁止伪造 `PENDING_*`/`HELD_GESTATION`；`entry_price` 缺失用 `price` 兜底并标 `entry_price_approx=True`；<br>4. archive replay：25 份 `live_trading_ticket.csv` 逐行 `(action, target_weight, blocking_reason)` 一致；<br>5. parity harness 逐 bar 断言 `\|Δw\|<1e-4`、`ΔShares==0`。 | [`pipeline/tests/test_policy_parity.py`](file:///home/stone/Work/github/quant/pipeline/tests/test_policy_parity.py)（扩展）+ [`common/tests/test_position_lifecycle.py`](file:///home/stone/Work/github/quant/common/tests/test_position_lifecycle.py)（沿用） | L | `M4.2` |
 | **`M4.4`** | `[ ]` | 删除旧实现与版本收口 | [`common/position_lifecycle.py`](file:///home/stone/Work/github/quant/common/position_lifecycle.py)（删 6 态 FSM 主体）<br>[`common/allocation_templates.py`](file:///home/stone/Work/github/quant/common/allocation_templates.py)（删 `_step_asset_inertia` 旧实现）<br>[`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py)（删 `resolve_trade_inertia_threshold` 等重复 resolver） | 1. 前三阶段全绿后删除重复实现，仅保留 legacy key → `PositionPolicyConfig` 映射 adapter；<br>2. 保留 `action=="SELL"` 作为唯一平仓真值与 `blocking_reason` 取证，**不得**恢复「由 `tgt_w==0` 推断平仓」；<br>3. `stop_cooldown_bars` 双义（个股 5 / 组合回撤 21）先改名再删，改名须确认无 config 键消费 portfolio 语义；<br>4. 全量 pytest + `--dump-strategies` 重建后 `git diff strategy_dumps/` 为空；<br>5. [`docs/version.md`](file:///home/stone/Work/github/quant/docs/version.md) 追加中文 changelog，[`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) 更新状态。 | `pytest common/tests pipeline/tests -q --import-mode=importlib` | M | `M4.3` |
 
@@ -2006,3 +2006,80 @@ uv run pytest common/tests/test_intraday_bar_contract.py common/tests/test_intra
 - `ml/bnn_forecaster` 的 `pyproject.toml` 依赖与测试运行方式未逐行读，子项目脚手架以它为准前须核对。
 
 **计数（2026-11-05，本条为现行权威值）**：新增 `§2.23` 与 `ML1` 一行（`[ ]`），故现役由 **149 = 105 `[x]` + 44 `[ ]`** 变为 **150 = 105 `[x]` + 45 `[ ]`**；两文件合计由 **215 = 171 `[x]` + 44 `[ ]`** 变为 **216 = 171 `[x]` + 45 `[ ]`**；归档 8 张子表仍 **66 项全 `[x]`** 不变。`§2.22` 仍为 **1 项 = 0 `[x]` + 1 `[ ]`**；新增 `§2.23` 为 **1 项 = 0 `[x]` + 1 `[ ]`**。§4.43、§4.44 的计数与判定原文保留不动（`§4.44` 六.3 的失效以 §4.45 为准）。
+
+---
+
+### 4.46 `M4.2` 阶段一闭环、守卫失效修复与 dump 追版本（2026-11-05，零计数变更）
+
+本节记录 `M4.2` **阶段一**的实际交付，以及同期发现并修复的一处**「测试全绿但仍无保护」**实例。**不改任何状态位、不新增任务行**：`M4.2` 行仍为 `[ ]`（阶段二未开始），现役计数仍 `150 = 105 [x] + 45 [ ]`。
+
+#### 4.46.1 阶段一实际交付，以及台账原文的两处事实错误
+
+`ba83f17` 已合并：`blend_base.py` 的日循环按默认关的标志 `blend_use_policy_kernel` 委托给内核；`BASE_VERSION 1.7.0 → 1.8.0`；`docs/version.md` 追加 §29；开/关两路输出 `max_abs_diff == 0.0`，NaN 掩码与列序一致（在 `asymmetric_sells=True`、`min_holding_bars=5` 下同样成立）。
+
+台账 `M4.2` 行的两处措辞与代码不符，**属行文错误而非实现偏差**，在此登记以免后来人对着行文怀疑实现：
+
+1. 行文把入口写成 `AssetPolicy`。实际 `AssetPolicy.step` 是**六态生命周期阶梯**（`step_position_lifecycle` 的移植），`M4.1` 自身文档写明无人调用，其消费者是 `M4.3`。真正的惯性内核是 `AssetPolicy.inertia_step`，面板级入口是 `PortfolioSequencer.sequence`（**逐 bar**，非面板级：接收 `ideal_w`/`current_w` 的 `Series` 与 `PolicyContext`，返回已承诺的稠密 `Series`）。
+2. 行文要求 `apply_asset_inertia` 保留签名并内部委托。该函数**不在** `blend_base.py`；`blend_base.py:33` 只是**死导入**。它实际位于 `common/allocation_templates.py:648`，`_step_asset_inertia` 在 `:551` —— 这正是阶段二的范围。
+
+另记一条实施中确认的语义区分：内核 `Decision.target_weight` 是**请求**（买入尚未被现金上限约束），只有 `sequence` 返回的 `Series` 才是**已承诺权重**。接线写回的是后者；若把前者当成交写进调仓表，即重复 `LV18` 那类「把建议当已施行」的错误。
+
+#### 4.46.2 守卫失效：一次「绿灯但无保护」的实测
+
+`ba83f17` 收窄了一条既有守卫（原 `test_kernel_has_no_callers_in_templates_or_blend_base`）时，把 `blend_base.py` 半边换成了**四条 `in blob_src` 子串检查**（模块名、`p.get("blend_use_policy_kernel")`、`getattr(cfg, "blend_use_policy_kernel", False)`、`_step_asset_inertia(`）。独立核验实测：
+
+| 反向改坏 | 结果 |
+| :-- | :-- |
+| `use_policy_kernel = bool(kernel_flag)` 硬改为 `True` | **275 passed，无红灯** |
+| `if use_policy_kernel:` → `if True:`（守卫删除、内核无条件） | **275 passed，无红灯** |
+| 连同 `test_blend_policy_kernel.py` 一起跑，强制翻标志 | **283 passed，无红灯** |
+
+根因有二：(a) 四条断言只检查字符串存在，删掉 `if` 或硬编码 `True` 都不改变字符串；(b) **因为内核与 `_step_asset_inertia` 逐位等价**（`max_abs_diff == 0.0`），任何**输出型**测试在原理上都无法发现「默认被悄悄翻转」。
+
+**这正是 `M4.2` 阶段二「翻默认必须有等价性证据」那道门禁的真实状态：当时没有任何自动化保护。** 一个已知为空的守卫比没有守卫更危险，因为它让后来人以为有保护。
+
+修复见 `0760c1a`：改为**双向调用路径 spy**，并保留模板侧的 import 扫描。实测口径：
+
+- 标志关（或缺省）：`_step_asset_inertia` 被调 **199** 次、`sequence` **0** 次；
+- 标志开：`_step_asset_inertia` **0** 次、`sequence` **199** 次。
+
+（**199 而非 119**：该数取决于 universe 与 bar 数，200 根 bar 下 `t == 0` 跳过一步。凡引用此数必须注明其构造。）
+
+修复后的反向改坏证据：B1 硬编码 `True` → 红，断言为 `with 'blend_use_policy_kernel' absent, '_step_asset_inertia' was called 0 times ... the default flipped silently`；B2 `if True:` → 红，但**红的是 `AttributeError`（`policy_sequencer` 未构建）而非断言**，已如实标注；并在 `:951` 与 `:1685` 两处同时改坏后才使断言本身触发。**「断言红」与「程序崩溃」必须分开记录**，否则「反向改坏转红」这条验收会自欺。
+
+已知残余弱点：模板侧仍是**文本 import 扫描**，漏 `__import__('common.position_policy')` 与 `importlib.import_module(...)`；对本条例的用途够用，但不得当作防篡改。
+
+#### 4.46.3 配置字段补齐
+
+`06e5896`：`pipeline/research_strategy/rs/config.py:819` 新增 `blend_use_policy_kernel: bool = False`，位于 `blend_*` 状态机块末、别名块前。
+
+- 属 **dataclass 加默认字段**，向后兼容，**不属版本轴**（`StrategyConfig` 不是策略/模板类；`BASE_VERSION` 只存在于 `BaseBlendAllocationStrategy`）。
+- 名字**必须带前缀**：`resolve_param` 末段是裸名 `getattr(cfg, name)`，2026-10-21 正是裸 `wq_alpha_id` 泄漏全局字段，把 `ChanFourStateExecutionStrategy` 换成 `WorldQuantAlphaStrategy(#101)`。
+- 新增用例 `test_strategy_config_field_alone_selects_kernel_path`：**只经构造函数**传标志（params 不带），断言内核路径被选中。这是此前**无法写**的用例——字段不存在时，配置侧恒为 `False`。
+- 两次反向改坏分别打红**不同**断言：默认改 `True` → `assert True is False`；摘掉 config 兜底 → `legacy calls=159`。两向都堵，非单条糊弄。
+
+#### 4.46.4 dump 追版本，以及一条结构性事实
+
+`--dump-strategies` 已执行。**先确认写入面**：`build_and_dump_strategies_as_backtester_files()` 只写 `pipeline/research_strategy/results/strategy_dumps/<key>_strategy.json`，**不会**写 `strategies_config.json`（后者是只读输入，md5 前后一致）。执行结果：58 份 dump 中 **6 份变化**，每份仅 8 个叶子（`base_version`、`entry_data.base_version`、`version_info.base_version`、`composite_version` 各 2），版本叶子由 `1.7.0` ×18 变为 `1.8.0` ×18，其余 52 份 md5 完全一致。
+
+四条红线**一条未触**：无 `blend_weighting_mode` 变化、无参数默认值变化、无子策略类变化、无策略增删。钉住的例外前后均为 `regime_ic_ir_hybrid`（`strategies_config.json:402` 与 dump 文件 `:57`、`:109`），独立 `grep` 与既有测试双重确认。新标志**未**写入任何 dump，符合既有钉扎测试的要求。
+
+**结构性事实（本轮最重要的意外发现）**：`pipeline/research_strategy/results/` 被 `pipeline/.gitignore` 忽略，因此 **dump 产物不进版本库**——`git diff -- strategy_dumps/` 按构造恒为空，「逐条 diff」必须在磁盘层面用扁平化叶子映射与 md5 完成，不能用 git。由此产生一个**可审计性缺口**：若日后要回答「实盘票据当时读的是哪份 dump」，无法从仓库复现，只能靠归档快照回溯。此项**仅登记为观察**，不立项；若将来需要，最小做法是把 dump 的关键字段（`base_version`、`blend_weighting_mode`、选用策略集合）落一份随代码提交的摘要。
+
+#### 4.46.5 测试实测
+
+| 套件 | 结果 | 基线 |
+| :-- | :-- | :-- |
+| `pipeline/research_strategy/tests` | **631 passed + 1 xfailed** | 630 + 1，差值恰为新增 1 条配置路径用例 |
+| `common/tests` | **1341 passed, 1 skipped** | 与基线一致，无差值 |
+| `pipeline/tests/test_strategy_dumps_invariants.py` | 7 passed | — |
+| `-k cfsb_deployed_regime_mode` | 1 passed | — |
+
+无任何测试断言过旧 dump 字面量，故无需修改既有断言。
+
+#### 4.46.6 未验证
+
+- 本地未推送提交数未复测：上一轮实测 34 条，其后新增 `0760c1a`、`06e5896`，算术应为 36，但**未实测**。
+- 是否有任何部署路径从 `results/`（gitignore 目录）之外拷贝 dump 未确认。
+- `pipeline/scripts/blend_dump_overrides.py` **刻意未运行**——它属 2026-10-24 记录的漂移路径。
+- 阶段二仍未开始：`common/allocation_templates.py` 的 `apply_asset_inertia`/`_step_asset_inertia` 委托、模板侧守卫用例的相应更新、以及**默认翻转**（须等价性证据先合入）。`M4.2` 行状态因此保持 `[ ]`。
