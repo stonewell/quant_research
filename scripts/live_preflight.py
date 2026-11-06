@@ -62,11 +62,12 @@ The rule enforced now (second pass) is:
    (`resolve_strategy_definition` matches the config key first and synthesises a
    `research_strategy_spec`), and if that entry were ever pinned, such a dump is now checked
    rather than trusted.
-4. `is_static_template()` itself is untouched: the set has 13 entries and the last four
+4. `is_static_template()` itself is untouched: the set has 14 entries (`sleeve_allocator`
+   added 2026-11-05 with the M2.2 core-satellite template) and four of them
    (`momentum`, `hrp`, `inv_vol`, `ew`) are aliases rather than `AllocationTemplate.name`
-   values; all 13 stay byte-identical (an existing test pins them). A CHECKED strategy that
-   pins no `blend_weighting_mode` still returns `verified=True` -- being checked is not the
-   same as being suspect.
+   values; the 13 pre-existing names stay byte-identical (an existing test pins them).
+   A CHECKED strategy that pins no `blend_weighting_mode` still returns `verified=True` --
+   being checked is not the same as being suspect.
 """
 
 import json
@@ -93,6 +94,7 @@ _STATIC_TEMPLATE_NAMES = {
     "mean_reversion",
     "minimum_variance",
     "breadth_gated_momentum",
+    "sleeve_allocator",
     "momentum",
     "hrp",
     "inv_vol",
@@ -277,7 +279,7 @@ def is_static_template_exempt(name: Optional[str], config_keys: frozenset) -> bo
     so that conflation cannot creep back in here.
 
     A name is exempt iff:
-    1. it is a static basket template name (`is_static_template` -- 13 entries, the last four
+    1. it is a static basket template name (`is_static_template` -- 14 entries, the last four
        of which, `momentum` / `hrp` / `inv_vol` / `ew`, are aliases rather than
        `AllocationTemplate.name` values; unchanged), AND
     2. it is NOT a top-level key of `strategies_config.json`.

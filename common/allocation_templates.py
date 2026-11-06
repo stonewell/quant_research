@@ -1880,3 +1880,26 @@ class PatternBasedAllocationTemplate(AllocationTemplate):
         lb = self.feature_lookback
         base_lookback = max(lb) if isinstance(lb, (tuple, list)) else lb
         return base_lookback + params.get("hold_days", 21)
+
+
+# --------------------------------------------------------------------------- #
+# Late registry entry: `common.sleeve_allocator` (M2.2 core-satellite template).
+#
+# That module imports THIS module's base class and helpers, so importing it
+# eagerly here is circular by construction. It is therefore imported at the very
+# bottom (after every name it needs already exists) AND guarded on both sides:
+#   * this direct-import order -> the allocator module runs to completion here,
+#     registers itself, and the guard below is a no-op;
+#   * the reversed order (something imports `common.sleeve_allocator` first) ->
+#     its own import of this module re-enters here while it is still partially
+#     initialized, `SleeveAllocator` does not exist yet, this ImportError is the
+#     expected one, and the allocator registers itself when it finishes.
+# A real ImportError raised from inside the allocator module would leave the
+# registry at 9 entries, which `common/tests/test_sleeve_allocator.py` catches.
+try:
+    from common.sleeve_allocator import SleeveAllocator as _SleeveAllocator
+except ImportError:  # pragma: no cover - only reachable on the reversed import order
+    _SleeveAllocator = None
+
+if _SleeveAllocator is not None and _SleeveAllocator not in ALLOCATION_TEMPLATES:
+    ALLOCATION_TEMPLATES.append(_SleeveAllocator)

@@ -406,7 +406,7 @@ def test_all_nine_static_templates_fidelity_and_accounting_identity():
         universe[chr(65 + i)] = make_ohlcv_from_closes(closes, start="2020-01-01")
     symbols = list(universe.keys())
 
-    assert len(ALLOCATION_TEMPLATES) == 9
+    assert len(ALLOCATION_TEMPLATES) == 10  # 9 originals + SleeveAllocator (M2.2)
 
     for template_cls in ALLOCATION_TEMPLATES:
         template = template_cls()

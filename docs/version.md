@@ -4212,3 +4212,37 @@ LIVETRADING_STRICT_SEED_BOOK=0        # 0 / false / no / off 同样生效
   - `pipeline/.venv/bin/python -m pytest pipeline/tests -q --import-mode=importlib` -> **610 passed, 1 skipped**
   - `pipeline/.venv/bin/python -m pytest common/tests pipeline/tests -q --import-mode=importlib`（合并跑，`--import-mode=importlib` 规避同名测试文件 `import file mismatch`）-> **1887 passed, 2 skipped**，与两半之和（1277 + 610 通过、1 + 1 跳过）逐项相等，无跨目录串扰
   - `pipeline/.venv/bin/python -m pytest pipeline/strategy_generator/tests -q --import-mode=importlib` -> 74 passed
+
+## 28. M2.2: 核心-卫星双 sleeve 配置模板 SleeveAllocator（新增静态模板，1.0.0，2026-11-05）
+
+### 28.1 版本轴
+| 对象 | 旧版本 | 新版本 | 说明 |
+| --- | --- | --- | --- |
+| `common/sleeve_allocator.py::SleeveAllocator` | —（新增） | **`1.0.0`** | 新增的第 10 个静态 `AllocationTemplate`，首版即 1.0.0 |
+| `BaseBlendAllocationStrategy.BASE_VERSION` | `1.7.0` | `1.7.0`（不变） | 本模板**不继承** blend 底座，`pipeline/research/blend/*` 零改动，故底座不升版本 |
+| `common/allocation_templates.py` 文件级 `BASE_VERSION` | 不存在 | 不存在 | 该文件从未有文件级 `BASE_VERSION`；9 个既有静态模板各自 `version` 均未改动（仅注册表追加一项） |
+
+### 28.2 模块语义（新模板，非既有模板改动）
+- **固定预算合成**：`w_total = Σ_s budget_s · w_sleeve_s`，`sleeve_beta_budget=0.25`（核心/core）、`sleeve_alpha_budget=0.55`（卫星/satellite）、`sleeve_cash_budget=0.20`（现金储备）。三者之和必须严格等于 `1.0`（容差 `1e-9`），违反即抛 `ValueError`——这是**配置错误**（预算未分割资本），不做静默重新归一化退化。
+- **现金流腿显式化**：现金预算不是第四个"持仓 sleeve"，而是残差 `max(0, 1 − Σrisky)`；调用 `sleeve_cash_ticker` 指定现金标的时，通过既有 `_cap_and_deroute_to_cash` 辅助函数显式写入该列（`cap=1.0` 兜底），否则按本仓库"风险权重和 ≤ 1"约定隐含为现金。
+- **危机叠加层只作用于 beta sleeve**：`sleeve_crisis_scale=0.5` 仅乘核心 sleeve 权重，alpha sleeve **逐位相同**。危机信号本身为**调用方注入**（`sleeve_crisis_active`，`bool` 或按日期索引的 `bool` Series/dict），属于**已披露的简化**：仓库内唯一可用的广度/推力检测器位于 `scripts/check_live_portfolio_health.py`（实盘运维模块，`common/` 反向 import 会倒置依赖方向），`BreadthGatedMomentumAllocation` 的广度去风险逻辑内联在其 `generate_weights` 中、不可复用，故不在此新造检测器。
+- **sleeve 内加权**：默认 `sleeve_within_weighting="equal"`（无估计量的最小构件）；可选 `"inverse_vol"`，复用既有 `_inverse_vol_weights(scale=budget)` 原语；`sleeve_vol_lookback=60` 只在该模式下参与 `warmup_bars`。权衡：等权忽略风险贡献会高配高波动成员，逆波动率对单次噪声波动估计敏感且对平坦序列无定义。
+- **标的集合与迁移**：`sleeve_beta_tickers` / `sleeve_alpha_tickers` 支持平坦列表，或按调仓日的**阶跃函数**式排程（`dict`/`Series`，取"该日及之前最后一次声明"）；同一日期同时属于两个 sleeve 视为配置错误并抛 `ValueError`；两集合之外的标的被**排除**，并在每个调仓行写**显式 `0.0`**。两者都未配置时，全部标的按各自预算同时参与两个 sleeve（非退化的文档化默认值）。
+- **稀疏权重契约**：非调仓日 `NaN`，模板内部绝不 `ffill()`；**每个调仓行对所有标的都写实数**——被排除标的、以及被迁移出某 sleeve 的标的均写显式 `0.0`，避免回测器列向 `ffill()` 静默沿用陈旧持仓。稀疏化不经过 `_sparse_from_daily`（其行选择按"值是否变化"，会丢弃"与上期目标相同"的合法调仓行，正是该模块 docstring 警告的反模式），改为在排定的调仓日整行写入（与既有 9 个静态模板一致）；但其**微权重裁剪约定（`1e-4`，源自 `_step_asset_inertia`）被复用**。
+- **注册表接线**：`common/allocation_templates.py` 文件**末尾**受保护地 import 并 append `SleeveAllocator`（该新模块 import 底座类，属构造性循环依赖；两种 import 顺序均可用，新模块自身亦有自注册兜底）。`scripts/live_preflight.py::_STATIC_TEMPLATE_NAMES` 追加 `sleeve_allocator`（13 → 14 项，既有 13 项逐字不变，`dual_momentum` 与配置键的碰撞关系不变）。
+
+### 28.3 搜索空间的真实行为后果（重要）
+把 `SleeveAllocator` 加入 `ALLOCATION_TEMPLATES` 使 `strategy_generator` 的**候选模板从 9 个变为 10 个**：在未显式 `--no-compose-aspects` 的默认搜索中，它会作为一个独立候选参与网格搜索 + Equivalent Random Search；其默认 `param_grid`（`rebalance_freq_days` ×3、`sleeve_within_weighting` ×2、`sleeve_vol_lookback` ×1）**新增 6 个网格试验**，即在同等 ERS 随机抽样预算（ERS 每次搜索只跑一次，作用于最终优胜者）下，`_search_allocation` 的 `n_trials` 增加 6。既有 9 个模板自身的 `generate_weights` 输出**逐位不变**；但一次搜索的**排名/优胜者可能变化**（新候选可能胜出），这对研究结论是真实的、非空转的后果，历史回测结论的复现须锁定模板集合。
+- **不产生 dump 变动**：静态模板不序列化进 `strategy_dumps/`（`--dump-strategies` 只导出 `StrategyConfig` 驱动的 research/blend 策略，见 27.3）。本次实测 `pipeline/research_strategy/results/strategy_dumps/*.json` 中既无 `equal_weight` 也无 `sleeve_allocator`，故**未执行** `--dump-strategies`，且不需要执行。
+- **同步更新的硬编码计数**：`common/tests/test_allocation_backtester_fidelity.py` 的 `len(ALLOCATION_TEMPLATES) == 9 -> 10`；`common/tests/test_strategy_versioning.py` 新增该类并断言 `version == "1.0.0"`，测试名由 `test_nine_static_templates_versioning` 改为 `test_static_templates_versioning`（覆盖面不变，仅去掉与数量矛盾的名称）。其余仅存注释/文案中的"9 个静态模板"字样（`common/strategy_aspects.py` 的 `ATOMIC_TEMPLATE_ASPECTS` 注释与 `CompositeAllocationTemplate.explain_weights` 文案、`pipeline/strategy_generator/stratgen/generator.py` docstring、`docs/version.md` 27.3）——本任务文件所有权不含上述文件，未改动；`SleeveAllocator` 有意不进入 `ATOMIC_TEMPLATE_ASPECTS`（它不是可分解为 selection+weighting 两个 aspect 的模板，`build_composite_candidates` 以 `name in ATOMIC_TEMPLATE_ASPECTS` 过滤，天然跳过）。
+
+### 28.4 离线测试验证（100% 离线、0 网络依赖）
+- `pipeline/.venv/bin/python -m pytest common/tests/test_sleeve_allocator.py -q --import-mode=importlib` -> **12 passed**（新增文件）：手算切分（`0.25/2`、`0.55/2`，`atol=1e-12`）、预算和不等于 1 抛错、危机层只缩放 beta 且 alpha 逐位相同、`Σrisky ≤ 1` 与显式现金腿、稀疏契约（非调仓日全 `NaN`、被排除标的显式 `0.0`、绝不 ffill）、sleeve 迁移（`beta -> alpha` 两侧均写实数、无陈旧沿用）、`inverse_vol` 与默认 `equal`、版本、注册表（含 10 项计数）。
+- **非空转（变异）验证**：临时改坏实现并复跑，确认变红后复原（备份复原后 12 passed）：
+  - 等权除以 `len(active)+1` -> 6 条变红（含用例 1、4、6、7）。
+  - 危机乘子短路（`if False and ...`）-> 2 条变红（用例 3 的两条）。
+  - 调仓行排除标的留 `NaN`（同时关闭 `1e-4` 裁剪的 0.0 回写）-> 用例 5 变红。
+- **回归结果**：
+  - `pipeline/.venv/bin/python -m pytest common/tests -q --import-mode=importlib` -> **1289 passed, 1 skipped**（基线 1277 passed, 1 skipped；增量恰为新增 12 条）。
+  - `pipeline/.venv/bin/python -m pytest pipeline/strategy_generator/tests -q --import-mode=importlib` -> **74 passed**（与基线一致）。
+  - `pipeline/.venv/bin/python -m pytest common/tests/test_live_dump_preflight.py -q --import-mode=importlib` -> **47 passed**（与基线一致；注意该文件位于 `common/tests/`，不在 `pipeline/tests/`）。

@@ -2,7 +2,7 @@
 
 Covers:
 1. AllocationTemplate version attribute, get_version_info(), and version_string property.
-2. 9 static allocation templates versioning.
+2. 10 static allocation templates versioning.
 3. CompositeAllocationTemplate and CompositeTimingTemplate versioning with aspect metadata.
 4. BaseBlendAllocationStrategy and institutional blend subclasses versioning (v1.0.0, base: v1.0.0).
 5. Research strategies (ChanThreeTypeStrategy, ChanVaaCompoundStrategy, WorldQuantAlphaStrategy, etc.).
@@ -41,6 +41,7 @@ from common.allocation_templates import (
     BreadthGatedMomentumAllocation,
     PatternBasedAllocationTemplate,
 )
+from common.sleeve_allocator import SleeveAllocator
 from common.strategy_aspects import (
     CompositeAllocationTemplate,
     SELECTION_ASPECTS,
@@ -105,9 +106,13 @@ def test_allocation_template_base_versioning():
     assert t2.get_version_info()["version"] == "2.1.0"
 
 
-def test_nine_static_templates_versioning():
+def test_static_templates_versioning():
     """Verify static allocation templates versioning (CrossSectionalMomentumAllocation is 1.1.0,
-    MinimumVarianceAllocation is 1.1.0, others 1.0.0)."""
+    MinimumVarianceAllocation is 1.1.0, others 1.0.0).
+
+    Renamed from `test_nine_static_templates_versioning` when M2.2 added the tenth static
+    template (`SleeveAllocator`, 1.0.0) -- same coverage, name no longer lies about the count.
+    """
     static_classes_v100 = [
         EqualWeightAllocation,
         InverseVolatilityAllocation,
@@ -116,6 +121,7 @@ def test_nine_static_templates_versioning():
         MaxDiversificationAllocation,
         MeanReversionAllocation,
         BreadthGatedMomentumAllocation,
+        SleeveAllocator,
     ]
     for cls in static_classes_v100:
         inst = cls()
@@ -135,6 +141,12 @@ def test_nine_static_templates_versioning():
     assert min_var.version == "1.1.0"
     assert min_var.version_string == "v1.1.0"
     assert min_var.get_version_info()["version"] == "1.1.0"
+
+    # M2.2: new core-satellite static template, initial version.
+    sleeve = SleeveAllocator()
+    assert sleeve.version == "1.0.0"
+    assert sleeve.version_string == "v1.0.0"
+    assert sleeve.get_version_info()["version"] == "1.0.0"
 
 
 def test_composite_templates_versioning():
