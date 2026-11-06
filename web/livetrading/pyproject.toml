@@ -13,6 +13,7 @@ dependencies = [
     "scipy>=1.10",
     "matplotlib>=3.7",
     "duckdb>=1.1",
+    "baostock>=0.9.4",
 ]
 
 [dependency-groups]
