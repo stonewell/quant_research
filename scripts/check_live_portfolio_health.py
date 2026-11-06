@@ -2105,7 +2105,11 @@ def _absolutize_child_arg(path: Optional[str]) -> Optional[str]:
     return os.path.normpath(os.path.join(_REPO_ROOT, path))
 
 
-def build_stage2_command(args: argparse.Namespace, enable_intraday_5m: bool = False) -> List[str]:
+def build_stage2_command(
+    args: argparse.Namespace,
+    enable_intraday_5m: bool = False,
+    portfolio_value: Optional[float] = None,
+) -> List[str]:
     """Builds the argv for the auto-launched Stage 2 runner (`--auto-run-stage2`).
 
     (P1.3) `--health-report-file` is passed EXPLICITLY instead of relying on
@@ -2120,6 +2124,14 @@ def build_stage2_command(args: argparse.Namespace, enable_intraday_5m: bool = Fa
     Every path-valued flag is absolutized (see `_absolutize_child_arg`), so the
     resulting argv is identical no matter which directory the operator ran
     Stage 1 from.
+
+    (LV12, 2026-11-05) `portfolio_value` is the NAV Stage 2 is launched with. It is
+    threaded EXPLICITLY (`gate_nav`, i.e. the marked-to-market `nav_effective`) so the
+    child that sizes orders inherits the SAME NAV the parent gated on -- a Stage-1 gate
+    verdict computed from MTM while Stage 2 sizes lots against the frozen form value was
+    the second half of the LV12 divergence. The default is `args.portfolio_value` so
+    every other caller keeps its historical argv byte-for-byte (and `str(...)` of the
+    untouched object is preserved verbatim, not re-coerced to float).
     """
     for required in ("output_dir", "universe_file", "strategy_file", "account_state_file"):
         if not getattr(args, required, None):
@@ -2128,6 +2140,7 @@ def build_stage2_command(args: argparse.Namespace, enable_intraday_5m: bool = Fa
                 "before Stage 2 can be auto-launched"
             )
 
+    stage2_nav = args.portfolio_value if portfolio_value is None else portfolio_value
     stage2_script = os.path.join(_REPO_ROOT, "scripts", "run_live_strategy.py")
     output_dir = _absolutize_child_arg(args.output_dir)
     # Same filename `generate_reports` wrote above (see STAGE1_HEALTH_REPORT_JSON).
@@ -2137,7 +2150,7 @@ def build_stage2_command(args: argparse.Namespace, enable_intraday_5m: bool = Fa
         sys.executable,
         stage2_script,
         "--portfolio-value",
-        str(args.portfolio_value),
+        str(stage2_nav),
         "--universe-file",
         _absolutize_child_arg(args.universe_file),
         "--strategy-file",
@@ -2398,6 +2411,51 @@ def main(cli_args: Optional[List[str]] = None):
     enable_intraday_5m = getattr(args, "enable_intraday_5m", False) or bool(
         resolve_blend_param(params, "enable_intraday_5m", False, bool)
     )
+
+    # (LV12, 2026-11-05) ONE NAV FOR BOTH STAGES. The 5m intraday trough math below IS a NAV
+    # computation, so it must run on the SAME NAV the daily gate ran on -- the marked-to-market
+    # `nav_effective` -- and never on the operator form value. Before this, `hwm_intra` /
+    # `dd_trough` were the only NAV figures in the whole report still scaled by
+    # `--portfolio-value`: on the archived 10-30 / 11-02 pair the form value was frozen at
+    # 199935.46 while the book marked 191630.06, so the intraday trough was measured against a
+    # NAV that did not exist. `gate_nav` already carries the LV1 degraded fallback (the form
+    # placeholder when `nav_effective` is unusable) and that fallback is PRESERVED here on
+    # purpose: a degraded run must keep producing today's numbers rather than crash.
+    intraday_nav_base = gate_nav
+
+    # The form-vs-MTM difference is RECORDED, never silently absorbed (LV12 deliverable c).
+    # Emitted only when both NAVs were measured AND they disagree beyond the frozen LV1
+    # tolerance -- so a `form == MTM` run adds no key at all and its 5m block stays
+    # byte-identical. A DEGRADED run emits nothing here either: LV1 has already warned, loudly,
+    # that the whole gate NAV fell back to the form placeholder; there is no silent difference
+    # to disclose in that case, only an admitted absence.
+    intraday_nav_base_record: Optional[Dict[str, Any]] = None
+    if nav_resolution.get("nav_deviation_exceeded") is True:
+        _base_form = nav_resolution.get("nav_form")
+        _base_mtm = nav_resolution.get("nav_mtm")
+        intraday_nav_base_record = {
+            "basis": "mark_to_market",
+            # Both raw inputs, the signed delta and the LV1 deviation, so an auditor can
+            # recompute `hwm_intra` / `dd_trough` without re-deriving which NAV was used.
+            "form_value": _base_form,
+            "mtm_value": _base_mtm,
+            "delta": float(_base_mtm) - float(_base_form),
+            "deviation_pct": nav_resolution.get("nav_deviation_pct"),
+            "threshold_pct": nav_resolution.get("nav_deviation_threshold_pct"),
+            "base_used": float(intraday_nav_base),
+            "note": (
+                "5m 日内 HWM/回撤底座 = 盯市 nav_effective；操作员表单值仅留痕，"
+                "不参与 intraday 净值计算（LV12）"
+            ),
+        }
+        print(
+            "[WARN] (LV12) 5m 日内 NAV 底座与表单值不一致: "
+            f"MTM {float(_base_mtm):,.2f} vs 表单 {float(_base_form):,.2f}"
+            f"（差 {float(_base_mtm) - float(_base_form):+,.2f}，偏离 "
+            f"{nav_resolution.get('nav_deviation_pct'):+.2%}）；"
+            "hwm_intra/dd_trough 已按盯市净值计算，表单值仅留痕。"
+        )
+
     intraday_5m_info = None
     if enable_intraday_5m:
         try:
@@ -2601,16 +2659,16 @@ def main(cli_args: Optional[List[str]] = None):
                                     if shares > 0:
                                         bar_nav += shares * p_close
                                     elif weight > 0:
-                                        bar_nav += weight * args.portfolio_value
+                                        bar_nav += weight * intraday_nav_base
                                         total_weight += weight
                                 elif sym == cash_proxy:
                                     if weight > 0:
-                                        bar_nav += weight * args.portfolio_value
+                                        bar_nav += weight * intraday_nav_base
                                         total_weight += weight
 
                             if bar_nav > 0:
                                 if total_weight > 0 and total_weight < 1.0:
-                                    bar_nav += (1.0 - total_weight) * args.portfolio_value
+                                    bar_nav += (1.0 - total_weight) * intraday_nav_base
                                 nav_series.append(bar_nav)
 
                         if nav_series:
@@ -2656,6 +2714,13 @@ def main(cli_args: Optional[List[str]] = None):
                 }
         except Exception as exc:
             print(f"[WARN] Failed to evaluate 5m intraday features: {exc}")
+
+    # (LV12) Attach the explicit form-vs-MTM record to the SAME dict that lands in
+    # `stage1_health_report.json::intraday_5m_metrics` -- a log line alone would be invisible to
+    # every consumer of the report. Omitted entirely when the two NAVs agree (or when the run was
+    # degraded), so the `form == MTM` outputs stay byte-identical.
+    if intraday_5m_info is not None and intraday_nav_base_record is not None:
+        intraday_5m_info["nav_base"] = intraday_nav_base_record
 
     macro_info = evaluate_market_breadth_and_thrust(universe, params)
     vol_info = evaluate_realized_volatility(universe, params)
@@ -2747,7 +2812,11 @@ def main(cli_args: Optional[List[str]] = None):
             # (P1.3) argv construction lives in `build_stage2_command` so the offline
             # suite can assert the exact flag set (notably the explicit absolute
             # `--health-report-file`) without launching a child process.
-            cmd = build_stage2_command(args, enable_intraday_5m=enable_intraday_5m)
+            # (LV12) ... and the NAV threaded in is the SAME resolved gate NAV (`gate_nav`),
+            # i.e. MTM when measurable and the LV1 form placeholder only when it is not.
+            cmd = build_stage2_command(
+                args, enable_intraday_5m=enable_intraday_5m, portfolio_value=gate_nav
+            )
             print(f"\n[AUTO-EXECUTE] Launching Stage 2: {os.path.basename(cmd[1])} ...")
             import subprocess
             subprocess.run(cmd, check=True)

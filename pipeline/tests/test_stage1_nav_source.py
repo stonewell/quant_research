@@ -387,8 +387,12 @@ def test_gate_call_site_uses_resolved_nav_not_the_form_value():
     assert "current_nav=args.portfolio_value" not in source
     assert "current_nav=gate_nav" in source
     assert "resolve_gate_nav_context(args)" in source
-    # Stage 2's argv still speaks the operator's form value -- unchanged by LV1.
-    assert 'str(args.portfolio_value)' in source
+    # (LV12, 2026-11-05) Stage 2's argv NO LONGER speaks the operator's form value -- LV1 left it
+    # that way, and LV12 closed exactly that gap: the child is launched with the SAME resolved
+    # gate NAV (`gate_nav`, i.e. MTM). The guard is inverted rather than dropped, so a revert to
+    # `str(args.portfolio_value)` still fails loudly here.
+    assert "str(args.portfolio_value)" not in source
+    assert "portfolio_value=gate_nav" in source
 
 
 # ---------------------------------------------------------------------------
