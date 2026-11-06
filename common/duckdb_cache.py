@@ -26,6 +26,7 @@ from common.market_clock import (
     infer_market_from_symbol,
     last_expected_bar_ts,
 )
+from common.data_coverage import find_volume_column
 
 if TYPE_CHECKING:
     from .data import FundamentalMetrics
@@ -2149,8 +2150,11 @@ class DuckDBCache:
         bars instead of being taken at face value (L2.18), with a WARNING per repair.
 
         NULL-VOLUME CONTRACT (LV5, `docs/data_gap_visibility_schema.md`): `Volume` is defaulted to
-        `0.0` **only when the `Volume` COLUMN IS ABSENT from `df`**. A present-but-null/NaN volume
-        CELL is a different fact and is **refused** -- those rows are dropped from this write and
+        `0.0` **only when the `Volume` COLUMN IS ABSENT from `df`** -- and "absent" is decided
+        case-insensitively (`Volume` / `volume` / `VOLUME`), because a case mismatch is not a
+        missing axis: treating it as one stored every real volume as `0.0` with no trace.
+        A present-but-null/NaN volume CELL is a different fact and is **refused** -- those rows
+        are dropped from this write and
         the call raises `NullVolumeRefused` (symbol/provider/interval/every refused date/row
         count/first+last date/value repr) AFTER the batch's remaining legal rows commit. It is
         never coerced to `0.0`: `0.0` asserts "no trades that day", the source asserted nothing.
@@ -2253,7 +2257,18 @@ class DuckDBCache:
         df_to_store = pd.DataFrame(index=pd.to_datetime(df.index))
         for col in ["Open", "High", "Low", "Close"]:
             df_to_store[col] = df[col]
-        df_to_store["Volume"] = df["Volume"] if "Volume" in df.columns else 0.0
+        # CASE-INSENSITIVE VOLUME LOOKUP (LV5 phase 2 fix). The pre-fix code tested the literal
+        # `"Volume"` only, so a frame carrying lowercase `volume` looked like "no volume column"
+        # and fell into this branch's `else 0.0`: every real volume in it was stored as `0.0`. A
+        # case-mismatch silently converting real volume to 0.0 falsifies dollar-volume filters
+        # and breadth with no trace at all -- the store looks fully populated -- which is the
+        # same defect class as `fillna(0.0)` on a null cell
+        # (`docs/data_gap_visibility_schema.md` §2.4), only harder to notice.
+        # `find_volume_column` is shared with `common/data_coverage.py` so the reader and the
+        # writer agree on what "the volume column" is; a frame that genuinely has no volume axis
+        # still gets the documented `0.0` convention.
+        volume_col = find_volume_column(df.columns)
+        df_to_store["Volume"] = df[volume_col] if volume_col is not None else 0.0
         if "Amount" in df.columns:
             df_to_store["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
         elif "amount" in df.columns:
@@ -2280,7 +2295,7 @@ class DuckDBCache:
         # contract exists to prevent. The refusal is raised AFTER the legal rows commit.
         # ------------------------------------------------------------------------------
         null_volume_refusal: Optional[NullVolumeRefused] = None
-        if "Volume" in df.columns:
+        if volume_col is not None:
             null_volume_mask = pd.isna(df_to_store["Volume"]).to_numpy(dtype=bool)
             if null_volume_mask.any():
                 refused_index = df_to_store.index[null_volume_mask]
