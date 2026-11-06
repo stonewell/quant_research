@@ -477,6 +477,14 @@ flowchart TD
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
 | **`W1`** | `[ ]` | 已交付构件接入真实运行路径（三项独立子任务，见 §4.41 与 §4.42） | ①`common/fill_reconciliation.py`；②`pipeline/instrument_selection/selectorbot/scoring.py` + `run_screener.py`；③`common/sleeve_allocator.py` + `strategies_config.json` + `scripts/live_preflight.py` | 1. **`W1a` 回单摄取**：`LV4` 对账器接入 Stage 2 之后的回单摄取路径，`nav_breakdown.json::cash` **仍不回改**，只报差额；前置＝用户给出券商回单格式（字段/单位/时间戳语义）与摄取时点。<br>2. **`W1b` 因子启用**：`run_screener` 显式传 `daily_data` 与合并权重，使 `M3.1` 因子真正参与 `overall_selection_score`；前置＝用户裁定权重标定口径，并接受**选股结果将改变**。<br>3. **`W1c` 袖分配器选型**：若采用 `M2.2` 的 `SleeveAllocator`，须入 `strategies_config.json` 并过 `live_preflight` 白名单；属**策略行为变更**，须走版本轴与 `docs/version.md`。<br>4. 三项**各自独立可验收**，不得因一项受阻而阻塞另两项。<br>5. 未获前置裁定前**不得开工**，也不得用「先改文案/先默认开启」的方式绕过。 | `W1a` 扩展 `pipeline/tests/test_fill_reconciliation.py`；`W1b` 扩展 `pipeline/instrument_selection/tests/test_scoring.py`；`W1c` 扩展 `common/tests/test_sleeve_allocator.py` 与 `common/tests/test_live_dump_preflight.py` | M | 用户裁定三项前置（见交付第 1–3 条） |
 
+### 2.23 机器学习子项目登记（`ML1`，2026-11-05 由用户裁定立项，1 项待办）
+
+本表登记与 `ml/bnn_forecaster` 同构的**独立子项目**：自有 `uv` 环境、自有 `tests/`，不污染 `pipeline/` 的依赖树。横跨两个项目组，故**不入 §2.17 执行序列**。
+
+| 任务 | 状态 | 主题 | 涉及文件 | 交付与验收 | 测试落点 | 规模 | 前置 |
+| :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
+| **`ML1`** | `[ ]` | LightGBM + 遗传规划（GP）两阶段 Alpha 挖掘子项目（来源 [`docs/LightGBM与遗传规划（GP）中短期量化Alpha投研体系研究.md`](file:///home/stone/Work/github/quant/docs/LightGBM与遗传规划（GP）中短期量化Alpha投研体系研究.md)，见 §4.45） | 新建 `ml/alpha_mining/`（路径名待用户确认）：`pyproject.toml`、`tests/`、`README.md`；复用 `common/alpha101_operators.py`、`common/factor_analyzer.py`、`common/indicators.py` | 1. **环境隔离**：独立 `uv` 环境（`lightgbm` + `numpy` + `pandas` + `scipy`），**禁止**把 `lightgbm` 装进 `pipeline/.venv`；`common/` 仍靠 `sys.path` 注入复用。<br>2. **算子层一律 REUSE**：`ts_sum`/`ts_std`/`ts_corr`/`ts_cov`/`ts_rank`/`ts_argmax`/`ts_argmin`/`ts_decay_linear`/`cs_rank`/`cs_demean`/`cs_zscore`/`signed_power` 已全部存在于 `common/alpha101_operators.py:92-245`，**不得重写**；仅补 `sigmoid`、`signed_log` 两条缺失纯函数。<br>3. **适应度函数**：`RankIC × sqrt(ICIR) − λ1·Turnover − λ2·max_abs_corr（与存量因子的横截面最大绝对相关） − λ3·Length`，其中 RankIC/ICIR 复用 `common/factor_analyzer.py:60`、`:162`，只写组合与惩罚项。<br>4. **Purged Group TimeSeries CV + Embargo**：因持有期 `k` 使标签重叠 `k−1` 天，必须清除跨界样本并在测试段后设 3~5 日隔离带；此构件**无第三方依赖**，须可在纯 `pandas`/`numpy` 下离线测试。<br>5. **LightGBM 组合层**：`lambdarank` 或自定义负 RankIC 损失；`max_depth` 3~5、`num_leaves` 15~31、`feature_fraction` 0.6~0.8、`min_child_samples` 100~500。<br>6. **落地监控**：对抗性验证防时间漂移、特征重要性衰减报警、换手过载熔断。<br>7. **不改变现网**：子项目产出在获批前**不得**写入 `strategies_config.json`、不得进 `run_screener.py`、不得改任何既有回测输出。 | 新建 `ml/alpha_mining/tests/`（100% 合成数据、零网络）；Purged CV 需有「跨 Purge 边界的样本被剔除」用例；GP 适应度需有「与存量因子相关系数超 0.6 时被惩罚」用例；`sigmoid`/`signed_log` 落在 `common/tests/test_alpha101_operators.py` | L | 用户批准新依赖；裁定标签口径（特质残差 vs 原始收益）与是否允许最终影响选股结果；确认子项目路径名 |
+
 ---
 
 ## 三、 六级主优先级执行路线图与并行波次编排（`Tier P0` $\to$ `Tier P5`）
@@ -1962,3 +1970,39 @@ uv run pytest common/tests/test_intraday_bar_contract.py common/tests/test_intra
 - `ml/bnn_forecaster` 的实际依赖以 `pyproject.toml` 为准，未验证其是否能承担树模型任务。
 
 本节为**审计记录，不是任务清单**；开工须由用户另行裁定，并在 `§2.x` 新增任务行。
+
+### 4.45 机器学习子项目立项与 `§4.44` 六.3 改判（2026-11-05，新增 `§2.23` 一行）
+
+本节记录**用户 2026-11-05 的裁定**：LightGBM 与遗传规划（GP）不再列为「刻意跳过」，改为**启动独立子项目**（登记于 §2.23 的 `ML1`），并链接来源文档 [`docs/LightGBM与遗传规划（GP）中短期量化Alpha投研体系研究.md`](file:///home/stone/Work/github/quant/docs/LightGBM与遗传规划（GP）中短期量化Alpha投研体系研究.md)。
+
+**这是一次改判，`§4.44` 的 `六.3` 原判因此失效。** 依「只追加、不回改」规则，`§4.44` 的原文保留不动，凡冲突以本节为准。
+
+**改判理由**：原判「刻意跳过：依赖需批准」把两件事混为一谈 —— 依赖不可控 与 价值不足。真正的约束只是**依赖必须隔离**，而本仓库已有先例：`ml/bnn_forecaster` 自带独立 `uv` 环境，`common/` 与 `backtester/` 通过 `sys.path` 注入复用。LightGBM/GP 完全可按同一形态落地，无需污染 `pipeline/.venv`。
+
+#### 4.45.1 来源文档与既有构件的复用边界
+
+| 文档要求 | 现状 | 处置 |
+| :-- | :-- | :-- |
+| GP 时序算子库 `ts_decay_linear` / `ts_rank` / `ts_argmax` / `ts_argmin` / `ts_corr` / `ts_cov` / `ts_std` / `ts_sum` | 全部已有，`common/alpha101_operators.py:92-164` | **REUSE，禁止重写** |
+| GP 截面算子 `cs_rank` / `cs_demean` / `cs_zscore` / `signed_power` | 全部已有，`alpha101_operators.py:195-245` | **REUSE** |
+| 非线性算子 `sigmoid` / `signed_log` | **缺失** | 补两条纯函数于同一模块，ZERO-AXIS |
+| 适应度函数中的 RankIC 与 ICIR | 已有 `common/factor_analyzer.py:60` `compute_rank_ic`、`:162` `factor_ic_summary` | **REUSE**，只写组合式与惩罚项 |
+| Löwdin 对称正交化 | 已有 `_apply_lowdin_orthogonalization`（`pipeline/research/blend/blend_base.py`，默认开） | 先确认可否被外部模块独立导入；若与 blend 状态耦合过深，在子项目内重写前须单独裁定，**不得**默认复制一份 |
+| MAD 极值缩尾 + 稳健标准化 | **缺失**，与 `§4.43` 的 `E4` 缺口是同一件事 | 新增纯函数，两处共用，避免各写一份 |
+| Purged Group TimeSeries CV + Embargo | **缺失**（全库无 `purged` / `embargo`） | 新增，纯 `pandas`/`numpy`，无第三方依赖 |
+| LightGBM 训练、`lambdarank` | **缺失**，且需新依赖 | 仅落在子项目独立环境，**不装进 `pipeline/.venv`** |
+| 特质残差标签工程 | `common/daily_factors.py:192` `ivol_residual` 只对市场因子单变量残差化 | 文档要求同时剔除行业暴露并除以个股波动率、再扣非流动性惩罚 —— 属**不同口径**，需新函数，不可声称已覆盖 |
+
+#### 4.45.2 三条硬边界（实施前即生效）
+
+1. **环境边界**：`lightgbm` 只允许出现在 `ml/*/pyproject.toml`。若有人试图把它加进 `pipeline/pyproject.toml`，应当被拒绝 —— 那会让 `pipeline/.venv` 与全部既有离线测试同时承担版本风险。
+2. **重复建设边界**：`ML1` 的第 2 条把 12 个算子逐个点名 REUSE。写新算子的唯一合法理由是「该算子不在 `alpha101_operators.py` 中」，并由 diff 证明。
+3. **现网边界**：子项目产出在获批前**不得**进入 `strategies_config.json`、`run_screener.py` 或任何部署配置；进入即属策略行为变更，须走版本轴与 `docs/version.md`。
+
+#### 4.45.3 未验证
+
+- `_apply_lowdin_orthogonalization` 是否能脱离 blend 实例独立导入（它是 `BaseBlendAllocationStrategy` 的方法还是模块函数）—— 未确认，实施前须读该符号的宿主。
+- 来源文档的代码骨架（§六）依赖 `lightgbm` 与可能的 `sklearn` 风格切分工具，未逐行核对其导入项；若骨架引入 `pipeline/.venv` 之外的第二个新依赖，须回到用户批准。
+- `ml/bnn_forecaster` 的 `pyproject.toml` 依赖与测试运行方式未逐行读，子项目脚手架以它为准前须核对。
+
+**计数（2026-11-05，本条为现行权威值）**：新增 `§2.23` 与 `ML1` 一行（`[ ]`），故现役由 **149 = 105 `[x]` + 44 `[ ]`** 变为 **150 = 105 `[x]` + 45 `[ ]`**；两文件合计由 **215 = 171 `[x]` + 44 `[ ]`** 变为 **216 = 171 `[x]` + 45 `[ ]`**；归档 8 张子表仍 **66 项全 `[x]`** 不变。`§2.22` 仍为 **1 项 = 0 `[x]` + 1 `[ ]`**；新增 `§2.23` 为 **1 项 = 0 `[x]` + 1 `[ ]`**。§4.43、§4.44 的计数与判定原文保留不动（`§4.44` 六.3 的失效以 §4.45 为准）。
