@@ -1828,3 +1828,57 @@ uv run pytest common/tests/test_intraday_bar_contract.py common/tests/test_intra
 理由：这三项各自的**结项验收都是针对构件与口径**，成立；但现网行为并未改变。若不登记，后来人会把一屏 `[x]` 读成「实盘已改善」——这正是 §4.41 记录的假进度风险。`W1` 的三个子项**各自独立可验收**，且每一项都需用户先给前置裁定（券商回单格式 / 因子权重标定 / 是否改实盘策略），故 `W1` **不入 §2.17 执行序列**，也不得在前置未定时开工或用「先默认开启」绕过。
 
 **计数（2026-11-05，本条为现行权威值）**：新增 `W1` 一行（`[ ]`），故现役由 **148 = 105 `[x]` + 43 `[ ]`** 变为 **149 = 105 `[x]` + 44 `[ ]`**（总项数 **148 → 149**，`[x]` 不变、`[ ]` **43 → 44**）；两文件合计由 **214 = 171 `[x]` + 43 `[ ]`** 变为 **215 = 171 `[x]` + 44 `[ ]`**；归档 8 张子表仍 **66 项全 `[x]`** 不变。`§2.21` 仍为 **18 项 = 7 `[x]` + 11 `[ ]`**（`LV14`–`LV18` 仅补注、状态位未变）；新增 `§2.22` 为 **1 项 = 0 `[x]` + 1 `[ ]`**。§4.32–§4.41 各计数为各自时点值，按「只追加、不回改」原样保留。
+
+### 4.43 Alpha 研究报告覆盖审计：报告提议 ↔ 现有实现（2026-11-05，零状态变更、不立项）
+
+本节把 [`docs/中短期量化Alpha因子与策略体系研究报告.md`](file:///home/stone/Work/github/quant/docs/中短期量化Alpha因子与策略体系研究报告.md)（242 行：5 个因子族、3 套策略架构、4 条工程准则）逐条对照代码，登记**已覆盖 / 真正缺失 / 刻意跳过**三态。
+
+**本节不改任何 `[x]` / `[ ]`、不新增任务行、不动计数（仍 `149 = 105 [x] + 44 [ ]`）**；第三节的候选只登记为「候选（未立项）」，开工需用户另行裁定。
+
+**结论摘要**：报告的第四节（工程化回测与实盘优化准则：因子标准化与正交化流程、换手成本控制、IC/ICIR 与分层评估）**已全部实现，无需新增任何代码**；「量价微观结构」的核心信号在 WorldQuant Alpha101 因子库中已有等价实现；真正缺失的只有 3 个信号，且都可做成零版本轴的纯函数；另有 2 族因**数据源根本不存在**而刻意跳过。
+
+#### 4.43.1 覆盖矩阵
+
+| 编号 | 报告提议 | 判定 | 证据 |
+| :-- | :-- | :-- | :-- |
+| `F1` | 量价秩相关 `-Corr(Rank(VWAP₅), Rank(Vol₅))` | **已覆盖** | WQ Alpha #48/#53：[`alpha101_factors.py`](file:///home/stone/Work/github/quant/pipeline/research_strategy/rs/alpha101_factors.py) `:481-482`、`:694-695`（`cs_rank(ts_corr(cs_rank(volume), cs_rank(vwap), 5))`），算子见 [`alpha101_operators.py`](file:///home/stone/Work/github/quant/common/alpha101_operators.py) `:121-139` |
+| `F2` | Amihud 非流动性 + `SMA5/SMA20` 冲击比 | **缺失** | 全库无 `|ret| / (volume·close)` 形态 |
+| `F3` | 尾盘成交量占比（14:30–15:00） | **缺失（实盘恒不可用）** | [`intraday_features.py`](file:///home/stone/Work/github/quant/common/intraday_features.py) 有 `Afternoon_Ret_5m`、`UpVol_Ratio_5m`，无尾盘量占比 |
+| `F4` | 特质动量（20 日残差求和） | **刻意跳过：已有等价物** | [`residual_momentum_strategy.py`](file:///home/stone/Work/github/quant/pipeline/research_strategy/rs/residual_momentum_strategy.py) 已直接以特质动量定价；再写 20 日横截面版本属薄副本 |
+| `F5` | 低特质波动（IVOL） | **已覆盖但惰性** | [`daily_factors.py`](file:///home/stone/Work/github/quant/common/daily_factors.py) `:192` `ivol_residual` |
+| `F6` | MAX / 反彩票（top-K 日收益均值） | **缺失** | `ts_max` / `ts_argmax` 是滚动**单点**极值，不是 top-K 均值 |
+| `F7` | 偏态 / 下行半方差 | **已覆盖** | 下行半偏差 → [`indicators.py`](file:///home/stone/Work/github/quant/common/indicators.py) `:115` `downside_realized_vol`；筛选器已消费 `downside_vol_ratio`（[`scoring.py`](file:///home/stone/Work/github/quant/pipeline/instrument_selection/selectorbot/scoring.py) `:269-271`）；[`metrics.py`](file:///home/stone/Work/github/quant/common/metrics.py) 的 skew 是 DSR 输入，**不是**横截面信号 |
+| `F8` | SUE / 分析师预期修正 | **刻意跳过：无数据源** | 项目未接入基本面或分析师数据管道 |
+| `E1` | 因子正交化（Löwdin） | **已覆盖** | `blend_enable_orthogonalization`（`pipeline/research/blend/blend_base.py`，默认 `True`） |
+| `E2` | 换手率成本控制 | **已覆盖** | `MinimumVarianceAllocation.opt_turnover_penalty`（[`allocation_templates.py`](file:///home/stone/Work/github/quant/common/allocation_templates.py) `:1347`） |
+| `E3` | IC / ICIR + 分层单调性 + 半衰期 | **已覆盖** | [`factor_analyzer.py`](file:///home/stone/Work/github/quant/common/factor_analyzer.py) `:60` `compute_rank_ic`、`:162` `factor_ic_summary`、`:239` `compute_quantile_returns`、`:115` `compute_factor_autocorrelation_half_life` |
+| `E4` | 标准化流程 winsorize → z-score → 中性化 | **已覆盖（winsorize 除外）** | `alpha101_operators.py` `:195/:201/:208/:214/:222`（`cs_rank`/`cs_scale`/`cs_demean`/`cs_zscore`/`cs_indneutralize`）、[`sector_metadata.py`](file:///home/stone/Work/github/quant/common/sector_metadata.py) `:193/:282`；**winsorize、分位裁剪与 MAD 稳健 z 是唯一缺口** |
+
+#### 4.43.2 候选（未立项，开工需用户裁定）
+
+| 候选 | 目标位置 | 版本轴 | 重复性核查 | 前置裁定 | 风险备注 |
+| :-- | :-- | :-- | :-- | :-- | :-- |
+| **`A1`** `amihud_illiquidity(close, volume, short=5, long=20)` | `common/daily_factors.py` 新增纯函数 | **ZERO-AXIS** | 无匹配（检索式：`returns.abs()`、`dollar_volume`、`/ (volume`、`* close`） | 须先追加进 `DAILY_FACTOR_RAW_COLUMNS` / `DAILY_FACTOR_WEIGHTS`（`scoring.py:97-109`），并在 `run_screener.py:242` 传 `daily_data` | 单位假设（股数 vs 手）会让数值量级错而形态对，docstring 须声明并由用例钉死绝对值；符号方向（流动性修复 vs 非流动性冲击）**报告内部自相矛盾，不编码**，留给调用方 |
+| **`A2`** `max_return(close, lookback=20, k=2)` | `common/daily_factors.py` 新增纯函数 | **ZERO-AXIS** | 无匹配（`nlargest`、`rolling().max()`、`ts_max`、`ts_argmax` 均为单点极值） | 同 `A1` | 与 `rolling().max()` 混淆会系统性高估彩票暴露；须有「均值 ≠ 最大值」用例反向钉死 |
+| **`A3`** `late_day_volume_share(df_5m, "14:30", "15:00")` | `common/intraday_features.py` **追加一列**（复用该模块既有按日分组与 `bar_count>=45` 全天判定，非新模块） | **ZERO-AXIS** | **部分重复**：已有按 `time` 切片聚合成交量的内部实现，但无该占比 → **REUSE/EXTEND** | 须把 5m 富化接入筛选器，并接受「仅历史可用」 | **实盘取值恒为 `NaN`**：实盘 14:15 截断时 14:30–15:00 的 bar 尚不存在；若用截断日成交量做分母会得到「看起来像信号」的通胀值，必须由 `bar_count>=45` 挡住 |
+
+#### 4.43.3 「已覆盖」≠「已生效」—— 归口 `W1`
+
+`F1`、`F5` 代码齐全，但 `score_universe(..., use_daily_factors=False, daily_data=None)`（`scoring.py:217-226`）默认关，且唯一调用方 `run_screener.py:242-248` 既不传 `daily_data` 也不传 `weights` —— **日频因子在生产路径上从未点火**。这属**接线问题**，归 §2.22 的 `W1b`，**不得用「再写一份同样的因子」绕过**。本会话曾一度准备重复建设，记此以免重犯。
+
+#### 4.43.4 刻意不建（附理由）
+
+1. **日频下行半方差因子** —— `common/indicators.py:115` 已是同一数学（下行半偏差 → 年化波动），正确动作是**改为横截面消费**而非新增函数；`common/intraday_features.py:298` 的 `RS_Down_5m` 是 5 分钟日内分解，属**另一个对象**，不可顶替。
+2. **特质动量** —— 见 `F4`。
+3. **因子评估全套**（IC/ICIR/分层/半衰期）—— 见 `E3`，已实现且有测试。
+4. **横截面标准化** —— 见 `E4`；只差 winsorize，而 winsorize 目前**没有任何消费方**，按「先有需求再加」处理，不预先铺代码。
+5. **SUE / 分析师预期修正** —— 见 `F8`。
+
+#### 4.43.5 未验证
+
+- `common/intraday_synthetic.py` 的生成器 API 未读，`A3` 的测试数据来源须在实施前确认。
+- 报告所称「`R3` 日内面板」未确认为独立产物：只确认了 `data/intraday_5m` parquet、DuckDB `intraday_5m` 表与 `common/intraday_features.py` 三处。
+- `gtja191_factors.py` / `alpha101_factors.py` 是否以隐晦别名藏有 Amihud 或 top-K 均值：只做了**数学形态**检索，未逐条读全部公式名字符串。若实施 `A1`/`A2`，开工前须补一次逐条通读。
+- `blend_base.py` 的行号因并发编辑可能漂移，本节引用该文件**只给函数名与标志名，不给行号**。
+
+本节为**审计记录，不是任务清单**；开工须由用户另行裁定，并在 §2.x 新增任务行。
