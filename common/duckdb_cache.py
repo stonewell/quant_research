@@ -564,6 +564,61 @@ class HistoryRewriteRefused(RuntimeError):
     """
 
 
+class NullVolumeRefused(RuntimeError):
+    """store_bars refused a row whose `Volume` CELL is null/NaN -- it never wrote `0.0` instead.
+
+    Frozen contract: `docs/data_gap_visibility_schema.md` §4.1-§4.3 (`data_gap/v1`). The payload
+    below is that section's field list, field for field; do not drop or rename one.
+
+    Why this is not a `Constraint Error` (the pre-LV5 behaviour): `ohlcv_bars.volume` is
+    `DOUBLE NOT NULL`, so a null volume used to reach `INSERT OR REPLACE`, raise DuckDB's
+    constraint error inside the transaction and roll the whole batch back. That exception carries
+    no symbol, no provider and no date, so the only thing a caller could do with it was print a
+    string (`scripts/check_live_portfolio_health.py:928` printed one generic WARN for 22 symbols).
+    This type is that error made nameable and attributable.
+
+    Scope (frozen §4.3, "per-row refuse, never per-batch die"): only the offending ROWS are
+    removed and reported; the rest of the batch is written normally, and this exception is raised
+    AFTER that write commits. A caller isolating per symbol
+    (`scripts/sync_china_5m_and_indices.py::patch_equity_daily_bars`) therefore continues with the
+    next symbol instead of losing the remaining tail of the run.
+
+    `value_repr` is `"nan"` when every refused cell is a float NaN and `"null"` otherwise (a
+    `None`/`pd.NA` cell) -- the literal representations frozen by §4.1.
+    """
+
+    def __init__(
+        self,
+        *,
+        symbol: str,
+        provider: str,
+        interval: str,
+        dates,
+        value_repr: str = "null",
+    ):
+        normalized = sorted(
+            {d.date() if hasattr(d, "date") else d for d in dates}
+        )
+        if not normalized:
+            raise ValueError("NullVolumeRefused requires at least one refused date")
+        self.symbol = symbol
+        self.provider = provider
+        self.interval = interval
+        self.dates = list(normalized)
+        self.n_rows = len(self.dates)
+        self.first_date = self.dates[0]
+        self.last_date = self.dates[-1]
+        self.value_repr = value_repr
+        super().__init__(
+            f"store_bars refused {self.n_rows} row(s) with a null volume "
+            f"({self.value_repr}) for {provider}/{symbol} interval={interval} over "
+            f"{self.first_date}..{self.last_date}"
+            + ("" if self.n_rows == 1 else f" ({self.n_rows} dates: {self.dates})")
+            + "; 0.0 was NOT substituted -- a null volume means 'not collected', not 'no trades'"
+            " (docs/data_gap_visibility_schema.md §2.4). Those dates are NOT stored."
+        )
+
+
 def _truthy_env(name: str) -> bool:
     return str(os.environ.get(name, "")).strip().lower() in _TRUE_ENV_VALUES
 
@@ -2093,6 +2148,14 @@ class DuckDBCache:
         incident) -- and a missing or contradicting metadata row is rebuilt/corrected from the
         bars instead of being taken at face value (L2.18), with a WARNING per repair.
 
+        NULL-VOLUME CONTRACT (LV5, `docs/data_gap_visibility_schema.md`): `Volume` is defaulted to
+        `0.0` **only when the `Volume` COLUMN IS ABSENT from `df`**. A present-but-null/NaN volume
+        CELL is a different fact and is **refused** -- those rows are dropped from this write and
+        the call raises `NullVolumeRefused` (symbol/provider/interval/every refused date/row
+        count/first+last date/value repr) AFTER the batch's remaining legal rows commit. It is
+        never coerced to `0.0`: `0.0` asserts "no trades that day", the source asserted nothing.
+        An explicitly stored `0.0` (a real no-trade session) is accepted unchanged.
+
         HISTORY-REWRITE INVARIANT (L2.32): an incoming row whose `(provider, symbol, date)` is
         already stored may only replace the stored row when its OHLCV agrees with the stored
         values within `_HISTORY_REWRITE_RTOL` (rtol 1e-9, absolute floor 0.0). Any materially
@@ -2177,7 +2240,12 @@ class DuckDBCache:
             store="store_bars",
         )
 
-        # Ensure required price columns; default Volume to 0.0 if omitted
+        # Ensure required price columns. `Volume` falls back to 0.0 ONLY when the COLUMN IS
+        # ABSENT from the input frame -- that is a declared convention ("this caller's frame has
+        # no volume axis"), not a repair of a bad cell. A present-but-null cell is a different
+        # fact ("the source returned a row without the value") and is REFUSED by name below,
+        # never coerced to 0.0: once stored, `0.0` and "really zero" are byte-identical
+        # (`docs/data_gap_visibility_schema.md` §2.4).
         for col in ["Open", "High", "Low", "Close"]:
             if col not in df.columns:
                 raise ValueError(f"DataFrame missing required OHLCV column '{col}'")
@@ -2192,6 +2260,49 @@ class DuckDBCache:
             df_to_store["Amount"] = pd.to_numeric(df["amount"], errors="coerce")
         else:
             df_to_store["Amount"] = None
+
+        # ------------------------------------------------------------------------------
+        # NULL-VOLUME GUARD (LV5; frozen contract `docs/data_gap_visibility_schema.md`
+        # §4.1-§4.3).
+        #
+        # BEFORE `frame_min_date`/`frame_max_date` and before the `asset_sync_metadata` upsert on
+        # purpose: those are the "this date is covered" bookkeeping, and a refused day must never
+        # be recorded there. The history-rewrite gate further down compares only dates present in
+        # `temp_bars_to_insert`, so the refusal cannot leak into it either.
+        #
+        # `pd.isna` at the PANDAS boundary, not a SQL `IS NULL`: `register` maps pandas NaN to SQL
+        # NULL, so a SQL-side check could not tell "NaN" from "NULL" and the contract would be
+        # decided by the storage layer instead of stated once, here.
+        #
+        # SCOPE = PER ROW (frozen §4.3). The offending rows are removed and reported; the rest of
+        # the batch is written normally. A whole-batch refusal would make "one bad row" and "the
+        # whole batch is bad" indistinguishable to the caller, which is exactly the collapse this
+        # contract exists to prevent. The refusal is raised AFTER the legal rows commit.
+        # ------------------------------------------------------------------------------
+        null_volume_refusal: Optional[NullVolumeRefused] = None
+        if "Volume" in df.columns:
+            null_volume_mask = pd.isna(df_to_store["Volume"]).to_numpy(dtype=bool)
+            if null_volume_mask.any():
+                refused_index = df_to_store.index[null_volume_mask]
+                refused_values = df_to_store["Volume"].to_numpy(dtype=object)[null_volume_mask]
+                # §4.1: the literal repr of the offending cells -- "nan" only when EVERY one of
+                # them is a float NaN, "null" otherwise (None / pd.NA / NaT-like).
+                all_float_nan = all(
+                    isinstance(v, float) and v != v for v in refused_values
+                )
+                null_volume_refusal = NullVolumeRefused(
+                    symbol=symbol,
+                    provider=provider,
+                    interval=interval,
+                    dates=[ts.date() for ts in refused_index],
+                    value_repr="nan" if all_float_nan else "null",
+                )
+                df_to_store = df_to_store.loc[~null_volume_mask]
+                if df_to_store.empty:
+                    # Frozen §4.3: an empty post-removal batch must not INSERT, and there is no
+                    # metadata to reconcile -- so nothing at all is written or recorded.
+                    raise null_volume_refusal
+
         frame_min_date = df_to_store.index.min().date()
         frame_max_date = df_to_store.index.max().date()
 
@@ -2518,6 +2629,14 @@ class DuckDBCache:
         finally:
             if not self.is_memory:
                 con.close()
+
+        # Frozen §4.3 scope: the legal rows of this batch were just COMMITTED, so the refusal is
+        # raised AFTER the transaction rather than inside it. Raising earlier would roll the good
+        # rows back and turn "one null-volume row" into "nothing stored for this symbol", which is
+        # the batch-wide collapse §4.3 forbids. The payload names every refused date so the
+        # caller can attribute the loss to exactly those sessions.
+        if null_volume_refusal is not None:
+            raise null_volume_refusal
 
     def store_adjust_factors(
         self,

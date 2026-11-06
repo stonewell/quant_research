@@ -50,7 +50,12 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from common.duckdb_cache import DuckDBCache, is_intraday_interval, is_factor_neutral_symbol
+from common.duckdb_cache import (
+    DuckDBCache,
+    NullVolumeRefused,
+    is_intraday_interval,
+    is_factor_neutral_symbol,
+)
 from common.financial_api import (
     BaoStockDataProvider,
     EastMoneyDataProvider,
@@ -1003,6 +1008,13 @@ def patch_equity_daily_bars(
     refusals = RefusalCollector("PART A.2 (equity daily patch)")
     #: symbol -> "Provider: TypeName: message" for symbols whose fetches ALL raised.
     fetch_errors: Dict[str, str] = {}
+    #: `NullVolumeRefused` collected per (symbol, write namespace). LV5: a null volume used to
+    #: surface as a bare DuckDB `Constraint Error` raised from the `store_bars` call below, which
+    #: sits OUTSIDE every per-symbol `try` -- so ONE bad row aborted this whole `for sym` loop,
+    #: leaving the remaining symbols never attempted and skipping `refusals.raise_if_any()` /
+    #: `return fetch_errors`. Nothing here is re-raised into that shape: each refusal is
+    #: attributed to its symbol/provider and the loop moves on (schema doc §4.3/§6).
+    null_volume_refusals: List[NullVolumeRefused] = []
     #: `(symbol, provider, exception)` already warned about. The provider loop below runs
     #: the same fetch twice (once per write namespace), so without this each failing symbol
     #: would log its warning twice and look like two independent failures.
@@ -1131,22 +1143,48 @@ def patch_equity_daily_bars(
                 # (first-ever sync, no stored bars) may pass the real request start. The
                 # metadata boundaries themselves remain the bar facts -- `store_bars`
                 # cross-checks `ohlcv_bars`' MIN/MAX and never the window.
-                cache.store_bars(
-                    provider=prov,
-                    symbol=sym,
-                    df=plan.df,
-                    requested_start=plan.requested_start(patch_start),
-                    requested_end=end,
-                    interval="1d",
-                    # F7: the frame came from `fetch_raw_ohlcv` above, so declare it. Leaving
-                    # this off is what produced unidentifiable-basis rows in the first place.
-                    adjustflag="raw",
-                )
+                # LV5 per-symbol isolation: `NullVolumeRefused` only. A null-volume row means this
+                # symbol's fetched window contains a cell the source never filled; the rest of the
+                # window WAS written (the cache refuses per row, not per batch), so the loop must
+                # continue to the next symbol instead of losing the whole tail of the run. Any
+                # OTHER exception type still propagates -- widening this to `except Exception`
+                # would convert unknown failures into silent per-symbol skips, a separate change.
+                try:
+                    cache.store_bars(
+                        provider=prov,
+                        symbol=sym,
+                        df=plan.df,
+                        requested_start=plan.requested_start(patch_start),
+                        requested_end=end,
+                        interval="1d",
+                        # F7: the frame came from `fetch_raw_ohlcv` above, so declare it. Leaving
+                        # this off is what produced unidentifiable-basis rows in the first place.
+                        adjustflag="raw",
+                    )
+                except NullVolumeRefused as exc:
+                    null_volume_refusals.append(exc)
+                    print(
+                        f"REFUSED (null volume) {exc.symbol} [{exc.provider}] "
+                        f"{exc.n_rows} row(s) {exc.first_date}..{exc.last_date} "
+                        f"value={exc.value_repr} (not stored, 0.0 not substituted)"
+                    )
+                    continue
                 _report_cross_check(cache, prov, sym, interval="1d")
                 print(f"PATCHED +{len(plan.df)} bars (max: {plan.df.index.max().strftime('%Y-%m-%d')})")
     finally:
         bs_prov.logout()
 
+    if null_volume_refusals:
+        # Reported AFTER the loop so the batch's other report machinery (`refusals`,
+        # `fetch_errors`) still runs: an isolated refusal may not skip it. Deliberately not fed
+        # into `refusals` (whose `raise_if_any` would abort the report) and deliberately not
+        # re-raised -- the Stage-1 caller's batch-level `except` would degrade it back into the
+        # single generic WARN this isolation exists to replace.
+        print(
+            f"[NULL-VOLUME] {len(null_volume_refusals)} write(s) refused a null volume "
+            f"(symbols: {', '.join(sorted({e.symbol for e in null_volume_refusals}))}); "
+            "those dates are NOT in the cache."
+        )
     refusals.raise_if_any()
     return fetch_errors
 
