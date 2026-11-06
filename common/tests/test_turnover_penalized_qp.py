@@ -207,10 +207,10 @@ def test_cash_allowance_is_respected():
     assert np.all(sums < 1.0 - 1e-3)
 
 
-def test_cap_infeasibility_degrades_without_raising():
+def test_cap_infeasibility_holds_cap_and_parks_residual_in_cash():
     """`cap=0.20` with `n=4` cannot fund a fully invested book
-    (`n*cap = 0.8 < 1`). Documented degrade: relax the cap to `max(cap, 1/n)`,
-    warn, and never raise."""
+    (`n*cap = 0.8 < 1`). The cap is a HARD risk limit, so it is NOT relaxed:
+    total exposure becomes `n*cap = 0.8` and the `0.2` residual is CASH."""
     tpl = MinimumVarianceAllocation()
     params = {
         "cov_lookback": 60,
@@ -220,16 +220,45 @@ def test_cap_infeasibility_degrades_without_raising():
         "opt_sector_dev": 0.03,
         "opt_prune": 0.0,
     }
-    with pytest.warns(RuntimeWarning, match="infeasible"):
+    with pytest.warns(RuntimeWarning, match="constrained by the position cap"):
         rows = _rebalance_rows(tpl.generate_weights(_four_asset_universe(), params))
 
     assert len(rows) >= 2
     arr = rows.to_numpy()
-    np.testing.assert_allclose(arr.sum(axis=1), 1.0, rtol=0.0, atol=1e-6)
-    assert np.nanmax(arr) <= max(0.20, 0.25) + 1e-6
+    # Budget constrained by the cap -> 0.8 invested, 0.2 cash.
+    np.testing.assert_allclose(arr.sum(axis=1), 0.80, rtol=0.0, atol=1e-6)
+    # The cap is NEVER breached (the opposite of a relaxation).
+    assert np.nanmax(arr) <= 0.20 + 1e-9
     note = tpl.explain_weights(params)
-    assert "documented degrade" in note
-    assert "25.00%" in note
+    assert "budget constrained by the position cap" in note
+    assert "never relaxed" in note
+    # ... and it is NOT reported as a cap relaxation.
+    assert "documented degrade" not in note
+    assert "relaxed to" not in note
+
+
+def test_feasible_cap_still_fully_invested_and_no_budget_note():
+    """`n=10, cap=0.20` can fund a full book (`n*cap = 2.0 >= 1`), so the normal
+    path is untouched: `sum(w) == 1` and NO budget-constrained note."""
+    tpl = MinimumVarianceAllocation()
+    universe = {
+        s: make_ar1_ohlcv(phi=0.3, n=300, seed=100 + i, scale=0.02 + 0.004 * i)
+        for i, s in enumerate([f"S{i:02d}" for i in range(10)])
+    }
+    params = {
+        **BASE_PARAMS,
+        "opt_turnover_penalty": 1e-8,
+        "opt_single_cap": 0.20,
+        "opt_sector_dev": 0.03,
+        "opt_prune": 0.0,
+    }
+    rows = _rebalance_rows(tpl.generate_weights(universe, params))
+    assert len(rows) >= 2
+    arr = rows.to_numpy()
+    np.testing.assert_allclose(arr.sum(axis=1), 1.0, rtol=0.0, atol=1e-6)
+    assert np.nanmax(arr) <= 0.20 + 1e-9
+    note = tpl.explain_weights(params)
+    assert "budget constrained by the position cap" not in note
 
 
 # ---------------------------------------------------------------------------
@@ -523,10 +552,11 @@ def test_single_symbol_universe_unchanged():
             universe, {**base, "opt_turnover_penalty": 1e-3, "opt_single_cap": 0.6}
         )
     )
-    # The cap 0.6 is infeasible for n=1 under the fully invested budget
-    # (1*0.6 < 1), so the documented degrade relaxes it to 1.0: a single-asset
-    # book is 100% that asset, no cash residual.
-    assert np.allclose(penalized["AAA"].to_numpy(), 1.0)
+    # The cap 0.6 is a HARD limit for n=1 (1*0.6 < 1): the budget gives way,
+    # NOT the cap. So the book is 60% AAA and 40% cash -- never 100% AAA.
+    assert np.allclose(penalized["AAA"].to_numpy(), 0.6, atol=1e-6)
+    assert np.all(penalized["AAA"].to_numpy() <= 0.6 + 1e-9)
+    assert np.allclose(penalized.sum(axis=1).to_numpy(), 0.6, atol=1e-6)
 
 
 def test_all_nan_window_returns_empty_frames_without_raising():

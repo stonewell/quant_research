@@ -245,9 +245,14 @@ def _turnover_penalized_weights(
     unsolved half of Markowitz 1952):
 
         min_w  w' S w  +  gamma * sum_i sqrt((w_i - w0_i)^2 + 1e-6)
-        s.t.   0 <= w_i <= effective_cap
-               1 - cash_allowance <= sum_i w_i <= 1     (residual is CASH)
+        s.t.   0 <= w_i <= single_cap
+               lower_budget <= sum_i w_i <= upper_budget     (residual is CASH)
                |sum_{i in g} w_i - sum_{i in g} w0_i| <= sector_dev   for each group g
+
+    where
+
+        upper_budget = min(1.0, n * single_cap)
+        lower_budget = min(1.0 - cash_allowance, upper_budget)   # never above upper
 
     BUDGET CORRECTION (deliberate and reasoned -- NOT an approximation). An
     earlier revision constrained only `sum(w) <= 1`, leaving a free cash
@@ -265,11 +270,24 @@ def _turnover_penalized_weights(
     `cash_allowance = 0.0` the book is fully invested, and a positive
     allowance merely permits (it never forces) a cash residual.
 
-    CAP FEASIBILITY (documented degrade, never raises): the fully invested
-    budget requires `n * single_cap >= 1`, e.g. `cap=0.20` with `n=4` is
-    infeasible. The cap is relaxed to `effective_cap = max(single_cap, 1/n)`,
-    the smallest relaxation that restores feasibility, with a `RuntimeWarning`
-    and an `explain_weights` note.
+    CAP FEASIBILITY (the cap is a HARD risk limit; cash absorbs any
+    shortfall, never raises): a fully invested book requires
+    `n * single_cap >= 1`, e.g. `cap=0.20` with `n=4` cannot fund a 100%
+    book. The budget -- not the cap -- is what gives way:
+
+        upper_budget = min(1.0, n * single_cap)
+        lower_budget = min(1.0 - cash_allowance, upper_budget)   # never above upper
+
+    so `n * cap >= 1` reproduces the previous behaviour exactly
+    (`[1 - allowance, 1]`), while `n * cap < 1` solves for
+    `sum(w) == n * cap` and holds the residual `1 - n * cap` in CASH.
+    THE CAP IS NEVER RAISED. A per-position cap is a RISK LIMIT while cash is
+    always a feasible alternative, so relaxing the cap to reach full
+    investment would invert the safety ordering -- exactly the "silently
+    degraded constraint" (静默失效) failure family this repo documents. Callers
+    get a `RuntimeWarning` and an `explain_weights` note phrased as *budget
+    constrained by the position cap => cash residual*, never as a cap
+    relaxation.
 
     The L1 turnover term is smoothed as `sqrt(d^2 + 1e-6)` (a standard
     pseudo-Huber smoothing of |d|) so the objective stays differentiable for
@@ -303,8 +321,8 @@ def _turnover_penalized_weights(
       4. `_min_variance_weights(cov)` (the legacy path), then cap/renormalize;
       5. equal weight 1/n clipped to the cap.
 
-    Returns a vector of length `len(w0)` with `0 <= w <= effective_cap` and
-    `1 - cash_allowance - 1e-6 <= sum(w) <= 1 + 1e-12`.
+    Returns a vector of length `len(w0)` with `0 <= w <= single_cap` and
+    `lower_budget - 1e-6 <= sum(w) <= upper_budget + 1e-12`.
     """
     import warnings
 
@@ -332,27 +350,27 @@ def _turnover_penalized_weights(
 
     allowance = float(cash_allowance) if cash_allowance is not None else 0.0
     allowance = float(np.clip(allowance if np.isfinite(allowance) else 0.0, 0.0, 1.0))
-    lower_budget = 1.0 - allowance
 
-    # --- Cap feasibility under the fully invested budget (documented degrade,
-    # never raises): requiring `sum(w) >= 1 - cash_allowance` needs
-    # `n * cap >= lower_budget`. If the cap is too tight for that, relax it to
-    # exactly `lower_budget / n` -- the smallest relaxation that restores
-    # feasibility -- and warn instead of raising or silently leaving the
-    # budget unmet. See the docstring for why freezing the cap here would be
-    # wrong (an unmet budget is the very defect this box constraint fixes).
-    effective_cap = cap
-    if n > 0 and effective_cap * n < lower_budget - 1e-12:
-        effective_cap = lower_budget / n
+    # --- Budget bounds. The position cap is a HARD risk limit, so it is never
+    # relaxed: instead the total-exposure budget is capped at what the cap can
+    # actually fund, and CASH absorbs the shortfall. `n * cap >= 1` leaves this
+    # identical to the previous `[1 - allowance, 1]` box (within 1e-12 of 1 we
+    # snap to a full book so the feasible case keeps the exact same program).
+    raw_total_cap = float(n * cap) if n > 0 else 0.0
+    upper_budget = 1.0 if raw_total_cap >= 1.0 - 1e-12 else raw_total_cap
+    # Never above `upper_budget`: a lower bound above the achievable total
+    # would make the program infeasible (the very defect the box fixes).
+    lower_budget = float(min(1.0 - allowance, upper_budget))
+
+    if n > 0 and raw_total_cap < 1.0 - 1e-12:
         warnings.warn(
-            f"single_cap={cap:.4f} is infeasible for n={n} assets with a "
-            f"minimum total exposure of {lower_budget:.4f} "
-            f"(n * cap = {cap * n:.4f} < {lower_budget:.4f}); relaxing the "
-            f"effective cap to {effective_cap:.4f} (documented degrade)",
+            f"single_cap={cap:.4f} x n={n} assets caps total exposure at "
+            f"{upper_budget:.4f} < 1; the budget is constrained by the position "
+            f"cap and the residual {1.0 - upper_budget:.4f} is held in cash "
+            f"(the cap is a risk limit and is NOT relaxed)",
             RuntimeWarning,
             stacklevel=3,
         )
-    cap = effective_cap
 
     groups: List[np.ndarray] = []
     if sector_groups:
@@ -383,7 +401,7 @@ def _turnover_penalized_weights(
     def _budget_ok(w) -> bool:
         """The feasible box on total exposure, up to solver tolerance."""
         total = float(np.sum(np.asarray(w, dtype=float).reshape(-1)))
-        return (total >= lower_budget - 1e-6) and (total <= 1.0 + 1e-6)
+        return (total >= lower_budget - 1e-6) and (total <= upper_budget + 1e-6)
 
     def _finalize(w) -> np.ndarray:
         """Project any solver output onto the feasible long-only box + budget
@@ -394,8 +412,8 @@ def _turnover_penalized_weights(
             return _equal_weight_rung()
         arr = np.clip(arr, 0.0, cap)
         total = float(arr.sum())
-        if total > 1.0:
-            arr = arr / total
+        if total > upper_budget:
+            arr = arr * (upper_budget / total)
         # Clipping can pull exposure BELOW the lower budget bound (e.g. the
         # legacy min-variance vector clipped at a binding cap). Spread the
         # shortfall over the symbols that still have cap headroom rather than
@@ -410,6 +428,9 @@ def _turnover_penalized_weights(
         return arr
 
     def _equal_weight_rung() -> np.ndarray:
+        # `min(1/n, cap)` per slot sums to `min(1, n*cap) == upper_budget`, i.e.
+        # this rung is budget-feasible by construction in both regimes (fully
+        # invested, or cap-constrained with the residual in cash).
         base = min(1.0 / n, cap) if n > 0 else 0.0
         return np.full(n, base, dtype=float)
 
@@ -421,15 +442,16 @@ def _turnover_penalized_weights(
         return float(w @ cov @ w) + gamma * _smooth_l1(w)
 
     def _build_constraints(with_sector: bool) -> list:
-        # Total-exposure BOX: `lower_budget <= sum(w) <= 1`. With the default
-        # allowance of 0 the box degenerates into an equality, which SLSQP
-        # handles far more accurately as such -- it is the same constraint set,
-        # just written in the numerically better-behaved form.
-        if lower_budget >= 1.0 - 1e-12:
-            cons = [{"type": "eq", "fun": lambda w: float(np.sum(w)) - 1.0}]
+        # Total-exposure BOX: `lower_budget <= sum(w) <= upper_budget`. With no
+        # cash allowance and a cap that can fund a full book the box
+        # degenerates into an equality (`sum(w) == 1`), which SLSQP handles far
+        # more accurately as such -- it is the same constraint set, just
+        # written in the numerically better-behaved form.
+        if lower_budget >= upper_budget - 1e-12:
+            cons = [{"type": "eq", "fun": lambda w: float(np.sum(w)) - upper_budget}]
         else:
             cons = [
-                {"type": "ineq", "fun": lambda w: 1.0 - float(np.sum(w))},
+                {"type": "ineq", "fun": lambda w: upper_budget - float(np.sum(w))},
                 {"type": "ineq", "fun": lambda w: float(np.sum(w)) - lower_budget},
             ]
         if with_sector:
@@ -448,8 +470,8 @@ def _turnover_penalized_weights(
     # Start point: the previous target, capped; a from-cash start (all-zero w0)
     # has no sensible direction, so equal weight is the neutral warm start.
     x0 = np.clip(w0, 0.0, cap)
-    if x0.sum() > 1.0:
-        x0 = x0 / x0.sum()
+    if x0.sum() > upper_budget:
+        x0 = x0 * (upper_budget / x0.sum())
     if x0.sum() <= 1e-12:
         x0 = _equal_weight_rung()
 
@@ -471,10 +493,10 @@ def _turnover_penalized_weights(
         for i in range(n):
             cons.append({"type": "ineq", "fun": lambda z, i=i: z[n + i] - (z[i] - w0[i])})
             cons.append({"type": "ineq", "fun": lambda z, i=i: z[n + i] - (w0[i] - z[i])})
-        if lower_budget >= 1.0 - 1e-12:
-            cons.append({"type": "eq", "fun": lambda z: float(np.sum(z[:n])) - 1.0})
+        if lower_budget >= upper_budget - 1e-12:
+            cons.append({"type": "eq", "fun": lambda z: float(np.sum(z[:n])) - upper_budget})
         else:
-            cons.append({"type": "ineq", "fun": lambda z: 1.0 - float(np.sum(z[:n]))})
+            cons.append({"type": "ineq", "fun": lambda z: upper_budget - float(np.sum(z[:n]))})
             cons.append({"type": "ineq", "fun": lambda z: float(np.sum(z[:n])) - lower_budget})
         if with_sector:
             for idx in groups:
@@ -1393,11 +1415,20 @@ class MinimumVarianceAllocation(AllocationTemplate):
         cap, a total-exposure box, an optional per-sector turnover budget, and
         a prune dead-zone.
 
-        BUDGET: `1 - opt_cash_allowance <= sum(w) <= 1` (default fully
-        invested). The lower bound is what makes the turnover penalty
-        scale-consistent -- with free cash slack the variance term drives total
-        exposure to zero and the solve becomes independent of `w0`; see
-        `_turnover_penalized_weights`'s docstring for the `nu = 0` derivation.
+        BUDGET: `lower_budget <= sum(w) <= upper_budget` with
+
+            upper_budget = min(1, n * opt_single_cap)
+            lower_budget = min(1 - opt_cash_allowance, upper_budget)   # never above upper
+
+        i.e. fully invested (`sum(w) == 1`) by default whenever the cap can
+        fund it (`n * cap >= 1`). The lower bound is what makes the turnover
+        penalty scale-consistent -- with free cash slack the variance term
+        drives total exposure to zero and the solve becomes independent of
+        `w0`; see `_turnover_penalized_weights`'s docstring for the `nu = 0`
+        derivation. When the cap makes full investment infeasible
+        (`n * cap < 1`) **cash absorbs the shortfall and the cap is never
+        breached**: a cap is a hard risk limit, while cash is always a
+        feasible alternative -- so the budget gives way, not the cap.
 
         WHERE `w0` COMES FROM (the one design point a reader will question):
         `generate_weights(universe, params)` is STATELESS -- it recomputes the
@@ -1420,8 +1451,8 @@ class MinimumVarianceAllocation(AllocationTemplate):
         if not symbols:
             return pd.DataFrame()
 
-        # Reset the per-call cap-degrade note consumed by `explain_weights`.
-        self._cap_degrade_note = ""
+        # Reset the per-call budget-constraint note consumed by `explain_weights`.
+        self._budget_constrained_note = ""
 
         master_index = _get_master_index(universe)
         if len(master_index) == 0:
@@ -1434,11 +1465,13 @@ class MinimumVarianceAllocation(AllocationTemplate):
                 returns_df[sym] = df["Close"].pct_change().reindex(master_index)
 
         single_cap = float(params.get("opt_single_cap", getattr(self, "opt_single_cap", 0.20)))
+        single_cap = float(
+            np.clip(single_cap if np.isfinite(single_cap) else 1.0, 0.0, 1.0)
+        )
         cash_allowance = float(
             params.get("opt_cash_allowance", getattr(self, "opt_cash_allowance", 0.0))
         )
         cash_allowance = float(np.clip(cash_allowance if np.isfinite(cash_allowance) else 0.0, 0.0, 1.0))
-        cash_lower = 1.0 - cash_allowance
         sector_dev = float(params.get("opt_sector_dev", getattr(self, "opt_sector_dev", 0.03)))
         prune = float(params.get("opt_prune", getattr(self, "opt_prune", 0.005)))
         sector_map = params.get("opt_sector_map", getattr(self, "opt_sector_map", None)) or {}
@@ -1461,11 +1494,13 @@ class MinimumVarianceAllocation(AllocationTemplate):
             if not valid_symbols:
                 continue
 
-            if single_cap is not None and len(valid_symbols) * float(single_cap) < cash_lower - 1e-12:
-                self._cap_degrade_note = (
-                    f"single cap {float(single_cap):.2%} is infeasible for {len(valid_symbols)} "
-                    f"assets with a minimum total exposure of {cash_lower:.2%}; effective cap "
-                    f"relaxed to {cash_lower / len(valid_symbols):.2%} (documented degrade)"
+            if single_cap is not None and len(valid_symbols) * single_cap < 1.0 - 1e-12:
+                self._budget_constrained_note = (
+                    f"budget constrained by the position cap: {single_cap:.2%} x "
+                    f"{len(valid_symbols)} assets funds at most "
+                    f"{len(valid_symbols) * single_cap:.2%} of the book, so the "
+                    f"residual {1.0 - len(valid_symbols) * single_cap:.2%} is held "
+                    f"in cash (the cap is a risk limit and is never relaxed)"
                 )
 
             cov = sub_ret[valid_symbols].cov().to_numpy()
@@ -1481,10 +1516,11 @@ class MinimumVarianceAllocation(AllocationTemplate):
             # From a cash start there is no PRIOR sector exposure to deviate
             # from, so the budget reads `|sum_g w - 0| <= dev`, i.e. it caps
             # TOTAL investment at `n_groups * dev` -- which contradicts the
-            # fully invested budget below (`1 - cash_allowance <= sum(w)`) for
-            # any realistic `dev`. Drop the (vacuous, jointly infeasible)
-            # sector constraints on that one solve rather than spending two
-            # failed rungs discovering the same infeasibility.
+            # fully invested budget below (`lower_budget <= sum(w)`,
+            # `1 - cash_allowance` when the cap can fund it) for any realistic
+            # `dev`. Drop the (vacuous, jointly infeasible) sector constraints
+            # on that one solve rather than spending two failed rungs
+            # discovering the same infeasibility.
             if not np.any(w0 > 0.0):
                 groups = None
 
@@ -1493,12 +1529,16 @@ class MinimumVarianceAllocation(AllocationTemplate):
             # only `sum(w) <= 1` the L1 term degenerated into a proportional
             # entry cost and the all-cash portfolio won. That workaround is
             # gone -- and removed as PROVABLY unnecessary: the budget is now
-            # the box `1 - cash_allowance <= sum(w) <= 1`, so for `w0 == 0`
-            # and `cash_allowance == 0` we have `||w - w0||_1 = sum(w) = 1`,
+            # closed from below (`lower_budget <= sum(w)`), so whenever the cap
+            # can fund a full book (`n * cap >= 1`) and `cash_allowance == 0`
+            # we have `sum(w) == 1` and therefore `||w - w0||_1 = sum(w) = 1`,
             # a CONSTANT over the whole feasible set. A constant addend cannot
             # change the argmin, so the first rebalance reduces to the plain
             # minimum-variance portfolio automatically (pinned by
-            # `test_first_rebalance_equals_min_variance_under_penalty`).
+            # `test_first_rebalance_equals_min_variance_under_penalty`). In the
+            # cap-constrained case the same argument holds with `sum(w) = n*cap`
+            # in place of 1: the penalty term is still constant, so the solve
+            # is min-variance over the reduced budget, with cash taking the rest.
             w = _turnover_penalized_weights(
                 cov, w0, turnover_penalty, single_cap, groups, sector_dev, cash_allowance
             )
@@ -1509,27 +1549,29 @@ class MinimumVarianceAllocation(AllocationTemplate):
                 snapped = np.abs(w - w0) < prune
                 w = np.where(snapped, w0, w)
                 w = np.clip(w, 0.0, None)
-                eff_cap = (
-                    max(float(single_cap), cash_lower / len(valid_symbols))
-                    if single_cap is not None else 1.0
-                )
-                # Clip to the EFFECTIVE cap: the raw `opt_single_cap` may be
-                # infeasible under the exposure floor (see the degrade note).
-                w = np.minimum(w, eff_cap)
+                # The cap is used VERBATIM here -- it is a hard risk limit and
+                # is never raised. What the cap implies is a ceiling on total
+                # exposure (`n * cap`), so the budget box below is the capped
+                # one; any resulting shortfall is held in cash.
+                n_valid = len(valid_symbols)
+                raw_total_cap = float(n_valid * single_cap)
+                upper_budget = 1.0 if raw_total_cap >= 1.0 - 1e-12 else raw_total_cap
+                lower_budget = float(min(1.0 - cash_allowance, upper_budget))
+                w = np.minimum(w, single_cap)
                 # Restore the total-exposure box WITHOUT touching the snapped
                 # entries (their exact equality with the prior target is the
                 # whole point of the dead-zone), otherwise the budget refill
                 # would quietly undo every prune. Also keeps pruning from
                 # re-introducing exposure decay through the back door.
                 free = ~snapped
-                surplus = float(w.sum()) - 1.0
-                deficit = cash_lower - float(w.sum())
+                surplus = float(w.sum()) - upper_budget
+                deficit = lower_budget - float(w.sum())
                 if surplus > 1e-12 and free.any():
                     free_sum = float(w[free].sum())
                     if free_sum > 0.0:
                         w[free] = w[free] * max(0.0, (free_sum - surplus) / free_sum)
                 elif deficit > 1e-12 and free.any():
-                    headroom = eff_cap - w[free]
+                    headroom = single_cap - w[free]
                     room = float(headroom.sum())
                     if room > 0.0:
                         w[free] = w[free] + headroom * min(1.0, deficit / room)
@@ -1566,14 +1608,14 @@ class MinimumVarianceAllocation(AllocationTemplate):
             base += (
                 f" Turnover-penalized mode: objective adds {penalty:g} * L1(w - w_prev) "
                 f"(Garleanu & Pedersen 2013 proportional trading costs), each weight capped at "
-                f"{float(cap):.0%}, total exposure held between "
+                f"{float(cap):.0%} (hard limit, never relaxed), total exposure held between "
                 f"{max(0.0, 1.0 - cash):.2%} and 100% (cash may hold up to {cash:.2%}), and each "
-                f"sector's exposure change budgeted at {float(dev):.2%}. If "
-                f"n * cap < 1 - cash_allowance the cap is relaxed to "
-                f"(1 - cash_allowance) / n so the exposure floor stays feasible (documented "
-                f"degrade, never raises)."
+                f"sector's exposure change budgeted at {float(dev):.2%}. When the cap cannot fund "
+                f"a full book (n * cap < 1) the budget is constrained by the position cap: total "
+                f"exposure is capped at n * cap and the residual is held as CASH -- the cap is "
+                f"never raised (never raises)."
             )
-            note = getattr(self, "_cap_degrade_note", "")
+            note = getattr(self, "_budget_constrained_note", "")
             if note:
                 base += f" ({note})"
         return base

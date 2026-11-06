@@ -4151,12 +4151,14 @@ LIVETRADING_STRICT_SEED_BOOK=0        # 0 / false / no / off 同样生效
 - **学术依据**：Garleanu & Pedersen (2013, *Journal of Finance*, "Dynamic Trading with Predictable Returns and Transaction Costs")——比例型交易成本在一阶近似下等价于对权重变化施加 L1 惩罚；方差项沿用 Markowitz (1952) 的无预期收益（λ=0）形式（预期收益估计不可靠，故不引入）。
 - **目标函数**：
   `min_w  wᵀΣw + γ·Σ_i sqrt((w_i − w0_i)² + 1e-6)`
-  约束：`0 ≤ w_i ≤ opt_single_cap`、**`1 − opt_cash_allowance ≤ Σw ≤ 1`**（总暴露箱式约束；默认 `opt_cash_allowance=0.0` 即 `Σw == 1` 满仓，残差为现金且非符号资产），以及在提供行业映射且非「自现金起点」时逐行业 `|Σ_g w − Σ_g w0| ≤ opt_sector_dev`。
+  约束：`0 ≤ w_i ≤ opt_single_cap`、**`lower_budget ≤ Σw ≤ upper_budget`**（总暴露箱式约束，`upper_budget = min(1, n · cap)`、`lower_budget = min(1 − opt_cash_allowance, upper_budget)`；默认 `opt_cash_allowance=0.0` 且 `n · cap ≥ 1` 时即 `Σw == 1` 满仓，残差为现金且非符号资产；cap 不足以满仓时见下「上限可行性」），以及在提供行业映射且非「自现金起点」时逐行业 `|Σ_g w − Σ_g w0| ≤ opt_sector_dev`。
   L1 使用 `sqrt(d²+1e-6)` 平滑（伪 Huber），保证 SLSQP 可微；平滑对换手标量的误差上界为 1e-3。
 
   **⚠ 预算约束修正（2026-11-05 同日修订，非近似而是缺陷修复）**：初版仅约束 `Σw ≤ 1`（自由现金残差）。该规划是退化的，且可解析证明：总暴露无下界 ⇒ 预算乘子失效 `ν = 0` ⇒ 一阶条件 `2Σw + γ·sign(w − w0) = 0` ⇒ `w ≈ −(γ/2)Σ⁻¹sign(Δw)`。此时**方差项把总暴露压向零**，而 L1 项只能以固定力度 `γ` 抵抗，不动点是一个与 `w0` 几乎无关的极小组合 → 实测总暴露逐期衰减 `1.00 → 0.97 → 0.94 → 0.91 → 0.88`（多行业映射下衰减更快，约 6%/期）。改为**总暴露箱式约束**（下界闭合）恢复预算乘子、消除崩塌；仍完全满足原需求「`Σw ≤ 1` 永不越界」。新增参数 `opt_cash_allowance`（默认 `0.0`，不进入 `param_grid`）只用于允许（而非强制）现金残差。
 
-  **上限可行性退化（不抛异常）**：满仓预算要求 `n · cap ≥ 1 − opt_cash_allowance`；例如 `cap=0.20, n=4`（`0.8 < 1`）不可行。处理为**文档化退化**：`effective_cap = max(opt_single_cap, (1 − opt_cash_allowance)/n)`（即 `max(cap, 1/n)`，默认现金额度下），同时发出 `RuntimeWarning` 并在 `explain_weights` 输出中追加退化说明，绝不抛异常。
+  **上限可行性（cap 是硬风险上限，绝不放松；现金吸收差额）**：满仓预算要求 `n · cap ≥ 1`；例如 `cap=0.20, n=4`（`0.8 < 1`）在满仓要求下不可行。正确处理方向是**预算让位、上限不动**：
+
+  `upper_budget = min(1.0, n · opt_single_cap)`、`lower_budget = min(1.0 − opt_cash_allowance, upper_budget)`（下界恒不高于上界）。`n · cap ≥ 1` 时与 `[1 − allowance, 1]` 完全一致（`allowance=0` 即 `Σw == 1`）；`n · cap < 1` 时改为求解 `Σw == n · cap`，**剩余 `1 − n · cap` 以现金持有**，`cap` 逐字用于边界、prune 裁剪、`_finalize` 与回退第 5 级。此前同日的 `effective_cap = max(opt_single_cap, (1 − opt_cash_allowance)/n)` **已彻底删除**——那是「为达成满仓而上调风险上限」，把安全次序倒置：cap 是硬性风险限额，而现金永远是可行替代，故让位的是预算而不是上限；该做法正是本仓库反复警示的「静默失效家族」。现改为发出 `RuntimeWarning` 并在 `explain_weights` 中追加说明，措辞为「预算受单票上限约束 ⇒ 现金残差」，而**不是**「上限被放松」，且绝不抛异常。
 
   **首次调仓特例已删除（且可证不必要）**：初版因「`Σw ≤ 1` 时 `w0 ≡ 0` 的 L1 退化为按比例入场成本、全现金解占优」而把首次调仓硬编码为普通最小方差解。修正后该 workaround **不必要**：`w0 ≡ 0` 且 `Σw == 1` 时 `‖w − w0‖₁ = Σw = 1` 在整个可行集上是**常数**，常数项不改变 argmin，首次调仓自动退化为最小方差解。已用测试 `test_first_rebalance_equals_min_variance_under_penalty` 锁定（`w0 ≡ 0`、`γ > 0` 的结果与 `_min_variance_weights` 在 `1e-6` 内一致）。
 
