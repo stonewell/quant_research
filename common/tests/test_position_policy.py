@@ -21,11 +21,19 @@ Two rules this file refuses to bend:
 The M4.1 kernel shipped as DEAD CODE. M4.2 phase 1 flips exactly ONE call site:
 `pipeline/research/blend/blend_base.py`'s inertia step now delegates to
 `PortfolioSequencer.sequence` behind the default-OFF `blend_use_policy_kernel`
-flag. `test_kernel_callers_are_guarded_by_opt_in_flag` statically pins the
-remaining invariants: `common/allocation_templates.py` is still kernel-free
-(phase 2 owns that flip), and the blend call site keeps BOTH the opt-in flag and
-the legacy `_step_asset_inertia` call, so neither the default-off guarantee nor
-the default code path can be deleted unnoticed.
+flag. `test_kernel_callers_are_guarded_by_opt_in_flag` pins the remaining
+invariants -- but only the templates half is a static scan
+(`common/allocation_templates.py` is still kernel-free; phase 2 owns that flip).
+
+The blend half is a BEHAVIOURAL call-path spy, deliberately not a source
+substring check (this file previously did the latter, and it was vacuous: the
+kernel is bit-identical to `_step_asset_inertia`, so forcing
+`use_policy_kernel = True` or deleting the `if use_policy_kernel:` branch left
+every test in the repo green -- output equivalence cannot see a silent default
+flip). The spy patches `blend_base._step_asset_inertia` and
+`PortfolioSequencer.sequence`, runs one real `generate_weights` with the flag
+absent and one with it True, and demands the legacy step is the ONLY route
+taken when off and NEVER taken when on.
 
 Disclosed finding recorded here rather than hidden (see
 `test_reapplying_kernel_to_its_own_output`): re-applying the inertia filter to
@@ -867,7 +875,24 @@ def test_reapplying_kernel_to_its_own_output(seed):
 # ---------------------------------------------------------------------------
 
 
-def test_kernel_callers_are_guarded_by_opt_in_flag():
+def _blend_universe(n_days: int = 200) -> dict:
+    """Deterministic synthetic blend universe (offline; `BIL` is the cash proxy)."""
+    from common.testing import make_ohlcv_from_closes
+
+    dates = pd.bdate_range("2020-01-01", periods=n_days)
+    t = np.arange(n_days)
+    universe = {
+        "601225.SH": make_ohlcv_from_closes(100.0 + 0.15 * t + 5.0 * np.sin(2 * np.pi * t / 25)),
+        "601857.SH": make_ohlcv_from_closes(100.0 + 0.08 * t + 4.0 * np.cos(2 * np.pi * t / 30)),
+        "601872.SH": make_ohlcv_from_closes(100.0 - 0.05 * t + 3.0 * np.sin(2 * np.pi * t / 20)),
+        "BIL": make_ohlcv_from_closes(np.full(n_days, 100.0)),
+    }
+    for frame in universe.values():
+        frame.index = dates
+    return universe
+
+
+def test_kernel_callers_are_guarded_by_opt_in_flag(monkeypatch):
     """M4.2 phase 1: the ONLY kernel caller is blend_base, and only behind a flag.
 
     History: M4.1 shipped the kernel as dead code and this guard asserted that
@@ -878,16 +903,23 @@ def test_kernel_callers_are_guarded_by_opt_in_flag():
 
       * `common/allocation_templates.py` -- still MUST NOT import the kernel
         (phase 2 owns that flip and must update this guard in its own commit);
-      * `pipeline/research/blend/blend_base.py` -- MAY import it, but the file
-        must keep (a) the opt-in flag with a `False` fallback and (b) the legacy
-        `_step_asset_inertia(` call. Losing either one would mean the default
-        path stopped being the pre-M4.2 code.
+        asserted by the static import scan below, unchanged since M4.1;
+      * `pipeline/research/blend/blend_base.py` -- MAY import it, but the DEFAULT
+        path must still be the legacy `_step_asset_inertia` step and the flag-ON
+        path must bypass it. Asserted BEHAVIOURALLY (a call-path spy), because
+        the kernel is bit-identical to the legacy step (`max_abs_diff == 0.0`):
+        output comparison is structurally incapable of noticing a default flip,
+        and a source-substring check cannot notice the branch being neutralised
+        (`use_policy_kernel = True`, or `if use_policy_kernel:` -> `if True:`).
     """
     import re
 
+    import pipeline.research.blend.blend_base as blend_base
+    from pipeline.research.blend import GenericBlendStrategy
+
     import_line = re.compile(r"^\s*(?:from\s+\S+\s+import\b|import\b)")
 
-    # (a) the templates module stays kernel-free
+    # (a) the templates module stays kernel-free -- static import scan (unchanged)
     templates_path = os.path.join(_PROJECT_ROOT, "common/allocation_templates.py")
     assert os.path.isfile(templates_path), "expected guard target to exist"
     offenders = []
@@ -901,19 +933,61 @@ def test_kernel_callers_are_guarded_by_opt_in_flag():
         "common/allocation_templates.py must stay kernel-free until phase 2: " + "; ".join(offenders)
     )
 
-    # (b) the blend call site keeps both the opt-in flag and the legacy path
-    blend_path = os.path.join(_PROJECT_ROOT, "pipeline/research/blend/blend_base.py")
-    assert os.path.isfile(blend_path), "expected guard target to exist"
-    with open(blend_path, encoding="utf-8") as handle:
-        blend_src = handle.read()
-    assert "position_policy" in blend_src, "blend_base no longer imports the kernel"
-    assert 'p.get("blend_use_policy_kernel")' in blend_src, (
-        "blend_base lost the params lookup for the opt-in flag"
+    # (b) the blend call site delegates by CALL PATH, not by source text.
+    assert hasattr(blend_base, "_step_asset_inertia"), (
+        "blend_base no longer imports the legacy `_step_asset_inertia` step -- the "
+        "default-off path would no longer be the pre-M4.2 code"
     )
-    assert 'getattr(cfg, "blend_use_policy_kernel", False)' in blend_src, (
-        "the opt-in flag must fall back to False (default OFF) via its PREFIXED key"
+    calls = {"legacy": 0, "kernel": 0}
+    original_step = blend_base._step_asset_inertia
+    original_sequence = PortfolioSequencer.sequence
+
+    def spy_step(**kwargs):
+        calls["legacy"] += 1
+        return original_step(**kwargs)
+
+    def spy_sequence(self, *args, **kwargs):
+        calls["kernel"] += 1
+        return original_sequence(self, *args, **kwargs)
+
+    monkeypatch.setattr(blend_base, "_step_asset_inertia", spy_step)
+    monkeypatch.setattr(PortfolioSequencer, "sequence", spy_sequence)
+
+    universe = _blend_universe(200)
+
+    # (b1) flag absent -> the legacy step runs, the kernel is NEVER touched.
+    off = GenericBlendStrategy().generate_weights(universe, {})
+    assert len(off.dropna(how="all")) > 0, (
+        "the synthetic run produced no rebalance rows -- the call-path spy would be vacuous"
     )
-    assert "_step_asset_inertia(" in blend_src, (
-        "blend_base lost the legacy `_step_asset_inertia` call -- the default-off "
-        "path would no longer be the pre-M4.2 code"
+    assert calls["legacy"] > 0, (
+        "with `blend_use_policy_kernel` absent, `_step_asset_inertia` was called "
+        f"{calls['legacy']} times: the DEFAULT inertia path is no longer the pre-M4.2 "
+        f"step (kernel calls={calls['kernel']}) -- the default flipped silently"
     )
+    assert calls["kernel"] == 0, (
+        f"the DEFAULT path called `PortfolioSequencer.sequence` {calls['kernel']} times "
+        "without opting in via `blend_use_policy_kernel`"
+    )
+
+    # (b2) flag True -> the kernel is used and the legacy step is BYPASSED.
+    calls["legacy"] = 0
+    calls["kernel"] = 0
+    on = GenericBlendStrategy().generate_weights(
+        universe, {"blend_use_policy_kernel": True}
+    )
+    assert calls["kernel"] > 0, (
+        "with `blend_use_policy_kernel=True` the kernel path was never taken "
+        f"(legacy calls={calls['legacy']}) -- the opt-in branch has gone dead"
+    )
+    assert calls["legacy"] == 0, (
+        f"with `blend_use_policy_kernel=True` `_step_asset_inertia` still ran "
+        f"{calls['legacy']} times: the legacy step was not bypassed, so the flag "
+        "did not actually select the kernel"
+    )
+
+    # Disclosed, and the reason this guard is behavioural: the two paths are
+    # cell-identical, so output equality is necessary but proves nothing about
+    # WHICH path was taken. Kept here so a future divergence surfaces next to the
+    # call-path assertion that actually guards the switch.
+    pd.testing.assert_frame_equal(on, off)
