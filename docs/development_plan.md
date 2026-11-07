@@ -395,7 +395,7 @@ flowchart TD
 | 任务编号 | 状态 | 任务名称 | 涉及核心文件与符号 | 核心交付内容与验收标准 | 配套离线单测 | 规模 | 前置依赖 |
 | :--- | :---: | :--- | :--- | :--- | :--- | :---: | :--- |
 | **`D10`** | `[ ]` | 矩阵/净额部署的取簿顺序与写盘时序无逐档行为断言（实盘账务真相闸门档，与 `D5`–`D9` 同族） | `web/livetrading/execution_service.py`<br>`run_multi_strategy_netted_deploy` / `get_previous_multi_netting_post_holdings` / 无键 `resolve_seed_holdings`<br>`web/livetrading/tests/test_live_book_integrity.py` 第 6 节现状 | 1. **缺口（§4.26 未闭合项第 1 条 `:1281`）**：矩阵/净额路径的取簿三档（上一轮净额 `post_holdings` → 无键 `resolve_seed_holdings` → 拒绝）与其写盘时序，目前**只由静态结构支撑**，无逐档行为断言；`test_multi_deploy_summary_records_universe_key` 虽驱动真实 `run_multi_strategy_netted_deploy`，但**显式传入 `current_holdings`**、并未走取簿链。<br>2. **交付**：三档各一条行为用例（命中上一轮计划簿 / 命中无键种子 / 未知即拒），外加写盘时序用例（拒绝早于任何 `holdings.json` / `nav_breakdown.json` / 子进程）。<br>3. **验收**：每条用例做「反向改坏即转红」验证；被拒轮零残留可机械核对。<br>4. **边界**：只补断言，**不改**取簿实现、不改下单定量；与本表 `D13` 的 sidecar 写入路由互不覆盖。 | 扩展 `web/livetrading/tests/test_live_book_integrity.py`（矩阵取簿三档 + 写盘时序） | 待估 | 无（取簿链已于 §4.26 落地；同族 `D5`–`D9` 均已闭环） |
-| **`D11`** | `[ ]` | 多策略净额 runner 的真 5 分钟日内支持（能力建设，非回归） | `scripts/run_live_multi_strategy.py`<br>`load_live_universe(..., interval="1d")`（当前无任何 5m 代码）<br>待移植：`load_intraday_5m_universe` / `enrich_universe_with_intraday_features`（`common/intraday_features.py`）<br>`observability.intraday_5m` | 1. **现状（§4.27 第 1 条 `:1296`）**：`891df17` 只是**停止**发出该脚本从不接受的 `--enable-intraday-5m`，矩阵路径因此**只跑日线信号**；在完成前任何「矩阵已支持 5m」的说法都是错的。<br>2. **交付**：把 `load_intraday_5m_universe` + `enrich_universe_with_intraday_features` 移植进净额 runner，重新发出开关，并让 `observability.intraday_5m` 由 `source="none"` 变为真实来源。<br>3. **刻意延后（原文理由，逐字）**：「它需要在净额 runner 里引入整条 5m 特征管线并重新校准"矩阵是否声明日内能力"的口径，属研究/特性排期；本轮的正确目标只是**不再发出脚本不认的参数**（否则每一轮都在 argparse 阶段死亡，零成交）。把特性塞进修复会让一个 P0 缺陷修复的验证面失控。」（§4.27 `:1301`）<br>4. **性质**：**能力建设，不是回归修复**；`source="none"` 必须能被显式观测到，不得默认谎报已启用。 | 待定（需 5m 合成数据离线用例；`common/tests/test_intraday_features.py` 为既有参考） | 待估 | 无（`891df17` 的「不再发不认参数」已独立闭环）<br>⏸ **交付口径已冻结（2026-11-06，用户裁定）**：开关＝**跟着配置走**（不设默认关的手动开关），解析须复用模板自身 `resolve_param`，轮级并集、策略级闸门不变，观测层硬覆盖须同批改，验收改三态（含诚实 `UNAVAILABLE` 负结果口径）—— 详见 **§4.50**。本条仍 `[ ]`、未开工。 |
+| **`D11`** | `[x]` | 多策略净额 runner 的真 5 分钟日内支持（能力建设，非回归） | `scripts/run_live_multi_strategy.py`<br>`load_live_universe(..., interval="1d")`（当前无任何 5m 代码）<br>待移植：`load_intraday_5m_universe` / `enrich_universe_with_intraday_features`（`common/intraday_features.py`）<br>`observability.intraday_5m` | 1. **现状（§4.27 第 1 条 `:1296`）**：`891df17` 只是**停止**发出该脚本从不接受的 `--enable-intraday-5m`，矩阵路径因此**只跑日线信号**；在完成前任何「矩阵已支持 5m」的说法都是错的。<br>2. **交付**：把 `load_intraday_5m_universe` + `enrich_universe_with_intraday_features` 移植进净额 runner，重新发出开关，并让 `observability.intraday_5m` 由 `source="none"` 变为真实来源。<br>3. **刻意延后（原文理由，逐字）**：「它需要在净额 runner 里引入整条 5m 特征管线并重新校准"矩阵是否声明日内能力"的口径，属研究/特性排期；本轮的正确目标只是**不再发出脚本不认的参数**（否则每一轮都在 argparse 阶段死亡，零成交）。把特性塞进修复会让一个 P0 缺陷修复的验证面失控。」（§4.27 `:1301`）<br>4. **性质**：**能力建设，不是回归修复**；`source="none"` 必须能被显式观测到，不得默认谎报已启用。 | 待定（需 5m 合成数据离线用例；`common/tests/test_intraday_features.py` 为既有参考） | 待估 | 无（`891df17` 的「不再发不认参数」已独立闭环）<br>⏸ **交付口径已冻结（2026-11-06，用户裁定）**：开关＝**跟着配置走**（不设默认关的手动开关），解析须复用模板自身 `resolve_param`，轮级并集、策略级闸门不变，观测层硬覆盖须同批改，验收改三态（含诚实 `UNAVAILABLE` 负结果口径）—— 详见 **§4.50**。✅ **已落地（2026-11-07）**：见 **§4.52**（含 B1 缺陷复盘与双层防御、三态验收、残余局限）。 |
 | **`D12`** | `[ ]` | `docs/universe/china/50只A股高流动性优质股票精选/50_stock.txt` 表头行 `证券代码` 被当作标的加载（改文件 = 改宇宙定义，**须人工显式裁决**） | `docs/universe/china/50只A股高流动性优质股票精选/50_stock.txt`<br>`FileUniverseProvider`（只跳空行与 `#` 行）<br>`461910c` 引入的 `symbols[0] == "证券代码"` 断言 | 1. **事实（§4.27 第 2 条 `:1297`）**：`FileUniverseProvider` 只跳空行与 `#` 行，故该表头一直被当作一个「标号」加载（实测 provider 返回 **51** 条，首条即 `证券代码`），runner 与下拉框**都**报告它。<br>2. **为何不直接改**：删除该行会改变下一轮加载的**宇宙定义**（实际加载与下单的标的集合），属独立决策，**必须由人显式裁决**后才能改文件 —— 本行是**裁决阻塞**，不是技术阻塞。<br>3. **刻意延后（原文理由，逐字）**：「改动它是**修改宇宙定义**，会改变下一轮实际加载与下单的标的集合，风险面远大于"下拉框多一行"；且当前行为现已由测试固定，不会静默漂移。」（§4.27 `:1302`）<br>4. **验收（裁决后）**：`symbols[0]` 断言按新定义更新；provider 返回条数与文件有效行数一致；若涉及剔除说明同步 `docs/black_list.md`。<br>⏸ **挂起口径（2026-11-01 用户批准）**：本条明确属于人工裁决阻塞（改文件即改实盘宇宙定义，见第 2、3 条原文），任何 Agent 均无权单独代为裁决；在用户给出显式裁决指令前持续挂起，不占任何工程排期与实施产能。 | 更新 `461910c` 引入的宇宙加载断言（`symbols[0] == "证券代码"`） | S | **人工裁决**（用户对「是否改宇宙定义」的显式裁定） |
 | **`D13`** | `[ ]` | 矩阵/净额轮缺手工修正通道（`operator_holdings.json` sidecar 无写入路由） | `web/livetrading/storage.py`<br>`save_holdings`（`operator_holdings.json` 写入点，`run_dir is None` 时）<br>`_display_book_for_run_dir` / `holdings_source = operator_manual_correction`<br>矩阵轮目录形态 `<archive>/<date>/multi_netted_<matrix>` | 1. **缺口（§4.27 第 3 条 `:1298`）**：`1250719` 的 `operator_holdings.json` sidecar 由 `save_holdings` 在 `run_dir is None`（`/api/holdings` 的真实手工保存）时写入；矩阵轮目录形态**没有**对应的写入路由 —— 若手工把 sidecar 放进该目录，展示与种子**都会遵从**，但今天没有任何 UI/API 能产生它。<br>2. **刻意延后（原文理由，逐字）**：「矩阵轮的账务仍由"上一轮净额计划 → 种子"链覆盖（§4.26 第 1 条的实现），缺的是**人工断言入口**而非取簿能力；补入口要先定"矩阵净额簿的人工修正语义"（净额后各子账本如何分摊），不宜在收口批次里临时发明。」（§4.27 `:1303`）<br>3. **验收（落地时）**：先出「矩阵净额簿人工修正语义」结论再落路由；写入侧与展示/种子侧各有行为用例，且均做「反向改坏即转红」。<br>⏸ **挂起口径（2026-11-01 用户批准）**：本条链式前置阻塞于 `D10`（账务取簿链逐档行为断言），且须先确立「矩阵净额簿人工修正语义」（见第 2 条原文）；在 `D10` 闭环并完成语义论证前持续挂起，不进任何开发波次。 | 扩展 `web/livetrading/tests/test_live_book_integrity.py`（sidecar 写入路由 + 展示/种子遵从） | 待估 | `D10`（取簿链断言先固化，再谈人工入口） |
 | **`D14`** | `[ ]` | `app.js` 部署载荷无真浏览器覆盖（仅源码形状断言；无 JS 测试基建） | `web/livetrading/static/js/app.js`<br>`getHoldingsFromTable()`（`:1454-1470`）/ `state.holdingsEdited` / `confirmEmptyBookIfNeeded`<br>`web/livetrading/tests/test_live_book_integrity.py` 第 18 节静态断言（`test_every_deploy_payload_sends_the_confirmed_empty_book`） | 1. **现状（§4.27 第 4 条 `:1299`）**：`state.holdingsEdited` 的清零/置真、四条部署路径的 `current_holdings: null` 与 `edited: true` 组合，全部只经**静态核对**；仓库没有 JS 测试框架，故这些断言无法在 pytest 中钉住。另有一条窄口：**新增但从未键入的空行不置 `edited`**，部署时会被丢弃。<br>2. **已推进但不闭合**：`05c69e1` 新增 1 条**静态源码断言**（四条部署载荷必须同时含 `state.holdingsEdited` 与 `emptyBookConfirmed === true`、`current_holdings:` 站点数恰为 4），能挡「形状」回归，但**不能**证明浏览器行为（无 JS 运行时、不执行 `app.js`，仅读源码文本）。<br>3. **刻意延后（原文理由，逐字）**：「仓库无 JS 测试基建，引入一套仅为一个开关服务的框架不划算；服务端 `UnconfirmedPlanAsInputError` 作为**兜底**已覆盖"UI 发错簿"的后果，JS 侧属**纵深防御**而非唯一防线。」（§4.27 `:1304`）<br>4. **验收（落地时）**：真浏览器/JS 运行时覆盖 `confirmEmptyBookIfNeeded` 的真实交互与 `edited` / `confirm_empty_book` 两闸组合。 | 第 18 节静态断言保留；真浏览器覆盖需 JS 测试基建（缺口本身） | 待估 | 无（服务端 `UnconfirmedPlanAsInputError` 兜底已闭环） |
@@ -425,7 +425,7 @@ flowchart TD
 | **`R1`** | `[ ]` | 开盘前依据日内回撤（`hwm_intra` / `dd_trough`）决定当日目标暴露是否下调（议程 `R1`，Tier P2，2026-11-01 登记） | [`scripts/check_live_portfolio_health.py`](file:///home/stone/Work/github/quant/scripts/check_live_portfolio_health.py)<br>`intraday_5m_info["hwm_intra"]` / `["dd_trough"]`（未测时置 `None`：`:1771-1772`；赋值 `:1839-1840` 与 `:1904-1907`；落 JSON `:1935-1936`；仪表盘 `:1111-1112`、`:1364`）<br>消费面**待确认**：Stage 2 目标暴露计算（`scripts/run_live_strategy.py`）—— 2026-11-01 登记时**未接线** | 1. **阈值书面冻结**：先把「触发下调的日内回撤阈值」与「下调比例」写成可复算的冻结值（含依据与失效条件）；**不得**沿用 `:1364` 现在把 `dd_trough` 标为 `Diagnostic only (R5)` 的诊断语义并顺手把它改成门禁 —— 那是 `R5`（§三 `:489` 的 `T4.1`）的归属，本条只消费同一个量、另立阈值。<br>2. **事实依据（仓库内可核对）**：`check_live_portfolio_health.py` 已产出 `hwm_intra`（日内峰值净值）与 `dd_trough`（自日内峰值到谷的回撤），落点 `:1935-1936`，未测时置 `None`（`:1771-1772`），仪表盘已在展示（`:1111-1112`）。**但当前没有任何消费方用它们下调目标暴露** —— 即「测得到、不消费」。<br>3. **交付**：新增「开盘前由 `dd_trough` 幅度决定当日目标暴露系数」的**确定性纯函数**（输入输出皆可离线构造），结果写进 Stage 1 报告与 ticket 的可观测字段；**必须**与 `dd_trough is None`（未测）区分开。<br>4. **验收（三态 + 反向改坏即转红）**：①**触发态** —— 合成 `dd_trough` 越过冻结阈值 ⇒ 目标暴露按冻结比例下调，ticket 可见下调原因；②**未触发态** —— 阈值内侧 ⇒ 目标暴露 **bit-identical** 于接入前（零改动）；③**阈值边界** —— 恰好等于阈值时行为固定且被测试钉死（`>=` 与 `>` 择一并写明理由）；三态各一条离线用例，**删掉判据即转红**（禁止恒真断言）。另加 `dd_trough is None` 一条：**不得**被当成 0（既不下调也不静默通过），须显式降级并告警。<br>5. **边界**：只做「市场层」的暴露系数，**不改**个股选择、**不改** `blend_base.py`、**不改** `common/allocation_templates.py`、**不碰**版本轴；本条阈值与 `R5` 的盘中回撤门禁阈值**不得合并成一套**（同一数据、两个目的，合并即两侧同时失真）。 | 新增 `pipeline/tests/test_intraday_exposure_damping.py`（合成序列三态 + `None` 降级；全离线，**禁止**读生产报告文件） | M | `R3`（能力前置） |
 | **`R3`** | `[x]` | 离线可验证的 5m 数据面：合成 5m 面板 + 时间戳 / 时区 / 缺失三类可见化（**能力前置**，先于其余四条；2026-11-01 登记） | [`common/intraday_bar_contract.py`](file:///home/stone/Work/github/quant/common/intraday_bar_contract.py)（`M3.3` 已闭环的 bar 契约，`CONTRACT_VERSION = "m3.3.1"` 于 `:67`，写侧以 `probe_version` 落盘 `:154`）<br>[`common/intraday_features.py`](file:///home/stone/Work/github/quant/common/intraday_features.py)（口径只读参照：`Afternoon_Ret_5m` `:380`、`Morning_Low_5m` `:389-391`、输出列清单 `:676-677`）<br>`common/testing.py`（既有合成 OHLCV 生成器：`make_ohlcv_from_closes` `:16`、`make_random_walk_df` `:32`、`make_trending_pullback_df` `:53` 等，**实测只到日线粒度** —— 按 `intraday` / `5m` / `minute` 检索该文件**零命中**） | 1. **口径书面冻结（本条无量化阈值，冻结的是面板规格）**：交易日跨度、每交易日 bar 数（A 股 **48**，与 `M3.3` 第 3 条一致）、bar 时间戳标签约定（**结束时刻**，与 `M3.3` 第 4 条一致）、午休区间（11:30–13:00 无 bar）、时区（`Asia/Shanghai`）、以及「停牌 / 缺失」的判别规则。规格一旦冻结，其余四条**一律引用它**，不得各自另立一套。<br>2. **事实依据（缺口确凿）**：仓库今天**没有**任何可控的合成 5m 面板生成器 —— 既有 5m 测试要么驱动真缓存、要么引用标定库，而标定库所在的 `backtests_research/` 被 `.gitignore:17` 忽略、不入库；`common/testing.py` 的合成器只到日线粒度（见左列实测）。这正是本组其余四条无法开工的直接原因。<br>3. **交付**：新增离线合成 5m 面板生成器，**可参数化**（标的数、交易日跨度、每日 bar 数、停牌日、缺口日、跨午休错位、时区偏移、重复时间戳），并把「时间戳 / 时区 / 缺失」三类问题**可见化** —— 返回显式的 `missing` / `duplicate` / `tz_mismatch` 分类计数，**不得**静默裁掉坏 bar。<br>4. **验收（反向改坏即转红）**：①正常面板 ⇒ 48 根/日、午休无 bar、时间戳单调且标签为结束时刻；②**注入缺口** ⇒ 分类计数精确命中，且坏 bar **不**被静默丢弃；③**注入时区偏移 / 重复时间戳** ⇒ 显式报错或显式计数，绝不静默通过；④每条用例都做「删掉对应断言就变红」的验证。<br>5. **边界（严格）**：**不含任何生产信号** —— 不新增因子、**不改** `intraday_features.py` 的特征定义、不改任何策略 / 模板、不碰版本轴；对真实数据**零依赖**（不读缓存、不联网、不读标定库）。<br>✅ **已落地闭环（2026-11-05）**：新增 [`common/intraday_synthetic.py`](file:///home/stone/Work/github/quant/common/intraday_synthetic.py)（冻结规格常量 `SESSION_BARS_PER_DAY=48` / `BAR_TIMESTAMP_CONVENTION="END"` / `GRID_LABELS` 09:35–11:30 + 13:05–15:00 / `SESSION_TIMEZONE="Asia/Shanghai"` / `EXPECTED_UTC_OFFSET_MINUTES=480` / `PANEL_SPEC_VERSION="r3.1"`；`classify_5m_panel(...)` 输出 `missing` / `duplicate` / `tz_mismatch` / `lunch` / `pre_session` / `post_session` / `off_grid` / `suspended` / `unknown` 分类计数与逐行明细；`build_synthetic_5m_panel(...)` 可参数化标的数 / 交易日数 / 每日 bar 数 / 停牌日 / 缺口日 / 跨午休错位 / 时区偏移 / 重复时间戳）与 [`common/tests/test_synthetic_5m_panel.py`](file:///home/stone/Work/github/quant/common/tests/test_synthetic_5m_panel.py)（**20 条**，含一条手建帧把「日线有成交、5m 零 bar ⇒ `missing` 而非 `unknown`」的已披露偏差钉死）；面板直接通过 `common.intraday_bar_contract.run_gate`（同一 `run_gate` 无 shim）。详见 §4.32。 | 新增 `common/tests/test_synthetic_5m_panel.py`（面板规格 + 缺口 / 重复 / 时区三类可见化，全离线） | M | 无（可独立先行；其余四条均以本条为前置） |
 | **`R4`** | `[ ]` | 横截面收益「离散度」崩塌检测并下调市场层暴露（议程 `R4`，Tier P2，2026-11-01 登记） | 消费面**待确认**（登记时未定；与本表 `R1` 同层——都作用于「市场层暴露」——但**判据不同**，见第 5 条）<br>口径参照 [`common/intraday_features.py`](file:///home/stone/Work/github/quant/common/intraday_features.py) 的横截面特征口径<br>**登记时实测**：按 `dispersion` / `cross_sectional` / `cross-sectional`（大小写不敏感）检索 `common/indicators.py` 与 `common/intraday_features.py`，**仅 1 处命中** —— [`common/indicators.py`](file:///home/stone/Work/github/quant/common/indicators.py) `:146` 的 `cross-sectional (Jegadeesh & Titman 1993)` 是**动量因子的文献注记**，**不是**离散度算子 ⇒ 本条为**从零新增**，不是参数化既有逻辑 | 1. **阈值书面冻结（本条的重点就在这一步）**：先冻结三件事 —— ①「离散度」的**定义**（横截面收益**标准差** vs. **MAD** 择一，并写明否决另一项的理由：标准差对单只极端值敏感、MAD 更稳健但在小样本 / 高同向时可能退化为 0）；②**滚动窗口**（bar 数或分钟数，须写明取值理由）；③**阈值**（绝对阈值，还是相对自身历史的百分位）。三者齐备前**不得**开工。<br>2. **事实依据**：仓库现有「崩塌 / 跳水」类判断全部基于**单标的**序列（如 `M3.2` 的窗口 VWAP 偏离、`dd_trough` 类日内回撤），**没有任何横截面离散度算子**（见左列实测）⇒ 本条是从零新增算子，须自带定义与依据。<br>3. **交付**：新增横截面离散度算子 + 「离散度崩塌 ⇒ 市场层暴露下调」的**确定性纯函数**；结果落可观测字段。<br>4. **验收（两侧都要，反向改坏即转红）**：①**普通日 bit-identical** —— 离散度在正常区间时，暴露系数与接入前**完全一致**（零改动，不是「差一点点」）；②**崩塌日才降暴露** —— 合成一个横截面收益高度同向塌陷的面板 ⇒ 暴露下调且可见原因；③**单只极端值不得冒充崩塌** —— 一只标的暴涨 / 暴跌、横截面其余平稳时**不得**触发（这正是标准差 vs. MAD 的判别用例，也是本条最容易写错的地方）；④阈值边界固定且被测试钉死。<br>5. **边界**：不改个股选择、不改 `blend_base.py`、不改任何策略类、不碰版本轴；与 `R1` 是**两个独立判据**（回撤幅度 vs. 横截面结构），**不得**合并成一条，也**不得**互相复用阈值或互相调用。 | 待定（需 `R3` 的合成面板；至少覆盖上述 4 条验收，其中第③条必须有独立用例） | 待估 | `R3`（能力前置） |
-| **`R6`** | `[ ]` | 收盘前固定时点决定是否下调**隔夜**暴露（议程 `R6`，**Tier P1**，2026-11-01 登记） | 消费面**待确认**：Stage 2 目标持仓与 cash sweep 段<br>成交价口径参照 [`common/allocation_backtester.py`](file:///home/stone/Work/github/quant/common/allocation_backtester.py)<br>`EXECUTION_PRICE_MODES`（`:109`）= `("close", "next_open", "next_vwap", "intraday_twap")`<br>取价语义注记 `:479`、`:483`（二者明确 `intraday_twap` 与 `next_vwap` **永不**降级成别的价）<br>非法值校验 `:899-901` | 1. **时点书面冻结**：先冻结「收盘前第几个 bar / 几点几分」这个判定时点，并**在两种成交价口径下都成立** —— 即该时点必须早于其下单所对应的取价时点（`close` 与 `intraday_twap` 两种模式下都要自洽，否则同一决策在两套口径下会退化成两个不同的策略）。时点未冻结前**不得**开工。<br>2. **诚实定位（必须写在实现之前）**：本条是**降隔夜暴露**（收盘前决定、当日收盘或收盘集合竞价附近执行），**不是日内择时** —— 它不预测日内路径、不试图在盘中做多做空切换。**为何未被 `M3.2` 的负结果证伪覆盖**：`M3.2` 检验的是「窗口 VWAP 作为成交价的系统偏差」（结论为负、不改引擎），`R6` 检验的是「隔夜跳空风险是否值得在收盘前减仓」，**被解释变量不同** ⇒ `M3.2` 的负结果**既不构成**对 `R6` 的否定证据、**也不构成**支持；`R6` 必须由自己的验收用例独立成立，或独立按负结果结项（后者完全允许）。<br>3. **交付**：固定时点的判定纯函数 + 隔夜暴露下调比例，并在 ticket 上落可观测字段（含「未触发」与「数据不足」两种显式取值）。<br>4. **验收（反向改坏即转红）**：①固定时点触发 ⇒ 隔夜暴露按冻结比例下调，且**在同一时点**决定（不得因执行延迟漂移到任意盘中时刻）；②不触发 ⇒ bit-identical；③`close` 与 `intraday_twap` 两种 `execution_price` 下**决策序列一致** —— 回归验证方式：把判定时点挪到取价时点**之后**，测试必须转红（这是「执行价格未来函数」的最小可测形式）；④时区与半日市（若成立）边界固定。<br>5. **边界**：只动「隔夜暴露」这一维，不动个股选择、不做日内择时、**不改** `blend_base.py` 的 5m 开关面（那是 `R7`）、不碰版本轴。 | 待定（需 `R3` 的合成面板；重点是第 4 条③的双口径一致性回归） | M | `R3`（能力前置） |
+| **`R6`** | `[x]` | 收盘前固定时点决定是否下调**隔夜**暴露（议程 `R6`，**Tier P1**，2026-11-01 登记） | 消费面**待确认**：Stage 2 目标持仓与 cash sweep 段<br>成交价口径参照 [`common/allocation_backtester.py`](file:///home/stone/Work/github/quant/common/allocation_backtester.py)<br>`EXECUTION_PRICE_MODES`（`:109`）= `("close", "next_open", "next_vwap", "intraday_twap")`<br>取价语义注记 `:479`、`:483`（二者明确 `intraday_twap` 与 `next_vwap` **永不**降级成别的价）<br>非法值校验 `:899-901` | 1. **时点书面冻结**：先冻结「收盘前第几个 bar / 几点几分」这个判定时点，并**在两种成交价口径下都成立** —— 即该时点必须早于其下单所对应的取价时点（`close` 与 `intraday_twap` 两种模式下都要自洽，否则同一决策在两套口径下会退化成两个不同的策略）。时点未冻结前**不得**开工。<br>2. **诚实定位（必须写在实现之前）**：本条是**降隔夜暴露**（收盘前决定、当日收盘或收盘集合竞价附近执行），**不是日内择时** —— 它不预测日内路径、不试图在盘中做多做空切换。**为何未被 `M3.2` 的负结果证伪覆盖**：`M3.2` 检验的是「窗口 VWAP 作为成交价的系统偏差」（结论为负、不改引擎），`R6` 检验的是「隔夜跳空风险是否值得在收盘前减仓」，**被解释变量不同** ⇒ `M3.2` 的负结果**既不构成**对 `R6` 的否定证据、**也不构成**支持；`R6` 必须由自己的验收用例独立成立，或独立按负结果结项（后者完全允许）。<br>3. **交付**：固定时点的判定纯函数 + 隔夜暴露下调比例，并在 ticket 上落可观测字段（含「未触发」与「数据不足」两种显式取值）。<br>4. **验收（反向改坏即转红）**：①固定时点触发 ⇒ 隔夜暴露按冻结比例下调，且**在同一时点**决定（不得因执行延迟漂移到任意盘中时刻）；②不触发 ⇒ bit-identical；③`close` 与 `intraday_twap` 两种 `execution_price` 下**决策序列一致** —— 回归验证方式：把判定时点挪到取价时点**之后**，测试必须转红（这是「执行价格未来函数」的最小可测形式）；④时区与半日市（若成立）边界固定。<br>5. **边界**：只动「隔夜暴露」这一维，不动个股选择、不做日内择时、**不改** `blend_base.py` 的 5m 开关面（那是 `R7`）、不碰版本轴。<br>6. ✅ **已落地（2026-11-07）**：见 **§4.53**（判据已按 `r6.3` 变更并先冻结、后实现、再测试；含残余局限与禁止叠加条款）。 | 待定（需 `R3` 的合成面板；重点是第 4 条③的双口径一致性回归） | M | `R3`（能力前置） |
 | **`R7`** | `[ ]` | 缺 5m 数据 ⇒ **冻结新开仓**（`M3.10` / `Fix A` 只完成了「永不 PASS」的诚实半边，冻结半边从未实现）（议程 `R7`，Tier P2，2026-11-01 登记） | [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py)<br>`_missing_5m` 现**仅** `print` 告警（`:2038-2045`，文案 `[WARN] 以下 N 个标的缺少 5m 数据，日内字段为空`），此后**不再被任何决策逻辑消费**<br>[`pipeline/research/blend/blend_base.py`](file:///home/stone/Work/github/quant/pipeline/research/blend/blend_base.py)<br>`enable_intraday_5m`（`:705`）/ `enable_5m_interval_nesting`（`:706`）/ `use_intraday_downside_vol`（`:708`），三者默认均 `False`<br>诚实性先例：`Fix A` 于本文件 `:816`，其澄清段 `:845` | 1. **判据书面冻结**：先冻结「缺 5m」的判定口径 —— 是「全 universe 无 5m」还是「某标的无 5m」、是「帧为空」还是「帧存在但日内字段缺失」。不同口径对应**完全不同**的冻结范围（全市场冻结 vs. 单标的冻结），冻结前**不得**开工。<br>2. **事实依据（缺口确凿）**：`M3.10` / `Fix A` 解决的是**诚实性** —— 缺失 5m 时不得把 `intraday_vwap_breadth` 算成 `1.0` 而让门禁静默通过（先例见 `Fix A` 行 `:816`、澄清段 `:845`：「缺失 5m ⇒ 永不 PASS」与「缺失数据不得伪装成风险结论」同时成立）。**但「缺 5m ⇒ 冻结新开仓」从未实现**：`scripts/run_live_strategy.py:2038-2045` 至今只做 `print("[WARN] ...")`，`_missing_5m` 之后不再被任何决策逻辑消费 ⇒ 缺数据时**照常开仓**。故本条的「永不 PASS」另一半仍是空白。<br>3. **交付**：把 `_missing_5m` 从「打印」升级为「进入决策」—— 缺失达到冻结口径时**新开仓一律置零**（允许卖出 / 减仓），并在 ticket 与报告里落**显式**告警字段；沿用 §2.19 `D11` 第 4 条口径：`source` 必须能被显式观测到，**不得默认谎报已启用**。<br>4. **验收（两态 + 反向改坏即转红）**：①**缺失态** ⇒ 新开仓数量恒为 0 / 买单被拒 / 显式告警，且**卖出路径不受影响**（不得因缺数据把仓位冻结成不能减）；②**正常态** ⇒ **零改动**（bit-identical，含既有 55+ 策略与 9 静态模板的工单形状）；③删掉冻结判据，缺失态用例必须转红；④**不得**把「缺 5m」与「5m 测得但为中性」混为一谈（前者无数据、后者有数据）。<br>5. **边界**：**不改** `blend_base.py` 的 5m 开关默认值（仍全 `False`）；**不改** `M3.10` 已闭环的探活 / 分页断言；**不改**矩阵净额 runner 的 5m 能力（那是 §2.19 `D11`，本表不代劳、也不得顺手一并改）；不碰版本轴。 | 待定（需 `R3` 的合成面板；缺失态 / 正常态各一条 + 卖出路径不受影响一条） | M | `R3`（能力前置） |
 | **`D6`** | `[ ]` | 日内止损不可建模（成交价建模缺口；任何「日内止损」研究在解决前不得开工） | [`common/allocation_backtester.py`](file:///home/stone/Work/github/quant/common/allocation_backtester.py)<br>`EXECUTION_PRICE_MODES`（`:109`）仅 4 种**日频**模式：`close` / `next_open` / `next_vwap` / `intraday_twap`<br>`intraday_twap` 的实现与校验：`:954-957`、`:982`、`:1597`；口径注记 `:479`、`:483`<br>非法值校验 `:899-901` | 1. **口径书面冻结（本条冻结的是「不可建模」这一结论本身）**：先冻结判据 —— 「什么叫日内止损可被回测」必须是**可判定**的（例：能在 5m bar 内触发，并在触发后的**下一个可成交价**成交，且该价不含任何未来信息）。在该判据被满足前，「不可建模」是**登记事实**，不是待办。<br>2. **事实依据**：回测器只有 4 种**日频**成交价模式（`common/allocation_backtester.py:109`），其中 `intraday_twap` 是「日频目标权重的日内切片」（见 `:479` 的口径注记），**不是**「bar 级触发 + bar 级成交」的事件驱动撮合。故任何「日内止损」研究只能靠日线 OHLC 的**事后**判断（如「当日最低价穿过止损价 ⇒ 假设在止损价成交」），这是典型的**前视 / 不可成交**假设：价格被穿过后，实际可成交价与穿越顺序均未知。<br>3. **交付（本条无实现，只有约束）**：登记「日内止损在成交价建模解决前不得开工」这一**硬阻塞**，并把解除阻塞的前置条件写清（bar 级事件驱动撮合 + 触发后下一可成交价建模 + 对应离线用例）。<br>4. **验收（解除阻塞时才成立）**：出现 bar 级撮合后，须能证明「触发时刻 → 成交时刻」不引用任何未来 bar —— 用合成面板构造「先穿后回」与「先回后穿」两条路径，**两者结果必须不同**（若相同即说明仍在用日线事后判断）；反向改坏即转红。<br>5. **边界 / 挂起**：本条**不可执行、长期挂起**；**不得**以「先做一版近似日线止损」的方式绕过，也**不得**把它读成「已排期、只是排在后面」。<br>⏸ **挂起口径（2026-11-01 用户裁定）**：本条属**能力缺口硬阻塞** —— 依赖的前置是「bar 级事件驱动撮合与触发后成交价建模」，仓库内**无任何既有任务承载**该前置；在成交价建模落地前，任何以本条名义开工的研究（含「先用日线 min(low, stop) 近似」）一律视为**违反本表**，不产生可验收结论。 | 待定（解除阻塞时才需要：合成 bar 级路径「先穿后回」/「先回后穿」两态） | 待估 | **硬阻塞**（须先完成 bar 级事件驱动撮合与触发后成交价建模；无既有任务承载） |
 
@@ -485,6 +485,21 @@ flowchart TD
 | 任务 | 状态 | 主题 | 涉及文件 | 交付与验收 | 测试落点 | 规模 | 前置 |
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
 | **`ML1`** | `[ ]` | LightGBM + 遗传规划（GP）两阶段 Alpha 挖掘子项目（来源 [`docs/LightGBM与遗传规划（GP）中短期量化Alpha投研体系研究.md`](file:///home/stone/Work/github/quant/docs/LightGBM与遗传规划（GP）中短期量化Alpha投研体系研究.md)，见 §4.45） | 新建 `ml/alpha_mining/`（路径名待用户确认）：`pyproject.toml`、`tests/`、`README.md`；复用 `common/alpha101_operators.py`、`common/factor_analyzer.py`、`common/indicators.py` | 1. **环境隔离**：独立 `uv` 环境（`lightgbm` + `numpy` + `pandas` + `scipy`），**禁止**把 `lightgbm` 装进 `pipeline/.venv`；`common/` 仍靠 `sys.path` 注入复用。<br>2. **算子层一律 REUSE**：`ts_sum`/`ts_std`/`ts_corr`/`ts_cov`/`ts_rank`/`ts_argmax`/`ts_argmin`/`ts_decay_linear`/`cs_rank`/`cs_demean`/`cs_zscore`/`signed_power` 已全部存在于 `common/alpha101_operators.py:92-245`，**不得重写**；仅补 `sigmoid`、`signed_log` 两条缺失纯函数。<br>3. **适应度函数**：`RankIC × sqrt(ICIR) − λ1·Turnover − λ2·max_abs_corr（与存量因子的横截面最大绝对相关） − λ3·Length`，其中 RankIC/ICIR 复用 `common/factor_analyzer.py:60`、`:162`，只写组合与惩罚项。<br>4. **Purged Group TimeSeries CV + Embargo**：因持有期 `k` 使标签重叠 `k−1` 天，必须清除跨界样本并在测试段后设 3~5 日隔离带；此构件**无第三方依赖**，须可在纯 `pandas`/`numpy` 下离线测试。<br>5. **LightGBM 组合层**：`lambdarank` 或自定义负 RankIC 损失；`max_depth` 3~5、`num_leaves` 15~31、`feature_fraction` 0.6~0.8、`min_child_samples` 100~500。<br>6. **落地监控**：对抗性验证防时间漂移、特征重要性衰减报警、换手过载熔断。<br>7. **不改变现网**：子项目产出在获批前**不得**写入 `strategies_config.json`、不得进 `run_screener.py`、不得改任何既有回测输出。 | 新建 `ml/alpha_mining/tests/`（100% 合成数据、零网络）；Purged CV 需有「跨 Purge 边界的样本被剔除」用例；GP 适应度需有「与存量因子相关系数超 0.6 时被惩罚」用例；`sigmoid`/`signed_log` 落在 `common/tests/test_alpha101_operators.py` | L | 用户批准新依赖；裁定标签口径（特质残差 vs 原始收益）与是否允许最终影响选股结果；确认子项目路径名 |
+
+### 2.24 阶段五归因/自愈文档衍生任务（`AT1`–`AT6`，2026-11-07 登记，Tier P2/P3）
+
+本节把 `docs/量化策略性能归因与生命周期自愈体系.md`（253 行、5 节）逐条对照现有代码后登记为任务行。该文档的多数「原语」已存在（`common/factor_analyzer.py:60` RankIC / `:115` 自相关半衰期 / `:162` IC 汇总 / `:239` 分层收益），但**快照侧、消费侧、报告侧**缺失；另有 4 类提议因数据源在仓库内根本不存在而**刻意不建**（见 §4.51）。横跨 `common/` 与计划表，**不入 §2.17 执行序列**。
+
+| 任务 | 状态 | 主题 | 涉及文件 | 交付与验收 | 测试落点 | 规模 | 前置 |
+| :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
+| **`AT1`** | `[ ]` | Brinson 行业/选股/交互归因纯函数与报告 | 新建 `common/brinson_attribution.py`；复用 `common/sector_metadata.py:56` `load_sector_map`、`:96` `resolve_sector`（**不得新建行业映射**） | 1. 纯函数：持仓权重/基准权重/区间收益/行业映射 → `allocation_effect`、`selection_effect`、`interaction_effect` 与逐行业明细；<br>2. **恒等式**：三者之和 = 组合收益 − 基准收益，误差 ≤ `1e-12`，必须是断言而非注释；<br>3. 行业缺失标的必须显式落入 `UNCLASSIFIED` 桶并计入报告，**禁止静默丢弃或按行业均值填充**；<br>4. advisory，**不得**接入任何门禁或下单路径 | `pipeline/tests/test_brinson_attribution.py`（100% 离线合成数据） | M | 无 |
+| **`AT2`** | `[ ]` | 特质残差收益与 Specific Alpha 健康度 | 新建 `common/specific_alpha.py`；`common/daily_factors.py:192` `ivol_residual` **只能复用、不得当作等价物** | 1. 明确标注 **SIMPLIFIED**：无商业 Barra 因子收益表，只能用「市场残差 + 现有日频风格因子横截面回归残差」近似，须逐条说明与完整 Barra 的差异；<br>2. 文档 §2.3 阈值**只作报告标签，不作门禁**；<br>3. docstring 必须写清：单变量市场残差 ≠ 多因子特质收益分解（§4.44:1995 已明定不可顶替） | `pipeline/tests/test_specific_alpha.py` | M | 无 |
+| **`AT3`** | `[ ]` | 策略信号快照 + 实盘 IC/ICIR/半衰期衰减监控 | 每轮快照 `(date, strategy, symbol, score, universe_id)`（**含落选标的**）；复用 `common/factor_analyzer.py:60`/`:115`/`:162`；Stage 2 票据写出路径 | 1. **先决条件**：无横截面预测分数就无法算 IC——`detail_reason.dimension_signals` 是持仓内子策略权重（`scripts/run_live_strategy.py:2399-2413` 汇总、`:2986-2990` 取值、`:3051` 写入、`round(...,4)`），**不是** score，不得当 IC 输入；<br>2. 快照必须覆盖全部候选（含未入选），否则横截面被选择截断、结构性高估；<br>3. horizon 与收益口径书面冻结（用收盘收益；`--cutoff-time` 默认 14:15 是盘中信息集，不得混用）；<br>4. **分市场分腿**计算；单日横截面 < 15 只落 `INSUFFICIENT_HISTORY`，**禁止补零、禁止当 0**；<br>5. advisory；历史不可重算（qfq 修订、配置/dump 漂移），**禁止**用今日数据回填过去 10 日分数；<br>6. 明确写出：即便补齐，首个结论最早也要在「10 个有效评估日 + horizon」之后 | `pipeline/tests/test_signal_snapshot.py`、`pipeline/tests/test_ic_decay_monitor.py` | L | 无（为 `AT5` 前置） |
+| **`AT4`** | `[ ]` | 实盘换手膨胀与参与率容量监控 | `scripts/run_live_strategy.py` 或新建 `common/live_capacity.py`；**不得新建阈值** | 1. 回测侧已有 `total_turnover` / `max_volume_participation`，实盘侧为零实现——只补实盘观测，不改回测；<br>2. 换手基线**只许复用 `L2.36` 预注册值**（8.0×/年合格、10.0×/年硬上限），不得另造第二个阈值；<br>3. 参与率同时给「占当日成交量」与「占近 20 日均量」两口径，缺失落显式三态，**禁止用 0 或均值填充**；<br>4. advisory，不接门禁 | `pipeline/tests/test_live_capacity.py` | M | 无 |
+| **`AT5`** | `[ ]` | 信号层 Yellow/Orange/Red 警报矩阵（advisory） | 新建 `common/signal_alerts.py`；**只读**消费 `AT3`/`AT4` 输出 | 1. **先冻结映射**（指标 → 层级 → 动作），冻结前不得写码（§2.20 纪律）；<br>2. **不得合并或改写**既有阈值：组合层 10/15/20 回撤熔断、`LV1`、`R1`（日内回撤门禁）、`R4`（横截面离散度）、`R6`（隔夜暴露）各管一维，阈值不得互相复用；<br>3. 数据不足必须透传 `INSUFFICIENT_HISTORY`，不得降级为「正常」；<br>4. 首版只出报告，**不接**降权/清盘执行 | `pipeline/tests/test_signal_alerts.py` | M | `AT3`、`AT4` |
+| **`AT6`** | `[ ]` | 重演化触发与平滑热替换协议 | 新建协议文档 + 状态机；依赖 `ML1` | 1. 四步：冻结旧权重（分批释放）→ 新特征/模型产出 → 影子交易（paper）→ 切换；每步须有可复算的进入/退出条件；<br>2. **硬阻塞**于 `ML1`（`ml/alpha_mining/` 尚未落地）与用户对「切换风险预算」的裁决；<br>3. 写明：警报只触发**候选**，切换需人工确认，**无自动上线**；<br>4. 影子交易最小样本与显著性依据必须书面冻结，不得沿用文档 §四 的「5~10 个交易日」占位值 | `pipeline/tests/test_hot_swap_protocol.py` | L | `ML1` + 用户裁决 |
+
+计数（本节写作时点，独立记数、不回改旧节）：**151 → 157**（`[x]` 106 不变，`[ ]` 45 → 51，新增 6 行）；两文件合计 **217 → 223**。`D11` 与 `R6` 的在办状态不受本节影响，其结项见 §4.52 / §4.53。
 
 ---
 
@@ -2264,3 +2279,148 @@ uv run pytest common/tests/test_intraday_bar_contract.py common/tests/test_intra
 #### 4.50.8 计数（纯追加）
 
 无新增任务行、无状态位变动：计数沿用 §4.49.7 的 2026-11-06 权威值（现役 **151 = 105 `[x]` + 46 `[ ]`**；两文件合计 **217 = 171 `[x]` + 46 `[ ]`**）。`D11` 仍为 `[ ]`，本节只冻结口径、**不含任何开工或结项证据**。
+
+### 4.51 阶段五文档覆盖审计：`AT1`–`AT6` 的登记依据（2026-11-07，纯登记、无代码变更）
+
+本节把 `docs/量化策略性能归因与生命周期自愈体系.md` 逐条对照现有代码的审计结论固化在案，作为 §2.24 六个任务行的登记依据。**本节零代码改动、不改任何 `[ ]`/`[x]`、不增删既有任务行、不重编号**；`D11`（`:398`）与 `R6`（`:428`）在**本节写作时点**仍各为 `[ ]`（二者后于 §4.52 / §4.53 结项并翻为 `[x]`，本节按快照口径不回写）。
+
+#### 4.51.1 审计对象与结论摘要
+
+对象 = `docs/量化策略性能归因与生命周期自愈体系.md`，253 行、5 节。结论：原语多数已实现，缺的是**快照 / 消费 / 报告**三层；真正缺失只有 Brinson、特质残差、实盘容量、信号层警报、热替换 5 类；「连续 10 日 IC≤0」不是原语缺失而是**输入不存在**；另有 4 类因数据源不存在而刻意不建。本节只登记，不改任何 `[x]`/`[ ]`，不动 `D11`/`R6`。
+
+#### 4.51.2 覆盖矩阵
+
+| 编号 | 文档提议 | 判定 | 证据 |
+| :-- | :-- | :-- | :-- |
+| `C1` | Brinson 行业/选股/交互归因 | **缺失** | 全库无 `allocation_effect`/`selection_effect`/`interaction_effect`/`brinson`；`common/sector_metadata.py:56`/`:96` 只提供分组，不是归因 |
+| `C2` | Barra 结构化多因子风险归因 | **缺失（完整版刻意不建）** | 无商业因子收益表；`common/daily_factors.py` 只有单因子面板；`ivol_residual:192` 是单变量市场残差 |
+| `C3` | 特质残差收益（Specific Alpha） | **缺失** | 同上；§4.44:1995 已明定不可顶替 |
+| `C4` | 滚动 IC / ICIR / 自相关半衰期原语 | **已覆盖** | `common/factor_analyzer.py:60`、`:115`、`:162`、`:239` |
+| `C5` | 「连续 10 日 IC≤0」衰减预警 | **缺失（且先决条件不具备）** | 原语有、消费方为零；无 `(date, strategy, symbol, score)` 快照，见 §4.51.4 |
+| `C6` | 因子拥挤度 / 资金抱团热力图 | **刻意不建** | 无公募重仓、两融、成分重叠数据源（§4.44.5 已裁定） |
+| `C7` | 换手率过载与容量边界 | **缺失（实盘侧）** | 回测有 `total_turnover`/`max_volume_participation`；`scripts/run_live_strategy.py` 只有惯性/换手阈值（`:356`、`:1937`），无实盘参与率观测 |
+| `C8` | 分级警报与动态降权矩阵 | **部分重叠** | 组合层 10/15/20 熔断、`LV1`、`R1`/`R4`/`R6` 已在；缺的是**信号层（IC/换手）**触发映射 |
+| `C9` | 母组合按 Specific ICIR 自适应再分配 | **延后（不立项）** | `pipeline/research/blend/blend_base.py` 的 `rolling_ic_ir` 只覆盖**子策略层**；`common/sleeve_allocator.py` 无 ICIR 输入；矩阵级分配阻塞于信号快照 + 拥挤惩罚无数据 |
+| `C10` | 重演化触发与平滑热替换 | **缺失** | `ML1` 只覆盖 GP/LightGBM **挖掘**，不含「冻结→影子→切换」协议 |
+
+#### 4.51.3 刻意不建（4 条）
+
+- **Jaccard/成分重叠拥挤度**：无公募持仓与指数成分历史快照 —— 数据源不存在 ⇒ 建了也只能造假。
+- **两融余额/融资买入占比**：无 feed —— 数据源不存在 ⇒ 建了也只能造假。
+- **估值分位 EP/FP/BTOP 历史分位**：无 point-in-time 估值历史，只有当期快照 —— 数据源不存在 ⇒ 建了也只能造假。
+- **完整 Barra 风险模型**：无商业因子收益表与行业收益率表 —— 数据源不存在 ⇒ 建了也只能造假。
+
+#### 4.51.4 为什么「连续 10 日 IC≤0」今天不能直接上线（7 条）
+
+1. IC 需横截面**预测分数**；Stage 2 只落 `target_weight`/`target_shares`/`detail_reason`，无 score 快照。
+2. `detail_reason.dimension_signals` 是 blend 子策略**权重**（`scripts/run_live_strategy.py:2399-2413`、`:2986-2990`、`:3051`，`round(...,4)`），且只对当日被持有的 composite/blend 标的产生 ⇒ 同时犯「权重≠排序」与「持仓子集≠候选池」两个错。
+3. `AllocationTemplate.generate_weights` 返回稀疏目标权重，不是连续 score；静态/择时类规则直出，无量纲可比性。
+4. 横截面被「选择」截断 ⇒ 幸存者偏差，落选标的当场丢弃且不可事后恢复。
+5. horizon 与信息集不匹配：决策在 `--cutoff-time`（默认 14:15 市场本地钟，`scripts/run_live_strategy.py:1270-1277`）的未收盘信息集，IC 需收盘收益；「连续 10 日」最早只能在 `10 + h` 个交易日后有结论。
+6. 历史不可重算：缓存前复权且会修订，配置/dump/universe/5m 可用性都会漂移 ⇒ 用今日数据回填过去属于伪造历史（`L24`/`LV7` 口径）。
+7. 用最终权重当分数会把风控当 alpha：生命周期确认期、`apply_asset_inertia`、锁仓、整手取整、现金扫描都会改写权重（`LV8` 的 `chan_four_state` 恒 0.0 是同类坑）。
+
+#### 4.51.5 名字像但对象不同（防重复建设，5 条）
+
+1. `common/sleeve_allocator.py` sleeve 预算 ≠ 按 Specific ICIR 的母组合再分配（无 ICIR 输入）。
+2. `blend_base.py` 的 `rolling_ic_ir` ≠ 矩阵级策略间分配。
+3. `common/daily_factors.py:192` `ivol_residual` ≠ 多因子特质收益分解。
+4. `scripts/check_live_portfolio_health.py` 的 10 日 NAV 恢复腿（`NAV_10D_STATUS_INSUFFICIENT_HISTORY`，`:117`/`:127`）≠ 信号层 IC 衰减预警。
+5. `detail_reason.dimension_signals` ≠ 可算 IC 的预测分数。
+
+#### 4.51.6 未验证项（4 条，不得直接变默认值）
+
+1. 文档 §五 示例代码的 `ic_threshold=0.02`、`max_crowding_overlap=0.35`、`max_turnover_expansion=1.3` 未经本仓库任何数据校准。
+2. Barra 归因未指明因子库与收益频率。
+3. 母组合 ICIR 公式中的 `Penalty_Crowd` 无数据源。
+4. 热替换「5~10 个交易日影子交易」无最小样本/显著性依据。
+
+#### 4.51.7 计数（纯追加）
+
+本节不新增任务行、不改状态位；沿用本节写作时点值 **151 = 106 `[x]` + 45 `[ ]`**（两文件合计 217）；`§2.24` 的 6 行为同批登记，其自身计数在 §2.24 末尾记为 **157 = 106 `[x]` + 51 `[ ]`**（两文件 223）。`D11` 与 `R6` 的结项分别在 **§4.52** / **§4.53** 单独追加，届时再更新计数，本节不回改。
+
+**计数校正说明（2026-11-07）**：本小节初次落盘时沿用了 §4.49.7 / §4.50.8 的旧基线 `151 = 105 `[x]` + 46 `[ ]`，而 §4.49.7 / §4.50.8 的旧登记值与本日实测值均为 `151 = 106 `[x]` + 45 `[ ]`（行总数同为 151，仅 `[x]`/`[ ]` 拆分不同）。差异来源**未逐节追溯**（本节不做考古，也不回改 §4.49.7 / §4.50.8 的旧值）。现按实测改为 **157 = 106 `[x]` + 51 `[ ]`**。
+
+### 4.52 `D11` 结项：多策略净额 runner 的真 5 分钟日内支持（2026-11-07，含 B1 缺陷复盘）
+
+**4.52.1 结项摘要**
+
+`D11` 交付的是**能力建设**，不是回归修复：把 `load_intraday_5m_universe` + `enrich_universe_with_intraday_features`（`common/intraday_features.py`）移植进净额 runner `scripts/run_live_multi_strategy.py`，重新发出该脚本真正接受的 5m 开关，并让 `observability.intraday_5m` 由 `source="none"` 变为**真实来源**。三态口径不变：`source` 必须是可观测的实测值，缺数据时诚实报 `none` / `UNAVAILABLE`，**不得**默认谎报已启用。
+
+**观测层结构**：`scripts/run_live_multi_strategy.py:605-649` 为本轮 5m 观测块的清空与重建（调用点 `:827`）；轮标识 `round_id` 于 `:519` 生成、`generated_at` 于 `:556-557` 写入；消费侧在 `web/livetrading/execution_service.py` 的 `reconcile_intraday_5m_observability`，轮起始时刻 `round_started_at` 于 `:3627`，净额路径的调用点 `:3859`。
+
+**4.52.2 B1 缺陷与双层防御（事故复盘，必须保留）**
+
+- **缺陷**：净额路径下，上一轮遗留的 `observability.intraday_5m` 块不会被新一轮覆盖就位，`generated_at` 仍旧。web 侧只读该块、不比对轮次，于是把**上一轮**的 5m 观测当成本轮结果消费 —— 在第一个真正开启 `enable_intraday_5m` 的策略上会**谎报日内能力已就绪**，属 §2.19 第 4 条明令禁止的那一类。
+- **潜伏性（当时判断不可省略）**：结项时点 `strategies_config.json` 中**没有任何策略**开启 `enable_intraday_5m`（该键在配置里根本不存在），故 B1 处于**潜伏态**，不会立刻改变任一工单；但它会在第一次打开开关时立刻发作。
+- **双层防御**（两层都必须留下，单层不可替代）：
+  1. **生产侧**：子进程在每轮开始时**先清空**旧观测块，再写新块（`:605-649`），从源头保证同目录下不存在跨轮残留。
+  2. **消费侧 fail-closed**：web 在归一化时比较时间戳，`generated_at < round_started_at` 一律判为**无效/缺失**（不读、不降级为「已就绪」），宁可多报 `none`。这是**防御第二层**：即使生产侧因崩溃、被杀、并发写而漏清，消费侧也不会把旧块当新块。
+- **承重证明**：两层各自单独移除时，对应的变异用例均**转红**；恢复后复绿。故两层都不是装饰性代码。
+
+**4.52.3 验证证据（分三类，不合并档次）**
+
+| 证据类别 | 内容 |
+| :-- | :-- |
+| 实现方自报 | 定向三文件 **139 passed, 1 skipped**；web 全量 **274 passed, 1 skipped** |
+| 独立复核 | 两轮只读复核：初版 **ACCEPT-WITH-NITS** → B1 修复后 **ACCEPT**（无影响资金的未关闭项） |
+| 承重性 | B1 两层各有一次「移除即转红、恢复即复绿」的变异实验记录 |
+
+新增用例落于 `web/livetrading/tests/test_multi_strategy_intraday_5m.py`（8 个用例），其中同日重跑与崩溃轮次日志残留两条在 `:532-606`。
+
+**4.52.4 残余局限与未验证项（不得读成已解决）**
+
+1. **web 归一化会丢弃 `round_id` / `generated_at`**：fail-closed 依赖的时间戳在归一化产物里不再保留，故下游若需再次做轮次一致性判断，**没有**可用字段；这是**已知设计缺陷**（nit），不影响当前判定路径。
+2. **同目录并发 clear 风险**：清空是按目录而非按轮次隔离；若两个 runner 被指向同一个输出目录并发运行，后启动者会清掉前者的块。当前部署为单 runner 串行，**未加锁**。
+3. **子策略参数若挂在顶层 `param_prefix` 之外**，顶层 `resolve_param` 看不到，能力探测会**诚实降级**为 state 1/3 而非假装可用 —— 这是刻意的降级方向，不是缺陷；但也意味着「三态全绿」在自定义策略文件上可能永远达不到。
+4. 本条**未**端到端验证真实市场的 5m 供给质量（离线合成数据不覆盖数据源侧缺口）；`M3.10` / `Fix A` 的「缺失 5m ⇒ 永不 PASS」仍属 `R7` 范围，本结项**不**代劳。
+
+**4.52.5 计数**
+
+本节只翻转 `D11` 一个状态位：**157 = 107 `[x]` + 50 `[ ]`**（行总数不变）。`R6` 的翻转在 §4.53 单独记账，本节不回改前节。
+
+### 4.53 `R6` 结项：收盘前固定时点下调隔夜暴露（2026-11-07，含 `r6.3` 判据变更）
+
+**4.53.1 结项摘要**
+
+`R6` 落地为「收盘前固定时点决定是否下调**隔夜**暴露」，**不是**日内择时：不预测日内路径、不做盘中多空切换。冻结参数（用户批准，2026-11-07）：判定时点 `D = session_close_time(market, day) − 45min`（各市场用**自己的**收盘钟）；局部跳空窗口 `W = 20`；基线取近 `252` 个交易日的 `σ_gap` **中位数**；触发条件 `σ_gap > 2.0 × baseline`（**严格大于**）；下调比例 `ρ = 0.5`，**只作用于非现金目标权重**，现金部分自然吸收、**不做重归一化**；三态 `TRIGGERED | NOT_TRIGGERED | INSUFFICIENT_DATA`；`enabled` **默认开**；数据不足 ⇒ `ratio = 1.0` + WARN，**不拒票**。
+
+**4.53.2 判据冻结与 `r6.3` 变更（先文档、后代码、再测试）**
+
+按 §2.20 纪律，本次判据变更**先落冻结文档**再动代码：
+
+1. `docs/overnight_derisk_judgement_freeze.md` 197 → 254 行，**纯追加**；新增 `## Revision 2026-11-07b (r6.3)` 于 `:199`，正文前 197 行字节不变。
+2. 再改 `common/overnight_derisk.py`：`DECISION_SPEC_VERSION = "r6.3"`。
+3. 再改测试与实盘接线。
+
+**唯一变更点**：跳空横截面由「当前目标持仓簿」改为「该市场**已载入 universe** 去现金代理」。
+
+- `C = resolve_cash_proxy_target_symbols(universe.keys(), cash_proxy)`；`U(m) = {i ∈ universe \ C : market_of(i) = m}`；`gap_t` 为 `U(m)` 内可用标的的**等权均值**；`N_t` 为当日可用（两腿价格均有效且 `Close_{t−1} > 0`）的标的数。
+- 集合选取 `scripts/run_live_strategy.py:2342-2361`，传入点 `:2391`；计数实现 `common/overnight_derisk.py:410-412`。
+- 某市场**无** universe 成员 ⇒ 空集 ⇒ `INSUFFICIENT_DATA`，**永不**回落到持仓簿。
+
+**四条变更理由（原文要点）**：①簿口径使判据依赖当日目标权重，而权重本身由下游门槛改写 ⇒ 同一行情、不同门槛会给不同结论；②簿会被轮动/惯性过滤改变成分，导致历史 σ 序列随之**翻转**，判据不稳定；③用历史 σ 需要一个「不随今日决策变化」的横截面，簿口径在时序上不自洽（轻前视）；④与 §3 自述的「不需要第二路输入」直接矛盾。
+
+**不得叠加**：`r6.1` / `r6.2` / `r6.3` 三套判据**不得同时接线**，同一时刻只允许一套规则；条款已逐字写入冻结文档 `:245-247` 与契约文档 `:247`。代码侧确认：`common/overnight_exposure.py`（`r6.1`）在 `scripts/run_live_strategy.py` 中**零引用**。
+
+**4.53.3 验证证据（分三类，不合并档次）**
+
+| 证据类别 | 内容 |
+| :-- | :-- |
+| 实现方自报 | `test_overnight_derisk.py` **42 passed**；`common/tests/test_live_strategy.py` **25 passed, 11 warnings**；全量 `pipeline/tests` **771 passed, 1 skipped**；全量 `common/tests` **1355 passed, 1 skipped** |
+| 独立静态复核 | **ACCEPT**（无影响资金的缺陷）；该环境无 shell，pytest 与 `git diff` 两项它自标「无法验证」 |
+| 独立执行校验 | 复跑 `test_overnight_derisk.py` **42 passed in 1.33s**、`test_live_strategy.py` **25 passed, 11 warnings**；`git diff -U0 -- docs/overnight_exposure_contract.md \| grep -c '^-[^-]'` = **0**；前 209 行对 `HEAD` **IDENTICAL_FIRST_209** |
+
+**承重变异**：把 `group_universe` 退回 `group_symbols`（即横截面退回簿口径）⇒ `test_r63_cross_section_is_the_universe_and_ignores_the_target_book` 在 `pipeline/tests/test_overnight_derisk.py:767` 转红，报 `assert ['600000.SH', '601398.SH'] == ['000001.SZ', …, '600519.SH']`；未变异副本对照组 1 passed；该文件内**只有这 1 条**对该回退敏感。另有 `M1`（对缩放后簿重归一化）、`M3`（接受过短基线窗口）、`M4`（删除 `D >= close` 守卫）三处变异各自转红后复绿。
+
+**4.53.4 残余局限与禁止事项**
+
+1. **universe 本身会漂移**：横截面取「今日已载入的 universe」，故历史窗口会随后续宇宙变更而移动；这不是簿口径那种逐日翻转，但**不等于**完全 point-in-time 重建。
+2. **「独立于持仓」不字面成立**：持仓标的被并入 `symbols_to_load` 后也会进入 `U(m)`。冻结文档 §3 已如实披露，故**不是缺陷**，但对外表述不得写成「与持仓无关」。
+3. **`L2.39` / tenure lock 可让 `ratio_applied = 0.5` 而权重不变**：锁仓与整手取整发生在降暴露之后，故「已下调」这一**记录**成立、**实际权重**可能未动。读 ticket 时必须同时看 `ratio_applied` 与最终权重，不可只看前者。
+4. **阈值不得复用**：`R6` 的 45min / 2.0× / 252 中位数与 `R1`（日内回撤门禁）、`R4`（横截面离散度）、`R5` 是不同判据，**禁止**互相借用阈值。
+5. 未验证：真实多市场半日市/极端时区边界的端到端行为；`INSUFFICIENT_DATA` 在真实数据缺口下的告警频率。
+
+**4.53.5 最终计数**
+
+本节翻转 `R6` 一个状态位。**最终值（以实测状态单元格为准，独立记数、不回改旧节）：157 = 108 `[x]` + 49 `[ ]`**（两文件合计 223）。行总数不变；`AT1`–`AT6` 六行、`ML1`、`D10`、`D12` 等**均未改动**。
