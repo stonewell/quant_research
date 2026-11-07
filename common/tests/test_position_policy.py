@@ -49,14 +49,20 @@ strict "f(f(x)) == f(x) bit-for-bit" phrasing is unprovable for either side.
 import os
 import sys
 
+import importlib.util
+import subprocess
+import tempfile
+
 import numpy as np
 import pandas as pd
 import pytest
 
 # Ensure project root is in sys.path
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
+_REPO_ROOT = _PROJECT_ROOT  # this file lives at <repo>/common/tests/, so the root IS the repo
+for _root in (_PROJECT_ROOT,):
+    if _root not in sys.path:
+        sys.path.insert(0, _root)
 
 from common.allocation_templates import apply_asset_inertia
 from common.position_policy import (
@@ -75,6 +81,61 @@ from common.position_policy import (
 
 # Number of randomized differential seeds. The gate asks for at least 200.
 SEEDS = list(range(240))
+
+# The commit immediately BEFORE M4.2 phase-2 / commit 1b, i.e. the last revision
+# in which `common/allocation_templates.py::apply_asset_inertia` still ran its own
+# per-bar loop. PINNED for the same reason as
+# `pipeline/research_strategy/tests/test_blend_policy_kernel.py`: now that the
+# delegation has landed, `HEAD:common/allocation_templates.py` IS the delegated
+# file, so a `HEAD:`-based reference would compare the kernel against itself and
+# keep passing no matter what the kernel did. The pin is also what makes the
+# `position_policy`-free assertion below possible.
+_LEGACY_TEMPLATES_COMMIT = "ab82318"
+_LEGACY_TEMPLATES_PATH = "common/allocation_templates.py"
+_LEGACY_MODULE = None
+
+
+def _legacy_apply_asset_inertia():
+    """The PRE-delegation `apply_asset_inertia`, loaded from a pinned git blob."""
+    global _LEGACY_MODULE
+    if _LEGACY_MODULE is not None:
+        return _LEGACY_MODULE.apply_asset_inertia
+
+    try:
+        proc = subprocess.run(
+            ["git", "show", f"{_LEGACY_TEMPLATES_COMMIT}:{_LEGACY_TEMPLATES_PATH}"],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        # NOT a skip: this is the primary bit-identity gate. A skip would let the
+        # whole 240-seed differential harness disappear silently.
+        pytest.fail(
+            f"cannot read the pre-delegation allocation_templates blob "
+            f"({_LEGACY_TEMPLATES_COMMIT}:{_LEGACY_TEMPLATES_PATH}) from git: {exc}"
+        )
+
+    src = proc.stdout
+    assert src.strip(), "git show returned an empty allocation_templates source"
+    assert "position_policy" not in src, (
+        "the pinned blob already imports the policy kernel; the differential gate "
+        "would be comparing the delegation against itself (vacuous)"
+    )
+
+    tmpdir = tempfile.mkdtemp(prefix="m4_2_templates_legacy_")
+    module_path = os.path.join(tmpdir, "allocation_templates_legacy.py")
+    with open(module_path, "w", encoding="utf-8") as fh:
+        fh.write(src)
+
+    spec = importlib.util.spec_from_file_location("_allocation_templates_legacy", module_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    _LEGACY_MODULE = module
+    return module.apply_asset_inertia
+
 
 
 # ---------------------------------------------------------------------------
@@ -307,12 +368,21 @@ def _build_case(seed: int):
 
 @pytest.mark.parametrize("seed", SEEDS)
 def test_kernel_is_cell_identical_to_apply_asset_inertia(seed):
-    """M4.1 gate: 240 seeds, whole matrix of threshold/cash/emergency/tenure shapes."""
+    """M4.1 gate: 240 seeds, whole matrix of threshold/cash/emergency/tenure shapes.
+
+    Since M4.2 phase-2 / commit 1b, `apply_asset_inertia` IS a delegation to
+    `kernel_apply_asset_inertia`, so comparing the two directly would be
+    tautological (and would stay green even if the delegation changed the
+    numbers). The reference is therefore the PRE-delegation implementation, read
+    from the pinned commit `_LEGACY_TEMPLATES_COMMIT`, and the live delegated
+    function is compared to it as well -- three-way, same cells.
+    """
     daily, kwargs, ref_kwargs = _build_case(seed)
     context = f"seed={seed} kwargs={_kw_summary(kwargs)}"
 
-    ref = apply_asset_inertia(daily, **ref_kwargs)
+    ref = _legacy_apply_asset_inertia()(daily, **ref_kwargs)
     got = kernel_apply_asset_inertia(daily, **kwargs)
+    delegated = apply_asset_inertia(daily, **ref_kwargs)
 
     # Invariant 2, stated explicitly before the equality gate so a regression
     # names the mechanism (see helper docstring).
@@ -331,6 +401,20 @@ def test_kernel_is_cell_identical_to_apply_asset_inertia(seed):
     except AssertionError as exc:  # pragma: no cover - only on a real defect
         raise AssertionError(
             f"{context}: values differ -- {_first_mismatch(ref, got)}\n{exc}"
+        ) from None
+
+    # The production entry point (now a delegation) must be indistinguishable from
+    # the pinned legacy function -- this is the bit-identity the flip relies on.
+    assert (ref.isna() == delegated.isna()).all().all(), (
+        f"{context}: the delegated `apply_asset_inertia` changed the NaN footprint "
+        f"-- {_first_mismatch(ref, delegated)}"
+    )
+    try:
+        np.testing.assert_array_equal(ref.to_numpy(), delegated.to_numpy())
+    except AssertionError as exc:  # pragma: no cover - only on a real defect
+        raise AssertionError(
+            f"{context}: the delegated `apply_asset_inertia` changed values -- "
+            f"{_first_mismatch(ref, delegated)}\n{exc}"
         ) from None
 
 
@@ -866,8 +950,10 @@ def test_reapplying_kernel_to_its_own_output(seed):
         err_msg=context,
     )
 
-    # The real gate: the second pass is bit-identical to the reference's second pass.
-    _assert_cell_identical(apply_asset_inertia(first, **kwargs), second, context=context)
+    # The real gate: the second pass is bit-identical to the LEGACY reference's
+    # second pass (pinned pre-delegation source; `apply_asset_inertia` itself is
+    # now the delegation, so using it here would be tautological).
+    _assert_cell_identical(_legacy_apply_asset_inertia()(first, **kwargs), second, context=context)
 
 
 # ---------------------------------------------------------------------------
@@ -893,24 +979,28 @@ def _blend_universe(n_days: int = 200) -> dict:
 
 
 def test_kernel_callers_are_guarded_by_opt_in_flag(monkeypatch):
-    """M4.2 phase 1: the ONLY kernel caller is blend_base, and only behind a flag.
+    """M4.2 phase 2: two call sites, two DIFFERENT contracts.
 
     History: M4.1 shipped the kernel as dead code and this guard asserted that
     BOTH `common/allocation_templates.py` and `pipeline/research/blend/blend_base.py`
-    were import-free. Phase 1 of M4.2 deliberately flips the blend inertia step
-    (`blend_use_policy_kernel`, default `False`), so the guard is narrowed rather
-    than dropped:
+    were import-free. Each phase then narrowed (never dropped) the guard:
 
-      * `common/allocation_templates.py` -- still MUST NOT import the kernel
-        (phase 2 owns that flip and must update this guard in its own commit);
-        asserted by the static import scan below, unchanged since M4.1;
+      * `common/allocation_templates.py` -- phase 2 / commit 1b makes this real:
+        the module DOES now import the kernel, but ONLY `kernel_apply_asset_inertia`,
+        ONLY for `apply_asset_inertia`, and `apply_asset_inertia` must be exactly
+        one delegation call. `_step_asset_inertia` (still the blend engine's
+        flag-off branch) and `_sparse_from_daily` (the inline dense->sparse
+        compression) must stay NON-delegating -- asserted behaviourally with spies,
+        because a source substring would not notice `_step_asset_inertia` being
+        re-pointed at the kernel;
       * `pipeline/research/blend/blend_base.py` -- MAY import it, but the DEFAULT
-        path must still be the legacy `_step_asset_inertia` step and the flag-ON
-        path must bypass it. Asserted BEHAVIOURALLY (a call-path spy), because
-        the kernel is bit-identical to the legacy step (`max_abs_diff == 0.0`):
-        output comparison is structurally incapable of noticing a default flip,
-        and a source-substring check cannot notice the branch being neutralised
-        (`use_policy_kernel = True`, or `if use_policy_kernel:` -> `if True:`).
+        inertia path must still be the legacy `_step_asset_inertia` step and the
+        flag-ON path must bypass it. Asserted BEHAVIOURALLY (a call-path spy),
+        because the kernel is bit-identical to the legacy step
+        (`max_abs_diff == 0.0`): output comparison is structurally incapable of
+        noticing a default flip, and a source-substring check cannot notice the
+        branch being neutralised (`use_policy_kernel = True`, or
+        `if use_policy_kernel:` -> `if True:`).
 
     M4.2 phase 2 / commit 1a adds ONE projection delegation, and it is NOT part of
     the flag: `blend_base` now compresses via `SparseProjector.project` (a literal
@@ -927,7 +1017,13 @@ def test_kernel_callers_are_guarded_by_opt_in_flag(monkeypatch):
 
     import_line = re.compile(r"^\s*(?:from\s+\S+\s+import\b|import\b)")
 
-    # (a) the templates module stays kernel-free -- static import scan (unchanged)
+    # (a) `common/allocation_templates.py`: the kernel is imported ONLY for
+    # `apply_asset_inertia`, and that function is exactly one delegation call.
+    #
+    # Static half: the single `position_policy` import must name
+    # `kernel_apply_asset_inertia` and nothing else -- an import of `AssetPolicy`,
+    # `SparseProjector` or `_sparse_from_daily`'s replacement here would mean a
+    # second, unguarded call site.
     templates_path = os.path.join(_PROJECT_ROOT, "common/allocation_templates.py")
     assert os.path.isfile(templates_path), "expected guard target to exist"
     offenders = []
@@ -937,9 +1033,84 @@ def test_kernel_callers_are_guarded_by_opt_in_flag(monkeypatch):
                 continue
             if import_line.match(line):
                 offenders.append(f"common/allocation_templates.py:{number}: {line.strip()}")
-    assert not offenders, (
-        "common/allocation_templates.py must stay kernel-free until phase 2: " + "; ".join(offenders)
+    assert len(offenders) == 1, (
+        "expected exactly ONE `common.position_policy` import in "
+        f"common/allocation_templates.py (for `apply_asset_inertia`), got {offenders}"
     )
+    assert "kernel_apply_asset_inertia" in offenders[0] and "{" not in offenders[0], (
+        "common/allocation_templates.py must import ONLY `kernel_apply_asset_inertia` "
+        f"from the kernel module; got: {offenders[0]}"
+    )
+
+    import common.allocation_templates as templates
+
+    kernel_calls = {"n": 0}
+    original_kernel = templates.kernel_apply_asset_inertia
+
+    def spy_kernel(*args, **kwargs):
+        kernel_calls["n"] += 1
+        return original_kernel(*args, **kwargs)
+
+    monkeypatch.setattr(templates, "kernel_apply_asset_inertia", spy_kernel)
+
+    rng = np.random.default_rng(4242)
+    daily = pd.DataFrame(
+        rng.random((12, 4)) * 0.25,
+        index=pd.bdate_range("2021-01-04", periods=12),
+        columns=["A", "B", "C", "CASH"],
+    )
+    # `_step_asset_inertia` is SINGLE-BAR and must not route through the kernel --
+    # it is still the blend engine's flag-off branch and its per-bar call shape is
+    # what makes that branch bit-identical to the pre-M4.2 code.
+    kernel_calls["n"] = 0
+    templates._step_asset_inertia(
+        t=1,
+        ideal_w=daily.iloc[1],
+        current_w=daily.iloc[0],
+        risky_symbols=["A", "B", "C"],
+        symbols=["A", "B", "C", "CASH"],
+        thresh_t=pd.Series({"A": 0.02, "B": 0.02, "C": 0.02}),
+        holding_age={"A": 1, "B": 1, "C": 1},
+        last_buy_bar={"A": 0, "B": 0, "C": 0},
+        cash_proxy="CASH",
+        em_row=None,
+    )
+    assert kernel_calls["n"] == 0, (
+        f"`_step_asset_inertia` called the kernel {kernel_calls['n']} times: it must "
+        "stay the standalone per-bar step (blend_base's flag-off branch uses it directly)"
+    )
+
+    # `_sparse_from_daily` keeps its INLINE compression -- it must not become a
+    # `SparseProjector.project` alias (that projection is wired in blend_base only).
+    project_calls = {"n": 0}
+    original_project_only = SparseProjector.project
+
+    def spy_project_only(self, frame):
+        project_calls["n"] += 1
+        return original_project_only(self, frame)
+
+    monkeypatch.setattr(SparseProjector, "project", spy_project_only)
+    sparse_input = daily.copy()
+    sparse_input.iloc[3] = sparse_input.iloc[2]  # an unchanged day MUST project to NaN
+    sparse = templates._sparse_from_daily(sparse_input)
+    assert project_calls["n"] == 0, (
+        f"`_sparse_from_daily` called `SparseProjector.project` {project_calls['n']} times: "
+        "the helper must keep its own inline compression"
+    )
+    assert sparse.iloc[3].isna().all(), (
+        "the unchanged day was not projected to NaN -- the non-vacuity guard for the "
+        "inline compression is broken"
+    )
+    monkeypatch.setattr(SparseProjector, "project", original_project_only)
+
+    # `apply_asset_inertia` delegates EXACTLY ONCE per call (not once per bar).
+    kernel_calls["n"] = 0
+    templates.apply_asset_inertia(daily, min_weight_change=0.02, cash_proxy="CASH")
+    assert kernel_calls["n"] == 1, (
+        f"`apply_asset_inertia` called the kernel {kernel_calls['n']} times for one "
+        "panel: the panel loop must be delegated ONCE, not re-entered per bar"
+    )
+    monkeypatch.setattr(templates, "kernel_apply_asset_inertia", original_kernel)
 
     # (a2) phase-2 commit 1a: sparse projection is delegated, flag-independently.
     assert not hasattr(blend_base, "_sparse_from_daily"), (
@@ -970,7 +1141,7 @@ def test_kernel_callers_are_guarded_by_opt_in_flag(monkeypatch):
         "blend_base no longer imports the legacy `_step_asset_inertia` step -- the "
         "default-off path would no longer be the pre-M4.2 code"
     )
-    calls = {"legacy": 0, "kernel": 0}
+    calls = {"legacy": 0, "kernel": 0, "delegated_helper": 0}
     original_step = blend_base._step_asset_inertia
     original_sequence = PortfolioSequencer.sequence
 
@@ -979,7 +1150,23 @@ def test_kernel_callers_are_guarded_by_opt_in_flag(monkeypatch):
         return original_step(**kwargs)
 
     def spy_sequence(self, *args, **kwargs):
-        calls["kernel"] += 1
+        # PROVENANCE, because since commit 1b the kernel is reachable WITHOUT the
+        # flag: `common.allocation_templates.apply_asset_inertia` now delegates to
+        # `kernel_apply_asset_inertia`, and several sub-strategies call it
+        # (`worldquant_alpha_strategy`, `gtja191_factors`, `chan_advanced_strategies`,
+        # `timing_aspects`, ...). Those calls ARE the kernel running, unconditionally
+        # and by design. What this guard still owns is the BLEND ENGINE's own per-bar
+        # inertia step, so the counter splits on the immediate caller's module:
+        # `blend_base.py` = the `generate_weights` loop (flag-gated),
+        # `position_policy.py` = the delegated panel helper (flag-independent).
+        import inspect
+
+        frame = inspect.currentframe().f_back
+        caller = os.path.basename(frame.f_code.co_filename) if frame else ""
+        if caller == "blend_base.py":
+            calls["kernel"] += 1
+        else:
+            calls["delegated_helper"] += 1
         return original_sequence(self, *args, **kwargs)
 
     monkeypatch.setattr(blend_base, "_step_asset_inertia", spy_step)
@@ -987,7 +1174,9 @@ def test_kernel_callers_are_guarded_by_opt_in_flag(monkeypatch):
 
     universe = _blend_universe(200)
 
-    # (b1) flag absent -> the legacy step runs, the kernel is NEVER touched.
+    # (b1) flag absent -> the legacy step runs; the blend engine's own kernel step
+    # is NEVER taken (the delegated panel helper is, and must be -- see the
+    # provenance note in `spy_sequence`).
     off = GenericBlendStrategy().generate_weights(universe, {})
     assert len(off.dropna(how="all")) > 0, (
         "the synthetic run produced no rebalance rows -- the call-path spy would be vacuous"
@@ -999,7 +1188,11 @@ def test_kernel_callers_are_guarded_by_opt_in_flag(monkeypatch):
     )
     assert calls["kernel"] == 0, (
         f"the DEFAULT path called `PortfolioSequencer.sequence` {calls['kernel']} times "
-        "without opting in via `blend_use_policy_kernel`"
+        "from `blend_base.py` without opting in via `blend_use_policy_kernel`"
+    )
+    assert calls["delegated_helper"] > 0, (
+        "`apply_asset_inertia` did not reach the kernel at all -- commit 1b's "
+        "delegation has gone dead, and the flag-off run would no longer cover it"
     )
     assert projections["off"] > 0, (
         "with `blend_use_policy_kernel` absent, `SparseProjector.project` was never "
@@ -1009,6 +1202,7 @@ def test_kernel_callers_are_guarded_by_opt_in_flag(monkeypatch):
     # (b2) flag True -> the kernel is used and the legacy step is BYPASSED.
     calls["legacy"] = 0
     calls["kernel"] = 0
+    calls["delegated_helper"] = 0
     spy_project.state = "on"
     spy_write.state = "on"
     on = GenericBlendStrategy().generate_weights(

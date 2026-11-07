@@ -25,6 +25,7 @@ import pandas as pd
 from common.covariance import denoise_correlation, denoise_covariance
 from common.indicator_features import compute_feature
 from common.indicators import realized_vol, roc, rsi
+from common.position_policy import kernel_apply_asset_inertia
 from common.scheduling import get_rebalance_dates as _get_rebalance_dates
 
 
@@ -674,62 +675,36 @@ def apply_asset_inertia(
     3. Residual unallocated cash is routed to `cash_proxy` (if present).
     4. Emergency dates (indicated by `emergency_mask`) bypass inertia and holding constraints
        to allow immediate liquidation or de-risking without threshold delay.
+
+    M4.2 phase 2 (commit 1b): the body is now a single delegation to
+    `common.position_policy.kernel_apply_asset_inertia`, which reproduces this
+    function cell-for-cell (identical threshold-normalization preamble, first-row
+    seed, tenure clocks, `emergency_mask` handling, and per-bar sequencing). The
+    signature and all defaults above are UNCHANGED -- every existing caller keeps
+    calling `apply_asset_inertia` and gets bit-identical frames, `NaN` = "no
+    instruction" and explicit `0.0` = "exit" preserved.
+
+    Why the delegation is unconditional here (no opt-in flag): the equivalence
+    was proven over 240 randomized seeds before the flip
+    (`common/tests/test_position_policy.py`, now re-pinned against this function's
+    pre-delegation source so the gate stays non-vacuous). The flag
+    (`blend_use_policy_kernel`) gates the blend engine's per-bar step SELECTION,
+    not this panel-level helper.
+
+    `_step_asset_inertia` is deliberately KEPT and still used directly by
+    `pipeline/research/blend/blend_base.py`'s default (flag-off) branch; it is not
+    a thin wrapper over the kernel.
     """
-    if daily.empty:
-        return daily
-
-    symbols = list(daily.columns)
-    risky_symbols = [s for s in symbols if s != cash_proxy]
-    n_dates = len(daily)
-
-    is_df_thresh = isinstance(min_weight_change, pd.DataFrame)
-    if isinstance(min_weight_change, (int, float)):
-        if min_weight_change <= 0.0 and min_holding_bars <= 0:
-            return daily
-        thresh = pd.Series(float(min_weight_change), index=risky_symbols)
-    elif isinstance(min_weight_change, dict):
-        thresh = pd.Series(min_weight_change).reindex(risky_symbols).fillna(0.02)
-    elif isinstance(min_weight_change, pd.Series):
-        thresh = min_weight_change.reindex(risky_symbols).fillna(0.02)
-    elif is_df_thresh:
-        thresh = None
-    else:
-        thresh = pd.Series(0.02, index=risky_symbols)
-
-    filtered = daily.copy()
-    current_w = daily.iloc[0].copy()
-    filtered.iloc[0] = current_w
-
-    holding_age = {s: 0 for s in risky_symbols}
-    last_buy_bar = {s: (0 if current_w[s] > 1e-4 else -999) for s in risky_symbols}
-
-    for t in range(1, n_dates):
-        ideal_w = daily.iloc[t]
-        em_row = emergency_mask.iloc[t] if emergency_mask is not None else None
-        if is_df_thresh:
-            thresh_t = min_weight_change.iloc[t].reindex(risky_symbols).fillna(0.02)
-        else:
-            thresh_t = thresh
-
-        current_w = _step_asset_inertia(
-            t=t,
-            ideal_w=ideal_w,
-            current_w=current_w,
-            risky_symbols=risky_symbols,
-            symbols=symbols,
-            thresh_t=thresh_t,
-            holding_age=holding_age,
-            last_buy_bar=last_buy_bar,
-            cash_proxy=cash_proxy,
-            em_row=em_row,
-            asymmetric_sells=asymmetric_sells,
-            entry_threshold=entry_threshold,
-            min_holding_bars=min_holding_bars,
-            asymmetric_sell_ratio=asymmetric_sell_ratio,
-        )
-        filtered.iloc[t] = current_w
-
-    return filtered
+    return kernel_apply_asset_inertia(
+        daily,
+        min_weight_change=min_weight_change,
+        cash_proxy=cash_proxy,
+        emergency_mask=emergency_mask,
+        asymmetric_sells=asymmetric_sells,
+        entry_threshold=entry_threshold,
+        min_holding_bars=min_holding_bars,
+        asymmetric_sell_ratio=asymmetric_sell_ratio,
+    )
 
 
 def _sparse_from_daily(

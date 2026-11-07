@@ -332,7 +332,7 @@ def test_strategy_config_field_alone_selects_kernel_path(monkeypatch):
     """
     import pipeline.research.blend.blend_base as blend_base
 
-    calls = {"legacy": 0, "kernel": 0}
+    calls = {"legacy": 0, "kernel": 0, "delegated_helper": 0}
     original_step = blend_base._step_asset_inertia
     original_sequence = PortfolioSequencer.sequence
 
@@ -341,7 +341,20 @@ def test_strategy_config_field_alone_selects_kernel_path(monkeypatch):
         return original_step(**kwargs)
 
     def spy_sequence(self, *args, **kwargs):
-        calls["kernel"] += 1
+        # PROVENANCE split: since M4.2 phase-2 / commit 1b,
+        # `common.allocation_templates.apply_asset_inertia` delegates to
+        # `kernel_apply_asset_inertia` unconditionally, so the kernel also runs when
+        # the flag is OFF (through sub-strategies that call that helper). The flag
+        # only selects the BLEND ENGINE's own per-bar step, which lives in
+        # `blend_base.py`; `position_policy.py` callers are the delegated helper.
+        import inspect
+
+        frame = inspect.currentframe().f_back
+        caller = os.path.basename(frame.f_code.co_filename) if frame else ""
+        if caller == "blend_base.py":
+            calls["kernel"] += 1
+        else:
+            calls["delegated_helper"] += 1
         return original_sequence(self, *args, **kwargs)
 
     monkeypatch.setattr(blend_base, "_step_asset_inertia", spy_step)
@@ -363,7 +376,11 @@ def test_strategy_config_field_alone_selects_kernel_path(monkeypatch):
     )
     assert calls["kernel"] == 0, (
         f"the DEFAULT config called `PortfolioSequencer.sequence` {calls['kernel']} times "
-        "without opting in via `blend_use_policy_kernel`"
+        "from `blend_base.py` without opting in via `blend_use_policy_kernel`"
+    )
+    assert calls["delegated_helper"] > 0, (
+        "`apply_asset_inertia` never reached the kernel -- the commit-1b delegation is "
+        "dead, so this run would not cover it at all"
     )
 
     # (b) constructor keyword alone (params carry no flag) -> kernel path, legacy bypassed.

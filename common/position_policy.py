@@ -16,24 +16,31 @@ cannot express per-symbol tenure/confirmation state):
                          from freed cash, residual -> `cash_proxy`.
   * `SparseProjector` -- the sparse-weights projection and its write-back table.
 
-STAGE: M4.1 -- PURE ADDITION, ZERO CALLERS
-==========================================
-This module is deliberately DEAD CODE. Nothing imports it, nothing delegates to
-it, and no engine's output changes because of it:
+STAGE: M4.1 DEAD CODE -> M4.2 PHASE 2 PARTIAL WIRING
+====================================================
+M4.1 shipped this module as deliberately DEAD CODE. Phases 1 and 2 of M4.2 have
+since wired it, bit-identically, at exactly these points:
 
-  * `common/allocation_templates.py` still runs its own `_step_asset_inertia` /
-    `apply_asset_inertia` / `_sparse_from_daily`.
-  * `common/position_lifecycle.py` still runs its own `step_position_lifecycle`;
+  * `common/allocation_templates.py` -- `apply_asset_inertia` is now a single
+    delegation to `kernel_apply_asset_inertia` (M4.2 phase 2 / commit 1b). Its
+    `_step_asset_inertia` and `_sparse_from_daily` remain the module's OWN
+    implementations and are NOT kernel wrappers.
+  * `pipeline/research/blend/blend_base.py` -- the per-bar inertia step delegates
+    to `PortfolioSequencer.sequence` behind the default-OFF
+    `blend_use_policy_kernel` (phase 1), and the final dense->sparse compression
+    now calls `SparseProjector.project` unconditionally (phase 2 / commit 1a;
+    projection has no behavioural knob to gate).
+  * `common/position_lifecycle.py` STILL runs its own `step_position_lifecycle`;
     it only RE-EXPORTS the enums/labels/predicates defined here (see part E of
     M4.1 -- a type migration, no behaviour).
-  * `pipeline/research/blend/blend_base.py`, `backtester/`, `scripts/` and
-    `web/` are untouched.
+  * `backtester/`, `scripts/` and `web/` are untouched; `SparseProjector.write`
+    and `AssetPolicy.step`'s 6-state gates are NOT wired into any backtest path
+    yet (M4.3 / M4.1 items #4/#5).
 
-Wiring is a later stage (design §8 stage 2/3: `blend_use_policy_kernel` /
-`live_use_policy_kernel`, both default `False`). Do not import this module from
-a production path before that stage lands, and do not bump any `version` /
-`BASE_VERSION` for this file: it carries no version constant on purpose,
-because M4.1 changes no backtest behaviour.
+The live-trading wiring (`live_use_policy_kernel`) is still a later stage
+(design §8 stage 3). Do not bump any `version` / `BASE_VERSION` for this file:
+it carries no version constant on purpose, and no call-site flip here changes a
+backtest number.
 
 BIT-IDENTICAL REFERENCE
 =======================
