@@ -1,36 +1,39 @@
-"""M4.2 -- `blend_use_policy_kernel` wiring tests (default ON since 1.9.0).
+"""M4.2 -> M4.4 stage D1 -- `blend_use_policy_kernel`: the legacy path is GONE.
+
+History: M4.2 wired the position-policy kernel behind `blend_use_policy_kernel`
+and flipped its default ON in `BASE_VERSION 1.9.0`. M4.4 stage D1
+(`BASE_VERSION 2.0.0`) DELETED the pre-M4.2 `_step_asset_inertia` branch and its
+import, so the kernel is now the ONLY per-bar inertia step and the key is inert:
+an explicit `False` logs a loud removal warning and the kernel runs anyway.
 
 What this file pins, in one place:
 
-  1. OUTPUT IDENTITY WITH THE PRE-M4.2 MODULE -- both arms (the post-1.9.0 default,
-     i.e. flag absent -> kernel, and the explicit opt-out `False` -> legacy) equal
-     the PRE-M4.2 module exactly: same cells, same `NaN` positions, same column
-     order, `max_abs_diff == 0.0`. The parent module is loaded from a PINNED git
-     blob, not from `HEAD:`. Why pinned: once this change is committed,
-     `HEAD:pipeline/research/blend/blend_base.py` IS the new file, so a
-     `HEAD:`-based comparison would silently degrade into code-versus-itself and
-     keep passing even if the legacy branch were rewritten. The pin (the last
-     commit before the delegation) also lets the loaded source be asserted flag-free,
-     which is what makes the test non-vacuous.
-  2. PATH EQUIVALENCE -- the kernel arm (`True`) returns the SAME committed weights
-     as the explicit legacy arm (`False`) (tolerance 0.0: both paths run the same
-     float arithmetic, so any difference would be structural, not numerical). The
-     legacy arm is selected EXPLICITLY because the flag-absent default is the kernel
-     since 1.9.0 -- comparing against the absent arm would now be a self-comparison.
+  1. OUTPUT IDENTITY WITH THE PRE-M4.2 MODULE -- every arm (flag absent, explicit
+     `False`, explicit `True`) equals the PRE-M4.2 module exactly: same cells, same
+     `NaN` positions, same column order, `max_abs_diff == 0.0`. The parent module is
+     loaded from a PINNED git blob, not from `HEAD:`. Why pinned: a
+     `HEAD:`-based comparison would degrade into code-versus-itself once the change
+     lands, and keep passing even if the kernel's committed arithmetic were
+     rewritten. The pin (the last commit before the delegation) still contains the
+     legacy step, which is what makes the comparison non-vacuous.
+  2. INERT LEGACY KEY -- `blend_use_policy_kernel=False`, in `params` or on
+     `StrategyConfig`, produces the SAME frame as flag-absent AND emits the removal
+     warning naming `BASE_VERSION 2.0.0`. It must not be honoured silently (there
+     is no legacy engine left to honour it with) and it must not be dropped
+     silently either.
   3. SPARSE / CELL-LEVEL CONTRACT -- non-rebalance rows are all `NaN`, the output is
      never forward-filled by the template, a rebalance row carries NO `NaN` in a
      risky column, and a de-risked symbol is an explicit `0.0` (a `NaN` there would
      make the backtester's column-wise `ffill()` silently keep the stale position).
-  4. FLAG RESOLUTION -- params first, then the `StrategyConfig` attribute, on the
-     PREFIXED key only. The bare name `use_policy_kernel` must be ignored: the
-     2026-10-21 `wq_alpha_id` incident was a bare name falling through to a global
-     `StrategyConfig` field and silently swapping a sub-strategy class.
+  4. KEY RESOLUTION -- the legacy key is read on the PREFIXED name only (that is
+     why `False` still warns). The bare name `use_policy_kernel` must be ignored:
+     the 2026-10-21 `wq_alpha_id` incident was a bare name falling through to a
+     global `StrategyConfig` field and silently swapping a sub-strategy class.
   5. DEPLOYED CONFIG PIN -- `chan_four_state_blend` stays on
      `regime_ic_ir_hybrid` (documented exception, `docs/version.md` §8).
-  6. VERSION PIN -- `BaseBlendAllocationStrategy.BASE_VERSION == "1.9.0"`
-     (bumped WITH the default flip: the default is a behavioural contract, so a
-     `1.8.0` stamp while running the kernel path would be the 2026-11-02
-     "two version pairs" shape).
+  6. VERSION PIN -- `BaseBlendAllocationStrategy.BASE_VERSION == "2.0.0"`
+     (major: a flag branch was deleted, so the engine contract changed). A `1.9.0`
+     stamp here would let a dump claim a two-path engine that no longer exists.
 
 100% offline: synthetic OHLCV only (`common.testing.make_ohlcv_from_closes`).
 """
@@ -63,9 +66,18 @@ from pipeline.research_strategy.rs.config import StrategyConfig
 # the wrong reference here).
 _PARENT_COMMIT = "c51dd2a"
 _PARENT_PATH = "pipeline/research/blend/blend_base.py"
+# `common/allocation_templates.py` as of the last commit BEFORE `apply_asset_inertia`
+# delegated to the kernel -- i.e. the module that still CONTAINS the legacy
+# `_step_asset_inertia` the pinned parent blend_base imports. Needed because M4.4
+# stage D1 deleted that symbol from the live module: the pinned parent cannot be
+# exec'd against it any more, and the parent arm must be paired with the module of
+# its own era, not with a stub.
+_TEMPLATES_PARENT_COMMIT = "ab82318"
+_TEMPLATES_PARENT_PATH = "common/allocation_templates.py"
 _FLAG = "blend_use_policy_kernel"
 
 _PARENT_MODULE = None
+_TEMPLATES_PARENT_MODULE = None
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +98,52 @@ def _make_universe(n_days: int = 200) -> dict:
     for df in universe.values():
         df.index = dates
     return universe
+
+
+def _templates_parent_module():
+    """Import the PRE-delegation `common.allocation_templates` from the pinned blob.
+
+    Only used to satisfy the pinned parent `blend_base` blob's
+    `from common.allocation_templates import ..., _step_asset_inertia`: that symbol
+    no longer exists in the live module after M4.4 stage D1, and the reference arm
+    must run the reference step, not a shim.
+    """
+    global _TEMPLATES_PARENT_MODULE
+    if _TEMPLATES_PARENT_MODULE is not None:
+        return _TEMPLATES_PARENT_MODULE
+
+    try:
+        proc = subprocess.run(
+            ["git", "show", f"{_TEMPLATES_PARENT_COMMIT}:{_TEMPLATES_PARENT_PATH}"],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:  # pragma: no cover
+        pytest.skip(f"cannot read the pre-delegation allocation_templates blob: {exc}")
+
+    src = proc.stdout
+    assert "def _step_asset_inertia(" in src, (
+        "the pinned allocation_templates blob no longer contains the legacy "
+        "`_step_asset_inertia` step -- the reference arm would be vacuous"
+    )
+    assert "kernel_apply_asset_inertia" not in src, (
+        "the pinned allocation_templates blob already imports the policy kernel; the "
+        "reference must be the PRE-delegation implementation"
+    )
+
+    tmpdir = tempfile.mkdtemp(prefix="m4_2_templates_parent_")
+    module_path = os.path.join(tmpdir, "allocation_templates_pre_m42.py")
+    with open(module_path, "w", encoding="utf-8") as fh:
+        fh.write(src)
+
+    spec = importlib.util.spec_from_file_location("_templates_pre_m42", module_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    _TEMPLATES_PARENT_MODULE = module
+    return module
 
 
 def _parent_module():
@@ -120,7 +178,17 @@ def _parent_module():
     spec = importlib.util.spec_from_file_location("_blend_base_pre_m42", module_path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    # The pinned parent imports `_step_asset_inertia`, which the live module no
+    # longer has (D1). Swap the pinned pre-delegation module in for the duration of
+    # the exec so the reference arm is the reference code end to end, then restore.
+    import common.allocation_templates as _live_templates
+
+    _pinned_templates = _templates_parent_module()
+    sys.modules["common.allocation_templates"] = _pinned_templates
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules["common.allocation_templates"] = _live_templates
     _PARENT_MODULE = module
     return module
 
@@ -165,8 +233,8 @@ def _assert_frames_identical(actual: pd.DataFrame, expected: pd.DataFrame, label
 
 @pytest.fixture(scope="module")
 def frames():
-    """Default (flag absent = KERNEL since 1.9.0), explicit opt-out (legacy),
-    explicit True, and the pinned pre-M4.2 parent module."""
+    """Flag absent, legacy key `False` (inert since D1), explicit `True`, and the
+    pinned pre-M4.2 parent module. All three live-engine arms are the kernel now."""
     universe = _make_universe(200)
     return {
         "universe": universe,
@@ -178,20 +246,23 @@ def frames():
 
 
 # ---------------------------------------------------------------------------
-# 1. disabled bit-identity vs. the pre-change module
+# 1. bit-identity vs. the pre-change module (the legacy step's last known output)
 # ---------------------------------------------------------------------------
 
 
 def test_disabled_path_is_bit_identical_to_pre_change_module(frames):
-    """The opt-out AND the post-1.9.0 default both equal the pre-M4.2 output exactly.
+    """All three arms equal the pre-M4.2 output exactly -- the D1 non-regression gate.
 
-    Before commit 2 this only had to cover the flag-absent (then legacy) and
-    explicit-False arms. After the flip the flag-absent arm is the KERNEL, so the
-    pair now says something stronger and still non-vacuous: whichever of the two
-    routes the flag selects, the produced frame is the pre-M4.2 module's frame to
-    the last digit (`max_abs_diff == 0.0`, identical NaN footprint, identical
-    column order). The explicit `False` arm is what keeps the legacy branch
-    covered -- an "absent" arm alone would now compare the kernel with itself.
+    M4.4 stage D1 deleted the legacy step, so "which arm is running" is no longer a
+    question: every arm is the kernel. What still has to hold is that DELETING the
+    branch changed nothing a consumer can see -- that is what this pinned-blob
+    comparison buys, to the last digit (`max_abs_diff == 0.0`, identical `NaN`
+    footprint, identical column order), for flag absent, `False` and `True`.
+
+    The parent blob is the last commit BEFORE the M4.2 delegation, i.e. the legacy
+    `_step_asset_inertia` implementation itself. Keeping the arms while the engine
+    they used to differentiate is gone is deliberate: the frame is the contract, and
+    the arms are how a future refactor would show up.
     """
     absent = frames["absent"]
     parent = frames["parent"]
@@ -200,38 +271,66 @@ def test_disabled_path_is_bit_identical_to_pre_change_module(frames):
     assert len(absent.dropna(how="all")) > 0, "no rebalance rows -- the comparison would be vacuous"
     _assert_frames_identical(absent, parent, "default path (flag absent) vs pre-M4.2 module")
 
-    # Explicit False is the legacy branch (the guard tests truthiness, not
-    # presence), and is bit-identical to the parent by construction.
+    # The legacy key is still RECOGNISED (it warns) and still changes nothing.
     _assert_frames_identical(frames["explicit_false"], parent, "flag False vs pre-M4.2 module")
+    _assert_frames_identical(frames["kernel"], parent, "flag True vs pre-M4.2 module")
 
 
 # ---------------------------------------------------------------------------
-# 2. enabled equivalence with the legacy path
+# 2. the legacy key is inert -- and loud about it
 # ---------------------------------------------------------------------------
 
 
-def test_enabled_kernel_matches_legacy_committed_weights_exactly(frames):
-    """Flag True => same committed weights as `_step_asset_inertia`, tolerance 0.0.
+def test_flag_false_is_inert_and_warns_after_legacy_removal(caplog):
+    """`blend_use_policy_kernel=False` must not select a path (there is none) and
+    must not be swallowed in silence.
 
-    Both routes execute the same float arithmetic (`sells-first`, cash-capped buys
-    in `(-diff, symbol)` order, cash residual), so an exact match is attainable --
-    the tolerance is not loosened to hide a structural difference.
+    Two failure shapes this pins, and they are different:
+
+      * a silent `False` -> the caller believes a legacy engine is running while the
+        kernel runs (the 2026-11-02 "name and engine disagreeing" shape);
+      * a raising `False` -> every persisted params file / live config still
+        carrying the old opt-out fails closed for a key that no longer selects
+        anything. D1 deliberately chose the warning (documented in
+        `blend_base.generate_weights`), so the warning IS the contract now.
     """
-    kernel = frames["kernel"]
-    # The legacy side is the EXPLICIT opt-out: since commit 2 the flag-absent arm
-    # is the kernel too, so using it here would compare the kernel to itself.
-    legacy = frames["explicit_false"]
-    assert len(kernel.dropna(how="all")) > 0
-    _assert_frames_identical(kernel, legacy, "kernel path vs explicit legacy path")
+    import logging
+
+    universe = _make_universe(160)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        inert = _run(universe, {_FLAG: False})
+    assert len(inert.dropna(how="all")) > 0, "no rebalance rows -- the warning arm would be vacuous"
+    _assert_frames_identical(inert, _run(universe), "legacy key False vs flag absent")
+
+    hits = [rec.getMessage() for rec in caplog.records if _FLAG in rec.getMessage()]
+    assert len(hits) == 1, (
+        f"expected exactly ONE removal warning for `{_FLAG}=False`, got {hits!r} -- "
+        "an explicit opt-out must not be ignored silently after its path was deleted"
+    )
+    assert "2.0.0" in hits[0], (
+        f"the removal warning does not name the version that removed the path: {hits[0]!r}"
+    )
+
+    # And the DEFAULT must stay quiet -- a warning on every run would be noise that
+    # hides the real one.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        _run(universe)
+    assert not [rec for rec in caplog.records if _FLAG in rec.getMessage()], (
+        "the flag-absent (default) run emitted the legacy-key warning"
+    )
 
 
-def test_enabled_kernel_matches_legacy_with_asymmetric_sells_and_tenure_lock():
-    """Same equivalence with the two branches the default fixture never takes.
+def test_asymmetric_sells_and_tenure_lock_remain_effective_on_the_kernel_path():
+    """The two knobs the deleted branch used to read still reach the engine.
 
     `asymmetric_sells=True` (sell band = 60% of the threshold) and
-    `min_holding_bars=5` (mother-position / recent-add tenure suppressions) are the
-    two places `_step_asset_inertia` and `AssetPolicy.inertia_step` could drift, so
-    the equivalence is re-proved with both enabled rather than assumed.
+    `min_holding_bars=5` (mother-position / recent-add tenure suppressions) were the
+    two places the legacy step and `AssetPolicy.inertia_step` could drift, so D1
+    keeps the non-vacuity check: with both on, the frame must differ from the
+    default run (the knobs are not silently dropped), and the inert legacy key must
+    still produce the identical frame.
     """
     universe = _make_universe(160)
     params_extra = {
@@ -239,16 +338,17 @@ def test_enabled_kernel_matches_legacy_with_asymmetric_sells_and_tenure_lock():
         "blend_min_holding_bars": 5,
         "blend_min_weight_change": 0.03,
     }
-    legacy = _run(universe, {**params_extra, _FLAG: False})
+    flagged_false = _run(universe, {**params_extra, _FLAG: False})
     kernel = _run(universe, {**params_extra, _FLAG: True})
     assert len(kernel.dropna(how="all")) > 0, "no rebalance rows -- comparison would be vacuous"
     # Non-vacuity: the asymmetric/tenure knobs must actually change the frame,
     # otherwise the branches this test claims to cover are never reached.
-    assert not legacy.equals(_run(universe)), (
+    assert not kernel.equals(_run(universe)), (
         "the asymmetric-sells / tenure-lock parameters did not change the output -- "
         "those branches would not be exercised by this comparison"
     )
-    _assert_frames_identical(kernel, legacy, "kernel vs legacy (asymmetric sells + tenure lock)")
+    _assert_frames_identical(kernel, flagged_false, "kernel vs inert legacy key (asymmetric + tenure)")
+    _assert_frames_identical(kernel, _run(universe, params_extra), "flag True vs flag absent")
 
 
 # ---------------------------------------------------------------------------
@@ -294,15 +394,23 @@ def test_kernel_path_preserves_sparse_nan_and_explicit_zero_contract(frames):
 # ---------------------------------------------------------------------------
 
 
-def test_flag_resolution_order_and_prefixed_key_only():
+def test_flag_resolution_order_and_prefixed_key_only(caplog):
+    """The legacy key is read on the PREFIXED name only, and it selects nothing.
+
+    Post-D1 the key is inert, so "resolution" can only mean two observable things:
+    the PREFIXED key is still what the engine looks at (`False` there is recognised
+    and warned about, `params` first and then the `StrategyConfig` attribute), while
+    the bare `use_policy_kernel` -- the 2026-10-21 fallthrough shape -- is never
+    consulted at all (no warning, no branch).
+    """
+    import logging
+
     universe = _make_universe(120)
-    # `baseline` is the opt-out arm (the flag-absent default is the kernel now).
-    baseline = _run(universe, {_FLAG: False})
     kernel = _run(universe, {_FLAG: True})
     assert len(kernel.dropna(how="all")) > 0, "no rebalance rows -- resolution test would be vacuous"
     _assert_frames_identical(kernel, _run(universe, {_FLAG: True}), "params-driven kernel path")
 
-    # (a) the StrategyConfig attribute is the second source
+    # (a) the StrategyConfig attribute is still read
     cfg = StrategyConfig()
     # Post-construction assignment: pins PRECEDENCE only; that the field actually
     # exists (constructor route) is covered by
@@ -311,19 +419,36 @@ def test_flag_resolution_order_and_prefixed_key_only():
     cfg_attr_kernel = _run(universe, None, cfg=cfg)
     _assert_frames_identical(cfg_attr_kernel, kernel, "config-attribute-driven kernel path")
 
-    # (b) params win over the config attribute
-    params_off = _run(universe, {_FLAG: False}, cfg=cfg)
-    _assert_frames_identical(params_off, baseline, "params False must override config True")
+    # (b) params are read BEFORE the config attribute -- observable as exactly ONE
+    # warning when params say False and the config says True (two lookups, but the
+    # params hit short-circuits the config read). The frame cannot differ: the key
+    # selects nothing.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        params_off = _run(universe, {_FLAG: False}, cfg=cfg)
+    _assert_frames_identical(params_off, kernel, "inert legacy key False must not change the frame")
+    hits = [rec.getMessage() for rec in caplog.records if _FLAG in rec.getMessage()]
+    assert len(hits) == 1, (
+        f"expected exactly one warning for `{_FLAG}=False` in params (params read "
+        f"first, config ignored), got {hits!r}"
+    )
 
-    # (c) the BARE name is ignored in both sources -- the 2026-10-21 fallthrough bug
-    bare_only = _run(universe, {"use_policy_kernel": True})
-    _assert_frames_identical(bare_only, baseline, "bare 'use_policy_kernel' must be ignored (params)")
+    # (c) the BARE name is ignored in both sources -- the 2026-10-21 fallthrough bug.
+    # Concretely: it must not even trigger the prefixed-key warning.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        bare_only = _run(universe, {"use_policy_kernel": True})
+    _assert_frames_identical(bare_only, kernel, "bare 'use_policy_kernel' must be ignored (params)")
     cfg_bare = StrategyConfig()
     cfg_bare.use_policy_kernel = True
     _assert_frames_identical(
         _run(universe, None, cfg=cfg_bare),
-        baseline,
+        kernel,
         "bare 'use_policy_kernel' must be ignored (config attribute)",
+    )
+    assert not [rec for rec in caplog.records if _FLAG in rec.getMessage()], (
+        "a bare `use_policy_kernel` produced the PREFIXED-key warning -- the lookup is "
+        "reading the bare name, which is exactly the 2026-10-21 fallthrough shape"
     )
 
 
@@ -332,39 +457,36 @@ def test_flag_resolution_order_and_prefixed_key_only():
 # ---------------------------------------------------------------------------
 
 
-def test_strategy_config_field_alone_selects_kernel_path(monkeypatch):
-    """`StrategyConfig(blend_use_policy_kernel=True)` -- the CONSTRUCTOR route.
+def test_strategy_config_field_alone_selects_kernel_path(monkeypatch, caplog):
+    """`StrategyConfig(blend_use_policy_kernel=...)` -- the CONSTRUCTOR route.
 
     Distinct from `test_flag_resolution_order_and_prefixed_key_only` above, which
     reached the config source by *assigning an ad-hoc attribute after construction*:
     that works even when the dataclass has no such field, so it could not prove the
-    field exists. The M4.2 author flagged the config route as untestable for exactly
-    that reason. Constructing with the keyword now raises `TypeError` if the field is
-    removed, and the spies below prove the attribute is not decorative -- params here
-    carry NO flag, so only `getattr(cfg, "blend_use_policy_kernel", False)` at
-    `blend_base.generate_weights` can select the branch.
+    field exists. Constructing with the keyword raises `TypeError` if the field is
+    removed -- and that is exactly what this test now pins: the field SURVIVES D1 as
+    a legacy key, is still read (both `True` and `False` reach the engine, the latter
+    with the removal warning), and selects nothing, because there is no second path.
 
-    Behavioural, not output-based: the two paths are bit-identical by construction
-    (`test_enabled_kernel_matches_legacy_committed_weights_exactly`), so no frame
-    comparison can tell them apart.
+    Behavioural, not output-based, for the ROUTE: the spy proves
+    `PortfolioSequencer.sequence` is called from `blend_base.py` in every case, and
+    `blend_base` no longer exposing `_step_asset_inertia` proves the legacy engine is
+    actually gone rather than merely unreachable.
     """
+    import logging
+
     import pipeline.research.blend.blend_base as blend_base
 
-    calls = {"legacy": 0, "kernel": 0, "delegated_helper": 0}
-    original_step = blend_base._step_asset_inertia
+    calls = {"kernel": 0, "delegated_helper": 0}
     original_sequence = PortfolioSequencer.sequence
 
-    def spy_step(**kwargs):
-        calls["legacy"] += 1
-        return original_step(**kwargs)
-
     def spy_sequence(self, *args, **kwargs):
-        # PROVENANCE split: since M4.2 phase-2 / commit 1b,
-        # `common.allocation_templates.apply_asset_inertia` delegates to
-        # `kernel_apply_asset_inertia` unconditionally, so the kernel also runs when
-        # the flag is OFF (through sub-strategies that call that helper). The flag
-        # only selects the BLEND ENGINE's own per-bar step, which lives in
-        # `blend_base.py`; `position_policy.py` callers are the delegated helper.
+        # PROVENANCE split: `common.allocation_templates.apply_asset_inertia`
+        # delegates to `kernel_apply_asset_inertia` unconditionally too, so the
+        # kernel also runs for sub-strategies through that helper. What the D1 gate
+        # owns is the BLEND ENGINE's own per-bar step, which lives in
+        # `blend_base.py`; the split on the immediate caller's module keeps the two
+        # separate.
         import inspect
 
         frame = inspect.currentframe().f_back
@@ -375,18 +497,21 @@ def test_strategy_config_field_alone_selects_kernel_path(monkeypatch):
             calls["delegated_helper"] += 1
         return original_sequence(self, *args, **kwargs)
 
-    monkeypatch.setattr(blend_base, "_step_asset_inertia", spy_step)
     monkeypatch.setattr(PortfolioSequencer, "sequence", spy_sequence)
+
+    assert not hasattr(blend_base, "_step_asset_inertia"), (
+        "blend_base still exposes the legacy `_step_asset_inertia` step -- M4.4 "
+        "stage D1 (BASE_VERSION 2.0.0) deleted that path and its import"
+    )
 
     universe = _make_universe(160)
 
-    # (a) the dataclass default is now True (M4.2 commit 2, `BASE_VERSION 1.9.0`)
-    # and the default config takes the KERNEL path.
+    # (a) the dataclass default is True and takes the (only) kernel path.
     default_cfg = StrategyConfig()
     assert default_cfg.blend_use_policy_kernel is True, (
-        "StrategyConfig.blend_use_policy_kernel must default to True: the kernel was "
-        "proven cell-identical to `_step_asset_inertia` (240-seed finite sweep plus the "
-        "NaN differential) and is the committed default since BASE_VERSION 1.9.0"
+        "StrategyConfig.blend_use_policy_kernel must default to True: the kernel is "
+        "the only inertia engine since BASE_VERSION 2.0.0, so a False default would "
+        "claim a legacy path that no longer exists"
     )
     on_default = _run(universe, None, cfg=default_cfg)
     assert len(on_default.dropna(how="all")) > 0, (
@@ -394,54 +519,50 @@ def test_strategy_config_field_alone_selects_kernel_path(monkeypatch):
     )
     assert calls["kernel"] > 0, (
         "with the DEFAULT StrategyConfig, `PortfolioSequencer.sequence` was never "
-        f"called from `blend_base.py` (legacy calls={calls['legacy']}): the default "
-        "did not flip to the kernel path"
-    )
-    assert calls["legacy"] == 0, (
-        f"with the DEFAULT StrategyConfig, `_step_asset_inertia` still ran "
-        f"{calls['legacy']} times -- the legacy branch is still the default"
+        "called from `blend_base.py`: the per-bar inertia step is not wired"
     )
     assert calls["delegated_helper"] > 0, (
         "`apply_asset_inertia` never reached the kernel -- the commit-1b delegation is "
         "dead, so this run would not cover it at all"
     )
 
-    # (b) the OPT-OUT is still explicit and still real: `False` in `params` must
-    # select the legacy step and bypass the kernel. This is what keeps the two
-    # differential harnesses meaningful -- with the default ON, an "off" arm that
-    # omits the flag would silently run the kernel and compare it to itself.
-    calls["legacy"] = 0
+    # (b) `False` in params: still read, still loud, still the kernel.
     calls["kernel"] = 0
     calls["delegated_helper"] = 0
-    off = _run(universe, {_FLAG: False}, cfg=StrategyConfig())
-    assert len(off.dropna(how="all")) > 0, "no rebalance rows -- the spy would be vacuous"
-    assert calls["legacy"] > 0, (
-        "with `blend_use_policy_kernel=False` in `params`, `_step_asset_inertia` was "
-        f"never called (kernel calls={calls['kernel']}): the explicit opt-out no longer "
-        "reaches the legacy path, so the differential's OFF arm is dead"
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        inert = _run(universe, {_FLAG: False}, cfg=StrategyConfig())
+    assert len(inert.dropna(how="all")) > 0, "no rebalance rows -- the spy would be vacuous"
+    _assert_frames_identical(inert, _run(universe, None), "legacy key False vs flag absent")
+    assert calls["kernel"] > 0, (
+        "with `blend_use_policy_kernel=False` in `params`, the kernel step was never "
+        "called from `blend_base.py`: the legacy opt-out still bypasses the only engine"
     )
-    assert calls["kernel"] == 0, (
-        "with `blend_use_policy_kernel=False` in `params`, `PortfolioSequencer.sequence` "
-        f"ran {calls['kernel']} times from `blend_base.py`: the opt-out did not bypass "
-        "the blend engine's kernel step"
-    )
-    assert calls["delegated_helper"] > 0, (
-        "`apply_asset_inertia` never reached the kernel on the opt-out run -- the "
-        "flag-independent delegation is dead, so this run would not cover it"
+    assert any(
+        _FLAG in rec.getMessage() and "2.0.0" in rec.getMessage()
+        for rec in caplog.records
+    ), (
+        "`blend_use_policy_kernel=False` did not emit the BASE_VERSION 2.0.0 removal "
+        f"warning: {[rec.getMessage() for rec in caplog.records]!r}"
     )
 
-    # (c) constructor keyword alone (params carry no flag) -> kernel path, legacy bypassed.
-    calls["legacy"] = 0
+    # (c) constructor keyword alone (params carry no key): the config route is READ.
     calls["kernel"] = 0
-    on = _run(universe, None, cfg=StrategyConfig(blend_use_policy_kernel=True))
-    assert len(on.dropna(how="all")) > 0, "no rebalance rows -- the spy would be vacuous"
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        off_cfg = _run(universe, None, cfg=StrategyConfig(blend_use_policy_kernel=False))
+    assert len(off_cfg.dropna(how="all")) > 0, "no rebalance rows -- the spy would be vacuous"
+    _assert_frames_identical(off_cfg, on_default, "config False vs default config")
     assert calls["kernel"] > 0, (
-        "`StrategyConfig(blend_use_policy_kernel=True)` did not select the kernel path "
-        f"(legacy calls={calls['legacy']}): the StrategyConfig attribute is not wired"
+        "`StrategyConfig(blend_use_policy_kernel=False)` bypassed the kernel -- there is "
+        "no legacy branch left, so this can only mean the step was skipped entirely"
     )
-    assert calls["legacy"] == 0, (
-        f"`_step_asset_inertia` still ran {calls['legacy']} times with the config field "
-        "set to True -- the flag did not actually bypass the legacy step"
+    assert any(
+        _FLAG in rec.getMessage() and "2.0.0" in rec.getMessage()
+        for rec in caplog.records
+    ), (
+        "`StrategyConfig(blend_use_policy_kernel=False)` produced no removal warning -- "
+        "the StrategyConfig leg of the legacy-key lookup is no longer read"
     )
 
 
@@ -469,22 +590,23 @@ def test_chan_four_state_blend_still_pinned_to_regime_ic_ir_hybrid():
 
 
 def test_base_version_bumped_with_the_default_flip():
-    """`1.8.0 -> 1.9.0` is owed BY the default flip, not by an optional feature.
+    """`1.9.0 -> 2.0.0` is owed BY the branch deletion, not by an optional feature.
 
-    The flag's default is the behavioural contract of every blend strategy: a dump
-    stamped `1.8.0` that actually runs the kernel path would be exactly the
-    2026-11-02 "two version pairs" failure (name and engine disagreeing). So the
-    flip is a breaking engine change and the version must move WITH it -- a
-    `1.8.0` here means the flip shipped unversioned.
+    M4.2 flipped the default and paid with `1.8.0 -> 1.9.0`. M4.4 stage D1 then
+    DELETED the alternative branch: the engine no longer has two paths, and a
+    `blend_use_policy_kernel` key that used to select one now selects nothing (it
+    only warns). That is a breaking base-engine contract change, hence a MAJOR
+    bump -- a `1.9.0` stamp after D1 would let a dump advertise a two-path engine
+    that cannot be reproduced, which is the 2026-11-02 "two version pairs" shape.
     """
-    assert BaseBlendAllocationStrategy.BASE_VERSION == "1.9.0"
+    assert BaseBlendAllocationStrategy.BASE_VERSION == "2.0.0"
     inst = GenericBlendStrategy()
-    assert inst.base_version == "1.9.0"
-    assert "base: v1.9.0" in inst.version_string
+    assert inst.base_version == "2.0.0"
+    assert "base: v2.0.0" in inst.version_string
 
 
 # ---------------------------------------------------------------------------
-# kernel contract used by the flag-True branch (guards against a silent
+# kernel contract used by the per-bar step (guards against a silent
 # request-as-committed mistake when the wiring is refactored)
 # ---------------------------------------------------------------------------
 

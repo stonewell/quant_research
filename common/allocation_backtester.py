@@ -860,6 +860,17 @@ def run_allocation_backtest(
             market_type = "china" if china_trading else ("us" if us_trading else ("hk" if hk_trading else "other"))
             _proxy_syms = CASH_PROXY_SYMBOLS if cash_proxy_symbols is None else cash_proxy_symbols
             resolved_cash_proxy = next((s for s in symbols if str(s).upper() in _proxy_syms), None)
+            # (M1.1 / Stage C) `universe` is forwarded VERBATIM, and that is
+            # load-bearing: the simulator derives the two OPT-IN policy gates'
+            # bar anchors (`ma20_close` / `vwap20` / `vol_ma20`, plus a `VAL`
+            # level *if the frame has one*) from these very frames. Nothing is
+            # stripped or re-shaped here, so a frame that carries `Close`,
+            # `Volume` and an attached structural `VAL`
+            # (`common.structural_factors.enrich_universe_with_structural_features`)
+            # hands the same series to the state machine that the live runner
+            # hands it -- one derivation, `derive_lifecycle_context`. A frame
+            # without `Volume`/`VAL` degrades those anchors to `None` (both gates
+            # no-op); no column is invented here.
             sparse_weights, lifecycle_records_out = simulate_position_lifecycle(
                 universe=universe,
                 target_weights=sparse_weights,

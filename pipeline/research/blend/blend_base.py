@@ -19,10 +19,12 @@ Features provided across all blend strategies:
 - Asset-level protective stop (-8%) & Chandelier ATR trailing stop with post-stop cooldown
 - Quality & relative strength gate suppressing entries into persistent downtrend assets
 - Volatility-scaled adaptive asymmetric inertia rebalancing with entry bypass
-- Delegation of that inertia step to `common.position_policy`
-  (`blend_use_policy_kernel`, default ON since `BASE_VERSION 1.9.0`); the
-  pre-M4.2 `_step_asset_inertia` path stays available as the explicit opt-out
-  and is byte-for-byte the pre-M4.2 code
+- The inertia step IS the `common.position_policy` kernel, unconditionally.
+  `BASE_VERSION 2.0.0` (M4.4 stage D1) DELETED the pre-M4.2
+  `_step_asset_inertia` branch, so there is no second engine left to select:
+  `blend_use_policy_kernel=False` no longer chooses a path -- it logs a loud
+  warning naming this removal and the kernel runs anyway (an explicit opt-out
+  must not be honoured silently by a run that cannot honour it).
 """
 
 from collections import defaultdict
@@ -36,7 +38,6 @@ from common.allocation_templates import (
     AllocationTemplate,
     apply_asset_inertia,
     _fill_out_columns,
-    _step_asset_inertia,
 )
 from common.indicators import atr, sma
 from common.position_policy import (
@@ -165,7 +166,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
     and adaptive turnover filters so any blend strategy can inherit them cleanly.
     """
 
-    BASE_VERSION: str = "1.9.0"
+    BASE_VERSION: str = "2.0.0"
     version: str = "1.0.0"
 
     def __init__(
@@ -185,7 +186,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             self.config = config
         self.param_prefix = param_prefix
         self.alt_param_prefixes = alt_param_prefixes or []
-        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "1.9.0")
+        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "2.0.0")
         strat_version: str = version or getattr(self.__class__, "version", "1.0.0")
         tags = factor_tags or [
             "regime_trend_strength",
@@ -919,25 +920,37 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
 
         use_inertia = (min_weight_change > 0.0 or min_holding_bars > 0)
 
-        # --- M4.2 guard: delegate the inertia step to the position-policy kernel.
-        # Default ON since `BASE_VERSION 1.9.0`; the kernel is cell-identical to the
-        # pre-M4.2 code (240-seed finite sweep + the NaN differential in
-        # `pipeline/tests/test_policy_parity.py`). Passing
-        # `blend_use_policy_kernel=False` in `params` selects the legacy branch,
-        # which is the pre-M4.2 code path untouched (verified to the last digit
-        # against the pre-change module by
-        # `pipeline/research_strategy/tests/test_blend_policy_kernel.py`).
+        # --- M4.4 stage D1 (`BASE_VERSION 2.0.0`): the inertia step IS the
+        # `common.position_policy` kernel, UNCONDITIONALLY. The pre-M4.2
+        # `_step_asset_inertia` branch and its module-level import are deleted, so
+        # there is no second engine left to select.
+        #
+        # `blend_use_policy_kernel` survives only as a recognisable LEGACY KEY: it
+        # is still a `StrategyConfig` field and may still sit in persisted params /
+        # live configs. It is NOT ignored silently -- an explicit `False` (from
+        # params, else from the config attribute) logs a loud warning naming this
+        # removal, then the kernel runs. Raising instead would fail-closed every
+        # consumer that still carries the old opt-out (persisted strategy params,
+        # the OFF arm of `pipeline/tests/test_policy_parity.py`) for a key that no
+        # longer selects anything -- a bigger behaviour change than the removal,
+        # and one that D1 must not make on the live path.
         #
         # Resolution is DELIBERATELY not `resolve_param`: that helper ends in a
         # bare-name `getattr(cfg, name)`, and the 2026-10-21 incident was exactly a
         # bare name (`wq_alpha_id`) falling through to a GLOBAL `StrategyConfig`
-        # field and silently swapping a sub-strategy class. Both lookups below use
-        # the prefixed key `blend_use_policy_kernel` -- params first, then the
-        # config attribute, with NO bare-name step.
+        # field and silently swapping a sub-strategy class. The lookup below uses
+        # the prefixed key only -- params first, then the config attribute, with NO
+        # bare-name step.
         kernel_flag = p.get("blend_use_policy_kernel")
         if kernel_flag is None:
-            kernel_flag = getattr(cfg, "blend_use_policy_kernel", False)
-        use_policy_kernel = bool(kernel_flag)
+            kernel_flag = getattr(cfg, "blend_use_policy_kernel", True)
+        if bool(kernel_flag) is False:
+            _LOGGER.warning(
+                "blend_use_policy_kernel=False was configured but the legacy "
+                "`_step_asset_inertia` path was removed in BASE_VERSION 2.0.0 "
+                "(M4.4): running the position-policy kernel instead. Drop the flag "
+                "from params/config to silence this warning."
+            )
         inertia_thresh_df = None
         static_inertia_thresh = pd.Series(float(min_weight_change), index=risky_symbols)
         if use_inertia and adaptive_inertia and risky_symbols:
@@ -951,20 +964,19 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         holding_age = {s: 0 for s in risky_symbols}
         last_buy_bar = {s: -999 for s in risky_symbols}
 
-        # Kernel handles for the kernel path (built once, reused every bar; the
-        # sequencer itself holds no state between calls beyond nothing -- the
-        # tenure clocks above are caller-owned and mutated in place). `None` when
-        # the flag is explicitly False, so the legacy branch provably never
-        # touches them.
+        # Kernel handles (built once when inertia is on, reused every bar; the
+        # sequencer itself holds no state between calls -- the tenure clocks above
+        # are caller-owned and mutated in place).
         policy_sequencer: Optional[PortfolioSequencer] = None
         policy_cfg: Optional[PositionPolicyConfig] = None
-        if use_inertia and use_policy_kernel:
+        if use_inertia:
             policy_sequencer = PortfolioSequencer()
-            # ONLY the four fields `_step_asset_inertia` reads are set. In
-            # particular `asymmetric_sell_ratio` stays at the literal 0.60 that
-            # `_step_asset_inertia` falls back to -- the legacy call site never
-            # passed this argument, so making it configurable here would be a
-            # behaviour change smuggled in under an equivalence flag.
+            # ONLY the four fields the pre-M4.2 `_step_asset_inertia` step read are
+            # set. In particular `asymmetric_sell_ratio` stays at the literal 0.60
+            # that step falls back to -- the legacy call site never passed this
+            # argument, so exposing it here would be a behaviour change smuggled in
+            # under the (now removed) equivalence flag. D1 keeps these four fields
+            # byte-for-byte so the committed weights stay identical.
             policy_cfg = PositionPolicyConfig(
                 min_holding_bars=min_holding_bars,
                 asymmetric_sells=asymmetric_sells,
@@ -1692,50 +1704,34 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                 else:
                     prev_w_series = desired_weights.iloc[t - 1]
                     thresh_t = inertia_thresh_df.iloc[t] if inertia_thresh_df is not None else static_inertia_thresh
-                    if use_policy_kernel:
-                        # One bar at a time: `PortfolioSequencer.sequence` is
-                        # per-bar, not panel-level (it takes this bar's
-                        # `ideal_w`/`current_w` and returns the committed row).
-                        #
-                        # The returned Series is the COMMITTED weight row -- the
-                        # only authority on weights. The per-symbol `Decision`s
-                        # inside the sequencer are REQUESTS (a BUY's
-                        # `target_weight` is still uncapped by freed cash), so
-                        # they are never written to `desired_weights`; only this
-                        # row is. Cell-level contract preserved by construction:
-                        # the row is dense (a de-risked symbol is an explicit
-                        # `0.0`, never `NaN`) and the frame below is never
-                        # forward-filled here -- `SparseProjector.project` turns
-                        # unchanged rows into `NaN` at the very end.
-                        current_w = policy_sequencer.sequence(
-                            raw_w,
-                            prev_w_series,
-                            ctx=PolicyContext(bar_index=t),
-                            risky_symbols=risky_symbols,
-                            symbols=symbols,
-                            thresh_t=thresh_t,
-                            holding_age=holding_age,
-                            last_buy_bar=last_buy_bar,
-                            cfg=policy_cfg,
-                            cash_proxy=cash_proxy,
-                            em_row=asset_emergency_df.iloc[t],
-                        )
-                    else:
-                        current_w = _step_asset_inertia(
-                            t=t,
-                            ideal_w=raw_w,
-                            current_w=prev_w_series,
-                            risky_symbols=risky_symbols,
-                            symbols=symbols,
-                            thresh_t=thresh_t,
-                            holding_age=holding_age,
-                            last_buy_bar=last_buy_bar,
-                            cash_proxy=cash_proxy,
-                            em_row=asset_emergency_df.iloc[t],
-                            asymmetric_sells=asymmetric_sells,
-                            entry_threshold=entry_thresh,
-                            min_holding_bars=min_holding_bars,
-                        )
+                    # One bar at a time: `PortfolioSequencer.sequence` is per-bar,
+                    # not panel-level (it takes this bar's `ideal_w`/`current_w` and
+                    # returns the committed row). M4.4 stage D1: this is the ONLY
+                    # inertia step -- the pre-M4.2 `_step_asset_inertia` branch and
+                    # the `blend_use_policy_kernel` gate around it are gone.
+                    #
+                    # The returned Series is the COMMITTED weight row -- the only
+                    # authority on weights. The per-symbol `Decision`s inside the
+                    # sequencer are REQUESTS (a BUY's `target_weight` is still
+                    # uncapped by freed cash), so they are never written to
+                    # `desired_weights`; only this row is. Cell-level contract
+                    # preserved by construction: the row is dense (a de-risked
+                    # symbol is an explicit `0.0`, never `NaN`) and the frame below
+                    # is never forward-filled here -- `SparseProjector.project`
+                    # turns unchanged rows into `NaN` at the very end.
+                    current_w = policy_sequencer.sequence(
+                        raw_w,
+                        prev_w_series,
+                        ctx=PolicyContext(bar_index=t),
+                        risky_symbols=risky_symbols,
+                        symbols=symbols,
+                        thresh_t=thresh_t,
+                        holding_age=holding_age,
+                        last_buy_bar=last_buy_bar,
+                        cfg=policy_cfg,
+                        cash_proxy=cash_proxy,
+                        em_row=asset_emergency_df.iloc[t],
+                    )
                 desired_weights.loc[date] = current_w
             else:
                 desired_weights.loc[date] = raw_w

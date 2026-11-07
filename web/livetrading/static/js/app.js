@@ -2286,6 +2286,7 @@
         "TENURE_LOCKED": "未满最低持仓周期",
         "LIMIT_UP_LOCKED": "涨停封板",
         "NO_PRICE": "价格缺失",
+        "REENTRY_GATED": "再入场价格未确认",
         "NONE": "无阻断",
     };
 

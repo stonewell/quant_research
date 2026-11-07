@@ -549,103 +549,6 @@ def _fill_out_columns(daily: pd.DataFrame, symbols: list) -> pd.DataFrame:
     return daily[symbols]
 
 
-def _step_asset_inertia(
-    t: int,
-    ideal_w: pd.Series,
-    current_w: pd.Series,
-    risky_symbols: list,
-    symbols: list,
-    thresh_t: pd.Series,
-    holding_age: Dict[str, int],
-    last_buy_bar: Dict[str, int],
-    cash_proxy: Optional[str] = "CASH",
-    em_row: Optional[Union[bool, pd.Series]] = None,
-    asymmetric_sells: bool = False,
-    entry_threshold: Optional[float] = None,
-    min_holding_bars: int = 0,
-    asymmetric_sell_ratio: float = 0.60,
-) -> pd.Series:
-    """Single-bar asset-level inertia filter step updating `holding_age` and `last_buy_bar` in place."""
-    if em_row is not None:
-        if isinstance(em_row, pd.Series):
-            symbol_emergency = {s: bool(em_row.get(s, False)) for s in risky_symbols}
-            is_global_emergency = all(symbol_emergency.values()) if symbol_emergency else False
-        else:
-            is_global_emergency = bool(em_row)
-            symbol_emergency = {s: is_global_emergency for s in risky_symbols}
-    else:
-        is_global_emergency = False
-        symbol_emergency = {s: False for s in risky_symbols}
-
-    for s in risky_symbols:
-        if current_w[s] > 1e-4:
-            holding_age[s] += 1
-        else:
-            holding_age[s] = 0
-
-    if is_global_emergency:
-        return ideal_w.copy()
-
-    sell_thresh = (thresh_t * float(asymmetric_sell_ratio)) if asymmetric_sells else thresh_t
-    buy_thresh = thresh_t.copy()
-    if entry_threshold is not None:
-        new_entry_mask = (current_w[risky_symbols] <= 1e-4)
-        buy_thresh[new_entry_mask] = entry_threshold
-
-    diff = ideal_w[risky_symbols] - current_w[risky_symbols]
-    sells_raw = diff[diff <= -sell_thresh].index.tolist()
-
-    # Suppress sells if asset holding tenure is below min_holding_bars (unless emergency)
-    # Note: Incremental adds to an existing mother position do not reset the mother position's holding tenure lock.
-    sells = []
-    for s in sells_raw:
-        if symbol_emergency.get(s, False):
-            sells.append(s)
-        elif min_holding_bars > 0:
-            if holding_age[s] < min_holding_bars:
-                # Mother position has not elapsed min_holding_bars: suppress all sells
-                pass
-            elif ideal_w[s] > 1e-4 and (t - last_buy_bar[s]) < min_holding_bars:
-                # Partial trimming of a recently added position (< min_holding_bars): suppress trim
-                pass
-            else:
-                sells.append(s)
-        else:
-            sells.append(s)
-
-    buys = diff[diff >= buy_thresh].index.tolist()
-
-    if not sells and not buys:
-        return current_w.copy()
-
-    new_w = current_w.copy()
-    # 1. Execute sells first to release cash capacity
-    for s in sells:
-        new_w[s] = ideal_w[s]
-        if new_w[s] <= 1e-4:
-            last_buy_bar[s] = -999
-
-    # 2. Execute buys up to incremental available capacity without diluting untouched or held assets
-    avail_inc = max(0.0, 1.0 - float(new_w[risky_symbols].sum()))
-
-    buys_sorted = sorted(buys, key=lambda b: (-diff[b], b))
-    for b in buys_sorted:
-        desired_inc = max(0.0, float(ideal_w[b] - current_w[b]))
-        actual_inc = min(desired_inc, avail_inc)
-
-        if actual_inc >= buy_thresh[b]:
-            new_w[b] = current_w[b] + actual_inc
-            last_buy_bar[b] = t
-            avail_inc = max(0.0, avail_inc - actual_inc)
-        else:
-            new_w[b] = current_w[b]
-
-    if cash_proxy in symbols:
-        new_w[cash_proxy] = max(0.0, 1.0 - float(new_w[risky_symbols].sum()))
-
-    return new_w
-
-
 def apply_asset_inertia(
     daily: pd.DataFrame,
     min_weight_change: Union[float, Dict[str, float], pd.Series, pd.DataFrame] = 0.02,
@@ -687,14 +590,12 @@ def apply_asset_inertia(
     Why the delegation is unconditional here (no opt-in flag): the equivalence
     was proven over 240 randomized seeds before the flip
     (`common/tests/test_position_policy.py`, now re-pinned against this function's
-    pre-delegation source so the gate stays non-vacuous). The flag
-    (`blend_use_policy_kernel`) gates the blend engine's per-bar step SELECTION,
-    not this panel-level helper.
-
-    `_step_asset_inertia` is deliberately KEPT and still used directly by
-    `pipeline/research/blend/blend_base.py`'s explicit opt-out branch
-    (`blend_use_policy_kernel=False`; the flag defaults to ON since
-    `BASE_VERSION 1.9.0`); it is not a thin wrapper over the kernel.
+    pre-delegation source so the gate stays non-vacuous). The blend engine's own
+    per-bar step is delegated to the same kernel too, and since
+    `BASE_VERSION 2.0.0` (M4.4 stage D1) it is the ONLY per-bar implementation:
+    the legacy `_step_asset_inertia` helper was deleted, so there is no second
+    code path left to select, and `blend_use_policy_kernel=False` now only logs a
+    warning before the kernel runs.
     """
     return kernel_apply_asset_inertia(
         daily,

@@ -121,18 +121,13 @@ class ExemptSite(NamedTuple):
 # liquidation. Anything not listed here must be free of liquidation wording.
 # ---------------------------------------------------------------------------
 EXEMPT_SITES: tuple = (
-    ExemptSite(
-        path="common/position_lifecycle.py",
-        anchor="if raw_target_weight == 0.0:",
-        reason=(
-            "The RAW model target, i.e. the pre-lifecycle input -- the SOURCE of a "
-            "genuine exit request, not an inference from a post-lifecycle ticket "
-            "weight. `step_position_lifecycle` turns this 0.0 into `SELL` via the "
-            "exit-confirmation ladder, which is exactly what `is_liquidation_event` "
-            "vouches for downstream. Removing this leg would delete real exits. "
-            "File is also frozen by L2.24 (do not touch)."
-        ),
-    ),
+    # (M4.4 stage D3) `common/position_lifecycle.py::if raw_target_weight == 0.0:`
+    # was exempted here until D3 deleted that legacy 6-state body (BASE_VERSION
+    # 2.0.0). The same "raw model target 0.0 -> SELL ladder" now lives in
+    # `common/position_policy.py::AssetPolicy.step`, which this scan reports clean
+    # (no liquidation wording on the zero test), so the exemption is REMOVED rather
+    # than left pointing at code that no longer exists -- a stale entry widens the
+    # allow-list for whatever lands on that anchor next.
     ExemptSite(
         path="common/order_netting.py",
         anchor="elif rounded_tgt_shares == 0 and cur_master_shares > 0:",

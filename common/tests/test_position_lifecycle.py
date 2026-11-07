@@ -1,8 +1,11 @@
 """Unit tests for Unified Position Lifecycle State Machine (UPLSM) and inertia fixes."""
 
+import importlib.util
 import json
 import os
+import subprocess
 import sys
+import tempfile
 
 # Ensure project root is in sys.path
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -13,6 +16,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from common import position_lifecycle as _live_lifecycle
 from common.allocation_templates import apply_asset_inertia
 from common.position_lifecycle import (
     AssetLifecycleState,
@@ -159,7 +163,12 @@ def test_volume_breakout_fast_path_entry():
     assert d4.action == "HOLD_FILTERED"
     assert state4.state == PositionState.PENDING_ENTRY
 
-    # Case E: Fast path disabled enforces normal guard latency confirmation even with confluence
+    # Case E: a config that DISABLES the entry fast path is REJECTED (M4.4 D3).
+    # "fast path disabled" was a legacy-body toggle; that body is gone, and the
+    # kernel's entry fast path is unconditional. Silently running it would turn the
+    # requested policy into a different one, so the adapter raises -- naming the
+    # config key and the version that removed the legacy path -- and evaluates
+    # nothing (the state is untouched, so no counter is credited).
     cfg_disabled = PositionLifecycleConfig(
         guard_latency_bars=2,
         volume_surge_multiplier=1.5,
@@ -167,17 +176,18 @@ def test_volume_breakout_fast_path_entry():
         enable_entry_fast_path=False,
     )
     state5 = AssetLifecycleState(symbol="MSFT")
-    d5 = step_position_lifecycle(
-        state5,
-        raw_target_weight=0.15,
-        current_price=400.0,
-        cfg=cfg_disabled,
-        current_volume=3000000.0,
-        ma20_volume=1000000.0,
-        market_breadth=0.70,
-    )
-    assert d5.action == "HOLD_FILTERED"
-    assert state5.state == PositionState.PENDING_ENTRY
+    with pytest.raises(ValueError, match="enable_entry_fast_path=False"):
+        step_position_lifecycle(
+            state5,
+            raw_target_weight=0.15,
+            current_price=400.0,
+            cfg=cfg_disabled,
+            current_volume=3000000.0,
+            ma20_volume=1000000.0,
+            market_breadth=0.70,
+        )
+    assert state5.state == PositionState.FLAT
+    assert state5.entry_streak == 0
 
 
 def test_hard_stop_loss_fast_path_exit():
@@ -1065,13 +1075,21 @@ def test_coerce_blocking_reason_tolerates_legacy_and_garbage(raw, expected):
     assert blocking_reason_label(raw)  # always renderable, never an empty label
 
 
-def test_step_asset_inertia_l2_38_entry_threshold_alignment():
-    """L2.38: _step_asset_inertia sets buy_thresh[new_entry_mask] = entry_threshold directly
+def test_policy_sequencer_l2_38_entry_threshold_alignment():
+    """L2.38: a NEW entry is gated by `entry_threshold` DIRECTLY, not `min(thresh_t, ...)`.
 
-    without taking np.minimum(thresh_t, entry_threshold), preventing adaptive inertia from
-    lowering the entry threshold below the specified parameter.
+    Re-pointed in M4.4 D2: the original test drove the private
+    `common.allocation_templates._step_asset_inertia`, which D1 deleted once the
+    kernel became the only engine. `PortfolioSequencer.sequence` /
+    `AssetPolicy.inertia_step` is that engine now, and it must carry the same
+    L2.38 property: a fresh entry (`current <= 1e-4`) uses `cfg.entry_threshold`
+    verbatim, so adaptive inertia lowering the per-symbol threshold (0.02) can
+    never lower the entry hurdle below the configured 0.05 either.
+
+    The two boundary cases the original pinned are preserved exactly: 0.035
+    (above `thresh_t`, below `entry_threshold`) must NOT enter, 0.055 must.
     """
-    from common.allocation_templates import _step_asset_inertia
+    from common.position_policy import PolicyContext, PositionPolicyConfig, PortfolioSequencer
 
     symbols = ["SYM_A", "CASH"]
     risky_symbols = ["SYM_A"]
@@ -1079,41 +1097,41 @@ def test_step_asset_inertia_l2_38_entry_threshold_alignment():
     current_w = pd.Series({"SYM_A": 0.0, "CASH": 1.0})
     ideal_w = pd.Series({"SYM_A": 0.035, "CASH": 0.65})  # 0.02 <= 0.035 < 0.05
 
-    holding_age = {"SYM_A": 0}
-    last_buy_bar = {"SYM_A": -999}
+    sequencer = PortfolioSequencer()
+    cfg = PositionPolicyConfig(entry_threshold=0.05)
 
-    res = _step_asset_inertia(
-        t=1,
-        ideal_w=ideal_w,
-        current_w=current_w,
-        risky_symbols=risky_symbols,
-        symbols=symbols,
-        thresh_t=thresh_t,
-        holding_age=holding_age,
-        last_buy_bar=last_buy_bar,
-        cash_proxy="CASH",
-        entry_threshold=0.05,
-    )
+    def _step(ideal: pd.Series) -> pd.Series:
+        return sequencer.sequence(
+            ideal_w=ideal,
+            current_w=current_w,
+            ctx=PolicyContext(bar_index=1),
+            risky_symbols=risky_symbols,
+            symbols=symbols,
+            thresh_t=thresh_t,
+            holding_age={"SYM_A": 0},       # FLAT: the entry, not a tenure case
+            last_buy_bar={"SYM_A": -999},
+            cfg=cfg,
+            cash_proxy="CASH",
+            em_row=pd.Series(False, index=risky_symbols),
+        )
 
-    # Since entry_threshold=0.05 and ideal_w is 0.035 < 0.05, new entry must NOT be permitted (remains 0.0)
+    res = _step(ideal_w)
+
+    # Since entry_threshold=0.05 and ideal_w is 0.035 < 0.05, new entry must NOT be
+    # permitted (remains 0.0) -- and with no trade the row is the untouched
+    # `current_w` copy, i.e. the cash proxy keeps its full weight.
     assert res["SYM_A"] == 0.0
     assert res["CASH"] == 1.0
 
     # If ideal_w is 0.055 >= 0.05, entry proceeds
     ideal_w2 = pd.Series({"SYM_A": 0.055, "CASH": 0.45})
-    res2 = _step_asset_inertia(
-        t=1,
-        ideal_w=ideal_w2,
-        current_w=current_w,
-        risky_symbols=risky_symbols,
-        symbols=symbols,
-        thresh_t=thresh_t,
-        holding_age=holding_age,
-        last_buy_bar=last_buy_bar,
-        cash_proxy="CASH",
-        entry_threshold=0.05,
-    )
+    res2 = _step(ideal_w2)
     assert res2["SYM_A"] == pytest.approx(0.055)
+    # ... and the buys are followed by the kernel's cash-residual routing
+    # (`1 - sum(risky)` into the cash proxy), which is why the column reads 0.945
+    # rather than the ideal's 0.45. Pinned so a future "tidy up" cannot quietly
+    # stop residualising freed cash.
+    assert res2["CASH"] == pytest.approx(0.945)
 
 
 def test_step_position_lifecycle_l2_40_portfolio_deleverage_bypasses_inertia_and_tenure():
@@ -1405,3 +1423,557 @@ def test_simulate_position_lifecycle_warns_once_when_cash_proxy_is_not_in_the_un
         simulate_position_lifecycle(universe_with_cash, weights_with_cash, cfg=cfg, cash_proxy="BIL")
 
 
+# --------------------------------------------------------------------------- #
+# (M4.3) `common.position_policy` adapter -- kernel engine behind
+# `step_position_lifecycle` (DEFAULT ON since M4.4 D2). The gate: the kernel must
+# produce the same (action, target_weight, reason, blocking_reason) decision as the
+# legacy body plus the same persisted state trajectory, while
+# `live_use_policy_kernel=False` still runs the legacy body BYTE FOR BYTE. Both are
+# asserted here; the multi-symbol / multi-seed differential lives in
+# `pipeline/tests/test_policy_parity.py`.
+# --------------------------------------------------------------------------- #
+
+from common.position_lifecycle import (  # noqa: E402  (M4.3 test-only import)
+    position_policy_config_from_lifecycle,
+    resolve_position_policy_config,
+)
+from common.position_policy import PositionPolicyConfig  # noqa: E402
+
+
+def test_policy_kernel_flag_defaults_on_and_false_is_an_inert_legacy_key(monkeypatch, caplog):
+    """A bare config says ON; an explicit `False` no longer selects anything (D3).
+
+    M4.4 stage D3 deleted the legacy body, so `live_use_policy_kernel` survives
+    only as a RECOGNISABLE LEGACY KEY: it is still resolved (a persisted strategy
+    JSON or `account_state.json` may carry it) but it cannot route to a deleted
+    path. What is pinned here:
+
+      * the default stays True (a default that drifted would be re-introducing a
+        selection nobody asked for);
+      * `False` still RESOLVES to False -- dropping the key would be a silent
+        schema change -- and the field is carried on the config untouched;
+      * but a step with `False` runs the KERNEL and logs one loud removal warning
+        naming the flag and `BASE_VERSION 2.0.0`. It does NOT raise: failing a live
+        run closed over a dead key is a bigger behaviour change than the removal.
+    """
+    assert PositionLifecycleConfig().live_use_policy_kernel is True
+    assert resolve_position_lifecycle_config().live_use_policy_kernel is True
+    assert resolve_position_lifecycle_config(params={}, args=None).live_use_policy_kernel is True
+
+    # The key is still resolvable through the dataclass field, the resolver's
+    # params and its `lifecycle_*` alias -- it is inert, not deleted.
+    assert PositionLifecycleConfig(live_use_policy_kernel=False).live_use_policy_kernel is False
+    assert (
+        resolve_position_lifecycle_config(params={"live_use_policy_kernel": False}).live_use_policy_kernel
+        is False
+    )
+    assert (
+        resolve_position_lifecycle_config(params={"lifecycle_live_use_policy_kernel": False}).live_use_policy_kernel
+        is False
+    )
+
+    # ... and it selects NOTHING: the kernel runs, the decision is the kernel's,
+    # and the removal is announced exactly once (the module caches the emission so
+    # a backtest does not repeat it on every per-asset step).
+    monkeypatch.setattr(_live_lifecycle, "_REMOVED_KERNEL_FLAG_WARNED", False)
+    off_cfg = PositionLifecycleConfig(live_use_policy_kernel=False)
+    state_warned = AssetLifecycleState(symbol="A")
+    with caplog.at_level("WARNING", logger="common.position_lifecycle"):
+        warned = step_position_lifecycle(state_warned, 0.30, 100.0, off_cfg)
+    removal_warnings = [
+        r for r in caplog.records if "live_use_policy_kernel=False" in r.getMessage()
+    ]
+    assert len(removal_warnings) == 1, [r.getMessage() for r in caplog.records]
+    assert "BASE_VERSION 2.0.0" in removal_warnings[0].getMessage()
+
+    baseline = step_position_lifecycle(AssetLifecycleState(symbol="A"), 0.30, 100.0, PositionLifecycleConfig())
+    assert warned.to_dict() == baseline.to_dict()
+    # Second step: no duplicate warning (per process, not per step).
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="common.position_lifecycle"):
+        step_position_lifecycle(AssetLifecycleState(symbol="A"), 0.30, 100.0, off_cfg)
+    assert not [r for r in caplog.records if "live_use_policy_kernel" in r.getMessage()]
+
+    # ... and the six M1.1 knobs default to the KERNEL's own defaults (both gates
+    # OFF), so an unflagged config is semantically inert rather than "on by
+    # accident through a default that drifted".
+    bare, kernel = PositionLifecycleConfig(), PositionPolicyConfig()
+    for f in (
+        "two_day_breakdown_rule",
+        "breakdown_days",
+        "breakdown_vol_shrink_pct",
+        "price_reentry_gate",
+        "price_reentry_pct",
+        "reentry_vwap_lookback",
+    ):
+        assert getattr(bare, f) == getattr(kernel, f), f
+        assert getattr(resolve_position_lifecycle_config(), f) == getattr(kernel, f), f
+    assert bare.two_day_breakdown_rule is False
+    assert bare.price_reentry_gate is False
+
+
+def test_resolve_position_policy_config_maps_the_live_resolution_onto_the_kernel():
+    """`resolve_position_policy_config` == legacy resolver + the ONE mapping.
+
+    The mapping is pinned field by field, including the two documented
+    divergences: the rename `stop_cooldown_bars -> asset_stop_cooldown_bars` (the
+    legacy field is the PER-ASSET cooldown, NOT blend_base's portfolio-level 21),
+    and `min_entry_threshold=None -> entry_threshold=None` (the backtest-side
+    resolver deliberately keeps `None`; the live driver's 0.05 is the driver's
+    own choice and must not leak into this shared bridge).
+    """
+    params = {
+        "lifecycle_guard_latency_bars": 3,
+        "min_hold_bars": 4,
+        "reentry_cooldown_bars": 6,
+        "min_weight_change": 0.07,
+        "cfsb_inertia_relative_ratio": 0.25,
+        "lifecycle_hard_stop_loss_pct": 0.11,
+        "lifecycle_atr_multiplier": 3.5,
+        "lifecycle_volume_surge_multiplier": 2.5,
+        "lifecycle_breadth_thrust_threshold": 0.45,
+        "live_use_policy_kernel": True,
+        "two_day_breakdown_rule": True,
+        "breakdown_days": 3,
+        "breakdown_vol_shrink_pct": 0.5,
+        "price_reentry_gate": True,
+        "price_reentry_pct": 0.03,
+        "reentry_vwap_lookback": 10,
+    }
+    legacy = resolve_position_lifecycle_config(params=params)
+    mapped = resolve_position_policy_config(params=params)
+    assert isinstance(mapped, PositionPolicyConfig)
+    assert mapped == position_policy_config_from_lifecycle(legacy)
+
+    assert mapped.guard_latency_bars == 3
+    assert mapped.min_holding_bars == 4
+    assert mapped.normal_cooldown_bars == 6
+    assert mapped.asset_stop_cooldown_bars == legacy.stop_cooldown_bars == 6
+    assert mapped.inertia_threshold == pytest.approx(0.07)
+    assert mapped.inertia_relative_ratio == pytest.approx(0.25)
+    assert mapped.entry_threshold is None                 # documented divergence
+    assert mapped.hard_stop_loss_pct == pytest.approx(0.11)
+    assert mapped.atr_multiplier == pytest.approx(3.5)
+    assert mapped.volume_surge_multiplier == pytest.approx(2.5)
+    assert mapped.breadth_thrust_threshold == pytest.approx(0.45)
+    # the six M1.1 knobs
+    assert mapped.two_day_breakdown_rule is True
+    assert mapped.breakdown_days == 3
+    assert mapped.breakdown_vol_shrink_pct == pytest.approx(0.5)
+    assert mapped.price_reentry_gate is True
+    assert mapped.price_reentry_pct == pytest.approx(0.03)
+    assert mapped.reentry_vwap_lookback == 10
+
+    # An EXPLICIT entry threshold is carried, not discarded.
+    assert resolve_position_policy_config(
+        params={"lifecycle_min_entry_threshold": 0.05}
+    ).entry_threshold == pytest.approx(0.05)
+
+
+# --------------------------------------------------------------------------- #
+# M4.4 D3: the pinned PRE-deletion legacy body (the parity reference)
+# --------------------------------------------------------------------------- #
+# `step_position_lifecycle` has no legacy branch any more -- D3 deleted it in
+# `BASE_VERSION 2.0.0`. The parity claim that licensed the deletion must stay
+# executable, so the "legacy" arm runs from a PINNED git blob: `a415450`, the
+# commit before the deletion landed (a `HEAD:`-based reference would track the
+# deletion and go vacuous the moment it is committed). This is the same pattern
+# `common/tests/test_position_policy.py` uses for `apply_asset_inertia`.
+_LEGACY_LIFECYCLE_COMMIT = "a415450"
+_LEGACY_LIFECYCLE_PATH = "common/position_lifecycle.py"
+_LEGACY_LIFECYCLE_MODULE = None
+
+#: The state fields BOTH engines carry. The kernel-only additions
+#: (`breakdown_streak`, `expansion_streak`, `last_exit_price`, `cold_start`,
+#: `entry_price_approx`) are asserted separately -- folding them into the equality
+#: would turn a documented representation difference into a permanent failure.
+_SHARED_STATE_KEYS = (
+    "symbol",
+    "state",
+    "held_bars",
+    "entry_streak",
+    "exit_streak",
+    "cooldown_remaining",
+    "entry_price",
+    "peak_price",
+    "current_weight",
+    "broker_weight",
+    "last_exit_type",
+)
+
+
+def _legacy_lifecycle_module():
+    """Load the pre-D3 `common/position_lifecycle.py` from the pinned git blob.
+
+    Not a skip on failure: this is a primary bit-identity gate, and a skip would
+    let the differential disappear silently.
+    """
+    global _LEGACY_LIFECYCLE_MODULE
+    if _LEGACY_LIFECYCLE_MODULE is not None:
+        return _LEGACY_LIFECYCLE_MODULE
+
+    try:
+        proc = subprocess.run(
+            ["git", "show", f"{_LEGACY_LIFECYCLE_COMMIT}:{_LEGACY_LIFECYCLE_PATH}"],
+            cwd=_PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        pytest.fail(
+            f"cannot read the pre-D3 lifecycle blob "
+            f"({_LEGACY_LIFECYCLE_COMMIT}:{_LEGACY_LIFECYCLE_PATH}) from git: {exc}"
+        )
+
+    src = proc.stdout
+    assert src.strip(), "git show returned an empty position_lifecycle source"
+    assert "def step_position_lifecycle(" in src, (
+        "the pinned lifecycle blob no longer defines `step_position_lifecycle` -- "
+        "the legacy arm would be vacuous"
+    )
+    assert "AssetPolicy" not in src and "live_use_policy_kernel" not in src, (
+        "the pinned lifecycle blob already contains the M4.3 kernel adapter -- the "
+        "reference must be the PRE-deletion legacy body"
+    )
+
+    tmpdir = tempfile.mkdtemp(prefix="m4_4_d3_legacy_lifecycle_")
+    module_path = os.path.join(tmpdir, "position_lifecycle_pre_d3.py")
+    with open(module_path, "w", encoding="utf-8") as fh:
+        fh.write(src)
+
+    spec = importlib.util.spec_from_file_location(
+        "_parity_position_lifecycle_pre_d3", module_path
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    _LEGACY_LIFECYCLE_MODULE = module
+    return module
+
+
+_SCRIPTED_STEPS = [
+    # (raw_target, price, volume, ma20_volume, breadth, atr, kwargs)
+    (0.20, 100.0, 1_000_000.0, 1_000_000.0, 0.50, 1.0, {}),          # pending entry 1/2
+    (0.20, 101.0, 1_000_000.0, 1_000_000.0, 0.50, 1.0, {}),          # confirmed -> BUY gestation
+    (0.20, 102.0, 1_000_000.0, 1_000_000.0, 0.50, 1.0, {}),          # tenure lock
+    (0.20, 103.0, 1_000_000.0, 1_000_000.0, 0.50, 1.0, {}),          # held active
+    (0.18, 104.0, 1_000_000.0, 1_000_000.0, 0.50, 1.0, {}),          # sub-inertia trim -> HOLD
+    (0.10, 105.0, 1_000_000.0, 1_000_000.0, 0.50, 1.0, {}),          # real trim -> SELL
+    (0.10, 105.0, 1_000_000.0, 1_000_000.0, 0.50, 1.0, {"is_market_open": False}),  # freeze
+    (0.10, 88.0, 1_000_000.0, 1_000_000.0, 0.50, 1.0, {}),           # hard stop (8%)
+    (0.10, 88.0, 1_000_000.0, 1_000_000.0, 0.50, 1.0, {}),           # cooldown blocked
+    (0.10, 88.0, 1_000_000.0, 1_000_000.0, 0.50, 1.0, {}),
+    (0.10, 88.0, 1_000_000.0, 1_000_000.0, 0.50, 1.0, {}),
+    (0.10, 88.0, 1_000_000.0, 1_000_000.0, 0.50, 1.0, {}),
+    (0.10, 88.0, 1_000_000.0, 1_000_000.0, 0.50, 1.0, {}),
+    (0.10, 88.0, 1_000_000.0, 1_000_000.0, 0.50, 1.0, {}),           # cooldown expiring
+    (0.30, 95.0, 3_000_000.0, 1_000_000.0, 0.70, 1.0, {}),           # volume breakout entry
+    (0.30, 96.0, 1_000_000.0, 1_000_000.0, 0.70, 1.0, {"is_emergency_halt": True}),
+    (0.05, 97.0, 1_000_000.0, 1_000_000.0, 0.70, 1.0, {"is_portfolio_deleverage": True}),
+    (0.00, 98.0, 1_000_000.0, 1_000_000.0, 0.70, 1.0, {}),
+    (0.00, 98.0, 1_000_000.0, 1_000_000.0, 0.70, 1.0, {}),
+]
+
+
+def _run_scripted(cfg: PositionLifecycleConfig, module=None):
+    """Run `_SCRIPTED_STEPS` through ONE state; return decisions + trajectories.
+
+    `module` is `common.position_lifecycle` by default (the LIVE kernel adapter)
+    and the PINNED pre-D3 module (see `_legacy_lifecycle_module`) for the legacy
+    arm of the parity gate -- the script is the same, so the two runs are directly
+    comparable.
+
+    The decision tuple deliberately INCLUDES the human-readable `reason`: the two
+    engines must not merely agree on the number, they must explain it the same
+    way (the ticket prints `reason` verbatim). `detail_reason` is compared on its
+    `blocking_reason` key only -- the legacy body and the kernel carry different
+    extra detail keys BY DESIGN (the kernel travels counters in `detail`).
+    """
+    module = module or _live_lifecycle
+    state = module.AssetLifecycleState(symbol="600000.SH")
+    decisions, states, last_exit_prices = [], [], []
+    for raw_target, price, vol, ma_vol, breadth, atr, kwargs in _SCRIPTED_STEPS:
+        d = module.step_position_lifecycle(
+            state,
+            raw_target_weight=raw_target,
+            current_price=price,
+            cfg=cfg,
+            market="china",
+            current_volume=vol,
+            ma20_volume=ma_vol,
+            market_breadth=breadth,
+            atr=atr,
+            **kwargs,
+        )
+        decisions.append(
+            (
+                d.action,
+                d.target_weight,
+                d.reason,
+                d.state_before,
+                d.state_after,
+                d.fast_path_triggered,
+                d.cancelled_entry_streak,
+                coerce_blocking_reason(d.blocking_reason),
+                coerce_blocking_reason(d.detail_reason.get("blocking_reason")),
+            )
+        )
+        # The in-place mutation contract every caller depends on.
+        assert d.state_after == state.state
+        snapshot = state.to_dict()
+        # `last_exit_price` is the ONE state field the two engines deliberately do
+        # NOT share: it is the kernel's gate-3b anchor (written on every exit), and
+        # the legacy body never maintains it because gate 3b is unreachable there.
+        # It travels separately so the comparison below stays a pure equality on
+        # the shared state.
+        last_exit_prices.append(snapshot.pop("last_exit_price", 0.0))
+        states.append({k: snapshot.get(k) for k in _SHARED_STATE_KEYS})
+    return decisions, states, last_exit_prices
+
+
+def test_kernel_adapter_decision_and_state_trajectory_match_the_pinned_legacy_body():
+    """Live kernel vs the PINNED pre-D3 legacy body: identical decisions AND state.
+
+    M4.4 stage D3 deleted the legacy 6-state body from `common/position_lifecycle.py`
+    (`BASE_VERSION 2.0.0`), so the "OFF" arm is now executed from a pinned git blob
+    -- `a415450`, the commit before the deletion -- instead of from a config flag.
+    That keeps the gate that licensed the deletion executable: an OFF arm that
+    silently ran the kernel would compare the kernel with itself and prove nothing.
+
+    State is compared through the SHARED state fields after EVERY step --
+    `LifecycleDecision` does not carry the counters, so a harness that only
+    compared decisions would miss a `held_bars`/`cooldown_remaining` drift until it
+    surfaced as a different action days later.
+    """
+    legacy_module = _legacy_lifecycle_module()
+    off_dec, off_states, off_exit_px = _run_scripted(
+        # A bare config: the legacy body has no kernel key at all (that key was
+        # added WITH the adapter), so `live_use_policy_kernel` is not a concept
+        # here. Pinned explicitly because this test's whole point is
+        # legacy-vs-kernel.
+        legacy_module.PositionLifecycleConfig(),
+        module=legacy_module,
+    )
+    on_dec, on_states, on_exit_px = _run_scripted(PositionLifecycleConfig())
+
+    assert len(off_dec) == len(on_dec) == len(_SCRIPTED_STEPS)
+    for i, (a, b) in enumerate(zip(off_dec, on_dec)):
+        assert a == b, f"step {i} diverged:\n legacy={a}\n kernel={b}"
+
+    for i, (a, b) in enumerate(zip(off_states, on_states)):
+        assert a == b, f"step {i} state diverged:\n legacy={a}\n kernel={b}"
+
+    # Non-vacuity: the script really traverses the interesting branches, so the
+    # equality above is not "both sides did nothing".
+    actions = {d[0] for d in off_dec}
+    assert {"BUY", "SELL", "HOLD", "HOLD_FILTERED"} <= actions, actions
+    assert any(d[5] == "STOP_LOSS" for d in off_dec), "the hard-stop fast path never fired"
+    assert any(d[7] == BlockingReason.COOLDOWN_BLOCKED for d in off_dec), "cooldown never blocked"
+    assert any(s["state"] == PositionState.COOLDOWN.value for s in off_states)
+
+    # ... and the documented state divergence, pinned: ONLY the kernel maintains
+    # the gate-3b anchor. The legacy body must keep writing 0.0 (it never had one),
+    # so this field can never be used to claim the ON path is byte-identical.
+    assert all(v == 0.0 for v in off_exit_px)
+    stop_idx = next(i for i, d in enumerate(off_dec) if d[5] == "STOP_LOSS")
+    assert on_exit_px[stop_idx] == pytest.approx(_SCRIPTED_STEPS[stop_idx][1])
+    assert all(v == 0.0 for v in on_exit_px[:stop_idx])
+
+
+def test_kernel_adapter_keeps_the_in_place_mutation_contract():
+    """The kernel is pure; the ADAPTER must still mutate `state` (design invariant).
+
+    `run_live_strategy` reads `state.is_holding()`, `state.held_bars` and finally
+    persists `state.to_dict()` AFTER the call. A pure-kernel adapter that forgot to
+    write the snapshot back would silently freeze every live position.
+    """
+    state = AssetLifecycleState(symbol="600519.SH")
+    cfg = PositionLifecycleConfig(guard_latency_bars=1, live_use_policy_kernel=True)
+    d1 = step_position_lifecycle(state, 0.30, 100.0, cfg)
+    assert d1.action == "BUY"
+    assert state.state == PositionState.HELD_GESTATION
+    assert state.is_holding()
+    assert state.entry_price == 100.0
+    assert state.current_weight == pytest.approx(0.30)
+
+    d2 = step_position_lifecycle(state, 0.30, 101.0, cfg)
+    assert state.held_bars == 1, "held_bars did not advance through the adapter"
+    assert d2.state_after == state.state
+
+
+def test_kernel_adapter_rejects_a_disabled_fast_path():
+    """`enable_*_fast_path=False` is a HARD PRECONDITION failure (M4.4 D3).
+
+    The kernel's stop-loss / entry fast paths are unconditional; "disabled" was a
+    legacy-body toggle and that body was deleted in `BASE_VERSION 2.0.0`. Silently
+    running an always-on stop for a config that asked for a disabled one would be
+    the exact silent behaviour change the adapter exists to prevent, so the step
+    raises -- naming the key and the version -- before touching the state.
+    """
+    for key in ("enable_exit_fast_path", "enable_entry_fast_path"):
+        cfg = PositionLifecycleConfig(**{key: False, "min_holding_bars": 0})
+        st = AssetLifecycleState(
+            symbol="A", state=PositionState.HELD_ACTIVE, held_bars=10,
+            entry_price=100.0, peak_price=100.0, current_weight=0.30,
+        )
+        before = st.to_dict()
+        with pytest.raises(ValueError, match=f"{key}=False"):
+            step_position_lifecycle(st, 0.30, 80.0, cfg)
+        with pytest.raises(ValueError, match="BASE_VERSION 2.0.0"):
+            step_position_lifecycle(st, 0.30, 80.0, cfg)
+        assert st.to_dict() == before, "a rejected config must not mutate the state"
+
+    # BOTH keys disabled is reported as one error naming both, so the operator
+    # does not have to fix them one run at a time.
+    cfg_both = PositionLifecycleConfig(
+        enable_entry_fast_path=False, enable_exit_fast_path=False
+    )
+    with pytest.raises(ValueError) as excinfo:
+        step_position_lifecycle(AssetLifecycleState(symbol="A"), 0.10, 100.0, cfg_both)
+    assert "enable_entry_fast_path" in str(excinfo.value)
+    assert "enable_exit_fast_path" in str(excinfo.value)
+
+
+def test_kernel_adapter_two_day_breakdown_rule_is_a_noop_without_ma20_close():
+    """`two_day_breakdown_rule=True` cannot fire through this signature.
+
+    `step_position_lifecycle` carries no `ma20_close`, so gate 2b's structural
+    break can never be evaluated and the gate degrades to a strict no-op (the
+    kernel treats a missing anchor as "cannot evaluate", never as 0.0). Pinned so
+    a future context-plumbing change is a deliberate decision, not a surprise.
+    """
+    base = PositionLifecycleConfig(live_use_policy_kernel=True)
+    armed = PositionLifecycleConfig(live_use_policy_kernel=True, two_day_breakdown_rule=True)
+    assert _run_scripted(base) == _run_scripted(armed)
+
+
+def test_cold_start_state_fields_roundtrip_and_legacy_defaults():
+    """The five M4.3 state fields survive serialization; older dicts load inert."""
+    st = AssetLifecycleState(
+        symbol="600519.SH",
+        state=PositionState.HELD_ACTIVE,
+        held_bars=3,
+        breakdown_streak=2,
+        expansion_streak=1,
+        last_exit_price=92.5,
+        cold_start=True,
+        entry_price_approx=True,
+        entry_price=95.0,
+    )
+    restored = AssetLifecycleState.from_dict(json.loads(json.dumps(st.to_dict())))
+    assert restored.to_dict() == st.to_dict()
+    assert restored.cold_start is True
+    assert restored.entry_price_approx is True
+    assert restored.breakdown_streak == 2
+    assert restored.expansion_streak == 1
+    assert restored.last_exit_price == pytest.approx(92.5)
+
+    # An archived `account_state.json` written before M4.3 carries none of these
+    # keys; every one must fall back to the inert value (never raise, never True).
+    legacy = {
+        "symbol": "A",
+        "state": "HELD_ACTIVE",
+        "held_bars": 4,
+        "entry_streak": 0,
+        "exit_streak": 0,
+        "cooldown_remaining": 0,
+        "entry_price": 10.0,
+        "peak_price": 11.0,
+        "current_weight": 0.2,
+        "broker_weight": 0.2,
+        "last_exit_type": None,
+    }
+    old = AssetLifecycleState.from_dict(legacy)
+    assert old.cold_start is False
+    assert old.entry_price_approx is False
+    assert old.breakdown_streak == 0
+    assert old.expansion_streak == 0
+    assert old.last_exit_price == 0.0
+
+
+def test_cold_start_lifecycle_state_zeroes_history_and_restricts_states():
+    """M4.3 cold start: no persisted state -> NOTHING is fabricated.
+
+    The legacy hydration branch invents `HELD_GESTATION` (from a broker
+    holding-bar guess) and `PENDING_ENTRY` (from a model signal streak). Those
+    states were never observed, so the kernel's very first step would credit
+    tenure/confirmation the position did not earn. The cold-start rule instead
+    zeroes every counter and restricts the state to
+    {HELD_ACTIVE, COOLDOWN, FLAT}. `held_bars` is the one exception: it is broker
+    fact (the account ledger), not a lifecycle counter.
+    """
+    from common.position_lifecycle import cold_start_lifecycle_state
+
+    # --- held lot, WITH a recorded cost basis ------------------------------
+    held = cold_start_lifecycle_state(
+        "600519.SH",
+        is_held=True,
+        held_bars=7,
+        bars_since_exit=99,
+        reentry_cooldown_bars=2,
+        entry_price=1500.0,
+        price=1600.0,
+        current_weight=0.20,
+    )
+    assert held.state == PositionState.HELD_ACTIVE          # never HELD_GESTATION
+    assert held.held_bars == 7                              # broker fact, kept
+    assert held.entry_streak == held.exit_streak == 0
+    assert held.breakdown_streak == held.expansion_streak == 0
+    assert held.cooldown_remaining == 0
+    assert held.entry_price == pytest.approx(1500.0)
+    assert held.peak_price == pytest.approx(1600.0)
+    assert held.entry_price_approx is False
+    assert held.cold_start is True
+    assert held.last_exit_price == 0.0
+    assert held.current_weight == pytest.approx(0.20)
+    assert held.broker_weight == pytest.approx(0.20)
+
+    # --- held lot, NO recorded cost basis: price is the anchor + flagged -----
+    approx = cold_start_lifecycle_state(
+        "600519.SH",
+        is_held=True,
+        held_bars=0,
+        bars_since_exit=99,
+        reentry_cooldown_bars=2,
+        entry_price=0.0,
+        price=1600.0,
+        current_weight=0.20,
+    )
+    assert approx.entry_price == pytest.approx(1600.0)
+    assert approx.entry_price_approx is True, "an approximated stop anchor must be marked"
+    assert approx.peak_price == pytest.approx(1600.0)
+
+    # --- inside the re-entry cooldown ---------------------------------------
+    cooling = cold_start_lifecycle_state(
+        "A", is_held=False, held_bars=0, bars_since_exit=1, reentry_cooldown_bars=4
+    )
+    assert cooling.state == PositionState.COOLDOWN
+    assert cooling.cooldown_remaining == 3
+    assert cooling.last_exit_price == 0.0, "no fabricated anchor -> gate 3b ALLOWS, never locks"
+
+    # --- a signal streak for a FLAT symbol must NOT fabricate PENDING_ENTRY --
+    flat = cold_start_lifecycle_state(
+        "A", is_held=False, held_bars=0, bars_since_exit=99, reentry_cooldown_bars=2
+    )
+    assert flat.state == PositionState.FLAT
+    assert flat.entry_streak == 0
+    assert flat.entry_price == 0.0 and flat.entry_price_approx is False
+
+
+def test_cold_start_state_is_never_produced_by_a_persisted_legacy_state():
+    """Provenance guard: `cold_start`/`entry_price_approx` are only ever set on purpose.
+
+    `cold_start_lifecycle_state` is the ONLY producer of `cold_start=True` (the
+    legacy hydration branch that used to compete with it was deleted in M4.4 D3),
+    so a state built by the dataclass default -- or hydrated from a persisted
+    dict -- cannot accidentally carry `cold_start=True`, which would be a lie about
+    how it was created.
+    """
+    default_state = AssetLifecycleState(symbol="A")
+    assert default_state.cold_start is False
+    assert default_state.entry_price_approx is False
+
+    hydrated = AssetLifecycleState.from_dict({"symbol": "A", "state": "HELD_ACTIVE"})
+    assert hydrated.cold_start is False
+    assert hydrated.entry_price_approx is False

@@ -163,9 +163,12 @@ def test_lifecycle_entry_confirmation_filters_impulse():
     weights.loc[dates[1], "A"] = 0.0
     weights.loc[dates[1], "B"] = 0.0
 
+    # (M4.4 D3) The old `enable_entry_fast_path=False` opt-out is gone with the
+    # legacy body; the kernel's entry fast path is unconditional. It cannot fire on
+    # this fixture anyway (constant prices, no volume surge/breadth thrust), so the
+    # guard-latency assertion below is unchanged in intent.
     cfg = PositionLifecycleConfig(
         guard_latency_bars=2,
-        enable_entry_fast_path=False,
     )
 
     filtered_w, records = simulate_position_lifecycle(

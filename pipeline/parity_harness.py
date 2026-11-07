@@ -64,7 +64,8 @@ WHAT THE REPLAY MODEL IS (disclosed, and why it is honest)
    again would double-apply them. The consequence is that any archived row whose
    non-trade was caused by a Stage-2 gate (``COOLDOWN_BLOCKED``,
    ``TENURE_LOCKED``, ``MIN_ENTRY_THRESHOLD``, ``MARKET_CLOSED_FREEZE``,
-   ``PENDING_ENTRY_CONFIRM``, ``LIMIT_UP_LOCKED``, ``CANCEL_PENDING``) cannot be
+   ``PENDING_ENTRY_CONFIRM``, ``LIMIT_UP_LOCKED``, ``CANCEL_PENDING``,
+   ``REENTRY_GATED``) cannot be
    reproduced by THIS replay. Those rows are listed separately and are never
    counted as "aligned", even when the share count happens to match (see
    :data:`GATE_REASONS`). Gate-level parity is a different, narrower question --
@@ -204,6 +205,11 @@ GATE_REASONS = frozenset({
     "INERTIA",
     "TENURE_LOCKED",
     "LIMIT_UP_LOCKED",
+    # (M4.3) `price_reentry_gate` (kernel gate 3b) refuses a re-entry whose price
+    # has not cleared the last exit by `price_reentry_pct`. Same class of row as
+    # the rest: the archived live book already applied it, and the pinned-off
+    # replay cannot, so it must be listed as non-replayable rather than aligned.
+    "REENTRY_GATED",
 })
 
 #: Actions that mean "this row traded nothing" regardless of its target weight.

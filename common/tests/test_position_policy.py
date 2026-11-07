@@ -19,27 +19,24 @@ Two rules this file refuses to bend:
     identical values (including identical real `0.0` cells).
 
 The M4.1 kernel shipped as DEAD CODE. M4.2 flipped both call sites, and commit 2
-(`BASE_VERSION 1.9.0`) made the kernel the DEFAULT: `blend_base`'s inertia step
-selects `PortfolioSequencer.sequence` unless `blend_use_policy_kernel=False` is
-passed explicitly, and `common/allocation_templates.py::apply_asset_inertia`
-delegates to `kernel_apply_asset_inertia` unconditionally (commit 1b).
+(`BASE_VERSION 1.9.0`) made the kernel the DEFAULT. M4.4 stage D1
+(`BASE_VERSION 2.0.0`) then DELETED the legacy `_step_asset_inertia` branch: the
+blend engine's per-bar inertia step is `PortfolioSequencer.sequence`,
+unconditionally, and `blend_use_policy_kernel=False` is an inert legacy key that
+only logs a removal warning.
 `test_kernel_callers_are_guarded_by_opt_in_flag` pins the remaining invariants:
 on the templates side a static import scan plus behavioural no-delegation checks
-(the per-bar `_step_asset_inertia` and the inline `_sparse_from_daily` compression
-must NOT route through the kernel).
+(the inline `_sparse_from_daily` compression must NOT route through the kernel);
+on the blend side that the kernel really is the only per-bar step, that the
+legacy symbol is gone from `blend_base`, and that the inert key cannot bypass it.
 
-The blend half is a BEHAVIOURAL call-path spy, deliberately not a source
-substring check (this file previously did the latter, and it was vacuous: the
-kernel is bit-identical to `_step_asset_inertia`, so forcing
-`use_policy_kernel = True` or deleting the `if use_policy_kernel:` branch left
-every test in the repo green -- output equivalence cannot see a silent default
-flip). The spy patches `blend_base._step_asset_inertia` and
-`PortfolioSequencer.sequence` and runs two real `generate_weights` calls: one on
-the DEFAULT config (kernel path since 1.9.0) and one with the EXPLICIT opt-out
-`blend_use_policy_kernel=False` (legacy path). Each arm must take its own route
-and never the other's -- that is what proves the legacy path is still present and
-selectable, i.e. that the differential harnesses' OFF arm did not become a
-self-comparison of the kernel.
+The blend half is a BEHAVIOURAL call-path spy rather than a source substring check
+(output equivalence cannot see a routing change when one engine is left, and the
+kernel was cell-identical to the deleted step by construction). The spy patches
+`PortfolioSequencer.sequence` and runs real `generate_weights` calls on the
+DEFAULT config, with the inert `blend_use_policy_kernel=False` key (params and
+`StrategyConfig`), and with `True`; every arm must reach the kernel from
+`blend_base.py`, and the inert key must not bypass it.
 
 Disclosed finding recorded here rather than hidden (see
 `test_reapplying_kernel_to_its_own_output`): re-applying the inertia filter to
@@ -56,6 +53,7 @@ import os
 import sys
 
 import importlib.util
+import logging
 import subprocess
 import tempfile
 
@@ -72,16 +70,20 @@ for _root in (_PROJECT_ROOT,):
 
 from common.allocation_templates import apply_asset_inertia
 from common.position_policy import (
+    BLOCKING_REASON_LABELS,
     AssetPolicy,
     AssetState,
     BlockingReason,
     Decision,
+    ExitType,
     PolicyAction,
     PolicyContext,
     PortfolioSequencer,
     PositionPolicyConfig,
     PositionState,
     SparseProjector,
+    blocking_reason_label,
+    is_liquidation_event,
     kernel_apply_asset_inertia,
 )
 
@@ -1246,41 +1248,37 @@ def _blend_universe(n_days: int = 200) -> dict:
     return universe
 
 
-def test_kernel_callers_are_guarded_by_opt_in_flag(monkeypatch):
-    """M4.2 phase 2 (commit 2, `BASE_VERSION 1.9.0`): the kernel is the DEFAULT,
-    the legacy path is still PRESENT and still explicitly selectable.
+def test_kernel_callers_are_guarded_by_opt_in_flag(monkeypatch, caplog):
+    """M4.4 stage D1 (`BASE_VERSION 2.0.0`): the kernel is the ONLY per-bar step.
 
     History: M4.1 shipped the kernel as dead code and this guard asserted that
     BOTH `common/allocation_templates.py` and `pipeline/research/blend/blend_base.py`
-    were import-free. Each phase then narrowed (never dropped) the guard:
+    were import-free. M4.2 phase 2 narrowed it to "imported, but the legacy opt-out
+    is still real"; D1 now deletes the legacy step, so the guard flips to "there is
+    no second engine left, and the inert key cannot pretend otherwise":
 
-      * `common/allocation_templates.py` -- phase 2 / commit 1b makes this real:
-        the module DOES now import the kernel, but ONLY `kernel_apply_asset_inertia`,
-        ONLY for `apply_asset_inertia`, and `apply_asset_inertia` must be exactly
-        one delegation call. `_step_asset_inertia` (still the blend engine's
-        flag-off branch) and `_sparse_from_daily` (the inline dense->sparse
-        compression) must stay NON-delegating -- asserted behaviourally with spies,
-        because a source substring would not notice `_step_asset_inertia` being
-        re-pointed at the kernel;
-      * `pipeline/research/blend/blend_base.py` -- MAY import it. Since commit 2
-        (1.9.0) the DEFAULT inertia path is the kernel (`PortfolioSequencer.sequence`)
-        and the explicit opt-out `blend_use_policy_kernel=False` must still run the
-        legacy `_step_asset_inertia` step. Asserted BEHAVIOURALLY (a call-path spy),
-        because the kernel is bit-identical to the legacy step
-        (`max_abs_diff == 0.0`): output comparison is structurally incapable of
-        noticing a default flip, and a source-substring check cannot notice the
-        branch being neutralised (`use_policy_kernel = True`, or
-        `if use_policy_kernel:` -> `if True:`). Dropping the opt-out arm instead of
-        re-scoping it would let the legacy branch rot away silently -- and would
-        turn every "flag OFF vs ON" differential into the kernel compared with
-        itself.
+      * `common/allocation_templates.py` -- imports ONLY
+        `kernel_apply_asset_inertia`, ONLY for `apply_asset_inertia`, and
+        `apply_asset_inertia` must be exactly one delegation call.
+        `_step_asset_inertia` is DELETED (asserted by absence), while
+        `_sparse_from_daily` keeps its INLINE dense->sparse compression -- still
+        asserted behaviourally with a spy, because a source substring would not
+        notice it being re-pointed at `SparseProjector.project`;
+      * `pipeline/research/blend/blend_base.py` -- the per-bar inertia step is
+        `PortfolioSequencer.sequence`, unconditionally, and the legacy symbol is
+        gone from the module. `blend_use_policy_kernel=False` (params or
+        `StrategyConfig`) must still reach the kernel AND log the BASE_VERSION
+        2.0.0 removal warning. Asserted BEHAVIOURALLY (a call-path spy): the
+        kernel is bit-identical to the deleted step (`max_abs_diff == 0.0`), so
+        output comparison is structurally incapable of noticing that the step was
+        skipped, and a source substring cannot notice the call being moved.
 
     M4.2 phase 2 / commit 1a adds ONE projection delegation, and it is NOT part of
-    the flag: `blend_base` now compresses via `SparseProjector.project` (a literal
+    the key: `blend_base` compresses via `SparseProjector.project` (a literal
     transcription of `_sparse_from_daily`'s compression branch) unconditionally,
     because the step has no behavioural knob to gate -- it is a pure dense->sparse
-    projection, not the `sequence` call path. It is pinned below behaviourally in
-    BOTH flag states, so a future refactor cannot quietly re-route it back through
+    projection, not the `sequence` call path. It is pinned below behaviourally,
+    so a future refactor cannot quietly re-route it back through
     `_sparse_from_daily` (or wire `SparseProjector.write`, which belongs to M4.3).
     """
     import re
@@ -1332,25 +1330,14 @@ def test_kernel_callers_are_guarded_by_opt_in_flag(monkeypatch):
         index=pd.bdate_range("2021-01-04", periods=12),
         columns=["A", "B", "C", "CASH"],
     )
-    # `_step_asset_inertia` is SINGLE-BAR and must not route through the kernel --
-    # it is still the blend engine's flag-off branch and its per-bar call shape is
-    # what makes that branch bit-identical to the pre-M4.2 code.
-    kernel_calls["n"] = 0
-    templates._step_asset_inertia(
-        t=1,
-        ideal_w=daily.iloc[1],
-        current_w=daily.iloc[0],
-        risky_symbols=["A", "B", "C"],
-        symbols=["A", "B", "C", "CASH"],
-        thresh_t=pd.Series({"A": 0.02, "B": 0.02, "C": 0.02}),
-        holding_age={"A": 1, "B": 1, "C": 1},
-        last_buy_bar={"A": 0, "B": 0, "C": 0},
-        cash_proxy="CASH",
-        em_row=None,
-    )
-    assert kernel_calls["n"] == 0, (
-        f"`_step_asset_inertia` called the kernel {kernel_calls['n']} times: it must "
-        "stay the standalone per-bar step (blend_base's flag-off branch uses it directly)"
+    # M4.4 stage D1 (`BASE_VERSION 2.0.0`): the legacy single-bar step is GONE from
+    # this module. Asserted, not assumed -- a re-introduced `_step_asset_inertia`
+    # would be a second per-bar engine (exactly what D1 removed), and its old
+    # "must not delegate" assertion would then be the wrong guard entirely.
+    assert not hasattr(templates, "_step_asset_inertia"), (
+        "common/allocation_templates.py still defines `_step_asset_inertia` -- M4.4 "
+        "stage D1 deleted the legacy per-bar step (BASE_VERSION 2.0.0); the kernel's "
+        "`PortfolioSequencer.sequence` is the only per-bar inertia implementation"
     )
 
     # `_sparse_from_daily` keeps its INLINE compression -- it must not become a
@@ -1410,27 +1397,25 @@ def test_kernel_callers_are_guarded_by_opt_in_flag(monkeypatch):
     monkeypatch.setattr(SparseProjector, "write", spy_write)
 
     # (b) the blend call site delegates by CALL PATH, not by source text.
-    assert hasattr(blend_base, "_step_asset_inertia"), (
-        "blend_base no longer imports the legacy `_step_asset_inertia` step -- the "
-        "explicit opt-out path would no longer be the pre-M4.2 code"
+    # M4.4 stage D1: the legacy step is not merely unreachable, it is GONE (and so
+    # is its import, which is why there is no `_step_asset_inertia` spy any more).
+    assert not hasattr(blend_base, "_step_asset_inertia"), (
+        "blend_base still re-exports the legacy `_step_asset_inertia` step -- D1 "
+        "deleted the path (BASE_VERSION 2.0.0), so keeping the symbol importable "
+        "would leave a second per-bar engine one `if` away"
     )
-    calls = {"legacy": 0, "kernel": 0, "delegated_helper": 0}
-    original_step = blend_base._step_asset_inertia
+    calls = {"kernel": 0, "delegated_helper": 0}
     original_sequence = PortfolioSequencer.sequence
 
-    def spy_step(**kwargs):
-        calls["legacy"] += 1
-        return original_step(**kwargs)
-
     def spy_sequence(self, *args, **kwargs):
-        # PROVENANCE, because since commit 1b the kernel is reachable WITHOUT the
-        # flag: `common.allocation_templates.apply_asset_inertia` now delegates to
+        # PROVENANCE, because the kernel is reachable WITHOUT the key:
+        # `common.allocation_templates.apply_asset_inertia` delegates to
         # `kernel_apply_asset_inertia`, and several sub-strategies call it
         # (`worldquant_alpha_strategy`, `gtja191_factors`, `chan_advanced_strategies`,
         # `timing_aspects`, ...). Those calls ARE the kernel running, unconditionally
         # and by design. What this guard still owns is the BLEND ENGINE's own per-bar
         # inertia step, so the counter splits on the immediate caller's module:
-        # `blend_base.py` = the `generate_weights` loop (flag-gated),
+        # `blend_base.py` = the `generate_weights` loop (the D1 invariant),
         # `position_policy.py` = the delegated panel helper (flag-independent).
         import inspect
 
@@ -1442,26 +1427,19 @@ def test_kernel_callers_are_guarded_by_opt_in_flag(monkeypatch):
             calls["delegated_helper"] += 1
         return original_sequence(self, *args, **kwargs)
 
-    monkeypatch.setattr(blend_base, "_step_asset_inertia", spy_step)
     monkeypatch.setattr(PortfolioSequencer, "sequence", spy_sequence)
 
     universe = _blend_universe(200)
 
-    # (b1) DEFAULT (flag absent) -> the KERNEL step runs; the blend engine's own
-    # legacy step is NEVER taken (the delegated panel helper also runs, and must --
-    # see the provenance note in `spy_sequence`).
+    # (b1) DEFAULT (key absent) -> the kernel step runs from `blend_base.py`; the
+    # delegated panel helper also runs, and must (see the provenance note above).
     default_run = GenericBlendStrategy().generate_weights(universe, {})
     assert len(default_run.dropna(how="all")) > 0, (
         "the synthetic run produced no rebalance rows -- the call-path spy would be vacuous"
     )
     assert calls["kernel"] > 0, (
         "with `blend_use_policy_kernel` absent, `PortfolioSequencer.sequence` was "
-        f"never called from `blend_base.py` (legacy calls={calls['legacy']}): the "
-        "DEFAULT inertia path is not the kernel, so the 1.9.0 default flip is gone"
-    )
-    assert calls["legacy"] == 0, (
-        f"with `blend_use_policy_kernel` absent, `_step_asset_inertia` still ran "
-        f"{calls['legacy']} times: the legacy step is still the default path"
+        "never called from `blend_base.py`: the per-bar inertia step is not the kernel"
     )
     assert calls["delegated_helper"] > 0, (
         "`apply_asset_inertia` did not reach the kernel at all -- commit 1b's "
@@ -1472,53 +1450,51 @@ def test_kernel_callers_are_guarded_by_opt_in_flag(monkeypatch):
         "compression step was not delegated"
     )
 
-    # (b2) explicit `blend_use_policy_kernel=False` -> the LEGACY step runs and the
-    # blend engine's kernel step is BYPASSED. This is the opt-out that keeps the
-    # differential's OFF arm real (and `apply_asset_inertia` still delegates, by
-    # design, flag-independently).
-    calls["legacy"] = 0
+    # (b2) the inert legacy key `False`: it must NOT bypass the kernel (there is no
+    # legacy step left to land in) and it must NOT be swallowed in silence. A
+    # raise-instead-of-warn design would fail-closed every persisted params file
+    # still carrying the old opt-out, which D1 explicitly avoided.
     calls["kernel"] = 0
     calls["delegated_helper"] = 0
     spy_project.state = "on"
     spy_write.state = "on"
-    off = GenericBlendStrategy().generate_weights(
-        universe, {"blend_use_policy_kernel": False}
+    with caplog.at_level(logging.WARNING):
+        inert = GenericBlendStrategy().generate_weights(
+            universe, {"blend_use_policy_kernel": False}
+        )
+    assert len(inert.dropna(how="all")) > 0, (
+        "the legacy-key run produced no rebalance rows -- the call-path spy would be vacuous"
     )
-    assert len(off.dropna(how="all")) > 0, (
-        "the opt-out run produced no rebalance rows -- the call-path spy would be vacuous"
-    )
-    assert calls["legacy"] > 0, (
-        "with `blend_use_policy_kernel=False` `_step_asset_inertia` was never called "
-        f"(kernel calls={calls['kernel']}): the legacy step is no longer reachable, so "
-        "the opt-out is dead and every OFF-vs-ON differential is now the kernel "
-        "compared with itself"
-    )
-    assert calls["kernel"] == 0, (
-        f"with `blend_use_policy_kernel=False` the kernel path ran {calls['kernel']} "
-        "times from `blend_base.py`: the explicit opt-out did not bypass the kernel"
+    assert calls["kernel"] > 0, (
+        "with `blend_use_policy_kernel=False` the kernel step was never called from "
+        "`blend_base.py`: the inert key bypassed the only remaining inertia engine"
     )
     assert calls["delegated_helper"] > 0, (
-        "`apply_asset_inertia` did not reach the kernel on the opt-out run -- the "
+        "`apply_asset_inertia` did not reach the kernel on the legacy-key run -- the "
         "flag-independent delegation has gone dead"
     )
+    assert any(
+        "blend_use_policy_kernel" in rec.getMessage() and "2.0.0" in rec.getMessage()
+        for rec in caplog.records
+    ), (
+        "`blend_use_policy_kernel=False` produced no BASE_VERSION 2.0.0 removal "
+        f"warning: {[rec.getMessage() for rec in caplog.records]!r}"
+    )
 
-    # (b3) an explicit `True` is the same route as the default (the flag is a
-    # selection, not a mode), so both kernel arms must be cell-identical.
-    calls["legacy"] = 0
+    # (b3) an explicit `True` is the same route as the default (the key selects
+    # nothing), so both kernel arms must be cell-identical.
     calls["kernel"] = 0
     on = GenericBlendStrategy().generate_weights(
         universe, {"blend_use_policy_kernel": True}
     )
-    assert calls["kernel"] > 0 and calls["legacy"] == 0, (
-        f"explicit True took the wrong route (kernel={calls['kernel']}, "
-        f"legacy={calls['legacy']})"
+    assert calls["kernel"] > 0, (
+        "explicit True did not reach the kernel step from `blend_base.py`"
     )
 
-    # Disclosed, and the reason this guard is behavioural: the two paths are
-    # cell-identical, so output equality is necessary but proves nothing about
-    # WHICH path was taken. Kept here so a future divergence surfaces next to the
-    # call-path assertions that actually guard the switch.
-    pd.testing.assert_frame_equal(on, off)
+    # Disclosed: with a single engine, output equality is necessary but proves
+    # nothing about WHICH route was taken -- the call-path spies above are the
+    # actual guard. Kept here so a routing divergence surfaces next to them.
+    pd.testing.assert_frame_equal(on, inert)
     pd.testing.assert_frame_equal(default_run, on)
 
     # Projection is flag-INDEPENDENT (commit 1a): taken in both states, and the
@@ -1532,3 +1508,632 @@ def test_kernel_callers_are_guarded_by_opt_in_flag(monkeypatch):
         f"({projections_written} calls); that write-back rule belongs to M4.3 and "
         "must not be introduced by the projection commit"
     )
+
+
+# ---------------------------------------------------------------------------
+# E. Two-day structural breakdown confirmation (gate 2b, OPT-IN, default OFF)
+# ---------------------------------------------------------------------------
+# `PositionPolicyConfig.two_day_breakdown_rule` gates a new gate 2b between the
+# stop fast path and the cooldown gate. Everything below asserts the three
+# synthetic scenarios the design item names (假破位反弹 / 缩量回踩 / 连续两日破位)
+# plus the two contracts that make the gate safe to ship at all:
+#
+#   * a MISSING input (`ma20_close` / `val` / `vol_ma20` / `volume`) degrades to
+#     a NO-OP -- `None` is never read as 0 and no breakdown is ever fabricated;
+#   * with the flag OFF the new context fields are invisible, i.e. the decision
+#     stream is identical to the pre-change path (strict no-op, not "usually off").
+#
+# `breakdown_streak` is its own counter: day 1 of a break must never move
+# `exit_streak`, or one broken-structure day plus one model-exit day would add up
+# to a "confirmed" exit and double-count two independent confirmations.
+
+
+def _breakdown_state(**overrides):
+    """A held position deliberately ABOVE the hard-stop line (entry 10.0, +3%)."""
+    base = dict(
+        symbol="AAA",
+        state=PositionState.HELD_ACTIVE,
+        held_bars=3,
+        entry_price=10.0,
+        peak_price=10.5,
+        current_weight=0.30,
+    )
+    base.update(overrides)
+    return AssetState(**base)
+
+
+def _run_breakdown_bars(closes, *, cfg, ma20_close, val=None, volumes=None, vol_ma20=None):
+    """Drive `AssetPolicy.step` over `closes`, carrying state via `state_after`.
+
+    The carry is exactly what an adapter does (`detail["state_after"]` becomes the
+    next bar's `AssetState`), so the streak/state assertions here describe the
+    real multi-bar behaviour rather than four independent one-shot calls.
+
+    `raw_target_weight` is the held weight on every bar: these are pure
+    structural-break scenarios, and a zero raw target would additionally arm the
+    orthogonal signal-exit gate (`exit_streak`), which would blur which counter
+    fired. Prices stay within the hard-stop band, so gate 2 cannot fire either.
+    """
+    policy = AssetPolicy()
+    state = _breakdown_state()
+    decisions = []
+    for i, close in enumerate(closes):
+        ctx = PolicyContext(
+            price=float(close),
+            ma20_close=ma20_close,
+            val=val,
+            volume=None if volumes is None else float(volumes[i]),
+            vol_ma20=vol_ma20,
+        )
+        decision = policy.step(state, float(state.current_weight), ctx, cfg)
+        decisions.append(decision)
+        snapshot = dict(decision.detail["state_after"])
+        snapshot["state"] = decision.next_state
+        state = AssetState(**snapshot)
+    return decisions, state
+
+
+def test_breakdown_fake_break_rebound_never_sells():
+    """假破位反弹: day1 breaks (no trade), day2 recovers -> streak reset, no SELL."""
+    cfg = PositionPolicyConfig(two_day_breakdown_rule=True)
+    decisions, state = _run_breakdown_bars(
+        [10.0, 9.5, 10.5],
+        cfg=cfg,
+        ma20_close=10.0,
+        volumes=[1e6, 1e6, 1e6],
+        vol_ma20=1e6,
+    )
+    baseline, breaking, rebound = decisions
+
+    # Bar 0 sits ON the floor -> not a breakdown, the ordinary ladder answers.
+    assert baseline.action == PolicyAction.HOLD
+    assert baseline.detail["state_after"]["breakdown_streak"] == 0
+
+    # Bar 1 is one counted break: PENDING_EXIT and NO trade (weight held).
+    assert breaking.action == PolicyAction.HOLD_FILTERED
+    assert breaking.target_weight == pytest.approx(0.30)
+    assert breaking.blocking_reason is BlockingReason.EXIT_CONFIRMING
+    assert breaking.next_state is PositionState.PENDING_EXIT
+    assert breaking.detail["breakdown_streak"] == 1
+    assert breaking.detail["state_after"]["breakdown_streak"] == 1
+    assert breaking.detail["state_after"]["exit_streak"] == 0, (
+        "day 1 of a structural break must not advance `exit_streak` -- that counter "
+        "belongs to the model-signal exit gate"
+    )
+
+    # Bar 2 recovers: the confirmation is cleared and the normal ladder resumes.
+    assert rebound.action != PolicyAction.SELL
+    assert not is_liquidation_event(rebound.action, rebound.blocking_reason)
+    assert rebound.next_state is PositionState.HELD_ACTIVE
+    assert rebound.detail["state_after"]["breakdown_streak"] == 0
+    assert state.state is PositionState.HELD_ACTIVE
+    assert all(d.action != PolicyAction.SELL for d in decisions)
+
+
+def test_breakdown_volume_shrink_pullback_is_exempt():
+    """缩量回踩: close below the floor on shrinking volume does not count."""
+    cfg = PositionPolicyConfig(two_day_breakdown_rule=True)
+    exempt, _ = _run_breakdown_bars(
+        [9.5], cfg=cfg, ma20_close=10.0, volumes=[0.59e6], vol_ma20=1e6
+    )
+    decision = exempt[0]
+    # Exempt means NO-OP for the rule: the ordinary ladder still answers the
+    # bar (weight unchanged -> inertia HOLD), but nothing was counted and the
+    # state machine was not pushed into a pending exit.
+    assert decision.action == PolicyAction.HOLD
+    assert decision.target_weight == pytest.approx(0.30)
+    assert decision.next_state is PositionState.HELD_ACTIVE
+    assert decision.next_state is not PositionState.PENDING_EXIT
+    assert decision.detail["state_after"]["breakdown_streak"] == 0
+    assert "breakdown_streak" not in decision.detail
+
+    # Orthogonality, explicitly: an exempt bar must NOT suppress the model-exit
+    # gate, or a low-volume break could hold a position the model already left.
+    state = _breakdown_state()
+    model_exit = AssetPolicy().step(
+        state,
+        0.0,
+        PolicyContext(price=9.5, ma20_close=10.0, volume=0.59e6, vol_ma20=1e6),
+        cfg,
+    )
+    assert model_exit.action == PolicyAction.HOLD_FILTERED
+    assert model_exit.blocking_reason is BlockingReason.EXIT_CONFIRMING
+    assert model_exit.detail["exit_streak"] == 1
+    assert model_exit.detail["state_after"]["breakdown_streak"] == 0
+    assert model_exit.next_state is PositionState.PENDING_EXIT
+
+    # Boundary: the SAME bar at 0.61x the volume MA is a counted break, so the
+    # exemption is the configured fraction and not "volume was supplied".
+    counted, _ = _run_breakdown_bars(
+        [9.5], cfg=cfg, ma20_close=10.0, volumes=[0.61e6], vol_ma20=1e6
+    )
+    assert counted[0].detail["state_after"]["breakdown_streak"] == 1
+    assert counted[0].next_state is PositionState.PENDING_EXIT
+    assert counted[0].blocking_reason is BlockingReason.EXIT_CONFIRMING
+
+
+def test_breakdown_two_consecutive_days_sells_with_literal_zero_cell():
+    """连续两日破位: SELL on the second counted day, with an explicit `0.0` cell."""
+    cfg = PositionPolicyConfig(two_day_breakdown_rule=True)
+    decisions, state = _run_breakdown_bars(
+        [9.5, 9.4],
+        cfg=cfg,
+        ma20_close=10.0,
+        volumes=[1e6, 1e6],
+        vol_ma20=1e6,
+    )
+    confirming, exiting = decisions
+
+    assert confirming.action == PolicyAction.HOLD_FILTERED
+    assert confirming.next_state is PositionState.PENDING_EXIT
+    assert confirming.detail["state_after"]["breakdown_streak"] == 1
+
+    assert exiting.action == PolicyAction.SELL
+    assert exiting.target_weight == 0.0
+    assert is_liquidation_event(exiting.action, exiting.blocking_reason)
+    assert exiting.blocking_reason is BlockingReason.NONE, (
+        "a SELL is never a blocked row; a blocking label may not ride on an exit"
+    )
+    assert exiting.next_state is PositionState.COOLDOWN
+
+    snapshot = exiting.detail["state_after"]
+    assert snapshot["cooldown_remaining"] == cfg.normal_cooldown_bars
+    assert snapshot["last_exit_type"] == ExitType.BREAKDOWN.value
+    assert snapshot["last_exit_price"] == pytest.approx(9.4)
+    assert snapshot["breakdown_streak"] == 0
+    assert snapshot["exit_streak"] == 0
+    assert snapshot["held_bars"] == 0
+    assert snapshot["entry_streak"] == 0
+    assert snapshot["entry_price"] == 0.0
+    assert snapshot["peak_price"] == 0.0
+    assert snapshot["current_weight"] == 0.0
+    assert state.state is PositionState.COOLDOWN
+
+    # Sparse-weights contract: the projection of the decision stream carries a
+    # LITERAL 0.0 on the exit bar -- not NaN, not a missing row. A missing row
+    # would be forward-filled by the backtester and silently keep the position.
+    projector = SparseProjector()
+    previous = 0.30
+    row = [0.30]  # the frame's initial-allocation row
+    for decision in decisions:
+        written = projector.write(decision, previous)
+        row.append(np.nan if written is None else float(written))
+        if written is not None:
+            previous = float(written)
+    sparse = projector.project(
+        pd.DataFrame({"AAA": row}, index=pd.bdate_range("2024-09-02", periods=len(row)))
+    )
+    exit_cell = sparse["AAA"].iloc[-1]
+    assert exit_cell == 0.0
+    assert not pd.isna(exit_cell)
+    assert projector.write(exiting, 0.30) == 0.0
+    # The confirming bar writes nothing at all (NaN row -> "no instruction").
+    assert projector.write(confirming, 0.30) is None
+    assert pd.isna(sparse["AAA"].iloc[-2])
+
+
+def test_breakdown_missing_inputs_degrade_to_noop():
+    """No fabricated breaks: every optional input degrades to a no-op, never to 0."""
+    cfg = PositionPolicyConfig(two_day_breakdown_rule=True)
+
+    # No MA20 anchor -> the rule cannot evaluate this bar: no count, no state
+    # change, no SELL, no crash (three consecutive bars below any sensible floor).
+    decisions, state = _run_breakdown_bars(
+        [9.7, 9.6, 9.5],
+        cfg=cfg,
+        ma20_close=None,
+        volumes=[1e6, 1e6, 1e6],
+        vol_ma20=1e6,
+    )
+    for decision in decisions:
+        assert decision.action != PolicyAction.SELL
+        assert decision.next_state is not PositionState.PENDING_EXIT
+        assert decision.detail["state_after"]["breakdown_streak"] == 0
+    assert state.state is PositionState.HELD_ACTIVE
+
+    # A missing `vol_ma20` cannot claim the shrink exemption -> the break counts.
+    counted, _ = _run_breakdown_bars(
+        [9.7, 9.6], cfg=cfg, ma20_close=10.0, volumes=[1e6, 1e6], vol_ma20=None
+    )
+    assert counted[0].detail["state_after"]["breakdown_streak"] == 1
+    assert counted[1].action == PolicyAction.SELL
+
+    # A missing `volume` is not an exemption either (the conservative direction).
+    no_volume, _ = _run_breakdown_bars(
+        [9.5], cfg=cfg, ma20_close=10.0, volumes=None, vol_ma20=1e6
+    )
+    assert no_volume[0].detail["state_after"]["breakdown_streak"] == 1
+
+    # `val` is optional and only ever LOWERS the floor: 9.5 < MA20 10.0 but is
+    # not below min(10.0, 9.0) = 9.0, so nothing is counted.
+    above_val, _ = _run_breakdown_bars(
+        [9.5], cfg=cfg, ma20_close=10.0, val=9.0, volumes=[1e6], vol_ma20=1e6
+    )
+    assert above_val[0].action != PolicyAction.SELL
+    assert above_val[0].detail["state_after"]["breakdown_streak"] == 0
+    assert above_val[0].action == PolicyAction.HOLD
+
+
+def test_breakdown_rule_off_is_identical_to_the_pre_change_path():
+    """OFF parity: the new context fields are invisible while the flag is False."""
+    cfg = PositionPolicyConfig()
+    assert cfg.two_day_breakdown_rule is False
+
+    closes = [10.0, 9.5, 9.4, 10.5]
+
+    def run(ctx_for):
+        policy = AssetPolicy()
+        state = _breakdown_state()
+        out = []
+        for close in closes:
+            decision = policy.step(state, float(state.current_weight), ctx_for(close), cfg)
+            out.append(
+                (
+                    decision.action,
+                    decision.target_weight,
+                    decision.blocking_reason,
+                    decision.next_state,
+                    decision.reason,
+                    decision.detail,
+                )
+            )
+            snapshot = dict(decision.detail["state_after"])
+            snapshot["state"] = decision.next_state
+            state = AssetState(**snapshot)
+        return out
+
+    populated = run(
+        lambda close: PolicyContext(
+            price=close,
+            ma20_close=10.0,
+            val=9.0,
+            vol_ma20=1e6,
+            volume=5e5,
+            vwap20=10.2,
+        )
+    )
+    bare = run(lambda close: PolicyContext(price=close))
+
+    # Whole decision stream -- action, weight, label, state, reason and detail.
+    assert populated == bare
+    # And the rule really is off: two consecutive closes below the floor sell
+    # nothing and leave the counter at zero.
+    assert all(decision[0] != PolicyAction.SELL for decision in populated)
+    assert all(decision[5]["state_after"]["breakdown_streak"] == 0 for decision in populated)
+
+
+def test_breakdown_days_is_clamped_and_configurable_above_the_floor():
+    """`breakdown_days` never drops below 2, and a larger window is honoured."""
+    assert PositionPolicyConfig().breakdown_days == 2
+    assert PositionPolicyConfig(breakdown_days=1).breakdown_days == 2
+    assert PositionPolicyConfig(breakdown_days=0).breakdown_days == 2
+    assert PositionPolicyConfig(breakdown_days=3).breakdown_days == 3
+
+    cfg = PositionPolicyConfig(two_day_breakdown_rule=True, breakdown_days=3)
+    decisions, _ = _run_breakdown_bars(
+        [9.5, 9.4, 9.3],
+        cfg=cfg,
+        ma20_close=10.0,
+        volumes=[1e6, 1e6, 1e6],
+        vol_ma20=1e6,
+    )
+    assert [decision.action for decision in decisions] == [
+        PolicyAction.HOLD_FILTERED,
+        PolicyAction.HOLD_FILTERED,
+        PolicyAction.SELL,
+    ]
+    assert decisions[-1].target_weight == 0.0
+
+
+# ---------------------------------------------------------------------------
+# F. Price/VWAP re-entry confirmation (gate 3b, OPT-IN, default OFF)
+# ---------------------------------------------------------------------------
+# `PositionPolicyConfig.price_reentry_gate` (default False) evaluates the
+# design item's re-entry rule on the bar gate 3's cooldown counter reaches zero.
+# Contract asserted here:
+#
+#   * two INDEPENDENT legs, either admits the entry -- a 2% rebound off the last
+#     exit print, or a VWAP-reclaim bar (`price > vwap20` AND `volume > vol_ma20`);
+#   * a BLOCK is `HOLD_FILTERED` / `REENTRY_GATED` at `target_weight=0.0` with the
+#     asset kept FLAT: in the sparse frame that is a MISSING row, never an
+#     explicit `0.0` (an explicit `0.0` is reserved for an actual exit);
+#   * an UNKNOWN exit print (`last_exit_price == 0.0`) degrades to ALLOW with a
+#     warning -- a missing field must never lock a symbol out of re-entering;
+#   * with the gate OFF the ladder is byte-for-byte the pre-change ladder;
+#   * every exit path (stop / emergency / trailing / model-signal) now writes
+#     `last_exit_price`, so the gate actually has data to compare against.
+#
+# `price_reentry_pct` keeps the ledger's `lifecycle_price_reentry_pct=0.02`; only
+# the switch is new.
+
+
+def _cooldown_state(**overrides):
+    """A post-exit COOLDOWN state on its EXPIRY bar (1 day left, exit at 10.0)."""
+    base = dict(
+        symbol="AAA",
+        state=PositionState.COOLDOWN,
+        held_bars=0,
+        entry_price=0.0,
+        peak_price=0.0,
+        current_weight=0.0,
+        cooldown_remaining=1,
+        last_exit_type=ExitType.HARD_STOP.value,
+        last_exit_price=10.0,
+    )
+    base.update(overrides)
+    return AssetState(**base)
+
+
+def _carry(decision):
+    """Commit exactly one transition, the way an adapter does."""
+    snapshot = dict(decision.detail["state_after"])
+    snapshot["state"] = decision.next_state
+    return AssetState(**snapshot)
+
+
+def _expiry_step(price, *, cfg, raw_target=0.30, **ctx_kwargs):
+    """One `step` on the cooldown-expiry bar with the given synthetic context."""
+    return AssetPolicy().step(
+        _cooldown_state(),
+        raw_target,
+        PolicyContext(price=price, **ctx_kwargs),
+        cfg,
+    )
+
+
+def test_reentry_gate_allows_when_price_rebounds_above_the_threshold():
+    """Leg 1: `price > last_exit_price × (1 + 2%)` admits the entry (2% == 10.2)."""
+    cfg = PositionPolicyConfig(price_reentry_gate=True)
+    assert cfg.price_reentry_pct == 0.02
+    assert cfg.reentry_vwap_lookback == 20
+
+    decision = _expiry_step(10.5, cfg=cfg)
+    # The gate passed, so the ordinary ladder answers: the confirmation window
+    # opens (no REENTRY_GATED, no block).
+    assert decision.blocking_reason is not BlockingReason.REENTRY_GATED
+    assert decision.blocking_reason is BlockingReason.PENDING_ENTRY_CONFIRM
+    assert decision.next_state is PositionState.PENDING_ENTRY
+    assert decision.action == PolicyAction.HOLD_FILTERED
+
+    # Carrying the state, the very next qualifying bar BUYS (normal ladder).
+    follow_up = AssetPolicy().step(
+        _carry(decision), 0.30, PolicyContext(price=10.6), cfg
+    )
+    assert follow_up.action == PolicyAction.BUY
+    assert follow_up.target_weight == pytest.approx(0.30)
+    assert follow_up.next_state is PositionState.HELD_GESTATION
+
+    # Boundary: exactly at the required price is NOT "above" it.
+    at_threshold = _expiry_step(10.2, cfg=cfg, vwap20=None)
+    assert at_threshold.blocking_reason is BlockingReason.REENTRY_GATED
+
+
+def test_reentry_gate_allows_on_vwap_reclaim_with_expanding_volume():
+    """Leg 2: price > vwap20 AND volume > vol_ma20 admits a sub-threshold price."""
+    cfg = PositionPolicyConfig(price_reentry_gate=True)
+    reclaimed = _expiry_step(
+        10.1, cfg=cfg, vwap20=10.0, volume=2e6, vol_ma20=1e6
+    )
+    assert reclaimed.blocking_reason is not BlockingReason.REENTRY_GATED
+    assert reclaimed.blocking_reason is BlockingReason.PENDING_ENTRY_CONFIRM
+    assert reclaimed.next_state is PositionState.PENDING_ENTRY
+    assert reclaimed.detail["state_after"]["last_exit_price"] == pytest.approx(10.0)
+
+    # Neither half of the conjunct is enough on its own.
+    no_volume_expansion = _expiry_step(
+        10.1, cfg=cfg, vwap20=10.0, volume=1e6, vol_ma20=1e6
+    )
+    assert no_volume_expansion.blocking_reason is BlockingReason.REENTRY_GATED
+    below_vwap = _expiry_step(
+        10.1, cfg=cfg, vwap20=10.1, volume=2e6, vol_ma20=1e6
+    )
+    assert below_vwap.blocking_reason is BlockingReason.REENTRY_GATED
+
+
+def test_reentry_gate_blocks_with_flat_state_and_a_missing_sparse_row():
+    """Neither leg satisfied -> HOLD_FILTERED/REENTRY_GATED, flat, MISSING row."""
+    cfg = PositionPolicyConfig(price_reentry_gate=True)
+    decision = _expiry_step(
+        10.0, cfg=cfg, vwap20=10.5, volume=5e5, vol_ma20=1e6
+    )
+
+    assert decision.action == PolicyAction.HOLD_FILTERED
+    assert decision.target_weight == 0.0
+    assert decision.blocking_reason is BlockingReason.REENTRY_GATED
+    assert blocking_reason_label(decision.blocking_reason) == "再入场价格未确认"
+    # Kept FLAT: no position, no cooldown re-armed, exit print preserved.
+    assert decision.next_state is PositionState.FLAT
+    snapshot = decision.detail["state_after"]
+    assert snapshot["state"] == PositionState.FLAT
+    assert snapshot["cooldown_remaining"] == 0
+    assert snapshot["current_weight"] == 0.0
+    assert snapshot["last_exit_price"] == pytest.approx(10.0)
+
+    # Auditable gate inputs, all six of them.
+    assert decision.detail["current_price"] == pytest.approx(10.0)
+    assert decision.detail["last_exit_price"] == pytest.approx(10.0)
+    assert decision.detail["required_price"] == pytest.approx(10.2)
+    assert decision.detail["price_reentry_pct"] == pytest.approx(0.02)
+    assert decision.detail["vwap20"] == pytest.approx(10.5)
+    assert decision.detail["volume"] == pytest.approx(5e5)
+    assert decision.detail["vol_ma20"] == pytest.approx(1e6)
+
+    # Sparse contract: a blocked re-entry is a MISSING row, never an explicit 0.0
+    # (the preceding SELL already carried the target to 0.0).
+    projector = SparseProjector()
+    assert projector.write(decision, 0.0) is None
+    assert not is_liquidation_event(decision.action, decision.blocking_reason)
+
+    sparse = projector.project(
+        pd.DataFrame({"AAA": [0.30, 0.0, np.nan]}, index=pd.bdate_range("2024-09-02", periods=3))
+    )
+    assert sparse["AAA"].iloc[1] == 0.0  # the exit row keeps its literal 0.0
+    assert pd.isna(sparse["AAA"].iloc[2])  # the blocked bar writes nothing
+
+
+def test_reentry_gate_degrades_to_allow_when_the_exit_print_is_unknown(caplog):
+    """`last_exit_price == 0.0` -> ALLOW with a warning, never a permanent lockout."""
+    cfg = PositionPolicyConfig(price_reentry_gate=True)
+    with caplog.at_level(logging.WARNING, logger="common.position_policy"):
+        decision = AssetPolicy().step(
+            _cooldown_state(last_exit_price=0.0),
+            0.30,
+            PolicyContext(price=9.0, vwap20=None),
+            cfg,
+        )
+    assert decision.blocking_reason is not BlockingReason.REENTRY_GATED
+    assert decision.blocking_reason is BlockingReason.PENDING_ENTRY_CONFIRM
+    assert decision.next_state is PositionState.PENDING_ENTRY
+    assert any("last_exit_price" in record.message for record in caplog.records), (
+        "a degraded gate must say so out loud, not silently allow"
+    )
+
+    # A negated / NaN print is the same "unknown" (never a block).
+    for bad in (-1.0, float("nan"), float("inf")):
+        allowed = AssetPolicy().step(
+            _cooldown_state(last_exit_price=bad),
+            0.30,
+            PolicyContext(price=9.0),
+            cfg,
+        )
+        assert allowed.blocking_reason is not BlockingReason.REENTRY_GATED
+        assert allowed.next_state is PositionState.PENDING_ENTRY
+
+    # The warning is emitted once per degraded bar, not once per config.
+    assert sum("price_reentry_gate" in record.message for record in caplog.records) == 4
+
+
+def test_reentry_gate_allows_when_vwap20_is_absent_but_price_recovered(caplog):
+    """A missing `vwap20` cannot veto a price leg that already passes."""
+    cfg = PositionPolicyConfig(price_reentry_gate=True)
+    with caplog.at_level(logging.WARNING, logger="common.position_policy"):
+        decision = _expiry_step(10.3, cfg=cfg, vwap20=None)
+    assert decision.blocking_reason is BlockingReason.PENDING_ENTRY_CONFIRM
+    assert decision.next_state is PositionState.PENDING_ENTRY
+    assert not caplog.records, "a passing gate must be silent (no degrade warning)"
+
+
+def test_reentry_gate_off_is_identical_to_the_pre_change_path():
+    """OFF is a strict no-op: the new context fields are completely invisible."""
+    cfg = PositionPolicyConfig()
+    assert cfg.price_reentry_gate is False
+
+    closes = [10.0, 9.8, 10.4]
+
+    def run(ctx_for):
+        policy = AssetPolicy()
+        state = _cooldown_state()
+        out = []
+        for close in closes:
+            decision = policy.step(state, 0.30, ctx_for(close), cfg)
+            out.append(
+                (
+                    decision.action,
+                    decision.target_weight,
+                    decision.blocking_reason,
+                    decision.next_state,
+                    decision.reason,
+                    decision.detail,
+                )
+            )
+            state = _carry(decision)
+        return out
+
+    # This context WOULD be blocked with the gate ON (price 10.0 < 10.2 and
+    # price < vwap20), so the comparison is not vacuous.
+    populated = run(
+        lambda close: PolicyContext(
+            price=close, vwap20=10.5, vol_ma20=1e6, volume=5e5
+        )
+    )
+    bare = run(lambda close: PolicyContext(price=close))
+    assert populated == bare
+    assert all(row[2] is not BlockingReason.REENTRY_GATED for row in populated)
+
+    # And with the gate ON the very same first bar IS blocked -- that is what
+    # makes the OFF comparison above meaningful.
+    gated = _expiry_step(10.0, cfg=PositionPolicyConfig(price_reentry_gate=True),
+                         vwap20=10.5, vol_ma20=1e6, volume=5e5)
+    assert gated.blocking_reason is BlockingReason.REENTRY_GATED
+
+
+def test_reentry_gate_state_and_labels_are_synced():
+    """The new enum member is labelled, complete, and never reads as an exit."""
+    assert BlockingReason.REENTRY_GATED.value == "REENTRY_GATED"
+    assert BLOCKING_REASON_LABELS[BlockingReason.REENTRY_GATED.value] == "再入场价格未确认"
+    assert blocking_reason_label("REENTRY_GATED") == "再入场价格未确认"
+    assert blocking_reason_label("reentry_gated") == "再入场价格未确认"
+    # Every member has a label and the label table has no orphans.
+    assert set(BLOCKING_REASON_LABELS) == {member.value for member in BlockingReason}
+    assert not is_liquidation_event(
+        PolicyAction.HOLD_FILTERED, BlockingReason.REENTRY_GATED
+    )
+
+
+def test_last_exit_price_is_written_by_every_exit_path():
+    """Stop / emergency / trailing / model-signal exits all retain their print."""
+    policy = AssetPolicy()
+    cfg = PositionPolicyConfig()
+
+    def held(price, **ctx_kwargs):
+        return policy.step(
+            AssetState(
+                symbol="AAA",
+                state=PositionState.HELD_ACTIVE,
+                held_bars=3,
+                entry_price=10.0,
+                peak_price=10.5,
+                current_weight=0.30,
+            ),
+            0.30,
+            PolicyContext(price=price, **ctx_kwargs),
+            cfg,
+        )
+
+    hard_stop = held(8.9)
+    assert hard_stop.action == PolicyAction.SELL
+    assert hard_stop.detail["state_after"]["last_exit_type"] == ExitType.HARD_STOP.value
+    assert hard_stop.detail["state_after"]["last_exit_price"] == pytest.approx(8.9)
+
+    emergency = held(9.5, is_emergency_halt=True)
+    assert emergency.action == PolicyAction.SELL
+    assert emergency.detail["state_after"]["last_exit_type"] == ExitType.CIRCUIT_BREAKER.value
+    assert emergency.detail["state_after"]["last_exit_price"] == pytest.approx(9.5)
+
+    # peak 10.5 - 4.5 × atr 0.1 == 10.05 > price 10.0 -> trailing stop (not a loss).
+    trailing = held(10.0, atr=0.1)
+    assert trailing.action == PolicyAction.SELL
+    assert trailing.detail["state_after"]["last_exit_type"] == ExitType.TRAILING_STOP.value
+    assert trailing.detail["state_after"]["last_exit_price"] == pytest.approx(10.0)
+
+    # Model-signal exit: two confirming bars, exit print = the exit bar's close.
+    state = AssetState(
+        symbol="AAA",
+        state=PositionState.HELD_ACTIVE,
+        held_bars=3,
+        entry_price=10.0,
+        peak_price=10.5,
+        current_weight=0.30,
+        last_exit_price=0.0,
+    )
+    confirming = policy.step(state, 0.0, PolicyContext(price=10.4), cfg)
+    assert confirming.next_state is PositionState.PENDING_EXIT
+    assert confirming.detail["state_after"]["last_exit_price"] == 0.0, (
+        "an un-exited position must not claim an exit print"
+    )
+    model_exit = policy.step(_carry(confirming), 0.0, PolicyContext(price=10.3), cfg)
+    assert model_exit.action == PolicyAction.SELL
+    assert model_exit.next_state is PositionState.COOLDOWN
+    snapshot = model_exit.detail["state_after"]
+    assert snapshot["last_exit_type"] == ExitType.NORMAL.value
+    assert snapshot["last_exit_price"] == pytest.approx(10.3)
+
+    # The written print is exactly what the gate compares against afterwards.
+    gated = AssetPolicy().step(
+        _carry(model_exit),
+        0.30,
+        PolicyContext(price=10.3),  # below 10.3 × 1.02 == 10.506
+        PositionPolicyConfig(price_reentry_gate=True),
+    )
+    assert gated.blocking_reason is BlockingReason.REENTRY_GATED
+    assert gated.detail["last_exit_price"] == pytest.approx(10.3)

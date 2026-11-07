@@ -78,6 +78,56 @@ WHAT IS *NOT* CLAIMED HERE
 * The sparse projection (`SparseProjector.project`) is a literal transcription
   and IS intended to be identical, but it also has zero callers in M4.1.
 
+OPT-IN EXTENSION -- gate 2b, two-day structural breakdown (DEFAULT OFF)
+=====================================================================
+`PositionPolicyConfig.two_day_breakdown_rule` (default `False`) inserts a gate
+2b into `AssetPolicy.step`, between the stop fast path (gate 2) and the cooldown
+gate (gate 3), evaluated ONLY for already-held states:
+
+  * `close < min(ma20_close, val)` (or `< ma20_close` when `val` is absent) is a
+    counted breakdown bar -- but only when the bar is not a 缩量回踩, i.e. only
+    when volume is not below `breakdown_vol_shrink_pct * vol_ma20`;
+  * one counted bar -> `PENDING_EXIT` + `HOLD_FILTERED`/`EXIT_CONFIRMING` (no
+    trade, no row), `breakdown_days` counted bars -> `SELL` at an explicit
+    `0.0` + `COOLDOWN`;
+  * a close back at/above the floor clears the counter and falls through to the
+    pre-existing ladder unchanged (假破位反弹 never sells);
+  * every input it needs is optional and a missing one degrades to a NO-OP --
+    `None` is never read as 0, and no breakdown is ever fabricated.
+
+It is a strict no-op when the flag is `False` (the branch is not entered at
+all), and it uses its OWN `breakdown_streak` counter so the `exit_streak` /
+`guard_latency_bars` signal-exit confirmation is never double-counted.
+
+OPT-IN EXTENSION -- gate 3b, price/VWAP re-entry confirmation (DEFAULT OFF)
+=========================================================================
+`PositionPolicyConfig.price_reentry_gate` (default `False`) evaluates the same
+design item's re-entry rule on the bar gate 3's cooldown counter reaches zero --
+the bar the asset would otherwise become eligible to re-enter:
+
+  * PASS if `price > last_exit_price * (1 + price_reentry_pct)` (the ledger's
+    2% rebound), or if a VWAP reclaim is confirmed on this bar
+    (`price > vwap20` AND `volume > vol_ma20`);
+  * BLOCK otherwise -> `HOLD_FILTERED` / `BlockingReason.REENTRY_GATED` at
+    `target_weight=0.0`, the asset stays `FLAT` (no position), and
+    `last_exit_price` is kept so the decision stays auditable and comparable;
+  * a MISSING / non-positive / non-finite `last_exit_price` degrades to ALLOW
+    with a warning: an unknown exit print must never lock a symbol out of ever
+    re-entering (`_reentry_gate_block`).
+
+WHY IT IS OFF BY DEFAULT (recorded decision, not an oversight): switching it on
+makes EVERY post-cooldown re-entry require a 2% rebound off the exit print,
+which is a live trading-behaviour change, and it would break `M4.2`'s
+bit-identical guarantee. The explicit switch keeps the engine byte-identical
+while preserving the ledger's `lifecycle_price_reentry_pct=0.02` threshold
+instead of quietly dropping it. `AssetState.last_exit_price` is written by every
+exit path (stop / breakdown / model-signal) so the gate has data; the gate is
+evaluated ONLY on the cooldown-expiry bar, which is the only bar gate 3 owns --
+so a blocked re-entry is a ONE-BAR VETO (the block is returned for that bar and
+not persisted: the next bar skips gate 3, is never re-asked, and proceeds through
+the normal entry ladder), never a sustained gated state. See
+`AssetPolicy._reentry_gate_block` for the full consequence statement.
+
 INVARIANTS (design §5)
 ======================
 1. long-only: the per-symbol layer never emits a negative target of its own
@@ -152,6 +202,12 @@ class ExitType(str, Enum):
     HARD_STOP = "HARD_STOP"
     TRAILING_STOP = "TRAILING_STOP"
     CIRCUIT_BREAKER = "CIRCUIT_BREAKER"
+    # Opt-in two-day structural breakdown exit (gate 2b, `two_day_breakdown_rule`).
+    # Deliberately NOT folded into HARD_STOP: `HARD_STOP` means "loss_pct crossed
+    # hard_stop_loss_pct", and reusing it would make a `min(MA20, VAL)` structural
+    # break indistinguishable from a fixed-percentage stop in the forensic record
+    # -- exactly the label conflation `BlockingReason` was introduced to end.
+    BREAKDOWN = "BREAKDOWN"
 
 
 class BlockingReason(str, Enum):
@@ -191,6 +247,12 @@ class BlockingReason(str, Enum):
     LIMIT_UP_LOCKED = "LIMIT_UP_LOCKED"
     # Missing / non-positive price on evaluation bar.
     NO_PRICE = "NO_PRICE"
+    # Opt-in price/VWAP re-entry gate (gate 3b, `price_reentry_gate`): the
+    # cooldown expired, but neither the 2%-rebound leg nor the VWAP-reclaim leg
+    # is satisfied, so the asset stays FLAT and no entry row is written. Its own
+    # member (rather than reusing `COOLDOWN_BLOCKED`) because the cooldown HAS
+    # expired here -- the block is a price-confirmation veto, not a timer.
+    REENTRY_GATED = "REENTRY_GATED"
     # No blocking gate fired.
     NONE = "NONE"
 
@@ -207,6 +269,7 @@ BLOCKING_REASON_LABELS: Dict[str, str] = {
     BlockingReason.TENURE_LOCKED.value: "未满最低持仓周期",
     BlockingReason.LIMIT_UP_LOCKED.value: "涨停封板",
     BlockingReason.NO_PRICE.value: "价格缺失",
+    BlockingReason.REENTRY_GATED.value: "再入场价格未确认",
     BlockingReason.NONE.value: "无阻断",
 }
 
@@ -324,7 +387,10 @@ class AssetState:
     """Per-symbol persistent state carried INTO a policy step.
 
     A superset of `AssetLifecycleState` (same field names, same meaning) plus
-    `expansion_streak` for the blend engines' expansion-confirmation ladder.
+    `expansion_streak` for the blend engines' expansion-confirmation ladder, plus
+    the opt-in-rule fields `breakdown_streak` (gate 2b's own confirmation counter,
+    never `exit_streak`) and `last_exit_price` (retained through cooldown for the
+    opt-in price/VWAP re-entry gate, gate 3b).
     The kernel NEVER mutates the instance it is given: `AssetPolicy.step`
     works on a private copy and returns the updated snapshot in
     `Decision.detail["state_after"]` (design invariant 3: the same
@@ -348,6 +414,21 @@ class AssetState:
     current_weight: float = 0.0
     broker_weight: float = 0.0
     last_exit_type: Optional[str] = None
+    #: Separate confirmation counter for the OPT-IN two-day structural-breakdown
+    #: rule (gate 2b). It is deliberately NOT `exit_streak`: `exit_streak` is the
+    #: model-signal exit gate paired with `guard_latency_bars`, and reusing it
+    #: would double-count two independent confirmations into one counter (one
+    #: broken-structure day plus one model-exit day would look like a confirmed
+    #: exit). Default-inert: nothing increments it unless
+    #: `two_day_breakdown_rule` is True.
+    breakdown_streak: int = 0
+    #: Close of the last exit (stop / emergency / breakdown / model-signal),
+    #: retained through the cooldown so the opt-in price/VWAP re-entry gate
+    #: (gate 3b) can compare against it (`docs/long_only_multi_asset_gap_analysis.md`
+    #: §P0-1, design item M1.1). Written by EVERY exit path; `0.0` means
+    #: "unknown" and the gate treats it as "cannot evaluate" -> ALLOW with a
+    #: warning, never as a permanent lockout.
+    last_exit_price: float = 0.0
 
 
 @dataclass
@@ -373,6 +454,22 @@ class PolicyContext:
     is_portfolio_deleverage: bool = False
     structural: dict = field(default_factory=dict)
     bar_index: int = 0
+    # ---- inputs of the two OPT-IN rules (gate 2b / gate 3b) ----------------
+    # Every one of these is optional, and `None` means "this bar cannot be
+    # evaluated by that rule" -- never 0.0, never "no breakdown", never a
+    # fabricated break. They are separate fields from `vwap` / `ma20_volume`
+    # above on purpose: `ma20_volume` belongs to the entry fast path's volume
+    # surge test, and folding the two would merge two orthogonal thresholds
+    # (`docs/development_plan.md` M1.1 item 6: 正交性，不得合并阈值).
+    # `ma20_close` / `val` feed gate 2b (two-day structural breakdown).
+    # `vwap20` / `vol_ma20` feed gate 3b (price/VWAP re-entry confirmation):
+    # `vwap20` is a PRE-COMPUTED 20-day VWAP -- the kernel never derives one, so
+    # `PositionPolicyConfig.reentry_vwap_lookback` only documents the derivation
+    # window for the layer that computes it.
+    ma20_close: Optional[float] = None
+    vwap20: Optional[float] = None
+    vol_ma20: Optional[float] = None
+    val: Optional[float] = None
 
 
 @dataclass
@@ -433,6 +530,12 @@ class PositionPolicyConfig:
     `guard_latency_bars` (the confirmation window): the old resolvers parsed
     these two side by side under one name family, which is how "门槛" and
     "确认期" got conflated (design §2).
+
+    Two rule blocks below are OPT-IN and default OFF, each with its own switch
+    (`two_day_breakdown_rule` -> gate 2b, `price_reentry_gate` -> gate 3b), so
+    the default configuration keeps every pre-change decision byte-identical.
+    `price_reentry_pct=0.02` is the ledger's `lifecycle_price_reentry_pct` kept
+    verbatim; only the switch is new.
     """
 
     guard_latency_bars: int = 2
@@ -448,6 +551,67 @@ class PositionPolicyConfig:
     atr_multiplier: float = 4.5
     volume_surge_multiplier: float = 1.5
     breadth_thrust_threshold: float = 0.60
+    # ---- OPT-IN two-day structural-breakdown confirmation (gate 2b) ----------
+    # `two_day_breakdown_rule` is the ONLY switch. While it is False (default)
+    # gate 2b is not entered at all, so the policy chain is byte-for-byte the
+    # pre-change chain and `common/tests/test_position_policy.py`'s parity
+    # harnesses keep their 240-seed cell-level guarantee.
+    #
+    # `breakdown_days` is the number of counted breakdown bars required before
+    # the SELL. It is CLAMPED UP to 2 in `__post_init__`: a 1-day setting would
+    # be a single-bar whipsaw exit, which is precisely what this rule exists to
+    # prevent and what its name promises. A caller who genuinely wants an
+    # unconfirmed structural exit should disable the rule and use the stop path,
+    # not run a two-day rule with one day of confirmation.
+    #
+    # `breakdown_vol_shrink_pct` is the 缩量回踩 exemption: a bar whose volume is
+    # below this fraction of `vol_ma20` does not count as a breakdown.
+    two_day_breakdown_rule: bool = False
+    breakdown_days: int = 2
+    breakdown_vol_shrink_pct: float = 0.60
+    # ---- OPT-IN price/VWAP re-entry confirmation (gate 3b) -------------------
+    # `price_reentry_gate` is the ONLY switch, and it is OFF by default ON
+    # PURPOSE: with it ON every post-cooldown re-entry would require a 2%
+    # rebound off the last exit print, which is a live trading-behaviour change
+    # (and it would break M4.2's bit-identical guarantee). Keeping the switch
+    # explicit preserves the ledger's `lifecycle_price_reentry_pct=0.02`
+    # threshold instead of silently dropping it. While it is False the gate-3
+    # expiry path is byte-for-byte the pre-change path.
+    #
+    # `reentry_vwap_lookback` is PLUMBING ONLY: the kernel receives a
+    # pre-computed `PolicyContext.vwap20`, so this value is consumed by the
+    # derivation layer that builds the context, not by the kernel.
+    price_reentry_gate: bool = False
+    price_reentry_pct: float = 0.02
+    reentry_vwap_lookback: int = 20
+
+    def __post_init__(self) -> None:
+        """Normalise `breakdown_days` (never below the two-day confirmation floor).
+
+        Downstream code compares `breakdown_streak >= breakdown_days` directly,
+        so the clamp must live here rather than at the comparison: one clamped
+        value is the single truth. The clamp is applied even while the rule is
+        OFF so the dataclass is normalised regardless of the flag (an inert
+        value that silently becomes a 1-day rule when the flag is turned on is
+        worse than a normalised one).
+        """
+        try:
+            days = int(self.breakdown_days)
+        except (TypeError, ValueError):
+            _LOGGER.warning(
+                "two_day_breakdown_rule: non-numeric breakdown_days=%r, falling back to 2",
+                self.breakdown_days,
+            )
+            days = 2
+        if days < 2:
+            _LOGGER.warning(
+                "two_day_breakdown_rule: breakdown_days=%r is below the two-day confirmation "
+                "minimum, clamping to 2 (a 1-day rule would be a single-bar whipsaw exit and "
+                "contradicts the rule's own contract)",
+                self.breakdown_days,
+            )
+            days = 2
+        self.breakdown_days = days
 
 
 def _snapshot(state: AssetState) -> Dict[str, Any]:
@@ -465,6 +629,8 @@ def _snapshot(state: AssetState) -> Dict[str, Any]:
         "current_weight": float(state.current_weight),
         "broker_weight": float(state.broker_weight),
         "last_exit_type": state.last_exit_type,
+        "breakdown_streak": int(state.breakdown_streak),
+        "last_exit_price": float(state.last_exit_price),
     }
 
 
@@ -707,8 +873,17 @@ class AssetPolicy:
              `next_state=COOLDOWN`, `asset_stop_cooldown_bars`; it bypasses BOTH
              the tenure lock and inertia (a T+1 lock must never convert a bounded
              stop into an unbounded tail loss -- the 2026-10-22 incident);
+          2b. two-day structural breakdown confirmation -- OPT-IN, default OFF
+             (`two_day_breakdown_rule`); evaluated only for held states, below
+             the stop fast path. Not entered at all while the flag is False (see
+             `_two_day_breakdown_step`);
           3. cooldown gate -- blocks entry only, never a holding; decrements the
              counter, and on expiry resets to FLAT and falls through;
+          3b. price/VWAP re-entry confirmation -- OPT-IN, default OFF
+             (`price_reentry_gate`); evaluated only on the cooldown-EXPIRY bar
+             (see `_reentry_gate_block`). A block is `HOLD_FILTERED` /
+             `REENTRY_GATED` at `0.0` with the asset kept FLAT, i.e. a missing
+             row, never an explicit `0.0` exit;
           4. minimum entry weight gate;
           5. entry-confirmation streak (`guard_latency_bars`) + volume/breadth
              fast path;
@@ -831,6 +1006,11 @@ class AssetPolicy:
                     st.last_exit_type = ExitType.TRAILING_STOP.value
                     stop_reason = f"触发个股 ATR 跟踪止损风控 (当前价格 {ctx.price:.2f} < 跟踪止损价 {trailing_stop:.2f})"
 
+                # Retain the exit PRINT for the opt-in re-entry gate (gate 3b).
+                # Pure additive state write: no other behaviour of the stop path
+                # changes, and with `price_reentry_gate` False nothing reads it.
+                st.last_exit_price = float(ctx.price)
+
                 detail = {
                     "loss_pct": loss_pct,
                     "current_price": ctx.price,
@@ -857,6 +1037,23 @@ class AssetPolicy:
                     detail=detail,
                 )
 
+            # ---- gate 2b: two-day structural breakdown (OPT-IN, default OFF) --
+            # Placed BELOW the stop/emergency fast path (a bounded hard stop must
+            # never wait a second day) and ABOVE the cooldown / entry / exit /
+            # inertia / tenure gates. While `two_day_breakdown_rule` is False
+            # this branch is not entered at all, so the documented gate order and
+            # every existing decision are unchanged (strict no-op).
+            if cfg.two_day_breakdown_rule:
+                breakdown_decision = self._two_day_breakdown_step(
+                    st,
+                    ctx,
+                    cfg,
+                    state_before=state_before,
+                    can_sell=can_sell,
+                )
+                if breakdown_decision is not None:
+                    return breakdown_decision
+
         # ---- gate 3: cooldown gate (blocks entry only) --------------------
         if st.cooldown_remaining > 0:
             st.cooldown_remaining -= 1
@@ -876,6 +1073,24 @@ class AssetPolicy:
             st.state = PositionState.FLAT
             st.entry_streak = 0
             st.exit_streak = 0
+
+            # ---- gate 3b: price/VWAP re-entry confirmation (OPT-IN, default OFF)
+            # Evaluated ONLY on the cooldown-EXPIRY bar -- the single bar gate 3
+            # owns, and the bar the asset would otherwise become eligible to
+            # re-enter. A block is a ONE-BAR veto: nothing persists it, so the
+            # next bar skips gate 3 and walks the normal entry ladder unchecked.
+            # While `price_reentry_gate` is False this branch is not
+            # entered at all, so the ladder is byte-for-byte the pre-change
+            # ladder (strict no-op, not "usually off").
+            if cfg.price_reentry_gate:
+                reentry_block = self._reentry_gate_block(
+                    st,
+                    ctx,
+                    cfg,
+                    state_before=state_before,
+                )
+                if reentry_block is not None:
+                    return reentry_block
 
         # ---- gates 4/5: entry side (FLAT / PENDING_ENTRY only) -----------
         if st.state in (PositionState.FLAT, PositionState.PENDING_ENTRY):
@@ -1041,6 +1256,10 @@ class AssetPolicy:
                     st.state = PositionState.COOLDOWN
                     st.cooldown_remaining = cfg.normal_cooldown_bars
                     st.last_exit_type = ExitType.NORMAL.value
+                    # Retain the exit PRINT for the opt-in re-entry gate (gate
+                    # 3b). Additive state write only -- the decision below is
+                    # unchanged, and nothing reads the field while the gate is OFF.
+                    st.last_exit_price = float(ctx.price)
                     detail = {
                         "exit_streak": streak_count,
                         "guard_latency_bars": cfg.guard_latency_bars,
@@ -1177,6 +1396,299 @@ class AssetPolicy:
             state_before=state_before,
             state=st,
             detail=detail_dict,
+        )
+
+    def _two_day_breakdown_step(
+        self,
+        st: AssetState,
+        ctx: PolicyContext,
+        cfg: PositionPolicyConfig,
+        *,
+        state_before: PositionState,
+        can_sell: bool,
+    ) -> Optional[Decision]:
+        """Gate 2b: the opt-in two-day structural-breakdown confirmation.
+
+        `docs/development_plan.md` M1.1 item 4 / design §P0-1: a close below the
+        structural floor -- `min(MA20, VAL)`, or `MA20` alone when `VAL` is not
+        supplied -- is NOT an exit. It is one counted breakdown bar; only the
+        second counted bar liquidates (`PENDING_EXIT` in between). The two-day
+        window is what kills 单日假破位 (a one-bar spike through the floor that
+        recovers the next day), which is one of the three real loss sources named
+        in `docs/long_only_multi_asset_gap_analysis.md` §5.
+
+        Contract:
+          * `breakdown_streak` is this rule's OWN counter. `exit_streak` belongs
+            to the model-signal exit gate (`guard_latency_bars`) and is never
+            reused here -- reusing it would let one broken-structure day plus one
+            model-exit day add up to a "confirmed" exit.
+          * missing data degrades to a NO-OP, never to a fabricated break:
+            without a finite positive `ma20_close` the bar is not evaluated at
+            all (streak untouched -- a data gap neither confirms nor clears);
+            `val` is optional and only ever LOWERS the floor; `vol_ma20`/`volume`
+            being absent can never claim the 缩量 exemption (so the bar counts,
+            the conservative direction).
+          * a close back at/above the floor RESETS the streak and falls through
+            to the pre-existing ladder unchanged -- 假破位反弹 must never sell.
+          * a 缩量回踩 bar is a pure no-op: not counted, and it does not block
+            the orthogonal gates below (a blocked bar could otherwise suppress a
+            model exit indefinitely -- see the branch comment).
+          * the SELL path returns `target_weight=0.0` through `_decision`, i.e.
+            exactly the construction gate 2 / gate 6 use, so `SparseProjector`
+            writes a literal `0.0` (an explicit close), never a missing row,
+            never a NaN (`AGENTS.md` sparse-weights contract).
+          * the confirmed breakdown is a RISK exit, so -- like the stop fast path
+            -- it is not tenure-lockable: the two-day confirmation is itself the
+            anti-whipsaw delay. A tenure override is logged, never silent.
+
+        Returns `None` when the bar is not a (counted) breakdown, meaning "carry
+        on with the normal gate ladder".
+        """
+        ma20 = ctx.ma20_close
+        if ma20 is None or not np.isfinite(ma20) or float(ma20) <= 0.0:
+            # No MA20 anchor -> the rule cannot evaluate this bar. `None` must
+            # never be read as 0 (that would make every close a "breakdown").
+            return None
+
+        floor = float(ma20)
+        if ctx.val is not None and np.isfinite(ctx.val) and float(ctx.val) > 0.0:
+            floor = min(floor, float(ctx.val))
+
+        detail: Dict[str, Any] = {
+            "current_price": float(ctx.price),
+            "ma20_close": float(ma20),
+            "val": None if ctx.val is None else float(ctx.val),
+            "breakdown_floor": floor,
+            "breakdown_days": int(cfg.breakdown_days),
+        }
+
+        if not (float(ctx.price) < floor):
+            # 假破位反弹: the close is back at/above the floor. Clear the pending
+            # confirmation and let the existing gates decide, exactly as they
+            # would have without this rule.
+            st.breakdown_streak = 0
+            return None
+
+        # 缩量回踩 exemption. Asymmetry is deliberate: a MISSING volume or
+        # vol_ma20 cannot claim the exemption, so the bar counts.
+        vol = ctx.volume
+        vol_ma = ctx.vol_ma20
+        is_volume_shrink = bool(
+            vol is not None
+            and vol_ma is not None
+            and np.isfinite(vol)
+            and np.isfinite(vol_ma)
+            and float(vol_ma) > 0.0
+            and float(vol) < float(cfg.breakdown_vol_shrink_pct) * float(vol_ma)
+        )
+        if is_volume_shrink:
+            # 缩量回踩 is a NO-OP for this rule: the bar is not counted, and --
+            # deliberately -- it also does not return a `HOLD_FILTERED` row.
+            # Blocking the bar here would suppress the ORTHOGONAL gates below
+            # (the model-exit confirmation `exit_streak` / the inertia trim), and
+            # a low-volume bar parked below the floor could then hold a position
+            # the model already exited indefinitely -- the silent-position-
+            # retention bug class this repo forbids. The rule is exempt, so it
+            # stays out of the way and the pre-existing ladder decides.
+            return None
+
+        st.breakdown_streak += 1
+        st.state = PositionState.PENDING_EXIT
+        detail.update(
+            {
+                "breakdown_streak": int(st.breakdown_streak),
+                "volume": None if vol is None else float(vol),
+                "vol_ma20": None if vol_ma is None else float(vol_ma),
+                "breakdown_vol_shrink_pct": float(cfg.breakdown_vol_shrink_pct),
+            }
+        )
+
+        if st.breakdown_streak >= int(cfg.breakdown_days):
+            confirmed_streak = st.breakdown_streak
+            if not can_sell:
+                _LOGGER.warning(
+                    "tenure lock overridden by two-day breakdown exit for %s: "
+                    "held_bars=%d < min_holding_bars=%d (a confirmed structural break is a "
+                    "risk exit; the two-day confirmation is its anti-whipsaw delay, and the "
+                    "T+1 lock must not extend a broken position's tail loss)",
+                    st.symbol,
+                    st.held_bars,
+                    cfg.min_holding_bars,
+                )
+            st.state = PositionState.COOLDOWN
+            # Cooldown choice is DELIBERATE and asymmetric vs. the risk exit
+            # above (`asset_stop_cooldown_bars`). The two-day confirmation window
+            # IS this rule's anti-whipsaw delay: the position only exits after
+            # `breakdown_days` consecutive closes below min(MA20, VAL), so the
+            # re-entry gate does not additionally charge the longer stop-loss
+            # cooling period for a signal that was already slow to fire. Stated
+            # consequence, so nobody "fixes" it by accident: a broken-down
+            # symbol can be re-admitted SOONER (`normal_cooldown_bars`, default
+            # 2) than a hard-stop / trailing-stop / emergency-halt casualty
+            # (`asset_stop_cooldown_bars`, default max(5, normal)) -- the stop
+            # path fires on a single bar and therefore pays the longer penalty.
+            st.cooldown_remaining = cfg.normal_cooldown_bars
+            st.last_exit_type = ExitType.BREAKDOWN.value
+            st.last_exit_price = float(ctx.price)
+            detail.update(
+                {
+                    "confirmed_breakdown_streak": int(confirmed_streak),
+                    "last_exit_type": st.last_exit_type,
+                    "last_exit_price": st.last_exit_price,
+                }
+            )
+            st.held_bars = 0
+            st.entry_streak = 0
+            # Hygiene, NOT reuse: every other SELL path zeroes the signal-exit
+            # counter so a later holding period cannot inherit a stale
+            # confirmation. `exit_streak` is never incremented by this rule.
+            st.exit_streak = 0
+            st.breakdown_streak = 0
+            st.entry_price = 0.0
+            st.peak_price = 0.0
+            st.current_weight = 0.0
+            return _decision(
+                PolicyAction.SELL,
+                0.0,
+                f"连续 {confirmed_streak} 日收于结构下轨 (价格 {ctx.price:.2f} < "
+                f"min(MA20, VAL) = {floor:.2f})，破位确认生效，清仓离场",
+                state_before=state_before,
+                state=st,
+                detail=detail,
+            )
+
+        return _decision(
+            PolicyAction.HOLD_FILTERED,
+            float(st.current_weight),
+            f"结构破位进入确认期 (第 {st.breakdown_streak}/{cfg.breakdown_days} 日待确认，"
+            f"价格 {ctx.price:.2f} < min(MA20, VAL) = {floor:.2f}，防单日假破位)",
+            state_before=state_before,
+            state=st,
+            blocking_reason=BlockingReason.EXIT_CONFIRMING,
+            detail=detail,
+        )
+
+    def _reentry_gate_block(
+        self,
+        st: AssetState,
+        ctx: PolicyContext,
+        cfg: PositionPolicyConfig,
+        *,
+        state_before: PositionState,
+    ) -> Optional[Decision]:
+        """Gate 3b: the opt-in price/VWAP re-entry confirmation.
+
+        `docs/development_plan.md` M1.1 / `docs/long_only_multi_asset_gap_analysis.md`
+        §P0-1: after a cooldown expires the asset must not be re-entered straight
+        into the same falling tape it was just sold into. Two INDEPENDENT legs,
+        either of which admits the entry:
+
+          * PRICE leg: `price > last_exit_price * (1 + price_reentry_pct)` -- the
+            position has rebounded off the exit print by the configured margin;
+          * VWAP leg: `price > vwap20` AND `volume > vol_ma20` -- a confirmed
+            reclaim of the 20-day VWAP on expanding volume (a genuine bid, not a
+            drifting bounce). Both volume inputs must be present: a missing
+            `vol_ma20` cannot claim "expanding volume", so the leg does not pass.
+
+        DEGRADE, NEVER DEADLOCK (the contract that matters most here): an
+        unusable exit print -- `last_exit_price <= 0`, non-finite, i.e. unknown
+        because no exit wrote it -- makes the PRICE leg unevaluable, and an
+        unevaluable leg must never veto the entry. The gate then ALLOWS with a
+        warning, so a symbol can never be locked out of re-entering forever by a
+        missing field. (The VWAP leg cannot rescue a block either: if there is no
+        `vwap20` AND no usable exit print there is no evidence at all, and the
+        gate allows rather than inventing one.) Note the asymmetry that is
+        deliberate: a PRESENT and FAILING price leg plus a missing `vwap20` is a
+        BLOCK, because the rebound evidence genuinely says "not yet".
+
+        Returns `None` to mean "the entry may proceed, carry on with the normal
+        ladder"; a `Decision` to short-circuit it. The blocked row is
+        `HOLD_FILTERED` at `target_weight=0.0` with the asset kept `FLAT`: in the
+        sparse frame that is a MISSING row (`SparseProjector.write` returns
+        `None` when the target equals the carried 0.0), never an explicit `0.0`
+        -- an explicit `0.0` is reserved for an actual exit. `last_exit_price` is
+        NOT reset, so the decision stays auditable and comparable.
+
+        WHAT A BLOCK ACTUALLY COSTS -- A ONE-BAR VETO, NOT A PERSISTENT GATED
+        STATE (read this before "fixing" the apparent leak): this gate runs
+        ONLY on the cooldown-EXPIRY bar, because that is the single bar gate 3
+        owns. Gate 3 decrements `cooldown_remaining` to 0, sets
+        `state = FLAT`, and calls this method exactly once, on that bar. A block
+        returns `HOLD_FILTERED` for THIS bar and nothing re-arms the counter or
+        flags the symbol as gated -- so on the NEXT bar gate 3 is skipped
+        entirely (`cooldown_remaining == 0`), this method is never consulted,
+        and the asset walks the normal entry ladder (gate 4 threshold, gate 5
+        entry-confirmation streak) as if the exit price had never been checked.
+        The confirmation is therefore a ONE-BAR DEFERRAL of the re-entry, not a
+        sustained veto: the gate cannot hold a symbol out of the market for more
+        than a single bar, and it deliberately does not reintroduce the
+        "lock a symbol out forever" failure the degrade-to-allow rule above
+        exists to prevent. If a future change makes this a multi-bar gate, it
+        must persist the block in `AssetState` explicitly -- do not assume this
+        method is re-asked.
+        """
+        last_exit = float(st.last_exit_price)
+        price = float(ctx.price)
+        pct = float(cfg.price_reentry_pct)
+        required_price = last_exit * (1.0 + pct)
+
+        vwap20 = ctx.vwap20
+        volume = ctx.volume
+        vol_ma20 = ctx.vol_ma20
+        has_vwap20 = bool(
+            vwap20 is not None and np.isfinite(vwap20) and float(vwap20) > 0.0
+        )
+        vwap_leg_pass = bool(
+            has_vwap20
+            and price > float(vwap20)
+            and volume is not None
+            and vol_ma20 is not None
+            and np.isfinite(volume)
+            and np.isfinite(vol_ma20)
+            and float(volume) > float(vol_ma20)
+        )
+
+        if not (np.isfinite(last_exit) and last_exit > 0.0):
+            # Unknown exit print -> the price leg cannot be evaluated. Allowing is
+            # the only safe direction: blocking would permanently lock the symbol
+            # out of ever re-entering (`AssetState.last_exit_price` defaults 0.0).
+            _LOGGER.warning(
+                "price_reentry_gate: %s has no usable last_exit_price (%r); allowing the "
+                "re-entry (an unknown exit print must never block a symbol forever). "
+                "price=%r vwap20=%r",
+                st.symbol,
+                st.last_exit_price,
+                ctx.price,
+                ctx.vwap20,
+            )
+            return None
+
+        if price > required_price or vwap_leg_pass:
+            return None
+
+        detail: Dict[str, Any] = {
+            "current_price": price,
+            "last_exit_price": last_exit,
+            "required_price": required_price,
+            "price_reentry_pct": pct,
+            "vwap20": None if vwap20 is None else float(vwap20),
+            "volume": None if volume is None else float(volume),
+            "vol_ma20": None if vol_ma20 is None else float(vol_ma20),
+            "last_exit_type": st.last_exit_type,
+            "vwap_leg_evaluable": has_vwap20,
+            "vwap_leg_passed": vwap_leg_pass,
+            "note": "再入场价格/VWAP 未确认：保持空仓 (NOT an exit, NOT a 0.0 row)",
+        }
+        return _decision(
+            PolicyAction.HOLD_FILTERED,
+            0.0,
+            f"冷却期满但再入场确认未通过 (价格 {price:.2f} 未高于离场价 "
+            f"{last_exit:.2f}×(1+{pct:.1%}) = {required_price:.2f}，且未同时满足 "
+            f"价格>VWAP20 与 成交量>vol_ma20)，保持空仓不追高",
+            state_before=state_before,
+            state=st,
+            blocking_reason=BlockingReason.REENTRY_GATED,
+            detail=detail,
         )
 
 

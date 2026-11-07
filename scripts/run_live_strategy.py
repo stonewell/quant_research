@@ -127,7 +127,11 @@ from common.position_lifecycle import (
     PositionState,
     blocking_reason_label,
     coerce_blocking_reason,
+    cold_start_lifecycle_state,
+    derive_lifecycle_context_from_frame,
     is_liquidation_event,
+    lifecycle_context_at,
+    resolve_position_policy_config,
     step_position_lifecycle,
 )
 from common.strategy_spec import _STATIC_TEMPLATES, get_template, load_strategy_file
@@ -1162,6 +1166,22 @@ def parse_args(args: Optional[List[str]] = None):
         help="Trading days cooldown after full exit before permitting re-entry (default: 2)",
     )
     parser.add_argument(
+        "--live-use-policy-kernel",
+        action="store_true",
+        default=False,
+        help=(
+            "(M4.3) INERT LEGACY KEY. The `common.position_policy` kernel is the ONLY engine for "
+            "the per-asset lifecycle step since M4.4 D3 (`step_position_lifecycle` delegates to "
+            "`AssetPolicy.step`; the legacy 6-state body was deleted in BASE_VERSION 2.0.0). "
+            "Resolution is still CLI -> strategy params (`live_use_policy_kernel`) -> True, but a "
+            "pinned `false` now only emits a one-time removal warning and the kernel runs anyway. "
+            "Kept for back-compat with persisted configs. Hydrated symbols with no persisted "
+            "lifecycle state are cold-started by the kernel rule (counters zeroed, state "
+            "restricted to FLAT/HELD_ACTIVE/COOLDOWN) instead of fabricating "
+            "PENDING_ENTRY/HELD_GESTATION."
+        ),
+    )
+    parser.add_argument(
         "--min-entry-threshold",
         type=float,
         default=None,
@@ -2039,6 +2059,25 @@ def main(cli_args: Optional[List[str]] = None):
     params["min_entry_bars"] = min_entry_bars
     params["guard_latency_bars"] = guard_latency_bars
 
+    # ---- M4.3: inert policy-kernel key + M1.1 opt-in knobs -------------------
+    # The key is still RESOLVED (1. `--live-use-policy-kernel` -> args, 2. strategy
+    # params `live_use_policy_kernel` / blend-prefixed spellings, 3. True) and
+    # still carried on the config, but since M4.4 stage D3 it selects NOTHING: the
+    # legacy state machine it used to opt out of was deleted in BASE_VERSION 2.0.0.
+    # A persisted strategy param pinning `live_use_policy_kernel=false` therefore
+    # only makes `step_position_lifecycle` log its one-time removal warning; the
+    # kernel runs either way (failing the run closed over a dead key would be a
+    # bigger behaviour change than the removal).
+    live_use_policy_kernel = bool(getattr(args, "live_use_policy_kernel", False)) or bool(
+        resolve_blend_param(params, "live_use_policy_kernel", True, bool)
+    )
+    # The six M1.1 knobs come from the SHARED resolver so the live driver and the
+    # kernel can never disagree about them (one mapping, `position_policy_
+    # config_from_lifecycle`). Only these six are taken: the runner keeps its own
+    # resolution for every legacy field (notably `min_entry_threshold`, which the
+    # backtest-side resolver deliberately leaves `None` while live derives 0.05).
+    _policy_cfg = resolve_position_policy_config(params, args)
+
     lifecycle_cfg = PositionLifecycleConfig(
         guard_latency_bars=guard_latency_bars,
         min_holding_bars=min_holding_bars,
@@ -2057,6 +2096,16 @@ def main(cli_args: Optional[List[str]] = None):
         breadth_thrust_threshold=0.60,
         enable_entry_fast_path=True,
         enable_exit_fast_path=True,
+        # M4.3: the inert kernel key + the six M1.1 opt-in gates. Since M4.4 D3 the
+        # key selects nothing (`False` only triggers the adapter's removal warning);
+        # it is carried so a persisted config keeps round-tripping.
+        live_use_policy_kernel=live_use_policy_kernel,
+        two_day_breakdown_rule=_policy_cfg.two_day_breakdown_rule,
+        breakdown_days=_policy_cfg.breakdown_days,
+        breakdown_vol_shrink_pct=_policy_cfg.breakdown_vol_shrink_pct,
+        price_reentry_gate=_policy_cfg.price_reentry_gate,
+        price_reentry_pct=_policy_cfg.price_reentry_pct,
+        reentry_vwap_lookback=_policy_cfg.reentry_vwap_lookback,
     )
 
     # Build descriptive engine banner information
@@ -2074,6 +2123,10 @@ def main(cli_args: Optional[List[str]] = None):
     engine_parts.append(f"最低持仓={min_holding_bars}日")
     engine_parts.append(f"惰性过滤={min_trade_thresh:.1%}")
     engine_parts.append(f"最低建仓={min_entry_thresh:.1%}")
+    # M4.4 D3: the kernel is the ONLY engine, so the banner always says so. (The
+    # inert `live_use_policy_kernel` key is not consulted -- announcing the engine
+    # conditionally would imply a choice that no longer exists.)
+    engine_parts.append("策略内核=position_policy")
     engine_info = " | ".join(engine_parts)
 
     strat_ver = strategy_def.get("strategy_version", "1.0.0")
@@ -2790,6 +2843,32 @@ def main(cli_args: Optional[List[str]] = None):
                     except Exception:
                         sym_atr = None
 
+            # (M1.1 / Stage C) The two OPT-IN policy gates need bar anchors this
+            # loop never carried: a 20-bar MA of close and a 20-bar VWAP (gate 2b's
+            # structural floor / gate 3b's reclaim leg), plus a VAL level ONLY if
+            # the loaded frame actually has one. They are derived by the SAME
+            # helper the backtest simulator uses (`derive_lifecycle_context`), from
+            # the SAME frame this loop just priced -- so the ticket and the
+            # backtest cannot disagree on a trigger. Warmup / missing data decode
+            # to `None` (both gates then no-op); nothing is ever fabricated, and
+            # `None` is never read as 0.0.
+            #
+            # The four values are computed even while both gates are OFF (their
+            # defaults): the derivation is a pure trailing window, so it cannot
+            # move a decision by itself, and deriving them here means the ON path
+            # has no separate code path to rot.
+            #
+            # `bar=None` (the frame's LAST row) is the as-of session, not a
+            # look-ahead: `as_of_universe(universe, as_of_date)` has already
+            # truncated every frame to `index <= as_of_date`, and `latest_close`
+            # above prices the very same row.
+            anchor_ctx = lifecycle_context_at(
+                derive_lifecycle_context_from_frame(
+                    universe.get(sym),
+                    vwap_lookback=int(getattr(lifecycle_cfg, "reentry_vwap_lookback", 20) or 20),
+                )
+            )
+
             # Determine market
             if sym.endswith(".SH") or sym.endswith(".SZ") or sym.endswith(".BJ"):
                 asset_market = "china"
@@ -2810,37 +2889,37 @@ def main(cli_args: Optional[List[str]] = None):
                 state.broker_weight = cur_w
                 if entry_prices.get(sym, 0.0) > 0 and state.entry_price <= 0:
                     state.entry_price = float(entry_prices.get(sym, 0.0))
+                    # (M4.3) A real recorded cost basis supersedes a cold-start
+                    # approximation; carrying the flag afterwards would keep
+                    # claiming a stop was anchored on a guess.
+                    state.entry_price_approx = False
                 if state.entry_price > 0:
                     state.peak_price = max(state.peak_price, state.entry_price, price if current_shares > 0 else 0.0)
             else:
                 cur_sh = current_shares
                 is_held = (cur_sh > 0) or (cur_w > 1e-6)
                 held_b = holding_bars.get(sym, 1 if is_held else 0)
-                if is_held:
-                    state_enum = PositionState.HELD_GESTATION if held_b < 1 else PositionState.HELD_ACTIVE
-                elif bars_since_exit < reentry_cooldown_bars:
-                    state_enum = PositionState.COOLDOWN
-                elif entry_signal_streak.get(sym, 0) > 0:
-                    state_enum = PositionState.PENDING_ENTRY
-                else:
-                    state_enum = PositionState.FLAT
-
-                cooldown_rem = max(0, reentry_cooldown_bars - bars_since_exit) if state_enum == PositionState.COOLDOWN else 0
-                entry_p = float(entry_prices.get(sym, 0.0) or 0.0)
-                peak_p = max(entry_p, price) if is_held and price > 0 else entry_p
-                state = AssetLifecycleState(
-                    symbol=sym,
-                    state=state_enum,
+                # ---- M4.3 COLD START (the ONLY cold start since M4.4 D3) -----
+                # There is NO persisted lifecycle state for this symbol, so there is
+                # no history to resume. The deleted legacy hydration branch
+                # FABRICATED one: `HELD_GESTATION` from a broker holding-bar guess
+                # and `PENDING_ENTRY` from a model signal streak -- states the
+                # machine was never actually observed in, which the kernel's first
+                # step would then silently credit tenure/confirmation for.
+                # The rule itself lives in `cold_start_lifecycle_state` (one
+                # implementation, unit-tested): zeroed counters, state restricted to
+                # FLAT / HELD_ACTIVE / COOLDOWN, `entry_price` falling back to the
+                # current price with `entry_price_approx=True` when no cost basis
+                # exists.
+                state = cold_start_lifecycle_state(
+                    sym,
+                    is_held=is_held,
                     held_bars=held_b,
-                    entry_streak=int(entry_signal_streak.get(sym, 0)),
-                    exit_streak=int(zero_target_streak.get(sym, 0)),
-                    cooldown_remaining=cooldown_rem,
-                    entry_price=entry_p,
-                    peak_price=peak_p,
+                    bars_since_exit=bars_since_exit,
+                    reentry_cooldown_bars=reentry_cooldown_bars,
+                    entry_price=float(entry_prices.get(sym, 0.0) or 0.0),
+                    price=price,
                     current_weight=cur_w,
-                    # (2026-10-22 incident) New-state creation must also capture
-                    # the actual brokerage weight snapshot (see hydration branch).
-                    broker_weight=cur_w,
                 )
 
             # Pre-execution brokerage reconciliation:
@@ -2856,6 +2935,11 @@ def main(cli_args: Optional[List[str]] = None):
                 state.peak_price = 0.0
                 state.entry_streak = 0
                 state.exit_streak = 0
+                # (M4.3) The reconciliation is not a real exit, so it must NOT
+                # fabricate a gate-3b anchor (`last_exit_price`), but it does end
+                # any structural ladder the phantom holding had accrued.
+                state.breakdown_streak = 0
+                state.expansion_streak = 0
 
             # (D6, 2026-10-29 incident) The MIRROR of the reconciliation above, and the
             # one that was missing: the lifecycle machine says the asset is gone (FLAT)
@@ -2883,6 +2967,10 @@ def main(cli_args: Optional[List[str]] = None):
                 is_emergency_halt=is_circuit_halt,
                 is_market_open=is_market_open,
                 is_portfolio_deleverage=is_portfolio_deleverage,
+                ma20_close=anchor_ctx["ma20_close"],
+                vwap20=anchor_ctx["vwap20"],
+                vol_ma20=anchor_ctx["vol_ma20"],
+                val=anchor_ctx["val"],
             )
 
             action = decision.action
@@ -3760,9 +3848,16 @@ def main(cli_args: Optional[List[str]] = None):
                     updated_last_exit_date.pop(sym, None)
                     if sym in updated_lifecycle_states:
                         updated_lifecycle_states[sym]["held_bars"] = 0
+                        # (M4.3) A fresh entry invalidates any breakdown ladder
+                        # accrued while flat; the kernel's gate 2b counts only
+                        # consecutive held bars. Inert for the legacy engine.
+                        updated_lifecycle_states[sym]["breakdown_streak"] = 0
+                        updated_lifecycle_states[sym]["expansion_streak"] = 0
                         if p > 0:
                             updated_lifecycle_states[sym]["entry_price"] = p
                             updated_lifecycle_states[sym]["peak_price"] = p
+                            # A real fill replaces any cold-start approximation.
+                            updated_lifecycle_states[sym]["entry_price_approx"] = False
             else:
                 if sym not in dual_holding_bars:
                     dual_holding_bars[sym] = int(r.get("holding_bars", 1))
@@ -3802,6 +3897,15 @@ def main(cli_args: Optional[List[str]] = None):
                     updated_lifecycle_states[sym]["current_weight"] = 0.0
                     updated_lifecycle_states[sym]["exit_streak"] = 0
                     updated_lifecycle_states[sym]["entry_streak"] = 0
+                    # (M4.3) A real, closed exit ends any in-progress structural
+                    # breakdown/expansion ladder, and its close becomes the
+                    # anchor `price_reentry_gate` (gate 3b) tests against. These
+                    # keys are inert for the legacy engine (which reads neither),
+                    # so writing them cannot change an OFF-path decision.
+                    updated_lifecycle_states[sym]["breakdown_streak"] = 0
+                    updated_lifecycle_states[sym]["expansion_streak"] = 0
+                    if p > 0:
+                        updated_lifecycle_states[sym]["last_exit_price"] = float(p)
                     if not updated_lifecycle_states[sym].get("last_exit_type"):
                         updated_lifecycle_states[sym]["last_exit_type"] = ExitType.NORMAL.value
             elif cur_sh == 0 and tgt_sh == 0:

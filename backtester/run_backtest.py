@@ -351,18 +351,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--lifecycle-breadth-thrust-threshold",
                    type=float, default=None, dest="lifecycle_breadth_thrust_threshold",
                    help="UPLSM market breadth thrust threshold for entry fast path (default: 0.60).")
+    # Both fast-path toggles are ALWAYS ON since BASE_VERSION 2.0.0 (M4.4 stage
+    # D3): the kernel has no field for them, and `step_position_lifecycle` now
+    # calls `_require_kernel_step_supported(cfg)` unconditionally, so a resolved
+    # `enable_*_fast_path=False` raises `ValueError` instead of selecting a
+    # legacy body. The `--no-lifecycle-entry-fast-path` /
+    # `--no-lifecycle-exit-fast-path` flags are therefore REMOVED (not turned
+    # into no-ops): silently accepting them would leave an operator believing a
+    # stop-loss / emergency-deleverage path is disabled when it is armed, which
+    # is exactly the failure mode that hard precondition exists to prevent. An
+    # old command line now fails fast with argparse's "unrecognized arguments".
     p.add_argument("--lifecycle-enable-entry-fast-path",
                    dest="lifecycle_enable_entry_fast_path", action="store_true", default=None,
-                   help="Enable UPLSM volume/breadth entry fast path.")
-    p.add_argument("--no-lifecycle-entry-fast-path",
-                   dest="lifecycle_enable_entry_fast_path", action="store_false",
-                   help="Disable UPLSM entry fast path.")
+                   help="Enable UPLSM volume/breadth entry fast path (always ON since BASE_VERSION "
+                        "2.0.0; the former --no-lifecycle-entry-fast-path switch was removed).")
     p.add_argument("--lifecycle-enable-exit-fast-path",
                    dest="lifecycle_enable_exit_fast_path", action="store_true", default=None,
-                   help="Enable UPLSM emergency deleverage exit fast path.")
-    p.add_argument("--no-lifecycle-exit-fast-path",
-                   dest="lifecycle_enable_exit_fast_path", action="store_false",
-                   help="Disable UPLSM exit fast path.")
+                   help="Enable UPLSM emergency deleverage exit fast path (always ON since "
+                        "BASE_VERSION 2.0.0; the former --no-lifecycle-exit-fast-path switch was removed).")
     p.add_argument("--no-lifecycle-compare",
                    dest="lifecycle_compare", action="store_false", default=True,
                    help="Skip lifecycle A/B comparison arm (lifecycle_ab_comparison.csv).")
