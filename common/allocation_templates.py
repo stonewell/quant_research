@@ -692,8 +692,9 @@ def apply_asset_inertia(
     not this panel-level helper.
 
     `_step_asset_inertia` is deliberately KEPT and still used directly by
-    `pipeline/research/blend/blend_base.py`'s default (flag-off) branch; it is not
-    a thin wrapper over the kernel.
+    `pipeline/research/blend/blend_base.py`'s explicit opt-out branch
+    (`blend_use_policy_kernel=False`; the flag defaults to ON since
+    `BASE_VERSION 1.9.0`); it is not a thin wrapper over the kernel.
     """
     return kernel_apply_asset_inertia(
         daily,

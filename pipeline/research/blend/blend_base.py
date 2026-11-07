@@ -19,8 +19,10 @@ Features provided across all blend strategies:
 - Asset-level protective stop (-8%) & Chandelier ATR trailing stop with post-stop cooldown
 - Quality & relative strength gate suppressing entries into persistent downtrend assets
 - Volatility-scaled adaptive asymmetric inertia rebalancing with entry bypass
-- Opt-in (default OFF) delegation of that inertia step to `common.position_policy`
-  (`blend_use_policy_kernel`); the default path is byte-for-byte the pre-M4.2 code
+- Delegation of that inertia step to `common.position_policy`
+  (`blend_use_policy_kernel`, default ON since `BASE_VERSION 1.9.0`); the
+  pre-M4.2 `_step_asset_inertia` path stays available as the explicit opt-out
+  and is byte-for-byte the pre-M4.2 code
 """
 
 from collections import defaultdict
@@ -163,7 +165,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
     and adaptive turnover filters so any blend strategy can inherit them cleanly.
     """
 
-    BASE_VERSION: str = "1.8.0"
+    BASE_VERSION: str = "1.9.0"
     version: str = "1.0.0"
 
     def __init__(
@@ -183,7 +185,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             self.config = config
         self.param_prefix = param_prefix
         self.alt_param_prefixes = alt_param_prefixes or []
-        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "1.8.0")
+        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "1.9.0")
         strat_version: str = version or getattr(self.__class__, "version", "1.0.0")
         tags = factor_tags or [
             "regime_trend_strength",
@@ -917,10 +919,13 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
 
         use_inertia = (min_weight_change > 0.0 or min_holding_bars > 0)
 
-        # --- M4.2 opt-in guard: delegate the inertia step to the position-policy
-        # kernel. Default OFF, and with the flag absent/False the block below is
-        # the pre-M4.2 code path untouched (verified to the last digit against the
-        # pre-change module by
+        # --- M4.2 guard: delegate the inertia step to the position-policy kernel.
+        # Default ON since `BASE_VERSION 1.9.0`; the kernel is cell-identical to the
+        # pre-M4.2 code (240-seed finite sweep + the NaN differential in
+        # `pipeline/tests/test_policy_parity.py`). Passing
+        # `blend_use_policy_kernel=False` in `params` selects the legacy branch,
+        # which is the pre-M4.2 code path untouched (verified to the last digit
+        # against the pre-change module by
         # `pipeline/research_strategy/tests/test_blend_policy_kernel.py`).
         #
         # Resolution is DELIBERATELY not `resolve_param`: that helper ends in a
@@ -946,10 +951,11 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         holding_age = {s: 0 for s in risky_symbols}
         last_buy_bar = {s: -999 for s in risky_symbols}
 
-        # Kernel handles for the opt-in path (built once, reused every bar; the
+        # Kernel handles for the kernel path (built once, reused every bar; the
         # sequencer itself holds no state between calls beyond nothing -- the
         # tenure clocks above are caller-owned and mutated in place). `None` when
-        # the flag is off, so the legacy branch provably never touches them.
+        # the flag is explicitly False, so the legacy branch provably never
+        # touches them.
         policy_sequencer: Optional[PortfolioSequencer] = None
         policy_cfg: Optional[PositionPolicyConfig] = None
         if use_inertia and use_policy_kernel:

@@ -409,6 +409,12 @@ def main():
         # (P1.8 / P1.9) Pre-flight consistency check between dump and strategies_config.json.
         # The static-template exemption is owned by the verifier (`is_static_template_exempt`);
         # gating on the bare name here would mis-exempt a research dump keyed `dual_momentum`.
+        #
+        # (LV7 defect B.5) NOTE: this verifier has NO version axis. The dump-vs-live-class
+        # version parity check on this path is the one inside `resolve_strategy_definition`
+        # (line above), which runs before it re-stamps the live values. Do not remove or
+        # relocate that check -- on this runner it is the only version gate, so a
+        # `BASE_VERSION` bump would otherwise let stale dumps through untouched.
         verify_live_strategy_dump_preflight(
             strategy_def=strat_def,
             strategy_key=actual_key,

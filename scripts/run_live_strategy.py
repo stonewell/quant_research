@@ -138,6 +138,8 @@ from pipeline.live_signal.lsig.signal import as_of_universe, latest_rebalance_ro
 from scripts.live_paths import DEFAULT_STRATEGY_KEY, default_live_output_dir
 from scripts.live_preflight import (
     LiveDumpPreflightError,
+    assert_account_state_version_parity,
+    assert_dump_version_parity,
     verify_live_strategy_dump_preflight,
 )
 
@@ -1026,6 +1028,32 @@ def resolve_strategy_definition(
         strategy_def["params"] = params
 
     # Extract version metadata
+    #
+    # (LV7, frozen contract `docs/lv7_prior_state_contract.md` §5.2) COMPARE BEFORE TAKING.
+    # The two expressions below give the LIVE CLASS precedence and then the result is
+    # stamped back over `strategy_def["strategy_version"]`, so a dump/class disagreement
+    # used to be unobservable (it got overwritten) and the ticket printed a number no
+    # persisted artifact agreed with -- exactly how the 2026-11-02 archive ended up with
+    # two coexisting version pairs. The parity check runs first and fails closed.
+    #
+    # LAYERING (LV7 defect B.5, decided 2026-11-06 -- shape A, "keep the check here"):
+    # this call therefore fails closed at the PARSING layer, because `parse_args` calls
+    # `resolve_strategy_definition` to learn `strategy_key` (the output directory depends
+    # on it, so that disk read is unavoidable). The P1.10 rule ("argument parsing stays
+    # free of disk-backed fail-fast validation") applies ONLY to
+    # `verify_live_strategy_dump_preflight`, which is still called from `main()`; it does
+    # NOT apply to the version axis. Do NOT relocate this call into `main()` beside that
+    # verifier: by then the two re-stamps four lines below have already overwritten the
+    # recorded values, so the check would compare live-vs-live and could never fail.
+    # The check MUST stay above those re-stamps. It is also the ONLY version gate on the
+    # netted/matrix path (`scripts/run_live_multi_strategy.py` calls this same resolver;
+    # its own `verify_live_strategy_dump_preflight` has no version axis).
+    assert_dump_version_parity(
+        strategy_def,
+        getattr(template, "version", None),
+        getattr(template, "base_version", None),
+        dump_display=resolved_desc,
+    )
     strat_version = getattr(template, "version", None) or strategy_def.get("strategy_version") or "1.0.0"
     base_version = getattr(template, "base_version", None) or strategy_def.get("base_version")
     if hasattr(template, "get_version_info"):
@@ -1795,6 +1823,14 @@ def main(cli_args: Optional[List[str]] = None):
     # strategies_config.json. MOVED here from `parse_args()` so argument parsing stays free of
     # this side effect (Stage 1 and the multi-strategy runner already gate in `main()`), and it
     # now runs exactly once, at the start of the run.
+    # SCOPE (LV7 defect B.5, 2026-11-06): "argument parsing stays free of disk-backed
+    # fail-fast validation" holds for THIS gate (the weighting-mode axis) only. The VERSION
+    # axis is deliberately a parsing-layer gate: `parse_args` calls
+    # `resolve_strategy_definition` (it must -- `output_dir` is derived from the resolved
+    # `strategy_key`), and that function compares the dump's recorded version fields against
+    # the live class BEFORE re-stamping them. Moving that comparison here would be vacuous
+    # (it would read the already-re-stamped dict) and would drop the only version guard on
+    # the netted/matrix runner. See the layering note at the comparison site.
     # INVARIANT: this must stay ABOVE every write in this function -- the run has to fail
     # BEFORE any ticket artifact exists -- so do NOT move it below `os.makedirs(...)` or the
     # ticket construction; a "fail-before-ticket" regression is what P1.10 exists to prevent.
@@ -1955,6 +1991,21 @@ def main(cli_args: Optional[List[str]] = None):
 
     strat_ver = strategy_def.get("strategy_version", "1.0.0")
     base_ver = strategy_def.get("base_version")
+    # (LV7, `docs/lv7_prior_state_contract.md` §5.3) The carried-forward account state must
+    # have been written by TODAY's engine version. Checked HERE (before any order math and
+    # before any ticket artifact exists), and again immediately before the state is
+    # persisted -- the state dict is heavily mutated in between.
+    # Fail closed: a stale `base_version` (the 2026-11-02 archive carries 1.7.0 while the
+    # live class is 1.8.0) must STOP the run, never be silently re-stamped. The remedy is
+    # an explicit operator action (§5.4), not an automatic overwrite.
+    _live_strategy_version = getattr(template, "version", None) or strat_ver
+    _live_base_version = getattr(template, "base_version", None) or base_ver
+    assert_account_state_version_parity(
+        account_state,
+        _live_strategy_version,
+        _live_base_version,
+        state_display=args.account_state_file,
+    )
     strategy_version_info = strategy_def.get("version_info")
     if strategy_version_info is None and hasattr(template, "get_version_info"):
         try:
@@ -3520,6 +3571,17 @@ def main(cli_args: Optional[List[str]] = None):
 
     # Persist updated state into account_state.json if available
     if args.account_state_file:
+        # (LV7, `docs/lv7_prior_state_contract.md` §5.3) Re-assert the version parity
+        # IMMEDIATELY before the write: the state object is mutated throughout this
+        # function, so the early check is not sufficient proof of what would land on disk.
+        # Same read-only predicate, no auto-heal -- and note this block never rewrites a
+        # MISMATCHED version, it only re-stamps today's (already-verified) values.
+        assert_account_state_version_parity(
+            account_state,
+            _live_strategy_version,
+            _live_base_version,
+            state_display=args.account_state_file,
+        )
         if isinstance(account_state.get("prior_state"), dict):
             if "lifecycle_states" not in account_state["prior_state"]:
                 account_state["prior_state"]["lifecycle_states"] = dict(account_state.get("lifecycle_states", {}))

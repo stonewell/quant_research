@@ -429,7 +429,15 @@ _NAV_DD_PARAMS = {
 }
 
 
-def _nav_history(n: int, *, start_nav: float = 100000.0, step: float = 0.0) -> list:
+def _nav_history(n: int, *, start_nav: float = 100000.0, step: float = 1.0) -> list:
+    """`n` genuinely DISTINCT NAV points by default.
+
+    (LV7) The threshold is now judged on the count of ADJACENTLY DISTINCT observations,
+    so a fixture built with `step=0.0` is ONE distinct point, not `n` -- it would report
+    `INSUFFICIENT_HISTORY` even at n=10 and no longer express "a full 10-day window".
+    A deliberately frozen / duplicate-tailed series is built explicitly at its call site
+    instead (see `pipeline/tests/test_stage1_nav_source.py`), never by default.
+    """
     return [start_nav + step * i for i in range(n)]
 
 
@@ -720,6 +728,36 @@ def test_append_nav_history_point_flags_frozen_series_and_caps_at_ten():
 
     # The window constant is the single owner of the cap.
     assert _mod.NAV_10D_RECOVERY_WINDOW == 10
+
+
+def test_nav_10d_recovery_base_is_window_start_not_series_head():
+    """(LV7 nit B.4) The 10-day recovery base is `nav_hist[-10]`, not `nav_hist[0]`.
+
+    `append_nav_history_point` caps the list at the window today, so `[0]` coincides with
+    the 10th-back entry BY ACCIDENT. Feed a longer, fully distinct series: a `[0]`-based base
+    would measure 11 sessions back under a 10-day label and print a different (wrong)
+    recovery percentage. The cap would normally hide this, so the test bypasses the writer.
+    """
+    window = _mod.NAV_10D_RECOVERY_WINDOW
+    # 11 entries, all adjacently distinct: head = 120.0, ten-back = 110.0, tail = 108.0.
+    hist = [120.0, 110.0] + [100.0 + i for i in range(9)]
+    assert len(hist) == window + 1
+    state = {"nav_history_10d": hist}
+    params = {
+        "cfsb_dd_reduce_thresh": 0.10,
+        "cfsb_dd_defensive_thresh": 0.15,
+        "cfsb_dd_stop_thresh": 0.20,
+    }
+
+    res = inspect_portfolio_drawdown(
+        current_nav=115.0, peak_nav=125.0, state=state, params=params
+    )
+
+    assert res["nav_10d_status"] == _mod.NAV_10D_STATUS_OK
+    # Base is hist[-10] == 110.0 -> +4.5454%. A hist[0]-based base (120.0) would give
+    # -4.1667%, i.e. the opposite sign: this assertion is the regression guard.
+    assert res["nav_10d_return"] == pytest.approx(115.0 / 110.0 - 1.0)
+    assert res["nav_10d_return"] > 0.0
 
 
 def test_main_wires_effective_nav_into_nav_history_not_form_value():

@@ -99,7 +99,7 @@
 | 阶段 | 动作 | feature flag | 回滚 | 验收 |
 |---|---|---|---|---|
 | 1 extract | 新建 `common/position_policy.py`（`AssetPolicy`/`PortfolioSequencer`/`SparseProjector`/`PositionPolicyConfig`）；把 `_step_asset_inertia` 的 per-symbol 逻辑抽成 `AssetPolicy.inertia_step()`，sells-first/cash/emergency 抽成 `PortfolioSequencer.sequence()`；**不动任何调用方** | 无（纯新增、死代码） | 删文件 | 单测逐行等价于 `_step_asset_inertia` |
-| 2 backtest adapter | `blend_base.generate_weights` 日循环改调内核（`use_inertia` 分支 `:1534-1559`、`_apply_portfolio_deleverage` `:1561-1563`）；`_sparse_from_daily` 改调 `SparseProjector`；`apply_asset_inertia` 改为委托 | `blend_use_policy_kernel`（默认 `False`） | flag=False 走旧路径 | 差分 harness：全 seed 下 `generate_weights` 逐 cell 的 NaN/0.0/值一致 |
+| 2 backtest adapter | `blend_base.generate_weights` 日循环改调内核（`use_inertia` 分支 `:1534-1559`、`_apply_portfolio_deleverage` `:1561-1563`）；`_sparse_from_daily` 改调 `SparseProjector`；`apply_asset_inertia` 改为委托 | `blend_use_policy_kernel`（**默认 `True`**，`BASE_VERSION 1.9.0` 起） | 显式传 `blend_use_policy_kernel=False` 走旧路径 | 差分 harness：全 seed 下 `generate_weights` 逐 cell 的 NaN/0.0/值一致（含 NaN 输入类） |
 | 3 live adapter | `run_live_strategy` 在 `step_position_lifecycle` 调用点（`:2117-2130`）前插入内核；`position_lifecycle` 降级为 adapter；ticket builder 消费同一 `Decision` | `live_use_policy_kernel`（默认 `False`） | flag=False 走旧 FSM | live archive replay 逐行 `(action, target_weight, blocking_reason)` 一致 |
 | 4 delete | 删除 6 态 FSM 主体、`apply_asset_inertia/_step_asset_inertia` 旧实现、`resolve_trade_inertia_threshold` 等重复 resolver；保留 legacy key 映射 | 无（前三阶段全绿后） | `git revert` | 全量 pytest + `--dump-strategies` 重建后 `git diff` 无漂移 |
 
@@ -120,6 +120,7 @@
 
 - 改 `pipeline/research/blend/blend_base.py` → `BASE_VERSION 1.7.0 → 1.8.0`（向后兼容），同步 `common/tests/test_strategy_versioning.py:181` 与 `pipeline/research_strategy/tests/test_blend_strategy_versioning.py:42`。
   - **（2026-10-31 与 `docs/development_plan.md` 口径同步）**：本节原文写作 `1.6.0 → 1.7.0`，该值已过期——`1.6.0 → 1.7.0` 已由 `C6.1`（2026-10-29）消耗，现役 `BASE_VERSION` 为 **`1.7.0`**（两份 versioning 测试均断言 `"1.7.0"`），故下一次升级为 **`1.7.0 → 1.8.0`**。同步义务本身不变：两份 versioning 测试 + `--dump-strategies` + `docs/version.md` 中文 changelog。
+  - **（2026-11-06 口径更新）**：`1.8.0` 已由 M4.2 阶段一消耗；阶段二（默认翻转）作为**行为契约变更**再升一级 `1.8.0 → 1.9.0`，已落地，详见 [`docs/version.md`](file:///home/stone/Work/github/quant/docs/version.md) §30。
 - 改 `common/allocation_templates.py` → `AllocationTemplate` 无 file-level `BASE_VERSION`（**不要发明**），只 bump 被改类的 per-class `version`。
 - 改具体策略逻辑 → bump 该类 `version`。
 - 统一执行：`uv run python pipeline/research_strategy/run_research_strategy.py --dump-strategies` 重建 dumps；`docs/version.md` 追加中文 changelog；`docs/development_plan.md` 更新状态。

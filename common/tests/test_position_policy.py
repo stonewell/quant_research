@@ -18,12 +18,15 @@ Two rules this file refuses to bend:
     and demands identical index, identical columns, identical NaN positions and
     identical values (including identical real `0.0` cells).
 
-The M4.1 kernel shipped as DEAD CODE. M4.2 phase 1 flips exactly ONE call site:
-`pipeline/research/blend/blend_base.py`'s inertia step now delegates to
-`PortfolioSequencer.sequence` behind the default-OFF `blend_use_policy_kernel`
-flag. `test_kernel_callers_are_guarded_by_opt_in_flag` pins the remaining
-invariants -- but only the templates half is a static scan
-(`common/allocation_templates.py` is still kernel-free; phase 2 owns that flip).
+The M4.1 kernel shipped as DEAD CODE. M4.2 flipped both call sites, and commit 2
+(`BASE_VERSION 1.9.0`) made the kernel the DEFAULT: `blend_base`'s inertia step
+selects `PortfolioSequencer.sequence` unless `blend_use_policy_kernel=False` is
+passed explicitly, and `common/allocation_templates.py::apply_asset_inertia`
+delegates to `kernel_apply_asset_inertia` unconditionally (commit 1b).
+`test_kernel_callers_are_guarded_by_opt_in_flag` pins the remaining invariants:
+on the templates side a static import scan plus behavioural no-delegation checks
+(the per-bar `_step_asset_inertia` and the inline `_sparse_from_daily` compression
+must NOT route through the kernel).
 
 The blend half is a BEHAVIOURAL call-path spy, deliberately not a source
 substring check (this file previously did the latter, and it was vacuous: the
@@ -31,9 +34,12 @@ kernel is bit-identical to `_step_asset_inertia`, so forcing
 `use_policy_kernel = True` or deleting the `if use_policy_kernel:` branch left
 every test in the repo green -- output equivalence cannot see a silent default
 flip). The spy patches `blend_base._step_asset_inertia` and
-`PortfolioSequencer.sequence`, runs one real `generate_weights` with the flag
-absent and one with it True, and demands the legacy step is the ONLY route
-taken when off and NEVER taken when on.
+`PortfolioSequencer.sequence` and runs two real `generate_weights` calls: one on
+the DEFAULT config (kernel path since 1.9.0) and one with the EXPLICIT opt-out
+`blend_use_policy_kernel=False` (legacy path). Each arm must take its own route
+and never the other's -- that is what proves the legacy path is still present and
+selectable, i.e. that the differential harnesses' OFF arm did not become a
+self-comparison of the kernel.
 
 Disclosed finding recorded here rather than hidden (see
 `test_reapplying_kernel_to_its_own_output`): re-applying the inertia filter to
@@ -851,6 +857,268 @@ def test_sparse_projector_write_never_fabricates_a_zero():
 
 
 # ---------------------------------------------------------------------------
+# B12-B15. NaN cells -- the `Decision` invariant vs. the sparse NaN contract
+# ---------------------------------------------------------------------------
+#
+# The 240-seed harness above is VACUOUS on this input class: `_make_daily_frame`
+# only emits clipped/rounded finite values, so "NaN is never 0.0" is never
+# actually exercised. These tests are the missing differential.
+#
+# The defect they pin: `Decision.__post_init__` raises on a NaN `target_weight`
+# (design invariant 2, kept deliberately -- the live ticket path relies on it),
+# while the reference `_step_asset_inertia` propagates a NaN cell silently and
+# correctly (every comparison against NaN is False, so the symbol is never a
+# sell/buy candidate and its cell is never rewritten). Two reachable inputs made
+# the kernel raise where the reference propagates:
+#   * a NaN `current_w[s]` -> the non-trading fall-through `target_weight=current`;
+#     reachable from row 0 (a late-listing symbol with no history yet), because
+#     `current_w` is seeded from `daily.iloc[0]` and then carried forward;
+#   * a NaN `ideal_w[s]` on a global-emergency bar -> the pass-through
+#     `target_weight=ideal`.
+# `apply_asset_inertia` delegates to the kernel UNCONDITIONALLY (commit 176a36d),
+# so this was live on the production path even with
+# `blend_use_policy_kernel=False`.
+
+
+def _nan_daily_frame(nan_cells, *, seed=20211105, n_rows=45, n_risky=7):
+    """A realistic dense frame with exactly the NaN cells named in `nan_cells`.
+
+    `nan_cells` is a sequence of `(row_position, symbol)` pairs. Every other cell
+    is finite (asserted), so a "one NaN cell in a risky symbol" shape is
+    unambiguous and a defect cannot hide behind a second missing value. `CASH`
+    is never a target: it is the residual, not a position.
+    """
+    rng = np.random.default_rng(seed)
+    daily = _make_daily_frame(
+        rng, n_rows=n_rows, n_risky=n_risky, sparseish=True, with_cash=True
+    )
+    assert not daily.isna().to_numpy().any(), "the base frame is finite by construction"
+    for row, symbol in nan_cells:
+        assert symbol in daily.columns and symbol != "CASH"
+        daily.iloc[row, daily.columns.get_loc(symbol)] = np.nan
+    return daily
+
+
+def _assert_nan_cell_forced_to_nan(daily, out, *, context, impl):
+    """No input NaN cell may be rewritten to `0.0` (a silent liquidation).
+
+    Kept separate from `_assert_cell_identical` so a guard that emits `0.0`
+    instead of `NaN` fails on THIS assertion (NaN vs 0.0), not merely as a
+    generic value diff.
+    """
+    nan_in = daily.isna().to_numpy()
+    assert nan_in.any(), f"{context}: the frame carries no NaN cell (vacuous)"
+    zero_out = out.to_numpy(dtype=float) == 0.0
+    violations = np.argwhere(nan_in & zero_out)
+    assert not len(violations), (
+        f"{context}: {impl} rewrote a NaN input cell as 0.0 (a silent liquidation, "
+        f"NOT 'no instruction') at {[tuple(x) for x in violations[:5]]}"
+    )
+    assert out.isna().to_numpy().any(), (
+        f"{context}: {impl} dropped every NaN cell -- NaN must survive as NaN"
+    )
+
+
+def test_kernel_propagates_nan_cells_like_reference():
+    """Three-way cell identity on a dense frame with ONE NaN cell in a risky symbol.
+
+    Pinned pre-delegation reference vs. `kernel_apply_asset_inertia` vs. the live
+    delegated `apply_asset_inertia`: NaN positions equal, real `0.0` positions
+    equal, values exactly equal, and no NaN cell turned into `0.0`.
+    """
+    daily = _nan_daily_frame([(0, "SYM02")])
+    kwargs = {
+        "min_weight_change": 0.02,
+        "cash_proxy": "CASH",
+        "min_holding_bars": 2,
+        "asymmetric_sells": True,
+        "entry_threshold": 0.05,
+    }
+    context = "nan-current (single NaN cell, row 0)"
+
+    assert int(daily.isna().to_numpy().sum()) == 1, "exactly one NaN cell, by construction"
+
+    ref = _legacy_apply_asset_inertia()(daily, **kwargs)
+    got = kernel_apply_asset_inertia(daily, **kwargs)
+    delegated = apply_asset_inertia(daily, **kwargs)
+
+    # The run is not a pass-through: the reference rewrote at least one finite cell.
+    finite = (daily.notna() & ref.notna()).to_numpy()
+    assert (ref.to_numpy(dtype=float)[finite] != daily.to_numpy(dtype=float)[finite]).any(), (
+        f"{context}: the reference changed nothing -- the case would be vacuous"
+    )
+
+    _assert_cell_identical(ref, got, context=f"{context}: kernel vs pinned reference")
+    _assert_cell_identical(
+        ref, delegated, context=f"{context}: delegated vs pinned reference"
+    )
+    _assert_nan_cell_forced_to_nan(daily, got, context=context, impl="kernel")
+    _assert_nan_cell_forced_to_nan(daily, delegated, context=context, impl="delegated")
+
+    # `0.0` positions are identical too (a real exit is not a missing instruction).
+    assert ((ref.to_numpy(dtype=float) == 0.0) == (got.to_numpy(dtype=float) == 0.0)).all()
+    assert ((ref.to_numpy(dtype=float) == 0.0) == (delegated.to_numpy(dtype=float) == 0.0)).all()
+
+    # Structural expectation: the NaN-looking column stays NaN for the whole
+    # frame, because a NaN current can never clear a sell/buy threshold.
+    assert got["SYM02"].isna().all(), context
+    assert delegated["SYM02"].isna().all(), context
+
+
+def test_kernel_nan_in_ideal_only():
+    """Branch 1 of 2: the global-emergency pass-through (`target_weight=ideal`).
+
+    No NaN anywhere in row 0, so `current_w` is finite at the bar in question;
+    only `ideal_w` is NaN, on the one bar the mask marks as an all-halted
+    (global) emergency. The reference returns `ideal_w.copy()` (NaN included);
+    the kernel used to raise from `Decision.__post_init__`.
+    """
+    daily = _nan_daily_frame([(6, "SYM02")])
+    emergency = pd.Series(False, index=daily.index)
+    emergency.iloc[6] = True  # a per-date bool row == "global flag" for that bar
+    kwargs = {
+        "min_weight_change": 0.02,
+        "cash_proxy": "CASH",
+        "emergency_mask": emergency,
+    }
+    context = "nan-ideal (global-emergency pass-through)"
+
+    assert int(daily.isna().to_numpy().sum()) == 1, "exactly one NaN cell, by construction"
+    assert daily.iloc[0].notna().all(), "row 0 must stay finite: copy the ideal branch"
+
+    ref = _legacy_apply_asset_inertia()(daily, **kwargs)
+    got = kernel_apply_asset_inertia(daily, **kwargs)
+    delegated = apply_asset_inertia(daily, **kwargs)
+
+    _assert_cell_identical(ref, got, context=f"{context}: kernel vs pinned reference")
+    _assert_cell_identical(
+        ref, delegated, context=f"{context}: delegated vs pinned reference"
+    )
+    _assert_nan_cell_forced_to_nan(daily, got, context=context, impl="kernel")
+    _assert_nan_cell_forced_to_nan(daily, delegated, context=context, impl="delegated")
+
+    # The NaN appears exactly at the pass-through bar and is carried forward as a
+    # NaN current afterwards (never as a 0.0 exit).
+    assert got["SYM02"].iloc[1:6].notna().all(), context
+    assert got["SYM02"].iloc[6:].isna().all(), context
+    assert delegated["SYM02"].iloc[6:].isna().all(), context
+
+
+def test_kernel_nan_in_current_only():
+    """Branch 2 of 2: the non-trading fall-through (`target_weight=current`).
+
+    NaN only in `current` (seeded from row 0, carried by the column-wise chain);
+    no emergency mask at all, so `inertia_step` reaches the final
+    `HOLD_FILTERED` return -- the exact branch the review named.
+    """
+    daily = _nan_daily_frame([(0, "SYM04")], seed=7, n_rows=40)
+    kwargs = {
+        "min_weight_change": 0.05,
+        "cash_proxy": "CASH",
+        "min_holding_bars": 7,
+    }
+    context = "nan-current only (fall-through)"
+
+    assert int(daily.isna().to_numpy().sum()) == 1, "exactly one NaN cell, by construction"
+    assert daily["SYM04"].isna().sum() == 1 and daily["SYM04"].isna().iloc[0], (
+        "the NaN must be in the row-0 seed of `current_w`"
+    )
+
+    ref = _legacy_apply_asset_inertia()(daily, **kwargs)
+    got = kernel_apply_asset_inertia(daily, **kwargs)
+    delegated = apply_asset_inertia(daily, **kwargs)
+
+    _assert_cell_identical(ref, got, context=f"{context}: kernel vs pinned reference")
+    _assert_cell_identical(
+        ref, delegated, context=f"{context}: delegated vs pinned reference"
+    )
+    _assert_nan_cell_forced_to_nan(daily, got, context=context, impl="kernel")
+    _assert_nan_cell_forced_to_nan(daily, delegated, context=context, impl="delegated")
+
+    # Direct, symbol-level proof of the fall-through: `inertia_step` must still
+    # refuse to build the NaN `Decision` itself (that is why the guard is at the
+    # sequencer/panel layer, not inside the per-symbol step).
+    with pytest.raises(ValueError, match="NaN"):
+        AssetPolicy().inertia_step(
+            "SYM04",
+            pd.Series({"SYM04": np.nan, "CASH": 0.5}),
+            pd.Series({"SYM04": np.nan, "CASH": 0.5}),
+            0.05,
+            PositionPolicyConfig(min_holding_bars=7),
+            ctx=PolicyContext(bar_index=1),
+            holding_age={"SYM04": 0},
+            last_buy_bar={"SYM04": -999},
+        )
+
+
+def test_kernel_nan_in_current_and_ideal_both():
+    """Both NaN sources in one frame: NaN `current` from row 0 and NaN `ideal`
+    on the global-emergency bar. Still cell-identical, still no `0.0`."""
+    daily = _nan_daily_frame([(0, "SYM02"), (6, "SYM02")], seed=13, n_rows=36)
+    emergency = pd.Series(False, index=daily.index)
+    emergency.iloc[6] = True
+    kwargs = {
+        "min_weight_change": 0.02,
+        "cash_proxy": "CASH",
+        "emergency_mask": emergency,
+        "asymmetric_sells": True,
+    }
+    context = "nan-current + nan-ideal"
+
+    assert int(daily.isna().to_numpy().sum()) == 2, "exactly two NaN cells, by construction"
+
+    ref = _legacy_apply_asset_inertia()(daily, **kwargs)
+    got = kernel_apply_asset_inertia(daily, **kwargs)
+    delegated = apply_asset_inertia(daily, **kwargs)
+
+    _assert_cell_identical(ref, got, context=f"{context}: kernel vs pinned reference")
+    _assert_cell_identical(
+        ref, delegated, context=f"{context}: delegated vs pinned reference"
+    )
+    _assert_nan_cell_forced_to_nan(daily, got, context=context, impl="kernel")
+    _assert_nan_cell_forced_to_nan(daily, delegated, context=context, impl="delegated")
+
+
+@pytest.mark.parametrize("case", ["nan_current", "nan_ideal", "nan_both"])
+def test_kernel_nan_does_not_raise(case):
+    """The precise regression: these inputs used to raise `ValueError`.
+
+    Before the fix both `kernel_apply_asset_inertia` (flag-independent, so also
+    through the delegated `apply_asset_inertia`) failed with
+    `ValueError: Decision.target_weight must never be NaN ...`.
+    """
+    seed = {"nan_current": 20211105, "nan_ideal": 20211105, "nan_both": 13}[case]
+    cells = {
+        "nan_current": [(0, "SYM02")],
+        "nan_ideal": [(6, "SYM02")],
+        "nan_both": [(0, "SYM02"), (6, "SYM02")],
+    }[case]
+    daily = _nan_daily_frame(cells, seed=seed, n_rows=40)
+
+    emergency = None
+    if case in ("nan_ideal", "nan_both"):
+        emergency = pd.Series(False, index=daily.index)
+        emergency.iloc[6] = True
+    kwargs = {"min_weight_change": 0.02, "cash_proxy": "CASH", "emergency_mask": emergency}
+
+    for impl, fn in (
+        ("pinned reference", _legacy_apply_asset_inertia()),
+        ("kernel", kernel_apply_asset_inertia),
+        ("delegated", apply_asset_inertia),
+    ):
+        out = fn(daily, **kwargs)  # must NOT raise
+        assert out.index.equals(daily.index) and out.columns.equals(daily.columns), (
+            f"{case}: {impl} did not complete the run"
+        )
+        assert out.shape == daily.shape, f"{case}: {impl} changed the frame shape"
+
+    # The invariant that forces the guard to live at the panel layer is still
+    # armed -- the NaN is FILTERED OUT before a `Decision` exists, never allowed in.
+    with pytest.raises(ValueError, match="NaN"):
+        Decision(action=PolicyAction.HOLD_FILTERED, target_weight=float("nan"))
+
+
+# ---------------------------------------------------------------------------
 # C. Invariants
 # ---------------------------------------------------------------------------
 
@@ -979,7 +1247,8 @@ def _blend_universe(n_days: int = 200) -> dict:
 
 
 def test_kernel_callers_are_guarded_by_opt_in_flag(monkeypatch):
-    """M4.2 phase 2: two call sites, two DIFFERENT contracts.
+    """M4.2 phase 2 (commit 2, `BASE_VERSION 1.9.0`): the kernel is the DEFAULT,
+    the legacy path is still PRESENT and still explicitly selectable.
 
     History: M4.1 shipped the kernel as dead code and this guard asserted that
     BOTH `common/allocation_templates.py` and `pipeline/research/blend/blend_base.py`
@@ -993,14 +1262,18 @@ def test_kernel_callers_are_guarded_by_opt_in_flag(monkeypatch):
         compression) must stay NON-delegating -- asserted behaviourally with spies,
         because a source substring would not notice `_step_asset_inertia` being
         re-pointed at the kernel;
-      * `pipeline/research/blend/blend_base.py` -- MAY import it, but the DEFAULT
-        inertia path must still be the legacy `_step_asset_inertia` step and the
-        flag-ON path must bypass it. Asserted BEHAVIOURALLY (a call-path spy),
+      * `pipeline/research/blend/blend_base.py` -- MAY import it. Since commit 2
+        (1.9.0) the DEFAULT inertia path is the kernel (`PortfolioSequencer.sequence`)
+        and the explicit opt-out `blend_use_policy_kernel=False` must still run the
+        legacy `_step_asset_inertia` step. Asserted BEHAVIOURALLY (a call-path spy),
         because the kernel is bit-identical to the legacy step
         (`max_abs_diff == 0.0`): output comparison is structurally incapable of
         noticing a default flip, and a source-substring check cannot notice the
         branch being neutralised (`use_policy_kernel = True`, or
-        `if use_policy_kernel:` -> `if True:`).
+        `if use_policy_kernel:` -> `if True:`). Dropping the opt-out arm instead of
+        re-scoping it would let the legacy branch rot away silently -- and would
+        turn every "flag OFF vs ON" differential into the kernel compared with
+        itself.
 
     M4.2 phase 2 / commit 1a adds ONE projection delegation, and it is NOT part of
     the flag: `blend_base` now compresses via `SparseProjector.project` (a literal
@@ -1139,7 +1412,7 @@ def test_kernel_callers_are_guarded_by_opt_in_flag(monkeypatch):
     # (b) the blend call site delegates by CALL PATH, not by source text.
     assert hasattr(blend_base, "_step_asset_inertia"), (
         "blend_base no longer imports the legacy `_step_asset_inertia` step -- the "
-        "default-off path would no longer be the pre-M4.2 code"
+        "explicit opt-out path would no longer be the pre-M4.2 code"
     )
     calls = {"legacy": 0, "kernel": 0, "delegated_helper": 0}
     original_step = blend_base._step_asset_inertia
@@ -1174,55 +1447,79 @@ def test_kernel_callers_are_guarded_by_opt_in_flag(monkeypatch):
 
     universe = _blend_universe(200)
 
-    # (b1) flag absent -> the legacy step runs; the blend engine's own kernel step
-    # is NEVER taken (the delegated panel helper is, and must be -- see the
-    # provenance note in `spy_sequence`).
-    off = GenericBlendStrategy().generate_weights(universe, {})
-    assert len(off.dropna(how="all")) > 0, (
+    # (b1) DEFAULT (flag absent) -> the KERNEL step runs; the blend engine's own
+    # legacy step is NEVER taken (the delegated panel helper also runs, and must --
+    # see the provenance note in `spy_sequence`).
+    default_run = GenericBlendStrategy().generate_weights(universe, {})
+    assert len(default_run.dropna(how="all")) > 0, (
         "the synthetic run produced no rebalance rows -- the call-path spy would be vacuous"
     )
-    assert calls["legacy"] > 0, (
-        "with `blend_use_policy_kernel` absent, `_step_asset_inertia` was called "
-        f"{calls['legacy']} times: the DEFAULT inertia path is no longer the pre-M4.2 "
-        f"step (kernel calls={calls['kernel']}) -- the default flipped silently"
+    assert calls["kernel"] > 0, (
+        "with `blend_use_policy_kernel` absent, `PortfolioSequencer.sequence` was "
+        f"never called from `blend_base.py` (legacy calls={calls['legacy']}): the "
+        "DEFAULT inertia path is not the kernel, so the 1.9.0 default flip is gone"
     )
-    assert calls["kernel"] == 0, (
-        f"the DEFAULT path called `PortfolioSequencer.sequence` {calls['kernel']} times "
-        "from `blend_base.py` without opting in via `blend_use_policy_kernel`"
+    assert calls["legacy"] == 0, (
+        f"with `blend_use_policy_kernel` absent, `_step_asset_inertia` still ran "
+        f"{calls['legacy']} times: the legacy step is still the default path"
     )
     assert calls["delegated_helper"] > 0, (
         "`apply_asset_inertia` did not reach the kernel at all -- commit 1b's "
-        "delegation has gone dead, and the flag-off run would no longer cover it"
+        "delegation has gone dead, and this run would no longer cover it"
     )
     assert projections["off"] > 0, (
-        "with `blend_use_policy_kernel` absent, `SparseProjector.project` was never "
-        "called -- the sparse compression step was not delegated"
+        "on the DEFAULT run `SparseProjector.project` was never called -- the sparse "
+        "compression step was not delegated"
     )
 
-    # (b2) flag True -> the kernel is used and the legacy step is BYPASSED.
+    # (b2) explicit `blend_use_policy_kernel=False` -> the LEGACY step runs and the
+    # blend engine's kernel step is BYPASSED. This is the opt-out that keeps the
+    # differential's OFF arm real (and `apply_asset_inertia` still delegates, by
+    # design, flag-independently).
     calls["legacy"] = 0
     calls["kernel"] = 0
     calls["delegated_helper"] = 0
     spy_project.state = "on"
     spy_write.state = "on"
+    off = GenericBlendStrategy().generate_weights(
+        universe, {"blend_use_policy_kernel": False}
+    )
+    assert len(off.dropna(how="all")) > 0, (
+        "the opt-out run produced no rebalance rows -- the call-path spy would be vacuous"
+    )
+    assert calls["legacy"] > 0, (
+        "with `blend_use_policy_kernel=False` `_step_asset_inertia` was never called "
+        f"(kernel calls={calls['kernel']}): the legacy step is no longer reachable, so "
+        "the opt-out is dead and every OFF-vs-ON differential is now the kernel "
+        "compared with itself"
+    )
+    assert calls["kernel"] == 0, (
+        f"with `blend_use_policy_kernel=False` the kernel path ran {calls['kernel']} "
+        "times from `blend_base.py`: the explicit opt-out did not bypass the kernel"
+    )
+    assert calls["delegated_helper"] > 0, (
+        "`apply_asset_inertia` did not reach the kernel on the opt-out run -- the "
+        "flag-independent delegation has gone dead"
+    )
+
+    # (b3) an explicit `True` is the same route as the default (the flag is a
+    # selection, not a mode), so both kernel arms must be cell-identical.
+    calls["legacy"] = 0
+    calls["kernel"] = 0
     on = GenericBlendStrategy().generate_weights(
         universe, {"blend_use_policy_kernel": True}
     )
-    assert calls["kernel"] > 0, (
-        "with `blend_use_policy_kernel=True` the kernel path was never taken "
-        f"(legacy calls={calls['legacy']}) -- the opt-in branch has gone dead"
-    )
-    assert calls["legacy"] == 0, (
-        f"with `blend_use_policy_kernel=True` `_step_asset_inertia` still ran "
-        f"{calls['legacy']} times: the legacy step was not bypassed, so the flag "
-        "did not actually select the kernel"
+    assert calls["kernel"] > 0 and calls["legacy"] == 0, (
+        f"explicit True took the wrong route (kernel={calls['kernel']}, "
+        f"legacy={calls['legacy']})"
     )
 
     # Disclosed, and the reason this guard is behavioural: the two paths are
     # cell-identical, so output equality is necessary but proves nothing about
     # WHICH path was taken. Kept here so a future divergence surfaces next to the
-    # call-path assertion that actually guards the switch.
+    # call-path assertions that actually guard the switch.
     pd.testing.assert_frame_equal(on, off)
+    pd.testing.assert_frame_equal(default_run, on)
 
     # Projection is flag-INDEPENDENT (commit 1a): taken in both states, and the
     # write-back rule (`SparseProjector.write`) is still NOT wired (that is M4.3).

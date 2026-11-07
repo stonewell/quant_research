@@ -1232,7 +1232,11 @@ class PortfolioSequencer:
              is global; an all-True row is a global emergency);
           2. ask `AssetPolicy.inertia_step` for every risky symbol -- this also
              advances each symbol's tenure clock, which MUST happen before the
-             global-emergency short-circuit below;
+             global-emergency short-circuit below. A symbol whose `ideal_w` or
+             `current_w` cell is NaN is NOT asked (a `Decision` may not carry a
+             NaN `target_weight`); its cell is carried through untouched and its
+             tenure clock is advanced directly, which is what the reference's
+             all-NaN-comparisons-False vectorized pass does;
           3. on a global emergency, return `ideal_w.copy()` UNMODIFIED: no tenure
              filtering, no buy/sell gating, and no cash residual write;
           4. otherwise, if no symbol wants to trade, return `current_w.copy()`
@@ -1265,6 +1269,35 @@ class PortfolioSequencer:
 
         decisions: Dict[str, Decision] = {}
         for s in risky_symbols:
+            current = float(current_w[s])
+            ideal = float(ideal_w[s])
+            if not (np.isfinite(current) and np.isfinite(ideal)):
+                # (2a) NaN PASSTHROUGH -- filtered HERE, at the panel layer, so
+                # that no `Decision` is ever built from a NaN cell.
+                #
+                # `_step_asset_inertia` propagates a NaN cell silently: every
+                # comparison against NaN is False, so the symbol can never be
+                # in `sells`/`buys`, its cell is never written, and it survives
+                # verbatim (`filtered.iloc[t] = current_w`). `inertia_step`
+                # CANNOT express that, because `Decision.__post_init__`
+                # rightfully raises on a NaN `target_weight` -- that invariant
+                # guards the live ticket path and must not be weakened, so the
+                # NaN is filtered out before the `Decision` exists instead.
+                #
+                # Two reachable shapes (both raise `ValueError` if they reach
+                # `inertia_step`): a NaN `current_w[s]` (row 0 of a late-listing
+                # symbol with no history yet, carried forward) hits the
+                # non-trading fall-through's `target_weight=current`, and a NaN
+                # `ideal_w[s]` on a global-emergency bar hits the pass-through's
+                # `target_weight=ideal`. Converting either to `0.0` would be a
+                # silent liquidation (the sparse contract: NaN = no
+                # instruction), so the cell MUST come out NaN.
+                #
+                # Only the tenure clock moves, exactly as the reference's
+                # pre-loop does (`current_w[s] > 1e-4` is False for NaN -> reset
+                # to 0; `last_buy_bar[s]` is never touched on a non-trading bar).
+                holding_age[s] = (holding_age[s] + 1) if current > 1e-4 else 0
+                continue
             decisions[s] = self._policy.inertia_step(
                 s,
                 ideal_w,
@@ -1278,12 +1311,14 @@ class PortfolioSequencer:
                 is_global_emergency=is_global_emergency,
             )
 
-        # (3) Pass-through of the ideal row, byte-for-byte.
+        # (3) Pass-through of the ideal row, byte-for-byte (NaN cells included).
         if is_global_emergency:
             return ideal_w.copy()
 
-        sells = [s for s in risky_symbols if decisions[s].detail["in_sells"]]
-        buys = [s for s in risky_symbols if decisions[s].detail["in_buys"]]
+        # `decisions` is keyed in `risky_symbols` order minus the NaN symbols
+        # (2a), which is exactly the reference's `diff[...].index` order.
+        sells = [s for s in decisions if decisions[s].detail["in_sells"]]
+        buys = [s for s in decisions if decisions[s].detail["in_buys"]]
 
         # (4) Nothing to do: return an untouched copy (no cash residual write).
         if not sells and not buys:

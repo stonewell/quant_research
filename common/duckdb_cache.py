@@ -736,6 +736,38 @@ def canonicalize_provider_key(name: Any) -> str:
     return key
 
 
+def sync_timestamp_utc_naive(explicit: Optional[datetime.datetime] = None) -> datetime.datetime:
+    """The value written to every `last_sync_time` column: **naive UTC**.
+
+    2026-11-05 audit (development_plan `LV19` item 2): the columns used to be stamped with
+    `datetime.datetime.now()`, i.e. the HOST's wall clock with the tzinfo thrown away. On the
+    live station (UTC+08:00) a write at 04:23:28 UTC was stored as `20:23:28`, so an operator
+    reading `20:23` placed it on the previous evening -- 16 hours from the market clock, and the
+    one number an auditor uses to decide "was this bar written by THIS run". The comparison is
+    now unambiguous and tz-independent.
+
+    Invariants this function is the single owner of:
+      * the returned value is ALWAYS tz-naive (a `TIMESTAMP` column has no offset; storing an
+        aware object would make the driver's cast decide the offset silently);
+      * it is ALWAYS UTC. Rendering market-local time (`Asia/Shanghai`) is a READ/report-side
+        conversion (`.replace(tzinfo=timezone.utc).astimezone(MARKET_TZ)`), never a different
+        stored value -- see `docs/lv19_freshness_contract.md` §3;
+      * an explicit `explicit=` is treated as already-UTC when naive, and converted to UTC when
+        aware, so the column invariant holds for every caller instead of only the default path.
+
+    DISCLOSED CONSEQUENCE: `is_range_covered`'s legacy "already synced today" shortcut compares
+    this stored *date* against the host's local date, so between 00:00 and 08:00 +08:00 it can
+    read "not synced today" for a row written minutes earlier. That shortcut is bypassed whenever
+    `expected_date` is supplied (the whole live path, `L2.2`), and it never decides bar freshness
+    on its own -- the bar layer still has to reach the expected session.
+    """
+    if explicit is None:
+        return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    if explicit.tzinfo is not None:
+        return explicit.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    return explicit
+
+
 def is_synthetic_provider(provider_name_or_instance: Any) -> bool:
     """Returns True if the provider is a synthetic Brownian motion data generator.
     Synthetic data is generated on-the-fly and must always bypass the cache DB.
@@ -1171,6 +1203,11 @@ class DuckDBCache:
       - asset_sync_metadata: (provider, symbol) -> earliest_available_date, is_earliest_known,
                                                   latest_available_date, last_sync_time
 
+    Time convention (LV19, `docs/lv19_freshness_contract.md` §3): every `last_sync_time`
+    column below holds **naive UTC** -- no offset, written by `sync_timestamp_utc_naive`.
+    Rendering market-local (`Asia/Shanghai`) time is a read/report-side conversion; the stored
+    number is never local time and must not be printed as if it were.
+
     `read_only=True` opens an EXISTING database without creating directories or
     tables, for audit scripts / tests that only inspect a cache. It is never
     blocked by the pytest production-path net (see `refuse_production_cache_path`);
@@ -1263,6 +1300,7 @@ class DuckDBCache:
                 earliest_available_date DATE NOT NULL,
                 is_earliest_known BOOLEAN NOT NULL DEFAULT FALSE,
                 latest_available_date DATE NOT NULL,
+                -- LV19 §3: NAIVE UTC (see `sync_timestamp_utc_naive`); never local time.
                 last_sync_time TIMESTAMP NOT NULL,
                 adjustflag VARCHAR,
                 PRIMARY KEY (provider, symbol)
@@ -1292,6 +1330,7 @@ class DuckDBCache:
                 is_earliest_known BOOLEAN NOT NULL DEFAULT FALSE,
                 latest_available_ts TIMESTAMP NOT NULL,
                 latest_close_ref DOUBLE,
+                -- LV19 §3: NAIVE UTC (see `sync_timestamp_utc_naive`); never local time.
                 last_sync_time TIMESTAMP NOT NULL,
                 adjustflag VARCHAR,
                 PRIMARY KEY (provider, symbol, interval)
@@ -1964,7 +2003,9 @@ class DuckDBCache:
                     # The purge removed the row with the bars; the reconciliation below re-reads
                     # whatever survives instead of trusting the pre-purge snapshot.
 
-        sync_ts = sync_time if sync_time is not None else datetime.datetime.now()
+        # LV19 §3: NAIVE UTC, always. This was `datetime.datetime.now()` -- a bare local wall
+        # clock -- and the resulting 16-hour skew made a same-run write read as "last evening".
+        sync_ts = sync_timestamp_utc_naive(sync_time)
 
         records_df = pd.DataFrame({
             "provider": provider,
@@ -2321,7 +2362,9 @@ class DuckDBCache:
         frame_min_date = df_to_store.index.min().date()
         frame_max_date = df_to_store.index.max().date()
 
-        sync_ts = sync_time if sync_time is not None else datetime.datetime.now()
+        # LV19 §3: NAIVE UTC, always. This was `datetime.datetime.now()` -- a bare local wall
+        # clock -- and the resulting 16-hour skew made a same-run write read as "last evening".
+        sync_ts = sync_timestamp_utc_naive(sync_time)
 
         # Prepare records for insertion
         records_df = pd.DataFrame({
@@ -3187,6 +3230,40 @@ class DuckDBCache:
             requested,
         )
         return requested
+
+    # -- LV19: per-namespace freshness trace of the last daily-bar patch pass -- #
+    #: The three states are exhaustive and their meanings are exact (`docs/lv19_freshness_contract.md`
+    #: §4). `skipped` does NOT prove the namespace satisfies the zero-tolerance criterion -- it says
+    #: only "this pass wrote nothing here" -- which is precisely the gap `per_namespace` exists to
+    #: expose next to `fetch_errors`.
+    NAMESPACE_TRACE_STATES = ("skipped", "patched", "failed")
+
+    def record_namespace_trace(self, trace: Dict[str, str]) -> None:
+        """Publish the last `patch_equity_daily_bars` pass's `{provider -> state}` trace.
+
+        WHY ON THE CACHE (and not in the return value): `patch_equity_daily_bars` returns
+        `symbol -> "<provider>: Type: msg"`, a shape three production call sites and ~10 offline
+        tests already depend on, so LV19's mandatory `per_namespace` output gets its own channel
+        instead of changing that mapping's meaning. The cache is the object the call already
+        owns and the object the station already holds open, so the trace cannot be lost between
+        the primitive and its caller.
+
+        Scope: PROCESS-LOCAL and LAST-PASS-ONLY -- it is not persisted to DuckDB, because it
+        describes one refresh attempt, not a data fact (the stored facts are `ohlcv_bars` and
+        `*_sync_metadata`). A read-only handle accepts the assignment too: it is an attribute,
+        not a write.
+        """
+        unknown = sorted({str(v) for v in (trace or {}).values()} - set(self.NAMESPACE_TRACE_STATES))
+        if unknown:
+            raise ValueError(
+                f"record_namespace_trace: unknown state(s) {unknown}; allowed are "
+                f"{list(self.NAMESPACE_TRACE_STATES)}"
+            )
+        self._namespace_trace = {str(k): str(v) for k, v in (trace or {}).items()}
+
+    def namespace_trace(self) -> Dict[str, str]:
+        """`{provider -> skipped|patched|failed}` from the last patch pass ({} if none ran)."""
+        return dict(getattr(self, "_namespace_trace", {}) or {})
 
     def query_bars(
         self,

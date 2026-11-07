@@ -43,6 +43,12 @@ if _REPO_ROOT not in sys.path:
 
 import pytest
 
+from scripts.live_preflight import (  # noqa: E402  (repo root is on sys.path just above)
+    LiveDumpPreflightError,
+    assert_account_state_version_parity,
+    assert_dump_version_parity,
+)
+
 
 def _load_script(module_name, relative_path):
     """Loads a standalone script (not an importable package module) via importlib."""
@@ -544,3 +550,280 @@ def test_lv11_degraded_run_persists_unknown_tier_and_leaves_nav_series_alone(tmp
     assert updated_ok["nav_history_10d"][-1] == pytest.approx(MTM_NAV_1102)
     assert updated_ok["tier_status"] == "EVALUATED"
     assert "nav_degraded_as_of" not in updated_ok
+
+
+# ---------------------------------------------------------------------------
+# LV7 -- frozen prior_state annotation, `nav_history_10d` distinct-count threshold,
+#        and read-only dump/state version parity.
+#
+# Frozen contract: `docs/lv7_prior_state_contract.md` (§2 annotation, §3 threshold,
+# §4 status vocabulary, §5 version parity). 100% offline: every fixture is a literal
+# dict or a `tmp_path` JSON written here -- NOTHING reads `data/runs/**`.
+# ---------------------------------------------------------------------------
+
+# The 2026-11-02 archive's `nav_history_10d` (L8-L13), reproduced as literals: FIVE raw
+# points whose last two are identical, i.e. FOUR distinct sessions.
+_ARCHIVED_NAV_HISTORY = [199595.4, 200658.01, 197351.17, 199935.46, 199935.46]
+
+
+def _dd_with_history(history, *, current_nav=105000.0):
+    """`inspect_portfolio_drawdown` over an explicit 10-day series (no peak -> dd 0)."""
+    state = dict(_flat_state())
+    state["nav_history_10d"] = list(history)
+    return _mod.inspect_portfolio_drawdown(
+        current_nav=current_nav,
+        peak_nav=None,
+        state=state,
+        params={},
+        as_of_date="2026-11-02",
+    )
+
+
+def test_frozen_suspect_equal(tmp_path, capsys):
+    """`prior_state.current_nav ==` today's NAV must be ANNOTATED, in BOTH write branches.
+
+    Semantics (contract §2): `prior_state` is the previous session's confirmed snapshot.
+    When the two values are bit-for-bit equal the carrier looks frozen; the run must say
+    so. Reverse-mutation: delete the `detect_frozen_prior_state(...)` call / the
+    `prior_state_frozen_suspect` kwarg pass-through and this test goes red.
+    """
+    prior_state = {
+        "as_of_date": "2026-11-02",
+        "current_nav": 199935.46,
+        "nav_history_10d": list(_ARCHIVED_NAV_HISTORY),
+    }
+
+    reason = _mod.detect_frozen_prior_state(prior_state, 199935.46)
+    assert reason, "identical NAV must produce a reason"
+    assert "199,935.46" in reason
+    assert "2026-11-02" in reason
+
+    # (a) MEASURED branch
+    breakdown = _write_breakdown(tmp_path, {"nav_effective": 199935.46})
+    resolution = _mod.resolve_gate_nav_context(_args(breakdown))
+    dd = _mod.attach_nav_provenance(_dd_for(resolution["nav_gate_nav"]), resolution)
+    updated = _mod.build_account_state_update(
+        {},
+        {},
+        dd,
+        as_of_date="2026-11-02",
+        gate_code="GO",
+        prior_state=prior_state,
+        prior_state_frozen_suspect=reason,
+    )
+    assert updated["prior_state_frozen_suspect"] is True
+    assert "199,935.46" in updated["prior_state_frozen_reason"]
+    # Annotation only: the NAV numbers themselves are untouched.
+    assert updated["current_nav"] == pytest.approx(199935.46)
+    assert updated["prior_state"] is prior_state
+    # JSON-safe `true`, not the string "True".
+    assert json.loads(json.dumps(updated))["prior_state_frozen_suspect"] is True
+    assert "LV7" in capsys.readouterr().out
+
+    # (b) DEGRADED branch -- a frozen carrier must not hide behind a degraded/green report.
+    empty = tmp_path / "empty_dir"
+    empty.mkdir()
+    res_bad = _mod.resolve_gate_nav_context(_args(str(empty / "nav_breakdown.json")))
+    assert res_bad["nav_gate_status"] == _mod.NAV_GATE_STATUS_DEGRADED
+    dd_bad = _mod.attach_nav_provenance(_dd_for(res_bad["nav_gate_nav_used"]), res_bad)
+    updated_bad = _mod.build_account_state_update(
+        {},
+        {},
+        dd_bad,
+        as_of_date="2026-11-02",
+        gate_code="GO",
+        prior_state=prior_state,
+        prior_state_frozen_suspect=reason,
+    )
+    assert updated_bad["circuit_breaker_tier"] == "UNKNOWN"
+    assert updated_bad["prior_state_frozen_suspect"] is True
+    assert updated_bad["prior_state_frozen_reason"] == reason
+
+    # (c) WIRING. A pure-function test cannot see `main()`, so the production path is
+    # pinned at the source level: the detector must be CALLED, its result passed into
+    # `build_account_state_update`, and the annotation stamped in BOTH branches. Delete
+    # any of those and this test goes red even though the helper itself still passes.
+    path = os.path.join(_REPO_ROOT, "scripts", "check_live_portfolio_health.py")
+    with open(path, encoding="utf-8") as f:
+        source = f.read()
+    assert source.count("detect_frozen_prior_state(") == 2, "definition + one call site"
+    assert "prior_state_frozen_suspect=prior_state_frozen_reason" in source
+    assert source.count("**frozen_annotation,") == 2
+    # The comparison value is the MEASURED gate NAV, never the display placeholder.
+    assert 'nav_resolution["nav_gate_nav"],\n    )' in source
+
+
+def test_no_marker_when_distinct():
+    """A genuinely different prior NAV must emit NO key at all -- never `false`.
+
+    Old consumers must not gain a field they never agreed to read; "absent" is the
+    clean signal (contract §2).
+    """
+    prior_state = {"as_of_date": "2026-11-02", "current_nav": 199935.46}
+
+    assert _mod.detect_frozen_prior_state(prior_state, 200658.01) is None
+    # Unmeasurable on either side is "cannot tell", not "clean" and not "frozen".
+    assert _mod.detect_frozen_prior_state(prior_state, None) is None
+    assert _mod.detect_frozen_prior_state({}, 199935.46) is None
+    assert _mod.detect_frozen_prior_state(None, 199935.46) is None
+    assert _mod.detect_frozen_prior_state({"current_nav": "n/a"}, 199935.46) is None
+
+    clean = _mod.build_account_state_update(
+        {},
+        {},
+        _dd_for(200658.01),
+        as_of_date="2026-11-02",
+        gate_code="GO",
+        prior_state=prior_state,
+        prior_state_frozen_suspect=_mod.detect_frozen_prior_state(prior_state, 200658.01),
+    )
+    assert "prior_state_frozen_suspect" not in clean
+    assert "prior_state_frozen_reason" not in clean
+    assert clean.get("prior_state_frozen_suspect") is not False
+
+
+def test_nav10d_distinct_three_states():
+    """4 / 5 / 10 distinct observations -> INSUFFICIENT_HISTORY / INSUFFICIENT_HISTORY / numeric.
+
+    The threshold's denominator is the DISTINCT count (contract §3), so 4 and 5 stay
+    unmeasured and only 10 produces a number.
+    """
+    four = _dd_with_history([100000.0, 100100.0, 100200.0, 100300.0])
+    five = _dd_with_history([100000.0, 100100.0, 100200.0, 100300.0, 100400.0])
+    ten = _dd_with_history([100000.0 + 100.0 * i for i in range(10)], current_nav=100900.0)
+
+    assert four["nav_10d_distinct_len"] == 4
+    assert four["nav_10d_status"] == _mod.NAV_10D_STATUS_INSUFFICIENT_HISTORY
+    assert four["nav_10d_return"] is None
+    assert four["fast_recovery_nav"] is False
+
+    assert five["nav_10d_distinct_len"] == 5
+    assert five["nav_10d_status"] == _mod.NAV_10D_STATUS_INSUFFICIENT_HISTORY
+    assert five["nav_10d_return"] is None
+
+    assert ten["nav_10d_distinct_len"] == 10
+    assert ten["nav_10d_status"] == _mod.NAV_10D_STATUS_OK
+    assert ten["nav_10d_return"] == pytest.approx(100900.0 / 100000.0 - 1.0)
+    assert ten["nav_10d_unavailable_reason"] is None
+    assert ten["fast_recovery_nav"] is True
+
+
+def test_duplicate_tail_counts_once():
+    """The archived 5-point series has a duplicated tail -> FOUR distinct sessions.
+
+    Reverse-mutation: revert `count_distinct_nav_points` to a plain `len(...)` and the
+    distinct assertions below go red (raw length is 5, not 4).
+    """
+    assert _mod.count_distinct_nav_points(_ARCHIVED_NAV_HISTORY) == 4
+    # Non-adjacent repeats are real observations and DO count (A, B, A -> 3).
+    assert _mod.count_distinct_nav_points([1.0, 2.0, 1.0]) == 3
+    # Unparseable points are skipped, not counted and not fatal.
+    assert _mod.count_distinct_nav_points([1.0, "n/a", None, 2.0]) == 2
+    assert _mod.count_distinct_nav_points([]) == 0
+
+    dd = _dd_with_history(_ARCHIVED_NAV_HISTORY, current_nav=199935.46)
+    assert dd["nav_10d_history_len"] == 5, "the raw record count must stay readable"
+    assert dd["nav_10d_distinct_len"] == 4
+    assert dd["nav_10d_status"] == _mod.NAV_10D_STATUS_INSUFFICIENT_HISTORY
+    assert dd["nav_10d_return"] is None
+    assert "去重后仅 4" in (dd["nav_10d_unavailable_reason"] or "")
+
+    # Ten RAW records that are only nine distinct sessions never reach the threshold --
+    # the freeze would otherwise pad itself to 10 by copying its own tail.
+    padded = _dd_with_history([100000.0 + 100.0 * i for i in range(9)] + [100800.0])
+    assert padded["nav_10d_history_len"] == 10
+    assert padded["nav_10d_distinct_len"] == 9
+    assert padded["nav_10d_status"] == _mod.NAV_10D_STATUS_INSUFFICIENT_HISTORY
+    assert padded["nav_10d_return"] is None
+
+
+def test_insufficient_never_zero():
+    """Short / absent history must NEVER produce a numeric 0.0 return (contract §4).
+
+    `INSUFFICIENT_HISTORY` is the only spelling of "unmeasured"; nothing anywhere may be
+    read as "measured a flat 0.00%".
+    """
+    for history in ([], [100000.0], [100000.0, 100000.0, 100000.0], _ARCHIVED_NAV_HISTORY):
+        dd = _dd_with_history(history, current_nav=100000.0)
+        assert dd["nav_10d_status"] == _mod.NAV_10D_STATUS_INSUFFICIENT_HISTORY
+        assert dd["nav_10d_status"] != _mod.NAV_10D_STATUS_OK
+        assert dd["nav_10d_return"] is None
+        assert dd["nav_10d_return"] != 0.0
+        assert dd["fast_recovery_nav"] is False
+        # Survives JSON as an explicit null, not as 0 / "0.0" / false.
+        payload = json.loads(json.dumps(dd, default=str))
+        assert payload["nav_10d_return"] is None
+        assert payload["nav_10d_status"] == "INSUFFICIENT_HISTORY"
+        assert payload["nav_10d_required_len"] == 10
+        assert payload["nav_10d_history_len"] == len(history)
+
+
+# ---------------------------------------------------------------------------
+# LV7 §5 -- version parity is READ-ONLY and fails closed
+# ---------------------------------------------------------------------------
+
+
+def test_version_mismatch_raises():
+    """Dump-vs-class and state-vs-class disagreements must raise, naming both values.
+
+    Reverse-mutation: make `_assert_version_axis` return early (skip the comparison) and
+    every assertion below goes red.
+    """
+    dump = {"strategy_version": "1.2.2", "base_version": "1.8.0"}
+    with pytest.raises(LiveDumpPreflightError) as exc:
+        assert_dump_version_parity(dump, "1.3.0", "1.8.0", dump_display="chan_x_strategy.json")
+    message = str(exc.value)
+    assert "1.2.2" in message and "1.3.0" in message
+    assert "chan_x_strategy.json" in message
+
+    # The base axis is checked independently: same strategy version, older engine base.
+    with pytest.raises(LiveDumpPreflightError) as exc_base:
+        assert_dump_version_parity(
+            {"strategy_version": "1.2.2", "base_version": "1.7.0"}, "1.2.2", "1.8.0"
+        )
+    assert "1.7.0" in str(exc_base.value) and "1.8.0" in str(exc_base.value)
+
+    # A carried-forward account_state written by another engine version is the same class
+    # of failure (the archived 2026-11-02 state: 1.2.2 / 1.7.0 vs live 1.2.2 / 1.8.0).
+    with pytest.raises(LiveDumpPreflightError) as exc_state:
+        assert_account_state_version_parity(
+            {"strategy_version": "1.2.2", "base_version": "1.7.0"},
+            "1.2.2",
+            "1.8.0",
+            state_display="account_state.json",
+        )
+    assert "account_state.json" in str(exc_state.value)
+
+
+def test_match_passes():
+    """Equal metadata (and carriers that assert nothing) must pass silently."""
+    assert_dump_version_parity(
+        {"strategy_version": "1.2.2", "base_version": "1.8.0"}, "1.2.2", "1.8.0"
+    )
+    # `base_version: null` is the dumper's canonical spelling for a non-blend strategy.
+    assert_dump_version_parity({"strategy_version": "1.0.0", "base_version": None}, "1.0.0", None)
+    # A carrier with no version keys asserts nothing -> nothing to compare.
+    assert_dump_version_parity({"template_name": "equal_weight"}, "1.0.0", None)
+    assert_account_state_version_parity({}, "1.2.2", "1.8.0")
+    assert_account_state_version_parity({"strategy_version": "1.2.2"}, "1.2.2", "1.8.0")
+    # Read-only: neither call mutates its container.
+    dump = {"strategy_version": "1.2.2", "base_version": "1.8.0"}
+    state = {"strategy_version": "1.2.2", "base_version": "1.8.0"}
+    assert_dump_version_parity(dump, "1.2.2", "1.8.0")
+    assert_account_state_version_parity(state, "1.2.2", "1.8.0")
+    assert dump == {"strategy_version": "1.2.2", "base_version": "1.8.0"}
+    assert state == {"strategy_version": "1.2.2", "base_version": "1.8.0"}
+
+
+def test_missing_recorded_version_raises():
+    """An EXPLICITLY recorded but empty version field is malformed, not "no claim"."""
+    with pytest.raises(LiveDumpPreflightError):
+        assert_dump_version_parity({"strategy_version": ""}, "1.3.0")
+    with pytest.raises(LiveDumpPreflightError):
+        assert_dump_version_parity({"strategy_version": "   "}, "1.3.0")
+    # A null base on a carrier whose live class DOES carry one cannot be confirmed.
+    with pytest.raises(LiveDumpPreflightError):
+        assert_dump_version_parity({"base_version": None}, "1.2.2", "1.8.0")
+    with pytest.raises(LiveDumpPreflightError):
+        assert_account_state_version_parity({"strategy_version": None}, "1.2.2", None)
+

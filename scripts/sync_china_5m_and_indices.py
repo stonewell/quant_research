@@ -53,6 +53,7 @@ if _REPO_ROOT not in sys.path:
 from common.duckdb_cache import (
     DuckDBCache,
     NullVolumeRefused,
+    canonicalize_provider_key,
     is_intraday_interval,
     is_factor_neutral_symbol,
 )
@@ -66,6 +67,24 @@ from common.financial_api import (
 from common.market_clock import MARKET_CHINA, market_now
 
 _LOGGER = logging.getLogger(__name__)
+
+#: The TWO write namespaces PART A.2 (`patch_equity_daily_bars`) fans a single fetch into.
+#: Named once so the tolerance branch, the write tail and the per-namespace trace cannot drift
+#: apart. They are cache keys (provider CLASS names, as `common/data.py` stores them), NOT the
+#: short settings names `fuyao` / `marketdb` -- `DuckDBCache.resolve_provider_key` is what maps
+#: one onto the other, and callers that want to single out a namespace for ZERO tolerance pass
+#: the resolved key (see `strict_namespaces` below).
+FUYAO_NAMESPACE = "FuyaoDataProvider"
+MARKETDB_NAMESPACE = "MarketDBDataProvider"
+
+#: Non-strict namespaces keep this weekend/holiday tolerance: a stored `max_date` this close to
+#: the requested end is treated as "already up to date". Strict (`valuation-reading`) namespaces
+#: get ZERO tolerance instead -- see `patch_equity_daily_bars` (LV19 / `docs/lv19_freshness_contract.md`).
+NAMESPACE_FRESHNESS_TOLERANCE_DAYS = 2
+
+#: Aggregation rank for the LV19 per-namespace trace: a single `failed` for one symbol must not
+#: be averaged away by 19 `patched` ones. Higher wins when several symbols mark the same namespace.
+_STATE_RANK = {"skipped": 0, "patched": 1, "failed": 2}
 
 MAJOR_INDICES = [
     "000300.SH",  # CSI 300
@@ -951,6 +970,8 @@ def patch_equity_daily_bars(
     cache: DuckDBCache,
     stocks: List[str],
     end: str,
+    *,
+    strict_namespaces: Sequence[str] = (MARKETDB_NAMESPACE,),
 ) -> Dict[str, str]:
     """Patches lagging recent daily bars for the 22 stocks in the Fuyao & MarketDB namespaces.
 
@@ -967,12 +988,32 @@ def patch_equity_daily_bars(
     plain `SKIPPED (no new bars)` and is not reported as a failure. A failure is therefore
     reported once per symbol even though it blocks every lagging namespace it would feed.
 
+    ``strict_namespaces`` (LV19, 2026-11-06): the write namespaces whose stored ``max_date``
+    must reach ``end`` EXACTLY (zero-day tolerance) because that is the namespace the
+    valuation read (`common/freshness.py`) will demand the ``as_of`` bar from. Every other
+    write namespace keeps ``end - NAMESPACE_FRESHNESS_TOLERANCE_DAYS`` so a full-universe
+    weekend/holiday run is not re-fetched wholesale. Entries are compared through
+    `canonicalize_provider_key`, so either the stored key (`MarketDBDataProvider`) or the
+    settings name (`marketdb`) selects the same namespace -- the live station passes its own
+    resolved key, this script must never decide that on its own (freeze doc
+    `docs/lv19_freshness_contract.md` §1/§2).
+
     Returns
     -------
     Dict[str, str]
         `symbol -> "<provider>: TypeName: message"` for every symbol that raised.
         Empty dict on a fully clean run (the previous `None` return is implied by `{}`
         for every existing caller).
+
+    Notes
+    -----
+    The per-namespace trace (``{provider -> "skipped" | "patched" | "failed"}``) is NOT part of
+    this return value: the mapping's shape and meaning are load-bearing for the Stage-1 child,
+    the Stage-2 station and ~10 offline tests, and LV19's freeze doc makes it mandatory output.
+    It is therefore published on the CACHE the call already owns, via
+    `record_namespace_trace` / `namespace_trace` (`common/duckdb_cache.py`), which
+    `web/livetrading/execution_service.py` reads back after this call and prints in the round
+    summary.
     """
     print("\n" + "=" * 80)
     print(f"PART A.2: Checking & Patching 22 Stocks Recent Daily Bars (-> {end})")
@@ -1015,6 +1056,14 @@ def patch_equity_daily_bars(
     refusals = RefusalCollector("PART A.2 (equity daily patch)")
     #: symbol -> "Provider: TypeName: message" for symbols whose fetches ALL raised.
     fetch_errors: Dict[str, str] = {}
+    #: LV19: `provider -> "skipped" | "patched" | "failed"` for THIS pass, published on the cache
+    #: at the end. Before this, `fetch_errors == {}` was read as "every namespace is fresh", but
+    #: it only ever meant "no symbol failed to yield bars" -- on 2026-11-05 Fuyao was skipped as
+    #: fresh (2-day tolerance) while the valuation read demanded the exact `as_of` session, and
+    #: that skip left no trace anywhere. Aggregation is WORST-FIRST across symbols (`failed` >
+    #: `patched` > `skipped`): a namespace written for 19 symbols and refused for one is not
+    #: green, and the per-symbol detail is already in `fetch_errors`.
+    per_namespace: Dict[str, str] = {}
     #: `NullVolumeRefused` collected per (symbol, write namespace). LV5: a null volume used to
     #: surface as a bare DuckDB `Constraint Error` raised from the `store_bars` call below, which
     #: sits OUTSIDE every per-symbol `try` -- so ONE bad row aborted this whole `for sym` loop,
@@ -1037,6 +1086,19 @@ def patch_equity_daily_bars(
         logged_failures.add(key)
         _log_symbol_fetch_failure("1d", _sym, _provider, _exc)
 
+    #: Canonical forms of `strict_namespaces` -- compared canonically so the caller may pass the
+    #: settings name (`marketdb`) OR the stored cache key (`MarketDBDataProvider`) and still
+    #: single out the very namespace `compute_nav` reads from. Unknown names simply match nothing
+    #: (no namespace is silently promoted to zero tolerance).
+    strict_keys = {canonicalize_provider_key(p) for p in (strict_namespaces or ())}
+
+    def _mark(_prov: str, _state: str) -> None:
+        """Record one namespace outcome, WORST-FIRST (`failed` > `patched` > `skipped`)."""
+        assert _state in ("skipped", "patched", "failed"), _state
+        previous = per_namespace.get(_prov)
+        if previous is None or _STATE_RANK[_state] > _STATE_RANK[previous]:
+            per_namespace[_prov] = _state
+
     try:
         for sym in stocks:
             # One fetch per symbol, written to EVERY namespace that is actually lagging (option
@@ -1045,11 +1107,24 @@ def patch_equity_daily_bars(
             # response feeding one namespace: same bytes, double the network cost. A namespace
             # that is already fresh is still never written to, because it never enters `lagging`
             # and therefore never reaches the write tail at all.
+            #
+            # LV19 (2026-11-06): the tolerance is now PER NAMESPACE. The namespace the valuation
+            # read will demand the exact `as_of` bar from gets ZERO days of slack; every other
+            # namespace keeps the 2-day weekend/holiday tolerance (a full-universe weekend run
+            # must not turn into a wholesale re-fetch). The old single 2-day rule is why the
+            # 2026-11-05 pre-refresh reported `fetch_errors=none` while `compute_nav` still saw a
+            # previous-session bar in the namespace it actually read.
             lagging: List[str] = []
-            for prov in ("FuyaoDataProvider", "MarketDBDataProvider"):
+            for prov in (FUYAO_NAMESPACE, MARKETDB_NAMESPACE):
                 max_date = row_dict.get((sym, prov))
-                if max_date is not None and max_date >= target_end_date - datetime.timedelta(days=2):
-                    continue  # Already up to date
+                floor_date = target_end_date
+                if canonicalize_provider_key(prov) not in strict_keys:
+                    floor_date = target_end_date - datetime.timedelta(
+                        days=NAMESPACE_FRESHNESS_TOLERANCE_DAYS
+                    )
+                if max_date is not None and max_date >= floor_date:
+                    _mark(prov, "skipped")  # Judged fresh by ITS OWN tolerance: untouched.
+                    continue
                 lagging.append(prov)
             if not lagging:
                 continue  # Every namespace fresh -- identical to the old "all skipped" case.
@@ -1109,11 +1184,18 @@ def patch_equity_daily_bars(
                         fetch_errors[sym] = "; ".join(
                             f"{p}: {summarize_fetch_error(e)}" for p, e in attempts
                         )
+                    # LV19 trace: every namespace that NEEDED this fetch is still behind.
+                    for prov in lagging:
+                        _mark(prov, "failed")
                     print(
                         f"FAILED (fetch error, {len(attempts)} provider(s) raised: "
                         f"{type(attempts[-1][1]).__name__})"
                     )
                 else:
+                    # A valid "nothing new" answer, not an error (`fetch_errors` stays empty --
+                    # its meaning is pinned by `test_symbol_with_zero_bars_is_not_reported_as_a_fetch_error`).
+                    for prov in lagging:
+                        _mark(prov, "skipped")
                     print("SKIPPED (no new bars)")
                 continue
 
@@ -1182,18 +1264,21 @@ def patch_equity_daily_bars(
                     # The pre-merge code fetched per namespace and reported exactly this as
                     # "no new bars"; keep that, and keep an empty frame out of
                     # `plan_history_write`, which refuses one with a `ValueError`.
+                    _mark(prov, "skipped")  # No error, nothing inserted: see the tri-state table.
                     print("SKIPPED (no new bars)")
                     continue
                 try:
                     plan = plan_history_write(cache, prov, sym, prov_df, interval="1d")
                 except QfqWriteRefused as exc:
                     refusals.add(exc)
+                    _mark(prov, "failed")  # Refused write: this namespace is still behind.
                     continue
 
                 if plan.is_empty:
                     # Nothing to insert: the cache already holds every bar in this window on
                     # the stored basis. Deliberately no write and no warning -- rewriting
                     # identical rows is what produced the 126 `ulp_noise` rows in §13.4.
+                    _mark(prov, "skipped")
                     print(f"ALREADY CURRENT (dropped {plan.n_dropped_overlap} stored row(s))")
                     continue
 
@@ -1239,6 +1324,7 @@ def patch_equity_daily_bars(
                     )
                 except NullVolumeRefused as exc:
                     null_volume_refusals.append(exc)
+                    _mark(prov, "failed")  # Refused (per row): never "green" for this namespace.
                     print(
                         f"REFUSED (null volume) {exc.symbol} [{exc.provider}] "
                         f"{exc.n_rows} row(s) {exc.first_date}..{exc.last_date} "
@@ -1246,9 +1332,24 @@ def patch_equity_daily_bars(
                     )
                     continue
                 _report_cross_check(cache, prov, sym, interval="1d")
+                _mark(prov, "patched")  # Bars actually inserted for this namespace.
                 print(f"PATCHED +{len(plan.df)} bars (max: {plan.df.index.max().strftime('%Y-%m-%d')})")
     finally:
         bs_prov.logout()
+
+    # LV19: publish the per-namespace trace BEFORE any refusal is raised -- a run that ends in
+    # `QfqWriteRefused` is exactly when an auditor asks "which namespace was skipped", and the
+    # exception unwinds past everything below. `fetch_errors` keeps its old shape/meaning; this is
+    # a SEPARATE channel on the cache the caller already owns (freeze doc §4), because the
+    # mapping's signature/meaning are load-bearing for three call sites plus ~10 tests.
+    record_trace = getattr(cache, "record_namespace_trace", None)
+    if callable(record_trace):
+        record_trace(per_namespace)
+    if per_namespace:
+        print(
+            "[NAMESPACE-TRACE] "
+            + " ".join(f"{prov}={per_namespace[prov]}" for prov in sorted(per_namespace))
+        )
 
     if null_volume_refusals:
         # Reported AFTER the loop so the batch's other report machinery (`refusals`,

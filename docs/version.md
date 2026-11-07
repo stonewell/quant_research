@@ -4289,3 +4289,42 @@ LIVETRADING_STRICT_SEED_BOOK=0        # 0 / false / no / off 同样生效
 
 ### 29.4 必要的守卫测试同步（所有权外文件，已披露）
 M4.1 的静态守卫 `common/tests/test_position_policy.py::test_kernel_has_no_callers_in_templates_or_blend_base` 断言 `common/allocation_templates.py` **与** `pipeline/research/blend/blend_base.py` 都不得 import 内核。本阶段按设计翻转了后者的调用点，该断言必然变红，故改名为 `test_kernel_callers_are_guarded_by_opt_in_flag` 并收窄为：(a) `allocation_templates.py` 仍不得 import 内核（阶段二翻转时须再次更新本守卫）；(b) `blend_base.py` 允许 import，但必须同时保留 `p.get("blend_use_policy_kernel")`、`getattr(cfg, "blend_use_policy_kernel", False)` 与旧 `_step_asset_inertia(` 调用，防止有人删掉关闭态路径或默认值。测试计数不变（`common/tests` 仍为 1341 passed, 1 skipped）。
+
+## 30. M4.2 阶段二：`blend_use_policy_kernel` 默认翻转（`False → True`）与 `BASE_VERSION 1.9.0`（2026-11-06）
+
+### 30.1 版本轴
+| 对象 | 旧版本 | 新版本 | 说明 |
+| --- | --- | --- | --- |
+| `StrategyConfig.blend_use_policy_kernel` 默认值 | `False` | **`True`** | 行为契约变更：blend 引擎每日惰性步进的**默认**选择由 `_step_asset_inertia` 换成 `PortfolioSequencer.sequence` |
+| `BaseBlendAllocationStrategy.BASE_VERSION` | `1.8.0` | **`1.9.0`** | 与上一行**同一次改动**：默认值即契约，不得只翻默认不升版 |
+| 各 blend 子类 `version` | 不变 | 不变 | 未改动任何子策略类的信号/风险逻辑与参数默认值，沿用 `1.7.0 → 1.8.0` 的先例（只升底座） |
+| `common/allocation_templates.py` 文件级 `BASE_VERSION` | 不存在 | 不存在 | 该文件**从未**有文件级 `BASE_VERSION`；本次仅改 `apply_asset_inertia` 的 docstring，不 bump 任何类的 `version` |
+
+**为何升版是"翻默认"的债务，而不是可选项**：`blend_use_policy_kernel` 的默认值是**每一份 blend dump 的行为契约**。若只翻默认、不动版本，一份盖着 `1.8.0` 的 dump 就会以旧版名义跑在新引擎路径上——这正是 2026-11-02「两套版本对」事故的形状（dump / 账本声明的引擎与真正执行的引擎不一致，且**从版本号上完全看不出来**）。因此本阶段的默认翻转与 `BASE_VERSION 1.8.0 → 1.9.0` 是**一次改动**；用户已明令：**翻默认必须携带升版，永远不得只翻不升**。
+
+### 30.2 变更点
+- `pipeline/research_strategy/rs/config.py`：`blend_use_policy_kernel: bool = True`。字段**位置不变**（仍在 `blend_*` 状态机块末、别名块前，未重排任何字段）；注释同步写明默认值、升版理由，以及"该默认值本身是行为契约"。
+- `pipeline/research/blend/blend_base.py`：`BASE_VERSION: str = "1.9.0"`；`__init__` 中 `self.base_version` 的兜底字面量同步为 `"1.9.0"`；`generate_weights` 内解析/构造处的注释由"默认关"改为"默认内核、显式 `False` 走旧路径"。**调用点代码一行未改**：解析顺序仍是 `params` 优先、`StrategyConfig` 属性兜底，且两处都只用带前缀键 `blend_use_policy_kernel`（绝不走 `resolve_param` 的裸名回退）。
+- **旧路径原样保留**：`if use_policy_kernel: ... else: _step_asset_inertia(...)` 的 `else` 分支未动。默认翻转只更换"缺省选择"，旧路径仍是**可显式选择的一等路径**（`{"blend_use_policy_kernel": False}`）——这正是所有差分 harness 的 OFF 臂仍然成立的前提。
+- `common/allocation_templates.py`：仅 docstring 同步（`apply_asset_inertia` 文档中 `_step_asset_inertia` 的定位由"默认（flag-off）分支"改为"显式 opt-out 分支"）。**无代码路径变更**。
+
+### 30.3 翻转依据
+1. **240-seed 有限值逐格恒等**：`common/tests/test_position_policy.py` 的随机差分在 240 个 seed 上断言 旧 `_step_asset_inertia` / `kernel_apply_asset_inertia` / 委托后的 `apply_asset_inertia` 三者的 `NaN` 掩码、显式 `0.0` 掩码与数值完全一致（`max_abs_diff == 0.0`）。
+2. **NaN 输入类差分（本次新增）**：`pipeline/tests/test_policy_parity.py::test_diff_harness_nan_cells_off_vs_on`。`NaN` 与 `0.0` 在稀疏权重契约里是**两种不同指令**（"无指令沿用旧仓" vs "清仓"），而原 64-seed 差分与两条 golden 的输入帧**全为有限值**（合成 OHLCV 有限，且 `generate_weights` 的 Step 2 会把子策略权重 `.ffill().fillna(0.0)`），NaN 类从未被差分覆盖。新用例喂入含 NaN 单元格的目标权重面板（晚挂牌标致的 NaN `current_w`、持仓中缺失的 NaN `ideal_w`），断言 OFF ≡ ON 的 `NaN` 位置 / 显式 `0.0` 位置 / 数值三者逐格相同，并**单独**断言"NaN 绝不会被改写成 `0.0`"、"NaN `ideal_w` 在持仓 bar 上解析为持有权重而非清仓"。
+   - 面板级（`common/position_policy.py` 的 `NaN PASSTHROUGH` 透传）由并行任务的守卫覆盖，本阶段未改动该文件。
+3. **66 条既有 parity 用例 + 1 条新增 NaN 用例**：`pipeline/tests/test_policy_parity.py` 的 64-seed 差分 + `equal_weight` 静态模板 golden + `chan_four_state_blend` 的 `baseline` / `no_inertia` 两档 golden，全部要求 OFF/ON 逐 cell 相同；加上 30.3(2) 的 NaN 差分后共 **67 条**。**注意**：默认翻到 `True` 之后，"OFF 臂"必须在 `params` 里**显式**传 `False`；只省略该键会变成"内核与自己比"，仍然全绿但毫无意义——本次已把三处 OFF 臂全部改为显式 `False`。
+
+### 30.4 守卫测试的语义反转（不删除，只改判据方向）
+- `pipeline/research_strategy/tests/test_blend_policy_kernel.py::test_strategy_config_field_alone_selects_kernel_path`：原断言"默认 `False` 且缺省走旧路径"，现改为"(a) 默认 `True` 且缺省走内核；(b) 显式 `False` 仍走旧路径且绕过内核（证明 opt-out 可达，差分 OFF 臂非死代码）；(c) 构造器关键字 `True` 与缺省同路"。同文件 `test_disabled_path_is_bit_identical_to_pre_change_module` / `test_enabled_kernel_matches_legacy_*` / `test_flag_resolution_order_and_prefixed_key_only` 的"旧路径侧"全部改为**显式 `False`**（原来用的是"省略该键"）。
+- `common/tests/test_position_policy.py::test_kernel_callers_are_guarded_by_opt_in_flag`：`allocation_templates.py` 半边的静态扫描**仍然成立**（该文件只 import `kernel_apply_asset_inertia` 一处，且 `_step_asset_inertia` / `_sparse_from_daily` 仍不委托），故保留不动；blend 半边由"缺省必须走旧路径"改为"缺省必须走内核、显式 `False` 必须走旧路径"，并断言两条路线互斥。
+
+### 30.5 运行后果（必须由操作者处理，引擎不自动愈合）
+- **陈旧 dump 现在硬失败**：`scripts/run_live_strategy.py` 在 `resolve_strategy_definition` 用活类版本**覆写**记录值之前调用 `scripts/live_preflight.py::assert_dump_version_parity`；`base_version` 为 `1.8.0` 而活类为 `1.9.0` 时直接抛 `LiveDumpPreflightError`（不出票、退出码非 0）。
+- **必须重跑 `--dump-strategies`**（本次已在代码改动全部落地后执行，见 30.6）。
+- **实盘 `account_state.json` 若仍盖 `1.8.0`，下一次 Stage 2 会被拒绝一次**：`assert_account_state_version_parity` 同样 fail-closed 且**没有自动刷新路径**（`docs/lv7_prior_state_contract.md` §5.4：上一晚由别的引擎算出的账本，不能因为今晚引擎升级就自动获得信任）。处置方式是操作者**显式确认后刷新/重建**账本，绝不由引擎静默 re-stamp。
+
+### 30.6 dump 与回归实测
+`cd pipeline && uv run python research_strategy/run_research_strategy.py --dump-strategies`（58 份 dump；`pipeline/research_strategy/results/` 被 gitignore，故以磁盘取证）：
+- 翻转前：`base_version` 分布 `{None: 52, "1.8.0": 6}`。
+- 翻转后：`base_version` 分布 `{None: 52, "1.9.0": 6}`；6 份 blend dump（`chan_four_state_blend` / `chan_risk_managed_blend` / `chan_crisis_shield_blend` / `chan_four_state_shield_blend` / `chan_dual_hybrid_blend` / `generic_blend`）的 `base_version` 与 `version_info.base_version` 同为 `1.9.0`，`version_info.composite_version` 形如 `1.2.2 [base: 1.9.0]`；52 份非 blend dump 的 blend 轴**仍为 `null`**（如 `all_weather_strategy.json`）。
+- `pipeline/research_strategy/strategies_config.json` **未被写入**（`git status` 无该文件，即与 `HEAD` 逐字节一致）；`chan_four_state_blend` 的 `blend_weighting_mode="regime_ic_ir_hybrid"` 钉子测试通过，未被"规范化"。

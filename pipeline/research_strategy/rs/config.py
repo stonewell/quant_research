@@ -804,11 +804,17 @@ class StrategyConfig:
     blend_thrust_exit_thresh: float = 0.58
     blend_bucket_renorm_max_delta: Optional[float] = None
 
-    # M4.2 opt-in: delegate the blend inertia step to the position-policy kernel
-    # (`common/position_policy.py::PortfolioSequencer`). Default `False`, so the
-    # pre-M4.2 `_step_asset_inertia` path stays the default. The M4.2 call site in
+    # M4.2: delegate the blend inertia step to the position-policy kernel
+    # (`common/position_policy.py::PortfolioSequencer`). Default `True` since
+    # `BASE_VERSION 1.9.0` (2026-11-06): the kernel is cell-identical to the
+    # pre-M4.2 `_step_asset_inertia` path -- including the NaN input class -- so
+    # the default is now the kernel and the legacy path is the explicit opt-out
+    # (`{"blend_use_policy_kernel": False}` in `params`). The M4.2 call site in
     # `pipeline/research/blend/blend_base.py::generate_weights` reads `params`
     # FIRST, then this attribute as the fallback.
+    # Because this default IS the behavioural contract, flipping it without the
+    # `BASE_VERSION` bump would let a `1.8.0` dump run a different engine than the
+    # one it names (the 2026-11-02 "two version pairs" failure shape).
     # The name is PREFIXED (`blend_`) deliberately, and the call site never routes
     # it through `BaseBlendAllocationStrategy.resolve_param`: that helper's last
     # precedence step is a bare-name `getattr(cfg, name)`, so a bare name here
@@ -816,7 +822,7 @@ class StrategyConfig:
     # into every blend strategy -- the exact shape of the 2026-10-21 incident, when
     # a bare `wq_alpha_id` fell through and swapped a deployed sub-strategy class
     # (`ChanFourStateExecutionStrategy` -> `WorldQuantAlphaStrategy(#101)`).
-    blend_use_policy_kernel: bool = False
+    blend_use_policy_kernel: bool = True
 
     # Blend Base Template aliases (unprefixed versions for convenience)
     weighting_mode: Optional[str] = None

@@ -708,6 +708,7 @@ def build_account_state_update(
     gate_code: str,
     intraday_5m_info: Optional[Dict[str, Any]] = None,
     prior_state: Any = None,
+    prior_state_frozen_suspect: Optional[str] = None,
 ) -> Dict[str, Any]:
     """The `account_state.json` delta one Stage-1 run persists (LV11 item 6).
 
@@ -726,8 +727,28 @@ def build_account_state_update(
       placeholder back pushes a form value into the HWM chain (the LV1 / LV7 defect).
     * **measured run**: byte-identical to the pre-LV11 behaviour (append the effective NAV,
       persist the tier the math actually produced).
+
+    (LV7, `docs/lv7_prior_state_contract.md` §2) `prior_state_frozen_suspect` is the
+    REASON string returned by `detect_frozen_prior_state` (or `None`). A truthy value
+    stamps `prior_state_frozen_suspect: true` + `prior_state_frozen_reason` in **both**
+    branches below, so a frozen carried state cannot hide behind a green report. A clean
+    run emits **neither key** -- never `false` -- so old consumers see no new field at
+    all. Annotation only: no NAV number is ever rewritten.
     """
     updated_state = dict(state)
+    # Emitted in BOTH branches (degraded + measured): see the docstring. Absent, not False,
+    # when clean.
+    frozen_annotation: Dict[str, Any] = {}
+    if prior_state_frozen_suspect:
+        print(
+            "[WARN] (LV7) prior_state 疑似冻结: "
+            f"{prior_state_frozen_suspect}。已落 `prior_state_frozen_suspect: true`，"
+            "本次运行不改写任何 NAV；请核对上游账户状态是否在复制当日净值。"
+        )
+        frozen_annotation = {
+            "prior_state_frozen_suspect": True,
+            "prior_state_frozen_reason": str(prior_state_frozen_suspect),
+        }
     nav_degraded = dd_info.get("nav_gate_status") == NAV_GATE_STATUS_DEGRADED
     buy_scale = intraday_5m_info.get("intraday_buy_scale", 1.0) if intraday_5m_info else 1.0
 
@@ -748,6 +769,7 @@ def build_account_state_update(
                 "nav_history_10d": list(baseline_state.get("nav_history_10d", []) or []),
                 "prior_state": prior_state,
                 "nav_degraded_as_of": as_of_date,
+                **frozen_annotation,
             }
         )
     else:
@@ -782,6 +804,7 @@ def build_account_state_update(
                 "intraday_buy_scale": buy_scale,
                 "nav_history_10d": nav_hist,
                 "prior_state": prior_state,
+                **frozen_annotation,
             }
         )
 
@@ -981,6 +1004,96 @@ def save_account_state(state_file: str, state: Dict[str, Any]) -> None:
         json.dump(serializable, f, indent=2, ensure_ascii=False, default=str)
 
 
+def _coerce_nav_float(value: Any) -> Optional[float]:
+    """`float(value)` or `None` when unparseable / non-finite / absent.
+
+    Deliberately NARROW: `None`, `""`, `"n/a"`, NaN and infinities all become
+    `None` ("we cannot say") instead of a number. A sentinel number would be
+    indistinguishable from a real NAV and would silently enter comparisons.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if out != out or out in (float("inf"), float("-inf")):
+        return None
+    return out
+
+
+def detect_frozen_prior_state(
+    prior_state: Any,
+    today_nav: Any,
+) -> Optional[str]:
+    """Return a human-readable reason when the carried `prior_state` NAV is FROZEN, else `None`.
+
+    (LV7, frozen contract `docs/lv7_prior_state_contract.md` §2)
+
+    Semantics: `prior_state` is supposed to be the PREVIOUS trading day's CONFIRMED
+    snapshot. `latest_account_state_at_or_before` already picks the right instance
+    (订正 ①), so this function does NOT re-select anything -- it only ANNOTATES. The
+    remaining defect is that a stale/frozen carrier is indistinguishable from "nothing
+    changed today": the 2026-11-02 archive has `prior_state.as_of_date = 2026-10-29`
+    with `prior_state.current_nav == 199935.46 ==` the top-level value, i.e. the dates
+    advance while the NAV is copied. Once the upstream form value freezes, the whole
+    chain SELF-CONFIRMS.
+
+    Rules (annotation only -- never mutates a NAV, never feeds the tier arithmetic):
+
+    * `prior_state.current_nav == today_nav` by EXACT float equality -> reason string.
+      Exact, not `approx`: a frozen value is a bit-for-bit copy of the same decimal
+      literal, while a tolerance would flag genuine small moves and turn the marker
+      into noise that operators learn to ignore.
+    * Anything unmeasurable on either side (`None` / missing / unparseable) -> `None`.
+      "Cannot tell" is not "clean", but it is also not a provable freeze; callers must
+      pass the MEASURED gate NAV, and a DEGRADED run has none.
+    """
+    if not isinstance(prior_state, dict):
+        return None
+    prior_nav = _coerce_nav_float(prior_state.get("current_nav"))
+    today = _coerce_nav_float(today_nav)
+    if prior_nav is None or today is None or prior_nav != today:
+        return None
+    prior_as_of = prior_state.get("as_of_date") or "未知"
+    return (
+        f"prior_state.current_nav 与当日门禁 NAV 完全相同（{today:,.2f}；"
+        f"prior_state.as_of_date={prior_as_of}）—— 前推的很可能是当日净值的复制，"
+        "而非上一交易日的已确认结算；该标记仅为注释，不改写任何 NAV / 熔断算术"
+    )
+
+
+def count_distinct_nav_points(nav_history: Any) -> int:
+    """Count ADJACENTLY DISTINCT, parseable NAV points (a consecutive duplicate counts once).
+
+    (LV7, frozen contract `docs/lv7_prior_state_contract.md` §3)
+
+    The 10-day recovery statistic needs >= 10 DISTINCT observations. Raw length is the
+    wrong denominator: the 2026-11-02 archive held FIVE raw points whose last two were
+    both 199935.46, and a frozen series would otherwise "reach" the threshold by copying
+    itself ten times -- nobody has to pad it, the freeze pads itself.
+
+    Rules:
+    * unparseable points are SKIPPED (they neither count nor crash the caller);
+    * a point equal to the immediately preceding counted value counts ONCE;
+    * non-adjacent repeats (A, B, A) count TWICE -- de-duplication targets consecutive
+      copies, not genuine observations.
+
+    Counting only: the series itself is NEVER rewritten here (`append_nav_history_point`
+    still keeps flat points and warns, because a genuinely flat NAV overnight is real).
+    """
+    count = 0
+    previous: Optional[float] = None
+    for raw in nav_history or []:
+        value = _coerce_nav_float(raw)
+        if value is None:
+            continue
+        if count == 0 or value != previous:
+            count += 1
+        previous = value
+    return count
+
+
 def append_nav_history_point(
     nav_history: Sequence[float],
     effective_nav: float,
@@ -1042,6 +1155,21 @@ def resolve_blend_param(
         val = params[name]
         return param_type(val) if param_type is not None and val is not None else val
     return default
+
+
+
+def nav10d_display_len(dd_info: Dict[str, Any]) -> int:
+    """Count shown in the human-readable `n/10 个交易日` renders.
+
+    (LV7) The DISTINCT count is what the threshold is judged on, so it is also the number
+    an operator should read: a 5-record series with a duplicated tail has 4 usable
+    sessions, not 5. Falls back to the raw length for hand-built `dd_info` dicts that
+    predate the field (JSON still carries both, so audit never depends on rendering).
+    """
+    distinct = dd_info.get("nav_10d_distinct_len")
+    if distinct is not None:
+        return int(distinct)
+    return int(dd_info.get("nav_10d_history_len", 0) or 0)
 
 
 def inspect_portfolio_drawdown(
@@ -1132,12 +1260,23 @@ def inspect_portfolio_drawdown(
     # POSITIVE MEASURED recovery, never by missing data. The tier /
     # circuit-breaker / linear-scale math below is untouched -- `r_10d` only ever
     # fed `fast_recovery_nav`.
+    # (LV7, `docs/lv7_prior_state_contract.md` §3) The threshold is the count of
+    # ADJACENTLY DISTINCT observations, not `len(nav_history_10d)`. Raw length let a
+    # frozen series reach "10 points" by copying itself; the 2026-11-02 archive held 5
+    # raw points whose last two were both 199935.46 (4 distinct). A consecutive
+    # duplicate counts once, and the series itself is never rewritten here.
     nav_hist = state.get("nav_history_10d", []) or []
     nav_hist_len = len(nav_hist)
+    nav_10d_distinct_len = count_distinct_nav_points(nav_hist)
     base_nav: Optional[float] = None
-    if nav_hist_len >= NAV_10D_RECOVERY_WINDOW:
+    if nav_10d_distinct_len >= NAV_10D_RECOVERY_WINDOW:
         try:
-            base_nav = float(nav_hist[0])
+            # Base = the observation exactly `NAV_10D_RECOVERY_WINDOW` sessions back, NOT
+            # `nav_hist[0]` (LV7 nit B.4). `append_nav_history_point` caps the list at that
+            # window today, so `[0]` happens to be the 10th-back entry -- but if the cap
+            # ever grows, `[0]` would silently measure a >10-session return under a 10-day
+            # label. The index is safe: `distinct_len >= WINDOW` implies `len >= WINDOW`.
+            base_nav = float(nav_hist[-NAV_10D_RECOVERY_WINDOW])
         except (TypeError, ValueError):
             base_nav = None
 
@@ -1146,15 +1285,24 @@ def inspect_portfolio_drawdown(
         nav_10d_status = NAV_10D_STATUS_OK
         nav_10d_unavailable_reason = None
     else:
-        # Short history, or a non-positive / unparseable base (a corrupt series is
+        # Short history, a duplicate-heavy history that never actually reached ten
+        # distinct sessions, or a non-positive / unparseable base (a corrupt series is
         # equally unmeasurable). Either way: no number, and no override.
         r_10d = None
         nav_10d_status = NAV_10D_STATUS_INSUFFICIENT_HISTORY
-        if nav_hist_len < NAV_10D_RECOVERY_WINDOW:
-            nav_10d_unavailable_reason = (
-                f"nav_history_10d 仅有 {nav_hist_len}/{NAV_10D_RECOVERY_WINDOW} 个交易日记录，"
-                "不足以测量 10 日 NAV 恢复幅度"
-            )
+        if nav_10d_distinct_len < NAV_10D_RECOVERY_WINDOW:
+            if nav_hist_len < NAV_10D_RECOVERY_WINDOW:
+                nav_10d_unavailable_reason = (
+                    f"nav_history_10d 仅有 {nav_hist_len}/{NAV_10D_RECOVERY_WINDOW} 个交易日记录"
+                    f"（去重后仅 {nav_10d_distinct_len} 个不同值），"
+                    "不足以测量 10 日 NAV 恢复幅度"
+                )
+            else:
+                nav_10d_unavailable_reason = (
+                    f"nav_history_10d 有 {nav_hist_len} 条记录，但去重后仅 "
+                    f"{nav_10d_distinct_len}/{NAV_10D_RECOVERY_WINDOW} 个不同交易日"
+                    "（相邻重复点不重复计数），不足以测量 10 日 NAV 恢复幅度"
+                )
         else:
             nav_10d_unavailable_reason = (
                 f"nav_history_10d 起点 NAV 非正数或不可解析 ({nav_hist[0]!r})，10 日恢复幅度不可测"
@@ -1202,7 +1350,10 @@ def inspect_portfolio_drawdown(
         # real measurement; `INSUFFICIENT_HISTORY` means it is `None` (JSON null)
         # and the fast-recovery override is UNAVAILABLE -- not "not triggered".
         "nav_10d_status": nav_10d_status,
+        # `history_len` stays the RAW record count (old readers are byte-compatible);
+        # `distinct_len` is the count the threshold is actually judged on (LV7).
         "nav_10d_history_len": nav_hist_len,
+        "nav_10d_distinct_len": nav_10d_distinct_len,
         "nav_10d_required_len": NAV_10D_RECOVERY_WINDOW,
         "nav_10d_unavailable_reason": nav_10d_unavailable_reason,
         "fast_recovery_nav": fast_recovery_nav,
@@ -1599,7 +1750,7 @@ def resolve_gate_directive(
     # circuit-breaker verdicts are unchanged, only their disclosure is.
     if dd_info.get("nav_10d_status") == NAV_10D_STATUS_INSUFFICIENT_HISTORY:
         _nav_unavail_reason = dd_info.get("nav_10d_unavailable_reason") or (
-            f"nav_history_10d 仅有 {dd_info.get('nav_10d_history_len', 0)}"
+            f"nav_history_10d 仅有 {nav10d_display_len(dd_info)}"
             f"/{NAV_10D_RECOVERY_WINDOW} 个交易日记录，数据不足"
         )
         actions.append(
@@ -1684,7 +1835,7 @@ def print_dashboard(
         # would claim a measurement the run never had.
         print(
             f"  ⚠️ FAST-RECOVERY NAV   : UNAVAILABLE — 10 日 NAV 恢复幅度未测得"
-            f"（{dd_info.get('nav_10d_history_len', 0)}/{NAV_10D_RECOVERY_WINDOW} 个交易日, 数据不足）"
+            f"（{nav10d_display_len(dd_info)}/{NAV_10D_RECOVERY_WINDOW} 个交易日, 数据不足）"
             "，覆盖保持关闭（未测得 ≠ 未触发）"
         )
     elif dd_info["fast_recovery_nav"]:
@@ -1883,6 +2034,9 @@ def generate_reports(
         "strategy_info": strategy_info,
         "strategy_version": strategy_info.get("strategy_version", "1.0.0"),
         "base_version": strategy_info.get("base_version"),
+        # (LV7 nit) Copied alongside the value it describes: False == "these strings are the
+        # dump's own record, nothing in this report checked them against the live class".
+        "strategy_version_verified": strategy_info.get("strategy_version_verified", False),
         "version_info": strategy_info.get("version_info"),
         # (2026-10-22 live-path hardening, FIX 1 reconciliation) `directive` is
         # the coarse 3-value enum every web/API consumer and the operator UI
@@ -1922,7 +2076,7 @@ def generate_reports(
     )
     if _nav10d_insufficient:
         _nav10d_value = (
-            f"N/A ({dd_info.get('nav_10d_history_len', 0)}/{NAV_10D_RECOVERY_WINDOW} 个交易日, 数据不足)"
+            f"N/A ({nav10d_display_len(dd_info)}/{NAV_10D_RECOVERY_WINDOW} 个交易日, 数据不足)"
         )
         _nav10d_verdict = "⚪ N/A (override unavailable)"
     else:
@@ -1974,6 +2128,11 @@ def generate_reports(
         )
 
     strat_ver_display = f"v{strategy_info.get('strategy_version', '1.0.0')}" + (f" [base: v{strategy_info.get('base_version')}]" if strategy_info.get('base_version') else "")
+    # (LV7 nit) Stage 1 never compares the dump's recorded versions against the live class
+    # (Stage 2 owns that gate and fails closed before any ticket). Say so next to the number
+    # instead of letting a stale dump's version print as established fact.
+    if not strategy_info.get("strategy_version_verified", False):
+        strat_ver_display += " ⚠️ UNVERIFIED (dump 记录值，未与今日活类校验)"
     # (2026-11-04 audit) Derived from Stage 2's own enforcement predicate -- see the
     # SINGLE_STOCK_CAP_* block. This row used to read "Enforced across all regimes"
     # unconditionally, which contradicted the same run's disclosed 21.5077% breach.
@@ -2279,6 +2438,14 @@ def main(cli_args: Optional[List[str]] = None):
         "template_name": template_name,
         "strategy_version": str(strat_ver),
         "base_version": str(base_ver) if base_ver else None,
+        # (LV7 nit, 2026-11-06) PROVENANCE, not verification. Stage 1 reads these strings
+        # straight out of the dump and runs NO dump-vs-live-class parity check -- that gate
+        # lives in Stage 2's `resolve_strategy_definition` (and re-instantiating the template
+        # here purely to compare versions would duplicate its entire construction, plus add a
+        # new failure mode to a report-only stage). Always False, so no consumer can read the
+        # numbers above as "confirmed against the live engine"; Stage 2 re-checks them and
+        # fails closed before any ticket exists.
+        "strategy_version_verified": False,
         "version_info": ver_info,
         "weighting_mode": weighting_mode,
         # Honest provenance: False means "nothing in this run confirmed the mode above
@@ -2395,6 +2562,18 @@ def main(cli_args: Optional[List[str]] = None):
         # the report keeps its shape. `attach_nav_provenance` relabels the verdict
         # UNKNOWN, so this can never read as a measured NAV.
         gate_nav = nav_resolution["nav_gate_nav_used"]
+
+    # (LV7, `docs/lv7_prior_state_contract.md` §2) The carried `prior_state` must be the
+    # PREVIOUS session's confirmed snapshot. `latest_account_state_at_or_before` already
+    # picks the right instance (订正 ①) -- this is VALIDATION ONLY, it re-selects nothing.
+    # A frozen carrier (prior NAV == today's NAV) is annotated, never "corrected".
+    # The MEASURED gate NAV is the right comparison value: on a degraded run
+    # `nav_gate_nav` is None (the form placeholder is display-only), so no marker is
+    # claimed from a number nobody measured.
+    prior_state_frozen_reason = detect_frozen_prior_state(
+        prior_state_to_preserve,
+        nav_resolution["nav_gate_nav"],
+    )
 
     dd_info = inspect_portfolio_drawdown(
         current_nav=gate_nav,
@@ -2751,6 +2930,7 @@ def main(cli_args: Optional[List[str]] = None):
             gate_code=gate_code,
             intraday_5m_info=intraday_5m_info,
             prior_state=prior_state_to_preserve,
+            prior_state_frozen_suspect=prior_state_frozen_reason,
         )
         save_account_state(args.account_state_file, updated_state)
 

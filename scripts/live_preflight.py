@@ -564,3 +564,146 @@ def verify_live_strategy_dump_preflight(
 
     # Pinned value compared and agreed.
     return PreflightVerdict(verified=True)
+
+
+# ---------------------------------------------------------------------------
+# (LV7) Version-metadata parity -- READ-ONLY cross-check, fail closed
+# ---------------------------------------------------------------------------
+# Frozen contract: `docs/lv7_prior_state_contract.md` §5.
+#
+# Why this exists at all: `resolve_strategy_definition` computes
+#     strat_version = getattr(template, "version", None) or strategy_def.get("strategy_version")
+# i.e. the LIVE CLASS wins and the result is then stamped BACK over the dump's recorded
+# value. An inconsistency ("the dump says 1.2.2, the running class is 1.3.0") therefore
+# could never be observed: it was silently overwritten, and the ticket printed a version
+# number that no persisted artifact agreed with. That is exactly how the 2026-11-02
+# archive ended up carrying two coexisting version pairs (ticket 1.2.2 / 1.7.0 alongside
+# a dump at 1.8.0). The check below runs BEFORE that overwrite, so "compare then take"
+# replaces "take then pretend".
+#
+# Rules (do not soften any of them):
+#   * Key ABSENT in the recorded carrier -> nothing was asserted -> no comparison. A dump
+#     that does not claim a version cannot be lying about one; comparing it against the
+#     live class would manufacture a failure for every legacy/config-synthesised carrier.
+#   * Key PRESENT but empty (`null` / "" / whitespace) while the live class carries a
+#     value -> raise. An explicitly recorded yet valueless field is a malformed record,
+#     not "no claim". (`base_version: null` is the dumper's canonical spelling for a
+#     non-blend strategy, so null == live None is EQUAL, not empty.)
+#   * Both sides carry a value and they differ -> raise.
+#   * Either side is unverifiable because the OTHER side has a value the recorded side
+#     cannot confirm -> raise (e.g. recorded 1.7.0 vs live None).
+#
+# NEVER auto-heal: no function here writes a version back, and the
+# `--allow-weighting-mode-override` escape hatch does NOT apply to the version axis
+# (that flag only covers the pinned weighting mode).
+
+
+def _normalise_version_value(value: Any) -> Optional[str]:
+    """`None`/blank -> `None`; otherwise the stripped string form."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _assert_version_axis(
+    *,
+    container: Dict[str, Any],
+    key: str,
+    axis: str,
+    live_value: Any,
+    context: str,
+) -> None:
+    """Compare ONE recorded version field against the live class's own value."""
+    if key not in container:
+        # Nothing asserted on this axis -- see the rules above.
+        return
+
+    recorded = _normalise_version_value(container.get(key))
+    live = _normalise_version_value(live_value)
+
+    if recorded is None and live is None:
+        # Canonical spelling for "this carrier/class has no such axis" (non-blend).
+        return
+
+    if recorded is None:
+        raise LiveDumpPreflightError(
+            f"版本元数据不一致（{axis}）：{context} 显式携带 `{key}` 但取值为空/不可解析，"
+            f"而今日活类为 {live!r}。无法交叉校验的记录不得当作一致。"
+            "该检查失败关闭，且不可被 --allow-weighting-mode-override 放行。"
+        )
+
+    if live is None:
+        raise LiveDumpPreflightError(
+            f"版本元数据不一致（{axis}）：{context} 记录 `{key}` = {recorded!r}，"
+            f"但今日活类没有对应的 {axis}（None）。无法交叉校验的记录不得当作一致。"
+            "该检查失败关闭，且不可被 --allow-weighting-mode-override 放行。"
+        )
+
+    if recorded != live:
+        raise LiveDumpPreflightError(
+            f"版本元数据不一致（{axis}）：{context} 记录 `{key}` = {recorded!r}，"
+            f"而今日活类 {axis} = {live!r}。票据不得以旧引擎的版本号写出；"
+            "本条**不会**自动改写任何版本字段（禁止重新盖章）——"
+            "请重新生成 dump，或按 docs/lv7_prior_state_contract.md §5.4 由操作者显式处理。"
+        )
+
+
+def assert_dump_version_parity(
+    strategy_def: Dict[str, Any],
+    live_strategy_version: Any,
+    live_base_version: Any = None,
+    *,
+    dump_display: str = "",
+) -> None:
+    """Raise `LiveDumpPreflightError` when the persisted dump's versions disagree with the live class.
+
+    Read-only: nothing in `strategy_def` is mutated. Call this BEFORE
+    `resolve_strategy_definition` stamps the live class's values over the recorded ones.
+    """
+    context = f"策略 dump `{dump_display or '<未命名 dump>'}`"
+    _assert_version_axis(
+        container=strategy_def,
+        key="strategy_version",
+        axis="strategy_version",
+        live_value=live_strategy_version,
+        context=context,
+    )
+    _assert_version_axis(
+        container=strategy_def,
+        key="base_version",
+        axis="base_version",
+        live_value=live_base_version,
+        context=context,
+    )
+
+
+def assert_account_state_version_parity(
+    account_state: Dict[str, Any],
+    live_strategy_version: Any,
+    live_base_version: Any = None,
+    *,
+    state_display: str = "",
+) -> None:
+    """Raise when the carried-forward `account_state.json` was written by a different engine version.
+
+    Read-only. Called twice per run (before the ticket exists, and again immediately
+    before persisting) because the state dict is heavily mutated in between.
+    """
+    if not isinstance(account_state, dict) or not account_state:
+        return
+    context = f"账户状态 `{state_display or '<未命名 account_state>'}`"
+    _assert_version_axis(
+        container=account_state,
+        key="strategy_version",
+        axis="strategy_version",
+        live_value=live_strategy_version,
+        context=context,
+    )
+    _assert_version_axis(
+        container=account_state,
+        key="base_version",
+        axis="base_version",
+        live_value=live_base_version,
+        context=context,
+    )

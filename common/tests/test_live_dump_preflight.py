@@ -957,6 +957,10 @@ def test_run_live_strategy_cli_preflight_integration(tmp_path, healthy_chan_dump
     pre-flight gate moved into `main()` so argument parsing no longer performs a disk-backed
     validation with a fail-fast side effect. Both halves are asserted here on the SAME argv --
     parsing must not raise, and `main()` must.
+
+    SCOPE (LV7 defect B.5): that "parsing is side-effect free" guarantee covers the
+    WEIGHTING-MODE axis only. The VERSION axis is a deliberate parsing-layer gate, asserted
+    separately in `test_stale_version_dump_fails_closed_at_parse_layer` below.
     """
     strategy_def, _ = healthy_chan_dump
     bad_def = copy.deepcopy(strategy_def)
@@ -985,6 +989,57 @@ def test_run_live_strategy_cli_preflight_integration(tmp_path, healthy_chan_dump
     ])
     assert parsed.allow_weighting_mode_override is True
     assert parsed._strategy_def["params"]["blend_weighting_mode"] == "rolling_ic_ir"
+
+
+def test_stale_version_dump_fails_closed_at_parse_layer(tmp_path, healthy_chan_dump):
+    """(LV7 defect B.5) A dump whose recorded versions disagree with the live class fails closed.
+
+    WHY THIS TEST EXISTS: the P1.10 case above uses a fixture with NO version keys, so it
+    proves nothing about the version axis -- it is vacuously green. Here the dump carries
+    real, wrong version strings, so the comparison has two concrete values to disagree on.
+
+    LAYERING (deliberate, shape A): the failure surfaces in `parse_args`, because `parse_args`
+    resolves the strategy definition to bind `output_dir`, and the comparison MUST happen
+    before that resolver re-stamps the live class's values over the recorded ones. If the
+    check were moved into `main()` it would compare live-vs-live and the assertion below
+    would never fire -- see `scripts/run_live_strategy.py` at the comparison site.
+
+    Reverse-mutation (M1): delete the `assert_dump_version_parity(...)` call in
+    `resolve_strategy_definition` and phase 1 fails with "DID NOT RAISE".
+    """
+    strategy_def, _ = healthy_chan_dump
+    stale_def = copy.deepcopy(strategy_def)
+    # Values no live class can carry, so this fixture cannot drift into passing by accident.
+    stale_def["strategy_version"] = "0.0.0-stale"
+    stale_def["base_version"] = "0.0.0-stale-base"
+
+    strat_file = tmp_path / "chan_four_state_blend_strategy.json"
+    strat_file.write_text(json.dumps(stale_def), encoding="utf-8")
+
+    # 1. Parsing fails closed, and the refusal names the recorded value + the version axis
+    #    (not the weighting-mode axis, which the fixture keeps healthy).
+    with pytest.raises(LiveDumpPreflightError) as exc_info:
+        rls.parse_args(["--strategy-file", str(strat_file)])
+    err = str(exc_info.value)
+    assert "0.0.0-stale" in err
+    assert "版本元数据不一致" in err
+
+    # 2. The same argv through `main()` fails closed before writing anything.
+    out_dir = tmp_path / "out"
+    with pytest.raises(LiveDumpPreflightError):
+        rls.main([
+            "--strategy-file", str(strat_file),
+            "--output-dir", str(out_dir),
+            "--data-provider", "synthetic",
+        ])
+    assert not out_dir.exists()
+
+    # 3. The escape hatch for the weighting mode does NOT cover the version axis.
+    with pytest.raises(LiveDumpPreflightError):
+        rls.parse_args([
+            "--strategy-file", str(strat_file),
+            "--allow-weighting-mode-override",
+        ])
 
 
 def test_main_fails_preflight_before_any_ticket_written(tmp_path, healthy_chan_dump):
@@ -1132,6 +1187,34 @@ def _run_stage1(tmp_path, strat_file, extra_args=()):
         *extra_args,
     ])
     return json.loads((out_dir / "stage1_health_report.json").read_text(encoding="utf-8"))
+
+
+def test_stage1_report_marks_dump_versions_unverified(tmp_path, healthy_chan_dump):
+    """(LV7 nit) Stage 1 stamps the dump's versions but must not present them as verified.
+
+    Stage 1 performs no dump-vs-live-class version comparison, so a stale dump's version
+    string would otherwise be reported as established fact. The provenance flag is the
+    honest replacement for a check this stage deliberately does not run (Stage 2 owns it).
+    """
+    strategy_def, _ = healthy_chan_dump
+    stale_def = copy.deepcopy(strategy_def)
+    stale_def["strategy_version"] = "0.0.0-stale"
+    stale_def["base_version"] = "0.0.0-stale-base"
+    strat_file = tmp_path / "chan_four_state_blend_strategy.json"
+    strat_file.write_text(json.dumps(stale_def), encoding="utf-8")
+
+    report = _run_stage1(tmp_path, strat_file)
+
+    # The recorded value is still carried through (Stage 1 does not invent one) ...
+    assert report["strategy_version"] == "0.0.0-stale"
+    assert report["strategy_info"]["base_version"] == "0.0.0-stale-base"
+    # ... but never as a verified fact, at either surface.
+    assert report["strategy_info"]["strategy_version_verified"] is False
+    assert report["strategy_version_verified"] is False
+
+    markdown = (tmp_path / "out" / "stage1_health_report.md").read_text(encoding="utf-8")
+    assert "0.0.0-stale" in markdown
+    assert "UNVERIFIED" in markdown
 
 
 def test_unregistered_override_records_unverified_mode_not_a_fabricated_value(tmp_path, capsys):

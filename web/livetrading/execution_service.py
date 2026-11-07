@@ -776,9 +776,12 @@ def refresh_held_book_daily_bars(
     before any writable handle is constructed -- no second copy of the resolution rule.
 
     Returns ``{"status": "completed"|"skipped", "reason", "symbols", "cache_file",
-    "fetch_errors"}``; ``fetch_errors`` is the primitive's own per-symbol
-    ``"<provider>: Type: msg"`` map (an empty dict on a clean run), carried through so the
-    caller can say WHY a symbol stayed stale instead of only that it did.
+    "fetch_errors", "strict_namespace", "per_namespace"}``; ``fetch_errors`` is the primitive's own
+    per-symbol ``"<provider>: Type: msg"`` map (an empty dict on a clean run), carried through so the
+    caller can say WHY a symbol stayed stale instead of only that it did. ``per_namespace`` is LV19's
+    machine-readable ``{provider -> skipped|patched|failed}`` trace (read back from the cache, not
+    from the primitive's return value -- that shape is frozen), and ``strict_namespace`` is the
+    resolved provider key the zero-day tolerance was applied to (empty when nothing resolved).
     """
     syms = sorted({str(s).strip().upper() for s in (symbols or []) if str(s or "").strip()})
     summary: Dict[str, Any] = {
@@ -787,6 +790,8 @@ def refresh_held_book_daily_bars(
         "symbols": syms,
         "cache_file": None,
         "fetch_errors": {},
+        "strict_namespace": None,
+        "per_namespace": {},
     }
     if not syms:
         summary["reason"] = "empty_book"
@@ -837,9 +842,30 @@ def refresh_held_book_daily_bars(
         return summary
 
     cache = DuckDBCache(db_path=db_file)
-    fetch_errors = patch_equity_daily_bars(cache, syms, end=as_of) or {}
+    # LV19 §1 (freeze doc `docs/lv19_freshness_contract.md`): the STRICT namespace is the one the
+    # valuation read is about to demand the exact `as_of` bar from -- i.e. the station's own
+    # configured provider, mapped onto the key the cache actually stores through
+    # `resolve_provider_key` (`fuyao` -> `FuyaoDataProvider`). NEVER a literal here: the two write
+    # namespaces are hardcoded in the primitive, and the read side is configured, so this is the
+    # single place where the two are reconciled.
+    # DISCLOSED LIMIT: a provider name that resolves to no stored key (a typo, or a cache that has
+    # never held bars from it) yields an empty strict namespace -- the 2-day tolerance then applies
+    # to every write namespace, exactly as before LV19. It is NOT silent: `resolve_provider_key`
+    # logs a WARNING and the resolved value is echoed in `summary["strict_namespace"]` / the log.
+    strict_namespace = cache.resolve_provider_key(str(data_provider or "").strip())
+    summary["strict_namespace"] = strict_namespace
+    fetch_errors = patch_equity_daily_bars(
+        cache,
+        syms,
+        end=as_of,
+        strict_namespaces=(strict_namespace,) if strict_namespace else (),
+    ) or {}
     summary["status"] = "completed"
     summary["fetch_errors"] = dict(fetch_errors)
+    # LV19 §4: the primitive's return shape is frozen (`fetch_errors` keeps its meaning), so the
+    # per-namespace trace (`skipped` / `patched` / `failed`) comes back through the cache channel.
+    trace_reader = getattr(cache, "namespace_trace", None)
+    summary["per_namespace"] = dict(trace_reader()) if callable(trace_reader) else {}
     return summary
 
 
@@ -1798,9 +1824,16 @@ class ExecutionService:
         )
         if summary.get("status") == "completed":
             fetch_errors = summary.get("fetch_errors") or {}
+            per_namespace = summary.get("per_namespace") or {}
+            # LV19 §4: `per_namespace` is MANDATORY output, not decoration -- `fetch_errors=none`
+            # alone was read as "every namespace is fresh" on 2026-11-05 while the namespace
+            # `compute_nav` reads had been skipped. `strict_namespace` is printed next to it so the
+            # operator can see WHICH namespace carried the zero-day requirement.
             print(
                 f"[ExecutionService] (LV11) 持仓日线预刷新完成: as_of={as_of} "
                 f"symbols={symbols} fetch_errors={sorted(fetch_errors) or 'none'} "
+                f"strict_namespace={summary.get('strict_namespace') or '<unresolved>'} "
+                f"per_namespace={per_namespace or '{}'} "
                 f"(仅账本内标的；Stage 1 仍会做全 universe 刷新)"
             )
         else:

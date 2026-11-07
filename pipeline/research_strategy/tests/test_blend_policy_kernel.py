@@ -1,20 +1,22 @@
-"""M4.2 phase 1 -- `blend_use_policy_kernel` (default OFF) wiring tests.
+"""M4.2 -- `blend_use_policy_kernel` wiring tests (default ON since 1.9.0).
 
 What this file pins, in one place:
 
-  1. DISABLED BIT-IDENTITY -- with the flag absent (or explicitly False) the blend
-     engine's output equals the PRE-M4.2 module exactly: same cells, same `NaN`
-     positions, same column order, `max_abs_diff == 0.0`. The parent module is
-     loaded from a PINNED git blob, not from `HEAD:`. Why pinned: once this change
-     is committed, `HEAD:pipeline/research/blend/blend_base.py` IS the new file, so
-     a `HEAD:`-based comparison would silently degrade into code-versus-itself and
+  1. OUTPUT IDENTITY WITH THE PRE-M4.2 MODULE -- both arms (the post-1.9.0 default,
+     i.e. flag absent -> kernel, and the explicit opt-out `False` -> legacy) equal
+     the PRE-M4.2 module exactly: same cells, same `NaN` positions, same column
+     order, `max_abs_diff == 0.0`. The parent module is loaded from a PINNED git
+     blob, not from `HEAD:`. Why pinned: once this change is committed,
+     `HEAD:pipeline/research/blend/blend_base.py` IS the new file, so a
+     `HEAD:`-based comparison would silently degrade into code-versus-itself and
      keep passing even if the legacy branch were rewritten. The pin (the last
      commit before the delegation) also lets the loaded source be asserted flag-free,
      which is what makes the test non-vacuous.
-  2. ENABLED EQUIVALENCE -- with the flag True, `PortfolioSequencer.sequence` returns
-     the SAME committed weights as `_step_asset_inertia` (tolerance 0.0: both paths
-     run the same float arithmetic, so any difference would be structural, not
-     numerical).
+  2. PATH EQUIVALENCE -- the kernel arm (`True`) returns the SAME committed weights
+     as the explicit legacy arm (`False`) (tolerance 0.0: both paths run the same
+     float arithmetic, so any difference would be structural, not numerical). The
+     legacy arm is selected EXPLICITLY because the flag-absent default is the kernel
+     since 1.9.0 -- comparing against the absent arm would now be a self-comparison.
   3. SPARSE / CELL-LEVEL CONTRACT -- non-rebalance rows are all `NaN`, the output is
      never forward-filled by the template, a rebalance row carries NO `NaN` in a
      risky column, and a de-risked symbol is an explicit `0.0` (a `NaN` there would
@@ -25,7 +27,10 @@ What this file pins, in one place:
      `StrategyConfig` field and silently swapping a sub-strategy class.
   5. DEPLOYED CONFIG PIN -- `chan_four_state_blend` stays on
      `regime_ic_ir_hybrid` (documented exception, `docs/version.md` §8).
-  6. VERSION PIN -- `BaseBlendAllocationStrategy.BASE_VERSION == "1.8.0"`.
+  6. VERSION PIN -- `BaseBlendAllocationStrategy.BASE_VERSION == "1.9.0"`
+     (bumped WITH the default flip: the default is a behavioural contract, so a
+     `1.8.0` stamp while running the kernel path would be the 2026-11-02
+     "two version pairs" shape).
 
 100% offline: synthetic OHLCV only (`common.testing.make_ohlcv_from_closes`).
 """
@@ -160,7 +165,8 @@ def _assert_frames_identical(actual: pd.DataFrame, expected: pd.DataFrame, label
 
 @pytest.fixture(scope="module")
 def frames():
-    """Legacy (flag absent), legacy (explicit False), kernel (True), parent module."""
+    """Default (flag absent = KERNEL since 1.9.0), explicit opt-out (legacy),
+    explicit True, and the pinned pre-M4.2 parent module."""
     universe = _make_universe(200)
     return {
         "universe": universe,
@@ -177,16 +183,25 @@ def frames():
 
 
 def test_disabled_path_is_bit_identical_to_pre_change_module(frames):
-    """Flag absent => output equals the pre-M4.2 implementation exactly."""
+    """The opt-out AND the post-1.9.0 default both equal the pre-M4.2 output exactly.
+
+    Before commit 2 this only had to cover the flag-absent (then legacy) and
+    explicit-False arms. After the flip the flag-absent arm is the KERNEL, so the
+    pair now says something stronger and still non-vacuous: whichever of the two
+    routes the flag selects, the produced frame is the pre-M4.2 module's frame to
+    the last digit (`max_abs_diff == 0.0`, identical NaN footprint, identical
+    column order). The explicit `False` arm is what keeps the legacy branch
+    covered -- an "absent" arm alone would now compare the kernel with itself.
+    """
     absent = frames["absent"]
     parent = frames["parent"]
 
     # Non-vacuity guard: the comparison must actually contain rebalance rows.
     assert len(absent.dropna(how="all")) > 0, "no rebalance rows -- the comparison would be vacuous"
-    _assert_frames_identical(absent, parent, "flag absent vs pre-M4.2 module")
+    _assert_frames_identical(absent, parent, "default path (flag absent) vs pre-M4.2 module")
 
-    # Explicit False must take the same branch (the guard tests truthiness, not
-    # presence), so it is also bit-identical to the parent.
+    # Explicit False is the legacy branch (the guard tests truthiness, not
+    # presence), and is bit-identical to the parent by construction.
     _assert_frames_identical(frames["explicit_false"], parent, "flag False vs pre-M4.2 module")
 
 
@@ -203,9 +218,11 @@ def test_enabled_kernel_matches_legacy_committed_weights_exactly(frames):
     the tolerance is not loosened to hide a structural difference.
     """
     kernel = frames["kernel"]
-    absent = frames["absent"]
+    # The legacy side is the EXPLICIT opt-out: since commit 2 the flag-absent arm
+    # is the kernel too, so using it here would compare the kernel to itself.
+    legacy = frames["explicit_false"]
     assert len(kernel.dropna(how="all")) > 0
-    _assert_frames_identical(kernel, absent, "kernel path vs legacy path")
+    _assert_frames_identical(kernel, legacy, "kernel path vs explicit legacy path")
 
 
 def test_enabled_kernel_matches_legacy_with_asymmetric_sells_and_tenure_lock():
@@ -222,7 +239,7 @@ def test_enabled_kernel_matches_legacy_with_asymmetric_sells_and_tenure_lock():
         "blend_min_holding_bars": 5,
         "blend_min_weight_change": 0.03,
     }
-    legacy = _run(universe, dict(params_extra))
+    legacy = _run(universe, {**params_extra, _FLAG: False})
     kernel = _run(universe, {**params_extra, _FLAG: True})
     assert len(kernel.dropna(how="all")) > 0, "no rebalance rows -- comparison would be vacuous"
     # Non-vacuity: the asymmetric/tenure knobs must actually change the frame,
@@ -279,7 +296,8 @@ def test_kernel_path_preserves_sparse_nan_and_explicit_zero_contract(frames):
 
 def test_flag_resolution_order_and_prefixed_key_only():
     universe = _make_universe(120)
-    baseline = _run(universe)
+    # `baseline` is the opt-out arm (the flag-absent default is the kernel now).
+    baseline = _run(universe, {_FLAG: False})
     kernel = _run(universe, {_FLAG: True})
     assert len(kernel.dropna(how="all")) > 0, "no rebalance rows -- resolution test would be vacuous"
     _assert_frames_identical(kernel, _run(universe, {_FLAG: True}), "params-driven kernel path")
@@ -362,28 +380,57 @@ def test_strategy_config_field_alone_selects_kernel_path(monkeypatch):
 
     universe = _make_universe(160)
 
-    # (a) the dataclass default is False and the default config takes the legacy path.
+    # (a) the dataclass default is now True (M4.2 commit 2, `BASE_VERSION 1.9.0`)
+    # and the default config takes the KERNEL path.
     default_cfg = StrategyConfig()
-    assert default_cfg.blend_use_policy_kernel is False, (
-        "StrategyConfig.blend_use_policy_kernel must default to False -- flipping it "
-        "makes the position-policy kernel the default path for every blend strategy"
+    assert default_cfg.blend_use_policy_kernel is True, (
+        "StrategyConfig.blend_use_policy_kernel must default to True: the kernel was "
+        "proven cell-identical to `_step_asset_inertia` (240-seed finite sweep plus the "
+        "NaN differential) and is the committed default since BASE_VERSION 1.9.0"
     )
-    off = _run(universe, None, cfg=default_cfg)
-    assert len(off.dropna(how="all")) > 0, "no rebalance rows -- the spy would be vacuous"
-    assert calls["legacy"] > 0, (
-        "with the DEFAULT StrategyConfig, `_step_asset_inertia` was never called "
-        f"(kernel calls={calls['kernel']}): the pre-M4.2 inertia path is no longer the default"
+    on_default = _run(universe, None, cfg=default_cfg)
+    assert len(on_default.dropna(how="all")) > 0, (
+        "no rebalance rows -- the spy would be vacuous"
     )
-    assert calls["kernel"] == 0, (
-        f"the DEFAULT config called `PortfolioSequencer.sequence` {calls['kernel']} times "
-        "from `blend_base.py` without opting in via `blend_use_policy_kernel`"
+    assert calls["kernel"] > 0, (
+        "with the DEFAULT StrategyConfig, `PortfolioSequencer.sequence` was never "
+        f"called from `blend_base.py` (legacy calls={calls['legacy']}): the default "
+        "did not flip to the kernel path"
+    )
+    assert calls["legacy"] == 0, (
+        f"with the DEFAULT StrategyConfig, `_step_asset_inertia` still ran "
+        f"{calls['legacy']} times -- the legacy branch is still the default"
     )
     assert calls["delegated_helper"] > 0, (
         "`apply_asset_inertia` never reached the kernel -- the commit-1b delegation is "
         "dead, so this run would not cover it at all"
     )
 
-    # (b) constructor keyword alone (params carry no flag) -> kernel path, legacy bypassed.
+    # (b) the OPT-OUT is still explicit and still real: `False` in `params` must
+    # select the legacy step and bypass the kernel. This is what keeps the two
+    # differential harnesses meaningful -- with the default ON, an "off" arm that
+    # omits the flag would silently run the kernel and compare it to itself.
+    calls["legacy"] = 0
+    calls["kernel"] = 0
+    calls["delegated_helper"] = 0
+    off = _run(universe, {_FLAG: False}, cfg=StrategyConfig())
+    assert len(off.dropna(how="all")) > 0, "no rebalance rows -- the spy would be vacuous"
+    assert calls["legacy"] > 0, (
+        "with `blend_use_policy_kernel=False` in `params`, `_step_asset_inertia` was "
+        f"never called (kernel calls={calls['kernel']}): the explicit opt-out no longer "
+        "reaches the legacy path, so the differential's OFF arm is dead"
+    )
+    assert calls["kernel"] == 0, (
+        "with `blend_use_policy_kernel=False` in `params`, `PortfolioSequencer.sequence` "
+        f"ran {calls['kernel']} times from `blend_base.py`: the opt-out did not bypass "
+        "the blend engine's kernel step"
+    )
+    assert calls["delegated_helper"] > 0, (
+        "`apply_asset_inertia` never reached the kernel on the opt-out run -- the "
+        "flag-independent delegation is dead, so this run would not cover it"
+    )
+
+    # (c) constructor keyword alone (params carry no flag) -> kernel path, legacy bypassed.
     calls["legacy"] = 0
     calls["kernel"] = 0
     on = _run(universe, None, cfg=StrategyConfig(blend_use_policy_kernel=True))
@@ -407,10 +454,12 @@ def test_chan_four_state_blend_still_pinned_to_regime_ic_ir_hybrid():
         "chan_four_state_blend's deployed weighting mode drifted to "
         f"{params.get('blend_weighting_mode')!r} (expected 'regime_ic_ir_hybrid')"
     )
-    # The new flag must not have been baked into the deployed config by this phase.
+    # The default lives in `StrategyConfig`, not in the deployed SSOT config: a
+    # per-strategy override here would mask the global default and make this file's
+    # pin untestable.
     assert _FLAG not in params, (
-        f"{_FLAG} was written into the deployed SSOT config; this phase must not flip "
-        "the default anywhere"
+        f"{_FLAG} was written into the deployed SSOT config; the flip belongs to "
+        "`StrategyConfig` only, so a strategy-level copy would drift from it"
     )
 
 
@@ -419,11 +468,19 @@ def test_chan_four_state_blend_still_pinned_to_regime_ic_ir_hybrid():
 # ---------------------------------------------------------------------------
 
 
-def test_base_version_bumped_for_the_opt_in_flag():
-    assert BaseBlendAllocationStrategy.BASE_VERSION == "1.8.0"
+def test_base_version_bumped_with_the_default_flip():
+    """`1.8.0 -> 1.9.0` is owed BY the default flip, not by an optional feature.
+
+    The flag's default is the behavioural contract of every blend strategy: a dump
+    stamped `1.8.0` that actually runs the kernel path would be exactly the
+    2026-11-02 "two version pairs" failure (name and engine disagreeing). So the
+    flip is a breaking engine change and the version must move WITH it -- a
+    `1.8.0` here means the flip shipped unversioned.
+    """
+    assert BaseBlendAllocationStrategy.BASE_VERSION == "1.9.0"
     inst = GenericBlendStrategy()
-    assert inst.base_version == "1.8.0"
-    assert "base: v1.8.0" in inst.version_string
+    assert inst.base_version == "1.9.0"
+    assert "base: v1.9.0" in inst.version_string
 
 
 # ---------------------------------------------------------------------------
