@@ -34,11 +34,15 @@ from common.allocation_templates import (
     AllocationTemplate,
     apply_asset_inertia,
     _fill_out_columns,
-    _sparse_from_daily,
     _step_asset_inertia,
 )
 from common.indicators import atr, sma
-from common.position_policy import PolicyContext, PortfolioSequencer, PositionPolicyConfig
+from common.position_policy import (
+    PolicyContext,
+    PortfolioSequencer,
+    PositionPolicyConfig,
+    SparseProjector,
+)
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -1695,7 +1699,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                         # row is. Cell-level contract preserved by construction:
                         # the row is dense (a de-risked symbol is an explicit
                         # `0.0`, never `NaN`) and the frame below is never
-                        # forward-filled here -- `_sparse_from_daily` turns
+                        # forward-filled here -- `SparseProjector.project` turns
                         # unchanged rows into `NaN` at the very end.
                         current_w = policy_sequencer.sequence(
                             raw_w,
@@ -1758,4 +1762,14 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             prev_state["thrust_active"] = thrust_active
 
         daily_weights = _fill_out_columns(daily_weights, symbols)
-        return _sparse_from_daily(daily_weights)
+        # M4.2 phase 2 (commit 1a): the sparse compression step now goes through
+        # `SparseProjector.project`, a literal transcription of
+        # `_sparse_from_daily`'s compression branch (same `changed` mask, same
+        # forced first row, same `where`). `apply_asset_inertia` is NOT re-entered
+        # here -- the inertia pass already happened in the loop above, exactly as
+        # before (this call site always passed the default `min_weight_change=0.0`,
+        # for which `_sparse_from_daily` skipped inertia entirely).
+        #
+        # `SparseProjector.write` (M4.3) is deliberately NOT wired: the write-back
+        # rule still belongs to `desired_weights`/the sequencer above.
+        return SparseProjector().project(daily_weights)

@@ -911,6 +911,14 @@ def test_kernel_callers_are_guarded_by_opt_in_flag(monkeypatch):
         output comparison is structurally incapable of noticing a default flip,
         and a source-substring check cannot notice the branch being neutralised
         (`use_policy_kernel = True`, or `if use_policy_kernel:` -> `if True:`).
+
+    M4.2 phase 2 / commit 1a adds ONE projection delegation, and it is NOT part of
+    the flag: `blend_base` now compresses via `SparseProjector.project` (a literal
+    transcription of `_sparse_from_daily`'s compression branch) unconditionally,
+    because the step has no behavioural knob to gate -- it is a pure dense->sparse
+    projection, not the `sequence` call path. It is pinned below behaviourally in
+    BOTH flag states, so a future refactor cannot quietly re-route it back through
+    `_sparse_from_daily` (or wire `SparseProjector.write`, which belongs to M4.3).
     """
     import re
 
@@ -932,6 +940,30 @@ def test_kernel_callers_are_guarded_by_opt_in_flag(monkeypatch):
     assert not offenders, (
         "common/allocation_templates.py must stay kernel-free until phase 2: " + "; ".join(offenders)
     )
+
+    # (a2) phase-2 commit 1a: sparse projection is delegated, flag-independently.
+    assert not hasattr(blend_base, "_sparse_from_daily"), (
+        "blend_base still imports `_sparse_from_daily` -- the projection step was "
+        "supposed to move to `SparseProjector.project` (and the import dropped, it "
+        "had no other use in the file)"
+    )
+    projections = {"off": 0, "on": 0}
+    projections_written = {"off": 0, "on": 0}
+    original_project = SparseProjector.project
+    original_write = SparseProjector.write
+
+    def spy_project(self, daily):
+        projections[spy_project.state] += 1
+        return original_project(self, daily)
+
+    def spy_write(self, decision, previous_target):
+        projections_written[spy_write.state] += 1
+        return original_write(self, decision, previous_target)
+
+    spy_project.state = "off"
+    spy_write.state = "off"
+    monkeypatch.setattr(SparseProjector, "project", spy_project)
+    monkeypatch.setattr(SparseProjector, "write", spy_write)
 
     # (b) the blend call site delegates by CALL PATH, not by source text.
     assert hasattr(blend_base, "_step_asset_inertia"), (
@@ -969,10 +1001,16 @@ def test_kernel_callers_are_guarded_by_opt_in_flag(monkeypatch):
         f"the DEFAULT path called `PortfolioSequencer.sequence` {calls['kernel']} times "
         "without opting in via `blend_use_policy_kernel`"
     )
+    assert projections["off"] > 0, (
+        "with `blend_use_policy_kernel` absent, `SparseProjector.project` was never "
+        "called -- the sparse compression step was not delegated"
+    )
 
     # (b2) flag True -> the kernel is used and the legacy step is BYPASSED.
     calls["legacy"] = 0
     calls["kernel"] = 0
+    spy_project.state = "on"
+    spy_write.state = "on"
     on = GenericBlendStrategy().generate_weights(
         universe, {"blend_use_policy_kernel": True}
     )
@@ -991,3 +1029,15 @@ def test_kernel_callers_are_guarded_by_opt_in_flag(monkeypatch):
     # WHICH path was taken. Kept here so a future divergence surfaces next to the
     # call-path assertion that actually guards the switch.
     pd.testing.assert_frame_equal(on, off)
+
+    # Projection is flag-INDEPENDENT (commit 1a): taken in both states, and the
+    # write-back rule (`SparseProjector.write`) is still NOT wired (that is M4.3).
+    assert projections["on"] > 0, (
+        "with `blend_use_policy_kernel=True`, `SparseProjector.project` was never "
+        "called -- the projection step is missing from the kernel path too"
+    )
+    assert projections_written["off"] == 0 and projections_written["on"] == 0, (
+        "`SparseProjector.write` is now wired into the backtest path "
+        f"({projections_written} calls); that write-back rule belongs to M4.3 and "
+        "must not be introduced by the projection commit"
+    )
