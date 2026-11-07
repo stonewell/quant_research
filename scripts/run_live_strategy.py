@@ -47,7 +47,7 @@ import re
 import sys
 import unicodedata
 from datetime import date, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -84,7 +84,7 @@ def _resolve_path(p: Optional[str]) -> Optional[str]:
 
 
 from common.data import get_data_provider
-from common.allocation_backtester import _get_hk_board_lot
+from common.allocation_backtester import CASH_PROXY_SYMBOLS, _get_hk_board_lot
 from common.cli_utils import (
     add_data_provider_cli_args,
     add_market_clock_cli_args,
@@ -106,7 +106,17 @@ from common.market_clock import (
     MixedMarketUniverseError,
     UnknownSymbolMarketError,
     as_of_trading_date,
+    infer_market_from_symbol,
     infer_market_from_symbols,
+)
+from common.overnight_derisk import (
+    DECISION_SPEC_VERSION as OVERNIGHT_DERISK_SPEC_VERSION,
+    DEFAULT_DOWNSCALE_RATIO as OVERNIGHT_DERISK_DEFAULT_RATIO,
+    OvernightDeriskConfig,
+    OvernightDeriskStatus,
+    apply_overnight_downscale,
+    compute_gap_series,
+    evaluate_overnight_derisk,
 )
 from common.position_lifecycle import (
     AssetLifecycleState,
@@ -1276,6 +1286,32 @@ def parse_args(args: Optional[List[str]] = None):
         ),
     )
     parser.add_argument(
+        "--enable-overnight-derisk",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "`R6` (rule r6.3) overnight de-risking, DEFAULT ON (owner ruling 2026-11-07). At the "
+            "derived instant D = session_close_time(market, day) - 45min (half-day aware, market-"
+            "local -- never a hard-coded 14:15), decide whether the cross-sectional overnight gap "
+            "volatility has spiked above 2x its trailing 252-session median and, if so, multiply "
+            "every NON-cash-proxy target weight by --overnight-derisk-ratio (the difference stays "
+            "in cash; no renormalisation). The sigma cross-section is the LOADED UNIVERSE for the "
+            "market minus the cash proxies (r6.3), never the target book. Insufficient data does "
+            "NOT de-risk and does NOT refuse the ticket: it warns loudly and lands an explicit "
+            "field on every affected row. See docs/overnight_derisk_judgement_freeze.md."
+        ),
+    )
+    parser.add_argument(
+        "--overnight-derisk-ratio",
+        type=float,
+        default=OVERNIGHT_DERISK_DEFAULT_RATIO,
+        help=(
+            "Downscale applied to non-cash-proxy target weights when the overnight-de-risk "
+            "judgement TRIGGERS (default: 0.5). Must satisfy 0 < ratio < 1: 0.0 would mean "
+            "liquidation and >= 1.0 would mean leverage, both outside this rule's semantics."
+        ),
+    )
+    parser.add_argument(
         "--allow-stale-prices",
         action="store_true",
         help=(
@@ -1326,6 +1362,16 @@ def parse_args(args: Optional[List[str]] = None):
         parsed.entry_confirm_bars = parsed.guard_latency_bars
     if not has_exit:
         parsed.exit_confirm_bars = parsed.guard_latency_bars
+
+    # (`R6`, rule r6.3) Validate the overnight-de-risk budget HERE, before any data load or
+    # order math: 0.0 would mean liquidation and >= 1.0 leverage, both outside the frozen
+    # semantics of a *downscale*. `enabled=False` still validates the ratio, because a budget
+    # that cannot be honoured must not sit silently in a config waiting for the next flag flip.
+    overnight_derisk_config = OvernightDeriskConfig(
+        downscale_ratio=float(parsed.overnight_derisk_ratio),
+        enabled=bool(parsed.enable_overnight_derisk),
+    )
+    parsed._overnight_derisk_config = overnight_derisk_config
 
     # 1. Resolve strategy definition to determine strategy key and output directory
     strategy_input = parsed.strategy_file or parsed.strategy
@@ -1406,6 +1452,43 @@ def load_holdings(args) -> Optional[Dict[str, Any]]:
         except Exception:
             pass
     return None
+
+
+def resolve_cash_proxy_target_symbols(
+    target_symbols: Iterable[str],
+    cash_proxy: str,
+) -> set[str]:
+    """Target keys that count as **cash** for the overnight-de-risk multiplier (`R6`).
+
+    Two *existing* authorities, no new ticker literals invented here:
+
+    1. ``cash_proxy`` -- the run's cash-sweep symbol (``params["cash_proxy"]``, default ``BIL``),
+       i.e. exactly the symbol ``model_cash_target`` / the Tier-3 "100% cash sweep" / Phase 4 use;
+    2. ``common.allocation_backtester.CASH_PROXY_SYMBOLS`` -- the repo's canonical set of "a symbol
+       whose own price already carries the risk-free rate" (T-bill ETF / money-market fund / 1-day
+       repo). A China book holding both ``511880.SH`` and ``GC001`` must not have either of them
+       halved as if it were risky equity.
+
+    Matching uses the **bare code** (exchange suffix stripped, case folded), because the canonical
+    set stores ``511880`` while universes carry ``511880.SH``. The return value is a subset of
+    `target_symbols` itself, so it can be passed straight to
+    `common.overnight_derisk.apply_overnight_downscale`, whose cash test is a deliberate exact-key
+    match (no fuzzy matching that could silently exempt a genuinely risky ticker).
+    """
+    bare_codes: set[str] = set()
+    for sym in [cash_proxy] + sorted(CASH_PROXY_SYMBOLS):
+        text = str(sym or "").strip().upper()
+        if not text:
+            continue
+        bare_codes.add(text)
+        if "." in text:
+            bare_codes.add(text.split(".", 1)[0])
+    return {
+        sym
+        for sym in target_symbols
+        if str(sym).strip().upper() in bare_codes
+        or str(sym).strip().upper().split(".", 1)[0] in bare_codes
+    }
 
 
 def resolve_holdings_weights_and_shares(
@@ -1818,6 +1901,10 @@ def apply_market_value_cap(
 
 def main(cli_args: Optional[List[str]] = None):
     args = parse_args(cli_args)
+    # (`R6`, rule r6.3) The overnight-de-risk budget, already validated inside `parse_args`
+    # (0 < ratio < 1). Read it here as one object so the integration site cannot re-derive a
+    # different default than the CLI documents.
+    overnight_derisk_config: OvernightDeriskConfig = args._overnight_derisk_config
 
     # (P1.10 / 2026-10-24) Pre-flight consistency check between the resolved strategy dump and
     # strategies_config.json. MOVED here from `parse_args()` so argument parsing stays free of
@@ -2217,6 +2304,190 @@ def main(cli_args: Optional[List[str]] = None):
 
     latest_rebal_date = rebalances.index[-1].strftime("%Y-%m-%d")
     current_targets = rebalances.iloc[-1].fillna(0.0)
+
+    # ------------------------------------------------------------------ #
+    # (`R6`, rule r6.3) OVERNIGHT DE-RISKING -- decided here, applied here
+    # ------------------------------------------------------------------ #
+    # Positioning (frozen judgement: `docs/overnight_derisk_judgement_freeze.md`): this is
+    # "how much exposure do we carry through tonight's gap", NOT intraday timing and NOT
+    # per-symbol selection. It sits exactly where the model's target weights become final --
+    # before `model_equity_target` and before every downstream gate -- so the circuit breakers
+    # / recovery scale / Stage-1 distribution gate all consume the DE-RISKED book instead of
+    # silently re-scaling the un-de-risked one.
+    #
+    # Applied PER MARKET: `D = session_close_time(market, day) - 45min` is market-local and
+    # half-day aware, so lending one market's clock to another market's book is precisely the
+    # look-ahead the freeze document §2.2 forbids (a fixed 14:15 is after the close on a US/HK
+    # half-day). `resolve_live_clock_context` already refuses a cross-market universe unless
+    # `--market` was passed explicitly, so the normal run collapses to exactly one group.
+    #
+    # (`r6.3`, freeze doc `## Revision 2026-11-07b`) TWO DIFFERENT SETS, never confused:
+    #   * the SIGMA cross-section is the LOADED UNIVERSE for the market minus the cash proxies
+    #     (`cross_section_markets` below). It must not be the target book: a 2-name book yields a
+    #     2-name sigma, the trigger then flips on strategy rotation rather than on risk, and
+    #     recomputing the trailing 252-sigma baseline from TODAY's book retroactively rewrites
+    #     history (a mild look-ahead). A market whose cross-section is empty yields
+    #     INSUFFICIENT_DATA -- there is deliberately NO fallback to the book.
+    #   * the APPLICATION surface is still the target book (`market_groups`): a market only gets
+    #     a multiplier where the book actually holds a risky weight.
+    overnight_derisk_by_market: Dict[str, Dict[str, Any]] = {}
+    overnight_derisk_row_market: Dict[str, str] = {}
+    overnight_derisk_summary: Optional[Dict[str, Any]] = None
+    if overnight_derisk_config.enabled:
+        session_date_for_derisk = pd.Timestamp(as_of_date).date()
+        cash_proxy_keys = resolve_cash_proxy_target_symbols(current_targets.index, cash_proxy)
+        risky_keys = [s for s in current_targets.index if s not in cash_proxy_keys]
+
+        # (r6.3) Sigma cross-section: loaded universe, grouped by market, cash proxies removed.
+        universe_cash_proxy_keys = resolve_cash_proxy_target_symbols(list(universe.keys()), cash_proxy)
+        universe_market_of: Dict[str, str] = {}
+        cross_section_markets: Dict[str, List[str]] = {}
+        universe_market_fallback: List[str] = []
+        for sym in universe:
+            try:
+                sym_market = infer_market_from_symbol(sym)
+            except UnknownSymbolMarketError:
+                # The gate already resolved this run's authoritative market; a symbol it could
+                # not identify does not open a new one, and guessing a calendar is what the
+                # market-clock design (§14 row 3) explicitly refuses. It is NOT silent any more:
+                # the fallback is printed below so an unverified market attribution is visible.
+                sym_market = clock_ctx.market
+                universe_market_fallback.append(str(sym))
+            universe_market_of[str(sym)] = sym_market
+            if sym in universe_cash_proxy_keys:
+                # Cash proxies carry the risk-free rate, not overnight equity gap risk: they must
+                # never enter N_t (they would mechanically damp sigma toward zero).
+                continue
+            cross_section_markets.setdefault(sym_market, []).append(sym)
+
+        # Application surface: the book, grouped by the same markets.
+        market_groups: Dict[str, List[str]] = {}
+        book_market_fallback: List[str] = []
+        for sym in risky_keys:
+            sym_market = universe_market_of.get(str(sym))
+            if sym_market is None:
+                try:
+                    sym_market = infer_market_from_symbol(sym)
+                except UnknownSymbolMarketError:
+                    sym_market = clock_ctx.market
+                    book_market_fallback.append(str(sym))
+            market_groups.setdefault(sym_market, []).append(sym)
+
+        if universe_market_fallback:
+            print(
+                f"[INFO] (R6) universe 中 {len(universe_market_fallback)} 个标的无法从符号推断市场，"
+                f"已回退到本次运行市场 {clock_ctx.market}: {sorted(universe_market_fallback)}"
+                "（市场归属未经符号验证，判定时点与横截面均按该市场计算）"
+            )
+        if book_market_fallback:
+            print(
+                f"[INFO] (R6) 目标簿中无法从符号推断市场的标的已回退到本次运行市场 "
+                f"{clock_ctx.market}: {sorted(book_market_fallback)}"
+            )
+
+        for sym_market in sorted(market_groups):
+            group_symbols = market_groups[sym_market]
+            cross_section_symbols = cross_section_markets.get(sym_market, [])
+            group_universe = {s: universe[s] for s in cross_section_symbols}
+            gap, symbols_used_series = compute_gap_series(group_universe, as_of_date)
+            decision = evaluate_overnight_derisk(
+                gap,
+                symbols_used_series,
+                sym_market,
+                session_date_for_derisk,
+                overnight_derisk_config,
+            )
+            scaled = apply_overnight_downscale(
+                {s: float(current_targets[s]) for s in group_symbols},
+                decision,
+                cash_proxy_keys,
+            )
+            for sym, weight in scaled.items():
+                current_targets[sym] = weight
+            block = decision.ticket_block(overnight_derisk_config)
+            overnight_derisk_by_market[sym_market] = block
+            for sym in group_symbols:
+                overnight_derisk_row_market[sym] = sym_market
+
+            if decision.status is OvernightDeriskStatus.INSUFFICIENT_DATA:
+                # (Owner ruling 2026-11-07) insufficient data only WARNS: it does not de-risk,
+                # and it does not refuse the ticket -- but it must NEVER look like "not
+                # triggered", so the state, the evidence and the reason all print AND land on
+                # every affected ticket row.
+                print("\n" + "!" * 110)
+                print(
+                    f"[WARN] (R6) 隔夜暴露下调判据数据不足 (market={sym_market}) —— "
+                    "**不降暴露**，且这**不是**「未触发」。"
+                )
+                print(f"       {decision.reason}")
+                print(
+                    f"       decision_instant={block['decision_instant']} "
+                    f"sessions_used={decision.sessions_used} "
+                    f"symbols_used={decision.symbols_used} ratio_applied={block['ratio_applied']}"
+                )
+                print("!" * 110 + "\n")
+            else:
+                print(
+                    f"\n[OVERNIGHT DERISK / 隔夜暴露] market={sym_market} "
+                    f"status={decision.status.value} D={block['decision_instant']} "
+                    f"σ_gap={block['sigma_gap']} baseline={block['baseline_median']} "
+                    f"ratio={block['ratio_applied']}"
+                )
+
+        if not market_groups:
+            print(
+                "\n[INFO] (R6) 隔夜暴露下调判据已启用，但目标权重中没有任何风险标的"
+                "（全部为现金代理），无需判定。"
+            )
+
+        overnight_derisk_summary = {
+            "spec_version": OVERNIGHT_DERISK_SPEC_VERSION,
+            "config": {
+                "minutes_before_close": overnight_derisk_config.minutes_before_close,
+                "gap_window": overnight_derisk_config.gap_window,
+                "baseline_window": overnight_derisk_config.baseline_window,
+                "sigma_multiplier": overnight_derisk_config.sigma_multiplier,
+                "downscale_ratio": overnight_derisk_config.downscale_ratio,
+            },
+            "cash_proxy_symbols": sorted(str(s) for s in cash_proxy_keys),
+            "status_by_market": {
+                market: block["status"] for market, block in overnight_derisk_by_market.items()
+            },
+            "markets": overnight_derisk_by_market,
+        }
+        if len(overnight_derisk_by_market) == 1:
+            # Normal case: flatten so `summary.json.overnight_derisk.status` is directly
+            # readable. A mixed book keeps the per-market map only -- there is no single status,
+            # and inventing a fourth word (e.g. "MIXED") would break the closed tri-state.
+            only = next(iter(overnight_derisk_by_market.values()))
+            overnight_derisk_summary.update(
+                {
+                    key: only[key]
+                    for key in (
+                        "status",
+                        "market",
+                        "decision_instant",
+                        "sigma_gap",
+                        "baseline_median",
+                        "sigma_multiplier",
+                        "ratio_applied",
+                        "sessions_used",
+                        "symbols_used",
+                        "reason",
+                    )
+                }
+            )
+        # A MERGE into the same summary.json (`persist_run_metadata` is a merge, not an
+        # overwrite), so the clock/freshness block written before the data load survives and
+        # this run gains one machine-readable decision block. It repeats the "审计字段已写入"
+        # banner -- cosmetic, and far cheaper than a second writer that could clobber a key.
+        persist_run_metadata(
+            args.output_dir,
+            clock_ctx,
+            freshness_summary=freshness_summary,
+            probe_attempts=probe_attempts,
+            extra={"overnight_derisk": overnight_derisk_summary},
+        )
 
     # (2026-10-22 incident) Surface the MODEL's executable equity/cash split so
     # it is clearly distinguishable from the Stage-1 advisory target_exposure.
@@ -3087,6 +3358,13 @@ def main(cli_args: Optional[List[str]] = None):
         if fast_path_badge:
             detail_reason["fast_path_badge"] = fast_path_badge
             detail_reason["fast_path_triggered"] = decision.fast_path_triggered
+        # (`R6`, rule r6.3) The overnight-de-risk verdict travels WITH the row, so a reader that
+        # only keeps `detail_reason` can still tell TRIGGERED / NOT_TRIGGERED / INSUFFICIENT_DATA
+        # apart (the last one carries `ratio_applied == 1.0` too -- `status` + `reason` are the
+        # discriminators, exactly as the freeze document §9 requires).
+        _overnight_market = overnight_derisk_row_market.get(sym)
+        if _overnight_market is not None:
+            detail_reason["overnight_derisk"] = overnight_derisk_by_market[_overnight_market]
         # (D6, 2026-10-29 incident) The structured half of the residual-lot annotation: a
         # reader that only keeps `detail_reason` (audit tooling, the UI's row inspector)
         # must still be able to tell "warned but not enforced" from "sold it".

@@ -207,3 +207,41 @@ drawdown     = (cutoff_bar_close - running_high) / running_high
 | ④ | 时区 / 半日市边界固定 | `test_naive_index_rejected`、`test_insufficient_data_never_read_as_zero`、`test_utc_stamped_feed_yields_the_same_decision` | 把 `<=` 改成 `<`；或把不足分支的 `scale` 改成 `0.0` |
 
 三处反向改坏的实测留痕（改坏 → 转红 → 还原 → 复绿）记录在 `R6` 的结项附注里，不在本文复述；本文只钉住「改哪里必须转红」。
+
+## Revision 2026-11-07
+
+> **性质**：按本文开头「修订方式」追加的 **append-only** 修订段。**上方全部冻结文本原样保留**（可追溯），本段在其上**覆盖**与 `R6` 实盘消费面判据有关的部分。冲突时本段优先。
+
+**变更**：`R6` 的**判定时点**与**触发判据**被 [`docs/overnight_derisk_judgement_freeze.md`](file:///home/stone/Work/github/quant/docs/overnight_derisk_judgement_freeze.md)（`overnight_derisk/v1`，规则规格号 **`r6.2`**，用户 **2026-11-07** 显式批准）取代，用于实盘 / Stage 2 的消费面。取代范围仅限：
+
+| 项 | 本文冻结值（`r6.1`，保留） | 现行值（`r6.2`，本段） |
+|---|---|---|
+| 判定时点 | 固定 wall clock `14:45:00`（`Asia/Shanghai`） | `D = session_close_time(market, day) − 45min`，经 `common/market_clock.py` 计算（半日市感知，`D >= close` 或 `D <= open` 即抛错） |
+| 触发判据 | 5m 日内回撤 `<= -0.15`（`cutoff` 那根 bar 的 close 对 running high） | `σ_gap(t) > 2.0 × median(σ_gap[s], 最近 252 个 σ)`，`σ_gap` = 20 日 `std` of 横截面等权隔夜跳空 `Open_t/Close_{t−1}−1` |
+| 数据面 | 5m bar-END 面板 | **日线** `Open` / `Close`（不依赖 5m） |
+| 三态词表 | `TRIGGERED` / `NOT_TRIGGERED` / `INSUFFICIENT_DATA`，`INSUFFICIENT_DATA ⇒ scale is None` | 词表**不变**；`INSUFFICIENT_DATA ⇒ ratio = 1.0`（不降暴露）且**必须**落显式字段 + `WARN`，默认**不拒票**（用户 2026-11-07 裁定） |
+| 下调幅度 | `0.5` 市场层乘数 | `ρ = 0.5`，只乘非现金代理权重，现金代理不动、差额留现金 |
+
+**取代理由（两条，均为可核对的事实）**：
+
+1. 本文 §2.1 的时点论证只证明了 `14:45 < 15:00`（A 股全日收盘），**没有**证明它在**美股 / 港股半日市**下仍早于收盘：美股半日 13:00、港股半日 12:00 收盘时，固定的 `14:45`（乃至 `15:15`）已是收盘之后 ⇒ 决策会读到取价之后才存在的 bar，构成**取价未来函数**。由会话收盘时刻反推（`r6.2`）使时点在半日市自动前移，并在几何不成立时抛错。
+2. 本条 §1.1 自述被解释变量是**隔夜收益**（「今晚愿意带多少市场暴露穿过隔夜跳空」）；`r6.1` 的触发量是**日内回撤**，与隔夜跳空**没有冻结意义上的对应关系**。`r6.2` 的判据直接测量隔夜跳空幅度的异常放大，与其自述的被解释变量同构。
+
+**保留部分（本段不改）**：本文 §1.1 / §1.2 的定位（降隔夜暴露、非日内择时、非逐标的选择、非波动率目标化）、§1.3 与 `M3.2` 负结果的关系、§1.4 的数字诚实披露、§6 的确定性要求、§8 的全部非目标（尤其 `R7` 的 5m 开关面、`R1`/`R4`/`R5` 阈值不得合并、**仍不改** `blend_base.py` 与版本轴）。
+
+**模块处置（不删不改）**：`common/overnight_exposure.py` 与其用例 `pipeline/tests/test_overnight_exposure_decision.py` **原样保留**（它们是 `r6.1` 的可执行冻结文本，仍是「日内回撤判据」这一独立判据的实现与回归网），但**不再作为 `R6` 的实盘消费面**——消费面改由 `common/overnight_derisk.py` 承担。两份判据**不得**同时作用于同一目标权重（叠加会把 `0.5 × 0.5` 误读成一次 `0.25` 的下调，那是一个谁也没有冻结过的规则）。**接线状态**：`r6.2` 已接线到 `scripts/run_live_strategy.py`（Stage 2 目标权重定稿处），`r6.1` 仍**未接线**（与本文 §8 第 5 条一致）。
+
+**未变**：本节所涉的任务状态、优先级、计数一律以 [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) §2.20 为准；本段不改该文件的任何状态位与计数。
+
+## Revision 2026-11-07b（`r6.3` 横截面定义）
+
+> **性质**：按本文开头「修订方式」追加的 **append-only** 修订段（上方冻结文本与 `r6.2` 修订段原样保留）。本段只做一处覆盖：`r6.2` 行里的**横截面定义**。
+
+**变更**：上表 `r6.2` 行的触发判据「`σ_gap` = 20 日 `std` of 横截面等权隔夜跳空」中，**横截面集合**由 `r6.3` 取代（[`docs/overnight_derisk_judgement_freeze.md`](file:///home/stone/Work/github/quant/docs/overnight_derisk_judgement_freeze.md) `## Revision 2026-11-07b (r6.3)`，用户 2026-11-07 裁定）：
+
+- `r6.2`（被取代）：横截面 = 当日**目标簿**的非现金标的；
+- `r6.3`（现行）：横截面 = **本次运行已加载 universe 中、该市场、剔除现金代理**的全部标的；该市场横截面为空 ⇒ `INSUFFICIENT_DATA`，**不回退到目标簿**。
+
+**其余 `r6.2` 项一字不变**：判定时点 `D = session_close_time(market, day) − 45min`、`W=20` / 基线 `252` / `m=2.0` 严格 `>`、`ρ=0.5` 只乘非现金代理且差额留现金（不重新归一化）、三态词表、`INSUFFICIENT_DATA ⇒ ratio = 1.0` + `WARN` + 不拒票、`enabled` 默认开。
+
+**不得叠加（重申）**：同一份目标权重**同一时刻只允许一套规则接线**。`r6.1`（固定 `14:45` + 5m 日内回撤）、`r6.2`（横截面取自目标簿）、`r6.3`（横截面取自 universe 剔除现金代理）是**三套**判据规格，**不得叠加** —— 叠加会把两次 `0.5` 乘成一次谁也没有冻结过的 `0.25` 下调。`r6.2` 的横截面定义保留以便追溯，但**不得再接线**。
