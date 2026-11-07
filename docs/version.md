@@ -4328,3 +4328,68 @@ M4.1 的静态守卫 `common/tests/test_position_policy.py::test_kernel_has_no_c
 - 翻转前：`base_version` 分布 `{None: 52, "1.8.0": 6}`。
 - 翻转后：`base_version` 分布 `{None: 52, "1.9.0": 6}`；6 份 blend dump（`chan_four_state_blend` / `chan_risk_managed_blend` / `chan_crisis_shield_blend` / `chan_four_state_shield_blend` / `chan_dual_hybrid_blend` / `generic_blend`）的 `base_version` 与 `version_info.base_version` 同为 `1.9.0`，`version_info.composite_version` 形如 `1.2.2 [base: 1.9.0]`；52 份非 blend dump 的 blend 轴**仍为 `null`**（如 `all_weather_strategy.json`）。
 - `pipeline/research_strategy/strategies_config.json` **未被写入**（`git status` 无该文件，即与 `HEAD` 逐字节一致）；`chan_four_state_blend` 的 `blend_weighting_mode="regime_ic_ir_hybrid"` 钉子测试通过，未被"规范化"。
+
+## 31. M4.4：仓位策略内核单一化（`BASE_VERSION 1.9.0 → 2.0.0`）与 M1.1 两日破位 / 再入场闸门（2026-11-07）
+
+### 31.1 版本轴
+| 对象 | 旧版本 | 新版本 | 说明 |
+| --- | --- | --- | --- |
+| `BaseBlendAllocationStrategy.BASE_VERSION` | `1.9.0` | **`2.0.0`** | **破坏性 / 主版本**：`_step_asset_inertia` 旧实现与 `blend_use_policy_kernel` 的 legacy `else` 分支被删除；`blend_use_policy_kernel=False` 由「选择旧实现」变为「惰性键 + 告警后仍走内核」 |
+| 各 blend 子类 `version` | 不变 | 不变 | 未改动任何子策略类的信号 / 风险逻辑与参数默认值，沿用 `1.7.0 → 1.8.0` 的先例（只升底座） |
+| `common/allocation_templates.py` 文件级 `BASE_VERSION` | 不存在 | 不存在 | 该文件**从未**有文件级 `BASE_VERSION`；本次删除 `_step_asset_inertia` 但不 bump 任何静态模板类的 `version`（模板信号逻辑未变） |
+| `common/position_policy.py` / `common/position_lifecycle.py` | 无版本轴字段 | 无 | 实盘侧同批变更（31.3）记在本节，但不属于 blend 版本轴，无 semver 可升 |
+
+**为何是主版本而非次版本**：`1.9.0` 时「`False` = 走旧实现」是一条**真实可执行**的路径，任何盖着 `1.9.0` 的 dump / 实盘 config 都可能在用它。`2.0.0` 下同一个键不再能选择任何实现——这是契约删除，不是能力新增，故不可用 `1.9.1` 掩盖。
+
+### 31.2 删除项与保留项（`common/allocation_templates.py` / `pipeline/research/blend/blend_base.py`）
+- **删 `_step_asset_inertia`（97 行，`git diff` hunk `@@ -549,103 +549,6 @@`）**。理由：它是 blend 每日惰性步进的**第二套实现**，与内核 `AssetPolicy.inertia_step` 逐位等价（M4.2 的 240-seed 有限值差分、NaN 类差分与 parity 用例已证）；等价却并存，等于给两条路径各自留了独立漂移的空间。
+- **保留 `apply_asset_inertia`**：它现在是**唯一**的单 bar 惰性步进入口，函数体只剩一次 `kernel_apply_asset_inertia(...)` 委托（守卫测试用 spy 断言「恰好一次委托」，不用源码字符串匹配——字符串匹配看不出调用被搬走）。它有 15+ 调用方，其中包含**跨项目**的 `ml/bnn_forecaster/bnnf/strategy.py`（跑在自己的 `uv` 环境里），不能因为 blend 引擎换实现就被打断。
+- **保留 `_sparse_from_daily`**：稠密→稀疏压缩是**投影**而非引擎选择，没有行为开关可拨。其压缩分支的等价实现 `SparseProjector.project` 已在 M4.2 phase 2 于 `blend_base` 内无条件使用并被守卫行为化钉死，故 `_sparse_from_daily` 保持原位、行为不变。**稀疏契约与单元格级 `0.0` 语义未变**：`generate_weights` 仍然**绝不** `ffill()` 自己的输出，调仓行的退出仍写**显式 `0.0`**。
+- **`blend_base.py` 的 `if use_policy_kernel: … else: _step_asset_inertia(…)`：`else` 分支整体删除**，模块级对该符号的 import 一并删除。`blend_use_policy_kernel` 降级为**惰性键**：显式 `False`（`params` 优先，其次 `StrategyConfig` 属性）**不抛错**，而是打一条点名 `BASE_VERSION 2.0.0` 与「legacy `_step_asset_inertia` path was removed」的警告，然后照常走内核。**为何不 raise**：仍携带旧 opt-out 的持久化 params / 实盘 config 会被 fail-closed 直接拒绝——那是比删除本身更大的行为变更，而且发生在实盘路径上；键已失去含义，告警后照跑才是最小伤害。
+- **解析序仍然不走 `resolve_param`**：该函数的最后一级回退是裸名 `getattr(cfg, name)`，2026-10-21 的 `wq_alpha_id` 事故正是裸名命中了全局 `StrategyConfig` 字段并静默替换了子策略类。本处继续只用带前缀键 `blend_use_policy_kernel`，无裸名步。
+- **静态守卫同步反转（不删用例）**：`common/tests/test_position_policy.py::test_kernel_callers_are_guarded_by_opt_in_flag` 由 M4.2 的「import 了内核但旧 opt-out 必须仍是真实路径」改为「模块里已经不存在第二套引擎」：`allocation_templates.py` 只允许 import `kernel_apply_asset_inertia`、`apply_asset_inertia` 必须是恰好一次委托、`_step_asset_inertia` 以**缺席**断言删除、`_sparse_from_daily` 的内联压缩仍用 spy 行为化断言；`blend_base.py` 侧断言惰性步进**无条件**是 `PortfolioSequencer.sequence`、legacy 符号已从模块消失，且 `blend_use_policy_kernel=False`（params 侧与 config 侧各一次）**仍必须走到内核并打出 2.0.0 删除告警**。
+
+### 31.3 实盘侧同批变更（不属于 blend 版本轴，但必须在同一份日志里交代）
+- **`live_use_policy_kernel`：默认 `False → True`（M4.2 阶段二），M4.4 D3 后成为惰性键**。持久化的 `false` 只打一条点名该键与删除版本的警告，内核照跑；`resolve_position_lifecycle_config` 仍按 `live_use_policy_kernel` / `lifecycle_live_use_policy_kernel` 两级别名 + CLI 覆盖解析，以保持既有配置文件可读。
+- **`common/position_lifecycle.py` 旧 6 态 FSM 主体删除（468 行，hunk `@@ -244,468 +764,32 @@`）**。`step_position_lifecycle` 保留**原签名**与 `LifecycleDecision` 返回类型，函数体只剩三段：「构建上下文 → `AssetPolicy.step` → `_decision_to_lifecycle`」。`Decision.detail["state_after"]`（计数器、任期、冷却、价格的全量 JSON 快照）写回调用方的 `AssetLifecycleState`，因此**原地变更契约**对调用后读 `state` 的代码不变；`fast_path_triggered` / `cancelled_entry_streak` 从内核 detail 复原。
+- **`_kernel_step_supported` → `_require_kernel_step_supported`（探测改为硬前置检查）**：`enable_entry_fast_path` / `enable_exit_fast_path` 为 `False` 时**抛 `ValueError`** 并点名该键。理由：内核的入场 / 风险快路径**就是策略本身，没有对应开关**，静默按 always-on 跑等于把用户显式关掉的止损变成实盘止损。这两个字段为兼容既有配置文件而保留（默认 `True`）。
+- **`simulate_position_lifecycle` 内嵌的手写 NO_PRICE 分支删除**：NO_PRICE 现只有内核**一处**实现，回测与实盘不再各自手搓同一分支。`MARKET_CLOSED_FREEZE` / `NO_PRICE` 这两个「什么都没评估」的原因仍按旧形状镜像进 `detail_reason["blocking_reason"]`（只有这两个）。
+
+### 31.4 M1.1 新增能力（`common/position_policy.py`，均为 opt-in）
+- **gate 2b：两日破位确认 `two_day_breakdown_rule`（默认 `False`）**。`breakdown_days` 默认 2，且 `__post_init__` 强制 clamp 到 ≥ 2（1 日规则就是单 bar 抖动出场，与本规则存在的目的自相矛盾）；`breakdown_vol_shrink_pct=0.60` 是缩量回踩豁免。判定：`close < min(ma20_close, val)`（`val` 缺失时退化为 `ma20_close`）且量能不缩 → 独立计数器 `AssetState.breakdown_streak` 递增，`>= breakdown_days` 时以 `ExitType.BREAKDOWN` 退出；**独立计数器，绝不复用 `exit_streak`**（两条计数同时推进会让 2b 的确认被 2a 的平仓确认污染）。`BREAKDOWN` 也**不折进 `HARD_STOP`**，否则法证记录里结构破位与固定百分比止损无法区分。
+- **gate 3b：价格 / VWAP 再入场闸门 `price_reentry_gate`（默认 `False`），阈值 `price_reentry_pct=0.02`**（即账本里的 `lifecycle_price_reentry_pct`，**按账本保留**，不借「顺手统一」改默认）。只在 cooldown **到期那一个 bar** 评估：`price > last_exit_price*(1+pct)` 且（`price > vwap20` 且 `volume > vol_ma20`）为 PASS；否则 `HOLD_FILTERED` + **`BlockingReason.REENTRY_GATED`**（中文标签「再入场价格未确认」，`web/livetrading/static/js/app.js` 已同步同一文案）。`last_exit_price` 缺失 / 非正 / 非有限 → **ALLOW**，绝不静默把标的锁死在 FLAT。`reentry_vwap_lookback` 只是管线参数：内核吃预计算的 `PolicyContext.vwap20`，自己从不推 VWAP。
+- **新增枚举**：`ExitType.BREAKDOWN`、`BlockingReason.REENTRY_GATED`（标签「再入场价格未确认」）。
+- **新增状态**：`AssetState.breakdown_streak`（独立计数器）、`AssetState.last_exit_price`（保留至冷却结束，供闸门 3b 与法证比对）。
+- **`PolicyContext` 新增 `ma20_close` / `vwap20` / `vol_ma20` / `val`**：**缺失即 no-op，绝不当作 0**——把缺列当 0 会让 `min(MA20, 0)` 退化成无条件破位。
+
+### 31.5 离线验证（100% 离线，0 网络依赖）
+- `pipeline/tests/test_policy_parity.py` → **78 passed**（本次 dump 重建后复核：`78 passed in 445.72s`）
+- `pipeline/.venv/bin/python -m pytest common/tests pipeline/tests -q --import-mode=importlib` → **2169 passed, 2 skipped**
+- `backtester/tests` → **123 passed**
+- `pipeline/research_strategy/tests` → **631 passed, 1 xfailed**
+- `common/tests/test_position_policy.py` → **296 passed**（本次 dump 重建后复核：`296 passed in 35.52s`）
+
+### 31.6 dump 重建与逐文件 diff（账本判据不可满足，改判据后取证）
+- **目录**：`pipeline/research_strategy/results/strategy_dumps`（由 `pipeline/.gitignore` 的 `results/` 规则忽略，`git check-ignore` 已确认）。
+- **改前快照**：重建前先把当时磁盘内容（仍是 `1.9.0`）整份复制到 `/tmp/opencode/dump_snapshot_pre_d4/`（58 份）。
+- **命令**：`cd pipeline && uv run python research_strategy/run_research_strategy.py --dump-strategies` → `Dumped 58 strategy definition(s)`。该分支在 `main()` 里于任何数据加载之前 `return`，**纯序列化配置、不取数、无网络**。
+- **结果**：58 份 ↔ 58 份，**6 份不同**（`chan_risk_managed_blend` / `chan_crisis_shield_blend` / `chan_four_state_blend` / `chan_four_state_shield_blend` / `chan_dual_hybrid_blend` / `generic_blend`），52 份逐字节相同。每份不同文件恰好 **4 行**：顶层 `base_version`、`version_info.base_version`、`version_info.composite_version` 内嵌串（如 `1.2.2 [base: 1.9.0]`）、`version_info.sub_strategies` 对应项的 `base_version`。把快照中每个 `1.9.0` 替换为 `2.0.0` 后，6 份**全部逐字节相同** ⇒ **无参数、无权重、无键漂移**；`strategy_version` 无一变动（`1.0.2` / `1.0.1` / `1.2.2` / `1.0.1` / `1.1.1` / `1.0.1`）；重建后目录内已不存在任何 `1.9.0`。
+- **`git status --porcelain=v1`**：本次重建是该目录内的唯一写入，且目录被忽略；`docs/version.md` 是本节唯一的文件改动，**无任何 `.py` 变化**。
+- `pipeline/research_strategy/strategies_config.json` **未被写入**（`git status` 无该文件），`chan_four_state_blend` 的 `blend_weighting_mode="regime_ic_ir_hybrid"` 钉子测试仍通过。
+
+### 31.7 书面偏差披露（三条，原文照写）
+① **账本原判据「`git diff strategy_dumps/` 为空」不可满足**：dump 写入器把 `base_version` 记进每一份文件，而该目录被 `.gitignore` 忽略（`git diff` 对它永远为空，也无法作为"重建正确"的证据）。故改判据为「与改前快照逐文件对比，只允许版本字段变化」，并按 31.6 逐文件取证。
+② **`stop_cooldown_bars` 双义未在 `M4.4` 内改名**：组合级的 `21` 在 `blend_base.py` / `StrategyConfig.blend_stop_cooldown_bars`，个股级的 `5` 在 `PositionLifecycleConfig.stop_cooldown_bars`；内核侧已用 `asset_stop_cooldown_bars` 消歧，但配置层同名不同义仍在，**另立任务处理**，不在本次破坏性升版里夹带改名。
+③ **`resolve_trade_inertia_threshold` 未删**：它有两个**生产**消费者——`scripts/run_live_strategy.py` 的同名实现与 `common/position_lifecycle.py` 的惰性导入——**不是**重复 resolver，删除会断实盘路径。
+
+### 31.8 已知局限
+仓库里只有 **`VAL` 一列**（由 `common/structural_factors.enrich_universe_with_structural_features` 产出，仅 `backtester/run_backtest.py` 与 `blend_base.py` 两条路径附加），合成数据与各数据提供方**都不产**该列。因此闸门 2b 的 `min(MA20, VAL)` 在绝大多数路径上实际**退化为 `MA20`**；`PolicyContext.val` 的「缺失即 no-op」契约就是为此写的——宁可退化为单锚点，也不能把缺列当 0 造出无条件破位。
+
+### 31.9 收尾补记：独立复核三项非阻塞发现（2026-11-07）
+
+本节记录独立复核产出的三项**非阻塞**发现的处置，纯收尾，**不改本节上述任何结论、不动任何计数**。三项中 NB-1 已改代码，NB-2 / NB-3 仅补注释。
+
+- **NB-1（已改代码）`backtester/run_backtest.py` 的 `--no-lifecycle-entry-fast-path` / `--no-lifecycle-exit-fast-path` 被删除，不是改成 no-op。** 该两开关把 `enable_entry_fast_path` / `enable_exit_fast_path` 置为 `False`，而 M4.4 阶段 D3 之后 `_require_kernel_step_supported`（`common/position_lifecycle.py:436`，调用点 `:771`）对 `False` 直接抛 `ValueError` —— 语义上已无合法取值。**删除而非静默 no-op 的理由**：no-op 会让操作者相信「止损已被关闭」，而实际止损仍在运行，这正是该硬前置检查要防的失败模式（被关掉的是执行路径，不是止损）。删除后传入即被 argparse 拒绝：`unrecognized arguments`、**`rc=2`**，不进入任何回测逻辑（实测：两个开关各自 `error: unrecognized arguments: ...` 且 `SystemExit rc=2`）。两个正向开关 `--lifecycle-enable-entry-fast-path` / `--lifecycle-enable-exit-fast-path` 保留，help 文案已注明前者已移除（`backtester/run_backtest.py:358-371`）。
+- **NB-2（仅补注释，未改行为）两日破位确认退出取 `normal_cooldown_bars`（默认 2），硬止损 / 紧急路径取 `asset_stop_cooldown_bars`（默认 `max(5, normal)`）。** 理由：两日确认窗口**本身就是**本条规则的防抖延迟，故不再额外支付止损冷却；后果（已破位标的可能比已止损标的更早被重新纳入）**已被接受并记录**，不改行为。注释落点 `common/position_policy.py:1520-1530`。
+- **NB-3（仅补注释，未改行为）闸门 3b（`price_reentry_gate`）只在冷却「到期那一个 bar」评估，block 是单 bar 否决而非持久化的闸门状态。** 该 block 不写进 `AssetState`，下一 bar 直接跳闸门 3、走正常入场阶梯，且**不重新校验 reclaim**；docstring 已明文写清，并警告**未来任何多 bar 闸门必须显式持久化该 block**（`common/position_policy.py:1078-1080`、`:1614-1627`）。
+- **离线验证（实测）**：`backtester/tests` → **123 passed**；`common/tests/test_position_policy.py` → **296 passed**；`pipeline/tests/test_policy_parity.py` → **78 passed（442.00s）**。
