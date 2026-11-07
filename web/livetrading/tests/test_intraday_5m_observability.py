@@ -164,6 +164,207 @@ def test_reconcile_without_artifacts_is_not_checked_not_pass():
 
 
 # ---------------------------------------------------------------------------
+# 2b. (D11 / §4.50.3) THE CHILD'S OWN BLOCK WINS -- or the hard overwrite turns it
+#     back into a less specific source and a real 5m round is unobservable
+# ---------------------------------------------------------------------------
+def _child_block(**overrides):
+    block = {
+        "requested": True,
+        "enabled": True,
+        "rows_5m": 48,
+        "as_of_date": "2026-10-23",
+        "symbols_with_rows": ["600519.SH"],
+        "symbols_unavailable": [],
+        "reason": None,
+        "source": "multi_strategy_netted",
+    }
+    block.update(overrides)
+    return block
+
+
+def test_reconcile_prefers_the_childs_own_block_over_stdout_and_health():
+    """State 2 (§4.50.4): a REAL child block must survive reconciliation verbatim.
+
+    Before D11 the netted call site passed `health_report=None`, so the only reachable
+    sources were `stdout` (needs the WARN marker) and `none` -- and `_apply_intraday_observability`
+    HARD-OVERWRITES `observability["intraday_5m"]`, so a block the child had already persisted
+    was replaced by `"none"`. `re-break`: drop `child_report` from the priority chain -> this
+    test reads `source == "stdout"` and fails (verified red).
+    """
+    stdout = f"[WARNING] {INTRADAY_5M_WARN_MARKER} (enabled=False): as_of=..."
+    health = {"intraday_5m_metrics": {"enabled": True, "symbols_measured": 3, "symbols_5m_available": 1}}
+
+    block = reconcile_intraday_5m_observability(
+        health,
+        stdout=stdout,
+        as_of_date="2026-10-23",
+        child_report=_child_block(),
+    )
+
+    assert block["source"] == "multi_strategy_netted"
+    assert block["requested"] is True
+    assert block["enabled"] is True
+    assert block["rows_5m"] == 48
+    assert block["symbols_with_rows"] == ["600519.SH"]
+
+
+def test_reconcile_falls_through_without_a_child_block():
+    """Absent child block => the OLD behaviour, unchanged (Stage 1/2 call sites)."""
+    stdout = f"[WARNING] {INTRADAY_5M_WARN_MARKER} (enabled=False): as_of=..."
+    from_stdout = reconcile_intraday_5m_observability(
+        None, stdout=stdout, as_of_date="2026-10-23", child_report=None
+    )
+    assert from_stdout["source"] == "stdout"
+
+    from_health = reconcile_intraday_5m_observability(
+        {"intraday_5m_metrics": {"enabled": False, "symbols_measured": 2, "symbols_5m_available": 0}},
+        stdout="",
+        as_of_date="2026-10-23",
+        child_report=None,
+    )
+    assert from_health["source"] == "stage1_health_report.intraday_5m_metrics"
+
+    # An empty/malformed block is "nothing to go on", not "requested=False".
+    for junk in ({}, ["not", "a", "mapping"], {"requested": True}):
+        block = reconcile_intraday_5m_observability(
+            None, stdout=stdout, as_of_date="2026-10-23", child_report=junk
+        )
+        assert block["source"] == "stdout", junk
+
+
+def test_reconcile_respects_a_child_block_that_says_not_requested():
+    """`requested=False` is a WELL-FORMED answer -- a stray stdout marker must not revive 5m.
+
+    The zero-request state (§4.50.4 clause 1) is `requested=False`, so a run that honestly
+    did not ask for 5m must not be relabelled "requested but unavailable" by an unrelated
+    marker elsewhere in the child's stdout.
+    """
+    block = reconcile_intraday_5m_observability(
+        None,
+        stdout=f"[WARNING] {INTRADAY_5M_WARN_MARKER} (enabled=False): as_of=...",
+        as_of_date="2026-10-23",
+        child_report=_child_block(requested=False, enabled=False, rows_5m=0),
+    )
+
+    assert block["requested"] is False
+    assert block["enabled"] is False
+    assert block["source"] == "multi_strategy_netted"
+
+
+def test_reconcile_ignores_a_stale_child_block():
+    """A block inherited from ANOTHER session is not evidence for THIS round."""
+    block = reconcile_intraday_5m_observability(
+        None,
+        stdout="",
+        as_of_date="2026-10-23",
+        child_report=_child_block(as_of_date="2026-10-22"),
+    )
+
+    assert block["source"] == "none", "a stale block must fall through, not be trusted"
+    assert block["requested"] is False
+
+
+# ---------------------------------------------------------------------------
+# 2c. (B1) SAME-DAY RERUN: the block must be from THIS round, not the last one
+#     in the same reused `multi_netted_<matrix>` directory
+# ---------------------------------------------------------------------------
+def test_reconcile_rejects_a_same_day_block_generated_before_this_round():
+    """`as_of_date` matches (same session) -- only `generated_at` can separate the rounds.
+
+    The matrix run directory is fixed per matrix+date and never cleaned, so a rerun finds
+    the previous round's block in `summary.json`. Monotonic freshness is the tie the old
+    `as_of_date`-only check could never draw.
+    """
+    round_start = "2026-10-23T07:30:00+00:00"
+    stale = _child_block(generated_at="2026-10-23T06:00:00+00:00")
+    fresh = _child_block(generated_at="2026-10-23T07:31:00+00:00")
+
+    rejected = reconcile_intraday_5m_observability(
+        None, stdout="", as_of_date="2026-10-23", child_report=stale, round_started_at=round_start
+    )
+    assert rejected["source"] == "none"
+    assert rejected["requested"] is False
+    assert rejected["enabled"] is False
+
+    accepted = reconcile_intraday_5m_observability(
+        None, stdout="", as_of_date="2026-10-23", child_report=fresh, round_started_at=round_start
+    )
+    assert accepted["source"] == "multi_strategy_netted"
+    assert accepted["enabled"] is True
+
+
+def test_reconcile_fails_closed_without_a_usable_generated_at():
+    """At the netting call site an UNPROVABLE timestamp is stale, never fresh.
+
+    Missing, unparseable and timezone-naive `generated_at` all fail closed. A stray
+    timezone-naive string could belong to any offset; assuming UTC is how a stale block
+    would sneak through.
+    """
+    round_start = "2026-10-23T07:30:00+00:00"
+    for bad in ({}, {"generated_at": ""}, {"generated_at": "not-a-timestamp"}, {"generated_at": "2026-10-23T09:00:00"}):
+        block = reconcile_intraday_5m_observability(
+            None,
+            stdout="",
+            as_of_date="2026-10-23",
+            child_report=_child_block(**bad),
+            round_started_at=round_start,
+        )
+        assert block["source"] == "none", bad
+        assert block["requested"] is False, bad
+
+    # Stage-1/Stage-2 call sites pass no `round_started_at`: behaviour is unchanged there
+    # (a block with no `generated_at` is still accepted on the older call sites).
+    unchanged = reconcile_intraday_5m_observability(
+        None, stdout="", as_of_date="2026-10-23", child_report=_child_block()
+    )
+    assert unchanged["source"] == "multi_strategy_netted"
+
+
+def test_reconcile_accepts_a_tz_aware_generated_at_datetime_object():
+    """A `datetime` round start is accepted (that is what the netting call site passes)."""
+    import datetime as dt
+
+    block = reconcile_intraday_5m_observability(
+        None,
+        stdout="",
+        as_of_date="2026-10-23",
+        child_report=_child_block(generated_at="2026-10-23T07:31:00+00:00"),
+        round_started_at=dt.datetime(2026, 10, 23, 7, 30, tzinfo=dt.timezone.utc),
+    )
+    assert block["source"] == "multi_strategy_netted"
+
+
+def test_reconcile_never_enables_a_child_block_with_zero_rows():
+    """`enabled=True` next to zero measured rows is rewritten, child block or not."""
+    block = reconcile_intraday_5m_observability(
+        None,
+        stdout="",
+        as_of_date="2026-10-23",
+        child_report=_child_block(enabled=True, rows_5m=0, reason="provider 不支持 5m"),
+    )
+
+    assert block["requested"] is True
+    assert block["enabled"] is False
+    assert block["rows_5m"] == 0
+    assert block["reason"] == "provider 不支持 5m"
+    assert block["source"] == "multi_strategy_netted"
+
+
+def test_apply_intraday_observability_does_not_erase_a_child_block():
+    """The persistence step writes the RECONCILED block, never a hard-coded `"none"`."""
+    summary = {"freshness_summary": {"status": "PASS", "expected_session": "2026-10-23"}}
+    reconciled = reconcile_intraday_5m_observability(
+        None, stdout="", as_of_date="2026-10-23", child_report=_child_block()
+    )
+
+    _service()._apply_intraday_observability(summary, reconciled)
+
+    assert summary["observability"]["intraday_5m"]["source"] == "multi_strategy_netted"
+    assert summary["observability"]["intraday_5m"]["enabled"] is True
+    assert "intraday_5m" not in summary["freshness_summary"]
+
+
+# ---------------------------------------------------------------------------
 # 3. What lands in summary.json (the reader-facing surface)
 # ---------------------------------------------------------------------------
 

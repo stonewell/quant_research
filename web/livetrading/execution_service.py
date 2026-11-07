@@ -369,17 +369,132 @@ def summarize_intraday_5m_availability(
     return block
 
 
+def _coerce_utc_datetime(value: Any) -> Optional[datetime]:
+    """Parse an ISO-8601 timestamp into a tz-aware UTC `datetime`, or ``None``.
+
+    A NAIVE timestamp is rejected (``None``) rather than assumed to be UTC: the whole point
+    of the freshness check below is to reject a block we cannot PROVE belongs to this round,
+    and "which timezone was that?" is exactly that kind of unprovable. The child stamps
+    tz-aware UTC, so this only ever fires on a foreign/hand-made block.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _normalize_child_intraday_5m_block(
+    child_report: Optional[Mapping[str, Any]],
+    as_of_date: Optional[str],
+    round_started_at: Optional[Any] = None,
+) -> Optional[Dict[str, Any]]:
+    """Normalize a CHILD RUNNER's self-reported `observability.intraday_5m` block.
+
+    Returns ``None`` when the block is ABSENT or STALE, so the caller falls through to the
+    older sources. Four distinct cases must not be conflated:
+
+    * ``None`` / empty / not a mapping / missing the `requested`+`enabled` pair
+      -> "no usable self-report", fall through;
+    * ``as_of_date`` present on the block and different from this round's session
+      -> a block inherited from another round's `summary.json`, fall through;
+    * ``round_started_at`` given and the block's own ``generated_at`` is BEFORE it (or is
+      missing / unparseable / timezone-naive) -> a block left behind by an EARLIER same-day
+      round in the SAME run directory, fall through. The netted run directory is fixed per
+      matrix+date, so `as_of_date` alone can never separate two same-day rounds; this
+      monotonic freshness rule is the only tie that can. FAIL CLOSED: an unstamped block is
+      treated as stale, never as fresh;
+    * ``requested=False`` -> a WELL-FORMED answer ("this round did not ask for 5m") and it
+      is RESPECTED, never overridden by a stray stdout marker.
+
+    The `enabled` invariant is enforced, not trusted: a block claiming `enabled=True` with
+    zero measured rows becomes `enabled=False`, exactly like
+    `summarize_intraday_5m_availability`.
+    """
+    if not isinstance(child_report, Mapping) or not child_report:
+        return None
+    if "requested" not in child_report or "enabled" not in child_report:
+        return None
+    reported_as_of = child_report.get("as_of_date")
+    if reported_as_of and as_of_date and str(reported_as_of) != str(as_of_date):
+        return None
+    if round_started_at is not None:
+        produced_at = _coerce_utc_datetime(child_report.get("generated_at"))
+        started_at = _coerce_utc_datetime(round_started_at)
+        # Our own caller always passes a tz-aware datetime; a value we cannot parse means we
+        # cannot certify freshness either, so nothing is accepted.
+        if produced_at is None or started_at is None or produced_at < started_at:
+            return None
+
+    requested = bool(child_report.get("requested"))
+    try:
+        rows = int(child_report.get("rows_5m") or 0)
+    except (TypeError, ValueError):
+        rows = 0
+    block: Dict[str, Any] = {
+        "requested": requested,
+        "enabled": bool(child_report.get("enabled")) and requested and rows > 0,
+        "rows_5m": rows,
+        "as_of_date": reported_as_of if reported_as_of else as_of_date,
+        "symbols_with_rows": sorted(str(s) for s in (child_report.get("symbols_with_rows") or [])),
+        "symbols_unavailable": sorted(
+            str(s) for s in (child_report.get("symbols_unavailable") or [])
+        ),
+        "reason": child_report.get("reason"),
+        "source": str(child_report.get("source") or "child_self_report"),
+    }
+    if child_report.get("warning"):
+        block["warning"] = str(child_report.get("warning"))
+    return block
+
+
+def extract_child_intraday_5m_block(summary: Any) -> Optional[Mapping[str, Any]]:
+    """Extract `observability.intraday_5m` from a child round's `summary.json` payload."""
+    if not isinstance(summary, Mapping):
+        return None
+    observability = summary.get("observability")
+    if not isinstance(observability, Mapping):
+        return None
+    block = observability.get("intraday_5m")
+    return block if isinstance(block, Mapping) and block else None
+
+
 def reconcile_intraday_5m_observability(
     health_report: Optional[Mapping[str, Any]] = None,
     *,
     stdout: str = "",
     as_of_date: Optional[str] = None,
+    child_report: Optional[Mapping[str, Any]] = None,
+    round_started_at: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Persistable 5m-availability verdict for a run, derived from its artifacts.
 
     Priority (most specific first):
-      1. THIS stage's own stdout marker -- the child's honest WARN;
-      2. Stage 1's structured ``intraday_5m_metrics`` block.
+      1. THE CHILD'S OWN self-report (`child_report`, e.g. the netted runner's
+         `observability.intraday_5m`) -- the only source that knows whether 5m was
+         requested, loaded and usable for THIS round;
+      2. THIS stage's own stdout marker -- the child's honest WARN;
+      3. Stage 1's structured ``intraday_5m_metrics`` block.
+
+    `child_report` defaults to ``None`` so the Stage-1/Stage-2 call sites are untouched
+    (they resolve the same facts from their own stdout/report). Before D11 the matrix path
+    could only ever produce ``source="stdout"`` or ``source="none"`` -- and a real block the
+    child had already persisted was then HARD-OVERWRITTEN by `_apply_intraday_observability`,
+    which is why the child's block has to win here or it would be unobservable.
+
+    ``round_started_at`` (matrix netting only) makes the child block MONOTONICALLY fresh:
+    a block whose own ``generated_at`` predates this round's start, or that carries no
+    provable timestamp, is treated as absent. That is what prevents an EARLIER same-day
+    round's block -- in the same, reused `multi_netted_<matrix>` directory -- from being
+    read as the current round's self-report. Stage-1/Stage-2 call sites omit it, so their
+    behaviour is unchanged.
 
     A report that says "requested, but nothing measured" is reconciled IN PLACE:
     ``enabled`` is forced to ``False`` and ``intraday_5m_available`` to ``False``,
@@ -391,7 +506,13 @@ def reconcile_intraday_5m_observability(
         if isinstance(candidate, Mapping):
             metrics = candidate
 
-    if INTRADAY_5M_WARN_MARKER in (stdout or ""):
+    child_block = _normalize_child_intraday_5m_block(
+        child_report, as_of_date, round_started_at=round_started_at
+    )
+
+    if child_block is not None:
+        block = child_block
+    elif INTRADAY_5M_WARN_MARKER in (stdout or ""):
         block = summarize_intraday_5m_availability(
             None,
             as_of_date,
@@ -3496,6 +3617,14 @@ class ExecutionService:
         # (L2.4/L2.5) Same archive-key invariant as Stage 1/2; the matrix run dir is
         # `<archive>/<as_of>/multi_netted_<matrix>`.
         self._assert_archive_keyed_by(run_dir, val_date)
+        # (B1) THIS round's start, in tz-aware UTC, captured before anything is written into
+        # the run directory. `<archive>/<date>/multi_netted_<matrix>` is FIXED per matrix+date
+        # and never cleaned, so a same-day rerun finds the previous round's
+        # `observability.intraday_5m` sitting in `summary.json`; `as_of_date` is identical on
+        # both, so only a monotonic timestamp can tell them apart. Passed to
+        # `reconcile_intraday_5m_observability` below, which rejects any child block whose
+        # `generated_at` predates this instant (and any block it cannot prove is fresh).
+        round_started_at = datetime.now(timezone.utc)
 
         # ------------------------ VALIDATION / REFUSALS ONLY ------------------------
         # (fix 2) Same invariant as Stage 2: everything that can REFUSE is decided BEFORE
@@ -3655,24 +3784,23 @@ class ExecutionService:
             cmd.extend(["--start-date", start_d])
         if self.storage.cache_dir:
             cmd.extend(["--cache-dir", self.storage.cache_dir])
-        # (P4b) NO `--enable-intraday-5m` here.  `c8559e6` (2026-10-20) added the flag to
-        # THIS argv only; `scripts/run_live_multi_strategy.py` never defined it (no commit
-        # on any branch ever has), so every matrix round since that date died in argparse
-        # with `error: unrecognized arguments: --enable-intraday-5m` (exit 2, ~0.8 s,
-        # `deploy_status: FAILED`, `trades_count: 0`) before the runner read a single bar.
-        # The multi runner loads DAILY bars only (`load_live_universe(..., interval="1d")`,
-        # never overridden) and contains no 5m code path at all -- there is no 5m
-        # capability to switch on, and no other flag name to use.  The strategy-level
-        # channel still works untouched: `enable_intraday_5m` inside a strategy dump's
-        # `params` reaches `generate_weights` verbatim, and `blend_base` guards on the
-        # presence of the 5m COLUMNS, so it degrades to the daily signal instead of
-        # crashing.  The matrix path therefore runs on the daily signal only, which is
-        # what the summary's `observability.intraday_5m` now honestly reports
-        # (`requested=False`, `source="none"`).  This is option (b) of the P4b audit:
-        # stop passing a flag the script cannot accept; wiring real 5m support into the
-        # netting runner (the `load_intraday_5m_universe` +
-        # `enrich_universe_with_intraday_features` block that `run_live_strategy.py:1984`
-        # runs) is a separate, deliberate feature -- not a side effect of this fix.
+        # (`P4b` / `D11`) NO `--enable-intraday-5m` here, and that is now a DESIGN choice, not
+        # a limitation.  `c8559e6` (2026-10-20) added the flag to THIS argv only;
+        # `scripts/run_live_multi_strategy.py` never defined it (no commit on any branch ever
+        # had), so every matrix round since then died in argparse with `error: unrecognized
+        # arguments: --enable-intraday-5m` (exit 2, ~0.8 s, `deploy_status: FAILED`,
+        # `trades_count: 0`) before the runner read a single bar.  `891df17` stopped emitting
+        # it; `D11` then gave the netted runner REAL 5m support
+        # (`load_intraday_5m_universe` + `enrich_universe_with_intraday_features`, one
+        # round-level union load) driven by CONFIGURATION, per the frozen ruling in
+        # `docs/development_plan.md` §4.50.0: the switch follows the strategy's own
+        # `enable_intraday_5m` param, resolved through that template's own `resolve_param`,
+        # and there is deliberately NO default-off manual CLI switch.  Re-adding the flag here
+        # would therefore (a) be a second, manually-operated criterion the strategy's config
+        # could contradict and (b) push a load decision through an argv that the real runner
+        # would have to accept.  The honest three-state outcome (no request / enabled /
+        # requested-but-unavailable) is reported by the CHILD itself in
+        # `observability.intraday_5m` and reconciled below.
         if allow_intraday:
             cmd.append("--allow-intraday")
         else:
@@ -3710,12 +3838,26 @@ class ExecutionService:
         failure = summarize_execution_failure(
             stderr, returncode=proc.returncode, label="Multi-Strategy Netting Deploy"
         ) if not success else {}
-        intraday_obs = reconcile_intraday_5m_observability(None, stdout=stdout, as_of_date=val_date)
         summary_file = os.path.join(run_dir, "summary.json")
-        # (L2.4) MERGE, never overwrite: `run_live_multi_strategy.py` already persisted
-        # the §9 `clock` / `freshness_summary` block here; replacing the file with this
-        # layer's keys used to delete exactly the audit trail we are adding.
+        # (D11 / §4.50.3) The child persists its OWN `observability.intraday_5m` block
+        # (`scripts/run_live_multi_strategy.py`, source `multi_strategy_netted`). Read it
+        # BEFORE reconciling and hand it over as the first priority: `_apply_intraday_observability`
+        # HARD-OVERWRITES `observability["intraday_5m"]`, so without this the child's real
+        # block was replaced with `source="none"` and "the matrix supports 5m" could never be
+        # observed -- exactly the false-green §4.50.3 exists to prevent.
+        # MERGE, never overwrite: `run_live_multi_strategy.py` already persisted the §9
+        # `clock` / `freshness_summary` block here; replacing the file with this layer's keys
+        # used to delete exactly the audit trail we are adding.
         summary = self.storage._load_json(summary_file, default={})
+        intraday_obs = reconcile_intraday_5m_observability(
+            None,
+            stdout=stdout,
+            as_of_date=val_date,
+            child_report=extract_child_intraday_5m_block(summary),
+            # (B1) Reject a block left behind by an earlier same-day round in this reused
+            # matrix directory; fail closed when the block's `generated_at` is absent/unusable.
+            round_started_at=round_started_at,
+        )
         summary.update({
             # (L2.4, §9) tz-aware UTC anchor; market-local/session live in `clock`.
             "timestamp": datetime.now(timezone.utc).isoformat(),

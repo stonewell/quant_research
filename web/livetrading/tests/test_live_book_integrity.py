@@ -2954,20 +2954,26 @@ def test_multi_deploy_summary_records_universe_key(temp_storage, monkeypatch):
     child is told to load must still be the one materialised from `custom_symbols`
     (`resolved_universe.txt`), unchanged by the label.
 
-    (P4b) End-to-end proof of the argv fix as well: the argv handed to the faked child must
+    (P4b / D11) End-to-end proof of the argv fix as well: the argv handed to the faked child must
     be accepted by the REAL `run_live_multi_strategy.py` parser (a fake child cannot notice
     a flag argparse would reject -- the explicit `parse_args` below is what catches it), the
     round must not be recorded `FAILED` when that child succeeds, and the intraday block must
-    say truthfully that the matrix path requested no 5m features.
+    report the ZERO-REQUEST state truthfully (state 1 of §4.50.4): this faked child wrote no
+    `observability.intraday_5m`, so nothing requested 5m and `source` stays `"none"` -- it is
+    NOT an assertion that the runner has no 5m capability any more (D11 added it: a
+    config-driven request would put a real block with `source="multi_strategy_netted"` here).
 
     re-break: drop `universe_key`/`universe_name` from the matrix summary dict in
     `run_multi_strategy_netted_deploy` -- both summary asserts fail (verified red).
     re-break (P4b, argv): re-add `cmd.append("--enable-intraday-5m")` to the matrix argv --
-    the `parse_args` call below raises `SystemExit` naming the flag (verified red).
+    the `parse_args` call below raises `SystemExit` naming the flag (verified red: the flag is
+    deliberately absent from the runner's parser, see §4.50.0).
     re-break (P4b, status): make `deploy_status` unconditionally `"FAILED"` -- the status
     assert fails (verified red).
-    re-break (P4b, honesty): set `block["requested"] = True` in `_apply_intraday_observability`
-    -- the intraday assert fails on a claim the matrix path cannot honour (verified red).
+    re-break (P4b, honesty): make the faked child's summary carry an
+    `observability.intraday_5m` block claiming `requested=True` on zero rows -- the block is
+    normalized to `enabled=False` by `reconcile_intraday_5m_observability` and the
+    `requested is True` assert below fails (verified red).
     """
     calls = []
 
@@ -3009,7 +3015,9 @@ def test_multi_deploy_summary_records_universe_key(temp_storage, monkeypatch):
     # ... and a child that exits 0 must not be recorded as a failed round.
     assert summary["deploy_status"] != "FAILED", summary.get("deploy_stderr")
     assert summary["deploy_returncode"] == 0
-    # The matrix runner has no 5m capability at all, so the summary must not claim one.
+    # The matrix runner's 5m switch is CONFIG-DRIVEN (D11 / §4.50.0), so this faked child
+    # (which wrote no `observability.intraday_5m`) is the ZERO-REQUEST state: `requested`
+    # must stay False and the source must stay "none", never a fabricated "enabled".
     intraday = summary["observability"]["intraday_5m"]
     assert intraday["requested"] is False
     assert intraday["enabled"] is False
@@ -3082,7 +3090,7 @@ def test_multi_deploy_request_accepts_universe_key():
 
 
 # ---------------------------------------------------------------------------
-# 16. (P4b) argv CONTRACT: every flag the service emits must exist in the script
+# 16. (P4b -> D11) argv CONTRACT: every flag the service emits must exist in the script
 #
 # FORENSIC CONTEXT (measured, not remembered).  `c8559e6` (2026-10-20) added
 # `cmd.append("--enable-intraday-5m")` to the MATRIX argv in
@@ -3099,6 +3107,14 @@ def test_multi_deploy_request_accepts_universe_key():
 # have", and nothing but the child's own parser can answer it.  These two tests
 # therefore compare the argv the SERVICE builds against the parser the SCRIPT builds,
 # in both directions.
+#
+# POST-D11 STANCE (docs/development_plan.md §4.50): the netted runner now HAS real 5m
+# support, but the switch is CONFIG-DRIVEN -- "跟着配置走，不设默认关的手动开关" (user ruling
+# 2026-11-06).  So the contract is no longer "the matrix argv must not mention 5m because
+# there is no capability"; it is "the matrix argv must remain free of a MANUAL 5m switch,
+# because enabling it is the strategy's own `enable_intraday_5m` param".  That is asserted
+# positively below, and it still fails loudly if anyone re-invents the flag without also
+# wiring the runner's argparse (the exact 2026-10-20 defect).
 # ---------------------------------------------------------------------------
 
 #: One faked child that records its argv and exits 0 -- the subject is the argv, never
@@ -3199,10 +3215,16 @@ def test_multi_deploy_argv_is_accepted_by_the_script_parser(temp_storage, monkey
     Every flag the service emits must be one the script defines; an operator who runs the
     printed command by hand must not meet a different argparse than the service does.
 
+    POST-D11: the runner really does support 5m now, but the switch follows the strategy's
+    configuration (§4.50.0), so the argv stays free of a MANUAL `--enable-intraday-5m`.
+    Both halves are asserted: the service's argv parses, and the runner's parser does not
+    define a manual 5m switch for the service to emit.
+
     re-break: re-add `cmd.append("--enable-intraday-5m")` to the matrix argv in
-    `run_multi_strategy_netted_deploy` -- this test fails naming `--enable-intraday-5m`
-    (verified red), while the single-path test below stays green: they are different
-    scripts, which is exactly why both exist.
+    `run_multi_strategy_netted_deploy` -- `parse_args` fails naming the flag AND the
+    "no manual switch" assertion fails (verified red). Conversely, define
+    `--enable-intraday-5m` in the runner's parser without emitting it -- the same assertion
+    fails, so a manual switch cannot be re-introduced silently.
     """
     calls = _capture_argv(monkeypatch)
     service = ExecutionService(temp_storage)
@@ -3216,8 +3238,12 @@ def test_multi_deploy_argv_is_accepted_by_the_script_parser(temp_storage, monkey
         data_provider="synthetic",
     )
     assert len(calls) == 1
-    _assert_argv_contract(
-        _script_parser("scripts.run_live_multi_strategy"), calls[0], "run_live_multi_strategy.py"
+    parser = _script_parser("scripts.run_live_multi_strategy")
+    _assert_argv_contract(parser, calls[0], "run_live_multi_strategy.py")
+    # (§4.50.0) Enabling 5m on this path is configuration, not a CLI switch.
+    assert "--enable-intraday-5m" not in _accepted_options(parser), (
+        "the netted runner must not grow a manual 5m switch: D11's frozen ruling is "
+        "'开关跟着配置走' -- the strategy's own enable_intraday_5m param decides"
     )
 
 

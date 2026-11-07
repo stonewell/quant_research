@@ -25,6 +25,13 @@ Usage:
     --current-holdings '{"300394.SZ": 500, "601872.SH": 1000, "BIL": 80000}' \
     --portfolio-value 100000 \
     --data-provider synthetic
+
+5m intraday features (D11, docs/development_plan.md §4.50):
+  The 5m layer is CONFIG-DRIVEN -- there is no CLI switch on this runner. Set
+  `enable_intraday_5m: true` in a strategy's own `params` and this round loads the 5m
+  panel ONCE for the whole symbol union, enriches the daily universe once, and reports
+  the outcome honestly in `summary.json` (`observability.intraday_5m`, source
+  `multi_strategy_netted`). No strategy asking for it => no 5m code path at all.
 """
 
 import argparse
@@ -32,7 +39,7 @@ import json
 import os
 import re
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
@@ -63,6 +70,7 @@ from common.cli_utils import (
     resolve_live_clock_context,
     shared_data_dir,
 )
+from common.data import get_data_provider
 from common.freshness import assert_fresh_universe, latest_close
 from common.order_netting import (
     FrictionSavings,
@@ -307,8 +315,430 @@ def parse_strategy_specs(strategies_arg: List[str], config_file: Optional[str]) 
     return specs
 
 
+# --------------------------------------------------------------------------- #
+# (D11 / docs/development_plan.md §4.50) REAL 5m intraday support for the netted
+# runner -- config-driven, round-level union, honest observability
+# --------------------------------------------------------------------------- #
+# WHY THIS BLOCK EXISTS
+# ---------------------
+# Until `D11` this runner had NO 5m code path at all: `load_live_universe(..., interval="1d")`
+# was the only load, so `blend_base.py`'s `enable_intraday_5m` (and the Garman-Klass /
+# UpVol / Chan-5m gates behind it) could only ever degrade to the daily signal.  The web
+# layer's matrix argv stopped passing `--enable-intraday-5m` in `P4b` precisely because
+# this script never defined it (`891df17`); re-adding a manual switch is NOT the fix.
+#
+# §4.50.0 (user ruling, 2026-11-06): the switch FOLLOWS CONFIGURATION -- there is no
+# default-off CLI switch on this path.  The single criterion is the strategy's own
+# `enable_intraday_5m` param, resolved through THAT template's own resolver
+# (§4.50.1), so the loading decision and the consuming decision (`blend_base.py:714`)
+# cannot disagree.  Re-implementing the precedence chain here (`params.get(...)` or a
+# `*_enable_intraday_5m` scan) would miss `cfg.blend_enable_intraday_5m` and reproduce
+# the 2026-10-22 "printed success, fields all empty" defect on this path.
+#
+# §4.50.2: the load/enrich is a ROUND-LEVEL UNION (one call over `all_symbols_to_load`,
+# including out-of-universe holdings) and must stay OUTSIDE the per-strategy loop -- once
+# per strategy would re-fetch the same panel N times.
+
+#: Sentinel the web layer's `reconcile_intraday_5m_observability` greps for
+#: (`web/livetrading/execution_service.py::INTRADAY_5M_WARN_MARKER`). Duplicated as a
+#: literal on purpose: `scripts/` must not import the web app, and the two strings are
+#: pinned equal by `web/livetrading/tests/test_multi_strategy_intraday_5m.py`.
+INTRADAY_5M_WARN_MARKER = "5m 日内特征不可用"
+
+#: The exact column `blend_base.py` gates on (`"UpVol_Ratio_5m" in df_s.columns`).
+#: "enrichment produced a usable column" means THIS column, not merely "rows arrived".
+INTRADAY_5M_INDICATOR_COLUMN = "UpVol_Ratio_5m"
+
+#: `source` tag written into `observability.intraday_5m`; also proves to a reader that the
+#: block came from the round's own child process, not from stdout/stage-1 reconciliation.
+INTRADAY_5M_SOURCE = "multi_strategy_netted"
+
+#: Same default as Stage 2 (`run_live_strategy.py --cutoff-time`) and
+#: `pipeline/research/blend/blend_base.py:719`.
+DEFAULT_INTRADAY_CUTOFF_TIME = "14:15"
+
+_HHMM_RE = re.compile(r"^\d{1,2}:\d{2}$")
+
+
+def resolve_intraday_5m_request(template: Any, params: Dict[str, Any]) -> Tuple[bool, bool]:
+    """`(requested, resolved_by_template)` for ONE strategy (§4.50.1).
+
+    Uses the template's OWN `resolve_param` when it exposes one (`BaseBlendAllocationStrategy`
+    and every subclass), so the loading decision walks the very same precedence chain the
+    consumer walks: `p.<prefix>_<name>` -> `p.blend_<name>` -> `p.<name>` -> `cfg.<prefix>_<name>`
+    -> `cfg.blend_<name>` -> `cfg.<name>` -> default.
+
+    Static allocation templates carry no such switch (they have no `resolve_param`), so they
+    can never request 5m; `resolved_by_template=False` records that this was a "no switch to
+    consult" answer rather than a configured `False`.
+    """
+    resolver = getattr(template, "resolve_param", None)
+    if not callable(resolver):
+        return False, False
+    return bool(resolver(params, "enable_intraday_5m", False, bool)), True
+
+
+def resolve_intraday_cutoff(template: Any, params: Dict[str, Any]) -> str:
+    """The requesting strategy's own `intraday_cutoff_time`, defaulted to 14:15."""
+    resolver = getattr(template, "resolve_param", None)
+    if not callable(resolver):
+        return DEFAULT_INTRADAY_CUTOFF_TIME
+    raw = resolver(params, "intraday_cutoff_time", DEFAULT_INTRADAY_CUTOFF_TIME, str)
+    text = str(raw).strip() if raw is not None else ""
+    if not _HHMM_RE.match(text):
+        print(
+            f"[WARN] 无法解析 intraday_cutoff_time={raw!r}，回退默认 "
+            f"{DEFAULT_INTRADAY_CUTOFF_TIME}（HH:MM）"
+        )
+        return DEFAULT_INTRADAY_CUTOFF_TIME
+    return text
+
+
+def combine_intraday_cutoffs(values: List[str]) -> str:
+    """The EARLIEST requested cutoff -- one `enrich` call serves the whole round.
+
+    DISCLOSED CHOICE: §4.50 freezes only the ENABLE switch, but `enrich_universe_with_intraday_features`
+    can only run at ONE cutoff per round, so when two requesting strategies configure
+    different cutoffs one of them is honoured exactly. The earliest value is the only
+    conservative direction: no requesting strategy is handed features computed further into
+    the session than its own configured cutoff (the alternative would silently widen one
+    strategy's information window). Today no tracked config sets this key, so the choice is
+    inert until someone does.
+    """
+    valid = [v.strip() for v in values if isinstance(v, str) and _HHMM_RE.match(v.strip())]
+    if not valid:
+        return DEFAULT_INTRADAY_CUTOFF_TIME
+    return min(valid, key=lambda s: (int(s.split(":")[0]), int(s.split(":")[1])))
+
+
+def load_intraday_5m_panel(
+    symbols: List[str],
+    *,
+    start: str,
+    end: str,
+    data_provider: Any,
+    cutoff_time: str,
+    cache_dir: Optional[str] = None,
+) -> Dict[str, pd.DataFrame]:
+    """Thin import seam around `common.intraday_features.load_intraday_5m_universe`.
+
+    Imported lazily (as Stage 2 does) so this runner keeps working in an environment where
+    the optional intraday dependencies are absent, and exposed as a module-level name so a
+    test can prove the loader is NOT called in the zero-request state.
+    """
+    from common.intraday_features import load_intraday_5m_universe
+
+    return load_intraday_5m_universe(
+        symbols,
+        start=start,
+        end=end,
+        data_provider=data_provider,
+        cutoff_time=cutoff_time,
+        cache_dir=cache_dir,
+    )
+
+
+def enrich_intraday_5m_panel(
+    universe: Dict[str, pd.DataFrame],
+    universe_5m: Dict[str, pd.DataFrame],
+    *,
+    cutoff_time: str,
+) -> Dict[str, pd.DataFrame]:
+    """Thin import seam around `enrich_universe_with_intraday_features` (Stage 2 parity)."""
+    from common.intraday_features import (
+        IntradayFeatureConfig,
+        enrich_universe_with_intraday_features,
+    )
+
+    return enrich_universe_with_intraday_features(
+        universe,
+        universe_5m,
+        config=IntradayFeatureConfig(cutoff_time=cutoff_time),
+        synthesize_intraday_bar=True,
+    )
+
+
+def summarize_intraday_5m_frames(
+    universe_5m: Dict[str, pd.DataFrame], as_of_date: str
+) -> Dict[str, Any]:
+    """Count REAL 5m ROWS on the as-of session, never symbols and never daily bars.
+
+    Same counting rule as the web layer's `summarize_intraday_5m_availability`
+    (`web/livetrading/execution_service.py`), which is what the persisted block means: the
+    2026-10-22 incident was a SUCCESS line whose count was the DAILY symbol count while the
+    5m universe was empty. A frame carrying `attrs["intraday_5m_available"] = False` stays
+    "unavailable" even if it accidentally holds rows.
+    """
+    rows = 0
+    with_rows: List[str] = []
+    unavailable: List[str] = []
+    last_ts = None
+    session = pd.Timestamp(as_of_date).normalize() if as_of_date else None
+    for sym, df in (universe_5m or {}).items():
+        name = str(sym)
+        if (
+            df is None
+            or bool(getattr(df, "empty", True))
+            or getattr(df, "attrs", {}).get("intraday_5m_available") is False
+        ):
+            unavailable.append(name)
+            continue
+        try:
+            index = pd.DatetimeIndex(df.index)
+        except (TypeError, ValueError):
+            unavailable.append(name)
+            continue
+        if session is not None:
+            try:
+                n_on_session = int((index.normalize() == session).sum())
+            except (TypeError, ValueError):
+                n_on_session = 0
+        else:
+            n_on_session = int(len(index))
+        rows += n_on_session
+        (with_rows if n_on_session > 0 else unavailable).append(name)
+        if len(index):
+            ts = index.max()
+            if last_ts is None or ts > last_ts:
+                last_ts = ts
+    return {
+        "rows_5m": int(rows),
+        "symbols_with_rows": sorted(with_rows),
+        "symbols_unavailable": sorted(unavailable),
+        "last_5m_timestamp": last_ts.isoformat() if last_ts is not None else None,
+    }
+
+
+def build_intraday_5m_block(
+    *,
+    requested: bool,
+    frames: Dict[str, Any],
+    as_of_date: Optional[str],
+    usable_symbols: List[str],
+    reason: Optional[str] = None,
+    round_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """The block persisted as `observability.intraday_5m` -- SAME SHAPE as the web layer's.
+
+    `enabled` is true only when the round asked for 5m, REAL rows landed on the as-of
+    session, AND enrichment actually produced `UpVol_Ratio_5m` for at least one symbol
+    (§4.50.4 state 3 + "no silent degradation": rows without a usable column would make
+    `blend_base.py:799` silently fall back to the daily signal while a naive `rows > 0`
+    check claimed success).
+
+    DISCLOSED STRICTNESS: `summarize_intraday_5m_availability` enables on `rows > 0` alone.
+    This child-side block additionally requires the consumable column, i.e. it can only be
+    MORE conservative than the web layer -- never `enabled=True` on data a strategy cannot use.
+
+    ROUND IDENTITY (`round_id` + `generated_at`, B1): the netted run directory is FIXED per
+    matrix+date (`<archive>/<date>/multi_netted_<matrix>`) and never cleaned, so a same-day
+    rerun reuses it and every block it ever wrote carries the SAME `as_of_date`. That alone
+    cannot distinguish "this round's report" from "last round's report", so the block also
+    carries:
+
+    * ``round_id`` -- the UTC ISO-8601 instant this round STARTED (chosen over a uuid4 so an
+      operator can order two same-day rounds, from the block alone, without another file);
+    * ``generated_at`` -- tz-aware UTC ISO-8601 of block CREATION.
+
+    The web layer rejects a block whose ``generated_at`` predates its own round start (and
+    a block with no/unparseable/naive ``generated_at`` -- fail closed), which is what stops
+    a previous same-day round's block from being read as the current round's self-report.
+    """
+    rows = int(frames.get("rows_5m") or 0)
+    enabled = bool(requested and rows > 0 and usable_symbols)
+    block: Dict[str, Any] = {
+        "requested": bool(requested),
+        "enabled": enabled,
+        "rows_5m": rows,
+        "as_of_date": as_of_date,
+        # (B1) Provenance stamps; see the docstring. `generated_at` is what the web layer
+        # compares against its own round start, so it must stay tz-aware UTC.
+        "round_id": round_id,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "symbols_with_rows": list(frames.get("symbols_with_rows") or []),
+        "symbols_unavailable": list(frames.get("symbols_unavailable") or []),
+        "reason": reason,
+        "source": INTRADAY_5M_SOURCE,
+    }
+    if block["requested"] and not enabled:
+        message = (
+            f"[WARNING] {INTRADAY_5M_WARN_MARKER} (enabled=False)：as_of={as_of_date} "
+            f"当日真实 5m 行数为 {rows}（统计的是 5m 行数，不是标的数，也不是日线 bar 数）。"
+        )
+        if reason:
+            message += f"原因：{reason}。"
+        message += " 下游必须把日内 VWAP / Chan-5m 门槛视为 UNKNOWN/SKIPPED，绝不静默 PASS。"
+        block["warning"] = message
+    return block
+
+
+def persist_intraday_5m_observability(output_dir: str, block: Dict[str, Any]) -> str:
+    """MERGE `observability.intraday_5m` into `<output_dir>/summary.json`.
+
+    A MERGE for the same reason `persist_run_metadata` is one: `web/livetrading` later
+    `update()`s its own keys into this file, and replacing it here would delete the
+    clock/freshness audit trail. Also why the zero-request state writes NOTHING at all --
+    a round that never asked for 5m must leave the file byte-identical to the pre-D11 path.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, "summary.json")
+    payload: Dict[str, Any] = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                payload = loaded
+        except Exception as exc:  # pragma: no cover - unreadable archive is reported, not fatal
+            print(f"[WARN] 无法解析既有 summary.json ({path}): {exc}；将覆盖写入 5m 观测块")
+    observability = payload.get("observability")
+    if not isinstance(observability, dict):
+        observability = {}
+        payload["observability"] = observability
+    observability["intraday_5m"] = block
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False, default=str)
+    print(f"[INTRADAY 5M] 日内特征观测块已写入: {path} (enabled={block.get('enabled')})")
+    return path
+
+
+def clear_intraday_5m_observability(output_dir: str) -> bool:
+    """Drop a PREVIOUS round's `observability.intraday_5m` block at round start (B1).
+
+    `persist_run_metadata` MERGES into `<output_dir>/summary.json` (the same merge contract
+    `persist_intraday_5m_observability` relies on), and the netted run directory is FIXED
+    per matrix+date and never cleaned -- so a same-day rerun inherits the previous round's
+    5m block verbatim. Nothing later in this round can tell that block apart from its own
+    report (both carry the same `as_of_date`), which is how a zero-request rerun used to
+    publish `requested=True / enabled=True` for a round that never touched 5m.
+
+    The block must only ever describe the round that just ran, so it is cleared BEFORE the
+    5m request/gating block. If this round dies before writing its own block, the stale one
+    is already gone -- absence is then the honest answer (the web layer falls through to
+    `source="none"`).
+
+    A round with no pre-existing block is left BYTE-IDENTICAL (fresh-run path unchanged),
+    and if `observability` held nothing but the stale block it is removed entirely, so a
+    zero-request round still persists no `observability` key at all (§4.50.4 clause 1).
+
+    Returns ``True`` only when a stale block was actually removed. An UNREADABLE existing
+    summary is reported and left untouched -- overwriting it here would delete the clock /
+    freshness audit trail for a corruption we did not cause.
+    """
+    path = os.path.join(output_dir, "summary.json")
+    if not os.path.exists(path):
+        return False
+    payload: Dict[str, Any] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            payload = loaded
+    except Exception as exc:
+        print(f"[WARN] 无法解析既有 summary.json ({path}): {exc}；跳过 5m 观测块清理")
+        return False
+    observability = payload.get("observability")
+    if not isinstance(observability, dict) or "intraday_5m" not in observability:
+        return False
+    observability.pop("intraday_5m", None)
+    if not observability:
+        payload.pop("observability", None)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False, default=str)
+    print(f"[INTRADAY 5M] 已清除上一轮残留的观测块: {path}")
+    return True
+
+
+def apply_intraday_5m_features(
+    universe: Dict[str, pd.DataFrame],
+    *,
+    symbols: List[str],
+    start_date: str,
+    as_of_date: str,
+    data_provider: Any,
+    cutoff_time: str,
+    cache_dir: Optional[str] = None,
+    provider_label: str = "",
+    round_id: Optional[str] = None,
+) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
+    """ONE 5m load + ONE enrichment for the whole round; returns `(enriched, block)`.
+
+    Ported from `scripts/run_live_strategy.py:2102-2168` (loading block AND the honest
+    warnings -- §4.50.7 requires both, or the 2026-10-22 "printed success, fields all
+    empty" success-message defect is copied onto the matrix path).
+    """
+    universe_5m = load_intraday_5m_panel(
+        symbols,
+        start=start_date,
+        end=as_of_date,
+        data_provider=data_provider,
+        cutoff_time=cutoff_time,
+        cache_dir=cache_dir,
+    )
+    enriched = enrich_intraday_5m_panel(universe, universe_5m, cutoff_time=cutoff_time)
+
+    frames = summarize_intraday_5m_frames(universe_5m, as_of_date)
+    n_5m_ok = sum(1 for _df in universe_5m.values() if _df is not None and not _df.empty)
+    missing_5m = sorted(
+        _s for _s in symbols
+        if _s not in universe_5m or universe_5m[_s] is None or universe_5m[_s].empty
+    )
+    reason: Optional[str] = None
+    if n_5m_ok == 0:
+        reason = (
+            f"{len(symbols)} 个标的的 5m 数据帧全部为空 "
+            f"(provider={provider_label}, 截断时点={cutoff_time})"
+        )
+        # Same wording as Stage 2: report what ACTUALLY arrived, never a daily-symbol count.
+        # `(enabled=False)` is part of the line (not only of the persisted block) so a human
+        # reading the console cannot mistake this for the 2026-10-22 "success" message.
+        print(
+            f"[WARN] {INTRADAY_5M_WARN_MARKER} (enabled=False)：{len(symbols)} 个标的的 5m 数据帧全部为空 "
+            f"(provider={provider_label}, 截断时点={cutoff_time})。"
+            "常见原因：provider does not support 5m (该数据源仅支持日线 interval='1d')。"
+            "后续 intraday_vwap / vwap_premium_pct / chan_5m_state 等日内字段将为空值，"
+            "本轮仅按日线信号生成工单；请勿把本行理解为日内特征已生效。"
+        )
+    else:
+        print(
+            f"[INFO] 5m 日内特征已聚合: 有效标的数 {n_5m_ok}/{len(symbols)} "
+            f"(截断时点: {cutoff_time}, 最新 5m K 线: {frames['last_5m_timestamp']})"
+        )
+        if missing_5m:
+            print(
+                f"[WARN] 以下 {len(missing_5m)} 个标的缺少 5m 数据，日内字段为空: "
+                f"{', '.join(missing_5m[:20])}{' ...' if len(missing_5m) > 20 else ''}"
+            )
+
+    usable = sorted(
+        _s for _s in symbols
+        if _s in enriched
+        and not bool(getattr(enriched[_s], "empty", True))
+        and INTRADAY_5M_INDICATOR_COLUMN in getattr(enriched[_s], "columns", [])
+    )
+    if reason is None and not usable:
+        reason = f"5m 行已到达但 enrich 后无 {INTRADAY_5M_INDICATOR_COLUMN} 列，日内特征未生效"
+        print(f"[WARN] {INTRADAY_5M_WARN_MARKER} (enabled=False)：{reason}")
+
+    block = build_intraday_5m_block(
+        requested=True,
+        frames=frames,
+        as_of_date=as_of_date,
+        usable_symbols=usable,
+        reason=reason,
+        round_id=round_id,
+    )
+    return enriched, block
+
+
 def main():
     args = parse_args()
+    # (B1) ROUND IDENTITY. The netted run directory is fixed per matrix+date and reused by
+    # every same-day rerun, so `as_of_date` alone can NEVER distinguish this round's 5m
+    # self-report from the previous round's. Captured once, before anything is loaded, and
+    # stamped into the block as `round_id` + the freshness anchor `generated_at`.
+    round_started_at = datetime.now(timezone.utc)
+    round_id = round_started_at.isoformat()
     # (L2.3) Netted live deployment: as-of + run-window gate resolved from the market
     # clock exactly as in Stage 2, before any data load.
     universe_symbols = resolve_universe_from_args(args)
@@ -386,6 +816,45 @@ def main():
         extra={"date": val_date, "stage": "multi_strategy_netted", "run_mode": run_mode},
     )
 
+    # (B1) `persist_run_metadata` MERGES into the existing `summary.json`, and this round's
+    # directory (`<archive>/<date>/multi_netted_<matrix>`) is fixed per matrix+date and never
+    # cleaned -- so a same-day rerun inherits the PREVIOUS round's
+    # `observability.intraday_5m` block. If this round requests nothing it writes no block,
+    # and if it dies before building one it writes none either: either way the inherited
+    # block would be read as this round's self-report (`requested=True / enabled=True` on a
+    # round that never touched 5m). The block may only ever describe the round that just
+    # ran, so the previous one is cleared HERE, before the request/gating block below.
+    clear_intraday_5m_observability(args.output_dir)
+
+    # (D11 / §4.50.1) Resolve the 5m REQUEST before anything is loaded -- one pre-pass using
+    # the SAME `resolve_strategy_definition` the strategy loop uses, so the loading decision
+    # and the consuming decision (`blend_base.py:714`) can never drift. A `params.get(...)`
+    # here would miss `cfg.blend_enable_intraday_5m` and silently reproduce the 2026-10-22
+    # "printed success, fields all empty" defect on this path.
+    resolved_strategies: List[Dict[str, Any]] = []
+    intraday_5m_requesters: List[str] = []
+    intraday_cutoffs: List[str] = []
+    for s_spec in strategy_specs:
+        s_key = s_spec["strategy_key"]
+        strat_def, actual_key, resolved_desc, template = resolve_strategy_definition(s_key, None)
+        params = strat_def.get("params", {})
+        requests_5m, template_has_switch = resolve_intraday_5m_request(template, params)
+        if requests_5m:
+            intraday_5m_requesters.append(s_key)
+            intraday_cutoffs.append(resolve_intraday_cutoff(template, params))
+        resolved_strategies.append({
+            "spec": s_spec,
+            "strategy_def": strat_def,
+            "actual_key": actual_key,
+            "resolved_desc": resolved_desc,
+            "template": template,
+            "params": params,
+            "requests_intraday_5m": requests_5m,
+            # False = the template exposes no such switch at all (a static allocation
+            # template). Recorded so "no switch to consult" is not read as "configured off".
+            "intraday_5m_switch_present": template_has_switch,
+        })
+
     # (2026-10-22 incident, Fix 2 / L2.3) Netting prices come from the SAME single
     # freshness owner as Stage 2 (`common.freshness.latest_close`), not `.iloc[-1]`.
     latest_prices = {}
@@ -397,14 +866,80 @@ def main():
         else:
             latest_prices[sym] = 1.0
 
+    # (D11 / §4.50.2) ROUND-LEVEL union: ONE `load_intraday_5m_universe` + ONE
+    # `enrich_universe_with_intraday_features` over EVERY symbol this round loaded
+    # (`all_symbols_to_load`, out-of-universe holdings included), and only when at least one
+    # strategy asked for it. Inside the loop this would become N full re-fetches.
+    #
+    # Prices above are deliberately resolved from the UN-ENRICHED frames: enrichment
+    # synthesizes the partial as-of daily bar from truncated 5m data, and D11 is a SIGNAL
+    # capability. Re-pricing the netted ticket on a 14:15-synthesized close would be a
+    # separate, money-changing decision that §4.50 never authorises.
+    universe_intraday_5m: Optional[Dict[str, pd.DataFrame]] = None
+    if intraday_5m_requesters:
+        cutoff_t = combine_intraday_cutoffs(intraday_cutoffs)
+        print(
+            f"\n[INTRADAY 5M] {len(intraday_5m_requesters)}/{len(strategy_specs)} 个策略请求日内 5m: "
+            f"{', '.join(intraday_5m_requesters)} (截断时点: {cutoff_t})"
+        )
+        try:
+            provider_5m = get_data_provider(args.data_provider, **build_data_kwargs(args))
+            universe_intraday_5m, intraday_5m_block = apply_intraday_5m_features(
+                universe,
+                symbols=all_symbols_to_load,
+                start_date=start_date,
+                as_of_date=val_date,
+                data_provider=provider_5m,
+                cutoff_time=cutoff_t,
+                cache_dir=cache_dir,
+                provider_label=args.data_provider,
+                round_id=round_id,
+            )
+        except Exception as exc:
+            # Honest degradation, exactly like Stage 2: warn, keep the daily signal, and
+            # still persist a block that says requested-but-unavailable (§4.50.4 state 3).
+            print(
+                "[WARN] Failed to load 5m intraday features in the multi-strategy netted "
+                f"runner: {exc} {INTRADAY_5M_WARN_MARKER} (enabled=False)"
+            )
+            universe_intraday_5m = None
+            intraday_5m_block = build_intraday_5m_block(
+                requested=True,
+                frames={
+                    "rows_5m": 0,
+                    "symbols_with_rows": [],
+                    "symbols_unavailable": list(all_symbols_to_load),
+                },
+                as_of_date=val_date,
+                usable_symbols=[],
+                reason=f"5m 加载/聚合异常: {exc}",
+                round_id=round_id,
+            )
+        persist_intraday_5m_observability(args.output_dir, intraday_5m_block)
+
     # 3. Evaluate each strategy to extract its rebalance targets
     intents: List[SubStrategyIntent] = []
     print("\n[STEP 1: 评估各子策略独立调仓意向 (Evaluating Sub-Strategy Targets)]")
-    for s_spec in strategy_specs:
+    for s_ctx in resolved_strategies:
+        s_spec = s_ctx["spec"]
         s_key = s_spec["strategy_key"]
         w_strat = s_spec["capital_weight"]
-        strat_def, actual_key, resolved_desc, template = resolve_strategy_definition(s_key, None)
-        params = strat_def.get("params", {})
+        strat_def = s_ctx["strategy_def"]
+        actual_key = s_ctx["actual_key"]
+        resolved_desc = s_ctx["resolved_desc"]
+        template = s_ctx["template"]
+        params = s_ctx["params"]
+
+        # (D11 / §4.50.2) The strategy-level gate is unchanged, and it is enforced HERE as
+        # well: a strategy that did not request 5m gets the ORIGINAL daily universe. Handing
+        # everyone the enriched copy would move a non-requesting strategy's inputs too --
+        # `enrich` synthesizes/replaces the partial as-of daily bar, so "only the requesting
+        # strategy sees intraday columns" has to be structural, not merely hoped for.
+        strategy_universe = (
+            universe_intraday_5m
+            if (s_ctx["requests_intraday_5m"] and universe_intraday_5m is not None)
+            else universe
+        )
 
         # (P1.8 / P1.9) Pre-flight consistency check between dump and strategies_config.json.
         # The static-template exemption is owned by the verifier (`is_static_template_exempt`);
@@ -412,8 +947,8 @@ def main():
         #
         # (LV7 defect B.5) NOTE: this verifier has NO version axis. The dump-vs-live-class
         # version parity check on this path is the one inside `resolve_strategy_definition`
-        # (line above), which runs before it re-stamps the live values. Do not remove or
-        # relocate that check -- on this runner it is the only version gate, so a
+        # (the pre-pass above, which runs before it re-stamps the live values). Do not remove
+        # or relocate that check -- on this runner it is the only version gate, so a
         # `BASE_VERSION` bump would otherwise let stale dumps through untouched.
         verify_live_strategy_dump_preflight(
             strategy_def=strat_def,
@@ -427,7 +962,7 @@ def main():
             or s_key.replace("_", " ").title()
         )
 
-        sparse_weights = template.generate_weights(universe, params)
+        sparse_weights = template.generate_weights(strategy_universe, params)
         rebalances = latest_rebalance_rows(sparse_weights)
         if rebalances.empty:
             print(f"  [WARN] Strategy {s_key} returned no rebalances. Defaulting to 0.")
