@@ -119,7 +119,7 @@
 | `20261025_125300` | `09_param_grid/inertia/inertia_015_10` | Chan Four-State Risk-Managed Blend Strategy | CAGR: 28.88% / Sharpe: 1.44 / MaxDD: 5.28% | 参数网格 walkforward: cfsb_min_weight_change=0.15 + cfsb_min_holding_bars=10（18 折, 2022-01-04→2026-10-22, --cash-sweep-rate 0.015） | L2.49 |
 | `20261025_125300` | `09_param_grid/inertia/inertia_015_10` | Chan Risk-Managed Blend Strategy | CAGR: 22.07% / Sharpe: 1.42 / MaxDD: 4.86% | 参数网格 walkforward: crb_min_weight_change=0.15 + crb_min_holding_bars=10（18 折, 2022-01-04→2026-10-22, --cash-sweep-rate 0.015） | L2.49 |
 | `20261107_210715_baseline6` | `01_crb_baseline` | Chan Risk-Managed Blend Strategy | CAGR: 28.19% / Sharpe: 1.4803 / MaxDD: 4.24% | 18 折基线 (2022-01-04→2026-10-22, 0.25y/0.25y, 现金计息 1.5%)；均值为折均值，非聚合 | LV21 |
-| `20261107_210715_baseline6` | `02_cfsb_baseline` | Chan Four-State Blend Strategy | CAGR: 25.30% / Sharpe: 1.1516 / MaxDD: 4.68% | 18 折基线；`regime_ic_ir_hybrid` 钉值保留，M1.1 双闸门 OFF | LV21 |
+| `20261107_210715_baseline6` | `02_cfsb_baseline` | Chan Four-State Risk-Managed Blend Strategy | CAGR: 25.30% / Sharpe: 1.1516 / MaxDD: 4.68% | 18 折基线；`regime_ic_ir_hybrid` 钉值保留，M1.1 双闸门 OFF | LV21 |
 | `20261107_210715_baseline6` | `03_cfssb_baseline` | Chan Four-State Shield Blend Strategy | CAGR: 23.49% / Sharpe: 1.1049 / MaxDD: 4.51% | 18 折基线 | LV21 |
 | `20261107_210715_baseline6` | `04_ccsb_baseline` | Chan Crisis Shield Blend Strategy | CAGR: 20.77% / Sharpe: 1.2044 / MaxDD: 4.32% | 18 折基线 | LV21 |
 | `20261107_210715_baseline6` | `05_cdhb_baseline` | Chan Dual Hybrid Blend Strategy | CAGR: 24.89% / Sharpe: 0.9771 / MaxDD: 4.58% | 18 折基线 | LV21 |
