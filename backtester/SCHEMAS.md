@@ -98,8 +98,8 @@ Columns:
 - `prior_shares` (`float`): Whole shares held before rebalance.
 - `target_shares` (`float`): Target whole shares held after rebalance (`prior_shares +/- shares`).
 - `commission` (`float`): Commission cost incurred (`trade_value * commission_pct`).
-- `slippage` (`float`): Slippage cost incurred (`trade_value * slippage_pct`).
-- `total_cost` (`float`): Total transaction cost (`commission + slippage`).
+- `slippage` (`float`): Slippage cost incurred (`trade_value * slippage_pct + market_impact`), i.e. the price concession plus the market-impact term.
+- `total_cost` (`float`): Total transaction cost (`commission + slippage + stamp`). `stamp` is the sell-side stamp duty (5 bps default), dual-sided HK stamp duty (0.1085%), or the US SEC fee, depending on the market.
 - `portfolio_equity` (`float`): Pre-rebalance portfolio equity before deducting turnover costs.
 
 ### `results/walkforward_report.csv` (`--mode walkforward`)
@@ -107,7 +107,8 @@ Columns:
 One row per rolling fold. Columns: `start_date`, `end_date` (str, `YYYY-MM-DD`), `sharpe_ratio`,
 `cagr`, `max_drawdown`, `calmar_ratio`, `win_rate`, `profit_factor` (all `float`, `NaN` for a fold
 where the template produced empty weights or an empty equity curve), `total_turnover` (`float`,
-`0.0` on a `NaN` fold), `total_rebalances` (`int`, `0` on a `NaN` fold).
+**two-way** cumulative traded notional (buys + sells) divided by pre-rebalance equity, including the
+day-0 initial build; `0.0` on a `NaN` fold), `total_rebalances` (`int`, `0` on a `NaN` fold).
 
 When `--baseline-symbol` is set, 5 extra columns are appended: `baseline_sharpe_ratio`,
 `baseline_cagr`, `baseline_max_drawdown`, `baseline_calmar_ratio` (the baseline run's per-fold

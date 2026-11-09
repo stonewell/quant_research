@@ -50,13 +50,13 @@ Schema 归属于 `strategy_generator` 并由其记录——参阅 `../pipeline/s
 - `prior_shares` (`float`): 再平衡前持有的整股数。
 - `target_shares` (`float`): 再平衡后持有的目标整股数 (`prior_shares +/- shares`)。
 - `commission` (`float`): 产生的佣金费用 (`trade_value * commission_pct`)。
-- `slippage` (`float`): 产生的滑点成本 (`trade_value * slippage_pct`)。
-- `total_cost` (`float`): 总交易摩擦成本 (`commission + slippage`)。
+- `slippage` (`float`): 产生的滑点成本 (`trade_value * slippage_pct + market_impact`)，即价格让价与市场冲击之和。
+- `total_cost` (`float`): 总交易摩擦成本 (`commission + slippage + stamp`)。其中 `stamp` 为卖出侧印花税（默认 5bp）、港股双边印花税（0.1085%）或美股 SEC 费，视市场而定。
 - `portfolio_equity` (`float`): 扣除交易摩擦前的再平衡前组合权益。
 
 ### `results/walkforward_report.csv` (`--mode walkforward`)
 
-每个滚动窗口一行。列：`start_date`、`end_date`（字符串，`YYYY-MM-DD`）、`sharpe_ratio`、`cagr`、`max_drawdown`、`calmar_ratio`、`win_rate`、`profit_factor`（均为 `float`，若模板生成了空权重或空权益曲线则为 `NaN`）、`total_turnover`（`float`，`NaN` 窗口上为 `0.0`）、`total_rebalances`（`int`，`NaN` 窗口上为 `0`）。
+每个滚动窗口一行。列：`start_date`、`end_date`（字符串，`YYYY-MM-DD`）、`sharpe_ratio`、`cagr`、`max_drawdown`、`calmar_ratio`、`win_rate`、`profit_factor`（均为 `float`，若模板生成了空权重或空权益曲线则为 `NaN`）、`total_turnover`（`float`，**双边**累计成交名义额（买入+卖出）除以再平衡前权益，含 Day-0 初始建仓；`NaN` 窗口上为 `0.0`）、`total_rebalances`（`int`，`NaN` 窗口上为 `0`）。
 
 当设置了 `--baseline-symbol` 时，附加 5 个额外列：`baseline_sharpe_ratio`、`baseline_cagr`、`baseline_max_drawdown`、`baseline_calmar_ratio`（基准运行同名的逐窗口指标）与 `outperformance`（`cagr - baseline_cagr`）。这些列通过 **`(start_date, end_date)` 而非行位置** 连接到策略的窗口行上——策略与基准的窗口列表来自独立加载的日历和位置计算，因此不保证逐行对应。在 `(start_date, end_date)` 上没有匹配基准窗口的策略窗口将在所有 5 列中获得 `NaN`，而非被丢弃。
 
