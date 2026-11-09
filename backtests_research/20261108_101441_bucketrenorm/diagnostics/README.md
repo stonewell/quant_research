@@ -8,23 +8,25 @@
 
 | 文件名 | 类型 | 行数 | 大小 | MD5 校验码 | 描述说明 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `run_bt_debug.py` | 运行脚本 | 13 | 317 B | `b14a8261f8d7bd718f957d2559d60870` | DEBUG 级别启动包装脚本，配置 `logging.basicConfig(level=DEBUG)` 后通过 `runpy.run_path` 运行 `backtester/run_backtest.py` |
+| `_provenance/run_bt_debug.py` | 运行脚本 | 13 | 317 B | `b14a8261f8d7bd718f957d2559d60870` | DEBUG 级别启动包装脚本，配置 `logging.basicConfig(level=DEBUG)` 后通过 `runpy.run_path` 运行 `backtester/run_backtest.py` |
 | `diag_a00_base_015.log` | 诊断日志 | 6,436 | 1.4 MB | `e5df099ca750bf0900192ba845b031c7` | 基线臂 `a00`（`blend_bucket_renorm_max_delta=0.15`）Standard 模式 DEBUG 运行日志 |
 | `diag_a01_none.log` | 诊断日志 | 5,011 | 1.1 MB | `342572f79cdeb207fcdc12489f0d0963` | 无钳位臂 `a01`（`blend_bucket_renorm_max_delta=null`）Standard 模式 DEBUG 运行日志 |
 | `diag_a02_030.log` | 诊断日志 | 6,436 | 1.4 MB | `090cd04d51ee417379294f941983013c` | 放宽钳位臂 `a02`（`blend_bucket_renorm_max_delta=0.30`）Standard 模式 DEBUG 运行日志 |
 | `diag_a03_060.log` | 诊断日志 | 6,436 | 1.4 MB | `dcdea9fe71d907d8eae0b2c3b4cd2a2b` | 宽松钳位臂 `a03`（`blend_bucket_renorm_max_delta=0.60`）Standard 模式 DEBUG 运行日志 |
-| `verify_a00_diag.py` | 验证脚本 | 48 | 2.0 KB | `cee9e4fcf567821d47df75830ee3bfde` | 提取 `a00` 中 pre-renorm 与 delta-clamped 差异，复核滞后条数（lag bars）与最大 L1 距离 |
-| `verify_flip_stable.py` | 验证脚本 | 207 | 7.7 KB | `30f13114c7a456e5c6fbacbc53e22bfc` | 全四臂机制比对脚本：复核翻转点稳定性、滞后 bars、L1 距离分布及各臂钳位触发状态 |
+| `_provenance/verify_a00_diag.py` | 验证脚本 | 48 | 2.0 KB | `cee9e4fcf567821d47df75830ee3bfde` | 提取 `a00` 中 pre-renorm 与 delta-clamped 差异，复核滞后条数（lag bars）与最大 L1 距离 |
+| `_provenance/verify_flip_stable.py` | 验证脚本 | 207 | 7.7 KB | `30f13114c7a456e5c6fbacbc53e22bfc` | 全四臂机制比对脚本：复核翻转点稳定性、滞后 bars、L1 距离分布及各臂钳位触发状态 |
+
+> 脚本位于 `_provenance/` 以便纳入版本控制（`.gitignore` 只白名单 `**/_provenance/**`），日志与四臂产物仍不入库。
 
 ---
 
 ## 2. 诊断运行命令（Standard Mode）
 
-四臂诊断运行均使用标准单段回测模式（Standard Mode），调用 `run_bt_debug.py` 包装器。运行命令如下：
+四臂诊断运行均使用标准单段回测模式（Standard Mode），调用 `_provenance/run_bt_debug.py` 包装器。运行命令如下：
 
 ```bash
 # 通用参数模板
-python run_bt_debug.py \
+python _provenance/run_bt_debug.py \
   --strategy-file ../strategies/chan_four_state_blend_strategy.json \
   --universe-file ../universe_20_stocks.txt \
   --start 2022-01-04 \
@@ -79,7 +81,7 @@ DEBUG 日志中包含以下关键格式输出，对应 [`pipeline/research/blend
 
 ## 5. 机制指标复算与核心结论
 
-通过 `verify_a00_diag.py` 与 `verify_flip_stable.py` 复算的代表性指标：
+通过 `_provenance/verify_a00_diag.py` 与 `_provenance/verify_flip_stable.py` 复算的代表性指标：
 - **`a00_base_015` 滞后表现**：
   - 正式回测区间（1161 bars）中，存在 **100 lag bars**（即钳位后权重与 pre-renorm 目标权重产生实质偏移）；
   - 全样本最大 L1 距离为 **1.471242**（出现在 2021-02-18 预热期）。
