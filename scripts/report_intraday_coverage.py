@@ -19,12 +19,19 @@ READ-ONLY GUARANTEES
 * A missing DB file is reported, never created (`DuckDBCache` would `makedirs` + `_init_tables`).
 * No network, no downloader, no provider object -- just `SELECT`s.
 
-WHY THE DEFAULT WINDOW IS 2026-01-05 .. 2026-11-05
+WHY THE DEFAULT WINDOW IS 2026-10-19 .. 2026-11-05
 -------------------------------------------------
-That is the window `M3.11` registered from the `M3.4` snapshot ("起点 2026-01-05、共 18,048
-根"). Defaulting to it means the bare command answers the only question that matters:
-*does the current cache still support the window we registered?* -- rather than a
-self-fulfilling "does the cache cover itself". Pass `--start/--end` for another window.
+The `2026-11-08` user ruling re-baselined the 5m table to the post-`M3.8` caliber (see
+`docs/intraday_5m_coverage.md`): current coverage is `34,944` rows / 28 symbols / from
+`2026-09-16`, and `511880.SH` 5m spans `2026-10-19 09:35 ~ 2026-11-05 15:00` (14 sessions,
+672 bars, single BaoStock provider). Defaulting to that span means the bare command answers
+the only question that matters *under the current caliber*: does the cache support the window
+we now claim? -- rather than a self-fulfilling "does the cache cover itself", and rather than
+re-failing forever against the retired `2026-01-05` window.
+
+The OLD caliber is still reproducible on demand -- `--start 2026-01-05 --end 2026-11-05`
+reports `coverage FAIL` (14/219 weekdays = 6.4%) and exits `1`, which is the historical
+verdict preserved in the doc. Nothing about the checks themselves changed.
 """
 
 from __future__ import annotations
@@ -53,11 +60,22 @@ from common.intraday_coverage import (
 
 _READ_COLUMNS = "provider, symbol, interval, ts, open, high, low, close, volume, amount"
 
-#: `M3.11` registered this window from the `M3.4` project snapshot; see module docstring.
-DEFAULT_START = "2026-01-05"
+#: New caliber (post-`M3.8`) target window, fixed by the 2026-11-08 user ruling: the 5m table
+#: was re-baselined to `34,944 行 / 28 只 / 2026-09-16 起` and `511880.SH` now spans
+#: `2026-10-19 09:35 ~ 2026-11-05 15:00` (14 sessions / 672 bars). See
+#: `docs/intraday_5m_coverage.md` and `docs/development_plan.md` `M3.11`.
+#: The retired window (`2026-01-05 ~ 2026-11-05`, the `M3.4` snapshot) stays reproducible via
+#: `--start 2026-01-05`; it is deliberately NOT the default any more.
+DEFAULT_START = "2026-10-19"
 DEFAULT_END = "2026-11-05"
 DEFAULT_SYMBOL = "511880.SH"
 DEFAULT_PEER = "000001.SH"
+
+#: Exit-code contract: `0` only when every verdict is `pass`; `1` when any is
+#: `fail`/`insufficient`; `2` is reserved for usage / IO problems (missing DB, unknown symbol).
+EXIT_ALL_PASS = 0
+EXIT_NOT_ALL_PASS = 1
+EXIT_USAGE_OR_IO = 2
 
 
 def _connect(db_path: str) -> duckdb.DuckDBPyConnection:
@@ -110,7 +128,12 @@ def _verdict(report) -> str:
     return {"pass": "PASS", "fail": "FAIL"}.get(report.status, "INSUFFICIENT")
 
 
-def main(argv=None) -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
+    """The CLI surface, split out so tests can pin defaults without touching DuckDB.
+
+    Side-effect free by construction: building the parser opens no connection, stats no path
+    and reads no environment variable.
+    """
     ap = argparse.ArgumentParser(
         description="Read-only 5m coverage / completeness / comparability report (M3.11)."
     )
@@ -126,7 +149,20 @@ def main(argv=None) -> int:
                     help="minimum shared-bar ratio over the overlap")
     ap.add_argument("--bars-per-session", type=int, default=BARS_PER_SESSION_5M)
     ap.add_argument("--json", action="store_true", help="print the three reports as JSON")
-    args = ap.parse_args(argv)
+    return ap
+
+
+def exit_code_for_statuses(statuses) -> int:
+    """Pure mapping from the check verdicts to the process exit code.
+
+    `0` only when *every* verdict is `pass`; `1` as soon as one is `fail`/`insufficient`.
+    `2` is never produced here -- execution errors return it directly in `main()`.
+    """
+    return EXIT_ALL_PASS if all(s == STATUS_PASS for s in statuses) else EXIT_NOT_ALL_PASS
+
+
+def main(argv=None) -> int:
+    args = build_arg_parser().parse_args(argv)
 
     start = pd.to_datetime(args.start).date()
     end = pd.to_datetime(args.end).date()
@@ -135,14 +171,14 @@ def main(argv=None) -> int:
         con = _connect(args.db)
     except (FileNotFoundError, OSError, duckdb.Error) as exc:
         print(f"[ERROR] cannot open cache read-only: {exc}", file=sys.stderr)
-        return 2
+        return EXIT_USAGE_OR_IO
 
     try:
         providers = _providers(con, args.symbol, args.interval)
         if not providers:
             print(f"[ERROR] no {args.interval} rows for {args.symbol} in {args.db}",
                   file=sys.stderr)
-            return 2
+            return EXIT_USAGE_OR_IO
         used_provider, used_rows = providers[0]
         frame = _frame(con, args.symbol, args.interval, used_provider)
 
@@ -224,7 +260,7 @@ def main(argv=None) -> int:
     statuses = [coverage.status, completeness.status]
     if comparability is not None:
         statuses.append(comparability.status)
-    return 0 if all(s == STATUS_PASS for s in statuses) else 1
+    return exit_code_for_statuses(statuses)
 
 
 if __name__ == "__main__":

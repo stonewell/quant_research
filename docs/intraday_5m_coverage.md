@@ -4,7 +4,7 @@
 > **任务出处**：`docs/development_plan.md` §2.15 `M3.11`（由 `M3.4` 第 4 条拆出，2026-11-01 立项，档位 Tier P2）。
 > **测量时间**：**2026-11-08**（本机时区，`data/cache.duckdb` mtime `2026-11-05 20:23`）。
 > **解释器**：`pipeline/.venv/bin/python`；全部连接恒为 `duckdb.connect("<path>", read_only=True)`，本轮**未写入、未下载、未联网**。
-> **代码落点**：判据实现 `common/intraday_coverage.py`（纯函数、零 IO）；只读 CLI `scripts/report_intraday_coverage.py`；离线单测 `pipeline/tests/test_intraday_coverage.py`。
+> **代码落点**：判据实现 `common/intraday_coverage.py`（纯函数、零 IO）；只读 CLI `scripts/report_intraday_coverage.py`；离线单测 `pipeline/tests/test_intraday_coverage.py`（判据）+ `pipeline/tests/test_report_intraday_coverage_cli.py`（CLI 默认窗口与退出码契约）。
 
 ## 0. 一句话结论
 
@@ -113,8 +113,8 @@ symbol,interval,provider,start_ts,end_ts,sessions,bar_count,bars_per_session,amo
 
 ```bash
 cd /home/stone/Work/github/quant
-pipeline/.venv/bin/python scripts/report_intraday_coverage.py            # 默认 511880.SH / 2026-01-05~2026-11-05
-echo "exit=$?"                                                          # 0 仅当三问全 PASS；本机当前为 1
+pipeline/.venv/bin/python scripts/report_intraday_coverage.py            # 默认 511880.SH / 2026-10-19~2026-11-05（新口径）
+echo "exit=$?"                                                          # 0 仅当三问全 PASS；新口径下本机当前为 0
 ```
 
 变体：
@@ -125,7 +125,7 @@ pipeline/.venv/bin/python scripts/report_intraday_coverage.py --symbol 601288.SH
 pipeline/.venv/bin/python scripts/report_intraday_coverage.py --json > /tmp/opencode/m311_coverage.json
 ```
 
-- 默认窗口之所以是 `2026-01-05 ~ 2026-11-05`（而非「现有一切」）：裸跑必须回答「**我们还撑不撑得起登记的那个窗口**」，否则就退化成「缓存覆盖它自己」的恒真检查。
+- 默认窗口之所以是 `2026-10-19 ~ 2026-11-05`（2026-11-08 重新基线化后的**新口径**，而非「现有一切」，也不再是旧口径 `2026-01-05`）：裸跑必须回答「**我们还撑不撑得起登记的那个窗口**」，否则就退化成「缓存覆盖它自己」的恒真检查。旧口径窗口用 `--start 2026-01-05` 复现（该窗口下覆盖仍为 `FAIL 6.4%`、`exit 1`，属历史判定、不改写）。
 - 脚本**只读**：`duckdb.connect(..., read_only=True)`，无 `ATTACH`/建表/`CHECKPOINT`/`EXPORT`；库文件缺失时**报错退出码 2，绝不创建**（`DuckDBCache` 会 `makedirs` + `_init_tables`，脚本刻意不用它）。
 
 离线单测：
@@ -171,7 +171,7 @@ cd /home/stone/Work/github/quant/pipeline && ../pipeline/.venv/bin/python -m pyt
 
 即 **5m 历史整体回退约 3.7 年**，不止现金替代腿。若这是 `M3.8` raw 重下的既定后果，应登记为「新口径」；若非预期，则为数据丢失事件，优先级高于本行。
 
-**（2026-11-08 用户裁决）**：该回退系 `M3.8` raw 重下的**既定后果**，登记为**新口径** —— 现行 5m 覆盖即 **34,944 行 / 28 只 / 2026-09-16 起**（其中 7 只指数为双 provider 重复，占 20,832 行）；**不视为数据丢失、不排回补**。历史覆盖（2022-01-04 起）仅存于迁移前备份库 `data/cache.backup-20261027-pre-m38raw.duckdb`，**不参与现行标定/回测**。据此，`M3.11` 原三问判据中的「覆盖比例」在**新口径**下的分母应为 `2026-10-19 ~ 2026-11-05`（14 个交易日），该区间覆盖为 **100%**；而按**旧口径目标窗口**（`2026-01-05~2026-11-05`）判得的 `FAIL 6.4%` 仍作为历史判定保留、不改写。已知遗留（不改代码，仅登记）：`scripts/report_intraday_coverage.py` 的默认目标窗口仍固定为旧口径，重新基线化属可选后续。
+**（2026-11-08 用户裁决）**：该回退系 `M3.8` raw 重下的**既定后果**，登记为**新口径** —— 现行 5m 覆盖即 **34,944 行 / 28 只 / 2026-09-16 起**（其中 7 只指数为双 provider 重复，占 20,832 行）；**不视为数据丢失、不排回补**。历史覆盖（2022-01-04 起）仅存于迁移前备份库 `data/cache.backup-20261027-pre-m38raw.duckdb`，**不参与现行标定/回测**。据此，`M3.11` 原三问判据中的「覆盖比例」在**新口径**下的分母应为 `2026-10-19 ~ 2026-11-05`（14 个交易日），该区间覆盖为 **100%**；而按**旧口径目标窗口**（`2026-01-05~2026-11-05`）判得的 `FAIL 6.4%` 仍作为历史判定保留、不改写。（2026-11-08 后续）已知遗留已闭环：`scripts/report_intraday_coverage.py` 的默认目标窗口已重新基线化为新口径 `2026-10-19 ~ 2026-11-05`，裸跑三问判据应为 PASS、`exit 0`；旧口径窗口仍可用 `--start 2026-01-05` 复现。
 
 ## 7. 诚实声明（范围边界，逐条可核）
 
