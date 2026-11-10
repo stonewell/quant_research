@@ -3585,7 +3585,11 @@ def test_empty_book_and_edited_gates_are_independent(temp_storage, tmp_path, mon
     assert calls == []
 
     # (b) An EMPTY book (confirmed) on a date with no completed round needs no `edited`.
-    empty_date = "2026-10-31"
+    # 2026-11-02 (a Monday) rather than the old 2026-10-31: since the 2026-11-08/184755
+    # incident `run_live_deploy` refuses a pinned NON-trading as-of before any side effect
+    # (2026-10-31 is a Saturday), and this test's subject is gate independence, not the
+    # calendar gate.
+    empty_date = "2026-11-02"
     res = service.run_live_deploy(
         **_deploy_kwargs(
             tmp_path,

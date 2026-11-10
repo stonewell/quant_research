@@ -1653,6 +1653,63 @@ class ExecutionService:
             now=now,
         )
 
+    def _assert_explicit_as_of_is_trading_session(
+        self,
+        valuation_date: str,
+        universe_file: Optional[str] = None,
+        custom_symbols: Optional[List[str]] = None,
+    ) -> None:
+        """Refuse a pinned `--as-of-date` that is not a trading session BEFORE any write.
+
+        INCIDENT (2026-11-08/184755).  An explicit `--as-of-date 2026-11-08` (a Sunday)
+        was only validated by the Stage-1 CHILD (`common/cli_utils.py::
+        resolve_live_clock_context`), i.e. after the web layer had already allocated
+        `<date>/<HHMMSS>/` and seeded it from `latest_account_state_at_or_before`.  The
+        refusal therefore left an orphan instance behind: a copied 11-05 book
+        (`base_version=1.8.0`) plus a `health_status: "FAILED"` summary, which then
+        outranked the healthy 11-06 dirs as the next Stage-2 seed.  Checking the calendar
+        HERE keeps a mis-typed / holiday as-of from touching the archive at all.
+
+        Callers invoke this ONLY for an operator-pinned as-of: the resolved
+        (`market_clock`) date is a trading session by construction, and re-checking it
+        would add a second, drifting definition of "trading day".  The check itself is
+        offline (the holiday tables are local; `market_now` reads the host clock only for
+        the `calendar=<status>` label) and it does not decide order semantics: it refuses
+        the RUN, it never "fixes" the date.
+
+        The market is inferred exactly like `_clock_observability` (the ONE owner of
+        market inference, `StorageManager.market_clock_markets`, with China as the
+        workspace default when nothing votes).  An uncovered calendar year raises
+        `HolidayCalendarCoverageError` (a `ValueError`) rather than guessing "open".
+        """
+        try:
+            parsed = datetime.strptime(str(valuation_date).strip(), "%Y-%m-%d").date()
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"--as-of-date 必须是 YYYY-MM-DD，收到 {valuation_date!r}: {exc}"
+            ) from exc
+        market_clock = _market_clock_module()
+        markets_fn = getattr(self.storage, "market_clock_markets", None)
+        symbols = self._symbols_for_valuation_clock(universe_file, custom_symbols)
+        markets = list(markets_fn(symbols=symbols) or []) if callable(markets_fn) else []
+        primary = markets[0] if markets else "china"
+        clock = market_clock.market_now(primary)
+        try:
+            is_trading = clock.is_trading_day(parsed)
+        except market_clock.HolidayCalendarCoverageError as exc:
+            raise ValueError(
+                f"--as-of-date {parsed.isoformat()} 的 {primary} 节假日历不可用"
+                f"（calendar={clock.calendar_status()}）：{exc}。"
+                "日历未知不等于开市，估值日必须是交易日；请先补齐节假日历再运行。"
+            ) from exc
+        if not is_trading:
+            raise ValueError(
+                f"--as-of-date {parsed.isoformat()} 不是 {primary} 的交易日"
+                f"（calendar={clock.calendar_status()}）。估值日必须是交易日；"
+                "休市日请使用其前一个交易日。"
+                "（本轮在创建任何 run 目录 / 播种 account_state 之前即已拒绝，归档未被改动。）"
+            )
+
     # -- (L2.4) archive key + §9 observability -- #
     @staticmethod
     def _assert_archive_keyed_by(run_dir: str, valuation_date: str) -> None:
@@ -2491,6 +2548,13 @@ class ExecutionService:
         val_date = as_of_date or self._market_clock_val_date(universe_file, custom_symbols)
         explicit_as_of = as_of_date or None
         as_of_source = "explicit" if explicit_as_of else "market_clock"
+        # (2026-11-08/184755 incident) A pinned as-of that is not a trading session is
+        # refused HERE, before `get_run_dir` / `_allocate_stage1_run_dir` /
+        # `os.makedirs` / the account-state seed below can leave an orphan instance.
+        if explicit_as_of:
+            self._assert_explicit_as_of_is_trading_session(
+                val_date, universe_file, custom_symbols
+            )
         base_dir = self.storage.get_run_dir(strat_key, univ_key, val_date, prefer_existing=True)
         # (L2.4) The archive KEY is the valuation session; asserting it here keeps
         # run_dir and summary.json['date'] from ever drifting apart.
@@ -3126,6 +3190,12 @@ class ExecutionService:
         val_date = as_of_date or self._market_clock_val_date(universe_file, custom_symbols)
         explicit_as_of = as_of_date or None
         as_of_source = "explicit" if explicit_as_of else "market_clock"
+        # (2026-11-08/184755 incident) Same fail-before-side-effects rule as
+        # `run_health_check`: a pinned non-trading as-of must not reach `get_run_dir`.
+        if explicit_as_of:
+            self._assert_explicit_as_of_is_trading_session(
+                val_date, universe_file, custom_symbols
+            )
         base_dir = self.storage.get_run_dir(strat_key, univ_key, val_date, prefer_existing=True)
         # (L2.4) Archive key == valuation session (never the host's `date.today()`).
         self._assert_archive_keyed_by(base_dir, val_date)

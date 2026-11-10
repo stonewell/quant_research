@@ -1146,6 +1146,66 @@ def list_instances_for_date(date_dir: Optional[str]) -> List[str]:
     return out
 
 
+#: Summary keys a Stage-1 round writes ONLY when it refused/failed.
+_INSTANCE_FAILURE_SUMMARY_KEYS: Tuple[str, ...] = ("error_kind", "error_headline")
+
+
+def _instance_state_is_trustworthy(instance_dir: Optional[str]) -> bool:
+    """Whether a run dir's `account_state.json` may be used as a cross-day seed.
+
+    INCIDENT (2026-11-08/184755).  `--as-of-date 2026-11-08` (a Sunday) was rejected by
+    the Stage-1 child's market-clock gate, but the web layer had ALREADY allocated
+    `2026-11-08/184755/` and copied the newest at-or-before state into it
+    (`base_version=1.8.0`, an 11-05 book) before launching that child.  The instance then
+    carried a *failed* round's `summary.json` plus a plausible-looking state file, and
+    `latest_account_state_at_or_before` -- which used to walk dates/instances newest-first
+    and return the first EXISTING `account_state.json` -- handed that orphan to Stage 2
+    ahead of the 11-06 dirs holding the real `2.0.0` book.  Stage 2 refused with
+    `LiveDumpPreflightError` (1.8.0 vs 2.0.0).
+
+    This predicate answers one question only: **did this round complete a healthy
+    Stage 1?**  A directory that never ran (no `summary.json`, i.e. a legacy archive) or
+    that ran Stage 1 successfully is accepted; a directory whose summary records a
+    non-`SUCCESS` health status, or a refusal (`error_kind` / `error_headline`) without a
+    health status at all, is skipped as a seed source.
+
+    NOT a version check and NOT a substitution for one: WHICH instance is seeded changes
+    here, the version stamping does not.  The fail-closed parity contract stays in
+    `scripts/live_preflight.py::assert_account_state_version_parity` (untouched) -- a
+    wrong-version state that somehow reaches Stage 2 still refuses.
+
+    Deliberately tolerant where the summary cannot answer: a missing / unparseable /
+    non-object `summary.json` is treated as "no verdict recorded" (legacy behaviour),
+    never as a failure, so old archives keep seeding and a half-written summary cannot
+    silently break the carry-forward chain.
+
+    `deploy_status` is intentionally IGNORED: a healthy Stage-1 round whose Stage 2
+    attempt failed still owns the lifecycle/streak state that the next round must
+    continue from.
+    """
+    if not instance_dir:
+        return True
+    summary_path = os.path.join(str(instance_dir), "summary.json")
+    if not os.path.exists(summary_path):
+        return True
+    try:
+        with open(summary_path, "r", encoding="utf-8") as f:
+            summary = json.load(f)
+    except (OSError, ValueError):
+        return True
+    if not isinstance(summary, dict):
+        return True
+
+    status = summary.get("health_status")
+    if status is not None and str(status).strip():
+        return str(status).strip().upper() == "SUCCESS"
+    for key in _INSTANCE_FAILURE_SUMMARY_KEYS:
+        value = summary.get(key)
+        if value is not None and str(value).strip():
+            return False
+    return True
+
+
 def has_stage2_artifact(path: Optional[str]) -> bool:
     """True when a run dir carries a Stage-2 order artifact (evidence Stage 2 ran).
 
@@ -2763,6 +2823,17 @@ class StorageManager:
         ordered instance walk means the seed can only ever be the LAST resort, never the
         winner.  Legacy flat-only archives are untouched (the walk returns just the flat
         dir when there are no instance subdirs).
+
+        (2026-11-08/184755 incident) "Newest existing `account_state.json`" is NOT the
+        same thing as "newest state a completed round produced".  A rejected explicit
+        as-of left an orphan instance holding a copied 11-05 book plus
+        `health_status: "FAILED"`, and it outranked the older healthy dirs.  Both the
+        per-instance walk and the legacy/flat branch therefore require
+        `_instance_state_is_trustworthy` before a state file may be seeded.  That filter
+        changes WHICH instance is seeded, never how the state is version-stamped: the
+        fail-closed parity contract (`scripts/live_preflight.py::
+        assert_account_state_version_parity`) is untouched and still refuses a
+        wrong-version state at Stage 2.
         """
         target = validate_date_str(date_str)
         if not target or not strategy_key or not universe_key:
@@ -2777,6 +2848,8 @@ class StorageManager:
             if not path:
                 continue
             if not prefer_instance:
+                if not _instance_state_is_trustworthy(path):
+                    continue
                 state = self._load_json(os.path.join(path, "account_state.json"))
                 if state:
                     return state
@@ -2788,14 +2861,17 @@ class StorageManager:
             visited_dates.add(key)
             base_dir = os.path.dirname(path) if is_instance_dir_name(os.path.basename(path)) else path
             for instance_dir in reversed(list_instances_for_date(base_dir) or [path]):
+                if not _instance_state_is_trustworthy(instance_dir):
+                    continue
                 state = self._load_json(os.path.join(instance_dir, "account_state.json"))
                 if state:
                     return state
             # `base_dir` may be a bare container (`is_run_dir` false) for a matrix-run
             # subdirectory: read that run dir itself rather than giving up on the date.
-            state = self._load_json(os.path.join(path, "account_state.json"))
-            if state:
-                return state
+            if _instance_state_is_trustworthy(path):
+                state = self._load_json(os.path.join(path, "account_state.json"))
+                if state:
+                    return state
         return None
 
     # --------------------------------------------------------------------------

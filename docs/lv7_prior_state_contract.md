@@ -139,6 +139,25 @@
 
 `scripts/live_preflight.py` 已经是三条实盘入口**共用的**"出票前体检"模块，异常类型已在 `main()` 中抛出并被调用方认知。版本不一致与权重模式漂移属于**同一类**失败（"今晚这张票读的不是我以为的那台引擎"），因此复用同一异常类型，而不是新增第二个近义异常。该校验**不可**被 `--allow-weighting-mode-override` 放行 —— 那个逃生口只覆盖权重模式钉住值，不覆盖版本轴。
 
+### 5.6 2026-11-09 孤儿种子事件与两处新增护栏（实现记录）
+
+**现象**：2026-11-09 首跑 Stage 2 以 `base_version` `1.8.0` vs 活类 `2.0.0` 拒绝出票（`LiveDumpPreflightError`）。引擎行为正确，问题在"它读到的是哪一份账本"。
+
+**根因一（孤儿实例）**：`web/livetrading/execution_service.py::run_health_check` 在启动 Stage-1 子进程**之前**就已分配 `<date>/<HHMMSS>/` 并把 `latest_account_state_at_or_before` 的结果拷贝成 `<run_dir>/account_state.json`；而显式 `--as-of-date 2026-11-08`（周日，非交易日）只由子进程的 `common/cli_utils.resolve_live_clock_context` 拒绝。于是留下 `2026-11-08/184755/`：一份 11-05 的账本（`base_version=1.8.0`）加一份 `health_status: "FAILED"` 的 `summary.json`。
+
+**根因二（选种只看目录新旧）**：`web/livetrading/storage.py::latest_account_state_at_or_before` 只按"日期降序 → 当日实例降序 → 第一份存在且非空的 `account_state.json`"返回，既不校验实例是否跑成，也不校验状态自身的 `as_of_date`。该孤儿（11-08）因此压过持有正确 `2.0.0` 账本的 11-06 目录，§5.4 第 2 条的一次手工修正被架空——"只更新一次"只在修正对象恰好是下一次被选中的种子时成立。
+
+**修改（不含任何版本轴改动）**：
+
+1. `web/livetrading/execution_service.py::_assert_explicit_as_of_is_trading_session`：仅在操作者显式指定 as-of 时校验其是否为交易日；在 `run_health_check` 与 `run_live_deploy` 中均于 `get_run_dir` / `_allocate_stage1_run_dir` / `os.makedirs` / 账本播种**之前**调用，拒绝时归档不被改动。
+2. `web/livetrading/storage.py::_instance_state_is_trustworthy`：`latest_account_state_at_or_before` 跳过 `health_status` 存在且非 `SUCCESS`、或仅有 `error_kind` / `error_headline` 的实例。无 `summary.json` 的旧归档照常作种子；`health_status: "SUCCESS"` 而 `deploy_status: "FAILED"` 的实例照常作种子（该轮仍拥有需要延续的生命周期状态）。
+
+**不变式**：本改动只改变"哪一份实例被选作种子"，不改变版本盖章。§5.4 的 fail-closed 契约、`assert_account_state_version_parity` 与 `assert_dump_version_parity` 均未改动；错版本账本若仍到达 Stage 2，依旧拒绝出票。
+
+**残留缺口**：`run_multi_strategy_netted_deploy` 尚未接入同一闸门（矩阵路径不参与按 `(strategy, universe)` 的前推链、不播种 `account_state.json`，故不构成同类版本风险，只会留下一个无效归档条目）；跨市场组合只校验主市场日历，次市场休市仍由子进程拒绝（孤儿由上面的过滤器兜住）。
+
+**验证**：`web/livetrading/tests/test_account_state_seed_selection.py`（11 条离线用例，含 AST 级顺序守卫与"本过滤不得引入版本比较"的结构守卫）；`cd web/livetrading && .venv/bin/python -m pytest tests -q` → 285 passed, 1 skipped.
+
 ## 6. 归档事实与订正原文（逐字引用）
 
 `LV7` 行的三处订正原文如下（引自 [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) `LV7` 行，**逐字**，不改写）：
