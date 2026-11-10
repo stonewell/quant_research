@@ -83,6 +83,12 @@ def _resolve_path(p: Optional[str]) -> Optional[str]:
     return p
 
 
+from common.advisory_report import (
+    ADVISORY_PHASE_P3,
+    _json_number,
+    build_advisory_block,
+    r1_decision_to_dict,
+)
 from common.data import get_data_provider
 from common.allocation_backtester import CASH_PROXY_SYMBOLS, _get_hk_board_lot
 from common.cli_utils import (
@@ -95,6 +101,8 @@ from common.cli_utils import (
     shared_data_dir,
 )
 from common.financial_api import check_missing_trading_days, get_trading_days_calendar
+from common.intraday_drawdown_derisk import evaluate_intraday_drawdown
+from common.r1_derisk_report import apply_r1_intraday_derisk
 from common.live_execution_timing import (
     build_ticket_payload,
     merge_timing_into_summary,
@@ -1226,6 +1234,17 @@ def parse_args(args: Optional[List[str]] = None):
         ),
     )
     parser.add_argument(
+        "--enforce-r1-derisk",
+        action="store_true",
+        help=(
+            "(AT7 P3) ENABLE the R1 intraday de-risk on the sizing path: buy increments are "
+            "multiplied by the R1 multiplier (real intraday_buy_scale x R1 multiplier, e.g. "
+            "0.50 x 0.25 = 0.125), sells and the cash leg untouched. "
+            "DEFAULT OFF = the shadow line only, so this cannot change an order unless "
+            "explicitly asked. Kill-switch: LIVETRADING_DISABLE_R1_DERISK=1."
+        ),
+    )
+    parser.add_argument(
         "--volume-breakout-mult",
         type=float,
         default=1.5,
@@ -1650,6 +1669,42 @@ def apply_intraday_distribution_gate(
     return scaled_target
 
 
+def compute_r1_advisory(health_report: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """(`AT7` **P2** shadow) The `R1` multiplier *as a diary entry* -- never a sizing input.
+
+    Reads the Stage-1 `intraday_5m_metrics` pair (`hwm_intra` / `dd_trough`) that
+    `scripts/check_live_portfolio_health.py` already writes, hands it to
+    `common.intraday_drawdown_derisk.evaluate_intraday_drawdown` (the SOLE owner of
+    the `-2 / -3 / -4 %` ladder and of the `1.0 / 0.75 / 0.50 / 0.25` multipliers --
+    none is re-declared here), and flattens the verdict with
+    `common.advisory_report.r1_decision_to_dict`.
+
+    Returns `None` when either reading is absent. `None` is the honest answer, not a
+    failure: `R1` itself returns `INSUFFICIENT_DATA` with `drawdown=None` for an
+    unmeasurable session, and this wrapper keeps that distinction one level up -- an
+    absent shadow line says "there was nothing to shadow", while a fabricated
+    multiplier of `1.0` (or a drawdown of `0.0`) would claim "measured, and it was
+    fine", which is a far stronger and false statement. Stage-1 writes explicit
+    `null`s on its SKIPPED path (`check_live_portfolio_health.py:2737-2738`), so this
+    branch is reachable in production, not just in tests.
+
+    `reference_price` is deliberately NOT passed: the self-consistency anchor is the
+    previous close / carried prior peak, and Stage-1 does not surface that anchor as
+    its own field (`hwm_intra` is already `max(carried peak, session peak)`), so the
+    guard cannot be evaluated from the report alone. Guessing an anchor would
+    manufacture a verdict; omitting it just leaves that one guard unevaluated.
+
+    Pure: no I/O, no mutation of the report, no module state -- callable twice with the
+    same dict and bit-identically repeatable (pinned by
+    `pipeline/tests/test_advisory_wiring.py`).
+    """
+    metrics = (health_report or {}).get("intraday_5m_metrics") or {}
+    hwm, dd = metrics.get("hwm_intra"), metrics.get("dd_trough")
+    if hwm is None or dd is None:
+        return None            # unmeasurable -> no shadow line; never fabricate 0/1
+    return r1_decision_to_dict(evaluate_intraday_drawdown(hwm_intra=hwm, dd_trough=dd))
+
+
 # --------------------------------------------------------------------------- #
 # (D6/D7, 2026-10-29 live incident) Delivery-time guards on the generated ticket
 # --------------------------------------------------------------------------- #
@@ -1678,6 +1733,8 @@ STALE_LOT_LIQUIDATION_BADGE = "STALE_LOT_LIQUIDATION"
 MV_CAP_BADGE = "MV_CAP"
 _DISABLE_STALE_LOT_ENV = "LIVETRADING_DISABLE_STALE_LOT_LIQUIDATION"
 _DISABLE_MV_CAP_ENV = "LIVETRADING_DISABLE_MV_CAP"
+#: (`AT7` P3) Kill-switch for the R1 intraday de-risk enforcement.
+_DISABLE_R1_DERISK_ENV = "LIVETRADING_DISABLE_R1_DERISK"
 #: Reason prefix for an emitted residual-lot sell (kept verbatim: operators grep it).
 STALE_LOT_REASON = "残仓强制清出（已离场标的仍有持股）"
 #: Default single-name delivery cap (mirrors the 20% model-side cap).
@@ -1710,6 +1767,51 @@ def mv_cap_enforcement_enabled(requested: Optional[bool] = None) -> bool:
     if _env_truthy(_DISABLE_MV_CAP_ENV):
         return False
     return bool(requested)
+
+
+def r1_derisk_enforcement_enabled(requested: Optional[bool] = None) -> bool:
+    """Whether the `R1` intraday de-risk may scale BUY increments (default OFF).
+
+    Third instance of the same two-gate shape (`AT7` P3, user-approved
+    2026-11-09), and the precedence is: **env kill-switch > CLI flag > OFF**.
+
+      * `LIVETRADING_DISABLE_R1_DERISK=1` wins over everything -- even over an
+        explicit `--enforce-r1-derisk`, so an operator can neutralise a persisted
+        invocation without editing it;
+      * otherwise the CLI request decides, and `None`/`False` both mean OFF.
+
+    Nothing else in the run reads this: the caller passes the boolean down to the
+    one sizing call site (`apply_r1_intraday_derisk`), there is no module state.
+    """
+    if _env_truthy(_DISABLE_R1_DERISK_ENV):
+        return False
+    return bool(requested)
+
+
+def resolve_r1_derisk_target(
+    target_series: pd.Series,
+    current_series: pd.Series,
+    cash_proxy: str,
+    *,
+    enforced: bool,
+    r1_multiplier: Optional[float],
+) -> Tuple[pd.Series, bool]:
+    """Return `(target_series_after, applied)` for the `AT7` P3 de-risk gate. Pure; no I/O.
+
+    The ONE place the enforcement predicate lives, so a wiring regression (wrong
+    flag, wrong series, dropped block) is testable instead of hidden inside
+    `main()`. `applied` is `False` -- and the caller's OWN object is returned
+    unchanged, not a copy -- unless enforcement was granted AND there is a real
+    de-risking multiplier (`< 1.0`); `>= 1.0`, `None` and a non-finite value are
+    all no-ops, exactly as in `common.r1_derisk_report.apply_r1_intraday_derisk`.
+    Multiplying by a missing multiplier is never "assume 1.0".
+    """
+    if not enforced or r1_multiplier is None or not float(r1_multiplier) < 1.0:
+        return target_series, False
+    return (
+        apply_r1_intraday_derisk(target_series, current_series, cash_proxy, r1_multiplier),
+        True,
+    )
 
 
 def assess_stale_input_lot(
@@ -2690,6 +2792,61 @@ def main(cli_args: Optional[List[str]] = None):
         account_state=account_state,
     )
 
+    # (`AT7` P2) SHADOW line, computed NEXT TO the real gate and read by it never.
+    # `r1_adv` is `None` when Stage-1 could not measure the intraday drawdown; in
+    # that case no shadow number is invented (see `compute_r1_advisory`).
+    r1_adv = compute_r1_advisory(health_report)
+    # The REAL buy-side scale: the SAME fallback chain `apply_intraday_distribution_gate`
+    # resolves inline (`health_report` -> `account_state` -> 0.50 default). Re-resolved
+    # here rather than refactored out of the gate ON PURPOSE -- P2 is write-only, so the
+    # sizing function above must stay byte-identical, and one extra read of two dicts
+    # cannot change an order. (Stage-1 only ever writes 0.50 on a positive distribution
+    # detection and mirrors 1.0 otherwise, so this value equals the scale the gate
+    # actually applies whenever the gate fires.)
+    real_intraday_buy_scale = float(
+        health_report.get("intraday_buy_scale", account_state.get("intraday_buy_scale", 0.50))
+    )
+    # (`AT7` P3) SCOPE OF `intraday_buy_scale`: it is Stage-1's *intraday
+    # distribution* brake and NOTHING else. `R4` (cross-sectional dispersion /
+    # market-level de-risk) is explicitly OUT OF SCOPE for this row -- there is no
+    # `R4` import here, no market-level de-risk is computed, and this scale must
+    # not be stretched to cover one. `R1` below is the ONLY thing that composes
+    # with it, and only on buy increments.
+    #
+    # (`AT7` P3) ENFORCEMENT of the frozen composition:
+    #     effective_buy_scale = real_buy_scale x r1.multiplier   (0.50 x 0.25 = 0.125)
+    # Two gates must both say yes (`r1_derisk_enforcement_enabled`: env kill-switch
+    # > `--enforce-r1-derisk` > OFF), so the default path is bit-identical to P2.
+    # `apply_r1_intraday_derisk` scales the float weights HERE -- upstream of lot
+    # rounding, of the purchasing-power rescale and of the delivered market-value
+    # cap -- so a de-risked target still flows through every existing rounding and
+    # validation gate instead of bypassing them. It runs AFTER
+    # `apply_intraday_distribution_gate`, which is what makes the composition
+    # multiplicative rather than a replacement.
+    r1_enforced = r1_derisk_enforcement_enabled(getattr(args, "enforce_r1_derisk", False))
+    r1_multiplier: Optional[float] = None
+    if r1_adv is not None and r1_adv.get("multiplier") is not None:
+        r1_multiplier = float(r1_adv["multiplier"])
+    # The whole predicate (flag AND real multiplier) lives in this pure helper; on
+    # the default OFF path it hands back the caller's own object, so nothing below
+    # can tell P3 from P2.
+    target_series, r1_applied = resolve_r1_derisk_target(
+        target_series,
+        current_series,
+        cash_proxy,
+        enforced=r1_enforced,
+        r1_multiplier=r1_multiplier,
+    )
+    if r1_applied:
+        effective_buy_scale = real_intraday_buy_scale * r1_multiplier
+        print("\n" + "!" * 110)
+        print(
+            f"[R1 INTRADAY DERISK / 日内回撤降险] status={r1_adv['status']} "
+            f"multiplier={r1_multiplier:.2f}; 买入增量按 实盘系数 {real_intraday_buy_scale:.2%} "
+            f"× R1 {r1_multiplier:.2f} = {effective_buy_scale:.2%} 压缩；卖单与现金不动。"
+        )
+        print("!" * 110 + "\n")
+
     # 5. Build Execution Order Plan
     # Compute implied cash weight: strategy outputs equity weights, remainder is cash
     equity_weight_sum = sum(float(target_series[s]) for s in target_series.index if s != cash_proxy)
@@ -2753,6 +2910,81 @@ def main(cli_args: Optional[List[str]] = None):
     updated_lifecycle_states: Dict[str, Any] = {}
     rows = []
     stale_price_symbols: List[str] = []
+    # (`AT7` P3) ONE portfolio-level advisory block per run, built OUTSIDE the
+    # per-symbol loop so every row carries the same object shape. This run is
+    # labelled `P3` and REPLACES the `P2` block -- one run is one phase, never
+    # two blocks. Honest empty inputs for the two dimensions that still have no
+    # live source: no cross-sectional score source exists in the live chain yet
+    # (`common/signal_snapshot.py:12-38`) and there is no executed-notional
+    # ledger, so the matrix renders INSUFFICIENT and both capacity labels render
+    # MISSING. `r1` / `real_buy_scale` / `shadow_buy_scale` keep the same shape as
+    # P2; `r1_effective` is flipped to `True` ONLY when the two-gate switch let
+    # `apply_r1_intraday_derisk` actually shrink a buy increment, and
+    # `effective_buy_scale` is added exactly then.
+    #
+    # `r1_effective` is (re)assigned here rather than passed to the builder: the
+    # builder is the frozen shared shape (`common/advisory_report.py`, owned by
+    # P1/P2) and it always renders the conservative `False`; only this caller
+    # knows whether an order was really resized.
+    advisory_block = build_advisory_block(
+        phase=ADVISORY_PHASE_P3,
+        leg_reports=(),
+        turnover=None,
+        participation=None,
+        as_of=as_of_date,
+        r1=r1_adv,
+        real_buy_scale=real_intraday_buy_scale,
+    )
+    advisory_block["r1_effective"] = r1_applied
+    if r1_applied:
+        # `_json_number` guard: the ticket writer has no `allow_nan=False` crutch, so
+        # a non-finite composed scale must be ABSENT, never `NaN`.
+        effective_buy_scale_json = _json_number(
+            real_intraday_buy_scale * r1_multiplier
+        )
+        if effective_buy_scale_json is not None:
+            advisory_block["effective_buy_scale"] = effective_buy_scale_json
+        # `gates_orders` on the R1 sub-block means "THIS run's orders were actually
+        # resized by R1" -- the top-level flag stays `False` because the advisory
+        # LAYER never gates (it is a report, not an input to any sizing function).
+        advisory_block["r1"]["gates_orders"] = True
+    # NOTE on the TOP-LEVEL `gates_orders`: it stays `False`, and that is not in
+    # tension with `r1_effective=True`. The flag is the ADVISORY-LAYER fence ("no
+    # other gate or sizing function consumes this block" -- still exactly true, the
+    # multiplier is applied by the caller from `r1_adv`), while `r1_effective`
+    # records that the R1 multiplier itself was applied to buy increments. Flipping
+    # the top-level `gates_orders` here would contradict the frozen builder's
+    # contract; `advisory_block["r1"]["gates_orders"]` (set above) is the field that
+    # does describe this run. The two fields answer two different questions.
+    # Exactly ONE R1 log line per run, and only when there was a verdict to
+    # report. When enforcement fired the line says so (the banner above already
+    # stated the composed scale); otherwise it states the P2 fence in the line
+    # itself so a pasted log cannot be mistaken for an executed de-risk.
+    if r1_adv is not None and advisory_block.get("shadow_buy_scale") is not None:
+        if r1_applied:
+            print(
+                "[ADVISORY R1 DERISK] real intraday_buy_scale=%.2f | "
+                "R1 multiplier=%.2f (status=%s) | "
+                "effective_buy_scale=%.2f | APPLIED to buy increments only"
+                % (
+                    advisory_block["real_buy_scale"],
+                    advisory_block["r1"]["multiplier"],
+                    advisory_block["r1"]["status"],
+                    advisory_block["effective_buy_scale"],
+                )
+            )
+        else:
+            print(
+                "[ADVISORY SHADOW] real intraday_buy_scale=%.2f | "
+                "R1 shadow multiplier=%.2f (status=%s) | "
+                "composed shadow scale=%.2f | NOT applied to orders"
+                % (
+                    advisory_block["real_buy_scale"],
+                    advisory_block["r1"]["multiplier"],
+                    advisory_block["r1"]["status"],
+                    advisory_block["shadow_buy_scale"],
+                )
+            )
     for sym in all_symbols:
         tgt_w = float(target_series[sym])
         # (2026-10-22 incident, Fix 6) FREEZE the raw strategy target here, before
@@ -2767,6 +2999,9 @@ def main(cli_args: Optional[List[str]] = None):
         # had no thrust allocation at all. This is AUDIT metadata only: every
         # downstream share/trade computation keeps using the lifecycle-adjusted
         # `tgt_w` exactly as before.
+        # On an enforced `R1` (`--enforce-r1-derisk`) run this target is already
+        # POST-de-risk; stale-lot detection stays correct because a buy increment
+        # can only shrink, never invert, so `raw_tgt_w > current >= 0` still holds.
         raw_tgt_w = tgt_w
         cur_w = float(current_series[sym])
         delta_w = tgt_w - cur_w
@@ -3443,6 +3678,14 @@ def main(cli_args: Optional[List[str]] = None):
                 "lot_size": int(sym_lot),
             },
         }
+        # (`AT7` P1/P2/P3) Advisory-only audit key: same shape on every symbol, never
+        # read back by any gate or sizing function (P2 carries the shadow `r1` /
+        # `shadow_buy_scale` line; P3 flips `r1_effective` and adds
+        # `effective_buy_scale` when --enforce-r1-derisk actually applied).
+        # Strictly JSON-native (no numpy/pandas scalars) because the ticket writer
+        # uses `json.dump(..., ensure_ascii=False)` without `default=str` /
+        # `allow_nan=False`.
+        detail_reason["advisory"] = advisory_block
         if fast_path_badge:
             detail_reason["fast_path_badge"] = fast_path_badge
             detail_reason["fast_path_triggered"] = decision.fast_path_triggered

@@ -54,6 +54,7 @@ _REPO_ROOT = _find_repo_root()
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from common.advisory_report import ADVISORY_PHASE_P1, build_advisory_block
 from common.data import get_data_provider
 from common.cli_utils import (
     CASH_PROXY_SYMBOLS,
@@ -1991,8 +1992,16 @@ def generate_reports(
     refresh_summary: Optional[Dict[str, Any]] = None,
     timing: Optional[Dict[str, Any]] = None,
     single_stock_cap: Optional[Dict[str, Any]] = None,
+    *,
+    advisory: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str]:
-    """Generate and write structured JSON and Markdown summary reports."""
+    """Generate and write structured JSON and Markdown summary reports.
+
+    `advisory` (`AT7` P1) is the optional advisory block from
+    `common.advisory_report.build_advisory_block`. It is written verbatim and
+    consumed by nothing here: default `None` keeps every existing caller and
+    byte-for-byte report unchanged.
+    """
     os.makedirs(output_dir, exist_ok=True)
     json_path = os.path.join(output_dir, STAGE1_HEALTH_REPORT_JSON)
     md_path = os.path.join(output_dir, "stage1_health_report.md")
@@ -2061,6 +2070,11 @@ def generate_reports(
         ),
         "intraday_5m_metrics": intraday_5m_info,
         "trader_actions": actions,
+        # (`AT7` P1) Advisory-only: the AT5 matrix / AT4 labels / R1 verdict,
+        # written for audit and read by NO gate. `advisory=True` +
+        # `gates_orders=False` travel inside the block. `None` when the caller
+        # did not supply one (existing behaviour preserved).
+        "advisory": advisory,
     }
 
     serializable_report = to_json_serializable(report_dict)
@@ -2951,6 +2965,15 @@ def main(cli_args: Optional[List[str]] = None):
         single_stock_cap=single_stock_cap,
     )
 
+    # (`AT7` P1) One advisory block for this run, built from HONEST EMPTY INPUTS:
+    # no cross-sectional score source exists in the live chain yet
+    # (`common/signal_snapshot.py:12-38`) and there is no executed-notional
+    # ledger, so the matrix renders INSUFFICIENT and both capacity labels
+    # render MISSING. Nothing is fabricated to make the report look measured.
+    advisory_block = build_advisory_block(
+        phase=ADVISORY_PHASE_P1,
+        as_of=as_of_date,
+    )
     json_rep, md_rep = generate_reports(
         output_dir=args.output_dir,
         as_of_date=as_of_date,
@@ -2967,6 +2990,7 @@ def main(cli_args: Optional[List[str]] = None):
         refresh_summary=refresh_summary,
         timing=timing,
         single_stock_cap=single_stock_cap,
+        advisory=advisory_block,
     )
     # (L2.3, design §9) `summary.json` is the shared per-run archive key/value store the
     # web layer merges into; the clock + freshness blocks land there too.
