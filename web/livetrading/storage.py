@@ -813,6 +813,12 @@ def is_run_dir(path: Optional[str]) -> bool:
             "post_holdings.json",
             "holdings.json",
             "account_state.json",
+            # AT8: parameter provenance is written by the Stage-2 runner, so its presence
+            # makes the directory a real run archive worth listing. It is NOT evidence the
+            # round completed: the file is written before the ticket, so a run that
+            # refuses/crashes afterwards leaves it behind -- hence it stays OUT of
+            # `has_stage2_artifact` (see that function's docstring).
+            "effective_params.json",
         )
     )
 
@@ -1169,6 +1175,11 @@ def has_stage2_artifact(path: Optional[str]) -> bool:
             "netted_trading_ticket.json",
             "netted_trading_ticket.csv",
             "post_holdings.json",
+            # AT8's `effective_params.json` is deliberately NOT in this list: the runner
+            # writes it BEFORE it builds/emits the ticket, so a Stage-2 attempt that
+            # refuses or crashes between the provenance write and the order artifact would
+            # otherwise masquerade as a completed round (and shadow the real instance's
+            # state / distrust its own `holdings.json`). Provenance is not an order.
         }
     )
 

@@ -45,6 +45,11 @@ WHY THIS SCRIPT EXISTS (因果链，务必按顺序读)
   ``action`` / ``target_shares`` / ``trade_value``）会被重算，其余一律原样保留，
   并在 ``_meta.recomputed_scope = "input_derived_only"`` 与
   ``_meta.not_recomputed`` 里显式声明。**宁可标注"未重算"，也不生成看起来完整的假票面。**
+* AT8 参数溯源文件 ``effective_params.json``（``common/effective_params.py``）记录的是
+  **原始 run 的输入**：每个运行时重新解析参数的 ``{declared, resolved, source}`` 三元组、
+  子策略类名、以及实际生效的 blend 加权模式。它是"这次 run 到底用了什么"的证据，
+  **repair 永远不改写它**（见 ``NEVER_REWRITTEN_BY_REPAIR``）：不为了对齐修好的票面去改，
+  不刷新版本字符串，文件不存在时也不会用今天的代码回填。
 
 产出
 ====
@@ -1513,6 +1518,16 @@ NOT_RECOMPUTED: Tuple[str, ...] = (
     "sector_throttle",
     "intraday_microstructure",
 )
+
+# AT8 (`common/effective_params.py`): `effective_params.json` records the ORIGINAL run
+# inputs -- the declared/resolved/source triples for every run-time re-resolution, plus
+# the instantiated sub-strategy classes and the effective blend weighting mode. It is
+# evidence of what the run really used, so repair NEVER rewrites it: not to "match" a
+# repaired ticket, not to refresh a version string, not even when the file is absent
+# (an absent artifact stays absent rather than being back-filled from today's code).
+# Deliberately NOT part of `NOT_RECOMPUTED` above: that tuple enumerates TICKET fields
+# copied into `detail_reason`, while this is a separate run-level artifact.
+NEVER_REWRITTEN_BY_REPAIR: Tuple[str, ...] = ("effective_params.json",)
 
 
 def recompute_ticket(

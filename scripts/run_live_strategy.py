@@ -41,6 +41,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -90,6 +91,14 @@ from common.advisory_report import (
     r1_decision_to_dict,
 )
 from common.data import get_data_provider
+from common.effective_params import (
+    SOURCE_CONFIG,
+    SOURCE_DEFAULT,
+    SOURCE_DUMP,
+    SOURCE_OVERRIDE,
+    build_effective_params,
+    param_entry,
+)
 from common.allocation_backtester import CASH_PROXY_SYMBOLS, _get_hk_board_lot
 from common.cli_utils import (
     add_data_provider_cli_args,
@@ -363,7 +372,7 @@ def resolve_blend_param(
     """Resolve configuration parameter across blend strategy prefix variants:
     cfsb_*, crb_*, ccsb_*, cfssb_*, cdhb_*, blend_*, or direct un-prefixed name.
     """
-    for prefix in ("cfsb", "crb", "ccsb", "cfssb", "cdhb", "blend"):
+    for prefix in _BLEND_PARAM_PREFIXES:
         k = f"{prefix}_{name}"
         if k in params:
             val = params[k]
@@ -372,6 +381,149 @@ def resolve_blend_param(
         val = params[name]
         return param_type(val) if param_type is not None and val is not None else val
     return default
+
+
+#: Blend prefix spellings, in resolution order. One tuple so the resolver and the
+#: AT8 provenance layer can never disagree about which key won.
+_BLEND_PARAM_PREFIXES: Tuple[str, ...] = ("cfsb", "crb", "ccsb", "cfssb", "cdhb", "blend")
+
+#: Literal marker for "this run has no strategy-dump artifact".
+MISSING_DUMP_SHA256 = "MISSING"
+
+
+def effective_params_dump_sha256(
+    config_source: Optional[str],
+    repo_root: Optional[str] = None,
+) -> str:
+    """sha256 of the strategy-dump artifact this run resolved, else ``"MISSING"``.
+
+    `config_source` is `resolve_strategy_definition`'s `resolved_desc`: a repo-relative
+    path for a strategy/dump file, or ``strategies_config.json:<key>`` /
+    ``static_template:<name>`` for the two non-dump origins.
+
+    Only a REAL file gets a hash. A static template, a `strategies_config.json:` entry
+    (that file is not the run's SSOT dump) and a nonexistent path all report the
+    literal ``"MISSING"`` -- never a fabricated 64-hex value that would look like
+    provenance. Read-only: the file is opened ``rb`` and never written.
+    """
+    if not config_source:
+        return MISSING_DUMP_SHA256
+    desc = str(config_source)
+    if desc.startswith("strategies_config.json:") or desc.startswith("static_template:"):
+        return MISSING_DUMP_SHA256
+    path = desc if os.path.isabs(desc) else os.path.join(repo_root or _REPO_ROOT, desc)
+    if not os.path.isfile(path):
+        return MISSING_DUMP_SHA256
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return MISSING_DUMP_SHA256
+
+
+def _effective_param_source(
+    declared_params: Dict[str, Any],
+    keys: Iterable[str],
+    *,
+    cli_override: bool = False,
+    config_origin: str = SOURCE_DUMP,
+) -> Tuple[Any, str]:
+    """Return ``(declared, source)`` for the first key present in `declared_params`.
+
+    Precedence mirrors the resolver: the caller passes `keys` in RESOLUTION order
+    (blend prefixes first, then the bare name, then suffix aliases). A CLI override
+    outranks everything (that is what the runner's own resolvers do).
+    """
+    declared = None
+    found = False
+    for key in keys:
+        if key in declared_params:
+            declared = declared_params[key]
+            found = True
+            break
+    if cli_override:
+        return declared, SOURCE_OVERRIDE
+    if not found:
+        return None, SOURCE_DEFAULT
+    return declared, config_origin
+
+
+def _record_effective_param(
+    entries: Dict[str, Dict[str, Any]],
+    declared_params: Dict[str, Any],
+    name: str,
+    resolved: Any,
+    *,
+    keys: Optional[Iterable[str]] = None,
+    cli_override: bool = False,
+    config_origin: str = SOURCE_DUMP,
+    aliases: Iterable[str] = (),
+) -> None:
+    """Record one resolved parameter's provenance triple into `entries`."""
+    if keys is None:
+        keys = [f"{prefix}_{name}" for prefix in _BLEND_PARAM_PREFIXES] + [name]
+    declared_keys = list(keys) + [k for k in aliases if k not in keys]
+    declared, source = _effective_param_source(
+        declared_params, declared_keys, cli_override=cli_override, config_origin=config_origin
+    )
+    entries[name] = param_entry(declared, resolved, source)
+
+
+def _effective_params_config_origin(resolved_desc: Optional[str]) -> str:
+    """Classify where a declared param came from: dump vs `strategies_config.json`.
+
+    A static template's injected `param_grid` defaults are DEFAULTS, not a config
+    artifact, so they report `default`.
+    """
+    desc = str(resolved_desc or "")
+    if desc.startswith("strategies_config.json:"):
+        return SOURCE_CONFIG
+    if desc.startswith("static_template:"):
+        return SOURCE_DEFAULT
+    return SOURCE_DUMP
+
+
+def _write_effective_params(
+    output_dir: str,
+    payload: Dict[str, Any],
+) -> Optional[str]:
+    """Write ``<output_dir>/effective_params.json`` atomically; never raise into the run.
+
+    AT8 is an OBSERVATION layer: a capture/write failure must print loudly and let
+    the order path continue unchanged. Returns the path, or ``None`` on failure.
+
+    ATOMIC (same pattern as `scripts/repair_live_run_snapshots.write_bytes_atomic`):
+    the payload is serialised into ``effective_params.json.tmp`` in the SAME directory,
+    flushed/closed, then `os.replace`d onto the final name. A crash mid-write therefore
+    leaves at most a ``.tmp`` -- never a truncated ``effective_params.json`` that a
+    reader would parse as a complete-but-empty provenance record. A failed replace
+    deletes the leftover ``.tmp`` before re-raising for the caller's loud warning.
+    """
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, "effective_params.json")
+        tmp_path = path + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+                f.flush()
+            os.replace(tmp_path, path)
+        except BaseException:
+            # `KeyboardInterrupt`/`SystemExit` must keep propagating, but a half-written
+            # temp file is never a useful artifact -- remove it on the way out.
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        print(f"[EFFECTIVE PARAMS] 参数溯源已写入: {path}")
+        return path
+    except Exception as exc:
+        print(
+            f"[EFFECTIVE PARAMS] warning: 写入失败，运行继续（参数溯源缺失）: {exc}",
+            file=sys.stderr,
+        )
+        return None
 
 
 def resolve_trade_inertia_threshold(params: Dict[str, Any], default: float = 0.05) -> float:
@@ -1102,6 +1254,16 @@ def resolve_strategy_definition(
     return strategy_def, strategy_key, resolved_desc, template
 
 
+def _cli_flag_given(raw_args: Iterable[str], flag: str) -> bool:
+    """True when ``flag`` was actually typed on the command line.
+
+    Recognises both ``--flag value`` and ``--flag=value`` spellings. A parsed value
+    cannot answer this: argparse defaults make "typed 2" and "default 2"
+    indistinguishable, and the latency flags are aliases of one collapsed value.
+    """
+    return any(a == flag or a.startswith(flag + "=") for a in raw_args)
+
+
 def parse_args(args: Optional[List[str]] = None):
     parser = argparse.ArgumentParser(
         description="Universal Operational Live Trading Execution Runner (All Strategies)"
@@ -1384,10 +1546,25 @@ def parse_args(args: Optional[List[str]] = None):
 
     # Reconcile guard_latency_bars with backward compatibility overrides
     raw_args = args if args is not None else sys.argv[1:]
-    has_guard = any(a == "--guard-latency-bars" or a.startswith("--guard-latency-bars=") for a in raw_args)
-    has_entry = any(a == "--entry-confirm-bars" or a.startswith("--entry-confirm-bars=") for a in raw_args)
-    has_exit = any(a == "--exit-confirm-bars" or a.startswith("--exit-confirm-bars=") for a in raw_args)
-    has_min_entry = (parsed.min_entry_bars is not None)
+    has_guard = _cli_flag_given(raw_args, "--guard-latency-bars")
+    has_entry = _cli_flag_given(raw_args, "--entry-confirm-bars")
+    has_exit = _cli_flag_given(raw_args, "--exit-confirm-bars")
+    has_min_entry = _cli_flag_given(raw_args, "--min-entry-bars")
+    # AT8: which latency/tenure flags the operator ACTUALLY typed. Provenance derives
+    # `source=override` from this set, never from a parsed value -- an argparse default
+    # (e.g. `guard_latency_bars`'s 2) is indistinguishable from a typed 2, and the four
+    # latency spellings below all move the ONE collapsed value the runner keeps.
+    parsed._explicit_cli_flags = frozenset(
+        flag
+        for flag, given in (
+            ("--guard-latency-bars", has_guard),
+            ("--entry-confirm-bars", has_entry),
+            ("--exit-confirm-bars", has_exit),
+            ("--min-entry-bars", has_min_entry),
+            ("--min-holding-bars", _cli_flag_given(raw_args, "--min-holding-bars")),
+        )
+        if given
+    )
 
     if not has_guard:
         if has_min_entry:
@@ -2090,12 +2267,36 @@ def main(cli_args: Optional[List[str]] = None):
 
     template_name = strategy_def["template_name"]
     params = strategy_def.get("params", {})
+    # ---- AT8: save the DECLARED params before anything mutates them in place ----
+    # `params` IS `strategy_def["params"]`, and the resolution block below writes
+    # `params["min_entry_bars"]` / `params["guard_latency_bars"]` back into it. Reading
+    # "declared" after that would report the RESOLVED value as declared. Freeze a shallow
+    # copy NOW; this is the only mandatory ordering constraint of the provenance layer.
+    declared_params = dict(params)
+    effective_param_entries: Dict[str, Dict[str, Any]] = {}
+    _effective_origin = _effective_params_config_origin(resolved_desc)
+    _effective_dump_sha = effective_params_dump_sha256(resolved_desc)
+    # No run id is minted anywhere in this runner, so derive a deterministic one from the
+    # SAME clock context the run stamps into summary.json (`<as_of>_<local HHMMSS>`).
+    try:
+        _run_hhmmss = clock_ctx.clock.local_now().strftime("%H%M%S")
+    except Exception:
+        _run_hhmmss = clock_ctx.clock.stamp().local_now.strftime("%H%M%S")
+    effective_run_id = f"{as_of_date}_{_run_hhmmss}"
     strat_name = (
         strategy_def.get("strategy_name")
         or strategy_def.get("research_strategy_spec", {}).get("entry_data", {}).get("name")
         or template_name.replace("_", " ").title()
     )
     cash_proxy = params.get("cash_proxy", "BIL")
+    _record_effective_param(
+        effective_param_entries,
+        declared_params,
+        "cash_proxy",
+        cash_proxy,
+        keys=("cash_proxy",),
+        config_origin=_effective_origin,
+    )
 
     # Load account state (if available) for NAV or circuit breakers
     account_state = {}
@@ -2161,6 +2362,95 @@ def main(cli_args: Optional[List[str]] = None):
     params["min_entry_bars"] = min_entry_bars
     params["guard_latency_bars"] = guard_latency_bars
 
+    # ---- AT8 provenance: the values just re-resolved, against the frozen declared dict ----
+    # `source` keys off the flags the operator ACTUALLY typed (`parse_args` records them),
+    # never off a parsed value: `--guard-latency-bars` / `--entry-confirm-bars` /
+    # `--exit-confirm-bars` / `--min-entry-bars` all collapse into the same guard latency
+    # (the resolution chain just above), so any of them that was typed can override both keys.
+    _explicit_cli_flags = getattr(args, "_explicit_cli_flags", frozenset())
+    _latency_flag_typed = any(
+        flag in _explicit_cli_flags
+        for flag in (
+            "--guard-latency-bars",
+            "--entry-confirm-bars",
+            "--exit-confirm-bars",
+            "--min-entry-bars",
+        )
+    )
+    # A typed latency flag is only an OVERRIDE when its value is the one that survived:
+    # `parse_args` folds `--entry-confirm-bars`/`--exit-confirm-bars` into
+    # `args.guard_latency_bars`, but the chain just above prefers `args.min_entry_bars` when
+    # it is set, and lets a dump `guard_latency_bars` / `*_min_entry_bars` pin outrank a
+    # typed `--guard-latency-bars` / `--entry-confirm-bars` / `--exit-confirm-bars`.
+    # Reporting `override` there would assert an override that never applied
+    # (declared == resolved). The floor mirrors `resolve_min_entry_bars`'s `max(1, ...)`.
+    if "--min-entry-bars" in _explicit_cli_flags:
+        _cli_latency = max(1, int(args.min_entry_bars))
+    elif _latency_flag_typed:
+        _cli_latency = max(1, int(getattr(args, "guard_latency_bars", 2)))
+    else:
+        _cli_latency = None
+    _latency_cli_override = (
+        _cli_latency is not None and int(guard_latency_bars) == _cli_latency
+    )
+    # `--min-holding-bars` has no sibling spelling and its resolver checks the CLI FIRST,
+    # so a typed flag always wins there -- presence is the honest test.
+    _min_holding_cli_override = "--min-holding-bars" in _explicit_cli_flags
+    # `min_holding_bars` resolution order (see `resolve_min_holding_bars`): prefixed
+    # `*_min_holding_bars` -> bare -> prefixed/`*_min_hold_bars` suffix scan -> default.
+    _min_holding_keys: List[str] = [
+        f"{prefix}_min_holding_bars" for prefix in _BLEND_PARAM_PREFIXES
+    ] + ["min_holding_bars"]
+    _min_holding_keys += [
+        f"{prefix}_min_hold_bars" for prefix in _BLEND_PARAM_PREFIXES
+    ] + ["min_hold_bars"]
+    _min_holding_keys += [
+        k
+        for k in declared_params
+        if (k.endswith("_min_holding_bars") or k.endswith("_min_hold_bars"))
+        and k not in _min_holding_keys
+    ]
+    _record_effective_param(
+        effective_param_entries,
+        declared_params,
+        "min_holding_bars",
+        min_holding_bars,
+        keys=_min_holding_keys,
+        cli_override=_min_holding_cli_override,
+        config_origin=_effective_origin,
+    )
+    # `guard_latency_bars` / `min_entry_bars` collapse to ONE resolved value (the chain
+    # above) but are recorded under both names an operator may search for. Declared is the
+    # first of the two spellings present in the frozen dict; `_latency_cli_override` is true
+    # only when a typed latency flag supplied the value that survived the chain.
+    _entry_keys: List[str] = [
+        f"{prefix}_min_entry_bars" for prefix in _BLEND_PARAM_PREFIXES
+    ] + ["min_entry_bars"]
+    _entry_keys += [
+        k
+        for k in declared_params
+        if k.endswith("_min_entry_bars") and k not in _entry_keys
+    ]
+    _entry_cli_override = _latency_cli_override
+    _record_effective_param(
+        effective_param_entries,
+        declared_params,
+        "guard_latency_bars",
+        guard_latency_bars,
+        keys=("guard_latency_bars",) + tuple(_entry_keys),
+        cli_override=_entry_cli_override,
+        config_origin=_effective_origin,
+    )
+    _record_effective_param(
+        effective_param_entries,
+        declared_params,
+        "min_entry_bars",
+        min_entry_bars,
+        keys=("min_entry_bars", "guard_latency_bars") + tuple(_entry_keys),
+        cli_override=_entry_cli_override,
+        config_origin=_effective_origin,
+    )
+
     # ---- M4.3: inert policy-kernel key + M1.1 opt-in knobs -------------------
     # The key is still RESOLVED (1. `--live-use-policy-kernel` -> args, 2. strategy
     # params `live_use_policy_kernel` / blend-prefixed spellings, 3. True) and
@@ -2173,12 +2463,56 @@ def main(cli_args: Optional[List[str]] = None):
     live_use_policy_kernel = bool(getattr(args, "live_use_policy_kernel", False)) or bool(
         resolve_blend_param(params, "live_use_policy_kernel", True, bool)
     )
+    _record_effective_param(
+        effective_param_entries,
+        declared_params,
+        "live_use_policy_kernel",
+        live_use_policy_kernel,
+        keys=[f"{prefix}_live_use_policy_kernel" for prefix in _BLEND_PARAM_PREFIXES]
+        + ["live_use_policy_kernel", "lifecycle_live_use_policy_kernel"],
+        cli_override=bool(getattr(args, "live_use_policy_kernel", False)),
+        config_origin=_effective_origin,
+    )
     # The six M1.1 knobs come from the SHARED resolver so the live driver and the
     # kernel can never disagree about them (one mapping, `position_policy_
     # config_from_lifecycle`). Only these six are taken: the runner keeps its own
     # resolution for every legacy field (notably `min_entry_threshold`, which the
     # backtest-side resolver deliberately leaves `None` while live derives 0.05).
     _policy_cfg = resolve_position_policy_config(params, args)
+    # AT8: per-knob provenance for the six M1.1 opt-in gates. `lifecycle_<field>` outranks
+    # the bare field in the shared resolver, so `declared` reads the same two spellings and
+    # a `--lifecycle-*` CLI value is the only override.
+    for _knob_name in (
+        "two_day_breakdown_rule",
+        "breakdown_days",
+        "breakdown_vol_shrink_pct",
+        "price_reentry_gate",
+        "price_reentry_pct",
+        "reentry_vwap_lookback",
+    ):
+        _record_effective_param(
+            effective_param_entries,
+            declared_params,
+            _knob_name,
+            getattr(_policy_cfg, _knob_name),
+            keys=(f"lifecycle_{_knob_name}", _knob_name),
+            cli_override=getattr(args, f"lifecycle_{_knob_name}", None) is not None,
+            config_origin=_effective_origin,
+        )
+
+    # AT8 (incident-2 anchor): `declared` is the BARE key -- usually absent -- while the
+    # resolver picks the blend-prefixed spelling (`cfsb_inertia_relative_ratio`) out of the
+    # dump. Recording the prefixed value as "declared" would hide exactly the divergence
+    # this artifact exists to expose (declared null -> resolved 0.30).
+    _inertia_relative_ratio = resolve_blend_param(params, "inertia_relative_ratio", 0.0, float)
+    _inertia_present = "inertia_relative_ratio" in declared_params or any(
+        f"{prefix}_inertia_relative_ratio" in declared_params for prefix in _BLEND_PARAM_PREFIXES
+    )
+    effective_param_entries["inertia_relative_ratio"] = param_entry(
+        declared_params.get("inertia_relative_ratio"),
+        _inertia_relative_ratio,
+        _effective_origin if _inertia_present else SOURCE_DEFAULT,
+    )
 
     lifecycle_cfg = PositionLifecycleConfig(
         guard_latency_bars=guard_latency_bars,
@@ -2190,7 +2524,7 @@ def main(cli_args: Optional[List[str]] = None):
         # SELL trims must clear max(inertia_threshold, ratio * current_weight).
         # Resolved via cfsb_inertia_relative_ratio for chan_four_state_blend;
         # 0.0 (disabled) everywhere else so other strategies are unaffected.
-        inertia_relative_ratio=resolve_blend_param(params, "inertia_relative_ratio", 0.0, float),
+        inertia_relative_ratio=_inertia_relative_ratio,
         min_entry_threshold=min_entry_thresh,
         hard_stop_loss_pct=0.08,
         atr_multiplier=4.5,
@@ -2218,6 +2552,13 @@ def main(cli_args: Optional[List[str]] = None):
     if "vol_model" in params or any(k.endswith("_vol_model") for k in params):
         vm = resolve_blend_param(params, "vol_model", "garman_klass", str)
         engine_parts.append(f"波动率模型={vm}")
+        _record_effective_param(
+            effective_param_entries,
+            declared_params,
+            "vol_model",
+            vm,
+            config_origin=_effective_origin,
+        )
     if "rebalance_freq_days" in params:
         engine_parts.append(f"调仓周期={params['rebalance_freq_days']}日")
     engine_parts.append(f"UPLSM确认={guard_latency_bars}日")
@@ -2343,6 +2684,14 @@ def main(cli_args: Optional[List[str]] = None):
 
     enable_intraday_5m = getattr(args, "enable_intraday_5m", False) or bool(
         resolve_blend_param(params, "enable_intraday_5m", False, bool)
+    )
+    _record_effective_param(
+        effective_param_entries,
+        declared_params,
+        "enable_intraday_5m",
+        enable_intraday_5m,
+        cli_override=bool(getattr(args, "enable_intraday_5m", False)),
+        config_origin=_effective_origin,
     )
     if enable_intraday_5m:
         try:
@@ -2878,9 +3227,26 @@ def main(cli_args: Optional[List[str]] = None):
 
     # Precompute sub-strategy signals for blend strategies
     sub_strategy_weights_by_symbol: Dict[str, Dict[str, float]] = {}
+    _sub_strategy_classes: Optional[Dict[str, str]] = None
+    _effective_weighting_mode: Optional[str] = None
     if hasattr(template, "get_sub_strategies"):
         try:
             sub_strats = template.get_sub_strategies(universe, params)
+            # ---- AT8 run-level facts, captured ONCE per run ------------------------
+            # Not per symbol and never inside `detail_reason`: these describe the RUN,
+            # so they belong beside `params`, not in every ticket row.
+            _sub_strategy_classes = {
+                sname: type(s_strat).__name__ for sname, s_strat in sub_strats.items()
+            }
+            if hasattr(template, "resolve_param"):
+                # Deliberately the SAME resolver, the SAME `params` and the SAME default
+                # the engine's own call uses inside `blend_base.generate_weights` (which
+                # this observation layer must not touch). `resolve_param` is pure, so a
+                # second call cannot disagree with the first -- but this IS a duplicate
+                # call site, disclosed here rather than silently re-deriving the mode.
+                _effective_weighting_mode = template.resolve_param(
+                    params, "weighting_mode", "rolling_ic_ir", str
+                )
             for sname, s_strat in sub_strats.items():
                 w_sp = s_strat.generate_weights(universe, params)
                 if not w_sp.empty:
@@ -2894,6 +3260,30 @@ def main(cli_args: Optional[List[str]] = None):
                                 sub_strategy_weights_by_symbol[sym_k][sname] = round(float(val_k), 4)
         except Exception:
             pass
+
+    # ---- AT8: persist parameter provenance. OBSERVATION ONLY -------------------------
+    # Nothing below reads this file back, so a failure here must never alter sizing or the
+    # order path: both the pure build and the disk write are wrapped, and the only effect
+    # of a failure is one loud stderr warning.
+    try:
+        _effective_payload = build_effective_params(
+            strategy_id=strategy_key,
+            strategy_version=strategy_def.get("strategy_version"),
+            base_version=strategy_def.get("base_version"),
+            config_source=resolved_desc,
+            strategy_dump_sha256=_effective_dump_sha,
+            as_of=as_of_date,
+            run_id=effective_run_id,
+            params=effective_param_entries,
+            sub_strategy_classes=_sub_strategy_classes,
+            effective_weighting_mode=_effective_weighting_mode,
+        )
+        _write_effective_params(args.output_dir, _effective_payload)
+    except Exception as exc:
+        print(
+            f"[EFFECTIVE PARAMS] warning: 参数溯源构建失败，运行继续: {exc}",
+            file=sys.stderr,
+        )
 
     # Sector holding counts & throttle limit
     sector_counts: Dict[str, int] = {}
