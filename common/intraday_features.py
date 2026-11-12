@@ -835,6 +835,306 @@ def _intraday_5m_cache_candidates(cache_dir: Optional[str]) -> List[str]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# 5m provenance: honour the CALLER's provider, record every fallback
+# ---------------------------------------------------------------------------
+# (2026-11-11 defect, `六` item 6 -- "5m 特征静默陈旧") The Step-1.5 DuckDB fallback used
+# a FIXED provider order (`BaoStockDataProvider` -> `EastMoneyDataProvider` -> `fuyao`),
+# ignoring the `provider` the caller configured. The live run used `fuyao`, whose cache
+# rows reached 2026-11-10, but the fallback read BaoStock first -- whose `intraday_ohlcv_bars`
+# stopped at 2026-11-09 -- so the 5m layer was silently one session older than the data the
+# run had actually asked for. Downstream that froze `RS_Down_5m` (via `dropna().iloc[-21:]`)
+# and made `realized_vol_21d` identical for three consecutive sessions (0.3240854096084951),
+# while the run blamed "provider does not support 5m" -- a false diagnosis of a stale cache.
+#
+# Rule now enforced here: the caller's provider is ALWAYS queried first, under every cache
+# key form it may have been written with; other providers are only consulted when the
+# caller's provider has no 5m rows at all, and that switch is recorded on the returned
+# frame (`fallback_from` / `fallback_to` / `fallback_reason` attrs) and logged.
+_INTRADAY_5M_FALLBACK_PROVIDERS: Tuple[str, ...] = (
+    "BaoStockDataProvider",
+    "EastMoneyDataProvider",
+    "fuyao",
+)
+"""Last-resort provider keys, used ONLY when the caller's provider has no cached 5m rows.
+
+Order preserved from the pre-2026-11-11 behaviour so a caller that passes no provider at
+all (research/backtest paths) keeps the historical result bit-for-bit.
+"""
+
+_INTRADAY_5M_PROVIDER_CLASS_NAMES: Dict[str, str] = {
+    "baostock": "BaoStockDataProvider",
+    "eastmoney": "EastMoneyDataProvider",
+    "fuyao": "FuyaoDataProvider",
+    "marketdb": "MarketDBDataProvider",
+}
+"""Canonical short name -> the class name every cache writer actually stores.
+
+Only needed when a caller passes a provider as a STRING (`"fuyao"`): the cache's primary key
+is `type(inner_provider).__name__`, so a short string alone would query zero rows and look
+like "no coverage" -- the exact confusion that produced the 2026-11-09 stale window.
+"""
+
+FALLBACK_REASON_UNSUPPORTED_5M = "provider_unsupported_5m"
+"""Step-1 fetch raised -- the provider explicitly refused the 5m interval."""
+
+FALLBACK_REASON_RETURNED_EMPTY = "provider_returned_empty"
+"""Step-1 fetch succeeded but returned zero rows and the cache holds none either."""
+
+INTRADAY_5M_FRESHNESS_OK = "ok"
+INTRADAY_5M_FRESHNESS_STALE = "stale_last_bar"
+INTRADAY_5M_FRESHNESS_NO_BARS = "no_5m_bars"
+
+
+def _intraday_5m_canonical_provider(name: Any) -> str:
+    """Comparison key for a provider name (`FuyaoDataProvider` == `fuyao`).
+
+    Reuses `common.duckdb_cache.canonicalize_provider_key` (the single definition of that
+    equivalence -- the same one the cache's read-path reconciliation uses), imported lazily
+    because `duckdb_cache` hard-imports `duckdb` and this module must stay importable in
+    environments without it. Falls back to an equivalent local rule if it cannot import.
+    """
+    try:
+        from common.duckdb_cache import canonicalize_provider_key
+
+        return canonicalize_provider_key(name)
+    except Exception:  # noqa: BLE001 - duckdb absent / import cycle: use the same rule locally
+        key = str(name).strip().lower()
+        suffix = "dataprovider"
+        if key.endswith(suffix) and len(key) > len(suffix):
+            key = key[: -len(suffix)]
+        return key
+
+
+def _intraday_5m_unwrap_provider(data_provider: Any) -> Any:
+    """Peel `CachedDataProvider`-style wrappers down to the real upstream provider."""
+    inner = data_provider
+    for _ in range(4):  # wrappers are shallow; the cap only stops a pathological cycle
+        nxt = getattr(inner, "inner_provider", None)
+        if nxt is None or nxt is inner:
+            break
+        inner = nxt
+    return inner
+
+
+def _intraday_5m_provider_plan(data_provider: Any) -> Tuple[List[str], Optional[str]]:
+    """`(cache_provider_keys, display_name)` for the caller's configured provider.
+
+    Cache keys are class names (`FuyaoDataProvider`, what every writer stamps via
+    `type(self.inner_provider).__name__`), but the short station name (`fuyao`) is tried
+    too, in case a caller hands us that string directly. Ordered most-specific first.
+    """
+    inner = _intraday_5m_unwrap_provider(data_provider)
+    if inner is None:
+        return [], None
+
+    if isinstance(inner, str):
+        class_name = inner.strip()
+        if not class_name:
+            return [], None
+        # A caller may hand us the station's SHORT name (`fuyao`), while every cache writer
+        # stamps the CLASS name (`FuyaoDataProvider`). Add the known class-name spelling for
+        # the same canonical key so a short name can still hit its own rows first.
+        short = _intraday_5m_canonical_provider(class_name)
+        keys: List[str] = [class_name]
+        for known in _INTRADAY_5M_FALLBACK_PROVIDERS:
+            if _intraday_5m_canonical_provider(known) == short and known not in keys:
+                keys.append(known)
+        class_spelling = _INTRADAY_5M_PROVIDER_CLASS_NAMES.get(short)
+        if class_spelling and class_spelling not in keys:
+            keys.append(class_spelling)
+        if short not in keys:
+            keys.append(short)
+        return keys, class_name
+
+    class_name = type(inner).__name__
+    short = _intraday_5m_canonical_provider(class_name)
+    keys = []
+    for key in (class_name, short):
+        if key and key not in keys:
+            keys.append(key)
+    return keys, class_name
+
+
+def _intraday_5m_provider_order(
+    preferred_keys: List[str],
+) -> List[str]:
+    """Preferred cache keys first, then the historical fallback list minus duplicates.
+
+    Duplicates are removed by CANONICAL name so a preferred `FuyaoDataProvider` never
+    re-queries the same rows as the fallback entry `fuyao`.
+    """
+    seen: Set[str] = {_intraday_5m_canonical_provider(k) for k in preferred_keys}
+    order: List[str] = list(preferred_keys)
+    for name in _INTRADAY_5M_FALLBACK_PROVIDERS:
+        canon = _intraday_5m_canonical_provider(name)
+        if canon in seen:
+            continue
+        seen.add(canon)
+        order.append(name)
+    return order
+
+
+def latest_5m_bar_ts(frame: Optional[pd.DataFrame]) -> Optional[pd.Timestamp]:
+    """Last timestamp of a 5m frame, or `None` when it holds no bars."""
+    if frame is None or bool(getattr(frame, "empty", True)):
+        return None
+    try:
+        idx = pd.DatetimeIndex(frame.index)
+    except (TypeError, ValueError):
+        return None
+    if len(idx) == 0:
+        return None
+    return pd.Timestamp(idx.max())
+
+
+def _naive(ts: pd.Timestamp) -> pd.Timestamp:
+    """Drop tzinfo while keeping wall-clock time, so naive/aware frames compare cleanly."""
+    ts = pd.Timestamp(ts)
+    if ts.tzinfo is not None:
+        return ts.tz_localize(None)
+    return ts
+
+
+def assess_intraday_5m_freshness(
+    universe_5m: Union[Dict[str, pd.DataFrame], pd.DataFrame, None],
+    *,
+    expected_last_session: Optional[Any] = None,
+    market: str = "china",
+    now: Optional[datetime.datetime] = None,
+    holidays: Optional[Any] = None,
+    bar_interval_minutes: int = 5,
+) -> Dict[str, Any]:
+    """Measure 5m staleness against the session the cache is SUPPOSED to hold.
+
+    Reusable, offline judgement (2026-11-11 defect, `六` item 6). It answers the question the
+    archive could not: "is the last 5m bar actually today's session, or is the cache frozen?"
+    A stale 5m layer must be reported as stale instead of being re-labelled "provider does not
+    support 5m", and its `lag_calendar_days` is what makes the drift visible.
+
+    Trading-calendar logic is NOT re-implemented: `expected_last_session` (close + publication
+    grace) and `last_expected_bar_ts` (per-date close, half-days included) both come from
+    `common/market_clock.py`.
+
+    Args:
+        universe_5m: `{symbol: frame}` as returned by `load_intraday_5m_universe`, or a single
+            frame (reported under the key `"<single>"`).
+        expected_last_session: session the cache must reach. `date`/`datetime`/`str`/Timestamp
+            accepted; omitted -> `common.market_clock.expected_last_session(market, now, holidays)`.
+        market: `common.market_holidays` market code, default China A-shares.
+        now: deterministic instant for the default expected session (tests/replays pass one).
+        holidays: extra full-day closures forwarded to `market_clock`.
+        bar_interval_minutes: 5 for the 5m layer; only sets the intraday deadline (close minus
+            one bar), never the day the session is on.
+
+    Returns:
+        Dict with `expected_last_session`, `expected_deadline_ts`, `latest_available_ts`,
+        `stale`, `lag_calendar_days`, `reason`, per-symbol `symbols`, `stale_symbols`,
+        `fresh_symbols` and `n_symbols`.
+        `stale=True` iff the newest bar is older than the expected session's last full bar
+        (or no bars exist at all -> `reason="no_5m_bars"`, `lag_calendar_days=None`).
+    """
+    from common.market_clock import last_expected_bar_ts
+    from common.market_clock import expected_last_session as _expected_last_session
+
+    if expected_last_session is None:
+        session_date = _expected_last_session(market=market, now=now, holidays=holidays)
+    else:
+        session_date = pd.Timestamp(expected_last_session).date()
+
+    deadline = pd.Timestamp(
+        last_expected_bar_ts(
+            market,
+            session_date,
+            datetime.timedelta(minutes=int(bar_interval_minutes)),
+        )
+    )
+    session_start = pd.Timestamp(session_date)
+
+    if isinstance(universe_5m, pd.DataFrame):
+        frames: Dict[str, pd.DataFrame] = {"<single>": universe_5m}
+    else:
+        frames = dict(universe_5m or {})
+
+    per_symbol: Dict[str, Dict[str, Any]] = {}
+    stale_symbols: List[str] = []
+    fresh_symbols: List[str] = []
+    overall_last: Optional[pd.Timestamp] = None
+
+    for sym, frame in frames.items():
+        last = latest_5m_bar_ts(frame)
+        name = str(sym)
+        if last is None:
+            per_symbol[name] = {
+                "latest_available_ts": None,
+                "stale": True,
+                "lag_calendar_days": None,
+                "reason": INTRADAY_5M_FRESHNESS_NO_BARS,
+            }
+            stale_symbols.append(name)
+            continue
+
+        last_naive = _naive(last)
+        stale = bool(last_naive < deadline)
+        lag = int((session_start - last_naive.normalize()).days)
+        lag = max(0, lag)
+        per_symbol[name] = {
+            "latest_available_ts": last_naive.isoformat(),
+            "stale": stale,
+            "lag_calendar_days": lag,
+            "reason": INTRADAY_5M_FRESHNESS_STALE if stale else INTRADAY_5M_FRESHNESS_OK,
+        }
+        if stale:
+            stale_symbols.append(name)
+        else:
+            fresh_symbols.append(name)
+        if overall_last is None or last_naive > overall_last:
+            overall_last = last_naive
+
+    if overall_last is None:
+        overall_reason = INTRADAY_5M_FRESHNESS_NO_BARS
+        overall_lag: Optional[int] = None
+        overall_stale = True
+    else:
+        # Aggregate = WORST symbol, never the best one: one fresh symbol must not mask a
+        # stale sibling (the 2026-11 freeze was per-symbol `RS_Down_5m`).
+        overall_stale = bool(stale_symbols)
+        overall_reason = (
+            INTRADAY_5M_FRESHNESS_STALE if overall_stale else INTRADAY_5M_FRESHNESS_OK
+        )
+        stale_lags = [
+            int(per_symbol[s]["lag_calendar_days"])
+            for s in stale_symbols
+            if per_symbol[s]["lag_calendar_days"] is not None
+        ]
+        all_lags = [
+            int(v["lag_calendar_days"])
+            for v in per_symbol.values()
+            if v["lag_calendar_days"] is not None
+        ]
+        # Report the WORST observed lag; `None` when staleness is only "no bars at all"
+        # (there is no bar date to measure a lag from).
+        if stale_lags:
+            overall_lag = max(stale_lags)
+        elif overall_stale:
+            overall_lag = None
+        else:
+            overall_lag = max(all_lags or [0])
+
+    return {
+        "expected_last_session": session_date.isoformat(),
+        "expected_deadline_ts": deadline.isoformat(),
+        "latest_available_ts": None if overall_last is None else overall_last.isoformat(),
+        "stale": overall_stale,
+        "lag_calendar_days": overall_lag,
+        "reason": overall_reason,
+        "symbols": per_symbol,
+        "stale_symbols": sorted(stale_symbols),
+        "fresh_symbols": sorted(fresh_symbols),
+        "n_symbols": len(per_symbol),
+    }
+
+
 def load_intraday_5m_universe(
     symbols: List[str],
     start: Optional[str] = None,
@@ -843,6 +1143,8 @@ def load_intraday_5m_universe(
     parquet_dir: str = "data/intraday_5m",
     cutoff_time: Optional[str] = "14:15",
     cache_dir: Optional[str] = None,
+    expected_last_session: Optional[Any] = None,
+    market: str = "china",
     **kwargs: Any,
 ) -> Dict[str, pd.DataFrame]:
     """Three-layer intraday data loading pipeline (Section 1.6 / line 383).
@@ -850,6 +1152,21 @@ def load_intraday_5m_universe(
     Step 1: Fetch historical baseline from DuckDB/data_provider.
     Step 2: Read Day-T lock-free Parquet if present (data/intraday_5m/{YYYY-MM-DD}.parquet).
     Step 3: On-demand EastMoney fallback if intraday bucket hole is detected.
+
+    Provider provenance (2026-11-11, fixes the silently-stale 5m layer): the DuckDB fallback
+    queries the CALLER's configured provider first (`FuyaoDataProvider` for a `fuyao` live run,
+    even when `data_provider` is a `CachedDataProvider` wrapper) and only falls back to other
+    providers when that provider has zero cached 5m rows. Each returned frame carries:
+
+      * `intraday_5m_source` -- `"data_provider"` | `"duckdb_cache"` | `"parquet"` ...
+      * `intraday_5m_provider` -- provider key that actually served the bars
+      * `intraday_5m_latest_ts` -- last bar timestamp (ISO-8601)
+      * `fallback_from` / `fallback_to` / `fallback_reason` (+ `fallback_reason_detail`)
+        ONLY when the serving provider differs from the caller's -- never silent.
+
+    `expected_last_session` (optional) additionally stamps `intraday_5m_stale` and
+    `intraday_5m_lag_calendar_days` on each frame via `assess_intraday_5m_freshness`, so a
+    frozen cache is visible at the loader instead of being blamed on provider capability.
     """
     if cache_dir and parquet_dir == "data/intraday_5m":
         cand = os.path.join(cache_dir, "intraday_5m")
@@ -857,14 +1174,32 @@ def load_intraday_5m_universe(
             parquet_dir = cand
     out: Dict[str, pd.DataFrame] = {}
 
+    # Caller-configured provider keys, resolved ONCE (not per symbol). Empty when the caller
+    # passed no provider -- then the historical fallback order applies unchanged.
+    preferred_keys, preferred_label = _intraday_5m_provider_plan(data_provider)
+    preferred_canon = {_intraday_5m_canonical_provider(k) for k in preferred_keys}
+    provider_order = _intraday_5m_provider_order(preferred_keys)
+
     for sym in symbols:
         df_sym = pd.DataFrame()
+        source: Optional[str] = None
+        provider_used: Optional[str] = None
+        fallback_from: Optional[str] = None
+        fallback_to: Optional[str] = None
+        fallback_reason: Optional[str] = None
+        fallback_detail: Optional[str] = None
+        fetch_exc: Optional[BaseException] = None
+
         # Step 1: Data provider query
         if data_provider is not None:
             try:
                 df_sym = data_provider.fetch_ohlcv(sym, start=start, end=end, interval="5m")
             except Exception as exc:
+                fetch_exc = exc
                 logger.debug("Provider fetch 5m failed for %s: %s", sym, exc)
+            if not df_sym.empty:
+                source = "data_provider"
+                provider_used = preferred_label or type(data_provider).__name__
 
         # Step 1.5: DuckDBCache fallback if provider returned empty or was not specified
         #
@@ -912,12 +1247,17 @@ def load_intraday_5m_universe(
                         continue
 
                     try:
-                        for p_name in ["BaoStockDataProvider", "EastMoneyDataProvider", "fuyao"]:
+                        # Preferred (caller-configured) provider keys first; the historical
+                        # fallback list only after them. Never a fixed order any more -- that
+                        # fixed order is what served BaoStock's 11-09 bars to a `fuyao` run
+                        # whose own cache rows reached 11-10.
+                        for p_name in provider_order:
                             df_cand = duck_c.query_intraday_bars(
                                 p_name, sym, interval="5m", start=start, end=end
                             )
                             if not df_cand.empty:
                                 df_sym = df_cand
+                                provider_used = str(p_name)
                                 break
                     except Exception as exc:  # noqa: BLE001 - logged, never silent
                         # A readable-but-invalid cache (missing table / locked file) is
@@ -929,6 +1269,7 @@ def load_intraday_5m_universe(
                             exc,
                         )
                         df_sym = pd.DataFrame()
+                        provider_used = None
                         continue
 
                     if df_sym.empty:
@@ -940,6 +1281,34 @@ def load_intraday_5m_universe(
                             db_p,
                         )
                         continue
+
+                    source = "duckdb_cache"
+                    if (
+                        provider_used is not None
+                        and preferred_label is not None
+                        and _intraday_5m_canonical_provider(provider_used) not in preferred_canon
+                    ):
+                        # The caller asked for `preferred_label`; this cache could not serve it.
+                        # Record the switch so no consumer has to infer it from timestamps,
+                        # and never let it look like "the configured provider delivered this".
+                        fallback_from = preferred_label
+                        fallback_to = provider_used
+                        if fetch_exc is not None:
+                            fallback_reason = FALLBACK_REASON_UNSUPPORTED_5M
+                        else:
+                            fallback_reason = FALLBACK_REASON_RETURNED_EMPTY
+                        fallback_detail = (
+                            f"{preferred_label} 在 {os.path.basename(db_p)} 中无 5m 行；"
+                            f"改用 {provider_used}"
+                            + (f"（Step-1 异常: {fetch_exc}）" if fetch_exc is not None else "")
+                        )
+                        logger.warning(
+                            "5m 数据来源回退：%s 在缓存中无 5m 覆盖，%s 改用 %s（reason=%s）",
+                            preferred_label,
+                            sym,
+                            provider_used,
+                            fallback_reason,
+                        )
                     break
 
         # Step 2: Check local lock-free parquets
@@ -963,14 +1332,40 @@ def load_intraday_5m_universe(
                 if not df_sym.empty:
                     df_sym = pd.concat([df_sym, combined_p])
                     df_sym = df_sym[~df_sym.index.duplicated(keep="last")].sort_index()
+                    source = f"{source}+parquet" if source else "duckdb_cache+parquet"
                 else:
                     df_sym = combined_p.sort_index()
+                    source = "parquet"
 
         if df_sym.empty:
             # Explicit unavailability marker (no `enabled`/`Is_Partial_Bar` field exists at
             # this layer -- empty frame is the convention) so a caller/log can distinguish
             # "5m data unavailable" from a frame that merely failed to be requested.
             df_sym.attrs["intraday_5m_available"] = False
+        else:
+            df_sym.attrs["intraday_5m_available"] = True
+            if source:
+                df_sym.attrs["intraday_5m_source"] = source
+            if provider_used:
+                df_sym.attrs["intraday_5m_provider"] = provider_used
+            last_ts = latest_5m_bar_ts(df_sym)
+            if last_ts is not None:
+                df_sym.attrs["intraday_5m_latest_ts"] = _naive(last_ts).isoformat()
+            if fallback_to is not None:
+                df_sym.attrs["fallback_from"] = fallback_from
+                df_sym.attrs["fallback_to"] = fallback_to
+                df_sym.attrs["fallback_reason"] = fallback_reason
+                if fallback_detail:
+                    df_sym.attrs["fallback_reason_detail"] = fallback_detail
+            if expected_last_session is not None:
+                freshness = assess_intraday_5m_freshness(
+                    {"<single>": df_sym},
+                    expected_last_session=expected_last_session,
+                    market=market,
+                )["symbols"]["<single>"]
+                df_sym.attrs["intraday_5m_stale"] = freshness["stale"]
+                df_sym.attrs["intraday_5m_lag_calendar_days"] = freshness["lag_calendar_days"]
+                df_sym.attrs["intraday_5m_freshness_reason"] = freshness["reason"]
         out[sym] = df_sym
 
     return out
