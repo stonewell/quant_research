@@ -104,6 +104,63 @@ class ExecutionTimingError(ValueError):
     """
 
 
+# ---------------------------------------------------------------------------
+# `D3` (2026-11-11) -- "the ticket was generated AFTER the fill it declares"
+# ---------------------------------------------------------------------------
+#
+# THE DEFECT THIS CLOSES.  The two frozen enums say, on every ticket, that the orders fill
+# at the NEXT session's open (`as_of+1` / `next_open`).  Nothing compared that DECLARED
+# instant with the instant the ticket was actually written.  Three consecutive archives
+# (`2026-11-09` -> `local_now=2026-11-10T12:50:14+08:00`, `2026-11-10` ->
+# `2026-11-11T12:27:29+08:00`, `2026-11-11` -> `2026-11-12T12:52:42+08:00`) resolve
+# `execution_date = as_of+1` and were all written around NOON of that very
+# `execution_date`: the declared next-open reference price had already expired when the
+# file appeared, so the ticket could only have been read as a stale "next_open" order.
+# Because nothing failed, the defect was invisible for three sessions.
+#
+# THE RULE (fail-closed, no vocabulary change).  `annotate_executability` compares the
+# planned OPEN of `execution_date` (market-local, from the SAME `MarketClock` spec that
+# produced `execution_date`) against the run's real generation instant and, when the open
+# is already behind us, stamps `executable: false` + `timing_violation` +
+# `lateness_minutes`.  The caller (`scripts/run_live_strategy.py`) then REFUSES to write a
+# ticket (`MissedExecutionOpenError`) and asks for a rerun -- see `disposition`.
+#
+# WHY REFUSE AND NOT "DEFER TO THE NEXT SESSION": carrying `execution_date` forward to a
+# later open while `price_reference` stays `next_open` would be a false statement about
+# which close the prices came from (the vocabulary has no spelling for "close t-1, fill
+# t+2"), and the module docstring above forbids adding a third spelling.  The honest
+# action is "this run cannot be a next-open ticket"; re-run it (which re-prices on the
+# then-latest closed session) or accept a different decision date.
+TIMING_VIOLATION_AFTER_OPEN = "after_open"
+TIMING_VIOLATION_AFTER_CLOSE = "after_close"
+TIMING_DISPOSITION_REFUSED = "refused"
+
+#: Audit fields `annotate_executability` may add.  They are written ONLY when a violation
+#: exists, so a clean run's key set (`execution_timing.json`) is byte-identical to the
+#: pre-D3 one -- an absent field means "not late (or not judgeable)", never "false".
+TIMING_AUDIT_KEYS: Tuple[str, ...] = (
+    "executable",
+    "timing_violation",
+    "lateness_minutes",
+    "planned_open",
+    "planned_close",
+    "disposition",
+    "generated_at",
+    "timing_log",
+)
+
+
+class MissedExecutionOpenError(ExecutionTimingError):
+    """Raised when a ticket would be written AFTER the open it declares as its fill.
+
+    A `ValueError` for the same reason as its parent: the run cannot produce a truthful
+    `as_of+1` / `next_open` ticket, and defaulting one in is exactly the ambiguity LV2
+    removed.  Distinct subclass so a caller/operator can tell "the numbers are malformed"
+    (`ExecutionTimingError`) apart from "the run is too late to mean what it says"
+    (`MissedExecutionOpenError`).
+    """
+
+
 def validate_execution_session(value: Any) -> str:
     """Return `value` if it is a member of `EXECUTION_SESSIONS`, else raise."""
     if value is None or value == "":
@@ -242,6 +299,116 @@ def resolve_execution_timing(
     return timing
 
 
+def _planned_session_instants(
+    clock: Any, execution_date: Optional[str]
+) -> Optional[Tuple[_dt.datetime, _dt.datetime]]:
+    """`(open, close)` of `execution_date` in the clock's market zone, or None.
+
+    Uses the SAME `MarketClock` object that resolved `execution_date`
+    (`_next_trading_session`), so the planned instant and the declared date can never be
+    derived from two different calendars.  `close` honours an early-close day through
+    `MarketSpec.close_time_on`.
+    """
+    if clock is None or not execution_date:
+        return None
+    try:
+        day = _dt.date.fromisoformat(str(execution_date))
+        spec = clock.spec
+        tz = clock.tz
+        open_dt = _dt.datetime.combine(day, spec.morning_open, tzinfo=tz)
+        close_dt = _dt.datetime.combine(day, spec.close_time_on(day), tzinfo=tz)
+    except Exception:
+        return None
+    return open_dt, close_dt
+
+
+def annotate_executability(
+    timing: Mapping[str, Any], clock: Any = None
+) -> Dict[str, Any]:
+    """Return `timing` plus the `D3` executability verdict (only when there IS a violation).
+
+    Not judgeable -> the mapping is returned UNCHANGED (no audit keys), which is also the
+    clean-run shape: `execution_date` unavailable, `clock` absent, or a `run_mode=replay`
+    historical replay (which has no real fill to be late for).  Absence therefore means
+    "no evidence of lateness", never "verified executable=false".
+
+    Judged -> `executable: False`, `timing_violation` in
+    `{after_open, after_close}`, `lateness_minutes` counted from the planned OPEN (so the
+    number is the same quantity in both cases), `planned_open` / `planned_close`,
+    `disposition` (`refused`), and a grep-able `timing_log` line.
+    """
+    result = dict(timing or {})
+    if str(result.get("run_mode") or "live") == "replay":
+        return result
+    if result.get("provenance") == PROVENANCE_REPLAY:
+        return result
+    instants = _planned_session_instants(clock, result.get("execution_date"))
+    if instants is None:
+        return result
+    try:
+        now = clock.now.astimezone(clock.tz)
+    except Exception:
+        return result
+    planned_open, planned_close = instants
+    if now < planned_open:
+        return result
+    violation = (
+        TIMING_VIOLATION_AFTER_CLOSE if now >= planned_close else TIMING_VIOLATION_AFTER_OPEN
+    )
+    lateness = (now - planned_open).total_seconds() / 60.0
+    result.update(
+        {
+            "executable": False,
+            "timing_violation": violation,
+            "lateness_minutes": round(lateness, 1),
+            "planned_open": planned_open.isoformat(),
+            "planned_close": planned_close.isoformat(),
+            "disposition": TIMING_DISPOSITION_REFUSED,
+            # The real generation instant (market-local). `timing["local_now"]` is `None` in
+            # every archived block (`LiveClockContext` has no `local_now()`), so it cannot be
+            # the evidence this verdict is built on or rendered from.
+            "generated_at": now.isoformat(),
+        }
+    )
+    result["timing_log"] = executability_log_line(result)
+    return result
+
+
+def executability_log_line(
+    timing: Mapping[str, Any], generated_at: Optional[str] = None
+) -> str:
+    """One grep-able `[EXECUTION TIMING]` verdict line (violation + disposition + lateness).
+
+    Always rendered -- including the clean case -- so `deploy_stdout` answers "was the fill
+    instant still ahead of the writer?" for EVERY run, not only for the late ones.  A clean
+    line says `executable=true ... disposition=proceed` and, deliberately, does not invent
+    `lateness_minutes` (there is no lateness to report).
+    """
+    timing = timing or {}
+    violation = timing.get("timing_violation")
+    as_of = timing.get("as_of") or "?"
+    execution_date = timing.get("execution_date") or "?"
+    now_text = (
+        generated_at or timing.get("generated_at") or timing.get("local_now") or "unknown instant"
+    )
+    if not violation:
+        return (
+            f"[EXECUTION TIMING] executable=true timing_violation=none disposition=proceed "
+            f"as_of={as_of} execution_date={execution_date} generated_at={now_text} "
+            f"(planned fill is still ahead of the writer)"
+        )
+    return (
+        f"[EXECUTION TIMING] executable=false timing_violation={violation} "
+        f"disposition={timing.get('disposition') or TIMING_DISPOSITION_REFUSED} "
+        f"lateness_minutes={timing.get('lateness_minutes')} "
+        f"as_of={as_of} execution_date={execution_date} "
+        f"planned_open={timing.get('planned_open')} "
+        f"planned_close={timing.get('planned_close')} generated_at={now_text} "
+        f"NOTE=票据未写出, 需重跑 (declared next-open fill already "
+        f"{'closed' if violation == TIMING_VIOLATION_AFTER_CLOSE else 'opened'})"
+    )
+
+
 def execution_window_header(timing: Mapping[str, Any]) -> str:
     """One human-readable line describing WHEN this run actually happened.
 
@@ -368,30 +535,42 @@ def merge_timing_into_summary(timing: Mapping[str, Any]) -> Dict[str, Any]:
     `summary.json` is the per-run key/value store both live stages merge into
     (`common/cli_utils.persist_run_metadata`) and the web layer `update()`s afterwards, so the
     timing survives a Stage-1 -> Stage-2 -> web sequence without a second source of truth.
+
+    (`D3`) The executability audit keys are copied in ONLY when they exist, exactly like
+    `write_execution_timing` does: a clean run's block keeps its pre-D3 key set.
     """
     session, reference = validate_execution_timing(
         (timing or {}).get("execution_session"), (timing or {}).get("price_reference")
     )
+    block = {
+        "as_of": (timing or {}).get("as_of"),
+        "execution_date": (timing or {}).get("execution_date"),
+        "run_mode": (timing or {}).get("run_mode"),
+        "window_gate": (timing or {}).get("window_gate"),
+        "in_window": (timing or {}).get("in_window"),
+        "window_label": (timing or {}).get("window_label"),
+        "provenance": (timing or {}).get("provenance"),
+        "session_state": (timing or {}).get("session_state"),
+        "local_now": (timing or {}).get("local_now"),
+        "overnight_gap_hint": (timing or {}).get("overnight_gap_hint"),
+    }
+    for key in TIMING_AUDIT_KEYS:
+        if (timing or {}).get(key) is not None:
+            block[key] = (timing or {}).get(key)
     return {
         "execution_session": session,
         "price_reference": reference,
-        "execution_timing": {
-            "as_of": (timing or {}).get("as_of"),
-            "execution_date": (timing or {}).get("execution_date"),
-            "run_mode": (timing or {}).get("run_mode"),
-            "window_gate": (timing or {}).get("window_gate"),
-            "in_window": (timing or {}).get("in_window"),
-            "window_label": (timing or {}).get("window_label"),
-            "provenance": (timing or {}).get("provenance"),
-            "session_state": (timing or {}).get("session_state"),
-            "local_now": (timing or {}).get("local_now"),
-            "overnight_gap_hint": (timing or {}).get("overnight_gap_hint"),
-        },
+        "execution_timing": block,
     }
 
 
 def write_execution_timing(output_dir: str, timing: Mapping[str, Any]) -> str:
-    """Persist the timing block beside the ticket (import-safe, no web-layer dependency)."""
+    """Persist the timing block beside the ticket (import-safe, no web-layer dependency).
+
+    (`D3`) Audit keys (`executable` / `timing_violation` / `lateness_minutes` / ...) are
+    appended ONLY when the caller stamped them, so the clean-run payload is byte-identical
+    to the pre-D3 one.
+    """
     import json
     import os
 
@@ -421,6 +600,9 @@ def write_execution_timing(output_dir: str, timing: Mapping[str, Any]) -> str:
             )
         },
     }
+    for key in TIMING_AUDIT_KEYS:
+        if (timing or {}).get(key) is not None:
+            payload[key] = (timing or {}).get(key)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
     return path

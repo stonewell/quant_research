@@ -34,8 +34,9 @@ import argparse
 import copy
 import json
 import os
+import re
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -207,14 +208,106 @@ _RUN_DIR_ROUND_MARKERS = (
     "stage1_health_report.json",
 )
 
-#: Which NAV the gate used. `mtm` == measured; `form_fallback_refused` == degraded.
+#: Which NAV the gate used. `mtm` == measured; `form_fallback_refused` == degraded;
+#: `timebase_mismatch_refused` == a measured number that was REFUSED because its equity
+#: and cash legs do not share one instant (see the `LV1-TIMEBASE` block below).
 NAV_SOURCE_MTM = "mtm"
 NAV_SOURCE_FORM_FALLBACK_REFUSED = "form_fallback_refused"
+NAV_SOURCE_TIMEBASE_REFUSED = "timebase_mismatch_refused"
 
 #: Gate verdict availability. `DEGRADED_NAV_UNAVAILABLE` means the tier below is an
 #: UNEVALUATED placeholder, not a passing verdict.
 NAV_GATE_STATUS_EVALUATED = "EVALUATED"
 NAV_GATE_STATUS_DEGRADED = "DEGRADED_NAV_UNAVAILABLE"
+
+#: ---------------------------------------------------------------------------
+#: (LV1-TIMEBASE, 2026-11-11) `nav_effective` must be ONE instant's NAV.
+#:
+#: THE DEFECT. `nav_effective` is `equity + cash` as the valuation layer computed it.
+#: The two legs are sourced at DIFFERENT times in the live path: the equity leg is
+#: marked at the snapshot's `as_of` (today's close), while the cash leg can be the
+#: PREVIOUS session's settled balance --
+#:
+#:   (a) intraday / pre-trade Stage 1: the LV11 pre-staged snapshot
+#:       (`execution_service.py::run_health_check` -> `_archived_cash_for` ->
+#:       `_resolve_nav(cash=<previous round's summary.json cash>)` ->
+#:       `_write_nav_breakdown`) marks TODAY's book but reuses the LAST ROUND's cash
+#:       residual, and records that provenance as a `cash_from_archive:` warning
+#:       inside `nav_breakdown.json::nav_warnings`.
+#:   (b) post-close / next-day recompute: cash == that day's settled
+#:       `nav_breakdown.json::cash`, and `equity + cash` is genuinely one instant.
+#:
+#: ARCHIVE FACT (2026-11-10/202644, 11-11/205137 -- verified read-only): before
+#: 2026-11-11 the SAME `nav_breakdown.json` path was written TWICE per round --
+#: (a) before the gate child launches, then (b) by Stage 2
+#: (`run_live_deploy` -> `_write_nav_breakdown`), which OVERWRITES it ~0.4 s after
+#: Stage 1 finished. That double-write is now history: since 2026-11-11 the
+#: `nav_breakdown.json` this file reads (`--nav-breakdown-file`) is always the Stage-1
+#: gate snapshot, and the Stage-2 valuation goes to
+#: `nav_breakdown.stage2.json` instead. The archive therefore keeps (b) -- a
+#: perfectly consistent same-instant file -- while `stage1_health_report.json` still
+#: records the `nav_mtm` the gate actually used (208,067.60 / 101,093.32). Replaying the
+#: archived breakdown alone can never reproduce the defect; the pre-staged payload has to
+#: be reconstructed from `equity` + the PREVIOUS session's `summary.json::cash`.
+#:
+#: Mixing them is a silent, enormous NAV error whenever the previous session traded:
+#: 2026-11-10 -> `nav_effective` 208,067.60 = equity 182,471.00 + cash 25,596.60
+#: (11-09's cash; the 11-10 same-instant value was 196,852.32) => +5.14% phantom
+#: gain; 2026-11-11 -> 101,093.32 = 86,712.00 + 14,381.32 (11-10's cash; true
+#: 196,397.11) => -51.59% phantom drawdown => TIER_3_HALT + full liquidation, while
+#: the book had moved -0.23%. A reverse-signed cash move masks real risk just as
+#: easily, so BOTH directions must be refused, never averaged away.
+#:
+#: THE RULE. The gate accepts a measured NAV only when its legs are provably one
+#: instant. Detectors, all from the snapshot itself (no new I/O):
+#:   * `cash_as_of != as_of` (STRUCTURED, written by the valuation layer) => the cash
+#:     leg belongs to another session => mismatch. This is the authoritative signal;
+#:   * `cash_from_archive:` in `nav_warnings` (older snapshots that predate
+#:     `cash_as_of`) => same conclusion, with the archived round's date read from the
+#:     provenance text. A round of the SAME session is not a mismatch;
+#:   * `|nav_effective - (equity + cash)| > NAV_TIMEBASE_LEGS_TOLERANCE` => the file
+#:     contradicts itself => whichever leg is stale, the number is unusable.
+#:
+#: THE PRODUCER now refuses to publish such a NAV at all: a cross-timebase staged
+#: snapshot carries `nav_effective=None` + `cash_as_of` + `nav_degradation_reason`, so the
+#: gate degrades on `NAV_EFFECTIVE_MISSING` before any number reaches the breaker. The
+#: checks below are the second line of defence -- they cover archives written by older
+#: builders and any future writer that reintroduces the mixed sum.
+#:
+#: On a mismatch the number is REFUSED: `nav_source = "timebase_mismatch_refused"`,
+#: `nav_gate_status = "DEGRADED_NAV_UNAVAILABLE"`, `nav_gate_nav = None` => tier
+#: UNKNOWN => Stage 2 refuses to issue a ticket. Deliberately NOT a fallback to
+#: `nav_form`: that is the frozen operator value LV1 already banned from the gate
+#: arithmetic (invalidation condition (ii)), and it is stale in exactly the same
+#: direction. Deliberately NOT "repair from the legs" either: when the cash leg is
+#: the previous session's settled balance, the same-instant cash is simply NOT IN THE
+#: SNAPSHOT, so any repair would be an invention. Refusing is the conservative
+#: choice -- it costs a re-staged snapshot, never an unwanted liquidation.
+#:
+#: `--nav-cash-leg` makes the (a)/(b) distinction explicit for callers that know:
+#:   * `auto` (default) -- infer from the snapshot (the two detectors above);
+#:   * `same_instant` -- the caller asserts cash and equity are one instant; still
+#:     enforces the legs tolerance, but ignores the archive marker;
+#:   * `prior_close` -- the caller asserts the cash leg is a settled prior-close
+#:     balance (semantic (a)); the mixed NAV can NEVER be a same-instant NAV, so it
+#:     is refused outright.
+#: ---------------------------------------------------------------------------
+NAV_TIMEBASE_STATUS_OK = "OK"
+#: Could not be measured (no `equity`/`cash` legs, `cash_source="missing"`, or an
+#: explicit NAV override): no claim is made, and the pre-existing behaviour stands.
+NAV_TIMEBASE_STATUS_UNVERIFIABLE = "UNVERIFIABLE"
+NAV_TIMEBASE_STATUS_CASH_LEG_PRIOR_ROUND = "CASH_LEG_PRIOR_ROUND"
+NAV_TIMEBASE_STATUS_LEGS_MISMATCH = "LEGS_MISMATCH"
+#: Fixed, grep-able prefix required by the LV1-TIMEBASE contract.
+NAV_TIMEBASE_MISMATCH_PREFIX = "[NAV TIMEBASE MISMATCH]"
+#: Money tolerance for `nav_effective == equity + cash` (one currency unit).
+NAV_TIMEBASE_LEGS_TOLERANCE = 1.0
+#: The producer's marker for "cash came from a PREVIOUS round's summary.json".
+NAV_TIMEBASE_CASH_FROM_ARCHIVE_MARKER = "cash_from_archive:"
+NAV_CASH_LEG_AUTO = "auto"
+NAV_CASH_LEG_SAME_INSTANT = "same_instant"
+NAV_CASH_LEG_PRIOR_CLOSE = "prior_close"
+NAV_CASH_LEG_CHOICES = (NAV_CASH_LEG_AUTO, NAV_CASH_LEG_SAME_INSTANT, NAV_CASH_LEG_PRIOR_CLOSE)
 
 
 def _fmt_metric(value: Any, spec: str, na: str = "N/A") -> str:
@@ -262,6 +355,21 @@ def parse_args(args: Optional[List[str]] = None):
             "(default: nav_breakdown.json in --output-dir, i.e. the file the web valuation layer "
             "writes next to account_state.json). This file -- not --portfolio-value -- supplies "
             "the drawdown / circuit-breaker NAV."
+        ),
+    )
+    parser.add_argument(
+        "--nav-cash-leg",
+        choices=list(NAV_CASH_LEG_CHOICES),
+        default=NAV_CASH_LEG_AUTO,
+        help=(
+            "(LV1-TIMEBASE) Which timebase the snapshot's CASH leg belongs to. "
+            "`auto` (default): infer from nav_breakdown.json -- a `cash_from_archive:` "
+            "provenance line means the cash leg is a PREVIOUS round's settled residual while "
+            "the equity leg is marked at this as_of, and the mixed NAV is refused (tier "
+            "UNKNOWN). `same_instant`: the caller asserts equity and cash are one instant; "
+            "only the equity+cash tolerance is enforced. `prior_close`: the caller asserts "
+            "the cash leg is the previous close's settled balance (semantic (a)), so the "
+            "mixed NAV can never be a same-instant NAV and is refused outright."
         ),
     )
     parser.add_argument(
@@ -505,11 +613,172 @@ def load_nav_breakdown(
     return payload, NAV_BREAKDOWN_STATUS_OK
 
 
+def _finite_float(value: Any) -> Optional[float]:
+    """`float(value)` when it is a finite real number, else `None` (never a guess)."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if np.isfinite(out) else None
+
+
+def _cash_from_archive_warning(nav_breakdown: Any) -> Optional[str]:
+    """The producer's `cash_from_archive:` provenance line, if present (LV1-TIMEBASE).
+
+    `execution_service.py` appends this to `nav_warnings` precisely when the LV11
+    pre-staged snapshot reused a PREVIOUS round's `summary.json::cash`. Absent => no such
+    claim, and the legs tolerance is the only detector left.
+    """
+    warnings = nav_breakdown.get("nav_warnings") if isinstance(nav_breakdown, dict) else None
+    if not isinstance(warnings, (list, tuple)):
+        return None
+    for entry in warnings:
+        if isinstance(entry, str) and entry.startswith(NAV_TIMEBASE_CASH_FROM_ARCHIVE_MARKER):
+            return entry
+    return None
+
+
+def _archive_cash_is_same_session(archive_warning: str, nav_breakdown: Dict[str, Any]) -> bool:
+    """Is the archived cash from THIS snapshot's session (=> same instant, no mismatch)?
+
+    "Previous ROUND" is not automatically "previous SESSION": on a same-day re-run the
+    pre-staged cash can come from an earlier round of the SAME session (`runs/.../<date>/`),
+    where it is the day's settled balance and the legs do share one instant. Refusing that
+    would be a false positive, so the archive date is read from the provenance text (the
+    producer embeds the `summary.json` path, which is keyed by date -- see
+    `execution_service._archived_cash_for`).
+
+    Unparseable provenance is treated as a DIFFERENT session (the conservative reading: the
+    warning literally says 上一轮, and `--nav-cash-leg same_instant` is the documented
+    operator override).
+    """
+    as_of = nav_breakdown.get("as_of") if isinstance(nav_breakdown, dict) else None
+    if not isinstance(as_of, str) or not as_of:
+        return False
+    dates = re.findall(r"\d{4}-\d{2}-\d{2}", archive_warning)
+    if not dates:
+        return False
+    # The path is appended last; the LAST date is the archived round's own directory date.
+    return dates[-1] >= as_of
+
+
+def assess_nav_timebase(
+    nav_breakdown: Optional[Dict[str, Any]],
+    nav_effective: Optional[float],
+    cash_leg_basis: str = NAV_CASH_LEG_AUTO,
+) -> Dict[str, Any]:
+    """PURE check that `nav_effective`'s equity and cash legs share ONE instant.
+
+    See the `LV1-TIMEBASE` block above `NAV_TIMEBASE_STATUS_OK` for the defect this
+    closes and for why a mismatch is REFUSED rather than repaired or replaced by the
+    operator form value.
+
+    Never raises, never invents a number: every unmeasurable case returns
+    `NAV_TIMEBASE_STATUS_UNVERIFIABLE`, which leaves the pre-existing behaviour
+    untouched (a snapshot that does not carry legs is not thereby accused).
+    """
+    basis = cash_leg_basis if cash_leg_basis in NAV_CASH_LEG_CHOICES else NAV_CASH_LEG_AUTO
+    payload = nav_breakdown if isinstance(nav_breakdown, dict) else {}
+    equity = _finite_float(payload.get("equity"))
+    cash = _finite_float(payload.get("cash"))
+    cash_source_raw = payload.get("cash_source")
+    cash_source = cash_source_raw if isinstance(cash_source_raw, str) else None
+    nav_source_raw = payload.get("nav_source")
+    nav_source = nav_source_raw if isinstance(nav_source_raw, str) else None
+    # `cash_source == "missing"` means the engine had NO resolvable cash and wrote 0.0
+    # as an explicit UNDERSTATEMENT; `equity + 0.0` is not a same-instant NAV, so the
+    # legs cannot be used as evidence either way.
+    legs_nav: Optional[float] = None
+    if equity is not None and cash is not None and cash_source != "missing":
+        legs_nav = float(equity + cash)
+    mtm_value = _finite_float(nav_effective)
+    legs_delta: Optional[float] = None
+    if legs_nav is not None and mtm_value is not None:
+        legs_delta = float(mtm_value - legs_nav)
+    archive_warning = _cash_from_archive_warning(payload)
+    # (LV1-TIMEBASE) STRUCTURED timebase first: `cash_as_of` is written by the valuation
+    # layer itself (`_write_nav_breakdown`), so no date is ever parsed out of a log line.
+    cash_as_of_raw = payload.get("cash_as_of")
+    cash_as_of = cash_as_of_raw if isinstance(cash_as_of_raw, str) else None
+    snapshot_as_of = payload.get("as_of") if isinstance(payload.get("as_of"), str) else None
+
+    status = NAV_TIMEBASE_STATUS_UNVERIFIABLE
+    detail: Optional[str] = None
+    if nav_source == "override":
+        # An explicit override IS the operator's signed assertion; the engine's legs are
+        # a reference for the diff line only and are EXPECTED to differ. Refusing here
+        # would break the one documented acknowledged-NAV path.
+        detail = "nav_source=override：人工覆盖净值不参与腿间校验（记账为 override）"
+    elif basis == NAV_CASH_LEG_PRIOR_CLOSE:
+        status = NAV_TIMEBASE_STATUS_CASH_LEG_PRIOR_ROUND
+        detail = (
+            f"调用方显式声明 --nav-cash-leg={NAV_CASH_LEG_PRIOR_CLOSE}：现金腿是上一收盘的"
+            "已结算余额，而权益腿是本快照 as_of 的盯市价——两腿不同时点，拒绝用于门禁"
+        )
+    elif (
+        basis == NAV_CASH_LEG_AUTO
+        and cash_as_of is not None
+        and snapshot_as_of is not None
+        and cash_as_of != snapshot_as_of
+    ):
+        status = NAV_TIMEBASE_STATUS_CASH_LEG_PRIOR_ROUND
+        detail = (
+            "现金腿时间戳与权益腿不同：cash_as_of="
+            f"{cash_as_of} != as_of={snapshot_as_of}（快照自带结构化字段 `cash_as_of`）"
+            f"；nav_effective={mtm_value}（equity={equity} + cash={cash}）不可作为门禁净值"
+        )
+    elif (
+        archive_warning is not None
+        and basis == NAV_CASH_LEG_AUTO
+        and not _archive_cash_is_same_session(archive_warning, payload)
+    ):
+        status = NAV_TIMEBASE_STATUS_CASH_LEG_PRIOR_ROUND
+        detail = (
+            "现金腿取自上一轮归档（快照自带 provenance："
+            f"`{archive_warning}`），权益腿却是本 as_of 的盯市价 → 两腿不同时点；"
+            f"nav_effective={mtm_value}（equity={equity} + cash={cash}）不可作为门禁净值"
+        )
+    elif legs_nav is None:
+        detail = "快照未同时给出可用的 equity / cash 腿（或 cash_source=missing），无法判定时点"
+    elif legs_delta is not None and abs(legs_delta) > NAV_TIMEBASE_LEGS_TOLERANCE:
+        status = NAV_TIMEBASE_STATUS_LEGS_MISMATCH
+        detail = (
+            f"快照自相矛盾：nav_effective={mtm_value:,.2f} 与 equity+cash="
+            f"{legs_nav:,.2f} 相差 {legs_delta:+,.2f}（容差 ±{NAV_TIMEBASE_LEGS_TOLERANCE:,.2f}）"
+            f"→ 至少一条腿的时点/来源与本轮不一致"
+            + (f"（equity={equity:,.2f}, cash={cash:,.2f}, cash_source={cash_source}）")
+        )
+    else:
+        status = NAV_TIMEBASE_STATUS_OK
+        detail = None
+
+    return {
+        "status": status,
+        "detail": detail,
+        "equity": equity,
+        "cash": cash,
+        "cash_source": cash_source,
+        "cash_as_of": cash_as_of,
+        "legs_nav": legs_nav,
+        "legs_delta": legs_delta,
+        "cash_leg_basis": (
+            NAV_CASH_LEG_PRIOR_CLOSE
+            if status == NAV_TIMEBASE_STATUS_CASH_LEG_PRIOR_ROUND
+            else NAV_CASH_LEG_SAME_INSTANT
+        )
+        if status != NAV_TIMEBASE_STATUS_UNVERIFIABLE
+        else basis,
+    }
+
+
 def resolve_gate_nav(
     nav_breakdown: Optional[Dict[str, Any]],
     form_nav: Optional[float],
     breakdown_status: str = NAV_BREAKDOWN_STATUS_OK,
     deviation_threshold: float = NAV_DEVIATION_WARN_PCT,
+    cash_leg_basis: str = NAV_CASH_LEG_AUTO,
 ) -> Dict[str, Any]:
     """PURE resolver for the Stage-1 gate NAV (LV1). No I/O, no globals mutated.
 
@@ -529,6 +798,10 @@ def resolve_gate_nav(
         `nav_gate_status = "DEGRADED_NAV_UNAVAILABLE"`, `gate_nav = None`, and the
         deviation fields are `None` (NOT `False`) so "not measurable" can never be
         read as "inside threshold".
+      * MTM present but its legs span two instants (LV1-TIMEBASE) ->
+        `nav_source = "timebase_mismatch_refused"`, same degraded gate status and
+        `None` deviation fields, `nav_mtm = None` (the refused number survives as
+        `nav_rejected_nav_effective` for audit only). See `assess_nav_timebase`.
 
     Deviation is signed and measured against the form value:
     `(mtm - form) / |form|`. A negative value means the form overstates NAV -- the
@@ -580,7 +853,49 @@ def resolve_gate_nav(
                 f"nav_breakdown.json 未提供可用的 {NAV_BREAKDOWN_EFFECTIVE_KEY} "
                 f"(status={status})：门禁净值不可判定，表单值 {form_val} 仅作占位显示，"
                 "不构成盯市净值，熔断状态按 UNKNOWN 处理（缺失 ≠ 未触发）"
+                # (LV1-TIMEBASE) The producer's own reason, when it withheld `nav_effective`
+                # on purpose (e.g. a cross-timebase staged snapshot), so the archive says
+                # WHY instead of only "missing".
+                + (
+                    f"；生产端声明: {nav_breakdown.get('nav_degradation_reason')}"
+                    if isinstance(nav_breakdown, dict)
+                    and isinstance(nav_breakdown.get("nav_degradation_reason"), str)
+                    else ""
+                )
             ),
+        }
+
+    # (LV1-TIMEBASE) A measured number is only usable when BOTH legs belong to the same
+    # instant. A silent acceptance here is exactly how the 11-10 / 11-11 phantom
+    # +5.14% / -51.59% NAVs reached the circuit breaker.
+    timebase = assess_nav_timebase(nav_breakdown, mtm, cash_leg_basis)
+    if timebase["status"] in (
+        NAV_TIMEBASE_STATUS_CASH_LEG_PRIOR_ROUND,
+        NAV_TIMEBASE_STATUS_LEGS_MISMATCH,
+    ):
+        return {
+            "nav_source": NAV_SOURCE_TIMEBASE_REFUSED,
+            "nav_mtm": None,
+            "nav_form": form_val,
+            "nav_deviation_pct": None,
+            "nav_deviation_exceeded": None,
+            "nav_deviation_threshold_pct": float(deviation_threshold),
+            "nav_breakdown_status": status,
+            "nav_breakdown_as_of": as_of,
+            "nav_gate_status": NAV_GATE_STATUS_DEGRADED,
+            "nav_gate_nav": None,
+            "nav_degradation_reason": f"{NAV_TIMEBASE_MISMATCH_PREFIX} {timebase['detail']}",
+            # Audit trail: which snapshot number was refused, and on what evidence.
+            "nav_timebase_status": timebase["status"],
+            "nav_timebase_detail": timebase["detail"],
+            "nav_cash_leg_basis": timebase["cash_leg_basis"],
+            "nav_rejected_nav_effective": mtm,
+            "nav_equity": timebase["equity"],
+            "nav_cash": timebase["cash"],
+            "nav_cash_source": timebase["cash_source"],
+            "nav_cash_as_of": timebase["cash_as_of"],
+            "nav_legs_nav": timebase["legs_nav"],
+            "nav_legs_delta": timebase["legs_delta"],
         }
 
     deviation_pct: Optional[float] = None
@@ -601,6 +916,11 @@ def resolve_gate_nav(
         "nav_gate_status": NAV_GATE_STATUS_EVALUATED,
         "nav_gate_nav": mtm,
         "nav_degradation_reason": None,
+        # Additive provenance: `OK` / `UNVERIFIABLE` are the only values reachable on
+        # this path (a mismatch returned above). Kept OUT of `attach_nav_provenance`'s
+        # unconditional key list so a clean run's published key set does not change.
+        "nav_timebase_status": timebase["status"],
+        "nav_timebase_detail": timebase["detail"],
     }
 
 
@@ -624,15 +944,40 @@ def resolve_gate_nav_context(args) -> Dict[str, Any]:
         payload,
         getattr(args, "portfolio_value", None),
         breakdown_status=status,
+        cash_leg_basis=getattr(args, "nav_cash_leg", NAV_CASH_LEG_AUTO),
+    )
+    _timebase_refused = resolution.get("nav_timebase_status") in (
+        NAV_TIMEBASE_STATUS_CASH_LEG_PRIOR_ROUND,
+        NAV_TIMEBASE_STATUS_LEGS_MISMATCH,
     )
     if resolution["nav_gate_nav"] is None:
-        # LOUD, not silent.
-        print(
-            "[WARN] (LV1) 门禁净值降级: 取不到盯市净值 "
-            f"({resolution['nav_degradation_reason']})。"
-            "本次回撤/熔断判定为 UNKNOWN，**不是**「未触发」；"
-            "请恢复 nav_breakdown.json 后重跑，勿用表单值替代盯市净值。"
-        )
+        # LOUD, not silent. A TIMEBASE refusal is reported by its own (more precise) line
+        # below: there the snapshot DID yield an MTM, it was rejected as mixed-instant --
+        # saying "取不到盯市净值" about it would be wrong.
+        if not _timebase_refused:
+            print(
+                "[WARN] (LV1) 门禁净值降级: 取不到盯市净值 "
+                f"({resolution['nav_degradation_reason']})。"
+                "本次回撤/熔断判定为 UNKNOWN，**不是**「未触发」；"
+                "请恢复 nav_breakdown.json 后重跑，勿用表单值替代盯市净值。"
+            )
+        # (LV1-TIMEBASE) A REFUSED number needs its own, grep-able line: "the snapshot
+        # exists but its legs span two instants" is a different operational fact from
+        # "no snapshot", and only this one is repaired by re-marking the book.
+        if _timebase_refused:
+            print(
+                f"{NAV_TIMEBASE_MISMATCH_PREFIX} (LV1-TIMEBASE) 拒绝用该 nav_effective "
+                f"驱动熔断判定: status={resolution.get('nav_timebase_status')}; "
+                f"rejected nav_effective={resolution.get('nav_rejected_nav_effective')!r}; "
+                f"equity={resolution.get('nav_equity')!r}, cash={resolution.get('nav_cash')!r}, "
+                f"cash_source={resolution.get('nav_cash_source')!r}, "
+                f"equity+cash={resolution.get('nav_legs_nav')!r}。\n"
+                f"  理由: {resolution.get('nav_timebase_detail')}\n"
+                "  权益腿与现金腿必须属于同一时点；本次按保守档处理（tier = UNKNOWN，"
+                "Stage 2 将拒绝出票）。请用同一时点的持仓 + 已结算现金重新产出 "
+                "nav_breakdown.json 后重跑 Stage 1；若确实要按上一收盘已结算现金计价，"
+                "显式加 `--nav-cash-leg prior_close` 让口径落档。"
+            )
         # (LV11) Say WHICH kind of absence this is. A timing gap is recoverable by staging
         # the snapshot (the web layer now does that before launching Stage 1); a lost
         # snapshot means this run directory already had one and it disappeared.
@@ -688,6 +1033,27 @@ def attach_nav_provenance(dd_info: Dict[str, Any], nav_resolution: Dict[str, Any
         "nav_degradation_reason",
     ):
         dd_info[key] = nav_resolution.get(key)
+    # (LV1-TIMEBASE) Persisted ONLY when a mismatch was measured, so a clean run's
+    # published key set stays byte-identical (the LV1 key-set contract). A refused
+    # number must be auditable from the archive: which snapshot value was thrown out,
+    # and the legs that made it unusable.
+    if nav_resolution.get("nav_timebase_status") in (
+        NAV_TIMEBASE_STATUS_CASH_LEG_PRIOR_ROUND,
+        NAV_TIMEBASE_STATUS_LEGS_MISMATCH,
+    ):
+        for key in (
+            "nav_timebase_status",
+            "nav_timebase_detail",
+            "nav_cash_leg_basis",
+            "nav_rejected_nav_effective",
+            "nav_equity",
+            "nav_cash",
+            "nav_cash_source",
+            "nav_cash_as_of",
+            "nav_legs_nav",
+            "nav_legs_delta",
+        ):
+            dd_info[key] = nav_resolution.get(key)
     if nav_resolution.get("nav_gate_nav") is None:
         dd_info["tier_status"] = "UNKNOWN"
         dd_info["tier_label"] = (
@@ -824,6 +1190,16 @@ def build_account_state_update(
             "tier_status": dd_info.get("tier_status"),
         }
     )
+    # (LV1-TIMEBASE) Only on a measured mismatch: the archive must say which snapshot
+    # value was refused and which legs made it unusable. A clean run writes neither key.
+    if dd_info.get("nav_timebase_status") in (
+        NAV_TIMEBASE_STATUS_CASH_LEG_PRIOR_ROUND,
+        NAV_TIMEBASE_STATUS_LEGS_MISMATCH,
+    ):
+        updated_state["nav_timebase_status"] = dd_info.get("nav_timebase_status")
+        updated_state["nav_timebase_detail"] = dd_info.get("nav_timebase_detail")
+        updated_state["nav_cash_leg_basis"] = dd_info.get("nav_cash_leg_basis")
+        updated_state["nav_rejected_nav_effective"] = dd_info.get("nav_rejected_nav_effective")
     return updated_state
 
 
@@ -1460,88 +1836,568 @@ def evaluate_market_breadth_and_thrust(
     }
 
 
+#: Minimum number of daily observations a volatility estimate may be built from.
+#: (D7, 2026-11-11) A 21-day realized volatility computed from FEWER than 21 bars is
+#: not a 21-day realized volatility. The pre-D7 code accepted `>= 10` bars for the
+#: Garman-Klass branch (and silently used whatever `iloc[-21:]` happened to contain),
+#: i.e. a short history produced a number that LOOKED like a full-window estimate.
+#: Short history is now an explicit degradation (null + reason), never a number.
+VOL_MIN_OBS = 21
+
+#: Reason code emitted when no symbol has enough history to estimate volatility.
+VOL_DEGRADED_INSUFFICIENT_HISTORY = "insufficient_history"
+
+
 def evaluate_realized_volatility(
     universe: Dict[str, pd.DataFrame],
     params: Dict[str, Any],
+    as_of: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Compute 21-day realized market volatility and Barroso volatility targeting scaling factor."""
+    """Compute 21-day realized market volatility and Barroso volatility targeting scaling factor.
+
+    (D7, 2026-11-11) TWO DEFECTS FIXED HERE -- both of the "stale risk input / silent
+    degradation" family, and both visible in the archived `chan_four_state_blend`
+    snapshots for 2026-11-09/10/11, where `realized_vol_21d` was identical to 16
+    decimal places (0.3240854096084951) and `vol_scaling_factor` frozen at 0.370273
+    while `breadth`/`thrust` changed every day.
+
+    1. STALE INTRADAY WINDOW OVERRIDING A FRESH DAILY ESTIMATE. The 5m downside
+       semivariance branch below reads the `RS_Down_5m` column joined onto the DAILY
+       frame, then `.dropna()` -> `.iloc[-21:]`. `dropna()` makes the window END AT
+       THE LAST NON-NaN DATE, not at `as_of`: when the intraday cache stops on
+       2026-11-09, the 11-10 and 11-11 windows silently re-use the SAME 21
+       observations ending 11-09 and overwrite the (correctly recomputed, as-of)
+       Garman-Klass value. The window endpoint was invisible in the report, so
+       "frozen volatility" had no discoverable cause. Now: `as_of` is passed in, the
+       intraday window end is MEASURED, and a window that does not reach `as_of` is
+       REJECTED (`vol_intraday_rejected_reason`, `vol_intraday_input_stale`) instead
+       of being used. The daily branches are truncated to `as_of` defensively too.
+
+    2. INSUFFICIENT HISTORY SILENTLY FABRICATED A NUMBER. With no estimable symbol
+       the old code set `vol_21d = target_vol` (i.e. scale = 1.0) while still
+       reporting a `vol_model` and `vol_elevated: false` -- indistinguishable from a
+       measured calm market. Now: `realized_vol_21d = None`, an explicit
+       `vol_degraded`/`vol_degraded_reason_code`/`vol_degraded_reason` triple, and
+       `vol_scaling_factor = 1.0` labelled `vol_scaling_fallback:
+       "insufficient_history"` so the neutral scaling is never read as a measurement.
+       The SAME rule now applies to the 5m branch: it used to accept 5 observations
+       while still calling the result "21d" (the archived 0.3240854096084951 was a
+       16-session semivariance -- the BaoStock 5m cache starts 2026-10-19), so
+       eligibility there also requires VOL_MIN_OBS.
+
+    Every window endpoint actually used is persisted (`vol_window_start` /
+    `vol_window_end` / `vol_n_obs` / `vol_input_bars_last_date`), so a stale input is
+    visible in the report instead of having to be reverse-engineered from a repeated
+    float.
+    """
     target_vol = float(resolve_blend_param(params, "target_vol", 0.12, float))
     vol_model = str(resolve_blend_param(params, "vol_model", "garman_klass", str)).lower()
     cash_proxy = params.get("cash_proxy", "BIL")
 
-    vol_estimates = []
+    as_of_ts: Optional[pd.Timestamp] = None
+    if as_of is not None:
+        try:
+            as_of_ts = pd.Timestamp(as_of).normalize()
+        except (TypeError, ValueError):
+            as_of_ts = None
+
+    def _truncate(df: pd.DataFrame) -> pd.DataFrame:
+        """Point-in-time truncation. The caller already truncates, but the window end
+        of THIS function is what the report now certifies, so it is enforced here."""
+        if as_of_ts is not None and isinstance(df.index, pd.DatetimeIndex):
+            return df.loc[:as_of_ts]
+        return df
+
+    vol_estimates: List[float] = []
     gk_count = 0
+    #: per-symbol last bar date of the window that actually fed its estimate
+    daily_window_ends: List[pd.Timestamp] = []
+    daily_window_starts: List[pd.Timestamp] = []
+    daily_obs: List[int] = []
+    skipped_symbols: List[str] = []
+
     for sym, df in universe.items():
         if sym == cash_proxy or df.empty or "Close" not in df:
             continue
+        df = _truncate(df)
+        if df.empty:
+            skipped_symbols.append(sym)
+            continue
+
         # Extreme-value Garman-Klass (1980) volatility using OHLC bars
         if vol_model == "garman_klass" and all(c in df.columns for c in ("High", "Low", "Close", "Open")):
             h = df["High"].replace(0, np.nan)
             l = df["Low"].replace(0, np.nan)
             c = df["Close"].replace(0, np.nan)
             o = df["Open"].replace(0, np.nan)
-            if not (h == l).all() and len(c.dropna()) >= 10:
-                log_hl = np.log((h / l).clip(lower=1e-6)) ** 2
-                log_co = np.log((c / o).clip(lower=1e-6)) ** 2
-                gk_var = 0.5 * log_hl - (2.0 * np.log(2.0) - 1.0) * log_co
-                gk_var = gk_var.clip(lower=0.0)
-                gk_vol = float(np.sqrt(gk_var.iloc[-21:].mean() * 252.0))
+            log_hl = np.log((h / l).clip(lower=1e-6)) ** 2
+            log_co = np.log((c / o).clip(lower=1e-6)) ** 2
+            gk_var = (0.5 * log_hl - (2.0 * np.log(2.0) - 1.0) * log_co).clip(lower=0.0)
+            gk_var_valid = gk_var.dropna()
+            if not (h == l).all() and len(gk_var_valid) >= VOL_MIN_OBS:
+                window = gk_var_valid.iloc[-VOL_MIN_OBS:]
+                gk_vol = float(np.sqrt(window.mean() * 252.0))
                 if not np.isnan(gk_vol) and gk_vol > 0:
                     vol_estimates.append(gk_vol)
                     gk_count += 1
+                    daily_window_ends.append(pd.Timestamp(window.index[-1]))
+                    daily_window_starts.append(pd.Timestamp(window.index[0]))
+                    daily_obs.append(int(len(window)))
                     continue
 
-        # Close-to-close fallback
+        # Close-to-close fallback (needs VOL_MIN_OBS RETURNS, hence VOL_MIN_OBS+1 prices)
         c = df["Close"].dropna()
-        if len(c) > 22:
+        if len(c) >= VOL_MIN_OBS + 1:
             ret = c.pct_change().dropna()
-            cc_vol = float(ret.iloc[-21:].std() * np.sqrt(252))
+            window = ret.iloc[-VOL_MIN_OBS:]
+            cc_vol = float(window.std() * np.sqrt(252))
             if not np.isnan(cc_vol) and cc_vol > 0:
                 vol_estimates.append(cc_vol)
+                daily_window_ends.append(pd.Timestamp(window.index[-1]))
+                daily_window_starts.append(pd.Timestamp(window.index[0]))
+                daily_obs.append(int(len(window)))
+                continue
+        skipped_symbols.append(sym)
 
-    if vol_estimates:
-        vol_21d = float(np.median(vol_estimates))
-    else:
-        vol_21d = target_vol
-
-    scale = min(1.0, target_vol / vol_21d) if vol_21d > 0 else 1.0
-    active_model = "Garman-Klass (1980)" if (gk_count > 0 and vol_model == "garman_klass") else "Close-to-Close"
+    vol_21d: Optional[float] = float(np.median(vol_estimates)) if vol_estimates else None
+    input_source = (
+        "unavailable"
+        if vol_21d is None
+        else ("garman_klass_ohlc" if (gk_count > 0 and vol_model == "garman_klass") else "close_to_close")
+    )
+    active_model = {
+        "garman_klass_ohlc": "Garman-Klass (1980)",
+        "close_to_close": "Close-to-Close",
+        "unavailable": "Unavailable (insufficient history)",
+    }[input_source]
+    scale = min(1.0, target_vol / vol_21d) if (vol_21d is not None and vol_21d > 0) else 1.0
 
     # Downside semivariance & jump check
-    downside_estimates = []
-    signed_jumps = []
+    #
+    # (D7 second finding) This branch used to accept `len(rs_down_s) >= 5` while still
+    # calling the result a "21-day" volatility: on the archived cache the BaoStock 5m
+    # history only starts 2026-10-19, i.e. 16 sessions, so 0.3240854096084951 was a
+    # 16-observation semivariance wearing a 21-day label. Eligibility now requires
+    # VOL_MIN_OBS, exactly like the daily branch; the observed window end/length is
+    # still MEASURED and reported for every symbol that has any 5m feature, so a stale
+    # or short 5m cache remains visible even when it cannot be used.
+    downside_estimates: List[float] = []
+    signed_jumps: List[float] = []
+    intraday_window_ends: List[pd.Timestamp] = []
+    intraday_window_starts: List[pd.Timestamp] = []
+    intraday_obs: List[int] = []
+    intraday_obs_all: List[int] = []
     for sym, df in universe.items():
         if sym == cash_proxy or df.empty:
             continue
+        df = _truncate(df)
+        if df.empty:
+            continue
         if "RS_Down_5m" in df.columns:
             rs_down_s = df["RS_Down_5m"].dropna()
-            if len(rs_down_s) >= 5:
-                down_vol = float(np.sqrt(252.0 * (2.0 * rs_down_s).iloc[-21:].mean()))
+            if len(rs_down_s) > 0:
+                intraday_window_ends.append(pd.Timestamp(rs_down_s.index[-1]))
+                intraday_obs_all.append(int(len(rs_down_s)))
+            if len(rs_down_s) >= VOL_MIN_OBS:
+                window = rs_down_s.iloc[-VOL_MIN_OBS:]
+                down_vol = float(np.sqrt(252.0 * (2.0 * window).mean()))
                 if not np.isnan(down_vol) and down_vol > 0:
                     downside_estimates.append(down_vol)
+                    intraday_window_starts.append(pd.Timestamp(window.index[0]))
+                    intraday_obs.append(int(len(window)))
         if "Signed_Jump_5m" in df.columns:
             sj = df["Signed_Jump_5m"].dropna()
             if len(sj) > 0:
                 signed_jumps.append(float(sj.iloc[-1]))
 
-    if downside_estimates:
+    intraday_used = False
+    intraday_rejected_reason: Optional[str] = None
+    intraday_window_end: Optional[pd.Timestamp] = max(intraday_window_ends) if intraday_window_ends else None
+    intraday_available_obs: Optional[int] = min(intraday_obs_all) if intraday_obs_all else None
+    intraday_stale = bool(
+        intraday_window_end is not None
+        and as_of_ts is not None
+        and intraday_window_end.normalize() < as_of_ts
+    )
+    intraday_eligible = bool(downside_estimates)
+
+    if intraday_window_end is not None and intraday_stale:
+        # THE D7 DEFECT, refused. The 5m feature window stops BEFORE `as_of`, so this
+        # estimate is not an as-of measurement: it is the previous session's number
+        # wearing today's date. Overwriting the fresh daily estimate with it is what
+        # froze `realized_vol_21d` across three sessions (11-10/11-11 re-used the
+        # 11-09 window). Recorded, never silently applied.
+        intraday_rejected_reason = (
+            f"5m downside-semivariance window ends {intraday_window_end.date()} < as_of "
+            f"{as_of_ts.date()} (intraday feature inputs are stale); rejected so a stale "
+            "window cannot override the as-of daily estimate"
+        )
+    elif intraday_window_end is not None and not intraday_eligible:
+        intraday_rejected_reason = (
+            f"5m downside semivariance has only {intraday_available_obs} usable sessions "
+            f"(< {VOL_MIN_OBS}); a shorter window is not a 21-day estimate"
+        )
+
+    if downside_estimates and not intraday_stale:
         downside_vol_21d = float(np.median(downside_estimates))
         med_jump = float(np.median(signed_jumps)) if signed_jumps else 0.0
         if med_jump >= 0.0:
             eff_vol = downside_vol_21d
             active_model = "5m Downside Semivariance (Patton & Sheppard 2015)"
         else:
-            eff_vol = max(vol_21d, downside_vol_21d)
+            eff_vol = max(vol_21d, downside_vol_21d) if vol_21d is not None else downside_vol_21d
             active_model = "Garman-Klass / Downside Vol Max"
-        scale = min(1.0, target_vol / eff_vol) if eff_vol > 0 else 1.0
-        vol_21d = eff_vol
+        if eff_vol > 0:
+            scale = min(1.0, target_vol / eff_vol)
+            vol_21d = eff_vol
+            intraday_used = True
+            input_source = "downside_semivariance_5m"
+
+    # --- Explicit degradation (never a silent `target_vol` substitute) -----------
+    vol_degraded = vol_21d is None
+    vol_degraded_reason_code: Optional[str] = None
+    vol_degraded_reason: Optional[str] = None
+    if vol_degraded:
+        vol_degraded_reason_code = VOL_DEGRADED_INSUFFICIENT_HISTORY
+        vol_degraded_reason = (
+            f"no symbol in the universe has >= {VOL_MIN_OBS} usable "
+            f"{'Garman-Klass (OHLC)' if vol_model == 'garman_klass' else 'close-to-close'} "
+            f"observations up to as_of={as_of_ts.date() if as_of_ts is not None else 'N/A'}; "
+            f"realized_vol_21d is NULL (not a measurement) and Barroso scaling falls back "
+            f"to the neutral 1.0x"
+        )
+        scale = 1.0
+
+    # --- Window provenance -------------------------------------------------------
+    def _iso(ts: Optional[pd.Timestamp]) -> Optional[str]:
+        return None if ts is None else pd.Timestamp(ts).date().isoformat()
+
+    daily_last: Optional[pd.Timestamp] = max(daily_window_ends) if daily_window_ends else None
+    as_of_lag_days: Optional[int] = None
+    if daily_last is not None and as_of_ts is not None:
+        as_of_lag_days = int((as_of_ts - daily_last.normalize()).days)
+    intraday_lag_days: Optional[int] = None
+    if intraday_window_end is not None and as_of_ts is not None:
+        intraday_lag_days = int((as_of_ts - intraday_window_end.normalize()).days)
+
+    # The reported window MUST describe the input that produced the reported number:
+    # the 5m downside window when it was used, otherwise the daily window.
+    if intraday_used:
+        used_start: Optional[pd.Timestamp] = min(intraday_window_starts) if intraday_window_starts else None
+        used_end: Optional[pd.Timestamp] = intraday_window_end
+        used_obs: Optional[int] = min(intraday_obs) if intraday_obs else None
+        used_lag_days = intraday_lag_days
+    else:
+        used_start = min(daily_window_starts) if daily_window_starts else None
+        used_end = daily_last
+        used_obs = min(daily_obs) if daily_obs else None
+        used_lag_days = as_of_lag_days
 
     return {
+        # --- pre-existing keys (unchanged semantics, except realized_vol_21d may be None)
         "realized_vol_21d": vol_21d,
         "target_vol": target_vol,
         "vol_scaling_factor": scale,
-        "vol_elevated": vol_21d > target_vol,
+        "vol_elevated": bool(vol_21d is not None and vol_21d > target_vol),
         "vol_model": active_model,
+        # --- D7 provenance: WHICH bars, WHICH window, HOW fresh
+        "vol_as_of": _iso(as_of_ts),
+        "vol_input_source": input_source,
+        #: Last bar date of the window that actually fed the reported estimate.
+        "vol_input_bars_last_date": _iso(used_end),
+        #: Days between as_of and that last input bar (0 == the window reaches today).
+        "vol_input_lag_days": used_lag_days,
+        #: True when the input window does not reach as_of (should be impossible behind
+        #: the freshness gate -- recorded so it can never be assumed).
+        "vol_input_stale": bool(
+            used_end is not None and as_of_ts is not None and used_end.normalize() < as_of_ts
+        ),
+        "vol_window_start": _iso(used_start),
+        "vol_window_end": _iso(used_end),
+        #: Shortest contributing window -- the estimate is only as long as this.
+        "vol_n_obs": used_obs,
+        #: Daily-branch window, kept beside the reported one so an intraday-sourced
+        #: estimate cannot hide the daily bars that are also on hand.
+        "vol_daily_bars_last_date": _iso(daily_last),
+        "vol_daily_lag_days": as_of_lag_days,
+        "vol_symbols_used": len(vol_estimates),
+        "vol_symbols_skipped": sorted(skipped_symbols),
+        # --- 5m downside-semivariance provenance
+        "vol_intraday_used": intraday_used,
+        "vol_intraday_window_end": _iso(intraday_window_end),
+        "vol_intraday_n_obs": int(min(intraday_obs)) if intraday_obs else None,
+        #: Usable sessions actually on hand (21 required for eligibility), reported even
+        #: when the branch could not be used, so a short 5m history stays visible.
+        "vol_intraday_available_obs": intraday_available_obs,
+        "vol_intraday_eligible": intraday_eligible,
+        "vol_intraday_lag_days": intraday_lag_days,
+        "vol_intraday_input_stale": bool(intraday_stale),
+        "vol_intraday_rejected_reason": intraday_rejected_reason,
+        # --- explicit degradation
+        "vol_degraded": vol_degraded,
+        "vol_degraded_reason_code": vol_degraded_reason_code,
+        "vol_degraded_reason": vol_degraded_reason,
+        #: Only set when a neutral 1.0x stands in for an UNMEASURED factor.
+        "vol_scaling_fallback": VOL_DEGRADED_INSUFFICIENT_HISTORY if vol_degraded else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# (D7, 2026-11-11) 5m INTRADAY COVERAGE -- MEASURED, NOT ASSUMED.
+#
+# `observability.intraday_5m` on the archived 2026-11-10/11-11 rounds reported
+# `symbols_measured=0` with reason "5m 日内特征缺失: ... 常见原因: provider does not
+# support 5m", next to `enabled=true` and `symbols_5m_available=20`. That reads as
+# "the provider cannot do 5m", which is FALSE: a read-only query of
+# `data/cache.duckdb::intraday_ohlcv_bars` shows 48 5m rows for each of the 20
+# universe symbols on 2026-11-09 (max ts 2026-11-09 15:00, BaoStock), and the
+# 2026-11-09 round measured all 20. The 5m cache simply stopped being refreshed
+# after 11-09, so on 11-10/11-11 the last daily row's VWAP_Prem_5m is NaN and no
+# symbol is "measured" -- a STALE-CACHE degradation, not a capability gap.
+# (`load_intraday_5m_universe`'s DuckDB fallback also tries BaoStock first
+# regardless of the configured provider, so a `fuyao` run is silently served
+# BaoStock rows; that is the upstream cause and is NOT fixed here -- this script
+# only stops MISREPORTING it.)
+#
+# The status fields below make the distinction machine-readable:
+#   * `provider_unsupported`          -- zero non-empty 5m frames for the universe;
+#   * `degraded_stale_intraday_cache` -- frames exist but their last bar predates as_of;
+#   * `degraded_unmeasured_features`  -- frames reach as_of yet no feature was measured;
+#   * `evaluated`                     -- at least one symbol carried a measured feature.
+# `enabled` keeps the web layer's meaning (real rows on the as-of session) -- it is
+# False on a stale cache even though `requested` stays True, so "requested" can never
+# be read as "measured".
+# ---------------------------------------------------------------------------
+INTRADAY_5M_STATUS_EVALUATED = "evaluated"
+INTRADAY_5M_STATUS_STALE = "degraded_stale_intraday_cache"
+INTRADAY_5M_STATUS_UNSUPPORTED = "provider_unsupported"
+INTRADAY_5M_STATUS_UNMEASURED = "degraded_unmeasured_features"
+
+INTRADAY_5M_CODE_STALE = "intraday_5m_stale_window"
+INTRADAY_5M_CODE_UNAVAILABLE = "intraday_5m_unavailable"
+INTRADAY_5M_CODE_UNMEASURED = "intraday_5m_features_unmeasured"
+
+#: (D7 follow-up, 2026-11-11) Injectable wall clock for the self-report stamp.
+#: `None` -> real UTC now (production behaviour unchanged); tests/replays pin it so two
+#: Stage-1 runs of the SAME inputs produce a BYTE-IDENTICAL `intraday_5m_metrics` block
+#: (the `generated_at` stamp used to leak 0.5s of wall-clock drift into
+#: `test_nav_source_parity.py::test_equal_navs_leave_the_five_minute_block_bit_identical`).
+INTRADAY_5M_NOW_OVERRIDE: Optional[datetime] = None
+
+
+def _intraday_5m_now(now: Optional[datetime] = None) -> datetime:
+    """The instant stamped into `intraday_5m_metrics.generated_at`.
+
+    Precedence: explicit `now` argument > module override > real UTC now. The module
+    override exists so a test can freeze the clock for a whole `main()` invocation
+    without threading a parameter through the CLI.
+    """
+    if now is not None:
+        return now
+    if INTRADAY_5M_NOW_OVERRIDE is not None:
+        return INTRADAY_5M_NOW_OVERRIDE
+    return datetime.now(timezone.utc)
+
+
+def summarize_intraday_5m_provenance(
+    universe_5m: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Aggregate the loader's per-frame provenance attrs (`common.intraday_features`).
+
+    Every served frame carries `intraday_5m_provider` / `intraday_5m_source` /
+    `intraday_5m_latest_ts`, and a frame that had to fall back additionally carries
+    `fallback_from` / `fallback_to` / `fallback_reason`. The report must say WHICH
+    provider actually served the bars and WHICH fallback happened -- otherwise a
+    `fuyao` run served by BaoStock's frozen cache is indistinguishable from a fuyao
+    delivery, which is exactly how the 2026-11-09..11 freeze stayed invisible.
+
+    Aggregation rule: a field is a scalar when every contributing frame agrees, and a
+    sorted list of the distinct values when they disagree (nothing is hidden by a
+    "first symbol wins" pick). `provider`/`source` are the majority value -- ties broken
+    by sorted order -- because "which provider dominates this universe" is the useful
+    scalar, with `provider_by_symbol` kept for the full picture.
+    """
+    providers: Dict[str, str] = {}
+    sources: Dict[str, str] = {}
+    fallbacks: Dict[str, Dict[str, Any]] = {}
+    latest: Optional[str] = None
+    latest_ts_obj: Optional[pd.Timestamp] = None
+
+    for sym, frame in (universe_5m or {}).items():
+        name = str(sym)
+        attrs = getattr(frame, "attrs", {}) or {}
+        prov = attrs.get("intraday_5m_provider")
+        src = attrs.get("intraday_5m_source")
+        if prov:
+            providers[name] = str(prov)
+        if src:
+            sources[name] = str(src)
+        if attrs.get("fallback_to") is not None:
+            fallbacks[name] = {
+                "from": attrs.get("fallback_from"),
+                "to": attrs.get("fallback_to"),
+                "reason": attrs.get("fallback_reason"),
+                "detail": attrs.get("fallback_reason_detail"),
+            }
+        ts_raw = attrs.get("intraday_5m_latest_ts")
+        if ts_raw:
+            try:
+                ts = pd.Timestamp(ts_raw)
+            except (TypeError, ValueError):
+                continue
+            if latest_ts_obj is None or ts > latest_ts_obj:
+                latest_ts_obj, latest = ts, ts.isoformat()
+
+    def _majority(values: Dict[str, str]) -> Optional[str]:
+        if not values:
+            return None
+        counts: Dict[str, int] = {}
+        for value in values.values():
+            counts[value] = counts.get(value, 0) + 1
+        best = max(counts.values())
+        return sorted(v for v, c in counts.items() if c == best)[0]
+
+    def _collapse(key: str) -> Any:
+        vals = sorted({str(fb[key]) for fb in fallbacks.values() if fb.get(key) is not None})
+        if not vals:
+            return None
+        return vals[0] if len(vals) == 1 else vals
+
+    return {
+        "provider": _majority(providers),
+        "source": _majority(sources),
+        "latest_ts": latest,
+        "provider_by_symbol": dict(sorted(providers.items())),
+        "n_symbols_with_provenance": len(providers),
+        # Fallback chain: null unless at least one symbol had to switch provider.
+        "fallback_from": _collapse("from"),
+        "fallback_to": _collapse("to"),
+        "fallback_reason": _collapse("reason"),
+        "n_fallback_symbols": len(fallbacks),
+        "fallback_by_symbol": {k: v for k, v in sorted(fallbacks.items())},
+    }
+
+
+def probe_intraday_5m_cache_coverage(
+    universe_5m: Optional[Dict[str, Any]],
+    as_of_date: Optional[str],
+) -> Dict[str, Any]:
+    """Measure what the 5m layer ACTUALLY returned for `as_of_date`.
+
+    Counts 5m ROWS on the as-of session (never symbols, never daily bars -- the
+    2026-10-22 defect) and reports the last bar date of the whole 5m universe, so a
+    stale cache is visible instead of being blamed on provider capability.
+    """
+    session: Optional[pd.Timestamp] = None
+    if as_of_date:
+        try:
+            session = pd.Timestamp(as_of_date).normalize()
+        except (TypeError, ValueError):
+            session = None
+
+    rows_5m = 0
+    with_rows: List[str] = []
+    unavailable: List[str] = []
+    last_bar: Optional[pd.Timestamp] = None
+
+    for sym, df in (universe_5m or {}).items():
+        name = str(sym)
+        if df is None or bool(getattr(df, "empty", True)):
+            unavailable.append(name)
+            continue
+        idx = pd.DatetimeIndex(df.index)
+        if len(idx) > 0:
+            sym_last = pd.Timestamp(idx.max())
+            if last_bar is None or sym_last > last_bar:
+                last_bar = sym_last
+        n_on_session = int((idx.normalize() == session).sum()) if session is not None else int(len(idx))
+        rows_5m += n_on_session
+        (with_rows if n_on_session > 0 else unavailable).append(name)
+
+    lag_days: Optional[int] = None
+    if last_bar is not None and session is not None:
+        lag_days = int((session - last_bar.normalize()).days)
+
+    return {
+        "rows_5m": int(rows_5m),
+        "as_of_date": as_of_date,
+        "symbols_with_rows": sorted(with_rows),
+        "symbols_unavailable": sorted(unavailable),
+        "intraday_data_last_bar_date": None if last_bar is None else last_bar.date().isoformat(),
+        "intraday_lag_calendar_days": lag_days,
+        "intraday_data_stale": bool(lag_days is not None and lag_days > 0),
+    }
+
+
+def classify_intraday_5m_status(
+    coverage: Dict[str, Any],
+    *,
+    n_5m_symbols_nonempty: int,
+    features_measured: int,
+    requested: bool = True,
+    freshness: Optional[Dict[str, Any]] = None,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Derive `status` / `degraded` / `degraded_reason_code` from MEASURED facts.
+
+    `freshness` is the output of `common.intraday_features.assess_intraday_5m_freshness`
+    (worst-symbol aggregation). When supplied it is authoritative: a cache that holds the
+    as-of session but not its closing bar is NOT a frozen cache, so `status` must not claim
+    one. Only when it is omitted does the coarser max-bar-date heuristic of `coverage` apply
+    (kept for callers/tests that only measured coverage).
+
+    The emitted `degraded_reason_code` never uses `provider_unsupported_5m`: that token is a
+    PROVIDER-LEVEL fact owned by the loader's `fallback_reason` (e.g. "fuyao has no 5m rows
+    for 601872.SH"), not a layer-level diagnosis. The layer-level codes are:
+    `intraday_5m_unavailable` (zero 5m frames at all), `intraday_5m_stale_window` (frames
+    exist but end on an earlier session), `intraday_5m_features_unmeasured` (frames reach
+    the session yet no feature was measured).
+    """
+    rows_5m = int(coverage.get("rows_5m") or 0)
+    try:  # lazy: keep this script's module-level imports unchanged
+        from common.intraday_features import (
+            INTRADAY_5M_FRESHNESS_OK,
+            INTRADAY_5M_FRESHNESS_STALE,
+        )
+    except ImportError:  # pragma: no cover - only if the module is unavailable
+        INTRADAY_5M_FRESHNESS_OK, INTRADAY_5M_FRESHNESS_STALE = "ok", "stale_last_bar"
+
+    if freshness is not None:
+        stale = bool(freshness.get("stale"))
+        lag = freshness.get("lag_calendar_days")
+        freshness_reason = freshness.get("reason")
+    else:
+        stale = bool(coverage.get("intraday_data_stale"))
+        lag = coverage.get("intraday_lag_calendar_days")
+        freshness_reason = INTRADAY_5M_FRESHNESS_STALE if stale else INTRADAY_5M_FRESHNESS_OK
+
+    # `lag >= 1` == the newest bar belongs to an EARLIER session (a frozen cache). A lag of
+    # 0 with `stale=True` only means "the session's closing bar is not in yet", which is
+    # normal for an intraday run and is reported through `freshness_reason`, not as a freeze.
+    frozen_on_earlier_session = bool(stale and lag is not None and int(lag) >= 1)
+    has_any_frame = int(n_5m_symbols_nonempty) > 0
+    has_any_bar = coverage.get("intraday_data_last_bar_date") is not None or has_any_frame
+
+    if int(features_measured) > 0:
+        status, code = INTRADAY_5M_STATUS_EVALUATED, None
+    elif not has_any_frame and not has_any_bar:
+        status, code = INTRADAY_5M_STATUS_UNSUPPORTED, INTRADAY_5M_CODE_UNAVAILABLE
+    elif frozen_on_earlier_session:
+        status, code = INTRADAY_5M_STATUS_STALE, INTRADAY_5M_CODE_STALE
+    else:
+        status, code = INTRADAY_5M_STATUS_UNMEASURED, INTRADAY_5M_CODE_UNMEASURED
+
+    degraded = status != INTRADAY_5M_STATUS_EVALUATED
+    return {
+        "requested": bool(requested),
+        # Web-layer contract: `enabled` == REAL rows on the as-of session.
+        "enabled": bool(requested) and rows_5m > 0,
+        "status": status,
+        "degraded": degraded,
+        "degraded_reason_code": code,
+        "freshness_reason": freshness_reason,
+        # ISO-8601 UTC, so the web layer's freshness check can consume this block.
+        "generated_at": _intraday_5m_now(now).isoformat(),
     }
 
 
@@ -1765,6 +2621,25 @@ def resolve_gate_directive(
             f"Volatility Alert: 21d realized vol ({vol_info['realized_vol_21d']:.1%}) > target ({vol_info['target_vol']:.1%}); "
             f"Barroso scaling scales equity by {vol_info['vol_scaling_factor']:.2f}x."
         )
+    # (D7) An UNMEASURED volatility factor must say so out loud: `vol_scaling_factor: 1.0`
+    # is the neutral stand-in, not evidence of a calm market.
+    if vol_info.get("vol_degraded"):
+        actions.append(
+            "⚠️ Volatility Targeting UNAVAILABLE — 21 日实现波动率未测得"
+            f"（reason_code={vol_info.get('vol_degraded_reason_code')}: "
+            f"{vol_info.get('vol_degraded_reason', 'insufficient history')}）。"
+            "Barroso 缩放回退为中性 1.00x（不是「波动率低所以不缩放」），"
+            "该因子既未通过也未触发。"
+        )
+    elif vol_info.get("vol_intraday_rejected_reason"):
+        actions.append(
+            "⚠️ 5m 下行半方差窗口未采用 — "
+            f"{vol_info.get('vol_intraday_rejected_reason')}；"
+            f"本次 realized_vol_21d 由 {vol_info.get('vol_input_source')} 按 as_of "
+            f"{vol_info.get('vol_as_of')} 计算"
+            f"（窗口 {vol_info.get('vol_window_start')} → {vol_info.get('vol_window_end')}，"
+            f"n_obs={vol_info.get('vol_n_obs')}）。"
+        )
 
     return code, headline, actions
 
@@ -1861,15 +2736,62 @@ def print_dashboard(
     # 3. Volatility Targeting
     print("\n[3. REALIZED VOLATILITY TARGETING (BARROSO & SANTA-CLARA 2015)]")
     v_status = "⚠️ Scaled Down" if vol_info["vol_elevated"] else "🟢 Stable"
+    if vol_info.get("vol_degraded"):
+        v_status = "⚠️ UNAVAILABLE (neutral 1.00x fallback)"
     vol_mod_lbl = f", Model: {vol_info.get('vol_model', 'N/A')}" if "vol_model" in vol_info else ""
-    print(f"  21-Day Realized Vol   : {vol_info['realized_vol_21d']:>6.1%} (Target Vol: {vol_info['target_vol']:>5.1%}{vol_mod_lbl}) | {v_status}")
+    print(f"  21-Day Realized Vol   : {_fmt_metric(vol_info['realized_vol_21d'], '>6.1%')} (Target Vol: {vol_info['target_vol']:>5.1%}{vol_mod_lbl}) | {v_status}")
     print(f"  Volatility Scaling    : {vol_info['vol_scaling_factor']:>6.2f}x")
+    # (D7) Window provenance: a repeated float is diagnosable only if the input window
+    # is on screen. Printed for every run, stale or not.
+    print(
+        f"  Vol Input Window      : {(vol_info.get('vol_window_start') or 'N/A')} → "
+        f"{(vol_info.get('vol_window_end') or 'N/A')} (n_obs={_fmt_metric(vol_info.get('vol_n_obs'), 'd')}, "
+        f"last_bar={vol_info.get('vol_input_bars_last_date') or 'N/A'}, "
+        f"lag={_fmt_metric(vol_info.get('vol_input_lag_days'), 'd')}d, "
+        f"source={vol_info.get('vol_input_source')})"
+    )
+    if vol_info.get("vol_intraday_input_stale"):
+        print(
+            "  ⚠️ 5m Downside Window  : STALE — ends "
+            f"{vol_info.get('vol_intraday_window_end')} (lag {vol_info.get('vol_intraday_lag_days')}d), "
+            "REJECTED (not used to override the as-of daily estimate)"
+        )
+    elif vol_info.get("vol_intraday_rejected_reason"):
+        print(
+            "  ⚠️ 5m Downside Window  : NOT USED — "
+            f"{vol_info.get('vol_intraday_rejected_reason')}"
+            f" (available sessions={vol_info.get('vol_intraday_available_obs')})"
+        )
 
-    if intraday_5m_info and intraday_5m_info.get("enabled"):
+    if intraday_5m_info and (intraday_5m_info.get("requested") or intraday_5m_info.get("enabled")):
         print("\n[4. 5-MINUTE INTRADAY MICROSTRUCTURE & MARK-TO-MARKET (14:00)]")
         # (2026-10-22 incident, Fix 1) Render UNMEASURED metrics as N/A. The old
         # dashboard printed fabricate-looking numbers (breadth 100.0%) computed
         # from NaN-substituted constants on a run whose 5m frame was empty.
+        if intraday_5m_info.get("degraded"):
+            # (D7) `requested=true` must never be read as "measured". Name the status, the
+            # measured cause (stale cache vs. no 5m rows) and the provider/fallback chain.
+            _fb_reason = intraday_5m_info.get("fallback_reason")
+            _fb_from = intraday_5m_info.get("fallback_from")
+            _fb_to = intraday_5m_info.get("fallback_to")
+            _fb_chain = (
+                f"{_fb_from}→{_fb_to}" + (f" ({_fb_reason})" if _fb_reason else "")
+                if (_fb_from or _fb_to)
+                else "none"
+            )
+            print(
+                f"  ⚠️ Status             : DEGRADED — status={intraday_5m_info.get('status')} "
+                f"(requested=true but NOT evaluated; degraded_reason_code="
+                f"{intraday_5m_info.get('degraded_reason_code')}, "
+                f"freshness_reason={intraday_5m_info.get('freshness_reason')})"
+            )
+            print(
+                f"  5m Coverage           : rows_5m(as_of)={intraday_5m_info.get('rows_5m')} | "
+                f"last 5m bar={intraday_5m_info.get('latest_available_ts')} | "
+                f"stale={intraday_5m_info.get('stale')} lag={intraday_5m_info.get('lag_calendar_days')}d | "
+                f"provider={intraday_5m_info.get('provider')}/{intraday_5m_info.get('source')} | "
+                f"fallback={_fb_chain}"
+            )
         if intraday_5m_info.get("intraday_features_available") is False:
             print(f"  ⚠️ 状态               : SKIPPED / UNKNOWN — 5m 日内特征不可用 (不影响日线门禁)")
             print(f"  原因 (Reason)         : {intraday_5m_info.get('unavailable_reason', 'N/A')}")
@@ -2203,18 +3125,69 @@ def generate_reports(
 
 ## 3. Realized Volatility Targeting
 
-- **21-Day Realized Volatility**: `{vol_info['realized_vol_21d']:.1%}` (Target Vol: `{vol_info['target_vol']:.1%}`)
+- **21-Day Realized Volatility**: `{_fmt_metric(vol_info['realized_vol_21d'], '.1%')}` (Target Vol: `{vol_info['target_vol']:.1%}`)
 - **Barroso Volatility Scaling**: `{vol_info['vol_scaling_factor']:.2f}x`
+- **Input Window**: `{vol_info.get('vol_window_start') or 'N/A'}` → `{vol_info.get('vol_window_end') or 'N/A'}` (n_obs `{_fmt_metric(vol_info.get('vol_n_obs'), 'd')}`, last bar `{vol_info.get('vol_input_bars_last_date') or 'N/A'}`, lag `{_fmt_metric(vol_info.get('vol_input_lag_days'), 'd')}`d, source `{vol_info.get('vol_input_source')}`)
 - **Assessment**: {"⚠️ Elevated volatility: Rescaling portfolio equity exposure downwards." if vol_info['vol_elevated'] else "🟢 Realized market variance within standard bounds."}
-
----
 """
+    # (D7) A degraded / stale-window volatility input gets its own loud line. Silence
+    # here is what let a frozen 0.3240854096084951 read as a measured market.
+    if vol_info.get("vol_degraded"):
+        md_content += (
+            "\n> **⚠️ VOLATILITY FACTOR UNAVAILABLE (DEGRADED, NOT PASS).** "
+            f"reason_code=`{vol_info.get('vol_degraded_reason_code')}`: "
+            f"{vol_info.get('vol_degraded_reason')}  "
+            "The `1.00x` Barroso scaling above is the neutral fallback "
+            "(`vol_scaling_fallback=insufficient_history`), NOT a measured calm market.\n"
+        )
+    if vol_info.get("vol_intraday_input_stale"):
+        md_content += (
+            "\n> **⚠️ 5m DOWNSIDE-SEMIVARIANCE WINDOW STALE — REJECTED.** Window ends "
+            f"`{vol_info.get('vol_intraday_window_end')}` (lag `{vol_info.get('vol_intraday_lag_days')}`d) "
+            f"vs as_of `{vol_info.get('vol_as_of')}`; it was NOT used, so the estimate above "
+            "comes from the as-of daily window.\n"
+        )
+    elif vol_info.get("vol_intraday_rejected_reason"):
+        md_content += (
+            "\n> **⚠️ 5m DOWNSIDE-SEMIVARIANCE WINDOW NOT USED.** "
+            f"{vol_info.get('vol_intraday_rejected_reason')} "
+            f"(available sessions `{vol_info.get('vol_intraday_available_obs')}`).\n"
+        )
+    md_content += "\n---\n"
     # (2026-10-22 incident, Fix 1) Intraday metrics are rendered only when they
     # were actually measured; otherwise the section states UNAVAILABLE and every
     # number is `N/A`. A missing measurement must never be printed as a value.
-    if intraday_5m_info and intraday_5m_info.get("enabled"):
+    if intraday_5m_info and (intraday_5m_info.get("requested") or intraday_5m_info.get("enabled")):
         _id_avail = intraday_5m_info.get("intraday_features_available")
         md_content += "\n## 4. 5-Minute Intraday Microstructure\n\n"
+        if intraday_5m_info.get("degraded"):
+            # (D7) One loud, grep-able line: `requested=true` is NOT "measured". It now names
+            # the lag (in days) and the ACTUAL provider/fallback chain, because "provider does
+            # not support 5m" was a misdiagnosis of a frozen cache served by a fallback.
+            _fb_reason = intraday_5m_info.get("fallback_reason")
+            _fb_from = intraday_5m_info.get("fallback_from")
+            _fb_to = intraday_5m_info.get("fallback_to")
+            if _fb_from or _fb_to:
+                _fb_text = f"`{_fb_from}→{_fb_to}" + (
+                    f" ({_fb_reason})`" if _fb_reason else "`"
+                )
+            else:
+                _fb_text = "无回退（`provider={}`）".format(
+                    intraday_5m_info.get("provider")
+                )
+            md_content += (
+                f"> **⚠️ DEGRADED — `status={intraday_5m_info.get('status')}`, "
+                f"`degraded=true`, `degraded_reason_code={intraday_5m_info.get('degraded_reason_code')}`, "
+                f"`freshness_reason={intraday_5m_info.get('freshness_reason')}`.** "
+                "`requested=true` 只表示已请求 5m 层，**不表示已测得**。"
+                f"as_of 当日 5m 行数 `{intraday_5m_info.get('rows_5m')}`，"
+                f"5m 数据最后一根 bar `{intraday_5m_info.get('latest_available_ts') or intraday_5m_info.get('intraday_data_last_bar_date')}`"
+                f"，`stale={intraday_5m_info.get('stale')}`，滞后 "
+                f"`{intraday_5m_info.get('lag_calendar_days')}` 天；"
+                f"供数来源 `{intraday_5m_info.get('provider')}` / `{intraday_5m_info.get('source')}`，"
+                f"回退链 {_fb_text}"
+                f"（{intraday_5m_info.get('n_fallback_symbols')}/{intraday_5m_info.get('n_symbols')} 个标的）。\n\n"
+            )
         if _id_avail is False:
             md_content += (
                 "> **UNAVAILABLE — gate status `SKIPPED` / `UNKNOWN` (NOT passed).**\n"
@@ -2235,7 +3208,7 @@ def generate_reports(
 
     md_content += (
         "\n## "
-        + ("5" if (intraday_5m_info and intraday_5m_info.get("enabled")) else "4")
+        + ("5" if (intraday_5m_info and (intraday_5m_info.get("requested") or intraday_5m_info.get("enabled"))) else "4")
         + ". Mandatory Human Trader Actions (Stage 2 Execution)\n\n"
     )
     for i, act in enumerate(actions, start=1):
@@ -2650,10 +3623,14 @@ def main(cli_args: Optional[List[str]] = None):
         )
 
     intraday_5m_info = None
+    _5m_coverage: Optional[Dict[str, Any]] = None
+    _5m_provenance: Optional[Dict[str, Any]] = None
+    _5m_freshness: Optional[Dict[str, Any]] = None
     if enable_intraday_5m:
         try:
             from common.intraday_features import (
                 IntradayFeatureConfig,
+                assess_intraday_5m_freshness,
                 load_intraday_5m_universe,
                 enrich_universe_with_intraday_features,
             )
@@ -2682,6 +3659,27 @@ def main(cli_args: Optional[List[str]] = None):
             # many symbols actually carry a measured feature, and when none do we
             # emit None + `intraday_features_available: false` +
             # `distribution_gate_status: "SKIPPED"` with a logged reason.
+            # (D7) MEASURE the 5m coverage before deciding anything. `symbols_5m_available`
+            # alone cannot tell "provider has no 5m" apart from "the 5m cache stopped on a
+            # previous session"; the last-bar date and the as-of row count can.
+            _5m_coverage = probe_intraday_5m_cache_coverage(universe_5m, as_of_date)
+            # (D7 follow-up) WHICH provider served the bars, and whether a fallback happened.
+            # A `fuyao` run served by BaoStock's frozen cache now says so instead of looking
+            # like a fuyao delivery.
+            _5m_provenance = summarize_intraday_5m_provenance(universe_5m)
+            # (D7 follow-up) Session-level staleness, worst-symbol aggregation, delegated to
+            # the ONE owner (`common.intraday_features.assess_intraday_5m_freshness`): the
+            # max-bar-date heuristic cannot tell "closing bar not in yet" from "frozen cache".
+            # Guarded: a calendar error must not take the whole 5m block down with it.
+            try:
+                _5m_freshness = assess_intraday_5m_freshness(
+                    universe_5m,
+                    expected_last_session=as_of_date,
+                    market=getattr(clock_ctx, "market", "china") or "china",
+                )
+            except Exception as exc:  # noqa: BLE001 - reported, never fatal
+                print(f"[WARN] 5m 新鲜度评估失败（按未评估处理）: {exc}")
+                _5m_freshness = None
             cash_proxy = params.get("cash_proxy", "BIL")
             n_5m_ok = sum(
                 1
@@ -2700,11 +3698,48 @@ def main(cli_args: Optional[List[str]] = None):
                 measured_syms.append(sym)
 
             if not measured_syms:
-                _unavail_reason = (
-                    f"5m 日内特征缺失: {len(universe_symbols)} 个标的中 5m 数据帧非空的仅 {n_5m_ok} 个，"
-                    "且无任何标的具备已测得的 VWAP_Prem_5m 特征 "
-                    f"(provider={args.data_provider})。常见原因: provider does not support 5m。"
+                # (D7) The old text blamed the provider unconditionally. Now the reason
+                # states WHICH cause was MEASURED: no 5m rows at all vs. a 5m cache whose
+                # last bar predates as_of (the 2026-11-10/11-11 case: 20 frames present,
+                # last bar 2026-11-09, `provider=fuyao` merely served stale rows), and WHICH
+                # provider/fallback chain actually delivered them.
+                _last_5m = _5m_coverage.get("intraday_data_last_bar_date")
+                _lag_5m = _5m_freshness.get("lag_calendar_days")
+                _stale_5m = bool(_5m_freshness.get("stale"))
+                _served_by = _5m_provenance.get("provider") or "unknown"
+                _fb_from = _5m_provenance.get("fallback_from")
+                _fb_to = _5m_provenance.get("fallback_to")
+                _fb_reason = _5m_provenance.get("fallback_reason")
+                _fb_chain = (
+                    f"{_fb_from}→{_fb_to} ({_fb_reason})"
+                    if _fb_from or _fb_to
+                    else "无回退"
                 )
+                if n_5m_ok <= 0:
+                    _unavail_reason = (
+                        f"5m 日内特征缺失: {len(universe_symbols)} 个标的中 5m 数据帧非空的 0 个"
+                        f"(provider={args.data_provider}, 5m 行数={_5m_coverage.get('rows_5m')})。"
+                        "这是没有任何 5m 数据（缓存与 provider 均为空），不是「当日特征算不出」。"
+                    )
+                elif _stale_5m:
+                    _unavail_reason = (
+                        f"5m 日内特征缺失（5m 数据陈旧，NOT 该 provider 不支持 5m）: "
+                        f"{len(universe_symbols)} 个标的中 5m 数据帧非空 {n_5m_ok} 个，"
+                        f"但这些帧的最后一根 bar 是 {_last_5m}"
+                        f"（expected_last_session={_5m_freshness.get('expected_last_session')}，"
+                        f"滞后 {_lag_5m} 天，freshness_reason={_5m_freshness.get('reason')}，"
+                        f"as_of 当日 5m 行数={_5m_coverage.get('rows_5m')}），"
+                        f"因此当日没有任何 VWAP_Prem_5m 特征。实际供数 provider={_served_by}，"
+                        f"回退链={_fb_chain}。需先补齐 5m 缓存，不是换 provider。"
+                    )
+                else:
+                    _unavail_reason = (
+                        f"5m 日内特征缺失: {len(universe_symbols)} 个标的中 5m 数据帧非空 {n_5m_ok} 个，"
+                        f"as_of {as_of_date} 当日 5m 行数={_5m_coverage.get('rows_5m')}，"
+                        "仍无任何标的具备已测得的 VWAP_Prem_5m 特征 "
+                        f"(实际供数 provider={_served_by}，回退链={_fb_chain})。"
+                        "这是特征计算/读取路径问题，不是 provider 能力缺失。"
+                    )
                 print(f"[WARN] {_unavail_reason}")
                 print("[WARN] 日内分布门禁状态 = SKIPPED (UNKNOWN)：未测得数据不得视为 PASS，本次不会因日内跳水下调买入预算。")
                 intraday_5m_info = {
@@ -2908,6 +3943,39 @@ def main(cli_args: Optional[List[str]] = None):
         except Exception as exc:
             print(f"[WARN] Failed to evaluate 5m intraday features: {exc}")
 
+    # (D7) Merge the MEASURED coverage / provenance / freshness record into whichever branch
+    # ran, and correct `enabled` to the web layer's contract (real rows on the as-of session).
+    # Without this, `enabled=true` claimed "已启用" on a stale 5m cache.
+    if intraday_5m_info is not None:
+        _5m_coverage_rec = _5m_coverage or probe_intraday_5m_cache_coverage({}, as_of_date)
+        _5m_prov_rec = _5m_provenance or summarize_intraday_5m_provenance({})
+        _5m_status = classify_intraday_5m_status(
+            _5m_coverage_rec,
+            n_5m_symbols_nonempty=int(intraday_5m_info.get("symbols_5m_available") or 0),
+            features_measured=int(intraday_5m_info.get("symbols_vwap_measured") or 0),
+            requested=True,
+            freshness=_5m_freshness,
+        )
+        intraday_5m_info.update(_5m_coverage_rec)
+        intraday_5m_info.update(_5m_prov_rec)
+        intraday_5m_info.update(_5m_status)
+        if _5m_freshness is not None:
+            # Session-level staleness: worst-symbol aggregation straight from the OWNER
+            # (`assess_intraday_5m_freshness`), never re-derived here.
+            intraday_5m_info.update(
+                {
+                    "expected_last_session": _5m_freshness.get("expected_last_session"),
+                    "expected_deadline_ts": _5m_freshness.get("expected_deadline_ts"),
+                    "latest_available_ts": _5m_freshness.get("latest_available_ts"),
+                    "stale": bool(_5m_freshness.get("stale")),
+                    "lag_calendar_days": _5m_freshness.get("lag_calendar_days"),
+                    "freshness_reason": _5m_freshness.get("reason"),
+                    "stale_symbols": list(_5m_freshness.get("stale_symbols") or []),
+                    "fresh_symbols": list(_5m_freshness.get("fresh_symbols") or []),
+                    "n_symbols": _5m_freshness.get("n_symbols"),
+                }
+            )
+
     # (LV12) Attach the explicit form-vs-MTM record to the SAME dict that lands in
     # `stage1_health_report.json::intraday_5m_metrics` -- a log line alone would be invisible to
     # every consumer of the report. Omitted entirely when the two NAVs agree (or when the run was
@@ -2916,7 +3984,10 @@ def main(cli_args: Optional[List[str]] = None):
         intraday_5m_info["nav_base"] = intraday_nav_base_record
 
     macro_info = evaluate_market_breadth_and_thrust(universe, params)
-    vol_info = evaluate_realized_volatility(universe, params)
+    # (D7) `as_of` is passed so the 5m downside-semivariance window is MEASURED against
+    # today's session and rejected when stale; without it a frozen 5m cache silently
+    # froze `realized_vol_21d` across sessions (2026-11-09/10/11 archive).
+    vol_info = evaluate_realized_volatility(universe, params, as_of=as_of_date)
 
     # 5. Synthesize Gate Directive
     # (2026-11-04 audit) The single-stock cap state is resolved ONCE from Stage 2's own

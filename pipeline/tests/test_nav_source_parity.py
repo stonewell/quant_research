@@ -183,18 +183,40 @@ def _enrich(universe, universe_5m, config=None, synthesize_intraday_bar=False):
     return enriched
 
 
-def _patch_5m(monkeypatch):
+def _patch_5m(monkeypatch, loader=None, enricher=None):
     """Patch the 5m loaders INSIDE `common.intraday_features`.
 
     Stage 1 imports them lazily inside `main()`, so patching the module attributes is the only
     hook that does not require a real 5m provider.
+
+    (D7 follow-up) The 5m block stamps `intraday_5m_metrics.generated_at` with the wall clock,
+    so two runs of IDENTICAL inputs differed by ~0.5 s and the "bit-identical" contract below
+    could never hold. The stamp exists for the web layer's freshness check, not for the run's
+    content, so the clock is PINNED here through the module's documented override hook: two
+    runs then differ by nothing at all, and the assertion keeps its original meaning
+    ("`form == MTM` => the 5m block is byte-identical") instead of being weakened to
+    "identical except the timestamp".
     """
+    import datetime as _dt
+
     import common.intraday_features as intraday_features
 
-    monkeypatch.setattr(intraday_features, "load_intraday_5m_universe", _five_minute_frames)
-    monkeypatch.setattr(intraday_features, "enrich_universe_with_intraday_features", _enrich)
+    monkeypatch.setattr(
+        intraday_features, "load_intraday_5m_universe", loader or _five_minute_frames
+    )
+    monkeypatch.setattr(
+        intraday_features,
+        "enrich_universe_with_intraday_features",
+        enricher or _enrich,
+    )
     # The 5m block asks for a provider instance; nothing below it may touch a real cache.
     monkeypatch.setattr(_mod, "get_data_provider", lambda *a, **k: object())
+    # Deterministic self-report stamp (see the docstring above).
+    monkeypatch.setattr(
+        _mod,
+        "INTRADAY_5M_NOW_OVERRIDE",
+        _dt.datetime(2026, 4, 10, 14, 5, 0, tzinfo=_dt.timezone.utc),
+    )
 
 
 def _run(
@@ -207,11 +229,13 @@ def _run(
     peak_nav=PEAK_NAV,
     enable_5m=True,
     auto_stage2=False,
+    loader=None,
+    enricher=None,
 ):
     """One full Stage-1 `main()` invocation, hermetic, with the child launch captured."""
     paths = _write_inputs(tmp_path, tag, nav_effective, form_nav=form_nav)
     if enable_5m:
-        _patch_5m(monkeypatch)
+        _patch_5m(monkeypatch, loader=loader, enricher=enricher)
 
     captured = []
 
@@ -254,6 +278,7 @@ def _run(
         "intraday": result["intraday_5m_info"],
         "reported_intraday": report.get("intraday_5m_metrics"),
         "dd": result["dd_info"],
+        "out_dir": paths["out"],
     }
 
 
@@ -501,3 +526,94 @@ def test_daily_gate_fields_are_untouched_by_the_5m_base_swap(tmp_path, monkeypat
     # `dd_trough` stays DIAGNOSTIC: the gate/tier numbers are never rewritten from it.
     assert with_5m["intraday"]["dd_trough"] != pytest.approx(dd["drawdown_pct"], abs=1e-6)
     assert dd["tier"] == without_5m["dd"]["tier"]
+
+
+# ---------------------------------------------------------------------------
+# 8. (D7 follow-up) Provider provenance + session freshness reach the report
+# ---------------------------------------------------------------------------
+def _stale_5m_with_fallback(symbols, start=None, end=None, data_provider=None, cutoff_time="14:00"):
+    """5m frames whose last bar belongs to the PREVIOUS session, served via a fallback.
+
+    Mirrors the measured 2026-11-10/11-11 shape: the configured provider has no 5m rows for
+    these symbols, the cache falls back to BaoStock, and that cache stops on an earlier
+    session. Attrs are exactly what `load_intraday_5m_universe` stamps.
+    """
+    assert end == AS_OF, f"stage 1 resolved an unexpected as_of_date: {end!r}"
+    prev_session = pd.Timestamp(AS_OF) - pd.Timedelta(days=1)
+    idx = pd.DatetimeIndex([prev_session + pd.Timedelta(hours=14, minutes=55)])
+    frames = {}
+    for sym in symbols:
+        frame = pd.DataFrame(
+            {"Open": 10.0, "High": 10.1, "Low": 9.9, "Close": 10.0, "Volume": 1_000.0},
+            index=idx,
+        )
+        frame.attrs.update(
+            {
+                "intraday_5m_available": True,
+                "intraday_5m_source": "duckdb_cache",
+                "intraday_5m_provider": "BaoStockDataProvider",
+                "intraday_5m_latest_ts": idx[0].isoformat(),
+                "fallback_from": "FuyaoDataProvider",
+                "fallback_to": "BaoStockDataProvider",
+                "fallback_reason": "provider_unsupported_5m",
+                "fallback_reason_detail": "FuyaoDataProvider 在 cache.duckdb 中无 5m 行",
+            }
+        )
+        frames[sym] = frame
+    return frames
+
+
+def _no_features(universe, universe_5m, config=None, synthesize_intraday_bar=False):
+    """No measured microstructure columns -> the distribution gate cannot be evaluated."""
+    return dict(universe)
+
+
+def test_provider_fallback_and_session_staleness_reach_the_report(tmp_path, monkeypatch):
+    """DISCRIMINATING: pre-D7 the block said only "provider does not support 5m".
+
+    It must now record WHO served the bars (BaoStock via a fuyao fallback), the fallback
+    reason, and the session lag measured by `assess_intraday_5m_freshness` -- and it must
+    NOT reduce the diagnosis to the provider-level token in `degraded_reason_code`.
+    """
+    run = _run(
+        tmp_path,
+        monkeypatch,
+        "stale_fallback",
+        nav_effective=FORM_NAV,
+        form_nav=FORM_NAV,
+        loader=_stale_5m_with_fallback,
+        enricher=_no_features,
+    )
+    block = run["reported_intraday"]
+    prev_iso = f"{pd.Timestamp(AS_OF) - pd.Timedelta(days=1):%Y-%m-%d}T14:55:00"
+
+    # --- provenance (who actually served it)
+    assert block["provider"] == "BaoStockDataProvider"
+    assert block["source"] == "duckdb_cache"
+    assert block["latest_ts"] == prev_iso
+    assert block["fallback_from"] == "FuyaoDataProvider"
+    assert block["fallback_to"] == "BaoStockDataProvider"
+    assert block["fallback_reason"] == "provider_unsupported_5m"
+    assert block["n_fallback_symbols"] == 2
+    assert set(block["provider_by_symbol"]) == {"AAA", "BBB"}
+
+    # --- session freshness (worst symbol, from the shared owner)
+    assert block["stale"] is True
+    assert block["lag_calendar_days"] == 1
+    assert block["freshness_reason"] == "stale_last_bar"
+    assert block["expected_last_session"] == AS_OF
+    assert block["rows_5m"] == 0  # nothing on the as-of session
+
+    # --- the diagnosis, not a blunt "provider unsupported"
+    assert block["status"] == "degraded_stale_intraday_cache"
+    assert block["degraded"] is True
+    assert block["degraded_reason_code"] == "intraday_5m_stale_window"
+    assert block["degraded_reason_code"] != "provider_unsupported_5m"
+    assert block["enabled"] is False  # requested, but zero as-of rows
+    assert block["requested"] is True
+    assert block["generated_at"] == "2026-04-10T14:05:00+00:00"  # pinned clock
+
+    # --- the Markdown banner names the lag AND the fallback chain
+    md = open(os.path.join(run["out_dir"], "stage1_health_report.md"), encoding="utf-8").read()
+    assert "FuyaoDataProvider→BaoStockDataProvider (provider_unsupported_5m)" in md
+    assert "滞后 `1` 天" in md

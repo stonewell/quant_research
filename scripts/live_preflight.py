@@ -70,10 +70,12 @@ The rule enforced now (second pass) is:
    being checked is not the same as being suspect.
 """
 
+import copy
 import json
 import os
+import re
 import sys
-from typing import Any, Dict, NamedTuple, Optional
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -706,4 +708,351 @@ def assert_account_state_version_parity(
         axis="base_version",
         live_value=live_base_version,
         context=context,
+    )
+
+
+# ---------------------------------------------------------------------------
+# (D2) `prior_state` selection -- newest SUCCESSFUL, version-consistent snapshot
+# ---------------------------------------------------------------------------
+# WHY THIS LIVES HERE.  `prior_state` is supposed to be "the previous session's CONFIRMED
+# snapshot" (`docs/lv7_prior_state_contract.md` §1).  The 2026-11-09 archive
+# (`2026-11-09/204956/account_state.json`) carried `prior_state.as_of_date = 2026-11-05`
+# while a *successful* 2026-11-06 snapshot existed at `2026-11-06/185016/` -- so
+# `nav_history_10d` never received 11-06's 199,480.90, the 10-day recovery measure fell to
+# `INSUFFICIENT_HISTORY`, and the "-5.23%" printed on 11-09 was really a two-session move.
+# The sibling `2026-11-06/184826/` was a FAILED deploy (`nav=186,476.57`), and the
+# 2026-11-08 instance was an orphan copy of the 11-05 book.
+#
+# THE RULE IMPLEMENTED BELOW (and the reason it is a *resolver*, not a "walk to the previous
+# dated directory"):
+#   1. Every candidate is a directory that actually holds an `account_state.json`
+#      (`<date>/` or `<date>/<HHMMSS>/`).  There is NO implicit "date-root-level file"
+#      fallback: a date whose only snapshots live in instance subdirectories is a normal
+#      candidate, not a reason to jump to an older date (that implicit fallback is exactly
+#      what skipped 11-06/185016).
+#   2. A candidate is INADMISSIBLE when its run verdict is a recorded non-SUCCESS
+#      (`deploy_status` wins, else `health_status`), when the state's OWN `as_of_date` is
+#      not the directory's date (the orphan signature: an 11-05 book sitting in an 11-08
+#      directory), or when its `base_version` disagrees with today's live engine.
+#   3. Among admissible candidates the winner is the NEWEST date, and within one date the
+#      NEWEST instance.  A failed newest instance falls back to the next-newest instance of
+#      the SAME date before any older date is considered.
+#   4. Every rejection is recorded with a machine-readable reason, so a FAILED snapshot can
+#      never be skipped silently.
+#
+# READ-ONLY with respect to the archive: nothing here writes, repairs or re-stamps a
+# snapshot.  `apply_prior_state_selection` only mutates the in-memory state dict that the
+# caller is about to persist for TODAY's round.
+
+PRIOR_STATE_LOG_PREFIX = "[PRIOR STATE]"
+
+_DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_INSTANCE_DIR_RE = re.compile(r"^\d{6}$")
+
+#: Machine-readable skip reasons (`prior_state_source["skipped"][*]["reason"]`).
+SKIP_STATUS_NOT_SUCCESS = "run_status_not_success"
+SKIP_AS_OF_MISMATCH = "as_of_date_does_not_match_the_run_date"
+SKIP_AS_OF_MISSING = "as_of_date_missing"
+SKIP_BASE_VERSION_MISMATCH = "base_version_mismatch"
+SKIP_BASE_VERSION_MISSING = "base_version_missing"
+SKIP_UNREADABLE = "account_state_unreadable_or_empty"
+
+
+class PriorStateCandidate(NamedTuple):
+    """One snapshot directory considered as a `prior_state` source."""
+
+    path: str
+    run_date: str
+    instance: str
+    run_status: Optional[str]
+    status_source: Optional[str]
+    base_version: Optional[str]
+    as_of: Optional[str]
+    eligible: bool
+    reason: str
+
+    def as_skip_record(self) -> Dict[str, Any]:
+        return {
+            "path": self.path,
+            "run_date": self.run_date,
+            "instance": self.instance,
+            "run_status": self.run_status,
+            "base_version": self.base_version,
+            "as_of": self.as_of,
+            "reason": self.reason,
+        }
+
+
+class PriorStateSelection(NamedTuple):
+    """Outcome of one `prior_state` resolution (`state=None` -> nothing admissible)."""
+
+    state: Optional[Dict[str, Any]]
+    source: Optional[Dict[str, Any]]
+    candidates: Tuple[PriorStateCandidate, ...]
+    log_line: str
+
+
+def _load_json_object(path: str) -> Optional[Dict[str, Any]]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def snapshot_run_status(run_dir: str) -> Tuple[Optional[str], Optional[str]]:
+    """`(status, source_key)` for one run dir from its `summary.json`, or `(None, None)`.
+
+    `deploy_status` wins over `health_status` because a round that never produced a Stage-2
+    ticket has no post-trade book to carry forward: `2026-11-06/184826` is
+    `health_status=SUCCESS, deploy_status=FAILED` and its NAV (186,476.57) is a Stage-1
+    placeholder, not a settlement.  A directory with no readable summary keeps `(None, None)`
+    -- "no verdict recorded" (legacy archive), never "failed".
+    """
+    summary = _load_json_object(os.path.join(str(run_dir), "summary.json"))
+    if not summary:
+        return None, None
+    for key in ("deploy_status", "health_status"):
+        value = summary.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip().upper(), key
+    return None, None
+
+
+def _instance_sort_key(run_dir: str) -> str:
+    """Chronological key for one instance dir: summary `timestamp` first, name as tiebreak."""
+    summary = _load_json_object(os.path.join(str(run_dir), "summary.json"))
+    stamp = ""
+    if summary:
+        stamp = str(summary.get("timestamp") or summary.get("date") or "")
+    return f"{stamp}|{os.path.basename(str(run_dir))}"
+
+
+def derive_session_root(output_dir: Optional[str]) -> Optional[str]:
+    """`<...>/<strategy>/<universe>` for a run dir, or None when the shape is not an archive.
+
+    The live archive layout is `<root>/<strategy>/<universe>/<YYYY-MM-DD>[/<HHMMSS>]/`
+    (`web/livetrading/storage.py::allocate_run_instance_dir`).  Anything else -- notably the
+    CLI default `scripts/results/live/<strategy_key>` -- returns None so the resolver simply
+    does not run; it never guesses a parent and scans unrelated directories.
+    """
+    if not output_dir:
+        return None
+    path = os.path.abspath(str(output_dir))
+    if _INSTANCE_DIR_RE.match(os.path.basename(path)):
+        path = os.path.dirname(path)
+    if not _DATE_DIR_RE.match(os.path.basename(path)):
+        return None
+    parent = os.path.dirname(path)
+    return parent or None
+
+
+def list_prior_state_candidates(
+    session_root: Optional[str],
+    as_of_date: str,
+    *,
+    expected_base_version: Any = None,
+) -> List[PriorStateCandidate]:
+    """All snapshot dirs strictly BEFORE `as_of_date`, NEWEST date first, newest instance first.
+
+    "Strictly before" is the `prior_state` contract (previous session's confirmed snapshot);
+    today's own earlier instances are the same session and are covered by the carried state
+    itself, not by this resolver.
+    """
+    if not session_root or not os.path.isdir(str(session_root)) or not as_of_date:
+        return []
+    expected = _normalise_version_value(expected_base_version)
+    date_dirs = sorted(
+        (
+            name
+            for name in os.listdir(str(session_root))
+            if _DATE_DIR_RE.match(name) and name < str(as_of_date)
+        ),
+        reverse=True,
+    )
+    out: List[PriorStateCandidate] = []
+    for run_date in date_dirs:
+        date_dir = os.path.join(str(session_root), run_date)
+        if not os.path.isdir(date_dir):
+            continue
+        instance_dirs: List[str] = []
+        if os.path.exists(os.path.join(date_dir, "account_state.json")):
+            instance_dirs.append(date_dir)
+        instance_dirs.extend(
+            sorted(
+                (
+                    os.path.join(date_dir, name)
+                    for name in os.listdir(date_dir)
+                    if _INSTANCE_DIR_RE.match(name)
+                    and os.path.isdir(os.path.join(date_dir, name))
+                ),
+                key=_instance_sort_key,
+                reverse=True,
+            )
+        )
+        for run_dir in instance_dirs:
+            state_path = os.path.join(run_dir, "account_state.json")
+            if not os.path.exists(state_path):
+                continue
+            state = _load_json_object(state_path)
+            instance_label = "flat" if run_dir == date_dir else os.path.basename(run_dir)
+            if not state:
+                out.append(
+                    PriorStateCandidate(
+                        path=state_path,
+                        run_date=run_date,
+                        instance=instance_label,
+                        run_status=None,
+                        status_source=None,
+                        base_version=None,
+                        as_of=None,
+                        eligible=False,
+                        reason=SKIP_UNREADABLE,
+                    )
+                )
+                continue
+            status, status_source = snapshot_run_status(run_dir)
+            base_version = _normalise_version_value(state.get("base_version"))
+            as_of = _normalise_version_value(state.get("as_of_date"))
+            eligible, reason = True, "eligible"
+            if status is not None and status != "SUCCESS":
+                eligible, reason = False, SKIP_STATUS_NOT_SUCCESS
+            elif as_of is None:
+                eligible, reason = False, SKIP_AS_OF_MISSING
+            elif as_of != run_date:
+                eligible, reason = False, SKIP_AS_OF_MISMATCH
+            elif expected is not None and base_version != expected:
+                eligible = False
+                reason = (
+                    SKIP_BASE_VERSION_MISMATCH if base_version else SKIP_BASE_VERSION_MISSING
+                )
+            out.append(
+                PriorStateCandidate(
+                    path=state_path,
+                    run_date=run_date,
+                    instance=instance_label,
+                    run_status=status,
+                    status_source=status_source,
+                    base_version=base_version,
+                    as_of=as_of,
+                    eligible=eligible,
+                    reason=reason,
+                )
+            )
+    return out
+
+
+def select_prior_state(
+    session_root: Optional[str],
+    as_of_date: str,
+    *,
+    expected_base_version: Any = None,
+) -> PriorStateSelection:
+    """Resolve the newest admissible `prior_state` snapshot (see the section header)."""
+    candidates = tuple(
+        list_prior_state_candidates(
+            session_root, as_of_date, expected_base_version=expected_base_version
+        )
+    )
+    chosen = next((c for c in candidates if c.eligible), None)
+    if chosen is None:
+        reason = (
+            "no_candidate_directories_under_session_root"
+            if not candidates
+            else "no_admissible_candidate"
+        )
+        return PriorStateSelection(
+            state=None,
+            source=None,
+            candidates=candidates,
+            log_line=(
+                f"{PRIOR_STATE_LOG_PREFIX} unresolved as_of={as_of_date} "
+                f"session_root={session_root or '<none>'} reason={reason} "
+                f"considered={len(candidates)} -- 保留既有 prior_state 不变"
+            ),
+        )
+    state = _load_json_object(chosen.path)
+    skipped = [c.as_skip_record() for c in candidates if not c.eligible]
+    source = {
+        "path": chosen.path,
+        "as_of": chosen.as_of,
+        "run_date": chosen.run_date,
+        "instance": chosen.instance,
+        "run_status": chosen.run_status,
+        "status_source": chosen.status_source,
+        "base_version": chosen.base_version,
+        "selection_reason": "newest_successful_snapshot_at_or_before_as_of",
+        "skipped": skipped,
+    }
+    # The console/summary line names the first few rejections; the FULL list (with reasons)
+    # is in `prior_state_source["skipped"]` so nothing is silently dropped, while a long
+    # carry-forward chain cannot bloat `deploy_stdout` into unreadability.
+    shown = skipped[:6]
+    skip_text = ", ".join(
+        f"{s['run_date']}/{s['instance']}:{s['reason']}" for s in shown
+    )
+    if len(skipped) > len(shown):
+        skip_text += f", +{len(skipped) - len(shown)} more (see prior_state_source.skipped)"
+    return PriorStateSelection(
+        state=state,
+        source=source,
+        candidates=candidates,
+        log_line=(
+            f"{PRIOR_STATE_LOG_PREFIX} selected path={chosen.path} as_of={chosen.as_of} "
+            f"run_date={chosen.run_date} instance={chosen.instance} "
+            f"run_status={chosen.run_status or '<no verdict>'} "
+            f"({chosen.status_source or 'legacy'}) base_version={chosen.base_version} "
+            f"reason={source['selection_reason']} skipped={len(skipped)}"
+            + (f" skips=[{skip_text}]" if skipped else "")
+        ),
+    )
+
+
+def _same_snapshot(left: Any, right: Any) -> bool:
+    """`True` when two state dicts describe the same snapshot (date + NAV, exact)."""
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    if str(left.get("as_of_date") or "") != str(right.get("as_of_date") or ""):
+        return False
+    try:
+        return float(left.get("current_nav")) == float(right.get("current_nav"))
+    except (TypeError, ValueError):
+        return False
+
+
+def apply_prior_state_selection(
+    account_state: Dict[str, Any], selection: PriorStateSelection
+) -> Optional[str]:
+    """Install the resolved snapshot as `prior_state` and record where it came from.
+
+    Returns the log line to print (also meant for `summary.json`), or None when this
+    resolver had nothing to say.  `account_state` is mutated in place; when no admissible
+    candidate exists the carried `prior_state` is left EXACTLY as it was (an unresolved
+    selection must never destroy state).
+    """
+    if not isinstance(account_state, dict):
+        return None
+    if selection.source is None:
+        # Unresolved: report it, but never destroy the carried block.
+        return selection.log_line
+    carried = account_state.get("prior_state")
+    if _same_snapshot(carried, selection.state):
+        action = "kept"
+        reason = "carried_prior_state_is_the_newest_admissible_snapshot"
+    else:
+        action = "replaced"
+        reason = "carried_prior_state_skipped_a_newer_admissible_snapshot"
+        if not isinstance(carried, dict):
+            reason = "carried_prior_state_missing"
+        account_state["prior_state"] = copy.deepcopy(selection.state)
+    source = dict(selection.source)
+    source["selection_reason"] = reason
+    source["carried_prior_state_as_of"] = (
+        str(carried.get("as_of_date")) if isinstance(carried, dict) and carried.get("as_of_date") else None
+    )
+    account_state["prior_state_source"] = source
+    return (
+        f"{selection.log_line} action={action} carried_as_of={source['carried_prior_state_as_of']} "
+        f"reason={reason}"
     )
