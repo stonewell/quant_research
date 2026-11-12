@@ -22,7 +22,7 @@
 
 ### 0.2 非目标（本文明确**不**改变什么）
 
-1. **不改变** `nav_breakdown.json` 的产出。该文件由 Stage 1 `web/livetrading/execution_service.py::_write_nav_breakdown`（`:2273-2304`）写出，其 `cash` 取自 `_resolve_nav`（`:2080`）→ `compute_nav`（`web/livetrading/valuation.py:688-736`），现金值经 `_archived_cash_for`（`:2020-2078`）回溯上一轮 `summary.json::cash`。该链路属**估值侧**，本文只**读取**其结果作为对账的「观测期末现金」。
+1. **不改变** `nav_breakdown.json` 的产出。该文件是 **Stage-1 门禁快照**（`web/livetrading/execution_service.py::_write_nav_breakdown`（`:2273-2304`）在门禁子进程启动前写出，Stage 1 经 `--nav-breakdown-file` 读它）；2026-11-11 前它曾被 Stage 2 覆写为部署后估值，现已拆分：Stage-2 的部署后估值另存 `nav_breakdown.stage2.json`，`summary.json` 裸名（`nav_effective` / `cash` / `cash_source` / `cash_as_of` …）为门禁值、`*_stage2` 族为部署值。其 `cash` 取自 `_resolve_nav`（`:2080`）→ `compute_nav`（`web/livetrading/valuation.py:688-736`），现金值经 `_archived_cash_for`（`:2020-2078`）回溯上一轮 `summary.json::cash`。该链路属**估值侧**，本文只**读取**其结果作为对账的「观测期末现金」。
 2. **不改变**票据生成。`scripts/run_live_strategy.py:3491-3492` 写出 `live_trading_ticket.csv` 的行为、列集合、行序一律不动。
 3. **不改变** `delta_weight` 算术。`trade_val = delta_w * portfolio_value`（`scripts/run_live_strategy.py:2798`）保持不变。
 4. **不改变** sweep 逻辑。现金腿动作的赋值（`scripts/run_live_strategy.py:2440-2448`：`SWEEP_CASH` / `RELEASE_CASH`）保持不变。
@@ -43,7 +43,7 @@
 本节只陈述**可复核的事实**，作为 §5 / §6 判定规则的动机。
 
 1. 票据由 Stage 2 `scripts/run_live_strategy.py` 在 `:3491-3492` 写出，现金腿金额由 `:2798` 的 `trade_val = delta_w * portfolio_value` 决定，现金腿动作在 `:2440-2448` 被赋为 `SWEEP_CASH`（`delta_w > 0`）或 `RELEASE_CASH`（`delta_w <= 0`）。
-2. `nav_breakdown.json::cash` 由 Stage 1 `_write_nav_breakdown`（`:2273-2304`）写出，源头是上一轮归档的 `summary.json::cash`（`_archived_cash_for`，`:2020-2078`），即**操作员/归档值**，不是本轮的成交结果。
+2. `nav_breakdown.json::cash` 是 Stage-1 **门禁快照**的现金腿（`_write_nav_breakdown`（`:2273-2304`）在门禁前写出；2026-11-11 前曾被 Stage 2 覆写为部署后估值，现 Stage-2 部署后值另存 `nav_breakdown.stage2.json` / `summary.json` 的 `*_stage2` 字段族），源头是上一轮归档的 `summary.json::cash`（`_archived_cash_for`，`:2020-2078`），即**操作员/归档值**，不是本轮的成交结果。
 3. **全仓不存在成交回单表，也不存在现金流水账。** 与成交判定相关的内容只有若干**说明性注释**，明示「无回单」：`execution_service.py:2678`、`:3060-3062`、`:3215-3217`、`:3453`。
 4. 实测形状（2026-10-30 / 2026-11-02）：BIL 的 `SWEEP_CASH` 票据在自身内部承认 **−10836.00** 的现金流出，而 `nav_breakdown.json::cash` 两轮均停在 **47800.06**；2026-10-29 → 10-30 现金由 **59063.46** 变为 **47800.06**（**−11263.40**），同样无流水可对。
 
