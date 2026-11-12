@@ -259,8 +259,36 @@ def test_instantiate_strategy_from_config_entry():
     assert v_info["version"] == "2.3.4"
 
 
+#: Pinned `--as-of-date` for the subprocess ticket-structure check below. It is a china-market
+#: trading day inside `common/market_holidays.py`'s covered range (2020-2027), chosen purely so
+#: the child run is a REPLAY (`run_mode=replay`, `window_gate=not_applicable_replay`).
+#:
+#: WHY A REPLAY AND NOT "TODAY": `scripts/run_live_strategy.py` calls
+#: `enforce_execution_executability()` (common/live_execution_timing.py `annotate_executability`)
+#: before it writes anything, and that gate REFUSES (MissedExecutionOpenError, no ticket) once the
+#: wall clock is past the OPEN of the `execution_date` the ticket declares (`as_of+1`). A run
+#: against the market clock's own as-of therefore fails closed for the whole intraday stretch
+#: after the open -- i.e. this structural assertion used to be red for most of the Chinese
+#: trading day. Replay is the gate's OWN documented exemption (there is no live fill to be late
+#: for), so this is not a bypass: `execution_session == "as_of+1"` and
+#: `price_reference == "next_open"` stay frozen and are still asserted below.
+#:
+#: SCOPE: this test covers the ticket's SERIALIZATION only -- `detail_reason` sub-schemas plus the
+#: `strategy_version` / `base_version` keys on each order row and the `strategy_version` /
+#: `strategy_version_info` block in `account_state.json`. Execution-instant compliance
+#: (late/refused/proceed verdicts, `--allow-intraday` not laundering a missed open,
+#: clean-key-set invariance) is covered by `pipeline/tests/test_execution_executability.py`;
+#: do not re-derive it here.
+_REPLAY_AS_OF_DATE = "2025-08-22"
+
+
 def test_live_ticket_detail_reason_and_version_structure():
-    """Verify live_trading_ticket.json serialization contains detail_reason and version fields."""
+    """Verify live_trading_ticket.json serialization contains detail_reason and version fields.
+
+    Runs the real runner as a child process in REPLAY mode (`--as-of-date` pinned to
+    `_REPLAY_AS_OF_DATE`) so the ticket structure is reproducible at any hour of the day.
+    See `_REPLAY_AS_OF_DATE` for why the exemption is required and what it does NOT weaken.
+    """
     with tempfile.TemporaryDirectory() as tmp_dir:
         out_ticket_json = os.path.join(tmp_dir, "live_trading_ticket.json")
         out_account_state = os.path.join(tmp_dir, "account_state.json")
@@ -286,6 +314,10 @@ def test_live_ticket_detail_reason_and_version_structure():
             "--output-dir", tmp_dir,
             "--account-state-file", out_account_state,
             "--lookback-days", "300",
+            # Pinned past session => `run_mode=replay`, the executability gate's own exemption.
+            # Without it the child refuses (exit 1, no ticket) whenever the wall clock is already
+            # past the declared `as_of+1` open -- a time-of-day-dependent red.
+            "--as-of-date", _REPLAY_AS_OF_DATE,
             "--no-strict-market-clock",
         ]
         # cwd=_PROJECT_ROOT pins the child's working directory instead of silently
@@ -315,6 +347,9 @@ def test_live_ticket_detail_reason_and_version_structure():
         assert "summary_reason" in first_ticket
         assert "strategy_version" in first_ticket
         assert first_ticket["strategy_version"] == "1.0.0"
+        # Static allocation templates carry no BASE_VERSION, so the ticket row states
+        # `base_version: null` -- the KEY is what this structural test pins.
+        assert "base_version" in first_ticket
         assert "detail_reason" in first_ticket
 
         # Inspect detail_reason schema

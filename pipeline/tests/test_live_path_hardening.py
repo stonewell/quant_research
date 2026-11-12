@@ -469,10 +469,83 @@ def test_live_runner_5m_logging_reports_absence_honestly(tmp_path, patched_weigh
 
     out = capsys.readouterr().out
     assert "5m 日内特征不可用" in out
-    assert "provider does not support 5m" in out
+    # (2026-11-11, `六` item 6) The discredited "provider does not support 5m" diagnosis is
+    # gone: a 5m-capable provider also returns zero rows, and the real attribution is the
+    # missing per-symbol coverage / fallback chain, which is what the line now names.
+    assert "该 provider 无这批标的的 5m 行" in out
+    assert "常见原因：provider does not support 5m" not in out
     # The old lie is gone.
     assert "成功加载并聚合 5m 日内特征" not in out
     # The run still produced a daily-signal ticket.
+    assert not order_df.empty
+
+
+def test_live_runner_tells_the_loader_which_session_the_cache_must_reach(
+    tmp_path, patched_weights, capsys
+):
+    """(2026-11-11) Without `expected_last_session` a frozen 5m cache is invisible.
+
+    The runner must hand the loader the session the cache is SUPPOSED to hold, and the
+    `[INFO]` line must then report `provider` / `source` / `stale` / `lag_calendar_days`
+    instead of only a timestamp.
+    """
+    from unittest.mock import patch
+
+    import common.intraday_features as intraday_mod
+    from scripts.run_live_strategy import main as live_main
+
+    universe_file = _write_universe(tmp_path, ["600000.SH", "601857.SH", "BIL"])
+    holdings_file = _write_json(tmp_path, "holdings.json", {"BIL": 100000})
+    state_file = str(tmp_path / "account_state.json")
+
+    patched_weights({"600000.SH": 0.5, "601857.SH": 0.0, "BIL": 0.5})
+    args = _live_args(
+        tmp_path,
+        universe_file,
+        state_file,
+        _AS_OF_SECOND,
+        extra=[
+            "--current-holdings-file", holdings_file,
+            "--enable-intraday-5m",
+            "--exit-confirm-bars", "1",
+        ],
+    )
+
+    recorded = {}
+
+    def _stale_loader(symbols, **kwargs):
+        recorded["symbols"] = list(symbols)
+        recorded["kwargs"] = dict(kwargs)
+        frames = {}
+        for sym in symbols:
+            frame = pd.DataFrame(
+                {"Close": [1.0]},
+                index=pd.DatetimeIndex([f"{_AS_OF_SECOND} 09:35"]),
+            )
+            frame.attrs.update(
+                {
+                    "intraday_5m_available": True,
+                    "intraday_5m_source": "duckdb_cache",
+                    "intraday_5m_provider": "BaoStockDataProvider",
+                    "intraday_5m_stale": True,
+                    "intraday_5m_lag_calendar_days": 2,
+                }
+            )
+            frames[sym] = frame
+        return frames
+
+    with patch.object(intraday_mod, "load_intraday_5m_universe", _stale_loader):
+        order_df = live_main(args)
+
+    out = capsys.readouterr().out
+    # The loader was told WHICH session the cache has to reach.
+    assert recorded["kwargs"].get("expected_last_session") is not None
+    # ...and the report is no longer a bare timestamp.
+    assert "provider=BaoStockDataProvider" in out
+    assert "source=duckdb_cache" in out
+    assert "stale=True" in out
+    assert "lag_calendar_days=2" in out
+    assert "5m 缓存陈旧" in out
     assert not order_df.empty
 
 

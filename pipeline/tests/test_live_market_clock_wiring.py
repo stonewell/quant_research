@@ -46,6 +46,7 @@ import pytest
 import common.cli_utils as cli_utils
 from common.cli_utils import RunWindowError, load_universe_with_banner
 from common.freshness import StalePriceError
+from common.live_execution_timing import MissedExecutionOpenError
 from common.market_clock import MarketClock
 
 # --------------------------------------------------------------------------- #
@@ -142,27 +143,37 @@ def test_intraday_run_is_refused_by_default(monkeypatch, tmp_path):
 
 
 def test_allow_intraday_runs_but_values_at_previous_published_session(monkeypatch, tmp_path, capsys):
-    """Case 1 continued: `--allow-intraday` passes the gate, as_of stays 2026-10-22.
+    """Case 1 continued: `--allow-intraday` passes the WINDOW gate, as_of stays 2026-10-22.
 
     Today's bar is unfinished, so the valuation session MUST be the previous published
     one. `summary.json` records the whole decision.
+
+    (`D3`, 2026-11-11) The window gate is no longer the only gate. At 09:59 on 2026-10-23
+    the ticket the run would declare (`execution_session=as_of+1` / `price_reference=
+    next_open` => fill at the 2026-10-23 OPEN) is already 29 minutes stale, so the run fails
+    closed and writes NO ticket. The market-clock decisions are still auditable: the
+    `execution_timing.json` block records `as_of=2026-10-22` (not 10-23), `session=open` and
+    the `intraday_allowed` gate -- and, in the same file, `executable=false` +
+    `timing_violation=after_open`.
     """
     from scripts.run_live_strategy import main as live_main
 
     _freeze(monkeypatch, _BEIJING_0959)
-    order_df = live_main(
-        _stage2_args(tmp_path, _AS_OF_INTRADAY, extra=["--allow-intraday"])
-    )
-    assert order_df is not None and not order_df.empty
+    with pytest.raises(MissedExecutionOpenError):
+        live_main(_stage2_args(tmp_path, _AS_OF_INTRADAY, extra=["--allow-intraday"]))
 
-    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
-    clock = summary["clock"]
-    assert clock["market"] == "china"
-    assert clock["session"] == "open"
-    assert clock["as_of_trading_date"] == _AS_OF_INTRADAY
-    assert clock["expected_last_session"] == _AS_OF_INTRADAY
-    assert clock["run_window_gate"] == "intraday_allowed"
-    assert clock["allow_intraday"] is True
+    block = json.loads(
+        (tmp_path / "execution_timing.json").read_text(encoding="utf-8")
+    )
+    assert block["as_of"] == _AS_OF_INTRADAY
+    assert block["execution_date"] == _AS_OF_PUBLISHED
+    assert block["session_state"] == "open"
+    assert block["window_gate"] == "intraday_allowed"
+    assert block["in_window"] is False
+    assert block["executable"] is False
+    assert block["timing_violation"] == "after_open"
+    assert block["disposition"] == "refused"
+    assert not (tmp_path / "live_trading_ticket.csv").exists()
 
 
 def test_pre_open_us_book_resolves_previous_session(monkeypatch, tmp_path):
@@ -226,13 +237,32 @@ def test_weekend_as_of_resolves_to_previous_friday_and_is_allowed(monkeypatch, t
 
 
 def test_published_grace_boundary_decides_today_vs_yesterday(monkeypatch, tmp_path):
-    """Case 2 vs 3: 15:05 (unpublished) keeps as_of on 10-22; 15:30 moves it to 10-23."""
+    """Case 2 vs 3: 15:05 (unpublished) keeps as_of on 10-22; 15:30 moves it to 10-23.
+
+    (`D3`, 2026-11-11) At 15:05 the valuation session is still 10-22, so the declared fill is
+    the 10-23 OPEN -- 5h35m in the past. That run now fails closed (an `as_of+1` ticket
+    written after its own open cannot be honoured). The grace boundary is exactly what makes
+    the 15:30 sibling legal: it values on 10-23 and therefore declares the next session's
+    open (2026-10-26, Monday), which is still ahead of the writer.
+    """
     from scripts.run_live_strategy import main as live_main
 
     _freeze(monkeypatch, _BEIJING_1505)
-    live_main(_stage2_args(tmp_path))
-    clock = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))["clock"]
-    assert clock["as_of_trading_date"] == _AS_OF_INTRADAY
+    with pytest.raises(MissedExecutionOpenError):
+        live_main(_stage2_args(tmp_path))
+    block = json.loads((tmp_path / "execution_timing.json").read_text(encoding="utf-8"))
+    assert block["as_of"] == _AS_OF_INTRADAY
+    assert block["execution_date"] == _AS_OF_PUBLISHED
+    assert block["timing_violation"] == "after_close"
+
+    # 15:30: today's close IS published -> as_of moves to 10-23 -> the declared fill is a
+    # future session's open, so the run is allowed.
+    published_dir = tmp_path / "published"
+    published_dir.mkdir()
+    _freeze(monkeypatch, _BEIJING_1530)
+    live_main(_stage2_args(published_dir))
+    clock = json.loads((published_dir / "summary.json").read_text(encoding="utf-8"))["clock"]
+    assert clock["as_of_trading_date"] == _AS_OF_PUBLISHED
     assert clock["publication_grace_minutes"] == 30
 
 

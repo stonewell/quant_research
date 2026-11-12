@@ -47,7 +47,7 @@ import os
 import re
 import sys
 import unicodedata
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -113,9 +113,13 @@ from common.financial_api import check_missing_trading_days, get_trading_days_ca
 from common.intraday_drawdown_derisk import evaluate_intraday_drawdown
 from common.r1_derisk_report import apply_r1_intraday_derisk
 from common.live_execution_timing import (
+    MissedExecutionOpenError,
+    annotate_executability,
     build_ticket_payload,
+    executability_log_line,
     merge_timing_into_summary,
     resolve_execution_timing,
+    ticket_order_rows,
     write_execution_timing,
 )
 from common.market_clock import (
@@ -169,8 +173,11 @@ from pipeline.live_signal.lsig.signal import as_of_universe, latest_rebalance_ro
 from scripts.live_paths import DEFAULT_STRATEGY_KEY, default_live_output_dir
 from scripts.live_preflight import (
     LiveDumpPreflightError,
+    apply_prior_state_selection,
     assert_account_state_version_parity,
     assert_dump_version_parity,
+    derive_session_root,
+    select_prior_state,
     verify_live_strategy_dump_preflight,
 )
 
@@ -631,6 +638,67 @@ def resolve_run_mode(clock_ctx: Any) -> str:
     ):
         return "replay"
     return "live"
+
+
+def enforce_execution_executability(
+    timing: Dict[str, Any],
+    clock_ctx: Any,
+    output_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """(`D3`) Refuse to write a ticket AFTER the open it declares as its fill instant.
+
+    THE DEFECT. `execution_session=as_of+1` / `price_reference=next_open` declare that the
+    orders fill at the NEXT session's open. Nothing compared that declared instant with the
+    instant the ticket was actually written: the archived runs of 2026-11-09 / 11-10 / 11-11
+    were all generated around noon of their own `execution_date`
+    (`local_now=2026-11-10T12:50:14+08:00` for `execution_date=2026-11-10`, etc.), i.e. the
+    declared next-open reference price had ALREADY expired when the file appeared. The run
+    still succeeded, so the archive said "next_open" about an order that could only be read
+    as stale.
+
+    DISPOSITION = (A) HARD REFUSE, fail-closed. Deferring instead ((B)) would carry
+    `execution_date` to a later open while `price_reference` stayed `next_open` -- a false
+    statement about which close the prices came from, and `common/live_execution_timing.py`'s
+    frozen vocabulary has no third spelling for "close t-1, fill t+2". So: no ticket, a
+    `MissedExecutionOpenError`, and the operator re-runs (which re-prices on the then-latest
+    closed session).
+
+    `--allow-intraday` is deliberately NOT consulted here: it only relaxes the designed
+    inspection WINDOW (`common/cli_utils.assert_run_window`). Missing the open is a different
+    fact and no flag may launder it.
+
+    Returns the annotated timing block (the caller keeps using it); raises when violated.
+    The structured audit block is written to `execution_timing.json` BEFORE raising, so the
+    refusal itself is auditable in the archive (`executable=false` + `timing_violation` +
+    `lateness_minutes` + `disposition=refused`).
+    """
+    annotated = annotate_executability(timing, getattr(clock_ctx, "clock", None))
+    generated_at: Optional[str] = None
+    try:
+        generated_at = clock_ctx.clock.local_now().isoformat()
+    except Exception:
+        generated_at = None
+    line = executability_log_line(annotated, generated_at)
+    print(line)
+    violation = annotated.get("timing_violation")
+    if not violation:
+        return annotated
+    # Keep the persisted `timing_log` identical to the printed verdict (the clock's own
+    # instant when it is readable, `annotate_executability`'s fallback otherwise).
+    annotated["timing_log"] = line
+    if output_dir:
+        try:
+            write_execution_timing(output_dir, annotated)
+        except Exception as exc:  # pragma: no cover - audit write must not mask the refusal
+            print(f"[WARN] 未能写入 execution_timing.json 审计块: {exc}")
+    raise MissedExecutionOpenError(
+        f"{line}\n"
+        f"票据声明在 {annotated.get('execution_date')} 开盘成交"
+        f"（execution_session=as_of+1, price_reference=next_open），但本次运行发生在其后 "
+        f"（violation={violation}, lateness_minutes={annotated.get('lateness_minutes')}）。"
+        "因此该票的参考价已失效：本轮不出票（fail-closed），请重跑。"
+        "`--allow-intraday` 只放宽运行窗口，不放行「已错过开盘」，不能作为绕过。"
+    )
 
 
 def announce_run_mode(clock_ctx: Any, run_mode: str) -> None:
@@ -2198,6 +2266,553 @@ def apply_market_value_cap(
     return row
 
 
+# ---------------------------------------------------------------------------
+# (D4, evidence `runs/2026-11-09/204956`) Delivered-weight accounting
+# ---------------------------------------------------------------------------
+#
+# THE DEFECT THIS CLOSES.  A ticket row states a MODEL target weight (`target_weight`)
+# and a WHOLE-LOT quantity (`target_shares`) that cannot express it, and nothing bridged
+# the two:
+#
+#   * 600660.SH: `target_weight = 0.2`, `detail_reason.lot_rounding.target_shares_raw =
+#     299.04`, `shares = 200` -> the row delivers `200 * 56.62 / NAV = 17.17%`, but the
+#     ticket still printed "目标: 20.0%" and `account_state.lifecycle_states` persisted
+#     `current_weight = 0.2`.  The next round's inertia filter / min-entry filter /
+#     single-name cap therefore all compared against a weight the book can never hold.
+#   * the whole ticket summed to `Σ target_weight = 1.028337` (BIL row included) while
+#     `Σ current_weight = 1.000000` -- i.e. the generated book claimed 102.8% of NAV.
+#   * 601919.SH breached the 20% delivered cap (`market_value_weight = 0.211865`) and the
+#     breach existed ONLY inside `detail_reason.mv_cap`; the operator had to open the JSON
+#     to find it.
+#
+# THE CONTRACT (three additive fields, no existing meaning changed):
+#   * `target_weight_model`    -- the model's original target for the row (audit only).
+#   * `target_weight_effective`-- `target_shares * price / NAV`, i.e. what the ticket
+#                                 actually delivers; the cash-proxy row carries the NAV
+#                                 RESIDUAL (`1 - Σ equity effective`), which is the only
+#                                 honest weight a placeholder row with no share quantity
+#                                 can have.
+#   * ticket top level: `weights_normalized` / `weight_normalization_factor` /
+#     `target_weight_sum` / `target_weight_sum_model` / `rounding_rebalanced` /
+#     `mv_cap_breaches`.
+# `target_weight` itself keeps its pre-D4 meaning (the model/clamped target that sizing
+# used), because archived readers and the live UI consume it.
+WEIGHT_BUDGET_TOLERANCE = 1e-9
+TARGET_WEIGHT_EFFECTIVE_DECIMALS = 8
+
+#: (D5) Sidecar that makes "an EMPTY book" distinguishable from "no book". Written next to
+#: `post_holdings.json` by this runner; read by `web/livetrading/storage.py`
+#: (`post_holdings_meta_status`), which keeps the same filename constant.
+POST_HOLDINGS_META_FILENAME = "post_holdings.meta.json"
+
+
+def _row_weight(row: Dict[str, Any], key: str = "target_weight") -> float:
+    """`row[key]` as a finite float, 0.0 when absent/unusable (never NaN into JSON)."""
+    try:
+        value = float(row.get(key) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if np.isfinite(value) else 0.0
+
+
+def _detail_block(row: Dict[str, Any], name: str) -> Optional[Dict[str, Any]]:
+    """`row["detail_reason"][name]` as a mutable dict, created on demand; None if unusable."""
+    detail = row.get("detail_reason")
+    if not isinstance(detail, dict):
+        return None
+    block = detail.get(name)
+    if not isinstance(block, dict):
+        block = {}
+        detail[name] = block
+    return block
+
+
+def normalize_model_target_weights(
+    rows: List[Dict[str, Any]],
+    *,
+    portfolio_value: float,
+    cash_proxy: Optional[str] = None,
+    lot_size_fn: Optional[Any] = None,
+    tolerance: float = WEIGHT_BUDGET_TOLERANCE,
+) -> Dict[str, Any]:
+    """Scale the model's target weights down when the buy side sums above 100% (D4).
+
+    Runs BEFORE the purchasing-power rescale and the delivered-cap pass, so every later
+    stage (lot rounding, cash reconciliation, printing) sees a book that already fits
+    inside one NAV.  Proportional: `factor = 1 / Σ`, where `Σ` counts ONLY the weights this
+    function is allowed to rewrite: the BUY legs plus the cash-proxy placeholder.
+
+    SCOPE (deliberate, load-bearing): a SELL / HOLD / CANCEL_PENDING row's TARGET is NEVER
+    rescaled.  A ticket may not silently turn "sell 300" into "sell 280" (a different
+    order), and a freeze/HOLD row's target is the position being carried -- rewriting it
+    would break the "market closed => nothing was evaluated" invariant.  Those rows also
+    cannot be rescaled in practice: with a stale price the carried weight can legitimately
+    exceed 100% (`current_weight = 4.75` in the L2.23 freeze test), and normalizing it would
+    manufacture a trade the model never asked for.  If the non-BUY rows keep the book above
+    100%, `reconcile_delivered_weight_budget` reports `budget_ok = False` and WARNs instead
+    of touching them.
+
+    Pure arithmetic on plain dicts (no I/O, no globals) so it is unit-testable offline.
+    Returns the audit summary that ends up at the ticket's top level.
+    """
+    lot_size_fn = lot_size_fn or resolve_lot_size
+    pv = float(portfolio_value or 0.0)
+    summary: Dict[str, Any] = {
+        "weights_normalized": False,
+        "weight_normalization_factor": 1.0,
+        "target_weight_sum_model": 0.0,
+        "weight_normalization_partial": False,
+    }
+    if pv <= 0 or not rows:
+        return summary
+
+    def _scalable(row: Dict[str, Any]) -> bool:
+        if cash_proxy is not None and row.get("symbol") == cash_proxy:
+            return True
+        return str(row.get("action") or "").strip().upper() == "BUY"
+
+    total = 0.0
+    for r in rows:
+        if _scalable(r):
+            total += _row_weight(r)
+    summary["target_weight_sum_model"] = round(total, TARGET_WEIGHT_EFFECTIVE_DECIMALS)
+    if not np.isfinite(total) or total <= 1.0 + tolerance:
+        return summary
+
+    factor = 1.0 / total
+    summary["weights_normalized"] = True
+    summary["weight_normalization_factor"] = round(factor, 10)
+
+    for r in rows:
+        if not _scalable(r):
+            continue
+        before = _row_weight(r)
+        if before <= 0.0:
+            continue
+        r["target_weight"] = before * factor
+        r["delta_weight"] = r["target_weight"] - _row_weight(r, "current_weight")
+        block = _detail_block(r, "weight_budget")
+        if block is not None:
+            block["normalization_factor"] = summary["weight_normalization_factor"]
+            block["target_weight_model"] = round(_row_weight(r, "target_weight_model") or before, 10)
+        if cash_proxy is not None and r.get("symbol") == cash_proxy:
+            continue
+        price = _row_weight(r, "price")
+        if price <= 0.0:
+            continue
+        lot = max(1, int(lot_size_fn(str(r.get("symbol") or "")) or 1))
+        target_f = (r["target_weight"] * pv) / price
+        new_target = int(np.floor(target_f / lot) * lot)
+        new_delta = new_target - int(r.get("current_shares") or 0)
+        if new_delta < 0:
+            # The scaled target fell below what is already held.  Emitting a SELL was not
+            # asked for by the model, so the row becomes a zero-quantity record instead of
+            # an order in the opposite direction.
+            new_delta = 0
+            new_target = int(r.get("current_shares") or 0)
+            summary["weight_normalization_partial"] = True
+        r["target_shares"] = new_target
+        r["delta_shares"] = new_delta
+        r["shares"] = int(abs(new_delta))
+        r["trade_value"] = new_delta * price
+        r["trade_value_rmb"] = r["trade_value"]
+        detail = r.get("detail_reason")
+        if isinstance(detail, dict):
+            if isinstance(detail.get("lot_rounding"), dict):
+                detail["lot_rounding"]["shares"] = int(new_delta)
+                detail["lot_rounding"]["target_shares_raw"] = round(target_f, 2)
+            if isinstance(detail.get("inertia_check"), dict):
+                detail["inertia_check"]["delta_weight"] = round(r["delta_weight"], 4)
+    return summary
+
+
+def reconcile_delivered_weight_budget(
+    rows: List[Dict[str, Any]],
+    *,
+    portfolio_value: float,
+    cash_proxy: Optional[str] = None,
+    lot_size_fn: Optional[Any] = None,
+    tolerance: float = WEIGHT_BUDGET_TOLERANCE,
+) -> Dict[str, Any]:
+    """Stamp `target_weight_effective` and keep `Σ effective <= 1` (D4).
+
+    Always: every row gets `target_weight_effective = target_shares * price / NAV` (cash
+    proxy: the NAV residual).  That is the number the book can actually deliver AFTER
+    whole-lot rounding, and the one `account_state.lifecycle_states.current_weight` now
+    persists.
+
+    When `Σ effective` still exceeds 1 because a lot rounded UP above its target, whole
+    lots are shaved off the SMALLEST delivered positions first (`action == "BUY"` rows with
+    a real delta only -- a ticket may not invent a SELL), and `rounding_rebalanced` is set.
+    The function is idempotent, so the caller runs it once before the delivered-cap pass
+    (where shaving is still allowed) and once after it (to refresh the stamp on rows whose
+    quantity the cap just clamped).
+
+    Pure arithmetic on plain dicts (no I/O) so it is unit-testable offline.
+    """
+    lot_size_fn = lot_size_fn or resolve_lot_size
+    pv = float(portfolio_value or 0.0)
+    summary: Dict[str, Any] = {
+        "rounding_rebalanced": False,
+        "target_weight_sum": 0.0,
+        "equity_weight_sum": 0.0,
+        "cash_weight_effective": None,
+        "budget_ok": True,
+        "shaved_rows": [],
+    }
+    if pv <= 0 or not rows:
+        return summary
+
+    equity = [r for r in rows if not (cash_proxy is not None and r.get("symbol") == cash_proxy)]
+    cash_rows = [r for r in rows if cash_proxy is not None and r.get("symbol") == cash_proxy]
+
+    def eff(row: Dict[str, Any]) -> float:
+        return market_value_weight(
+            row.get("target_shares"), row.get("price"), pv
+        )
+
+    total = float(sum(eff(r) for r in equity))
+    guard = 0
+    while total > 1.0 + tolerance and guard < 100000:
+        guard += 1
+        candidates: List[Tuple[float, Dict[str, Any], int]] = []
+        for r in equity:
+            if str(r.get("action") or "").strip().upper() != "BUY":
+                continue
+            lot = max(1, int(lot_size_fn(str(r.get("symbol") or "")) or 1))
+            if int(r.get("delta_shares") or 0) < lot:
+                continue
+            candidates.append((eff(r), r, lot))
+        if not candidates:
+            break
+        candidates.sort(key=lambda item: item[0])
+        _w, row, lot = candidates[0]
+        price = _row_weight(row, "price")
+        if price <= 0.0:
+            break
+        excess_value = (total - 1.0) * pv
+        # `- 1e-9` on the lot count, not on the weights: `total - 1.0` is 0.02000000000000002
+        # for a 1.02 book, and a bare `ceil` would then shave ONE LOT TOO MANY.
+        lots = int(np.ceil(excess_value / (lot * price) - 1e-9))
+        lots = max(1, min(lots, int(row.get("delta_shares") or 0) // lot))
+        shaved = lots * lot
+        row["target_shares"] = int(row.get("target_shares") or 0) - shaved
+        row["delta_shares"] = int(row.get("delta_shares") or 0) - shaved
+        row["shares"] = int(abs(row["delta_shares"]))
+        row["trade_value"] = float(row["delta_shares"]) * price
+        row["trade_value_rmb"] = row["trade_value"]
+        block = _detail_block(row, "weight_budget")
+        if block is not None:
+            block["shaved_shares"] = int(block.get("shaved_shares") or 0) + shaved
+        detail = row.get("detail_reason")
+        if isinstance(detail, dict) and isinstance(detail.get("lot_rounding"), dict):
+            detail["lot_rounding"]["shares"] = int(row["delta_shares"])
+        summary["rounding_rebalanced"] = True
+        summary["shaved_rows"].append(row.get("symbol"))
+        total = float(sum(eff(r) for r in equity))
+
+    for r in equity:
+        r["target_weight_effective"] = round(eff(r), TARGET_WEIGHT_EFFECTIVE_DECIMALS)
+    summary["equity_weight_sum"] = round(total, TARGET_WEIGHT_EFFECTIVE_DECIMALS)
+
+    total_effective = total
+    if cash_rows:
+        # A cash-proxy row carries no share quantity (`target_shares` is 0 by construction),
+        # so the only truthful "delivered weight" it can state is the NAV left over.
+        cash_eff = max(0.0, 1.0 - total)
+        for r in cash_rows:
+            r["target_weight_effective"] = round(cash_eff, TARGET_WEIGHT_EFFECTIVE_DECIMALS)
+        total_effective = total + cash_eff
+        summary["cash_weight_effective"] = round(cash_eff, TARGET_WEIGHT_EFFECTIVE_DECIMALS)
+
+    summary["target_weight_sum"] = round(total_effective, TARGET_WEIGHT_EFFECTIVE_DECIMALS)
+    summary["budget_ok"] = bool(-tolerance <= total_effective <= 1.0 + tolerance)
+    return summary
+
+
+def merge_weight_budget_summaries(
+    base: Dict[str, Any], update: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Fold a second `reconcile_delivered_weight_budget` pass into the first (D4).
+
+    The refresh pass (after the delivered-cap clamp) must not lose the "we had to shave
+    lots / normalize weights" verdict the first pass recorded.
+    """
+    merged = dict(base or {})
+    for key in ("rounding_rebalanced",):
+        merged[key] = bool((base or {}).get(key)) or bool((update or {}).get(key))
+    for key in ("weights_normalized", "weight_normalization_partial"):
+        merged[key] = bool((base or {}).get(key)) or bool((update or {}).get(key))
+    for key in ("target_weight_sum", "equity_weight_sum", "cash_weight_effective", "budget_ok"):
+        if key in (update or {}):
+            merged[key] = (update or {}).get(key)
+    shaved: List[Any] = []
+    for src in (base or {}, update or {}):
+        for sym in src.get("shaved_rows") or []:
+            if sym not in shaved:
+                shaved.append(sym)
+    merged["shaved_rows"] = shaved
+    return merged
+
+
+def collect_mv_cap_breaches(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Ticket-level summary of every delivered market-value cap breach (D4).
+
+    `apply_market_value_cap` records the verdict inside `detail_reason.mv_cap`; a breach
+    that only lives there is invisible to an operator reading the ticket header (the
+    2026-11-09 601919.SH case: 21.19% delivered against a 20% cap, undiscovered).
+    """
+    breaches: List[Dict[str, Any]] = []
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        block = (r.get("detail_reason") or {}).get("mv_cap") or {}
+        if not block.get("breached"):
+            continue
+        breaches.append({
+            "symbol": r.get("symbol"),
+            "market_value_weight": block.get("market_value_weight"),
+            "cap": block.get("cap"),
+            "enforced": bool(block.get("enforced")),
+            "clamped": bool(block.get("clamped")),
+        })
+    return breaches
+
+
+#: Grep-able markers for the machine check below (`D6`).
+TICKET_BUY_STDOUT_MARKER = "🟢 BUY "
+TICKET_SELL_STDOUT_MARKER = "🔴 SELL "
+
+
+#: Below this gap the delivered weight and the stated target are the same number with
+#: rounding noise (`20.0%` vs `19.9996%`), so no annotation is printed.
+DELIVERED_WEIGHT_NOTE_TOLERANCE = 0.001
+
+
+def _delivered_weight_note(row: Any) -> str:
+    """` | 可交付: 17.17% (整手取整后)` when the ticket cannot deliver its stated target.
+
+    (D4) The 2026-11-09 600660.SH row said `目标: 20.0%` while its 200-share lot delivered
+    17.17%; the operator had no way to see the gap without doing the arithmetic by hand.
+    """
+    try:
+        eff = row.get("target_weight_effective")
+        tgt = float(row.get("target_weight") or 0.0)
+        eff_f = float(eff)
+    except (TypeError, ValueError):
+        return ""
+    if not np.isfinite(eff_f):
+        return ""
+    if abs(eff_f - tgt) <= DELIVERED_WEIGHT_NOTE_TOLERANCE:
+        return ""
+    return f" | 可交付: {eff_f:>5.2%} (整手取整后)"
+
+
+def print_ticket_order_line(line: str, sink: Optional[List[str]] = None) -> None:
+    """`print` one rendered ticket line, keeping a copy for the parity check (D6)."""
+    print(line)
+    if sink is not None:
+        sink.append(line)
+
+
+def verify_ticket_stdout_order_parity(
+    orders: Iterable[Any],
+    stdout_text: Optional[str],
+    *,
+    action: str = "BUY",
+    marker: str = TICKET_BUY_STDOUT_MARKER,
+) -> Dict[str, Any]:
+    """Machine check: one printed order line per ticket order of `action` (D6).
+
+    2026-11-09/204956 evidence: PHASE 2 printed `🟢 BUY 600660.SH ... 200 股` TWICE while
+    the ticket carried one order -- an operator copying the stdout would have doubled the
+    position.  The rendering loop had two `print()` calls per row (the second one existed
+    only to attach the sub-lot warning), so the invariant "orders == printed lines" is now
+    asserted instead of assumed.
+
+    Pure text/count comparison (no I/O), so it can be run against any archived
+    `summary.json::deploy_stdout` as well as against a live run's captured lines.
+    """
+    wanted = str(action or "").strip().upper()
+    n_orders = 0
+    for o in orders or []:
+        getter = getattr(o, "get", None)
+        if not callable(getter):
+            continue
+        if str(getter("action") or "").strip().upper() == wanted:
+            n_orders += 1
+    n_lines = sum(1 for line in str(stdout_text or "").splitlines() if marker in line)
+    result = {
+        "action": wanted,
+        "marker": marker,
+        "orders": n_orders,
+        "printed_lines": n_lines,
+        "parity": n_orders == n_lines,
+    }
+    if not result["parity"]:
+        print(
+            f"[WARN/TICKET STDOUT PARITY] {wanted}: 票据 {n_orders} 条 vs 标准输出 "
+            f"{n_lines} 行 (marker={marker!r}) -- 照 stdout 抄单可能重复或漏单。"
+        )
+    return result
+
+
+def summarize_intraday_5m_loading(
+    universe_5m: Optional[Dict[str, Any]],
+    symbols: Iterable[str],
+    *,
+    provider_label: Optional[str],
+    cutoff_time: str,
+    expected_last_session: Optional[Any] = None,
+    market: str = "china",
+) -> List[str]:
+    """Report what the 5m layer ACTUALLY delivered, with the attribution it can prove.
+
+    (2026-11-11, `六` item 6) The zero-row branch used to print
+    ``常见原因：provider does not support 5m (该数据源仅支持日线 interval='1d')``. That
+    diagnosis is FALSE: the live run used a 5m-capable provider and still saw zero rows,
+    because the symbols had no 5m coverage in the provider OR in the DuckDB fallback (and,
+    in the sibling failure, because the cache stopped a session earlier than the daily
+    data). The misleading sentence is replaced by the two causes that are actually
+    distinguishable from the frames themselves:
+
+      * ``该 provider 无该标的 5m 行`` -- the caller's provider offered no rows and the
+        fallback chain (other providers in the DuckDB cache / parquet) had none either.
+        When a fallback DID serve some symbols its ``fallback_from -> fallback_to``
+        (and ``fallback_reason``) is printed, so "who served this" is never inferred
+        from timestamps;
+      * ``缓存陈旧 (lag=N 天)`` -- rows exist but the newest one predates the expected
+        session, measured by `common.intraday_features.assess_intraday_5m_freshness`
+        (never re-derived here).
+
+    The success line additionally carries `provider` / `source` / `fallback_reason` /
+    `stale` / `lag_calendar_days`, which is what makes a silently frozen 5m layer visible
+    where the old line only printed a timestamp.
+
+    Pure formatting over `df.attrs`: no I/O, no fetch, no calendar guessing.
+    """
+    symbol_list = list(symbols)
+    total = len(symbol_list)
+    frames = universe_5m or {}
+    ok = [
+        df
+        for df in frames.values()
+        if df is not None and not bool(getattr(df, "empty", True))
+    ]
+    n_ok = len(ok)
+
+    providers: Dict[str, int] = {}
+    sources: Dict[str, int] = {}
+    fallback_reasons: Dict[str, int] = {}
+    chains: Dict[str, int] = {}
+    n_stale = 0
+    lags: List[int] = []
+    stale_evidence = False
+    for df in ok:
+        attrs = getattr(df, "attrs", None) or {}
+        if attrs.get("intraday_5m_provider"):
+            key = str(attrs["intraday_5m_provider"])
+            providers[key] = providers.get(key, 0) + 1
+        if attrs.get("intraday_5m_source"):
+            key = str(attrs["intraday_5m_source"])
+            sources[key] = sources.get(key, 0) + 1
+        if attrs.get("fallback_reason"):
+            key = str(attrs["fallback_reason"])
+            fallback_reasons[key] = fallback_reasons.get(key, 0) + 1
+        if attrs.get("fallback_from") or attrs.get("fallback_to"):
+            key = f"{attrs.get('fallback_from') or '?'}->{attrs.get('fallback_to') or '?'}"
+            chains[key] = chains.get(key, 0) + 1
+        if attrs.get("intraday_5m_stale") is not None:
+            stale_evidence = True
+            if attrs.get("intraday_5m_stale") is True:
+                n_stale += 1
+        lag = attrs.get("intraday_5m_lag_calendar_days")
+        if isinstance(lag, int) and not isinstance(lag, bool):
+            lags.append(int(lag))
+
+    def _joined(counts: Dict[str, int]) -> str:
+        if not counts:
+            return "n/a"
+        return ", ".join(f"{k}x{v}" for k, v in sorted(counts.items()))
+
+    if n_ok == 0:
+        fallback_text = (
+            f"回退链 {provider_label or '<no provider>'} -> DuckDB 缓存（其它 provider） -> parquet"
+            if provider_label
+            else "回退链 DuckDB 缓存（其它 provider） -> parquet"
+        )
+        return [
+            f"[WARN] 5m 日内特征不可用：{total} 个标的的 5m 数据帧全部为空 "
+            f"(provider={provider_label or 'n/a'}, 截断时点={cutoff_time})。"
+            f"归因：该 provider 无这批标的的 5m 行（{fallback_text} 亦无该标的的行）。"
+            "（旧文案把零行归因为『该数据源不支持 5m，仅支持日线 interval=1d』，此判断已被证伪："
+            "支持 5m 的 provider 同样会零行；逐标的的回退/缓存告警见上方 5m 加载日志。）"
+            "后续 intraday_vwap / vwap_premium_pct / chan_5m_state 等日内字段将为空值，"
+            "Stage-2 仅按日线信号生成工单；请勿把本行理解为日内特征已生效。"
+        ]
+
+    try:
+        last_5m_ts = max(
+            pd.Timestamp(df.index.max()) for df in ok
+        )
+    except (TypeError, ValueError):
+        last_5m_ts = None
+
+    stale_flag: Optional[bool] = (n_stale > 0) if stale_evidence else None
+    lag_value: Optional[int] = max(lags) if lags else None
+    expected_session = None
+    if expected_last_session is not None:
+        try:
+            expected_session = pd.Timestamp(expected_last_session).date().isoformat()
+        except (TypeError, ValueError):
+            expected_session = None
+        # Frames loaded WITHOUT `expected_last_session` carry no stale/lag attrs; measure
+        # the aggregate then, through the shared owner, instead of guessing "fresh".
+        if not stale_evidence and not lags:
+            try:
+                from common.intraday_features import assess_intraday_5m_freshness
+
+                freshness = assess_intraday_5m_freshness(
+                    {s: d for s, d in frames.items() if d is not None},
+                    expected_last_session=expected_last_session,
+                    market=market,
+                )
+                stale_flag = bool(freshness.get("stale"))
+                lag_value = freshness.get("lag_calendar_days")
+            except Exception:  # diagnostics must never break the run
+                pass
+
+    lines = [
+        f"[INFO] 5m 日内特征已聚合: 有效标的数 {n_ok}/{total} "
+        f"(截断时点: {cutoff_time}, 最新 5m K 线: {last_5m_ts}, "
+        f"provider={_joined(providers)}, source={_joined(sources)}, "
+        f"fallback_reason={_joined(fallback_reasons)}, "
+        f"stale={stale_flag}, lag_calendar_days={lag_value})"
+    ]
+    if chains:
+        lines.append(
+            f"[WARN] 5m 数据来源回退：{_joined(chains)}（reason={_joined(fallback_reasons)}）-- "
+            "这些标的的日内特征由回退 provider 提供，不等于所配置 provider 已交付 5m 数据。"
+        )
+    if stale_flag:
+        lines.append(
+            f"[WARN] 5m 缓存陈旧：最新 5m K 线未达期望会话 {expected_session or expected_last_session} "
+            f"(stale=True, lag_calendar_days={lag_value})。"
+            "日内特征不代表当日，请勿据此判断日内状态；需刷新 5m 缓存后重跑。"
+        )
+    if n_ok < total:
+        missing = sorted(
+            str(s)
+            for s in symbol_list
+            if s not in frames or frames.get(s) is None or bool(getattr(frames.get(s), "empty", True))
+        )
+        lines.append(
+            f"[WARN] 以下 {len(missing)} 个标的缺少 5m 数据，日内字段为空: "
+            f"{', '.join(missing[:20])}{' ...' if len(missing) > 20 else ''}"
+        )
+    return lines
+
+
 def main(cli_args: Optional[List[str]] = None):
     args = parse_args(cli_args)
     # (`R6`, rule r6.3) The overnight-de-risk budget, already validated inside `parse_args`
@@ -2255,6 +2870,12 @@ def main(cli_args: Optional[List[str]] = None):
     timing = resolve_execution_timing(clock_ctx, as_of=clock_ctx.as_of_date, run_mode=run_mode)
     print(f"[EXECUTION TIMING] {timing['header_text']}")
     print(f"[EXECUTION TIMING] {timing['overnight_gap_hint']}")
+    # (D3) Compare the DECLARED fill instant (`execution_date` open) with the real generation
+    # instant. A run that is already past that open (or past the close) cannot produce a
+    # truthful `as_of+1` / `next_open` ticket, so it fails closed HERE -- before any data
+    # load, any order math and any ticket write. Replay runs are exempt inside
+    # `annotate_executability` (there is no live fill to be late for).
+    timing = enforce_execution_executability(timing, clock_ctx, args.output_dir)
     if getattr(args, "start_date", None):
         start_date = args.start_date
     else:
@@ -2306,6 +2927,31 @@ def main(cli_args: Optional[List[str]] = None):
                 account_state = json.load(f)
         except Exception as e:
             print(f"[WARN] Failed to read account state from {args.account_state_file}: {e}")
+
+    # ---- (D2) `prior_state` must be the PREVIOUS session's CONFIRMED snapshot ----------
+    # The 2026-11-09 archive carried `prior_state.as_of_date = 2026-11-05` while a SUCCESSFUL
+    # 2026-11-06 snapshot (`2026-11-06/185016/`) existed, so the lifecycle/streak/entry-price
+    # baseline resumed from a two-session-old book (a FAILED 11-06 deploy and an orphan 11-08
+    # copy of the 11-05 ledger were the only other candidates). Resolve the snapshot HERE from
+    # the archive itself instead of trusting whatever block the carried state happens to hold:
+    # newest date, newest SUCCESSFUL instance within it, snapshot's own `as_of_date` equal to
+    # its run date, and `base_version` equal to today's live engine. The decision (and every
+    # skipped candidate with its reason) lands in `account_state["prior_state_source"]`, and
+    # the line is printed for `summary.json`'s `deploy_stdout` / `prior_state_log`.
+    prior_state_log: Optional[str] = None
+    try:
+        _prior_selection = select_prior_state(
+            derive_session_root(args.output_dir),
+            as_of_date,
+            expected_base_version=(
+                getattr(template, "base_version", None) or strategy_def.get("base_version")
+            ),
+        )
+        prior_state_log = apply_prior_state_selection(account_state, _prior_selection)
+        if prior_state_log:
+            print(prior_state_log)
+    except Exception as exc:  # a resolver failure must not eat the carried state
+        print(f"[WARN] prior_state 解析失败（保留既有 prior_state）: {exc}")
 
     # Track streak counters, historical entry prices, and UPLSM lifecycle states from account_state
     entry_signal_streak: Dict[str, int] = dict(account_state.get("entry_signal_streak", {}))
@@ -2671,6 +3317,10 @@ def main(cli_args: Optional[List[str]] = None):
             "stage": "stage2",
             "run_mode": run_mode,
             **merge_timing_into_summary(timing),
+            # (D2) Grep-able `[PRIOR STATE] ...` conclusion (same line the console printed),
+            # so "which snapshot did this ticket resume from?" is answerable from the archive
+            # alone. Absent when the resolver had nothing to say (no archive context).
+            **({"prior_state_log": prior_state_log} if prior_state_log else {}),
             # (LV11) Only present when the operator explicitly acknowledged an unevaluated
             # breaker; recorded here so the permission is auditable next to the ticket rather
             # than living only in the server's console scrollback.
@@ -2702,15 +3352,19 @@ def main(cli_args: Optional[List[str]] = None):
             )
             provider = get_data_provider(args.data_provider, **build_data_kwargs(args))
             cutoff_t = getattr(args, "cutoff_time", "14:15") or "14:15"
+            _5m_market = getattr(clock_ctx, "market", None) or "china"
             universe_5m = load_intraday_5m_universe(
                 symbols_to_load,
                 start=start_date,
                 end=as_of_date,
                 data_provider=provider,
                 cutoff_time=cutoff_t,
-            )
-            universe = enrich_universe_with_intraday_features(
-                universe, universe_5m, config=IntradayFeatureConfig(cutoff_time=cutoff_t), synthesize_intraday_bar=True
+                # (2026-11-11, `六` item 6) Stamp `intraday_5m_stale` /
+                # `intraday_5m_lag_calendar_days` on each frame so a FROZEN cache is
+                # distinguishable from "no 5m support" at the loader, not inferred from
+                # timestamps by every downstream reader.
+                expected_last_session=expected_last_session,
+                market=_5m_market,
             )
             # (2026-10-22 incident, Fix 1) This line used to print
             # "成功加载并聚合 5m 日内特征 ... 标的数: {len(universe)}" -- a SUCCESS
@@ -2720,41 +3374,28 @@ def main(cli_args: Optional[List[str]] = None):
             # empty, enrich_universe_with_intraday_features early-returned an
             # un-enriched frame, and downstream VWAP/Chan-5m fields were all
             # None -- while this line still claimed 20 symbols of intraday
-            # microstructure had been aggregated. Report what actually arrived:
-            # count symbols with a NON-EMPTY 5m frame and the real last 5m
-            # timestamp, and say WARN + the reason when there are none.
-            n_5m_ok = sum(
-                1
-                for _s, _df in universe_5m.items()
-                if _df is not None and not _df.empty
+            # microstructure had been aggregated.
+            # (2026-11-11, `六` item 6) The zero-row WARN then blamed "provider does not
+            # support 5m", which is DISPROVEN: the live provider delivered 5m fine, its
+            # per-symbol coverage was missing / its cache stopped one session early. The
+            # reporting now says WHICH cause it can prove (`provider=`, `source=`,
+            # `fallback_from->to`, `stale`, `lag_calendar_days`) instead of guessing.
+            #
+            # Reported BEFORE the enrichment on purpose: the enrichment can raise (a
+            # malformed/degenerate 5m frame does), and a report that only runs on the
+            # success path would once again hide the state of the data it describes.
+            for _line in summarize_intraday_5m_loading(
+                universe_5m,
+                symbols_to_load,
+                provider_label=str(getattr(args, "data_provider", "") or ""),
+                cutoff_time=str(cutoff_t),
+                expected_last_session=expected_last_session,
+                market=_5m_market,
+            ):
+                print(_line)
+            universe = enrich_universe_with_intraday_features(
+                universe, universe_5m, config=IntradayFeatureConfig(cutoff_time=cutoff_t), synthesize_intraday_bar=True
             )
-            if n_5m_ok == 0:
-                print(
-                    f"[WARN] 5m 日内特征不可用：{len(symbols_to_load)} 个标的的 5m 数据帧全部为空 "
-                    f"(provider={args.data_provider}, 截断时点={cutoff_t})。"
-                    "常见原因：provider does not support 5m (该数据源仅支持日线 interval='1d')。"
-                    "后续 intraday_vwap / vwap_premium_pct / chan_5m_state 等日内字段将为空值，"
-                    "Stage-2 仅按日线信号生成工单；请勿把本行理解为日内特征已生效。"
-                )
-            else:
-                _last_5m_ts = max(
-                    _df.index.max().to_pydatetime()
-                    for _df in universe_5m.values()
-                    if _df is not None and not _df.empty
-                )
-                print(
-                    f"[INFO] 5m 日内特征已聚合: 有效标的数 {n_5m_ok}/{len(symbols_to_load)} "
-                    f"(截断时点: {cutoff_t}, 最新 5m K 线: {_last_5m_ts})"
-                )
-                if n_5m_ok < len(symbols_to_load):
-                    _missing_5m = sorted(
-                        _s for _s in symbols_to_load
-                        if _s not in universe_5m or universe_5m[_s] is None or universe_5m[_s].empty
-                    )
-                    print(
-                        f"[WARN] 以下 {len(_missing_5m)} 个标的缺少 5m 数据，日内字段为空: "
-                        f"{', '.join(_missing_5m[:20])}{' ...' if len(_missing_5m) > 20 else ''}"
-                    )
         except Exception as exc:
             print(f"[WARN] Failed to load 5m intraday features in Stage 2 runner: {exc}")
 
@@ -3030,7 +3671,11 @@ def main(cli_args: Optional[List[str]] = None):
             f"tier_status={_tier_status!r} nav_gate_status={_nav_gate_status!r} "
             f"circuit_breaker_tier={circuit_tier!r} "
             f"nav_source={account_state.get('nav_source') or health_report.get('nav_source')!r} "
-            f"nav_mtm={account_state.get('nav_mtm') or health_report.get('nav_mtm')!r}"
+            f"nav_mtm={account_state.get('nav_mtm') or health_report.get('nav_mtm')!r} "
+            # (LV1-TIMEBASE) `timebase_mismatch_refused` says WHICH kind of degradation this
+            # is: the snapshot existed, but its equity and cash legs spanned two instants.
+            f"nav_timebase_status="
+            f"{(account_state.get('nav_timebase_status') or health_report.get('nav_timebase_status'))!r}"
         )
         if not degraded_gate_acknowledged():
             raise LiveGateDegradedError(
@@ -4109,6 +4754,19 @@ def main(cli_args: Optional[List[str]] = None):
             "price": price,
             "current_weight": cur_w,
             "target_weight": tgt_w,
+            # (D4, 2026-11-09 evidence) Two additive columns, deliberately placed HERE and
+            # NOT appended at the end: `blocking_reason` must stay the TRAILING column of
+            # the CSV (pinned by the L2.24 regression test), so the new audit fields are
+            # inserted next to the weight they describe.
+            #   * `target_weight_model` -- the model's ORIGINAL target for this row, frozen
+            #     before weight normalization / lot rounding / the delivered cap touch
+            #     anything, so the audit trail survives every downstream rewrite;
+            #   * `target_weight_effective` -- what the ticket actually DELIVERS
+            #     (`target_shares * price / NAV`), stamped by
+            #     `reconcile_delivered_weight_budget` below.
+            # `target_weight` itself keeps its pre-D4 meaning.
+            "target_weight_model": float(tgt_w),
+            "target_weight_effective": None,
             "delta_weight": delta_w,
             "current_shares": current_shares,
             "target_shares": target_shares,
@@ -4146,6 +4804,32 @@ def main(cli_args: Optional[List[str]] = None):
             "blocking_reason": coerce_blocking_reason(blocking_reason).value,
         })
 
+    # (D4, evidence 2026-11-09/204956) FIRST: the buy side of the model's book must fit
+    # inside one NAV before anything downstream is sized from it.  The archive's ticket
+    # summed to `Σ target_weight = 1.028337` -- a book claiming 102.8% of the account.
+    # Proportional normalization happens HERE (before the purchasing-power rescale and the
+    # delivered-cap pass), so every later stage works on a book that already fits and the
+    # ticket records `weights_normalized` + the factor it used instead of shipping 102.8%.
+    # SELL/HOLD/CANCEL_PENDING targets are deliberately NOT rescaled -- see the function's
+    # docstring: that would rewrite an order (or a freeze's carried weight) the model never
+    # asked to change.
+    weight_budget = normalize_model_target_weights(
+        rows,
+        portfolio_value=args.portfolio_value,
+        cash_proxy=cash_proxy,
+        lot_size_fn=lambda s: resolve_lot_size(s, args.lot_size),
+    )
+    if weight_budget["weights_normalized"]:
+        print(
+            f"[WARN/WEIGHT BUDGET] 模型目标权重合计 (买入侧+现金) {weight_budget['target_weight_sum_model']:.6f} > 1，"
+            f"已按系数 {weight_budget['weight_normalization_factor']:.6f} 等比归一"
+            + (
+                "（部分买入行归一后已跌破当前持仓，按 0 股登记而不是反向卖出）"
+                if weight_budget["weight_normalization_partial"]
+                else ""
+            )
+        )
+
     # Purchasing power constraint: total buys cannot exceed available cash + sales proceeds
     initial_cash_val = current_series.get(cash_proxy, 0.0) * args.portfolio_value
     # Double freeze R14: exclude unexecutable LIMIT_DOWN_ILLIQUID_RISK sell orders from purchasing power
@@ -4179,6 +4863,28 @@ def main(cli_args: Optional[List[str]] = None):
                     if "inertia_check" in r["detail_reason"]:
                         r["detail_reason"]["inertia_check"]["delta_weight"] = round(r["delta_weight"], 4)
 
+    # (D4) SECOND: stamp the DELIVERED weight of every row and make the book fit one NAV.
+    # Whole-lot rounding rounds UP as often as down (299.04 raw shares -> 200 delivered,
+    # i.e. 20.00% stated vs 17.17% delivered), and it can also push the total over 100%.
+    # Shaving is only ever applied to rows that would BUY MORE (never to a HOLD whose drift
+    # is already held, and never by inventing a SELL) and always starts with the SMALLEST
+    # delivered position, which is where lot-rounding amplification comes from.
+    _lot_fn = lambda s: resolve_lot_size(s, args.lot_size)
+    weight_budget = merge_weight_budget_summaries(
+        weight_budget,
+        reconcile_delivered_weight_budget(
+            rows,
+            portfolio_value=args.portfolio_value,
+            cash_proxy=cash_proxy,
+            lot_size_fn=_lot_fn,
+        ),
+    )
+    if weight_budget["rounding_rebalanced"]:
+        print(
+            f"[WARN/WEIGHT BUDGET] 整手取整后合计权重超 100%，已从最小权重标的削减整手数: "
+            f"{', '.join(str(s) for s in weight_budget['shaved_rows'])}"
+        )
+
     # (D7, 2026-10-29 incident) DELIVERED market-value cap, evaluated AFTER lot rounding
     # (including the purchasing-power rescale above, which re-rounds every BUY).  The
     # model's 20% clamp in `blend_base.py` works on the RAW weight, so the quantity that
@@ -4208,6 +4914,33 @@ def main(cli_args: Optional[List[str]] = None):
                 f"[WARN/市值上限] {r['symbol']}: 交付市值权重 "
                 f"{_mv_block.get('market_value_weight'):.2%} > 上限 {mv_cap:.2%}{_tail}"
             )
+            # (D4) The same verdict in a grep-able, ASCII-tagged line: a breach that only
+            # lives inside `detail_reason` was how 2026-11-09's 601919.SH (21.19% vs 20%)
+            # stayed invisible to everyone reading the ticket header.
+            print(
+                f"[WARN/MV CAP] {r['symbol']}: delivered market-value weight "
+                f"{_mv_block.get('market_value_weight'):.2%} > cap {mv_cap:.2%} "
+                f"(enforced={bool(_mv_block.get('enforced'))}){_tail}"
+            )
+
+    # (D4) The cap may have clamped a BUY down (or the purchasing-power rescale re-rounded
+    # it), so refresh the delivered stamp on the final quantities.  Idempotent: a book that
+    # already fits is only re-stamped, never shaved twice.
+    weight_budget = merge_weight_budget_summaries(
+        weight_budget,
+        reconcile_delivered_weight_budget(
+            rows,
+            portfolio_value=args.portfolio_value,
+            cash_proxy=cash_proxy,
+            lot_size_fn=_lot_fn,
+        ),
+    )
+    mv_cap_breaches = collect_mv_cap_breaches(rows)
+    if not weight_budget["budget_ok"]:
+        print(
+            f"[WARN/WEIGHT BUDGET] 票据目标权重合计 {weight_budget['target_weight_sum']:.6f} 仍超出 1.0，"
+            f"无买入整手可削减（持仓漂移或无现金代理行），请人工核对。"
+        )
 
     order_df = pd.DataFrame(rows)
 
@@ -4255,6 +4988,12 @@ def main(cli_args: Optional[List[str]] = None):
     cash_rows = order_df[order_df["action"].str.contains("CASH")]
 
     print("\n[PHASE 1: EXECUTE SELLS FIRST (第一阶段: 卖出平仓/减仓释放资金)]")
+    # (D6, evidence 2026-11-09/204956) Every rendered ORDER line is tee'd into this buffer
+    # and the BUY/SELL count is asserted against the ticket AFTER it is written:
+    # `verify_ticket_stdout_order_parity`.  That check exists because PHASE 2 used to print
+    # one `🟢 BUY` line per row TWICE (a second `print()` existed only to attach the
+    # sub-lot warning), and an operator copying the stdout would have doubled the order.
+    ticket_stdout_lines: List[str] = []
     if sells.empty:
         print("  今日无需执行任何卖出指令 (No sell orders required today).")
     else:
@@ -4262,7 +5001,13 @@ def main(cli_args: Optional[List[str]] = None):
             sym_col = pad_east_asian(f"{r['symbol']} ({r['name']})", 24)
             warn_tag = " ⚠️ [LIMIT_DOWN_ILLIQUID_RISK / 资金已冻结]" if r.get("execution_warning") == "LIMIT_DOWN_ILLIQUID_RISK" else ""
             limit_p = r.get("suggested_limit_price", r["price"])
-            print(f"  🔴 SELL {sym_col} | 现价: {r['price']:>7.2f} (建议限价: {limit_p:.2f}) | 仓位: {r['current_weight']:>5.1%} -> 目标: {r['target_weight']:>5.1%} ({r['delta_weight']:>+5.1%}) | 卖出: {abs(r['delta_shares']):>6} 股 (~¥{abs(r['trade_value']):>9,.2f}){warn_tag}")
+            print_ticket_order_line(
+                f"  🔴 SELL {sym_col} | 现价: {r['price']:>7.2f} (建议限价: {limit_p:.2f}) | "
+                f"仓位: {r['current_weight']:>5.1%} -> 目标: {r['target_weight']:>5.1%} "
+                f"({r['delta_weight']:>+5.1%}) | 卖出: {abs(r['delta_shares']):>6} 股 "
+                f"(~¥{abs(r['trade_value']):>9,.2f}){_delivered_weight_note(r)}{warn_tag}",
+                ticket_stdout_lines,
+            )
 
     print("\n[PHASE 2: EXECUTE BUYS SECOND (第二阶段: 买入建仓/加仓资金配置)]")
     if buys.empty:
@@ -4273,7 +5018,9 @@ def main(cli_args: Optional[List[str]] = None):
             price_info = f"建议限价: {r.get('suggested_limit_price', r['price']):.2f}"
             if r.get("passive_support_limit_price") and r.get("passive_support_limit_price") != r.get("suggested_limit_price"):
                 price_info += f" (被动支撑: {r['passive_support_limit_price']:.2f})"
-            print(f"  🟢 BUY  {sym_col} | 现价: {r['price']:>7.2f} | 仓位: {r['current_weight']:>5.1%} -> 目标: {r['target_weight']:>5.1%} ({r['delta_weight']:>+5.1%}) | 买入: {r['shares']:>6} 股 (~¥{r['trade_value']:>9,.2f}) | {price_info}")
+            # (D6) EXACTLY ONE line per BUY row.  The sub-lot warning and the delivered
+            # weight annotation are folded into THIS line -- they used to live in a second
+            # `print()` of the same order, which is how the duplicated `🟢 BUY` appeared.
             qty_str = f"{r['delta_shares']:>6}"
             suffix = ""
             if r['delta_shares'] == 0:
@@ -4281,8 +5028,14 @@ def main(cli_args: Optional[List[str]] = None):
                 raw_shares = (r['delta_weight'] * args.portfolio_value) / r['price'] if r['price'] > 0 else 0
                 qty_str = f"{'0':>6}"
                 suffix = f" ⚠️  低于单手门槛 (不足{sym_lot}股) — 目标需{raw_shares:.0f}股, 1手需¥{sym_lot * r['price']:,.0f}"
-            sym_col = pad_east_asian(f"{r['symbol']} ({r['name']})", 24)
-            print(f"  🟢 BUY  {sym_col} | 现价: {r['price']:>7.2f} | 仓位: {r['current_weight']:>5.1%} -> 目标: {r['target_weight']:>5.1%} ({r['delta_weight']:>+5.1%}) | 买入: {qty_str} 股 (~¥{r['trade_value']:>9,.2f}){suffix}")
+            eff_note = _delivered_weight_note(r)
+            print_ticket_order_line(
+                f"  🟢 BUY  {sym_col} | 现价: {r['price']:>7.2f} | 仓位: {r['current_weight']:>5.1%} "
+                f"-> 目标: {r['target_weight']:>5.1%} ({r['delta_weight']:>+5.1%}) | "
+                f"买入: {qty_str} 股 (~¥{r['trade_value']:>9,.2f}) | {price_info}"
+                f"{eff_note}{suffix}",
+                ticket_stdout_lines,
+            )
 
     # Phase 3: only show positions the user actually holds (cur_w > 0) or that have a real target weight
     # (L2.23) EXCEPT the market-closed freeze rows, which are pulled out into
@@ -4545,6 +5298,41 @@ def main(cli_args: Optional[List[str]] = None):
                 dual_holding_bars.pop(sym, None)
                 dual_entry_prices.pop(sym, None)
 
+    # (D4, evidence `2026-11-09/204956`) Persist the DELIVERED weight, not the model's wish.
+    # The archive's `account_state.lifecycle_states["600660.SH"]` carried
+    # `current_weight = 0.2` (the model target) while the ticket could only deliver
+    # `0.171663` (200 shares x 56.62 / NAV); nothing recorded the 17.17% that the book would
+    # actually hold, so the next round's inertia / min-entry / single-name-cap gates all
+    # compared against a weight that could never exist. `target_weight_model` keeps the
+    # original number for audit, `current_weight` becomes what is deliverable.
+    # Runs AFTER the cooldown/exit reconciliation above on purpose: a real liquidation has
+    # already zeroed `current_weight` there, and its delivered weight IS 0.0, so this loop
+    # cannot resurrect a phantom position.
+    if "target_weight_effective" in order_df.columns:
+        for _rec in order_df.to_dict(orient="records"):
+            _sym = _rec.get("symbol")
+            if _sym == cash_proxy:
+                continue
+            _st = updated_lifecycle_states.get(_sym)
+            if not isinstance(_st, dict):
+                continue
+            _eff = _rec.get("target_weight_effective")
+            if _eff is None:
+                continue
+            try:
+                _eff_f = float(_eff)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(_eff_f):
+                continue
+            _st["current_weight"] = round(_eff_f, TARGET_WEIGHT_EFFECTIVE_DECIMALS)
+            _model = _rec.get("target_weight_model")
+            if _model is not None:
+                try:
+                    _st["target_weight_model"] = round(float(_model), TARGET_WEIGHT_EFFECTIVE_DECIMALS)
+                except (TypeError, ValueError):
+                    pass
+
     updated_exit_bars_ago = resolve_exit_cooldown(
         list(updated_last_exit_date.keys()),
         {"last_exit_date": updated_last_exit_date},
@@ -4564,6 +5352,43 @@ def main(cli_args: Optional[List[str]] = None):
     # `common.live_execution_timing.ticket_order_rows` -- every archived ticket is still a
     # bare list, and a reader that assumes one shape silently sees "no ticket" for the other.
     ticket_payload = build_ticket_payload(order_df.to_dict(orient="records"), timing)
+    # (D4, evidence `2026-11-09/204956`) BOOK-LEVEL verdicts at the ticket's TOP level, so a
+    # reader never has to re-derive them from the rows and never has to open the per-row
+    # `detail_reason` block:
+    #   * `weights_normalized` (+ factor) -- the model's raw targets summed above 100% and
+    #     were scaled proportionally instead of the ticket claiming 102.8% of NAV;
+    #   * `target_weight_sum` / `target_weight_sum_model` -- delivered (post lot-rounding,
+    #     cash-proxy residual included) vs the model's own sum. The delivered one never
+    #     exceeds `1 + 1e-9`;
+    #   * `rounding_rebalanced` -- whole lots had to be shaved off the smallest positions to
+    #     keep the delivered book inside one NAV;
+    #   * `mv_cap_breaches` -- EVERY delivered single-name cap breach, so a 21.19%-against-
+    #     20% breach can no longer hide inside `detail_reason.mv_cap`.
+    ticket_payload["weights_normalized"] = bool(weight_budget.get("weights_normalized"))
+    ticket_payload["weight_normalization_factor"] = float(
+        weight_budget.get("weight_normalization_factor") or 1.0
+    )
+    ticket_payload["target_weight_sum"] = weight_budget.get("target_weight_sum")
+    ticket_payload["target_weight_sum_model"] = weight_budget.get("target_weight_sum_model")
+    #: `False` only when the book could NOT be brought inside 100% without inventing an
+    #: order (e.g. held drift already above NAV): the WARN line was printed, and both the
+    #: ticket and the archive say so instead of quietly claiming a fitting book.
+    ticket_payload["weight_budget_ok"] = bool(weight_budget.get("budget_ok", True))
+    ticket_payload["rounding_rebalanced"] = bool(weight_budget.get("rounding_rebalanced"))
+    ticket_payload["mv_cap_breaches"] = mv_cap_breaches
+    # (D6, evidence `2026-11-09/204956`) MACHINE CHECK, archived with the ticket: one printed
+    # order line per order. PHASE 2 used to render the same BUY twice (one `orders` entry),
+    # i.e. an operator copying the stdout would have doubled the position.
+    ticket_payload["ticket_stdout_parity"] = {
+        action: verify_ticket_stdout_order_parity(
+            ticket_order_rows(ticket_payload), "\n".join(ticket_stdout_lines),
+            action=action, marker=marker,
+        )
+        for action, marker in (
+            ("BUY", TICKET_BUY_STDOUT_MARKER),
+            ("SELL", TICKET_SELL_STDOUT_MARKER),
+        )
+    }
     try:
         with open(out_json, "w", encoding="utf-8") as f:
             json.dump(ticket_payload, f, indent=2, ensure_ascii=False)
@@ -4576,13 +5401,46 @@ def main(cli_args: Optional[List[str]] = None):
     print(f"[SUCCESS] 交易指令单已导出至: {out_csv} 及 {out_json}")
 
     # Save post_holdings.json if output_dir is given
+    # (D5, evidence `2026-11-11/205137`) `post_holdings.json` alone cannot tell "the book is
+    # EMPTY" apart from "the file was never produced": the archive above holds `{}` because
+    # the day fully liquidated, which is the CORRECT result, yet every reader saw the same
+    # thing as a missing file. The shape of `post_holdings.json` is therefore unchanged
+    # (`{symbol: shares}`, `{}` = flat) and a sidecar `post_holdings.meta.json` now states
+    # completeness explicitly. Its schema:
+    #   {"as_of": "YYYY-MM-DD", "complete": bool, "n_symbols": int,
+    #    "generated_at": ISO-8601 local, "source": "ticket"|"replay"}
+    # `complete: true` + `{}` = a confirmed all-cash book (a legal seed); a missing file or a
+    # missing/false `complete` = UNUSABLE (readers must return None, never "flat").
     post_holdings_path = os.path.join(args.output_dir, "post_holdings.json")
+    post_holdings_written = False
     try:
         with open(post_holdings_path, "w", encoding="utf-8") as f:
             json.dump(post_holdings, f, indent=2, ensure_ascii=False)
+        post_holdings_written = True
         print(f"[SUCCESS] 预测持仓已导出至: {post_holdings_path}")
     except Exception as e:
         print(f"[WARN] Failed to write post_holdings.json: {e}")
+    post_holdings_meta_path = os.path.join(args.output_dir, POST_HOLDINGS_META_FILENAME)
+    try:
+        post_holdings_meta = {
+            "as_of": str(as_of_date),
+            "complete": bool(post_holdings_written),
+            "n_symbols": len([
+                s for s, q in (post_holdings or {}).items() if int(q or 0) > 0
+            ]),
+            "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            # A pinned past session is a REPLAY (`resolve_run_mode`); its book is a
+            # reconstruction, not a fill plan, and the sidecar says so.
+            "source": "replay" if str(run_mode) == "replay" else "ticket",
+        }
+        with open(post_holdings_meta_path, "w", encoding="utf-8") as f:
+            json.dump(post_holdings_meta, f, indent=2, ensure_ascii=False)
+        print(
+            f"[SUCCESS] 预测持仓元数据已导出至: {post_holdings_meta_path} "
+            f"(complete={post_holdings_meta['complete']}, n_symbols={post_holdings_meta['n_symbols']})"
+        )
+    except Exception as e:
+        print(f"[WARN] Failed to write {POST_HOLDINGS_META_FILENAME}: {e}")
 
     # Persist updated state into account_state.json if available
     if args.account_state_file:
