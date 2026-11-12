@@ -7,7 +7,7 @@ custom universe management, interactive holdings, daily archival, and responsive
 import os
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -40,6 +40,21 @@ except (ImportError, ValueError):
         SettingsModel,
     )
     from storage import StorageManager
+
+
+#: (D8, 2026-11-11) Version-metadata fields an `account_state.json` carries. They are
+#: written by the engine (Stage 1 / Stage 2 child) and cross-checked READ-ONLY against the
+#: live class; `docs/lv7_prior_state_contract.md` §5.4 forbids "re-stamping" them as a
+#: repair. `POST /api/account-state` therefore refuses a body containing any of them.
+#:
+#: `AccountStateModel` declares none of them, so pydantic silently DROPS them today --
+#: which is precisely why the check reads the raw body instead of the validated model: the
+#: guard must not depend on the model staying narrow.
+ACCOUNT_STATE_VERSION_STAMP_FIELDS = (
+    "base_version",
+    "strategy_version",
+    "strategy_version_info",
+)
 
 
 def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
@@ -189,7 +204,41 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
         return storage.get_account_state(date_str, strategy_key=strategy_key, universe_key=universe_key)
 
     @app.post("/api/account-state", summary="Update account state")
-    async def update_account_state(payload: AccountStateModel) -> Dict[str, Any]:
+    async def update_account_state(payload: AccountStateModel, request: Request) -> Dict[str, Any]:
+        # (D8, 2026-11-11) NO RE-STAMPING THROUGH THE GENERIC SAVE PATH.
+        #
+        # `docs/lv7_prior_state_contract.md` §5.4: version metadata is cross-checked
+        # READ-ONLY and a mismatch is fail-closed; the only ways out are an operator-supplied
+        # updated state file, a documented manual update, or rolling back the dump/engine.
+        # "Save the state and quietly refresh `base_version`" is exactly the forbidden
+        # repair, and this endpoint is the one place a caller could attempt it with a plain
+        # HTTP POST (the real archive shows such later writes: `2026-10-15/account_state.json`
+        # was rewritten 2.9 days after its round ended).
+        #
+        # The RAW body is inspected on purpose: `AccountStateModel` does not declare these
+        # keys, so pydantic DROPS them today -- the request "succeeds" while the version
+        # fields vanish. That silent partial write is bad enough; the real hazard is a future
+        # `extra="allow"` / declared field turning this into a working re-stamp. Refusing the
+        # attempt explicitly keeps the guard true regardless of the model's shape.
+        raw_body: Any = None
+        try:
+            raw_body = await request.json()
+        except Exception:  # not JSON / already-consumed body: nothing to inspect
+            raw_body = None
+        if isinstance(raw_body, dict):
+            offending = [key for key in ACCOUNT_STATE_VERSION_STAMP_FIELDS if key in raw_body]
+            if offending:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "禁止重新盖章（docs/lv7_prior_state_contract.md §5.4）："
+                        f"/api/account-state 不接受版本元数据字段 {offending}。"
+                        "版本校验是只读比对、失败关闭，任何不一致必须由操作者按 §5.4 显式"
+                        "处理（提供已更新的状态文件 / 人工更新并在运行记录中写明依据 / "
+                        "回滚到匹配的 dump 与引擎版本），不得通过通用状态保存接口改写。"
+                        "请移除这些字段后重试。"
+                    ),
+                )
         data = payload.model_dump(exclude_unset=True)
         storage.save_account_state(
             data,
@@ -220,6 +269,13 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
                 universe_name=payload.universe_name,
                 allow_intraday=payload.allow_intraday,
                 refresh_data=payload.refresh_data,
+                # (LV1-TIMEBASE) MUST be forwarded: this is an explicit keyword list, so a
+                # model field not re-listed here is accepted by pydantic and silently
+                # dropped -- which is how the web form's 现金余额 never reached the
+                # pre-staged snapshot and the gate marked `today's equity + last round's
+                # cash`. Dropping it again would restore exactly that defect (tier UNKNOWN
+                # on every first run of a session instead of a same-instant NAV).
+                cash=payload.cash,
             )
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))

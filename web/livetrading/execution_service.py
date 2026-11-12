@@ -611,7 +611,19 @@ ALLOW_DEGRADED_GATE_ENV = "LIVETRADING_ALLOW_DEGRADED_GATE"
 
 #: Row-level mark, one entry per symbol.  NEVER folded into `summary.json` (which stays a
 #: top-level digest): a 20-symbol book would otherwise bloat every summary by 20 blocks.
+#:
+#: (D8, 2026-11-11) ONE FILE PER STAGE. `nav_breakdown.json` is the GATE snapshot: the
+#: web layer pre-stages it before Stage 1 launches (`run_health_check`, LV11) and Stage 1
+#: reads exactly that file (`--nav-breakdown-file`), so the archived file IS what the
+#: breaker was shown. Stage 2's own deploy-time mark goes to
+#: `nav_breakdown.stage2.json` instead of overwriting it: the old single-path write meant
+#: the gate could decide on `nav_effective = 197,899.90` (equity 172,303.00 + archive cash
+#: 25,596.90) while the archive kept Stage 2's `197,899.60` (form cash 25,596.60), a 0.30
+#: difference that made the stored gate input unreconstructable (2026-11-09/204716).
 NAV_BREAKDOWN_FILENAME = "nav_breakdown.json"
+#: (D8) Stage 2's OWN deploy-time mark -- the number its `--portfolio-value` was built
+#: from. Written alongside, NEVER over `NAV_BREAKDOWN_FILENAME`.
+NAV_BREAKDOWN_STAGE2_FILENAME = "nav_breakdown.stage2.json"
 
 #: Machine-readable failure classes.  They are written into `nav_warnings` (prefixed as
 #: `reason=<class>: ...`) and into the refusal text, so the two failure families below can
@@ -1727,6 +1739,36 @@ class ExecutionService:
                 f"{valuation_date!r}: run_dir and summary.json['date'] would disagree."
             )
 
+    @staticmethod
+    def _install_prior_state(
+        container: Dict[str, Any], carried: Optional[Dict[str, Any]]
+    ) -> None:
+        """Install `_carry_forward_account_state`'s result the way Stage 2 records it.
+
+        `carried` is the (D2) resolver-selected snapshot -- the newest SUCCESSFUL,
+        `as_of`-consistent, same-engine state -- plus its `prior_state_source` audit
+        block. Stage 2's shape puts the SNAPSHOT in `prior_state` and the provenance
+        NEXT TO IT at the top level, so this mirrors that split:
+
+          * `prior_state`         <- the snapshot (its embedded `prior_state_source`
+                                     removed, so the block is not duplicated one level
+                                     deeper on every round);
+          * `prior_state_source`  <- `path` / `as_of` / `run_date` / `instance` /
+                                     `run_status` / `base_version` / `selection_reason`
+                                     / `skipped[*]` (every rejected candidate + reason).
+
+        No version field is touched: the snapshot is copied verbatim, never re-stamped
+        (`docs/lv7_prior_state_contract.md` §5.4). A no-op on `None`.
+        """
+        if not isinstance(carried, dict) or not carried:
+            return
+        source = carried.get("prior_state_source")
+        snapshot = {k: v for k, v in carried.items() if k != "prior_state_source"}
+        if snapshot:
+            container["prior_state"] = snapshot
+        if isinstance(source, dict) and source:
+            container["prior_state_source"] = dict(source)
+
     def _clock_observability(
         self,
         valuation_date: str,
@@ -2197,6 +2239,7 @@ class ExecutionService:
         cash: Optional[float],
         cash_source: Optional[str],
         as_of: str,
+        cash_as_of: Optional[str] = None,
         per_symbol: Optional[Mapping[str, Any]] = None,
         stale_symbols: Optional[List[str]] = None,
         dividend_alarms: Optional[List[dict]] = None,
@@ -2215,6 +2258,12 @@ class ExecutionService:
             "equity": None if equity is None else float(equity),
             "cash": None if cash is None else float(cash),
             "cash_source": cash_source,
+            #: (LV1-TIMEBASE) The SESSION the `cash` leg belongs to, i.e. the timebase that
+            #: `equity` must share. `None` = unknown (e.g. `cash_source="missing"`, an
+            #: operator override with no engine mark). Consumers (Stage 1's gate) compare it
+            #: with `as_of` and refuse a cross-timebase `nav_effective` rather than gating on
+            #: `today's equity + the previous session's settled cash`.
+            "cash_as_of": cash_as_of,
             "as_of": as_of,
             #: ``symbol -> position-open date`` actually handed to the engine, and where
             #: those dates came from: ``"run_archive"`` (derived from archived books) or
@@ -2234,8 +2283,16 @@ class ExecutionService:
         strategy_key: Optional[str],
         universe_key: Optional[str],
         exclude_dir: Optional[str] = None,
-    ) -> Tuple[Optional[float], Optional[str]]:
-        """`(cash, summary_path)` from the most recent archived round at-or-before `date_str`.
+    ) -> Tuple[Optional[float], Optional[str], Optional[str]]:
+        """`(cash, cash_as_of, summary_path)` from the most recent archived round at-or-before `date_str`.
+
+        `cash_as_of` is the ARCHIVED ROUND's own session date (structured, from the run
+        record -- never parsed out of a path or a log string). It is the timebase of the
+        returned cash, and callers MUST compare it with the session they are marking before
+        publishing `equity + cash` as one NAV: the 2026-11-10 / 11-11 incident was exactly
+        `today's equity + the previous session's settled cash` (LV1-TIMEBASE).
+
+        Returns `(None, None, None)` when nothing usable is archived.
 
         WHY THIS EXISTS (LV11). `resolve_seed_holdings` returns SHARE counts only -- cash is
         the implied NAV residual, so it is deliberately NOT a holding
@@ -2251,17 +2308,27 @@ class ExecutionService:
         (`cash_source` in explicit / bil_fallback); a `missing` 0.0 is never recycled  -- that
         would turn "unknown" into a measured zero, the exact inversion this task forbids.
 
-        Returns `(None, None)` when nothing usable is archived, which leaves the engine's own
-        parked-cash fallback (or its refusal) in charge.
+        (D8, 2026-11-11) TWO FIELD FAMILIES, ONE PREFERENCE ORDER.  `summary.json::cash`
+        is now the STAGE-1 GATE residual (the value the breaker was shown), with its own
+        `cash_as_of`; `cash_stage2` is Stage 2's deploy-time residual.  The gate value wins,
+        because it is the one the archive's decision was made on, and its `cash_as_of` is
+        honoured -- a gate cash carried from an earlier session must stay stamped with THAT
+        session, otherwise the LV1-TIMEBASE comparison would bless exactly the cross-timebase
+        mix (`today's equity + yesterday's cash`) it exists to reject.  Stage 2's value is
+        the fallback for a round whose gate could not measure cash at all (`cash_source` not
+        in explicit / bil_fallback): same capability as before, new field name.
+
+        Returns `(None, None, None)` when nothing usable is archived, which leaves the engine's
+        own parked-cash fallback (or its refusal) in charge.
         """
         if not strategy_key or not universe_key:
-            return None, None
+            return None, None, None
         try:
             runs = self.storage.list_runs(
                 strategy_key=strategy_key, universe_key=universe_key, require_both=True
             )
         except Exception:  # pragma: no cover - archive walk is best-effort here
-            return None, None
+            return None, None, None
         excluded = os.path.abspath(exclude_dir) if exclude_dir else None
         for run in runs:
             run_path = run.get("path") or ""
@@ -2276,16 +2343,44 @@ class ExecutionService:
             if not os.path.exists(summary_path):
                 continue
             summary = self.storage._load_json(summary_path, default={}) or {}
-            if str(summary.get("cash_source") or "") not in ("explicit", "bil_fallback"):
+            cash, cash_as_of = self._cash_residual_from_summary(summary, run_date)
+            if cash is None:
                 continue
-            raw_cash = summary.get("cash")
+            return cash, cash_as_of, summary_path
+        return None, None, None
+
+    @staticmethod
+    def _cash_residual_from_summary(
+        summary: Mapping[str, Any], run_date: Optional[str]
+    ) -> Tuple[Optional[float], Optional[str]]:
+        """`(cash, cash_as_of)` from a round's `summary.json`, gate fields first.
+
+        Measured sources only (`explicit` / `bil_fallback`): `missing` means "unknown" and
+        must never be recycled as a number.  The timebase is the one the writer stamped
+        (`cash_as_of`) -- falling back to the archived round's session only for legacy
+        summaries written before the stamp existed, which is exactly the pre-existing
+        behaviour for those files.
+        """
+        candidates = (
+            ("cash", "cash_source", "cash_as_of"),
+            ("cash_stage2", "cash_source_stage2", "cash_as_of_stage2"),
+        )
+        for cash_key, source_key, as_of_key in candidates:
+            if str(summary.get(source_key) or "") not in ("explicit", "bil_fallback"):
+                continue
             try:
-                cash = float(raw_cash)
+                cash = float(summary.get(cash_key))
             except (TypeError, ValueError):
                 continue
             if cash != cash or cash in (float("inf"), float("-inf")):  # NaN / inf
                 continue
-            return cash, summary_path
+            cash_as_of = (
+                summary.get(as_of_key)
+                or run_date
+                or str(summary.get("date") or "")
+                or None
+            )
+            return cash, cash_as_of
         return None, None
 
     def _resolve_nav(
@@ -2300,6 +2395,7 @@ class ExecutionService:
         strategy_key: Optional[str] = None,
         universe_key: Optional[str] = None,
         exclude_dir: Optional[str] = None,
+        cash_as_of: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Mark the book to market and decide what `--portfolio-value` will be.
 
@@ -2344,6 +2440,7 @@ class ExecutionService:
                 provider=provider,
                 anchors=anchors,
                 anchor_source=anchor_source,
+                cash_as_of=cash_as_of,
             )
 
         try:
@@ -2369,6 +2466,7 @@ class ExecutionService:
                 cash=float(cash) if cash is not None else None,
                 cash_source="explicit" if cash is not None else None,
                 as_of=as_of,
+                cash_as_of=cash_as_of,
                 anchors=anchors,
                 anchor_source=anchor_source,
                 nav_warnings=list(exc.nav_warnings)
@@ -2386,6 +2484,7 @@ class ExecutionService:
             cash=res.cash,
             cash_source=res.cash_source,
             as_of=res.as_of,
+            cash_as_of=cash_as_of or res.as_of,
             anchors=anchors,
             anchor_source=anchor_source,
             per_symbol=res.per_symbol,
@@ -2404,6 +2503,7 @@ class ExecutionService:
         provider: str,
         anchors: Optional[Mapping[str, str]] = None,
         anchor_source: Optional[str] = None,
+        cash_as_of: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Explicit human override: deploy with `override_value`, but say what was skipped.
 
@@ -2473,6 +2573,7 @@ class ExecutionService:
             cash=cash_value,
             cash_source=cash_source,
             as_of=as_of,
+            cash_as_of=cash_as_of or as_of,
             anchors=anchors,
             anchor_source=anchor_source,
             per_symbol=per_symbol,
@@ -2481,13 +2582,24 @@ class ExecutionService:
             nav_warnings=warnings,
         )
 
-    def _write_nav_breakdown(self, run_dir: str, nav_info: Mapping[str, Any]) -> str:
+    def _write_nav_breakdown(
+        self,
+        run_dir: str,
+        nav_info: Mapping[str, Any],
+        *,
+        filename: str = NAV_BREAKDOWN_FILENAME,
+    ) -> str:
         """Persist the per-symbol mark to its own file, never into `summary.json`.
 
         A 20-symbol book would add ~20 blocks to every summary; the digest keeps scalars
         plus a pointer (`nav_breakdown_file` / `nav_symbol_count`) to this file instead.
+
+        (D8, 2026-11-11) `filename` exists so the two stages cannot share one path: Stage 1
+        pre-stages the GATE snapshot (`nav_breakdown.json`) and Stage 2 writes its own mark
+        to `nav_breakdown.stage2.json`.  Both callers keep the documented payload shape;
+        only the destination differs, so no reader has to learn a second schema.
         """
-        path = os.path.join(run_dir, NAV_BREAKDOWN_FILENAME)
+        path = os.path.join(run_dir, filename)
         payload = {
             "as_of": nav_info.get("as_of"),
             "nav_effective": nav_info.get("nav_effective"),
@@ -2496,6 +2608,9 @@ class ExecutionService:
             "equity": nav_info.get("equity"),
             "cash": nav_info.get("cash"),
             "cash_source": nav_info.get("cash_source"),
+            #: (LV1-TIMEBASE) STRUCTURED timebase of the `cash` leg (see `_nav_payload`):
+            #: Stage 1 compares it with `as_of` instead of parsing dates out of a log line.
+            "cash_as_of": nav_info.get("cash_as_of"),
             #: Position-open dates used for the total-return ratio, and their provenance.
             #: ``None`` means every symbol inside `per_symbol` was marked at RAW (a lower
             #: bound) -- see the `anchor_unavailable` entries in `nav_warnings`.
@@ -2511,8 +2626,54 @@ class ExecutionService:
             "nav_warnings": list(nav_info.get("nav_warnings") or []),
             "per_symbol": dict(nav_info.get("per_symbol") or {}),
         }
+        # (LV1-TIMEBASE) Present ONLY when the writer deliberately withheld a NAV (a
+        # cross-timebase staged snapshot). A normal mark emits no such key, so every
+        # pre-existing payload stays exactly as before.
+        if nav_info.get("nav_degradation_reason"):
+            payload["nav_degradation_reason"] = nav_info.get("nav_degradation_reason")
         self.storage._save_json(path, payload)
         return path
+
+    def _read_nav_breakdown(self, path: str) -> Optional[Dict[str, Any]]:
+        """The snapshot at `path` as a dict, or `None` when absent/unreadable/empty."""
+        if not path or not os.path.exists(path):
+            return None
+        payload = self.storage._load_json(path, default=None)
+        return payload if isinstance(payload, dict) and payload else None
+
+    @staticmethod
+    def _nav_summary_fields(nav: Mapping[str, Any], *, suffix: str = "") -> Dict[str, Any]:
+        """The NAV scalars `summary.json` records, from EITHER nav payload shape.
+
+        Accepts a `_nav_payload` (`nav_info`, key `equity`) and a `nav_breakdown.*`
+        snapshot (same keys, see `_write_nav_breakdown`), so the gate snapshot and Stage 2's
+        own mark can be published side by side without copying one into the other's names.
+
+        (D8) `suffix` names the producer: `""` = Stage-1 gate snapshot (what the breaker
+        was shown), `"_stage2"` = Stage 2's deploy-time mark (what `--portfolio-value`
+        was built from).  They are NEVER averaged or merged -- a reader must pick one.
+        """
+        per_symbol = nav.get("per_symbol") or {}
+        anchors = nav.get("anchors") or {}
+        return {
+            f"nav_effective{suffix}": nav.get("nav_effective"),
+            f"nav_computed{suffix}": nav.get("nav_computed"),
+            f"nav_source{suffix}": nav.get("nav_source"),
+            #: `nav_info` spells the equity leg `equity`; the summary has always spelled
+            #: the same number `nav_equity` (see the Stage-2 round fields).
+            f"nav_equity{suffix}": nav.get("nav_equity", nav.get("equity")),
+            f"cash{suffix}": nav.get("cash"),
+            f"cash_source{suffix}": nav.get("cash_source"),
+            #: (LV1-TIMEBASE) The session the `cash` leg belongs to.  Published in the
+            #: summary so a later reader does not have to infer it (`_archived_cash_for`
+            #: consumes exactly this field when it carries a residual forward).
+            f"cash_as_of{suffix}": nav.get("cash_as_of"),
+            f"nav_stale_symbols{suffix}": list(nav.get("stale_symbols") or []),
+            f"nav_warnings{suffix}": list(nav.get("nav_warnings") or []),
+            f"nav_symbol_count{suffix}": len(per_symbol),
+            f"anchor_source{suffix}": nav.get("anchor_source"),
+            f"anchor_count{suffix}": len(anchors),
+        }
 
     def run_health_check(
         self,
@@ -2530,8 +2691,20 @@ class ExecutionService:
         universe_name: Optional[str] = None,
         allow_intraday: bool = True,
         refresh_data: bool = True,
+        cash: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Execute Stage 1 Health Check."""
+        """Execute Stage 1 Health Check.
+
+        ``cash`` is the operator's CURRENT cash balance for this session. It exists so the
+        LV11 pre-staged snapshot can be marked at ONE instant (LV1-TIMEBASE): without it the
+        only pre-form cash source is the previous round's `summary.json::cash`, and
+        `today's equity + the previous session's settled cash` is not a NAV (2026-11-10 /
+        11-11: phantom +5.14% / -51.59%, the latter tripping TIER_3 and liquidating the
+        account while the book had moved -0.23%). When it is omitted, a previous-session
+        cash residual is NOT silently combined with today's mark: the staged snapshot
+        carries `nav_effective=None` + `cash_as_of`, Stage 1 degrades to tier UNKNOWN and
+        Stage 2 fails closed.
+        """
         provider = data_provider or self.storage.default_data_provider or "marketdb"
         strat_key, univ_key, strat_name, univ_name = self.storage.resolve_keys(
             strategy_file=strategy_file,
@@ -2582,7 +2755,7 @@ class ExecutionService:
                 if existing_st and existing_st.get("as_of_date") == val_date and "prior_state" not in existing_st:
                     carried = self.storage._carry_forward_account_state(val_date, strat_key, univ_key)
                     if carried:
-                        existing_st["prior_state"] = carried
+                        self._install_prior_state(existing_st, carried)
                         self.storage._save_json(account_state_file, existing_st)
             except Exception:
                 pass
@@ -2601,7 +2774,8 @@ class ExecutionService:
                     if state_data.get("as_of_date") == val_date and "prior_state" not in state_data:
                         carried = self.storage._carry_forward_account_state(val_date, strat_key, univ_key)
                         if carried:
-                            state_data = {**state_data, "prior_state": carried}
+                            state_data = dict(state_data)
+                            self._install_prior_state(state_data, carried)
                     self.storage._save_json(account_state_file, state_data)
             except Exception:
                 pass
@@ -2672,17 +2846,31 @@ class ExecutionService:
                         "若缓存仍缺 as_of bar 将按陈旧价格失败关闭）: %s", exc
                     )
                 # Cash is NOT a holding (it is the NAV residual), so the seed book alone
-                # cannot be marked. Prefer the previous round's measured residual; a book
-                # that carries a parked-cash position still works with `cash=None` via the
-                # engine's own `bil_fallback`, and when neither is available the engine
-                # fails closed and this block degrades loudly instead of guessing.
-                staged_cash, cash_origin = self._archived_cash_for(
+                # cannot be marked. THREE sources, in strict timebase order:
+                #
+                #   1. `cash` (operator-provided for THIS health check, e.g. the web form's
+                #      现金余额) -- same-instant by construction: `cash_as_of = val_date`;
+                #   2. the previous round's measured residual -- STAMPED with that round's
+                #      session (`_archived_cash_for` -> `cash_as_of`). Using it is allowed
+                #      ONLY when it is this session's; a PREVIOUS SESSION's settled balance
+                #      combined with today's equity is the 2026-11-10/11-11 defect
+                #      (`208,067.60 = 182,471.00 + 25,596.60` from 11-09, and
+                #      `101,093.32 = 86,712.00 + 14,381.32` from 11-10 -> a phantom
+                #      -51.59% drawdown -> TIER_3_HALT -> full liquidation);
+                #   3. no cash at all -> the engine's own parked-cash `bil_fallback` (marked
+                #      at `as_of`, therefore same-instant) or its fail-closed refusal.
+                staged_cash, cash_as_of, cash_origin = self._archived_cash_for(
                     val_date, strat_key, univ_key, exclude_dir=run_dir
                 )
+                if cash is not None:
+                    # The operator's number wins over the archive: it is the only source
+                    # that can describe THIS session's cash.
+                    staged_cash, cash_as_of, cash_origin = float(cash), val_date, None
                 staged_nav = self._resolve_nav(
                     seed_book,
                     as_of=val_date,
                     cash=staged_cash,
+                    cash_as_of=cash_as_of,
                     portfolio_value=portfolio_value,
                     nav_override=False,
                     provider=provider,
@@ -2693,13 +2881,52 @@ class ExecutionService:
                 if cash_origin:
                     staged_nav["nav_warnings"] = list(staged_nav.get("nav_warnings") or []) + [
                         f"cash_from_archive: cash={staged_nav.get('cash')} 取自上一轮 "
-                        f"summary.json ({cash_origin})——持仓本身不含现金，这是唯一可用的已测量残差"
+                        f"summary.json ({cash_origin})，该轮 as_of={cash_as_of}"
+                        "——持仓本身不含现金，这是唯一可用的已测量残差"
                     ]
+                if staged_cash is not None and str(cash_as_of or "") != str(val_date):
+                    # (LV1-TIMEBASE) REFUSE to publish a cross-timebase NAV. The equity leg
+                    # was just refreshed to `val_date`; the cash leg belongs to
+                    # `cash_as_of`. Their sum is not a NAV for any single instant, and Stage
+                    # 1 has no way to un-mix it (the same-instant cash is simply not on
+                    # disk), so the snapshot says so explicitly: `nav_effective=None` =>
+                    # Stage 1 degrades (`NAV_EFFECTIVE_MISSING` -> tier UNKNOWN) and Stage 2
+                    # refuses to issue a ticket until the operator supplies this session's
+                    # cash (the web form's 现金余额, forwarded as `cash`).
+                    #
+                    # Rejected alternative: publishing the mixed number with a warning.
+                    # That is precisely the silent path the 11-10/11-11 rounds took -- a
+                    # >1:1 cash move turns into a phantom +/-50% NAV and trips (or hides)
+                    # TIER_3. Rejected alternative: silently reusing the operator FORM nav
+                    # (`portfolio_value`) -- LV1 (ii) forbids the form value entering the
+                    # gate arithmetic.
+                    staged_nav["nav_effective"] = None
+                    staged_nav["nav_computed"] = None
+                    staged_nav["nav_source"] = "staged_cash_timebase_mismatch"
+                    staged_nav["nav_degradation_reason"] = (
+                        f"(LV1-TIMEBASE) 预置快照拒绝跨时点拼装净值：权益腿已按 as_of="
+                        f"{val_date} 盯市，现金腿却来自 as_of={cash_as_of} 的归档残差"
+                        f"（cash={staged_nav.get('cash')}）——这不是任何单一时点的 NAV。"
+                        "请用本交易日已结算现金重跑（web 表单的『现金余额』会作为 cash 传入），"
+                        "或人工覆盖净值后再部署；缺失 ≠ 未触发，本快照不构成熔断结论。"
+                    )
+                    staged_nav["nav_warnings"] = list(staged_nav.get("nav_warnings") or []) + [
+                        "cash_timebase_mismatch: "
+                        f"cash_as_of={cash_as_of} != as_of={val_date}; "
+                        "nav_effective withheld (LV1-TIMEBASE)"
+                    ]
+                    print(
+                        "[LV1-TIMEBASE] 拒绝预置跨时点净值: "
+                        f"as_of={val_date}, cash_as_of={cash_as_of}, "
+                        f"equity={staged_nav.get('equity')}, cash={staged_nav.get('cash')} "
+                        f"-> nav_effective withheld（Stage 1 将显式降级为 UNKNOWN）"
+                    )
                 staged_nav_path = self._write_nav_breakdown(run_dir, staged_nav)
                 print(
                     f"[ExecutionService] (LV11) 估值快照已预置: {staged_nav_path} "
                     f"(seed_source={seed_source}, nav_effective={staged_nav.get('nav_effective')}, "
-                    f"cash_source={staged_nav.get('cash_source')}"
+                    f"cash_source={staged_nav.get('cash_source')}, "
+                    f"cash_as_of={staged_nav.get('cash_as_of')}"
                     f"{', cash_from_archive=' + cash_origin if cash_origin else ''})"
                 )
             else:
@@ -2895,6 +3122,46 @@ class ExecutionService:
     # --------------------------------------------------------------------------
     # Holdings-input reconciliation (no fill receipt exists -- this is advisory)
     # --------------------------------------------------------------------------
+    def _prev_post_status(
+        self, prev_run_dir: Optional[str], prev_post: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """(D5) Classify the REFERENCE itself: available / complete / WHY.
+
+        `prev_post_available` answers "is there a previous planned book?"; it cannot answer
+        "is that book a CONFIRMED one?" -- `{}` from a fully-liquidated round, a book
+        re-derived from the ticket because `post_holdings.json` was never written, and an
+        incomplete sidecar all looked identical (and all read as a clean pass).
+
+        The verdict comes from the single owner (`StorageManager.post_holdings_meta_status`
+        -> `classify_post_holdings_meta`), never re-derived here. Passed `None` for the
+        directory it still returns the honest "no reference" answer (`available=False`,
+        `reason="post_holdings_missing"`), so callers do not need a second branch.
+
+        Keys are additive to `holdings_input_check`; no existing key changes meaning.
+        """
+        try:
+            status = self.storage.post_holdings_meta_status(prev_run_dir, book=prev_post)
+        except Exception as exc:  # a broken sidecar must not block the deploy
+            logging.warning("[holdings-input-check] prev_post_status 判定失败（忽略）: %s", exc)
+            return {
+                "available": False,
+                "complete": None,
+                "reason": f"post_holdings_status_error: {exc}",
+                "legacy": False,
+                "meta_present": False,
+                "path": None,
+            }
+        return {
+            "available": bool(status.get("available")),
+            # `None` = unknown (no sidecar / no book), NOT "incomplete": a legacy archive
+            # legitimately has no sidecar and keeps its pre-D5 semantics.
+            "complete": status.get("complete"),
+            "reason": status.get("reason"),
+            "legacy": bool(status.get("legacy")),
+            "meta_present": bool(status.get("meta_present")),
+            "path": status.get("path"),
+        }
+
     def _check_holdings_input(
         self,
         current_holdings: Optional[Dict[str, Any]],
@@ -2951,6 +3218,17 @@ class ExecutionService:
         if prev_post is None:
             # No earlier plan to compare against (first ever run, or every earlier run
             # lacked both post_holdings.json and a ticket with target_shares).
+            # (D5) The reference resolver hands back a DIRECTORY only when it found a plan,
+            # so an incomplete sidecar / missing book would otherwise lose the reason that
+            # explains it. Classify the newest earlier round instead -- that is the dir a
+            # reader would have used, and its sidecar is what says why no plan came out.
+            status_dir = prev_run_dir
+            if status_dir is None and not matrix_id:
+                earlier = self.storage._earlier_runs(
+                    val_date, strategy_key, universe_key
+                )
+                if earlier:
+                    status_dir = earlier[0].get("path")
             return {
                 "mismatched": {},
                 "n_mismatched": 0,
@@ -2964,12 +3242,22 @@ class ExecutionService:
                 "reference_symbols_without_lifecycle": [],
                 "prev_post_lifecycle_available": False,
                 "clean_pass": True,
+                # (D5) WHY there is no reference: the same classifier the readers use, so
+                # "first ever run" / "file never produced" / "sidecar says incomplete" are
+                # distinguishable instead of collapsing into one `False`.
+                "prev_post_status": self._prev_post_status(status_dir, prev_post),
             }
 
         check = diff_holdings_input_vs_prev_post(shares_input, prev_post)
         check["prev_post_available"] = True
         check["prev_post_run_dir"] = prev_run_dir
         check["strict"] = strict_holdings_input_enabled()
+        # (D5) `prev_post_available` only says a reference EXISTS. This says how much the
+        # reference can be trusted: a `post_holdings.json` with `complete: true` (a
+        # confirmed book, `{}` = flat) vs. a book RECONSTRUCTED from the ticket
+        # (`post_holdings_missing`) vs. an incomplete sidecar vs. a legacy archive with no
+        # sidecar at all. Additive: no existing key changes meaning.
+        check["prev_post_status"] = self._prev_post_status(prev_run_dir, prev_post)
 
         # (D5) Cross-check the REFERENCE book against the previous run's lifecycle state.
         # `None` prev_run_dir (a legacy reference we could not attribute to a directory)
@@ -3345,6 +3633,10 @@ class ExecutionService:
             effective_holdings,
             as_of=val_date,
             cash=cash,
+            # (LV1-TIMEBASE) The deploy form's cash (`payload.cash`, or the parked-cash
+            # holding marked at `val_date`) is the operator's assertion about the CURRENT
+            # book, so its timebase is this session. Stamped explicitly instead of inferred.
+            cash_as_of=val_date,
             portfolio_value=portfolio_value,
             nav_override=nav_override,
             provider=provider,
@@ -3355,7 +3647,48 @@ class ExecutionService:
         #: The value the child receives (`--portfolio-value`).  For the computed path this is
         #: the engine's dividend-inclusive mark -- deliberately NOT `portfolio_value`.
         effective_portfolio_value = nav_info["nav_effective"]
-        self._write_nav_breakdown(run_dir, nav_info)
+        # (D8, 2026-11-11) TWO SNAPSHOTS, TWO PATHS -- Stage 2 MUST NOT overwrite the gate's.
+        #
+        # THE DEFECT THIS CLOSES. `nav_breakdown.json` used to be written twice per round:
+        # `run_health_check` pre-staged it before the gate child (LV11) and THIS line
+        # rewrote the same path with Stage 2's mark. Whenever the two marks differ -- the
+        # pre-stage uses the previous round's archived cash, Stage 2 uses the operator's
+        # form cash -- the archived file stopped being the number the breaker decided on.
+        # 2026-11-09/204716: gate `nav_effective = 197,899.90` (equity 172,303.00 + archive
+        # cash 25,596.90), archived `197,899.60` (form cash 25,596.60). Audit point: the
+        # gate input is unreconstructable from the archive, so "the breaker saw X" cannot be
+        # proven after the fact. `nav_breakdown.json` therefore stays EXACTLY what Stage 1
+        # read, and Stage 2's own mark goes to `nav_breakdown.stage2.json`.
+        #
+        # STAGE-2-ONLY ROUNDS (restart / another uvicorn worker / no Stage 1 at all) have
+        # no gate snapshot in this (freshly allocated) directory. There is nothing to
+        # preserve, so the legacy path is still populated for readers that only know that
+        # filename -- and the summary says which case it was
+        # (`nav_gate_snapshot_source`), never silently pretending a gate ran.
+        stage2_nav_path = self._write_nav_breakdown(
+            run_dir, nav_info, filename=NAV_BREAKDOWN_STAGE2_FILENAME
+        )
+        gate_nav_path = os.path.join(run_dir, NAV_BREAKDOWN_FILENAME)
+        gate_nav = self._read_nav_breakdown(gate_nav_path)
+        if gate_nav is not None:
+            gate_nav_source = "stage1_gate_snapshot"
+        else:
+            self._write_nav_breakdown(run_dir, nav_info)
+            gate_nav = nav_info
+            gate_nav_source = "stage2_nav_no_stage1_snapshot"
+            logging.warning(
+                "[D8] %s: 本目录没有 Stage-1 预置的估值快照（仅 Stage 2 / 重启 / 多 worker），"
+                "门禁字段回落为 Stage-2 自己的估值并标记 nav_gate_snapshot_source=%s；"
+                "这不是门禁依据，summary 的 nav_*_stage2 仍单独留痕。",
+                run_dir,
+                gate_nav_source,
+            )
+        print(
+            f"[ExecutionService] (D8) 估值快照分开落盘: gate={gate_nav_path} "
+            f"(source={gate_nav_source}, nav_effective={gate_nav.get('nav_effective')}, "
+            f"cash={gate_nav.get('cash')}) | stage2={stage2_nav_path} "
+            f"(nav_effective={nav_info.get('nav_effective')}, cash={nav_info.get('cash')})"
+        )
 
         # Save holdings snapshot in run_dir and globally. (L2.62) `run_dir` pins the archive
         # write to THIS round's instance directory -- "latest" would resolve the session's
@@ -3520,27 +3853,32 @@ class ExecutionService:
             "universe_key": univ_key,
             "universe_name": univ_name,
             "universe_file": univ_path,
-            # `portfolio_value` stays the OPERATOR'S input (audit: what was asked for);
-            # `nav_effective` is what the child actually received on the command line.
+            # `portfolio_value` stays the OPERATOR'S input (audit: what was asked for).
             "portfolio_value": portfolio_value,
-            "nav_effective": nav_info["nav_effective"],
-            # (NAV) Dividend-aware mark. Scalars only -- the per-symbol detail lives in
-            # `<run_dir>/nav_breakdown.json` (`nav_breakdown_file` below) so a 20-symbol
-            # book cannot bloat the digest.
-            "nav_computed": nav_info["nav_computed"],
-            "nav_source": nav_info["nav_source"],
-            "nav_equity": nav_info["equity"],
-            "cash": nav_info["cash"],
-            "cash_source": nav_info["cash_source"],
-            "nav_stale_symbols": nav_info["stale_symbols"],
-            "nav_warnings": nav_info["nav_warnings"],
-            "nav_symbol_count": len(nav_info["per_symbol"]),
-            #: Where the position-open dates used for the total-return ratio came from.
-            #: ``"run_archive"`` = derived from archived books; ``None`` = no anchor was
-            #: available and those symbols were marked at RAW (a LOWER BOUND).
-            "anchor_source": nav_info["anchor_source"],
-            "anchor_count": len(nav_info["anchors"]),
+            # (D8, 2026-11-11) GATE fields and STAGE-2 fields are published SIDE BY SIDE and
+            # NEVER merged/averaged. The bare `nav_effective` / `cash` / `nav_source` ... are
+            # the STAGE-1 GATE snapshot -- the only NAV the breaker was ever shown -- because
+            # that is the number a post-hoc audit must be able to reconstruct. Stage 2's own
+            # deploy-time mark (the one `--portfolio-value` was built from) lives in the
+            # `*_stage2` suffix and in `nav_breakdown.stage2.json`.
+            #
+            # The two can legitimately differ by cents (archive cash vs operator form cash):
+            # 2026-11-09/204716 was gate 197,899.90 vs deploy 197,899.60. Before D8 the
+            # summary kept only the deploy number, so the gate input was lost.
+            # Scalars only -- the per-symbol detail lives in each `nav_breakdown*` file.
+            **self._nav_summary_fields(gate_nav),
+            **self._nav_summary_fields(nav_info, suffix="_stage2"),
+            #: (D8) `nav_breakdown.json` = what Stage 1 read. `nav_breakdown.stage2.json` =
+            #: what Stage 2 marked. A reader that only knows the first name keeps getting the
+            #: gate snapshot (that is the desired, backwards-compatible semantics).
             "nav_breakdown_file": NAV_BREAKDOWN_FILENAME,
+            "nav_breakdown_stage2_file": NAV_BREAKDOWN_STAGE2_FILENAME,
+            #: Which producer the bare `nav_*` gate fields came from:
+            #: ``"stage1_gate_snapshot"`` (normal) or
+            #: ``"stage2_nav_no_stage1_snapshot"`` (Stage-2-only round in a fresh dir, where
+            #: no gate snapshot existed -- the fields then repeat Stage 2's own mark and must
+            #: NOT be read as a gate decision).
+            "nav_gate_snapshot_source": gate_nav_source,
             "data_provider": provider,
             "as_of_source": as_of_source,
             # (L2.62) Which Stage-1 gate report this ticket obeyed -- derived from the
@@ -3620,6 +3958,10 @@ class ExecutionService:
             # (NAV) What the book was marked at, and where that number came from. The UI
             # highlights `nav_source == "override"` and shows the cash provenance so a
             # BIL-derived cash balance is never mistaken for an operator-entered one.
+            # NOTE (D8): these are the DEPLOY values (what `--portfolio-value` was built
+            # from), i.e. `summary.json`'s `*_stage2` fields. The gate snapshot -- the number
+            # the breaker decided on -- is returned separately under `nav_gate_snapshot` and
+            # is what `summary.json`'s bare `nav_*` keys now carry.
             "nav_computed": nav_info["nav_computed"],
             "nav_effective": nav_info["nav_effective"],
             "nav_source": nav_info["nav_source"],
@@ -3627,6 +3969,11 @@ class ExecutionService:
             "cash_source": nav_info["cash_source"],
             "nav_warnings": nav_info["nav_warnings"],
             "anchor_source": nav_info["anchor_source"],
+            "nav_gate_snapshot": {
+                "file": NAV_BREAKDOWN_FILENAME,
+                "source": gate_nav_source,
+                **self._nav_summary_fields(gate_nav),
+            },
             # Planned post-ticket book (from `target_shares`) -- what the holdings table should
             # show after this deploy. `holdings` above is the PRE-trade input book.
             "holdings_plan": post_holdings,

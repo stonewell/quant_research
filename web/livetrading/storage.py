@@ -13,6 +13,7 @@ of ``update_settings`` so the UI can never rewrite the template.  See ``L2.16`` 
 ``docs/development_plan.md``.
 """
 
+import copy
 import json
 import logging
 import os
@@ -127,6 +128,22 @@ try:
 except ImportError:  # pragma: no cover - repo root not yet importable
     sys.path.insert(0, find_repo_root())
     from scripts.live_paths import MULTI_STRATEGY_KEY, default_live_output_dir
+
+# (D2, 2026-11-09 incident) WHICH earlier snapshot may be carried forward is ONE rule with ONE
+# owner, and that owner is `scripts/live_preflight.py` (the same resolver Stage 2 runs before
+# it issues a ticket). Imported, never re-implemented: a second copy here is how the web layer
+# used to select `2026-11-08/184755` (an orphan instance holding an 11-05 book,
+# `base_version=1.8.0`) as the carry source while a SUCCESSFUL `2026-11-06/185016`
+# (`nav=199,480.90`, `base_version=2.0.0`) existed.
+#
+# The resolver is read-only with respect to the archive, and this module only ever consumes
+# `selection.state` / `selection.source` -- the carried snapshot is returned as it was
+# written. Versions are NEVER re-stamped here (`docs/lv7_prior_state_contract.md` §5.4).
+try:
+    from scripts.live_preflight import select_prior_state
+except ImportError:  # pragma: no cover - repo root not yet importable
+    sys.path.insert(0, find_repo_root())
+    from scripts.live_preflight import select_prior_state
 
 #: Resolved fallback location for `get_multi_netting_run`. One owner above; nothing in
 #: this module may re-spell it.
@@ -313,6 +330,86 @@ OPERATOR_HOLDINGS_FILENAME = "operator_holdings.json"
 #: pre_trade_fallback, snapshot}`; `resolve_seed_holdings` adds it to its own legal set too
 #: (`operator_snapshot` / `previous_post_holdings` / `none`).
 OPERATOR_MANUAL_CORRECTION_SOURCE = "operator_manual_correction"
+
+# --------------------------------------------------------------------------- #
+# (D5, evidence `2026-11-11/205137`) "empty book" is NOT "no book"
+# --------------------------------------------------------------------------- #
+# `2026-11-11/205137/post_holdings.json` holds `{}` because that day fully liquidated --
+# the CORRECT result.  Nothing in the file says so, though: `{}` and "the writer never ran"
+# are byte-indistinguishable, so `holdings_input_check.prev_post_available` and the next
+# day's seed both had to guess, and a caller that guessed "no book" silently re-bought a
+# liquidated book (the 2026-10-26/10-27 ghost-position class).
+#
+# The fix keeps `post_holdings.json`'s shape EXACTLY as it is (`{symbol: shares}`, `{}` =
+# flat) and adds a sidecar written by `scripts/run_live_strategy.py`:
+#   {"as_of": "YYYY-MM-DD", "complete": bool, "n_symbols": int,
+#    "generated_at": ISO-8601 local, "source": "ticket"|"replay"}
+# `{}` + `complete: true` = a CONFIRMED all-cash book (a legal seed); an incomplete sidecar
+# = unusable.  A pre-D5 archive has no sidecar at all and keeps the old semantics
+# ("file exists => the book is the book", `{}` = flat) while being flagged
+# `legacy_post_holdings_no_meta`, so the two cases remain distinguishable in logs.
+POST_HOLDINGS_FILENAME = "post_holdings.json"
+POST_HOLDINGS_META_FILENAME = "post_holdings.meta.json"
+
+#: `reason` values returned by `classify_post_holdings_meta` / `post_holdings_meta_status`.
+POST_HOLDINGS_REASON_OK = "post_holdings_meta_complete"
+POST_HOLDINGS_REASON_INCOMPLETE = "post_holdings_meta_incomplete"
+POST_HOLDINGS_REASON_MISSING = "post_holdings_missing"
+POST_HOLDINGS_REASON_LEGACY = "legacy_post_holdings_no_meta"
+
+#: Run dirs already reported as legacy, so a reader that walks the whole archive
+#: (`_planned_book_from_run_dir` runs per candidate dir) logs ONCE per directory instead of
+#: once per walk.  Bounded: the marker only exists to keep a live server's log readable.
+_LEGACY_POST_HOLDINGS_WARNED: set = set()
+
+
+def classify_post_holdings_meta(meta: Any, *, file_exists: bool) -> Dict[str, Any]:
+    """(D5) May a run dir's `post_holdings.json` be used, and on what grounds?
+
+    Pure function: inputs are the PARSED sidecar and whether the book file exists, no file
+    I/O, so the rule itself is unit-testable offline.
+
+    Returns::
+
+        {"available": bool, "reason": str, "complete": bool | None, "legacy": bool,
+         "as_of": str | None, "n_symbols": int | None, "source": str | None}
+
+    The rule, in order:
+      1. no book file -> UNAVAILABLE (`post_holdings_missing`).  "Unknown" must never be
+         read as "flat";
+      2. book file + sidecar `complete: true` -> AVAILABLE (`post_holdings_meta_complete`).
+         An EMPTY book is legal here -- that is the whole point of the sidecar;
+      3. book file + sidecar present but not `complete` -> UNAVAILABLE
+         (`post_holdings_meta_incomplete`): the writer says its own output is partial;
+      4. book file + NO sidecar -> AVAILABLE, flagged `legacy_post_holdings_no_meta`
+         (backward compatibility: every archive written before D5 has no sidecar, and
+         its `{}` still means "flat");
+      5. book file + UNREADABLE sidecar (not a mapping) -> same legacy treatment: a corrupt
+         sidecar proves nothing about the book, so it must not silently invalidate it.
+    """
+    result: Dict[str, Any] = {
+        "available": False,
+        "reason": POST_HOLDINGS_REASON_MISSING,
+        "complete": None,
+        "legacy": False,
+        "as_of": None,
+        "n_symbols": None,
+        "source": None,
+    }
+    if not file_exists:
+        return result
+    if not isinstance(meta, dict) or not meta:
+        result.update(available=True, reason=POST_HOLDINGS_REASON_LEGACY, legacy=True)
+        return result
+    result["as_of"] = meta.get("as_of")
+    result["n_symbols"] = meta.get("n_symbols")
+    result["source"] = meta.get("source")
+    complete = meta.get("complete")
+    if complete is True:
+        result.update(available=True, reason=POST_HOLDINGS_REASON_OK, complete=True)
+        return result
+    result.update(available=False, reason=POST_HOLDINGS_REASON_INCOMPLETE, complete=False)
+    return result
 
 # Ticket/cash names that never denote a real share position. BIL is included deliberately: the
 # Stage 2 runner (`resolve_holdings_weights_and_shares` in scripts/run_live_strategy.py)
@@ -1149,6 +1246,13 @@ def list_instances_for_date(date_dir: Optional[str]) -> List[str]:
 #: Summary keys a Stage-1 round writes ONLY when it refused/failed.
 _INSTANCE_FAILURE_SUMMARY_KEYS: Tuple[str, ...] = ("error_kind", "error_headline")
 
+#: `as_of` sentinel for an UNDATED carry-forward read (`get_account_state()` with no date).
+#: `scripts.live_preflight.list_prior_state_candidates` keeps only date directories that
+#: sort STRICTLY BELOW `as_of`, so a high sentinel means "every date, including today" --
+#: the set the pre-D2 linear scan covered -- while the resolvers' own admissibility rules
+#: still apply unchanged. It is never written to a file.
+_NO_DATE_PRIOR_STATE_AS_OF = "9999-12-31"
+
 
 def _instance_state_is_trustworthy(instance_dir: Optional[str]) -> bool:
     """Whether a run dir's `account_state.json` may be used as a cross-day seed.
@@ -1927,11 +2031,11 @@ class StorageManager:
             return None
 
         # 1. Check if post_holdings.json exists
-        post_file = os.path.join(run_dir, "post_holdings.json")
-        if os.path.exists(post_file):
-            data = self._load_json(post_file, default=None)
-            if isinstance(data, dict):
-                return data
+        # (D5) Through the sidecar, so an EMPTY book (`{}` = all cash) is returned as `{}`
+        # while a missing/incomplete one falls through instead of masquerading as "flat".
+        post_status = self.post_holdings_meta_status(run_dir)
+        if post_status.get("available") and isinstance(post_status.get("book"), dict):
+            return post_status["book"]
 
         # 2. Check ticket for target_shares
         ticket = self._load_json(os.path.join(run_dir, "live_trading_ticket.json"))
@@ -2125,14 +2229,109 @@ class StorageManager:
                 return h
         return None
 
+    def _select_prior_state(
+        self,
+        date_str: Optional[str],
+        strategy_key: Optional[str],
+        universe_key: Optional[str],
+        *,
+        expected_base_version: Optional[str] = None,
+    ) -> Optional["object"]:
+        """(D2) The Stage-2 resolver's verdict for this `(strategy, universe)` session.
+
+        Thin adapter ONLY: every admissibility/ordering rule (run verdict, the orphan
+        signature `state.as_of_date != its run date`, `base_version`, newest-date ->
+        newest-instance, "same-day rerun is NOT an orphan") is `scripts.live_preflight.
+        select_prior_state`'s. Re-implementing any of it here is what produced the
+        2026-11-09 `prior_state=11-05` defect.
+
+        The scan root is the session root `<archive>/<strategy>/<universe>` -- the shape
+        the live archive actually has (`get_run_dir`) -- resolved case-insensitively
+        through `find_existing_run_dir`, so a differently-cased archive folder is still
+        found instead of yielding "no candidates".
+
+        `date_str=None` (the argument-less `get_account_state()` / "newest state of all"
+        read) uses a HIGH sentinel as `as_of`, which keeps the resolver's
+        "strictly-earlier date dirs" contract intact while making today's own snapshot
+        eligible -- exactly the set the old linear scan covered.
+
+        `expected_base_version` is optional and defaults to None = "do not filter on
+        version". That is deliberate: the AUTHORITATIVE live value is the live strategy
+        class, which only Stage 2 has, and it fails closed on a mismatch anyway
+        (`assert_account_state_version_parity`). A dump-derived guess here could be the
+        STALE side and would then reject every healthy snapshot.
+        """
+        if not strategy_key or not universe_key:
+            return None
+        session_root = self.find_existing_run_dir(strategy_key, universe_key, None)
+        # `session_root=None` is handed to the resolver on purpose: it then returns its own
+        # `unresolved` verdict (`reason=no_candidate_directories_under_session_root`) so a
+        # first-of-install read is still explainable, instead of silently resolving nothing.
+        return select_prior_state(
+            session_root,
+            date_str or _NO_DATE_PRIOR_STATE_AS_OF,
+            expected_base_version=expected_base_version,
+        )
+
     def _carry_forward_account_state(
         self,
         date_str: Optional[str],
         strategy_key: Optional[str],
         universe_key: Optional[str],
         runs: Optional[List[Dict[str, Any]]] = None,
+        *,
+        expected_base_version: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """account_state.json of the most recent earlier run that has one (linear scan)."""
+        """The newest ADMISSIBLE earlier `account_state.json`, with its provenance block.
+
+        D2 (2026-11-09 incident): this used to return the first earlier directory that
+        merely HELD an `account_state.json` -- no run verdict, no `as_of_date` check, no
+        version axis. The 2026-11-08/184755 orphan (a copied 11-05 book + `health_status:
+        FAILED`) therefore won over the SUCCESSFUL 2026-11-06/185016 snapshot, and the
+        caller stored the orphan as `prior_state`.
+
+        The selection is delegated wholesale to
+        `scripts/live_preflight.select_prior_state` (see `_select_prior_state`), so the web
+        layer and Stage 2 cannot disagree about "the previous session's confirmed
+        snapshot". The returned dict is the snapshot AS WRITTEN plus one additive key:
+
+        * `prior_state_source` -- the resolver's audit block (`path`, `as_of`,
+          `run_date`, `instance`, `run_status`, `status_source`, `base_version`,
+          `selection_reason`, and every rejected candidate with its machine-readable
+          reason in `skipped`).
+
+        It is NOT installed as `prior_state` here: callers place the whole returned dict
+        INTO `prior_state` (`execution_service._install_prior_state`) or return it as the
+        state entering `date_str` (`get_account_state`), and Stage 2 re-derives the same
+        block and records it at the top level. Adding a self-referential `prior_state`
+        would deepen that nesting on every round. No field of the snapshot is rewritten:
+        `base_version` / `strategy_version*` stay exactly as the engine stamped them
+        (`docs/lv7_prior_state_contract.md` §5.4).
+
+        When the resolver finds NO admissible candidate the pre-D2 sweep is kept as the
+        last resort (a legacy archive whose state predates `as_of_date` still seeds), and
+        the `[PRIOR STATE] unresolved ...` line is logged -- an unresolved selection never
+        rewrites or drops whatever `prior_state` the state already carries.
+        """
+        if strategy_key and universe_key:
+            selection = self._select_prior_state(
+                date_str,
+                strategy_key,
+                universe_key,
+                expected_base_version=expected_base_version,
+            )
+            if selection is not None:
+                if selection.source is not None:
+                    state = copy.deepcopy(selection.state) if selection.state else None
+                    if state:
+                        state["prior_state_source"] = copy.deepcopy(dict(selection.source))
+                        logger.info("%s", selection.log_line)
+                        return state
+                # Unresolved: loud when candidates existed and were all rejected (a real
+                # archive defect), quiet on the first-ever run (no candidates at all).
+                log = logger.warning if selection.candidates else logger.info
+                log("%s", selection.log_line)
+
         if runs is None:
             runs = self._earlier_runs(date_str, strategy_key, universe_key)
         for r in runs:
@@ -2143,6 +2342,81 @@ class StorageManager:
             if st:
                 return st
         return None
+
+    def post_holdings_meta_status(
+        self, run_dir: Optional[str], book: Any = None
+    ) -> Dict[str, Any]:
+        """(D5) I/O wrapper around `classify_post_holdings_meta` for one run directory.
+
+        `book` lets a caller that already loaded `post_holdings.json` skip the second read
+        (`None` means "not loaded yet, this method decides existence by itself").
+
+        The returned dict additionally carries `path` / `meta_path` / `meta_present` so an
+        operator can see WHICH file was judged.  Logging is deliberate: a legacy archive is
+        usable but must be visible as `legacy_post_holdings_no_meta`, and an incomplete
+        sidecar is a real defect the next round has to hear about.
+        """
+        result: Dict[str, Any] = {
+            "available": False,
+            "reason": POST_HOLDINGS_REASON_MISSING,
+            "complete": None,
+            "legacy": False,
+            "as_of": None,
+            "n_symbols": None,
+            "source": None,
+            "path": None,
+            "meta_path": None,
+            "meta_present": False,
+            "book": None,
+        }
+        if not run_dir or not os.path.isdir(run_dir):
+            return result
+
+        post_path = os.path.join(run_dir, POST_HOLDINGS_FILENAME)
+        meta_path = os.path.join(run_dir, POST_HOLDINGS_META_FILENAME)
+        file_exists = os.path.exists(post_path)
+        meta_present = os.path.exists(meta_path)
+        meta = self._load_json(meta_path, default=None) if meta_present else None
+
+        status = classify_post_holdings_meta(meta, file_exists=file_exists)
+        resolved_book = book
+        if resolved_book is None and file_exists:
+            loaded = self._load_json(post_path, default=None)
+            resolved_book = loaded if isinstance(loaded, dict) else None
+
+        result.update(status)
+        result["path"] = post_path
+        result["meta_path"] = meta_path
+        result["meta_present"] = meta_present
+        result["book"] = resolved_book
+
+        if not file_exists:
+            # Not a warning: a first-ever run legitimately has no book.  The REASON is what
+            # keeps this "unknown" distinguishable from "flat".
+            return result
+        if status["reason"] == POST_HOLDINGS_REASON_LEGACY:
+            key = os.path.abspath(run_dir)
+            if key not in _LEGACY_POST_HOLDINGS_WARNED:
+                if len(_LEGACY_POST_HOLDINGS_WARNED) > 4096:
+                    _LEGACY_POST_HOLDINGS_WARNED.clear()
+                _LEGACY_POST_HOLDINGS_WARNED.add(key)
+                logger.warning(
+                    "[post-holdings] %s: %s (no %s) -- keeping pre-D5 semantics: the "
+                    "existing book is usable and an empty dict means FLAT. Re-run Stage 2 "
+                    "to emit the sidecar.",
+                    run_dir,
+                    POST_HOLDINGS_REASON_LEGACY,
+                    POST_HOLDINGS_META_FILENAME,
+                )
+        elif status["reason"] == POST_HOLDINGS_REASON_INCOMPLETE:
+            logger.warning(
+                "[post-holdings] %s: %s (%s) -- the book is NOT usable, and an empty dict "
+                "must not be read as FLAT.",
+                run_dir,
+                POST_HOLDINGS_REASON_INCOMPLETE,
+                meta_path,
+            )
+        return result
 
     def _planned_book_from_run_dir(
         self,
@@ -2160,14 +2434,19 @@ class StorageManager:
         NEVER falls back to `holdings.json` / `current_holdings.json`: those hold the
         day's PRE-trade INPUT, i.e. exactly the value the holdings-input comparison
         exists to audit -- using them would make the check agree with itself.
+
+        (D5) `post_holdings.json` is consulted through `post_holdings_meta_status`, so
+        "the book is EMPTY" (`{}` + `complete: true`) and "the book is not there / not
+        complete" stay different answers: the former is returned as `{}` (a legal
+        all-cash plan), the latter falls through to the ticket replay, and finally to
+        `None`.  A pre-D5 archive (no sidecar) keeps the old "file exists => usable"
+        semantics and is logged as `legacy_post_holdings_no_meta`.
         """
         if not run_dir or not os.path.isdir(run_dir):
             return None
-        post_file = os.path.join(run_dir, "post_holdings.json")
-        if os.path.exists(post_file):
-            data = self._load_json(post_file, default=None)
-            if isinstance(data, dict):
-                return data
+        post_status = self.post_holdings_meta_status(run_dir)
+        if post_status.get("available") and isinstance(post_status.get("book"), dict):
+            return post_status["book"]
         for name in ticket_names:
             ticket = self._load_json(os.path.join(run_dir, f"{name}.json"), default=None)
             if not ticket:

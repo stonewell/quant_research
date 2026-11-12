@@ -262,6 +262,10 @@ def test_snapshot_is_staged_before_the_gate_child_launches(workspace, monkeypatc
         as_of_date=AS_OF,
         data_provider=PROVIDER,
         refresh_data=False,
+        # (LV1-TIMEBASE) same-instant cash: the archived residual is from 2026-01-05, which
+        # would (correctly) be refused, so the operator's own balance is what makes this a
+        # normal mark. Cash itself is unrelated to the ordering assertion below.
+        cash=0.0,
     )
 
     assert len(captured) == 1, captured  # exactly one child: the gate
@@ -302,6 +306,7 @@ def test_staged_snapshot_is_the_engine_mark_not_the_form_value(workspace, monkey
         portfolio_value=100000.0,
         data_provider=PROVIDER,
         refresh_data=False,
+        cash=0.0,  # (LV1-TIMEBASE) same-instant cash: see the test above
     )
 
     run_dir = _flag(captured[0], "--output-dir")
@@ -330,9 +335,12 @@ def test_cash_is_taken_from_the_previous_rounds_measured_residual(workspace):
         strategy_file=_strategy_file(workspace), custom_symbols=["AAA"]
     )
 
-    cash, origin = svc._archived_cash_for(AS_OF, strat_key, univ_key)
+    cash, cash_as_of, origin = svc._archived_cash_for(AS_OF, strat_key, univ_key)
 
     assert cash == pytest.approx(250.0)
+    # (LV1-TIMEBASE) the cash's OWN session travels with it -- the equity leg is marked at
+    # `AS_OF`, so callers must be able to tell a same-instant residual from yesterday's.
+    assert cash_as_of == "2026-01-05"
     assert origin and origin.endswith("summary.json")
 
 
@@ -348,7 +356,7 @@ def test_an_unmeasured_cash_is_never_recycled_as_zero(workspace):
         strategy_file=_strategy_file(workspace), custom_symbols=["AAA"]
     )
 
-    assert svc._archived_cash_for(AS_OF, strat_key, univ_key) == (None, None)
+    assert svc._archived_cash_for(AS_OF, strat_key, univ_key) == (None, None, None)
 
 
 def test_a_future_rounds_cash_is_not_borrowed(workspace):
@@ -359,7 +367,7 @@ def test_a_future_rounds_cash_is_not_borrowed(workspace):
         strategy_file=_strategy_file(workspace), custom_symbols=["AAA"]
     )
 
-    assert svc._archived_cash_for(AS_OF, strat_key, univ_key) == (None, None)
+    assert svc._archived_cash_for(AS_OF, strat_key, univ_key) == (None, None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +434,7 @@ def test_held_book_is_refreshed_before_the_snapshot_is_marked(workspace, monkeyp
         as_of_date=AS_OF,
         data_provider=PROVIDER,
         refresh_data=True,
+        cash=0.0,  # (LV1-TIMEBASE) same-instant cash; the archive's is from 2026-01-05
     )
 
     # (1) The refresh runs FIRST, on the HELD BOOK, for the valuation date.

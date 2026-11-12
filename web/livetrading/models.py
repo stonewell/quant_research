@@ -92,6 +92,15 @@ class RunHealthRequest(BaseModel):
     data_provider: Optional[str] = None
     allow_intraday: bool = Field(True, description="Allow running during intraday/lunch sessions using latest published session")
     refresh_data: bool = Field(True, description="Refresh market data before Stage 1 starts")
+    #: (LV1-TIMEBASE) The operator's CURRENT cash balance, used ONLY to mark the pre-staged
+    #: valuation snapshot at one instant. Without it the staging path has no same-session
+    #: cash and must NOT combine today's equity with a previous session's residual, so it
+    #: publishes `nav_effective=None` and the gate degrades to UNKNOWN. Must be forwarded
+    #: explicitly by the route -- an unlisted model field is silently dropped.
+    cash: Optional[float] = Field(
+        None,
+        description="现金余额（用于预置快照的同口径计价）；留空则拒绝跨时点拼装净值",
+    )
 
 
 class RunDeployRequest(BaseModel):
