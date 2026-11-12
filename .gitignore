@@ -3,6 +3,11 @@ __pycache__/
 *.pyc
 **/data/*.csv
 **/data/*.duckdb*
+# Diagnostic backups written by scripts/repair_*.py under data/repair_backups/<ts>/
+# (JSON row exports + a pre-repair DB byte copy). Derived repair evidence, never an
+# input, and NOT covered by the sibling `*.duckdb*` rule above -- that pattern only
+# matches files sitting directly inside a `data/` dir, not a nested backup tree.
+**/data/repair_backups/
 **/results/*.png
 **/results/*.csv
 **/results/*.json
