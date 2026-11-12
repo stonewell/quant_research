@@ -76,6 +76,26 @@ _UNDECLARED_BASIS = "unknown"
 #: zero" is not a meaningful claim, and two genuinely-zero values compare exactly equal anyway.
 _HISTORY_REWRITE_RTOL = 1e-9
 
+#: Read-side plausibility band for the `adjust_factors.factor_hfq` values a read APPLIES (D9,
+#: docs/development_plan.md).
+#:
+#: Why 4x: a backward (HFQ) factor is a cumulative product of corporate actions, so it only ever
+#: walks UP, one step per split / bonus issue / dividend. Inside one read's applied segment the
+#: factors live on ONE basis, and the steps a real action produces are percent-level (the largest
+#: single sessions observed in this cache are ~1.3x, e.g. a 10-for-3 bonus). 4x against the median
+#: therefore leaves an enormous margin for a genuinely split-heavy name while still catching a
+#: value that cannot belong to the same series at all: the D9 incident stamped
+#: `600660.SH / 2026-09-24 / 81.588562` into a series whose neighbours were 1.2452-1.3895, i.e.
+#: a 58.7x deviation from the median. The band is symmetric because an as-of lookup can just as
+#: well see a *too small* factor (a foreign window's anchor) and divide by it.
+#:
+#: Scope (D9 follow-up): the sample is the distinct as-of hits of THIS read plus, in `qfq` mode,
+#: the normalisation anchor -- NOT the symbol's whole stored history. `query_adjust_factors` has
+#: no `start` filter, so a foreign 1993-2023 prefix would otherwise fail every 2024+ read of a
+#: symbol whose applied segment is perfectly consistent.
+IMPLAUSIBLE_ADJUST_FACTOR_RATIO = 4.0
+IMPLAUSIBLE_ADJUST_FACTOR_MIN_RATIO = 0.25
+
 #: Intraday interval -> bar length in minutes. This is the single source of both
 #: `_INTRADAY_INTERVALS` (what counts as intraday at all) and `_intraday_bar_interval`
 #: (how much tolerance the L2.26 session-reachability check allows), so the two can
@@ -101,6 +121,103 @@ class MissingAdjustFactorsError(RuntimeError):
             msg
             or f"Missing adjustment factors for non-neutral symbol '{symbol}'. Cannot derive adjusted prices from raw bars."
         )
+
+
+class ImplausibleAdjustFactorStep(RuntimeError):
+    """A read found an APPLIED `adjust_factors.factor_hfq` that cannot belong to its own series.
+
+    D9 (docs/development_plan.md): `adjust_factors` is keyed on `(symbol, date)` only, while the
+    table carries a `source` column. Two writers use two different normalisation bases for the
+    same symbol (Fuyao anchors at its window start, BaoStock accumulates from the IPO), so a
+    sparse BaoStock event row that lands on a date already covered by the dense Fuyao series
+    *replaces* the dense row (`INSERT OR REPLACE`). The surviving value is 58.7x its neighbours,
+    which is not a corporate action but a different unit, and applying it silently rescales every
+    bar of that session (the incident turned a 52.47 qfq close into 3080.96 and moved `sma_50`
+    from 54.21 to 114.75).
+
+    The band is judged on the factor values the read ACTUALLY applies (as-of hits + the `qfq`
+    anchor), never on the symbol's whole stored history: an old foreign-basis prefix that the
+    requested window does not touch is the repair script's business, not a read failure (D9
+    follow-up -- banding the full array made every 2024+ read of `600660.SH` raise). So this
+    exception means "a value that reached a price is off its own series by 4x", and it is
+    deliberately a hard failure rather than a warning: a wrong multiplier on the hot read path
+    propagates into breadth / exposure / dividend flags with no other visible trace.
+    """
+
+    def __init__(
+        self,
+        symbol: str,
+        date: Any,
+        value: float,
+        median: float,
+        *,
+        source: Optional[str] = None,
+        n_offending: int = 1,
+        n_factors: Optional[int] = None,
+        bar_window: Optional[str] = None,
+    ):
+        self.symbol = symbol
+        self.date = date
+        self.value = float(value)
+        self.median = float(median)
+        self.source = source
+        self.n_offending = int(n_offending)
+        self.n_factors = n_factors
+        #: Requested bar range that hit the offending factor, e.g. ``"2024-09-02..2026-09-30"``.
+        self.bar_window = bar_window
+        ratio = self.value / self.median if self.median else float("nan")
+        source_label = "unknown" if source is None else repr(source)
+        extra = "" if n_offending <= 1 else f", {n_offending} implausible applied value(s)"
+        hit_bars = "" if bar_window is None else f"\n  hit bars: {bar_window}"
+        super().__init__(
+            f"Implausible adjustment factor for {symbol!r} on {date}: factor_hfq="
+            f"{self.value!r} is {ratio:.2f}x the median {self.median!r} of the "
+            f"{'applied' if n_factors is None else n_factors} distinct factor(s) this read "
+            f"applies (allowed band {IMPLAUSIBLE_ADJUST_FACTOR_MIN_RATIO}-"
+            f"{IMPLAUSIBLE_ADJUST_FACTOR_RATIO}x), source={source_label}{extra}."
+            f"{hit_bars}\n"
+            f"  This is the signature of two normalisation bases in one symbol's "
+            f"`adjust_factors` rows (the D9 cross-source overwrite), not of a corporate "
+            f"action: a real split/bonus/dividend moves the factor by percent-level steps.\n"
+            f"  Remedy: `python scripts/repair_cross_source_adjust_factors.py "
+            f"--symbol {symbol} --dry-run` lists the foreign-source rows (dry-run is the "
+            f"default; `--apply` writes a JSON backup before deleting), then re-pull the "
+            f"symbol from a single source."
+        )
+
+
+class CrossSourceAdjustFactorRefused(UserWarning):
+    """An `adjust_factors` write was refused because it would mix two normalisation bases.
+
+    Emitted (and then the batch is skipped -- never raised) by
+    `DuckDBCache.store_adjust_factors`, mirroring `scripts/sync_china_5m_and_indices.py`'s
+    `QfqRebaseWarning` contract: the caller is told, everything else keeps running, and nothing
+    is written. The message starts with a fixed prefix so a sync log can be grepped for it.
+    """
+
+    #: Greppable prefix -- every message this class carries starts with it.
+    PREFIX = "[REFUSED] cross-source adjust-factor write"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        symbol: Optional[str] = None,
+        stored_source: Optional[str] = None,
+        stored_rows: Optional[int] = None,
+        incoming_source: Optional[str] = None,
+        refused_dates: int = 0,
+        batch_dates: int = 0,
+        examples: Any = (),
+    ):
+        super().__init__(message)
+        self.symbol = symbol
+        self.stored_source = stored_source
+        self.stored_rows = stored_rows
+        self.incoming_source = incoming_source
+        self.refused_dates = refused_dates
+        self.batch_dates = batch_dates
+        self.examples = tuple(examples)
 
 
 class UnknownAdjustBasisError(RuntimeError):
@@ -290,6 +407,21 @@ def is_legacy_basis_unknown(raw: Any) -> bool:
     that no basis was declared, so it is not part of the legacy-migration population.
     """
     return raw is None
+
+
+def _source_at(fac_df: pd.DataFrame, position: int) -> Optional[str]:
+    """`source` of the factor row at ``position`` (``None`` when the column is absent/NULL).
+
+    Used only on the cold `ImplausibleAdjustFactorStep` path, so the defensive shape costs
+    nothing on the read hot path.
+    """
+    if "source" not in fac_df.columns:
+        return None
+    try:
+        value = fac_df["source"].iloc[position]
+    except (IndexError, KeyError):  # pragma: no cover - defensive
+        return None
+    return None if pd.isna(value) else str(value)
 
 
 def _day_keys(index: Any) -> np.ndarray:
@@ -2702,8 +2834,39 @@ class DuckDBCache:
         df: pd.DataFrame,
         source: str = "baostock",
         sync_time: Optional[datetime.datetime] = None,
+        allow_cross_source: bool = False,
     ) -> None:
-        """Stores or updates daily backward adjustment factors in adjust_factors table."""
+        """Stores or updates daily backward adjustment factors in adjust_factors table.
+
+        ONE SOURCE PER SYMBOL (D9, `docs/development_plan.md`). The table is keyed on
+        `(symbol, date)` while it also stores `source`, so `INSERT OR REPLACE` lets a writer whose
+        factors are normalised on a DIFFERENT basis silently destroy the other source's rows.
+        That is the D9 incident: `scripts/sync_china_5m_and_indices.py` writes BaoStock's sparse
+        event rows (cumulative from the IPO: `600660.SH` reaches 81.588562 by 2026-09-24) into a
+        symbol whose dense daily rows come from Fuyao (2024-anchored: 1.2452-1.3895). The
+        surviving row is 58.7x its neighbours, and applying it rescaled that session's qfq close
+        from 52.47 to 3080.96.
+
+        So a batch whose `source` differs from a source already holding rows *inside the same
+        date interval* is refused as a whole: nothing is written, a
+        `CrossSourceAdjustFactorRefused` warning names the clash, and the call returns
+        normally -- a sync must be able to finish (the alternative, raising, would abort the
+        remaining symbols of a scheduled run).
+
+        The refusal is limited to DATE OVERLAP on purpose. A legitimate writer that extends an
+        already-mixed symbol *past* a foreign source's window (the everyday Fuyao incremental
+        sync on a symbol whose old BaoStock prefix ends in 2023) must keep working; refusing
+        that would freeze factor updates on every legacy-mixed symbol. Overlapping or
+        interleaving -- the only shapes that can overwrite or interleave bases -- are refused.
+
+        `allow_cross_source=True` is the audited escape hatch for a tool that has verified both
+        series share a basis (or that the overwrite is intended).
+
+        The schema is deliberately NOT changed (no `source` in the primary key, no migration):
+        the read path already anchors QFQ on exactly one value
+        (`get_latest_factor_hfq` over the whole table), and `_apply_factors_to_df` keeps a
+        plausibility band as the second line of defence for rows written before this gate.
+        """
         if df is None or df.empty:
             return
 
@@ -2752,6 +2915,14 @@ class DuckDBCache:
 
         con = self._get_connection(read_only=False)
         try:
+            refusal = (
+                None
+                if allow_cross_source
+                else self._cross_source_conflict(con, symbol, source, records)
+            )
+            if refusal is not None:
+                warnings.warn(refusal, CrossSourceAdjustFactorRefused, stacklevel=3)
+                return
             con.register("temp_factors_to_insert", records)
             con.execute("""
                 INSERT OR REPLACE INTO adjust_factors (symbol, date, factor_hfq, source, last_sync_time)
@@ -2761,6 +2932,115 @@ class DuckDBCache:
         finally:
             if not self.is_memory:
                 con.close()
+
+    def _cross_source_conflict(
+        self,
+        con,
+        symbol: str,
+        source: str,
+        records: pd.DataFrame,
+    ) -> Optional["CrossSourceAdjustFactorRefused"]:
+        """Build the D9 refusal warning, or `None` when this batch may be written.
+
+        A conflict exists when the symbol already holds rows from a DIFFERENT `source` and at
+        least one date of the incoming batch falls inside that source's covered interval
+        `[min(date), max(date)]`. Inside the interval is the load-bearing word: the primary key
+        is `(symbol, date)`, so only an overlapping batch can destroy a row, and only an
+        interleaved one can put two normalisation bases into a single as-of sequence. A batch
+        that continues the series outside the foreign window (the everyday Fuyao incremental
+        sync on a symbol carrying an old BaoStock prefix) is allowed -- see
+        `store_adjust_factors`' docstring for why that exemption is not a loophole.
+
+        `source IS NULL` rows are ignored: a NULL records no basis claim at all (every writer in
+        this repo passes a real source), so it cannot prove a clash.
+        """
+        existing = con.execute(
+            "SELECT source, count(*), min(date), max(date) FROM adjust_factors "
+            "WHERE symbol = ? AND source IS NOT NULL GROUP BY source",
+            [symbol],
+        ).fetchall()
+        foreign = [r for r in existing if r[0] != source]
+        if not foreign:
+            return None
+
+        incoming_dates = pd.to_datetime(pd.Series(records["date"])).dt.date
+        incoming = pd.Series(sorted(set(incoming_dates)))
+
+        hits: List[Tuple[str, int, Dict[Any, float], Any, Tuple[Any, Any]]] = []
+        for f_source, f_count, f_min, f_max in foreign:
+            inside = incoming[(incoming >= f_min) & (incoming <= f_max)]
+            if inside.empty:
+                continue
+            stored = con.execute(
+                "SELECT date, factor_hfq FROM adjust_factors "
+                f"WHERE symbol = ? AND source = ? AND date BETWEEN ? AND ?",
+                [symbol, f_source, f_min, f_max],
+            ).fetchall()
+            stored_map = {
+                (d if isinstance(d, datetime.date) else d.date()): float(v)
+                for d, v in stored
+            }
+            hits.append((f_source, int(f_count), stored_map, inside, (f_min, f_max)))
+        if not hits:
+            return None
+
+        f_source, f_count, stored_map, inside, (f_min, f_max) = max(
+            hits, key=lambda h: len(h[3])
+        )
+        clash_dates = list(inside.tolist())
+        incoming_by_day = {
+            (d if isinstance(d, datetime.date) else pd.Timestamp(d).date()): float(v)
+            for d, v in zip(pd.to_datetime(records["date"]).dt.date, records["factor_hfq"])
+        }
+        # Examples prefer real collisions (a stored row at that very date) -- those are the rows
+        # the D9 bug would have overwritten, so the operator sees both sides of the clash.
+        collisions = [d for d in clash_dates if d in stored_map]
+        examples = []
+        for d in (collisions or clash_dates)[:2]:
+            examples.append(
+                {
+                    "date": d.isoformat(),
+                    "stored": stored_map.get(d),
+                    "incoming": incoming_by_day[d],
+                    "collision": d in stored_map,
+                }
+            )
+
+        lines = [
+            f"{CrossSourceAdjustFactorRefused.PREFIX} for {symbol!r}: "
+            f"{f_count} row(s) from {f_source!r} are already stored "
+            f"({f_min.isoformat()}..{f_max.isoformat()}), and this batch is stamped "
+            f"{source!r}. {len(clash_dates)} of {len(incoming)} date(s) in the batch fall "
+            f"inside that interval and would be written on a different normalisation basis "
+            f"(the key is (symbol, date), so an existing row would be REPLACED). "
+            f"Nothing was written.",            "  examples: "
+            + "; ".join(
+                f"{e['date']} "
+                + (
+                    f"stored={e['stored']!r} ({f_source}) -> incoming={e['incoming']!r}"
+                    if e["stored"] is not None
+                    else f"incoming={e['incoming']!r} (no stored row; interleaves the "
+                    f"{f_source} series)"
+                )
+                for e in examples
+            ),
+            "  Remedy: one source per symbol. List the foreign rows with "
+            "`python scripts/repair_cross_source_adjust_factors.py --symbol "
+            f"{symbol} --dry-run` (dry-run is the default; `--apply` writes a JSON backup "
+            "first), then re-pull the symbol from a single source. Pass "
+            "`allow_cross_source=True` only for a tool that has verified both series share "
+            "a basis.",
+        ]
+        return CrossSourceAdjustFactorRefused(
+            "\n".join(lines),
+            symbol=symbol,
+            stored_source=f_source,
+            stored_rows=f_count,
+            incoming_source=source,
+            refused_dates=len(clash_dates),
+            batch_dates=len(incoming),
+            examples=examples,
+        )
 
     def get_latest_factor_hfq(self, symbol: str) -> Optional[float]:
         """Returns the latest factor_hfq across the entire adjust_factors table for symbol."""
@@ -2807,6 +3087,117 @@ class DuckDBCache:
         res_df = res_df.set_index("date").sort_index()
         res_df.index.name = "date"
         return res_df
+
+    def _assert_plausible_adjust_factors(
+        self,
+        symbol: str,
+        fac_df: pd.DataFrame,
+        event_hfq: np.ndarray,
+        pos: np.ndarray,
+        divisor: float,
+        mode: str,
+        bar_index: pd.Index,
+    ) -> None:
+        """Second line of defence for D9: refuse an APPLIED factor that cannot belong to its series.
+
+        WHAT IS GUARANTEED (and what is not). The band is computed over the factor values this
+        read actually multiplies into prices -- the distinct as-of hits `hfq_t[pos >= 0]`, plus,
+        in `qfq` mode, the normalisation anchor `hfq_latest` (it divides every bar). It therefore
+        guarantees "the segment of the series that reached the prices is single-magnitude". It
+        does NOT guarantee "the `adjust_factors` table holds no foreign-basis rows": a symbol may
+        legitimately carry an old prefix that the requested window never touches, and judging the
+        whole array would fail every modern read of such a symbol (D9 follow-up: `600660.SH`'s
+        1993-2023 BaoStock prefix made every 2024+ read raise, including the live breadth path --
+        a wrong error replacing a wrong price). Cleaning the table is
+        `scripts/repair_cross_source_adjust_factors.py`'s job, not the read path's.
+
+        The write gate (`store_adjust_factors`) stops NEW cross-source overwrites, but rows
+        polluted before that gate existed are already on disk, and `allow_cross_source=True`
+        can produce them again. Applying such a row is silent otherwise: `qfq = raw *
+        hfq[t]/hfq[latest]` turns `600660.SH`'s 52.47 close on 2026-09-24 into 3080.96, and the
+        only downstream trace is a breadth / target-exposure / dividend-flag shift.
+
+        The test is deliberately coarse -- median-relative, scale only -- because the legitimate
+        signal (a monotone step per corporate action) and the defect (a value in a different
+        UNIT) differ by orders of magnitude. See `IMPLAUSIBLE_ADJUST_FACTOR_RATIO` for why the
+        band is 4x.
+        """
+        # Distinct values this read applies. A dict keyed on the VALUE (not the position) makes the
+        # sample a set: one factor row typically serves hundreds of bars, and duplicates would
+        # bias the median towards the length of their run. Event rows win over the `-1` anchor
+        # marker so a poisoned latest row is reported by its own date, not as "the anchor".
+        applied: Dict[float, int] = {}
+        for i in np.unique(pos[pos >= 0]):
+            applied.setdefault(float(event_hfq[i]), int(i))
+        if mode == "qfq" and applied and divisor > 0:
+            applied.setdefault(float(divisor), -1)
+
+        if not applied:  # every bar precedes the first factor row -> nothing is applied
+            return
+        values = np.asarray(sorted(applied), dtype=float)
+        sample_positions = [applied[v] for v in values]
+        positive_mask = values > 0
+        if not positive_mask.any():
+            return
+        positive = values[positive_mask]
+        median = float(np.median(positive))
+        if not np.isfinite(median) or median <= 0:
+            return
+        ratio = positive / median
+        bad = np.flatnonzero(
+            (ratio > IMPLAUSIBLE_ADJUST_FACTOR_RATIO)
+            | (ratio < IMPLAUSIBLE_ADJUST_FACTOR_MIN_RATIO)
+        )
+        if bad.size == 0:
+            return
+
+        # Report the worst offender, preferring the TOO-LARGE side: the D9 signature is a foreign
+        # basis pasted in, which is always the larger number. When only the small side is out of
+        # band (the whole applied segment sits above one small foreign anchor) that is reported
+        # instead. Either way the operator gets a date they can find in the repair dry-run.
+        pos_positive = np.flatnonzero(positive_mask)
+        bad_ratios = ratio[bad]
+        worst_local = int(
+            bad[int(np.argmax(bad_ratios))] if (bad_ratios > 1).any() else bad[int(np.argmin(bad_ratios))]
+        )
+        worst = pos_positive[worst_local]
+        origin = sample_positions[worst]
+        if origin >= 0:
+            date = pd.Timestamp(fac_df.index[origin]).date().isoformat()
+            source = _source_at(fac_df, origin)
+        else:
+            # The anchor is the table's latest row, which may lie AFTER this window's `end`.
+            row = self._get_connection(read_only=True)
+            try:
+                latest = row.execute(
+                    "SELECT date, source FROM adjust_factors WHERE symbol = ? "
+                    "ORDER BY date DESC LIMIT 1",
+                    [symbol],
+                ).fetchone()
+            finally:
+                if not self.is_memory:
+                    row.close()
+            date = (
+                "the qfq anchor"
+                if latest is None
+                else (latest[0] if isinstance(latest[0], str) else latest[0].isoformat())
+                + " (qfq anchor, latest factor row)"
+            )
+            source = None if latest is None else latest[1]
+
+        bars = pd.Timestamp(bar_index.min()).date().isoformat() + ".." + pd.Timestamp(
+            bar_index.max()
+        ).date().isoformat()
+        raise ImplausibleAdjustFactorStep(
+            symbol,
+            date,
+            values[worst],
+            median,
+            source=source,
+            n_offending=int(bad.size),
+            n_factors=int(positive.size),
+            bar_window=bars,
+        )
 
     def _resolve_read_basis(
         self,
@@ -3005,6 +3396,15 @@ class DuckDBCache:
         hfq_t = np.where(pos >= 0, event_hfq[np.clip(pos, 0, None)], 1.0)
 
         divisor = hfq_latest if (hfq_latest is not None and hfq_latest > 0) else 1.0
+        # Judged on the factors this read actually APPLIES (D9 follow-up): `query_adjust_factors`
+        # has no `start` filter, so `event_hfq` carries the symbol's whole history including a
+        # foreign-basis prefix the requested window never touches. Banding the raw array turned
+        # every 2024+ read of `600660.SH` into `ImplausibleAdjustFactorStep` even though the
+        # prices being scaled were all dense-basis -- a wrong error replacing a wrong price.
+        self._assert_plausible_adjust_factors(
+            symbol, fac_df, event_hfq, pos, divisor, mode, out.index
+        )
+
         if mode == "hfq":
             applied_mults = hfq_t
         else:  # qfq
