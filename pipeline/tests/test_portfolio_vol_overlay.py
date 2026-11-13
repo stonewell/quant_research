@@ -46,9 +46,18 @@ WHAT IS PINNED HERE
    (never the product), and a Tier-3 halt that already zeroed the book is attributed to the
    breaker (`superseded_by_circuit_breaker`), never to the vol cap.
 
-100% offline: pandas Series only, no market data, no network, no filesystem.
+8. AT8 PROVENANCE (2026-11-12 defect): the ticket carried `vol_overlay.applied = true` while
+   `effective_params.json::params` held neither `cfsb_portfolio_vol_overlay_enabled` nor
+   `cfsb_portfolio_vol_overlay_mode`, so the "why was a cap on this round?" question could not
+   be answered from the snapshot. The two keys are now registered through the SAME resolver the
+   run executes, with honest `source` labels, and a NON-allowlisted strategy records them too
+   (`enabled=False`, `mode="off"`, `source="default"`) so the snapshot also explains absence.
+
+100% offline: pandas Series only, no market data, no network, no filesystem (the one `main()`
+test uses the synthetic provider and a pinned past session, like `test_effective_params.py`).
 """
 
+import json
 import os
 import sys
 
@@ -62,14 +71,24 @@ if _REPO_ROOT not in sys.path:
 from scripts.run_live_strategy import (  # noqa: E402
     PORTFOLIO_VOL_OVERLAY_MODE_OFF,
     VOL_OVERLAY_DELIVERY_SHORTFALL_RATIO,
+    VOL_OVERLAY_ENABLED_PARAM,
+    VOL_OVERLAY_MODE_PARAM,
     VOL_OVERLAY_SUPERSEDED_BY_CIRCUIT_BREAKER,
     VOL_OVERLAY_UNAVAILABLE_REASON,
     apply_portfolio_vol_ceiling,
     apply_portfolio_vol_overlay_for_strategy,
     evaluate_vol_overlay_delivery,
     format_vol_overlay_delivery_warning,
+    record_portfolio_vol_overlay_effective_params,
     resolve_portfolio_vol_overlay_params,
+    resolve_portfolio_vol_overlay_provenance,
     resolve_stage1_vol_inputs,
+)
+from common.effective_params import (  # noqa: E402
+    SOURCE_DEFAULT,
+    SOURCE_DUMP,
+    SOURCE_OVERRIDE,
+    build_effective_params,
 )
 
 CASH = "BIL"
@@ -510,3 +529,169 @@ def test_main_runs_the_cap_after_the_stage1_defenses():
     assert linear_scale < overlay_call
     assert tier3_zero < overlay_call
     assert "superseded_by=circuit_breaker_superseded" in source[overlay_call:overlay_call + 400]
+
+
+# ---------------------------------------------------------------------------
+# 8. AT8 PROVENANCE -- the snapshot must be able to explain the cap
+# ---------------------------------------------------------------------------
+
+
+def _entries(strategy_key="chan_four_state_blend", params=None, **kwargs):
+    entries = {}
+    provenance = record_portfolio_vol_overlay_effective_params(
+        entries, params or {}, strategy_key, **kwargs
+    )
+    return entries, provenance
+
+
+def test_allowlisted_strategy_registers_both_overlay_keys_with_config_source():
+    """The observed defect: `vol_overlay.applied` was true with NO overlay key in `params`.
+
+    The dump DECLARES both keys, so the honest source is the config origin (a
+    `strategies_config.json` entry or a dump file -- `SOURCE_DUMP` here, matching the caller's
+    `_effective_params_config_origin`).
+    """
+    declared = _params(enabled=True, mode="cap")
+    entries, provenance = _entries(params=declared, config_origin=SOURCE_DUMP)
+
+    assert set(entries) == {VOL_OVERLAY_ENABLED_PARAM, VOL_OVERLAY_MODE_PARAM}
+    assert entries[VOL_OVERLAY_ENABLED_PARAM] == {
+        "declared": True,
+        "resolved": True,
+        "source": SOURCE_DUMP,
+    }
+    assert entries[VOL_OVERLAY_MODE_PARAM] == {
+        "declared": "cap",
+        "resolved": "cap",
+        "source": SOURCE_DUMP,
+    }
+    assert provenance["allowlisted"] is True
+
+    # ... and the two keys survive the projection into the real artifact payload.
+    payload = build_effective_params(
+        strategy_id="chan_four_state_blend",
+        strategy_version="1.6.0",
+        base_version="1.1.0",
+        config_source="strategies_config.json:chan_four_state_blend",
+        strategy_dump_sha256="0" * 64,
+        as_of="2026-11-12",
+        run_id="2026-11-12_163000",
+        params=entries,
+    )
+    assert payload["params"][VOL_OVERLAY_ENABLED_PARAM]["resolved"] is True
+    assert payload["params"][VOL_OVERLAY_MODE_PARAM]["resolved"] == "cap"
+    assert payload["params"][VOL_OVERLAY_ENABLED_PARAM]["source"] == SOURCE_DUMP
+
+
+def test_allowlisted_strategy_without_declared_keys_reports_default_and_enabled():
+    """A dump predating the wiring resolves ENABLED (user requirement) and says `default`.
+
+    `declared` must stay literal `None` -- "the strategy never wrote this" is different from
+    "the strategy wrote false", and only the latter may be read as an opt-out.
+    """
+    entries, provenance = _entries(params={}, config_origin=SOURCE_DUMP)
+
+    assert entries[VOL_OVERLAY_ENABLED_PARAM] == {
+        "declared": None,
+        "resolved": True,
+        "source": SOURCE_DEFAULT,
+    }
+    assert entries[VOL_OVERLAY_MODE_PARAM] == {
+        "declared": None,
+        "resolved": "cap",
+        "source": SOURCE_DEFAULT,
+    }
+    assert provenance["enabled"] is True and provenance["mode"] == "cap"
+
+
+def test_non_allowlisted_strategy_still_registers_keys_as_disabled_default():
+    """Non-allowlisted: keys exist, `enabled=False`, and the ignored declaration stays visible."""
+    entries, provenance = _entries(
+        strategy_key="chan_risk_managed_blend",
+        params=_params(enabled=True, mode="cap"),
+        config_origin=SOURCE_DUMP,
+    )
+
+    assert entries[VOL_OVERLAY_ENABLED_PARAM] == {
+        "declared": True,          # the dump asked for it ...
+        "resolved": False,         # ... and the allowlist gate is why it is off
+        "source": SOURCE_DEFAULT,  # the effective value is the gate's default, not the dump's
+    }
+    assert entries[VOL_OVERLAY_MODE_PARAM] == {
+        "declared": "cap",
+        "resolved": "off",
+        "source": SOURCE_DEFAULT,
+    }
+    assert provenance["allowlisted"] is False
+
+
+def test_cli_override_is_reported_as_override_only_for_an_allowlisted_strategy():
+    entries, _ = _entries(
+        params=_params(enabled=False, mode="off"),
+        config_origin=SOURCE_DUMP,
+        cli_override=True,
+    )
+    assert entries[VOL_OVERLAY_ENABLED_PARAM]["source"] == SOURCE_OVERRIDE
+    assert entries[VOL_OVERLAY_MODE_PARAM]["source"] == SOURCE_OVERRIDE
+
+    # An override flag must NOT launder a non-allowlisted strategy into "override".
+    blocked, _ = _entries(
+        strategy_key="turtle_breakout", params=_params(), cli_override=True
+    )
+    assert blocked[VOL_OVERLAY_ENABLED_PARAM]["source"] == SOURCE_DEFAULT
+
+
+def test_provenance_never_disagrees_with_the_resolver_it_projects():
+    """One source of truth: provenance delegates to `resolve_portfolio_vol_overlay_params`."""
+    cases = [
+        ("chan_four_state_blend", {}),
+        ("chan_four_state_blend", {"cfsb_portfolio_vol_overlay_enabled": "false"}),
+        ("chan_four_state_blend", {"cfsb_portfolio_vol_overlay_mode": "multiply"}),
+        ("chan_four_state_blend", {"portfolio_vol_overlay_mode": "off"}),
+        ("chan_risk_managed_blend", _params()),
+    ]
+    for key, params in cases:
+        provenance = resolve_portfolio_vol_overlay_provenance(key, params)
+        assert (provenance["enabled"], provenance["mode"]) == (
+            resolve_portfolio_vol_overlay_params(key, params)
+        )
+
+
+def test_main_writes_the_two_overlay_keys_into_effective_params(tmp_path, monkeypatch):
+    """End-to-end on the real `main()`: an offline static template (non-allowlisted)."""
+    import scripts.run_live_strategy as runner
+
+    strategy_file = tmp_path / "strategy.json"
+    strategy_file.write_text(
+        json.dumps({"template_name": "equal_weight", "params": {}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    out_dir = tmp_path / "run"
+
+    monkeypatch.delenv("LIVETRADING_PREFER_INSTANCE_STATE", raising=False)
+    runner.main(
+        [
+            "--strategy-file",
+            str(strategy_file),
+            "--data-provider",
+            "synthetic",
+            "--as-of-date",
+            "2026-11-06",
+            "--output-dir",
+            str(out_dir),
+        ]
+    )
+
+    artifact = out_dir / "effective_params.json"
+    assert artifact.is_file()
+    params = json.loads(artifact.read_text(encoding="utf-8"))["params"]
+    assert VOL_OVERLAY_ENABLED_PARAM in params
+    assert VOL_OVERLAY_MODE_PARAM in params
+    # equal_weight is off the allowlist -> recorded as an explicit, explained absence.
+    assert params[VOL_OVERLAY_ENABLED_PARAM] == {
+        "declared": None,
+        "resolved": False,
+        "source": SOURCE_DEFAULT,
+    }
+    assert params[VOL_OVERLAY_MODE_PARAM]["resolved"] == PORTFOLIO_VOL_OVERLAY_MODE_OFF
+    assert params[VOL_OVERLAY_MODE_PARAM]["source"] == SOURCE_DEFAULT

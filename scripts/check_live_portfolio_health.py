@@ -87,7 +87,10 @@ from pipeline.live_signal.lsig.signal import as_of_universe
 from scripts.live_paths import DEFAULT_STRATEGY_KEY, default_live_output_dir
 from scripts.live_preflight import (
     LiveDumpPreflightError,
+    detect_state_version_clobber,
+    stamp_account_state_version,
     verify_live_strategy_dump_preflight,
+    version_triple_from_strategy_def,
 )
 
 def _resolve_path(p: Optional[str]) -> Optional[str]:
@@ -1030,11 +1033,14 @@ def attach_nav_provenance(dd_info: Dict[str, Any], nav_resolution: Dict[str, Any
     numeric fields are copied into `account_state.json`, so the provenance has to
     travel with it -- a log line alone would be invisible to every consumer.
 
-    On a degraded run the tier ENUM is deliberately left untouched (Stage 2 compares
-    `circuit_breaker_tier == "TIER_3_HALT"`, and inventing a new enum value there would
-    silently change order behaviour), but `tier_status` becomes `UNKNOWN` and the
-    human label stops claiming a passing verdict: missing NAV must never be readable
-    as "breaker not triggered".
+    (2026-11-12 defect A) On a degraded run the tier enum is now ALSO written as
+    `UNKNOWN`. Previously it kept the placeholder's `"NORMAL"` while
+    `account_state.circuit_breaker_tier` became `"UNKNOWN"`, so the two archives
+    contradicted each other and Stage 2's top-level `circuit_breaker_tier` read (or the
+    placeholder `"NORMAL"`, or nothing) looked like an evaluated, passing breaker.
+    `tier_status` / `nav_breaker_evaluated` carry the same verdict, and the human label
+    keeps its "UNKNOWN (NAV DEGRADED ...)" wording: missing NAV must never be readable as
+    "breaker not triggered". The measured branch is untouched.
     """
     for key in (
         "nav_source",
@@ -1072,6 +1078,11 @@ def attach_nav_provenance(dd_info: Dict[str, Any], nav_resolution: Dict[str, Any
             dd_info[key] = nav_resolution.get(key)
     if nav_resolution.get("nav_gate_nav") is None:
         dd_info["tier_status"] = "UNKNOWN"
+        # (2026-11-12 defect A) The tier enum must agree with `tier_status` and with
+        # `account_state.circuit_breaker_tier` ("UNKNOWN" on a degraded run). Leaving the
+        # placeholder "NORMAL" here made "report NORMAL / archive UNKNOWN" simultaneously
+        # true, and Stage 2's top-level read saw a passing-looking tier.
+        dd_info["tier"] = "UNKNOWN"
         dd_info["tier_label"] = (
             "⚪ UNKNOWN (NAV DEGRADED — 盯市净值不可用，熔断层级未判定；缺失 ≠ 未触发)"
         )
@@ -1080,6 +1091,19 @@ def attach_nav_provenance(dd_info: Dict[str, Any], nav_resolution: Dict[str, Any
         dd_info["tier_status"] = "EVALUATED"
         dd_info["nav_breaker_evaluated"] = True
     return dd_info
+
+
+def _round_version_triple(strategy_def: Any) -> Dict[str, Any]:
+    """This round's `strategy_version` / `base_version` / `strategy_version_info`.
+
+    (2026-11-12 seeding race) Stage 1 deliberately does NOT instantiate the live class
+    (`strategy_version_verified` stays False; see `strategy_info`), so the dump it already
+    loaded is the only engine version this stage legitimately knows. That is enough here:
+    the state this stage writes is TODAY's, and it must at least record THIS round's dump --
+    never the triple copied out of yesterday's snapshot. Cross-checking the dump against the
+    live class remains Stage 2's fail-closed job, before any ticket exists.
+    """
+    return version_triple_from_strategy_def(strategy_def)
 
 
 def build_account_state_update(
@@ -1092,6 +1116,7 @@ def build_account_state_update(
     intraday_5m_info: Optional[Dict[str, Any]] = None,
     prior_state: Any = None,
     prior_state_frozen_suspect: Optional[str] = None,
+    version_triple: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """The `account_state.json` delta one Stage-1 run persists (LV11 item 6).
 
@@ -1110,6 +1135,11 @@ def build_account_state_update(
       placeholder back pushes a form value into the HWM chain (the LV1 / LV7 defect).
     * **measured run**: byte-identical to the pre-LV11 behaviour (append the effective NAV,
       persist the tier the math actually produced).
+
+    (2026-11-12 seeding race) `version_triple` is the CURRENT round's triple
+    (`_round_version_triple(strategy_def)`); when supplied it is stamped onto the returned
+    state (top level only -- `prior_state` keeps the snapshot's own fields). Omitting it
+    keeps the previous output byte-identical, which is what every direct-call test relies on.
 
     (LV7, `docs/lv7_prior_state_contract.md` §2) `prior_state_frozen_suspect` is the
     REASON string returned by `detect_frozen_prior_state` (or `None`). A truthy value
@@ -1216,6 +1246,23 @@ def build_account_state_update(
         updated_state["nav_timebase_detail"] = dd_info.get("nav_timebase_detail")
         updated_state["nav_cash_leg_basis"] = dd_info.get("nav_cash_leg_basis")
         updated_state["nav_rejected_nav_effective"] = dd_info.get("nav_rejected_nav_effective")
+
+    # (2026-11-12 seeding race) THE ROUND'S OWN VERSION TRIPLE, stamped LAST and always.
+    #
+    # This function builds the state FOR `as_of_date`, and it starts from `dict(state)` --
+    # which, on the first run of a session, is the SEED copied out of the previous session's
+    # snapshot. Copying it also copied its `strategy_version` (2026-11-12: `1.2.2` while the
+    # live class was `1.3.0`), so the round's state was published claiming the OLD engine and
+    # Stage 2's parity gate refused the round -- a coin flip decided by whether the polluted
+    # file happened to be corrected between two same-day instances.
+    #
+    # `version_triple` therefore comes from THIS round's strategy dump (`strategy_info`), never
+    # from the carried state. `prior_state` keeps its own triple untouched: that block is the
+    # snapshot, and its version fields are evidence of which engine wrote it
+    # (`docs/lv7_prior_state_contract.md` §5.4). `None` keeps the legacy callers' output
+    # byte-identical (every direct-call test passes no triple).
+    if version_triple is not None:
+        stamp_account_state_version(updated_state, version_triple)
     return updated_state
 
 
@@ -3051,6 +3098,14 @@ def generate_reports(
         "gate_code": gate_code,
         "gate_headline": gate_headline,
         "portfolio_health": dd_info,
+        # (2026-11-12 defect A) TOP-LEVEL mirror of the breaker enum. Stage 2 reads
+        # `circuit_breaker_tier` at the report's top level (it also digs into
+        # `portfolio_health` since the same fix), and this key used to be absent entirely --
+        # so an older reader fell back to its own placeholder, or to a polluted
+        # `account_state.json`, and could see "NORMAL" while the gate verdict was UNKNOWN.
+        # Degraded runs now publish "UNKNOWN" here (see `attach_nav_provenance`); measured
+        # runs publish exactly the tier the drawdown math produced.
+        "circuit_breaker_tier": dd_info.get("tier"),
         "market_macro": macro_info,
         "volatility_targeting": vol_info,
         # (2026-10-22 incident, Fix 1) SCHEMA CHANGE, disclosed: when the intraday
@@ -4134,6 +4189,10 @@ def main(cli_args: Optional[List[str]] = None):
         # layer: the decision itself lives in `build_account_state_update`, which is a pure,
         # directly-tested function precisely because this block used to sit inline here and
         # every offline test bypassed `main()` (see its docstring for the two lies it fixed).
+        # (2026-11-12 seeding race) The triple for the state THIS round creates for
+        # `as_of_date`, taken from the strategy dump this run already loaded -- never
+        # inherited from `state`, which on the first run of a session is yesterday's copy.
+        _round_triple = _round_version_triple(strategy_def)
         updated_state = build_account_state_update(
             state,
             baseline_state,
@@ -4143,8 +4202,23 @@ def main(cli_args: Optional[List[str]] = None):
             intraday_5m_info=intraday_5m_info,
             prior_state=prior_state_to_preserve,
             prior_state_frozen_suspect=prior_state_frozen_reason,
+            version_triple=_round_triple,
         )
         save_account_state(args.account_state_file, updated_state)
+        # (2026-11-12 seeding race, requirement b) ASSERT WHAT LANDED. Stamping in memory is
+        # not proof of the file: a later write into the same path (a second seeding pass, a
+        # restarted stage, an operator edit) is exactly how the two 11-12 instances diverged.
+        # Re-read and refuse -- with the grep-able marker -- when the on-disk state claims THIS
+        # session with another engine's triple. Read-only: nothing is re-stamped here.
+        _landed = load_account_state(args.account_state_file)
+        _landed_clobber = detect_state_version_clobber(
+            _landed if isinstance(_landed, dict) else {},
+            _round_triple.get("strategy_version"),
+            _round_triple.get("base_version"),
+            as_of_date=as_of_date,
+        )
+        if _landed_clobber:
+            raise LiveDumpPreflightError(f"{_landed_clobber} `{args.account_state_file}`")
 
     # 7. Print Dashboard & Export Reports
     print_dashboard(

@@ -176,6 +176,7 @@ from scripts.live_preflight import (
     apply_prior_state_selection,
     assert_account_state_version_parity,
     assert_dump_version_parity,
+    assert_state_version_not_clobbered,
     derive_session_root,
     select_prior_state,
     verify_live_strategy_dump_preflight,
@@ -224,6 +225,229 @@ def degraded_gate_acknowledged() -> bool:
         "yes",
         "on",
     )
+
+
+#: (2026-11-12 defect A) `stage1_health_report.json` publishes the gate verdict INSIDE
+#: `portfolio_health` (`tier_status`, `nav_gate_status`, `nav_breaker_evaluated`,
+#: `nav_source`, ...), but `README`-era vintages only mirrored a subset at the top level and
+#: that top level could carry the placeholder `circuit_breaker_tier="NORMAL"`. The pre-fix
+#: reader looked ONLY at the top level, so `tier_status`/`nav_gate_status` were always
+#: `None` and the fail-closed branch leaned entirely on `account_state.json` -- which is
+#: itself carried over from the previous round (`web/livetrading/execution_service.py`),
+#: i.e. exactly the archive that can be stale-but-green.
+HEALTH_GATE_UNKNOWN_STATUS = "UNKNOWN"
+HEALTH_GATE_DEGRADED_NAV_STATUS = "DEGRADED_NAV_UNAVAILABLE"
+#: "More defensive" ordering used when the two archives disagree about the tier. A
+#: lower-severity tier may never override a higher-severity one; `"UNKNOWN"` outranks
+#: everything because an unevaluated breaker is not a passing breaker.
+HEALTH_GATE_TIER_SEVERITY: Dict[str, int] = {
+    "UNKNOWN": 100,
+    "TIER_3_HALT": 40,
+    "TIER_2_DEFENSIVE": 30,
+    "TIER_1_DAMPING": 20,
+    "CAUTION_RECOVERING": 10,
+    "NORMAL": 0,
+}
+
+
+def _gate_text(value: Any) -> Optional[str]:
+    """`value` as a stripped string, or `None` when absent/blank (never `"None"`)."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _gate_first_present(*values: Any) -> Any:
+    """First value that is not `None`. Unlike `a or b` this keeps a legitimate `0.0`."""
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _gate_keyed_provenance(gate: Dict[str, Any], key: str, *fallbacks: Any) -> Any:
+    """THIS round's gate value when the key exists (even as `None`), else the fallbacks.
+
+    A degraded report explicitly stores `nav_mtm: null`; falling back to a carried-over
+    numeric NAV in that case would print a marked-to-market value the gate refused to use.
+    """
+    if key in gate:
+        return gate.get(key)
+    return _gate_first_present(*fallbacks)
+
+
+def resolve_stage1_health_gate(
+    account_state: Optional[Dict[str, Any]],
+    health_report: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Resolve the Stage-1 gate verdict from BOTH archives, keeping the WORSE answer.
+
+    WHY BOTH: `stage1_health_report.json` is this round's measurement;
+    `account_state.json` is what the previous round persisted. Either can be the stale one,
+    and a green value in the stale one must not launder a degraded value in the other (the
+    2026-11-12 incident: the report said `tier_status=UNKNOWN` nested while the carried
+    account state said `EVALUATED`, and Stage 2 ordered anyway).
+
+    Resolution rules (deliberately additive -- nothing previously refused becomes allowed):
+      * `tier_status`     -- `UNKNOWN` if EITHER source has it; else `EVALUATED` if either does;
+      * `nav_gate_status` -- `DEGRADED_NAV_UNAVAILABLE` if either has it;
+      * `circuit_breaker_tier` -- max SEVERITY across `account_state`, the nested
+        `portfolio_health` block and the report's top-level mirror. A top-level placeholder
+        `"NORMAL"` therefore cannot outvote a nested `TIER_2_DEFENSIVE`, and when the gate is
+        known to be unevaluated the resolved tier is forced to `"UNKNOWN"` instead of the
+        placeholder "NORMAL";
+      * `nav_breaker_evaluated` -- `False` wins over `True`; a string-independent guard for
+        the same condition (a rewritten/renamed status string cannot hide it).
+
+    Pure dict-in/dict-out (no I/O) so the fail-closed decision is unit-testable offline.
+    """
+    acct = account_state if isinstance(account_state, dict) else {}
+    report = health_report if isinstance(health_report, dict) else {}
+    # The nested block is where Stage 1 actually writes the verdict; older/flat reports put
+    # it at the top level. Read both -- the top level is a fallback, never the only source.
+    _health_gate = report.get("portfolio_health")
+    if not isinstance(_health_gate, dict):
+        _health_gate = report
+    sources = (acct, _health_gate, report)
+
+    tier_statuses = [_gate_text(s.get("tier_status")) for s in sources]
+    nav_gate_statuses = [_gate_text(s.get("nav_gate_status")) for s in sources]
+
+    def _worse_status(values: List[Optional[str]], degraded: str) -> Optional[str]:
+        present = [v for v in values if v]
+        if any(v.upper() == degraded for v in present):
+            return degraded
+        return present[0] if present else None
+
+    tier_status = _worse_status(tier_statuses, HEALTH_GATE_UNKNOWN_STATUS)
+    nav_gate_status = _worse_status(nav_gate_statuses, HEALTH_GATE_DEGRADED_NAV_STATUS)
+
+    breaker_flags = [s.get("nav_breaker_evaluated") for s in sources]
+    if any(flag is False for flag in breaker_flags):
+        nav_breaker_evaluated: Optional[bool] = False
+    elif any(flag is True for flag in breaker_flags):
+        nav_breaker_evaluated = True
+    else:
+        nav_breaker_evaluated = None
+
+    tier_candidates = [
+        _gate_text(acct.get("circuit_breaker_tier")),
+        _gate_text(_health_gate.get("circuit_breaker_tier")),
+        _gate_text(_health_gate.get("tier")),
+        _gate_text(report.get("circuit_breaker_tier")),
+    ]
+    _known_tiers = [c for c in tier_candidates if c]
+    if (
+        tier_status == HEALTH_GATE_UNKNOWN_STATUS
+        or nav_breaker_evaluated is False
+        or any(c.upper() == HEALTH_GATE_UNKNOWN_STATUS for c in _known_tiers)
+    ):
+        # An unevaluated breaker is not a passing breaker -- never let the placeholder
+        # "NORMAL" (or a carried-over green tier) speak for it.
+        circuit_tier: Optional[str] = HEALTH_GATE_UNKNOWN_STATUS
+    elif _known_tiers:
+        circuit_tier = max(
+            _known_tiers,
+            key=lambda c: HEALTH_GATE_TIER_SEVERITY.get(c.upper(), 15),
+        )
+    else:
+        circuit_tier = None
+
+    degraded_reasons: List[str] = []
+    if tier_status == HEALTH_GATE_UNKNOWN_STATUS:
+        degraded_reasons.append("tier_status=UNKNOWN")
+    if nav_gate_status == HEALTH_GATE_DEGRADED_NAV_STATUS:
+        degraded_reasons.append("nav_gate_status=DEGRADED_NAV_UNAVAILABLE")
+    if nav_breaker_evaluated is False:
+        degraded_reasons.append("nav_breaker_evaluated=false")
+    if circuit_tier == HEALTH_GATE_UNKNOWN_STATUS:
+        degraded_reasons.append("circuit_breaker_tier=UNKNOWN")
+
+    return {
+        "degraded": bool(degraded_reasons),
+        "degraded_reasons": degraded_reasons,
+        "tier_status": tier_status,
+        "nav_gate_status": nav_gate_status,
+        "circuit_breaker_tier": circuit_tier,
+        "nav_breaker_evaluated": nav_breaker_evaluated,
+        # Provenance is read from THIS round's gate block first (it names the degradation),
+        # then the carried-over account_state (which may hold a persisted timebase verdict),
+        # then the report's flat mirror.
+        "nav_source": _gate_keyed_provenance(
+            _health_gate, "nav_source", acct.get("nav_source"), report.get("nav_source")
+        ),
+        "nav_mtm": _gate_keyed_provenance(
+            _health_gate, "nav_mtm", acct.get("nav_mtm"), report.get("nav_mtm")
+        ),
+        "nav_timebase_status": _gate_keyed_provenance(
+            _health_gate,
+            "nav_timebase_status",
+            acct.get("nav_timebase_status"),
+            report.get("nav_timebase_status"),
+        ),
+        "gate": _health_gate,
+    }
+
+
+def format_stage1_gate_degraded_detail(info: Dict[str, Any]) -> str:
+    """One-line, copy-pasteable provenance for a refused/acknowledged degraded gate."""
+    return (
+        f"tier_status={info.get('tier_status')!r} "
+        f"nav_gate_status={info.get('nav_gate_status')!r} "
+        f"circuit_breaker_tier={info.get('circuit_breaker_tier')!r} "
+        f"nav_breaker_evaluated={info.get('nav_breaker_evaluated')!r} "
+        f"nav_source={info.get('nav_source')!r} "
+        f"nav_mtm={info.get('nav_mtm')!r} "
+        # (LV1-TIMEBASE) Which KIND of degradation this is: the snapshot existed, but its
+        # equity and cash legs spanned two instants.
+        f"nav_timebase_status={info.get('nav_timebase_status')!r} "
+        f"reasons={info.get('degraded_reasons')}"
+    )
+
+
+def assert_stage1_gate_usable(
+    account_state: Optional[Dict[str, Any]],
+    health_report: Optional[Dict[str, Any]],
+    *,
+    acknowledged: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Refuse BEFORE any order math when Stage 1's gate NAV was not usable.
+
+    Returns the resolved gate info (including `circuit_breaker_tier`, which `main()` still
+    needs for the Tier-2/Tier-3 paths). Raises `LiveGateDegradedError` unless the operator
+    explicitly acknowledged the degradation (`LIVETRADING_ALLOW_DEGRADED_GATE=1`); the
+    acknowledgement is logged loudly and is NOT silent.
+    """
+    info = resolve_stage1_health_gate(account_state, health_report)
+    if not info["degraded"]:
+        return info
+    _degraded_detail = format_stage1_gate_degraded_detail(info)
+    if acknowledged is None:
+        acknowledged = degraded_gate_acknowledged()
+    if not acknowledged:
+        raise LiveGateDegradedError(
+            "\n" + "!" * 110
+            + "\n[REFUSED / 拒绝出票] Stage 1 门禁净值不可用：本次回撤/熔断判定为 UNKNOWN，"
+            "\n**不是**「未触发」。缺失 ≠ 未触发 —— 在未取得盯市净值前不得生成任何工单。"
+            f"\n  {_degraded_detail}"
+            "\n处置: 恢复/预置 nav_breakdown.json 后重跑 Stage 1（web 启动器会在拉起 Stage 1 前"
+            "预置估值快照），切勿放宽门禁或用表单值替代盯市净值。"
+            "\n唯一例外: 操作员已人工裁定净值（表单勾选「人工覆盖净值」）时，"
+            f"{ALLOW_DEGRADED_GATE_ENV}=1 会记录该次知情承担并继续。"
+            + "\n" + "!" * 110
+        )
+    # Acknowledged: proceed, but NEVER quietly -- the archive records the acknowledgement
+    # (`gate_degraded_acknowledged` in `summary.json`) on top of Stage 1's own
+    # `circuit_breaker_tier="UNKNOWN"`, so an auditor can see the breaker was unevaluated.
+    print("\n" + "!" * 110)
+    print(
+        "[WARN] (LV11) 操作员已显式确认在**门禁净值不可用**的前提下继续出票 "
+        f"({ALLOW_DEGRADED_GATE_ENV}=1)。熔断档位仍为 UNKNOWN —— 这不是「已评估且未触发」。"
+    )
+    print(f"       {_degraded_detail}")
+    print("!" * 110 + "\n")
+    return info
 
 
 # (2026-10-22 incident, Fix 2) Freshness policy -- bar-date-vs-expected-session
@@ -2298,7 +2522,11 @@ def apply_market_value_cap(
 #     to find it.
 #
 # THE CONTRACT (three additive fields, no existing meaning changed):
-#   * `target_weight_model`    -- the model's original target for the row (audit only).
+#   * `target_weight_model`    -- the row's target coordinate AFTER the Stage-1 intraday
+#                                 gate and the vol cap, AFTER `step_position_lifecycle` /
+#                                 the min-entry filter, and BEFORE lot rounding (audit
+#                                 only; divide by `equity_scale_factor` to recover the
+#                                 pre-cap value).
 #   * `target_weight_effective`-- `target_shares * price / NAV`, i.e. what the ticket
 #                                 actually delivers; the cash-proxy row carries the NAV
 #                                 RESIDUAL (`1 - Σ equity effective`), which is the only
@@ -2307,6 +2535,9 @@ def apply_market_value_cap(
 #   * ticket top level: `weights_normalized` / `weight_normalization_factor` /
 #     `target_weight_sum` / `target_weight_sum_model` / `rounding_rebalanced` /
 #     `mv_cap_breaches`.
+#     NOTE (2026-11-12 defect B): `target_weight_sum_model` is `normalize_model_target_weights`'
+#     Σ over the legs it may rewrite (BUY rows + cash proxy) at the pre-normalization,
+#     pre-lot-rounding instant -- NOT the sum of the whole model book.
 # `target_weight` itself keeps its pre-D4 meaning (the model/clamped target that sizing
 # used), because archived readers and the live UI consume it.
 WEIGHT_BUDGET_TOLERANCE = 1e-9
@@ -2358,6 +2589,16 @@ VOL_OVERLAY_UNAVAILABLE_REASON = "vol_unavailable"
 #: The guard NEVER enlarges weights and NEVER skips lot rounding to close the gap: the fix
 #: is for an operator to see the shortfall, not for the runner to invent exposure.
 VOL_OVERLAY_DELIVERY_SHORTFALL_RATIO = 0.5
+#: (2026-11-12 defect B) LIFECYCLE-ATTRITION GUARDRAIL. The ceiling is measured on the
+#: target VECTOR, but the ticket only carries rows that SURVIVED `step_position_lifecycle`
+#: (PENDING_ENTRY confirmation, exit-confirming, inertia/tenure blocks) plus the 5% /
+#: minimum-entry filter. On the archived `2026-11-12/162857` ticket that pass removed
+#: 12.85pp of a 38.94pp cap (33%) before lot rounding even started, yet the old
+#: `delivery_shortfall_ratio` divided by the CAP (`0.2507/0.3894 = 0.64`) and stayed quiet:
+#: a third of the de-risking could vanish without a single WARN. This ratio is
+#: `post_lifecycle / capped` and WARNS below the threshold (default 0.8, i.e. more than
+#: one fifth of the ceiling lost before lots). Report-only, exactly like the delivery leg.
+VOL_OVERLAY_LIFECYCLE_SHORTFALL_RATIO = 0.8
 #: Reason code stamped into the audit block when a Stage-1 circuit breaker has ALREADY
 #: zeroed the risk book before the ceiling is evaluated. Without it the audit reads
 #: "capped_equity_sum=0, binding=false" and could be mistaken for the vol cap clearing the
@@ -2543,6 +2784,98 @@ def resolve_portfolio_vol_overlay_params(
     return bool(enabled), mode
 
 
+#: (2026-11-12 AT8 audit) The two config keys this overlay resolves. They were resolved here
+#: and CONSUMED by `apply_portfolio_vol_overlay_for_strategy`, but never registered in
+#: `effective_param_entries` -- so a ticket carrying `vol_overlay.applied = true` could not be
+#: reproduced from its own `effective_params.json`: the snapshot held no overlay key at all,
+#: and "why was a cap enabled on this round?" was answerable only by opening the dump.
+VOL_OVERLAY_ENABLED_PARAM = "cfsb_portfolio_vol_overlay_enabled"
+VOL_OVERLAY_MODE_PARAM = "cfsb_portfolio_vol_overlay_mode"
+
+
+def resolve_portfolio_vol_overlay_provenance(
+    strategy_key: Optional[str],
+    params: Optional[Dict[str, Any]],
+    *,
+    declared_params: Optional[Dict[str, Any]] = None,
+    config_origin: str = SOURCE_DUMP,
+    cli_override: bool = False,
+) -> Dict[str, Any]:
+    """`resolve_portfolio_vol_overlay_params` + WHERE each resolved value came from (AT8).
+
+    Resolution itself is NOT re-implemented: the `(enabled, mode)` pair is taken from
+    `resolve_portfolio_vol_overlay_params`, so the snapshot can never disagree with the run
+    (allowlist-first, prefixed-only keys, unknown spelling -> `cap`, `off` -> disabled).
+
+    `params` is what the resolver reads; `declared_params` (the caller's pre-mutation freeze)
+    is what gets reported as `declared`. They coincide for these two keys -- nothing in this
+    runner writes them back -- but keeping the two inputs separate makes that an explicit fact
+    rather than an assumption.
+
+    SOURCE LABELS use `common/effective_params.py`'s CLOSED vocabulary
+    (`default` / `config` / `dump` / `override`), which has no `"allowlist"` member. A strategy
+    OFF the allowlist therefore reports `default` for both keys: the effective value does not
+    come from that strategy's params at all, it is the gate's own built-in default
+    (`enabled=False`, `mode="off"`). `allowlisted=False` plus the echoed `declared_*` values
+    make the "why" readable -- a dump that declares `enabled=True` still shows
+    `declared=True / resolved=False / source=default`, i.e. declared-but-gated, never
+    "the config turned it off".
+    """
+    declared_src: Dict[str, Any] = declared_params if declared_params is not None else (params or {})
+    enabled, mode = resolve_portfolio_vol_overlay_params(strategy_key, params)
+    allowlisted = strategy_key in PORTFOLIO_VOL_OVERLAY_STRATEGY_KEYS
+
+    def _source(param_name: str) -> str:
+        if not allowlisted:
+            return SOURCE_DEFAULT
+        if cli_override:
+            return SOURCE_OVERRIDE
+        return config_origin if param_name in declared_src else SOURCE_DEFAULT
+
+    return {
+        "enabled": enabled,
+        "mode": mode,
+        "allowlisted": allowlisted,
+        "declared_enabled": declared_src.get(VOL_OVERLAY_ENABLED_PARAM),
+        "declared_mode": declared_src.get(VOL_OVERLAY_MODE_PARAM),
+        "enabled_source": _source(VOL_OVERLAY_ENABLED_PARAM),
+        "mode_source": _source(VOL_OVERLAY_MODE_PARAM),
+    }
+
+
+def record_portfolio_vol_overlay_effective_params(
+    entries: Dict[str, Dict[str, Any]],
+    declared_params: Dict[str, Any],
+    strategy_key: Optional[str],
+    *,
+    config_origin: str = SOURCE_DUMP,
+    cli_override: bool = False,
+) -> Dict[str, Any]:
+    """Register the two overlay keys as provenance triples; returns the resolution.
+
+    `entries` is the `{param_name: {declared, resolved, source}}` map that
+    `build_effective_params` projects into `effective_params.json` -- no key cap and no
+    de-duplication beyond plain dict assignment, so these two names are written exactly once
+    (a later write for the same name would simply overwrite it, as for every other param).
+    """
+    provenance = resolve_portfolio_vol_overlay_provenance(
+        strategy_key,
+        declared_params,
+        declared_params=declared_params,
+        config_origin=config_origin,
+        cli_override=cli_override,
+    )
+    entries[VOL_OVERLAY_ENABLED_PARAM] = param_entry(
+        provenance["declared_enabled"],
+        provenance["enabled"],
+        provenance["enabled_source"],
+    )
+    entries[VOL_OVERLAY_MODE_PARAM] = param_entry(
+        provenance["declared_mode"], provenance["mode"], provenance["mode_source"]
+    )
+    return provenance
+
+
 def resolve_stage1_vol_inputs(health_report: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Read Stage-1's realized volatility / Barroso factor out of the health report.
 
@@ -2654,7 +2987,13 @@ def apply_portfolio_vol_ceiling(
         "mode": PORTFOLIO_VOL_OVERLAY_MODE_CAP,
         "realized_vol_21d": realized_vol_21d,
         "vol_scaling_factor": vol_scaling_factor,
+        # (2026-11-12 defect B) `model_equity_sum` is the Σ equity target of the vector this
+        # function RECEIVED -- i.e. AFTER the intraday distribution gate and any Stage-1
+        # damping, and BEFORE this cap. It was never "the model's original target"; Stage 2
+        # had already applied the intraday gate upstream. `pre_cap_equity_sum` is the same
+        # number under an unambiguous name; both are kept so archived readers keep working.
         "model_equity_sum": None,
+        "pre_cap_equity_sum": None,
         "capped_equity_sum": None,
         "equity_scale_factor": None,
         "binding": False,
@@ -2669,9 +3008,13 @@ def apply_portfolio_vol_ceiling(
     model_sum = float(
         sum(max(0.0, float(target_series[s])) for s in risky_idx)
     )
-    # Recorded even when the factor is unusable: the ticket must still say what the MODEL
-    # asked for, so an operator can see that nothing was capped and why.
+    # Recorded even when the factor is unusable: the ticket must still say what the book
+    # asked for, so an operator can see that nothing was capped and why. SEMANTICS
+    # (2026-11-12 defect B): this is the POST-intraday-gate, POST-Stage-1-damping, PRE-cap
+    # equity sum -- NOT the model's original book (see `pre_cap_equity_sum`, the same value
+    # under an unambiguous name).
     summary["model_equity_sum"] = round(model_sum, TARGET_WEIGHT_EFFECTIVE_DECIMALS)
+    summary["pre_cap_equity_sum"] = summary["model_equity_sum"]
     summary["capped_equity_sum"] = summary["model_equity_sum"]
 
     if superseded_by:
@@ -2740,30 +3083,46 @@ def evaluate_vol_overlay_delivery(
     capped_equity_sum: Optional[float],
     delivered_equity_sum: Optional[float],
     *,
+    post_lifecycle_equity_sum: Optional[float] = None,
     binding: bool = False,
     shortfall_ratio: float = VOL_OVERLAY_DELIVERY_SHORTFALL_RATIO,
+    lifecycle_shortfall_threshold: float = VOL_OVERLAY_LIFECYCLE_SHORTFALL_RATIO,
 ) -> Dict[str, Any]:
-    """Compare the CEILING the model asked for against what whole lots can actually deliver.
+    """Compare the CEILING against what the ticket can actually deliver, in TWO legs.
 
-    A ceiling is a weight; a ticket is an integer number of lots. On a small ceiling those
-    two disagree badly: the measured replay of the 2026-11-11 book delivered `0.00482777`
-    of NAV against a `0.037` ceiling (ratio ~= 0.13), i.e. ~87% of the intended de-risking
-    never reached the market. This function only REPORTS that (`delivery_shortfall`,
-    `delivery_shortfall_ratio`); it never rounds up, enlarges a weight, or drops the lot
-    rounding to make the numbers agree.
+    (2026-11-12 defect B) The original single-leg version divided the delivered equity by
+    the CAP and called the result "lot-rounding loss". That was wrong whenever the lifecycle
+    machine (or the minimum-entry filter) removed part of the book FIRST: on the archived
+    `2026-11-12/162857` ticket the cap was 0.3894, the rows that survived lifecycle summed to
+    0.2610, and whole lots delivered 0.2507 -- the old ratio `0.2507/0.3894 = 0.64` cleared
+    its 0.5 threshold even though 12.85pp (33% of the ceiling) had already disappeared
+    before rounding. This function therefore reports BOTH legs:
 
-    Contract:
-      * not binding, or a zero/absent ceiling -> no shortfall, ratio `None` (nothing to deliver);
-      * binding -> `ratio = delivered / capped`, `shortfall = ratio < shortfall_ratio`;
-      * `delivered > capped` (lots rounded UP) -> ratio > 1 -> no shortfall (drift is already
-        reported by `ceiling_exceeded_by`).
+      * LIFECYCLE leg -- `lifecycle_shortfall_ratio = post_lifecycle / capped`, flagged
+        (`lifecycle_shortfall`) below `lifecycle_shortfall_threshold` (0.8): the ceiling was
+        mostly eaten by lifecycle / minimum-entry filtering, not by lots.
+      * DELIVERY leg -- `delivery_shortfall_ratio = delivered / post_lifecycle` (the true
+        whole-lot loss), flagged below `shortfall_ratio` (0.5). When the caller does not pass
+        a lifecycle sum the denominator falls back to the cap, preserving the legacy meaning
+        for old callers/tests.
 
-    Pure arithmetic on floats (no I/O) so it is unit-testable offline.
+    Contract (unchanged in spirit):
+      * not binding, or a zero/absent ceiling -> nothing to measure, all flags False;
+      * `delivered > denominator` (lots rounded UP) -> ratio > 1 -> no shortfall (drift is
+        already reported by `ceiling_exceeded_by`);
+      * `post_lifecycle == 0` with a positive cap -> lifecycle leg flags the total loss and
+        the delivery leg is NOT measured (there is no denominator left).
+
+    Pure arithmetic on floats (no I/O) so it is unit-testable offline. Report-only: it never
+    rounds up, enlarges a weight, or skips lot rounding to close the gap.
     """
     result: Dict[str, Any] = {
         "delivery_shortfall": False,
         "delivery_shortfall_ratio": None,
+        "lifecycle_shortfall": False,
+        "lifecycle_shortfall_ratio": None,
         "delivery_ok": True,
+        "lifecycle_ok": True,
     }
     try:
         capped = float(capped_equity_sum)  # type: ignore[arg-type]
@@ -2771,26 +3130,96 @@ def evaluate_vol_overlay_delivery(
         return result
     if not np.isfinite(capped) or capped <= 0.0 or not binding:
         return result
+
+    post_lifecycle: Optional[float]
+    try:
+        post_lifecycle = (
+            float(post_lifecycle_equity_sum)
+            if post_lifecycle_equity_sum is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        post_lifecycle = None
+    if post_lifecycle is not None and not np.isfinite(post_lifecycle):
+        post_lifecycle = None
+
+    denominator = capped
+    if post_lifecycle is not None:
+        lifecycle_ratio = max(0.0, post_lifecycle) / capped
+        result["lifecycle_shortfall_ratio"] = round(lifecycle_ratio, 4)
+        result["lifecycle_shortfall"] = bool(
+            lifecycle_ratio < float(lifecycle_shortfall_threshold)
+        )
+        result["lifecycle_ok"] = not result["lifecycle_shortfall"]
+        if post_lifecycle <= 0.0:
+            # Nothing survived the lifecycle pass: there is no delivery to measure, but the
+            # lifecycle leg above already reports the full loss.
+            return result
+        denominator = post_lifecycle
+
     try:
         delivered = float(delivered_equity_sum)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return result
     if not np.isfinite(delivered):
         return result
-    ratio = max(0.0, delivered) / capped
+    ratio = max(0.0, delivered) / denominator
     result["delivery_shortfall_ratio"] = round(ratio, 4)
     result["delivery_shortfall"] = bool(ratio < float(shortfall_ratio))
     result["delivery_ok"] = not result["delivery_shortfall"]
     return result
 
 
+def format_vol_overlay_lifecycle_warning(
+    capped_equity_sum: float,
+    post_lifecycle_equity_sum: float,
+    reasons: Optional[Dict[str, Any]] = None,
+) -> str:
+    """The greppable one-liner for a ceiling mostly eaten by the lifecycle pass."""
+    capped_pct = float(capped_equity_sum) * 100.0
+    post_pct = float(post_lifecycle_equity_sum) * 100.0
+    gap_pp = capped_pct - post_pct
+    reason_txt = ""
+    if isinstance(reasons, dict) and reasons:
+        parts = []
+        for code in sorted(reasons):
+            block = reasons.get(code) or {}
+            try:
+                weight = float(block.get("equity_sum") or 0.0) * 100.0
+                count = int(block.get("symbols") or 0)
+            except (TypeError, ValueError):
+                continue
+            parts.append(f"{code}: {count} 只 / {weight:.2f}pp")
+        if parts:
+            reason_txt = "；归因(" + ", ".join(parts) + ")"
+    return (
+        f"[WARN/VOL OVERLAY] 上限 {capped_pct:.2f}% 但有 {gap_pp:.2f}pp 被生命周期/最低建仓"
+        f"过滤掉（过滤后仅剩 {post_pct:.2f}%）{reason_txt} —— 已如实记录，"
+        "未放大权重也未放宽任何门槛。"
+    )
+
+
 def format_vol_overlay_delivery_warning(
     capped_equity_sum: float,
     delivered_equity_sum: float,
+    post_lifecycle_equity_sum: Optional[float] = None,
 ) -> str:
-    """The greppable one-liner for a capped-but-undeliverable book (`[WARN/VOL OVERLAY]`)."""
+    """The greppable one-liner for a capped-but-undeliverable book (`[WARN/VOL OVERLAY]`).
+
+    (2026-11-12 defect B) When `post_lifecycle_equity_sum` is supplied the message names BOTH
+    brackets, so the operator can tell a whole-lot loss from lifecycle attrition: the ceiling
+    percentage alone used to be read as "lots ate 33%" when lots had only eaten 3pp.
+    """
     capped_pct = float(capped_equity_sum) * 100.0
     delivered_pct = float(delivered_equity_sum) * 100.0
+    if post_lifecycle_equity_sum is not None:
+        post_pct = float(post_lifecycle_equity_sum) * 100.0
+        gap_pp = post_pct - delivered_pct
+        return (
+            f"[WARN/VOL OVERLAY] 上限 {capped_pct:.2f}%（生命周期后 {post_pct:.2f}%）但整手后仅能交付 "
+            f"{delivered_pct:.2f}%（整手缺口 {gap_pp:.2f}pp）—— 整手取整吃掉了大部分可交付幅度，"
+            "已如实记录，未放大权重也未跳过整手取整。"
+        )
     gap_pp = capped_pct - delivered_pct
     return (
         f"[WARN/VOL OVERLAY] 上限 {capped_pct:.2f}% 但整手后仅能交付 "
@@ -3570,6 +3999,21 @@ def main(cli_args: Optional[List[str]] = None):
         _effective_origin if _inertia_present else SOURCE_DEFAULT,
     )
 
+    # ---- LV18 / AT8 (2026-11-12 defect): the vol-overlay gate must be reproducible ------
+    # A ticket with `vol_overlay.applied = true` was un-explainable from its own snapshot:
+    # `cfsb_portfolio_vol_overlay_enabled` / `_mode` were resolved (and consumed, see
+    # `apply_portfolio_vol_overlay_for_strategy` below) but never registered here, so
+    # `effective_params.json` carried neither key. Recorded through the SAME resolver the run
+    # executes (no re-derivation), and for a strategy OFF the allowlist the keys are recorded
+    # too -- as `enabled=False` / `mode="off"` with `source="default"` -- so the snapshot can
+    # also answer "why does THIS strategy carry no overlay?".
+    record_portfolio_vol_overlay_effective_params(
+        effective_param_entries,
+        declared_params,
+        strategy_key,
+        config_origin=_effective_origin,
+    )
+
     lifecycle_cfg = PositionLifecycleConfig(
         guard_latency_bars=guard_latency_bars,
         min_holding_bars=min_holding_bars,
@@ -3639,6 +4083,19 @@ def main(cli_args: Optional[List[str]] = None):
     # an explicit operator action (§5.4), not an automatic overwrite.
     _live_strategy_version = getattr(template, "version", None) or strat_ver
     _live_base_version = getattr(template, "base_version", None) or base_ver
+    # (2026-11-12 seeding race) BEFORE the parity gate, label the specific case it cannot
+    # distinguish: this state ALREADY claims THIS session but carries another engine's
+    # version, i.e. the round's own `account_state.json` was overwritten by the seeding of a
+    # previous session's snapshot. Parity alone would send the operator to "regenerate the
+    # dump" -- the wrong remedy, because the dump check already passed above. Fail-closed
+    # either way; this only re-labels the diagnosis.
+    assert_state_version_not_clobbered(
+        account_state,
+        _live_strategy_version,
+        _live_base_version,
+        as_of_date=as_of_date,
+        state_display=args.account_state_file,
+    )
     assert_account_state_version_parity(
         account_state,
         _live_strategy_version,
@@ -4065,53 +4522,12 @@ def main(cli_args: Optional[List[str]] = None):
         print(f"       将严格执行最低持仓锁定期 (min_holding_bars={min_holding_bars})，锁定未满期持仓，避免日内/隔日频繁反向开平仓。")
 
     # Check circuit breaker from account_state or health_report
-    circuit_tier = account_state.get("circuit_breaker_tier") or health_report.get("circuit_breaker_tier")
-    # (LV11 item 6) FAIL CLOSED on a degraded gate NAV, BEFORE any order math below.
-    # `circuit_tier` alone cannot express this: the Stage-1 report/JSON carries the
-    # degradation in `tier_status` / `nav_gate_status`, and pre-LV11 the persisted
-    # `circuit_breaker_tier` was the *placeholder's* "NORMAL" even while the report said
-    # UNKNOWN. Both spellings are checked here so a run against EITHER vintage of archive
-    # refuses: an unevaluated breaker is not a passing breaker, and "missing != not
-    # triggered" is the rule the 10-day NAV recovery leg already follows.
-    _tier_status = account_state.get("tier_status") or health_report.get("tier_status")
-    _nav_gate_status = account_state.get("nav_gate_status") or health_report.get("nav_gate_status")
-    if (
-        str(_tier_status or "").upper() == "UNKNOWN"
-        or str(_nav_gate_status or "").upper() == "DEGRADED_NAV_UNAVAILABLE"
-        or str(circuit_tier or "").upper() == "UNKNOWN"
-    ):
-        _degraded_detail = (
-            f"tier_status={_tier_status!r} nav_gate_status={_nav_gate_status!r} "
-            f"circuit_breaker_tier={circuit_tier!r} "
-            f"nav_source={account_state.get('nav_source') or health_report.get('nav_source')!r} "
-            f"nav_mtm={account_state.get('nav_mtm') or health_report.get('nav_mtm')!r} "
-            # (LV1-TIMEBASE) `timebase_mismatch_refused` says WHICH kind of degradation this
-            # is: the snapshot existed, but its equity and cash legs spanned two instants.
-            f"nav_timebase_status="
-            f"{(account_state.get('nav_timebase_status') or health_report.get('nav_timebase_status'))!r}"
-        )
-        if not degraded_gate_acknowledged():
-            raise LiveGateDegradedError(
-                "\n" + "!" * 110
-                + "\n[REFUSED / 拒绝出票] Stage 1 门禁净值不可用：本次回撤/熔断判定为 UNKNOWN，"
-                "\n**不是**「未触发」。缺失 ≠ 未触发 —— 在未取得盯市净值前不得生成任何工单。"
-                f"\n  {_degraded_detail}"
-                "\n处置: 恢复/预置 nav_breakdown.json 后重跑 Stage 1（web 启动器会在拉起 Stage 1 前"
-                "预置估值快照），切勿放宽门禁或用表单值替代盯市净值。"
-                "\n唯一例外: 操作员已人工裁定净值（表单勾选「人工覆盖净值」）时，"
-                f"{ALLOW_DEGRADED_GATE_ENV}=1 会记录该次知情承担并继续。"
-                + "\n" + "!" * 110
-            )
-        # Acknowledged: proceed, but NEVER quietly -- the archive records the acknowledgement
-        # (`gate_degraded_acknowledged` in `summary.json`) on top of Stage 1's own
-        # `circuit_breaker_tier="UNKNOWN"`, so an auditor can see the breaker was unevaluated.
-        print("\n" + "!" * 110)
-        print(
-            "[WARN] (LV11) 操作员已显式确认在**门禁净值不可用**的前提下继续出票 "
-            f"({ALLOW_DEGRADED_GATE_ENV}=1)。熔断档位仍为 UNKNOWN —— 这不是「已评估且未触发」。"
-        )
-        print(f"       {_degraded_detail}")
-        print("!" * 110 + "\n")
+    # (2026-11-12 defect A) The verdict lives INSIDE the report's `portfolio_health` block;
+    # the top-level mirror is a fallback (and may be a placeholder). `resolve_stage1_health_gate`
+    # reads BOTH archives and keeps the worse answer, and `assert_stage1_gate_usable` refuses
+    # BEFORE any order math when either says the breaker was never evaluated.
+    _gate_info = assert_stage1_gate_usable(account_state, health_report)
+    circuit_tier = _gate_info["circuit_breaker_tier"]
     freeze_rem = int(account_state.get("freeze_remaining_bars", health_report.get("freeze_remaining_bars", 0)))
     gate_code = account_state.get("gate_code") or health_report.get("gate_code")
     is_recovering = (gate_code == "CAUTION_RECOVERING" or circuit_tier == "CAUTION_RECOVERING")
@@ -4196,6 +4612,16 @@ def main(cli_args: Optional[List[str]] = None):
     current_series = reference.reindex(all_symbols, fill_value=0.0)
 
     # Apply Stage 1 intraday distribution gating (CAUTION_INTRADAY_DISTRIBUTION)
+    # (2026-11-12 defect B) Capture the equity sum BEFORE the gate so the vol-overlay audit
+    # can attribute the whole chain instead of collapsing "gate x cap x lifecycle x lot
+    # rounding" into one opaque number. The gate's own scaling logic is NOT touched.
+    _pre_distribution_gate_equity_sum = float(
+        sum(
+            max(0.0, float(target_series[s]))
+            for s in target_series.index
+            if cash_proxy is None or str(s) != str(cash_proxy)
+        )
+    )
     target_series = apply_intraday_distribution_gate(
         target_series,
         current_series,
@@ -5250,9 +5676,14 @@ def main(cli_args: Optional[List[str]] = None):
             # NOT appended at the end: `blocking_reason` must stay the TRAILING column of
             # the CSV (pinned by the L2.24 regression test), so the new audit fields are
             # inserted next to the weight they describe.
-            #   * `target_weight_model` -- the model's ORIGINAL target for this row, frozen
-            #     before weight normalization / lot rounding / the delivered cap touch
-            #     anything, so the audit trail survives every downstream rewrite;
+            #   * `target_weight_model` -- this row's target coordinate as the ticket froze it:
+            #     it has ALREADY passed the Stage-1 intraday gate, the Stage-1 vol ceiling
+            #     (`equity_scale_factor`) and `step_position_lifecycle` / the minimum-entry
+            #     filter, and has NOT yet been lot-rounded / delivered-capped. (2026-11-12
+            #     defect B: the pre-fix comment called it "the model's ORIGINAL target ...
+            #     frozen before ... the delivered cap", which was wrong on both ends -- it is
+            #     computed AFTER the cap, so dividing by `equity_scale_factor` is what
+            #     recovers the cap-front model value, and AFTER the lifecycle pass.)
             #   * `target_weight_effective` -- what the ticket actually DELIVERS
             #     (`target_shares * price / NAV`), stamped by
             #     `reconcile_delivered_weight_budget` below.
@@ -5850,8 +6281,12 @@ def main(cli_args: Optional[List[str]] = None):
     #   * `weights_normalized` (+ factor) -- the model's raw targets summed above 100% and
     #     were scaled proportionally instead of the ticket claiming 102.8% of NAV;
     #   * `target_weight_sum` / `target_weight_sum_model` -- delivered (post lot-rounding,
-    #     cash-proxy residual included) vs the model's own sum. The delivered one never
-    #     exceeds `1 + 1e-9`;
+    #     cash-proxy residual included) vs `normalize_model_target_weights`' own sum, which
+    #     counts ONLY the legs it is allowed to rewrite (BUY rows + the cash proxy) at the
+    #     moment BEFORE normalization and BEFORE lot rounding -- NOT the model's whole book
+    #     (SELL/HOLD rows are excluded by contract).  (2026-11-12 defect B corrected this
+    #     comment: it used to call that partial sum "the model's own sum".)  The delivered one
+    #     never exceeds `1 + 1e-9`;
     #   * `rounding_rebalanced` -- whole lots had to be shaved off the smallest positions to
     #     keep the delivered book inside one NAV;
     #   * `mv_cap_breaches` -- EVERY delivered single-name cap breach, so a 21.19%-against-
@@ -5872,20 +6307,31 @@ def main(cli_args: Optional[List[str]] = None):
     # verdicts. Present ONLY for the allowlisted strategy with the overlay enabled -- every
     # other strategy's ticket is byte-identical to before this change.
     #   {"applied", "mode", "realized_vol_21d", "vol_scaling_factor",
-    #    "model_equity_sum", "capped_equity_sum", "equity_scale_factor", "binding",
-    #    "reason", "superseded_by_circuit_breaker", "delivered_equity_sum",
-    #    "ceiling_exceeded_by", "delivery_shortfall", "delivery_shortfall_ratio"}
+    #    "model_equity_sum", "pre_cap_equity_sum", "pre_gate_equity_sum",
+    #    "capped_equity_sum", "equity_scale_factor", "binding",
+    #    "reason", "superseded_by_circuit_breaker", "post_lifecycle_equity_sum",
+    #    "lifecycle_filtered_equity_sum", "lifecycle_filtered_reasons",
+    #    "lifecycle_attribution_complete", "delivered_equity_sum",
+    #    "ceiling_exceeded_by", "delivery_shortfall", "delivery_shortfall_ratio",
+    #    "lifecycle_shortfall", "lifecycle_shortfall_ratio"}
     # `binding=True` means the cap actually reduced the equity targets (the difference is
     # parked in the cash proxy); `applied=True` with `reason="vol_unavailable"` means Stage-1
     # produced no MEASURED factor and the book was deliberately left untouched (never
     # defaulted to a 1.0x multiplier); `superseded_by_circuit_breaker=True` means a Stage-1
     # breaker (Tier-3 halt) had ALREADY emptied the book, so the ceiling is not the reason it
     # is flat -- never read `capped_equity_sum=0` as "the vol cap cleared the book".
-    # `delivered_equity_sum` is the post-lot-rounding reality (`Σ target_weight_effective`),
-    # `ceiling_exceeded_by` reports how far whole lots pushed it past the ceiling, and
-    # `delivery_shortfall` flags the opposite failure: a ceiling so small that lot rounding
-    # delivers only a sliver of it. The ticket-level `vol_overlay_delivery_ok` mirrors that
-    # flag and leaves `weight_budget_ok` (a 100%-budget verdict) untouched.
+    # (2026-11-12 defect B) The equity chain, in order: `pre_gate_equity_sum` (before the
+    # intraday distribution gate) -> `model_equity_sum` == `pre_cap_equity_sum` (post-gate,
+    # pre-cap) -> `capped_equity_sum` -> `post_lifecycle_equity_sum` (after
+    # `step_position_lifecycle` + the min-entry filter) -> `delivered_equity_sum` (post
+    # lot-rounding, `Σ target_weight_effective`). `lifecycle_filtered_equity_sum` =
+    # `capped - post_lifecycle`, attributed per reason code in `lifecycle_filtered_reasons`
+    # ({code: {"symbols", "equity_sum"}}). `ceiling_exceeded_by` reports how far whole lots
+    # pushed delivery past the ceiling; `delivery_shortfall` flags lot rounding delivering
+    # only a sliver of the POST-LIFECYCLE book, while `lifecycle_shortfall` flags a ceiling
+    # mostly eaten by the lifecycle pass instead -- they are distinct findings and the two
+    # ticket flags (`vol_overlay_delivery_ok` / `vol_overlay_lifecycle_ok`) mirror them
+    # separately, leaving `weight_budget_ok` (a 100%-budget verdict) untouched.
     if vol_overlay is not None:
         _delivered_equity = sum(
             _row_weight(r, "target_weight_effective")
@@ -5900,21 +6346,109 @@ def main(cli_args: Optional[List[str]] = None):
             )
         else:
             vol_overlay["ceiling_exceeded_by"] = None
-        # (LV18 item 2) Delivery-shortfall guardrail. Report-only: weights, lot rounding and
+        # (2026-11-12 defect B) ATTRIBUTION: the chain is
+        #   pre_gate  -> (intraday distribution gate) -> model/pre_cap
+        #             -> (Stage-1 vol ceiling)           -> capped
+        #             -> (lifecycle + min-entry filter)  -> post_lifecycle
+        #             -> (whole-lot rounding)            -> delivered.
+        # Only `post_lifecycle` to `delivered` is genuine lot-rounding loss; the old
+        # `delivery_shortfall_ratio` divided by `capped` and therefore stayed quiet while a
+        # third of the ceiling was eaten by the lifecycle pass (archived 2026-11-12/162857:
+        # capped 0.3894, post-lifecycle 0.2610, delivered 0.2507 -> old ratio 0.64 "OK").
+        # `rows` here is the FULL pre-drop list (NO_POSITION rows included), so the equity sum
+        # below is the model's post-lifecycle target, not the ticket's surviving subset.
+        _post_lifecycle_equity = 0.0
+        _lifecycle_filtered_gap = 0.0
+        _lifecycle_reasons: Dict[str, Any] = {}
+        for _r in rows:
+            _sym = str(_r.get("symbol") or "")
+            if _sym == str(cash_proxy):
+                continue
+            _row_target = max(0.0, _row_weight(_r, "target_weight"))
+            _post_lifecycle_equity += _row_target
+            try:
+                _pre_lifecycle = max(0.0, float(target_series.get(_sym, 0.0) or 0.0))
+            except (TypeError, ValueError):
+                _pre_lifecycle = 0.0
+            _gap = _pre_lifecycle - _row_target
+            if _gap <= 0.0:
+                continue
+            _lifecycle_filtered_gap += _gap
+            _action = str(_r.get("action") or "").strip().upper()
+            if _action == "NO_POSITION":
+                _code = "no_position"
+            else:
+                _typed = coerce_blocking_reason(_r.get("blocking_reason"))
+                _code = (
+                    str(_typed.value).lower()
+                    if _typed is not BlockingReason.NONE
+                    else f"action_{_action.lower() or 'unknown'}"
+                )
+            _bucket = _lifecycle_reasons.setdefault(
+                _code, {"symbols": 0, "equity_sum": 0.0}
+            )
+            _bucket["symbols"] += 1
+            _bucket["equity_sum"] = round(
+                _bucket["equity_sum"] + _gap, TARGET_WEIGHT_EFFECTIVE_DECIMALS
+            )
+        vol_overlay["pre_gate_equity_sum"] = round(
+            _pre_distribution_gate_equity_sum, TARGET_WEIGHT_EFFECTIVE_DECIMALS
+        )
+        vol_overlay["post_lifecycle_equity_sum"] = round(
+            _post_lifecycle_equity, TARGET_WEIGHT_EFFECTIVE_DECIMALS
+        )
+        if vol_overlay.get("capped_equity_sum") is not None:
+            vol_overlay["lifecycle_filtered_equity_sum"] = round(
+                max(
+                    0.0,
+                    float(vol_overlay["capped_equity_sum"]) - _post_lifecycle_equity,
+                ),
+                TARGET_WEIGHT_EFFECTIVE_DECIMALS,
+            )
+        else:
+            vol_overlay["lifecycle_filtered_equity_sum"] = None
+        vol_overlay["lifecycle_filtered_reasons"] = _lifecycle_reasons
+        # Cross-check: independently measured per-row gaps should equal capped - post. A
+        # mismatch means a symbol in the target vector never produced a row (the caps are
+        # still the authoritative headline number, this flag is just honest about it).
+        vol_overlay["lifecycle_attribution_complete"] = bool(
+            vol_overlay.get("lifecycle_filtered_equity_sum") is not None
+            and abs(
+                float(vol_overlay["lifecycle_filtered_equity_sum"]) - _lifecycle_filtered_gap
+            )
+            <= 1e-6
+        )
+        # (LV18 item 2 + 2026-11-12 defect B) Delivery-shortfall guardrail now splits into
+        # two legs: lifecycle attrition (denominator = capped) and genuine whole-lot loss
+        # (denominator = post_lifecycle). Report-only: weights, lot rounding and
         # `weight_budget_ok` are all left alone -- an operator sees the gap, the runner never
         # invents exposure to close it.
         _delivery = evaluate_vol_overlay_delivery(
             vol_overlay.get("capped_equity_sum"),
             _delivered_equity,
+            post_lifecycle_equity_sum=vol_overlay.get("post_lifecycle_equity_sum"),
             binding=bool(vol_overlay.get("binding")),
         )
         vol_overlay["delivery_shortfall"] = _delivery["delivery_shortfall"]
         vol_overlay["delivery_shortfall_ratio"] = _delivery["delivery_shortfall_ratio"]
+        vol_overlay["lifecycle_shortfall"] = _delivery["lifecycle_shortfall"]
+        vol_overlay["lifecycle_shortfall_ratio"] = _delivery["lifecycle_shortfall_ratio"]
         ticket_payload["vol_overlay_delivery_ok"] = _delivery["delivery_ok"]
+        ticket_payload["vol_overlay_lifecycle_ok"] = _delivery["lifecycle_ok"]
+        if _delivery["lifecycle_shortfall"]:
+            print(
+                format_vol_overlay_lifecycle_warning(
+                    float(vol_overlay["capped_equity_sum"]),
+                    float(vol_overlay["post_lifecycle_equity_sum"]),
+                    vol_overlay.get("lifecycle_filtered_reasons"),
+                )
+            )
         if _delivery["delivery_shortfall"]:
             print(
                 format_vol_overlay_delivery_warning(
-                    float(vol_overlay["capped_equity_sum"]), _delivered_equity
+                    float(vol_overlay["capped_equity_sum"]),
+                    _delivered_equity,
+                    vol_overlay.get("post_lifecycle_equity_sum"),
                 )
             )
         ticket_payload["vol_overlay"] = vol_overlay
@@ -5991,6 +6525,17 @@ def main(cli_args: Optional[List[str]] = None):
         # function, so the early check is not sufficient proof of what would land on disk.
         # Same read-only predicate, no auto-heal -- and note this block never rewrites a
         # MISMATCHED version, it only re-stamps today's (already-verified) values.
+        #
+        # (2026-11-12 seeding race) The clobber guard runs FIRST for the same reason as the
+        # early call: a state dated today with an older triple is the seeding defect, not a
+        # stale dump, and that distinction must reach the operator.
+        assert_state_version_not_clobbered(
+            account_state,
+            _live_strategy_version,
+            _live_base_version,
+            as_of_date=as_of_date,
+            state_display=args.account_state_file,
+        )
         assert_account_state_version_parity(
             account_state,
             _live_strategy_version,

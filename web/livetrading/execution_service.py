@@ -297,6 +297,22 @@ def _market_clock_module():
     return market_clock
 
 
+def _preflight_module():
+    """`scripts.live_preflight`, with a repo-root sys.path retry (standalone web launch).
+
+    The VERSION contract (which triple a state may carry, and the `[STATE VERSION
+    CLOBBERED]` diagnosis) has one owner, exactly like the `prior_state` resolver
+    `storage.py` already imports from this module. Re-spelling the rules here is how the web
+    layer and Stage 2 would drift apart.
+    """
+    try:
+        import scripts.live_preflight as live_preflight
+    except ImportError:  # pragma: no cover - repo root not importable yet
+        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+        import scripts.live_preflight as live_preflight
+    return live_preflight
+
+
 def summarize_intraday_5m_availability(
     universe_5m: Optional[Mapping[str, Any]] = None,
     as_of_date: Optional[str] = None,
@@ -1740,6 +1756,128 @@ class ExecutionService:
                 f"{valuation_date!r}: run_dir and summary.json['date'] would disagree."
             )
 
+    def _round_version_triple(self, strategy_file: Optional[str]) -> Dict[str, Any]:
+        """The version triple THIS round's strategy dump records.
+
+        Read from the dump the child itself will load (`strategy_version` / `base_version` /
+        `version_info`), never from the state being seeded: that is the whole point of the
+        2026-11-12 fix. Stage 2 still cross-checks the dump against the live class and fails
+        closed before any ticket exists, so this is a stamp of "what this round ran", not a
+        claim that it was verified.
+        """
+        dump: Any = None
+        if strategy_file:
+            try:
+                dump = self.storage._load_json(strategy_file, default=None)
+            except Exception as exc:  # an unreadable dump is the child's failure to report
+                logging.warning("[ACCOUNT STATE SEED] 策略 dump 读取失败（不阻断播种）: %s", exc)
+                dump = None
+        return _preflight_module().version_triple_from_strategy_def(
+            dump if isinstance(dump, dict) else {}
+        )
+
+    def _assert_seeded_state_version(
+        self, account_state_file: str, version_triple: Mapping[str, Any], val_date: str
+    ) -> None:
+        """Fail loudly (grep-able marker) when the state just created carries another triple.
+
+        Only meaningful for a state that claims THIS round's session; the caller invokes it
+        exactly then. Read-only: nothing is re-stamped.
+        """
+        preflight = _preflight_module()
+        landed = self.storage._load_json(account_state_file, default=None)
+        if not isinstance(landed, dict):
+            raise preflight.LiveDumpPreflightError(
+                f"[ACCOUNT STATE SEED] 播种后无法回读 `{account_state_file}`，"
+                "无法证明落盘的版本号就是本轮的版本号（失败关闭）。"
+            )
+        message = preflight.detect_state_version_clobber(
+            landed,
+            version_triple.get("strategy_version"),
+            version_triple.get("base_version"),
+            as_of_date=val_date,
+        )
+        if message:
+            raise preflight.LiveDumpPreflightError(f"{message} `{account_state_file}`")
+
+    def _seed_round_account_state(
+        self,
+        account_state_file: str,
+        *,
+        val_date: str,
+        strat_key: Optional[str],
+        univ_key: Optional[str],
+        version_triple: Mapping[str, Any],
+        install_prior_state: bool,
+    ) -> None:
+        """Create this round's `account_state.json` if (and only if) it does not exist yet.
+
+        (2026-11-12 seeding race) TWO rules, both load-bearing:
+
+        1. **CREATE-ONLY.** When the file already exists it belongs to THIS round -- Stage 1
+           may already have written it for `val_date` -- and nothing here may rewrite it. The
+           previous shape re-saved the loaded dict after merging `prior_state`, which is one
+           write ordering away from putting an earlier instance's copy over the freshly
+           stamped file (the two same-day instances of 2026-11-12: `162625` FAILED on
+           `strategy_version=1.2.2`, `162857` SUCCEEDED with `1.3.0`). Only the
+           `prior_state` / `prior_state_source` audit block is merged; the top-level version
+           fields and business fields (`current_nav`, ...) are never touched.
+
+        2. **THE ROUND'S OWN TRIPLE, NEVER THE SNAPSHOT'S.** A seed that already describes
+           `val_date` (a same-day rerun's earlier instance) is stamped with `version_triple`
+           and verified on disk. A seed that describes an EARLIER session is copied
+           VERBATIM on purpose: Stage 1 turns it into `prior_state`, and that block is
+           lineage evidence -- its `strategy_version` must keep saying which engine wrote it
+           (`docs/lv7_prior_state_contract.md` §5.4). The state for the new session gets its
+           triple from the stage that actually creates it
+           (`check_live_portfolio_health.build_account_state_update`), which is why the web
+           layer does not re-stamp an older-dated copy (that would mislabel yesterday's book
+           as today's AND destroy the lineage the same fix must preserve).
+        """
+        preflight = _preflight_module()
+        created_for_today = False
+        try:
+            if os.path.exists(account_state_file):
+                existing = self.storage._load_json(account_state_file, default=None)
+                if (
+                    install_prior_state
+                    and isinstance(existing, dict)
+                    and existing.get("as_of_date") == val_date
+                    and "prior_state" not in existing
+                ):
+                    carried = self.storage._carry_forward_account_state(
+                        val_date, strat_key, univ_key
+                    )
+                    if carried:
+                        self._install_prior_state(existing, carried)
+                        self.storage._save_json(account_state_file, existing)
+                return
+            state_data = self.storage.latest_account_state_at_or_before(
+                val_date, strat_key, univ_key
+            )
+            if not state_data:
+                state_data = self.storage.get_account_state(
+                    date_str=val_date, strategy_key=strat_key, universe_key=univ_key
+                )
+            if not state_data:
+                return
+            if state_data.get("as_of_date") == val_date:
+                state_data = dict(state_data)
+                if install_prior_state and "prior_state" not in state_data:
+                    carried = self.storage._carry_forward_account_state(
+                        val_date, strat_key, univ_key
+                    )
+                    if carried:
+                        self._install_prior_state(state_data, carried)
+                preflight.stamp_account_state_version(state_data, version_triple)
+                created_for_today = True
+            self.storage._save_json(account_state_file, state_data)
+        except Exception as exc:  # a missing baseline must not block the stage (unchanged)
+            logging.warning("[ACCOUNT STATE SEED] account_state 预置失败（忽略）: %s", exc)
+            return
+        if created_for_today:
+            self._assert_seeded_state_version(account_state_file, version_triple, val_date)
+
     @staticmethod
     def _install_prior_state(
         container: Dict[str, Any], carried: Optional[Dict[str, Any]]
@@ -2749,37 +2887,18 @@ class ExecutionService:
         univ_path = self._resolve_universe(universe_file, custom_symbols, run_dir)
         account_state_file = os.path.join(run_dir, "account_state.json")
 
-        # Ensure account_state_file in daily run_dir has proper pre-trade baseline
-        if os.path.exists(account_state_file):
-            try:
-                existing_st = self.storage._load_json(account_state_file)
-                if existing_st and existing_st.get("as_of_date") == val_date and "prior_state" not in existing_st:
-                    carried = self.storage._carry_forward_account_state(val_date, strat_key, univ_key)
-                    if carried:
-                        self._install_prior_state(existing_st, carried)
-                        self.storage._save_json(account_state_file, existing_st)
-            except Exception:
-                pass
-        else:
-            try:
-                # (L2.62) A fresh instance dir starts empty; seed it with the newest state
-                # at-or-before this session -- which on a rerun is THIS session's earlier
-                # instance (what the flat layout used to have in the same file), and on a
-                # first run is the previous session's state, exactly as before.
-                state_data = self.storage.latest_account_state_at_or_before(
-                    val_date, strat_key, univ_key
-                )
-                if not state_data:
-                    state_data = self.storage.get_account_state(date_str=val_date, strategy_key=strat_key, universe_key=univ_key)
-                if state_data:
-                    if state_data.get("as_of_date") == val_date and "prior_state" not in state_data:
-                        carried = self.storage._carry_forward_account_state(val_date, strat_key, univ_key)
-                        if carried:
-                            state_data = dict(state_data)
-                            self._install_prior_state(state_data, carried)
-                    self.storage._save_json(account_state_file, state_data)
-            except Exception:
-                pass
+        # (2026-11-12 seeding race) CREATE-ONLY baseline for this round's instance dir, with
+        # the round's own version triple -- see `_seed_round_account_state`. The previous
+        # inline block re-saved an EARLIER state here, so whichever write landed last decided
+        # which `strategy_version` the round published.
+        self._seed_round_account_state(
+            account_state_file,
+            val_date=val_date,
+            strat_key=strat_key,
+            univ_key=univ_key,
+            version_triple=self._round_version_triple(strat_path),
+            install_prior_state=True,
+        )
 
         # (LV11) PRE-STAGE the valuation snapshot BEFORE the gate child is launched.
         #
@@ -3617,15 +3736,20 @@ class ExecutionService:
         # newest run at-or-before this session -- on a rerun that is THIS session's earlier
         # instance (what the flat layout kept in the same file, and the reason the
         # carry-forward chain must not be allowed to break).
-        if not os.path.exists(account_state_file):
-            try:
-                seed_state = self.storage.latest_account_state_at_or_before(
-                    val_date, strat_key, univ_key
-                )
-                if seed_state:
-                    self.storage._save_json(account_state_file, seed_state)
-            except Exception as exc:  # a missing baseline must not block the deploy
-                logging.warning("[L2.62] account_state 预置失败（忽略）: %s", exc)
+        #
+        # (2026-11-12 seeding race) Same CREATE-ONLY helper as Stage 1: it never rewrites a
+        # state Stage 1 already wrote for `val_date` (that write carries the round's own
+        # version triple) and it stamps this round's triple when the seed itself is already
+        # dated `val_date`. `install_prior_state=False` keeps this path's historical shape --
+        # Stage 2 resolves `prior_state` itself (`apply_prior_state_selection`).
+        self._seed_round_account_state(
+            account_state_file,
+            val_date=val_date,
+            strat_key=strat_key,
+            univ_key=univ_key,
+            version_triple=self._round_version_triple(strat_path),
+            install_prior_state=False,
+        )
 
         # (NAV) Mark the book BEFORE any further side effect or argv assembly.  Fails
         # closed: a book that cannot be valued is a refusal by default (see `_resolve_nav`),

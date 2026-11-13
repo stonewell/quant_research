@@ -75,7 +75,7 @@ import json
 import os
 import re
 import sys
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Tuple
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -709,6 +709,183 @@ def assert_account_state_version_parity(
         live_value=live_base_version,
         context=context,
     )
+
+
+# ---------------------------------------------------------------------------
+# (2026-11-12 seeding race) WHOSE version triple may a state file carry?
+# ---------------------------------------------------------------------------
+# THE DEFECT THIS SECTION EXISTS FOR. Two instances of the SAME session
+# (`2026-11-12/162625` FAILED, `/162857` SUCCESS) disagreed about the engine version.
+# `162625`'s `account_state.json` recorded `strategy_version='1.2.2'` while the live class
+# was `1.3.0`, because the file the round started from was a COPY of the previous session's
+# snapshot (11-11) -- and the `1.2.2` was inherited wholesale, `repair_provenance` included.
+# Stage 1 then rewrote the state for that session but only touched business fields
+# (`build_account_state_update` starts from `dict(state)`), so the stale number survived and
+# Stage 2's fail-closed parity gate refused the round. The sibling instance succeeded only
+# because by then the polluted file had been corrected: whoever writes last wins.
+#
+# THE RULE, in two halves that must NOT be conflated:
+#   * An ARCHIVED snapshot is lineage evidence. Its `strategy_version` / `base_version` /
+#     `strategy_version_info` keep saying WHICH engine wrote it; nothing here rewrites them
+#     (`docs/lv7_prior_state_contract.md` §5.4, and `prior_state` is where the carried
+#     snapshot ends up -- it must keep its original triple).
+#   * The state a round CREATES for its own session (`as_of_date == this session`) must
+#     carry the CURRENT round's triple, never the one inherited from the snapshot it was
+#     seeded out of. `stamp_account_state_version` IS that write; it is idempotent, and it
+#     never descends into `prior_state`.
+ACCOUNT_STATE_VERSION_FIELDS: Tuple[str, ...] = (
+    "strategy_version",
+    "base_version",
+    "strategy_version_info",
+)
+
+#: Grep-able marker for "this round's OWN state was rolled back to an older engine".
+#: Deliberately worded differently from the parity gate's message: the operator's remedy is
+#: NOT "regenerate the dump" here -- the dump-vs-live check already passed, otherwise it
+#: would have spoken first. What went wrong is the SEEDING order.
+STATE_VERSION_CLOBBER_MARKER = "[STATE VERSION CLOBBERED]"
+
+
+def version_triple_from_strategy_def(strategy_def: Any) -> Dict[str, Any]:
+    """The version triple a strategy dump records, spelled the way `account_state` spells it.
+
+    Same source Stage 1 already reports (`strategy_info`) and Stage 2 resolves through
+    `resolve_strategy_definition`. Only TRUTHY values are emitted: a template with no
+    `base_version` axis must not gain an explicit `base_version: null` (the parity gate reads
+    "key absent" and "both None" as the same canonical spelling, but writing the key would
+    make new states differ from old ones for no reason).
+    """
+    src = strategy_def if isinstance(strategy_def, Mapping) else {}
+    base = _normalise_version_value(src.get("base_version"))
+    info = src.get("version_info")
+    triple: Dict[str, Any] = {
+        "strategy_version": _normalise_version_value(src.get("strategy_version")) or "1.0.0",
+    }
+    if base:
+        triple["base_version"] = base
+    if isinstance(info, Mapping) and info:
+        triple["strategy_version_info"] = dict(info)
+    return triple
+
+
+def stamp_account_state_version(
+    account_state: Dict[str, Any], triple: Mapping[str, Any]
+) -> Dict[str, Any]:
+    """Stamp `triple` onto the TOP LEVEL of a state THIS round is creating.
+
+    Mutates and returns `account_state`. `prior_state` is never touched: it is the carried
+    snapshot, and its version fields are the evidence of which engine wrote it.
+
+    A key the current engine does NOT have is REMOVED rather than left behind (e.g.
+    `base_version` on a non-blend template): an inherited blend-era value would otherwise be
+    refused by the parity gate as "recorded X, live None" -- a real defect, but a misleading
+    diagnosis for "this round never stamped its own version".
+    """
+    if not isinstance(account_state, dict):
+        return account_state
+    src = triple if isinstance(triple, Mapping) else {}
+    account_state["strategy_version"] = _normalise_version_value(
+        src.get("strategy_version")
+    ) or "1.0.0"
+    for key in ("base_version", "strategy_version_info"):
+        value = src.get(key)
+        if value:
+            account_state[key] = copy.deepcopy(value) if isinstance(value, Mapping) else value
+        else:
+            account_state.pop(key, None)
+    return account_state
+
+
+def state_version_mismatches(
+    account_state: Dict[str, Any],
+    live_strategy_version: Any,
+    live_base_version: Any = None,
+) -> List[str]:
+    """`["strategy_version '1.2.2' != '1.3.0'"]` for the axes that disagree (empty == ok).
+
+    Mirrors `_assert_version_axis`'s comparison exactly -- including "a key that is ABSENT
+    asserts nothing" -- so this predicate can never fire where the fail-closed parity gate
+    would not. `strategy_version_info` is stamped alongside the two scalar axes but is NOT
+    compared here (the parity gate never compared it either; adding a second, stricter axis
+    would silently widen a refusal condition).
+    """
+    if not isinstance(account_state, dict) or not account_state:
+        return []
+    out: List[str] = []
+    for key, live_value in (
+        ("strategy_version", live_strategy_version),
+        ("base_version", live_base_version),
+    ):
+        if key not in account_state:
+            continue
+        recorded = _normalise_version_value(account_state.get(key))
+        live = _normalise_version_value(live_value)
+        if recorded != live:
+            out.append(f"{key} {recorded!r} != {live!r}")
+    return out
+
+
+def detect_state_version_clobber(
+    account_state: Dict[str, Any],
+    live_strategy_version: Any,
+    live_base_version: Any = None,
+    *,
+    as_of_date: Any = None,
+) -> Optional[str]:
+    """The `[STATE VERSION CLOBBERED]` diagnosis, or None when this state is not this round's.
+
+    Scoped by `as_of_date` ON PURPOSE. A state that still describes an EARLIER session may
+    legitimately carry an older triple -- it is the snapshot being carried forward, and the
+    generic parity gate already refuses it with its own "regenerate the dump" wording. Only a
+    state that ALREADY claims THIS session while disagreeing with the live class is provably
+    the seeding race: the round's own write was overwritten (or never stamped) after the
+    version it should carry had been decided.
+    """
+    if not isinstance(account_state, dict) or not account_state or not as_of_date:
+        return None
+    if str(account_state.get("as_of_date") or "") != str(as_of_date):
+        return None
+    mismatches = state_version_mismatches(
+        account_state, live_strategy_version, live_base_version
+    )
+    if not mismatches:
+        return None
+    return (
+        f"{STATE_VERSION_CLOBBER_MARKER} 本轮 account_state 的版本字段被旧值覆盖："
+        f"该 state 的 as_of_date 已经是本轮 {as_of_date}，但 {'; '.join(mismatches)}。"
+        "这不是「需要重新生成 dump」—— dump 与活类的校验在此之前已经通过；"
+        "这是播种/结转竞态：上一交易日的快照被复制进本轮新生成的 state，"
+        "把 Stage-1 刚写好的当前版本号盖了回去"
+        "（见 web/livetrading/execution_service.py::run_health_check / run_live_deploy 的 "
+        "account_state 播种，以及 scripts/check_live_portfolio_health.py::save_account_state"
+        " 的写入顺序）。本检查仍然失败关闭：不自动改写任何已归档的历史版本字段。"
+    )
+
+
+def assert_state_version_not_clobbered(
+    account_state: Dict[str, Any],
+    live_strategy_version: Any,
+    live_base_version: Any = None,
+    *,
+    as_of_date: Any = None,
+    state_display: str = "",
+) -> None:
+    """Raise `LiveDumpPreflightError` with the grep-able marker when the round's own state is stale.
+
+    Call this BEFORE `assert_account_state_version_parity`, so a polluted-today state reports
+    the seeding race instead of the (wrong) "regenerate the dump" remedy. Read-only, and it
+    never weakens the parity gate: it only re-labels a subset of what parity would refuse.
+    """
+    message = detect_state_version_clobber(
+        account_state,
+        live_strategy_version,
+        live_base_version,
+        as_of_date=as_of_date,
+    )
+    if not message:
+        return
+    context = f"账户状态 `{state_display or '<未命名 account_state>'}`"
+    raise LiveDumpPreflightError(f"{message} {context}")
 
 
 # ---------------------------------------------------------------------------
