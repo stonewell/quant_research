@@ -101,6 +101,21 @@ class RunHealthRequest(BaseModel):
         None,
         description="现金余额（用于预置快照的同口径计价）；留空则拒绝跨时点拼装净值",
     )
+    #: (P1-1, 2026-11-12) Wall-clock time after which THIS session's 5m bars are assumed
+    #: published, forwarded to the Stage-1 child as `--intraday-publish-after HH:MM`.
+    #: ``None`` (the default) means the flag is NOT passed at all, so the child keeps its
+    #: own 20:00 default and argv stays byte-identical to the pre-P1-1 shape. It only
+    #: decides whether a missing 5m layer is reported as `pending_publication` (wait) or
+    #: `missing` (sync defect); it never moves the run window or the daily-bar rule.
+    #: MUST be forwarded explicitly by the route -- an unlisted model field is silently
+    #: dropped (exactly how `cash` / `confirm_empty_book` were lost before).
+    intraday_publish_after: Optional[str] = Field(
+        None,
+        description=(
+            "5m 当日数据的发布时刻 HH:MM（00:00–23:59，默认留空=沿用子进程的 20:00）；"
+            "仅决定缺失的 5m 层记为 pending_publication 还是 missing"
+        ),
+    )
 
 
 class RunDeployRequest(BaseModel):
@@ -157,6 +172,18 @@ class RunDeployRequest(BaseModel):
     lot_size: Optional[int] = None
     guard_latency_bars: int = Field(2, description="UPLSM entry confirmation latency guard bars (default 2)")
     allow_intraday: bool = Field(True, description="Allow running during intraday/lunch sessions using latest published session")
+    #: (P1-1, 2026-11-12) Same contract as `RunHealthRequest.intraday_publish_after`:
+    #: ``None`` = the flag is not passed (child keeps 20:00); a value is forwarded verbatim
+    #: as `--intraday-publish-after HH:MM` after validation. Stage 1 and Stage 2 must agree
+    #: on this axis, otherwise the gate evaluates a different 5m availability rule than the
+    #: deploy does.
+    intraday_publish_after: Optional[str] = Field(
+        None,
+        description=(
+            "5m 当日数据的发布时刻 HH:MM（00:00–23:59，默认留空=沿用子进程的 20:00）；"
+            "与 Stage-1 门禁保持同一口径"
+        ),
+    )
 
 
 # Harmonized alias for Stage 2 live strategy request
@@ -198,6 +225,16 @@ class RunResponse(BaseModel):
     nav_source: Optional[str] = None
     cash: Optional[float] = None
     cash_source: Optional[str] = None
+    #: (P1-3, 2026-11-12) Provenance of the cash leg's TIMEBASE, beside `cash` itself:
+    #: `operator_form` / `operator_override` / `archive_residual` / `missing`, the ISO-8601
+    #: moment it was adopted, and the warning string
+    #: `identical_to_previous_round_residual` when this round's cash numerically equals the
+    #: previous archived residual (advisory only). MUST be declared here: `response_model`
+    #: filters undeclared keys out, so the UI would silently lose the "上次录入" line.
+    cash_as_of: Optional[str] = None
+    cash_as_of_source: Optional[str] = None
+    cash_as_of_input_at: Optional[str] = None
+    cash_as_of_warning: Optional[str] = None
     nav_warnings: Optional[List[str]] = None
     #: Provenance of the position-open dates behind the total-return ratio:
     #: ``"run_archive"`` when derived from archived books, else ``None`` (those symbols

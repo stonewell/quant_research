@@ -76,6 +76,21 @@
             <label for="input-peak-nav">高位(HWM)</label>
             <input type="number" id="input-peak-nav" class="form-input" placeholder="自动: 历史高位" step="1000">
         </div>
+        <!-- (P1-1, 2026-11-12) The 5m layer's OWN availability axis. Deliberately an
+             OPTIONAL override of the child scripts' 20:00 default: the box starts EMPTY and
+             an empty box sends nothing at all (`intraday_publish_after: null`), so the
+             argv the children receive is byte-identical to before this field existed.
+             Accepted format is strict HH:MM (00:00-23:59); the route answers 400 otherwise
+             rather than silently falling back to 20:00. -->
+        <div class="control-item" id="ctrl-intraday-publish-after">
+            <label for="input-intraday-publish-after">5m 发布时刻</label>
+            <input type="text" id="input-intraday-publish-after" class="form-input"
+                   placeholder="20:00" maxlength="5"
+                   pattern="(?:[01]\d|2[0-3]):[0-5]\d"
+                   title="HH:MM（00:00–23:59）；留空使用默认 20:00">
+            <span style="font-size:10.5px;line-height:1.25;color:var(--text-muted,#8b949e);max-width:190px;"
+                  id="hint-intraday-publish-after">5m 当日数据通常 20:00 后才可用；留空使用默认</span>
+        </div>
     </div>
 
     <!-- Navigation & Execution Toolbar (Row 3: Tabs on Left, Action Buttons on Right) -->
@@ -163,6 +178,12 @@
                         <input type="number" id="input-cash" class="form-input form-input-sm"
                                step="0.01" min="0" placeholder="留空则用 BIL/511880 市值">
                     </div>
+                    <!-- (P1-3, 2026-11-12) WHERE/WHEN the last recorded cash leg was
+                         adopted (`cash_as_of_source` / `cash_as_of_input_at` from the
+                         archived summary). Hidden until a round actually recorded them, so
+                         an old archive that predates the pair shows nothing instead of a
+                         fabricated time. -->
+                    <div id="cash-last-record" class="plan-notice" style="display: none;"></div>
                     <!-- NAV provenance: computed / override / fallback, plus cash source. -->
                     <div id="nav-provenance" class="plan-notice" style="display: none;"></div>
                     <div class="holdings-summary-bar">

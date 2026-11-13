@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 try:
-    from .execution_service import ExecutionService
+    from .execution_service import ExecutionService, normalize_intraday_publish_after
     from .models import (
         AccountStateModel,
         CustomUniverseModel,
@@ -27,7 +27,7 @@ try:
     )
     from .storage import StorageManager
 except (ImportError, ValueError):
-    from execution_service import ExecutionService
+    from execution_service import ExecutionService, normalize_intraday_publish_after
     from models import (
         AccountStateModel,
         CustomUniverseModel,
@@ -253,6 +253,15 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
     # --------------------------------------------------------------------------
     @app.post("/api/run-health", response_model=RunResponse, summary="Execute Stage 1 Health Check")
     async def run_health_check(payload: RunHealthRequest) -> Dict[str, Any]:
+        # (P1-1, 2026-11-12) A malformed `HH:MM` is a 400 at the ROUTE, before the service
+        # can build a run dir: the service would otherwise surface it as the generic 500
+        # that means "the child failed", which hides an input error behind a run failure.
+        try:
+            publish_after = normalize_intraday_publish_after(
+                payload.intraday_publish_after
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         try:
             return execution_service.run_health_check(
                 strategy_file=payload.strategy_file,
@@ -276,12 +285,25 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
                 # cash`. Dropping it again would restore exactly that defect (tier UNKNOWN
                 # on every first run of a session instead of a same-instant NAV).
                 cash=payload.cash,
+                # (P1-1, 2026-11-12) Forwarded EXPLICITLY -- this is an explicit keyword
+                # list, so a model field not re-listed here is accepted by pydantic and
+                # silently dropped (the same trap that lost `cash`). `None` means "not
+                # supplied": the child keeps its own 20:00 default.
+                intraday_publish_after=publish_after,
             )
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
 
     @app.post("/api/run-deploy", response_model=RunResponse, summary="Execute Stage 2 Live Deployment")
     async def run_live_deploy(payload: RunDeployRequest) -> Dict[str, Any]:
+        # (P1-1) Same route-level 400 as `/api/run-health`; without it a typo would reach
+        # the child as an argparse failure indistinguishable from a real run failure.
+        try:
+            publish_after = normalize_intraday_publish_after(
+                payload.intraday_publish_after
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         try:
             return execution_service.run_live_deploy(
                 strategy_file=payload.strategy_file,
@@ -313,6 +335,9 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
                 allow_intraday=payload.allow_intraday,
                 cash=payload.cash,
                 nav_override=payload.nav_override,
+                # (P1-1, 2026-11-12) Explicit forward (see above): dropping it would make
+                # the deploy judge a different 5m publication window than the gate.
+                intraday_publish_after=publish_after,
             )
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))

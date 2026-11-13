@@ -642,6 +642,65 @@ NAV_BREAKDOWN_FILENAME = "nav_breakdown.json"
 #: from. Written alongside, NEVER over `NAV_BREAKDOWN_FILENAME`.
 NAV_BREAKDOWN_STAGE2_FILENAME = "nav_breakdown.stage2.json"
 
+#: (P1-1, 2026-11-12) `--intraday-publish-after HH:MM` -- the R1/§9 second availability axis
+#: on TOP of `--allow-intraday`: it says when the as-of session's 5m bars are assumed
+#: published, so a not-yet-published layer is `pending_publication` (wait) instead of
+#: `missing` (sync defect). Both children define it with their own 20:00 default
+#: (`scripts/check_live_portfolio_health.py`, `scripts/run_live_strategy.py`), so the web
+#: layer forwards it ONLY when the operator typed one -- an absent value must leave argv
+#: byte-identical to the pre-P1-1 shape rather than pinning a second default here.
+INTRADAY_PUBLISH_AFTER_FLAG = "--intraday-publish-after"
+
+#: Strict `HH:MM`, 00:00-23:59. One digit-hour ("9:30") is REJECTED on purpose: the child
+#: parses it with `datetime.strptime(..., "%H:%M")`-style logic in places and a silently
+#: different spelling would make the gate and the deploy disagree about the same session.
+_INTRADAY_PUBLISH_AFTER_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+
+
+def normalize_intraday_publish_after(value: Optional[str]) -> Optional[str]:
+    """`HH:MM` (00:00-23:59) or ``None``; raises ``ValueError`` on anything else.
+
+    Absent / blank / whitespace-only all mean "not supplied" -> ``None`` -> the flag is
+    never appended, i.e. the child keeps its documented 20:00 default. A malformed value
+    is a REFUSAL (the route maps it to HTTP 400), never a silent drop: silently ignoring
+    it is the exact failure mode that made the web form's 现金余额 unreachable, and here it
+    would leave the operator believing the 5m layer is being judged at, say, 21:30 while
+    the gate still used 20:00.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text == "":
+        return None
+    if not _INTRADAY_PUBLISH_AFTER_RE.match(text):
+        raise ValueError(
+            f"{INTRADAY_PUBLISH_AFTER_FLAG} 只接受 HH:MM（00:00–23:59）格式，收到 {value!r}；"
+            "留空表示沿用子进程默认的 20:00"
+        )
+    return text
+
+#: (P1-3, 2026-11-12) Provenance of `cash_as_of` -- WHERE the cash leg's timebase came
+#: from, so a reader never has to guess. Exactly these four:
+#:   * ``operator_form``      -- the form's 现金余额 for THIS session (``cash_as_of=val_date``);
+#:   * ``operator_override``  -- the operator pinned the NAV (`nav_override=True`);
+#:   * ``archive_residual``   -- the previous round's measured residual, carrying THAT
+#:                              round's own `cash_as_of` (`_archived_cash_for`);
+#:   * ``missing``            -- no cash input at all; whatever stamp ends up on disk came
+#:                              from the engine's mark, not from an operator/archive value.
+#: The parked-cash leg is NOT a 5th value: `cash_source="bil_fallback"` already says the
+#: engine valued BIL / 511880, and duplicating it here would give one situation two labels.
+CASH_AS_OF_SOURCE_OPERATOR_FORM = "operator_form"
+CASH_AS_OF_SOURCE_OPERATOR_OVERRIDE = "operator_override"
+CASH_AS_OF_SOURCE_ARCHIVE_RESIDUAL = "archive_residual"
+CASH_AS_OF_SOURCE_MISSING = "missing"
+
+#: (P1-3) WARNING ONLY, never a refusal: this round's cash leg is numerically identical to
+#: the previous archived round's residual. On a genuine fill the residual moves; an
+#: identical number is much more often a copied/stale entry (or the residual being recycled
+#: unchanged), and the operator should see that before the order ticket is built. The
+#: archive decides nothing on it.
+CASH_AS_OF_WARNING_IDENTICAL = "identical_to_previous_round_residual"
+
 #: Machine-readable failure classes.  They are written into `nav_warnings` (prefixed as
 #: `reason=<class>: ...`) and into the refusal text, so the two failure families below can
 #: never be conflated by a reader or by a future log-grep.
@@ -2385,8 +2444,20 @@ class ExecutionService:
         nav_warnings: Optional[List[str]] = None,
         anchors: Optional[Mapping[str, str]] = None,
         anchor_source: Optional[str] = None,
+        cash_as_of_source: Optional[str] = None,
+        cash_as_of_input_at: Optional[str] = None,
     ) -> Dict[str, Any]:
         """The single shape every NAV path returns, so three code paths cannot drift."""
+        #: (P1-3, 2026-11-12) `cash_as_of` alone said WHICH session the cash leg belongs
+        #: to but never WHERE that stamp came from, and nothing recorded WHEN it was
+        #: adopted -- so a residual carried from the archive and a same-session operator
+        #: entry were indistinguishable after the fact. Both are additive fields.
+        #:
+        #: The fallback is `missing`, never an invented `operator_form`: every caller that
+        #: HAS an operator/archive cash input names its source explicitly, so reaching this
+        #: default means no such input existed (`cash_source` then also reports
+        #: `bil_fallback` when the engine valued the parked-cash holding).
+        resolved_cash_as_of_source = cash_as_of_source or CASH_AS_OF_SOURCE_MISSING
         return {
             #: value handed to the child as `--portfolio-value`
             "nav_effective": float(nav),
@@ -2403,6 +2474,15 @@ class ExecutionService:
             #: with `as_of` and refuse a cross-timebase `nav_effective` rather than gating on
             #: `today's equity + the previous session's settled cash`.
             "cash_as_of": cash_as_of,
+            #: (P1-3) WHERE that timebase came from (see `CASH_AS_OF_SOURCE_*`) and WHEN it
+            #: was adopted (ISO-8601, UTC). Additive: old readers ignore both keys.
+            "cash_as_of_source": resolved_cash_as_of_source,
+            "cash_as_of_input_at": cash_as_of_input_at
+            or (
+                datetime.now(timezone.utc).isoformat()
+                if cash_as_of is not None
+                else None
+            ),
             "as_of": as_of,
             #: ``symbol -> position-open date`` actually handed to the engine, and where
             #: those dates came from: ``"run_archive"`` (derived from archived books) or
@@ -2535,6 +2615,7 @@ class ExecutionService:
         universe_key: Optional[str] = None,
         exclude_dir: Optional[str] = None,
         cash_as_of: Optional[str] = None,
+        cash_as_of_source: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Mark the book to market and decide what `--portfolio-value` will be.
 
@@ -2580,6 +2661,7 @@ class ExecutionService:
                 anchors=anchors,
                 anchor_source=anchor_source,
                 cash_as_of=cash_as_of,
+                cash_as_of_source=cash_as_of_source,
             )
 
         try:
@@ -2606,6 +2688,7 @@ class ExecutionService:
                 cash_source="explicit" if cash is not None else None,
                 as_of=as_of,
                 cash_as_of=cash_as_of,
+                cash_as_of_source=cash_as_of_source,
                 anchors=anchors,
                 anchor_source=anchor_source,
                 nav_warnings=list(exc.nav_warnings)
@@ -2624,6 +2707,7 @@ class ExecutionService:
             cash_source=res.cash_source,
             as_of=res.as_of,
             cash_as_of=cash_as_of or res.as_of,
+            cash_as_of_source=cash_as_of_source,
             anchors=anchors,
             anchor_source=anchor_source,
             per_symbol=res.per_symbol,
@@ -2643,6 +2727,7 @@ class ExecutionService:
         anchors: Optional[Mapping[str, str]] = None,
         anchor_source: Optional[str] = None,
         cash_as_of: Optional[str] = None,
+        cash_as_of_source: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Explicit human override: deploy with `override_value`, but say what was skipped.
 
@@ -2713,6 +2798,7 @@ class ExecutionService:
             cash_source=cash_source,
             as_of=as_of,
             cash_as_of=cash_as_of or as_of,
+            cash_as_of_source=cash_as_of_source,
             anchors=anchors,
             anchor_source=anchor_source,
             per_symbol=per_symbol,
@@ -2750,6 +2836,12 @@ class ExecutionService:
             #: (LV1-TIMEBASE) STRUCTURED timebase of the `cash` leg (see `_nav_payload`):
             #: Stage 1 compares it with `as_of` instead of parsing dates out of a log line.
             "cash_as_of": nav_info.get("cash_as_of"),
+            #: (P1-3, 2026-11-12) ADDITIVE provenance pair so the archived snapshot is
+            #: self-describing: where the `cash_as_of` stamp came from
+            #: (`operator_form` / `operator_override` / `archive_residual` / `missing`) and
+            #: when it was adopted. Old readers simply ignore them.
+            "cash_as_of_source": nav_info.get("cash_as_of_source"),
+            "cash_as_of_input_at": nav_info.get("cash_as_of_input_at"),
             #: Position-open dates used for the total-return ratio, and their provenance.
             #: ``None`` means every symbol inside `per_symbol` was marked at RAW (a lower
             #: bound) -- see the `anchor_unavailable` entries in `nav_warnings`.
@@ -2770,8 +2862,46 @@ class ExecutionService:
         # pre-existing payload stays exactly as before.
         if nav_info.get("nav_degradation_reason"):
             payload["nav_degradation_reason"] = nav_info.get("nav_degradation_reason")
+        # (P1-3) Same additive contract: the warning key exists ONLY when this round's cash
+        # numerically equals the previous archived residual. It never blocks anything --
+        # the value is a provenance hint for the operator/audit, not a gate.
+        if nav_info.get("cash_as_of_warning"):
+            payload["cash_as_of_warning"] = nav_info.get("cash_as_of_warning")
         self.storage._save_json(path, payload)
         return path
+
+    @staticmethod
+    def _flag_cash_identical_to_previous_round(
+        nav_info: Dict[str, Any], previous_round_cash: Optional[float]
+    ) -> bool:
+        """Append `cash_as_of_warning` when this round's cash == the previous residual.
+
+        (P1-3, 2026-11-12) WARNING ONLY -- the deploy is never refused on this. On a real
+        fill the residual moves (a BUY spends cash, a SELL adds it), so an IDENTICAL number
+        is far more often a copied/stale form entry -- or the archived residual being
+        recycled unchanged -- than a coincidence. The operator should see that before the
+        ticket is built, and the archive should say it after the fact.
+
+        Returns whether the warning was set. Numeric comparison with a 1e-6 tolerance:
+        the archived value round-trips through JSON, so `==` on floats is the wrong test.
+        """
+        current = nav_info.get("cash")
+        if previous_round_cash is None or current is None:
+            return False
+        try:
+            if abs(float(current) - float(previous_round_cash)) > 1e-6:
+                return False
+        except (TypeError, ValueError):  # pragma: no cover - defensive, values are floats
+            return False
+        nav_info["cash_as_of_warning"] = CASH_AS_OF_WARNING_IDENTICAL
+        logging.warning(
+            "[nav] 本轮现金 %s 与上一轮归档残差 %s 数值相同（%s）：只告警，不拒绝；"
+            "若并非真实成交后的余量，请核对表单是否沿用了旧值。",
+            current,
+            previous_round_cash,
+            CASH_AS_OF_WARNING_IDENTICAL,
+        )
+        return True
 
     def _read_nav_breakdown(self, path: str) -> Optional[Dict[str, Any]]:
         """The snapshot at `path` as a dict, or `None` when absent/unreadable/empty."""
@@ -2807,6 +2937,13 @@ class ExecutionService:
             #: summary so a later reader does not have to infer it (`_archived_cash_for`
             #: consumes exactly this field when it carries a residual forward).
             f"cash_as_of{suffix}": nav.get("cash_as_of"),
+            #: (P1-3) Provenance of that timebase, published next to it so a summary reader
+            #: never has to open the breakdown file to learn `operator_form` vs
+            #: `archive_residual`. Old summaries lack the keys -> `None`, which reads as
+            #: "not recorded" rather than "measured".
+            f"cash_as_of_source{suffix}": nav.get("cash_as_of_source"),
+            f"cash_as_of_input_at{suffix}": nav.get("cash_as_of_input_at"),
+            f"cash_as_of_warning{suffix}": nav.get("cash_as_of_warning"),
             f"nav_stale_symbols{suffix}": list(nav.get("stale_symbols") or []),
             f"nav_warnings{suffix}": list(nav.get("nav_warnings") or []),
             f"nav_symbol_count{suffix}": len(per_symbol),
@@ -2831,6 +2968,11 @@ class ExecutionService:
         allow_intraday: bool = True,
         refresh_data: bool = True,
         cash: Optional[float] = None,
+        #: (P1-1, 2026-11-12) `HH:MM` after which this session's 5m bars are assumed
+        #: published, forwarded as `--intraday-publish-after`. ``None`` = do not pass it:
+        #: the child keeps its own 20:00 default, so argv is byte-identical to before.
+        #: Appended LAST so every existing positional caller keeps its meaning.
+        intraday_publish_after: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Execute Stage 1 Health Check.
 
@@ -2844,6 +2986,9 @@ class ExecutionService:
         carries `nav_effective=None` + `cash_as_of`, Stage 1 degrades to tier UNKNOWN and
         Stage 2 fails closed.
         """
+        # (P1-1) Validate BEFORE any side effect (run dir allocation / cache refresh), so a
+        # malformed `HH:MM` cannot leave a half-built archive entry behind.
+        publish_after = normalize_intraday_publish_after(intraday_publish_after)
         provider = data_provider or self.storage.default_data_provider or "marketdb"
         strat_key, univ_key, strat_name, univ_name = self.storage.resolve_keys(
             strategy_file=strategy_file,
@@ -2982,21 +3127,41 @@ class ExecutionService:
                 staged_cash, cash_as_of, cash_origin = self._archived_cash_for(
                     val_date, strat_key, univ_key, exclude_dir=run_dir
                 )
+                #: (P1-3) Snapshot of the PREVIOUS round's residual BEFORE the operator's
+                #: form value can replace it: that is the number the identical-cash warning
+                #: compares against, and Stage 1 must not consult the form for it.
+                previous_round_cash = staged_cash
                 if cash is not None:
                     # The operator's number wins over the archive: it is the only source
                     # that can describe THIS session's cash.
                     staged_cash, cash_as_of, cash_origin = float(cash), val_date, None
+                    staged_cash_source = CASH_AS_OF_SOURCE_OPERATOR_FORM
+                else:
+                    # (P1-3) No form cash -> either the archived residual (carrying THAT
+                    # round's own `cash_as_of`) or no cash input at all (`missing`). The
+                    # parked-cash leg is described by `cash_source="bil_fallback"`, not
+                    # duplicated as a second source value here.
+                    staged_cash_source = (
+                        CASH_AS_OF_SOURCE_ARCHIVE_RESIDUAL
+                        if staged_cash is not None
+                        else CASH_AS_OF_SOURCE_MISSING
+                    )
                 staged_nav = self._resolve_nav(
                     seed_book,
                     as_of=val_date,
                     cash=staged_cash,
                     cash_as_of=cash_as_of,
+                    cash_as_of_source=staged_cash_source,
                     portfolio_value=portfolio_value,
                     nav_override=False,
                     provider=provider,
                     strategy_key=strat_key,
                     universe_key=univ_key,
                     exclude_dir=run_dir,
+                )
+                # (P1-3) Warning only -- the gate is NOT refused on it (see the helper).
+                self._flag_cash_identical_to_previous_round(
+                    staged_nav, previous_round_cash
                 )
                 if cash_origin:
                     staged_nav["nav_warnings"] = list(staged_nav.get("nav_warnings") or []) + [
@@ -3096,6 +3261,11 @@ class ExecutionService:
             cmd.append("--no-allow-intraday")
         if not refresh_data:
             cmd.append("--no-refresh-data")
+        # (P1-1, 2026-11-12) ONLY when the operator supplied one: no token is added for
+        # `None`, so the pre-P1-1 argv is reproduced byte for byte and the child keeps its
+        # own 20:00 default. Appended last so every pre-existing token keeps its position.
+        if publish_after:
+            cmd.extend([INTRADAY_PUBLISH_AFTER_FLAG, publish_after])
 
         print(f"[ExecutionService] Running Stage 1 Health Check: {' '.join(cmd)}")
         proc = subprocess.run(
@@ -3544,6 +3714,10 @@ class ExecutionService:
         #: meaning.  "The operator asserts the submitted holdings were reviewed against
         #: broker fills" -- never inferred; see `_refuse_unconfirmed_plan_input`.
         edited: bool = False,
+        #: (P1-1, 2026-11-12) Same contract as `run_health_check`'s parameter: `HH:MM`,
+        #: appended after `edited` (still last), and ONLY forwarded when supplied
+        #: (`None` = the child keeps its 20:00 default and argv is unchanged).
+        intraday_publish_after: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Execute Stage 2 Live Deployment.
 
@@ -3582,6 +3756,9 @@ class ExecutionService:
         `account_state.json` / `holdings.json` / `nav_breakdown.json` behind, keeps the
         hand-off pending and launches no child.
         """
+        # (P1-1) Validated BEFORE the run dir is allocated / the hand-off consumed, so a
+        # malformed `HH:MM` refuses the round without touching the archive.
+        publish_after = normalize_intraday_publish_after(intraday_publish_after)
         provider = data_provider or self.storage.default_data_provider or "marketdb"
         strat_key, univ_key, strat_name, univ_name = self.storage.resolve_keys(
             strategy_file=strategy_file,
@@ -3762,6 +3939,18 @@ class ExecutionService:
             # holding marked at `val_date`) is the operator's assertion about the CURRENT
             # book, so its timebase is this session. Stamped explicitly instead of inferred.
             cash_as_of=val_date,
+            #: (P1-3, 2026-11-12) WHERE that stamp came from. An override is named first:
+            #: the operator pinned the NAV by hand, so the timebase is theirs even when a
+            #: form cash also exists.
+            cash_as_of_source=(
+                CASH_AS_OF_SOURCE_OPERATOR_OVERRIDE
+                if nav_override
+                else (
+                    CASH_AS_OF_SOURCE_OPERATOR_FORM
+                    if cash is not None
+                    else CASH_AS_OF_SOURCE_MISSING
+                )
+            ),
             portfolio_value=portfolio_value,
             nav_override=nav_override,
             provider=provider,
@@ -3769,6 +3958,15 @@ class ExecutionService:
             universe_key=univ_key,
             exclude_dir=run_dir,
         )
+        # (P1-3) WARNING ONLY, computed against the PREVIOUS archived round's residual
+        # (`exclude_dir=run_dir` keeps this round's own dir out of the walk, so a rerun
+        # compares with the round before it, not with itself). Never refuses the deploy.
+        previous_cash, _previous_cash_as_of, _previous_summary = (
+            self._archived_cash_for(
+                val_date, strat_key, univ_key, exclude_dir=run_dir
+            )
+        )
+        self._flag_cash_identical_to_previous_round(nav_info, previous_cash)
         #: The value the child receives (`--portfolio-value`).  For the computed path this is
         #: the engine's dividend-inclusive mark -- deliberately NOT `portfolio_value`.
         effective_portfolio_value = nav_info["nav_effective"]
@@ -3868,6 +4066,11 @@ class ExecutionService:
         # the child only annotates + warns on a stale input lot.
         if liquidate_stale_input_lots:
             cmd.append("--liquidate-stale-input-lots")
+        # (P1-1, 2026-11-12) ONLY when the operator supplied one -- see `run_health_check`:
+        # no token for `None`, so the pre-P1-1 argv is reproduced byte for byte and the two
+        # stages judge the same 5m availability axis.
+        if publish_after:
+            cmd.extend([INTRADAY_PUBLISH_AFTER_FLAG, publish_after])
 
         print(f"[ExecutionService] Running Stage 2 Live Deployment: {' '.join(cmd)}")
         # (LV11) An explicit "人工覆盖净值" IS the operator's assertion that the book could not
@@ -4092,6 +4295,16 @@ class ExecutionService:
             "nav_source": nav_info["nav_source"],
             "cash": nav_info["cash"],
             "cash_source": nav_info["cash_source"],
+            #: (P1-3, 2026-11-12) The cash leg's timebase provenance for THIS deploy:
+            #: which input stamped `cash_as_of` (operator_form / operator_override /
+            #: archive_residual / missing), when it was adopted, and -- only when it applies
+            #: -- the "identical to the previous round's residual" warning. MUST be declared
+            #: on `RunResponse` too, or `response_model` filters them out over HTTP and the
+            #: UI's "上次录入" line can never render.
+            "cash_as_of": nav_info["cash_as_of"],
+            "cash_as_of_source": nav_info["cash_as_of_source"],
+            "cash_as_of_input_at": nav_info["cash_as_of_input_at"],
+            "cash_as_of_warning": nav_info.get("cash_as_of_warning"),
             "nav_warnings": nav_info["nav_warnings"],
             "anchor_source": nav_info["anchor_source"],
             "nav_gate_snapshot": {

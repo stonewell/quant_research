@@ -107,6 +107,8 @@
         inputDate: document.getElementById("input-as-of-date"),
         inputValue: document.getElementById("input-portfolio-value"),
         inputCash: document.getElementById("input-cash"),
+        cashLastRecord: document.getElementById("cash-last-record"),
+        inputIntradayPublishAfter: document.getElementById("input-intraday-publish-after"),
         inputNavOverride: document.getElementById("input-nav-override"),
         inputPeakNav: document.getElementById("input-peak-nav"),
         selectProvider: document.getElementById("select-provider"),
@@ -550,6 +552,8 @@
         if (bundle.summary && bundle.summary.nav_source) {
             renderNavProvenance(bundle.summary);
         }
+        // (P1-3) Cash provenance of the round being displayed, beside the cash box.
+        renderCashLastRecord(bundle.summary || null);
         if (runProvider && el.selectProvider) {
             el.selectProvider.value = runProvider;
             saveSessionState();
@@ -1302,6 +1306,49 @@
     }
 
     /**
+     * (P1-3, 2026-11-12) "上次录入：<时间> / 来源：<source>" beside the cash box.
+     *
+     * Read from whichever round the page is SHOWING: `summary.json` on load (the archived
+     * round) or a run response's top-level scalars right after a run. The two field
+     * families exist because a round publishes the gate mark and Stage 2's own mark side by
+     * side (`*_stage2`); Stage 2's is the one describing what the operator just entered,
+     * so it wins when present.
+     *
+     * Absent keys (any archive written before P1-3) hide the line entirely: "not recorded"
+     * must never be rendered as a timestamp, and the box must not imply a provenance the
+     * archive does not have.
+     */
+    const CASH_AS_OF_SOURCE_LABEL = {
+        operator_form: "手工填写",
+        operator_override: "人工覆盖净值",
+        archive_residual: "上一轮归档残差",
+        missing: "未录入（由引擎自行估值）",
+    };
+
+    function renderCashLastRecord(src) {
+        if (!el.cashLastRecord) return;
+        const hide = () => {
+            el.cashLastRecord.style.display = "none";
+            el.cashLastRecord.textContent = "";
+        };
+        if (!src || typeof src !== "object") { hide(); return; }
+        const at = src.cash_as_of_input_at_stage2 ?? src.cash_as_of_input_at ?? null;
+        const source = src.cash_as_of_source_stage2 ?? src.cash_as_of_source ?? null;
+        if (!at && !source) { hide(); return; }
+        const sourceLabel = CASH_AS_OF_SOURCE_LABEL[source] || (source || "--");
+        const atLabel = at
+            ? String(at).replace("T", " ").replace(/\.\d+/, "").replace(/\+00:00$/, " UTC")
+            : "--";
+        let text = `上次录入：${atLabel} / 来源：${sourceLabel}`;
+        const warn = src.cash_as_of_warning_stage2 ?? src.cash_as_of_warning ?? null;
+        if (warn === "identical_to_previous_round_residual") {
+            text += "（现金与上一轮归档残差数值相同：仅告警，请确认这不是沿用的旧值）";
+        }
+        el.cashLastRecord.textContent = "💵 " + text;
+        el.cashLastRecord.style.display = "block";
+    }
+
+    /**
      * Re-render the holdings table from a deploy response.
      *
      * Source priority:
@@ -1536,6 +1583,17 @@
 
     function getNavOverrideInput() {
         return !!(el.inputNavOverride && el.inputNavOverride.checked);
+    }
+
+    // (P1-1, 2026-11-12) Optional override of the children's 20:00 5m-publication default.
+    // Blank -> `null` -> the backend does NOT append `--intraday-publish-after`, so the argv
+    // stays exactly what it was before this field existed. A malformed value is NOT
+    // silently dropped: the route answers 400 with the reason and the run does not start.
+    function getIntradayPublishAfterInput() {
+        if (!el.inputIntradayPublishAfter) return null;
+        const raw = String(el.inputIntradayPublishAfter.value ?? "").trim();
+        if (raw === "") return null;
+        return raw;
     }
 
     function recalcHoldings() {
@@ -1773,6 +1831,10 @@
             nav_override: getNavOverrideInput(),
             peak_nav: peakNav,
             data_provider: provider,
+            // (P1-1) `null` = not supplied -> the children keep their own 20:00 default.
+            // Sent by BOTH Stage 1 and Stage 2 (this object is the base for the deploy
+            // payload too), so the gate and the deploy judge the same 5m availability axis.
+            intraday_publish_after: getIntradayPublishAfterInput(),
         };
     }
 
@@ -2010,6 +2072,8 @@
             // (defect 2026-10-27) Refresh the holdings table from the ticket's planned book
             // so a long-lived page cannot re-submit this round's pre-trade holdings tomorrow.
             renderNavProvenance(data);
+            // (P1-3) The cash leg this round just adopted, with its source and timestamp.
+            renderCashLastRecord(data);
             renderHoldingsInputAlert(data.holdings_input_check);
             await refreshHoldingsAfterDeploy(data, keys);
 
@@ -2157,6 +2221,8 @@
                     state.accountState = dataDeploy.account_state;
                 }
                 renderNavProvenance(dataDeploy);
+                // (P1-3) Same provenance line as the standalone deploy path.
+                renderCashLastRecord(dataDeploy);
                 renderHoldingsInputAlert(dataDeploy.holdings_input_check);
                 await refreshHoldingsAfterDeploy(dataDeploy, keys);
             }
