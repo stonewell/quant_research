@@ -34,6 +34,11 @@ construction on any host*, and giving the window gate something to compare again
    * `as_of_trading_date()` -- close **plus** `publication_grace_minutes` (30 for
      China/HK, 15 for US; an estimate, disclosed as such in §14). Only after the grace
      does it admit *today*. This is what valuation / freshness expectations use.
+     The close here is the **day's own** (`MarketSpec.close_time_on`), so a recorded
+     13:00 US / 12:00 HK half-day admits today from 13:15 / 12:30 -- the same instant
+     `post_close_to_open_window` starts at (2026-11-12). See item 3's rationale below and
+     `MarketSpec.close_time_on`'s docstring for why `L2.27`'s "late but safe" split was
+     closed.
 4. **`SessionState` enum boundary.** `NON_TRADING_DAY` / `PRE_OPEN` /
    `OPENING_AUCTION` / `OPEN` / `LUNCH_BREAK` / `CLOSED`, with `HOLIDAY` kept as an
    **alias of `NON_TRADING_DAY`** (same value `"non_trading_day"`). Rationale: the §5
@@ -62,10 +67,14 @@ construction on any host*, and giving the window gate something to compare again
 
 **Not in scope here** (§11 Phase 0): nothing in the repo calls this module yet. Cache
 freshness (`expected_last_session`), the CLI window gate and the Web archive keys are
-`L2.2`-`L2.5`. `common/market_holidays.py` now models full-day closures **and** scheduled
-early closes (`L2.27`); the early close reaches the session-*geometry* accessors only
-(`MarketSpec.close_time_on` -> `session_close_time` / `last_expected_bar_ts`), not the
-`L2.1` as-of/session-state answers -- see `MarketSpec.close_time_on`'s docstring.
+`L2.2`-`L2.5`. `common/market_holidays.py` models full-day closures **and** scheduled
+early closes (`L2.27`). A recorded early close reaches BOTH the session-*geometry*
+accessors (`MarketSpec.close_time_on` -> `session_close_time` /
+`last_expected_bar_ts`) AND the as-of/publication chain (`_publication_time` ->
+`publication_ready` / `as_of_trading_date`), so the day becomes usable at exactly the
+instant the post-close window opens. `session_state` / `last_completed_session` still key
+off the full session (they are not publication judgements) -- see
+`MarketSpec.close_time_on`'s docstring.
 """
 
 from __future__ import annotations
@@ -194,18 +203,24 @@ class MarketSpec:
     def close_time_on(self, day: _dt.date) -> _dt.time:
         """Final close on `day`: the early close when one is recorded, else `close_time`.
 
-        **Scope (`L2.27`, disclosed):** only the session-*geometry* consumers use this --
-        `session_close_time(market, day)` and therefore `last_expected_bar_ts`, i.e. the
-        intraday freshness deadline. `MarketClock.session_state()`,
-        `last_completed_session()`, `as_of_trading_date()` and
-        `publication_ready()` still key off the full-session `close_time` (L2.1
-        semantics, intentionally untouched): on a 13:00 day they keep calling the market
-        "open" until 16:00 and hold as-of on the previous session until 16:15. That is
-        *late*, never *wrong/optimistic* -- and it is why an early-close day is only
-        judged by the freshness gate from 16:15 onward, by which time the shortened
-        deadline (12:55 for 5m bars) is what must be met. Shortening those four would
-        change every L2.1/live-gate answer and is a separate task, not a side effect of
-        an intraday-freshness fix.
+        **Scope (two consumers, since 2026-11-12):** the day-specific close feeds
+
+        1. the session-*geometry* chain -- `session_close_time(market, day)` and therefore
+           `last_expected_bar_ts`, i.e. the intraday freshness deadline (`L2.27`), and
+        2. the as-of publication chain -- `MarketClock._publication_time(day)`, which is
+           what `publication_ready()` and `as_of_trading_date()` compare against.
+
+        Because `post_close_to_open_window` takes its START from this same
+        `close_time_on(day) + grace`, the clock now admits today on a half-day at exactly
+        the instant that day's window opens. `L2.27` had deliberately left (2) on the
+        full-session `close_time` ("late, never wrong") and disclosed it as a separate
+        task; the measured cost was a dead zone, not just a delay: on a US 13:00 day the
+        previous window ended at 09:30 while the half-day's window only became visible at
+        16:15 (full close + grace), so 09:30..16:15 contained NO open window and the day
+        could not be run at all. Reading the day's own close closes that gap without
+        touching `session_state()` / `last_completed_session()` (neither is a
+        publication judgement): 13:00-16:00 on a 13:00 day still reads `OPEN`, and
+        `last_completed_session` still flips at the full close.
         """
         early = self.early_close_on(day)
         return self.close_time if early is None else early
@@ -280,8 +295,9 @@ def session_close_time(market: str, session_date: Optional[_dt.date] = None) -> 
 
     Added for `L2.26` so the intraday cache gate never hard-codes "15:00"/"16:00" in
     `common/duckdb_cache.py`: this module stays the single owner of session geometry.
-    Purely read-only -- it is a thin alias of `MarketSpec.close_time`, so the `L2.1`
-    semantics (as-of / completed-session / run-window) are untouched.
+    Purely read-only -- it is a thin alias of `MarketSpec.close_time_on`, the same
+    day-specific close the as-of publication chain and the post-close window start read
+    (2026-11-12); `session_state` / `last_completed_session` remain full-session.
 
     `L2.27` -- **day-level early close.**  `session_date=None` returns the normal
     full-session close, byte-for-byte the pre-`L2.27` answer (every existing caller, and
@@ -566,12 +582,23 @@ class MarketClock:
 
     # -- date resolution --------------------------------------------------- #
     def _publication_time(self, day: _dt.date) -> _dt.time:
-        """Market-local time at which `day`'s close is assumed published (close+grace)."""
-        close_dt = _dt.datetime.combine(day, self.spec.close_time)
+        """Market-local time at which `day`'s close is assumed published (close+grace).
+
+        The close is the **day-specific** one (`MarketSpec.close_time_on`): a recorded
+        13:00/12:00 half-day is published at 13:15/12:30, not at 16:15/16:30. This is the
+        single definition shared by `publication_ready()` / `as_of_trading_date()` and by
+        `post_close_to_open_window()`'s start, so "today is usable" and "today's window is
+        open" can never disagree on an early-close day.
+        """
+        close_dt = _dt.datetime.combine(day, self.spec.close_time_on(day))
         return (close_dt + _dt.timedelta(minutes=self.grace_minutes)).time()
 
     def publication_ready(self) -> bool:
         """True once *today's* close is at least `grace` minutes old.
+
+        The close is today's own (`close_time_on`), so a recorded half-day becomes ready
+        at 13:00+grace / 12:00+grace instead of 16:00+grace -- the same instant
+        `post_close_to_open_window()` opens today's window.
 
         Before the close this is False by construction; on a non-trading day it is
         False (there is no today-close to publish). While it is False, `as_of` stays on
@@ -627,6 +654,14 @@ class MarketClock:
         previous day, because upstream is not expected to have published it. This is
         deliberately **not** `last_completed_session()` -- that function answers the
         window-gate question ("may we run?") and returns today from the close instant.
+
+        **Half-days (2026-11-12):** "close" is the day's own close, taken from
+        `MarketSpec.close_time_on`. A recorded 13:00 US / 12:00 HK early close therefore
+        admits today from 13:15 / 12:30 -- exactly the instant
+        `post_close_to_open_window()` opens that day's window, so the two cannot disagree.
+        `session_state()` still reports `OPEN` until 16:00 on such a day (it is a session
+        phase, not a publication judgement); the run-window gate decides membership from
+        the explicit window bounds, not from `session_state()`.
         """
         local = self.local_now()
         day = local.date()
@@ -947,6 +982,9 @@ def post_close_to_open_window(
         13:00 US / 12:00 HK half-day starts 13:15 / 12:30) plus `publication_grace_minutes`
         (daily-bar availability only -- 5m has its own, later, availability rule and must
         NOT be folded in here: see `common.intraday_features.INTRADAY_5M_PUBLICATION_AFTER_LOCAL`).
+        This is the SAME `close_time_on(day) + grace` instant `as_of_trading_date()` flips
+        on (2026-11-12), so an early-close day cannot leave a dead zone between "the
+        previous window ended" and "this day's as-of became visible".
       * the end is the **next trading day's** open (`next_trading_day`, so Friday -> Monday
         and a pre-holiday day -> the day after the holiday; never "tomorrow 09:30").
     """

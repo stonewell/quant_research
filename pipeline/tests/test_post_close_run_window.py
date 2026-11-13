@@ -172,10 +172,12 @@ def test_allow_intraday_note_names_the_window_not_a_time_literal():
 def test_half_day_start_uses_the_recorded_early_close():
     """US 2026-11-27 closes at 13:00 (recorded early close) -> the window opens 13:15.
 
-    DISCLOSED RESIDUAL (`L2.27` scope, deliberately untouched here): the window's ANCHOR
-    still flips on the full-session clock (16:00 + 15min), so the half-day window becomes
-    visible at 16:15 rather than 13:15. That direction is LATE, never optimistic -- and once
-    it is visible, its START is the recorded 13:00 close + grace, not 16:15.
+    (2026-11-12) The window's ANCHOR now flips at this same start: `as_of` admits the
+    half-day from 13:00 + grace, because `as_of_trading_date()` reads the day's own close
+    (`close_time_on`) instead of the 16:00 full session. Previously the start was 13:15 but
+    the anchor only flipped at 16:15, leaving 09:30..16:15 with no open window at all --
+    the day could not legally be run. See
+    `pipeline/tests/test_half_day_as_of_window_alignment.py` for the boundary cases.
     """
     clock = MarketClock(
         market="us", now=dt.datetime(2026, 11, 27, 16, 30, tzinfo=_NY)

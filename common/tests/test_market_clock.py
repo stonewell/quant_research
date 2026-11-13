@@ -786,22 +786,37 @@ def test_pinned_early_close_dates():
     assert mh.table_revision().endswith(".2"), "data edit without a TABLE_REVISION bump?"
 
 
-def test_l2_1_session_state_and_as_of_are_deliberately_not_shortened():
-    """DISCLOSED scope boundary (L2.27): only the session GEOMETRY shrinks, not L2.1.
+def test_l2_27_as_of_follows_the_early_close_but_session_state_does_not():
+    """Half-day split, updated 2026-11-12: as-of/publication follow the early close.
 
-    `session_state` / `as_of_trading_date` keep the full-session rules, i.e. a 13:00 day is
-    still reported OPEN at 14:30 and as-of holds the previous session until close+grace.
-    That is *late*, never optimistic, and it is what keeps the fix safe: the shortened
-    deadline is only consulted from 16:15 onward, when the real close has long passed.
+    `L2.27` originally left `as_of_trading_date` / `publication_ready` on the FULL-session
+    close ("late, never optimistic") and disclosed closing them as a separate task. The
+    separate task is this one: the window START already used `close_time_on(day)`, so a US
+    13:00 day opened its window at 13:15 while as-of only flipped at 16:15 -- and between
+    the previous window's 09:30 end and 16:15 NO window was open, i.e. the half-day could
+    not legally be run at all. as-of and the window start are now the same instant
+    (`close_time_on(day) + grace`).
+
+    `session_state` / `last_completed_session` are deliberately NOT shortened: they are
+    session-phase / pure-calendar answers, not publication judgements, and the live gate
+    decides membership from the explicit window bounds.
     """
+    before_grace = clock(MARKET_US, 2026, 11, 27, 18, 14)  # 13:14 ET
+    assert before_grace.publication_ready() is False
+    assert before_grace.as_of_trading_date() == US_NORMAL  # 11-26 is Thanksgiving
+
+    at_grace = clock(MARKET_US, 2026, 11, 27, 18, 15)      # 13:15 ET = 13:00 + 15min
+    assert at_grace.publication_ready() is True
+    assert at_grace.as_of_trading_date() == US_EARLY
+
     midday = clock(MARKET_US, 2026, 11, 27, 19, 30)   # 14:30 ET, after the 13:00 close
-    assert midday.session_state() is SessionState.OPEN
-    assert midday.as_of_trading_date() == US_NORMAL    # 11-26 is Thanksgiving
+    assert midday.session_state() is SessionState.OPEN   # unchanged: phase, not publication
+    assert midday.as_of_trading_date() == US_EARLY
 
     after_grace = clock(MARKET_US, 2026, 11, 27, 21, 20)   # 16:20 ET
     assert after_grace.session_state() is SessionState.CLOSED
     assert after_grace.as_of_trading_date() == US_EARLY
-    # ...and from that moment the freshness gate measures the SHORTENED deadline.
+    # ...and the freshness gate measures the SHORTENED deadline from that as-of.
     assert last_expected_bar_ts(
         MARKET_US, after_grace.as_of_trading_date(), FIVE_MIN
     ) == _dt.datetime(2026, 11, 27, 12, 55)
