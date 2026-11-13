@@ -635,6 +635,18 @@ class StrategyConfig:
     # micro-trim that previously slipped through on the absolute 0.05 gate.
     cfsb_inertia_relative_ratio: float = 0.30
 
+    # --- (LV18, 2026-11-12) Stage-1 Barroso volatility overlay (live execution only) ---
+    # Wired in `scripts/run_live_strategy.py` (ticket build), NOT in the blend engine: the
+    # factor is a CEILING on the equity budget, i.e.
+    # `equity_budget = min(model_equity_sum, vol_scaling_factor)`. Declared here (and in
+    # `strategies_config.json` under the same prefixed names) so the config entries round-trip
+    # through `StrategyConfig.from_dict` instead of being silently dropped as "unknown key(s)"
+    # -- AGENTS.md §7's `wq_alpha_id` lesson is about silently ignored/mis-resolved blend keys.
+    # `cap` = ceiling (default); `off` = overlay disabled. Nothing here touches
+    # `cfsb_enable_vol_targeting` / `cfsb_target_vol`, which remain the engine's own scaling.
+    cfsb_portfolio_vol_overlay_enabled: bool = True
+    cfsb_portfolio_vol_overlay_mode: str = "cap"
+
     # --- Chan Crisis Shield Blend Strategy (chan_crisis_shield_blend) ---
     ccsb_three_type_weight: float = 0.45
     ccsb_vaa_weight: float = 0.35
@@ -1184,6 +1196,11 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.crb_target_vol must be > 0, got {self.crb_target_vol}")
         if self.cfsb_target_vol <= 0.0:
             raise ValueError(f"StrategyConfig.cfsb_target_vol must be > 0, got {self.cfsb_target_vol}")
+        if str(self.cfsb_portfolio_vol_overlay_mode).strip().lower() not in ("cap", "off"):
+            raise ValueError(
+                "StrategyConfig.cfsb_portfolio_vol_overlay_mode must be 'cap' or 'off', got "
+                f"{self.cfsb_portfolio_vol_overlay_mode!r}"
+            )
         if self.crb_tier1_cooldown_bars <= 0:
             raise ValueError(f"StrategyConfig.crb_tier1_cooldown_bars must be > 0, got {self.crb_tier1_cooldown_bars}")
         if self.cfsb_tier1_cooldown_bars <= 0:

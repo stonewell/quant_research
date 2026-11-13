@@ -101,6 +101,12 @@ from common.market_holidays import (
 #: fails loudly instead of looping forever.
 _MAX_LOOKBACK_DAYS = 45
 
+#: Fixed, arbitrary, mid-week instant used ONLY to construct a calendar probe clock
+#: (`MarketClock` requires a `now`). `is_trading_day` never reads the instant, so pinning
+#: it keeps calendar helpers (`next_trading_day`) entirely free of wall-clock reads --
+#: which is what lets the offline tests stay deterministic.
+_CALENDAR_PROBE_INSTANT = _dt.datetime(2000, 1, 3, tzinfo=_dt.timezone.utc)
+
 
 class NaiveDatetimeError(ValueError):
     """A datetime reached the market clock without a tzinfo.
@@ -872,6 +878,154 @@ def expected_last_session(
     )
 
 
+def next_trading_day(
+    market: str,
+    day: _dt.date,
+    holidays: Optional[Iterable[_dt.date]] = None,
+) -> _dt.date:
+    """First trading day **strictly after** `day` on the market's own calendar.
+
+    The single owner of "next session" arithmetic for the post-close run window and for
+    `live_execution_timing`'s `execution_date` hint (which used to re-implement this loop,
+    with its own 14-day bound). Friday -> Monday, pre-holiday -> the day after the
+    holiday; the answer is never "tomorrow" by assumption.
+
+    `holidays=None` uses the static table (and therefore raises on an uncovered year);
+    an explicit iterable -- including empty -- overrides it. The lookahead bound is the
+    same `_MAX_LOOKBACK_DAYS` used by `_previous_trading_day`, and exhausting it raises
+    instead of guessing a weekday.
+    """
+    if not isinstance(day, _dt.date) or isinstance(day, _dt.datetime):
+        raise TypeError(
+            f"day must be a plain datetime.date (not datetime), got {type(day).__name__}"
+        )
+    # A calendar-only probe: the instant never enters the `is_trading_day` answer, and
+    # pinning it keeps this function free of any wall-clock read.
+    probe = MarketClock(
+        market=market,
+        now=_CALENDAR_PROBE_INSTANT,
+        holidays=None if holidays is None else frozenset(holidays),
+    )
+    for offset in range(1, _MAX_LOOKBACK_DAYS + 1):
+        candidate = day + _dt.timedelta(days=offset)
+        if probe.is_trading_day(candidate):
+            return candidate
+    raise RuntimeError(
+        f"no trading day found for market={probe.market!r} in the "
+        f"{_MAX_LOOKBACK_DAYS} days after {day} -- the holiday calendar looks corrupt "
+        "(or covers every weekday); refusing to fall back to a weekday guess"
+    )
+
+
+def post_close_to_open_window(
+    market: str,
+    trading_day: Optional[_dt.date] = None,
+    holidays: Optional[Iterable[_dt.date]] = None,
+    *,
+    now: Optional[_dt.datetime] = None,
+    publication_grace_minutes: Optional[int] = None,
+) -> Tuple[_dt.datetime, _dt.datetime]:
+    """THE live run window: `as_of` close + publication grace -> next session's open.
+
+    Returns a pair of **naive market-local** datetimes `[start, end)`. This is the single
+    source of truth behind `common.cli_utils.market_run_window`; nothing else may state
+    window bounds of its own.
+
+    Why this window (2026-11-12 user ruling): the ticket prices are `as_of` closes and the
+    first executable instant is the **next open** (`execution_session="as_of+1"`,
+    `price_reference="next_open"`, frozen). Running *before* the close therefore produced
+    tickets whose price did not exist yet, and the old "13:55-14:20 / 14:10-15:00"
+    inspection windows only made sense while the book was still being traded. The honest
+    window for "decided on a published close, executable at the next open" is exactly
+    close+grace -> next open, which **crosses midnight**.
+
+    Semantics:
+      * `trading_day=None` -> `clock.as_of_trading_date()` (the session whose close+grace
+        has already elapsed), which is the same `as_of` the gate and the freshness checks
+        use, so the window cannot disagree with them.
+      * the start is the **day-specific** close (`MarketSpec.close_time_on`, so a recorded
+        13:00 US / 12:00 HK half-day starts 13:15 / 12:30) plus `publication_grace_minutes`
+        (daily-bar availability only -- 5m has its own, later, availability rule and must
+        NOT be folded in here: see `common.intraday_features.INTRADAY_5M_PUBLICATION_AFTER_LOCAL`).
+      * the end is the **next trading day's** open (`next_trading_day`, so Friday -> Monday
+        and a pre-holiday day -> the day after the holiday; never "tomorrow 09:30").
+    """
+    canonical = normalize_market(market)
+    clock = market_now(
+        canonical,
+        now=now,
+        holidays=holidays,
+        publication_grace_minutes=publication_grace_minutes,
+    )
+    day = clock.as_of_trading_date() if trading_day is None else trading_day
+    if not isinstance(day, _dt.date) or isinstance(day, _dt.datetime):
+        raise TypeError(
+            f"trading_day must be a plain datetime.date (not datetime), got "
+            f"{type(day).__name__}"
+        )
+    if not clock.is_trading_day(day):
+        raise ValueError(
+            f"{day.isoformat()} is not a trading day for market={canonical} "
+            f"(calendar={clock.calendar_status()}); a post-close window is anchored on a "
+            "session, so pass its trading day (holidays use the preceding session)"
+        )
+    start = _dt.datetime.combine(day, clock.spec.close_time_on(day)) + _dt.timedelta(
+        minutes=clock.grace_minutes
+    )
+    end = _dt.datetime.combine(
+        next_trading_day(canonical, day, holidays), clock.spec.morning_open
+    )
+    return (start, end)
+
+
+def format_run_window(window: Tuple[_dt.datetime, _dt.datetime]) -> str:
+    """Operational label for a window pair, e.g. `"2026-11-12 15:30 → 2026-11-13 09:30"`.
+
+    Datetimes (not times) on purpose: this window always crosses midnight, so a bare
+    `%H:%M-%H:%M` label would read `15:30-09:30` and invite the old "same afternoon"
+    misreading. Full dates make the next-session bind unambiguous in logs and reports.
+    """
+    try:
+        start, end = window
+        if isinstance(start, _dt.datetime) and isinstance(end, _dt.datetime):
+            return f"{start.strftime('%Y-%m-%d %H:%M')} → {end.strftime('%Y-%m-%d %H:%M')}"
+        return f"{start.strftime('%H:%M')} → {end.strftime('%H:%M')}"
+    except Exception:  # noqa: BLE001 - a label must never take a run down
+        return "unknown"
+
+
+def in_post_close_to_open_window(
+    now: Optional[_dt.datetime] = None,
+    market: str = MARKET_CHINA,
+    holidays: Optional[Iterable[_dt.date]] = None,
+    publication_grace_minutes: Optional[int] = None,
+) -> bool:
+    """Is `now` inside the post-close -> next-open window of this market?
+
+    Deliberately NOT `MarketClock.in_run_window`: that one answers "is this a trading day
+    AND inside the daily time box", so it says False all weekend and all evening
+    (non-trading days are excluded outright). The post-close window spans precisely those
+    hours, so membership is computed from the instantiated window instead of a time pair.
+    `trading_day=None` inside `post_close_to_open_window` re-anchors on `as_of`, which is
+    what makes Monday 09:00 belong to Friday's window and Monday 09:31 not.
+    """
+    clock = market_now(
+        market,
+        now=now,
+        holidays=holidays,
+        publication_grace_minutes=publication_grace_minutes,
+    )
+    start, end = post_close_to_open_window(
+        clock.market,
+        None,
+        holidays,
+        now=clock.now,
+        publication_grace_minutes=clock.publication_grace_minutes,
+    )
+    local_now = clock.local_now().replace(tzinfo=None)
+    return bool(start <= local_now < end)
+
+
 __all__ = [
     "ClockStamp",
     "MARKET_CHINA",
@@ -887,6 +1041,8 @@ __all__ = [
     "as_of_trading_date",
     "coverage_years",
     "expected_last_session",
+    "format_run_window",
+    "in_post_close_to_open_window",
     "infer_market_from_symbol",
     "infer_market_from_symbols",
     "is_covered",
@@ -894,7 +1050,9 @@ __all__ = [
     "last_expected_bar_ts",
     "market_now",
     "market_spec",
+    "next_trading_day",
     "normalize_market",
+    "post_close_to_open_window",
     "render_clock_stamp",
     "resolve_market",
     "session_close_time",

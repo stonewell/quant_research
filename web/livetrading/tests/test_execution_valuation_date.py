@@ -133,8 +133,9 @@ _RUN_WINDOW_STDERR = (
     "    verdict = assert_run_window(\n"
     "common.cli_utils.RunWindowError: [stage2] 运行窗口门禁拒绝 (RUN WINDOW GATE REFUSED): "
     "stage=stage2 market=china local_now=2026-10-23T10:05:00+08:00 session=open "
-    "expected_window=14:10-15:00 (市场本地时间) as_of=2026-10-22。窗口外运行会把「此刻」当成实时。"
-    "处理：在市场本地窗口内运行；或显式 --allow-intraday 放行盘中运行；"
+    "expected_window=2026-10-22 15:30 → 2026-10-23 09:30 (市场本地时间) "
+    "as_of=2026-10-22 execution_date=2026-10-23。窗口外运行会把「此刻」当成实时。"
+    "处理：在市场本地收盘后（日线已发布）至次日开盘前运行；或显式 --allow-intraday 放行；"
     "或 --no-strict-market-clock 降级为警告。\n"
 )
 

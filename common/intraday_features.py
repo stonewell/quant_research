@@ -1135,6 +1135,125 @@ def assess_intraday_5m_freshness(
     }
 
 
+#: (2026-11-12) When BaoStock's **intraday 5m** bars for session T are expected to be
+#: fetchable. LIVE OBSERVATION, NOT A PROTOCOL GUARANTEE: BaoStock often only refreshes the
+#: day's minute bars after ~20:00 market-local, sometimes later, and other providers are
+#: faster. Configurable via `--intraday-publish-after` (CLI) and overridable per call.
+#:
+#: This is a **second, independent availability axis** and must never be folded into
+#: `publication_grace_minutes` (the DAILY-bar rule, close+30min -> 15:30 for China): a
+#: strategy that does not need 5m is legally able to ticket from 15:30, and pushing the run
+#: window start to 20:00 would delay it for no reason.
+INTRADAY_5M_PUBLICATION_AFTER_LOCAL = "20:00"
+
+#: Three-state readiness of the as-of session's 5m layer.
+INTRADAY_5M_PUBLICATION_AVAILABLE = "available"
+INTRADAY_5M_PUBLICATION_PENDING = "pending_publication"
+INTRADAY_5M_PUBLICATION_MISSING = "missing"
+
+INTRADAY_5M_PUBLICATION_CODE_PENDING = "intraday_5m_pending_publication"
+#: Same token Stage 1's degraded path has always emitted (`intraday_5m_stale_window`).
+#: Re-spelled here only so this module can be used on its own; the two MUST stay equal --
+#: `pipeline/tests/test_intraday_5m_publication_state.py` asserts it identity-wise.
+INTRADAY_5M_PUBLICATION_CODE_MISSING = "intraday_5m_stale_window"
+
+
+def assess_intraday_5m_publication_state(
+    universe_5m: Union[Dict[str, pd.DataFrame], pd.DataFrame, None],
+    *,
+    as_of: Optional[Any] = None,
+    market: str = "china",
+    now: Optional[datetime.datetime] = None,
+    holidays: Optional[Any] = None,
+    publish_after: str = INTRADAY_5M_PUBLICATION_AFTER_LOCAL,
+    bar_interval_minutes: int = 5,
+) -> Dict[str, Any]:
+    """Three-state 5m readiness for `as_of`, on TOP of the existing staleness owner.
+
+    States:
+      * `available`           -- the cache reaches the as-of session's last full bar
+                                 (`assess_intraday_5m_freshness().stale is False`);
+      * `pending_publication` -- it does not, and the clock is still before
+                                 `publish_after` on the as-of session's own date, i.e. the
+                                 provider probably has not published yet (BaoStock: ~20:00);
+      * `missing`             -- it does not, and `publish_after` has already passed: this
+                                 is a sync defect, not a publication delay.
+
+    DESIGN: this is a *thin layer*, never a second source of truth. Whether the bars are
+    short is decided exclusively by `assess_intraday_5m_freshness` (which owns the
+    per-session deadline, half-days included); this function only adds the "what time is
+    it, relative to the publication habit" axis. Nothing here re-derives a bar deadline,
+    and `available` is definitionally `not stale` -- so the "never silently use the
+    previous session's 5m" guarantee is unchanged: a stale frame never becomes available
+    by waiting past 20:00, it becomes `missing`.
+
+    Args:
+        universe_5m: frames as returned by `load_intraday_5m_universe`.
+        as_of: the valuation session. Defaults to
+            `common.market_clock.expected_last_session(market, now=now)`.
+        now: injectable tz-aware instant (tests/replays). Omitted -> real UTC now, which is
+            the only wall-clock read of this function.
+        publish_after: `"HH:MM"` market-local expected 5m publication time.
+
+    Returns:
+        Flat dict with `status`, `available`, `expected_after`, `degraded_reason_code`
+        (`intraday_5m_pending_publication` / `intraday_5m_stale_window` / None),
+        `as_of`, `now_local`, `expected_publication_ts`, plus the freshness fields.
+    """
+    from common.market_clock import market_now
+
+    publish_time = (
+        publish_after
+        if isinstance(publish_after, datetime.time)
+        else datetime.time.fromisoformat(str(publish_after))
+    )
+    freshness = assess_intraday_5m_freshness(
+        universe_5m,
+        expected_last_session=as_of,
+        market=market,
+        now=now,
+        holidays=holidays,
+        bar_interval_minutes=bar_interval_minutes,
+    )
+    session_date = pd.Timestamp(freshness["expected_last_session"]).date()
+
+    # One clock read, market-local, naive -> comparable with the wall-clock literals below.
+    clock = market_now(market, now=now, holidays=holidays)
+    now_local = clock.local_now().replace(tzinfo=None)
+    expected_publication_ts = datetime.datetime.combine(session_date, publish_time)
+
+    stale = bool(freshness.get("stale"))
+    if not stale:
+        status = INTRADAY_5M_PUBLICATION_AVAILABLE
+        code = None
+    elif now_local < expected_publication_ts:
+        status = INTRADAY_5M_PUBLICATION_PENDING
+        code = INTRADAY_5M_PUBLICATION_CODE_PENDING
+    else:
+        status = INTRADAY_5M_PUBLICATION_MISSING
+        # Same code the degraded path has always used: "the cache did not reach the
+        # session it was supposed to hold", now with the publication delay ruled out.
+        code = INTRADAY_5M_PUBLICATION_CODE_MISSING
+
+    return {
+        "status": status,
+        "available": status == INTRADAY_5M_PUBLICATION_AVAILABLE,
+        "expected_after": publish_time.strftime("%H:%M"),
+        "degraded_reason_code": code,
+        "as_of": session_date.isoformat(),
+        "market": market,
+        "now_local": now_local.isoformat(),
+        "expected_publication_ts": expected_publication_ts.isoformat(),
+        "stale": stale,
+        "expected_last_session": freshness.get("expected_last_session"),
+        "expected_deadline_ts": freshness.get("expected_deadline_ts"),
+        "latest_available_ts": freshness.get("latest_available_ts"),
+        "lag_calendar_days": freshness.get("lag_calendar_days"),
+        "freshness_reason": freshness.get("reason"),
+        "freshness": freshness,
+    }
+
+
 def load_intraday_5m_universe(
     symbols: List[str],
     start: Optional[str] = None,

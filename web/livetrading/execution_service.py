@@ -136,10 +136,11 @@ _FAILURE_RULES: Tuple[Tuple[str, Tuple[str, ...], str, str], ...] = (
     (
         "run_window_gate",
         ("RunWindowError", "运行窗口门禁拒绝", "RUN WINDOW GATE REFUSED"),
-        "运行窗口门禁拒绝：当前不在允许的实盘运行窗口内（盘中 / 开盘前默认拒绝生成工单）",
-        "等到市场本地收盘后的运行窗口再跑（A 股 14:10 之后，收盘后门禁不再适用）；"
-        "确需盘中放行，请确认后在被调脚本上显式加 --allow-intraday（或 --no-strict-market-clock "
-        "降级为警告）——盘中工单只能使用上一已收盘交易日的价格。",
+        "运行窗口门禁拒绝：当前不在允许的实盘运行窗口内（盘中 / 开盘后 / 收盘后但日线尚未发布，默认拒绝生成工单）",
+        "等到市场本地「当日收盘+日线发布宽限 → 次日开盘」窗口内再跑（A 股约 15:30 起至次日 "
+        "09:30；若启用 5m 特征，建议 20:00 后再跑）；"
+        "确需窗口外放行，请确认后在被调脚本上显式加 --allow-intraday（或 --no-strict-market-clock "
+        "降级为警告）——窗口外工单只能使用上一已收盘交易日的价格。",
     ),
     (
         # (2026-11-04) `LiveGateDegradedError` is raised by Stage 2 BEFORE any order math

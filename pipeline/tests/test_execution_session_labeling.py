@@ -16,10 +16,11 @@ read that, not this file, if the two ever disagree):
     and therefore its header text -- never the two enum values. The original plan wording
     ("in-window => ``execution_session = as_of``") was explicitly superseded; do NOT
     reintroduce an "in-window => as_of" branch.
-(c) **Header.** The 13:55 -- 14:20 window may be named in human-facing text ONLY by a run
-    that was genuinely inside it. The two archived rounds that motivated LV2 ran pre-open
-    (02:02 / 05:53 market-local) and still claimed the window -- that is the lie this suite
-    pins shut.
+(c) **Header.** The run window (now: `as_of` close + daily grace -> NEXT open, i.e. it
+    crosses midnight) may be named in human-facing text ONLY by a run that was genuinely
+    inside it. The two archived rounds that motivated LV2 ran pre-open (02:02 / 05:53
+    market-local) and still claimed a pre-close inspection window -- that is the lie this
+    suite pins shut.
 (d) **Ticket shape.** ``live_trading_ticket.json`` is a versioned ENVELOPE
     (``{"ticket_schema": ..., "execution_session": ..., "orders": [...]}``). Every archived
     run still holds the pre-LV2 bare list, so every reader must go through
@@ -29,6 +30,7 @@ read that, not this file, if the two ever disagree):
 100% offline: no network, no real market data, no `data/runs/**`.
 """
 
+import datetime
 import json
 import os
 import sys
@@ -71,17 +73,26 @@ from common.live_execution_timing import (
 #: 2026-10-30 dir = 2026-11-02T02:02:37+08:00; 2026-11-02 dir = 2026-11-03T05:53:40+08:00.
 #: Both are pre-open and both reports wrongly claimed the 13:55 -- 14:20 window.
 _ARCHIVED_PREOPEN_INSTANTS = ("2026-11-02T02:02:37+08:00", "2026-11-03T05:53:40+08:00")
-_WINDOW = (types.SimpleNamespace(strftime=lambda f: "13:55"),
-           types.SimpleNamespace(strftime=lambda f: "14:20"))
+#: The live window is now "as_of close + daily grace -> NEXT open" (2026-11-12 ruling), so
+#: it is a datetime pair that crosses midnight, not a (time, time) pair.
+_WINDOW_START = datetime.datetime(2026, 11, 3, 15, 30)
+_WINDOW_END = datetime.datetime(2026, 11, 4, 9, 30)
+_WINDOW = (_WINDOW_START, _WINDOW_END)
+_WINDOW_LABEL = "2026-11-03 15:30 → 2026-11-04 09:30"
 
 
 def _clock_ctx(gate, *, local_now="2026-11-03T10:15:00+08:00", as_of="2026-11-03"):
     """Duck-typed stand-in for `common.cli_utils.LiveClockContext` (the real seam)."""
 
     class _Clock:
+        # `market` + `holidays` are what `next_trading_day` needs (the single owner of
+        # "next session" arithmetic); the stub no longer carries its own trading-day loop.
+        market = "china"
+        holidays = None
+
         @staticmethod
         def session_state():
-            return types.SimpleNamespace(value="open")
+            return types.SimpleNamespace(value="closed")
 
         @staticmethod
         def is_trading_day(day):
@@ -157,7 +168,8 @@ def test_in_window_run_names_the_window_and_keeps_the_frozen_enums():
     assert timing["price_reference"] == FROZEN_PRICE_REFERENCE == "next_open"
     assert timing["provenance"] == PROVENANCE_IN_WINDOW
     assert timing["in_window"] is True
-    assert "13:55" in timing["header_text"] and "14:20" in timing["header_text"]
+    assert _WINDOW_LABEL in timing["header_text"]
+    assert timing["window_label"] == _WINDOW_LABEL
 
 
 @pytest.mark.parametrize(
@@ -165,17 +177,17 @@ def test_in_window_run_names_the_window_and_keeps_the_frozen_enums():
     ["downgraded_outside_window", "intraday_allowed", "something_new"],
 )
 def test_out_of_window_run_must_not_print_the_window_but_keeps_the_frozen_enums(gate):
-    """Acceptance ②: out-of-window => NO `13:55` / `14:20` anywhere, same `as_of+1`.
+    """Acceptance ②: out-of-window => NO window label anywhere, same `as_of+1`.
 
     re-break: hard-code the window string (what the pre-LV2 `generate_reports` did) and the
-    two `assert "13:55" not in ...` lines go red.
+    `_WINDOW_LABEL not in ...` assertion goes red.
     """
     timing = resolve_execution_timing(_clock_ctx(gate), as_of="2026-11-03")
 
     assert timing["provenance"] == PROVENANCE_OUTSIDE_WINDOW
     assert timing["in_window"] is False
-    assert "13:55" not in timing["header_text"]
-    assert "14:20" not in timing["header_text"]
+    assert _WINDOW_LABEL not in timing["header_text"]
+    assert "15:30" not in timing["header_text"]
     assert timing["execution_session"] == "as_of+1"
     assert timing["price_reference"] == "next_open"
 
@@ -187,22 +199,21 @@ def test_the_two_archived_preopen_instants_never_claim_the_window(local_now):
         _clock_ctx("downgraded_outside_window", local_now=local_now),
         as_of="2026-11-02",
     )
-    assert "13:55" not in timing["header_text"]
-    assert "14:20" not in timing["header_text"]
+    assert _WINDOW_LABEL not in timing["header_text"]
     assert local_now in timing["header_text"]
 
 
 def test_not_applicable_and_replay_provenance_are_distinct_from_in_window():
-    """Weekend/holiday/post-close is NOT "in window"; a replay is not either."""
+    """A legacy `not_applicable` label is NOT "in window"; a replay is not either."""
     na = resolve_execution_timing(_clock_ctx("not_applicable"), as_of="2026-11-01")
     assert na["provenance"] == PROVENANCE_NOT_APPLICABLE
-    assert "13:55" not in na["header_text"]
+    assert _WINDOW_LABEL not in na["header_text"]
 
     replay = resolve_execution_timing(
         _clock_ctx("not_applicable_replay"), as_of="2026-10-01", run_mode="replay"
     )
     assert replay["provenance"] == PROVENANCE_REPLAY
-    assert "13:55" not in replay["header_text"]
+    assert _WINDOW_LABEL not in replay["header_text"]
     assert "REPLAY" in replay["header_text"]
 
 
@@ -380,19 +391,20 @@ def _dashboard_kwargs(timing):
 
 
 def test_dashboard_withdraws_the_clock_window_outside_the_window(capsys):
-    """The Stage-1 dashboard's "act between 14:15 and 14:50" line must not lie.
+    """The Stage-1 dashboard's clock promise must not lie.
 
     It was unconditional, so the two archived PRE-OPEN rounds printed a clock appointment
-    that had already passed / not yet arrived. Only an in-window run may name a window; an
-    out-of-window one still lists the actions but withdraws the clock promise.
+    that had already passed / not yet arrived. Only an in-window run may name a clock
+    promise; an out-of-window one still lists the actions but withdraws it.
     """
     dash = _load_script("check_live_portfolio_health_dash", os.path.join("scripts", "check_live_portfolio_health.py"))
 
     inside = resolve_execution_timing(_clock_ctx("in_window"), as_of="2026-11-03")
     dash.print_dashboard(**_dashboard_kwargs(inside))
     out_in_window = capsys.readouterr().out
-    assert "MANDATORY HUMAN TRADER ACTIONS FOR STAGE 2 (14:15 – 14:50):" in out_in_window
-    assert "13:55" in out_in_window  # the header may name the window: it was inside it
+    # The promise is now the NEXT OPEN (tickets price at the as_of close).
+    assert "成交时点: 2026-11-04 开盘" in out_in_window
+    assert _WINDOW_LABEL in out_in_window  # the header may name the window: it was inside it
 
     outside = resolve_execution_timing(
         _clock_ctx("downgraded_outside_window"), as_of="2026-11-03"
@@ -400,8 +412,8 @@ def test_dashboard_withdraws_the_clock_window_outside_the_window(capsys):
     dash.print_dashboard(**_dashboard_kwargs(outside))
     out_outside = capsys.readouterr().out
     assert "MANDATORY HUMAN TRADER ACTIONS FOR STAGE 2 (" in out_outside
-    assert "(14:15 – 14:50)" not in out_outside
-    assert "13:55" not in out_outside and "14:20" not in out_outside
+    assert "成交时点: 2026-11-04 开盘" not in out_outside
+    assert _WINDOW_LABEL not in out_outside
     # The actions themselves are NOT withheld -- only the false clock promise is.
     assert "do the thing" in out_outside
 

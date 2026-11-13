@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Stage 1 Operational Live Deployment Runner: Portfolio Health & Macro Regime Inspection.
 
-Evaluates the mandatory pre-trade health gate -- design §8 window: (13:55, 14:20) in the
-MARKET's own local time (China/HK/US), not the host's clock -- before Stage 2 order generation:
+Evaluates the mandatory pre-trade health gate inside the live run window --
+`as_of` close + daily publication grace -> the NEXT session's open, in the MARKET's own
+local time (China/HK/US), not the host's clock (see
+`common.market_clock.post_close_to_open_window`, the single owner) -- before Stage 2 order
+generation:
 1. Calculates portfolio High-Water Mark (HWM) peak-to-trough drawdown and circuit breaker tiers:
    - Normal (DD < 10%): Full risk budget, proceed to Stage 2.
    - Tier 1 (10% <= DD < 15%): Smooth linear damping towards cash (15-day auto-healing).
@@ -69,6 +72,7 @@ from common.cli_utils import (
 )
 from common.freshness import assert_fresh_universe
 from common.indicators import sma
+from common.intraday_features import INTRADAY_5M_PUBLICATION_AFTER_LOCAL
 from common.live_execution_timing import (
     merge_timing_into_summary,
     resolve_execution_timing,
@@ -441,6 +445,18 @@ def parse_args(args: Optional[List[str]] = None):
             "Intraday cutoff time for Stage 1, expressed in the MARKET's local wall clock (not the "
             "host's; default: 14:00, 36 5m bars). Used only for 5m microstructure/drawdown monitoring; "
             "daily-bar valuation always uses the as-of session from the market clock."
+        ),
+    )
+    parser.add_argument(
+        "--intraday-publish-after",
+        default=INTRADAY_5M_PUBLICATION_AFTER_LOCAL,
+        help=(
+            "Market-local wall-clock time after which the as-of session's 5m bars are assumed "
+            f"published (default {INTRADAY_5M_PUBLICATION_AFTER_LOCAL}). BaoStock 5m data often only "
+            "appears after ~20:00 -- this is a live observation, not a protocol guarantee, and it is "
+            "independent of --publication-grace-minutes (the DAILY bar rule): it never moves the run "
+            "window, it only decides whether a missing 5m layer is reported as "
+            "'pending_publication' (wait) or 'missing' (sync defect)."
         ),
     )
     parser.add_argument(
@@ -2172,10 +2188,18 @@ INTRADAY_5M_STATUS_EVALUATED = "evaluated"
 INTRADAY_5M_STATUS_STALE = "degraded_stale_intraday_cache"
 INTRADAY_5M_STATUS_UNSUPPORTED = "provider_unsupported"
 INTRADAY_5M_STATUS_UNMEASURED = "degraded_unmeasured_features"
+#: (2026-11-12) Same bars-missing fact as STALE/UNMEASURED, but the CAUSE is measured: the
+#: clock has not reached the 5m publication time yet (`--intraday-publish-after`, 20:00 for
+#: BaoStock). Distinct on purpose -- "wait" and "fix the sync" need different operator
+#: actions, and auditing a run must be able to tell them apart months later.
+INTRADAY_5M_STATUS_PENDING = "pending_publication"
 
 INTRADAY_5M_CODE_STALE = "intraday_5m_stale_window"
 INTRADAY_5M_CODE_UNAVAILABLE = "intraday_5m_unavailable"
 INTRADAY_5M_CODE_UNMEASURED = "intraday_5m_features_unmeasured"
+#: Mirrors `common.intraday_features.INTRADAY_5M_PUBLICATION_CODE_PENDING` (one spelling is
+#: asserted equal in the offline tests; kept local so this script keeps its lazy imports).
+INTRADAY_5M_CODE_PENDING = "intraday_5m_pending_publication"
 
 #: (D7 follow-up, 2026-11-11) Injectable wall clock for the self-report stamp.
 #: `None` -> real UTC now (production behaviour unchanged); tests/replays pin it so two
@@ -2336,6 +2360,7 @@ def classify_intraday_5m_status(
     features_measured: int,
     requested: bool = True,
     freshness: Optional[Dict[str, Any]] = None,
+    publication: Optional[Dict[str, Any]] = None,
     now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """Derive `status` / `degraded` / `degraded_reason_code` from MEASURED facts.
@@ -2346,12 +2371,21 @@ def classify_intraday_5m_status(
     one. Only when it is omitted does the coarser max-bar-date heuristic of `coverage` apply
     (kept for callers/tests that only measured coverage).
 
+    `publication` is the output of
+    `common.intraday_features.assess_intraday_5m_publication_state` -- the SAME staleness
+    fact plus the "has the 5m publication hour arrived yet" axis. When it says
+    `pending_publication` and no feature was measured, the cause is known
+    (`intraday_5m_pending_publication`) and it OUTRANKS the generic
+    `degraded_unmeasured_features` label: the operator action is "rerun after 20:00", not
+    "debug the feature path". It never upgrades a degraded state to `evaluated`.
+
     The emitted `degraded_reason_code` never uses `provider_unsupported_5m`: that token is a
     PROVIDER-LEVEL fact owned by the loader's `fallback_reason` (e.g. "fuyao has no 5m rows
     for 601872.SH"), not a layer-level diagnosis. The layer-level codes are:
     `intraday_5m_unavailable` (zero 5m frames at all), `intraday_5m_stale_window` (frames
     exist but end on an earlier session), `intraday_5m_features_unmeasured` (frames reach
-    the session yet no feature was measured).
+    the session yet no feature was measured), `intraday_5m_pending_publication` (bars short
+    of the session AND the publication hour has not arrived).
     """
     rows_5m = int(coverage.get("rows_5m") or 0)
     try:  # lazy: keep this script's module-level imports unchanged
@@ -2387,8 +2421,15 @@ def classify_intraday_5m_status(
     else:
         status, code = INTRADAY_5M_STATUS_UNMEASURED, INTRADAY_5M_CODE_UNMEASURED
 
+    # Known cause outranks the generic label, but only while nothing was measured: a
+    # measured feature set is `evaluated` no matter what the publication clock says.
+    if publication is not None and int(features_measured) <= 0:
+        if publication.get("status") == INTRADAY_5M_STATUS_PENDING:
+            status = INTRADAY_5M_STATUS_PENDING
+            code = publication.get("degraded_reason_code") or INTRADAY_5M_CODE_PENDING
+
     degraded = status != INTRADAY_5M_STATUS_EVALUATED
-    return {
+    result = {
         "requested": bool(requested),
         # Web-layer contract: `enabled` == REAL rows on the as-of session.
         "enabled": bool(requested) and rows_5m > 0,
@@ -2399,6 +2440,17 @@ def classify_intraday_5m_status(
         # ISO-8601 UTC, so the web layer's freshness check can consume this block.
         "generated_at": _intraday_5m_now(now).isoformat(),
     }
+    if publication is not None:
+        # Only the publication-axis facts; the freshness fields are merged once, by the
+        # caller, straight from the owner (`assess_intraday_5m_freshness`).
+        result.update(
+            {
+                "expected_after": publication.get("expected_after"),
+                "expected_publication_ts": publication.get("expected_publication_ts"),
+                "publication_state": publication.get("status"),
+            }
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2558,6 +2610,17 @@ def resolve_gate_directive(
                 f"（{intraday_5m_info.get('unavailable_reason', 'no measured intraday features')}）。"
                 "该门禁既未通过也未触发；未测得数据不会被当作 PASS，也不会缩放买入预算。"
             )
+            # (2026-11-12) The cause is KNOWN and temporary (BaoStock 5m publishes ~20:00).
+            # Disclosed as an operator action, never as a refusal: the DAILY-bar decision is
+            # complete at close+grace, so a book that does not need the 5m gate is unaffected;
+            # only a strategy that DOES need it should rerun later. Tickets are still emitted.
+            if intraday_5m_info.get("status") == INTRADAY_5M_STATUS_PENDING:
+                actions.append(
+                    "⏳ 5m 当日数据尚未发布（BaoStock 通常 "
+                    f"{intraday_5m_info.get('expected_after') or INTRADAY_5M_PUBLICATION_AFTER_LOCAL} "
+                    "后可用）：依赖 5m 日内门禁（如 intraday_buy_scale / 日内分布门禁）的策略，"
+                    "建议 20:00 后重跑本阶段；本次仅按日线口径出票，未使用 5m 特征。"
+                )
         elif intraday_5m_info and intraday_5m_info.get("distribution_gate_status") == "UNKNOWN":
             # Partially-measured case (2026-10-22 live-path hardening): some
             # symbols carry a VWAP premium but too few carry every component for
@@ -2764,7 +2827,7 @@ def print_dashboard(
         )
 
     if intraday_5m_info and (intraday_5m_info.get("requested") or intraday_5m_info.get("enabled")):
-        print("\n[4. 5-MINUTE INTRADAY MICROSTRUCTURE & MARK-TO-MARKET (14:00)]")
+        print("\n[4. 5-MINUTE INTRADAY MICROSTRUCTURE & MARK-TO-MARKET (截断时点见下)]")
         # (2026-10-22 incident, Fix 1) Render UNMEASURED metrics as N/A. The old
         # dashboard printed fabricate-looking numbers (breadth 100.0%) computed
         # from NaN-substituted constants on a run whose 5m frame was empty.
@@ -2793,7 +2856,13 @@ def print_dashboard(
                 f"fallback={_fb_chain}"
             )
         if intraday_5m_info.get("intraday_features_available") is False:
-            print(f"  ⚠️ 状态               : SKIPPED / UNKNOWN — 5m 日内特征不可用 (不影响日线门禁)")
+            if intraday_5m_info.get("status") == INTRADAY_5M_STATUS_PENDING:
+                print(
+                    "  ⏳ 状态               : PENDING PUBLICATION — 5m 当日数据尚未发布"
+                    f"（BaoStock 通常 {intraday_5m_info.get('expected_after') or INTRADAY_5M_PUBLICATION_AFTER_LOCAL} 后可用）"
+                )
+            else:
+                print(f"  ⚠️ 状态               : SKIPPED / UNKNOWN — 5m 日内特征不可用 (不影响日线门禁)")
             print(f"  原因 (Reason)         : {intraday_5m_info.get('unavailable_reason', 'N/A')}")
         print(
             f"  Intraday VWAP Breadth : {_fmt_metric(intraday_5m_info.get('intraday_vwap_breadth'), '>6.1%'):>6} "
@@ -2817,13 +2886,17 @@ def print_dashboard(
     print("-" * 110)
     print(f"FINAL PRE-TRADE DIRECTIVE : {gate_headline}")
     print("-" * 110)
-    # (LV2) Only a run genuinely INSIDE the design window may name a clock window. This line
+    # (LV2) Only a run genuinely INSIDE the run window may name a clock promise. This line
     # used to print "(14:15 – 14:50)" unconditionally -- including on the two archived PRE-OPEN
     # rounds that motivated LV2, i.e. it told an operator to "act between 14:15 and 14:50" on a
-    # report produced at 02:02 market-local. Outside the window the actions still apply; only
-    # the clock promise is withdrawn (the real timing lives in the report header).
+    # report produced at 02:02 market-local. Under the post-close window the promise is the
+    # NEXT OPEN (the ticket's price is an as_of close), so that is what gets printed.
     if timing and timing.get("in_window"):
-        print("MANDATORY HUMAN TRADER ACTIONS FOR STAGE 2 (14:15 – 14:50):")
+        _exec_date = timing.get("execution_date") or "次一交易日"
+        print(
+            f"MANDATORY HUMAN TRADER ACTIONS FOR STAGE 2 (成交时点: {_exec_date} 开盘；"
+            "工单在本窗口内生成):"
+        )
     else:
         print("MANDATORY HUMAN TRADER ACTIONS FOR STAGE 2 (窗口外 / 回放运行 — 实际时点见表头 Execution Timing):")
     for i, act in enumerate(actions, start=1):
@@ -3626,6 +3699,7 @@ def main(cli_args: Optional[List[str]] = None):
     _5m_coverage: Optional[Dict[str, Any]] = None
     _5m_provenance: Optional[Dict[str, Any]] = None
     _5m_freshness: Optional[Dict[str, Any]] = None
+    _5m_publication: Optional[Dict[str, Any]] = None
     if enable_intraday_5m:
         try:
             from common.intraday_features import (
@@ -3680,6 +3754,28 @@ def main(cli_args: Optional[List[str]] = None):
             except Exception as exc:  # noqa: BLE001 - reported, never fatal
                 print(f"[WARN] 5m 新鲜度评估失败（按未评估处理）: {exc}")
                 _5m_freshness = None
+            # (2026-11-12) SECOND, INDEPENDENT AXIS: is the as-of session's 5m layer simply
+            # not published yet? BaoStock usually refreshes the day's minute bars after
+            # ~20:00, while the DAILY bar is ready at close+grace (15:30). Without this,
+            # a 16:00 run reported a stale/frozen cache when nothing was wrong. It is built
+            # ON TOP of `assess_intraday_5m_freshness` (same `stale` truth, no second
+            # deadline arithmetic) and it never relaxes the rule that a previous session's
+            # 5m bars are unusable -- `available` is defined as `not stale`.
+            _5m_publication: Optional[Dict[str, Any]] = None
+            try:
+                from common.intraday_features import assess_intraday_5m_publication_state
+                _5m_publication = assess_intraday_5m_publication_state(
+                    universe_5m,
+                    as_of=as_of_date,
+                    market=getattr(clock_ctx, "market", "china") or "china",
+                    now=_intraday_5m_now(),
+                    publish_after=getattr(
+                        args, "intraday_publish_after", INTRADAY_5M_PUBLICATION_AFTER_LOCAL
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 - reported, never fatal
+                print(f"[WARN] 5m 发布状态评估失败（按「未知/已过期」处理）: {exc}")
+                _5m_publication = None
             cash_proxy = params.get("cash_proxy", "BIL")
             n_5m_ok = sum(
                 1
@@ -3715,7 +3811,30 @@ def main(cli_args: Optional[List[str]] = None):
                     if _fb_from or _fb_to
                     else "无回退"
                 )
-                if n_5m_ok <= 0:
+                _5m_pending = bool(
+                    _5m_publication is not None
+                    and _5m_publication.get("status") == INTRADAY_5M_STATUS_PENDING
+                )
+                _5m_publication_missing = bool(
+                    _5m_publication is not None
+                    and not _5m_publication.get("available")
+                    and not _5m_pending
+                )
+                if _5m_pending:
+                    # (2026-11-12) Named cause, not a cache defect: BaoStock's 5m layer for the
+                    # as-of session is usually published after ~20:00. Greppable on purpose.
+                    print(
+                        "[WARN] 5m 当日数据尚未发布（BaoStock 通常 20:00 后可用）；本次运行将不使用 5m 特征"
+                    )
+                    _unavail_reason = (
+                        f"5m 当日数据尚未发布（BaoStock 通常 {_5m_publication.get('expected_after')} "
+                        f"后可用，当前 {_5m_publication.get('now_local')}）；本次运行将不使用 5m 特征，"
+                        "且不会退化为使用前一交易日的 5m 数据"
+                        f"（缓存末根={_5m_publication.get('latest_available_ts')}，"
+                        f"expected_last_session={_5m_publication.get('expected_last_session')}）。"
+                        "如需 5m 日内门禁结论，请在该时点之后重跑。"
+                    )
+                elif n_5m_ok <= 0:
                     _unavail_reason = (
                         f"5m 日内特征缺失: {len(universe_symbols)} 个标的中 5m 数据帧非空的 0 个"
                         f"(provider={args.data_provider}, 5m 行数={_5m_coverage.get('rows_5m')})。"
@@ -3731,6 +3850,13 @@ def main(cli_args: Optional[List[str]] = None):
                         f"as_of 当日 5m 行数={_5m_coverage.get('rows_5m')}），"
                         f"因此当日没有任何 VWAP_Prem_5m 特征。实际供数 provider={_served_by}，"
                         f"回退链={_fb_chain}。需先补齐 5m 缓存，不是换 provider。"
+                        + (
+                            # (2026-11-12) The publication hour has already passed, so
+                            # "not published yet" is ruled out -- say what that means.
+                            f"已过 {_5m_publication.get('expected_after')} 仍缺当日 5m，需检查同步。"
+                            if _5m_publication_missing
+                            else ""
+                        )
                     )
                 else:
                     _unavail_reason = (
@@ -3955,6 +4081,7 @@ def main(cli_args: Optional[List[str]] = None):
             features_measured=int(intraday_5m_info.get("symbols_vwap_measured") or 0),
             requested=True,
             freshness=_5m_freshness,
+            publication=_5m_publication,
         )
         intraday_5m_info.update(_5m_coverage_rec)
         intraday_5m_info.update(_5m_prov_rec)

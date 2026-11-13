@@ -75,7 +75,7 @@ def test_six_institutional_blend_subclasses():
         GenericBlendStrategy,
     ]
     expected_versions = {
-        ChanFourStateBlendStrategy: "1.2.2",
+        ChanFourStateBlendStrategy: "1.3.0",
         ChanRiskManagedBlendStrategy: "1.1.1",
         ChanCrisisShieldBlendStrategy: "1.0.2",
         ChanFourStateShieldBlendStrategy: "1.0.1",
@@ -109,7 +109,7 @@ def test_blend_version_info_structure():
     strat = ChanFourStateBlendStrategy()
     info = strat.get_version_info()
     assert info["strategy_class"] == "ChanFourStateBlendStrategy"
-    assert info["version"] == "1.2.2"
+    assert info["version"] == "1.3.0"
     assert info["base_version"] == "2.0.0"
     assert "chan_four_state" in info["sub_strategies"]
     assert "chan_three_type" in info["sub_strategies"]

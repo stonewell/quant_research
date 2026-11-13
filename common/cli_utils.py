@@ -11,18 +11,27 @@ It also owns the **live-run market-clock plumbing** (`L2.3`): the five
 resolver, the run-window gate and the `summary.json` clock stamp.
 
 **How §5's "intraday => refuse by default" row is reconciled with §8/§14.** Taken
-literally the two cancel out: Stage 2's designed window is `(14:10, close)`, i.e. itself
-intraday, so "refuse every intraday run" would refuse its own window. The rule implemented
-here is the window-based one (§14 row 2, "不按是否盘中判，按窗口判"):
+literally the two cancel out: the historical Stage-2 window sat *inside* the session, so
+"refuse every intraday run" would have refused its own window. The rule implemented here is
+the window-based one (§14 row 2, "不按是否盘中判，按窗口判"):
 
-* inside the declared market-local window => allowed; an intraday instant still gets a
-  loud note, because the valuation as-of is the **previous published session** either way
-  (today's daily bar is unfinished and is never marked to);
-* `NON_TRADING_DAY` / `CLOSED`, or a pinned `--as-of-date` earlier than the clock's
-  session (a deliberate replay) => the window does not apply;
+* inside the declared market-local window => allowed. (Since 2026-11-12 that window is
+  post-close, so an intraday instant can no longer be inside it; the note still names the
+  as-of, which is always the last **published** session.)
+* a pinned `--as-of-date` earlier than the clock's session (a deliberate replay) => the
+  window does not apply;
 * any other instant (the 2026-10-22 case: Beijing 10:05, intraday and ~4h early) =>
   **refused**, and `--allow-intraday` (or `--no-strict-market-clock`) is the single
   documented way to override it.
+
+**The window itself (2026-11-12 ruling)** is `as_of close + publication grace ->
+next session's open`, and it **crosses midnight** (China: 15:30 -> next trading day
+09:30). It is defined once, in
+`common.market_clock.post_close_to_open_window()`, and every consumer here (gate, banner,
+`summary.json` stamp, `--help` text) reads it from there. The old fixed
+"13:55-14:20" (Stage 1) / "14:10-15:00" (Stage 2) A-share inspection boxes are gone: the
+ticket prices are `as_of` closes executable at the **next open**, so the honest moment to
+produce them is after the close is published, not while the book is still trading.
 """
 
 import argparse
@@ -42,10 +51,12 @@ from .market_clock import (
     MARKET_US,
     MarketClock,
     MixedMarketUniverseError,
-    SessionState,
     UnknownSymbolMarketError,
+    format_run_window,
     market_now,
+    next_trading_day,
     normalize_market,
+    post_close_to_open_window,
     resolve_market,
 )
 
@@ -170,17 +181,12 @@ def load_universe_with_banner(symbols, start, end, interval: str = "1d", *,
 # --------------------------------------------------------------------------- #
 # Market-clock plumbing for the live entrypoints (L2.3)
 # --------------------------------------------------------------------------- #
-#: Design §8 default run windows, in **market-local** wall clock. Stage 1 is the
-#: pre-trade health gate; Stage 2's window ends at each market's own close, which
-#: is why it cannot be a single literal (the old hard-coded "14:15"/"14:00"
-#: strings were bare A-share numbers that meant nothing for HK/US).
-_STAGE1_WINDOW: Tuple[dt.time, dt.time] = (dt.time(13, 55), dt.time(14, 20))
-_STAGE2_WINDOW_START: dt.time = dt.time(14, 10)
-_MARKET_CLOSE_TIMES: Dict[str, dt.time] = {
-    MARKET_CHINA: dt.time(15, 0),
-    MARKET_HK: dt.time(16, 0),
-    MARKET_US: dt.time(16, 0),
-}
+#: The live run window is now "as_of close + daily publication grace -> next session's
+#: open" (2026-11-12 ruling) and spans midnight, so it can no longer be a pair of bare
+#: `datetime.time` literals: the OLD `_STAGE1_WINDOW = (13:55, 14:20)` /
+#: `_STAGE2_WINDOW_START = 14:10` constants are deliberately GONE rather than kept as a
+#: second, silently-diverging truth. Everything derives from
+#: `common.market_clock.post_close_to_open_window()`.
 
 _STAGE_CHOICES = ("stage1", "stage2")
 
@@ -206,103 +212,163 @@ class RunWindowError(RuntimeError):
     """
 
 
-def market_run_window(market: str, stage: str = "stage2") -> Tuple[dt.time, dt.time]:
-    """Default run window for `market`/`stage`, as naive market-LOCAL times (§8)."""
-    canonical = normalize_market(market)
+def market_run_window(
+    market: str,
+    stage: str = "stage2",
+    *,
+    now: Optional[dt.datetime] = None,
+    holidays: Optional[Iterable[dt.date]] = None,
+    publication_grace_minutes: Optional[int] = None,
+) -> Tuple[dt.datetime, dt.datetime]:
+    """The live run window for `market`, as naive market-LOCAL datetimes.
+
+    **A pure alias, deliberately holding no truth of its own:** the window is defined
+    exactly once, in `common.market_clock.post_close_to_open_window()` (as_of close +
+    daily publication grace -> next session's open, i.e. it crosses midnight). `stage` is
+    still accepted (and validated) because every caller passes it, but both stages share
+    the SAME window: Stage 1 inspects and Stage 2 tickets off the same published close, and
+    two different boxes for the same decision is how the old pre-close window produced
+    tickets priced at a bar that had not closed yet.
+
+    `now`/`holidays` are injectable so the offline tests never read the wall clock.
+    """
     if stage not in _STAGE_CHOICES:
         raise ValueError(f"stage must be one of {_STAGE_CHOICES}, got {stage!r}")
-    if stage == "stage1":
-        return _STAGE1_WINDOW
-    return (_STAGE2_WINDOW_START, _MARKET_CLOSE_TIMES[canonical])
+    normalize_market(market)  # fail loudly on an unsupported market id
+    return post_close_to_open_window(
+        market,
+        None,
+        holidays,
+        now=now,
+        publication_grace_minutes=publication_grace_minutes,
+    )
 
 
 @dataclass(frozen=True)
 class RunWindowVerdict:
     """Result of evaluating the gate; `outcome` is persisted verbatim in `summary.json`."""
 
-    outcome: str  # in_window | not_applicable | intraday_allowed | downgraded_outside_window
+    #: in_window | intraday_allowed | downgraded_outside_window
+    #: (`not_applicable` / `not_applicable_replay` are produced by callers, not by
+    #: `assert_run_window`: under the post-close window a weekend or holiday instant is
+    #: INSIDE a window -- the one opened by the last session's close.)
+    outcome: str
     note: str
     in_window: bool
+    #: Bounds of the window that was judged, plus the two dates an operator needs in a
+    #: refusal. Kept on the verdict so the message and the persisted stamp cannot drift.
+    window_start: Optional[dt.datetime] = None
+    window_end: Optional[dt.datetime] = None
+    as_of: Optional[dt.date] = None
+    execution_date: Optional[dt.date] = None
 
 
 def assert_run_window(
     clock: MarketClock,
     stage: str,
-    window: Tuple[dt.time, dt.time],
+    window: Tuple[dt.datetime, dt.datetime],
     *,
     allow_intraday: bool = False,
     strict: bool = True,
 ) -> RunWindowVerdict:
-    """Refuse (or warn) when *now* is outside the market's declared run window.
+    """Refuse (or warn) when *now* is outside the market's post-close run window.
 
-    Semantics (design §5 + §8 + §14 row 2, reconciled -- see the module docstring):
+    `window` must be the pair returned by `market_run_window()` (naive market-local
+    datetimes). Membership is decided by the explicit instant range -- NOT by
+    `MarketClock.in_run_window`, whose "non-trading day => False" rule would wrongly
+    exclude the whole evening/weekend span this window is made of.
 
-    * **inside** the window => allowed. An intraday instant inside the window still
-      gets a loud note, because the valuation as-of for an intraday run is the
-      *previous* published session (the current day's daily bar is not finished and
-      must never be marked to).
-    * `NON_TRADING_DAY` / `CLOSED` => the window is **not applicable** (there is no
-      continuous session to be early or late for). This is the weekend/holiday and
-      post-close valuation case §5 explicitly allows: as_of is the last session.
-    * `PRE_OPEN` / `OPENING_AUCTION` / `OPEN` / `LUNCH_BREAK` **outside** the window
-      => refused by default. `--allow-intraday` (or `--no-strict-market-clock`)
-      downgrades it to a warning; the 2026-10-22 run (Beijing 10:05, i.e. intraday
-      and ~4h before the designed window) is exactly this branch.
+    Semantics:
+    * **inside** => allowed, with a note naming the window, `as_of` and `execution_date`.
+      An intraday instant can no longer be inside it (the window starts after the close),
+      so the note is informational only.
+    * **outside** => refused by default: pre-open/intraday instants are before the close
+      that opens the window, and the session close..close+grace gap is before that
+      session's daily bar is assumed published. `--allow-intraday` downgrades the refusal
+      to a loud warning (unchanged meaning: it only overrides THIS gate; a ticket whose
+      execution instant has already passed is still blocked by
+      `scripts/run_live_strategy.py::enforce_execution_executability`), and
+      `--no-strict-market-clock` likewise.
     """
     if stage not in _STAGE_CHOICES:
         raise ValueError(f"stage must be one of {_STAGE_CHOICES}, got {stage!r}")
+    if (
+        not isinstance(window, (tuple, list))
+        or len(window) != 2
+        or not all(isinstance(b, dt.datetime) for b in window)
+    ):
+        raise ValueError(
+            "window must be the (start, end) datetime pair from "
+            f"common.cli_utils.market_run_window(), got {window!r}. A bare time pair "
+            "cannot express a window that crosses midnight."
+        )
+    start, end = window
     state = clock.session_state()
-    in_window = clock.in_run_window(window)
+    as_of = clock.as_of_trading_date()
+    execution_date = next_trading_day(
+        clock.market, as_of, None if clock.holidays is None else frozenset(clock.holidays)
+    )
+    window_text = format_run_window(window)
+    local_now = clock.local_now().replace(tzinfo=None)
+    in_window = bool(start <= local_now < end)
+    # One string, reused by every branch: current instant, window bounds, as_of and the
+    # execution session. Greppable on purpose (`expected_window=`, `execution_date=`).
+    facts = (
+        f"local_now={clock.local_now().isoformat()} session={state.value} "
+        f"expected_window={window_text} (市场本地时间) "
+        f"as_of={as_of.isoformat()} execution_date={execution_date.isoformat()}"
+    )
 
     if in_window:
-        note = ""
-        if clock.is_intraday:
-            note = (
-                f"盘中窗口内运行 (session={state.value})：估值 as_of 仍为上一已收盘交易日 "
-                f"{clock.as_of_trading_date().isoformat()}，当日未完成的日线 bar 不参与估值。"
-            )
-        return RunWindowVerdict(outcome="in_window", note=note, in_window=True)
-
-    if state in (SessionState.NON_TRADING_DAY, SessionState.CLOSED):
         return RunWindowVerdict(
-            outcome="not_applicable",
+            outcome="in_window",
             note=(
-                f"{state.value}: 运行窗口不适用（非连续竞价时段），as_of="
-                f"{clock.as_of_trading_date().isoformat()}。"
+                f"收盘后→次日开盘窗口内运行：{window_text}；估值 as_of={as_of.isoformat()}，"
+                f"工单执行日 execution_date={execution_date.isoformat()}（次日开盘成交）。"
             ),
-            in_window=False,
+            in_window=True,
+            window_start=start,
+            window_end=end,
+            as_of=as_of,
+            execution_date=execution_date,
         )
 
     if allow_intraday:
         return RunWindowVerdict(
             outcome="intraday_allowed",
             note=(
-                f"显式 --allow-intraday：market={clock.market} session={state.value} "
-                f"在窗口 {window[0].strftime('%H:%M')}-{window[1].strftime('%H:%M')} 之外运行，已放行并告警。"
+                f"显式 --allow-intraday：market={clock.market} {facts} 在窗口之外运行，"
+                "已放行并告警（本开关只放行窗口门禁；已过成交时点的票据仍会被执行可执行性检查拒绝）。"
             ),
             in_window=False,
+            window_start=start,
+            window_end=end,
+            as_of=as_of,
+            execution_date=execution_date,
         )
 
     if not strict:
         return RunWindowVerdict(
             outcome="downgraded_outside_window",
             note=(
-                f"--no-strict-market-clock：market={clock.market} session={state.value} "
-                f"在窗口 {window[0].strftime('%H:%M')}-{window[1].strftime('%H:%M')} 之外运行，已降级为警告。"
+                f"--no-strict-market-clock：market={clock.market} {facts} 在窗口之外运行，"
+                "已降级为警告。"
             ),
             in_window=False,
+            window_start=start,
+            window_end=end,
+            as_of=as_of,
+            execution_date=execution_date,
         )
 
     raise RunWindowError(
         f"[{stage}] 运行窗口门禁拒绝 (RUN WINDOW GATE REFUSED): "
-        f"stage={stage} market={clock.market} "
-        f"local_now={clock.local_now().isoformat()} session={state.value} "
-        f"expected_window={window[0].strftime('%H:%M')}-{window[1].strftime('%H:%M')} "
-        f"(市场本地时间) as_of={clock.as_of_trading_date().isoformat()}。"
+        f"stage={stage} market={clock.market} {facts}。"
+        "合法窗口 = 估值日收盘 + 日线发布宽限 → 次日开盘（跨午夜）。"
         "窗口外运行会把「此刻」当成实时，而手里实际是过期的收盘价"
         "（2026-10-22 事故：北京 10:05 运行，估值日 10-22，6 只标的 K 线停在 10-21）。"
-        "处理：在市场本地窗口内运行；或显式 --allow-intraday 放行盘中运行；"
-        "或 --no-strict-market-clock 降级为警告。"
+        "处理：在市场本地收盘后（日线已发布）至次日开盘前运行；或显式 --allow-intraday "
+        "放行窗口外运行；或 --no-strict-market-clock 降级为警告。"
     )
 
 
@@ -326,7 +392,10 @@ class LiveClockContext:
     as_of_source: str
     expected_last_session: dt.date
     freshness_strict: bool
-    window: Tuple[dt.time, dt.time]
+    #: The post-close -> next-open window this stage judged (`market_run_window()`),
+    #: as naive market-local datetimes. Crosses midnight by construction, so it is a
+    #: datetime pair, not a `(time, time)` pair.
+    window: Tuple[dt.datetime, dt.datetime]
     window_gate: str
     window_note: str
     allow_intraday: bool
@@ -349,7 +418,9 @@ class LiveClockContext:
                 "as_of_trading_date": self.as_of_date,
                 "clock_as_of_trading_date": self.clock_as_of,
                 "expected_last_session": self.expected_last_session.isoformat(),
-                "run_window": f"{self.window[0].strftime('%H:%M')}-{self.window[1].strftime('%H:%M')}",
+                "run_window": format_run_window(self.window),
+                "run_window_start": self.window[0].isoformat(),
+                "run_window_end": self.window[1].isoformat(),
                 "run_window_gate": self.window_gate,
                 "run_window_note": self.window_note,
                 "allow_intraday": self.allow_intraday,
@@ -368,7 +439,7 @@ class LiveClockContext:
             f"utc={self.clock.now.isoformat()} local={self.clock.local_now().isoformat()} "
             f"as_of={self.as_of_date}({self.as_of_source}) "
             f"expected_last_session={self.expected_last_session.isoformat()} "
-            f"window={self.window[0].strftime('%H:%M')}-{self.window[1].strftime('%H:%M')}"
+            f"window={format_run_window(self.window)}"
             f"[{self.window_gate}] strict_freshness={self.freshness_strict}"
         )
 
@@ -376,15 +447,17 @@ class LiveClockContext:
 def add_market_clock_cli_args(parser: argparse.ArgumentParser, *, stage: str) -> None:
     """Add the market-clock flags shared by every live entrypoint (design §8).
 
-    stage is only used to pick the default window in `--help` text; the gate itself
-    re-derives it via `market_run_window()`.
+    stage only selects the Stage-1 vs Stage-2 defaults for `--allow-intraday`; the window
+    itself is the same for both and is re-derived from
+    `common.market_clock.post_close_to_open_window()` by the gate, so it is never restated
+    here as a literal.
 
     `--as-of-date` is NOT added here (each script already declares it); its help text
     is updated in place to say the default now comes from the market clock.
     """
     if stage not in _STAGE_CHOICES:
         raise ValueError(f"stage must be one of {_STAGE_CHOICES}, got {stage!r}")
-    window = _STAGE1_WINDOW if stage == "stage1" else (dt.time(14, 10), dt.time(15, 0))
+    window_hint = "估值日收盘 + 日线发布宽限 → 次日开盘（A 股示例：15:30 → 次日 09:30）"
     parser.add_argument(
         "--market",
         choices=(MARKET_CHINA, MARKET_HK, MARKET_US),
@@ -400,12 +473,14 @@ def add_market_clock_cli_args(parser: argparse.ArgumentParser, *, stage: str) ->
         action=argparse.BooleanOptionalAction,
         default=(stage == "stage1"),
         help=(
-            "Explicitly allow an INTRADAY run outside the default run window "
-            f"({window[0].strftime('%H:%M')}-{window[1].strftime('%H:%M')} market-local for {stage}). "
+            "Explicitly allow a run OUTSIDE the default run window "
+            f"({window_hint}; market-local for {stage}). "
             "Stage 1 defaults to True (health check on latest published session); Stage 2 defaults to False. "
             "Without it, an OPEN/LUNCH_BREAK market outside that window refuses to generate orders: that is "
             "the 2026-10-22 failure (run at Beijing 10:05, valuation 10-22, six symbols' bars stuck at 10-21). "
-            "As-of stays the last PUBLISHED session either way -- today's unfinished daily bar is never used."
+            "As-of stays the last PUBLISHED session either way -- today's unfinished daily bar is never used. "
+            "This flag relaxes the WINDOW gate only; a ticket whose execution instant has already passed is "
+            "still refused by the executability check."
         ),
     )
     parser.add_argument(
@@ -538,7 +613,15 @@ def resolve_live_clock_context(
 
     allow_intraday = bool(getattr(args, "allow_intraday", stage == "stage1"))
     strict_market_clock = bool(getattr(args, "strict_market_clock", True))
-    window = market_run_window(market, stage)
+    # Same instant / calendar / grace as `clock`, so the window can never be derived from a
+    # different wall clock than the as-of it is anchored on (tests inject `now`).
+    window = market_run_window(
+        market,
+        stage,
+        now=clock.now,
+        holidays=clock.holidays,
+        publication_grace_minutes=clock.publication_grace_minutes,
+    )
     # A pinned as-of EARLIER than the clock's published session is a deliberate historical
     # replay/backfill: "is now a good moment to trade?" is the wrong question for it (no
     # live order is being generated from today's data), and the cache/freshness expectation
@@ -554,6 +637,14 @@ def resolve_live_clock_context(
                 f"{clock_as_of.isoformat()}，运行窗口门禁不适用（本工单不是当前时点的实盘指令）。"
             ),
             in_window=False,
+            window_start=window[0],
+            window_end=window[1],
+            as_of=as_of,
+            execution_date=next_trading_day(
+                clock.market,
+                as_of,
+                None if clock.holidays is None else frozenset(clock.holidays),
+            ),
         )
     else:
         verdict = assert_run_window(

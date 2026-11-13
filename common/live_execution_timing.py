@@ -34,8 +34,8 @@ The value domain is aligned with the backtester's ``EXECUTION_PRICE_MODES``
 USER RULING (2026-11-03, `docs/development_plan.md` §4.29 and the `LV2` row) -- READ THIS
 BEFORE "FIXING" IT
 ---------------------------------------------------------------------------------
-`assert_run_window` (`common/cli_utils.py:228`) resolves ``as_of`` to the last **closed**
-session, always: an in-window intraday run still values on the previous published close
+`assert_run_window` (`common/cli_utils.py::assert_run_window`) resolves ``as_of`` to the last
+**closed** session, always: an in-window intraday run still values on the previous published close
 (today's unfinished daily bar must never be marked to).  So a live ticket is *never* a
 same-session execution, and the plan's original acceptance ("in-window => ``as_of``") was
 replaced by:
@@ -208,10 +208,19 @@ def validate_execution_timing(
 
 
 def _window_label(window: Any) -> Optional[str]:
-    """`"13:55 – 14:20"` for an `(open, close)` time pair, else None."""
+    """`"2026-11-12 15:30 → 2026-11-13 09:30"` for a window pair, else None.
+
+    Delegated to `common.market_clock.format_run_window` so the label every report quotes
+    has ONE spelling (the window crosses midnight, so a bare `15:30 – 09:30` would read as
+    the same afternoon).
+    """
+    if window is None:
+        return None
     try:
-        start, end = window
-        return f"{start.strftime('%H:%M')} – {end.strftime('%H:%M')}"
+        from common.market_clock import format_run_window
+
+        label = format_run_window(window)
+        return None if label == "unknown" else label
     except Exception:
         return None
 
@@ -219,20 +228,30 @@ def _window_label(window: Any) -> Optional[str]:
 def _next_trading_session(clock: Any, as_of: Optional[str]) -> Optional[str]:
     """Best-effort next trading day AFTER `as_of` using the market's own calendar.
 
-    Returns None when the calendar is unavailable (synthetic fixtures, no clock) -- the
-    caller must render the hint without a concrete date rather than guess one.
+    Delegates to `common.market_clock.next_trading_day` -- the single owner of this
+    arithmetic (it used to be re-implemented here with its own 14-day loop, i.e. a second
+    truth that could disagree with the run window's end date).
+
+    Returns None when the calendar is unavailable (synthetic fixtures, no clock, or a
+    duck-typed clock without a `market`), so the caller renders the hint without a
+    concrete date rather than guessing one.
     """
     if clock is None or not as_of:
         return None
+    market = getattr(clock, "market", None)
+    if not market:
+        return None
     try:
-        day = _dt.date.fromisoformat(str(as_of))
-        for _ in range(14):
-            day = day + _dt.timedelta(days=1)
-            if clock.is_trading_day(day):
-                return day.isoformat()
+        from common.market_clock import next_trading_day
+
+        holidays = getattr(clock, "holidays", None)
+        return next_trading_day(
+            market,
+            _dt.date.fromisoformat(str(as_of)),
+            None if holidays is None else frozenset(holidays),
+        ).isoformat()
     except Exception:
         return None
-    return None
 
 
 def resolve_execution_timing(
@@ -425,7 +444,7 @@ def execution_window_header(timing: Mapping[str, Any]) -> str:
 
     if provenance == PROVENANCE_IN_WINDOW and label:
         return (
-            f"Generated inside the market-local {label} inspection window "
+            f"Generated inside the market-local post-close→next-open run window {label} "
             f"(at {local_now}, gate={gate})"
         )
     if provenance == PROVENANCE_REPLAY:
@@ -435,12 +454,12 @@ def execution_window_header(timing: Mapping[str, Any]) -> str:
         )
     if provenance == PROVENANCE_NOT_APPLICABLE:
         return (
-            f"Generated at {local_now} with no continuous session in progress "
-            f"(session={timing.get('session_state') or 'unknown'}, gate={gate}); the designed "
-            f"inspection window is not applicable"
+            f"Generated at {local_now} with a legacy not-applicable gate label "
+            f"(session={timing.get('session_state') or 'unknown'}, gate={gate}); the "
+            f"post-close run window was not evaluated for this run"
         )
     return (
-        f"Generated OUTSIDE the designed inspection window at {local_now} "
+        f"Generated OUTSIDE the post-close→next-open run window at {local_now} "
         f"(session={timing.get('session_state') or 'unknown'}, gate={gate})"
     )
 

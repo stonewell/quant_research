@@ -51,9 +51,10 @@ from common.market_clock import MarketClock
 from scripts.run_live_strategy import enforce_execution_executability
 
 _TZ = _dt.timezone(_dt.timedelta(hours=8))
+#: The live window is a datetime pair now (post-close -> next open, crossing midnight).
 _WINDOW = (
-    types.SimpleNamespace(strftime=lambda f: "13:55"),
-    types.SimpleNamespace(strftime=lambda f: "14:20"),
+    _dt.datetime(2026, 11, 9, 15, 30),
+    _dt.datetime(2026, 11, 10, 9, 30),
 )
 
 

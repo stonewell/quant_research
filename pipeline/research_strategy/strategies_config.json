@@ -399,6 +399,8 @@
       "cfsb_min_entry_bars": 2,
       "cfsb_thrust_incumbent_bonus": 1.20,
       "cfsb_inertia_relative_ratio": 0.30,
+      "cfsb_portfolio_vol_overlay_enabled": true,
+      "cfsb_portfolio_vol_overlay_mode": "cap",
       "blend_weighting_mode": "regime_ic_ir_hybrid",
       "blend_enable_orthogonalization": true,
       "blend_enable_structural_regime": true,

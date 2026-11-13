@@ -121,9 +121,10 @@ def _stage2_args(tmp_path, as_of=None, extra=None):
 def test_intraday_run_is_refused_by_default(monkeypatch, tmp_path):
     """Case 1: Beijing 09:59 is OPEN -> refusal, and the message must be actionable.
 
-    This is the 2026-10-22 shape (intraday, hours before the designed window). The gate
-    must name the stage, market, market-local time, session state and expected window --
-    "not in window" alone tells an operator nothing.
+    This is the 2026-10-22 shape (intraday, hours after the window's end, which is the
+    session OPEN). The gate must name the stage, market, market-local time, session state,
+    the window bounds, as_of and execution_date -- "not in window" alone tells an operator
+    nothing.
     """
     from scripts.run_live_strategy import main as live_main
 
@@ -136,7 +137,10 @@ def test_intraday_run_is_refused_by_default(monkeypatch, tmp_path):
     assert "market=china" in msg
     assert "2026-10-23T09:59:00+08:00" in msg  # market-local, not host-local
     assert "session=open" in msg
-    assert "14:10-15:00" in msg
+    # The window is "as_of close + grace -> NEXT open" and crosses midnight.
+    assert "expected_window=2026-10-22 15:30 → 2026-10-23 09:30" in msg
+    assert "as_of=2026-10-22" in msg
+    assert "execution_date=2026-10-23" in msg
     assert "--allow-intraday" in msg
     # Nothing was produced: the gate runs before any data load.
     assert not (tmp_path / "live_trading_ticket.csv").exists()
@@ -179,9 +183,9 @@ def test_allow_intraday_runs_but_values_at_previous_published_session(monkeypatc
 def test_pre_open_us_book_resolves_previous_session(monkeypatch, tmp_path):
     """Case 6: US 09:00 ET PRE_OPEN -> as_of is 10-22 (the host's `date.today()` said 10-23).
 
-    The window gate treats PRE_OPEN as outside the window, so the run is refused by
-    default -- but the REFUSAL message must already carry the correct as_of, and
-    `--allow-intraday` must then value at 10-22, not 10-23.
+    PRE_OPEN is **inside** the post-close window: 10-22's close+grace (16:15) opened a
+    window that ends at 10-23's open (09:30), so 09:00 is a legal moment to write a ticket
+    that fills at that open. What must hold is the VALUATION: 10-22, never 10-23.
     """
     from scripts.run_live_strategy import main as live_main
 
@@ -195,16 +199,14 @@ def test_pre_open_us_book_resolves_previous_session(monkeypatch, tmp_path):
         "--data-provider", "synthetic",
         "--no-cache",
     ]
-    with pytest.raises(RunWindowError) as excinfo:
-        live_main(base + ["--as-of-date", _AS_OF_INTRADAY])
-    assert "market=us" in str(excinfo.value)
-    assert "session=pre_open" in str(excinfo.value)
-
-    live_main(base + ["--as-of-date", _AS_OF_INTRADAY, "--allow-intraday"])
+    live_main(base + ["--as-of-date", _AS_OF_INTRADAY])
     clock = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))["clock"]
     assert clock["market"] == "us"
     assert clock["as_of_trading_date"] == _AS_OF_INTRADAY
     assert clock["local_now"].endswith("-04:00")  # DST-aware, from tzdata
+    assert clock["run_window_gate"] == "in_window"
+    # Window = 10-22 close (16:00) + 15min US grace -> 10-23 09:30 open.
+    assert clock["run_window"] == "2026-10-22 16:15 → 2026-10-23 09:30"
 
 
 def test_default_as_of_comes_from_the_market_clock_not_the_host(monkeypatch, tmp_path):
@@ -221,11 +223,16 @@ def test_default_as_of_comes_from_the_market_clock_not_the_host(monkeypatch, tmp
     assert clock["as_of_source"] == "market_clock"
     assert clock["as_of_trading_date"] == _AS_OF_PUBLISHED
     assert clock["session"] == "closed"
-    assert clock["run_window_gate"] == "not_applicable"
+    # 15:30 IS the window start: close 15:00 + 30min grace, running until the next open.
+    assert clock["run_window_gate"] == "in_window"
 
 
 def test_weekend_as_of_resolves_to_previous_friday_and_is_allowed(monkeypatch, tmp_path):
-    """Case 4: Saturday -> NON_TRADING_DAY, as_of = Friday 10-23, window not applicable."""
+    """Case 4: Saturday -> NON_TRADING_DAY, as_of = Friday 10-23, INSIDE Friday's window.
+
+    The window a weekend belongs to is the one opened by Friday's close and closed by
+    Monday's open -- so Saturday is legally inside it (it used to be 'not applicable').
+    """
     from scripts.run_live_strategy import main as live_main
 
     _freeze(monkeypatch, _SATURDAY)
@@ -233,23 +240,33 @@ def test_weekend_as_of_resolves_to_previous_friday_and_is_allowed(monkeypatch, t
     clock = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))["clock"]
     assert clock["session"] == "non_trading_day"
     assert clock["as_of_trading_date"] == _AS_OF_PUBLISHED  # Friday, not Saturday
-    assert clock["run_window_gate"] == "not_applicable"
+    assert clock["run_window_gate"] == "in_window"
+    # Friday's close -> MONDAY's open (not "tomorrow 09:30").
+    assert clock["run_window"] == "2026-10-23 15:30 → 2026-10-26 09:30"
 
 
 def test_published_grace_boundary_decides_today_vs_yesterday(monkeypatch, tmp_path):
     """Case 2 vs 3: 15:05 (unpublished) keeps as_of on 10-22; 15:30 moves it to 10-23.
 
-    (`D3`, 2026-11-11) At 15:05 the valuation session is still 10-22, so the declared fill is
-    the 10-23 OPEN -- 5h35m in the past. That run now fails closed (an `as_of+1` ticket
-    written after its own open cannot be honoured). The grace boundary is exactly what makes
-    the 15:30 sibling legal: it values on 10-23 and therefore declares the next session's
-    open (2026-10-26, Monday), which is still ahead of the writer.
+    (`D3`, 2026-11-11) At 15:05 the valuation session is still 10-22, so the declared fill
+    would be the 10-23 OPEN -- 5h35m in the past. Under the post-close window that instant
+    is refused even EARLIER, by the window gate: 10-22's window closed at 10-23 09:30 and
+    10-23's window does not open until 15:30. `--allow-intraday` still cannot rescue it --
+    the executability check then fails closed on its own. The grace boundary is exactly what
+    makes the 15:30 sibling legal: it values on 10-23 and therefore declares the next
+    session's open (2026-10-26, Monday), which is still ahead of the writer.
     """
     from scripts.run_live_strategy import main as live_main
 
     _freeze(monkeypatch, _BEIJING_1505)
-    with pytest.raises(MissedExecutionOpenError):
+    with pytest.raises(RunWindowError) as excinfo:
         live_main(_stage2_args(tmp_path))
+    assert "expected_window=2026-10-22 15:30 → 2026-10-23 09:30" in str(excinfo.value)
+    assert not (tmp_path / "live_trading_ticket.csv").exists()
+
+    # The override does not make an already-open fill legal: this is the D3 invariant.
+    with pytest.raises(MissedExecutionOpenError):
+        live_main(_stage2_args(tmp_path, extra=["--allow-intraday"]))
     block = json.loads((tmp_path / "execution_timing.json").read_text(encoding="utf-8"))
     assert block["as_of"] == _AS_OF_INTRADAY
     assert block["execution_date"] == _AS_OF_PUBLISHED
@@ -264,6 +281,7 @@ def test_published_grace_boundary_decides_today_vs_yesterday(monkeypatch, tmp_pa
     clock = json.loads((published_dir / "summary.json").read_text(encoding="utf-8"))["clock"]
     assert clock["as_of_trading_date"] == _AS_OF_PUBLISHED
     assert clock["publication_grace_minutes"] == 30
+    assert clock["run_window"] == "2026-10-23 15:30 → 2026-10-26 09:30"
 
 
 # --------------------------------------------------------------------------- #
@@ -576,11 +594,28 @@ def test_backtest_guard_rejects_a_real_session():
 # Reconciliation sanity: the gate's two spellings agree, and cost nothing to compute
 # --------------------------------------------------------------------------- #
 def test_run_window_defaults_are_market_local():
-    """`--cutoff`-style literals are gone: windows come from the market's own session."""
-    assert cli_utils.market_run_window("china", "stage1") == (dt.time(13, 55), dt.time(14, 20))
-    assert cli_utils.market_run_window("china", "stage2") == (dt.time(14, 10), dt.time(15, 0))
-    assert cli_utils.market_run_window("hk", "stage2") == (dt.time(14, 10), dt.time(16, 0))
-    assert cli_utils.market_run_window("us", "stage2") == (dt.time(14, 10), dt.time(16, 0))
+    """The window is ONE post-close -> next-open range, derived per market (no literals)."""
+    # China: 15:00 close + 30min grace -> next trading day 09:30 open. Injected `now`
+    # (Friday 2026-10-23 15:30) so nothing here reads the wall clock.
+    china = cli_utils.market_run_window("china", "stage2", now=_BEIJING_1530)
+    assert china == (
+        dt.datetime(2026, 10, 23, 15, 30),
+        dt.datetime(2026, 10, 26, 9, 30),
+    )
+    # Both stages judge the same window: the inspection stage and the ticketing stage read
+    # the SAME published close.
+    assert cli_utils.market_run_window("china", "stage1", now=_BEIJING_1530) == china
+    # HK: 16:00 close + 30min. At 15:30 Beijing/HK the HK close has NOT been published yet,
+    # so as_of is still 10-22 -> the window runs 10-22 16:30 -> 10-23 09:30.
+    assert cli_utils.market_run_window("hk", "stage2", now=_BEIJING_1530) == (
+        dt.datetime(2026, 10, 22, 16, 30),
+        dt.datetime(2026, 10, 23, 9, 30),
+    )
+    # US: 16:00 close + 15min -> next day 09:30 (local wall clock of that market).
+    assert cli_utils.market_run_window("us", "stage2", now=_US_PREOPEN) == (
+        dt.datetime(2026, 10, 22, 16, 15),
+        dt.datetime(2026, 10, 23, 9, 30),
+    )
 
 
 def test_allow_stale_prices_and_no_strict_freshness_are_one_switch(monkeypatch):
@@ -600,8 +635,11 @@ def test_allow_stale_prices_and_no_strict_freshness_are_one_switch(monkeypatch):
         allow_stale_prices = False
 
     # `BIL` is a cash proxy, so it must not make an A-share book look cross-market --
-    # and the label records that inference excluded it.
-    ctx = cli_utils.resolve_live_clock_context(_Args(), ["600000.SH", "BIL"], "stage2")
+    # and the label records that inference excluded it. `now` is injected so this test
+    # never depends on the host's wall clock being inside the window.
+    ctx = cli_utils.resolve_live_clock_context(
+        _Args(), ["600000.SH", "BIL"], "stage2", now=_BEIJING_1530
+    )
     assert ctx.freshness_strict is True
     assert ctx.market_inference == "inferred_excluding_cash_proxies"
 
@@ -609,13 +647,15 @@ def test_allow_stale_prices_and_no_strict_freshness_are_one_switch(monkeypatch):
     explicit = _Args()
     explicit.market = "china"
     assert cli_utils.resolve_live_clock_context(
-        explicit, ["600000.SH", "BIL"], "stage2"
+        explicit, ["600000.SH", "BIL"], "stage2", now=_BEIJING_1530
     ).market_inference == "explicit"
 
     for attr in ("strict_freshness", "allow_stale_prices"):
         args = _Args()
         setattr(args, attr, False if attr == "strict_freshness" else True)
-        ctx = cli_utils.resolve_live_clock_context(args, ["600000.SH"], "stage2")
+        ctx = cli_utils.resolve_live_clock_context(
+            args, ["600000.SH"], "stage2", now=_BEIJING_1530
+        )
         assert ctx.freshness_strict is False
 
 
@@ -715,7 +755,7 @@ def test_explicit_same_day_as_of_is_live_not_replay(monkeypatch, tmp_path, capsy
     assert "REPLAY MODE" not in out
     summary = _summary(tmp_path)
     assert summary["run_mode"] == "live"
-    assert summary["clock"]["run_window_gate"] == "not_applicable"
+    assert summary["clock"]["run_window_gate"] == "in_window"
     assert summary["clock"]["as_of_source"] == "explicit"
 
 

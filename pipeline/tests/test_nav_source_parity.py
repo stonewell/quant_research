@@ -211,11 +211,14 @@ def _patch_5m(monkeypatch, loader=None, enricher=None):
     )
     # The 5m block asks for a provider instance; nothing below it may touch a real cache.
     monkeypatch.setattr(_mod, "get_data_provider", lambda *a, **k: object())
-    # Deterministic self-report stamp (see the docstring above).
+    # Deterministic self-report stamp AND deterministic 5m publication state (see the
+    # docstring above). 2026-04-11T00:05Z == 2026-04-10 20:05 ET: AFTER the 5m publication
+    # hour (20:00), so a cache that stops on 04-09 is a genuinely STALE cache, not
+    # "today's bars are not published yet" -- which is the state this fixture is about.
     monkeypatch.setattr(
         _mod,
         "INTRADAY_5M_NOW_OVERRIDE",
-        _dt.datetime(2026, 4, 10, 14, 5, 0, tzinfo=_dt.timezone.utc),
+        _dt.datetime(2026, 4, 11, 0, 5, 0, tzinfo=_dt.timezone.utc),
     )
 
 
@@ -611,7 +614,7 @@ def test_provider_fallback_and_session_staleness_reach_the_report(tmp_path, monk
     assert block["degraded_reason_code"] != "provider_unsupported_5m"
     assert block["enabled"] is False  # requested, but zero as-of rows
     assert block["requested"] is True
-    assert block["generated_at"] == "2026-04-10T14:05:00+00:00"  # pinned clock
+    assert block["generated_at"] == "2026-04-11T00:05:00+00:00"  # pinned clock
 
     # --- the Markdown banner names the lag AND the fallback chain
     md = open(os.path.join(run["out_dir"], "stage1_health_report.md"), encoding="utf-8").read()

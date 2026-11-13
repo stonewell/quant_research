@@ -32,6 +32,15 @@ Usage:
   panel ONCE for the whole symbol union, enriches the daily universe once, and reports
   the outcome honestly in `summary.json` (`observability.intraday_5m`, source
   `multi_strategy_netted`). No strategy asking for it => no 5m code path at all.
+
+  `--intraday-publish-after HH:MM` (default: UNSET) is a SECOND, INDEPENDENT axis on top of
+  the above: it does not enable 5m and it never moves the run window. When given, the round's
+  5m block additionally carries a `publication_state` assessment (via
+  `common.intraday_features.assess_intraday_5m_publication_state`) so an empty as-of 5m layer
+  can be told apart as `pending_publication` (provider simply has not published yet -- wait and
+  rerun) vs `missing` (sync defect). Unset => no assessment is computed and the block stays
+  byte-identical to the pre-flag path, i.e. Stage 2's `20:00` default is NOT silently imposed
+  on this runner's archive.
 """
 
 import argparse
@@ -281,6 +290,23 @@ def parse_args():
         ),
     )
 
+    parser.add_argument(
+        "--intraday-publish-after",
+        default=None,
+        help=(
+            "Market-local wall-clock time (HH:MM) after which the as-of session's 5m bars are "
+            "assumed published. DEFAULT: UNSET -- no publication assessment at all, so the "
+            "persisted `observability.intraday_5m` block is byte-identical to the pre-flag "
+            "path (Stage 2 / Stage 1 both default to 20:00; that default is deliberately NOT "
+            "imposed here, because this runner has no child process to forward it to -- it "
+            "labels its OWN 5m block). When given, an as-of 5m layer that does not reach the "
+            "session is labelled `pending_publication` (wait and rerun) instead of `missing` "
+            "(sync defect). It never enables 5m (that stays config-driven, §4.50.0) and never "
+            "moves the run window. See common.intraday_features."
+            "assess_intraday_5m_publication_state."
+        ),
+    )
+
     add_data_provider_cli_args(parser)
     # (L2.3) as-of / market / run-window gate / strict freshness / probe retry limit.
     add_market_clock_cli_args(parser, stage="stage2")
@@ -517,6 +543,7 @@ def build_intraday_5m_block(
     usable_symbols: List[str],
     reason: Optional[str] = None,
     round_id: Optional[str] = None,
+    publication: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """The block persisted as `observability.intraday_5m` -- SAME SHAPE as the web layer's.
 
@@ -569,6 +596,12 @@ def build_intraday_5m_block(
             message += f"原因：{reason}。"
         message += " 下游必须把日内 VWAP / Chan-5m 门槛视为 UNKNOWN/SKIPPED，绝不静默 PASS。"
         block["warning"] = message
+    # `publication_state` is attached ONLY when the operator passed
+    # `--intraday-publish-after` (`publication is None` otherwise). Keeping the key absent by
+    # default is what makes the unset path byte-identical to the pre-flag archive, and it keeps
+    # the web layer's reconciliation reading a shape it already knows.
+    if publication is not None:
+        block["publication_state"] = publication
     return block
 
 
@@ -649,6 +682,52 @@ def clear_intraday_5m_observability(output_dir: str) -> bool:
     return True
 
 
+def assess_round_publication(
+    universe_5m: Dict[str, pd.DataFrame],
+    *,
+    as_of_date: str,
+    market: str,
+    now: Optional[datetime] = None,
+    publish_after: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """`pending_publication` vs `missing` for this round's as-of 5m layer -- OPT-IN ONLY.
+
+    ``None`` when `--intraday-publish-after` was NOT given (the default): that is the whole
+    backward-compatibility contract. Nothing is computed, nothing is persisted, and the
+    `observability.intraday_5m` block keeps exactly the keys it had before this flag existed.
+    Stage 2's `20:00` default is deliberately NOT applied here: this runner would be imposing
+    "wait until 20:00" on an archive nothing asked to be re-labelled.
+
+    When a time IS given, the state is delegated wholesale to
+    `common.intraday_features.assess_intraday_5m_publication_state` (the single owner of the
+    freshness deadline + the publication-habit axis) -- no deadline arithmetic is re-derived
+    here, and a previous session's 5m bars can still never become `available` by waiting.
+
+    A calendar/clock failure is reported and downgraded to "not assessed", never fatal, which
+    matches Stage 1's degraded path (`check_live_portfolio_health.py`).
+    """
+    if publish_after is None:
+        return None
+    try:
+        from common.intraday_features import assess_intraday_5m_publication_state
+
+        state = assess_intraday_5m_publication_state(
+            universe_5m,
+            as_of=as_of_date,
+            market=market,
+            now=now,
+            publish_after=publish_after,
+        )
+    except Exception as exc:  # noqa: BLE001 - reported, never fatal (same as Stage 1)
+        print(f"[WARN] 5m 发布状态评估失败（按「未评估」处理）: {exc}")
+        return None
+    print(
+        f"[INTRADAY 5M] 发布状态: {state['status']} "
+        f"(预计发布时点 {state['expected_after']}, 市场本地此刻 {state['now_local']})"
+    )
+    return state
+
+
 def apply_intraday_5m_features(
     universe: Dict[str, pd.DataFrame],
     *,
@@ -660,12 +739,22 @@ def apply_intraday_5m_features(
     cache_dir: Optional[str] = None,
     provider_label: str = "",
     round_id: Optional[str] = None,
+    publish_after: Optional[str] = None,
+    market: str = "china",
+    now: Optional[datetime] = None,
 ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
     """ONE 5m load + ONE enrichment for the whole round; returns `(enriched, block)`.
 
     Ported from `scripts/run_live_strategy.py:2102-2168` (loading block AND the honest
     warnings -- §4.50.7 requires both, or the 2026-10-22 "printed success, fields all
     empty" success-message defect is copied onto the matrix path).
+
+    `publish_after` (``--intraday-publish-after``) is OPTIONAL and defaults to ``None``:
+    only when the operator names a time does this round assess (and persist) the
+    `pending_publication` vs `missing` axis. That assessment is delegated wholesale to
+    `common.intraday_features.assess_intraday_5m_publication_state` -- no deadline
+    arithmetic is re-derived here, exactly as Stage 1/2 do it. `now` exists so tests and
+    replays can pin the clock; ``None`` means the single real UTC read.
     """
     universe_5m = load_intraday_5m_panel(
         symbols,
@@ -676,6 +765,15 @@ def apply_intraday_5m_features(
         cache_dir=cache_dir,
     )
     enriched = enrich_intraday_5m_panel(universe, universe_5m, cutoff_time=cutoff_time)
+
+    # `--intraday-publish-after` only: OPTIONAL second availability axis (Stage 1/2 parity).
+    publication = assess_round_publication(
+        universe_5m,
+        as_of_date=as_of_date,
+        market=market,
+        now=now,
+        publish_after=publish_after,
+    )
 
     frames = summarize_intraday_5m_frames(universe_5m, as_of_date)
     n_5m_ok = sum(1 for _df in universe_5m.values() if _df is not None and not _df.empty)
@@ -727,6 +825,7 @@ def apply_intraday_5m_features(
         usable_symbols=usable,
         reason=reason,
         round_id=round_id,
+        publication=publication,
     )
     return enriched, block
 
@@ -894,6 +993,13 @@ def main():
                 cache_dir=cache_dir,
                 provider_label=args.data_provider,
                 round_id=round_id,
+                # `--intraday-publish-after` is forwarded ONLY when the operator set it
+                # (`default=None`). Unset => `publish_after=None` => no publication assessment
+                # at all, so the archived block stays byte-identical to the pre-flag path.
+                publish_after=getattr(args, "intraday_publish_after", None),
+                market=getattr(clock_ctx, "market", "china") or "china",
+                # One clock read per round: the same instant `persist_run_metadata` stamped.
+                now=getattr(clock_ctx.clock, "now", None),
             )
         except Exception as exc:
             # Honest degradation, exactly like Stage 2: warn, keep the daily signal, and
@@ -914,6 +1020,16 @@ def main():
                 usable_symbols=[],
                 reason=f"5m 加载/聚合异常: {exc}",
                 round_id=round_id,
+                # Same opt-in axis as the success path: a round that asked the question gets an
+                # answer even when the load itself blew up (empty frames are a legitimate input
+                # for the publication assessment).
+                publication=assess_round_publication(
+                    {},
+                    as_of_date=val_date,
+                    market=getattr(clock_ctx, "market", "china") or "china",
+                    now=getattr(clock_ctx.clock, "now", None),
+                    publish_after=getattr(args, "intraday_publish_after", None),
+                ),
             )
         persist_intraday_5m_observability(args.output_dir, intraday_5m_block)
 

@@ -101,6 +101,17 @@
             <button id="btn-open-settings" class="btn btn-secondary btn-icon btn-compact" title="系统路径与设置">
                 ⚙️
             </button>
+            <!-- (2026-11-12) The live run window moved from the retired pre-close
+                 inspection boxes to "post-close + daily publication grace -> next open".
+                 Stated on screen so an operator cannot plan a pre-close run by habit; the
+                 label text is pinned by web/livetrading/tests/test_run_window_ui_copy.py.
+                 The 5m layer publishes later (BaoStock ~20:00) and is a SEPARATE
+                 availability axis, hence the extra hint rather than a later window. -->
+            <span
+                id="run-window-hint"
+                style="font-size:11px;line-height:1.25;color:var(--text-muted,#8b949e);margin-left:6px;max-width:230px;"
+                title="合法出票窗口 = 估值日收盘 + 日线发布宽限 → 次日开盘（A 股约 15:30 → 次日 09:30，跨午夜）。若启用 5m 日内特征，BaoStock 通常 20:00 后才发布，建议 20:00 后运行。"
+            >建议运行时间：今日收盘后至次日开盘前（建议 15:30–20:00）</span>
         </div>
     </div>
 

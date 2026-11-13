@@ -1555,6 +1555,18 @@ def parse_args(args: Optional[List[str]] = None):
         ),
     )
     parser.add_argument(
+        "--intraday-publish-after",
+        default="20:00",
+        help=(
+            "Market-local wall-clock time after which the as-of session's 5m bars are assumed "
+            "published (default 20:00). BaoStock 5m data often only appears after ~20:00 -- a live "
+            "observation, not a protocol guarantee. Independent of --publication-grace-minutes (the "
+            "DAILY bar rule): it never moves the run window, it only labels a missing 5m layer as "
+            "'pending_publication' (wait and rerun) vs 'missing' (sync defect). See "
+            "common.intraday_features.INTRADAY_5M_PUBLICATION_AFTER_LOCAL."
+        ),
+    )
+    parser.add_argument(
         "--enable-overnight-derisk",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -2300,6 +2312,58 @@ def apply_market_value_cap(
 WEIGHT_BUDGET_TOLERANCE = 1e-9
 TARGET_WEIGHT_EFFECTIVE_DECIMALS = 8
 
+# ---------------------------------------------------------------------------------------
+# (LV18 wiring, 2026-11-12) STAGE-1 BARROSO VOLATILITY SCALING -> CAP ON THE EQUITY BUDGET
+#
+# `scripts/check_live_portfolio_health.py::evaluate_realized_volatility` has always computed
+# `vol_scaling_factor = clip(target_vol / realized_vol_21d)` (Barroso & Santa-Clara 2015,
+# target_vol = 0.12), printed it three times and archived it -- but `docs/development_plan.md`
+# LV18 registered that it had NO downstream consumer: the number was presented as an applied
+# risk action while nothing in Stage 2 was sized by it.
+#
+# WHY `cap` AND NOT A SECOND MULTIPLICATION (the load-bearing decision):
+#   `BaseBlendAllocationStrategy` already applies its OWN Garman-Klass target-vol scaling
+#   (`blend_enable_vol_targeting` / `blend_target_vol = 0.12`) to the portfolio, which is why
+#   the model's own equity target on 2026-11-11 was 46.3% instead of a fully invested book.
+#   Multiplying the two independent estimates of "how much risk to take" (archived 11-11:
+#   model equity 0.463, Stage-1 factor 0.370) would ask the book to hold only
+#   0.463 * 0.370 = 0.171 of NAV -- i.e. cut risk twice for the same observation of elevated
+#   volatility. Stage-1's factor is therefore wired as a CEILING the book may not exceed:
+#       equity_budget = min(model_equity_sum, vol_scaling_factor)
+#   The strategy's own vol targeting stays the primary sizing engine; Stage-1 can only make
+#   the book LESS aggressive, never more. See docs/version.md (2026-11-12 entry, §LV18).
+PORTFOLIO_VOL_OVERLAY_MODE_CAP = "cap"
+PORTFOLIO_VOL_OVERLAY_MODE_OFF = "off"
+PORTFOLIO_VOL_OVERLAY_MODES: Tuple[str, ...] = (
+    PORTFOLIO_VOL_OVERLAY_MODE_CAP,
+    PORTFOLIO_VOL_OVERLAY_MODE_OFF,
+)
+#: Allowlist (deliberate): the overlay is wired for `chan_four_state_blend` ONLY, declared in
+#: `pipeline/research_strategy/strategies_config.json` under the prefixed keys
+#: `cfsb_portfolio_vol_overlay_enabled` / `cfsb_portfolio_vol_overlay_mode`. AGENTS.md is
+#: explicit that blend sub-strategy/state resolution must use the strategy-PREFIXED key and
+#: never a bare name that can collide with a global `StrategyConfig` field (the 2026-10-21
+#: `wq_alpha_id` incident), so the resolver below only reads prefixed spellings.
+PORTFOLIO_VOL_OVERLAY_STRATEGY_KEYS: Tuple[str, ...] = ("chan_four_state_blend",)
+#: Reason code for "Stage-1 worked but produced no MEASURED factor" (short history / stale
+#: intraday window). A missing factor must NEVER be read as 1.0x -- that would silently
+#: re-enable full risk exactly when the risk input is unknown.
+VOL_OVERLAY_UNAVAILABLE_REASON = "vol_unavailable"
+#: (LV18 item 2, 2026-11-12) DELIVERY-SHORTFALL GUARDRAIL. The ceiling is expressed in
+#: continuous weight space, but the ticket can only deliver whole LOTS. A tiny ceiling
+#: (e.g. factor 0.037 on a ~200k account) can round down to almost nothing: the measured
+#: replay delivered 0.48% of NAV against a 3.70% ceiling -- 87% of the intended de-risking
+#: silently failed to reach the market. Anything below this delivered/capped ratio is
+#: reported (`delivery_shortfall`, `vol_overlay_delivery_ok=false`) and printed as a WARN.
+#: The guard NEVER enlarges weights and NEVER skips lot rounding to close the gap: the fix
+#: is for an operator to see the shortfall, not for the runner to invent exposure.
+VOL_OVERLAY_DELIVERY_SHORTFALL_RATIO = 0.5
+#: Reason code stamped into the audit block when a Stage-1 circuit breaker has ALREADY
+#: zeroed the risk book before the ceiling is evaluated. Without it the audit reads
+#: "capped_equity_sum=0, binding=false" and could be mistaken for the vol cap clearing the
+#: book (it did not -- it had nothing left to cap).
+VOL_OVERLAY_SUPERSEDED_BY_CIRCUIT_BREAKER = "circuit_breaker_tier3"
+
 #: (D5) Sidecar that makes "an EMPTY book" distinguishable from "no book". Written next to
 #: `post_holdings.json` by this runner; read by `web/livetrading/storage.py`
 #: (`post_holdings_meta_status`), which keeps the same filename constant.
@@ -2424,6 +2488,315 @@ def normalize_model_target_weights(
             if isinstance(detail.get("inertia_check"), dict):
                 detail["inertia_check"]["delta_weight"] = round(r["delta_weight"], 4)
     return summary
+
+
+def _as_config_bool(value: Any, default: bool) -> bool:
+    """Coerce a JSON/CLI-ish config value to bool, keeping string spellings honest.
+
+    `bool("false")` is `True`, which would make a persisted `"cfsb_portfolio_vol_overlay_enabled":
+    "false"` silently ENABLE a risk overlay. Config values here are JSON booleans in practice,
+    but the coercion must not depend on that.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on", "y"):
+        return True
+    if text in ("0", "false", "no", "off", "n"):
+        return False
+    return default
+
+
+def resolve_portfolio_vol_overlay_params(
+    strategy_key: Optional[str],
+    params: Optional[Dict[str, Any]],
+) -> Tuple[bool, str]:
+    """Resolve `(enabled, mode)` for the Stage-1 volatility overlay.
+
+    Gating order is deliberate:
+      1. STRATEGY ALLOWLIST FIRST. Only `chan_four_state_blend` may carry the overlay; every
+         other strategy resolves `(False, "off")` regardless of what its params say, so the
+         50+ other strategies keep byte-identical behaviour (AGENTS.md: do not change the
+         default behaviour of the rest of the fleet).
+      2. Then the strategy-PREFIXED keys (`cfsb_portfolio_vol_overlay_enabled` / `_mode`),
+         never a bare name -- `resolve_blend_param`'s final fallback is a bare
+         `getattr(cfg, name)`, which is exactly the collision class the `wq_alpha_id` incident
+         came from. Here the prefixed spelling is spelled out explicitly for this strategy.
+      3. Default ENABLED (user requirement, 2026-11-12): a dump that predates the key must not
+         silently revert the wiring to inert again.
+    """
+    if strategy_key not in PORTFOLIO_VOL_OVERLAY_STRATEGY_KEYS:
+        return False, PORTFOLIO_VOL_OVERLAY_MODE_OFF
+    p = params or {}
+    enabled = _as_config_bool(p.get("cfsb_portfolio_vol_overlay_enabled"), True)
+    mode = str(p.get("cfsb_portfolio_vol_overlay_mode") or PORTFOLIO_VOL_OVERLAY_MODE_CAP).strip().lower()
+    if mode not in PORTFOLIO_VOL_OVERLAY_MODES:
+        # Unknown spelling: fall back to the conservative-but-active `cap` (a ceiling can
+        # only de-risk); never silently switch to "multiply" or "off".
+        mode = PORTFOLIO_VOL_OVERLAY_MODE_CAP
+    if mode == PORTFOLIO_VOL_OVERLAY_MODE_OFF:
+        enabled = False
+    return bool(enabled), mode
+
+
+def resolve_stage1_vol_inputs(health_report: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Read Stage-1's realized volatility / Barroso factor out of the health report.
+
+    Accepts both shapes the report has carried: the nested `volatility_targeting` block and
+    the duplicated top-level keys. A factor is only `available` when it is a FINITE POSITIVE
+    number measured by Stage 1 -- `vol_degraded` / `vol_scaling_fallback` (the 2026-11-11 D7
+    degradation path, where `realized_vol_21d` is NULL and the factor is a neutral 1.0x label
+    rather than a measurement) is reported as `vol_unavailable`, never as "1.0x, nothing to
+    see". The caller keeps the model weights untouched in that case.
+    """
+    report = health_report or {}
+    nested = report.get("volatility_targeting")
+    vt: Dict[str, Any] = nested if isinstance(nested, dict) else {}
+
+    def _get(key: str) -> Any:
+        if key in vt and vt[key] is not None:
+            return vt[key]
+        return report.get(key)
+
+    realized = _get("realized_vol_21d")
+    raw_scale = _get("vol_scaling_factor")
+    degraded = bool(_get("vol_degraded") or False)
+    fallback = _get("vol_scaling_fallback")
+
+    info: Dict[str, Any] = {
+        "realized_vol_21d": None,
+        "vol_scaling_factor": None,
+        "available": False,
+        "reason": None,
+    }
+    try:
+        if realized is not None:
+            realized_f = float(realized)
+            info["realized_vol_21d"] = realized_f if np.isfinite(realized_f) else None
+    except (TypeError, ValueError):
+        info["realized_vol_21d"] = None
+
+    if degraded or fallback:
+        info["reason"] = VOL_OVERLAY_UNAVAILABLE_REASON
+        return info
+    try:
+        scale = float(raw_scale)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        info["reason"] = VOL_OVERLAY_UNAVAILABLE_REASON
+        return info
+    if not np.isfinite(scale) or scale <= 0.0:
+        info["reason"] = VOL_OVERLAY_UNAVAILABLE_REASON
+        return info
+    info["vol_scaling_factor"] = scale
+    info["available"] = True
+    return info
+
+
+def apply_portfolio_vol_ceiling(
+    target_series: pd.Series,
+    *,
+    cash_proxy: Optional[str],
+    vol_scaling_factor: Optional[float],
+    realized_vol_21d: Optional[float] = None,
+    tolerance: float = WEIGHT_BUDGET_TOLERANCE,
+    superseded_by: Optional[str] = None,
+) -> Tuple[pd.Series, Dict[str, Any]]:
+    """Apply Stage-1's Barroso factor as a CEILING on the equity weight vector.
+
+    CONTRACT (`mode="cap"`):
+        equity_budget = min(Σ equity target weights, vol_scaling_factor)
+
+    The factor is a CAP, never a multiplier. `BaseBlendAllocationStrategy` already applies its
+    own Garman-Klass target-vol scaling (`blend_target_vol = 0.12`), which is why the model's
+    own equity target on the archived 2026-11-11 round was 0.463 instead of a fully invested
+    book; multiplying the two would ask for `0.463 * 0.370 = 0.171` of NAV, i.e. de-risk the
+    same elevated-volatility observation twice.
+
+    WHY THIS RUNS ON THE WEIGHT VECTOR AND NOT ON THE BUILT ROWS (the load-bearing decision,
+    measured 2026-11-12): a pass over already-built ticket rows cannot de-risk a book that is
+    ALREADY invested. `normalize_model_target_weights`' contract forbids inventing a SELL when
+    a scaled target falls below the held quantity, and the same rule applied here left the
+    delivered book at 78.6% while the row claimed a 3.7% target (`partial=true`) -- i.e. the
+    exact "presented as applied, actually inert" shape LV18 exists to kill. Silently emitting
+    SELLs from the row pass is worse: it would bypass `step_position_lifecycle`'s `can_sell`
+    (China T+1 gestation), the tenure lock and the inertia/normalization gates. Scaling the
+    TARGET VECTOR instead is the same place `apply_r1_intraday_derisk` and the Stage-1 linear
+    damping / Tier-2 defense already operate, so every downstream gate (lifecycle, tenure,
+    lot rounding, purchasing power, delivered MV cap) still applies, and a trim is emitted by
+    the machinery that is allowed to emit it. Callers must ALSO set
+    `is_portfolio_deleverage=True` when this binds so the tenure lock permits the trim (L2.40).
+
+    Cash is deliberately untouched here: the caller recomputes the implied cash residual
+    immediately after (`1 - Σ equity`), so a capped book parks the difference in the cash
+    proxy instead of leaving it unallocated.
+
+    A missing / degraded factor is a NO-OP (`applied=False`, `reason="vol_unavailable"`) --
+    never a 1.0x multiplier, because an unmeasured volatility is not a calm market.
+
+    ORDERING vs. THE STAGE-1 DEFENSES (Tier-2 recovery damping / linear drawdown damping) --
+    the rule is STRICTER WINS, NEVER THE PRODUCT: this function consumes the target vector
+    AFTER those defenses have already scaled it, so it can only tighten an already-damped
+    book, never re-scale it. A 0.50 damping followed by a 0.37 ceiling yields 0.37 (not
+    0.50 x 0.37 = 0.185); a 0.30 damping against a 0.37 ceiling is a no-op (`binding=False`),
+    also not a product. If a Tier-3 halt (`TIER_3_HALT`) has already zeroed the book, the
+    caller passes `superseded_by="circuit_breaker_tier3"` so the audit says "nothing left to
+    cap" instead of crediting the ceiling with clearing the book (`binding` stays `False`,
+    `equity_scale_factor` stays `None`).
+
+    Pure function: returns a NEW series plus the audit block (no I/O, no globals).
+    """
+    summary: Dict[str, Any] = {
+        "applied": False,
+        "mode": PORTFOLIO_VOL_OVERLAY_MODE_CAP,
+        "realized_vol_21d": realized_vol_21d,
+        "vol_scaling_factor": vol_scaling_factor,
+        "model_equity_sum": None,
+        "capped_equity_sum": None,
+        "equity_scale_factor": None,
+        "binding": False,
+        "reason": None,
+        "superseded_by_circuit_breaker": False,
+    }
+    if target_series is None or len(target_series) == 0:
+        summary["reason"] = "no_targets"
+        return target_series, summary
+
+    risky_idx = [s for s in target_series.index if cash_proxy is None or str(s) != str(cash_proxy)]
+    model_sum = float(
+        sum(max(0.0, float(target_series[s])) for s in risky_idx)
+    )
+    # Recorded even when the factor is unusable: the ticket must still say what the MODEL
+    # asked for, so an operator can see that nothing was capped and why.
+    summary["model_equity_sum"] = round(model_sum, TARGET_WEIGHT_EFFECTIVE_DECIMALS)
+    summary["capped_equity_sum"] = summary["model_equity_sum"]
+
+    if superseded_by:
+        # A Stage-1 breaker already emptied the book. There is nothing to cap, and the audit
+        # must NOT be readable as "the vol ceiling cleared the book" (`binding=False`,
+        # `equity_scale_factor=None`). Deliberately does not touch `is_portfolio_deleverage`.
+        summary["superseded_by_circuit_breaker"] = True
+        summary["reason"] = str(superseded_by)
+        return target_series.copy(), summary
+
+    if vol_scaling_factor is None or not np.isfinite(float(vol_scaling_factor)) or float(vol_scaling_factor) <= 0.0:
+        summary["reason"] = VOL_OVERLAY_UNAVAILABLE_REASON
+        return target_series.copy(), summary
+    summary["applied"] = True
+    if model_sum <= 0.0:
+        summary["reason"] = "empty_equity_book"
+        return target_series.copy(), summary
+
+    budget = min(model_sum, float(vol_scaling_factor))
+    summary["capped_equity_sum"] = round(budget, TARGET_WEIGHT_EFFECTIVE_DECIMALS)
+    summary["binding"] = bool(budget < model_sum - tolerance)
+    if not summary["binding"]:
+        # The strategy's own book is already at or below the Stage-1 ceiling.
+        return target_series.copy(), summary
+
+    factor = budget / model_sum
+    summary["equity_scale_factor"] = round(factor, 10)
+    capped = target_series.copy()
+    for sym in risky_idx:
+        capped[sym] = float(target_series[sym]) * factor
+    return capped, summary
+
+
+def apply_portfolio_vol_overlay_for_strategy(
+    target_series: pd.Series,
+    *,
+    strategy_key: Optional[str],
+    params: Optional[Dict[str, Any]],
+    health_report: Optional[Dict[str, Any]],
+    cash_proxy: Optional[str] = None,
+    superseded_by: Optional[str] = None,
+) -> Tuple[pd.Series, Optional[Dict[str, Any]]]:
+    """Strategy-gated entry point used by `main()`.
+
+    Returns the caller's series UNCHANGED and `None` as the audit block for every
+    non-allowlisted strategy AND for a disabled overlay, so their tickets simply do not
+    carry a `vol_overlay` key -- that is what keeps the other 50+ strategies byte-identical
+    to before this change.
+    """
+    enabled, mode = resolve_portfolio_vol_overlay_params(strategy_key, params)
+    if not enabled:
+        return target_series, None
+    vol = resolve_stage1_vol_inputs(health_report)
+    capped, summary = apply_portfolio_vol_ceiling(
+        target_series,
+        cash_proxy=cash_proxy,
+        vol_scaling_factor=vol["vol_scaling_factor"],
+        realized_vol_21d=vol["realized_vol_21d"],
+        superseded_by=superseded_by,
+    )
+    summary["mode"] = mode
+    return capped, summary
+
+
+def evaluate_vol_overlay_delivery(
+    capped_equity_sum: Optional[float],
+    delivered_equity_sum: Optional[float],
+    *,
+    binding: bool = False,
+    shortfall_ratio: float = VOL_OVERLAY_DELIVERY_SHORTFALL_RATIO,
+) -> Dict[str, Any]:
+    """Compare the CEILING the model asked for against what whole lots can actually deliver.
+
+    A ceiling is a weight; a ticket is an integer number of lots. On a small ceiling those
+    two disagree badly: the measured replay of the 2026-11-11 book delivered `0.00482777`
+    of NAV against a `0.037` ceiling (ratio ~= 0.13), i.e. ~87% of the intended de-risking
+    never reached the market. This function only REPORTS that (`delivery_shortfall`,
+    `delivery_shortfall_ratio`); it never rounds up, enlarges a weight, or drops the lot
+    rounding to make the numbers agree.
+
+    Contract:
+      * not binding, or a zero/absent ceiling -> no shortfall, ratio `None` (nothing to deliver);
+      * binding -> `ratio = delivered / capped`, `shortfall = ratio < shortfall_ratio`;
+      * `delivered > capped` (lots rounded UP) -> ratio > 1 -> no shortfall (drift is already
+        reported by `ceiling_exceeded_by`).
+
+    Pure arithmetic on floats (no I/O) so it is unit-testable offline.
+    """
+    result: Dict[str, Any] = {
+        "delivery_shortfall": False,
+        "delivery_shortfall_ratio": None,
+        "delivery_ok": True,
+    }
+    try:
+        capped = float(capped_equity_sum)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return result
+    if not np.isfinite(capped) or capped <= 0.0 or not binding:
+        return result
+    try:
+        delivered = float(delivered_equity_sum)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return result
+    if not np.isfinite(delivered):
+        return result
+    ratio = max(0.0, delivered) / capped
+    result["delivery_shortfall_ratio"] = round(ratio, 4)
+    result["delivery_shortfall"] = bool(ratio < float(shortfall_ratio))
+    result["delivery_ok"] = not result["delivery_shortfall"]
+    return result
+
+
+def format_vol_overlay_delivery_warning(
+    capped_equity_sum: float,
+    delivered_equity_sum: float,
+) -> str:
+    """The greppable one-liner for a capped-but-undeliverable book (`[WARN/VOL OVERLAY]`)."""
+    capped_pct = float(capped_equity_sum) * 100.0
+    delivered_pct = float(delivered_equity_sum) * 100.0
+    gap_pp = capped_pct - delivered_pct
+    return (
+        f"[WARN/VOL OVERLAY] 上限 {capped_pct:.2f}% 但整手后仅能交付 "
+        f"{delivered_pct:.2f}%（缺口 {gap_pp:.2f}pp）—— 整手取整吃掉了大部分降风险幅度，"
+        "已如实记录，未放大权重也未跳过整手取整。"
+    )
 
 
 def reconcile_delivered_weight_budget(
@@ -2665,6 +3038,8 @@ def summarize_intraday_5m_loading(
     cutoff_time: str,
     expected_last_session: Optional[Any] = None,
     market: str = "china",
+    now: Optional[Any] = None,
+    publish_after: str = "20:00",
 ) -> List[str]:
     """Report what the 5m layer ACTUALLY delivered, with the attribution it can prove.
 
@@ -2795,11 +3170,46 @@ def summarize_intraday_5m_loading(
             "这些标的的日内特征由回退 provider 提供，不等于所配置 provider 已交付 5m 数据。"
         )
     if stale_flag:
-        lines.append(
-            f"[WARN] 5m 缓存陈旧：最新 5m K 线未达期望会话 {expected_session or expected_last_session} "
-            f"(stale=True, lag_calendar_days={lag_value})。"
-            "日内特征不代表当日，请勿据此判断日内状态；需刷新 5m 缓存后重跑。"
-        )
+        # (2026-11-12) Distinguish "the provider has not published the day's 5m bars yet"
+        # (BaoStock: usually after ~20:00) from "the cache is frozen". Both mean the 5m
+        # features are unusable for this run, so neither is relaxed -- only the operator
+        # action differs: wait and rerun vs. fix the sync.
+        pending_after: Optional[str] = None
+        publication_missing = False
+        try:
+            from common.intraday_features import assess_intraday_5m_publication_state
+
+            _pub = assess_intraday_5m_publication_state(
+                {s: d for s, d in frames.items() if d is not None},
+                as_of=expected_session or expected_last_session,
+                market=market,
+                now=now,
+                publish_after=publish_after,
+            )
+            if _pub.get("status") == "pending_publication":
+                pending_after = str(_pub.get("expected_after") or publish_after)
+            elif _pub.get("status") == "missing":
+                publication_missing = True
+        except Exception:  # diagnostics must never break the run
+            pending_after = None
+        if pending_after:
+            lines.append(
+                f"[WARN] 5m 当日数据尚未发布（BaoStock 通常 {pending_after} 后可用）；本次运行将不使用 5m 特征"
+                f"（最新 5m K 线未达期望会话 {expected_session or expected_last_session}，"
+                f"lag_calendar_days={lag_value}）。5m 依赖型门禁建议 {pending_after} 后重跑；"
+                "本次仅按日线信号生成工单。"
+            )
+        else:
+            lines.append(
+                f"[WARN] 5m 缓存陈旧：最新 5m K 线未达期望会话 {expected_session or expected_last_session} "
+                f"(stale=True, lag_calendar_days={lag_value})。"
+                "日内特征不代表当日，请勿据此判断日内状态；需刷新 5m 缓存后重跑。"
+                + (
+                    f"已过 {publish_after} 仍缺当日 5m，需检查同步。"
+                    if publication_missing
+                    else ""
+                )
+            )
     if n_ok < total:
         missing = sorted(
             str(s)
@@ -3391,6 +3801,9 @@ def main(cli_args: Optional[List[str]] = None):
                 cutoff_time=str(cutoff_t),
                 expected_last_session=expected_last_session,
                 market=_5m_market,
+                publish_after=str(
+                    getattr(args, "intraday_publish_after", None) or "20:00"
+                ),
             ):
                 print(_line)
             universe = enrich_universe_with_intraday_features(
@@ -3703,6 +4116,10 @@ def main(cli_args: Optional[List[str]] = None):
     gate_code = account_state.get("gate_code") or health_report.get("gate_code")
     is_recovering = (gate_code == "CAUTION_RECOVERING" or circuit_tier == "CAUTION_RECOVERING")
     is_portfolio_deleverage = False
+    # (LV18 item 3) Set ONLY by the Tier-3 halt below. Threaded into the vol-ceiling audit so
+    # an emptied book is attributed to the breaker rather than to Stage-1's vol cap. It is
+    # deliberately NOT `is_portfolio_deleverage`: the halt path keeps its existing semantics.
+    circuit_breaker_superseded = None
     if (circuit_tier == "TIER_3_HALT" or freeze_rem > 0) and not is_recovering:
         print("\n" + "!" * 110)
         print(f"[CIRCUIT BREAKER ENGAGED / 熔断器生效] 账户处于第三级熔断停牌期 (Tier 3 Emergency Halt, 剩余冷冻: {freeze_rem} 交易日)")
@@ -3711,6 +4128,7 @@ def main(cli_args: Optional[List[str]] = None):
         current_targets = pd.Series(0.0, index=current_targets.index)
         if cash_proxy in current_targets.index:
             current_targets[cash_proxy] = 1.0
+        circuit_breaker_superseded = VOL_OVERLAY_SUPERSEDED_BY_CIRCUIT_BREAKER
     elif is_recovering:
         raw_scale = (
             account_state.get("linear_equity_scale")
@@ -3840,6 +4258,80 @@ def main(cli_args: Optional[List[str]] = None):
             f"× R1 {r1_multiplier:.2f} = {effective_buy_scale:.2%} 压缩；卖单与现金不动。"
         )
         print("!" * 110 + "\n")
+
+    # ---------------------------------------------------------------------------------
+    # (LV18, 2026-11-12) STAGE-1 BARROSO CEILING -> EQUITY BUDGET CAP (not a multiplier)
+    #
+    # `check_live_portfolio_health.py::evaluate_realized_volatility` always COMPUTED
+    # `vol_scaling_factor = clip(target_vol / realized_vol_21d)` and archived it, but
+    # nothing consumed it (docs/development_plan.md LV18: "presented as an applied risk
+    # action, actually inert"). It is wired HERE, on the TARGET WEIGHT VECTOR, for exactly
+    # the reason `apply_r1_intraday_derisk` right above is: a later pass over built rows
+    # cannot de-risk an already-invested book without inventing SELLs that would bypass
+    # `step_position_lifecycle`'s `can_sell` (China T+1 gestation), the tenure lock and the
+    # inertia gate -- measured on 2026-11-11 synthetic replay, the row pass left the
+    # delivered book at 78.6% while the row claimed 3.7% (`partial=true`), i.e. inert again.
+    #
+    # SEMANTICS (`model_equity_sum` = Σ equity targets of the model book):
+    #     equity_budget = min(model_equity_sum, vol_scaling_factor)
+    # NOT a product: `blend_base.py` already applies its own Garman-Klass target-vol
+    # scaling (`blend_target_vol = 0.12`), so multiplying would de-risk the same elevated
+    # volatility twice (archived 2026-11-11/205137: 0.463 x 0.370 = 0.171, not 0.370).
+    #
+    # The implied cash residual is recomputed immediately below (`1 - Σ equity`), so a
+    # capped book parks the difference in the cash proxy. `is_portfolio_deleverage=True`
+    # is set when the cap binds so the tenure lock permits the trim (L2.40), exactly like
+    # the Tier-2 / linear-damping Stage-1 defenses above.
+    #
+    # ORDERING vs. THOSE DEFENSES (Tier-2 recovery damping / linear drawdown damping):
+    # STRICTER WINS, NEVER THE PRODUCT. This pass reads the vector AFTER they scaled it, so
+    # it can only tighten an already-damped book: 0.50 damping + 0.37 ceiling -> 0.37 (not
+    # 0.185); 0.30 damping + 0.37 ceiling -> binding=False, series untouched (also not
+    # 0.111). A Tier-3 halt has already zeroed the book before this point, so the breaker is
+    # passed in as `superseded_by` and the audit attributes the empty book to the breaker
+    # (`superseded_by_circuit_breaker=true`) instead of crediting the vol cap with it.
+    # Strategy-gated (`chan_four_state_blend` ONLY): every other strategy gets its series
+    # back untouched and `vol_overlay=None`, keeping its ticket byte-identical.
+    # ---------------------------------------------------------------------------------
+    target_series, vol_overlay = apply_portfolio_vol_overlay_for_strategy(
+        target_series,
+        strategy_key=strategy_key,
+        params=params,
+        health_report=health_report,
+        cash_proxy=cash_proxy,
+        superseded_by=circuit_breaker_superseded,
+    )
+    if vol_overlay is not None:
+        if vol_overlay.get("reason") == VOL_OVERLAY_UNAVAILABLE_REASON:
+            print(
+                "[INFO/VOL OVERLAY] Stage-1 波动率因子不可用（未实测/已降级），"
+                "保留模型原始仓位，不做任何缩放（默认 1.0x 会把未测得当成平静市况）。"
+            )
+        elif vol_overlay.get("superseded_by_circuit_breaker"):
+            print(
+                "[INFO/VOL OVERLAY] 三级熔断已先行清零风险仓位 "
+                f"(superseded_by={vol_overlay.get('reason')})；上限没有参与本次降风险，"
+                "不重复缩放，也不把清仓记在上限名下。"
+            )
+        elif vol_overlay.get("binding"):
+            _rv = vol_overlay.get("realized_vol_21d")
+            _rv_txt = f"{_rv:.1%}" if isinstance(_rv, (int, float)) else "N/A"
+            print("\n" + "!" * 110)
+            print(
+                f"[RISK ALERT / VOL OVERLAY] Stage-1 Barroso 上限生效: "
+                f"模型权益 {vol_overlay['model_equity_sum']:.2%} -> 上限 "
+                f"{vol_overlay['capped_equity_sum']:.2%} "
+                f"(21d 实测波动 {_rv_txt}, 因子 {vol_overlay['vol_scaling_factor']:.4f}x；"
+                f"语义=取上限(min)，非相乘); 超出部分转为现金停泊。"
+            )
+            print("!" * 110 + "\n")
+            is_portfolio_deleverage = True
+        else:
+            print(
+                f"[INFO/VOL OVERLAY] Stage-1 上限未触发（模型权益 "
+                f"{vol_overlay['model_equity_sum']:.2%} <= 因子 "
+                f"{vol_overlay['vol_scaling_factor']:.4f}x），目标仓位保持不变。"
+            )
 
     # 5. Build Execution Order Plan
     # Compute implied cash weight: strategy outputs equity weights, remainder is cash
@@ -5376,6 +5868,56 @@ def main(cli_args: Optional[List[str]] = None):
     ticket_payload["weight_budget_ok"] = bool(weight_budget.get("budget_ok", True))
     ticket_payload["rounding_rebalanced"] = bool(weight_budget.get("rounding_rebalanced"))
     ticket_payload["mv_cap_breaches"] = mv_cap_breaches
+    # (LV18, 2026-11-12) Stage-1 Barroso ceiling, archived next to the other book-level
+    # verdicts. Present ONLY for the allowlisted strategy with the overlay enabled -- every
+    # other strategy's ticket is byte-identical to before this change.
+    #   {"applied", "mode", "realized_vol_21d", "vol_scaling_factor",
+    #    "model_equity_sum", "capped_equity_sum", "equity_scale_factor", "binding",
+    #    "reason", "superseded_by_circuit_breaker", "delivered_equity_sum",
+    #    "ceiling_exceeded_by", "delivery_shortfall", "delivery_shortfall_ratio"}
+    # `binding=True` means the cap actually reduced the equity targets (the difference is
+    # parked in the cash proxy); `applied=True` with `reason="vol_unavailable"` means Stage-1
+    # produced no MEASURED factor and the book was deliberately left untouched (never
+    # defaulted to a 1.0x multiplier); `superseded_by_circuit_breaker=True` means a Stage-1
+    # breaker (Tier-3 halt) had ALREADY emptied the book, so the ceiling is not the reason it
+    # is flat -- never read `capped_equity_sum=0` as "the vol cap cleared the book".
+    # `delivered_equity_sum` is the post-lot-rounding reality (`Σ target_weight_effective`),
+    # `ceiling_exceeded_by` reports how far whole lots pushed it past the ceiling, and
+    # `delivery_shortfall` flags the opposite failure: a ceiling so small that lot rounding
+    # delivers only a sliver of it. The ticket-level `vol_overlay_delivery_ok` mirrors that
+    # flag and leaves `weight_budget_ok` (a 100%-budget verdict) untouched.
+    if vol_overlay is not None:
+        _delivered_equity = sum(
+            _row_weight(r, "target_weight_effective")
+            for r in rows
+            if str(r.get("symbol") or "") != str(cash_proxy)
+        )
+        vol_overlay["delivered_equity_sum"] = round(_delivered_equity, TARGET_WEIGHT_EFFECTIVE_DECIMALS)
+        if vol_overlay.get("capped_equity_sum") is not None:
+            vol_overlay["ceiling_exceeded_by"] = round(
+                max(0.0, _delivered_equity - float(vol_overlay["capped_equity_sum"])),
+                TARGET_WEIGHT_EFFECTIVE_DECIMALS,
+            )
+        else:
+            vol_overlay["ceiling_exceeded_by"] = None
+        # (LV18 item 2) Delivery-shortfall guardrail. Report-only: weights, lot rounding and
+        # `weight_budget_ok` are all left alone -- an operator sees the gap, the runner never
+        # invents exposure to close it.
+        _delivery = evaluate_vol_overlay_delivery(
+            vol_overlay.get("capped_equity_sum"),
+            _delivered_equity,
+            binding=bool(vol_overlay.get("binding")),
+        )
+        vol_overlay["delivery_shortfall"] = _delivery["delivery_shortfall"]
+        vol_overlay["delivery_shortfall_ratio"] = _delivery["delivery_shortfall_ratio"]
+        ticket_payload["vol_overlay_delivery_ok"] = _delivery["delivery_ok"]
+        if _delivery["delivery_shortfall"]:
+            print(
+                format_vol_overlay_delivery_warning(
+                    float(vol_overlay["capped_equity_sum"]), _delivered_equity
+                )
+            )
+        ticket_payload["vol_overlay"] = vol_overlay
     # (D6, evidence `2026-11-09/204956`) MACHINE CHECK, archived with the ticket: one printed
     # order line per order. PHASE 2 used to render the same BUY twice (one `orders` entry),
     # i.e. an operator copying the stdout would have doubled the position.

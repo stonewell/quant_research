@@ -39,7 +39,21 @@ class ChanFourStateBlendStrategy(BaseBlendAllocationStrategy):
     #       strategies_config.json (the mode the 2026-10-22 live run executed
     #       under; the first round's re-dump had silently reverted it to
     #       `rolling_ic_ir`, which made Fix 3/4 inert). See docs/version.md §8.
-    version: str = "1.2.2"
+    # 1.2.2 -> 1.3.0 (2026-11-12, LV18 wiring): Stage-1's Barroso realized-volatility factor
+    #   (`check_live_portfolio_health.py::evaluate_realized_volatility`) is now a CONSUMER
+    #   inside the live ticket build, as a CEILING on the equity budget:
+    #       equity_budget = min(model_equity_sum, vol_scaling_factor)
+    #   Deliberately NOT a multiplication: `blend_base.py` already applies its own
+    #   Garman-Klass target-vol scaling (`cfsb_target_vol = 0.12`), so multiplying would
+    #   de-risk the same volatility observation twice (archived 2026-11-11/205137:
+    #   model equity 0.463 x factor 0.3703 = 0.171 instead of 0.370).
+    #   Gate: `cfsb_portfolio_vol_overlay_enabled` (default true) +
+    #   `cfsb_portfolio_vol_overlay_mode` (`cap`|`off`) in strategies_config.json, wired in
+    #   `scripts/run_live_strategy.py` (strategy allowlist = this strategy only), so no other
+    #   strategy's ticket changes. A degraded Stage-1 factor is `applied=false` /
+    #   `reason=vol_unavailable` and NEVER defaults to a 1.0x multiplier. No `blend_base.py`
+    #   vol-targeting logic was touched, so `BASE_VERSION` stays `2.0.0`. See docs/version.md.
+    version: str = "1.3.0"
 
     def __init__(self, config: Optional[StrategyConfig] = None, version: Optional[str] = None):
         cfg = config or StrategyConfig()
