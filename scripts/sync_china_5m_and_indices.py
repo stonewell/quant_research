@@ -64,7 +64,8 @@ from common.financial_api import (
     normalize_thscode,
     summarize_fetch_error,
 )
-from common.market_clock import MARKET_CHINA, market_now
+from common.market_clock import MARKET_CHINA, last_expected_bar_ts, market_now
+from common.market_holidays import HolidayCalendarCoverageError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -85,6 +86,28 @@ NAMESPACE_FRESHNESS_TOLERANCE_DAYS = 2
 #: Aggregation rank for the LV19 per-namespace trace: a single `failed` for one symbol must not
 #: be averaged away by 19 `patched` ones. Higher wins when several symbols mark the same namespace.
 _STATE_RANK = {"skipped": 0, "patched": 1, "failed": 2}
+
+#: Bar length of the PART B intraday stream. It is handed to
+#: `common/market_clock.py::last_expected_bar_ts`, which answers "session close minus one bar"
+#: (14:55 for a China 5m day; the afternoon close anchor makes the lunch break need no special
+#: case). The 5m freshness deadline is therefore **never a literal in this script**.
+INTRADAY_BAR_INTERVAL = datetime.timedelta(minutes=5)
+
+#: How far `expected_intraday_session` may walk backwards to find a real session. Covers the
+#: Spring Festival / National Day blocks without an unbounded loop; exceeding it means the
+#: holiday table is corrupt, which must raise rather than guess.
+INTRADAY_SESSION_LOOKBACK_DAYS = 21
+
+#: Grace on the **earliest** side of the 5m cache-hit probe ONLY: the intraday history is anchored
+#: at `--start-5m` and the two providers trim the first session differently, so "the cached
+#: earliest bar is within a week of the requested start" is still a covered window. This half is
+#: unchanged by the freshness fix; the **latest** half is now strict (see `probe_intraday_cache`).
+INTRADAY_EARLIEST_TOLERANCE_DAYS = 7
+
+#: Fixed, grep-able string. Stage 1 (`intraday_5m_metrics` -> `stale` / `degraded_reason_code`)
+#: keys off exactly this text, so it must not be reworded casually: forward-dated 5m data that is
+#: silently half a session long is the failure mode this message exists to make visible.
+INTRADAY_INCOMPLETE_WARNING = "[WARN] 5m 当日数据不完整"
 
 MAJOR_INDICES = [
     "000300.SH",  # CSI 300
@@ -1389,18 +1412,199 @@ def _persist_intraday_probe(
         _LOGGER.warning("Failed to persist intraday probe verdict for %s: %s", symbol, exc)
 
 
+def _as_plain_date(value: Any) -> datetime.date:
+    """Coerce a `str` / `date` / `datetime` / `Timestamp` bound to a plain `datetime.date`.
+
+    `pd.Timestamp` subclasses `datetime`, so the `datetime` branch must come first -- a bare
+    `isinstance(value, date)` check would happily return a `datetime` and
+    `last_expected_bar_ts` would then reject it (it validates "plain date, not datetime").
+    """
+    if isinstance(value, datetime.datetime):
+        return value.date()
+    if isinstance(value, datetime.date):
+        return value
+    return pd.to_datetime(value).date()
+
+
+def expected_intraday_session(
+    end: Any,
+    market: str = MARKET_CHINA,
+) -> datetime.date:
+    """The session the 5m sync window's tail is supposed to reach.
+
+    `end` is a **fetch bound** (see `default_end_date`), so it may be a weekend or an exchange
+    holiday. The freshness deadline must snap onto the last *real* session at/before it,
+    otherwise a Saturday run would demand a Saturday 14:55 bar that no exchange can produce and
+    every symbol would be re-fetched forever (the very loop the strict deadline exists to avoid).
+
+    "Is this a session?" is delegated to `MarketClock.is_trading_day` (the holiday table's owner)
+    instead of a `weekday() < 5` guess. An uncovered year degrades to that weekday rule with a
+    logged warning -- same stance as the cache layer (a redundant re-fetch is cheap, a stale
+    mark-to-market is not), and never silently to "closed".
+    """
+    day = _as_plain_date(end)
+    clock = market_now(market)
+    for _ in range(INTRADAY_SESSION_LOOKBACK_DAYS + 1):
+        try:
+            if clock.is_trading_day(day):
+                return day
+        except HolidayCalendarCoverageError as exc:
+            _LOGGER.warning(
+                "Intraday freshness: holiday calendar unknown for %s (%s); falling back to the "
+                "weekday rule when picking the expected session",
+                day.isoformat(),
+                exc,
+            )
+            if day.weekday() < 5:
+                return day
+        day -= datetime.timedelta(days=1)
+    raise ValueError(
+        f"no trading session found for {market!r} in the {INTRADAY_SESSION_LOOKBACK_DAYS} days "
+        f"at/before {_as_plain_date(end).isoformat()} -- the holiday calendar looks corrupt"
+    )
+
+
+def intraday_deadline(
+    session_date: datetime.date,
+    bar_interval: datetime.timedelta = INTRADAY_BAR_INTERVAL,
+    market: str = MARKET_CHINA,
+) -> pd.Timestamp:
+    """Timestamp the expected session's last **complete** bar must reach.
+
+    One-line wrapper so the sync script has exactly one place that owns "where is the close":
+    `common/market_clock.py::last_expected_bar_ts` (= close - one bar, 14:55 for a China 5m
+    session). This is the same call `common/duckdb_cache.py::_intraday_expected_session_deadline`
+    makes, so the writer-side probe and the reader-side coverage gate cannot drift apart.
+    """
+    return pd.Timestamp(last_expected_bar_ts(market, session_date, bar_interval))
+
+
+def probe_intraday_cache(
+    earliest_ts: Any,
+    latest_ts: Any,
+    start_ts: pd.Timestamp,
+    expected_deadline: pd.Timestamp,
+    *,
+    earliest_tolerance_days: int = INTRADAY_EARLIEST_TOLERANCE_DAYS,
+) -> Dict[str, Any]:
+    """Decide whether the cached 5m series is already good enough, and return the evidence.
+
+    Two independent halves, and conflating them was the defect this function replaces:
+
+      * **earliest** ("is the backfill anchored where we asked?") keeps a 7-calendar-day
+        tolerance: it describes history coverage, not freshness.
+      * **latest** ("is the session we are asking for actually on disk?") is now **strict**:
+        the newest bar must reach `expected_deadline` (`last_expected_bar_ts` = 14:55 for a China
+        5m session). The old rule tolerated `latest.date() >= end - 2 days`, which for 5m meant
+        "yesterday's session counts as today's": every daily run before `as_of - 2` days reported
+        CACHE HIT and *today's* bars never entered the cache.
+
+    Returns a plain, JSON-friendly dict (`ts` values are ISO strings):
+
+        {"hit": bool, "reason": str, "earliest_ts": str|None, "latest_ts": str|None,
+         "expected_deadline": str, "earliest_required_by": str, "latest_required_at": str}
+
+    `reason` is one of `fresh` / `no_metadata` / `stale_session` / `earliest_short`, so a caller
+    can tell "nothing cached" from "cached but yesterday" without parsing prose.
+    """
+    deadline = pd.Timestamp(expected_deadline)
+    earliest_required_by = pd.Timestamp(start_ts) + pd.Timedelta(days=earliest_tolerance_days)
+
+    def _fmt(value: Any) -> Optional[str]:
+        return None if value is None else str(pd.Timestamp(value))
+
+    probe: Dict[str, Any] = {
+        "hit": False,
+        "reason": "no_metadata",
+        "earliest_ts": _fmt(earliest_ts),
+        "latest_ts": _fmt(latest_ts),
+        "expected_deadline": str(deadline),
+        "earliest_required_by": str(earliest_required_by),
+        "latest_required_at": str(deadline),
+    }
+    if latest_ts is None or earliest_ts is None:
+        return probe
+    if pd.Timestamp(latest_ts) < deadline:
+        probe["reason"] = "stale_session"
+        return probe
+    if pd.Timestamp(earliest_ts) > earliest_required_by:
+        probe["reason"] = "earliest_short"
+        return probe
+    probe["hit"] = True
+    probe["reason"] = "fresh"
+    return probe
+
+
+class IntradayIncompleteWarning(UserWarning):
+    """A fetched 5m series stops before the expected session's last complete bar.
+
+    Raised (not swallowed, not "fixed" by manufacturing bars) so Stage 1 can record
+    `intraday_incomplete` / a degraded reason code instead of trusting a half session.
+    """
+
+
+class Sync5mReport(dict):
+    """`sync_5m_intraday`'s return value: the old `{symbol: error}` mapping **plus** fields.
+
+    Subclasses `dict` on purpose (backwards compatibility is a hard requirement): `len()`,
+    iteration, `.items()` and `_absorb()`-style consumers of the existing call sites still see
+    exactly the per-symbol *fetch error* mapping they saw before -- nothing new is folded into
+    the error namespace, so a diagnostic can never be mistaken for a fetch failure. The new
+    evidence lives in attributes:
+
+      * `cache_probes[symbol]` -- the `probe_intraday_cache` dict (hit / reason / timestamps);
+      * `incomplete_symbols[symbol]` -- `intraday_incomplete` evidence for a half session;
+      * `intraday_incomplete` -- True when at least one symbol came back short;
+      * `expected_session` / `expected_deadline` -- the single deadline the whole run used.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cache_probes: Dict[str, Dict[str, Any]] = {}
+        self.incomplete_symbols: Dict[str, Dict[str, Any]] = {}
+        self.expected_session: Optional[datetime.date] = None
+        self.expected_deadline: Optional[str] = None
+
+    @property
+    def intraday_incomplete(self) -> bool:
+        return bool(self.incomplete_symbols)
+
+    def to_diagnostics(self) -> Dict[str, Any]:
+        """Whole-report view for a JSON summary (`summary["intraday_5m"]`-shaped)."""
+        return {
+            "expected_session": (
+                None if self.expected_session is None else self.expected_session.isoformat()
+            ),
+            "expected_deadline": self.expected_deadline,
+            "intraday_incomplete": self.intraday_incomplete,
+            "incomplete_symbols": {s: dict(v) for s, v in self.incomplete_symbols.items()},
+            "cache_probes": {s: dict(v) for s, v in self.cache_probes.items()},
+        }
+
+
 def sync_5m_intraday(
     cache: DuckDBCache,
     stocks: List[str],
     indices: List[str],
     start: str,
     end: str,
+    *,
+    verbose: bool = False,
 ) -> Dict[str, str]:
     """Syncs 5m intraday data sequentially with a single persistent BaoStock session.
 
     Per-symbol isolation as in `patch_equity_daily_bars`: a raised fetch error is logged
     and the symbol recorded in the returned mapping (empty dict = clean run), never
     aborting the loop.
+
+    The returned object is a `Sync5mReport` (a `dict` subclass, so every pre-existing caller is
+    unaffected) carrying the structured `cache_probe` / `intraday_incomplete` evidence described
+    in its docstring. `verbose=True` additionally prints one `cache_probe` line per symbol.
+
+    Freshness contract (5m only -- the daily paths above are untouched): a cached symbol is
+    skipped **only** when its newest bar reaches `last_expected_bar_ts(expected_session)` (14:55
+    for China 5m), and a series that comes back short of that deadline is written as-is, marked
+    `intraday_incomplete`, and warned about. It is never padded to look complete.
     """
     print("\n" + "=" * 80)
     print(f"PART B: Pulling & Caching 5m Intraday Bars [{start} -> {end}]")
@@ -1409,6 +1613,20 @@ def sync_5m_intraday(
 
     start_ts = pd.Timestamp(start)
     end_date = pd.to_datetime(end).date()
+
+    # The ONE deadline for the whole run. `end` is a fetch bound (possibly a weekend/holiday), so
+    # it snaps onto the last real session at/before it; the anchor itself (close - one bar) comes
+    # from `common/market_clock.py::last_expected_bar_ts`, never from a 15:00/14:55 literal here.
+    expected_session = expected_intraday_session(end_date)
+    expected_deadline = intraday_deadline(expected_session)
+    print(
+        f"Freshness deadline: session {expected_session.isoformat()} must reach "
+        f">= {expected_deadline.strftime('%Y-%m-%d %H:%M')} "
+        "(market_clock.last_expected_bar_ts = close - one 5m bar)"
+    )
+    report = Sync5mReport()
+    report.expected_session = expected_session
+    report.expected_deadline = str(expected_deadline)
 
     # Targets: 22 stocks + 511880.SH
     all_targets = list(stocks)
@@ -1431,16 +1649,35 @@ def sync_5m_intraday(
 
     try:
         for idx, sym in enumerate(all_targets, 1):
-            # Check cache hit
+            # Check cache hit. Freshness = "the newest cached bar reaches this session's last
+            # complete bar" (strict); the earliest side keeps its 7-day backfill tolerance. The
+            # decision and its evidence live in `probe_intraday_cache` (one implementation, so the
+            # log line and the branch cannot disagree).
             meta = cache.get_intraday_metadata("BaoStockDataProvider", sym, "5m")
             if not meta:
                 meta = cache.get_intraday_metadata("EastMoneyDataProvider", sym, "5m")
-            if meta:
-                min_ts = meta["earliest_available_ts"]
-                max_ts = meta["latest_available_ts"]
-                if min_ts <= start_ts + pd.Timedelta(days=7) and max_ts.date() >= end_date - datetime.timedelta(days=2):
-                    print(f"[{idx}/{len(all_targets)}] [CACHE HIT] {sym} already covered ({min_ts} -> {max_ts})")
-                    continue
+            probe = probe_intraday_cache(
+                None if not meta else meta["earliest_available_ts"],
+                None if not meta else meta["latest_available_ts"],
+                start_ts,
+                expected_deadline,
+            )
+            report.cache_probes[sym] = probe
+            _LOGGER.info("cache_probe %s: %s", sym, probe)
+            if verbose:
+                print(f"[{idx}/{len(all_targets)}] cache_probe {sym}: {probe}")
+            if probe["hit"]:
+                print(
+                    f"[{idx}/{len(all_targets)}] [CACHE HIT] {sym} already covered "
+                    f"({probe['earliest_ts']} -> {probe['latest_ts']}; "
+                    f"deadline {probe['expected_deadline']})"
+                )
+                continue
+            if verbose and probe["reason"] != "no_metadata":
+                print(
+                    f"[{idx}/{len(all_targets)}] {sym} cache verdict: {probe['reason']} "
+                    f"(latest {probe['latest_ts']} < deadline {probe['latest_required_at']})"
+                )
 
             print(f"[{idx}/{len(all_targets)}] Fetching 5m for {sym}...", end=" ", flush=True)
             t0 = time.time()
@@ -1487,6 +1724,42 @@ def sync_5m_intraday(
                 continue
 
             full_df = full_df[~full_df.index.duplicated(keep="last")].sort_index()
+
+            # "Published but half a session" must be loud (2026-11 defect): the 5m stream is used
+            # the same day, so a frame that stops before `last_expected_bar_ts` (14:55) means
+            # upstream had not published the close (or truncated the day). The published bars are
+            # STILL written -- dropping data to look consistent is worse -- but nothing is padded,
+            # the report says `intraday_incomplete`, and a fixed, grep-able warning is emitted so
+            # Stage 1 can mark the 5m metrics stale instead of silently trusting them.
+            fetched_latest = pd.Timestamp(full_df.index.max())
+            if fetched_latest < expected_deadline:
+                gap = expected_deadline - fetched_latest
+                missing_bars = max(0, int(round(gap / INTRADAY_BAR_INTERVAL)))
+                incomplete = {
+                    "intraday_incomplete": True,
+                    "latest_ts": str(fetched_latest),
+                    "expected_deadline": str(expected_deadline),
+                    "expected_session": expected_session.isoformat(),
+                    "missing_bars_estimate": missing_bars,
+                    "provider": target_prov,
+                }
+                report.incomplete_symbols[sym] = incomplete
+                message = (
+                    f"{INTRADAY_INCOMPLETE_WARNING}: {sym} last 5m bar "
+                    f"{fetched_latest.strftime('%Y-%m-%d %H:%M')} is before the expected session "
+                    f"{expected_session.isoformat()} last complete bar "
+                    f"{expected_deadline.strftime('%Y-%m-%d %H:%M')} "
+                    f"(provider {target_prov}); published bars were still written, none were "
+                    f"fabricated. missing_bars_estimate={missing_bars} "
+                    "(calendar-bar upper bound: the lunch break inflates it)"
+                )
+                warnings.warn(message, IntradayIncompleteWarning, stacklevel=2)
+                print(message)
+            else:
+                print(
+                    f"[intraday_complete] {sym} last bar {fetched_latest.strftime('%Y-%m-%d %H:%M')}"
+                    f" >= deadline {expected_deadline.strftime('%Y-%m-%d %H:%M')}"
+                )
 
             # M3.8: Fetch and store adjust factors for raw 5m bars
             if hasattr(bs_prov, "fetch_adjust_factors"):
@@ -1593,7 +1866,26 @@ def sync_5m_intraday(
             print(f"-> Index {idx_sym} (5m) skipped: {e}")
 
     refusals.raise_if_any()
-    return fetch_errors
+
+    # Diagnostics summary: "how many symbols were half a session" belongs in the run log, not
+    # only in the per-symbol lines (Stage 1 reads this alongside the warnings).
+    print(
+        f"\n5m cache probes: {sum(1 for p in report.cache_probes.values() if p['hit'])} hit / "
+        f"{sum(1 for p in report.cache_probes.values() if not p['hit'])} fetched "
+        f"(deadline {report.expected_deadline})"
+    )
+    if report.intraday_incomplete:
+        print(
+            f"{INTRADAY_INCOMPLETE_WARNING}: {len(report.incomplete_symbols)} symbol(s) did not "
+            f"reach the {expected_session.isoformat()} last complete bar "
+            f"{expected_deadline.strftime('%H:%M')} -> intraday_incomplete=true "
+            f"({', '.join(sorted(report.incomplete_symbols))})"
+        )
+    else:
+        print(f"[intraday_complete] all fetched symbols reached {expected_deadline}")
+
+    report.update(fetch_errors)
+    return report
 
 
 def print_verification_summary(cache: DuckDBCache, stocks: List[str], indices: List[str]) -> None:
@@ -1670,6 +1962,14 @@ def main():
         ),
     )
     parser.add_argument("--cache-dir", default=os.path.join(_REPO_ROOT, "data"), help="DuckDB cache folder")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help=(
+            "Print the structured 5m `cache_probe` verdict (hit/reason/latest_ts/"
+            "expected_deadline) for every symbol, instead of only CACHE HIT / fetch lines."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1692,7 +1992,15 @@ def main():
     patch_equity_daily_bars(cache, stocks, end=args.end)
 
     # Part B: 5m intraday downloading and caching (Sequential Single-Process)
-    sync_5m_intraday(cache, stocks, MAJOR_INDICES, start=args.start_5m, end=args.end)
+    report_5m = sync_5m_intraday(
+        cache, stocks, MAJOR_INDICES, start=args.start_5m, end=args.end, verbose=args.verbose
+    )
+    if report_5m.intraday_incomplete:
+        print(
+            f"\n[STAGE 1 SIGNAL] intraday_incomplete=true for "
+            f"{len(report_5m.incomplete_symbols)} symbol(s); the 5m metrics for "
+            f"{report_5m.expected_session} cannot be trusted as a complete session."
+        )
 
     # Part C: Print summary verification tables
     print_verification_summary(cache, stocks, MAJOR_INDICES)
