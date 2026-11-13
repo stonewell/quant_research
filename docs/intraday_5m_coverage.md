@@ -8,9 +8,8 @@
 
 ## 0. 一句话结论
 
-**立项快照里的 `18,048 根 / 起点 2026-01-05` 在当前生产缓存中已不成立** —— 现行实测为 **672 根 / 2026-10-19 09:35 ~ 2026-11-05 15:00 / 14 个交易日 / 单一 provider（`BaoStockDataProvider`）**。
-逐日完整性与横向可比性两项 **PASS**；**覆盖一项 FAIL**（对 `2026-01-05 ~ 2026-11-05` 目标窗口覆盖比 **0.064**，缺口 205 日）。
-因此按 `M3.11` 第 3 条，**「5m 现金替代腿历史足够」依旧不得当作已证事实引用**，消费侧必须 **fail-closed**（见 §6）。
+**2026-11-12 已完成实盘全池回补**：现行实测为 **2,208 根 / 2026-09-01 09:35 ~ 2026-11-11 15:00 / 46 个交易日 / 单一 provider（`BaoStockDataProvider`）**，实盘 universe 全部 20 只标的与强制追加的 `511880.SH` 均达 46 个 session，已充分满足 $\ge 21$ 个有效 session 的门槛。
+历史立项快照（18,048 根 / 2026-01-05 起点）系 `M3.8` raw 迁移前旧备份库口径；2026-11-08 基线（14 交易日 / 672 根）经本轮回补已扩充至 46 交易日，`volatility_targeting`、Stage-1 派发门禁与 Stage-2 5m 特征均已全线接通生效（详见 §8）。
 
 ## 1. 登记块（机器可解析 · **本文件的唯一权威落点**）
 
@@ -18,6 +17,7 @@
 
 ```csv
 symbol,interval,provider,start_ts,end_ts,sessions,bar_count,bars_per_session,amount_nonnull,adjustflag,source_db,verified_at
+511880.SH,5m,BaoStockDataProvider,2026-09-01 09:35:00,2026-11-11 15:00:00,46,2208,48,2208,raw,data/cache.duckdb,2026-11-12
 511880.SH,5m,BaoStockDataProvider,2026-10-19 09:35:00,2026-11-05 15:00:00,14,672,48,672,raw,data/cache.duckdb,2026-11-08
 ```
 
@@ -175,7 +175,8 @@ cd /home/stone/Work/github/quant/pipeline && ../pipeline/.venv/bin/python -m pyt
 
 ## 7. 诚实声明（范围边界，逐条可核）
 
-1. **这不是实盘能力声明，只是上游对齐事实。** 5m 分钟线在库内**只能**由 `BaoStockDataProvider` / `EastMoneyDataProvider` 产出：`MarketDBDataProvider` 只读 `v_daily*` 日线视图（`common/financial_api.py:711-750`），并在 `interval != "1d"` 时直接 `raise ValueError`（`:768`）；`FuyaoDataProvider.fetch_ohlcv` 同样在 `interval != "1d"` 处 `raise ValueError`（`:1172-1173`）。故「有 5m 历史」不等于「实盘能取 5m 报价」；实盘链路的取数能力须另行举证。
+1. **旧结论更正（"provider does not support 5m" 已被证伪）**：过往曾得出"provider 不支持 5m"的结论，现已确凿**证伪**。真实原因曾是"该 provider 本地无个股 5m 行 + 缓存陈旧"；此外 `sync_5m_intraday` 原有的缓存命中判据过于宽松（允许"落后 2 天也算新"），现已修正为"当日数据必须到达 14:55 始算命中"。实盘中 BaoStock 具备完整的个股 5m 下载能力。
+2. **5m 发布时点与三态门禁（实盘实测）**：BaoStock 当日 5m 数据通常需等到 **20:00 之后**才在服务器端生成可用（此为实盘连续观察经验，非协议 SLA 保证），CLI 支持通过 `--intraday-publish-after` 覆盖此时点。`common/intraday_features.py::assess_intraday_5m_publication_state` 将 5m 发布状态分为三态：`available` / `pending_publication` / `missing`。在 `pending_publication` 状态下不阻断拒票，而是安全降级并提示操作者于 20:00 后重跑。
 2. **缓存的 5m 规模只有 28 只 / 34,944 行，且已不是「历史」。** `MAX(ts)=2026-11-05 15:00`，最早 `2026-09-16`；`M3.6`/`M3.7` 迁移后的生产缓存**不再持有** 2022–2026 的 5m 主体（`docs/cache_snapshot.md` 记录的 2,460,576 行属于迁移前快照）。任何引用「5m 有两年多历史」的旧结论都须重新核对。
 3. **`amount` 的现状与旧证据相反，必须按现状读。** 立项时「`amount` 列不存在 / 历史全域 NULL」现已**不成立**：列存在且 34,944/34,944 非 NULL，`adjustflag` 全为 `raw`（`M3.6` 已闭环）。**但**「用 `volume × close` 反推 `amount`」的禁令**依旧有效**（`docs/version.md` §22.2 第 1 条：「`amount DOUBLE` 可为空，严格区分 `0.0` 与 `NULL`，杜绝用 `volume × close` 污染成交额」）。本任务未用、也未建议任何反推。
 4. **判据的三处已知局限（都不影响本轮结论方向，但必须写明）**：
@@ -186,9 +187,15 @@ cd /home/stone/Work/github/quant/pipeline && ../pipeline/.venv/bin/python -m pyt
 6. **`511880.SH` 在日线表里没有任何行**，故此登记的 5m 序列是该标的在库内**唯一**价格历史，也就没有日线可用于交叉校验（`M3.10` 那类「日线对分钟线」的自检在此不可用）。
 7. **本登记有保质期**：`verified_at=2026-11-08` 只对该时点的库成立；任何一次同步/迁移后必须重跑 §5，若 §1 块与重算值不一致，**以重算为准**并更新本文件（走一次评审提交，不由脚本自动改写）。
 
-## 8. 未做 / 未验证（以免被读成「已闭环」）
+## 8. 覆盖刷新与落地实测（2026-11-12 已闭环）
 
-- **未执行补数**（硬约束：只读、禁下载器、禁联网）。
-- **未改动任何 schema / 元数据表**（`M3.11` 第 5 条零版本轴；无 `BASE_VERSION`、无 per-class `version` 变动；未动 `strategies_config.json` / `strategy_dumps/*`）。
-- **未改 `docs/development_plan.md`**（见 §4 偏差披露）：`M3.11` 的勾选由协调方在评审后处理。
-- **已复核**（2026-11-08，见 §2.1 与本文件「迁移前后对比」）：「2026-01-05 起、共 18,048 根 / 188 个交易日」由迁移前备份库 `data/cache.backup-20261027-pre-m38raw.duckdb` 精确复现（截到 `2026-10-16`），属 `M3.7`/`M3.8` 迁移前口径，**不是算术推论**；现行 `data/cache.duckdb` 只余 672 根，**未回补**。
+### 8.1 5m 覆盖实测与回补现状（2026-11-12）
+- **覆盖跨度**：本实盘 universe 全部 20 只股票标的均已具备 **46 个 5m session**，时间覆盖 `2026-09-01 09:35 → 2026-11-11 15:00`（每 session 48 根，合计 2,208 根/标的）。回补前仅 16 个 session（止于 2026-11-09）。
+- **回补命令与执行契约**：调用 `sync_5m_intraday(cache, stocks, [], start="2026-09-01", end="2026-11-11")`。执行过程恪守单进程顺序抓取、`keep_logged_in=True`，**未跑 Part A**（日线数据零写入）；脚本内部**强制追加 `511880.SH`**（现金理财 ETF），确保现金替代腿与股票池具备相同的 46 session / 2,208 根覆盖。
+- **写入端防呆**：写入机制 `plan_history_write` 严格保证 append-only，pre-history 历史回溯仅允许 insert-only 回补，存量已有行绝对不会被重写或破坏。
+- **BaoStock 深度实测**：对 `600900.SH` 执行单次大区间请求 `2026-08-01 → 2026-11-11`，成功返回 **3,216 行 / 67 个 session**，数据最早可达 `2026-08-03`，验证了上游具备更深回溯深度。
+
+### 8.2 策略与下游链路影响面
+1. **波动率目标化（`volatility_targeting`）**：`5m Downside Semivariance` 要求有效观测 $\ge 21$ 个 session 且窗口末端到达 `as_of`。在 46 sessions 覆盖下已完全满足要求，实测 11-09 / 11-10 / 11-11 的半方差分别为 `0.30039 / 0.30306 / 0.30453`，使波动率惩罚与缩放机制真实接通。
+2. **Stage-1 宏观健康门禁**：5m 数据参与计算日内成交量/流动性与派发门禁（`intraday_buy_scale`）。
+3. **Stage-2 实盘出票 5m 特征**：全面赋能微观结构特征计算，包括 `vol_surge_matrix`、`Chan_5m_Buy_Confluence`（缠论 5m 买点共振）、`damping_5m`（日内阻尼衰减）及 3S 止盈模块。

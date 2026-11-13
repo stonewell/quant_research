@@ -29,7 +29,7 @@
 |---|---|---|
 | `summary.json` 时间戳 | 裸 `2026-10-22T19:05:27`（无 tz） | 北京/香港 `2026-10-23 10:05`（上午盘中）；太平洋 `2026-10-22 19:05`（美股已收盘） |
 | 缓存写入时刻 | PT `18:59:41`–`19:02:10` | 北京 `2026-10-23 09:59`–`10:02`，即 **A 股上午连续竞价时段内** |
-| 实际运行窗口 | 北京 `10:05` 左右 | 距设计预期的 `13:55`–`14:20` 尾盘窗口约 4 小时 |
+| 实际运行窗口 | 北京 `10:05` 左右 | 距设计预期的 `13:55`–`14:20` 尾盘窗口约 4 小时（现已改为收盘后 15:30 至下一交易日开盘 09:30 统一跨午夜窗口，含 `run_window_start` / `run_window_end` ISO 字段，见 `docs/version.md` §33） |
 
 一次"按尾盘口径设计"的实盘运行，实际发生在次日**早盘盘中**，而全链路没有任何一处代码对此提出异议。
 
@@ -84,7 +84,7 @@ cat /etc/timezone
 | 归因 | 判定 | 依据 |
 |---|---|---|
 | (a) 无任何新鲜度断言 | **是（近因）** | 6 只标的 K 线停在 `2026-10-21`，仍参与盯市与出票 |
-| (b) 无运行窗口门禁 | **是（近因）** | 北京 10:05 运行，距预期 `13:55`–`14:20` 窗口约 4 小时 |
+| (b) 无运行窗口门禁 | **是（近因）** | 北京 10:05 运行，距预期 `13:55`–`14:20` 窗口约 4 小时（现已改为收盘后 15:30 至下一交易日开盘 09:30 统一跨午夜/跨周末窗口，单一真值由 `post_close_to_open_window` 派生，见 `docs/version.md` §33） |
 | (c) as_of 算错 | **否** | 见上表不变量 |
 
 市场时钟专项的目标是让 as_of **构造上正确且跨宿主稳健**，并为 (b) 提供可断言的窗口语义；它**不是**在修一个算错的日期。
@@ -321,7 +321,7 @@ def assert_run_window(clock, stage, window, *, allow_intraday=False, strict=True
 | `--strict-freshness` | 实盘 `True` | 任一标的 bar 日期 ≠ 预期即硬失败 |
 | `--publication-grace-minutes` | 30（中/港）/15（美） | 覆盖发布宽限 |
 
-**窗口默认值（市场本地时间）**：Stage 1 `(13:55, 14:20)`；Stage 2 `(14:10, close)`→China `(14:10, 15:00)`、HK `(14:10, 16:00)`、US `(14:10, 16:00)`。必须经 `clock.local_now()` 归一化后再比较。
+**窗口默认值与统一跨午夜窗口（市场本地时间）**：原设计的盘前/盘中分 stage 窗口（Stage 1 `(13:55, 14:20)`、Stage 2 `(14:10, close)`）已废除，统一改为**单一跨午夜/跨周末窗口**：`[估值日收盘 + 30 分钟日线发布宽限（China 为 15:30）, 下一交易日开盘（09:30）)`，具备**跨午夜**特性；结束点按交易日历取"下一交易日开盘"（周五 15:30 → 下周一 09:30）。单一真值由 `common/market_clock.py::post_close_to_open_window` / `next_trading_day` / `format_run_window` / `in_post_close_to_open_window` 统一定义；`common/cli_utils.py::market_run_window` 已是纯别名，`assert_run_window` 改为显式区间判定并删除了 `not_applicable` 分支。`summary.json::clock.run_window` 格式化为 `"YYYY-MM-DD 15:30 → YYYY-MM-DD 09:30"`，并新增 `run_window_start` / `run_window_end`（ISO）字段。（详见 `docs/version.md` §33）
 
 **现存字面量的来历。** 仓库里已有的 `"14:15"`（`run_live_strategy.py:826`）与 `"14:00"`（`check_live_portfolio_health.py:165–166`）是**裸的、面向 A 股的字符串**，不带任何时区。本文反复提到的"14:00–14:15 窗口"就源自这两个 `argparse` 默认值——它**从未由任何时钟计算得出**。这也是 10:05 运行毫无告警的原因：链路上根本不存在"当前时刻是否在窗口内"的比较。
 
@@ -337,6 +337,7 @@ def assert_run_window(clock, stage, window, *, allow_intraday=False, strict=True
 | 市场本地时间戳 | 操作者可读锚（带 tz 偏移） |
 | market + session state | 如 `china/open` 的二元组 |
 | `as_of_trading_date` | 本次估值依据的交易日 |
+| `run_window` / `run_window_start` / `run_window_end` | 跨午夜运行窗口（如 `"2026-11-12 15:30 → 2026-11-13 09:30"` 及 ISO 起止时间戳） |
 | 逐标的 price bar date | 每个标的实际使用的 bar 属哪一天 |
 | freshness PASS/FAIL 汇总 | **逐条列出** bar 日期 ≠ as_of 的标的 |
 
@@ -436,7 +437,7 @@ def assert_run_window(clock, stage, window, *, allow_intraday=False, strict=True
 | # | 开放决策 | 建议 |
 |---|---|---|
 | 1 | 美股/港股节假日来源（静态表 vs 已存在依赖） | 先跑一次 import 检查；有则用，无则静态表 2024–2028 + 越界告警 |
-| 2 | 盘中运行策略 | 不按"是否盘中"判，按窗口判：中国 `13:55`–`14:20` 放行，窗口外拒绝 |
+| 2 | 盘中运行策略 | 历史设计曾拟盘中窗口放行（中国 `13:55`–`14:20`）；**现已改为收盘后 15:30 至下一交易日开盘 09:30 统一跨午夜窗口**（结束点按交易日历推至下一交易日开盘，含 `run_window_start/end`），盘中时段默认硬拒绝，详见 `docs/version.md` §33 |
 | 3 | 混合市场 universe | 无 `--market` 时拒绝；给了则逐标的按其所属市场的 expected session 估值 |
 | 4 | 发布宽限期时长（30/15 分钟）为**估计值** | 需用上游真实发布延迟校准，校准前按估计值并披露 |
 | 5 | 已持久化的 naive 时间戳与旧归档目录 | 不重写，仅从今往后修正；历史数据按"语义不明"处理 |

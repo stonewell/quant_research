@@ -4393,3 +4393,241 @@ M4.1 的静态守卫 `common/tests/test_position_policy.py::test_kernel_has_no_c
 - **NB-2（仅补注释，未改行为）两日破位确认退出取 `normal_cooldown_bars`（默认 2），硬止损 / 紧急路径取 `asset_stop_cooldown_bars`（默认 `max(5, normal)`）。** 理由：两日确认窗口**本身就是**本条规则的防抖延迟，故不再额外支付止损冷却；后果（已破位标的可能比已止损标的更早被重新纳入）**已被接受并记录**，不改行为。注释落点 `common/position_policy.py:1520-1530`。
 - **NB-3（仅补注释，未改行为）闸门 3b（`price_reentry_gate`）只在冷却「到期那一个 bar」评估，block 是单 bar 否决而非持久化的闸门状态。** 该 block 不写进 `AssetState`，下一 bar 直接跳闸门 3、走正常入场阶梯，且**不重新校验 reclaim**；docstring 已明文写清，并警告**未来任何多 bar 闸门必须显式持久化该 block**（`common/position_policy.py:1078-1080`、`:1614-1627`）。
 - **离线验证（实测）**：`backtester/tests` → **123 passed**；`common/tests/test_position_policy.py` → **296 passed**；`pipeline/tests/test_policy_parity.py` → **78 passed（442.00s）**。
+
+## 32. `LV18` 接线：Stage-1 Barroso 波动率缩放以 **cap 语义**接入实盘票据构建（`chan_four_state_blend` `1.2.2 → 1.3.0`，2026-11-12）
+
+### 32.1 版本轴
+
+| 对象 | 改前 | 改后 | 说明 |
+| --- | --- | --- | --- |
+| `ChanFourStateBlendStrategy.version` | `1.2.2` | **`1.3.0`** | 该策略的**实盘下单行为**改变（权益预算被 Stage-1 因子封顶），属策略行为变更，按 AGENTS §7 必须升 `version` |
+| `BaseBlendAllocationStrategy.BASE_VERSION` | `2.0.0` | **不变 `2.0.0`** | 本次**未改** `blend_base.py` 的任何内容（其 Garman-Klass 目标波动率缩放、权重加权、钳位逻辑一字未动）⇒ 不触发底座升版 |
+| 其余 5 个在产 blend 策略 `version` | — | **不变** | 覆写仅对 `chan_four_state_blend` 生效（显式白名单），其它策略行为与票据**逐字节不变** |
+
+### 32.2 变更语义（为什么是「取上限」而不是「再乘一次」）
+
+`scripts/check_live_portfolio_health.py::evaluate_realized_volatility` 一直计算
+`vol_scaling_factor = clip(target_vol / realized_vol_21d)`（`target_vol = 0.12`，Barroso & Santa-Clara 2015），
+但 `docs/development_plan.md` 的 `LV18` 已登记它**没有任何下游消费者**——被算出来、被打印三处、被写进报告，
+却没有一行 Stage-2 代码用它定仓。本次把它接入，语义定为：
+
+```
+equity_budget = min(Σ 模型权益目标权重, vol_scaling_factor)
+```
+
+**为什么不是相乘**：`pipeline/research/blend/blend_base.py` 自身已有 Garman-Klass 目标波动率缩放
+（`cfsb_enable_vol_targeting=true` / `cfsb_target_vol=0.12`），这正是策略侧权益目标只有 46.3%（而非满仓）的原因。
+两者都是对「该承担多少风险」的独立估计，相乘等于对**同一次**高波动观测**降两次风险**：
+归档 `2026-11-11/205137` 实测 `realized_vol_21d=0.3240854096084951`、`vol_scaling_factor=0.3702727628033721`、
+模型权益 `46.3%` ⇒ 相乘为 `0.463 × 0.370 = 0.171`，取上限为 `0.370`。故 Stage-1 只能作为
+**不得更激进的天花板**，不能替代策略自身的波动率目标。
+
+### 32.3 生效点（与任务书原定落点的偏离，附实测证据）
+
+任务书原定「票据构建阶段（权重归一化之后、`target_weight_effective` 计算之前）」。
+**实测后改为作用在目标权重向量上**（`target_series`，紧接 `resolve_r1_derisk_target` 之后、隐含现金残差重算之前），
+理由是可复现的：
+
+- 行级后处理**无法对已建仓的账本降风险**。`normalize_model_target_weights` 的契约明确「归一后目标跌破现有持仓一律按 0 股登记，
+  不得凭空造 SELL」；同一规则套到行级 cap 上，2026-11-11 合成复核实测：`target_weight` 已写到 `3.70%`，
+  但 `target_weight_effective` 仍为 `78.60%`（`partial=true`）——正是 `LV18` 要消灭的「展示成已施行、实际惰性」形状。
+- 若改为在行级「允许造 SELL」，则会**绕过** `step_position_lifecycle` 的 `can_sell`（中国 T+1 孕育期）、
+  tenure lock 与惰性/归一化闸门 —— 等于用手写 SELL 覆盖仓位生命周期状态机，风险高于收益。
+- 作用在权重向量上，与 `apply_r1_intraday_derisk` 以及 Stage-1 的 Tier-2 防御 / 线性阻尼**同一落点**，
+  于是生命周期、tenure、整手取整、购买力、交付市值上限**全部照旧生效**，减仓由有权发 SELL 的机件发出。
+
+改造后同一合成复核实测：`模型权益 85.93% → 上限 3.70%`，票据 Phase 1 输出 11 条减仓 SELL，
+`vol_overlay.model_equity_sum=0.85932719` / `capped_equity_sum=0.037` / `delivered_equity_sum=0.00482777`。
+cap 生效时**同时**置 `is_portfolio_deleverage=True`，使 tenure lock 按既有 L2.40 规则放行部分减仓。
+
+### 32.4 参数与字段
+
+- 新增配置（**仅** `strategies_config.json` 的 `chan_four_state_blend` 条目，默认开启）：
+  `cfsb_portfolio_vol_overlay_enabled: true`、`cfsb_portfolio_vol_overlay_mode: "cap"`（可选 `"off"`）。
+- 键名按 blend 前缀规范写作 `cfsb_*`（**不得**用裸名，避免 2026-10-21 `wq_alpha_id` 那类全局 `StrategyConfig` 字段串味）；
+  解析器只读带前缀拼写，未知取值降级为回到 `cap`（只会更保守，不会静默变 `off`）。
+- `StrategyConfig` 同步声明 `cfsb_portfolio_vol_overlay_enabled` / `cfsb_portfolio_vol_overlay_mode`
+  （与其校验），使配置条目经 `StrategyConfig.from_dict` 往返时不再落进 `unknown key(s)` 告警。
+- 票据顶层新增（**仅**该策略且开关开启时出现）：
+  ```
+  "vol_overlay": {
+    "applied": bool, "mode": "cap", "realized_vol_21d": float|null,
+    "vol_scaling_factor": float|null, "model_equity_sum": float|null,
+    "capped_equity_sum": float|null, "equity_scale_factor": float|null,
+    "binding": bool, "reason": null|"vol_unavailable"|"empty_equity_book"|"no_targets",
+    "delivered_equity_sum": float, "ceiling_exceeded_by": float|null
+  }
+  ```
+- **降级契约**：`vol_scaling_factor` 缺失 / `vol_degraded=true` / 带 `vol_scaling_fallback` 时，
+  `applied=false` + `reason="vol_unavailable"`，**保留模型原始权重**，绝不按 1.0x 处理
+  （未测得的波动率不等于平静市况；D7 的 `1.0x` 只是标签，不是测量）。
+- 未改动：`evaluate_realized_volatility` 的任何计算、`blend_base.py` 的任何波动率缩放逻辑、`common/duckdb_cache.py`。
+
+### 32.5 dump 与 `regime_ic_ir_hybrid` 钉子复验（实测）
+
+`cd pipeline && .venv/bin/python research_strategy/run_research_strategy.py --dump-strategies` → `58` 份，正常退出。
+
+| 字段 | dump 前 | dump 后 |
+| --- | --- | --- |
+| `chan_four_state_blend.strategy_version` | `1.2.2` | **`1.3.0`** |
+| `chan_four_state_blend.base_version` | `2.0.0` | **`2.0.0`（不变）** |
+| `version_info.composite_version` | `1.2.2 [base: 2.0.0]` | **`1.3.0 [base: 2.0.0]`** |
+| `params.blend_weighting_mode` | `regime_ic_ir_hybrid` | **`regime_ic_ir_hybrid`（未被归一化）** |
+| `params.cfsb_inertia_relative_ratio` | `0.3` | `0.3` |
+| `params.cfsb_portfolio_vol_overlay_enabled` / `_mode` | 无 | `true` / `"cap"` |
+
+逐文件对比改前快照（`/tmp/opencode/dump_snapshot_pre_lv18/`）：58 份中**仅 `chan_four_state_blend_strategy.json` 一份**变化，
+其余 57 份逐字节相同（无参数/权重/键漂移）。
+
+### 32.6 离线验证（100% 离线，实际运行结果）
+
+| 命令 | 结果 |
+| --- | --- |
+| `pipeline/.venv/bin/python -m pytest pipeline/tests/test_live_weight_budget_and_buy_stdout_parity.py pipeline/tests/test_portfolio_vol_overlay.py -q --import-mode=importlib` | **29 passed** |
+| `pipeline/.venv/bin/python -m pytest pipeline/research_strategy/tests/test_blend_strategy_versioning.py common/tests/test_strategy_versioning.py -q --import-mode=importlib` | **10 passed** |
+| `pipeline/.venv/bin/python -m pytest pipeline/tests -q --import-mode=importlib` | **1172 passed, 1 skipped** |
+| `pipeline/.venv/bin/python -m pytest common/tests -q --import-mode=importlib` | **1407 passed, 1 skipped** |
+| `pipeline/.venv/bin/python -m pytest pipeline/research_strategy/tests -q --import-mode=importlib` | **631 passed, 1 xfailed** |
+
+新增 `pipeline/tests/test_portfolio_vol_overlay.py`（14 用例）钉死：①0.44 + 0.37 ⇒ 0.37 且**不是** 0.163（cap≠相乘）；
+②0.30 + 0.37 ⇒ 0.30、`binding=false`、权重逐位不变；③因子缺失/降级（含 D7 的 `1.0x` 标签）⇒ 权重不变、
+`applied=false`、`reason="vol_unavailable"`；④开关关闭 / `mode=off` ⇒ 不产生审计块、返回同一对象；
+⑤非白名单策略（`chan_risk_managed_blend` / `turtle_breakout` / `equal_weight` / 空键）⇒ 同样不产生审计块、权重不变。
+
+### 32.7 未验证项 / 已知局限（必须如实登记）
+
+1. **未跑真实实盘票据**：本节全部证据来自离线单测 + `--data-provider synthetic` 的端到端复核，
+   未在生产 `marketdb` 数据的 2026-11-11 账本上重跑出票。`strategy_version=1.3.0` 会经
+   `run_live_strategy.py` 的 `getattr(template, "version", None)` 自动带上（与 `strategy_dumps` 一致），
+   但**未在归档票据上肉眼核对**。
+2. **日常权益预算会真的从约 46% 降到约 37%**：若 Stage-1 因子持续低于模型权益和（如 11-11 的 `0.370`），
+   该策略的持仓结构会改变——不是微调：按当日模型权益 `0.463` 计，约 `9.3` 个百分点 NAV 从权益转入现金停泊，
+   并按整手/惰性/tenure 规则分多日或一次性减仓。这是本次改动的**主要行为影响**，不是「无影响」。
+3. **整手粒度会显著低于上限**：合成复核实测 `capped_equity_sum=0.037` 而
+   `delivered_equity_sum=0.004828`——低价位/小 NAV 下 100 股一手本身就大于若干标的目标权重，只能归零。
+   票据已用 `ceiling_exceeded_by`（本次 `0.0`）与 `delivered_equity_sum` 把这一漂移显式化，
+   但**未**为它设置容差告警阈值。
+4. **与指数/宏观腿的交互未测**：cap 只封顶权益权重向量，不改 Stage-1 的广度/冲力/熔断判据；
+   同日同时触发 Tier-2 防御或 R1 降险时的**叠加顺序**为「Tier-2/线性阻尼 → R1 → volatility cap」，
+   本组合路径只做了代码级推演，未做专门 A/B 实测。
+5. `blend_base.py` 的 Garman-Klass 缩放**未做任何改动**，故其 `BASE_VERSION` 不升；若后续要改成
+   「Stage-1 与引擎共用同一个目标波动率估计」，那将是另一次底座级变更，需另立任务并按 AGENTS §7 升 `BASE_VERSION`。
+
+### 32.8 追查：票据里 `vol_scaling_factor: 0.037` 是「测试造数」，不是 10× 缩放缺陷
+
+复核结论（**无需修复，仅登记**）：`0.037` 不具备任何真实计算链路来源，它是本会话为验证上限逻辑
+**人工构造**的 Stage-1 报告值。
+
+1. `scripts/check_live_portfolio_health.py::evaluate_realized_volatility` 的公式为
+   `vol_scaling_factor = clip(target_vol / realized_vol_21d)`（`target_vol = 0.12`）。
+   真实归档 `2026-11-11/205137`：`realized_vol_21d = 0.3240854096084951` ⇒ `0.12 / 0.324085… = 0.3702727628033721`；
+   `2026-11-11/234433`：`0.30175093526962316` ⇒ `0.3976789662400766`；实盘 2026-11-05 为 `33.9% → 0.35x`。
+   没有任何一档能算出 `0.037`。
+2. `resolve_stage1_vol_inputs` 对因子是**逐字读取**（`float(raw_scale)`，仅做有限性/正数校验），
+   链路中**不存在**任何 `÷10`、`×0.1` 或二次换算；`0.037` 只可能来自报告文件本身。
+3. 造数现场：`/tmp/opencode/lv18_run2/stage1_health_report.json`（复制到 `lv18_run3`）由助手手写，
+   `realized_vol_21d` 抄自 11-11 归档（`0.3240854096084951`），而 `vol_scaling_factor` 却被随手写成 `0.037`
+   ——两者不满足 `0.12 / rv` 关系，即该样本本身就自相矛盾。
+4. 该样本仅用于证明「极小上限 + 整手取整 ⇒ 几乎交付不了」这一极端场景（见 32.9 的交付缺口护栏），
+   **不代表**任何真实交易日的 Stage-1 输出。真实票据的因子应始终等于 `clip(0.12 / realized_vol_21d)` 且入参可复算。
+
+### 32.9 交付缺口护栏（item 2）与叠加顺序钉死（item 3）——**不升版本**
+
+两项均为**审计/告警层**改动，权重算法逐字未变，故 `ChanFourStateBlendStrategy.version` 保持
+`1.3.0`、`BASE_VERSION` 保持 `2.0.0`（无 `blend_base.py` 改动）。
+
+**item 2（交付缺口）**：新增常量 `VOL_OVERLAY_DELIVERY_SHORTFALL_RATIO = 0.5`、
+纯函数 `evaluate_vol_overlay_delivery()` 与 `format_vol_overlay_delivery_warning()`。
+`vol_overlay` 审计块新增 `delivery_shortfall`（bool）与 `delivery_shortfall_ratio = delivered / capped`
+（仅在 `binding=true` 且 `capped>0` 时有意义；`delivered > capped` 时比值 >1、不判为缺口），
+票据顶层新增 `vol_overlay_delivery_ok`（bool）。**`weight_budget_ok` 语义完全未改**（它仍是「能否塞进 100% NAV」的判据）。
+缺口触发时打印 `[WARN/VOL OVERLAY] 上限 X% 但整手后仅能交付 Y%（缺口 Zpp）`。
+**绝不**通过放大权重或跳过整手取整来「补齐」缺口——护栏只报告，不制造敞口。
+
+**item 3（叠加顺序：取更严者，绝不连乘）**：volatility cap 读取的是 Tier-2 快速恢复阻尼 /
+线性回撤阻尼 / R1 降险**之后**的目标权重向量，因此只能收紧、不能再乘一次：
+`0.50 阻尼 + 0.37 上限 ⇒ 0.37`（非 `0.185`）；`0.30 阻尼 + 0.37 上限 ⇒ binding=false、权重逐位不变`（非 `0.111`）。
+三级熔断（`TIER_3_HALT` / 冷冻期）在 cap 之前已把风险仓位清零，故 `main()` 以
+`superseded_by="circuit_breaker_tier3"` 传入，审计块记 `superseded_by_circuit_breaker=true`、
+`reason="circuit_breaker_tier3"`、`binding=false`、`equity_scale_factor=null`，
+**不得**被读成「上限把仓位清零了」；同时**不动** `is_portfolio_deleverage`（熔断路径语义保持原样）。
+
+验证（离线，实际运行）：`pipeline/tests/test_portfolio_vol_overlay.py` 由 14 例扩至 **25 例**（新增 11 例：
+6 例覆盖交付缺口/阈值/`weight_budget_ok` 不变，5 例覆盖 Tier-2 取严、Tier-3 归属、线性归零与调用顺序）；
+`pipeline/tests` 全量 **1183 passed, 1 skipped**。
+
+**端到端合成复核（`--data-provider synthetic`，实际运行，RC=0）**：
+
+| 场景 | 复现目录 | 票据实测 |
+| --- | --- | --- |
+| 上限生效但整手交付不出（因子 `0.037`，模型权益 `59.08%`） | `/tmp/opencode/lv18_run4` | `capped=0.037` / `delivered=0.0` / `delivery_shortfall=true` / `delivery_shortfall_ratio=0.0` / `vol_overlay_delivery_ok=false` / `weight_budget_ok=true`（未受影响）；stdout 第 813 行 `[WARN/VOL OVERLAY] 上限 3.70% 但整手后仅能交付 0.00%（缺口 3.70pp）` |
+| Tier-3 熔断（`circuit_breaker_tier=TIER_3_HALT`, `freeze_remaining_bars=3`） | `/tmp/opencode/lv18_run5` | `superseded_by_circuit_breaker=true` / `reason="circuit_breaker_tier3"` / `binding=false` / `equity_scale_factor=null` / `capped_equity_sum=0.0` / `delivery_shortfall=false`；唯一指令为 `BIL SWEEP_CASH`（未凭空产生 SELL）；stdout `[INFO/VOL OVERLAY] 三级熔断已先行清零风险仓位 (superseded_by=circuit_breaker_tier3)` |
+
+注：上述两轮使用的 `stage1_health_report.json` 仍是**手工造数**（`0.037` 见 32.8），仅用于打通路径，
+不是真实交易日的 Stage-1 输出；真实票据的因子必须等于 `clip(0.12 / realized_vol_21d)`。
+
+## 33. 实盘运行窗口重构：收盘后至次日开盘统一窗口与 5m 日内发布三态解耦（2026-11-12）
+
+关联任务：[`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) §2.21 追加记录、[`docs/development_plan_archive.md`](file:///home/stone/Work/github/quant/docs/development_plan_archive.md) §2.21 `LV2` 及 §4.30（彻底取代历史尾盘窗口与 `--allow-post-close` 临时融通）；涉及时钟基础设施 [`common/market_clock.py`](file:///home/stone/Work/github/quant/common/market_clock.py)、CLI 工具类 [`common/cli_utils.py`](file:///home/stone/Work/github/quant/common/cli_utils.py)、日内特征评估 [`common/intraday_features.py`](file:///home/stone/Work/github/quant/common/intraday_features.py)、数据同步脚本 [`scripts/sync_china_5m_and_indices.py`](file:///home/stone/Work/github/quant/scripts/sync_china_5m_and_indices.py) 以及两阶段实盘运行脚本 [`scripts/check_live_portfolio_health.py`](file:///home/stone/Work/github/quant/scripts/check_live_portfolio_health.py) 与 [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py)。
+
+> **Supersede 声明**：本重构彻底取代 [`docs/development_plan_archive.md`](file:///home/stone/Work/github/quant/docs/development_plan_archive.md) §2.21 `LV2` 及 §4.30 中关于 13:55–14:20 盘中尾盘运行窗口与 `--allow-post-close` 临时融通的遗留设计。实盘出票契约是次日开盘执行，窗口唯一真相源即收盘后至次日开盘。
+
+### 33.1 变更背景：语义自相矛盾的根除
+
+1. **核心矛盾**：实盘工单（`live_orders_ticket.json`）的执行契约明确声明为「次日开盘集合竞价（09:30）执行」（Next-Day Market Open）。然而历史运行窗口门禁却沿用「尾盘盘中运行」假定：Stage 1 默认 `13:55–14:20`、Stage 2 默认 `14:10–15:00`。
+   - 尾盘运行时，当日收盘价尚未确立、5m 日内数据尚未收齐，产出的工单被迫隔夜闲置；
+   - 盘后（15:00 以后）真实完整日线落盘后运行，又会被 `--strict-market-clock` 门禁硬拦截，历史妥协方案是在脚本中通过 `--allow-post-close` 绕过校验；
+   - 这种「执行在次日开盘、门禁却逼在尾盘、盘后又打补丁放行」的拼凑逻辑存在严重的语义断层。
+2. **归档实证（三份实盘运行，缺陷不是偶发）**：票据抬头声明 `execution_session="as_of+1"` / `price_reference="next_open"`，但票据实际在**次日 12:27–12:52** 才生成，`lateness_minutes` 实测 **200–360**。在 14:10 跑的运行里当日尚未收盘，`as_of` 只能取到**上一交易日**；于是抬头声明的成交时点（「今日 09:30 集合竞价」）在票据真正生成时**早已过去** —— 声明的执行语义与出票时刻互相矛盾，三份归档全部命中，属**结构性**缺陷而非操作员偶发误用。
+3. **重构方案**：将运行窗口唯一定义为**收盘后至次日开盘（Post-Close to Next-Open）统一跨夜区间**：
+   $$\text{Run Window} = [\text{as\_of 收盘} + \text{publication\_grace (15:30)}, \; \text{next\_trading\_day 开盘 (09:30)})$$
+   - 该窗口横跨自然日午夜；周末与法定节假日自动通过交易日历解析到下一个交易日（如周五收盘 15:30 至下周一开盘 09:30）；
+   - 操作员在估值日收盘数据入库后到次日开盘前任意时刻运行，均属合法窗口。
+
+### 33.2 运行窗口单一真相源（`common/market_clock.py` 与 `common/cli_utils.py`）
+
+1. **时钟核心实现（均为 `common/market_clock.py`，签名为实测）**：
+   - `post_close_to_open_window(market: str, trading_day: Optional[date] = None, holidays: Optional[Iterable[date]] = None, *, now: Optional[datetime] = None, publication_grace_minutes: Optional[int] = None) -> Tuple[datetime, datetime]`：返回**市场本地 naive** 的 `[start, end)`；`trading_day=None` 时锚在 `as_of`，这正是「周一 09:00 属于周五的窗口、周一 09:31 不属于」的原因；
+   - `next_trading_day(market: str, day: date, holidays: Optional[Iterable[date]] = None) -> date`：严格取 `day` **之后**的第一个交易日；周五 → 周一、节前 → 节后首个交易日，绝不假定「明天」；`holidays=None` 用静态表（未覆盖年份直接报错），显式传入（含空集）则覆盖；
+   - `format_run_window(window: Tuple[datetime, datetime]) -> str`：输出运维标签（如 `2026-11-12 15:30 → 2026-11-13 09:30`），此窗口必跨午夜，故**不**只打 `%H:%M`；
+   - `in_post_close_to_open_window(now: Optional[datetime] = None, market: str = MARKET_CHINA, holidays: Optional[Iterable[date]] = None, publication_grace_minutes: Optional[int] = None) -> bool`：由**实例化出的窗口**判定命中，而**不**复用 `MarketClock.in_run_window` —— 后者问的是「今天是否交易日且落在日内时段」，整晚与整个周末都答 False，恰恰与跨夜窗口相反。
+2. **接口规范演进与消歧**：
+   - `common/cli_utils.py::market_run_window` 退化为对 `post_close_to_open_window` 的纯别名；
+   - 其返回签名由旧的纯时间元组 `(time, time)` 变更为精确带日期的 `(datetime, datetime)`；
+   - `common/cli_utils.py::assert_run_window` 简化为确定性断言 `start <= clock.local_now() < end`，彻底删除旧实现中静默放行的 `not_applicable` 分支（周末／假日不再「不适用」，它们**落在**上一收盘开启的那个窗口内）；`not_applicable_replay` **保留**（历史回放/补跑仍由调用方产出，语义是「本工单不是当前时点的实盘指令」）；
+   - `common/live_execution_timing.py::_window_label` 与 `::_next_trading_session` 改为**委托**：前者调 `format_run_window`（保证「跨越午夜用哪一串写法」只有一个拼法，避免 `15:30 – 09:30` 被读成同一个下午），后者调 `next_trading_day`（原先它自带一套 14 天循环，是能与窗口终点告假的第二真相）。
+3. **报表与落盘 Schema 升级**：
+   - `summary.json::clock.run_window` 统一更新为 `2026-11-12 15:30 → 2026-11-13 09:30` 形式；
+   - 新增 `run_window_start` 与 `run_window_end` 结构化 ISO 时间戳字段。
+
+### 33.3 5m 日内发布时效独立解耦（三态评估矩阵）
+
+1. **时效解耦**：
+   - 日线收盘数据在收盘后 30 分钟（15:30）由宽限期 `publication_grace_minutes=30` 保证；
+   - BaoStock 5m 日内数据实际发布时点通常在市场本地时间 **20:00 之后**（经验观测，非上游协议保证），不能与日线共用 30 分钟宽限；
+   - 声明常量 `INTRADAY_5M_PUBLICATION_AFTER_LOCAL: str = "20:00"`，并支持 CLI 参数 `--intraday-publish-after` 显式覆盖。
+2. **三态评估机制（`assess_intraday_5m_publication_state`）**：
+   - `available`：as_of 当日 5m 数据已入库（覆盖完整，最新 bar $\ge$ 14:55，判据取自 `common/market_clock.last_expected_bar_ts`）；
+   - `pending_publication`：as_of 当日 5m 尚未入库，但当前市场时间早于 20:00 发布阈值。**此状态不拒绝出票**，策略平滑降级（如日内特征退化至日线等），并在 stdout 与报告中提示操作员可于 20:00 之后重跑以刷新日内特征（reason code `intraday_5m_pending_publication`）；
+   - `missing`：当前市场时间已过 20:00 且 5m 数据依然缺失，判定为上游真实交付失败或同步缺漏，沿用既有降级 reason code `intraday_5m_stale_window`（不新造第三套码）。
+3. **与日线宽限期互不复用**：`publication_grace_minutes`（默认 30，收盘 → 15:30）**只**用于日线收盘价发布；5m 的 20:00 阈值是**独立的第二维度**，不复用、不并入该宽限，也不推迟窗口起点 15:30。理由是二者属**上游两个不同管道**的时效：把 5m 的 20:00 塞进日线宽限会让窗口起点跑到 20:30，从而错误地把「收盘后即可出票」整体推迟两小时。
+
+### 33.4 数据同步新鲜度探测修复（`scripts/sync_china_5m_and_indices.py`）
+
+1. **当日新鲜度探测严格化**：`probe_symbol_5m_freshness` 的缓存命中原先按「落后 2 天也算新」容忍，现改为**当日必须到达 `common/market_clock.last_expected_bar_ts`**（中国 5m 即收盘 15:00 减一根 bar = **14:55**）—— deadline 由该函数派生，脚本内**不再**出现 14:55 / 15:00 字面量。命中前一日或半日未完成的 bar 一律不得伪造 `FRESH`；
+2. **未发布状态显式化**：当日未发布／未收齐时，报告显式标 `intraday_incomplete`，并打固定可 grep 的 `[WARN] 5m 当日数据不完整`，不再静默接受半日数据、也不再声称同步成功；缺口**永不补零凑齐**；
+3. **网络与连接纪律**：保持单进程串行同步与 `keep_logged_in=True`，彻底杜绝并发 socket 请求导致 BaoStock 服务器封禁。
+
+### 33.5 测试验证与回归状态
+
+- **新增离线测试用例（全部 100% 离线、零网络、零归档目录依赖）**：
+  - `pipeline/tests/test_post_close_run_window.py` —— **9 例**：跨夜（15:30 → 次日 09:30）、周五 → 下周一、节假日顺延的窗口起止计算，`in_post_close_to_open_window` 边界（`start` 含、`end` 不含）、`assert_run_window` 的拦截／放行，以及 `not_applicable` 分支确已删除；
+  - `pipeline/tests/test_intraday_5m_publication_state.py` —— **5 例**：`available` / `pending_publication` / `missing` 三态、20:00 阈值前后同一输入的态切换、`pending_publication` **不拒票**且带「建议 20:00 后重跑」提示、`missing` 沿用 `intraday_5m_stale_window`；
+  - `web/livetrading/tests/test_run_window_ui_copy.py` —— **4 例**：Web 端 UI 文案与后端窗口一致（跨越午夜必须带日期、不出现裸 `15:30 – 09:30`）、`run_window_start` / `run_window_end` 字段被正确渲染。
+- **全量回归（2026-11-12 实跑，0 failed）**：`common` **1407**、`pipeline` **1191**、`web/livetrading` **336**、`backtester` **123**；零新增外部依赖、零 `.py` 破坏性变更。
+
+### 33.6 版本轴与作用域（本次零版本变动）
+
+- **未改任何策略类**：本轮不触 `pipeline/research/blend/*`、不触 `pipeline/research_strategy/rs/*`、不触 `common/allocation_templates.py`；
+- **未 bump 任何 `version` / `BASE_VERSION`**：窗口与发布时效属**执行层 / 数据时效层**，不改变任何策略的信号、权重、风险预算或子策略组合。因此 `ChanFourStateBlendStrategy.version` 仍为 §32 结案时的 `1.3.0`、`BASE_VERSION` 仍为 `2.0.0`，也**未**重跑 `--dump-strategies`（dump 与版本轴保持 §32 的落盘状态）。
+- **取代关系**：本章取代 `LV2` 记录的旧 `13:55–14:20` / `14:10–15:00` 窗口与 `--allow-post-close` 融通（**`LV2` 原文不改动**，见 [`docs/development_plan_archive.md`](file:///home/stone/Work/github/quant/docs/development_plan_archive.md) §2.21 `LV2` 及 §4.30，并在 [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) §2.21 表头补记中加指向本章的追加句）；今后任何「窗口内/窗口外」的判定一律以 `common/market_clock.post_close_to_open_window` 为唯一真值源。
