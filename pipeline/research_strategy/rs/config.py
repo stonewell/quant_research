@@ -646,6 +646,14 @@ class StrategyConfig:
     # `cfsb_enable_vol_targeting` / `cfsb_target_vol`, which remain the engine's own scaling.
     cfsb_portfolio_vol_overlay_enabled: bool = True
     cfsb_portfolio_vol_overlay_mode: str = "cap"
+    # --- (PLAN C, 2026-11-12) forced de-risk of ALREADY-EXITING positions ---
+    # When the ceiling above is BINDING and the post-lifecycle book is still more than 1pp over
+    # it, flatten ONLY positions whose lifecycle state is `PENDING_EXIT` / `EXIT_CONFIRMING`
+    # (largest contribution first) until the book is back inside the ceiling. Never touches
+    # `HELD_ACTIVE`, never breaks China T+1, never trades a stale/absent price. Default ON
+    # (user decision). Prefixed like the two keys above so it can never collide with a global
+    # `StrategyConfig` field through `resolve_blend_param`'s bare-name fallback.
+    cfsb_portfolio_vol_ceiling_force_exits: bool = True
 
     # --- Chan Crisis Shield Blend Strategy (chan_crisis_shield_blend) ---
     ccsb_three_type_weight: float = 0.45

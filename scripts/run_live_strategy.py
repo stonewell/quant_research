@@ -2848,6 +2848,58 @@ VOL_OVERLAY_LIFECYCLE_SHORTFALL_RATIO = 0.8
 #: book (it did not -- it had nothing left to cap).
 VOL_OVERLAY_SUPERSEDED_BY_CIRCUIT_BREAKER = "circuit_breaker_tier3"
 
+# ---------------------------------------------------------------------------------------
+# (PLAN C, 2026-11-12) VOL CEILING -> FORCED DE-RISK OF ALREADY-EXITING POSITIONS
+#
+# MEASURED DEFECT (replay of 2026-11-09): `binding=true` did NOT mean "the book was reduced to
+# the ceiling". The Stage-1 cap scales the TARGET VECTOR to 0.3995, but
+# `step_position_lifecycle` then keeps holding a position that is already in an exit state --
+# `000157.SZ` sat in `EXIT_CONFIRMING` (decision made, only the confirmation counters/tenure
+# were still running) at 16.66% of NAV. The delivered book therefore summed to 0.5166,
+# `ceiling_exceeded_by = 0.1172`, and the ONLY consequence was that audit number: an
+# over-ceiling book was shipped with a note attached.
+#
+# THE FIX (this narrow slice, "plan C"): when the cap is BINDING and the post-lifecycle book
+# is still more than `VOL_CEILING_FORCE_EXIT_MIN_OVERAGE` above the ceiling, forcibly flatten
+# ONLY positions that ALREADY have an exit intent -- lifecycle state `PENDING_EXIT` or
+# `EXIT_CONFIRMING` -- largest contribution first, until the book is back inside the ceiling.
+# This is NOT a general de-risk: `HELD_ACTIVE` names are never forced out (that would be a
+# silent strategy override dressed as risk management), and the three hard blocks below are
+# absolute.
+#
+# WHITELIST (may be force-sold):
+#   * an exit intent already recorded by the machine -- lifecycle state `PENDING_EXIT`, or
+#     the structured `blocking_reason == EXIT_CONFIRMING` verdict (the six-state enum has no
+#     `EXIT_CONFIRMING` state: an exit being confirmed is `PENDING_EXIT` + `HOLD_FILTERED` /
+#     `EXIT_CONFIRMING`, which is exactly what 2026-11-09's row carried);
+#   * actually held (`current_shares > 0`) and not already liquidating today;
+#   * a usable price (`price > 0`, `price_stale == False`);
+#   * China T+1 satisfied (`held_bars >= 1`). China's settlement rule is a BROKER constraint,
+#     not a risk preference: a position bought today cannot be sold today no matter how
+#     over-ceiling the book is.
+# BLACKLIST (never force-sold, each recorded in `force_exit_skipped`):
+#   * `t_plus_one`   -- today's buy (China, `held_bars < 1`), even inside an exit state;
+#   * `no_exit_intent` -- `HELD_ACTIVE` / no lifecycle state / `MIN_ENTRY_THRESHOLD`-filtered
+#     and any other held row the model has NOT decided to leave;
+#   * `no_price`     -- halted / stale / placeholder price.
+# The switch is `cfsb_portfolio_vol_ceiling_force_exits` (default True, strategy-PREFIXED per
+# AGENTS.md so it can never collide with a global `StrategyConfig` field). With it OFF the
+# ticket is byte-identical to 1.3.0: no `forced_exits`, no skip list, no extra stdout line.
+VOL_CEILING_FORCE_EXIT_MIN_OVERAGE = 0.01
+VOL_CEILING_FORCE_EXIT_REASON = "ceiling_enforced_pending_exit"
+#: The six-state lifecycle machine has NO `EXIT_CONFIRMING` state -- an exit being confirmed
+#: is `state=PENDING_EXIT` PLUS the structured verdict `blocking_reason=EXIT_CONFIRMING`
+#: (`common/position_policy.py`: "one counted bar -> PENDING_EXIT + HOLD_FILTERED /
+#: EXIT_CONFIRMING"). Both spellings therefore count as "already has an exit intent", and the
+#: archived 2026-11-09 row (`000157.SZ`, HOLD_FILTERED / EXIT_CONFIRMING) is eligible through
+#: the SECOND tuple -- reading only the state values would silently make the measured defect
+#: unfixable.
+VOL_CEILING_FORCE_EXIT_STATES: Tuple[str, ...] = (PositionState.PENDING_EXIT.value,)
+VOL_CEILING_FORCE_EXIT_BLOCKING_REASONS: Tuple[str, ...] = (
+    BlockingReason.EXIT_CONFIRMING.value,
+)
+VOL_CEILING_FORCE_EXITS_PARAM = "cfsb_portfolio_vol_ceiling_force_exits"
+
 #: (D5) Sidecar that makes "an EMPTY book" distinguishable from "no book". Written next to
 #: `post_holdings.json` by this runner; read by `web/livetrading/storage.py`
 #: (`post_holdings_meta_status`), which keeps the same filename constant.
@@ -3116,6 +3168,23 @@ def record_portfolio_vol_overlay_effective_params(
     entries[VOL_OVERLAY_MODE_PARAM] = param_entry(
         provenance["declared_mode"], provenance["mode"], provenance["mode_source"]
     )
+    # (PLAN C) The forced-exit switch is part of the SAME overlay, so it is registered by the
+    # same call: a ticket carrying `forced_exits` must be reproducible from its own snapshot.
+    # A strategy OFF the allowlist records `False` / `source=default` for the same reason the
+    # two keys above do -- the value does not come from that strategy's params at all.
+    _declared_force = declared_params.get(VOL_CEILING_FORCE_EXITS_PARAM)
+    _force_enabled = resolve_vol_ceiling_force_exits_enabled(strategy_key, declared_params)
+    if strategy_key not in PORTFOLIO_VOL_OVERLAY_STRATEGY_KEYS:
+        _force_source = SOURCE_DEFAULT
+    elif cli_override:
+        _force_source = SOURCE_OVERRIDE
+    elif VOL_CEILING_FORCE_EXITS_PARAM in declared_params:
+        _force_source = config_origin
+    else:
+        _force_source = SOURCE_DEFAULT
+    entries[VOL_CEILING_FORCE_EXITS_PARAM] = param_entry(
+        _declared_force, _force_enabled, _force_source
+    )
     return provenance
 
 
@@ -3320,6 +3389,325 @@ def apply_portfolio_vol_overlay_for_strategy(
     )
     summary["mode"] = mode
     return capped, summary
+
+
+def resolve_vol_ceiling_force_exits_enabled(
+    strategy_key: Optional[str],
+    params: Optional[Dict[str, Any]],
+) -> bool:
+    """Resolve the plan-C switch for the vol-ceiling forced-exit pass.
+
+    SAME GATING ORDER as `resolve_portfolio_vol_overlay_params`: the strategy ALLOWLIST is
+    checked first (path C is part of the same Stage-1 overlay, so any strategy off the list
+    keeps a byte-identical ticket), then the strategy-PREFIXED key
+    `cfsb_portfolio_vol_ceiling_force_exits` -- never the bare name, because
+    `resolve_blend_param`'s final fallback is a bare `getattr(cfg, name)` and that is exactly
+    the 2026-10-21 `wq_alpha_id` collision class AGENTS.md forbids. Default ENABLED (user
+    decision, 2026-11-12): a dump that predates the key must not silently leave the ceiling
+    unenforced again.
+    """
+    if strategy_key not in PORTFOLIO_VOL_OVERLAY_STRATEGY_KEYS:
+        return False
+    # The literal spelling is deliberate and mirrors `resolve_portfolio_vol_overlay_params`
+    # above: `pipeline/tests/test_config_wiring.py` proves a `StrategyConfig` field is
+    # CONSUMED by finding the literal key in business code (`p.get("<key>")`), so this
+    # resolver must spell the key out -- `VOL_CEILING_FORCE_EXITS_PARAM` is the same string
+    # and is used for the `effective_params.json` provenance registration.
+    return _as_config_bool(
+        (params or {}).get("cfsb_portfolio_vol_ceiling_force_exits"), True
+    )
+
+
+def _row_asset_market(symbol: str, default_market: Optional[str] = None) -> str:
+    """Market of a ticket row, derived from the symbol exactly as the sizing loop does.
+
+    Kept as one helper so the China T+1 test in the forced-exit pass cannot drift from the
+    T+1 test in the sizing loop (`is_china_t1_gestation`).
+    """
+    sym = str(symbol or "")
+    if sym.endswith(".SH") or sym.endswith(".SZ") or sym.endswith(".BJ"):
+        return "china"
+    if sym.endswith(".HK") or (sym.isdigit() and len(sym) in (4, 5)):
+        return "hk"
+    return "china" if str(default_market or "").lower() == "china" else "us"
+
+
+def apply_vol_ceiling_force_exits(
+    rows: List[Dict[str, Any]],
+    *,
+    capped_equity_sum: Optional[float],
+    binding: bool,
+    portfolio_value: float,
+    cash_proxy: Optional[str] = None,
+    enabled: bool = True,
+    default_market: Optional[str] = None,
+    min_overage: float = VOL_CEILING_FORCE_EXIT_MIN_OVERAGE,
+) -> Dict[str, Any]:
+    """(PLAN C) Flatten ALREADY-EXITING positions until the book is back inside the ceiling.
+
+    Runs on the BUILT ticket rows, AFTER `step_position_lifecycle` has had its say, and it
+    only ever rewrites rows whose lifecycle state is `PENDING_EXIT` / `EXIT_CONFIRMING` --
+    i.e. names the model already decided to leave and is merely waiting out the confirmation
+    counters / tenure lock. The measured failure it closes: `binding=true`, capped 0.3995,
+    post-lifecycle 0.5661 because `000157.SZ` was parked in `EXIT_CONFIRMING`, delivered
+    0.5166 -- 11.72pp OVER the ceiling with nothing but `ceiling_exceeded_by` to show for it.
+
+    WHY THE ROW PASS IS CORRECT HERE (and was wrong for the general cap): the LC18 wiring
+    applies the cap to the TARGET VECTOR precisely because a row pass cannot de-risk a book
+    the model still wants to hold. Plan C does not contradict that -- it never touches a
+    position the model wants, it only completes an exit the model ALREADY ordered. Every
+    protective gate is still honoured explicitly (China T+1 / no usable price / no exit
+    intent), because those are execution realities, not risk preferences.
+
+    ORDER / SIZE: largest contribution first (`shares * price / NAV`, the delivered weight),
+    each sold to ZERO in one step. Half-trims are deliberately NOT emitted: they would
+    multiply the order count and leave a sub-threshold scrap behind that the minimum-entry /
+    inertia filters can never clean up.
+
+    PURE MUTATION of `rows` + a summary dict; no I/O, no globals, no rounding of weights into
+    order fields other than the share arithmetic the ticket already uses.
+
+    Returns (all keys always present):
+      * `applied`                                 -- True when at least one row was forced out;
+      * `forced_exits`                            -- [{symbol, lifecycle_state, shares, weight, reason}];
+      * `forced_exit_equity_sum`                  -- Σ delivered weight removed;
+      * `force_exit_skipped`                      -- [{symbol, reason}] (`t_plus_one` /
+                                                     `no_exit_intent` / `no_price`);
+      * `post_lifecycle_equity_sum_before_force`  -- Σ equity target BEFORE this pass;
+      * `post_lifecycle_equity_sum_after_force`   -- Σ equity target AFTER this pass;
+      * `overage_before` / `overage_after`        -- `Σ - capped`, `None` when not binding.
+    """
+    result: Dict[str, Any] = {
+        "applied": False,
+        "forced_exits": [],
+        "forced_exit_equity_sum": 0.0,
+        "force_exit_skipped": [],
+        "post_lifecycle_equity_sum_before_force": None,
+        "post_lifecycle_equity_sum_after_force": None,
+        "overage_before": None,
+        "overage_after": None,
+        "skipped_reason": None,
+    }
+    equity_rows = [
+        r for r in (rows or []) if cash_proxy is None or str(r.get("symbol")) != str(cash_proxy)
+    ]
+    post_before = 0.0
+    for r in equity_rows:
+        post_before += max(0.0, _row_weight(r, "target_weight"))
+    result["post_lifecycle_equity_sum_before_force"] = round(
+        post_before, TARGET_WEIGHT_EFFECTIVE_DECIMALS
+    )
+    result["post_lifecycle_equity_sum_after_force"] = round(
+        post_before, TARGET_WEIGHT_EFFECTIVE_DECIMALS
+    )
+    if not enabled:
+        result["skipped_reason"] = "disabled"
+        return result
+    try:
+        capped = float(capped_equity_sum)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        result["skipped_reason"] = "no_ceiling"
+        return result
+    if not np.isfinite(capped) or capped <= 0.0 or not binding:
+        # Nothing was capped on the vector, so there is no ceiling to enforce. An absent /
+        # non-binding ceiling must NEVER be read as "0.0, so sell everything".
+        result["skipped_reason"] = "not_binding"
+        return result
+    overage_before = post_before - capped
+    result["overage_before"] = round(
+        max(0.0, overage_before), TARGET_WEIGHT_EFFECTIVE_DECIMALS
+    )
+    if overage_before <= float(min_overage):
+        # 1pp dead-band: a sub-threshold overage is left alone rather than traded on, so a
+        # book oscillating around the ceiling does not churn positions in and out.
+        result["skipped_reason"] = "below_threshold"
+        result["overage_after"] = result["overage_before"]
+        return result
+
+    candidates: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    for r in equity_rows:
+        sym = str(r.get("symbol") or "")
+        shares = int(r.get("current_shares") or 0)
+        cur_w = _row_weight(r, "current_weight")
+        if shares <= 0 and cur_w <= 1e-9:
+            continue  # nothing held: not a candidate and not a "skip" finding
+        detail = r.get("detail_reason") if isinstance(r.get("detail_reason"), dict) else {}
+        lifecycle_block = detail.get("lifecycle_state") if isinstance(detail, dict) else {}
+        state_value = (
+            str(lifecycle_block.get("state") or "")
+            if isinstance(lifecycle_block, dict)
+            else ""
+        )
+        blocking_value = str(r.get("blocking_reason") or "").strip().upper()
+        # An already-planned liquidation is not a second order: it will be gone anyway.
+        if (
+            str(r.get("action") or "").strip().upper() == "SELL"
+            and int(r.get("target_shares") or 0) == 0
+        ):
+            continue
+        if state_value not in VOL_CEILING_FORCE_EXIT_STATES and (
+            blocking_value not in VOL_CEILING_FORCE_EXIT_BLOCKING_REASONS
+        ):
+            skipped.append({"symbol": sym, "reason": "no_exit_intent"})
+            continue
+        if _row_asset_market(sym, default_market) == "china" and int(
+            r.get("holding_bars") or 0
+        ) < 1:
+            # China T+1: today's buy cannot be sold today, even inside an exit state.
+            skipped.append({"symbol": sym, "reason": "t_plus_one"})
+            continue
+        price = float(r.get("price") or 0.0)
+        if price <= 0.0 or not np.isfinite(price) or bool(r.get("price_stale")):
+            skipped.append({"symbol": sym, "reason": "no_price"})
+            continue
+        candidates.append(r)
+
+    # "Contribution to the overage" is measured the way the book is actually delivered
+    # (`shares * price / NAV`), not from the persisted broker weight: the two can drift by
+    # exactly the rounding the ticket is about to apply.
+    _nav_for_sort = float(portfolio_value) if portfolio_value and float(portfolio_value) > 0 else 0.0
+
+    def _delivered_weight(row: Dict[str, Any]) -> float:
+        _shares = float(row.get("current_shares") or 0)
+        _price = float(row.get("price") or 0.0)
+        if _nav_for_sort > 0 and _shares > 0 and _price > 0:
+            return _shares * _price / _nav_for_sort
+        return _row_weight(row, "current_weight")
+
+    candidates.sort(key=lambda r: -_delivered_weight(r))
+
+    forced: List[Dict[str, Any]] = []
+    remaining = post_before
+    nav = float(portfolio_value) if portfolio_value and float(portfolio_value) > 0 else 0.0
+    for r in candidates:
+        if remaining <= capped + 1e-12:
+            break
+        sym = str(r.get("symbol") or "")
+        shares = int(r.get("current_shares") or 0)
+        price = float(r.get("price") or 0.0)
+        cur_w = _row_weight(r, "current_weight")
+        delivered_w = (shares * price / nav) if nav > 0 else cur_w
+        if delivered_w <= 0.0:
+            skipped.append({"symbol": sym, "reason": "no_price"})
+            continue
+        detail = r.get("detail_reason") if isinstance(r.get("detail_reason"), dict) else {}
+        lifecycle_block = detail.get("lifecycle_state") if isinstance(detail, dict) else {}
+        state_value = (
+            str(lifecycle_block.get("state") or "") if isinstance(lifecycle_block, dict) else ""
+        )
+        blocking_value = str(r.get("blocking_reason") or "").strip().upper()
+        # The exit intent as an operator reads it in the replay log: the structured
+        # `EXIT_CONFIRMING` verdict wins over the bare lifecycle state, because that is the
+        # label the 2026-11-09 row actually carried.
+        exit_intent = (
+            blocking_value
+            if blocking_value in VOL_CEILING_FORCE_EXIT_BLOCKING_REASONS
+            else state_value
+        )
+        old_reason = str(r.get("reason") or "")
+        badge = f"[风控强制减仓 {VOL_CEILING_FORCE_EXIT_REASON}]"
+        r["action"] = "SELL"
+        r["target_weight"] = 0.0
+        r["target_weight_model"] = 0.0
+        r["delta_weight"] = -cur_w
+        r["target_shares"] = 0
+        r["delta_shares"] = -shares
+        r["shares"] = int(shares)
+        r["trade_value"] = -shares * price
+        r["trade_value_rmb"] = r["trade_value"]
+        r["blocking_reason"] = BlockingReason.NONE.value
+        r["reason"] = f"{badge} | 原信号: {old_reason}" if old_reason else badge
+        r["summary_reason"] = (
+            f"波动率天花板生效({capped:.2%})，强制平掉退出确认期仓位 {delivered_w:.2%} "
+            f"({VOL_CEILING_FORCE_EXIT_REASON})"
+        )
+        if isinstance(r.get("detail_reason"), dict):
+            block = r["detail_reason"].setdefault("vol_ceiling_force_exit", {})
+            block.update(
+                {
+                    "reason": VOL_CEILING_FORCE_EXIT_REASON,
+                    "lifecycle_state": state_value,
+                    "exit_intent": exit_intent,
+                    "blocking_reason": blocking_value,
+                    "shares": int(shares),
+                    "weight": round(delivered_w, TARGET_WEIGHT_EFFECTIVE_DECIMALS),
+                    "ceiling": round(capped, TARGET_WEIGHT_EFFECTIVE_DECIMALS),
+                    "post_lifecycle_before": round(
+                        post_before, TARGET_WEIGHT_EFFECTIVE_DECIMALS
+                    ),
+                }
+            )
+            r["detail_reason"]["is_liquidation"] = True
+            inertia = r["detail_reason"].get("inertia_check")
+            if isinstance(inertia, dict):
+                inertia["triggered"] = True
+                inertia["delta_weight"] = round(-cur_w, 4)
+            lot = r["detail_reason"].get("lot_rounding")
+            if isinstance(lot, dict):
+                lot["shares"] = int(shares)
+                lot["target_shares_raw"] = float(shares)
+        forced.append(
+            {
+                "symbol": sym,
+                "lifecycle_state": exit_intent,
+                "shares": int(shares),
+                "weight": round(delivered_w, TARGET_WEIGHT_EFFECTIVE_DECIMALS),
+                "reason": VOL_CEILING_FORCE_EXIT_REASON,
+            }
+        )
+        remaining -= delivered_w
+
+    result["forced_exits"] = forced
+    result["force_exit_skipped"] = skipped
+    result["forced_exit_equity_sum"] = round(
+        sum(f["weight"] for f in forced), TARGET_WEIGHT_EFFECTIVE_DECIMALS
+    )
+    result["applied"] = bool(forced)
+    result["post_lifecycle_equity_sum_after_force"] = round(
+        max(0.0, remaining), TARGET_WEIGHT_EFFECTIVE_DECIMALS
+    )
+    result["overage_after"] = round(
+        max(0.0, remaining - capped), TARGET_WEIGHT_EFFECTIVE_DECIMALS
+    )
+    return result
+
+
+def format_vol_ceiling_force_exit_line(
+    report: Dict[str, Any], capped_equity_sum: Optional[float] = None
+) -> str:
+    """One greppable `[INFO/VOL CEILING]` line for the forced-exit pass (plan C)."""
+    forced = report.get("forced_exits") or []
+    pp = float(report.get("forced_exit_equity_sum") or 0.0) * 100.0
+    ceiling_txt = "N/A"
+    try:
+        _c = float(capped_equity_sum)  # type: ignore[arg-type]
+        if np.isfinite(_c):
+            ceiling_txt = f"{_c:.2%}"
+    except (TypeError, ValueError):
+        pass
+    return (
+        f"[INFO/VOL CEILING] 强制平掉 {len(forced)} 个退出期仓位 ({pp:.2f}pp) "
+        f"以满足上限 {ceiling_txt}"
+    )
+
+
+def format_vol_ceiling_force_exit_skip_line(report: Dict[str, Any]) -> Optional[str]:
+    """The optional second `[INFO/VOL CEILING]` line naming what could NOT be forced out."""
+    skipped = report.get("force_exit_skipped") or []
+    if not skipped:
+        return None
+    by_reason: Dict[str, List[str]] = {}
+    for item in skipped:
+        by_reason.setdefault(str(item.get("reason") or "unknown"), []).append(
+            str(item.get("symbol") or "")
+        )
+    parts = [f"{code}: {', '.join(syms)}" for code, syms in sorted(by_reason.items())]
+    return (
+        "[INFO/VOL CEILING] 超限但不可强制卖出 "
+        + " | ".join(parts)
+        + "（T+1/无退出意向/无有效价，均不下单）"
+    )
 
 
 def evaluate_vol_overlay_delivery(
@@ -6003,6 +6391,48 @@ def main(cli_args: Optional[List[str]] = None):
             "blocking_reason": coerce_blocking_reason(blocking_reason).value,
         })
 
+    # (PLAN C, 2026-11-12) VOL CEILING -> FORCED DE-RISK OF ALREADY-EXITING POSITIONS.
+    # Runs HERE: after `step_position_lifecycle` / the minimum-entry filter have produced the
+    # post-lifecycle book (the exact book `post_lifecycle_equity_sum` measures), and BEFORE
+    # the 100%-budget normalization / purchasing-power / delivered-MV-cap passes, so a forced
+    # SELL participates in every later check exactly like a strategy-issued one.
+    #
+    # ORDERING IS THE WHOLE POINT (measured 2026-11-09): `binding=true` on the vector did NOT
+    # mean the book was reduced -- `000157.SZ` held 16.66% while parked in `EXIT_CONFIRMING`,
+    # so capped 0.3995 / post-lifecycle 0.5661 / delivered 0.5166 shipped 11.72pp OVER the
+    # ceiling with only `ceiling_exceeded_by` to show for it.
+    if vol_overlay is not None:
+        vol_force_report = apply_vol_ceiling_force_exits(
+            rows,
+            capped_equity_sum=vol_overlay.get("capped_equity_sum"),
+            binding=bool(vol_overlay.get("binding")),
+            portfolio_value=args.portfolio_value,
+            cash_proxy=cash_proxy,
+            enabled=resolve_vol_ceiling_force_exits_enabled(strategy_key, params),
+            default_market=getattr(args, "market", None),
+        )
+        if vol_force_report.get("skipped_reason") != "disabled":
+            vol_overlay["forced_exits"] = vol_force_report["forced_exits"]
+            vol_overlay["forced_exit_equity_sum"] = vol_force_report[
+                "forced_exit_equity_sum"
+            ]
+            vol_overlay["force_exit_skipped"] = vol_force_report["force_exit_skipped"]
+            vol_overlay["post_lifecycle_equity_sum_before_force"] = vol_force_report[
+                "post_lifecycle_equity_sum_before_force"
+            ]
+            vol_overlay["vol_ceiling_force_exit_applied"] = bool(
+                vol_force_report["applied"]
+            )
+            if vol_force_report.get("applied"):
+                print(
+                    format_vol_ceiling_force_exit_line(
+                        vol_force_report, vol_overlay.get("capped_equity_sum")
+                    )
+                )
+                _skip_line = format_vol_ceiling_force_exit_skip_line(vol_force_report)
+                if _skip_line:
+                    print(_skip_line)
+
     # (D4, evidence 2026-11-09/204956) FIRST: the buy side of the model's book must fit
     # inside one NAV before anything downstream is sized from it.  The archive's ticket
     # summed to `Σ target_weight = 1.028337` -- a book claiming 102.8% of the account.
@@ -6590,6 +7020,13 @@ def main(cli_args: Optional[List[str]] = None):
     #    "lifecycle_attribution_complete", "delivered_equity_sum",
     #    "ceiling_exceeded_by", "delivery_shortfall", "delivery_shortfall_ratio",
     #    "lifecycle_shortfall", "lifecycle_shortfall_ratio"}
+    # (PLAN C, 2026-11-12) plus, when the forced-exit switch is ON, these additive keys:
+    #    "forced_exits" [{symbol, lifecycle_state, shares, weight, reason}],
+    #    "forced_exit_equity_sum", "force_exit_skipped"
+    #    [{symbol, reason: t_plus_one|no_exit_intent|no_price}],
+    #    "post_lifecycle_equity_sum_before_force", "post_lifecycle_equity_sum_after_force",
+    #    "vol_ceiling_force_exit_applied", "ceiling_exceeded_by_before_force".
+    # `ceiling_exceeded_by` keeps its meaning but is now measured AFTER the forced pass.
     # `binding=True` means the cap actually reduced the equity targets (the difference is
     # parked in the cash proxy); `applied=True` with `reason="vol_unavailable"` means Stage-1
     # produced no MEASURED factor and the book was deliberately left untouched (never
@@ -6615,11 +7052,28 @@ def main(cli_args: Optional[List[str]] = None):
             if str(r.get("symbol") or "") != str(cash_proxy)
         )
         vol_overlay["delivered_equity_sum"] = round(_delivered_equity, TARGET_WEIGHT_EFFECTIVE_DECIMALS)
+        # (PLAN C) `forced_exit_equity_sum` is measured in DELIVERED terms
+        # (`shares * price / NAV`), and every forced row is a whole-position exit, so the
+        # pre-force delivered book is exactly `delivered + forced`. `ceiling_exceeded_by`
+        # keeps its documented meaning ("how far whole lots pushed delivery past the
+        # ceiling") and is now measured AFTER the forced pass; the pre-force number is kept
+        # next to it so the 2026-11-09 shape (11.72pp over) stays auditable.
+        _forced_exit_sum = float(vol_overlay.get("forced_exit_equity_sum") or 0.0)
         if vol_overlay.get("capped_equity_sum") is not None:
             vol_overlay["ceiling_exceeded_by"] = round(
                 max(0.0, _delivered_equity - float(vol_overlay["capped_equity_sum"])),
                 TARGET_WEIGHT_EFFECTIVE_DECIMALS,
             )
+            if "forced_exit_equity_sum" in vol_overlay:
+                vol_overlay["ceiling_exceeded_by_before_force"] = round(
+                    max(
+                        0.0,
+                        _delivered_equity
+                        + _forced_exit_sum
+                        - float(vol_overlay["capped_equity_sum"]),
+                    ),
+                    TARGET_WEIGHT_EFFECTIVE_DECIMALS,
+                )
         else:
             vol_overlay["ceiling_exceeded_by"] = None
         # (2026-11-12 defect B) ATTRIBUTION: the chain is
@@ -6651,7 +7105,16 @@ def main(cli_args: Optional[List[str]] = None):
                 continue
             _lifecycle_filtered_gap += _gap
             _action = str(_r.get("action") or "").strip().upper()
-            if _action == "NO_POSITION":
+            _detail = _r.get("detail_reason") if isinstance(_r.get("detail_reason"), dict) else {}
+            if isinstance(_detail, dict) and isinstance(
+                _detail.get("vol_ceiling_force_exit"), dict
+            ):
+                # (PLAN C) A forced de-risk is NOT a lifecycle filter: name it with its own
+                # bucket so `lifecycle_filtered_reasons` cannot report the ceiling enforcement
+                # as "the lifecycle machine ate the ceiling" (the exact misattribution
+                # 2026-11-12 defect B was about).
+                _code = "vol_ceiling_force_exit"
+            elif _action == "NO_POSITION":
                 _code = "no_position"
             else:
                 _typed = coerce_blocking_reason(_r.get("blocking_reason"))
@@ -6673,6 +7136,12 @@ def main(cli_args: Optional[List[str]] = None):
         vol_overlay["post_lifecycle_equity_sum"] = round(
             _post_lifecycle_equity, TARGET_WEIGHT_EFFECTIVE_DECIMALS
         )
+        if "forced_exit_equity_sum" in vol_overlay:
+            # Same number, unambiguous name: `post_lifecycle_equity_sum` is measured after the
+            # plan-C forced pass, so a reader comparing it with the pre-force book needs both.
+            vol_overlay["post_lifecycle_equity_sum_after_force"] = vol_overlay[
+                "post_lifecycle_equity_sum"
+            ]
         if vol_overlay.get("capped_equity_sum") is not None:
             vol_overlay["lifecycle_filtered_equity_sum"] = round(
                 max(

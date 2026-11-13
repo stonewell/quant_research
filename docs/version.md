@@ -4631,3 +4631,95 @@ cap 生效时**同时**置 `is_portfolio_deleverage=True`，使 tenure lock 按�
 - **未改任何策略类**：本轮不触 `pipeline/research/blend/*`、不触 `pipeline/research_strategy/rs/*`、不触 `common/allocation_templates.py`；
 - **未 bump 任何 `version` / `BASE_VERSION`**：窗口与发布时效属**执行层 / 数据时效层**，不改变任何策略的信号、权重、风险预算或子策略组合。因此 `ChanFourStateBlendStrategy.version` 仍为 §32 结案时的 `1.3.0`、`BASE_VERSION` 仍为 `2.0.0`，也**未**重跑 `--dump-strategies`（dump 与版本轴保持 §32 的落盘状态）。
 - **取代关系**：本章取代 `LV2` 记录的旧 `13:55–14:20` / `14:10–15:00` 窗口与 `--allow-post-close` 融通（**`LV2` 原文不改动**，见 [`docs/development_plan_archive.md`](file:///home/stone/Work/github/quant/docs/development_plan_archive.md) §2.21 `LV2` 及 §4.30，并在 [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) §2.21 表头补记中加指向本章的追加句）；今后任何「窗口内/窗口外」的判定一律以 `common/market_clock.post_close_to_open_window` 为唯一真值源。
+
+## 34. 方案 C：波动率天花板对「退出确认期」仓位的强制减仓（`chan_four_state_blend` `1.3.0 → 1.3.1`，2026-11-12）
+
+关联任务：[`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) §2.21 `LV18` 行末状态追加句（本章为 §32 `LV18` 接线之后的**行为加强**）；代码位置 [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py)（`apply_vol_ceiling_force_exits`、`resolve_vol_ceiling_force_exits_enabled`、`format_vol_ceiling_force_exit_line`）、[`pipeline/research/blend/chan_four_state_blend.py`](file:///home/stone/Work/github/quant/pipeline/research/blend/chan_four_state_blend.py)、[`pipeline/research_strategy/rs/config.py`](file:///home/stone/Work/github/quant/pipeline/research_strategy/rs/config.py)、[`pipeline/research_strategy/strategies_config.json`](file:///home/stone/Work/github/quant/pipeline/research_strategy/strategies_config.json)。
+
+### 34.1 缺陷：`binding=true` 不等于「已压到天花板」
+
+`2026-11-09` 的端到端回放（`chan_four_state_blend`）实测：
+
+| 字段 | 值 | 含义 |
+| --- | --- | --- |
+| `capped_equity_sum` | `0.3995` | Stage-1 Barroso 上限已生效 |
+| `binding` | `true` | 上限确实缩小了目标向量 |
+| `post_lifecycle_equity_sum` | `0.5661` | `step_position_lifecycle` 之后仍留在账上的权益 |
+| `delivered_equity_sum` | `0.5166` | 整手取整后真正交付 |
+| `ceiling_exceeded_by` | `0.1172` | **超天花板 11.72pp** |
+
+根因不是取整，而是**存活下来的持仓**：`000157.SZ` 处于 `HOLD_FILTERED` / `EXIT_CONFIRMING`（六态生命周期里其 `state` 为 `PENDING_EXIT`，`blocking_reason` 为 `EXIT_CONFIRMING`）—— 模型**已经决定卖出**，只是在等确认计数 / 最短持有期跑完，于是它保留了 **16.66%** 现仓。此前这一超限只体现在 `ceiling_exceeded_by` 这一个审计字段里：**超上限的组合照常出票，并附一条注释**。
+
+### 34.2 方案 C 的语义
+
+当**上限已生效（`binding=true`）**且**`post_lifecycle > capped + 阈值`** 时，只对**已有退出意向**的持仓强制减仓，直到回到天花板以内：
+
+$$\text{post\_lifecycle} \le \text{capped},\quad \text{仅当 } state=\text{PENDING\_EXIT} \text{ 或 } blocking\_reason=\text{EXIT\_CONFIRMING}$$
+
+- **执行位置**：票据构建阶段，`step_position_lifecycle` 与最低建仓过滤**之后**（即 `post_lifecycle_equity_sum` 所度量的那本账），`normalize_model_target_weights` / 购买力再缩放 / 交付市值上限**之前**——强制 SELL 与策略自身发出的 SELL 走**完全相同**的下游检查；
+- **顺序**：按「对超限的贡献」从大到小（`shares × price / NAV`，即交付口径权重）逐个处理，一旦 `post_lifecycle ≤ capped` 立即停止；
+- **单笔规模**：一次**卖到 0**（整笔平掉）。**不**做半仓：半仓会放大工单条数，并留下一笔低于最低建仓 / 惰性阈值的碎仓，此后再也没有机制能清掉它；
+- **不改变既有 cap 语义**：`apply_portfolio_vol_ceiling` 的 `min()` 判定、`equity_scale_factor`、`vol_scaling_factor` 的计算与 `docs/version.md` §32 完全一致，方案 C 只是在上限**之后**再补一次执行；
+- **不动 `blend_base.py` 的波动率目标逻辑**，**不动** `evaluate_realized_volatility`：因此 `BASE_VERSION` **保持 `2.0.0`**。
+
+### 34.3 允许 / 禁止强卖的判定边界
+
+| 判定 | 条件 | 结果 |
+| --- | --- | --- |
+| 允许 | `state == PENDING_EXIT`（退出意向已登记） | 可强制平仓 |
+| 允许 | `blocking_reason == EXIT_CONFIRMING`（平仓信号确认中） | 可强制平仓 |
+| 允许前提 | 实际持有（`current_shares > 0`，或 `current_weight > 0`） | 否则不是候选，也不记为「跳过」 |
+| 允许前提 | 未在今日已计划清仓（`action == SELL` 且 `target_shares == 0` 的行**不重复下单**） | — |
+| 允许前提 | 价格可用（`price > 0` 且 `price_stale == False`） | 否则 `no_price` 跳过 |
+| 允许前提 | 中国 A 股必须满足 T+1（`holding_bars >= 1`） | 否则 `t_plus_one` 跳过 |
+| **禁止** | 今日买入（中国 `holding_bars < 1`），**即使处于退出确认期** | 跳过并记 `t_plus_one` |
+| **禁止** | `HELD_ACTIVE` / 无生命周期状态 / 任何「模型没打算卖」的持仓 | 跳过并记 `no_exit_intent` |
+| **禁止** | `MIN_ENTRY_THRESHOLD` 等过滤项（本就无持仓） | 不构成候选 |
+| **禁止** | 停牌 / 陈旧价 / 无行情（占位价） | 跳过并记 `no_price` |
+| **禁止** | 上限未生效（`binding=false`）或 `capped <= 0` | 整轮不动（`not_binding`，绝不被读成「0 → 全卖」） |
+
+> 边界说明（必须留痕）：中国 T+1 是**券商结算约束**，不是风险偏好 —— 再超限也不能卖今日买入的仓位；`HELD_ACTIVE` 是**策略意图**，把它强卖掉等于用风控的名义静默改写策略结论，因此方案 C 明确不做「一般性降险」。
+
+### 34.4 阈值与开关
+
+- `VOL_CEILING_FORCE_EXIT_MIN_OVERAGE = 0.01`（1pp）：超限不足 1pp **不动**，避免组合在上限附近抖动时反复买入卖出（`skipped_reason="below_threshold"`）；
+- `cfsb_portfolio_vol_ceiling_force_exits`（默认 **`true`**，按用户决定）：已在 `strategies_config.json` 中按**前缀键**声明，并作为 `StrategyConfig` 字段登记以保证 dump 往返（AGENTS.md §7：blend 参数禁止裸名撞全局 `StrategyConfig` 字段；`resolve_blend_param` 的裸名兜底正是 `wq_alpha_id` 事故的同源坑）；
+- **关闭时与 1.3.0 完全一致**：不写 `forced_exits` / `force_exit_skipped` / `forced_exit_equity_sum` 任何键，不打 `[INFO/VOL CEILING]` 行。
+
+### 34.5 记录字段（`vol_overlay`）
+
+新增：
+
+- `forced_exits: [{symbol, lifecycle_state, shares, weight, reason: "ceiling_enforced_pending_exit"}]` —— `lifecycle_state` 记录的是**人读得到的退出意向标签**（`EXIT_CONFIRMING` 优先，其次为 `PENDING_EXIT`），每行 `detail_reason.vol_ceiling_force_exit` 另有 `lifecycle_state` / `exit_intent` / `blocking_reason` / `shares` / `weight` / `ceiling` / `post_lifecycle_before` 全量留痕；
+- `forced_exit_equity_sum` —— 被强制平掉的**交付口径**权益合计；
+- `force_exit_skipped: [{symbol, reason: "t_plus_one" | "no_exit_intent" | "no_price"}]`；
+- `post_lifecycle_equity_sum_before_force` / `post_lifecycle_equity_sum_after_force` —— 强制减仓前后的权益合计；
+- `vol_ceiling_force_exit_applied` —— 布尔。
+- `ceiling_exceeded_by` **保持既有语义**（交付口径 − 天花板），但改为在强制减仓**之后**计算；原值另存 `ceiling_exceeded_by_before_force`（= 强制前交付合计 − 天花板，强制行为整笔平仓，故 `delivered_before = delivered_after + forced_exit_equity_sum`，可精确复原）。
+- 归因：`lifecycle_filtered_reasons` 为强制减仓单列 `vol_ceiling_force_exit` 桶，**不得**记成「生命周期机器吃掉了天花板」（§32 之后的 defect B 归因口径保持）。
+- 票据：强制行的 `action` 改为 `SELL`，`target_shares = 0`、`delta_shares = -current_shares`、`blocking_reason = NONE`、`detail_reason.is_liquidation = true`，`reason`/`summary_reason` 带 `ceiling_enforced_pending_exit`，便于事后区分「策略卖出」与「风控强制卖出」。
+
+`deploy_stdout` 固定可 grep 行：
+
+```
+[INFO/VOL CEILING] 强制平掉 N 个退出期仓位 (X pp) 以满足上限 Y%
+[INFO/VOL CEILING] 超限但不可强制卖出 t_plus_one: <syms> | no_exit_intent: <syms>（T+1/无退出意向/无有效价，均不下单）
+```
+
+（第二行仅在存在跳过项时打印。）
+
+### 34.6 版本轴与 dump 复核
+
+- `ChanFourStateBlendStrategy.version`：**`1.3.0` → `1.3.1`**（行为变更、非破坏性：只增加一种在天花板超限时**完成既有退出**的执行路径）；
+- `BASE_VERSION`：**不变**，仍为 `2.0.0`（`blend_base.py` 的波动率目标逻辑、`evaluate_realized_volatility` 均未被修改）；
+- 同步更新：`pipeline/research_strategy/tests/test_blend_strategy_versioning.py`、`common/tests/test_strategy_versioning.py` 中的版本断言；
+- 重跑 `cd pipeline && .venv/bin/python research_strategy/run_research_strategy.py --dump-strategies`，复核 `chan_four_state_blend_strategy.json`：
+  - `strategy_version = 1.3.1`；
+  - `params.blend_weighting_mode = regime_ic_ir_hybrid`（**文档化例外，未被归一化回 `rolling_ic_ir`**）；
+  - `params.cfsb_portfolio_vol_overlay_enabled = true`、`params.cfsb_portfolio_vol_overlay_mode = "cap"`、`params.cfsb_portfolio_vol_ceiling_force_exits = true`。
+
+### 34.7 测试状态（100% 离线）
+
+- 新增 `pipeline/tests/test_vol_ceiling_force_exits.py`（**16 例**）：①`binding=true` / `post=0.5661` / `capped=0.3995` / `000157.SZ` 退出确认期 → 产生强制 SELL，`post_after ≤ capped`，`forced_exit_equity_sum = 0.1666`；②同样超限但全部来自 `HELD_ACTIVE` → 不下单、超限保留、`force_exit_skipped` 记 `no_exit_intent`；③`000157.SZ` 今日买入（`holding_bars=0`）→ `t_plus_one` 跳过（即使处于退出确认期）；④超限 < 1pp → 不动（并验证阈值可配）；⑤超限来自陈旧价 / 零价 → `no_price` 跳过；⑥按贡献从大到小、够用即停；⑦今日已计划清仓的行不重复下单；⑧开关关闭 → 与 1.3.0 完全一致（无 `forced_exits`）；⑨开关解析：前缀键生效、**裸名不生效**、非白名单策略一律 `False`；⑩`binding=false` / `capped=0` 一律不动；⑪stdout 两行文案；⑫强制行 `SELL` 与 `ticket_stdout_parity` 仍为 true；⑬源码契约：强制减仓在 `normalize_model_target_weights` **之前**、`ceiling_exceeded_by` 在强制减仓**之后**计算。
+- 回归（实跑，0 failed）：`pipeline/tests/test_portfolio_vol_overlay.py`、`pipeline/tests/test_vol_overlay_attribution.py`、`pipeline/tests/test_live_weight_budget_and_buy_stdout_parity.py`、`pipeline/tests/test_vol_ceiling_force_exits.py`（73 passed）；`pipeline/research_strategy/tests/test_blend_strategy_versioning.py`、`common/tests/test_strategy_versioning.py`（10 passed）；`pipeline/tests/test_live_path_hardening.py`、`pipeline/tests/test_live_holdings_input_check.py`、`pipeline/tests/test_state_version_clobber_guard.py`、`pipeline/tests/test_stage1_nav_source.py`、`common/tests/test_live_strategy.py`（154 passed）。
+- 已披露的未验证项：`t_plus_one` 的判定完全依赖票据行已有的 `holding_bars` 与符号后缀市场推断（与规模测算循环的 `is_china_t1_gestation` 同源，但**未**在真实券商账户上做过「当日买入即退出确认期」的端到端实盘验证）；此外强制平仓后 `account_state` 的再入场冷却由既有的 `should_anchor_reentry_cooldown`（`action=SELL` 且 `target_shares=0`）承接，本次未新增独立验证。

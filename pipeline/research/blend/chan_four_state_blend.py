@@ -53,7 +53,18 @@ class ChanFourStateBlendStrategy(BaseBlendAllocationStrategy):
     #   strategy's ticket changes. A degraded Stage-1 factor is `applied=false` /
     #   `reason=vol_unavailable` and NEVER defaults to a 1.0x multiplier. No `blend_base.py`
     #   vol-targeting logic was touched, so `BASE_VERSION` stays `2.0.0`. See docs/version.md.
-    version: str = "1.3.0"
+    # 1.3.0 -> 1.3.1 (2026-11-12, PLAN C): the Stage-1 ceiling is now ENFORCED, not merely
+    #   reported. Measured on the 2026-11-09 replay: `binding=true`, `capped_equity_sum=0.3995`,
+    #   but `post_lifecycle_equity_sum=0.5661` because `000157.SZ` sat in `EXIT_CONFIRMING` at
+    #   16.66%, so the ticket delivered 0.5166 -- 11.72pp OVER the ceiling with only
+    #   `ceiling_exceeded_by` to show for it. Now: when the cap binds and the post-lifecycle
+    #   book is >1pp over, ONLY positions already in `PENDING_EXIT` / `EXIT_CONFIRMING` are
+    #   flattened (largest contribution first) until the book is inside the ceiling; China T+1,
+    #   stale/absent prices and every `HELD_ACTIVE` name are hard-blocked and recorded in
+    #   `force_exit_skipped`. Switch `cfsb_portfolio_vol_ceiling_force_exits` (default ON).
+    #   Non-breaking: `blend_base.py` vol targeting / `evaluate_realized_volatility` untouched,
+    #   so `BASE_VERSION` stays `2.0.0`. See docs/version.md §34.
+    version: str = "1.3.1"
 
     def __init__(self, config: Optional[StrategyConfig] = None, version: Optional[str] = None):
         cfg = config or StrategyConfig()

@@ -71,6 +71,7 @@ if _REPO_ROOT not in sys.path:
 from scripts.run_live_strategy import (  # noqa: E402
     PORTFOLIO_VOL_OVERLAY_MODE_OFF,
     VOL_OVERLAY_DELIVERY_SHORTFALL_RATIO,
+    VOL_CEILING_FORCE_EXITS_PARAM,
     VOL_OVERLAY_ENABLED_PARAM,
     VOL_OVERLAY_MODE_PARAM,
     VOL_OVERLAY_SUPERSEDED_BY_CIRCUIT_BREAKER,
@@ -554,7 +555,11 @@ def test_allowlisted_strategy_registers_both_overlay_keys_with_config_source():
     declared = _params(enabled=True, mode="cap")
     entries, provenance = _entries(params=declared, config_origin=SOURCE_DUMP)
 
-    assert set(entries) == {VOL_OVERLAY_ENABLED_PARAM, VOL_OVERLAY_MODE_PARAM}
+    assert set(entries) == {
+        VOL_OVERLAY_ENABLED_PARAM,
+        VOL_OVERLAY_MODE_PARAM,
+        VOL_CEILING_FORCE_EXITS_PARAM,
+    }
     assert entries[VOL_OVERLAY_ENABLED_PARAM] == {
         "declared": True,
         "resolved": True,
@@ -564,6 +569,13 @@ def test_allowlisted_strategy_registers_both_overlay_keys_with_config_source():
         "declared": "cap",
         "resolved": "cap",
         "source": SOURCE_DUMP,
+    }
+    # (PLAN C) the forced-exit switch rides in the same snapshot; absent from this dump, so
+    # its honest provenance is the resolver's default (enabled) -- not "the config said so".
+    assert entries[VOL_CEILING_FORCE_EXITS_PARAM] == {
+        "declared": None,
+        "resolved": True,
+        "source": SOURCE_DEFAULT,
     }
     assert provenance["allowlisted"] is True
 
@@ -622,6 +634,9 @@ def test_non_allowlisted_strategy_still_registers_keys_as_disabled_default():
         "resolved": "off",
         "source": SOURCE_DEFAULT,
     }
+    # (PLAN C) the forced-exit switch is gated by the SAME allowlist
+    assert entries[VOL_CEILING_FORCE_EXITS_PARAM]["resolved"] is False
+    assert entries[VOL_CEILING_FORCE_EXITS_PARAM]["source"] == SOURCE_DEFAULT
     assert provenance["allowlisted"] is False
 
 
