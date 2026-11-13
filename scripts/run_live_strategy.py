@@ -227,6 +227,36 @@ def degraded_gate_acknowledged() -> bool:
     )
 
 
+#: NAV provenance spelling Stage 1 stamps when the operator asserted the NAV BY HAND
+#: (`check_live_portfolio_health.py`: `nav_source == "override"`). It is the only in-band
+#: evidence that THIS run's degradation was accepted by a human, as opposed to inherited.
+NAV_SOURCE_OVERRIDE = "override"
+
+
+def degraded_gate_ack_env_inherited(gate_info: Optional[Dict[str, Any]]) -> bool:
+    """True when the degraded-gate permission plausibly came from the PROCESS env, not a human.
+
+    (gate re-review, item 4) `web/livetrading/execution_service.py::_get_subprocess_env`
+    builds every child env as `dict(os.environ)`, so a `LIVETRADING_ALLOW_DEGRADED_GATE` preset
+    in the web service process is inherited by EVERY Stage-1/Stage-2 run it launches. The
+    permission is only legitimate when it accompanies THIS run's explicit "人工覆盖净值"
+    acknowledgement, which Stage 1 records as `nav_source="override"`. So: degraded gate +
+    env flag set + no `override` provenance on this run = the acknowledgement is inherited
+    ambient state, and it is reported as such -- loudly on the console and machine-readably
+    as `summary.json::gate_degraded_ack_env_inherited=true`.
+
+    A healthy gate is not flagged: the flag is inert when nothing degraded, so warning about
+    a "degraded release" there would be a false statement (and would train operators to
+    ignore the line).
+    """
+    if not isinstance(gate_info, dict) or not gate_info.get("degraded"):
+        return False
+    if not degraded_gate_acknowledged():
+        return False
+    nav_source = str(gate_info.get("nav_source") or "").strip().lower()
+    return nav_source != NAV_SOURCE_OVERRIDE
+
+
 #: (2026-11-12 defect A) `stage1_health_report.json` publishes the gate verdict INSIDE
 #: `portfolio_health` (`tier_status`, `nav_gate_status`, `nav_breaker_evaluated`,
 #: `nav_source`, ...), but `README`-era vintages only mirrored a subset at the top level and
@@ -248,6 +278,88 @@ HEALTH_GATE_TIER_SEVERITY: Dict[str, int] = {
     "CAUTION_RECOVERING": 10,
     "NORMAL": 0,
 }
+
+
+#: (gate re-review, item 3) Severity ladder for `gate_code`, used by the same "keep the WORSE
+#: answer" rule as the tier ladder above. A gate code may only ever ESCALATE: a STALE
+#: `CAUTION_RECOVERING` carried in `account_state.json` may not soften a `TIER_3_HALT` /
+#: `HALT` verdict published by THIS round's report -- that is what made Stage 2 skip the 100%
+#: cash sweep and take the fast-recovery (30%) branch on a halted account.
+HEALTH_GATE_CODE_SEVERITY: Dict[str, int] = {
+    "GO": 0,
+    "NORMAL": 0,
+    "CAUTION_RECOVERING": 10,
+    "CAUTION": 15,
+}
+
+
+def _gate_code_severity(code: Optional[str]) -> int:
+    """Severity rank of a gate code; `-1` when absent, and never `GO` for an unknown code.
+
+    An unrecognised code ranks ABOVE `CAUTION` (it cannot license the recovery branch) but
+    BELOW `TIER_3_HALT`; codes that spell a tier (or "HALT") borrow the tier ladder, so
+    `gate_code="TIER_3_HALT"` outranks `circuit_breaker_tier="CAUTION_RECOVERING"`.
+    """
+    text = (code or "").strip().upper()
+    if not text:
+        return -1
+    if text in HEALTH_GATE_CODE_SEVERITY:
+        return HEALTH_GATE_CODE_SEVERITY[text]
+    if text in HEALTH_GATE_TIER_SEVERITY:
+        return HEALTH_GATE_TIER_SEVERITY[text]
+    if "TIER_3" in text or "HALT" in text:
+        return HEALTH_GATE_TIER_SEVERITY["TIER_3_HALT"]
+    if "UNKNOWN" in text or "UNVERIFIED" in text:
+        return HEALTH_GATE_TIER_SEVERITY["UNKNOWN"]
+    if "RECOVER" in text or "CAUTION" in text:
+        return HEALTH_GATE_CODE_SEVERITY["CAUTION_RECOVERING"]
+    return HEALTH_GATE_CODE_SEVERITY["CAUTION"]
+
+
+def _gate_bool(value: Any) -> Optional[bool]:
+    """Force a JSON-ish flag to a tri-state bool: `True/False` when recognisable, else `None`.
+
+    (gate re-review, item 2) The archived flag is JSON, but archives are also hand-edited and
+    re-serialised by other tools, so `"false"` / `"0"` / `0` occur in the wild. The old
+    `flag is False` test only matched the Python `False` singleton, so a `"false"` string
+    silently read as "no opinion" and the breaker passed. Only the spellings listed here are
+    recognised -- nothing is guessed (an unparsable value stays `None`, i.e. no opinion).
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+        return None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("true", "1"):
+            return True
+        if text in ("false", "0"):
+            return False
+    return None
+
+
+def _gate_float(value: Any) -> Optional[float]:
+    """`value` as a float, or `None` when absent/unparsable (never a silent `0.0`)."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _gate_int(value: Any, default: int = 0) -> int:
+    """`value` as an int, or `default` when absent/unparsable."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _gate_text(value: Any) -> Optional[str]:
@@ -280,6 +392,8 @@ def _gate_keyed_provenance(gate: Dict[str, Any], key: str, *fallbacks: Any) -> A
 def resolve_stage1_health_gate(
     account_state: Optional[Dict[str, Any]],
     health_report: Optional[Dict[str, Any]],
+    *,
+    run_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Resolve the Stage-1 gate verdict from BOTH archives, keeping the WORSE answer.
 
@@ -297,8 +411,29 @@ def resolve_stage1_health_gate(
         `"NORMAL"` therefore cannot outvote a nested `TIER_2_DEFENSIVE`, and when the gate is
         known to be unevaluated the resolved tier is forced to `"UNKNOWN"` instead of the
         placeholder "NORMAL";
-      * `nav_breaker_evaluated` -- `False` wins over `True`; a string-independent guard for
-        the same condition (a rewritten/renamed status string cannot hide it).
+      * `nav_breaker_evaluated` -- `False` wins over `True`, with JSON-ish spellings
+        (`"false"` / `"0"` / `0`) coerced first; a string-independent guard for the same
+        condition (a rewritten/renamed status string cannot hide it);
+      * `gate_code` -- max SEVERITY across BOTH archives, so a stale `CAUTION_RECOVERING`
+        in `account_state.json` can never soften a `TIER_3_HALT` / `HALT` gate in THIS
+        round's report;
+      * `linear_equity_scale` -- the MINIMUM of the two archives (the more conservative
+        damping), not "account_state first";
+      * `freeze_remaining_bars` -- the MAXIMUM of the two archives (a freeze may not be
+        aged out by a stale carry-over);
+      * `is_recovering` -- `CAUTION_RECOVERING` ONLY while no source reports anything more
+        severe: a resolved tier/tier-naming gate code above CAUTION, or a positive freeze,
+        always wins (that is what routes the account to the 100% cash sweep instead of the
+        fast-recovery scale).
+
+    (gate re-review, item 1) MISSING != EVALUATED, the remaining legs: a degradation is a
+    positive finding, so "no gate block at all" must not read as green. When THIS round's
+    report was loaded (`health_report` non-empty) but carries NEITHER `portfolio_health` NOR
+    any top-level gate key, or when `account_state` is nothing but a placeholder
+    `circuit_breaker_tier` with no `tier_status` / `nav_breaker_evaluated` anywhere, the gate
+    is `UNKNOWN` and is refused. `run_mode="replay"` is the one exemption: a historical
+    replay has no live gate to evaluate, and offline fixtures built before the gate block
+    existed must keep working (`main()` passes the resolved run mode).
 
     Pure dict-in/dict-out (no I/O) so the fail-closed decision is unit-testable offline.
     """
@@ -310,6 +445,8 @@ def resolve_stage1_health_gate(
     if not isinstance(_health_gate, dict):
         _health_gate = report
     sources = (acct, _health_gate, report)
+    # A historical replay is exempt from the "no gate block" rule below (see docstring).
+    _is_replay = str(run_mode or "").strip().lower() == "replay"
 
     tier_statuses = [_gate_text(s.get("tier_status")) for s in sources]
     nav_gate_statuses = [_gate_text(s.get("nav_gate_status")) for s in sources]
@@ -323,7 +460,45 @@ def resolve_stage1_health_gate(
     tier_status = _worse_status(tier_statuses, HEALTH_GATE_UNKNOWN_STATUS)
     nav_gate_status = _worse_status(nav_gate_statuses, HEALTH_GATE_DEGRADED_NAV_STATUS)
 
-    breaker_flags = [s.get("nav_breaker_evaluated") for s in sources]
+    # (item 1) "This round's report was loaded but says nothing about the gate" is NOT a pass.
+    # `_GATE_BLOCK_KEYS` deliberately includes `circuit_breaker_tier`: a report that only
+    # mirrors a tier still HAS a gate block (legacy flat vintages, pinned elsewhere).
+    _GATE_BLOCK_KEYS = (
+        "tier_status",
+        "nav_gate_status",
+        "nav_breaker_evaluated",
+        "circuit_breaker_tier",
+        "gate_code",
+    )
+    report_has_gate_block = (
+        isinstance(report.get("portfolio_health"), dict) and bool(report.get("portfolio_health"))
+    ) or any(key in report for key in _GATE_BLOCK_KEYS)
+    # An EXPLICIT evaluation marker in either archive means the gate really was evaluated;
+    # a bare `circuit_breaker_tier="NORMAL"` is a placeholder, not an evaluation.
+    _evaluation_markers = ("tier_status", "nav_breaker_evaluated", "nav_gate_status")
+    acct_evaluated = any(key in acct for key in _evaluation_markers)
+    report_evaluated = any(key in report for key in _evaluation_markers) or any(
+        key in _health_gate for key in _evaluation_markers
+    )
+    unevaluated_source: Optional[str] = None
+    if report and not report_has_gate_block:
+        unevaluated_source = (
+            "report_has_no_gate_block(no portfolio_health / top-level status keys)"
+        )
+    elif (
+        acct
+        and "circuit_breaker_tier" in acct
+        and not acct_evaluated
+        and not report_evaluated
+    ):
+        unevaluated_source = (
+            "account_state_placeholder_only(circuit_breaker_tier without "
+            "tier_status/nav_breaker_evaluated)"
+        )
+    if unevaluated_source and not _is_replay:
+        tier_status = HEALTH_GATE_UNKNOWN_STATUS
+
+    breaker_flags = [_gate_bool(s.get("nav_breaker_evaluated")) for s in sources]
     if any(flag is False for flag in breaker_flags):
         nav_breaker_evaluated: Optional[bool] = False
     elif any(flag is True for flag in breaker_flags):
@@ -331,12 +506,34 @@ def resolve_stage1_health_gate(
     else:
         nav_breaker_evaluated = None
 
+    gate_codes = [
+        _gate_text(acct.get("gate_code")),
+        _gate_text(_health_gate.get("gate_code")),
+        _gate_text(report.get("gate_code")),
+    ]
+    _known_codes = [c for c in gate_codes if c]
+    gate_code: Optional[str] = None
+    if _known_codes:
+        # max() keeps the FIRST of equal-severity candidates, so an unchanged pair keeps the
+        # historical "account_state first" answer while a worse code always wins.
+        gate_code = max(_known_codes, key=_gate_code_severity)
+    _gate_code_sev = _gate_code_severity(gate_code)
+
     tier_candidates = [
         _gate_text(acct.get("circuit_breaker_tier")),
         _gate_text(_health_gate.get("circuit_breaker_tier")),
         _gate_text(_health_gate.get("tier")),
         _gate_text(report.get("circuit_breaker_tier")),
     ]
+    # A gate code that NAMES a tier (`TIER_3_HALT`, `HALT`, ...) is also a tier verdict, so it
+    # joins the severity comparison instead of being read from account_state alone.
+    tier_candidates.extend(
+        c
+        for c in _known_codes
+        if c.upper() in HEALTH_GATE_TIER_SEVERITY
+        or "TIER_" in c.upper()
+        or "HALT" in c.upper()
+    )
     _known_tiers = [c for c in tier_candidates if c]
     if (
         tier_status == HEALTH_GATE_UNKNOWN_STATUS
@@ -354,7 +551,37 @@ def resolve_stage1_health_gate(
     else:
         circuit_tier = None
 
+    _tier_sev = HEALTH_GATE_TIER_SEVERITY.get((circuit_tier or "").upper(), -1)
+    _recovering_sev = HEALTH_GATE_TIER_SEVERITY["CAUTION_RECOVERING"]
+    # (item 3) `freeze_remaining_bars`: the MAXIMUM of the two archives -- a stale 0 in the
+    # carried state may not age out a freeze this round's report still reports.
+    freeze_remaining_bars = max(
+        _gate_int(acct.get("freeze_remaining_bars")),
+        _gate_int(report.get("freeze_remaining_bars")),
+        _gate_int(_health_gate.get("freeze_remaining_bars")),
+    )
+    # (item 3) Recovery ONLY while nothing more severe is on the table anywhere: a worse
+    # resolved tier, a worse gate code, or an active freeze all veto it, so the Tier-3 halt
+    # (100% cash sweep) keeps priority over `CAUTION_RECOVERING` (30% scale).
+    is_recovering = bool(
+        (gate_code == "CAUTION_RECOVERING" or circuit_tier == "CAUTION_RECOVERING")
+        and _gate_code_sev <= _recovering_sev
+        and _tier_sev <= _recovering_sev
+        and freeze_remaining_bars <= 0
+    )
+    # (item 3) `linear_equity_scale`: the MINIMUM of the two archives -- the more conservative
+    # damping wins, instead of letting a stale 1.0 in account_state override a 0.5 this round.
+    _scale_candidates = [
+        _gate_float(acct.get("linear_equity_scale")),
+        _gate_float(report.get("linear_equity_scale")),
+        _gate_float(_health_gate.get("linear_equity_scale")),
+    ]
+    _present_scales = [v for v in _scale_candidates if v is not None]
+    linear_equity_scale: Optional[float] = min(_present_scales) if _present_scales else None
+
     degraded_reasons: List[str] = []
+    if unevaluated_source and not _is_replay:
+        degraded_reasons.append(unevaluated_source)
     if tier_status == HEALTH_GATE_UNKNOWN_STATUS:
         degraded_reasons.append("tier_status=UNKNOWN")
     if nav_gate_status == HEALTH_GATE_DEGRADED_NAV_STATUS:
@@ -371,6 +598,14 @@ def resolve_stage1_health_gate(
         "nav_gate_status": nav_gate_status,
         "circuit_breaker_tier": circuit_tier,
         "nav_breaker_evaluated": nav_breaker_evaluated,
+        # (item 3) Worse-answer resolution for the three values `main()` used to read from
+        # account_state first. A stale carry-over must never soften this round's verdict.
+        "gate_code": gate_code,
+        "is_recovering": is_recovering,
+        "freeze_remaining_bars": freeze_remaining_bars,
+        "linear_equity_scale": linear_equity_scale,
+        "run_mode": "replay" if _is_replay else "live",
+        "unevaluated_source": unevaluated_source,
         # Provenance is read from THIS round's gate block first (it names the degradation),
         # then the carried-over account_state (which may hold a persisted timebase verdict),
         # then the report's flat mirror.
@@ -397,6 +632,9 @@ def format_stage1_gate_degraded_detail(info: Dict[str, Any]) -> str:
         f"nav_gate_status={info.get('nav_gate_status')!r} "
         f"circuit_breaker_tier={info.get('circuit_breaker_tier')!r} "
         f"nav_breaker_evaluated={info.get('nav_breaker_evaluated')!r} "
+        # (gate re-review, item 3) The resolved gate code, so "was this the stale carried
+        # CAUTION_RECOVERING or this round's HALT?" is answerable from the refusal text.
+        f"gate_code={info.get('gate_code')!r} "
         f"nav_source={info.get('nav_source')!r} "
         f"nav_mtm={info.get('nav_mtm')!r} "
         # (LV1-TIMEBASE) Which KIND of degradation this is: the snapshot existed, but its
@@ -411,6 +649,7 @@ def assert_stage1_gate_usable(
     health_report: Optional[Dict[str, Any]],
     *,
     acknowledged: Optional[bool] = None,
+    run_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Refuse BEFORE any order math when Stage 1's gate NAV was not usable.
 
@@ -418,8 +657,12 @@ def assert_stage1_gate_usable(
     needs for the Tier-2/Tier-3 paths). Raises `LiveGateDegradedError` unless the operator
     explicitly acknowledged the degradation (`LIVETRADING_ALLOW_DEGRADED_GATE=1`); the
     acknowledgement is logged loudly and is NOT silent.
+
+    `run_mode="replay"` exempts only the "no gate block at all" leg of
+    `resolve_stage1_health_gate` (a historical replay has no live gate to evaluate); every
+    explicit UNKNOWN / unevaluated-breaker verdict stays refused in both modes.
     """
-    info = resolve_stage1_health_gate(account_state, health_report)
+    info = resolve_stage1_health_gate(account_state, health_report, run_mode=run_mode)
     if not info["degraded"]:
         return info
     _degraded_detail = format_stage1_gate_degraded_detail(info)
@@ -4526,11 +4769,49 @@ def main(cli_args: Optional[List[str]] = None):
     # the top-level mirror is a fallback (and may be a placeholder). `resolve_stage1_health_gate`
     # reads BOTH archives and keeps the worse answer, and `assert_stage1_gate_usable` refuses
     # BEFORE any order math when either says the breaker was never evaluated.
-    _gate_info = assert_stage1_gate_usable(account_state, health_report)
+    #
+    # (gate re-review, item 3) `freeze_remaining_bars`, `gate_code`, `is_recovering` and
+    # `linear_equity_scale` are ALSO resolved across both archives and keep the worse answer
+    # (freeze: max, gate_code: max severity, linear scale: min). Reading them "account_state
+    # first" let a STALE carried-over `gate_code="CAUTION_RECOVERING"` mark a Tier-3-halted
+    # account as recovering, which skipped the 100% cash sweep below, and let a stale
+    # `linear_equity_scale=1.0` override this round's 0.5. A stale archive must never soften
+    # the latest report's more severe conclusion.
+    _gate_info = assert_stage1_gate_usable(account_state, health_report, run_mode=run_mode)
     circuit_tier = _gate_info["circuit_breaker_tier"]
-    freeze_rem = int(account_state.get("freeze_remaining_bars", health_report.get("freeze_remaining_bars", 0)))
-    gate_code = account_state.get("gate_code") or health_report.get("gate_code")
-    is_recovering = (gate_code == "CAUTION_RECOVERING" or circuit_tier == "CAUTION_RECOVERING")
+    freeze_rem = int(_gate_info.get("freeze_remaining_bars") or 0)
+    gate_code = _gate_info.get("gate_code")
+    # Only true while NOTHING more severe is on the table (see `resolve_stage1_health_gate`):
+    # TIER_3_HALT / a positive freeze / a worse gate code all beat CAUTION_RECOVERING.
+    is_recovering = bool(_gate_info.get("is_recovering"))
+
+    # (gate re-review, item 4) `web/livetrading/execution_service.py::_get_subprocess_env`
+    # seeds every child env with `dict(os.environ)`, so a `LIVETRADING_ALLOW_DEGRADED_GATE`
+    # preset in the web SERVICE process is inherited by every Stage-1/Stage-2 run it launches
+    # -- the per-run "人工覆盖净值" acknowledgement is then no longer per-run. The web file is
+    # NOT modified here (single-owner discipline); this run only refuses to let the permission
+    # pass as if a human had confirmed THIS booking: it warns and records the provenance.
+    if degraded_gate_ack_env_inherited(_gate_info):
+        print("\n" + "!" * 110)
+        print(
+            "[WARN] 降级放行来自进程环境而非当次人工确认 —— "
+            f"{ALLOW_DEGRADED_GATE_ENV} 已存在于本进程环境 (子进程继承自 web 服务)，"
+            f"而本次门禁净值来源为 nav_source={_gate_info.get('nav_source')!r}"
+            f"（人工裁决应记为 {NAV_SOURCE_OVERRIDE!r}）。"
+        )
+        print(
+            "       该次放行不构成「操作员已裁定本轮净值」的证据；"
+            "summary.json 已落 gate_degraded_ack_env_inherited=true 供审计。"
+        )
+        print("!" * 110 + "\n")
+        # Merge (never overwrite) into the same summary.json the earlier stages wrote.
+        persist_run_metadata(
+            args.output_dir,
+            clock_ctx,
+            freshness_summary=freshness_summary,
+            probe_attempts=probe_attempts,
+            extra={"gate_degraded_ack_env_inherited": True},
+        )
     is_portfolio_deleverage = False
     # (LV18 item 3) Set ONLY by the Tier-3 halt below. Threaded into the vol-ceiling audit so
     # an emptied book is attributed to the breaker rather than to Stage-1's vol cap. It is
@@ -4546,11 +4827,8 @@ def main(cli_args: Optional[List[str]] = None):
             current_targets[cash_proxy] = 1.0
         circuit_breaker_superseded = VOL_OVERLAY_SUPERSEDED_BY_CIRCUIT_BREAKER
     elif is_recovering:
-        raw_scale = (
-            account_state.get("linear_equity_scale")
-            if account_state.get("linear_equity_scale") is not None
-            else health_report.get("linear_equity_scale")
-        )
+        # (item 3) Same resolution as below: the MINIMUM of the two archives.
+        raw_scale = _gate_info.get("linear_equity_scale")
         rec_scale = float(raw_scale) if raw_scale is not None else 0.30
         if rec_scale <= 0.0 or rec_scale >= 0.999:
             rec_scale = 0.30
@@ -4561,12 +4839,10 @@ def main(cli_args: Optional[List[str]] = None):
         if cash_proxy in current_targets.index:
             tot_risky = float(current_targets[risky_syms_in_targets].sum())
             current_targets[cash_proxy] = max(0.0, 1.0 - tot_risky)
-    elif account_state.get("linear_equity_scale") is not None or health_report.get("linear_equity_scale") is not None:
-        live_scale = float(
-            account_state.get("linear_equity_scale")
-            if account_state.get("linear_equity_scale") is not None
-            else health_report.get("linear_equity_scale")
-        )
+    elif _gate_info.get("linear_equity_scale") is not None:
+        # (item 3) The MINIMUM of the two archives, not "account_state first": a stale 1.0 in
+        # the carried state must not cancel the 0.5 this round's report asked for.
+        live_scale = float(_gate_info["linear_equity_scale"])
         if live_scale < 0.999:
             print(f"[RISK DAMPING / 风险阻尼] 根据账户实盘回撤，线性压缩股票仓位比例至: {live_scale:.1%}")
             is_portfolio_deleverage = True

@@ -1736,14 +1736,22 @@ def test_live_linear_equity_scale_portfolio_deleverage(tmp_path, patched_weights
     assert float(bil_row["target_weight"]) >= 0.525
 
 
-def test_live_fast_recovery_override_tier3_parity(tmp_path, patched_weights, capsys):
-    """L2.42: Stage 2 receiving CAUTION_RECOVERING (even with circuit_breaker_tier=TIER_3_HALT
-    and freeze_remaining_bars > 0) does NOT liquidate 100% to 0.0, but scales risky targets
-    to 30% (0.30) with is_portfolio_deleverage=True.
+def test_live_tier3_halt_wins_over_stale_caution_recovering(tmp_path, patched_weights, capsys):
+    """L2.42 (SUPERSEDED 2026-11-12 by the gate re-review, item 3).
+
+    WHAT IT PINNED BEFORE: Stage 2 receiving `gate_code=CAUTION_RECOVERING` did NOT liquidate,
+    even with `circuit_breaker_tier=TIER_3_HALT` and `freeze_remaining_bars > 0`; it scaled
+    risky targets to 30% instead. That is exactly the defect: a STALE `gate_code` carried in
+    `account_state.json` soft-laundered this round's own `TIER_3_HALT`, so a halted account
+    went through the fast-recovery branch and kept a 30% book.
+
+    WHAT IT PINS NOW: severity only ever ESCALATES across the two archives. A stale
+    `CAUTION_RECOVERING` cannot outvote `TIER_3_HALT` / an active freeze, so the Tier-3 halt
+    wins and the book is 100% cash (`is_recovering` is False).
     """
     from scripts.run_live_strategy import main as live_main
 
-    rec_dir = tmp_path / "live_recovery"
+    rec_dir = tmp_path / "live_halt"
     rec_dir.mkdir()
     universe_file = _write_universe(rec_dir, ["600000.SH", "BIL"])
     holdings_file = _write_json(rec_dir, "holdings.json", {"600000.SH": 0.50, "BIL": 0.50})
@@ -1789,16 +1797,16 @@ def test_live_fast_recovery_override_tier3_parity(tmp_path, patched_weights, cap
     capsys.readouterr()
 
     row = order_df[order_df["symbol"] == "600000.SH"].iloc[0]
-    # Must NOT be 0.0 liquidation; must be partial trim to 0.15
+    # MUST be a 0.0 liquidation: TIER_3_HALT + freeze > 0 beat the stale CAUTION_RECOVERING.
     assert row["action"] == "SELL"
-    assert float(row["target_weight"]) == pytest.approx(0.15)
-    assert "组合级去杠杆风控减仓" in str(row["reason"])
+    assert float(row["target_weight"]) == pytest.approx(0.0)
 
     bil_row = order_df[order_df["symbol"] == "BIL"].iloc[0]
     assert bil_row["action"] == "SWEEP_CASH"
-    assert float(bil_row["target_weight"]) >= 0.80
+    assert float(bil_row["target_weight"]) >= 0.999
 
-    # Also verify fallback when linear_equity_scale was legacy 0.0 or None in state
+    # The same verdict holds when the carried `linear_equity_scale` was a legacy 0.0: the halt
+    # does not consult the damping scale at all.
     state_legacy = dict(state_payload)
     state_legacy["linear_equity_scale"] = 0.0
     state_legacy_file = _write_json(rec_dir, "account_state_legacy.json", state_legacy)
@@ -1819,6 +1827,6 @@ def test_live_fast_recovery_override_tier3_parity(tmp_path, patched_weights, cap
 
     row_legacy = order_df_legacy[order_df_legacy["symbol"] == "600000.SH"].iloc[0]
     assert row_legacy["action"] == "SELL"
-    assert float(row_legacy["target_weight"]) == pytest.approx(0.15)
+    assert float(row_legacy["target_weight"]) == pytest.approx(0.0)
 
 
