@@ -4723,3 +4723,68 @@ $$\text{post\_lifecycle} \le \text{capped},\quad \text{仅当 } state=\text{PEND
 - 新增 `pipeline/tests/test_vol_ceiling_force_exits.py`（**16 例**）：①`binding=true` / `post=0.5661` / `capped=0.3995` / `000157.SZ` 退出确认期 → 产生强制 SELL，`post_after ≤ capped`，`forced_exit_equity_sum = 0.1666`；②同样超限但全部来自 `HELD_ACTIVE` → 不下单、超限保留、`force_exit_skipped` 记 `no_exit_intent`；③`000157.SZ` 今日买入（`holding_bars=0`）→ `t_plus_one` 跳过（即使处于退出确认期）；④超限 < 1pp → 不动（并验证阈值可配）；⑤超限来自陈旧价 / 零价 → `no_price` 跳过；⑥按贡献从大到小、够用即停；⑦今日已计划清仓的行不重复下单；⑧开关关闭 → 与 1.3.0 完全一致（无 `forced_exits`）；⑨开关解析：前缀键生效、**裸名不生效**、非白名单策略一律 `False`；⑩`binding=false` / `capped=0` 一律不动；⑪stdout 两行文案；⑫强制行 `SELL` 与 `ticket_stdout_parity` 仍为 true；⑬源码契约：强制减仓在 `normalize_model_target_weights` **之前**、`ceiling_exceeded_by` 在强制减仓**之后**计算。
 - 回归（实跑，0 failed）：`pipeline/tests/test_portfolio_vol_overlay.py`、`pipeline/tests/test_vol_overlay_attribution.py`、`pipeline/tests/test_live_weight_budget_and_buy_stdout_parity.py`、`pipeline/tests/test_vol_ceiling_force_exits.py`（73 passed）；`pipeline/research_strategy/tests/test_blend_strategy_versioning.py`、`common/tests/test_strategy_versioning.py`（10 passed）；`pipeline/tests/test_live_path_hardening.py`、`pipeline/tests/test_live_holdings_input_check.py`、`pipeline/tests/test_state_version_clobber_guard.py`、`pipeline/tests/test_stage1_nav_source.py`、`common/tests/test_live_strategy.py`（154 passed）。
 - 已披露的未验证项：`t_plus_one` 的判定完全依赖票据行已有的 `holding_bars` 与符号后缀市场推断（与规模测算循环的 `is_china_t1_gestation` 同源，但**未**在真实券商账户上做过「当日买入即退出确认期」的端到端实盘验证）；此外强制平仓后 `account_state` 的再入场冷却由既有的 `should_anchor_reentry_cooldown`（`action=SELL` 且 `target_shares=0`）承接，本次未新增独立验证。
+
+## 35. 5m 日内门禁三态化：未测量不再默认 50% 买入缩放，缺 5m 冻结新开仓（执行层变更，无版本轴变动，2026-11-12）
+
+### 35.1 缺陷 A：未测量的分布门禁被默认当作 50% 买入缩放
+
+`scripts/run_live_strategy.py` 有两处**各自独立**的买入缩放解析，且都以 `0.50` 兜底：
+
+```python
+# 改前（:2379，门禁内）与（:5312，provenance / advisory 读取点）
+intraday_buy_scale = float(
+    health_report.get("intraday_buy_scale", account_state.get("intraday_buy_scale", 0.50)))
+```
+
+键缺失（= 本轮**从未测量**）被静默解释为「买入砍半」。这与仓库既有纪律正相反 —— Stage-1 自己的 SKIPPED 分支恰恰会写 `intraday_buy_scale = 1.0` + `distribution_gate_status = "SKIPPED"` 而不是伪造一个缩放系数。两份重复实现还带来第二个隐患：**已施加的缩放**与**报告里的缩放**有可能不一致。
+
+### 35.2 缺陷 B：缺 5m 只打印、不冻结新开仓
+
+`_missing_5m` 早已不存在（被 `summarize_intraday_5m_loading`（现 `:4347`，调用点 `:5139`；本条改动前为 `:4096` / `:4888`）取代），但该函数**只打印**，不进入任何决策 —— 5m 缺失时照常开仓，`R7` 的「冻结半边」始终空白。
+
+### 35.3 三态语义与各自取值（唯一解析者）
+
+新增**单一纯函数** `resolve_intraday_gate_state(health_report, account_state, *, intraday_5m_enabled=None)`（`scripts/run_live_strategy.py:2428`）。门禁函数（`:2574` 起）与 provenance/票据读取点（`real_intraday_buy_scale`，`:5591`）**共用它的输出**，不再各写一份逻辑。
+
+| `intraday_gate_status` | 触发条件 | `intraday_buy_scale_applied` | 买入增量 |
+| --- | --- | --- | --- |
+| `not_applicable` | `enable_intraday_5m` 关闭；或无 5m 指标块且无 `CAUTION_INTRADAY_DISTRIBUTION` 指令（= 未进入 5m 门禁） | `1.0` | **不缩放**，返回调用方**同一对象**（bit-identical） |
+| `unknown_fail_closed` | 5m 已启用/已进入门禁，但没有任何可用测量：`status` / `publication_state` ∈ {`missing`, `provider_unsupported`, `degraded_stale_intraday_cache`, `degraded_unmeasured_features`, …}；或状态为「已测量」但两处都没有 `intraday_buy_scale` 键 | `0.0` | **冻结新开/加仓**（`cur + Δ×0 = cur`），**卖单与减仓逐字节不变** |
+| `evaluated` | 有真实测量（`status ∈ {evaluated, available}` 且带 `intraday_buy_scale`；或无状态但有实测 `intraday_buy_scale`） | 实测值（如 `0.50`） | 与改前**完全一致**，缩放公式 `cur + Δ×scale` **未改一个字符** |
+| `pending_publication` | 5m 当日尚未发布（`status`/`publication_state == "pending_publication"`） | 有实测则用实测，否则 `1.0` | **不冻结**；未实测时等于不缩放 |
+
+**任何情形都不再出现 `0.50` 默认。**「策略是否启用 5m」的判定只用两处可靠来源：①`main()` 顶部已解析的 `enable_intraday_5m`（`args.enable_intraday_5m or resolve_blend_param(params, "enable_intraday_5m", ...)`，`scripts/run_live_strategy.py:5087` —— 与「是否加载 5m 层」**同一个判定**，不另立第二套）；②当调用方未传该开关时，退读 Stage-1 报告自身的 `intraday_5m_metrics.requested` / 指标块是否存在。
+
+### 35.4 为什么 `pending_publication` 必须**不**冻结
+
+BaoStock 当日 5m 通常在 **20:00 之后**才可用（实盘观察值，非协议保证），而 Stage-2 的运行窗口是 `[估值日收盘+30min（15:30）, 下一交易日开盘（09:30）)`（见 §33）。也就是说 **15:30–20:00 之间跑票时「5m 未发布」是常态**，不是缺陷；把它当成缺失并冻结新开仓，会让整个跨夜窗口的正常交易被锁死。因此 `pending_publication` 只降级、不阻断；真正需要冻结的是「已过发布时点仍拿不到」的 `missing` 族。
+
+### 35.5 新增可观测字段与 WARN 文案
+
+- stdout（每次运行**一行**，`grep "INTRADAY GATE"` 可命中，`[WARN/INTRADAY GATE]` 只用于两种「未测得」判决）：
+
+  ```
+  [INFO/INTRADAY GATE] status=not_applicable reason=intraday_5m_not_enabled intraday_5m_status=- 5m_enabled=False buy_scale=1.00 -> 买入增量不缩放（bit-identical），未启用/未进入 5m 门禁
+  [WARN/INTRADAY GATE] status=unknown_fail_closed reason=5m_missing_fail_closed intraday_5m_status=missing 5m_enabled=True buy_scale=0.00 -> 买入增量冻结为 0（不新开/不加仓）；卖单与减仓路径不变
+  ```
+
+- 票据顶层（`live_trading_ticket.json`）与 `summary.json`（经 `persist_run_metadata` 合并写入）：`intraday_gate_status`、`intraday_gate_reason`（如 `5m_missing_fail_closed` / `intraday_buy_scale_missing_fail_closed` / `intraday_5m_pending_publication` / `intraday_5m_not_enabled` / `intraday_5m_gate_not_engaged`）、`intraday_buy_scale_applied`；票据另带 `intraday_5m_status`、`intraday_5m_enabled` 与汇总块 `intraday_gate`。
+
+### 35.6 影响面（哪些买入量会变）
+
+- `enable_intraday_5m` 关闭（当前 `strategies_config.json` 中**无任何策略开启**）⇒ `not_applicable`，买入量与改前**逐字节一致**；
+- 开启且 5m 实测正常 ⇒ `evaluated`，与改前一致（含分布预警时的 `0.50`）；
+- 开启但 5m `missing` / 陈旧 / provider 不支持 / 特征未测得 ⇒ **新开与加仓买入量降为 0**（改前是照常开仓，或更早以前是砍半）—— 这是本条**唯一**会改变下单量的路径；卖单、减仓、现金腿与 T+1 / 冷却 / 惯性闸门路径**未改一行**；
+- 15:30–20:00 的 `pending_publication` ⇒ 与改前一致（不冻结）。
+- 扫描/评审点：`apply_intraday_distribution_gate` 的缩放公式、`apply_market_value_cap`、购买力 rescale 均未改动。
+
+### 35.7 测试状态（100% 离线，全离线合成输入）
+
+- 新增 `pipeline/tests/test_intraday_5m_gate_three_state.py`（**17 例**）：①开关关闭 ⇒ `not_applicable` / `1.0` / 返回同一对象（bit-identical）；②开启 + 5 种 `missing` 族状态 ⇒ `unknown_fail_closed` / `0.0` / 买入落在 `current` / 卖单与现金腿不动；③开启 + `pending_publication` ⇒ 不冻结（默认 `1.0`，有实测则用实测）；④开启 + `evaluated` + 实测 `0.50` ⇒ 与改前公式逐值相同；⑤键缺失且无法判定 ⇒ 显式 `0.0`（不是 `0.50`）+ 断言 `[WARN/INTRADAY GATE]` 出现；⑥静态契约：AST 层面确认模块内**不存在** `.get("intraday_buy_scale", <默认>)`，解析者唯一、两处共用；⑦票据与 `summary.json` 三个显式字段齐备；⑧`NaN`/`inf` 的「实测值」不算测量 ⇒ 走 fail-closed，绝不污染权重向量。
+- **反向验证（真实做过）**：临时删掉 `missing ⇒ 0.0` 判据（改为回退 `0.50`），上述用例 2（5 个参数化分支）与「不得发明 0.50」用例**全部转红**（6 failed / 11 passed）；恢复后 17 passed。
+- 回归（实跑，原文见回报）：`pipeline/tests/test_intraday_5m_gate_three_state.py` + `pipeline/tests/test_live_weight_budget_and_buy_stdout_parity.py` + `pipeline/tests/test_portfolio_vol_overlay.py` = **63 passed**；`pipeline/tests -k "intraday or gate or buy"` = **219 passed, 1080 deselected**；`test_vol_overlay_attribution.py` / `test_advisory_wiring.py` / `test_nav_source_parity.py` / `common/tests/test_live_strategy.py` = **75 passed**；`pipeline/tests` 全量 = **1298 passed, 1 skipped**（0 failed）。另核对 `pipeline/research_strategy/strategies_config.json` 中 `enable_intraday_5m` 出现次数为 **0**，即本次改动对当前在跑策略的下单量影响面为空。
+- 为适配本次调用签名，**只改断言口径不改被测行为**：`pipeline/tests/test_vol_overlay_attribution.py` 的源码契约改为断言门禁调用仍收到 `health_report` / `account_state` 并新增 `gate_state=intraday_gate_state`。
+
+### 35.8 边界
+
+本条为**执行层变更**：未改任何策略类 / 模板、未改 `blend_base.py`、**未 bump `version` 与 `BASE_VERSION`**、未跑 `--dump-strategies`、未联网、未写 `runs/`。

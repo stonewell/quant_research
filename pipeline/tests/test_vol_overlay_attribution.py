@@ -236,10 +236,13 @@ def test_pre_gate_equity_sum_is_captured_before_the_distribution_gate():
     capture = source.index("_pre_distribution_gate_equity_sum = float(")
     gate_call = source.index("target_series = apply_intraday_distribution_gate(")
     assert capture < gate_call
-    # the gate's own scaling logic is not touched: the call keeps its original signature
-    assert "health_report=health_report,\n        account_state=account_state,\n    )" in source[
-        gate_call:gate_call + 400
-    ]
+    # the gate's own scaling logic is not touched: the call still receives BOTH
+    # archives (and, since the 5m three-state fix, the ONE resolved gate state so
+    # the applied scale and the reported scale can never diverge).
+    window = source[gate_call:gate_call + 800]
+    assert "health_report=health_report," in window
+    assert "account_state=account_state," in window
+    assert "gate_state=intraday_gate_state," in window
 
 
 def test_ticket_feeds_post_lifecycle_into_the_delivery_evaluation_and_archives_attribution():

@@ -2356,32 +2356,283 @@ def resolve_holdings_weights_and_shares(
     return weights_dict, shares_dict, total_equity_val, cash_val
 
 
+# --------------------------------------------------------------------------- #
+# (defect A/B, 2026-11-12) 5m GATE THREE-STATE RESOLUTION -- the SINGLE owner
+# --------------------------------------------------------------------------- #
+# FORENSIC CONTEXT (why the old code was wrong):
+#   Both old read sites resolved the buy scale as
+#       float(health_report.get("intraday_buy_scale",
+#                               account_state.get("intraday_buy_scale", 0.50)))
+#   i.e. a MISSING key -- "this run never measured anything" -- silently became
+#   `0.50`, "halve the buys". That is the exact opposite of this repo's standing
+#   discipline ("missing != evaluated": Stage-1's own SKIPPED branch writes
+#   `intraday_buy_scale = 1.0` + `distribution_gate_status = "SKIPPED"` rather
+#   than fabricating a scale). It also left the `R7` half of the freeze contract
+#   unimplemented: a `missing` 5m layer only PRINTED a warning
+#   (`summarize_intraday_5m_loading`) and never entered the decision, so a run
+#   with no 5m data still opened new positions.
+#
+# FOUR STATUS LABELS, THREE SCALE OUTCOMES (1.0 / 0.0 / measured) -- and no
+# `0.50` anywhere:
+#   * `not_applicable`          -- the strategy does not engage the 5m gate
+#                                  (`enable_intraday_5m` off / no 5m metrics /
+#                                  no CAUTION_INTRADAY_DISTRIBUTION directive)
+#                                  => scale 1.0, buy increments bit-identical;
+#   * `unknown_fail_closed`     -- 5m IS engaged but nothing usable was measured
+#                                  (status `missing` / stale / unsupported /
+#                                  unmeasured, or a measured status with no
+#                                  scale key) => scale 0.0, new buys and adds are
+#                                  frozen at the current weight, SELLS untouched;
+#   * `evaluated`               -- a real measurement exists => use it verbatim;
+#   * `pending_publication`     -- the day's 5m bars are not published yet
+#                                  (BaoStock: usually after ~20:00). This is the
+#                                  NORMAL state of a 15:30-20:00 pre-open run, so
+#                                  it must NOT freeze: scale = the measured value
+#                                  if present, else 1.0 (allow).
+INTRADAY_GATE_NOT_APPLICABLE = "not_applicable"
+INTRADAY_GATE_UNKNOWN_FAIL_CLOSED = "unknown_fail_closed"
+INTRADAY_GATE_EVALUATED = "evaluated"
+INTRADAY_GATE_PENDING_PUBLICATION = "pending_publication"
+
+#: Reason codes (stable, grep-able; the exact Stage-1 status travels beside them
+#: in `intraday_5m_status` so the token never has to encode every variant).
+INTRADAY_GATE_REASON_NOT_ENABLED = "intraday_5m_not_enabled"
+INTRADAY_GATE_REASON_NOT_ENGAGED = "intraday_5m_gate_not_engaged"
+INTRADAY_GATE_REASON_5M_MISSING = "5m_missing_fail_closed"
+INTRADAY_GATE_REASON_SCALE_MISSING = "intraday_buy_scale_missing_fail_closed"
+INTRADAY_GATE_REASON_PENDING = "intraday_5m_pending_publication"
+
+#: Stage-1 `intraday_5m_metrics.status` / `publication_state` values that mean
+#: "something WAS measured / published" -- the only ones allowed to keep a
+#: non-zero buy scale. `pending_publication` has its own (non-freezing) branch;
+#: every OTHER token is treated as "not measured" and freezes (`R7`).
+_5M_MEASURED_STATUSES = frozenset({"evaluated", "available"})
+_5M_PENDING_STATUSES = frozenset({"pending_publication"})
+
+
+def _resolve_5m_status_token(metrics: Dict[str, Any]) -> Optional[str]:
+    """The 5m measurement axis of the Stage-1 report, in priority order.
+
+    `status` is `classify_intraday_5m_status`'s verdict (the owner of the
+    `degraded_*` vocabulary); `publication_state` is the publication axis that
+    `assess_intraday_5m_publication_state` merged in beside it. Both are read
+    here rather than re-derived, so this function never invents a status.
+    """
+    for key in ("status", "publication_state"):
+        token = metrics.get(key)
+        if isinstance(token, str) and token.strip():
+            return token.strip()
+    return None
+
+
+def resolve_intraday_gate_state(
+    health_report: Optional[Dict[str, Any]] = None,
+    account_state: Optional[Dict[str, Any]] = None,
+    *,
+    intraday_5m_enabled: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Resolve the 5m gate into ONE of three states and ONE applied buy scale.
+
+    This is the ONLY place the buy scale is decided; `apply_intraday_distribution_gate`
+    and the advisory/provenance read site both consume its output, so the two can
+    never disagree again (they used to re-implement the same fallback chain).
+
+    `intraday_5m_enabled` is the caller's already-resolved switch
+    (`main()`: `args.enable_intraday_5m` or `resolve_blend_param(params,
+    "enable_intraday_5m", ...)`, i.e. the SAME resolution that decides whether the
+    5m layer is loaded). When omitted, the report itself is consulted
+    (`intraday_5m_metrics.requested` / presence of the block).
+
+    Never returns 0.50: a missing measurement is `0.0` (fail-closed), an unused
+    gate is `1.0`, and only a real measurement can produce anything else. Pure:
+    no I/O, no mutation of either dict.
+    """
+    health_report = health_report or {}
+    account_state = account_state or {}
+    metrics = health_report.get("intraday_5m_metrics") or {}
+    if not isinstance(metrics, dict):
+        metrics = {}
+
+    status_5m = _resolve_5m_status_token(metrics)
+    gate_code = health_report.get("gate_code") or account_state.get("gate_code")
+    gate_fired = gate_code == "CAUTION_INTRADAY_DISTRIBUTION"
+
+    if intraday_5m_enabled is not None:
+        enabled: Optional[bool] = bool(intraday_5m_enabled)
+        enabled_source = "effective_params.enable_intraday_5m"
+    elif "requested" in metrics:
+        enabled = bool(metrics.get("requested"))
+        enabled_source = "intraday_5m_metrics.requested"
+    elif metrics:
+        enabled = True
+        enabled_source = "intraday_5m_metrics.present"
+    else:
+        enabled = None
+        enabled_source = "unresolved"
+
+    measured = health_report.get("intraday_buy_scale")
+    if measured is None:
+        measured = account_state.get("intraday_buy_scale")
+    measured_scale: Optional[float] = None
+    if measured is not None:
+        try:
+            candidate = float(measured)
+        except (TypeError, ValueError):
+            candidate = None
+        # A non-finite "measurement" is not a measurement: never let `NaN`/`inf`
+        # reach the weight vector (the old inline `float(...)` would have).
+        if candidate is not None and bool(np.isfinite(candidate)):
+            measured_scale = candidate
+
+    def _state(
+        gate_status: str,
+        scale: float,
+        reason: Optional[str],
+    ) -> Dict[str, Any]:
+        return {
+            "intraday_gate_status": gate_status,
+            "intraday_gate_reason": reason,
+            "intraday_buy_scale_applied": float(scale),
+            "intraday_5m_status": status_5m,
+            "intraday_5m_enabled": enabled,
+            "intraday_5m_enabled_source": enabled_source,
+            "gate_code": gate_code,
+        }
+
+    # 1. Switch OFF => the 5m gate is not part of this run: apply nothing.
+    if enabled is False:
+        return _state(
+            INTRADAY_GATE_NOT_APPLICABLE, 1.0, INTRADAY_GATE_REASON_NOT_ENABLED
+        )
+
+    # 2. Nothing engages the 5m gate at all (no switch, no metrics block, no
+    #    CAUTION_INTRADAY_DISTRIBUTION directive): also "apply nothing". This is
+    #    the pre-existing behaviour for every non-5m strategy and MUST stay
+    #    bit-identical.
+    if not (enabled is True or gate_fired or bool(metrics)):
+        return _state(
+            INTRADAY_GATE_NOT_APPLICABLE, 1.0, INTRADAY_GATE_REASON_NOT_ENGAGED
+        )
+
+    # 3. Not published yet (typically a 15:30-20:00 run): DO NOT freeze. A
+    #    measured scale (if Stage-1 somehow had one) is still honoured; otherwise
+    #    the allow value is 1.0 -- never 0.50 and never 0.0.
+    if status_5m in _5M_PENDING_STATUSES:
+        return _state(
+            INTRADAY_GATE_PENDING_PUBLICATION,
+            measured_scale if measured_scale is not None else 1.0,
+            INTRADAY_GATE_REASON_PENDING,
+        )
+
+    # 4. Measured (or no status token at all, which is only acceptable when a
+    #    real scale was written): use the measurement verbatim.
+    if status_5m is None or status_5m in _5M_MEASURED_STATUSES:
+        if measured_scale is not None:
+            return _state(INTRADAY_GATE_EVALUATED, measured_scale, None)
+        # Engaged, no status token, no scale: nothing was measured, so nothing
+        # can be claimed. Fail closed instead of silently halving.
+        return _state(
+            INTRADAY_GATE_UNKNOWN_FAIL_CLOSED, 0.0, INTRADAY_GATE_REASON_SCALE_MISSING
+        )
+
+    # 5. Any other Stage-1 token (`provider_unsupported`,
+    #    `degraded_stale_intraday_cache`, `degraded_unmeasured_features`,
+    #    `missing`, ...) means the 5m layer delivered nothing usable.
+    return _state(
+        INTRADAY_GATE_UNKNOWN_FAIL_CLOSED, 0.0, INTRADAY_GATE_REASON_5M_MISSING
+    )
+
+
+def format_intraday_gate_line(state: Dict[str, Any]) -> str:
+    """One grep-able line stating WHICH of the states this run is in.
+
+    `[WARN/INTRADAY GATE]` is reserved for the two "nothing measured" verdicts
+    (fail-closed, and the undeterminable variant) because those are the ones an
+    operator must act on; the two benign states print `[INFO/INTRADAY GATE]`.
+    Both share the `INTRADAY GATE` token so one `grep` finds every run.
+    """
+    status = str(state.get("intraday_gate_status") or "?")
+    level = "WARN" if status == INTRADAY_GATE_UNKNOWN_FAIL_CLOSED else "INFO"
+    scale = float(state.get("intraday_buy_scale_applied") or 0.0)
+    if status == INTRADAY_GATE_NOT_APPLICABLE:
+        effect = "买入增量不缩放（bit-identical），未启用/未进入 5m 门禁"
+    elif status == INTRADAY_GATE_UNKNOWN_FAIL_CLOSED:
+        effect = "买入增量冻结为 0（不新开/不加仓）；卖单与减仓路径不变"
+    elif status == INTRADAY_GATE_PENDING_PUBLICATION:
+        effect = "5m 当日未发布属正常（通常 20:00 后可用），不冻结交易"
+    else:
+        effect = "按实测值缩放买入增量；卖单与现金不动"
+    return (
+        f"[{level}/INTRADAY GATE] status={status} "
+        f"reason={state.get('intraday_gate_reason') or '-'} "
+        f"intraday_5m_status={state.get('intraday_5m_status') or '-'} "
+        f"5m_enabled={state.get('intraday_5m_enabled')} "
+        f"buy_scale={scale:.2f} -> {effect}"
+    )
+
+
 def apply_intraday_distribution_gate(
     target_series: pd.Series,
     current_series: pd.Series,
     cash_proxy: str,
     health_report: Optional[Dict[str, Any]] = None,
     account_state: Optional[Dict[str, Any]] = None,
+    *,
+    intraday_5m_enabled: Optional[bool] = None,
+    gate_state: Optional[Dict[str, Any]] = None,
 ) -> pd.Series:
     """Applies Stage 1 intraday distribution gating to target weights.
 
     When gate_code is 'CAUTION_INTRADAY_DISTRIBUTION', all Phase 1 sell orders remain
     100% untouched, but buy increments (target > current) for non-cash assets are scaled down
-    by intraday_buy_scale (default 0.50). The unallocated weight automatically sweeps into cash.
+    by the scale `resolve_intraday_gate_state` resolved (0.0 on a fail-closed 5m
+    `missing`, 0.50 on a measured distribution alert, ...). The unallocated weight
+    automatically sweeps into cash.
+
+    (`R7` defect B) A 5m layer that is ENGAGED but delivered nothing usable
+    (`unknown_fail_closed`) freezes new buys even when the directive is absent:
+    the freeze is exactly `scale = 0.0`, so every `target > current` leg lands on
+    `current` and every `target <= current` leg is never touched -- SELLS and
+    trims must never be blocked by missing intraday data.
+
+    Every path whose scale is `1.0` (not applicable / pending publication /
+    measured-but-not-scaling) returns the caller's own object (identity), so the
+    vector -- and every downstream order -- stays byte-identical.
     """
     health_report = health_report or {}
     account_state = account_state or {}
-    gate_code = health_report.get("gate_code") or account_state.get("gate_code")
-    if gate_code != "CAUTION_INTRADAY_DISTRIBUTION":
-        return target_series
+    if gate_state is None:
+        gate_state = resolve_intraday_gate_state(
+            health_report, account_state, intraday_5m_enabled=intraday_5m_enabled
+        )
+        # Only when it resolved on its own; `main()` resolves once and prints there,
+        # so a run never emits the line twice.
+        print(format_intraday_gate_line(gate_state))
 
-    intraday_buy_scale = float(
-        health_report.get("intraday_buy_scale", account_state.get("intraday_buy_scale", 0.50))
-    )
-    print("\n" + "!" * 110)
-    print(f"[INTRADAY DISTRIBUTION ALERT / 日内冲高派发预警] 检测到 Stage 1 门禁指令: CAUTION_INTRADAY_DISTRIBUTION")
-    print(f"根据实盘风控守则，所有 Phase 1 卖单正常执行，新开/加仓风险资产的目标买入增量压缩至: {intraday_buy_scale:.1%}")
-    print("!" * 110 + "\n")
+    gate_code = health_report.get("gate_code") or account_state.get("gate_code")
+    gate_status = gate_state.get("intraday_gate_status")
+    intraday_buy_scale = float(gate_state.get("intraday_buy_scale_applied") or 0.0)
+
+    if gate_status == INTRADAY_GATE_UNKNOWN_FAIL_CLOSED:
+        print("\n" + "!" * 110)
+        print(
+            "[INTRADAY GATE FREEZE / 5m 缺失冻结新开仓] "
+            f"status={gate_status} reason={gate_state.get('intraday_gate_reason')} "
+            f"intraday_5m_status={gate_state.get('intraday_5m_status')}"
+        )
+        print("5m 日内层未测得（不是『测得为中性』）：新开/加仓增量置 0，卖单与减仓正常执行；"
+              "未测量的状态不得被当成 0.50 缩放，也不得凭空放行。")
+        print("!" * 110 + "\n")
+    elif gate_code != "CAUTION_INTRADAY_DISTRIBUTION":
+        return target_series
+    elif intraday_buy_scale >= 1.0:
+        # Nothing instructed: hand back the SAME object so the vector is untouched.
+        return target_series
+    else:
+        print("\n" + "!" * 110)
+        print(f"[INTRADAY DISTRIBUTION ALERT / 日内冲高派发预警] 检测到 Stage 1 门禁指令: CAUTION_INTRADAY_DISTRIBUTION")
+        print(f"根据实盘风控守则，所有 Phase 1 卖单正常执行，新开/加仓风险资产的目标买入增量压缩至: {intraday_buy_scale:.1%}")
+        print("!" * 110 + "\n")
 
     scaled_target = target_series.copy()
     for s in scaled_target.index:
@@ -2894,7 +3145,10 @@ VOL_CEILING_FORCE_EXIT_REASON = "ceiling_enforced_pending_exit"
 #: archived 2026-11-09 row (`000157.SZ`, HOLD_FILTERED / EXIT_CONFIRMING) is eligible through
 #: the SECOND tuple -- reading only the state values would silently make the measured defect
 #: unfixable.
-VOL_CEILING_FORCE_EXIT_STATES: Tuple[str, ...] = (PositionState.PENDING_EXIT.value,)
+VOL_CEILING_FORCE_EXIT_STATES: Tuple[str, ...] = (
+    PositionState.PENDING_EXIT.value,
+    "EXIT_CONFIRMING",
+)
 VOL_CEILING_FORCE_EXIT_BLOCKING_REASONS: Tuple[str, ...] = (
     BlockingReason.EXIT_CONFIRMING.value,
 )
@@ -5286,27 +5540,56 @@ def main(cli_args: Optional[List[str]] = None):
             if cash_proxy is None or str(s) != str(cash_proxy)
         )
     )
+    # (defect A, 2026-11-12) ONE resolution for the whole run: the gate below and the
+    # provenance/advisory read site further down both consume THIS dict, so the scale
+    # that was applied and the scale that is reported can never diverge again (they used
+    # to re-implement the same `health_report -> account_state -> 0.50` fallback chain in
+    # two places). `enable_intraday_5m` is the switch resolved at the top of `main()`
+    # (CLI flag or the strategy's own param) -- the SAME resolution that decided whether
+    # the 5m layer was loaded, never a second predicate.
+    intraday_gate_state = resolve_intraday_gate_state(
+        health_report,
+        account_state,
+        intraday_5m_enabled=enable_intraday_5m,
+    )
+    print(format_intraday_gate_line(intraday_gate_state))
+    # (defect A/B, 2026-11-12) The SAME three fields land in summary.json, so a consumer
+    # that never opens the ticket can still tell WHICH state this run was in and what
+    # scale was applied. A merge into the existing summary (never an overwrite).
+    persist_run_metadata(
+        args.output_dir,
+        clock_ctx,
+        freshness_summary=freshness_summary,
+        probe_attempts=probe_attempts,
+        extra={
+            "intraday_gate_status": intraday_gate_state["intraday_gate_status"],
+            "intraday_gate_reason": intraday_gate_state["intraday_gate_reason"],
+            "intraday_buy_scale_applied": intraday_gate_state["intraday_buy_scale_applied"],
+            "intraday_5m_status": intraday_gate_state["intraday_5m_status"],
+            "intraday_5m_enabled": intraday_gate_state["intraday_5m_enabled"],
+        },
+    )
     target_series = apply_intraday_distribution_gate(
         target_series,
         current_series,
         cash_proxy,
         health_report=health_report,
         account_state=account_state,
+        intraday_5m_enabled=enable_intraday_5m,
+        gate_state=intraday_gate_state,
     )
 
     # (`AT7` P2) SHADOW line, computed NEXT TO the real gate and read by it never.
     # `r1_adv` is `None` when Stage-1 could not measure the intraday drawdown; in
     # that case no shadow number is invented (see `compute_r1_advisory`).
     r1_adv = compute_r1_advisory(health_report)
-    # The REAL buy-side scale: the SAME fallback chain `apply_intraday_distribution_gate`
-    # resolves inline (`health_report` -> `account_state` -> 0.50 default). Re-resolved
-    # here rather than refactored out of the gate ON PURPOSE -- P2 is write-only, so the
-    # sizing function above must stay byte-identical, and one extra read of two dicts
-    # cannot change an order. (Stage-1 only ever writes 0.50 on a positive distribution
-    # detection and mirrors 1.0 otherwise, so this value equals the scale the gate
-    # actually applies whenever the gate fires.)
+    # The REAL buy-side scale: the scale the gate above ACTUALLY applied to this run's
+    # buy increments, read straight out of the ONE resolved state. (defect A, 2026-11-12:
+    # this used to re-resolve the same `health_report -> account_state -> 0.50` chain
+    # inline, which is how "never measured" became "halve the buys"; the 0.50 default is
+    # gone and there is no second copy of the logic.)
     real_intraday_buy_scale = float(
-        health_report.get("intraday_buy_scale", account_state.get("intraday_buy_scale", 0.50))
+        intraday_gate_state["intraday_buy_scale_applied"]
     )
     # (`AT7` P3) SCOPE OF `intraday_buy_scale`: it is Stage-1's *intraday
     # distribution* brake and NOTHING else. `R4` (cross-sectional dispersion /
@@ -7009,6 +7292,22 @@ def main(cli_args: Optional[List[str]] = None):
     ticket_payload["weight_budget_ok"] = bool(weight_budget.get("budget_ok", True))
     ticket_payload["rounding_rebalanced"] = bool(weight_budget.get("rounding_rebalanced"))
     ticket_payload["mv_cap_breaches"] = mv_cap_breaches
+    # (defect A/B, 2026-11-12) The 5m gate's three-state verdict, at the ticket's TOP
+    # level next to the other book-level verdicts:
+    #   * `intraday_gate_status`       -- `not_applicable` / `evaluated` /
+    #                                     `pending_publication` / `unknown_fail_closed`;
+    #   * `intraday_gate_reason`       -- the stable reason code (e.g.
+    #                                     `5m_missing_fail_closed`); `None` when evaluated;
+    #   * `intraday_buy_scale_applied` -- the multiplier ACTUALLY applied to buy
+    #                                     increments (1.0 = untouched, 0.0 = new buys frozen).
+    # `intraday_5m_status` / `intraday_5m_enabled` travel beside them so the exact Stage-1
+    # token and the resolved switch are auditable without re-reading the Stage-1 archive.
+    ticket_payload["intraday_gate_status"] = intraday_gate_state["intraday_gate_status"]
+    ticket_payload["intraday_gate_reason"] = intraday_gate_state["intraday_gate_reason"]
+    ticket_payload["intraday_buy_scale_applied"] = intraday_gate_state[
+        "intraday_buy_scale_applied"
+    ]
+    ticket_payload["intraday_gate"] = dict(intraday_gate_state)
     # (LV18, 2026-11-12) Stage-1 Barroso ceiling, archived next to the other book-level
     # verdicts. Present ONLY for the allowlisted strategy with the overlay enabled -- every
     # other strategy's ticket is byte-identical to before this change.
