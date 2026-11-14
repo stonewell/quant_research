@@ -867,6 +867,31 @@ class StrategyConfig:
     enable_5m_stop_filter: Optional[bool] = None
     intraday_cutoff_time: Optional[str] = None
 
+    # Which data provider serves the 5m BARS, independent of the run-level
+    # `--data-provider` (which still owns every DAILY bar). Resolved through the same
+    # chain the live scripts use for `enable_intraday_5m`
+    # (`<prefix>_intraday_5m_provider` -> `blend_intraday_5m_provider` ->
+    # `intraday_5m_provider`), and used to build a SECOND provider instance that is
+    # passed ONLY to `load_intraday_5m_universe`.
+    #
+    # WHY a separate knob exists (2026-11-13): the live strategy's 5m coverage is not
+    # uniform across providers. Measured on the live cache, the 20 traded EQUITIES hold
+    # 5m bars only under `BaoStockDataProvider` (2,256 rows each), while the 7 INDICES
+    # hold 5m bars only under `FuyaoDataProvider` / `EastMoneyDataProvider` (BaoStock
+    # refuses index intraday queries outright). A run-level `--data-provider` therefore
+    # cannot be right for both halves. Pinning `baostock` here makes the equities come
+    # from BaoStock's own cache rows (no fallback) and lets the indices arrive through
+    # the recorded Fuyao fallback -- instead of relying on that fallback chain by
+    # accident (see `_INTRADAY_5M_FALLBACK_PROVIDERS` in `common/intraday_features.py`
+    # for the dead-spelling defect that had to be fixed for the indices to survive).
+    #
+    # `None` (default) keeps today's behaviour EXACTLY: derive the 5m provider from the
+    # run-level provider and let the loader's fallback chain decide per symbol. Short
+    # station names (`baostock`, `fuyao`, ...) are the canonical spellings accepted by
+    # `common.data.get_data_provider`; a class name is accepted too (the loader
+    # canonicalises both when it builds cache keys).
+    intraday_5m_provider: Optional[str] = None
+
     # --- Price Action Breakout & Retest Strategy (docs/chan_similar_trading.md Strategy 1) ---
     pabr_box_window: int = 20                # consolidation box length (~4 weeks)
     pabr_max_box_range_pct: float = 0.15     # max box range (high - low) / low

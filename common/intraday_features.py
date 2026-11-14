@@ -854,12 +854,30 @@ def _intraday_5m_cache_candidates(cache_dir: Optional[str]) -> List[str]:
 _INTRADAY_5M_FALLBACK_PROVIDERS: Tuple[str, ...] = (
     "BaoStockDataProvider",
     "EastMoneyDataProvider",
-    "fuyao",
+    "FuyaoDataProvider",
 )
 """Last-resort provider keys, used ONLY when the caller's provider has no cached 5m rows.
 
 Order preserved from the pre-2026-11-11 behaviour so a caller that passes no provider at
 all (research/backtest paths) keeps the historical result bit-for-bit.
+
+(2026-11-13 defect, dead fallback entry) The Fuyao entry used to be spelled `"fuyao"`, the
+SHORT station name -- while every cache writer stamps `type(inner_provider).__name__`
+(`FuyaoDataProvider`, see `common/data.py` / `DuckDBCache.store_intraday_bars`) and
+`DuckDBCache.query_intraday_bars` is EXACT-match on that key. Measured on the live cache:
+the 7 indices are stored under `"FuyaoDataProvider"` (1,728 rows/symbol) and `"EastMoneyDataProvider"`
+(1,728), while the keys `"fuyao"` / `"baostock"` / `"eastmoney"` hold 0 rows each -- so this
+entry queried nothing and that half of the fallback chain was DEAD. Consequence once the
+live strategy pins its 5m provider to BaoStock: BaoStock carries the 21 equity-side symbols
+(2,256 rows each) but NO index at all (it refuses index intraday queries), and the indices
+exist only under Fuyao/EastMoney -- so the 7 indices' 5m silently vanished (28 -> 21 symbols
+with 5m, only a WARNING).
+
+Fix: this tuple now spells every provider the way the WRITERS store it, and
+`_intraday_5m_provider_order` additionally queues the short-name spelling of each canonical
+provider (see `_intraday_5m_provider_spellings`) so a cache written under either form is
+reachable. Equivalence itself is still owned by `canonicalize_provider_key`; nothing here
+re-implements it.
 """
 
 _INTRADAY_5M_PROVIDER_CLASS_NAMES: Dict[str, str] = {
@@ -956,22 +974,57 @@ def _intraday_5m_provider_plan(data_provider: Any) -> Tuple[List[str], Optional[
     return keys, class_name
 
 
+def _intraday_5m_provider_spellings(name: Any) -> List[str]:
+    """Every EXACT cache key form under which `name`'s rows may have been written.
+
+    `DuckDBCache.query_intraday_bars` matches `provider = ?` exactly (deliberately -- an
+    auto-resolving read path would launder a genuine typo into a successful read, see
+    `DuckDBCache.resolve_provider_key`), so a fallback entry naming only ONE spelling
+    silently queries zero rows for the other. Writers stamp the class name
+    (`FuyaoDataProvider`); settings / CLI / strategy params speak the short station name
+    (`fuyao`). Both are queued, WRITER-STORED CLASS NAME FIRST, because that is the form
+    every writer produces and therefore the one that actually returns rows.
+
+    The `fuyao` == `FuyaoDataProvider` equivalence comes from `canonicalize_provider_key`
+    (`_intraday_5m_canonical_provider`) plus `_INTRADAY_5M_PROVIDER_CLASS_NAMES`; this
+    helper only expands a canonical name back into its known spellings.
+    """
+    raw = str(name).strip()
+    if not raw:
+        return []
+    canon = _intraday_5m_canonical_provider(raw)
+    spellings: List[str] = []
+    for cand in (_INTRADAY_5M_PROVIDER_CLASS_NAMES.get(canon), raw, canon):
+        if cand and cand not in spellings:
+            spellings.append(cand)
+    return spellings
+
+
 def _intraday_5m_provider_order(
     preferred_keys: List[str],
 ) -> List[str]:
     """Preferred cache keys first, then the historical fallback list minus duplicates.
 
-    Duplicates are removed by CANONICAL name so a preferred `FuyaoDataProvider` never
-    re-queries the same rows as the fallback entry `fuyao`.
+    The caller's own provider is queued ONLY under `preferred_keys` (one group skipped
+    wholesale when its canonical form is already covered) so its rows are never queried
+    twice under two spellings. Each remaining fallback entry is expanded to every spelling
+    its rows may have been written with (`_intraday_5m_provider_spellings`), de-duplicated
+    on the EXACT key -- dedup on the canonical name alone is what made the Fuyao entry
+    unusable before 2026-11-13 (the short spelling won the group and matched no rows).
     """
-    seen: Set[str] = {_intraday_5m_canonical_provider(k) for k in preferred_keys}
+    seen_canon: Set[str] = {_intraday_5m_canonical_provider(k) for k in preferred_keys}
     order: List[str] = list(preferred_keys)
+    seen_keys: Set[str] = set(order)
     for name in _INTRADAY_5M_FALLBACK_PROVIDERS:
         canon = _intraday_5m_canonical_provider(name)
-        if canon in seen:
+        if canon in seen_canon:
             continue
-        seen.add(canon)
-        order.append(name)
+        seen_canon.add(canon)
+        for spelling in _intraday_5m_provider_spellings(name):
+            if spelling in seen_keys:
+                continue
+            seen_keys.add(spelling)
+            order.append(spelling)
     return order
 
 

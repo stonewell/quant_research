@@ -192,7 +192,7 @@ def test_blend_strategies_versioning():
         GenericBlendStrategy,
     ]
     expected_versions = {
-        ChanFourStateBlendStrategy: "1.3.1",
+        ChanFourStateBlendStrategy: "1.4.0",
         ChanRiskManagedBlendStrategy: "1.1.1",
         ChanCrisisShieldBlendStrategy: "1.0.2",
         ChanFourStateShieldBlendStrategy: "1.0.1",

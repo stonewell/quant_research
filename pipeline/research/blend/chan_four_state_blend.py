@@ -64,7 +64,21 @@ class ChanFourStateBlendStrategy(BaseBlendAllocationStrategy):
     #   `force_exit_skipped`. Switch `cfsb_portfolio_vol_ceiling_force_exits` (default ON).
     #   Non-breaking: `blend_base.py` vol targeting / `evaluate_realized_volatility` untouched,
     #   so `BASE_VERSION` stays `2.0.0`. See docs/version.md §34.
-    version: str = "1.3.1"
+    # 1.3.1 -> 1.4.0 (2026-11-13, 5m provider pin): this strategy's 5m bars are now served by
+    #   an EXPLICIT provider instead of the run-level `--data-provider` fallback chain.
+    #   `strategies_config.json` gains `"intraday_5m_provider": "baostock"` (new
+    #   `StrategyConfig.intraday_5m_provider`, resolved `cfsb_*` -> `blend_*` -> bare, then
+    #   forwarded Stage 1 -> Stage 2 as `--intraday-5m-provider`). WHY: measured on the live
+    #   cache, the 20 traded EQUITIES carry 5m bars ONLY under `BaoStockDataProvider`
+    #   (2,256 rows each) -- `FuyaoDataProvider` / `EastMoneyDataProvider` hold 5m for the 7
+    #   INDICES only -- so the previous "derive it from the run-level provider" behaviour
+    #   depended on a fallback chain that had a DEAD entry (`fuyao` vs the stored
+    #   `FuyaoDataProvider`), which silently dropped the indices' 5m from a BaoStock-pinned
+    #   run. Purely a data-source selection change: no signal, sizing, ranking or risk logic
+    #   is touched, the daily provider is unchanged, and `None` (every other strategy)
+    #   reproduces the old behaviour bit-for-bit -- hence a MINOR bump, not a MAJOR one, and
+    #   `BASE_VERSION` stays `2.0.0` (`blend_base.py` untouched). See docs/version.md §40.
+    version: str = "1.4.0"
 
     def __init__(self, config: Optional[StrategyConfig] = None, version: Optional[str] = None):
         cfg = config or StrategyConfig()

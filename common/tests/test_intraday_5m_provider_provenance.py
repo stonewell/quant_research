@@ -343,3 +343,79 @@ def test_no_5m_data_at_all_is_stale(bad):
 
     assert result["stale"] is True
     assert result["reason"] == intraday_mod.INTRADAY_5M_FRESHNESS_NO_BARS
+
+
+# ---------------------------------------------------------------------------
+# 5. A BaoStock-PINNED caller must still reach the indices via the Fuyao fallback
+#    (2026-11-13 defect: the fallback entry for Fuyao was spelled `fuyao`, which no
+#    writer ever stores, so that half of the chain queried zero rows and the 7
+#    indices' 5m silently disappeared once the live strategy pinned `baostock`)
+# ---------------------------------------------------------------------------
+
+
+def test_baostock_pinned_caller_reaches_indices_through_the_fuyao_fallback(tmp_path, monkeypatch):
+    """One call, two symbols, two providers -- the measured live split.
+
+    BaoStock holds the equities' 5m (2,256 rows each) but NOT the indices' (it refuses
+    index intraday queries); the indices live under Fuyao. A `BaoStockDataProvider`-pinned
+    caller must therefore serve the equity from its OWN rows (no fallback bookkeeping at
+    all) and the index through the Fuyao fallback (fully recorded). Before the spelling fix
+    the index frame came back EMPTY.
+    """
+    db_path = _seed(tmp_path, "BaoStockDataProvider", "600000.SH", _session_frame(["2026-11-11"]))
+    cache = DuckDBCache(db_path)
+    cache.store_intraday_bars(
+        "FuyaoDataProvider",
+        "000300.SH",
+        _session_frame(["2026-11-11"], base=4000.0),
+        interval="5m",
+        adjustflag="qfq",
+    )
+    _patch_5m_cache(monkeypatch, db_path)
+
+    provider_cls = _stub_provider_class("BaoStockDataProvider")
+    out = intraday_mod.load_intraday_5m_universe(
+        ["600000.SH", "000300.SH"],
+        data_provider=provider_cls(),
+        parquet_dir=str(tmp_path / "no_parquet"),
+    )
+
+    equity = out["600000.SH"]
+    assert not equity.empty, "the equity must be served by the pinned provider's own rows"
+    assert equity.attrs["intraday_5m_provider"] == "BaoStockDataProvider"
+    # The pinned provider DID deliver this symbol -> no fallback may be recorded.
+    assert "fallback_from" not in equity.attrs
+    assert "fallback_to" not in equity.attrs
+    assert "fallback_reason" not in equity.attrs
+
+    index = out["000300.SH"]
+    assert not index.empty, (
+        "the index must survive a BaoStock pin: its 5m rows live under FuyaoDataProvider, "
+        "reachable only if the fallback list spells what the writers stored"
+    )
+    assert index.attrs["intraday_5m_provider"] == "FuyaoDataProvider"
+    assert index.attrs["fallback_from"] == "BaoStockDataProvider"
+    assert index.attrs["fallback_to"] == "FuyaoDataProvider"
+    assert index.attrs["fallback_reason"] == intraday_mod.FALLBACK_REASON_RETURNED_EMPTY
+
+
+def test_fallback_order_names_what_writers_store():
+    """Every fallback entry must resolve to a writer-stored key, and both spellings are queued.
+
+    `query_intraday_bars` is exact-match, so an entry spelled only as the short station name
+    (`fuyao`) can never return the rows writers stamp as `FuyaoDataProvider`.
+    """
+    order = intraday_mod._intraday_5m_provider_order([])
+    for stored in ("BaoStockDataProvider", "EastMoneyDataProvider", "FuyaoDataProvider"):
+        assert stored in order, f"{stored} missing from fallback order {order}"
+    # ... and the short spelling is still queued (a cache written under it stays reachable).
+    for short in ("baostock", "fuyao"):
+        assert short in order, f"{short} missing from fallback order {order}"
+
+    # The caller's own provider is queued ONCE (under its own keys, never re-queried under
+    # the other spelling of the same canonical provider).
+    pinned = intraday_mod._intraday_5m_provider_order(
+        intraday_mod._intraday_5m_provider_plan(_stub_provider_class("BaoStockDataProvider")())[0]
+    )
+    assert pinned[:2] == ["BaoStockDataProvider", "baostock"]
+    assert "FuyaoDataProvider" in pinned and "fuyao" in pinned
