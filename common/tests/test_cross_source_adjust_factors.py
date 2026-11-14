@@ -151,11 +151,42 @@ def test_cross_source_batch_is_refused_whole_not_partially():
     assert _stored(cache) == before
 
 
-def test_batch_outside_a_foreign_span_is_allowed():
-    """An append past a foreign SPAN is not a conflict (the everyday incremental-sync shape).
+def test_append_behind_a_foreign_span_is_allowed():
+    """A backfill BEHIND the frontier is not a conflict (the pre-dense-span prefix shape).
 
-    Without this, a symbol carrying an old BaoStock prefix would have its legitimate Fuyao
-    updates refused forever, which would freeze factor updates on every legacy-mixed symbol.
+    Nothing already stored gets replaced (no date overlap) and no incoming row can become the
+    latest row for the symbol, so this shape must keep working -- otherwise a legacy-mixed
+    symbol could never receive the BaoStock rows that are the only factors for its old bars.
+    """
+    cache = DuckDBCache(db_path=":memory:")
+    cache.store_adjust_factors(
+        "601398.SH",
+        _factors([1.654876, 1.600000], pd.to_datetime(["2024-01-02", "2024-01-03"])),
+        source=DENSE_SOURCE,
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cache.store_adjust_factors(
+            "601398.SH",
+            _factors([3.232896], pd.to_datetime(["2023-09-18"])),
+            source=SPARSE_SOURCE,
+        )
+    assert [w for w in caught if issubclass(w.category, CrossSourceAdjustFactorRefused)] == []
+    stored = _stored(cache, "601398.SH")
+    assert stored[datetime.date(2023, 9, 18)] == (pytest.approx(3.232896), SPARSE_SOURCE)
+    assert stored[datetime.date(2024, 1, 2)] == (pytest.approx(1.654876), DENSE_SOURCE)
+    # The frontier still belongs to the dense source, i.e. the anchor did not move.
+    assert cache.get_latest_factor_hfq("601398.SH") == pytest.approx(1.6)
+
+
+def test_source_switch_past_the_frontier_is_refused_and_named():
+    """BEHAVIOUR CHANGE (§37.5 residual (c), closed): a switch past the frontier needs the hatch.
+
+    A symbol whose only stored rows are a stale BaoStock prefix, then a first Fuyao batch dated
+    AFTER them. Nothing would be overwritten, but the Fuyao rows would take the anchor away from
+    BaoStock -- and by dates and values alone this is INDISTINGUISHABLE from the poison shape
+    below (Fuyao dense series, then a BaoStock event row). The gate therefore fails closed and
+    the audited `allow_cross_source=True` is what a real, verified source switch has to pass.
     """
     cache = DuckDBCache(db_path=":memory:")
     cache.store_adjust_factors(
@@ -163,17 +194,112 @@ def test_batch_outside_a_foreign_span_is_allowed():
         _factors([3.232896], pd.to_datetime(["2023-09-18"])),
         source=SPARSE_SOURCE,
     )
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
+    before = _stored(cache, "601398.SH")
+
+    with pytest.warns(CrossSourceAdjustFactorRefused) as record:
         cache.store_adjust_factors(
             "601398.SH",
             _factors([1.654876], pd.to_datetime(["2024-01-02"])),
             source=DENSE_SOURCE,
         )
-    assert [w for w in caught if issubclass(w.category, CrossSourceAdjustFactorRefused)] == []
+    warning = record[0].message
+    assert warning.rule == CrossSourceAdjustFactorRefused.RULE_FRONTIER_APPEND
+    assert _stored(cache, "601398.SH") == before
+
+    # The audited hatch writes it, which is the documented path for a verified basis switch.
+    cache.store_adjust_factors(
+        "601398.SH",
+        _factors([1.654876], pd.to_datetime(["2024-01-02"])),
+        source=DENSE_SOURCE,
+        allow_cross_source=True,
+    )
     stored = _stored(cache, "601398.SH")
     assert stored[datetime.date(2024, 1, 2)] == (pytest.approx(1.654876), DENSE_SOURCE)
     assert stored[datetime.date(2023, 9, 18)] == (pytest.approx(3.232896), SPARSE_SOURCE)
+
+
+# ---------------------------------------------------------------------------
+# (2b) source STRINGS are compared canonicalised (2026-11-13 review fix)
+# ---------------------------------------------------------------------------
+#
+# `_cross_source_conflict` used to compare raw strings (`r[0] != source`). Two spellings of the
+# SAME provider coexist in this repo: `common/data.py` stamps the class name
+# (`BaoStockDataProvider`) while `store_adjust_factors`'s own default is the short alias
+# (`baostock`). A caller relying on that default therefore had its legitimate update refused as
+# "cross-source" against rows it had itself written. These two tests pin BOTH halves of the
+# contract: aliases must be equal, and genuinely different providers must stay different.
+
+
+def test_source_alias_is_not_treated_as_a_foreign_source():
+    """`baostock` (the API default) must match stored `BaoStockDataProvider` -- no false refusal.
+
+    This is the regression: the default source never collided with a stored class name, so a
+    caller that simply omitted `source=` got `[REFUSED] cross-source` on every overlapping update
+    and its factors silently froze.
+    """
+    cache = DuckDBCache(db_path=":memory:")
+    cache.store_adjust_factors(
+        "600660.SH",
+        _factors([1.245211, 1.389485], pd.to_datetime(["2026-09-24", "2026-09-25"])),
+        source=SPARSE_SOURCE,  # class-name spelling, what the provider wrapper writes
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cache.store_adjust_factors(  # source= omitted on purpose: the documented default
+            "600660.SH", _factors([2.5], pd.to_datetime(["2026-09-24"]))
+        )
+    assert [w for w in caught if issubclass(w.category, CrossSourceAdjustFactorRefused)] == []
+
+    stored = _stored(cache)
+    assert stored[datetime.date(2026, 9, 24)][0] == pytest.approx(2.5)
+    assert stored[datetime.date(2026, 9, 25)][1] == SPARSE_SOURCE
+
+
+@pytest.mark.parametrize(
+    "incoming",
+    ["fuyao", "Fuyao", "FuyaoDataProvider"],
+)
+def test_different_providers_still_conflict_after_canonicalisation(incoming):
+    """Canonicalisation must NOT collapse two real providers: Fuyao vs BaoStock still refuses.
+
+    Deliberately parameterised over every Fuyao spelling -- if the alias mapping ever widened
+    into "any provider whose key is a prefix/suffix of another", this is the test that goes red,
+    and it is the only property the whole D9 write gate rests on.
+    """
+    cache = DuckDBCache(db_path=":memory:")
+    cache.store_adjust_factors(
+        "600660.SH",
+        _factors([73.117], pd.to_datetime(["2023-05-18"])),
+        source=SPARSE_SOURCE,
+    )
+    before = _stored(cache)
+
+    with pytest.warns(CrossSourceAdjustFactorRefused) as record:
+        cache.store_adjust_factors(
+            "600660.SH", _factors([1.245211], pd.to_datetime(["2023-05-18"])), source=incoming
+        )
+
+    warning = record[0].message
+    assert warning.incoming_source == incoming
+    assert warning.stored_source == SPARSE_SOURCE
+    assert _stored(cache) == before
+
+
+def test_canonicalize_provider_key_separates_the_two_incident_sources():
+    """The comparison key itself: aliases fold together, the D9 pair does not."""
+    from common.duckdb_cache import canonicalize_provider_key
+
+    assert canonicalize_provider_key("baostock") == canonicalize_provider_key(
+        "BaoStockDataProvider"
+    )
+    assert canonicalize_provider_key("fuyao") == canonicalize_provider_key("FuyaoDataProvider")
+    assert canonicalize_provider_key(SPARSE_SOURCE) != canonicalize_provider_key(DENSE_SOURCE)
+    # Unknown strings pass through (case-folded only) rather than being mutated into a wrong key.
+    assert canonicalize_provider_key("MarketDBDataProvider") == canonicalize_provider_key(
+        "marketdb"
+    )
+    assert canonicalize_provider_key("some_new_vendor") == "some_new_vendor"
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +537,294 @@ def test_read_guard_skips_the_judgement_when_no_factor_is_applied(monkeypatch):
     monkeypatch.setattr(cache, "query_adjust_factors", lambda *a, **k: fac)
     out = cache._apply_factors_to_df(_bars(dates), "600660.SZ", adjust_mode="hfq")
     np.testing.assert_allclose(out["Close"].to_numpy(), 52.0, rtol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# (6b) band BOUNDARIES: inclusive on both ends, and the known false positive
+# ---------------------------------------------------------------------------
+#
+# The 4.0x / 0.25x decision was previously only reachable via 62x and 1.3x samples, so nothing
+# pinned whether the band is `<` or `<=`. It is INCLUSIVE: `ratio > 4.0` / `ratio < 0.25` are the
+# failure predicates, i.e. a factor sitting exactly on the boundary is accepted. These tests are
+# the only place that decides it, so a future "tighten the band" edit has to change them openly.
+
+#: Five business days: one factor row per day, so every value below is a real as-of hit.
+_BAND_DATES = pd.bdate_range("2024-01-02", periods=5)
+
+
+def _band_factors(extreme: float):
+    """Five distinct factors whose MEDIAN is exactly 1.0, with `extreme` among them.
+
+    The median has to be exact, otherwise "exactly 4.0x the median" is not expressible. With an
+    odd count of DISTINCT values the median is one of them, so the list is built around 1.0:
+    the two shapes below are the ones that keep 1.0 in the middle slot for both directions.
+    """
+    if extreme > 1.0:
+        return [0.5, 0.9, 1.0, extreme, 1.1]
+    return [extreme, 0.5, 1.0, 1.1, 1.5]
+
+
+def _band_cache(extreme: float):
+    cache = DuckDBCache(db_path=":memory:")
+    factors = _band_factors(extreme)
+    cache.store_adjust_factors(
+        "600660.SH", _factors(factors, _BAND_DATES), source=DENSE_SOURCE
+    )
+    cache.store_bars(DENSE_SOURCE, "600660.SH", _bars(_BAND_DATES), adjustflag="raw")
+    return cache, factors
+
+
+@pytest.mark.parametrize("extreme", [4.0, 0.25], ids=["4.0x", "0.25x"])
+def test_band_boundary_values_are_accepted(extreme):
+    """INCLUSIVE: a factor at exactly 4.0x / 0.25x the applied median must NOT raise."""
+    cache, factors = _band_cache(extreme)
+
+    qfq = cache.query_bars(DENSE_SOURCE, "600660.SH", adjust="qfq")
+
+    # ...and it really was APPLIED to a price (a boundary test that skipped the extreme would
+    # pass for the wrong reason).
+    np.testing.assert_allclose(
+        qfq["Close"].to_numpy(), 52.0 * np.array(factors) / factors[-1], rtol=1e-12
+    )
+
+
+@pytest.mark.parametrize("extreme", [4.01, 0.24], ids=["4.01x", "0.24x"])
+def test_band_boundary_values_just_outside_are_rejected(extreme):
+    """EXCLUSIVE: 4.01x / 0.24x is outside and must fail closed with the offending value named."""
+    cache, factors = _band_cache(extreme)
+
+    with pytest.raises(ImplausibleAdjustFactorStep) as excinfo:
+        cache.query_bars(DENSE_SOURCE, "600660.SH", adjust="qfq")
+
+    err = excinfo.value
+    assert err.value == pytest.approx(extreme)
+    assert err.median == pytest.approx(1.0)
+    assert err.value / err.median == pytest.approx(extreme)
+
+
+#: A real 10-for-1 split: a single monotone ~10.5x step, i.e. exactly the shape a backward factor
+#: is SUPPOSED to contain. The band is calibrated to THIS cache (largest observed single step
+#: ~1.3x), so such a name is rejected.
+_SPLIT_FACTORS = [1.0, 1.02, 1.05, 10.5, 10.71, 10.92]
+
+
+def test_known_false_positive_a_real_10x_split_is_rejected():
+    """CHARACTERISATION TEST -- this is the KNOWN FALSE POSITIVE, not supported behaviour.
+
+    A genuine 10-for-1 split produces a monotone ~10.5x step, which the 4x band cannot tell apart
+    from a foreign normalisation basis (both are "orders of magnitude off the median"). The read
+    fails closed, which is the deliberate choice -- a wrong error beats a wrong price -- and the
+    remedy is an operator decision, not a silently widened band.
+
+    DO NOT "fix" this by widening `IMPLAUSIBLE_ADJUST_FACTOR_RATIO` in passing: widening the band
+    is a deliberate future change with its own evidence (it would also stop catching a
+    moderately-off foreign basis), and this test must then be rewritten ON PURPOSE. See
+    `docs/version.md` §37 residual (d).
+    """
+    cache = DuckDBCache(db_path=":memory:")
+    dates = pd.bdate_range("2024-01-02", periods=len(_SPLIT_FACTORS))
+    cache.store_adjust_factors(
+        "600660.SH", _factors(_SPLIT_FACTORS, dates), source=DENSE_SOURCE
+    )
+    cache.store_bars(DENSE_SOURCE, "600660.SH", _bars(dates), adjustflag="raw")
+
+    with pytest.raises(ImplausibleAdjustFactorStep) as excinfo:
+        cache.query_bars(DENSE_SOURCE, "600660.SH", adjust="qfq")
+
+    err = excinfo.value
+    assert err.median == pytest.approx((1.05 + 10.5) / 2)  # median of the 6 distinct values
+    assert err.value == pytest.approx(1.0)  # the small side is the offender here
+    assert err.value / err.median < 0.25
+
+
+# ---------------------------------------------------------------------------
+# (6c) FRONTIER-ANCHOR residual (c) -- REFUSED at the write gate since 2026-11-13
+# ---------------------------------------------------------------------------
+#
+# See docs/version.md §37.5 residual (c), closed by this section. The overlap rule alone let a
+# batch that continues a series OUTSIDE a foreign span through (deliberately: otherwise every
+# legacy-mixed symbol's incremental sync would be frozen forever). Such a batch overwrites
+# nothing, but because `get_latest_factor_hfq` picks the latest row by date ACROSS sources, the
+# appended foreign-basis row becomes the qfq divisor, i.e. it silently rescales the whole qfq
+# series by its own basis -- and if that ratio lands inside the read-side [0.25, 4.0]x band,
+# nothing else fires at all.
+#
+# The second rule refuses exactly that: a batch reaching PAST the symbol's latest stored row is
+# refused unless its own source owns that row. The read side is deliberately UNCHANGED, so the
+# last test here forces a row in with the audited escape hatch and shows the old consequence.
+
+#: Dense (Fuyao-basis) rows ending at D, then the foreign BaoStock row at the next session.
+_FRONTIER_DENSE_DATES = pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"])
+_FRONTIER_FOREIGN_DATE = pd.to_datetime(["2024-01-05"])
+
+#: The production shape of the 20 live symbols: a dense Fuyao series from 2024 and a BaoStock
+#: prefix ending in 2023. The Fuyao rows are written FIRST here because that is the state the
+#: cache is already in -- re-creating "prefix first, Fuyao second" would itself be the source
+#: switch that the frontier rule (correctly) refuses.
+_MIXED_PREFIX_DATES = pd.to_datetime(["1993-06-10", "2023-05-18"])
+_MIXED_PREFIX_FACTORS = [1.0, 73.117]
+_MIXED_DENSE_DATES = pd.bdate_range("2024-01-02", "2026-11-11")
+_MIXED_FUYAO_FACTOR = 1.389485
+
+
+def _legacy_mixed_symbol(cache, symbol="600660.SH"):
+    """600660-style state: dense Fuyao 2024-01-02..2026-11-11 + BaoStock prefix 1993..2023."""
+    cache.store_adjust_factors(
+        symbol,
+        _factors([_MIXED_FUYAO_FACTOR] * len(_MIXED_DENSE_DATES), _MIXED_DENSE_DATES),
+        source=DENSE_SOURCE,
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cache.store_adjust_factors(
+            symbol, _factors(_MIXED_PREFIX_FACTORS, _MIXED_PREFIX_DATES), source=SPARSE_SOURCE
+        )
+    # The fixture itself must be accepted (a backfill behind the frontier), or every test below
+    # would be measuring a different state than the one production has.
+    assert [w for w in caught if issubclass(w.category, CrossSourceAdjustFactorRefused)] == []
+
+
+def test_frontier_poison_is_refused_and_nothing_is_written():
+    """The exact live hazard: a BaoStock event row past Fuyao's dense range must NOT land.
+
+    Today's sync window (2026-11-03..11-12) lies outside Fuyao's covered interval, so the
+    overlap rule accepts it -- and the row (~58x the Fuyao scale) would then be the LATEST row,
+    i.e. the qfq anchor, which hard-fails every 2024+ read (or, if inside the band, silently
+    poisons prices). The frontier rule refuses it instead.
+    """
+    cache = DuckDBCache(db_path=":memory:")
+    _legacy_mixed_symbol(cache)
+    before = _stored(cache)
+    before_latest = cache.get_latest_factor_hfq("600660.SH")
+    assert before_latest == pytest.approx(_MIXED_FUYAO_FACTOR)
+
+    with pytest.warns(CrossSourceAdjustFactorRefused) as record:
+        cache.store_adjust_factors(
+            "600660.SH",
+            _factors([81.588562], pd.to_datetime(["2026-11-12"])),
+            source=SPARSE_SOURCE,
+        )
+
+    warning = record[0].message
+    assert warning.rule == CrossSourceAdjustFactorRefused.RULE_FRONTIER_APPEND
+    assert warning.symbol == "600660.SH"
+    assert warning.stored_source == DENSE_SOURCE
+    assert warning.stored_rows == len(_MIXED_DENSE_DATES)
+    assert warning.incoming_source == SPARSE_SOURCE
+    assert warning.refused_dates == 1
+    assert warning.batch_dates == 1
+    assert warning.examples[0]["date"] == "2026-11-12"
+    assert warning.examples[0]["collision"] is False
+
+    # Nothing was written -- not even a single row -- and the anchor did not move.
+    assert _stored(cache) == before
+    assert cache.get_latest_factor_hfq("600660.SH") == pytest.approx(before_latest)
+    assert datetime.date(2026, 11, 12) not in _stored(cache)
+
+
+def test_frontier_refusal_message_names_the_rule_the_frontier_and_both_sources():
+    """The operator-facing contract: the text alone must say what was refused and why."""
+    cache = DuckDBCache(db_path=":memory:")
+    _legacy_mixed_symbol(cache)
+
+    with pytest.warns(CrossSourceAdjustFactorRefused) as record:
+        cache.store_adjust_factors(
+            "600660.SH",
+            _factors([81.588562], pd.to_datetime(["2026-11-12"])),
+            source=SPARSE_SOURCE,
+        )
+    text = str(record[0].message)
+    assert text.startswith(CrossSourceAdjustFactorRefused.PREFIX)
+    assert "FRONTIER rule" in text
+    assert "2026-11-11" in text  # the frontier row's date
+    assert "2026-11-12" in text  # the incoming date that crossed it
+    assert DENSE_SOURCE in text and SPARSE_SOURCE in text
+    assert "81.588562" in text
+    assert "get_latest_factor_hfq" in text
+    assert "Nothing was written" in text
+    assert "allow_cross_source=True" in text  # the documented escape hatch for a real switch
+
+
+def test_legitimate_fuyao_frontier_append_on_a_legacy_mixed_symbol_is_allowed():
+    """REGRESSION GUARD: the everyday incremental sync must keep working.
+
+    Fuyao already owns the latest row for the symbol, so a Fuyao append one session later is a
+    continuation of the anchor's own series, not an anchor takeover. If this ever refuses, every
+    legacy-mixed symbol's factor updates are frozen (the very outcome the overlap rule's
+    outside-interval exemption existed to prevent).
+    """
+    cache = DuckDBCache(db_path=":memory:")
+    _legacy_mixed_symbol(cache)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cache.store_adjust_factors(
+            "600660.SH",
+            _factors([1.389485], pd.to_datetime(["2026-11-12"])),
+            source=DENSE_SOURCE,
+        )
+    assert [w for w in caught if issubclass(w.category, CrossSourceAdjustFactorRefused)] == []
+
+    stored = _stored(cache)
+    assert stored[datetime.date(2026, 11, 12)] == (pytest.approx(1.389485), DENSE_SOURCE)
+    assert stored[datetime.date(1993, 6, 10)][1] == SPARSE_SOURCE  # prefix untouched
+    assert cache.get_latest_factor_hfq("600660.SH") == pytest.approx(1.389485)
+
+
+def test_backfill_behind_the_frontier_on_a_legacy_mixed_symbol_is_allowed():
+    """A BaoStock batch dated BEHIND the Fuyao frontier is a prefix backfill, not a takeover."""
+    cache = DuckDBCache(db_path=":memory:")
+    _legacy_mixed_symbol(cache)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cache.store_adjust_factors(
+            "600660.SH",
+            _factors([74.5], pd.to_datetime(["2023-12-29"])),
+            source=SPARSE_SOURCE,
+        )
+    assert [w for w in caught if issubclass(w.category, CrossSourceAdjustFactorRefused)] == []
+
+    stored = _stored(cache)
+    assert stored[datetime.date(2023, 12, 29)] == (pytest.approx(74.5), SPARSE_SOURCE)
+    assert cache.get_latest_factor_hfq("600660.SH") == pytest.approx(_MIXED_FUYAO_FACTOR)
+
+
+def test_frontier_row_forced_in_with_the_hatch_still_becomes_the_qfq_anchor():
+    """The READ side is unchanged: the write gate is the only defence, so the hatch must be safe.
+
+    Same shape as the old characterisation test, but the append now has to be forced with
+    `allow_cross_source=True`. It still becomes the qfq divisor, and the 1.26-vs-1.05 ratio is
+    still inside the read-side band, so the qfq series still shows a +20% jump that raw prices do
+    not have. Pinned so that a future anchor-aware read guard is a conscious change, and so that
+    nobody "frees up" the escape hatch believing the read side would catch it.
+    """
+    cache = DuckDBCache(db_path=":memory:")
+    cache.store_adjust_factors(
+        "600660.SH",
+        _factors([1.0, 1.05, 1.05], _FRONTIER_DENSE_DATES),
+        source=DENSE_SOURCE,
+    )
+
+    cache.store_adjust_factors(
+        "600660.SH",
+        _factors([1.26], _FRONTIER_FOREIGN_DATE),
+        source=SPARSE_SOURCE,
+        allow_cross_source=True,
+    )
+
+    # ...and it is now the anchor the qfq derivation divides by.
+    assert cache.get_latest_factor_hfq("600660.SH") == pytest.approx(1.26)
+
+    dates = _FRONTIER_DENSE_DATES.append(_FRONTIER_FOREIGN_DATE)
+    cache.store_bars(DENSE_SOURCE, "600660.SH", _bars(dates), adjustflag="raw")
+    qfq = cache.query_bars(DENSE_SOURCE, "600660.SH", adjust="qfq")  # accepted: 1.26 is in band
+
+    # Raw closes are flat at 52.0; the qfq series is NOT, because the divisor changed basis.
+    np.testing.assert_allclose(
+        qfq["Close"].to_numpy(), 52.0 * np.array([1.0, 1.05, 1.05, 1.26]) / 1.26, rtol=1e-12
+    )
+    assert qfq["Close"].iloc[-1] / qfq["Close"].iloc[-2] == pytest.approx(1.2)
 
 
 # ---------------------------------------------------------------------------

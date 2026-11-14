@@ -2,27 +2,31 @@
 
 WHAT IS BEING PINNED, AND WHY IT NEEDS A TEST
 ---------------------------------------------
-`M3.11` was closed on the **new caliber** ruling of 2026-11-08: the 5m table shrank to
-`34,944 行 / 28 只 / 2026-09-16 起` and `511880.SH` now spans `2026-10-19 09:35 ~
-2026-11-05 15:00`. The script's default target window was still the retired `M3.4` snapshot
-window (`2026-01-05 ~ 2026-11-05`), so a bare run re-reported `coverage FAIL 6.4%` and
-`exit 1` forever -- a correct answer about a window nobody claims any more, and exactly the
-kind of stale default that silently outlives its ruling.
+`M3.11` was closed on the **new caliber** ruling of 2026-11-08, and the script's default target
+window has since been changed twice: first from the retired `M3.4` snapshot
+(`2026-01-05 ~ 2026-11-05`) to the `M3.11` snapshot (`2026-10-19 ~ 2026-11-05`), then from that
+second frozen literal to a **derived** window. Each fixed pair was a correct answer about a
+window nobody claims any more the moment the cache grew past it, which is exactly the kind of
+stale default that silently outlives its ruling.
 
-Three things are therefore pinned here, and nothing else:
+Four things are therefore pinned here, and nothing else:
 
-  * the default window IS the new caliber (and the old window stays reachable as an override);
-  * `--start` / `--end` overrides still win over the defaults, unchanged;
+  * the window is DERIVED from the cache (`end` = latest bar date, `start` = `end` minus
+    `--sessions` sessions) and no fixed `DEFAULT_START` / `DEFAULT_END` literal comes back;
+  * `--start` / `--end` overrides still win over the derivation, independently;
+  * the weekday look-back arithmetic itself (`window_start_for`) and the resolution
+    precedence (`resolve_window`);
   * the exit-code contract -- `0` only when every verdict is `pass`, `1` when any is
     `fail`/`insufficient`, `2` reserved for usage / IO errors.
 
 100% offline: the script is loaded through `importlib` (it lives in `scripts/`, not in an
-importable package) and only `build_arg_parser()` / `exit_code_for_statuses()` are exercised.
-**No DuckDB connection is opened, no `data/` path is stat'd, no network is touched** -- the
-module-level `import duckdb` is a library import only, and `main()` (the sole place that
-connects) is never called.
+importable package) and only `build_arg_parser()` / `window_start_for()` / `resolve_window()` /
+`exit_code_for_statuses()` are exercised. **No DuckDB connection is opened, no `data/` path is
+stat'd, no network is touched** -- the module-level `import duckdb` is a library import only,
+and `main()` (the sole place that connects) is never called.
 """
 
+import datetime as dt
 import importlib.util
 import os
 import sys
@@ -55,27 +59,31 @@ _mod = _load_script(
     os.path.join("scripts", "report_intraday_coverage.py"),
 )
 
-#: The post-`M3.8` caliber (2026-11-08 ruling). Written as literals on purpose: if someone
-#: re-baselines the constants, this test must fail loudly rather than follow the constant.
-NEW_CALIBER_START = "2026-10-19"
-NEW_CALIBER_END = "2026-11-05"
 #: The retired `M3.4` snapshot window -- still reachable via `--start`, never the default.
 OLD_CALIBER_START = "2026-01-05"
+#: The `M3.11` snapshot's end date -- the second literal that used to be a default.
+SECOND_LITERAL_END = "2026-11-05"
 
 
 # ---------------------------------------------------------------------------
-# 1. Defaults ARE the new caliber
+# 1. The default window is DERIVED, not a fixed pair
 # ---------------------------------------------------------------------------
-def test_default_window_constants_are_the_new_caliber():
-    assert _mod.DEFAULT_START == NEW_CALIBER_START
-    assert _mod.DEFAULT_END == NEW_CALIBER_END
+def test_no_fixed_default_window_literal_survives():
+    """The whole point of the change: there is no `DEFAULT_START`/`DEFAULT_END` to go stale.
+
+    Written as an explicit absence check on purpose: re-introducing either constant (even
+    with an updated date) would resurrect the defect this test exists to prevent.
+    """
+    assert not hasattr(_mod, "DEFAULT_START")
+    assert not hasattr(_mod, "DEFAULT_END")
+    assert _mod.DEFAULT_SESSIONS == 20
 
 
-def test_parser_defaults_are_the_new_caliber():
+def test_parser_defaults_are_derived():
     args = _mod.build_arg_parser().parse_args([])
-    assert args.start == NEW_CALIBER_START
-    assert args.end == NEW_CALIBER_END
-    assert (args.start, args.end) == (_mod.DEFAULT_START, _mod.DEFAULT_END)
+    assert args.start is None
+    assert args.end is None
+    assert args.sessions == _mod.DEFAULT_SESSIONS
 
 
 def test_old_caliber_start_is_not_the_default_any_more():
@@ -83,24 +91,81 @@ def test_old_caliber_start_is_not_the_default_any_more():
     retired window's question."""
     args = _mod.build_arg_parser().parse_args([])
     assert args.start != OLD_CALIBER_START
+    assert args.end != SECOND_LITERAL_END
+
+
+@pytest.mark.parametrize(
+    "end, sessions, expected_start",
+    [
+        # 20 sessions back from a Friday: 4 full weeks + the Friday itself.
+        (dt.date(2026, 11, 13), 20, dt.date(2026, 10, 19)),
+        (dt.date(2026, 11, 13), 1, dt.date(2026, 11, 13)),
+        (dt.date(2026, 11, 13), 5, dt.date(2026, 11, 9)),
+        # A weekend end is not a session: the count starts at the preceding Friday.
+        (dt.date(2026, 11, 14), 1, dt.date(2026, 11, 13)),
+        (dt.date(2026, 11, 15), 2, dt.date(2026, 11, 12)),
+        # Multi-week span, no weekend counted twice.
+        (dt.date(2026, 12, 1), 10, dt.date(2026, 11, 18)),
+    ],
+)
+def test_window_start_for_counts_weekdays_backwards(end, sessions, expected_start):
+    assert _mod.window_start_for(end, sessions) == expected_start
+
+
+@pytest.mark.parametrize("sessions", [0, -1, _mod.MAX_SESSIONS + 1])
+def test_window_start_for_rejects_absurd_session_counts(sessions):
+    with pytest.raises(ValueError):
+        _mod.window_start_for(dt.date(2026, 11, 13), sessions)
+
+
+def test_derived_window_uses_the_latest_bar_and_reports_its_sources():
+    latest = dt.date(2026, 11, 13)
+    start, end, start_source, end_source = _mod.resolve_window(None, None, 20, latest)
+    assert (start, end) == (_mod.window_start_for(latest, 20), latest)
+    assert (start_source, end_source) == ("derived", "latest_bar")
+
+
+def test_resolution_requires_a_window_end_when_the_cache_has_no_bars():
+    with pytest.raises(ValueError):
+        _mod.resolve_window(None, None, 20, None)
 
 
 # ---------------------------------------------------------------------------
-# 2. Overrides still win (unchanged behaviour)
+# 2. Overrides still win (unchanged precedence)
 # ---------------------------------------------------------------------------
-def test_start_and_end_overrides_win_over_defaults():
+def test_start_and_end_overrides_win_over_the_derivation():
     args = _mod.build_arg_parser().parse_args(
-        ["--start", OLD_CALIBER_START, "--end", "2026-11-05"]
+        ["--start", OLD_CALIBER_START, "--end", SECOND_LITERAL_END]
     )
     assert args.start == OLD_CALIBER_START
-    assert args.end == "2026-11-05"
+    assert args.end == SECOND_LITERAL_END
+    start, end, start_source, end_source = _mod.resolve_window(
+        args.start, args.end, 20, dt.date(2026, 11, 13)
+    )
+    assert (start.isoformat(), end.isoformat()) == (OLD_CALIBER_START, SECOND_LITERAL_END)
+    assert (start_source, end_source) == ("--start", "--end")
 
 
 def test_overrides_are_independent_of_each_other():
-    """`--start` alone must keep the default end (that is how the old caliber is reproduced)."""
+    """`--start` alone must keep the derived end (that is how the old caliber is reproduced)."""
     args = _mod.build_arg_parser().parse_args(["--start", OLD_CALIBER_START])
     assert args.start == OLD_CALIBER_START
-    assert args.end == NEW_CALIBER_END
+    assert args.end is None
+    start, end, start_source, end_source = _mod.resolve_window(
+        args.start, args.end, 20, dt.date(2026, 11, 13)
+    )
+    assert start.isoformat() == OLD_CALIBER_START
+    assert end == dt.date(2026, 11, 13)
+    assert (start_source, end_source) == ("--start", "latest_bar")
+
+
+def test_sessions_override_changes_the_derived_start_only():
+    args = _mod.build_arg_parser().parse_args(["--sessions", "5"])
+    assert args.sessions == 5
+    start, end, _, _ = _mod.resolve_window(
+        args.start, args.end, args.sessions, dt.date(2026, 11, 13)
+    )
+    assert (start, end) == (dt.date(2026, 11, 9), dt.date(2026, 11, 13))
 
 
 # ---------------------------------------------------------------------------

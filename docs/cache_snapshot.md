@@ -291,6 +291,259 @@ cp -p data/cache.duckdb.bak.20261024-200255 data/cache.duckdb
 
 ---
 
+## 2026-11-13 快照（实测）
+
+> **定位（先读这一条）**：本节是**当前口径**。上方 §1–§8bis 记的 2026-10-24 19:51–19:53 PDT 快照是
+> **历史快照**，按仓库惯例**只追加、不回改** —— 其中的 `ohlcv_bars` 568,474 / §8bis 的 567,925、
+> `intraday_ohlcv_bars` 2,460,576，以及 §1 表里"同目录备份 **6 个**、合计 1.9 GiB"，
+> **均已不是现状**。凡引用"现在库里有多少"的地方，一律以本节为准；引用 10-24 的数字时必须写明
+> "2026-10-24 口径"。
+>
+> **测量时间**：**2026-11-13 16:31–16:40 PST（UTC−8，本机时区）**。注意 10-24 那次标的是
+> **PDT（UTC−7）**，两次差一个时区，跨日期换算时别混。
+> **解释器**：`pipeline/.venv/bin/python`（Python **3.11.15**）、`duckdb` **1.5.5**。
+> **连接形态**：一律 `duckdb.connect("<path>", read_only=True)`；未 `ATTACH`、未建表、未
+> `CHECKPOINT`/`EXPORT`/`VACUUM`，未把库拷进仓库（草稿脚本只落在 `/tmp/opencode`）。
+
+### A.1 库文件事实
+
+| 项 | 实测值 |
+|---|---|
+| 路径 | `data/cache.duckdb`（`PRAGMA database_size` 的 `database_name` 列回 `cache`） |
+| 大小 | **20,983,808** 字节 = **20.0 MiB**（库内 `PRAGMA database_size` 报 `21.2 MiB`） |
+| mtime | **2026-11-12 16:27:11.511530624 −0800** |
+| md5 | **`5688a3dae6a212a5b9515f81f408013c`** |
+| sha256 | `37538090eed0b4ea7c6db3533206fda71730ead6fc91db075f447bb5b5492d08` |
+| `data/cache.duckdb.wal` | **不存在**（`ls data/*.wal` → `No such file or directory`） |
+| 与备份的关系 | md5 **逐位等于** `data/repair_backups/20261113_040659Z/cache.duckdb.pre-e2e` ⇒ **自 2026-11-12 16:27 起没有任何写入** |
+| 相对 10-24 | 324,022,272 → **20,983,808** 字节（**−93.5%**）；表清单也从 6 张变 7 张（新增 `adjust_factors`） |
+
+```bash
+stat -c '%s %y' data/cache.duckdb && md5sum data/cache.duckdb && sha256sum data/cache.duckdb
+ls data/*.wal
+pipeline/.venv/bin/python -c 'import duckdb
+c = duckdb.connect("data/cache.duckdb", read_only=True)
+print(c.execute("PRAGMA database_size").fetchall())'
+```
+
+### A.2 表与行数（本节的核心数字）
+
+测于 **2026-11-13 16:31:20 PST**，SQL 对每张表逐条执行（表名来自 `information_schema`，共 7 张
+`BASE TABLE`，**无视图**）：
+
+```sql
+SELECT table_name, table_type FROM information_schema.tables
+WHERE table_schema = 'main' ORDER BY 1;
+-- 然后对每个 table_name 执行：
+SELECT count(*) FROM "<table_name>";
+```
+
+| 表 | 现行行数 | 2026-10-24 快照 | 变化 | 备注 |
+|---|---:|---:|---:|---|
+| `ohlcv_bars` | **72,367** | 568,474（§8bis 清理后 567,925） | **−495,558** ↓ | 日线，raw 存储 |
+| `intraday_ohlcv_bars` | **71,568** | **2,460,576** | **−2,389,008** ↓ | 5m，28 只 |
+| `asset_sync_metadata` | **68** | 318（清理后 316） | **−248** ↓ | 一行一序列，与日线 68 条序列对齐 |
+| `intraday_sync_metadata` | **35** | 46 | **−11** ↓ | 一行一 (symbol, interval) |
+| `stock_fundamentals_annual` | **0** | 0 | 0 | 仍为空 |
+| `stock_industry_metadata` | **0** | 0 | 0 | 仍为空 |
+| `adjust_factors` | **13,949** | （未列出；2026-10-27 才建表） | n/a | 20 只个股，`factor_hfq` 无 NULL |
+
+> **行数消歧（2026-11-13 16:48 PST 只读复核）**：本行的 `13,949` 是**现行值**（= Fuyao
+> `13,564` + BaoStock `385`，即 **2026-11-11 跨源覆盖清洗删掉 21 行之后**的计数；清洗前为
+> `13,970`），因此它与「事故前」口径**数值巧合相同却是两个不同时点**——同一行右列的
+> 「2026-10-27 才建表」只是建表日期说明，**不是**这 13,949 的测量时点。
+
+- 10-24 快照里那四张有数据的表**全部下降**（无一张上升）—— 这一点是本节最该被读到的结论，
+  具体成因链见 §A.5。
+- **四表合计**：72,367 + 71,568 + 68 + 35 = **144,038** 行（10-24 清理后为 3,028,863，**−2,884,825**）。
+- 若把 `adjust_factors` 计入，现行五表合计 **157,987** 行。
+
+### A.3 覆盖（日线）
+
+```sql
+WITH per AS (SELECT provider, symbol, count(*) AS n, min(date) AS d0, max(date) AS d1
+             FROM ohlcv_bars GROUP BY 1,2)
+SELECT provider, count(*), sum(n), min(n), CAST(median(n) AS BIGINT), max(n),
+       count(*) FILTER (WHERE n < 250), min(d0), max(d1)
+FROM per GROUP BY 1 ORDER BY 1;
+```
+
+| provider | 序列 | 行数 | n_min | n_中位 | n_max | n<250 | 最早 | 最新 |
+|---|---:|---:|---:|---:|---:|---:|---|---|
+| `BaoStockDataProvider` | 7 | 224 | 32 | 32 | 32 | 7 | 2026-09-22 | 2026-11-12 |
+| `EastMoneyDataProvider` | 7 | 224 | 32 | 32 | 32 | 7 | 2026-09-22 | 2026-11-12 |
+| `FuyaoDataProvider` | 27 | 21,829 | 32 | 692 | 2,637 | 7 | 2016-01-04 | 2026-11-12 |
+| `MarketDBDataProvider` | 27 | 50,090 | 32 | 2,637 | 2,637 | 7 | 2016-01-04 | 2026-11-12 |
+| **合计** | **68** | **72,367** | 32 | — | 2,637 | **28** | 2016-01-04 | 2026-11-12 |
+
+- 全库：`SELECT min(date), max(date), count(DISTINCT symbol), count(DISTINCT provider),
+  count(DISTINCT date) FROM ohlcv_bars;` → **2016-01-04 / 2026-11-12 / 27 / 4 / 2,637**。
+- **27 个 `symbol` = 20 只个股 + 7 只指数**；20 只个股恰好对应 `adjust_factors` 的 20 个 `symbol`
+  （指数不派生复权因子，`SELECT ... FROM ohlcv_bars b WHERE NOT EXISTS (SELECT 1 FROM
+  adjust_factors f WHERE f.symbol = b.symbol)` → 7 个，全是 `.SH`/`.SZ` 指数）。
+- 序列长度分三档（实测）：① 7 只指数 × 4 provider = **28 条，各 32 行**（2026-09-22 起，
+  即 `n<250` 的那 28 条，全部是这档）；② `Fuyao` 个股：16 条 **682–692 行**（2024-01-02 起）
+  + 4 条 **2,637 行**（2016-01-04 起：`601225/601288/601872/601919.SH`）；
+  ③ `MarketDB` 个股：14 条 2,637 行，4 条 2,620–2,632 行，`600941.SH` 1,175 行（2022-01-05 起）、
+  `601728.SH` 1,265 行（2021-08-20 起）—— 这两条是上市日限制，不是缺测。
+
+**最后数据日分布（10-24 快照里最坑的一栏，现在已齐）**：
+
+```sql
+WITH per AS (SELECT provider, symbol, max(date) d FROM ohlcv_bars GROUP BY 1,2)
+SELECT d, count(*) FROM per GROUP BY 1 ORDER BY 1 DESC;
+```
+
+→ **68 条序列全部止于 2026-11-12**（唯一一档，`count = 68`）。截面宽度
+（`SELECT date, count(DISTINCT symbol) ... WHERE date >= '2026-11-01'`）**每个交易日都是 27**。
+⇒ §4 那条"最新日期只由 20 条 Fuyao 撑起"、§6.1/§6.2 那套"成批截断"的坑**在现行库上不再成立**；
+反过来说，库内标的集合现在就是这 **27 只**（外加仅存在于 5m 表的 `511880.SH`）——
+10-24 快照里那批 `YFinance`（2012 起）与 `MarketDB`/`Fuyao` 的其它标的**已不在库内**，
+所以"长历史"这句话现在只能对上述 27 只中的个股成立，不能再泛指全库。
+
+### A.4 覆盖（5m）—— 对"34,944 行 / 28 只 / 2026-09-16"这条 note 的核实
+
+```sql
+SELECT provider, interval, count(DISTINCT symbol), count(*), min(ts), max(ts)
+FROM intraday_ohlcv_bars GROUP BY 1,2 ORDER BY 1,2;
+SELECT provider, count(*) AS sym_days, min(c), max(c),
+       count(*) FILTER (WHERE c <> 48) AS non_48
+FROM (SELECT provider, symbol, CAST(ts AS DATE) d, count(*) c
+      FROM intraday_ohlcv_bars GROUP BY 1,2,3) GROUP BY 1;
+```
+
+| provider | interval | 标的 | 行数 | 最早 ts | 最新 ts | symbol-day | 每日根数 |
+|---|---|---:|---:|---|---|---:|---|
+| `BaoStockDataProvider` | `5m` | 21 | 47,376 | 2026-09-01 09:35 | 2026-11-12 15:00 | 987 | 48（min=max） |
+| `EastMoneyDataProvider` | `5m` | 7 | 12,096 | 2026-09-16 09:35 | 2026-11-12 15:00 | 252 | 48（min=max） |
+| `FuyaoDataProvider` | `5m` | 7 | 12,096 | 2026-09-16 09:35 | 2026-11-12 15:00 | 252 | 48（min=max） |
+| **合计** | — | **28** | **71,568** | 2026-09-01 | 2026-11-12 | 1,491 | **0 个非 48** |
+
+**结论：那条 note 已过期，需要按本节更正。** 分四点说清：
+
+1. `docs/intraday_5m_coverage.md` / `docs/development_plan.md` 的 `M3.11` 行里
+   "**34,944 行 / 28 只 / 2026-09-16 起**"是 **2026-11-08** 的实测值，不是现状。
+2. 现状是 **71,568 行 / 28 只**；起点**按 provider 分两档**（`BaoStock` 21 只 **2026-09-01**，
+   其余 14 条 **2026-09-16**），`MAX(ts)` 已推进到 **2026-11-12 15:00**（note 里的
+   "`MAX(ts)=2026-11-05`" 同样过期）。
+3. 中间那一档也留了证据：`data/repair_backups/` 里**两个**更早的库副本都实测为
+   **38,976 行 / 28 只 / 2026-09-16–2026-11-10**（`BaoStock` 21 只只到 **2026-10-19** 起、
+   16 个 session）—— 分别是 `20261111-215145/cache.duckdb.bak.20261111-215145`
+   （md5 `96f322a6…`，11-11 21:51）与 `20261112_222030/cache.duckdb.pre-5m-backfill`
+   （md5 `5a25d0a1…`，11-12 14:20）。⇒ 11-12 那次回补同时做了两件事：把 `BaoStock` 腿加深到
+   09-01、并把全表推进到 11-12。**34,944 这个数在库内两个备份上都复现不出来**
+   （那已是更早的手工快照档），所以它只应被标注为"2026-11-08 历史值"，不再是口径。
+4. 逐日完整性维持不变：每 (provider, symbol, 交易日) **恒 48 根，0 个例外**；午休无 bar 的口径未变。
+
+`511880.SH` 仍是"**只有 5m、没有日线**"的唯一标的（`SELECT count(*) FROM ohlcv_bars WHERE
+symbol='511880.SH'` → **0**）；反向差集（只在日线）为 **0**，与旧 §6.6 的"日内多 1 个、日线多 181 个"
+相比，现在只剩这 1 个不对称点。
+
+### A.5 为什么行数全在下降（事实链，不猜动机）
+
+这一节只列可复核的事实，**不替任何一次未登记的变更背书**：
+
+| 时间点 | 库大小 | 依据 |
+|---|---:|---|
+| 2026-10-24 20:03（§8bis 清理后） | 324,022,272 | §8bis.3 |
+| 2026-10-27（M3.8 raw 重下前备份） | 322,973,696 | `data/cache.backup-20261027-pre-m38raw.duckdb` |
+| **2026-11-11 21:51（已收缩）** | **16,527,360** | `repair_backups/20261111-215145/cache.duckdb.bak.20261111-215145` |
+| 2026-11-12 14:20（5m 回补前） | 16,527,360 | `.../20261112_222030/cache.duckdb.pre-5m-backfill` |
+| 2026-11-12 16:27（现行） | 20,983,808 | §A.1 |
+
+⇒ 收缩发生在 **2026-10-27 → 2026-11-11 21:51** 之间，至迟在 11-11 晚间已经是 16.5 MB 的小库；
+11-12 的 5m 回补把它撑到 20.98 MB。现行库的形态与 10-24 库**不是同一类库**：
+
+- 10-24 库：5 个 provider、201–203 个 `symbol`、`ohlcv_bars` 无 `amount` 列、qfq 值直存（M3.8 前的直连写入）；
+- 现行库：4 个 provider、**27 个 `symbol`**、`ohlcv_bars` 增 `amount` 且**无 `adjustflag` 列**
+  （复权基在 `asset_sync_metadata.adjustflag`，实测 68 行全为 `raw`）、价格是 raw。
+
+⇒ 这**不是** §8bis 那种"按行 DELETE 清理"（那种清理不改文件大小，见 §8bis.5(i)），
+而是**整库被重建为一个更小的 raw-only 库**。**该次收缩在 `docs/version.md` 与
+`docs/development_plan.md` 里找不到登记条目**（对 `72,367` / `71,568` / `68 条序列` 在这两个
+文件里 `grep` 均 0 命中），所以本节只把它记成"**已发生、未登记**"，不替它解释原因；
+任何依赖 10 月长历史的结论都须重新核对。
+
+### A.6 数据质量快查
+
+| 检查 | 现行结果 | SQL 要点 |
+|---|---|---|
+| 自然键重复（日线 / 5m） | **0 / 0 组** | `GROUP BY 1,2,3`（5m 加 `interval,ts`）`HAVING count(*)>1` |
+| 价格列 / 成交量空值 | **0 行**（两表） | `count(*) FILTER (WHERE open IS NULL OR … OR volume IS NULL)` |
+| 非正价格 | **0 行** | `close<=0` 等四列 |
+| OHLC 逻辑矛盾 | **0 行**（两表） | `high < greatest(open,close) OR low > least(open,close) OR high<low` |
+| 零/负成交量（日线） | **524 行**：`Fuyao` 2 只 150 行 + `MarketDB` 8 只 374 行 | `volume<=0` |
+| 零/负成交量（5m） | **0 行** | 同上 |
+| `amount` 为 NULL（日线） | **13,805 行，全在 `Fuyao`** | `amount IS NULL`；`MarketDB`/`BaoStock`/`EastMoney` 均为 0 |
+| `amount` = 0（日线） | 524 行（与零成交量的行完全重合） | `amount=0` |
+| 单日 \|涨跌\| >50% | **1 行**：`MarketDB/300394.SZ` **2016-05-19** 86.00→32.16（**−62.605%**） | 见下方窗口 SQL |
+| 断档 >20 日历日 | **0 对**（10-24 快照为 13 对） | 见下方窗口 SQL |
+| `adjust_factors` 主键重复 | **0 组** | `GROUP BY symbol,date HAVING count(*)>1` |
+| 孤儿（metadata 无 bar / bar 无 metadata） | **0 / 0**（两张 metadata 各查一次） | `NOT EXISTS` 反查 |
+
+```sql
+-- 单日涨跌 >50%（唯一命中行）
+WITH s AS (SELECT provider, symbol, date, close,
+       lag(close) OVER (PARTITION BY provider, symbol ORDER BY date) AS pc FROM ohlcv_bars)
+SELECT * FROM s WHERE pc > 0 AND abs(close/pc-1) > 0.5;
+
+-- 断档 >20 日历日
+WITH s AS (SELECT provider, symbol, date,
+       lag(date) OVER (PARTITION BY provider, symbol ORDER BY date) AS pd FROM ohlcv_bars)
+SELECT count(*) FROM s WHERE pd IS NOT NULL AND date_diff('day', pd, date) > 20;
+```
+
+那 1 行 `300394.SZ` 的 −62.6% 需要下游自己判性质（长期停牌复牌首日 vs 数据错误）；本节只登记
+"它存在、只此一处"，**不声称**它是或不是真实行情。
+
+### A.7 备份清单（对 §1 "6 个备份 / 1.9 GiB" 的事实对照）
+
+`ls -la --time-style=long-iso data/` + `du -cb data/*.bak* data/cache.backup-*`：
+
+| 文件 | 字节 | mtime | md5 |
+|---|---:|---|---|
+| `cache.duckdb.bak` | 323,235,840 | 2026-10-21 15:12 | `9010a45addaa877467ae61db33f74efc` |
+| `cache.duckdb.bak.20261022-213155` | 323,235,840 | 2026-10-22 19:02 | `347a3583eb9c1986026970cb7ade5f65` |
+| `cache.duckdb.bak.20261022-215322` | 323,235,840 | 2026-10-22 21:34 | `dbca540fe761d665d5c423caf24f26bf` |
+| `cache.duckdb.bak.20261023-211859` | 323,235,840 | 2026-10-22 21:53 | `1bad0ea875b4278620175c097e4cdc14` |
+| `cache.duckdb.bak.20261023-212614` | 323,235,840 | 2026-10-22 21:53 | `1bad0ea875b4278620175c097e4cdc14`（**与上一行逐位相同**） |
+| `cache.duckdb.bak.20261024-125524` | 323,235,840 | 2026-10-23 21:38 | `04aa1cf5d26fd995f390a4df54a3e301` |
+| `cache.duckdb.bak.20261024-200255` | 324,022,272 | 2026-10-24 12:55 | `ac7b5df94ad12481bd8d5e8bae54d6d0` |
+| `cache.backup-20261027-pre-m38raw.duckdb` | 322,973,696 | 2026-10-26 22:22 | `72923353576c2cd828f96c12ca30b83e` |
+| **合计 8 个** | **2,586,411,008（2.41 GiB）** | — | **7 个不同 md5** |
+
+`data/repair_backups/`（3 个子目录，`du -sh` 分别 16M / 16M / 21M，是分配块不是字节）：
+
+| 目录 | 文件数 | 字节 | 备份库 md5 | 目录内容 |
+|---|---:|---:|---|---|
+| `20261111-215145` | 3 | 16,535,986 | `96f322a65b70764ae65931804df2d1c2` | 库副本 16,527,360 + 移除行 6,740 + manifest 1,886 |
+| `20261112_222030` | 1 | 16,527,360 | `5a25d0a16c85618c3527cd2790dac31b` | 5m 回补前库副本（§A.4 用它复核中间档） |
+| `20261113_040659Z` | 1 | 20,983,808 | `5688a3dae6a212a5b9515f81f408013c` | e2e 前库副本，**与现行库逐位相同** |
+| **合计** | **5** | **54,047,154（51.5 MiB）** | — | — |
+
+三个目录内的文件名分别是 `cache.duckdb.bak.20261111-215145`（+ `adjust_factors_removed.json`
+6,740 B + `repair_manifest.json` 1,886 B）、`cache.duckdb.pre-5m-backfill`、`cache.duckdb.pre-e2e`。
+
+对 §1 的更正口径：**不是 6 个、不是 1.9 GiB、也不是清一色 323,235,840 字节** ——
+是 **8 个**（7 个 `.bak*` + 1 个 `cache.backup-*`）、**2,586,411,008 字节**，其中
+`.bak.20261024-200255` 是 324,022,272 字节，另有两个 `.bak` 逐位相同。
+`data/` 下还多出 `repair_backups/` 这一层（**3 个目录、5 个文件**），10-24 快照里完全没有它。
+
+### A.8 只读声明与本节的"未测"
+
+- 查询前后 `size` / `mtime` / `md5` **三项完全一致**（20,983,808 / `2026-11-12
+  16:27:11.511530624 −0800` / `5688a3da…`），全程未出现 `data/cache.duckdb.wal`。
+- 另对 `data/repair_backups/` 内**两份**库副本（`cache.duckdb.bak.20261111-215145`、
+  `cache.duckdb.pre-5m-backfill`）各做了一次**只读**连接（同样 `read_only=True`）以复核 §A.4 的
+  中间档，未写、未拷贝、未 `ATTACH`。
+- **未测（不猜）**：① 跨 provider 重叠观测差异（旧 §6.3 的 8,748 行 / 2.5781% / 29.44%）本轮
+  未重跑 —— 现行库只剩 68 条序列，那组结论仍只对 10-24 库成立；② 7 个 qfq 时代旧备份的**表内**
+  行数未测（只测了 `md5` 与大小，读 2.3 GB 只为行数不划算）；③ `stock_fundamentals_annual` /
+  `stock_industry_metadata` 仍为 0 行，**没有**可测内容；④ 停牌清单、除权事件与上述 −62.6%
+  的性质判定不在本轮范围。
+
+---
+
 # 下半部分：代码行为 —— 同一份库在 walkforward 里被怎么读
 
 > **与上半部分的分工（不要混引）**：§1–§8 是**数据事实**——某一时刻这个库长什么样（md5 / 行数 / schema / 覆盖 / 质量），证据来自对 `data/cache.duckdb` 的只读 SQL，**随写入失效**。§9–§17 是**代码行为**——同一份库被 `backtester/run_backtest.py` 读进内存时发生的路径解析、并发、缺失处理与 fold 切分，证据是源码行号，**不随库内容变化**（只有改代码才会变）。两者唯一的接缝是 §15 那张"什么事件会让上半部分的 md5/行数失效"。
@@ -400,7 +653,7 @@ cp -p data/cache.duckdb.bak.20261024-200255 data/cache.duckdb
 - [ ] ② **显式给 `--start` / `--end`**。默认 `2015-01-01` / `2024-12-31`（`backtester/run_backtest.py:116-117`），与上半 §4"最近截面只剩 20 只"毫无关系；靠默认值跑出的区间没人复核过。
 - [ ] ③ **读 `_resolve_master_calendar` 那条前移告警**（`:326-333`）；反之 `_align_universe` 的两条告警**不该出现**（§13 ③），出现即说明调用链被改。
 - [ ] ④ **数一遍 `Error in window` 与 `NaN metrics`**（`:826`、`:831`）；NaN fold 不参与均值 ⇒ 报出的 Sharpe 可能只代表部分区间（§13 ⑧）。
-- [ ] ⑤ **跑前记下 `md5sum data/cache.duckdb`**（当前 `ac7b5df94ad12481bd8d5e8bae54d6d0`，上半 §1），跑后再记；不一致就别把两次结果混着比。
+- [ ] ⑤ **跑前记下 `md5sum data/cache.duckdb`**（当前 `ac7b5df94ad12481bd8d5e8bae54d6d0`，上半 §1；**2026-11-13 更正**：现行为 `5688a3da…`，见新增的「2026-11-13 快照」§A.1，前者是 10-24 口径），跑后再记；不一致就别把两次结果混着比。
 - [ ] ⑥ **运行期间不要启动下载器 / 同步脚本**（§10：无跨进程锁、无 WAL、可能读到半更新状态）。
 
 ## 17. git 忽略的边界

@@ -19,19 +19,29 @@ READ-ONLY GUARANTEES
 * A missing DB file is reported, never created (`DuckDBCache` would `makedirs` + `_init_tables`).
 * No network, no downloader, no provider object -- just `SELECT`s.
 
-WHY THE DEFAULT WINDOW IS 2026-10-19 .. 2026-11-05
--------------------------------------------------
-The `2026-11-08` user ruling re-baselined the 5m table to the post-`M3.8` caliber (see
-`docs/intraday_5m_coverage.md`): current coverage is `34,944` rows / 28 symbols / from
-`2026-09-16`, and `511880.SH` 5m spans `2026-10-19 09:35 ~ 2026-11-05 15:00` (14 sessions,
-672 bars, single BaoStock provider). Defaulting to that span means the bare command answers
-the only question that matters *under the current caliber*: does the cache support the window
-we now claim? -- rather than a self-fulfilling "does the cache cover itself", and rather than
-re-failing forever against the retired `2026-01-05` window.
+WHY THE DEFAULT WINDOW IS DERIVED, NOT A FIXED PAIR
+---------------------------------------------------
+A hardcoded default pair is a snapshot that silently outlives the ruling that produced it.
+This script has already been through two of those: the retired `M3.4` window
+(`2026-01-05 ~ 2026-11-05`) re-reported `coverage FAIL 6.4%` / `exit 1` forever, and its
+`M3.11` replacement (`2026-10-19 ~ 2026-11-05`) became a second frozen literal the first time
+the cache grew past it. Both were correct on the day they were written and wrong afterwards.
 
-The OLD caliber is still reproducible on demand -- `--start 2026-01-05 --end 2026-11-05`
-reports `coverage FAIL` (14/219 weekdays = 6.4%) and exits `1`, which is the historical
-verdict preserved in the doc. Nothing about the checks themselves changed.
+So the bare command derives its window from the cache it is reporting on:
+
+* `end`   = the latest bar date available for `--symbol`/`--interval` (that symbol's newest
+            `ts` under the provider the report actually uses), or `--end` when given;
+* `start` = `end` minus `--sessions` trading sessions (default `20`), or `--start` when given.
+
+The arithmetic is **weekday** arithmetic, matching `common/intraday_coverage.py`'s
+`calendar_basis="weekday_approx"` default: statutory holidays are counted as expected
+weekdays, which can only make the window *wider* than N real sessions and therefore can only
+**depress** the coverage ratio (the safe direction -- never "pass on a shorter window than
+claimed"). A caller who wants an exact calendar passes `--start` explicitly.
+
+Nothing is hidden: the resolved window and where each end came from are printed, so a run is
+self-documenting, and the retired calibers stay reproducible on demand --
+`--start 2026-01-05 --end 2026-11-05` still reports the historical `coverage FAIL` verdict.
 """
 
 from __future__ import annotations
@@ -60,14 +70,16 @@ from common.intraday_coverage import (
 
 _READ_COLUMNS = "provider, symbol, interval, ts, open, high, low, close, volume, amount"
 
-#: New caliber (post-`M3.8`) target window, fixed by the 2026-11-08 user ruling: the 5m table
-#: was re-baselined to `34,944 行 / 28 只 / 2026-09-16 起` and `511880.SH` now spans
-#: `2026-10-19 09:35 ~ 2026-11-05 15:00` (14 sessions / 672 bars). See
-#: `docs/intraday_5m_coverage.md` and `docs/development_plan.md` `M3.11`.
-#: The retired window (`2026-01-05 ~ 2026-11-05`, the `M3.4` snapshot) stays reproducible via
-#: `--start 2026-01-05`; it is deliberately NOT the default any more.
-DEFAULT_START = "2026-10-19"
-DEFAULT_END = "2026-11-05"
+#: Default look-back length, in trading sessions, of the derived window (see module docstring).
+#: There is deliberately **no** `DEFAULT_START` / `DEFAULT_END` literal any more: a fixed pair
+#: is a snapshot that outlives its ruling (`M3.4` -> `M3.11` both did exactly that).
+DEFAULT_SESSIONS = 20
+
+#: Guard on `--sessions`: a look-back longer than this is a typo, not a request. Weekday
+#: arithmetic would still terminate, but the sanity bound keeps a fat-fingered `--sessions`
+#: from scanning the whole cache one day at a time.
+MAX_SESSIONS = 5000
+
 DEFAULT_SYMBOL = "511880.SH"
 DEFAULT_PEER = "000001.SH"
 
@@ -120,6 +132,75 @@ def _series_starts(con, interval: str):
     return {str(s): ts for s, ts in rows}
 
 
+def _latest_bar_date(con, symbol: str, interval: str, provider: str):
+    """Newest `ts` date for one (symbol, interval, provider) -- the derived `--end`.
+
+    Provider-pinned for the same reason `_frame` is: the cache legally holds one symbol under
+    several providers, and "the latest bar" must be the latest bar of the series this report
+    actually evaluates, not of a sibling series it never reads.
+    """
+    (value,) = con.execute(
+        "SELECT MAX(ts) FROM intraday_ohlcv_bars "
+        "WHERE symbol = ? AND interval = ? AND provider = ?",
+        [symbol, interval, provider],
+    ).fetchone()
+    return None if value is None else pd.Timestamp(value).date()
+
+
+def window_start_for(end: dt.date, sessions: int) -> dt.date:
+    """The first of `sessions` weekdays ending at (and counting back from) `end`.
+
+    Pure and offline on purpose -- this is the only piece of arithmetic the derived default
+    adds, and it is pinned directly by tests rather than through DuckDB.
+
+    Weekday arithmetic (Mon-Fri), **not** the exchange holiday calendar: it matches the
+    `calendar_basis="weekday_approx"` the coverage check itself uses when no explicit calendar
+    is supplied, so the derived window and the ratio it is judged by agree. Holidays inside the
+    window are counted as expected sessions, which can only widen the window and depress the
+    ratio -- never the reverse.
+    """
+    if sessions < 1:
+        raise ValueError(f"sessions must be >= 1, got {sessions!r}")
+    if sessions > MAX_SESSIONS:
+        raise ValueError(f"sessions must be <= {MAX_SESSIONS}, got {sessions!r}")
+    day = end
+    counted = 0
+    while True:
+        if day.weekday() < 5:
+            counted += 1
+            if counted >= sessions:
+                return day
+        day -= dt.timedelta(days=1)
+
+
+def resolve_window(start_arg, end_arg, sessions: int, latest_bar_date):
+    """Resolve the target window and say where each bound came from.
+
+    Returns `(start, end, start_source, end_source)` with sources in
+    `{"--start", "--end", "derived", "latest_bar"}`. `--start`/`--end` are explicit overrides
+    and always win; without them the window is derived from the cache (module docstring).
+    """
+    if end_arg is not None:
+        end = pd.to_datetime(end_arg).date()
+        end_source = "--end"
+    elif latest_bar_date is not None:
+        end = latest_bar_date if isinstance(latest_bar_date, dt.date) else pd.Timestamp(
+            latest_bar_date
+        ).date()
+        end_source = "latest_bar"
+    else:
+        raise ValueError("no --end and no bars in the cache: cannot derive a window end")
+
+    if start_arg is not None:
+        start = pd.to_datetime(start_arg).date()
+        start_source = "--start"
+    else:
+        start = window_start_for(end, sessions)
+        start_source = "derived"
+
+    return start, end, start_source, end_source
+
+
 def _fmt_ts(value) -> str:
     return "-" if value is None else str(pd.Timestamp(value))[:16]
 
@@ -141,8 +222,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="cache path (opened read_only; never created)")
     ap.add_argument("--symbol", default=DEFAULT_SYMBOL, help="symbol under test")
     ap.add_argument("--interval", default="5m")
-    ap.add_argument("--start", default=DEFAULT_START, help="target window start")
-    ap.add_argument("--end", default=DEFAULT_END, help="target window end")
+    ap.add_argument("--start", default=None,
+                    help="target window start (default: derived -- end minus --sessions sessions)")
+    ap.add_argument("--end", default=None,
+                    help="target window end (default: the latest available bar date)")
+    ap.add_argument("--sessions", type=int, default=DEFAULT_SESSIONS,
+                    help=f"look-back in trading sessions when deriving --start (default: "
+                         f"{DEFAULT_SESSIONS}, max: {MAX_SESSIONS})")
     ap.add_argument("--peer", default=DEFAULT_PEER,
                     help="peer symbol for cross comparability ('' to skip)")
     ap.add_argument("--tolerance", type=float, default=0.99,
@@ -164,9 +250,6 @@ def exit_code_for_statuses(statuses) -> int:
 def main(argv=None) -> int:
     args = build_arg_parser().parse_args(argv)
 
-    start = pd.to_datetime(args.start).date()
-    end = pd.to_datetime(args.end).date()
-
     try:
         con = _connect(args.db)
     except (FileNotFoundError, OSError, duckdb.Error) as exc:
@@ -180,6 +263,20 @@ def main(argv=None) -> int:
                   file=sys.stderr)
             return EXIT_USAGE_OR_IO
         used_provider, used_rows = providers[0]
+        try:
+            start, end, start_source, end_source = resolve_window(
+                args.start,
+                args.end,
+                args.sessions,
+                _latest_bar_date(con, args.symbol, args.interval, used_provider),
+            )
+        except (ValueError, TypeError) as exc:
+            print(f"[ERROR] cannot resolve the target window: {exc}", file=sys.stderr)
+            return EXIT_USAGE_OR_IO
+        if start > end:
+            print(f"[ERROR] target window reversed: start={start} > end={end} "
+                  f"(start from {start_source}, end from {end_source})", file=sys.stderr)
+            return EXIT_USAGE_OR_IO
         frame = _frame(con, args.symbol, args.interval, used_provider)
 
         coverage = check_coverage(
@@ -210,6 +307,13 @@ def main(argv=None) -> int:
 
     if args.json:
         payload = {
+            "window": {
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "start_source": start_source,
+                "end_source": end_source,
+                "sessions": args.sessions,
+            },
             "coverage": coverage.as_dict(),
             "completeness": completeness.as_dict(),
             "comparability": None if comparability is None else comparability.as_dict(),
@@ -222,7 +326,8 @@ def main(argv=None) -> int:
               f"provider={used_provider} rows={used_rows}"
               + (f"  (other providers present: "
                  f"{', '.join(f'{p}:{n}' for p, n in providers[1:])})" if len(providers) > 1 else ""))
-        print(f"target window: {start} .. {end}   bars/session={args.bars_per_session}")
+        print(f"target window: {start} .. {end}   bars/session={args.bars_per_session}"
+              f"   (start={start_source}, end={end_source}, sessions={args.sessions})")
         print()
         print(f"{'检查':<10} {'结论':<13} 关键数字")
         print("-" * 96)

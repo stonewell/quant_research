@@ -142,6 +142,14 @@ class ImplausibleAdjustFactorStep(RuntimeError):
     exception means "a value that reached a price is off its own series by 4x", and it is
     deliberately a hard failure rather than a warning: a wrong multiplier on the hot read path
     propagates into breadth / exposure / dividend flags with no other visible trace.
+
+    A window that SPANS the foreign-basis prefix can raise this without any overwrite having
+    happened (2026-11-13, `docs/black_list.md`-adjacent reader confusion): for the 20 live
+    symbols the pre-2024 rows are BaoStock trade-multiple factors while the dense 2024+ rows are
+    the 2024-anchored Fuyao series, so a single `qfq` read of e.g. 2000-2026 applies rows from
+    BOTH bases and the 4x band -- correctly -- fires on the mix. The message below names that
+    cause and the workaround; the exception itself, its fields and its "hard failure" severity
+    are unchanged.
     """
 
     def __init__(
@@ -182,7 +190,13 @@ class ImplausibleAdjustFactorStep(RuntimeError):
             f"  Remedy: `python scripts/repair_cross_source_adjust_factors.py "
             f"--symbol {symbol} --dry-run` lists the foreign-source rows (dry-run is the "
             f"default; `--apply` writes a JSON backup before deleting), then re-pull the "
-            f"symbol from a single source."
+            f"symbol from a single source.\n"
+            f"  If the requested window spans a foreign-basis PREFIX instead (for the 20 live "
+            f"symbols: anything starting before 2024, where BaoStock's price-multiple scale sits "
+            f"in front of the Fuyao-anchored dense rows), no overwrite happened -- the read "
+            f"itself is mixing two bases. Workaround: read `raw` bars plus the factor explicitly, "
+            f"or start the window at/after the dense range (2024-01-02 for those symbols) so the "
+            f"applied segment has one basis."
         )
 
 
@@ -193,10 +207,24 @@ class CrossSourceAdjustFactorRefused(UserWarning):
     `DuckDBCache.store_adjust_factors`, mirroring `scripts/sync_china_5m_and_indices.py`'s
     `QfqRebaseWarning` contract: the caller is told, everything else keeps running, and nothing
     is written. The message starts with a fixed prefix so a sync log can be grepped for it.
+
+    Two rules can produce this warning, distinguished by `rule` (and by the message text):
+
+      * `RULE_INSIDE_INTERVAL` -- the batch has dates INSIDE a foreign source's covered interval,
+        so `INSERT OR REPLACE` would overwrite those rows (the D9 incident shape);
+      * `RULE_FRONTIER_APPEND` -- the batch has no date collision, but it reaches PAST the
+        symbol's latest stored row while being stamped with a source that does not own that row.
+        The new rows would become the latest row for the symbol, i.e. the QFQ anchor
+        (`docs/version.md` §37.5 residual (c), closed 2026-11-13).
     """
 
     #: Greppable prefix -- every message this class carries starts with it.
     PREFIX = "[REFUSED] cross-source adjust-factor write"
+
+    #: The batch collides with (or interleaves) a foreign source's covered interval.
+    RULE_INSIDE_INTERVAL = "inside-foreign-interval"
+    #: The batch would become the latest row for the symbol on a foreign basis.
+    RULE_FRONTIER_APPEND = "frontier-append"
 
     def __init__(
         self,
@@ -209,6 +237,7 @@ class CrossSourceAdjustFactorRefused(UserWarning):
         refused_dates: int = 0,
         batch_dates: int = 0,
         examples: Any = (),
+        rule: str = RULE_INSIDE_INTERVAL,
     ):
         super().__init__(message)
         self.symbol = symbol
@@ -218,6 +247,7 @@ class CrossSourceAdjustFactorRefused(UserWarning):
         self.refused_dates = refused_dates
         self.batch_dates = batch_dates
         self.examples = tuple(examples)
+        self.rule = rule
 
 
 class UnknownAdjustBasisError(RuntimeError):
@@ -2853,14 +2883,29 @@ class DuckDBCache:
         normally -- a sync must be able to finish (the alternative, raising, would abort the
         remaining symbols of a scheduled run).
 
-        The refusal is limited to DATE OVERLAP on purpose. A legitimate writer that extends an
-        already-mixed symbol *past* a foreign source's window (the everyday Fuyao incremental
-        sync on a symbol whose old BaoStock prefix ends in 2023) must keep working; refusing
-        that would freeze factor updates on every legacy-mixed symbol. Overlapping or
-        interleaving -- the only shapes that can overwrite or interleave bases -- are refused.
+        The overlap rule alone was NOT enough (§37.5 residual (c), closed 2026-11-13): a batch
+        that continues a series *outside* a foreign interval overwrites no row, but it can become
+        the LATEST row for the symbol -- and `get_latest_factor_hfq` picks the latest row by date
+        ACROSS sources with no source filter, so a foreign-basis append silently becomes the QFQ
+        anchor and rescales every qfq price by the ratio of the two bases. If that ratio happens
+        to sit inside the read-side `[0.25, 4.0]x` band, nothing else fires at all. Hence the
+        second rule (`RULE_FRONTIER_APPEND`): a batch that reaches PAST the symbol's latest
+        stored row is refused unless its own source is the one that owns that row.
+
+        What is still allowed, deliberately:
+
+        * an append past a foreign SPAN from the source that owns the current latest row -- the
+          everyday Fuyao incremental sync on a legacy-mixed symbol (BaoStock prefix, Fuyao dense
+          series). Refusing that would freeze factor updates on every legacy-mixed symbol;
+        * a backfill BEHIND the frontier (dates earlier than the latest stored row, outside every
+          foreign interval) -- the pre-dense-span prefix shape;
+        * an empty symbol accepts any source;
+        * same-source writes keep `INSERT OR REPLACE` semantics.
 
         `allow_cross_source=True` is the audited escape hatch for a tool that has verified both
-        series share a basis (or that the overwrite is intended).
+        series share a basis (or that the overwrite is intended) -- and it is also what a
+        deliberate SOURCE SWITCH past the frontier has to pass, because the two shapes are
+        indistinguishable from dates and values alone.
 
         The schema is deliberately NOT changed (no `source` in the primary key, no migration):
         the read path already anchors QFQ on exactly one value
@@ -2942,24 +2987,54 @@ class DuckDBCache:
     ) -> Optional["CrossSourceAdjustFactorRefused"]:
         """Build the D9 refusal warning, or `None` when this batch may be written.
 
-        A conflict exists when the symbol already holds rows from a DIFFERENT `source` and at
-        least one date of the incoming batch falls inside that source's covered interval
-        `[min(date), max(date)]`. Inside the interval is the load-bearing word: the primary key
-        is `(symbol, date)`, so only an overlapping batch can destroy a row, and only an
-        interleaved one can put two normalisation bases into a single as-of sequence. A batch
-        that continues the series outside the foreign window (the everyday Fuyao incremental
-        sync on a symbol carrying an old BaoStock prefix) is allowed -- see
-        `store_adjust_factors`' docstring for why that exemption is not a loophole.
+        A conflict exists when the symbol already holds rows from a DIFFERENT `source` and either
 
-        `source IS NULL` rows are ignored: a NULL records no basis claim at all (every writer in
-        this repo passes a real source), so it cannot prove a clash.
+        1. at least one date of the incoming batch falls inside that source's covered interval
+           `[min(date), max(date)]` (`RULE_INSIDE_INTERVAL`); or
+        2. the batch reaches PAST the symbol's latest stored row while being stamped with a
+           source that does not own that row (`RULE_FRONTIER_APPEND`).
+
+        (1) is load-bearing for the key: the primary key is `(symbol, date)`, so only an
+        overlapping batch can destroy a row, and only an interleaved one can put two
+        normalisation bases into a single as-of sequence.
+
+        (2) closes §37.5 residual (c). The overlap rule alone left a hole: a batch dated AFTER
+        every stored row overwrites nothing, yet `get_latest_factor_hfq` picks the latest row by
+        DATE across sources, so the appended foreign-basis row becomes the qfq divisor and
+        rescales the entire qfq series by the ratio of the two bases -- silently, if that ratio
+        lands inside the read-side `[0.25, 4.0]x` band. The fix refuses exactly the appends that
+        would take the anchor away from the source that currently owns it, which keeps the
+        legitimate shapes alive:
+
+        * incoming source == the source owning the latest stored row -> allowed (the everyday
+          Fuyao incremental sync on a legacy-mixed symbol);
+        * `max(incoming) <= max(stored)` -> allowed (a backfill behind the frontier, e.g. the
+          pre-dense-span prefix);
+        * empty symbol, or only same-source rows -> no foreign source, so nothing is refused.
+
+        SOURCE STRINGS ARE COMPARED CANONICALISED (2026-11-13 review fix): writers stamp either
+        the CLASS NAME (`BaoStockDataProvider`, what `common/data.py` uses) or the SHORT alias
+        (`baostock`, which is this function's own default). A raw `!=` therefore declared a
+        provider to be its own foreign source: a caller relying on the default `source="baostock"`
+        had its legitimate update refused as `[REFUSED] cross-source` against rows it had itself
+        written as `BaoStockDataProvider`. `canonicalize_provider_key` (the single definition of
+        "same provider, different spelling" in this module) folds the `DataProvider` suffix and
+        case, so `baostock` == `BaoStockDataProvider` and `fuyao` == `FuyaoDataProvider`. It stays
+        narrow on purpose: `FuyaoDataProvider` and `BaoStockDataProvider` must remain different,
+        because that pair is the whole reason this guard exists.
+
+        `source IS NULL` rows are ignored by BOTH rules: a NULL records no basis claim at all
+        (every writer in this repo passes a real source), so it cannot prove a clash -- and it
+        must not make the anchor look ownerless either, which would refuse every append to a
+        symbol carrying legacy NULL rows.
         """
         existing = con.execute(
             "SELECT source, count(*), min(date), max(date) FROM adjust_factors "
             "WHERE symbol = ? AND source IS NOT NULL GROUP BY source",
             [symbol],
         ).fetchall()
-        foreign = [r for r in existing if r[0] != source]
+        incoming_key = canonicalize_provider_key(source)
+        foreign = [r for r in existing if canonicalize_provider_key(r[0]) != incoming_key]
         if not foreign:
             return None
 
@@ -2982,7 +3057,9 @@ class DuckDBCache:
             }
             hits.append((f_source, int(f_count), stored_map, inside, (f_min, f_max)))
         if not hits:
-            return None
+            return self._cross_source_frontier_refusal(
+                symbol, source, incoming_key, existing, incoming, records
+            )
 
         f_source, f_count, stored_map, inside, (f_min, f_max) = max(
             hits, key=lambda h: len(h[3])
@@ -3040,6 +3117,107 @@ class DuckDBCache:
             refused_dates=len(clash_dates),
             batch_dates=len(incoming),
             examples=examples,
+            rule=CrossSourceAdjustFactorRefused.RULE_INSIDE_INTERVAL,
+        )
+
+    def _cross_source_frontier_refusal(
+        self,
+        symbol: str,
+        source: str,
+        incoming_key: str,
+        existing: List[Tuple[str, int, Any, Any]],
+        incoming: "pd.Series",
+        records: pd.DataFrame,
+    ) -> Optional["CrossSourceAdjustFactorRefused"]:
+        """Second D9 rule: refuse an append that would take the QFQ anchor away from its owner.
+
+        `existing` is the per-source census the caller already read
+        (`source, count, min(date), max(date)`, NULL sources excluded). The frontier is the
+        LATEST stored row for the symbol, across sources -- the row `get_latest_factor_hfq`
+        would return, because that query has no source filter.
+
+        Refuse when the batch reaches past that frontier AND its own (canonicalised) source is
+        not among the sources owning the frontier row. Two consequences, both intended:
+
+        * a legitimate Fuyao incremental sync on a legacy-mixed symbol (BaoStock prefix, Fuyao
+          dense series) stays allowed, because Fuyao owns the latest row;
+        * a foreign batch whose LATEST date is still behind the frontier stays allowed -- that is
+          a backfill of the pre-dense-span prefix, not an anchor takeover.
+
+        Returns `None` when the frontier is not crossed, which is the common case and must stay
+        cheap: a symbol with a foreign prefix and its own rows extending to the newest session
+        never even builds a warning.
+        """
+        if not existing:
+            return None
+        frontier = max(r[3] for r in existing)
+        # Any source tied AT the frontier owns the anchor, so a batch from it is a continuation.
+        if any(
+            canonicalize_provider_key(r[0]) == incoming_key and r[3] == frontier
+            for r in existing
+        ):
+            return None  # the batch continues the series that owns the anchor
+        # Messaging: the frontier owner with the most rows, so the warning names the source that
+        # actually holds the bulk of the series rather than an arbitrary tied one.
+        anchor_source, anchor_rows, anchor_min, _ = max(
+            (r for r in existing if r[3] == frontier), key=lambda r: int(r[1])
+        )
+
+        incoming_max = max(incoming.tolist())
+        if incoming_max <= frontier:
+            return None  # backfill behind the frontier: no row becomes the latest one
+
+        past = [d for d in incoming.tolist() if d > frontier]
+        incoming_by_day = {
+            (d if isinstance(d, datetime.date) else pd.Timestamp(d).date()): float(v)
+            for d, v in zip(pd.to_datetime(records["date"]).dt.date, records["factor_hfq"])
+        }
+        examples = [
+            {
+                "date": d.isoformat(),
+                "stored": None,
+                "incoming": incoming_by_day[d],
+                "collision": False,
+            }
+            for d in past[:2]
+        ]
+
+        lines = [
+            f"{CrossSourceAdjustFactorRefused.PREFIX} for {symbol!r}: the FRONTIER rule refused "
+            f"this batch. The latest stored row for this symbol is {frontier.isoformat()} and "
+            f"belongs to {anchor_source!r} ({anchor_rows} row(s), "
+            f"{anchor_min.isoformat()}..{frontier.isoformat()}); this batch is stamped "
+            f"{source!r} and reaches {incoming_max.isoformat()}, so {len(past)} of "
+            f"{len(incoming)} date(s) would be PAST that frontier and would become the LATEST row "
+            f"for the symbol. `get_latest_factor_hfq` selects the latest row by date ACROSS "
+            f"sources with no source filter, so those rows would become the QFQ anchor and "
+            f"rescale every stored qfq price by the ratio of the two normalisation bases "
+            f"(nothing else catches it when that ratio happens to sit inside the read-side "
+            f"plausibility band). Nothing was written.",
+            "  examples: "
+            + "; ".join(
+                f"{e['date']} incoming={e['incoming']!r} (past the {anchor_source} frontier "
+                f"{frontier.isoformat()}; no stored row, but it would take over the anchor)"
+                for e in examples
+            ),
+            "  Remedy: one source per symbol -- a batch may extend a symbol only when its own "
+            "source owns the latest stored row. List the foreign rows with "
+            "`python scripts/repair_cross_source_adjust_factors.py --symbol "
+            f"{symbol} --dry-run` (dry-run is the default; `--apply` writes a JSON backup "
+            "first), then re-pull the symbol from a single source. A deliberate SOURCE SWITCH "
+            "past the frontier has to pass `allow_cross_source=True` after verifying both series "
+            "share a basis: by dates and values alone it is indistinguishable from this refusal.",
+        ]
+        return CrossSourceAdjustFactorRefused(
+            "\n".join(lines),
+            symbol=symbol,
+            stored_source=anchor_source,
+            stored_rows=int(anchor_rows),
+            incoming_source=source,
+            refused_dates=len(past),
+            batch_dates=len(incoming),
+            examples=examples,
+            rule=CrossSourceAdjustFactorRefused.RULE_FRONTIER_APPEND,
         )
 
     def get_latest_factor_hfq(self, symbol: str) -> Optional[float]:
@@ -4142,3 +4320,241 @@ class DuckDBCache:
             "blacklist_reason": row[6],
             "last_sync_time": row[7],
         }
+
+
+# ---------------------------------------------------------------------------
+# Observability: does `adjust_factors` reach the same session as `ohlcv_bars`?
+# ---------------------------------------------------------------------------
+#: Aggregate states of `inspect_adjust_factor_freshness`. Worst-first precedence is
+#: `missing` > `lagging` > `ok`; `unknown` is reserved for "the census could not be read at
+#: all" (never conflated with "no factors", which IS a measured, nameable fact).
+ADJUST_FACTOR_FRESHNESS_OK = "ok"
+ADJUST_FACTOR_FRESHNESS_LAGGING = "lagging"
+ADJUST_FACTOR_FRESHNESS_MISSING = "missing"
+ADJUST_FACTOR_FRESHNESS_UNKNOWN = "unknown"
+
+
+def inspect_adjust_factor_freshness(
+    db_path: str,
+    *,
+    symbols: Optional[Sequence[str]] = None,
+    bar_provider: Optional[str] = None,
+    worst_limit: int = 5,
+) -> Dict[str, Any]:
+    """READ-ONLY OBSERVATION: per symbol, how far `adjust_factors` lags `ohlcv_bars`.
+
+    WHY THIS EXISTS (2026-11-13). `adjust_factors` is a SEPARATE table from `ohlcv_bars`, written
+    by a separate provider path (`DuckDBCache.store_adjust_factors` <- the local MarketDB factor
+    table) while raw bars keep arriving from the Fuyao REST feed. Nothing compared the two maxima,
+    and `get_latest_factor_hfq` is non-None for such a symbol -- so `MissingAdjustFactorsError`
+    never fired while 12 sessions of qfq prices were derived from a factor set that stopped at
+    2026-10-27. The read is `qfq = raw * factor_hfq[t] / factor_hfq[latest]`: the ANCHOR is the
+    latest stored factor, so a stale tail is invisible in the output shape and only becomes a
+    priced error once a corporate action lands inside the gap (on 2026-11-13 none had: the remote
+    Fuyao qfq series equalled the cached raw closes for every one of the 12 sessions). This
+    function makes that state NAMEABLE instead of silently benign.
+
+    CONTRACT -- IT IS NOT A GATE.
+      * It never raises: an unreadable database returns `status="unknown"` plus `error`.
+      * It writes nothing, opens `read_only=True`, and creates no directory.
+      * It is consumed by the Stage-1 report as `adjust_factor_freshness` and by one `[WARN]`
+        line. NO order path, weight path, freshness gate or fail-closed decision reads it --
+        Stage 2 behaves exactly as it did before this function existed. If a later decision wants
+        it to gate, that is a deliberate change to be made THERE, not a side effect of wiring an
+        observation in.
+
+    SCOPE. Factor-neutral symbols (indices, cash ETF 511880 -- `is_factor_neutral_symbol`) are
+    excluded: they legitimately carry no factor rows, and reporting them as `missing` would turn
+    a correct state into a permanent warning. A non-neutral symbol WITH bars but no factor rows is
+    `missing`; a symbol with no bars at all is `missing` with `reason="no_bars"` (not measurable,
+    and `assert_fresh_universe` owns that failure).
+
+    `lag_sessions` counts DISTINCT bar dates strictly greater than that symbol's
+    `max(factor_date)` -- the exact sessions whose qfq derivation carries the last factor forward
+    by as-of lookup. `lag_days` is the plain calendar difference of the two maxima.
+
+    `bar_provider` selects the write namespace the bars are read from (`None` = every provider,
+    i.e. the freshest row any namespace holds). Stage 1 passes the provider it just refreshed, so
+    the census describes the namespace the run actually read.
+
+    Returned block: `status` (`ok` | `lagging` | `missing` | `unknown`), the counts, the maxima,
+    `worst_symbols` (the `worst_limit` deepest lags) and `per_symbol` (ISO date strings, so the
+    block drops straight into `stage1_health_report.json`).
+    """
+    block: Dict[str, Any] = {
+        "status": ADJUST_FACTOR_FRESHNESS_UNKNOWN,
+        "enforcement": "observation_only",
+        "gates_orders": False,
+        "bar_provider": bar_provider,
+        "n_symbols": 0,
+        "n_ok": 0,
+        "n_lagging": 0,
+        "n_missing": 0,
+        "max_lag_sessions": 0,
+        "max_lag_days": 0,
+        "worst_symbols": [],
+        "per_symbol": {},
+        "error": None,
+    }
+    con = None
+    try:
+        if not db_path or str(db_path) == ":memory:":
+            raise ValueError("inspect_adjust_factor_freshness needs a cache FILE path")
+        if not os.path.exists(str(db_path)):
+            raise FileNotFoundError(f"cache file not found: {db_path}")
+
+        con = duckdb.connect(str(db_path), read_only=True)
+        want = [str(s).strip() for s in symbols] if symbols is not None else None
+
+        fac = {
+            row[0]: (row[1], int(row[2]))
+            for row in con.execute(
+                "SELECT symbol, max(date), count(*) FROM adjust_factors GROUP BY 1"
+            ).fetchall()
+        }
+
+        bar_clauses = ["1=1"]
+        bar_params: List[Any] = []
+        if bar_provider:
+            bar_clauses.append("provider = ?")
+            bar_params.append(str(bar_provider))
+        if want is not None and want:
+            bar_clauses.append(f"symbol IN ({','.join('?' * len(want))})")
+            bar_params.extend(want)
+        bars = {
+            row[0]: (row[1], int(row[2]))
+            for row in con.execute(
+                "SELECT symbol, max(date), count(*) FROM ohlcv_bars WHERE "
+                + " AND ".join(bar_clauses)
+                + " GROUP BY 1",
+                bar_params,
+            ).fetchall()
+        }
+
+        candidates = sorted(set(fac) | set(bars)) if want is None else list(dict.fromkeys(want))
+        per_symbol: Dict[str, Dict[str, Any]] = {}
+        for sym in candidates:
+            if is_factor_neutral_symbol(sym):
+                continue
+            factor_max, n_factor_rows = fac.get(sym, (None, 0))
+            bar_max, n_bar_rows = bars.get(sym, (None, 0))
+            entry: Dict[str, Any] = {
+                "symbol": sym,
+                "factor_max_date": factor_max,
+                "bar_max_date": bar_max,
+                "factor_rows": n_factor_rows,
+                "bar_rows": n_bar_rows,
+                "reason": None,
+                "lag_sessions": None,
+                "lag_days": None,
+            }
+            if n_bar_rows == 0:
+                entry.update(status=ADJUST_FACTOR_FRESHNESS_MISSING, reason="no_bars")
+            elif n_factor_rows == 0:
+                entry.update(status=ADJUST_FACTOR_FRESHNESS_MISSING, reason="no_factor_rows")
+            else:
+                lag_days = int((bar_max - factor_max).days)
+                entry["lag_days"] = lag_days
+                if lag_days > 0:
+                    clauses = ["symbol = ?", "date > ?"]
+                    sparams: List[Any] = [sym, str(factor_max)]
+                    if bar_provider:
+                        clauses.append("provider = ?")
+                        sparams.append(str(bar_provider))
+                    n_sessions = con.execute(
+                        "SELECT count(DISTINCT date) FROM ohlcv_bars WHERE "
+                        + " AND ".join(clauses),
+                        sparams,
+                    ).fetchone()[0]
+                    entry.update(
+                        status=ADJUST_FACTOR_FRESHNESS_LAGGING,
+                        lag_sessions=int(n_sessions or 0),
+                        lag_days=lag_days,
+                    )
+                else:
+                    entry.update(status=ADJUST_FACTOR_FRESHNESS_OK, lag_sessions=0)
+            per_symbol[sym] = entry
+
+        # Aggregate. Worst-first: a missing factor set outranks a measurable lag, which outranks
+        # ok -- "19 of 20 fresh" must never render as `ok`. Serialisation (ISO date strings) is
+        # applied first so `worst_symbols` carries exactly the same JSON-safe shape as
+        # `per_symbol` and can be dropped into `stage1_health_report.json` unmodified.
+        serialised = {
+            sym: {
+                **{k: v for k, v in e.items() if k not in ("factor_max_date", "bar_max_date")},
+                "factor_max_date": (
+                    None if e["factor_max_date"] is None else str(e["factor_max_date"])
+                ),
+                "bar_max_date": None if e["bar_max_date"] is None else str(e["bar_max_date"]),
+            }
+            for sym, e in per_symbol.items()
+        }
+        lagging = [e for e in serialised.values() if e["status"] == ADJUST_FACTOR_FRESHNESS_LAGGING]
+        missing = [e for e in serialised.values() if e["status"] == ADJUST_FACTOR_FRESHNESS_MISSING]
+        block["n_symbols"] = len(serialised)
+        block["n_ok"] = sum(
+            1 for e in serialised.values() if e["status"] == ADJUST_FACTOR_FRESHNESS_OK
+        )
+        block["n_lagging"] = len(lagging)
+        block["n_missing"] = len(missing)
+        block["max_lag_sessions"] = max((e["lag_sessions"] or 0) for e in lagging) if lagging else 0
+        block["max_lag_days"] = max((e["lag_days"] or 0) for e in lagging) if lagging else 0
+        worst = sorted(
+            lagging, key=lambda e: (-(e["lag_sessions"] or 0), -(e["lag_days"] or 0), e["symbol"])
+        )
+        block["worst_symbols"] = [dict(e) for e in worst[: max(0, int(worst_limit))]]
+        if missing:
+            block["status"] = ADJUST_FACTOR_FRESHNESS_MISSING
+        elif lagging:
+            block["status"] = ADJUST_FACTOR_FRESHNESS_LAGGING
+        elif serialised:
+            block["status"] = ADJUST_FACTOR_FRESHNESS_OK
+        else:
+            # Nothing to inspect is NOT a pass: no factor-bearing, non-neutral symbol was seen.
+            block["status"] = ADJUST_FACTOR_FRESHNESS_UNKNOWN
+            block["error"] = "no non-neutral symbol with bars or factor rows was found"
+        block["per_symbol"] = serialised
+    except Exception as exc:  # noqa: BLE001 -- an observation must never break the caller
+        block["status"] = ADJUST_FACTOR_FRESHNESS_UNKNOWN
+        block["error"] = f"{type(exc).__name__}: {exc}"
+        return block
+    finally:
+        if con is not None:
+            con.close()
+    return block
+
+
+def format_adjust_factor_freshness_warning(block: Optional[Dict[str, Any]]) -> Optional[str]:
+    """One grep-able `[WARN]` line for a `lagging`/`missing` census, else `None`.
+
+    Kept separate from `inspect_adjust_factor_freshness` so the printed line and the persisted
+    JSON can never disagree, and so the reader of a Stage-1 log sees the SAME numbers the report
+    carries. Pure formatting: it cannot raise on a well-formed block, returns `None` for
+    `ok`/`unknown` (an unavailable census is already announced by its own `error`), and states
+    that nothing is gated.
+    """
+    if not isinstance(block, dict):
+        return None
+    status = block.get("status")
+    if status not in (ADJUST_FACTOR_FRESHNESS_LAGGING, ADJUST_FACTOR_FRESHNESS_MISSING):
+        return None
+    n_bad = int(block.get("n_lagging") or 0) + int(block.get("n_missing") or 0)
+    n_total = int(block.get("n_symbols") or 0)
+    worst = block.get("worst_symbols") or []
+    detail = "、".join(
+        f"{w.get('symbol')} 因子 {w.get('factor_max_date')} < 行情 {w.get('bar_max_date')}"
+        f"（{w.get('lag_sessions')} 个交易日）"
+        for w in worst[:3]
+    )
+    missing_syms = [
+        sym
+        for sym, e in (block.get("per_symbol") or {}).items()
+        if e.get("status") == ADJUST_FACTOR_FRESHNESS_MISSING
+    ]
+    if missing_syms:
+        detail = (detail + "；" if detail else "") + f"无因子: {', '.join(missing_syms[:5])}"
+    return (
+        f"[WARN] adjust_factor_freshness={status}: {n_bad}/{n_total} 个标的复权因子落后/缺失"
+        f"（最多 {block.get('max_lag_sessions')} 个交易日）。{detail}。"
+        f" 仅观测：不参与任何门禁、权重或下单路径。"
+    )

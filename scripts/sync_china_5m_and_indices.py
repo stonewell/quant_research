@@ -51,6 +51,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from common.duckdb_cache import (
+    CrossSourceAdjustFactorRefused,
     DuckDBCache,
     NullVolumeRefused,
     canonicalize_provider_key,
@@ -1582,6 +1583,25 @@ class Sync5mReport(dict):
         }
 
 
+def _cross_source_rule_reason(rule: str) -> str:
+    """One-line, greppable form of a `CrossSourceAdjustFactorRefused.rule` (`why`, not `what`).
+
+    Printed next to every `[CROSS-SOURCE]` entry so the log states WHICH basis rule refused the
+    batch without the operator having to re-read the full cache warning (which, under `-W error`,
+    used to be the only trace of it at all).
+    """
+    if rule == CrossSourceAdjustFactorRefused.RULE_FRONTIER_APPEND:
+        return (
+            "frontier-append: the batch reaches past the symbol's latest stored row, so it would "
+            "become the latest row -- i.e. the QFQ anchor every qfq price is divided by -- on a "
+            "foreign normalisation basis"
+        )
+    return (
+        "inside-foreign-interval: the batch has dates inside the stored source's covered interval, "
+        "so INSERT OR REPLACE would overwrite those rows on a different normalisation basis"
+    )
+
+
 def sync_5m_intraday(
     cache: DuckDBCache,
     stocks: List[str],
@@ -1645,6 +1665,12 @@ def sync_5m_intraday(
 
     refusals = RefusalCollector("PART B (5m intraday)")
     fetch_errors: Dict[str, str] = {}
+    #: `CrossSourceAdjustFactorRefused` collected per (symbol, adjust-factor write) -- same shape as
+    #: PART A.2's `null_volume_refusals`: printed AFTER the loop and deliberately NOT fed into
+    #: `refusals`, because `refusals.raise_if_any()` ABORTS the rest of PART B and one symbol's
+    #: refused factor batch (the D9 cross-source gate: nothing was written) is not a reason to lose
+    #: every remaining symbol of a nightly sync. It is still never silent -- see the print below.
+    cross_source_factor_refusals: List[CrossSourceAdjustFactorRefused] = []
     t_total = time.time()
 
     try:
@@ -1766,8 +1792,45 @@ def sync_5m_intraday(
                 try:
                     factors_df = bs_prov.fetch_adjust_factors(sym, start, end)
                     if factors_df is not None and not factors_df.empty:
-                        cache.store_adjust_factors(sym, factors_df, source="BaoStockDataProvider")
+                        # D9 cross-source gate: `store_adjust_factors` REFUSES a batch whose
+                        # `source` would mix two normalisation bases, and reports it as a
+                        # `CrossSourceAdjustFactorRefused` UserWarning -- it never raises, so the
+                        # refusal used to reach the operator only as a default-format stderr
+                        # warning that nothing in this run counted (a nightly sync could skip a
+                        # symbol and still look green).
+                        #
+                        # `catch_warnings(record=True)` alone is NOT enough: recording only
+                        # replaces the *printer*, the filters still apply, so under `-W error`
+                        # (or `PYTHONWARNINGS=error`) the warning is raised instead of recorded,
+                        # lands in the `except Exception` below, is re-reported as a generic
+                        # `QfqWriteRefused`, and `refusals.raise_if_any()` then ABORTS the whole of
+                        # PART B. Hence the CATEGORY-SCOPED `simplefilter("always", ...)`:
+                        #   * "always" (not "default") guarantees ONE recorded entry PER REFUSED
+                        #     SYMBOL -- the default policy prints a UserWarning once per location,
+                        #     so the second refused symbol at this same call site would vanish;
+                        #   * scoped to this one category, so any other warning raised inside the
+                        #     call keeps whatever filter is in force (`-W error` still errors on
+                        #     it, exactly as before).
+                        # Never `allow_cross_source=True` here: the refusal is the point.
+                        with warnings.catch_warnings(record=True) as factor_warnings:
+                            warnings.simplefilter("always", CrossSourceAdjustFactorRefused)
+                            cache.store_adjust_factors(
+                                sym, factors_df, source="BaoStockDataProvider"
+                            )
+                        for recorded in factor_warnings:
+                            # `warnings.warn(instance, Category)` records the instance itself, and
+                            # a string message is instantiated with the category, so an `isinstance`
+                            # check on the message is exactly "this is a cross-source refusal".
+                            if isinstance(recorded.message, CrossSourceAdjustFactorRefused):
+                                cross_source_factor_refusals.append(recorded.message)
                     elif not is_factor_neutral_symbol(sym):
+                        # `market_now(...)` returns a `MarketClock`, NOT a datetime: both entries
+                        # below used to call `.date()` and raised
+                        # `AttributeError: 'MarketClock' object has no attribute 'date'` from inside
+                        # this handler -- i.e. every generic factor-write failure aborted PART B
+                        # with an opaque traceback instead of the intended `QfqWriteRefused`, and
+                        # (before the catch above) that is also what a `-W error` refusal became.
+                        # `.local_date()` is the same call `default_end_date` above makes.
                         msg = f"Empty adjust factors for non-neutral symbol {sym}"
                         print(f"[WARN {msg}]")
                         refusals.add(
@@ -1776,7 +1839,7 @@ def sync_5m_intraday(
                                 symbol=sym,
                                 provider=target_prov,
                                 interval="5m",
-                                date=market_now(MARKET_CHINA).date(),
+                                date=market_now(MARKET_CHINA).local_date(),
                             )
                         )
                 except Exception as e:
@@ -1788,7 +1851,7 @@ def sync_5m_intraday(
                             symbol=sym,
                             provider=target_prov,
                             interval="5m",
-                            date=market_now(MARKET_CHINA).date(),
+                            date=market_now(MARKET_CHINA).local_date(),
                         )
                     )
 
@@ -1821,6 +1884,28 @@ def sync_5m_intraday(
             )
     finally:
         bs_prov.logout()
+
+    if cross_source_factor_refusals:
+        # Reported AFTER the loop, BEFORE `refusals.raise_if_any()` (the LV19 precedent): a run
+        # that ends in an UNRELATED `QfqWriteRefused` unwinds past everything below, and "which
+        # factor rows were skipped" is exactly what an auditor asks then. Deliberately not routed
+        # through `refusals`: that would abort PART B, and a refused adjust-factor batch writes
+        # nothing without invalidating the run (the 5m bars themselves are a separate write).
+        print(
+            f"[CROSS-SOURCE] {len(cross_source_factor_refusals)} adjust-factor write(s) refused a "
+            f"cross-source basis (symbols: "
+            f"{', '.join(sorted({r.symbol or '?' for r in cross_source_factor_refusals}))}); "
+            "those factor dates are NOT in the cache and nothing was overwritten for them."
+        )
+        for refusal in cross_source_factor_refusals:
+            print(
+                f"[CROSS-SOURCE] {refusal.symbol or '?'} source={refusal.incoming_source or '?'} "
+                f"rule={refusal.rule} stored={refusal.stored_source or '?'} "
+                f"({refusal.stored_rows or 0} row(s)) "
+                f"refused_dates={refusal.refused_dates}/{refusal.batch_dates} "
+                f"reason={_cross_source_rule_reason(refusal.rule)} "
+                "(run continues: one refused symbol must never abort the sync)"
+            )
 
     refusals.raise_if_any()
 
