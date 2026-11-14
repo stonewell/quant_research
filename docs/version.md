@@ -5850,3 +5850,89 @@ stored.replace(tzinfo=datetime.timezone.utc).astimezone(MARKET_TZ)
 计数侧：[`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md)
 §2.21 的 `LV19` 本轮由 `[ ]` 转 `[x]`，并拆出新行 `LV24`（Stage-1 全 universe 刷新的
 `per_namespace` 缺失）；两者均**不是**本节引入的代码改动。
+
+## 43. Stage-1 全 universe 刷新的逐命名空间留痕（`LV24` 收口，trace only，无版本轴变动，2026-11-13）
+
+> **本节编号**：落笔前实测现有最高节号为 **42**，故本节取 **43**，只追加在文件末尾。
+> 本节**不改任何策略/模板类**、不 bump `version` / `BASE_VERSION`、不跑 `--dump-strategies`、
+> 不重写任何 `strategy_dumps/*.json`、不回写任何已归档 `data/runs/**`。
+> 契约来源：[`docs/lv19_freshness_contract.md`](file:///home/stone/Work/github/quant/docs/lv19_freshness_contract.md)
+> §4.1 / §4.4 / §6.6；
+> 任务状态：[`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) §2.21 `LV24`。
+
+### 43.1 补的是一个「留痕缺口」，不是数据缺陷
+
+- **缺口**（冻结文档 §6.6）：`scripts/check_live_portfolio_health.py` 的全 universe 日线补数
+  （`patch_equity_daily_bars` 调用点 `:1530`）只落**聚合** `fetch_errors`，没有任何逐命名空间
+  留痕。于是 `fetch_errors={}` + `steps.patch_equity_daily_bars = "ok"` 与「每个命名空间都已经是
+  最新」在读起来上**完全一样** —— 2026-11-05 那次就是这样。
+- **方向仍然是「多取」，不是「读到陈旧 bar」**：非严格命名空间沿用 2 日周末/假日容忍，若真落后，
+  冻结文档 §6.1 的读穿透路径会把它补齐。本条**不改取数方向**，只是把「我们没刷新这个命名空间」
+  从不可见变为可见。
+- **零影响面**：不改写入哪些命名空间、不改容忍度、不改顺序、不改任何 fetch 行为、不改
+  `fetch_errors` 的形状/排序/语义；不触碰选股、权重、暴露与下单路径；**零版本轴**。
+
+### 43.2 trace 的形状（复用 `namespace_trace/v1` 词表，不新增状态）
+
+三态**逐字沿用** LV19 已冻结的词表（`skipped` / `patched` / `failed`，冻结 §4.1）：
+`DuckDBCache.record_namespace_trace` 依旧只接受这三个值，LV24 **没有**新增第四态
+（`read_through` 仍是 §4.5 的预留、未实现）。状态之外补一个 `reason`，因为三态回答不了
+操作者真正的问题：
+
+| 状态 | `reason` | 含义 |
+|---|---|---|
+| `skipped` | `fresh_strict` | 严格命名空间的 `max_date` 已达 `end`（零容忍判据） |
+| `skipped` | `fresh_tolerance` | **仅**在 2 日容忍下算新鲜 —— 「我们没刷新它」的唯一可见证据 |
+| `skipped` | `no_new_bars` / `already_current` | 响应在本命名空间窗口内无可写 bar / 全部已在库且同基准 |
+| `patched` | ——（`null`） | 本轮为该命名空间写入了 bar |
+| `failed` | `fetch_error` | 该标的的所有取数源都抛错 |
+| `failed` | `refused_write` + `rule` | 写入被拒：`rule=qfq_rebase_refused`（`plan_history_write` 的跨源拒绝：来窗与已存收盘价冲突）或 `rule=null_volume_refused`（逐行拒写，从不以 `0.0` 顶替） |
+
+聚合规则**不变**（冻结 §4.2，worst-first：`failed` > `patched` > `skipped`）；`reason` / `symbol`
+/ `rule` 描述的是**把该命名空间推到当前（最坏）状态的那一次结果**，因此
+「19 次 `patched` + 1 次 `failed`」记为 `failed`，且保留失败那次的标的与规则。
+
+### 43.3 通道：出参 + 缓存，**不动**返回值
+
+- **不改签名返回值**（冻结 §4.4 钉住）：`patch_equity_daily_bars` 仍返回
+  `symbol -> "<provider>: Type: msg"`，`fetch_errors` 的形状/排序/语义**一字未动**。
+- 新增**可选关键字出参** `trace_out`（`scripts/sync_china_5m_and_indices.py:1026`），由原语在
+  `refusals.raise_if_any()` **之前**就地填充（拒写异常不得吞掉留痕）；既有
+  `DuckDBCache.record_namespace_trace` / `namespace_trace` 通道**照旧**发布同一份三态映射，
+  Station 侧 `web/livetrading/execution_service.py:1076` 的读取不受影响。
+- 之所以用出参而不是返回值：缓存通道只能承载三态（其 API 显式拒绝其它值），承载不了 `reason`；
+  而返回值被冻结。
+
+### 43.4 报告键与那**一行**打印
+
+- `stage1_health_report.json::data_refresh.equity_daily_patch`（新增块，`summary["equity_daily_patch"]`，
+  写入点 `scripts/check_live_portfolio_health.py:1547`）：
+
+  ```
+  {"namespace_trace":  {"FuyaoDataProvider": "skipped", "MarketDBDataProvider": "patched"},
+   "namespace_detail": {"FuyaoDataProvider": {"state": "skipped", "reason": "fresh_tolerance",
+                                              "symbol": "600660.SH"},
+                        "MarketDBDataProvider": {"state": "patched", "reason": null,
+                                                 "symbol": "600660.SH"}}}
+  ```
+
+  三个状态 + `reason` 四类跳过理由 + 拒写 `rule`。原有键**全部不变**；该块在「一个命名空间都
+  没被评估」时**缺席**（与 `fetch_errors` 同一约定：缺席不是空表）。
+- **一行**摘要（`summarise_namespace_trace`，`:1339`）：仅当存在 `failed`，或存在
+  `reason=fresh_tolerance`（容忍度跳过）时打印，例如
+  `[STAGE 1 NAMESPACE TRACE] 1 个命名空间仅因容忍度未刷新（FuyaoDataProvider） -- FuyaoDataProvider=skipped(fresh_tolerance) MarketDBDataProvider=patched （…）`。
+  干净轮（全部 `patched` 或严格新鲜）**不打印**，避免绿跑噪音。
+
+### 43.5 验证（全离线、合成数据）
+
+- 用例：`pipeline/tests/test_stage1_nav_source.py` 的 `test_lv24_*` 共 **8 条**（①全部 `patched`
+  ②容忍度跳过仍整体成功 ③取数失败 `failed`/`fetch_error` ④拒写 `failed`/`refused_write`+`rule`
+  ⑤worst-first 与标的顺序无关 ⑥`fetch_errors` 冻结字节 ⑦原语返回值源码级守卫 ⑧干净轮不打印）。
+- **反向改坏即转红**：把 `trace_out` 的填充就地注掉后，①②③(两种)⑤ **5 条转红**；
+  以 `sha256` 还原后全绿（`9fc3b1751922ab9a…`，见计划表 `LV24` 收口注记）。
+- **`fetch_errors` 冻结实测**：同一合成输入在**改动前（HEAD）**与**改动后**的原语上各跑一次
+  「干净 / 仅 MarketDB 补数 / 取数双抛错 / 跨源拒写」四个场景，序列化结果
+  **逐字节相同**（`sha256` 相同）；拒写场景连聚合异常的 `str()` 也相同。
+- 既有回归：`pipeline/tests` 全套 `1386 passed, 1 skipped`；`common/tests` 中
+  `test_live_health_check.py` / `test_intraday_features.py` / `test_ohlcv_null_volume_contract.py`
+  `76 passed`。
