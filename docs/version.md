@@ -1929,6 +1929,28 @@ flag）；`fixtures/parity/` 下 **4 套合成归档**（`aligned_china_2026_10_
   `publication_ready` **仍按全天收盘**（即 `L2.1` 语义不动）。后果：早收日 13:00–16:00 仍显示 `OPEN`、as-of
   仍指向前一交易日。这个偏差方向是**偏保守、不偏乐观**（只可能"晚判"，不可能"早判为已收盘"），把它们一并
   收口会改动每一个 `L2.1`/实盘门禁答案，属独立任务。
+
+  > **（2026-11-13 更正：该句描述的是 `c10bdae` 之前的行为，现与代码矛盾）**：`as-of` / 发布判定**已经
+  > 改过** —— `common/market_clock.py:593-594` 的 `_publication_time(day)` 改用 `close_time_on(day)` +
+  > 宽限，`:668` 的 `as_of_trading_date()` 拿市场本地时间与它比较，因此**早收日当天即被认作 `as-of`**
+  > （美股 13:00 早收在 13:15、港股 12:00 半日在 12:30），不再指向前一交易日。
+  > **仍未修的只是另一件事**：`session_state()`（`common/market_clock.py:527`，静态比较在 `:546` /
+  > `:553`）依旧只比 `morning_close` / `afternoon_close`，所以 13:00–16:00 的 `session_state` 仍报
+  > `OPEN`；`last_completed_session`（`:626`）也仍在全天收盘翻转（早收日真正收缩的是
+  > `last_expected_bar_ts` / `session_close_time`，与这两个相位/翻转判定无关）。
+  > **两件事必须分开读：`as-of` / 发布判定 = 已修，`session_state` 相位 = 未修** —— 相位只是标签，运行窗口
+  > 门禁按显式窗口区间判定、不读 `session_state`（见 `MarketSpec.close_time_on` 的 docstring）。
+  > 「C17」一词在本仓库**零命中**（`grep -rn C17` 只命中 `.venv/` 里的第三方文件），故**不另建条目**：这次
+  > 时钟语义变更属 **§33「实盘运行窗口重构」（2026-11-12，本文 `:4569` 起）** 的同一口径 —— 33.2 运行窗口
+  > 单一真相源 / 33.3 5m 发布三态 / 33.4 同步新鲜度；对应实现提交为 `c10bdae`（`git show c10bdae` 逐行可查）。
+  >
+  > **（2026-11-13 补记：`session_state` 已修）** 上面「`session_state` 相位 = 未修」一句**已过期**：
+  > `session_state()` 现按 `MarketSpec.early_close_on(day)` 判定 —— 早收日 09:30..13:00/12:00 为 `OPEN`，
+  > 自早收瞬时起为 `CLOSED`（**无 `LUNCH_BREAK`、无下午 `OPEN`**，边界半开：`t == early` 即 `CLOSED`）；
+  > `last_completed_session()` 一并改为按 `close_time_on(day)` 翻转（**行为中性**，全仓无生产调用方）。
+  > 该变更**纯属标签/元数据**：三条判定链（运行窗口 `assert_run_window`、严格新鲜度
+  > `last_expected_bar_ts` / `as_of_trading_date`、可执行性 `spec.close_time_on`）早已是早收感知的，且
+  > **无一读取 `session_state()`**，故无 feature flag。详见 **§36「半日市（早收）相位收口」**。
 - **披露（数据时效）**：**2026 / 2027 的早收日期是规则推导的 `PROVISIONAL`，未与 NYSE/Nasdaq、HKEX 官方公告
   复核**（`PROVISIONAL_YEARS = {2026, 2027}`；2020–2025 依据公告钉住）。最坏失败方向是"**多取一次**"而非
   "未覆盖被误判为已覆盖"。
@@ -4788,3 +4810,990 @@ BaoStock 当日 5m 通常在 **20:00 之后**才可用（实盘观察值，非�
 ### 35.8 边界
 
 本条为**执行层变更**：未改任何策略类 / 模板、未改 `blend_base.py`、**未 bump `version` 与 `BASE_VERSION`**、未跑 `--dump-strategies`、未联网、未写 `runs/`。
+
+## 36. 半日市（早收）相位收口：`session_state()` 不再在真实收盘后报 `OPEN`（标签/元数据变更，无版本轴变动，2026-11-13）
+
+> **编号说明**：本条为**追加**条目。本文 §34 / §35 已被 2026-11-12 的「方案 C 减仓」与「5m 门禁三态化」占用，故本次早收收口顺延为 **§36**（内容与任务书一致，仅序号顺延）。
+
+### 36.1 缺陷：相位标签与真实收盘不一致
+
+`L2.27` 把「半日市 / 早收」的**几何链**（`session_close_time` / `last_expected_bar_ts`）与**as-of / 发布链**（`_publication_time` → `publication_ready` / `as_of_trading_date`）都改成了按当日 `MarketSpec.close_time_on(day)` 收缩，但 `session_state()`
+（`common/market_clock.py:551` 起，改动前 `:527-555`）仍只与静态的 `morning_close` / `afternoon_close` 比较。后果：美股 13:00 早收日（感恩节次日、7 月 3 日、平安夜）在 **13:00–16:00** 被报为 `OPEN`，港股 12:00 半日市在 **12:00–16:00** 被报为 `LUNCH_BREAK` 后又在 13:00 回到 `OPEN` —— 一个**下午场并不存在**的交易日，相位标签却声称它在交易。
+
+`docs/version.md` **§16.11.1**（`~:1933` 与 `:1947-1953`；**不是 §27** —— 那是 `M1.3` 换手惩罚，与时钟无关）
+与 `docs/development_plan_archive.md` 的 `L2.27` 行在 2026-11-13 已各追加过一条「更正」note，明确记录
+「`as-of` / 发布判定 = 已修，`session_state` 相位 = 未修」。本条即那个「未修」项。
+
+### 36.2 唯一谓词（插入位置与形状）
+
+在 `session_state()` 的 `PRE_OPEN` 判定之后、`t < spec.morning_close` 分支之前插入（`early` 取 SSOT 表，`close_time_on` 亦委托同一函数）：
+
+```python
+early = spec.early_close_on(day)   # None on a normal full session
+if early is not None:
+    # Recorded half-day: there is no afternoon session (US closes 13:00, HK 12:00).
+    # The whole tradable span is one morning session ending at `early`.
+    return SessionState.OPEN if t < early else SessionState.CLOSED
+```
+
+口径三条：
+
+1. **显式 `early is not None` 守卫**，不用 `close_time_on(day) <= morning_close` 这类「退化比较」写法 —— 后者能被读成任何含义，且把「没有半日」和「半日恰好等于午收」混为一谈。
+2. **不新增 `SessionState` 成员**：`SessionState` 的取值是落盘契约（`summary.json` / 日志），新增成员会重新制造 decision-4 明确要消灭的「消费方忘记也检查新成员」缺陷类。早收后一律 `CLOSED`。
+3. **边界半开**：`t < early` ⇒ `OPEN`；`t == early` ⇒ `CLOSED`。与全日的收盘侧口径一致（09:30:00 即 `OPEN`，16:00:00 / 15:00:00 即 `CLOSED`）。
+
+半日市因此**没有** `LUNCH_BREAK`、**没有**第二个 `OPEN`：整个可交易区间就是一段以 `early` 结束的早盘。
+
+### 36.3 为什么这是**纯标签**变更（无 feature flag）
+
+只读影响面分析已确认：三条**真正做判定**的链路早就是早收感知的，且**没有一条**读 `session_state()`：
+
+| 判定链 | 入口 | 早收感知来源 |
+| --- | --- | --- |
+| 运行窗口门禁 | `assert_run_window` / `post_close_to_open_window`（`common/cli_utils.py`） | 显式窗口区间 + `close_time_on(day) + grace` |
+| 严格新鲜度 | `last_expected_bar_ts` / `as_of_trading_date` | `close_time_on(day)` |
+| 可执行性 | `session_close_time(market, day) − 45min`（`evaluate_overnight_derisk` 判定瞬时 `D`） | 委托 `early_close_on(day)` |
+
+「可执行性」一行的入口**不是** `MarketSpec.close_time_on` 本身：隔夜降险（`r6.3`）的判定瞬时是
+`session_close_time(market, day) − 45min`（`common/overnight_derisk.py` 的 `resolve_decision_instant`，
+由 `scripts/run_live_strategy.py` 的 `evaluate_overnight_derisk` 调用点触发），而 `session_close_time`
+只是 `close_time_on` 的薄别名、最终委托同一 `early_close_on(day)`。`D3` 出票时点门禁
+（`annotate_executability` → `_planned_session_instants`）确实直取 `spec.close_time_on(day)` —— 同一
+SSOT 的另一个入口。两条都不读静态 `close_time`。
+
+`session_state()` 只出现在**可观测性**输出（`ClockStamp.session` / `summary.json` 的 `clock.session` /
+banner 文案）与 `is_intraday`。**`is_intraday`（`common/market_clock.py:586`）除测试外没有任何生产消费方**
+（`grep -rn "\.is_intraday\b"` 只命中 `common/tests/test_market_clock.py`）—— 原稿「其消费方同样是
+打印/诊断」把「没有消费方」写成了「有诊断消费方」，属同一类夸大。因此不需要开关：不存在「门禁读到新标签
+后改变行为」的路径。唯一可见变化是**标签本身变正确**。
+
+### 36.4 `last_completed_session()` 一并收口（行为中性）
+
+`last_completed_session()`（`common/market_clock.py:645`）原先与 `self.spec.close_time`（全天收盘）比较。本次改为 `self.spec.close_time_on(day)`，与几何链 / as-of 链共用同一 SSOT，`docstring` 中「Used by the run-window gate」的**错误声明**同时删除。
+
+**本次为行为中性（behaviour-neutral）**：`grep -rn last_completed_session` 全仓除定义、docstring 与测试外**零调用**，运行窗口门禁走的是 `post_close_to_open_window` + `assert_run_window`。改写只是消除一个会误导后来者的谎言式 docstring，外加让该函数在早收日自洽。
+
+### 36.5 披露文本同步（改前这些句子断言的是旧行为）
+
+- `common/market_clock.py`：模块 docstring（decision 3 的「Used by the run-window gate」与「still key off the full session」段）、`MarketSpec.close_time_on`、`session_close_time`、`session_state`、`as_of_trading_date` 五处 docstring；
+- `common/market_holidays.py:56-64`：删除「still reported `OPEN` after its real close by `session_state()`」及其「只有几何访问器收缩」的陈述，改为「早收收盘已到达全部消费方，最后一步仅属标签，无门禁消费方读 `session_state`」。
+
+### 36.6 测试（100% 离线，全部冻结注入瞬时）
+
+- **改写（钉住旧行为的两条）**：
+  - `common/tests/test_market_clock.py::test_l2_27_as_of_follows_the_early_close_but_session_state_does_not` → 更名 `test_l2_27_as_of_and_session_state_follow_the_early_close`；`14:30 ET` 断言 `OPEN` → **`CLOSED`**；`16:20 ET` 的 `CLOSED` 与 `last_expected_bar_ts == 12:55` 原样保留。
+  - `pipeline/tests/test_half_day_as_of_window_alignment.py:67-71`：`13:29 ET` 断言 `OPEN` → **`CLOSED`**，注释重写为「拒绝的真实理由是 13:00–13:30 的发布宽限，不是仍在交易」。
+- **新增**（`common/tests/test_market_clock.py`，4 例）：
+  1. 美股 2026-11-27（13:00）：`PRE_OPEN` @09:29:59、`OPEN` @09:30 与 12:55、`CLOSED` @13:00（精确边界）/13:05/15:59/16:00；并复核 `session_close_time("us", day) == 13:00` 与 `last_expected_bar_ts == 12:55` 未变。
+  2. 港股 2026-12-24（12:00）：`OPEN` @11:55、`CLOSED` @12:00 且**显式断言不是 `LUNCH_BREAK`**、`CLOSED` @12:30/13:00/15:59（无下午 `OPEN`）；同一文件的正常港股日 12-23 仍为 `LUNCH_BREAK` @12:00 与 `OPEN` @13:00，证明新分支只对**记录的早收日**生效。
+  3. 不相邻日不受影响：11-25 全日 13:30 仍 `OPEN`、16:00 `CLOSED`；11-26（感恩节全日休市）与 11-28（周六）仍 `NON_TRADING_DAY`。
+  4. `last_completed_session` 在 13:00 / 12:00 翻转，且全日日仍按 16:00 翻转。
+- **反向验证（真实做过）**：临时把新分支短路（`early = None; if False:`）→ 上述第 1、2 例**转红**（2 failed / 2 passed，参数化几何用例 112 例仍绿，证明区分力非恒真断言）；还原后 116 passed。
+- **回归（实跑原文见回报）**：`common/tests/test_market_clock.py` **112 → 116 passed**；`pipeline/tests/test_half_day_as_of_window_alignment.py` + `pipeline/tests/test_live_market_clock_wiring.py` = **46 passed**；`common/tests -k "market_clock or holidays or cli_utils or intraday_features"` = **214 passed, 1236 deselected**。
+
+### 36.7 边界
+
+本条**未改**任何策略类 / 模板、未改 `blend_base.py`、**未 bump `version` 与 `BASE_VERSION`**（`market_clock.py` 本就没有版本轴）、未跑 `--dump-strategies`、未联网、未写 `runs/`、未动 `web/livetrading/**` 与 `scripts/*`。全日（`early is None`）路径**逐位不变**：既有参数化几何用例（中美港三市场、09:30/午休/13:00/15:59/16:00 边界）全部原样通过。
+
+### 36.8 复核收尾（2026-11-13）
+
+本条写成后经一次独立复核，结论是「**无阻塞项**，6 点 → **5 PASS + 1 FAIL-WITH-NITS（文档诚实性）**」。
+FAIL 的 nits 已全部当轮收口，本节即其记录 —— 三项都只是**注释 / docstring / 测试收紧**，
+`session_state()` / `last_completed_session()` / `as_of_trading_date()` 的运行时判定**一行未改**。
+
+- **§36 自身三处表述就地更正**（同轮，见 §36.1 / §36.3）：
+  - `L2.27` 的更正 note 在 **§16.11.1**（`:1933`、`:1947-1953`），不在 §27 —— §27（`:4169`）是
+    「`M1.3` 换手惩罚」，与时钟无关；
+  - `MarketClock.is_intraday`（`common/market_clock.py:586`）**除测试外没有任何生产消费方**（全仓
+    `grep "\.is_intraday\b"` 只命中 `common/tests/test_market_clock.py`），不是「打印/诊断消费」；
+  - 「可执行性」链的入口是 `session_close_time(market, day) − 45min`，不是 `MarketSpec.close_time_on`
+    本身（详见 §36.3 表格后的段落）。
+- **`docs/market_clock_and_asof_resolution.md:195` 的表格单元格更正**：该格曾称
+  `last_completed_session()` 供「运行窗口门禁（§8）」使用。事实相反 —— 它是**纯日历、零生产调用方**；
+  门禁是 `post_close_to_open_window` + `assert_run_window`，按**显式窗口区间**判定
+  （`common/cli_utils.py:314`：`in_window = bool(start <= local_now < end)`）。
+- **`common/market_clock.py` `as_of_trading_date()` 的 docstring 有同一句谎言**：
+  「that function answers the window-gate question」已按同口径改写（纯日历、无生产调用方、门禁按显式
+  窗口区间判定）。
+- **半日市分支的隐式数据假设已就地登记，不变式测试同步收紧。** 该分支把 `[morning_open, early)` 读作
+  一段连续早盘，隐含 `early <= morning_close`；在午休市场，早收晚于午收会让 12:00–13:00 报 `OPEN`
+  而不是 `LUNCH_BREAK`。现在：
+  - 分支注释显式写出该假设，并记下代价与出路 —— 未来的 13:30 式港股早收**必须先把 `LUNCH_BREAK`
+    教给这个分支**，而不是只往早收表里加一行；
+  - `common/tests/test_market_clock.py` 的数据不变式测试对**午休市场**（`afternoon_open is not None`）
+    追加 `close <= morning_close`，其余市场保留 `morning_open < close < close_time`；
+  - 现表**每一行都满足**：中国表为空（无半日市）、港股每笔早收都是 12:00 == `morning_close`、美股
+    13:00 且 `afternoon_open is None`（本就没有下午场）。所以这是一条**前瞻性护栏**，不是补修现表。
+
+> **运行时影响：零。** 上述三项分别是注释、docstring 与测试断言收紧，无一处改判定逻辑。实跑：
+> `common/tests/test_market_clock.py` **116 passed**；`common/tests -k "market_clock or holidays"`
+> **156 passed, 1305 deselected**；`pipeline/tests -k "half_day or market_clock or live_market_clock"`
+> **49 passed, 1307 deselected**。
+
+## 37. 数据层 `D9`：`adjust_factors` 跨源覆盖事故（写侧拒绝 / 读侧量级护栏 / 生产库清洗，2026-11-11，补记 2026-11-13）
+
+> **编号说明**：§36 已被 2026-11-13 的「半日市相位收口」占用（见上一条），故本条顺延为 **§37**，
+> 是当前最后一个编号。
+>
+> **为什么现在才补**：`AGENTS.md` §7 规定 `docs/version.md` 是变更日志的 SSOT，但本条记录的
+> 数据层 `D9` 事故此前**只**以引用块形式存在于 `docs/development_plan.md` §2.19 的两条「只追加」
+> 补记里（`:1168` 起的修复记录与「补记之一」）。独立复核（2026-11-11 起，2026-11-13 收口）
+> 判定其为**文档缺口**：事故本体、残余清单与清洗证据没有任何一处属于「变更日志」口径。
+> 本条只做**追认与登记**，不改任何实现行为（37.6 的源码修复除外，见该节）。
+
+### 37.1 缺陷：两套归一化基准共用一条 `(symbol, date)` 主键
+
+`adjust_factors` 有 `source` 列，但主键只有 `(symbol, date)`；`store_adjust_factors` 用
+`INSERT OR REPLACE` 落盘。于是「谁最后写」决定该日期的因子值，与 `source` 无关。
+
+`scripts/sync_china_5m_and_indices.py` 写入 BaoStock 的**稀疏事件行**（自 IPO 累计归一化，
+只在有公司行为的日期出现），而同批 symbol 的**稠密日频行**来自 Fuyao（以 2024 起点归一化）。
+两者基准相差三个数量级，却共享同一条键，因此 BaoStock 的事件行**覆盖**了 Fuyao 的日频行：
+
+| 项 | 值 |
+| --- | --- |
+| 键 | `600660.SH / 2026-09-24` |
+| 被覆盖（Fuyao，稠密基准） | `factor_hfq = 1.3894851` |
+| 覆盖者（BaoStock，IPO 累计基准） | `factor_hfq = 81.588562`（≈ 58.7× 邻域） |
+| 后果（当日 qfq 收盘） | `52.47 → 3080.96` |
+| 后果（`sma_50`，2024-09-02..2026-11-10） | `54.21 → 114.75` |
+
+错误是**静默的**：读路径对该值不设量级校验，唯一的痕迹在更下游 —— breadth、`target_exposure`、
+分红告警各偏一点，没有任何一处会报错。这是本条所有护栏的存在理由。
+
+### 37.2 写侧：`allow_cross_source=False` 与**整批**拒绝
+
+`store_adjust_factors` 新增 `allow_cross_source: bool = False`。当本批 `source` 与「已存储、
+且日期区间与**本批日期**相交」的异源行冲突时：
+
+- **整批拒绝**：一行都不写。不做部分写入 —— 部分成功会让调用方以为同步发生了；
+- **不抛异常**，只发 `warnings.warn(CrossSourceAdjustFactorRefused)`，固定前缀
+  `[REFUSED] cross-source adjust-factor write`。同步流程必须能跑完剩下的 symbol，抛异常会把
+  一个 symbol 的问题升级成一次调度失败；
+- 拒绝条件**只**限定为「日期落在异源已覆盖区间 `[min(date), max(date)]` 之内」。区间**外**的追加
+  一律放行（否则 20 个 legacy-mixed 标的的 Fuyao 增量同步会被永久冻结）；
+- `allow_cross_source=True` 是经审计的逃生口，只给「已验证两侧同一基准」或「确认要覆盖」的工具用。
+
+表结构**未改、无迁移**：`source` 不进主键。读侧仍只有 `get_latest_factor_hfq` 一个 QFQ 锚点。
+
+### 37.3 读侧：`[0.25, 4.0]×` 带，判**实际被应用**的 as-of 因子
+
+新增 `_assert_plausible_adjust_factors` 与异常 `ImplausibleAdjustFactorStep`，常量
+`IMPLAUSIBLE_ADJUST_FACTOR_RATIO = 4.0` / `IMPLAUSIBLE_ADJUST_FACTOR_MIN_RATIO = 0.25`，
+**超带即 fail-closed**（不是警告），消息内给出修复命令与被污染的 bar 区间 `bar_window`。
+
+带为什么是 4×：后复权因子是公司行为的累积乘积，只会上行，真实动作是**百分比级**台阶（本库观测到的
+最大单步约 **1.3×**，如 10 送 3）。而缺陷是一个**换了单位**的值，与中位数差两三个数量级。4× 对
+「拆股密集」的真实标的仍留有巨大余量，同时足以抓住 58.7× 这种事。带是**对称**的：as-of 查找同样会
+看到「过小」的外源锚点并去除以它。
+
+**首次尝试是错的，必须记下来**：第一版把 `query_adjust_factors(symbol, end=...)` 返回的**整段**
+因子取中位数，而该查询**没有 `start` 过滤**，于是 `600660.SH` 的 1993–2023 外源前缀（73.117 ≈ 55×）
+与 `000157.SZ`（45×）让**任何**全历史读取都抛异常 —— 实测 `600660.SH` 2024-09-02..2026-11-10 的
+`qfq` 读取在改前即抛（`value=81.588562` / `median=1.3190` / `date=2026-09-24` / `n_offending=30`），
+把原本「能跑但错价」的路径换成了**不可用**路径。错的价格不是改进，错的报错也不是。
+
+**现行语义**：判定样本 = 本次读取**实际命中**的去重 as-of 因子值（`np.unique(pos[pos>=0])`，
+按**值**去重，避免长连续段把中位数拉偏），`qfq` 模式下再加**归一化锚点** `hfq_latest`（它除到
+每根 bar 上；与事件值重复时不重复计数，事件行优先，故「被污染的锚点恰是最新行」仍按该行自身日期报出）。
+样本为空则不判定。因此护栏的保证是「**被应用到价格上的那一段**因子是单一量级」，
+**不保证**「表里没有历史前缀污染」—— 后者归清洗脚本。这条边界是本节的中心，不要读错。
+
+### 37.4 已执行的清洗（2026-11-11 21:51:45，一次，已收口）
+
+`scripts/repair_cross_source_adjust_factors.py --apply --i-know-this-is-production`：
+
+| 项 | 值 |
+| --- | --- |
+| 删除行数 | **21 行 / 4 个 symbol** |
+| 明细 | `600660.SH` 5、`000999.SZ` 6、`600362.SH` 4、`601919.SH` 6 |
+| 备份目录 | `data/repair_backups/20261111-215145/` |
+| `adjust_factors_removed.json`（21 行原值）md5 | `95b9a4a6fd66aad7147c036da5c802b3` |
+| `repair_manifest.json` `db_md5_before` → `db_md5_after` | `96f322a6…` → `4188e51c…` |
+| `adjust_factors` BaoStock 行数 | **406 → 385**（Fuyao 13,564 行未动） |
+| 事后 dry-run | `nothing to repair`（exit 0） |
+
+事后复核（只读）：`600660.SH` 2026-09-24 的 `qfq/raw` 乘数回到 **0.981413**、
+`000999.SZ` 2026-10-16 = **0.983989**、`601919.SH` 2026-10-23 = **0.973538**；
+`600660.SH` `sma_50` = **54.1603**（改前 114.75，期望 ~54.21，差 0.09%）；
+20 个双源标的在 2024-09-02..2026-11-11 窗口的 `qfq` 读取全部 OK。
+
+**2026-11-13 独立复核实测**（`duckdb.connect(..., read_only=True)`，库文件 md5
+`5688a3dae6a212a5b9515f81f408013c` 读前读后一致、无 `.wal` 生成）：`adjust_factors` 共
+**13,949 行 / 20 个 symbol**，其中 Fuyao `13,564` + BaoStock `385`；`600660.SH / 2026-09-24`
+**已不存在**；`factor_hfq` 无 NULL。该 13,949 与 `docs/cache_snapshot.md` §A.2 表内的现行值一致，
+且与事故前的 13,970 相差正好 21 行 —— 巧合提醒见该文件同处的「行数消歧」注。
+
+### 37.5 残余登记（**(c) 已关闭，其余三条仍为已知残余**）
+
+> **2026-11-13 修订**：本节 (c) 条目于当日**关闭**（写侧新增前沿追加拒绝 `RULE_FRONTIER_APPEND`），
+> 其正文就地改写、不是新增条目；(a)/(b)/(d) 三条**仍未修复**，性质与措辞不变。
+
+以下 (a)/(b)/(d) 三条是**当前产品行为**，不是待办清单上的偶然遗漏。写在这里是为了让下一个人
+先读到它们，再决定是否动护栏。**不要**把它们描述成「已解决」。(c) 已于 2026-11-13 关闭，
+其条目保留下来是为了让读者看到「这个洞曾经存在、以及现在靠什么关掉」，不要当成仍生效的残余。
+
+**(a) 16 个 legacy-mixed 标的仍带外源基准的前缀行。**
+清洗只删「落在异源区间**之内**」的行（那 4 个 symbol 的 21 行）。其余 16 个双源标的的 BaoStock
+行全部落在 Fuyao 区间**之外**，是那些 bar **唯一**的因子行 —— 按判定规则**保留不动**。删掉会让
+这些 bar 退回 1.0 中性因子，误差反而更大。
+
+**(b) `600660.SH` / `000157.SZ` 的全历史读取仍按设计 fail-closed。**
+前缀仍在（`600660.SH` 34 行，最高 73.117 = 55.43× 稠密中位数；`000157.SZ` 27 行，最高 63.0955
+= 45.13×）。只要请求的窗口**跨进**该前缀，读侧护栏就会显式抛 `ImplausibleAdjustFactorStep`
+（实测 `600660.SH` 跨 2024-01-02 报 `1.2452 / 0.02×`）。这是**故意的**：一个显式失败胜过一个
+静默错价。彻底修复需按单一 source 重下这两只标的的 2024 前置历史，属后续动作，本次**未联网拉取**。
+`--drop-foreign-prefix` 经评估**不建议实现**（删后一次性伪阶跃 ±20%~46%，劣于 fail-closed）。
+
+**(c) 前沿追加曾可变成 QFQ 锚点 —— 2026-11-13 已关闭（`RULE_FRONTIER_APPEND`）。**
+写侧原先只拦「日期落在异源区间**之内**」的覆盖，对「日期在区间**之外**」的追加**有意放行**
+（否则增量同步永久冻结）。于是一条**异源基准**的行只要落在稠密区间紧接着的后面，写侧就不会
+拒绝（无键冲突）；而 `get_latest_factor_hfq` 是**跨 source 按 date 取最新一行**，这条行便成为
+qfq 的**除数** —— 若它的数值落在稠密中位数的 `[0.25, 4.0]×` 之内，读侧护栏也不会触发，
+整条 qfq 序列被这条行的基准静默缩放。
+
+**关闭方式（写侧谓词，2026-11-13）**：同一批 `store_adjust_factors` 在「同源」规则之外再加
+一条**前沿**规则 —— 一批数据若 `max(新日期) > 该标的最新已存行日期`，且其来源（先经
+`canonicalize_provider_key` 规范化）**不是**拥有那根最新行的来源，则**整批拒绝、零写入**，
+告警带 `rule=frontier-append` 并给出前沿日期与两侧来源。**仍然放行**：前沿属源自己的追加
+（legacy-mixed 标的上的 Fuyao 日常增量）、前沿**之前**的回补、空标的、同源覆盖。
+
+**读侧一字未改**：`get_latest_factor_hfq` 仍无 source 过滤，`[0.25, 4.0]×` 带与边界均不变
+⇒ 写路径现在是**唯一**防线。因此 `allow_cross_source=True` 仍是审计逃生口，且**强行写入的行
+仍会成为锚点** —— 这一条由 `common/tests/test_cross_source_adjust_factors.py` 的
+`test_frontier_row_forced_in_with_the_hatch_still_becomes_the_qfq_anchor` 钉住，
+不要误以为「加了这个规则，逃生口也安全了」。
+
+**行为变更（必须登记）**：一个**只存过外源前缀**的标的，其**首次本源写入**若越过前沿也会被拒。
+从日期与数值上看，它与「投毒」不可区分，故 fail-closed；真要写就以 `allow_cross_source=True`
+显式升级处理，而不是放宽谓词。
+
+**测试**：该文件 **26 → 31** 条。五个新增用例 ——
+`test_source_switch_past_the_frontier_is_refused_and_named`、
+`test_frontier_poison_is_refused_and_nothing_is_written`、
+`test_frontier_refusal_message_names_the_rule_the_frontier_and_both_sources`、
+`test_legitimate_fuyao_frontier_append_on_a_legacy_mixed_symbol_is_allowed`、
+`test_backfill_behind_the_frontier_on_a_legacy_mixed_symbol_is_allowed`
+（后两条守住「不许把合法形状一起拒掉」）。另有两处**改名**（计数不变）：
+`test_batch_outside_a_foreign_span_is_allowed` → `test_append_behind_a_foreign_span_is_allowed`、
+`…_known_residual` → `test_frontier_row_forced_in_with_the_hatch_still_becomes_the_qfq_anchor`
+（默认路径已改为拒绝，旧名里的 `known_residual` 会指向一个不再存在的洞，故必须换名）。
+
+**(d) 一次真实的 ≳7× 公司行为会被带拦下（假阳性）。**
+带是按**本库**标定的（观测最大单步约 1.3×）。当读取窗口内只有「动作前 / 动作后」两个平台时，中位数
+落在两者之间（`m ≈ (a+b)/2`），小侧触发条件是 `a/m < 0.25`，即 `b/a ≳ 7`。所以一个真实的
+10 拆 1 会 fail-closed。这是当前**有意**的取舍（错的报错优于错的价格），并被
+`test_known_false_positive_a_real_10x_split_is_rejected` 以特征化用例钉死。
+**放宽带是一次需要有独立证据的显式未来变更**，不是顺手调参：放宽同时会放过「中等幅度错基」。
+真正要区分两者得靠 source 维度的结构信息（例如让锚点感知稠密基准），不在本轮范围。
+
+### 37.6 2026-11-13 复核收口：source 字符串规范化（一处真实修复）
+
+**缺陷**：`_cross_source_conflict` 用**原始字符串**比较（`r[0] != source`），而本仓库存在同一
+provider 的两种拼写 —— `common/data.py` 落的是**类名** `BaoStockDataProvider`，
+`store_adjust_factors` 自己的默认值是**短别名** `baostock`。于是一个**依赖默认值**的调用方
+会把自己写过的行判为「异源」，它自己的合法更新被 `[REFUSED] cross-source` 拒掉，因子静默冻结。
+
+**修法**：比较前先规范化 —— 复用本模块既有的**唯一**定义
+`common/duckdb_cache.py::canonicalize_provider_key`（大小写折叠 + 剥离 `DataProvider` 后缀），
+不新增第二份别名表。性质刻意保持很窄：
+`baostock` == `BaoStockDataProvider`、`fuyao` == `FuyaoDataProvider`，而
+**Fuyao 与 BaoStock 必须仍然是两个不同 provider** —— 这一对正是整个写侧护栏存在的理由。
+未知字符串按原样（仅折大小写）通过。
+
+**测试**（`common/tests/test_cross_source_adjust_factors.py`，15 → **26** 条）：
+
+1. `test_source_alias_is_not_treated_as_a_foreign_source` —— 省略 `source=` 默认别名对上已存类名，
+   **零拒绝**且确实写入（钉住本次修复）；
+2. `test_different_providers_still_conflict_after_canonicalisation`（`fuyao` / `Fuyao` /
+   `FuyaoDataProvider` 三拼写参数化）—— 对已存 BaoStock 行**仍然拒绝**、零写入（钉住不可塌缩）；
+3. `test_canonicalize_provider_key_separates_the_two_incident_sources` —— 直接钉住比较键本身；
+4. `test_band_boundary_values_are_accepted`（`4.0×` / `0.25×`）与
+   `test_band_boundary_values_just_outside_are_rejected`（`4.01×` / `0.24×`）—— 带边界为**闭区间**。
+   此前只有 62× 与 1.3× 样本，`>` 还是 `>=` 无人钉住；现在改 `>` 为 `>=` 即转红（已实测）；
+5. `test_known_false_positive_a_real_10x_split_is_rejected` —— 37.5(d) 的特征化用例；
+6. `test_frontier_row_forced_in_with_the_hatch_still_becomes_the_qfq_anchor` —— 37.5(c) 在
+   `allow_cross_source=True` 下的特征化用例（原 `…_can_become_the_qfq_anchor_known_residual`，
+   2026-11-13 关闭 (c) 时改名：默认路径已改为拒绝，只剩显式逃生口仍能复现旧行为）。
+
+5 的用例名与 docstring 显式写明「这是已知的假阳性，不是受支持的行为」；6 的 docstring 写明
+「只有 `allow_cross_source=True` 才会复现旧行为，默认路径已拒绝」—— 以免后来者「顺手修好」
+或以为该带本来就该这样。
+
+**验证（实跑）**：`common/tests/test_cross_source_adjust_factors.py` → **26 passed**；
+`common/tests -k "adjust_factor or cross_source or duckdb_cache"` → **130 passed, 1331 deselected**。
+全部 100% 离线（内存 / 临时 DuckDB），零 provider、零网络、零真实行情。
+
+### 37.7 边界
+
+本条**未改**任何策略类 / 模板、未改 `blend_base.py`、**未 bump `version` 与 `BASE_VERSION`**
+（`common/duckdb_cache.py` 本就没有版本轴）、未跑 `--dump-strategies`、未联网、未写
+`data/cache.duckdb`（复核全程 `read_only=True`，库文件 md5 读前读后一致、未生成 `.wal`）、
+未动 `web/livetrading/**` 与 `scripts/*`、未执行任何新的 `--apply`。
+
+## 38. `R7b` 独立复核收口：5m 门禁的「本轮实测尺度」读错层级（执行层变更，无版本轴变动，2026-11-13）
+
+> **本节编号**：落笔前实测现有最高节号为 **37**（`37.1`–`37.7`，另一路 worker 正在写），
+> 因此本节取 **38**，并按只追加的方式写在文件末尾。
+
+独立复核结论：**无阻断项**，但存在一个真实 MEDIUM 缺陷（F1）与若干加固项（F2 / N3 / N4）。
+本节记录修复与未做项。
+
+### 38.1 F1（真实缺陷）：`evaluated` 的尺度从不来自「本轮测量」
+
+**生产侧到底把值写在哪**（本节落笔时实测行号；同文件有并发改动，行号相对复核时整体下移约 50）：
+
+| 位置 | 内容 |
+| --- | --- |
+| `scripts/check_live_portfolio_health.py:4052` / `:4219` | 未测得 / 测得分支各自把 `intraday_buy_scale` 写进 `intraday_5m_info` |
+| `scripts/check_live_portfolio_health.py:3197` | 该 dict 以 `intraday_5m_metrics` 为键进入 `stage1_health_report.json` |
+| `scripts/check_live_portfolio_health.py:1207` / `:1243` | 同时镜像进 `account_state.json`（degraded / 正常两个分支） |
+| 报告**顶层** | **不存在** `intraday_buy_scale` 这个键（`grep` 全文件仅上述处） |
+
+**缺陷**：`scripts/run_live_strategy.py::resolve_intraday_gate_state` 只读报告顶层
+（修复前 `:2524`），再兜底读 `account_state`（`:2526`）。由于生产从不写顶层键，第一个读取
+**恒为 `None`**，"实测尺度"永远来自 `account_state` 的上一轮残留值。两个后果：
+
+1. 「本轮测量即单一事实来源」的设计意图未达成——分支 4（修复前 `:2580`）自称 `evaluated`，
+   实际数值来自上一轮；
+2. `status_5m is None`（Stage 1 根本没产出 `intraday_5m_metrics` 块）而 5m **已启用**时，
+   分支 4 仍返回 `evaluated` + 残留尺度。这正是本函数在 `gate_code` / `freeze_remaining_bars` /
+   `linear_equity_scale` 上已经防住的「残留值冒充本轮事实」同类问题。
+
+**为什么既有测试抓不到**：旧测试把尺度写在**报告顶层**（
+`{"gate_code": ..., "intraday_buy_scale": 0.50}`）——那是 Stage 1 从不产出的形状。
+测试与缺陷代码共享同一个错误假设，于是两边一起「通过」。（旁证：旧测试
+`test_account_state_scale_is_still_honoured` 甚至把「`account_state` 镜像可当实测来源」写成了断言。）
+本次已把测试改为**生产真实形状**（嵌套块），并由红检证明新测试确实会转红。
+
+### 38.2 修法（代码形状）
+
+读取顺序（`scripts/run_live_strategy.py:2545-2580`）：
+
+```python
+reported_raw = metrics.get("intraday_buy_scale")        # 生产唯一来源
+if reported_raw is None:                                 # 仅旧/手写报告的最后兜底
+    reported_raw = health_report.get("intraday_buy_scale")
+report_carries_scale = reported_raw is not None          # 「带了但不可用」≠「没带」
+reported_scale = _finite_scale(reported_raw)
+measured_scale = reported_scale if reported_scale is not None else (
+    _finite_scale(account_state.get("intraday_buy_scale")) if not report_carries_scale else None
+)
+```
+
+- **顶层读取保留为最后兜底**，理由写进代码注释：那是历史/手写/第三方报告的唯一可能形状，
+  保留不会让生产路径变松（生产永不写该键，`reported_raw` 已在第一步拿到）。
+- **`report_carries_scale` 与解析值分开记录**：报告带了键但值不可用（`NaN` / `inf` / 非数值）
+  时**不得**静默借用 `account_state` 而看起来像测过了——这条性质由
+  `test_non_finite_scale_fails_closed` 继续钉住。
+
+分支 4 拆成四段（`:2623-2663`），全部复用既有状态与原因码，未新增词汇：
+
+| 段 | 条件 | 结果 |
+| --- | --- | --- |
+| 4a | 报告自带尺度（嵌套优先，顶层兜底） | `evaluated` + 该值 |
+| 4b | 有 status token 但报告无尺度（`account_state` 有值） | `evaluated` + 镜像值（token 说明**本轮**确实测量了，镜像同轮写入） |
+| 4c | **无 token + 5m 明确启用** | `unknown_fail_closed` + `0.0`（`intraday_buy_scale_missing_fail_closed`） |
+| 4d | 无 token + 开关未解析（`enabled is None`，仅非 `main()` 调用方） | 沿用旧镜像兜底 `evaluated` |
+
+`pending_publication`（分支 3）**未改动**：它仍可用「报告优先、`account_state` 兜底」的
+`measured_scale`，与本轮前逐字节一致。
+
+### 38.3 行为变更（必读）
+
+- **5m 启用但 Stage 1 无 metrics 块**：`evaluated` + 上一轮残留尺度 → **`unknown_fail_closed` +
+  `0.0`**（原因码仍是 `intraday_buy_scale_missing_fail_closed`）。新开 / 加仓增量冻结，
+  卖单与减仓不变。这是本次唯一的行为变更，方向是"更保守"。
+- **5m 未启用（`not_applicable`）**：逐字段不变（`test_default_paths_are_unchanged_by_the_nested_read`
+  用字面 dict 钉住 `gate_status` / `reason` / `scale` / `5m_status` / `enabled` / `enabled_source` /
+  `gate_code` 七个键）。
+- **`pending_publication`**：逐字段不变（同一测试的第二个字面 dict），且 `apply_...gate` 仍返回
+  调用方**同一个对象**（identity）。
+- **55+ 策略 / 9 个静态模板**（不启用 5m）：`main()` 解析出的开关为 `False` → 分支 1；无开关、
+  无 metrics、无 `CAUTION_INTRADAY_DISTRIBUTION` 指令 → 分支 2。两条路径都在本次改动**之前**
+  就返回 `1.0`，票据字节不变。
+- **为什么 4d 仍然保留镜像兜底**：`main()` 永远显式传 `intraday_5m_enabled`
+  （`:5252` `enable_intraday_5m = args.enable_intraday_5m or resolve_blend_param(...)`），
+  所以"开关未解析"这条形状在真实两阶段流程里**不可达**；它只服务于外部/历史调用方，由
+  `common/tests/test_live_strategy.py::test_apply_intraday_distribution_gate_account_state_fallback`
+  钉住。同一组输入，只要传 `intraday_5m_enabled=True` 就转为 4c 冻结——两边都由
+  `test_legacy_unresolved_switch_still_uses_the_state_mirror` 钉住。
+
+### 38.4 N3 决策：`intraday_buy_scale_applied` 的语义（改注释，不新增字段）
+
+原注释称它是「真正施加到买入增量上的乘数」，但字段只记录**分布门禁**那一层；R1 同时触发时
+实际施加的是 `real × r1`。本次选择**修正注释**而不是新增顶层 `effective_buy_scale`：
+
+- 组合值**已经存在**于每行 `detail_reason.advisory.effective_buy_scale`（R1 实际生效时写入）
+  与控制台 `[R1 INTRADAY DERISK]` 行，再加一个顶层副本只是第二份可漂移的真相；
+- 该字段与 `intraday_gate_status` 属**同一根轴**（分布门禁），保持"一个状态一个数"；
+- 新增顶层键会改变 R1 生效时的票据 schema，而 R1 默认关闭（双重开关），收益不抵风险。
+
+### 38.5 F2：状态词表的同一性（只加测试断言，不加运行时机制）
+
+`pending_publication` 在三个模块里各写一次字面量（`common/intraday_features.py:1151`、
+`check_live_portfolio_health.py:2309`、`run_live_strategy.py:2446` / `:2474` / `:4631`）；`evaluated` / `available` /
+`missing` 同理。本次**不**引入共享常量（Stage 1 刻意保持惰性导入），改为在
+`pipeline/tests/test_intraday_5m_publication_state.py::test_status_vocabulary_is_identical_across_the_three_modules`
+里做**恒等断言**：三处 `pending_publication`、三处原因码 `intraday_5m_pending_publication`、
+`evaluated` / `available` 与 Stage 2 两个集合的成员关系，任一处改名即转红。
+
+`_5M_MEASURED_STATUSES = {"evaluated", "available"}` 混用两套词表：**保留** `"available"` 并写注释
+说明它是**刻意的冗余**——它对应 `publication_state` 轴，当前经
+`_resolve_5m_status_token`（`status` 优先）不可达，但若将来出现只带 publication 轴的报告，
+该 token 会被读成"已发布/已测得"而不是被误冻结；且它**不能**单独放行任何值（仍需真实尺度）。
+`"evaluated"` 才是 `status` 轴的真实 token。
+
+### 38.6 N4：测试加固
+
+1. `test_evaluated_without_alert_is_a_no_op` 原来**永远走不到** `intraday_buy_scale >= 1.0` 的
+   空操作分支（`gate_code != CAUTION_...` 提前返回）。新增 `gate_code=CAUTION` + `scale=1.0`
+   用例，断言 `out is target`（**对象恒等**，而非数值相等——`cur + delta*1.0` 的往返已可能改动浮点）。
+2. 删掉 `== 0.0` 旁边冗余的 `!= 0.50`。
+3. AST 守卫从"仅字面 `.get(key, default)`"扩展到三种形状：
+   (a) 任何默认值（含 `None` 之外的常量）；(b) **改名的首参**（`k = "intraday_buy_scale"` 后
+   `d.get(k, 0.5)`，通过收集该字符串字面量的赋值目标实现）；(c) **`or` 默认值**
+   （`d.get(key) or 0.50` / `d[key] or 0.5`）。
+   **仍然抓不到的**（已在测试 docstring 中明写，不声称完备）：`if scale is None: scale = 0.5`
+   之类的普通分支赋值、`DEFAULT_SCALE = 0.5` 交给包装函数、以及 `_scale(report) or 0.5`——
+   这些需要数据流分析，本守卫刻意保持纯语法层。
+
+### 38.7 N5：未做（说明）
+
+`assess_intraday_5m_freshness` 与 `assess_intraday_5m_publication_state` 各自读一次墙钟，
+在 `now` 省略时亚秒级漂移理论上可能跨过 20:00 边界。**本次不做**：两个生产调用点
+（`check_live_portfolio_health.py:3923`、`run_live_strategy.py:4624-4628`）都显式传 `now`，
+所以该形状在生产不可达；而修它要改 `common/intraday_features.py` 的函数体（本次仅授权
+"必要时加共享常量"），收益为零、churn 与回归面不为零。
+
+### 38.8 验证（实跑，含红检）
+
+```
+pipeline/.venv/bin/python -m pytest pipeline/tests/test_intraday_5m_gate_three_state.py \
+    pipeline/tests/test_intraday_5m_publication_state.py -q
+-> 29 passed in 1.00s
+
+pipeline/.venv/bin/python -m pytest pipeline/tests -q -k "intraday_5m or stage1 or stage2 or gate"
+-> 208 passed, 1148 deselected, 3 warnings in 5.74s
+```
+
+红检（把 F1 就地回退成修复前形状，随后按 sha256 原样还原
+`f15f5f1679797fca9f202c891478a65dc64d3c8150e8bdd49ee45911c79f4f0c`）：
+
+- `test_stale_account_state_scale_is_not_a_measurement_without_a_metrics_block`
+  → `AssertionError: 0.5` / `assert 'evaluated' == 'unknown_fail_closed'`（旧码用残留尺度放行）；
+- `test_report_shape_parity_nested_equals_legacy_top_level`
+  → `{'intraday_buy_scale_applied': 0.0, 'intraday_gate_status': 'unknown_fail_closed'}`
+  `!= {'intraday_buy_scale_applied': 0.5, 'intraday_gate_status': 'evaluated'}`——
+  即"生产真实形状"在旧码下根本读不到尺度；
+- 连带转红：`test_nested_report_scale_is_the_measurement`、
+  `test_nested_report_scale_beats_a_stale_account_state_carry_over`（`assert 0.5 == 1.0`，
+  残留值压过报告值，缺陷一行复现）、`test_legacy_unresolved_switch_still_uses_the_state_mirror`。
+
+全量回归：`pipeline/tests`（`--import-mode=importlib`）→ **1344 passed, 1 skipped**；
+`common/tests` → **1460 passed, 1 skipped**；`common/tests/test_live_strategy.py` → **25 passed**
+（未改该文件，旧镜像兜底断言仍通过）。
+
+### 38.9 边界
+
+本次**未改**任何策略类 / 分配模板 / `blend_base.py` ⇒ **未 bump `version` / `BASE_VERSION`**、
+**未跑 `--dump-strategies`**（票据新增字段为零）。改动文件仅：
+`scripts/run_live_strategy.py`（门禁解析 + 两处注释）、
+`pipeline/tests/test_intraday_5m_gate_three_state.py`、
+`pipeline/tests/test_intraday_5m_publication_state.py`、本节（`docs/version.md`）。
+未动 `web/livetrading/**`、`common/duckdb_cache.py`、`docs/development_plan.md`、
+`common/intraday_features.py`、`scripts/check_live_portfolio_health.py`（F1 的写侧无需改动：
+它本来就是对的）。测试全程 100% 离线（手写 pandas Series / dict），零 provider、零网络。
+
+## 39. 中国交易日历三处更正：2024-02-09 补入、2026-10-08 移除、2026-02-23 补入（数据表更正，无版本轴变动，2026-11-13）
+
+> **本节编号**：落笔前实测现有最高节号为 **38**，因此本节取 **39**，并按只追加的方式写在
+> 文件末尾。本次**未**改任何策略类 / 分配模板 / `blend_base.py`。
+
+`common/market_holidays.py` 的中国休市表有两处与实测行情矛盾、一处需由所有者裁决。
+三处均已在同一批（2026-11-13）就地更正，`TABLE_REVISION` 由 `2026-10-23.2` →
+**`2026-11-13.1`**（同一天同一批更正，不拆成三个修订号）。
+
+### 39.1 三处更正一览
+
+| 日期 | 方向 | 依据 | 改前 | 改后 |
+| --- | --- | --- | --- | --- |
+| `2024-02-09` | 补入（2020–2025 **固定**年，非 provisional） | 缓存实测证据 | 交易日（表内无任何 bar） | 休市 |
+| `2026-10-08` | 从国庆块**移除**（`PROVISIONAL` 年） | 缓存实测证据 | 休市 | 交易日 |
+| `2026-02-23` | 补入（`PROVISIONAL` 年） | **所有者裁决 2026-11-13** + 数据旁证 | 交易日 | 休市 |
+
+更正后的块形状（周末行按表设计省略，见模块 docstring §3）：
+
+- **2024 春节**：表内 = `02-09, 02-12, 02-13, 02-14, 02-15, 02-16`；加上被省略的周末
+  `02-10/11`（六/日）与 `02-17`（六），即真实的 **`02-09…02-17`** 连续休市。改前只有
+  `02-12…02-16`，即整块**缺首日**。
+- **2026 春节**：`02-16, 02-17, 02-18, 02-19, 02-20` **+ `02-23`**；`02-24` 仍是交易日。
+- **2026 国庆**：`10-01, 10-02, 10-05, 10-06, 10-07`（`10-03/04` 为周末，省略），即真实
+  **`10-01…10-07`**；`10-08` 恢复为交易日。
+
+### 39.2 证据（全部只读实测 `data/cache.duckdb`，2026-11-13）
+
+库规模：`ohlcv_bars` 共 72,367 行；`FuyaoDataProvider` / `MarketDBDataProvider` 各 **27**
+个标的（20 只股票 + 7 只指数），两源覆盖 `2016-01-04…2026-11-12`；`intraday_ohlcv_bars`
+覆盖 `2026-09-01 09:35…2026-11-12 15:00`（47 个交易日）。
+
+1. **`2024-02-09`**：该日在**两个**日线源下都是 **0 行**，5m 表同样 0 行；相邻的
+   `2024-02-08` 与 `2024-02-19` 各有完整的 20 只截面。注意 27 个标的中只有 20 只股票
+   拥有 2024 年初的历史（7 只指数起于 `2026-09-22`），故该窗口内的可观测全集就是 20 只，
+   不是 27 只。
+2. **2024 全年反查（这才是「补一天」的真正理由）**：对 2024 每个**表内交易日**检查
+   「两源同时无 bar」，结果**恰好只有 `2024-02-09` 一个**；反向检查（表内休市日却两源都有
+   bar）**为空**。因此没有第二个 2024 空洞，只补这一天，不做任何外推。
+3. **`2026-10-08`**：两个日线源均携带 **27/27** 标的的完整截面（与 `2026-10-09` 同覆盖）；
+   独立 BaoStock 5m 源为 **21 标的 × 48 根 = 1,008 行/标的日**，`48` 根即
+   `09:30–11:30 + 13:00–15:00`，**无午休窗口 bar**，与"完整交易日"一致而非残缺/回放。
+4. **区间对称差**：`2026-09-01…2026-11-12` 内 5m 表实有 **47** 个交易日，表隐含 **46**
+   个，`cal_only = ∅`、`data_only = {2026-10-08}` —— 差集恰好是这一天。
+5. **`2026-02-23`**：两个日线源均 **27/27 标的 0 行**，5m 表 0 行（5m 仅覆盖 9 月起，
+   故 5m 对此日**不能作旁证**）。它是数据范围内 2026 年**唯一**「表内交易日却零 bar」的日子：
+   `02-16…02-20` 零 bar 是因为**它们本来就是表内休市日**，`02-24` 起又恢复 20 只完整截面。
+   **单凭一个普遍空洞无法区分「真休市」与「同步缺陷」**，这正是当时不动它的原因；本次由
+   **所有者于 2026-11-13 裁决为休市**，裁决 + 数据旁证共同构成依据 —— 这是对表内
+   「交易日」的**更正**，不是新的假设。
+
+### 39.3 对实盘的影响（`expected_last_session` / `is_stale_bar` / `strict_freshness`）
+
+新鲜度门禁 `common/freshness.py::is_stale_bar` 是**单侧**比较：只有 `bar < expected` 判为
+陈旧，**比 expected 更新的 bar 一律接受**（live 调用方在 `as_of_universe` 已按 as_of 截断）。
+据此三处的影响方向**并不一致**，本节按实测结果记录，而不是按预期记录：
+
+- **`2024-02-09`（真正的误报 FAIL，已消除）**：改前 `2024-02-12 10:00 CST` 的 as_of 解析为
+  `2024-02-09`（表内交易日，但**任何源都没有 bar**）。同步到位的最新 bar 是 `02-08`，
+  `02-08 < 02-09` ⇒ `is_stale_bar = True` ⇒ `strict_freshness` 对**每个标的**报
+  `STALE PRICE`。即 `02-12…02-19` 收盘+宽限之前的每个运行窗口都必然 FAIL，且 FAIL 归因于
+  "数据陈旧"，与数据无关。改后 as_of = **`2024-02-08`**（真实交易日），误报消失。
+- **`2026-02-23`（同向的误报 FAIL，已消除）**：改前 `2026-02-24` 收盘+宽限前 as_of =
+  `2026-02-23`；最新真实 bar 为 `2026-02-13`，`02-13 < 02-23` ⇒ 全标的 FAIL。改后
+  as_of = **`2026-02-13`**；`02-24 15:30 CST`（收盘+宽限）之后翻到 `2026-02-24`。
+- **`2026-10-08`（方向相反，必须诚实标注）**：任务书预期是"最新 bar 是 10-08 而 expected
+  停在前一交易日 ⇒ 全标的误报 FAIL"，**实测不成立** —— 见上面的单侧比较：改前 `2026-10-09`
+  运行的 as_of 是 `2026-09-30`，而最新 bar 是 `10-08`（**更新**）⇒ `is_stale_bar = False`，
+  **不会**报 stale。真实的改前后果更隐蔽：**as-of 被算早 5 个交易日**，
+  `as_of_universe(..., 2026-09-30)` 把 `10-08` 这根 bar 丢掉，账面估值、运行目录与
+  `summary.json` 的 as-of 都回退到 `09-30`，而数据其实就在库里；同时若 `10-08` 的 bar
+  **真的缺失**，这个缺口会被更早的 expected **掩盖**（该报的没报）。改后 as_of =
+  `2026-10-08`，`is_stale_bar(..., "2026-10-08")` 对 `10-08` 的 bar 为 `False`（PASS）。
+  该回归已由测试钉死（`assert expected == "2026-10-08"`），并在红检时复现为
+  `assert '2026-09-30' == '2026-10-08'`。
+- **窗口影响面**：三处都只改变"窗口终点落在该日及之后"的 `expected_last_session`。最晚的
+  一处是 `2026-02-23`，已在过去 ⇒ **对今天（2026-11-13）及以后的 live 窗口没有任何影响**，
+  属于历史口径更正。
+
+### 39.4 未改动的东西
+
+- `PROVISIONAL_YEARS` **保持不变**（`frozenset({2026, 2027})`）。三处更正都不构成对 2026 年
+  整体安排的复核：`2026-10-01…07`、`02-16…20` 等**仍然是规则推导、未对表 SSE/SZSE 公告**，
+  需按 `common/market_holidays.py` docstring 的复核清单取公告后再改注释与修订号。
+- `COVERAGE_START_YEAR` / `COVERAGE_END_YEAR`（2020/2027）、`*_EARLY_CLOSES`（中国无半日市）
+  均未动。**未外推**：2027 块逐字未改。
+- 未改任何策略 / 模板 / `blend_base.py` ⇒ **未 bump `version` / `BASE_VERSION`**、
+  **未跑 `--dump-strategies`**。改动文件仅：`common/market_holidays.py`、
+  `common/tests/test_market_clock.py`、新增 `common/tests/test_market_holidays_data_corrections.py`、
+  `pipeline/tests/test_post_close_run_window.py`（国庆窗口终点/`next_trading_day` 钉值随 10-08
+  更正）、本节。
+- **未动**：`scripts/**`、`web/livetrading/**`、`strategies_config.json`、
+  `docs/development_plan.md`。`docs/market_clock_and_asof_resolution.md` 也不在本任务文件
+  所有权内，若其中引用旧国庆块 `10-01..08`，需另立单更新。
+
+### 39.5 测试与红检
+
+新增 `common/tests/test_market_holidays_data_corrections.py`（10 项，全程离线、冻结时刻，
+不读 `data/cache.duckdb`）：2024-02-09 非交易日且春节块抵达 `02-09`；2026-10-08 为交易日、
+国庆块止于 `10-07`；2026-02-23 为休市（裁决）且 `02-24` 仍为交易日；三条
+`expected_last_session` 落点断言；两个方向的 `is_stale_bar` 断言；以及"表内只含工作日"的
+结构不变式（`2024`/`2026` 两年）。
+
+随数据更正而必须更新的**钉值测试**：
+
+- `common/tests/test_market_clock.py`：`test_known_landmark_closures_are_present` 的中国
+  地标 `2026-10-08` → `2026-10-07`；`test_pinned_early_close_dates` 里
+  `table_revision().endswith(".2")` → 精确钉 `"2026-11-13.1"`；
+  `test_first_session_after_spring_festival_valued_against_pre_holiday_close` 的首个交易日
+  `2026-02-23` → `2026-02-24`（`02-23` 已是休市）。
+- `pipeline/tests/test_post_close_run_window.py`：
+  `test_holiday_end_is_the_next_session_after_the_closure` 的国庆窗口终点
+  `2026-10-09 09:30` → `2026-10-08 09:30`，`next_trading_day(china, 2026-09-30)`
+  `10-09` → `10-08`。
+
+命令与结果（实测）：
+
+```
+pipeline/.venv/bin/python -m pytest common/tests -q -k "holidays or market_clock or freshness"
+-> 166 passed, 1307 deselected in 1.46s
+
+pipeline/.venv/bin/python -m pytest pipeline/tests -q -k "market_clock or half_day or freshness or stage1"
+-> 143 passed, 1226 deselected, 10 warnings in 7.21s
+```
+
+红检（把 `2026-10-08` 就地加回国庆块，其余不动）：
+
+- `test_expected_last_session_on_2026_10_09_is_2026_10_08` →
+  `AssertionError: assert '2026-09-30' == '2026-10-08'`（正是改前的错误 as-of）；
+- `test_2026_10_08_bar_is_not_stale_and_the_pre_fix_defect_was_silent` → 同一条断言处转红；
+- `test_2026_10_08_is_a_trading_day_and_the_block_stops_at_10_07` → 转红（`10-08` 又变休市）。
+  共 **3 failed**。随后按 `sha256` 原样还原（`e3812d0af3cd11778c7f5976954294cbfc73567750e84b8366e9600ba857c1df`
+  前后一致，`diff` 为空）。
+
+全量回归（本节落笔时实测，一次跑完）：
+
+```
+pipeline/.venv/bin/python -m pytest common/tests -q
+-> 1472 passed, 1 skipped, 29 warnings in 81.57s
+
+pipeline/.venv/bin/python -m pytest pipeline/tests -q
+-> 1368 passed, 1 skipped, 61 warnings in 565.63s
+```
+
+`common/tests` 的本次增量是**新增 10 项用例**；`pipeline/tests` 本次**只改 1 个钉值测试、
+未新增用例**。两次全量之间其余的数字变化来自并发改动（同期另有 worker 在同一工作树内写
+`web/livetrading/**`、`scripts/**` 及其测试），不属于本节范围，也不作为本节结论的依据。
+
+## 40. 5m 行情提供方从「运行级推导」改为「配置层固定」（`ChanFourStateBlendStrategy` `1.3.1 → 1.4.0`，2026-11-13）
+
+> **本节编号**：落笔前实测现有最高节号为 **39**（`grep -n '^## ' docs/version.md` 的最后一项），
+> 故本节取 **40**，按只追加的方式写在文件末尾；§39 及更早内容一字未改。
+> 本节只动一个参数轴 —— **哪一份 5m bar 由哪个 provider 提供**。日线 provider
+> （`--data-provider`）、5m 开关（`enable_intraday_5m`）、5m 截断时点（`intraday_cutoff_time`）
+> 的语义均未变。
+
+### 40.1 起因：同一份 5m 覆盖在两个半区**互不重叠**（只读实测 `data/cache.duckdb`）
+
+`intraday_ohlcv_bars` 的 provider 覆盖**不是**「任一 provider 都能供全 28 只」。实测（只读，
+`duckdb.connect(..., read_only=True)`，2026-11-13）：
+
+| provider（= 写侧存的类名） | 标的数 | 每标的行数 | 区间（`ts` 的日期部分） | 其中指数 | 合计行数 |
+| --- | ---: | ---: | --- | ---: | ---: |
+| `BaoStockDataProvider` | **21** | 2,256 | `2026-09-01 → 2026-11-12` | **0** | 47,376 |
+| `FuyaoDataProvider` | **7** | 1,728 | `2026-09-16 → 2026-11-12` | **7** | 12,096 |
+| `EastMoneyDataProvider` | **7** | 1,728 | `2026-09-16 → 2026-11-12` | **7** | 12,096 |
+
+- 21 = **20 只股票 + `511880.SH`**（现金替代腿）。`BaoStockDataProvider` 下**一只指数都没有**
+  —— `StrategyConfig.intraday_5m_provider` 的注释记载 BaoStock 对指数日内查询直接报错，
+  即这是"不支持"，不是"暂时缺数据"。
+- 7 只指数（`000001.SH`、`000016.SH`、`000300.SH`、`000852.SH`、`000905.SH`、`399001.SZ`、
+  `399006.SZ`）**只**存在于 Fuyao / EastMoney 两个键下，两源逐标的行数完全相同（各 1,728）。
+- 三行合计 47,376 + 12,096 + 12,096 = **71,568**，与整表 `count(*)` 一致（无第四种 key）。
+- **短名键全部 0 行**：`provider='fuyao'` / `'baostock'` / `'eastmoney'` 各 **0** 行。写侧存的是
+  `type(self.inner_provider).__name__`（`common/data.py` 5 处），读侧 `query_intraday_bars`
+  的 WHERE 是严格 `provider = ?`。
+
+因此**任何单一运行级 `--data-provider` 都不可能有哪一半是"直接拿到"的**：选 BaoStock，7 只指数的
+5m 只能经由兜底链；选 Fuyao / EastMoney，20 只股票的 5m 也只能经由兜底链。两半总有一半靠运气 ——
+而那条兜底链本身还有一处是死的（§40.3）。
+
+### 40.2 参数与解析链
+
+新增 `StrategyConfig.intraday_5m_provider: Optional[str] = None`
+（`pipeline/research_strategy/rs/config.py:893`）。**默认 `None` = 旧行为逐位保留**：5m provider
+仍由运行级 `--data-provider` 推导，逐标的是否回退仍由 `load_intraday_5m_universe` 的兜底链决定。
+
+解析链（与 `enable_intraday_5m` 完全同一条，复用同一个 resolver）：
+
+```
+cfsb_intraday_5m_provider
+  -> blend_intraday_5m_provider
+  -> intraday_5m_provider
+  -> cfg.intraday_5m_provider
+```
+
+最后一步是 `BaseBlendAllocationStrategy.resolve_param` 的**裸名 `getattr(cfg, name)` 兜底** ——
+这正是 AGENTS.md §7 里 `wq_alpha_id` 事故的机制。一个 blend 的 `get_sub_strategies` 若用裸名解析
+某个与新全局字段同名的选择参数，就会静默吃到全局值。本例的安全边界是：`intraday_5m_provider`
+**不是**任何子策略选择参数的裸名（全仓只有该配置字段、`strategies_config.json` 的钉值、测试里的
+同名字面量），因此裸名兜底只会命中新字段本身。
+
+三个入口各自构造**只喂 5m** 的第二个 provider 实例（日线实例与缓存刷新路径不动）：
+
+| 入口 | 第二实例 | 打印（原文） |
+| --- | --- | --- |
+| `scripts/check_live_portfolio_health.py`（Stage 1） | `provider_5m = get_data_provider(_5m_provider_name, ...)`，只传给 `load_intraday_5m_universe` | `[INTRADAY 5M] 5m 行情提供方已按策略参数固定为 {name}（日线仍用 {args.data_provider}）` |
+| `scripts/run_live_strategy.py`（Stage 2） | `provider_5m = get_data_provider(intraday_5m_provider or args.data_provider, ...)` | `[INTRADAY 5M] 5m 行情提供方已固定为 {name}（日线仍用 {args.data_provider}）` |
+| `scripts/run_live_multi_strategy.py`（多策略轮） | 每轮**一次** 5m 加载 ⇒ 一个 `provider_5m` | 同上（`round_5m_provider`） |
+
+- **多策略轮的合并规则**（`combine_intraday_5m_providers`）：无钉值 → `None`；一个钉值 → 该值；
+  多个一致 → 该值；**多个不一致 → 取首个请求方的钉值并打 WARN 列出全部钉值**（一轮只做一次
+  5m 加载，物理上不可能有两个 provider，故不做"静默择一"）。
+- **Stage 1 → Stage 2 转发**：`build_stage2_command(..., intraday_5m_provider=...)` **仅在解析到值
+  时**追加 `--intraday-5m-provider <name>`；`None` 时一个字节都不加，既有 argv 逐字节不变
+  （`pipeline/tests/test_intraday_5m_provider_param.py` 有对应断言）。
+- **`effective_params.json`**：该参数按 `param_entry(declared, resolved, source)` 三元组落盘
+  （`common/effective_params.py`），即 `declared` = 从 `cfsb_*` / `blend_*` / 裸名里**声明**到的值，
+  `resolved` = 本轮**实际使用**的值，`source` = 闭集词表里的来源标签（CLI 覆盖 / dump /
+  `strategies_config.json` / default）。"配置写了但没生效"与"根本没写"因此可区分。
+
+### 40.3 真实 bug：兜底链里 Fuyao 拼成了短名，而读侧是精确匹配
+
+`common/intraday_features.py::_INTRADAY_5M_FALLBACK_PROVIDERS` 原本是
+`("BaoStockDataProvider", "EastMoneyDataProvider", "fuyao")` —— 前两项是写侧类名，第三项却是**短名**。
+
+- 写侧恒为类名（`common/data.py` 多处 `type(self.inner_provider).__name__`；
+  `DuckDBCache.store_intraday_bars` 按传入 key 落库）；
+- 读侧 `DuckDBCache.query_intraday_bars` 的 WHERE 是 `provider = ?`，**精确匹配**；
+- ⇒ `"fuyao"` 这个兜底项**命中 0 行**，整条兜底链的第三段是死的。
+
+后果在"把 5m 固定到 BaoStock"之后才显形：BaoStock 有 21 个标的、**0 只指数**，而 7 只指数只在
+Fuyao / EastMoney 下 ⇒ 指数腿的 5m 会静默消失（28 → 21 只，只有一条 WARNING）。
+
+修复（同一批）：
+
+1. 元组改为**写侧拼写**（`FuyaoDataProvider`），不再是短名；
+2. 新增 `_intraday_5m_provider_spellings(name)`，把一个规范名展开成它可能被写入的全部**精确键**
+   （写侧类名在前，短名与规范名兜底）；
+3. `_intraday_5m_provider_order(...)` 改为**按精确键**去重 —— 改前按**规范名**去重，正是"短名赢下
+   整组、于是整组只剩一个匹配不到任何行的键"的根因；
+4. `fuyao` == `FuyaoDataProvider` 的**等价关系仍然只由** `common/duckdb_cache.py::canonicalize_provider_key`
+   拥有（`_intraday_5m_canonical_provider` 只是调用它），本节与新 helper **没有**第二份等价规则；
+5. **故意不**在 `query_intraday_bars` 内做自动解析：读路径静默回退会把拼写错误（如 `fuyoa`）
+   洗成一次"成功读取"。可选的对账入口是调用方显式调用的 `DuckDBCache.resolve_provider_key`
+   （三步：精确键命中即返回 → 唯一规范名匹配 → 否则原值返回，并打 WARNING）。
+
+### 40.4 版本轴
+
+| 项 | 改前 | 改后 | 理由 |
+| --- | --- | --- | --- |
+| `ChanFourStateBlendStrategy.version` | `1.3.1` | **`1.4.0`** | 向后兼容的**参数新增** + 该策略在 `strategies_config.json` 的**钉值新增**；信号计算与仓位逻辑零改动 ⇒ MINOR |
+| `BaseBlendAllocationStrategy.BASE_VERSION` | `2.0.0` | **`2.0.0`（不变）** | 未改 `pipeline/research/blend/blend_base.py` |
+| 其余 5 个 blend 子类 | — | **全部不变** | `chan_crisis_shield_blend` `1.0.2`、`chan_dual_hybrid_blend` `1.0.1`、`chan_four_state_shield_blend` `1.0.1`、`chan_risk_managed_blend` `1.1.1`、`generic_blend` `1.0.1` |
+
+同步项：
+
+- `strategies_config.json` 的 `chan_four_state_blend.parameters` 增 **一行**
+  `"intraday_5m_provider": "baostock"`（未加前缀：该键是全局 `StrategyConfig` 字段的裸名，链上
+  第二/第三步都可以命中）；其它键**一字未动**，含 2026-10-22 记录的部署例外
+  `blend_weighting_mode="regime_ic_ir_hybrid"`、`blend_enable_orthogonalization=true`、
+  `cfsb_inertia_relative_ratio=0.30`。
+- 两个版本断言测试同步到 `1.4.0`：`common/tests/test_strategy_versioning.py:195`、
+  `pipeline/research_strategy/tests/test_blend_strategy_versioning.py:78`（另有 `:112` 的
+  `version_info["version"]` 断言）。
+- 新增离线用例 `pipeline/tests/test_intraday_5m_provider_param.py`（纯 JSON + AST + argv 解析，
+  零 provider、零网络）。
+
+### 40.5 dump 事实（证据在哪、为什么入库里找不到）
+
+- 真实 dump 目录是 **`pipeline/research_strategy/results/strategy_dumps/`**，
+  被 `pipeline/.gitignore` 第 1 行 `results/` 覆盖 ⇒ **dump 不入库**
+  （`git ls-files pipeline/research_strategy/results/strategy_dumps` 为空）。
+  因此"版本升了但仓库里搜不到新 dump"是**预期**，不是漏提交。
+- 重新生成后的 `chan_four_state_blend_strategy.json`（本地 2026-11-13 18:22 生成）逐键对比，
+  与改前相比**唯一**的差异是：
+  - `strategy_version`、`version_info.version`、`version_info.composite_version`
+    （`"1.4.0 [base: 2.0.0]"`）、`research_strategy_spec.entry_data.version` 四处的
+    `1.3.1 → 1.4.0`；
+  - `params.intraday_5m_provider` 与
+    `research_strategy_spec.entry_data.parameters.intraday_5m_provider` 两处的 `"baostock"`。
+- 本节复核时对该 dump 的直接读取结果与之吻合：`"1.4.0"` 出现 **4** 次、`"1.3.1"` 出现 **0** 次、
+  `intraday_5m_provider` 出现 **2** 次；`base_version = "2.0.0"`；三个子策略版本仍为 `1.0.0`。
+- 钉值**未翻**：dump 内 `blend_weighting_mode = "regime_ic_ir_hybrid"`、
+  `blend_enable_orthogonalization = true`、`cfsb_inertia_relative_ratio = 0.3`。
+- 本节**未重跑** `--dump-strategies`（它会写 `results/`，属会污染并发工作树的动作）；上述为对
+  **现行 dump 文件**的只读读取。
+
+### 40.6 如实披露（未验证项与验收标志）
+
+**未做真实数据 / 网络运行。** 因此"固定之后 28/28 个标的都能取到 5m"目前**只是接线层推断**：
+它由"21 只走 BaoStock 自身缓存行、7 只走 Fuyao 回退且该回退项现在真的能命中"拼出来，
+本轮**没有**一次真实的 Stage-1/Stage-2 运行来证实。
+
+实盘首跑应以这两处为验收标志（字段名以属主为准，不要按记忆写）：
+
+- `stage1_health_report.json::intraday_5m_metrics` 中：
+  `provider = "BaoStockDataProvider"`、`n_symbols_with_provenance = 28`、
+  `n_fallback_symbols = 7`、`fallback_from = "BaoStockDataProvider"`、
+  `fallback_to = "FuyaoDataProvider"`。
+  注意 `summarize_intraday_5m_provenance(...)` 的返回是**扁平合并**进 `intraday_5m_metrics` 的
+  （`intraday_5m_info.update(_5m_prov_rec)`），**不**存在 `intraday_5m_metrics.provenance` 这一层
+  子键 —— 按 `provenance` 去读会读空。
+- 日志：Stage 1 的 `[INTRADAY 5M] 5m 行情提供方已按策略参数固定为 baostock（日线仍用 …）`，
+  或 Stage 2 / 多策略轮的 `[INTRADAY 5M] 5m 行情提供方已固定为 baostock（日线仍用 …）`。
+
+另一处**如实登记的怪癖**：`build_stage2_command` 里转发 `--intraday-5m-provider` 的语句位于
+`if enable_intraday_5m:` **之外**，所以即使 5m 层关闭、只要解析到钉值，该标志也会被下发。Stage 2
+只在 `if enable_intraday_5m:` 块内读它，**行为无影响**；保留现状是为了让 `effective_params`
+的溯源在两个 stage 之间保持一致（不为了一条死标志去改 argv 构造）。
+
+### 40.7 边界
+
+未改 `pipeline/research/blend/blend_base.py`（`BASE_VERSION` 仍 `2.0.0`）、未改任何日线取数路径、
+未改 `web/livetrading/**`、未联网、未重生成 dump。本节范围内的测试全部离线。
+
+## 41. 生产缓存口径变更：`M3.8` raw 单口径重建已生效（用户裁决：属预期，不回滚，2026-11-13）
+
+> **本节编号**：落笔前实测现有最高节号为 **39**（本节与 §40 同批追加，先落 §40 再落 §41），
+> 故本节取 **41**，只追加在文件末尾。本节**不**改任何代码、不 bump 任何版本轴，记录的是
+> **生产库的口径事实 + 用户裁决 + 三个读数陷阱**。
+
+### 41.1 实测（只读，读前读后 `md5` 一致，无 `.wal`）
+
+连接形态恒为 `duckdb.connect("data/cache.duckdb", read_only=True)`
+（`pipeline/.venv/bin/python`，duckdb 1.5.5）；未 `ATTACH`、未建表、未 `CHECKPOINT`。
+库文件 `md5 = 5688a3dae6a212a5b9515f81f408013c`（读前读后一致），
+大小 **20,983,808 字节 = 20.0 MiB**，`data/cache.duckdb.wal` **不存在**；mtime `2026-11-12 16:27`。
+
+| 表 | 现行行数 |
+| --- | ---: |
+| `ohlcv_bars` | **72,367** |
+| `intraday_ohlcv_bars` | **71,568** |
+| `asset_sync_metadata` | **68** |
+| `intraday_sync_metadata` | **35** |
+| 四张有数据的表合计 | **144,038** |
+| `adjust_factors` | **13,949** |
+
+- **27 只标的**（20 只股票 + 7 只指数）/ **4 个 provider** 键 / `2016-01-04 → 2026-11-12` /
+  **2,637** 个不同交易日。日线 side 的 68 行 `asset_sync_metadata` 恰好等于日线
+  `(provider, symbol)` 序列数 **68**（`27+27+7+7`），无孤行无缺行；`intraday_sync_metadata` 的
+  35 行 = 21 + 7 + 7，与 5m 表的 `(provider, symbol, interval)` 序列数一致。
+- `intraday_ohlcv_bars` 的 **28** 个不同标的 = 27 + `511880.SH`（现金替代腿只出现在 5m 表）。
+
+### 41.2 与 2026-10-24 快照对比：**四张表全部下降，无一上升**
+
+| 表 | 2026-10-24 快照 | 2026-11-13 实测 | 变化 |
+| --- | ---: | ---: | ---: |
+| `ohlcv_bars` | 568,474 | **72,367** | **−495,558** |
+| `intraday_ohlcv_bars` | 2,460,576 | **71,568** | **−2,389,008** |
+| `asset_sync_metadata` | 318 | **68** | **−250**（若按 §8bis 清理后 316 计则为 −248） |
+| `intraday_sync_metadata` | 46 | **35** | **−11** |
+
+（10-24 那四个基线数字来自 `docs/cache_snapshot.md`，不是本节的转抄发明；本节只负责**现行**一侧。）
+
+### 41.3 形态与 `M3.8` 的 raw 单口径重建一致（五条可复核的判据）
+
+1. `asset_sync_metadata.adjustflag` **68/68 = `raw`**（`GROUP BY adjustflag` 只有一个值）；
+   `intraday_sync_metadata.adjustflag` 同样 35/35 = `raw`。
+2. `intraday_ohlcv_bars` **保留行级 `adjustflag` 列**且实测全为 `raw`（47,376 + 12,096 + 12,096
+   行全部 `raw`），但**读路径不用它**：`DuckDBCache._resolve_read_basis` 在日内分支读的是
+   `intraday_sync_metadata.adjustflag`（`get_intraday_metadata`），行级那一列只是写侧留痕。
+   因此"表里有 `adjustflag`"与"读路径按那一列判口径"是两件事，不要把前者当成后者的证据。
+3. `adjust_factors` 恰好 **13,949 行 / 20 个 symbol** —— 20 = 股票池（20 只股票），
+   7 只指数不在其中（指数不做复权因子派生）。
+4. 反向核对：全库日线最早 `2016-01-04`、最晚 `2026-11-12`（2,637 个交易日），四张有数据的表
+   **没有一张上升**；旧口径（qfq 直存 + 两年多 5m 主体）的规模在新库里**不存在**
+   （2,460,576 → 71,568）。27 只标的（20 股票 + 7 指数）× 2,637 日的主体历史现在只挂在
+   `FuyaoDataProvider`（21,829 行）与 `MarketDBDataProvider`（50,090 行）两源下。
+5. **日线 provider 分布也被同一次重建收窄 —— 这一条只能靠与备份对比才看得出。** 现行
+   `BaoStockDataProvider` / `EastMoneyDataProvider` 各只带 **7 只指数、224 行/源**
+   （224 = 7 × 32 个交易日，区间 `2026-09-22 → 2026-11-12`）；而在
+   `data/cache.duckdb.bak.20261024-200255` 里，同样这两个源的同 7 只指数是从 **`2016-01-04`**
+   起的（`max(date)` 分别为 `2026-10-16` / `2026-10-16`）。因此"指数日线只有 32 个交易日"是
+   **重建的后果**，不是这两个源一直如此 —— 不要把它当成常量写进任何基线。
+
+### 41.4 用户裁决（2026-11-13）：属**预期重建**，不视为数据丢失，**不回滚**
+
+- 上述缩水登记为 `M3.8` raw 单口径重建的**既定后果**，不是事故，**不做任何回滚动作**。
+- `data/repair_backups/` 下 2026-11-11 与 11-12 的两份库副本（5m **38,976 行 / 28 只 /
+  `2026-09-16 → 2026-11-10`**，逐份实测）**仅作历史留存**，不参与现行标定/回测，也**不**用来
+  "恢复"任何表。
+
+### 41.5 三个必须写明的口径陷阱
+
+**① 「34,944 行 / 28 只 / `2026-09-16` 起」这一档无法从任何仓内备份复现。**
+该数字出现在 `docs/development_plan.md`、`docs/development_plan_archive.md`、
+`docs/intraday_5m_coverage.md` 与 `docs/cache_snapshot.md` 的历史段里，按**2026-11-08 历史值**读。
+仓内 11 个库副本的实测（只读）如下 —— **没有一个**是 34,944：
+
+| 副本 | 5m 行数 | 5m 标的数 | 5m 区间 |
+| --- | ---: | ---: | --- |
+| `data/cache.backup-20261027-pre-m38raw.duckdb` | 2,469,600 | 27 | `2022-01-04 → 2026-10-26` |
+| `data/cache.duckdb.bak` 及另 5 个带时间戳的 `.bak.*`（共 6 份） | 2,460,576 | 23 | `2022-01-04 → 2026-10-16` |
+| `data/cache.duckdb.bak.20261024-200255` | 2,460,576 | 23 | `2022-01-04 → 2026-10-16` |
+| `repair_backups/20261111-215145/…bak.20261111-215145` | 38,976 | 28 | `2026-09-16 → 2026-11-10` |
+| `repair_backups/20261112_222030/cache.duckdb.pre-5m-backfill` | 38,976 | 28 | `2026-09-16 → 2026-11-10` |
+| `repair_backups/20261113_040659Z/cache.duckdb.pre-e2e`（= 现行库） | 71,568 | 28 | `2026-09-01 → 2026-11-12` |
+
+**② `docs/cache_snapshot.md` 里那个 `adjust_factors = 13,949` 与今日数值"巧合相同"，不要互相引用。**
+该文件 §A.2 的对照表把今日的 `13,949` 放在"现行行数"列、把「未列出；2026-10-27 才建表」放在
+`2026-10-24 快照`列 —— **10-24 那次快照根本没测这张表**，仓内也不存在 2026-10-27 对该表的实测记录。
+`13,949` 的真实来历是两个**不同时点**：跨源覆盖清洗**前** 13,970 → 清洗删掉 **21 行**（§37.4）后
+13,949（Fuyao 13,564 + BaoStock 385）。因此该数字**不能**用来证明"表一直没变"。
+
+**③ 备份清单的两个数字都已过期（旧文写"6 个 / 1.9 GiB"）。**
+实测 `data/` 下除 `cache.duckdb` 本身外有 **8 个文件**（7 个 `.bak*` + 1 个
+`cache.backup-20261027-pre-m38raw.duckdb`），合计 **2,586,411,008 字节 = 2.41 GiB**；
+`data/repair_backups/` 另有 **3 个目录 / 5 个文件 / 54,047,154 字节**（`du -sh` 报 52M，
+那是分配块而非字节数）。`docs/cache_snapshot.md` §1 表内的"6 个 / 1.9 GiB"是 **2026-10-24
+当时的实测**、现已过期；同文件 §A.7 的"8 个 / 2,586,411,008 字节"与本节实测一致。
+
+### 41.6 边界与未测
+
+- 本节是**只读复核 + 裁决登记**：未清洗、未回补、未回滚、未新建备份，未联网。
+- **未测**：任何单标的的逐日 5m 完整性（48 根/日）在 `2026-09-01 → 09-15` 这段 BaoStock 独有
+  区间上的表现；`amount` 列的逐行非空率。二者都不影响本节的行数/口径结论。
+- 时间口径：所有"今日/实测"均指 2026-11-13 的只读查询；库文件 mtime 仍是 2026-11-12 16:27，
+  即本次复核**没有**写入任何字节。
+
+### 41.7 指数日线历史回补（2026-11-14）
+
+> **本节与 §41.1–§41.6 的关系**：§41 记录的「27 只标的 / 72,367 行」与「7 只指数只有 32 个
+> 交易日」是 **2026-11-13 的实测事实**，本节**不改写**它们，只登记随后的一次**回补**及其
+> 验证。读 §41.1 的表时请把它当成「回补前」的快照。本节**未**改任何代码、未 bump 任何版本轴。
+
+**回补前**：7 只指数（`000001.SH` `000016.SH` `000300.SH` `000852.SH` `000905.SH`
+`399001.SZ` `399006.SZ`）在现行库里，**每个 provider 命名空间只有 32 行**，区间
+`2026-09-22 → 2026-11-12`；而重建前的备份 `data/cache.duckdb.bak.20261024-200255` 里
+同 7 条序列是从 **`2016-01-04`** 起的。因此「指数只有 32 个交易日」是 **`M3.8` 重建把指数历史
+截断了**的后果，**不是**数据源本身的常量 —— 这一条正是 §41.3 判据 5 的结论，本节把它补回来。
+
+**回补后**（只读复核，`duckdb.connect(..., read_only=True)`）：
+
+| 指标 | 回补前 | 回补后 |
+| --- | ---: | ---: |
+| `ohlcv_bars` 总行数 | 72,367 | **145,247** |
+| 7 只指数 × 4 个命名空间 | 896 行（7 × 32 × 4） | **73,776 行**（+72,880） |
+| 每命名空间新增 | 0 | **+18,220** |
+| 库文件字节数 | 20,983,808 | **22,294,528** |
+| 库文件 md5 | `5688a3da…` | **`93212862…`** |
+| `data/cache.duckdb.wal` | 无 | 无 |
+
+- 4 个命名空间为 `BaoStockDataProvider` / `EastMoneyDataProvider` / `FuyaoDataProvider` /
+  `MarketDBDataProvider`；每个命名空间现有 **18,444** 行指数日线，逐标的 **2,630–2,637** 行
+  （差额见下文「缺口」一段）。
+- 每条序列的 `min(date)` = **`2016-01-04`**、`max(date)` = **`2026-11-12`**（28 个命名空间全同）。
+
+**来源与「`provider` 不再等于来源」**：这批历史是从 **BaoStock** 取的 —— **154 个严格顺序**的
+≤180 日切片（单进程、无多线程 / 无 multiprocessing、游标逐段推进、持久会话），
+154 = 7 标的 × 22 段（`2016-01-01 → 2026-09-21` 按 180 日切）。合并时**同一份 frame 写进全部
+四个命名空间**，因为本仓自己的指数写入口
+（`scripts/sync_china_5m_and_indices.py::_sync_major_indices`）原本就这么写；两份库都显示四条序列
+逐字节相同。**所以回补之后，对这 28 条序列而言 `provider` 不是来源证据** ——
+不要再从 `provider` 推出「这段历史是 EastMoney 下的」这类结论。
+
+**独立正确性证明（不是自证）**：取回序列与**重建前备份**在重叠区间上**逐位一致** ——
+7 只标的、18,311 个 `(symbol, date)` 全部对齐，差异 **0 日期 / 0 close / 0 volume**（同样
+0 open / 0 high / 0 low）。备份是重建前的产物、与本轮取数无共同来源，因此这构成对「取到的是
+同一条序列」的独立证据，而不是拿自己写的行验证自己。
+
+**写路径**：只经 `DuckDBCache.store_bars`（计划层报 `shape='backfill'`、
+`overlap_sessions=0`，即纯前置插入、不覆盖任何已有 session），`adjustflag='raw'`；
+写前整库字节副本落在
+`data/repair_backups/20261114_031903Z_index-daily-backfill/cache.duckdb.pre-index-backfill`
+（md5 与回补前库相同），同目录的 `repair_manifest.json` 记录了前后总行数、接缝与逐项验证结论。
+
+**验证（全部实测，非推断）**：
+
+- `2020-01-01 → 2026-09-21` 的每个工作日交易日**全部在场**：**1,630** 个 session
+  （= 工作日 − **124** 个休市日，日历由 `common/market_holidays.py` 离线导出），
+  28 个命名空间 **0 缺失 / 0 多余**。
+- **0 重复** `(provider, symbol, date)`；**0** 个 NULL / 非正 OHLC；**0** 个 `high < low`；
+  **0** 行落在周末或已登记休市日上（2020 → 2026-09-21 范围）。
+- 回补前已存在的 **896** 行重叠区间（`2026-09-22 → 2026-11-12`）**校验和不变**
+  （写前字节副本对拍，`896` 行 checksum 前后相同）。
+- `query_bars(adjust="qfq")` 与 `adjust="raw"` **逐行相同**（7 只指数
+  `is_factor_neutral_symbol=True`，且 `adjust_factors` 对这 7 只仍是 **0 行**）—— 回补不会
+  在 qfq 侧引入任何缩放。
+- 全程无 `.wal` 残留；结束时 `CHECKPOINT`，`pragma_database_size` 的 `wal_size` 为 0。
+
+**两个必须写明的局限**：
+
+1. **2016–2019 没有离线日历 oracle**：`market_holidays` 的覆盖是 **2020–2027**，对更早年份
+   拒绝猜。这四年改用**重建前备份自身的 session 集合**做对拍：7 只标的 **0 缺失 / 0 多余**。
+   这不是「用日历证明」，而是「用另一份独立数据证明」，两者不能互相冒充。
+2. **有 4 只指数仍缺少数几个 session，且是既有的源侧空洞**，不是本轮引入：`000852.SH` /
+   `000905.SH` 各少 1 天（`2016-08-11`），`399001.SZ` / `399006.SZ` 分别少 6 / 7 天
+   （`2016-01-18 … 2016-04-13` 一带）。这些日期在 BaoStock 返回的行里 OHLC 逻辑不可能
+   （`common/data.py::_drop_invalid_ohlcv_rows` 会剔掉 `high < low`、`high < open/close`、
+   非正价、NaN/inf 的行），**同一批日期在重建前备份里同样不存在** ⇒ 不是本轮写丢的，
+   也没有为此改任何代码。
