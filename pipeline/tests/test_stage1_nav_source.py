@@ -37,12 +37,16 @@ import os
 import sys
 import types
 
+import pandas as pd
+
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import pytest
 
+from common.duckdb_cache import DuckDBCache  # noqa: E402  (offline in-memory/on-disk cache)
+from scripts import sync_china_5m_and_indices as sync  # noqa: E402  (LV24 Stage-1 patch primitive)
 from scripts.live_preflight import (  # noqa: E402  (repo root is on sys.path just above)
     LiveDumpPreflightError,
     assert_account_state_version_parity,
@@ -826,4 +830,448 @@ def test_missing_recorded_version_raises():
         assert_dump_version_parity({"base_version": None}, "1.2.2", "1.8.0")
     with pytest.raises(LiveDumpPreflightError):
         assert_account_state_version_parity({"strategy_version": None}, "1.2.2", None)
+
+
+# ---------------------------------------------------------------------------
+# LV24 -- per-namespace trace on the Stage-1 FULL-UNIVERSE daily-bar refresh
+#
+# Contract: freeze doc `docs/lv19_freshness_contract.md` §4.1 (three mutually exclusive
+# states, worst-first aggregation), §4.4 (`fetch_errors` shape/meaning FROZEN -- this suite
+# must never change them), §6.6 (the gap LV24 closes: the Stage-1 child passed no
+# `strict_namespaces` and produced no `per_namespace`, so "we skipped a namespace by
+# tolerance" was invisible).
+#
+# WHAT THIS SECTION PINS
+#   1. every namespace patched  -> the trace says `patched` for both, and `fetch_errors` is
+#      BYTE-IDENTICAL to the pre-LV24 return value (same dict type, same emptiness);
+#   2. a namespace skipped as fresh -> `skipped` + the REASON (`fresh_strict` vs
+#      `fresh_tolerance`), and the refresh still reports success overall;
+#   3. a failure -> `failed` with its reason, plus `rule` for a refused write (including the
+#      CROSS-SOURCE refusal raised by `plan_history_write`), the rest of the trace unaffected;
+#   4. worst-first aggregation (§4.2) is pinned, in BOTH symbol orders;
+#   5. `fetch_errors` cannot drift: exact serialized bytes + a source-level guard.
+#
+# 100% OFFLINE: provider doubles return prepared synthetic frames (or raise); the cache is a
+# `tmp_path` DuckDB file; `sync_indices_daily` is stubbed. No network, no `data/runs/**`, and
+# no read of the production cache.
+# ---------------------------------------------------------------------------
+
+LV24_SYMBOL = "600660.SH"
+LV24_SYMBOL_B = "601288.SH"
+LV24_END = "2026-10-28"
+FUYAO = sync.FUYAO_NAMESPACE
+MARKETDB = sync.MARKETDB_NAMESPACE
+
+
+def _lv24_frame(dates, base=40.0, step=0.37):
+    """Deterministic OHLCV frame; non-round floats so a rescale could never be mistaken for it."""
+    rows = []
+    for i, _ in enumerate(dates):
+        price = base + i * step
+        rows.append(
+            {
+                "Open": price * 0.998712345678,
+                "High": price * 1.004321098765,
+                "Low": price * 0.995432109876,
+                "Close": price,
+                "Volume": 1_000_000.0 + 137.0 * i,
+            }
+        )
+    return pd.DataFrame(rows, index=pd.DatetimeIndex(dates))
+
+
+_LV24_CONTINUOUS = _lv24_frame(pd.bdate_range("2026-10-01", LV24_END))
+
+
+def _lv24_up_to(day):
+    return _LV24_CONTINUOUS.loc[_LV24_CONTINUOUS.index <= day].copy()
+
+
+def _lv24_refetch():
+    """The look-back window plus the missing tail, i.e. what a real re-fetch returns."""
+    return _LV24_CONTINUOUS.loc[_LV24_CONTINUOUS.index >= "2026-10-15"].copy()
+
+
+class _Lv24Provider:
+    """Provider double: one prepared frame per call (or a raise), recording every request."""
+
+    def __init__(self, frame=None, error=None, error_symbols=(), **kwargs):
+        self._frame = frame
+        self._error = error
+        self._error_symbols = set(error_symbols)
+        self.kwargs = kwargs
+        self.starts = []
+
+    def fetch_raw_ohlcv(self, symbol, start, end, interval="1d", **kwargs):
+        assert interval == "1d"
+        self.starts.append((symbol, start))
+        if self._error is not None and (not self._error_symbols or symbol in self._error_symbols):
+            raise self._error
+        return self._frame.copy()
+
+    #: `getattr(prov, "fetch_raw_ohlcv", prov.fetch_ohlcv)` evaluates the fallback EAGERLY, so a
+    #: double without this attribute fails on attribute access rather than on the call.
+    def fetch_ohlcv(self, symbol, start, end, interval="1d", **kwargs):
+        return self.fetch_raw_ohlcv(symbol, start, end, interval=interval, **kwargs)
+
+    def logout(self):
+        return None
+
+
+def _lv24_store(cache, df, provider, symbol=LV24_SYMBOL):
+    cache.store_bars(
+        provider=provider,
+        symbol=symbol,
+        df=df,
+        requested_start=df.index.min().strftime("%Y-%m-%d"),
+        requested_end=df.index.max().strftime("%Y-%m-%d"),
+        interval="1d",
+        adjustflag="raw",
+    )
+
+
+def _lv24_seed(tmp_path):
+    """Fresh `tmp_path` cache where BOTH namespaces lag beyond their own tolerance.
+
+    MarketDB is the Stage-1 default strict namespace (zero tolerance), so `end - 1` already
+    lags. Fuyao is NOT strict here (the Stage-1 child passes no `strict_namespaces`), so it must
+    be more than two days behind to be fetched at all -- `end - 3` = Friday 2026-10-23.
+    """
+    db_file = str(tmp_path / "cache.duckdb")
+    cache = DuckDBCache(db_file)
+    _lv24_store(cache, _lv24_up_to("2026-10-27"), MARKETDB)
+    _lv24_store(cache, _lv24_up_to("2026-10-23"), FUYAO)
+    return db_file
+
+
+def _lv24_install(monkeypatch, bs, em, capture=False):
+    monkeypatch.setattr(sync, "BaoStockDataProvider", lambda **kw: bs)
+    monkeypatch.setattr(sync, "EastMoneyDataProvider", lambda **kw: em)
+    monkeypatch.setattr(sync, "sync_indices_daily", lambda *a, **kw: {})
+    captured = {}
+    if capture:
+        real_patch = sync.patch_equity_daily_bars
+
+        def _wrapped(*args, **kwargs):
+            result = real_patch(*args, **kwargs)
+            captured["result"] = result
+            return result
+
+        monkeypatch.setattr(sync, "patch_equity_daily_bars", _wrapped)
+    return captured
+
+
+def _lv24_run(db_file, symbols=(LV24_SYMBOL,)):
+    return _mod.refresh_stage1_data(
+        list(symbols),
+        LV24_END,
+        "marketdb",  # only used for the synthetic/no-cache short circuit
+        cache_dir=db_file,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 1. All namespaces patched -> both `patched`; `fetch_errors` unchanged
+# ---------------------------------------------------------------------------
+
+
+def test_lv24_all_namespaces_patched_are_traced(tmp_path, monkeypatch, capsys):
+    """Both write namespaces lag beyond their own tolerance => both fetched, both `patched`.
+
+    Reverse-mutation: drop the LV24 trace population (`trace_out` never filled) and this test
+    goes red on the missing report block -- the refresh itself keeps working, which is exactly
+    the defect LV24 records (a trace gap, not a data defect).
+    """
+    db_file = _lv24_seed(tmp_path)
+    captured = _lv24_install(
+        monkeypatch,
+        _Lv24Provider(_lv24_refetch()),
+        _Lv24Provider(_lv24_refetch()),
+        capture=True,
+    )
+
+    summary = _lv24_run(db_file)
+
+    trace = summary["equity_daily_patch"]
+    assert trace["namespace_trace"] == {FUYAO: "patched", MARKETDB: "patched"}
+    assert trace["namespace_detail"] == {
+        FUYAO: {"state": "patched", "reason": None, "symbol": LV24_SYMBOL},
+        MARKETDB: {"state": "patched", "reason": None, "symbol": LV24_SYMBOL},
+    }
+    # FROZEN `fetch_errors`: a plain dict, empty on a clean run -- unchanged by LV24.
+    assert type(captured["result"]) is dict
+    assert captured["result"] == {}
+    assert summary["status"] == "completed"
+    assert summary["steps"]["patch_equity_daily_bars"] == "ok"
+    assert "fetch_errors" not in summary
+    # Nothing to warn about: every namespace was refreshed (no noise on a green run).
+    assert "[STAGE 1 NAMESPACE TRACE]" not in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# 2. A namespace skipped as FRESH -> `skipped` + reason, refresh still a success
+# ---------------------------------------------------------------------------
+
+
+def test_lv24_fresh_namespace_skip_records_reason_and_still_succeeds(
+    tmp_path, monkeypatch, capsys
+):
+    """MarketDB at `end` (strict, zero tolerance) + Fuyao one day behind (holiday tolerance).
+
+    The reason field is the whole point: `skipped` alone cannot distinguish "current" from
+    "a tolerance said close enough". `fresh_tolerance` is the one that must be visible, because
+    it is the namespace the valuation read may take a stale bar from (freeze §6.6).
+    """
+    db_file = str(tmp_path / "cache.duckdb")
+    seed = DuckDBCache(db_file)
+    _lv24_store(seed, _lv24_up_to(LV24_END), MARKETDB)   # strict + genuinely fresh
+    _lv24_store(seed, _lv24_up_to("2026-10-27"), FUYAO)  # within the 2-day tolerance
+
+    bs = _Lv24Provider(_lv24_refetch())
+    em = _Lv24Provider(_lv24_refetch())
+    _lv24_install(monkeypatch, bs, em)
+
+    summary = _lv24_run(db_file)
+
+    trace = summary["equity_daily_patch"]
+    assert trace["namespace_trace"] == {FUYAO: "skipped", MARKETDB: "skipped"}
+    assert trace["namespace_detail"][MARKETDB]["reason"] == sync.FRESH_STRICT
+    assert trace["namespace_detail"][FUYAO]["reason"] == sync.FRESH_TOLERANCE
+    # Nothing lagged: no request may be issued at all (the tolerance is still intact).
+    assert bs.starts == [] and em.starts == []
+
+    # The refresh itself is still a SUCCESS -- observation, not enforcement.
+    assert summary["status"] == "completed"
+    assert summary["steps"]["patch_equity_daily_bars"] == "ok"
+    assert "fetch_errors" not in summary
+
+    out = capsys.readouterr().out
+    assert "[STAGE 1 NAMESPACE TRACE]" in out
+    assert f"{FUYAO}=skipped(fresh_tolerance)" in out
+    assert "容忍度" in out
+
+
+# ---------------------------------------------------------------------------
+# 3. A failure (fetch error AND refused write) -> `failed` with its reason/rule
+# ---------------------------------------------------------------------------
+
+
+def test_lv24_fetch_error_is_failed_and_rest_unaffected(tmp_path, monkeypatch, capsys):
+    """One failing symbol => its lagging namespace is `failed`, the fresh one stays `skipped`.
+
+    `fetch_errors` keeps its exact frozen value: `"<Provider>: <Type>: <msg>"` joined per
+    attempted provider, one entry per failing symbol.
+    """
+    db_file = str(tmp_path / "cache.duckdb")
+    seed = DuckDBCache(db_file)
+    _lv24_store(seed, _lv24_up_to("2026-10-27"), MARKETDB)  # strict, lagging
+    _lv24_store(seed, _lv24_up_to(LV24_END), FUYAO)         # fresh -- by the 2-day tolerance only
+
+    _lv24_install(
+        monkeypatch,
+        _Lv24Provider(error=RuntimeError("bs boom")),
+        _Lv24Provider(error=RuntimeError("em boom")),
+    )
+
+    summary = _lv24_run(db_file)
+
+    trace = summary["equity_daily_patch"]
+    assert trace["namespace_trace"] == {MARKETDB: "failed", FUYAO: "skipped"}
+    assert trace["namespace_detail"][MARKETDB] == {
+        "state": "failed",
+        "reason": sync.FETCH_ERROR,
+        "symbol": LV24_SYMBOL,
+    }
+    assert trace["namespace_detail"][FUYAO]["reason"] == sync.FRESH_TOLERANCE
+    # FROZEN shape: the exact pre-LV24 string, no extra keys, no trace leakage.
+    assert summary["fetch_errors"] == {
+        LV24_SYMBOL: "BaoStockDataProvider: RuntimeError: bs boom; "
+        "EastMoneyDataProvider: RuntimeError: em boom"
+    }
+    assert summary["steps"]["fetch_errors"] == 1
+    assert summary["status"] == "completed"
+    assert "[STAGE 1 NAMESPACE TRACE]" in capsys.readouterr().out
+
+
+def test_lv24_refused_write_is_failed_with_its_rule(tmp_path, monkeypatch, capsys):
+    """The CROSS-SOURCE refusal (`plan_history_write` -> `QfqWriteRefused`) is `failed` + rule.
+
+    A re-based incoming window contradicts the stored closes, so NOTHING is written for that
+    namespace: calling it `skipped` would say "we did not need to", which is a lie. The trace
+    must survive the aggregate re-raise (`refusals.raise_if_any`), which is why `trace_out` is
+    filled before it.
+    """
+    db_file = str(tmp_path / "cache.duckdb")
+    seed = DuckDBCache(db_file)
+    _lv24_store(seed, _lv24_up_to("2026-10-27"), MARKETDB)
+    _lv24_store(seed, _lv24_up_to(LV24_END), FUYAO)
+
+    refetched = _lv24_refetch()
+    for col in ("Open", "High", "Low", "Close"):
+        refetched[col] = refetched[col] * 0.75
+
+    _lv24_install(monkeypatch, _Lv24Provider(refetched), _Lv24Provider(refetched))
+
+    summary = _lv24_run(db_file)
+
+    trace = summary["equity_daily_patch"]
+    assert trace["namespace_trace"] == {MARKETDB: "failed", FUYAO: "skipped"}
+    assert trace["namespace_detail"][MARKETDB] == {
+        "state": "failed",
+        "reason": sync.REFUSED_WRITE,
+        "symbol": LV24_SYMBOL,
+        "rule": sync.RULE_QFQ_REBASE_REFUSED,
+    }
+    # The refusal still aborts the pass the way it always did (Stage-1 degrades to a warn) --
+    # LV24 changes no control flow, it only records what happened.
+    assert summary["steps"]["patch_equity_daily_bars"].startswith("warn: ")
+    assert "fetch_errors" not in summary
+
+    out = capsys.readouterr().out
+    assert "[STAGE 1 NAMESPACE TRACE]" in out
+    assert f"{MARKETDB}=failed(refused_write)[qfq_rebase_refused]" in out
+
+
+# ---------------------------------------------------------------------------
+# 4. Worst-first aggregation (§4.2) is pinned, in BOTH symbol orders
+# ---------------------------------------------------------------------------
+
+
+def _lv24_two_symbols(tmp_path, monkeypatch, symbols):
+    """A patched for both, B's fetch raising => MarketDB is `patched` AND `failed`."""
+    db_file = str(tmp_path / "cache.duckdb")
+    seed = DuckDBCache(db_file)
+    for symbol in (LV24_SYMBOL, LV24_SYMBOL_B):
+        _lv24_store(seed, _lv24_up_to("2026-10-27"), MARKETDB, symbol)
+        _lv24_store(seed, _lv24_up_to(LV24_END), FUYAO, symbol)
+
+    bs = _Lv24Provider(
+        _lv24_refetch(), error=RuntimeError("bs boom"), error_symbols={LV24_SYMBOL_B}
+    )
+    em = _Lv24Provider(
+        _lv24_refetch(), error=RuntimeError("em boom"), error_symbols={LV24_SYMBOL_B}
+    )
+    _lv24_install(monkeypatch, bs, em)
+    return _lv24_run(db_file, symbols)
+
+
+def test_lv24_worst_first_aggregation_is_order_independent(tmp_path, monkeypatch, capsys):
+    """One `patched` + one `failed` is `failed` (freeze §4.2) -- whichever symbol comes first."""
+    forward = _lv24_two_symbols(
+        tmp_path / "forward", monkeypatch, [LV24_SYMBOL, LV24_SYMBOL_B]
+    )
+    backward = _lv24_two_symbols(
+        tmp_path / "backward", monkeypatch, [LV24_SYMBOL_B, LV24_SYMBOL]
+    )
+
+    for summary in (forward, backward):
+        trace = summary["equity_daily_patch"]
+        # `patched` (A) must never mask `failed` (B), and `failed` must never be downgraded
+        # by a later `patched`.
+        assert trace["namespace_trace"][MARKETDB] == "failed"
+        # ... and the detail keeps the outcome that CAUSED the worst state, not the last one.
+        assert trace["namespace_detail"][MARKETDB] == {
+            "state": "failed",
+            "reason": sync.FETCH_ERROR,
+            "symbol": LV24_SYMBOL_B,
+        }
+        assert summary["fetch_errors"] == {
+            LV24_SYMBOL_B: "BaoStockDataProvider: RuntimeError: bs boom; "
+            "EastMoneyDataProvider: RuntimeError: em boom"
+        }
+    # The rank table itself is pinned: `failed` > `patched` > `skipped`.
+    assert sync._STATE_RANK == {"skipped": 0, "patched": 1, "failed": 2}
+
+
+# ---------------------------------------------------------------------------
+# 5. `fetch_errors` freeze (freeze doc §4.4) -- exact bytes + a source-level guard
+#
+# Existing coverage this relies on (do not delete): `test_failed_reported`,
+# `test_refused_write_is_reported_as_failed` and
+# `test_symbol_with_zero_bars_is_not_reported_as_a_fetch_error` in
+# `pipeline/tests/test_patch_equity_daily_bars_contract.py`, which pin the primitive's own
+# error mapping; the assertions below pin it as seen from the Stage-1 caller.
+# ---------------------------------------------------------------------------
+
+
+def test_lv24_fetch_errors_shape_is_frozen(tmp_path, monkeypatch, capsys):
+    """Same input => the SAME output object as before LV24 (a plain `dict`, same literals).
+
+    Nothing about the trace may enter this mapping: no state keys, no `failed` marker, no
+    reason strings -- it stays `symbol -> "<provider>: <Type>: <msg>"` and nothing else.
+    """
+    db_file = str(tmp_path / "cache.duckdb")
+    seed = DuckDBCache(db_file)
+    _lv24_store(seed, _lv24_up_to("2026-10-27"), MARKETDB)
+    _lv24_store(seed, _lv24_up_to(LV24_END), FUYAO)
+
+    captured = _lv24_install(
+        monkeypatch,
+        _Lv24Provider(error=RuntimeError("bs boom")),
+        _Lv24Provider(error=RuntimeError("em boom")),
+        capture=True,
+    )
+    capsys.readouterr()
+    _lv24_run(db_file)
+
+    result = captured["result"]
+    assert type(result) is dict, "the return type must stay a plain dict"
+    assert json.dumps(result, sort_keys=True) == (
+        '{"600660.SH": "BaoStockDataProvider: RuntimeError: bs boom; '
+        'EastMoneyDataProvider: RuntimeError: em boom"}'
+    )
+    # No trace vocabulary leaks into the frozen mapping.
+    for token in ("skipped", "patched", "failed", "fresh_tolerance", "qfq_rebase_refused"):
+        assert token not in json.dumps(result)
+
+
+def test_lv24_primitive_keeps_the_frozen_return_statement():
+    """Source-level guard: the trace is an out-parameter, never a second return value."""
+    path = os.path.join(_REPO_ROOT, "scripts", "sync_china_5m_and_indices.py")
+    with open(path, encoding="utf-8") as f:
+        source = f.read()
+
+    assert ") -> Dict[str, str]:" in source  # the frozen return annotation
+    assert "return fetch_errors" in source
+    assert 'fetch_errors[sym] = "; ".join(' in source
+    # The trace lives in its own dict; it is never merged into `fetch_errors`.
+    assert "fetch_errors.update(" not in source
+    assert "trace_out" in source
+
+
+def test_lv24_summary_line_is_absent_without_a_reason():
+    """`summarise_namespace_trace` says NOTHING about a clean trace (no noise on green runs)."""
+    assert _mod.summarise_namespace_trace(None) is None
+    assert _mod.summarise_namespace_trace({}) is None
+    assert (
+        _mod.summarise_namespace_trace(
+            {
+                "namespace_trace": {MARKETDB: "patched", FUYAO: "skipped"},
+                "namespace_detail": {
+                    MARKETDB: {"state": "patched", "reason": None, "symbol": LV24_SYMBOL},
+                    FUYAO: {
+                        "state": "skipped",
+                        "reason": sync.FRESH_STRICT,
+                        "symbol": LV24_SYMBOL,
+                    },
+                },
+            }
+        )
+        is None
+    )
+    line = _mod.summarise_namespace_trace(
+        {
+            "namespace_trace": {MARKETDB: "failed"},
+            "namespace_detail": {
+                MARKETDB: {
+                    "state": "failed",
+                    "reason": sync.REFUSED_WRITE,
+                    "symbol": LV24_SYMBOL,
+                    "rule": sync.RULE_NULL_VOLUME_REFUSED,
+                }
+            },
+        }
+    )
+    assert line.startswith("[STAGE 1 NAMESPACE TRACE]")
+    assert f"{MARKETDB}=failed(refused_write)[null_volume_refused]" in line
 

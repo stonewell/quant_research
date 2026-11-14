@@ -1336,6 +1336,68 @@ def inspect_stage1_adjust_factor_freshness(
     return inspect_adjust_factor_freshness(db_file)
 
 
+def summarise_namespace_trace(namespace_trace: Optional[Dict[str, Any]]) -> Optional[str]:
+    """One operator line for the LV24 per-namespace patch trace -- or `None` when nothing is due.
+
+    LV24 (2026-11-13): the Stage-1 full-universe refresh printed an AGGREGATE `fetch_errors`
+    only, so `fetch_errors={}` / `steps.patch_equity_daily_bars = ok` read exactly like "every
+    namespace is current" while a namespace could have been skipped as fresh **by a tolerance**
+    (the 2026-11-05 shape: the namespace the valuation read demanded an exact `as_of` bar from).
+    `patch_equity_daily_bars` already published the three-state map on the cache for the holdings
+    path; this surfaces the same trace for the Stage-1 child.
+
+    OBSERVATION ONLY (`enforcement: observation_only`): the line reports, it never gates. It is
+    printed when the trace contains a `failed` namespace OR a namespace that was skipped under
+    the non-strict TOLERANCE (i.e. "we did not refresh it, and not because it was current") --
+    those are the two facts the old aggregate could not express. A trace where every namespace
+    was skipped strictly-fresh or patched prints nothing.
+
+    Returns the line (also printed by the caller) so tests can assert on the text without
+    scraping stdout. `None` when there is no trace at all.
+    """
+    if not isinstance(namespace_trace, dict) or not namespace_trace:
+        return None
+    states = namespace_trace.get("namespace_trace") or {}
+    detail = namespace_trace.get("namespace_detail") or {}
+    if not states:
+        return None
+
+    def _describe(prov: str) -> str:
+        state = states.get(prov)
+        reason = (detail.get(prov) or {}).get("reason")
+        rule = (detail.get(prov) or {}).get("rule")
+        text = f"{prov}={state}"
+        if reason:
+            text += f"({reason})"
+        if rule:
+            text += f"[{rule}]"
+        return text
+
+    failed = sorted(prov for prov, state in states.items() if state == "failed")
+    tolerance_skipped = sorted(
+        prov
+        for prov, state in states.items()
+        if state == "skipped" and (detail.get(prov) or {}).get("reason") == "fresh_tolerance"
+    )
+    if not failed and not tolerance_skipped:
+        return None
+
+    traced = " ".join(_describe(prov) for prov in sorted(states))
+    why = []
+    if failed:
+        why.append(f"{len(failed)} 个命名空间失败（{', '.join(failed)}）")
+    if tolerance_skipped:
+        why.append(
+            f"{len(tolerance_skipped)} 个命名空间仅因容忍度未刷新"
+            f"（{', '.join(tolerance_skipped)}）"
+        )
+    return (
+        f"[STAGE 1 NAMESPACE TRACE] {'; '.join(why)} -- {traced}"
+        " （逐命名空间留痕，仅观测、不影响选股/权重/下单；"
+        "容忍度跳过不等于新鲜，估值可能读到陈旧 bar）"
+    )
+
+
 def refresh_stage1_data(
     symbols: Sequence[str],
     as_of_date: str,
@@ -1362,6 +1424,15 @@ def refresh_stage1_data(
 
     `summary["cache_created"]` is True only when this call actually had to create the file
     (`False` when it already existed, and `False` when the run refused -- nothing was created).
+
+    `summary["equity_daily_patch"]` (LV24, 2026-11-13) is the per-namespace trace of the
+    daily-bar patch pass, `{"namespace_trace": {provider -> skipped|patched|failed},
+    "namespace_detail": {provider -> {state, reason, symbol[, rule]}}}`. It is OBSERVATION ONLY
+    and additive: it exists because `fetch_errors` (frozen shape/meaning, freeze doc
+    `docs/lv19_freshness_contract.md` §4.4) can only say "a symbol failed", never "this namespace
+    was skipped by a tolerance rather than refreshed". The key is absent when the pass never got
+    to evaluate a namespace (skipped/refused refresh, empty universe), never an empty map for
+    "nothing to report" -- same convention as `fetch_errors`.
     """
     if no_cache or str(data_provider).strip().lower() in ("synthetic", "csv"):
         return {"status": "skipped", "reason": "synthetic_or_no_cache"}
@@ -1451,12 +1522,32 @@ def refresh_stage1_data(
 
         # 2. Patch equity daily bars
         if equity_syms:
+            # LV24: per-namespace trace for THIS refresh, filled in place by the patch pass even
+            # when it ends in a refusal (the primitive fills `trace_out` before re-raising).
+            namespace_trace: Dict[str, Any] = {}
             try:
-                _absorb(patch_equity_daily_bars(cache, equity_syms, end=as_of_date))
+                _absorb(
+                    patch_equity_daily_bars(
+                        cache,
+                        equity_syms,
+                        end=as_of_date,
+                        trace_out=namespace_trace,
+                    )
+                )
                 summary["steps"]["patch_equity_daily_bars"] = "ok"
             except Exception as exc:
                 print(f"[STAGE 1 DATA REFRESH WARN] 个股日线补充拉取异常 (容错忽略): {exc}")
                 summary["steps"]["patch_equity_daily_bars"] = f"warn: {exc}"
+            # LV24 (2026-11-13): persist `{provider -> skipped|patched|failed}` PLUS the reason
+            # behind each state under `stage1_health_report.json::data_refresh.equity_daily_patch`.
+            # Observation only: nothing below reads it back into the gate, the weights or the
+            # orders, and the block is absent when the pass never evaluated a namespace. The
+            # `fetch_errors` key beside it keeps its frozen shape/meaning (freeze doc §4.4).
+            if namespace_trace:
+                summary["equity_daily_patch"] = namespace_trace
+                line = summarise_namespace_trace(namespace_trace)
+                if line:
+                    print(line)
 
         # 3. 5m intraday sync if enabled
         if enable_intraday_5m:

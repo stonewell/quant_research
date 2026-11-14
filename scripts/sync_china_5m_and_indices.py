@@ -88,6 +88,33 @@ NAMESPACE_FRESHNESS_TOLERANCE_DAYS = 2
 #: be averaged away by 19 `patched` ones. Higher wins when several symbols mark the same namespace.
 _STATE_RANK = {"skipped": 0, "patched": 1, "failed": 2}
 
+#: WHY a namespace ended in its state (LV24, 2026-11-13). The three STATES stay LV19's frozen
+#: vocabulary (`skipped` / `patched` / `failed`, freeze doc `docs/lv19_freshness_contract.md`
+#: §4.1) and are the only values `DuckDBCache.record_namespace_trace` accepts. A state alone
+#: cannot answer the operator's actual question -- "did we skip the namespace because a tolerance
+#: said it was close enough, or because the source had nothing for its window?" -- so the reason
+#: travels in the DETAILED channel (`per_namespace_detail`, `trace_out`) and never in the state map.
+FRESH_STRICT = "fresh_strict"          # skipped: max_date reached `end` (zero-tolerance ns)
+FRESH_TOLERANCE = "fresh_tolerance"    # skipped: max_date within the 2-day holiday tolerance
+NO_NEW_BARS = "no_new_bars"            # skipped: the response held no bar for this ns' window
+ALREADY_CURRENT = "already_current"    # skipped: every fetched bar already stored on this basis
+FETCH_ERROR = "fetch_error"            # failed: every provider raised for that symbol
+REFUSED_WRITE = "refused_write"        # failed: the write was refused (`rule` says which gate)
+RULE_QFQ_REBASE_REFUSED = "qfq_rebase_refused"    # cross-source: incoming window vs stored closes
+RULE_NULL_VOLUME_REFUSED = "null_volume_refused"  # per-row: a null volume cell, never 0.0-ed
+
+#: Closed vocabulary of `namespace_detail[*]["reason"]`. `None` is the only other legal value
+#: (`patched` needs no reason). Pinned by an assert inside `patch_equity_daily_bars._mark`, so a
+#: new branch cannot invent a seventh spelling that downstream consumers have never seen.
+NAMESPACE_TRACE_REASONS = (
+    FRESH_STRICT,
+    FRESH_TOLERANCE,
+    NO_NEW_BARS,
+    ALREADY_CURRENT,
+    FETCH_ERROR,
+    REFUSED_WRITE,
+)
+
 #: Bar length of the PART B intraday stream. It is handed to
 #: `common/market_clock.py::last_expected_bar_ts`, which answers "session close minus one bar"
 #: (14:55 for a China 5m day; the afternoon close anchor makes the lunch break need no special
@@ -996,6 +1023,7 @@ def patch_equity_daily_bars(
     end: str,
     *,
     strict_namespaces: Sequence[str] = (MARKETDB_NAMESPACE,),
+    trace_out: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, str]:
     """Patches lagging recent daily bars for the 22 stocks in the Fuyao & MarketDB namespaces.
 
@@ -1022,6 +1050,30 @@ def patch_equity_daily_bars(
     resolved key, this script must never decide that on its own (freeze doc
     `docs/lv19_freshness_contract.md` §1/§2).
 
+    ``trace_out`` (LV24, 2026-11-13): an OBSERVATION-ONLY sink for the per-namespace trace,
+    passed in as a mutable dict and filled in place just before any refusal is raised. It is not
+    part of the return value (see Notes) and it changes nothing about which namespaces are
+    written, the tolerance, the ordering, or any fetch: ``enforcement: observation_only``.
+    On return it holds::
+
+        {
+          "namespace_trace":  {provider -> "skipped" | "patched" | "failed"},   # LV19 shape
+          "namespace_detail": {provider -> {"state", "reason", "symbol", "rule"?}},
+        }
+
+    `namespace_trace` is the SAME mapping published on the cache via
+    `record_namespace_trace` (identical keys and values); `namespace_detail` adds the WHY that a
+    three-state map cannot carry:
+    `reason` is one of `patch_equity_daily_bars`'s module-level constants --
+    `fresh_strict` / `fresh_tolerance` for a namespace judged fresh by its own tolerance
+    (**this is the one that must be visible**: "we did not refresh the namespace the valuation
+    read may use"), `no_new_bars` / `already_current` for a no-op window,
+    `fetch_error` / `refused_write` for `failed` -- and `rule` names the refusing gate
+    (`qfq_rebase_refused` = the incoming window disagrees with stored closes, the cross-source
+    refusal raised by `plan_history_write`; `null_volume_refused` =
+    `store_bars` refused a null volume row). `symbol` names the symbol that produced the
+    recorded outcome. Both maps are empty when nothing was evaluated.
+
     Returns
     -------
     Dict[str, str]
@@ -1037,7 +1089,10 @@ def patch_equity_daily_bars(
     It is therefore published on the CACHE the call already owns, via
     `record_namespace_trace` / `namespace_trace` (`common/duckdb_cache.py`), which
     `web/livetrading/execution_service.py` reads back after this call and prints in the round
-    summary.
+    summary. `trace_out` (LV24) is the same data handed back in-band for a caller that wants to
+    persist it in a report; it is an OPTIONAL out-parameter rather than a return-value change
+    because freeze doc §4.4 freezes that return shape, and because the cache channel can only
+    carry the three states (its API rejects anything else), not the reasons.
     """
     print("\n" + "=" * 80)
     print(f"PART A.2: Checking & Patching 22 Stocks Recent Daily Bars (-> {end})")
@@ -1088,6 +1143,12 @@ def patch_equity_daily_bars(
     #: `patched` > `skipped`): a namespace written for 19 symbols and refused for one is not
     #: green, and the per-symbol detail is already in `fetch_errors`.
     per_namespace: Dict[str, str] = {}
+    #: LV24: `provider -> {"state", "reason", "symbol"[, "rule"]}` for THIS pass -- the WHY behind
+    #: each `per_namespace` state. `fresh_tolerance` is the entry that matters operationally: it
+    #: says "a tolerance, not freshness, is why the namespace the valuation read may use was not
+    #: refreshed". Kept separate from `per_namespace` because `record_namespace_trace` accepts only
+    #: the three frozen states (freeze doc §4.5 rejects anything else, deliberately).
+    per_namespace_detail: Dict[str, Dict[str, Any]] = {}
     #: `NullVolumeRefused` collected per (symbol, write namespace). LV5: a null volume used to
     #: surface as a bare DuckDB `Constraint Error` raised from the `store_bars` call below, which
     #: sits OUTSIDE every per-symbol `try` -- so ONE bad row aborted this whole `for sym` loop,
@@ -1116,12 +1177,31 @@ def patch_equity_daily_bars(
     #: (no namespace is silently promoted to zero tolerance).
     strict_keys = {canonicalize_provider_key(p) for p in (strict_namespaces or ())}
 
-    def _mark(_prov: str, _state: str) -> None:
-        """Record one namespace outcome, WORST-FIRST (`failed` > `patched` > `skipped`)."""
+    def _mark(
+        _prov: str,
+        _state: str,
+        _reason: Optional[str] = None,
+        _symbol: Optional[str] = None,
+        _rule: Optional[str] = None,
+    ) -> None:
+        """Record one namespace outcome, WORST-FIRST (`failed` > `patched` > `skipped`).
+
+        LV24: `(reason, symbol, rule)` describe the FIRST outcome that established the
+        namespace's CURRENT state -- a later outcome replaces it only when it is strictly worse,
+        i.e. when it is the one explaining why the state got worse. So one `failed` symbol out of
+        19 `patched` keeps the namespace `failed` AND keeps that symbol's reason/rule (freeze §4.2:
+        a partially refused namespace is not green).
+        """
         assert _state in ("skipped", "patched", "failed"), _state
+        assert _reason is None or _reason in NAMESPACE_TRACE_REASONS, _reason
         previous = per_namespace.get(_prov)
-        if previous is None or _STATE_RANK[_state] > _STATE_RANK[previous]:
-            per_namespace[_prov] = _state
+        if previous is not None and _STATE_RANK[_state] <= _STATE_RANK[previous]:
+            return
+        per_namespace[_prov] = _state
+        entry: Dict[str, Any] = {"state": _state, "reason": _reason, "symbol": _symbol}
+        if _rule is not None:
+            entry["rule"] = _rule
+        per_namespace_detail[_prov] = entry
 
     try:
         for sym in stocks:
@@ -1147,7 +1227,18 @@ def patch_equity_daily_bars(
                         days=NAMESPACE_FRESHNESS_TOLERANCE_DAYS
                     )
                 if max_date is not None and max_date >= floor_date:
-                    _mark(prov, "skipped")  # Judged fresh by ITS OWN tolerance: untouched.
+                    # Judged fresh by ITS OWN tolerance: untouched. The reason distinguishes the
+                    # two predicates on purpose -- `fresh_tolerance` means "a holiday tolerance,
+                    # not the bar, is what decided this", which is exactly the fact the 2026-11-05
+                    # evidence could not recover from `fetch_errors=none` (freeze doc §4.3).
+                    _mark(
+                        prov,
+                        "skipped",
+                        FRESH_STRICT
+                        if canonicalize_provider_key(prov) in strict_keys
+                        else FRESH_TOLERANCE,
+                        sym,
+                    )
                     continue
                 lagging.append(prov)
             if not lagging:
@@ -1210,7 +1301,7 @@ def patch_equity_daily_bars(
                         )
                     # LV19 trace: every namespace that NEEDED this fetch is still behind.
                     for prov in lagging:
-                        _mark(prov, "failed")
+                        _mark(prov, "failed", FETCH_ERROR, sym)
                     print(
                         f"FAILED (fetch error, {len(attempts)} provider(s) raised: "
                         f"{type(attempts[-1][1]).__name__})"
@@ -1219,7 +1310,7 @@ def patch_equity_daily_bars(
                     # A valid "nothing new" answer, not an error (`fetch_errors` stays empty --
                     # its meaning is pinned by `test_symbol_with_zero_bars_is_not_reported_as_a_fetch_error`).
                     for prov in lagging:
-                        _mark(prov, "skipped")
+                        _mark(prov, "skipped", NO_NEW_BARS, sym)
                     print("SKIPPED (no new bars)")
                 continue
 
@@ -1288,21 +1379,26 @@ def patch_equity_daily_bars(
                     # The pre-merge code fetched per namespace and reported exactly this as
                     # "no new bars"; keep that, and keep an empty frame out of
                     # `plan_history_write`, which refuses one with a `ValueError`.
-                    _mark(prov, "skipped")  # No error, nothing inserted: see the tri-state table.
+                    # No error, nothing inserted: see the tri-state table.
+                    _mark(prov, "skipped", NO_NEW_BARS, sym)
                     print("SKIPPED (no new bars)")
                     continue
                 try:
                     plan = plan_history_write(cache, prov, sym, prov_df, interval="1d")
                 except QfqWriteRefused as exc:
                     refusals.add(exc)
-                    _mark(prov, "failed")  # Refused write: this namespace is still behind.
+                    # Refused write: this namespace is still behind. `rule` names the gate --
+                    # this is the CROSS-SOURCE refusal (the incoming window disagrees with the
+                    # stored closes), and LV24 requires it to be visible as `failed`, never as a
+                    # skip, because the namespace was NOT brought up to date.
+                    _mark(prov, "failed", REFUSED_WRITE, sym, RULE_QFQ_REBASE_REFUSED)
                     continue
 
                 if plan.is_empty:
                     # Nothing to insert: the cache already holds every bar in this window on
                     # the stored basis. Deliberately no write and no warning -- rewriting
                     # identical rows is what produced the 126 `ulp_noise` rows in §13.4.
-                    _mark(prov, "skipped")
+                    _mark(prov, "skipped", ALREADY_CURRENT, sym)
                     print(f"ALREADY CURRENT (dropped {plan.n_dropped_overlap} stored row(s))")
                     continue
 
@@ -1348,7 +1444,8 @@ def patch_equity_daily_bars(
                     )
                 except NullVolumeRefused as exc:
                     null_volume_refusals.append(exc)
-                    _mark(prov, "failed")  # Refused (per row): never "green" for this namespace.
+                    # Refused (per row): never "green" for this namespace.
+                    _mark(prov, "failed", REFUSED_WRITE, sym, RULE_NULL_VOLUME_REFUSED)
                     print(
                         f"REFUSED (null volume) {exc.symbol} [{exc.provider}] "
                         f"{exc.n_rows} row(s) {exc.first_date}..{exc.last_date} "
@@ -1356,7 +1453,7 @@ def patch_equity_daily_bars(
                     )
                     continue
                 _report_cross_check(cache, prov, sym, interval="1d")
-                _mark(prov, "patched")  # Bars actually inserted for this namespace.
+                _mark(prov, "patched", None, sym)  # Bars actually inserted for this namespace.
                 print(f"PATCHED +{len(plan.df)} bars (max: {plan.df.index.max().strftime('%Y-%m-%d')})")
     finally:
         bs_prov.logout()
@@ -1373,6 +1470,20 @@ def patch_equity_daily_bars(
         print(
             "[NAMESPACE-TRACE] "
             + " ".join(f"{prov}={per_namespace[prov]}" for prov in sorted(per_namespace))
+        )
+    # LV24: hand the same data back in-band, reasons included, for a caller that persists it in a
+    # report (Stage 1 does). Filled in place and BEFORE `raise_if_any()` for the same reason the
+    # cache publication is: a refused write must not be able to hide the trace. An out-parameter
+    # (not a return value) keeps freeze doc §4.4's frozen return shape intact.
+    if trace_out is not None:
+        trace_out.clear()
+        trace_out.update(
+            {
+                "namespace_trace": dict(per_namespace),
+                "namespace_detail": {
+                    prov: dict(detail) for prov, detail in per_namespace_detail.items()
+                },
+            }
         )
 
     if null_volume_refusals:
