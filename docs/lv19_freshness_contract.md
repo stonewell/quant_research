@@ -220,3 +220,89 @@ stored.replace(tzinfo=datetime.timezone.utc).astimezone(MARKET_TZ)
 ## 8. 修订记录
 
 （暂无修订。任何修订以 `## Revision YYYY-MM-DD` 追加于本文末尾，不回改上文。）
+
+## Revision 2026-11-13
+
+> **本节覆盖范围**：只关闭 §6.6 登记的两半缺口中的 **(b) 逐命名空间留痕缺失**。
+> §6.6 的冻结原文**不回改**；冲突时以本节为准。它的另一半 **(a) 子进程不派生严格命名空间**
+> **仍然开**：`scripts/check_live_portfolio_health.py` 的调用点（`:1531`）依旧**不传**
+> `strict_namespaces`，方向仍是「多抓一次，而不是读到陈旧 bar」。
+> 代码依据：`a37f186`（实现）；任务状态 SSOT：`docs/development_plan.md` §2.21 `LV24`
+> （`d2adfff` 收口）。本节**不改**任何上文条文、不新增第五态、不动 §4.4。
+> 随本节落地，§8 那句「（暂无修订。）」的状态随之失效；§8 的**机制条款**（append-only、
+> 不回改上文、修订段覆盖冻结文本）继续有效。
+
+### R1. 关闭的残留
+
+* **§6.6(b)**「Stage-1 子进程的全 universe 刷新没有 `per_namespace` 留痕」——**已关闭**。
+  该路径此前只有**聚合** `fetch_errors`，于是 `fetch_errors={}` 与「每个命名空间都是最新」
+  在读起来上完全一样（2026-11-05 的形状）。现在每个**被评估**的命名空间都会写下状态与理由。
+
+### R2. 新增的通道：出参，不是返回值
+
+`patch_equity_daily_bars` 新增**可选关键字出参** `trace_out`（就地填充，且在
+`refusals.raise_if_any()` **之前**填充——拒写异常不得吞掉留痕）：
+
+```
+{"namespace_trace":  {provider -> "skipped" | "patched" | "failed"},
+ "namespace_detail": {provider -> {"state", "reason", "symbol"[, "rule"]}}}
+```
+
+* `namespace_trace` 与缓存通道 `DuckDBCache.record_namespace_trace` 发布的映射**同键同值**，
+  词表**逐字沿用 §4.1**：**没有第四态**。`read_through` 仍是 §4.5 的预留、**仍不实现**。
+* `reason` 回答三态回答不了的「为什么」：
+  * `skipped`：`fresh_strict`（严格命名空间的零容忍判据已满足）／`fresh_tolerance`
+    （**仅**在 2 日周末／假日容忍下算新鲜——即「我们没刷新它」的唯一可见证据）／
+    `no_new_bars`（响应在本命名空间窗口内无可写 bar）／`already_current`
+    （全部已在库且同基准）。
+  * `failed`：`fetch_error`（该标的的取数源全部抛错）／`refused_write` + `rule`，
+    其中 `rule ∈ {qfq_rebase_refused, null_volume_refused}`：前者是 `plan_history_write`
+    的跨源拒绝（来窗与已存收盘价冲突），后者是逐行拒写（空成交量从不用 `0.0` 顶替）。
+* 聚合仍是 §4.2 的 worst-first（`failed` > `patched` > `skipped`）；`reason`／`symbol`／`rule`
+  记的是**把该命名空间推到当前（最坏）状态的那一次**结果，故「19 次 `patched` + 1 次 `failed`」
+  记为 `failed`，且保留失败那次标的与规则。
+
+### R3. §4.4 仍然冻结（本修订不触碰）
+
+* `fetch_errors` 的**返回类型、排序与含义一字未动**：仍是裸 `dict`，形如
+  `symbol -> "<provider>: Type: msg"`；trace 只走**出参**，源码里的 `return fetch_errors`
+  **原样保留**（因此 §0.2 第 6 条继续成立）。
+* 实测（同一合成输入，**改动前 `HEAD` 的原语** vs 改动后的原语，各跑四个场景：干净／
+  仅 `MarketDB` 补数／双源抛错／跨源拒写）：序列化结果**逐字节相同**，
+  `sha256 = 64d9dd4f…`（完整值见下；拒写场景连聚合异常的 `str()` 亦相同）。
+
+  ```
+  64d9dd4ffcb06fe18f7573e4b2845cc6628fbc0da28b1dce5458acbc795ced21
+  ```
+
+* 两条守卫各钉一面：`test_lv24_primitive_keeps_the_frozen_return_statement`（源码级：
+  `) -> Dict[str, str]:` 与 `return fetch_errors` 存在、`fetch_errors.update(` 不存在、
+  `trace_out` 存在）与 `test_lv24_fetch_errors_shape_is_frozen`（字节级：逐字符比对 +
+  确认没有任何 trace 词汇漏进该映射）。
+
+### R4. 报告面（只有这两处可见）
+
+* `stage1_health_report.json::data_refresh.equity_daily_patch`（`summary["equity_daily_patch"]`，
+  写入点 `scripts/check_live_portfolio_health.py:1547`）：即 R2 的两键结构。一个命名空间
+  **都没被评估**时该块**缺席**（与 `fetch_errors` 同一约定：缺席不是空表）。
+* 控制台**一行** `[STAGE 1 NAMESPACE TRACE]`（`summarise_namespace_trace`，`:1339`）：
+  **仅**在存在 `failed`、或存在 `reason=fresh_tolerance` 的 `skipped` 时打印；
+  全部 `patched` / 严格新鲜的绿跑**不打印**。
+* **明确披露**：Stage-1 的 **markdown** 报告**不渲染**该 trace——它只进 JSON 与那一行控制台
+  输出。需要追溯逐命名空间状态时请读 `stage1_health_report.json`，不要到 markdown 里找。
+
+### R5. 验证（全离线、合成数据）
+
+* `pipeline/tests/test_stage1_nav_source.py` 新增 **8 条** `test_lv24_*`（`pytest ... -k lv24`
+  可单独筛出）：全部 `patched`／容忍度跳过仍整体成功／取数失败／拒写带 `rule`／
+  worst-first 与标的顺序无关／`fetch_errors` 冻结字节／原语返回值源码级守卫／干净轮不打印。
+* **反向改坏即转红**：注掉 `trace_out` 的填充后，其中 **5 条转红**；还原后 8 条全绿。
+* 既有回归：`pipeline/tests` 全套 **1386 passed, 1 skipped**。
+
+### R6. 不改变什么
+
+* 方向不变：**宁可多抓一次，也不读到陈旧 bar**——不放松任何容忍度（§2 照旧），不改写入哪些
+  命名空间、不改顺序、不改任何 fetch 行为。
+* **零选股／权重／下单影响**：`enforcement: observation_only`，该留痕只报告、不参与任何闸门。
+* **零版本轴**：不 bump 任何 `version` / `BASE_VERSION`，不跑 `--dump-strategies`，不改任何
+  `strategy_dumps/*.json`（代码改动已在 `docs/version.md` §43 单独登记）。
