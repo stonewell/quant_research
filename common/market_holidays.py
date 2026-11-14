@@ -44,6 +44,10 @@ be worse than the stale deadline it reports.
    2026 and 2027 are flagged `PROVISIONAL_YEARS`: their statutory arrangements are
    still subject to exchange notices, so they must be re-verified before this
    table is trusted for an order-authorising gate.  2020-2025 are stable history.
+   `PROVISIONAL` years are rule-derived, not transcription: see the **re-verification
+   checklist** at the end of this docstring, and `is_provisional` /
+   `provisional_years_covering` for the machine-readable form.  A `PROVISIONAL` year that
+   is silently trusted by a gate is exactly what that checklist exists to stop.
 2. **Full-day closures AND scheduled early closes are modelled** (`L2.27`).  The
    closure tables (`*_HOLIDAYS`) and the early-close tables (`*_EARLY_CLOSES`) are
    separate on purpose: a holiday is "no session today", an early close is "a shorter
@@ -52,11 +56,14 @@ be worse than the stale deadline it reports.
    day after Thanksgiving / July 3 / Christmas Eve when those are sessions; HK 12:00
    with no afternoon session on the eves of Christmas, New Year and Lunar New Year;
    China: none -- A-share shortened days are always full closures, already in the
-   holiday table).  An early-close date is therefore *still a trading day* and still
-   reported `OPEN` after its real close by `common/market_clock.py::session_state()`,
-   which keeps `L2.1`'s as-of/completed-session semantics untouched -- only the
-   session-*geometry* accessors (`session_close_time` / `last_expected_bar_ts`) take
-   the shortened close.  That residual gap is disclosed, not hidden: see
+   holiday table).  An early-close date is therefore *still a trading day*, and its
+   shortened close reaches every consumer: the session-*geometry* accessors
+   (`session_close_time` / `last_expected_bar_ts`), the as-of/publication chain
+   (`as_of_trading_date` / `publication_ready`) and the phase/calendar accessors
+   (`session_state` reports `CLOSED` from the early close onward with no `LUNCH_BREAK`,
+   `last_completed_session` flips at the early close; 2026-11-13).  So an early-close
+   day is no longer reported `OPEN` after its real close.  That last step was label-only:
+   no gating consumer reads `session_state`, see `docs/version.md` §36 and
    `MarketSpec.close_time_on`'s docstring in `common/market_clock.py`.
    Early closes shift the *last bar* obligation, which is exactly what the `L2.26`
    intraday freshness gate compares against; without this table the 13:00 US days
@@ -78,6 +85,31 @@ the source notice in the per-block comment and bump `TABLE_REVISION`.  The same 
 to the `*_EARLY_CLOSES` tables (`L2.27`): 2020-2025 are pinned from published
 NYSE/Nasdaq and HKEX half-day notices, **2026-2027 are `PROVISIONAL`** (rule-derived,
 not yet re-verified against the official notices -- see each block's comment).
+
+**Re-verification checklist for a `PROVISIONAL` year (do this before trusting it).**
+Nothing in this repo can perform these steps offline, which is precisely why the years are
+flagged instead of being quietly assumed correct.  Do **not** invent or "improve" a date
+from memory: an unverified table that fails loud (this flag + the WARN emitted by the live
+clock banner) is strictly better than a confident table that is wrong.
+
+1. **Fetch the notices** (per market, per year -- one notice each, not a derived guess):
+   * China: SSE / SZSE / BSE 2026 (resp. 2027) 部分节假日休市安排通知 -- full closures only;
+     A-shares publish **no** scheduled half-days (a shortened day is a full closure).
+   * HK: HKEX "Trading hours" page + the half-day trading notices for the Lunar New Year
+     eve, Christmas eve and New Year's eve.
+   * US: the NYSE / Nasdaq holiday calendar for the year (full closures) **and** the
+     scheduled early-close list (day after Thanksgiving, July 3, December 24).
+2. **Pin what the notice says**, not what the rule predicts: compare every date in
+   `CHINA_/HK_/US_HOLIDAYS` and `CHINA_/HK_/US_EARLY_CLOSES` for that year against it and
+   correct the literals.  Keep the invariant that a date is a weekday (Sat/Sun rows are
+   omitted) and that an early close is never also a full closure.
+3. **Record the provenance**: replace the block's `# PROVISIONAL: ...` comment with the
+   notice id/date and the URL you actually read, then bump `TABLE_REVISION`
+   (e.g. `"2026-10-23.2"` -> `"2026-11-13.1"`).
+4. **Drop the flag last**: remove the year from `PROVISIONAL_YEARS` **only after** steps
+   1-3, so the diff that stops warning is the same diff that carries the citation.
+5. **Say so if a notice is unavailable** (e.g. 2027 published later): leave the year
+   `PROVISIONAL` and extend `COVERAGE_END_YEAR` instead of pre-filling dates from a rule.
 """
 
 from __future__ import annotations
@@ -87,7 +119,11 @@ from typing import Dict, FrozenSet, Optional, Tuple
 
 #: Bump on every edit to the literal tables below (audit trail for archives).
 #: `2026-10-23.2` = `L2.27` early-close (half-day) tables added.
-TABLE_REVISION = "2026-10-23.2"
+#: `2026-11-13.1` = China data corrections (`docs/version.md` §39), one batch on one day:
+#: 2024-02-09 added, 2026-10-08 removed from the National Day block, 2026-02-23 added
+#: (owner ruling). All three are evidence/ruling corrections, not notice transcriptions;
+#: 2026 stays `PROVISIONAL`.
+TABLE_REVISION = "2026-11-13.1"
 
 #: First and last calendar year for which the tables below are populated.
 COVERAGE_START_YEAR = 2020
@@ -214,7 +250,22 @@ CHINA_HOLIDAYS: Dict[int, FrozenSet[_dt.date]] = {
     2024: _d(
         2024,
         (1, 1),
-        (2, 12), (2, 13), (2, 14), (2, 15), (2, 16),
+        # 2024-02-09 was MISSING from this block until 2026-11-13 (docs/version.md §39).
+        # Evidence (read-only, `data/cache.duckdb`): 2024-02-09 carries **zero** bars for
+        # every symbol that has any history in Feb-2024, under BOTH daily providers
+        # (`FuyaoDataProvider`, `MarketDBDataProvider`) and in `intraday_ohlcv_bars`; the
+        # adjacent sessions 02-08 and 02-19 both carry a full cross-section. A cache-wide
+        # sweep of 2024 found this to be the ONLY weekday the table called a session while
+        # both providers had zero bars, so exactly one day is added -- the real SSE/SZSE
+        # Spring Festival closure was 02-09..02-17 and the weekend rows (02-10/11, 02-17)
+        # are omitted by design (docstring §3). Before the fix the table's Spring Festival
+        # hole was only 02-12..02-16, i.e. it claimed a session on 02-09.
+        # Consequence: `expected_last_session` asked for 2024-02-09 bars that never
+        # existed, so every run between 02-12 and 02-19 was a spurious `is_stale_bar`
+        # FAIL; after the fix it resolves to 02-08. Purely historical -- this can only
+        # change `expected_last_session` for a window that ends on/after 2024-02-09, and
+        # no live window ends in 2024, so today's tickets are unaffected.
+        (2, 9), (2, 12), (2, 13), (2, 14), (2, 15), (2, 16),
         (4, 4), (4, 5),
         (5, 1), (5, 2), (5, 3),
         (6, 10),
@@ -231,16 +282,56 @@ CHINA_HOLIDAYS: Dict[int, FrozenSet[_dt.date]] = {
         (10, 1), (10, 2), (10, 3), (10, 6), (10, 7), (10, 8),
     ),
     # PROVISIONAL: 2026 statutory arrangement (Spring Festival CNY = 2026-02-17,
-    # National Day block 2026-10-01..08).  Re-verify against SSE/SZSE notices.
+    # National Day block 2026-10-01..07 -- see the 10-08 note below).  Re-verify against
+    # SSE/SZSE notices.
+    #
+    # 2026-10-08 REMOVED from the National Day block on 2026-11-13 (docs/version.md §39).
+    # The rule-derived block was 10-01..08, but 2026-10-08 was demonstrably a real session:
+    #   * BOTH daily providers (`FuyaoDataProvider`, `MarketDBDataProvider`) carry a full
+    #     2026-10-08 cross-section -- 27/27 symbols (20 equities + 7 indices), identical
+    #     to 2026-10-09's coverage, in a store whose newest bar is 2026-11-12;
+    #   * the independent BaoStock 5m feed carries exactly 48 bars per symbol on 10-08
+    #     (09:30-11:30 + 13:00-15:00) with no lunch-window bars -- a complete session, not
+    #     a partial/replayed one;
+    #   * over 2026-09-01..2026-11-12 the 5m table holds 47 sessions while the table
+    #     implied 46, and the symmetric difference is exactly {2026-10-08}.
+    # Consequence: the pre-fix table erased the 2026-10-08 session from as-of arithmetic --
+    # `expected_last_session` resolved to 2026-09-30 for a 2026-10-09 run, so
+    # `as_of_universe(..., 09-30)` dropped the 10-08 bar and the book / run directory were
+    # dated 5 sessions back while the data was present (and a genuinely missing 10-08 bar
+    # was *hidden* by the earlier expectation). NOTE (measured, not assumed): this was a
+    # SILENT wrong-as-of, not a raised stale FAIL -- `is_stale_bar` is one-sided
+    # (`bar < expected`), so a newer 10-08 bar never tripped `strict_freshness`.
+    # HONEST SCOPE: the year stays `PROVISIONAL` (`PROVISIONAL_YEARS` is unchanged), so the
+    # REST of the 2026 block -- including 10-01..07 -- remains rule-derived and unverified
+    # against the published exchange notice. This one date is corrected on measured cache
+    # evidence only; do not read the fix as a re-verification of 2026.
+    #
+    # 2026-02-23 ADDED as a closure on 2026-11-13 -- **owner ruling** (2026-11-13), i.e. a
+    # decision, not a new data-derived assumption. It was previously "trading day per this
+    # table", so this is a correction. Data corroboration (read-only, `data/cache.duckdb`):
+    # 2026-02-23 carries ZERO bars for all 27 symbols under BOTH daily providers
+    # (`FuyaoDataProvider`, `MarketDBDataProvider`) and nothing in the BaoStock 5m feed; it
+    # is the only such day in 2026 -- 02-16..02-20 are zero *because they are holidays
+    # here*, and 02-24 onward carries the full 20-equity cross-section again. A universal
+    # hole alone cannot distinguish "closure" from "sync defect" (which is why it was left
+    # alone until now); the ruling is what turns it into a table entry. Do NOT extrapolate:
+    # only 02-23 changes, the rest of the provisional 2026 block stays as-is and
+    # `PROVISIONAL_YEARS` is untouched.
+    # Consequence: before the fix a post-02-23 run expected a 02-23 bar that never existed
+    # (`bar` = 02-13 or 02-20's neighbour < expected 02-23) -> a spurious `strict_freshness`
+    # FAIL for every symbol. Historical: only windows ending on/after 2026-02-23 change, so
+    # no live window is affected today.
     2026: _d(
         2026,
         (1, 1), (1, 2),
         (2, 16), (2, 17), (2, 18), (2, 19), (2, 20),
+        (2, 23),                                            # owner ruling 2026-11-13
         (4, 6),
         (5, 1), (5, 4), (5, 5),
         (6, 19),
         (9, 25),
-        (10, 1), (10, 2), (10, 5), (10, 6), (10, 7), (10, 8),
+        (10, 1), (10, 2), (10, 5), (10, 6), (10, 7),
     ),
     # PROVISIONAL: 2027 (CNY = 2027-02-06, so New-Year's-Eve 02-05 is treated as
     # closed; Qingming 04-05, Dragon Boat 06-09, Mid-Autumn 09-15, National Day 10-01).
@@ -537,12 +628,49 @@ def is_covered(market: str, year: int) -> bool:
     return int(year) in _TABLES[normalize_market(market)]
 
 
+def _year_of(value) -> int:
+    """Calendar year of a `date` / `datetime` / ISO string (the only coercion this module does)."""
+    if isinstance(value, _dt.datetime):
+        return value.date().year
+    if isinstance(value, _dt.date):
+        return value.year
+    return _dt.date.fromisoformat(str(value)[:10]).year
+
+
 def is_provisional(market: str, year: int) -> bool:
-    """True when `year` is covered but its arrangement is not yet final.
+    """True when `year` is covered but its arrangement is **not final**.
 
     Independent of coverage: an uncovered year is not "provisional", it is unknown.
+
+    **What `True` means for a gate.**  The dates for a provisional year are *rule-derived*
+    (nth-weekday rules, lunar-calendar conversions, observed-day substitutions), **not**
+    transcribed from the exchange's published notice.  They must be re-verified against the
+    official notices -- see the re-verification checklist in the module docstring -- before
+    any order-authorising decision treats them as settled.  `True` is not an error: the table
+    is usable, it is just not yet *evidence*.  The worst failure direction is a session this
+    table believes is open when the exchange is closed, so callers that release orders print
+    it (see `common/cli_utils.py::resolve_live_clock_context`) instead of swallowing it.
     """
     return is_covered(market, year) and int(year) in PROVISIONAL_YEARS
+
+
+def provisional_years_covering(dates) -> FrozenSet[int]:
+    """The provisional years touched by `dates` -- `frozenset()` when none is.
+
+    `dates` is any iterable of `datetime.date` / `datetime.datetime` / ISO strings (a session
+    window, an as-of plus its expected session, a run's date range).  Returned years are
+    provisional **for every supported market**, because `PROVISIONAL_YEARS` is a property of
+    the statutory notices, not of one exchange -- the three markets publish on their own
+    schedule but none of the covered years is pinned for any of them.
+
+    Like `is_provisional`, this answers "is the answer evidence or a rule?" -- it does not
+    raise on an uncovered year (use `is_covered` / `calendar_status` for the UNKNOWN axis).
+    """
+    years = set()
+    for value in dates or ():
+        if value is not None:
+            years.add(_year_of(value))
+    return frozenset(year for year in years if year in PROVISIONAL_YEARS)
 
 
 def calendar_status(market: str, year: int) -> str:
@@ -707,5 +835,6 @@ __all__ = [
     "is_covered",
     "is_provisional",
     "normalize_market",
+    "provisional_years_covering",
     "table_revision",
 ]

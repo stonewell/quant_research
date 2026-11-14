@@ -192,7 +192,7 @@ def resolve_market(explicit, symbols) -> str: ...
 
 | 函数 | 语义 | 用途 | 对发布延迟 |
 |---|---|---|---|
-| `last_completed_session()` | **纯日历**：该市场收盘时刻已过的最近交易日 | 运行窗口门禁（§8） | 完全不关心 |
+| `last_completed_session()` | **纯日历**：该市场收盘时刻已过的最近交易日 | **无生产调用者**（纯日历参照；运行窗口门禁是 §8 的 `post_close_to_open_window` + `assert_run_window`，按显式窗口区间判定） | 完全不关心 |
 | `as_of_trading_date()` | 收盘 **+ 发布宽限** 后才承认的最近交易日 | 估值 as_of、新鲜度期望（§5、§6） | 内建 `publication_grace_minutes` |
 
 门禁问"现在该不该跑"，估值问"现在应拿到哪一天的收盘"。**两个不同的问题不允许共用一个函数**，否则会出现"窗口内但数据未发布"或"数据已发布但窗口已关"的错配。

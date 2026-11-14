@@ -59,6 +59,7 @@ from .market_clock import (
     post_close_to_open_window,
     resolve_market,
 )
+from .market_holidays import provisional_years_covering
 
 _PROVIDER_ROTATION = ["yfinance", "csv", "synthetic"]
 
@@ -679,6 +680,26 @@ def resolve_live_clock_context(
     print(ctx.render_banner())
     if ctx.window_note:
         print(f"[MARKET CLOCK] {ctx.window_note}")
+    # `PROVISIONAL` years are rule-derived, not transcribed from an exchange notice
+    # (`common/market_holidays.py`), and every live decision below (is trading day / as-of /
+    # freeze) rests on that table. Say it out loud on the same banner that already reports
+    # the clock, rather than letting an unverified calendar authorise orders silently.
+    # An injected `holidays=` override means the static table is not consulted at all
+    # (`calendar_status() == "explicit"`), so there is nothing provisional to disclose.
+    provisional = (
+        sorted(provisional_years_covering((clock_as_of, as_of)))
+        if clock.holidays is None
+        else []
+    )
+    if provisional:
+        years = "、".join(str(year) for year in provisional)
+        print(
+            f"[WARN] [PROVISIONAL CALENDAR] {market} 的 {years} 年休市/早收表为规则推导，"
+            "未与交易所公告逐条复核（`common/market_holidays.py` 的 PROVISIONAL_YEARS "
+            "仍含该年份）。本票的交易日、as-of 与休市冻结都依赖该表：临时休市或临时早收"
+            "不会出现在这里。核实后请把该年份移出 PROVISIONAL_YEARS 并 bump "
+            "TABLE_REVISION（复核清单见该模块 docstring）。"
+        )
     if as_of_source == "explicit" and ctx.as_of_date != ctx.clock_as_of:
         print(
             f"[MARKET CLOCK] 显式 --as-of-date={ctx.as_of_date} 早于时钟最近已收盘交易日 "

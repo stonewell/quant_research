@@ -106,17 +106,21 @@ def test_friday_window_ends_at_monday_open_not_tomorrow():
 
 
 def test_holiday_end_is_the_next_session_after_the_closure():
-    """China National Day 2026-10-01..08: the last session is 09-30, reopening 10-09."""
+    """China National Day 2026-10-01..07: last session 09-30, reopening 10-08.
+
+    The block used to be 10-01..08; 10-08 was removed on 2026-11-13 because both daily
+    providers and a 48-bar BaoStock 5m session prove it traded (`docs/version.md` §39).
+    """
     before_holiday = _cn_clock(2026, 9, 30, 20, 0)
     window = market_run_window("china", "stage2", now=before_holiday.now)
     assert window == (
         dt.datetime(2026, 9, 30, 15, 30),
-        dt.datetime(2026, 10, 9, 9, 30),
+        dt.datetime(2026, 10, 8, 9, 30),
     )
     mid_holiday = _cn_clock(2026, 10, 4, 12, 0)
     assert in_post_close_to_open_window(mid_holiday.now, "china") is True
     assert (
-        next_trading_day("china", dt.date(2026, 9, 30)) == dt.date(2026, 10, 9)
+        next_trading_day("china", dt.date(2026, 9, 30)) == dt.date(2026, 10, 8)
     )
 
 

@@ -29,7 +29,7 @@ construction on any host*, and giving the window gate something to compare again
 3. **Two date functions, never one** (§4 of the design doc -- the easiest thing to get
    wrong here):
    * `last_completed_session()` -- pure calendar: the latest trading day whose close
-     time has passed. Used by the run-window gate, which does not care about
+     time has passed. Diagnostics only (no production caller); it does not care about
      upstream publication delay.
    * `as_of_trading_date()` -- close **plus** `publication_grace_minutes` (30 for
      China/HK, 15 for US; an estimate, disclosed as such in §14). Only after the grace
@@ -68,13 +68,14 @@ construction on any host*, and giving the window gate something to compare again
 **Not in scope here** (§11 Phase 0): nothing in the repo calls this module yet. Cache
 freshness (`expected_last_session`), the CLI window gate and the Web archive keys are
 `L2.2`-`L2.5`. `common/market_holidays.py` models full-day closures **and** scheduled
-early closes (`L2.27`). A recorded early close reaches BOTH the session-*geometry*
-accessors (`MarketSpec.close_time_on` -> `session_close_time` /
-`last_expected_bar_ts`) AND the as-of/publication chain (`_publication_time` ->
-`publication_ready` / `as_of_trading_date`), so the day becomes usable at exactly the
-instant the post-close window opens. `session_state` / `last_completed_session` still key
-off the full session (they are not publication judgements) -- see
-`MarketSpec.close_time_on`'s docstring.
+early closes (`L2.27`). A recorded early close reaches the session-*geometry* accessors
+(`MarketSpec.close_time_on` -> `session_close_time` / `last_expected_bar_ts`), the
+as-of/publication chain (`_publication_time` -> `publication_ready` /
+`as_of_trading_date`), **and** the phase/calendar accessors
+(`session_state` -> no `LUNCH_BREAK` and `CLOSED` from the early close onward;
+`last_completed_session` -> flips at the early close; 2026-11-13). So the day becomes
+usable at exactly the instant the post-close window opens, and its phase label stops
+claiming `OPEN` after the real close. See `MarketSpec.close_time_on`'s docstring.
 """
 
 from __future__ import annotations
@@ -203,24 +204,27 @@ class MarketSpec:
     def close_time_on(self, day: _dt.date) -> _dt.time:
         """Final close on `day`: the early close when one is recorded, else `close_time`.
 
-        **Scope (two consumers, since 2026-11-12):** the day-specific close feeds
+        **Scope (three consumers, since 2026-11-13):** the day-specific close feeds
 
         1. the session-*geometry* chain -- `session_close_time(market, day)` and therefore
            `last_expected_bar_ts`, i.e. the intraday freshness deadline (`L2.27`), and
         2. the as-of publication chain -- `MarketClock._publication_time(day)`, which is
-           what `publication_ready()` and `as_of_trading_date()` compare against.
+           what `publication_ready()` and `as_of_trading_date()` compare against, and
+        3. the phase/calendar accessors -- `session_state()` (via the same SSOT
+           `early_close_on`, so a half-day has no `LUNCH_BREAK` / second `OPEN`) and
+           `last_completed_session()`.
 
         Because `post_close_to_open_window` takes its START from this same
-        `close_time_on(day) + grace`, the clock now admits today on a half-day at exactly
+        `close_time_on(day) + grace`, the clock admits today on a half-day at exactly
         the instant that day's window opens. `L2.27` had deliberately left (2) on the
         full-session `close_time` ("late, never wrong") and disclosed it as a separate
         task; the measured cost was a dead zone, not just a delay: on a US 13:00 day the
         previous window ended at 09:30 while the half-day's window only became visible at
         16:15 (full close + grace), so 09:30..16:15 contained NO open window and the day
-        could not be run at all. Reading the day's own close closes that gap without
-        touching `session_state()` / `last_completed_session()` (neither is a
-        publication judgement): 13:00-16:00 on a 13:00 day still reads `OPEN`, and
-        `last_completed_session` still flips at the full close.
+        could not be run at all. (3) closed the last residual on 2026-11-13: 13:00-16:00
+        on a 13:00 day used to read `OPEN` and `last_completed_session` used to flip at
+        the full close. That flip is label/observability only -- no gating consumer reads
+        either one (see `docs/version.md` §36).
         """
         early = self.early_close_on(day)
         return self.close_time if early is None else early
@@ -296,8 +300,8 @@ def session_close_time(market: str, session_date: Optional[_dt.date] = None) -> 
     Added for `L2.26` so the intraday cache gate never hard-codes "15:00"/"16:00" in
     `common/duckdb_cache.py`: this module stays the single owner of session geometry.
     Purely read-only -- it is a thin alias of `MarketSpec.close_time_on`, the same
-    day-specific close the as-of publication chain and the post-close window start read
-    (2026-11-12); `session_state` / `last_completed_session` remain full-session.
+    day-specific close the as-of publication chain, the post-close window start and
+    `session_state` / `last_completed_session` read (2026-11-12, extended 2026-11-13).
 
     `L2.27` -- **day-level early close.**  `session_date=None` returns the normal
     full-session close, byte-for-byte the pre-`L2.27` answer (every existing caller, and
@@ -529,6 +533,16 @@ class MarketClock:
 
         Half-open boundaries: `[open, close)` is OPEN, so 09:30:00 is OPEN and
         15:00:00 / 16:00:00 are already CLOSED.
+
+        **Recorded half-days (2026-11-13, `L2.27` follow-up)** use the day's own close
+        (`MarketSpec.early_close_on`), not the static afternoon close: there is no
+        afternoon session on such a day (US closes 13:00, HK 12:00), so the whole
+        tradable span is one morning session. 09:30..13:00/12:00 is `OPEN`, and from
+        `early` onward the answer is `CLOSED` -- no `LUNCH_BREAK`, no second `OPEN`.
+        Deliberately reuses `CLOSED` instead of adding a member: `SessionState` values
+        are the on-disk contract (see the enum), and a new member would recreate the
+        "consumer forgot to also check it" bug class decision 4 exists to prevent.
+        A full session is bit-identical to before (`early is None`).
         """
         day = self.local_date()
         if not self.is_trading_day(day):
@@ -543,6 +557,20 @@ class MarketClock:
 
         if t < spec.morning_open:
             return SessionState.PRE_OPEN
+        early = spec.early_close_on(day)   # None on a normal full session
+        if early is not None:
+            # Recorded half-day: there is no afternoon session (US closes 13:00, HK 12:00).
+            # The whole tradable span is one morning session ending at `early`.
+            #
+            # Implicit DATA assumption: `early <= morning_close`. Treating
+            # `[morning_open, early)` as one continuous session would otherwise report
+            # OPEN straight across the lunch gap on a lunch-split market. Safe today
+            # because every HK entry is exactly 12:00 == `morning_close` (HKEX rule: no
+            # afternoon session on an eve) and China records no half-days at all; the
+            # invariant test asserts `close <= morning_close` for every lunch-split
+            # market. A future 13:30-style HK early close must be taught `LUNCH_BREAK`
+            # here first, not just added to the table.
+            return SessionState.OPEN if t < early else SessionState.CLOSED
         if t < spec.morning_close:
             return SessionState.OPEN
         if spec.afternoon_open is None:
@@ -626,13 +654,19 @@ class MarketClock:
     def last_completed_session(self) -> _dt.date:
         """Latest trading day whose **close instant has passed**. Pure calendar.
 
-        Used by the run-window gate, which asks "should we be running now?" and does
-        not care whether upstream has published yet.  At exactly the close instant the
-        day counts as completed (the session is over).
+        Observability / diagnostics only: no production caller (the run-window gate asks
+        `post_close_to_open_window` + `assert_run_window`, and the as-of question is
+        `as_of_trading_date`).  At exactly the close instant the day counts as completed
+        (the session is over).
+
+        The close is the **day's own** (`MarketSpec.close_time_on`, 2026-11-13): on a
+        recorded 13:00 US / 12:00 HK half-day today counts as completed from 13:00 / 12:00,
+        which is the same close the geometry and publication chains use. Behaviour-neutral
+        today because nothing outside tests calls it.
         """
         local = self.local_now()
         day = local.date()
-        if self.is_trading_day(day) and local.time() >= self.spec.close_time:
+        if self.is_trading_day(day) and local.time() >= self.spec.close_time_on(day):
             return day
         return self._previous_trading_day(day)
 
@@ -652,16 +686,18 @@ class MarketClock:
 
         Note the close..grace row: the session *has* ended, yet as-of is still the
         previous day, because upstream is not expected to have published it. This is
-        deliberately **not** `last_completed_session()` -- that function answers the
-        window-gate question ("may we run?") and returns today from the close instant.
+        deliberately **not** `last_completed_session()` -- that function is pure calendar
+        (today counts from the close instant) and has no production caller; the run-window
+        gate is `post_close_to_open_window` + `assert_run_window`, which decides from the
+        explicit window bounds (see `docs/version.md` §33).
 
         **Half-days (2026-11-12):** "close" is the day's own close, taken from
         `MarketSpec.close_time_on`. A recorded 13:00 US / 12:00 HK early close therefore
         admits today from 13:15 / 12:30 -- exactly the instant
         `post_close_to_open_window()` opens that day's window, so the two cannot disagree.
-        `session_state()` still reports `OPEN` until 16:00 on such a day (it is a session
-        phase, not a publication judgement); the run-window gate decides membership from
-        the explicit window bounds, not from `session_state()`.
+        `session_state()` agrees too since 2026-11-13: it reports `CLOSED` from the early
+        close onward (no afternoon session), and the run-window gate decides membership
+        from the explicit window bounds rather than from `session_state()`.
         """
         local = self.local_now()
         day = local.date()

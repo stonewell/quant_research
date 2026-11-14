@@ -64,11 +64,10 @@ def test_half_day_1329_is_still_the_previous_session_and_the_window_is_shut():
 
     assert clock.as_of_trading_date() == _US_PREV_SESSION
     assert clock.publication_ready() is False
-    # `session_state` still says OPEN between 13:00 and 16:00 on a half-day -- a disclosed
-    # L2.27 residual: it is a phase LABEL, not a publication judgement, and the live gate
-    # never consults it (membership is the explicit window range). The honest reason for
-    # this refusal is the 13:00..13:30 publication grace, not a still-trading session.
-    assert clock.session_state() is SessionState.OPEN
+    # `session_state` says CLOSED after the 13:00 half-day close (2026-11-13): the session
+    # really has ended, so the honest reason for this refusal is the 13:00..13:30
+    # publication grace -- not a still-trading session.
+    assert clock.session_state() is SessionState.CLOSED
 
     window = market_run_window("us", "stage2", now=now, publication_grace_minutes=30)
     # The PREVIOUS session's window: opened 11-25 16:30, closed at 11-27 09:30.

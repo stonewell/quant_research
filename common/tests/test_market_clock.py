@@ -206,7 +206,9 @@ def test_weekend_and_holiday_roll_back_to_previous_session(market, instant, as_o
 
 
 def test_first_session_after_spring_festival_valued_against_pre_holiday_close():
-    clk = clock(MARKET_CHINA, 2026, 2, 23, 1, 59)  # Monday 09:59 CST, market reopened
+    # 2026-02-23 is a closure (owner ruling 2026-11-13, `docs/version.md` §39), so the first
+    # session after the Spring Festival block is Tuesday 02-24.
+    clk = clock(MARKET_CHINA, 2026, 2, 24, 1, 59)  # Tuesday 09:59 CST, market reopened
     assert clk.session_state() is SessionState.OPEN
     assert clk.as_of_trading_date() == _dt.date(2026, 2, 13)
 
@@ -464,7 +466,10 @@ def test_holiday_tables_contain_only_weekdays_and_no_duplicates():
 @pytest.mark.parametrize(
     "market, dates",
     [
-        (MARKET_CHINA, [_dt.date(2026, 10, 1), _dt.date(2026, 10, 8), _dt.date(2026, 2, 17)]),
+        # China: the 2026 National Day block is `10-01..07` since 2026-11-13 -- 10-08 was
+        # removed because both daily providers and a 48-bar BaoStock 5m session prove it
+        # was a real session (`docs/version.md` §39). 10-07 keeps this a *block* landmark.
+        (MARKET_CHINA, [_dt.date(2026, 10, 1), _dt.date(2026, 10, 7), _dt.date(2026, 2, 17)]),
         (MARKET_HK, [_dt.date(2026, 7, 1), _dt.date(2026, 2, 17)]),
         (MARKET_US, [_dt.date(2026, 7, 3), _dt.date(2026, 1, 19), _dt.date(2026, 6, 19)]),
     ],
@@ -742,11 +747,22 @@ def test_early_close_lookup_is_tri_state_and_returns_a_copy():
 
 
 def test_early_close_tables_are_trading_weekdays_inside_the_covered_years():
-    """Data invariant: a half-day on a closure/weekend would be silently inert."""
+    """Data invariant: a half-day on a closure/weekend would be silently inert.
+
+    There are two invariants, not one. Besides "a real session, shortened", a half-day on a
+    **lunch-split** market must end no later than that market's `morning_close`: the
+    `session_state()` half-day branch reads `[morning_open, early)` as ONE continuous
+    session, so an HK entry such as 13:30 would report `OPEN` across 12:00..13:00 instead of
+    `LUNCH_BREAK` then `OPEN`. Every HK entry is 12:00 == `morning_close` today; this
+    assertion is what keeps a future table edit from silently breaking that branch.
+    Continuous-session markets (US, `afternoon_open is None`) only get the weaker
+    "strictly inside the session" check -- 13:00 on a 09:30..16:00 day is correct there.
+    """
     for market in (MARKET_CHINA, MARKET_HK, MARKET_US):
         first, last = coverage_years(market)
         assert (first, last) == (mh.COVERAGE_START_YEAR, mh.COVERAGE_END_YEAR)
         spec = market_spec(market)
+        lunch_split = spec.afternoon_open is not None
         for year in range(first, last + 1):
             table = mh.early_closes_for(market, year)   # raises if a year were missing
             closures = mh.holidays_for(market, year)
@@ -758,6 +774,12 @@ def test_early_close_tables_are_trading_weekdays_inside_the_covered_years():
                     f"{market} {day}: early close {close} must be strictly inside "
                     f"({spec.morning_open}, {spec.close_time})"
                 )
+                if lunch_split:
+                    assert close <= spec.morning_close, (
+                        f"{market} {day}: early close {close} is past the morning close "
+                        f"{spec.morning_close} on a lunch-split market -- `session_state()` "
+                        "would report OPEN across the lunch gap; teach it LUNCH_BREAK first"
+                    )
 
 
 def test_pinned_early_close_dates():
@@ -783,11 +805,14 @@ def test_pinned_early_close_dates():
     }
     # 2023 has no half-day session at all (all three eves fall on a weekend).
     assert mh.early_closes_for(MARKET_HK, 2023) == {}
-    assert mh.table_revision().endswith(".2"), "data edit without a TABLE_REVISION bump?"
+    # Bumped `2026-10-23.2` -> `2026-11-13.1` by the China data corrections of 2026-11-13
+    # (2024-02-09 added, 2026-10-08 removed; `docs/version.md` §39). The assertion stays a
+    # pin so a silent table edit still has to touch this line.
+    assert mh.table_revision() == "2026-11-13.1", "data edit without a TABLE_REVISION bump?"
 
 
-def test_l2_27_as_of_follows_the_early_close_but_session_state_does_not():
-    """Half-day split, updated 2026-11-12: as-of/publication follow the early close.
+def test_l2_27_as_of_and_session_state_follow_the_early_close():
+    """Half-day split, updated 2026-11-12 (as-of) and 2026-11-13 (session phase).
 
     `L2.27` originally left `as_of_trading_date` / `publication_ready` on the FULL-session
     close ("late, never optimistic") and disclosed closing them as a separate task. The
@@ -797,9 +822,10 @@ def test_l2_27_as_of_follows_the_early_close_but_session_state_does_not():
     not legally be run at all. as-of and the window start are now the same instant
     (`close_time_on(day) + grace`).
 
-    `session_state` / `last_completed_session` are deliberately NOT shortened: they are
-    session-phase / pure-calendar answers, not publication judgements, and the live gate
-    decides membership from the explicit window bounds.
+    `session_state` followed on 2026-11-13: on a recorded half-day there is no afternoon
+    session, so 13:00..16:00 is `CLOSED`, not `OPEN`. Label-only -- no gating consumer
+    reads `session_state`; the live gate decides membership from the explicit window
+    bounds (`docs/version.md` §36).
     """
     before_grace = clock(MARKET_US, 2026, 11, 27, 18, 14)  # 13:14 ET
     assert before_grace.publication_ready() is False
@@ -810,7 +836,7 @@ def test_l2_27_as_of_follows_the_early_close_but_session_state_does_not():
     assert at_grace.as_of_trading_date() == US_EARLY
 
     midday = clock(MARKET_US, 2026, 11, 27, 19, 30)   # 14:30 ET, after the 13:00 close
-    assert midday.session_state() is SessionState.OPEN   # unchanged: phase, not publication
+    assert midday.session_state() is SessionState.CLOSED   # half-day: no afternoon session
     assert midday.as_of_trading_date() == US_EARLY
 
     after_grace = clock(MARKET_US, 2026, 11, 27, 21, 20)   # 16:20 ET
@@ -820,3 +846,81 @@ def test_l2_27_as_of_follows_the_early_close_but_session_state_does_not():
     assert last_expected_bar_ts(
         MARKET_US, after_grace.as_of_trading_date(), FIVE_MIN
     ) == _dt.datetime(2026, 11, 27, 12, 55)
+
+
+# --------------------------------------------------------------------------- #
+# Half-day session phases (2026-11-13). `L2.27` shortened the geometry/as-of chains;
+# `session_state` was the last accessor still claiming `OPEN` after a recorded early
+# close. These pin the new rule: ONE morning session, no `LUNCH_BREAK`, no second
+# `OPEN`, and the boundary is half-open at the early close instant itself.
+# --------------------------------------------------------------------------- #
+def _us_clock(y: int, mo: int, d: int, h: int, mi: int, s: int = 0) -> MarketClock:
+    """US clock from a New York wall-clock literal (EST in November: UTC-5)."""
+    return market_now(MARKET_US, now=_dt.datetime(y, mo, d, h + 5, mi, s, tzinfo=UTC))
+
+
+def _hk_clock(y: int, mo: int, d: int, h: int, mi: int, s: int = 0) -> MarketClock:
+    """HK clock from a Hong Kong wall-clock literal (UTC+8 all year)."""
+    return market_now(MARKET_HK, now=_dt.datetime(y, mo, d, h - 8, mi, s, tzinfo=UTC))
+
+
+def test_half_day_session_state_us_closes_at_the_early_close_boundary():
+    """US 2026-11-27 (13:00 ET): OPEN [09:30, 13:00), CLOSED from 13:00 -- half-open."""
+    # PRE_OPEN one second before the open.
+    assert _us_clock(2026, 11, 27, 9, 29, 59).session_state() is SessionState.PRE_OPEN
+    # The open instant itself is OPEN (unchanged half-open rule on the opening side).
+    assert _us_clock(2026, 11, 27, 9, 30).session_state() is SessionState.OPEN
+    assert _us_clock(2026, 11, 27, 12, 55).session_state() is SessionState.OPEN
+    # The early close instant itself is ALREADY CLOSED (half-open at the close side).
+    assert _us_clock(2026, 11, 27, 13, 0).session_state() is SessionState.CLOSED
+    assert _us_clock(2026, 11, 27, 13, 5).session_state() is SessionState.CLOSED
+    # ...and no second OPEN reappears later in the "would-have-been" full session.
+    assert _us_clock(2026, 11, 27, 15, 59).session_state() is SessionState.CLOSED
+    assert _us_clock(2026, 11, 27, 16, 0).session_state() is SessionState.CLOSED
+    # The geometry chain is unchanged by this fix -- one calendar, one close.
+    assert session_close_time(MARKET_US, US_EARLY) == _dt.time(13, 0)
+    assert last_expected_bar_ts(MARKET_US, US_EARLY, FIVE_MIN) == _dt.datetime(
+        2026, 11, 27, 12, 55
+    )
+
+
+def test_half_day_session_state_hk_is_closed_not_lunch_break_at_noon():
+    """HK 2026-12-24 (12:00): morning-only. 12:00 must be CLOSED, never LUNCH_BREAK."""
+    assert _hk_clock(2026, 12, 24, 11, 55).session_state() is SessionState.OPEN
+    noon = _hk_clock(2026, 12, 24, 12, 0).session_state()
+    assert noon is SessionState.CLOSED
+    # Explicit and load-bearing: LUNCH_BREAK would imply an afternoon session that does
+    # not exist on a half-day (and would make `is_intraday` true again via `LUNCH_BREAK`).
+    assert noon is not SessionState.LUNCH_BREAK
+    assert _hk_clock(2026, 12, 24, 12, 30).session_state() is SessionState.CLOSED
+    assert _hk_clock(2026, 12, 24, 13, 0).session_state() is SessionState.CLOSED
+    assert _hk_clock(2026, 12, 24, 15, 59).session_state() is SessionState.CLOSED
+    # A full HK day still has its lunch break and its afternoon OPEN -- proving the new
+    # branch is gated on a RECORDED early close, not on HK's noon morning close.
+    assert _hk_clock(2026, 12, 23, 12, 0).session_state() is SessionState.LUNCH_BREAK
+    assert _hk_clock(2026, 12, 23, 13, 0).session_state() is SessionState.OPEN
+    assert _hk_clock(2026, 12, 23, 16, 0).session_state() is SessionState.CLOSED
+
+
+def test_early_close_phase_does_not_leak_to_adjacent_days():
+    """Full days either side of the half-day keep their full-session phases."""
+    # 11-25 (Wed, full session): the 13:00-16:00 window is OPEN, unlike the half-day.
+    assert _us_clock(2026, 11, 25, 13, 30).session_state() is SessionState.OPEN
+    assert _us_clock(2026, 11, 25, 16, 0).session_state() is SessionState.CLOSED
+    # 11-26 is Thanksgiving: a full closure, so all three instants are NON_TRADING_DAY.
+    for h, mi in ((9, 29), (12, 0), (13, 30)):
+        assert _us_clock(2026, 11, 26, h, mi).session_state() is SessionState.NON_TRADING_DAY
+    # The Saturday right after the half-day is still NON_TRADING_DAY at 13:00.
+    assert _us_clock(2026, 11, 28, 13, 0).session_state() is SessionState.NON_TRADING_DAY
+
+
+def test_last_completed_session_follows_the_early_close():
+    """`last_completed_session` flips at the day's own close, not at 16:00."""
+    # 13:00 ET on the half-day: the session is over -> today.
+    assert _us_clock(2026, 11, 27, 13, 0).last_completed_session() == US_EARLY
+    assert _us_clock(2026, 11, 27, 12, 59).last_completed_session() == US_NORMAL
+    # HK 12:00 half-day, and the full day before it still flips at 16:00.
+    assert _hk_clock(2026, 12, 24, 12, 0).last_completed_session() == HK_EARLY
+    assert _hk_clock(2026, 12, 24, 11, 59).last_completed_session() == _dt.date(2026, 12, 23)
+    assert _hk_clock(2026, 12, 23, 15, 59).last_completed_session() == _dt.date(2026, 12, 22)
+    assert _hk_clock(2026, 12, 23, 16, 0).last_completed_session() == _dt.date(2026, 12, 23)
