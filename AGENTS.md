@@ -215,6 +215,15 @@ This codebase is unusually disclosure-heavy -- match it, don't strip it out:
   architecture and research plan documents in `docs/` should contain only theoretical modeling,
   codebase audits, and module specifications, and must link to `docs/development_plan.md` for task
   lists and execution tracking.
+- **No single-line walls of text (applies to every document you write or edit):**
+  documentation files (`AGENTS.md`, `AGENTS_ZH.md`, `README.md`, everything under `docs/`,
+  per-project `README.md`/`SCHEMAS.md`, and long code-block-adjacent docstrings) must never
+  be one giant unwrapped line per paragraph. Use markdown structure instead -- wrap prose at
+  roughly 100 columns like the rest of this file does, one sentence or clause per line where
+  it helps, blank lines between paragraphs, `-` bullets and nested sub-bullets for
+  enumerations, numbered lists for ordered steps, `|` tables for multi-attribute comparisons,
+  and fenced ```` ``` ```` blocks for anything code-like. The goal is that a reader (or diff
+  review) sees several short, scannable lines rather than one horizontally-scrolling line.
 
 ## Known pre-existing issues & data provider gotchas
 
