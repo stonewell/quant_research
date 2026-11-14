@@ -5797,3 +5797,56 @@ Fuyao / EastMoney 下 ⇒ 指数腿的 5m 会静默消失（28 → 21 只，只�
    （`common/data.py::_drop_invalid_ohlcv_rows` 会剔掉 `high < low`、`high < open/close`、
    非正价、NaN/inf 的行），**同一批日期在重建前备份里同样不存在** ⇒ 不是本轮写丢的，
    也没有为此改任何代码。
+
+## 42. `last_sync_time` 时区口径切换：naive 本地 → naive UTC（无版本轴变动，2026-11-13）
+
+> **本节编号**：落笔前实测现有最高节号为 **41**，故本节取 **42**，只追加在文件末尾。
+> 本节**不改任何代码、不 bump 任何版本轴、不跑 `--dump-strategies`**，
+> 记录的是**数据侧的口径边界**与一个仍然延后的交付项。
+> 契约来源：[`docs/lv19_freshness_contract.md`](file:///home/stone/Work/github/quant/docs/lv19_freshness_contract.md) §3；
+> 任务状态：[`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) §2.21 `LV19`。
+
+### 42.1 两段口径，数据里**没有**切换标记
+
+- **修复前写入的行**：`last_sync_time` 是 **naive 本地墙钟**。事故当时宿主时区为 **UTC−08:00**，
+  故 2026-11-05 那批行（`MarketDBDataProvider` `20:20:10–13`、`FuyaoDataProvider` `20:23:28–35`）
+  是**太平洋时间**，与市场时钟（+08:00）相差 **16 小时** —— 这正是当时把 `20:23` 读成
+  「前一晚」、而它其实是同一次运行**第 3 分钟**的直接原因。
+- **修复后写入的行**：`last_sync_time` 是 **naive UTC**，由唯一 owner
+  `common/duckdb_cache.py::sync_timestamp_utc_naive`（`:901`）产生，两处写入点为
+  `:2170`（`store_intraday_bars`）与 `:2529`（`store_bars`）；显式传入的 aware `sync_time`
+  也会被归一为 naive UTC（aware → 转 UTC 再去 `tzinfo`）。
+- **没有切换标记**：该列是 `TIMESTAMP`，两种口径都**无偏移量**，行内**没有任何字段**能区分
+  「本地」与「UTC」。因此任何读者**不得假设单一约定**，只能按**日期**判读。
+
+### 42.2 边界取本节日期（2026-11-13）
+
+- **2026-11-13 及以后**写入的行：按 **naive UTC** 读。
+- **早于 2026-11-13** 的行：按**当时的宿主本地墙钟**读 —— 本机为 UTC−08:00，但**换机器即失效**，
+  这是本条最脆弱处，已披露。判读同一列时必须先看 `last_sync_time` 的**日期**再定口径。
+- **诚实补充（不改变上面这条边界）**：引入该 helper 的提交是 `f1beab4`（2026-11-07），
+  因此 11-08 及以后写入的行很可能**已经**是 naive UTC。但数据里**没有任何行内标记**能证明某行
+  确由新代码写入，故不按「11-07」而按本节日期作**保守分界**：晚于 11-13 按 UTC 读，早于 11-13
+  必须**显式判读、不得默认**。
+- 推论：**不要把 `MAX(last_sync_time)` 的字面值直接当作「本轮写了」的证据**而不先定口径；
+  跨过 11-13 的时间差里有一半是 8 小时的时区台阶，不是运行间隔。
+
+### 42.3 仍然延后、**未交付**的一项
+
+`LV19` 交付②的后半句要求「报告中同时给出转换后的市场时间」。本节**不**声称该项已完成：
+按冻结文档 §3.4，报告侧渲染的**唯一**合法写法是
+
+```
+stored.replace(tzinfo=datetime.timezone.utc).astimezone(MARKET_TZ)
+```
+
+而当前**无任何报告渲染该列**（冻结文档 §6.4 同结论），因此该项**延后、未交付**。
+禁止把裸值 `strftime` 后标成 `+08:00` —— 那会把 42.1 的那个 16 小时误读重新引入。
+
+### 42.4 边界（零代码、零版本轴）
+
+本节未改 `common/duckdb_cache.py`、未改任何策略/模板类、未动 `BASE_VERSION` / `version`、
+未跑 `--dump-strategies`、未改任何 `strategy_dumps/*.json`，也未回写任何已归档 `data/runs/**`。
+计数侧：[`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md)
+§2.21 的 `LV19` 本轮由 `[ ]` 转 `[x]`，并拆出新行 `LV24`（Stage-1 全 universe 刷新的
+`per_namespace` 缺失）；两者均**不是**本节引入的代码改动。
