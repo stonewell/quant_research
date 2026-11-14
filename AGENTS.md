@@ -206,6 +206,18 @@ available in the current shell.
    - Never re-propose enhancements that were empirically refuted or closed as negative results,
      never duplicate primitives that have already landed, and explicitly cite the relevant
      finished task IDs when justifying net-new proposals.
+9. **Empirical Positive-Value Gate Before Strategy or Trading Code Changes**:
+   - Before implementing or merging any code change related to strategies, signals, alpha
+     factors, portfolio construction, risk controls, or live trading execution, agents **must
+     empirically verify** (via offline backtests, walkforward/ablation comparisons, or
+     quantitative diagnostics against the baseline) that the change produces **positive or
+     strictly non-degrading results** for strategy performance, risk-adjusted return, or trading
+     execution quality.
+   - Pure refactors or bugfixes meant to preserve baseline behavior must verify zero unintended
+     signal or weight drift; strategy/trading enhancements that fail to demonstrate positive
+     empirical value (or introduce degradation, zero-trade starvation, or double-counting risk)
+     **must not be merged into production paths** unless explicitly requested as opt-in
+     disabled-by-default experimental flags.
 
 
 
