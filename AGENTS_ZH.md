@@ -81,8 +81,11 @@ uv run python run_pipeline.py --data-provider synthetic --universe SPY QQQ ...
    - 所有测试套件必须通过 `SyntheticDataProvider` 或 `common/testing.py` 的合成 OHLCV 生成器 100% 离线运行。
    - 命令行参数默认值必须为 `--data-provider synthetic`。
 2. **任务与路线图唯一事实来源 (SSOT)**：
-   - 所有量化工程任务拆解、状态追踪、优先级队列及执行路线图统一集中在 `docs/development_plan.md` 中维护。
+   - 所有量化工程任务拆解、状态追踪、优先级队列及执行路线图统一集中在
+     `docs/development_plan.md` 中维护。
    - `docs/` 下的各模块设计与架构文档必须链接至 `docs/development_plan.md` 查看任务清单和执行状态。
+   - 在 SSOT 中登记任何新任务或提出策略/架构增强建议之前，必须先行交叉核验全部已结项实证与
+     消融结论（参见规则 8）。
 3. **稀疏权重契约与单元格 NaN vs 0.0 (Sparse Weights Contract & Cell-level NaN vs. 0.0)**：
    - `generate_weights(universe, params)` 返回的权重矩阵仅在实际调仓日记录目标权重，其余非调仓日必须保持为 `NaN`。
    - 模板内部绝不进行前向填充 (`ffill()`)。
@@ -104,6 +107,14 @@ uv run python run_pipeline.py --data-provider synthetic --universe SPY QQQ ...
        2. 运行 `uv run python pipeline/research_strategy/run_research_strategy.py --dump-strategies` 刷新 `strategy_dumps/*.json` 持久化元数据；
        3. 确保实盘工单（`run_live_strategy.py` 导出的 `live_trading_ticket.json`）记录的 `strategy_version` 与 `base_version` 比特级对齐；
        4. **版本变更日志持久化 (SSOT 于 `docs/version.md`)**：每次策略版本（`version`）或底座引擎版本（`BASE_VERSION`）发生变更时，必须在 `docs/version.md` 中用中文追加记录该版本的变更日志与摘要（包含变更日期、策略名称/底座标识、旧版本号 $\to$ 新版本号、算法/信号/风控核心变动点、参数增减、以及配套单测验证结论），确保策略历史沿革具备不可篡改的审计追踪能力。
+8. **新任务立项与策略增强建议的前置已结项实证交叉核验铁律**：
+   - 在 `docs/development_plan.md` 中登记任何新任务或提出任何策略/架构增强建议之前，智能体
+     **必须先行检索、对比并交叉核验 `docs/development_plan.md`、`docs/development_plan_archive.md`
+     与 `docs/version.md` 中全部已结项任务（`[x]`）的实证数据、消融结论与负结果结案裁定**
+     （如 `LV8`/`LV20` 反转空桶负结果结案、`C4.1`/`C5.2` 零交易死锁教训、`M1`–`M4` 已交付原语、
+     `L2.*` 后置去杠杆与双重降仓防呆边界）。
+   - 严禁重提已被实证证伪或按负结果结案的改动建议，严禁重复造轮子开发已交付原语，且在论证
+     任何净增量方案时必须显式引用关联的已结项任务编号作为前置依据。
 
 
 ---

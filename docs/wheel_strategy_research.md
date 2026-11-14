@@ -116,18 +116,67 @@ stateDiagram-v2
 在当前回测引擎中，所有策略均继承自 `AllocationTemplate`，必须满足：
 1. 仅在调仓日输出权重，非调仓日保持 `NaN`。
 2. 绝对不可内部 `ffill()`。
-3. 退出或去风险必须写入明确的 `0.0`，不可留 `NaN`（防止回测器全局列前向填充污染）。
+3. 退出或去风险必须写入明确的 `0.0`，不可留 `NaN`（防止回测器全局列向前向填充污染保留旧仓）。
 
 `SyntheticWheelStrategy` 提供两种执行模式：
 - **模式 A (`wheel_execution_mode="discrete_fsm"`, 主推荐模式)**:
-  - State 0: 目标权重为 0.0 标的 + 1.0 现金 (`BIL`)。
-  - State 1: 目标权重为 1.0 标的 + 0.0 现金。
+  - `State_0`: 目标权重为 0.0 标的 + 1.0 现金代理 (`BIL` / `511880`)。
+  - `State_1`: 目标权重为 1.0 标的 + 0.0 现金代理。
+  - `State_2`: 现金避险状态，标的权重显式写 `0.0`，100% 切换至现金代理。
   - 履约与被行权通过内部状态机与 BSM 虚拟定价精确推进，权利金折算为成本下移与现金分红。
 - **模式 B (`wheel_execution_mode="delta_replication"`, 连续 Delta 复制模式)**:
   - 标的每日理论权重 $w_{sym, t} = \Delta_{BSM}(t)$，现金权重 $w_{cash, t} = 1.0 - w_{sym, t}$。
   - 经过 `min_weight_change=0.03` 惯性过滤器平滑，消除微小换手摩擦。
 
-### 4.2 模块落位与类接口设计
+### 4.2 统一持仓生命周期 (UPLSM) 与序列器对齐
+为了与全仓持仓策略内核收敛架构（`M4.2`/`M4.4`）对齐，轮式三状态机映射至统一生命周期系统：
+- **状态映射与序列器流转**：
+  - `State_0 (Short Put)` 对应 UPLSM 现金待机态，等待行权分配或权利金到期；
+  - `State_1 (Covered Call)` 对应 UPLSM 在职多头持仓态（`ACTIVE_LONG`）；
+  - `State_2 (Cash Shield)` 对应 UPLSM 风险避险冷却态（`COOLING`）。
+- **显式 `0.0` 权重契约与硬止损穿透**：
+  - 当由 `State_1` 触及灾难性跌幅（$S_t \le C_0 \times (1 - 8\%)$）转入 `State_2` 时，
+    必须向调仓行写入显式 `0.0` 标的权重；
+  - 触发 `-8%` 硬止损时，激活 UPLSM 紧急穿透旁路（emergency bypass），
+    直接豁免中国 A 股最低持仓周期限制（如适用），确保单日 100% 清仓避险；
+  - 全流程接入 `common/position_policy.py` 中的 `PortfolioSequencer.sequence`
+    统一处理惰性与后置去杠杆。
+
+### 4.3 共享原语复用与离线向量化定价规范
+严格遵循 `AGENTS.md` 避免重复造轮子原则，最大化复用共享组件：
+- **Garman-Klass 波动率算子**：直接复用抽离至 `common/indicators.py` 的
+  `garman_klass_volatility` 共享原语，严禁在策略内部私有重写。
+- **缠论中枢下轨 ($ZD$) 锚定**：直接复用
+  `pipeline/research_strategy/rs/chan_advanced_strategies.py` 中的
+  `_extract_pivot_and_stroke_series` 函数，提取当前最近已确认中枢的下轨价格 `Last_Pivot_ZD`，
+  并强制施加行权价约束 $K_p \le \text{Last\_Pivot\_ZD}$。
+- **100% 离线向量化 BSM 核心**：利用 `scipy.special.ndtr`（正态累积分布 $N(x)$）与
+  `scipy.special.ndtri`（标准正态分位数函数 $N^{-1}(p)$），直接对 NumPy 数组向量化求取
+  Black-Scholes Greeks 及基于目标 Delta 的行权价逆求：
+  $$
+  d_1 = \text{ndtri}(e^{q\tau} \Delta_{\text{call}}), \quad
+  K = S_t \exp\left( -d_1 \sigma \sqrt{\tau} + (r - q + 0.5\sigma^2)\tau \right)
+  $$
+  全程零网络依赖、零 C++ 扩展，保证 100% 离线可测。
+
+### 4.4 双轨波动率契约与配置接线门禁 (`P1.7`)
+- **双轨波动率契约 (离线 HV 代理 vs 实盘 IVR)**：
+  - **离线回测模式 (HV 代理)**：由于日线历史缓存库（`data/cache.duckdb`）
+    不包含历史逐日期权链隐含波动率，策略采用离线 HV 代理模型估算 IV：
+    $$
+    \hat{\sigma}_{\text{IV},t} = \lambda_{\text{VRP}} \cdot \sigma_{\text{GK},t},
+    \quad \lambda_{\text{VRP}} = 1.15
+    $$
+    并基于 252 日滚动窗口计算实现波动率分位数，作为合成 $\text{IVR}_t$ 代理。
+  - **实盘执行模式 (真实 IVR)**：实盘运行可通过东财/Wind 等衍生品接口
+    或外部配置注入真实期权链 IVR 数据，无缝覆盖离线代理。
+- **配置接线门禁 (`P1.7`)**：
+  - 任务 `W1.1`（在 `rs/config.py` 中扩增 `wheel_*` 字段）
+    与 `W1.2`（在 `SyntheticWheelStrategy` 中读取对应配置）必须在同一批次联合落地；
+  - 必须严格通过 `pipeline/tests/test_config_wiring.py` 的静态 AST 门禁检测，
+    防止声明字段但未被策略读取引发 AST 接线告警或回归红检。
+
+### 4.5 模块落位与类接口设计
 
 ```
 pipeline/research_strategy/
@@ -143,9 +192,17 @@ pipeline/research_strategy/
 
 ## 5. 研发推进计划 (Development Roadmap)
 
-在 `docs/development_plan.md` 的 Wave 4 (先进非线性收益与衍生品策略) 中新增 **Track W (Wheel 策略量化体系)**：
-- [ ] **W1.1**: 在 `rs/config.py` 中扩增 `wheel_*` 参数（`wheel_symbol`, `wheel_cash_proxy`, `wheel_target_dte`, `wheel_put_delta`, `wheel_call_delta`, `wheel_ivr_threshold`, `wheel_stop_loss_pct` 等）。
-- [ ] **W1.2**: 编写 `rs/synthetic_wheel_strategy.py`，实现 BSM Greeks 计算、Delta 逆求行权价、Garman-Klass 波动率代理及完整的 FSM 状态机与硬止损逻辑。
+在 `docs/development_plan.md` 的 **Wave 6 (Tier P5 孵化池)** 中维护 **Track W (Wheel 策略量化体系)**
+（与 §2.7 及 §3 架构编排完全对齐，属现网零影响的增量能力，仅在产能空档期插入）：
+- [ ] **W1.1**: 在 `rs/config.py` 中扩增 `wheel_*` 参数（`wheel_symbol`,
+  `wheel_cash_proxy`, `wheel_target_dte`, `wheel_put_delta`, `wheel_call_delta`,
+  `wheel_ivr_threshold`, `wheel_stop_loss_pct` 等），
+  与 `W1.2` 联合落地以通过 `P1.7` 配置接线门禁。
+- [ ] **W1.2**: 编写 `rs/synthetic_wheel_strategy.py`，复用
+  `common/indicators.py` 的 `garman_klass_volatility` 与 `scipy.special`
+  BSM 向量化求解，实现离线 VRP 代理、FSM 三状态机映射与 `-8%` 紧急穿透硬止损逻辑。
 - [ ] **W1.3**: 在 `rs/strategy.py` 中注册 `SyntheticWheelStrategy` 到 `STRATEGY_CLASS_MAP`。
-- [ ] **W1.4**: 编写 `tests/test_synthetic_wheel_strategy.py`，覆盖 BSM 逆解精度、状态机跳变、稀疏权重契约与硬止损清仓逻辑（100% 离线测试）。
-- [ ] **W1.5**: 在 `strategies_config.json` 中添加标准预设并在 `docs/development_plan.md` 中完成闭环归档。
+- [ ] **W1.4**: 编写 `tests/test_synthetic_wheel_strategy.py`，覆盖 BSM 逆解精度、状态机跳变、
+  稀疏权重契约与显式 `0.0` 避险清仓逻辑（100% 离线测试）。
+- [ ] **W1.5**: 在 `strategies_config.json` 中添加标准预设并在
+  `docs/development_plan.md` 中完成闭环归档。

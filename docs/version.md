@@ -1,8 +1,13 @@
 # 量化策略与引擎语义化版本沿革与变更日志档案 (Strategy & Base Engine Version Changelog)
 
 > **版本规范**：遵循 Semantic Versioning 2.0.0 (SemVer)  
-> **权威性质**：全代码库量化策略与资产配置引擎语义化版本演进与变更审计唯一事实来源 (Single Source of Truth, SSOT)  
-> **管理规范**：严格遵循 [`AGENTS.md`](file:///home/stone/Work/github/quant/AGENTS.md) 与 [`AGENTS_ZH.md`](file:///home/stone/Work/github/quant/AGENTS_ZH.md) 核心量化工程规范第 7 条。任何策略或底座算法发生变动时，必须在此处持久化追加审计记录。
+> **权威性质**：全代码库量化策略与资产配置引擎语义化版本演进与变更审计
+> 唯一事实来源 (Single Source of Truth, SSOT)  
+> **管理规范**：严格遵循 [`AGENTS.md`](file:///home/stone/Work/github/quant/AGENTS.md)
+> 与 [`AGENTS_ZH.md`](file:///home/stone/Work/github/quant/AGENTS_ZH.md) 核心量化工程规范第 7 条。
+> 任何策略或底座算法发生变动时，必须在此处持久化追加审计记录。  
+> **最新更新基准**：2026-11-13（`BaseBlendAllocationStrategy` `BASE_VERSION` `v2.0.0`，
+> 全代码库各家族版本与 §40 生产实盘配置基准对齐）
 
 ---
 
@@ -13,41 +18,120 @@
 ```
                 ┌────────────────────────────────────────────────────────┐
                 │          底座引擎版本 (Engine BASE_VERSION)              │
-                │  - BaseBlendAllocationStrategy: v1.6.0                 │
-                │  - AllocationTemplate: v1.0.0                          │
+                │  - BaseBlendAllocationStrategy: v2.0.0                 │
                 └──────────────────────────┬─────────────────────────────┘
                                            │ 继承与多态注入
                                            ▼
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │                          具体策略子类版本 (Strategy Class version)                        │
-│  - ChanRiskManagedBlendStrategy: v1.1.0 [base: v1.6.0]                                 │
-│  - ChanFourStateBlendStrategy:   v1.2.1 [base: v1.6.0]                                 │
-│  - ChanCrisisShieldBlendStrategy: v1.0.1 [base: v1.6.0]                                │
-│  - ChanDualHybridBlendStrategy:  v1.0.0 [base: v1.6.0]                                 │
-│  - GenericBlendStrategy:         v1.0.0 [base: v1.6.0]                                 │
-│  - 9 大静态配置模板 (EqualWeight, RiskParity ...): v1.0.0 (csmom: v1.1.0)              │
+│  - ChanRiskManagedBlendStrategy:       v1.1.1 [base: v2.0.0]                           │
+│  - ChanFourStateBlendStrategy:         v1.4.0 [base: v2.0.0]                           │
+│  - ChanCrisisShieldBlendStrategy:      v1.0.2 [base: v2.0.0]                           │
+│  - ChanDualHybridBlendStrategy:        v1.0.1 [base: v2.0.0]                           │
+│  - ChanFourStateShieldBlendStrategy:   v1.0.1 [base: v2.0.0]                           │
+│  - GenericBlendStrategy:               v1.0.1 [base: v2.0.0]                           │
+│  - 静态配置模板体系 (EqualWeight, csmom v1.1.0, min_var v1.1.0, sleeve v1.0.0 ...)       │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 1.1 双轴定义与递增契约
-1. **底座引擎版本 (`BASE_VERSION`)**：
-   - 作用域：`BaseBlendAllocationStrategy`（`pipeline/research/blend/blend_base.py`）与 `AllocationTemplate`（`common/allocation_templates.py`）。
-   - 递增时机：修改、扩展或新增底座通用算子、组合风控熔断层（Garman-Klass、ATR 吊灯止损、微观结构过滤器、高频共振通道、换手惯性拦截器等）。
-   - 递增规则：向后兼容功能扩展递增 Minor（如 `1.0.0` $\to$ `1.1.0`）；重大契约破损变更递增 Major（如 `1.1.0` $\to$ `2.0.0`）。
-2. **子类策略版本 (`version`)**：
-   - 作用域：具体的量化策略子类（如 `ChanRiskManagedBlendStrategy`、`GenericBlendStrategy`、`WorldQuantAlphaStrategy` 等）。
-   - 递增时机：调整子策略权重配比、默认参数超参、选股信号门槛、特定因子特征组合或出入场规则。
-   - 递增规则：向后兼容的参数或逻辑调优递增 Minor（如 `1.0.0` $\to$ `1.1.0`）；策略架构或核心流派重构递增 Major（如 `1.0.0` $\to$ `2.0.0`）。
-3. **复合版本显示标准**：
-   - 底座派生策略实例输出格式统一为：`v{version} [base: v{BASE_VERSION}]`（例如：`v1.0.0 [base: v1.1.0]`）。
-   - 单体配置模板输出格式为：`v{version}`（例如：`v1.0.0`）。
+### 1.1 基础融合底座版本 (Base Blend Engine Version)
 
-### 1.2 四步联动固化铁律 (Four-step Synchronized Requirements)
+依据 [`AGENTS.md`](file:///home/stone/Work/github/quant/AGENTS.md) 核心量化工程规范第 7 条，
+全仓仅 `BaseBlendAllocationStrategy` 拥有 `BASE_VERSION`：
+
+| 底座引擎类名 (`Engine Class`) | 模块路径 (`Module`) | 当前底座版本 (`BASE_VERSION`) | 演进标志与核心机制 |
+| :--- | :--- | :---: | :--- |
+| `BaseBlendAllocationStrategy` | `pipeline/research/blend/blend_base.py` | **`2.0.0`** | `M4.2`/`M4.4` PositionPolicy 内核收敛、`L2.40` Sequencer 后置组合去杠杆与 legacy `_step_asset_inertia` 物理退役 |
+
+> [!IMPORTANT]
+> **全仓唯一 BASE_VERSION 规范**：`AllocationTemplate`（`common/allocation_templates.py`）
+> 为配置模板抽象基类，无文件级 `BASE_VERSION`（类无写死 `version` 属性，实例默认回退 `v1.0.0`），
+> 严格归入 §1.2 静态配置模板体系维护，严禁与底座引擎版本混淆。
+
+### 1.2 静态资产配置模板版本 (Static Allocation Templates & Helpers)
+
+静态资产配置模板与核心配置辅助组件版本基线（继承 `AllocationTemplate` 或独立算子）：
+
+| 模板 / 组件类名 | 模块路径 | 当前版本 (`version`) | 演进标志与工程说明 |
+| :--- | :--- | :---: | :--- |
+| `AllocationTemplate` | `common/allocation_templates.py` | **`1.0.0`** | 资产配置模板抽象基类（实例默认回退 `v1.0.0`），确立稀疏权重契约与显式 `0.0` 清仓契约 |
+| `EqualWeightAllocation` | `common/allocation_templates.py` | **`1.0.0`** | 1/N 等权重分散基准配置 |
+| `InverseVolatilityAllocation` | `common/allocation_templates.py` | **`1.0.0`** | 资产历史波动率倒数加权 |
+| `CrossSectionalMomentumAllocation` | `common/allocation_templates.py` | **`1.1.0`** | `M1.2` 引入 RankBand 滞后缓冲与 ΔScore 不对称门禁 |
+| `HierarchicalRiskParityAllocation` | `common/allocation_templates.py` | **`1.0.0`** | Marcos Lopez de Prado 层次风险平价算法 |
+| `DualMomentumAllocation` | `common/allocation_templates.py` | **`1.0.0`** | Gary Antonacci 绝对动量门禁 + 截面相对动量选股 |
+| `MaxDiversificationAllocation` | `common/allocation_templates.py` | **`1.0.0`** | Choueifaty 最大分散度比率（DR）凸优化 |
+| `MeanReversionAllocation` | `common/allocation_templates.py` | **`1.0.0`** | 短期超卖 RSI(2) / 均值回归配置 |
+| `MinimumVarianceAllocation` | `common/allocation_templates.py` | **`1.1.0`** | `M1.3` 引入 $L_1$ 换手惩罚项的纯 SciPy SLSQP 二次规划求解器 |
+| `BreadthGatedMomentumAllocation` | `common/allocation_templates.py` | **`1.0.0`** | 全市场多头广度（MA50 上方占比）硬门禁择时动量配置 |
+| `SleeveAllocator` | `common/sleeve_allocator.py` | **`1.0.0`** | `M2.2` 核心-卫星多资产组合分套袖配置器 |
+| `RankBandSelection` | `common/selection_band.py` | **`1.0.0`** | `M1.2` 截面双阈值排名滞后缓冲核心原语（独立辅助类） |
+
+### 1.3 多策略动态融合家族 (Flagship Multi-Strategy Blend Family)
+
+六大多流派 Blend 旗舰策略当前版本与底座版本绑定状态：
+
+| 策略类名 (`Strategy Class`) | 内部标识 (`Strategy ID`) | 当前版本 (`version`) | 绑定底座 (`base_version`) | 复合版本标识 (`version_string`) | 部署特征与关键机制 |
+| :--- | :--- | :---: | :---: | :---: | :--- |
+| `ChanFourStateBlendStrategy` | `chan_four_state_blend` | **`1.4.0`** | **`2.0.0`** | `v1.4.0 [base: v2.0.0]` | 四状态状态机驱动；部署例外为 `regime_ic_ir_hybrid`，§40 固定 `intraday_5m_provider="baostock"` |
+| `ChanRiskManagedBlendStrategy` | `chan_risk_managed_blend` | **`1.1.1`** | **`2.0.0`** | `v1.1.1 [base: v2.0.0]` | 缠论结构与风控增强多流派配置策略，主打回撤控制与稳健复合收益 |
+| `ChanCrisisShieldBlendStrategy` | `chan_crisis_shield_blend` | **`1.0.2`** | **`2.0.0`** | `v1.0.2 [base: v2.0.0]` | 危机防御型盾牌策略，内置极端熊市熔断、流动性保护与对冲卸载 |
+| `ChanDualHybridBlendStrategy` | `chan_dual_hybrid_blend` | **`1.0.1`** | **`2.0.0`** | `v1.0.1 [base: v2.0.0]` | 双轨混动策略，结合缠论短波段择时与中长周期资产动量/反转配置 |
+| `ChanFourStateShieldBlendStrategy` | `chan_four_state_shield_blend` | **`1.0.1`** | **`2.0.0`** | `v1.0.1 [base: v2.0.0]` | 四状态状态机与全景危机防护装甲合体策略 |
+| `GenericBlendStrategy` | `generic_blend` | **`1.0.1`** | **`2.0.0`** | `v1.0.1 [base: v2.0.0]` | 通用多流派 Blend 组合框架，支持任意配置文件的子策略插拔与动态正交加权 |
+
+### 1.4 研究策略家族 (Research & Advanced Timing Strategies)
+
+高级单资产择时、多周期缠论模型与公式化 Alpha 策略版本基线：
+
+| 策略 / 模板类名 | 模块路径 | 当前版本 (`version`) | 演进标志与核心机制 |
+| :--- | :--- | :---: | :--- |
+| `ChanVolumeProfileHybridStrategy` | `pipeline.research_strategy.rs.chan_vp_hybrid_strategy` | **`1.1.0`** | `C5.2` HVN 校验基准迁移至同窗 `[VAL, VAH]` 价值区 |
+| `WyckoffChanSpringStrategy` | `pipeline.research_strategy.rs.wyckoff_chan_strategy` | **`1.1.0`** | `C5.1` 曲率死门修正，`wyckoff_spring_min_curvature` 放宽至 `0.8` |
+| `ChanMeanReversionDivergenceStrategy` | `pipeline.research_strategy.rs.chan_advanced_strategies` | **`1.1.0`** | `C5.1` 曲率死门修正，极端背驰与曲率门限改用可达默认值 |
+| `ChanThreeTypeStrategy` | `pipeline.research_strategy.rs.strategy` | **`1.0.0`** | 缠论一二三类买卖点标准动力学策略 |
+| `ChanVaaCompoundStrategy` | `pipeline.research_strategy.rs.chan_advanced_strategies` | **`1.0.0`** | 缠论结构与 Keller 脆弱度动量（VAA）复合策略 |
+| `ChanFourStateExecutionStrategy` | `pipeline.research_strategy.rs.chan_advanced_strategies` | **`1.0.0`** | 四状态缠论执行策略 |
+| `ChanCompositeStrategy` | `pipeline.research_strategy.rs.chan_advanced_strategies` | **`1.0.0`** | 缠论多周期笔段中枢复合策略 |
+| `WorldQuantAlphaStrategy` | `pipeline.research_strategy.rs.worldquant_alpha_strategy` | **`1.0.0`** | WorldQuant 101 Formulaic Alpha 经典公式因子驱动策略 |
+| `WorldQuantMegaAlphaStrategy` | `pipeline.research_strategy.rs.worldquant_alpha_strategy` | **`1.0.0`** | WorldQuant 巨型多因子集成策略 |
+| `CompositeAllocationTemplate` | `common.strategy_aspects` | **`1.0.0`** | 选股切面 (Selection) 与加权切面 (Weighting) 动态重组模板 |
+| `CompositeTimingTemplate` | `pipeline.research_strategy.rs.timing_aspects` | **`1.0.0`** | 入场切面 (Entry) 与风控/出场切面 (Exit) 跨流派重组择时模板 |
+| `PatternBasedAllocationTemplate` | `common.allocation_templates` | **`1.0.0`** | 形态挖掘 (Pattern Mining) 拐点信号驱动配置模板 |
+
+### 1.5 双轴定义与递增契约 (Dual-Axis Definition & Increment Rules)
+1. **底座引擎版本 (`BASE_VERSION`)**：
+   - 作用域：严格限定为 `BaseBlendAllocationStrategy`（`pipeline/research/blend/blend_base.py`）；
+     `common/allocation_templates.py` 无文件级 `BASE_VERSION`。
+   - 递增时机：修改、扩展或新增底座通用算子、组合风控熔断层（Garman-Klass、
+     ATR 吊灯止损、微观结构过滤器、高频共振通道、换手惯性拦截器等）。
+   - 递增规则：向后兼容功能扩展递增 Minor（如 `1.0.0` $\to$ `1.1.0`）；
+     重大契约破损变更递增 Major（如 `1.9.0` $\to$ `2.0.0`）。
+2. **子类策略版本 (`version`)**：
+   - 作用域：具体的量化策略子类（如 `ChanRiskManagedBlendStrategy`、
+     `GenericBlendStrategy`、`WorldQuantAlphaStrategy` 等）与静态配置模板。
+   - 递增时机：调整子策略权重配比、默认参数超参、选股信号门槛、
+     特定因子特征组合或出入场规则。
+   - 递增规则：向后兼容的参数或逻辑调优递增 Minor（如 `1.0.0` $\to$ `1.1.0`）；
+     策略架构或核心流派重构递增 Major（如 `1.0.0` $\to$ `2.0.0`）。
+3. **复合版本显示标准**：
+   - 底座派生策略实例输出格式统一为：`v{version} [base: v{BASE_VERSION}]`
+     （例如：`v1.4.0 [base: v2.0.0]`）。
+   - 单体配置模板输出格式为：`v{version}`（例如：`v1.1.0`）。
+
+### 1.6 四步联动固化铁律 (Four-step Synchronized Requirements)
 任何 Agent 或研究员在递增策略或引擎版本时，必须完整执行以下四步闭环：
-1. **单测断言同步更新**：同步更新 `pipeline/research_strategy/tests/test_blend_strategy_versioning.py` 与 `common/tests/test_strategy_versioning.py` 中的版本断言，确保 100% 离线测试通过；
-2. **配置元数据刷新**：执行 `uv run python pipeline/research_strategy/run_research_strategy.py --dump-strategies`，刷新持久化配置导出 `strategy_dumps/*.json`；
-3. **实盘工单对齐**：确保实盘交易工单生成器（`run_live_strategy.py` 输出的 `live_trading_ticket.json` 与 `account_state.json`）中的 `strategy_version` 与 `base_version` 比特级对齐；
-4. **日志持久化归档 (SSOT)**：在本文档（`docs/version.md`）中用中文追加记录该版本的详细变更日志、改动原因、算法逻辑及验证结论。
+1. **单测断言同步更新**：同步更新
+   `pipeline/research_strategy/tests/test_blend_strategy_versioning.py`
+   与 `common/tests/test_strategy_versioning.py` 中的版本断言，确保 100% 离线测试通过；
+2. **配置元数据刷新**：执行
+   `uv run python pipeline/research_strategy/run_research_strategy.py --dump-strategies`，
+   刷新持久化配置导出 `strategy_dumps/*.json`；
+3. **实盘工单对齐**：确保实盘交易工单生成器
+   （`run_live_strategy.py` 输出的 `live_trading_ticket.json` 与 `account_state.json`）
+   中的 `strategy_version` 与 `base_version` 比特级对齐；
+4. **日志持久化归档 (SSOT)**：在本文档（`docs/version.md`）中用中文追加记录该版本的详细变更日志、
+   改动原因、算法逻辑及验证结论。
 
 ---
 
@@ -236,30 +320,33 @@
 
 | 策略类名 (`Strategy Class`) | 内部标识 (`Strategy ID`) | 当前版本 (`version`) | 所属底座版本 (`base_version`) | 复合版本标识 (`version_string`) | 核心流派与组合机制说明 |
 | :--- | :--- | :---: | :---: | :---: | :--- |
-| `ChanRiskManagedBlendStrategy` | `chan_risk_managed_blend` | **`1.1.0`** | `1.6.0` | `v1.1.0 [base: v1.6.0]` | 缠论结构与风控增强多流派配置策略，主打回撤控制与稳健复合收益 |
-| `ChanFourStateBlendStrategy` | `chan_four_state_blend` | **`1.2.1`** | `1.6.0` | `v1.2.1 [base: v1.6.0]` | 四状态缠论状态机驱动（趋势/盘整/背驰/反转）动态调权配置旗舰策略（权重模式 `regime_ic_ir_hybrid` 为 `rolling_ic_ir` 默认值的已记录例外，见 §8） |
-| `ChanCrisisShieldBlendStrategy` | `chan_crisis_shield_blend` | **`1.0.1`** | `1.6.0` | `v1.0.1 [base: v1.6.0]` | 危机防御型盾牌策略，内置极端熊市熔断、防崩盘流动性保护与对冲卸载 |
-| `ChanDualHybridBlendStrategy` | `chan_dual_hybrid_blend` | **`1.0.0`** | `1.6.0` | `v1.0.0 [base: v1.6.0]` | 双轨混动策略，结合缠论短波段择时与中长周期资产动量/反转配置 |
-| `GenericBlendStrategy` | `generic_blend` | **`1.0.0`** | `1.6.0` | `v1.0.0 [base: v1.6.0]` | 通用多流派 Blend 组合框架，支持任意配置文件的子策略插拔与动态正交加权 |
-| `ChanFourStateShieldBlendStrategy` | `chan_four_state_shield_blend` | **`1.0.0`** | `1.6.0` | `v1.0.0 [base: v1.6.0]` | 四状态状态机与全景危机防护装甲合体策略 |
+| `ChanFourStateBlendStrategy` | `chan_four_state_blend` | **`1.4.0`** | `2.0.0` | `v1.4.0 [base: v2.0.0]` | 由第三腿 `ChanFourStateExecutionStrategy`（四状态缠论执行状态机）驱动、外层采用 `regime_ic_ir_hybrid` 按三风格桶（`momentum` / `reversal` / `defensive`）动态调权的旗舰配置策略（权重模式 `regime_ic_ir_hybrid` 为 `rolling_ic_ir` 默认值的已记录例外，见 §8；§40 固定 `intraday_5m_provider="baostock"`） |
+| `ChanRiskManagedBlendStrategy` | `chan_risk_managed_blend` | **`1.1.1`** | `2.0.0` | `v1.1.1 [base: v2.0.0]` | 缠论结构与风控增强多流派配置策略，主打回撤控制与稳健复合收益 |
+| `ChanCrisisShieldBlendStrategy` | `chan_crisis_shield_blend` | **`1.0.2`** | `2.0.0` | `v1.0.2 [base: v2.0.0]` | 危机防御型盾牌策略，内置极端熊市熔断、防崩盘流动性保护与对冲卸载 |
+| `ChanDualHybridBlendStrategy` | `chan_dual_hybrid_blend` | **`1.0.1`** | `2.0.0` | `v1.0.1 [base: v2.0.0]` | 双轨混动策略，结合缠论短波段择时与中长周期资产动量/反转配置 |
+| `GenericBlendStrategy` | `generic_blend` | **`1.0.1`** | `2.0.0` | `v1.0.1 [base: v2.0.0]` | 通用多流派 Blend 组合框架，支持任意配置文件的子策略插拔与动态正交加权 |
+| `ChanFourStateShieldBlendStrategy` | `chan_four_state_shield_blend` | **`1.0.1`** | `2.0.0` | `v1.0.1 [base: v2.0.0]` | 四状态状态机与全景危机防护装甲合体策略 |
 
 ---
 
 ## 4. 静态资产配置模板基线档案 (Static Allocation Templates Registry)
 
-`common/allocation_templates.py` 中定义的 9 大经典与现代资产配置模板基线版本记录：
+`common/allocation_templates.py` 及相关模块定义的经典与现代资产配置模板及辅助组件基线版本记录：
 
 | 模板类名 (`Template Class`) | 模板标识 (`name`) | 当前版本 (`version`) | 因子标签 (`factor_tags`) | 理论机制与数学模型 |
 | :--- | :--- | :---: | :--- | :--- |
-| `EqualWeightAllocation` | `equal_weight` | **`1.0.0`** | `["baseline"]` | 1/N 等权重分散基准配置 |
-| `InverseVolatilityAllocation` | `inverse_vol` | **`1.0.0`** | `["volatility_targeting"]` | 资产历史波动率倒数加权，平抑极端高波标的冲击 |
-| `CrossSectionalMomentumAllocation` | `csmom` | **`1.1.0`** | `["relative_momentum"]` | 截面相对动量选拔，重仓动量排名前分位数强势标的（M1.2 支持不对称 rank-band 与 ΔScore 门禁） |
-| `HierarchicalRiskParityAllocation` | `hrp` | **`1.0.0`** | `["risk_parity"]` | Marcos Lopez de Prado 层次风险平价算法，避免逆协方差矩阵病态奇异 |
-| `DualMomentumAllocation` | `dual_momentum` | **`1.0.0`** | `["absolute_momentum", "relative_momentum"]` | Gary Antonacci 绝对动量门禁 + 截面相对动量选股 |
-| `MaxDiversificationAllocation` | `max_div` | **`1.0.0`** | `["risk_parity"]` | Choueifaty 分散化比率（Diversification Ratio）最大化凸优化 |
+| `AllocationTemplate` | 必填参数（无默认值） | **`1.0.0`**（实例回退） | `[]` | 资产配置模板基础抽象基类（`name` 必填，`version: Optional[str] = None` 实例默认回退 `v1.0.0`），确立稀疏权重契约与单元格级 `0.0` vs `NaN` 退出契约 |
+| `EqualWeightAllocation` | `equal_weight` | **`1.0.0`** | `["static_fixed_weight"]` | 1/N 等权重分散基准配置 |
+| `InverseVolatilityAllocation` | `inverse_volatility` | **`1.0.0`** | `["volatility_targeting"]` | 资产历史波动率倒数加权，平抑极端高波标的冲击 |
+| `CrossSectionalMomentumAllocation` | `cross_sectional_momentum` | **`1.1.0`** | `["relative_momentum"]` | 截面相对动量选拔，重仓动量排名前分位数强势标的（`M1.2` 支持不对称 rank-band 与 ΔScore 门禁） |
+| `HierarchicalRiskParityAllocation` | `hierarchical_risk_parity` | **`1.0.0`** | `["correlation_diversification"]` | Marcos Lopez de Prado 层次风险平价算法，避免逆协方差矩阵病态奇异 |
+| `DualMomentumAllocation` | `dual_momentum` | **`1.0.0`** | `["absolute_momentum_trend", "relative_momentum"]` | Gary Antonacci 绝对动量门禁 + 截面相对动量选股 |
+| `MaxDiversificationAllocation` | `max_diversification` | **`1.0.0`** | `["volatility_targeting", "correlation_diversification"]` | Choueifaty 分散化比率（Diversification Ratio）最大化凸优化 |
 | `MeanReversionAllocation` | `mean_reversion` | **`1.0.0`** | `["mean_reversion"]` | 短期超卖 RSI(2) / 均值回归反转配置 |
-| `MinimumVarianceAllocation` | `min_var` | **`1.0.0`** | `["low_volatility"]` | Markowitz 最小方差投资组合二次规划求解 |
-| `BreadthGatedMomentumAllocation` | `breadth_gated_mom` | **`1.0.0`** | `["trend_following", "relative_momentum"]` | 全市场多头广度（MA50 上方占比）硬门禁宏观择时动量配置 |
+| `MinimumVarianceAllocation` | `minimum_variance` | **`1.1.0`** | `["correlation_diversification"]` | Markowitz 最小方差投资组合二次规划求解（`M1.3` 支持长多 $L_1$ 换手惩罚项） |
+| `BreadthGatedMomentumAllocation` | `breadth_gated_momentum` | **`1.0.0`** | `["breadth", "relative_momentum"]` | 全市场多头广度（MA50 上方占比）硬门禁宏观择时动量配置 |
+| `SleeveAllocator` | `sleeve_allocator` | **`1.0.0`** | `["static_fixed_weight"]` | `M2.2` 核心-卫星分套袖资产配置模板（支持多子策略/资产套袖独立预算） |
+| `RankBandSelection` | —（独立辅助类） | **`1.0.0`** | —（独立辅助类） | `M1.2` 截面双阈值排名滞后缓冲核心原语（独立辅助类，不继承 `AllocationTemplate`，无 `name`/`factor_tags`；不对称进入/退出带宽过滤抖动换手） |
 
 ---
 
@@ -267,6 +354,9 @@
 
 | 策略/模板类名 | 当前版本 (`version`) | 归属模块 | 说明 |
 | :--- | :---: | :--- | :--- |
+| `ChanVolumeProfileHybridStrategy` | **`1.1.0`** | `pipeline.research_strategy.rs.chan_vp_hybrid_strategy` | 缠论中枢与筹码分布 (Volume Profile) 混合策略（`C5.2`：HVN 校验基准迁移至同窗价值区 `[VAL, VAH]`） |
+| `WyckoffChanSpringStrategy` | **`1.1.0`** | `pipeline.research_strategy.rs.wyckoff_chan_strategy` | 威科夫弹簧破底翻与缠论一买共振策略（`C5.1`：`wyckoff_spring_min_curvature` 放宽至 `0.8`） |
+| `ChanMeanReversionDivergenceStrategy` | **`1.1.0`** | `pipeline.research_strategy.rs.chan_advanced_strategies` | 缠论背驰与均值回归策略（`C5.1`：曲率死门修正，背驰与曲率门限改用可达默认值） |
 | `CompositeAllocationTemplate` | **`1.0.0`** | `common.strategy_aspects` | 选股切面 (Selection) 与加权切面 (Weighting) 动态重组复合配置模板 |
 | `CompositeTimingTemplate` | **`1.0.0`** | `pipeline.research_strategy.rs.timing_aspects` | 入场切面 (Entry) 与风控/出场切面 (Exit) 跨流派重组单资产择时模板 |
 | `PatternBasedAllocationTemplate` | **`1.0.0`** | `common.allocation_templates` | 形态挖掘 (Pattern Mining) 拐点信号驱动配置模板 |
