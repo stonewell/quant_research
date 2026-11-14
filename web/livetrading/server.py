@@ -358,6 +358,16 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
 
     @app.post("/api/deploy/multi", summary="Execute Multi-Strategy Order Netting Deployment")
     async def run_multi_strategy_deploy(payload: MultiStrategyDeployRequest) -> Dict[str, Any]:
+        # (P1-1 parity, 2026-11-13) Same route-level 400 as `/api/run-health` and
+        # `/api/run-deploy`, through the SAME validator: a malformed `HH:MM` is an input error
+        # at the boundary, not the generic 500 that means "the child failed", and it is
+        # refused before any matrix run directory is allocated.
+        try:
+            publish_after = normalize_intraday_publish_after(
+                payload.intraday_publish_after
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         try:
             strat_list = [s.model_dump() for s in payload.strategies] if payload.strategies else None
             return execution_service.run_multi_strategy_netted_deploy(
@@ -384,6 +394,11 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
                 min_holding_bars=payload.min_holding_bars,
                 inertia_threshold=payload.inertia_threshold,
                 allow_intraday=payload.allow_intraday,
+                # (P1-1 parity, 2026-11-13) Explicit forward -- this is an explicit keyword
+                # list, so a model field not re-listed here is accepted by pydantic and
+                # silently dropped (the same trap that lost `cash`/`confirm_empty_book`).
+                # `None` means "not supplied": the child gets no token at all.
+                intraday_publish_after=publish_after,
             )
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))

@@ -404,6 +404,56 @@ def resolve_intraday_5m_request(template: Any, params: Dict[str, Any]) -> Tuple[
     return bool(resolver(params, "enable_intraday_5m", False, bool)), True
 
 
+def resolve_intraday_5m_provider(template: Any, params: Dict[str, Any]) -> Optional[str]:
+    """The requesting strategy's own `intraday_5m_provider`, or `None` when unpinned.
+
+    Same resolver the switch above uses (`template.resolve_param`), i.e. the chain
+    `p.<prefix>_intraday_5m_provider` -> `p.blend_intraday_5m_provider` ->
+    `p.intraday_5m_provider` -> `cfg.<prefix>_...` -> `cfg.blend_...` -> `cfg....` ->
+    default. `None` means: keep the pre-2026-11-13 behaviour and let the round-level
+    `--data-provider` + `load_intraday_5m_universe`'s fallback chain decide.
+
+    A static allocation template has no `resolve_param` (and cannot request 5m at all),
+    so it reports `None` rather than inventing a value.
+    """
+    resolver = getattr(template, "resolve_param", None)
+    if not callable(resolver):
+        return None
+    raw = resolver(params, "intraday_5m_provider", None, str)
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    return text or None
+
+
+def combine_intraday_5m_providers(values: List[Optional[str]]) -> Optional[str]:
+    """The ONE provider this round loads 5m from, given each requester's pin.
+
+    DISCLOSED CHOICE (mirrors `combine_intraday_cutoffs`): §4.50 does one 5m load per
+    round, so at most one provider can serve it. Unlike a cutoff there is no
+    "conservative direction" between two data sources, so this NEVER silently picks a
+    winner:
+
+      * no pins            -> `None` (run-level `--data-provider`, i.e. the old path);
+      * exactly one pin    -> that pin;
+      * several pins that AGREE -> that value;
+      * several pins that DISAGREE -> the FIRST requester's pin, with a loud warning that
+        names every pin, so the operator can see which strategies were overridden by the
+        round-level constraint instead of discovering it from a provenance line later.
+    """
+    pinned = [v for v in values if v]
+    if not pinned:
+        return None
+    distinct = sorted({str(v) for v in pinned})
+    if len(distinct) == 1:
+        return distinct[0]
+    print(
+        f"[WARN] 5m provider 参数不一致: {', '.join(distinct)}；本轮只做一次 5m 加载，"
+        f"采用首个请求方的 {pinned[0]}（其余策略的 5m 将由该 provider + 回退链提供）"
+    )
+    return str(pinned[0])
+
+
 def resolve_intraday_cutoff(template: Any, params: Dict[str, Any]) -> str:
     """The requesting strategy's own `intraday_cutoff_time`, defaulted to 14:15."""
     resolver = getattr(template, "resolve_param", None)
@@ -933,6 +983,7 @@ def main():
     resolved_strategies: List[Dict[str, Any]] = []
     intraday_5m_requesters: List[str] = []
     intraday_cutoffs: List[str] = []
+    intraday_5m_provider_pins: List[Optional[str]] = []
     for s_spec in strategy_specs:
         s_key = s_spec["strategy_key"]
         strat_def, actual_key, resolved_desc, template = resolve_strategy_definition(s_key, None)
@@ -941,6 +992,13 @@ def main():
         if requests_5m:
             intraday_5m_requesters.append(s_key)
             intraday_cutoffs.append(resolve_intraday_cutoff(template, params))
+            # (2026-11-13) WHICH provider serves this requester's 5m bars, resolved through
+            # the SAME template resolver as the switch above (`params.get(...)` here would
+            # miss `cfg.cfsb_intraday_5m_provider`/`cfg.blend_*` and reintroduce exactly the
+            # 2026-10-22 "decision and consumption disagree" shape).
+            intraday_5m_provider_pins.append(
+                resolve_intraday_5m_provider(template, params)
+            )
         resolved_strategies.append({
             "spec": s_spec,
             "strategy_def": strat_def,
@@ -982,7 +1040,17 @@ def main():
             f"{', '.join(intraday_5m_requesters)} (截断时点: {cutoff_t})"
         )
         try:
-            provider_5m = get_data_provider(args.data_provider, **build_data_kwargs(args))
+            # (2026-11-13) One 5m load per round -> one provider. `None` (no requester
+            # pinned one) keeps the old run-level `--data-provider` behaviour exactly.
+            round_5m_provider = combine_intraday_5m_providers(intraday_5m_provider_pins)
+            provider_5m = get_data_provider(
+                round_5m_provider or args.data_provider, **build_data_kwargs(args)
+            )
+            if round_5m_provider:
+                print(
+                    f"[INTRADAY 5M] 5m 行情提供方已固定为 {round_5m_provider}"
+                    f"（日线仍用 {args.data_provider}）"
+                )
             universe_intraday_5m, intraday_5m_block = apply_intraday_5m_features(
                 universe,
                 symbols=all_symbols_to_load,
@@ -991,7 +1059,7 @@ def main():
                 data_provider=provider_5m,
                 cutoff_time=cutoff_t,
                 cache_dir=cache_dir,
-                provider_label=args.data_provider,
+                provider_label=round_5m_provider or args.data_provider,
                 round_id=round_id,
                 # `--intraday-publish-after` is forwarded ONLY when the operator set it
                 # (`default=None`). Unset => `publish_after=None` => no publication assessment

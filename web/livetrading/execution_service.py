@@ -4349,6 +4349,13 @@ class ExecutionService:
         #: A matrix book identical to THIS date's already-completed netted plan is refused
         #: with `UnconfirmedPlanAsInputError` unless this is `True`.
         edited: bool = False,
+        #: (P1-1 parity, 2026-11-13) `HH:MM` after which the as-of session's 5m bars are
+        #: assumed published, forwarded as `--intraday-publish-after`. ``None`` = do NOT pass
+        #: the token: `scripts/run_live_multi_strategy.py` has no default of its own for this
+        #: axis (unset means "no publication assessment"), so an unset request keeps the child
+        #: argv byte-identical to the pre-P1-1 shape. Appended at the END of the signature so
+        #: every existing positional caller keeps its meaning.
+        intraday_publish_after: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Execute Multi-Strategy Order Netting & Live Deployment.
 
@@ -4361,7 +4368,18 @@ class ExecutionService:
         date's netted plan is refused with `UnconfirmedPlanAsInputError` unless the caller
         states the book was reviewed against broker fills.  Independent of
         `confirm_empty_book` -- neither implies the other.
+
+        ``intraday_publish_after`` (P1-1 parity) mirrors both single-strategy stages on the
+        THIRD request shape: the same `normalize_intraday_publish_after` validator, the same
+        "``None`` = no token at all" argv contract, and the effective value mirrored into the
+        matrix `summary.json` so an auditor can tell "not supplied" (``null``) apart from a
+        value the round actually judged the 5m layer at.
         """
+        # (P1-1 parity) Validate BEFORE any side effect (run dir allocation /
+        # `resolved_universe.txt` / `holdings.json`), exactly like `run_health_check` and
+        # `run_live_deploy`: a malformed `HH:MM` is an INPUT error and must not be able to
+        # leave a half-built archive entry (or a partially written matrix plan chain) behind.
+        publish_after = normalize_intraday_publish_after(intraday_publish_after)
         provider = data_provider or self.storage.default_data_provider or "synthetic"
         # (C6) Same rule as Stage 1/2: the run directory is named after the market
         # clock's published session unless the operator pinned one.
@@ -4560,6 +4578,12 @@ class ExecutionService:
             cmd.append("--allow-intraday")
         else:
             cmd.append("--no-allow-intraday")
+        # (P1-1 parity, 2026-11-13) ONLY when the operator supplied one: no token is added for
+        # `None`, so the pre-P1-1 argv is reproduced byte for byte (the regression test
+        # asserts the FULL token list) and the runner keeps its own "unset = no publication
+        # assessment" default. Appended last so every pre-existing token keeps its position.
+        if publish_after:
+            cmd.extend([INTRADAY_PUBLISH_AFTER_FLAG, publish_after])
 
         print(f"[ExecutionService] Running Multi-Strategy Netting Deploy: {' '.join(cmd)}")
         proc = subprocess.run(
@@ -4653,6 +4677,14 @@ class ExecutionService:
             # round's planned post-ticket book, so a stale-table netted deploy stays
             # reconstructable from the archive.
             "holdings_input_check": holdings_input_check,
+            # (P1-1 parity, 2026-11-13) The EFFECTIVE 5m publication cutoff this round ran
+            # with: `None` = the operator supplied none, so the token was not passed and the
+            # runner computed no publication assessment at all. Recorded here (the same
+            # provenance block that already carries `as_of_source` / `holdings_seed_source`)
+            # rather than only in the child's argv, so "which rule judged this session's 5m
+            # layer?" is answerable from the archive alone -- and so `null` can never be
+            # mistaken for "judged at some default".
+            "intraday_publish_after": publish_after,
         })
         if failure:
             summary.update({k: failure[k] for k in ("error_kind", "error_headline", "error_hint", "error_detail")})

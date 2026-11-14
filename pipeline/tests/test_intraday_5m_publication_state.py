@@ -288,6 +288,61 @@ def test_strategy_without_5m_is_unaffected_at_1600(tmp_path, monkeypatch, capsys
 
 
 # ---------------------------------------------------------------------------
+# 5. ONE spelling across three modules (`R7b` F2 -- identity, not copy-paste)
+# ---------------------------------------------------------------------------
+def test_status_vocabulary_is_identical_across_the_three_modules():
+    """`pending_publication` / `evaluated` / `available` are THREE modules' shared strings.
+
+    They are declared as literals in `common/intraday_features.py`,
+    `scripts/check_live_portfolio_health.py` and `scripts/run_live_strategy.py` (no shared
+    import: Stage 1 keeps lazy imports and Stage 2 owns its gate vocabulary). These are
+    IDENTITY assertions -- not new runtime machinery -- so renaming either constant in one
+    module turns this test red instead of silently splitting the vocabulary.
+    """
+    from scripts import run_live_strategy as stage2
+
+    # "pending_publication": publication owner -> Stage-1 status -> Stage-2 gate state.
+    assert (
+        INTRADAY_5M_PUBLICATION_PENDING
+        == _HEALTH.INTRADAY_5M_STATUS_PENDING
+        == stage2.INTRADAY_GATE_PENDING_PUBLICATION
+        == "pending_publication"
+    )
+    # The reason code that travels beside it, in all three modules.
+    assert (
+        INTRADAY_5M_PUBLICATION_CODE_PENDING
+        == _HEALTH.INTRADAY_5M_CODE_PENDING
+        == stage2.INTRADAY_GATE_REASON_PENDING
+        == "intraday_5m_pending_publication"
+    )
+    # "evaluated" (status axis) and "available" (publication axis) both stay in Stage-2's
+    # measured set, and both spellings still match their owners.
+    assert _HEALTH.INTRADAY_5M_STATUS_EVALUATED == "evaluated"
+    assert INTRADAY_5M_PUBLICATION_AVAILABLE == "available"
+    assert stage2._5M_MEASURED_STATUSES == frozenset(
+        {_HEALTH.INTRADAY_5M_STATUS_EVALUATED, INTRADAY_5M_PUBLICATION_AVAILABLE}
+    )
+    assert stage2._5M_PENDING_STATUSES == frozenset({INTRADAY_5M_PUBLICATION_PENDING})
+
+    # "missing": the publication owner's third state and the freshness owner's stale
+    # reason both reach Stage 1's `--publication` help text; Stage 1 spells the stale
+    # status with its own longer token, so only the publication string is shared.
+    assert INTRADAY_5M_PUBLICATION_MISSING == "missing"
+    assert INTRADAY_5M_PUBLICATION_MISSING not in stage2._5M_MEASURED_STATUSES
+    assert INTRADAY_5M_PUBLICATION_MISSING not in stage2._5M_PENDING_STATUSES
+
+    # Every Stage-2 token that is neither measured nor pending freezes (`R7`).
+    for frozen_token in (
+        INTRADAY_5M_PUBLICATION_MISSING,
+        _HEALTH.INTRADAY_5M_STATUS_STALE,
+        _HEALTH.INTRADAY_5M_STATUS_UNSUPPORTED,
+        _HEALTH.INTRADAY_5M_STATUS_UNMEASURED,
+    ):
+        assert frozen_token not in stage2._5M_MEASURED_STATUSES
+        assert frozen_token not in stage2._5M_PENDING_STATUSES
+
+
+# ---------------------------------------------------------------------------
 # Minimal directive inputs (mirrors `test_execution_session_labeling._dashboard_kwargs`)
 # ---------------------------------------------------------------------------
 def _dd_info():

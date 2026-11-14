@@ -71,6 +71,7 @@ from common.cli_utils import (
     shared_data_dir,
 )
 from common.freshness import assert_fresh_universe
+from common.duckdb_cache import format_adjust_factor_freshness_warning
 from common.indicators import sma
 from common.intraday_features import INTRADAY_5M_PUBLICATION_AFTER_LOCAL
 from common.live_execution_timing import (
@@ -1093,6 +1094,32 @@ def attach_nav_provenance(dd_info: Dict[str, Any], nav_resolution: Dict[str, Any
     return dd_info
 
 
+def resolve_stage1_run_mode(clock_ctx: Any) -> str:
+    """`replay` or `live` for THIS Stage-1 run -- delegated, never re-derived (`L2.30`).
+
+    Stage 1's report writes `execution_timing` (the block a post-hoc audit reads to learn
+    "which session do these prices fill in, and was this a real run?"). That call used to
+    assert `run_mode="live"`, so a deliberate replay -- `--as-of-date` pinned to a session
+    EARLIER than the market clock's latest published one, which
+    `common/cli_utils.resolve_live_clock_context` labels
+    `window_gate="not_applicable_replay"` -- still published a report claiming to be live.
+
+    The predicate lives in `scripts.run_live_strategy.resolve_run_mode` and is imported
+    on purpose: Stage 2 and the netted runner already share that ONE definition, and a second
+    copy here could drift into disagreeing with them about the same invocation. Lazy import
+    keeps this module's import graph free of the whole Stage-2 runner (the backtester + signal
+    stack) while still being the same object at run time.
+
+    Every non-replay shape is `live`: no `--as-of-date` (as-of = the clock's session), an
+    explicit `--as-of-date` equal to the clock's session (what the web layer sends), and a
+    future as-of (rejected by the clock upstream). A genuine live run's report is therefore
+    unchanged bit-for-bit.
+    """
+    from scripts.run_live_strategy import resolve_run_mode
+
+    return resolve_run_mode(clock_ctx)
+
+
 def _round_version_triple(strategy_def: Any) -> Dict[str, Any]:
     """This round's `strategy_version` / `base_version` / `strategy_version_info`.
 
@@ -1266,6 +1293,49 @@ def build_account_state_update(
     return updated_state
 
 
+def resolve_cache_db_file(cache_dir: str) -> str:
+    """The exact `.duckdb` file `DuckDBCache(cache_dir)` would open.
+
+    ONE owner for this rule (2026-11-13): `refresh_stage1_data` judged its "refuse to create a
+    missing cache" gate on it, and the adjust-factor freshness census below now reads the same
+    file, so a `--cache-dir` that is itself a `.duckdb`/`.db` file cannot make the two disagree.
+    """
+    cache_is_file = cache_dir.endswith(".duckdb") or cache_dir.endswith(".db")
+    if os.path.isdir(cache_dir) or not cache_is_file:
+        return os.path.join(cache_dir, "cache.duckdb")
+    return cache_dir
+
+
+def inspect_stage1_adjust_factor_freshness(
+    *,
+    refresh_summary: Optional[Dict[str, Any]],
+    cache_dir: str,
+) -> Dict[str, Any]:
+    """Stage-1 census of "do the adjustment factors reach the bars?" -- OBSERVATION ONLY.
+
+    Deliberately thin: it resolves the file the run just refreshed and delegates to
+    `common.duckdb_cache.inspect_adjust_factor_freshness`, which never raises. Nothing here
+    feeds `gate_code`, breadth/thrust/vol, target exposure, weights or orders -- the block is
+    written to `stage1_health_report.json::adjust_factor_freshness` and printed as one `[WARN]`
+    line when it is `lagging`/`missing`. Stage 2 is untouched by design: a stale factor tail is
+    currently PRICE-NEUTRAL (the qfq anchor is the latest stored factor, so `qfq == raw` until a
+    corporate action lands in the gap), and turning an observation into a gate is a separate,
+    explicit decision.
+
+    A skipped/failed refresh contributes no cache file: `refresh_summary["cache_file"]` is used
+    when present (it is the path that was actually opened), otherwise the path is resolved from
+    `cache_dir` with the same rule the gate used.
+    """
+    from common.duckdb_cache import inspect_adjust_factor_freshness
+
+    db_file = None
+    if isinstance(refresh_summary, dict):
+        db_file = refresh_summary.get("cache_file")
+    if not db_file:
+        db_file = resolve_cache_db_file(cache_dir)
+    return inspect_adjust_factor_freshness(db_file)
+
+
 def refresh_stage1_data(
     symbols: Sequence[str],
     as_of_date: str,
@@ -1305,11 +1375,7 @@ def refresh_stage1_data(
     # Resolve the FINAL database file the same way `DuckDBCache.__init__` does, so the gate
     # below judges the exact path that is about to be opened (a `--cache-dir` may itself be
     # the `.duckdb` file rather than a directory).
-    cache_is_file = eff_cache_dir.endswith(".duckdb") or eff_cache_dir.endswith(".db")
-    if os.path.isdir(eff_cache_dir) or not cache_is_file:
-        db_file = os.path.join(eff_cache_dir, "cache.duckdb")
-    else:
-        db_file = eff_cache_dir
+    db_file = resolve_cache_db_file(eff_cache_dir)
     existed = os.path.exists(db_file)
 
     summary: Dict[str, Any] = {
@@ -1909,6 +1975,47 @@ VOL_MIN_OBS = 21
 
 #: Reason code emitted when no symbol has enough history to estimate volatility.
 VOL_DEGRADED_INSUFFICIENT_HISTORY = "insufficient_history"
+
+# ---------------------------------------------------------------------------
+# (LV18 LABEL FIX, 2026-11-13) THE FACTOR'S SCOPE IS PART OF THE FACTOR
+#
+# `LV18` was filed because this script COMPUTED `vol_scaling_factor` and PRESENTED it as
+# an applied risk action while nothing downstream consumed it ("presented as an applied
+# action, actually inert"). The wiring (`scripts/run_live_strategy.py::apply_portfolio_
+# vol_overlay_for_strategy`, cap semantics) fixed the global case, but it is STRATEGY
+# GATED: it is consumed as a `min()` CEILING on total equity ONLY for the vol-ceiling
+# ALLOWLIST (`PORTFOLIO_VOL_OVERLAY_STRATEGY_KEYS`, currently `chan_four_state_blend`).
+# For every other strategy the number is INERT, and the pre-fix strings here claimed for
+# all of them, unconditionally:
+#   * "Barroso scaling scales equity by 0.42x"                    (gate actions)
+#   * "Volatility Scaling    :   0.42x"                           (terminal dashboard)
+#   * "Barroso Volatility Scaling: `0.42x`"                       (Markdown report)
+#   * "Elevated volatility: Rescaling portfolio equity exposure downwards."  (assessment)
+# That is the LV18 lie one level down -- per strategy instead of globally.
+#
+# WHY A NEUTRAL, TWO-PART QUALIFIER AT EVERY SITE (and not a per-strategy branch):
+# none of the four render sites knows its strategy's ALLOWLIST MEMBERSHIP.
+# `resolve_gate_directive` receives no strategy identity at all; `print_dashboard` /
+# `generate_reports` receive `strategy_info`, which carries `strategy_name` /
+# `template_name` but NOT the `strategy_key` the allowlist is expressed in, and neither
+# receives a resolved membership flag. Branching on `template_name` would be an invented
+# lookup that silently rots the day a strategy is added to (or removed from) the Stage-2
+# allowlist, and importing the whole Stage-2 runner here to read its constant would put a
+# live deployment's Stage 1 behind that module's import graph for a display string.
+# So the qualifier is written to be TRUE IN BOTH CASES, like its neighbour
+# `[Stage-1 advisory, ignored by Stage-2 orders]` on `target_exposure`:
+#   * "applied as a cap only for ... allowlist strategies" -- never claims application for
+#     an off-allowlist strategy (the inert case), and
+#   * "cap ... no effect on other strategies" -- never implies the factor MULTIPLIES or
+#     raises exposure for an allowlisted one (it is a ceiling: `min(model_equity_sum, f)`).
+# One owner: every user-visible presentation of the factor interpolates THIS string, and
+# `pipeline/tests/test_vol_scaling_labeling.py` statically asserts the renderers keep
+# doing so, so a future edit cannot drop the scope silently.
+# ---------------------------------------------------------------------------
+VOL_CAP_SCOPE_QUALIFIER = (
+    "[applied as a cap only for vol-ceiling allowlist strategies "
+    "(currently chan_four_state_blend); no effect on other strategies' orders]"
+)
 
 
 def evaluate_realized_volatility(
@@ -2727,9 +2834,13 @@ def resolve_gate_directive(
         )
 
     if vol_info["vol_elevated"]:
+        # (LV18 label fix, 2026-11-13) "scales equity by X" asserted an APPLIED rescale for
+        # whichever strategy this gate serves; the factor is a Stage-2 CEILING consumed only
+        # by the vol-ceiling allowlist, so the scope travels with the number.
         actions.append(
             f"Volatility Alert: 21d realized vol ({vol_info['realized_vol_21d']:.1%}) > target ({vol_info['target_vol']:.1%}); "
-            f"Barroso scaling scales equity by {vol_info['vol_scaling_factor']:.2f}x."
+            f"Barroso factor {vol_info['vol_scaling_factor']:.2f}x is a CEILING on total equity "
+            f"(never a multiplier, and it can only LOWER exposure) {VOL_CAP_SCOPE_QUALIFIER}."
         )
     # (D7) An UNMEASURED volatility factor must say so out loud: `vol_scaling_factor: 1.0`
     # is the neutral stand-in, not evidence of a calm market.
@@ -2845,12 +2956,17 @@ def print_dashboard(
 
     # 3. Volatility Targeting
     print("\n[3. REALIZED VOLATILITY TARGETING (BARROSO & SANTA-CLARA 2015)]")
-    v_status = "⚠️ Scaled Down" if vol_info["vol_elevated"] else "🟢 Stable"
+    # (LV18 label fix, 2026-11-13) "⚠️ Scaled Down" claimed an APPLIED rescale for every
+    # strategy, but this line reports a MEASUREMENT (realized vol above target); whether
+    # anything downstream is capped is stated, with its scope, on the factor line below.
+    v_status = "⚠️ Vol Above Target" if vol_info["vol_elevated"] else "🟢 Stable"
     if vol_info.get("vol_degraded"):
         v_status = "⚠️ UNAVAILABLE (neutral 1.00x fallback)"
     vol_mod_lbl = f", Model: {vol_info.get('vol_model', 'N/A')}" if "vol_model" in vol_info else ""
     print(f"  21-Day Realized Vol   : {_fmt_metric(vol_info['realized_vol_21d'], '>6.1%')} (Target Vol: {vol_info['target_vol']:>5.1%}{vol_mod_lbl}) | {v_status}")
-    print(f"  Volatility Scaling    : {vol_info['vol_scaling_factor']:>6.2f}x")
+    # (LV18 label fix) The value alone read as an applied rescale for EVERY strategy; the
+    # factor is a Stage-2 ceiling on the allowlist only, so the scope is printed with it.
+    print(f"  Volatility Scaling    : {vol_info['vol_scaling_factor']:>6.2f}x {VOL_CAP_SCOPE_QUALIFIER}")
     # (D7) Window provenance: a repeated float is diagnosable only if the input window
     # is on screen. Printed for every run, stale or not.
     print(
@@ -3036,6 +3152,7 @@ def generate_reports(
     single_stock_cap: Optional[Dict[str, Any]] = None,
     *,
     advisory: Optional[Dict[str, Any]] = None,
+    adjust_factor_freshness: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str]:
     """Generate and write structured JSON and Markdown summary reports.
 
@@ -3043,6 +3160,12 @@ def generate_reports(
     `common.advisory_report.build_advisory_block`. It is written verbatim and
     consumed by nothing here: default `None` keeps every existing caller and
     byte-for-byte report unchanged.
+
+    `adjust_factor_freshness` (2026-11-13) is the READ-ONLY census from
+    `inspect_stage1_adjust_factor_freshness`: per-symbol `max(adjust_factors.date)` vs
+    `max(ohlcv_bars.date)`, its aggregate `status`, and `gates_orders: False`. It is persisted
+    verbatim under the same key and read by NO gate -- `None` (every pre-2026-11-13 caller, and
+    any run whose cache could not be inspected) simply omits it.
     """
     os.makedirs(output_dir, exist_ok=True)
     json_path = os.path.join(output_dir, STAGE1_HEALTH_REPORT_JSON)
@@ -3072,6 +3195,10 @@ def generate_reports(
         # these prices fill in" from the ordinal position of the report in the archive.
         "execution_timing": (dict(timing) if isinstance(timing, dict) else None),
         "freshness_summary": freshness_summary,
+        # (2026-11-13, observation only) "Do the adjustment factors reach the bars?" -- see
+        # `inspect_stage1_adjust_factor_freshness`. `gates_orders: False` travels inside the
+        # block: it is written for audit and consumed by NO gate, weight or order path.
+        "adjust_factor_freshness": adjust_factor_freshness,
         # (2026-10-27) The pre-flight data-refresh outcome, including
         # `cache_created` (True only when THIS run had to create a missing
         # cache.duckdb, i.e. only with --allow-create-cache). Persisted so a
@@ -3203,6 +3330,17 @@ def generate_reports(
     _cap_state = single_stock_cap if isinstance(single_stock_cap, dict) else single_stock_cap_state()
     _cap_display = f"{float(_cap_state.get('cap', 0.20)):.1%}"
     _cap_status_cell = single_stock_cap_status_text(_cap_state)
+    # (LV18 label fix, 2026-11-13) "Rescaling portfolio equity exposure downwards" was an
+    # unconditional APPLIED-action claim; the factor is a Stage-2 ceiling for the vol-ceiling
+    # allowlist only, and it can only LOWER exposure. Same qualifier as the factor line above.
+    _vol_cap_assessment = (
+        (
+            "⚠️ Elevated volatility: total equity exposure is CAPPED, never raised "
+            + VOL_CAP_SCOPE_QUALIFIER
+        )
+        if vol_info["vol_elevated"]
+        else "🟢 Realized market variance within standard bounds."
+    )
     md_content = f"""# Stage 1 Live Pre-Trade Health & Macro Audit Report
 
 > **Valuation Date**: `{as_of_date}`  
@@ -3254,9 +3392,9 @@ def generate_reports(
 ## 3. Realized Volatility Targeting
 
 - **21-Day Realized Volatility**: `{_fmt_metric(vol_info['realized_vol_21d'], '.1%')}` (Target Vol: `{vol_info['target_vol']:.1%}`)
-- **Barroso Volatility Scaling**: `{vol_info['vol_scaling_factor']:.2f}x`
+- **Barroso Volatility Scaling**: `{vol_info['vol_scaling_factor']:.2f}x` {VOL_CAP_SCOPE_QUALIFIER}
 - **Input Window**: `{vol_info.get('vol_window_start') or 'N/A'}` → `{vol_info.get('vol_window_end') or 'N/A'}` (n_obs `{_fmt_metric(vol_info.get('vol_n_obs'), 'd')}`, last bar `{vol_info.get('vol_input_bars_last_date') or 'N/A'}`, lag `{_fmt_metric(vol_info.get('vol_input_lag_days'), 'd')}`d, source `{vol_info.get('vol_input_source')}`)
-- **Assessment**: {"⚠️ Elevated volatility: Rescaling portfolio equity exposure downwards." if vol_info['vol_elevated'] else "🟢 Realized market variance within standard bounds."}
+- **Assessment**: {_vol_cap_assessment}
 """
     # (D7) A degraded / stale-window volatility input gets its own loud line. Silence
     # here is what let a frozen 0.3240854096084951 read as a measured market.
@@ -3383,6 +3521,7 @@ def build_stage2_command(
     args: argparse.Namespace,
     enable_intraday_5m: bool = False,
     portfolio_value: Optional[float] = None,
+    intraday_5m_provider: Optional[str] = None,
 ) -> List[str]:
     """Builds the argv for the auto-launched Stage 2 runner (`--auto-run-stage2`).
 
@@ -3451,6 +3590,11 @@ def build_stage2_command(
         cmd.append("--no-cache")
     if enable_intraday_5m:
         cmd.append("--enable-intraday-5m")
+    # (2026-11-13) Forward the PINNED 5m provider so the child loads its 5m layer from the
+    # same source this process gated on. `None` (unpinned) appends nothing, so every
+    # existing argv stays byte-for-byte identical.
+    if intraday_5m_provider:
+        cmd.extend(["--intraday-5m-provider", str(intraday_5m_provider)])
     # (L2.3) Forward the market-clock policy the operator chose for Stage 1 so the
     # auto-launched Stage 2 resolves the SAME market/as-of/grace and applies the same
     # gate strictness. Without this, Stage 1 could run under `--market hk` (or an
@@ -3488,7 +3632,17 @@ def main(cli_args: Optional[List[str]] = None):
     # gate used, so the dashboard, the Markdown header, the JSON report and `summary.json`
     # cannot disagree about when this run happened. Values are frozen (`as_of+1` /
     # `next_open`) per the 2026-11-03 user ruling -- see `common/live_execution_timing.py`.
-    timing = resolve_execution_timing(clock_ctx, as_of=as_of_date, run_mode="live")
+    #
+    # (L2.30 Stage-1 half, 2026-11-13) `run_mode` is DERIVED, never asserted. This call used
+    # to hardcode `run_mode="live"`, so a `--as-of-date` pinned to an EARLIER session (a
+    # deliberate replay/backfill) still produced a Stage-1 report claiming `run_mode="live"`
+    # in `execution_timing` -- a report lying about its own mode, in the very block a post-hoc
+    # audit reads. The predicate is NOT re-implemented here: `resolve_stage1_run_mode`
+    # delegates to `scripts.run_live_strategy.resolve_run_mode`, the one replay predicate both
+    # Stage 2 and the netted runner already use (same-day / clock-derived runs stay `live`
+    # bit-for-bit, so a genuine live run's report is unchanged).
+    run_mode = resolve_stage1_run_mode(clock_ctx)
+    timing = resolve_execution_timing(clock_ctx, as_of=as_of_date, run_mode=run_mode)
     print(f"[EXECUTION TIMING] {timing['header_text']}")
     if getattr(args, "start_date", None):
         start_date = args.start_date
@@ -3638,6 +3792,20 @@ def main(cli_args: Optional[List[str]] = None):
         fetch_errors=(refresh_summary.get("fetch_errors") if isinstance(refresh_summary, dict) else None),
     )
 
+    # (2026-11-13, OBSERVATION ONLY) The bar freshness above is about `ohlcv_bars`; nothing so
+    # far compared it with `adjust_factors`, which is written by a DIFFERENT path and stopped 12
+    # sessions earlier. `get_latest_factor_hfq` is non-None for such a symbol, so
+    # `MissingAdjustFactorsError` never fires and the qfq anchor silently comes from the stale
+    # row. The census names that state (JSON + one [WARN] line); it feeds NO gate and NO order
+    # path -- see `inspect_stage1_adjust_factor_freshness`.
+    adjust_factor_freshness = inspect_stage1_adjust_factor_freshness(
+        refresh_summary=refresh_summary,
+        cache_dir=args.cache_dir or shared_data_dir(),
+    )
+    _af_freshness_warning = format_adjust_factor_freshness_warning(adjust_factor_freshness)
+    if _af_freshness_warning:
+        print(_af_freshness_warning)
+
     # 3. Load Account State & Evaluate Portfolio Drawdown
     state = load_account_state(args.account_state_file)
 
@@ -3705,6 +3873,24 @@ def main(cli_args: Optional[List[str]] = None):
     enable_intraday_5m = getattr(args, "enable_intraday_5m", False) or bool(
         resolve_blend_param(params, "enable_intraday_5m", False, bool)
     )
+    # (2026-11-13) WHICH provider serves the 5m BARS, resolved through the SAME chain as
+    # the switch above (`cfsb_intraday_5m_provider` -> `blend_intraday_5m_provider` ->
+    # `intraday_5m_provider`). `None` = today's behaviour: use the run-level
+    # `--data-provider` and let `load_intraday_5m_universe`'s fallback chain decide per
+    # symbol. A pin is NOT a silent preference: see `StrategyConfig.intraday_5m_provider`
+    # for the measured split (equities' 5m only under BaoStock, indices' only under
+    # Fuyao/EastMoney) that makes the run-level provider unable to serve both halves.
+    #
+    # Resolved HERE (outside the loader's `try`) so the value survives a loader failure and
+    # can always be forwarded to Stage 2 below -- Stage 2 must load the 5m layer from the
+    # SAME provider Stage 1 gated on. Store it under the flags' naming so the two stages
+    # cannot drift (`args.intraday_5m_provider` is reserved for the forwarded value; the
+    # param-derived one keeps the `_resolved` suffix).
+    _intraday_5m_provider_resolved = resolve_blend_param(
+        params, "intraday_5m_provider", None, str
+    )
+    if _intraday_5m_provider_resolved is not None:
+        _intraday_5m_provider_resolved = str(_intraday_5m_provider_resolved).strip() or None
 
     # (LV12, 2026-11-05) ONE NAV FOR BOTH STAGES. The 5m intraday trough math below IS a NAV
     # computation, so it must run on the SAME NAV the daily gate ran on -- the marked-to-market
@@ -3763,13 +3949,25 @@ def main(cli_args: Optional[List[str]] = None):
                 load_intraday_5m_universe,
                 enrich_universe_with_intraday_features,
             )
-            provider = get_data_provider(args.data_provider, **build_data_kwargs(args))
+            # (2026-11-13) The 5m BARS may come from a DIFFERENT provider than every daily
+            # bar: `provider_5m` is a SECOND instance, used ONLY for
+            # `load_intraday_5m_universe`. The daily provider (loaded earlier from
+            # `args.data_provider`), the Stage-1 cache refresh that ran before it, and every
+            # other fetch are untouched. Unpinned (`None`) => the run-level provider, i.e.
+            # exactly the object/behaviour this block had before the pin existed.
+            _5m_provider_name = _intraday_5m_provider_resolved or args.data_provider
+            provider_5m = get_data_provider(_5m_provider_name, **build_data_kwargs(args))
+            if _intraday_5m_provider_resolved:
+                print(
+                    f"[INTRADAY 5M] 5m 行情提供方已按策略参数固定为 "
+                    f"{_intraday_5m_provider_resolved}（日线仍用 {args.data_provider}）"
+                )
             cutoff_t = getattr(args, "cutoff_time", "14:00") or "14:00"
             universe_5m = load_intraday_5m_universe(
                 universe_symbols,
                 start=start_date,
                 end=as_of_date,
-                data_provider=provider,
+                data_provider=provider_5m,
                 cutoff_time=cutoff_t,
             )
             universe = enrich_universe_with_intraday_features(
@@ -3892,7 +4090,7 @@ def main(cli_args: Optional[List[str]] = None):
                 elif n_5m_ok <= 0:
                     _unavail_reason = (
                         f"5m 日内特征缺失: {len(universe_symbols)} 个标的中 5m 数据帧非空的 0 个"
-                        f"(provider={args.data_provider}, 5m 行数={_5m_coverage.get('rows_5m')})。"
+                        f"(provider={_5m_provider_name}, 5m 行数={_5m_coverage.get('rows_5m')})。"
                         "这是没有任何 5m 数据（缓存与 provider 均为空），不是「当日特征算不出」。"
                     )
                 elif _stale_5m:
@@ -4263,6 +4461,7 @@ def main(cli_args: Optional[List[str]] = None):
         timing=timing,
         single_stock_cap=single_stock_cap,
         advisory=advisory_block,
+        adjust_factor_freshness=adjust_factor_freshness,
     )
     # (L2.3, design §9) `summary.json` is the shared per-run archive key/value store the
     # web layer merges into; the clock + freshness blocks land there too.
@@ -4291,7 +4490,11 @@ def main(cli_args: Optional[List[str]] = None):
             # (LV12) ... and the NAV threaded in is the SAME resolved gate NAV (`gate_nav`),
             # i.e. MTM when measurable and the LV1 form placeholder only when it is not.
             cmd = build_stage2_command(
-                args, enable_intraday_5m=enable_intraday_5m, portfolio_value=gate_nav
+                args,
+                enable_intraday_5m=enable_intraday_5m,
+                portfolio_value=gate_nav,
+                # (2026-11-13) Same pin this Stage used for its own 5m load.
+                intraday_5m_provider=_intraday_5m_provider_resolved,
             )
             print(f"\n[AUTO-EXECUTE] Launching Stage 2: {os.path.basename(cmd[1])} ...")
             import subprocess

@@ -1936,6 +1936,12 @@
             data_provider: baseParams.data_provider,
             min_holding_bars: 2,
             inertia_threshold: 0.05,
+            // (P1-1 parity, 2026-11-13) The multi payload is built field-by-field, so the
+            // key must be named here or `MultiStrategyDeployRequest` never sees it. Same
+            // source as the single path's `...baseParams` spread: `getExecutionParams`
+            // stores `null` when the operator left the input blank, and the route appends
+            // `--intraday-publish-after` only for a non-empty value.
+            intraday_publish_after: baseParams.intraday_publish_after,
         };
         if (state.holdingsEdited) deployParams.edited = true;
         if (emptyBookConfirmed === true) deployParams.confirm_empty_book = true;
@@ -2165,6 +2171,11 @@
                     data_provider: baseParams.data_provider,
                     min_holding_bars: 2,
                     inertia_threshold: 0.05,
+                    // (P1-1 parity, 2026-11-13) Same reason/source as the standalone multi
+                    // deploy above: this literal is field-by-field, so the key has to be
+                    // named; `baseParams.intraday_publish_after` is `null` unless the
+                    // operator set the input.
+                    intraday_publish_after: baseParams.intraday_publish_after,
                 };
                 if (state.holdingsEdited) multiDeployParams.edited = true;
                 if (emptyBookConfirmed === true) multiDeployParams.confirm_empty_book = true;

@@ -173,6 +173,7 @@ from pipeline.live_signal.lsig.signal import as_of_universe, latest_rebalance_ro
 from scripts.live_paths import DEFAULT_STRATEGY_KEY, default_live_output_dir
 from scripts.live_preflight import (
     LiveDumpPreflightError,
+    PRIOR_STATE_LOG_PREFIX,
     apply_prior_state_selection,
     assert_account_state_version_parity,
     assert_dump_version_parity,
@@ -181,6 +182,56 @@ from scripts.live_preflight import (
     select_prior_state,
     verify_live_strategy_dump_preflight,
 )
+
+#: (D3, 2026-11-13) Machine-readable markers for the `prior_state` resolutions that selected
+#: NOTHING. They are written into `account_state.json` as
+#: `prior_state_source` / `prior_state_source_reason` (the resolution that DID succeed keeps
+#: writing its provenance DICT into `prior_state_source`, unchanged). They exist because a
+#: bare absent/`null` field conflated two different facts:
+#:
+#:   * ``not_applicable`` -- the resolver never looked. `derive_session_root` refused the
+#:     output dir (a FLAT directory such as the CLI default
+#:     `scripts/results/live/<strategy_key>`, which is not the
+#:     `<root>/<strategy>/<universe>/<date>` archive shape), so "which snapshot should this
+#:     resume from?" does not apply to this run at all. ``reason=flat_run_dir``.
+#:   * ``unresolved`` -- the resolver ran and RAISED (unreadable archive / bad version axis).
+#:     The carried state is kept and the failure is now visible in-band instead of only in a
+#:     `[WARN]` line on the console. ``reason=resolver_error``.
+#:
+#: A third state -- the resolver looked and found no admissible candidate -- deliberately gets
+#: NO marker: it is the pre-existing shape and `select_prior_state`'s log line already names
+#: the reason (`no_candidate_directories_under_session_root` / `no_admissible_candidate`).
+PRIOR_STATE_SOURCE_NOT_APPLICABLE = "not_applicable"
+PRIOR_STATE_SOURCE_UNRESOLVED = "unresolved"
+PRIOR_STATE_NOT_APPLICABLE_FLAT_RUN_DIR = "flat_run_dir"
+PRIOR_STATE_UNRESOLVED_RESOLVER_ERROR = "resolver_error"
+
+
+def _stamp_prior_state_applicability(
+    account_state: Dict[str, Any], marker: str, reason: str
+) -> Optional[str]:
+    """Record WHY no `prior_state` snapshot was selected; returns the log fragment.
+
+    NON-DESTRUCTIVE on purpose, and that is the whole contract: when the carried state already
+    holds a `prior_state_source` DICT, a round that could not resolve must not overwrite it --
+    the dict says which snapshot the carried `prior_state` actually came from, and losing that
+    would re-create the D2 blind spot (a two-session-old book with no provenance at all). The
+    reason is still recorded (`prior_state_source_reason`), so the absence of a fresh selection
+    is never silent. A `None`/absent/string `prior_state_source` (i.e. no provenance to lose)
+    is replaced by the marker.
+    """
+    if not isinstance(account_state, dict):
+        return None
+    existing = account_state.get("prior_state_source")
+    replaced = not isinstance(existing, dict)
+    if replaced:
+        account_state["prior_state_source"] = marker
+    account_state["prior_state_source_reason"] = reason
+    return (
+        f"prior_state_source={marker} reason={reason}"
+        if replaced
+        else f"prior_state_source_reason={reason} (carried prior_state_source kept)"
+    )
 
 
 class LiveGateDegradedError(RuntimeError):
@@ -2013,6 +2064,17 @@ def parse_args(args: Optional[List[str]] = None):
         help="Enable 5-minute intraday execution price guidance and microstructure checks",
     )
     parser.add_argument(
+        "--intraday-5m-provider",
+        default=None,
+        help=(
+            "Provider that serves the 5m BARS (default: unset -> the strategy's own "
+            "`intraday_5m_provider` param, else the run-level --data-provider). Forwarded "
+            "by Stage 1 for `--auto-run-stage2` so both stages load the same 5m source. "
+            "Use a canonical short name accepted by common.data.get_data_provider "
+            "(e.g. baostock, fuyao, eastmoney). It NEVER changes the DAILY provider."
+        ),
+    )
+    parser.add_argument(
         "--cutoff-time",
         default="14:15",
         help=(
@@ -2406,6 +2468,19 @@ INTRADAY_GATE_REASON_PENDING = "intraday_5m_pending_publication"
 #: "something WAS measured / published" -- the only ones allowed to keep a
 #: non-zero buy scale. `pending_publication` has its own (non-freezing) branch;
 #: every OTHER token is treated as "not measured" and freezes (`R7`).
+#:
+#: (`R7b` F2) These sets deliberately mix the two Stage-1 vocabularies, and the test
+#: pins that the SPELLINGS are identical to their owners (a rename must fail loudly):
+#:   * `"evaluated"` -- `check_live_portfolio_health.INTRADAY_5M_STATUS_EVALUATED`, the
+#:     `status` axis (what `classify_intraday_5m_status` emits; `_resolve_5m_status_token`
+#:     prefers it);
+#:   * `"available"` -- `common.intraday_features.INTRADAY_5M_PUBLICATION_AVAILABLE`, the
+#:     `publication_state` axis. It is UNREACHABLE today (`_resolve_5m_status_token` only
+#:     reaches `publication_state` when `status` is absent, which Stage 1 never produces),
+#:     and it is kept ON PURPOSE as belt-and-braces: a future/third-party report carrying
+#:     only the publication axis would then be READ as measured instead of being frozen.
+#:     Do not "clean it up" -- an extra token here can only allow a run that Stage 1
+#:     itself called published; every branch below still requires a real scale.
 _5M_MEASURED_STATUSES = frozenset({"evaluated", "available"})
 _5M_PENDING_STATUSES = frozenset({"pending_publication"})
 
@@ -2446,6 +2521,14 @@ def resolve_intraday_gate_state(
     Never returns 0.50: a missing measurement is `0.0` (fail-closed), an unused
     gate is `1.0`, and only a real measurement can produce anything else. Pure:
     no I/O, no mutation of either dict.
+
+    SOURCE OF TRUTH (`R7b` F1): the measured scale is read from
+    `intraday_5m_metrics["intraday_buy_scale"]` -- the nested block Stage 1 actually
+    writes. `account_state["intraday_buy_scale"]` is a CARRY-OVER: honoured by the
+    non-freezing `pending_publication` branch, by the "report carries a status token but
+    no readable scale" shape, and by the legacy caller that never resolved the switch. A
+    bare carried scale with no report attestation fails closed (0.0) whenever 5m is
+    affirmatively enabled, instead of being reported as `evaluated`.
     """
     health_report = health_report or {}
     account_state = account_state or {}
@@ -2470,19 +2553,43 @@ def resolve_intraday_gate_state(
         enabled = None
         enabled_source = "unresolved"
 
-    measured = health_report.get("intraday_buy_scale")
-    if measured is None:
-        measured = account_state.get("intraday_buy_scale")
-    measured_scale: Optional[float] = None
-    if measured is not None:
+    # (`R7b` F1) THE SCALE LIVES INSIDE `intraday_5m_metrics`, NOT AT THE REPORT's TOP
+    # LEVEL. Stage 1 nests it in the very dict it builds for the 5m layer
+    # (`check_live_portfolio_health.py`: `intraday_5m_info["intraday_buy_scale"]`, on the
+    # measured AND the unmeasured branch) and mirrors it into `account_state.json`
+    # (`build_account_state_update`); it writes no report-level key at all. Reading only
+    # the top level therefore ALWAYS fell through to the carried-over `account_state`, so
+    # "this round's measurement" was never actually read in the real two-stage flow.
+    reported_raw = metrics.get("intraday_buy_scale")
+    if reported_raw is None:
+        # LAST-resort legacy shape, kept only for hand-built / pre-nesting reports that
+        # put the scale at the report top level. Production Stage 1 has never written
+        # this key, so in the real flow `reported_raw` above is the only source.
+        reported_raw = health_report.get("intraday_buy_scale")
+
+    def _finite_scale(value: Any) -> Optional[float]:
+        """A non-finite "measurement" is not a measurement (`NaN`/`inf` must never
+        reach the weight vector -- the old inline `float(...)` let it through)."""
+        if value is None:
+            return None
         try:
-            candidate = float(measured)
+            candidate = float(value)
         except (TypeError, ValueError):
-            candidate = None
-        # A non-finite "measurement" is not a measurement: never let `NaN`/`inf`
-        # reach the weight vector (the old inline `float(...)` would have).
-        if candidate is not None and bool(np.isfinite(candidate)):
-            measured_scale = candidate
+            return None
+        return candidate if bool(np.isfinite(candidate)) else None
+
+    # `report_carries_scale` is deliberately tracked separately from the parsed value: a
+    # report that DOES carry a key with an unusable value must not silently borrow the
+    # carried state and look measured.
+    report_carries_scale = reported_raw is not None
+    reported_scale = _finite_scale(reported_raw)
+    # A scale surviving only in `account_state` is LAST RUN's carry-over. It is still used
+    # by the non-freezing `pending_publication` branch, by 4b (a status token attests a
+    # reading) and by 4d (legacy caller with an unresolved switch) -- but NEVER as a
+    # stand-in for "this round measured a scale" when 5m is affirmatively enabled (4c).
+    measured_scale: Optional[float] = reported_scale
+    if measured_scale is None and not report_carries_scale:
+        measured_scale = _finite_scale(account_state.get("intraday_buy_scale"))
 
     def _state(
         gate_status: str,
@@ -2524,13 +2631,45 @@ def resolve_intraday_gate_state(
             INTRADAY_GATE_REASON_PENDING,
         )
 
-    # 4. Measured (or no status token at all, which is only acceptable when a
-    #    real scale was written): use the measurement verbatim.
+    # 4. Measured, or no status token at all.
     if status_5m is None or status_5m in _5M_MEASURED_STATUSES:
+        # 4a. The REPORT itself carries this round's scale (nested block, or the legacy
+        #     top-level shape): use it verbatim -- the single source of truth.
+        if reported_scale is not None:
+            return _state(INTRADAY_GATE_EVALUATED, reported_scale, None)
+        # 4b. The report carries a status token but no readable scale. A token means
+        #     Stage 1 DID measure something this round, and it wrote its scale into
+        #     `account_state` in the same run -- so the mirror is still this round's
+        #     number, and the pre-nesting report shape keeps working.
+        if status_5m is not None:
+            if measured_scale is not None:
+                return _state(INTRADAY_GATE_EVALUATED, measured_scale, None)
+            return _state(
+                INTRADAY_GATE_UNKNOWN_FAIL_CLOSED, 0.0, INTRADAY_GATE_REASON_SCALE_MISSING
+            )
+        # ---- no status token: the report has NO metrics block (or no status key) ----
+        # 4c. (`R7b` F1) 5m is AFFIRMATIVELY ENABLED for this run, yet the report attests
+        #     nothing measured. A scale surviving in `account_state` is therefore the
+        #     PREVIOUS run's carry-over (it is never cleared -- Stage 1 rewrites the value
+        #     in place), so it must NOT be reported as `evaluated`. Fail closed with the
+        #     existing SCALE_MISSING code: same class of defence as the frozen/unevaluated
+        #     `prior_state` refusals, and the whole point of R7b's "no measurement is not a
+        #     measurement". THIS is the behaviour change: pre-F1 this branch returned
+        #     `evaluated` + yesterday's scale, because the scale was only ever looked for at
+        #     the report's top level (which Stage 1 never writes) and so always came from
+        #     `account_state`.
+        if enabled is True:
+            return _state(
+                INTRADAY_GATE_UNKNOWN_FAIL_CLOSED, 0.0, INTRADAY_GATE_REASON_SCALE_MISSING
+            )
+        # 4d. Legacy / non-`main()` caller shape: the 5m switch was never resolved
+        #     (`intraday_5m_enabled` omitted AND no `metrics.requested`), so nothing can be
+        #     said about whether 5m is on; the only attestation is the CAUTION directive
+        #     itself. Keep the pre-R7b mirror fallback here -- `main()` ALWAYS passes the
+        #     resolved switch, so this shape cannot arise in the live two-stage flow
+        #     (pinned by `test_legacy_unresolved_switch_still_uses_the_state_mirror`).
         if measured_scale is not None:
             return _state(INTRADAY_GATE_EVALUATED, measured_scale, None)
-        # Engaged, no status token, no scale: nothing was measured, so nothing
-        # can be claimed. Fail closed instead of silently halving.
         return _state(
             INTRADAY_GATE_UNKNOWN_FAIL_CLOSED, 0.0, INTRADAY_GATE_REASON_SCALE_MISSING
         )
@@ -4662,20 +4801,57 @@ def main(cli_args: Optional[List[str]] = None):
     # its run date, and `base_version` equal to today's live engine. The decision (and every
     # skipped candidate with its reason) lands in `account_state["prior_state_source"]`, and
     # the line is printed for `summary.json`'s `deploy_stdout` / `prior_state_log`.
+    #
+    # (D3, 2026-11-13) THE THREE NON-SELECTED STATES ARE NOW MACHINE-READABLE. A selection
+    # that resolved nothing used to leave `prior_state_source` ABSENT, which reads as a bare
+    # `null`: "did we not look?" and "did we look and find nothing?" were the same shape. They
+    # are different facts and must not be collapsed:
+    #   * `not_applicable` + reason `flat_run_dir` -- `derive_session_root` REFUSED the output
+    #     dir (the CLI default `scripts/results/live/<strategy_key>` is a FLAT directory, not
+    #     the `<root>/<strategy>/<universe>/<date>` archive shape), so the resolver did NOT
+    #     look at anything. Nothing is wrong with the archive; the question does not apply.
+    #   * `unresolved` + reason `resolver_error` -- the resolver RAN and raised. Something is
+    #     wrong (unreadable archive, bad version axis); the carried state was kept.
+    #   * no marker at all -- the resolver ran, looked, and found no admissible candidate. That
+    #     is the pre-existing shape (`select_prior_state` still logs
+    #     `reason=no_candidate_directories_under_session_root` / `no_admissible_candidate`) and
+    #     is left untouched deliberately: an unresolved selection must never rewrite state.
+    # A real `prior_state_source` dict is NEVER overwritten by any of these markers (see
+    # `_stamp_prior_state_applicability`); provenance that resolved is not destroyed by a
+    # later round that could not resolve.
     prior_state_log: Optional[str] = None
     try:
+        _prior_session_root = derive_session_root(args.output_dir)
         _prior_selection = select_prior_state(
-            derive_session_root(args.output_dir),
+            _prior_session_root,
             as_of_date,
             expected_base_version=(
                 getattr(template, "base_version", None) or strategy_def.get("base_version")
             ),
         )
         prior_state_log = apply_prior_state_selection(account_state, _prior_selection)
+        if _prior_selection.source is None and not _prior_session_root:
+            _applicability = _stamp_prior_state_applicability(
+                account_state,
+                PRIOR_STATE_SOURCE_NOT_APPLICABLE,
+                PRIOR_STATE_NOT_APPLICABLE_FLAT_RUN_DIR,
+            )
+            if _applicability:
+                prior_state_log = f"{prior_state_log} {_applicability}" if prior_state_log else _applicability
         if prior_state_log:
             print(prior_state_log)
     except Exception as exc:  # a resolver failure must not eat the carried state
         print(f"[WARN] prior_state 解析失败（保留既有 prior_state）: {exc}")
+        _applicability = _stamp_prior_state_applicability(
+            account_state,
+            PRIOR_STATE_SOURCE_UNRESOLVED,
+            PRIOR_STATE_UNRESOLVED_RESOLVER_ERROR,
+        )
+        if _applicability:
+            print(f"{PRIOR_STATE_LOG_PREFIX} {_applicability}")
+            prior_state_log = (
+                f"{prior_state_log} {_applicability}" if prior_state_log else f"{PRIOR_STATE_LOG_PREFIX} {_applicability}"
+            )
 
     # Track streak counters, historical entry prices, and UPLSM lifecycle states from account_state
     entry_signal_streak: Dict[str, int] = dict(account_state.get("entry_signal_streak", {}))
@@ -5095,6 +5271,35 @@ def main(cli_args: Optional[List[str]] = None):
         cli_override=bool(getattr(args, "enable_intraday_5m", False)),
         config_origin=_effective_origin,
     )
+    # (2026-11-13) WHICH provider serves the 5m BARS -- independent of the run-level
+    # `--data-provider`, which keeps owning every DAILY bar. Precedence:
+    #   1. `--intraday-5m-provider` (operator pin, and the value Stage 1 forwards for
+    #      `--auto-run-stage2`): an explicit pin must never be silently overridden by a
+    #      config value, exactly like the `--enable-intraday-5m` flag.
+    #   2. the strategy's own `intraday_5m_provider` param, through the SAME resolver chain
+    #      as the switch above (`cfsb_intraday_5m_provider` -> `blend_intraday_5m_provider`
+    #      -> `intraday_5m_provider`).
+    #   3. the run-level `--data-provider`.
+    # `None` (nothing pinned) reproduces the pre-2026-11-13 behaviour bit-for-bit: the 5m
+    # loader gets the run-level provider and its per-symbol fallback chain decides.
+    # WHY a separate provider exists: measured on the live cache, the 20 traded EQUITIES
+    # carry 5m bars only under `BaoStockDataProvider` (2,256 rows each) while the 7 INDICES
+    # carry them only under `FuyaoDataProvider`/`EastMoneyDataProvider` -- one run-level
+    # provider cannot serve both halves.
+    _cli_5m_provider = getattr(args, "intraday_5m_provider", None)
+    intraday_5m_provider = (
+        (str(_cli_5m_provider).strip() or None) if _cli_5m_provider else None
+    ) or (resolve_blend_param(params, "intraday_5m_provider", None, str) or None)
+    if intraday_5m_provider is not None:
+        intraday_5m_provider = str(intraday_5m_provider).strip() or None
+    _record_effective_param(
+        effective_param_entries,
+        declared_params,
+        "intraday_5m_provider",
+        intraday_5m_provider,
+        cli_override=bool(_cli_5m_provider),
+        config_origin=_effective_origin,
+    )
     if enable_intraday_5m:
         try:
             from common.intraday_features import (
@@ -5102,14 +5307,24 @@ def main(cli_args: Optional[List[str]] = None):
                 load_intraday_5m_universe,
                 enrich_universe_with_intraday_features,
             )
-            provider = get_data_provider(args.data_provider, **build_data_kwargs(args))
+            # SECOND provider instance, used ONLY for the 5m bars. The daily provider (built
+            # earlier from `args.data_provider`) and every daily/fundamental fetch are
+            # untouched.
+            provider_5m = get_data_provider(
+                intraday_5m_provider or args.data_provider, **build_data_kwargs(args)
+            )
+            if intraday_5m_provider:
+                print(
+                    f"[INTRADAY 5M] 5m 行情提供方已固定为 {intraday_5m_provider}"
+                    f"（日线仍用 {args.data_provider}）"
+                )
             cutoff_t = getattr(args, "cutoff_time", "14:15") or "14:15"
             _5m_market = getattr(clock_ctx, "market", None) or "china"
             universe_5m = load_intraday_5m_universe(
                 symbols_to_load,
                 start=start_date,
                 end=as_of_date,
-                data_provider=provider,
+                data_provider=provider_5m,
                 cutoff_time=cutoff_t,
                 # (2026-11-11, `六` item 6) Stamp `intraday_5m_stale` /
                 # `intraday_5m_lag_calendar_days` on each frame so a FROZEN cache is
@@ -5139,7 +5354,9 @@ def main(cli_args: Optional[List[str]] = None):
             for _line in summarize_intraday_5m_loading(
                 universe_5m,
                 symbols_to_load,
-                provider_label=str(getattr(args, "data_provider", "") or ""),
+                provider_label=str(
+                    intraday_5m_provider or getattr(args, "data_provider", "") or ""
+                ),
                 cutoff_time=str(cutoff_t),
                 expected_last_session=expected_last_session,
                 market=_5m_market,
@@ -7298,8 +7515,19 @@ def main(cli_args: Optional[List[str]] = None):
     #                                     `pending_publication` / `unknown_fail_closed`;
     #   * `intraday_gate_reason`       -- the stable reason code (e.g.
     #                                     `5m_missing_fail_closed`); `None` when evaluated;
-    #   * `intraday_buy_scale_applied` -- the multiplier ACTUALLY applied to buy
-    #                                     increments (1.0 = untouched, 0.0 = new buys frozen).
+    #   * `intraday_buy_scale_applied` -- the DISTRIBUTION-GATE scale applied to buy
+    #                                     increments (1.0 = untouched, 0.0 = new buys
+    #                                     frozen). It is NOT the fully composed multiplier:
+    #                                     when the `R1` intraday de-risk overlay also fires,
+    #                                     the number actually applied to the weights is
+    #                                     `this * r1_multiplier` (`effective_buy_scale`,
+    #                                     recorded per row in
+    #                                     `detail_reason.advisory.effective_buy_scale` when
+    #                                     R1 fired, and in the `[R1 INTRADAY DERISK]` console
+    #                                     line). Kept as
+    #                                     the distribution fact -- the same axis named by
+    #                                     `intraday_gate_status` -- instead of publishing a
+    #                                     second composed copy that could drift from it.
     # `intraday_5m_status` / `intraday_5m_enabled` travel beside them so the exact Stage-1
     # token and the resolved switch are auditable without re-reading the Stage-1 archive.
     ticket_payload["intraday_gate_status"] = intraday_gate_state["intraday_gate_status"]

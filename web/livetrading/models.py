@@ -301,4 +301,23 @@ class MultiStrategyDeployRequest(BaseModel):
     min_holding_bars: int = 2
     inertia_threshold: float = 0.05
     allow_intraday: bool = Field(True, description="Allow running during intraday/lunch sessions using latest published session")
+    #: (P1-1 parity, 2026-11-13) Same contract as `RunHealthRequest.intraday_publish_after`
+    #: and `RunDeployRequest.intraday_publish_after`: ``None`` (the default) means the flag is
+    #: NOT passed at all, so the netted child keeps its own "no assessment" behaviour and the
+    #: child argv is byte-identical to the pre-P1-1 shape; a value is forwarded verbatim as
+    #: `--intraday-publish-after HH:MM` after `normalize_intraday_publish_after` validation
+    #: (the ONE validator, shared with both single-strategy stages -- never a second copy).
+    #: DEFECT CLOSED: this field existed only on the two single-strategy requests, so a
+    #: session whose 5m bars are published later could be described to the gate and to Stage 2
+    #: but NOT to the netted matrix round -- which would then label its empty as-of 5m layer
+    #: `missing` (a sync defect, the wrong remedy) instead of `pending_publication` (wait).
+    #: MUST be forwarded explicitly by the route -- an unlisted model field is silently
+    #: dropped (exactly how `cash` / `confirm_empty_book` were lost before).
+    intraday_publish_after: Optional[str] = Field(
+        None,
+        description=(
+            "5m 当日数据的发布时刻 HH:MM（00:00–23:59，默认留空=不做发布时点评估）；"
+            "仅决定缺失的 5m 层记为 pending_publication 还是 missing"
+        ),
+    )
 
