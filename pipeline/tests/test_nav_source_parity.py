@@ -142,13 +142,43 @@ def _write_inputs(tmp_path, tag, nav_effective, form_nav=FORM_NAV):
     }
 
 
-def _five_minute_frames(symbols, start=None, end=None, data_provider=None, cutoff_time="14:00"):
+_LAST_5M_CALL: dict = {}
+"""The arguments Stage 1 handed `load_intraday_5m_universe` in the last `_run`."""
+
+
+def _assert_bounded_5m_start(start):
+    """Stage 1 must pass the BOUNDED 5m window, never its own wide `--start-date`.
+
+    `_run` invokes `main()` with `--start-date 2025-09-01`; the 5m loader only needs ~41 trading
+    days (`VOL_MIN_OBS = 21` + a 20-session warm-up), so forwarding that verbatim made Stage 1
+    re-download two years x N symbols of 5m bars. The DAILY load still gets `2025-09-01` -- this
+    bound is 5m-only.
+    """
+    from common.intraday_features import INTRADAY_5M_MAX_LOOKBACK_DAYS
+
+    assert start is not None, "stage 1 passed no start to the 5m loader"
+    floor = pd.Timestamp(AS_OF) - pd.Timedelta(days=INTRADAY_5M_MAX_LOOKBACK_DAYS)
+    assert pd.Timestamp(start) >= floor, (
+        f"the 5m window reaches back to {start}, older than the {INTRADAY_5M_MAX_LOOKBACK_DAYS}"
+        f"-calendar-day floor ({floor.date().isoformat()})"
+    )
+
+
+def _five_minute_frames(symbols, start=None, end=None, data_provider=None, cutoff_time="14:00", **kwargs):
     """Hand-built 5m frames indexed at `AS_OF`, INSIDE the 14:00 cutoff.
 
     `end` is the resolved `as_of_date` Stage 1 passes in, so the fake cannot drift from the
-    run's own session.
+    run's own session. `**kwargs` swallows the loader's optional, non-behavioural arguments
+    (`cache_dir`, `verbose`, `max_wall_seconds`, `max_lookback_days`): this stub serves
+    hand-built frames, so none of them can change what it returns -- only a signature without
+    them would turn the whole 5m block into the WARN fallback.
     """
     assert end == AS_OF, f"stage 1 resolved an unexpected as_of_date: {end!r}"
+    _assert_bounded_5m_start(start)
+    _LAST_5M_CALL.clear()
+    _LAST_5M_CALL.update(
+        {"symbols": list(symbols), "start": start, "end": end, "kwargs": dict(kwargs)}
+    )
     idx = pd.DatetimeIndex([pd.Timestamp(f"{AS_OF} {t}") for t in BAR_TIMES])
     frames = {}
     for sym in symbols:
@@ -534,14 +564,17 @@ def test_daily_gate_fields_are_untouched_by_the_5m_base_swap(tmp_path, monkeypat
 # ---------------------------------------------------------------------------
 # 8. (D7 follow-up) Provider provenance + session freshness reach the report
 # ---------------------------------------------------------------------------
-def _stale_5m_with_fallback(symbols, start=None, end=None, data_provider=None, cutoff_time="14:00"):
+def _stale_5m_with_fallback(symbols, start=None, end=None, data_provider=None, cutoff_time="14:00", **kwargs):
     """5m frames whose last bar belongs to the PREVIOUS session, served via a fallback.
 
     Mirrors the measured 2026-11-10/11-11 shape: the configured provider has no 5m rows for
     these symbols, the cache falls back to BaoStock, and that cache stops on an earlier
-    session. Attrs are exactly what `load_intraday_5m_universe` stamps.
+    session. Attrs are exactly what `load_intraday_5m_universe` stamps. `**kwargs` swallows
+    the loader's optional `cache_dir`/`verbose`/... arguments, which cannot change the
+    hand-built frames this stub returns.
     """
     assert end == AS_OF, f"stage 1 resolved an unexpected as_of_date: {end!r}"
+    _assert_bounded_5m_start(start)
     prev_session = pd.Timestamp(AS_OF) - pd.Timedelta(days=1)
     idx = pd.DatetimeIndex([prev_session + pd.Timedelta(hours=14, minutes=55)])
     frames = {}
@@ -620,3 +653,41 @@ def test_provider_fallback_and_session_staleness_reach_the_report(tmp_path, monk
     md = open(os.path.join(run["out_dir"], "stage1_health_report.md"), encoding="utf-8").read()
     assert "FuyaoDataProvider→BaoStockDataProvider (provider_unsupported_5m)" in md
     assert "滞后 `1` 天" in md
+
+
+def test_stage1_wires_the_5m_load_cache_first_and_bounded(tmp_path, monkeypatch, capsys):
+    """The Stage-1 5m call site, as `main()` actually invokes it (2026-11-15 incident).
+
+    Pinned here because the 2026-11-15 hang was a CALL-SITE defect, not a loader defect: the
+    loader accepted `cache_dir` but Stage 1 never forwarded it, and it forwarded its own
+    two-year `--start-date`. Both are invisible to a stub that only checks `end`, so this test
+    asserts the arguments the real call site produces:
+
+      * `start` clamped to the intraday floor (NOT `--start-date 2025-09-01`);
+      * `cache_dir` = the shared data dir every other Stage-1 read uses;
+      * `verbose=True`, so the per-symbol progress lines are visible;
+      * one `[INTRADAY 5M] loading ...` line printed BEFORE the call, naming the window.
+    """
+    from common.intraday_features import INTRADAY_5M_MAX_LOOKBACK_DAYS
+
+    run = _run(tmp_path, monkeypatch, "wired_5m", nav_effective=FORM_NAV, form_nav=FORM_NAV)
+    out = capsys.readouterr().out
+
+    call = _LAST_5M_CALL
+    expected_start = (
+        pd.Timestamp(AS_OF) - pd.Timedelta(days=INTRADAY_5M_MAX_LOOKBACK_DAYS)
+    ).date().isoformat()
+    assert call["start"] == expected_start
+    assert call["start"] != "2025-09-01", "Stage 1 forwarded its wide --start-date to the 5m load"
+    assert call["end"] == AS_OF
+    assert call["kwargs"]["verbose"] is True
+    assert call["kwargs"]["cache_dir"] == _mod.shared_data_dir()
+    # The loader is NOT given a wall-clock budget here: Stage 1 stays reproducible.
+    assert call["kwargs"].get("max_wall_seconds") is None
+
+    banner = f"[INTRADAY 5M] loading {len(call['symbols'])} symbols {expected_start} -> {AS_OF}"
+    assert banner in out, f"missing the pre-call stage banner; stdout was:\n{out[-2000:]}"
+    # The banner is ONE line and it precedes the loader's own per-symbol progress lines.
+    assert out.count("[INTRADAY 5M] loading") == 1
+    # And the 5m block still produced a report (the wiring change did not degrade it).
+    assert run["reported_intraday"] is not None

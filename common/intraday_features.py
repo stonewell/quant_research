@@ -22,6 +22,7 @@ import glob
 import logging
 import math
 import os
+import time
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -827,12 +828,33 @@ def _intraday_5m_cache_candidates(cache_dir: Optional[str]) -> List[str]:
     Extracted so tests can point the fallback at a `tmp_path` cache instead of the
     live `<repo>/data/cache.duckdb`; behaviour is identical to the previously
     inline list (`cache_dir` first, then the two repo-relative defaults).
+
+    (2026-11-15 incident) `cache_dir` is now HONOURED end-to-end: callers
+    (`scripts/check_live_portfolio_health.py`, `backtester/run_backtest.py`, the live
+    runners) already pass the shared data directory, but the loader never forwarded it here,
+    so the candidates fell back to CWD-relative paths and a run started from another working
+    directory would have missed the warm cache entirely. A `cache_dir` that already names a
+    `.duckdb`/`.db` FILE is used verbatim (same rule as
+    `scripts/check_live_portfolio_health.py::resolve_cache_db_file`), instead of appending a
+    second `cache.duckdb` onto it.
     """
-    return [
-        os.path.join(cache_dir or "data", "cache.duckdb"),
-        os.path.join("data", "cache.duckdb"),
-        os.path.join("pipeline", "data", "cache.duckdb"),
-    ]
+    paths: List[str] = []
+    if cache_dir:
+        if str(cache_dir).endswith((".duckdb", ".db")):
+            paths.append(str(cache_dir))
+        else:
+            paths.append(os.path.join(str(cache_dir), "cache.duckdb"))
+    paths.extend(
+        [
+            os.path.join("data", "cache.duckdb"),
+            os.path.join("pipeline", "data", "cache.duckdb"),
+        ]
+    )
+    deduped: List[str] = []
+    for p in paths:
+        if p not in deduped:
+            deduped.append(p)
+    return deduped
 
 
 # ---------------------------------------------------------------------------
@@ -1026,6 +1048,230 @@ def _intraday_5m_provider_order(
             seen_keys.add(spelling)
             order.append(spelling)
     return order
+
+
+INTRADAY_5M_MAX_LOOKBACK_DAYS = 90
+"""Default cap on how far back a 5m NETWORK fetch may reach, in calendar days.
+
+(Primary incident 2026-11-15, Stage-1 "hang") `load_intraday_5m_universe` used to hand the
+caller's `start` straight to `data_provider.fetch_ohlcv`, so a live Stage-1 run with
+`--start-date 2024-01-01` re-downloaded ~2 years of 5m bars for 20 symbols over BaoStock
+(`send_msg` under `_fetch_ohlcv_internal`, 30+ minutes) while the local DuckDB cache already
+held every one of those bars through the previous session's 15:00 close.
+
+90 calendar days is the floor with margin: the intraday feature layer needs about 41 TRADING
+days of history at the as-of date -- `VOL_MIN_OBS = 21` sessions for the volume-scaled /
+intraday-volatility estimates (`scripts/check_live_portfolio_health.py::VOL_MIN_OBS`) plus the
+20-session `volume_seasonality_lookback_days` warm-up -- i.e. roughly 60 calendar days; 90
+covers that plus holidays. This bounds the NETWORK window only; the cache READ window
+(`[start, end]`) is deliberately unchanged, because shortening it would truncate a backtest
+replay's 5m history (`backtester/run_backtest.py` passes the whole backtest span and no
+provider) and therefore change its features. Callers that genuinely need a longer download
+pass `max_lookback_days=None` (or a larger number) -- nothing is silently crippled.
+"""
+
+INTRADAY_5M_CACHE_EDGE_TOLERANCE_DAYS = 7
+"""Weekend/holiday tolerance when deciding a cached 5m series reaches the window's end.
+
+The SAME number, and the same rationale, as `DuckDBCache.is_range_covered` /
+`is_intraday_range_covered` for callers that pass no `expected_last_session`: a 7-day window
+absorbs a weekend plus a short exchange holiday without re-deriving a holiday calendar in this
+module (the market clock is owned by `common/market_clock.py` -- design §6/§10). When the
+caller DOES pass `expected_last_session`, that session is a session by contract and the
+tolerance is ZERO, exactly like the L2.2/L2.7 gate.
+"""
+
+
+def _intraday_5m_ts(value: Any) -> Optional[pd.Timestamp]:
+    """Naive `Timestamp` for a date-like value; `None` for `None`/unparseable input."""
+    if value is None:
+        return None
+    try:
+        return _naive(pd.Timestamp(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _intraday_5m_network_window(
+    start: Optional[str],
+    end: Optional[str],
+    *,
+    max_lookback_days: Optional[int] = INTRADAY_5M_MAX_LOOKBACK_DAYS,
+) -> Tuple[Optional[str], Optional[str]]:
+    """The `(start, end)` a NETWORK fetch is allowed to use -- never older than the floor.
+
+    `max_lookback_days=None` (or a non-positive value) disables the bound and returns the
+    caller's window untouched. `end=None` keeps its "everything after `start`" meaning for the
+    provider; only the clamped start changes (measured back from today).
+    """
+    end_dt = _intraday_5m_ts(end)
+    end_ref = end_dt if end_dt is not None else pd.Timestamp.now().normalize()
+    start_dt = _intraday_5m_ts(start)
+    if max_lookback_days is not None and int(max_lookback_days) > 0:
+        floor = end_ref.normalize() - pd.Timedelta(days=int(max_lookback_days))
+        if start_dt is None or start_dt.normalize() < floor:
+            start_dt = floor
+    net_start = start_dt.date().isoformat() if start_dt is not None else start
+    net_end = end_dt.date().isoformat() if end_dt is not None else None
+    return net_start, net_end
+
+
+def intraday_5m_bounded_start(
+    start: Optional[str],
+    end: Optional[str] = None,
+    *,
+    max_lookback_days: Optional[int] = INTRADAY_5M_MAX_LOOKBACK_DAYS,
+) -> Optional[str]:
+    """`max(start, end - max_lookback_days)` as an ISO date -- the PUBLIC clamp.
+
+    Callers that hand this loader a wide `start` (Stage 1 forwards `--start-date`, which a live
+    report sets to ~2 years back) should clamp their own `start` BEFORE the call: the loader's
+    bound applies to the NETWORK half only, and the cache READ still spans `[start, end]`, so an
+    unclamped start makes the DuckDB query materialise two years of 5m rows per symbol for data
+    the intraday features never read (`VOL_MIN_OBS = 21` + a 20-session seasonality warm-up).
+
+    This is the SAME arithmetic as `_intraday_5m_network_window` (it delegates to it), so the
+    caller's window and the loader's network floor cannot drift apart. `max_lookback_days=None`
+    returns `start` untouched.
+    """
+    return _intraday_5m_network_window(start, end, max_lookback_days=max_lookback_days)[0]
+
+
+def _intraday_5m_cache_tail_reference(
+    end: Optional[str],
+    expected_last_session: Optional[Any],
+) -> Tuple[pd.Timestamp, pd.Timedelta]:
+    """`(reference date, tolerance)` for "does the cached series reach the window's end?".
+
+    An explicit `expected_last_session` is a trading session by contract -> zero tolerance
+    (the L2.2/L2.7 rule). An explicit `end` gets `INTRADAY_5M_CACHE_EDGE_TOLERANCE_DAYS` of
+    slack so a weekend/holiday end date does not force a pointless re-fetch. With NO end at
+    all there is no calendar claim to reconcile -- the caller is asking for "everything, as
+    fresh as you have" -- so the target is the newest bar available and the tolerance is zero.
+    """
+    session = _intraday_5m_ts(expected_last_session)
+    if session is not None:
+        return session.normalize(), pd.Timedelta(0)
+    end_dt = _intraday_5m_ts(end)
+    if end_dt is None:
+        return pd.Timestamp.now().normalize(), pd.Timedelta(0)
+    return end_dt.normalize(), pd.Timedelta(days=INTRADAY_5M_CACHE_EDGE_TOLERANCE_DAYS)
+
+
+def _intraday_5m_uncovered_window(
+    frame: Optional[pd.DataFrame],
+    net_start: Optional[str],
+    net_end: Optional[str],
+    *,
+    tail_ref: Optional[pd.Timestamp] = None,
+    tail_tolerance: Optional[pd.Timedelta] = None,
+    earliest_available: Optional[Any] = None,
+) -> Optional[Tuple[Optional[str], Optional[str]]]:
+    """The part of `[net_start, net_end]` the cached `frame` does NOT already hold.
+
+    `None` means "the cache covers the window -> do not touch the network". A non-empty result
+    is the *gap only*, never the whole span, so a cache that is warm up to the previous session
+    costs one fetch of the new session rather than a second download of two years.
+
+    Edge rules (all dates compared at day granularity):
+
+      * empty/absent cache -> the entire (already bounded) network window;
+      * TAIL -- the last cached bar must reach the reference date within `tail_tolerance`
+        (`0` when the caller passed `expected_last_session`);
+      * HEAD -- only re-fetched when the cache PROVES it holds history before `net_start`
+        (`earliest_available`, from the cache's own metadata) yet has no rows right after it.
+        Without that proof a symbol whose cached history simply begins later (a recent
+        listing, or a cache that starts at the window's own start) would be re-downloaded at
+        full length on every run.
+    """
+    if tail_ref is None:
+        tail_ref, tail_tolerance = _intraday_5m_cache_tail_reference(net_end, None)
+    tolerance = (
+        tail_tolerance
+        if tail_tolerance is not None
+        else pd.Timedelta(days=INTRADAY_5M_CACHE_EDGE_TOLERANCE_DAYS)
+    )
+    if frame is None or bool(getattr(frame, "empty", True)):
+        return (net_start, net_end)
+    try:
+        idx = pd.DatetimeIndex(frame.index)
+        first_dt = _naive(pd.Timestamp(idx.min())).normalize()
+        last_dt = _naive(pd.Timestamp(idx.max())).normalize()
+    except (TypeError, ValueError):  # non-datetime index: cannot judge, take the whole window
+        return (net_start, net_end)
+
+    gap_start: Optional[pd.Timestamp] = None
+    gap_end: Optional[pd.Timestamp] = None
+
+    tail_edge = pd.Timestamp(tail_ref).normalize()
+    if last_dt + tolerance < tail_edge:
+        gap_start = last_dt + pd.Timedelta(days=1)
+        gap_end = tail_edge
+
+    start_dt = _intraday_5m_ts(net_start)
+    if start_dt is not None:
+        start_date = start_dt.normalize()
+        if first_dt > start_date + tolerance:
+            earliest_dt = _intraday_5m_ts(earliest_available)
+            if earliest_dt is not None and earliest_dt.normalize() <= start_date:
+                if gap_start is None:
+                    gap_start = start_date
+                    gap_end = first_dt - pd.Timedelta(days=1)
+                else:
+                    # Holes at BOTH edges: one span beats two round trips.
+                    gap_start = start_date
+
+    if gap_start is None or gap_end is None or gap_start > gap_end:
+        return None
+    return (gap_start.date().isoformat(), gap_end.date().isoformat())
+
+
+def _intraday_5m_merge_gap_fill(base: pd.DataFrame, fetched: pd.DataFrame) -> pd.DataFrame:
+    """`base` plus the freshly fetched gap rows; a duplicated bar takes the FETCHED value.
+
+    Columns are restricted to what both sides carry and the index keeps `base`'s name and
+    ascending order, so a gap fill cannot reshape what a caller already received.
+    """
+    cols = [c for c in base.columns if c in fetched.columns]
+    if not cols:
+        return base
+    merged = pd.concat([base[cols], fetched[cols]])
+    merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+    merged.index.name = base.index.name
+    return merged
+
+
+def _intraday_5m_cached_earliest(cache: Any, provider: Any, symbol: str) -> Optional[Any]:
+    """Cached `earliest_available_ts` for one (provider, symbol), or `None` when unknown.
+
+    Used ONLY to tell "the cache has history before the requested start, but not right after
+    it" (a real hole worth re-fetching) apart from "this symbol's cached history simply begins
+    later" (re-fetching it would download the whole span again on every run). A missing
+    metadata row / absent table is not an error here -- it degrades to "no proof of a hole".
+    """
+    try:
+        meta = cache.get_intraday_metadata(provider, symbol, "5m")
+    except Exception:  # noqa: BLE001 - diagnostics only, never a reason to fail the load
+        return None
+    if not meta:
+        return None
+    return meta.get("earliest_available_ts")
+
+
+def _intraday_5m_check_wall_budget(
+    symbol: Any,
+    clock_start: float,
+    max_wall_seconds: Optional[float],
+) -> None:
+    """Raise `TimeoutError` once `max_wall_seconds` is exceeded; no-op when the budget is off."""
+    if not max_wall_seconds:
+        return
+    elapsed = time.monotonic() - clock_start
+    if elapsed > float(max_wall_seconds):
+        raise TimeoutError(
+            f"[INTRADAY 5M] wall-clock budget exceeded at symbol {symbol}: "
+            f"elapsed {elapsed:.1f}s > max_wall_seconds={float(max_wall_seconds):.1f}s"
+        )
 
 
 def latest_5m_bar_ts(frame: Optional[pd.DataFrame]) -> Optional[pd.Timestamp]:
@@ -1317,20 +1563,38 @@ def load_intraday_5m_universe(
     cache_dir: Optional[str] = None,
     expected_last_session: Optional[Any] = None,
     market: str = "china",
+    max_lookback_days: Optional[int] = INTRADAY_5M_MAX_LOOKBACK_DAYS,
+    max_wall_seconds: Optional[float] = None,
+    verbose: bool = False,
     **kwargs: Any,
 ) -> Dict[str, pd.DataFrame]:
     """Three-layer intraday data loading pipeline (Section 1.6 / line 383).
 
-    Step 1: Fetch historical baseline from DuckDB/data_provider.
+    Step 0 (2026-11-15): read the local DuckDB cache FIRST and only fetch what it does not
+    already hold. Before this, Step 1 always went to the provider, so a live Stage-1 run
+    re-downloaded two years x 20 symbols over BaoStock while a warm cache sat on disk.
+    Step 1: Fetch the UNCOVERED window from data_provider (never the whole span again).
     Step 2: Read Day-T lock-free Parquet if present (data/intraday_5m/{YYYY-MM-DD}.parquet).
     Step 3: On-demand EastMoney fallback if intraday bucket hole is detected.
 
-    Provider provenance (2026-11-11, fixes the silently-stale 5m layer): the DuckDB fallback
-    queries the CALLER's configured provider first (`FuyaoDataProvider` for a `fuyao` live run,
-    even when `data_provider` is a `CachedDataProvider` wrapper) and only falls back to other
-    providers when that provider has zero cached 5m rows. Each returned frame carries:
+    New keyword arguments (all backward compatible):
+      * `max_lookback_days` (default `INTRADAY_5M_MAX_LOOKBACK_DAYS` = 90) -- the furthest a
+        NETWORK fetch may reach back from the window's end; the cache READ window is
+        untouched. `None` disables the bound.
+      * `max_wall_seconds` -- optional hard budget for the whole call; on expiry raises
+        `TimeoutError` naming the symbol and the elapsed time. `None` (default) = off.
+      * `verbose` -- one `[INTRADAY 5M] i/N <symbol> <- <origin>` line per symbol, so a slow
+        load is distinguishable from a hung one.
 
-      * `intraday_5m_source` -- `"data_provider"` | `"duckdb_cache"` | `"parquet"` ...
+    Provider provenance (2026-11-11, fixes the silently-stale 5m layer): the DuckDB cache is
+    queried under the CALLER's configured provider keys first (`FuyaoDataProvider` for a
+    `fuyao` live run, even when `data_provider` is a `CachedDataProvider` wrapper) and other
+    providers are only consulted when that provider has zero cached 5m rows. Each returned
+    frame carries:
+
+      * `intraday_5m_source` -- `"duckdb_cache"` | `"data_provider"` | `"parquet"` ...
+        (`"duckdb_cache+data_provider"` when a provider top-up added the missing tail, and
+        then `intraday_5m_gap_filled_from` names that provider)
       * `intraday_5m_provider` -- provider key that actually served the bars
       * `intraday_5m_latest_ts` -- last bar timestamp (ISO-8601)
       * `fallback_from` / `fallback_to` / `fallback_reason` (+ `fallback_reason_detail`)
@@ -1338,7 +1602,8 @@ def load_intraday_5m_universe(
 
     `expected_last_session` (optional) additionally stamps `intraday_5m_stale` and
     `intraday_5m_lag_calendar_days` on each frame via `assess_intraday_5m_freshness`, so a
-    frozen cache is visible at the loader instead of being blamed on provider capability.
+    frozen cache is visible at the loader instead of being blamed on provider capability. It
+    also switches the cache's tail-coverage test to the exact session (zero tolerance).
     """
     if cache_dir and parquet_dir == "data/intraday_5m":
         cand = os.path.join(cache_dir, "intraday_5m")
@@ -1352,7 +1617,19 @@ def load_intraday_5m_universe(
     preferred_canon = {_intraday_5m_canonical_provider(k) for k in preferred_keys}
     provider_order = _intraday_5m_provider_order(preferred_keys)
 
-    for sym in symbols:
+    # (2026-11-15 incident) Bounds for the network half. The cache READ window stays
+    # `[start, end]` so a backtest replaying a long history from cache keeps every bar.
+    net_start, net_end = _intraday_5m_network_window(
+        start, end, max_lookback_days=max_lookback_days
+    )
+    tail_ref, tail_tolerance = _intraday_5m_cache_tail_reference(end, expected_last_session)
+    clock_start = time.monotonic()
+    n_total = len(symbols)
+
+    for idx, sym in enumerate(symbols, start=1):
+        # (2026-11-15 incident) Never grind indefinitely: an optional budget turns "still
+        # running after 30 minutes" into a named `TimeoutError`.
+        _intraday_5m_check_wall_budget(sym, clock_start, max_wall_seconds)
         df_sym = pd.DataFrame()
         source: Optional[str] = None
         provider_used: Optional[str] = None
@@ -1361,19 +1638,20 @@ def load_intraday_5m_universe(
         fallback_reason: Optional[str] = None
         fallback_detail: Optional[str] = None
         fetch_exc: Optional[BaseException] = None
+        gap_filled_from: Optional[str] = None
+        cache_earliest: Optional[Any] = None
+        cache_db_used: Optional[str] = None
+        served_from_cache = False
 
-        # Step 1: Data provider query
-        if data_provider is not None:
-            try:
-                df_sym = data_provider.fetch_ohlcv(sym, start=start, end=end, interval="5m")
-            except Exception as exc:
-                fetch_exc = exc
-                logger.debug("Provider fetch 5m failed for %s: %s", sym, exc)
-            if not df_sym.empty:
-                source = "data_provider"
-                provider_used = preferred_label or type(data_provider).__name__
-
-        # Step 1.5: DuckDBCache fallback if provider returned empty or was not specified
+        # Step 0 (2026-11-15 incident, PRIMARY FIX): READ THE LOCAL CACHE FIRST.
+        #
+        # This used to be Step 1.5 -- a fallback consulted only AFTER the provider had already
+        # returned empty or raised. A live Stage-1 run therefore always went to the network
+        # first: `--start-date 2024-01-01` reached this function verbatim and ~2 years x 20
+        # symbols of BaoStock 5m bars were re-downloaded (py-spy: `send_msg` <-
+        # `_result_rows_to_df` <- `_fetch_ohlcv_internal` <- `fetch_ohlcv` <- here) while
+        # `data/cache.duckdb` already held every one of those bars through the previous
+        # session's 15:00 close. Order is now: cache -> (only the uncovered gap) -> provider.
         #
         # READ-ONLY intent (L2.13). This branch only ever queries intraday bars, so it
         # MUST construct `DuckDBCache(..., read_only=True)`. Until 2026-10-23 it used the
@@ -1388,100 +1666,157 @@ def load_intraday_5m_universe(
         # the 5m cache is unavailable and which symbol was skipped, and the symbol's
         # entry stays an empty frame (the "unavailable" convention consumed by
         # `enrich_universe_with_intraday_features` and by the live scripts' own WARN).
-        if df_sym.empty:
+        # The cache READ window stays the caller's `[start, end]` -- only the network half is
+        # bounded (`net_start`/`net_end`), so cache-only callers (backtest replays) keep every
+        # bar they received before this change.
+        try:
+            from common.duckdb_cache import DuckDBCache, ProductionCachePathError
+        except ImportError as exc:  # duckdb not installed in this environment
+            DuckDBCache = None  # type: ignore[assignment,misc]
+            logger.warning(
+                "5m 缓存不可用（DuckDBCache 导入失败），已跳过 %s 的 DuckDB 5m 读取: %s",
+                sym,
+                exc,
+            )
+
+        if DuckDBCache is not None:
+            for db_p in _intraday_5m_cache_candidates(cache_dir):
+                if not os.path.exists(db_p):
+                    continue
+                try:
+                    # `read_only=True`: never creates directories/tables, never writes,
+                    # and is deliberately NOT blocked by the L2.13 pytest guard.
+                    duck_c = DuckDBCache(db_p, read_only=True)
+                except (ProductionCachePathError, RuntimeError, OSError) as exc:
+                    # ProductionCachePathError subclasses RuntimeError; OSError covers a
+                    # cache file that vanished between `exists()` and the open.
+                    logger.warning(
+                        "5m 缓存不可用（只读打开失败），已跳过 %s 的 DuckDB 5m 回退（%s）: %s",
+                        sym,
+                        db_p,
+                        exc,
+                    )
+                    continue
+
+                try:
+                    # Preferred (caller-configured) provider keys first; the historical
+                    # fallback list only after them. Never a fixed order any more -- that
+                    # fixed order is what served BaoStock's 11-09 bars to a `fuyao` run
+                    # whose own cache rows reached 11-10.
+                    for p_name in provider_order:
+                        df_cand = duck_c.query_intraday_bars(
+                            p_name, sym, interval="5m", start=start, end=end
+                        )
+                        if not df_cand.empty:
+                            df_sym = df_cand
+                            provider_used = str(p_name)
+                            # Metadata earliest: proves "the cache has history BEFORE the
+                            # requested start", the only case where a head gap is real.
+                            cache_earliest = _intraday_5m_cached_earliest(duck_c, p_name, sym)
+                            break
+                except Exception as exc:  # noqa: BLE001 - logged, never silent
+                    # A readable-but-invalid cache (missing table / locked file) is
+                    # still "5m data unavailable", not an implicit empty result.
+                    logger.warning(
+                        "5m 缓存不可用（查询失败），已跳过 %s 的 DuckDB 5m 回退（%s）: %s",
+                        sym,
+                        db_p,
+                        exc,
+                    )
+                    df_sym = pd.DataFrame()
+                    provider_used = None
+                    continue
+
+                if df_sym.empty:
+                    # Opened successfully but zero rows for every provider: report the
+                    # absence instead of letting an empty frame pass as normal data.
+                    logger.warning(
+                        "5m 缓存不可用：只读打开成功但 %s 在 %s 中 0 行 5m 数据，已跳过该标的的 DuckDB 回退",
+                        sym,
+                        db_p,
+                    )
+                    continue
+
+                source = "duckdb_cache"
+                cache_db_used = db_p
+                served_from_cache = True
+                break
+
+        # Step 1 (rewritten 2026-11-15): provider TOP-UP of the UNCOVERED window only.
+        # `gap is None` means the cache already covers `[net_start, net_end]` -> the network is
+        # never touched, which is the entire point of the fix. A cache warm up to the previous
+        # session therefore costs one fetch of the new session, not a second two-year download.
+        gap = _intraday_5m_uncovered_window(
+            df_sym,
+            net_start,
+            net_end,
+            tail_ref=tail_ref,
+            tail_tolerance=tail_tolerance,
+            earliest_available=cache_earliest,
+        )
+        if data_provider is not None and gap is not None:
+            _intraday_5m_check_wall_budget(sym, clock_start, max_wall_seconds)
+            df_new = pd.DataFrame()
             try:
-                from common.duckdb_cache import DuckDBCache, ProductionCachePathError
-            except ImportError as exc:  # duckdb not installed in this environment
-                DuckDBCache = None  # type: ignore[assignment,misc]
-                logger.warning(
-                    "5m 缓存不可用（DuckDBCache 导入失败），已跳过 %s 的 DuckDB 5m 回退: %s",
-                    sym,
-                    exc,
-                )
-
-            if DuckDBCache is not None:
-                for db_p in _intraday_5m_cache_candidates(cache_dir):
-                    if not os.path.exists(db_p):
-                        continue
-                    try:
-                        # `read_only=True`: never creates directories/tables, never writes,
-                        # and is deliberately NOT blocked by the L2.13 pytest guard.
-                        duck_c = DuckDBCache(db_p, read_only=True)
-                    except (ProductionCachePathError, RuntimeError, OSError) as exc:
-                        # ProductionCachePathError subclasses RuntimeError; OSError covers a
-                        # cache file that vanished between `exists()` and the open.
-                        logger.warning(
-                            "5m 缓存不可用（只读打开失败），已跳过 %s 的 DuckDB 5m 回退（%s）: %s",
+                df_new = data_provider.fetch_ohlcv(sym, start=gap[0], end=gap[1], interval="5m")
+            except Exception as exc:
+                fetch_exc = exc
+                logger.debug("Provider fetch 5m failed for %s: %s", sym, exc)
+            if not df_new.empty:
+                if df_sym.empty:
+                    df_sym = df_new
+                    source = "data_provider"
+                    provider_used = preferred_label or type(data_provider).__name__
+                else:
+                    n_before = len(df_sym)
+                    merged = _intraday_5m_merge_gap_fill(df_sym, df_new)
+                    if len(merged) > n_before:
+                        df_sym = merged
+                        gap_filled_from = preferred_label or type(data_provider).__name__
+                        source = f"{source}+data_provider"
+                        logger.info(
+                            "5m 缺口补齐：%s 用 %s 补 %s..%s（新增 %d 行）",
                             sym,
-                            db_p,
-                            exc,
+                            gap_filled_from,
+                            gap[0],
+                            gap[1],
+                            len(merged) - n_before,
                         )
-                        continue
 
-                    try:
-                        # Preferred (caller-configured) provider keys first; the historical
-                        # fallback list only after them. Never a fixed order any more -- that
-                        # fixed order is what served BaoStock's 11-09 bars to a `fuyao` run
-                        # whose own cache rows reached 11-10.
-                        for p_name in provider_order:
-                            df_cand = duck_c.query_intraday_bars(
-                                p_name, sym, interval="5m", start=start, end=end
-                            )
-                            if not df_cand.empty:
-                                df_sym = df_cand
-                                provider_used = str(p_name)
-                                break
-                    except Exception as exc:  # noqa: BLE001 - logged, never silent
-                        # A readable-but-invalid cache (missing table / locked file) is
-                        # still "5m data unavailable", not an implicit empty result.
-                        logger.warning(
-                            "5m 缓存不可用（查询失败），已跳过 %s 的 DuckDB 5m 回退（%s）: %s",
-                            sym,
-                            db_p,
-                            exc,
-                        )
-                        df_sym = pd.DataFrame()
-                        provider_used = None
-                        continue
-
-                    if df_sym.empty:
-                        # Opened successfully but zero rows for every provider: report the
-                        # absence instead of letting an empty frame pass as normal data.
-                        logger.warning(
-                            "5m 缓存不可用：只读打开成功但 %s 在 %s 中 0 行 5m 数据，已跳过该标的的 DuckDB 回退",
-                            sym,
-                            db_p,
-                        )
-                        continue
-
-                    source = "duckdb_cache"
-                    if (
-                        provider_used is not None
-                        and preferred_label is not None
-                        and _intraday_5m_canonical_provider(provider_used) not in preferred_canon
-                    ):
-                        # The caller asked for `preferred_label`; this cache could not serve it.
-                        # Record the switch so no consumer has to infer it from timestamps,
-                        # and never let it look like "the configured provider delivered this".
-                        fallback_from = preferred_label
-                        fallback_to = provider_used
-                        if fetch_exc is not None:
-                            fallback_reason = FALLBACK_REASON_UNSUPPORTED_5M
-                        else:
-                            fallback_reason = FALLBACK_REASON_RETURNED_EMPTY
-                        fallback_detail = (
-                            f"{preferred_label} 在 {os.path.basename(db_p)} 中无 5m 行；"
-                            f"改用 {provider_used}"
-                            + (f"（Step-1 异常: {fetch_exc}）" if fetch_exc is not None else "")
-                        )
-                        logger.warning(
-                            "5m 数据来源回退：%s 在缓存中无 5m 覆盖，%s 改用 %s（reason=%s）",
-                            preferred_label,
-                            sym,
-                            provider_used,
-                            fallback_reason,
-                        )
-                    break
+        if (
+            served_from_cache
+            and gap_filled_from is None
+            and provider_used is not None
+            and preferred_label is not None
+            and _intraday_5m_canonical_provider(provider_used) not in preferred_canon
+        ):
+            # The caller asked for `preferred_label`; this cache could not serve it.
+            # Record the switch so no consumer has to infer it from timestamps,
+            # and never let it look like "the configured provider delivered this".
+            #
+            # Cache-first note (2026-11-15): `fetch_exc` is set only when the caller's provider
+            # was actually asked for the uncovered gap and raised. When the cached rows fully
+            # covered the bounded window the provider is deliberately NOT called, so
+            # `RETURNED_EMPTY` keeps its honest reading -- "the caller's provider contributed
+            # no rows for this symbol" -- without a pointless network round trip.
+            fallback_from = preferred_label
+            fallback_to = provider_used
+            if fetch_exc is not None:
+                fallback_reason = FALLBACK_REASON_UNSUPPORTED_5M
+            else:
+                fallback_reason = FALLBACK_REASON_RETURNED_EMPTY
+            fallback_detail = (
+                f"{preferred_label} 在 {os.path.basename(cache_db_used or '')} 中无 5m 行；"
+                f"改用 {provider_used}"
+                + (f"（Step-1 异常: {fetch_exc}）" if fetch_exc is not None else "")
+            )
+            logger.warning(
+                "5m 数据来源回退：%s 在缓存中无 5m 覆盖，%s 改用 %s（reason=%s）",
+                preferred_label,
+                sym,
+                provider_used,
+                fallback_reason,
+            )
 
         # Step 2: Check local lock-free parquets
         if os.path.isdir(parquet_dir):
@@ -1529,6 +1864,11 @@ def load_intraday_5m_universe(
                 df_sym.attrs["fallback_reason"] = fallback_reason
                 if fallback_detail:
                     df_sym.attrs["fallback_reason_detail"] = fallback_detail
+            if gap_filled_from is not None:
+                # Which provider topped up the tail the cache had not published yet. Stamped
+                # separately from `intraday_5m_provider` (the cache key that served the bulk)
+                # so a mixed frame never reads as a single-source delivery.
+                df_sym.attrs["intraday_5m_gap_filled_from"] = gap_filled_from
             if expected_last_session is not None:
                 freshness = assess_intraday_5m_freshness(
                     {"<single>": df_sym},
@@ -1538,6 +1878,20 @@ def load_intraday_5m_universe(
                 df_sym.attrs["intraday_5m_stale"] = freshness["stale"]
                 df_sym.attrs["intraday_5m_lag_calendar_days"] = freshness["lag_calendar_days"]
                 df_sym.attrs["intraday_5m_freshness_reason"] = freshness["reason"]
+        if verbose:
+            # (2026-11-15 incident) One line per symbol, so a slow 5m load is visibly a load
+            # and not a hang. Style follows `scripts/sync_china_5m_and_indices.py`.
+            if df_sym.empty:
+                _origin = "none"
+            elif gap_filled_from is not None:
+                _origin = "cache+provider"
+            elif served_from_cache:
+                _origin = "cache"
+            elif source and source.startswith("data_provider"):
+                _origin = "provider"
+            else:
+                _origin = "parquet"
+            print(f"[INTRADAY 5M] {idx}/{n_total} {sym} <- {_origin}", flush=True)
         out[sym] = df_sym
 
     return out

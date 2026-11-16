@@ -5304,6 +5304,7 @@ def main(cli_args: Optional[List[str]] = None):
         try:
             from common.intraday_features import (
                 IntradayFeatureConfig,
+                intraday_5m_bounded_start,
                 load_intraday_5m_universe,
                 enrich_universe_with_intraday_features,
             )
@@ -5313,19 +5314,51 @@ def main(cli_args: Optional[List[str]] = None):
             provider_5m = get_data_provider(
                 intraday_5m_provider or args.data_provider, **build_data_kwargs(args)
             )
-            if intraday_5m_provider:
-                print(
-                    f"[INTRADAY 5M] 5m 行情提供方已固定为 {intraday_5m_provider}"
-                    f"（日线仍用 {args.data_provider}）"
-                )
             cutoff_t = getattr(args, "cutoff_time", "14:15") or "14:15"
             _5m_market = getattr(clock_ctx, "market", None) or "china"
+            # (2026-11-15 incident, Stage-2 half) The 5m window is BOUNDED and INDEPENDENT of
+            # the daily `--start-date`, exactly like Stage 1
+            # (`check_live_portfolio_health.py`). Forwarding `start_date` verbatim made a live
+            # run re-download ~2 years x 20 symbols of BaoStock 5m bars over the network on
+            # EVERY invocation (py-spy on the lost 2026-11-15 run: `send_msg` <-
+            # `_fetch_ohlcv_internal`; 22+ minutes of pure waste) while `data/cache.duckdb`
+            # already held every one of those bars. `intraday_5m_bounded_start` is the loader's
+            # OWN public clamp, so this window and the loader's network floor cannot drift
+            # apart; only the 5m call is affected -- the DAILY load above (and every strategy
+            # that consumes it) still gets `start_date` unchanged.
+            intraday_5m_start = intraday_5m_bounded_start(start_date, as_of_date)
+            # ONE line, BEFORE the call, that names the stage, the symbol count and the window:
+            # after it, the loader's own `[INTRADAY 5M] i/N <symbol> <- <origin>` progress lines
+            # follow, so a slow load can never again look like a hang. This EXTENDS the previous
+            # provider-pinning line instead of adding a second status line (the pin, when set,
+            # stays a suffix verbatim so the documented message is unchanged).
+            print(
+                f"[INTRADAY 5M] loading {len(symbols_to_load)} symbols "
+                f"{intraday_5m_start} -> {as_of_date} "
+                f"(provider={intraday_5m_provider or args.data_provider}, cache-first; "
+                f"日线起点仍为 {start_date})"
+                + (
+                    f"（5m 行情提供方已固定为 {intraday_5m_provider}，"
+                    f"日线仍用 {args.data_provider}）"
+                    if intraday_5m_provider
+                    else ""
+                )
+                + " ..."
+            )
             universe_5m = load_intraday_5m_universe(
                 symbols_to_load,
-                start=start_date,
+                start=intraday_5m_start,
                 end=as_of_date,
                 data_provider=provider_5m,
                 cutoff_time=cutoff_t,
+                # The same cache directory every other Stage-2 read uses (resolved once above,
+                # next to the daily load). It was accepted as a kwarg by the loader but never
+                # forwarded here, so `cache_dir` stayed `None` and the CWD-relative candidate
+                # paths missed the warm cache entirely.
+                cache_dir=cache_dir,
+                # One `[INTRADAY 5M] i/N <symbol> <- <origin>` line per symbol: after the banner
+                # above, the next visible line proves WHICH symbol/stage is running.
+                verbose=True,
                 # (2026-11-11, `六` item 6) Stamp `intraday_5m_stale` /
                 # `intraday_5m_lag_calendar_days` on each frame so a FROZEN cache is
                 # distinguishable from "no 5m support" at the loader, not inferred from

@@ -1830,3 +1830,231 @@ def test_live_tier3_halt_wins_over_stale_caution_recovering(tmp_path, patched_we
     assert float(row_legacy["target_weight"]) == pytest.approx(0.0)
 
 
+
+
+# ---------------------------------------------------------------------------
+# (2026-11-15 incident, Stage-2 half) The 5m call site is CACHE-FIRST and BOUNDED
+# ---------------------------------------------------------------------------
+# The Stage-1 half of the same incident is pinned in
+# `pipeline/tests/test_nav_source_parity.py::test_stage1_wires_the_5m_load_cache_first_and_bounded`.
+# Stage 2 had the identical defect and it cost a live run: `--start-date 2024-01-01` reached
+# `load_intraday_5m_universe` verbatim and `cache_dir` was never forwarded, so every invocation
+# re-downloaded ~2 years x 20 symbols of BaoStock 5m bars (`py-spy`: `send_msg` <-
+# `_fetch_ohlcv_internal`; 22+ minutes) while the warm `data/cache.duckdb` sat unused.
+#
+# Both tests are 100% offline: `--data-provider synthetic` for the daily bars, a stub
+# `get_data_provider` for the 5m provider, and a `tmp_path` DuckDB for the "warm cache" case.
+
+
+def _five_minute_session(day: str, base: float = 100.0) -> pd.DataFrame:
+    """One synthetic A-share 5m session (48 bars: 09:35..11:30, 13:05..15:00)."""
+    morning = pd.date_range(f"{day} 09:35", f"{day} 11:30", freq="5min")
+    afternoon = pd.date_range(f"{day} 13:05", f"{day} 15:00", freq="5min")
+    idx = morning.append(afternoon)
+    closes = base + pd.Series(range(len(idx)), dtype="float64").to_numpy() * 0.01
+    return pd.DataFrame(
+        {
+            "Open": closes,
+            "High": closes + 0.05,
+            "Low": closes - 0.05,
+            "Close": closes,
+            "Volume": 1_000.0,
+        },
+        index=idx,
+    )
+
+
+class _FiveMinuteProviderStub:
+    """5m provider stub shaped like a real one (`fetch_ohlcv(symbol, start, end, interval)`).
+
+    Records every call so a test can prove the network was skipped entirely.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def fetch_ohlcv(self, symbol, start=None, end=None, interval="1d", **kwargs):
+        self.calls.append((symbol, start, end, interval))
+        return pd.DataFrame()
+
+
+def _five_minute_provider_stub() -> _FiveMinuteProviderStub:
+    """Stub whose CLASS NAME is the DuckDB cache key the loader resolves from the provider.
+
+    The loader queries the caller's provider first, keyed by `type(provider).__name__` (that is
+    what the cache writers stamp). Naming it `BaoStockDataProvider` reproduces the live pin
+    (`--intraday-5m-provider baostock`) without a cache written by any other provider.
+    """
+
+    class BaoStockDataProvider(_FiveMinuteProviderStub):
+        pass
+
+    return BaoStockDataProvider()
+
+
+def test_stage2_wires_the_5m_load_cache_first_and_bounded(tmp_path, patched_weights, capsys):
+    """The Stage-2 5m call site, as `main()` actually invokes it (2026-11-15 incident).
+
+    A CALL-SITE defect, not a loader defect: the loader accepted `cache_dir`/`start` but Stage 2
+    forwarded its raw two-year `--start-date` and no cache directory. Both are invisible to a
+    stub that only inspects `end`, so this asserts the arguments the real call site produces:
+
+      * `start` clamped by the loader's own PUBLIC `intraday_5m_bounded_start` (NOT
+        `--start-date 2024-01-01`);
+      * `cache_dir` = the run's resolved cache directory (the same value the DAILY load gets);
+      * `verbose=True`, so the per-symbol progress lines are visible;
+      * ONE `[INTRADAY 5M] loading ...` line printed BEFORE the call, naming the window;
+      * `expected_last_session` still forwarded exactly as before (semantics unchanged);
+      * the DAILY load is untouched -- it still receives `--start-date 2024-01-01`.
+    """
+    from unittest.mock import patch
+
+    import common.intraday_features as intraday_mod
+    import scripts.run_live_strategy as runner
+    from common.intraday_features import INTRADAY_5M_MAX_LOOKBACK_DAYS
+
+    universe_file = _write_universe(tmp_path, ["600000.SH", "601857.SH", "BIL"])
+    holdings_file = _write_json(tmp_path, "holdings.json", {"BIL": 100000})
+    state_file = str(tmp_path / "account_state.json")
+    cache_dir = str(tmp_path / "shared_data")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    patched_weights({"600000.SH": 0.5, "601857.SH": 0.0, "BIL": 0.5})
+    args = _live_args(
+        tmp_path,
+        universe_file,
+        state_file,
+        _AS_OF_SECOND,
+        extra=[
+            "--current-holdings-file", holdings_file,
+            "--enable-intraday-5m",
+            "--intraday-5m-provider", "baostock",
+            "--cache-dir", cache_dir,
+        ],
+    )
+
+    recorded = {}
+    daily = {}
+
+    def _loader(symbols, **kwargs):
+        recorded["symbols"] = list(symbols)
+        recorded["kwargs"] = dict(kwargs)
+        return {}
+
+    orig_load_live_universe = runner.load_live_universe
+
+    def _daily_loader(live_args, symbols, start, end, **kwargs):
+        daily["start"] = start
+        return orig_load_live_universe(live_args, symbols, start, end, **kwargs)
+
+    with patch.object(intraday_mod, "load_intraday_5m_universe", _loader), patch.object(
+        runner, "load_live_universe", _daily_loader
+    ):
+        order_df = runner.main(args)
+
+    out = capsys.readouterr().out
+    kwargs = recorded["kwargs"]
+
+    # --- the 5m window is the loader's own bound, not the run's two-year daily start
+    expected_start = intraday_mod.intraday_5m_bounded_start("2024-01-01", _AS_OF_SECOND)
+    assert expected_start is not None
+    assert kwargs["start"] == expected_start
+    assert kwargs["start"] != "2024-01-01", "Stage 2 forwarded its wide --start-date to the 5m load"
+    floor = pd.Timestamp(_AS_OF_SECOND) - pd.Timedelta(days=INTRADAY_5M_MAX_LOOKBACK_DAYS)
+    assert pd.Timestamp(kwargs["start"]) >= floor
+    assert kwargs["end"] == _AS_OF_SECOND
+
+    # --- the cache directory reaches the loader (it used to stay `None`)
+    assert kwargs["cache_dir"] == cache_dir
+    assert kwargs["cache_dir"] is not None
+
+    # --- per-symbol progress is requested, and the staleness stamp is unchanged
+    assert kwargs["verbose"] is True
+    assert kwargs["expected_last_session"] is not None
+    assert kwargs["market"] is not None
+
+    # --- the DAILY load keeps the operator's --start-date, byte for byte
+    assert daily["start"] == "2024-01-01"
+
+    # --- ONE banner line, naming the stage, the symbol count, the bounded window and the
+    #     (unchanged) daily start; the provider pin stays a suffix on that same line.
+    banner_lines = [ln for ln in out.splitlines() if "[INTRADAY 5M] loading" in ln]
+    assert len(banner_lines) == 1, f"expected exactly one 5m banner, got:\n{banner_lines}"
+    banner = banner_lines[0]
+    assert f"{len(recorded['symbols'])} symbols" in banner
+    assert expected_start in banner and _AS_OF_SECOND in banner
+    assert "provider=baostock" in banner
+    assert "cache-first" in banner
+    assert "日线起点仍为 2024-01-01" in banner
+    assert "5m 行情提供方已固定为 baostock" in banner
+    # No duplicated status line: the pin message lives on the banner, not on a second print.
+    assert "[INTRADAY 5M]" in banner
+
+    assert not order_df.empty
+
+
+def test_stage2_5m_load_never_touches_the_network_on_a_warm_cache(
+    tmp_path, monkeypatch, patched_weights, capsys
+):
+    """Same call site, REAL loader: a warm `cache.duckdb` means ZERO provider calls.
+
+    This is the quantified half of the incident. The 5m window is seeded in a `tmp_path` DuckDB
+    under the pinned provider's cache key; the provider stub records every `fetch_ohlcv`. With
+    `cache_dir` forwarded and the window bounded, the loader serves every symbol from the cache
+    and the provider is never asked -- i.e. the 22+ minutes of re-downloading cannot happen.
+    """
+    from unittest.mock import patch
+
+    import scripts.run_live_strategy as runner
+    from common.duckdb_cache import DuckDBCache
+
+    universe_file = _write_universe(tmp_path, ["600000.SH", "601857.SH", "BIL"])
+    holdings_file = _write_json(tmp_path, "holdings.json", {"BIL": 100000})
+    state_file = str(tmp_path / "account_state.json")
+    cache_dir = tmp_path / "shared_data"
+    cache_dir.mkdir()
+    cache_db = DuckDBCache(str(cache_dir / "cache.duckdb"))
+    # ALL THREE symbols the run loads, cash proxy included: `symbols_to_load` is the universe
+    # plus any held symbols, and a cache that lacks one of them is not "warm" for that symbol.
+    for sym in ("600000.SH", "601857.SH", "BIL"):
+        cache_db.store_intraday_bars(
+            "BaoStockDataProvider",
+            sym,
+            pd.concat(
+                [_five_minute_session("2024-05-09"), _five_minute_session("2024-05-10")]
+            ).sort_index(),
+            interval="5m",
+            adjustflag="qfq",
+        )
+    assert os.path.exists(str(cache_dir / "cache.duckdb"))
+
+    # Repo-relative layers must not leak in: the loader's default `parquet_dir` and its
+    # fallback `data/cache.duckdb` candidate are CWD-relative, so run from `tmp_path`.
+    monkeypatch.chdir(tmp_path)
+
+    provider = _five_minute_provider_stub()
+    patched_weights({"600000.SH": 0.5, "601857.SH": 0.0, "BIL": 0.5})
+    args = _live_args(
+        tmp_path,
+        universe_file,
+        state_file,
+        _AS_OF_SECOND,
+        extra=[
+            "--current-holdings-file", holdings_file,
+            "--enable-intraday-5m",
+            "--intraday-5m-provider", "baostock",
+            "--cache-dir", str(cache_dir),
+        ],
+    )
+
+    with patch.object(runner, "get_data_provider", lambda *a, **k: provider):
+        order_df = runner.main(args)
+
+    out = capsys.readouterr().out
+    # THE assertion of the fix: not one 5m fetch reached the provider.
+    assert provider.calls == [], f"warm cache still hit the network: {provider.calls}"
+    # ...and the rows really came from the cache, not from an empty/unavailable path.
+    assert "[INFO] 5m 日内特征已聚合" in out
+    assert "source=duckdb_cache" in out
+    assert "provider=BaoStockDataProvider" in out
+    assert not order_df.empty

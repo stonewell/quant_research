@@ -233,7 +233,9 @@ def test_stage1_reports_pending_publication_end_to_end(tmp_path, monkeypatch, ca
 
     monkeypatch.setattr(helpers, "_patch_5m", _patch)
 
-    def _stale_loader(symbols, start=None, end=None, data_provider=None, cutoff_time="14:00"):
+    def _stale_loader(symbols, start=None, end=None, data_provider=None, cutoff_time="14:00", **kwargs):
+        # `**kwargs` = the loader's optional `cache_dir`/`verbose`/... arguments; this stub
+        # builds the frames itself, so none of them may change what it returns.
         return {s: _frame("2026-11-11 14:55:00") for s in symbols}
 
     run = helpers._run(
