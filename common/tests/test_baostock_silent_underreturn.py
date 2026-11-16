@@ -52,9 +52,12 @@ DAILY_PROFILE_FIELDS = ["date", "open", "high", "low", "close", "volume"]
 
 @pytest.fixture(autouse=True)
 def _isolate_session_state(monkeypatch):
-    """The relogin budget is process-wide by design; isolate it per test."""
+    """The relogin budget and the session counters are process-wide by design; isolate them."""
     monkeypatch.setitem(fin_api._BAOSTOCK_RELOGIN_STATE, "count", 0)
+    monkeypatch.setitem(fin_api._BAOSTOCK_LOGIN_STATE, "logins", 0)
     monkeypatch.delenv("BAOSTOCK_MAX_RELOGINS", raising=False)
+    monkeypatch.delenv("BAOSTOCK_MAX_REPAIR_DAYS", raising=False)
+    monkeypatch.delenv("BAOSTOCK_ALLOW_UNVERIFIED_INTRADAY", raising=False)
 
 
 # ---------------------------------------------------------------------------
@@ -478,7 +481,60 @@ def test_suspended_session_is_not_reported_as_missing(monkeypatch):
 
 
 def test_day_missing_with_a_normal_daily_bar_is_reported_as_missing(monkeypatch):
-    """A short day whose daily bar is normal (`volume > 0`, price moves) is a real gap."""
+    """A short day whose daily bar is normal (`volume > 0`, price moves) is a real gap.
+
+    2026-11-15: such a day is POSITIVE EVIDENCE of data loss, so an intraday request is
+    refused by default (`_assert_intraday_completeness`) -- a short 5m frame shapes live
+    orders. This test pins the CLASSIFICATION (which the probe still publishes before the
+    refusal) *and* the fatal default, with NO `BAOSTOCK_ALLOW_UNVERIFIED_INTRADAY` opt-out:
+    the escape hatch has its own test
+    (`test_missing_intraday_day_opt_out_returns_the_short_frame_with_disclosure`) so that
+    setting it here can never again hide a weakened guarantee.
+    """
+    days = _weekdays("2020-01-06", "2020-01-10")
+    gap = days[1]
+
+    def kline(args, kwargs):
+        code = args[0]
+        if code == "sh.000001":
+            return _FakeResult([["2020-01-10", "3000.0"]], PROBE_FIELDS)
+        if kwargs.get("frequency") == "d":
+            return _FakeResult([_daily_row(day) for day in days], DAILY_PROFILE_FIELDS)
+        if kwargs.get("start_date") != kwargs.get("end_date"):
+            rows = []
+            for day in days:
+                if day != gap:
+                    rows.extend(_day_rows(day, code))
+            return _FakeResult(rows, INTRADAY_FIELDS)
+        return _kline_day(args, kwargs, [], code)
+
+    _install_baostock(monkeypatch, kline=kline, calendar=_calendar_rows)
+    provider = BaoStockDataProvider(adjustflag="3")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(DataProviderSessionError) as excinfo:
+            provider.fetch_ohlcv(
+                "002371.SZ", days[0].isoformat(), days[-1].isoformat(), interval="5m"
+            )
+
+    assert any("no suspension evidence" in str(w.message) for w in caught)
+    assert gap.isoformat() in str(excinfo.value)
+
+    probe = provider.last_probe_result
+    assert probe["missing_days"] == [gap.isoformat()]
+    assert probe["suspended_days"] == 0
+    assert probe["last_result"] == "missing"
+
+
+def test_missing_intraday_day_opt_out_returns_the_short_frame_with_disclosure(monkeypatch):
+    """The documented best-effort opt-out still suppresses the one remaining fatal case.
+
+    Same fixture as the test above, only the env knob differs: `missing_days` is the case
+    `BAOSTOCK_ALLOW_UNVERIFIED_INTRADAY=1` exists for (positive evidence of loss that the
+    caller chose to accept), and it must disclose on the frame, not hide the defect.
+    """
+    monkeypatch.setenv("BAOSTOCK_ALLOW_UNVERIFIED_INTRADAY", "1")
     days = _weekdays("2020-01-06", "2020-01-10")
     gap = days[1]
 
@@ -506,12 +562,10 @@ def test_day_missing_with_a_normal_daily_bar_is_reported_as_missing(monkeypatch)
         )
 
     assert len(df) == (len(days) - 1) * 48
-    assert any("no suspension evidence" in str(w.message) for w in caught)
-
-    probe = provider.last_probe_result
-    assert probe["missing_days"] == [gap.isoformat()]
-    assert probe["suspended_days"] == 0
-    assert probe["last_result"] == "missing"
+    classification = df.attrs["intraday_completeness"]
+    assert classification["missing_days"] == [gap.isoformat()]
+    assert classification["incomplete"] is False
+    assert any("Returned anyway because" in str(w.message) for w in caught)
 
 
 def test_suspended_day_without_any_daily_row_is_unverified_not_missing(monkeypatch):
@@ -520,6 +574,11 @@ def test_suspended_day_without_any_daily_row_is_unverified_not_missing(monkeypat
     A missing daily row is *not* evidence of a download gap: the day must land in its own
     `unverified_days` bucket (disclosed by a distinct warning) instead of inflating
     `missing_days`, which would misdirect diagnosis towards the wrong root cause.
+
+    AND -- review 2026-11-15b -- "cannot tell" must never destroy valid data: this test
+    carries NO `BAOSTOCK_ALLOW_UNVERIFIED_INTRADAY` opt-out, because `unverified_days` is
+    non-fatal by default. The whole symbol's 5m series survives (0 raises, 0 data loss) with
+    the classification attached to `DataFrame.attrs["intraday_completeness"]`.
     """
     days = _weekdays("2020-01-06", "2020-01-10")
     suspended = days[2]
@@ -560,6 +619,12 @@ def test_suspended_day_without_any_daily_row_is_unverified_not_missing(monkeypat
     assert probe["missing_days"] == []
     assert probe["suspended_days"] == 0
     assert probe["last_result"] == "unverified_no_daily_row"
+
+    # disclosed, not discarded: the classification travels WITH the (complete) frame
+    classification = df.attrs["intraday_completeness"]
+    assert classification["unverified_days"] == [suspended.isoformat()]
+    assert classification["missing_days"] == []
+    assert classification["incomplete"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -641,3 +706,314 @@ def test_probe_observer_failure_never_breaks_the_download(monkeypatch):
     df = provider.fetch_ohlcv("002371.SZ", "2020-01-06", "2020-01-10", interval="5m")
 
     assert len(df) == len(days) * 48
+
+
+# ---------------------------------------------------------------------------
+# 6. Bounded repair + truthful session telemetry + the intraday completeness gate
+#    (2026-11-15 Stage-2 incident: ~22 min in the repair loop, `relogins` stuck at 0
+#    while the socket was rebuilt, and a short 5m frame returned as a success)
+# ---------------------------------------------------------------------------
+
+
+def _gap_fixture(monkeypatch, gaps: List[datetime.date], days: List[datetime.date]):
+    """Bulk 5m shard omits `gaps`; each per-day refetch of a gap answers empty.
+
+    The daily series is normal (`volume > 0`) for every day, so every gap is a *missing*
+    day rather than a suspension.
+    """
+
+    def kline(args, kwargs):
+        code = args[0]
+        if code == "sh.000001":
+            return _FakeResult([["2020-01-10", "3000.0"]], PROBE_FIELDS)
+        if kwargs.get("frequency") == "d":
+            return _FakeResult([_daily_row(day) for day in days], DAILY_PROFILE_FIELDS)
+        if kwargs.get("start_date") != kwargs.get("end_date"):
+            rows: List[list] = []
+            for day in days:
+                if day not in gaps:
+                    rows.extend(_day_rows(day, code))
+            return _FakeResult(rows, INTRADAY_FIELDS)
+        return _kline_day(args, kwargs, [], code)
+
+    return _install_baostock(monkeypatch, kline=kline, calendar=_calendar_rows)
+
+
+def test_repair_loop_is_bounded_by_max_repair_days(monkeypatch):
+    """`BAOSTOCK_MAX_REPAIR_DAYS=2` -> at most two per-day refetches, residuals disclosed."""
+    monkeypatch.setenv("BAOSTOCK_MAX_REPAIR_DAYS", "2")
+    # The gate is exercised separately; here we want the returned frame + the verdict.
+    monkeypatch.setenv("BAOSTOCK_ALLOW_UNVERIFIED_INTRADAY", "1")
+
+    days = _weekdays("2020-01-06", "2020-01-10")
+    gaps = days[:4]  # 4 short days, budget allows 2
+    _gap_fixture(monkeypatch, gaps, days)
+    provider = BaoStockDataProvider(adjustflag="3")
+    assert provider._max_repair_days == 2
+
+    calls: List[datetime.date] = []
+    real_query_day_rows = provider._query_day_rows
+
+    def counting_query_day_rows(*args, **kwargs):
+        calls.append(kwargs["day"])
+        return real_query_day_rows(*args, **kwargs)
+
+    monkeypatch.setattr(provider, "_query_day_rows", counting_query_day_rows)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        df = provider.fetch_ohlcv(
+            "002371.SZ", days[0].isoformat(), days[-1].isoformat(), interval="5m"
+        )
+
+    assert len(calls) == 2, f"the refetch loop must stop at the budget, got {calls}"
+    assert calls == gaps[:2]
+
+    probe = provider.last_probe_result
+    assert probe["last_result"] == "repair_budget_exhausted"
+    assert probe["repair_budget_hit"] is True
+    assert probe["refetched_days"] == 2
+    assert probe["deferred_repair_days"] == 2
+    # the residual days are NOT dropped: they keep their honest classification
+    # (`sessions` is a frozenset, so compare order-insensitively)
+    assert sorted(probe["missing_days"]) == sorted(d.isoformat() for d in gaps)
+    assert probe["suspended_days"] == 0
+
+    budget_warnings = [
+        str(w.message) for w in caught if "repair budget exhausted" in str(w.message)
+    ]
+    assert len(budget_warnings) == 1
+    assert "BAOSTOCK_MAX_REPAIR_DAYS=2" in budget_warnings[0]
+    assert "sz.002371" in budget_warnings[0]
+    assert "2 short day(s) left unrefetched" in budget_warnings[0]
+
+    # the opt-out path attaches the same classification to the frame
+    assert df.attrs["intraday_completeness"]["last_result"] == "repair_budget_exhausted"
+
+
+def test_max_repair_days_zero_is_the_unbounded_opt_out(monkeypatch):
+    monkeypatch.setenv("BAOSTOCK_MAX_REPAIR_DAYS", "0")
+    monkeypatch.setenv("BAOSTOCK_ALLOW_UNVERIFIED_INTRADAY", "1")
+    days = _weekdays("2020-01-06", "2020-01-10")
+    gaps = days[:4]
+    _gap_fixture(monkeypatch, gaps, days)
+    provider = BaoStockDataProvider(adjustflag="3")
+    assert provider._max_repair_days == 0
+
+    provider.fetch_ohlcv("002371.SZ", days[0].isoformat(), days[-1].isoformat(), interval="5m")
+
+    probe = provider.last_probe_result
+    assert probe["refetched_days"] == 4, "0 = researcher opt-out, every short day refetched"
+    assert "repair_budget_hit" not in probe
+    assert probe["last_result"] == "missing"
+
+
+def test_sockets_built_counts_a_fresh_per_symbol_login_and_is_not_relogins(monkeypatch):
+    """The Stage-2 blind spot: the socket was rebuilt while `relogins` stayed 0."""
+    days = _weekdays("2020-01-06", "2020-01-10")
+
+    def kline(_args, kwargs):
+        if kwargs.get("frequency") == "d":
+            return _FakeResult([_daily_row(day) for day in days], DAILY_PROFILE_FIELDS)
+        return _FakeResult(_intraday_rows(days, "sz.002371"), INTRADAY_FIELDS)
+
+    ledger = _install_baostock(monkeypatch, kline=kline, calendar=_calendar_rows)
+    provider = BaoStockDataProvider(adjustflag="3", keep_logged_in=False)
+
+    provider.fetch_ohlcv("002371.SZ", days[0].isoformat(), days[-1].isoformat(), interval="5m")
+    first = provider.last_probe_result
+    assert ledger["login"] == 1
+    assert first["sockets_built"] == 1, "a fresh per-symbol login established a session"
+    assert first["relogins"] == 0, "relogins keeps its old meaning: heal-driven only"
+    assert provider.established_sessions == 1
+
+    provider.fetch_ohlcv("002398.SZ", days[0].isoformat(), days[-1].isoformat(), interval="5m")
+    second = provider.last_probe_result
+    assert ledger["login"] == 2
+    assert second["sockets_built"] == 2
+    assert second["relogins"] == 0
+    assert fin_api._BAOSTOCK_RELOGIN_STATE["count"] == 0
+    assert provider.established_sessions == 2
+
+
+def test_missing_intraday_day_raises_by_default(monkeypatch):
+    """Change D: an unaccounted trading day must not come back as a successful short frame."""
+    days = _weekdays("2020-01-06", "2020-01-10")
+    gap = days[1]
+    _gap_fixture(monkeypatch, [gap], days)
+    provider = BaoStockDataProvider(adjustflag="3")
+
+    with pytest.raises(DataProviderSessionError) as excinfo:
+        provider.fetch_ohlcv("002371.SZ", days[0].isoformat(), days[-1].isoformat(), interval="5m")
+
+    message = str(excinfo.value)
+    assert "unusable BaoStock answer for 002371.SZ" in message
+    assert "intraday completeness unverified" in message
+    assert gap.isoformat() in message
+    assert "BAOSTOCK_ALLOW_UNVERIFIED_INTRADAY" in message
+    # still a payload error for every existing per-symbol isolation path
+    assert isinstance(excinfo.value, fin_api.DataProviderPayloadError)
+    assert provider.last_probe_result["missing_days"] == [gap.isoformat()]
+
+
+def test_unverified_intraday_day_is_disclosed_not_fatal_by_default(monkeypatch):
+    """`unverified` (no daily row at all) is UNDECIDABLE, so it discloses instead of raising.
+
+    Review 2026-11-15b: making this fatal dropped the WHOLE symbol's valid 5m series (a
+    routine 停牌 shape: BaoStock omits the suspended session's daily row). "Cannot tell" must
+    not destroy data -- the default returns the frame with `attrs` disclosure and a warning.
+    """
+    days = _weekdays("2020-01-06", "2020-01-10")
+    gap = days[2]
+
+    def kline(args, kwargs):
+        code = args[0]
+        if code == "sh.000001":
+            return _FakeResult([["2020-01-10", "3000.0"]], PROBE_FIELDS)
+        if kwargs.get("frequency") == "d":
+            return _FakeResult(
+                [_daily_row(day) for day in days if day != gap], DAILY_PROFILE_FIELDS
+            )
+        if kwargs.get("start_date") != kwargs.get("end_date"):
+            rows: List[list] = []
+            for day in days:
+                if day != gap:
+                    rows.extend(_day_rows(day, code))
+            return _FakeResult(rows, INTRADAY_FIELDS)
+        return _kline_day(args, kwargs, [], code)
+
+    _install_baostock(monkeypatch, kline=kline, calendar=_calendar_rows)
+    provider = BaoStockDataProvider(adjustflag="3")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        df = provider.fetch_ohlcv(
+            "002371.SZ", days[0].isoformat(), days[-1].isoformat(), interval="5m"
+        )
+
+    assert len(df) == (len(days) - 1) * 48, "the valid days must survive"
+    assert any(
+        "no positive evidence of a download gap" in str(w.message) for w in caught
+    ), "the disclosure must be loud, not silent"
+    assert provider.last_probe_result["unverified_days"] == [gap.isoformat()]
+    assert df.attrs["intraday_completeness"]["unverified_days"] == [gap.isoformat()]
+
+
+def test_suspended_session_with_an_omitted_daily_row_keeps_its_intraday_data(monkeypatch):
+    """THE REGRESSION THIS PINS: a suspended symbol must not lose its whole 5m series.
+
+    Fixture = a 停牌 session for which BaoStock serves neither 5m bars nor a daily row (its
+    documented habit). With the DEFAULT env (no opt-out) the request must return every other
+    session's bars, WARN, and stamp `intraday_completeness` -- never raise, which would make
+    the caller's per-symbol isolation drop a perfectly good series.
+    """
+    days = _weekdays("2020-01-06", "2020-01-10")
+    suspended = days[3]
+
+    def kline(args, kwargs):
+        code = args[0]
+        if code == "sh.000001":
+            return _FakeResult([["2020-01-10", "3000.0"]], PROBE_FIELDS)
+        if kwargs.get("frequency") == "d":
+            return _FakeResult(
+                [_daily_row(day) for day in days if day != suspended],
+                DAILY_PROFILE_FIELDS,
+            )
+        if kwargs.get("start_date") != kwargs.get("end_date"):
+            rows: List[list] = []
+            for day in days:
+                if day != suspended:
+                    rows.extend(_day_rows(day, code))
+            return _FakeResult(rows, INTRADAY_FIELDS)
+        return _kline_day(args, kwargs, [], code)
+
+    _install_baostock(monkeypatch, kline=kline, calendar=_calendar_rows)
+    provider = BaoStockDataProvider(adjustflag="3")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        df = provider.fetch_ohlcv(
+            "002371.SZ", days[0].isoformat(), days[-1].isoformat(), interval="5m"
+        )
+
+    assert len(df) == (len(days) - 1) * 48
+    assert not df.empty
+    classification = df.attrs["intraday_completeness"]
+    assert classification["symbol"] == "002371.SZ"
+    assert classification["unverified_days"] == [suspended.isoformat()]
+    assert classification["missing_days"] == []
+    assert classification["incomplete"] is False
+    assert any(
+        "cannot be verified" in str(w.message) for w in caught
+    ), "the WARNING is the human-readable half of the disclosure"
+
+
+def test_suspended_and_partial_sessions_never_trip_the_gate(monkeypatch):
+    """停牌 and a legitimate half-day must stay non-fatal (only gaps are fatal)."""
+    days = _weekdays("2020-01-06", "2020-01-10")
+    suspended = days[1]
+    half_day = days[3]
+
+    def kline(args, kwargs):
+        code = args[0]
+        if code == "sh.000001":
+            return _FakeResult([["2020-01-10", "3000.0"]], PROBE_FIELDS)
+        if kwargs.get("frequency") == "d":
+            return _FakeResult(
+                [
+                    _daily_row(day, volume="0" if day == suspended else "1000")
+                    for day in days
+                ],
+                DAILY_PROFILE_FIELDS,
+            )
+        if kwargs.get("start_date") != kwargs.get("end_date"):
+            rows: List[list] = []
+            for day in days:
+                if day == suspended:
+                    continue
+                if day == half_day:
+                    rows.extend(_day_rows(day, code)[:24])  # early close: 24 of 48 bars
+                else:
+                    rows.extend(_day_rows(day, code))
+            return _FakeResult(rows, INTRADAY_FIELDS)
+        day = datetime.date.fromisoformat(str(kwargs.get("start_date")))
+        if day == half_day:
+            # BaoStock has no more bars for that session than the 24 it already served, so
+            # the per-day refetch cannot top it up: the day stays at 24 of 48 (`partial`).
+            return _FakeResult([], INTRADAY_FIELDS)
+        if day == suspended:
+            return _FakeResult([], INTRADAY_FIELDS)
+        return _FakeResult(_day_rows(day, code), INTRADAY_FIELDS)
+
+    _install_baostock(monkeypatch, kline=kline, calendar=_calendar_rows)
+    provider = BaoStockDataProvider(adjustflag="3")
+
+    df = provider.fetch_ohlcv("002371.SZ", days[0].isoformat(), days[-1].isoformat(), interval="5m")
+
+    probe = provider.last_probe_result
+    assert probe["suspended_days"] == 1
+    assert probe["partial_days"] == [half_day.isoformat()]
+    assert probe["missing_days"] == []
+    assert probe["unverified_days"] == []
+    assert "intraday_completeness" not in df.attrs, "no gate disclosure on a legitimate short day"
+    assert len(df) == (len(days) - 1) * 48 - 24
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [("", 60), ("2", 2), ("0", 0), ("-5", 0), ("abc", 60)],
+)
+def test_max_repair_days_env_parsing(monkeypatch, raw, expected):
+    """`0`/negative is the documented unbounded opt-out; a malformed value must NOT be."""
+    if raw == "":
+        monkeypatch.delenv("BAOSTOCK_MAX_REPAIR_DAYS", raising=False)
+    else:
+        monkeypatch.setenv("BAOSTOCK_MAX_REPAIR_DAYS", raw)
+    if raw == "abc":
+        with pytest.warns(UserWarning, match="BAOSTOCK_MAX_REPAIR_DAYS"):
+            parsed = fin_api._parse_max_repair_days(raw)
+    else:
+        parsed = fin_api._parse_max_repair_days(
+            None if raw == "" else raw
+        )
+    assert parsed == expected

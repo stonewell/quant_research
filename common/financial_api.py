@@ -172,11 +172,51 @@ class DataProviderSessionError(DataProviderPayloadError):
 #: `baostock.common.context`, which is itself process-global.
 _BAOSTOCK_RELOGIN_STATE: Dict[str, int] = {"count": 0}
 
+#: Process-wide count of BaoStock sessions that were ACTUALLY established -- every
+#: successful `login()` the provider performs, whether it is the fresh per-symbol login
+#: (`_ensure_session` -> `_login`, which is the path a `keep_logged_in=False` caller takes
+#: for every request and which rebuilds the socket from scratch) or a heal-driven re-login
+#: (`_recover_session` -> `_login`).
+#:
+#: WHY IT EXISTS (2026-11-15 forensic, the Stage-2 5m incident): `_BAOSTOCK_RELOGIN_STATE`
+#: only counts HEAL-driven re-logins. During that run it stayed at `0` for ~22 minutes
+#: while the socket was provably rebuilt at least twice (fd `socket:[109279]` ->
+#: `socket:[124285]`, local port `39398` -> `33012`), because the rebuild happened on the
+#: fresh per-symbol `_login` path, which incremented nothing. Telemetry that under-reports
+#: a transport event is worse than no telemetry: it actively makes an operator rule out
+#: the correct root cause. This is the honest denominator; `relogins` keeps its exact old
+#: meaning (heal-driven only) so every existing assertion still says what it always said.
+_BAOSTOCK_LOGIN_STATE: Dict[str, int] = {"logins": 0}
+
 #: Conservative default for `BAOSTOCK_MAX_RELOGINS`. Each relogin costs a TCP
 #: handshake + a login round-trip and BaoStock throttles by IP, so 3 is enough to ride
 #: out a transient blip during a ~400-symbol sync while still failing loudly (instead
 #: of hanging or hammering) when the service is genuinely down.
 _DEFAULT_MAX_RELOGINS = 3
+
+#: Conservative default for `BAOSTOCK_MAX_REPAIR_DAYS`: how many *missing trading days*
+#: one intraday request may re-fetch one-by-one in `_repair_intraday_underreturn`.
+#:
+#: WHY 60: each refetched day is one full wire request. The 2026-11-15 Stage-2 incident
+#: spent ~22 minutes inside that loop doing one request per missing day and then threw the
+#: result away -- the requested window was pinned at 2024-01-01, so the SAME hundreds of
+#: "missing" days were refetched on every single run, forever, with no cap and no way to
+#: finish. 60 is deliberately generous (a page-boundary truncation such as the 002371.SZ
+#: 4000-row cut touches a handful of days; 60 consecutive short days is already the far
+#: tail of a repairable truncation) yet finite: a residual larger than that is a SYSTEMIC
+#: gap -- wrong window, delisted symbol, blocked/expired session -- which per-day repair
+#: cannot fix by definition. Past the cap the provider stops, records the residual days in
+#: the existing classification (`missing_days`/`suspended_days`/`unverified_days`) and
+#: says so once, loudly. Researchers who really want the old unbounded behaviour can set
+#: `BAOSTOCK_MAX_REPAIR_DAYS=0` (or a negative value) to opt out.
+_DEFAULT_MAX_REPAIR_DAYS = 60
+
+#: Env opt-out for the intraday completeness gate (change D of the 2026-11-15 incident
+#: follow-up): when set to a truthy value a still-short intraday answer is returned with
+#: its classification attached to `DataFrame.attrs` even for the POSITIVE-EVIDENCE cases
+#: (`missing_days` / `incomplete`) that are fatal by default. `unverified_days`,
+#: `suspended_days` and `partial_days` never need it -- they are disclosed, not refused.
+_ALLOW_UNVERIFIED_INTRADAY_ENV = "BAOSTOCK_ALLOW_UNVERIFIED_INTRADAY"
 
 #: `baostock/common/contants.py:155-162` -- the socket/connection family, and the ONLY
 #: error codes that mean "the transport broke". Everything else is the request's fault
@@ -220,6 +260,27 @@ _BAOSTOCK_TRANSPORT_MSG_HINTS: Tuple[str, ...] = (
     "socket",
 )
 
+#: `BSERR_NO_LOGIN` (`baostock/common/contants.py:143`, 用户未登录). DELIBERATELY kept out
+#: of `_BAOSTOCK_TRANSPORT_ERROR_CODES`: on its own it is a business answer ("your session
+#: is not logged in"), and a business error must never burn a relogin. It is handled by
+#: `_is_session_auth_failure` instead, which the heal path only honours *after* the same
+#: request has already received a good answer on the same socket -- i.e. exactly when
+#: "not logged in" is implausible and a desynchronised stream is the better explanation.
+_BAOSTOCK_SESSION_AUTH_ERROR_CODES = frozenset(
+    {
+        "10001001",  # BSERR_NO_LOGIN  用户未登录
+    }
+)
+
+#: Text fallbacks for the same answer (the code is sometimes lost when the payload is read
+#: from a desynchronised stream, and `send_msg` only `print`s the raw exception).
+_BAOSTOCK_SESSION_AUTH_MSG_HINTS: Tuple[str, ...] = (
+    "用户未登",
+    "未登录",
+    "未登陆",
+    "not logged in",
+)
+
 
 def _is_transport_failure(error_code: Any, msg: Any) -> bool:
     """Classify one BaoStock failure as transport/session (repairable) vs business.
@@ -235,6 +296,32 @@ def _is_transport_failure(error_code: Any, msg: Any) -> bool:
     if not text:
         return False
     return any(hint.lower() in text for hint in _BAOSTOCK_TRANSPORT_MSG_HINTS)
+
+
+def _is_session_auth_failure(error_code: Any, msg: Any) -> bool:
+    """Whether an answer is `BSERR_NO_LOGIN` (`10001001`, 用户未登录) -- purely lexical.
+
+    Heuristic classification, NOT a verdict on its own. `baostock/util/socketutil.py:71-77`
+    `send_msg` is `while True: recv(8192)` with every exception swallowed and **no response
+    framing, sequence number or CRC** (the CRC it does send is over the *request*,
+    `security/history.py:102-104`). A truncated response therefore desynchronises the stream,
+    and the next `ResultData.next` can decode the PREVIOUS message's payload -- including a
+    stale `10001001 用户未登录`. The library has no way to tell "the server rejected my
+    session" from "my stream is off by one message", so neither do we.
+
+    Consequently this is used only as a *session-suspect* signal: the caller treats a
+    `10001001` as repairable only after the same request already got a good answer on the
+    same socket (see the heal path in `_fetch_ohlcv_internal`). A `10001001` on the very
+    first chunk, with nothing to compare against, stays a plain business error -- which is
+    exactly the case the pre-existing transport budget exists to keep quiet.
+    """
+    code = str(error_code if error_code is not None else "").strip()
+    if code in _BAOSTOCK_SESSION_AUTH_ERROR_CODES:
+        return True
+    text = str(msg if msg is not None else "").strip()
+    if not text:
+        return False
+    return any(hint in text for hint in _BAOSTOCK_SESSION_AUTH_MSG_HINTS)
 
 
 def _parse_max_relogins(raw: Any) -> int:
@@ -259,6 +346,30 @@ def _parse_max_relogins(raw: Any) -> int:
             f"{_DEFAULT_MAX_RELOGINS} (an unbounded relogin loop is worse than failing)."
         )
         return _DEFAULT_MAX_RELOGINS
+    return value
+
+
+def _parse_max_repair_days(raw: Any) -> int:
+    """`BAOSTOCK_MAX_REPAIR_DAYS` -> per-request per-day-refetch cap (`0` = unbounded).
+
+    Unlike `BAOSTOCK_MAX_RELOGINS`, an explicit `0`/negative value here is NOT an error: it
+    is the documented researcher opt-out that restores the historical unbounded repair loop
+    (see `_DEFAULT_MAX_REPAIR_DAYS` for why the shipped default is finite). A malformed
+    value still degrades to the finite default loudly, because "I could not read the knob"
+    must never mean "run unbounded".
+    """
+    if raw is None or str(raw).strip() == "":
+        return _DEFAULT_MAX_REPAIR_DAYS
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        warnings.warn(
+            f"Invalid BAOSTOCK_MAX_REPAIR_DAYS={raw!r}; falling back to "
+            f"{_DEFAULT_MAX_REPAIR_DAYS}."
+        )
+        return _DEFAULT_MAX_REPAIR_DAYS
+    if value < 0:
+        return 0
     return value
 
 
@@ -1858,6 +1969,22 @@ class BaoStockDataProvider(BaseDataProvider):
       the full series, so any `rows > 0` style check was blind to it. Both are guarded
       here (zero-row liveness probe + per-trading-day completeness), gated on the exchange
       calendar and inert (byte-identical) when `query_trade_dates` is unavailable.
+    - Bounded repair (2026-11-15 Stage-2 incident): the per-day refetch loop is capped by
+      `BAOSTOCK_MAX_REPAIR_DAYS` (default 60; `0` = unbounded opt-out) and its residuals are
+      still classified (`missing_days`/`suspended_days`/`unverified_days`/`partial_days`)
+      with `last_result="repair_budget_exhausted"`. A heal re-issues ONLY the chunk that
+      failed, keeping the frames already collected. `probe["sockets_built"]` (and the
+      banner `logins=`) count every session actually established, so a rebuild on the fresh
+      per-symbol login path is no longer invisible while `probe["relogins"]` stays 0.
+    - Intraday completeness gate: after repair, an intraday answer is refused ONLY on
+      POSITIVE EVIDENCE of data loss -- `missing_days` (zero bars behind a real daily bar) or
+      `incomplete` (a chunk whose transport provably failed and never answered). Everything
+      the provider cannot decide (`unverified_days`: no daily row at all, i.e. the routine
+      停牌 shape where BaoStock omits the row), plus `suspended_days` and `partial_days`, is
+      returned with the classification attached to `DataFrame.attrs["intraday_completeness"]`
+      and a warning: "cannot tell" must disclose, never discard valid data.
+      `BAOSTOCK_ALLOW_UNVERIFIED_INTRADAY=1` downgrades the remaining fatal cases to the same
+      disclosure.
     """
 
     _lock = threading.Lock()
@@ -1919,6 +2046,13 @@ class BaoStockDataProvider(BaseDataProvider):
         #: Per-process relogin budget (`BAOSTOCK_MAX_RELOGINS`, default 3 -- see
         #: `_DEFAULT_MAX_RELOGINS` for why it is that conservative).
         self._max_relogins = _parse_max_relogins(os.environ.get("BAOSTOCK_MAX_RELOGINS"))
+        #: Per-request cap on one-by-one per-day refetches inside
+        #: `_repair_intraday_underreturn` (`BAOSTOCK_MAX_REPAIR_DAYS`, default 60 -- see
+        #: `_DEFAULT_MAX_REPAIR_DAYS` for the incident that made it necessary). `0` means
+        #: "no cap" (researcher opt-out).
+        self._max_repair_days = _parse_max_repair_days(
+            os.environ.get("BAOSTOCK_MAX_REPAIR_DAYS")
+        )
         #: True once a transport failure has been observed on the current socket. Read by
         #: `_ensure_session` at every request entry, cleared only by a successful login.
         self._session_dirty = False
@@ -2053,11 +2187,20 @@ class BaoStockDataProvider(BaseDataProvider):
             pass
 
     def _login(self, bs) -> bool:
-        """One `baostock.login()` + `_apply_socket_timeout()`. False on a login failure."""
+        """One `baostock.login()` + `_apply_socket_timeout()`. False on a login failure.
+
+        A SUCCESSFUL login is the only place a socket is actually built (parity with
+        `socketutil.SocketUtil.connect`, which publishes a brand-new socket on
+        `context.default_socket` per login), so it is the one place the process-wide
+        `_BAOSTOCK_LOGIN_STATE["logins"]` counter advances -- for the fresh per-symbol path
+        AND for the heal path (`_recover_session` -> `_login`). `relogins` intentionally
+        stays heal-only; see `_BAOSTOCK_LOGIN_STATE` for the incident that exposed the gap.
+        """
         lg = bs.login()
         if hasattr(lg, "error_code") and lg.error_code != "0":
             warnings.warn(f"BaoStock login failed: {getattr(lg, 'error_msg', 'unknown error')}")
             return False
+        _BAOSTOCK_LOGIN_STATE["logins"] = int(_BAOSTOCK_LOGIN_STATE["logins"]) + 1
         if self._keep_logged_in:
             self._is_logged_in = True
         self._session_dirty = False
@@ -2154,9 +2297,19 @@ class BaoStockDataProvider(BaseDataProvider):
         return (
             f"{prefix}{str(trigger or '')[: PAYLOAD_SNIPPET_CHARS * 2]}"
             f" | session: relogins={_BAOSTOCK_RELOGIN_STATE['count']}/{self._max_relogins} ({state})"
+            f", logins={int(_BAOSTOCK_LOGIN_STATE['logins'])}"
             f", last_error_code={code if code is not None else '?'}"
             f", last_error_msg={str(msg if msg is not None else '')[:PAYLOAD_SNIPPET_CHARS]!r}"
         )
+
+    @property
+    def established_sessions(self) -> int:
+        """Process-wide count of BaoStock sessions actually built (fresh login + re-login).
+
+        Distinct from `probe["relogins"]` / `_BAOSTOCK_RELOGIN_STATE`, which count
+        HEAL-driven re-logins only. See `_BAOSTOCK_LOGIN_STATE`.
+        """
+        return int(_BAOSTOCK_LOGIN_STATE["logins"])
 
     # -- silent under-return guards (M3.10) ---------------------------------------
     # Two defects returned *fewer* rows than the exchange session implies while every check
@@ -2475,7 +2628,7 @@ class BaoStockDataProvider(BaseDataProvider):
     def _repair_intraday_underreturn(
         self, bs, *, bs_code, fields, freq, req_adjustflag, dfs, start_dt, end_dt, probe
     ) -> None:
-        """Assert per-trading-day completeness; refetch short days one by one.
+        """Assert per-trading-day completeness; refetch short days one by one (bounded).
 
         `rows == trading_days * 48` is the only shape check that catches a page-boundary
         truncation: the 002371.SZ defect cut at exactly 4000 rows (= 83 full days + 16
@@ -2483,6 +2636,13 @@ class BaoStockDataProvider(BaseDataProvider):
         blind. Whole missing days are caught here too because the expected count comes from
         the exchange calendar, never from the returned frame itself -- explicitly not
         "total row count" as a proxy for per-day validation.
+
+        BOUNDED (2026-11-15): the refetch loop is capped by `BAOSTOCK_MAX_REPAIR_DAYS`
+        (default 60, see `_DEFAULT_MAX_REPAIR_DAYS`). The Stage-2 incident spent ~22 minutes
+        here issuing one wire request per missing day (319 of them for one symbol) and then
+        produced nothing; because the requested window was pinned, the identical days were
+        refetched on every later run. Past the cap the loop STOPS but the residual days are
+        still classified and published -- a budget hit is disclosed, never silently dropped.
         """
         bar_target = self._BAOSTOCK_BARS_PER_DAY.get(freq)
         if bar_target is None:
@@ -2517,8 +2677,15 @@ class BaoStockDataProvider(BaseDataProvider):
         warnings.warn(msg)
         _LOGGER.warning(msg)
 
+        # `0` (or negative, normalised to 0 by `_parse_max_repair_days`) = unbounded opt-out.
+        budget = int(getattr(self, "_max_repair_days", _DEFAULT_MAX_REPAIR_DAYS))
+        budget_hit = budget > 0 and len(short) > budget
+        scheduled = short[:budget] if budget_hit else short
+
         refetched = 0
-        for day in short:
+        attempted = 0
+        for day in scheduled:
+            attempted += 1
             day_rows = self._query_day_rows(
                 bs,
                 bs_code=bs_code,
@@ -2530,8 +2697,13 @@ class BaoStockDataProvider(BaseDataProvider):
             if day_rows is not None and not day_rows.empty:
                 dfs.append(day_rows)
                 refetched += 1
-        probe["refetched_days"] = len(short)
+        # `refetched_days` = days we actually re-queried (it equalled `len(short)` before the
+        # cap existed, and still does whenever the budget is not hit).
+        probe["refetched_days"] = attempted
         probe["repaired_days"] = refetched
+        if budget_hit:
+            probe["repair_budget_hit"] = True
+            probe["deferred_repair_days"] = len(short) - attempted
 
         have = self._bars_by_session(dfs)
         probe["returned_bars"] = self._accounted_bars(have, sessions, bar_target)
@@ -2546,6 +2718,7 @@ class BaoStockDataProvider(BaseDataProvider):
         suspended: List[datetime.date] = []
         missing: List[datetime.date] = []
         unverified: List[datetime.date] = []
+        partial: List[datetime.date] = []
         for day in remaining:
             row = profile.get(day)
             if row is None:
@@ -2561,17 +2734,39 @@ class BaoStockDataProvider(BaseDataProvider):
                 all(pd.notna(x) for x in (o, h, low, c)) and o == h == low == c
             )
             is_suspended = bool(pd.isna(vol) or float(vol) <= 0.0 or frozen)
-            (suspended if is_suspended else missing).append(day)
+            if is_suspended:
+                suspended.append(day)
+            elif have.get(day, 0) > 0:
+                # A day that DID produce bars but fewer than a full session, with a normal
+                # daily bar behind it. That is the legitimate short-session shape (a half
+                # day / late open / intra-day halt), i.e. "verifiably traded, just fewer
+                # bars" -- NOT a data gap, and it must never become fatal downstream. The
+                # genuinely dangerous shape is the day with ZERO bars, which stays in
+                # `missing` and is what the completeness gate acts on.
+                partial.append(day)
+            else:
+                missing.append(day)
 
         probe["suspended_days"] = len(suspended)
         probe["missing_days"] = [d.isoformat() for d in missing]
         probe["unverified_days"] = [d.isoformat() for d in unverified]
+        probe["partial_days"] = [d.isoformat() for d in partial]
         if suspended:
             _LOGGER.info(
                 "BaoStock: %s has %d suspended session(s) in %s->%s (no bars expected): %s",
                 bs_code, len(suspended), start_dt, end_dt,
                 [d.isoformat() for d in suspended[:5]],
             )
+        if partial:
+            partial_msg = (
+                f"BaoStock short-session (not a gap) for {bs_code} ({freq}m) on "
+                f"{len(partial)} trading day(s) {[d.isoformat() for d in partial[:5]]}: "
+                f"fewer than {bar_target} bars but the daily bar shows real trading, so this "
+                "is a legitimate partial session (half day / late open / halt). Counted as "
+                "'partial_days' and never treated as missing data."
+            )
+            warnings.warn(partial_msg)
+            _LOGGER.warning(partial_msg)
         if missing:
             probe["last_result"] = "missing"
             warn_msg = (
@@ -2594,8 +2789,28 @@ class BaoStockDataProvider(BaseDataProvider):
             _LOGGER.warning(unverified_msg)
             if not missing:
                 probe["last_result"] = "unverified_no_daily_row"
-        if not missing and not unverified:
+        if not missing and not unverified and not partial:
             probe["last_result"] = "suspended"
+
+        if budget_hit:
+            # Last write wins on purpose: the classification above is still published in
+            # `missing_days`/`suspended_days`/`unverified_days`/`partial_days`, but the
+            # single-line verdict must say WHY the request gave up rather than pretending a
+            # bounded loop finished (`repaired`/`missing`/`suspended` all imply "we tried
+            # everything"). One WARNING, naming symbol + refetched + residual counts.
+            probe["last_result"] = "repair_budget_exhausted"
+            budget_msg = (
+                f"BaoStock repair budget exhausted for {bs_code} ({freq}m, "
+                f"{start_dt}->{end_dt}): refetched {attempted} day(s), "
+                f"BAOSTOCK_MAX_REPAIR_DAYS={budget}; {len(short) - attempted} short day(s) "
+                f"left unrefetched {[d.isoformat() for d in short[attempted:attempted + 5]]}"
+                f"{'...' if len(short) - attempted > 5 else ''}. Residuals are classified "
+                f"above (missing={len(missing)}, unverified={len(unverified)}, "
+                f"suspended={len(suspended)}, partial={len(partial)}); set "
+                f"BAOSTOCK_MAX_REPAIR_DAYS=0 for the unbounded pre-2026-11-15 behaviour."
+            )
+            warnings.warn(budget_msg)
+            _LOGGER.warning(budget_msg)
 
     def _record_probe(self, symbol: str, probe: Dict[str, Any]) -> None:
         """Publish this request's guard verdict (no-op when no guard was evaluated).
@@ -2612,6 +2827,10 @@ class BaoStockDataProvider(BaseDataProvider):
         result = dict(probe)
         result["symbol"] = symbol
         result.setdefault("last_result", "unknown")
+        # END-of-request truth: how many sessions the process had actually established when
+        # this request finished. Distinct from `relogins` (heal-driven only); see
+        # `_BAOSTOCK_LOGIN_STATE` for the incident that made the fresh-login path invisible.
+        result["sockets_built"] = int(_BAOSTOCK_LOGIN_STATE["logins"])
         if symbol not in self._probe_stats and len(self._probe_stats) >= self._MAX_PROBE_STATS:
             self._probe_stats.pop(next(iter(self._probe_stats)))
         self._probe_stats[symbol] = result
@@ -2631,6 +2850,168 @@ class BaoStockDataProvider(BaseDataProvider):
     def last_probe_result(self) -> Optional[Dict[str, Any]]:
         """Most recent guard verdict (`None` until a guard actually evaluated something)."""
         return self._last_probe_result
+
+    # -- intraday completeness gate (change D of the 2026-11-15 incident) --------
+    def _allow_unverified_intraday(self) -> bool:
+        """`BAOSTOCK_ALLOW_UNVERIFIED_INTRADAY=1` -> disclose instead of raising."""
+        raw = str(os.environ.get(_ALLOW_UNVERIFIED_INTRADAY_ENV, "")).strip().lower()
+        return raw in ("1", "true", "yes", "on")
+
+    def _mark_unaccounted_intraday_sessions(
+        self, bs, *, dfs, freq: str, start_dt, end_dt, probe: Dict[str, Any]
+    ) -> None:
+        """Publish the sessions a failed chunk left unaccounted for (no per-day refetch).
+
+        Reached only when the single heal-retry is spent and a chunk never answered, so the
+        collected frames are a PREFIX of the requested range. Every expected closed session
+        that `dfs` does not cover is by definition missing; they go to `unverified_days`
+        (never `suspended_days`, which needs positive daily-bar evidence of a suspension)
+        plus an explicit `incomplete` flag, and the completeness gate turns that into a
+        refusal for intraday requests.
+
+        Deliberately NO day-by-day refetch here: the socket we just failed to repair is the
+        worst possible source to ask, and burning up to `BAOSTOCK_MAX_REPAIR_DAYS` requests
+        against it is what made the 2026-11-15 incident take 22 minutes. The calendar lookup
+        is the only query, and it is cached.
+        """
+        bar_target = self._BAOSTOCK_BARS_PER_DAY.get(freq)
+        if bar_target is None:
+            return
+        probe["incomplete"] = True
+        sessions = self._expected_closed_sessions(bs, start_dt, end_dt)
+        if sessions is None:
+            # No verifiable calendar either: we cannot enumerate the days, but the request is
+            # still provably incomplete, which is what the gate acts on.
+            probe["last_result"] = "transport_failure_incomplete_unverified_calendar"
+            return
+        have = self._bars_by_session(dfs)
+        unaccounted = sorted(day for day in sessions if have.get(day, 0) < bar_target)
+        probe["unverified_days"] = [d.isoformat() for d in unaccounted]
+        probe["expected_bars"] = len(sessions) * bar_target
+        probe["returned_bars"] = self._accounted_bars(have, sessions, bar_target)
+        probe["last_result"] = "transport_failure_incomplete"
+        msg = (
+            f"BaoStock refused to complete {freq}m request after the heal budget was spent: "
+            f"{len(unaccounted)} trading day(s) never answered "
+            f"{[d.isoformat() for d in unaccounted[:5]]}"
+            f"{'...' if len(unaccounted) > 5 else ''}; counted as unverified, never as "
+            "suspended."
+        )
+        warnings.warn(msg)
+        _LOGGER.warning(msg)
+
+    def _assert_intraday_completeness(
+        self, out, probe: Dict[str, Any], *, symbol: str, norm_sym: str, freq: str,
+        start_dt, end_dt,
+    ) -> None:
+        """Refuse a SHORT intraday frame only when the provider has PROOF that data was lost.
+
+        FATAL ONLY ON POSITIVE EVIDENCE (2026-11-15 Stage-2 incident + its 2026-11-15b review):
+
+        - `missing_days` -- zero bars for that session AND a real daily bar behind it
+          (`volume > 0`, price moved). The exchange says the stock traded; we have nothing.
+          That is measured loss, and a short 5m frame feeds `common/intraday_features.py`,
+          whose signals shape LIVE SELLS AND BUYS. So it raises.
+        - `incomplete` -- a chunk's transport provably failed, the heal budget was spent and
+          the request is a PREFIX of the range. Also measured loss (bars we asked for never
+          arrived), so it raises.
+        - an unverifiable calendar (`completeness_unverified_no_calendar`) leaves both empty,
+          so every client/double without `query_trade_dates` is unaffected.
+
+        NON-FATAL BY DEFAULT -- DISCLOSE, DO NOT DISCARD:
+
+        - `unverified_days` -- no daily row at all, so "suspended vs missing" is UNDECIDABLE.
+          BaoStock OMITS the daily row for some 停牌 sessions, so this is the routine A-share
+          suspension shape. The pre-review version raised here, which made a legitimately
+          suspended symbol lose its WHOLE valid intraday series (the per-symbol isolation in
+          the callers drops the symbol): "we cannot tell" destroyed data we actually had. It
+          is therefore returned with the classification on
+          `DataFrame.attrs["intraday_completeness"]` plus a warning.
+        - `suspended_days` (no-trade session CONFIRMED by `volume == 0` / frozen O=H=L=C) and
+          `partial_days` (bars present but fewer than a full session, behind a normal daily
+          bar: half day / late open / intra-day halt) stay silent about the gate for the same
+          reason -- they are known-legitimate, and attaching a defect marker to them would
+          train operators to ignore the marker that DOES matter.
+
+        `BAOSTOCK_ALLOW_UNVERIFIED_INTRADAY=1` still suppresses the remaining fatal cases
+        (`missing_days` / `incomplete`), preserving the documented best-effort opt-out.
+
+        The exception is deliberately in the `DataProviderSessionError` family (a subclass of
+        `DataProviderPayloadError`): every existing caller already isolates that type per
+        symbol and reports a fetch failure, never "no data" -- the same contract the desync
+        that produced the gap uses.
+        """
+        missing = list(probe.get("missing_days") or [])
+        unverified = list(probe.get("unverified_days") or [])
+        incomplete = bool(probe.get("incomplete"))
+        # "We measured a loss" vs "we could not measure this day". Only the first is fatal.
+        measured_loss = bool(missing) or incomplete
+        if not measured_loss and not unverified:
+            return
+
+        classification = {
+            "symbol": symbol,
+            "frequency": f"{freq}m",
+            "requested": [start_dt.isoformat(), end_dt.isoformat()],
+            "missing_days": missing,
+            "unverified_days": unverified,
+            "suspended_days": int(probe.get("suspended_days") or 0),
+            "partial_days": list(probe.get("partial_days") or []),
+            "returned_bars": probe.get("returned_bars"),
+            "expected_bars": probe.get("expected_bars"),
+            "incomplete": incomplete,
+            "last_result": probe.get("last_result"),
+            "probe": dict(probe),
+        }
+        summary = (
+            f"{len(missing)} missing and {len(unverified)} unverified trading day(s) after "
+            f"per-day repair ({freq}m, {start_dt}->{end_dt}; missing="
+            f"{missing[:5]}{'...' if len(missing) > 5 else ''}, unverified="
+            f"{unverified[:5]}{'...' if len(unverified) > 5 else ''}, "
+            f"returned_bars={probe.get('returned_bars')}/{probe.get('expected_bars')})"
+        )
+        if not measured_loss:
+            # UNKNOWN, NOT LOSS (review 2026-11-15b): the ONLY defect here is "this session is
+            # unaccounted for". The bars we DID receive are the exchange's real bars, so the
+            # frame is returned -- disclosed on `attrs` (machine-readable) and in one warning
+            # (human-readable), never turned into a failed symbol.
+            out.attrs["intraday_completeness"] = classification
+            unverified_msg = (
+                f"BaoStock intraday answer for {symbol} ({norm_sym}) has {len(unverified)} "
+                f"trading day(s) that cannot be verified ({freq}m, {start_dt}->{end_dt}): "
+                f"{unverified[:5]}{'...' if len(unverified) > 5 else ''}. Returned WITHOUT "
+                f"raising because there is no positive evidence of a download gap (BaoStock "
+                f"omits the daily row for suspended sessions); the classification is attached "
+                f"to DataFrame.attrs['intraday_completeness']."
+            )
+            warnings.warn(unverified_msg)
+            _LOGGER.warning(unverified_msg)
+            return
+        if self._allow_unverified_intraday():
+            # Opt-out: the caller asked for best-effort data, so return the (short) frame but
+            # make the defect impossible to miss -- machine-readable in `attrs`, loud in the
+            # log/warning stream.
+            out.attrs["intraday_completeness"] = classification
+            opt_out_msg = (
+                f"BaoStock incomplete intraday answer for {symbol} ({norm_sym}): {summary}. "
+                f"Returned anyway because {_ALLOW_UNVERIFIED_INTRADAY_ENV} is set; the "
+                "classification is attached to DataFrame.attrs['intraday_completeness']."
+            )
+            warnings.warn(opt_out_msg)
+            _LOGGER.warning(opt_out_msg)
+            return
+        raise DataProviderSessionError(
+            self._session_failure_message(
+                symbol,
+                f"intraday completeness unverified: {summary}",
+                state=(
+                    "incomplete intraday answer refused (a short frame shapes live orders); "
+                    f"set {_ALLOW_UNVERIFIED_INTRADAY_ENV}=1 to accept it with disclosure"
+                ),
+            ),
+            encoding_used=None,
+            body_snippet=summary[:PAYLOAD_SNIPPET_CHARS],
+        )
 
     def _fetch_ohlcv_internal(
         self, symbol: str, start: str, end: str, interval: str = "1d", adjustflag: Optional[str] = None
@@ -2733,6 +3114,9 @@ class BaoStockDataProvider(BaseDataProvider):
             "suspended_days": 0,
             "missing_days": [],
             "unverified_days": [],
+            #: Bars present but fewer than a full session, behind a normal daily bar: a
+            #: legitimate short session (half day / late open / intra-day halt), never a gap.
+            "partial_days": [],
             "expected_bars": None,
             "returned_bars": None,
             "last_result": "unknown",
@@ -2749,13 +3133,29 @@ class BaoStockDataProvider(BaseDataProvider):
             failure: Optional[Tuple[str, str]] = None
             #: Whether the current request has already consumed its single heal-retry.
             request_retried = False
+            #: Raw (still unparsed) chunk frames that ALREADY answered. Kept across a heal on
+            #: purpose: a transport failure must never discard good data (2026-11-15 -- the
+            #: old loop rebuilt this list from scratch and re-issued every chunk, roughly
+            #: doubling the cost for any symbol that lost its session mid-flight).
+            dfs: List[pd.DataFrame] = []
+            #: Index into `chunks` of the next chunk to issue. A heal resumes HERE, i.e. at
+            #: the chunk that actually failed, not at the start of the request.
+            resume_from = 0
             try:
                 while True:
-                    dfs = []
                     transport_errors = []
                     failure = None
+                    # Where a heal would resume if this pass ends in a transport failure. Set
+                    # before each wire request (the failing chunk) and advanced as soon as the
+                    # chunk counts as answered, so a failure inside the truncation assertion
+                    # or the per-day repair resumes at the NEXT chunk instead of re-issuing
+                    # rows already collected in `dfs` (they would be de-duplicated, but
+                    # re-requesting them is what doubled the incident's cost).
+                    next_resume = resume_from
                     try:
-                        for c_start, c_end in chunks:
+                        for offset, (c_start, c_end) in enumerate(chunks[resume_from:]):
+                            chunk_index = resume_from + offset
+                            next_resume = chunk_index
                             rs = bs.query_history_k_data_plus(
                                 bs_code,
                                 fields,
@@ -2776,15 +3176,32 @@ class BaoStockDataProvider(BaseDataProvider):
                                 warnings.warn(msg)
                                 _LOGGER.warning(msg)
                                 transport_errors.append(msg)
-                                if _is_transport_failure(rs_code, rs_msg):
+                                # A `10001001` (BSERR_NO_LOGIN) answer is session-SUSPECT
+                                # only after this request already got a good answer on the
+                                # SAME socket: `send_msg` has no response framing, so a
+                                # desynchronised stream can replay the previous message --
+                                # including a stale "用户未登录" -- and the library cannot
+                                # tell that apart from a real logout (see
+                                # `_is_session_auth_failure`). Prior success on this socket is
+                                # exactly the evidence that makes "not logged in" implausible,
+                                # so only then is it worth rebuilding the session. On the very
+                                # first chunk (`not dfs`) it stays a plain business error.
+                                if _is_transport_failure(rs_code, rs_msg) or (
+                                    dfs and _is_session_auth_failure(rs_code, rs_msg)
+                                ):
                                     failure = (str(rs_code), str(rs_msg))
                                     break
+                                next_resume = chunk_index + 1
                                 continue
 
                             chunk_df = self._result_rows_to_df(rs, fields)
 
                             if chunk_df is not None and not chunk_df.empty:
                                 dfs.append(chunk_df)
+
+                            # This chunk is answered: a heal from here on resumes at the next
+                            # one, never re-issues it.
+                            next_resume = chunk_index + 1
 
                             # M3.10: per-shard truncation *detection*. The 002371.SZ defect
                             # stopped at exactly 4000 rows, i.e. the shard answered "success"
@@ -2815,6 +3232,11 @@ class BaoStockDataProvider(BaseDataProvider):
                         # anything gets returned/cached; "dead" reuses the existing single
                         # heal-retry, and a second empty answer after the relogin raises
                         # instead of handing back a silent empty frame.
+                        # NOTE (`not dfs`): after a mid-request heal the chunks that already
+                        # answered stay in `dfs`, so this branch is intentionally skipped --
+                        # an empty retried chunk cannot be told apart from a legitimately
+                        # empty one by a whole-request liveness probe, and the intraday
+                        # completeness gate below is what refuses the resulting short frame.
                         if failure is None and not dfs and not transport_errors:
                             verdict = self._zero_row_verdict(bs, start_dt, end_dt)
                             probe["attempts"] = int(probe["attempts"]) + 1
@@ -2830,6 +3252,9 @@ class BaoStockDataProvider(BaseDataProvider):
                                 _LOGGER.warning(dead_msg)
                                 transport_errors.append(dead_msg)
                                 failure = ("0", "zero rows from every query (dead session)")
+                                # A dead session answered NOTHING, so there is no good chunk
+                                # to keep: the heal must re-issue this whole pass.
+                                next_resume = resume_from
                                 probe["last_result"] = "dead_session"
                             elif verdict == "alive":
                                 probe["last_result"] = "empty_verified_alive"
@@ -2869,30 +3294,50 @@ class BaoStockDataProvider(BaseDataProvider):
                         transport_errors.append(msg)
                         failure = (type(exc).__name__, str(exc))
 
-                    # Heal at most once per request: mark the session dirty, rebuild it
-                    # (bounded by BAOSTOCK_MAX_RELOGINS) and re-run every chunk, so a
-                    # symbol that was mid-flight when the stream desynchronised is
-                    # rescued instead of abandoned -- but the request can never loop.
                     if failure is not None:
                         # Sticky even when the retry already happened: the next request must
                         # re-establish the session instead of querying a stream we cannot
                         # trust (and must fail fast once the budget is gone).
                         self._session_dirty = True
                         self._last_transport_failure = failure
-                    if failure is None or request_retried:
+                    if failure is None:
                         break
-                    request_retried = True
-                    probe["relogins"] = int(probe["relogins"]) + 1
-                    if not self._recover_session(
-                        bs,
-                        symbol=norm_sym,
-                        trigger=f"code={failure[0]} msg={failure[1]}",
-                    ):
+                    if not request_retried:
+                        # Single heal-retry: rebuild the session (bounded by
+                        # BAOSTOCK_MAX_RELOGINS) and re-issue ONLY the chunk that failed
+                        # (2026-11-15: it used to re-run every chunk, which for a
+                        # desynchronised stream meant paying for the whole request twice).
+                        # `request_retried` is what guarantees the request can never loop.
+                        request_retried = True
+                        probe["relogins"] = int(probe["relogins"]) + 1
+                        if self._recover_session(
+                            bs,
+                            symbol=norm_sym,
+                            trigger=f"code={failure[0]} msg={failure[1]}",
+                        ):
+                            # Re-issue from the failed chunk onwards; `dfs` keeps every
+                            # chunk that already answered (never discard good data).
+                            resume_from = next_resume
+                            continue
                         # Relogin refused: keep the dirty flag so the next request retries
                         # healing (or fails fast once the budget is gone) rather than
                         # talking to a socket we know is broken.
                         self._session_dirty = True
-                        break
+                    # Terminal: the heal is spent (or was refused) and the request still has a
+                    # chunk that never answered, so the frame is a PREFIX of the requested
+                    # range. Enumerate what that left unaccounted for, while the session is
+                    # still usable, so the completeness gate refuses it instead of returning
+                    # a silently short frame.
+                    if dfs and is_intraday:
+                        self._mark_unaccounted_intraday_sessions(
+                            bs,
+                            dfs=dfs,
+                            freq=freq,
+                            start_dt=start_dt,
+                            end_dt=end_dt,
+                            probe=probe,
+                        )
+                    break
             finally:
                 if not self._keep_logged_in:
                     try:
@@ -2988,6 +3433,19 @@ class BaoStockDataProvider(BaseDataProvider):
             # for a qfq/hfq series by downstream basis detection.
             out["adjustflag"] = "3"
             out.attrs["adjust_basis"] = "raw"
+        if is_intraday:
+            # Change D (2026-11-15): a SHORT 5m frame must not look like a success. No-op
+            # unless the repair pass actually classified days as missing/unverified, so the
+            # healthy path keeps its exact rows/dtypes/index/attrs.
+            self._assert_intraday_completeness(
+                out,
+                probe,
+                symbol=symbol,
+                norm_sym=norm_sym,
+                freq=freq,
+                start_dt=start_dt,
+                end_dt=end_dt,
+            )
         return out
 
     def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
