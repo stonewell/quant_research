@@ -1,6 +1,21 @@
 """Execution service for invoking Stage 1 Health Check and Stage 2 Live Deployment.
 
-Runs scripts via isolated Python subprocesses with live output capture and automatic archival.
+Runs scripts via isolated Python subprocesses with bounded, buffered-then-reported output
+capture and automatic archival.
+
+**Bounded Stage-1 launch (2026-11-15 incident).** The children used to be launched with
+``subprocess.run(capture_output=True)`` and NO ``timeout=``, with their stdout read only
+after exit.  A legitimately slow run was therefore both unbounded and invisible: a real
+Stage-1 round was still progressing after 30+ minutes while the operator saw no output at
+all and the station had no way to abort.  Stage 1 now runs under
+``STAGE1_DEFAULT_TIMEOUT_SECONDS`` (``LIVETRADING_STAGE1_TIMEOUT_SECONDS`` overrides it),
+children get ``PYTHONUNBUFFERED=1`` so the pipe carries progress as it is printed, and a
+round that hits the bound is archived as ``health_status="TIMEOUT"`` and returned as a
+structured ``stage1_timeout`` failure carrying the partial output -- never a traceback,
+never a silent success.  HONEST LIMIT: this is not yet a live stream (the web station has
+no progress channel to forward to and the dashboard polls a single request/response), so
+"live output capture" remains only partially true: output is delivered when the child
+finishes or when the bound kills it.
 
 **Valuation date ownership (L2.3 / C6 fix).** The web layer no longer pushes
 ``--as-of-date=today`` at the child scripts.  ``date.today()`` is the *host's*
@@ -833,6 +848,89 @@ STAGE1_EVIDENCE_SUMMARY_KEYS: Tuple[str, ...] = (
     "health_returncode",
     "health_report_source",
 )
+
+
+# --------------------------------------------------------------------------- #
+# (2026-11-15 incident) A Stage-1 child must be BOUNDED and its partial output
+# must survive the bound -- an invisible infinite wait is the defect
+# --------------------------------------------------------------------------- #
+#: Wall-clock budget for ONE Stage-1 child launch (``run_health_check``).
+#:
+#: WHY THIS EXISTS. The launch used to be ``subprocess.run(capture_output=True)`` with NO
+#: ``timeout=`` -- and ``proc.stdout`` was only read after the child exited.  So a slow child
+#: was unbounded AND invisible.  On 2026-11-15 a real Stage-1 run was still *progressing*
+#: after 30+ minutes (py-spy on the live PID showed it advancing) while the operator saw
+#: zero output, read the station as hung, and had no way to abort the round.  A bound turns
+#: that into a REPORTED outcome (`health_status="TIMEOUT"` + the partial output the child
+#: had produced) instead of an unbounded, silent wait.
+#:
+#: WHY 60 MINUTES (not 30). The observed honest duration exceeded 30 minutes because of a
+#: KNOWN data-path problem (provider refresh latency) that is being fixed separately, so a
+#: 30-minute bound would kill legitimate runs and fabricate a gate failure -- strictly worse
+#: than the defect.  60 minutes is ~2x the worst observed honest run: generous enough that
+#: only a genuinely wedged child reaches it, tight enough that the operator is not left
+#: waiting indefinitely.
+#:
+#: `LIVETRADING_STAGE1_TIMEOUT_SECONDS` overrides it (the repo's `LIVETRADING_*` convention,
+#: same as `LIVETRADING_STRICT_SEED_BOOK`).  ``0`` / negative disables the bound (documented
+#: escape hatch for an operator who KNOWS a round needs longer, logged every time).
+#: An unparsable value falls back to the default with a WARNING instead of silently removing
+#: the safety net -- "a typo disables the guard" is how the original defect comes back.
+STAGE1_TIMEOUT_ENV = "LIVETRADING_STAGE1_TIMEOUT_SECONDS"
+STAGE1_DEFAULT_TIMEOUT_SECONDS: float = 60.0 * 60.0
+
+#: `error_kind` / machine-readable token of the bounded-launch outcome.  A DISTINCT state on
+#: purpose: this round was neither gated (`health_status="SUCCESS"`) nor refused by a gate
+#: (the classified `run_window` / `stale_price` / `as_of` kinds) -- the child never finished.
+#: The HTTP `status` stays ``"error"`` because that is the ONLY branch the dashboard renders
+#: as a failure (`static/js/app.js`: `if (data.status === "error") throw`); a novel status
+#: value would be toasted as a SUCCESS, i.e. the "silent success" this fix must not produce.
+STAGE1_TIMEOUT_ERROR_KIND = "stage1_timeout"
+
+
+def resolve_stage1_timeout_seconds() -> Optional[float]:
+    """Seconds to allow ONE Stage-1 child, or ``None`` for "unbounded" (explicit opt-out).
+
+    Read at CALL time (never cached at import) so an operator can change the budget for the
+    next round without restarting the station, and so tests can drive it with ``monkeypatch``.
+    """
+    raw = os.environ.get(STAGE1_TIMEOUT_ENV)
+    if raw is None or str(raw).strip() == "":
+        return STAGE1_DEFAULT_TIMEOUT_SECONDS
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        logging.warning(
+            "[stage1-timeout] %s=%r 无法解析为秒数，回退默认上限 %.0fs",
+            STAGE1_TIMEOUT_ENV,
+            raw,
+            STAGE1_DEFAULT_TIMEOUT_SECONDS,
+        )
+        return STAGE1_DEFAULT_TIMEOUT_SECONDS
+    if value <= 0:
+        # Deliberate opt-out, but never silent: an unbounded round must be visible in the
+        # log, otherwise "no timeout" and "a timeout nobody can see" look the same.
+        logging.warning(
+            "[stage1-timeout] %s=%r <= 0：本次 Stage 1 不设超时上限（显式关闭）",
+            STAGE1_TIMEOUT_ENV,
+            raw,
+        )
+        return None
+    return value
+
+
+def _timeout_partial_text(value: Any) -> str:
+    """Text a killed child had produced, whatever ``TimeoutExpired`` handed back.
+
+    ``text=True`` normally means ``str``, but bytes (or ``None``) are still possible.  The
+    whole point of keeping partial output is that the operator sees how far the child got,
+    so this must never raise.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
 
 class Stage1HealthReportMissingError(RuntimeError):
@@ -2144,6 +2242,27 @@ class ExecutionService:
         if existing_pythonpath:
             paths.append(existing_pythonpath)
         env["PYTHONPATH"] = os.path.pathsep.join(paths)
+        # (2026-11-15 incident) THE CHILD MUST NOT BLOCK-BUFFER ITS STDOUT.
+        #
+        # WHY. `run_health_check` captures the child's output through a PIPE, and CPython
+        # block-buffers a non-tty stdout (~8 KB). The 2026-11-15 run had been working for
+        # 30+ minutes and had flushed NOTHING: the parent's `proc.stdout` stayed empty and
+        # the operator, with no line of progress to read, correctly concluded "hung". The
+        # same buffering is why the timeout path could not report how far the child got.
+        #
+        # `PYTHONUNBUFFERED=1` (read by the child's interpreter before it starts) forces
+        # line-unbuffered stdout/stderr, so every `print()` reaches the pipe as it happens.
+        # That makes the partial output attached to a `TimeoutExpired` REAL progress, and is
+        # the precondition for any future live streaming through this module.
+        #
+        # It is set UNCONDITIONALLY (overriding an inherited `PYTHONUNBUFFERED=0`): a
+        # buffered child is exactly the defect, and no caller here benefits from batching.
+        #
+        # Encoding is deliberately NOT forced (`PYTHONIOENCODING`): tracked code has no
+        # precedent for it (the only hits are inside a third-party venv), and pinning
+        # `utf-8` here would silently change how a child writes Chinese gate messages on a
+        # non-UTF-8 host -- a separate decision, not part of this fix.
+        env["PYTHONUNBUFFERED"] = "1"
         if extra:
             env.update({str(k): str(v) for k, v in extra.items()})
         return env
@@ -3267,14 +3386,190 @@ class ExecutionService:
         if publish_after:
             cmd.extend([INTRADAY_PUBLISH_AFTER_FLAG, publish_after])
 
-        print(f"[ExecutionService] Running Stage 1 Health Check: {' '.join(cmd)}")
-        proc = subprocess.run(
-            cmd,
-            cwd=self.storage.repo_root,
-            env=self._get_subprocess_env(),
-            capture_output=True,
-            text=True,
+        # (2026-11-15 incident) BOUNDED launch. Read at call time, so an operator can change
+        # the budget for the next round without restarting the station.
+        stage1_timeout = resolve_stage1_timeout_seconds()
+        budget_label = "unbounded" if stage1_timeout is None else f"{stage1_timeout:.0f}s"
+        print(
+            f"[ExecutionService] Running Stage 1 Health Check (timeout={budget_label}): "
+            f"{' '.join(cmd)}",
+            flush=True,
         )
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=self.storage.repo_root,
+                env=self._get_subprocess_env(),
+                capture_output=True,
+                text=True,
+                # (2026-11-15) THE DEFECT THIS CLOSES: no `timeout=` meant a slow child was
+                # unbounded and -- because stdout was read only after exit -- invisible too.
+                # `None` here only happens through the explicit env opt-out; the default is a
+                # real bound (see `STAGE1_DEFAULT_TIMEOUT_SECONDS` for the 60-minute choice).
+                timeout=stage1_timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # (2026-11-15 incident) THE ROUND DID NOT FINISH -- report that, and how far it got.
+            #
+            # WHY THE BOUND IS REAL HERE: `cmd` is spawned directly, with no wrapper process
+            # in front of it, so the PID that `subprocess.run` SIGKILLs on timeout IS the
+            # Stage-1 runner: no descendant survives the bound, and the BaoStock session it
+            # held dies with it.
+            #
+            # HONEST LIMIT OF THIS HANDLER: `subprocess.run` kills the child itself
+            # (`Popen.kill()` -> SIGKILL on POSIX) *before* re-raising, so no SIGTERM grace
+            # interval can be sent from here. A graceful teardown would need a `Popen` handle
+            # that this call site does not hold; giving it one is a separate change (every
+            # existing test, including the out-of-scope `pipeline/tests/` suite, intercepts
+            # `subprocess.run`, so swapping the launch mechanism would make those suites
+            # launch REAL runners).
+            #
+            # What this handler CAN do and does: preserve the output produced up to the kill
+            # (`PYTHONUNBUFFERED=1` in `_get_subprocess_env` is what makes it real progress
+            # rather than an empty buffer), archive the round as `health_status="TIMEOUT"`,
+            # and return a structured `stage1_timeout` failure instead of a traceback or --
+            # worse -- a silent success.
+            partial_output = getattr(exc, "output", None)
+            if partial_output is None:
+                partial_output = getattr(exc, "stdout", None)
+            stdout = _timeout_partial_text(partial_output)
+            stderr = _timeout_partial_text(getattr(exc, "stderr", None))
+            timeout_seconds = float(
+                getattr(exc, "timeout", None) or stage1_timeout or 0.0
+            )
+            partial_lines = len([ln for ln in stdout.splitlines() if ln.strip()])
+            message = (
+                f"Stage 1 健康度门禁超时（{STAGE1_TIMEOUT_ERROR_KIND}）：子进程运行 "
+                f"{timeout_seconds:.0f}s 后仍未结束，已被终止，本轮没有取得门禁结论。"
+                f"\n已保留部分输出 {partial_lines} 行 / {len(stdout)} 字符（见下方 STDOUT，"
+                f"并归档至 {run_dir}）；请据此判断它卡在哪一步。"
+                f"\n处理建议：先排查数据刷新/网络为何耗时异常（这是本次超时的已知原因）；"
+                f"若确认该轮只是需要更长时间，可设置 {STAGE1_TIMEOUT_ENV}=<秒数> 放宽上限"
+                f"（默认 {STAGE1_DEFAULT_TIMEOUT_SECONDS:.0f}s，设为 0 表示不设上限）。"
+            )
+            print(f"[ExecutionService] {message}", flush=True)
+            logging.error(
+                "[stage1-timeout] kind=%s run_dir=%s timeout=%.0fs stdout_chars=%d "
+                "stderr_chars=%d",
+                STAGE1_TIMEOUT_ERROR_KIND,
+                run_dir,
+                timeout_seconds,
+                len(stdout),
+                len(stderr),
+            )
+            failure = {
+                "error_kind": STAGE1_TIMEOUT_ERROR_KIND,
+                "error_headline": "Stage 1 门禁超时终止（子进程未在预算内结束）",
+                "error_hint": (
+                    "排查数据刷新耗时；确需更长预算可设置 "
+                    f"{STAGE1_TIMEOUT_ENV}=<秒数>（0 = 不设上限）。"
+                ),
+                "error_detail": (
+                    f"timeout_seconds={timeout_seconds:.0f} "
+                    f"partial_stdout_lines={partial_lines}"
+                ),
+                "error_message": message,
+            }
+            # Nothing was measured (no report), so the 5m verdict must NOT read as "measured
+            # and fine": `reconcile_intraday_5m_observability` is handed NO report, and only
+            # the partial stdout can speak.
+            intraday_obs = reconcile_intraday_5m_observability(
+                None, stdout=stdout, as_of_date=val_date
+            )
+            summary = self.storage._load_json(summary_file, default={}) or {}
+            round_fields = {
+                # Same field set as the completed path, so a Stage-2 round (and every reader
+                # of `summary.json`) sees one shape regardless of how Stage 1 ended.
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "date": val_date,
+                "as_of": val_date,
+                "strategy_key": strat_key,
+                "strategy_name": strat_name,
+                "strategy_file": strat_path,
+                "universe_key": univ_key,
+                "universe_name": univ_name,
+                "universe_file": univ_path,
+                "portfolio_value": portfolio_value,
+                "data_provider": provider,
+                "as_of_source": as_of_source,
+                # `"TIMEOUT"`, never `"SUCCESS"`/`"FAILED"`: the child neither passed nor
+                # refused. `storage._instance_summary_is_admissible` treats any non-SUCCESS
+                # status as non-admissible, so this round can never seed a later round.
+                "health_status": "TIMEOUT",
+                "health_returncode": None,
+                "health_stdout": stdout,
+                "health_stderr": stderr,
+                # Machine-readable bound, so a later reader can tell "we gave up at T" from
+                # "the child said no": `health_output_truncated` marks the stdout above as
+                # PARTIAL rather than the child's complete output.
+                "health_timeout_seconds": timeout_seconds,
+                "health_output_truncated": True,
+            }
+            summary.update(round_fields)
+            owned_keys = set(round_fields)
+            failure_fields = {
+                k: failure[k]
+                for k in ("error_kind", "error_headline", "error_hint", "error_detail")
+            }
+            summary.update(failure_fields)
+            owned_keys |= set(failure_fields)
+            clock_block = self._merge_observability(
+                summary,
+                valuation_date=val_date,
+                universe_file=universe_file,
+                custom_symbols=custom_symbols,
+                as_of_source=as_of_source,
+                stage="stage1",
+            )
+            self._apply_intraday_observability(summary, intraday_obs)
+            owned_keys |= {"clock", "freshness_summary", "observability", "intraday_5m"}
+            summary, dropped_fields = de_merge_run_summary(
+                pre_summary, summary, owned_keys
+            )
+            if dropped_fields:
+                logging.warning(
+                    "[summary-de-merge] %s: dropped cross-round fields %s "
+                    "(L2.62 继承白名单为空)",
+                    run_dir,
+                    dropped_fields,
+                )
+            self.storage._save_json(summary_file, summary)
+            # Recorded even though the round failed: Stage 2 must still re-own this round's
+            # fields (so the timeout evidence survives a later de-merge) and will REFUSE to
+            # deploy, because `stage1_health_report.json` was never written
+            # (`Stage1HealthReportMissingError` -- fail closed, never an ungated ticket).
+            self._record_stage1_owned_keys(pending_key, run_dir, owned_keys)
+            # The child's `account_state.json` is NOT promoted to the global state: it may be
+            # truncated mid-write by the kill, and publishing a half-written book would change
+            # what the NEXT round sizes from. The archive keeps it untouched for forensics.
+            return {
+                # `"error"` on purpose, NOT a novel status: `static/js/app.js` only fails
+                # loudly on `status === "error"`, so a new value would be toasted as SUCCESS
+                # (a silent success, which this fix must never produce). The DISTINCT state is
+                # `error_kind="stage1_timeout"` -- the same taxonomy `run_window` /
+                # `stale_price` / `as_of` failures use -- plus `timeout_seconds` below.
+                "status": "error",
+                "message": message,
+                "date": val_date,
+                "as_of_source": as_of_source,
+                "clock": clock_block,
+                "freshness_summary": summary.get("freshness_summary"),
+                "intraday_5m": intraday_obs,
+                "strategy_key": strat_key,
+                "strategy_name": strat_name,
+                "universe_key": univ_key,
+                "universe_name": univ_name,
+                "stdout": stdout,
+                "stderr": stderr,
+                "health_report": None,
+                "account_state": None,
+                # Explicit, machine-readable timed-out marker for in-process callers/tests;
+                # `RunResponse` does not declare it, so it does not travel over HTTP (same as
+                # every other `error_kind` today -- reported, not hidden).
+                "timeout_seconds": timeout_seconds,
+                "timed_out": True,
+                **failure,
+            }
 
         stdout = proc.stdout
         stderr = proc.stderr

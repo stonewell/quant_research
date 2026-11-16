@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
 try:
     from .execution_service import ExecutionService, normalize_intraday_publish_after
@@ -263,7 +264,18 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         try:
-            return execution_service.run_health_check(
+            # (2026-11-15 incident) THIS CALL BLOCKS FOR THE WHOLE CHILD RUN (up to
+            # `STAGE1_DEFAULT_TIMEOUT_SECONDS`, 60 min by default). Called inline from this
+            # `async def` route it pinned the event loop for the entire duration: every other
+            # request -- the dashboard, its polls, the settings API -- was frozen, which is
+            # exactly what made a merely-slow Stage 1 look like a dead station. Offloading to
+            # the threadpool keeps the loop serving while one worker waits on the child.
+            #
+            # `run_in_threadpool` (not `asyncio.to_thread`) because it is starlette's own
+            # anyio-backed pool: the one the framework already sizes and shuts down with the
+            # app, so a long Stage 1 cannot outlive a reload as a stray task.
+            return await run_in_threadpool(
+                execution_service.run_health_check,
                 strategy_file=payload.strategy_file,
                 universe_file=payload.universe_file,
                 custom_symbols=payload.custom_symbols,
