@@ -5601,8 +5601,8 @@ cfsb_intraday_5m_provider
 
 | 入口 | 第二实例 | 打印（原文） |
 | --- | --- | --- |
-| `scripts/check_live_portfolio_health.py`（Stage 1） | `provider_5m = get_data_provider(_5m_provider_name, ...)`，只传给 `load_intraday_5m_universe` | `[INTRADAY 5M] 5m 行情提供方已按策略参数固定为 {name}（日线仍用 {args.data_provider}）` |
-| `scripts/run_live_strategy.py`（Stage 2） | `provider_5m = get_data_provider(intraday_5m_provider or args.data_provider, ...)` | `[INTRADAY 5M] 5m 行情提供方已固定为 {name}（日线仍用 {args.data_provider}）` |
+| `scripts/check_live_portfolio_health.py`（Stage 1） | `provider_5m = get_data_provider(_5m_provider_name, ...)`，只传给 `load_intraday_5m_universe` | `[INTRADAY 5M] 5m 行情提供方已按策略参数固定为 {name}（日线仍用 {args.data_provider}）` （2026-11-15 起：该句是本轮 `[INTRADAY 5M] loading …` 横幅的后缀，非独立行，见 §44.6；原串逐字保留以便既有 grep 命中） |
+| `scripts/run_live_strategy.py`（Stage 2） | `provider_5m = get_data_provider(intraday_5m_provider or args.data_provider, ...)` | `[INTRADAY 5M] 5m 行情提供方已固定为 {name}（日线仍用 {args.data_provider}）` （2026-11-15 起：同上，该句为 `[INTRADAY 5M] loading …` 横幅的后缀，见 §44.6；原串逐字保留） |
 | `scripts/run_live_multi_strategy.py`（多策略轮） | 每轮**一次** 5m 加载 ⇒ 一个 `provider_5m` | 同上（`round_5m_provider`） |
 
 - **多策略轮的合并规则**（`combine_intraday_5m_providers`）：无钉值 → `None`；一个钉值 → 该值；
@@ -5699,7 +5699,9 @@ Fuyao / EastMoney 下 ⇒ 指数腿的 5m 会静默消失（28 → 21 只，只�
   （`intraday_5m_info.update(_5m_prov_rec)`），**不**存在 `intraday_5m_metrics.provenance` 这一层
   子键 —— 按 `provenance` 去读会读空。
 - 日志：Stage 1 的 `[INTRADAY 5M] 5m 行情提供方已按策略参数固定为 baostock（日线仍用 …）`，
-  或 Stage 2 / 多策略轮的 `[INTRADAY 5M] 5m 行情提供方已固定为 baostock（日线仍用 …）`。
+  或 Stage 2 / 多策略轮的 `[INTRADAY 5M] 5m 行情提供方已固定为 baostock（日线仍用 …）`
+  （2026-11-15 起：这两句是本轮 `[INTRADAY 5M] loading …` 横幅的括号后缀，
+  不再是独立行；原串逐字保留以便既有 grep 命中，形态差异见 §44.6）。
 
 另一处**如实登记的怪癖**：`build_stage2_command` 里转发 `--intraday-5m-provider` 的语句位于
 `if enable_intraday_5m:` **之外**，所以即使 5m 层关闭、只要解析到钉值，该标志也会被下发。Stage 2
@@ -6026,3 +6028,170 @@ stored.replace(tzinfo=datetime.timezone.utc).astimezone(MARKET_TZ)
 - 既有回归：`pipeline/tests` 全套 `1386 passed, 1 skipped`；`common/tests` 中
   `test_live_health_check.py` / `test_intraday_features.py` / `test_ohlcv_null_volume_contract.py`
   `76 passed`。
+
+## 44. 实盘空跑事故收口：5m 加载绕过热缓存、逐日补数无上限、`10001001` 不可判定，以及「慢」被呈现为「死」（基础设施加固，无版本轴变动，2026-11-15）
+
+> **本节编号**：落笔前实测现有最高节号为 **43**（`grep -n '^## ' docs/version.md` 的最后一项），
+> 故本节取 **44**，按只追加的方式写在文件末尾。
+> **本节的性质是「基础设施加固」，不是「版本变更」。** 按
+> [`AGENTS.md`](file:///home/stone/Work/github/quant/AGENTS.md) 核心量化工程规范第 7 条，
+> 本文件的强制追加义务**只在策略 `version` 或 `BASE_VERSION` 变动时**触发；
+> 本轮**没有触碰任何策略类、任何 `AllocationTemplate` 子类、也没有触碰
+> `BaseBlendAllocationStrategy`**，因此**全仓没有一个版本号发生变化**，
+> 也没有跑 `--dump-strategies`、没有重写任何 `strategy_dumps/*.json`。
+> 未来的读者若来这里找版本号 diff，答案是「**没有**」——
+> 本节记录的是**取数路径**与**运维可见性**的加固。
+> §1–§43 一字未改，唯二例外是 §40.2 的表格行与 §40.6 的验收日志行：那两处描述的
+> 控制台原句**在本轮被改成了横幅后缀**，故就地补注（见 §44.6），且**原文字串逐字保留**。
+
+### 44.1 事故时间线（现场观测，不补写任何数字）
+
+- **14:48 → 15:12，Stage 1 正常通过。** `scripts/check_live_portfolio_health.py` 返回
+  `gate_code=GO`、`STEADY BULL BREADTH REGIME`；回撤 `-5.85%`（HWM `208,830.78`，
+  NAV `196,611.34`）、宽度 65%、推力 30%（**inactive，不是 fail**）、已实现波动 30.3%
+  ⇒ `vol_scaling_factor 0.40x`；`freshness_summary PASS 20/20`；退出码 0；
+  5 份 artifacts 全部落盘。也就是说：**Stage 1 这一侧当时是健康的**。
+- **15:12，Stage 2 由 web 站拉起**（PID 47125）。`py-spy --locals` 抓到的栈是
+  `load_intraday_5m_universe` → `BaoStockDataProvider.fetch_ohlcv` →
+  `_repair_intraday_underreturn`，即**每个缺失交易日发一次线上请求**。
+  实测样本 `300394.SZ`：`17984` 行对 `33264` 期望行（693 交易日 × 48）⇒ 约 **319** 个短日；
+  约 **5.7 s/日**；10 分 26 秒只走完 **3/20** 只标的。
+- **一张票据都没有产出。** `cache.duckdb` 的 mtime 停在 **14:50:49** ——
+  那 ~22 分钟的重取**一行都没落盘**。
+- **15:31:34，宿主进入休眠。** `hypridle` 的 `timeout = 600` 触发 `systemctl suspend`（即空闲
+  10 分钟），唤醒失败，操作者硬复位；这次运行随之消失。
+
+### 44.2 四个互相独立的根因
+
+1. **5m 加载绕过了本地热缓存。** `check_live_portfolio_health.py` 与 `run_live_strategy.py`
+   都把 2 年期的原始 `--start-date`（`2024-01-01`）直接传进 `load_intraday_5m_universe`，
+   且都传 `cache_dir=None`；加载器是**先问 provider、失败后才查 DuckDB**。
+   运行时实测：`cache_dir: None`、`start: "2024-01-01"`、`data/intraday_5m/` 不存在。
+2. **逐日补数循环没有上限。** `_repair_intraday_underreturn` 在整个请求窗口内一天发一次请求，
+   而窗口被钉在 2024-01-01，于是同样的几百个「缺失日」**每一轮都会被重新取一遍**。
+3. **`code=10001001 msg="用户未登录"` 从构造上就不可判定。**
+   `baostock/util/socketutil.py:71-77` 的 `send_msg` 是 `while True: recv(8192)` 并吞掉所有异常，
+   且**没有响应分帧 / 序号 / CRC 校验**（CRC 只作用于请求侧，
+   `baostock/security/history.py:102-104`）。一个被截断的响应会让整条流错位，
+   下一次 `ResultData.next` 可能读到**上一条消息的载荷** ——
+   代码无法区分「服务端拒绝了这个会话」与「我的流错了消息数」。
+   更糟的是：一个短掉的 5m 帧可能**以成功身份返回**，静默塑形实盘的 SELLS/BUYS。
+4. **web 层把「慢」呈现成了「死」。**
+   `subprocess.run(capture_output=True)` 没有 `timeout=`；
+   `_get_subprocess_env` 不设 `PYTHONUNBUFFERED`（子进程 `print` 在管道里按 ~8 KB 块缓冲）；
+   `server.py` 又把阻塞的健康检查放在 asyncio 事件循环上 —— 整个站点冻住，
+   操作者 30+ 分钟看不到一行输出。
+
+### 44.3 修复清单（按文件）
+
+- `common/financial_api.py`：
+  - `BAOSTOCK_MAX_REPAIR_DAYS`（默认 **60**，`0`/负数 = 取消上限的显式退出开关）
+    给逐日重取封顶；
+  - `probe["last_result"]="repair_budget_exhausted"` + `deferred_repair_days`，
+    残留项**分类**而不是丢弃；
+  - 新增**进程级** `logins` 计数与 `sockets_built` probe 键 —— 之前真正重建 socket 的那次
+    逐标的 `_login` **一个计数都没加**，所以 socket 换了而 `relogins` 仍是 0；
+  - 自愈改为**只重发失败的那一段**（`resume_from`），保留已成功的帧，
+    维持「每个请求至多自愈一次」的不变式；
+  - 新增 `_assert_intraday_completeness` 门禁。
+- `common/intraday_features.py`：`load_intraday_5m_universe` 改为 **cache-first**
+  （先读 `DuckDBCache.query_intraday_bars`，网络只补缺口，经
+  `_intraday_5m_merge_gap_fill` 且只合并共享列、保持升序）；真正使用 `cache_dir`
+  （此前被忽略）；新增 `verbose` 逐标的进度、可选的 `max_wall_seconds`，
+  以及公开钳制 `intraday_5m_bounded_start()` 与 `INTRADAY_5M_MAX_LOOKBACK_DAYS = 90`
+  （依据是 41 个交易日的下限：21 个观测 + 20 个会话的预热）。
+- `scripts/check_live_portfolio_health.py`、`scripts/run_live_strategy.py`：
+  5m 调用点改传钳制后的起点并转发 `cache_dir`，打一行
+  `[INTRADAY 5M] loading N symbols <start> -> <as_of> (provider=…, cache-first; 日线起点仍为 …)`
+  横幅，`verbose=True`。**日线 `--start-date` 的语义未变。**
+- `web/livetrading/execution_service.py`：子进程环境加 `PYTHONUNBUFFERED=1`；
+  Stage-1 启动改为有界，由 `LIVETRADING_STAGE1_TIMEOUT_SECONDS`（默认 **3600 s**，
+  `0`/负数 = 无界，解析不出 → 取默认并打 WARNING）控制；超时后本轮归档为
+  `health_status="TIMEOUT"`、`health_returncode=None`、`health_output_truncated=True`、
+  `error_kind="stage1_timeout"`，**保留已产出的部分 stdout**，
+  且不把半写的账户状态提升为正式状态。
+- `web/livetrading/server.py`：Stage-1 路由改为 `await run_in_threadpool(...)`，站点不再冻住。
+
+### 44.4 完整性契约变更（本轮真正重要的行为变化）
+
+- **致命（`DataProviderSessionError`）只在「有阳性缺失证据」时抛**：
+  `missing_days`（该日零 bar，且日线确实有这一根）与 `incomplete`（某段可证明从未应答）。
+- **非致命、改为披露**：`unverified_days`（连该日的日线都没有 ⇒ 停牌与缺口无法区分）、
+  `suspended_days`，以及新增的 `partial_days` 桶 —— 它们写进
+  `DataFrame.attrs["intraday_completeness"]` 并打 WARNING。
+- 逃生阀 `BAOSTOCK_ALLOW_UNVERIFIED_INTRADAY=1` 可抑制致命分支。
+- 理由：**未知就披露，不要丢弃** —— 一只停牌的 A 股标的，
+  不能因此把它的有效日内数据一并丢掉。
+
+### 44.5 显式移除 `systemd-inhibit` 包装器（后果如实披露）
+
+一个 `systemd-inhibit` 包装（`sleep_inhibited_argv`）曾被短暂加入，
+**按操作者指示移除**。后果必须写清楚：
+**代码层现在不再保护实盘运行免受宿主休眠** —— 手工跑 Stage 2 的人必须自己套
+`systemd-inhibit --what=sleep:idle --mode=block`，或者先停掉 `hypridle`。
+
+移除的理由：该包装是 **fork 而非 exec**，超时只会 SIGKILL 掉包装器、
+把真正的子进程留成孤儿；去掉它之后，`subprocess.run` 的 timeout 才打在
+**真正的子进程**上。
+
+### 44.6 控制台输出：一行横幅取代原先的独立状态行
+
+- 5m 加载现在**先打一行**横幅，形状如下（占位符，非实测样本）：
+
+  ```
+  [INTRADAY 5M] loading <N> symbols <start> -> <as_of> (provider=<name>, cache-first; 日线起点仍为 <daily_start>)（5m 行情提供方已固定为 <name>，日线仍用 <daily_name>） ...
+  ```
+
+  其后是加载器自己的 `[INTRADAY 5M] i/N <symbol> <- <origin>` 逐标的进度行。
+  于是「慢」在控制台上至少可见到具体是哪只标的、哪一段。
+- **§40 记的两句钉值提示现在不再是独立行**，而是上面横幅的**括号后缀**；
+  逐字形态变为 `（5m 行情提供方已固定为 <name>，日线仍用 <daily_name>）`
+  —— 即去掉了 `[INTRADAY 5M] ` 前缀、把首个 `（` 提前。
+  因此 §40.2 的表格与 §40.6 的验收日志两处描述**已就地补注**为「该句是本横幅的后缀」，
+  但**原文字串一字未删**：依赖该子串的既有 grep 仍会命中。
+  读那段历史记录的人应知道：**旧串描述的是「当时那一行」，不是「现在那一行的整行」。**
+
+### 44.7 验证（全离线、合成数据）
+
+- 离线套件：`common/tests` **1525 passed / 1 skipped**、`pipeline/tests`
+  **1389 passed / 1 skipped**、`web/livetrading/tests` **400 passed / 1 skipped**、
+  `backtester/tests` **123 passed**。
+- **零漂移**：指纹探针把一个纯净 `HEAD` 工作树的返回帧与本轮对比 ——
+  `healthy_5m rows=240 sha=d0e70ea3e323`、`healthy_5m_keepalive rows=240 sha=d0e70ea3e323`、
+  `suspended_5m rows=192 sha=922b67224872`、`daily rows=5 sha=1be25f13ed68` ——
+  **两侧完全一致**，`attrs` 亦一致。
+- **cache-first 有效性**：20 只标的的 universe 在热缓存下从 **20 次 provider `fetch_ohlcv` → 0 次**；
+  Stage-2 调用点改用钳制起点后，DuckDB 读窗口由 72,000 → **6,240 bars**（2 只标的的探针）。
+- **头号正确性问题已有答案**：把 5m 历史从 ~2 年缩到 90 个日历日
+  **不会**改变生成的权重 / 票据，因为 `common/intraday_features.py` 只算**逐日**特征
+  （5m 派生列上不存在跨日的 `rolling(` / `ewm(`），缺口填充也不能重排或重塑已缓存的帧。
+  **前提是 `use_intraday_downside_vol` 保持关闭**（默认关闭，仅用于消融）。
+- 反向判别也查过：把每个修复逐个改回去，对应测试即转红
+  （例如热缓存用例报 `warm cache still hit the network: [('600000.SH', '2024-02-10', ...)]`）。
+
+### 44.8 残余风险（如实列出，未在本轮关闭）
+
+- Stage 1 没给 5m 加载器传 `expected_last_session`，所以落后 `as_of_date`
+  **7 个日历日**以内的缓存算「已覆盖」、不会被补；后果是**丢掉** 5m 特征并打
+  `[WARN]` / `stale` 诊断，而不是静默使用陈旧 bar。
+  零容忍是一行改动（`expected_last_session=as_of_date`，Stage 2 已经这么做）。
+- `max_wall_seconds` 存在，但**生产未接线**（Stage 1 故意传 `None` 以保持可复现，有测试钉住）。
+- `/api/run-deploy` 与 `/api/deploy/multi` 仍在事件循环上跑阻塞子进程
+  （本轮只修了 Stage-1 路由）。
+- `data/intraday_5m/` 的分片持久化仍然缺失，冷缓存意味着下一轮还要全量联网取数。
+- 7 只指数在日线与 5m 上都落后一个会话（2026-11-12）；对 20 只股票的 universe 无害，
+  但任何含指数的 universe 都会中招。
+
+### 44.9 版本轴与边界
+
+| 项 | 改前 | 改后 | 理由 |
+| --- | --- | --- | --- |
+| 任一策略类 `version` | — | **全部不变** | 本轮未改任何策略类 |
+| `AllocationTemplate` 及各静态模板 | — | **全部不变** | 未改 `common/allocation_templates.py` |
+| `BaseBlendAllocationStrategy.BASE_VERSION` | `2.0.0` | **`2.0.0`（不变）** | 未改 `pipeline/research/blend/blend_base.py` |
+
+- 因此本轮**没有**触发 AGENTS.md 第 7 条的强制追加义务：本节是**主动**登记的
+  基础设施加固记录，不属于「版本升级」类条目，也**不存在**配套的
+  `strategy_dumps/*.json` 重生成或版本断言测试同步。
+- 未跑 `--dump-strategies`、未回写任何已归档 `data/runs/**`、未联网取数、
+  未执行任何 live 脚本（本节验证全部离线）。
