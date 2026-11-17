@@ -78,6 +78,16 @@ from common.live_execution_timing import (
     merge_timing_into_summary,
     resolve_execution_timing,
 )
+from common.nav_hwm import (
+    PEAK_NAV_OPERATOR_ATH_KEY,
+    PEAK_PROVENANCE_TOL,
+    PEAK_PROVENANCE_UNVERIFIABLE,
+    PEAK_PROVENANCE_UNVERIFIED_INHERITED,
+    hwm_eligibility,
+    leg_nav as nav_leg_nav,
+    max_leg_verified_nav,
+    peak_provenance,
+)
 from common.strategy_spec import load_strategy_file
 from common.universe import resolve_universe_from_args
 from pipeline.live_signal.lsig.signal import as_of_universe
@@ -476,6 +486,29 @@ def parse_args(args: Optional[List[str]] = None):
             "when any universe symbol's latest bar predates the as-of session, because breadth/thrust/vol "
             "would then be computed on yesterday's closes. This downgrades that hard failure to a loud "
             "warning and records freshness_summary=FAIL in the report."
+        ),
+    )
+    parser.add_argument(
+        "--require-provable-peak",
+        action="store_true",
+        default=False,
+        help=(
+            "(NV13) OPT-IN, default OFF. When ON, a high-water mark whose provenance is "
+            "`unverified_inherited` (it exceeds every leg-verified NAV in the run archive by "
+            f"more than {PEAK_PROVENANCE_TOL_HELP} and nothing declares it externally) OR "
+            "`unverifiable` (a peak is in use but THIS run has no leg-verified series to check "
+            "it against -- non-archive --output-dir, failed archive scan, empty tree) makes this "
+            "run FAIL CLOSED with exit code 2 BEFORE any report, state write or Stage-2 handoff. "
+            "The `unverifiable` half is deliberate: the flag must not pass silently in exactly "
+            "the deployments that cannot verify the peak. A run with NO usable peak at all "
+            "(`missing`) still proceeds -- there is no unprovable peak to refuse. "
+            "Declare an ATH the archive cannot see with `--peak-nav <value>`: when leg-verified "
+            "NAVs exist that re-labels the peak `attributable_external` and the run proceeds. "
+            "(With NO leg series at all the label stays `unverifiable` -- there is nothing to "
+            "attribute the number against -- so the refusal stands: run in the archive layout "
+            "or do not enable this flag there.) OFF leaves every decision, order "
+            "and rendered artefact unchanged (the peak's provenance is still recorded, and an "
+            "unverified or unverifiable one still prints exactly one [WARN] line)."
         ),
     )
     parser.add_argument(
@@ -966,6 +999,13 @@ def resolve_gate_nav_context(args) -> Dict[str, Any]:
         breakdown_status=status,
         cash_leg_basis=getattr(args, "nav_cash_leg", NAV_CASH_LEG_AUTO),
     )
+    # (2026-11-05 incident) The RAW snapshot travels with the resolution so the HWM
+    # eligibility guard (`common.nav_hwm.hwm_eligibility`) can read its structured
+    # same-instant evidence (`cash_as_of` / `nav_warnings` / `stale_symbols` /
+    # `nav_source`) without a SECOND disk read that could disagree with the one that
+    # produced the gate NAV. Internal only: `attach_nav_provenance` copies named keys,
+    # so this payload is never published into `stage1_health_report.json`.
+    resolution["nav_breakdown_payload"] = payload if isinstance(payload, dict) else None
     _timebase_refused = resolution.get("nav_timebase_status") in (
         NAV_TIMEBASE_STATUS_CASH_LEG_PRIOR_ROUND,
         NAV_TIMEBASE_STATUS_LEGS_MISMATCH,
@@ -1769,14 +1809,213 @@ def nav10d_display_len(dd_info: Dict[str, Any]) -> int:
     return int(dd_info.get("nav_10d_history_len", 0) or 0)
 
 
+#: ``<runs-root>/<YYYY-MM-DD>/<HHMMSS>/`` -- the live archive's layout, as understood by
+#: `web/livetrading/storage.py` and `scripts/check_live_run_integrity.py`. Used ONLY to
+#: LOCATE leg evidence (read-only); nothing here writes, and a layout that does not match
+#: simply yields no evidence (`peak_provenance == "unverifiable"`: the peak is reported
+#: and can never be a silent pass under `--require-provable-peak`, but nothing here is
+#: read as distrust of the number).
+_ARCHIVE_DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_ARCHIVE_INSTANCE_DIR_RE = re.compile(r"^\d{6}$")
+
+#: How many of the most recent archive DATES are scanned for leg evidence. The ATH the
+#: archive can vouch for is a running maximum, so an old date can carry the value that
+#: explains today's peak; 40 sessions is ~2 months, which covers the 2026-11-03 leg
+#: (202483.94) behind the 2026-11-16 peak while keeping the pre-trade gate cheap.
+PEAK_EVIDENCE_MAX_DATES = 40
+
+#: Exit code of the OPT-IN `--require-provable-peak` refusal (NV13). Same "refused /
+#: usage" code `scripts/repair_live_nav_hwm.py` uses: distinct from a crash (1) so a
+#: wrapper can tell "the engine declined" from "the engine broke".
+PEAK_PROVENANCE_EXIT_CODE = 2
+
+#: `PEAK_PROVENANCE_TOL` rendered for argparse, with its `%` escaped (`%%`). argparse
+#: formats every help string with `% params`, so a bare `%` swallows the rest of the line
+#: -- the first draft of the `--require-provable-peak` help printed the raw Option dicts
+#: instead of the tolerance. One constant, so the flag's help cannot drift from the rule.
+PEAK_PROVENANCE_TOL_HELP = f"{PEAK_PROVENANCE_TOL:.2%}".replace("%", "%%")
+
+
+def _round_archive_date_dirs(runs_root: str) -> List[str]:
+    """``<YYYY-MM-DD>`` directory names under an archive root, ascending (names only)."""
+    try:
+        names = sorted(os.listdir(runs_root))
+    except OSError:
+        return []
+    return [
+        name
+        for name in names
+        if _ARCHIVE_DATE_DIR_RE.match(name) and os.path.isdir(os.path.join(runs_root, name))
+    ]
+
+
+def locate_run_archive_root(
+    output_dir: Optional[str],
+    account_state_file: Optional[str] = None,
+) -> Optional[str]:
+    """The archive root when this run directory looks like ``<root>/<DATE>/<HHMMSS>``.
+
+    Deliberately a LAYOUT PROBE, not a new CLI flag: the deployed Stage-1 launch already
+    passes ``--output-dir <archive>/<date>/<HHMMSS>``, so the evidence is reachable
+    without an operator having to remember a second path. A default
+    ``scripts/results/live/<key>/`` directory does not match the pattern and returns
+    ``None`` -- then no leg series is claimed at all (``peak_provenance`` reports
+    ``unverifiable``, which is WARNED but never fatal unless ``--require-provable-peak``
+    is on), rather than comparing a peak against one round's legs and calling a
+    legitimate ATH a phantom.
+    """
+    state_path = account_state_file or output_dir
+    if not state_path:
+        return None
+    # `account_state_file` is a FILE inside the run directory; `output_dir` IS the run
+    # directory. Accepting both is what lets a caller pass either without silently
+    # resolving one level too high.
+    run_dir = (
+        os.path.dirname(os.path.abspath(state_path))
+        if account_state_file
+        else os.path.abspath(state_path)
+    )
+    instance = os.path.basename(run_dir)
+    day_dir = os.path.dirname(run_dir)
+    root = os.path.dirname(day_dir)
+    if not _ARCHIVE_INSTANCE_DIR_RE.match(instance):
+        return None
+    if not _ARCHIVE_DATE_DIR_RE.match(os.path.basename(day_dir)):
+        return None
+    return root if os.path.isdir(root) else None
+
+
+def collect_leg_verified_navs(
+    runs_root: Optional[str],
+    *,
+    as_of_date: Optional[str] = None,
+    max_dates: int = PEAK_EVIDENCE_MAX_DATES,
+) -> List[float]:
+    """Same-instant leg NAVs from the archive's ``nav_breakdown.json`` files (READ-ONLY).
+
+    This is the evidence base for `peak_provenance`: it can only ever contain a NAV the
+    archive can re-add from two legs, because `common.nav_hwm.hwm_eligibility` -- the ONE
+    owner of that verdict -- filters every round first. An ineligible round's legs are by
+    definition not same-instant, so their sum is exactly the kind of phantom this whole
+    module exists to keep out.
+
+    No exception escapes: an unreadable file is skipped (it is one round's evidence, not a
+    reason to fail a pre-trade gate), and a missing/odd root simply yields ``[]``. An
+    empty result is reported as ``unverifiable`` provenance downstream ("this run could
+    not check the peak"), never as distrust and never as ``missing`` -- a peak that is in
+    use but unchecked is exactly what the opt-in gate has to see.
+    """
+    navs: List[float] = []
+    if not runs_root:
+        return navs
+    date_names = _round_archive_date_dirs(runs_root)
+    if as_of_date:
+        # Future-dated rounds cannot explain today's peak, and reading them would be a
+        # look-ahead in a report that claims to be point-in-time.
+        date_names = [name for name in date_names if name <= str(as_of_date)]
+    if max_dates and max_dates > 0:
+        date_names = date_names[-int(max_dates):]
+    for date_name in date_names:
+        day_dir = os.path.join(runs_root, date_name)
+        try:
+            instance_names = sorted(os.listdir(day_dir))
+        except OSError:
+            continue
+        for instance in instance_names:
+            if not _ARCHIVE_INSTANCE_DIR_RE.match(instance):
+                continue
+            path = os.path.join(day_dir, instance, NAV_BREAKDOWN_FILENAME)
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            eligible, _reason = hwm_eligibility(payload)
+            if not eligible:
+                continue
+            value = nav_leg_nav(payload)
+            if value is not None:
+                navs.append(value)
+    return navs
+
+
 def inspect_portfolio_drawdown(
     current_nav: float,
     peak_nav: Optional[float],
     state: Dict[str, Any],
     params: Dict[str, Any],
     as_of_date: Optional[str] = None,
+    *,
+    nav_eligible: Optional[bool] = None,
+    ineligibility_reason: str = "",
+    leg_navs: Optional[Sequence[float]] = None,
 ) -> Dict[str, Any]:
-    """Compute peak-to-trough drawdown, circuit breaker tiers, auto-healing, and fast recovery."""
+    """Compute peak-to-trough drawdown, circuit breaker tiers, auto-healing, and fast recovery.
+
+    HWM ELIGIBILITY GUARD (2026-11-05 archive)
+    ------------------------------------------
+    `nav_eligible=False` means "this round's NAV is not a same-instant snapshot" -- on
+    2026-11-05 `current_nav` was 208830.78 = that day's equity (186218.00) + the PREVIOUS
+    round's cash (22612.78), while the legs on file summed to 198810.57. `peak_nav` only
+    ratchets up, so the phantom became the permanent high-water mark and every later
+    round reported a deeper drawdown than the account had (-5.77% vs the true -3.08% on
+    2026-11-16) -- i.e. a mixed-timebase number traded REAL circuit-breaker decisions.
+
+    The guard therefore bars an ineligible NAV from the HWM in BOTH directions:
+      * it may not RAISE the peak (`current_nav > effective_peak`, and the
+        `max(saved_peak, current_nav)` seed when a prior peak exists);
+      * it may not LOWER it either -- the Tier-1/Tier-3 auto-heal resets
+        `effective_peak = current_nav`, which would let a phantom rewrite the mark down.
+
+    DRAWDOWN MAGNITUDE UNDER THE GUARD (review finding, 2026-11-16)
+    ---------------------------------------------------------------
+    When the barred NAV sits ABOVE the frozen peak the raw drawdown is POSITIVE, and
+    `abs(current_dd)` would feed that phantom magnitude straight into the tier ladder: a
+    NAV 20% above a frozen peak would read as a 20% drawdown and trip `TIER_3_HALT` on a
+    healthy book. Under the guard the ladder therefore uses
+    `dd_mag = max(0.0, -current_dd)` -- a barred NAV above the mark is "no drawdown" --
+    while the gap itself is preserved verbatim in `hwm_barred_gap_pct`
+    (`max(0.0, current_dd)`) so nothing is hidden, only de-escalated. `drawdown_pct`
+    stays the raw signed value. Below the peak the two definitions coincide, so the
+    heal scenarios and every `nav_eligible` in (True, None) path are bit-identical.
+
+    `nav_eligible=None` means "no evidence either way" (no snapshot on hand, or the
+    eligibility probe itself failed) and is treated as ELIGIBLE, so every pre-existing
+    caller and every eligible-NAV run keeps its pre-change output bit-for-bit. The only
+    newly-reachable behaviour is the explicit `False` path, which is recorded in
+    `hwm_guard_applied` (True only when the guard actually blocked an advance or a heal).
+
+    PEAK PROVENANCE (``NV13``, 2026-11-16) -- A LABEL, NOT A GATE
+    ------------------------------------------------------------
+    The guard above bars a bad *this-round* NAV. It says nothing about the peak itself,
+    and the peak arrives by a different route: a new round copies the previous round's
+    state block, so a stale `prior_state.peak_nav` is inherited unconditionally (proof:
+    `2026-11-16/142959` re-inherited the phantom `208830.78` *during* the repair pass;
+    it reads `203049.96` today only because the source files had been repaired first).
+
+    `leg_navs` is the caller's leg-verified NAV series (see
+    `collect_leg_verified_navs`), and `common.nav_hwm.peak_provenance` turns it into
+    `peak_provenance` / `peak_provenance_detail` / `max_leg_verified_nav`. Those three
+    keys are ADDITIVE and INFORMATIONAL: they never touch `peak_nav`, `drawdown_pct`,
+    `drawdown_mag`, `tier`, `linear_equity_scale`, the counters or any order. The
+    tier-ladder arithmetic is bit-identical for every label -- the label only decides
+    whether one `[WARN]` line is rendered (`format_peak_provenance_warning`), and whether
+    the OPT-IN `--require-provable-peak` gate refuses the run (`enforce_provable_peak`,
+    default OFF; it refuses `unverified_inherited` AND `unverifiable`, so an environment
+    that cannot verify the peak is not waved through). The peak is never rewritten or
+    clamped here: raising a reported
+    drawdown would trip the breaker earlier, which is a behaviour change that needs its
+    own empirical gate.
+
+    HONEST BOUNDARY: the label does not make the peak trustworthy. `leg_verified` means
+    the value sits within `PEAK_PROVENANCE_TOL` of a NAV the archive can re-add from two
+    legs -- the true ATH of 2026-09-29 (203049.96) is only 0.28% above the highest leg
+    NAV in the tree (202483.94), which is why a tolerance exists at all. An untrustworthy
+    peak is made VISIBLE here, and optionally fatal; making it *provable* needs a signed
+    ATH record persisted by the producer (see the NV13 row in `docs/development_plan.md`).
+    """
     dd_reduce_thresh = float(resolve_blend_param(params, "dd_reduce_thresh", 0.10, float))
     dd_defensive_thresh = float(resolve_blend_param(params, "dd_defensive_thresh", 0.15, float))
     dd_stop_thresh = float(resolve_blend_param(params, "dd_stop_thresh", 0.20, float))
@@ -1788,16 +2027,45 @@ def inspect_portfolio_drawdown(
         state = state["prior_state"]
 
     # Resolve HWM peak NAV
+    #
+    # (2026-11-05 incident) An INELIGIBLE NAV may not move the HWM in either direction,
+    # so the "advance" is a guarded decision rather than `max(...)`/an assignment. The
+    # eligible path is byte-identical to the pre-guard code (`max(saved, current)`).
+    hwm_guard_active = nav_eligible is False
+    hwm_guard_applied = False
+
     saved_peak = state.get("peak_nav")
     if peak_nav is not None:
         effective_peak = float(peak_nav)
+        peak_nav_source = "cli"
     elif saved_peak is not None and saved_peak > 0:
-        effective_peak = max(float(saved_peak), current_nav)
+        effective_peak = float(saved_peak)
+        peak_nav_source = "prior_state"
+        if current_nav > effective_peak:
+            if hwm_guard_active:
+                # The 2026-11-05 phantom would have become the permanent HWM HERE.
+                hwm_guard_applied = True
+            else:
+                effective_peak = current_nav
+                peak_nav_source = "current_nav"
     else:
+        # No peak anywhere: this NAV IS the mark. Recorded as such (`peak_nav_source`)
+        # because a guarded round can still land here -- there is no earlier peak to
+        # protect, and refusing to initialise would leave the tier ladder unanchored.
         effective_peak = current_nav
+        peak_nav_source = "current_nav"
 
     current_dd = (current_nav - effective_peak) / effective_peak if effective_peak > 0 else 0.0
-    dd_mag = abs(current_dd)
+    if hwm_guard_active:
+        # (review finding) A barred NAV ABOVE the frozen peak is not a drawdown -- it is a
+        # gap this NAV may not close (it cannot raise the mark). Feeding `abs()` of that
+        # positive gap to the ladder would trigger TIER_3 on a healthy book, so the ladder
+        # sees only the downside part, and the raw gap is reported separately.
+        dd_mag = max(0.0, -current_dd)
+        hwm_barred_gap_pct: Optional[float] = max(0.0, current_dd)
+    else:
+        dd_mag = abs(current_dd)
+        hwm_barred_gap_pct = None
 
     tier1_counter = int(state.get("tier1_consecutive_bars", 0))
     tier3_counter = int(state.get("tier3_consecutive_bars", 0))
@@ -1816,31 +2084,59 @@ def inspect_portfolio_drawdown(
             freeze_remaining = max(0, freeze_remaining - 1)
 
         if tier3_counter >= stop_cooldown_bars:
-            effective_peak = current_nav
+            # (2026-11-05) The heal's DOWNSHIFT of the HWM is barred for an ineligible NAV:
+            # a mixed-timebase number must never rewrite the mark, not even downward. The
+            # tier/counter/scale semantics below are unchanged either way.
+            if hwm_guard_active:
+                hwm_guard_applied = True
+            else:
+                effective_peak = current_nav
             tier3_counter = 0
             freeze_remaining = 0
             current_dd = 0.0
             dd_mag = 0.0
             auto_healed = True
             heal_reason = f"Tier 3 Full Stop sustained {stop_cooldown_bars} bars: Auto-healed HWM reset to current NAV."
+            if hwm_guard_active:
+                heal_reason += (
+                    " [HWM GUARD: reset BLOCKED — 本轮 NAV 未通过同一时点校验"
+                    f"（{ineligibility_reason or 'no reason given'}），"
+                    "高水位既不上抬也不下调]"
+                )
     elif dd_mag >= dd_reduce_thresh:
         tier1_counter += 1
         tier3_counter = 0
         freeze_remaining = max(0, freeze_remaining - 1) if freeze_remaining > 0 else 0
 
         if tier1_counter >= tier1_cooldown_bars:
-            effective_peak = current_nav
+            # Same fence as the Tier-3 heal above.
+            if hwm_guard_active:
+                hwm_guard_applied = True
+            else:
+                effective_peak = current_nav
             tier1_counter = 0
             current_dd = 0.0
             dd_mag = 0.0
             auto_healed = True
             heal_reason = f"Tier 1/2 Risk Damping sustained {tier1_cooldown_bars} bars: Auto-healed HWM reset to current NAV."
+            if hwm_guard_active:
+                heal_reason += (
+                    " [HWM GUARD: reset BLOCKED — 本轮 NAV 未通过同一时点校验"
+                    f"（{ineligibility_reason or 'no reason given'}），"
+                    "高水位既不上抬也不下调]"
+                )
     else:
         tier1_counter = 0
         tier3_counter = 0
         freeze_remaining = max(0, freeze_remaining - 1) if freeze_remaining > 0 else 0
         if current_nav > effective_peak:
-            effective_peak = current_nav
+            if hwm_guard_active:
+                # THE 2026-11-05 DEFECT, refused: this is the branch that turned the
+                # phantom 208830.78 into the permanent high-water mark.
+                hwm_guard_applied = True
+            else:
+                effective_peak = current_nav
+                peak_nav_source = "current_nav"
 
     # Fast-Recovery Override (NAV 10-day momentum > 0)
     #
@@ -1927,7 +2223,20 @@ def inspect_portfolio_drawdown(
         tier_label = "🟢 NORMAL (Full Risk Budget)"
         linear_scale = 1.0
 
-    return {
+    # (NV13) PEAK PROVENANCE -- computed AFTER the ladder, from the FINAL peak, so the
+    # label describes the number actually published (`peak_nav_source == "current_nav"`
+    # after a ratchet is a different fact from "inherited"). Purely informational: nothing
+    # below this line feeds `effective_peak`, `current_dd`, `dd_mag`, the counters or the
+    # tier -- that is what makes every label bit-identical on the ladder.
+    _peak_label, _peak_detail = peak_provenance(
+        effective_peak,
+        leg_navs,
+        declared_external=(
+            peak_nav_source == "cli" or bool(state.get(PEAK_NAV_OPERATOR_ATH_KEY))
+        ),
+    )
+
+    result = {
         "current_nav": current_nav,
         "peak_nav": effective_peak,
         "drawdown_pct": current_dd,
@@ -1954,7 +2263,45 @@ def inspect_portfolio_drawdown(
         "nav_10d_required_len": NAV_10D_RECOVERY_WINDOW,
         "nav_10d_unavailable_reason": nav_10d_unavailable_reason,
         "fast_recovery_nav": fast_recovery_nav,
+        # --- (2026-11-05 incident) HWM ELIGIBILITY GUARD ---------------------------
+        #: Tri-state: True = same-instant NAV eligible for the HWM; False = barred (and
+        #: `hwm_guard_applied` says whether anything was actually blocked); None = no
+        #: evidence either way, so the pre-guard behaviour ran unchanged.
+        "hwm_eligible": nav_eligible,
+        #: Why the NAV was barred; None unless `hwm_eligible is False`.
+        "hwm_ineligibility_reason": (
+            (ineligibility_reason or "ineligible NAV (no reason given)")
+            if nav_eligible is False
+            else None
+        ),
+        #: Where the reported peak came from: "cli" (`--peak-nav`), "prior_state"
+        #: (`account_state.peak_nav`), or "current_nav" (this round's NAV set it).
+        "peak_nav_source": peak_nav_source,
+        #: True ONLY when the guard blocked a peak advance or an auto-heal HWM reset.
+        "hwm_guard_applied": bool(hwm_guard_applied),
+        # --- (NV13) PEAK PROVENANCE: what backs the number above --------------------
+        #: One of `common.nav_hwm.PEAK_PROVENANCE_LABELS`. `unverified_inherited` is the
+        #: accusatory one (peak above every leg-verified NAV, nothing declaring it
+        #: externally); `unverifiable` says the peak is in use but THIS run had no
+        #: leg-verified series to check it against ("could not verify" -- never "wrong").
+        #: Both print a `[WARN]` and both are refused by the opt-in
+        #: `--require-provable-peak` gate. `missing` = no usable peak at all, and is
+        #: silent -- absence of evidence is never read as proof, and nothing is being
+        #: divided by.
+        "peak_provenance": _peak_label,
+        #: The arithmetic behind the label (peak, highest leg-verified NAV, excess, tol).
+        "peak_provenance_detail": _peak_detail,
+        #: Highest NAV the archive can re-add from two same-instant legs; None when the
+        #: caller supplied no leg evidence at all (never a fabricated 0.0).
+        "max_leg_verified_nav": max_leg_verified_nav(leg_navs),
     }
+    if hwm_guard_active:
+        #: (review finding) The raw gap between a BARRED NAV and the frozen peak, i.e. what
+        #: `drawdown_mag` used to be when the gap was positive. Present ONLY on the guarded
+        #: path so every eligible/None result stays bit-identical (existing full-dict
+        #: equality tests compare these dicts field-for-field).
+        result["hwm_barred_gap_pct"] = hwm_barred_gap_pct
+    return result
 
 
 def evaluate_market_breadth_and_thrust(
@@ -2107,6 +2454,371 @@ VOL_CAP_SCOPE_QUALIFIER = (
     "[applied as a cap only for vol-ceiling allowlist strategies "
     "(currently chan_four_state_blend); no effect on other strategies' orders]"
 )
+
+# ---------------------------------------------------------------------------
+# (2026-11-16 archive, SCOPE DIAGNOSTIC) THE REPORTED VOL AND ITS TARGET ARE TWO
+# DIFFERENT QUANTITIES -- same units, different aggregation level.
+#
+# `realized_vol_21d` is `np.median(vol_estimates)`: a CROSS-SECTIONAL MEDIAN of
+# per-symbol vol estimates. `target_vol` (0.12) is a PORTFOLIO-level target, and the
+# strategy's own backtest scales on PORTFOLIO return vol (`blend_base.py:1557-1575`).
+# Comparing the two collapses the whole diversification benefit into the numerator.
+#
+# Measured, not asserted: the 2026-11-16 round reported `realized_vol_21d = 0.3033`
+# (30.3%), the downstream Stage-2 cap compared it against 0.12 and produced a
+# 0.3957 factor -- capping total equity at 39.6%. On the SAME 21 sessions
+# (2026-10-19..2026-11-16) the equal-weight 20-name basket realized 9.94%, and the
+# model's own target vector 11.6%. The ~3.2x gap IS the diversification factor, so
+# the live gate systematically over-deleverages relative to the backtest it claims
+# to mirror.
+#
+# This block is DIAGNOSTIC ONLY. `realized_vol_21d`, `vol_scaling_factor`, the
+# downside-semivariance branch and every existing consumer are untouched: adding a
+# second, correctly-scoped measurement next to a number whose semantics other code
+# already depends on must not move a single weight. The warning exists so an
+# operator can see WHY a 30% "vol" is not a 30%-vol portfolio.
+VOL_SCOPE_BASIS_CROSS_SECTIONAL = "cross_sectional_median"
+#: Ratio above which the two scopes are declared non-comparable. 1.5x is the point
+#: where the diversification gap alone would have moved a cap by more than a third.
+VOL_SCOPE_RATIO_WARN_THRESHOLD = 1.5
+
+
+def carry_dd_trough_basis_into_r1(
+    advisory: Optional[Dict[str, Any]],
+    intraday_5m_info: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Copy `dd_trough_basis` into an existing `advisory.r1` block, in place.
+
+    WHY: `R1` (`common.intraday_drawdown_derisk`) reads the Stage-1 `hwm_intra` /
+    `dd_trough` pair and reports `dd_source="dd_trough"`, which names the FIELD, not
+    the QUANTITY -- on the 2026-11-16 archive that quantity was the daily HWM
+    drawdown (`dd_trough` byte-identical to `portfolio_health.drawdown_pct`). A
+    consumer holding only the R1 block had no way to see that, so the basis is copied
+    through here.
+
+    Strictly additive and strictly defensive: a missing/`None` advisory, a block
+    without `r1` (the P1 shape Stage 1 emits today) and an `r1` that already carries
+    the key all leave the block BYTE-IDENTICAL. Nothing is fabricated -- no `r1` block
+    is ever created, and no status/multiplier/drawdown value is touched.
+    """
+    if not isinstance(advisory, dict):
+        return advisory
+    r1 = advisory.get("r1")
+    if not isinstance(r1, dict):
+        return advisory
+    basis = (intraday_5m_info or {}).get("dd_trough_basis")
+    if basis is not None and "dd_trough_basis" not in r1:
+        r1["dd_trough_basis"] = basis
+    return advisory
+
+
+def format_hwm_guard_warning(dd_info: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The one `[WARN]` line for a BLOCKED HWM advance/heal, or `None`.
+
+    (2026-11-05 incident) The guard silently refusing to move the high-water mark would
+    be the same defect facing the other way -- an operator must be able to see that the
+    reported drawdown is measured against an OLDER peak because this round's NAV was not
+    a same-instant snapshot. Rendered from `hwm_guard_applied` only, so a merely
+    ineligible-but-inert round (nothing to block) stays quiet.
+    """
+    info = dd_info or {}
+    if not info.get("hwm_guard_applied"):
+        return None
+    reason = info.get("hwm_ineligibility_reason") or "未说明原因"
+    peak = _fmt_metric(info.get("peak_nav"), ",.2f")
+    source = info.get("peak_nav_source") or "unknown"
+    return (
+        "[WARN] HWM 守卫：本轮 NAV 未通过同一时点校验（"
+        f"{reason}），已被排除在高水位之外——既未上抬也未下修（both directions barred）。"
+        f"本轮回撤仍按 HWM {peak} 计算（peak_nav_source={source}）；"
+        "熔断层级/线性缩放不受此守卫影响。"
+    )
+
+
+def format_peak_provenance_warning(dd_info: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The ONE `[WARN]` line for a peak nothing in the archive backs or can check, or `None`.
+
+    (NV13, 2026-11-16) Two silent failures are being closed here, in opposite directions:
+
+    * the phantom ``208830.78`` entered the permanent HWM with NOTHING in any report
+      saying the mark had no leg evidence behind it -- an operator reading ``-5.77%``
+      had no way to tell it was measured against a number the account never reached;
+    * a report that merely omitted the peak's provenance would be indistinguishable from
+      a verified one, which is how "today is clean" got read as "the engine is fixed".
+
+    Rendered for TWO labels, with deliberately different wording:
+
+    * ``unverified_inherited`` -- the peak is above every leg-verified NAV and nothing
+      declares it: the mark itself is the finding.
+    * ``unverifiable`` (review finding, HIGH) -- a peak IS in use but this run supplied no
+      leg-verified series, so the run could NOT check it. The line must say *could not
+      verify*, never *the peak is wrong*: the two are different claims, and a disclosure
+      that overstates its evidence is the same defect facing the other way. It used to be
+      silent (it shared the ``missing`` label), which left the one deployment that cannot
+      verify a peak as the one that also said nothing about it.
+
+    ``leg_verified`` / ``attributable_external`` are quiet (there is nothing to warn
+    about), and ``missing`` is quiet ON PURPOSE: no usable peak at all means nothing is
+    being divided by, so firing the line there would be noise.
+
+    ONE owner for the wording: `print_dashboard` and `generate_reports` both interpolate
+    this, so the terminal and the archived Markdown cannot drift (the LV18 lesson).
+    """
+    info = dd_info or {}
+    label = info.get("peak_provenance")
+    peak = _fmt_metric(info.get("peak_nav"), ",.2f")
+    source = info.get("peak_nav_source") or "unknown"
+    detail = info.get("peak_provenance_detail") or "no detail recorded"
+    if label == PEAK_PROVENANCE_UNVERIFIED_INHERITED:
+        max_leg = _fmt_metric(info.get("max_leg_verified_nav"), ",.2f")
+        return (
+            "[WARN] 峰值无出处（peak_provenance=unverified_inherited）："
+            f"HWM ¥{peak} 高于归档内最高逐腿核算净值 ¥{max_leg} 超过容差 "
+            f"{PEAK_PROVENANCE_TOL:.2%}（peak_nav_source={source}）。判定依据: {detail}。"
+            "该峰值不改写、不钳制：回撤与熔断层级仍按它计算（默认行为不变）；"
+            "如需声明归档之外的真实 ATH，请用 --peak-nav <value>，"
+            "如需让本轮失败关闭，请加 --require-provable-peak。"
+        )
+    if label == PEAK_PROVENANCE_UNVERIFIABLE:
+        return (
+            "[WARN] 峰值无法校验（peak_provenance=unverifiable）："
+            f"本轮 HWM ¥{peak}（peak_nav_source={source}）正在参与回撤与熔断层级计算，"
+            "但本轮没有取得任何逐腿核算净值（非归档 --output-dir / 归档扫描失败 / 目录为空），"
+            f"因此**无法证明、也无法否证**该峰值——这不表示峰值有误，只表示本轮没能校验它。"
+            f"判定依据: {detail}。"
+            "该峰值不改写、不钳制：回撤与熔断层级仍按它计算（默认行为不变）；"
+            "如需让本轮在无法校验时失败关闭，请加 --require-provable-peak；"
+            "如该峰值是归档之外的真实 ATH，请用 --peak-nav <value> 显式声明。"
+        )
+    return None
+
+
+def format_provable_peak_refusal(dd_info: Optional[Dict[str, Any]]) -> str:
+    """The fail-closed message for ``--require-provable-peak`` (exit code 2).
+
+    Names the THREE numbers an operator needs to judge the claim -- the peak, the highest
+    leg-verified NAV, and the tolerance -- plus ``--peak-nav`` as the declared-external
+    escape hatch. A refusal that does not say what to do next is how a gate gets bypassed
+    by hand instead of understood.
+
+    TWO distinct refusals (review finding, HIGH), because the two failures need different
+    remedies:
+
+    * ``unverified_inherited`` -- evidence exists and contradicts the peak: fix the archive
+      peak (or declare it with ``--peak-nav``).
+    * ``unverifiable`` -- NO evidence was gathered: the number may be perfectly good, so
+      the remedy is to supply the archive layout (or drop the opt-in flag for this
+      deployment), not to "repair" a peak nobody measured.
+    """
+    info = dd_info or {}
+    peak = _fmt_metric(info.get("peak_nav"), ",.2f")
+    max_leg = _fmt_metric(info.get("max_leg_verified_nav"), ",.2f")
+    source = info.get("peak_nav_source") or "unknown"
+    detail = info.get("peak_provenance_detail") or "no detail recorded"
+    if info.get("peak_provenance") == PEAK_PROVENANCE_UNVERIFIABLE:
+        return (
+            "[FAIL] PROVABLE-PEAK GATE (--require-provable-peak): HWM 峰值 ¥"
+            f"{peak} 本轮**无法校验** —— 没有取得任何逐腿核算净值"
+            f"（max_leg_verified_nav={max_leg}，容差 {PEAK_PROVENANCE_TOL:.2%}，"
+            f"peak_nav_source={source}）。判定依据: {detail}。\n"
+            "  这不是「峰值错误」的结论，而是「本轮没能验证它」：该 flag 要求可证，"
+            "无证据时即失败关闭，绝不在无法校验的部署里静默放行。\n"
+            "  本轮不写任何报告、不改任何状态、不向 Stage 2 交接（退出码 2）。\n"
+            "  处置：以归档布局运行（`--output-dir <archive>/<date>/<HHMMSS>`）以便取得逐腿证据；"
+            "如该峰值确实是归档之外的真实 ATH，请用 `--peak-nav <value>` 显式声明——但注意："
+            "`--peak-nav` 只有在已取得逐腿证据时才会把峰值改记为 attributable_external；"
+            "本轮没有任何逐腿证据，故该声明无法使它变得可校验，该 flag 仍会失败关闭"
+            "（另一个选择是在无法取得归档证据的部署里不加该 flag）。"
+        )
+    return (
+        "[FAIL] PROVABLE-PEAK GATE (--require-provable-peak): HWM 峰值 ¥"
+        f"{peak} 没有可证出处 —— 归档内最高逐腿核算净值 ¥{max_leg}，"
+        f"容差 {PEAK_PROVENANCE_TOL:.2%}，peak_nav_source={source}。"
+        f"判定依据: {detail}。\n"
+        "  本轮不写任何报告、不改任何状态、不向 Stage 2 交接（退出码 2）。"
+        "回撤 / 熔断层级因此未被一个无出处的分母驱动。\n"
+        "  若该峰值确实是归档之外的真实 ATH，请用 `--peak-nav <value>` 显式声明后重跑"
+        "（峰值将记为 attributable_external）；否则请先修复归档峰值出处"
+        "（见 docs/development_plan.md 的 NV13 行）。"
+    )
+
+
+def enforce_provable_peak(
+    dd_info: Optional[Dict[str, Any]],
+    *,
+    require_provable_peak: bool,
+) -> None:
+    """Fail closed (``SystemExit(2)``) on an unprovable peak; ``None`` otherwise.
+
+    (NV13) OPT-IN and OFF by default, because making the run refuse is a BEHAVIOUR change
+    (a session that used to produce a report now produces none), and AGENTS.md rule 9 puts
+    that behind an empirical gate. What ships enabled is the WARN line above; this
+    function is the operator's switch to stop the chain instead.
+
+    REFUSES TWO LABELS (review finding, HIGH): ``unverified_inherited`` *and*
+    ``unverifiable``. The second is the fix, not a widening: previously a peak with no
+    leg-verified series carried the ``missing`` label -- and this gate only refused
+    ``unverified_inherited`` -- so the flag passed silently in precisely the deployments
+    (non-archive layout, failed scan, empty tree) where nothing could verify the peak.
+    ``missing`` is STILL not a refusal: a run with no usable peak at all is not carrying
+    an unprovable peak.
+
+    Called from `main()` immediately after `inspect_portfolio_drawdown`, i.e. BEFORE the
+    dashboard, the reports, `save_account_state` and the Stage-2 handoff -- so a refusal
+    can leave no ticket and no half-written round behind. Exit code ``2`` is the same
+    "usage / refusal" code `scripts/repair_live_nav_hwm.py` uses for its guard rails.
+    """
+    if not require_provable_peak:
+        return
+    info = dd_info or {}
+    if info.get("peak_provenance") not in (
+        PEAK_PROVENANCE_UNVERIFIED_INHERITED,
+        PEAK_PROVENANCE_UNVERIFIABLE,
+    ):
+        return
+    print(format_provable_peak_refusal(info))
+    raise SystemExit(PEAK_PROVENANCE_EXIT_CODE)
+
+
+def _vol_pct_or_na(value: Any) -> str:
+    """Render a fraction as a percentage, `N/A` when unmeasured (never a fake 0.0%)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "N/A"
+    if not np.isfinite(number):
+        return "N/A"
+    return f"{number:.1%}"
+
+
+def format_vol_scope_comparison(vol_info: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The bare scope sentence, everything the renderers put after `Scope check: `.
+
+    Returns `None` when the equal-weight reference could not be measured, so a caller
+    simply omits the line -- a missing measurement is never rendered as a number.
+
+    ONE owner for the wording: the terminal dashboard and the Markdown report both
+    interpolate this, so the two artefacts cannot drift (the LV18 lesson: a scope claim
+    is only as honest as its least careful render site).
+    """
+    info = vol_info or {}
+    ew = info.get("vol_portfolio_ew_21d")
+    try:
+        ew_val = float(ew)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(ew_val) or ew_val <= 0:
+        return None
+    ratio = info.get("vol_scope_ratio")
+    try:
+        ratio_txt = f"{float(ratio):.2f}x"
+    except (TypeError, ValueError):
+        ratio_txt = "N/A"
+    return (
+        f"single-name median {_vol_pct_or_na(info.get('realized_vol_21d'))} vs "
+        f"equal-weight portfolio {ew_val:.1%} (ratio {ratio_txt}) — "
+        "单位口径不一致，组合口径下不触发上限"
+    )
+
+
+def format_vol_scope_mismatch(vol_info: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The `[WARN]` line stating the two numbers are NOT comparable, or `None`.
+
+    Prefers the warning already computed inside `evaluate_realized_volatility` (it
+    quotes the target vol too), and falls back to deriving one from the same two
+    numbers for a report/fixture that carries them without the string -- never invents
+    a warning when the ratio is at or below `VOL_SCOPE_RATIO_WARN_THRESHOLD`.
+    """
+    info = vol_info or {}
+    warning = info.get("vol_scope_warning")
+    if isinstance(warning, str) and warning.strip():
+        return f"[WARN] {warning.strip()}"
+    try:
+        ratio = float(info.get("vol_scope_ratio"))
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(ratio) or ratio <= VOL_SCOPE_RATIO_WARN_THRESHOLD:
+        return None
+    try:
+        ew_val = float(info.get("vol_portfolio_ew_21d"))
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(ew_val) or ew_val <= 0:
+        return None
+    return (
+        f"[WARN] Vol scope mismatch: the reported vol "
+        f"{_vol_pct_or_na(info.get('realized_vol_21d'))} is a CROSS-SECTIONAL MEDIAN of "
+        f"single-name volatilities, not a portfolio vol — the equal-weight portfolio "
+        f"realized {ew_val:.1%} over the same window (ratio {ratio:.2f}x). The two "
+        "numbers are NOT comparable; this line gates no order."
+    )
+
+
+def _equal_weight_portfolio_vol_21d(
+    universe: Dict[str, pd.DataFrame],
+    cash_proxy: Any,
+    as_of_ts: Optional[pd.Timestamp],
+) -> Tuple[Optional[float], Optional[str]]:
+    """Equal-weight PORTFOLIO realized vol over the same `VOL_MIN_OBS` daily window.
+
+    WHY THIS EXISTS (2026-11-16 archive): `realized_vol_21d` is a single-name
+    cross-sectional median (30.3% on that round) compared against a portfolio-level
+    target (12%), so the live vol ceiling de-levered on a quantity the backtest never
+    measures. This function answers the apples-to-apples question -- "what did the
+    basket itself realize?" -- without touching the number the gate consumes.
+
+    Construction (deliberately the simplest one that is not a fabrication):
+      1. daily `Close` per symbol, cash proxy excluded, frames truncated to `as_of`;
+      2. `pct_change()` per symbol on a common (unioned) date index;
+      3. ROW-WISE MEAN across symbols with a return on that date (`skipna=True`),
+         which is the daily return of an equal-weight rebalanced basket;
+      4. stdev of the last `VOL_MIN_OBS` observations, `ddof=1`, x `sqrt(252)`.
+
+    Returns `(vol, None)` on success and `(None, reason)` when it cannot be
+    measured. NEVER a number for a short window: fewer than `VOL_MIN_OBS` portfolio
+    observations is `(None, reason)`, exactly like the daily branch above.
+
+    HONEST CAVEAT: this is an EQUAL-WEIGHT basket, not the strategy's target vector.
+    The model's own target-weighted vol is not reconstructed here (Stage 1 has no
+    holdings and re-deriving weights would duplicate Stage 2). The equal-weight
+    number is a lower-bound-ish reference that makes the SCOPE gap visible; it is
+    published as `vol_portfolio_ew_21d`, never substituted into the gate.
+    """
+    closes: Dict[str, pd.Series] = {}
+    for sym, df in (universe or {}).items():
+        if sym == cash_proxy or df is None or getattr(df, "empty", True):
+            continue
+        if "Close" not in getattr(df, "columns", ()):
+            continue
+        frame = df
+        if as_of_ts is not None and isinstance(frame.index, pd.DatetimeIndex):
+            frame = frame.loc[:as_of_ts]
+        close = frame["Close"].replace(0, np.nan).dropna()
+        if len(close) >= 2:
+            closes[str(sym)] = close
+
+    if not closes:
+        return None, (
+            "no symbol in the universe has two usable daily closes up to as_of="
+            f"{as_of_ts.date() if as_of_ts is not None else 'N/A'}; an equal-weight "
+            "portfolio vol cannot be formed"
+        )
+
+    matrix = pd.DataFrame(closes).sort_index()
+    ew_returns = matrix.pct_change().mean(axis=1, skipna=True).dropna()
+    if len(ew_returns) < VOL_MIN_OBS:
+        return None, (
+            f"equal-weight portfolio has only {len(ew_returns)} daily return "
+            f"observations (< {VOL_MIN_OBS}); a shorter window is not a 21-day estimate"
+        )
+    window = ew_returns.iloc[-VOL_MIN_OBS:]
+    vol = float(window.std(ddof=1) * np.sqrt(252.0))
+    if not np.isfinite(vol) or vol <= 0:
+        return None, (
+            f"equal-weight portfolio vol over the last {len(window)} sessions is not a "
+            "usable positive number (degenerate / zero-variance window)"
+        )
+    return vol, None
 
 
 def evaluate_realized_volatility(
@@ -2354,6 +3066,44 @@ def evaluate_realized_volatility(
         used_obs = min(daily_obs) if daily_obs else None
         used_lag_days = as_of_lag_days
 
+    # --- (2026-11-16) SCOPE DIAGNOSTIC (additive; feeds NO gate) ------------------
+    # Computed from the SAME `universe` / `as_of` as the reported estimate, over the
+    # last VOL_MIN_OBS DAILY observations. `vol_21d` at this point is the FINAL
+    # reported value (including the 5m semivariance override), so the ratio describes
+    # exactly the number an operator reads.
+    try:
+        vol_portfolio_ew_21d, vol_scope_unavailable_reason = _equal_weight_portfolio_vol_21d(
+            universe, cash_proxy, as_of_ts
+        )
+    except Exception as exc:  # noqa: BLE001 - a DIAGNOSTIC may never fail the run
+        vol_portfolio_ew_21d = None
+        vol_scope_unavailable_reason = (
+            f"equal-weight portfolio vol could not be computed: {exc}"
+        )
+    vol_scope_ratio: Optional[float] = None
+    if vol_21d is not None and vol_portfolio_ew_21d is not None and vol_portfolio_ew_21d > 0:
+        vol_scope_ratio = float(vol_21d / vol_portfolio_ew_21d)
+    if vol_21d is None and vol_scope_unavailable_reason is None:
+        vol_scope_unavailable_reason = (
+            "realized_vol_21d is NULL (degraded), so there is nothing to compare against "
+            "the equal-weight portfolio vol"
+        )
+    elif vol_scope_ratio is None and vol_scope_unavailable_reason is None:
+        vol_scope_unavailable_reason = (
+            "vol_portfolio_ew_21d is zero/not positive; the ratio is undefined"
+        )
+
+    vol_scope_warning: Optional[str] = None
+    if vol_scope_ratio is not None and vol_scope_ratio > VOL_SCOPE_RATIO_WARN_THRESHOLD:
+        vol_scope_warning = (
+            f"SCOPE MISMATCH: realized_vol_21d={vol_21d:.4f} is the CROSS-SECTIONAL MEDIAN "
+            f"of single-name volatilities, but it is compared against target_vol="
+            f"{target_vol:.4f}, a PORTFOLIO-level target. The equal-weight portfolio "
+            f"realized {vol_portfolio_ew_21d:.4f} over the same {VOL_MIN_OBS} sessions "
+            f"(ratio {vol_scope_ratio:.2f}x); a portfolio-vol cap would not de-lever this "
+            "far. Diagnostic only -- no order is gated on this line."
+        )
+
     return {
         # --- pre-existing keys (unchanged semantics, except realized_vol_21d may be None)
         "realized_vol_21d": vol_21d,
@@ -2400,6 +3150,18 @@ def evaluate_realized_volatility(
         "vol_degraded_reason": vol_degraded_reason,
         #: Only set when a neutral 1.0x stands in for an UNMEASURED factor.
         "vol_scaling_fallback": VOL_DEGRADED_INSUFFICIENT_HISTORY if vol_degraded else None,
+        # --- (2026-11-16) SCOPE DIAGNOSTIC: single-name median vs. portfolio vol
+        #: Same-window, same-universe realized vol of the EQUAL-WEIGHT basket. The
+        #: apples-to-apples reference for a portfolio-level target; None when it
+        #: cannot be measured (reason in `vol_scope_unavailable_reason`).
+        "vol_portfolio_ew_21d": vol_portfolio_ew_21d,
+        #: `realized_vol_21d / vol_portfolio_ew_21d` -- how much of the reported
+        #: "vol" is really single-name dispersion the portfolio diversifies away.
+        "vol_scope_ratio": vol_scope_ratio,
+        "vol_scope_warning": vol_scope_warning,
+        #: What `realized_vol_21d` IS: a cross-sectional median, never a portfolio vol.
+        "vol_scope_basis": VOL_SCOPE_BASIS_CROSS_SECTIONAL,
+        "vol_scope_unavailable_reason": vol_scope_unavailable_reason,
     }
 
 
@@ -2446,6 +3208,16 @@ INTRADAY_5M_CODE_UNMEASURED = "intraday_5m_features_unmeasured"
 #: asserted equal in the offline tests; kept local so this script keeps its lazy imports).
 INTRADAY_5M_CODE_PENDING = "intraday_5m_pending_publication"
 
+#: (2026-11-16) What `intraday_5m_metrics.dd_trough` actually measures. On the
+#: archived round it was byte-identical to `portfolio_health.drawdown_pct`
+#: (-0.057661231739880504) with `hwm_intra == peak_nav`: the DAILY HWM drawdown
+#: relabelled as an intraday one, and `advisory.r1.dd_source="dd_trough"` consumed it
+#: as such. The value is kept (other code depends on the number); the label is not.
+DD_TROUGH_BASIS_DAILY_HWM = "daily_hwm_drawdown"
+#: The anchor `hwm_intra` is built from (`max(peak_nav, intraday marks)`, so the
+#: daily peak NAV is the floor). Named so a consumer never has to infer it.
+HWM_INTRA_SOURCE_PEAK_NAV = "portfolio_health.peak_nav"
+
 #: (D7 follow-up, 2026-11-11) Injectable wall clock for the self-report stamp.
 #: `None` -> real UTC now (production behaviour unchanged); tests/replays pin it so two
 #: Stage-1 runs of the SAME inputs produce a BYTE-IDENTICAL `intraday_5m_metrics` block
@@ -2466,6 +3238,94 @@ def _intraday_5m_now(now: Optional[datetime] = None) -> datetime:
     if INTRADAY_5M_NOW_OVERRIDE is not None:
         return INTRADAY_5M_NOW_OVERRIDE
     return datetime.now(timezone.utc)
+
+
+def _equal_weight_intraday_trough_proxy(
+    universe_5m: Optional[Dict[str, Any]],
+    cash_proxy: Any,
+    as_of_date: str,
+    cutoff_time: str,
+    min_symbols: int = 2,
+) -> Tuple[Optional[float], Optional[str], int]:
+    """PROXY: worst intraday drawdown of an EQUAL-WEIGHT 5m basket.
+
+    WHY THIS EXISTS (2026-11-16 archive): `intraday_5m_metrics.dd_trough` was
+    byte-identical to `portfolio_health.drawdown_pct` (-0.057661231739880504) and
+    `hwm_intra == peak_nav` on the same round -- i.e. the "intraday trough" field was
+    the DAILY HWM drawdown relabelled, and `advisory.r1.dd_source = "dd_trough"` read
+    it as an intraday measurement. Stage 1 has NO holdings, so a true intraday
+    portfolio NAV does not exist here and inventing one (weights x 5m marks from a
+    holdings file of unknown freshness) would be a fabricated risk number.
+
+    What CAN be measured honestly is a basket PATH: each symbol's intraday cumulative
+    return from its first bar of the session, averaged across the symbols that have
+    5m data at that timestamp, then the deepest peak-to-trough move of that averaged
+    path. That is a diversification-aware, unweighted proxy -- labelled a PROXY
+    everywhere it is rendered, never "the account's trough".
+
+    Returns `(trough, None, n_symbols)` with `trough <= 0`, or
+    `(None, reason, n_symbols)` when fewer than `min_symbols` symbols carry a usable
+    5m path (never a fabricated 0.0: a 0 drawdown would read as "measured, and flat").
+    """
+    cutoff: Optional[Any] = None
+    try:
+        cutoff = pd.Timestamp(str(cutoff_time)).time()
+    except (TypeError, ValueError):
+        cutoff = None
+    session_day: Optional[pd.Timestamp] = None
+    try:
+        session_day = pd.Timestamp(str(as_of_date)).normalize()
+    except (TypeError, ValueError):
+        session_day = None
+
+    paths: Dict[str, pd.Series] = {}
+    for sym, frame in (universe_5m or {}).items():
+        if sym == cash_proxy or frame is None or getattr(frame, "empty", True):
+            continue
+        if "Close" not in getattr(frame, "columns", ()):
+            continue
+        bars = frame
+        if session_day is not None and isinstance(bars.index, pd.DatetimeIndex):
+            # Only the as-of session's bars: a stale cache's last session is NOT
+            # this session's intraday path. A numpy boolean mask (`.loc`) is used
+            # deliberately: an EMPTY python list of row flags would be read by pandas
+            # as an empty COLUMN selection, which is how the first version of this
+            # helper turned a stale frame into `KeyError: 'Close'`.
+            in_session = np.asarray(bars.index.normalize() == session_day, dtype=bool)
+            if cutoff is not None:
+                in_session = in_session & np.asarray(
+                    [ts.time() <= cutoff for ts in bars.index], dtype=bool
+                )
+            bars = bars.loc[in_session]
+        close = bars["Close"].replace(0, np.nan).dropna()
+        if len(close) < 2:
+            continue
+        first = float(close.iloc[0])
+        if first <= 0:
+            continue
+        paths[str(sym)] = close / first - 1.0
+
+    n_syms = len(paths)
+    if n_syms < min_symbols:
+        return None, (
+            f"only {n_syms} symbol(s) carry a usable 5m path on {as_of_date} "
+            f"(cutoff {cutoff_time}); an equal-weight basket proxy needs >= {min_symbols}"
+        ), n_syms
+
+    ew_path = pd.DataFrame(paths).sort_index().mean(axis=1, skipna=True).dropna()
+    if len(ew_path) < 2:
+        return None, (
+            f"equal-weight 5m basket has only {len(ew_path)} aligned bar(s) on "
+            f"{as_of_date}; a peak-to-trough path needs >= 2"
+        ), n_syms
+    nav = 1.0 + ew_path
+    trough = float((nav / nav.cummax() - 1.0).min())
+    if not np.isfinite(trough) or trough > 0:
+        return None, (
+            "equal-weight 5m basket path produced a non-finite or positive drawdown; "
+            "no usable intraday trough"
+        ), n_syms
+    return trough, None, n_syms
 
 
 def summarize_intraday_5m_provenance(
@@ -3009,6 +3869,18 @@ def print_dashboard(
         )
     print(f"  High-Water Mark (HWM) : {dd_info['peak_nav']:>12,.2f}")
     print(f"  Peak-to-Trough DD     : {dd_info['drawdown_pct']:>11.2%}")
+    # (2026-11-05 incident) When the HWM guard actually blocked something, say so and
+    # name the evidence: the phantom 208830.78 of 11-05 entered the HWM silently, and a
+    # silent refusal would be the same defect facing the other way.
+    _hwm_guard_line = format_hwm_guard_warning(dd_info)
+    if _hwm_guard_line:
+        print(f"  {_hwm_guard_line}")
+    # (NV13) One `[WARN]` line ONLY when the peak itself has no backing in the archive
+    # (`unverified_inherited`). Every other label prints nothing, so a verified or
+    # explicitly-declared peak keeps the pre-change dashboard byte-identical.
+    _peak_provenance_line = format_peak_provenance_warning(dd_info)
+    if _peak_provenance_line:
+        print(f"  {_peak_provenance_line}")
     print(f"  Circuit Breaker Tier  : {dd_info['tier_label']}")
     print(f"  Linear Equity Scale   : {dd_info['linear_equity_scale']:>11.1%}")
 
@@ -3055,6 +3927,17 @@ def print_dashboard(
         v_status = "⚠️ UNAVAILABLE (neutral 1.00x fallback)"
     vol_mod_lbl = f", Model: {vol_info.get('vol_model', 'N/A')}" if "vol_model" in vol_info else ""
     print(f"  21-Day Realized Vol   : {_fmt_metric(vol_info['realized_vol_21d'], '>6.1%')} (Target Vol: {vol_info['target_vol']:>5.1%}{vol_mod_lbl}) | {v_status}")
+    # (2026-11-16) SCOPE CHECK. The line above is a CROSS-SECTIONAL MEDIAN of single-name
+    # vols compared against a PORTFOLIO target. The apples-to-apples reference (equal-weight
+    # basket over the same 21 sessions) is printed right next to it, so the 3.2x gap that
+    # over-delevered the 2026-11-16 round is visible on the dashboard, not buried in JSON.
+    # Diagnostic only: nothing reads these two lines into a gate, a NAV or a scale.
+    _vol_scope_text = format_vol_scope_comparison(vol_info)
+    if _vol_scope_text:
+        print(f"  Scope check           : {_vol_scope_text}")
+    _vol_scope_warn_text = format_vol_scope_mismatch(vol_info)
+    if _vol_scope_warn_text:
+        print(f"  {_vol_scope_warn_text}")
     # (LV18 label fix) The value alone read as an applied rescale for EVERY strategy; the
     # factor is a Stage-2 ceiling on the allowlist only, so the scope is printed with it.
     print(f"  Volatility Scaling    : {vol_info['vol_scaling_factor']:>6.2f}x {VOL_CAP_SCOPE_QUALIFIER}")
@@ -3129,6 +4012,27 @@ def print_dashboard(
         print(
             f"  Intraday Trough DD    : {_fmt_metric(intraday_5m_info.get('dd_trough'), '>11.2%'):>11} "
             f"(Intraday Peak: {_fmt_metric(intraday_5m_info.get('hwm_intra'), ',.2f')})"
+        )
+        # (2026-11-16) The number above is a DAILY-HWM drawdown (2026-11-16 archive: it was
+        # byte-identical to `portfolio_health.drawdown_pct`, and R1 read it as intraday). The
+        # basis is printed WITH it, plus the equal-weight 5m basket PROXY -- which is the only
+        # honest intraday measure Stage 1 can form (it has no holdings). Neither line gates an
+        # order.
+        print(
+            f"  Trough DD Basis       : {intraday_5m_info.get('dd_trough_basis') or DD_TROUGH_BASIS_DAILY_HWM} "
+            f"(HWM anchor: {intraday_5m_info.get('hwm_intra_source') or HWM_INTRA_SOURCE_PEAK_NAV})"
+        )
+        _trough_proxy = intraday_5m_info.get("intraday_trough_ew_proxy")
+        print(
+            f"  Intraday Trough PROXY : {_fmt_metric(_trough_proxy, '>11.2%')} "
+            f"(EW 5m basket path, n={_fmt_metric(intraday_5m_info.get('intraday_trough_ew_proxy_symbols'), 'd')}; "
+            "PROXY, never the account's trough)"
+            + (
+                f" — 未测得: {intraday_5m_info.get('intraday_trough_ew_proxy_unavailable_reason')}"
+                if _trough_proxy is None
+                and intraday_5m_info.get("intraday_trough_ew_proxy_unavailable_reason")
+                else ""
+            )
         )
         print(f"  Distribution Gate     : {intraday_5m_info.get('distribution_gate_status', 'EVALUATED')}")
         if intraday_5m_info.get("distribution_alert"):
@@ -3374,6 +4278,24 @@ def generate_reports(
         else ""
     )
 
+    # (2026-11-05 incident) HWM-eligibility disclosure, rendered in the archive too: the
+    # phantom peak was only visible months later because nothing in the report said the
+    # mark had been fed a mixed-timebase NAV. Empty string when the guard did not apply,
+    # so every existing report stays byte-identical.
+    _hwm_guard_disclosure = ""
+    _hwm_guard_text = format_hwm_guard_warning(dd_info)
+    if _hwm_guard_text:
+        _hwm_guard_disclosure = f"> **{_hwm_guard_text}**\n\n"
+
+    # (NV13) Peak-provenance disclosure, rendered in the archive TOO: the phantom peak was
+    # only noticed months later because nothing in the report said the mark had no leg
+    # evidence behind it. Empty string for every other label, so existing reports stay
+    # byte-identical (same one-owner wording as the dashboard line).
+    _peak_provenance_disclosure = ""
+    _peak_provenance_text = format_peak_provenance_warning(dd_info)
+    if _peak_provenance_text:
+        _peak_provenance_disclosure = f"> **{_peak_provenance_text}**\n\n"
+
     # (LV1) NAV provenance, rendered in the report -- not only logged. See the frozen
     # contract block above `NAV_BREAKDOWN_FILENAME`.
     _nav_threshold_display = _fmt_metric(dd_info.get("nav_deviation_threshold_pct"), ".2%")
@@ -3458,7 +4380,7 @@ def generate_reports(
 | **Tier 3 Cooldown & Freeze** | `{dd_info['freeze_remaining_bars']} bars left` | 21 Bars lockout | {"Active Lockout" if dd_info['freeze_remaining_bars'] > 0 else "Clear"} |
 | **10-Day NAV Recovery** | `{_nav10d_value}` | > 0.0% | {_nav10d_verdict} |
 
-{_nav10d_disclosure}---
+{_nav10d_disclosure}{_hwm_guard_disclosure}{_peak_provenance_disclosure}---
 
 ## 2. Universe Market Breadth & Momentum Thrust
 
@@ -3487,6 +4409,16 @@ def generate_reports(
 - **Input Window**: `{vol_info.get('vol_window_start') or 'N/A'}` → `{vol_info.get('vol_window_end') or 'N/A'}` (n_obs `{_fmt_metric(vol_info.get('vol_n_obs'), 'd')}`, last bar `{vol_info.get('vol_input_bars_last_date') or 'N/A'}`, lag `{_fmt_metric(vol_info.get('vol_input_lag_days'), 'd')}`d, source `{vol_info.get('vol_input_source')}`)
 - **Assessment**: {_vol_cap_assessment}
 """
+    # (2026-11-16) Scope line + WARN sit immediately under the volatility number they
+    # qualify. Same wording owner as the terminal dashboard
+    # (`format_vol_scope_comparison`), so the archived Markdown cannot drift from the
+    # operator's screen. Diagnostic only; no gate, no order, no scale is derived here.
+    _vol_scope_md = format_vol_scope_comparison(vol_info)
+    if _vol_scope_md:
+        md_content += f"- **Scope check**: {_vol_scope_md}\n"
+    _vol_scope_warn_md = format_vol_scope_mismatch(vol_info)
+    if _vol_scope_warn_md:
+        md_content += f"\n> **{_vol_scope_warn_md}**\n"
     # (D7) A degraded / stale-window volatility input gets its own loud line. Silence
     # here is what let a frozen 0.3240854096084951 read as a measured market.
     if vol_info.get("vol_degraded"):
@@ -3557,7 +4489,8 @@ def generate_reports(
             f"| **Intraday VWAP Breadth** | `{_fmt_metric(intraday_5m_info.get('intraday_vwap_breadth'), '.1%')}` | Threshold: 25.0% |\n"
             f"| **Afternoon Return Mean** | `{_fmt_metric(intraday_5m_info.get('afternoon_return_mean'), '+.2%')}` | Since 11:30 |\n"
             f"| **Afternoon VWAP Breakdown Ratio** | `{_fmt_metric(intraday_5m_info.get('afternoon_vwap_breakdown_ratio'), '.1%')}` | |\n"
-            f"| **Intraday Trough Drawdown** | `{_fmt_metric(intraday_5m_info.get('dd_trough'), '.2%')}` | Diagnostic only (R5) |\n"
+            f"| **Intraday Trough Drawdown** | `{_fmt_metric(intraday_5m_info.get('dd_trough'), '.2%')}` | Diagnostic only (R5); basis `{intraday_5m_info.get('dd_trough_basis') or DD_TROUGH_BASIS_DAILY_HWM}` — 分母是日线 HWM（`{intraday_5m_info.get('hwm_intra_source') or HWM_INTRA_SOURCE_PEAK_NAV}`），不是独立的日内净值序列 |\n"
+            f"| **Intraday Trough (EW 5m PROXY)** | `{_fmt_metric(intraday_5m_info.get('intraday_trough_ew_proxy'), '.2%')}` | PROXY only（等权 5m 篮子路径的最深回撤，{_fmt_metric(intraday_5m_info.get('intraday_trough_ew_proxy_symbols'), 'd')} 个标的；不是账户口径）{(' — 未测得: ' + str(intraday_5m_info.get('intraday_trough_ew_proxy_unavailable_reason'))) if intraday_5m_info.get('intraday_trough_ew_proxy') is None and intraday_5m_info.get('intraday_trough_ew_proxy_unavailable_reason') else ''} |\n"
             f"| **Distribution Gate Status** | `{intraday_5m_info.get('distribution_gate_status', 'EVALUATED')}` | `SKIPPED`/`UNKNOWN` never means PASS |\n"
             f"| **Intraday Buy Scale** | `{intraday_5m_info.get('intraday_buy_scale', 1.0):.2f}` | 0.50 only on a positive detection |\n\n"
         )
@@ -3949,16 +4882,69 @@ def main(cli_args: Optional[List[str]] = None):
         nav_resolution["nav_gate_nav"],
     )
 
+    # (2026-11-05 incident) HWM ELIGIBILITY for THIS round's NAV. The archive's
+    # `current_nav` was that day's equity plus the PREVIOUS round's cash; because the
+    # peak only ratchets up, the phantom became permanent. The verdict comes from the
+    # ONE owner (`common.nav_hwm.hwm_eligibility`) reading the SAME snapshot that
+    # produced the gate NAV -- no second disk read, so the two can never disagree.
+    # Defensive by design: an absent snapshot or a probe failure passes `None`
+    # ("no evidence either way" => pre-guard behaviour), never a crash and never a
+    # silent rejection of a perfectly good NAV.
+    nav_eligible: Optional[bool] = None
+    nav_ineligibility_reason = ""
+    try:
+        from common.nav_hwm import hwm_eligibility
+
+        _nav_payload = nav_resolution.get("nav_breakdown_payload")
+        if isinstance(_nav_payload, dict):
+            nav_eligible, nav_ineligibility_reason = hwm_eligibility(_nav_payload)
+        else:
+            nav_eligible, nav_ineligibility_reason = None, ""
+    except Exception as exc:  # noqa: BLE001 - eligibility is advisory, never fatal
+        nav_eligible = None
+        nav_ineligibility_reason = f"hwm_eligibility 评估失败: {exc}"
+        print(f"[WARN] HWM 资格校验失败（按「无证据」处理，行为不变）: {exc}")
+
+    # (NV13) PEAK EVIDENCE -- the leg-verified NAV series the inherited peak is checked
+    # against. Best effort and READ-ONLY: `locate_run_archive_root` recognises a run dir
+    # laid out as `<archive>/<date>/<HHMMSS>` (the deployed launch), and anything else
+    # (a scratch or `scripts/results/live/<key>` dir) yields NO series at all -- which
+    # reports `peak_provenance="unverifiable"` (the run could not check the peak; WARN,
+    # and refused by `--require-provable-peak`), instead of comparing a peak to one
+    # round's legs and calling a legitimate ATH a phantom. A probe failure is never a
+    # reason to fail a pre-trade gate by itself.
+    leg_navs: Optional[List[float]] = None
+    try:
+        _archive_root = locate_run_archive_root(args.output_dir, args.account_state_file)
+        if _archive_root:
+            leg_navs = collect_leg_verified_navs(_archive_root, as_of_date=as_of_date) or None
+    except Exception as exc:  # noqa: BLE001 - evidence gathering is advisory, never fatal
+        leg_navs = None
+        print(f"[WARN] 峰值出处取证失败（按「无证据」处理，行为不变）: {exc}")
+
     dd_info = inspect_portfolio_drawdown(
         current_nav=gate_nav,
         peak_nav=args.peak_nav,
         state=baseline_state,
         params=params,
         as_of_date=as_of_date,
+        nav_eligible=nav_eligible,
+        ineligibility_reason=nav_ineligibility_reason,
+        leg_navs=leg_navs,
     )
     # Attach the NAV-source provenance to the SAME dict that lands in the report JSON
     # (`"portfolio_health": dd_info`) and in `account_state.json`.
     attach_nav_provenance(dd_info, nav_resolution)
+
+    # (NV13) OPT-IN fail-closed on a peak nothing in the archive backs. Placed HERE --
+    # before the dashboard, the reports, `save_account_state` and the Stage-2 handoff --
+    # so `--require-provable-peak` can leave no ticket and no half-written round behind.
+    # Default OFF: the run keeps its pre-change behaviour and only the WARN line below
+    # changes, which is why this cannot move an order on its own.
+    enforce_provable_peak(
+        dd_info,
+        require_provable_peak=bool(getattr(args, "require_provable_peak", False)),
+    )
 
     # 4. Evaluate Universe Breadth, Thrust & Volatility (and optional 5m Intraday Enrichment)
     enable_intraday_5m = getattr(args, "enable_intraday_5m", False) or bool(
@@ -4168,6 +5154,26 @@ def main(cli_args: Optional[List[str]] = None):
                     continue
                 measured_syms.append(sym)
 
+            # (2026-11-16) ONE measurement, shared by BOTH branches below so the block's
+            # key set never depends on which path ran. PROXY only -- computed from the 5m
+            # bars already in hand, never from a holdings-weighted NAV. Guarded on purpose:
+            # a DIAGNOSTIC must never be able to take the 5m risk block down (the block's
+            # `except` above would otherwise drop breadth/trough/scale entirely).
+            try:
+                (
+                    _intraday_trough_ew_proxy,
+                    _intraday_trough_reason,
+                    _intraday_trough_syms,
+                ) = _equal_weight_intraday_trough_proxy(
+                    universe_5m, cash_proxy, as_of_date, cutoff_t
+                )
+            except Exception as exc:  # noqa: BLE001 - diagnostic only, never fatal
+                _intraday_trough_ew_proxy = None
+                _intraday_trough_syms = 0
+                _intraday_trough_reason = (
+                    f"equal-weight 5m basket proxy could not be computed: {exc}"
+                )
+
             if not measured_syms:
                 # (D7) The old text blamed the provider unconditionally. Now the reason
                 # states WHICH cause was MEASURED: no 5m rows at all vs. a 5m cache whose
@@ -4272,6 +5278,18 @@ def main(cli_args: Optional[List[str]] = None):
                     "trough_alert": None,
                     "hwm_intra": None,
                     "dd_trough": None,
+                    # (2026-11-16) Honest labels, same values: `dd_trough` is null here,
+                    # and when it is NOT null it is the DAILY HWM drawdown
+                    # (`hwm_intra` anchored on `portfolio_health.peak_nav`). R1's
+                    # `dd_source="dd_trough"` reads this number; these two fields say
+                    # WHICH quantity it actually is.
+                    "dd_trough_basis": DD_TROUGH_BASIS_DAILY_HWM,
+                    "hwm_intra_source": HWM_INTRA_SOURCE_PEAK_NAV,
+                    # PROXY only: worst intraday drawdown of an equal-weight 5m basket.
+                    # Null (with a reason) when too few symbols carry a session path.
+                    "intraday_trough_ew_proxy": _intraday_trough_ew_proxy,
+                    "intraday_trough_ew_proxy_symbols": _intraday_trough_syms,
+                    "intraday_trough_ew_proxy_unavailable_reason": _intraday_trough_reason,
                     "intraday_buy_scale": 1.0,
                 }
             else:
@@ -4436,6 +5454,23 @@ def main(cli_args: Optional[List[str]] = None):
                     "trough_alert": trough_alert,
                     "hwm_intra": hwm_intra,
                     "dd_trough": dd_trough,
+                    # (2026-11-16) The values above are UNCHANGED; only their meaning is
+                    # now stated. `dd_trough` is a DAILY-HWM drawdown: its denominator is
+                    # `hwm_intra`, which is anchored on `portfolio_health.peak_nav` (the
+                    # intraday mark-to-market path can only raise that HWM, never create a
+                    # separate intraday series). The 2026-11-16 archive showed
+                    # `dd_trough == drawdown_pct` to 18 decimals with `hwm_intra ==
+                    # peak_nav`, i.e. R1 was reading the daily drawdown under an
+                    # intraday name.
+                    "dd_trough_basis": DD_TROUGH_BASIS_DAILY_HWM,
+                    "hwm_intra_source": HWM_INTRA_SOURCE_PEAK_NAV,
+                    # PROXY only: worst intraday drawdown of an equal-weight 5m basket
+                    # (per-symbol intraday path from the session open, averaged, then its
+                    # deepest peak-to-trough move). NEVER the account's trough -- Stage 1
+                    # has no holdings, so the account's intraday NAV does not exist here.
+                    "intraday_trough_ew_proxy": _intraday_trough_ew_proxy,
+                    "intraday_trough_ew_proxy_symbols": _intraday_trough_syms,
+                    "intraday_trough_ew_proxy_unavailable_reason": _intraday_trough_reason,
                     # Scaling is only ever applied on a POSITIVE detection; an
                     # unavailable/unknown gate never silently scales and never
                     # claims to have passed.
@@ -4566,6 +5601,10 @@ def main(cli_args: Optional[List[str]] = None):
         phase=ADVISORY_PHASE_P1,
         as_of=as_of_date,
     )
+    # (2026-11-16) The R1 block, when one is present, now says WHICH drawdown it read;
+    # `dd_source="dd_trough"` only names the field. No-op for today's P1 shape (no `r1`
+    # key), so the advisory block stays byte-identical there.
+    carry_dd_trough_basis_into_r1(advisory_block, intraday_5m_info)
     json_rep, md_rep = generate_reports(
         output_dir=args.output_dir,
         as_of_date=as_of_date,

@@ -74,6 +74,7 @@ __all__ = [
     "ADVISORY_PHASE_P2",
     "ADVISORY_PHASE_P3",
     "ADVISORY_PHASES",
+    "DD_TROUGH_BASIS_DAILY_HWM",
     "build_advisory_block",
     "r1_decision_to_dict",
 ]
@@ -82,6 +83,18 @@ ADVISORY_PHASE_P1 = "P1"
 ADVISORY_PHASE_P2 = "P2"
 ADVISORY_PHASE_P3 = "P3"
 ADVISORY_PHASES = (ADVISORY_PHASE_P1, ADVISORY_PHASE_P2, ADVISORY_PHASE_P3)
+
+#: What `intraday_5m_metrics.dd_trough` actually measures on every Stage-1 round to
+#: date: the DAILY high-water-mark drawdown (`dd_trough` was byte-identical to
+#: `portfolio_health.drawdown_pct`, e.g. -0.057661231739880504 on 2026-11-16, with
+#: `hwm_intra == peak_nav`), NOT an intraday account trough. `dd_source="dd_trough"`
+#: names the field, so this names the QUANTITY.
+#:
+#: Mirrors `scripts/check_live_portfolio_health.py::DD_TROUGH_BASIS_DAILY_HWM` (one
+#: spelling, asserted equal in the offline tests). Kept local on purpose: `common/`
+#: must not import a `scripts/` entry point, exactly like Stage 1's local mirror of
+#: `INTRADAY_5M_CODE_PENDING`.
+DD_TROUGH_BASIS_DAILY_HWM = "daily_hwm_drawdown"
 
 
 def _json_number(value: Any) -> Optional[float]:
@@ -106,7 +119,11 @@ def _as_of_text(as_of: Any) -> Optional[str]:
     return str(as_of)
 
 
-def r1_decision_to_dict(decision: Any) -> Dict[str, Any]:
+def r1_decision_to_dict(
+    decision: Any,
+    *,
+    dd_trough_basis: Optional[str] = None,
+) -> Dict[str, Any]:
     """Pure field extraction from `common.intraday_drawdown_derisk.IntradayDrawdownDecision`.
 
     The decision dataclass has no `to_dict()` (deliberately -- it is an internal
@@ -117,7 +134,17 @@ def r1_decision_to_dict(decision: Any) -> Dict[str, Any]:
     writes `0.0` for "unmeasurable", which would read as "measured, sitting
     exactly at the high"). `advisory` / `gates_orders` are re-asserted here so a
     consumer that only keeps this dict still sees the round-1 fence.
+
+    `dd_trough_basis` (2026-11-05/11-16 archive) names WHICH quantity `drawdown` came
+    from. `dd_source="dd_trough"` only names the FIELD; on the archived rounds that
+    field held the DAILY HWM drawdown (stage 1: `dd_trough` byte-identical to
+    `portfolio_health.drawdown_pct`), so a consumer holding only `advisory.r1` could not
+    tell an intraday trough from a daily one. Precedence: explicit keyword > an
+    attribute on the decision object > `"daily_hwm_drawdown"` (the only basis stage 1
+    has ever produced). Purely descriptive: `status`, `multiplier`, `drawdown` and
+    `r1_effective` are untouched, and R1 stays advisory-only.
     """
+    basis = dd_trough_basis or getattr(decision, "dd_trough_basis", None)
     return {
         "advisory": True,
         "gates_orders": False,
@@ -126,6 +153,7 @@ def r1_decision_to_dict(decision: Any) -> Dict[str, Any]:
         "drawdown": _json_number(getattr(decision, "drawdown", None)),
         "reason": getattr(decision, "reason", None),
         "dd_source": getattr(decision, "dd_source", None),
+        "dd_trough_basis": str(basis) if basis else DD_TROUGH_BASIS_DAILY_HWM,
     }
 
 

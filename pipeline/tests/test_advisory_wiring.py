@@ -60,6 +60,7 @@ from common.advisory_report import (
     ADVISORY_PHASE_P1,
     ADVISORY_PHASE_P2,
     ADVISORY_PHASE_P3,
+    DD_TROUGH_BASIS_DAILY_HWM,
     build_advisory_block,
     r1_decision_to_dict,
 )
@@ -371,6 +372,11 @@ def test_r1_field_extraction_is_pure_and_json_safe():
         "drawdown": -0.025,
         "reason": "dd -2.50% in (-2%, -4%]",
         "dd_source": "price",
+        # (2026-11-05/11-16) `dd_source` names the FIELD; this names the QUANTITY. The
+        # default is stage 1's only basis to date, emitted unconditionally so a Stage-2
+        # consumer holding just `advisory.r1` can never mistake a daily HWM drawdown for
+        # an intraday trough.
+        "dd_trough_basis": DD_TROUGH_BASIS_DAILY_HWM,
     }
     # Unmeasured drawdown stays `None`, never 0.0.
     unmeasured = r1_decision_to_dict(
