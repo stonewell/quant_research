@@ -1760,27 +1760,119 @@
         }
     }
 
+    // -- (SSOT item 10, 2026-11-16) a save must never LAUNDER A PLAN INTO A BOOK ---------
+    // After a successful Stage 2 the table is repainted from the ticket's PROJECTED
+    // post-trade book (`holdings_plan`, same source as `post_holdings.json`) under a notice
+    // that says it is a plan, not a fill receipt.  `POST /api/holdings` now REFUSES that
+    // exact non-empty book with HTTP 409 unless the caller passes `confirm_plan_book: true`
+    // (`storage.UnconfirmedPlanBookSaveError`), because persisting it writes
+    // `operator_holdings.json` with `source: operator_manual_correction` -- the file every
+    // later round reads as "a human checked this against the broker".
+    //
+    // `saveHoldings()` used to ignore `res.ok` entirely and log `[SUCCESS]` no matter what,
+    // so the 409 was invisible and the operator was told a refusal had been persisted --
+    // strictly worse than no guard, because it produces a false confirmation.  The refusal
+    // is therefore handled as a REFUSAL (log `detail` verbatim, keep the plan notice, toast
+    // an error) and only an operator who has checked the broker can convert it into a
+    // deliberate `confirm_plan_book: true` re-submit.  Same `window.confirm` pattern as the
+    // empty-book guard (`confirmEmptyBookIfNeeded`, above) -- a second modal framework for
+    // one question would be more surface, not more safety.
+    //   The two guards stay INDEPENDENT: the empty-book question is asked first (it is
+    // about "the account is all cash", which the server cannot tell apart from "the table
+    // never rendered"), and this one only ever fires on a non-empty plan-shaped book.
+    function confirmPlanBookSave(detail) {
+        return window.confirm(
+            "服务器拒绝保存：当前持仓表与「同一交易日」工单的票后【计划】账簿逐股一致。\n\n" +
+            "・计划 ≠ 成交回执：这张表是「若每一张工单都按其指令成交」的推演，" +
+            "系统没有收到任何券商成交回执，无法确认真实成交；\n" +
+            "・保存它会把计划值写成 operator_holdings.json（source: operator_manual_correction），" +
+            "此后每一轮都会被当作「人已核实过的账本」；\n\n" +
+            "只有当你已对照券商实际成交逐股核实、确认真实账簿与该计划完全一致时，" +
+            "才选「确定」（将以 confirm_plan_book=true 重新提交同一份持仓）。\n" +
+            "若表格只是还停在计划上，请选「取消」，先按券商持仓修正股数与现金再保存。\n\n" +
+            "── 服务器原文 ──\n" + detail
+        );
+    }
+
     async function saveHoldings() {
         const holdings = getHoldingsFromTable();
         const dateVal = el.inputDate.value || state.currentDate;
         const nav = parseFloat(el.inputValue.value) || 100000.0;
         const keys = getActiveKeys();
 
+        // `confirmPlanBook` is the ONLY difference between the first attempt and the
+        // operator-confirmed re-submit: the key is omitted (not sent as `false`) until the
+        // 409 prompt has been accepted, so an ordinary save keeps its pre-guard payload.
+        const postHoldings = (confirmPlanBook) => fetch("/api/holdings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                holdings: holdings,
+                date: dateVal,
+                portfolio_value: nav,
+                cash: getCashInput(),
+                strategy_key: keys.stratKey,
+                universe_key: keys.univKey,
+                // Present ONLY on the re-submit the operator explicitly accepted above.
+                ...(confirmPlanBook ? { confirm_plan_book: true } : {}),
+            }),
+        });
+
+        // The server's `detail` names `date=` and `instance=`, i.e. WHICH plan was painted
+        // into the table -- forward it verbatim instead of paraphrasing.  A 422 carries a
+        // list of field errors, hence the JSON fallback.
+        const refusalDetail = (data, res) => {
+            const detail = data ? data.detail : null;
+            if (detail === undefined || detail === null || detail === "") {
+                return res.statusText ? `${res.status} ${res.statusText}` : `HTTP ${res.status}`;
+            }
+            return typeof detail === "string" ? detail : JSON.stringify(detail);
+        };
+
         try {
             setConsoleStatus("正在保存持仓...", true);
-            const res = await fetch("/api/holdings", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    holdings: holdings,
-                    date: dateVal,
-                    portfolio_value: nav,
-                    cash: getCashInput(),
-                    strategy_key: keys.stratKey,
-                    universe_key: keys.univKey,
-                }),
-            });
-            const data = await res.json();
+
+            // GUARD 1 -- an empty table is never "confirmed all-cash" by accident.  Asked
+            // first and on its own: the server's plan-book gate never licenses an empty
+            // book, and this gate never licenses a plan-shaped one.
+            if (confirmEmptyBookIfNeeded(holdings) === false) {
+                const msg = "已取消保存持仓：持仓表为空且未确认「全部空仓」，未向服务端发送任何请求。";
+                logConsole(`[ABORT] ${msg}`);
+                showToast("已取消：空持仓表需要确认才会按「全部空仓」保存", "error");
+                setConsoleStatus("保存已取消", false);
+                return;
+            }
+
+            let res = await postHoldings(false);
+            let data = await res.json();
+
+            // GUARD 2 -- 409: the submitted book IS this date's plan.  Nothing was written
+            // (the server raises before any write), so nothing may be reported as written.
+            if (!res.ok && res.status === 409) {
+                const detail = refusalDetail(data, res);
+                logConsole(`[REFUSED] 保存被拒绝 (HTTP 409)：提交的持仓与同日计划账本完全一致，未声明已核实；服务端未写入任何持仓。\n${detail}`);
+                if (!confirmPlanBookSave(detail)) {
+                    const msg = "已取消保存：未确认该账簿来自券商实际成交，计划账本不会作为已核实持仓保存（持仓表与计划提示均未改动）。";
+                    logConsole(`[ABORT] ${msg}`);
+                    showToast("已取消：计划账本不会作为已核实持仓保存", "error");
+                    setConsoleStatus("保存已取消", false);
+                    return;
+                }
+                logConsole("[CONFIRMED] 操作员已对照券商核实，以 confirm_plan_book=true 重新提交同一份持仓。");
+                res = await postHoldings(true);
+                data = await res.json();
+            }
+
+            // Any other non-2xx (422 validation, 500, ...) is a failure too: never log
+            // success for a response the server did not acknowledge as a save.
+            if (!res.ok) {
+                const detail = refusalDetail(data, res);
+                logConsole(`[ERROR] 保存持仓失败 (HTTP ${res.status})：服务端未写入任何持仓。\n${detail}`);
+                showToast(`❌ 保存持仓失败: HTTP ${res.status}`, "error");
+                setConsoleStatus("保存失败", false);
+                return;
+            }
+
             logConsole(`[SUCCESS] 持仓配置已成功保存 (${Object.keys(holdings).length} 只持仓标的已持久化)`);
             // The operator has now confirmed the REAL book: the "planned" label no longer
             // describes this table, so drop it rather than leave a misleading banner.

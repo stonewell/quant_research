@@ -4396,6 +4396,22 @@ class ExecutionService:
         #: Surfaced to the UI as `holdings_plan` so the holdings table can be refreshed
         #: with what the book SHOULD be -- never presented as a fill receipt.
         post_holdings: Optional[Dict[str, int]] = None
+        #: (NV10) Outcome of writing the book+sidecar PAIR, mirrored into `summary.json`
+        #: (`post_holdings_written` / `post_holdings_reason`). Defaults describe "no ticket",
+        #: so a round that never produced one is not mistaken for one that lost its book.
+        post_holdings_write: Dict[str, Any] = {
+            "written": False,
+            "book_written": False,
+            "meta_written": False,
+            "complete": False,
+            "reason": "no_ticket",
+            "source": None,
+            "n_symbols": None,
+            "as_of": None,
+            "path": None,
+            "meta_path": None,
+            "error": None,
+        }
         try:
             # (LV2) The ticket may be the pre-LV2 bare list OR the versioned envelope
             # (`{"ticket_schema": ..., "execution_session": ..., "orders": [...]}`), and the
@@ -4421,11 +4437,32 @@ class ExecutionService:
                 for r in ticket_records:
                     if isinstance(r, dict) and is_placeholder_stock_name(r.get("name"), r.get("symbol")):
                         r["name"] = get_stock_name(r.get("symbol"), r.get("symbol"))
-                # Save post_holdings.json for subsequent day carry-over
+                # (NV10) The PAIR, not just the book. This used to write `post_holdings.json`
+                # and NEVER its `post_holdings.meta.json` attestation -- byte-identical to a
+                # pre-D5 legacy round, i.e. a lost sidecar was indistinguishable from an old
+                # archive. `ensure_post_holdings_attestation` leaves an already-attested dir
+                # byte-unchanged (the child's own `source: "replay"` and `generated_at`
+                # survive) and otherwise fills the gap fail-closed.
                 post_holdings = post_holdings_from_ticket(ticket_records)
                 if post_holdings is not None:
-                    self.storage._save_json(os.path.join(run_dir, "post_holdings.json"), post_holdings)
+                    post_holdings_write = self.storage.ensure_post_holdings_attestation(
+                        run_dir,
+                        post_holdings,
+                        as_of=val_date,
+                    )
+                else:
+                    post_holdings_write.update(
+                        written=False,
+                        reason="ticket_without_target_shares",
+                        path=os.path.join(run_dir, "post_holdings.json"),
+                    )
         except Exception as e:
+            post_holdings_write.update(
+                written=False,
+                complete=False,
+                reason="ticket_load_error",
+                error=f"{type(e).__name__}: {e}",
+            )
             print(f"[ExecutionService] Error loading or converting ticket: {e}")
 
         state_data = self.storage._load_json(account_state_file, default=None)
@@ -4459,6 +4496,54 @@ class ExecutionService:
         failure = summarize_execution_failure(
             stderr, returncode=proc.returncode, label="Stage 2 Live Deployment"
         ) if not success else {}
+
+        # (NV10) FAIL CLOSED. A round that shipped a ticket but whose post-trade book could
+        # not be attested is NOT a successful round: the next session would seed from an
+        # un-attested (or worse, partial) book while this one claims SUCCESS. The child now
+        # raises `PostHoldingsAttestationError` for its own failures (that arm already lands
+        # in `failure` above via `returncode != 0`); this arm covers a write that failed HERE,
+        # after the child succeeded -- the case that used to be a bare `print(...)`.
+        if (
+            success
+            and ticket_records
+            and not post_holdings_write.get("written")
+            and post_holdings_write.get("reason") == "post_holdings_write_failed"
+            # No ticket rows with `target_shares` -> the book is UNDERIVABLE, not lost; that
+            # is reported through `post_holdings_written=false` + its reason instead of
+            # failing a round whose orders are already correct (see NV10 in
+            # `docs/development_plan.md`).
+        ):
+            success = False
+            headline = (
+                "票据已出，但交易后账簿 post_holdings.json / post_holdings.meta.json "
+                "未能落盘 —— 本轮不得视为成功（下一轮无法安全地以此为种子）"
+            )
+            hint = (
+                "检查 run_dir 的写权限与磁盘空间后重跑本轮；"
+                "残缺的 sidecar 会保持 complete=false，读取方会拒绝使用该账簿。"
+            )
+            detail = (
+                f"reason={post_holdings_write.get('reason')} "
+                f"error={post_holdings_write.get('error')} "
+                f"run_dir={run_dir}"
+            )
+            # Built from the SAME helper so every key the summary/UI expects
+            # (`error_excerpt` / `error_message` included) is present, then overridden with
+            # this defect's cause instead of a child traceback there is none of.
+            failure = summarize_execution_failure(
+                "", returncode=proc.returncode, label="Stage 2 Live Deployment"
+            )
+            failure.update(
+                error_kind="PostHoldingsAttestationError",
+                error_headline=headline,
+                error_hint=hint,
+                error_detail=detail,
+                error_excerpt=detail,
+                error_message=(
+                    f"Stage 2 Live Deployment 未完成（票据已出但交易后账簿未落盘）：{headline}"
+                    f"\n原因原文：{detail}\n处理建议：{hint}"
+                ),
+            )
 
         # Update summary.json
         summary = self.storage._load_json(summary_file, default={})
@@ -4528,6 +4613,20 @@ class ExecutionService:
             # Advisory (never blocking by default): the INPUT book vs the previous round's
             # PLANNED post-ticket book, so a stale-table deploy stays reconstructable.
             "holdings_input_check": holdings_input_check,
+            # (NV10) Did THIS round end with an attested post-trade book? Additive key: its
+            # ABSENCE is how a pre-D5 legacy round is told apart from a current round that
+            # lost its book -- the two are otherwise byte-identical on disk (book present, no
+            # sidecar). `post_holdings_reason` is one of storage.POST_HOLDINGS_REASON_*:
+            #   post_holdings_meta_complete / post_holdings_meta_already_complete / ...
+            #   post_holdings_write_failed      -> the round is FAILED (fail-closed)
+            #   ticket_without_target_shares    -> UNDERIVABLE, not lost (flag says so)
+            #   no_ticket                       -> nothing to attest
+            # `post_holdings_meta_source` names the producer of the sidecar that ended up on
+            # disk (`ticket` / `replay` / `backfill_from_ticket`), so a backfilled legacy
+            # round can never masquerade as a fresh live attestation.
+            "post_holdings_written": bool(post_holdings_write.get("written")),
+            "post_holdings_reason": post_holdings_write.get("reason"),
+            "post_holdings_meta_source": post_holdings_write.get("source"),
         }
         summary.update(round_fields)
         owned_keys = set(round_fields)

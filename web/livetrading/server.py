@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import Field
 from starlette.concurrency import run_in_threadpool
 
 try:
@@ -26,7 +27,7 @@ try:
         RunResponse,
         SettingsModel,
     )
-    from .storage import StorageManager
+    from .storage import StorageManager, UnconfirmedPlanBookSaveError
 except (ImportError, ValueError):
     from execution_service import ExecutionService, normalize_intraday_publish_after
     from models import (
@@ -40,7 +41,7 @@ except (ImportError, ValueError):
         RunResponse,
         SettingsModel,
     )
-    from storage import StorageManager
+    from storage import StorageManager, UnconfirmedPlanBookSaveError
 
 
 #: (D8, 2026-11-11) Version-metadata fields an `account_state.json` carries. They are
@@ -56,6 +57,28 @@ ACCOUNT_STATE_VERSION_STAMP_FIELDS = (
     "strategy_version",
     "strategy_version_info",
 )
+
+
+class HoldingsSaveRequest(HoldingsUpdateModel):
+    """`POST /api/holdings` payload: the shared book shape plus its ONE route-local flag.
+
+    (SSOT item 10, 2026-11-16) The save button persists whatever the holdings table
+    contains.  After a successful Stage 2 that table is repainted from the ticket's
+    PROJECTED post-trade book, so an unconfirmed click used to turn the plan into
+    `operator_holdings.json` -- a "human-verified" book that outranks the plan on both the
+    display and the deploy-seed path.  `confirm_plan_book=true` is the caller's explicit
+    statement that the fills genuinely matched the plan exactly, and is the ONLY way to
+    save a plan-shaped book.  Declared next to the route that enforces it (rather than
+    widening the shared `HoldingsUpdateModel`) so the flag and its refusal cannot drift.
+    """
+
+    confirm_plan_book: bool = Field(
+        False,
+        description=(
+            "确认提交的持仓确实与同日计划账本逐股一致（成交完全按计划执行时）——"
+            "未标记且提交簿等于同日最新实例的计划账本时返回 409"
+        ),
+    )
 
 
 def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
@@ -154,13 +177,22 @@ def create_app(storage: Optional[StorageManager] = None) -> FastAPI:
         return storage.get_holdings(date_str, strategy_key=strategy_key, universe_key=universe_key)
 
     @app.post("/api/holdings", summary="Save current holdings")
-    async def save_holdings(payload: HoldingsUpdateModel) -> Dict[str, Any]:
-        storage.save_holdings(
-            payload.holdings,
-            date_str=payload.date,
-            strategy_key=payload.strategy_key,
-            universe_key=payload.universe_key,
-        )
+    async def save_holdings(payload: HoldingsSaveRequest) -> Dict[str, Any]:
+        # (SSOT item 10, 2026-11-16) A 409 here means "the table you are saving IS this
+        # date's plan, not a book": the plan is a projection from the ticket, never a fill
+        # receipt, and persisting it writes `operator_holdings.json` -- the file every later
+        # round reads as "a human verified this".  `storage.save_holdings` raises BEFORE any
+        # write, so a refusal leaves the archive byte-identical.
+        try:
+            storage.save_holdings(
+                payload.holdings,
+                date_str=payload.date,
+                strategy_key=payload.strategy_key,
+                universe_key=payload.universe_key,
+                confirm_plan_book=payload.confirm_plan_book,
+            )
+        except UnconfirmedPlanBookSaveError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
         return {"status": "success", "message": "Holdings saved successfully", "holdings": payload.holdings}
 
     # --------------------------------------------------------------------------

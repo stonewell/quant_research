@@ -523,6 +523,484 @@ def post_holdings_from_ticket(ticket: Any) -> Optional[Dict[str, int]]:
 
 
 # --------------------------------------------------------------------------- #
+# (NV10) The WRITE side of the D5 pair: book + attestation, fail-closed
+# --------------------------------------------------------------------------- #
+# FORENSIC CONTEXT (measured 2026-11-16, `check_live_run_integrity.py` on the real archive)
+# --------------------------------------------------------------------------------------
+# Ten rounds (2026-10-29/215823 .. 2026-11-10/202644) carry `post_holdings.json` but NO
+# `post_holdings.meta.json`, while every round from 2026-11-11/234433 onward carries
+# `complete: true`.  ALL TEN PREDATE the sidecar feature (commit d0e8c93, 2026-11-11
+# 23:43 -0800): the runner at 2026-11-11/205137 (20:51, before the commit) wrote no
+# sidecar and got one only from an ad-hoc `source="repair_backfill"` patch at 23:31, while
+# 2026-11-11/234433 (23:46, after the commit) wrote `source="replay"` itself.  So the ten
+# findings are LEGACY rounds, not live losses -- see `docs/development_plan.md` NV10.
+#
+# The hole that DID still exist at write time is here, in the producer:
+#   * `ExecutionService.run_live_deploy` rewrote `post_holdings.json` from the ticket and
+#     NEVER wrote the sidecar, so any round whose book came from that re-derivation was
+#     byte-identical to a pre-D5 legacy round (book present, no attestation);
+#   * both producers swallowed a failed write behind `print("[WARN] ...")`, so a round with
+#     a lost book was still reported `deploy_status=SUCCESS`.
+# The helpers below close both: one function owns the pair, the attestation is written
+# LAST (a crash leaves `complete: false`, never a "legacy but usable" dir), and every
+# failure is returned as data so the caller can fail the round closed instead of warning.
+POST_HOLDINGS_REASON_ALREADY = "post_holdings_meta_already_complete"
+POST_HOLDINGS_REASON_WRITE_FAILED = "post_holdings_write_failed"
+POST_HOLDINGS_REASON_NOT_DERIVABLE = "ticket_without_target_shares"
+POST_HOLDINGS_REASON_NO_TICKET = "no_ticket"
+POST_HOLDINGS_REASON_NO_BOOK = "post_holdings_missing"
+POST_HOLDINGS_REASON_NO_RUN_DIR = "run_dir_missing"
+POST_HOLDINGS_REASON_DIFFERS = "book_differs_from_ticket"
+POST_HOLDINGS_REASON_META_INCOMPLETE = "post_holdings_meta_incomplete"
+POST_HOLDINGS_REASON_TICKET_VOIDED = "ticket_voided"
+POST_HOLDINGS_REASON_AS_OF_UNKNOWN = "as_of_unknown"
+
+#: `post_holdings.meta.json::source` values this module can produce.
+POST_HOLDINGS_SOURCE_TICKET = "ticket"
+POST_HOLDINGS_SOURCE_BACKFILL = "backfill_from_ticket"
+
+
+def _positive_share_count(book: Any) -> int:
+    """How many symbols the book holds with a POSITIVE share count (never raises)."""
+    if not isinstance(book, dict):
+        return 0
+    count = 0
+    for value in book.values():
+        try:
+            if int(float(value)) > 0:
+                count += 1
+        except (TypeError, ValueError):
+            continue
+    return count
+
+
+def _atomic_write_json(path: str, payload: Any) -> None:
+    """Serialise to `<path>.tmp` then `os.replace` it, so a crash never leaves half JSON.
+
+    Same pattern as `scripts/run_live_strategy.py::_write_effective_params` and
+    `scripts/repair_live_run_snapshots.write_bytes_atomic`: a reader can only ever observe
+    the previous bytes or the complete new payload -- which is what makes the
+    "attestation last" ordering below meaningful.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    tmp_path = f"{path}.tmp-{os.getpid()}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, ensure_ascii=False, default=str)
+            fh.flush()
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def build_post_holdings_meta(
+    *,
+    as_of: Any,
+    complete: bool,
+    n_symbols: int,
+    source: str,
+    note: Optional[str] = None,
+) -> Dict[str, Any]:
+    """The sidecar payload, in ONE place (schema pinned by `test_post_holdings_meta_semantics`)."""
+    payload: Dict[str, Any] = {
+        "as_of": str(as_of) if as_of is not None else None,
+        "complete": bool(complete),
+        "n_symbols": int(n_symbols),
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "source": source,
+    }
+    if note:
+        payload["note"] = note
+    return payload
+
+
+def read_post_holdings_status(run_dir: Optional[str]) -> Dict[str, Any]:
+    """Read-only status of one run dir's book+sidecar pair (no logging, never raises).
+
+    Extends :func:`classify_post_holdings_meta` with the file-level facts a writer needs
+    (`file_exists` / `meta_present` / the parsed book) so the write path and the backfill
+    planner judge a directory through the SAME rule a reader does.
+    """
+    result: Dict[str, Any] = {
+        "run_dir": run_dir,
+        "file_exists": False,
+        "meta_present": False,
+        "book": None,
+        "path": None,
+        "meta_path": None,
+    }
+    if not run_dir or not os.path.isdir(run_dir):
+        result.update(classify_post_holdings_meta(None, file_exists=False))
+        result["available"] = False
+        return result
+    post_path = os.path.join(run_dir, POST_HOLDINGS_FILENAME)
+    meta_path = os.path.join(run_dir, POST_HOLDINGS_META_FILENAME)
+    file_exists = os.path.exists(post_path)
+    meta_present = os.path.exists(meta_path)
+    meta: Any = None
+    if meta_present:
+        try:
+            with open(meta_path, "r", encoding="utf-8") as fh:
+                meta = json.load(fh)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            meta = None
+    book: Any = None
+    if file_exists:
+        try:
+            with open(post_path, "r", encoding="utf-8") as fh:
+                book = json.load(fh)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            book = None
+    result.update(classify_post_holdings_meta(meta, file_exists=file_exists))
+    result.update(
+        file_exists=file_exists,
+        meta_present=meta_present,
+        book=book if isinstance(book, dict) else None,
+        path=post_path,
+        meta_path=meta_path,
+    )
+    return result
+
+
+def write_post_holdings_attestation(
+    run_dir: str,
+    book: Optional[Dict[str, int]],
+    *,
+    as_of: Any,
+    source: str = POST_HOLDINGS_SOURCE_TICKET,
+    note: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Write `post_holdings.json` + `post_holdings.meta.json` as a PAIR; return the outcome.
+
+    ORDER IS THE CONTRACT (fail-closed): the sidecar is first written with
+    `complete: false`, only then the book, and `complete: true` is written LAST.  A crash
+    or a failing rename therefore leaves a dir that `classify_post_holdings_meta` reports
+    `post_holdings_meta_incomplete` -- i.e. UNUSABLE -- instead of the pre-D5 shape
+    ("book present, no sidecar") that every legacy reader silently trusts.
+
+    Never raises: a write failure is returned as `{"written": False, "reason":
+    "post_holdings_write_failed", "error": ...}` so the CALLER (not this helper) decides to
+    fail the round closed.  `book=None` means "the ticket cannot express a book" and is
+    reported as `ticket_without_target_shares` -- it is NOT an empty book.
+    """
+    outcome: Dict[str, Any] = {
+        "written": False,
+        "book_written": False,
+        "meta_written": False,
+        "complete": False,
+        "reason": POST_HOLDINGS_REASON_WRITE_FAILED,
+        "source": source,
+        "n_symbols": 0,
+        "as_of": str(as_of) if as_of is not None else None,
+        "path": None,
+        "meta_path": None,
+        "error": None,
+    }
+    if not run_dir:
+        outcome["reason"] = POST_HOLDINGS_REASON_NO_RUN_DIR
+        return outcome
+    if book is None:
+        outcome["reason"] = POST_HOLDINGS_REASON_NOT_DERIVABLE
+        return outcome
+    if not isinstance(book, dict):
+        outcome["reason"] = POST_HOLDINGS_REASON_NOT_DERIVABLE
+        return outcome
+
+    post_path = os.path.join(run_dir, POST_HOLDINGS_FILENAME)
+    meta_path = os.path.join(run_dir, POST_HOLDINGS_META_FILENAME)
+    n_symbols = _positive_share_count(book)
+    outcome.update(path=post_path, meta_path=meta_path, n_symbols=n_symbols)
+    try:
+        _atomic_write_json(
+            meta_path,
+            build_post_holdings_meta(
+                as_of=as_of,
+                complete=False,
+                n_symbols=0,
+                source=source,
+                note="pending: the book below is being written (a crash here must read as INCOMPLETE, never as a legacy-but-usable book)",
+            ),
+        )
+        outcome["meta_written"] = True
+        _atomic_write_json(post_path, book)
+        outcome["book_written"] = True
+        _atomic_write_json(
+            meta_path,
+            build_post_holdings_meta(
+                as_of=as_of,
+                complete=True,
+                n_symbols=n_symbols,
+                source=source,
+                note=note,
+            ),
+        )
+    except OSError as exc:
+        # The `complete: false` sidecar (if it landed) keeps the dir unusable on purpose.
+        outcome.update(
+            written=False,
+            complete=False,
+            reason=POST_HOLDINGS_REASON_WRITE_FAILED,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return outcome
+    outcome.update(
+        written=True,
+        complete=True,
+        reason=POST_HOLDINGS_REASON_OK,
+    )
+    return outcome
+
+
+def ensure_post_holdings_attestation(
+    run_dir: str,
+    book: Optional[Dict[str, int]],
+    *,
+    as_of: Any,
+    source: str = POST_HOLDINGS_SOURCE_TICKET,
+    note: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Idempotent variant: an ALREADY attested dir is left byte-unchanged.
+
+    Used by the deploy path after the child has run: the child's own pair (which may say
+    `source: "replay"` and carries ITS `generated_at`) wins, and this only fills a gap --
+    a missing book, or a book without a usable sidecar.  `written=True, reason=
+    "post_holdings_meta_already_complete"` reports the no-op explicitly so a caller can log
+    it instead of mistaking silence for success.
+    """
+    status = read_post_holdings_status(run_dir)
+    if status.get("available") and status.get("complete") is True and status.get("file_exists"):
+        return {
+            "written": True,
+            "book_written": False,
+            "meta_written": False,
+            "complete": True,
+            "reason": POST_HOLDINGS_REASON_ALREADY,
+            "source": status.get("source"),
+            "n_symbols": status.get("n_symbols"),
+            "as_of": status.get("as_of"),
+            "path": status.get("path"),
+            "meta_path": status.get("meta_path"),
+            "error": None,
+        }
+    return write_post_holdings_attestation(
+        run_dir, book, as_of=as_of, source=source, note=note
+    )
+
+
+def _load_ticket_from_run_dir(run_dir: str, names: Tuple[str, ...] = ("live_trading_ticket",)) -> Any:
+    """First parseable ticket in `run_dir` (`<name>.json`, else `<name>.csv`); else None."""
+    for name in names:
+        json_path = os.path.join(run_dir, f"{name}.json")
+        if os.path.exists(json_path):
+            try:
+                with open(json_path, "r", encoding="utf-8") as fh:
+                    return json.load(fh)
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                return None
+        csv_path = os.path.join(run_dir, f"{name}.csv")
+        if os.path.exists(csv_path):
+            try:
+                return parse_ticket_csv(csv_path)
+            except Exception:  # noqa: BLE001 - a broken CSV is "no ticket", not a crash
+                return None
+    return None
+
+
+def _same_book(left: Optional[Dict[str, Any]], right: Optional[Dict[str, Any]]) -> bool:
+    """Exact per-symbol share equality (casing-normalized); `None` never equals a book."""
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    if set(left) != set(right):
+        return False
+    for sym, value in left.items():
+        try:
+            if int(float(value)) != int(float(right[sym])):
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
+def plan_post_holdings_meta_backfill(
+    run_dir: Optional[str],
+    *,
+    as_of: Optional[str] = None,
+    ticket_names: Tuple[str, ...] = ("live_trading_ticket",),
+) -> Dict[str, Any]:
+    """Decide (never write) whether one LEGACY round's sidecar can be reconstructed losslessly.
+
+    "Losslessly" is deliberately narrow, because the alternative is inventing a book:
+
+    * the round must have a `post_holdings.json` (this tool never creates one -- a missing
+      book is a missing book, not something to derive and call fact);
+    * the ticket must carry `target_shares` (`post_holdings_from_ticket` -> None otherwise),
+      must not be VOIDED (`<name>.voided.json` next to it), and its derivation must match
+      the on-disk book EXACTLY -- any difference is ambiguity, so it is refused and
+      reported rather than resolved by preference;
+    * an existing sidecar is never touched: `complete: true` is a no-op, anything else is
+      refused (that is a writer defect to investigate, not a hole to paper over).
+
+    Returns `{"action": "write_sidecar"|"skip"|"refuse", "reason", "book", "as_of",
+    "ticket_source", "meta_payload", "run_dir"}`.  Pure I/O reads; no writes.
+    """
+    plan: Dict[str, Any] = {
+        "run_dir": run_dir,
+        "action": "refuse",
+        "reason": POST_HOLDINGS_REASON_NO_RUN_DIR,
+        "book": None,
+        "as_of": as_of,
+        "ticket_source": None,
+        "meta_payload": None,
+    }
+    if not run_dir or not os.path.isdir(run_dir):
+        return plan
+
+    status = read_post_holdings_status(run_dir)
+    if not status.get("file_exists"):
+        plan["reason"] = POST_HOLDINGS_REASON_NO_BOOK
+        return plan
+    if status.get("meta_present"):
+        if status.get("complete") is True:
+            plan.update(action="skip", reason=POST_HOLDINGS_REASON_ALREADY)
+        else:
+            plan["reason"] = POST_HOLDINGS_REASON_META_INCOMPLETE
+        return plan
+
+    for name in ticket_names:
+        if os.path.exists(os.path.join(run_dir, f"{name}.voided.json")):
+            plan["reason"] = POST_HOLDINGS_REASON_TICKET_VOIDED
+            return plan
+
+    ticket = _load_ticket_from_run_dir(run_dir, ticket_names)
+    if ticket is None:
+        plan["reason"] = POST_HOLDINGS_REASON_NO_TICKET
+        return plan
+    plan["ticket_source"] = (
+        "live_trading_ticket.json"
+        if os.path.exists(os.path.join(run_dir, f"{ticket_names[0]}.json"))
+        else f"{ticket_names[0]}.csv"
+    )
+
+    derived = post_holdings_from_ticket(ticket)
+    if derived is None:
+        plan["reason"] = POST_HOLDINGS_REASON_NOT_DERIVABLE
+        return plan
+    existing = status.get("book")
+    if not _same_book(existing, derived):
+        plan["reason"] = POST_HOLDINGS_REASON_DIFFERS
+        plan["book"] = existing
+        return plan
+
+    resolved_as_of = ticket.get("as_of") if isinstance(ticket, dict) else None
+    resolved_as_of = resolved_as_of or as_of
+    if not resolved_as_of:
+        resolved_as_of = _date_from_run_dir(run_dir)
+    if not resolved_as_of:
+        plan["reason"] = POST_HOLDINGS_REASON_AS_OF_UNKNOWN
+        return plan
+
+    plan.update(
+        action="write_sidecar",
+        reason=POST_HOLDINGS_REASON_OK,
+        book=existing,
+        as_of=str(resolved_as_of),
+        meta_payload=build_post_holdings_meta(
+            as_of=resolved_as_of,
+            complete=True,
+            n_symbols=_positive_share_count(existing),
+            source=POST_HOLDINGS_SOURCE_BACKFILL,
+            note=(
+                "legacy round: the book was written before the D5 sidecar existed and is "
+                "reconstructed here from the SAME round's ticket target_shares (exact match, "
+                "no shares invented, post_holdings.json untouched)"
+            ),
+        ),
+    )
+    return plan
+
+
+def _date_from_run_dir(run_dir: str) -> Optional[str]:
+    """`<...>/<YYYY-MM-DD>/<HHMMSS>` -> the date component; else the dir's own date name."""
+    for candidate in (os.path.basename(os.path.dirname(os.path.abspath(run_dir))),
+                      os.path.basename(os.path.abspath(run_dir))):
+        if _DATE_RE.match(candidate or ""):
+            return candidate
+    return None
+
+
+def apply_post_holdings_meta_backfill(
+    plan: Dict[str, Any],
+    *,
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """Apply (or, with `dry_run`, merely report) one backfill plan.
+
+    The write is `<meta_path>` ONLY, created with `O_EXCL` so an existing sidecar can never
+    be overwritten even if one appeared between planning and applying.  A non-`write_sidecar`
+    plan is reported and left alone -- there is no "force" mode.
+    """
+    outcome: Dict[str, Any] = {
+        "run_dir": (plan or {}).get("run_dir"),
+        "action": (plan or {}).get("action", "refuse"),
+        "reason": (plan or {}).get("reason"),
+        "applied": False,
+        "would_write": False,
+        "meta_path": None,
+        "payload": (plan or {}).get("meta_payload"),
+        "error": None,
+    }
+    if not plan or plan.get("action") != "write_sidecar":
+        return outcome
+    meta_path = os.path.join(plan["run_dir"], POST_HOLDINGS_META_FILENAME)
+    outcome["meta_path"] = meta_path
+    outcome["would_write"] = True
+    if dry_run:
+        return outcome
+
+    payload = plan.get("meta_payload")
+    if not isinstance(payload, dict):
+        outcome.update(reason=POST_HOLDINGS_REASON_WRITE_FAILED, error="no meta_payload in plan")
+        return outcome
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(meta_path)), exist_ok=True)
+        # O_EXCL: never overwrite an existing sidecar, even a file created a moment ago.
+        handle = os.open(meta_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2, ensure_ascii=False, default=str)
+                fh.write("\n")
+                fh.flush()
+        except BaseException:
+            try:
+                os.unlink(meta_path)
+            except OSError:
+                pass
+            raise
+    except FileExistsError:
+        outcome.update(
+            applied=False,
+            would_write=True,
+            reason=POST_HOLDINGS_REASON_ALREADY,
+            error="an existing sidecar appeared before the write; left untouched",
+        )
+        return outcome
+    except OSError as exc:
+        outcome.update(
+            applied=False,
+            reason=POST_HOLDINGS_REASON_WRITE_FAILED,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return outcome
+    outcome.update(applied=True, reason=POST_HOLDINGS_REASON_OK)
+    return outcome
+
+
+# --------------------------------------------------------------------------- #
 # Holdings-input reconciliation (advisory; never assumes a fill)
 # --------------------------------------------------------------------------- #
 # FORENSIC CONTEXT (defect this exists to catch, 2026-10-27):
@@ -564,6 +1042,117 @@ class LiveSeedBookMissingError(RuntimeError):
     `holdings.json`) or stop.  Raised by the deploy path when
     `resolve_seed_holdings()` returns `(None, "none")`.
     """
+
+
+# --------------------------------------------------------------------------- #
+# (SSOT item 10, 2026-11-16) The MANUAL save must not persist the PLAN as a book
+# --------------------------------------------------------------------------- #
+# FORENSIC CONTEXT (witnessed in production, 2026-11-16):
+#   After a successful Stage 2 the UI repaints the holdings table from the ticket's
+#   PROJECTED post-trade book (`post_holdings.json` via `RunResponse.holdings_plan`) and
+#   shows a notice that this is a PLAN, not a fill receipt.  For 2026-11-16 that plan is
+#   `600660.SH 300 / 601919.SH 900 / 601728.SH 2300 / 600900.SH 500` -- two symbols the
+#   account never owned.
+#   `POST /api/holdings` (the 「💾 保存持仓」 button) then persists whatever the table
+#   contains into `operator_holdings.json` with `source: operator_manual_correction`, i.e.
+#   a book that means "a human asserted this against broker fills".  It had NO guard, while
+#   the DEPLOY path already refuses this shape (`execution_service.UnconfirmedPlanAsInputError`,
+#   see README_ZH §3/§6).  The save button was therefore the bypass: one click converted a
+#   plan into a verified book, and (because `operator_holdings.json` outranks the plan on
+#   both the display and the seed path) every later round sized against a fiction.
+#
+#   DECISION: the manual-arm save refuses a NON-EMPTY book that equals the date's LATEST
+#   recorded plan, unless the caller passes `confirm_plan_book=true`.  The gate is
+#   deliberately shaped like the deploy-side one -- cash proxies filtered, share-for-share
+#   equality, empty books NOT its business -- so the two cannot drift apart.
+#: The per-request field that licenses saving a book identical to this date's plan.  The
+#: operator sets it only after checking that the fills really did match the plan exactly.
+PLAN_BOOK_CONFIRM_FIELD = "confirm_plan_book"
+
+
+class UnconfirmedPlanBookSaveError(RuntimeError):
+    """Refusal (HTTP 409): a manual save re-submitted this date's PLAN as a verified book.
+
+    Same shape and naming as `execution_service.UnconfirmedPlanAsInputError` (a
+    `LiveSeedBookMissingError`): one message builder, one meaning, and the refusal carries
+    the `date` / instance that matched so the operator can see WHICH plan was painted into
+    the table.  Unlike the deploy-side gate this one guards a WRITE of
+    `operator_holdings.json`, so it is raised before any directory is created -- a refused
+    save must leave the archive byte-identical.
+
+    The two gates are INDEPENDENT: an empty book is `EmptyBookConfirmationRequiredError`'s
+    business (deploy side, `confirm_empty_book`), never this one, and this one never
+    licenses an empty book.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        date_str: Optional[str] = None,
+        plan_run_dir: Optional[str] = None,
+    ) -> None:
+        super().__init__(message)
+        #: The date whose plan matched (`YYYY-MM-DD`).
+        self.date_str = date_str
+        #: The run dir of the instance whose `post_holdings.json` matched.
+        self.plan_run_dir = plan_run_dir
+
+
+def _plan_shape_shares(book: Any) -> Dict[str, int]:
+    """`symbol -> integer shares`, the book shape a PLAN can be compared in.
+
+    Mirrors `execution_service._shares_book`'s coercion on purpose (the payload is
+    polymorphic: JSON numbers, numeric strings, `{shares: n}` row dicts): symbols are
+    upper-cased, zero rows and unparsable/weight-only rows are DROPPED, so `{"A": 100,
+    "B": 0}` and `{"A": 100}` are the SAME book -- a deleted line left at 0 shares is not a
+    position.  A row whose count truncates to 0 is dropped too, which is what keeps a
+    weight-mode book (0.05) from masquerading as a 0-share plan.
+
+    Cash proxies (`BIL` / `CASH*`) are filtered exactly as the deploy-side plan gate filters
+    them: they are the cash leg, never part of `post_holdings.json`, and leaving them in
+    would let a plan-shaped table pass merely by adding one parked-cash row.
+    """
+    out: Dict[str, int] = {}
+    if not isinstance(book, dict):
+        return out
+    for raw_symbol, raw_value in book.items():
+        symbol = str(raw_symbol or "").strip().upper()
+        if not symbol or is_cash_symbol(symbol):
+            continue
+        if isinstance(raw_value, dict):
+            raw_value = raw_value.get("shares", raw_value.get("share", raw_value.get("quantity")))
+        try:
+            shares = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if shares != shares or shares in (float("inf"), float("-inf")):
+            continue
+        count = int(shares)
+        if count == 0:
+            continue
+        out[symbol] = count
+    return out
+
+
+def plan_book_save_unconfirmed_message(
+    date_str: Optional[str],
+    plan_run_dir: Optional[str] = None,
+) -> str:
+    """Bilingual refusal text for a manual save identical to the date's plan book."""
+    instance = os.path.basename(os.path.normpath(plan_run_dir)) if plan_run_dir else None
+    scope = f"date={date_str!r} instance={instance!r} plan={plan_run_dir!r}"
+    return (
+        "提交的持仓与同日计划盘后账本完全一致，且未声明已核实；已拒绝保存。"
+        "计划账本（post_holdings.json）只是“若每一张工单都按其指令成交”的推演，"
+        "不是成交回执；把它保存为 operator_holdings.json 会在此后每一轮被当作"
+        "“人已核实的账本”。请对照券商实际成交修正持仓表后重试；若成交确实与该计划"
+        f"逐股完全一致，请以 {PLAN_BOOK_CONFIRM_FIELD}=true 重新提交。"
+        "A book identical to the same date's plan is never saved as a verified book: the "
+        "plan is not a fill receipt. Correct the table against the broker, or re-submit "
+        f"with {PLAN_BOOK_CONFIRM_FIELD}=true if the fills genuinely match the plan exactly."
+        f" 范围/scope: {scope}。"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -2418,6 +3007,28 @@ class StorageManager:
             )
         return result
 
+    def ensure_post_holdings_attestation(
+        self,
+        run_dir: Optional[str],
+        book: Optional[Dict[str, int]],
+        *,
+        as_of: Any = None,
+        source: str = POST_HOLDINGS_SOURCE_TICKET,
+        note: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """(NV10) Make sure a run dir ends with BOTH the book and its `complete: true` sidecar.
+
+        The deploy path calls this after the child has run: a child that already attested
+        its own pair is left byte-unchanged (`reason=post_holdings_meta_already_complete`,
+        so `source: "replay"` and the child's own `generated_at` survive), while a dir that
+        only has the book -- the shape a pre-D5 round and a crashed/lost-sidecar round share
+        -- gets the missing sidecar.  Module-level twin of this method (same rule, same
+        messages) so the standalone backfill CLI cannot drift from the writer.
+        """
+        return ensure_post_holdings_attestation(
+            run_dir, book, as_of=as_of, source=source, note=note
+        )
+
     def _planned_book_from_run_dir(
         self,
         run_dir: Optional[str],
@@ -2711,6 +3322,147 @@ class StorageManager:
 
         return None, "none"
 
+    def _plan_book_date_dirs(
+        self,
+        target_date: str,
+        strategy_key: Optional[str] = None,
+        universe_key: Optional[str] = None,
+    ) -> List[str]:
+        """Dated directories that may carry `target_date`'s plan book.
+
+        Scoped callers (`strategy_key` + `universe_key`, what the web UI always sends) get
+        exactly their session's dated directory -- another strategy's plan must never be
+        used as the reference.  A selection-less caller (legacy flat layout / a bare
+        `{"date": ...}` body) gets the flat `<archive>/<date>` directory plus every
+        `<archive>/<strategy>/<universe>/<date>` that exists, so omitting the keys cannot be
+        used to dodge the guard.
+        """
+        base_dir = self.find_existing_run_base_dir(strategy_key, universe_key, target_date)
+        if base_dir:
+            return [base_dir]
+        if strategy_key and universe_key:
+            return []
+        if not os.path.isdir(self.archive_dir):
+            return []
+        candidates: List[str] = []
+        flat = os.path.join(self.archive_dir, target_date)
+        if is_run_dir(flat):
+            candidates.append(flat)
+        try:
+            strategy_entries = sorted(os.listdir(self.archive_dir))
+        except OSError:
+            return candidates
+        for s_entry in strategy_entries:
+            s_path = os.path.join(self.archive_dir, s_entry)
+            if s_entry == target_date or not os.path.isdir(s_path):
+                continue
+            try:
+                universe_entries = sorted(os.listdir(s_path))
+            except OSError:
+                continue
+            for u_entry in universe_entries:
+                cand = os.path.join(s_path, u_entry, target_date)
+                if os.path.isdir(cand) and cand not in candidates:
+                    candidates.append(cand)
+        return candidates
+
+    def plan_books_for_date(
+        self,
+        date_str: Optional[str] = None,
+        strategy_key: Optional[str] = None,
+        universe_key: Optional[str] = None,
+    ) -> List[Tuple[Dict[str, Any], str]]:
+        """One plan book per dated directory, each with the run dir it came from.
+
+        SELECTION RULE: newest run instance first (`list_instances_for_date` reversed, i.e.
+        the same ordering every reader uses -- the instance's own `summary.json` timestamp
+        with the `HHMMSS` name as fallback/tiebreak, never mtime).  If that instance has no
+        `post_holdings.json`, the walk continues to the newest instance that HAS one; a
+        superseded instance is therefore only ever consulted when no newer instance carries
+        a plan at all.  The flat `<date>/` directory is the session's FIRST instance by the
+        layout contract, so it is walked last.
+
+        A scoped (strategy + universe) call yields at most ONE candidate -- another
+        strategy's plan is never a reference.  A selection-less call yields the flat legacy
+        directory plus every `<strategy>/<universe>/<date>` that exists, so omitting the
+        keys can neither dodge the guard nor silently pick one selection's plan over
+        another's.
+
+        File existence decides, not the D5 attestation verdict: the question here is "does
+        this round's plan record say the same thing the table says?", and a half-written
+        `post_holdings.json` is a writer defect to investigate, never a licence to bless a
+        plan-shaped book.  A non-dict payload is treated as "no plan in this instance".
+
+        (`2026-11-16/supersession.json` is NOT consulted -- same-date instances are ordered
+        by their own declared write time, which is what that file would restate.)
+        """
+        target_date = validate_date_str(date_str)
+        if not target_date:
+            return []
+        candidates: List[Tuple[Dict[str, Any], str]] = []
+        for date_dir in self._plan_book_date_dirs(target_date, strategy_key, universe_key):
+            for instance_dir in reversed(list_instances_for_date(date_dir)):
+                status = read_post_holdings_status(instance_dir)
+                if status.get("file_exists") and isinstance(status.get("book"), dict):
+                    candidates.append((status["book"], instance_dir))
+                    break
+        return candidates
+
+    def plan_book_for_date(
+        self,
+        date_str: Optional[str] = None,
+        strategy_key: Optional[str] = None,
+        universe_key: Optional[str] = None,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """`(book, run_dir)` of the date's LATEST plan book, or `(None, None)`.
+
+        Single-answer view of :meth:`plan_books_for_date` (same selection rule); the save
+        guard iterates the full candidate list so a selection-less caller cannot slip past
+        by matching a plan other than the first one scanned.
+        """
+        candidates = self.plan_books_for_date(date_str, strategy_key, universe_key)
+        return candidates[0] if candidates else (None, None)
+
+    def assert_not_plan_book_save(
+        self,
+        holdings: Dict[str, Any],
+        date_str: Optional[str] = None,
+        strategy_key: Optional[str] = None,
+        universe_key: Optional[str] = None,
+    ) -> None:
+        """Refuse a MANUAL save that re-persists this date's plan as a verified book.
+
+        Raises :class:`UnconfirmedPlanBookSaveError` when ALL of these hold:
+          * the submitted book carries at least one non-zero share position;
+          * it equals, order-insensitively and share-for-share, the date's latest plan book
+            (`plan_books_for_date`);
+          * the caller did not pass `confirm_plan_book=true`.
+
+        An EMPTY / all-zero / weight-only book returns immediately: that shape is
+        `EmptyBookConfirmationRequiredError`'s business on the deploy path, and the two
+        gates are independent (see the module-level note above the error class).
+        """
+        submitted = _plan_shape_shares(holdings)
+        if not submitted:
+            return
+        for plan, plan_run_dir in self.plan_books_for_date(date_str, strategy_key, universe_key):
+            if submitted != _plan_shape_shares(plan):
+                continue
+            logging.warning(
+                "[plan-book-save] 提交的持仓与同日计划账本完全一致且未声明 %s=true，已拒绝保存: "
+                "date=%s strategy=%s universe=%s plan_dir=%s",
+                PLAN_BOOK_CONFIRM_FIELD,
+                date_str,
+                strategy_key,
+                universe_key,
+                plan_run_dir,
+            )
+            raise UnconfirmedPlanBookSaveError(
+                plan_book_save_unconfirmed_message(date_str, plan_run_dir=plan_run_dir),
+                date_str=date_str,
+                plan_run_dir=plan_run_dir,
+            )
+
     def save_holdings(
         self,
         holdings: Dict[str, Any],
@@ -2718,6 +3470,7 @@ class StorageManager:
         strategy_key: Optional[str] = None,
         universe_key: Optional[str] = None,
         run_dir: Optional[str] = None,
+        confirm_plan_book: bool = False,
     ) -> None:
         """Persist the operator's holdings input into the day's archive snapshot.
 
@@ -2738,8 +3491,19 @@ class StorageManager:
         dir) and therefore NEVER writes it: marking an automated pre-trade seed as a human
         assertion would display/size that seed as the true book -- the 2026-10-29 ghost-lot
         defect all over again.  `run_dir=None` is exactly "an operator typed this in".
+
+        (SSOT item 10, 2026-11-16) The MANUAL arm additionally refuses a non-empty book
+        identical to this date's LATEST plan (`post_holdings.json`) unless
+        `confirm_plan_book=True`: the UI paints the plan, so one click on 「保存持仓」
+        otherwise turned the projection into `operator_holdings.json` -- a book that
+        outranks the plan on both the display and the seed path.  The guard runs BEFORE
+        `os.makedirs`, so a refused save leaves no trace, and it never runs for a
+        deploy-path save (`run_dir` pinned): that arm is already guarded by `edited` in
+        `execution_service`.
         """
         date_str = validate_date_str(date_str)
+        if date_str and run_dir is None and not confirm_plan_book:
+            self.assert_not_plan_book_save(holdings, date_str, strategy_key, universe_key)
         if date_str:
             daily_dir = run_dir or self.get_run_dir(strategy_key, universe_key, date_str, prefer_existing=True)
             os.makedirs(daily_dir, exist_ok=True)
@@ -3999,3 +4763,156 @@ class StorageManager:
         }
 
 
+# --------------------------------------------------------------------------- #
+# (NV10) Standalone, DRY-RUN-BY-DEFAULT backfill of `post_holdings.meta.json`
+# --------------------------------------------------------------------------- #
+# WHAT THIS IS FOR (and what it refuses to be):
+#   Ten archived rounds predate the D5 sidecar, so `check_live_run_integrity.py` reports
+#   them as `POST_HOLDINGS_MISSING` even though their `post_holdings.json` is present and
+#   correct.  The sidecar can be reconstructed LOSSLESSLY from the SAME round's ticket when
+#   `post_holdings_from_ticket(ticket)` reproduces the on-disk book exactly.  Everything else
+#   is reported, never guessed:
+#     * a missing book is NOT derived from the ticket (that would invent facts);
+#     * a book that differs from its own ticket is AMBIGUOUS, so it is refused, not "fixed";
+#     * a voided ticket is refused (the decision was withdrawn);
+#     * an existing sidecar is NEVER overwritten -- `O_EXCL`, no `--force`;
+#     * `--dry-run` is the DEFAULT; `--apply` is required to write anything.
+#   This CLI has never been run against the live archive (`NV10` only implements + tests it).
+def backfill_post_holdings_meta_runs(
+    runs_root: str,
+    *,
+    apply: bool = False,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Plan (and optionally apply) the sidecar backfill for every `<date>/<HHMMSS>` instance."""
+    results: List[Dict[str, Any]] = []
+    root = os.path.abspath(runs_root)
+    if not os.path.isdir(root):
+        raise FileNotFoundError(f"runs root is not a directory: {runs_root}")
+    for day_name in sorted(os.listdir(root)):
+        if not _DATE_RE.match(day_name):
+            continue
+        if from_date and day_name < from_date:
+            continue
+        if to_date and day_name > to_date:
+            continue
+        day_dir = os.path.join(root, day_name)
+        if not os.path.isdir(day_dir):
+            continue
+        for inst_name in sorted(os.listdir(day_dir)):
+            if not re.match(r"^\d{6}$", inst_name):
+                continue
+            run_dir = os.path.join(day_dir, inst_name)
+            if not os.path.isdir(run_dir):
+                continue
+            plan = plan_post_holdings_meta_backfill(run_dir, as_of=day_name)
+            outcome = apply_post_holdings_meta_backfill(plan, dry_run=not apply)
+            results.append(
+                {
+                    "date": day_name,
+                    "instance": inst_name,
+                    "run_dir": run_dir,
+                    "plan_action": plan["action"],
+                    "plan_reason": plan["reason"],
+                    "as_of": plan.get("as_of"),
+                    "ticket_source": plan.get("ticket_source"),
+                    "n_symbols": (plan.get("meta_payload") or {}).get("n_symbols"),
+                    "book": plan.get("book"),
+                    "applied": outcome["applied"],
+                    "would_write": outcome["would_write"],
+                    "error": outcome.get("error"),
+                }
+            )
+    counts: Dict[str, int] = {}
+    for item in results:
+        counts[item["plan_action"]] = counts.get(item["plan_action"], 0) + 1
+    return {
+        "runs_root": root,
+        "mode": "apply" if apply else "dry_run",
+        "results": results,
+        "counts_by_action": counts,
+        "written": sum(1 for item in results if item["applied"]),
+        "would_write": sum(1 for item in results if item["would_write"] and not item["applied"]),
+        "refused": [item for item in results if item["plan_action"] == "refuse"],
+    }
+
+
+def render_backfill_report(payload: Dict[str, Any]) -> str:
+    """Aligned one-line-per-instance report; refusals carry the reason a human must act on."""
+    lines: List[str] = [
+        f"runs root : {payload['runs_root']}",
+        f"mode      : {payload['mode']}"
+        + (" (nothing is written: pass --apply to create sidecars)" if payload["mode"] == "dry_run" else ""),
+        "",
+    ]
+    if not payload["results"]:
+        lines.append("no <YYYY-MM-DD>/<HHMMSS> instance directories found")
+    for item in payload["results"]:
+        verdict = {
+            "write_sidecar": "would write" if payload["mode"] == "dry_run" else "WROTE",
+            "skip": "skip (already attested)",
+            "refuse": "REFUSED",
+        }.get(item["plan_action"], item["plan_action"])
+        detail = item["plan_reason"]
+        if item["plan_action"] == "write_sidecar":
+            detail = f"{detail} as_of={item['as_of']} n_symbols={item['n_symbols']}"
+        elif item["plan_action"] == "refuse":
+            detail = f"{detail}" + (f" ({item['error']})" if item.get("error") else "")
+        lines.append(
+            f"  {item['date']}/{item['instance']}  {verdict:<22} {detail}"
+        )
+    lines.append("")
+    counts = ", ".join(f"{k}={v}" for k, v in sorted(payload["counts_by_action"].items())) or "none"
+    lines.append(
+        f"summary: {len(payload['results'])} instance(s) -- {counts}; "
+        f"written={payload['written']} would_write={payload['would_write']} "
+        f"refused={len(payload['refused'])}"
+    )
+    return "\n".join(lines)
+
+
+def _backfill_main(argv: Optional[List[str]] = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Backfill the D5 `post_holdings.meta.json` sidecar of LEGACY run rounds from "
+            "their own ticket. Dry run by default; never overwrites an existing sidecar, "
+            "never creates a missing `post_holdings.json`, and refuses ambiguous rounds."
+        )
+    )
+    parser.add_argument("--runs-root", required=True, help="<runs-root> containing <YYYY-MM-DD>/<HHMMSS>/")
+    parser.add_argument("--apply", action="store_true", help="write the sidecars (default: dry run)")
+    parser.add_argument("--from", dest="from_date", default=None, help="first date (YYYY-MM-DD)")
+    parser.add_argument("--to", dest="to_date", default=None, help="last date (YYYY-MM-DD)")
+    parser.add_argument("--json-out", default=None, help="also write the JSON payload here")
+    parser.add_argument("--strict", action="store_true", help="exit 1 when any round is refused")
+    args = parser.parse_args(argv)
+
+    try:
+        payload = backfill_post_holdings_meta_runs(
+            args.runs_root,
+            apply=args.apply,
+            from_date=args.from_date,
+            to_date=args.to_date,
+        )
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(render_backfill_report(payload))
+    if args.json_out:
+        try:
+            with open(args.json_out, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2, default=str)
+                fh.write("\n")
+        except OSError as exc:
+            print(f"error: cannot write --json-out {args.json_out}: {exc}", file=sys.stderr)
+            return 2
+    if args.strict and payload["refused"]:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised through `_backfill_main`
+    raise SystemExit(_backfill_main())
