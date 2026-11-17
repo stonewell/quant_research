@@ -6195,3 +6195,508 @@ stored.replace(tzinfo=datetime.timezone.utc).astimezone(MARKET_TZ)
   `strategy_dumps/*.json` 重生成或版本断言测试同步。
 - 未跑 `--dump-strategies`、未回写任何已归档 `data/runs/**`、未联网取数、
   未执行任何 live 脚本（本节验证全部离线）。
+
+---
+
+## 45. 实盘 HWM 虚高修复、波幅口径作用域诊断与运行完整性审计（无版本轴变动，2026-11-16）
+
+> **本节编号**：落笔前实测现有最高节号为 **44**（`grep -n '^## ' docs/version.md` 的最后一项），
+> 故本节取 **45**，按只追加的方式写在文件末尾。
+> **本节的性质是「生产数据回填 + Stage-1 诊断加固 + 只读审计工具」，不是「版本变更」。**
+> 按 [`AGENTS.md`](file:///home/stone/Work/github/quant/AGENTS.md) 核心量化工程规范第 7 条，
+> 本文件的强制追加义务**只在策略 `version` 或 `BASE_VERSION` 变动时**触发；
+> 本轮**没有触碰任何策略类、任何 `AllocationTemplate` 子类，也没有触碰
+> `BaseBlendAllocationStrategy`** ⇒ 全仓没有一个**策略 / 底座**版本号发生变化
+> （唯一变动的是 `scripts/repair_live_nav_hwm.py` 的**脚本自述** `SCRIPT_VERSION`
+> `1.0.0` → `1.2.0`，它不是策略 `version`、也不是 `BASE_VERSION` 轴，见 §45.6），
+> 未跑 `--dump-strategies`、未重写任何 `strategy_dumps/*.json`。
+> **这是刻意的决定、不是遗漏**：`scripts/live_preflight.py::select_prior_state` 以**精确字符串相等**
+> 比较 `base_version`，任何 bump 都会让下一轮跳过上一份 `prior_state` 快照（冷启动丢
+> `entry_prices` / `holding_bars` / 冷却状态，`-8%` 止损失去参考锚点），
+> 归档里已有 `LiveDumpPreflightError base_version`（2026-11-06 / 2026-11-09）与
+> `strategy_version`（2026-11-12）的 `DEPLOY_FAILED` 先例。台账见
+> [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) §2.27。
+> §1–§44 一字未改（§44.1 的现场观测值不回改，见 §45.1 末段）。
+
+### 45.1 事故与回填（`common/nav_hwm.py` + `scripts/repair_live_nav_hwm.py`）
+
+- **2026-11-05 的 `peak_nav` 是混合时基的和**：`208,830.78` = 当日权益腿 `186,218.00`
+  + **上一轮**现金腿 `22,612.78`；同一快照的两腿真值是 `198,810.57`，误差 `10,020.21`（NAV 的 5.0%）。
+  成因是现金腿与权益腿不读同一份快照。
+- **它被棘轮成了永久印记**：`peak = max(peak, nav)` 只上不下 ⇒ 之后每一轮的回撤都被高报。
+  2026-11-16 报 `-5.77%`，真实为 `-3.08%`（`196,789.34 / 203,049.96 - 1`，
+  真 ATH `203,049.96`，2026-09-29）。而回撤正是多级熔断的输入 —— 虚高峰值在**交易真实的风控决策**。
+- **第一轮修复只改顶层三个键**：`peak_nav` / `drawdown_pct` / `nav_history_10d`，共 **21** 份
+  `account_state.json`；其余 **337** 个文件按 md5 **逐字节校验未动**；写前全量快照 +
+  `nav_hwm_manifest.2026-11-16.json` 留证；重跑**幂等**；`--apply` 缺省关闭（默认 dry-run）。
+- **第二轮补的是第一轮漏掉的嵌套副本（同日发现、同日修）**：每份 `account_state.json` 还嵌一个
+  `prior_state`（上一轮状态的拷贝），第一轮只改顶层，这些副本仍写着幻影峰值 `208830.78`。
+  它**不是**无害残留：`inspect_portfolio_drawdown` 在 `as_of_date == state["as_of_date"]` 时
+  **换用 `prior_state`**，而「同 `as_of` 重跑」正是操作者当天要走的路径。现场即
+  `2026-11-16/124508`：顶层已是 `203049.96` / `-0.030832904374864…`，其 `prior_state` 仍读
+  峰值 `208830.78` / 回撤 `-0.05851359651101242`，于是重跑页显示 `-5.77%` 与
+  `HWM ¥208,830.78` —— 同一份快照里截图级自相矛盾，先复现、后修。
+- **第二轮只碰嵌套的同样三键**：`prior_state.peak_nav` / `prior_state.drawdown_pct` /
+  `prior_state.nav_history_10d`，共 **22** 份；`prior_state.current_nav`、各级连续计数与
+  `prior_state.circuit_breaker_tier` **一律不动**（它们是「那一轮到底读到了什么」的记录）。
+  `2026-11-16/124508` → 峰值 `203049.96`、回撤 `-0.031709535919140275`（历史点里清掉
+  `208830.78` 及其相邻重复的 `199935.46`）；`2026-11-13/144835` → `203049.96` /
+  `-0.035222119718713585`。发现码新增 `NESTED_PRIOR_STATE_STALE` /
+  `NESTED_PRIOR_STATE_HISTORY_STALE` / `NESTED_PRIOR_STATE_RESTATED` /
+  `PRIOR_STATE_SOURCE_MISMATCH` / `PRIOR_STATE_SOURCE_MISSING`。
+- **第二轮的验收**：未触碰的 **348** 个文件按 md5 对拍 **PASS 348 / FAIL 0**；
+  再跑一次 `--apply` 仍**逐字节幂等**（**615** 个文件不变）。
+  回归载荷：`inspect_portfolio_drawdown(196789.34, None, <修后的 11-16 state>, {},
+  as_of_date="2026-11-16")` → `-0.030832904374864…`（修前 `-0.057661`，即页面上的 `-5.77%`）。
+- **联动**：Tier-1（`-10%`）阈值随真 ATH 由 `187,947.70` 移到 `182,744.96`（`203,049.96 × 0.90`）。
+  即修复前该门禁是在**高报**的回撤上、**提前**触发的。
+- **并发修改护栏（复核发现，已落地）**：写前重读每一个目标文件，与评估期的 `before` 逐字段比对，
+  **收集全部不匹配后以退出码 `2` 中止，且零写入**（无 `.orig`、无 manifest、退出前不留半成品）。
+  用例 `test_concurrent_edit_between_appraise_and_apply_aborts_before_any_write` 断言整棵归档树的
+  指纹在失败前后**不变**。峰值是归档**无法自行重算**的那一个数，
+  覆写它等于销毁「当天引擎到底读到什么」的记录。
+- **峰值地板（复核发现，已落地）**：地板只由 **ELIGIBLE 腿**推导；
+  显式 `--peak` **豁免**（只告警、不拒跑）。
+  报告新增 `max_eligible_leg_nav` / `max_leg_nav_all` / `peak_floor_applied`，
+  让「地板用了哪些轮」可审计。脚本自述版本 `SCRIPT_VERSION` `1.0.0` → `1.1.0`
+  （护栏 + 峰值地板）→ `1.2.0`（嵌套 `prior_state` 发现码 + 只追加台账），见 §45.6 / §45.7。
+- **只读实证**：对真实归档跑一次 dry run —— `[clean] 0`、退出码 `0`、**579** 个文件未改动、零提案。
+  该读数取自扩容前的树；两轮回填后树内已 **615** 个文件，复测口径与 `--peak` 的必要性见 §45.7。
+- **未修的一件事（不要读成已随本节修好）**：以上全是**数据修复**。引擎侧**没有**任何不变量
+  阻止一个新的 `prior_state.peak_nav` 被继承 —— 第二轮进行中就落地了 `2026-11-16/142959`，
+  它同样继承了虚高峰值，只因源文件已先被修好，今天才读到 `203049.96`。
+  即「今天干净」归功于数据、不归功于引擎；该不变量登记为 `NV13`，未实施。
+- **与既有台账的分工**：`LV10`（§2.21）登记的是同日**三套净值并存**的分母缺陷，
+  本节修的是其中 `current_nav` 被写进 HWM 之后的**后果**；`nav_history_10d` 的语义与门槛归 `LV7`。
+  **§44.1 的「回撤 `-5.85%`（HWM `208,830.78`）」是当时的系统输出，不回改** ——
+  那句如实记录了当时读到的数，而那个 HWM 正是本节修掉的虚高值。
+
+### 45.2 HWM 合格性守卫（`scripts/check_live_portfolio_health.py`）
+
+- 新增 `inspect_portfolio_drawdown(..., nav_eligible=..., ineligibility_reason=...)`，
+  出口键 `hwm_eligible` / `hwm_ineligibility_reason` / `peak_nav_source` / `hwm_guard_applied`。
+- **合格性优先级书面冻结**：① 结构化 `cash_as_of` **说了算**（`!=` ⇒ 不合格，`==` ⇒ 合格），
+  同轮告警字符串**只作旁证、不得翻案** —— 否则「同会话重跑命中 `cash_from_archive`」会被误拦，
+  HWM 被冻住，熔断转为**欠**触发；② `stale_symbols` 非空与 `nav_source == "form_fallback"`
+  是**无条件**拦截（它们不是时基主张）。
+- **双向拦截**：抬升路径与 Tier-1 / Tier-3 自愈的**下压**路径都拦；`nav_eligible=None`
+  视为**合格**，故既有调用方与合格轮次**逐字节不变**。
+  `peak_nav_source` ∈ {`cli` / `prior_state` / `current_nav`}；
+  `hwm_guard_applied` 仅在**真的拦下一次**时为真（不合格但无事可拦时保持安静）。
+- **守卫下阶梯幅度的钳制（复核发现，已落地）**：守卫生效时阶梯幅度取
+  `dd_mag = max(0.0, -current_dd)` —— 被拦下且**高于**冻结峰值的 NAV 是「无回撤」，
+  不是正向幅度；原始缺口另存 `hwm_barred_gap_pct = max(0.0, current_dd)`，
+  **只在守卫路径写入**，故 `nav_eligible` ∈ (True, `None`) 的判定字典**逐位不变**。
+  `drawdown_pct` 仍是原始带符号值。**挡掉的具体失败**：`120,000` 对 `100,000` 冻结峰值，
+  改前 `abs(+0.20)` ⇒ `TIER_3_HALT`（一本健康账被清成 100% 现金）；改后 `NORMAL`、
+  `dd_mag == 0.0`、`hwm_barred_gap_pct == 0.20`，而下方 `79,000` 仍正确给出 `TIER_3_HALT`。
+- **证据优先级（复核发现，已落地）**：结构化 `cash_as_of` **双向**拍板（`==` 合格 / `!=` 不合格），
+  生产者告警降级为 `corroborating_warnings`、**永不能翻案**；`nav_warnings` + `cash_as_of_warning`
+  只在结构化对缺席时按**前缀**扫描。`hwm_eligibility_detail()` 暴露 `deciding_evidence`，
+  让「哪条证据赢的」可被审计。**钉死回归载荷**：2026-11-16 的真实快照
+  （`cash_as_of == as_of` + `cash_as_of_warning=identical_to_previous_round_residual`）
+  返回 ELIGIBLE，`deciding_evidence` 为 `structured…warning text cannot override this`。
+- **只读实证**：旧 vs 新判定在**全部 34 个实例轮**上 **34 合格 / 34 合格 / 0 变化**；
+  `pipeline/tests` **1608 passed + 1 skipped**、`common/tests` **1525 passed + 1 skipped**
+  （定稿前实测；简报所引的 `1585` 是该轮补测前的中途读数）。
+
+### 45.3 波幅作用域：诊断、消融与开关
+
+- **诊断（零行为变更）**：Stage-1 的 `realized_vol_21d` 是**单名波动率的横截面中位数**，
+  却与组合层面的目标比较。2026-11-16 实测单名中位 **30.3%** 对等权组合 **9.9%** ⇒
+  `vol_scope_ratio` **3.05x**（阈值 1.5）⇒ 打印 `Scope check` 与 `[WARN] SCOPE MISMATCH`。
+- **基准更正**：`R1` 口中的「intraday trough」实测是**日线 HWM 回撤** ⇒ 落
+  `dd_trough_basis=daily_hwm_drawdown`（默认值），另立**显式 PROXY** 的
+  `intraday_trough_ew_proxy`（等权 5m 篮子路径，含未测原因）；
+  `common/advisory_report.py::r1_decision_to_dict` 携带同一 basis，票据侧补写。
+- **消融（`scripts/run_vol_ceiling_ablation.py`）**：`2022-04`–`2026-11`、**1,113** 个会话。
+  现状 `stage1` 口径**100% 交易日触顶** ⇒ CAGR `14.19% → 6.04%`、Sharpe `1.173 → 1.128`；
+  `portfolio` 口径 CAGR `13.16%`、Sharpe `1.129`、仅 **17%** 触顶。
+  配对分块 bootstrap 的 B−A Sharpe：全窗口 `[-0.175, +0.162]`、实盘窗口 `[-0.121, +0.268]`。
+- **结论：INCONCLUSIVE，保持 opt-in OFF。** 三条预注册判据里的第三条（CI 排除 0）不成立。
+  现状层是**杠杆削减**（平均敞口 ≈ **46.5%**），**不是**风险改善；反过来组合口径也**从未被证明更好**。
+  故不翻默认、不给推荐值，按既有负结果惯例（`LV8` / `LV20` / `C4.1` / `C5.2`）结案。
+  **披露**：本实验用日频 21 日单名波动替代 Stage-1 的 5m 下行半方差（5m 缓存自 2026-10-19 才有），
+  且不含成本 / 手数 / 滑点 —— 结论只能读成「作用域不可证」。
+- **开关 `cfsb_vol_ceiling_scope`** ∈ {`stage1`（默认）, `portfolio`}：解析顺序为
+  **策略白名单 → `--vol-ceiling-scope` → 带前缀的 dump 键 → 默认**；裸名拼写一律忽略
+  （2026-10-21 `wq_alpha_id` 同型碰撞）；未知拼写降级 `stage1` 并留 `fallback_reason`；
+  口径 provenance 进 `effective_params.json`。默认路径在 **60 例**上**逐位等同**接入前。
+- **语义不对称（必读）**：`stage1` 是**上限**语义 `min(Σ, factor)` —— 因子是单名统计量，
+  与组合目标不同量纲，只能当预算钳制，并沿用 `LV18`「取上限、不与之相乘」的防双重降险裁定；
+  `portfolio` 是**缩放**语义 `Σ × factor`（`model_sum × scale_f`），因子由该策略自身目标权重算出的
+  `sqrt(w'Σw)` 与其自身目标波动给出，**同量纲** ⇒ 按风险比例缩放整本权益。
+  cap 语义在 factor > 1 时是静默无效的，因而无法检验「组合口径」这个命题。
+
+### 45.4 运行归档完整性审计（`scripts/check_live_run_integrity.py`）
+
+- **为什么要跨轮看**：2026-11-13 在单轮视图里是「又一次拒单」，是两个实例拼起来才成结论 ——
+  `144835/` 是 `stage2` + `gate_code=GO` 但**无** `deploy_status`、**无** `live_trading_ticket.json`；
+  `192803/` 是 `FAILED` + `MissedExecutionOpenError` + `timing_violation=after_open`
+  （lateness `119.2` min）。
+- **六类发现**（各带日期 / 实例 / 严重度 / 中文一行）：`MISSED_SESSION`(HIGH) /
+  `TIMING_REFUSED`(HIGH) / `DEPLOY_FAILED`(MEDIUM) / `POST_HOLDINGS_MISSING`(MEDIUM) /
+  `TICKET_UNFILLED`(LOW) / `DUPLICATE_INSTANCES`(LOW)；`MissedExecutionOpenError` **不**双记为
+  `DEPLOY_FAILED`。`--strict` 供 CI 使用；工具严格只读（唯一写点是操作者指定的 `--json-out`）。
+- **实测（`2026-10-29 .. 2026-11-16` 真实归档）：DIRTY** —— **2** 条 HIGH
+  （`MISSED_SESSION` 2026-11-13；`TIMING_REFUSED` 2026-11-12，lateness `149.4`）、
+  **14** 条 MEDIUM（**4** `DEPLOY_FAILED`、**10** `POST_HOLDINGS_MISSING`）、**2** 条 LOW。
+- **后果**：2026-11-16 开盘**没有任何可执行票据**（无一条记录携带 `execution_date=2026-11-16`），
+  故 `600362` 的 `-8%` 止损**漏了一个会话**。审计器只**判**归档、**不改**归档；
+  修复方向与 `POST_HOLDINGS_MISSING` 链分别登记为 `NV11` / `NV10`，均未实施。
+- **2026-11-16 的两个实例与取代关系（后补留证）**：该日归档内有 `124508`（`strategy_version 1.4.0`
+  + `stage1`，票面权益 `32.3%`）与 `142959`（`1.5.0` + `portfolio`，`64.6%`）两个实例并存；
+  目录级 `2026-11-16/supersession.json` 落
+  `superseded_by: "2026-11-16/142959"`、`authoritative_run: "142959"`、
+  `strategy_version_observed: "1.4.0 -> 1.5.0"`，并写明 `124508` 的任何一个数
+  **从未被采纳**为执行账本（`recorded_at 2026-11-16T22:41:50Z`）。
+  两者都**不删不改**：`124508` 是「当时按 `stage1` 口径下过的指令」的不可变证据。
+  该文件是**人工留证**的审计记录，不是自动生成物（11-12 的 `162625` / `162857` / `195821`
+  三实例已是同一先例）。
+
+### 45.5 票据审计字段（`scripts/run_live_strategy.py`，纯增量）
+
+- `equity_direction`：权益口径（**剔除现金腿**）的前后权重与净变动，实测
+  **25.1% → 32.3%（+7.2pp）**、净买入 **¥14,193**；打印使用**字面标签 `EQUITY DIRECTION`**
+  （`_vol_scope_note` 已指向该标签，改名即断链）。
+- `sector_throttle`：`throttled` + `throttle_state` ∈ {`binding` / `not_binding` / `cannot_prove`}。
+  该块是从**已交付账本反推**，不是重跑权重层准入规则（真实规则在 `blend_base.py` 的
+  `sector_counts[sec] < allowed_sec_cap`）⇒ `binding` 只表示「约束成立」，**不**表示「某单被压掉」；
+  输入不可判时报 `cannot_prove`，不臆造判决。
+- `is_partial_trim`：部分减仓与清仓区分。
+- `lot_rounding_drag`：逐行 + 票据级，实测 **-5,296 RMB / -2.69% NAV**
+  （买腿 **-3,383** / 卖腿 **-1,913**）。**于此订正早前口径 `-5,281`** —— 该数是未按腿相加的旧值，
+  逐腿求和以 **-5,296** 为准。
+- **边界**：**下单路径未变**，以改前 / 改后票据 diff 证明；不改任何阈值、不碰版本轴。
+
+### 45.6 版本轴与边界
+
+| 项 | 改前 | 改后 | 理由 |
+| --- | --- | --- | --- |
+| 任一策略类 `version` | — | **全部不变** | 本轮未改任何策略类 |
+| `AllocationTemplate` 及各静态模板 | — | **全部不变** | 未改 `common/allocation_templates.py` |
+| `BaseBlendAllocationStrategy.BASE_VERSION` | `2.0.0` | **`2.0.0`（不变）** | 未改 `pipeline/research/blend/blend_base.py` |
+| `strategy_dumps/*.json` | — | **未重生成** | 未跑 `--dump-strategies` |
+| `scripts/repair_live_nav_hwm.py` 的 `SCRIPT_VERSION` | `1.0.0` | **`1.2.0`** | **脚本自述版本，非策略 `version` / `BASE_VERSION` 轴**（`1.1.0`：并发修改护栏 + 峰值地板；`1.2.0`：嵌套 `prior_state` 缺口与只追加台账） |
+
+- 因此本轮**没有**触发 AGENTS.md 第 7 条的强制追加义务：本节是**主动**登记的生产回填与诊断加固记录。
+- **唯一的版本号变动是脚本自述版本**：`scripts/repair_live_nav_hwm.py` 的 `SCRIPT_VERSION`
+  `1.0.0` → `1.1.0`（并发修改护栏 + 「只取 ELIGIBLE 腿」的峰值地板）→ **`1.2.0`**
+  （嵌套 `prior_state` 的发现码与只追加台账，见 §45.7）。
+  它**不是**策略类 `version`、**不是** `AllocationTemplate` 的 `version`、**也不是** `BASE_VERSION`
+  —— 不进入 `strategy_dumps/*.json`、不被 `select_prior_state` 比较、不影响票据的
+  `strategy_version` / `base_version`，故「无版本轴变动」的结论**不被它推翻**。
+- **本节表格只描述本批次**：同日**晚些**的后续批次（工作区已见改动）把
+  `ChanFourStateBlendStrategy.version` `1.4.0` → `1.5.0`，并把 `cfsb_vol_ceiling_scope`
+  在 `strategies_config.json` 里钉为 `portfolio`（`BASE_VERSION` 仍 `2.0.0`）。
+  该批次由**它自己的** `docs/version.md` §46 与相应任务行登记，**不属本节**，
+  本节的「无版本轴变动」不得被读成对它的描述。
+- **明确未做、且已登记前置的事**：行业映射补齐（`600900.SH` → `utilities`、`000999.SZ` → `pharma`）
+  会落在**底座引擎**里 ⇒ 必须 bump `BASE_VERSION`，而 `select_prior_state` 的精确字符串比较会让下一轮
+  跳过 `prior_state`（冷启动丢 `entry_prices` / `holding_bars` / 冷却，`-8%` 止损失锚）。
+  前置是先让 `select_prior_state` 容忍**同 major** 的 bump（含用例）+ 一次行业映射消融。
+  价格口径统一（NAV 收盘 / 票据截断价 / 对账票据价，当日 `172 RMB` 分差）属**定仓路径变更**，
+  按规则 9 须先过实证门禁。二者分别登记为 `NV8` / `NV9`。
+- 未联网取数；未执行任何下单 / 部署脚本，也未回写任何已归档 `data/runs/**`
+  （`repair_live_nav_hwm.py` 只在真实归档上跑过一次**默认 dry-run**，全程只读）；
+  生产写操作只有 §45.1 的两轮 `account_state.json` 回填 —— 第一轮 **21** 份（顶层三键）、
+  第二轮 **22** 份（嵌套 `prior_state` 三键），合计 **43** 次写，均带写前快照、manifest 与
+  md5 对拍。
+
+### 45.7 台账改为只追加（`passes`）与回填口径、`--peak` 的必需性
+
+- **为什么必须改**：`nav_hwm_manifest.<date>.json` 原是**后写覆盖**（last-write-wins）。
+  同一日常规就会跑两轮（顶层一轮、`prior_state` 一轮），于是第二轮把第一轮的台账整份覆盖 ——
+  `.orig` 备份还在，但**台账不再说第一轮改了什么**。断的是「记录」，不是字节，而记录正是审计链。
+- **结构**：顶层 `passes` 数组，每项 `{recorded_at, script_version, file_count, nested_rewritten,
+  files}`，另有 `pass_count`；**最新一轮的字段仍镜像在顶层**，故单轮读者与所有 1.2.0 之前的
+  manifest 照旧可读（旧格式在下次写入时把自身顶层当作第一轮升级进 `passes`）。
+  **只有真的改写过文件才合并**，故幂等的第二次 `--apply` 仍让 manifest 逐字节不变；
+  **已存在但损坏**的台账在**任何写盘之前**以退出码 `2` 中止，不覆盖、不重建（与并发修改护栏同理：
+  台账是「当天引擎到底读到什么」的唯一记录）。
+- **回填**：`nav_hwm_manifest.2026-11-16.json` 已回填为**两轮** —— 第一轮 `21` 份（仅顶层，`nested_rewritten 0`）、
+  第二轮 `22` 份（22 个嵌套）；md5 一律取自保留下来的 `.orig` 字节，与第二轮自己的
+  `md5_before` 交叉核对（重叠的 20 份逐位一致），未按推测填写任何一份。
+  第一轮的自述版本**不可恢复**（它的顶层已被覆盖），记 `null` 并附理由注记 —— 保持「不知道就写不知道」，
+  不用猜的数填坑。第二轮的 `script_version` 是 `1.1.0`（其顶层原值原样搬入 `passes[1]`，未回改）；
+  把「嵌套缺口 + 只追加台账」一并落库时才把 `SCRIPT_VERSION` 推到 `1.2.0`，回填由该版本执行。
+- **`--peak` 的口径（操作必读）**：真 ATH `203049.96`（2026-09-29）落在**树外**的旧快照里，
+  工具从树内可推导的峰值只有 `max_eligible_leg_nav = 202483.94`。
+  故**不带** `--peak` 的 dry run 会（正确地）提 **23** 条重述、退出码 `1`；
+  要复现 `[clean] 0` 必须显式给峰：`--peak 203049.96` → `scanned=24`、`[clean] 0`、退出码 `0`。
+  **这是设计、不是漂移**：峰值地板只由 ELIGIBLE 腿推导（§45.1），而显式 `--peak` 是操作者的断言。
+  若把「不带 --peak 就报 23 条」读成回归，就会去「修」一个本来就对的行为。
+- **边界**：本轮只动台账结构与本脚本的自述版本；不改任何策略类、不改 `common/nav_hwm.py` 的判定语义、
+  不碰 `BASE_VERSION`，故 §45.6 的「无版本轴变动」在加入 §45.7 后**仍然成立**。
+
+## 46. 实盘波幅天花板改按「组合口径」计量（`ChanFourStateBlendStrategy` `1.4.0 → 1.5.0`，2026-11-16）
+
+> **本节编号**：落笔前实测现有最高节号为 **45**（`grep -n '^## ' docs/version.md` 的最后一项），
+> 故本节取 **46**，按只追加的方式写在文件末尾；§1–§45 一字未改。
+> **本节是「owner 裁决（消融臂 B）」的落地登记，不是新实验**：消融本身已在 §45.3 结案并归档
+> （`backtests_research/20261116_131625_volscope_ablation/`，结论 INCONCLUSIVE、默认不翻）。
+> 本轮只做三件事：把**已经实现**的开关**持久化**到某个策略的配置里、按 AGENTS.md 第 7 条
+> 给该策略**升版本**、并用离线实跑证明「口径真的解析成 `portfolio`」且「升版本不会让下一轮冷启动」。
+> 台账（任务拆解 / 状态）仍在
+> [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) §2.27，
+> 本节不重复登记任务号。
+>
+> **（2026-11-16 同日追加，§46.1–§46.5 一字未改）**：本日又补两个小节 ——
+> **§46.6** 把「消融判定仍为 INCONCLUSIVE」与「`portfolio` 是业主裁定」的关系**显式钉死**，
+> **§46.7** 登记 `NV13` 的峰值出处判定（只读五标签 + opt-in 失败关闭闸门）与同批的两笔修复写链整改。
+> 两者都**没有**新增实验、**没有**版本轴变动。
+
+### 46.1 决策与持久化位置（两个写点、一个出口 `source=dump`）
+
+- **决策**：owner 选定**组合口径**（消融臂 B）作为实盘波幅天花板的作用域。即
+  `sqrt(w' Σ w)`（模型自身目标权重、21d 协方差、252 年化）与该策略**自身**目标波动
+  （breadth ≥ 0.60 时 0.24，否则 0.12）比较，并按**缩放**语义 `Σ × factor` 压低整本权益，
+  而不是 `stage1` 的**上限**语义 `min(Σ, factor)`。
+- **写点一（全局默认）**：`pipeline/research_strategy/rs/config.py` 新增
+  `StrategyConfig.cfsb_vol_ceiling_scope: str = "stage1"`。
+  **默认必须是 `stage1`**：消融判据（CI 排除 0）不成立，翻全局默认等于用一次不显著的实验
+  改动所有策略与所有历史 dump。该字段同时也是「`from_dict` 不再把键当 unknown 丢掉」的唯一
+  途径（§7 的 `wq_alpha_id` 教训）。
+- **写点二（逐策略钉死）**：`pipeline/research_strategy/strategies_config.json` 的
+  `chan_four_state_blend.parameters` 中新增 `"cfsb_vol_ceiling_scope": "portfolio"`，
+  与既有的 `blend_weighting_mode="regime_ic_ir_hybrid"` **同一机制**（逐策略 `parameters` 块，
+  经 `instantiate_strategy_from_config_entry` → `StrategyConfig.from_dict` → `--dump-strategies`
+  写入 dump 的 `params`）。全仓**只有这一个**策略声明该键。
+- **未动**：`cfsb_portfolio_vol_overlay_enabled=true` 与
+  `cfsb_portfolio_vol_overlay_mode="cap"`、`cfsb_portfolio_vol_ceiling_force_exits=true`
+  全部保持原值 —— 覆盖层仍然**启用**、仍然是 `cap` 模式，本轮只换「量哪一把波动」。
+- **出口**：`scripts/run_live_strategy.py::resolve_vol_ceiling_scope` 的解析顺序
+  **策略白名单 → `--vol-ceiling-scope` → 带前缀的 `cfsb_vol_ceiling_scope` → `stage1`**。
+  读真实 dump 实测结果：
+  `{"allowlisted": true, "scope": "portfolio", "declared": "portfolio", "source": "dump", "cli_override": false, "fallback_reason": null}`。
+  裸名 `vol_ceiling_scope` 仍被忽略（同型碰撞防护），非白名单策略仍恒报 `stage1`/`default`。
+  票据与 `effective_params.json` 的双写一致：
+  `cfsb_vol_ceiling_scope = {"declared": "portfolio", "resolved": "portfolio", "source": "dump"}`。
+
+### 46.2 版本轴与同步更新
+
+| 项 | 改前 | 改后 | 理由 |
+| --- | --- | --- | --- |
+| `ChanFourStateBlendStrategy.version` | `1.4.0` | **`1.5.0`** | 该改动的直接后果是**实盘交付权益**（见 §46.4），必须进版本轴 |
+| `BaseBlendAllocationStrategy.BASE_VERSION` | `2.0.0` | **`2.0.0`（不变）** | 未改 `blend_base.py` 的定仓/波动目标逻辑；且 bump 会让下一轮跳过 `prior_state`（§46.3） |
+| 其余策略 / 静态模板 `version` | — | **全部不变** | 未改任何其它策略类或 `common/allocation_templates.py` |
+| `strategy_dumps/*.json` | `1.4.0` | **已重生成** | `cd pipeline && .venv/bin/python research_strategy/run_research_strategy.py --dump-strategies`；dump 内的 `strategy_version` / `version` / `composite_version` 与 `params` 全部同步为 `1.5.0` + `portfolio` |
+
+- 同步更新的用例：`pipeline/research_strategy/tests/test_blend_strategy_versioning.py`（期望表
+  + `version_info["version"]`）与 `common/tests/test_strategy_versioning.py`（期望表）均
+  `1.4.0 → 1.5.0`。
+- **新增用例** `pipeline/tests/test_vol_scope_version_transition.py`（**10** 例）：钉死「钉死位置唯一」、
+  「默认仍是 `stage1`」、「dump 解析为 `portfolio` 且 `source=dump`」、「`strategy_version` 变化**不**影响
+  `prior_state` 可采性」、「`base_version` 变化**才**会被拒」、「本轮必须自行重盖版本，未重盖则失败关闭、
+  且永不改写 `prior_state`」，以及「真实 dump 与活类版本一致」（dumps 为 gitignore 产物，缺失时 skip）。
+
+### 46.3 版本迁移不会让下一轮冷启动（`prior_state` 可采性，已实测）
+
+- **`select_prior_state` 只比 `base_version`，不比 `strategy_version`** ——
+  `scripts/live_preflight.py` 第 **1102** 行：
+
+  ```python
+  elif expected is not None and base_version != expected:
+      eligible = False
+      reason = (
+          SKIP_BASE_VERSION_MISMATCH if base_version else SKIP_BASE_VERSION_MISSING
+      )
+  ```
+
+  同函数内 `strategy_version` **一次都没出现**（`grep -n strategy_version` 在该文件只命中
+  §5 的 dump/account_state 一致性闸门，见下）。故 `1.4.0 → 1.5.0` **不改变**任何快照的可采性。
+- **实测（只读，真实归档）**：`select_prior_state(<session_root>, "2026-11-17", expected_base_version="2.0.0")`
+  → `[PRIOR STATE] selected path=…/2026-11-16/124508/account_state.json as_of=2026-11-16
+  run_date=2026-11-16 instance=124508 run_status=SUCCESS (deploy_status) base_version=2.0.0
+  reason=newest_successful_snapshot_at_or_before_as_of skipped=26`。
+  该快照自身仍写着 `strategy_version=1.4.0` / `base_version=2.0.0` / `nav=196,789.34` ——
+  **不被改写**（归档是血统证据，`prior_state` 保留原三元组）。
+- **真正会失败关闭的是另一条闸门**：`assert_account_state_version_parity`
+  （`_assert_version_axis`，第 611 行起）把**本轮自己的** `account_state` 与**活类**比较，
+  所以 `strategy_version` 一旦 bump，若本轮 state 仍带着上一轮的 `1.4.0`，Stage 2 会拒跑 ——
+  这正是 2026-11-12 `162625` 的 `strategy_version` 事故。该缺口已由
+  `check_live_portfolio_health.py::build_account_state_update`（第 1298–1299 行）用
+  **本轮 dump 的三元组**重盖（`stamp_account_state_version`，永不进 `prior_state`）闭合；
+  web 侧播种只在「种子已声称本轮日期」时重盖，跨日种子按原样复制，随后由 Stage 1 重盖。
+  本轮新增用例把这条依赖钉死：**重盖在 → 通过；重盖缺失 → 拒绝**（含 `detect_state_version_clobber`
+  的 `[STATE VERSION CLOBBERED]` 分支）。
+- **因此 `BASE_VERSION` 必须留在 `2.0.0`**：bump 它才会真正改变 1102 行的比较结果，让 2026-11-16
+  快照变成 `base_version_mismatch`，下一轮冷启动丢 `entry_prices` / `holding_bars` / 冷却状态，
+  `-8%` 止损失去参考锚点（§45.6 已把这条列为「行业映射」变更的前置条件）。
+
+### 46.4 离线实证（同一输入、同一缓存、同一 as-of，只改口径）
+
+环境：`--data-provider fuyao` + 本地 `data/cache.duckdb`（最新日线 `2026-11-16`，**未写入**、mtime 不变）、
+`--as-of-date 2026-11-16`、`--start-date 2024-01-01`（与 web 端 `default_start_date` 一致）、
+NAV `196,611.34`、持仓 `holdings.json`（`600362.SH` 200 / `600660.SH` 400 / `601919.SH` 1200）、
+Stage-1 报告取归档原文件。**输出只写 `/tmp/opencode/vsB_*/`，未触碰
+`/home/stone/Work/stock/simulate/` 下任何文件**（归档 `account_state.json` 事后复核仍为
+`strategy_version=1.4.0`、`base_version=2.0.0`，mtime 未变）。
+
+| 票据字段 | 控制臂（`--vol-ceiling-scope stage1`） | 处理臂（dump 钉死 `portfolio`） |
+| --- | --- | --- |
+| `vol_overlay.scope` / `scope_applied` | `stage1` / `stage1` | **`portfolio` / `portfolio`** |
+| `scope_fallback_reason` | `null` | **`null`**（无回落） |
+| `stage1_factor` | `0.39566311` | `0.39566311`（仍留痕，供对照） |
+| `portfolio_vol_21d` / `_63d` | `null` / `null` | **`0.1182` / `0.0949`** |
+| `realized_vol_21d`（票据，2026-11-16 上报修正**之后**的语义） | `0.3033`（Stage-1 单名中位数） | **`0.3033`**（同为 Stage-1 测量；组合值**不再**覆盖它） |
+| `consumed_vol_21d` / `consumed_vol_source`（同上，additive 新键） | `0.3033` / `stage1` | **`0.1182` / `portfolio`**（真正产生该因子的量） |
+| `target_vol_used` / `target_vol_source` | `null` / `null` | **`0.24` / `breadth`**（`market_breadth_50d=0.65`） |
+| `effective_factor` | `0.39566311`（`binding=true`） | **`1.0`（`binding=false`）** |
+| `model_equity_sum` | `0.75017648` | `0.75017648`（同一批模型权重） |
+| `capped_equity_sum` | `0.39566311` | **`0.75017648`**（≈ 模型权益，不再被单名中位数钳住） |
+| `post_lifecycle_equity_sum` | `0.35025206` | `0.66407722` |
+| `delivered_equity_sum` | `0.32370971`（**32.37%**） | **`0.64708373`（64.71%）** |
+| 净买入（票面 `EQUITY DIRECTION`） | `¥14,193`（+7.2pp） | **`¥77,772`（+39.6pp）** |
+
+- **交付权益提升**：`32.37% → 64.71%`，即 **+32.34pp**；按 NAV `196,611.34` 折
+  **+¥63,579**。相对归档票据的 `delivered_equity_sum=0.32341691`（32.34%）为 **+32.37pp / +¥63,637**。
+  控制臂 `0.32371` 与归档 `0.32342` 的 **0.03pp** 差异来自整手取整路径（`capped` / `post_lifecycle`
+  两个上游数逐位一致：`0.39566311` / `0.35025206`）。
+- **隐含的一次性买入**：处理臂净买入 `¥77,772`（`83,808` 买 − `6,036` 卖，9 张单），
+  控制臂 `¥14,193`（`31,083` 买 − `16,890` 卖）⇒ **增量约 `¥63,579`**，与交付权益差额自洽。
+- **字段语义披露（必读；2026-11-16 上报修正后的正确语义）**：票据的 `realized_vol_21d`
+  **在两种作用域下都是** Stage-1 的**单名波动率横截面中位数**（`0.3033`），因此可直接与
+  Stage-1 报告对照；**被消费的那把波动**另立两键 ——
+  `consumed_vol_21d`（`portfolio` 口径下是组合波动 `0.1182`，`stage1` 口径下等于
+  `realized_vol_21d`）与 `consumed_vol_source`（`stage1` / `portfolio`，等于 `scope_applied`，
+  故组合口径降级时如实报 `stage1`）。两者不可混读：前者是「按什么量去钳的」，后者是
+  「Stage-1 量到了什么」；Stage-1 的原值同时还以**因子**形式留在 `stage1_factor=0.39566311`。
+- **本节实验跑在修正之前（如实披露）**：上面的两臂票据产出时，处理臂确实把组合波动 `0.1182`
+  写进了 `realized_vol_21d` —— 那正是「一名两量」缺陷本身（一张票与一份 Stage-1 报告看起来
+  自相矛盾）。按修正后的语义，该数落在 `consumed_vol_21d`，`realized_vol_21d` 在**两臂**
+  都应为 `0.3033`；本节其余数字（因子、权益链、下单量）不受影响，因为两个量都是**上报用**的。
+- **该修正零版本轴变动**：两个新键是**纯 additive**，默认 `stage1` 路径除它们之外**逐位不变**，
+  且二者都不进入波幅上限的算术（`test_realized_vol_is_reporting_only_so_it_cannot_move_a_single_weight`
+  钉死「该值永不进入算术」）。§46.2 的 `ChanFourStateBlendStrategy.version` `1.4.0 → 1.5.0`
+  是本节**持久化 `portfolio` 口径**的后果，**不是**这次上报修正引起的；上报修正未改任何策略类
+  `version`、未改 `BASE_VERSION`，故零 `--dump-strategies`、零 `strategy_dumps/*.json` 重生成。
+  台账登记见 [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) §2.27 的 `NV15`(a)。
+- **未触顶**：`binding=false` ⇒ 覆盖率 `1.0`，不存在「组合波动已超目标却仍加杠杆」的反向风险；
+  `ceiling_exceeded_by=0.0`、强制减仓未触发（`forced_exits=[]`）。
+
+### 46.5 边界与未做
+
+- **未改`blend_base.py`**：策略自身的 Garman-Klass 目标波动缩放仍是唯一的定仓尺度；
+  覆盖层只是「权益预算」上的第二个（同量纲）尺度，**不相乘**（`LV18` 防双重降险裁定保持不变）。
+- **未翻全局默认**：`StrategyConfig` 默认仍是 `stage1`，其它策略、其它历史 dump 与所有既有票据
+  逐位不变；本轮只影响 `chan_four_state_blend`。
+- **未改消融结论**：§45.3 的 INCONCLUSIVE 判定与「不给推荐值」的记录保持原样；本轮记的是
+  **owner 显式选择**（臂 B），不是「实验证明了更好」。
+- **未做**：未 `git commit`；未改 `docs/development_plan.md`（另一路在写）；未触碰真实归档
+  `data/runs/**` 与 `/home/stone/Work/stock/simulate/**`；实跑只在 `/tmp/opencode/vsB_*/` 产出票据。
+- **验证状态**：`pipeline/tests/test_vol_scope_version_transition.py` **10 passed**；
+  `pipeline/research_strategy/tests/test_blend_strategy_versioning.py` +
+  `common/tests/test_strategy_versioning.py` 合计 **10 passed**；
+  `common/tests` 全套 **1525 passed + 1 skipped**（与 §45 基线一致，无回归）、
+  `pipeline/research_strategy/tests` 全套 **631 passed + 1 xfailed**、
+  `pipeline/tests` 全套 **1627 passed + 1 skipped**；
+  离线实跑两臂均 `[SUCCESS]` 出票（输出仅在 `/tmp/opencode/vsB_*/`）。
+
+### 46.6 审计完整性：消融判定、业主裁定与「非退化」依据的关系（2026-11-16 补记）
+
+> 本小节只**钉死口径**，不新增实验、不改任何数字。它是对 §45.3 / §46.1 / §46.5 的**显式收口** ——
+> 「默认值变了」与「实验推荐改」这两件事，后来很容易被读成同一件事。
+
+- 消融判定**仍是 INCONCLUSIVE**，且其**预注册判据未满足**：B−A Sharpe 的配对分块 bootstrap 95% CI
+  在**两个窗口上都跨 0**（全窗口 `[−0.175, +0.162]`、实盘窗口 `[−0.121, +0.268]`）⇒ 判据 (iii) 不成立。
+- `cfsb_vol_ceiling_scope="portfolio"` 是**业主裁定（2026-11-16）**，**不是**消融推荐：实验没有给出
+  推荐值，也没有翻任何默认（`StrategyConfig.cfsb_vol_ceiling_scope` 仍是 `stage1`，见 §46.1）。
+- 规则 9 的成立依据是点估计上的**「严格非退化」条款**，**不是**统计优势：
+  CAGR **13.16%** 对 **6.04%**、Sharpe **1.129** 对 **1.128**。
+- 因此**任何文档都不得**把本轮表述为「消融建议翻转默认」。正确读法是：实验**不能**证明组合口径更好，
+  业主**仍然选择**了它，而该选择在点估计上不退化。
+
+### 46.7 峰值出处判定（`NV13`）：只读五标签与 opt-in 失败关闭闸门（脚本自述 `1.3.0`，无版本轴变动，2026-11-16）
+
+- **背景（不要读成已修）**：§45 的两轮回填**都是数据修复**。新轮次落地时会**拷贝上一轮状态块**，
+  于是陈旧的 `prior_state.peak_nav` 重新进入新实例 —— 第二轮回填**进行中**落地的
+  `2026-11-16/142959` 就是证据（它同样继承了幻影峰值，只因源文件已先被修好，今天才读到 `203049.96`）。
+  `NV13` 交付的是**只读出处判定 + 一个 opt-in 的失败关闭闸门**：**可见**、可**显式拒绝**，
+  但**不是**「被拦住」。带签名的 ATH 记录（真修复）**仍未做**，见下第 7 项。
+- **台账**：[`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md)
+  §2.27 的 `NV13`（本日已由 `[ ]` 转 `[x]`，第 7 项原样保留缺口）。
+
+**1. 五个标签（唯一真值表）**
+
+| 标签 | 含义 | `[WARN]` | `--require-provable-peak` |
+| --- | --- | :---: | :---: |
+| `leg_verified` | 峰值 ≤ 最高逐腿核算净值 ×(1+tol) | 否 | 放行 |
+| `attributable_external` | 超出容差带，但**已声明**（`--peak-nav` / `peak_nav_operator_ath`） | 否 | 放行 |
+| `unverified_inherited` | 超出容差带且**未声明**（2026-11-05 那颗幻影的形状） | **是** | **exit 2** |
+| `unverifiable` | 峰值可用，但本轮**没有**任何逐腿核算净值可比对 | **是** | **exit 2** |
+| `missing` | 根本没有可用的峰值（缺席 / 非有限 / ≤ 0） | 否 | 放行 |
+
+**2. `unverifiable` 为什么是后加的（如实记录一次失败开放）**
+
+- 第一版实现只有 `missing` 一个「无出处」标签，于是把「**没有峰值**」与「**峰值在、但没东西可比**」
+  混成了一种 ⇒ 那条**失败关闭**的开关恰好在**无法校验**的部署上**静默放行**：非归档 `--output-dir`、
+  归档扫描失败、空树 —— 正是它存在的理由那几种情形。
+- 这是**独立复核**发现的（HIGH）。当时**还有一条用例把错误行为钉住**（断言「峰值在但无腿序列」判
+  `missing`），所以同一次自测**不可能**发现它 —— 记在这里，是因为「有测试覆盖」曾被当成已验收的理由。
+- 修法不是把开关放宽，而是**拆标签**：`missing` = 无峰值可当分母（不可能携带幻影，仍不拒绝）；
+  `unverifiable` = 峰值在用但本轮**没能校验**（拒绝）。**开关现在区分「不能校验」与「没有东西可校验」。**
+
+**3. 容差 `PEAK_PROVENANCE_TOL = 0.5%` 是分离装置，不是原理**
+
+- 合法外部 ATH **`203,049.96`**（2026-09-29，早于归档树的腿序列）落在归档最高逐腿核算净值
+  **`202,483.94`**（2026-11-03）上方 **+0.28%**；幻影 **`208,830.78`** 落在上方 **+3.13%**。
+- 0.5% 让合法的落在带内 **1.8 倍**、幻影落在带外 **6.3 倍**。数字与容差**逐字**写进告警与拒绝消息，
+  读者不必反推；已知代价如实披露：比真 ATH 再高 0.4% 的外部峰值会被读成 `leg_verified`。
+
+**4. 证据边界（防「自我抬升」）**
+
+- 逐腿核算净值只取归档**最近 40 个日期**（`PEAK_EVIDENCE_MAX_DATES`，约两个月），**时点正确**
+  （`date <= as_of`，未来日期一律不读），并**只**收 `hwm_eligibility` 判为**同一时相**的轮次 ——
+  幻影自己那双腿（`186,218.00 + 22,612.78`）因此**不能**把证据最大值抬上去。
+
+**5. 默认路径逐位不变，且只多一行告警**
+
+- 三个新键（`peak_provenance` / `peak_provenance_detail` / `max_leg_verified_nav`）在**阶梯之后**计算、
+  **永不回流**任何判定字段。
+- 用例 `test_every_peak_provenance_label_leaves_the_decision_dict_bit_identical` 把**同一输入**走遍
+  全部可达标签，断言整字典除这三键**完全相等**（并与不带证据的旧签名调用相等），同时**钉住绝对阶梯值**
+  （`peak_nav` = 真 ATH、`drawdown_pct` = 12.34%、`tier = TIER_1_DAMPING`、线性缩放、两级计数器、
+  `hwm_guard_applied=False`）⇒「相等」不可能等于「一致地错」。
+- **flag-off 下唯一有意变化**：`unverifiable` 时新增一行 `[WARN] 峰值无法校验`。其余输出零改动。
+
+**6. `--require-provable-peak`：opt-in、默认 OFF、拒绝发生在任何写之前**
+
+- 调用点在 `main()` 里紧跟 `inspect_portfolio_drawdown` 之后、dashboard / 报告 / `save_account_state` /
+  Stage-2 交接**之前** ⇒ 拒绝不会留下票据或半写的轮次，退出码 **2**（与修复脚本的护栏同码）。
+- 两个拒绝标签的消息**不同**：`unverified_inherited` 指向「超出所有逐腿核算净值且无人声明」；
+  `unverifiable` 明说这是「**本轮没能校验**」，**不是**「峰值是错的」。
+- 默认不拒绝是刻意：让会话不出报告属**行为变更**，按规则 9 先只上告警，把开关交给操作者。
+
+**7. 剩余缺口：带签名的 ATH 记录（未做）**
+
+- 真修复需要生产者落一条 **`{peak_nav, observed_at, source_round, leg_snapshot_fingerprint,
+  strategy_version, base_version}`**，把它当作**第五种出处**，并保证它能**在 `prior_state` 拷贝中存活**。
+- 在此之前：**保持开关 OFF**，只在 pre-flight / CI 里用 —— 那里一次拒绝的代价是重排一次发布，
+  不是错过一个会话。任何「`NV13` 已闭合峰值继承缺陷」的说法都是错的。
+
+**8. 同批复核整改：修复脚本的两处写链缺陷（`scripts/repair_live_nav_hwm.py`，脚本自述 `1.3.0`）**
+
+- **显式 `--peak` 之前只有下界、没有上界**：高于 `max_leg_nav_all ×(1+PEAK_PROVENANCE_TOL)` 时现在会
+  **大声告警**（dry-run 打印、**并写进 manifest** 的 `peak_warnings`），但**不中止** —— 操作者声明的
+  外部 ATH 是合法的，只是不得静默。文档里的理由也一并更正：既有 floor 是保护**自动推导路径**的
+  **下界**，**不是**防幻影的东西。在这之前 `--peak 208830.78` 会把本工具存在的意义**静默**写回去。
+- **写链对通用 I/O 失败事务化**：`write_bytes_atomic` 失败时**自己删掉**临时文件；
+  `ApplyAbortedError` 报出**哪些文件已重写、哪个失败**（含遗留的 `.orig`）；**即使部分失败仍写一份
+  `incomplete: true` 的 manifest**（一次不完整的修复不得无账可查）；退出码 **2**。
+- **字节级作用域由「断言」改为「检查」**：序列化后逐字段比对，任何落在**六个**被修字段
+  （顶层三键 + 嵌套 `prior_state` 同三键）之外的改动在**写入前**抛 `RepairScopeError`；
+  `passes` 条目畸形抛 `ManifestError`，不再被静默丢弃。
+
+**9. 版本轴与边界**
+
+- **零策略类 `version` 变动、零 `BASE_VERSION` 变动**：`NV13` 只加了 CLI 开关、纯函数助手与上报键；
+  因此零 `--dump-strategies`、零 `strategy_dumps/*.json` 重生成。唯一变动的版本号是**脚本自述**
+  `SCRIPT_VERSION` `1.2.0` → **`1.3.0`**，它不属这两条轴（§45.6 / §45.7 的先例）。
+- **未做**：未改层级阈值（`-10/-15/-20%`）、未改 `peak = max(peak, nav)` 的棘轮语义、
+  未改 `prior_state.current_nav`、未 `git commit`、未触碰真实归档 `data/runs/**`。
+- **离线验证位置**：`pipeline/tests/test_live_nav_hwm.py`（五标签真值表 / 逐位相等 + 绝对阶梯值 /
+  两种拒绝标签 / `missing` 不拒绝 / flag-off 逐字节 / 证据基数只收同一时相 / 上界告警进 manifest /
+  部分失败留 `incomplete: true` / 作用域检查 / 畸形 `passes`）与
+  `pipeline/tests/test_vol_scope_diagnostics.py`（告警在 dashboard 与 Markdown 各渲染一次、
+  其它标签静默）；全部离线合成归档。本轮只读复核实测：两个文件合计 **111 passed**。

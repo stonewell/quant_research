@@ -20,6 +20,7 @@
    - 实时计算组合总资产净值 (NAV)、闲置资金与现金占比。
    - 持仓账本**仅**持久化于运行归档中（取簿优先级见第 6 项）；不再存在任何全局持仓文件。
    - **手工保存同时记录"这是人确认过的账本"。** `POST /api/holdings`（未钉住运行目录的保存）会在逐字节相同的 `holdings.json` 旁写入 `operator_holdings.json`：`{"saved_at", "source": "operator_manual_correction", "holdings"}`。它是**部分成交**的唯一记录（本系统不接收任何券商成交回执），因此在**展示**与**种子**两条路径上都压过该轮的计划账本。部署路径始终钉住自己的运行目录，故永不写这个文件。
+   - **提交的账本与同一日的计划账本逐股一致时返回 `409`，除非调用方明确确认。** 计划账本（`post_holdings.json`）是"若每张工单都按其指令成交"的**推演**，**不是成交回执**；而 UI 在二阶成功后会把该计划画进持仓表，于是"点一下保存"就会把推演值写成 `operator_holdings.json`（`source: operator_manual_correction`），此后每一轮都把它当作**人已核实过**的账本。故未带 `confirm_plan_book: true` 的非空计划形态账本会被拒（HTTP `409`，与部署侧的 `UnconfirmedPlanAsInputError` 同一语义、不同入口）。逃生门是**显式**的：只有当你已对照券商实际成交逐股核实、确认真实账簿与计划完全一致时，才可带 `confirm_plan_book: true` 重投。选取规则：实例**由新到旧**、取**第一个有 `post_holdings.json`** 的实例（有更新的计划时绝不拿被取代实例）；带策略 / 标的池选择键时只在该选择内比，**不带键时与当日每个目录都比**，故"把键去掉"不是绕过；门禁在 `os.makedirs` **之前** ⇒ 被拒保存让归档**逐字节不变**。Web UI 现在会把该拒单**如实呈现**（渲染服务端 `detail`、给出"已核实→确认重投"的显式入口），不再把它记成 `[SUCCESS]`。
 4. **一阶：组合健康度与宏观门禁 (Stage 1: Portfolio Health & Macro Gate)**：
    - 计算自历史最高净值 (HWM) 的峰谷回撤。
    - 评估熔断层级（正常、一阶阻尼、二阶防守、三阶暂停冷冻）及自愈冷却计数，全面兼容混合策略参数前缀 (`cfsb_`, `crb_`, `ccsb_`, `cdhb_`, `blend_`)。
@@ -39,6 +40,7 @@
      - `stage1_health_report.json`：当日健康度门禁评估报告。
      - `live_trading_ticket.json` 与 `live_trading_ticket.csv`：当日生成的交易指令清单。
      - `post_holdings.json`：该轮交易单假设成交后的计划持仓账本。
+     - `post_holdings.meta.json`：该账本的**证明侧车**（`{"complete", "source", "as_of_date", "n_symbols", …}`）。账本与侧车是**一个失败关闭的对**：先落 `complete: false` → 写账本 → 再落 `complete: true`（每步 `os.replace`），故崩溃只会留下"侧车未完成"（不可用），**绝不会**留下"有账本无侧车"。**侧车缺席 ⇒ 这是侧车特性（2026-11-11 落地）之前的旧轮次**，不是"本轮丢了账本"；后者由 `summary.json` 的 additive 键 `post_holdings_written`（**键缺席 = 旧轮次**）/ `post_holdings_reason` / `post_holdings_meta_source` 与完整性检查器的 `[legacy]` / `[当前轮]` 标签区分。
      - `summary.json`：运行参数、执行耗时与日志输出。
    - **持仓与账户状态只持久化于此**：当请求未携带显式账本（正常 UI 流程对未改动的**非空**表格发送 `current_holdings: null`；经操作者确认的空账本是例外，必须显式提交，因为只有显式提交的空账本才能被 `confirm_empty_book` 授权）时，部署按以下顺序取种子：本会话的操作者手工修正（`operator_holdings.json`）→ 该轮计划盘后账本（`post_holdings.json`）→ 从未跑完二阶的会话目录中的快照（`holdings.json` / `current_holdings.json`）→ 上一轮的计划账本；全部皆无时拒绝生成交易单——以空账本定量会把已经卖出的仓位重新买回来。
    - **提交的空账本被拒绝，而非被当作"全现金"。** 形如 `{}`、全为零或每一行都没有可用股数的持仓簿会被拒绝（`EmptyBookConfirmationRequiredError`），因为引擎会为每个当前持仓标的生成卖出工单——等价于一次整仓清仓。真正意图是全现金的账户应每次请求中显式传 `confirm_empty_book: true`（Web UI 会先弹窗向操作员确认）；该轮归档时以 `holdings_seed_source = "operator_confirmed_empty_book"` 落盘，以便审计时与操作者手动录入的持仓清单（`operator_input`）区分开来。该门禁刻意不设环境变量开关（不同于 `LIVETRADING_STRICT_SEED_BOOK`），因为"表格还没填"绝不是合法的"全部现金"指令。
