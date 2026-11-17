@@ -78,7 +78,21 @@ class ChanFourStateBlendStrategy(BaseBlendAllocationStrategy):
     #   is touched, the daily provider is unchanged, and `None` (every other strategy)
     #   reproduces the old behaviour bit-for-bit -- hence a MINOR bump, not a MAJOR one, and
     #   `BASE_VERSION` stays `2.0.0` (`blend_base.py` untouched). See docs/version.md §40.
-    version: str = "1.4.0"
+    # 1.4.0 -> 1.5.0 (2026-11-16, owner decision / ablation arm B): the LIVE vol ceiling is now
+    #   measured on the PORTFOLIO, not on Stage-1's cross-sectional median of single-name vols.
+    #   `strategies_config.json` pins `"cfsb_vol_ceiling_scope": "portfolio"` (new
+    #   `StrategyConfig.cfsb_vol_ceiling_scope`, default `"stage1"` so no other strategy and no
+    #   legacy dump moves), and `scripts/run_live_strategy.py` applies it as SCALING
+    #   (`model_equity_sum * factor`) instead of a CAP (`min(model_equity_sum, factor)`).
+    #   WHY: the two quantities were never the same dimension -- 2026-11-16 measured single-name
+    #   median 30.3% vs a 12% PORTFOLIO target, so the cap bound on 100% of trading days and cut
+    #   CAGR 14.19% -> 6.04% for a Sharpe change whose bootstrap CI straddles 0
+    #   (`backtests_research/20261116_131625_volscope_ablation/`). Portfolio scope binds on ~17%
+    #   of days with CAGR ~13.2%. This changes DELIVERED LIVE EXPOSURE, hence a MINOR bump;
+    #   `blend_base.py` sizing is untouched and `BASE_VERSION` stays `2.0.0` (bumping it would
+    #   make `scripts/live_preflight.py::select_prior_state`'s exact-string comparison skip the
+    #   previous snapshot and cold-start the book). See docs/version.md §46.
+    version: str = "1.5.0"
 
     def __init__(self, config: Optional[StrategyConfig] = None, version: Optional[str] = None):
         cfg = config or StrategyConfig()

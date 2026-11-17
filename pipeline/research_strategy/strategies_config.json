@@ -402,6 +402,7 @@
       "cfsb_portfolio_vol_overlay_enabled": true,
       "cfsb_portfolio_vol_overlay_mode": "cap",
       "cfsb_portfolio_vol_ceiling_force_exits": true,
+      "cfsb_vol_ceiling_scope": "portfolio",
       "blend_weighting_mode": "regime_ic_ir_hybrid",
       "blend_enable_orthogonalization": true,
       "blend_enable_structural_regime": true,

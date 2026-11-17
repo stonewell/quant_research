@@ -654,6 +654,22 @@ class StrategyConfig:
     # (user decision). Prefixed like the two keys above so it can never collide with a global
     # `StrategyConfig` field through `resolve_blend_param`'s bare-name fallback.
     cfsb_portfolio_vol_ceiling_force_exits: bool = True
+    # --- (2026-11-16 owner decision, ablation arm B) WHICH volatility the ceiling measures ---
+    # `stage1` (DEFAULT) = the status quo: Stage-1's cross-sectional MEDIAN of single-name vols
+    # compared against a PORTFOLIO target (0.12) -- two different dimensions, so it binds on
+    # 100% of trading days. `portfolio` = `sqrt(w'Cov w)` on the model's own target weights
+    # (21d covariance, 252-annualised) against this strategy's regime target (0.24 when
+    # breadth >= 0.60 else 0.12), i.e. the same dimension, applied as SCALING (`sum x factor`)
+    # instead of a cap (`min(sum, factor)`).
+    # Declared here (and pinned per-strategy in `strategies_config.json`) so the key round-trips
+    # through `StrategyConfig.from_dict` instead of being dropped as "unknown". The default is
+    # `stage1` ON PURPOSE: the offline ablation's verdict was INCONCLUSIVE (paired bootstrap CI
+    # straddles 0), so no other strategy and no legacy dump changes behaviour. The runner
+    # (`scripts/run_live_strategy.py::resolve_vol_ceiling_scope`) owns the real resolution
+    # order (allowlist -> CLI -> this prefixed key -> `stage1`) and degrades an unknown
+    # spelling to `stage1` with `fallback_reason` instead of raising here -- a typo must never
+    # make the live config unconstructible, and it must never silently re-lever the book.
+    cfsb_vol_ceiling_scope: str = "stage1"
 
     # --- Chan Crisis Shield Blend Strategy (chan_crisis_shield_blend) ---
     ccsb_three_type_weight: float = 0.45
