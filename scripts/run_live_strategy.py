@@ -759,12 +759,23 @@ from common.freshness import (
 )
 
 
+# (2026-11-16) `CHINA_EQUITY_SECTORS` is imported BESIDE `_get_symbol_sector` on purpose:
+# `_get_symbol_sector` silently falls back to a code-prefix bucket (`sec_60` / `sec_00`) for
+# any name the table does not list, and the audit label `detail_reason.sector_throttle
+# ["sector_source"]` must be derived from the SAME table the classifier used -- re-spelling
+# the mapping here would let the two drift apart. A missing import degrades the label to
+# `"unknown"` (see `resolve_sector_source`); it must never crash a ticket.
 try:
-    from pipeline.research.blend.blend_base import _get_symbol_sector
+    from pipeline.research.blend.blend_base import (
+        CHINA_EQUITY_SECTORS,
+        _get_symbol_sector,
+    )
 except ImportError:
     try:
-        from research.blend.blend_base import _get_symbol_sector
+        from research.blend.blend_base import CHINA_EQUITY_SECTORS, _get_symbol_sector
     except ImportError:
+        CHINA_EQUITY_SECTORS = None  # type: ignore[assignment]
+
         def _get_symbol_sector(sym: str) -> str:
             raw = sym.split(".")[0]
             return f"sec_{raw[:2]}" if len(raw) >= 2 else "sec_other"
@@ -2122,6 +2133,26 @@ def parse_args(args: Optional[List[str]] = None):
         ),
     )
     parser.add_argument(
+        "--vol-ceiling-scope",
+        choices=VOL_CEILING_SCOPES,
+        default=None,
+        help=(
+            "(2026-11-16) WHICH volatility the Stage-1 vol ceiling is measured against, for the "
+            "allowlisted live strategy only (chan_four_state_blend). `stage1` (DEFAULT, and the "
+            "value used when this flag is omitted) keeps today's scope: a cross-sectional median "
+            "of single-name vols compared against a portfolio target -- the offline ablation "
+            "2022-04..2026-11 (backtests_research/20261116_131625_volscope_ablation) shows it "
+            "binds on 100%% of trading days, cutting CAGR 14.19%%->6.04%% with a Sharpe change "
+            "whose paired bootstrap 95%% CI (-0.175..+0.162) straddles 0, i.e. NOT a proven "
+            "improvement. `portfolio` measures sqrt(w'Cov w) on the model's own target weights "
+            "(21d covariance, 252-annualised) against the strategy's regime target (0.24 when "
+            "breadth >= 0.60 else 0.12): 17%% of days binding, CAGR 13.16%%, Sharpe 1.129. The "
+            "verdict was INCONCLUSIVE, so the default is unchanged and this flag is the opt-in. "
+            "Omitted -> the strategy param `cfsb_vol_ceiling_scope` -> `stage1`. An unknown "
+            "spelling falls back to `stage1` and records the rejection in the overlay audit."
+        ),
+    )
+    parser.add_argument(
         "--allow-stale-prices",
         action="store_true",
         help=(
@@ -3239,6 +3270,53 @@ VOL_OVERLAY_LIFECYCLE_SHORTFALL_RATIO = 0.8
 VOL_OVERLAY_SUPERSEDED_BY_CIRCUIT_BREAKER = "circuit_breaker_tier3"
 
 # ---------------------------------------------------------------------------------------
+# (2026-11-16) VOL CEILING *SCOPE* -- a switch, NOT a default flip
+#
+# MEASURED (offline ablation `scripts/run_vol_ceiling_ablation.py`, results archived in
+# `backtests_research/20261116_131625_volscope_ablation/`, 2022-04..2026-11): the status-quo
+# Stage-1 scope compares a CROSS-SECTIONAL MEDIAN of single-name vols (2026-11-16: 0.3033)
+# against a PORTFOLIO target (0.12). It binds on 100% of trading days, cutting CAGR
+# 14.19% -> 6.04% while Sharpe only moved 1.173 -> 1.128 -- and the paired block-bootstrap
+# 95% CI on the B-A Sharpe difference is [-0.175, +0.162], i.e. the improvement is NOT
+# significant. A portfolio-scoped cap (sqrt(w' Σ w), 63d or 21d covariance) binds on 17%
+# of days with CAGR 13.16% / Sharpe 1.129.
+#
+# VERDICT: INCONCLUSIVE (the documented decision rule requires the CI to exclude 0). So the
+# DEFAULT MUST NOT CHANGE without a human decision: `stage1` stays the default and reproduces
+# today's orders bit-for-bit. `portfolio` is OPT-IN via the strategy-PREFIXED key
+# `cfsb_vol_ceiling_scope` (AGENTS.md: never a bare name -- the 2026-10-21 `wq_alpha_id`
+# collision) or the `--vol-ceiling-scope` CLI override. Gated behind the SAME
+# `PORTFOLIO_VOL_OVERLAY_STRATEGY_KEYS` allowlist as the overlay itself.
+VOL_CEILING_SCOPE_PARAM = "cfsb_vol_ceiling_scope"
+VOL_CEILING_SCOPE_STAGE1 = "stage1"
+VOL_CEILING_SCOPE_PORTFOLIO = "portfolio"
+VOL_CEILING_SCOPES: Tuple[str, ...] = (
+    VOL_CEILING_SCOPE_STAGE1,
+    VOL_CEILING_SCOPE_PORTFOLIO,
+)
+#: Reason code for "a scope spelling was declared/typed that is not in `VOL_CEILING_SCOPES`".
+#: The effective scope degrades to the SAFE default (`stage1` = today's behaviour), and the
+#: rejected spelling stays visible in `declared` + this reason -- never silently swallowed.
+VOL_CEILING_SCOPE_UNKNOWN_REASON = "unknown_vol_ceiling_scope"
+#: Reason code for "portfolio scope was requested but the covariance inputs were not usable".
+#: There is NO cap in that case (the Stage-1 factor is used instead): an unmeasured portfolio
+#: vol is not a calm market, and inventing a factor from a partial window would silently
+#: re-lever the book.
+VOL_CEILING_SCOPE_FALLBACK_REASON = "portfolio_vol_unavailable"
+#: Regime target vols and the breadth branch, copied from `blend_base.py:1557-1575` (the
+#: strategy's OWN sizing engine) so the alternative scope is measured against the target the
+#: backtest actually used: 0.24 when breadth >= 0.60 (bull branch), else 0.12.
+VOL_CEILING_TARGET_BULL_VOL = 0.24
+VOL_CEILING_TARGET_BASE_VOL = 0.12
+VOL_CEILING_BREADTH_BULL_THRESHOLD = 0.60
+#: Covariance windows for the portfolio-scoped factor. 21d feeds the factor; 63d is REPORTED
+#: alongside (the ablation's primary arm used 63d, B21 was the 21d robustness check -- both
+#: were statistically indistinguishable, so the faster-reacting 21d is the applied one).
+VOL_CEILING_COV_SHORT_WINDOW = 21
+VOL_CEILING_COV_LONG_WINDOW = 63
+VOL_CEILING_TRADING_DAYS = 252
+
+# ---------------------------------------------------------------------------------------
 # (PLAN C, 2026-11-12) VOL CEILING -> FORCED DE-RISK OF ALREADY-EXITING POSITIONS
 #
 # MEASURED DEFECT (replay of 2026-11-09): `binding=true` did NOT mean "the book was reduced to
@@ -3297,6 +3375,177 @@ VOL_CEILING_FORCE_EXITS_PARAM = "cfsb_portfolio_vol_ceiling_force_exits"
 #: `post_holdings.json` by this runner; read by `web/livetrading/storage.py`
 #: (`post_holdings_meta_status`), which keeps the same filename constant.
 POST_HOLDINGS_META_FILENAME = "post_holdings.meta.json"
+POST_HOLDINGS_FILENAME = "post_holdings.json"
+
+#: (NV10) `reason` values of `write_post_holdings_attestation` -- kept byte-identical to
+#: `web/livetrading/storage.py`'s constants so a reader can switch on one vocabulary.
+POST_HOLDINGS_REASON_OK = "post_holdings_meta_complete"
+POST_HOLDINGS_REASON_WRITE_FAILED = "post_holdings_write_failed"
+
+
+class PostHoldingsAttestationError(RuntimeError):
+    """(NV10) The ticket was produced, but its post-trade book could not be attested.
+
+    Raised at the very END of `main()` (after `account_state.json` is persisted) so the
+    operator keeps the ticket AND the state, while the ROUND stops being reportable as
+    successful: `web/livetrading` derives `deploy_status` from this process's exit code, and
+    `check_live_run_integrity.py` reads the last `...Error:` line of stderr as the detail.
+
+    WHY THIS EXISTS (defect): the write used to live in `try/except` blocks that printed
+    `[WARN] Failed to write post_holdings.json` and carried on.  A round whose book was lost
+    looked EXACTLY like a pre-D5 legacy round -- no sidecar -- so nothing could tell
+    "this round lost its book" from "this round is old" (the 10 `POST_HOLDINGS_MISSING`
+    findings measured on 2026-11-16 are all the latter).  Silent, and unfalsifiable.
+    """
+
+
+def _json_positive_symbol_count(book: Optional[Dict[str, Any]]) -> int:
+    """Symbols in `book` with a POSITIVE integer share count (never raises)."""
+    count = 0
+    for value in (book or {}).values():
+        try:
+            if int(float(value)) > 0:
+                count += 1
+        except (TypeError, ValueError):
+            continue
+    return count
+
+
+def _atomic_write_json_file(path: str, payload: Any) -> None:
+    """Serialise to `<path>.tmp` then `os.replace` (same pattern as `_write_effective_params`).
+
+    A reader can only ever observe the previous bytes or the complete new payload -- which is
+    what makes "attestation last" meaningful: no half-written sidecar can be mistaken for an
+    attestation, and no truncated book can replace a good one.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, ensure_ascii=False, default=str)
+            fh.flush()
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def post_holdings_attestation_gate(
+    ticket_written: bool,
+    write_result: Optional[Dict[str, Any]],
+    *,
+    out_json: str = "",
+) -> Optional[str]:
+    """(NV10) The FATAL message when a ticket exists without its attested book, else None.
+
+    Extracted from `main()` so the rule is testable without running a whole strategy:
+    `ticket_written and not write_result["written"]` is the ONLY condition that fails a
+    round.  Everything else -- no ticket at all, an underivable book -- is reported through
+    the result dict, never by inventing a failure.  This message is returned to `main()`,
+    which raises it: the process then exits nonzero, and that exit code is what
+    `web/livetrading` records as `deploy_status=FAILED` (this child never writes
+    `summary.json::post_holdings_written`; the parent's `execution_service` does).
+    """
+    if not ticket_written:
+        return None
+    result = write_result or {}
+    if result.get("written"):
+        return None
+    return (
+        f"ticket written to {out_json or '<output_dir>'} but its post-trade book could not "
+        f"be attested ({POST_HOLDINGS_FILENAME} + {POST_HOLDINGS_META_FILENAME}): "
+        f"reason={result.get('reason')} error={result.get('error')} -- the next round must "
+        "not seed from an un-attested book; re-run this round after fixing the write failure "
+        "(a partial sidecar stays complete=false on purpose)"
+    )
+
+
+def write_post_holdings_attestation(
+    output_dir: Optional[str],
+    book: Optional[Dict[str, Any]],
+    *,
+    as_of_date: Any,
+    run_mode: str = "live",
+) -> Dict[str, Any]:
+    """(NV10) Write `post_holdings.json` + `post_holdings.meta.json` as ONE fail-closed pair.
+
+    ORDER IS THE CONTRACT. The sidecar is first written with `complete: false`, then the
+    book, then `complete: true` LAST. A crash between the steps therefore leaves
+    `post_holdings_meta_incomplete` (UNUSABLE) -- never the pre-D5 shape ("book present, no
+    sidecar") that `classify_post_holdings_meta` deliberately treats as legacy-but-usable.
+
+    Returns a result dict; NEVER raises on I/O (the caller decides to fail the round):
+      {"written": bool, "book_written": bool, "meta_written": bool, "complete": bool,
+       "reason": str, "n_symbols": int, "source": "ticket"|"replay",
+       "book_path": str|None, "meta_path": str|None, "error": str|None}
+
+    `book=None`/non-dict is reported as `ticket_without_target_shares`: an UNKNOWN book is
+    not an empty one and must not be attested as complete.
+    """
+    result: Dict[str, Any] = {
+        "written": False,
+        "book_written": False,
+        "meta_written": False,
+        "complete": False,
+        "reason": POST_HOLDINGS_REASON_WRITE_FAILED,
+        "n_symbols": 0,
+        "source": "replay" if str(run_mode) == "replay" else "ticket",
+        "book_path": None,
+        "meta_path": None,
+        "error": None,
+    }
+    if not output_dir:
+        result["reason"] = "output_dir_missing"
+        return result
+    if not isinstance(book, dict):
+        result["reason"] = "ticket_without_target_shares"
+        return result
+
+    book_path = os.path.join(output_dir, POST_HOLDINGS_FILENAME)
+    meta_path = os.path.join(output_dir, POST_HOLDINGS_META_FILENAME)
+    n_symbols = _json_positive_symbol_count(book)
+    result.update(book_path=book_path, meta_path=meta_path, n_symbols=n_symbols)
+
+    def _meta(complete: bool, n: int, note: Optional[str] = None) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "as_of": str(as_of_date),
+            "complete": complete,
+            "n_symbols": n,
+            "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "source": result["source"],
+        }
+        if note:
+            payload["note"] = note
+        return payload
+
+    try:
+        _atomic_write_json_file(
+            meta_path,
+            _meta(
+                False,
+                0,
+                "pending: the book is being written (a crash here must read as INCOMPLETE, "
+                "never as a legacy-but-usable book)",
+            ),
+        )
+        result["meta_written"] = True
+        _atomic_write_json_file(book_path, book)
+        result["book_written"] = True
+        _atomic_write_json_file(meta_path, _meta(True, n_symbols))
+    except OSError as exc:
+        result.update(
+            written=False,
+            complete=False,
+            reason=POST_HOLDINGS_REASON_WRITE_FAILED,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return result
+
+    result.update(written=True, complete=True, reason=POST_HOLDINGS_REASON_OK)
+    return result
 
 
 def _row_weight(row: Dict[str, Any], key: str = "target_weight") -> float:
@@ -3481,6 +3730,79 @@ VOL_OVERLAY_ENABLED_PARAM = "cfsb_portfolio_vol_overlay_enabled"
 VOL_OVERLAY_MODE_PARAM = "cfsb_portfolio_vol_overlay_mode"
 
 
+def resolve_vol_ceiling_scope(
+    strategy_key: Optional[str],
+    params: Optional[Dict[str, Any]],
+    *,
+    cli_value: Optional[str] = None,
+    config_origin: str = SOURCE_DUMP,
+) -> Dict[str, Any]:
+    """Resolve WHICH volatility the ceiling is measured against: `(scope, source, declared)`.
+
+    RESOLUTION ORDER (documented, and pinned by `test_vol_ceiling_scope.py`):
+      1. STRATEGY ALLOWLIST FIRST -- the scope belongs to the same overlay, so a strategy off
+         `PORTFOLIO_VOL_OVERLAY_STRATEGY_KEYS` reports `stage1` / `source=default` and its
+         ticket never mentions a scope at all.
+      2. `--vol-ceiling-scope` CLI value (source `override`) -- an operator pin outranks the
+         dump, exactly like every other runner resolver.
+      3. The strategy-PREFIXED dump key `cfsb_vol_ceiling_scope` (source = `config_origin`).
+         A BARE `vol_ceiling_scope` / `portfolio_vol_ceiling_scope` spelling is IGNORED on
+         purpose: `resolve_blend_param`'s final fallback is a bare `getattr(cfg, name)`, the
+         exact collision class of the 2026-10-21 `wq_alpha_id` incident.
+      4. Default `stage1` (source `default`) = today's behaviour, which the ablation did NOT
+         justify changing (`decision.flip_recommended = false`).
+
+    An UNKNOWN spelling (case/whitespace-insensitive) degrades to `stage1` and reports the
+    rejection in `fallback_reason`; the raw spelling stays in `declared`, so a typo is
+    readable rather than silent. Returns all keys always:
+
+        {allowlisted, scope, declared, source, cli_override, fallback_reason}
+    """
+    allowlisted = strategy_key in PORTFOLIO_VOL_OVERLAY_STRATEGY_KEYS
+    declared_raw = (params or {}).get(VOL_CEILING_SCOPE_PARAM)
+    result: Dict[str, Any] = {
+        "allowlisted": allowlisted,
+        "scope": VOL_CEILING_SCOPE_STAGE1,
+        "declared": declared_raw,
+        "source": SOURCE_DEFAULT,
+        "cli_override": False,
+        "fallback_reason": None,
+    }
+    if not allowlisted:
+        # The gate's own built-in default, not the dump's value (same honesty rule as
+        # `resolve_portfolio_vol_overlay_provenance`).
+        return result
+
+    def _normalise(raw: Any) -> Optional[str]:
+        if raw is None:
+            return None
+        text = str(raw).strip().lower()
+        return text or None
+
+    cli_norm = _normalise(cli_value)
+    declared_norm = _normalise(declared_raw)
+    if cli_norm is not None:
+        result["cli_override"] = True
+        result["source"] = SOURCE_OVERRIDE
+        if cli_norm in VOL_CEILING_SCOPES:
+            result["scope"] = cli_norm
+        else:
+            # argparse `choices` normally makes this unreachable; a programmatic caller can
+            # still get here, and a typo must never disable the (default) stage1 cap.
+            result["scope"] = VOL_CEILING_SCOPE_STAGE1
+            result["fallback_reason"] = VOL_CEILING_SCOPE_UNKNOWN_REASON
+        return result
+    if declared_norm is not None:
+        result["source"] = config_origin
+        if declared_norm in VOL_CEILING_SCOPES:
+            result["scope"] = declared_norm
+        else:
+            result["scope"] = VOL_CEILING_SCOPE_STAGE1
+            result["fallback_reason"] = VOL_CEILING_SCOPE_UNKNOWN_REASON
+        return result
+    return result
+
+
 def resolve_portfolio_vol_overlay_provenance(
     strategy_key: Optional[str],
     params: Optional[Dict[str, Any]],
@@ -3581,6 +3903,38 @@ def record_portfolio_vol_overlay_effective_params(
     return provenance
 
 
+def record_vol_ceiling_scope_effective_param(
+    entries: Dict[str, Dict[str, Any]],
+    declared_params: Dict[str, Any],
+    params: Optional[Dict[str, Any]],
+    strategy_key: Optional[str],
+    *,
+    cli_value: Optional[str] = None,
+    config_origin: str = SOURCE_DUMP,
+) -> Dict[str, Any]:
+    """Register `cfsb_vol_ceiling_scope` as a provenance triple; returns the resolution.
+
+    Same registration contract as `record_portfolio_vol_overlay_effective_params` (which owns
+    the other overlay keys), kept as its own function so the scope can be resolved ONCE for
+    the run -- `main()` stores the returned dict and hands `["scope"]` to
+    `apply_portfolio_vol_overlay_for_strategy`, so the snapshot and the executed cap can never
+    disagree. `params` is what the resolver reads, `declared_params` the pre-mutation freeze;
+    they coincide for this key (nothing writes it back).
+    """
+    resolution = resolve_vol_ceiling_scope(
+        strategy_key,
+        params,
+        cli_value=cli_value,
+        config_origin=config_origin,
+    )
+    entries[VOL_CEILING_SCOPE_PARAM] = param_entry(
+        declared_params.get(VOL_CEILING_SCOPE_PARAM),
+        resolution["scope"],
+        resolution["source"],
+    )
+    return resolution
+
+
 def resolve_stage1_vol_inputs(health_report: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Read Stage-1's realized volatility / Barroso factor out of the health report.
 
@@ -3634,6 +3988,253 @@ def resolve_stage1_vol_inputs(health_report: Optional[Dict[str, Any]]) -> Dict[s
     return info
 
 
+def _health_breadth(health_report: Optional[Dict[str, Any]]) -> Optional[float]:
+    """Market breadth out of the health report (`market_macro.breadth` then top-level).
+
+    Mirrors the two spellings the runner already reads elsewhere (`main()`'s
+    `breadth_val`), but returns `None` instead of a 0.50 placeholder: the caller must be able
+    to say "breadth was unavailable", because a silent 0.50 would pick the BEAR target while
+    looking like a measurement.
+    """
+    report = health_report or {}
+    candidates: List[Any] = []
+    macro = report.get("market_macro")
+    if isinstance(macro, dict):
+        candidates.append(macro.get("breadth"))
+    candidates.append(report.get("breadth"))
+    for raw in candidates:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(value):
+            return value
+    return None
+
+
+def resolve_target_vol_for_scope(
+    health_report: Optional[Dict[str, Any]],
+) -> Tuple[float, str]:
+    """Regime target vol for the PORTFOLIO-scoped factor + WHERE it came from.
+
+    `blend_base.py:1557-1575` (the strategy's own sizing engine, and therefore the target the
+    ablation measured against) uses 0.24 on the bull branch (`breadth >= 0.60`) and 0.12
+    otherwise. Breadth unavailable -> 0.12, reported as
+    `target_vol_source="breadth_unavailable_default"` so the audit never presents a defaulted
+    target as a measured one.
+    """
+    breadth = _health_breadth(health_report)
+    if breadth is None:
+        return VOL_CEILING_TARGET_BASE_VOL, "breadth_unavailable_default"
+    if breadth >= VOL_CEILING_BREADTH_BULL_THRESHOLD:
+        return VOL_CEILING_TARGET_BULL_VOL, "breadth"
+    return VOL_CEILING_TARGET_BASE_VOL, "breadth"
+
+
+def _close_series(frame: Any) -> Optional[pd.Series]:
+    """Close-price series of one loaded universe frame (`Close` first, then the aliases)."""
+    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+        return None
+    for col in ("Close", "close", "Adj Close"):
+        if col in frame.columns:
+            series = pd.to_numeric(frame[col], errors="coerce")
+            if series.notna().any():
+                return series
+    return None
+
+
+def _covariance_annualized_vol(
+    returns: pd.DataFrame,
+    weights: Dict[str, float],
+    window: int,
+    trading_days: int,
+) -> Optional[float]:
+    """`sqrt(252 * w' Σ w)` over the last `window` daily returns, Σ = sample cov (ddof=1).
+
+    Returns `None` -- never a fabricated number -- when the window is incomplete, carries a
+    NaN, or the resulting variance is non-positive. Weights are the MODEL target weights as
+    passed (they need not sum to 1: the residual is cash, which contributes no variance).
+    """
+    syms = [s for s in weights if s in returns.columns]
+    if not syms:
+        return None
+    sub = returns[syms].tail(int(window))
+    if len(sub) < int(window):
+        return None
+    matrix = sub.to_numpy(dtype=float)
+    if not np.isfinite(matrix).all():
+        return None
+    w = np.array([float(weights[s]) for s in syms], dtype=float)
+    cov = np.cov(matrix, rowvar=False, ddof=1)
+    cov = np.atleast_2d(np.asarray(cov, dtype=float))
+    if cov.shape != (len(syms), len(syms)):
+        return None
+    var = float(w @ cov @ w)
+    if not np.isfinite(var) or var <= 0.0:
+        return None
+    return float(np.sqrt(var * float(trading_days)))
+
+
+def compute_portfolio_volatility(
+    target_series: Optional[pd.Series],
+    universe: Optional[Dict[str, Any]],
+    *,
+    cash_proxy: Optional[str] = None,
+    short_window: int = VOL_CEILING_COV_SHORT_WINDOW,
+    long_window: int = VOL_CEILING_COV_LONG_WINDOW,
+    trading_days: int = VOL_CEILING_TRADING_DAYS,
+) -> Dict[str, Any]:
+    """Portfolio vol of the MODEL's own pre-cap risky book, from the loaded daily bars.
+
+    `w` is the target vector `apply_portfolio_vol_overlay_for_strategy` receives (pre-cap,
+    cash excluded), `Σ` the sample covariance of the last `short_window` / `long_window` daily
+    close-to-close returns of the SAME loaded universe frames, annualised by `trading_days`.
+    This is the scope the strategy's own backtest scales on (`blend_base.py`), as opposed to
+    Stage-1's cross-sectional median of single-name vols.
+
+    STRICTNESS (deliberate): a held-but-unpriced symbol, a short window or a NaN cell makes
+    that window `None` -- the caller then records `portfolio_vol_unavailable` and keeps the
+    Stage-1 factor. Silently dropping a name would UNDERSTATE the portfolio vol and therefore
+    de-risk LESS, which is the one direction a risk ceiling must never drift by accident.
+
+    Returns (all keys always present):
+      * `portfolio_vol_21d` / `portfolio_vol_63d` -- annualised vols, `None` when unusable;
+      * `short_window` / `long_window` / `trading_days` -- the actual inputs used;
+      * `n_symbols` -- symbols that contributed; `missing_symbols` -- held but unpriced;
+      * `unavailable_reason` -- `None` when both windows produced a number.
+    """
+    info: Dict[str, Any] = {
+        "portfolio_vol_21d": None,
+        "portfolio_vol_63d": None,
+        "short_window": int(short_window),
+        "long_window": int(long_window),
+        "trading_days": int(trading_days),
+        "n_symbols": 0,
+        "missing_symbols": [],
+        "unavailable_reason": None,
+    }
+    if target_series is None or len(target_series) == 0:
+        info["unavailable_reason"] = "no_targets"
+        return info
+    weights: Dict[str, float] = {}
+    for sym in target_series.index:
+        if cash_proxy is not None and str(sym) == str(cash_proxy):
+            continue
+        try:
+            w = float(target_series[sym])
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(w) or w <= 0.0:
+            continue
+        weights[str(sym)] = w
+    if not weights:
+        info["unavailable_reason"] = "no_risky_weights"
+        return info
+    closes: Dict[str, pd.Series] = {}
+    missing: List[str] = []
+    for sym in weights:
+        frame = (universe or {}).get(sym)
+        series = _close_series(frame)
+        if series is None:
+            missing.append(sym)
+            continue
+        closes[sym] = series
+    info["missing_symbols"] = sorted(missing)
+    info["n_symbols"] = len(closes)
+    if missing:
+        # One unpriced holding is enough to make the aggregate incomplete.
+        info["unavailable_reason"] = "missing_price_history"
+        return info
+    if not closes:
+        info["unavailable_reason"] = "no_price_history"
+        return info
+    frame = pd.DataFrame(closes).sort_index()
+    # A suspension is a 0% return for a HELD name, not a missing observation (the ablation
+    # forward-filled for the same reason); leading NaNs still make the window unusable.
+    frame = frame.ffill()
+    returns = frame.pct_change()
+    info["portfolio_vol_21d"] = _covariance_annualized_vol(
+        returns, weights, info["short_window"], info["trading_days"]
+    )
+    info["portfolio_vol_63d"] = _covariance_annualized_vol(
+        returns, weights, info["long_window"], info["trading_days"]
+    )
+    if info["portfolio_vol_21d"] is None or info["portfolio_vol_63d"] is None:
+        info["unavailable_reason"] = "insufficient_history"
+    return info
+
+
+def resolve_vol_ceiling_factor(
+    *,
+    scope: str,
+    stage1_factor: Optional[float],
+    portfolio_vol: Optional[Dict[str, Any]] = None,
+    target_vol_used: Optional[float] = None,
+    target_vol_source: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Decide the EFFECTIVE ceiling factor for `scope`, and say why when it cannot.
+
+    `stage1` (default) -- `effective_factor` is left `None` here and derived by the caller
+    from the cap's own binding verdict (`book_scale_factor` is NOT used), so the arithmetic is
+    exactly the pre-2026-11-16 one.
+
+    `portfolio` -- `factor = min(1, target_vol_used / portfolio_vol_21d)`; `portfolio_vol_63d`
+    is reported alongside (the ablation's primary arm; the two were indistinguishable). If
+    EITHER vol is unusable there is NO cap: `scope_fallback_reason` is set and the caller
+    falls back to the Stage-1 factor, because an unmeasured portfolio vol must never be read
+    as a calm market.
+    """
+    effective_scope = str(scope or VOL_CEILING_SCOPE_STAGE1).strip().lower()
+    info: Dict[str, Any] = {
+        "scope": VOL_CEILING_SCOPE_STAGE1,
+        "stage1_factor": stage1_factor,
+        "portfolio_vol_21d": None,
+        "portfolio_vol_63d": None,
+        "target_vol_used": None,
+        "target_vol_source": None,
+        "effective_factor": None,
+        "scope_fallback_reason": None,
+    }
+    if effective_scope not in VOL_CEILING_SCOPES:
+        info["scope_fallback_reason"] = VOL_CEILING_SCOPE_UNKNOWN_REASON
+        return info
+    info["scope"] = effective_scope
+    if effective_scope == VOL_CEILING_SCOPE_STAGE1:
+        return info
+
+    vol_info = portfolio_vol or {}
+    raw_21 = vol_info.get("portfolio_vol_21d")
+    raw_63 = vol_info.get("portfolio_vol_63d")
+
+    def _positive(value: Any) -> Optional[float]:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(number) or number <= 0.0:
+            return None
+        return number
+
+    v21 = _positive(raw_21)
+    v63 = _positive(raw_63)
+    info["portfolio_vol_21d"] = v21
+    info["portfolio_vol_63d"] = v63
+    target = _positive(target_vol_used)
+    if target is None:
+        target = VOL_CEILING_TARGET_BASE_VOL
+        info["target_vol_source"] = target_vol_source or "default_base_vol"
+    else:
+        info["target_vol_source"] = target_vol_source or "caller"
+    info["target_vol_used"] = target
+    if v21 is None or v63 is None:
+        # BOTH windows must be usable: 21d feeds the factor, 63d is the disclosed reference,
+        # and a half-measured pair is exactly the "unknown read as calm" failure mode.
+        info["scope_fallback_reason"] = VOL_CEILING_SCOPE_FALLBACK_REASON
+        return info
+    info["effective_factor"] = float(min(1.0, target / v21))
+    return info
+
+
 def apply_portfolio_vol_ceiling(
     target_series: pd.Series,
     *,
@@ -3642,11 +4243,21 @@ def apply_portfolio_vol_ceiling(
     realized_vol_21d: Optional[float] = None,
     tolerance: float = WEIGHT_BUDGET_TOLERANCE,
     superseded_by: Optional[str] = None,
+    book_scale_factor: Optional[float] = None,
+    scope: str = VOL_CEILING_SCOPE_STAGE1,
 ) -> Tuple[pd.Series, Dict[str, Any]]:
     """Apply Stage-1's Barroso factor as a CEILING on the equity weight vector.
 
     CONTRACT (`mode="cap"`):
         equity_budget = min(Σ equity target weights, vol_scaling_factor)
+
+    `book_scale_factor` (2026-11-16, scope=portfolio ONLY) switches the SECOND term of that
+    `min` from "a fraction of NAV the book may occupy" to "scale the book's gross equity by
+    this ratio": `equity_budget = Σ equity * book_scale_factor`. The two are NOT
+    interchangeable: a portfolio-scoped factor (e.g. 0.6) is a RISK ratio, so reading it as a
+    NAV budget would leave a 46%-equity book completely untouched at 0.46 < 0.6 -- the exact
+    "presented as applied, actually inert" shape LV18 exists to kill. With the default
+    `book_scale_factor=None` this function is BIT-IDENTICAL to before.
 
     The factor is a CAP, never a multiplier. `BaseBlendAllocationStrategy` already applies its
     own Garman-Klass target-vol scaling (`blend_target_vol = 0.12`), which is why the model's
@@ -3690,6 +4301,14 @@ def apply_portfolio_vol_ceiling(
     summary: Dict[str, Any] = {
         "applied": False,
         "mode": PORTFOLIO_VOL_OVERLAY_MODE_CAP,
+        #: Which scope produced `vol_scaling_factor` (`stage1` = today's behaviour). The
+        #: deeper audit keys (`stage1_factor` / `effective_factor` / the portfolio vols) are
+        #: stamped by `apply_portfolio_vol_overlay_for_strategy`, which is the only caller
+        #: that knows what it passed in.
+        "scope": scope if scope in VOL_CEILING_SCOPES else VOL_CEILING_SCOPE_STAGE1,
+        #: REPORTING-ONLY: never read by the arithmetic below. Always Stage-1's own
+        #: measurement -- the quantity that actually produced the factor is
+        #: `consumed_vol_21d` (stamped by `apply_portfolio_vol_overlay_for_strategy`).
         "realized_vol_21d": realized_vol_21d,
         "vol_scaling_factor": vol_scaling_factor,
         # (2026-11-12 defect B) `model_equity_sum` is the Σ equity target of the vector this
@@ -3739,6 +4358,16 @@ def apply_portfolio_vol_ceiling(
         return target_series.copy(), summary
 
     budget = min(model_sum, float(vol_scaling_factor))
+    if book_scale_factor is not None and summary["scope"] == VOL_CEILING_SCOPE_PORTFOLIO:
+        # scope=portfolio ONLY: the factor is a RISK ratio applied to the book's own gross
+        # equity, never a NAV budget (see the docstring). Falls back to the `min` above when
+        # the scale is unusable, so a caller can never widen the book by passing junk.
+        try:
+            scale_f = float(book_scale_factor)
+        except (TypeError, ValueError):
+            scale_f = None
+        if scale_f is not None and np.isfinite(scale_f) and scale_f >= 0.0:
+            budget = model_sum * scale_f
     summary["capped_equity_sum"] = round(budget, TARGET_WEIGHT_EFFECTIVE_DECIMALS)
     summary["binding"] = bool(budget < model_sum - tolerance)
     if not summary["binding"]:
@@ -3761,6 +4390,10 @@ def apply_portfolio_vol_overlay_for_strategy(
     health_report: Optional[Dict[str, Any]],
     cash_proxy: Optional[str] = None,
     superseded_by: Optional[str] = None,
+    scope: Optional[str] = None,
+    portfolio_vol: Optional[Dict[str, Any]] = None,
+    target_vol_used: Optional[float] = None,
+    target_vol_source: Optional[str] = None,
 ) -> Tuple[pd.Series, Optional[Dict[str, Any]]]:
     """Strategy-gated entry point used by `main()`.
 
@@ -3768,20 +4401,159 @@ def apply_portfolio_vol_overlay_for_strategy(
     non-allowlisted strategy AND for a disabled overlay, so their tickets simply do not
     carry a `vol_overlay` key -- that is what keeps the other 50+ strategies byte-identical
     to before this change.
+
+    `scope` is the SAME resolved switch `main()` already registered in
+    `effective_params.json` (passing it keeps one resolution for the run and the snapshot);
+    `None` re-resolves it from the strategy-prefixed param, which is what the tests use.
+    `portfolio_vol` / `target_vol_used` / `target_vol_source` are the portfolio-scope inputs
+    computed from the loaded daily bars; with `scope="portfolio"` and no usable vols the call
+    FALLS BACK to the Stage-1 factor and records `scope_fallback_reason` (never no-ops, and
+    never invents a factor). With `scope="stage1"` -- the default -- every one of those keys
+    is ignored, so the capped series and audit block are the pre-2026-11-16 ones plus the
+    additive scope keys.
+
+    TWO VOLATILITY NUMBERS, NEVER ONE (2026-11-16, reporting-only). Before this, under
+    `scope="portfolio"` the audit's `realized_vol_21d` held the PORTFOLIO vol that produced
+    the factor (11.82% on the archived 2026-11-16 round), so an auditor comparing the
+    Stage-1 report (30.33%) with the ticket read two different quantities under one name.
+    The block therefore carries:
+
+      * `realized_vol_21d` -- ALWAYS Stage-1's own measurement (the cross-sectional median),
+        in BOTH scopes, so it is directly comparable with the Stage-1 health report;
+      * `consumed_vol_21d` -- the number that actually produced the factor applied to the
+        weights (the portfolio vol under `portfolio`, the Stage-1 median under `stage1`);
+      * `consumed_vol_source` -- which of the two it is: `stage1` or `portfolio` (equal to
+        `scope_applied`, so a degraded portfolio request reports `stage1`).
+
+    Both are ADDITIVE: under the default `scope="stage1"` every other key -- and the whole
+    capped series -- keeps the exact value it had before, and `consumed_vol_21d` equals the
+    old `realized_vol_21d`. Neither key is read by the ceiling arithmetic; `realized_vol_21d`
+    in particular is reporting-only in `apply_portfolio_vol_ceiling`.
     """
     enabled, mode = resolve_portfolio_vol_overlay_params(strategy_key, params)
     if not enabled:
         return target_series, None
+    if scope is None:
+        scope_info = resolve_vol_ceiling_scope(strategy_key, params)
+        requested_scope = scope_info["scope"]
+        scope_fallback_reason = scope_info["fallback_reason"]
+    else:
+        literal = str(scope).strip().lower()
+        if literal in VOL_CEILING_SCOPES:
+            requested_scope = literal
+            scope_fallback_reason = None
+        else:
+            # A programmatic caller can hand us anything; a typo must not disable the cap.
+            requested_scope = VOL_CEILING_SCOPE_STAGE1
+            scope_fallback_reason = VOL_CEILING_SCOPE_UNKNOWN_REASON
     vol = resolve_stage1_vol_inputs(health_report)
-    capped, summary = apply_portfolio_vol_ceiling(
-        target_series,
-        cash_proxy=cash_proxy,
-        vol_scaling_factor=vol["vol_scaling_factor"],
-        realized_vol_21d=vol["realized_vol_21d"],
-        superseded_by=superseded_by,
+    stage1_factor = vol["vol_scaling_factor"]
+    factor_info = resolve_vol_ceiling_factor(
+        scope=requested_scope,
+        stage1_factor=stage1_factor,
+        portfolio_vol=portfolio_vol,
+        target_vol_used=target_vol_used,
+        target_vol_source=target_vol_source,
     )
+    if factor_info["scope_fallback_reason"] and not scope_fallback_reason:
+        scope_fallback_reason = factor_info["scope_fallback_reason"]
+    portfolio_factor = factor_info["effective_factor"]
+    if requested_scope == VOL_CEILING_SCOPE_PORTFOLIO and portfolio_factor is not None:
+        applied_scope = VOL_CEILING_SCOPE_PORTFOLIO
+        #: The vol that PRODUCED the factor (`consumed_vol_*` below), kept distinct from
+        #: `realized_vol_21d`, which always reports Stage-1's own measurement.
+        consumed_vol: Optional[float] = factor_info["portfolio_vol_21d"]
+        capped, summary = apply_portfolio_vol_ceiling(
+            target_series,
+            cash_proxy=cash_proxy,
+            # The portfolio factor IS the book's scale ratio, and is ALSO what the audit /
+            # the printed alert call the "factor": the stage1 factor is kept beside it in
+            # `stage1_factor` for comparison.
+            vol_scaling_factor=portfolio_factor,
+            # Reporting-only, and ALWAYS Stage-1's measurement even here: on the archived
+            # 2026-11-16 round this used to be the portfolio vol (11.82%), which made the
+            # ticket's `realized_vol_21d` incomparable with the Stage-1 report (30.33%).
+            # The quantity that produced the factor is `consumed_vol_21d` instead.
+            realized_vol_21d=vol["realized_vol_21d"],
+            superseded_by=superseded_by,
+            book_scale_factor=portfolio_factor,
+            scope=VOL_CEILING_SCOPE_PORTFOLIO,
+        )
+    else:
+        applied_scope = VOL_CEILING_SCOPE_STAGE1
+        #: Stage1 scope (or a degraded portfolio request) consumes the Stage-1 median -- the
+        #: same number `realized_vol_21d` already carried, hence the bit-identical default.
+        consumed_vol = vol["realized_vol_21d"]
+        capped, summary = apply_portfolio_vol_ceiling(
+            target_series,
+            cash_proxy=cash_proxy,
+            vol_scaling_factor=stage1_factor,
+            realized_vol_21d=vol["realized_vol_21d"],
+            superseded_by=superseded_by,
+            scope=VOL_CEILING_SCOPE_STAGE1,
+        )
     summary["mode"] = mode
+    summary["scope"] = factor_info["scope"]
+    #: Which scope ACTUALLY produced the factor. Equal to `scope` except when a portfolio-scope
+    #: request degraded (`scope_fallback_reason` says why) -- the ticket must not claim a
+    #: portfolio-scoped cap when the Stage-1 number was used.
+    summary["scope_applied"] = applied_scope
+    summary["stage1_factor"] = stage1_factor
+    summary["portfolio_vol_21d"] = factor_info["portfolio_vol_21d"]
+    summary["portfolio_vol_63d"] = factor_info["portfolio_vol_63d"]
+    summary["target_vol_used"] = factor_info["target_vol_used"]
+    summary["target_vol_source"] = factor_info["target_vol_source"]
+    summary["scope_fallback_reason"] = scope_fallback_reason
+    # (2026-11-16) The two ADDITIVE keys that keep `realized_vol_21d` unambiguous: which
+    # number the factor actually consumed, and which scope produced it. Under the default
+    # `stage1` both are the values the block already implied (`consumed_vol_21d` == the old
+    # `realized_vol_21d`, `source` == `scope_applied`), so nothing else moves.
+    summary["consumed_vol_21d"] = consumed_vol
+    summary["consumed_vol_source"] = applied_scope
+    if not summary.get("applied"):
+        # Nothing was scaled: the factor is UNMEASURED, not 1.0x (LV18's own rule).
+        effective_factor: Optional[float] = None
+    elif summary.get("binding"):
+        effective_factor = summary.get("equity_scale_factor")
+    else:
+        effective_factor = 1.0
+    summary["effective_factor"] = effective_factor
+    summary["scope_note"] = _vol_scope_note(summary)
     return capped, summary
+
+
+def _vol_scope_note(summary: Dict[str, Any]) -> str:
+    """ONE Chinese line saying which scope produced the factor, and what it means.
+
+    Reads only the audit block it decorates, so it can never disagree with the numbers the
+    ticket carries. The `stage1` wording states the measured semantics of that scope plainly
+    (position reduction, NOT a proven risk improvement -- the 2022-2026 ablation's paired
+    bootstrap CI on the B-A Sharpe difference straddles 0) instead of implying a benefit.
+    """
+    applied = str(summary.get("scope_applied") or VOL_CEILING_SCOPE_STAGE1)
+    fallback = summary.get("scope_fallback_reason")
+    if applied == VOL_CEILING_SCOPE_PORTFOLIO:
+        vol_21 = summary.get("portfolio_vol_21d")
+        vol_63 = summary.get("portfolio_vol_63d")
+        target = summary.get("target_vol_used")
+        vol_txt = f"{vol_21:.2%}" if isinstance(vol_21, (int, float)) else "N/A"
+        vol63_txt = f"{vol_63:.2%}" if isinstance(vol_63, (int, float)) else "N/A"
+        target_txt = f"{target:.2%}" if isinstance(target, (int, float)) else "N/A"
+        source = summary.get("target_vol_source") or "N/A"
+        return (
+            f"口径=组合波动（按模型目标权重 sqrt(w'Σw)，21d 协方差、252 年化：{vol_txt}；"
+            f"63d 对照 {vol63_txt}），目标 {target_txt}（来源 {source}）。"
+        )
+    note = (
+        "口径=单名波动率横截面中位数（现状 stage1）；上限语义=削减仓位，"
+        "不等于风险改善（ablation 2022-2026: 触发 100% 交易日, "
+        "CAGR 14.19%->6.04%, Sharpe 1.173->1.128, 差异不显著）。"
+    )
+    if fallback:
+        note += f" 组合口径回退原因={fallback}。"
+    if not summary.get("binding"):
+        note += " 本次未触发上限。"
+    return note
 
 
 def resolve_vol_ceiling_force_exits_enabled(
@@ -4252,6 +5024,70 @@ def format_vol_overlay_delivery_warning(
     )
 
 
+def format_vol_scope_alert_line(
+    vol_overlay: Optional[Dict[str, Any]],
+    health_report: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Honest SCOPE caption for a BINDING `stage1` ceiling (2026-11-16).
+
+    The old banner said only "上限生效: 模型权益 75.02% -> 39.57%", which reads as a risk
+    improvement. The physics is different: `realized_vol_21d` is a CROSS-SECTIONAL MEDIAN of
+    single-name vols compared against a PORTFOLIO target, so the "cap" is mostly a standing
+    position cut -- the 2022-2026 ablation measured it binding on 100% of trading days
+    (CAGR 14.19% -> 6.04%, Sharpe 1.173 -> 1.128, paired-bootstrap CI straddling 0).
+
+    Prints NOTHING for portfolio scope (that banner's own numbers are already the portfolio
+    comparison) and nothing for a non-binding round. `vol_scope_ratio` /
+    `vol_portfolio_ew_21d` are read from the health report WHEN PRESENT (Stage-1's scope
+    diagnostic); when absent that clause is simply omitted -- an unavailable diagnostic must
+    never crash the ticket nor be invented.
+
+    CROSS-REFERENCE (audited 2026-11-16, both literals pinned by
+    `pipeline/tests/test_ticket_audit_fields.py`): the closing pointer
+    `…当前仓位变动方向见票面 EQUITY DIRECTION。` can never dangle. Its ONLY print site is
+    nested under the binding banner in `main()`, while
+    `equity_direction_block = compute_equity_direction(...)`, the
+    `format_equity_direction_line(...)` print and the `ticket_payload["equity_direction"]`
+    attach are all unconditional top-level statements later in the SAME function -- and
+    `main()` contains no `sys.exit` and no early `return`/`raise` between the two, so a run
+    that emits this caption always emits the direction line (and carries the block). Renaming
+    either tag silently breaks the pointer.
+    """
+    if not isinstance(vol_overlay, dict):
+        return None
+    if vol_overlay.get("scope_applied") != VOL_CEILING_SCOPE_STAGE1:
+        return None
+    if not vol_overlay.get("binding"):
+        return None
+    report = health_report or {}
+    nested = report.get("volatility_targeting")
+    vt: Dict[str, Any] = nested if isinstance(nested, dict) else {}
+
+    def _get(key: str) -> Any:
+        if key in vt and vt[key] is not None:
+            return vt[key]
+        return report.get(key)
+
+    median = vol_overlay.get("realized_vol_21d")
+    median_txt = f"{float(median):.1%}" if isinstance(median, (int, float)) else "N/A"
+    ew_vol = _get("vol_portfolio_ew_21d")
+    ratio = _get("vol_scope_ratio")
+    comparison = ""
+    try:
+        if ew_vol is not None:
+            comparison = f"，同窗口等权组合口径约 {float(ew_vol):.1%}"
+            if ratio is not None:
+                comparison += f"({float(ratio):.2f}x)"
+    except (TypeError, ValueError):
+        comparison = ""
+    return (
+        f"口径提示: 因子基于单名波动率横截面中位数({median_txt}){comparison}；"
+        "上限语义=仓位削减(ablation 2022-2026: 触发 100% 交易日, "
+        "CAGR 14.19%->6.04%, Sharpe 1.173->1.128, 差异不显著)，不等于风险改善。"
+        "当前仓位变动方向见票面 EQUITY DIRECTION。"
+    )
+
+
 def reconcile_delivered_weight_budget(
     rows: List[Dict[str, Any]],
     *,
@@ -4403,6 +5239,515 @@ def collect_mv_cap_breaches(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, An
             "clamped": bool(block.get("clamped")),
         })
     return breaches
+
+
+# ---------------------------------------------------------------------------
+# (2026-11-16 incident) Ticket-level DIRECTION reporting
+# ---------------------------------------------------------------------------
+#
+# THE DEFECT THIS CLOSES.  The 2026-11-16 run printed the 110-column
+# `RISK ALERT / VOL OVERLAY` banner ("上限生效 模型权益 75.02% -> 39.57%") and then issued
+# NET BUYING of 14,193 RMB, taking the equity book from 25.1% to 32.3%.  Both statements
+# are true -- the ceiling binds the TARGET VECTOR, while the LIVE book sat well BELOW that
+# ceiling, so closing the gap had to be done with buys -- but nothing on the ticket said
+# so, and to an operator "cap binding" reads as "the book was de-risked today".
+#
+# The block below is that missing sentence.  It is computed from the DELIVERED rows only
+# (`current_weight` -> `target_weight_effective`), so it can never disagree with the
+# printed order lines.  AUDIT ONLY: it is built after every order field is frozen and is
+# read back by nothing -- no order, share count, price, target weight or `trade_value`
+# depends on it.
+
+#: |`equity_after - equity_before`| at or below this (in percentage points) reads as FLAT.
+#: Chosen to match the ticket's printed 1-decimal percentages: a 0.5pp move is the
+#: smallest change that survives the rounding on both sides.
+EQUITY_DIRECTION_FLAT_BAND_PP = 0.5
+
+#: Boundary slack for the band above. `0.195 - 0.200` is `-0.0050000000000000044`, i.e.
+#: exactly-half-a-point arithmetic lands on the WRONG side of a bare `<` comparison and
+#: would report REDUCE for a move the docs call FLAT. Strict `>` / `<` is kept (`at the band`
+#: is FLAT) with just enough epsilon to absorb float representation noise.
+_EQUITY_DIRECTION_PP_EPS = 1e-9
+
+
+def compute_equity_direction(
+    rows: Iterable[Dict[str, Any]],
+    *,
+    cash_proxy: Optional[str] = None,
+    vol_overlay: Optional[Dict[str, Any]] = None,
+    flat_band_pp: float = EQUITY_DIRECTION_FLAT_BAND_PP,
+) -> Dict[str, Any]:
+    """The equity book's DIRECTION, stated once at the ticket's top level (2026-11-16).
+
+    `equity_before`  = `Σ current_weight`      (what the book held before today's orders)
+    `equity_after`   = `Σ target_weight_effective` (what the ticket actually DELIVERS)
+    `delta_pp`       = (after - before) * 100
+    `net_trade_value_rmb` = `Σ trade_value_rmb` (negative = net sell)
+
+    The cash-proxy row is EXCLUDED: its `trade_value_rmb` is the mirror image of the
+    equity legs (written as `-equity_trades_val` by the cash reconciliation), so counting
+    it would always net the ticket to zero and destroy the direction signal.
+
+    `target_weight_effective` is the delivered weight stamped by
+    `reconcile_delivered_weight_budget`; when a caller hands over rows from before that
+    pass (or a hand-built test row) it falls back to `target_weight`, which is the stated
+    target -- a disclosed approximation, never a silent zero.
+
+    `direction` is ADD / REDUCE / FLAT at `±flat_band_pp`.
+
+    `interpretation_note` fires ONLY when the vol ceiling bound AND the book was net ADDED.
+    That is exactly the 2026-11-16 shape, and the wording exists to stop the contradiction
+    from being read as a de-risk: the ceiling capped the TARGET vector, the live book was
+    below that ceiling, so the delta had to be bought.  The numbers are interpolated, never
+    hardcoded, so the note stays true on a different day.
+
+    Pure arithmetic on plain dicts (no I/O) so it is unit-testable offline.
+    """
+    equity_before = 0.0
+    equity_after = 0.0
+    net_trade_value = 0.0
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        if cash_proxy is not None and str(r.get("symbol") or "") == str(cash_proxy):
+            continue
+        equity_before += _row_weight(r, "current_weight")
+        if r.get("target_weight_effective") is None:
+            equity_after += _row_weight(r, "target_weight")
+        else:
+            equity_after += _row_weight(r, "target_weight_effective")
+        net_trade_value += _row_weight(r, "trade_value_rmb")
+
+    delta_pp = (equity_after - equity_before) * 100.0
+    try:
+        band = float(flat_band_pp)
+    except (TypeError, ValueError):
+        band = EQUITY_DIRECTION_FLAT_BAND_PP
+    if delta_pp > band + _EQUITY_DIRECTION_PP_EPS:
+        direction = "ADD"
+    elif delta_pp < -(band + _EQUITY_DIRECTION_PP_EPS):
+        direction = "REDUCE"
+    else:
+        direction = "FLAT"
+
+    # `None` (not `False`) when the strategy carries no vol overlay at all: "the ceiling
+    # was never evaluated" and "the ceiling was evaluated and did not bind" are different
+    # facts, and only the second one may be read as "no cap pressure".
+    vol_cap_binding: Optional[bool] = None
+    if isinstance(vol_overlay, dict):
+        vol_cap_binding = bool(vol_overlay.get("binding"))
+
+    interpretation_note: Optional[str] = None
+    if vol_cap_binding and direction == "ADD":
+        capped = vol_overlay.get("capped_equity_sum")
+        try:
+            capped_txt = f"{float(capped):.1%}"
+        except (TypeError, ValueError):
+            capped_txt = "上限值未记录"
+        interpretation_note = (
+            f"上限绑定的对象是目标向量（{capped_txt}），而当前真实仓位（{equity_before:.1%}）"
+            f"低于该上限，因此本次差量必须靠买入兑现"
+            f"（净买入 ¥{net_trade_value:,.0f}，{delta_pp:+.1f}pp）；"
+            "“上限生效”与“今日加仓”同时成立，切勿读成今日在降风险。"
+        )
+
+    return {
+        "equity_before": round(equity_before, 6),
+        "equity_after": round(equity_after, 6),
+        "delta_pp": round(delta_pp, 2),
+        "net_trade_value_rmb": round(net_trade_value, 2),
+        "direction": direction,
+        "vol_cap_binding": vol_cap_binding,
+        "interpretation_note": interpretation_note,
+    }
+
+
+def format_equity_direction_line(equity_direction: Dict[str, Any]) -> str:
+    """One grep-able Chinese line for `compute_equity_direction`'s verdict (2026-11-16).
+
+    The literal tag `EQUITY DIRECTION` is part of the contract -- the vol-ceiling caption
+    points the reader at it ("...当前仓位变动方向见票面 EQUITY DIRECTION"), so renaming the
+    tag would silently break that cross-reference.
+    """
+    block = equity_direction or {}
+    label = {"ADD": "加仓", "REDUCE": "减仓", "FLAT": "持平"}.get(
+        str(block.get("direction") or ""), "未知"
+    )
+    verb = {"ADD": "净买入", "REDUCE": "净卖出", "FLAT": "净成交"}.get(
+        str(block.get("direction") or ""), "净成交"
+    )
+    try:
+        delta_pp = float(block.get("delta_pp") or 0.0)
+    except (TypeError, ValueError):
+        delta_pp = 0.0
+    try:
+        net = float(block.get("net_trade_value_rmb") or 0.0)
+    except (TypeError, ValueError):
+        net = 0.0
+    before = float(block.get("equity_before") or 0.0)
+    after = float(block.get("equity_after") or 0.0)
+    return (
+        f"[INFO/EQUITY DIRECTION] 权益方向: {label} {delta_pp:+.1f}pp"
+        f"（{verb} ¥{abs(net):,.0f}）| 前 {before:.1%} -> 后 {after:.1%}"
+    )
+
+
+def is_partial_trim(action: Any, target_weight: Any) -> bool:
+    """TRUE when a SELL row keeps the name instead of exiting it (2026-11-16).
+
+    Companion to `is_liquidation`, NOT a replacement and NOT folded into it:
+    `is_liquidation` is pinned to `common.position_lifecycle.is_liquidation_event`, i.e.
+    `action == "SELL"`, because at least three gates write a 0.0 target while trading
+    nothing and `CANCEL_PENDING` is a never-held record -- its meaning must not move.  This
+    key answers the narrower question an operator asks of a SELL row: "did it exit the name
+    or just trim it?".  2026-11-16 rows: 600660.SH (-2.3%) and 601919.SH (-2.2%) are
+    partial trims; 600362.SH (target 0) is a full exit.
+    """
+    if str(action or "").strip().upper() != "SELL":
+        return False
+    try:
+        tgt = float(target_weight)
+    except (TypeError, ValueError):
+        return False
+    if not np.isfinite(tgt):
+        return False
+    return bool(tgt > 0.0)
+
+
+# ---------------------------------------------------------------------------
+# (2026-11-16) SECTOR MAP PROVENANCE -- make the silent code-prefix fallback self-declaring
+# ---------------------------------------------------------------------------
+#
+# `blend_base._get_symbol_sector` classifies a symbol through `CHINA_EQUITY_SECTORS` and
+# falls back to a CODE-PREFIX bucket (`sec_60` for 600900.SH / 长江电力, `sec_00` for
+# 000999.SZ / 华润三九) for every name the table does not list. That fallback is not a
+# sector: it groups by code range, so `max_assets_per_sector` throttling is INERT for those
+# names -- which is why 600900.SH was actually bought on 2026-11-16. Recording the gap in
+# the mapping is a `BASE_VERSION` bump on the blend engine and would cold-start
+# `prior_state`, so the mapping is deliberately NOT changed here.
+#
+# What this layer adds is PROVENANCE ONLY: `sector_source` says which branch produced the
+# `sector` value beside it, plus ONE aggregate WARN line naming the affected symbols.
+# No `sector` / `throttled` / `throttle_state` value and no order field is touched.
+
+#: The symbol is a key of `CHINA_EQUITY_SECTORS` -- the sector is a real industry bucket.
+SECTOR_SOURCE_MAP = "map"
+#: Not a key: the sector is the meaningless code-prefix bucket, throttling is inert.
+SECTOR_SOURCE_CODE_PREFIX_FALLBACK = "code_prefix_fallback"
+#: The mapping could not be imported, or no symbol was handed over -- no claim is made.
+SECTOR_SOURCE_UNKNOWN = "unknown"
+
+#: Distinguishes "caller did not override the table" from `sector_map=None` ("no table").
+_SECTOR_MAP_UNSET = object()
+
+
+def resolve_sector_source(symbol: Any, *, sector_map: Any = _SECTOR_MAP_UNSET) -> str:
+    """Which branch of `_get_symbol_sector` classified `symbol`, as an audit label.
+
+    * `"map"`                  -- the symbol is a key of `CHINA_EQUITY_SECTORS`;
+    * `"code_prefix_fallback"` -- it is not, so `sector` is a code-prefix bucket and sector
+                                  throttling is inert for this name;
+    * `"unknown"`              -- the table is unavailable (the defensive `try/except` at
+                                  the top of this module), or no symbol was supplied.
+
+    Never raises: an audit label must not be able to fail a ticket.
+    """
+    mapping = CHINA_EQUITY_SECTORS if sector_map is _SECTOR_MAP_UNSET else sector_map
+    if not isinstance(mapping, dict):
+        return SECTOR_SOURCE_UNKNOWN
+    if symbol is None:
+        return SECTOR_SOURCE_UNKNOWN
+    try:
+        sym = str(symbol).strip()
+    except Exception:  # pragma: no cover - pathological __str__, still never raises
+        return SECTOR_SOURCE_UNKNOWN
+    if not sym:
+        return SECTOR_SOURCE_UNKNOWN
+    return SECTOR_SOURCE_MAP if sym in mapping else SECTOR_SOURCE_CODE_PREFIX_FALLBACK
+
+
+def format_sector_map_fallback_warning(
+    rows: Iterable[Dict[str, Any]],
+) -> Optional[str]:
+    """ONE aggregate WARN line naming rows whose sector came from the code-prefix fallback.
+
+    Returns `None` -- i.e. prints nothing -- when no row resolved through the fallback
+    (`"map"` and `"unknown"` rows never trigger it: the latter is not a proven fallback).
+    Read-only: it scans `detail_reason.sector_throttle` and never writes a row.
+    """
+    fallback_symbols: List[str] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        detail = row.get("detail_reason")
+        block = detail.get("sector_throttle") if isinstance(detail, dict) else None
+        if not isinstance(block, dict):
+            continue
+        if block.get("sector_source") != SECTOR_SOURCE_CODE_PREFIX_FALLBACK:
+            continue
+        sym = str(row.get("symbol") or "").strip()
+        if sym and sym not in fallback_symbols:
+            fallback_symbols.append(sym)
+    if not fallback_symbols:
+        return None
+    return (
+        f"[WARN/SECTOR MAP] 以下标的的行业取自代码前缀兜底(非产业分类): "
+        f"{', '.join(fallback_symbols)} —— 行业节流(max_assets_per_sector)对它们是空转的"
+        "(sector_source=code_prefix_fallback)，请人工核对这些名字的行业实际集中度。"
+    )
+
+
+def classify_sector_throttle(
+    *,
+    sector: Any,
+    current_sector_holdings: Any,
+    max_allowed: Any,
+    already_held: bool,
+    symbol: Any = None,
+    sector_map: Any = _SECTOR_MAP_UNSET,
+) -> Dict[str, Any]:
+    """The `detail_reason["sector_throttle"]` block, with a TRUTHFUL verdict (2026-11-16).
+
+    THE DEFECT THIS CLOSES.  `throttled` used to be the hardcoded literal `False`, i.e. the
+    block claimed "sector throttle checked and cleared" on every row, including rows a full
+    sector should have blocked -- a verdict nobody computed.
+
+    WHAT THIS SCRIPT CAN AND CANNOT KNOW.  The live runner has NO throttle of its own:
+    `max_assets_per_sector` is only READ here (resolved once from `params`), while the real
+    admission rule lives in the blend weight layer
+    (`pipeline/research/blend/blend_base.py`, thrust candidate selection over
+    `sector_counts[sec] < allowed_sec_cap`, where `adaptive_sector_throttle` may raise the
+    cap).  So this is an INFERENCE from the delivered book, never a re-execution of the
+    rule:
+
+      * `throttled = (not already_held) and current_sector_holdings >= max_allowed`
+        -- the row is a NEW entry into a sector already at its asset cap;
+      * `throttle_state` is always present and says how strong the claim is:
+          - `"binding"`     -- the inference above holds;
+          - `"not_binding"` -- the cap is disabled (`<= 0`), the name is an incumbent
+                              (the throttle only gates ADMISSION, never an existing
+                              holding), or the sector still has free slots;
+          - `"cannot_prove"`-- inputs unusable (`None` / non-numeric); the block says so
+                              rather than inventing a verdict.
+      * `throttled_reason` is added when True, `throttle_note` when False -- a reader must
+        never have to guess which side of the cap the row was on, nor which layer owns the
+        rule.
+      * `sector_source` (2026-11-16, additive) states WHICH branch produced `sector`:
+          - `"map"`                  -- `symbol` is a key of `CHINA_EQUITY_SECTORS`;
+          - `"code_prefix_fallback"` -- it is not, so `sector` is a code-prefix bucket
+                                        (`sec_60` / `sec_00`) and the cap above is inert for
+                                        this name; the ticket prints ONE aggregate WARN line
+                                        naming such symbols;
+          - `"unknown"`              -- the table could not be imported or no `symbol` was
+                                        supplied; no claim is made.
+
+    `sector`, `throttled` and `throttle_state` keep their exact previous meaning and values:
+    the provenance key is the only addition, and the caller's `symbol` is used for it ALONE
+    (never to re-derive `sector`).
+
+    2026-11-16 inputs (1 holding per sector against `max 3`) therefore render
+    `throttled=False` + `throttle_state="not_binding"`, exactly as they should.
+
+    Note the inference is one-sided: a sector AT its cap with a flat, zero-target name can
+    also be a name the model simply did not pick.  That is why the state is named
+    "binding" (the constraint held) instead of claiming an order was suppressed.
+    """
+    sector_name = sector
+    try:
+        counts: Optional[int] = (
+            None if current_sector_holdings is None else int(current_sector_holdings)
+        )
+    except (TypeError, ValueError):
+        counts = None
+    try:
+        cap: Optional[int] = None if max_allowed is None else int(max_allowed)
+    except (TypeError, ValueError):
+        cap = None
+
+    block: Dict[str, Any] = {
+        "sector": sector_name,
+        "max_allowed": cap,
+        "current_sector_holdings": counts,
+        "throttled": False,
+        "throttle_state": "cannot_prove",
+        # PROVENANCE, not a verdict: says whether `sector` above is a real industry bucket
+        # or the meaningless code-prefix fallback (see the block comment above). Placed
+        # here so it is present on EVERY return path, including `cannot_prove`.
+        "sector_source": resolve_sector_source(symbol, sector_map=sector_map),
+    }
+    if counts is None or cap is None:
+        block["throttle_note"] = (
+            "节流输入缺失（行业/上限/持仓数任一不可用），无法判定本次是否受行业名额约束；"
+            "真实节流在 blend 权重层（blend_base.py）执行，本脚本不计权重，故按未触发上报。"
+        )
+        return block
+    if cap <= 0:
+        block["throttle_state"] = "not_binding"
+        block["throttle_note"] = (
+            f"行业名额上限 <= 0（{cap}），节流在该参数下不启用；"
+            "真实节流在 blend 权重层（blend_base.py）执行，本脚本不计权重。"
+        )
+        return block
+    if already_held:
+        block["throttle_state"] = "not_binding"
+        block["throttle_note"] = (
+            f"本行标的已在该行业持仓中（行业 {counts} 只 / 上限 {cap} 只）："
+            "行业节流只拦新增入场，不作用于存量仓位，故本行不受约束；"
+            "真实节流在 blend 权重层（blend_base.py）执行，本脚本不计权重。"
+        )
+        return block
+    if counts >= cap:
+        block["throttled"] = True
+        block["throttle_state"] = "binding"
+        block["throttled_reason"] = (
+            f"本行是行业新增，而该行业名额已用满（已有 {counts} 只 >= 上限 {cap} 只）："
+            "行业节流在 blend 权重层（blend_base.py）已生效，该行业不应再获得新增名额；"
+            "若本行仍带着新增目标权重，说明权重层放宽了名额（adaptive_sector_throttle），"
+            "请以本块为准核对，本脚本不改任何权重。"
+        )
+        return block
+    block["throttle_state"] = "not_binding"
+    block["throttle_note"] = (
+        f"行业持仓 {counts} 只 < 上限 {cap} 只，行业名额尚有余量，节流未触发；"
+        "真实节流在 blend 权重层（blend_base.py）执行，本脚本不计权重。"
+    )
+    return block
+
+
+# ---------------------------------------------------------------------------
+# (2026-11-16 incident) Whole-lot DRAG accounting
+# ---------------------------------------------------------------------------
+#
+# The ticket states a model target and a whole-lot quantity that cannot express it, and
+# `detail_reason.lot_rounding` already exposes BOTH halves (`target_shares_raw` vs
+# `shares`) without ever combining them.  On 2026-11-16 the two halves added up to about
+# -5,281 RMB (-2.68% NAV): buys came up ~3,383 RMB short of the raw target and sells ran
+# ~1,913 RMB long, i.e. the delivered book deployed LESS equity than the model asked for
+# while the ticket reported the raw percentages.  That gap has to be stated in money.
+#
+# SIGN CONVENTION (one formula, both legs):
+#   `drag_rmb = (delivered_shares - raw_shares) * price`
+#     * negative -> LESS equity deployed than the raw target asked for
+#       (buy under-fill: asked 150, delivered 100 -> -50 * price;
+#        sell over-fill: asked -150, delivered -200 -> -50 * price);
+#     * positive -> MORE equity deployed than asked (buy over-fill / sell under-fill).
+# `delivered_shares` is SIGNED (`shares` is stored unsigned, so the sign comes from
+# `action`), matching `target_shares_raw`, which is signed by construction in the row
+# builder (positive BUY, negative SELL, `-current_shares` on a full liquidation).
+# REPORTING ONLY -- this block never feeds sizing, lot rounding or any order field.
+
+
+def signed_delivered_shares(row: Dict[str, Any]) -> int:
+    """`row["shares"]` with the sign of the order (BUY +, SELL -, else 0)."""
+    if not isinstance(row, dict):
+        return 0
+    try:
+        shares = abs(int(float(row.get("shares") or 0)))
+    except (TypeError, ValueError):
+        return 0
+    action = str(row.get("action") or "").strip().upper()
+    if action == "BUY":
+        return shares
+    if action == "SELL":
+        return -shares
+    return 0
+
+
+def lot_rounding_drag_for_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Per-row whole-lot drag, or `None` when the row carries no `lot_rounding` block.
+
+    Reads `detail_reason.lot_rounding.target_shares_raw` (kept in sync by the
+    purchasing-power rescale) and the row's final `shares` (kept in sync by
+    `apply_market_value_cap` and `reconcile_delivered_weight_budget`), so the numbers are
+    only correct when this is called AFTER all three passes -- which is where `main()` calls
+    it.
+    """
+    if not isinstance(row, dict):
+        return None
+    detail = row.get("detail_reason")
+    block = detail.get("lot_rounding") if isinstance(detail, dict) else None
+    if not isinstance(block, dict):
+        return None
+    try:
+        raw_shares = float(block.get("target_shares_raw") or 0.0)
+    except (TypeError, ValueError):
+        raw_shares = 0.0
+    if not np.isfinite(raw_shares):
+        raw_shares = 0.0
+    price = _row_weight(row, "price")
+    delivered = signed_delivered_shares(row)
+    return {
+        "delivered_shares": int(delivered),
+        "raw_shares": round(raw_shares, 2),
+        "drag_rmb": round((float(delivered) - raw_shares) * price, 2),
+    }
+
+
+def annotate_lot_rounding_drag(
+    rows: Iterable[Dict[str, Any]],
+    *,
+    cash_proxy: Optional[str] = None,
+    portfolio_value: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Write the per-row drag fields and return the ticket-level `lot_rounding_drag` block.
+
+    Per row (`detail_reason.lot_rounding`, additive keys): `delivered_shares`, `raw_shares`,
+    `drag_rmb`.  Ticket level: `drag_rmb` (total), `buy_drag_rmb`, `sell_drag_rmb`,
+    `drag_pct_nav`, plus `rows_measured` so a reader can tell "no drag" from "nothing was
+    measured".  The cash proxy is excluded: it is not lot-rounded and its trade value is the
+    mirror of the equity legs.
+
+    Pure arithmetic + in-place annotation on plain dicts (no I/O) so it is unit-testable.
+    """
+    total = 0.0
+    buy_total = 0.0
+    sell_total = 0.0
+    measured = 0
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        if cash_proxy is not None and str(r.get("symbol") or "") == str(cash_proxy):
+            continue
+        row_drag = lot_rounding_drag_for_row(r)
+        if row_drag is None:
+            continue
+        block = _detail_block(r, "lot_rounding")
+        if block is not None:
+            block["delivered_shares"] = row_drag["delivered_shares"]
+            block["raw_shares"] = row_drag["raw_shares"]
+            block["drag_rmb"] = row_drag["drag_rmb"]
+        measured += 1
+        total += row_drag["drag_rmb"]
+        action = str(r.get("action") or "").strip().upper()
+        if action == "BUY":
+            buy_total += row_drag["drag_rmb"]
+        elif action == "SELL":
+            sell_total += row_drag["drag_rmb"]
+
+    try:
+        pv = float(portfolio_value or 0.0)
+    except (TypeError, ValueError):
+        pv = 0.0
+    drag_pct_nav: Optional[float]
+    if pv > 0.0 and np.isfinite(pv):
+        drag_pct_nav = round(total / pv * 100.0, 4)
+    else:
+        drag_pct_nav = None
+
+    result: Dict[str, Any] = {
+        "drag_rmb": round(total, 2),
+        "buy_drag_rmb": round(buy_total, 2),
+        "sell_drag_rmb": round(sell_total, 2),
+        "drag_pct_nav": drag_pct_nav,
+        "rows_measured": measured,
+    }
+    if total < 0:
+        result["note"] = (
+            f"整手取整令实际交付权益比模型原始目标少 ¥{abs(total):,.0f}"
+            f"（买腿少投 ¥{abs(buy_total):,.0f}，卖腿多卖 ¥{abs(sell_total):,.0f}）；"
+            "负值 = 比原始目标少投入权益，仅用于解释票面与模型的差额，不参与任何下单计算。"
+        )
+    return result
 
 
 #: Grep-able markers for the machine check below (`D6`).
@@ -5072,6 +6417,22 @@ def main(cli_args: Optional[List[str]] = None):
         effective_param_entries,
         declared_params,
         strategy_key,
+        config_origin=_effective_origin,
+    )
+    # ---- (2026-11-16) VOL CEILING SCOPE: resolved ONCE, registered beside `_mode` --------
+    # The scope decides WHICH volatility the same ceiling consumes, so it belongs in the same
+    # snapshot block as `cfsb_portfolio_vol_overlay_mode` -- a ticket that says
+    # `vol_overlay.scope = "stage1"` must be reproducible from its own `effective_params.json`.
+    # Resolution order: CLI `--vol-ceiling-scope` (source `override`) > the strategy-PREFIXED
+    # key `cfsb_vol_ceiling_scope` (source = this run's config origin) > `stage1` (`default`).
+    # A bare/foreign spelling is never read (AGENTS.md prefixed-key rule) and an unknown value
+    # degrades to `stage1`, keeping the rejected spelling visible in `declared`.
+    vol_scope_resolution = record_vol_ceiling_scope_effective_param(
+        effective_param_entries,
+        declared_params,
+        params,
+        strategy_key,
+        cli_value=getattr(args, "vol_ceiling_scope", None),
         config_origin=_effective_origin,
     )
 
@@ -5915,7 +7276,28 @@ def main(cli_args: Optional[List[str]] = None):
     # (`superseded_by_circuit_breaker=true`) instead of crediting the vol cap with it.
     # Strategy-gated (`chan_four_state_blend` ONLY): every other strategy gets its series
     # back untouched and `vol_overlay=None`, keeping its ticket byte-identical.
+    #
+    # (2026-11-16) SCOPE. `vol_scope_resolution` was resolved once, next to the overlay
+    # provenance block, and is reused here (one resolution per run). Under the DEFAULT
+    # `stage1` NOTHING below changes: no portfolio vol is computed and the ceiling consumes
+    # the Stage-1 factor exactly as before. Only `scope=portfolio` computes
+    # `sqrt(w' Σ w)` from the ALREADY-LOADED daily bars against the model's pre-cap target
+    # vector, and the ablation that motivated it was INCONCLUSIVE
+    # (`backtests_research/20261116_131625_volscope_ablation`), which is why it stays OPT-IN.
     # ---------------------------------------------------------------------------------
+    _scope_portfolio_vol: Optional[Dict[str, Any]] = None
+    _scope_target_vol: Optional[float] = None
+    _scope_target_vol_source: Optional[str] = None
+    if (
+        vol_scope_resolution["scope"] == VOL_CEILING_SCOPE_PORTFOLIO
+        and strategy_key in PORTFOLIO_VOL_OVERLAY_STRATEGY_KEYS
+    ):
+        _scope_target_vol, _scope_target_vol_source = resolve_target_vol_for_scope(health_report)
+        _scope_portfolio_vol = compute_portfolio_volatility(
+            target_series,
+            universe,
+            cash_proxy=cash_proxy,
+        )
     target_series, vol_overlay = apply_portfolio_vol_overlay_for_strategy(
         target_series,
         strategy_key=strategy_key,
@@ -5923,6 +7305,10 @@ def main(cli_args: Optional[List[str]] = None):
         health_report=health_report,
         cash_proxy=cash_proxy,
         superseded_by=circuit_breaker_superseded,
+        scope=vol_scope_resolution["scope"],
+        portfolio_vol=_scope_portfolio_vol,
+        target_vol_used=_scope_target_vol,
+        target_vol_source=_scope_target_vol_source,
     )
     if vol_overlay is not None:
         if vol_overlay.get("reason") == VOL_OVERLAY_UNAVAILABLE_REASON:
@@ -5937,7 +7323,11 @@ def main(cli_args: Optional[List[str]] = None):
                 "不重复缩放，也不把清仓记在上限名下。"
             )
         elif vol_overlay.get("binding"):
-            _rv = vol_overlay.get("realized_vol_21d")
+            # The vol printed beside the factor must be the one the factor CONSUMED (a
+            # portfolio-scoped cap is sized off the portfolio vol, not Stage-1's median);
+            # `realized_vol_21d` now always carries the Stage-1 measurement, so reading it
+            # here would pair a 30.3% median with an 11.8%-vol factor.
+            _rv = vol_overlay.get("consumed_vol_21d", vol_overlay.get("realized_vol_21d"))
             _rv_txt = f"{_rv:.1%}" if isinstance(_rv, (int, float)) else "N/A"
             print("\n" + "!" * 110)
             print(
@@ -5947,6 +7337,13 @@ def main(cli_args: Optional[List[str]] = None):
                 f"(21d 实测波动 {_rv_txt}, 因子 {vol_overlay['vol_scaling_factor']:.4f}x；"
                 f"语义=取上限(min)，非相乘); 超出部分转为现金停泊。"
             )
+            # (2026-11-16) SCOPE caption INSIDE the same `!` banner: the percentages above
+            # describe a CROSS-SECTIONAL median of single-name vols on the default scope, and
+            # the ablation showed that scope cuts exposure without a significant Sharpe gain.
+            # The existing line above is kept verbatim (archived readers depend on it).
+            _scope_line = format_vol_scope_alert_line(vol_overlay, health_report)
+            if _scope_line:
+                print(_scope_line)
             print("!" * 110 + "\n")
             is_portfolio_deleverage = True
         else:
@@ -6792,6 +8189,15 @@ def main(cli_args: Optional[List[str]] = None):
             # attribution and UI consumers read this key (or the pair
             # `action` + `blocking_reason`) instead of re-deriving it.
             "is_liquidation": bool(is_liquidation_event(action, blocking_reason)),
+            # (2026-11-16) ADDITIVE companion, deliberately NOT folded into
+            # `is_liquidation`: that key is pinned to `action == "SELL"` (via
+            # `common.position_lifecycle.is_liquidation_event`) and its meaning must not
+            # move. This one answers the narrower question an operator asks of a SELL row
+            # -- "did it exit the name or just trim it?" -- so attribution can separate a
+            # 2.3pp trim from a full liquidation without re-deriving `target_weight`.
+            # 2026-11-16 rows: 600660.SH (-2.3%) and 601919.SH (-2.2%) are partial trims;
+            # 600362.SH (target 0) is a full exit.
+            "is_partial_trim": is_partial_trim(action, tgt_w),
             "dimension_signals": dim_signals,
             "lifecycle_state": state.to_dict() if sym != cash_proxy else {},
             "lifecycle_decision": decision_detail,
@@ -6811,12 +8217,30 @@ def main(cli_args: Optional[List[str]] = None):
                 "min_cooldown_bars": int(reentry_cooldown_bars),
                 "in_cooldown": bool(sym != cash_proxy and state.state == PositionState.COOLDOWN),
             },
-            "sector_throttle": {
-                "sector": sec,
-                "max_allowed": max_assets_per_sector,
-                "current_sector_holdings": cur_sec_holdings,
-                "throttled": False,
-            },
+            # (2026-11-16) TRUTHFUL throttle verdict. This key used to be the hardcoded
+            # literal `False`, i.e. every row claimed "sector throttle checked, cleared"
+            # -- a verdict nobody computed. The live runner has NO throttle of its own:
+            # `max_assets_per_sector` is only READ here (resolved once from `params` above),
+            # while the real admission rule lives in the blend weight layer
+            # (`pipeline/research/blend/blend_base.py`, thrust candidate selection over
+            # `sector_counts[sec] < allowed_sec_cap`, with `adaptive_sector_throttle` able
+            # to raise the cap). So the block now reports an INFERENCE from the delivered
+            # book plus an explicit `throttle_state`, and says `cannot_prove` rather than
+            # inventing a verdict when the inputs cannot support one. Today's inputs
+            # (1 holding per sector against max 3) render False + `not_binding`.
+            "sector_throttle": classify_sector_throttle(
+                sector=sec,
+                current_sector_holdings=cur_sec_holdings,
+                max_allowed=max_assets_per_sector,
+                already_held=bool(sym != cash_proxy and cur_w > 1e-4),
+                # PROVENANCE ONLY (2026-11-16): the sector VALUE still comes from
+                # `_get_symbol_sector` above; the symbol is handed over solely so the block
+                # can declare whether that value came from `CHINA_EQUITY_SECTORS` or from
+                # the code-prefix fallback (600900.SH / 000999.SZ, i.e. names missing from
+                # the table). The cash proxy is deliberately `None`: it is not an equity
+                # sector and must never appear in the aggregate fallback warning.
+                symbol=sym if sym != cash_proxy else None,
+            ),
             "macro_gate": {
                 "passed": bool(macro_passed),
                 "breadth": round(breadth_val, 4),
@@ -7098,6 +8522,29 @@ def main(cli_args: Optional[List[str]] = None):
         ),
     )
     mv_cap_breaches = collect_mv_cap_breaches(rows)
+    # (2026-11-16) WHOLE-LOT DRAG, measured LAST on purpose. `raw_shares` /
+    # `detail_reason.lot_rounding` are written in the row loop, but three later passes
+    # rewrite the quantity: the purchasing-power rescale (re-rounds every BUY and resets
+    # `target_shares_raw`), `apply_market_value_cap` (clamps `shares`), and
+    # `reconcile_delivered_weight_budget` (shaves lots, then re-stamps). Measuring the gap
+    # anywhere earlier would report drag the ticket no longer has. REPORTING ONLY: the
+    # per-row keys and the ticket block below are pure annotations -- no order, share
+    # count, price, target weight or `trade_value` is read back from them.
+    lot_rounding_drag_block = annotate_lot_rounding_drag(
+        rows,
+        cash_proxy=cash_proxy,
+        portfolio_value=args.portfolio_value,
+    )
+    if lot_rounding_drag_block.get("drag_rmb"):
+        _drag_pct = lot_rounding_drag_block.get("drag_pct_nav")
+        _drag_pct_txt = "NA" if _drag_pct is None else f"{float(_drag_pct):+.2f}%"
+        print(
+            f"[INFO/LOT ROUNDING DRAG] 整手取整拖累: ¥{lot_rounding_drag_block['drag_rmb']:,.0f}"
+            f"（{_drag_pct_txt} NAV）| 买腿 {lot_rounding_drag_block['buy_drag_rmb']:+,.0f} / "
+            f"卖腿 {lot_rounding_drag_block['sell_drag_rmb']:+,.0f}"
+            "（负值 = 比原始目标少投入权益）"
+        )
+
     if not weight_budget["budget_ok"]:
         print(
             f"[WARN/WEIGHT BUDGET] 票据目标权重合计 {weight_budget['target_weight_sum']:.6f} 仍超出 1.0，"
@@ -7119,6 +8566,25 @@ def main(cli_args: Optional[List[str]] = None):
         order_df.loc[cash_mask, "trade_value"] = -equity_trades_val
         order_df.loc[cash_mask, "trade_value_rmb"] = -equity_trades_val
 
+    # (2026-11-16 incident) DIRECTION OF THE EQUITY BOOK, stated BEFORE any order line.
+    # That run printed `RISK ALERT / VOL OVERLAY ... 上限生效 模型权益 75.02% -> 39.57%`
+    # and then bought a net 14,193 RMB, lifting equity from 25.1% to 32.3%. Both facts are
+    # consistent (the ceiling binds the TARGET vector; the live book sat BELOW it, so the
+    # delta had to be bought) but read together they look like a contradiction, and
+    # "上限生效" alone reads as "the book was de-risked". Nothing else on the ticket states
+    # which way the equity actually moved, so this block does, from the DELIVERED rows
+    # only -- computed here, after every weight/quantity pass has run and after the cash
+    # proxy is reconciled, and attached to the ticket top level further down.
+    # AUDIT ONLY: no order, share count, price, target weight or `trade_value` reads it.
+    equity_direction_block = compute_equity_direction(
+        order_df.to_dict(orient="records"),
+        cash_proxy=cash_proxy,
+        vol_overlay=vol_overlay,
+    )
+    print(f"\n{format_equity_direction_line(equity_direction_block)}")
+    if equity_direction_block.get("interpretation_note"):
+        print(f"[INFO/EQUITY DIRECTION] {equity_direction_block['interpretation_note']}")
+
     # Sort: SELLS FIRST -> BUYS SECOND -> HOLDS; drop NO_POSITION rows (0% on both sides)
     # (2026-10-22 incident, Fix 4) CANCEL_PENDING rows are RECORDS, not orders,
     # and must survive this filter: a symbol whose entry confirmation was
@@ -7138,6 +8604,19 @@ def main(cli_args: Optional[List[str]] = None):
 
     order_df["priority"] = order_df["action"].map(sort_priority)
     order_df = order_df.sort_values(by=["priority", "delta_weight"]).drop(columns=["priority"])
+
+    # (2026-11-16) ONE aggregate line, printed only when the ticket actually contains a row
+    # whose sector came from `_get_symbol_sector`'s code-prefix fallback (600900.SH /
+    # 000999.SZ on 11-16): for those names the `max_assets_per_sector` cap is INERT, and
+    # before this line the ticket said nothing about it -- 600900 was silently bought into a
+    # "sector" that is really `sec_60`. Deliberately not a banner block, and it never touches
+    # an order field: rows are scanned AFTER the NO_POSITION filter so a record that issues no
+    # order cannot trigger it.
+    _sector_fallback_line = format_sector_map_fallback_warning(
+        order_df.to_dict(orient="records")
+    )
+    if _sector_fallback_line:
+        print(_sector_fallback_line)
 
     print(f"\n调仓基准日期 (Rebalance Date): {latest_rebal_date}")
     print(f"持仓对照基准 (Reference Basis): {reference_source}")
@@ -7542,6 +9021,21 @@ def main(cli_args: Optional[List[str]] = None):
     ticket_payload["weight_budget_ok"] = bool(weight_budget.get("budget_ok", True))
     ticket_payload["rounding_rebalanced"] = bool(weight_budget.get("rounding_rebalanced"))
     ticket_payload["mv_cap_breaches"] = mv_cap_breaches
+    # (2026-11-16 incident) TWO audit-only book-level blocks, next to the verdicts above:
+    #   * `equity_direction` -- which way the equity book moved today, and (when the vol
+    #     ceiling bound AND the book was net ADDED) the sentence that stops "上限生效" being
+    #     read as "we de-risked": the cap binds the TARGET vector, the live book was below
+    #     it, so the delta had to be bought. The 2026-11-16 ticket said nothing about this.
+    #     `vol_cap_binding` is `None` (not `False`) for strategies with no vol overlay:
+    #     "never evaluated" and "evaluated, did not bind" are different facts.
+    #   * `lot_rounding_drag` -- the whole-lot gap in MONEY (`drag_rmb`, split buy/sell, plus
+    #     `drag_pct_nav`). The per-row `detail_reason.lot_rounding` already carried both
+    #     halves (`target_shares_raw` vs `shares`) but never combined them, so a book that
+    #     deployed 5,281 RMB less equity than the model asked for (-2.68% NAV on 11-16)
+    #     showed only the raw percentages.
+    # Both are pure reporting: they are built after every order field is frozen.
+    ticket_payload["equity_direction"] = equity_direction_block
+    ticket_payload["lot_rounding_drag"] = lot_rounding_drag_block
     # (defect A/B, 2026-11-12) The 5m gate's three-state verdict, at the ticket's TOP
     # level next to the other book-level verdicts:
     #   * `intraday_gate_status`       -- `not_applicable` / `evaluated` /
@@ -7573,6 +9067,7 @@ def main(cli_args: Optional[List[str]] = None):
     # verdicts. Present ONLY for the allowlisted strategy with the overlay enabled -- every
     # other strategy's ticket is byte-identical to before this change.
     #   {"applied", "mode", "realized_vol_21d", "vol_scaling_factor",
+    #    "consumed_vol_21d", "consumed_vol_source",
     #    "model_equity_sum", "pre_cap_equity_sum", "pre_gate_equity_sum",
     #    "capped_equity_sum", "equity_scale_factor", "binding",
     #    "reason", "superseded_by_circuit_breaker", "post_lifecycle_equity_sum",
@@ -7580,6 +9075,13 @@ def main(cli_args: Optional[List[str]] = None):
     #    "lifecycle_attribution_complete", "delivered_equity_sum",
     #    "ceiling_exceeded_by", "delivery_shortfall", "delivery_shortfall_ratio",
     #    "lifecycle_shortfall", "lifecycle_shortfall_ratio"}
+    # (2026-11-16) TWO VOLATILITY NUMBERS, under one rule: `realized_vol_21d` is ALWAYS
+    # Stage-1's own measurement (cross-sectional median of single-name vols, comparable with
+    # the Stage-1 health report), while `consumed_vol_21d` is the number that actually
+    # produced the applied factor and `consumed_vol_source` (`stage1` | `portfolio`, equal to
+    # `scope_applied`) says which. Before this, a portfolio-scoped round overwrote
+    # `realized_vol_21d` with the portfolio vol, so `<Stage-1 report 30.3%>` and
+    # `<ticket 11.8%>` looked like a contradiction instead of two different quantities.
     # (PLAN C, 2026-11-12) plus, when the forced-exit switch is ON, these additive keys:
     #    "forced_exits" [{symbol, lifecycle_state, shares, weight, reason}],
     #    "forced_exit_equity_sum", "force_exit_skipped"
@@ -7770,9 +9272,11 @@ def main(cli_args: Optional[List[str]] = None):
             ("SELL", TICKET_SELL_STDOUT_MARKER),
         )
     }
+    ticket_written = False
     try:
         with open(out_json, "w", encoding="utf-8") as f:
             json.dump(ticket_payload, f, indent=2, ensure_ascii=False)
+        ticket_written = True
         # Beside the ticket and merged into summary.json, so a consumer that only knows the
         # pre-LV2 list shape still has a machine-readable place to read the timing from.
         write_execution_timing(args.output_dir, timing)
@@ -7781,47 +9285,41 @@ def main(cli_args: Optional[List[str]] = None):
     print("\n" + "=" * 110)
     print(f"[SUCCESS] 交易指令单已导出至: {out_csv} 及 {out_json}")
 
-    # Save post_holdings.json if output_dir is given
+    # Save post_holdings.json + its attestation sidecar (NV10: ONE fail-closed pair)
     # (D5, evidence `2026-11-11/205137`) `post_holdings.json` alone cannot tell "the book is
     # EMPTY" apart from "the file was never produced": the archive above holds `{}` because
     # the day fully liquidated, which is the CORRECT result, yet every reader saw the same
     # thing as a missing file. The shape of `post_holdings.json` is therefore unchanged
-    # (`{symbol: shares}`, `{}` = flat) and a sidecar `post_holdings.meta.json` now states
+    # (`{symbol: shares}`, `{}` = flat) and a sidecar `post_holdings.meta.json` states
     # completeness explicitly. Its schema:
     #   {"as_of": "YYYY-MM-DD", "complete": bool, "n_symbols": int,
     #    "generated_at": ISO-8601 local, "source": "ticket"|"replay"}
     # `complete: true` + `{}` = a confirmed all-cash book (a legal seed); a missing file or a
     # missing/false `complete` = UNUSABLE (readers must return None, never "flat").
-    post_holdings_path = os.path.join(args.output_dir, "post_holdings.json")
-    post_holdings_written = False
-    try:
-        with open(post_holdings_path, "w", encoding="utf-8") as f:
-            json.dump(post_holdings, f, indent=2, ensure_ascii=False)
-        post_holdings_written = True
-        print(f"[SUCCESS] 预测持仓已导出至: {post_holdings_path}")
-    except Exception as e:
-        print(f"[WARN] Failed to write post_holdings.json: {e}")
-    post_holdings_meta_path = os.path.join(args.output_dir, POST_HOLDINGS_META_FILENAME)
-    try:
-        post_holdings_meta = {
-            "as_of": str(as_of_date),
-            "complete": bool(post_holdings_written),
-            "n_symbols": len([
-                s for s, q in (post_holdings or {}).items() if int(q or 0) > 0
-            ]),
-            "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-            # A pinned past session is a REPLAY (`resolve_run_mode`); its book is a
-            # reconstruction, not a fill plan, and the sidecar says so.
-            "source": "replay" if str(run_mode) == "replay" else "ticket",
-        }
-        with open(post_holdings_meta_path, "w", encoding="utf-8") as f:
-            json.dump(post_holdings_meta, f, indent=2, ensure_ascii=False)
+    #
+    # (NV10) The write owns BOTH files and writes the attestation LAST; a failure here no
+    # longer prints `[WARN]` and continues -- see `PostHoldingsAttestationError` below. A
+    # pinned past session is a REPLAY (`resolve_run_mode`); its book is a reconstruction,
+    # not a fill plan, and `source` says so.
+    post_holdings_write = write_post_holdings_attestation(
+        args.output_dir,
+        post_holdings,
+        as_of_date=as_of_date,
+        run_mode=run_mode,
+    )
+    if post_holdings_write["written"]:
+        print(f"[SUCCESS] 预测持仓已导出至: {post_holdings_write['book_path']}")
         print(
-            f"[SUCCESS] 预测持仓元数据已导出至: {post_holdings_meta_path} "
-            f"(complete={post_holdings_meta['complete']}, n_symbols={post_holdings_meta['n_symbols']})"
+            f"[SUCCESS] 预测持仓元数据已导出至: {post_holdings_write['meta_path']} "
+            f"(complete={post_holdings_write['complete']}, "
+            f"n_symbols={post_holdings_write['n_symbols']})"
         )
-    except Exception as e:
-        print(f"[WARN] Failed to write {POST_HOLDINGS_META_FILENAME}: {e}")
+    else:
+        print(
+            f"[ERROR] {POST_HOLDINGS_FILENAME} / {POST_HOLDINGS_META_FILENAME} 写入失败: "
+            f"reason={post_holdings_write['reason']} error={post_holdings_write['error']}",
+            file=sys.stderr,
+        )
 
     # Persist updated state into account_state.json if available
     if args.account_state_file:
@@ -7879,6 +9377,17 @@ def main(cli_args: Optional[List[str]] = None):
         except Exception as e:
             print(f"[WARN] Failed to update account state file: {e}")
     print("=" * 110)
+    # (NV10) FAIL CLOSED -- the last thing this round does is refuse to look successful.
+    # `web/livetrading` derives `deploy_status` from this process's exit code and
+    # `check_live_run_integrity.py` reads the last `...Error:` line of stderr as the finding's
+    # detail, so raising here is what turns "the book is missing" from a silent `[WARN]` into
+    # a named, counted failure. Deliberately AFTER `account_state.json` is persisted: the
+    # operator keeps the ticket and the state; only the verdict is withheld.
+    _attestation_failure = post_holdings_attestation_gate(
+        ticket_written, post_holdings_write, out_json=out_json
+    )
+    if _attestation_failure:
+        raise PostHoldingsAttestationError(_attestation_failure)
     return order_df
 
 
