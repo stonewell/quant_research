@@ -2259,6 +2259,101 @@ flowchart TD
 > `blend_weighting_mode="regime_ic_ir_hybrid"` 与 `blend_enable_orthogonalization` **未动**；
 > 无新任务登记、无计数变化、无下单影响。
 
+#### 绩效类判据补充：显著性条款（2026-11-18 裁决，选项 B）
+
+> **裁决要点**：绩效类任务的准出判据由「单条幅度/折数门槛」改为「两条并列、必须同时满足」，
+> 使既有的预注册门槛与铝业 A/B 的实际判定口径一致（选项 B：采纳更严格的显著性标准，
+> 与既有幅度/折数门槛**并用**，而非替换）。
+> 本小节**只定判据、不登记新任务**：不加任务行、不改任何既有行文字、不改 `[x]` / `[ ]` 计数、
+> 不改优先级列、不重编号。**`§2.21` 现行行数以 `LV*` 行实测为准 —— 18 行 = 9 `[x]` + 9 `[ ]`**
+> （`LV25` 已在 `:661-670` 补记）；上文 `:656` 等处的「17 行 = 9 `[x]` + 8 `[ ]`」一类数字
+> 均为**时点快照**，按「只追加、不回改」惯例保持原样。
+
+**1. 适用范围**
+
+- **适用**：所有以「修改实盘默认值」为交付物的绩效类任务 —— `LV21` / `LV22` / `LV23`，
+  以及今后新登记的同类项。
+- **不适用**：纯 bugfix、可观测性、文档订正类任务（如 `LV6` / `LV10` / `LV14` / `LV15` /
+  `LV16` / `LV17` / `LV25`），它们仍按「零漂移 / bit-identical」判据结案，不要求显著性。
+
+**2. 判据（① 与 ② 并列，必须同时满足）**
+
+- **① 幅度与折数**：`|ΔSharpe| ≥ 0.15` ∧ `≥14/18` 折同号 —— **现行，保留原文，不改动**
+  （原文见 `LV22` / `LV23` 行的「预注册门槛」表述）。
+- **② 统计显著性（2026-11-18 新增）**：配对折 Sharpe 差值的 **`t ≥ 2.0`**，
+  **且** DSR 达到可信阈值（阈值口径见第 4 条，本条取 **0.95**）。
+- ② 的 `t` 是**配对**检验量：同一 fold 网格、同一起止日期、同一 universe 下逐折 Sharpe
+  差值的「均值 ÷ 标准误」；**不得**用两臂全期聚合 Sharpe 相减、也不得用未配对的折间方差冒充。
+- ① 与 ② **不可互相替代**：① 通过不能豁免 ②，② 通过也不能豁免 ①。
+
+**3. 未通过时的处置**
+
+- **① 通过、② 不通过 ⇒ 结论必须记为「未分离」**（点估计与抽样噪声不可区分），
+  **不得**据此修改实盘默认值、不得写推荐值、不得进入 `strategies_config.json` 钉值。
+- 此时最多允许做成 **opt-in、默认关**的**影子臂**（与 `AGENTS.md` 规则 9 的「默认关」要求一致），
+  并须在任务行内显式写明「影子臂、不参与默认出票」。
+- ①② 皆不通过 ⇒ 按既有 NULL / 负结果结案路径处置，本条不引入新的结案形态。
+
+**4. DSR 阈值口径（沿用仓库既有，不凭空发明）**
+
+- **代码侧只有概率、没有阈值常量**：[`common/metrics.py`](file:///home/stone/Work/github/quant/common/metrics.py)
+  `:198` `deflated_sharpe_ratio` 返回概率本身；调用方
+  [`backtester/run_backtest.py`](file:///home/stone/Work/github/quant/backtester/run_backtest.py)
+  `:1275` / `:2231` 仅落数（`deflated_sharpe_ratio` 字段）与打印，**不做判定**。
+- **审计侧已有分层口径**：
+  [`pipeline/.agents/skills/walkforward-audit/scripts/run_audit.py`](file:///home/stone/Work/github/quant/pipeline/.agents/skills/walkforward-audit/scripts/run_audit.py)
+  `:792` 的 bonus 阶梯为 `0.15 if dsr > 0.95` / `0.10 if dsr > 0.50` / `0.05 if dsr > 0.05`；
+  [`SKILL.md`](file:///home/stone/Work/github/quant/pipeline/.agents/skills/walkforward-audit/SKILL.md)
+  `:205` 同述（DSR > 0.95 取满档 bonus）。
+- **文档侧多处已把 `DSR ≥ 0.95` 写成硬门槛**：
+  [`docs/development_plan_archive.md`](file:///home/stone/Work/github/quant/docs/development_plan_archive.md)
+  `:464`（Phase 6 §4.2：`DSR ≥ 0.95` ⇔ `t ≥ 2.0`，Harvey–Liu–Zhu 2016 变体数惩罚）、
+  同文件 `:70`（`T6.2` 终审）、
+  [`docs/chan_volume_profile_and_multi_theory_quant_synthesis_plan.md`](file:///home/stone/Work/github/quant/docs/chan_volume_profile_and_multi_theory_quant_synthesis_plan.md)
+  `:549`、
+  [`docs/autoresearch_stock_selection_and_symbolic_alpha_evolution.md`](file:///home/stone/Work/github/quant/docs/autoresearch_stock_selection_and_symbolic_alpha_evolution.md)
+  `:486` / `:608`（`min_deflated_sharpe = 0.95`）。
+- **已有合格样本**：`AGENTS.md` 把 `blend_13` 的 `DSR 0.9400` 记为合格样本（距门槛 0.01，
+  属「临界合格」，不作新门槛下调的依据）；deflated-Sharpe 的通行门槛为 **0.95**
+  （Bailey–López de Prado）。
+- ⇒ **本条采用 0.95**：与审计脚本的最高 bonus 档、与上述四份文档的既有硬门槛一致。
+  **披露**：仓库内**没有**统一的判定函数（只有分层 bonus 与散落文档口径），
+  故该阈值在「判据落地为代码」之前一律按 **0.95 人工比对**，后续统一实现时以本条为准修改。
+
+**5. 首个校准案例（2026-11-18 铝业核心-卫星 A/B）**
+
+证据出处：[`backtests_research/20261118_alu_ab/README.md`](file:///home/stone/Work/github/quant/backtests_research/20261118_alu_ab/README.md)
+（本节不复制其折表，只引结论数值）。
+
+- **b22 臂**（20 只 + `000807.SZ` + `002532.SZ`）：`ΔSharpe = +0.236`、**14/18** 折改善
+  ⇒ **满足 ①**；配对 **`t = 1.38`**、DSR 为 `1.1223e-58`（三臂分别 `2.2387e-82` /
+  `3.6780e-96` / `1.1223e-58`）⇒ **不满足 ②**。
+- **结论：「未分离，维持加 0 只」** —— 不改 universe、不设推荐值；若要继续，
+  只能做成 opt-in、默认关的影子臂。
+- **b21 臂**（仅加 `000807.SZ`）：`ΔSharpe = +0.047`、**11/18**、`t = 0.40`
+  ⇒ **① 与 ② 皆不满足**，按既有 NULL 路径结案。
+- 该案例是条款 ② 的**首份应用**：在旧判据下 b22 恰好**通过** ①（+0.236 ≥ 0.15 且 14/18 ≥ 14），
+  若无 ② 则结论只能落在裁判裁量上；本条把该次拒绝转为规则一致。
+
+**6. 为何需要该条款**
+
+- 折 Sharpe 的组内 σ 约 **2.30–2.51**，18 折下折均值的标准误约 **0.54–0.59**；
+  `±0.15` 的幅度门槛仅约 **0.28** 个标准误，而「折数同号」在 18 折上极易被少数窗口主导。
+- b22 的增量并不分散：**fold 4 / 6 / 11 / 12 / 16** 五段合计 **+5.23** 个 fold-Sharpe 点
+  （摊到 18 折即 **+0.29**，已超过全部 +0.236 的均值增量），而 **fold 17** 单独 **−1.801**。
+- 因此把这条**已知噪声底**写进判据，避免「规则宽松、执行从严」的长期不一致 ——
+  同一类证据换个人裁就是另一个结论，这正是本条要消除的偏差来源。
+
+**7. 不触碰的边界**
+
+- 不改任何策略参数、不改 `strategies_config.json` 钉值、不改任何 `version`。
+- **不改 `BASE_VERSION`**、不跑 `--dump-strategies`、不重写 `strategy_dumps/*.json`。
+- **不改 [`docs/version.md`](file:///home/stone/Work/github/quant/docs/version.md)** —— 本条属判据文档化，
+  **无版本演进**（不是策略改动，不触发 `AGENTS.md` 规则 7 的升版义务）。
+- 不改任何既有 `[x]` 结论、不改 `[x]` / `[ ]` 计数、不改优先级列、不重编号任何一行。
+- **不重开**任何已关闭的负结果（`LV8` / `LV20` / `LV22` / `LV23`）。
+- 不改 `backtests_research/**` 与任何代码；首个案例的证据为**只读引用**。
+
 ### 2.22 接线任务登记（`W1`，2026-11-05 由用户裁定立项，1 项待办）
 
 > [!NOTE]
