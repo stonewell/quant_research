@@ -65,6 +65,16 @@ from common.financial_api import (
     normalize_thscode,
     summarize_fetch_error,
 )
+# (2026-11-18, defect D1) `IntradayIncompleteWarning` USED TO BE DEFINED in this file. It now
+# lives in `common/intraday_features.py` and is imported here, so this module keeps exporting
+# `sync.IntradayIncompleteWarning` (pinned by
+# `pipeline/tests/test_sync_5m_freshness_probe.py`) as the SAME class object the enrichment
+# path raises. WHY: `common/` must never import from `scripts/`, and the enrichment side
+# announced the identical real-world condition (a 5m session short of a full session) through
+# a bare `logger.warning` -- two channels meant a caller could not catch the condition
+# uniformly. One category, two emitters, no local re-definition (a subclass or a copy here
+# would silently stop catching the enrichment-side warning).
+from common.intraday_features import IntradayIncompleteWarning
 from common.market_clock import MARKET_CHINA, last_expected_bar_ts, market_now
 from common.market_holidays import HolidayCalendarCoverageError
 
@@ -1645,14 +1655,6 @@ def probe_intraday_cache(
     probe["hit"] = True
     probe["reason"] = "fresh"
     return probe
-
-
-class IntradayIncompleteWarning(UserWarning):
-    """A fetched 5m series stops before the expected session's last complete bar.
-
-    Raised (not swallowed, not "fixed" by manufacturing bars) so Stage 1 can record
-    `intraday_incomplete` / a degraded reason code instead of trusting a half session.
-    """
 
 
 class Sync5mReport(dict):

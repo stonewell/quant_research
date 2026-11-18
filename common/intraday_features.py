@@ -24,7 +24,11 @@ post-close-only, so nothing here may ever touch the daily bar:
   578 RMB equity/cash split, NAV 128,619 at the official close vs 128,041 at the 14:15 bar).
 - **A 缺根日 (5m sample short of a full session, i.e. `< 45` bars) is now SKIPPED, not
   extrapolated**: the day gets no feature row, so every 5m-derived column joins as NaN, and
-  one WARNING per symbol-day names the date and the observed bar count.
+  one `IntradayIncompleteWarning` per symbol-day names the symbol, the date and the observed
+  bar count. (2026-11-18) That warning is DEFINED here and shared with
+  `scripts/sync_china_5m_and_indices.py`, so "incomplete 5m session" is one catchable
+  category, not one class plus one log line; `enrich_universe_with_intraday_features` also
+  exposes the same facts machine-readably through its optional `report` out-parameter.
 
 RETIRED 2026-11-17 (second owner ruling) -- ten columns were DELETED OUTRIGHT, not annotated,
 because NO production reader ever existed for them. Seven were never read; the other three lost
@@ -52,6 +56,7 @@ import logging
 import math
 import os
 import time
+import warnings
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -60,6 +65,36 @@ import pandas as pd
 from common.indicators import macd
 
 logger = logging.getLogger(__name__)
+
+
+class IntradayIncompleteWarning(UserWarning):
+    """A 5m sample is short of a complete session -- it is never padded, never extrapolated.
+
+    THE SINGLE CATEGORY for "the intraday layer saw an incomplete 5m day", so a caller can
+    `catch`/`pytest.warns` the condition once instead of pattern-matching prose in two
+    different channels.
+
+    (2026-11-18 defect D1) This class used to be defined in
+    `scripts/sync_china_5m_and_indices.py` only, while THIS module announced the same
+    real-world condition (a session whose 5m sample is short) through a bare
+    `logger.warning`. Two channels meant `pytest.warns` could not see the enrichment-side
+    emission at all, and a caller that wanted to record "degraded 5m coverage" had to
+    scrape a log. Ownership moved HERE because `common/` must never import from
+    `scripts/`; the sync script now imports the name back, so `sync.IntradayIncompleteWarning`
+    (pinned by `pipeline/tests/test_sync_5m_freshness_probe.py`) keeps working unchanged.
+
+    Two emitters, one category -- they describe the same defect at different layers:
+      * `scripts/sync_china_5m_and_indices.py::sync_5m_intraday` -- a FETCHED series that
+        stops before the expected session's last complete bar (`[WARN] 5m 当日数据不完整`);
+      * `compute_daily_intraday_features` here -- a stored session whose full-day 5m bar
+        count is short (`< 45` of ~48), which is SKIPPED rather than half-measured.
+    """
+
+
+#: Message prefix of the enrichment-side emission. Same fixed, greppable shape as the sync
+#: script's `INTRADAY_INCOMPLETE_WARNING`, so one `grep '[INTRADAY 5M]'` still finds every
+#: incomplete-5m event in a run log.
+INTRADAY_5M_SAMPLE_INCOMPLETE = "[INTRADAY 5M]"
 
 
 def _get_chan_modules():
@@ -440,6 +475,7 @@ def compute_daily_intraday_features(
     config: Optional[IntradayFeatureConfig] = None,
     chan_candidate_dates: Optional[Set[pd.Timestamp]] = None,
     symbol: Optional[str] = None,
+    skipped_days: Optional[List[Dict[str, Any]]] = None,
 ) -> pd.DataFrame:
     """Aggregate 5-minute bars into daily microstructure and Chan confluence features.
 
@@ -454,6 +490,12 @@ def compute_daily_intraday_features(
         If provided, dates outside this set skip heavy Chan structure calculation.
     symbol : Optional[str]
         Symbol name for price limit tier identification (ST, ChiNext, ETF, etc.).
+    skipped_days : Optional[List[Dict[str, Any]]]
+        (2026-11-18, defect D2) Optional OUT-parameter: every skipped 缺根日 is APPENDED to
+        this list as `{"symbol", "date", "bars"}` (date = ISO string). `enrich_universe_with_intraday_features`
+        owns the machine-readable report built from it; a direct caller of this function
+        keeps the pre-existing return contract either way (nothing is appended when
+        `skipped_days` is `None`, which is the default).
 
     Returns
     -------
@@ -515,14 +557,38 @@ def compute_daily_intraday_features(
         # 缺根日 (2026-11-17): drop the day instead of measuring half of it. `prev_close` is
         # therefore carried over from the last INCLUDED session, which is the honest choice --
         # the skipped day's own close was never observed as a measurement we trust.
+        #
+        # (2026-11-18, defect D1) ONE channel, not two: this used to be a bare
+        # `logger.warning`, which made the enrichment side invisible to `pytest.warns` and
+        # un-catchable by a caller (the sync script announced the sibling condition through
+        # `IntradayIncompleteWarning`). It is now `warnings.warn(..., IntradayIncompleteWarning)`
+        # and NOT also a log record -- re-emitting both would restore the two-channel defect
+        # this change removes. Operator visibility is unchanged: an unconfigured root logger
+        # (`logging.lastResort`) printed the old line to stderr, and the default warning filter
+        # prints this one to stderr too, with the `[INTRADAY 5M]` prefix intact.
+        #
+        # Default-filter behaviour (stated, not assumed): the "default" action dedupes on
+        # `(message text, category, lineno)` inside the ATTRIBUTING module's
+        # `__warningregistry__`, and the text carries symbol + date + bar count, so each
+        # symbol-day is shown. The only silence comes from an explicit operator policy
+        # (`-W ignore`, `PYTHONWARNINGS=ignore`, or a category filter) -- the same policy that
+        # would have hidden any warning channel; a repeated call in ONE process with an
+        # identical symbol/date/count is shown once. `stacklevel=2` attributes the warning to
+        # the caller (normally `enrich_universe_with_intraday_features`), like the sync-side
+        # emission does.
         full_bars = int(full_day_counts.get(d, len(day_bars)))
         if full_bars < 45:
-            logger.warning(
-                "[INTRADAY 5M] %s %s: 5m sample incomplete (%d of ~48 bars) -- 5m features for "
+            iso_date = pd.Timestamp(d).date().isoformat()
+            if skipped_days is not None:
+                skipped_days.append(
+                    {"symbol": symbol, "date": iso_date, "bars": full_bars}
+                )
+            warnings.warn(
+                f"{INTRADAY_5M_SAMPLE_INCOMPLETE} {symbol or '<universe>'} {iso_date}: "
+                f"5m sample incomplete ({full_bars} of ~48 bars) -- 5m features for "
                 "this session are SKIPPED (NaN); the daily bar is not touched.",
-                symbol or "<universe>",
-                pd.Timestamp(d).date(),
-                full_bars,
+                IntradayIncompleteWarning,
+                stacklevel=2,
             )
             continue
 
@@ -598,6 +664,7 @@ def enrich_universe_with_intraday_features(
     universe_5m: Dict[str, pd.DataFrame],
     config: Optional[IntradayFeatureConfig] = None,
     cutoff_time: Optional[Union[str, datetime.time]] = None,
+    report: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, pd.DataFrame]:
     """Enrich daily universe DataFrames with aligned 5m intraday features and split alignment (R4, R6).
 
@@ -621,6 +688,26 @@ def enrich_universe_with_intraday_features(
         Optional time cutoff string (e.g. '14:00', '14:15', '15:00') or datetime.time. If
         provided, overrides config.cutoff_time. It ONLY narrows the 5m feature window; it never
         touches the daily bar.
+    report : Optional[Dict[str, Any]]
+        (2026-11-18, defect D2) Optional OUT-parameter -- the machine-readable record of the
+        5m sessions that were SKIPPED because their sample was short of a full session. It is
+        filled IN PLACE; the RETURN TYPE is unchanged (a dict return would have broken every
+        caller). Contract, deliberately asymmetric so the default path cannot drift:
+
+          * `report` is `None` (default) -> nothing is collected;
+          * a dict is passed -> it is CLEARED on entry, then left EMPTY when no day was
+            skipped (a complete sample, or no 5m layer at all -- "5m off" and "5m clean" are
+            both `{}`, and a run can tell them apart from `enable_intraday_5m`/the gate block),
+            and otherwise filled with
+
+                {"count": <int>, "symbol_days": [{"symbol": str|None,
+                                                  "date": "YYYY-MM-DD",
+                                                  "bars": <int observed full-day bars>}, ...]}
+
+            in `universe_1d` iteration order and day order inside each symbol. Every consumer
+            keys off truthiness, so `{}` leaves the ticket/`summary.json` byte-identical to a
+            pre-change run. A module-level global is deliberately NOT used (two concurrent
+            calls would share it).
 
     Returns
     -------
@@ -628,7 +715,8 @@ def enrich_universe_with_intraday_features(
         Enriched daily universe with price alignment and microstructure columns. A day whose
         full-day 5m bar count is short of a session (`full_bars < 45`, counted BEFORE any
         cutoff filtering) carries NaN in every 5m-derived column -- see
-        `compute_daily_intraday_features`, which drops that day and warns.
+        `compute_daily_intraday_features`, which drops that day and warns with
+        `IntradayIncompleteWarning`.
     """
     if config is None:
         config = IntradayFeatureConfig()
@@ -651,6 +739,11 @@ def enrich_universe_with_intraday_features(
         "Chan_5m_ZG",
     ]
 
+    # (2026-11-18, defect D2) Collector for the skipped 缺根日, filled below by
+    # `compute_daily_intraday_features` and published through `report` at the end. It is a
+    # LOCAL list, never a module global: two concurrent calls must not share it.
+    skipped_days: List[Dict[str, Any]] = []
+
     for sym, df_1d in universe_1d.items():
         df_out = df_1d.copy()
         if not isinstance(df_out.index, pd.DatetimeIndex):
@@ -664,7 +757,7 @@ def enrich_universe_with_intraday_features(
 
         # Compute daily intraday features
         feat_df = compute_daily_intraday_features(
-            df_5m, config=config, symbol=sym
+            df_5m, config=config, symbol=sym, skipped_days=skipped_days
         )
 
         if feat_df.empty:
@@ -700,6 +793,17 @@ def enrich_universe_with_intraday_features(
             df_out[col] = aligned_feat[col].reindex(df_out.index)
 
         enriched_universe[sym] = df_out
+
+    # (2026-11-18, defect D2) Publish the machine-readable record LAST, so a caller reads it
+    # only after every symbol was visited. `clear()` first: the dict's documented meaning is
+    # "what THIS call skipped", and a stale carry-over from a previous round would otherwise
+    # look like a fresh undersampling event. Empty stays empty, so the default (5m-off) and
+    # fully-sampled paths are byte-identical to a pre-change run.
+    if report is not None:
+        report.clear()
+        if skipped_days:
+            report["count"] = len(skipped_days)
+            report["symbol_days"] = skipped_days
 
     return enriched_universe
 

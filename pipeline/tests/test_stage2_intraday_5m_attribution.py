@@ -27,6 +27,7 @@ turns exactly those attrs into the lines the runner prints:
 100% offline: synthetic frames and attrs only; no provider, no cache, no network.
 """
 
+import json
 import os
 import sys
 
@@ -34,9 +35,16 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__f
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+import numpy as np
 import pandas as pd
+import pytest
 
-from scripts.run_live_strategy import summarize_intraday_5m_loading
+from scripts.run_live_strategy import (
+    INTRADAY_5M_UNDERSAMPLED_KEY,
+    format_intraday_5m_undersampled,
+    main,
+    summarize_intraday_5m_loading,
+)
 
 
 def _empty_frame():
@@ -218,3 +226,174 @@ def test_no_expected_session_means_no_freshness_claim():
     assert "stale=None" in info, "no staleness evidence must not be reported as 'fresh'"
     assert "lag_calendar_days=None" in info
     assert not any("5m 缓存陈旧" in line for line in lines)
+
+
+# ---------------------------------------------------------------------------
+# 4. (2026-11-18, defect D2) An UNDERsampled 5m day must reach the artifacts
+# ---------------------------------------------------------------------------
+# FORENSIC CONTEXT. A 缺根日 (a session whose 5m sample is short of the 48 bars a normal China
+# session prints) is SKIPPED, not extrapolated: no feature row, so every 5m-derived column
+# joins as NaN. Until now the only trace was a console/log line -- nothing machine-readable
+# reached the ticket or `summary.json`, so an archive could not answer "was the 5m layer fully
+# measured today?" without scraping stdout.
+#
+# The channel added is deliberately ADDITIVE and CONDITIONAL: `intraday_5m_undersampled`
+# (count + per-symbol-day list) appears in the ticket and in `summary.json` ONLY when at least
+# one symbol-day was skipped. The 5m layer is OFF in the production default, so the default
+# path must stay byte-identical -- pinned by the end-to-end `(...absent...)` test below.
+
+
+def test_undersampled_formatter_is_silent_for_an_empty_report():
+    """`{}` / `None` -> NO lines. This is the default-path guarantee, as a pure function."""
+    assert format_intraday_5m_undersampled({}) == []
+    assert format_intraday_5m_undersampled(None) == []
+    assert format_intraday_5m_undersampled({"count": 0, "symbol_days": []}) == []
+
+
+def test_undersampled_formatter_names_symbol_date_bars_and_the_machine_field():
+    lines = format_intraday_5m_undersampled(
+        {
+            "count": 2,
+            "symbol_days": [
+                {"symbol": "600000.SH", "date": "2026-11-12", "bars": 39},
+                {"symbol": "600036.SH", "date": "2026-11-12", "bars": 12},
+            ],
+        }
+    )
+    text = "\n".join(lines)
+
+    assert lines[0].startswith("[WARN] 5m 日内特征欠采样")
+    assert "INTRADAY 5M UNDERSAMPLED" in lines[0]
+    assert "2 个 symbol-day" in text
+    assert "600000.SH 2026-11-12: 39/48 bars" in text
+    assert "600036.SH 2026-11-12: 12/48 bars" in text
+    assert INTRADAY_5M_UNDERSAMPLED_KEY in text
+    assert "count=2" in text
+    # The daily bar was NOT touched -- the line says so instead of implying a fix.
+    assert "日线未被改动" in text
+
+
+# -- end-to-end: one real `main()` run, 100% synthetic ------------------------------
+
+
+def _five_minute_panel(days, bars_per_day):
+    """`days` sessions of 5m bars, `bars_per_day[i]` bars each (48 = a full session)."""
+    frames = []
+    price = 100.0
+    for day, n in zip(days, bars_per_day):
+        ds = day.strftime("%Y-%m-%d")
+        times = pd.date_range(f"{ds} 09:35", f"{ds} 11:30", freq="5min").append(
+            pd.date_range(f"{ds} 13:05", f"{ds} 15:00", freq="5min")
+        )[: int(n)]
+        close = price + np.linspace(0.0, 0.4 * len(times), len(times))
+        open_ = np.concatenate([[price], close[:-1]])
+        frames.append(
+            pd.DataFrame(
+                {
+                    "Open": open_,
+                    "High": np.maximum(open_, close) + 0.05,
+                    "Low": np.minimum(open_, close) - 0.05,
+                    "Close": close,
+                    "Volume": np.full(len(times), 1000.0),
+                },
+                index=times,
+            )
+        )
+        price = float(close[-1])
+    return pd.concat(frames, axis=0)
+
+
+def _run_main(tmp_path, monkeypatch, extra_argv=()):
+    """Run `main()` against a throwaway archive dir with 2 synthetic symbols."""
+    import sys as _sys
+
+    out_dir = os.path.join(str(tmp_path), "archive", "equal_weight", "univ")
+    os.makedirs(out_dir, exist_ok=True)
+    universe_file = os.path.join(str(tmp_path), "univ.txt")
+    with open(universe_file, "w", encoding="utf-8") as f:
+        f.write("600000.SH\n600036.SH\n")
+    holdings_file = os.path.join(str(tmp_path), "holdings.json")
+    with open(holdings_file, "w", encoding="utf-8") as f:
+        json.dump({"600000.SH": 1000}, f)
+
+    monkeypatch.setattr(
+        _sys,
+        "argv",
+        [
+            "run_live_strategy.py",
+            "--strategy", "equal_weight",
+            "--universe-file", universe_file,
+            "--current-holdings-file", holdings_file,
+            "--account-state-file", os.path.join(out_dir, "account_state.json"),
+            "--output-dir", out_dir,
+            "--as-of-date", "2024-05-10",
+            "--start-date", "2024-01-01",
+            "--data-provider", "synthetic",
+            "--portfolio-value", "100000",
+            *extra_argv,
+        ],
+    )
+    main()
+    with open(os.path.join(out_dir, "live_trading_ticket.json"), "r", encoding="utf-8") as f:
+        ticket = json.load(f)
+    with open(os.path.join(out_dir, "summary.json"), "r", encoding="utf-8") as f:
+        summary = json.load(f)
+    return ticket, summary
+
+
+def test_default_run_ticket_and_summary_carry_no_undersampled_field(tmp_path, monkeypatch, capsys):
+    """THE DEFAULT PATH (5m OFF): the new field must NOT exist in either artifact.
+
+    This is the byte-identity bar for the whole change: the production default never loads a
+    5m layer, so a reader diffing today's archive against yesterday's must see nothing new.
+    `capsys` is also checked -- no `[WARN] 5m 日内特征欠采样` line may appear.
+    """
+    ticket, summary = _run_main(tmp_path, monkeypatch)
+    stdout = capsys.readouterr().out
+
+    assert INTRADAY_5M_UNDERSAMPLED_KEY not in ticket
+    assert INTRADAY_5M_UNDERSAMPLED_KEY not in summary
+    assert "5m 日内特征欠采样" not in stdout
+    # ... while the pre-existing gate block is untouched on this path.
+    assert "intraday_gate_status" in ticket and "intraday_gate_status" in summary
+
+
+def test_undersampled_5m_day_reaches_the_ticket_and_the_summary(tmp_path, monkeypatch, capsys):
+    """5m ON with one 39-bar session: ticket + summary carry count/date/bars, operator sees it.
+
+    `load_intraday_5m_universe` is monkeypatched (the loader's own three-tier pipeline is
+    covered elsewhere); everything downstream -- enrichment, the warning, the report, the
+    ticket row, `summary.json` -- is the real production code path.
+    """
+    import common.intraday_features as intraday_features
+
+    days = [pd.Timestamp(d) for d in ("2024-05-08", "2024-05-09", "2024-05-10")]
+    sessions = _five_minute_panel(days, [48, 48, 39])  # 2024-05-10 is 缺根日
+    universe_5m = {"600000.SH": sessions.copy(), "600036.SH": sessions.copy()}
+    calls = []
+
+    def _fake_loader(symbols, **kwargs):
+        calls.append(list(symbols))
+        return {sym: df.copy() for sym, df in universe_5m.items() if sym in list(symbols)}
+
+    monkeypatch.setattr(intraday_features, "load_intraday_5m_universe", _fake_loader)
+
+    with pytest.warns(intraday_features.IntradayIncompleteWarning):
+        ticket, summary = _run_main(
+            tmp_path, monkeypatch, extra_argv=("--enable-intraday-5m",)
+        )
+    stdout = capsys.readouterr().out
+
+    assert calls, "the 5m loader was never consulted with --enable-intraday-5m"
+    expected = {"count": 2}
+    for payload, where in ((ticket, "ticket"), (summary, "summary.json")):
+        block = payload[INTRADAY_5M_UNDERSAMPLED_KEY]
+        assert block["count"] == expected["count"], where
+        assert block["symbol_days"] == [
+            {"symbol": "600000.SH", "date": "2024-05-10", "bars": 39},
+            {"symbol": "600036.SH", "date": "2024-05-10", "bars": 39},
+        ], where
+    # ... and the operator read it, in the file's own warning idiom.
+    assert "[WARN] 5m 日内特征欠采样" in stdout
+    assert "600000.SH 2024-05-10: 39/48 bars" in stdout
+    assert INTRADAY_5M_UNDERSAMPLED_KEY in stdout

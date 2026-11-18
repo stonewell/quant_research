@@ -2523,6 +2523,13 @@ INTRADAY_GATE_REASON_PENDING = "intraday_5m_pending_publication"
 _5M_MEASURED_STATUSES = frozenset({"evaluated", "available"})
 _5M_PENDING_STATUSES = frozenset({"pending_publication"})
 
+#: (2026-11-18, defect D2) Ticket / `summary.json` field carrying the 5m sessions whose
+#: sample was short of a full session. ONE literal for both artifacts, so a consumer greps one
+#: name. It is present ONLY when at least one symbol-day was skipped -- a 5m-off run (the
+#: production default) and a fully-sampled one add NOTHING, which is what keeps those runs
+#: byte-identical to a pre-change ticket.
+INTRADAY_5M_UNDERSAMPLED_KEY = "intraday_5m_undersampled"
+
 
 def _resolve_5m_status_token(metrics: Dict[str, Any]) -> Optional[str]:
     """The 5m measurement axis of the Stage-1 report, in priority order.
@@ -5837,6 +5844,45 @@ def verify_ticket_stdout_order_parity(
     return result
 
 
+def format_intraday_5m_undersampled(
+    report: Optional[Dict[str, Any]],
+) -> List[str]:
+    """Operator lines for the 5m symbol-days that were SKIPPED as undersampled (D2, 2026-11-18).
+
+    Takes the dict `common.intraday_features.enrich_universe_with_intraday_features(report=...)`
+    filled: `{}`/`None` (nothing skipped -- a 5m-off run or a complete sample) returns `[]`, so
+    the default path prints NOTHING new. Otherwise one warning header plus one indented
+    `symbol date: bars/48` line per skipped day and the machine-readable pointer.
+
+    Same idiom as the file's other operator warnings (`[STALE PRICE WARNING]`,
+    `[WARN/SECTOR MAP]`): a `[WARN]` header, an indented enumeration, and the field name a
+    reader can grep in the archived artifacts. Pure formatting -- no I/O, no state.
+    """
+    if not report:
+        return []
+    symbol_days = report.get("symbol_days") or []
+    count = report.get("count", len(symbol_days))
+    if not symbol_days and not count:
+        # Defensive: the producer publishes `{}` when nothing was skipped, but a caller that
+        # normalises to `{"count": 0, "symbol_days": []}` must be just as silent.
+        return []
+    lines = [
+        f"[WARN] 5m 日内特征欠采样 (INTRADAY 5M UNDERSAMPLED)：{count} 个 symbol-day 的 5m "
+        "样本不足 45/48 根，已整体跳过该日 (5m 字段为 NaN, 日线未被改动, 无插补)。"
+    ]
+    for entry in symbol_days:
+        symbol = entry.get("symbol") or "<universe>"
+        lines.append(
+            f"    {symbol} {entry.get('date', '?')}: "
+            f"{entry.get('bars', '?')}/48 bars -> 5m 特征跳过"
+        )
+    lines.append(
+        f"    机器可读: live_trading_ticket.json / summary.json "
+        f"{INTRADAY_5M_UNDERSAMPLED_KEY} (count={count})"
+    )
+    return lines
+
+
 def summarize_intraday_5m_loading(
     universe_5m: Optional[Dict[str, Any]],
     symbols: Iterable[str],
@@ -6640,6 +6686,13 @@ def main(cli_args: Optional[List[str]] = None):
     # flag from Web Station, which appends `--enable-intraday-5m` unconditionally
     # (`web/livetrading/execution_service.py`), so 5m is NOT silently turned off in production.
     enable_intraday_5m = bool(getattr(args, "enable_intraday_5m", False))
+    # (2026-11-18, defect D2) Machine-readable record of the 5m sessions SKIPPED as
+    # undersampled (`< 45` of ~48 bars). Filled IN PLACE by
+    # `enrich_universe_with_intraday_features(report=...)` a few dozen lines below; it stays
+    # `{}` on the default (5m-off) path AND on a fully-sampled one, and EVERY consumer is
+    # gated on truthiness -- so a run whose 5m layer is off produces a ticket and a
+    # `summary.json` byte-identical to a pre-change run.
+    intraday_5m_undersampled: Dict[str, Any] = {}
     _record_effective_param(
         effective_param_entries,
         declared_params,
@@ -6778,8 +6831,18 @@ def main(cli_args: Optional[List[str]] = None):
             ):
                 print(_line)
             universe = enrich_universe_with_intraday_features(
-                universe, universe_5m, config=IntradayFeatureConfig(cutoff_time=cutoff_t)
+                universe,
+                universe_5m,
+                config=IntradayFeatureConfig(cutoff_time=cutoff_t),
+                # (2026-11-18, defect D2) OUT-parameter, not a return-value change: the
+                # skipped 缺根日 symbol-days land in `intraday_5m_undersampled` so they can
+                # reach the ticket / `summary.json` instead of dying in a log line.
+                report=intraday_5m_undersampled,
             )
+            # Printed HERE (where the 5m layer's own status lines live) and emitted only when
+            # something was skipped: `format_intraday_5m_undersampled({})` is `[]`.
+            for _line in format_intraday_5m_undersampled(intraday_5m_undersampled):
+                print(_line)
         except Exception as exc:
             print(f"[WARN] Failed to load 5m intraday features in Stage 2 runner: {exc}")
 
@@ -7191,18 +7254,24 @@ def main(cli_args: Optional[List[str]] = None):
     # (defect A/B, 2026-11-12) The SAME three fields land in summary.json, so a consumer
     # that never opens the ticket can still tell WHICH state this run was in and what
     # scale was applied. A merge into the existing summary (never an overwrite).
+    _intraday_summary_extra: Dict[str, Any] = {
+        "intraday_gate_status": intraday_gate_state["intraday_gate_status"],
+        "intraday_gate_reason": intraday_gate_state["intraday_gate_reason"],
+        "intraday_buy_scale_applied": intraday_gate_state["intraday_buy_scale_applied"],
+        "intraday_5m_status": intraday_gate_state["intraday_5m_status"],
+        "intraday_5m_enabled": intraday_gate_state["intraday_5m_enabled"],
+    }
+    # (2026-11-18, defect D2) Additive and CONDITIONAL: the field exists only when the
+    # enrichment actually skipped an undersampled symbol-day, so `summary.json` for a
+    # 5m-off run is byte-identical to a pre-change one.
+    if intraday_5m_undersampled:
+        _intraday_summary_extra[INTRADAY_5M_UNDERSAMPLED_KEY] = intraday_5m_undersampled
     persist_run_metadata(
         args.output_dir,
         clock_ctx,
         freshness_summary=freshness_summary,
         probe_attempts=probe_attempts,
-        extra={
-            "intraday_gate_status": intraday_gate_state["intraday_gate_status"],
-            "intraday_gate_reason": intraday_gate_state["intraday_gate_reason"],
-            "intraday_buy_scale_applied": intraday_gate_state["intraday_buy_scale_applied"],
-            "intraday_5m_status": intraday_gate_state["intraday_5m_status"],
-            "intraday_5m_enabled": intraday_gate_state["intraday_5m_enabled"],
-        },
+        extra=_intraday_summary_extra,
     )
     target_series = apply_intraday_distribution_gate(
         target_series,
@@ -9139,6 +9208,18 @@ def main(cli_args: Optional[List[str]] = None):
         "intraday_buy_scale_applied"
     ]
     ticket_payload["intraday_gate"] = dict(intraday_gate_state)
+    # (2026-11-18, defect D2) The 5m layer's FEATURE-COVERAGE fact, next to the gate verdict:
+    # `{"count": N, "symbol_days": [{"symbol", "date", "bars"}, ...]}` for every session whose
+    # 5m sample was short of `45/48` bars and was therefore SKIPPED (its 5m columns are NaN,
+    # the daily bar was never touched). Book-level and CONDITIONAL on purpose:
+    #   * top-level, not per-row -- a skipped symbol-day may have no order row at all (HOLD),
+    #     so a row field could never carry it universally;
+    #   * absent when nothing was skipped, so a 5m-off run's ticket stays byte-identical;
+    #   * NOT in `common/freshness.py`: that module judges PRICE staleness of the daily bar
+    #     (`is_stale_bar` / `latest_close`), while this is feature COVERAGE of the 5m layer --
+    #     a different axis, owned at the ticket/summary level.
+    if intraday_5m_undersampled:
+        ticket_payload[INTRADAY_5M_UNDERSAMPLED_KEY] = intraday_5m_undersampled
     # (LV18, 2026-11-12) Stage-1 Barroso ceiling, archived next to the other book-level
     # verdicts. Present ONLY for the allowlisted strategy with the overlay enabled -- every
     # other strategy's ticket is byte-identical to before this change.

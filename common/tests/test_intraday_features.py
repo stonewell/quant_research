@@ -8,6 +8,7 @@ import datetime
 import logging
 import os
 import sys
+import warnings
 from unittest.mock import MagicMock, patch
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -24,6 +25,10 @@ from common.duckdb_cache import (
     _get_resample_rule,
     is_intraday_interval,
 )
+#: (2026-11-18, defect D1) The ONE shared category for "a 5m sample is short of a full
+#: session". Imported at module level so a test can assert it is the same class object the
+#: sync script exports (`sync.IntradayIncompleteWarning`) rather than a local copy.
+from common.intraday_features import IntradayIncompleteWarning
 
 
 #: Every intraday column RETIRED by owner ruling and one name to prove absence against.
@@ -1017,7 +1022,12 @@ def test_missing_5m_day_is_skipped_not_synthesized(caplog):
     )
     short_day = days[-1]
 
-    with caplog.at_level(logging.WARNING, logger="common.intraday_features"):
+    # (2026-11-18, defect D1) ONE catchable channel: the skip is an
+    # `IntradayIncompleteWarning` (a `UserWarning` subclass defined in
+    # `common.intraday_features`), NOT a bare log record. `pytest.warns` proves the category
+    # is observable by a caller; the old `caplog` assertion could never have seen the sync
+    # script's identically-named condition.
+    with pytest.warns(IntradayIncompleteWarning):
         out = enrich_universe_with_intraday_features(
             {"SYM_D2": official},
             {"SYM_D2": df_5m},
@@ -1034,11 +1044,154 @@ def test_missing_5m_day_is_skipped_not_synthesized(caplog):
     # ... and the fully sampled days around it are still measured
     assert out.loc[days[0], "UpVol_Ratio_5m"] == out.loc[days[0], "UpVol_Ratio_5m"]
 
-    # (b3) one WARNING naming the symbol, the date and the observed bar count
-    msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
-    hits = [m for m in msgs if short_day.date().isoformat() in m and "SYM_D2" in m]
-    assert hits, msgs
-    assert "39" in hits[0]
+
+def test_undersampled_warning_carries_symbol_date_and_bar_count_and_is_silent_on_a_full_sample():
+    """(a) 2026-11-18 D1: the warning fires per short symbol-day, and NEVER on a full sample.
+
+    Discriminating both ways: a complete 48-bar panel must produce zero
+    `IntradayIncompleteWarning` (otherwise every live run is noisy), and a 39-bar session must
+    produce exactly one whose text names the symbol, the ISO date and the observed count (the
+    three facts an operator/diagnostic needs, and the three a dedupe key depends on).
+    """
+    from common.intraday_features import (
+        IntradayFeatureConfig,
+        enrich_universe_with_intraday_features,
+    )
+
+    days = pd.bdate_range("2026-10-12", periods=4)
+
+    def _daily(panel):
+        return pd.DataFrame(
+            [
+                {
+                    "Open": float(b["Open"].iloc[0]),
+                    "High": float(b["High"].max()),
+                    "Low": float(b["Low"].min()),
+                    "Close": float(b["Close"].iloc[-1]),
+                    "Volume": float(b["Volume"].sum()),
+                }
+                for _, b in panel.groupby(panel.index.normalize())
+            ],
+            index=days,
+        )
+
+    # 1. COMPLETE sample -> no warning at all
+    complete = _intraday_panel(4, [48, 48, 48, 48])
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        enrich_universe_with_intraday_features(
+            {"SYM": _daily(complete)},
+            {"SYM": complete},
+            config=IntradayFeatureConfig(cutoff_time="15:00"),
+        )
+    assert [w for w in caught if issubclass(w.category, IntradayIncompleteWarning)] == []
+
+    # 2. SHORT sample (39 bars on the LAST session) -> exactly one, carrying the three facts
+    short = _intraday_panel(4, [48, 48, 48, 39])
+    with pytest.warns(IntradayIncompleteWarning) as caught_one:
+        enrich_universe_with_intraday_features(
+            {"SYM": _daily(short)},
+            {"SYM": short},
+            config=IntradayFeatureConfig(cutoff_time="15:00"),
+        )
+    assert len(caught_one) == 1
+    message = str(caught_one[0].message)
+    assert "SYM" in message
+    assert days[-1].date().isoformat() in message
+    assert "39" in message
+    # ... and the class is the ONE shared category, not a local copy
+    assert caught_one[0].category is IntradayIncompleteWarning
+    assert issubclass(IntradayIncompleteWarning, UserWarning)
+
+
+def test_enrich_report_out_param_records_exactly_the_skipped_days_and_stays_empty_otherwise():
+    """(b) 2026-11-18 D2: the out-parameter is filled ONLY for skipped symbol-days.
+
+    Pinned, in one place:
+      * `report` omitted -> the return value is BIT-IDENTICAL to passing a dict (fail-soft: the
+        new parameter can never change the weights/features a run computes);
+      * a short day -> `{"count": 1, "symbol_days": [{"symbol", "date", "bars"}]}`, exact;
+      * a complete sample -> `{}` (a clean 5m layer adds nothing to the ticket);
+      * no 5m layer at all -> `{}` untouched, which is what keeps a 5m-off run byte-identical;
+      * a stale pre-populated dict is CLEARED, so yesterday's event cannot be re-reported.
+    """
+    from common.intraday_features import (
+        IntradayFeatureConfig,
+        enrich_universe_with_intraday_features,
+    )
+
+    days = pd.bdate_range("2026-10-12", periods=4)
+
+    def _daily(panel):
+        return pd.DataFrame(
+            [
+                {
+                    "Open": float(b["Open"].iloc[0]),
+                    "High": float(b["High"].max()),
+                    "Low": float(b["Low"].min()),
+                    "Close": float(b["Close"].iloc[-1]),
+                    "Volume": float(b["Volume"].sum()),
+                }
+                for _, b in panel.groupby(panel.index.normalize())
+            ],
+            index=days,
+        )
+
+    short = _intraday_panel(4, [48, 48, 48, 39])
+    report: dict = {}
+    with pytest.warns(IntradayIncompleteWarning):
+        out_with_report = enrich_universe_with_intraday_features(
+            {"SYM": _daily(short)},
+            {"SYM": short},
+            config=IntradayFeatureConfig(cutoff_time="15:00"),
+            report=report,
+        )
+    assert report == {
+        "count": 1,
+        "symbol_days": [
+            {"symbol": "SYM", "date": days[-1].date().isoformat(), "bars": 39}
+        ],
+    }
+
+    # The report is an OBSERVER: the enriched frame is unchanged by passing it.
+    with pytest.warns(IntradayIncompleteWarning):
+        out_without_report = enrich_universe_with_intraday_features(
+            {"SYM": _daily(short)},
+            {"SYM": short},
+            config=IntradayFeatureConfig(cutoff_time="15:00"),
+        )
+    pd.testing.assert_frame_equal(out_with_report["SYM"], out_without_report["SYM"])
+
+    # A COMPLETE sample fills nothing.
+    complete = _intraday_panel(4, [48, 48, 48, 48])
+    clean_report: dict = {}
+    enrich_universe_with_intraday_features(
+        {"SYM": _daily(complete)},
+        {"SYM": complete},
+        config=IntradayFeatureConfig(cutoff_time="15:00"),
+        report=clean_report,
+    )
+    assert clean_report == {}
+
+    # No 5m layer at all (the default production shape): the dict is untouched -> `{}`.
+    absent_report: dict = {}
+    enrich_universe_with_intraday_features(
+        {"SYM": _daily(complete)},
+        {},
+        config=IntradayFeatureConfig(cutoff_time="15:00"),
+        report=absent_report,
+    )
+    assert absent_report == {}
+
+    # A stale carry-over cannot survive a clean round.
+    stale = {"count": 9, "symbol_days": [{"symbol": "OLD", "date": "2000-01-01", "bars": 3}]}
+    enrich_universe_with_intraday_features(
+        {"SYM": _daily(complete)},
+        {"SYM": complete},
+        config=IntradayFeatureConfig(cutoff_time="15:00"),
+        report=stale,
+    )
+    assert stale == {}
 
 
 #: Adversarial values planted in each retired column name by the hostile-injection guard below.
