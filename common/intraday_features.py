@@ -4,10 +4,10 @@ Implements tasks T2.1, T2.2, and T2.3 from docs/intraday_5m_live_and_blend_enhan
 - Point-in-time causal cutoff (R1, R6): A-share 5m bars filtered strictly by ts.time() <= cutoff_time
   (48 bars at the full-session default; 36 at 14:00 / 39 at 14:15 remain available to reproduce
   a historical intraday run).
-- Pure intraday realized variance, semivariance decomposition, and bipower variation (RV, RS_Up, RS_Down, BPV).
+- Pure intraday returns and DOWNside semivariance (RS_Down_5m) plus the signed jump
+  (Signed_Jump_5m = RS_Up - RS_Down) that `check_live_portfolio_health.py` reads.
 - True Intraday VWAP and dimensionless premium (VWAP_Prem_5m) immune to price basis.
-- Microstructure order flow: signed up-volume ratio (UpVol_Ratio_5m) and overnight-gap-stripped
-  Smart Money factor (SmartMoney_Q_5m).
+- Microstructure order flow: signed up-volume ratio (UpVol_Ratio_5m).
 - Afternoon return (Afternoon_Ret_5m = C_{t,M} / C_{t,11:30} - 1) for afternoon distribution detection (R9.3).
 - 5m Chan sub-level interval nesting and MACD bull/bear confluence with 240-bar lookback (R9).
 - Cross-source split ratio alignment kappa_t = C_{t,1d} / C_{t,M,5m} (R4, R6).
@@ -24,9 +24,23 @@ post-close-only, so nothing here may ever touch the daily bar:
   578 RMB equity/cash split, NAV 128,619 at the official close vs 128,041 at the 14:15 bar).
 - **A 缺根日 (5m sample short of a full session, i.e. `< 45` bars) is now SKIPPED, not
   extrapolated**: the day gets no feature row, so every 5m-derived column joins as NaN, and
-  one WARNING per symbol-day names the date and the observed bar count. `Seasonality_Volume_Scale`
-  survives as a column for schema stability but its extrapolation is inert under the full-session
-  default (the `volume_seasonality_*` config fields are dead -- see their docstrings).
+  one WARNING per symbol-day names the date and the observed bar count.
+
+RETIRED 2026-11-17 (second owner ruling) -- ten columns were DELETED OUTRIGHT, not annotated,
+because NO production reader ever existed for them. Seven were never read; the other three lost
+their last reader when the blend Track-T switches were removed the same day:
+- never read: `RV_5m`, `RS_Up_5m`, `BPV_5m`, `Jump_Ratio_5m`, `Seasonality_Volume_Scale`,
+  `Morning_Low_5m`, `Chan_5m_ZD`;
+- orphaned by the blend switch deletion: `SmartMoney_Q_5m`, `Afternoon_Low_5m`,
+  `Chan_5m_Buy_Confluence`.
+Their producers went with them: the realized-variance/bipower/jump composition (only the DOWNside
+semivariance and the signed jump that `RS_Down_5m` / `Signed_Jump_5m` need are still computed),
+the Smart Money VWAP-premium block (`smart_money_top_pct` config field included), both intraday
+low windows, and the whole volume-seasonality extrapolation
+(`_compute_volume_seasonality_scales` + its three `volume_seasonality_*` config fields).
+`Chan_5m_Buy_Confluence` and the `Chan_5m_ZD` pivot low are the one disclosed exception: the
+`confluence` tier is NOT discarded -- the kept `Chan_5m_State` tag is derived from it -- so it
+survives as an internal local and is only no longer EXPOSED as a column.
 """
 
 from __future__ import annotations
@@ -90,8 +104,9 @@ class IntradayFeatureConfig:
     convention. A cutoff only ever NARROWS the 5m feature window; it never touches the daily
     bar. Pass `'14:15'` (39 bars) or `'14:00'` (36 bars) to reproduce a historical intraday
     feature window -- DISCLOSED COST: artifacts produced under that convention are no longer
-    bit-reproducible, and only strategies with a 5m switch ON are affected at all (every
-    deployed strategy has all three OFF, so the columns are never read).
+    bit-reproducible, and only strategies with a 5m switch ON are affected at all (the blend
+    Track-T switches were retired 2026-11-17 and every deployed strategy had all three OFF, so
+    the columns are never read).
     """
 
     chan_5m_lookback_bars: int = 240
@@ -102,45 +117,14 @@ class IntradayFeatureConfig:
     chan_5m_signal_window_bars: int = 12
     """Signals appearing within the most recent 12 bars (1 hour) are treated as active today."""
 
-    smart_money_top_pct: float = 0.20
-    """Cumulative volume percentage threshold for smart money selection (top 20%)."""
-
     morning_end_time: str = "11:30"
     """R9.3: Reference morning close time for Afternoon_Ret_5m calculation."""
-
-    afternoon_start_time: str = "13:05"
-    """Timestamp of the first 5m bar in the afternoon session."""
 
     enable_chan_5m: bool = True
     """Whether to evaluate 5m Chan structure, confluence, and pivots."""
 
     intraday_upvol_thresh: float = 0.58
     """Reference threshold for signed up-volume surge confirmation."""
-
-    volume_seasonality_lookback_days: int = 20
-    """Historical trading days to compute median cumulative volume proportion phi.
-
-    DEAD (2026-11-17 owner ruling -- kept, not deleted, as the historical record). This field
-    and the two `phi_*` defaults below only fed the partial-day volume EXTRAPOLATION that
-    accompanied daily-bar synthesis. Synthesis is retired (see the module docstring), the
-    deployment is post-close-only, and `_compute_volume_seasonality_scales` now returns the
-    identity 1.0 whenever `cutoff_time` is None or >= 15:00 -- i.e. always, in every live and
-    backtest path. Nothing reads phi to produce a volume any more.
-    """
-
-    volume_seasonality_phi_1400: float = 0.78
-    """Default cumulative volume proportion at 14:00 when historical baseline is unavailable.
-
-    DEAD (see `volume_seasonality_lookback_days`): only the retired partial-day synthesis path
-    read it, and that path is gone. Retained so a historical config still deserialises.
-    """
-
-    volume_seasonality_phi_1415: float = 0.84
-    """Default cumulative volume proportion at 14:15 when historical baseline is unavailable.
-
-    DEAD (see `volume_seasonality_lookback_days`): only the retired partial-day synthesis path
-    read it, and that path is gone. Retained so a historical config still deserialises.
-    """
 
     tick_size_stock: float = 0.01
     """A-share equity quote unit (RMB 0.01)."""
@@ -203,81 +187,6 @@ def _detect_limit_pct_and_tick(symbol: Optional[str]) -> Tuple[float, float]:
     return 0.10, 0.01
 
 
-def _compute_volume_seasonality_scales(
-    df_5m: pd.DataFrame,
-    cutoff_time: Optional[datetime.time],
-    config: IntradayFeatureConfig,
-) -> Dict[pd.Timestamp, float]:
-    """Calculate causal volume seasonality scaling factor phi^{-1} (R6).
-
-    For each date t, uses the median cumulative volume ratio from the prior N full days:
-    phi_t = median_{k=1..N}(V_{t-k, <=cutoff} / V_{t-k, full}).
-
-    RETIRED-INPUT (2026-11-17): this extrapolation existed ONLY to scale a truncated 5m volume
-    sum up to a full-day estimate before writing it into a synthesized daily bar. That synthesis
-    is gone, so the returned factor is now inert -- it is still attached as the
-    `Seasonality_Volume_Scale` column for schema stability, but no consumer multiplies a volume
-    by it. Under the full-session default (every live and backtest path) the function returns
-    the identity 1.0 immediately.
-    """
-    if cutoff_time is None or cutoff_time >= datetime.time(15, 0):
-        unique_dates = df_5m.index.normalize().unique()
-        return {d: 1.0 for d in unique_dates}
-
-    # Group by calendar date
-    day_groups = df_5m.groupby(df_5m.index.normalize())
-    full_day_ratios: Dict[pd.Timestamp, float] = {}
-
-    for d, g in day_groups:
-        total_vol = float(g["Volume"].sum())
-        bar_count = len(g)
-        # Full trading day has 48 bars (or >= 45 bars)
-        if bar_count >= 45 and total_vol > 0:
-            vol_cutoff = float(g.loc[g.index.time <= cutoff_time, "Volume"].sum())
-            full_day_ratios[d] = vol_cutoff / total_vol
-
-    # Default fallback phi
-    if cutoff_time == datetime.time(14, 0):
-        default_phi = config.volume_seasonality_phi_1400
-    elif cutoff_time == datetime.time(14, 15):
-        default_phi = config.volume_seasonality_phi_1415
-    else:
-        # Approximate by bar count ratio: M / 48
-        # e.g., 36 / 48 = 0.75, 39 / 48 = 0.8125
-        approx_bars = sum(
-            1 for h in [9, 10, 11, 13, 14] for m in range(0, 60, 5)
-            if ((h == 9 and m >= 35) or (h == 10) or (h == 11 and m <= 30) or
-                (h == 13 and m >= 5) or (h == 14)) and datetime.time(h, m) <= cutoff_time
-        )
-        default_phi = min(1.0, max(0.10, approx_bars / 48.0))
-
-    sorted_full_dates = sorted(full_day_ratios.keys())
-    unique_dates = sorted(df_5m.index.normalize().unique())
-    scale_map: Dict[pd.Timestamp, float] = {}
-
-    lookback = config.volume_seasonality_lookback_days
-
-    for d in unique_dates:
-        # Strictly causal: only dates strictly before d
-        prior_ratios = [
-            full_day_ratios[pd_date]
-            for pd_date in sorted_full_dates
-            if pd_date < d
-        ]
-        if len(prior_ratios) >= 5:
-            # Take last N full days
-            recent_ratios = prior_ratios[-lookback:]
-            phi = float(np.median(recent_ratios))
-            if phi <= 0.05 or phi > 1.0:
-                phi = default_phi
-        else:
-            phi = default_phi
-
-        scale_map[d] = 1.0 / phi if phi > 0 else 1.0
-
-    return scale_map
-
-
 def _compute_day_microstructure(
     day_bars: pd.DataFrame,
     prev_close: Optional[float],
@@ -313,7 +222,8 @@ def _compute_day_microstructure(
     else:
         res["VWAP_Prem_5m"] = 0.0
 
-    # 2. Pure Intraday Returns & Semivariance Decomposition (Andersen et al. 2003, Patton & Sheppard 2015)
+    # 2. Pure Intraday Returns, Downside Semivariance & Signed Jump
+    # (Andersen et al. 2003, Patton & Sheppard 2015)
     # r_{t,1} = ln(C_1 / O_1), stripping overnight gap
     # r_{t,j} = ln(C_j / C_{j-1}) for j >= 2
     r = np.zeros(m_count, dtype=float)
@@ -324,26 +234,16 @@ def _compute_day_microstructure(
             r[j] = math.log(closes[j] / closes[j - 1])
 
     r_sq = r * r
-    rv = float(r_sq.sum())
     rs_up = float(r_sq[r > 0].sum())
     rs_down = float(r_sq[r < 0].sum())
-
-    # Bipower Variation (BPV) and discrete Jump Component (Barndorff-Nielsen & Shephard 2004)
-    if m_count > 1:
-        abs_r = np.abs(r)
-        bpv = float((math.pi / 2.0) * (m_count / (m_count - 1.0)) * (abs_r[1:] * abs_r[:-1]).sum())
-    else:
-        bpv = rv
-
-    jump_component = max(0.0, rv - bpv)
-    jump_ratio = jump_component / (rv + 1e-12)
     signed_jump = rs_up - rs_down
 
-    res["RV_5m"] = rv
-    res["RS_Up_5m"] = rs_up
+    # (2026-11-17) `RV_5m` (sigma r^2), `RS_Up_5m`, `BPV_5m` and `Jump_Ratio_5m` are DELETED --
+    # no production reader ever existed. Only what the two LIVE columns need survives:
+    # `RS_Down_5m` is `rs_down` and `Signed_Jump_5m` is `rs_up - rs_down`, so `rs_up`/`rs_down`
+    # stay; the total `rv`, the bipower variation and the jump component fed nothing else and
+    # are gone (do not re-add them "for symmetry" -- re-add them with a consumer).
     res["RS_Down_5m"] = rs_down
-    res["BPV_5m"] = bpv
-    res["Jump_Ratio_5m"] = jump_ratio
     res["Signed_Jump_5m"] = signed_jump
 
     # 3. Signed Up-Volume Ratio (Bulk Volume Classification, Easley et al. 2012)
@@ -377,39 +277,7 @@ def _compute_day_microstructure(
         upvol_ratio = 0.5
     res["UpVol_Ratio_5m"] = float(np.clip(upvol_ratio, 0.0, 1.0))
 
-    # 4. Overnight-Gap-Stripped Smart Money Factor (SmartMoney_Q_5m)
-    # S_{t,j} = (|C_j - O_j| / O_j) / sqrt(V_j)
-    bar_ret = np.zeros(m_count, dtype=float)
-    valid_o = opens > 0
-    bar_ret[valid_o] = np.abs(closes[valid_o] - opens[valid_o]) / opens[valid_o]
-
-    sqrt_v = np.sqrt(np.maximum(0.0, vols))
-    smartness = np.zeros(m_count, dtype=float)
-    valid_v = sqrt_v > 0
-    smartness[valid_v] = bar_ret[valid_v] / sqrt_v[valid_v]
-
-    if tot_vol > 0:
-        sort_idx = np.argsort(-smartness)  # descending order
-        target_vol = tot_vol * config.smart_money_top_pct
-        cum_vol = 0.0
-        smart_indices = []
-
-        for idx in sort_idx:
-            smart_indices.append(idx)
-            cum_vol += vols[idx]
-            if cum_vol >= target_vol:
-                break
-
-        smart_vol = float(vols[smart_indices].sum())
-        if smart_vol > 0:
-            vwap_smart = float((typ_prices[smart_indices] * vols[smart_indices]).sum() / smart_vol)
-            res["SmartMoney_Q_5m"] = (vwap_smart / vwap) - 1.0 if vwap > 0 else 0.0
-        else:
-            res["SmartMoney_Q_5m"] = 0.0
-    else:
-        res["SmartMoney_Q_5m"] = 0.0
-
-    # 5. Afternoon Return relative to 11:30 morning close (Afternoon_Ret_5m, R9.3)
+    # 4. Afternoon Return relative to 11:30 morning close (Afternoon_Ret_5m, R9.3)
     t_1130 = datetime.time(11, 30)
     mask_1130 = day_bars.index.time == t_1130
     if mask_1130.any():
@@ -427,23 +295,7 @@ def _compute_day_microstructure(
     else:
         res["Afternoon_Ret_5m"] = 0.0
 
-    # 6. Morning Low (09:35..10:00) & Afternoon Low (13:05..cutoff)
-    t_0935 = datetime.time(9, 35)
-    t_1000 = datetime.time(10, 0)
-    mask_morning_ext = (day_bars.index.time >= t_0935) & (day_bars.index.time <= t_1000)
-    if mask_morning_ext.any():
-        res["Morning_Low_5m"] = float(day_bars.loc[mask_morning_ext, "Low"].min())
-    else:
-        res["Morning_Low_5m"] = float(lows.min())
-
-    t_1305 = datetime.time(13, 5)
-    mask_afternoon = day_bars.index.time >= t_1305
-    if mask_afternoon.any():
-        res["Afternoon_Low_5m"] = float(day_bars.loc[mask_afternoon, "Low"].min())
-    else:
-        res["Afternoon_Low_5m"] = float("nan")
-
-    # 7. Price Limit Lockout Detection (Last_3Bars_Locked_Limit, R10)
+    # 5. Price Limit Lockout Detection (Last_3Bars_Locked_Limit, R10)
     limit_pct, tick = _detect_limit_pct_and_tick(symbol)
     if prev_close is not None and prev_close > 0:
         limit_up = round(round(prev_close * (1.0 + limit_pct) / tick) * tick, 4)
@@ -482,11 +334,9 @@ def _evaluate_chan_5m_state(
 ) -> Dict[str, Any]:
     """Evaluate 5m Chan sub-level interval nesting and MACD bull/bear confluence (R9)."""
     default_res = {
-        "Chan_5m_Buy_Confluence": 0,
         "Chan_5m_Sell_Trigger": 0,
         "Chan_5m_State": "5m_NEUTRAL",
         "Chan_5m_ZG": float("nan"),
-        "Chan_5m_ZD": float("nan"),
     }
 
     if not config.enable_chan_5m or chan_modules is None or len(df_window) < 30:
@@ -515,10 +365,11 @@ def _evaluate_chan_5m_state(
         pivots = pivot_fn(strokes)
 
         zg_val = float("nan")
-        zd_val = float("nan")
         if len(pivots) > 0:
             zg_val = float(pivots["zg"].iloc[-1])
-            zd_val = float(pivots["zd"].iloc[-1])
+            # `Chan_5m_ZD` (the pivot LOW) is DELIBERATELY not extracted any more -- 2026-11-17:
+            # only `Chan_5m_ZG` ever had a production reader (`scripts/run_live_strategy.py`), so
+            # ZD's asymmetry with ZG is a deletion, not an oversight.
 
         last_fractal_kind = fractals["kind"].iloc[-1] if len(fractals) > 0 else None
 
@@ -546,7 +397,9 @@ def _evaluate_chan_5m_state(
             if "divergence_sell" in tail_pm.columns else False
         )
 
-        # 3. Buy Confluence
+        # 3. Buy Confluence tier -- (2026-11-17) NO LONGER EXPOSED as a `Chan_5m_Buy_Confluence`
+        # column (no production reader); it survives because the kept, LIVE `Chan_5m_State` tag
+        # is derived from it. Do not delete the tier without replacing the state mapping.
         if (has_c3_buy or has_pm_div_buy) and macd_bull:
             confluence = 2
         elif macd_bull and last_fractal_kind == "bottom":
@@ -571,17 +424,14 @@ def _evaluate_chan_5m_state(
             chan_state = "5m_NEUTRAL"
 
         return {
-            "Chan_5m_Buy_Confluence": confluence,
             "Chan_5m_Sell_Trigger": sell_trigger,
             "Chan_5m_State": chan_state,
             "Chan_5m_ZG": zg_val,
-            "Chan_5m_ZD": zd_val,
         }
 
     except Exception as exc:
         logger.debug("Error computing 5m Chan signals: %s", exc)
         default_res["Chan_5m_ZG"] = zg_val if "zg_val" in locals() else float("nan")
-        default_res["Chan_5m_ZD"] = zd_val if "zd_val" in locals() else float("nan")
         return default_res
 
 
@@ -608,9 +458,11 @@ def compute_daily_intraday_features(
     Returns
     -------
     pd.DataFrame
-        DataFrame indexed by date (normalized DatetimeIndex) with 21 standard features. A date
+        DataFrame indexed by date (normalized DatetimeIndex) with 11 standard features. A date
         whose 5m sample is incomplete (< 45 bars) is ABSENT from the index (2026-11-17) -- the
         caller joins by date, so its 5m-derived columns come out NaN. Nothing is extrapolated.
+        (Was 21 columns; the ten with no production reader were deleted 2026-11-17 -- see the
+        module docstring.)
     """
     if config is None:
         config = IntradayFeatureConfig()
@@ -627,10 +479,7 @@ def compute_daily_intraday_features(
 
     cutoff_t = _parse_time_cutoff(config.cutoff_time)
 
-    # 1. Volume seasonality scaling map (R6)
-    seasonality_scales = _compute_volume_seasonality_scales(df_5m, cutoff_t, config)
-
-    # 2. Causal cutoff filtering (R1, R6)
+    # 1. Causal cutoff filtering (R1, R6)
     if cutoff_t is not None:
         df_cut = df_5m.loc[df_5m.index.time <= cutoff_t].copy()
     else:
@@ -687,8 +536,6 @@ def compute_daily_intraday_features(
         )
 
         row["Date"] = d
-        row["Seasonality_Volume_Scale"] = seasonality_scales.get(d, 1.0)
-
 
         # Chan 5m structure (with lazy candidate date support, R9)
         should_calc_chan = (
@@ -708,11 +555,9 @@ def compute_daily_intraday_features(
             )
             row.update(chan_res)
         else:
-            row["Chan_5m_Buy_Confluence"] = 0
             row["Chan_5m_Sell_Trigger"] = 0
             row["Chan_5m_State"] = "5m_NEUTRAL"
             row["Chan_5m_ZG"] = float("nan")
-            row["Chan_5m_ZD"] = float("nan")
 
         records.append(row)
         prev_close = row["Close_5m_Cutoff"]
@@ -722,28 +567,22 @@ def compute_daily_intraday_features(
         out_df.set_index("Date", inplace=True)
     out_df.index = pd.to_datetime(out_df.index)
 
-    # Standard column ordering
+    # Standard column ordering. (2026-11-17) Ten columns are GONE from this list -- `RV_5m`,
+    # `RS_Up_5m`, `BPV_5m`, `Jump_Ratio_5m`, `Seasonality_Volume_Scale`, `Morning_Low_5m`,
+    # `Chan_5m_ZD`, `SmartMoney_Q_5m`, `Afternoon_Low_5m`, `Chan_5m_Buy_Confluence` -- each
+    # verified to have no production reader (see the module docstring). Adding one back without
+    # a reader re-creates the dead-column problem this deletion closed.
     standard_cols = [
         "Close_5m_Cutoff",
         "VWAP",
         "VWAP_Prem_5m",
-        "RV_5m",
-        "RS_Up_5m",
         "RS_Down_5m",
-        "BPV_5m",
-        "Jump_Ratio_5m",
         "Signed_Jump_5m",
         "UpVol_Ratio_5m",
-        "SmartMoney_Q_5m",
         "Afternoon_Ret_5m",
-        "Morning_Low_5m",
-        "Afternoon_Low_5m",
-        "Seasonality_Volume_Scale",
-        "Chan_5m_Buy_Confluence",
         "Chan_5m_Sell_Trigger",
         "Chan_5m_State",
         "Chan_5m_ZG",
-        "Chan_5m_ZD",
         "Last_3Bars_Locked_Limit",
     ]
 
@@ -804,12 +643,12 @@ def enrich_universe_with_intraday_features(
 
     enriched_universe: Dict[str, pd.DataFrame] = {}
 
+    # Price-dimensioned feature columns, projected onto the daily panel's own adjustment basis.
+    # `Morning_Low_5m`, `Afternoon_Low_5m` and `Chan_5m_ZD` were removed 2026-11-17 with the
+    # columns themselves (deleted: no reader); only the two a live ticket actually reads remain.
     price_cols = [
         "VWAP",
-        "Morning_Low_5m",
-        "Afternoon_Low_5m",
         "Chan_5m_ZG",
-        "Chan_5m_ZD",
     ]
 
     for sym, df_1d in universe_1d.items():
@@ -1105,8 +944,8 @@ held every one of those bars through the previous session's 15:00 close.
 
 90 calendar days is the floor with margin: the intraday feature layer needs about 41 TRADING
 days of history at the as-of date -- `VOL_MIN_OBS = 21` sessions for the volume-scaled /
-intraday-volatility estimates (`scripts/check_live_portfolio_health.py::VOL_MIN_OBS`) plus the
-20-session `volume_seasonality_lookback_days` warm-up -- i.e. roughly 60 calendar days; 90
+intraday-volatility estimates (`scripts/check_live_portfolio_health.py::VOL_MIN_OBS`) plus a
+20-session warm-up for those rolling estimates -- i.e. roughly 60 calendar days; 90
 covers that plus holidays. This bounds the NETWORK window only; the cache READ window
 (`[start, end]`) is deliberately unchanged, because shortening it would truncate a backtest
 replay's 5m history (`backtester/run_backtest.py` passes the whole backtest span and no

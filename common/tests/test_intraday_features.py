@@ -26,6 +26,28 @@ from common.duckdb_cache import (
 )
 
 
+#: Every intraday column RETIRED by owner ruling and one name to prove absence against.
+#: (2026-11-17, first ruling) the partial-day synthesis flags; (2026-11-17, second ruling) ten
+#: feature columns deleted OUTRIGHT because no production reader ever existed -- seven never read,
+#: three (`SmartMoney_Q_5m`, `Afternoon_Low_5m`, `Chan_5m_Buy_Confluence`) orphaned when the blend
+#: Track-T switches were removed. Assertions on these names must be ABSENCE assertions; a test
+#: that expects them back is testing a bug.
+_RETIRED_5M_COLUMNS = (
+    "Is_Partial_Bar",
+    "Is_Cutoff_Truncated",
+    "RV_5m",
+    "RS_Up_5m",
+    "BPV_5m",
+    "Jump_Ratio_5m",
+    "Seasonality_Volume_Scale",
+    "Morning_Low_5m",
+    "Chan_5m_ZD",
+    "SmartMoney_Q_5m",
+    "Afternoon_Low_5m",
+    "Chan_5m_Buy_Confluence",
+)
+
+
 #: M3.6 review P1: `store_*_bars` now REFUSE an implicit adjustment basis. These fixtures seed
 #: synthetic 5m/daily frames for metadata-reconciliation and coverage tests, and every read here
 #: uses the historical default `qfq`, so the label is declared explicitly rather than omitted.
@@ -775,18 +797,23 @@ def test_intraday_features_causal_truncation_and_kappa_alignment():
     assert feat_full.loc[d_crash, "Close_5m_Cutoff"] == pytest.approx(92.0)
 
     # (2026-11-17) The `Is_Partial_Bar` / `Is_Cutoff_Truncated` flag columns were DELETED with
-    # the retired daily-bar synthesis. A complete 48-bar sample is measured at every cutoff, so
-    # the only thing left to assert is that neither retired column survives in the frame.
-    for retired in ("Is_Partial_Bar", "Is_Cutoff_Truncated"):
+    # the retired daily-bar synthesis, and ten more feature columns were DELETED OUTRIGHT the
+    # same day (no production reader -- see the module docstring). A complete 48-bar sample is
+    # measured at every cutoff, so the only thing left to assert is that none of the retired
+    # columns survives in the frame.
+    for retired in _RETIRED_5M_COLUMNS:
         assert retired not in feat_1400.columns
         assert retired not in feat_1415.columns
         assert retired not in feat_full.columns
 
-    # Chan 5m sub-level structure & lazy candidate date assertions (T2.3, R9)
-    assert "Chan_5m_Buy_Confluence" in feat_1415.columns
+    # Chan 5m sub-level structure & lazy candidate date assertions (T2.3, R9). The state tag is
+    # what the ticket reads; the retired `Chan_5m_Buy_Confluence` tier is only an input to it.
     assert "Chan_5m_Sell_Trigger" in feat_1415.columns
     assert "Chan_5m_State" in feat_1415.columns
-    assert feat_1415.loc[d_crash, "Chan_5m_Buy_Confluence"] in (0, 1, 2)
+    assert feat_1415.loc[d_crash, "Chan_5m_State"] in (
+        "5m_NEUTRAL", "5m_BULL_FLOOR", "5m_3B_CONFIRMED", "5m_1B2B_CONFIRMED",
+        "5m_3S_EXIT", "5m_TOP_DIV_WARN",
+    )
     assert feat_1415.loc[d_crash, "Chan_5m_Sell_Trigger"] in (0, 1)
 
     # Lazy candidate dates: only d_crash is evaluated, days[0] defaults to neutral
@@ -796,7 +823,7 @@ def test_intraday_features_causal_truncation_and_kappa_alignment():
         chan_candidate_dates={d_crash},
     )
     assert feat_lazy.loc[days[0], "Chan_5m_State"] == "5m_NEUTRAL"
-    assert feat_lazy.loc[d_crash, "Chan_5m_Buy_Confluence"] == feat_1415.loc[d_crash, "Chan_5m_Buy_Confluence"]
+    assert feat_lazy.loc[d_crash, "Chan_5m_State"] == feat_1415.loc[d_crash, "Chan_5m_State"]
 
     # Test kappa_t cross-source split ratio alignment (R4, R6)
     # Suppose universe_1d has Close = 200.0 on crash day (due to 2:1 split basis difference)
@@ -843,7 +870,7 @@ def test_intraday_features_causal_truncation_and_kappa_alignment():
     #    into the enriched frame.
     for col in ("Open", "High", "Low", "Close", "Volume"):
         assert abs(float(df_enriched.loc[d_crash, col]) - float(df_1d.loc[d_crash, col])) < 1e-9, col
-    for retired in ("Is_Partial_Bar", "Is_Cutoff_Truncated"):
+    for retired in _RETIRED_5M_COLUMNS:
         assert retired not in df_enriched.columns
 
 
@@ -950,8 +977,8 @@ def test_enrich_never_overwrites_a_complete_daily_bar():
         # ... while the 5m FEATURES are still computed (the enrichment is not a no-op)
         assert out["VWAP_Prem_5m"].notna().all(), cutoff
         assert out["UpVol_Ratio_5m"].notna().all(), cutoff
-        # (d) neither retired flag column may appear in the output frame
-        for retired in ("Is_Partial_Bar", "Is_Cutoff_Truncated"):
+        # (d) no retired column (synthesis flags, deleted features) may appear in the frame
+        for retired in _RETIRED_5M_COLUMNS:
             assert retired not in out.columns, (cutoff, retired)
 
 
@@ -1013,8 +1040,152 @@ def test_missing_5m_day_is_skipped_not_synthesized(caplog):
     assert hits, msgs
     assert "39" in hits[0]
 
-def test_smart_money_upvol_ratio_and_semivariance():
-    """Test 7 (T2.2, T5.1): Realized semivariance decomposition, SmartMoney_Q_5m, UpVol_Ratio_5m, and Afternoon_Ret_5m."""
+
+#: Adversarial values planted in each retired column name by the hostile-injection guard below.
+#: Distinct per column (and including NaN / ±huge / a pathological 0.0 multiplier) so that a
+#: reintroduced reader cannot land on the clean value by accident.
+_HOSTILE_RETIRED_VALUES = {
+    "RV_5m": 1e9,
+    "RS_Up_5m": -1e9,
+    "BPV_5m": np.nan,
+    "Jump_Ratio_5m": 12345.678,
+    "Seasonality_Volume_Scale": 0.0,
+    "Morning_Low_5m": -1e9,
+    "Chan_5m_ZD": 1e9,
+    "SmartMoney_Q_5m": -0.999,
+    "Afternoon_Low_5m": -12345.678,
+    "Chan_5m_Buy_Confluence": 7,
+}
+
+
+def test_retired_5m_columns_have_no_reader_hostile_injection():
+    """(2026-11-17) Hostile-injection guard for the ten DELETED 5m columns.
+
+    Technique (mirrors the blend Track-T switch removal): plant all ten retired names, each with
+    an adversarial value, into BOTH the daily universe frame and the 5m bar frame, then assert the
+    feature block is bit-identical (identical `hash_pandas_object` digest) to a clean run. If any
+    surviving code path reads one of them -- as a selector, a multiplier, or a min/max bound --
+    the digest changes or the run raises.
+
+    Two more pins, because the digest alone cannot see a producer that is still filtered out of
+    the frame: the feature frame's column list must equal the 11 surviving names EXACTLY (so
+    re-adding a name to `standard_cols` goes red), and the ten injected daily columns must come
+    out of `enrich_universe_with_intraday_features` UNCHANGED (nothing recomputed them -- the
+    join would overwrite an injected value with a freshly computed one the moment a producer is
+    exposed again).
+
+    re-break, verified by hand on 2026-11-17 (both went red, then reverted):
+    (a) a READER -- perturbing `Signed_Jump_5m` by `100.0 if "RV_5m" in day_bars.columns` in
+        `_compute_day_microstructure` changes the digest (a read into a column that a later
+        block overwrites is a WEAKER probe and was measured to stay green -- keep the read on a
+        surviving output);
+    (b) a PRODUCER -- `res["RV_5m"] = 3.14` plus `"RV_5m"` in `standard_cols` breaks the exact
+        column-set assertion.
+    """
+    from common.intraday_features import (
+        IntradayFeatureConfig,
+        compute_daily_intraday_features,
+        enrich_universe_with_intraday_features,
+    )
+
+    deleted_names = tuple(_HOSTILE_RETIRED_VALUES)
+    assert set(deleted_names) <= set(_RETIRED_5M_COLUMNS), "guard must cover the retired list"
+
+    df_5m = _intraday_panel(6, [48] * 6)
+    days = pd.bdate_range("2026-10-12", periods=6)
+    kappa = 1.0035
+    official = pd.DataFrame(
+        [
+            {
+                "Open": float(b["Open"].iloc[0]) * kappa,
+                "High": float(b["High"].max()) * kappa,
+                "Low": float(b["Low"].min()) * kappa,
+                "Close": float(b["Close"].iloc[-1]) * kappa,
+                "Volume": float(b["Volume"].sum()),
+            }
+            for _, b in df_5m.groupby(df_5m.index.normalize())
+        ],
+        index=days,
+    )
+
+    cfg = IntradayFeatureConfig(cutoff_time="14:15")
+
+    def _digest(frame: pd.DataFrame) -> str:
+        import hashlib
+
+        return hashlib.md5(
+            pd.util.hash_pandas_object(frame, index=True).values.tobytes()
+        ).hexdigest()
+
+    # --- clean runs -------------------------------------------------------
+    clean_feat = compute_daily_intraday_features(df_5m, config=cfg, symbol="SYM_H")
+    clean_out = enrich_universe_with_intraday_features(
+        {"SYM_H": official}, {"SYM_H": df_5m}, config=cfg
+    )["SYM_H"]
+
+    # --- hostile runs: the ten names injected with adversarial values -----
+    feat_5m_hostile = df_5m.copy()
+    daily_hostile = official.copy()
+    for col in deleted_names:
+        value = _HOSTILE_RETIRED_VALUES[col]
+        feat_5m_hostile[col] = value
+        daily_hostile[col] = value
+
+    hostile_feat = compute_daily_intraday_features(
+        feat_5m_hostile, config=cfg, symbol="SYM_H"
+    )
+    hostile_out = enrich_universe_with_intraday_features(
+        {"SYM_H": daily_hostile}, {"SYM_H": feat_5m_hostile}, config=cfg
+    )["SYM_H"]
+
+    feature_block = [c for c in hostile_feat.columns]
+
+    # 1. the produced feature frame is EXACTLY the 11 surviving columns -- no retired name may
+    #    reappear, and no new dead column may be parked here "for schema stability"
+    assert list(clean_feat.columns) == [
+        "Close_5m_Cutoff",
+        "VWAP",
+        "VWAP_Prem_5m",
+        "RS_Down_5m",
+        "Signed_Jump_5m",
+        "UpVol_Ratio_5m",
+        "Afternoon_Ret_5m",
+        "Chan_5m_Sell_Trigger",
+        "Chan_5m_State",
+        "Chan_5m_ZG",
+        "Last_3Bars_Locked_Limit",
+    ]
+    for col in _RETIRED_5M_COLUMNS:
+        assert col not in clean_feat.columns, col
+        assert col not in hostile_feat.columns, col
+
+    # 2. identical digest with and without the injected columns (5m side)
+    assert _digest(clean_feat[feature_block]) == _digest(hostile_feat[feature_block])
+
+    # 3. identical digest on the daily side, and the official bar untouched
+    for col in feature_block:
+        assert _digest(clean_out[[col]]) == _digest(hostile_out[[col]]), col
+    for col in ("Open", "High", "Low", "Close", "Volume"):
+        assert _digest(clean_out[[col]]) == _digest(hostile_out[[col]]), col
+
+    # 4. pass-through: an injected value is never recomputed into a real one
+    for col in deleted_names:
+        value = _HOSTILE_RETIRED_VALUES[col]
+        if pd.isna(value):
+            assert hostile_out[col].isna().all(), col
+        else:
+            assert (hostile_out[col] == value).all(), col
+
+def test_upvol_ratio_signed_jump_and_afternoon_ret():
+    """Test 7 (T2.2, T5.1): UpVol_Ratio_5m, RS_Down_5m / Signed_Jump_5m, and Afternoon_Ret_5m.
+
+    (2026-11-17) This test used to also assert `SmartMoney_Q_5m`, `RS_Up_5m` and `RV_5m`; all
+    three columns were DELETED OUTRIGHT (no production reader), so their assertions are now
+    absence assertions. The signed jump is the surviving live reader of the same up/down
+    decomposition: `Signed_Jump_5m = RS_Up - RS_Down > 0` still means "upside variance dominates"
+    without exposing either half as a column. Sample A stays bullish-skewed and sample B
+    bearish-skewed, so the two signs below are the behavioural core that must not drift.
+    """
     from common.intraday_features import (
         IntradayFeatureConfig,
         compute_daily_intraday_features,
@@ -1091,21 +1262,26 @@ def test_smart_money_upvol_ratio_and_semivariance():
     assert row_a["UpVol_Ratio_5m"] > 0.60, f"Sample A UpVol ratio {row_a['UpVol_Ratio_5m']} expected > 0.60"
     assert row_b["UpVol_Ratio_5m"] < 0.40, f"Sample B UpVol ratio {row_b['UpVol_Ratio_5m']} expected < 0.40"
 
-    # 2. SmartMoney_Q_5m
-    # Sample A accumulated low -> Q < 0, close above VWAP -> VWAP_Prem > 0
-    assert row_a["SmartMoney_Q_5m"] < 0.0, f"Sample A Q {row_a['SmartMoney_Q_5m']} expected < 0"
+    # 2. Retired columns: SmartMoney_Q_5m / RV_5m / RS_Up_5m must NOT be produced at all
+    for retired in ("SmartMoney_Q_5m", "RV_5m", "RS_Up_5m", "BPV_5m", "Jump_Ratio_5m",
+                    "Morning_Low_5m", "Afternoon_Low_5m", "Seasonality_Volume_Scale",
+                    "Chan_5m_ZD", "Chan_5m_Buy_Confluence"):
+        assert retired not in feat_a.columns, retired
+        assert retired not in feat_b.columns, retired
+    # ... while the VWAP premium the Smart Money block was compared against is still measured.
+    # Sample A accumulated low -> close above VWAP -> VWAP_Prem > 0
     assert row_a["VWAP_Prem_5m"] > 0.0
-    # Sample B dumped high volume in afternoon -> Q > 0, close below VWAP -> VWAP_Prem < 0
-    assert row_b["SmartMoney_Q_5m"] > 0.0, f"Sample B Q {row_b['SmartMoney_Q_5m']} expected > 0"
+    # Sample B dumped high volume in afternoon -> close below VWAP -> VWAP_Prem < 0
     assert row_b["VWAP_Prem_5m"] < 0.0
 
-    # 3. Semivariance decomposition: RS_Up + RS_Down == RV
-    assert row_a["RS_Up_5m"] + row_a["RS_Down_5m"] == pytest.approx(row_a["RV_5m"], rel=1e-8, abs=1e-10)
-    assert row_b["RS_Up_5m"] + row_b["RS_Down_5m"] == pytest.approx(row_b["RV_5m"], rel=1e-8, abs=1e-10)
-    # Sample A has more upside variance than downside variance
-    assert row_a["RS_Up_5m"] > row_a["RS_Down_5m"]
-    # Sample B has more downside variance than upside variance
-    assert row_b["RS_Down_5m"] > row_b["RS_Up_5m"]
+    # 3. Semivariance decomposition: only its DOWN half and the signed jump are exposed now.
+    # `Signed_Jump_5m = RS_Up - RS_Down` keeps the sign information the retired pair carried.
+    assert row_a["RS_Down_5m"] >= 0.0
+    assert row_b["RS_Down_5m"] >= 0.0
+    # Sample A has more upside variance than downside variance -> positive signed jump
+    assert row_a["Signed_Jump_5m"] > 0.0, f"Sample A signed jump {row_a['Signed_Jump_5m']} expected > 0"
+    # Sample B has more downside variance than upside variance -> negative signed jump
+    assert row_b["Signed_Jump_5m"] < 0.0, f"Sample B signed jump {row_b['Signed_Jump_5m']} expected < 0"
 
     # 4. Afternoon_Ret_5m
     # Sample B dropped from ~104 at 11:30 to ~98 at 14:15 -> Afternoon_Ret_5m < -0.01
@@ -1197,11 +1373,13 @@ def test_enrich_universe_with_intraday_features_cutoff_time_kwarg():
 
     # 4. When config is provided along with cutoff_time, replace(config) updates cutoff_time
     #    while preserving other config attributes without mutating caller config.
+    #    (2026-11-17) `smart_money_top_pct` / `volume_seasonality_lookback_days` were deleted with
+    #    their columns, so this pins two surviving non-default fields instead.
     orig_config = IntradayFeatureConfig(
         cutoff_time="15:00",
-        smart_money_top_pct=0.35,
+        chan_5m_lookback_bars=180,
         enable_chan_5m=False,
-        volume_seasonality_lookback_days=10,
+        intraday_upvol_thresh=0.61,
     )
     with patch("common.intraday_features.compute_daily_intraday_features", wraps=compute_daily_intraday_features) as spy:
         enriched_custom = enrich_universe_with_intraday_features(
@@ -1216,9 +1394,9 @@ def test_enrich_universe_with_intraday_features_cutoff_time_kwarg():
         assert called_config is not orig_config
         assert called_config.cutoff_time == "14:00"
         # Preserved other attributes
-        assert called_config.smart_money_top_pct == 0.35
+        assert called_config.chan_5m_lookback_bars == 180
         assert called_config.enable_chan_5m is False
-        assert called_config.volume_seasonality_lookback_days == 10
+        assert called_config.intraday_upvol_thresh == pytest.approx(0.61)
         # Original config is unmutated
         assert orig_config.cutoff_time == "15:00"
 
