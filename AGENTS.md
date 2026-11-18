@@ -1,5 +1,3 @@
-[ English | [简体中文](AGENTS_ZH.md) ]
-
 # AGENTS.md
 
 Instructions for any coding agent (Claude Code, Codex, Cursor, etc.) working in this repository.
@@ -131,6 +129,12 @@ available in the current shell.
   Do NOT "normalize" it back to `rolling_ic_ir` -- a `--dump-strategies` pass did exactly that and
   silently switched the deployed engine, which also made the regime-branch defenses (bucket
   delta-clamp / thrust hysteresis) inert. See `docs/version.md` §8.
+  The six Track-T intraday-5m FEATURE switches (`blend_enable_intraday_5m`,
+  `blend_enable_5m_interval_nesting`, `blend_use_intraday_downside_vol`, `blend_enable_5m_stop_filter`,
+  `blend_intraday_upvol_thresh`, `blend_intraday_cutoff_time`) were DELETED on 2026-11-17 as a
+  negative result (the Phase-6 ablation showed interval nesting identical to baseline and the other
+  variants degrading Sharpe 0.210 → 0.135, ERS untrusted); see `docs/version.md` §47 — do not
+  reintroduce them as a default-`False` flag.
 
 - **Blend sub-strategy hookup & the bare-name `resolve_param` collision (critical -- caused a real
   bug, fixed 2026-10-21):** each blend strategy's `get_sub_strategies(universe, params)` builds its
@@ -163,10 +167,10 @@ available in the current shell.
 
 ## Core quantitative engineering rules
 
+> Rule numbers are cited externally across code comments and `docs/` — **never renumber**. Rule 6 is retired; the gap is intentional.
+
 1. **100% Offline Testing**:
-   - Never use real market data or network access in tests or example commands.
-   - Every test suite must run 100% offline via `SyntheticDataProvider` or `common/testing.py` synthetic OHLCV generators.
-   - CLI defaults must be `--data-provider synthetic`.
+   See **Testing policy** above — that section is the single source for this rule.
 2. **Single Source of Truth (SSOT)**:
    - All quantitative engineering task breakdowns, status tracking, priority queues, and
      execution roadmaps must be centralized exclusively in `docs/development_plan.md` (in Chinese).
@@ -175,11 +179,10 @@ available in the current shell.
    - Before registering new tasks or proposing enhancements in the SSOT, agents must first
      cross-reference all finished empirical task results and ablation closures (see Rule 8).
 3. **Sparse Weights Contract & Cell-level NaN vs. 0.0**:
-   - `generate_weights(universe, params)` must return sparse weights with target weights only on actual rebalance dates, leaving intermediate non-rebalance dates as `NaN`.
-   - Never forward-fill (`ffill()`) weights within the template itself.
-   - Inside an actual rebalance row, a cell value of `0.0` explicitly de-risks or exits an asset. Leaving a cell `NaN` carries forward the previous held weight due to global backtester column-wise `ffill()`.
+   See *Sparse weights contract (critical)* and *Cell-level NaN vs. 0.0 (critical)* under
+   **Core domain model** above.
 4. **Single Equivalent Random Search (ERS)**:
-   - Run ERS validation (`common/allocation_search.py`) exactly **once per search**, exclusively on the already-chosen winning strategy. Never run ERS once per candidate template.
+   See *Equivalent Random Search (ERS)* under **Core domain model** above.
 5. **Universe Asset Removal & Blacklist Documentation (SSOT in `docs/black_list.md`)**:
    - Anytime an agent suggests or executes removing a stock, ETF, or asset from any universe/portfolio (whether due to high unit price, structural loss, negative Alpha, fraud/ST risk, cyclical price wars, or friction bleed), the agent must record the asset symbol, name, removal date, removal trigger/category, and detailed quantitative/fundamental rationale in `docs/black_list.md` (in Chinese) for future reference and persistent memory.
 7. **Strategy Modification & Semantic Version Upgrade (Dual-Axis Decoupling)**:
@@ -236,14 +239,8 @@ This codebase is unusually disclosure-heavy -- match it, don't strip it out:
 - Git commit messages in this repo are terse, lowercase, present-tense summaries (e.g. "add chan
   pivot", "add denoise", "pattern mining merge with current strategy gen instead of separated
   pipeline").
-- **Single Source of Truth for task breakdowns & roadmaps (`docs/development_plan.md`):** All
-  quantitative engineering task breakdowns, status tracking, priority queues, and execution
-  roadmaps must be centralized exclusively in `docs/development_plan.md` (in Chinese). Individual
-  architecture and research plan documents in `docs/` should contain only theoretical modeling,
-  codebase audits, and module specifications, and must link to `docs/development_plan.md` for task
-  lists and execution tracking.
 - **No single-line walls of text (applies to every document you write or edit):**
-  documentation files (`AGENTS.md`, `AGENTS_ZH.md`, `README.md`, everything under `docs/`,
+  documentation files (`AGENTS.md`, `README.md`, everything under `docs/`,
   per-project `README.md`/`SCHEMAS.md`, and long code-block-adjacent docstrings) must never
   be one giant unwrapped line per paragraph. Use markdown structure instead -- wrap prose at
   roughly 100 columns like the rest of this file does, one sentence or clause per line where

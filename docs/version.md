@@ -3,8 +3,8 @@
 > **版本规范**：遵循 Semantic Versioning 2.0.0 (SemVer)  
 > **权威性质**：全代码库量化策略与资产配置引擎语义化版本演进与变更审计
 > 唯一事实来源 (Single Source of Truth, SSOT)  
-> **管理规范**：严格遵循 [`AGENTS.md`](file:///home/stone/Work/github/quant/AGENTS.md)
-> 与 [`AGENTS_ZH.md`](file:///home/stone/Work/github/quant/AGENTS_ZH.md) 核心量化工程规范第 7 条。
+> **管理规范**：严格遵循 [`AGENTS.md`](file:///home/stone/Work/github/quant/AGENTS.md) §7
+> 核心量化工程规范第 7 条。
 > 任何策略或底座算法发生变动时，必须在此处持久化追加审计记录。  
 > **最新更新基准**：2026-11-13（`BaseBlendAllocationStrategy` `BASE_VERSION` `v2.0.0`，
 > 全代码库各家族版本与 §40 生产实盘配置基准对齐）

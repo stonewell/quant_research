@@ -2,7 +2,7 @@
 
 > **版本**：v1.0.0  
 > **权威性质**：代码库全域标的剔除与黑名单唯一事实来源 (Single Source of Truth, SSOT)  
-> **遵守规范**：严格遵循 [`AGENTS.md`](file:///home/stone/Work/github/quant/AGENTS.md) 与 [`AGENTS_ZH.md`](file:///home/stone/Work/github/quant/AGENTS_ZH.md) 核心量化工程规范第 5 条。任何 Agent 或研究员在建议或执行从股票池/ETF池/组合中剔除资产时，必须在此处持久化建档。
+> **遵守规范**：严格遵循 [`AGENTS.md`](file:///home/stone/Work/github/quant/AGENTS.md) 核心量化工程规范第 5 条。任何 Agent 或研究员在建议或执行从股票池/ETF池/组合中剔除资产时，必须在此处持久化建档。
 
 ---
 
