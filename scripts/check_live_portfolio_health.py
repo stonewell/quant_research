@@ -4622,6 +4622,24 @@ def build_stage2_command(
     # existing argv stays byte-for-byte identical.
     if intraday_5m_provider:
         cmd.extend(["--intraday-5m-provider", str(intraday_5m_provider)])
+    # (2026-11-18) `--cutoff-time` is forwarded UNCONDITIONALLY, carrying the value THIS
+    # process resolved for its own 5m window (identical `or "15:00"` fallback to the
+    # Stage-1 5m block in `main`, so an empty string can never be split off as a stray
+    # token and the child is never left to re-derive a cutoff).
+    #
+    # Why not leave it to Stage 2's default: the two stages used to agree ONLY by the
+    # coincidence of two independent argparse defaults (both literally `"15:00"`). A
+    # `--cutoff-time 14:15` on Stage 1 therefore truncated the GATE's 5m
+    # drawdown/breadth/distribution window to 14:15 while the auto-launched Stage 2 kept
+    # the full 15:00 session -- one report and one ticket generated from two different
+    # information sets, with neither log line naming the mismatch. Sending the parent's
+    # resolved value (argparse: an explicit child argv value beats the child's default)
+    # makes that divergence structurally impossible even if the two defaults drift apart
+    # later. The token is thus ALWAYS present -- unlike `--intraday-5m-provider` above,
+    # there is no "unset" state to preserve: a cutoff always exists, and it is always the
+    # parent's.
+    stage2_cutoff = getattr(args, "cutoff_time", "15:00") or "15:00"
+    cmd.extend(["--cutoff-time", str(stage2_cutoff)])
     # (L2.3) Forward the market-clock policy the operator chose for Stage 1 so the
     # auto-launched Stage 2 resolves the SAME market/as-of/grace and applies the same
     # gate strictness. Without this, Stage 1 could run under `--market hk` (or an

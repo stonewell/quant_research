@@ -562,3 +562,94 @@ def test_gate_decision_and_numbers_are_untouched_by_the_cap_state():
         cap_mask_on = [a for a in actions_on if "single-stock" not in a.lower()]
         assert cap_mask_off == cap_mask_on
 
+
+# ---------------------------------------------------------------------------
+# 7. `--cutoff-time` forwarding: Stage 1 and Stage 2 may never measure the 5m
+#    window at two different cutoffs
+#
+# The gap this closes (2026-11-18): both stages expose `--cutoff-time` and both
+# defaulted to `"15:00"`, but `build_stage2_command()` did NOT forward it. The two
+# stages therefore agreed only by the COINCIDENCE of two independent argparse
+# defaults. `--cutoff-time 14:15` on Stage 1 truncated the GATE's 5m
+# drawdown/breadth/distribution window to 14:15 while the auto-launched Stage 2
+# kept the full 15:00 session -- gate verdict and ticket features computed on two
+# different information sets, with no log line naming either cutoff.
+#
+# The fix forwards the parent's RESOLVED value unconditionally, so the child can
+# no longer re-derive one. The tests below fail on the pre-fix implementation
+# (the token was simply absent, so `_flag_value` raises).
+# ---------------------------------------------------------------------------
+
+
+def test_auto_run_stage2_argv_always_carries_the_parents_resolved_cutoff(tmp_path):
+    """DISCRIMINATING: the pre-fix argv contained no `--cutoff-time` entry at all.
+
+    The token is an ADDITION to every argv (it is not gated by
+    `--enable-intraday-5m`), and its value is the parent's, never the child's default.
+    """
+    out_dir = str(tmp_path / "stage1_run")
+
+    # (i) Default run: the token is present and equals the value Stage 1 itself uses
+    # (the invariant is "the child gets the PARENT's cutoff", not a literal -- the
+    # default's own value is pinned once, in the parity test below).
+    defaulted_args = _stage1_args("--output-dir", out_dir)
+    defaulted = _mod.build_stage2_command(defaulted_args)
+    assert defaulted.count("--cutoff-time") == 1
+    assert _flag_value(defaulted, "--cutoff-time") == defaulted_args.cutoff_time
+
+    # (ii) The exact divergence scenario: an operator narrows Stage 1's window.
+    # Pre-fix the child kept 15:00 and this assertion never even got to run.
+    narrowed_args = _stage1_args("--output-dir", out_dir, "--cutoff-time", "14:15")
+    narrowed = _mod.build_stage2_command(narrowed_args)
+    assert _flag_value(narrowed, "--cutoff-time") == narrowed_args.cutoff_time
+    assert _flag_value(narrowed, "--cutoff-time") == "14:15"
+
+    # (iii) Present regardless of the 5m enable branch: a cutoff is a property of the
+    # run, not of whether this particular Stage 1 happened to load the 5m layer.
+    enabled = _mod.build_stage2_command(
+        _stage1_args("--output-dir", out_dir, "--cutoff-time", "14:15"), enable_intraday_5m=True
+    )
+    assert _flag_value(enabled, "--cutoff-time") == "14:15"
+
+    # (iv) An empty value resolves to the same fallback Stage 1's own 5m block uses
+    # (`or "15:00"`), so the child is never handed a stray empty token.
+    blank = _mod.build_stage2_command(_stage1_args("--output-dir", out_dir, "--cutoff-time", ""))
+    assert _flag_value(blank, "--cutoff-time") == "15:00"
+    assert "" not in blank
+
+
+def test_forwarded_cutoff_round_trips_through_stage2_parser(tmp_path):
+    """Cross-script contract: Stage 2's parser must read the forwarded token back.
+
+    Guards the other half of the wire -- renaming/removing `--cutoff-time` in
+    `scripts/run_live_strategy.py` (or making it non-string) would otherwise only
+    surface on a live auto-run.
+    """
+    args = _stage1_args("--output-dir", str(tmp_path / "stage1_run"), "--cutoff-time", "14:15")
+    cmd = _mod.build_stage2_command(args)
+
+    # cmd = [python, stage2_script, <real CLI flags>...]
+    parsed = _STAGE2.parse_args(cmd[2:])
+    assert parsed.cutoff_time == "14:15"
+    assert parsed.cutoff_time == args.cutoff_time
+
+
+def test_stage1_and_stage2_cutoff_defaults_must_stay_identical():
+    """Second belt: catches a ONE-SIDED default edit.
+
+    Forwarding makes a runtime divergence impossible (the child argv value wins over
+    the child's default), so this is not the primary guard -- but the two surfaces
+    should still agree on what "no flag" means, because the same two defaults are
+    what operators read in `--help`. Changing only one of them turns this red.
+    """
+    stage1_default = _mod.parse_args([]).cutoff_time
+    stage2_default = _STAGE2.parse_args([]).cutoff_time
+    assert stage1_default == stage2_default, (
+        "Stage 1 and Stage 2 disagree on the default --cutoff-time "
+        f"(stage1={stage1_default!r}, stage2={stage2_default!r})"
+    )
+    # A deliberate change of BOTH defaults still has to update this literal. That is
+    # intended, not friction: "15:00" is the FULL session, and any earlier default
+    # silently truncates every gate metric on every default run.
+    assert stage1_default == "15:00"
+
