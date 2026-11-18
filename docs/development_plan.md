@@ -2880,6 +2880,60 @@ Track MS 确立**零存量污染、零 `BASE_VERSION = 2.0.0` 变更、零 58 �
    + 1 条「结项标记 + 冻结阶梯未被顺手改动」守卫）；`pipeline/tests/test_advisory_wiring.py` **25 passed**（未改）；
    全离线、零网络、零 `docs/version.md` 条目。
 
+### 2026-11-17/18 盘后口径收尾补记（`NV9` 后续；`[x]/[ ]` 计数不变）
+
+1. **票据执行面锚点：涨跌停带按会话拆分。** `scripts/run_live_strategy.py` 原用同一对
+   `p_limit_up` / `p_limit_down`（`prev_close = Close[-2]`，即 `T-1` 收盘）同时服务两件事。现拆为：
+   `p_limit_up_session_t` / `p_limit_down_session_t`（**仅**用于 `LIMIT_UP_LOCKED` /
+   `LIMIT_DOWN_ILLIQUID_RISK` 的"`T` 日是否封板"判定，表达式逐字符未变）与
+   `p_limit_up_next` / `p_limit_down_next`（以 `price` = `T` 收盘为基，**仅**用于 `T+1` 开盘成交票的
+   限价夹逼）。原缺陷：大涨日买限价被压到上一交易日涨停价、大跌日卖限价被抬到上一交易日跌停价。
+   零漂移：权重 / 股数 / `trade_val` / 生命周期 / 两个风险判定均未变，唯一变化是
+   `suggested_limit_price` 与 `passive_support_limit_price`。回归
+   `pipeline/tests/test_live_limit_band_anchor.py`（4 例，含"还原旧实现即转红"的反向验证）。
+2. **删除十个无读者的 5m 特征列。** `common/intraday_features.py` 的 `standard_cols` 由 21 降至 11：
+   `RV_5m` / `RS_Up_5m` / `BPV_5m` / `Jump_Ratio_5m` / `Seasonality_Volume_Scale` / `Morning_Low_5m` /
+   `Afternoon_Low_5m` / `Chan_5m_ZD` / `SmartMoney_Q_5m` / `Chan_5m_Buy_Confluence`（后三列是 Track T
+   退役后变成孤儿，前七列从未有过生产读者）。连带删除 `smart_money_top_pct`、
+   `volume_seasonality_lookback_days` / `phi_1400` / `phi_1415`、`afternoon_start_time` 与
+   `_compute_volume_seasonality_scales`。**保留** `Chan_5m_Buy_Confluence` 内部的 `confluence` 层级——
+   它是仍存活的 `Chan_5m_State` 的驱动量，只取消列暴露。零版本轴变动（该模块不是策略/模板类）。
+   守卫：十列以对抗值注入日线与 5m 帧后，特征列仍恰为 11 列且输出哈希不变。
+3. **多策略 runner 的残留 resolver 清理。** `scripts/run_live_multi_strategy.py`：
+   `resolve_intraday_cutoff` 与 `combine_intraday_cutoffs` 删除（其数据源已不存在）；
+   `resolve_intraday_5m_request` 内联但**保留 `template.resolve_param` 路径**（裸 `params.get` 会漏掉
+   前缀键，即 2026-10-22「打印成功、字段全空」的形状）；`load_intraday_5m_panel` 的 `cutoff_time`
+   形参删除（它接受却从不转发）。轮级 cutoff 现只有 `DEFAULT_INTRADAY_CUTOFF_TIME = "15:00"` 一处。
+4. **`AGENTS.md` 精简与中文副本下线。** 规则 1 / 3 / 4 与文档风格节里的 SSOT bullet 属重复陈述，
+   改为指向更详细的对应章节（信息零损失，减约 12 行）；新增一句"规则编号被外部引用，**永不重排**，
+   规则 6 为历史退役留空"；blend 段新增"六个 Track T 5m 开关已于 2026-11-17 按负结果删除，
+   不得以默认 `False` 的形式重新引入"。`AGENTS_ZH.md` 因严重过期（domain model 仅 25 行 vs 英文 95 行，
+   缺 Modular Blend / Live Trading / 版本例外三节）**删除**，四条活入链改指 `AGENTS.md` 且**编号保留**。
+5. **5m 欠采样从"只落日志"变为"票据可见"。** 告警类 `IntradayIncompleteWarning` 归并到
+   `common/intraday_features.py`（`scripts/sync_china_5m_and_indices.py` 改为从该处 import，
+   `sync.IntradayIncompleteWarning` 名字仍可用）；`enrich_universe_with_intraday_features` 新增可选出参
+   `report`，逐 symbol-day 记录被跳过者。票据与 `summary.json` 仅在**至少跳过一个 symbol-day** 时写入
+   `intraday_5m_undersampled`，因此 5m 关闭的默认路径**逐字节不变**（有端到端测试钉住键缺失与 stdout
+   无新行）。
+6. **Stage-1 → Stage-2 的 cutoff 转发。** `scripts/check_live_portfolio_health.py::build_stage2_command`
+   现**无条件**转发 `--cutoff-time`，取值表达式与本进程自身 5m 块逐字一致
+   （`getattr(args, "cutoff_time", "15:00") or "15:00"`）。此前两段只靠"两个独立默认值恰好都为 15:00"
+   保持一致，单边改动或显式 `--cutoff-time 14:15` 会让门禁与出票跑在不同信息集上。另加一条
+   "两个 parser 的默认值必须相等"的守卫测试，覆盖"单边漂移"这一半。
+7. **`LIMIT_DOWN_ILLIQUID_RISK` 实证（2026-11-18，真实数据、只读缓存）。** 20 只部署标的 ×
+   `2024-01-02..2026-11-17`（更早历史因 `adjust_factors` 跨 2024-01-02 换基、产生约 10–12% 幻影缺口而排除），
+   剔除 109 个除权日后 **13,756 个标的-日**，`T` 收盘触跌停 **19 次**（0.138%）。结果：
+   `T+1` 开盘仍处跌停 **1/19 = 5.3%**（Wilson 95% CI 0.9%–24.6%，基准率 0.022% 的 239 倍）；
+   开盘已可成交 **18/19 = 94.7%**（CI 75.4%–99.1%）；连续收盘跌停最长 **2 个会话**（17/19 只封 1 天）；
+   过期一次的机会成本 ≈ **0.2% NAV**、约 **181 轮一次**（部署账簿 4 名持仓）。
+   **关键否定结论**：唯一"冻结正确"的样本与唯一"整日封死"的样本**不是同一天**，故"看 `T` 日是否整日
+   封死"这一收窄方向在样本内**无预测力**，且会恰好丢掉唯一正确的案例。冻结**不阻断卖单**，只冻结一拍
+   购买力与现金归集，它防的是不可恢复的透支。
+   **裁决**：**不改代码**（收窄无据、加宽有害）；仅把票据措辞从"跌停封死"改为事实描述
+   （"`T` 日收盘触跌停板，`T+1` 开盘多数可成交——本标签是资金保险，不是卖出禁止"）并在
+   `detail_reason` 带出 `T+1` 跌停价。**该措辞改动待办**：`scripts/run_live_strategy.py` 当时由并行批次
+   占用，未实施。证据强度：n=19 只支持方向，不支持把 5.3% 当作精确概率。
+
 ---
 
 ## 三、 六级主优先级执行路线图与并行波次编排（`Tier P0` $\to$ `Tier P5`）
