@@ -33,6 +33,17 @@ Usage:
   the outcome honestly in `summary.json` (`observability.intraday_5m`, source
   `multi_strategy_netted`). No strategy asking for it => no 5m code path at all.
 
+  (2026-11-17 owner ruling) NO SHIPPED STRATEGY CARRIES THAT KEY ANY MORE: the six blend
+  5m FEATURE switches were deleted from `StrategyConfig` and `blend_base.py` with their
+  read sites (Track-T is a refuted negative result), so in production this layer is always
+  in its "zero requests" state -- no load, no block. The capability below is retained as
+  the generic, test-pinned shape (the resolution still goes through each template's own
+  `resolve_param`, so a hand-written strategy file's params are still honoured) and must
+  NOT be re-pointed at a real strategy without re-running that ablation.
+
+  The round's cutoff is the single full-session constant
+  `DEFAULT_INTRADAY_CUTOFF_TIME` ("15:00"); it is no longer resolved per strategy.
+
   `--intraday-publish-after HH:MM` (default: UNSET) is a SECOND, INDEPENDENT axis on top of
   the above: it does not enable 5m and it never moves the run window. When given, the round's
   5m block additionally carries a `publication_state` assessment (via
@@ -390,41 +401,22 @@ INTRADAY_5M_INDICATOR_COLUMN = "UpVol_Ratio_5m"
 #: block came from the round's own child process, not from stdout/stage-1 reconciliation.
 INTRADAY_5M_SOURCE = "multi_strategy_netted"
 
-#: Same default as Stage 2 (`run_live_strategy.py --cutoff-time`): the FULL session.
-#: (2026-11-17 owner ruling) Live runs are post-close only and the intraday execution mode is
-#: retired, so the default cutoff truncates nothing; `_parse_time_cutoff` maps "15:00" and
-#: `None` to the same full-day window (`common/intraday_features.py`). The former note here
-#: ("`StrategyConfig.blend_intraday_cutoff_time` supplies 15:00 earlier in the chain") is
-#: DELETED with that field: this constant is now the whole convention, not a fallback behind
-#: a config value that no longer exists.
+#: The FULL session, and the ONLY cutoff this runner knows (since 2026-11-17).
+#:
+#: Same value as Stage 2's `run_live_strategy.py --cutoff-time` default: live runs are
+#: post-close only and the intraday execution mode is retired, so the cutoff truncates
+#: nothing; `_parse_time_cutoff` maps "15:00" and `None` to the same full-day window
+#: (`common/intraday_features.py`).
+#:
+#: READ AT EXACTLY ONE PLACE: the round's enrichment call (`enrich_intraday_5m_panel` ->
+#: `IntradayFeatureConfig(cutoff_time=...)`). The per-strategy resolvers that used to feed it
+#: (`resolve_intraday_cutoff` / `combine_intraday_cutoffs`) are DELETED together with
+#: `StrategyConfig.intraday_cutoff_time`: with no config field left there was nothing to
+#: resolve, so the constant is the whole convention rather than the tail of a precedence
+#: chain. A hand-written strategy file's `intraday_cutoff_time` param is therefore IGNORED --
+#: disclosed on purpose, and pinned by
+#: `web/livetrading/tests/test_multi_strategy_intraday_5m.py`.
 DEFAULT_INTRADAY_CUTOFF_TIME = "15:00"
-
-_HHMM_RE = re.compile(r"^\d{1,2}:\d{2}$")
-
-
-def resolve_intraday_5m_request(template: Any, params: Dict[str, Any]) -> Tuple[bool, bool]:
-    """`(requested, resolved_by_template)` for ONE strategy (§4.50.1).
-
-    Uses the template's OWN `resolve_param` when it exposes one, so the loading decision
-    walks the very same precedence chain the consumer walks: `p.<prefix>_<name>` ->
-    `p.blend_<name>` -> `p.<name>` -> `cfg.<prefix>_<name>` -> `cfg.blend_<name>` ->
-    `cfg.<name>` -> default.
-
-    (2026-11-17 owner ruling) NO SHIPPED STRATEGY can request 5m any more: the blend-side
-    switches were deleted from `StrategyConfig` and `blend_base.py` with their read sites,
-    so the `cfg.*` links of that chain are empty for every real template. A bare
-    `p["enable_intraday_5m"]` key in a hand-written strategy file would still resolve --
-    which is why this stays a resolver rather than a constant, and why the zero-request
-    state is what production now always takes.
-
-    Static allocation templates carry no such switch (they have no `resolve_param`), so they
-    can never request 5m; `resolved_by_template=False` records that this was a "no switch to
-    consult" answer rather than a configured `False`.
-    """
-    resolver = getattr(template, "resolve_param", None)
-    if not callable(resolver):
-        return False, False
-    return bool(resolver(params, "enable_intraday_5m", False, bool)), True
 
 
 def resolve_intraday_5m_provider(template: Any, params: Dict[str, Any]) -> Optional[str]:
@@ -452,10 +444,10 @@ def resolve_intraday_5m_provider(template: Any, params: Dict[str, Any]) -> Optio
 def combine_intraday_5m_providers(values: List[Optional[str]]) -> Optional[str]:
     """The ONE provider this round loads 5m from, given each requester's pin.
 
-    DISCLOSED CHOICE (mirrors `combine_intraday_cutoffs`): §4.50 does one 5m load per
-    round, so at most one provider can serve it. Unlike a cutoff there is no
-    "conservative direction" between two data sources, so this NEVER silently picks a
-    winner:
+    DISCLOSED CHOICE (§4.50 does one 5m load per round, so at most one provider can serve
+    it): unlike a cutoff -- which collapsed to the single round-level constant when the
+    per-strategy resolvers were deleted -- there is no "conservative direction" between two
+    data sources, so this NEVER silently picks a winner:
 
       * no pins            -> `None` (run-level `--data-provider`, i.e. the old path);
       * exactly one pin    -> that pin;
@@ -477,54 +469,12 @@ def combine_intraday_5m_providers(values: List[Optional[str]]) -> Optional[str]:
     return str(pinned[0])
 
 
-def resolve_intraday_cutoff(template: Any, params: Dict[str, Any]) -> str:
-    """The requesting strategy's own `intraday_cutoff_time`, defaulted to the FULL session.
-
-    (2026-11-17) Default changed from "14:15" to "15:00" -- live runs are post-close only, so
-    the default must not narrow any strategy's 5m information set. The blend
-    `StrategyConfig.intraday_cutoff_time` field is DELETED, so for every real template this
-    now returns `DEFAULT_INTRADAY_CUTOFF_TIME` unless the strategy's own `params` names a
-    cutoff; the resolver shape is kept because it is generic over `template.resolve_param`
-    and its behaviour is pinned by tests.
-    """
-    resolver = getattr(template, "resolve_param", None)
-    if not callable(resolver):
-        return DEFAULT_INTRADAY_CUTOFF_TIME
-    raw = resolver(params, "intraday_cutoff_time", DEFAULT_INTRADAY_CUTOFF_TIME, str)
-    text = str(raw).strip() if raw is not None else ""
-    if not _HHMM_RE.match(text):
-        print(
-            f"[WARN] 无法解析 intraday_cutoff_time={raw!r}，回退默认 "
-            f"{DEFAULT_INTRADAY_CUTOFF_TIME}（HH:MM）"
-        )
-        return DEFAULT_INTRADAY_CUTOFF_TIME
-    return text
-
-
-def combine_intraday_cutoffs(values: List[str]) -> str:
-    """The EARLIEST requested cutoff -- one `enrich` call serves the whole round.
-
-    DISCLOSED CHOICE: §4.50 freezes only the ENABLE switch, but `enrich_universe_with_intraday_features`
-    can only run at ONE cutoff per round, so when two requesting strategies configure
-    different cutoffs one of them is honoured exactly. The earliest value is the only
-    conservative direction: no requesting strategy is handed features computed further into
-    the session than its own configured cutoff (the alternative would silently widen one
-    strategy's information window). Today no tracked config sets this key, so the choice is
-    inert until someone does.
-    """
-    valid = [v.strip() for v in values if isinstance(v, str) and _HHMM_RE.match(v.strip())]
-    if not valid:
-        return DEFAULT_INTRADAY_CUTOFF_TIME
-    return min(valid, key=lambda s: (int(s.split(":")[0]), int(s.split(":")[1])))
-
-
 def load_intraday_5m_panel(
     symbols: List[str],
     *,
     start: str,
     end: str,
     data_provider: Any,
-    cutoff_time: str,
     cache_dir: Optional[str] = None,
 ) -> Dict[str, pd.DataFrame]:
     """Thin import seam around `common.intraday_features.load_intraday_5m_universe`.
@@ -533,12 +483,14 @@ def load_intraday_5m_panel(
     the optional intraday dependencies are absent, and exposed as a module-level name so a
     test can prove the loader is NOT called in the zero-request state.
 
-    (2026-11-17) `cutoff_time` is KEPT on this seam but deliberately NOT forwarded:
-    `load_intraday_5m_universe`'s own `cutoff_time` parameter was dead (it never narrowed a
-    bar) and has been deleted, so forwarding it now would be a lie. The cutoff that actually
-    matters is applied one layer up, by `enrich_intraday_5m_panel` ->
-    `IntradayFeatureConfig(cutoff_time=...)`. The argument stays in the signature because it
-    is the round's single cutoff and the seam is where a caller/test observes it.
+    (2026-11-17) The `cutoff_time` PARAMETER is DELETED, not kept as a seam.
+    `load_intraday_5m_universe`'s own `cutoff_time` argument was dead (it never narrowed a
+    bar) and is gone, so a parameter accepted here and forwarded nowhere carried no
+    information at all -- a test could only "observe" it by asserting a value the loader
+    never saw. The cutoff that actually matters is applied one layer up, by
+    `enrich_intraday_5m_panel` -> `IntradayFeatureConfig(cutoff_time=...)`, which is the
+    explicit seam a caller/test observes (and the one this runner feeds
+    `DEFAULT_INTRADAY_CUTOFF_TIME`).
     """
     from common.intraday_features import load_intraday_5m_universe
 
@@ -547,9 +499,8 @@ def load_intraday_5m_panel(
         start=start,
         end=end,
         data_provider=data_provider,
-        # (2026-11-17) `cutoff_time` is NOT forwarded: the loader's dead `cutoff_time`
-        # parameter was removed (it never narrowed anything). The cutoff is applied by
-        # `enrich_intraday_5m_panel` -> `IntradayFeatureConfig(cutoff_time=...)`.
+        # No `cutoff_time`: the loader has no such parameter any more, and the round's
+        # cutoff is applied by `enrich_intraday_5m_panel` -> `IntradayFeatureConfig`.
         cache_dir=cache_dir,
     )
 
@@ -850,7 +801,6 @@ def apply_intraday_5m_features(
         start=start_date,
         end=as_of_date,
         data_provider=data_provider,
-        cutoff_time=cutoff_time,
         cache_dir=cache_dir,
     )
     enriched = enrich_intraday_5m_panel(universe, universe_5m, cutoff_time=cutoff_time)
@@ -1047,22 +997,37 @@ def main():
 
     # (D11 / §4.50.1) Resolve the 5m REQUEST before anything is loaded -- one pre-pass using
     # the SAME `resolve_strategy_definition` the strategy loop uses, so the loading decision
-    # and the consuming decision can never drift. A `params.get(...)` here would miss a
-    # config-level value and silently reproduce the 2026-10-22 "printed success, fields all
-    # empty" defect on this path. (2026-11-17: the blend switches are deleted, so this pre-pass
-    # now always finds ZERO requesters for a shipped strategy -- see the retirement note above.)
+    # and the consuming decision can never drift.
+    #
+    # (2026-11-17) The former `resolve_intraday_5m_request` helper is INLINED just below, not
+    # replaced by a constant, because it was never truly constant -- only constant FOR EVERY
+    # SHIPPED TEMPLATE. Its chain (`p.<prefix>_<name>` -> `p.blend_<name>` -> `p.<name>` ->
+    # `cfg.*` -> default) now has empty `cfg.*` links for every real template: the six blend 5m
+    # switches were deleted from `StrategyConfig` and `blend_base.py` with their read sites (0
+    # of 58 dumps, 0 config keys carry them), so only a hand-written strategy file's own
+    # `params` can still answer YES. Going through the template's OWN `resolve_param` (rather
+    # than a bare `params.get("enable_intraday_5m")`) is what keeps "the loading decision
+    # cannot disagree with the consuming decision" true for such a file: `resolve_param` still
+    # finds a PREFIXED key (`cfsb_enable_intraday_5m`), which a bare lookup would silently
+    # miss -- the 2026-10-22 "printed success, fields all empty" shape. A template with no
+    # `resolve_param` at all (a static allocation template) has no switch to consult, and
+    # `intraday_5m_switch_present` records that so "no switch" is never read as "off".
     resolved_strategies: List[Dict[str, Any]] = []
     intraday_5m_requesters: List[str] = []
-    intraday_cutoffs: List[str] = []
     intraday_5m_provider_pins: List[Optional[str]] = []
     for s_spec in strategy_specs:
         s_key = s_spec["strategy_key"]
         strat_def, actual_key, resolved_desc, template = resolve_strategy_definition(s_key, None)
         params = strat_def.get("params", {})
-        requests_5m, template_has_switch = resolve_intraday_5m_request(template, params)
+        _template_resolver = getattr(template, "resolve_param", None)
+        template_has_switch = callable(_template_resolver)
+        requests_5m = (
+            bool(_template_resolver(params, "enable_intraday_5m", False, bool))
+            if template_has_switch
+            else False
+        )
         if requests_5m:
             intraday_5m_requesters.append(s_key)
-            intraday_cutoffs.append(resolve_intraday_cutoff(template, params))
             # (2026-11-13) WHICH provider serves this requester's 5m bars, resolved through
             # the SAME template resolver as the switch above (`params.get(...)` here would
             # miss `cfg.cfsb_intraday_5m_provider`/`cfg.blend_*` and reintroduce exactly the
@@ -1101,11 +1066,23 @@ def main():
     #
     # Prices above are deliberately resolved from the UN-ENRICHED frames: enrichment
     # synthesizes the partial as-of daily bar from truncated 5m data, and D11 is a SIGNAL
-    # capability. Re-pricing the netted ticket on a 14:15-synthesized close would be a
+    # capability. Re-pricing the netted ticket on a 5m-synthesized close would be a
     # separate, money-changing decision that §4.50 never authorises.
     universe_intraday_5m: Optional[Dict[str, pd.DataFrame]] = None
     if intraday_5m_requesters:
-        cutoff_t = combine_intraday_cutoffs(intraday_cutoffs)
+        # (2026-11-17) ONE cutoff for the round, and it is now a CONSTANT: the per-strategy
+        # `resolve_intraday_cutoff` + `combine_intraday_cutoffs` pair is DELETED with
+        # `StrategyConfig.intraday_cutoff_time` -- with no config field left there is nothing
+        # to resolve and therefore nothing to combine. Live runs are post-close only, so the
+        # full-session constant cannot narrow any requester's information set.
+        #
+        # This whole branch is UNREACHABLE for a shipped strategy (no shipped template can
+        # request 5m any more -- see the retirement note at the top of this block). It stays
+        # because it is the generic, test-pinned shape of the capability and because the
+        # round-level question ("does this round need a 5m layer?") is still the honest gate;
+        # it must NOT be re-pointed at a real strategy's params without re-running that
+        # ablation.
+        cutoff_t = DEFAULT_INTRADAY_CUTOFF_TIME
         print(
             f"\n[INTRADAY 5M] {len(intraday_5m_requesters)}/{len(strategy_specs)} 个策略请求日内 5m: "
             f"{', '.join(intraday_5m_requesters)} (截断时点: {cutoff_t})"

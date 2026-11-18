@@ -3,10 +3,16 @@
 Frozen spec: `docs/development_plan.md` §4.50 (task row `D11`, `:398`). The ruled shape is
 
 * §4.50.0 -- the switch FOLLOWS CONFIGURATION; no default-off manual CLI switch;
-* §4.50.1 -- the request must be resolved through THAT template's own `resolve_param`
-  (a `params.get("enable_intraday_5m", False)` here would miss
-  `cfg.blend_enable_intraday_5m` while `blend_base.py:714` still resolved True, i.e. the
-  2026-10-22 "printed success, fields all empty" defect on the netted path);
+* §4.50.1 -- the request must be resolved through THAT template's own `resolve_param`.
+  (2026-11-17) The six blend 5m FEATURE switches were deleted from `StrategyConfig` and
+  `blend_base.py` with their read sites, so the `cfg.*` links of that chain are empty for
+  every SHIPPED template and production always takes the zero-request state (clause 1).
+  What survives is the generic shape: a template exposing `resolve_param` still answers
+  through it (a bare `params.get("enable_intraday_5m")` would miss a prefixed key, i.e. the
+  2026-10-22 "printed success, fields all empty" defect on the netted path). The round's
+  cutoff is now the single full-session constant `DEFAULT_INTRADAY_CUTOFF_TIME` -- the
+  per-strategy `resolve_intraday_cutoff` / `combine_intraday_cutoffs` pair is deleted, and
+  so is the loader's accepted-but-never-forwarded `cutoff_time` parameter;
 * §4.50.2 -- ONE round-level union load (never inside the strategy loop), strategy-level
   gate unchanged;
 * §4.50.3 -- the child's own block must OUTRANK stdout/health in
@@ -157,18 +163,20 @@ class _SwitchedTemplate(_RecordingTemplate):
     `params` stays EMPTY on purpose: the switch is answered by the resolver, never by a bare
     `params.get(...)` lookup. A runner that re-implemented the resolution would read zero
     requests here and the partial-request state would go red.
+
+    (2026-11-17) Only the ENABLE branch survives. `resolve_intraday_cutoff` /
+    `combine_intraday_cutoffs` were deleted together with
+    `StrategyConfig.intraday_cutoff_time`, so there is no per-strategy cutoff left to answer
+    for: the round runs its single enrichment at `rms.DEFAULT_INTRADAY_CUTOFF_TIME`.
     """
 
-    def __init__(self, label, *, observations, enable_5m, cutoff=None):
+    def __init__(self, label, *, observations, enable_5m):
         super().__init__(label, observations=observations)
         self._enable_5m = enable_5m
-        self._cutoff = cutoff
 
     def resolve_param(self, p, name, default=None, param_type=None):
         if name == "enable_intraday_5m":
             return self._enable_5m
-        if name == "intraday_cutoff_time":
-            return self._cutoff if self._cutoff is not None else default
         return default
 
 
@@ -334,20 +342,25 @@ def test_partial_request_loads_once_and_only_the_requester_sees_intraday(monkeyp
     nothing loads, and the intraday-column assertion fails.
     """
     calls = []
+    enrichment_calls = []
     real_loader = rms.load_intraday_5m_panel
+    real_enrich = rms.enrich_intraday_5m_panel
 
     def _counting_loader(symbols, **kwargs):
         calls.append({"symbols": list(symbols), **kwargs})
         return real_loader(symbols, **kwargs)
 
+    def _counting_enrich(universe, universe_5m, **kwargs):
+        enrichment_calls.append(dict(kwargs))
+        return real_enrich(universe, universe_5m, **kwargs)
+
     monkeypatch.setattr(rms, "load_intraday_5m_panel", _counting_loader)
+    monkeypatch.setattr(rms, "enrich_intraday_5m_panel", _counting_enrich)
 
     # --- partial-request round: out-of-universe holding forces the union to cover it -------
     obs_partial = {}
     templates = {
-        "blend_on": _SwitchedTemplate(
-            "blend_on", observations=obs_partial, enable_5m=True, cutoff="14:00"
-        ),
+        "blend_on": _SwitchedTemplate("blend_on", observations=obs_partial, enable_5m=True),
         "trend_static": _RecordingTemplate("trend_static", observations=obs_partial),
     }
     _install_fake_strategy_resolution(monkeypatch, templates)
@@ -363,8 +376,19 @@ def test_partial_request_loads_once_and_only_the_requester_sees_intraday(monkeyp
     assert set(calls[0]["symbols"]) == {"600000.SH", "601857.SH", "000001.SZ", "BIL"}, (
         "the union load must cover out-of-universe holdings too (§4.50.2)"
     )
-    # The requesting strategy's own cutoff is what the shared enrichment ran at.
-    assert calls[0]["cutoff_time"] == "14:00"
+    # (2026-11-17) The cutoff is NO LONGER per-strategy. `resolve_intraday_cutoff` /
+    # `combine_intraday_cutoffs` were deleted with `StrategyConfig.intraday_cutoff_time`, so
+    # there is exactly ONE cutoff per round and it is the full-session constant. That is
+    # asserted where it is actually consumed -- the single enrichment call -- and the loader
+    # seam is asserted to carry NO cutoff at all, because its accepted-but-never-forwarded
+    # `cutoff_time` parameter is deleted (pinning a value there would pin a lie).
+    assert "cutoff_time" not in calls[0], (
+        "the 5m loader seam must not carry a cutoff the loader cannot use"
+    )
+    assert [c.get("cutoff_time") for c in enrichment_calls] == [
+        rms.DEFAULT_INTRADAY_CUTOFF_TIME
+    ], "the ONE round-level enrichment must run at the single full-session cutoff"
+    assert rms.DEFAULT_INTRADAY_CUTOFF_TIME == "15:00"
 
     requester = obs_partial["blend_on"]
     non_requester = obs_partial["trend_static"]
