@@ -21,6 +21,22 @@
         // would size "held == target" and emit ZERO orders, silently.
         holdingsEdited: false,
         accountState: {},
+        // (LVCASH, 2026-11-18) The cash leg of the round whose book is CURRENTLY on screen
+        // (engine-measured, same valuation date).  `null` means "no authoritative number":
+        // the card falls back to `#input-cash`, then to the derived `NAV − Σequity`.
+        //
+        // Only the run/bundle loaders may set it, and every one of them also stamps the
+        // round's engine mark into `#input-portfolio-value`, so the NAV and equity legs are
+        // on one timebase.  It is deliberately NOT persisted to localStorage: a restored
+        // session must not resurrect a cash leg from another date.
+        authoritativeCash: null,
+        // Guard for programmatic form writes (`setNavInputValue`).  Named for its first
+        // user (the NAV box) but it is the SHARED guard: both `#input-portfolio-value` and
+        // `#input-cash` listeners check it, because a write the page performs itself must
+        // never be read as an operator edit -- an operator edit is what clears the run's
+        // cash binding below.  Assigning `.value` fires no `input` event; the flag keeps the
+        // contract explicit so a future `dispatchEvent(new Event("input"))` stays safe.
+        isProgrammaticNavWrite: false,
         activeTicket: [],
         activeHealth: null,
         activeFrictionSavings: null,
@@ -431,6 +447,11 @@
 
     function restoreSessionState() {
         try {
+            // (LVCASH, 2026-11-18) A restored session must NEVER resurrect a cash leg: the
+            // value is not persisted at all (see `saveSessionState`), and the date that
+            // follows may have no archive for the round it belonged to.  Clearing it here
+            // makes that explicit rather than relying on the initial `state` literal.
+            state.authoritativeCash = null;
             const savedMode = localStorage.getItem(SESSION_KEYS.OP_MODE);
             if (savedMode && (savedMode === "multi" || savedMode === "single")) {
                 state.mode = savedMode;
@@ -564,10 +585,13 @@
             if (bundle.account_state.peak_nav && el.inputPeakNav) {
                 el.inputPeakNav.placeholder = `自动: ¥${bundle.account_state.peak_nav.toLocaleString()}`;
             }
-            if (bundle.account_state.current_nav && el.inputValue) {
-                el.inputValue.value = bundle.account_state.current_nav;
-            }
         }
+        // (LVCASH, 2026-11-18) Bind the card to this bundle's OWN cash leg and stamp the
+        // engine mark into the NAV box BEFORE the table is (re)painted, so `NAV − Σequity`
+        // stays a true residual instead of a cross-timebase one.  `applyRunResultTimebase`
+        // falls back through `summary.nav_effective[_stage2]` -> `account_state.current_nav`,
+        // which is what this block used to write by hand.
+        applyRunResultTimebase(bundle);
 
         if (bundle.holdings && Object.keys(bundle.holdings).length > 0) {
             renderHoldingsTable(bundle.holdings, priceMap);
@@ -691,6 +715,13 @@
         if (!targetDate) return null;
         state.currentDate = targetDate;
         if (el.inputDate) el.inputDate.value = targetDate;
+        // (LVCASH, 2026-11-18) A date change invalidates the cash binding unconditionally:
+        // whatever round was bound before belonged to another valuation date.  Every loader
+        // below re-binds it when (and only when) it finds an archive for THIS date.  The
+        // operator's typed `#input-cash` is deliberately NOT cleared here: their entry is
+        // their own input, it is simply read at precedence 2 (and labelled `operator_input`
+        // by the card) instead of being silently overwritten or credited to this date's run.
+        state.authoritativeCash = null;
 
         const keys = getActiveKeys();
 
@@ -753,10 +784,19 @@
                         if (prevData.account_state.peak_nav && el.inputPeakNav) {
                             el.inputPeakNav.placeholder = `自动: ¥${prevData.account_state.peak_nav.toLocaleString()}`;
                         }
-                        if (prevData.account_state.current_nav && el.inputValue) {
-                            el.inputValue.value = prevData.account_state.current_nav;
-                        }
+                        // Programmatic write (never an operator edit): the guard inside
+                        // `setNavInputValue` keeps it from clearing the cash binding.
+                        setNavInputValue(prevData.account_state.current_nav);
                     }
+
+                    // (LVCASH, 2026-11-18) NO cash binding on this path.  The book below is
+                    // the PREVIOUS round's, re-priced at today's quotes, while any cash we
+                    // could carry is LAST-SETTLED.  Using it here would silently present a
+                    // mixed-timebase number as this round's cash, so the card falls back to
+                    // the derived residual -- and the "上次录入" strip names the round the
+                    // cash actually came from, so the page says which number is which.
+                    state.authoritativeCash = null;
+                    renderCashLastRecord(prevData.bundle?.summary || null);
 
                     // Load holdings
                     state.holdings = prevData.holdings || {};
@@ -998,9 +1038,32 @@
             el.tbodyHoldings.addEventListener("change", () => { state.holdingsEdited = true; });
         }
         el.inputValue.addEventListener("input", () => {
+            // (LVCASH) Only a REAL keystroke lands here (programmatic `.value =` fires no
+            // `input` event).  The operator is previewing a hypothetical NAV, so the run's
+            // own cash leg no longer describes the number in the box: drop it explicitly
+            // (never rely on truthiness) and let the derived residual take over.
+            if (!state.isProgrammaticNavWrite) {
+                state.authoritativeCash = null;
+            }
             recalcHoldings();
             updateMobileParamSummary();
         });
+
+        // (LVCASH, 2026-11-18) `#input-cash` mirrors the NAV box, symmetrically: a real
+        // operator entry is an explicit assertion about THIS account, so it must take effect
+        // immediately instead of being outranked by precedence-1 run cash (which would make
+        // the field inert once a round is displayed).  Clearing the binding makes
+        // `resolveDisplayedCash` read the typed value at precedence 2 and label it
+        // `operator_input`; blanking the field hands the card back to the derived residual.
+        // `getCashInput()` is untouched: blank still means `null` (never `0`) for the backend.
+        if (el.inputCash) {
+            el.inputCash.addEventListener("input", () => {
+                if (!state.isProgrammaticNavWrite) {
+                    state.authoritativeCash = null;
+                }
+                recalcHoldings();
+            });
+        }
 
         // History
         el.btnLoadDate.addEventListener("click", onLoadDateClicked);
@@ -1261,11 +1324,38 @@
             bil_fallback: "BIL/511880 市值",
             missing: "无法确定",
         }[data.cash_source] || (data.cash_source || "--");
+        const cashLabelDeploy = {
+            explicit: "手工填写",
+            bil_fallback: "BIL/511880 市值",
+            missing: "无法确定",
+        }[data.cash_source_stage2] || (data.cash_source_stage2 || "--");
+
+        // (review MINOR 2, 2026-11-18) GATE vs DEPLOY legs are both legitimate and they
+        // legitimately differ on a round with real BUY/SELL rows: `summary.json`'s bare keys
+        // are the Stage-1 gate snapshot (pre-trade book), the `*_stage2` keys are Stage 2's own
+        // mark (post-trade book). The cash card reads the deploy leg, so printing only the gate
+        // figure here left the same screen showing two unexplained cash numbers. Show BOTH,
+        // distinctly labelled, whenever they differ; keep the single-figure wording otherwise.
+        const cashGate = (typeof data.cash === "number" && isFinite(data.cash)) ? data.cash : null;
+        const cashDeploy = (typeof data.cash_stage2 === "number" && isFinite(data.cash_stage2)) ? data.cash_stage2 : null;
+        const navDeploy = (typeof data.nav_effective_stage2 === "number" && isFinite(data.nav_effective_stage2))
+            ? data.nav_effective_stage2
+            : null;
+        const stagesDiffer = (a, b) => (a !== null && b !== null && Math.abs(a - b) > 0.005);
+        const cashDual = stagesDiffer(cashGate, cashDeploy);
+        const navDual = stagesDiffer(effective, navDeploy);
 
         const parts = [`本次部署净值来源：${sourceLabel}（nav_source=${source}）`];
-        parts.push(`生效净值 ${fmtMoney(effective)}`);
+        parts.push(`生效净值${navDual ? "(门禁/盘前)" : ""} ${fmtMoney(effective)}`);
+        if (navDual) parts.push(`部署净值(盘后) ${fmtMoney(navDeploy)}`);
         if (computed !== null) parts.push(`引擎计算值 ${fmtMoney(computed)}`);
-        parts.push(`现金 ${fmtMoney(data.cash)}（${cashLabel}）`);
+        if (cashDual) {
+            parts.push(`现金(门禁/盘前) ${fmtMoney(cashGate)}（${cashLabel}）`);
+            parts.push(`现金(部署/盘后) ${fmtMoney(cashDeploy)}（${cashLabelDeploy}）`);
+        } else {
+            parts.push(`现金 ${fmtMoney(cashGate !== null ? cashGate : cashDeploy)}`
+                + `（${cashGate !== null ? cashLabel : cashLabelDeploy}）`);
+        }
         // A missing position-open date means the mark is a LOWER BOUND (raw price, no
         // dividends). Say it here too: `anchor_inflation_ratio` is then 1.0, which would
         // otherwise read as "this name pays no dividend".
@@ -1386,9 +1476,37 @@
 
         if (!plan || Object.keys(plan).length === 0) {
             console.warn("部署返回体无 holdings_plan，且 /api/runs/previous 也无持仓 —— 保持当前持仓表格不动。");
+            // The round DID complete and carries a fresh engine mark, so refresh the NAV leg
+            // anyway (the two legs stop drifting).  (review MINOR 1) The cash binding is
+            // DROPPED here: the table was not repainted from this round's book, so keeping the
+            // previous round's cash would print it against THIS round's NAV (an all-cash
+            // account would show the old cash instead of ~`nav`).  Derived residual against
+            // the new NAV is the coherent answer.
+            state.authoritativeCash = null;
+            const unboundNav = pickRoundMark(data).nav;
+            if (unboundNav !== null) {
+                setNavInputValue(unboundNav);
+                recalcHoldings();
+                // (review MINOR B, 2026-11-18) This branch REFUSES to repaint the table, so the
+                // residual it now shows mixes the fresh NAV with the previous round's (or an
+                // operator-edited) book.  Disclose instead of compute: keep the number and the
+                // `derived_residual` source, and say plainly that it is not this round's cash.
+                // `recalcHoldings` repaints the tooltip, so this must come AFTER it; the
+                // `dataset` marker survives later repaints and is what a human/test can read.
+                if (el.valHoldingsCash) {
+                    el.valHoldingsCash.dataset.cashNote = "no_holdings_plan";
+                    el.valHoldingsCash.title = "本轮未返回持仓计划，表格保持上一轮；"
+                        + "现金为净值减当前表格市值的推导残差（非本轮实测）";
+                }
+            }
             return;
         }
 
+        // (LVCASH, 2026-11-18) Bind the displayed book to THIS round's own timebase before it
+        // is painted: the card's cash becomes the round's measured leg and `#input-portfolio-value`
+        // becomes the engine mark the book was priced against.  Doing it earlier (or not at all)
+        // is exactly what printed 67,946.52 instead of 69,033.52 on the 2026-11-18 round.
+        applyRunResultTimebase(data);
         state.holdings = plan;
         renderHoldingsTable(state.holdings);
         recalcHoldings();
@@ -1596,6 +1714,197 @@
         return raw;
     }
 
+    // -------------------------------------------------------------------------
+    // (LVCASH, 2026-11-18) Cash card: ONE precedence, ONE engine-mark write-back.
+    //
+    // The summary card's cash used to be `NAV箱 − Σ持仓市值` unconditionally.  Both legs are
+    // refreshed at different moments: the table is repainted from a round's planned book
+    // (re-priced) by `refreshHoldingsAfterDeploy`, while the NAV box still held whatever the
+    // operator typed BEFORE that round.  On the 2026-11-18 round that printed 67,946.52
+    // (197,652.52 − 129,706.00) while the engine's own numbers were NAV 198,739.52, equity
+    // 129,706.00, cash 69,033.52 -- off by exactly 1,087.00, and contradicting the
+    // NAV-provenance strip on the same screen which already showed 69,033.52.
+    //
+    // So: (1) the displayed round's OWN cash leg, used directly; (2) an explicit
+    // `#input-cash` entry; (3) the derived residual, clamped -- now only a preview for a
+    // hypothetical NAV or a date with no archive.  The arithmetic itself lives in
+    // `static/js/cash_resolve.js` (loaded before this file) so a test can execute the
+    // SHIPPED function instead of re-implementing it.
+    //
+    // OPERATOR EDITS CLEAR THE BINDING -- FOR BOTH FIELDS.  Precedence 1 would otherwise make
+    // the operator's own entry inert (type a cash figure and the card keeps printing the
+    // run's number), so a REAL keystroke in `#input-portfolio-value` **or** `#input-cash`
+    // does `state.authoritativeCash = null` before recomputing: from that moment the box's
+    // value wins at precedence 2 (cash) or the residual is derived from the typed NAV (3),
+    // and `dataset.cashSource` says which.  Programmatic writes (engine marks) are excluded
+    // by `state.isProgrammaticNavWrite`; date switches / `restoreSessionState` /
+    // `loadAccountState` clear the binding on their own and deliberately LEAVE the operator's
+    // typed `#input-cash` in place -- their input is not destroyed, it is simply still read
+    // at precedence 2 and labelled `operator_input`.
+    // -------------------------------------------------------------------------
+    const CASH_CARD_SOURCE_LABEL = {
+        authoritative_run: "本轮运行现金（引擎入账，与净值同一估值日）",
+        operator_input: "手工填写的现金余额（表单录入）",
+        derived_residual: "推导残差「净值 − 持仓市值」（非本轮入账现金）",
+    };
+
+    //: Local alias for the shared finite-number coercion (`null` = absent, never 0).
+    function toFiniteNumber(value) {
+        if (window.LiveTradingCash && typeof window.LiveTradingCash.toFiniteNumber === "function") {
+            return window.LiveTradingCash.toFiniteNumber(value);
+        }
+        if (value === null || value === undefined) return null;
+        if (typeof value === "string" && value.trim() === "") return null;
+        const num = typeof value === "number" ? value : parseFloat(value);
+        return isFinite(num) ? num : null;
+    }
+
+    /**
+     * Programmatic write into `#input-portfolio-value` -- the engine mark, never an edit.
+     *
+     * Returns `true` when the box was written.  The `isProgrammaticNavWrite` flag is
+     * belt-and-braces (`.value =` fires no `input` event) but keeps the contract explicit
+     * for the `input` listener below, which is what invalidates `state.authoritativeCash`.
+     */
+    function setNavInputValue(value) {
+        const num = toFiniteNumber(value);
+        if (num === null || !el.inputValue) return false;
+        state.isProgrammaticNavWrite = true;
+        try {
+            el.inputValue.value = num;
+        } finally {
+            state.isProgrammaticNavWrite = false;
+        }
+        return true;
+    }
+
+    /**
+     * Resolve ONE round's mark as a LOCKSTEP pair: `{nav, cash, stage}`.
+     *
+     * WHY ONE RESOLVER (review MINOR 3, 2026-11-18): the NAV leg and the cash leg used to be
+     * picked by two independent "first finite candidate" scans.  A round with
+     * `nav_effective_stage2` but a `null` `cash_stage2` (the engine could not value cash: no
+     * BIL/511880 held and the form blank) therefore paired Stage 2's NAV with the Stage-1
+     * gate's cash -- a cross-timebase mix, and in the worst case a cash figure LARGER than the
+     * NAV it was printed against.  That is the exact bug class this whole change exists to
+     * kill, so failover is now lockstep:
+     *
+     *   (a) `stage2` -- the `*_stage2` pair.  Chosen as soon as a stage-2 NAV exists; its cash
+     *       is taken from the SAME stage or is `null`.  It never borrows the gate's leg: the
+     *       book on screen is the post-trade book, so the gate's cash belongs to another book.
+     *   (b) `gate` -- the unprefixed pair (`nav_effective` / `cash`).  For a Stage-1-only
+     *       archive this is the gate snapshot; on a `/api/run-*` response these top-level keys
+     *       ARE the deploy values (`RunResponse`, `execution_service` 4689-4697), which is why
+     *       the reported round resolves through this branch.  Again same stage or `null`.
+     *   (c) `account_state` -- carried `current_nav` / `nav_mtm`, NAV only, `cash = null`.
+     *
+     * An incomplete pair yields `cash = null` ("unrecorded"), so the card falls through to
+     * `derived_residual`, which is self-consistent with the NAV that was just written.  `0` is
+     * a legitimate fully-invested balance and stays a pair; a negative cash leg does not.
+     */
+    function pickRoundMark(src) {
+        const NONE = { nav: null, cash: null, stage: null };
+        if (!src || typeof src !== "object") return NONE;
+        const account = (src.account_state && typeof src.account_state === "object") ? src.account_state : null;
+        const summary = (src.summary && typeof src.summary === "object") ? src.summary : null;
+
+        // Top-level key first, then the same key inside `summary` -- never a DIFFERENT stage's.
+        // The VALUE and its `cash_source` are read from the SAME carrier: a carrier that states
+        // the number must also state where it came from, and a summary-level source must never
+        // be attached to a top-level number.
+        const readPair = (valueKey, sourceKey) => {
+            if (src[valueKey] !== undefined && src[valueKey] !== null) {
+                return {
+                    value: src[valueKey],
+                    source: sourceKey ? src[sourceKey] : null,
+                };
+            }
+            if (summary && summary[valueKey] !== undefined && summary[valueKey] !== null) {
+                return {
+                    value: summary[valueKey],
+                    source: (sourceKey && summary[sourceKey] !== undefined) ? summary[sourceKey] : null,
+                };
+            }
+            return { value: null, source: null };
+        };
+        const navOf = (key) => {
+            const num = toFiniteNumber(readPair(key, null).value);
+            return (num !== null && num > 0) ? num : null;
+        };
+        // (review MINOR A, 2026-11-18) `cash_source === "missing"` means "the engine could not
+        // value cash", NOT zero -- the same rule `_cash_residual_from_summary`
+        // (`execution_service.py:2706-2708`) enforces, and the reason `compute_nav` can fail
+        // closed there. `fail_closed` keeps `missing` from serialising today, but that
+        // invariant is implicit, so mirror it: unrecorded -> `null` -> the card derives.
+        // Only the matcher's values are trusted (`explicit` / `bil_fallback`); an ABSENT source
+        // key keeps the old numeric-only behaviour, and a DIFFERENT stage's source is never
+        // consulted (it was never read at all).
+        const cashOf = (valueKey, sourceKey) => {
+            const pair = readPair(valueKey, sourceKey);
+            if (String(pair.source || "") === "missing") return null;
+            const num = toFiniteNumber(pair.value);
+            return (num !== null && num >= 0) ? num : null;
+        };
+
+        // (a) Stage 2's own pair.
+        const stage2Nav = navOf("nav_effective_stage2");
+        if (stage2Nav !== null) {
+            return { nav: stage2Nav, cash: cashOf("cash_stage2", "cash_source_stage2"), stage: "stage2" };
+        }
+        // (b) Gate snapshot / run-response deploy pair.
+        const gateNav = navOf("nav_effective");
+        if (gateNav !== null) {
+            return { nav: gateNav, cash: cashOf("cash", "cash_source"), stage: "gate" };
+        }
+        // (c) NAV-only carried account state.
+        const carried = [account ? account.current_nav : null, account ? account.nav_mtm : null];
+        for (let i = 0; i < carried.length; i++) {
+            const num = toFiniteNumber(carried[i]);
+            if (num !== null && num > 0) {
+                return { nav: num, cash: null, stage: "account_state" };
+            }
+        }
+        return NONE;
+    }
+
+    /**
+     * Bind a completed run/bundle to the card: its cash leg becomes authoritative AND the
+     * NAV box is stamped from the SAME `pickRoundMark` result, so the two visible legs are one
+     * snapshot by construction.
+     *
+     * A round whose pair is incomplete (`cash = null`) CLEARS the binding instead of keeping a
+     * previous round's number: that number described another book.
+     */
+    function applyRunResultTimebase(data) {
+        const mark = pickRoundMark(data);
+        state.authoritativeCash = mark.cash;
+        if (mark.nav !== null) {
+            setNavInputValue(mark.nav);
+        } else {
+            console.warn("[NAV] 本轮结果未携带 nav_effective，净值框保持原值（现金卡片将退回推导残差）。");
+        }
+        return mark;
+    }
+
+    /** Resolve the displayed cash, with a degraded fallback if `cash_resolve.js` is absent. */
+    function resolveCashForCard(input) {
+        const api = window.LiveTradingCash;
+        if (api && typeof api.resolveDisplayedCash === "function") {
+            return api.resolveDisplayedCash(input);
+        }
+        // A cached `index.html` (older than this file) may not load `cash_resolve.js`; the
+        // card must still render, so degrade to the historical derived residual.
+        const nav = toFiniteNumber(input.nav);
+        const navVal = nav === null ? 100000.0 : nav;
+        const equity = toFiniteNumber(input.totalEquity);
+        const cash = Math.max(0, navVal - (equity === null ? 0.0 : equity));
+        return {
+            cash: cash,
+            cashRatio: navVal > 0 ? (cash / navVal) * 100.0 : 0.0,
+            source: "derived_residual",
+        };
+    }
+
     function recalcHoldings() {
         const nav = parseFloat(el.inputValue.value) || 100000.0;
         const rows = el.tbodyHoldings.querySelectorAll("tr");
@@ -1647,12 +1956,29 @@
             }
         });
 
-        const cash = Math.max(0, nav - totalEquity);
-        const cashRatio = nav > 0 ? (cash / nav) * 100.0 : 0.0;
+        // (LVCASH) ONE precedence for the card: the displayed round's own measured cash leg
+        // (used directly, never subtracted), then an explicit `#input-cash` entry, then the
+        // historical derived residual -- which now only covers a hypothetical NAV preview or
+        // a date with no run archive.  See `cash_resolve.js` for the arithmetic and the
+        // 2026-11-18 regression it fixes.
+        const resolved = resolveCashForCard({
+            authoritativeCash: state.authoritativeCash,
+            operatorCash: getCashInput(),
+            nav: nav,
+            totalEquity: totalEquity,
+        });
+        const cash = resolved.cash;
+        const cashRatio = resolved.cashRatio;
 
         el.valHoldingsEquity.textContent = `¥${totalEquity.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
         el.valHoldingsCash.textContent = `¥${cash.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
         el.valHoldingsCashRatio.textContent = `${cashRatio.toFixed(1)}%`;
+        // Say WHERE the number came from (hover + DOM introspection), so a derived residual
+        // can never be read as the round's measured cash on a screenshot.
+        if (el.valHoldingsCash) {
+            el.valHoldingsCash.dataset.cashSource = resolved.source;
+            el.valHoldingsCash.title = CASH_CARD_SOURCE_LABEL[resolved.source] || "";
+        }
     }
 
     let fetchQuotesTimer = null;
@@ -1750,8 +2076,14 @@
                 if (data.peak_nav && el.inputPeakNav) {
                     el.inputPeakNav.placeholder = `自动: ¥${data.peak_nav.toLocaleString()}`;
                 }
-                if (data.current_nav && el.inputValue) {
-                    el.inputValue.value = data.current_nav;
+                // (LVCASH, 2026-11-18) A date-level account state carries a NAV but no cash
+                // leg, so any previously bound cash described another book: drop it, and
+                // write the mark programmatically (never as an operator edit).
+                state.authoritativeCash = null;
+                const navMark = toFiniteNumber(data.current_nav) !== null
+                    ? data.current_nav
+                    : data.nav_mtm;
+                if (setNavInputValue(navMark)) {
                     recalcHoldings();
                 }
             }
@@ -1957,6 +2289,14 @@
             if (data.account_state) {
                 state.accountState = data.account_state;
             }
+            // (LVCASH, 2026-11-18) Stage 1 re-marks the account with its own engine NAV, so
+            // write that mark back and DROP any cash binding: the gate's cash is not a deploy
+            // leg, and with the mark stamped the derived residual reproduces it exactly
+            // (gate NAV = equity + gate cash for the very book the table shows).
+            state.authoritativeCash = null;
+            const gateNavMark = pickRoundMark(data).nav;
+            if (gateNavMark !== null) setNavInputValue(gateNavMark);
+            recalcHoldings();
 
             saveSessionState();
             await updateScopedHistoryRuns();
@@ -3325,9 +3665,14 @@
             }
 
             // 4. Reload latest active holdings and account state, and latest run for current pair
-            loadHoldings();
-            loadAccountState();
-            loadLatestRunForCurrentPair(true);
+            // (LVCASH, 2026-11-18) AWAIT them, latest run LAST: the account-state loader clears
+            // the card's cash binding and only the run bundle/archive may re-bind it, so
+            // response ARRIVAL order must not decide which leg the card shows.
+            (async () => {
+                await loadHoldings();
+                await loadAccountState();
+                await loadLatestRunForCurrentPair(true);
+            })();
 
             setConsoleStatus("就绪 (全部4板块全景)", false);
             logConsole(`\n[VIEW] 已恢复全部四大板块全景展示 (1.标的池 2.实盘持仓 3.健康风控 4.调仓工单)，退出归档查看。`);

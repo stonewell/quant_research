@@ -2939,6 +2939,100 @@ Track MS 确立**零存量污染、零 `BASE_VERSION = 2.0.0` 变更、零 58 �
    股数与成交额 / 被否单集合均未变），回归见 `pipeline/tests/test_live_limit_band_anchor.py`（6 例）。
    证据强度：n=19 只支持方向，不支持把 5.3% 当作精确概率。
 
+### LVCASH 实盘台账「闲置可用现金」跨时基残差修复（2026-11-18；`[x]/[ ]` 计数不变）
+
+1. **缺陷（`LVCASH`，2026-11-18 实盘页面）**。持仓卡片右侧「闲置可用现金」显示 **67,946.52**，
+   而同屏「净值来源」条已打印 **69,033.52**，同页自相矛盾；差额恰为 **1,087.00**。
+2. **根因＝跨时基残差（`cross-timebase residual`）**。卡片现金原为
+   `#input-portfolio-value − Σ持仓市值` 无条件相减。两条腿的刷新时刻不同：
+   `refreshHoldingsAfterDeploy()` 用本轮**票后计划**账簿（按当日收盘重新计价）重绘表格，
+   而净值框仍留着操作者在**本轮运行之前**手填的 NAV。该轮引擎真值为
+   `nav_effective = 198,739.52`、`nav_equity = 129,706.00`、`cash = cash_stage2 = 69,033.52`
+   （`198,739.52 − 129,706.00` ✓）；卡片却按旧 NAV 相减
+   `197,652.52 − 129,706.00 = 67,946.52` ✗。11-18 票据 **0 笔 BUY/SELL**，
+   BIL 行为 `SWEEP/RELEASE_CASH`、0 股、`trade_value -0.0`、`net_trade_value_rmb 0.0`，
+   故已排除现金归集重复扣减、费用重复计入、买入成本重复计入、卖出回款缺失四条假设方向；
+   后端 `summary.json`（`_nav_summary_fields`）数值本身正确，缺陷纯在 Web 展示层。
+3. **修法**：新增单一现金口径 `static/js/cash_resolve.js::resolveDisplayedCash()`（`app.js` 之前加载），
+   优先级固定为 ①**本轮入账现金**（`cash_stage2` 优先，其次 `cash`，取自页面正在展示的那一轮；
+   同日同账簿，**直接采用、不做任何相减**）→ ②**操作者手填的 `#input-cash`**（空＝`null`，绝不写 0）
+   → ③**推导残差** `NAV − Σ权益`（钳制 `≥ 0`，现仅用于假设净值预览或该日无归档）。
+   同时把引擎净值写回净值框：运行完成 / 加载归档 bundle / `loadAccountState` 一律
+   `setNavInputValue()` 程序化写入（`nav_effective_stage2` → `nav_effective` →
+   `summary.*` → `account_state.current_nav` → `nav_mtm`），程序化写入**不算操作者编辑**。
+   真实键盘 `input` 事件显式置 `state.authoritativeCash = null`（不用真值判断），
+   推导预览随即恢复；日期切换与 `restoreSessionState()` 同法清空，
+   「继承前一可用基准日」回退路径**不绑定**上一轮已结算现金，只由「上次录入」条如实标注来源。
+4. **改动文件**：新增 `web/livetrading/static/js/cash_resolve.js`、
+   `web/livetrading/tests/test_cash_resolution_precedence.py`；
+   修改 `web/livetrading/static/js/app.js`（`state.authoritativeCash` / `isProgrammaticNavWrite`、
+   `setNavInputValue` / `pickEngineNav` / `pickAuthoritativeCash` / `applyRunResultTimebase` /
+   `resolveCashForCard`、`recalcHoldings` 现金段、`renderRunBundle`、`refreshHoldingsAfterDeploy`、
+   `handleDateSelected`、`loadAccountState`、`runHealthCheck`、`showAllFourSegments` 的顺序 await）、
+   `web/livetrading/static/index.html`（脚本顺序）。
+   **零**策略/模板版本变动、**零** `docs/version.md` 改动、**零** `scripts/run_live_strategy.py` 出票改动、
+   **零** `compute_nav` 语义改动（`RunResponse` 亦未加字段）。
+5. **验收**：`cd web/livetrading && uv run pytest tests -q` → **436 passed / 1 skipped**；
+   现金子集（`test_portfolio_valuation` / `test_nav_cash_timebase` / `test_cash_as_of_provenance` /
+   `test_stage2_nav_snapshot_isolation` / `test_execution_valuation_date` / `test_live_book_integrity` /
+   `test_cash_resolution_precedence`）→ **177 passed / 1 skipped**。新回归在 `node` 下执行**已交付**的
+   `cash_resolve.js`（非 Python 复写）：断言报告场景返回 **69,033.52** 且
+   `source == "authoritative_run"`，同时断言「旧 NAV 推导」仍复现 67,946.52（证明修的是**取值来源**
+   而非换了个减法）；另断言 `*_stage2` 双腿同源优先（门禁用 197,899.90/25,596.90 对部署
+   197,899.60/25,596.60 时不混用）。卡片格式契约（`toLocaleString` 2 位小数、比例 1 位 + `%`）未变。
+6. **`#input-cash` 与净值框对称（2026-11-18 第二轮，修上一条自查所披露的不对称）**。
+   原状：`#input-cash` 只被 `getCashInput()` 读作后端入参，**没有** `input` 监听器，于是在
+   ①运行现金占优先级 1 之后，操作者手填的现金对卡片**完全无效**（填了也照旧打印本轮现金）；
+   ②残留值随日期切换存活却无声地影响卡片，页面无法解释数字为何与本轮现金不同。
+   现改为与 `#input-portfolio-value` 同一规则：真实键盘 `input` → `state.authoritativeCash = null`
+   → `recalcHoldings()`，即"手填即生效"；程序化写入由**共用**守卫 `state.isProgrammaticNavWrite`
+   排除（该字段名沿用首个使用者，未重命名、未删除，NAV 路径保持不变）。优先级次序
+   **不动**（仍为 `authoritative_run` > `operator_input` > `derived_residual`）。
+   日期切换 / `restoreSessionState` / `loadAccountState` 照旧清空绑定，但**保留**操作者已填的
+   `#input-cash` 原值（不销毁其输入），该值仍按优先级 2 生效，并让卡片
+   `dataset.cashSource = "operator_input"` + `title` 明示"手工填写"，使"为何与本轮现金不同"
+   在页面上自证；`getCashInput()` 语义不变（空 ⇒ `null`，绝不写 0）。
+   回归：`test_cash_resolution_precedence.py` 新增
+   `test_operator_cash_entry_clears_the_run_binding_and_takes_effect`（监听器存在且清空绑定 /
+   守卫存在 / 日期切换不动该字段 / 清除后手填值返回 `operator_input`、清空后返回
+   `derived_residual` 且仍为 69,033.52）。本轮验收：`uv run pytest tests -q` → **437 passed /
+   1 skipped**（唯一 skip 为既有的 `LIVETRADING_VERIFY_ARCHIVE` 在线归档探针）；
+   `test_cash_resolution_precedence.py` → **11 passed**；`node --check` 两文件均通过。
+
+#### LVCASH 独立复核收口（2026-11-18，MINOR ×3 + NIT ×2，全部已关闭）
+
+独立复核结论为「无 BLOCKER/MAJOR，可用于实盘」，下列各项仅作收口，**不改**既有优先级次序：
+
+| 编号 | 问题 | 收口做法 |
+| :--- | :--- | :--- |
+| MINOR 1 | 空计划部署分支（`refreshHoldingsAfterDeploy` 无 `holdings_plan` 时）只刷新净值框、仍保留**上一轮**现金绑定 ⇒ 旧现金对新净值，全现金账户会打印旧现金而非 `≈nav` | 该分支先 `state.authoritativeCash = null` 再 `recalcHoldings()`，改用「新净值 − 现有持仓」的推导残差（自洽） |
+| MINOR 3 | 两条腿各自独立扫描候选键：`nav_effective_stage2` 有值而 `cash_stage2` 为空（无 BIL/511880 且表单留空）时，会拿**阶段二净值配门禁现金**，极端情形出现 `cash > nav` | 用单一解析器 `pickRoundMark()` 返回 `{nav, cash, stage}`：①`*_stage2` 对（净值存在即选该阶段，现金只取同阶段，缺失即 `null`）→②裸键对（门禁快照／`/api/run-*` 顶层即部署值）→③仅 `account_state.current_nav`/`nav_mtm` 的净值。**缺腿即 `null`，绝不借另一阶段的腿**；`0` 视为已记录（满仓），负现金腿不可用 |
+| MINOR 2 | 「净值来源」条只印门禁 `cash`/`nav_effective`，卡片印部署 `cash_stage2`/`nav_effective_stage2`，有真实买卖时两者合法不同却无解释 | 两阶段都存在且**数值不同**时并列标注：`现金(门禁/盘前) X` 与 `现金(部署/盘后) Y`、`生效净值(门禁/盘前)` 与 `部署净值(盘后)`；单一阶段保持原文案，两者都不隐藏 |
+| NIT 4 | 比例未钳制，授权／手填现金可给出 >100% 或负比例 | 只钳**比例**到 `[0, 100]`（`cash_resolve.js`），**现金数值保持逐字原样**（含负数与超 NAV），注释写明「只钳百分比，绝不改现金」 |
+| NIT 5 | `test_derived_branch_is_last_inside_the_resolver` 只断言文本先后，分支条件互换也能通过 | 明确标注为「无 node 时的补强文本检查、非行为证明」，并追加分支 `if` 守卫串（`if (authoritative !== null) {` / `} else if (operator !== null) {`）与标签归属断言 |
+
+验收：`test_cash_resolution_precedence.py` → **15 passed**
+（新增/改写 5 例：lockstep 快照、报告场景端到端 `198739.52 → 69033.52`、
+空计划分支清空绑定、双阶段并列标注、比例钳制而现金逐字）；
+`uv run pytest tests -q -p no:cacheprovider` → **441 passed / 1 skipped**（同一既有 skip）；
+`node --check` 两文件通过。报告场景仍为 **`nav 198739.52 → cash 69033.52`，
+`source = "authoritative_run"`**。
+
+#### LVCASH 第二轮复核收口（2026-11-18，MINOR A/B，均已关闭）
+
+第二轮独立复核同样为「无 BLOCKER/MAJOR，可保留用于实盘」，只余两项：
+
+| 编号 | 问题 | 收口做法 |
+| :--- | :--- | :--- |
+| MINOR A | `pickRoundMark` 的 `cashOf` 只判「有限且 `≥ 0`」，未核对来源；后端语义里 `cash_source = "missing"` 表示**无法估值**而非 0（`execution_service.py:2706-2708` 的 `_cash_residual_from_summary` 即按此拒绝，`compute_nav` 的 fail-closed 只是让该不变式隐式成立） | 现金腿与来源**同载体**读取（顶层优先、其次 `summary`，绝不跨阶段借来源）：`missing` → `null`；`explicit` / `bil_fallback` → 采用；**来源键缺失 → 维持纯数值旧行为**；`≥ 0` 阈值不变 |
+| MINOR B | 空计划分支拒绝重绘表格却仍打印 `净值 − 当前表格市值` 的推导残差，读者可能误读为本轮实测现金 | 数字与 `derived_residual` 标签**都不改**，只在该分支 `recalcHoldings()` 之后追加披露：`dataset.cashNote = "no_holdings_plan"`，`title` 写明「本轮未返回持仓计划，表格保持上一轮；现金为净值减当前表格市值的推导残差（非本轮实测）」 |
+
+验收：`test_cash_resolution_precedence.py` → **17 passed**（新增 2 例：`missing`+0 ⇒ `null` 对
+`explicit`+0 ⇒ `0.0`，含阶段二来源不被门禁来源救援；空计划分支披露文案）；
+`uv run pytest tests -q -p no:cacheprovider` → **443 passed / 1 skipped**；
+报告场景复核仍为 `{nav_effective: 198739.52, cash: 69033.52}` → `cash 69033.52`，
+`source = "authoritative_run"`。
+
 ---
 
 ## 三、 六级主优先级执行路线图与并行波次编排（`Tier P0` $\to$ `Tier P5`）

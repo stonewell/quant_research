@@ -584,6 +584,10 @@
     <div id="toast-notification" class="toast-notification"></div>
 
     <!-- Scripts -->
+    <!-- (LVCASH) MUST precede app.js: `recalcHoldings()` resolves the cash card through
+         `window.LiveTradingCash.resolveDisplayedCash`, and the cash precedence lives there
+         (authoritative round cash -> operator entry -> derived residual). -->
+    <script src="/static/js/cash_resolve.js"></script>
     <script src="/static/js/app.js"></script>
 </body>
 </html>
