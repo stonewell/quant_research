@@ -2087,11 +2087,14 @@ def parse_args(args: Optional[List[str]] = None):
     )
     parser.add_argument(
         "--cutoff-time",
-        default="14:15",
+        default="15:00",
         help=(
             "Intraday cutoff time for Stage 2 order generation, expressed in the MARKET's local wall "
-            "clock (not the host's; default: 14:15, 39 5m bars). Used only for 5m EXECUTION-price "
-            "guidance -- daily-bar valuation always uses the as-of session from the market clock."
+            "clock (not the host's; default: the FULL session, 15:00 / 48 5m bars). Live runs are "
+            "post-close only, so the default does NOT truncate anything. Passing an earlier value "
+            "(e.g. 14:15) narrows the 5m FEATURE information set only -- daily-bar valuation always "
+            "uses the as-of session from the market clock, and a complete official daily bar is "
+            "never overwritten by a truncated 5m aggregation."
         ),
     )
     parser.add_argument(
@@ -2109,9 +2112,14 @@ def parse_args(args: Optional[List[str]] = None):
     parser.add_argument(
         "--enable-overnight-derisk",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
-            "`R6` (rule r6.3) overnight de-risking, DEFAULT ON (owner ruling 2026-11-07). At the "
+            "`R6` (rule r6.3) overnight de-risking, DEFAULT OFF (owner ruling 2026-11-17: retired as "
+            "a NEGATIVE RESULT -- this deployment runs post-close and fills at the T+1 open, i.e. "
+            "AFTER the overnight gap the judgement exists to avoid, so it can only act as a "
+            "one-day-lagged exposure tilt; see the freeze doc `## Revision 2026-11-17`). The flag "
+            "is kept so an owner can still turn it ON explicitly "
+            "(`--enable-overnight-derisk`). When enabled: at the "
             "derived instant D = session_close_time(market, day) - 45min (half-day aware, market-"
             "local -- never a hard-coded 14:15), decide whether the cross-sectional overnight gap "
             "volatility has spiked above 2x its trailing 252-session median and, if so, multiply "
@@ -2544,9 +2552,10 @@ def resolve_intraday_gate_state(
     never disagree again (they used to re-implement the same fallback chain).
 
     `intraday_5m_enabled` is the caller's already-resolved switch
-    (`main()`: `args.enable_intraday_5m` or `resolve_blend_param(params,
-    "enable_intraday_5m", ...)`, i.e. the SAME resolution that decides whether the
-    5m layer is loaded). When omitted, the report itself is consulted
+    (`main()`: the `--enable-intraday-5m` CLI flag ALONE since 2026-11-17 -- the
+    `resolve_blend_param(params, "enable_intraday_5m", ...)` leg is gone with the
+    blend-side switches -- i.e. the SAME decision that decides whether the 5m layer
+    is loaded). When omitted, the report itself is consulted
     (`intraday_5m_metrics.requested` / presence of the block).
 
     Never returns 0.50: a missing measurement is `0.0` (fail-closed), an unused
@@ -6143,9 +6152,12 @@ def main(cli_args: Optional[List[str]] = None):
     # copy of the 11-05 ledger were the only other candidates). Resolve the snapshot HERE from
     # the archive itself instead of trusting whatever block the carried state happens to hold:
     # newest date, newest SUCCESSFUL instance within it, snapshot's own `as_of_date` equal to
-    # its run date, and `base_version` equal to today's live engine. The decision (and every
-    # skipped candidate with its reason) lands in `account_state["prior_state_source"]`, and
-    # the line is printed for `summary.json`'s `deploy_stdout` / `prior_state_log`.
+    # its run date, and `base_version` in the SAME MAJOR as today's live engine (patch/minor
+    # may differ -- `NV8`; `scripts/live_preflight.py::_version_majors_match`). A different
+    # MAJOR still refuses the snapshot, because that is a different engine era. The decision
+    # (and every skipped candidate with its reason) lands in
+    # `account_state["prior_state_source"]`, and the line is printed for `summary.json`'s
+    # `deploy_stdout` / `prior_state_log`.
     #
     # (D3, 2026-11-13) THE THREE NON-SELECTED STATES ARE NOW MACHINE-READABLE. A selection
     # that resolved nothing used to leave `prior_state_source` ABSENT, which reads as a bare
@@ -6621,9 +6633,13 @@ def main(cli_args: Optional[List[str]] = None):
         },
     )
 
-    enable_intraday_5m = getattr(args, "enable_intraday_5m", False) or bool(
-        resolve_blend_param(params, "enable_intraday_5m", False, bool)
-    )
+    # (2026-11-17 owner ruling) CLI ONLY. The blend-side 5m FEATURE switches were deleted, so
+    # there is no `enable_intraday_5m` strategy param left to OR in -- the old
+    # `args.enable_intraday_5m or resolve_blend_param(params, "enable_intraday_5m", ...)`
+    # expression could only ever have been true through the flag. The deployed run gets the
+    # flag from Web Station, which appends `--enable-intraday-5m` unconditionally
+    # (`web/livetrading/execution_service.py`), so 5m is NOT silently turned off in production.
+    enable_intraday_5m = bool(getattr(args, "enable_intraday_5m", False))
     _record_effective_param(
         effective_param_entries,
         declared_params,
@@ -6675,7 +6691,7 @@ def main(cli_args: Optional[List[str]] = None):
             provider_5m = get_data_provider(
                 intraday_5m_provider or args.data_provider, **build_data_kwargs(args)
             )
-            cutoff_t = getattr(args, "cutoff_time", "14:15") or "14:15"
+            cutoff_t = getattr(args, "cutoff_time", "15:00") or "15:00"
             _5m_market = getattr(clock_ctx, "market", None) or "china"
             # (2026-11-15 incident, Stage-2 half) The 5m window is BOUNDED and INDEPENDENT of
             # the daily `--start-date`, exactly like Stage 1
@@ -6711,7 +6727,9 @@ def main(cli_args: Optional[List[str]] = None):
                 start=intraday_5m_start,
                 end=as_of_date,
                 data_provider=provider_5m,
-                cutoff_time=cutoff_t,
+                # (2026-11-17) No `cutoff_time`: the loader's dead `cutoff_time` parameter was
+                # removed (it never narrowed anything). The cutoff below is applied by
+                # `enrich_universe_with_intraday_features` via `IntradayFeatureConfig`.
                 # The same cache directory every other Stage-2 read uses (resolved once above,
                 # next to the daily load). It was accepted as a kwarg by the loader but never
                 # forwarded here, so `cache_dir` stayed `None` and the CWD-relative candidate
@@ -6760,7 +6778,7 @@ def main(cli_args: Optional[List[str]] = None):
             ):
                 print(_line)
             universe = enrich_universe_with_intraday_features(
-                universe, universe_5m, config=IntradayFeatureConfig(cutoff_time=cutoff_t), synthesize_intraday_bar=True
+                universe, universe_5m, config=IntradayFeatureConfig(cutoff_time=cutoff_t)
             )
         except Exception as exc:
             print(f"[WARN] Failed to load 5m intraday features in Stage 2 runner: {exc}")
@@ -6825,6 +6843,12 @@ def main(cli_args: Optional[List[str]] = None):
     # before `model_equity_target` and before every downstream gate -- so the circuit breakers
     # / recovery scale / Stage-1 distribution gate all consume the DE-RISKED book instead of
     # silently re-scaling the un-de-risked one.
+    #
+    # (freeze doc `## Revision 2026-11-17`) This whole block runs ONLY on an explicit opt-in:
+    # `R6` was retired as a negative result (post-close run, T+1-open fill => the trigger executes
+    # after the gap it exists to avoid), so `--enable-overnight-derisk` now defaults to False.
+    # Skipping the block is NOT `NOT_TRIGGERED`: the ticket simply carries no `overnight_derisk`
+    # field, which means "this judgement did not run".
     #
     # Applied PER MARKET: `D = session_close_time(market, day) - 45min` is market-local and
     # half-day aware, so lending one market's clock to another market's book is precisely the
@@ -7220,6 +7244,29 @@ def main(cli_args: Optional[List[str]] = None):
     # `apply_intraday_distribution_gate`, which is what makes the composition
     # multiplicative rather than a replacement.
     r1_enforced = r1_derisk_enforcement_enabled(getattr(args, "enforce_r1_derisk", False))
+    # (2026-11-17 retirement) The banner is emitted HERE, where the two-gate resolution
+    # actually settles, and NOT from argparse: this is an *intent of execution*, not a
+    # *declaration of a parameter*, and only this line has seen the
+    # `LIVETRADING_DISABLE_R1_DERISK` kill-switch. Printing from argparse would let a run
+    # the env var just neutralised announce itself as "enabled", and it would also fire on
+    # `--help`, which returns before `main` ever reaches this point. The guard is the
+    # RESOLVED boolean, so the banner and the behaviour cannot disagree.
+    if r1_enforced:
+        print("\n" + "!" * 110)
+        print(
+            "[R1 INTRADAY DERISK RETIRED / 日内回撤降险已退役] "
+            "`--enforce-r1-derisk` 已显式开启；R1 已按负结果结项 (2026-11-17)。"
+        )
+        print(
+            "       理由：测量面取决策会话收盘、成交在 T+1 开盘，两者不同基准；"
+            "且现路径只压缩买入增量、不下调存量暴露 (sells 与现金腿不动)。"
+        )
+        print(
+            "       重新启用须先满足 docs/intraday_drawdown_derisk.md 的 "
+            "`## Revision 2026-11-17` 第 4 节预注册。本条横幅只做声明，"
+            "未改动任何算术或默认值。"
+        )
+        print("!" * 110 + "\n")
     r1_multiplier: Optional[float] = None
     if r1_adv is not None and r1_adv.get("multiplier") is not None:
         r1_multiplier = float(r1_adv["multiplier"])

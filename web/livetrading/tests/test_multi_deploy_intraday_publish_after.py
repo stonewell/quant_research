@@ -136,6 +136,13 @@ def test_multi_argv_is_unchanged_when_the_flag_is_not_supplied(workspace, monkey
     run_dir = _flag(argv, "--output-dir")
     # The FULL token list, in order: this is the whole "byte-identical to the old argv"
     # claim. Anything appended, reordered or normalised shows up here.
+    #
+    # (`NV16`, 2026-11-17) The LAST token is `--no-allow-intraday`, not `--allow-intraday`:
+    # the TICKETING default stays False (this round writes `netted_trading_ticket.json`, so a
+    # caller that says nothing is told to NOT relax the post-close -> next-open window). The
+    # Stage-1 INSPECTION request defaults to True again -- one shared flag, split by path.
+    # That is the ONLY delta here -- this suite's subject (`--intraday-publish-after` is not
+    # appended when unsupplied) is untouched.
     assert argv == [
         st.python_executable,
         st.multi_netting_script,
@@ -161,6 +168,44 @@ def test_multi_argv_is_unchanged_when_the_flag_is_not_supplied(workspace, monkey
         START,
         "--cache-dir",
         st.cache_dir,
+        # (`NV16`) TICKETING path: default stays False -- an explicit opt-in is the only way to
+        # relax the run window on this round.
+        "--no-allow-intraday",
+    ]
+
+
+def test_multi_explicit_true_still_relaxes_the_window(workspace, monkeypatch):
+    """The netted default stays `False`, but an explicit `True` must still flip the token."""
+    argv, _summary = _run_multi(workspace, monkeypatch, allow_intraday=True)
+
+    st = workspace["storage"]
+    run_dir = _flag(argv, "--output-dir")
+    assert argv == [
+        st.python_executable,
+        st.multi_netting_script,
+        "--strategies",
+        "chan_four_state_shield_blend:1.0",
+        "--universe-file",
+        os.path.join(run_dir, "resolved_universe.txt"),
+        "--portfolio-value",
+        "100000.0",
+        "--current-holdings-file",
+        os.path.join(run_dir, "holdings.json"),
+        "--output-dir",
+        run_dir,
+        "--data-provider",
+        "synthetic",
+        "--min-holding-bars",
+        "2",
+        "--inertia-threshold",
+        "0.05",
+        "--as-of-date",
+        AS_OF,
+        "--start-date",
+        START,
+        "--cache-dir",
+        st.cache_dir,
+        # The explicit opt-in -- NOT the fail-closed default.
         "--allow-intraday",
     ]
 

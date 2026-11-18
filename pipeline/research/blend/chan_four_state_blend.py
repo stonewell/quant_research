@@ -89,10 +89,22 @@ class ChanFourStateBlendStrategy(BaseBlendAllocationStrategy):
     #   CAGR 14.19% -> 6.04% for a Sharpe change whose bootstrap CI straddles 0
     #   (`backtests_research/20261116_131625_volscope_ablation/`). Portfolio scope binds on ~17%
     #   of days with CAGR ~13.2%. This changes DELIVERED LIVE EXPOSURE, hence a MINOR bump;
-    #   `blend_base.py` sizing is untouched and `BASE_VERSION` stays `2.0.0` (bumping it would
-    #   make `scripts/live_preflight.py::select_prior_state`'s exact-string comparison skip the
-    #   previous snapshot and cold-start the book). See docs/version.md §46.
-    version: str = "1.5.0"
+    #   `blend_base.py` sizing is untouched and `BASE_VERSION` stayed `2.0.0` at the time.
+    #   A same-MAJOR bump never cold-starts the book:
+    #   `scripts/live_preflight.py::select_prior_state` compares MAJORS only
+    #   (`_version_majors_match`, `NV8`), so the `2.0.0 -> 2.1.0` bump below keeps the
+    #   previous snapshot admissible -- only a different MAJOR refuses it.
+    #   See docs/version.md §46.
+    # 1.5.0 -> 1.6.0 (2026-11-17, Track-T retirement): the six blend-side 5m FEATURE switches
+    #   (`blend_enable_intraday_5m` / `blend_enable_5m_interval_nesting` /
+    #   `blend_intraday_upvol_thresh` / `blend_use_intraday_downside_vol` /
+    #   `blend_enable_5m_stop_filter` / `blend_intraday_cutoff_time` and their unprefixed
+    #   aliases) are DELETED from `StrategyConfig` and from `blend_base.py`, together with
+    #   every 5m column read they gated. The honoured-parameter surface of this class
+    #   therefore changed, hence a MINOR bump; DELIVERED WEIGHTS DO NOT MOVE (no deployed
+    #   config or dump ever enabled one, and the flag-off branch is what every read now is).
+    #   `BASE_VERSION` takes the matching MINOR bump `2.0.0 -> 2.1.0`. See docs/version.md §47.
+    version: str = "1.6.0"
 
     def __init__(self, config: Optional[StrategyConfig] = None, version: Optional[str] = None):
         cfg = config or StrategyConfig()

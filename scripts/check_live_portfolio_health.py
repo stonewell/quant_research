@@ -454,11 +454,14 @@ def parse_args(args: Optional[List[str]] = None):
     )
     parser.add_argument(
         "--cutoff-time",
-        default="14:00",
+        default="15:00",
         help=(
             "Intraday cutoff time for Stage 1, expressed in the MARKET's local wall clock (not the "
-            "host's; default: 14:00, 36 5m bars). Used only for 5m microstructure/drawdown monitoring; "
-            "daily-bar valuation always uses the as-of session from the market clock."
+            "host's; default: the FULL session, 15:00 / 48 5m bars). Live runs are post-close only, "
+            "so the default truncates nothing. An earlier value (e.g. 14:00) narrows the 5m "
+            "microstructure/drawdown information set only -- daily-bar valuation always uses the "
+            "as-of session from the market clock, and a complete official daily bar is never "
+            "overwritten by a truncated 5m aggregation."
         ),
     )
     parser.add_argument(
@@ -4751,9 +4754,10 @@ def main(cli_args: Optional[List[str]] = None):
         "orthogonalization": params.get("blend_enable_orthogonalization", True),
     }
 
-    enable_intraday_5m = getattr(args, "enable_intraday_5m", False) or bool(
-        resolve_blend_param(params, "enable_intraday_5m", False, bool)
-    )
+    # (2026-11-17 owner ruling) CLI ONLY: the blend 5m FEATURE switches are deleted, so there
+    # is no `enable_intraday_5m` strategy param left to OR in. Web Station always appends
+    # `--enable-intraday-5m`, so the deployed Stage-1 run keeps its 5m refresh.
+    enable_intraday_5m = bool(getattr(args, "enable_intraday_5m", False))
 
     if getattr(args, "refresh_data", True):
         refresh_summary = refresh_stage1_data(
@@ -4947,9 +4951,10 @@ def main(cli_args: Optional[List[str]] = None):
     )
 
     # 4. Evaluate Universe Breadth, Thrust & Volatility (and optional 5m Intraday Enrichment)
-    enable_intraday_5m = getattr(args, "enable_intraday_5m", False) or bool(
-        resolve_blend_param(params, "enable_intraday_5m", False, bool)
-    )
+    # (2026-11-17 owner ruling) CLI ONLY -- the blend 5m FEATURE switches are deleted, so there
+    # is no `enable_intraday_5m` strategy param to OR in. Web Station appends the flag, so the
+    # deployed Stage-2 run is unaffected.
+    enable_intraday_5m = bool(getattr(args, "enable_intraday_5m", False))
     # (2026-11-13) WHICH provider serves the 5m BARS, resolved through the SAME chain as
     # the switch above (`cfsb_intraday_5m_provider` -> `blend_intraday_5m_provider` ->
     # `intraday_5m_provider`). `None` = today's behaviour: use the run-level
@@ -5035,7 +5040,7 @@ def main(cli_args: Optional[List[str]] = None):
             # exactly the object/behaviour this block had before the pin existed.
             _5m_provider_name = _intraday_5m_provider_resolved or args.data_provider
             provider_5m = get_data_provider(_5m_provider_name, **build_data_kwargs(args))
-            cutoff_t = getattr(args, "cutoff_time", "14:00") or "14:00"
+            cutoff_t = getattr(args, "cutoff_time", "15:00") or "15:00"
             # (2026-11-15 incident) The 5m window is BOUNDED and INDEPENDENT of the daily
             # `--start-date`. It used to be forwarded verbatim, so `--start-date 2024-01-01`
             # made this loader re-download ~2 years x 20 symbols of BaoStock 5m bars over the
@@ -5068,7 +5073,8 @@ def main(cli_args: Optional[List[str]] = None):
                 start=intraday_5m_start,
                 end=as_of_date,
                 data_provider=provider_5m,
-                cutoff_time=cutoff_t,
+                # (2026-11-17) No `cutoff_time`: the loader's dead `cutoff_time` parameter was
+                # dropped; the cutoff is applied by the `IntradayFeatureConfig` two lines below.
                 # The same cache directory every other Stage-1 read uses. It was accepted as a
                 # kwarg but never forwarded here, so the candidate paths resolved CWD-relative
                 # and a run started elsewhere would have missed the warm cache entirely.
@@ -5079,7 +5085,7 @@ def main(cli_args: Optional[List[str]] = None):
                 verbose=True,
             )
             universe = enrich_universe_with_intraday_features(
-                universe, universe_5m, config=IntradayFeatureConfig(cutoff_time=cutoff_t), synthesize_intraday_bar=True
+                universe, universe_5m, config=IntradayFeatureConfig(cutoff_time=cutoff_t)
             )
 
             # (2026-10-22 incident, Fix 1) HONESTY GATE. This block used to

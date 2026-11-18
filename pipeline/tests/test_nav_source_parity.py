@@ -196,7 +196,10 @@ def _five_minute_frames(symbols, start=None, end=None, data_provider=None, cutof
     return frames
 
 
-def _enrich(universe, universe_5m, config=None, synthesize_intraday_bar=False):
+# (2026-11-17) The `synthesize_intraday_bar` kwarg was DELETED from the production
+# signature along with the daily-bar synthesis path; this double mirrors the new signature so
+# a stale call site would fail loudly here too.
+def _enrich(universe, universe_5m, config=None):
     """Attach MEASURED 5m features so the distribution gate is EVALUATED, not SKIPPED.
 
     The values deliberately trip the afternoon-distribution alert (breadth 0.0 < 25%,
@@ -599,7 +602,7 @@ def _stale_5m_with_fallback(symbols, start=None, end=None, data_provider=None, c
     return frames
 
 
-def _no_features(universe, universe_5m, config=None, synthesize_intraday_bar=False):
+def _no_features(universe, universe_5m, config=None):
     """No measured microstructure columns -> the distribution gate cannot be evaluated."""
     return dict(universe)
 

@@ -55,6 +55,31 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 
+def _new_empty_bucket_warn_state() -> Dict[str, Any]:
+    """Fresh counter state for the empty-style-bucket warning dedupe (log only).
+
+    Keys:
+    - `bars`  : regime-weighted bars seen in the current weight computation.
+    - `hits`  : those bars whose style buckets were incomplete.
+    - `first_date` / `last_date` : the first / last such bar label.
+    - `combos`       : every distinct empty-bucket combination seen, in order.
+    - `warned`       : whether the run's FIRST warning has been emitted.
+    - `warned_combos`: combinations already warned about (each warns at most once).
+
+    Pure bookkeeping -- nothing downstream of the weight computation reads this,
+    so changing it cannot move a weight, a bucket budget or a return value.
+    """
+    return {
+        "bars": 0,
+        "hits": 0,
+        "first_date": None,
+        "last_date": None,
+        "combos": [],
+        "warned": False,
+        "warned_combos": set(),
+    }
+
+
 CHINA_EQUITY_SECTORS = {
     "601225.SH": "coal", "601088.SH": "coal",
     "601857.SH": "oil_petrochem", "600028.SH": "oil_petrochem",
@@ -164,9 +189,16 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
     Encapsulates risk management, breadth detection, drawdown circuit breakers,
     Garman-Klass volatility targeting, ATR chandelier trailing stops, sector throttling,
     and adaptive turnover filters so any blend strategy can inherit them cleanly.
+
+    `BASE_VERSION 2.1.0` (2026-11-17 owner ruling) DELETED the six Track-T 5m FEATURE
+    switches and every column read they gated -- a MINOR bump because behaviour is
+    unchanged for every deployed strategy (none ever enabled a switch; the ablation was
+    a refuted negative result) and only a never-enabled parameter surface disappears.
+    `intraday_5m_provider` is deliberately KEPT: it routes 5m BARS for Stage-1 metrics
+    and the ticket fields, not blend features.
     """
 
-    BASE_VERSION: str = "2.0.0"
+    BASE_VERSION: str = "2.1.0"
     version: str = "1.0.0"
 
     def __init__(
@@ -186,7 +218,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             self.config = config
         self.param_prefix = param_prefix
         self.alt_param_prefixes = alt_param_prefixes or []
-        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "2.0.0")
+        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "2.1.0")
         strat_version: str = version or getattr(self.__class__, "version", "1.0.0")
         tags = factor_tags or [
             "regime_trend_strength",
@@ -195,6 +227,15 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             "volatility_targeting",
         ]
         super().__init__(name=name, param_grid={}, factor_tags=tags, version=strat_version)
+        # --- (2026-11-17, observability-only) Empty-style-bucket warning dedupe.
+        # `_compute_adaptive_weights` used to emit the SAME warning on EVERY bar
+        # with an incomplete style-bucket classification -- in practice on every
+        # bar of a multi-year run (measured on a live `deploy_stderr`: 28,286
+        # lines, 89.8% of the whole log), which buried the warnings that matter.
+        # This dict is pure log bookkeeping: no weight / bucket / budget / return
+        # value below is ever read from it, and every mutation is exception-guarded
+        # so the log path cannot raise into the weight computation.
+        self._eb_warn_state: Dict[str, Any] = _new_empty_bucket_warn_state()
 
     def get_version_info(self, params: Optional[dict] = None) -> Dict[str, Any]:
         sub_strats = {}
@@ -463,6 +504,94 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         except Exception:
             return sub_weights_matrix.copy()
 
+    def _note_regime_weighting_bar(self, empty_buckets: List[str], date: Any) -> None:
+        """Bounded logging for "empty style bucket(s)" -- observability ONLY.
+
+        WHY THIS EXISTS (2026-11-17): the 2026-10-22 incident guard below used to
+        `_LOGGER.warning(...)` on every affected bar. A blend deployed without a
+        `reversal` leg has that bucket empty on EVERY bar by construction, so a
+        live `deploy_stderr` measured 28,286 lines / 89.8% of log volume from this
+        one message, drowning the warnings that matter. The signal itself is NOT
+        dropped -- the guard exists because a silently renormalized budget can
+        concentrate the portfolio.
+
+        WHICH SCHEME (the brief allowed two): an end-of-run hook IS reachable, so
+        this uses the counter + summary form -- the FIRST occurrence of each
+        distinct empty-bucket combination warns with its full `date` and the exact
+        legacy wording, every repeat is counted silently, and
+        `_flush_empty_bucket_warning_summary` logs ONE summary when
+        `generate_weights` returns. The per-bar "coarse cadence" fallback was not
+        needed; re-warning only when the COMBINATION changes already bounds the
+        emissions at 7 (the number of non-empty subsets of the three buckets).
+
+        Never raises: the whole body is exception-guarded, and mutating this state
+        cannot change any weight (no code path reads it back into a calculation).
+        """
+        try:
+            st = self._eb_warn_state
+            st["bars"] += 1
+            if not empty_buckets:
+                return
+            st["hits"] += 1
+            st["last_date"] = date
+            if st["first_date"] is None:
+                st["first_date"] = date
+            key = tuple(empty_buckets)
+            if key not in st["combos"]:
+                st["combos"].append(key)
+            if not st["warned"]:
+                st["warned"] = True
+                st["warned_combos"].add(key)
+                _LOGGER.warning(
+                    "regime weighting: empty style bucket(s) %s at date=%s — sub-strategy "
+                    "style classification may be incomplete (first occurrence in this weight "
+                    "computation; repeats are counted and summarised once at the end)",
+                    empty_buckets,
+                    date,
+                )
+            elif key not in st["warned_combos"]:
+                # A NEW combination is new information (it names style legs that were
+                # not previously empty), so it gets its own warning -- still bounded
+                # by the 7 possible subsets, not by the bar count.
+                st["warned_combos"].add(key)
+                _LOGGER.warning(
+                    "regime weighting: empty style bucket(s) %s at date=%s — sub-strategy "
+                    "style classification may be incomplete (NEW combination; %d affected "
+                    "bar(s) so far in this weight computation)",
+                    empty_buckets,
+                    date,
+                    st["hits"],
+                )
+        except Exception:  # noqa: BLE001 - logging must never raise into the weight path
+            pass
+
+    def _flush_empty_bucket_warning_summary(self) -> None:
+        """One summary line per weight computation for the empty-bucket guard.
+
+        Called by `generate_weights` AFTER the sparse weights are produced (so no
+        value can depend on it). Emits nothing when no bar was affected. Reports
+        occurrences vs. regime-weighted bars, first/last date, the union of empty
+        bucket combinations, and how many repeat warnings were suppressed.
+        """
+        try:
+            st = self._eb_warn_state
+            if not st["hits"]:
+                return
+            _LOGGER.warning(
+                "regime weighting summary: empty style bucket(s) on %d of %d regime-weighted "
+                "bar(s) in this computation (first date=%s, last date=%s, combinations=%s, "
+                "%d repeat warning(s) suppressed) — sub-strategy style classification may be "
+                "incomplete",
+                st["hits"],
+                st["bars"],
+                st["first_date"],
+                st["last_date"],
+                [list(k) for k in st["combos"]],
+                max(0, st["hits"] - len(st["warned_combos"])),
+            )
+        except Exception:  # noqa: BLE001 - logging must never raise into the weight path
+            pass
+
     def _compute_adaptive_weights(
         self,
         sub_strats: Dict[str, AllocationTemplate],
@@ -561,12 +690,18 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             # concentrated the portfolio (e.g. defensive bucket jump). Warn so a
             # missing classification is visible instead of silently renormalizing.
             empty_buckets = [b for b in ("momentum", "reversal", "defensive") if not bucket_members[b]]
-            if empty_buckets:
-                _LOGGER.warning(
-                    "regime weighting: empty style bucket(s) %s at date=%s — sub-strategy style classification may be incomplete",
-                    empty_buckets,
-                    date,
-                )
+            # (2026-11-17 人工批准的例外，历史说明) 仅日志去重，不改任何数值/权重/风控；
+            # 当时按 AGENTS §7 本应升 BASE_VERSION，因实盘账簿冷启动顾虑（当时的 prior-state
+            # 门禁是**精确字符串**比较）获准免升。该顾虑随后被 `NV8` 的同 major 容差解除
+            # （`scripts/live_preflight.py::_version_majors_match`），故 2.0.0 -> 2.1.0 已随
+            # Track T 退役落实，且 2.0.0 的旧快照在 2.1.0 下**仍可采纳**。若日后在此处做功能
+            # 性改动，升版义务照旧。
+            #
+            # (2026-11-17, observability-only) First occurrence + each new combination
+            # warn, repeats are counted, one summary is flushed when `generate_weights`
+            # returns. `empty_buckets` itself is untouched and the renormalization right
+            # below is byte-for-byte the previous behaviour.
+            self._note_regime_weighting_bar(empty_buckets, date)
             _LOGGER.debug(
                 "regime weighting bar=%s breadth=%.3f thrust=%.3f budgets=%s members=%s",
                 date, breadth_val, thrust, budgets, {b: len(v) for b, v in bucket_members.items()},
@@ -641,6 +776,11 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
         cfg = self.config
         p = params or {}
+        # (2026-11-17, observability-only) Restart the empty-style-bucket warning
+        # counters for THIS weight computation; their one-line summary is logged
+        # just before this method returns. Log bookkeeping only -- no value below
+        # reads it.
+        self._eb_warn_state = _new_empty_bucket_warn_state()
 
         # Core parameters with institutional defaults
         cash_proxy = self.resolve_param(p, "cash_proxy", getattr(cfg, "cash_proxy", "BIL"), str)
@@ -711,13 +851,17 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         thrust_exit_thresh = self.resolve_param(p, "thrust_exit_thresh", 0.58, float)
         bucket_renorm_max_delta = self.resolve_param(p, "bucket_renorm_max_delta", None, float)
 
-        # 5-Minute Intraday Microstructure & Interval Nesting Parameters
-        enable_intraday_5m = self.resolve_param(p, "enable_intraday_5m", False, bool)
-        enable_5m_interval_nesting = self.resolve_param(p, "enable_5m_interval_nesting", False, bool)
-        intraday_upvol_thresh = self.resolve_param(p, "intraday_upvol_thresh", 0.58, float)
-        use_intraday_downside_vol = self.resolve_param(p, "use_intraday_downside_vol", False, bool)
-        enable_5m_stop_filter = self.resolve_param(p, "enable_5m_stop_filter", False, bool)
-        intraday_cutoff_time = self.resolve_param(p, "intraday_cutoff_time", "14:15", str)
+        # (2026-11-17 owner ruling) The six 5m FEATURE parameter reads that used to sit
+        # here (`enable_intraday_5m` / `enable_5m_interval_nesting` /
+        # `intraday_upvol_thresh` / `use_intraday_downside_vol` /
+        # `enable_5m_stop_filter` / `intraday_cutoff_time`) are DELETED with their
+        # `StrategyConfig` fields and every column-read block they gated. Track-T was a
+        # refuted negative result (`docs/reports/china/ablation_intraday_5m_report.md`:
+        # M1 == M0 on every column, M2/M3/M4 degrade Sharpe 0.210 -> 0.135, ERS
+        # UNTRUSTED at percentile 1.0%) and no deployed strategy enabled one. The
+        # `intraday_cutoff_time` local here was in fact DEAD -- never read again in this
+        # module; the effective cutoff has always come from the caller
+        # (`backtester/run_backtest.py`, `scripts/run_live_multi_strategy.py`).
 
         # Track C Multi-Theory Quantitative Synthesis Parameters (Anchors 1-5)
         enable_structural_regime = self.resolve_param(p, "enable_structural_regime", True, bool)
@@ -797,34 +941,14 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                     v = df_s["Volume"].reindex(master_index).ffill()
                     v_ma20 = sma(v, 20)
                     base_surge = (v >= 1.2 * v_ma20)
-                    if enable_intraday_5m and "UpVol_Ratio_5m" in df_s.columns:
-                        up_vol_s = df_s["UpVol_Ratio_5m"].reindex(master_index)
-                        if "VWAP_Prem_5m" in df_s.columns:
-                            vwap_prem_s = df_s["VWAP_Prem_5m"].reindex(master_index)
-                            vwap_ok = vwap_prem_s.isna() | (vwap_prem_s >= 0.0)
-                        elif "VWAP" in df_s.columns:
-                            vwap_s = df_s["VWAP"].reindex(master_index)
-                            vwap_ok = vwap_s.isna() | (c >= vwap_s)
-                        else:
-                            vwap_ok = True
-                        up_vol_ok = up_vol_s.isna() | (up_vol_s >= intraday_upvol_thresh)
-                        vol_surge_matrix[sym] = (base_surge & up_vol_ok & vwap_ok).astype(float)
-                    else:
-                        vol_surge_matrix[sym] = base_surge.astype(float)
+                    vol_surge_matrix[sym] = base_surge.astype(float)
                     vol_breakout_matrix[sym] = ((v >= 1.5 * v_ma20) & (v_ma20 > 0)).astype(float).fillna(0.0)
                 else:
                     vol_surge_matrix[sym] = 1.0
                     vol_breakout_matrix[sym] = 0.0
 
                 asset_returns[sym] = c.pct_change().fillna(0.0)
-                if use_intraday_downside_vol and "RS_Down_5m" in df_s.columns:
-                    rs_down = df_s["RS_Down_5m"].reindex(master_index)
-                    # 21-day rolling mean of (2 * RS_Down_5m), annualized by sqrt(252)
-                    df_sym = df_s.reindex(master_index).ffill()
-                    gk_fallback = _compute_garman_klass_vol(df_sym, 21, target_vol)
-                    downside_vol = np.sqrt(252.0 * (2.0 * rs_down).rolling(21, min_periods=5).mean())
-                    asset_vol_21d[sym] = downside_vol.fillna(gk_fallback).fillna(target_vol)
-                elif vol_model == "garman_klass":
+                if vol_model == "garman_klass":
                     df_sym = df_s.reindex(master_index).ffill()
                     asset_vol_21d[sym] = _compute_garman_klass_vol(df_sym, 21, target_vol)
                 else:
@@ -1048,16 +1172,9 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                     trailing_stop_p = asset_entry_price[s] * 0.92
                                 if curr_p < trailing_stop_p:
                                     is_stopped = True
-                                    # Anti-washout stop loss exemption (morning dip recovery filter)
-                                    if enable_5m_stop_filter and curr_p >= trailing_stop_p * 0.97:
-                                        if s in universe and not universe[s].empty:
-                                            df_u = universe[s]
-                                            if "Afternoon_Low_5m" in df_u.columns and date in df_u.index:
-                                                aft_low = df_u.loc[date, "Afternoon_Low_5m"]
-                                                vwap_prem = df_u.loc[date, "VWAP_Prem_5m"] if "VWAP_Prem_5m" in df_u.columns else np.nan
-                                                upvol = df_u.loc[date, "UpVol_Ratio_5m"] if "UpVol_Ratio_5m" in df_u.columns else np.nan
-                                                if pd.notna(aft_low) and aft_low >= trailing_stop_p and (pd.isna(vwap_prem) or vwap_prem >= 0.0) and (pd.isna(upvol) or upvol >= 0.60):
-                                                    is_stopped = False
+                                    # (2026-11-17 owner ruling) The anti-washout 5m
+                                    # exemption that used to live here is DELETED with
+                                    # `enable_5m_stop_filter`.
 
                                 # Track C Anchor 5: Naked POC profit taking protection
                                 if not is_stopped and enable_structural_chandelier_stop and asset_entry_price[s] and curr_p >= asset_entry_price[s] * 1.10:
@@ -1073,15 +1190,11 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                                     if curr_p >= float(npoc_val) and float(div_val) < -1.0:
                                                         is_stopped = True
 
-                                # Sub-level 3S take-profit lock:
-                                # When holding asset with floating profit >= 8% from entry, and pullback from peak >= 2 * ATR
-                                if not is_stopped and asset_entry_price[s] and (curr_p >= asset_entry_price[s] * 1.08 or peak_p >= asset_entry_price[s] * 1.08):
-                                    if curr_p <= peak_p - 2.0 * cur_atr:
-                                        if (enable_intraday_5m or enable_5m_stop_filter) and s in universe and not universe[s].empty:
-                                            df_u = universe[s]
-                                            if "Chan_5m_Sell_Trigger" in df_u.columns and date in df_u.index:
-                                                if df_u.loc[date, "Chan_5m_Sell_Trigger"] == 1:
-                                                    is_stopped = True
+                                # (2026-11-17 owner ruling) The "Sub-level 3S take-profit
+                                # lock" that used to sit here is DELETED: its entire body
+                                # was gated on `enable_intraday_5m or enable_5m_stop_filter`
+                                # and its only action ran inside that test, so removing the
+                                # two enclosing branch headers changes no outcome.
                             elif stop_mode == "fixed_pct":
                                 if curr_p < asset_entry_price[s] * 0.92:
                                     is_stopped = True
@@ -1352,15 +1465,11 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                         if float(vol_surge_matrix.iloc[t][s]) > 0.5:
                                             conf_count += 1
                                         damping_5m = 1.0
-                                        if enable_intraday_5m and s in universe and not universe[s].empty:
-                                            df_u = universe[s]
-                                            if date in df_u.index:
-                                                q_val = float(df_u.loc[date, "SmartMoney_Q_5m"]) if "SmartMoney_Q_5m" in df_u.columns and pd.notna(df_u.loc[date, "SmartMoney_Q_5m"]) else 0.0
-                                                up_val = float(df_u.loc[date, "UpVol_Ratio_5m"]) if "UpVol_Ratio_5m" in df_u.columns and pd.notna(df_u.loc[date, "UpVol_Ratio_5m"]) else 0.5
-                                                if q_val < -0.002 and up_val >= 0.55:
-                                                    conf_count += 1
-                                                elif up_val < 0.42:
-                                                    damping_5m = 0.5
+                                        # (2026-11-17 owner ruling) The 5m SmartMoney/UpVol
+                                        # adjustment that used to recompute `damping_5m`
+                                        # here is DELETED; the local stays 1.0 so the
+                                        # `c_mult *= damping_5m * damping_vp` line below is
+                                        # bit-identical to the flag-off path.
 
                                         # Track C Anchor 3: VP Confluence & Wyckoff Effort-Result Sizing
                                         #
@@ -1418,11 +1527,9 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                         a2_bonus = max(0.0, float(sub_daily["wq_alpha2"].loc[date, s]))
 
                                     base_score = r_val * (1.0 + 5.0 * a2_bonus) * c_mult
-                                    if enable_intraday_5m and s in universe and not universe[s].empty:
-                                        df_u = universe[s]
-                                        if "SmartMoney_Q_5m" in df_u.columns and date in df_u.index:
-                                            q_sm = float(df_u.loc[date, "SmartMoney_Q_5m"]) if pd.notna(df_u.loc[date, "SmartMoney_Q_5m"]) else 0.0
-                                            base_score *= (1.0 + 3.0 * max(0.0, -q_sm))
+                                    # (2026-11-17 owner ruling) The 5m SmartMoney_Q
+                                    # risk-off multiplier that used to apply to `base_score`
+                                    # here is DELETED with `enable_intraday_5m`.
                                     if t > 0:
                                         prev_date = master_index[t - 1]
                                         if float(desired_weights.loc[prev_date, s]) > 1e-4:
@@ -1601,14 +1708,10 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                             if entry_signal_bars[s] < min_entry_bars:
                                 if is_vol and is_breadth:
                                     entry_signal_bars[s] = min_entry_bars  # Fast-path bypass Day 1 confirmation (strict confluence)
-                                elif (enable_intraday_5m or enable_5m_interval_nesting) and s in universe and not universe[s].empty:
-                                    df_u = universe[s]
-                                    if "Chan_5m_Buy_Confluence" in df_u.columns and date in df_u.index:
-                                        c_conf = df_u.loc[date, "Chan_5m_Buy_Confluence"]
-                                        upvol = df_u.loc[date, "UpVol_Ratio_5m"] if "UpVol_Ratio_5m" in df_u.columns else np.nan
-                                        vwap_prem = df_u.loc[date, "VWAP_Prem_5m"] if "VWAP_Prem_5m" in df_u.columns else np.nan
-                                        if c_conf == 2 and (pd.isna(upvol) or upvol >= intraday_upvol_thresh) and (pd.isna(vwap_prem) or vwap_prem >= 0.0):
-                                            entry_signal_bars[s] = min_entry_bars  # Fast-track entry Day 1 bypass
+                                # (2026-11-17 owner ruling) The `elif` 5m Buy-Confluence
+                                # fast-track that used to sit between these two branches is
+                                # DELETED; the spring branch is now the only alternative
+                                # fast-track, exactly as it was with the flags off.
                                 elif enable_spring_fast_entry and entry_signal_bars[s] == 1 and s in universe and not universe[s].empty:
                                     df_u = universe[s]
                                     if date in df_u.index and "wyckoff_spring" in df_u.columns and "extremum_curvature" in df_u.columns:
@@ -1657,20 +1760,10 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                         else:
                             expansion_signal_bars[s] = 0
 
-            # Sub-level veto for new entries (Task T3.1):
-            if (enable_intraday_5m or enable_5m_interval_nesting):
-                prev_date_w = master_index[t - 1] if t > 0 else None
-                for s in risky_symbols:
-                    prev_w = float(desired_weights.loc[prev_date_w, s]) if prev_date_w is not None else 0.0
-                    target_w = float(raw_w[s])
-                    if prev_w <= 1e-4 and target_w >= entry_thresh:
-                        if s in universe and not universe[s].empty:
-                            df_u = universe[s]
-                            if "Chan_5m_Sell_Trigger" in df_u.columns and date in df_u.index:
-                                if df_u.loc[date, "Chan_5m_Sell_Trigger"] == 1:
-                                    aft_ret = df_u.loc[date, "Afternoon_Ret_5m"] if "Afternoon_Ret_5m" in df_u.columns else 0.0
-                                    if pd.notna(aft_ret) and aft_ret < -0.015:
-                                        raw_w[s] = 0.0  # Sub-level veto on entry
+            # (2026-11-17 owner ruling) The "Sub-level veto for new entries (Task T3.1)"
+            # block that stood here is DELETED whole: it was gated on
+            # `enable_intraday_5m or enable_5m_interval_nesting` and every action inside
+            # ran under that test.
 
             # Track C Anchor 4: Extreme kinetic top divergence veto for new entries when min_entry_bars <= 1
             if min_entry_bars <= 1 and enable_spring_fast_entry:
@@ -1774,4 +1867,9 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         #
         # `SparseProjector.write` (M4.3) is deliberately NOT wired: the write-back
         # rule still belongs to `desired_weights`/the sequencer above.
-        return SparseProjector().project(daily_weights)
+        sparse_weights = SparseProjector().project(daily_weights)
+        # (2026-11-17, observability-only) End-of-computation summary for the
+        # empty-style-bucket guard. Logged AFTER the weights exist so the log path
+        # can never influence them (it is also exception-guarded).
+        self._flush_empty_bucket_warning_summary()
+        return sparse_weights

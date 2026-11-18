@@ -2582,7 +2582,15 @@ def test_app_js_badge_survives_legacy_archive_rows_without_blocking_reason():
 
 
 def test_request_models_intraday_and_refresh_defaults():
-    """Verify RunHealthRequest, RunDeployRequest, and MultiStrategyDeployRequest defaults."""
+    """Verify RunHealthRequest, RunDeployRequest, and MultiStrategyDeployRequest defaults.
+
+    (`NV16`, 2026-11-17) `allow_intraday` is SPLIT BY PATH: the two TICKETING requests default
+    to **False** (live ticketing is post-close -> next-open only, so the web form must not relax
+    the run window implicitly), while the Stage-1 INSPECTION request defaults back to **True**
+    (a health check emits no orders, so refusing it intraday only costs diagnostics).
+    The field is KEPT on all three and an explicit value still overrides in either direction,
+    which is asserted below so the split cannot decay into "field removed".
+    """
     from models import RunHealthRequest, RunDeployRequest, MultiStrategyDeployRequest
 
     health_req = RunHealthRequest(strategy_file="dummy.json")
@@ -2590,10 +2598,18 @@ def test_request_models_intraday_and_refresh_defaults():
     assert health_req.refresh_data is True
 
     deploy_req = RunDeployRequest(strategy_file="dummy.json")
-    assert deploy_req.allow_intraday is True
+    assert deploy_req.allow_intraday is False
 
     multi_req = MultiStrategyDeployRequest()
-    assert multi_req.allow_intraday is True
+    assert multi_req.allow_intraday is False
+
+    # Explicit override survives in BOTH directions on every path (the escape hatch must exist).
+    assert RunHealthRequest(strategy_file="dummy.json", allow_intraday=False).allow_intraday is False
+    assert RunHealthRequest(strategy_file="dummy.json", allow_intraday=True).allow_intraday is True
+    assert RunDeployRequest(strategy_file="dummy.json", allow_intraday=True).allow_intraday is True
+    assert RunDeployRequest(strategy_file="dummy.json", allow_intraday=False).allow_intraday is False
+    assert MultiStrategyDeployRequest(allow_intraday=True).allow_intraday is True
+    assert MultiStrategyDeployRequest(allow_intraday=False).allow_intraday is False
 
 
 def test_execution_service_intraday_and_refresh_flags(temp_workspace, monkeypatch):
@@ -2616,7 +2632,15 @@ def test_execution_service_intraday_and_refresh_flags(temp_workspace, monkeypatc
 
     monkeypatch.setattr(subprocess, "run", mock_run)
 
-    # 1. Health check with default allow_intraday=True, refresh_data=True
+    # 1. Health check: DEFAULT allow_intraday is True again (`NV16` split -- the inspection
+    #    path emits no orders), then both explicit values still reach the child argv.
+    service.run_health_check(
+        strategy_file="dummy.json",
+        universe_file="dummy.txt",
+        data_provider="synthetic",
+    )
+    assert "--allow-intraday" in captured_cmds[-1]
+
     service.run_health_check(
         strategy_file="dummy.json",
         universe_file="dummy.txt",
@@ -2640,7 +2664,16 @@ def test_execution_service_intraday_and_refresh_flags(temp_workspace, monkeypatc
     assert "--no-allow-intraday" in cmd2
     assert "--no-refresh-data" in cmd2
 
-    # 3. Deploy check with allow_intraday=True and allow_intraday=False
+    # 3. Deploy check: DEFAULT is still False (`NV16` -- ticketing), and explicit values flip.
+    service.run_live_deploy(
+        strategy_file="dummy.json",
+        universe_file="dummy.txt",
+        data_provider="synthetic",
+        current_holdings={"600519.SH": 100},
+        nav_override=True,
+    )
+    assert "--no-allow-intraday" in captured_cmds[-1]
+
     service.run_live_deploy(
         strategy_file="dummy.json",
         universe_file="dummy.txt",
@@ -2666,7 +2699,14 @@ def test_execution_service_intraday_and_refresh_flags(temp_workspace, monkeypatc
     cmd3_no = captured_cmds[-1]
     assert "--no-allow-intraday" in cmd3_no
 
-    # 4. Multi-strategy deploy with allow_intraday=True and allow_intraday=False
+    # 4. Multi-strategy deploy: DEFAULT is still False (`NV16` -- ticketing), explicit flips.
+    service.run_multi_strategy_netted_deploy(
+        universe_file="dummy.txt",
+        data_provider="synthetic",
+        current_holdings={"600519.SH": 100},
+    )
+    assert "--no-allow-intraday" in captured_cmds[-1]
+
     service.run_multi_strategy_netted_deploy(
         universe_file="dummy.txt",
         data_provider="synthetic",

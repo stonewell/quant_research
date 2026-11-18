@@ -31,9 +31,12 @@ What this file pins, in one place:
      global `StrategyConfig` field and silently swapping a sub-strategy class.
   5. DEPLOYED CONFIG PIN -- `chan_four_state_blend` stays on
      `regime_ic_ir_hybrid` (documented exception, `docs/version.md` §8).
-  6. VERSION PIN -- `BaseBlendAllocationStrategy.BASE_VERSION == "2.0.0"`
-     (major: a flag branch was deleted, so the engine contract changed). A `1.9.0`
-     stamp here would let a dump claim a two-path engine that no longer exists.
+  6. VERSION PIN -- `BaseBlendAllocationStrategy.BASE_VERSION == "2.1.0"`
+     (`2.0.0` was the MAJOR bump for the deleted flag branch: the engine contract
+     changed. `2.1.0` (2026-11-17) is the MINOR bump that DELETED the six Track-T 5m
+     feature switches -- behaviour unchanged, only a never-enabled parameter surface
+     disappears). A `1.9.0` stamp here would let a dump claim a two-path engine that
+     no longer exists.
 
 100% offline: synthetic OHLCV only (`common.testing.make_ohlcv_from_closes`).
 """
@@ -599,10 +602,10 @@ def test_base_version_bumped_with_the_default_flip():
     bump -- a `1.9.0` stamp after D1 would let a dump advertise a two-path engine
     that cannot be reproduced, which is the 2026-11-02 "two version pairs" shape.
     """
-    assert BaseBlendAllocationStrategy.BASE_VERSION == "2.0.0"
+    assert BaseBlendAllocationStrategy.BASE_VERSION == "2.1.0"
     inst = GenericBlendStrategy()
-    assert inst.base_version == "2.0.0"
-    assert "base: v2.0.0" in inst.version_string
+    assert inst.base_version == "2.1.0"
+    assert "base: v2.1.0" in inst.version_string
 
 
 # ---------------------------------------------------------------------------

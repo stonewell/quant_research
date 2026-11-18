@@ -811,6 +811,30 @@ flowchart TD
 > （写链事务化与显式 `--peak` 上界，见 §2.27 表末补记），它**不属**策略 `version` / `BASE_VERSION` 两条轴，
 > 故仍零 `--dump-strategies`、零 `strategy_dumps/*.json` 重生成（留痕见 `docs/version.md` §45.6 / §46.7）。
 
+> **（2026-11-17 第五笔计数补记（`§2.27` 续登 `NV16`），只追加、不回改任何历史数字）**：
+> 新增 1 行 `NV16`（`[x]`，web `allow_intraday` 默认翻转为 `False` + 净额化多策略通道补装 D3
+> 执行可执行性门禁），登记 2026-11-17 业主裁定「实盘只在收盘后→次日开盘出票，盘中出票一律不合法」。
+> **收益落在已部署的单策略 web 路径**（默认不再放宽运行窗口）；净额化多策略通道经业主说明**目前未部署**，
+> 故其门禁是「**落地即闲置**」的**部署硬前置**（含 5m `cutoff_time` 14:00 / 14:15 的一行范围外观察），
+> 今天**不是**生产风险。它同时被补记为 `NV9` 的**前置**（`NV9` 行「前置依赖」列与第 5 项），
+> 但两行**不合并**、互不充当验收证据。
+> 本文件任务行实数 **118 → 119**（`[x]` **58 → 59**、`[ ]` **60 保持 60**）。
+> 分解口径：只做一步新增 1 行 `[x]`，故 `[x]` **+1** / 总行数 **+1**、`[ ]` 不变。
+> 计数由本文件自身 grep 逐项实测，三条命令及其结果：
+>
+> ```
+> grep -cE '^\| \*\*`[^`]+`\*\* \| `\[x\]`'  docs/development_plan.md   # 59
+> grep -cE '^\| \*\*`[^`]+`\*\* \| `\[ \]`'  docs/development_plan.md   # 60
+> grep -cE '^\| \*\*`[^`]+`\*\* \| `\[(x| )\]`' docs/development_plan.md  # 119
+> ```
+>
+> 三式互洽：**59 + 60 = 119**。`§2.27` 现为 **16 行** 实数 = **12 `[x]` + 4 `[ ]`**
+> （与 `grep -c '^| \*\*`NV' docs/development_plan.md` = **16** 逐位一致；此前实测 15 行 = 11 + 4）。
+> 顶部标题行与 `计数口径` 行的旧数字一律**不动**；本节**抬头**已同步为「16 项 = 12 `[x]` + 4 `[ ]`」。
+> 版本轴：本轮**零策略类 `version` 变动、零 `BASE_VERSION` 变动**（`NV16` 只动运行器时序门禁与 web
+> 请求默认值），故零 `--dump-strategies`、零 `strategy_dumps/*.json` 重生成；**`docs/version.md` 无需
+> 任何条目**（不是遗漏，是该文件的登记义务本来就不覆盖这两类改动，已在 `NV16` 第 8 项写明）。
+
 ### 2.3 《SuperTrend 自适应趋势跟踪与切面止损体系方案》原子任务表（`S1.1`–`S4.2`，共 7 个任务）（当前优先级：**Tier P5 孵化池**，不影响现有系统）
 
 | 任务编号 | 状态 | 任务名称 | 涉及核心文件与符号 | 核心交付内容与验收标准 (含单向棘轮机制与 8 大 Blend 锚点协同) | 配套离线单测 | 规模 | 前置依赖 |
@@ -1846,6 +1870,100 @@ flowchart TD
 > 本表上方 2026-11-12 计数补记之十七所记「8 项 = 4 `[x]` + 4 `[ ]`」等数字为登记时点快照，
 > 按「只追加、不回改」惯例保持原样，不回改、不重算。
 
+#### R6 负结果结项与默认翻转（2026-11-17，业主裁定）
+
+- **性质（同一状态位上的补记，不是重开）**：`R6` 在台账中**早已是 `[x]`**（2026-11-07 结项后按归档
+  规则移入 [`docs/development_plan_archive.md`](file:///home/stone/Work/github/quant/docs/development_plan_archive.md)
+  §2.20，该文件自述为**只读历史附录**、**禁止**在其中重开 / 回勾 / 追加任何行）。故本次**不重开、
+  不新增行、不改任何状态位、不改任何计数**：`[x]`/`[ ]` 两栏本文件实测**零变动**（详见下方计数段）。
+  本节登记的是**结项性质**（由「已落地」修正为「**已落地且按负结果结项**」）与**默认值翻转**。
+- **业主裁定（2026-11-17）**：`R6`（判据 `r6.3`）**退役默认开启并作为负结果结项**。理由不是样本不够，
+  而是**判据不可执行**：
+  1. 冻结目的只有一个 —— 「**今晚**愿意带多少暴露穿过隔夜跳空」，`D = 收盘 − 45min` 存在的唯一意义
+     是让决策**在收盘前**落地、由**当日**收盘附近成交承接（冻结书 §1.1 / §2）；
+  2. 现行部署口径是**收盘后出票 → 次日开盘成交**（`execution_session = as_of+1` /
+     `price_reference = next_open`，见 `LV2`），于是 `T` 日触发被**执行在 `T+1` 开盘**，
+     即**它要避开的那个 `T→T+1` 隔夜跳空已经发生之后**；
+  3. 剩下的只是一个**滞后一日的暴露倾斜**：触发量 `σ_gap(T)` 与 `T→T+1` 那一跳没有因果对应，
+     按冻结书 §7 失效条件第 1 条的精神已足以判「判据不可执行」，**不得**改写成「换一个执行口径就成立」。
+  4. 该结论**与 `14:15` 截止时刻无关**：本条只用日线 `Open`/`Close`，`D` 只是取价顺序的未来函数守卫；
+     即使盘前就跑，成交仍在 `T+1` 开盘。
+- **判据文档先行**：[`docs/overnight_derisk_judgement_freeze.md`](file:///home/stone/Work/github/quant/docs/overnight_derisk_judgement_freeze.md)
+  文末追加 **append-only** 的 `## Revision 2026-11-17`（原有正文与 `## Revision 2026-11-07b` 逐字保留），
+  记明不可执行性论证、**算术与阈值零重标定**、模块与用例保留作历史、默认翻转为 OFF、重新启用的门槛。
+  `DECISION_SPEC_VERSION` **仍为 `r6.3`**（判据规格标签，不是策略版本号，不随退役改动）。
+- **代码改动（仅默认值与随之的断言，零算术改动）**：
+  1. [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py)
+     `--enable-overnight-derisk`（`argparse.BooleanOptionalAction`）默认 `True` → **`False`**，
+     help 文案改写为「DEFAULT OFF / 负结果结项 / 显式开启仍完整可用」；开关**保留**，
+     `--overnight-derisk-ratio` 与 `OvernightDeriskConfig` 的装配链**不动**。
+  2. [`common/overnight_derisk.py`](file:///home/stone/Work/github/quant/common/overnight_derisk.py)
+     `OvernightDeriskConfig.enabled` 默认 `True` → **`False`**（避免未来新调用方默认继承已退役的加成层）；
+     docstring 中「默认 ON」那一句按修订段改写，并新增退役说明段。**其余一行未动**：
+     `minutes_before_close=45` / `gap_window=20` / `baseline_window=252` / `sigma_multiplier=2.0` /
+     `downscale_ratio=0.5`、三态词表、`apply_overnight_downscale` 的 NaN-vs-0.0 语义、
+     `resolve_decision_instant` 的几何守卫、`WARN` 全部原样。
+  3. **默认 OFF 的传播点是三条 argv**，三者都**不传**该开关，因此自动继承 OFF（无一行需要改写）：
+     web 的 `execution_service.run_live_deploy`（Stage 2）与 `run_health_check` → `--auto-run-stage2`
+     → [`check_live_portfolio_health.py`](file:///home/stone/Work/github/quant/scripts/check_live_portfolio_health.py)
+     `build_stage2_command`（**本来就没有**该 token）。全仓 `grep -rn "enable-overnight-derisk"`
+     （`*.py`，排除 `.venv`）只命中 `scripts/run_live_strategy.py` 与其用例，
+     `web/livetrading/` 与 `check_live_portfolio_health.py` **零命中** ⇒ **无任何一处硬编码 ON**。
+  4. 用例更新（[`pipeline/tests/test_overnight_derisk.py`](file:///home/stone/Work/github/quant/pipeline/tests/test_overnight_derisk.py)）：
+     `test_frozen_defaults_and_spec_version` 断言新默认 `enabled is False` 并保留
+     `OvernightDeriskConfig(enabled=True)` 一条；端到端 `TRIGGERED` 用例改为**显式**
+     `--enable-overnight-derisk`（证明显式开启仍完整可用）；「关掉即零改动」用例参数化为
+     `default_off` / `explicitly_off` 两态（默认不传开关时 `compute_gap_series` 一旦被调用即转红）；
+     `_r6_stage2_args` 显式带开关，避免默认翻转后这些用例**静默失效**。**文件级 42 → 43 例**。
+- **规则 9 证据（离线、只读缓存；诊断不是测试）**：部署面 = `chan_four_state_blend` × 宇宙
+  `custom_astock_202609_20_new`（20 只 A 股）× `china`，读数取自 `data/cache.duckdb`
+  （`FuyaoDataProvider`，即 runbook 的部署 provider；`hfq` 复权；窗口 `2024-01-02..2026-11-17`，
+  即该缓存里这 20 只标的的**单一复权基**密采区；`MarketDBDataProvider` 同窗口逐位复现同一结果）：
+
+  | 量 | 值 |
+  | :--- | :--- |
+  | 面板会话 / 可计算会话 | 695 / **424**（可计算起点 `2025-02-20`，即满 `20+252−1 = 271` 个有效 gap 日后的第一个会话） |
+  | `TRIGGERED` | **51**（占可计算 12.0%），首个 `2025-04-07`，末个 `2026-06-16` |
+  | `NOT_TRIGGERED` / `INSUFFICIENT_DATA` | 373 / **271**（全为可计算起点之前的会话） |
+  | 连续触发段 | 5 段，最长 **26** 个会话（`2026-02-06..2026-03-23`） |
+  | `T+1` 开盘执行后的隔夜效应（半仓 + 半现金@0，`delta = +0.5·r`） | 合计 **+4.36pp**，均值 `+0.085pp`，t=`+1.29`，赚 29 / 亏 22 |
+  | 同日（`T+1` 开盘→收盘）效应 | 合计 **+4.40pp**，均值 `+0.086pp`，t=`+1.69` |
+  | 合计（`T+1` 开盘→`T+2` 开盘） | 合计 **+8.76pp**，均值 `+0.172pp`，t=**`+1.56`**（不显著） |
+  | 被「晚一天」错过的那个跳空（`T` 收盘→`T+1` 开盘，未减仓） | 均值 **+0.055%**，t=`+0.61`（多数触发日的次日开盘微幅向上） |
+
+  **读法（不得美化）**：`R6` 在本窗口内**并非零触发**，但它（a）在 12% 的可计算会话上触发、最长连续
+  26 天，已经是「长期半仓」而不是偶发刹车；（b）按**现行 `T+1` 开盘成交口径**估算的收益差不显著
+  （t=1.56），且它真正想规避的那一跳在触发日平均是**向上**的 0.055% —— 即「想避的没避到、避到的是下一跳」。
+  这条统计本身**不是**结项理由（结项理由是第 2 条的不可执行性），它只用于证明「默认翻转没有可测的历史损失」：
+  该加成层在部署口径下的历史影响落在噪声带内。
+- **未做的事（明确边界）**：不改 `pipeline/research/blend/`（该目录下有与本条无关的在办改动）、
+  不改 `strategies_config.json`、不动 `chan_four_state_blend` 的任何钉住项、不碰 `R1`/`R4`/`R7` 的阈值、
+  不改 `minutes_before_close`（`14:15` 是另一个旋钮，见 `NV16` 第 9 项）、不动 `as_of+1` / `next_open` 枚举。
+- **版本轴：零**。零策略类 `version` 变动、零 `BASE_VERSION` 变动、零 `--dump-strategies`、
+  零 `strategy_dumps/*.json` 重生成；[`docs/version.md`](file:///home/stone/Work/github/quant/docs/version.md)
+  **无需任何条目**（不是遗漏：本条只改 `scripts/` 的一个默认值 + 一个纯模块的开关默认 + 文档）。
+
+> **（2026-11-17 计数补记之十九，只追加、不回改任何历史数字）**：`R6` 的上述补记为
+> **同一状态位上的性质修正 + 默认翻转**，**不新增行、不翻状态位**，故本文件任务行实数与
+> `[x]`/`[ ]` 两栏**均不变**。依据是两条机械观察，不是估算：
+>
+> ```
+> # 本轮改动是否新增/改动任何任务行？(只应为在办批次自带的 NV9 / NV16 两行)
+> git diff -- docs/development_plan.md | grep -E '^[+-]\| \*\*'
+> # 本文件计数口径实测（本次编辑后）
+> grep -cE '^\| \*\*`[^`]+`\*\* \| `\[x\]`'  docs/development_plan.md
+> grep -cE '^\| \*\*`[^`]+`\*\* \| `\[ \]`'  docs/development_plan.md
+> ```
+>
+> 第一条只回显 `NV9` / `NV16` 两行（**在办批次**的改动，非本节），即本节**零任务行**增删；
+> 后两条给出本文件当前实数 **59 `[x]` / 60 `[ ]`**（含在办批次的 `NV16` 一行），
+> 与本节无关、也不被本节改变 —— `R6` 行**不在本文件**：它自 2026-11-07 起就在归档 §2.20
+> 且已冻结为 `[x]`，而归档文件按文首第 2 条**禁止追加**。
+> 归档侧实测 **179 行 `[x]` / 0 行 `[ ]`**（该文件抬头所记「177」为其归档时点快照，本轮不回改）。
+> **声明**：本节不据此重算 `§2.20` 的任何历史项数口径（「6 项 = 5 `[x]` + 1 `[ ]`」等数字仍为
+> 各自登记时点快照）。
+
+
 ### 2.21 2026-10-30 / 2026-11-02 实盘运行复核衍生任务登记（`LV1`–`LV10`，共 10 个任务，2026-11-02 登记，全部 `[ ]` 未开工）**（2026-11-03 补记，不回改标题原数字）**：同日 `LV1` 结项（`[ ]` → `[x]`）并新登记 `LV11` / `LV12`（均 `[ ]`）后，本表实为 **12 个任务 = 1 `[x]` + 11 `[ ]`**；标题中的「共 10 个任务」「全部 `[ ]` 未开工」为 2026-11-02 登记时点留痕，不回改。**（2026-11-04 补记，不回改上句）**：`LV11` / `LV2` 结项（`[ ]` → `[x]`）并新登记 `LV13`（`[ ]`）后，本表实为 **13 个任务 = 3 `[x]` + 10 `[ ]`**；上句「12 个任务 = 1 `[x]` + 11 `[ ]`」为 2026-11-03 时点留痕，按「只追加、不回改」惯例保持原样。**（2026-11-04 补记之二，不回改上句）**：同日再登记 `LV14`–`LV18`（五行均 `[ ]`，纯登记、零代码改动）后，本表实为 **18 个任务 = 3 `[x]` + 15 `[ ]`**；上句「13 个任务 = 3 `[x]` + 10 `[ ]`」为同日**前一轮**的时点留痕，按「只追加、不回改」惯例保持原样。**（2026-11-05 补记）**：`LV13` 已闭环（`[ ]` → `[x]`），本表现行 **18 项 = 4 `[x]` + 14 `[ ]`**；上句「13 个任务 = 3 `[x]` + 10 `[ ]`」与其后的「18 个任务 = 3 `[x]` + 15 `[ ]`」均为各自时点留痕，不回改。`LV13` 的实现早于台账 —— 它随 §4.30 的 b1（commit `6152080`）于 2026-11-04 落地，本次只补状态位与验收证据。**（2026-11-05 补记之二）**：`LV12` 已闭环（`[ ]` → `[x]`），本表现行 **18 项 = 5 `[x]` + 13 `[ ]`**；上句「18 项 = 4 `[x]` + 14 `[ ]`」为同日时点留痕，不回改。**（2026-11-05 补记之三）**：`LV4` 已闭环（`[ ]` → `[x]`），本表现行 **18 项 = 6 `[x]` + 12 `[ ]`**；上句「18 项 = 5 `[x]` + 13 `[ ]`」为同日时点留痕，不回改。**（2026-11-05 补记之四）**：`LV5` 已闭环（`[ ]` → `[x]`），本表现行 **18 项 = 7 `[x]` + 11 `[ ]`**；上句「18 项 = 6 `[x]` + 12 `[ ]`」为同日时点留痕，不回改。
 
 > **编号与口径说明（2026-11-02 登记）**：
@@ -2102,6 +2220,44 @@ flowchart TD
 > 不新增也不修改本表或本文件的任务条目状态，计数保持不变：本表现行 **16 项 = 5 `[x]` + 11 `[ ]`**；
 > 本文件现存任务行实数 **50 项 = 5 `[x]` + 45 `[ ]`**，
 > 两文件合计 **227 = 182 `[x]` + 45 `[ ]`**（归档实测 177 `[x]` + 本文件 5）。
+> **（2026-11-17 `LV8` 执行记录：空风格桶告警「仅日志去重」，人工批准不升版——只追加，不改上文任何结论、
+> 不改任何计数）**：
+> ① **改动位置**：[`pipeline/research/blend/blend_base.py`](file:///home/stone/Work/github/quant/pipeline/research/blend/blend_base.py)
+> 的空风格桶分支（调用点 `:683-694`）：新增 `_new_empty_bucket_warn_state()`（`:58`）与实例计数器 `_eb_warn_state`
+> （`:231`）、`_note_regime_weighting_bar`（`:500`）、`_flush_empty_bucket_warning_summary`（`:561`）；
+> 计数器在每次 `generate_weights` 开头重置（`:773`），汇总在 `SparseProjector().project` **之后**、
+> 返回之前打印（`:1911`）。
+> ② **行为**：**首次**出现保留完整原告警（桶名 + 日期 + `style classification may be incomplete` 措辞，
+> 级别仍为 `warning`）；其后同一组合静默计数；**出现新组合**再告警一次（上限 7 = 三桶非空子集数，
+> 故未采用「按月粗粒度」回退方案）；每次权重计算末输出**一条**汇总（发生次数 / 该次计算内 regime 加权 bar
+> 总数 / 首末日 / 空桶组合并集 / 被抑制条数）。动机即本行已实测的事实：`cfsb` 三腿样式键为
+> `momentum`/`momentum`/`defensive`、**无 reversal 腿** ⇒ `reversal` 桶每 bar 必空，旧代码因此每 bar
+> 一条 `warning`（实盘 `deploy_stderr` 28,286 行 / 89.8% 日志量，见
+> `backtests_research/20261025_125300/ABLATION_AND_ANATOMY.md:400,407`「只打印首/末次并计数」的建议），
+> 真实告警被淹没。
+> ③ **零数值改动**：`empty_buckets` 构造、`bucket_members`、`budgets`、`active_budgets`/`norm_budgets`
+> 再归一化、钳位、权重与返回值**逐行未改**；计数器不被任何计算路径读取；两条日志路径整体 `try/except`
+> 包裹，不会抛异常进权重路径。实测：同一实例 300 个空桶 bar → **1 条**告警（原 300 条）；
+> 260 bar / 两类组合 → 2 条告警 + 1 条汇总。
+> ④ **版本轴：人工批准的例外，`BASE_VERSION` 保持 `2.0.0`**。按 `AGENTS.md` §7 修改 `blend_base.py`
+> 本应升 `BASE_VERSION`；但 [`scripts/live_preflight.py`](file:///home/stone/Work/github/quant/scripts/live_preflight.py)
+> `:1102-1106` 对 `base_version` 做**精确字符串匹配**，升版会把 `2026-11-16` / `2026-11-17` 快照判为
+> `base_version_mismatch` ⇒ 实盘账簿冷启动（丢失 `entry_price` -8% 止损锚、`holding_bars`、
+> `entry_streak` 与 `600362` / `000999` 两个冷却态）。经**人工明确批准**：不升版、
+> **不重导 `--dump-strategies`**（`strategy_dumps/*.json` 复归既有状态，
+> `chan_four_state_blend_strategy.json` sha256 `150b4294…810f6` 逐字节一致）、
+> **`docs/version.md` 不新增 2.1.0 节**（`grep -n "2\.1\.0" docs/version.md` 为空）。
+> 例外条已就地写入中文代码注释（`:686-689`）：日后在此处做**任何功能性改动**，升版义务照旧。
+> ⑤ **验证（全离线）**：`pipeline/research_strategy/tests/test_blend_strategy_versioning.py` **3 passed**；
+> `common/tests/test_strategy_versioning.py` **7 passed**；
+> `pipeline/tests/test_vol_scope_version_transition.py` **10 passed**；
+> `pipeline/research_strategy/tests` **631 passed + 1 xfailed**；直接调用 `assert_dump_version_parity`
+> （dump `1.5.0`/`2.0.0` vs 活类 `v1.5.0 [base: v2.0.0]`）**通过** ⇒ 11-16 / 11-17 快照仍可作前推源，
+> 树不再处于 fail-closed 中间态。
+> ⑥ **边界**：**`LV8` 的负结果结论（`chan_four_state` 零贡献）不因本条重开**，其预注册判据
+> （≥100 个有效交易日 / ≥2 年）不变；`chan_four_state_blend` 钉住的
+> `blend_weighting_mode="regime_ic_ir_hybrid"` 与 `blend_enable_orthogonalization` **未动**；
+> 无新任务登记、无计数变化、无下单影响。
 
 ### 2.22 接线任务登记（`W1`，2026-11-05 由用户裁定立项，1 项待办）
 
@@ -2543,7 +2699,7 @@ Track MS 确立**零存量污染、零 `BASE_VERSION = 2.0.0` 变更、零 58 �
 > 非策略逻辑变更**，仍只服务 `MS7`，**不得**回流 `ChanVolumeProfileHybridStrategy` /
 > `ChanFourStateExecutionStrategy` 或任何存量 blend 腿（`LV8` / `LV20` / `C4.1` / `C5.2` 的否决结论不变）。
 
-### 2.27 2026-11-16 实盘净值 HWM 修复、波幅口径消融与运行完整性审计批次（`NV1`–`NV15`，共 15 项 = 11 `[x]` + 4 `[ ]`）
+### 2.27 2026-11-16 实盘净值 HWM 修复、波幅口径消融与运行完整性审计批次（`NV1`–`NV16`，共 16 项 = 12 `[x]` + 4 `[ ]`）
 
 > **编号与口径说明（2026-11-16 登记）**：本表登记当日一轮**实盘净值口径修复 + 波幅作用域消融 +
 > 运行归档完整性审计**，编号取新族 `NV1`–`NV13`（`NV` = NAV integrity & run Verification），
@@ -2609,13 +2765,15 @@ Track MS 确立**零存量污染、零 `BASE_VERSION = 2.0.0` 变更、零 58 �
 | **`NV6`** | `[x]` | 运行归档完整性审计器 `check_live_run_integrity.py`（跨轮视图；实测 2026-11-16 归档 **DIRTY**） | 新建 [`scripts/check_live_run_integrity.py`](file:///home/stone/Work/github/quant/scripts/check_live_run_integrity.py)（`SEVERITY_BY_CODE` / `audit_run_archive` / `_verdict` / `render_report` / `build_parser`；`--strict` 供 CI）<br>只读归档 `<runs-root>/<YYYY-MM-DD>/<HHMMSS>/{summary.json, live_trading_ticket.json, post_holdings.json, post_holdings.meta.json}` | 1. **为什么需要**：单轮视图只会把 2026-11-13 读成「又一次拒单」—— `144835/` 是 `stage2` + `gate_code=GO` 但**无** `deploy_status`、**无** `live_trading_ticket.json`；`192803/` 是 `FAILED` + `MissedExecutionOpenError` + `timing_violation=after_open`（lateness **119.2** min）。两者合起来的真结论是「**该会话没有任何票据**」。<br>2. **六类发现**各带日期 / 实例 / 严重度 / 中文一行：`MISSED_SESSION`(HIGH) / `TIMING_REFUSED`(HIGH) / `DEPLOY_FAILED`(MEDIUM) / `POST_HOLDINGS_MISSING`(MEDIUM) / `TICKET_UNFILLED`(LOW) / `DUPLICATE_INSTANCES`(LOW)；`MissedExecutionOpenError` **不得**同时记成 `DEPLOY_FAILED`（同因双记会把严重度刷成噪声）。<br>3. **实测（`2026-10-29 .. 2026-11-16` 真实归档）**：**DIRTY** —— **2** 条 HIGH（`MISSED_SESSION` 2026-11-13；`TIMING_REFUSED` 2026-11-12，lateness **149.4**）、**14** 条 MEDIUM（**4** `DEPLOY_FAILED`、**10** `POST_HOLDINGS_MISSING`）、**2** 条 LOW。<br>4. **后果（与本表待办分开读）**：2026-11-16 开盘**没有任何可执行票据**（无一条记录携带 `execution_date=2026-11-16`），故 `600362` 的 `-8%` 止损**漏了一个会话**。审计器只**判**归档、**不改**归档；修复方向见 `NV11`，`POST_HOLDINGS_MISSING` 链见 `NV10`。<br>5. **边界**：严格只读（唯一写点是操作者指定路径的 `--json-out`）；不改任何运行产物、不触发下单、不联网。 | `pipeline/tests/test_live_run_integrity.py`（干净周零发现 / 周五信号丢失+周一开盘未填 / 无 `deploy_status` 不算 `DEPLOY_FAILED` / detail 取 traceback 行而非横幅 / 覆盖日仍计 `TIMING_REFUSED` / `MissedExecutionOpenError` 不双记 / 缺 `post_holdings` / `meta.complete=false` / `meta` 缺失 / 陈旧 `execution_date` / 同 `as_of` 多实例 / 周末与人工假期不算会话 / 参数与根目录四类用法错误；全离线合成归档） | M | 无 |
 | **`NV7`** | `[x]` | 票据审计字段补齐（`equity_direction` / `sector_throttle` / `is_partial_trim` / `lot_rounding_drag`） | [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py)（`compute_equity_direction` `:5043`、`format_equity_direction_line` `:5135`、`is_partial_trim` `:5165`、`classify_sector_throttle` `:5187`、`lot_rounding_drag_for_row` `:5325`、`annotate_lot_rounding_drag` `:5355`；票据写出 `:7865` / `:8191`） | 1. **`equity_direction`**：权益口径（**剔除现金腿**）的前后权重与净变动，实测 **25.1% → 32.3%（+7.2pp）**、净买入 **¥14,193**；打印使用**字面标签 `EQUITY DIRECTION`**（vol-ceiling 说明句已指向该标签，改名即断链）。<br>2. **`sector_throttle`**：`throttled` + `throttle_state` ∈ {`binding` / `not_binding` / `cannot_prove`}，输入不可判时用 `cannot_prove`——**不臆造判决**；该块是从**已交付账本反推**，不是重跑权重层准入规则（真实规则在 `blend_base.py` 的 `sector_counts[sec] < allowed_sec_cap`），故 `binding` 只表示「约束成立」，**不**表示「某单被压掉」。<br>3. **`is_partial_trim`**：部分减仓与清仓区分，防止「减一点」被读成「退出」。<br>4. **`lot_rounding_drag`**：逐行 + 票据级，实测 **-5,296 RMB / -2.69% NAV**（买腿 **-3,383** / 卖腿 **-1,913**）；**于此订正早前口径 -5,281** —— 该数是**未按腿相加**的旧值，逐腿求和以本行 **-5,296** 为准。<br>5. **边界**：**纯增量、下单路径未变**，以改前 / 改后票据 diff 证明；不改任何阈值、不碰版本轴。 | `pipeline/tests/test_ticket_audit_fields.py`（11-16 真实形状 / 现金腿剔除 / 阈值分档与 4bp 平档 / 平档带常量 / `reduce` 不触发提示 / `add` 但未触顶不触发 / 无 overlay 时报 `None` 而非 `False` / 提示句内插数字 / 隔日重算不继承） | M | 无 |
 | **`NV8`** | `[ ]` | 行业映射补齐（`600900.SH` → `utilities`、`000999.SZ` → `pharma`）：**受阻，前置未满足** | [`pipeline/research/blend/blend_base.py`](file:///home/stone/Work/github/quant/pipeline/research/blend/blend_base.py) 的 `CHINA_EQUITY_SECTORS`（`:58`）与 `_get_symbol_sector`（`:76`）<br>[`common/sector_metadata.py`](file:///home/stone/Work/github/quant/common/sector_metadata.py) 的 `_prefix_sector`（`:42`）与 `resolve_sector`<br>[`scripts/live_preflight.py`](file:///home/stone/Work/github/quant/scripts/live_preflight.py) 的 `select_prior_state`（`:1102` 一带的 `base_version != expected`） | 1. **现状**：两只标的均不在 `CHINA_EQUITY_SECTORS`，`_get_symbol_sector` 落到码前缀伪类 `sec_60` / `sec_00` ⇒ 行业节流对它们**实际失效**（各占一个「行业」桶，永不触帽）。<br>2. **阻塞点（不是「顺手加两行」）**：该字典在**底座引擎**内 ⇒ 按 AGENTS 规则 7 必须 bump `BASE_VERSION`（现 `2.0.0`）+ 同步 `test_strategy_versioning` / `--dump-strategies` / `docs/version.md`；而 `select_prior_state` 用**精确字符串相等**比较 `base_version`，bump 后**下一轮会跳过上一份 `prior_state` 快照** ⇒ 冷启动丢 `entry_prices` / `holding_bars` / 冷却状态，`-8%` 止损**失去参考锚点**。该失效模式不是假设：归档已有 `LiveDumpPreflightError base_version`（2026-11-06 / 2026-11-09）与 `strategy_version`（2026-11-12）的 `DEPLOY_FAILED` 先例（计数见 `NV6` 的 MEDIUM 项）。<br>3. **前置（必须先做）**：先让 `select_prior_state` 容忍**同 major** 的 bump（含离线用例），再跑一次**行业映射消融**（加 vs 不加，参照 `NV4` 的「判据先于结果」写法），最后才动字典。<br>4. **边界**：本节 `[ ]` 只登记 —— **零代码改动、零版本轴变动**；`§2.26.4` 的「底座零变动」原则对存量 blend 腿继续有效，本条若获批属**显式例外**且须在 `docs/version.md` 留痕。 | 待实现（前置含 `select_prior_state` 同 major 容忍用例与行业映射消融报告） | M | **用户裁定** + `select_prior_state` 同 major 容忍 + 消融报告 |
-| **`NV9`** | `[ ]` | 价格口径统一：NAV 用**官方收盘**、票据行用 **14:00 / 14:15 截断价**、部署对账用**票据价**（当日现金腿 172 RMB 分差） | [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py)（票据行价与 `--cutoff-time` 链路）<br>[`scripts/check_live_portfolio_health.py`](file:///home/stone/Work/github/quant/scripts/check_live_portfolio_health.py)（NAV 估值读收盘）<br>部署对账侧的票据价口径 | 1. **三处口径互不相同**且各有其合理性：NAV 必须是官方收盘（否则净值与对账不一致）、票据行必须用截断时点价（否则是未来函数）、部署对账只能拿票据价。今天表现为**现金腿 172 RMB 的拆分漂移** —— 数额不大，但它是三套口径并存的可观测量，**不是**舍入噪声。<br>2. **为什么延后**：统一口径是**定仓路径变更**，按 AGENTS 规则 9 必须先过实证门禁（离线改前 / 改后下单量对比 + 正 / 非退化证据），不能「看起来更一致」就改。<br>3. **交付（获批后）**：书面冻结「哪个量在哪个用途上算权威」，并在票据里落可复核的**口径标签**（不是把两个数强行改成相等）。<br>4. **边界**：不改估值频率、不改 `cutoff_time` 默认值、未触碰策略类时零版本轴变动。 | 待实现（三口径对拍的纯函数用例 + 改前 / 改后票据 diff） | M | AGENTS 规则 9 实证门禁（离线差分报告） |
+| **`NV9`** | `[ ]` | 价格口径统一：NAV 用**官方收盘**、票据行用 **14:00 / 14:15 截断价**、部署对账用**票据价**（当日现金腿 172 RMB 分差） | [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py)（票据行价与 `--cutoff-time` 链路）<br>[`scripts/check_live_portfolio_health.py`](file:///home/stone/Work/github/quant/scripts/check_live_portfolio_health.py)（NAV 估值读收盘）<br>部署对账侧的票据价口径 | 1. **三处口径互不相同**且各有其合理性：NAV 必须是官方收盘（否则净值与对账不一致）、票据行必须用截断时点价（否则是未来函数）、部署对账只能拿票据价。今天表现为**现金腿 172 RMB 的拆分漂移** —— 数额不大，但它是三套口径并存的可观测量，**不是**舍入噪声。<br>2. **为什么延后**：统一口径是**定仓路径变更**，按 AGENTS 规则 9 必须先过实证门禁（离线改前 / 改后下单量对比 + 正 / 非退化证据），不能「看起来更一致」就改。<br>3. **交付（获批后）**：书面冻结「哪个量在哪个用途上算权威」，并在票据里落可复核的**口径标签**（不是把两个数强行改成相等）。<br>4. **边界**：不改估值频率、不改 `cutoff_time` 默认值、未触碰策略类时零版本轴变动。<br>5. **前置（`NV16`，2026-11-17 追加登记）**：只要盘中仍可能出票，「哪个量在哪种用途上权威」就无法冻结 —— `NV16` 先把盘中出票在**净额化通道**上封死，本条才具备统一口径的前提；两行独立验收，互不充当证据。 | 待实现（三口径对拍的纯函数用例 + 改前 / 改后票据 diff） | M | AGENTS 规则 9 实证门禁（离线差分报告）；**`NV16`（前置：必须先让「盘后唯一」在全局成立）** |
 | **`NV10`** | `[x]` | `POST_HOLDINGS_MISSING` 链（**10** 轮）：**原前提已被实测推翻** —— 缺的是侧车 `post_holdings.meta.json`，不是账本；真缺陷是「本轮真丢账本」与「特性上线前的旧轮次」在盘上**逐字节不可区分**（已修） | [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py) 的 `write_post_holdings_attestation`（`:3463`）、`post_holdings_attestation_gate`（`:3436`）、`PostHoldingsAttestationError`（`:3386`）<br>[`web/livetrading/storage.py`](file:///home/stone/Work/github/quant/web/livetrading/storage.py) 的 `classify_post_holdings_meta` / `ensure_post_holdings_attestation` / `plan_post_holdings_meta_backfill` / `apply_post_holdings_meta_backfill`（`O_EXCL`、默认 dry-run、`source="backfill_from_ticket"`）<br>[`scripts/check_live_run_integrity.py`](file:///home/stone/Work/github/quant/scripts/check_live_run_integrity.py) 的 `POST_HOLDINGS_MISSING` 标签与 `post_holdings_legacy_rounds` / `post_holdings_current_losses`<br>票据侧 additive 键 `post_holdings_written` / `post_holdings_reason` / `post_holdings_meta_source` | 1. **前提更正（2026-11-16 实测；本行原登记的两条断言全部作废）**：`10` 轮**全部都有** `post_holdings.json`；缺的只是侧车 `post_holdings.meta.json` —— 完整性检查器的「完整性门禁」要求侧车 `complete: true`。侧车特性落地于 commit `d0e8c93`（2026-11-11 23:43 −0800），分界**逐位精确**：`≤ 2026-11-10/202644` 每轮都无侧车，`≥ 2026-11-11/234433` 每轮都是 `complete: true` ⇒ 这 10 条信号的是**旧数据**，**不是**降级轮次。<br>2. **原「后果链」不成立（同一份实测）**：`operator_manual_correction` 来自会话自己的 `operator_holdings.json`，`storage.resolve_seed_holdings` 把它排在**最前**；**每一轮**都用了它，包括四个**侧车齐全**的轮次。`holding_bars` / `entry_prices` 来自 `prior_state`（`live_preflight.select_prior_state` → `run_live_strategy.py` 的 `prior_state` 解析，`:1400-1420`），**从不**来自持仓种子；归档显示该链连续（`600660.SH` 19→20→…→28，`entry_prices` 保留）⇒「回落会重置锚点」**没有发生**。<br>3. **教训（这才是要留下的东西）**：该前提是**读 README 推断出来的、当时没有核归档**。README 描述的是「可能」的降级路径，不是「已发生」的事实 ⇒ 一条 `..._MISSING` 必须先分「数据旧」与「本轮丢」，再谈后果。<br>4. **真缺陷（比原登记更严重，已修）**：两个生产者都把**写账本失败**吞在 `[WARN]` 后面，而 web 部署路径**重写 `post_holdings.json` 却从不写侧车** ⇒「一本真丢了的账」与「一个特性上线前的旧轮次」在盘上**逐字节不可区分**，而该轮仍报 `deploy_status=SUCCESS`。<br>5. **修法：attestation 对 + 末尾门禁**：先写 `complete:false` 侧车 → 写账本 → 再写 `complete:true`（每一步都是 `os.replace`，故崩溃只留下 `post_holdings_meta_incomplete`＝不可用，绝不会「有账本无侧车」）；`post_holdings_attestation_gate` 在 `main()` **末尾**（`account_state.json` 已落盘之后）抛 `PostHoldingsAttestationError` ⇒ 非零退出 ⇒ `deploy_status=FAILED`；同一套 helper 进 `web/livetrading/storage.py`。**「不可推导的账」≠「丢了的账」**：前者只标记、不判败。<br>6. **additive 票据键**：`post_holdings_written` / `post_holdings_reason` / `post_holdings_meta_source`；**键缺席 = 旧轮次**（这正是新检查器区分 `[legacy]` / `[当前轮]` 的判据）。<br>7. **检查器分标签**：每条 `POST_HOLDINGS_MISSING` 打 `[legacy]` / `[当前轮]`，并计数 `post_holdings_legacy_rounds` / `post_holdings_current_losses`；真归档读作「历史遗留 **10** / 当前轮 **0**」。<br>8. **无损侧车回填：已实现，刻意未对归档执行**：只在该轮票据能**逐股精确重现**盘上账本时写侧车（否则拒绝）、`O_EXCL` 永不覆盖已存在侧车、**默认 dry-run**、`source="backfill_from_ticket"`。<br>9. **边界**：不改 `min_holding_bars` / 冷却长度 / 账本语义，不碰 `version` / `BASE_VERSION` 轴。 | `pipeline/tests/test_live_post_holdings_attestation.py`（**+18** 例：对写出与 `source` 标签 / 写账本失败留下 UNUSABLE 侧车而非 legacy 目录 / 未知账本不得 attested / 门禁只在「有票据无账本」时判败并抛具名错误 / `ensure` 补旧目录且已 attested 目录逐字节不变 / 写失败只报不抛 / 回填精确匹配与四类拒绝 / 幂等且 dry-run 零写 / 不覆盖后到侧车 / CLI 默认 dry-run / 检查器区分 legacy 与当前轮 / summary 声称有侧车而侧车已丢失）+ `pipeline/tests/test_live_run_integrity.py` 的 `post_holdings` 三态分支（`meta.complete=false` / `meta` 缺失 / 缺账本）<br>`web/livetrading/tests/test_post_holdings_write_path.py`（**+4** 例：子进程没留账本 ⇒ 两文件齐备且如实上报 / 子进程已 attested 的对逐字节不动 / attestation 失败 ⇒ 本轮 FAILED / 不可推导的账 ⇒ 只上报不判败） | M | 无 |
 | **`NV11`** | `[ ]` | 2026-11-13 / 11-16 断链的**修复方向**：无票据 ⇒ `600362` `-8%` 止损漏一个会话（**业主裁定暂不处理**，2026-11-16） | `NV6` 审计结论（HIGH `MISSED_SESSION` 2026-11-13 + 无 `execution_date=2026-11-16` 记录）<br>[`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py)（部署 / 票据落地）<br>[`scripts/check_live_portfolio_health.py`](file:///home/stone/Work/github/quant/scripts/check_live_portfolio_health.py)（Stage-1 → Stage-2 交接） | 1. **事实**（与 `NV6` 同一份实测，不另立数字）：2026-11-13 的信号既未在当日部署、也未在 11-16 开盘前补出票据 ⇒ 11-16 开盘**零填单指令**，`600362` 的 `-8%` 止损顺延一个会话。<br>2. **本条只登记不实施**：修复方向至少两条 —— ① 把「上一个有信号的会话是否已产生可执行票据」做成 Stage-1 的**硬前置检查**；② 在 Stage-2 启动时对**前一交易日**做**补部署**并显式标注 `late_deploy`。二者互斥性、与惰性 / 最低持仓的交互、以及是否需要例外都须**业主裁定**，故不得先写代码再补裁。`NV6` 的 `--strict` 已能把这类状态做成 CI 红灯 —— 先解决「**发现**」，再解决「**补做**」。<br>3. **业主裁定（2026-11-16）**：**暂不处理**。保留登记不得当作遗漏重新立项 —— 本行是「**已裁定不做**」的记录，不是「待办缺口」；若将来重启，须由业主**重新裁定**，并沿用第 2 项那两条互斥方向。<br>4. **边界**：零代码改动、零版本轴变动、零下单影响。 | 不实施（业主裁定，2026-11-16）；如重启则按 §四 补可复算命令 | M | **业主裁定：暂不处理（2026-11-16）** |
 | **`NV12`** | `[x]` | 守卫下阶梯幅度的**钳制**与 `hwm_barred_gap_pct` 缺口字段（docstring 声明的半句，已补落地） | [`scripts/check_live_portfolio_health.py`](file:///home/stone/Work/github/quant/scripts/check_live_portfolio_health.py) 的 `inspect_portfolio_drawdown` docstring（`:1806-1816`）与代码体（`:1864-1873` 的守卫分支、`:2080` 的 `result["hwm_barred_gap_pct"]`）<br>[`common/nav_hwm.py`](file:///home/stone/Work/github/quant/common/nav_hwm.py)（`hwm_eligibility_detail`，同一批次）<br>`pipeline/tests/test_vol_scope_diagnostics.py` 的 `test_barred_phantom_well_above_the_peak_cannot_trip_the_tier_ladder`（`:839`） | 1. **定案为「实现漏落」（上表 `NV2` 的第 ② 分支），已补齐**：守卫生效时阶梯幅度改为 `dd_mag = max(0.0, -current_dd)` —— **高于冻结峰值的被拦 NAV 是「无回撤」**，不是正向幅度；原始缺口另以 `hwm_barred_gap_pct = max(0.0, current_dd)` 原样发布。**该键只在守卫路径写入**，故 `nav_eligible` ∈ (True, `None`) 的判定字典保持**逐位不变**（既有整字典相等用例即护栏）；`drawdown_pct` 仍是**原始带符号值**，未改。低于峰值时两套定义**重合**，自愈场景不受影响。<br>2. **具体失败（钳制挡掉的就是这个）**：`120,000` 对 `100,000` 冻结峰值，改前 `dd_mag = abs(+0.20)` ⇒ **`TIER_3_HALT`（一本健康账被清成 100% 现金）**；改后 `tier = NORMAL`、`dd_mag == 0.0`、`linear_equity_scale == 1.0`、`hwm_barred_gap_pct == 0.20`。相邻的 `79,000`（低于峰值）仍正确给出 `TIER_3_HALT`、`dd_mag == 0.21`、缺口 `0.0`，证明钳制**只去升级、不改真实回撤**。<br>3. **实证**：真实归档**只读** dry run `[clean] 0`、退出码 `0`、**579** 个文件**未改动**、零提案；旧 vs 新合格性判定在**全部 34 个实例轮**上 **34 合格 / 34 合格 / 0 变化**；`pipeline/tests` **1608 passed + 1 skipped**、`common/tests` **1525 passed + 1 skipped**（本行定稿前实测；简报所引的 `1585` 是该轮补测前的中途读数）。<br>4. **边界**：只动守卫分支的阶梯幅度与一个仅在守卫路径出现的新键；不改层级阈值（`-10/-15/-20%`）、不改 `drawdown_pct` 的原始符号、不碰策略 `version` / `BASE_VERSION` 轴。 | `pipeline/tests/test_vol_scope_diagnostics.py`（`test_barred_phantom_well_above_the_peak_cannot_trip_the_tier_ladder` 主用例 + 其下方峰值邻居对照；全离线合成账） | S | `NV2`（已满足） |
 | **`NV13`** | `[x]` | 引擎侧「继承峰值」出处判定：**只读判定（五标签）+ opt-in 失败关闭闸门已交付**；带签名的 ATH 记录（真修复）**仍未做**，缺口如实保留 | [`common/nav_hwm.py`](file:///home/stone/Work/github/quant/common/nav_hwm.py) 的 `peak_provenance`（`:507`）/ `max_leg_verified_nav`（`:490`）/ `PEAK_PROVENANCE_LEG_VERIFIED`·`_ATTRIBUTABLE_EXTERNAL`·`_UNVERIFIED_INHERITED`·`_UNVERIFIABLE`·`_MISSING`（`:200-212`）/ `PEAK_PROVENANCE_TOL = 0.005`（`:223`）/ `PEAK_NAV_OPERATOR_ATH_KEY = "peak_nav_operator_ath"`（`:229`）<br>[`scripts/check_live_portfolio_health.py`](file:///home/stone/Work/github/quant/scripts/check_live_portfolio_health.py) 的 `collect_leg_verified_navs`（`:1888`，`PEAK_EVIDENCE_MAX_DATES = 40`）、`inspect_portfolio_drawdown` 三个 additive 键（`:2231` / `:2291-2296`）、`format_peak_provenance_warning`（`:2538`）、`enforce_provable_peak`（`:2646`）、CLI `--require-provable-peak`（`:492`）<br>[`scripts/repair_live_nav_hwm.py`](file:///home/stone/Work/github/quant/scripts/repair_live_nav_hwm.py) 的显式 `--peak` **上界**告警（`:675-688`）、`RepairScopeError`（`:883`）/ `ApplyAbortedError`（`:851`）/ `ManifestError`（`:841`）、`SCRIPT_VERSION` → **`1.3.0`**（`:130`） | 1. **五个标签（真值表，非近似）**：<br>· `leg_verified` —— 峰值 ≤ `max_leg_verified_nav ×(1+tol)`；**不**告警；闸门**放行**；<br>· `attributable_external` —— 超出容差带但**已声明**（CLI `--peak-nav` / `account_state.peak_nav_operator_ath`）；**不**告警；**放行**；<br>· `unverified_inherited` —— 超出容差带且**未声明**（即 2026-11-05 那颗幻影的形状）；**`[WARN]`**；**exit 2**；<br>· `unverifiable` —— 峰值可用，但本轮**没有任何**逐腿核算净值可与它比对；**`[WARN]`**；**exit 2**；<br>· `missing` —— 根本没有可用的峰值（缺席 / 非有限 / ≤ 0），没有东西在当分母；**不**告警；**放行**。<br>2. **`unverifiable` 是复核发现（HIGH）补出来的，如实记录**：第一版实现只有 `missing` 一个标签，把「没有峰值」与「有峰值但没东西可比」混为一谈 ⇒ 那条**失败关闭**的开关恰好在**无法校验**的部署上**静默放行**（`--output-dir` 非归档布局、扫描失败、空树）——正是它存在的理由所针对的那种情形。当时**还有一条用例把错误行为钉住**（断言这种情形判 `missing`），故这缺陷不可能被那次自测发现。**现在开关把「不能校验」与「没有东西可校验」分开**：`missing` 仍不拒绝（无峰值即不可能携带幻影），`unverifiable` 拒绝。<br>3. **容差 `PEAK_PROVENANCE_TOL = 0.5%` 是分离装置、不是原理**：合法外部 ATH **203,049.96** 位于归档最好逐腿核算净值 **202,483.94** 上方 **+0.28%**，幻影 **208,830.78** 位于上方 **+3.13%** ⇒ 0.5% 让合法的落在带内 **1.8 倍**、幻影落在带外 **6.3 倍**。数字与容差**逐字**写进告警与拒绝消息，读者可自行判案；已知代价如实披露：比真 ATH 再高 0.4% 的外部峰值会被读成 `leg_verified`。<br>4. **证据边界（防「自我抬升」）**：逐腿核算净值只取归档**最近 40 个日期**（`PEAK_EVIDENCE_MAX_DATES`，约两个月，覆盖 2026-11-03 那条腿），**时点正确**（`date <= as_of`，未来日期一律不读）；且**只有 `hwm_eligibility` 判为同一时相**的轮次才入证据基数 —— 幻影自己那双腿（`186,218.00 + 22,612.78`）因此**不能**把最大值抬上去。<br>5. **默认路径逐位不变**：三个新键（`peak_provenance` / `peak_provenance_detail` / `max_leg_verified_nav`）在**阶梯之后**计算、**永不回流**任何判定字段。用例 `test_every_peak_provenance_label_leaves_the_decision_dict_bit_identical` 把**同一输入**走遍全部可达标签，断言整字典除这三键**完全相等**（并与不带证据的旧签名调用相等），且**钉住绝对阶梯值**（`peak_nav` = 真 ATH、`drawdown_pct` = 12.34%、`tier = TIER_1_DAMPING`、线性缩放、`tier1_counter`/`tier3_counter`、`hwm_guard_applied=False`）⇒「相等」不可能等于「一致地错」。**flag-off 下唯一有意变化**是新增的 `[WARN] 峰值无法校验` 一行（`unverifiable`），默认不做其它改动。<br>6. **`--require-provable-peak` 是 opt-in、默认 OFF**：在任何写之前拒绝（**exit 2**），两种拒绝标签的消息**不同**；`unverifiable` 的消息**明说**这是「本轮没能校验」，**不是**「峰值是错的」。默认不拒绝是刻意：让会话不出报告属行为变更，按规则 9 先只上告警、把开关交给操作者。<br>7. **剩余缺口（本行不声称已修）**：真修复需要生产者落一条**带签名的 ATH 记录** —— `{peak_nav, observed_at, source_round, leg_snapshot_fingerprint, strategy_version, base_version}`，并把它当作**第五种出处**、且能在 `prior_state` 拷贝中存活；在此之前保持开关 **OFF**，只在 pre-flight / CI 里用（那里一次拒绝的代价是重排一次发布，不是错过一个会话）。<br>8. **规则 7 留痕**：本行**未碰**任何策略 `version`、**未碰** `BASE_VERSION` —— 交付物只有 CLI 开关、纯函数助手与上报键。 | `pipeline/tests/test_live_nav_hwm.py`（`test_peak_provenance_truth_table_on_the_three_real_numbers` 五标签真值表 / `test_every_peak_provenance_label_leaves_the_decision_dict_bit_identical` 逐位相等 + 绝对阶梯值 / `test_unverifiable_peak_is_refused_while_missing_is_not` / `test_require_provable_peak_exits_2_on_the_phantom_and_0_on_a_leg_verified_peak` / `test_unverifiable_peak_prints_its_own_warn_line_explaining_it_could_not_verify` / `test_cli_peak_is_the_declared_external_route_and_stays_attributable` / `test_flag_off_reproduces_todays_refusal_free_output_and_the_flag_parses_off_by_default` / `test_collect_leg_verified_navs_reads_only_same_instant_legs` / `test_unprovable_peak_end_to_end_through_the_archive_scan` / `test_max_leg_verified_nav_ignores_unusable_rows` / `test_peak_provenance_refuses_a_bogus_tolerance`）+ `pipeline/tests/test_vol_scope_diagnostics.py`（`test_peak_provenance_warn_renders_once_in_dashboard_and_markdown` / `test_unverifiable_peak_warns_that_the_run_could_not_verify_it_in_both_renderers` / `test_peak_provenance_warn_is_silent_for_every_other_label`；全离线合成归档） | M | `NV1`（数据侧已修）、`NV2`（守卫范式） |
 | **`NV14`** | `[ ]` | `scripts/repair_live_run_snapshots.py` 仍**只重写 `post_holdings.json`、不写侧车** ⇒ 任何对 D5 之后轮次的未来修复都会再造一个「legacy 形状」（**未修**） | [`scripts/repair_live_run_snapshots.py`](file:///home/stone/Work/github/quant/scripts/repair_live_run_snapshots.py)（`_write_restated_file` `:2258` 重述 `post_holdings.json`；`repair_2026_10_27_post_holdings` `:2476` 覆写 10-27 的账本；全文件 `grep post_holdings.meta` **零命中**）<br>对照已修的两条生产者：[`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py) 的 `write_post_holdings_attestation` 与 [`web/livetrading/storage.py`](file:///home/stone/Work/github/quant/web/livetrading/storage.py) 的 `ensure_post_holdings_attestation` | 1. **缺口（2026-11-16 实测，`NV10` 之外剩下的那一半）**：`NV10` 给**生产写入器**（子进程 + web 部署路径）装上了 attestation 对，但**修复脚本**这条第三方写链没跟上 —— 它用 `write_bytes_atomic` 直接覆写 `post_holdings.json`，既不写 `post_holdings.meta.json::complete`，也不登记 `post_holdings_written`。于是**一次修复**会把一个 D5 之后的轮次改写成与「旧轮次」同形的目录：`summary.json` 说没写过（或根本没有该键）、侧车缺席 ⇒ 完整性检查器只能把它读成 `[legacy]`，**真账本被重述过这件事在盘上不再可见**。<br>2. **今天为什么没炸**：该脚本目前只针对 2026-10-27 / 2026-10-29 这类**特性上线前**的轮次（10-27 的账本本身就是 legacy 形状，10-29 缺侧车），改写前后都是 legacy ⇒ 现有行为**不制造矛盾**，只是把「不能修 D5 之后的轮次」这条限制留在代码里。<br>3. **交付（获批后）**：让重述走与生产同一套 helper —— 覆写账本前先落 `complete:false`、写账本、再落 `complete:true`，并在 manifest 里登记 `post_holdings_written` 语义（或显式 `source="repair_restate"`），使「被修复过」与「从没写过」可区分；同时补一条「重述 D5 之后的合成轮次 ⇒ 侧车 `complete:true` 且 `[legacy]` 不再出现」的离线用例。<br>4. **边界**：不动 `.orig` 留底与幂等约定（`_write_restated_file` 的 manifest 稳定字段）；除实现本身改变行为时按脚本自述惯例 bump `SCRIPT_VERSION` 外不改其它行为；不碰 `version` / `BASE_VERSION` 轴。 | 待实现（合成 D5 之后轮次被重述 ⇒ 侧车齐备且检查器判 `[当前轮]`；重述 legacy 轮次 ⇒ 逐字节行为不变） | S | `NV10`（同一套 helper 已存在） |
 | **`NV15`** | `[x]` | 上报与保存路径四处纠正：波幅两数分离（`realized_vol_21d` 不再被覆盖）、损坏台账中止、计划账本保存门禁（409）、前端把拒单当成功（一行四件） | [`scripts/run_live_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_strategy.py) `apply_portfolio_vol_overlay_for_strategy`（`:4506-4509` 的 `consumed_vol_21d` / `consumed_vol_source`）<br>[`scripts/repair_live_nav_hwm.py`](file:///home/stone/Work/github/quant/scripts/repair_live_nav_hwm.py) `load_manifest`（`:995`）与 `main()` 的 `ManifestError` 分支（`:1179`）<br>[`web/livetrading/storage.py`](file:///home/stone/Work/github/quant/web/livetrading/storage.py) `plan_books_for_date`（`:3369`）/ `assert_not_plan_book_save`（`:3426`）/ `save_holdings`（`:3466`）<br>[`web/livetrading/server.py`](file:///home/stone/Work/github/quant/web/livetrading/server.py) `HoldingsSaveRequest.confirm_plan_book`（`:75`）与 `POST /api/holdings` 的 409 分支（`:195`）<br>[`web/livetrading/static/js/app.js`](file:///home/stone/Work/github/quant/web/livetrading/static/js/app.js) `saveHoldings()` / `confirmPlanBookSave()`（`:1772` 起） | **(a) 两个波幅数，永不再混读**：`realized_vol_21d` 现在**两种作用域下都**报 Stage-1 的测量（`0.3033`），被消费的那个量另立 `consumed_vol_21d`（`portfolio` 下 `0.1182`）与 `consumed_vol_source`（`stage1` / `portfolio`＝`scope_applied`）。默认路径除这两个 additive 键外**可证逐位等同**（整字典比对用例 + 序列逐位比对用例），并有一条用例证明 `realized_vol_21d` **永不进入算术**。<br>**(b) 损坏台账中止**：`ManifestError`（解析失败或不是 JSON 对象）在任何写入**之前**以**退出码 2** 中止，错误信息写**完整 manifest 路径**（只写文件名在一仓多 root 时不可定位）；「有未决修复」与「无未决修复」两种情形各有用例（后者零改动、台账原样保留、退出码 0）。<br>**(c) `POST /api/holdings` 的计划账本门禁（409）**：提交的**非空**账本与**同一交易日**的计划账本逐股一致、且未带 `confirm_plan_book=true` ⇒ **409**。计划选取走实例**由新到旧**、取**第一个有 `post_holdings.json`** 的实例 —— 有更新的计划时绝不拿被取代实例；带选择键时只在该策略 / 标的池内比，**不带选择键时则与当日每个目录都比**，故「把键扔掉」不是绕过；门禁在任何 `os.makedirs` 之前 ⇒ 被拒的保存让归档**逐字节不变**。<br>**(d) 前端盲区**：`app.js::saveHoldings()` 过去**完全不看 `res.ok`**，于是 409 被日志打成 `[SUCCESS]` —— 门禁形同不存在，而且比没有门禁更糟（它会给出**假的确认**）。现在任何非 2xx 都按失败处理、把服务端 `detail` **原样**渲染、409 额外提供「显式确认→重投」路径（`confirmPlanBookSave`），并且**空账本确认先问、与之独立**（后者同时让保存路径拒绝静默 `{}`）。<br>**边界**：四处都不改定仓 / 下单量算术、不改阈值、不碰 `version` / `BASE_VERSION` 轴（(a) 是纯上报，(b)(c)(d) 是保存与 CLI 失败路径）。 | `pipeline/tests/test_vol_ceiling_scope.py`（两数分离 `test_portfolio_scope_reports_the_stage1_median_and_names_the_consumed_vol` / `test_realized_vol_is_reporting_only_so_it_cannot_move_a_single_weight` / `test_default_scope_block_is_the_old_block_plus_two_additive_keys` / `consumed_vol_source` 随落回而降级）<br>`pipeline/tests/test_live_nav_hwm.py`（`test_corrupt_manifest_aborts_before_the_first_write` 两条 `ManifestError` 分支 + `test_corrupt_manifest_with_no_pending_changes_is_never_replaced`）<br>`web/livetrading/tests/test_plan_book_guard.py`（**14** 例：拒写且零写盘 / 存储层具名异常 / 带确认旗标放行 / 差一股即放行 / 无计划日期放行 / 最新实例是唯一参照 / 退回最新「有计划」的实例 / 被取代实例不误拒 / 报文含日期与实例 / 空账本不进该门禁 / 现金代理行不绕过 / 省略选择键仍命中 / 省略选择键比对每个选择 / 钉住 `run_dir` 不进门禁）<br>`web/livetrading/tests/test_plan_book_ui_contract.py`（**5** 例静态契约：先判状态再打成功 / 校验前不清提示不刷新 / 仅操作者确认后带 `confirm_plan_book` / 409 分支原样转发 `detail` / 空账本问题先于任何提交）<br>实测：`web/livetrading` **423 passed + 1 skipped**、`pipeline/tests` **1665 passed + 1 skipped**、`node --check app.js` 通过；UI 契约为**静态文本/顺序守卫**（仓内无 JS 运行器），并已对六处变异做过「先破后立」复核。 | L | 无 |
+| **`NV16`** | `[x]` | web `allow_intraday` 默认翻转为 `False`（收益落在**已部署**的单策略路径）+ 净额化多策略通道补装 D3 执行可执行性门禁（**该路径未部署 ⇒ 门禁落地即闲置**；部署前必须先关闭此缺口） | [`scripts/run_live_multi_strategy.py`](file:///home/stone/Work/github/quant/scripts/run_live_multi_strategy.py) `main()`（`:909` 起；`run_mode` 判定之后、`os.makedirs(args.output_dir)` 与 `load_live_universe` **之前**：`:936` `resolve_execution_timing` + `:939` `enforce_execution_executability`；两个符号都从 `common.live_execution_timing` / `scripts.run_live_strategy` **导入**，不复制）<br>[`web/livetrading/models.py`](file:///home/stone/Work/github/quant/web/livetrading/models.py) `RunHealthRequest`（`:111`）/ `RunDeployRequest`（`:200`）/ `MultiStrategyDeployRequest`（`:337`）的 `allow_intraday` 默认 `True` → **`False`**（字段保留）+ 文件头共享说明块（`:6-20`）<br>[`web/livetrading/execution_service.py`](file:///home/stone/Work/github/quant/web/livetrading/execution_service.py) `run_health_check`（`:3090`）/ `run_live_deploy`（`:4007`）/ `run_multi_strategy_netted_deploy`（`:4740`）同名参数默认同步 `True` → **`False`**（仍按传入值 append `--allow-intraday` / `--no-allow-intraday`，未硬编码）<br>既有回归按新默认更新末位 token：[`test_web_livetrading.py`](file:///home/stone/Work/github/quant/web/livetrading/tests/test_web_livetrading.py)、[`test_p1_intraday_publish_after.py`](file:///home/stone/Work/github/quant/web/livetrading/tests/test_p1_intraday_publish_after.py)、[`test_multi_deploy_intraday_publish_after.py`](file:///home/stone/Work/github/quant/web/livetrading/tests/test_multi_deploy_intraday_publish_after.py) | 1. **缺口事实（先复现后修）**：**（业主说明 2026-11-17：`scripts/run_live_multi_strategy.py` 目前**未部署**，故该缺口今天**不是生产风险**；本条把它作为「部署前必须先关」的硬前置登记，而不是正在发生的缺陷。）**`scripts/run_live_multi_strategy.py` 只有**运行窗口**门禁（`resolve_live_clock_context(..., stage="stage2")`），全文件 `grep enforce_execution_executability` / `MissedExecutionOpen` **零命中**，且无条件写出 `netted_trading_ticket.json`（票据写出块，装门前为 `:1306-1317`、现为 `:1340-1350` 一带）。而 `--allow-intraday` 只把窗口拒绝**降级为警告**（`common/cli_utils.py::assert_run_window` → `window_gate="intraday_allowed"`），web 三个请求模型的该字段默认又是 `True` ⇒ **盘中（11:00 / 14:00）的矩阵轮会写出票据**，而票面声明 `execution_session=as_of+1` / `price_reference=next_open` 早已过期。单策略通道自 D3 起是 fail-closed（`run_live_strategy.py:6078-6086` → `common/live_execution_timing.py:372-377`），净额化通道漏了这一层。**实测复核**：把该 gate 换回恒等函数，冻结 2026-10-23 11:00（北京）带 `--allow-intraday` 跑一轮 ⇒ `netted_trading_ticket.json` 写出 `True`（缺陷可达，非理论）；装回 gate 后同一输入抛 `MissedExecutionOpenError`，输出目录只剩审计块。<br>2. **修法（D3 逐项对齐；已落地，落地即闲置）**：用**同一个** `enforce_execution_executability(timing, clock_ctx, args.output_dir)`，输入与单策略路径逐项相同（同一个 `clock_ctx`、同一份 `resolve_execution_timing(...)`）；`now >= planned_open` ⇒ `MissedExecutionOpenError`，**票据零落盘**（json / csv / 节约报告 / 虚拟账本 / summary 全无），仅按既有约定写 `execution_timing.json`（`executable=false` + `timing_violation` + `lateness_minutes` + `disposition=refused`），使「被拒」与「没跑」在归档里可区分。<br>3. **位置不变量**：gate 置于 `os.makedirs(args.output_dir)`、`load_live_universe`、`persist_run_metadata` 与一切票据写出**之前** ⇒ 被拒的一轮不加载行情、不留任何工单产物（与 Stage 2 同形）。<br>4. **`--allow-intraday` 不参与判定**（owner 裁定，2026-11-17）：该开关只放宽**巡检窗口**，不得放行「已错过开盘」；错误消息里逐字写明这一点。<br>5. **回放 / 补录路径（刻意保留的 opt-in 逃生口）**：钉住**过去**的 `--as-of-date` 时 `run_mode="replay"`，`annotate_executability` 在 helper **内部**提前返回（没有真实成交可迟到）⇒ 盘中手工回放照旧出票、无需任何新开关；本条**没有**把回放也一并封死，并有用例钉住它。<br>6. **web 默认翻转**：三个请求模型 + 三个 service 方法默认 `False`（字段**保留**，显式 `allow_intraday: true` 仍可放宽窗口）。效果：站内一轮默认变 argv 末位 `--no-allow-intraday`；盘中提交从此在**子进程**处被窗口门禁**拒绝**（而非降级警告），即便操作者显式放行窗口，也会被第 2 项的 D3 gate 拦住。<br>7. **与 `NV9` 的关系（前置，**不**合并）**：`NV9` 要统一「NAV 用官方收盘 / 票据行用 14:00–14:15 截断价 / 对账用票据价」三套口径。只要盘中仍能出票，「哪个量在哪种用途上权威」就无法书面冻结 ⇒ **必须先让「盘后唯一」在全局成立**，才谈口径统一；故本条登记为 `NV9` 的**前置**（`NV9` 的「前置依赖」列同步补记），两行互不充当验收证据。<br>8. **版本轴：无**。零策略类 `version` 变动、零 `BASE_VERSION` 变动、零 `--dump-strategies`、零 `strategy_dumps/*.json` 重生成；改动只落在运行器时序门禁与 web 请求默认值。**`docs/version.md` 无需任何条目**（不是遗漏）：本条不触碰任何策略/底座代码路径，故版本轴与 `docs/version.md` 的登记义务都不成立。<br>9. **不做范围**：不动 `as_of+1` / `next_open` 枚举、不动 `overnight_derisk` 的 `minutes_before_close`（14:15 决策时刻是另一个旋钮）、不动 `strategies_config.json` 里 `chan_four_state_blend` 的钉住项、不碰 `pipeline/research/blend/`。<br>10. **范围外观察（一行留痕，按要求不深究）**：净额化轮级的 5m `cutoff_time` 取「**请求方策略自身解析值**」，因此可以与 `scripts/run_live_multi_strategy.py::DEFAULT_INTRADAY_CUTOFF_TIME = "14:15"` 不同 —— [`web/livetrading/tests/test_multi_strategy_intraday_5m.py`](file:///home/stone/Work/github/quant/web/livetrading/tests/test_multi_strategy_intraday_5m.py)`:365` 就钉住 `"14:00"`。这是既有解析链（§4.50.1）的既定行为、非本条引入，本轮**不投入时间**，仅留痕备查。 | 新建 `pipeline/tests/test_multi_strategy_execution_executability.py`（**3** 例：① 盘中 11:00 + `--allow-intraday` ⇒ `MissedExecutionOpenError` 且**零票据** + 审计块 `disposition=refused` / `timing_violation=after_open`；② 盘后 15:30（不带该开关，即新默认）⇒ 票据照旧逐件写出（**防过度拦截**）；③ 钉住过去 `--as-of-date` 的回放在盘中仍出票（逃生口不被误封））<br>既有：`pipeline/tests/test_execution_executability.py`、`test_live_market_clock_wiring.py`、`test_post_close_run_window.py` **63 passed**；`web/livetrading/tests` 全量复跑见验收数 | M | 无（`NV9` 反向依赖本条） |
+
 
 > **（2026-11-16 `NV13` 交付补记与两笔修复写链整改，只追加、不回改任何历史数字）**：
 > `NV13` 的交付边界见该行第 1–8 项；计数变动记在 §二 末尾的「第四笔计数补记」，此处不重复抄数字。
@@ -2637,6 +2795,90 @@ Track MS 确立**零存量污染、零 `BASE_VERSION = 2.0.0` 变更、零 58 �
 >    `SCRIPT_VERSION` → **`1.3.0`**。字节级作用域**由「断言」改为「检查」**：序列化后逐字段比对，
 >    任何落在**六个**被修字段（顶层三键 + 嵌套 `prior_state` 同三键）之外的改动在**写入前**抛
 >    `RepairScopeError`；`passes` 条目畸形抛 `ManifestError`，不再被静默丢弃。
+
+> **（2026-11-17 `NV16` 追加裁决补记：巡检路径与出票路径拆分，只追加、不回改任何历史数字）**：
+> `allow_intraday` 的默认值**按路径拆分**，不再是三处一律 `False`。
+>
+> 1. **出票路径（保持严格 fail-closed）**：Stage-2 单策略部署（`RunDeployRequest` /
+>    `execution_service.run_live_deploy`）与多策略净额化部署（`MultiStrategyDeployRequest` /
+>    `run_multi_strategy_netted_deploy`）默认值一律 `False`，即本条首批发版的取值，未回退。
+> 2. **巡检路径（放宽）**：Stage-1 健康检查（`RunHealthRequest` / `run_health_check`）默认值
+>    恢复为 `True`。理由：**巡检不出票 ⇒ 拦它只有诊断损失、没有安全收益** —— 盘中拒绝健康检查
+>    既不能降低出票风险，又让操作者失去唯一的运行前体检；且 Stage-1 的 CLI 默认本来就是宽松的，
+>    web 层单方面收紧只会造成两侧口径漂移。
+> 3. **不变的边界**：运行窗口门禁（`common/cli_utils.assert_run_window`，`--allow-intraday` 仅把
+>    拒绝降级为警告）与 `NV16` 新装的 D3 执行可执行性门禁（`enforce_execution_executability` /
+>    `MissedExecutionOpenError`）**对出票路径零改动** —— 窗口仍可被显式放宽，但**已错过的开盘
+>    永远不放行**。三处 service 方法依旧按传入值 append `--allow-intraday` /
+>    `--no-allow-intraday`，没有硬编码。
+> 4. **回归**：三个模型的默认值断言、三处 service 方法的末位 token、以及
+>    `test_p1_intraday_publish_after.py` / `test_multi_deploy_intraday_publish_after.py` 的全 argv
+>    用例均按路径改为「巡检宽松 / 出票严格」，并各补一条「显式传入仍翻转 token」的全 argv 用例。
+> 5. **边界**：未触碰 `scripts/run_live_strategy.py`、`scripts/run_live_multi_strategy.py`、
+>    `scripts/check_live_portfolio_health.py`（脚本侧行为本就正确）；零策略类 `version` 变动、
+>    零 `BASE_VERSION` 变动、零 `docs/version.md` 条目；`NV9` 与本表其他行未改，`[x]/[ ]` 计数不变。
+
+### NV9 5m 特征口径统一与"缺根日忽略"（2026-11-17）
+
+**背景**：2026-11-17 事故（578 RMB 权益/现金错分：官方收盘 NAV 128,619 vs 14:15 合成 bar NAV 128,041）复盘确认：
+`enrich_universe_with_intraday_features` 会在 `cutoff < 15:00` 时把**已持有官方收盘**的当日日线行覆盖为 14:15 聚合，
+该值随后成为交割单 `price` 与权重分子；同时合成发生在 kappa 对齐之前，使同一 panel 同时存在官方收盘基与 5m 基两种价格基准
+（`600000.SH` 2025-08-06 实测 VWAP 差 0.345%）。
+
+**本次改动（已落地，离线验证通过）**
+
+1. **日线永不被 5m 覆盖**：`synthesize_intraday_bar` 参数、其代码路径、`Is_Partial_Bar` 与 `Is_Cutoff_Truncated`
+   两列**全部删除**（旧调用点直接 `TypeError`，有守卫测试）。
+2. **缺根日忽略 5m**：当日 5m 根数 `< 45` 时整天不产出特征行 ⇒ 该日 5m 派生列为 `NaN`（不 fill、不外推），
+   并逐标的逐日 `WARNING`（含日期与实际根数）。理由：半测量的样本比"没有测量"更危险，旧行为会用 phi 把它外推成
+   一条看起来完整的日线。
+3. **口径统一为全日**：`common/intraday_features.py` 默认、Stage 1/2、多策略 runner、
+   `StrategyConfig.blend_intraday_cutoff_time`（含别名）与 **backtester** 全部改为全日
+   （`15:00` / `None`，`_parse_time_cutoff` 视为同一窗口）。
+4. **phi 三个 seasonality 字段保留但标注为 DEAD**（只服务已退役的盘中成交量外推，全域恒等 1.0）。
+
+**预注册规则（写入后不再逐次争论）**：任何策略若要开启 5m 特征（`enable_intraday_5m` /
+`use_intraday_downside_vol` / `enable_5m_stop_filter`），其**回测与实盘必须使用同一个 cutoff**；
+自 2026-11-17 起**二者均已为全日**，因此该义务已退化为**单一约定**，不再是逐策略的例外。
+代价：旧产物（14:15 特征口径）**不再可复现**。当前部署无对齐义务——58 个 `strategy_dumps/*.json`
+中 0 个开启任一 5m 开关，`strategies_config.json` 无 `enable_intraday_5m` 覆盖，
+`blend_base` 的 8 个 5m 列只在开关内被读取。
+
+**交叉引用**：`docs/market_clock_and_asof_resolution.md`（估值 bar 规则改写）、
+`docs/intraday_5m_live_and_blend_enhancement_plan.md`（文首退役公告，正文保留为历史设计记录）、
+`docs/version.md`（本次**无**策略版本轴变更：未改任何策略逻辑、`version` / `BASE_VERSION`）。
+
+### R1 结项补记（2026-11-17，负结果；`R1` 行保持 `[x]`，不重开、不新增行、不改计数）
+
+1. **结项理由（口径错配，不是样本不够）**：判据的**测量面**已随「盘后唯一」移到整段会话
+   （`common/intraday_features.py` 的 `cutoff_time` 默认、`scripts/check_live_portfolio_health.py` 的 Stage-1 5m 块、
+   `scripts/run_live_strategy.py` 的 Stage-2 5m 块），而**执行面**仍以决策会话收盘价定价
+   （票据价、涨跌停带 `prev_close = Close[-2]`、限价夹逼）并在 **`T+1` 开盘**成交
+   （`execution_session=as_of+1` / `price_reference=next_open`）。于是「`T` 收盘测出来的降险，`T+1` 开盘才成交」
+   —— 对**存量暴露**而言，保护晚于它本该预判的那一段行情。更关键：已签署的 `AT7` P3 执行路径是
+   **单边（买方）节流**（`--enforce-r1-derisk`），应用函数在 `common/r1_derisk_report.py`，它连
+   「下调存量暴露」都做不到 —— **唯一幸存的是「新开仓节流」**，不是冻结书 §1.1 的「市场层目标暴露下调」。
+2. **处置（与 `R6` 同一体制）**：镜像 `docs/overnight_derisk_judgement_freeze.md` 的 `## Revision 2026-11-17`
+   —— 不重标定任何算术/阈值、模块与用例保留作可执行历史、`DECISION_SPEC_VERSION = "r1.1"` 不动
+   （不 bump、不加 `-retired` 后缀，归档旧读数仍可读）、`--enforce-r1-derisk` **维持默认 OFF**
+   （本次**无**任何默认翻转动作）、`docs/version.md` 零条目、版本轴零变动；冻结书追加
+   `## Revision 2026-11-17（R1 按负结果结项；默认 OFF = 仅影子线）`，并在该修订段内**就地订正**
+   文首/§6/§7「零接线 / 无消费面」的过期口径（原文保留以便追溯）。
+3. **新增可见性**：显式开启 `--enforce-r1-derisk` 时，`scripts/run_live_strategy.py` 在两闸求值点
+   （`r1_derisk_enforcement_enabled` 之后、受 `LIVETRADING_DISABLE_R1_DERISK` 约束）打印 `"!"*110` 退役横幅；
+   被环境变量击杀时不打印，`--help` 不触发。
+4. **重启门槛（预注册，四条缺一不可）**：①测量面与成交时点同一基准（回到同会话内成交，或以 `T+1` 开盘/
+   盘前可得量为输入另立判据）；②新口径**另立规格号**（`r1.2` / `intraday_drawdown/v2`），不得复用 `r1.1` 阈值自证；
+   ③语义与实现对齐（若仍只缩放买方 ⇒ 改名「新开仓节流」；若要下调存量 ⇒ 显式接线卖出/减仓并另行冻结，
+   `0.0` 清仓仍归 `R7`/熔断族）；④离线 + 归档证据同时具备（AGENTS 规则 9）。
+5. **与其他行的关系（防重复提案）**：**`R6`** 同体制但判据量不同（隔夜跳空 vs 日内回撤），**不得互相充当重启证据**，
+   阈值更不得互借；**`NV9`** 同族不同层（`NV9` 问"同一用途哪个价权威"，`R1` 问"测到的量与成交的时点是否同基准"），
+   互不构成对方验收证据；**`NV16`**（盘后唯一）是两者共同的前置，本身不构成 `R1` 证据；
+   **`AT9`**（`reference_price` 锚点接线）价值前提消失但仍为重启前置，建议保留 `[ ]` 并补注「`R1` 结项期间不排期」，
+   **不得**直接关闭；**`AT7`** P1/P2 仍在线（报告字段 + 影子线，下单量 bit-identical），本次只关闭 P3 执行面。
+6. **本轮验收**：`pipeline/tests/test_intraday_drawdown_derisk.py` **15 passed**（原 14 条算术断言全保留
+   + 1 条「结项标记 + 冻结阶梯未被顺手改动」守卫）；`pipeline/tests/test_advisory_wiring.py` **25 passed**（未改）；
+   全离线、零网络、零 `docs/version.md` 条目。
 
 ---
 

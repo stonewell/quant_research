@@ -867,28 +867,25 @@ class StrategyConfig:
     enable_low_beta_inertia: Optional[bool] = None
     max_assets_per_sector: Optional[int] = None
 
-    # --- 5-Minute Intraday Microstructure & Interval Nesting Enhancement Parameters ---
-    blend_enable_intraday_5m: bool = False
-    blend_enable_5m_interval_nesting: bool = False
-    blend_intraday_upvol_thresh: float = 0.58
-    blend_use_intraday_downside_vol: bool = False
-    blend_enable_5m_stop_filter: bool = False
-    blend_intraday_cutoff_time: Optional[str] = "14:15"
-
-    # Intraday 5m aliases (unprefixed versions for convenience)
-    enable_intraday_5m: Optional[bool] = None
-    enable_5m_interval_nesting: Optional[bool] = None
-    intraday_upvol_thresh: Optional[float] = None
-    use_intraday_downside_vol: Optional[bool] = None
-    enable_5m_stop_filter: Optional[bool] = None
-    intraday_cutoff_time: Optional[str] = None
+    # (2026-11-17 owner ruling) The six 5m FEATURE switches that used to live here
+    # (`blend_enable_intraday_5m` / `blend_enable_5m_interval_nesting` /
+    # `blend_intraday_upvol_thresh` / `blend_use_intraday_downside_vol` /
+    # `blend_enable_5m_stop_filter` / `blend_intraday_cutoff_time` and their six
+    # unprefixed aliases) are DELETED, not defaulted off: the Track-T ablation
+    # (`docs/reports/china/ablation_intraday_5m_report.md`) found M1 bit-identical to
+    # the M0 baseline and M2/M3/M4 degrading Sharpe 0.210 -> 0.135, ERS
+    # `UNTRUSTED` (percentile 1.0%), and no deployed strategy ever enabled one
+    # (0 occurrences in `strategies_config.json`, 0/58 `strategy_dumps`). The
+    # blend-side read sites went with them. Do NOT reintroduce them as inert
+    # `False` defaults -- a switch nobody may turn on is a false promise.
 
     # Which data provider serves the 5m BARS, independent of the run-level
-    # `--data-provider` (which still owns every DAILY bar). Resolved through the same
-    # chain the live scripts use for `enable_intraday_5m`
-    # (`<prefix>_intraday_5m_provider` -> `blend_intraday_5m_provider` ->
+    # `--data-provider` (which still owns every DAILY bar). Resolved through the blend
+    # param chain (`<prefix>_intraday_5m_provider` -> `blend_intraday_5m_provider` ->
     # `intraday_5m_provider`), and used to build a SECOND provider instance that is
-    # passed ONLY to `load_intraday_5m_universe`.
+    # passed ONLY to `load_intraday_5m_universe`. This field is KEPT (2026-11-17) even
+    # though the six 5m FEATURE switches above are gone: it routes 5m BARS for the
+    # Stage-1 metrics and the ticket fields, which do not go through `blend_base.py`.
     #
     # WHY a separate knob exists (2026-11-13): the live strategy's 5m coverage is not
     # uniform across providers. Measured on the live cache, the 20 traded EQUITIES hold
@@ -1325,12 +1322,6 @@ class StrategyConfig:
             self.enable_orthogonalization = self.blend_enable_orthogonalization
 
         for alias, blend_attr in [
-            ("enable_intraday_5m", "blend_enable_intraday_5m"),
-            ("enable_5m_interval_nesting", "blend_enable_5m_interval_nesting"),
-            ("intraday_upvol_thresh", "blend_intraday_upvol_thresh"),
-            ("use_intraday_downside_vol", "blend_use_intraday_downside_vol"),
-            ("enable_5m_stop_filter", "blend_enable_5m_stop_filter"),
-            ("intraday_cutoff_time", "blend_intraday_cutoff_time"),
             ("enable_structural_regime", "blend_enable_structural_regime"),
             ("enable_cyq_quality_gate", "blend_enable_cyq_quality_gate"),
             ("min_cyq_winner_ratio", "blend_min_cyq_winner_ratio"),
@@ -1432,12 +1423,6 @@ class StrategyConfig:
         for alias, blend_attr in [
             ("weighting_mode", "blend_weighting_mode"),
             ("enable_orthogonalization", "blend_enable_orthogonalization"),
-            ("enable_intraday_5m", "blend_enable_intraday_5m"),
-            ("enable_5m_interval_nesting", "blend_enable_5m_interval_nesting"),
-            ("intraday_upvol_thresh", "blend_intraday_upvol_thresh"),
-            ("use_intraday_downside_vol", "blend_use_intraday_downside_vol"),
-            ("enable_5m_stop_filter", "blend_enable_5m_stop_filter"),
-            ("intraday_cutoff_time", "blend_intraday_cutoff_time"),
             ("enable_structural_regime", "blend_enable_structural_regime"),
             ("enable_cyq_quality_gate", "blend_enable_cyq_quality_gate"),
             ("min_cyq_winner_ratio", "blend_min_cyq_winner_ratio"),

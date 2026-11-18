@@ -1892,7 +1892,11 @@ def main():
                                           data_kwargs=data_kwargs, require_nonempty=True,
                                           expected_last_session=backtest_expected_last_session())
 
-    # Task B2.1: Memoized Pre-Enrichment across full historical universe
+    # (2026-11-17 owner ruling) The Track-T 5m enrichment branch that used to sit here is
+    # DELETED. Its `track_t_flags` set contained only the six blend 5m FEATURE switches,
+    # all of which are gone from `StrategyConfig`/`blend_base.py`, so no params dict can
+    # ever ask the backtester to load or enrich 5m data again -- blend strategies now
+    # always take their daily-only path, which is what every deployed strategy already did.
     track_c_flags = {
         "enable_structural_regime",
         "enable_cyq_quality_gate",
@@ -1900,21 +1904,10 @@ def main():
         "enable_spring_fast_entry",
         "enable_structural_chandelier_stop",
     }
-    track_t_flags = {
-        "enable_intraday_5m",
-        "enable_5m_interval_nesting",
-        "enable_5m_stop_filter",
-        "use_intraday_downside_vol",
-    }
     has_track_c = False
-    has_track_t = False
     if isinstance(params, dict):
         has_track_c = any(
             any(k.endswith(f) and bool(v) for f in track_c_flags)
-            for k, v in params.items()
-        )
-        has_track_t = any(
-            any(k.endswith(f) and bool(v) for f in track_t_flags)
             for k, v in params.items()
         )
     if template_name in ("wyckoff_chan_spring", "chan_vp_hybrid"):
@@ -1923,22 +1916,6 @@ def main():
     if has_track_c:
         from common.structural_factors import enrich_universe_with_structural_features
         universe = enrich_universe_with_structural_features(universe)
-
-    if has_track_t:
-        from common.intraday_features import enrich_universe_with_intraday_features, load_intraday_5m_universe
-        intraday_data = load_intraday_5m_universe(
-            universe_symbols,
-            fetch_start,
-            args.end,
-            cache_dir=cache_dir,
-        )
-        if intraday_data:
-            cutoff_str = (
-                params.get("blend_intraday_cutoff_time")
-                or params.get("intraday_cutoff_time")
-                or "14:15"
-            )
-            universe = enrich_universe_with_intraday_features(universe, intraday_data, cutoff_time=cutoff_str)
 
     os.makedirs(results_dir, exist_ok=True)
 

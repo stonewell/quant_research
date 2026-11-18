@@ -3084,6 +3084,9 @@ class ExecutionService:
         universe_key: Optional[str] = None,
         strategy_name: Optional[str] = None,
         universe_name: Optional[str] = None,
+        #: (`NV16`, split by path) INSPECTION default True: Stage 1 emits no orders, so denying
+        #: it intraday buys no safety and only costs diagnostics. The two TICKETING methods below
+        #: keep False. Forwarded verbatim either way -- the child is told the caller's value.
         allow_intraday: bool = True,
         refresh_data: bool = True,
         cash: Optional[float] = None,
@@ -3998,7 +4001,10 @@ class ExecutionService:
         strategy_name: Optional[str] = None,
         universe_name: Optional[str] = None,
         guard_latency_bars: int = 2,
-        allow_intraday: bool = True,
+        #: (`NV16`, split by path) TICKETING default False: this deploy emits an order ticket, so
+        #: the post-close->next-open window may only be relaxed by an explicit caller value; the
+        #: runner stays fail-closed past its declared open (`MissedExecutionOpenError`).
+        allow_intraday: bool = False,
         cash: Optional[float] = None,
         nav_override: bool = False,
         max_single_position: Optional[float] = None,
@@ -4728,7 +4734,10 @@ class ExecutionService:
         data_provider: Optional[str] = None,
         min_holding_bars: int = 2,
         inertia_threshold: float = 0.05,
-        allow_intraday: bool = True,
+        #: (`NV16`, split by path) TICKETING default False: the netted matrix round writes
+        #: `netted_trading_ticket.json`, so the post-close->next-open window may only be relaxed
+        #: by an explicit caller value; the D3 gate is unconditional regardless.
+        allow_intraday: bool = False,
         confirm_empty_book: bool = False,
         #: (P4) Retrieval metadata ONLY: recorded in the matrix summary so `list_runs` can
         #: report this round under the selection it ran under instead of the literal

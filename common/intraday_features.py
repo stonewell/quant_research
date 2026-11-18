@@ -2,7 +2,8 @@
 
 Implements tasks T2.1, T2.2, and T2.3 from docs/intraday_5m_live_and_blend_enhancement_plan.md:
 - Point-in-time causal cutoff (R1, R6): A-share 5m bars filtered strictly by ts.time() <= cutoff_time
-  (36 bars at 14:00, 39 bars at 14:15, 48 bars at 15:00).
+  (48 bars at the full-session default; 36 at 14:00 / 39 at 14:15 remain available to reproduce
+  a historical intraday run).
 - Pure intraday realized variance, semivariance decomposition, and bipower variation (RV, RS_Up, RS_Down, BPV).
 - True Intraday VWAP and dimensionless premium (VWAP_Prem_5m) immune to price basis.
 - Microstructure order flow: signed up-volume ratio (UpVol_Ratio_5m) and overnight-gap-stripped
@@ -10,8 +11,22 @@ Implements tasks T2.1, T2.2, and T2.3 from docs/intraday_5m_live_and_blend_enhan
 - Afternoon return (Afternoon_Ret_5m = C_{t,M} / C_{t,11:30} - 1) for afternoon distribution detection (R9.3).
 - 5m Chan sub-level interval nesting and MACD bull/bear confluence with 240-bar lookback (R9).
 - Cross-source split ratio alignment kappa_t = C_{t,1d} / C_{t,M,5m} (R4, R6).
-- Intraday volume seasonality extrapolation (Seasonality_Volume_Scale) and Is_Partial_Bar flag (R12).
 - Zero top-level pipeline.* imports: lazy imports used for Chan theory components.
+
+RETIRED 2026-11-17 (owner ruling) -- the intraday EXECUTION mode is gone; deployment is
+post-close-only, so nothing here may ever touch the daily bar:
+- **Partial-day synthesis is retired.** `enrich_universe_with_intraday_features` used to
+  overwrite the as-of day's `Open/High/Low/Close/Volume` with a truncated 5m aggregation,
+  mark it `Is_Partial_Bar=1`, and extrapolate volume through a historical intraday cumulative
+  share `phi`. That `synthesize_intraday_bar` flag, its code path and both flag columns
+  (`Is_Partial_Bar`, `Is_Cutoff_Truncated`) are DELETED. A post-close run already holds the
+  official close; replacing it changed the ticket `price` and the weight numerator (2026-11-17:
+  578 RMB equity/cash split, NAV 128,619 at the official close vs 128,041 at the 14:15 bar).
+- **A 缺根日 (5m sample short of a full session, i.e. `< 45` bars) is now SKIPPED, not
+  extrapolated**: the day gets no feature row, so every 5m-derived column joins as NaN, and
+  one WARNING per symbol-day names the date and the observed bar count. `Seasonality_Volume_Scale`
+  survives as a column for schema stability but its extrapolation is inert under the full-session
+  default (the `volume_seasonality_*` config fields are dead -- see their docstrings).
 """
 
 from __future__ import annotations
@@ -66,10 +81,17 @@ def _get_chan_modules():
 class IntradayFeatureConfig:
     """Configuration for causal intraday feature extraction and cross-cycle confluence."""
 
-    cutoff_time: Optional[str] = "14:15"
-    """R6: Default '14:15' (39 bars) aligned with Stage 2 live trading.
-    Pass '14:00' (36 bars) for Stage 1 macro health gate.
-    Pass None or '15:00' (48 bars) for full-day historical control mode.
+    cutoff_time: Optional[str] = "15:00"
+    """R6: Default is the FULL session (`'15:00'`, 48 bars -- `None`/`'15:00'` are the same
+    thing, see `_parse_time_cutoff`).
+
+    (2026-11-17 owner ruling) Live AND backtest runs are now POST-CLOSE ONLY and the intraday
+    execution mode is retired, so every default is the full session and backtest/live share one
+    convention. A cutoff only ever NARROWS the 5m feature window; it never touches the daily
+    bar. Pass `'14:15'` (39 bars) or `'14:00'` (36 bars) to reproduce a historical intraday
+    feature window -- DISCLOSED COST: artifacts produced under that convention are no longer
+    bit-reproducible, and only strategies with a 5m switch ON are affected at all (every
+    deployed strategy has all three OFF, so the columns are never read).
     """
 
     chan_5m_lookback_bars: int = 240
@@ -96,13 +118,29 @@ class IntradayFeatureConfig:
     """Reference threshold for signed up-volume surge confirmation."""
 
     volume_seasonality_lookback_days: int = 20
-    """Historical trading days to compute median cumulative volume proportion phi."""
+    """Historical trading days to compute median cumulative volume proportion phi.
+
+    DEAD (2026-11-17 owner ruling -- kept, not deleted, as the historical record). This field
+    and the two `phi_*` defaults below only fed the partial-day volume EXTRAPOLATION that
+    accompanied daily-bar synthesis. Synthesis is retired (see the module docstring), the
+    deployment is post-close-only, and `_compute_volume_seasonality_scales` now returns the
+    identity 1.0 whenever `cutoff_time` is None or >= 15:00 -- i.e. always, in every live and
+    backtest path. Nothing reads phi to produce a volume any more.
+    """
 
     volume_seasonality_phi_1400: float = 0.78
-    """Default cumulative volume proportion at 14:00 when historical baseline is unavailable."""
+    """Default cumulative volume proportion at 14:00 when historical baseline is unavailable.
+
+    DEAD (see `volume_seasonality_lookback_days`): only the retired partial-day synthesis path
+    read it, and that path is gone. Retained so a historical config still deserialises.
+    """
 
     volume_seasonality_phi_1415: float = 0.84
-    """Default cumulative volume proportion at 14:15 when historical baseline is unavailable."""
+    """Default cumulative volume proportion at 14:15 when historical baseline is unavailable.
+
+    DEAD (see `volume_seasonality_lookback_days`): only the retired partial-day synthesis path
+    read it, and that path is gone. Retained so a historical config still deserialises.
+    """
 
     tick_size_stock: float = 0.01
     """A-share equity quote unit (RMB 0.01)."""
@@ -174,6 +212,13 @@ def _compute_volume_seasonality_scales(
 
     For each date t, uses the median cumulative volume ratio from the prior N full days:
     phi_t = median_{k=1..N}(V_{t-k, <=cutoff} / V_{t-k, full}).
+
+    RETIRED-INPUT (2026-11-17): this extrapolation existed ONLY to scale a truncated 5m volume
+    sum up to a full-day estimate before writing it into a synthesized daily bar. That synthesis
+    is gone, so the returned factor is now inert -- it is still attached as the
+    `Seasonality_Volume_Scale` column for schema stability, but no consumer multiplies a volume
+    by it. Under the full-session default (every live and backtest path) the function returns
+    the identity 1.0 immediately.
     """
     if cutoff_time is None or cutoff_time >= datetime.time(15, 0):
         unique_dates = df_5m.index.normalize().unique()
@@ -563,7 +608,9 @@ def compute_daily_intraday_features(
     Returns
     -------
     pd.DataFrame
-        DataFrame indexed by date (normalized DatetimeIndex) with 22 standard features.
+        DataFrame indexed by date (normalized DatetimeIndex) with 21 standard features. A date
+        whose 5m sample is incomplete (< 45 bars) is ABSENT from the index (2026-11-17) -- the
+        caller joins by date, so its 5m-derived columns come out NaN. Nothing is extrapolated.
     """
     if config is None:
         config = IntradayFeatureConfig()
@@ -592,6 +639,15 @@ def compute_daily_intraday_features(
     if df_cut.empty:
         return pd.DataFrame()
 
+    # FULL-day 5m bar count per date, taken BEFORE the cutoff filter. (2026-11-17 owner ruling)
+    # A day whose 5m SAMPLE is short of a full session -- fewer than 45 of the 48 bars a normal
+    # Chinese session prints -- is a "缺根日": its 5m data is IGNORED wholesale (no feature row,
+    # hence NaN in every 5m-derived column after the join), because extrapolating a half-measured
+    # day (volume seasonality phi, partial-bar synthesis) is exactly what used to poison the
+    # daily bar. The cutoff is NOT a completeness question: a post-close 14:15 run still holds a
+    # complete 48-bar sample and only narrows the feature window.
+    full_day_counts = df_5m.groupby(df_5m.index.normalize()).size()
+
     # Pre-load Chan modules once if enabled
     chan_modules = _get_chan_modules() if config.enable_chan_5m else None
 
@@ -607,6 +663,20 @@ def compute_daily_intraday_features(
         if day_bars.empty:
             continue
 
+        # 缺根日 (2026-11-17): drop the day instead of measuring half of it. `prev_close` is
+        # therefore carried over from the last INCLUDED session, which is the honest choice --
+        # the skipped day's own close was never observed as a measurement we trust.
+        full_bars = int(full_day_counts.get(d, len(day_bars)))
+        if full_bars < 45:
+            logger.warning(
+                "[INTRADAY 5M] %s %s: 5m sample incomplete (%d of ~48 bars) -- 5m features for "
+                "this session are SKIPPED (NaN); the daily bar is not touched.",
+                symbol or "<universe>",
+                pd.Timestamp(d).date(),
+                full_bars,
+            )
+            continue
+
         # Microstructure features
         row = _compute_day_microstructure(
             day_bars=day_bars,
@@ -619,15 +689,6 @@ def compute_daily_intraday_features(
         row["Date"] = d
         row["Seasonality_Volume_Scale"] = seasonality_scales.get(d, 1.0)
 
-        # Is_Partial_Bar flag (R12)
-        # Only the current in-progress day (latest date) under a cutoff or any day with genuinely partial bars is partial
-        is_latest_date = (d == all_dates[-1])
-        if is_latest_date and (cutoff_t is not None and cutoff_t < datetime.time(15, 0)):
-            row["Is_Partial_Bar"] = 1
-        elif len(day_bars) < 45 and (cutoff_t is None or cutoff_t >= datetime.time(15, 0)):
-            row["Is_Partial_Bar"] = 1
-        else:
-            row["Is_Partial_Bar"] = 0
 
         # Chan 5m structure (with lazy candidate date support, R9)
         should_calc_chan = (
@@ -684,7 +745,6 @@ def compute_daily_intraday_features(
         "Chan_5m_ZG",
         "Chan_5m_ZD",
         "Last_3Bars_Locked_Limit",
-        "Is_Partial_Bar",
     ]
 
     for c in standard_cols:
@@ -698,10 +758,17 @@ def enrich_universe_with_intraday_features(
     universe_1d: Dict[str, pd.DataFrame],
     universe_5m: Dict[str, pd.DataFrame],
     config: Optional[IntradayFeatureConfig] = None,
-    synthesize_intraday_bar: bool = False,
     cutoff_time: Optional[Union[str, datetime.time]] = None,
 ) -> Dict[str, pd.DataFrame]:
-    """Enrich daily universe DataFrames with aligned 5m intraday features and split alignment (R4, R6, R12).
+    """Enrich daily universe DataFrames with aligned 5m intraday features and split alignment (R4, R6).
+
+    The DAILY frame is read-only here: `Open/High/Low/Close/Volume` are never rewritten. That
+    is a hard contract since 2026-11-17 -- the retired synthesis path used to replace the as-of
+    daily bar with a truncated 5m aggregation, which then became the ticket `price`
+    (`scripts/run_live_strategy.py` -> `common/freshness.py::latest_close`) and the weight
+    numerator. On 2026-11-17 it split 578 RMB of equity/cash (NAV 128,619 at the official close
+    vs 128,041 at the 14:15 bar). If the daily feed has no bar for a day, this join simply has
+    no feature row for it either; it never invents one.
 
     Parameters
     ----------
@@ -711,17 +778,18 @@ def enrich_universe_with_intraday_features(
         5-minute OHLCV universe.
     config : Optional[IntradayFeatureConfig]
         Configuration for feature computation.
-    synthesize_intraday_bar : bool
-        If True (Stage 1 / Stage 2 live mode), synthesizes or updates the current partial day's
-        OHLCV bar using truncated 5m data and seasonality volume scaling, setting Is_Partial_Bar=1.
     cutoff_time : Optional[Union[str, datetime.time]]
-        Optional time cutoff string (e.g. '14:00', '14:15', '15:00') or datetime.time.
-        If provided, overrides config.cutoff_time.
+        Optional time cutoff string (e.g. '14:00', '14:15', '15:00') or datetime.time. If
+        provided, overrides config.cutoff_time. It ONLY narrows the 5m feature window; it never
+        touches the daily bar.
 
     Returns
     -------
     Dict[str, pd.DataFrame]
-        Enriched daily universe with price alignment and microstructure columns.
+        Enriched daily universe with price alignment and microstructure columns. A day whose
+        full-day 5m bar count is short of a session (`full_bars < 45`, counted BEFORE any
+        cutoff filtering) carries NaN in every 5m-derived column -- see
+        `compute_daily_intraday_features`, which drops that day and warns.
     """
     if config is None:
         config = IntradayFeatureConfig()
@@ -734,7 +802,6 @@ def enrich_universe_with_intraday_features(
         else:
             config.cutoff_time = str(cutoff_time)
 
-    cutoff_t = _parse_time_cutoff(config.cutoff_time)
     enriched_universe: Dict[str, pd.DataFrame] = {}
 
     price_cols = [
@@ -753,7 +820,6 @@ def enrich_universe_with_intraday_features(
 
         df_5m = universe_5m.get(sym)
         if df_5m is None or df_5m.empty:
-            df_out["Is_Partial_Bar"] = 0
             enriched_universe[sym] = df_out
             continue
 
@@ -763,37 +829,14 @@ def enrich_universe_with_intraday_features(
         )
 
         if feat_df.empty:
-            df_out["Is_Partial_Bar"] = 0
             enriched_universe[sym] = df_out
             continue
 
-        # Synthesize intraday bar if requested (Live Stage 1 / Stage 2, R12)
-        if synthesize_intraday_bar:
-            if cutoff_t is not None:
-                df_5m_cut = df_5m.loc[df_5m.index.time <= cutoff_t]
-            else:
-                df_5m_cut = df_5m
-
-            for d_synth in feat_df.index:
-                # Synthesize if partial bar or if date does not exist in 1d
-                is_partial = feat_df.loc[d_synth, "Is_Partial_Bar"] == 1
-                if is_partial or (d_synth not in df_out.index):
-                    day_5m = df_5m_cut.loc[df_5m_cut.index.normalize() == d_synth]
-                    if not day_5m.empty:
-                        o_synth = float(day_5m["Open"].iloc[0])
-                        h_synth = float(day_5m["High"].max())
-                        l_synth = float(day_5m["Low"].min())
-                        c_synth = float(day_5m["Close"].iloc[-1])
-                        scale = float(feat_df.loc[d_synth, "Seasonality_Volume_Scale"])
-                        v_synth = float(day_5m["Volume"].sum()) * scale
-
-                        df_out.loc[d_synth, ["Open", "High", "Low", "Close", "Volume"]] = [
-                            o_synth, h_synth, l_synth, c_synth, v_synth
-                        ]
-
-            df_out.sort_index(inplace=True)
-
-        # Cross-source split ratio alignment: kappa_t = C_{t,1d} / C_{t,M,5m} (R4, R6)
+        # Cross-source split ratio alignment: kappa_t = C_{t,1d} / C_{t,M,5m} (R4, R6).
+        # The numerator is the OFFICIAL daily close, so every joined price column lands on the
+        # daily panel's own adjustment basis. (Before 2026-11-17 this loop ran AFTER a synthesis
+        # pass, so a synthesized row -- whose C_1d was itself the 5m close -- got kappa == 1.0
+        # and the panel carried two price bases; measured gap 0.345% on `600000.SH` 2025-08-06.)
         aligned_feat = feat_df.copy()
         common_dates = df_out.index.intersection(aligned_feat.index)
 
@@ -810,16 +853,17 @@ def enrich_universe_with_intraday_features(
                 if not pd.isna(val):
                     aligned_feat.loc[t_date, p_col] = val * kappa
 
-        # Join feature columns into daily DataFrame
+        # Join feature columns into daily DataFrame. Dates absent from `aligned_feat` (no 5m
+        # row, or a skipped 缺根日) become NaN in the 5m columns and are left as NaN -- never
+        # filled, never extrapolated: every consumer treats NaN as "not measured" rather than as
+        # a value (see the retirement note in the module docstring).
         for col in aligned_feat.columns:
             df_out[col] = aligned_feat[col].reindex(df_out.index)
-
-        # Fill Is_Partial_Bar for historical complete bars
-        df_out["Is_Partial_Bar"] = df_out["Is_Partial_Bar"].fillna(0).astype(int)
 
         enriched_universe[sym] = df_out
 
     return enriched_universe
+
 
 
 def _intraday_5m_cache_candidates(cache_dir: Optional[str]) -> List[str]:
@@ -1559,7 +1603,6 @@ def load_intraday_5m_universe(
     end: Optional[str] = None,
     data_provider: Optional[Any] = None,
     parquet_dir: str = "data/intraday_5m",
-    cutoff_time: Optional[str] = "14:15",
     cache_dir: Optional[str] = None,
     expected_last_session: Optional[Any] = None,
     market: str = "china",
@@ -1585,6 +1628,12 @@ def load_intraday_5m_universe(
         `TimeoutError` naming the symbol and the elapsed time. `None` (default) = off.
       * `verbose` -- one `[INTRADAY 5M] i/N <symbol> <- <origin>` line per symbol, so a slow
         load is distinguishable from a hung one.
+
+    (2026-11-17) The `cutoff_time` parameter is REMOVED. It was never referenced in this
+    function's body -- the loader always returned the full session -- yet its `"14:15"`
+    default read like a truncation that the caller could rely on. The cutoff is applied
+    ONE layer later, by `enrich_universe_with_intraday_features` /
+    `IntradayFeatureConfig.cutoff_time`.
 
     Provider provenance (2026-11-11, fixes the silently-stale 5m layer): the DuckDB cache is
     queried under the CALLER's configured provider keys first (`FuyaoDataProvider` for a
@@ -1845,9 +1894,10 @@ def load_intraday_5m_universe(
                     source = "parquet"
 
         if df_sym.empty:
-            # Explicit unavailability marker (no `enabled`/`Is_Partial_Bar` field exists at
-            # this layer -- empty frame is the convention) so a caller/log can distinguish
-            # "5m data unavailable" from a frame that merely failed to be requested.
+            # Explicit unavailability marker (no `enabled` field exists at this layer -- empty
+            # frame is the convention) so a caller/log can distinguish "5m data unavailable"
+            # from a frame that merely failed to be requested. (The former `Is_Partial_Bar`
+            # marker column was deleted on 2026-11-17 with the retired daily-bar synthesis.)
             df_sym.attrs["intraday_5m_available"] = False
         else:
             df_sym.attrs["intraday_5m_available"] = True

@@ -3,6 +3,26 @@
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
+#: (`NV16`, 2026-11-17) `allow_intraday` is SPLIT BY PATH, not uniform across the three models:
+#:
+#: * TICKETING paths (`RunDeployRequest`, `MultiStrategyDeployRequest`) default **False** --
+#:   live ticketing is **post-close -> next-open only**, so no intraday instant is ever a
+#:   legitimate moment to emit a ticket, and the web form must not silently launder an
+#:   11:00 / 14:00 submission into an order ticket;
+#: * INSPECTION path (`RunHealthRequest`, Stage 1) defaults **True** again -- a health check
+#:   emits no orders, so refusing it intraday buys no safety and only costs diagnostics.
+#:
+#: The field itself is KEPT on all three, because an explicit value is still the documented
+#: escape hatch for a deliberate inspection or a replay/backfill of a past session.
+#:
+#: Why the default mattered: without the explicit flag the child runner REFUSES an out-of-window
+#: run (`common.cli_utils.assert_run_window` -> `RunWindowError`), but `--allow-intraday`
+#: downgrades that refusal to a warning. The single-strategy path was still fail-closed because
+#: of `scripts/run_live_strategy.py::enforce_execution_executability` (`MissedExecutionOpenError`);
+#: the NETTED path had no such gate until `NV16`, so the flag alone was enough to produce a
+#: `netted_trading_ticket.json` after its own declared open. Both runners now carry the D3 gate,
+#: so `allow_intraday` can only ever relax the WINDOW, never a missed fill instant.
+
 
 class SettingsModel(BaseModel):
     """Dynamic path and execution configuration settings."""
@@ -90,7 +110,15 @@ class RunHealthRequest(BaseModel):
     portfolio_value: float = 100000.0
     peak_nav: Optional[float] = None
     data_provider: Optional[str] = None
-    allow_intraday: bool = Field(True, description="Allow running during intraday/lunch sessions using latest published session")
+    #: (`NV16`) INSPECTION path: default True -- a health check emits no orders, so relaxing
+    #: the run window here cannot launder a ticket (see the module-level note above).
+    allow_intraday: bool = Field(
+        True,
+        description=(
+            "允许在盘中/午间会话运行（默认 True：巡检不出票，仅影响运行窗口门禁）；"
+            "出票路径（Stage 2 部署 / 多策略净额化）默认 False，只允许收盘后→次日开盘"
+        ),
+    )
     refresh_data: bool = Field(True, description="Refresh market data before Stage 1 starts")
     #: (LV1-TIMEBASE) The operator's CURRENT cash balance, used ONLY to mark the pre-staged
     #: valuation snapshot at one instant. Without it the staging path has no same-session
@@ -171,7 +199,16 @@ class RunDeployRequest(BaseModel):
 
     lot_size: Optional[int] = None
     guard_latency_bars: int = Field(2, description="UPLSM entry confirmation latency guard bars (default 2)")
-    allow_intraday: bool = Field(True, description="Allow running during intraday/lunch sessions using latest published session")
+    #: (`NV16`) TICKETING path: default False -- the deploy emits an order ticket, so the
+    #: post-close -> next-open window may only be relaxed by an explicit request; pass `true`
+    #: only for a deliberate inspection or a replay/backfill round.
+    allow_intraday: bool = Field(
+        False,
+        description=(
+            "允许在盘中/午间会话运行（默认 False：实盘出票只允许收盘后→次日开盘）；"
+            "仅在刻意盘中巡检或历史回放/补录时显式置 true"
+        ),
+    )
     #: (P1-1, 2026-11-12) Same contract as `RunHealthRequest.intraday_publish_after`:
     #: ``None`` = the flag is not passed (child keeps 20:00); a value is forwarded verbatim
     #: as `--intraday-publish-after HH:MM` after validation. Stage 1 and Stage 2 must agree
@@ -300,7 +337,15 @@ class MultiStrategyDeployRequest(BaseModel):
     data_provider: Optional[str] = None
     min_holding_bars: int = 2
     inertia_threshold: float = 0.05
-    allow_intraday: bool = Field(True, description="Allow running during intraday/lunch sessions using latest published session")
+    #: (`NV16`) TICKETING path (netted matrix): default False -- this round writes
+    #: `netted_trading_ticket.json`, so the window may only be relaxed on an explicit request.
+    allow_intraday: bool = Field(
+        False,
+        description=(
+            "允许在盘中/午间会话运行（默认 False：实盘出票只允许收盘后→次日开盘）；"
+            "仅在刻意盘中巡检或历史回放/补录时显式置 true"
+        ),
+    )
     #: (P1-1 parity, 2026-11-13) Same contract as `RunHealthRequest.intraday_publish_after`
     #: and `RunDeployRequest.intraday_publish_after`: ``None`` (the default) means the flag is
     #: NOT passed at all, so the netted child keeps its own "no assessment" behaviour and the

@@ -6700,3 +6700,113 @@ Stage-1 报告取归档原文件。**输出只写 `/tmp/opencode/vsB_*/`，未�
   部分失败留 `incomplete: true` / 作用域检查 / 畸形 `passes`）与
   `pipeline/tests/test_vol_scope_diagnostics.py`（告警在 dashboard 与 Markdown 各渲染一次、
   其它标签静默）；全部离线合成归档。本轮只读复核实测：两个文件合计 **111 passed**。
+
+## 47. 退役 Track T：blend 侧六个 5m 日内特征开关整体删除（`BASE_VERSION 2.0.0 → 2.1.0`，2026-11-17）
+
+> **本节编号**：落笔前实测现有最高节号为 **46**（`grep -n '^## ' docs/version.md` 的最后一项），
+> 故本节取 **47**，只追加在文件末尾；§1–§46 一字未改。
+> **本节不是新实验，是既有负结果的「关闭动作」**：证据在
+> [`docs/reports/china/ablation_intraday_5m_report.md`](file:///home/stone/Work/github/quant/docs/reports/china/ablation_intraday_5m_report.md)。
+> 台账（任务拆解 / 状态）仍在
+> [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md)，本节不重复登记任务号。
+
+### 47.1 为什么删而不是「默认关」
+
+- 消融实测（M0–M4，同一窗口 / 同一合成 5m 数据）：**M1（区间嵌套）与 M0 基线逐列完全相同**
+  （Sharpe 0.210 / CAGR +1.65% / MaxDD 11.66% / 79 次调仓 / 换手 30.68 / DSR 0.9891 全等）；
+  **M2 / M3 / M4 反而劣化**，Sharpe **0.210 → 0.135**、CAGR 1.65% → 0.88%、DSR 0.9891 → 0.8558。
+- ERS 判定 **`UNTRUSTED`**（随机权重分位 **1.0%**，门槛 ≥ 90%）。
+- 部署面：`strategies_config.json` 对这六个键**零出现**；58 份 `strategy_dumps` 中**0 份**启用。
+- 因此它们是「**没人能开、开了也没有正收益**」的假承诺。AGENTS.md 规则 9 的处置是「默认关闭的
+  opt-in 实验位」，但这里连实验价值都已被 M1 等同 M0 否证，故按业主裁决**整体删除**，
+  不保留 `False` 默认值。
+
+### 47.2 删了什么（配置 / 引擎 / 脚本 / 回测 / 实验）
+
+- **配置**（`pipeline/research_strategy/rs/config.py`）：删除
+  `blend_enable_intraday_5m`、`blend_enable_5m_interval_nesting`、`blend_intraday_upvol_thresh`、
+  `blend_use_intraday_downside_vol`、`blend_enable_5m_stop_filter`、`blend_intraday_cutoff_time`
+  六个字段与它们的六个无前缀别名，以及 `__post_init__` / `from_dict` 里对应的六对同步项。
+- **引擎**（`pipeline/research/blend/blend_base.py`）：删除六个 `resolve_param` 读点与
+  **八处**整块列读取（`UpVol_Ratio_5m` / `VWAP_Prem_5m` / `RS_Down_5m` / `Afternoon_Low_5m` /
+  `Chan_5m_Sell_Trigger` / `SmartMoney_Q_5m` / `Chan_5m_Buy_Confluence` / `Afternoon_Ret_5m`），
+  **外层 `if` / `elif` 一并删除**（只删内层列判断会把「开关门控」变成「恒真分支」）。
+  其中 `intraday_cutoff_time` 只有赋值、全文件再无引用 —— 有效截断时点从来来自调用方
+  （`backtester/run_backtest.py`、`scripts/run_live_multi_strategy.py`）。
+- **回测**（`backtester/run_backtest.py`）：删除 `track_t_flags` 与 `has_track_t` 分支，
+  研究路径不再加载 / 富化 5m；对应的
+  `backtester/tests/test_run_backtest.py::test_backtester_cannot_enrich_5m_for_blend_strategies`
+  由「钉 cutoff 字面量」改为「钉**不存在**」的 AST 断言。
+- **脚本**：`scripts/run_live_strategy.py` 与 `scripts/check_live_portfolio_health.py` 的
+  `enable_intraday_5m` 收敛为**仅 CLI 旗标**（Web Station 无条件追加 `--enable-intraday-5m`，
+  实盘 5m 未被关掉）；`common/intraday_features.py::load_intraday_5m_universe` 删除**函数体内
+  从未引用**的 `cutoff_time` 形参；三处调用点不再传它。
+- **实验**：`pipeline/research/blend/experiments/ablation_intraday_5m.py` **整文件删除**
+  （开关删除后五个变体坍缩为同一组权重，再跑会覆盖真实负结果报告）；
+  `pipeline/scripts/run_blend_cross_matrix.py` 的 Track T 键全部移除，cell 3/4 明确标注 retired。
+- **保留不动**：`intraday_5m_provider`（路由的是 5m **行情**，服务于 Stage-1 指标与票面字段，
+  与 blend 特征无关），`strategies_config.json` 里 `chan_four_state_blend` 的
+  `"intraday_5m_provider": "baostock"` 原样保留。
+
+### 47.3 版本轴（AGENTS.md 第 7 条四件事）
+
+| 轴 | 旧 | 新 | 理由 |
+| :--- | :---: | :---: | :--- |
+| `BaseBlendAllocationStrategy.BASE_VERSION` | `2.0.0` | **`2.1.0`** | **minor**：可信参数面缩小，行为不变 |
+| `ChanFourStateBlendStrategy` | `1.5.0` | **`1.6.0`** | 同上（minor） |
+| `ChanRiskManagedBlendStrategy` | `1.1.1` | **`1.2.0`** | 同上 |
+| `ChanCrisisShieldBlendStrategy` | `1.0.2` | **`1.1.0`** | 同上 |
+| `ChanFourStateShieldBlendStrategy` | `1.0.1` | **`1.1.0`** | 同上 |
+| `ChanDualHybridBlendStrategy` | `1.0.1` | **`1.1.0`** | 同上 |
+| `GenericBlendStrategy` | `1.0.1` | **`1.1.0`** | 同上 |
+
+- **为什么是 minor 而不是 major**：没有任何部署策略的权重会移动（0/58 dump、0 配置键启用），
+  消失的只是一个「谁也不能开」的参数面；推翻的是**开关的存在**，不是引擎契约。
+- **为什么不是 patch**：被**认可**的参数集合变了（`StrategyConfig` 少六个字段、
+  `generate_weights` 少八条列读取分支），按第 7 条该升 minor。
+- **同 major 容差**：`scripts/live_preflight.py::select_prior_state` 已按 `NV8` 改为**同 major**
+  才算同一引擎时代，因此 `2.0.0 → 2.1.0` **不会**让上一轮 `prior_state` 冷启动；
+  换 major 仍然拒绝。`_assert_version_axis`（dump ↔ 活类）**故意保持精确比较** ——
+  它回答的是「这个确切引擎能否写这份产物」，与「哪一代引擎写的这本账」是两个问题。
+- **dump 重生成**：已执行 `uv run python research_strategy/run_research_strategy.py --dump-strategies`，
+  58 份 dump 中**只有六个 blend 文件**变化，且差异**仅在版本字段**（例如
+  `chan_four_state_blend_strategy.json`：`strategy_version 1.5.0 → 1.6.0`、
+  `base_version 2.0.0 → 2.1.0`，`version_info.composite_version` 同步为
+  `1.6.0 [base: 2.1.0]`）。其他 52 份逐字节未动。
+- **实盘票据**：版本号在
+  `pipeline/research/blend/blend_base.py::BaseBlendAllocationStrategy.__init__`
+  （`self.base_version` / `version_string`）写入实例，经 `run_live_strategy.py` 的
+  `get_version_info()` / `version_info` 进入票据与 `summary.json`；本节**未改**这条读取链。
+
+### 47.4 零漂移证明（逐位相同）
+
+- 方法：改动**前**用 `ChanFourStateBlendStrategy` 在**部署参数**（`strategies_config.json`
+  的 `chan_four_state_blend.parameters`）与 520 根合成日线上算出稀疏权重并落盘，
+  改动**后**用同一脚本重算，比较 `pickle` 与 `%.17g` CSV 的 sha256。
+- 结果：**完全相同** —— `sha256(pickle) = 033670cc38d6442940afcf62cc8fae2db8e572f78cd1304957da4dbf3c7749c6`、
+  119 个调仓行，改前改后一致（`version_string` 由 `v1.5.0 [base: v2.0.0]` 变为
+  `v1.6.0 [base: v2.1.0]`，这是版本轴而非权重）。
+- **反向对照（防止「删了外层 if、留下内层判断」）**：把八个 5m 列以**敌意取值**注入同一 universe
+  （`UpVol_Ratio_5m=0.0`、`VWAP_Prem_5m=-0.99`、`RS_Down_5m=9.99`、`Afternoon_Low_5m=0.0`、
+  `Chan_5m_Sell_Trigger=1`、`SmartMoney_Q_5m=-9.99`、`Chan_5m_Buy_Confluence=2`、
+  `Afternoon_Ret_5m=-0.99`），任何残留读取都会翻转决策；结果 sha256 **仍等于基线**
+  ⇒ 引擎**一次也没有读过**这些列。
+
+### 47.5 验证与边界
+
+- 离线测试（`--import-mode=importlib`）：`pipeline/research_strategy/tests` **629 passed, 1 xfailed**；
+  `pipeline/tests` **1700 passed, 1 skipped**；`backtester/tests` **124 passed**；
+  `common/tests` **1528 passed, 1 skipped**；`web/livetrading/tests`（其自带 venv）
+  **426 passed, 1 skipped**。全部 100% 离线、无网络、无真实行情。
+- `pipeline/tests/test_vol_scope_version_transition.py` **10 passed**（含
+  `test_real_dump_agrees_with_the_live_class_and_carries_the_pin`，即 dump ↔ 活类的精确版本门禁）；
+  `pipeline/research_strategy/tests/test_blend_strategy_versioning.py` **3 passed**；
+  `pipeline/tests/test_prior_state_selection.py` **38 passed**（含
+  `("2.0.0", "2.1.0")` 参数化：旧 2.0.0 快照对 2.1.0 活引擎**仍可采纳**）。
+- **未动**：`docs/development_plan.md`、`scripts/live_preflight.py`、`web/livetrading/**`、
+  `common/overnight_derisk.py`、`common/intraday_drawdown_derisk.py` 及其文档；
+  未 `git commit`。
+- **残余命中**：`grep -rn "blend_enable_intraday_5m|…" --include=*.py .` 只剩**退役说明性注释**
+  （`rs/config.py`、`chan_four_state_blend.py`、`run_live_multi_strategy.py`）与
+  `web/livetrading/tests/test_multi_strategy_intraday_5m.py` 的一处历史注释（该套件归属另一批次，
+  本轮不改）。没有任何可执行代码再引用这六个键。

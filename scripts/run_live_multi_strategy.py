@@ -81,6 +81,7 @@ from common.cli_utils import (
 )
 from common.data import get_data_provider
 from common.freshness import assert_fresh_universe, latest_close
+from common.live_execution_timing import resolve_execution_timing
 from common.order_netting import (
     FrictionSavings,
     MarketType,
@@ -104,6 +105,7 @@ from scripts.live_preflight import (
 )
 from scripts.run_live_strategy import (
     announce_run_mode,
+    enforce_execution_executability,
     load_holdings,
     load_symbol_names,
     pad_east_asian,
@@ -345,21 +347,30 @@ def parse_strategy_specs(strategies_arg: List[str], config_file: Optional[str]) 
 # (D11 / docs/development_plan.md §4.50) REAL 5m intraday support for the netted
 # runner -- config-driven, round-level union, honest observability
 # --------------------------------------------------------------------------- #
+# (2026-11-17 owner ruling) RETIREMENT NOTE: Track-T is a refuted negative result
+# (`docs/reports/china/ablation_intraday_5m_report.md`), so the six blend-side 5m
+# FEATURE switches were DELETED from `StrategyConfig` and `blend_base.py`. NO SHIPPED
+# STRATEGY CAN THEREFORE REQUEST 5m ANY MORE (0/58 dumps, 0 config keys): the machinery
+# below stays because it is generic over ANY template's `resolve_param` and its
+# zero-request state is pinned by tests, but in production it now always takes the
+# "zero requests" path (`source="none"`, no load). It must NOT be re-pointed at a real
+# strategy's params without re-running that ablation.
+# --------------------------------------------------------------------------- #
 # WHY THIS BLOCK EXISTS
 # ---------------------
 # Until `D11` this runner had NO 5m code path at all: `load_live_universe(..., interval="1d")`
-# was the only load, so `blend_base.py`'s `enable_intraday_5m` (and the Garman-Klass /
-# UpVol / Chan-5m gates behind it) could only ever degrade to the daily signal.  The web
-# layer's matrix argv stopped passing `--enable-intraday-5m` in `P4b` precisely because
-# this script never defined it (`891df17`); re-adding a manual switch is NOT the fix.
+# was the only load, so `blend_base.py`'s blend 5m gates (all deleted 2026-11-17) could only
+# ever degrade to the daily signal.  The web layer's matrix argv stopped passing
+# `--enable-intraday-5m` in `P4b` precisely because this script never defined it (`891df17`);
+# re-adding a manual switch is NOT the fix.
 #
 # §4.50.0 (user ruling, 2026-11-06): the switch FOLLOWS CONFIGURATION -- there is no
 # default-off CLI switch on this path.  The single criterion is the strategy's own
-# `enable_intraday_5m` param, resolved through THAT template's own resolver
-# (§4.50.1), so the loading decision and the consuming decision (`blend_base.py:714`)
-# cannot disagree.  Re-implementing the precedence chain here (`params.get(...)` or a
-# `*_enable_intraday_5m` scan) would miss `cfg.blend_enable_intraday_5m` and reproduce
-# the 2026-10-22 "printed success, fields all empty" defect on this path.
+# `enable_intraday_5m` param, resolved through THAT template's own resolver (§4.50.1), so
+# the loading decision and the consuming decision cannot disagree.  Re-implementing the
+# precedence chain here (`params.get(...)` or a `*_enable_intraday_5m` scan) would miss a
+# config-level value and reproduce the 2026-10-22 "printed success, fields all empty" defect
+# on this path.
 #
 # §4.50.2: the load/enrich is a ROUND-LEVEL UNION (one call over `all_symbols_to_load`,
 # including out-of-universe holdings) and must stay OUTSIDE the per-strategy loop -- once
@@ -379,9 +390,14 @@ INTRADAY_5M_INDICATOR_COLUMN = "UpVol_Ratio_5m"
 #: block came from the round's own child process, not from stdout/stage-1 reconciliation.
 INTRADAY_5M_SOURCE = "multi_strategy_netted"
 
-#: Same default as Stage 2 (`run_live_strategy.py --cutoff-time`) and
-#: `pipeline/research/blend/blend_base.py:719`.
-DEFAULT_INTRADAY_CUTOFF_TIME = "14:15"
+#: Same default as Stage 2 (`run_live_strategy.py --cutoff-time`): the FULL session.
+#: (2026-11-17 owner ruling) Live runs are post-close only and the intraday execution mode is
+#: retired, so the default cutoff truncates nothing; `_parse_time_cutoff` maps "15:00" and
+#: `None` to the same full-day window (`common/intraday_features.py`). The former note here
+#: ("`StrategyConfig.blend_intraday_cutoff_time` supplies 15:00 earlier in the chain") is
+#: DELETED with that field: this constant is now the whole convention, not a fallback behind
+#: a config value that no longer exists.
+DEFAULT_INTRADAY_CUTOFF_TIME = "15:00"
 
 _HHMM_RE = re.compile(r"^\d{1,2}:\d{2}$")
 
@@ -389,10 +405,17 @@ _HHMM_RE = re.compile(r"^\d{1,2}:\d{2}$")
 def resolve_intraday_5m_request(template: Any, params: Dict[str, Any]) -> Tuple[bool, bool]:
     """`(requested, resolved_by_template)` for ONE strategy (§4.50.1).
 
-    Uses the template's OWN `resolve_param` when it exposes one (`BaseBlendAllocationStrategy`
-    and every subclass), so the loading decision walks the very same precedence chain the
-    consumer walks: `p.<prefix>_<name>` -> `p.blend_<name>` -> `p.<name>` -> `cfg.<prefix>_<name>`
-    -> `cfg.blend_<name>` -> `cfg.<name>` -> default.
+    Uses the template's OWN `resolve_param` when it exposes one, so the loading decision
+    walks the very same precedence chain the consumer walks: `p.<prefix>_<name>` ->
+    `p.blend_<name>` -> `p.<name>` -> `cfg.<prefix>_<name>` -> `cfg.blend_<name>` ->
+    `cfg.<name>` -> default.
+
+    (2026-11-17 owner ruling) NO SHIPPED STRATEGY can request 5m any more: the blend-side
+    switches were deleted from `StrategyConfig` and `blend_base.py` with their read sites,
+    so the `cfg.*` links of that chain are empty for every real template. A bare
+    `p["enable_intraday_5m"]` key in a hand-written strategy file would still resolve --
+    which is why this stays a resolver rather than a constant, and why the zero-request
+    state is what production now always takes.
 
     Static allocation templates carry no such switch (they have no `resolve_param`), so they
     can never request 5m; `resolved_by_template=False` records that this was a "no switch to
@@ -455,7 +478,15 @@ def combine_intraday_5m_providers(values: List[Optional[str]]) -> Optional[str]:
 
 
 def resolve_intraday_cutoff(template: Any, params: Dict[str, Any]) -> str:
-    """The requesting strategy's own `intraday_cutoff_time`, defaulted to 14:15."""
+    """The requesting strategy's own `intraday_cutoff_time`, defaulted to the FULL session.
+
+    (2026-11-17) Default changed from "14:15" to "15:00" -- live runs are post-close only, so
+    the default must not narrow any strategy's 5m information set. The blend
+    `StrategyConfig.intraday_cutoff_time` field is DELETED, so for every real template this
+    now returns `DEFAULT_INTRADAY_CUTOFF_TIME` unless the strategy's own `params` names a
+    cutoff; the resolver shape is kept because it is generic over `template.resolve_param`
+    and its behaviour is pinned by tests.
+    """
     resolver = getattr(template, "resolve_param", None)
     if not callable(resolver):
         return DEFAULT_INTRADAY_CUTOFF_TIME
@@ -501,6 +532,13 @@ def load_intraday_5m_panel(
     Imported lazily (as Stage 2 does) so this runner keeps working in an environment where
     the optional intraday dependencies are absent, and exposed as a module-level name so a
     test can prove the loader is NOT called in the zero-request state.
+
+    (2026-11-17) `cutoff_time` is KEPT on this seam but deliberately NOT forwarded:
+    `load_intraday_5m_universe`'s own `cutoff_time` parameter was dead (it never narrowed a
+    bar) and has been deleted, so forwarding it now would be a lie. The cutoff that actually
+    matters is applied one layer up, by `enrich_intraday_5m_panel` ->
+    `IntradayFeatureConfig(cutoff_time=...)`. The argument stays in the signature because it
+    is the round's single cutoff and the seam is where a caller/test observes it.
     """
     from common.intraday_features import load_intraday_5m_universe
 
@@ -509,7 +547,9 @@ def load_intraday_5m_panel(
         start=start,
         end=end,
         data_provider=data_provider,
-        cutoff_time=cutoff_time,
+        # (2026-11-17) `cutoff_time` is NOT forwarded: the loader's dead `cutoff_time`
+        # parameter was removed (it never narrowed anything). The cutoff is applied by
+        # `enrich_intraday_5m_panel` -> `IntradayFeatureConfig(cutoff_time=...)`.
         cache_dir=cache_dir,
     )
 
@@ -530,7 +570,6 @@ def enrich_intraday_5m_panel(
         universe,
         universe_5m,
         config=IntradayFeatureConfig(cutoff_time=cutoff_time),
-        synthesize_intraday_bar=True,
     )
 
 
@@ -904,6 +943,37 @@ def main():
     # predicate in the codebase, not a second copy that can drift.
     run_mode = resolve_run_mode(clock_ctx)
     announce_run_mode(clock_ctx, run_mode)
+    # (NV16 / D3 parity) EXECUTION-EXECUTABILITY GATE. This runner declares the same frozen
+    # ticket vocabulary as Stage 2 (`execution_session=as_of+1` / `price_reference=next_open`,
+    # inherited through `common/live_execution_timing.py`), so it must also refuse to WRITE a
+    # netted ticket after the open that ticket claims to fill at.
+    #
+    # THE HOLE THIS CLOSES. Before NV16 this runner had the run-window gate only
+    # (`resolve_live_clock_context(..., stage="stage2")` above) and no executability check:
+    # `--allow-intraday` (web default `True` until NV16, `common/cli_utils.py`'s
+    # `intraday_allowed` branch) downgrades the window refusal to a warning, so a mid-session
+    # (11:00 / 14:00) multi-strategy run wrote `netted_trading_ticket.json` whose declared
+    # fill instant had already passed -- while the single-strategy path failed closed at
+    # `scripts/run_live_strategy.py::enforce_execution_executability`. 2026-11-17 operator
+    # ruling: live ticketing is post-close -> next-open ONLY, so intraday ticketing is never
+    # legitimate; this gate is the enforcement of that ruling on the netted path.
+    #
+    # ONE implementation, not a copy: the helper is imported from `scripts.run_live_strategy`
+    # on purpose (same reasoning as `resolve_run_mode` above) -- there must be exactly ONE
+    # executability predicate in the codebase, so the two runners cannot drift. `--allow-intraday`
+    # is deliberately NOT consulted: it relaxes the inspection WINDOW only, never a missed open.
+    # Replay (`run_mode="replay"`, a pinned PAST `--as-of-date`) stays exempt INSIDE
+    # `annotate_executability` -- there is no live fill to be late for, which is also why the
+    # replay/backfill escape hatch needs no flag from this runner.
+    #
+    # PLACEMENT INVARIANT: keep this ABOVE every write and every data load in this function
+    # (above `os.makedirs(args.output_dir)` and above `load_live_universe`). The refusal must
+    # cost nothing and must not leave any ticket artifact behind; the only file it may write is
+    # the auditable `execution_timing.json` block that records the refusal itself.
+    timing = resolve_execution_timing(clock_ctx, as_of=clock_ctx.as_of_date, run_mode=run_mode)
+    print(f"[EXECUTION TIMING] {timing['header_text']}")
+    print(f"[EXECUTION TIMING] {timing['overnight_gap_hint']}")
+    timing = enforce_execution_executability(timing, clock_ctx, args.output_dir)
     if getattr(args, "start_date", None):
         start_date = args.start_date
     else:
@@ -977,9 +1047,10 @@ def main():
 
     # (D11 / §4.50.1) Resolve the 5m REQUEST before anything is loaded -- one pre-pass using
     # the SAME `resolve_strategy_definition` the strategy loop uses, so the loading decision
-    # and the consuming decision (`blend_base.py:714`) can never drift. A `params.get(...)`
-    # here would miss `cfg.blend_enable_intraday_5m` and silently reproduce the 2026-10-22
-    # "printed success, fields all empty" defect on this path.
+    # and the consuming decision can never drift. A `params.get(...)` here would miss a
+    # config-level value and silently reproduce the 2026-10-22 "printed success, fields all
+    # empty" defect on this path. (2026-11-17: the blend switches are deleted, so this pre-pass
+    # now always finds ZERO requesters for a shipped strategy -- see the retirement note above.)
     resolved_strategies: List[Dict[str, Any]] = []
     intraday_5m_requesters: List[str] = []
     intraday_cutoffs: List[str] = []

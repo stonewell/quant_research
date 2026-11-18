@@ -21,6 +21,11 @@ WHAT IS PINNED (and what must turn red)
    for the market minus the cash proxies**, NOT the target book: the symbol set passed to
    `compute_gap_series` is identical when only the target book changes (rotation invariance), and
    cash proxies present in the universe never enter `N_t`.
+8. (freeze doc `## Revision 2026-11-17`) `R6` is **retired by default** as a negative result: the
+   module's `enabled` default and the runner's `--enable-overnight-derisk` default are both
+   **OFF**, so Stage 2 leaves the book bit-identical *without being told to*; the explicit opt-in
+   (`--enable-overnight-derisk`) still reproduces the full `TRIGGERED` path end to end. A missing
+   `overnight_derisk` block means "did not run", never `NOT_TRIGGERED`.
 
 100% offline: synthetic frames only. No network, no cache, no real market data, no
 `data/runs/**`, no `backtests_research/`.
@@ -450,7 +455,11 @@ def test_frozen_defaults_and_spec_version():
     assert cfg.baseline_window == 252
     assert cfg.sigma_multiplier == 2.0
     assert cfg.downscale_ratio == 0.5
-    assert cfg.enabled is True
+    # (freeze doc `## Revision 2026-11-17`) `R6` is retired by default: the judgement is NOT
+    # evaluated unless a caller asks for it. The switch is the only thing that moved -- the
+    # arithmetic above is byte-identical, and explicit ON restores `r6.3` in full.
+    assert cfg.enabled is False
+    assert OvernightDeriskConfig(enabled=True).enabled is True
     assert STATUSES == ("TRIGGERED", "NOT_TRIGGERED", "INSUFFICIENT_DATA")
 
 
@@ -557,6 +566,10 @@ def test_stage2_ticket_applies_the_triggered_downscale(tmp_path, monkeypatch):
     verdict is TRIGGERED without needing a ~300-session synthetic panel that happens to gap; the
     rest of the Stage-2 path (weights -> gates -> share math -> ticket) runs for real against the
     offline synthetic provider.
+
+    (freeze doc `## Revision 2026-11-17`) `R6` is retired by default, so this case passes
+    `--enable-overnight-derisk` EXPLICITLY: it is the proof that the explicit opt-in still
+    reproduces `r6.3` end to end, byte for byte.
     """
     import json
 
@@ -588,6 +601,7 @@ def test_stage2_ticket_applies_the_triggered_downscale(tmp_path, monkeypatch):
             "synthetic",
             "--portfolio-value",
             "100000",
+            "--enable-overnight-derisk",
         ]
     )
 
@@ -610,7 +624,19 @@ def test_stage2_ticket_applies_the_triggered_downscale(tmp_path, monkeypatch):
     assert summary["clock"]["probe_attempts"] >= 1
 
 
-def test_stage2_flag_off_leaves_the_book_untouched(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "extra_argv",
+    [(), ("--no-enable-overnight-derisk",)],
+    ids=["default_off", "explicitly_off"],
+)
+def test_stage2_without_the_opt_in_leaves_the_book_untouched(tmp_path, monkeypatch, extra_argv):
+    """`R6` is retired by default (freeze doc `## Revision 2026-11-17`).
+
+    Two argv shapes must BOTH leave the book alone: **omitting** the flag (the new default) and
+    passing `--no-enable-overnight-derisk` explicitly. `compute_gap_series` is poisoned in both,
+    so a regression that re-enables the judgement by default fails loudly instead of quietly
+    halving the book.
+    """
     import json
 
     import scripts.run_live_strategy as runner
@@ -619,7 +645,10 @@ def test_stage2_flag_off_leaves_the_book_untouched(tmp_path, monkeypatch):
     universe_file.write_text("600000.SH\n601398.SH\n", encoding="utf-8")
 
     def _boom(*args, **kwargs):  # pragma: no cover - must never be called
-        raise AssertionError("--no-enable-overnight-derisk must not evaluate the judgement")
+        raise AssertionError(
+            "overnight-derisk must not be evaluated without --enable-overnight-derisk "
+            f"(argv={extra_argv})"
+        )
 
     monkeypatch.setattr(runner, "compute_gap_series", _boom)
 
@@ -639,7 +668,7 @@ def test_stage2_flag_off_leaves_the_book_untouched(tmp_path, monkeypatch):
             "synthetic",
             "--portfolio-value",
             "100000",
-            "--no-enable-overnight-derisk",
+            *extra_argv,
         ]
     )
 
@@ -720,7 +749,14 @@ def _spy_gap_cross_sections(monkeypatch):
     return calls
 
 
-def _r6_stage2_args(universe_file, out_dir, as_of="2024-05-10", start="2023-01-01"):
+def _r6_stage2_args(universe_file, out_dir, as_of="2024-05-10", start="2023-01-01", enable=True):
+    """Stage-2 argv shared by the `r6.3` wiring tests.
+
+    (freeze doc `## Revision 2026-11-17`) `R6` is retired by default, so the judgement is switched
+    on **explicitly** here: every r6.3 wiring case asserts the opt-in path, and control arms ask
+    for `enable=False` (an explicit `--no-enable-overnight-derisk`) instead of relying on the flag
+    being absent. That way a future default change can never silently turn these cases vacuous.
+    """
     return [
         "--strategy", "equal_weight",
         "--universe-file", str(universe_file),
@@ -730,6 +766,7 @@ def _r6_stage2_args(universe_file, out_dir, as_of="2024-05-10", start="2023-01-0
         "--data-provider", "synthetic",
         "--portfolio-value", "100000",
         "--no-cache",
+        "--enable-overnight-derisk" if enable else "--no-enable-overnight-derisk",
     ]
 
 
@@ -857,23 +894,22 @@ def test_stage2_triggered_downsize_turns_a_held_winner_into_a_sell(tmp_path, mon
         lambda universe, as_of_date: (gap, _symbols_used(gap)),
     )
 
-    def _run(tag, extra):
+    def _run(tag, enable=True):
         state_file = tmp_path / f"state_{tag}.json"
         state_file.write_text(json.dumps({"holding_bars": {"600000.SH": 60}}), encoding="utf-8")
         out_dir = tmp_path / tag
         runner.main(
-            _r6_stage2_args(universe_file, out_dir)
+            _r6_stage2_args(universe_file, out_dir, enable=enable)
             + [
                 "--account-state-file", str(state_file),
                 "--current-holdings", json.dumps({"600000.SH": held_weight}),
                 "--exit-confirm-bars", "1",
             ]
-            + list(extra)
         )
         payload = json.loads((out_dir / "live_trading_ticket.json").read_text(encoding="utf-8"))
         return {r["symbol"]: r for r in payload["orders"]}
 
-    rows = _run("derisked", [])
+    rows = _run("derisked")
     row = rows["600000.SH"]
     assert row["action"] == "SELL", f"expected a downsizing SELL, got {row['action']} ({row.get('reason')})"
     # Weight truth: the de-risked target, not the raw 0.5.
@@ -886,8 +922,8 @@ def test_stage2_triggered_downsize_turns_a_held_winner_into_a_sell(tmp_path, mon
     assert int(row["delta_shares"]) < 0
     assert row["current_weight"] == pytest.approx(held_weight, abs=0.01)
 
-    # CONTROL: the same holdings, the same book, the flag off => the same delta is a BUY.
-    control = _run("control", ["--no-enable-overnight-derisk"])["600000.SH"]
+    # CONTROL: the same holdings, the same book, the opt-in withheld => the same delta is a BUY.
+    control = _run("control", enable=False)["600000.SH"]
     assert control["action"] == "BUY", control.get("reason")
     assert control["target_weight"] == pytest.approx(0.5)
     assert int(control["delta_shares"]) > 0

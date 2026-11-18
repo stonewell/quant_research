@@ -6,6 +6,36 @@ re-interpret it. `DECISION_SPEC_VERSION = "r1.1"` is a **judgement spec tag**, N
 version -- no `BASE_VERSION` / per-class `version` obligation attaches to a pure module
 (AGENTS §7), and none may be invented "for symmetry".
 
+RETIRED BY DEFAULT (owner ruling 2026-11-17, freeze document `## Revision 2026-11-17`)
+--------------------------------------------------------------------------------------
+`R1` is **closed as a negative result**. Its *measurement* face and its *execution* face no
+longer sit on the same basis, so the judgement cannot execute its own verdict:
+
+* the drawdown is measured on the **decision session's full close** -- the 5m cutoff now
+  defaults to the whole session (`common/intraday_features.py:84-95`; Stage-1
+  `scripts/check_live_portfolio_health.py:455-466`; Stage-2 `scripts/run_live_strategy.py`
+  `:2088-2098`), and the producer recomputes `hwm_intra` / `dd_trough` over that window
+  (`scripts/check_live_portfolio_health.py:5427-5428` -- the freeze document's
+  `:2856-2857` citation is a stale snapshot of the same expression);
+* the ticket such a reading would re-size is priced off that same close
+  (`scripts/run_live_strategy.py:7579`) with next-session limit bands (`:7976-7981`, pricing at
+  `:8079-8097`), and it fills at the **`T+1` open** (`execution_session=as_of+1` /
+  `price_reference=next_open`, `:6083`, `:9003`). A `T`-close measurement therefore sizes an
+  order that only trades at the `T+1` open -- two bases -- and for a *de-risk of existing
+  exposure* the protection arrives **after** the gap / next-session move it exists to pre-empt.
+
+The shipped opt-in path does not rescue this, it narrows it: it is **buy-side only**
+(`--enforce-r1-derisk`, `:1995-2005`: buy increments are multiplied, sells and the cash leg
+untouched), so it cannot lower exposure already held. Only the *entry throttle* survives; the
+frozen "market-layer exposure downshift" does not. Nothing arithmetic moves -- the ladder, the
+thresholds, the multipliers, the tri-state vocabulary, `DECISION_SPEC_VERSION = "r1.1"` and
+every exported name are untouched, and the acceptance suite is kept as executable history. The
+enforcement path is **CLOSED pending the pre-registration** in the freeze document's revision,
+and it is OFF by default anyway (`--enforce-r1-derisk` is a `store_true` flag;
+`LIVETRADING_DISABLE_R1_DERISK=1` kills it again). "RETIRED" is about *shipping it*, never about
+the numbers: they stay at their frozen values, and re-tuning them here is still forbidden (that
+requires appending to the freeze document first).
+
 WHAT THIS IS (positioning before arithmetic)
 --------------------------------------------
 One question, asked **before the open**: *yesterday's session ended `dd` below its own intraday
@@ -91,12 +121,24 @@ BOUNDARIES (do not "helpfully" fold these in)
   `:1727`), `R6` owns the overnight gap judgement: same market layer, different dependent variables,
   thresholds never shared. (The ledger's `:1364` citation for that label is stale -- `:1364` is now
   `def evaluate_market_breadth_and_thrust`; the label lives at the two lines above.)
-* **Round 1 is advisory only.** `advisory=True` / `gates_orders=False` travel on every result and
-  the dataclass **refuses** to be built any other way. This round wires nothing: no
-  `scripts/run_live_strategy.py` change, no ticket field, no weight rewrite, no `blend_base.py`
-  touch, no strategy-class change, no version-axis movement. Deliberately absent: any
-  `apply_*_downscale` helper -- the only thing a caller may do with a result this round is print it
-  (the fence idiom of `common/specific_alpha.py:536-544`).
+* **Advisory by default; one explicit opt-in enforcement path exists, and it is CLOSED.**
+  `advisory=True` / `gates_orders=False` travel on every result and the dataclass **refuses** to
+  be built any other way -- that fence is unchanged, and it is still what makes the module safe
+  by default. But the original sentence "this round wires nothing" is **no longer true**; it is
+  corrected here rather than deleted, because the frozen text above is history and the freeze
+  document's `## Revision 2026-11-17` is the authoritative correction. `AT7` P3 (user-approved
+  2026-11-09) shipped a Stage-2 enforcement path: `scripts/run_live_strategy.py:1995-2005`
+  declares `--enforce-r1-derisk` (a `store_true` flag, **default OFF**), `:2890` /
+  `:2925` (`LIVETRADING_DISABLE_R1_DERISK`, `r1_derisk_enforcement_enabled`) gate it,
+  `:7236-7258` composes it, `:7490-7511` reports it, and the applier lives in
+  `common/r1_derisk_report.py:84` -- **not** here. It reads the block's *float multiplier*,
+  never this dataclass's `gates_orders` flag, so the fence above is not what it violates; what
+  it violates is the frozen *claim*, because that path is **buy-side only** (buy increments
+  multiplied, sells and the cash leg untouched) and therefore cannot lower existing exposure.
+  Per the owner ruling of 2026-11-17 it is **closed pending the pre-registration** in the freeze
+  document -- do not turn it on again without a measured face that matches the execution instant.
+  This module still exposes **no** `apply_*` helper: the only thing a caller may do with a result
+  is print it (the fence idiom of `common/specific_alpha.py:536-544`).
 * **Pure**: no I/O, no clock reads, no network, no randomness, no global state, no warnings. Same
   inputs => equal outputs.
 """

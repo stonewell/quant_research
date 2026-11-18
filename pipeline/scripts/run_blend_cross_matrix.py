@@ -1,13 +1,25 @@
 #!/usr/bin/env python3
 """Cross-Ablation Matrix Orchestrator for Institutional Blend Strategies.
 
-Orchestrates the 6-cell cross-ablation matrix comparing:
-- Run 0: Baseline (All Track C & Track T = False)
+RETIREMENTS (2026-11-17 owner ruling):
+- **Track T (5m intraday) is RETIRED and removed from every cell below.** The six blend-side
+  5m FEATURE switches were deleted from `StrategyConfig` / `blend_base.py` after
+  `docs/reports/china/ablation_intraday_5m_report.md` found M1 bit-identical to the M0
+  baseline, M2/M3/M4 degrading Sharpe 0.210 -> 0.135, and ERS `UNTRUSTED` (percentile 1.0%).
+  Cells `track_t_core` / `track_t_full` therefore carry NO params (they re-run the baseline)
+  and `synergy_all` is reduced to Track C Full. Do not re-add those keys: they no longer
+  exist in `StrategyConfig`, and a matrix cell that "sets" them would silently run the
+  baseline while its label claimed otherwise. Historic Track-T numbers live only in the
+  report above (not reproducible).
+- Cells 0-2 (baseline / Track C core / Track C full) are unchanged.
+
+Orchestrates the cross-ablation matrix comparing:
+- Run 0: Baseline (All Track C = False)
 - Run 1: Track C Core (regime=True, cyq_gate=True)
 - Run 2: Track C Full (All Track C = True)
-- Run 3: Track T Core (intraday=True, nesting=True)
-- Run 4: Track T Full (All Track T = True)
-- Run 5: Synergy All (All Track C = True, All Track T = True)
+- Run 3: retired Track-T core (no params -- baseline)
+- Run 4: retired Track-T full (no params -- baseline)
+- Run 5: Synergy All (All Track C = True; Track T retired)
 
 Across Round 1 (2022-01-01 to 2025-12-31) and Round 2 (2025-11-28 to 2026-09-30).
 Parses walkforward_summary.json across all strategies and generates comprehensive
@@ -74,35 +86,19 @@ MATRIX_CONFIGS = [
     {
         "id": 3,
         "name": "track_t_core",
-        "description": "Track T Core (intraday=True, nesting=True)",
-        "params": {
-            "blend_enable_intraday_5m": True,
-            "blend_enable_5m_interval_nesting": True,
-            "enable_intraday_5m": True,
-            "enable_5m_interval_nesting": True,
-        },
+        "description": "Track T Core -- RETIRED 2026-11-17 (switches deleted; re-runs the baseline)",
+        "params": {},
     },
     {
         "id": 4,
         "name": "track_t_full",
-        "description": "Track T Full (All Track T = True)",
-        "params": {
-            "blend_enable_intraday_5m": True,
-            "blend_enable_5m_interval_nesting": True,
-            "blend_intraday_upvol_thresh": 0.58,
-            "blend_use_intraday_downside_vol": True,
-            "blend_enable_5m_stop_filter": True,
-            "enable_intraday_5m": True,
-            "enable_5m_interval_nesting": True,
-            "intraday_upvol_thresh": 0.58,
-            "use_intraday_downside_vol": True,
-            "enable_5m_stop_filter": True,
-        },
+        "description": "Track T Full -- RETIRED 2026-11-17 (switches deleted; re-runs the baseline)",
+        "params": {},
     },
     {
         "id": 5,
         "name": "synergy_all",
-        "description": "Synergy All (All Track C = True, All Track T = True)",
+        "description": "Synergy All (All Track C = True; Track T retired 2026-11-17)",
         "params": {
             # Track C Full
             "blend_enable_structural_regime": True,
@@ -117,17 +113,9 @@ MATRIX_CONFIGS = [
             "enable_vp_confluence_sizing": True,
             "enable_spring_fast_entry": True,
             "enable_structural_chandelier_stop": True,
-            # Track T Full
-            "blend_enable_intraday_5m": True,
-            "blend_enable_5m_interval_nesting": True,
-            "blend_intraday_upvol_thresh": 0.58,
-            "blend_use_intraday_downside_vol": True,
-            "blend_enable_5m_stop_filter": True,
-            "enable_intraday_5m": True,
-            "enable_5m_interval_nesting": True,
-            "intraday_upvol_thresh": 0.58,
-            "use_intraday_downside_vol": True,
-            "enable_5m_stop_filter": True,
+            # Track T retired 2026-11-17: the six blend 5m feature keys no longer exist in
+            # StrategyConfig, so passing them would be dead config at best (from_dict drops
+            # unknown keys) and a misleading label at worst.
         },
     },
 ]

@@ -185,11 +185,56 @@ def test_stage1_argv_is_unchanged_when_the_flag_is_not_supplied(workspace, monke
         "--cache-dir",
         st.cache_dir,
         "--enable-intraday-5m",
+        # (`NV16`, 2026-11-17; split by path afterwards) Stage 1 is the INSPECTION path, so its
+        # request default is `True` again: a health check emits no orders, so an unsupplied
+        # caller relaxes only the inspection WINDOW. The TICKETING rows below stay `False`.
+        # This is the ONLY delta in this argv; the P1-1 subject (no
+        # `--intraday-publish-after` token when unsupplied) is untouched.
         "--allow-intraday",
         "--no-refresh-data",
     ]
     # The `--strategy-file` value is the resolved strategy path, not the raw argument.
     assert os.path.basename(_flag(argv, "--strategy-file")) == "strat.json"
+
+
+def test_stage1_explicit_false_still_denies_the_window(workspace, monkeypatch):
+    """The inspection default is `True` again, but an explicit `False` must still reach argv.
+
+    Full token list, not "the token is somewhere": the ONLY delta versus the default argv is
+    that one token, so nothing was appended or reordered by the value itself.
+    """
+    argv, _svc = _run_stage1(workspace, monkeypatch, allow_intraday=False)
+
+    run_dir = _flag(argv, "--output-dir")
+    st = workspace["storage"]
+    assert argv == [
+        st.python_executable,
+        st.stage1_script,
+        "--strategy-file",
+        _flag(argv, "--strategy-file"),
+        "--universe-file",
+        os.path.join(run_dir, "resolved_universe.txt"),
+        "--portfolio-value",
+        "100000.0",
+        "--output-dir",
+        run_dir,
+        "--account-state-file",
+        os.path.join(run_dir, "account_state.json"),
+        "--data-provider",
+        PROVIDER,
+        "--nav-breakdown-file",
+        os.path.join(run_dir, execution_service.NAV_BREAKDOWN_FILENAME),
+        "--as-of-date",
+        AS_OF,
+        "--start-date",
+        START,
+        "--cache-dir",
+        st.cache_dir,
+        "--enable-intraday-5m",
+        # The explicit value -- NOT the permissive default.
+        "--no-allow-intraday",
+        "--no-refresh-data",
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -277,6 +322,46 @@ def test_stage2_argv_is_unchanged_when_the_flag_is_not_supplied(workspace, monke
         "--enable-intraday-5m",
         "--guard-latency-bars",
         "2",
+        # (`NV16`) TICKETING path: default stays False -- a deploy emits an order ticket, so an
+        # unsupplied caller is told NOT to relax the run window.
+        "--no-allow-intraday",
+    ]
+
+
+def test_stage2_explicit_true_still_relaxes_the_window(workspace, monkeypatch):
+    """The deploy default stays `False`, but an explicit `True` must still flip the token."""
+    stage1_argv, svc = _run_stage1(workspace, monkeypatch)
+    run_dir = _flag(stage1_argv, "--output-dir")
+    argv = _run_stage2(workspace, monkeypatch, svc, run_dir, allow_intraday=True)
+
+    st = workspace["storage"]
+    assert argv == [
+        st.python_executable,
+        st.stage2_script,
+        "--strategy-file",
+        _flag(argv, "--strategy-file"),
+        "--universe-file",
+        os.path.join(run_dir, "resolved_universe.txt"),
+        "--portfolio-value",
+        f"{SHARES * PRICE + CASH}",
+        "--current-holdings-file",
+        os.path.join(run_dir, "holdings.json"),
+        "--output-dir",
+        run_dir,
+        "--account-state-file",
+        os.path.join(run_dir, "account_state.json"),
+        "--data-provider",
+        PROVIDER,
+        "--as-of-date",
+        AS_OF,
+        "--start-date",
+        START,
+        "--cache-dir",
+        st.cache_dir,
+        "--enable-intraday-5m",
+        "--guard-latency-bars",
+        "2",
+        # The explicit value -- NOT the fail-closed default.
         "--allow-intraday",
     ]
 

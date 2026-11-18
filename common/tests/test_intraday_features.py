@@ -701,7 +701,11 @@ def test_marketdb_and_fuyao_index_gap_fallback_stitching(tmp_path, monkeypatch):
 
 
 def test_intraday_features_causal_truncation_and_kappa_alignment():
-    """Test 6 (T2.1, T5.1): Causal truncation (36/39/48 bars, R1), anti-lookahead, kappa_t alignment (R4/R6), and Is_Partial_Bar (R12)."""
+    """Test 6 (T2.1, T5.1): Causal truncation (36/39/48 bars, R1), anti-lookahead, kappa_t alignment (R4/R6).
+
+    (2026-11-17) The `Is_Partial_Bar` (R12) half of this test is gone with the retired synthesis
+    path; the truncation/alignment halves are unchanged.
+    """
     from common.intraday_features import (
         IntradayFeatureConfig,
         compute_daily_intraday_features,
@@ -770,10 +774,13 @@ def test_intraday_features_causal_truncation_and_kappa_alignment():
     assert feat_1415.loc[d_crash, "Close_5m_Cutoff"] == pytest.approx(100.0)
     assert feat_full.loc[d_crash, "Close_5m_Cutoff"] == pytest.approx(92.0)
 
-    # Is_Partial_Bar flag assertions (R12)
-    assert feat_1400.loc[d_crash, "Is_Partial_Bar"] == 1
-    assert feat_1415.loc[d_crash, "Is_Partial_Bar"] == 1
-    assert feat_full.loc[d_crash, "Is_Partial_Bar"] == 0
+    # (2026-11-17) The `Is_Partial_Bar` / `Is_Cutoff_Truncated` flag columns were DELETED with
+    # the retired daily-bar synthesis. A complete 48-bar sample is measured at every cutoff, so
+    # the only thing left to assert is that neither retired column survives in the frame.
+    for retired in ("Is_Partial_Bar", "Is_Cutoff_Truncated"):
+        assert retired not in feat_1400.columns
+        assert retired not in feat_1415.columns
+        assert retired not in feat_full.columns
 
     # Chan 5m sub-level structure & lazy candidate date assertions (T2.3, R9)
     assert "Chan_5m_Buy_Confluence" in feat_1415.columns
@@ -813,7 +820,6 @@ def test_intraday_features_causal_truncation_and_kappa_alignment():
         universe_1d,
         universe_5m,
         config=IntradayFeatureConfig(cutoff_time="14:15"),
-        synthesize_intraday_bar=False,
     )
     df_enriched = enriched["SYM_TEST"]
 
@@ -830,18 +836,182 @@ def test_intraday_features_causal_truncation_and_kappa_alignment():
     alpha41 = np.sqrt(df_enriched.loc[d_crash, "High"] * df_enriched.loc[d_crash, "Low"]) - df_enriched.loc[d_crash, "VWAP"]
     assert abs(alpha41) < 10.0  # reasonable residual on ~200 scale, not blown up by a 100 vs 200 basis mismatch
 
-    # 4. synthesize_intraday_bar=True sets Is_Partial_Bar=1 for the truncated day
-    enriched_synth = enrich_universe_with_intraday_features(
-        universe_1d,
-        universe_5m,
-        config=IntradayFeatureConfig(cutoff_time="14:15"),
-        synthesize_intraday_bar=True,
-    )
-    df_synth = enriched_synth["SYM_TEST"]
-    assert df_synth.loc[d_crash, "Is_Partial_Bar"] == 1
-    # Prior days with complete history remain 0
-    assert df_synth.loc[days[0], "Is_Partial_Bar"] == 0
+    # 4. The daily OHLCV is NEVER rewritten by the enrichment (2026-11-17: the
+    #    `synthesize_intraday_bar` switch that used to do that is deleted outright, so the
+    #    pre-fix "overwrite the as-of bar with a 39-bar 14:15 aggregation" path cannot even be
+    #    requested). Assert the untouched daily bar and that neither retired flag column leaks
+    #    into the enriched frame.
+    for col in ("Open", "High", "Low", "Close", "Volume"):
+        assert abs(float(df_enriched.loc[d_crash, col]) - float(df_1d.loc[d_crash, col])) < 1e-9, col
+    for retired in ("Is_Partial_Bar", "Is_Cutoff_Truncated"):
+        assert retired not in df_enriched.columns
 
+
+def test_synthesize_intraday_bar_keyword_is_rejected():
+    """(2026-11-17) `synthesize_intraday_bar` is DELETED: a stale caller must fail loudly.
+
+    The daily-bar synthesis it gated is gone (see the module docstring), so silently accepting
+    the keyword as a no-op would leave callers believing a daily bar still gets rebuilt from 5m
+    data. A `TypeError` at the call site is the contract.
+    """
+    from common.intraday_features import enrich_universe_with_intraday_features
+
+    idx = pd.bdate_range("2026-10-12", periods=2)
+    frame = pd.DataFrame(
+        {"Open": [1.0, 1.0], "High": [1.0, 1.0], "Low": [1.0, 1.0],
+         "Close": [1.0, 1.0], "Volume": [1.0, 1.0]},
+        index=idx,
+    )
+    for stale_value in (True, False):
+        with pytest.raises(TypeError):
+            enrich_universe_with_intraday_features(
+                {"S": frame}, {"S": frame}, synthesize_intraday_bar=stale_value
+            )
+
+
+def _intraday_panel(day_count: int, bars_per_day: list) -> pd.DataFrame:
+    """Build `day_count` sessions of 5m bars with a caller-chosen bar count per day.
+
+    Morning 09:35..11:30 (24 bars) + afternoon 13:05.. onward, so `bars_per_day=48` is a full
+    session, `39` stops at 14:15 and `36` stops at 14:00.
+    """
+    dfs = []
+    price = 100.0
+    for i, d in enumerate(pd.bdate_range("2026-10-12", periods=day_count)):
+        ds = d.strftime("%Y-%m-%d")
+        times = pd.date_range(f"{ds} 09:35:00", f"{ds} 11:30:00", freq="5min").append(
+            pd.date_range(f"{ds} 13:05:00", f"{ds} 15:00:00", freq="5min")
+        )
+        n = int(bars_per_day[i])
+        times = times[:n]
+        c = price + np.linspace(0.0, 0.4 * n, n)
+        o = np.concatenate([[price], c[:-1]])
+        dfs.append(
+            pd.DataFrame(
+                {
+                    "Open": o,
+                    "High": np.maximum(o, c) + 0.05,
+                    "Low": np.minimum(o, c) - 0.05,
+                    "Close": c,
+                    "Volume": np.full(n, 1000.0),
+                },
+                index=times,
+            )
+        )
+        price = float(c[-1])
+    return pd.concat(dfs, axis=0)
+
+
+def test_enrich_never_overwrites_a_complete_daily_bar():
+    """(a)/(c) 2026-11-17: a complete official daily bar survives enrichment untouched.
+
+    The daily frame is deliberately on a DIFFERENT adjustment basis (+0.35%) than the 5m feed,
+    mirroring the qfq-daily vs raw-5m gap measured on `600000.SH` 2025-08-06, so any attempt to
+    re-derive the as-of `Close` from 5m bars moves it by ~0.35% and cannot be missed.
+
+    re-break: reintroduce ANY code path that writes `df.loc[day, "Close"]` from a 5m
+    aggregation (the deleted `synthesize_intraday_bar` branch is the obvious one) and the
+    1e-9 equality below goes red. Verified red by forcing that branch back on.
+    """
+    from common.intraday_features import (
+        IntradayFeatureConfig,
+        enrich_universe_with_intraday_features,
+    )
+
+    df_5m = _intraday_panel(6, [48] * 6)
+    days = pd.bdate_range("2026-10-12", periods=6)
+    kappa = 1.0035
+    official = pd.DataFrame(
+        [
+            {
+                "Open": float(b["Open"].iloc[0]) * kappa,
+                "High": float(b["High"].max()) * kappa,
+                "Low": float(b["Low"].min()) * kappa,
+                "Close": float(b["Close"].iloc[-1]) * kappa,
+                "Volume": float(b["Volume"].sum()),
+            }
+            for _, b in df_5m.groupby(df_5m.index.normalize())
+        ],
+        index=days,
+    )
+    universe_1d = {"SYM_D1": official}
+    universe_5m = {"SYM_D1": df_5m}
+
+    for cutoff in ("14:15", "15:00"):
+        out = enrich_universe_with_intraday_features(
+            universe_1d,
+            universe_5m,
+            config=IntradayFeatureConfig(cutoff_time=cutoff),
+        )["SYM_D1"]
+        # (a) the official daily bar is untouched on EVERY session, whatever the cutoff
+        for col in ("Open", "High", "Low", "Close", "Volume"):
+            delta = float(np.max(np.abs(out[col].values - official[col].values)))
+            assert delta < 1e-9, (cutoff, col, delta)
+        # ... while the 5m FEATURES are still computed (the enrichment is not a no-op)
+        assert out["VWAP_Prem_5m"].notna().all(), cutoff
+        assert out["UpVol_Ratio_5m"].notna().all(), cutoff
+        # (d) neither retired flag column may appear in the output frame
+        for retired in ("Is_Partial_Bar", "Is_Cutoff_Truncated"):
+            assert retired not in out.columns, (cutoff, retired)
+
+
+def test_missing_5m_day_is_skipped_not_synthesized(caplog):
+    """(b)/(d) 2026-11-17: a 缺根日 (5m sample < 45 bars) is skipped, never synthesized.
+
+    The daily bar stays exactly as the daily feed delivered it, every 5m-derived column for
+    that date is NaN (nothing is extrapolated: no volume seasonality, no partial-bar
+    aggregation) and the skip is announced per symbol-day with the observed bar count.
+
+    re-break: restore the synthesis branch (write the truncated 5m aggregation into the daily
+    row) and `Close`/`Volume` change; restore a NaN->default fill and the `.isna().all()`
+    assertion fails.
+    """
+    from common.intraday_features import (
+        IntradayFeatureConfig,
+        enrich_universe_with_intraday_features,
+    )
+
+    # Last session carries 39 bars (09:35..14:15), the retired intraday window.
+    df_5m = _intraday_panel(6, [48, 48, 48, 48, 48, 39])
+    days = pd.bdate_range("2026-10-12", periods=6)
+    kappa = 1.0035
+    official = pd.DataFrame(
+        [
+            {
+                "Open": float(b["Open"].iloc[0]) * kappa,
+                "High": float(b["High"].max()) * kappa,
+                "Low": float(b["Low"].min()) * kappa,
+                "Close": float(b["Close"].iloc[-1]) * kappa,
+                "Volume": float(b["Volume"].sum()),
+            }
+            for _, b in df_5m.groupby(df_5m.index.normalize())
+        ],
+        index=days,
+    )
+    short_day = days[-1]
+
+    with caplog.at_level(logging.WARNING, logger="common.intraday_features"):
+        out = enrich_universe_with_intraday_features(
+            {"SYM_D2": official},
+            {"SYM_D2": df_5m},
+            config=IntradayFeatureConfig(cutoff_time="15:00"),
+        )["SYM_D2"]
+
+    # (b1) the official daily bar for the undersampled day is untouched
+    for col in ("Open", "High", "Low", "Close", "Volume"):
+        assert abs(float(out.loc[short_day, col]) - float(official.loc[short_day, col])) < 1e-9, col
+    # (b2) every 5m-derived column is NaN for that day -- skipped, not extrapolated
+    for col in ("VWAP", "VWAP_Prem_5m", "UpVol_Ratio_5m", "RS_Down_5m", "Chan_5m_State",
+                "Close_5m_Cutoff"):
+        assert pd.isna(out.loc[short_day, col]), col
+    # ... and the fully sampled days around it are still measured
+    assert out.loc[days[0], "UpVol_Ratio_5m"] == out.loc[days[0], "UpVol_Ratio_5m"]
+
+    # (b3) one WARNING naming the symbol, the date and the observed bar count
+    msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    hits = [m for m in msgs if short_day.date().isoformat() in m and "SYM_D2" in m]
+    assert hits, msgs
+    assert "39" in hits[0]
 
 def test_smart_money_upvol_ratio_and_semivariance():
     """Test 7 (T2.2, T5.1): Realized semivariance decomposition, SmartMoney_Q_5m, UpVol_Ratio_5m, and Afternoon_Ret_5m."""
@@ -945,7 +1115,7 @@ def test_smart_money_upvol_ratio_and_semivariance():
 
 def test_enrich_universe_with_intraday_features_cutoff_time_kwarg():
     """Verify enrich_universe_with_intraday_features supports cutoff_time keyword argument,
-    overrides default 14:15 cutoff (36 bars vs 39 bars), supports datetime.time objects,
+    overrides the full-session default (36 bars vs 48 bars), supports datetime.time objects,
     and updates config via replace(config) while preserving other config attributes.
     """
     from common.intraday_features import (
@@ -981,7 +1151,10 @@ def test_enrich_universe_with_intraday_features_cutoff_time_kwarg():
     bar_39_close = float(d_last_bars.iloc[38]["Close"])
     assert bar_36_close != bar_39_close
 
-    # 1. Default behavior: cutoff_time defaults to 14:15 (uses 39 bars)
+    # 1. Default behavior: cutoff_time now defaults to the FULL session ("15:00", 48 bars).
+    #    (2026-11-17 default change) `IntradayFeatureConfig.cutoff_time` used to default to
+    #    "14:15" (39 bars); live runs are post-close only, so the default no longer truncates
+    #    the 5m information set. The old 39-bar behaviour is asserted explicitly below.
     enriched_default = enrich_universe_with_intraday_features(
         universe_1d,
         universe_5m,
@@ -989,9 +1162,21 @@ def test_enrich_universe_with_intraday_features_cutoff_time_kwarg():
     assert "SYM_A" in enriched_default
     df_default = enriched_default["SYM_A"]
     assert "Close_5m_Cutoff" in df_default.columns
-    assert df_default.loc[d_last, "Close_5m_Cutoff"] == pytest.approx(bar_39_close)
+    full_day_close = float(d_last_bars["Close"].iloc[-1])
+    assert df_default.loc[d_last, "Close_5m_Cutoff"] == pytest.approx(full_day_close)
 
-    # 2. String cutoff_time="14:00" overrides default 14:15 (uses 36 bars instead of 39 bars)
+    # 1b. The retired intraday cutoff still works when asked for explicitly (39 bars).
+    enriched_1415 = enrich_universe_with_intraday_features(
+        universe_1d,
+        universe_5m,
+        cutoff_time="14:15",
+    )
+    assert enriched_1415["SYM_A"].loc[d_last, "Close_5m_Cutoff"] == pytest.approx(bar_39_close)
+    # (2026-11-17) The `Is_Cutoff_Truncated` column this used to check is deleted with the
+    # retired synthesis path; the truncation is now observable only through the 39-bar
+    # `Close_5m_Cutoff` value asserted above.
+
+    # 2. String cutoff_time="14:00" overrides the full-session default (36 bars instead of 48)
     enriched_1400 = enrich_universe_with_intraday_features(
         universe_1d,
         universe_5m,

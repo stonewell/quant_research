@@ -1,7 +1,18 @@
 # 深度研究与架构实施方案：5分钟高频日内数据赋能实盘 Go/No-Go 门禁与 Blend 策略体系升级
 # (Deep Analysis & Implementation Plan: 5-Minute Intraday Data Enhancement for Live Trading Go/No-Go & Modular Blend Strategies)
 
-> [!IMPORTANT]
+> [!WARNING]
+> **2026-11-17 退役公告（本文件为历史设计记录，正文保留原貌，不再代表当前实现）**：
+> 盘中执行模式已退役，实盘/回测均为**收盘后**单次运行。因此本方案 §4「模块 2.1」中的
+> **盘中合成日线**契约（`synthesize_intraday_bar` 开关、`Open/High/Low/Close/Volume` 覆盖、
+> $\phi$ 成交量外推、`Is_Partial_Bar` 标记）已**整体删除**：该开关不再存在于
+> `enrich_universe_with_intraday_features` 的签名中（旧调用点会 `TypeError`），两个标记列
+> 亦已删除。当前行为：**日线永不被 5m 覆盖**；缺根日（当日 5m 根数 `< 45`）**整天忽略**，
+> 其 5m 派生列为 `NaN` 并逐标的逐日打印 WARNING；`cutoff_time` 仅收窄 5m 特征窗口，
+> 实盘/回测默认均为全日 `15:00`。详见
+> [market_clock_and_asof_resolution.md](market_clock_and_asof_resolution.md) 与
+> `docs/development_plan.md`（NV9）。
+>
 > **2026-10-17 评审修订（二轮终审已全量合入正文）**：本方案已完成两轮代码级深度评审，所有修订项（R1–R14 及 §8.3 细节澄清：截断 bar 数、钉扎式布朗桥、VWAP `ffill` 泄漏与结构断点披露、跨源复权与截断时点无量纲对齐 R4/R6、`DuckDBCache` 日期型 `end` 截断当天 48 根 K 线修复 R13、盘中 HWM 回测一致性 R5、5m 缠论按需惰性求值 R9、涨跌停精确判据与 Phase 4 现金归集防透支 R10/R14、主动/被动双限价引导 R11、合成日线 `Is_Partial_Bar` 标记 R12、开关默认关闭 R7 及 Phase 0 / Phase 6 消融验证）**均已直接合入第一至第七章正文规范**，完整对照表见 [第八章 评审修订记录](#八-评审修订记录与待办-review-amendments--open-items-2026-10-17)。
 
 ---
@@ -434,12 +445,13 @@ class IntradayFeatureConfig:
 | `Chan_5m_State` | `str` | `"5m_3B_CONFIRMED"`, `"5m_1B2B_CONFIRMED"`, `"5m_BULL_FLOOR"`, `"5m_3S_EXIT"`, `"5m_TOP_DIV_WARN"`, `"5m_NEUTRAL"` |
 | `Chan_5m_ZG` / `Chan_5m_ZD` | `float` | 截至当日截断时刻的 5m 级别最近一个有效中枢上沿 $ZG_{5m}$ 与下沿 $ZD_{5m}$（挂载时乘以 $\kappa_t$，R4） |
 | `Last_3Bars_Locked_Limit` | `int` | **评审修订 R10**：以价格触及板块涨跌停价 `abs(C_{t,M} - round_to_tick(PreClose_t * (1 ± limit_pct))) <= tick_tol`（股票 `tick=0.01`，ETF `tick=0.001`）为主判据，辅以最近 3 根 5m K 线 $H_{t,j} == L_{t,j}$（剔除原“极度缩量”误判条件，因封死跌停板常伴巨量成交；上市前 5 个交易日无涨跌幅限制新股豁免置 `0`）：`-1` 为跌停封死/停牌风险，`+1` 为涨停封死，`0` 为正常 |
-| `Is_Partial_Bar` | `int` | **评审修订 R12**：`1` 表示当日日线行由盘中未完结 5m K 线（如 `14:00`/`14:15`）及 $\phi$ 外推成交量合成；`0` 表示完整收盘日线 |
+| ~~`Is_Partial_Bar`~~ | `int` | **已于 2026-11-17 删除**（见文首退役公告）：原为评审修订 R12，标记载荷 "合成日线列"。当前日线永不被 5m 覆盖，故不再需要该标记。 |
 
-- **主函数 2：`enrich_universe_with_intraday_features(universe_1d, universe_5m, config=None, synthesize_intraday_bar=False) -> Dict[str, pd.DataFrame]`**
+- **主函数 2：`enrich_universe_with_intraday_features(universe_1d, universe_5m, config=None, cutoff_time=None) -> Dict[str, pd.DataFrame]`**
+  （**2026-11-17**：签名中的 `synthesize_intraday_bar` 参数已删除，不再接受该关键字）
   - 将计算好的日频 5m 聚合特征通过索引对齐附加到 `universe_1d[sym]` 的列中；
   - **跨数据源复权基准与截断时点自动对齐（评审修订 R4 & R6）**：当 `universe_1d[sym]` 与 `universe_5m[sym]` 来自不同数据源或不同截断时刻时，对每个重叠交易日 $t$ 计算无偏缩放比例 $\kappa_t = C_{t,\text{1d}} / C_{t,M,\text{5m}}$，将所有具有绝对价格量纲的特征列（`VWAP`, `Morning_Low_5m`, `Afternoon_Low_5m`, `Chan_5m_ZG`, `Chan_5m_ZD`）乘以 $\kappa_t$ 投射至 `universe_1d[sym]` 的价格基准上（此时 $\text{VWAP}_{\text{aligned},t} = C_{t,\text{1d}} / (1 + \text{VWAP\_Prem}_{5m,t})$），确保下游无论是比较 `VWAP_Prem_5m >= 0` 还是计算 `Alpha#41 = sqrt(High * Low) - VWAP`，其价格量纲与截断时刻均 100% 严密自洽！
-  - 当 `synthesize_intraday_bar=True`（实盘 `14:00` / `14:15` 模式）且 `universe_5m[sym]` 含有比 `universe_1d[sym]` 更新的当日盘中 5m K 线时，自动用截至 `cutoff_time` 的 5m K 线（及季节性外推成交量 $\hat{V}_t$）合成或更新当日 $t$ 的日线行 `(Open, High, Low, Close, Volume)`，并显式写入 **`Is_Partial_Bar = 1`**（历史完整日线行 `Is_Partial_Bar = 0`，R12）；
+  - ~~当 `synthesize_intraday_bar=True` …合成或更新当日日线行…~~ **2026-11-17 删除**：日线 `Open/High/Low/Close/Volume` 永不被 5m 覆盖（覆盖会直接改变交割单 `price` 与权重分子，2026-11-17 事故：578 RMB 权益/现金错分，NAV 128,619（官方收盘）vs 128,041（14:15 合成））。缺根日（5m 根数 `< 45`）整天跳过并逐日 WARNING；
   - 若某标的缺少 `5m` 数据，则不破坏原有日线列，下游策略检测到扩展列不存在或为 `NaN` 时自动回退至纯日线算子，实现 **100% 零侵入兼容**。
 
 ---

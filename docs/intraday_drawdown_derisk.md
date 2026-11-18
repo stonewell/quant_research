@@ -202,3 +202,116 @@ dd_trough = (intra_min - hwm_intra) / hwm_intra if hwm_intra > 0 else 0.0
 | 单测文件名 `pipeline/tests/test_intraday_exposure_damping.py` | 实际交付 `pipeline/tests/test_intraday_drawdown_derisk.py` | **刻意偏离**：`damping`（阻尼）与 `derisk`（降险）不是同一个语义，且 `R4` 的实现文件同批命名为 `cs_dispersion_exposure`；本批统一用 `<判据>_derisk` 命名，便于与 `overnight_derisk` 族对齐。文件名不影响验收内容。 |
 | 「结果写进 Stage 1 报告与 ticket 的可观测字段」 | **本轮不接线**：只交付纯函数 + advisory 围栏 | 台账 `:333` 第 4 条的验收依赖接线，但那是一项**独立接线任务**（须触碰 `scripts/run_live_strategy.py` 与票据形状）；与 `R4` 同批的纪律是「首轮零接线、接线另行裁决」。故本文只冻结判据，并把 `reason` / `status` / `dd_source` / `reference_semantics` 全部落进 dataclass 字段，为接线预留可观测面。 |
 | 「`>=` 与 `>` 择一并写明理由」 | 选用 `dd <= 阈值`（即「回撤幅度 `>=` 阈值」） | 阈值是风险预算：恰好触到即视为已达；`<` 会让边界值落在更轻一档，等于给预算留了半个带宽的空隙。 |
+
+## Revision 2026-11-17（R1 按负结果结项；默认 OFF = 仅影子线）
+
+> **性质**：按文首「修订方式」追加的 **append-only** 修订段。**上方全部冻结文本原样保留**（可追溯）；
+> 本段只改写两件事：「**结项定位**」，以及文首 `:7` / §6 / §7 与实现侧模块 docstring 里那句
+> 「本轮无消费面 / advisory only / 零接线」的**口径**（该句在 `AT7` P3 接线之后已与代码矛盾，本段就地订正，
+> 只在本段内更正，不回改上方原文）。
+> **判定量、参考价锚点、阈值阶梯、乘子、三态词表、边界归属、可观测字段一律不重标定。**
+> **触发原因**：业主 **2026-11-17** 裁定（只读审计已完成，结论：与 `R6` 同一处置体制）。
+> 现行部署口径是**收盘后 → 次日开盘**出票、成交价为 **`T+1` 开盘**
+> （票据 `execution_session = as_of+1` / `price_reference = next_open`，见 `NV16`）；
+> 本判据的**测量面**已按整段会话计算，而它的**执行面**仍锚定在决策会话的收盘价上 ——
+> 两侧不再同一口径，判据因此**无法执行它自己的判断**（论证见第 2 节）。
+> **结论**：`R1` 按**负结果结项**，与 `R6` 同一条纪律（镜像
+> [`docs/overnight_derisk_judgement_freeze.md`](file:///home/stone/Work/github/quant/docs/overnight_derisk_judgement_freeze.md)
+> `:256-326` 的 `## Revision 2026-11-17`）；**不重标定任何算术或阈值**；模块与用例**原样保留作历史**；
+> `--enforce-r1-derisk` **维持默认 OFF**（它本就不曾默认开启，故本段**没有**任何默认翻转动作可做）。
+> 判据规格号仍为 **`r1.1`**：`common/intraday_drawdown_derisk.py::DECISION_SPEC_VERSION` 是**判据规格标签**，
+> 不是策略版本号，本条**不改**它。版本轴禁令照旧：零 `BASE_VERSION`、零 per-class `version`、
+> 零 `--dump-strategies`、[`docs/version.md`](file:///home/stone/Work/github/quant/docs/version.md) 无需条目。
+
+### 1. 唯一变更：结项定位（默认方向维持 OFF，未翻转任何开关）
+
+- **本段不翻任何默认值。** `scripts/run_live_strategy.py` 的 `--enforce-r1-derisk` 从一开始就是
+  `action="store_true"`（`:1995-2005`，默认 `False`），并有环境变量击杀开关
+  `LIVETRADING_DISABLE_R1_DERISK`（`:2890` / `:2925` `r1_derisk_enforcement_enabled`）。
+  因此 `R1` 的**已部署行为**只有一个：Stage-2 的 `P2` 影子线 —— `compute_r1_advisory`
+  （`scripts/run_live_strategy.py:2825`）从 Stage-1 的 `intraday_5m_metrics` 读出
+  `hwm_intra` / `dd_trough`，落成 `advisory.r1` 与 `shadow_buy_scale = real × multiplier`，
+  下单量 bit-identical 于未接入 —— 这一点**不因本段改变**。
+  （Stage-1 的 `P1` 块本身**不含** `r1` 键：`scripts/check_live_portfolio_health.py:5603-5606` 只传
+  `phase` / `as_of`，故「P1 已带 R1 字段」是错的，此处不得那样写。）
+- **本段唯一的新增内容是一句结项定位**：该 opt-in 执行路径（`:7236-7258` 合成、`:7490-7511` 报表、
+  应用函数 `common/r1_derisk_report.py:84`）自 2026-11-17 起**关闭**，重新开启须先满足第 4 节的预注册条件。
+- **可观测后果（照旧）**：缺 `advisory.r1` 键只意味着「本次未评估 / 未测量」，**不得**读成
+  `NOT_TRIGGERED`；§4 的三态封闭性不因结项而放宽。
+
+### 2. 为什么按负结果结项：测量面与执行面已不在同一口径
+
+这是本段的**全部理由**，逐条给出可核对的行号（行号均为 2026-11-17 快照）：
+
+1. **测量面已经移到整段会话（默认，无需任何开关）**：
+   `common/intraday_features.py:84-95`（`IntradayFeatureConfig.cutoff_time = "15:00"`，即 48 根 5m；
+   同日 D1/D2 裁定注明：盘后唯一，`cutoff` 只会**收窄**信息集、不再用于实盘）、
+   Stage-1 `scripts/check_live_portfolio_health.py:455-466`（`--cutoff-time` 默认 `15:00`）、
+   Stage-2 `scripts/run_live_strategy.py:2088-2098`（同一默认）。生产侧据此重算
+   `hwm_intra = max(peak_nav, intra_peak)` 与 `dd_trough`（`scripts/check_live_portfolio_health.py:5427-5428`
+   —— 本文 §1.3 / §1.4 上方引用的 `:2856-2857` 是同一表达式的**过期行号快照**，表达式本身未变）。
+   于是 `hwm_intra` / `dd_trough` / 广度 / 午后收益 / `RS_Down_5m` 这一组量，都是**整段会话**的读数。
+2. **执行面仍锚定在决策会话的收盘价上，成交在 `T+1` 开盘**：
+   票据行价格取 `as_of` 当日收盘 `latest_close(universe, sym, as_of_date, ...)`（`:7579`）；
+   涨跌停带由 `prev_close = Close[-2]` 推出 `p_limit_up` / `p_limit_down`（`:7976-7981`）；
+   限价由该价与两个带夹逼（`:8079-8097`）；而票面声明的成交时点是
+   `execution_session = as_of+1` / `price_reference = next_open`（`:6083`、`:9003`）。
+3. **因此这是一个「`T` 收盘测出来、`T+1` 开盘才成交」的判据 —— 两个基准**：
+   相对于**同一个**读数，成交发生在**下一个**会话的开盘。对「下调**存量**暴露」这个用途而言，
+   保护**晚于**它本该先发制人的那次跳空 / 次日走势落地：判据能观测到的信息在 `T` 收盘已经用尽，
+   而它要拦的那一段行情恰好落在「`T` 收盘 → `T+1` 开盘」之间。这与 `R6` 的结项理由同形
+   （`docs/overnight_derisk_judgement_freeze.md:285-300`：判据语义与执行时点是同一件事，不是两件事），
+   属**不可执行**，而不是「样本不够」。
+4. **现行 opt-in 路径是单边（买方）节流，连「下调存量暴露」都做不到**：
+   `--enforce-r1-derisk` 的 help 原文即「buy increments are multiplied by the R1 multiplier … sells and
+   the cash leg untouched」（`:1995-2005`）；实现同样只缩放买方增量 —— 应用函数是
+   `common/r1_derisk_report.py:84` `apply_r1_intraday_derisk`（由 `scripts/run_live_strategy.py:114`
+   导入），唯一调用点是 `resolve_r1_derisk_target`（`:2944`）。
+   即：**唯一幸存的是「新开仓节流」**，它的语义是「今天少买一点」，不是 §1.1 冻结的
+   「市场层**目标暴露**下调」。把一个入场节流继续称作暴露降险，会让 `P2` 影子里的
+   `0.75 / 0.50 / 0.25` 被读成「已经降了仓」，而账上仓位一分未减。
+5. **口径自相矛盾的自我披露（本段必须写，不得静默删除）**：文首 `:7`、§6（「本轮**只交付纯函数与离线用例** /
+   不接线」）与 §7（「`scripts/run_live_strategy.py` **Stage 2 从不读取**，`grep` 返回 0 行」）三处断言，
+   在 `AT7` P3（用户 2026-11-09 批准）把 `evaluate_intraday_drawdown` 接进 Stage 2
+   （`scripts/run_live_strategy.py:113` 的 import、`:2825` `compute_r1_advisory`）之后**已不成立**。
+   本段就此订正口径：**存在一个有签署的执行消费面，它默认 OFF、单边、且自本段起关闭**；
+   §6 / §7 的「零接线」与「零命中」两句自此**失效**，仅作 2026-11-08 的历史记录保留。
+   （上方冻结文本一律不改，是纪律，不是遗忘。）
+
+### 3. 不变项（一个都不动）
+
+- **算术与阈值零重标定**：`DEFAULT_LIGHT/MEDIUM/DEEP_DRAWDOWN_THRESH = -0.02 / -0.03 / -0.04`、
+  `MULTIPLIER_LIGHT/MEDIUM/DEEP = 0.75 / 0.50 / 0.25`、`MULTIPLIER_UNCHANGED`（字面 `1.0`，
+  仍非 `min(1.0, …)`）、`0 < multiplier < 1` 与 `deep < medium < light` 的构造期断言、
+  `REFERENCE_PRICE_SEMANTICS = "previous_close"`、`≤` 即降（等号归深档）、无滞回 / 无冷却 ——
+  **全部保持冻结值**，既不因为「反正关闭了」顺手改，也不因为「曾经接线过」就声称是已实证的最优值
+  （§3.1 的诚实披露继续有效）。
+- **三态语义不动**：五态词表、`INSUFFICIENT_DATA ≠ NOT_TRIGGERED ≠ 0.0`、`drawdown is None`、
+  `dd_source`、`reference_semantics`、`advisory=True` / `gates_orders=False` 的构造期围栏，全部沿用 §4。
+- **`DECISION_SPEC_VERSION` 不动**：仍是 `"r1.1"`（判据规格标签）。本条**不新增**任何版本号，
+  也不因为结项就把它改成 `r1.1-retired` 之类 —— 归档里旧的 `r1.1` 读数必须仍可读。
+- **模块与用例保留**：`common/intraday_drawdown_derisk.py` 与
+  `pipeline/tests/test_intraday_drawdown_derisk.py` **保留不删、算术不动**，
+  作为「这条判据曾经是什么、以及它为什么不可执行」的可执行历史；本段只追加
+  「结项标记 + 冻结阶梯未被顺手改动」的一条回归守卫。
+- **§2.20 的任务状态位不动（本轮不改台账）**：`R1` 行早已是 `[x]`；本次是**在同一状态位之上补记
+  结项性质（负结果）**，**不重开、不新增任务行、不改计数**。台账文本由协调方另批落笔。
+
+### 4. 重新启用的门槛（预注册）
+
+本条退役**不是**「等数据够了再开」。若将来要重新打开 `--enforce-r1-derisk`，必须先满足四条，缺一不可：
+
+1. **测量面与成交时点同一基准**：判据读数必须在**它能够成交的那个时点之前**可得 ——
+   要么回到「决策 → 同一会话内成交」（本仓库已退役的盘中出票，见 `NV16` 的前置链），
+   要么另立一条**以 `T+1` 开盘可得数据（或盘前可得量）为输入**的新判据，
+   使「测到 → 成交」之间不再存在一段未受保护的空档。**不得**只改一处注释就当作已解决。
+2. **另立规格号**：新口径必须自带新规格号（例如 `intraday_drawdown/v2` / `r1.2`），
+   **不得**复用 `r1.1` 的 `-2/-3/-4%` 阈值来「证明」新口径有效（不同判据的阈值不得互相借用，
+   §5 与 `R6` 修订段第 4 节同一条纪律）。
+3. **语义与实现必须对齐**：若新口径仍只缩放**买方增量**，则名称与语义须改成「新开仓节流」，
+   **不得**继续沿用「市场层目标暴露下调」；若确实要下调**存量**暴露，就必须显式接线卖出 / 减仓路径
+   并在本文件另行冻结（`0.0` 的清仓归属仍是 `R7` / 熔断族，见 §3.3）。
+4. **离线 + 归档证据同时具备**：按 AGENTS 规则 9 给出 `T+1` 开盘成交口径下的改前 / 改后下单量对比
+   （正 / 非退化证据），并另附票据 / 归档字段的可读性证据；两者缺一不算通过。
+   原 `AT9`（`reference_price` 锚点接线）若仍未完成，`§1.3` 的自洽闸就仍只是未生效的代码，
+   故它也是重启的前置项之一。

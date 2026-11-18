@@ -24,8 +24,10 @@ three archived deploy failures (`LiveDumpPreflightError` on 2026-11-06 / 11-09 `
    plus the runner's own resolver -- no second implementation of the resolution order.
 3. **A `strategy_version` bump cannot cold-start the book.** `select_prior_state` gates on
    `base_version` ONLY; the carried snapshot keeps its own (older) `strategy_version` as
-   lineage evidence and stays admissible. A `base_version` bump, by contrast, IS refused --
-   which is the explicit reason `BASE_VERSION` was left at `2.0.0`.
+   lineage evidence and stays admissible. The `base_version` gate is **MAJOR-scoped**
+   (`NV8`, owner decision A 2026-11-17): a patch/minor bump is the same engine era and is
+   admissible, while a DIFFERENT MAJOR is still refused. That tolerance is what makes the
+   forthcoming `BASE_VERSION` bump safe; it is why `BASE_VERSION` was left at `2.0.0` here.
 4. **The round's own state must be re-stamped, and that write is load-bearing.** The seed
    copied from the previous snapshot carries the OLD version; `stamp_account_state_version`
    (Stage 1, from the round's dump triple) makes the parity gate pass. Without the stamp the
@@ -215,25 +217,54 @@ def test_prior_state_admissibility_ignores_strategy_version(tmp_path):
     assert selection.source["skipped"] == []
 
 
-def test_a_base_version_bump_is_what_would_cold_start_the_book(tmp_path):
-    """The exact-string `base_version` comparison -- the reason `BASE_VERSION` stays 2.0.0."""
+def test_a_base_version_bump_cold_starts_the_book_only_across_a_major(tmp_path):
+    """The `base_version` axis is MAJOR-scoped (`NV8`), not exact-string.
+
+    A patch/minor bump is the same engine era, so the previous snapshot stays admissible and
+    the book does NOT cold-start (owner decision A, 2026-11-17: make the tolerance land
+    BEFORE the forthcoming `BASE_VERSION` bump). A DIFFERENT MAJOR is still refused -- that
+    is the half of the guard `BASE_VERSION` 2.0.0 -> 3.0.0 would trip, and it is pinned here
+    so nobody can widen the tolerance into "any bump is fine".
+    """
     live = ChanFourStateBlendStrategy()
     major, minor, patch = (int(p) for p in live.base_version.split("."))
-    bumped_base = f"{major}.{minor + 1}.{patch}"
+    same_root = tmp_path / "same_major"
+    cross_root = tmp_path / "cross_major"
+    same_root.mkdir()
+    cross_root.mkdir()
+
+    # Same major: MINOR and PATCH bumps both stay admissible, in both directions.
+    for bumped in (
+        f"{major}.{minor + 1}.{patch}",
+        f"{major}.{minor}.{patch + 1}",
+    ):
+        _make_snapshot(
+            same_root,
+            "2026-11-16",
+            strategy_version=live.version,
+            base_version=bumped,
+            status="SUCCESS",
+        )
+        allowed = select_prior_state(
+            str(same_root), "2026-11-17", expected_base_version=bumped
+        )
+        assert allowed.state is not None, allowed.log_line  # same string -> admissible
+        upgraded = select_prior_state(
+            str(same_root), "2026-11-17", expected_base_version=live.base_version
+        )
+        assert upgraded.state is not None, upgraded.log_line  # same major -> still admissible
+
+    # Different major: refused, with the pre-existing mismatch reason.
     _make_snapshot(
-        tmp_path,
+        cross_root,
         "2026-11-16",
         strategy_version=live.version,
-        base_version=bumped_base,
+        base_version=f"{major + 1}.0.0",
+        status="SUCCESS",
     )
-
-    selection = select_prior_state(
-        str(tmp_path), "2026-11-17", expected_base_version=bumped_base
+    refused = select_prior_state(
+        str(cross_root), "2026-11-17", expected_base_version=live.base_version
     )
-    assert selection.state is not None  # same string -> admissible
-
-    live_base = ChanFourStateBlendStrategy().base_version
-    refused = select_prior_state(str(tmp_path), "2026-11-17", expected_base_version=live_base)
     assert refused.state is None
     assert refused.source is None
     reasons = [c.reason for c in refused.candidates]

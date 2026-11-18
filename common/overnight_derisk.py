@@ -12,6 +12,19 @@ proxies** (`scripts/run_live_strategy.py` does exactly that); `r6.2`'s "today's 
 is retired because it made the risk reading depend on the book it de-risks (rotation instability +
 a historical-σ look-ahead). Everything else below is unchanged and still frozen.
 
+RETIRED BY DEFAULT (owner ruling 2026-11-17, freeze document `## Revision 2026-11-17`)
+--------------------------------------------------------------------------------------
+`R6` is **closed as a negative result** and this module is **off by default**
+(`OvernightDeriskConfig.enabled = False`; the CLI `--enable-overnight-derisk` default is OFF).
+The reason is unexecutability, not a bad sample: the deployment runs **post-close** and fills at
+the **T+1 open**, i.e. *after* the very overnight gap this judgement exists to avoid, so a T-day
+trigger can only act as a **one-day-lagged exposure tilt** -- it cannot execute its own judgement.
+Nothing else changes: the arithmetic, the frozen thresholds, the tri-state vocabulary and the
+ticket fields are **not** retuned, and `enabled=True` (or the CLI flag) still reproduces `r6.3`
+in full. The module and its acceptance suite are kept as executable history; therefore **never**
+read "the ticket carries no `overnight_derisk` block" as `NOT_TRIGGERED` -- the only thing a
+missing block means is "this judgement did not run".
+
 WHAT THIS IS (positioning before arithmetic)
 --------------------------------------------
 One question, asked **before the close**: *how much market exposure do we want to carry through
@@ -65,9 +78,11 @@ THE JUDGEMENT (nothing hidden)
 4. **Closed tri-state**: ``TRIGGERED`` / ``NOT_TRIGGERED`` / ``INSUFFICIENT_DATA``.
    ``INSUFFICIENT_DATA`` is **neither** "not triggered" **nor** ``0``: it does not de-risk
    (``ratio = 1.0`` is only "no multiplier was applied"), but it MUST be visible on every ticket
-   field and MUST emit a ``WARN``. The owner's 2026-11-07 ruling: default ON, insufficient data
-   only warns, it does **not** refuse the ticket (this is deliberately different from the Stage-1
-   NAV gate, where missing means refuse -- see the freeze document §5).
+   field and MUST emit a ``WARN``. When a caller does evaluate the judgement, insufficient data
+   only warns and does **not** refuse the ticket (owner ruling 2026-11-07, deliberately different
+   from the Stage-1 NAV gate, where missing means refuse -- see the freeze document §5). Whether it
+   is evaluated at all is the caller's switch, and that switch now defaults to **OFF** (see the
+   retirement note above).
 5. **Pure**: no clock reads, no I/O, no network, no random, no pandas global state. Same inputs =>
    equal outputs. **One disclosed side effect**: an ``INSUFFICIENT_DATA`` verdict emits a
    ``RuntimeWarning`` (diagnostic only, no state) so "insufficient" can never be mistaken for "not
@@ -148,7 +163,11 @@ class OvernightDeriskConfig:
     baseline_window: int = DEFAULT_BASELINE_WINDOW
     sigma_multiplier: float = DEFAULT_SIGMA_MULTIPLIER
     downscale_ratio: float = DEFAULT_DOWNSCALE_RATIO
-    enabled: bool = True
+    #: Default OFF: `R6` was retired as a NEGATIVE RESULT by the owner on 2026-11-17 (freeze doc
+    #: `## Revision 2026-11-17`) because this deployment fills at the T+1 open, i.e. AFTER the gap
+    #: the judgement exists to avoid. `enabled=True` restores `r6.3` in full -- this field gates
+    #: whether a caller evaluates the judgement and never touches any judgement arithmetic.
+    enabled: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.minutes_before_close, int) or isinstance(self.minutes_before_close, bool):

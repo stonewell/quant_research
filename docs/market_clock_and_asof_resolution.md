@@ -211,12 +211,20 @@ def resolve_market(explicit, symbols) -> str: ...
 | ≥ 收盘+grace | `CLOSED` | D | D | 允许 |
 | 周末 / 节假日 | `NON_TRADING_DAY` | D 之前最近交易日 | 同左 | 允许 |
 
-**显式规则：盘中运行不得使用当日未完成的日线 bar。** 这与"14:00 跑一次"不矛盾——5m 日内路径是**独立且被显式标注**的机制：`common/intraday_features.py:770–791` 把当日部分 bar 标成 `Is_Partial_Bar=1`。该 bar 只作**执行价参考**，永不充当估值收盘价：
+**显式规则：盘中运行不得使用当日未完成的日线 bar。** 5m 日内路径是**独立机制**，且自
+**2026-11-17** 起**不再改写日线**：`common/intraday_features.py::enrich_universe_with_intraday_features`
+只做列附加（$\kappa_t$ 对齐），既不合成也不覆盖 `Open/High/Low/Close/Volume`。原来的"合成盘中
+临时日线 + `Is_Partial_Bar=1` 标注 + $\phi$ 成交量外推"已随盘中执行模式一并**退役**：
+
+- 缺根日（当日 5m 根数 `< 45`，即样本不满）的 5m 数据**整天忽略**：该日不产出任何特征行，
+  所有 5m 派生列为 `NaN`，并**逐标的逐日**打印一条 WARNING（含日期与实际根数）；
+- 日线 bar 永远取自日线源，`synthesize_intraday_bar` 开关与 `Is_Partial_Bar` /
+  `Is_Cutoff_Truncated` 两列均已删除，任何旧调用点会直接 `TypeError`。
 
 | 用途 | 数据源 | 允许盘中 |
 |---|---|---|
-| 估值 / 盯市 NAV / 权重 | 日线，必须属于 as_of 交易日 | 否 |
-| 执行价引导 / 微观结构 | 5m，允许 `Is_Partial_Bar=1` | 是（受窗口与标注约束） |
+| 估值 / 盯市 NAV / 权重 | 日线，必须属于 as_of 交易日 | 否（日线永不被 5m 覆盖） |
+| 执行价引导 / 微观结构 | 5m；缺根日的 5m 被跳过（列为 `NaN`） | 是（受窗口约束） |
 
 ---
 
@@ -473,5 +481,5 @@ def assert_run_window(clock, stage, window, *, allow_intraday=False, strict=True
 | `web/livetrading/storage.py` | `282, 821, 861, 1570` | runs 根目录与宿主本地日期兜底 |
 | `web/livetrading/server.py` / `execution_service.py` | 93/285/296 与 133/298/444, 67/236/394/531 | 默认日期兜底、归档键兜底、裸 `datetime.now()` |
 | `common/financial_api.py` | `173`, `176`, `197`, `753–754` | 日历缓存、`get_trading_days_calendar`、空 `set()`、非日线抛错 |
-| `common/intraday_features.py` | `770–791`, `849–853` | `Is_Partial_Bar=1` 标注、逐标的吞异常 |
+| `common/intraday_features.py` | `compute_daily_intraday_features` / `enrich_universe_with_intraday_features` | 缺根日跳过 + 逐日 WARNING（`Is_Partial_Bar` 标注与合成路径已于 2026-11-17 删除）、逐标的吞异常 |
 | `common/freshness.py` | 全文 | `StalePriceError` / `latest_close` / `is_stale_bar` 边界 |

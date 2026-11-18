@@ -245,3 +245,24 @@ drawdown     = (cutoff_bar_close - running_high) / running_high
 **其余 `r6.2` 项一字不变**：判定时点 `D = session_close_time(market, day) − 45min`、`W=20` / 基线 `252` / `m=2.0` 严格 `>`、`ρ=0.5` 只乘非现金代理且差额留现金（不重新归一化）、三态词表、`INSUFFICIENT_DATA ⇒ ratio = 1.0` + `WARN` + 不拒票、`enabled` 默认开。
 
 **不得叠加（重申）**：同一份目标权重**同一时刻只允许一套规则接线**。`r6.1`（固定 `14:45` + 5m 日内回撤）、`r6.2`（横截面取自目标簿）、`r6.3`（横截面取自 universe 剔除现金代理）是**三套**判据规格，**不得叠加** —— 叠加会把两次 `0.5` 乘成一次谁也没有冻结过的 `0.25` 下调。`r6.2` 的横截面定义保留以便追溯，但**不得再接线**。
+
+## Revision 2026-11-17（`r6.3` 退役默认开启；`R6` 按负结果结项）
+
+> **性质**：按本文开头「修订方式」追加的 **append-only** 修订段（上方冻结文本与两段 `r6.2` / `r6.3` 修订段原样保留）。
+> 本段只覆盖上两段中「**`enabled` 默认开**」这一句与「接线状态」的表述，**不改**任何判据参数。
+
+**变更**：业主 **2026-11-17** 裁定 `R6` 退役默认开启并按**负结果结项**（判据不可执行：本仓库部署是
+**收盘后出票 → 次日开盘成交**，`T` 日触发被执行的 `T+1` 开盘**已在它要避开的隔夜跳空之后**，
+故只剩一个滞后一日的暴露倾斜）。完整论证、不变项与重新启用门槛见
+[`docs/overnight_derisk_judgement_freeze.md`](file:///home/stone/Work/github/quant/docs/overnight_derisk_judgement_freeze.md)
+的 `## Revision 2026-11-17`。
+
+**接线状态（本段覆盖上文的「`enabled` 默认开」与「已接线」）**：`r6.3` 仍是**唯一**的 `R6` 消费面实现，
+但**默认不评估** —— `scripts/run_live_strategy.py` 的 `--enable-overnight-derisk` 与
+`common/overnight_derisk.py::OvernightDeriskConfig.enabled` 默认均为 **`False`**；
+显式传 `--enable-overnight-derisk` 才恢复 `r6.3` 全行为。不评估时票据**没有** `overnight_derisk` 字段，
+那是「未参与」，**不得**读成 `NOT_TRIGGERED`。`r6.1` 仍**未接线**（与 `2026-11-07` 修订段的结论一致）。
+
+**不变**：`r6.1` 的冻结文本与模块处置、两份判据**不得叠加**的规则、本节的参数与三态词表**一字不改**；
+任务状态与计数仍以 [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) §2.20 为准。
+

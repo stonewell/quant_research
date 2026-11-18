@@ -1,7 +1,10 @@
+import ast
 import datetime
+import inspect
 import json
 import os
 import sys
+import textwrap
 import warnings
 from unittest.mock import patch
 
@@ -36,6 +39,45 @@ from backtester.run_backtest import (
     run_standard,
     run_walkforward,
 )
+
+
+def test_backtester_cannot_enrich_5m_for_blend_strategies():
+    """(2026-11-17 owner ruling) The backtester can no longer load or enrich 5m data.
+
+    Track-T is a refuted negative result (`docs/reports/china/ablation_intraday_5m_report.md`:
+    M1 identical to the M0 baseline, M2/M3/M4 degrade Sharpe 0.210 -> 0.135, ERS
+    `UNTRUSTED`), so the six blend 5m FEATURE switches and their read sites were deleted.
+    `main()` therefore has no `has_track_t` branch left: `track_t_flags` (which also carried
+    the now-removed `intraday_cutoff_time` fallback this test used to pin) is gone, and no
+    code path calls `load_intraday_5m_universe` / `enrich_universe_with_intraday_features`.
+
+    This is a DELIBERATE replacement for the old
+    `test_intraday_cutoff_default_is_the_full_session`, which pinned a `cutoff_str` assignment
+    that no longer exists. It asserts an ABSENCE, so it fails if anyone wires 5m enrichment
+    back into the research path.
+
+    re-break: add an `if has_track_t:` branch (or any 5m enrichment call) to `main` and this
+    test fails naming the symbol.
+    """
+    src = textwrap.dedent(inspect.getsource(backtester.run_backtest.main))
+    # `ast.unparse` DROPS comments on purpose: the retirement note above names the removed
+    # symbols, and documentation is allowed to; only executable code is checked.
+    code = ast.unparse(ast.parse(src))
+    for forbidden in (
+        "track_t_flags",
+        "has_track_t",
+        "load_intraday_5m_universe",
+        "enrich_universe_with_intraday_features",
+    ):
+        assert forbidden not in code, (
+            f"`{forbidden}` reappeared in backtester.run_backtest.main -- the Track-T 5m "
+            "switches were retired on 2026-11-17 and the research path must stay daily-only"
+        )
+
+    # ... and the module-level default the live runners share is still the full session.
+    from common.intraday_features import IntradayFeatureConfig, _parse_time_cutoff
+
+    assert _parse_time_cutoff(IntradayFeatureConfig().cutoff_time) is None
 
 
 def test_align_universe():

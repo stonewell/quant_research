@@ -23,6 +23,13 @@ WHAT IS PINNED (and what must turn red)
    domain. Honest limit, disclosed: a static scan can prove "no positive ratio constants and no
    `R4` constant names", it cannot prove "no threshold was numerically inspired by `R4`"; the
    discriminating property (sign) is what is asserted here.
+9. (freeze doc `## Revision 2026-11-17`) `R1` is **retired as a negative result**, and the guard
+   that pins it is a *documentation + ladder* guard, not a behaviour guard: the module and the
+   freeze document must both carry the retirement marker, and the frozen ladder (thresholds,
+   multipliers, tri-state vocabulary, `DECISION_SPEC_VERSION`) must still hold its 2026-11-08
+   values -- "nobody re-tuned the ladder while retiring it". Nothing here asserts a default flip:
+   there is none to assert (`--enforce-r1-derisk` was already `store_true` / OFF, and that is
+   pinned where it lives, `pipeline/tests/test_advisory_wiring.py`).
 
 100% offline: scalar constructions plus one panel from `common.intraday_synthetic`. No network, no
 cache, no real market data, no `data/runs/**`, no `backtests_research/`, no production report file.
@@ -64,6 +71,7 @@ from common.intraday_drawdown_derisk import (  # noqa: E402
 )
 
 _MODULE_PATH = os.path.join(_REPO_ROOT, "common", "intraday_drawdown_derisk.py")
+_DOC_PATH = os.path.join(_REPO_ROOT, "docs", "intraday_drawdown_derisk.md")
 
 #: The frozen ladder, as recorded in `docs/intraday_drawdown_derisk.md` §2 -- written out
 #: independently of the module so a silent constant edit cannot agree with itself in the tests.
@@ -525,3 +533,61 @@ def test_evaluate_on_a_synthetic_intraday_path():
     assert (via_field.status, via_field.multiplier, via_field.drawdown) == (
         decision.status, decision.multiplier, decision.drawdown
     )
+
+
+# --------------------------------------------------------------------------- #
+# 9. retirement guard (freeze doc `## Revision 2026-11-17`)
+# --------------------------------------------------------------------------- #
+def test_retirement_is_recorded_and_the_ladder_was_not_retuned():
+    """`R1` is retired as a negative result -- and the ladder it retires is still byte-frozen.
+
+    The retirement is a *judgement* change (freeze document `## Revision 2026-11-17`), not an
+    arithmetic or default one: the flag the enforcement path needs (`--enforce-r1-derisk`) was
+    already `store_true` / OFF before the ruling, so this module has no switch to flip and this
+    suite has no default to assert (`pipeline/tests/test_advisory_wiring.py` owns that pin). What
+    must be pinned here is the two-part promise of the ruling:
+
+    1. **both** the module docstring and the freeze document say it is retired, and the docstring
+       *discloses* the shipped opt-in path instead of silently deleting it (an un-retirement or a
+       "helpfully" cleaned-up fence turns this red);
+    2. the numbers did not move on the way out -- thresholds, multipliers, the literal `1.0`, the
+       anchor semantics, the tri-state vocabulary and the judgement spec tag are all written out
+       here independently, so "nobody re-tuned the ladder while retiring it" is checked against
+       the test's own copy, not against the module agreeing with itself.
+    """
+    module_doc = idd.__doc__ or ""
+    assert "RETIRED BY DEFAULT" in module_doc
+    assert "2026-11-17" in module_doc
+    # The shipped opt-in path is DISCLOSED, not quietly dropped from the fence wording.
+    assert "--enforce-r1-derisk" in module_doc
+    assert "buy-side only" in module_doc
+    # ...and the stale claim it replaces is gone (it is history in the freeze document, not here).
+    assert "This round wires nothing" not in module_doc
+
+    with open(_DOC_PATH, "r", encoding="utf-8") as handle:
+        doc = handle.read()
+    assert "## Revision 2026-11-17" in doc
+    assert "按负结果结项" in doc
+    # The append-only discipline: the 2026-11-08 freeze header is still above the revision.
+    assert doc.index("冻结日期") < doc.index("## Revision 2026-11-17")
+
+    # The ladder is untouched -- literals written out here, independently of the module constants.
+    assert (
+        DEFAULT_LIGHT_DRAWDOWN_THRESH,
+        DEFAULT_MEDIUM_DRAWDOWN_THRESH,
+        DEFAULT_DEEP_DRAWDOWN_THRESH,
+    ) == (-0.02, -0.03, -0.04)
+    assert (MULTIPLIER_LIGHT, MULTIPLIER_MEDIUM, MULTIPLIER_DEEP) == (0.75, 0.50, 0.25)
+    assert MULTIPLIER_UNCHANGED == 1.0 and repr(MULTIPLIER_UNCHANGED) == "1.0"
+    assert REFERENCE_PRICE_SEMANTICS == "previous_close"
+    assert STATUSES == (
+        "NOT_TRIGGERED", "DERISK_LIGHT", "DERISK_MEDIUM", "DERISK_DEEP", "INSUFFICIENT_DATA"
+    )
+    # The judgement spec tag is neither bumped nor suffixed: archived `r1.1` readings stay
+    # readable.
+    assert idd.DECISION_SPEC_VERSION == "r1.1"
+
+    # The applier lives in the sibling module (`common/r1_derisk_report.py`), never here: this
+    # module still owns no `apply_*` helper, which is the fence the retirement did NOT change.
+    assert not hasattr(idd, "apply_r1_intraday_derisk")
+    assert not [name for name in dir(idd) if name.startswith("apply_")]

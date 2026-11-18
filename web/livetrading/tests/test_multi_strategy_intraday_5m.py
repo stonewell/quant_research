@@ -290,14 +290,15 @@ def test_zero_requests_never_touch_the_5m_path(monkeypatch, tmp_path):
     # reconcile falls through to `source="none"` instead of trusting a fabricated verdict.
     assert "observability" not in first_summary
 
-    # The strategies saw EXACTLY the pre-D11 daily universe: no 5m column, no synthesized
-    # `Is_Partial_Bar` marker column leaking in from the enrichment.
+    # The strategies saw EXACTLY the pre-D11 daily universe: no 5m column leaking in from the
+    # enrichment. (2026-11-17) The `Is_Partial_Bar` marker this used to check was DELETED
+    # together with the retired daily-bar synthesis, so the daily-column subset check is now
+    # the complete guard: any enrichment leak shows up as an extra column.
     for observations in (obs_first, obs_second):
         for label in ("trend_static", "trend_off"):
             recorded = observations[label]
             assert not any(recorded["has_intraday_column"].values()), label
             for sym, columns in recorded["columns"].items():
-                assert "Is_Partial_Bar" not in columns, (label, sym)
                 assert set(columns) <= _DAILY_COLUMNS, (label, sym, columns)
 
     # Bit-identical artifacts: two zero-request rounds differ only by the output directory.
@@ -326,10 +327,11 @@ def test_partial_request_loads_once_and_only_the_requester_sees_intraday(monkeyp
 
     re-break: (a) move the load inside the strategy loop -> `len(calls) == 1` fails;
     (b) hand the enriched universe to every strategy (drop the per-strategy gate) -> the
-    non-requester's weights move (the synthesized partial bar changes its last close) and the
-    exact frame comparison fails; (c) resolve the switch via `params.get` instead of the
-    template's `resolve_param` -> the requester's params are empty, nothing loads, and the
-    intraday-column assertion fails.
+    non-requester inherits the 5m columns and the `_DAILY_COLUMNS` subset assertion fails
+    (note: since 2026-11-17 the enrichment no longer rewrites the daily Close at all, so the
+    columns -- not the last close -- are what discriminates here); (c) resolve the switch via
+    `params.get` instead of the template's `resolve_param` -> the requester's params are empty,
+    nothing loads, and the intraday-column assertion fails.
     """
     calls = []
     real_loader = rms.load_intraday_5m_panel
@@ -373,7 +375,9 @@ def test_partial_request_loads_once_and_only_the_requester_sees_intraday(monkeyp
         "the non-requesting strategy must not inherit 5m columns from the union load"
     )
     for sym, columns in non_requester["columns"].items():
-        assert "Is_Partial_Bar" not in columns, sym
+        # (2026-11-17) `Is_Partial_Bar` was deleted with the retired synthesis path; the daily
+        # column subset is the surviving guard against an enrichment leak.
+        assert set(columns) <= _DAILY_COLUMNS, (sym, columns)
 
     block = _load_json(os.path.join(partial_out, "summary.json"))["observability"]["intraday_5m"]
     assert block["requested"] is True

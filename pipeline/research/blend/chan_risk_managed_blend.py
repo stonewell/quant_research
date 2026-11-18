@@ -24,7 +24,12 @@ class ChanRiskManagedBlendStrategy(BaseBlendAllocationStrategy):
     volatility targeting, ATR trailing stops, and turnover controls.
     """
 
-    version: str = "1.1.1"
+    # 1.1.1 -> 1.2.0 (2026-11-17, Track-T retirement): the six blend-side 5m FEATURE
+    # switches are DELETED from `StrategyConfig` and `blend_base.py` with every column read
+    # they gated, so this class's honoured-parameter surface changed (MINOR). Delivered
+    # weights do not move: no config/dump ever enabled one. `BASE_VERSION 2.0.0 -> 2.1.0`.
+    # See docs/version.md §47.
+    version: str = "1.2.0"
 
     def __init__(self, config: Optional[StrategyConfig] = None, version: Optional[str] = None):
         cfg = config or StrategyConfig()

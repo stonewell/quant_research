@@ -291,15 +291,22 @@ def test_real_enriched_universe_keeps_the_intraday_branch_when_fresh():
     """End-to-end through `enrich_universe_with_intraday_features` (the live join path)."""
     df = _ohlc_frame(60)
     idx = df.index
-    # 5m bars for every session, 36 bars/day at <= 14:00, so features exist for as_of.
+    # 5m bars for every session: a COMPLETE 48-bar sample (2026-11-17: a day with fewer than
+    # 45 bars is a 缺根日 and its 5m data is now SKIPPED outright, so a 36-bar fixture would
+    # measure nothing). The `cutoff_time="14:00"` below then narrows the FEATURE window to the
+    # first 36 of those 48 bars without making the sample incomplete.
     # A per-bar random walk (not a flat bar) keeps `RS_Down_5m` non-zero -- a constant
     # frame yields rs_down == 0 and the estimator would (correctly) skip it.
     rng = np.random.default_rng(11)
     rows = []
     for d in idx:
         price = 100.0
-        for bar in range(36):
-            ts = d + pd.Timedelta(hours=9, minutes=35) + pd.Timedelta(minutes=5 * bar)
+        times = pd.date_range(
+            d + pd.Timedelta(hours=9, minutes=35), periods=24, freq="5min"
+        ).append(
+            pd.date_range(d + pd.Timedelta(hours=13, minutes=5), periods=24, freq="5min")
+        )
+        for ts in times:
             open_ = price
             close = price * float(np.exp(rng.normal(0.0, 0.002)))
             rows.append(
@@ -313,7 +320,6 @@ def test_real_enriched_universe_keeps_the_intraday_branch_when_fresh():
         {"STOCK_A": df},
         universe_5m,
         config=IntradayFeatureConfig(cutoff_time="14:00"),
-        synthesize_intraday_bar=True,
     )
     assert "RS_Down_5m" in enriched["STOCK_A"].columns
 
