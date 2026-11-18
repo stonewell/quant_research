@@ -267,7 +267,8 @@ classification may be incomplete
 
 驱动脚本与宇宙文件已归档（见第 8 节），脚本内部固定在仓库根目录执行、输出到
 `backtests_research/20261118_alu_ab/`。重跑前先把归档的 `universe_*_stocks.txt` 放回本目录，
-即可重新生成全部每臂产物与 `metrics.json`（均为 git 未跟踪文件）：
+即可重新生成全部每臂产物（仍为 git 未跟踪文件）；入库的 `_provenance/metrics.json` 与
+`_provenance/b2*_folds.csv` 就是这些产物的抽取副本：
 
 ```bash
 cd <repo-root>
@@ -283,8 +284,11 @@ pipeline/.venv/bin/python /tmp/opencode/alu_ab_archive/20261118_alu_ab/extract_m
 | 文件 | 内容 |
 |---|---|
 | `README.md` | 本文件 |
-| `metrics.json` | 三臂全部指标（机器可读，含 fold 明细与派生块） |
-| `b20_folds.csv` `b21_folds.csv` `b22_folds.csv` | fold 级指标副本（便于对齐比较） |
+| `_provenance/metrics.json` | 三臂全部指标（机器可读，含 fold 明细与派生块） |
+| `_provenance/b20_folds.csv` `_provenance/b21_folds.csv` `_provenance/b22_folds.csv` | fold 级指标副本（便于对齐比较） |
+
+这 4 个数据文件放在 `_provenance/` 下，是因为仓库 `.gitignore` 对 `backtests_research/`
+产物默认不入库、只白名单放行 `**/_provenance/**`；这样无需 `git add -f` 即可入库。
 
 已归档到仓库外的路径（结构保持不变，约 44 MiB）：
 
