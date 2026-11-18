@@ -8006,12 +8006,39 @@ def main(cli_args: Optional[List[str]] = None):
         if is_new_stock:
             limit_pct = 1.0  # exempt
 
+        # ---- PRICE-BAND ANCHOR (2026-11-17 fix) -------------------------------------
+        # Two DIFFERENT sessions are in play in this block, and their boards are NOT
+        # mutually replaceable:
+        #   * the TICKET FILLS AT THE `T+1` OPEN (`execution_session=as_of+1` /
+        #     `price_reference=next_open`, see `overnight_gap_hint`). The exchange band a
+        #     `T+1` order must respect is anchored on the **`T` close** -- `price`, the
+        #     as-of close `latest_close()` just returned (the frame's last bar IS `T`).
+        #   * "was `T` limit-locked?" (`LIMIT_UP_LOCKED` / `LIMIT_DOWN_ILLIQUID_RISK`)
+        #     is a statement about **session `T`**, whose board is anchored on the `T-1`
+        #     close -- hence `prev_close = Close[-2]`. That pair is CORRECT and must stay
+        #     on the `_session_t` variables below; re-pointing it at the `_next` band
+        #     would silently disable both risk vetoes.
+        # The stale-clamp defect this replaces: the `T-1` band used to also clamp the
+        # SUGGESTED limit price. After a limit-sized `T` move the old board sits on the
+        # wrong side of `price`, so the clamp only ever tightened the ticket -- a buy
+        # limit shaved down to the PREVIOUS session's ceiling, a sell limit lifted to the
+        # previous session's floor -- i.e. a stale, silently unfillable order. It never
+        # emitted an out-of-band price (the direction is always tightening), which is why
+        # nothing alarmed.
+        # `last_locked` (`Last_3Bars_Locked_Limit`) is likewise a **`T`-session fact** and
+        # keeps suppressing a `T+1` BUY. That is deliberately conservative: it can only
+        # DECLINE to chase a name that just locked, never place a wrong-priced order.
         prev_close = price
         if len(df_sym_all) >= 2:
             prev_close = float(df_sym_all["Close"].iloc[-2])
 
-        p_limit_up = round(prev_close * (1.0 + limit_pct), decimals) if limit_pct < 1.0 else price * 2.0
-        p_limit_down = round(prev_close * (1.0 - limit_pct), decimals) if limit_pct < 1.0 else 0.01
+        # Session `T` board (anchored on the `T-1` close): ONLY the "was T locked?" test.
+        p_limit_up_session_t = round(prev_close * (1.0 + limit_pct), decimals) if limit_pct < 1.0 else price * 2.0
+        p_limit_down_session_t = round(prev_close * (1.0 - limit_pct), decimals) if limit_pct < 1.0 else 0.01
+        # Session `T+1` board (anchored on the `T` close == `price`): what the suggested
+        # limit price is clamped against, because that is when the order actually fills.
+        p_limit_up_next = round(price * (1.0 + limit_pct), decimals) if limit_pct < 1.0 else price * 2.0
+        p_limit_down_next = round(price * (1.0 - limit_pct), decimals) if limit_pct < 1.0 else 0.01
 
         last_locked = 0
         intraday_vwap = None
@@ -8048,7 +8075,7 @@ def main(cli_args: Optional[List[str]] = None):
                 raw_shares = 0.0
             elif action == "BUY":
                 # Check LIMIT_UP_LOCKED (R10)
-                if limit_pct < 1.0 and (price >= p_limit_up - tick_tol or last_locked == 1):
+                if limit_pct < 1.0 and (price >= p_limit_up_session_t - tick_tol or last_locked == 1):
                     action = "HOLD_FILTERED"
                     target_shares = current_shares
                     delta_shares = 0
@@ -8079,7 +8106,7 @@ def main(cli_args: Optional[List[str]] = None):
                     actual_trade_val = delta_shares * price
             elif action == "SELL":
                 # Check LIMIT_DOWN_ILLIQUID_RISK (R10 & R14)
-                if limit_pct < 1.0 and (price <= p_limit_down + tick_tol or last_locked == -1 or cur_v == 0.0):
+                if limit_pct < 1.0 and (price <= p_limit_down_session_t + tick_tol or last_locked == -1 or cur_v == 0.0):
                     execution_warning = "LIMIT_DOWN_ILLIQUID_RISK"
                     reason = f"{reason} [跌停封死/流动性枯竭警示 LIMIT_DOWN_ILLIQUID_RISK]"
 
@@ -8109,11 +8136,13 @@ def main(cli_args: Optional[List[str]] = None):
             raw_shares = 0.0
 
         # Suggested limit prices (R11)
+        # These fill at the `T+1` OPEN, so they are clamped against the `T+1` board
+        # (`*_next`, anchored on the `T` close) -- NOT the `T`-session board above.
         suggested_limit_price = price
         passive_support_limit_price = price
         if sym != cash_proxy and price > 0:
             if action == "BUY":
-                suggested_limit_price = min(p_limit_up, round(price * 1.002, decimals))
+                suggested_limit_price = min(p_limit_up_next, round(price * 1.002, decimals))
                 if intraday_vwap and intraday_vwap > 0:
                     support_anchor = max(intraday_vwap, chan_5m_zg) if chan_5m_zg > 0 else intraday_vwap
                     passive_support_limit_price = min(
@@ -8124,9 +8153,9 @@ def main(cli_args: Optional[List[str]] = None):
                     passive_support_limit_price = suggested_limit_price
             elif action == "SELL":
                 if "止损" in reason or "HALT" in reason or "EMERGENCY" in reason:
-                    suggested_limit_price = max(p_limit_down, round(price * 0.997, decimals))
+                    suggested_limit_price = max(p_limit_down_next, round(price * 0.997, decimals))
                 else:
-                    suggested_limit_price = max(p_limit_down, round(price * 0.998, decimals))
+                    suggested_limit_price = max(p_limit_down_next, round(price * 0.998, decimals))
                 passive_support_limit_price = suggested_limit_price
 
         # Post-calculation lot-rounding zero shares liquidation:
